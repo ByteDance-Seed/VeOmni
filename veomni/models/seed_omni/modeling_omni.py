@@ -281,7 +281,10 @@ class OmniModel(nn.Module):
             Generation request dict (used for ``token_length.from_request``).
         context:
             Initial generation context (input_ids, attention_mask, ...).  If
-            ``None``, starts from a copy of ``request``.
+            ``None``, starts from a copy of ``request``.  During generation
+            ``input_ids`` grows as a full ``(B, T)`` sequence (HF
+            ``generate`` style); modules emit ``(B, 1)`` step tokens which
+            the FSM appends each iteration.
         max_new_tokens:
             Hard upper bound on total FSM iterations across all states.
         stop_token_ids:

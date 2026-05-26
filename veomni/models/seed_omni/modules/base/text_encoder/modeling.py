@@ -105,17 +105,31 @@ class TextEncoder(OmniModule, PreTrainedModel):
         """Default forward — alias for :meth:`encode` (the most common default)."""
         return self.encode(**kwargs)
 
-    def encode(self, input_ids: Optional[torch.LongTensor] = None, **_) -> Dict[str, Any]:
+    def encode(
+        self,
+        input_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Any = None,
+        **_,
+    ) -> Dict[str, Any]:
         """Word-token embedding lookup.
+
+        During autoregressive inference with KV cache, only the latest token
+        needs embedding — earlier positions are already in ``past_key_values``.
+        When ``past_key_values`` is set and ``input_ids`` is a growing
+        ``(B, T)`` sequence, embed ``input_ids[:, -1:]`` only.  On the first
+        prompt pass (no cache), embed the full ``input_ids`` prompt.
 
         Returns ``{"inputs_embeds": (B, T, hidden_size)}`` — or ``{}`` when
         ``input_ids`` is missing (text-free batch / micro-batch).
         """
         if input_ids is None:
             return {}
-        if input_ids.ndim == 1:
-            input_ids = input_ids.unsqueeze(1)
-        return {"inputs_embeds": self.embed_tokens(input_ids)}
+        ids = input_ids
+        if past_key_values is not None and isinstance(ids, torch.Tensor) and ids.ndim == 2 and ids.size(-1) > 1:
+            ids = ids[:, -1:]
+        if isinstance(ids, torch.Tensor) and ids.ndim == 1:
+            ids = ids.unsqueeze(1)
+        return {"inputs_embeds": self.embed_tokens(ids)}
 
     def decode(
         self,

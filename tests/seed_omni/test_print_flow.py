@@ -245,6 +245,22 @@ def test_fsm_interleave_text_to_image_to_text():
     assert FSM_SIGNAL_KEY not in final_ctx
 
 
+def test_generate_appends_input_ids_to_full_sequence():
+    """``ctx['input_ids']`` accumulates prompt + generated tokens (HF style)."""
+    model, _ = _build_model(token_script=[10, TOK_EOS], infer="interleave")
+    prompt = torch.tensor([[100]], dtype=torch.long)
+    final_ctx = model.generate(
+        request={},
+        context={"input_ids": prompt},
+        max_new_tokens=20,
+    )
+    ids = final_ctx["input_ids"]
+    assert isinstance(ids, torch.Tensor)
+    assert ids.ndim == 2 and ids.size(-1) >= 2
+    assert ids[0, 0].item() == 100
+    assert scalar_token_id(ids) == TOK_EOS
+
+
 def test_fsm_image_vq_routes_embed_back_into_inputs_embeds():
     """In ``image_vq``, edge ``vae_dec_to_ar`` writes ctx['embed'] → ctx['inputs_embeds']."""
     model, _ = _build_model(

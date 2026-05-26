@@ -53,9 +53,10 @@ generation_graph:
 
     text_ar:
       # tok_encode → janus_llama → tok_decode (variable, until transition fires).
-      # tok_decode writes input_ids back into ctx; JanusTextEncoder.decode
-      # also writes one-shot module_signal keys (start_image_gen / text_done)
-      # based on tokenizer semantics — the FSM never inspects token ids.
+      # tok_decode emits a (B, 1) next token; the framework appends it onto
+      # ctx["input_ids"] at step end (HF generate style).  With KV cache,
+      # tok_encode embeds only input_ids[:, -1:].  JanusTextEncoder.decode
+      # also writes one-shot module_signal keys (start_image_gen / text_done).
       body:
         - tok_enc_to_ar       # tok_encode  → janus_llama (inputs_embeds)
         - ar_to_tok_decode    # janus_llama → tok_decode  (hidden_states)

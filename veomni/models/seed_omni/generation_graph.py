@@ -105,7 +105,18 @@ See also
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional
 
-from .graph import END, EdgeDef, NodeDef, is_end, scalar_token_id
+import torch
+
+from .graph import (
+    END,
+    EdgeDef,
+    NodeDef,
+    append_input_ids,
+    is_end,
+    is_step_input_ids,
+    normalize_step_input_ids,
+    scalar_token_id,
+)
 
 
 # Reserved name for the framework-injected terminal state.  Every FSM
@@ -435,6 +446,7 @@ class GenerationGraph:
         ctx = dict(context)
         state = self._current_state
         executed: set = set()
+        pending_step_ids: Any = None
 
         # Per-node first appearance as `from_` in body — distinguishes
         # **feed-forward** edges (with `to: X` *before* X's first `from_`
@@ -465,6 +477,7 @@ class GenerationGraph:
                 pending[e.to] += 1
 
         def _run(node_name: str) -> None:
+            nonlocal pending_step_ids
             if is_end(node_name) or node_name in executed:
                 return
             if pending.get(node_name, 0) > 0:
@@ -491,7 +504,14 @@ class GenerationGraph:
             out = method_fn(**ctx)
             if not isinstance(out, dict):
                 raise TypeError(f"FSM node '{node_name}'.{method_name} must return a dict; got {type(out).__name__}.")
-            ctx.update(out)
+            step_ids = out.get("input_ids")
+            if step_ids is not None and is_step_input_ids(step_ids):
+                pending_step_ids = normalize_step_input_ids(step_ids)
+                for key, val in out.items():
+                    if key != "input_ids":
+                        ctx[key] = val
+            else:
+                ctx.update(out)
             executed.add(node_name)
 
         for i, edge in enumerate(state.body):
@@ -521,6 +541,17 @@ class GenerationGraph:
                     pending[edge.to] -= 1
 
         self._steps_in_state += 1
+        if pending_step_ids is not None:
+            ctx["input_ids"] = append_input_ids(context.get("input_ids"), pending_step_ids)
+            prev_mask = context.get("attention_mask")
+            if isinstance(prev_mask, torch.Tensor) and isinstance(pending_step_ids, torch.Tensor):
+                ones = torch.ones(
+                    pending_step_ids.size(0),
+                    1,
+                    dtype=prev_mask.dtype,
+                    device=prev_mask.device,
+                )
+                ctx["attention_mask"] = torch.cat([prev_mask, ones], dim=-1)
         return ctx
 
     def maybe_transition(self, context: Dict[str, Any], *, trace: Optional[List[str]] = None) -> bool:

@@ -17,8 +17,9 @@
 #     → text_ar
 #
 #   text_ar         (variable length: tok_encode → janus_llama → tok_decode.
-#                   tok_decode writes input_ids back into
-#                   ctx so each iteration's tok_encode reads them.)
+#                   Framework appends each sampled token onto ctx["input_ids"]
+#                   at step end; tok_encode embeds input_ids[:, -1:] when KV
+#                   cache is present.
 #     ├─ token == </s> → done
 #     └─ otherwise     → text_ar (continue)
 #

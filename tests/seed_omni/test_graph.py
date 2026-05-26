@@ -425,3 +425,20 @@ def test_to_mermaid_always_draws_data_pseudo_node():
     assert "losses" not in out
     assert "vision_encoder" in out
     assert "end_sink" in out
+
+
+# ── input_ids sequence helpers (HF generate alignment) ───────────────────────
+
+
+def test_append_input_ids_grows_sequence():
+    import torch
+
+    from veomni.models.seed_omni.graph import append_input_ids, is_step_input_ids, scalar_token_id
+
+    prompt = torch.tensor([[100, 101]], dtype=torch.long)
+    step = torch.tensor([[42]], dtype=torch.long)
+    full = append_input_ids(prompt, step)
+    assert full.tolist() == [[100, 101, 42]]
+    assert is_step_input_ids(step)
+    assert not is_step_input_ids(prompt)
+    assert scalar_token_id(full) == 42

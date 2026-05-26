@@ -286,7 +286,8 @@ edges:
 
   # ── 推理反馈边
   vae_decode_to_llama:{from: vae_decode,  output: embed,         to: janus_llama, as: inputs_embeds}
-  tok_decode_to_input:{from: tok_decode,  output: input_ids,     to: tok_encode,  as: input_ids}
+  # 推理时 decode 产出的 (B,1) step token 由框架 append 到 ctx["input_ids"]；
+  # 下一步 tok_encode 在有 past_key_values 时只 embed input_ids[:, -1:]。
 
 # ── 训练 DAG（只列 edges；nodes 由 endpoints 自动并出，topo 推执行序）
 training_graph:
@@ -515,7 +516,7 @@ generation_graph:
       body:
         - tok_enc_to_llama       # tok_encode 执行 → inputs_embeds 路由到 janus_llama
         - llama_to_tok_decode    # janus_llama 执行（generate_step）→ hidden_states 路由到 tok_decode
-        - tok_decode_to_input    # tok_decode 执行 → next input_ids 写回 ctx
+        - tok_decode_sink        # leaf；框架在 step 末 append decode 的 input_ids
       token_length: {type: variable}
       transitions:
         # text_decoder 采样后在 return dict 写 module_signal；YAML 不出现 token id
@@ -672,7 +673,7 @@ edges:
   vae_decode_to_end:   {from: vae_decode,  output: gen_loss,      to: end}
   # ── 推理反馈边
   vae_decode_to_llama: {from: vae_decode,  output: embed,         to: janus_llama, as: inputs_embeds}
-  tok_decode_to_input: {from: tok_decode,  output: input_ids,     to: tok_encode,  as: next_input_ids}
+  # decode/emit 的 (B,1) input_ids 由框架 append；tok_encode 有 KV 时只 embed 最后一列
 
 training_graph:
   edges:
@@ -689,7 +690,7 @@ generation_graph:
   initial: text_ar
   states:
     text_ar:
-      body: [tok_enc_to_llama, llama_to_tok_decode, tok_decode_to_input]
+      body: [tok_enc_to_llama, llama_to_tok_decode, tok_decode_sink]
       token_length: {type: variable}
       transitions:
         - {condition: {type: module_signal, key: start_image_gen}, next_state: image_vq_start}

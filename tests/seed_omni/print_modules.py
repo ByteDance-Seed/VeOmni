@@ -185,7 +185,8 @@ class PrintTextEmbed(_PrintBase):
 
     def encode(self, **kwargs: Any) -> dict[str, Any]:
         self._record("encode", **kwargs)
-        return {"inputs_embeds": f"<wte:{kwargs.get('input_ids', '?')}>"}
+        ids = kwargs.get("input_ids", "?")
+        return {"inputs_embeds": f"<wte:{ids}>"}
 
     def decode(self, **kwargs: Any) -> dict[str, Any]:
         self._record("decode", **kwargs)

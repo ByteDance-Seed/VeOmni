@@ -256,6 +256,17 @@ def test_text_encoder_decode_returns_single_loss_key():
     assert "lm_loss" not in out
 
 
+def test_text_encoder_encode_uses_last_token_with_kv_cache():
+    """With KV cache, ``encode`` embeds only ``input_ids[:, -1:]``."""
+    TextEncoder = _model_cls("text_encoder")
+    TextEncoderConfig = _config_cls("text_encoder")
+    te = TextEncoder(TextEncoderConfig(vocab_size=64, hidden_size=16))
+    full = torch.tensor([[1, 2, 42]], dtype=torch.long)
+    out = te.encode(input_ids=full, past_key_values=())
+    assert out["inputs_embeds"].shape == (1, 1, 16)
+    assert torch.equal(out["inputs_embeds"], te.embed_tokens(torch.tensor([[42]])))
+
+
 def test_text_encoder_encode_inference_loop_keys():
     """Inference path returns the exact keys the FSM body expects."""
     TextEncoder = _model_cls("text_encoder")
