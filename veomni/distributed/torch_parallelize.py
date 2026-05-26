@@ -15,7 +15,7 @@
 
 import types
 from functools import partial
-from typing import List, Optional, Tuple
+from typing import Any, Callable, List, Mapping, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -43,6 +43,192 @@ def _reset_hf_initialized_flag(module: nn.Module) -> None:
         module._is_hf_initialized = False
     for child in module.children():
         _reset_hf_initialized_flag(child)
+
+
+def _resolve_weights_path_mapping(
+    model: nn.Module,
+    weights_path: Mapping[str, str],
+) -> List[Tuple[str, nn.Module, str]]:
+    """Resolve a ``{sub_module_name: snapshot_path}`` mapping against the
+    model's direct children.
+
+    Strict bijection: the mapping's keys must equal the set of
+    ``model.named_children()`` names exactly.  This matches the contract
+    OmniModel exposes after the D2.2 small refactor — every declared
+    sub-module is a direct attribute, not nested under a ``modules_dict.``
+    middle layer.
+
+    Returns
+    -------
+    ``[(name, child, path), ...]`` in the mapping's declared order.
+
+    Raises
+    ------
+    KeyError if (a) any mapping key is not a direct child of ``model``, or
+    (b) any direct child of ``model`` is missing from the mapping.  Either
+    side of the mismatch is named in the error so YAML typos / omissions
+    surface immediately — the caller can't accidentally end up with a
+    silently un-initialised sub-module.
+    """
+    children = dict(model.named_children())
+    unknown = [name for name in weights_path if name not in children]
+    missing = [name for name in children if name not in weights_path]
+    if unknown or missing:
+        msg_parts = [f"weights_path mapping mismatch on {type(model).__name__}:"]
+        if unknown:
+            msg_parts.append(f"unknown key(s) {sorted(unknown)!r} (not a direct child)")
+        if missing:
+            msg_parts.append(f"missing key(s) {sorted(missing)!r} (child has no path)")
+        msg_parts.append(f"available children: {sorted(children)}")
+        raise KeyError(" ".join(msg_parts))
+
+    return [(name, children[name], weights_path[name]) for name in weights_path]
+
+
+def _apply_weights_load_step(
+    model: nn.Module,
+    weights_path: Optional[Union[str, Mapping[str, str]]],
+    materialize_device: str,
+    *,
+    broadcast_from_rank0: bool,
+    is_peft_model: bool,
+    adapter_path: Optional[str],
+    cpu_load_param_name: Optional[List[str]],
+    max_load_broadcast_size: float,
+    distribute_tensor_fn: Callable[..., Any],
+) -> None:
+    """Materialise meta-initialised parameters and (optionally) load weights.
+
+    Three behaviours, dispatched by the type of ``weights_path``:
+
+    * ``None`` — call ``model.to_empty(device=...)`` then ``model.init_weights()``
+      (HF random init).  Behaviourally identical to the pre-D2.2 inline
+      block in ``parallelize_model_fsdp2``.
+    * ``str`` — load the entire ``model`` from the single snapshot at the
+      given path via ``rank0_load_and_broadcast_weights`` (when broadcast
+      is enabled) or ``load_model_weights`` (every-rank-reads fallback).
+      Behaviourally identical to the pre-D2.2 inline block; this is the
+      path BaseTrainer / VLMTrainer / TextTrainer / DiTTrainer all hit.
+    * ``Mapping[str, str]`` — strict bijection over ``model.named_children()``:
+      every direct child must have an entry, every entry must name a
+      direct child.  Each ``(sub_module_name, sub_path)`` pair is loaded
+      via the same ``rank0_load_and_broadcast_weights`` / ``load_model_weights``
+      pair as the ``str`` branch, scoped to the corresponding child
+      subtree.  This is the path OmniTrainer (D2.3) will use to load
+      each named sub-module from its own HF snapshot.
+
+    Notes
+    -----
+    * The ``str`` / ``None`` branches preserve the pre-D2.2 control flow
+      and call sites — ``rank0_load_and_broadcast_weights`` and
+      ``load_model_weights`` are invoked with the same args in the same
+      order.  A small structural cleanup (eager ``distribute_tensor``
+      import; ``kwargs.pop`` of ``is_peft_model`` / ``adapter_path``
+      lifted to the caller) is functionally a no-op for those paths.
+    * The ``Mapping`` branch deliberately rejects ``is_peft_model=True``:
+      the existing PEFT loader (``model_utils.load_model_weights``) maps
+      a single base-model checkpoint into a single PEFT-wrapped model,
+      and there is no sane interpretation of "PEFT" applied uniformly
+      across a heterogeneous set of OmniModel sub-modules.  D-track will
+      design per-sub-module PEFT once V2 trainers settle; refusing the
+      combination today prevents silent miswiring.
+    * Calling ``load_model_weights`` on a child sub-tree of an FSDP-wrapped
+      root mirrors the pre-D2.2 ``str`` path's behaviour against
+      ``model.to_empty(...)`` on the wrapped root — both rely on
+      ``to_empty`` propagating through FSDP DTensor parameters.  This
+      composition is exercised end-to-end by D2.3's smoke tests (which
+      run real FSDP) — the unit tests here only cover dispatch.
+    """
+    if weights_path is None:
+        model.to_empty(device=materialize_device)
+        _reset_hf_initialized_flag(model)
+        model.init_weights()
+        return
+
+    if isinstance(weights_path, Mapping):
+        if is_peft_model:
+            raise NotImplementedError(
+                "weights_path: Mapping[str, str] is incompatible with is_peft_model=True. "
+                "PEFT for V2 OmniModel sub-modules will be designed in a follow-up; "
+                "for now, pass a single str weights_path or disable PEFT."
+            )
+        loaded = _resolve_weights_path_mapping(model, weights_path)
+        for name, child, sub_path in loaded:
+            logger.info_rank0(f"Loading weights for sub-module {name!r} from {sub_path}...")
+            _load_one(
+                model=child,
+                weights_path=sub_path,
+                materialize_device=materialize_device,
+                broadcast_from_rank0=broadcast_from_rank0,
+                is_peft_model=False,
+                adapter_path=None,
+                cpu_load_param_name=cpu_load_param_name,
+                max_load_broadcast_size=max_load_broadcast_size,
+                distribute_tensor_fn=distribute_tensor_fn,
+            )
+        return
+
+    logger.info_rank0(f"starting to load model weights from {weights_path}...")
+    if is_peft_model:
+        if adapter_path is not None:
+            logger.info_rank0(f"also loading lora adapter weights from {adapter_path}...")
+        else:
+            logger.info_rank0("also init peft model lora weights...")
+    _load_one(
+        model=model,
+        weights_path=weights_path,
+        materialize_device=materialize_device,
+        broadcast_from_rank0=broadcast_from_rank0,
+        is_peft_model=is_peft_model,
+        adapter_path=adapter_path,
+        cpu_load_param_name=cpu_load_param_name,
+        max_load_broadcast_size=max_load_broadcast_size,
+        distribute_tensor_fn=distribute_tensor_fn,
+    )
+
+
+def _load_one(
+    *,
+    model: nn.Module,
+    weights_path: str,
+    materialize_device: str,
+    broadcast_from_rank0: bool,
+    is_peft_model: bool,
+    adapter_path: Optional[str],
+    cpu_load_param_name: Optional[List[str]],
+    max_load_broadcast_size: float,
+    distribute_tensor_fn: Callable[..., Any],
+) -> None:
+    """Materialise + load weights into one (sub-)tree from a single snapshot.
+
+    Centralises the rank0-broadcast vs. every-rank-reads choice so both
+    the ``str`` and ``Mapping`` branches above share identical loader
+    behaviour.  ``model`` here may be the full top-level model or a
+    single named child — both are valid ``nn.Module`` instances.
+    """
+    if broadcast_from_rank0:
+        logger.info_rank0("Loading model weights from disk on rank0 then broadcasting to other ranks...")
+        rank0_load_and_broadcast_weights(
+            model,
+            weights_path,
+            materialize_device,
+            dtensor_factory=distribute_tensor_fn,
+            cpu_load_param_name=cpu_load_param_name,
+            max_load_broadcast_size=max_load_broadcast_size,
+            is_peft_model=is_peft_model,
+            adapter_path=adapter_path,
+        )
+    else:
+        logger.info_rank0("Every rank would read weights from disk and expect this to be slow!")
+        _dt_local_split = partial(distribute_tensor_fn, src_data_rank=None)
+        load_model_weights(
+            model,
+            weights_path,
+            materialize_device,
+            dtensor_factory=_dt_local_split,
+            is_peft_model=is_peft_model,
+            adapter_path=adapter_path,
+        )
 
 
 def _check_extra_parallel_dim0_divisibility(model: "nn.Module", para_name: str, ep_fsdp_size: int) -> bool:
@@ -75,7 +261,7 @@ def _check_extra_parallel_dim0_divisibility(model: "nn.Module", para_name: str, 
 
 def parallelize_model_fsdp2(
     model: "nn.Module",
-    weights_path: Optional[str] = None,
+    weights_path: Optional[Union[str, Mapping[str, str]]] = None,
     enable_reshard_after_forward: bool = True,
     mixed_precision: MixedPrecisionConfig = MixedPrecisionConfig(enable=True),  # noqa
     basic_modules: Optional[List[str]] = None,
@@ -104,6 +290,22 @@ def parallelize_model_fsdp2(
         emb_plan = {"embed_tokens.weight": Shard(0), "decoder.embed_tokens.weight": Shard(0)}
         ep_size, emb_size = 2, 4
     We will use this model for illustration of Expert Parallel + Embed Parallel below.
+
+    Args:
+        weights_path: One of three forms:
+            * ``None`` — random init (``to_empty + init_weights``).
+            * ``str`` — single HF snapshot path; loads the entire ``model``.
+              All existing single-model trainers (BaseTrainer / VLMTrainer /
+              TextTrainer / DiTTrainer) hit this branch.
+            * ``Mapping[str, str]`` — ``{sub_module_name: snapshot_path}``,
+              keyed by the model's direct ``named_children()`` names.
+              **Strict bijection** — every direct child must appear as a
+              key, every key must name a direct child; mismatches raise
+              ``KeyError``.  Each named child is loaded from its own
+              snapshot via the same loader the ``str`` branch uses.
+              Used by V2 OmniModel (D2.3), where each declared sub-module
+              owns its own HF folder.  Incompatible with
+              ``is_peft_model=True`` — raises ``NotImplementedError``.
     """
 
     parallel_state = get_parallel_state()
@@ -355,49 +557,23 @@ def parallelize_model_fsdp2(
                 prefetch_modules = prev_block._fsdp_modules
                 current_block.set_modules_to_backward_prefetch(list(reversed(prefetch_modules)))
 
-    # Handle meta initialization for FSDP2 (fallback if pre-load not done)
+    # Handle meta initialization for FSDP2 (fallback if pre-load not done).
     assert kwargs.get("init_device") == "meta", "Please use init_device: meta for FSDP2"
     materialize_device = "cpu" if enable_fsdp_cpu_offload else get_device_type()
 
-    if weights_path is None:
-        model.to_empty(device=materialize_device)
-        _reset_hf_initialized_flag(model)
-        model.init_weights()
-    else:
-        from torch.distributed.tensor import distribute_tensor
+    from torch.distributed.tensor import distribute_tensor
 
-        logger.info_rank0(f"starting to load model weights from {weights_path}...")
-        is_peft_model = kwargs.pop("is_peft_model", False)
-        adapter_path = kwargs.pop("adapter_path", None)
-        if is_peft_model:
-            if adapter_path is not None:
-                logger.info_rank0(f"also loading lora adapter weights from {adapter_path}...")
-            else:
-                logger.info_rank0("also init peft model lora weights...")
-
-        if kwargs.get("broadcast_model_weights_from_rank0"):
-            logger.info_rank0("Loading model weights from disk on rank0 then broadcasting to other ranks...")
-            rank0_load_and_broadcast_weights(
-                model,
-                weights_path,
-                materialize_device,
-                dtensor_factory=distribute_tensor,
-                cpu_load_param_name=kwargs.get("cpu_load_param_name", None),
-                max_load_broadcast_size=kwargs.get("max_load_broadcast_size", 20.0),
-                is_peft_model=is_peft_model,
-                adapter_path=adapter_path,
-            )
-        else:
-            logger.info_rank0("Every rank would read weights from disk and expect this to be slow!")
-            _dt_local_split = partial(distribute_tensor, src_data_rank=None)
-            load_model_weights(
-                model,
-                weights_path,
-                materialize_device,
-                dtensor_factory=_dt_local_split,
-                is_peft_model=is_peft_model,
-                adapter_path=adapter_path,
-            )
+    _apply_weights_load_step(
+        model=model,
+        weights_path=weights_path,
+        materialize_device=materialize_device,
+        broadcast_from_rank0=bool(kwargs.get("broadcast_model_weights_from_rank0")),
+        is_peft_model=kwargs.pop("is_peft_model", False),
+        adapter_path=kwargs.pop("adapter_path", None),
+        cpu_load_param_name=kwargs.get("cpu_load_param_name", None),
+        max_load_broadcast_size=kwargs.get("max_load_broadcast_size", 20.0),
+        distribute_tensor_fn=distribute_tensor,
+    )
 
     # Register grad norm clipping method for FSDP2
     from .fsdp2 import clip_grad_norm as clip_grad_norm_fn
@@ -409,7 +585,7 @@ def parallelize_model_fsdp2(
 
 def build_parallelize_model(
     model: "nn.Module",
-    weights_path: Optional[str] = None,
+    weights_path: Optional[Union[str, Mapping[str, str]]] = None,
     enable_reshard_after_forward: bool = True,
     mixed_precision: MixedPrecisionConfig = MixedPrecisionConfig(enable=True),  # noqa
     enable_gradient_checkpointing: bool = True,
@@ -420,6 +596,16 @@ def build_parallelize_model(
     """Apply parallel strategies to the model.
 
     Args:
+        weights_path: One of three forms:
+            * ``None`` — random init under FSDP2.
+            * ``str`` — single HF snapshot for the whole model (the path
+              all single-model trainers — BaseTrainer / VLMTrainer /
+              TextTrainer / DiTTrainer — hit today).
+            * ``Mapping[str, str]`` — ``{sub_module_name: snapshot_path}``
+              keyed by ``model.named_children()`` (strict bijection;
+              missing or extra keys raise ``KeyError``).  Used by V2
+              OmniModel (D2.3) to load each declared sub-module from its
+              own folder.  See :func:`parallelize_model_fsdp2` for details.
         muon_expert_zero_comm: Shard ExtraParallel weights on dim-0 when the
             EP-local dim is divisible by ``ep_fsdp_size``.
     """

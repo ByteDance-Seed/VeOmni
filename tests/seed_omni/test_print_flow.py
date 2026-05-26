@@ -861,3 +861,109 @@ def test_generation_graph_mermaid_renders_body_subgraphs_and_loops():
     assert "state_text_ar -.-> state_text_ar" in txt
     # Bridge state has fixed=1 → labelled `×1`.
     assert 'state_image_vq_start -.->|"×1"| state_image_vq_start' in txt
+
+
+# ── OmniModel topology contract ──────────────────────────────────────────────
+#
+# These tests pin down OmniModel's structural contract that downstream
+# wiring (notably build_parallelize_model's per-sub-module weights_path
+# dispatch in D2.2) depends on:
+#   * sub-modules are direct children — not nested under `modules_dict.<name>`;
+#   * named_parameters fqns flatten to `<name>.<rest>`;
+#   * the legacy `model.modules_dict[name]` view still works for back-compat.
+
+
+def test_omni_model_named_children_yields_submodules_directly():
+    """``model.named_children()`` enumerates sub-modules in declared order
+    with no `modules_dict.` middle layer — this is what
+    `build_parallelize_model(weights_path: Mapping[str, str])` will key off
+    in D2.2 to dispatch per-sub-module weight loading.
+    """
+    model, _ = _build_model(token_script=[])
+
+    names = [name for name, _ in model.named_children()]
+
+    # Order matches OmniConfig.module_names declaration order.
+    assert names == ["text_embed", "vision", "vqvae", "ar"]
+
+    # No nn.ModuleDict middle attribute leaks into the children iteration.
+    assert "modules_dict" not in names
+
+    # Each named child IS the actual OmniModule instance — no wrapping.
+    for name, child in model.named_children():
+        assert child is getattr(model, name)
+
+
+def test_omni_model_named_parameters_fqn_lacks_modules_dict_prefix():
+    """Parameter fqns shape as `<sub_module>.<rest>` so checkpoint shard
+    names map 1:1 to sub-module names without prefix-stripping logic.
+    """
+    model, _ = _build_model(token_script=[])
+
+    # Print modules carry one trainable buffer-as-parameter (see
+    # PrintTextEmbed).  We just need at least one fqn to assert the shape.
+    fqns = [n for n, _ in model.named_parameters()]
+    if fqns:
+        for fqn in fqns:
+            head = fqn.split(".", 1)[0]
+            assert head in {"text_embed", "vision", "vqvae", "ar"}, (
+                f"fqn {fqn!r} starts with {head!r} — should be a top-level "
+                f"sub-module name, not 'modules_dict' or any wrapper."
+            )
+
+
+def test_omni_model_modules_dict_is_back_compat_view():
+    """`model.modules_dict[name]` still works for callers that haven't been
+    migrated yet (e.g. test fixtures that mutate a sub-module).  The view
+    returns the same instance as `getattr(model, name)`.
+    """
+    model, _ = _build_model(token_script=[])
+
+    view = model.modules_dict
+    # Plain dict view — not an nn.ModuleDict that would re-register children.
+    assert isinstance(view, dict)
+    assert set(view) == {"text_embed", "vision", "vqvae", "ar"}
+    for name, mod in view.items():
+        assert mod is getattr(model, name)
+
+
+def test_omni_model_rejects_module_name_colliding_with_framework_attr():
+    """Sub-module names that collide with OmniModel's own attributes are
+    rejected loudly — preventing `add_module('config', ...)` from silently
+    overwriting ``self.config`` (the kind of bug that surfaces only when
+    something downstream reads it).
+
+    Renames ``text_embed → config`` everywhere in the print-flow YAML
+    fixture (modules, every node's ``module`` reference, every edge's
+    ``from`` / ``to`` reference) to construct a config that *would*
+    succeed without the guard, then asserts the guard fires.
+    """
+    import pytest
+
+    def _rename(s: str, old: str, new: str) -> str:
+        # `text_embed` may appear as either the bare module name (`module: text_embed`)
+        # or as the prefix in `module: text_embed.encode` etc.  Replace conservatively
+        # at word boundaries so we don't touch `text_ar` etc.
+        if s == old:
+            return new
+        if s.startswith(old + "."):
+            return new + s[len(old) :]
+        return s
+
+    cfg_dict = _config_dict()
+    cfg_dict["modules"] = {("config" if k == "text_embed" else k): v for k, v in cfg_dict["modules"].items()}
+    cfg_dict["nodes"] = {
+        n_name: {**n_def, "module": _rename(n_def["module"], "text_embed", "config")}
+        for n_name, n_def in cfg_dict["nodes"].items()
+    }
+    cfg = OmniConfig.from_dict(cfg_dict)
+
+    log: List[str] = []
+    modules = {
+        "config": PrintTextEmbed("config", log, token_script=[]),
+        "vision": PrintVisionEncoder("vision", log),
+        "vqvae": PrintVQVAE("vqvae", log),
+        "ar": PrintARBackbone("ar", log),
+    }
+    with pytest.raises(ValueError, match="collide with framework attribute"):
+        OmniModel(cfg, modules)

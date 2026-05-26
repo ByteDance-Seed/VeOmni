@@ -314,12 +314,14 @@ class OmniModel(PreTrainedModel, GenerationMixin):
         return self._fsm.step(input_ids, self.modules_dict, **kwargs)
 
     # ── ParallelPlan 递归聚合（供顶层 build_parallelize_model 使用）─────
-    # 注意：本类把 parameters() / named_parameters() delegate 到
-    # self.omni_modules，bypass 了 "omni_modules." 这一段，所以
-    # self.named_parameters() 看到的 fqn 是 <name>.<rest>，前缀只加 <name>.
+    # 注意：sub-modules 直接挂为 OmniModel 顶层 attribute（不通过 ModuleDict
+    # 中介，D2.2 已落地），所以 self.named_parameters() 看到的 fqn 是
+    # <name>.<rest>，无中间 prefix。`modules_dict` 是 property dict view，
+    # 用于向后兼容老 callsite。
     def get_parallel_plan(self) -> ParallelPlan | None:
         merged: dict[str, dict[str, Shard]] = {}
-        for name, mod in self.omni_modules.items():
+        for name in self._module_names:
+            mod = getattr(self, name)
             plan = mod.get_parallel_plan() if hasattr(mod, "get_parallel_plan") else None
             if plan is None:
                 continue
@@ -809,7 +811,8 @@ training_graph:
 class OmniModel(nn.Module):
     def get_parallel_plan(self) -> ParallelPlan | None:
         merged: dict[str, dict[str, Shard]] = {}
-        for name, mod in self.omni_modules.items():
+        for name in self._module_names:
+            mod = getattr(self, name)
             plan = mod.get_parallel_plan() if hasattr(mod, "get_parallel_plan") else None
             if plan is None:
                 continue
@@ -821,7 +824,7 @@ class OmniModel(nn.Module):
 
 ### FQN 视角对齐（重要细节）
 
-`OmniModel` 把 `parameters()` / `named_parameters()` delegate 到 `self.omni_modules`（bypass 了 `omni_modules.` 这一段），所以 `model.named_parameters()` 看到的 fqn 形如 `<module_name>.<rest>`。`ParallelPlan.apply` 按这一视角做 fqn 匹配，与 `update_prefix(name)` 加的 `<name>.` 前缀**对齐一致**。FSDP2 仍按真实 attribute 路径（`omni_modules.<name>.<...>`）找 child module，两套视角各走各的，互不干扰。
+`OmniModel` 把每个 sub-module 直接 attach 为顶层 attribute（**不**通过 `nn.ModuleDict` 中介，D2.2 已落地），所以 `model.named_parameters()` 看到的 fqn 形如 `<module_name>.<rest>`，无中间 prefix；`model.named_children()` 直接枚举 `[(<module_name>, sub_module), ...]`。`ParallelPlan.apply` 按这一视角做 fqn 匹配，与 `update_prefix(name)` 加的 `<name>.` 前缀**对齐一致**；`build_parallelize_model(weights_path={name: path, ...})` 也按这同一组 `named_children` 名做 dispatch（见 § "Build & 权重加载"）。`modules_dict` 字段保留为 property dict view（`{name: getattr(self, name) for name in self._module_names}`），方便老 callsite（如旧测试 fixture）继续用 `model.modules_dict[name]` 取子模块；它**不**是 `nn.ModuleDict`，写入它不影响真实 children。
 
 ### 举例
 
@@ -877,7 +880,7 @@ V2 当前版本**不接受 per-module 的 `micro_batch_size` / `dp_size` / `sp_s
 | 阶段 | 状态 | 说明 |
 |------|------|------|
 | stale cleanup | ✅ 已完成 | 删 `OmniTrainer` 里 stale 的 `OmniBuildArgs` / `OmniModel.build_from_args` 引用；`_build_model` / `_build_model_assets` 留 `NotImplementedError` stub。文件可 import，D1 collator 路径 (`_build_collate_fn`) 正常单测。 |
-| `build_parallelize_model` 多 path 扩展 | 🟡 待开 PR | 给 `parallelize_model_fsdp2` 加一个 `weights_path: Mapping[str, str]` 分支（保持现有 `str` / `None` 行为字节级不变），按 sub-name 在 meta-init + FSDP wrap 之后**逐子树**调 `load_model_weights` / `rank0_load_and_broadcast_weights`。带独立 unit test 证明对 BaseTrainer / VLMTrainer / TextTrainer / DiTTrainer 等 single-path 调用方零影响。 |
+| `build_parallelize_model` 多 path 扩展 | ✅ 已完成 | 顺手把 `OmniModel` sub-modules 提升为顶层 attribute（取代 `nn.ModuleDict` 中介、`modules_dict` 改 property dict view，向后兼容老 callsite），让 `model.named_children()` 直接枚举 `[(<name>, sub_module), ...]`；`parallelize_model_fsdp2` 抽出 `_apply_weights_load_step` helper 三分支 dispatch（`None` 随机 init、`str` 单 snapshot、`Mapping[str, str]` 按 named_children 分子树加载）。Mapping 分支强制 **strict bijection**——key 集必须等于 `named_children` 集，缺失或多余都抛 `KeyError`，避免 D2.3 静默漏掉子模块；同时拒绝 `is_peft_model=True`（V2 跨子模块 PEFT 语义未定义）。带 12 个独立单测覆盖三分支 + bijection 错误 + PEFT 拒绝，**不**走 distributed init；BaseTrainer / VLMTrainer / TextTrainer / DiTTrainer 等老 single-path 调用方控制流不变（小幅结构整理：`distribute_tensor` 提前 import、`is_peft_model` / `adapter_path` 在 helper 调用前 `kwargs.pop` 一次，行为等价）。 |
 | MODELING_REGISTRY 注册 + OmniTrainer 重写 | 🟡 待开 PR | 把 `janus_siglip` / `janus_vqvae` / `janus_llama` / `janus_text_embed` / `text_embed` 注册进 `MODELING_REGISTRY`（今天它们只在 HF `AutoConfig` / `AutoModel` 注册，`build_foundation_model` 在默认 `MODELING_BACKEND='veomni'` 下找不到）；重写 `_build_model` 走 `init_device='meta'` + `weights_path=None` 拿 empty 子模块、装配 `OmniModel(config, modules_dict)`、`_build_parallelized_model` 一次性 `build_parallelize_model(model, weights_path={name: cfg["weights_path"] ...})`；端到端 smoke test 不 mock `build_foundation_model` / `build_parallelize_model` 内部，跑 fake checkpoint 验证 registry 路径。 |
 
 > 旧版本（被回退）尝试过用 single-path `build_foundation_model` 直接加载到 cpu/cuda、再让 parallelize 阶段 `weights_path=None` 跳过 weight load。这条路有三个 runtime 阻断点：(1) V2 子模块未注册到 `MODELING_REGISTRY`，`build_foundation_model` 第一次 call 就抛 `Unknown Modeling name: janus_siglip`；(2) `parallelize_model_fsdp2` 在 `weights_path=None` 时会跑 `model.to_empty + init_weights()` 重置权重；(3) `init_device='cpu'` 下 `auto.py:242` 让 rank>0 拿空权重又没后续 broadcast，多 rank 静默发散。所以直接做终态比绕道更稳。
@@ -1112,8 +1115,8 @@ raw_batch["conversation_list"][0] = [   # 第 0 个 sample
 
 1. **Feature D1**（基础）：multimodal_transform.py 减重 + list-only collator——`process_seedomni_example` 移除 chat_template + tokenize + image_processor 调用，只保留 IO + resize；输出 `[{"conversation_list": [...]}]`。`SeedOmniCollator` 不做任何 batching/SP/padding，只把每个 sample 的 `conversation_list` 收集成 `list[list[dict]]`。OmniTrainer 在 `data_type='seedomni'` 时改走该 collator。
 2. **Feature D2**（基础）：OmniTrainer build flow 重写。拆三段独立 PR 推进——
-   1. **D2.1 — stale cleanup**：删 `OmniTrainer` 里失效的 `OmniBuildArgs` / `OmniModel.build_from_args` 引用；`_build_model` / `_build_model_assets` 留 `NotImplementedError` stub。让文件可 import，启用 D1 wiring tests；`OmniTrainer.__init__` 仍是软失败状态（在 `_build_model` raise）。
-   2. **D2.2 — extend `build_parallelize_model`**：给 `parallelize_model_fsdp2` 加 `weights_path: Mapping[str, str]` 分支（按 sub-name 在 meta-init + FSDP wrap 之后逐子树加载），保持现有 `str` / `None` 行为字节级不变。带独立单测证明 BaseTrainer / VLMTrainer / TextTrainer / DiTTrainer 不受影响。
+   1. ✅ **D2.1 — stale cleanup**：删 `OmniTrainer` 里失效的 `OmniBuildArgs` / `OmniModel.build_from_args` 引用；`_build_model` / `_build_model_assets` 留 `NotImplementedError` stub。让文件可 import，启用 D1 wiring tests；`OmniTrainer.__init__` 仍是软失败状态（在 `_build_model` raise）。
+   2. ✅ **D2.2 — extend `build_parallelize_model`**：顺手把 `OmniModel` sub-modules 提为顶层 attribute（取代 `nn.ModuleDict` 中介，`modules_dict` 改 property dict view），让 `model.named_children()` 直接出 `[(<name>, sub_module), ...]`。给 `parallelize_model_fsdp2` 加 `weights_path: Mapping[str, str]` 分支（抽出 `_apply_weights_load_step` helper 三分支 dispatch；强制 **strict bijection** 防止 D2.3 静默漏 child；拒绝 `is_peft_model=True`），保持现有 `str` / `None` 控制流。12 个独立单测覆盖三分支 + bijection 错误 + PEFT 拒绝；BaseTrainer / VLMTrainer / TextTrainer / DiTTrainer 等老 single-path 调用方行为等价。
    3. **D2.3 — registry + build flow**：把 V2 子模块（`janus_siglip` / `janus_vqvae` / `janus_llama` / `janus_text_embed` / `text_embed`）注册进 `MODELING_REGISTRY`；重写 `_build_model` 走 `init_device='meta'` + `weights_path=None` 拿 empty 子模块、装配 `OmniModel`，`_build_parallelized_model` 用 D2.2 的 dict 分支一次性加载所有子树。端到端 smoke test 不 mock `build_foundation_model` / `build_parallelize_model` 内部。
 
    **注意**：即使 D2.3 全部完成，trainer 仍**无法**端到端 train —— module forward 的输入契约仍是 V1 风格 flat tensor batch，`conversation_list` 喂不进去；这要等 D3-D5 把 chat template / image processor / splice 全部迁移到 module forward 后才能跑通。详细 build flow 设计见 § "Build & 权重加载"。

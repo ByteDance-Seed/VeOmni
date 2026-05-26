@@ -13,7 +13,13 @@ Architecture
 ------------
 ``OmniModel`` carries:
 
-* ``modules_dict``      — :class:`nn.ModuleDict` of named OmniModule instances.
+* sub-modules           — each named :class:`OmniModule` is attached as a
+                          **direct attribute** of ``OmniModel``, so
+                          ``model.named_children()`` enumerates them in the
+                          declared order and parameter fqns flatten to
+                          ``<module_name>.<rest>`` (no ``modules_dict.``
+                          middle prefix).  ``model.modules_dict`` remains as
+                          a read-only dict view for back-compat.
 * ``training_graph``    — :class:`TrainingGraph` (DAG over node/edge pools).
 * ``generation_graph``  — :class:`GenerationGraph` (FSM, optional).
 
@@ -108,6 +114,19 @@ class OmniModel(nn.Module):
 
     config_class = OmniConfig
 
+    # Names that ``OmniModel`` itself uses as attributes — sub-module names
+    # coming in from YAML must not collide with these or PyTorch's nn.Module
+    # ``add_module`` would silently overwrite framework state.  Listed
+    # explicitly so the failure mode is loud and obvious.
+    _RESERVED_ATTR_NAMES: Tuple[str, ...] = (
+        "config",
+        "training_graph",
+        "generation_graph",
+        "modules_dict",
+        "_module_names",
+        "_RESERVED_ATTR_NAMES",
+    )
+
     def __init__(self, config: OmniConfig, modules: Mapping[str, nn.Module]):
         super().__init__()
         self.config = config
@@ -118,7 +137,30 @@ class OmniModel(nn.Module):
                 f"OmniModel: modules dict missing entries declared in config: {missing}. "
                 f"Provided: {sorted(modules)}; expected: {config.module_names}."
             )
-        self.modules_dict = nn.ModuleDict(dict(modules))
+        clashes = [n for n in config.module_names if n in self._RESERVED_ATTR_NAMES]
+        if clashes:
+            raise ValueError(
+                f"OmniModel: sub-module name(s) {clashes} collide with framework "
+                f"attribute(s).  Rename these in your YAML's `modules:` section."
+            )
+
+        # Sub-modules are attached as **direct attributes** of OmniModel (not
+        # via an `nn.ModuleDict` middle layer) so that:
+        #   * ``model.named_children()`` directly yields ``[(name, mod), ...]``
+        #     — needed by ``build_parallelize_model`` (D2.2) to dispatch a
+        #     per-sub-module ``weights_path`` mapping;
+        #   * ``model.named_parameters()`` fqns shape as ``<name>.<rest>``
+        #     instead of ``modules_dict.<name>.<rest>`` — matches the design
+        #     contract in design.md § "FQN 视角对齐";
+        #   * downstream save/load callbacks that target subfolder names can
+        #     reuse those names verbatim without stripping a prefix.
+        # ``_module_names`` is a plain list (not an ``nn.Module``) so it
+        # doesn't show up under ``children()`` / ``modules()``.  The
+        # back-compat ``modules_dict`` view below preserves existing call
+        # sites that index/iterate by name.
+        self._module_names: List[str] = list(config.module_names)
+        for name in self._module_names:
+            self.add_module(name, modules[name])
 
         self.training_graph = TrainingGraph(
             nodes=config.nodes,
@@ -135,6 +177,17 @@ class OmniModel(nn.Module):
             if config.has_generation_graph()
             else None
         )
+
+    @property
+    def modules_dict(self) -> Dict[str, nn.Module]:
+        """Back-compat dict view of the sub-modules.
+
+        Read-only — sub-modules are real attributes; mutating this dict has
+        no effect on the model.  Returned as a fresh ``dict`` (not an
+        ``nn.ModuleDict``) so callers indexing / iterating it never see
+        the deprecated middle-attribute path.
+        """
+        return {name: getattr(self, name) for name in self._module_names}
 
     # ── Training ──────────────────────────────────────────────────────────────
 
@@ -172,7 +225,7 @@ class OmniModel(nn.Module):
         for node_name in self.training_graph.execution_order:
             module_name = self.training_graph.module_of(node_name)
             method = self.training_graph.method_of(node_name)
-            module = self.modules_dict[module_name]
+            module = getattr(self, module_name)
             raw_module = _unwrap_module(module)
 
             kwargs = self.training_graph.collect_inputs(node_name, node_outputs, batch)
@@ -244,7 +297,7 @@ class OmniModel(nn.Module):
         self.generation_graph.reset(request=request)
         ctx: Dict[str, Any] = dict(context if context is not None else request)
 
-        modules = {name: _unwrap_module(mod) for name, mod in self.modules_dict.items()}
+        modules = {name: _unwrap_module(getattr(self, name)) for name in self._module_names}
 
         total_steps = 0
         while not self.generation_graph.is_done() and total_steps < max_new_tokens:
@@ -285,16 +338,15 @@ class OmniModel(nn.Module):
     def named_omni_modules(self) -> Iterator[Tuple[str, OmniModule]]:
         """Yield ``(name, raw_module)`` for every entry whose unwrapped form
         is an :class:`OmniModule` mixin instance."""
-        for name, mod in self.modules_dict.items():
-            raw = _unwrap_module(mod)
+        for name in self._module_names:
+            raw = _unwrap_module(getattr(self, name))
             if isinstance(raw, OmniModule):
                 yield name, raw  # type: ignore[misc]
 
     def get_module(self, name: str) -> nn.Module:
-        mod = self.modules_dict.get(name)
-        if mod is None:
+        if name not in self._module_names:
             raise KeyError(f"Module '{name}' not found in OmniModel")
-        return mod
+        return getattr(self, name)
 
     def collect_assets(self) -> List[Any]:
         """Collect per-module assets (vision/audio processors, codebooks).
