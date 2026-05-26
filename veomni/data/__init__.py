@@ -16,6 +16,7 @@ from .chat_template import build_chat_template
 from .data_collator import (
     MainCollator,
     MakeMicroBatchCollator,
+    SeedOmniCollator,
     UnpackDataCollator,
 )
 from .data_loader import DistributedDataloader, build_dataloader
@@ -37,6 +38,7 @@ __all__ = [
     "DATA_TRANSFORM_REGISTRY",
     "MainCollator",
     "MakeMicroBatchCollator",
+    "SeedOmniCollator",
     "UnpackDataCollator",
     "build_dataset",
     "DistributedDataloader",

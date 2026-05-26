@@ -131,7 +131,7 @@ class OmniTrainer:
         self._build_model_assets()
         self._build_data_transform()
         self.base._build_dataset()
-        self.base._build_collate_fn()
+        self._build_collate_fn()
         self.base._build_dataloader()
         self.base._build_optimizer()
         self.base._build_lr_scheduler()
@@ -184,6 +184,30 @@ class OmniTrainer:
             max_seq_len=args.data.max_seq_len,
             text_keys=args.data.text_keys,
         )
+
+    def _build_collate_fn(self):
+        """Pick the collator that matches the active ``data_type``.
+
+        For ``data_type == "seedomni"`` the per-sample shape is
+        ``{"conversation_list": [...]}`` (list of dicts with possibly
+        heterogeneous image tensor shapes), and the V2 design contract
+        defers all sequence packing / SP slicing to module
+        ``pre_forward`` hooks — so we use the list-only
+        ``SeedOmniCollator``.
+
+        For all other ``data_type``s (legacy ``conversation`` / ``dpo`` /
+        ``classification`` / ``qwen*_vl`` / ...) we fall back to
+        ``BaseTrainer._build_collate_fn`` which builds a ``MainCollator``
+        with packing + SP — the V1 contract is preserved verbatim.
+        """
+        args: VeOmniOmniArguments = self.base.args
+        if args.data.data_type == "seedomni":
+            from ..data import SeedOmniCollator
+
+            self.base.collate_fn = SeedOmniCollator()
+            logger.info_rank0("OmniTrainer: using SeedOmniCollator (list-only) for data_type='seedomni'")
+        else:
+            self.base._build_collate_fn()
 
     # ── Forward / backward ─────────────────────────────────────────────────────
 

@@ -219,7 +219,9 @@ def process_seedomni_example(
     """
     import json
 
-    source = example.pop("source_name") if "source_name" in example else kwargs.get("source_name")
+    # Non-destructive read — datasets often share dict references and a
+    # subsequent ``__getitem__`` would otherwise see the key gone.
+    source = example.get("source_name", kwargs.get("source_name"))
     if source is None:
         raise KeyError(
             "process_seedomni_example: sample is missing 'source_name' (and no fallback "

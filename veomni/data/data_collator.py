@@ -464,3 +464,67 @@ class PackingPostCollator(DataCollator):
         logits_list = logits.split(seq_lens, dim=0)
         outputs.logits = logits_list
         return outputs
+
+
+@dataclass
+class SeedOmniCollator(DataCollator):
+    """List-only collator for the SeedOmni V2 ``conversation_list`` schema.
+
+    Pairs with ``data_type: seedomni`` (see
+    ``veomni/data/multimodal/seedomni_transform.py``) which emits
+    per-sample dicts of the form ``{"conversation_list": [items, ...]}``.
+    This collator turns ``N`` such dicts into a single batched dict
+    ``{"conversation_list": [[items_0], [items_1], ..., [items_{N-1}]]}``
+    plus any extra keys present in the samples (passed through
+    unchanged as a per-sample list).
+
+    No stacking, no padding, no sequence-parallel slicing — the V2 design
+    contract puts all of that inside model modules' ``pre_forward``,
+    where each module knows which fields it owns and how to slice them.
+    The data layer's job stops at "list of per-sample dicts → dict of
+    per-sample lists".
+
+    The collator is intentionally **agnostic** about the exact set of
+    keys present: any sample-level key is gathered into a list of length
+    ``batch_size``.  This keeps the schema open for later extensions
+    (precomputed features, offline-embedding payloads, etc.) without
+    needing to update the collator.
+
+    Image / audio tensors inside ``conversation_list`` items keep their
+    original shapes — different samples may carry images of different
+    resolutions, so the values **must not** be torch.stacked here.
+    Vision encoders (e.g. ``JanusSiglip``) collate them in their own
+    ``pre_forward`` after their image processor has matched shapes.
+
+    Example::
+
+        collator = SeedOmniCollator()
+        batch = collator([
+            {"conversation_list": [{"type": "text", "value": "hi", ...}]},
+            {"conversation_list": [{"type": "image", "value": <Tensor>, ...}]},
+        ])
+        # batch == {"conversation_list": [[{"type": "text", ...}], [{"type": "image", ...}]]}
+    """
+
+    def __call__(self, features: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+        if not features:
+            raise ValueError("SeedOmniCollator received an empty feature list")
+
+        # Gather keys across all samples.  Strict alignment (every sample
+        # must share the same key set) — silent dropping of fields would
+        # be a debugging nightmare.
+        first_keys = set(features[0].keys())
+        for i, f in enumerate(features[1:], start=1):
+            if set(f.keys()) != first_keys:
+                raise ValueError(
+                    f"SeedOmniCollator: sample {i} has keys {set(f.keys())} but sample 0 has {first_keys}; "
+                    f"all samples in a batch must carry the same key set."
+                )
+        if "conversation_list" not in first_keys:
+            raise KeyError(
+                "SeedOmniCollator: every sample must have a 'conversation_list' key "
+                "(produced by the seedomni data_transform); "
+                f"got {first_keys}"
+            )
+
+        return {key: [f[key] for f in features] for key in first_keys}
