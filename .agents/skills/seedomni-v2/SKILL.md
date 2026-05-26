@@ -11,14 +11,14 @@ description: "Use this skill when adding or modifying anything inside `veomni/mo
    - OmniModule is a **mixin**, not a base class.
    - `_loss` suffix collection (single key): each module loops all micro-batches inside one `forward`, `post_forward` does the token-level mean, and emits a scalar `<name>_loss`. OmniModel just sums.
    - **Data is 100% model-agnostic**: `raw_batch` starts with a single key `conversation_list` (`list[list[dict]]` of `{type, value, loss_mask, from_assistant}` items). All chat templating, tokenization, image processing, audio feature extraction, and boundary-marker injection happen **inside model modules** during forward. The same dataset can feed any ug model — Janus / Qwen-Omni / Bagel — without changes.
-   - **Per-module assets including tokenizer**: every processor (vision / image / audio) AND the tokenizer live inside their owning module's subfolder. There is **no top-level `tokenizer_path`** field — the tokenizer is owned by the family-specific `text_embed` module (`modules/<family>/text_embed/tokenizer/`). Pure DiT models without a text encoder have no tokenizer at all.
+   - **Per-module assets including tokenizer**: every processor (vision / image / audio) AND the tokenizer live inside their owning module's subfolder. There is **no top-level `tokenizer_path`** field — the tokenizer is owned by the family-specific `text_encoder` module (`modules/<family>/text_encoder/tokenizer/`). Pure DiT models without a text encoder have no tokenizer at all.
    - **Module forward → mutates raw_batch**: every module's `forward(**kwargs) -> Dict` return dict is **immediately written back into raw_batch** by OmniModel (keyed by `edge.output`). Data does **not** flow through edge channels to downstream modules — downstream reads the same `raw_batch` by its own input keys. Edges are dependency / topology contracts, not data conduits.
    - **No global collator final-step, no global SP slice node**: each module calls collator helpers and applies SP slicing **inside its own `pre_forward`** for the fields it owns. ViT slices the image batch dimension; text encoder slices the sequence dimension; nothing gets sliced twice.
-   - **Status**: this is the target contract; the current code still runs the V1-compatible path (`multimodal_chat_template.py` does chat templating + N pre-expanded placeholders; `JanusLlama.pre_forward` uses `masked_scatter`). Migration happens feature-by-feature (D1: lighter `multimodal_transform`; D2: lighter collator; D3: vision modules take over image processing + boundary markers; D4: `text_embed` takes over chat template + tokenize; D5: backbone splice). Don't try to land it all in one PR.
+   - **Status**: this is the target contract; the current code still runs the V1-compatible path (`multimodal_chat_template.py` does chat templating + N pre-expanded placeholders; `JanusLlama.pre_forward` uses `masked_scatter`). Migration happens feature-by-feature (D1: lighter `multimodal_transform`; D2: lighter collator; D3: vision modules take over image processing + boundary markers; D4: `text_encoder` takes over chat template + tokenize; D5: backbone splice). Don't try to land it all in one PR.
 2. `veomni/models/seed_omni/module.py` — the `OmniModule` mixin contract.
 3. `veomni/models/seed_omni/graph.py` + `training_graph.py` + `generation_graph.py` — `NodeDef` / `EdgeDef` schema and the DAG / FSM views.
 4. An existing module that matches your shape:
-   - **Generic / cross-family** → `modules/base/text_embed/modeling.py` (and the planned `modules/base/mlp_adapter/modeling.py`).
+   - **Generic / cross-family** → `modules/base/text_encoder/modeling.py` (and the planned `modules/base/mlp_adapter/modeling.py`).
    - **Vision encoder** → `modules/janus/siglip/modeling.py`.
    - **VQ codec** (encode + decode) → `modules/janus/vqvae/modeling.py`.
    - **AR backbone (no vocab layers)** → `modules/janus/llama/modeling.py`.
@@ -69,11 +69,15 @@ Layer 4: vision / audio encoder modules (forward stage)
               original modality item
            4. return dict written back to raw_batch by framework
 
-Layer 5: text_embed module (model-specific; chat-template + tokenize + wte all-in-one)
+Layer 5: text_encoder module (base provides default; family overrides chat-template)
          ──────────────────────────────────────────
-         modules/<family>/text_embed/  (tokenizer asset lives here)
+         base module:    modules/base/text_encoder/  (default impl: split-conversation
+                                                      + tokenize + wte + segment-split output)
+         family module:  modules/<family>/text_encoder/  (inherits base; tokenizer asset
+                                                          lives here; only overrides
+                                                          chat-template details)
          pre_forward: collator helper to gather batch
-         forward (single pass):
+         forward.encode (single pass):
            1. for each sample, walk conversation_list (now containing boundary
               markers from layer 4) and apply this family's chat template:
               - system / user / assistant role prefixes
@@ -86,17 +90,30 @@ Layer 5: text_embed module (model-specific; chat-template + tokenize + wte all-i
            2. compute labels (image/audio segments → -100; text segments use
               from_assistant + loss_mask)
            3. compute attention_mask
-           4. wte → inputs_embeds
-           5. SP slice (input_ids / inputs_embeds / labels / attention_mask)
-         return: {input_ids, inputs_embeds, labels, attention_mask}
+           4. wte → flat inputs_embeds (each modality item still 1 placeholder slot)
+           5. SPLIT: emit a NEW conversation_list, sliced by the original item
+              boundaries. Each segment carries:
+                {type, value: <Tensor (L_seg, D)>, from_assistant, loss_mask}
+              text segment value = wte embeddings of all its tokens (multi-token)
+              modality segment value = 1 placeholder embedding (single-token tensor)
+              boundary marker segment value = 1 marker token embedding
+           6. SP slice (input_ids / inputs_embeds / labels / attention_mask)
+         return: {
+           conversation_list (split, value=embeds segments),
+           input_ids, inputs_embeds (flat), labels, attention_mask,
+         }
 
 Layer 6: backbone (JanusLlama / QwenOmniThinker / ...)
          ──────────────────────────────────────────
          pre_forward:
-           1. multi-modal splice: each single placeholder → N patch tokens
-              (image_embeds from layer 4, placeholders from layer 5)
-           2. lock-step splice labels (-100 for image segments) /
-              attention_mask (1) / input_ids notion
+           1. segment-driven splice: walk the SPLIT conversation_list:
+                - text/boundary segment: keep segment.value as-is
+                - image/audio/vq_image segment: replace its 1-token placeholder
+                  embedding with the upstream encoder's N patch tokens
+                  (matched by appearance order)
+              Then concat all segments → final inputs_embeds.
+           2. regenerate labels (-100 for image segments) and attention_mask (1)
+              from segment metadata
            3. compute_position_ids on post-splice length
            4. final SP pad_and_slice
          forward → hidden_states
@@ -104,15 +121,16 @@ Layer 6: backbone (JanusLlama / QwenOmniThinker / ...)
 ```
 
 Key invariants:
-- **conversation_list is the ONLY raw_batch field at entry**. All other fields (input_ids, image_embeds, attention_mask, labels, position_ids, hidden_states) are produced by modules during forward and written back into raw_batch via return dicts.
-- **Each module owns its token concatenation + boundary injection**. text_embed assembles system prompt + EOS + role markers; ViT writes `boi`/`eoi` into conversation_list; audio writes `audio_bos`/`audio_eos`. There is no chat-template helper, no global image_pattern registry.
-- **Two length transitions in forward**: (a) text_embed produces "1 placeholder per image" input_ids; (b) backbone splice expands placeholders to N patch tokens. labels / attention_mask / position_ids are realigned in lock-step at each transition.
-- **Graph topology auto-orders modules**: ViT/VAE write `conversation_list`, text_embed reads `conversation_list`, so topological sort places ViT/VAE before text_embed; text_embed writes `inputs_embeds`, backbone reads `inputs_embeds`, so text_embed lands before backbone. **No explicit ordering edges needed.**
+- **conversation_list is the ONLY raw_batch field at entry**. All other fields (input_ids, image_embeds, attention_mask, labels, position_ids, hidden_states) are produced by modules during forward and written back into raw_batch via return dicts. **(Exception: offline-embedding training — see "Offline Embedding" section in design.md — has a different raw_batch entry shape because the dataset itself is a pickle of pre-computed tensors.)**
+- **Each module owns its token concatenation + boundary injection**. text_encoder assembles system prompt + EOS + role markers + emits the split-conversation output; ViT writes `boi`/`eoi` into conversation_list; audio writes `audio_bos`/`audio_eos`. There is no chat-template helper, no global image_pattern registry.
+- **Two transformations of conversation_list in forward**: (a) Layer 4 ViT/VAE INSERT marker items; (b) Layer 5 text_encoder SPLITS the list and replaces item.value with embedding-segment tensors; (c) Layer 6 backbone collapses the split list into flat inputs_embeds via segment-driven splice. labels / attention_mask / position_ids are computed at Layers 5 and 6.
+- **Backbone splice is segment-order driven, NOT token-id-position driven**: don't scan input_ids for placeholder positions; iterate segments and replace each modality segment's placeholder embedding with the corresponding ViT/VAE output (by appearance order). No `image_pos` / `und_image_pos` index fields needed.
+- **Graph topology auto-orders modules**: ViT/VAE write `conversation_list`, text_encoder reads `conversation_list`, so topological sort places ViT/VAE before text_encoder; text_encoder writes the split `conversation_list` (and `inputs_embeds`), backbone reads the split `conversation_list`, so text_encoder lands before backbone. **No explicit ordering edges needed.**
 
 When adding a new modality:
 - Create a new encoder OmniModule with its processor (module-private asset under `modules/<family>/<encoder>/`).
 - In its forward, extract own-type items from `conversation_list`, encode, and inject `<modality>_bos` / `<modality>_eos` markers around each item.
-- The family's `text_embed` module must know the new boundary token strings (or you add a hook on `text_embed` that the new encoder calls during init to register its markers).
+- The family's `text_encoder` module must know the new boundary token strings (or you add a hook on `text_encoder` that the new encoder calls during init to register its markers).
 - Add an edge `<new_encoder> → <backbone>` so the backbone receives the new embeds for splice.
 - Extend the backbone's splice to handle the new modality's embeds and update `compute_position_ids` if the modality affects RoPE layout.
 
@@ -168,7 +186,7 @@ These rules are enforced by the framework. Violate them and you'll fight the des
    - `vqvae.decode(hidden, gt_token_ids=...)` → `gen_loss` (train).
    - `vqvae.decode(hidden_only)` → sample `vq_token_id` + lookup `embed` (inference).
    - `vqvae.decode(token_id=...)` → just lookup `embed` (inference feedback).
-6. **Backbone modules don't own vocab layers.** `embed_tokens` and `lm_head` belong to a separate `wte_lm_head` module (e.g. `janus_wte_lm_head`). The AR backbone consumes `inputs_embeds` and returns `hidden_states` only. Replace the HF model's internal `embed_tokens` with `nn.Identity()` after `from_config`. Filter `embed_tokens.*` and `lm_head.*` out of the backbone state dict in the split script.
+6. **Backbone modules don't own vocab layers.** `embed_tokens` and `lm_head` belong to a separate `text_encoder` module (e.g. `janus_text_encoder`). The AR backbone consumes `inputs_embeds` and returns `hidden_states` only. Replace the HF model's internal `embed_tokens` with `nn.Identity()` after `from_config`. Filter `embed_tokens.*` and `lm_head.*` out of the backbone state dict in the split script.
 7. **No orphan, no cycle.** Every node has at least one outgoing edge. If the node is a sink (e.g. produces only `*_loss`), add an explicit `{from: X, output: <loss>, to: end}` edge. Self-loops or any cycle are rejected by `TrainingGraph` construction (cycles in inference go in `generation_graph` only).
 8. **`training_graph` / `generation_graph` only list `edges`** (subset of `edges:` pool). Active nodes are the union of `from` / `to` endpoints. The execution order is derived by topo sort — never write it manually.
 9. **Loss collection is by `_loss` suffix (single key).** Each module's `forward` internally iterates all micro-batches; `post_forward` computes the token-level mean (sum_loss / sum_tokens) and emits a single scalar `<name>_loss`. `OmniModel.forward()` collects all `_loss`-suffixed scalars and sums them. **No `*_loss_token_count` companion key, no per-batch mean-then-mean** (which would batch-weight the loss when token counts vary). Loss is NOT routed via edges — `to: end` is just a topology marker.
@@ -176,20 +194,20 @@ These rules are enforced by the framework. Violate them and you'll fight the des
 11. **One module instance, possibly many nodes.** Same module under multiple node names is the canonical pattern for "encode + decode" or "round-trip" use cases. Parameters are shared; gradients accumulate naturally.
 12. **One module type, one instance per OmniModel.** RL scenarios with reference + actor models build two OmniModels; within a single OmniModel a model_type maps to exactly one `nn.Module`.
 13. **SP slicing is a backbone-internal concern.** SP `pad_and_slice` happens in the backbone's `pre_forward`; SP `gather` happens in its `post_forward`. Pre-LLM nodes (e.g. `tok_encode`) and post-LLM nodes (e.g. `tok_decode`, `vae_decode`) operate on full-length tensors — they are SP-agnostic.
-14. **Per-module checkpoint callback, per-module subfolder; tokenizer is per-module too.** Every module has its own `CheckpointCallback` writing to `<output_ckpt_dir>/<module_name>/{config.json, model.safetensors, [optional asset]}`. **All processors AND tokenizers stay per-module** (vision processor, image processor, audio feature extractor, AND the tokenizer → live inside their owning module's subfolder). The tokenizer specifically lives in the family's `text_embed` module (`<output_ckpt_dir>/<family>_text_embed/tokenizer/`). **OmniConfig has no top-level `tokenizer_path` field.** Pure DiT models without a text encoder have no tokenizer in their config at all.
+14. **Per-module checkpoint callback, per-module subfolder; tokenizer is per-module too.** Every module has its own `CheckpointCallback` writing to `<output_ckpt_dir>/<module_name>/{config.json, model.safetensors, [optional asset]}`. **All processors AND tokenizers stay per-module** (vision processor, image processor, audio feature extractor, AND the tokenizer → live inside their owning module's subfolder). The tokenizer specifically lives in the family's `text_encoder` module (`<output_ckpt_dir>/<family>_text_encoder/tokenizer/`). **OmniConfig has no top-level `tokenizer_path` field.** Pure DiT models without a text encoder have no tokenizer in their config at all.
 
 15. **raw_batch = single field `conversation_list` at entry; module-driven processing thereafter.** raw_batch is a mutable dict whose only initial key is `conversation_list` (`list[list[dict]]` of `{type, value, loss_mask, from_assistant}` items). All derived fields (input_ids, image_embeds, attention_mask, labels, position_ids, hidden_states, ...) are produced by modules during forward and written back into raw_batch via return dicts. `multimodal_transform.py` only does basic IO + resize (path → tensor into item.value) — no chat templating, no tokenization, no image processing. The same dataset can feed any ug model — chat template / tokenize / image processor / boundary marker injection are all owned by the relevant module.
 
-16. **Module forward = kwargs + Dict return; data flows 100% through raw_batch.** Each module's `forward(**kwargs) -> Dict[str, Any]` keeps the HF-compatible signature, but OmniModel **immediately writes the return dict back into raw_batch** (keyed by `edge.output`). Edges do **not** carry data to downstream modules — downstream reads the same `raw_batch` by its own input keys. Edges are dependency contracts and topology markers. Collator helpers and SP slicing are called **inside each module's `pre_forward`** for the fields it owns: ViT slices the image batch dim; text_embed slices the sequence dim. There is no global collator final-step and no global SP slice node.
+16. **Module forward = kwargs + Dict return; data flows 100% through raw_batch.** Each module's `forward(**kwargs) -> Dict[str, Any]` keeps the HF-compatible signature, but OmniModel **immediately writes the return dict back into raw_batch** (keyed by `edge.output`). Edges do **not** carry data to downstream modules — downstream reads the same `raw_batch` by its own input keys. Edges are dependency contracts and topology markers. Collator helpers and SP slicing are called **inside each module's `pre_forward`** for the fields it owns: ViT slices the image batch dim; text_encoder slices the sequence dim. There is no global collator final-step and no global SP slice node.
 
 17. **Sampling state (incl. CFG) is per-request runtime ctx, not graph state.** `temperature` / `top_p` / `cfg_weight` and friends are passed via `OmniModel.generate(request, *, sampling: dict)` and written into `ctx` (which **is** the mutable raw_batch during inference), alongside `past_key_values`. Backbones consume them locally:
     - **CFG** is a backbone-private batch-axis mechanism. When `cfg_weight != 1.0`, the backbone calls its own `build_cfg_uncond_inputs` hook, replicates `inputs_embeds` / `attention_mask` / `position_ids` to 2× along the batch dim (even rows = cond, odd rows = uncond), runs forward, splits logits, merges via `uncond + cfg_weight * (cond - uncond)`, samples, and feeds the next token back as 2× along batch. FSM / graph see batch=1× (= `parallel_size`). When the FSM exits `image_vq` state, the backbone discards the 2× KV cache (consistent with #13 "KV cache is module-managed").
-    - **`build_cfg_uncond_inputs`** is an optional `OmniModule` hook. Default raises `NotImplementedError` — backbones that don't implement it are not allowed to receive `cfg_weight != 1.0` (generate-time validation throws `ValueError`). Pad / boundary token ids needed for uncond construction are taken from the backbone's tokenizer reference (typically borrowed from sibling `text_embed` module via `set_tokenizer`).
+    - **`build_cfg_uncond_inputs`** is an optional `OmniModule` hook. Default raises `NotImplementedError` — backbones that don't implement it are not allowed to receive `cfg_weight != 1.0` (generate-time validation throws `ValueError`). Pad / boundary token ids needed for uncond construction are taken from the backbone's tokenizer reference (typically borrowed from sibling `text_encoder` module via `set_tokenizer`).
     - **`parallel_size`** is a backbone module's `PretrainedConfig` field (NOT a sampling parameter), and is **only supported in T2I mode** (`infer_t2i.yaml`). Interleave / understanding inference must run with `parallel_size = 1` because batch-dim expansion is incompatible with switching back to text states. The same `parallel_size` must be configured on the AR backbone and the VQ codec (e.g. `JanusLlama` and `JanusVQVAE`); `OmniModel` validates this at build time.
 
     **Status**: target contract; current code does not yet implement inference CFG or `parallel_size`. To be implemented feature-by-feature.
 
-18. **Token concatenation / boundary markers / chat template all live in the relevant module.** text_embed (per family, in `modules/<family>/text_embed/`) owns the family's chat template implementation, tokenizer asset, and produces `input_ids` / `inputs_embeds` / `labels` / `attention_mask` from `conversation_list`. ViT / VAE inject `boi`/`eoi` items into `conversation_list` during their forward. Audio encoders inject `audio_bos`/`audio_eos`. **There is no `chat_template` module, no top-level chat-template helper, no global image_pattern registry.** Each family's chat template lives in its own `modules/<family>/text_embed/modeling.py`. The two length transitions during forward — text_embed producing "1 placeholder per image" input_ids and backbone splice expanding placeholders to N patch tokens — both realign labels / attention_mask / position_ids in lock-step (the second by the backbone, see "Backbone pre_forward 完成多模态 splice + 长度对齐" and "Position IDs" sections in `design.md`).
+18. **Token concatenation / boundary markers / chat template all live in the relevant module.** text_encoder (base in `modules/base/text_encoder/`, family-specific in `modules/<family>/text_encoder/` inherits base) owns the family's chat template implementation, tokenizer asset, and produces `input_ids` / `labels` / `attention_mask` plus a **split conversation_list whose item.value is the embedding segment** (text segment = multi-token wte embeddings; modality / boundary segment = single-token placeholder embedding). ViT / VAE inject `boi`/`eoi` items into `conversation_list` during their forward. Audio encoders inject `audio_bos`/`audio_eos`. **There is no `chat_template` module, no top-level chat-template helper, no global image_pattern registry.** The backbone collapses the split conversation_list into flat `inputs_embeds` via segment-order-driven splice (replace each modality segment's placeholder embedding with N patch tokens from upstream ViT/VAE; concat). labels / attention_mask / position_ids are realigned at this final splice step.
 
 ## Phase 1 — Decide module shape and location
 
@@ -199,7 +217,7 @@ Pick the closest existing pattern; copy its file structure and signatures.
 |---|---|---|---|
 | Pure encoder | `forward = encode` | `JanusSiglip` | `modules/<family>/` |
 | Codec (encode + decode) | `encode`, `decode`, `forward = encode` | `JanusVQVAE` | `modules/<family>/` |
-| Generic vocab head | `encode`, `decode`, `forward = encode` | `TextEmbed` (cross-family) | `modules/base/` |
+| Generic text encoder (chat-template + tokenize + wte + lm_head) | `encode`, `decode`, `forward = encode` | `TextEncoder` (base; family inherits) | `modules/base/text_encoder/` |
 | AR backbone (no vocab) | `forward`, `generate_step`, `pre_forward`/`post_forward` for SP | `JanusLlama` | `modules/<family>/` |
 | Diffusion | `forward = denoise_step`, `generate_step` (full denoise) | TBD | `modules/<family>/` |
 | Generic adapter (e.g. dim projection) | `forward` | `MLPAdapter` | `modules/base/` |
@@ -318,7 +336,7 @@ class BarFoo(PreTrainedModel, OmniModule):  # multi-inherit
 
 ### Optional `modules/<family>/processing_bar_foo.py`
 
-Only for modules that own a processor (vision processor, image processor, audio feature extractor). Modules that only own tokenizer (LLM backbones, wte_lm_head) skip this.
+Only for modules that own a processor (vision processor, image processor, audio feature extractor). Modules that only own tokenizer (LLM backbones, text_encoder) skip this.
 
 ### Patterns checklist
 
@@ -357,19 +375,19 @@ Only for modules that own a processor (vision processor, image processor, audio 
 If the new module's weights come from extracting a subset of an existing HuggingFace checkpoint, update `scripts/split_<family>.py`:
 
 1. Add a new output directory `<output_dir>/<sub_name>/`.
-2. Walk the source state dict and write only the keys that belong to this module (filter by prefix, e.g. `embed_tokens.*` for `wte_lm_head`).
+2. Walk the source state dict and write only the keys that belong to this module (filter by prefix, e.g. `embed_tokens.*` for `text_encoder`).
 3. Build a `BarFooConfig(...)` from the source HF config; call `config.save_pretrained(<output_dir>/<sub_name>/)`. This automatically writes `model_type` into `config.json`.
-4. **Remove those keys from any sibling module's state dict** to avoid duplication and strict-load failures (e.g. drop `embed_tokens.*` and `lm_head.*` from the AR backbone's state dict when extracting `wte_lm_head`).
+4. **Remove those keys from any sibling module's state dict** to avoid duplication and strict-load failures (e.g. drop `embed_tokens.*` and `lm_head.*` from the AR backbone's state dict when extracting `text_encoder`).
 5. Save the asset (if any) to the same subfolder via the appropriate `save_pretrained` (e.g. `image_processor.save_pretrained(<output_dir>/<sub_name>/)`).
 6. Print the new `weights_path` in the final summary so the YAML can be updated by copy-paste.
 
-The `text_embed` extraction in `scripts/split_janus.py` (especially the `tie_word_embeddings`-aware lm_head save) is the reference.
+The `text_encoder` extraction in `scripts/split_janus.py` (especially the `tie_word_embeddings`-aware lm_head save) is the reference.
 
 ## Phase 5 — Wire into the YAML graph
 
 ### YAML organisation: training file vs. inference file(s)
 
-V2 splits configuration into a master **training YAML** and one or more **inference YAMLs** under `configs/seed_omni/<model>/`. The training YAML carries the master vocabulary (`modules`, `nodes`, `edges`, `training_graph` — including any inference-only nodes / edges); each inference YAML carries **only** a `generation_graph` block for one inference scenario. **There is no top-level `tokenizer_path`** — the tokenizer asset lives in the family's `text_embed` module subfolder.
+V2 splits configuration into a master **training YAML** and one or more **inference YAMLs** under `configs/seed_omni/<model>/`. The training YAML carries the master vocabulary (`modules`, `nodes`, `edges`, `training_graph` — including any inference-only nodes / edges); each inference YAML carries **only** a `generation_graph` block for one inference scenario. **There is no top-level `tokenizer_path`** — the tokenizer asset lives in the family's `text_encoder` module subfolder.
 
 ```
 configs/seed_omni/janus_1.3b/
@@ -404,7 +422,7 @@ Naming conventions:
 
 Editing `train_<scope>.yaml`:
 
-1. **`modules:`** — add an entry with `weights_path` (or `config_path`) and any module-specific knobs (`freeze`, `gradient_checkpointing`, etc). **Don't write `model_type`** — it's read from the config.json at the path. The tokenizer (if needed) sits inside one of the modules' subfolders, typically `<family>_text_embed/tokenizer/`.
+1. **`modules:`** — add an entry with `weights_path` (or `config_path`) and any module-specific knobs (`freeze`, `gradient_checkpointing`, etc). **Don't write `model_type`** — it's read from the config.json at the path. The tokenizer (if needed) sits inside one of the modules' subfolders, typically `<family>_text_encoder/tokenizer/`.
 
    ```yaml
    modules:
@@ -509,16 +527,17 @@ Visual sanity:
 - **Edge `output:` mismatch**: if the source node returns `{"embeds": ...}` but the edge says `output: embed`, the route silently drops to `None`. Always grep the source node's return dict for the exact key.
 - **Cycle in `training_graph.edges`**: any feedback edge (e.g. `vae_decode_to_llama`) accidentally listed in `training_graph` will fail topo sort. Feedback edges belong only in `generation_graph` state bodies.
 - **Missing `to: end` for a sink**: produces a graph orphan. The framework will reject it; add the sink edge even if loss is collected by suffix.
-- **Backbone holding vocab layers**: AR LLM modules must NOT own `embed_tokens` / `lm_head` after migration. Replace internal `embed_tokens` with `nn.Identity()` after `from_config`, route `inputs_embeds` from a sibling `wte_lm_head` node. Filter `embed_tokens.*` and `lm_head.*` out of the backbone's state dict in the split script.
+- **Backbone holding vocab layers**: AR LLM modules must NOT own `embed_tokens` / `lm_head` after migration. Replace internal `embed_tokens` with `nn.Identity()` after `from_config`, route `inputs_embeds` from a sibling `text_encoder` node. Filter `embed_tokens.*` and `lm_head.*` out of the backbone's state dict in the split script.
 - **Per-batch mean then outer mean**: this batch-weights the loss when token counts vary, causing silent quality regressions. Invariant 9 — loop micro-batches inside the module, sum loss + sum tokens, divide once. Emit a single scalar `<name>_loss`. OmniModel just sums; never expect a `*_loss_token_count` companion key.
 - **Forgetting to update `MODULE_MIXIN_REGISTRY`**: instantiation will fail with "unknown model_type" — register before running any config that references the new module.
 - **Mixing `nodes` and `edges` fields in a single YAML entry**: the parser rejects entries with both `module:` and `from:` keys. Each entry belongs to exactly one pool.
 - **Skipping `pre_forward`/`post_forward` for SP-capable modules**: backbones that use SP must slice in their `pre_forward` and gather in their `post_forward`. Sibling pre/post-LLM modules are SP-agnostic and stay full-length.
 - **Writing `model_type` in YAML modules**: invariant 3 — YAML only declares paths. `model_type` lives in `configuration_xxx.py` and is read automatically.
-- **Adding a top-level `tokenizer_path`**: V2 has no such field. Tokenizer is per-module (lives inside `text_embed` module's subfolder). Pure DiT models without text encoder have no tokenizer in their config.
+- **Adding a top-level `tokenizer_path`**: V2 has no such field. Tokenizer is per-module (lives inside `text_encoder` module's subfolder). Pure DiT models without text encoder have no tokenizer in their config.
 - **Returning `{}` for missing inputs instead of dummy forward**: invariant 10 — empty dict breaks FSDP backward; build dummy tensors and run the full path.
-- **Looking up `raw_batch["input_ids"]` at OmniModel entry**: V2 entry-time raw_batch contains only `conversation_list`. `input_ids` is produced by `text_embed.forward` later in the pipeline — modules consuming `input_ids` (e.g. backbone splice) must depend on edges that route `text_embed`'s output, not raw_batch directly.
-- **Putting chat templating / tokenization into `multimodal_transform.py`**: in V2, that file does basic IO + resize only. Chat template + tokenize live in `text_embed.forward` (per family). Image processing lives in vision encoder modules. Putting them in the data layer breaks model-agnostic data.
+- **Looking up `raw_batch["input_ids"]` at OmniModel entry**: V2 entry-time raw_batch contains only `conversation_list`. `input_ids` is produced by `text_encoder.forward` later in the pipeline — modules consuming `input_ids` (e.g. backbone splice) must depend on edges that route `text_encoder`'s output, not raw_batch directly.
+- **Backbone scanning `input_ids` for placeholder positions**: V2 backbone splice is segment-order driven — iterate the split conversation_list (output of text_encoder) and replace each modality segment's placeholder embedding with N patch tokens. Don't add `image_pos` / `und_image_pos` index fields (V1 leftover).
+- **Putting chat templating / tokenization into `multimodal_transform.py`**: in V2, that file does basic IO + resize only. Chat template + tokenize live in `text_encoder.forward` (per family). Image processing lives in vision encoder modules. Putting them in the data layer breaks model-agnostic data.
 
 ## When to use this skill vs. siblings
 
