@@ -144,8 +144,6 @@ def test_janus_llama_save_reload_via_registry(tmp_path: Path):
 
     cfg = JanusLlamaConfig.from_pretrained(tmp_path)
     assert cfg.model_type == "janus_llama"
-    # HF Janus 1.3B uses 100581 for the image token (understanding+generation).
-    assert cfg.image_token_id == 100581
 
     jl2 = JanusLlama.from_pretrained(tmp_path)
     assert isinstance(jl2, JanusLlama)

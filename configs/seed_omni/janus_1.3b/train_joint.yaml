@@ -69,13 +69,13 @@ modules:
     weights_path: /mnt/hdfs/veomni/models/seed_omni/janus_1.3b/text_encoder
     # `vocab_size` / `hidden_size` / `tie_word_embeddings` come from
     # `text_encoder/config.json` (written by `scripts/split_janus.py`).
-    # The split script also writes `begin_of_image_token_id` /
-    # `end_of_image_token_id` read from the actual tokenizer.
+    # `begin_of_image_token_id` / `end_of_image_token_id` are resolved at
+    # runtime from the module tokenizer (not stored in config.json).
 
   janus_llama:
     weights_path: /mnt/hdfs/veomni/models/seed_omni/janus_1.3b/janus_llama
-    # `image_token_id` / `gen_image_token_id` come from janus_llama/config.json
-    # (Janus 1.3B uses 100581 for both understanding and generation slots).
+    # `image_token_id` / `gen_image_token_id` are resolved at runtime from
+    # the module tokenizer (not stored in config.json).
 
 # NOTE: ``micro_batch_size`` / DP / SP / TP / CP knobs are **not** per-module
 # in V2 — they live globally under ``train.*`` in the launcher YAML

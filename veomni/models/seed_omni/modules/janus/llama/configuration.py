@@ -9,13 +9,11 @@ can copy it verbatim.
 Adds two Janus-specific token IDs at the top level:
 
 * ``image_token_id``      — placeholder for understanding image patches
-                             (HF Janus default ``100581``; same field as
+                             (runtime, via tokenizer; same field as
                              :class:`transformers.JanusConfig.image_token_id`).
 * ``gen_image_token_id``  — placeholder for generation image patches
-                             (Janus uses the same id ``100581`` for both
-                             understanding and generation positions; we
-                             keep the field separate so a derived model
-                             with distinct slots can override it).
+                             (runtime, via tokenizer; kept separate so a
+                             derived model with distinct slots can override).
 
 The ``model_type`` literal here is the lookup key for
 ``OMNI_CONFIG_REGISTRY`` / ``OMNI_MODEL_REGISTRY``.
@@ -34,11 +32,7 @@ class JanusLlamaConfig(PretrainedConfig):
     def __init__(
         self,
         text_config: Optional[Dict[str, Any]] = None,
-        image_token_id: int = 100581,
-        gen_image_token_id: int = 100581,
         **kwargs,
     ):
         self.text_config = text_config or {}
-        self.image_token_id = image_token_id
-        self.gen_image_token_id = gen_image_token_id
         super().__init__(**kwargs)

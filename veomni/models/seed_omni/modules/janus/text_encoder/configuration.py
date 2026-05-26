@@ -4,8 +4,8 @@ Specialises :class:`TextEncoderConfig` with the two Janus-specific boundary
 token ids that the model is responsible for emitting around a VQ image
 span:
 
-* ``begin_of_image_token_id``  — :code:`<begin_of_image>` (default ``100016``).
-* ``end_of_image_token_id``    — :code:`<end_of_image>`   (default ``100593``).
+* ``begin_of_image_token_id``  — :code:`<begin_of_image>` (runtime, via tokenizer).
+* ``end_of_image_token_id``    — :code:`<end_of_image>`   (runtime, via tokenizer).
 
 Why a Janus-specific subclass?
 ------------------------------
@@ -26,19 +26,12 @@ from ...base.text_encoder.configuration import TextEncoderConfig
 class JanusTextEncoderConfig(TextEncoderConfig):
     """TextEncoder config + Janus image-boundary token ids.
 
-    Defaults are the Janus-1.3B tokenizer values; ``scripts/split_janus.py``
-    re-reads them from the actual tokenizer and writes the result into
-    ``config.json`` so reloads are checkpoint-faithful.
+    ``begin_of_image_token_id`` / ``end_of_image_token_id`` are **not**
+    constructor parameters — they are resolved at runtime when the module
+    tokenizer is wired in (``set_tokenizer`` → tokenizer ``post_init``).
     """
 
     model_type = "janus_text_encoder"
 
-    def __init__(
-        self,
-        begin_of_image_token_id: int = 100016,
-        end_of_image_token_id: int = 100593,
-        **kwargs,
-    ) -> None:
-        self.begin_of_image_token_id = begin_of_image_token_id
-        self.end_of_image_token_id = end_of_image_token_id
+    def __init__(self, **kwargs) -> None:
         super().__init__(**kwargs)

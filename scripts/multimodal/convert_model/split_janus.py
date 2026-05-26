@@ -46,8 +46,8 @@ these; emitting them is a model concern).  We use
 :class:`JanusTextEncoder` (model_type ``janus_text_encoder``) — a thin
 subclass of :class:`TextEncoder` that adds ``emit_image_start`` /
 ``emit_image_end`` call-site methods plus the two boundary token ids.
-The split script reads the actual boi/eoi ids from the tokenizer so the
-checkpoint stays self-describing.
+Boundary / placeholder token ids are resolved at runtime from the module
+tokenizer (not stored in ``config.json``).
 """
 
 import argparse
@@ -55,7 +55,9 @@ import os
 import shutil
 
 import torch
+
 from veomni.models.seed_omni.modules.janus.convert_janus_weight_to_hf import convert_model
+
 
 def _save_state_dict(state_dict: dict, output_dir: str) -> None:
     """Save a state dict as safetensors (falling back to .pt if unavailable)."""
@@ -67,24 +69,6 @@ def _save_state_dict(state_dict: dict, output_dir: str) -> None:
     except ImportError:
         torch.save(state_dict, os.path.join(output_dir, "pytorch_model.bin"))
         print("  [warn] safetensors not available; saved as pytorch_model.bin")
-
-
-def _resolve_token_id(tokenizer, candidates, default: int) -> int:
-    """Look up a special-token id by trying each candidate name.
-
-    ``candidates`` is an iterable of candidate token *strings* (or
-    ``None``); the first one that resolves to a non-``unk`` id wins.
-    Falls back to ``default`` if none match — keeping the script
-    robust against tokenizer changes upstream.
-    """
-    unk = getattr(tokenizer, "unk_token_id", None)
-    for cand in candidates:
-        if not cand:
-            continue
-        tid = tokenizer.convert_tokens_to_ids(cand)
-        if tid is not None and tid != unk:
-            return int(tid)
-    return default
 
 
 def split_janus(model_path: str, output_dir: str) -> None:
@@ -111,20 +95,7 @@ def split_janus(model_path: str, output_dir: str) -> None:
     model.eval()
     cfg = model.config
     inner = model.model
-
-    # Pull the boundary-token ids straight from the tokenizer's special
-    # tokens — Janus uses ``<begin_of_image>`` (boi) and ``<end_of_image>``
-    # (eoi) to delimit a VQ image span.  Storing them in the
-    # JanusTextEncoderConfig keeps the checkpoint self-describing so the
-    # FSM yaml doesn't need to hard-code vocabulary specifics.
-    
-    import ipdb;ipdb.set_trace()
-    tokenizer = AutoTokenizer.from_pretrained(model_path)
-    boi_id = _resolve_token_id(tokenizer, ("<begin_of_image>", getattr(tokenizer, "boi_token", None)), default=100016)
-    eoi_id = _resolve_token_id(tokenizer, ("<end_of_image>", getattr(tokenizer, "eoi_token", None)), default=100593)
-    image_token_id = getattr(cfg, "image_token_id", 100581)
-    print(f"  tokenizer boi={boi_id}  eoi={eoi_id}  image_token={image_token_id}")
-
+    # import ipdb; ipdb.set_trace()
     # ── 1. janus_siglip (vision_model + aligner) ────────────────────────────
     print("Extracting janus_siglip ...")
     vision_cfg_dict = cfg.vision_config.to_dict() if hasattr(cfg.vision_config, "to_dict") else vars(cfg.vision_config)
@@ -180,7 +151,7 @@ def split_janus(model_path: str, output_dir: str) -> None:
     # owns the boi/eoi emitter methods used by the inference FSM bridge
     # states.  The config is a JanusTextEncoderConfig — vocab_size /
     # hidden_size / tie_word_embeddings come from the original LLaMA
-    # config; boi/eoi come from the tokenizer.
+    # config; boi/eoi ids are resolved at runtime from the module tokenizer.
     print("Extracting text_encoder (as janus_text_encoder) ...")
     text_cfg = cfg.text_config
     text_cfg_dict = text_cfg.to_dict() if hasattr(text_cfg, "to_dict") else vars(text_cfg)
@@ -191,8 +162,6 @@ def split_janus(model_path: str, output_dir: str) -> None:
         tie_word_embeddings=tie,
         # LLaMA / Janus convention: lm_head has no bias.
         lm_head_bias=False,
-        begin_of_image_token_id=boi_id,
-        end_of_image_token_id=eoi_id,
     )
     te = JanusTextEncoder(te_cfg)
     te.embed_tokens.load_state_dict(inner.language_model.embed_tokens.state_dict())
@@ -202,15 +171,11 @@ def split_janus(model_path: str, output_dir: str) -> None:
 
     te_dir = os.path.join(output_dir, "text_encoder")
     te.save_pretrained(te_dir, safe_serialization=True)
-    print(f"  saved → {te_dir} (tie_word_embeddings={tie}, boi={boi_id}, eoi={eoi_id})")
+    print(f"  saved → {te_dir} (tie_word_embeddings={tie})")
 
     # ── 4. janus_llama (LlamaModel backbone, no embed_tokens / no lm_head) ─
     print("Extracting janus_llama ...")
-    llama_cfg = JanusLlamaConfig(
-        text_config=text_cfg_dict,
-        image_token_id=image_token_id,
-        gen_image_token_id=image_token_id,
-    )
+    llama_cfg = JanusLlamaConfig(text_config=text_cfg_dict)
     llama = JanusLlama(llama_cfg)
     src = inner.language_model.state_dict()
     src = {k: v for k, v in src.items() if not k.startswith("embed_tokens.")}
@@ -226,6 +191,7 @@ def split_janus(model_path: str, output_dir: str) -> None:
     tok_dir = os.path.join(output_dir, "tokenizer")
     os.makedirs(tok_dir, exist_ok=True)
     try:
+        tokenizer = AutoTokenizer.from_pretrained(model_path)
         tokenizer.save_pretrained(tok_dir)
     except Exception:  # noqa: BLE001
         # Fall back to a raw file copy (covers tokenizers that don't round-trip
