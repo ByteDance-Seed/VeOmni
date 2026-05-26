@@ -64,23 +64,24 @@ expose specialised inference routines.
       Ordered list of ``{condition: ..., next_state: S}`` items checked after
       every iteration.  First matching condition wins.  Supported conditions:
 
-        ``{type: token_match, token_id: T}``
-            Fires when ``context["last_token_id"] == T``.
-
         ``{type: steps_complete}``
             Fires when the current state has run its allotted iterations.
             Useless on a ``token_length: variable`` state (steps_done never
             reaches ``None``).
 
-        ``{type: ctx_flag, key: K}``
-            Fires when ``context[K]`` is truthy.  Used by states that loop
-            until a *module* declares completion — the module writes
-            ``ctx[K] = True`` from inside its ``generate_step`` (e.g. a VQ
-            decoder emits ``image_complete = True`` after the final patch
-            of a 24×24 grid; an audio codec emits ``audio_complete = True``
-            on EOS-of-audio).  The framework **auto-clears** ``ctx[K]``
-            once the transition fires so a stale flag never leaks into the
-            next state.  Pair with ``token_length: variable``.
+        ``{type: module_signal, key: K}``  (alias: ``ctx_flag``)
+            Fires when ``context[K]`` is truthy.  Modules write one-shot
+            boolean signals into ``ctx`` from inside ``generate_step`` /
+            ``decode`` — e.g. ``JanusTextEncoder.decode`` sets
+            ``start_image_gen`` / ``text_done`` after sampling; a VQ decoder
+            sets ``image_complete`` on the final patch.  The framework
+            **auto-clears** ``ctx[K]`` once the transition fires.  Pair
+            with ``token_length: variable``.  The FSM never inspects raw
+            token ids — vocabulary semantics stay inside the module.
+
+        ``{type: token_match, token_id: T}``  *(deprecated)*
+            Legacy: fires when ``context["last_token_id"] == T``.  Prefer
+            ``module_signal`` so token ids are not duplicated in YAML.
 
         ``{type: always}``
             Unconditional — useful as a fallback / terminal transition.
@@ -118,14 +119,15 @@ DONE_STATE_NAME: str = "done"
 # ── Condition helpers ─────────────────────────────────────────────────────────
 
 
-_KNOWN_CONDITION_TYPES = frozenset({"token_match", "steps_complete", "ctx_flag", "always"})
+_KNOWN_CONDITION_TYPES = frozenset({"token_match", "steps_complete", "module_signal", "ctx_flag", "always"})
+_MODULE_SIGNAL_TYPES = frozenset({"module_signal", "ctx_flag"})
 
 
 @dataclass
 class _Condition:
     type: str
     token_id: Optional[int] = None
-    key: Optional[str] = None  # used by ctx_flag
+    key: Optional[str] = None  # used by module_signal / ctx_flag
 
     def __post_init__(self) -> None:
         # Catch malformed YAML at FSM build time, not at first transition
@@ -134,11 +136,11 @@ class _Condition:
             raise ValueError(f"Unknown FSM condition type '{self.type}'. Supported: {sorted(_KNOWN_CONDITION_TYPES)}.")
         if self.type == "token_match" and self.token_id is None:
             raise ValueError("Condition `token_match` requires `token_id`.")
-        if self.type == "ctx_flag" and not self.key:
-            raise ValueError("Condition `ctx_flag` requires a non-empty `key`.")
+        if self.type in _MODULE_SIGNAL_TYPES and not self.key:
+            raise ValueError(f"Condition `{self.type}` requires a non-empty `key`.")
         if self.type != "token_match" and self.token_id is not None:
             raise ValueError(f"Condition `{self.type}` does not accept `token_id`.")
-        if self.type != "ctx_flag" and self.key is not None:
+        if self.type not in _MODULE_SIGNAL_TYPES and self.key is not None:
             raise ValueError(f"Condition `{self.type}` does not accept `key`.")
 
     def check(self, context: Dict[str, Any], steps_done: int, total_steps: Optional[int]) -> bool:
@@ -146,7 +148,7 @@ class _Condition:
             return context.get("last_token_id") == self.token_id
         if self.type == "steps_complete":
             return total_steps is not None and steps_done >= total_steps
-        if self.type == "ctx_flag":
+        if self.type in _MODULE_SIGNAL_TYPES:
             return bool(context.get(self.key))
         if self.type == "always":
             return True
@@ -155,8 +157,8 @@ class _Condition:
     def describe(self) -> str:
         if self.type == "token_match":
             return f"token_match({self.token_id})"
-        if self.type == "ctx_flag":
-            return f"ctx_flag({self.key})"
+        if self.type in _MODULE_SIGNAL_TYPES:
+            return f"module_signal({self.key})"
         return self.type
 
 
@@ -520,9 +522,9 @@ class GenerationGraph:
 
         Returns True if a transition fired (state changed).
 
-        For ``ctx_flag`` transitions the matched key is popped from
-        ``context`` *after* logging the trace and *before* the state
-        switch — this keeps a one-shot signal from re-firing the same
+        For ``module_signal`` / ``ctx_flag`` transitions the matched key is
+        popped from ``context`` *after* logging the trace and *before* the
+        state switch — this keeps a one-shot signal from re-firing the same
         transition (or unintentionally firing a transition with the same
         flag in the next state).
         """
@@ -531,7 +533,7 @@ class GenerationGraph:
             if trans.condition.check(context, self._steps_in_state, self._total_steps):
                 if trace is not None:
                     trace.append(f"transition: {state.name} -> {trans.next_state} [{trans.condition.describe()}]")
-                if trans.condition.type == "ctx_flag" and trans.condition.key is not None:
+                if trans.condition.type in _MODULE_SIGNAL_TYPES and trans.condition.key is not None:
                     context.pop(trans.condition.key, None)
                 self._transition_to(trans.next_state, context)
                 return True
@@ -582,7 +584,7 @@ class GenerationGraph:
           "如果没有次数限制那就不写数字".
 
         State transitions are thick arrows (``==>``) carrying the firing
-        condition (e.g. ``token_match(100016)``, ``steps_complete``).
+        condition (e.g. ``module_signal(start_image_gen)``, ``steps_complete``).
         The line weight + simpler label distinguishes them visually from
         the intra-body data edges.
 

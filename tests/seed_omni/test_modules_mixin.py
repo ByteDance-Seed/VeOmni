@@ -182,14 +182,14 @@ def test_janus_text_encoder_emit_methods_return_expected_shapes():
     JanusTextEncoder = _model_cls("janus_text_encoder")
     JanusTextEncoderConfig = _config_cls("janus_text_encoder")
 
-    cfg = JanusTextEncoderConfig(
-        vocab_size=128,
-        hidden_size=16,
-        tie_word_embeddings=True,
-        begin_of_image_token_id=42,
-        end_of_image_token_id=43,
-    )
+    cfg = JanusTextEncoderConfig(vocab_size=128, hidden_size=16, tie_word_embeddings=True)
     jte = JanusTextEncoder(cfg)
+
+    class _MockTokenizer:
+        def convert_tokens_to_ids(self, token: str) -> int:
+            return {"<begin_of_image>": 42, "<end_of_image>": 43}[token]
+
+    jte.set_tokenizer(_MockTokenizer())
 
     # No batch_size hint in ctx → defaults to 1.
     out = jte.emit_image_start()
@@ -204,6 +204,39 @@ def test_janus_text_encoder_emit_methods_return_expected_shapes():
     assert (out["input_ids"] == 43).all()
     assert out["last_token_id"].shape == (3,)
     assert out["inputs_embeds"].shape == (3, 1, 16)
+
+
+def test_janus_text_encoder_decode_emits_module_signals():
+    """``decode`` writes one-shot FSM ``module_signal`` keys for boi / eos."""
+    JanusTextEncoder = _model_cls("janus_text_encoder")
+    JanusTextEncoderConfig = _config_cls("janus_text_encoder")
+
+    cfg = JanusTextEncoderConfig(vocab_size=128, hidden_size=16, tie_word_embeddings=False)
+    jte = JanusTextEncoder(cfg)
+
+    class _MockTokenizer:
+        eos_token_id = 2
+
+        def convert_tokens_to_ids(self, token: str) -> int:
+            return {"<begin_of_image>": 42, "<end_of_image>": 43}[token]
+
+    jte.set_tokenizer(_MockTokenizer())
+
+    h = torch.ones(1, 1, 16)
+    jte.lm_head.weight.data.zero_()
+
+    jte.lm_head.weight.data[42] = 1.0
+    out = jte.decode(hidden_states=h)
+    assert out["last_token_id"].item() == 42
+    assert out["start_image_gen"] is True
+    assert "text_done" not in out
+
+    jte.lm_head.weight.data.zero_()
+    jte.lm_head.weight.data[2] = 1.0
+    out = jte.decode(hidden_states=h)
+    assert out["last_token_id"].item() == 2
+    assert out["text_done"] is True
+    assert "start_image_gen" not in out
 
 
 # ── Mixin call-site contracts (loss key, shapes) ──────────────────────────────
@@ -371,7 +404,7 @@ def test_janus_train_yaml_loads_with_v2_module_names():
 
     cfg = OmniConfig.from_yamls(_janus_cfg_dir() / "train.yaml")
 
-    assert set(cfg.modules) == {"janus_siglip", "janus_vqvae", "janus_llama", "text_encoder"}
+    assert set(cfg.modules) == {"janus_siglip", "janus_vqvae", "janus_llama", "janus_text_encoder"}
     assert cfg.modules["janus_siglip"]["weights_path"] == "janus_siglip"
     # Sanity: every training-graph edge is declared in the edges pool.
     edge_names = set(cfg.edges)
@@ -395,7 +428,7 @@ def test_janus_train_plus_infer_merges_generation_graph(infer_yaml: str):
         _janus_cfg_dir() / infer_yaml,
     )
     # Training vocabulary still present.
-    assert set(cfg.modules) == {"janus_siglip", "janus_vqvae", "janus_llama", "text_encoder"}
+    assert set(cfg.modules) == {"janus_siglip", "janus_vqvae", "janus_llama", "janus_text_encoder"}
     # Generation graph painted on top.
     assert cfg.has_generation_graph()
     assert "states" in cfg.generation_graph
@@ -465,6 +498,6 @@ def test_from_launcher_resolves_relative_module_paths():
     root = "seed_omni/janus_1.3b"
     assert cfg.tokenizer_path == root
     assert cfg.modules["janus_siglip"]["weights_path"] == f"{root}/janus_siglip"
-    assert cfg.modules["text_encoder"]["weights_path"] == f"{root}/text_encoder"
+    assert cfg.modules["janus_text_encoder"]["weights_path"] == f"{root}/janus_text_encoder"
     assert cfg.has_generation_graph()
     assert cfg.generation_graph["initial"] == "prompt_to_image"

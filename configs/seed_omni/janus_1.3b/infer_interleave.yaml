@@ -8,9 +8,9 @@
 # Flow
 # ----
 #   text_ar
-#     ├─ token == </s>            → done
-#     ├─ token == <begin_of_image> → image_vq_start
-#     └─ otherwise                 → text_ar (continue)
+#     ├─ module_signal text_done       → done
+#     ├─ module_signal start_image_gen → image_vq_start
+#     └─ otherwise                     → text_ar (continue)
 #
 #   image_vq_start (1 step: emit <begin_of_image> + feed into LLM, run AR once)
 #     → image_vq
@@ -48,21 +48,22 @@ generation_graph:
         - tok_decode_sink
       token_length: { type: fixed, value: 1 }
       transitions:
-        - { condition: { type: token_match, token_id: 100001 }, next_state: done }   # </s> on first token
+        - { condition: { type: module_signal, key: text_done }, next_state: done }
         - { condition: { type: steps_complete }, next_state: text_ar }
 
     text_ar:
       # tok_encode → janus_llama → tok_decode (variable, until transition fires).
-      # tok_decode writes input_ids/last_token_id back into ctx so the next
-      # iteration's tok_encode reads them automatically.
+      # tok_decode writes input_ids back into ctx; JanusTextEncoder.decode
+      # also writes one-shot module_signal keys (start_image_gen / text_done)
+      # based on tokenizer semantics — the FSM never inspects token ids.
       body:
         - tok_enc_to_ar       # tok_encode  → janus_llama (inputs_embeds)
         - ar_to_tok_decode    # janus_llama → tok_decode  (hidden_states)
         - tok_decode_sink     # leaf
       token_length: { type: variable }
       transitions:
-        - { condition: { type: token_match, token_id: 100016 }, next_state: image_vq_start }   # <begin_of_image>
-        - { condition: { type: token_match, token_id: 100001 }, next_state: done }              # </s>
+        - { condition: { type: module_signal, key: start_image_gen }, next_state: image_vq_start }
+        - { condition: { type: module_signal, key: text_done }, next_state: done }
 
     image_vq_start:
       # Emit <begin_of_image>, feed it through janus_llama.  Single step:
@@ -86,7 +87,7 @@ generation_graph:
       # that embedding back into the next iteration's janus_llama call as
       # inputs_embeds.  On the final patch (e.g. 576-th of a 24×24 grid)
       # JanusVqvae.decode appends `image_complete=True` to its output dict,
-      # which lands in ctx and fires the ctx_flag transition below.  The
+      # which lands in ctx and fires the module_signal transition below.  The
       # framework auto-clears the flag on transition so it never stale-fires
       # in image_vq_end.
       body:
@@ -94,7 +95,7 @@ generation_graph:
         - vae_decode_to_ar    # vae_decode   → janus_llama   (embed → inputs_embeds)
       token_length: { type: variable }
       transitions:
-        - { condition: { type: ctx_flag, key: image_complete }, next_state: image_vq_end }
+        - { condition: { type: module_signal, key: image_complete }, next_state: image_vq_end }
 
     image_vq_end:
       # Emit <end_of_image>, run AR once on it.  Mirrors image_vq_start.

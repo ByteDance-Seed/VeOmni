@@ -44,6 +44,11 @@ import torch
 from veomni.models.seed_omni import OmniConfig, OmniModel
 
 from .print_modules import (
+    SIGNAL_START_IMAGE_GEN,
+    SIGNAL_TEXT_DONE,
+    TOK_BOI,
+    TOK_EOI,
+    TOK_EOS,
     PrintARBackbone,
     PrintTextEmbed,
     PrintVisionEncoder,
@@ -51,10 +56,7 @@ from .print_modules import (
 )
 
 
-# ── Special token ids used in the FSM transitions ────────────────────────────
-TOK_BOI = 100016  # <begin_of_image> — text_ar → image_vq_start
-TOK_EOI = 100593  # <end_of_image>   — emitted by emit_image_end
-TOK_EOS = 2  # text_ar → done
+# ── Special token ids used in the print token script ─────────────────────────
 
 
 # ── Config builder ───────────────────────────────────────────────────────────
@@ -191,8 +193,11 @@ def _interleave_generation_graph() -> dict[str, Any]:
                 "body": ["tok_enc_to_ar", "ar_to_tok_dec", "tok_dec_sink"],
                 "token_length": {"type": "variable"},
                 "transitions": [
-                    {"condition": {"type": "token_match", "token_id": TOK_BOI}, "next_state": "image_vq_start"},
-                    {"condition": {"type": "token_match", "token_id": TOK_EOS}, "next_state": "done"},
+                    {
+                        "condition": {"type": "module_signal", "key": SIGNAL_START_IMAGE_GEN},
+                        "next_state": "image_vq_start",
+                    },
+                    {"condition": {"type": "module_signal", "key": SIGNAL_TEXT_DONE}, "next_state": "done"},
                 ],
             },
             "image_vq_start": {
@@ -204,7 +209,7 @@ def _interleave_generation_graph() -> dict[str, Any]:
                 "body": ["ar_to_vae_dec", "vae_dec_to_ar"],
                 "token_length": {"type": "variable"},
                 "transitions": [
-                    {"condition": {"type": "ctx_flag", "key": "image_complete"}, "next_state": "image_vq_end"},
+                    {"condition": {"type": "module_signal", "key": "image_complete"}, "next_state": "image_vq_end"},
                 ],
             },
             "image_vq_end": {
@@ -239,7 +244,7 @@ def _t2i_generation_graph() -> dict[str, Any]:
                 "body": ["ar_to_vae_dec", "vae_dec_to_ar"],
                 "token_length": {"type": "variable"},
                 "transitions": [
-                    {"condition": {"type": "ctx_flag", "key": "image_complete"}, "next_state": "image_vq_end"},
+                    {"condition": {"type": "module_signal", "key": "image_complete"}, "next_state": "image_vq_end"},
                 ],
             },
             "image_vq_end": {
@@ -265,7 +270,7 @@ def _understanding_generation_graph() -> dict[str, Any]:
                 "body": ["vis_to_ar", "tok_enc_to_ar", "ar_to_tok_dec", "tok_dec_sink"],
                 "token_length": {"type": "fixed", "value": 1},
                 "transitions": [
-                    {"condition": {"type": "token_match", "token_id": TOK_EOS}, "next_state": "done"},
+                    {"condition": {"type": "module_signal", "key": SIGNAL_TEXT_DONE}, "next_state": "done"},
                     {"condition": {"type": "steps_complete"}, "next_state": "text_ar"},
                 ],
             },
@@ -273,7 +278,7 @@ def _understanding_generation_graph() -> dict[str, Any]:
                 "body": ["tok_enc_to_ar", "ar_to_tok_dec", "tok_dec_sink"],
                 "token_length": {"type": "variable"},
                 "transitions": [
-                    {"condition": {"type": "token_match", "token_id": TOK_EOS}, "next_state": "done"},
+                    {"condition": {"type": "module_signal", "key": SIGNAL_TEXT_DONE}, "next_state": "done"},
                 ],
             },
         },
@@ -290,7 +295,7 @@ def _build_model(
     ``image_steps`` configures PrintVQVAE to emit ``image_complete=True``
     after that many inference ``decode()`` calls — mirrors the real Janus
     VQ decoder's "image complete" signal that drives the
-    ``image_vq → image_vq_end`` transition via ``ctx_flag``.
+    ``image_vq → image_vq_end`` transition via ``module_signal``.
     """
     log: list[str] = []
     cfg_dict = _config_dict()
@@ -410,15 +415,15 @@ def test_fsm_interleave_text_to_image_to_text():
 
     expected = (
         text_ar_step * 3
-        + [f"transition: text_ar -> image_vq_start [token_match({TOK_BOI})]"]
+        + [f"transition: text_ar -> image_vq_start [module_signal({SIGNAL_START_IMAGE_GEN})]"]
         + vq_start_step * 1
         + ["transition: image_vq_start -> image_vq [steps_complete]"]
         + image_vq_step * 3
-        + ["transition: image_vq -> image_vq_end [ctx_flag(image_complete)]"]
+        + ["transition: image_vq -> image_vq_end [module_signal(image_complete)]"]
         + vq_end_step * 1
         + ["transition: image_vq_end -> text_ar [steps_complete]"]
         + text_ar_step * 3
-        + [f"transition: text_ar -> done [token_match({TOK_EOS})]"]
+        + [f"transition: text_ar -> done [module_signal({SIGNAL_TEXT_DONE})]"]
     )
     assert trace == expected, "trace mismatch:\n" + "\n".join(trace)
 
@@ -493,7 +498,7 @@ def test_fsm_t2i_only_starts_with_prompt_state_and_ends_after_image():
         + ["image_vq_start:emit_image_start", "image_vq_start:run_ar"]
         + ["transition: image_vq_start -> image_vq [steps_complete]"]
         + ["image_vq:run_ar", "image_vq:vae_decode"] * 2
-        + ["transition: image_vq -> image_vq_end [ctx_flag(image_complete)]"]
+        + ["transition: image_vq -> image_vq_end [module_signal(image_complete)]"]
         + ["image_vq_end:emit_image_end", "image_vq_end:run_ar"]
         + ["transition: image_vq_end -> done [steps_complete]"]
     )
@@ -593,10 +598,10 @@ def test_fsm_state_node_sequence_derived():
     assert g.state_node_sequence("done") == []
 
 
-# ── ctx_flag transition (module-driven completion signal) ───────────────────
+# ── module_signal transition (module-driven completion signal) ───────────────
 
 
-def test_fsm_ctx_flag_transition_fires_on_module_signal():
+def test_fsm_module_signal_transition_fires_on_module_signal():
     """`image_vq` loops until vae_decode writes `ctx['image_complete']=True`.
 
     The PrintVQVAE mock counts inference `decode()` calls and emits the
@@ -623,12 +628,12 @@ def test_fsm_ctx_flag_transition_fires_on_module_signal():
     image_vq_decodes = [e for e in trace if e == "image_vq:vae_decode"]
     assert len(image_vq_decodes) == n_patches
 
-    # The transition fired with the ctx_flag condition (not steps_complete).
-    assert "transition: image_vq -> image_vq_end [ctx_flag(image_complete)]" in trace
+    # The transition fired with the module_signal condition (not steps_complete).
+    assert "transition: image_vq -> image_vq_end [module_signal(image_complete)]" in trace
 
 
-def test_fsm_ctx_flag_cleared_after_transition():
-    """Once `ctx_flag` fires, the framework pops the key — no stale reuse."""
+def test_fsm_module_signal_cleared_after_transition():
+    """Once ``module_signal`` fires, the framework pops the key — no stale reuse."""
     model, _ = _build_model(
         token_script=[TOK_BOI, TOK_EOS],  # → image, → done
         generation_graph=_interleave_generation_graph(),
@@ -646,8 +651,8 @@ def test_fsm_ctx_flag_cleared_after_transition():
     assert "image_complete" not in final_ctx
 
 
-def test_fsm_ctx_flag_does_not_fire_until_module_writes_it():
-    """A state with a `ctx_flag` transition stays in-state while the flag is absent."""
+def test_fsm_module_signal_does_not_fire_until_module_writes_it():
+    """A state with a ``module_signal`` transition stays in-state while the flag is absent."""
     # image_steps=None → PrintVQVAE never emits image_complete → image_vq
     # would loop forever.  Cap it via max_new_tokens and verify the state
     # never transitioned.
@@ -666,20 +671,20 @@ def test_fsm_ctx_flag_does_not_fire_until_module_writes_it():
     )
 
     # The transition out of image_vq must NEVER appear — the flag was never set.
-    assert "transition: image_vq -> image_vq_end [ctx_flag(image_complete)]" not in trace
+    assert "transition: image_vq -> image_vq_end [module_signal(image_complete)]" not in trace
     # And the FSM is still alive in image_vq (didn't reach `done`).
     assert not model.generation_graph.is_done()
 
 
-def test_fsm_ctx_flag_condition_requires_key():
-    """`ctx_flag` without a non-empty `key` is rejected at FSM build time."""
+def test_fsm_module_signal_condition_requires_key():
+    """``module_signal`` without a non-empty ``key`` is rejected at FSM build time."""
     import pytest
 
     fsm = _interleave_generation_graph()
     fsm["states"]["image_vq"]["transitions"] = [
-        {"condition": {"type": "ctx_flag"}, "next_state": "image_vq_end"},
+        {"condition": {"type": "module_signal"}, "next_state": "image_vq_end"},
     ]
-    with pytest.raises(ValueError, match=r"ctx_flag.*requires.*key"):
+    with pytest.raises(ValueError, match=r"module_signal.*requires.*key"):
         _build_model(token_script=[], generation_graph=fsm)
 
 
@@ -848,15 +853,15 @@ def test_generation_graph_mermaid_renders_body_subgraphs_and_loops():
 
     # State transitions: thick `==>` arrows + quoted condition labels (so the
     # styling is visually distinct from intra-body `output → as` data edges).
-    assert f'state_text_ar ==>|"token_match({TOK_BOI})"| state_image_vq_start' in txt
-    # `image_vq` runs until vae_decode signals completion via `ctx_flag`.
-    assert 'state_image_vq ==>|"ctx_flag(image_complete)"| state_image_vq_end' in txt
+    assert f'state_text_ar ==>|"module_signal({SIGNAL_START_IMAGE_GEN})"| state_image_vq_start' in txt
+    # `image_vq` runs until vae_decode signals completion via `module_signal`.
+    assert 'state_image_vq ==>|"module_signal(image_complete)"| state_image_vq_end' in txt
     # Transitions whose target is the `done` state route to the terminal node.
-    assert f'state_text_ar ==>|"token_match({TOK_EOS})"| fsm_done' in txt
+    assert f'state_text_ar ==>|"module_signal({SIGNAL_TEXT_DONE})"| fsm_done' in txt
 
     # Self-loop iteration counts: `fixed: N` → label `×N`; `variable` → unlabelled.
-    # `image_vq` is variable (loops until ctx_flag fires), `text_ar` is variable
-    # (loops until token_match fires) → both unlabelled.
+    # `image_vq` is variable (loops until module_signal fires), `text_ar` is variable
+    # (loops until module_signal fires) → both unlabelled.
     assert "state_image_vq -.-> state_image_vq" in txt
     assert "state_text_ar -.-> state_text_ar" in txt
     # Bridge state has fixed=1 → labelled `×1`.

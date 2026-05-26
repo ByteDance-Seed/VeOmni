@@ -64,16 +64,14 @@ generation_graph:
         - tok_decode_sink
       token_length: { type: fixed, value: 1 }
       transitions:
-        - { condition: { type: token_match, token_id: 100001 }, next_state: done }   # </s> on first token
+        - { condition: { type: module_signal, key: text_done }, next_state: done }
         - { condition: { type: steps_complete }, next_state: text_ar }
 
     text_ar:
-      # Same body shape as `infer_interleave.yaml#text_ar`, but transitions
-      # only allow termination (no <begin_of_image> path).
       body:
         - tok_enc_to_ar
         - ar_to_tok_decode
         - tok_decode_sink
       token_length: { type: variable }
       transitions:
-        - { condition: { type: token_match, token_id: 100001 }, next_state: done }   # </s>
+        - { condition: { type: module_signal, key: text_done }, next_state: done }

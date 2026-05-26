@@ -32,6 +32,14 @@ import torch.nn as nn
 from veomni.models.seed_omni import OmniModule
 
 
+# FSM ``module_signal`` keys emitted by PrintTextEmbed.decode (mirrors JanusTextEncoder).
+SIGNAL_START_IMAGE_GEN = "start_image_gen"
+SIGNAL_TEXT_DONE = "text_done"
+TOK_BOI = 100016
+TOK_EOI = 100593
+TOK_EOS = 2
+
+
 # ── Base ──────────────────────────────────────────────────────────────────────
 
 
@@ -97,7 +105,7 @@ class PrintVQVAE(_PrintBase):
     A real Janus VQ decoder loops over a fixed grid (24×24 = 576 patches)
     and raises an internal "image complete" event on the final patch; the
     FSM's ``image_vq`` state runs ``token_length: variable`` and listens
-    for that event via a ``ctx_flag(image_complete)`` transition.
+    for that event via a ``module_signal(image_complete)`` transition.
 
     Tests configure the simulated grid size via ``image_steps`` — after
     ``image_steps`` consecutive inference ``decode()`` calls the module
@@ -174,13 +182,18 @@ class PrintTextEmbed(_PrintBase):
         self._record("decode", **kwargs)
         if kwargs.get("labels") is not None:
             return {"_loss": _scalar_loss(0.3)}
-        # Inference: sample from the canned script.
+        # Inference: sample from the canned script, then emit module_signal flags.
         if self._cursor < len(self._token_script):
             tok = self._token_script[self._cursor]
             self._cursor += 1
         else:
-            tok = 2
-        return {"input_ids": tok, "last_token_id": tok}
+            tok = TOK_EOS
+        out: dict[str, Any] = {"input_ids": tok, "last_token_id": tok}
+        if tok == TOK_BOI:
+            out[SIGNAL_START_IMAGE_GEN] = True
+        elif tok == TOK_EOS:
+            out[SIGNAL_TEXT_DONE] = True
+        return out
 
     def reset_cursor(self) -> None:
         """Reset the token-script cursor.  Call between independent generate runs."""
@@ -191,7 +204,7 @@ class PrintTextEmbed(_PrintBase):
         return self._emit("boi", 100016, **kwargs)
 
     def emit_image_end(self, **kwargs: Any) -> dict[str, Any]:
-        return self._emit("eoi", 100593, **kwargs)
+        return self._emit("eoi", TOK_EOI, **kwargs)
 
     def _emit(self, label: str, token_id: int, **kwargs: Any) -> dict[str, Any]:
         self._record(f"emit_{label}", **kwargs)

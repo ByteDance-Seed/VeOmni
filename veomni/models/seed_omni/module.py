@@ -201,6 +201,15 @@ class OmniModule:
         """
         return self.forward(**kwargs)
 
+    def set_tokenizer(self, tokenizer: Any) -> None:
+        """Wire the global tokenizer and resolve vocabulary-specific token ids.
+
+        Optional.  Text-side modules use this to learn special-token ids
+        (boi / eoi / eos / image placeholder) at runtime instead of storing
+        them in ``config.json``.  Default: no-op.
+        """
+        return None
+
     def finalize(self, *, ctx: Dict[str, Any], request: Dict[str, Any]) -> Dict[str, Any]:
         """Post-generation hook called once when the FSM enters ``done``.
 

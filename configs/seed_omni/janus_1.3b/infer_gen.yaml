@@ -58,14 +58,14 @@ generation_graph:
       # final patch (e.g. 576-th for a 24×24 grid, or whenever the model
       # decides via its own EOS-of-image logic) it appends
       # `image_complete=True` to its output dict, which lands in ctx and
-      # fires the ctx_flag transition below.  The framework auto-clears
+      # fires the module_signal transition below.  The framework auto-clears
       # the flag on transition so it never stale-fires in image_vq_end.
       body:
         - ar_to_vae_decode
         - vae_decode_to_ar
       token_length: { type: variable }
       transitions:
-        - { condition: { type: ctx_flag, key: image_complete }, next_state: image_vq_end }
+        - { condition: { type: module_signal, key: image_complete }, next_state: image_vq_end }
 
     image_vq_end:
       # Janus T2I-only: emit <end_of_image> for symmetry, then stop.  No

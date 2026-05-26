@@ -8,7 +8,7 @@ flowchart LR
         direction TB
         siglip_encode["siglip_encode<br/><i>janus_siglip.forward</i>"]:::source
         vae_encode["vae_encode<br/><i>janus_vqvae.encode</i>"]:::source
-        tok_encode["tok_encode<br/><i>text_encoder.encode</i>"]:::source
+        tok_encode["tok_encode<br/><i>janus_text_encoder.encode</i>"]:::source
     end
     subgraph col1 [ ]
         direction TB
@@ -16,7 +16,7 @@ flowchart LR
     end
     subgraph col2 [ ]
         direction TB
-        tok_decode["tok_decode<br/><i>text_encoder.decode</i>"]:::sink
+        tok_decode["tok_decode<br/><i>janus_text_encoder.decode</i>"]:::sink
         vae_decode["vae_decode<br/><i>janus_vqvae.decode</i>"]:::sink
     end
     end_sink(("end")):::end_sink

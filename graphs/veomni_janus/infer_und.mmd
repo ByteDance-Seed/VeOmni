@@ -9,26 +9,26 @@ flowchart LR
         direction LR
         prompt_to_text__siglip_encode["siglip_encode<br/><i>janus_siglip.forward</i>"]:::body_node
         prompt_to_text__janus_llama["janus_llama<br/><i>janus_llama.forward</i>"]:::body_node
-        prompt_to_text__tok_encode["tok_encode<br/><i>text_encoder.encode</i>"]:::body_node
-        prompt_to_text__tok_decode["tok_decode<br/><i>text_encoder.decode</i>"]:::body_node
+        prompt_to_text__tok_encode["tok_encode<br/><i>janus_text_encoder.encode</i>"]:::body_node
+        prompt_to_text__tok_decode["tok_decode<br/><i>janus_text_encoder.decode</i>"]:::body_node
         prompt_to_text__siglip_encode -->|"image_embeds → und_image_embeds"| prompt_to_text__janus_llama
         prompt_to_text__tok_encode -->|"inputs_embeds"| prompt_to_text__janus_llama
         prompt_to_text__janus_llama -->|"hidden_states"| prompt_to_text__tok_decode
     end
     subgraph state_text_ar [text_ar]
         direction LR
-        text_ar__tok_encode["tok_encode<br/><i>text_encoder.encode</i>"]:::body_node
+        text_ar__tok_encode["tok_encode<br/><i>janus_text_encoder.encode</i>"]:::body_node
         text_ar__janus_llama["janus_llama<br/><i>janus_llama.forward</i>"]:::body_node
-        text_ar__tok_decode["tok_decode<br/><i>text_encoder.decode</i>"]:::body_node
+        text_ar__tok_decode["tok_decode<br/><i>janus_text_encoder.decode</i>"]:::body_node
         text_ar__tok_encode -->|"inputs_embeds"| text_ar__janus_llama
         text_ar__janus_llama -->|"hidden_states"| text_ar__tok_decode
     end
     state_prompt_to_text -.->|"×1"| state_prompt_to_text
     state_text_ar -.-> state_text_ar
     fsm_start ==> state_prompt_to_text
-    state_prompt_to_text ==>|"token_match(100001)"| fsm_done
+    state_prompt_to_text ==>|"module_signal(text_done)"| fsm_done
     state_prompt_to_text ==>|"steps_complete"| state_text_ar
-    state_text_ar ==>|"token_match(100001)"| fsm_done
+    state_text_ar ==>|"module_signal(text_done)"| fsm_done
     classDef body_node fill:#fff,stroke:#666
     classDef fsm_start fill:#dff,stroke:#06c,stroke-width:2px
     classDef fsm_terminal fill:#eee,stroke:#333,stroke-width:1px,stroke-dasharray:3 3

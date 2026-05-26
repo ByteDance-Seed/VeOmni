@@ -28,7 +28,7 @@ Output structure (matches ``design.md`` §11)
     janus_llama/
       config.json                     # JanusLlamaConfig (model_type=janus_llama)
       model.safetensors               # language_model.* (no embed_tokens / no lm_head)
-    text_encoder/
+    janus_text_encoder/
       config.json                     # JanusTextEncoderConfig (model_type=janus_text_encoder)
       model.safetensors               # embed_tokens.* (+ lm_head.* if untied)
     tokenizer.json                    # global tokenizer (written to output_dir root;
@@ -188,7 +188,7 @@ def split_janus(model_path: str, output_dir: str) -> None:
         # Untied: load the original lm_head linear.
         te.lm_head.load_state_dict(model.lm_head.state_dict(), assign=True)
 
-    te_dir = os.path.join(output_dir, "text_encoder")
+    te_dir = os.path.join(output_dir, "janus_text_encoder")
     te.save_pretrained(te_dir, safe_serialization=True)
     print(f"  saved → {te_dir} (tie_word_embeddings={text_cfg.tie_word_embeddings})")
 
@@ -222,7 +222,7 @@ def split_janus(model_path: str, output_dir: str) -> None:
     print(f"  model.model_path           : {output_dir}")
     print(f"  modules.janus_siglip.weights_path : janus_siglip   # → {siglip_dir}")
     print(f"  modules.janus_vqvae.weights_path  : janus_vqvae    # → {vqvae_dir}")
-    print(f"  modules.text_encoder.weights_path : text_encoder   # → {te_dir}")
+    print(f"  modules.janus_text_encoder.weights_path : janus_text_encoder   # → {te_dir}")
     print(f"  modules.janus_llama.weights_path  : janus_llama    # → {llama_dir}")
 
 

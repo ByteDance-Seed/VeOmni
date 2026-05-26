@@ -465,22 +465,38 @@ Editing `infer_<scenario>.yaml`:
 
 8. **`done` is framework-injected** — never declare a `done:` state block, never set `done_state`. `GenerationGraph` auto-injects a `done` state with empty body, no transitions, zero token budget; transitions whose `next_state: done` land on it. Authoring either knob is a hard error (raised at FSM build time). When the FSM enters `done`, `OmniModel.generate` walks every active module and calls its **`finalize(ctx, request)` hook**, merging non-empty returns into `ctx['finalize'][<module_name>]`. Override `finalize` on a module when you need to dump accumulated outputs — tokenizer-decode all generated `input_ids`, save accumulated VQ patches as images, write audio waveforms. The framework imposes no accumulation scheme: modules that need cross-step history append into a running list inside `ctx` during their own `generate_step`, then read it back in `finalize`.
 
-9. **Module-driven completion via `ctx_flag`** — when a state's exit condition is "the module decided it's finished" (e.g. VQ decoder hit the last patch of a 24×24 grid; audio codec emitted EOS-of-audio), use `token_length: variable` paired with a `ctx_flag` transition:
+9. **FSM transition conditions** — two primary types for inference:
+
+   | Type | Who decides | YAML shape | Example |
+   |------|-------------|------------|---------|
+   | `steps_complete` | Framework outer loop (fixed token budget) | `{ type: steps_complete }` | Image VQ span with known patch count |
+   | `module_signal` | Module writes a one-shot flag in its return dict | `{ type: module_signal, key: K }` | VQ decoder emits `image_complete`; text decoder emits `start_image_gen` / `text_done` |
+
+   **`module_signal`** (alias: `ctx_flag` for backward compat) — when a state's exit condition is "the module decided it's finished" (e.g. VQ decoder hit the last patch of a 24×24 grid; text decoder sampled `<begin_of_image>` or `</s>`), use `token_length: { type: variable }` paired with a `module_signal` transition:
 
     ```yaml
     image_vq:
       body: [ar_to_vae_decode, vae_decode_to_ar]
       token_length: { type: variable }
       transitions:
-        - { condition: { type: ctx_flag, key: image_complete }, next_state: image_vq_end }
+        - { condition: { type: module_signal, key: image_complete }, next_state: image_vq_end }
+
+    text_ar:
+      body: [tok_encode, janus_llama, tok_decode]
+      token_length: { type: variable }
+      transitions:
+        - { condition: { type: module_signal, key: start_image_gen }, next_state: image_vq_start }
+        - { condition: { type: module_signal, key: text_done }, next_state: done }
     ```
 
-    The module writes `ctx[<key>] = True` from inside its `generate_step` (or `decode`/`encode`/etc) on the final iteration. The framework checks `ctx[<key>]` after each step and **automatically pops the key** once the transition fires — so a one-shot signal never stale-fires the next state. Hard rules:
+    The module writes the signal key (`True`) from inside its `generate_step` (or `decode`/`encode`/etc). For text transitions, **do not** use `token_match` with hard-coded token ids in YAML — resolve ids via `set_tokenizer()` on the module and emit `module_signal` keys instead (see `JanusTextEncoder.decode`).
+
+    The framework checks `ctx[<key>]` after each step and **automatically pops the key** once the transition fires — so a one-shot signal never stale-fires the next state. Hard rules:
 
     - **Don't** use `token_length: fixed: 576` for VQ image generation — the patch budget belongs to the *model* (real VQ decoders carry their own grid arithmetic), not the YAML.
-    - **Don't** mix `ctx_flag` with `token_length: fixed: N` — the fixed budget will be ignored as long as the flag fires earlier; if it doesn't fire, the state runs forever (capped only by `max_new_tokens`). Match `variable` with `ctx_flag` to express "loop until the module says stop" cleanly.
-    - **Naming**: pick a key that is unique across the FSM lifetime (`image_complete`, `audio_complete`, …) — auto-clear protects you from one-state-to-the-next leakage, but two transitions in the same state listening on the same key would still race.
-    - Other condition types (`token_match`, `steps_complete`, `always`) are unchanged. Build-time validation rejects unknown types and missing `key` / `token_id` fields, so typos fail loud.
+    - **Don't** mix `module_signal` with `token_length: fixed: N` — match `variable` with `module_signal` to express "loop until the module says stop" cleanly.
+    - **Naming**: pick a key that is unique across the FSM lifetime (`image_complete`, `start_image_gen`, `text_done`, …).
+    - `token_match` is deprecated for new graphs — prefer `module_signal`. Build-time validation rejects unknown types and missing `key` / `token_id` fields.
 
 ## Phase 6 — Validate
 
