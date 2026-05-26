@@ -60,12 +60,10 @@ tokenizer_path: /mnt/hdfs/veomni/models/seed_omni/janus_1.3b/tokenizer
 modules:
   janus_siglip:
     weights_path: /mnt/hdfs/veomni/models/seed_omni/janus_1.3b/janus_siglip
-    micro_batch_size: 4
 
   janus_vqvae:
     weights_path: /mnt/hdfs/veomni/models/seed_omni/janus_1.3b/janus_vqvae
     freeze_vqvae: true
-    micro_batch_size: 4
 
   text_embed:
     weights_path: /mnt/hdfs/veomni/models/seed_omni/janus_1.3b/text_embed
@@ -78,7 +76,13 @@ modules:
     weights_path: /mnt/hdfs/veomni/models/seed_omni/janus_1.3b/janus_llama
     # `image_token_id` / `gen_image_token_id` come from janus_llama/config.json
     # (Janus 1.3B uses 100581 for both understanding and generation slots).
-    micro_batch_size: 2
+
+# NOTE: ``micro_batch_size`` / DP / SP / TP / CP knobs are **not** per-module
+# in V2 — they live globally under ``train.*`` in the launcher YAML
+# (e.g. ``configs/seed_omni/veomni_janus.yaml``).  Every module shares the
+# same global micro_batch_size and the same parallel mesh.  Per-module
+# parallel customisation will be revisited after the OmniTrainer build flow
+# is fully working.
 
 # ── Graph nodes (call-sites) ──────────────────────────────────────────────────
 # The same module may back multiple nodes (different methods).  Inference-only

@@ -829,9 +829,11 @@ class OmniModel(nn.Module):
 - `janus_siglip`（VLM ViT）：`get_parallel_plan()` 返回 `None`（无 ExtraParallel）；SP 在自己的 `forward()` 里通过 `gather_seq_scatter_heads` 处理
 - `bagel_dit`：当前版本不做 per-module 不同 mesh / TP；后续如有需要再扩展
 
-### micro_batch_size 一致
+### micro_batch_size / DP / SP 一致（暂时全局对齐）
 
-跨 node 的 `micro_batch_size` **强制全局一致**——暂不考虑不同 node 用不同 micro batch 数的场景（实现复杂度高、收益有限）。模块特化字段 `micro_batch_size` 仍保留在 `modules:` 池里以备未来扩展，但当前版本由顶层统一传入。
+V2 当前版本**不接受 per-module 的 `micro_batch_size` / `dp_size` / `sp_size` / `tp_size` / `cp_size` 字段**——`OmniConfig.modules.<name>.*` 里只有模块自身的 ckpt 路径与少量模块行为开关（`freeze` / `gradient_checkpointing` 等）。所有并行配置和 micro batch size **全部走顶层 launcher YAML**（`configs/seed_omni/veomni_janus.yaml` 的 `train.micro_batch_size` / `train.accelerator.*`），每个 module 的 dp / sp 都保持一致。
+
+这条约束等 OmniTrainer 整体 build flow 跑通（含 dataset / collator / optimizer / save / resume）后再放开——届时再回头讨论"哪些 module 真的需要异构 mb / dp / sp"，避免过早实现复杂的多-mesh / 多-mb 路径。
 
 ### 本版本明确**不做**的
 
@@ -839,7 +841,7 @@ class OmniModel(nn.Module):
 - ❌ 子模块持有自己的 `ParallelState` / mesh
 - ❌ 子模块声明独立 SP / EP group（SP / EP group 全局唯一）
 - ❌ DDP 路径（暂只支持 FSDP2）
-- ❌ 跨 node 不同 micro_batch_size
+- ❌ per-module micro_batch_size / dp_size / sp_size / tp_size / cp_size（OmniTrainer 整体可工作后再支持）
 
 ### 与现有基础设施
 
@@ -919,12 +921,13 @@ output_ckpt_dir/
 - **vocab-bound 模块（如 `janus_llama` backbone 等）本身没有 asset**——它们读 inputs_embeds / hidden_states，不直接读原始字节或 token id。
 - **vision encoder 类模块（如 `janus_siglip`、`janus_vqvae`）的 image processor 跟随该模块**——避免顶层维护一个 processor 注册表。模块的 `forward` 直接从 conversation_list 取已 resize 的 image tensor 并调本模块自己的 processor 完成 patch / normalize。
 
-### micro_batch_size、freeze、gradient_checkpointing 等模块特化字段
+### freeze、gradient_checkpointing 等模块特化字段
 
 写在 `modules.<name>.<field>`，由各模块自己读取并应用。当前版本：
 - `freeze: true` → 模块构造完后冻结所有参数（不参与训练）。
 - `gradient_checkpointing: true` → 模块 init 后调 `gradient_checkpointing_enable()`。
-- `micro_batch_size` → 字段保留但当前必须全局一致。
+
+并行配置（`micro_batch_size` / `dp_size` / `sp_size` / `tp_size` / `cp_size`）**不在** `modules.<name>` 下接受——参见 § "micro_batch_size / DP / SP 一致（暂时全局对齐）" 一节。
 
 ---
 

@@ -10,10 +10,16 @@ YAML structure (maps 1-to-1 to this class):
   #    module's `config.json` (loaded via HF AutoConfig) and is NOT specified
   #    here — the YAML carries only the location and overrides.
   modules:
-    siglip:        {weights_path: ..., config_path: ..., micro_batch_size: 4, ...}
-    janus_llama:   {weights_path: ..., micro_batch_size: 2}
-    wte_lm_head:   {weights_path: ...}
+    siglip:        {weights_path: ..., config_path: ...}
+    janus_llama:   {weights_path: ...}
+    text_encoder:  {weights_path: ...}
     vqvae:         {weights_path: ..., freeze: true}
+
+  # NOTE: ``micro_batch_size`` / DP / SP / TP / CP are NOT per-module — they
+  # live globally under ``train.*`` in the launcher YAML.  All modules share
+  # the same global micro_batch_size and parallel mesh; per-module parallel
+  # customisation will be revisited after the OmniTrainer build flow is
+  # fully working.
 
   # ── Graph nodes (call-sites): one entry per `module.method` invocation.
   #    The same module may appear under multiple node names.
