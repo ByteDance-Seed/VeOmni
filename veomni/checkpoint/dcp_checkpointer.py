@@ -27,7 +27,7 @@ from torch.distributed.checkpoint import (
     FileSystemWriter,
     load,
 )
-from torch.distributed.checkpoint.metadata import STATE_DICT_TYPE, Metadata
+from torch.distributed.checkpoint.metadata import STATE_DICT_TYPE, Metadata, TensorProperties
 from torch.distributed.checkpoint.state_dict import (
     StateDictOptions,
     get_model_state_dict,
@@ -48,6 +48,48 @@ logger = logging.get_logger(__name__)
 
 _EXTRA_STATE_FORMAT = "extra_state_rank_{}.pt"
 _EXTRA_STATE_DIR = "extra_state"
+
+
+# Workaround for a PyTorch DCP bug: ``TensorProperties`` is declared as
+# ``@dataclass`` (not ``@dataclass(frozen=True)``) in
+# ``torch/distributed/checkpoint/metadata.py``. With the default ``eq=True``,
+# Python sets ``__hash__`` to ``None`` — i.e. instances are unhashable. But
+# ``TensorProperties`` is held by ``TensorWriteData``, which IS
+# ``frozen=True`` and auto-generates a ``__hash__`` that cascades to all
+# field values. So hashing anything that transitively contains a
+# ``TensorProperties`` raises ``TypeError: unhashable type:
+# 'TensorProperties'``.
+#
+# This fires in production on the FSDP2 / ``ep_size=1`` MoE save path when
+# ``_fill_missing_optimizer_states`` synthesizes placeholders for params
+# that never received a gradient: DCP's ``_save_state_dict`` pickles the
+# global ``Metadata`` and broadcasts it; ``_unpickler.load()`` on receiving
+# ranks reconstructs a dict whose keys cascade through the unhashable
+# ``TensorProperties`` and crashes — observed as
+# ``TypeError: unhashable type: 'TensorProperties'`` on one rank and a
+# 10-min NCCL all-gather watchdog timeout on the others. The
+# ``ep_size>=2`` path bypasses this only because it doesn't synthesize
+# placeholders and so produces a smaller, simpler metadata shape that
+# happens not to need ``TensorProperties`` hashing.
+#
+# Fixing this at the placeholder-construction layer is fragile (the
+# placeholder being correct still triggers the bug as long as the
+# corresponding ``WriteItem`` gets hashed). The correct fix is upstream
+# in PyTorch (mark ``TensorProperties`` frozen, or give it an explicit
+# ``__hash__``). We install the equivalent as a one-time, idempotent
+# monkey-patch: hash the immutable field tuple. The guard means that if
+# upstream PyTorch fixes this — by setting ``frozen=True`` or providing
+# its own ``__hash__`` — our patch becomes a no-op and we don't fight it.
+if TensorProperties.__hash__ is None:
+    TensorProperties.__hash__ = lambda self: hash(
+        (
+            self.dtype,
+            self.layout,
+            self.requires_grad,
+            self.memory_format,
+            self.pin_memory,
+        )
+    )
 
 
 class ModelState(Stateful):
