@@ -83,6 +83,7 @@ import torch.nn as nn
 
 from .configuration_seed_omni import OmniConfig
 from .generation_graph import GenerationGraph
+from .graph import scalar_token_id
 from .module import OmniModule
 from .training_graph import TrainingGraph
 
@@ -305,7 +306,7 @@ class OmniModel(nn.Module):
             total_steps += 1
 
             if stop_token_ids:
-                last_id = ctx.get("last_token_id")
+                last_id = scalar_token_id(ctx.get("input_ids"))
                 if last_id is not None and last_id in stop_token_ids:
                     if trace is not None:
                         trace.append(f"stop:{last_id}")

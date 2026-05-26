@@ -42,6 +42,13 @@ TOK_EOI = 100593
 TOK_EOS = 2
 
 
+def _infer_batch_size(kwargs: dict[str, Any]) -> int:
+    v = kwargs.get("input_ids")
+    if isinstance(v, torch.Tensor) and v.dim() >= 1:
+        return int(v.size(0))
+    return 1
+
+
 # ── Base ──────────────────────────────────────────────────────────────────────
 
 
@@ -160,10 +167,10 @@ class PrintTextEmbed(_PrintBase):
     Parameters
     ----------
     token_script:
-        Sequence of ``last_token_id`` values to emit, one per
-        ``decode`` call in inference.  Once exhausted the module emits
-        ``2`` (``</s>``) forever.  This makes FSM transitions
-        reproducible without any sampling logic.
+        Sequence of token ids to emit, one per ``decode`` call in
+        inference.  Once exhausted the module emits ``2`` (``</s>``)
+        forever.  This makes FSM transitions reproducible without any
+        sampling logic.
     """
 
     def __init__(
@@ -190,7 +197,10 @@ class PrintTextEmbed(_PrintBase):
             self._cursor += 1
         else:
             tok = TOK_EOS
-        out: dict[str, Any] = {"input_ids": tok, "last_token_id": tok}
+        batch_size = _infer_batch_size(kwargs)
+        out: dict[str, Any] = {
+            "input_ids": torch.full((batch_size, 1), tok, dtype=torch.long),
+        }
         if tok == TOK_BOI:
             out[FSM_SIGNAL_KEY] = SIGNAL_START_IMAGE_GEN
         elif tok == TOK_EOS:
@@ -210,10 +220,10 @@ class PrintTextEmbed(_PrintBase):
 
     def _emit(self, label: str, token_id: int, **kwargs: Any) -> dict[str, Any]:
         self._record(f"emit_{label}", **kwargs)
+        batch_size = _infer_batch_size(kwargs)
         return {
-            "input_ids": token_id,
+            "input_ids": torch.full((batch_size, 1), token_id, dtype=torch.long),
             "inputs_embeds": f"<wte:{label}>",
-            "last_token_id": token_id,
         }
 
 

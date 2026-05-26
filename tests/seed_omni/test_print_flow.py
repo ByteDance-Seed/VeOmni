@@ -50,6 +50,7 @@ import yaml
 
 from veomni.models.seed_omni import OmniConfig, OmniModel
 from veomni.models.seed_omni.generation_graph import FSM_SIGNAL_KEY
+from veomni.models.seed_omni.graph import scalar_token_id
 
 from .print_modules import (
     SIGNAL_START_IMAGE_GEN,
@@ -239,7 +240,7 @@ def test_fsm_interleave_text_to_image_to_text():
     assert trace == expected, "trace mismatch:\n" + "\n".join(trace)
 
     assert model.generation_graph.is_done()
-    assert final_ctx["last_token_id"] == TOK_EOS
+    assert scalar_token_id(final_ctx.get("input_ids")) == TOK_EOS
     # The signal was popped on transition — never leaks.
     assert FSM_SIGNAL_KEY not in final_ctx
 
@@ -280,7 +281,7 @@ def test_fsm_emit_image_start_runs_inside_bridge_body():
     assert any(evt.startswith("text_encoder.emit_boi(") for evt in log)
     assert any(evt.startswith("text_encoder.emit_eoi(") for evt in log)
     # The boundary token id flowed into ctx, not magically appended by FSM.
-    assert final_ctx["last_token_id"] in (TOK_BOI, TOK_EOI, TOK_EOS, 2)
+    assert scalar_token_id(final_ctx.get("input_ids")) in (TOK_BOI, TOK_EOI, TOK_EOS, 2)
 
 
 # ── Inference (FSM) flow — T2I-only ──────────────────────────────────────────

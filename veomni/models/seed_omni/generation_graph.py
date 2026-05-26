@@ -81,7 +81,7 @@ expose specialised inference routines.
             the module.
 
         ``{type: token_match, token_id: T}``  *(deprecated)*
-            Legacy: fires when ``context["last_token_id"] == T``.  Prefer
+            Legacy: fires when the last ``input_ids`` token equals ``T``.  Prefer
             ``module_signal`` so token ids are not duplicated in YAML.
 
         ``{type: always}``
@@ -105,7 +105,7 @@ See also
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional
 
-from .graph import END, EdgeDef, NodeDef, is_end
+from .graph import END, EdgeDef, NodeDef, is_end, scalar_token_id
 
 
 # Reserved name for the framework-injected terminal state.  Every FSM
@@ -151,7 +151,7 @@ class _Condition:
 
     def check(self, context: Dict[str, Any], steps_done: int, total_steps: Optional[int]) -> bool:
         if self.type == "token_match":
-            return context.get("last_token_id") == self.token_id
+            return scalar_token_id(context.get("input_ids")) == self.token_id
         if self.type == "steps_complete":
             return total_steps is not None and steps_done >= total_steps
         if self.type in _MODULE_SIGNAL_TYPES:

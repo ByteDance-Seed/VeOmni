@@ -61,7 +61,7 @@ Optional hooks
     The framework does not impose an accumulation scheme; modules that
     need cross-step history are responsible for maintaining it inside
     ``ctx`` during ``generate_step`` (typical shape: append the current
-    step's ``last_token_id`` / ``vq_token_id`` into a running list).
+    step's ``input_ids`` / ``vq_token_id`` into a running list).
     Return value is collected under ``ctx['finalize'][<module_name>]``
     so callers can read decoded text, image paths, etc.  Default:
     ``{}`` (no-op — module has nothing to finalize).

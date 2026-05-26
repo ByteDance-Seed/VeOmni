@@ -44,13 +44,13 @@ Connection outputs
 ``encode``:
   ``inputs_embeds``    Float tensor ``(B, T, hidden_size)``.
 
-``decode``:
+  ``decode``:
   ``logits``           Float tensor ``(B, T, vocab_size)``.
   ``_loss``            Scalar token-mean CE loss (training, when
                        ``labels`` is given).
-  ``last_token_id``    Long tensor ``(B,)`` — sampled next token (inference).
-  ``input_ids``        Long tensor ``(B, 1)`` — same id, ready to be fed
-                       back to ``encode`` on the next FSM step.
+  ``input_ids``        Long tensor ``(B, 1)`` — sampled next token for the
+                       next FSM step (HF ``generate``-aligned; same field
+                       name as encode input).
 """
 
 from typing import Any, Dict, Optional
@@ -134,7 +134,7 @@ class TextEncoder(OmniModule, PreTrainedModel):
         * **Inference** (``hidden_states`` only):
             project the last position to logits, sample (temperature /
             top-p) and return the next token.  Returns
-            ``{"logits", "last_token_id", "input_ids"}``.
+            ``{"logits", "input_ids"}`` where ``input_ids`` is ``(B, 1)``.
         """
         if hidden_states is None:
             return {}
@@ -158,7 +158,6 @@ class TextEncoder(OmniModule, PreTrainedModel):
                 next_token_logits = self._top_p_filter(next_token_logits, top_p)
             probs = torch.softmax(next_token_logits, dim=-1)
             next_token = torch.multinomial(probs, num_samples=1)
-            out["last_token_id"] = next_token.squeeze(-1)
             out["input_ids"] = next_token
 
         return out

@@ -46,7 +46,9 @@ See ``design.md`` §1 for the full schema.
 """
 
 from dataclasses import dataclass
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
+
+import torch
 
 
 END: str = "end"
@@ -151,3 +153,21 @@ class EdgeDef:
     def is_sink(self) -> bool:
         """True iff this edge terminates at the virtual ``end`` sink."""
         return self.to == END
+
+
+def scalar_token_id(value: Any) -> Optional[int]:
+    """Extract one token id from ``input_ids`` (scalar, tensor, or nested list).
+
+    Used by the FSM (``token_match``), ``OmniModel.generate`` stop checks,
+    and modules that inspect the sampled token after ``decode``.
+    """
+    if isinstance(value, torch.Tensor):
+        if value.numel() == 0:
+            return None
+        flat = value.reshape(-1)
+        return int(flat[-1].item())
+    if isinstance(value, (list, tuple)) and value:
+        return scalar_token_id(value[-1])
+    if value is None:
+        return None
+    return int(value)

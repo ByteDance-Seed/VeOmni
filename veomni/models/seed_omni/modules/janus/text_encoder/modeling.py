@@ -34,11 +34,10 @@ Token ids are resolved from the wired tokenizer via :meth:`set_tokenizer`.
 Output protocol (emit methods)
 ------------------------------
 Both emit methods return the same key set as :meth:`TextEncoder.encode`
-plus ``last_token_id``::
+plus the boundary ``input_ids`` step::
 
     {"input_ids":      LongTensor(B, 1) — the boundary id,
-     "inputs_embeds":  FloatTensor(B, 1, hidden) — wte lookup of that id,
-     "last_token_id":  LongTensor(B)   — the boundary id}
+     "inputs_embeds":  FloatTensor(B, 1, hidden) — wte lookup of that id}
 
 Batch size is inferred from any tensor present in ``ctx`` so the emit
 fits naturally into the FSM step body without needing an explicit
@@ -49,8 +48,8 @@ from typing import Any, Dict, Optional
 
 import torch
 
-from veomni.models.seed_omni.generation_graph import FSM_SIGNAL_KEY
-
+from ....generation_graph import FSM_SIGNAL_KEY
+from ....graph import scalar_token_id
 from ...base.text_encoder.modeling import TextEncoder
 from .configuration import JanusTextEncoderConfig
 
@@ -107,10 +106,10 @@ class JanusTextEncoder(TextEncoder):
             top_p=top_p,
             **kwargs,
         )
-        if labels is not None or "last_token_id" not in out:
+        if labels is not None or "input_ids" not in out:
             return out
 
-        token_id = _scalar_token_id(out["last_token_id"])
+        token_id = scalar_token_id(out["input_ids"])
         if token_id is not None:
             if self._boi_token_id is not None and token_id == self._boi_token_id:
                 out[FSM_SIGNAL_KEY] = SIGNAL_START_IMAGE_GEN
@@ -150,7 +149,6 @@ class JanusTextEncoder(TextEncoder):
         return {
             "input_ids": ids,
             "inputs_embeds": inputs_embeds,
-            "last_token_id": ids.squeeze(-1),
         }
 
 
@@ -163,16 +161,6 @@ def _resolve_token_id(tokenizer: Any, candidates: tuple) -> Optional[int]:
         if tid is not None and tid != unk:
             return int(tid)
     return None
-
-
-def _scalar_token_id(value: Any) -> Optional[int]:
-    if isinstance(value, torch.Tensor):
-        if value.numel() == 0:
-            return None
-        return int(value.reshape(-1)[0].item())
-    if value is None:
-        return None
-    return int(value)
 
 
 def _infer_batch_size(ctx: Dict[str, Any]) -> int:

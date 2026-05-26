@@ -199,7 +199,6 @@ def test_janus_text_encoder_emit_methods_return_expected_shapes():
     # No batch_size hint in ctx → defaults to 1.
     out = jte.emit_image_start()
     assert out["input_ids"].tolist() == [[42]]
-    assert out["last_token_id"].tolist() == [42]
     assert out["inputs_embeds"].shape == (1, 1, 16)
 
     # batch_size inferred from ctx['input_ids'].
@@ -207,7 +206,6 @@ def test_janus_text_encoder_emit_methods_return_expected_shapes():
     out = jte.emit_image_end(input_ids=ctx_in)
     assert out["input_ids"].shape == (3, 1)
     assert (out["input_ids"] == 43).all()
-    assert out["last_token_id"].shape == (3,)
     assert out["inputs_embeds"].shape == (3, 1, 16)
 
 
@@ -232,13 +230,13 @@ def test_janus_text_encoder_decode_emits_module_signals():
 
     jte.lm_head.weight.data[42] = 1.0
     out = jte.decode(hidden_states=h)
-    assert out["last_token_id"].item() == 42
+    assert out["input_ids"].item() == 42
     assert out[FSM_SIGNAL_KEY] == SIGNAL_START_IMAGE_GEN
 
     jte.lm_head.weight.data.zero_()
     jte.lm_head.weight.data[2] = 1.0
     out = jte.decode(hidden_states=h)
-    assert out["last_token_id"].item() == 2
+    assert out["input_ids"].item() == 2
     assert out[FSM_SIGNAL_KEY] == SIGNAL_TEXT_DONE
 
 
@@ -265,8 +263,7 @@ def test_text_encoder_encode_inference_loop_keys():
     te = TextEncoder(TextEncoderConfig(vocab_size=64, hidden_size=16))
     h = torch.randn(2, 4, 16)
     out = te.decode(hidden_states=h)
-    assert set(out.keys()) >= {"logits", "last_token_id", "input_ids"}
-    assert out["last_token_id"].shape == (2,)
+    assert set(out.keys()) >= {"logits", "input_ids"}
     assert out["input_ids"].shape == (2, 1)
 
 
