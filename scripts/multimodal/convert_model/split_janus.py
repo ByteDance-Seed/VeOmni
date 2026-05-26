@@ -218,12 +218,12 @@ def split_janus(model_path: str, output_dir: str) -> None:
     print(f"  tokenizer → {output_dir}")
 
     print(f"\nDone.  Split checkpoint saved to: {output_dir}")
-    print("configs/seed_omni/janus_1.3b/train_joint.yaml should reference:")
-    print(f"  tokenizer_path              : {output_dir}")
-    print(f"  modules.janus_siglip.weights_path : {siglip_dir}")
-    print(f"  modules.janus_vqvae.weights_path  : {vqvae_dir}")
-    print(f"  modules.text_encoder.weights_path : {te_dir}")
-    print(f"  modules.janus_llama.weights_path  : {llama_dir}")
+    print("configs/seed_omni/janus_1.3b/veomni_janus.yaml should reference:")
+    print(f"  model.model_path           : {output_dir}")
+    print(f"  modules.janus_siglip.weights_path : janus_siglip   # → {siglip_dir}")
+    print(f"  modules.janus_vqvae.weights_path  : janus_vqvae    # → {vqvae_dir}")
+    print(f"  modules.text_encoder.weights_path : text_encoder   # → {te_dir}")
+    print(f"  modules.janus_llama.weights_path  : janus_llama    # → {llama_dir}")
 
 
 if __name__ == "__main__":

@@ -2,10 +2,10 @@
 #
 # This YAML defines the **vocabulary** the rest of the configs are built on:
 #
-#   * `tokenizer_path`     — the only global asset; raw conversation hits this
-#                            before any module sees a tensor.
-#   * `modules`            — every OmniModule the framework needs to build,
-#                            with weights paths and per-module knobs.
+#   * `modules`            — every OmniModule the framework needs to build.
+#                            Each ``weights_path`` is relative to the split
+#                            checkpoint root (``model.model_path`` in the
+#                            launcher YAML) unless written as an absolute path.
 #   * `nodes`              — every call-site (`module.method`) the graph
 #                            engine can dispatch to, INCLUDING ones that
 #                            only fire during inference (`emit_image_start`,
@@ -18,19 +18,17 @@
 #                            file selects the **joint understanding +
 #                            generation** SFT setup by default.
 #
-# This is the file used standalone for training.  For inference, also load
-# one of the sibling `infer_*.yaml` files via:
+# The global tokenizer is **not** declared here — it is loaded from
+# ``model.model_path`` in the launcher YAML (``veomni_janus.yaml``).
 #
-#     OmniConfig.from_yamls("train_joint.yaml", "infer_<scenario>.yaml")
+# For inference, the launcher YAML selects one of the sibling ``infer_*.yaml``
+# files via ``model.omni_infer_type``; each file deep-merges its
+# ``generation_graph`` over this vocabulary.  See ``OmniConfig.from_launcher``.
 #
-# The merge is deep — the inference YAML's `generation_graph` simply paints
-# on top of the training vocabulary.  See `OmniConfig.from_yamls` for the
-# merge rules.
+# Split the upstream Janus checkpoint first (creates the sub-folders
+# referenced by relative ``modules.*.weights_path``)::
 #
-# Split the upstream Janus checkpoint first (creates the four sub-folders
-# referenced by `modules.*.weights_path`)::
-#
-#   python scripts/split_janus.py \
+#   python scripts/multimodal/convert_model/split_janus.py \
 #     --model_path /mnt/hdfs/veomni/models/transformers/Janus-1.3B \
 #     --output_dir /mnt/hdfs/veomni/models/seed_omni/janus_1.3b
 #
@@ -48,32 +46,31 @@
 #   bridge states (`image_vq_start` / `image_vq_end`).  The framework FSM
 #   has zero special-cased behaviour around boundary tokens.
 
-# ── Global asset (the only one) ───────────────────────────────────────────────
-tokenizer_path: /mnt/hdfs/veomni/models/seed_omni/janus_1.3b/tokenizer
 
 # ── Module registry ───────────────────────────────────────────────────────────
 # Module names match the registered HF model_type strings:
 #   janus_siglip / janus_vqvae / janus_llama / janus_text_encoder
-# At build-time the trainer resolves each `weights_path/config.json` →
-# model_type → OMNI_MODEL_REGISTRY[model_type]() and instantiates via
-# HF `from_pretrained`.  See `veomni/models/seed_omni/modules/__init__.py`.
+# At build-time the trainer resolves each ``weights_path`` against
+# ``model.model_path`` from the launcher YAML (relative → subfolder,
+# absolute → used as-is), then reads ``config.json`` → model_type →
+# OMNI_MODEL_REGISTRY[model_type]().
 modules:
   janus_siglip:
-    weights_path: /mnt/hdfs/veomni/models/seed_omni/janus_1.3b/janus_siglip
+    weights_path: janus_siglip
 
   janus_vqvae:
-    weights_path: /mnt/hdfs/veomni/models/seed_omni/janus_1.3b/janus_vqvae
+    weights_path: janus_vqvae
     freeze_vqvae: true
 
   text_encoder:
-    weights_path: /mnt/hdfs/veomni/models/seed_omni/janus_1.3b/text_encoder
+    weights_path: text_encoder
     # `vocab_size` / `hidden_size` / `tie_word_embeddings` come from
     # `text_encoder/config.json` (written by `scripts/split_janus.py`).
     # `begin_of_image_token_id` / `end_of_image_token_id` are resolved at
     # runtime from the module tokenizer (not stored in config.json).
 
   janus_llama:
-    weights_path: /mnt/hdfs/veomni/models/seed_omni/janus_1.3b/janus_llama
+    weights_path: janus_llama
     # `image_token_id` / `gen_image_token_id` are resolved at runtime from
     # the module tokenizer (not stored in config.json).
 

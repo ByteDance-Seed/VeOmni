@@ -73,11 +73,51 @@ YAML structure (maps 1-to-1 to this class):
           - {condition: {type: steps_complete}, next_state: text_ar}
 """
 
+import os
 from copy import deepcopy
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Mapping, Optional, Union
 
 from transformers import PretrainedConfig
+
+
+def resolve_module_weights_path(weights_path: str, model_path: str) -> str:
+    """Resolve a module ``weights_path`` against the split checkpoint root.
+
+    Relative paths (e.g. ``janus_siglip``) join under ``model_path``.
+    Absolute paths are returned unchanged.
+    """
+    if os.path.isabs(weights_path):
+        return weights_path
+    return os.path.join(model_path, weights_path)
+
+
+def apply_model_path(cfg: "OmniConfig", model_path: str) -> "OmniConfig":
+    """Resolve relative module ``weights_path`` values and set ``tokenizer_path``.
+
+    The global tokenizer lives at ``model_path`` (``tokenizer.json`` etc. sit
+    next to the per-module subfolders written by ``split_janus.py``).
+    """
+    for mod_cfg in cfg.modules.values():
+        weights_path = mod_cfg.get("weights_path")
+        if weights_path is not None:
+            mod_cfg["weights_path"] = resolve_module_weights_path(str(weights_path), model_path)
+    cfg.tokenizer_path = model_path
+    return cfg
+
+
+def load_launcher_model_section(launcher_yaml: Union[str, Path]) -> Dict[str, Any]:
+    """Return the ``model:`` block from a VeOmni launcher YAML."""
+    import yaml
+
+    path = Path(launcher_yaml)
+    data = yaml.safe_load(path.read_text()) or {}
+    if not isinstance(data, dict):
+        raise TypeError(f"YAML at '{path}' must be a top-level mapping.")
+    model = data.get("model")
+    if not isinstance(model, dict):
+        raise ValueError(f"YAML at '{path}' must declare a top-level `model:` mapping.")
+    return model
 
 
 class OmniConfig(PretrainedConfig):
@@ -168,15 +208,20 @@ class OmniConfig(PretrainedConfig):
         --------
         Load training-only (single file)::
 
-            cfg = OmniConfig.from_yamls("configs/seed_omni/janus_1.3b/train_joint.yaml")
+            cfg = OmniConfig.from_yamls("configs/seed_omni/janus_1.3b/train.yaml")
 
         Load training + an inference scenario (paint a generation_graph
         on top)::
 
             cfg = OmniConfig.from_yamls(
-                "configs/seed_omni/janus_1.3b/train_joint.yaml",
+                "configs/seed_omni/janus_1.3b/train.yaml",
                 "configs/seed_omni/janus_1.3b/infer_interleave.yaml",
             )
+
+        Load from a VeOmni launcher YAML (``veomni_*.yaml``) with runtime
+        path resolution::
+
+            cfg = OmniConfig.from_launcher("configs/seed_omni/janus_1.3b/veomni_janus.yaml")
         """
         import yaml
 
@@ -191,6 +236,42 @@ class OmniConfig(PretrainedConfig):
                 raise TypeError(f"YAML at '{p}' must be a top-level mapping; got {type(data).__name__}.")
             merged = _deep_merge(merged, data)
         return cls.from_dict(merged, **kwargs)
+
+    @classmethod
+    def from_launcher(
+        cls,
+        launcher_yaml: Union[str, Path],
+        *,
+        infer_type: Optional[str] = None,
+        **kwargs,
+    ) -> "OmniConfig":
+        """Load OmniConfig from a VeOmni launcher YAML with path resolution.
+
+        Reads ``model.model_path``, ``model.omni_train_yaml_path``, and
+        optionally ``model.omni_infer_yaml_path[omni_infer_type]`` from the
+        launcher file.  Relative ``modules.*.weights_path`` values in the
+        training YAML are joined under ``model_path``; absolute paths are kept
+        as-is.  ``tokenizer_path`` is set to ``model_path``.
+        """
+        model = load_launcher_model_section(launcher_yaml)
+        model_path = model.get("model_path")
+        train_yaml = model.get("omni_train_yaml_path")
+        if not model_path:
+            raise ValueError(f"`model.model_path` is required in {launcher_yaml!s}.")
+        if not train_yaml:
+            raise ValueError(f"`model.omni_train_yaml_path` is required in {launcher_yaml!s}.")
+
+        infer_map: Mapping[str, str] = model.get("omni_infer_yaml_path") or {}
+        selected = infer_type or model.get("omni_infer_type")
+        paths: List[Union[str, Path]] = [train_yaml]
+        if selected is not None:
+            if selected not in infer_map:
+                known = ", ".join(sorted(infer_map)) or "(none)"
+                raise KeyError(f"Unknown omni_infer_type {selected!r} in {launcher_yaml!s}; expected one of: {known}.")
+            paths.append(infer_map[selected])
+
+        cfg = cls.from_yamls(*paths, **kwargs)
+        return apply_model_path(cfg, str(model_path))
 
 
 def _deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
@@ -211,4 +292,9 @@ def _deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any
     return out
 
 
-__all__ = ["OmniConfig"]
+__all__ = [
+    "OmniConfig",
+    "apply_model_path",
+    "load_launcher_model_section",
+    "resolve_module_weights_path",
+]

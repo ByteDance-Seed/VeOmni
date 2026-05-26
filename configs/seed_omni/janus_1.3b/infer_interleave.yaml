@@ -1,11 +1,9 @@
 # Janus-1.3B inference — interleave T2T + T2I (mid-stream image generation).
 #
-# Use::
+# Use (via launcher YAML)::
 #
-#   OmniConfig.from_yamls(
-#       "configs/seed_omni/janus_1.3b/train_joint.yaml",
-#       "configs/seed_omni/janus_1.3b/infer_interleave.yaml",
-#   )
+#   OmniConfig.from_launcher("configs/seed_omni/janus_1.3b/veomni_janus.yaml",
+#                            infer_type="infer_interleave")
 #
 # Flow
 # ----

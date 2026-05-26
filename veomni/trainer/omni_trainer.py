@@ -105,17 +105,64 @@ logger = helper.create_logger(__name__)
 
 @dataclass
 class OmniModelArguments(ModelArguments):
-    omni_config_path: Optional[str] = field(
+    """Model arguments for OmniModel V2 training / inference."""
+
+    omni_train_yaml_path: Optional[str] = field(
         default=None,
         metadata={
             "help": (
-                "Path to the OmniModel YAML config (e.g. "
-                "configs/seed_omni/janus_1.3b/train_joint.yaml).  Sub-module "
-                "weights are read from each ``modules.<name>.weights_path`` "
-                "entry inside that YAML."
+                "Path to the OmniModel master training YAML (e.g. "
+                "configs/seed_omni/janus_1.3b/train.yaml).  Declares "
+                "modules / nodes / edges / training_graph."
             )
         },
     )
+    omni_infer_yaml_path: Optional[Dict[str, str]] = field(
+        default_factory=dict,
+        metadata={
+            "help": (
+                "Mapping of inference scenario name → inference YAML path.  "
+                "Each value is deep-merged over ``omni_train_yaml_path`` at "
+                "runtime.  Example keys: infer_gen, infer_und, infer_interleave."
+            )
+        },
+    )
+    omni_infer_type: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Active inference scenario key into ``omni_infer_yaml_path``.  "
+                "Used at runtime to select which ``generation_graph`` to load."
+            )
+        },
+    )
+
+    def __post_init__(self):
+        super().__post_init__()
+        if self.model_path is not None:
+            # Global tokenizer lives at the split checkpoint root.
+            self.tokenizer_path = self.model_path
+
+    def load_omni_config(self, *, infer_type: Optional[str] = None):
+        """Build :class:`OmniConfig` with resolved module paths."""
+        from ..models.seed_omni.configuration_seed_omni import OmniConfig, apply_model_path
+
+        if not self.omni_train_yaml_path:
+            raise ValueError("`model.omni_train_yaml_path` is required for OmniModel V2.")
+        if not self.model_path:
+            raise ValueError("`model.model_path` is required for OmniModel V2.")
+
+        paths = [self.omni_train_yaml_path]
+        selected = infer_type or self.omni_infer_type
+        if selected is not None:
+            infer_map = self.omni_infer_yaml_path or {}
+            if selected not in infer_map:
+                known = ", ".join(sorted(infer_map)) or "(none)"
+                raise KeyError(f"Unknown omni_infer_type {selected!r}; expected one of: {known}.")
+            paths.append(infer_map[selected])
+
+        cfg = OmniConfig.from_yamls(*paths)
+        return apply_model_path(cfg, self.model_path)
 
 
 @dataclass

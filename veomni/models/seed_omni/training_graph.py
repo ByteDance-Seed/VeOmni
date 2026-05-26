@@ -236,7 +236,6 @@ class TrainingGraph:
 
     def to_mermaid(
         self,
-        show_io: bool = True,
         title: Optional[str] = None,
     ) -> str:
         """Render the active training DAG as Mermaid flowchart syntax.
@@ -244,6 +243,9 @@ class TrainingGraph:
         Each graph node is labelled ``<node_name><br/><module>.<method>`` so
         multiple nodes of the same module are visually distinct.  Edges with
         ``to: end`` render as dashed arrows into a single ``end`` terminal.
+
+        A dashed ``data`` pseudo-node fans out to every source node to mark
+        inputs that come from the shared batch dict (``raw_batch`` at runtime).
 
         Layout
         ------
@@ -264,11 +266,6 @@ class TrainingGraph:
 
         Parameters
         ----------
-        show_io:
-            When True (default), draws a dashed ``raw_batch`` pseudo-node
-            that fans out to every source node so the diagram makes the
-            graph's external inputs explicit.  Pass False for a compact
-            view that drops the pseudo-node.
         title:
             Optional Mermaid ``title:`` directive.
         """
@@ -299,8 +296,8 @@ class TrainingGraph:
             rank_to_nodes[depth[n]].append(n)
         ranks = sorted(rank_to_nodes)
 
-        if show_io and sources:
-            lines.append("    raw_batch[(raw batch)]:::io")
+        if sources:
+            lines.append("    data[(data)]:::io")
 
         # One invisible subgraph per topological rank — the renderer keeps each
         # rank as a vertical stack, and the columns line up left-to-right.
@@ -326,9 +323,9 @@ class TrainingGraph:
         if has_end:
             lines.append('    end_sink(("end")):::end_sink')
 
-        if show_io and sources:
+        if sources:
             for n in sorted(sources):
-                lines.append(f"    raw_batch -.-> {n}")
+                lines.append(f"    data -.-> {n}")
 
         for e in self._active_edges:
             label = self._edge_label(e)

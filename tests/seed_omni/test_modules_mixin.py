@@ -369,10 +369,10 @@ def test_janus_train_yaml_loads_with_v2_module_names():
     """The shipped training YAML must round-trip through ``OmniConfig.from_yamls``."""
     from veomni.models.seed_omni.configuration_seed_omni import OmniConfig
 
-    cfg = OmniConfig.from_yamls(_janus_cfg_dir() / "train_joint.yaml")
+    cfg = OmniConfig.from_yamls(_janus_cfg_dir() / "train.yaml")
 
     assert set(cfg.modules) == {"janus_siglip", "janus_vqvae", "janus_llama", "text_encoder"}
-    assert cfg.tokenizer_path is not None
+    assert cfg.modules["janus_siglip"]["weights_path"] == "janus_siglip"
     # Sanity: every training-graph edge is declared in the edges pool.
     edge_names = set(cfg.edges)
     for e in cfg.training_edges:
@@ -385,13 +385,13 @@ def test_janus_train_yaml_loads_with_v2_module_names():
     assert "emit_start_to_ar" not in cfg.training_edges
 
 
-@pytest.mark.parametrize("infer_yaml", ["infer_interleave.yaml", "infer_t2i.yaml", "infer_understanding.yaml"])
+@pytest.mark.parametrize("infer_yaml", ["infer_interleave.yaml", "infer_gen.yaml", "infer_und.yaml"])
 def test_janus_train_plus_infer_merges_generation_graph(infer_yaml: str):
     """Two-file load: training vocabulary + inference scenario merge cleanly."""
     from veomni.models.seed_omni.configuration_seed_omni import OmniConfig
 
     cfg = OmniConfig.from_yamls(
-        _janus_cfg_dir() / "train_joint.yaml",
+        _janus_cfg_dir() / "train.yaml",
         _janus_cfg_dir() / infer_yaml,
     )
     # Training vocabulary still present.
@@ -454,3 +454,17 @@ def test_from_yamls_deep_merge_overrides_specific_keys(tmp_path: Path):
     assert cfg.modules["bar"]["weights_path"] == "/y"  # untouched module preserved
     assert cfg.has_generation_graph()  # painted on
     assert cfg.training_edges == ["e1"]  # not stomped
+
+
+def test_from_launcher_resolves_relative_module_paths():
+    from veomni.models.seed_omni.configuration_seed_omni import OmniConfig
+
+    launcher = _janus_cfg_dir() / "veomni_janus.yaml"
+    cfg = OmniConfig.from_launcher(launcher, infer_type="infer_gen")
+
+    root = "seed_omni/janus_1.3b"
+    assert cfg.tokenizer_path == root
+    assert cfg.modules["janus_siglip"]["weights_path"] == f"{root}/janus_siglip"
+    assert cfg.modules["text_encoder"]["weights_path"] == f"{root}/text_encoder"
+    assert cfg.has_generation_graph()
+    assert cfg.generation_graph["initial"] == "prompt_to_image"

@@ -1,0 +1,103 @@
+# VeOmni training config for OmniModel V2 — Janus-1.3B
+#
+# Launch:
+#   bash train.sh tasks/train_omni.py configs/seed_omni/janus_1.3b/veomni_janus.yaml
+#
+# Visualize graphs (training + all inference scenarios):
+#   python scripts/visualize_omni_graph.py configs/seed_omni/janus_1.3b/veomni_janus.yaml
+#   → graphs/veomni_janus/{training,infer_gen,infer_und,infer_interleave}.mmd
+#
+# Prerequisites:
+#   1. Split Janus checkpoint:
+#      python scripts/multimodal/convert_model/split_janus.py \
+#        --model_path /mnt/hdfs/veomni/models/transformers/Janus-1.3B \
+#        --output_dir /mnt/hdfs/veomni/models/seed_omni/janus_1.3b
+#
+#   2. Set ``model.model_path`` below to that split output directory.
+#      Relative ``modules.*.weights_path`` entries in ``train.yaml`` (e.g.
+#      ``janus_siglip``) resolve to ``<model_path>/janus_siglip`` at runtime.
+#      Absolute ``weights_path`` values are used as-is.  The global tokenizer
+#      is loaded from ``model_path`` (``tokenizer.json`` lives at the root).
+
+model:
+  model_path: seed_omni/janus_1.3b
+  # Master training vocabulary: modules / nodes / edges / training_graph.
+  omni_train_yaml_path: configs/seed_omni/janus_1.3b/train.yaml
+  # Inference scenarios — each YAML deep-merges over omni_train_yaml_path.
+  omni_infer_yaml_path:
+    infer_gen: configs/seed_omni/janus_1.3b/infer_gen.yaml
+    infer_und: configs/seed_omni/janus_1.3b/infer_und.yaml
+    infer_interleave: configs/seed_omni/janus_1.3b/infer_interleave.yaml
+  # Active scenario at inference time (must be a key in omni_infer_yaml_path).
+  omni_infer_type: infer_interleave
+
+  model_config: {}
+  ops_implementation:
+    attn_implementation: flash_attention_2
+    cross_entropy_loss_implementation: default
+
+data:
+  data_type: omni
+  max_seq_len: 4096
+  train_path: /mnt/hdfs/veomni/data/janus_sft
+  datasets_type: mapping
+  chat_template: default
+  dataloader:
+    type: native
+    num_workers: 4
+    drop_last: true
+    pin_memory: true
+    prefetch_factor: 2
+
+train:
+  seed: 42
+  num_train_epochs: 1
+  global_batch_size: 32
+  micro_batch_size: 2          # gradient-accumulation steps per train_step
+  init_device: meta            # meta → weights loaded lazily by build_parallelize_model
+
+  accelerator:
+    fsdp_config:
+      fsdp_mode: fsdp2
+      full_shard: true
+      reshard_after_forward: true
+      reshard_after_backward: true
+      forward_prefetch: true
+      offload: false
+      max_load_broadcast_size: 20.0
+      mixed_precision:
+        enable: true
+        param_dtype: bfloat16
+        reduce_dtype: float32
+    offload_config:
+      enable_activation: false
+      activation_gpu_limit: 0.0
+
+  gradient_checkpointing:
+    enable: true
+    enable_reentrant: false
+
+  optimizer:
+    type: adamw
+    lr: 1.0e-4
+    lr_min: 1.0e-6
+    lr_start: 0.0
+    lr_warmup_ratio: 0.03
+    lr_decay_style: cosine
+    lr_decay_ratio: 1.0
+    weight_decay: 0.01
+    max_grad_norm: 1.0
+    no_decay_params: []
+    no_decay_modules: []
+
+  checkpoint:
+    output_dir: outputs/janus_1.3b_omni_sft
+    save_steps: 500
+    save_epochs: 0
+    save_hf_weights: true
+    hf_save_steps: 500
+    hf_save_epochs: 0
+  wandb:
+    enable: true
+    project: VeOmni_omni
+    name: janus_1.3b_omni_sft

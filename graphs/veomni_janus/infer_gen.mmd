@@ -1,5 +1,5 @@
 ---
-title: train_joint+infer_t2i — inference FSM
+title: veomni_janus — infer_gen
 ---
 %%{init: {'flowchart': {'defaultRenderer': 'elk'}}}%%
 flowchart LR
@@ -7,13 +7,13 @@ flowchart LR
     fsm_done(("⏹")):::fsm_terminal
     subgraph state_prompt_to_image [prompt_to_image]
         direction LR
-        prompt_to_image__tok_encode["tok_encode<br/><i>text_embed.encode</i>"]:::body_node
+        prompt_to_image__tok_encode["tok_encode<br/><i>text_encoder.encode</i>"]:::body_node
         prompt_to_image__janus_llama["janus_llama<br/><i>janus_llama.forward</i>"]:::body_node
         prompt_to_image__tok_encode -->|"inputs_embeds"| prompt_to_image__janus_llama
     end
     subgraph state_image_vq_start [image_vq_start]
         direction LR
-        image_vq_start__emit_image_start["emit_image_start<br/><i>text_embed.emit_image_start</i>"]:::body_node
+        image_vq_start__emit_image_start["emit_image_start<br/><i>text_encoder.emit_image_start</i>"]:::body_node
         image_vq_start__janus_llama["janus_llama<br/><i>janus_llama.forward</i>"]:::body_node
         image_vq_start__emit_image_start -->|"inputs_embeds"| image_vq_start__janus_llama
     end
@@ -26,7 +26,7 @@ flowchart LR
     end
     subgraph state_image_vq_end [image_vq_end]
         direction LR
-        image_vq_end__emit_image_end["emit_image_end<br/><i>text_embed.emit_image_end</i>"]:::body_node
+        image_vq_end__emit_image_end["emit_image_end<br/><i>text_encoder.emit_image_end</i>"]:::body_node
         image_vq_end__janus_llama["janus_llama<br/><i>janus_llama.forward</i>"]:::body_node
         image_vq_end__emit_image_end -->|"inputs_embeds"| image_vq_end__janus_llama
     end

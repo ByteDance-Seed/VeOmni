@@ -1,11 +1,9 @@
 # Janus-1.3B inference — text-to-image only (no preceding text generation).
 #
-# Use::
+# Use (via launcher YAML)::
 #
-#   OmniConfig.from_yamls(
-#       "configs/seed_omni/janus_1.3b/train_joint.yaml",
-#       "configs/seed_omni/janus_1.3b/infer_t2i.yaml",
-#   )
+#   OmniConfig.from_launcher("configs/seed_omni/janus_1.3b/veomni_janus.yaml",
+#                            infer_type="infer_gen")
 #
 # Flow
 # ----

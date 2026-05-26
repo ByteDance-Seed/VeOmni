@@ -406,8 +406,8 @@ def test_to_mermaid_janus_joint_contains_node_labels_and_end_sink():
     # The rank-banding subgraphs are styled invisible.
     assert "style col0 fill:transparent,stroke:none" in out
 
-    assert "raw_batch -.-> vision_encoder" in out
-    assert "raw_batch -.-> vq_encode" in out
+    assert "data -.-> vision_encoder" in out
+    assert "data -.-> vq_encode" in out
 
     # The single-loss protocol means each module collects its own _loss; we no
     # longer draw a `losses` collector node or any fan-in arrows to it.
@@ -416,13 +416,12 @@ def test_to_mermaid_janus_joint_contains_node_labels_and_end_sink():
         assert f"{n} -.-> losses" not in out
 
 
-def test_to_mermaid_compact_view_drops_io():
+def test_to_mermaid_always_draws_data_pseudo_node():
     nodes, edges = _janus_joint_pools()
     g = TrainingGraph(nodes=nodes, edges=edges, training_edges=_JANUS_TRAIN_EDGES)
-    out = g.to_mermaid(show_io=False)
-    # `losses` is unconditionally absent (per-module _loss). `raw_batch` is
-    # gated by show_io.
-    assert "raw_batch" not in out and "losses" not in out
+    out = g.to_mermaid()
+    assert "data[(data)]" in out
+    assert "data -.-> vision_encoder" in out
+    assert "losses" not in out
     assert "vision_encoder" in out
-    # Even in compact view the explicit `end` sink should still render.
     assert "end_sink" in out

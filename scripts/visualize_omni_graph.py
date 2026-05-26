@@ -1,69 +1,44 @@
 """
-Visualize an OmniModel config as Mermaid diagrams.
+Visualize OmniModel graphs from a VeOmni launcher YAML.
 
-The script is fixed to a **two-YAML contract**: always pass the master
-training YAML first, then the inference YAML.  This mirrors how SeedOmni
-V2 configs are organised:
+Contract
+--------
+Pass a single launcher YAML (e.g. ``configs/seed_omni/janus_1.3b/veomni_janus.yaml``).
+The script reads:
 
-* The master ``train_*.yaml`` declares ``modules`` / ``nodes`` / ``edges``
-  / ``training_graph``.  It is the single source of truth for the node
-  and edge pools.
-* Each ``infer_*.yaml`` is a delta that carries only a ``generation_graph``
-  referencing those names; ``OmniConfig.from_yamls`` deep-merges the
-  inference YAML on top of the training YAML.
+* ``model.omni_train_yaml_path`` — master training vocabulary
+* ``model.omni_infer_yaml_path`` — dict of scenario → inference YAML
 
-Two diagrams are produced from the merged config:
+and writes **four** diagrams to ``graphs/<yaml_basename>/`` (folder name
+matches the launcher YAML stem, e.g. ``veomni_janus.yaml`` → ``graphs/veomni_janus/``):
 
-* **Training graph**: ``TrainingGraph.to_mermaid()`` — a left-to-right
-  flowchart over the active call-site nodes and edges.  Leaf nodes
-  flowing to the virtual ``end`` keyword render as a dashed terminal.
-* **Inference FSM**: ``GenerationGraph.to_mermaid()`` — a ``flowchart LR``
-  where each non-``done`` state is a labelled subgraph carrying the
-  body's mini-flow (real data edges); a dashed self-loop on each
-  subgraph encodes the iteration count (``×N`` for ``fixed:N``, no
-  label for ``variable``).  State transitions are thick ``==>`` arrows
-  carrying the firing condition.  The ``done`` state itself is not
-  drawn — every transition that targets it lands on a small terminal
-  node instead.
+1. ``training.{html|mmd}`` — training DAG from ``training_graph``
+2. ``<infer_key>.{html|mmd}`` — one inference FSM per entry in ``omni_infer_yaml_path``
 
 Usage
 -----
-  # Both diagrams (default).
-  python scripts/visualize_omni_graph.py \\
-      configs/seed_omni/janus_1.3b/train_joint.yaml \\
-      configs/seed_omni/janus_1.3b/infer_interleave.yaml
+  # Default: raw Mermaid (.mmd) → graphs/veomni_janus/
+  python scripts/visualize_omni_graph.py configs/seed_omni/janus_1.3b/veomni_janus.yaml
 
-  # Render a standalone HTML file (open in any browser) — both diagrams stacked.
-  python scripts/visualize_omni_graph.py train.yaml infer.yaml -o /tmp/janus.html
-
-  # Save to .md (two fenced blocks) or .mmd (single mermaid; also writes a
-  # sibling .fsm.mmd alongside the training graph).
-  python scripts/visualize_omni_graph.py train.yaml infer.yaml -o graph.mmd
-  python scripts/visualize_omni_graph.py train.yaml infer.yaml -o graph.md
-
-  # Compact view without the dashed raw_batch pseudo-node (training graph
-  # only — FSM diagram is unaffected).  The single-loss protocol means
-  # modules collect their own _loss, so no `losses` pseudo-node is drawn
-  # in either view.
-  python scripts/visualize_omni_graph.py train.yaml infer.yaml --no-io
-
-  # Restrict to one diagram.
-  python scripts/visualize_omni_graph.py train.yaml infer.yaml --only train
-  python scripts/visualize_omni_graph.py train.yaml infer.yaml --only fsm
+  # Browser-renderable HTML instead
+  python scripts/visualize_omni_graph.py configs/seed_omni/janus_1.3b/veomni_janus.yaml --format html
 """
 
 from __future__ import annotations
 
 import argparse
+import os
 import sys
-from pathlib import Path
+from typing import Literal
 
 import yaml
 
-from veomni.models.seed_omni.configuration_seed_omni import OmniConfig
+from veomni.models.seed_omni.configuration_seed_omni import OmniConfig, load_launcher_model_section
 from veomni.models.seed_omni.generation_graph import GenerationGraph
 from veomni.models.seed_omni.training_graph import TrainingGraph
 
+
+OutputFormat = Literal["html", "mmd"]
 
 _HTML_TEMPLATE = """<!doctype html>
 <html lang="en">
@@ -73,7 +48,6 @@ _HTML_TEMPLATE = """<!doctype html>
   <style>
     body {{ font-family: -apple-system, BlinkMacSystemFont, sans-serif; margin: 2rem; color: #222; }}
     h1   {{ font-size: 1.4rem; margin-bottom: 0.5rem; }}
-    h2   {{ font-size: 1.1rem; margin-top: 2rem; margin-bottom: 0.4rem; color: #333; }}
     .meta {{ color: #666; font-size: 0.9rem; margin-bottom: 1.5rem; }}
     .meta code {{ background: #f3f3f7; padding: 0 0.3em; border-radius: 3px; }}
     .mermaid {{ background: #fafafa; padding: 1rem; border-radius: 6px; }}
@@ -85,239 +59,158 @@ _HTML_TEMPLATE = """<!doctype html>
 </head>
 <body>
   <h1>{title}</h1>
-  <div class="meta">
-    <div>execution_order: <code>{order}</code></div>
-    <div>sources: <code>{sources}</code></div>
-    <div>sinks: <code>{sinks}</code></div>
-    {fsm_meta}
-  </div>
-{sections}
+  <div class="meta">{meta}</div>
+  <pre class="mermaid">
+{body}
+  </pre>
 </body>
 </html>
 """
 
-_HTML_SECTION = """  <h2>{heading}</h2>
-  <pre class="mermaid">
-{body}
-  </pre>
-"""
-
-
 _MASTER_KEYS = ("nodes", "edges", "training_graph")
 
 
-def _safe_load_yaml(path: Path) -> dict:
+def _yaml_stem(yaml_path: str) -> str:
+    return os.path.splitext(os.path.basename(yaml_path))[0]
+
+
+def _safe_load_yaml(path: str) -> dict:
     try:
-        data = yaml.safe_load(path.read_text())
+        with open(path, encoding="utf-8") as f:
+            data = yaml.safe_load(f)
     except yaml.YAMLError as e:
         sys.exit(f"failed to parse YAML `{path}`: {e}")
+    except OSError as e:
+        sys.exit(f"failed to read YAML `{path}`: {e}")
     return data if isinstance(data, dict) else {}
 
 
-def _validate_yaml_roles(train_yaml: Path, infer_yaml: Path) -> None:
-    """Enforce the two-YAML contract: first arg is master, second is FSM delta.
-
-    Each file is checked once, on its own, against a minimal schema:
-
-    * ``train_yaml`` MUST declare at least one of the master pool keys
-      (``nodes`` / ``edges`` / ``training_graph``).  If it doesn't, the
-      caller almost certainly swapped the two paths — exit with an error
-      that suggests the fix instead of letting ``OmniConfig.from_yamls``
-      raise something cryptic about an empty ``training_edges``.
-    * ``infer_yaml`` MUST declare ``generation_graph``.  If it carries
-      master keys too, that's allowed (a self-contained config) but warned
-      about — usually the sign of a stray edit that drifted out of the
-      delta-YAML pattern.
-    """
-    train_data = _safe_load_yaml(train_yaml)
-    infer_data = _safe_load_yaml(infer_yaml)
-
-    train_has_master = any(k in train_data for k in _MASTER_KEYS)
-    infer_has_master = any(k in infer_data for k in _MASTER_KEYS)
-    train_has_fsm = "generation_graph" in train_data
-    infer_has_fsm = "generation_graph" in infer_data
-
-    # Most common mistake: caller swapped train_yaml ↔ infer_yaml.
-    if not train_has_master and infer_has_master:
+def _validate_train_yaml(train_yaml: str) -> None:
+    data = _safe_load_yaml(train_yaml)
+    if not any(k in data for k in _MASTER_KEYS):
         sys.exit(
-            f"YAML role mismatch: the FIRST argument should be the master training "
-            f"YAML (with `nodes` / `edges` / `training_graph`), but `{train_yaml.name}` "
-            f"has none of those — and `{infer_yaml.name}` does.\n"
-            f"Did you swap the two paths?  Try:\n"
-            f"    python scripts/visualize_omni_graph.py {infer_yaml} {train_yaml}"
+            f"`{train_yaml}` must declare at least one of `nodes` / `edges` / `training_graph` (master training YAML)."
         )
 
-    if not train_has_master:
-        sys.exit(
-            f"`{train_yaml}` (passed as the master training YAML) declares none of "
-            f"`nodes` / `edges` / `training_graph`.  Pass a complete training YAML."
-        )
 
-    if not infer_has_fsm:
-        sys.exit(
-            f"`{infer_yaml}` (passed as the inference YAML) has no `generation_graph` "
-            f"section.  Pass an inference YAML such as `infer_*.yaml`."
-        )
+def _validate_infer_yaml(infer_yaml: str) -> None:
+    data = _safe_load_yaml(infer_yaml)
+    if "generation_graph" not in data:
+        sys.exit(f"`{infer_yaml}` has no `generation_graph` section (inference YAML).")
 
-    if infer_has_master:
-        # Soft warning: usually the second file is a pure delta.  Carrying
-        # master keys is allowed (deep-merge will overwrite the master) but
-        # is surprising enough to flag.
-        print(
-            f"warning: `{infer_yaml.name}` carries master pool keys "
-            f"({', '.join(k for k in _MASTER_KEYS if k in infer_data)}); these "
-            f"will deep-merge over `{train_yaml.name}`.",
-            file=sys.stderr,
-        )
 
-    if train_has_fsm:
-        print(
-            f"warning: `{train_yaml.name}` already carries `generation_graph`; "
-            f"`{infer_yaml.name}` will deep-merge over it.",
-            file=sys.stderr,
-        )
+def _write_diagram(
+    path: str,
+    *,
+    fmt: OutputFormat,
+    title: str,
+    body: str,
+    meta: str,
+) -> None:
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    if fmt == "html":
+        content = _HTML_TEMPLATE.format(title=title, meta=meta, body=body)
+    else:
+        content = body + "\n"
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(content)
+
+
+def _render_training(cfg: OmniConfig, *, title: str) -> tuple[str, str]:
+    graph = TrainingGraph(
+        nodes=cfg.nodes,
+        edges=cfg.edges,
+        training_edges=cfg.training_edges,
+    )
+    body = graph.to_mermaid(title=title)
+    meta = (
+        f"<div>execution_order: <code>{', '.join(graph.execution_order)}</code></div>"
+        f"<div>sources: <code>{', '.join(graph.sources)}</code></div>"
+        f"<div>sinks: <code>{', '.join(graph.sinks)}</code></div>"
+    )
+    return body, meta
+
+
+def _render_fsm(cfg: OmniConfig, *, title: str) -> tuple[str, str]:
+    fsm = GenerationGraph(fsm_config=cfg.generation_graph, nodes=cfg.nodes, edges=cfg.edges)
+    body = fsm.to_mermaid(title=title)
+    meta = (
+        f"<div>fsm_initial: <code>{fsm.initial_state}</code></div>"
+        f"<div>fsm_states: <code>{', '.join(fsm.state_names)}</code></div>"
+    )
+    return body, meta
+
+
+def _output_dir(launcher_yaml: str) -> str:
+    """``graphs/<yaml_stem>/`` — folder name matches the launcher YAML basename."""
+    return os.path.join("graphs", _yaml_stem(launcher_yaml))
 
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument(
-        "train_yaml",
-        type=Path,
+        "launcher_yaml",
         help=(
-            "Master training YAML — declares `modules` / `nodes` / `edges` / "
-            "`training_graph`.  E.g. configs/seed_omni/janus_1.3b/train_joint.yaml"
+            "VeOmni launcher YAML (e.g. configs/seed_omni/janus_1.3b/veomni_janus.yaml).  "
+            "Must declare model.omni_train_yaml_path and model.omni_infer_yaml_path."
         ),
     )
     parser.add_argument(
-        "infer_yaml",
-        type=Path,
-        help=(
-            "Inference YAML — carries a `generation_graph` referencing nodes / "
-            "edges from the master.  Deep-merged on top of the training YAML.  "
-            "E.g. configs/seed_omni/janus_1.3b/infer_interleave.yaml"
-        ),
-    )
-    parser.add_argument(
-        "--output",
-        "-o",
-        type=Path,
-        default=None,
-        help="Output file: .html (browser-renderable), .mmd (raw mermaid), .md (fenced). Prints to stdout if omitted.",
-    )
-    parser.add_argument(
-        "--no-io",
-        action="store_true",
-        help="Compact view: drop the dashed raw_batch pseudo-node (training graph only).",
-    )
-    parser.add_argument(
-        "--title",
-        type=str,
-        default=None,
-        help="Diagram title (default: '<train_stem>+<infer_stem>').",
-    )
-    parser.add_argument(
-        "--only",
-        choices=("train", "fsm", "both"),
-        default="both",
-        help="Restrict output to one diagram. Default: both.",
+        "--format",
+        choices=("html", "mmd"),
+        default="mmd",
+        help="Output format: raw Mermaid (.mmd, default) or browser HTML (.html).",
     )
     return parser
 
 
 def main() -> None:
     args = _build_parser().parse_args()
-    train_yaml: Path = args.train_yaml
-    infer_yaml: Path = args.infer_yaml
+    launcher_yaml: str = args.launcher_yaml
+    fmt: OutputFormat = args.format
+    if not os.path.isfile(launcher_yaml):
+        sys.exit(f"config not found: {launcher_yaml}")
 
-    for p in (train_yaml, infer_yaml):
-        if not p.exists():
-            sys.exit(f"config not found: {p}")
+    model = load_launcher_model_section(launcher_yaml)
+    train_yaml = model.get("omni_train_yaml_path") or ""
+    infer_map: dict[str, str] = dict(model.get("omni_infer_yaml_path") or {})
+    if not train_yaml:
+        sys.exit(f"`model.omni_train_yaml_path` is missing in {launcher_yaml}")
+    if not os.path.isfile(train_yaml):
+        sys.exit(f"training YAML not found: {train_yaml}")
+    if not infer_map:
+        sys.exit(f"`model.omni_infer_yaml_path` is empty in {launcher_yaml}")
 
-    _validate_yaml_roles(train_yaml, infer_yaml)
+    _validate_train_yaml(train_yaml)
+    for infer_key, infer_path in infer_map.items():
+        if not os.path.isfile(infer_path):
+            sys.exit(f"inference YAML not found for {infer_key!r}: {infer_path}")
+        _validate_infer_yaml(infer_path)
 
-    cfg = OmniConfig.from_yamls(train_yaml, infer_yaml)
-    graph = TrainingGraph(
-        nodes=cfg.nodes,
-        edges=cfg.edges,
-        training_edges=cfg.training_edges,
-    )
+    out_dir = _output_dir(launcher_yaml)
+    launcher_label = _yaml_stem(launcher_yaml)
+    ext = ".html" if fmt == "html" else ".mmd"
 
-    title = args.title or f"{train_yaml.stem}+{infer_yaml.stem}"
+    # 1. Training graph (train YAML only).
+    cfg_train = OmniConfig.from_yamls(train_yaml)
+    train_title = f"{launcher_label} — training"
+    train_body, train_meta = _render_training(cfg_train, title=train_title)
+    train_path = os.path.join(out_dir, "training" + ext)
+    _write_diagram(train_path, fmt=fmt, title=train_title, body=train_body, meta=train_meta)
+    print(f"wrote {train_path}", file=sys.stderr)
 
-    diagrams: list[tuple[str, str]] = []  # (heading, mermaid_body)
+    # 2. One FSM per inference scenario.
+    for infer_key, infer_path in sorted(infer_map.items()):
+        cfg = OmniConfig.from_yamls(train_yaml, infer_path)
+        fsm_title = f"{launcher_label} — {infer_key}"
+        fsm_body, fsm_meta = _render_fsm(cfg, title=fsm_title)
+        fsm_path = os.path.join(out_dir, infer_key + ext)
+        _write_diagram(fsm_path, fmt=fmt, title=fsm_title, body=fsm_body, meta=fsm_meta)
+        print(f"wrote {fsm_path}", file=sys.stderr)
 
-    if args.only in ("train", "both"):
-        diagrams.append(
-            (
-                "Training graph",
-                graph.to_mermaid(show_io=not args.no_io, title=f"{title} — training"),
-            )
-        )
-
-    # The two-YAML contract guarantees a `generation_graph` is present (we
-    # validated `infer_yaml` above), so this branch is always taken when
-    # the user asks for the FSM.
-    fsm = GenerationGraph(fsm_config=cfg.generation_graph, nodes=cfg.nodes, edges=cfg.edges)
-    if args.only in ("fsm", "both"):
-        diagrams.append(("Inference FSM", fsm.to_mermaid(title=f"{title} — inference FSM")))
-
-    fsm_meta_text = (
-        f"<div>fsm_initial: <code>{fsm.initial_state}</code></div>"
-        f"<div>fsm_states: <code>{', '.join(fsm.state_names)}</code></div>"
-    )
-
-    out = args.output
-
-    if out is None:
-        # stdout: emit each diagram, separated by a blank line; stats to stderr.
-        print(f"# {title}", file=sys.stderr)
-        print(f"  execution_order : {graph.execution_order}", file=sys.stderr)
-        print(f"  sources         : {graph.sources}", file=sys.stderr)
-        print(f"  sinks           : {graph.sinks}", file=sys.stderr)
-        print(f"  fsm_initial     : {fsm.initial_state}", file=sys.stderr)
-        print(f"  fsm_states      : {fsm.state_names}", file=sys.stderr)
-        print("", file=sys.stderr)
-        for i, (heading, body) in enumerate(diagrams):
-            if i > 0:
-                print("")
-            print(f"# {heading}")
-            print(body)
-        return
-
-    suffix = out.suffix.lower()
-    if suffix == ".html":
-        sections = "\n".join(_HTML_SECTION.format(heading=h, body=b) for h, b in diagrams)
-        out.write_text(
-            _HTML_TEMPLATE.format(
-                title=title,
-                order=", ".join(graph.execution_order),
-                sources=", ".join(graph.sources),
-                sinks=", ".join(graph.sinks),
-                fsm_meta=fsm_meta_text,
-                sections=sections,
-            )
-        )
-        print(f"wrote {out}", file=sys.stderr)
-    elif suffix == ".md":
-        chunks = [f"# {title}\n"]
-        for heading, body in diagrams:
-            chunks.append(f"## {heading}\n\n```mermaid\n{body}\n```\n")
-        out.write_text("\n".join(chunks))
-        print(f"wrote {out}", file=sys.stderr)
-    elif suffix == ".mmd":
-        # .mmd carries a single mermaid diagram. Write training graph here;
-        # write the FSM (if present and requested) to a sibling `.fsm.mmd`.
-        train_body = next((b for h, b in diagrams if h == "Training graph"), None)
-        fsm_body = next((b for h, b in diagrams if h == "Inference FSM"), None)
-        if train_body is not None:
-            out.write_text(train_body + "\n")
-            print(f"wrote {out}", file=sys.stderr)
-        if fsm_body is not None:
-            fsm_path = out.with_suffix(".fsm.mmd") if train_body is not None else out
-            fsm_path.write_text(fsm_body + "\n")
-            print(f"wrote {fsm_path}", file=sys.stderr)
-    else:
-        sys.exit(f"unknown output suffix {suffix!r}; expected .html, .mmd, or .md")
+    print(f"\nDone — {1 + len(infer_map)} {fmt} diagrams under {out_dir}/", file=sys.stderr)
 
 
 if __name__ == "__main__":

@@ -1,14 +1,14 @@
 ---
-title: train_joint+infer_interleave — training
+title: veomni_janus — training
 ---
 %%{init: {'flowchart': {'defaultRenderer': 'elk'}}}%%
 flowchart LR
-    raw_batch[(raw batch)]:::io
+    data[(data)]:::io
     subgraph col0 [ ]
         direction TB
         siglip_encode["siglip_encode<br/><i>janus_siglip.forward</i>"]:::source
         vae_encode["vae_encode<br/><i>janus_vqvae.encode</i>"]:::source
-        tok_encode["tok_encode<br/><i>text_embed.encode</i>"]:::source
+        tok_encode["tok_encode<br/><i>text_encoder.encode</i>"]:::source
     end
     subgraph col1 [ ]
         direction TB
@@ -16,13 +16,13 @@ flowchart LR
     end
     subgraph col2 [ ]
         direction TB
-        tok_decode["tok_decode<br/><i>text_embed.decode</i>"]:::sink
+        tok_decode["tok_decode<br/><i>text_encoder.decode</i>"]:::sink
         vae_decode["vae_decode<br/><i>janus_vqvae.decode</i>"]:::sink
     end
     end_sink(("end")):::end_sink
-    raw_batch -.-> siglip_encode
-    raw_batch -.-> tok_encode
-    raw_batch -.-> vae_encode
+    data -.-> siglip_encode
+    data -.-> tok_encode
+    data -.-> vae_encode
     siglip_encode -->|"image_embeds → und_image_embeds"| janus_llama
     vae_encode -->|"gen_embeds → gen_image_embeds"| janus_llama
     tok_encode -->|"inputs_embeds"| janus_llama

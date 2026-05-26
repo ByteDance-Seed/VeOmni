@@ -1,12 +1,10 @@
 # Janus-1.3B inference — image understanding (I2T / VQA).  Uni-directional;
 # never emits an image mid-stream.
 #
-# Use::
+# Use (via launcher YAML)::
 #
-#   OmniConfig.from_yamls(
-#       "configs/seed_omni/janus_1.3b/train_joint.yaml",
-#       "configs/seed_omni/janus_1.3b/infer_understanding.yaml",
-#   )
+#   OmniConfig.from_launcher("configs/seed_omni/janus_1.3b/veomni_janus.yaml",
+#                            infer_type="infer_und")
 #
 # Flow
 # ----
