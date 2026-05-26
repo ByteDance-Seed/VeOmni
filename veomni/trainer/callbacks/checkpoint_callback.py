@@ -123,20 +123,13 @@ class CheckpointerCallback(Callback):
             },
         }
 
-        # Release the caching allocator's residual activations / autograd
-        # buffers from the just-completed training step BEFORE DCP starts
-        # gathering state dicts. Both the dcp planner's NCCL collective
-        # buffers and (for MoE / VLM training) the placeholder Adam state
-        # allocated inside ``OptimizerState._fill_missing_optimizer_states``
-        # for params that haven't received a gradient yet land on the
-        # same allocator, so any leftover headroom here pays off twice.
-        # The post-save ``helper.empty_cache()`` below already runs after
-        # the save; without this pre-save call the save fights the training
-        # step for HBM, which manifested on Qwen3.5-35B-a3b VL h100x16 as
-        # ``NCCL WARN Cuda failure 2 'out of memory'`` inside dcp.save's
-        # gather (``include/alloc.h:228``). The cost is one ``cudaFree`` +
-        # cache reset per ``save_steps`` (default 50–200 steps), well below
-        # measurement noise.
+        # Free the training step's residual activations / autograd buffers
+        # before DCP allocates NCCL collective buffers for the gather.
+        # Mirrors the existing post-save ``empty_cache()`` below; without
+        # this pre-save call the save can fight the training step for HBM
+        # (observed as ``NCCL WARN Cuda failure 2 'out of memory'`` inside
+        # dcp.save on Qwen3.5-35B-a3b VL h100x16). Cost: one ``cudaFree``
+        # per ``save_steps``, well below noise.
         helper.empty_cache()
 
         self.trainer.checkpointer.save(
