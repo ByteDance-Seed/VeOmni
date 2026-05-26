@@ -1,6 +1,6 @@
-"""Config for :class:`JanusTextEmbed`.
+"""Config for :class:`JanusTextEncoder`.
 
-Specialises :class:`TextEmbedConfig` with the two Janus-specific boundary
+Specialises :class:`TextEncoderConfig` with the two Janus-specific boundary
 token ids that the model is responsible for emitting around a VQ image
 span:
 
@@ -9,7 +9,7 @@ span:
 
 Why a Janus-specific subclass?
 ------------------------------
-The plain :class:`TextEmbed` is vocab-bound but model-agnostic and has
+The plain :class:`TextEncoder` is vocab-bound but model-agnostic and has
 *no* notion of boundary tokens.  Emitting :code:`<begin_of_image>` /
 :code:`<end_of_image>` around a VQ image span is a Janus-specific
 behaviour — that knowledge lives in the model, not in the FSM
@@ -20,18 +20,18 @@ The framework reaches these emit methods via dedicated graph nodes
 (``emit_image_start`` / ``emit_image_end``) declared in the YAML.
 """
 
-from ...base.text_embed import TextEmbedConfig
+from ...base.text_encoder.configuration import TextEncoderConfig
 
 
-class JanusTextEmbedConfig(TextEmbedConfig):
-    """TextEmbed config + Janus image-boundary token ids.
+class JanusTextEncoderConfig(TextEncoderConfig):
+    """TextEncoder config + Janus image-boundary token ids.
 
     Defaults are the Janus-1.3B tokenizer values; ``scripts/split_janus.py``
     re-reads them from the actual tokenizer and writes the result into
     ``config.json`` so reloads are checkpoint-faithful.
     """
 
-    model_type = "janus_text_embed"
+    model_type = "janus_text_encoder"
 
     def __init__(
         self,

@@ -17,9 +17,9 @@
 #
 #   1. Core graph / runtime types (:class:`OmniConfig`, :class:`OmniModel`,
 #      :class:`OmniModule`, :class:`TrainingGraph`, :class:`GenerationGraph`).
-#   2. Module mixin registry — :data:`MODULE_MIXIN_REGISTRY`,
-#      :data:`MODULE_PROCESSOR_REGISTRY` — used by :class:`OmniTrainer`
-#      (Step 2 wiring) to resolve ``model_type → mixin class``.
+#   2. Module registries — :data:`OMNI_CONFIG_REGISTRY`,
+#      :data:`OMNI_MODEL_REGISTRY`, :data:`OMNI_PROCESSOR_REGISTRY` — resolve
+#      ``model_type → class`` lazily at runtime.
 #   3. Per-module checkpoint callback for Step-2 trainer integration.
 from .checkpoint_callback import OmniModuleCheckpointCallback
 from .configuration_seed_omni import OmniConfig
@@ -27,7 +27,11 @@ from .generation_graph import GenerationGraph
 from .graph import END, EdgeDef, NodeDef
 from .modeling_omni import OmniModel
 from .module import OmniModule
-from .modules import MODULE_MIXIN_REGISTRY, MODULE_PROCESSOR_REGISTRY
+from .modules import (
+    OMNI_CONFIG_REGISTRY,
+    OMNI_MODEL_REGISTRY,
+    OMNI_PROCESSOR_REGISTRY,
+)
 from .training_graph import TrainingGraph
 
 
@@ -42,8 +46,9 @@ __all__ = [
     "EdgeDef",
     "END",
     # Module registry
-    "MODULE_MIXIN_REGISTRY",
-    "MODULE_PROCESSOR_REGISTRY",
+    "OMNI_CONFIG_REGISTRY",
+    "OMNI_MODEL_REGISTRY",
+    "OMNI_PROCESSOR_REGISTRY",
     # Lifecycle
     "OmniModuleCheckpointCallback",
 ]

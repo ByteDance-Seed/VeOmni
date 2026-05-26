@@ -1,8 +1,7 @@
 """Config for :class:`JanusSiglip` — Janus' SigLIP vision tower + aligner.
 
-The ``model_type`` literal here is the lookup key used by both HuggingFace
-``AutoConfig`` (after registration in :mod:`...modules.__init__`) and the
-SeedOmni V2 ``MODULE_MIXIN_REGISTRY``.
+The ``model_type`` literal here is the lookup key for
+``OMNI_CONFIG_REGISTRY`` / ``OMNI_MODEL_REGISTRY``.
 
 The whole vision-side hyper-parameters travel under ``vision_config`` —
 that mirrors the original :class:`transformers.JanusVisionConfig` schema so

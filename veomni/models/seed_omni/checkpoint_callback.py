@@ -8,7 +8,7 @@ trainer-agnostic by design — Step 2 of the migration wires it into
 Layout produced
 ---------------
 For a model with three modules (``janus_siglip``, ``janus_vqvae``,
-``janus_llama``, ``text_embed``)::
+``janus_llama``, ``text_encoder``)::
 
     <save_root>/global_step_{N}/hf_ckpt/
     ├── janus_siglip/
@@ -22,7 +22,7 @@ For a model with three modules (``janus_siglip``, ``janus_vqvae``,
     ├── janus_llama/
     │   ├── config.json
     │   └── model.safetensors            # no per-module asset
-    ├── text_embed/
+    ├── text_encoder/
     │   ├── config.json
     │   └── model.safetensors
     ├── tokenizer/                        # global; written by OmniTrainer top-level callback
@@ -76,7 +76,7 @@ class OmniModuleCheckpointCallback:
         ``processor.save_pretrained`` is called alongside the module so
         the next ``from_pretrained`` finds it next to ``config.json``.
         Modules without a per-module asset (``janus_llama``,
-        ``text_embed``) leave this ``None``.
+        ``text_encoder``) leave this ``None``.
     is_rank_0:
         Whether this process is the global rank-0 writer.  Only rank 0
         actually writes — other ranks no-op (matches the convention of

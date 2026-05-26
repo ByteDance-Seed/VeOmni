@@ -1,5 +1,5 @@
 """
-JanusTextEmbed — :class:`TextEmbed` + Janus image-boundary token emitters.
+JanusTextEncoder — :class:`TextEncoder` + Janus image-boundary token emitters.
 
 Why a Janus-specific subclass?
 ------------------------------
@@ -11,8 +11,8 @@ particular vocabulary uses ``100016`` / ``100593`` as image boundaries.
 So instead of having the FSM "append a token" between states, we add
 two explicit call-site methods on the model::
 
-    text_embed.emit_image_start()  # → <boi> token + its inputs_embeds
-    text_embed.emit_image_end()    # → <eoi> token + its inputs_embeds
+    text_encoder.emit_image_start()  # → <boi> token + its inputs_embeds
+    text_encoder.emit_image_end()    # → <eoi> token + its inputs_embeds
 
 The YAML wires these up as nodes (``emit_image_start`` /
 ``emit_image_end``) and the FSM body lists the corresponding edges.
@@ -22,7 +22,7 @@ convention, no special kwargs, no on_exit / on_enter hooks.
 
 Output protocol
 ---------------
-Both emit methods return the same key set as :meth:`TextEmbed.encode`
+Both emit methods return the same key set as :meth:`TextEncoder.encode`
 plus a synthesised ``last_token_id`` so an FSM ``token_match`` transition
 on the boundary id fires immediately after the bridge state runs::
 
@@ -39,14 +39,14 @@ from typing import Any, Dict
 
 import torch
 
-from ...base.text_embed import TextEmbed
-from .configuration import JanusTextEmbedConfig
+from ...base.text_encoder.modeling import TextEncoder
+from .configuration import JanusTextEncoderConfig
 
 
-class JanusTextEmbed(TextEmbed):
-    """:class:`TextEmbed` + ``emit_image_start`` / ``emit_image_end``."""
+class JanusTextEncoder(TextEncoder):
+    """:class:`TextEncoder` + ``emit_image_start`` / ``emit_image_end``."""
 
-    config_class = JanusTextEmbedConfig
+    config_class = JanusTextEncoderConfig
 
     # ── Janus boundary-token emitters ─────────────────────────────────────────
 

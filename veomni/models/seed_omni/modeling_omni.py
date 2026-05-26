@@ -66,7 +66,7 @@ Once the FSM reaches the built-in ``done`` state (auto-injected by
 :meth:`OmniModule.finalize` on every active module and merges any non-empty
 return values into ``ctx['finalize'][<module_name>]``.  This is where
 modules turn their accumulated step outputs into something usable:
-``TextEmbed.finalize`` tokenizer-decodes all generated ``input_ids``,
+``TextEncoder.finalize`` tokenizer-decodes all generated ``input_ids``,
 ``JanusVqvae.finalize`` saves accumulated VQ patches as images on disk,
 etc.  The default ``finalize`` is a no-op so modules that have nothing to
 report cost nothing.

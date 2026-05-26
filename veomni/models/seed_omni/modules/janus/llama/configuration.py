@@ -17,9 +17,8 @@ Adds two Janus-specific token IDs at the top level:
                              keep the field separate so a derived model
                              with distinct slots can override it).
 
-The ``model_type`` literal here is the lookup key for both HF
-``AutoConfig`` (after registration in :mod:`...modules.__init__`) and the
-SeedOmni V2 ``MODULE_MIXIN_REGISTRY``.
+The ``model_type`` literal here is the lookup key for
+``OMNI_CONFIG_REGISTRY`` / ``OMNI_MODEL_REGISTRY``.
 """
 
 from typing import Any, Dict, Optional

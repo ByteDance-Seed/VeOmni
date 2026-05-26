@@ -7,7 +7,7 @@ YAML structure (maps 1-to-1 to this class):
   tokenizer_path: /path/to/tokenizer
 
   # ── Modules: one entry per OmniModule.  `model_type` is read from each
-  #    module's `config.json` (loaded via HF AutoConfig) and is NOT specified
+  #    module's `config.json` (model_type read by OMNI_*_REGISTRY) and is NOT specified
   #    here — the YAML carries only the location and overrides.
   modules:
     siglip:        {weights_path: ..., config_path: ...}

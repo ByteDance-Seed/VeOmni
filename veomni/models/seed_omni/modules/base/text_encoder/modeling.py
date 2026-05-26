@@ -1,5 +1,5 @@
 """
-TextEmbed — generic OmniModule wrapping the word-token embedding (``wte``)
+TextEncoder — generic OmniModule wrapping the word-token embedding (``wte``)
 and language-model head (``lm_head``) extracted from any causal LLM.
 
 Why a separate module?
@@ -20,7 +20,7 @@ layers.
 
 Mixin form
 ----------
-``TextEmbed`` multi-inherits ``OmniModule`` (the SeedOmni V2 mixin) and
+``TextEncoder`` multi-inherits ``OmniModule`` (the SeedOmni V2 mixin) and
 :class:`transformers.PreTrainedModel` so HuggingFace ``from_pretrained`` /
 ``save_pretrained`` work natively — no custom build hooks required.
 
@@ -61,10 +61,10 @@ import torch.nn.functional as F
 from transformers import PreTrainedModel
 
 from ....module import OmniModule
-from .configuration import TextEmbedConfig
+from .configuration import TextEncoderConfig
 
 
-class TextEmbed(OmniModule, PreTrainedModel):
+class TextEncoder(OmniModule, PreTrainedModel):
     """Word-token embedding + LM head as a single OmniModule.
 
     Multi-inherits :class:`OmniModule` (V2 mixin) and HuggingFace
@@ -73,12 +73,12 @@ class TextEmbed(OmniModule, PreTrainedModel):
     model.safetensors}``.
     """
 
-    config_class = TextEmbedConfig
-    base_model_prefix = "text_embed"
+    config_class = TextEncoderConfig
+    base_model_prefix = "text_encoder"
     _no_split_modules: list = []
     main_input_name = "input_ids"
 
-    def __init__(self, config: TextEmbedConfig):
+    def __init__(self, config: TextEncoderConfig):
         super().__init__(config)
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)

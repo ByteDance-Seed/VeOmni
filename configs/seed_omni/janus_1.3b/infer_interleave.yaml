@@ -24,7 +24,7 @@
 #     → text_ar
 #
 # Bridge states (`image_vq_start` / `image_vq_end`) own the boundary-token
-# emission via `JanusTextEmbed.emit_image_start` / `emit_image_end`.  The
+# emission via `JanusTextEncoder.emit_image_start` / `emit_image_end`.  The
 # framework FSM has no special-cased boundary logic — these are normal
 # nodes that happen to produce a single fixed token.
 

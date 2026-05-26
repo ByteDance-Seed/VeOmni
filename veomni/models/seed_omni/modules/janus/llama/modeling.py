@@ -6,7 +6,7 @@ Mixin form: ``class JanusLlama(OmniModule, PreTrainedModel)``.
 The backbone *contains* a vanilla :class:`transformers.LlamaModel` whose
 ``embed_tokens`` has been replaced with an :class:`nn.Identity` — the
 word-token embedding lives in the sibling
-:class:`~veomni.models.seed_omni.modules.base.TextEmbed` module.  This
+:class:`~veomni.models.seed_omni.modules.base.TextEncoder` module.  This
 keeps the LLaMA forward path unchanged; ``inputs_embeds`` (passed in by
 the graph from the ``tok_encode`` node) is what actually flows through.
 
@@ -68,7 +68,7 @@ class JanusLlama(OmniModule, PreTrainedModel):
         text_cfg = LlamaConfig(**config.text_config) if config.text_config else LlamaConfig()
         self._text_cfg = text_cfg
         self.language_model = LlamaModel._from_config(text_cfg)
-        # Drop the embed_tokens parameters — owned by sibling TextEmbed.
+        # Drop the embed_tokens parameters — owned by sibling TextEncoder.
         self.language_model.set_input_embeddings(nn.Identity())
 
         self.post_init()
@@ -170,8 +170,8 @@ class JanusLlama(OmniModule, PreTrainedModel):
         if inputs_embeds is None:
             raise ValueError(
                 "JanusLlama.forward expects `inputs_embeds` (produced by "
-                "`text_embed.encode`). Word-token embedding has moved to "
-                "the TextEmbed module."
+                "`text_encoder.encode`). Word-token embedding has moved to "
+                "the TextEncoder module."
             )
 
         lm_out = self.language_model(
@@ -197,11 +197,11 @@ class JanusLlama(OmniModule, PreTrainedModel):
         """Single auto-regressive backbone step (FSM ``image_vq`` / ``text_ar``).
 
         Returns hidden states only; sampling lives downstream in
-        ``text_embed.decode`` / :meth:`JanusVqvae.decode`.
+        ``text_encoder.decode`` / :meth:`JanusVqvae.decode`.
         """
         if inputs_embeds is None:
             raise ValueError(
-                "JanusLlama.generate_step expects `inputs_embeds` (from text_embed.encode or vqvae.decode)."
+                "JanusLlama.generate_step expects `inputs_embeds` (from text_encoder.encode or vqvae.decode)."
             )
         lm_out = self.language_model(
             inputs_embeds=inputs_embeds,

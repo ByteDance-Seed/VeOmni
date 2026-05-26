@@ -21,31 +21,30 @@ Output structure (matches ``design.md`` §11)
     janus_llama/
       config.json                     # JanusLlamaConfig (model_type=janus_llama)
       model.safetensors               # language_model.* (no embed_tokens / no lm_head)
-    text_embed/
-      config.json                     # JanusTextEmbedConfig (model_type=janus_text_embed)
+    text_encoder/
+      config.json                     # JanusTextEncoderConfig (model_type=janus_text_encoder)
       model.safetensors               # embed_tokens.* (+ lm_head.* if untied)
     tokenizer/                        # global asset (one tokenizer per Omni model)
 
 The OmniConfig YAML side then reads each module from
-``<output_dir>/<module_name>``; ``AutoConfig.from_pretrained`` picks up
-``model_type`` from each ``config.json`` and the V2
-``MODULE_MIXIN_REGISTRY`` resolves the corresponding mixin class.
+``<output_dir>/<module_name>``; ``OMNI_CONFIG_REGISTRY`` / ``OMNI_MODEL_REGISTRY``
+resolve ``model_type`` from each ``config.json`` to the mixin class.
 
-Why a separate ``text_embed``?
+Why a separate ``text_encoder``?
 ------------------------------
 ``embed_tokens`` and ``lm_head`` are vocabulary-dependent and conceptually
 belong with the tokenizer side of the model — not the LLM backbone.
-Pulling them out as a generic :class:`TextEmbed` OmniModule lets the same
+Pulling them out as a generic :class:`TextEncoder` OmniModule lets the same
 graph treat text-vocab encode/decode and image-VQ encode/decode
 symmetrically (both have ``encode`` / ``decode`` call-site methods).
 
-Janus subclass: :class:`JanusTextEmbed`
+Janus subclass: :class:`JanusTextEncoder`
 ---------------------------------------
 Janus also needs to *emit* :code:`<begin_of_image>` / :code:`<end_of_image>`
 boundary tokens around a VQ image span (the framework has no notion of
 these; emitting them is a model concern).  We use
-:class:`JanusTextEmbed` (model_type ``janus_text_embed``) — a thin
-subclass of :class:`TextEmbed` that adds ``emit_image_start`` /
+:class:`JanusTextEncoder` (model_type ``janus_text_encoder``) — a thin
+subclass of :class:`TextEncoder` that adds ``emit_image_start`` /
 ``emit_image_end`` call-site methods plus the two boundary token ids.
 The split script reads the actual boi/eoi ids from the tokenizer so the
 checkpoint stays self-describing.
@@ -56,7 +55,7 @@ import os
 import shutil
 
 import torch
-
+from veomni.models.seed_omni.modules.janus.convert_janus_weight_to_hf import convert_model
 
 def _save_state_dict(state_dict: dict, output_dir: str) -> None:
     """Save a state dict as safetensors (falling back to .pt if unavailable)."""
@@ -88,26 +87,27 @@ def _resolve_token_id(tokenizer, candidates, default: int) -> int:
     return default
 
 
-def split_janus(model_path: str, output_dir: str, dtype: str = "bfloat16") -> None:
-    """Split the Janus checkpoint into the four V2 sub-module folders."""
+def split_janus(model_path: str, output_dir: str) -> None:
+    """Split the Janus checkpoint into the four sub-module folders."""
     print(f"Loading Janus from: {model_path}")
     from transformers import AutoTokenizer, JanusForConditionalGeneration
 
-    # Force registration of V2 module configs so save_pretrained works.
-    from veomni.models.seed_omni.modules import (
-        JanusLlama,
-        JanusLlamaConfig,
-        JanusSiglip,
-        JanusSiglipConfig,
-        JanusTextEmbed,
-        JanusTextEmbedConfig,
-        JanusVqvae,
-        JanusVqvaeConfig,
-    )
-    from veomni.models.seed_omni.modules.janus import JanusSiglipProcessor, JanusVqvaeProcessor
+    # Resolve V2 module classes lazily via registry factories.
+    import veomni.models.seed_omni.modules  # noqa: F401 — register factories
+    from veomni.models.seed_omni.modules import OMNI_CONFIG_REGISTRY, OMNI_MODEL_REGISTRY, OMNI_PROCESSOR_REGISTRY
 
-    torch_dtype = getattr(torch, dtype)
-    model = JanusForConditionalGeneration.from_pretrained(model_path, torch_dtype=torch_dtype, device_map="cpu")
+    JanusLlama = OMNI_MODEL_REGISTRY["janus_llama"]()
+    JanusLlamaConfig = OMNI_CONFIG_REGISTRY["janus_llama"]()
+    JanusSiglip = OMNI_MODEL_REGISTRY["janus_siglip"]()
+    JanusSiglipConfig = OMNI_CONFIG_REGISTRY["janus_siglip"]()
+    JanusTextEncoder = OMNI_MODEL_REGISTRY["janus_text_encoder"]()
+    JanusTextEncoderConfig = OMNI_CONFIG_REGISTRY["janus_text_encoder"]()
+    JanusVqvae = OMNI_MODEL_REGISTRY["janus_vqvae"]()
+    JanusVqvaeConfig = OMNI_CONFIG_REGISTRY["janus_vqvae"]()
+    JanusSiglipProcessor = OMNI_PROCESSOR_REGISTRY["janus_siglip"]()
+    JanusVqvaeProcessor = OMNI_PROCESSOR_REGISTRY["janus_vqvae"]()
+
+    model = JanusForConditionalGeneration.from_pretrained(model_path, device_map="auto")
     model.eval()
     cfg = model.config
     inner = model.model
@@ -115,8 +115,10 @@ def split_janus(model_path: str, output_dir: str, dtype: str = "bfloat16") -> No
     # Pull the boundary-token ids straight from the tokenizer's special
     # tokens — Janus uses ``<begin_of_image>`` (boi) and ``<end_of_image>``
     # (eoi) to delimit a VQ image span.  Storing them in the
-    # JanusTextEmbedConfig keeps the checkpoint self-describing so the
+    # JanusTextEncoderConfig keeps the checkpoint self-describing so the
     # FSM yaml doesn't need to hard-code vocabulary specifics.
+    
+    import ipdb;ipdb.set_trace()
     tokenizer = AutoTokenizer.from_pretrained(model_path)
     boi_id = _resolve_token_id(tokenizer, ("<begin_of_image>", getattr(tokenizer, "boi_token", None)), default=100016)
     eoi_id = _resolve_token_id(tokenizer, ("<end_of_image>", getattr(tokenizer, "eoi_token", None)), default=100593)
@@ -132,7 +134,7 @@ def split_janus(model_path: str, output_dir: str, dtype: str = "bfloat16") -> No
     siglip.aligner.load_state_dict(inner.aligner.state_dict())
 
     siglip_dir = os.path.join(output_dir, "janus_siglip")
-    siglip.to(torch_dtype).save_pretrained(siglip_dir, safe_serialization=True)
+    siglip.save_pretrained(siglip_dir, safe_serialization=True)
     # Per-module asset: vision processor.  The original Janus image processor
     # already encapsulates the right resize + normalise constants.
     try:
@@ -158,7 +160,7 @@ def split_janus(model_path: str, output_dir: str, dtype: str = "bfloat16") -> No
     vqvae.generation_head.load_state_dict(inner.generation_head.state_dict())
 
     vqvae_dir = os.path.join(output_dir, "janus_vqvae")
-    vqvae.to(torch_dtype).save_pretrained(vqvae_dir, safe_serialization=True)
+    vqvae.save_pretrained(vqvae_dir, safe_serialization=True)
     try:
         # VQVAE shares the same image processor as SigLIP in the original Janus
         # checkpoint; copy the JSON next to the VQVAE module so the per-module
@@ -173,17 +175,17 @@ def split_janus(model_path: str, output_dir: str, dtype: str = "bfloat16") -> No
         print(f"  [warn] could not extract image processor for vqvae: {e}")
     print(f"  saved → {vqvae_dir}")
 
-    # ── 3. text_embed (language_model.embed_tokens + lm_head) ──────────────
-    # Saved as JanusTextEmbed (model_type=janus_text_embed) so the model
+    # ── 3. text_encoder (language_model.embed_tokens + lm_head) ──────────────
+    # Saved as JanusTextEncoder (model_type=janus_text_encoder) so the model
     # owns the boi/eoi emitter methods used by the inference FSM bridge
-    # states.  The config is a JanusTextEmbedConfig — vocab_size /
+    # states.  The config is a JanusTextEncoderConfig — vocab_size /
     # hidden_size / tie_word_embeddings come from the original LLaMA
     # config; boi/eoi come from the tokenizer.
-    print("Extracting text_embed (as janus_text_embed) ...")
+    print("Extracting text_encoder (as janus_text_encoder) ...")
     text_cfg = cfg.text_config
     text_cfg_dict = text_cfg.to_dict() if hasattr(text_cfg, "to_dict") else vars(text_cfg)
     tie = bool(text_cfg_dict.get("tie_word_embeddings", False))
-    te_cfg = JanusTextEmbedConfig(
+    te_cfg = JanusTextEncoderConfig(
         vocab_size=text_cfg_dict.get("vocab_size"),
         hidden_size=text_cfg_dict.get("hidden_size"),
         tie_word_embeddings=tie,
@@ -192,14 +194,14 @@ def split_janus(model_path: str, output_dir: str, dtype: str = "bfloat16") -> No
         begin_of_image_token_id=boi_id,
         end_of_image_token_id=eoi_id,
     )
-    te = JanusTextEmbed(te_cfg)
+    te = JanusTextEncoder(te_cfg)
     te.embed_tokens.load_state_dict(inner.language_model.embed_tokens.state_dict())
     if not tie:
         # Untied: load the original lm_head linear.
         te.lm_head.load_state_dict(model.lm_head.state_dict())
 
-    te_dir = os.path.join(output_dir, "text_embed")
-    te.to(torch_dtype).save_pretrained(te_dir, safe_serialization=True)
+    te_dir = os.path.join(output_dir, "text_encoder")
+    te.save_pretrained(te_dir, safe_serialization=True)
     print(f"  saved → {te_dir} (tie_word_embeddings={tie}, boi={boi_id}, eoi={eoi_id})")
 
     # ── 4. janus_llama (LlamaModel backbone, no embed_tokens / no lm_head) ─
@@ -215,7 +217,7 @@ def split_janus(model_path: str, output_dir: str, dtype: str = "bfloat16") -> No
     llama.language_model.load_state_dict(src, strict=False)
 
     llama_dir = os.path.join(output_dir, "janus_llama")
-    llama.to(torch_dtype).save_pretrained(llama_dir, safe_serialization=True)
+    llama.save_pretrained(llama_dir, safe_serialization=True)
     print(f"  saved → {llama_dir} (no embed_tokens / no lm_head)")
 
     # ── 5. global tokenizer ─────────────────────────────────────────────────
@@ -238,7 +240,7 @@ def split_janus(model_path: str, output_dir: str, dtype: str = "bfloat16") -> No
     print(f"  tokenizer_path : {tok_dir}")
     print(f"  modules.janus_siglip.weights_path : {siglip_dir}")
     print(f"  modules.janus_vqvae.weights_path  : {vqvae_dir}")
-    print(f"  modules.text_embed.weights_path   : {te_dir}")
+    print(f"  modules.text_encoder.weights_path   : {te_dir}")
     print(f"  modules.janus_llama.weights_path  : {llama_dir}")
 
 
@@ -246,19 +248,19 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Split Janus-1.3B into SeedOmni V2 sub-checkpoints")
     parser.add_argument(
         "--model_path",
-        default="/mnt/hdfs/veomni/models/transformers/Janus-1.3B",
+        default="transformers/Janus-1.3B",
         help="Path to the original Janus checkpoint directory",
     )
     parser.add_argument(
         "--output_dir",
-        default="/mnt/hdfs/veomni/models/seed_omni/janus_1.3b",
+        default="seed_omni/Janus-1.3B",
         help="Directory to write the split sub-checkpoints",
     )
-    parser.add_argument(
-        "--dtype",
-        default="bfloat16",
-        choices=["bfloat16", "float32", "float16"],
-        help="Torch dtype for loading the checkpoint",
-    )
     args = parser.parse_args()
-    split_janus(args.model_path, args.output_dir, args.dtype)
+    origin_model_path = args.model_path
+    hf_model_path = args.model_path + "-hf"
+    convert_model(
+        local_dir=origin_model_path,
+        output_dir=hf_model_path,
+    )
+    split_janus(hf_model_path, args.output_dir)

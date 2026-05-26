@@ -46,7 +46,7 @@ already in :doc:`design.md` § "Build & 权重加载"):
    provably unaffected.
 #. **D2 stage 3 — re-implement OmniTrainer build flow**.  Register
    each V2 sub-module (``janus_siglip`` / ``janus_vqvae`` /
-   ``janus_llama`` / ``janus_text_embed`` / ``text_embed``) into
+   ``janus_llama`` / ``janus_text_encoder`` / ``text_encoder``) into
    :data:`veomni.models.loader.MODELING_REGISTRY` so
    :func:`veomni.models.build_foundation_model` can dispatch to the
    right mixin class (today they live only in HF

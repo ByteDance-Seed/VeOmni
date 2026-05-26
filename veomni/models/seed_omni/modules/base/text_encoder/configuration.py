@@ -1,15 +1,15 @@
-"""Configuration for :class:`TextEmbed`.
+"""Configuration for :class:`TextEncoder`.
 
-The ``model_type`` string is the lookup key used by both HuggingFace
-``AutoConfig`` and the V2 ``MODULE_MIXIN_REGISTRY`` (see
+The ``model_type`` string is the lookup key used by
+``OMNI_CONFIG_REGISTRY`` / ``OMNI_MODEL_REGISTRY`` (see
 ``modules/__init__.py``).  Every other field is plumbed through to
-``TextEmbed.__init__``.
+``TextEncoder.__init__``.
 """
 
 from transformers import PretrainedConfig
 
 
-class TextEmbedConfig(PretrainedConfig):
+class TextEncoderConfig(PretrainedConfig):
     """Config for the generic word-token embedding + LM head module.
 
     Parameters
@@ -28,7 +28,7 @@ class TextEmbedConfig(PretrainedConfig):
         ``False``.
     """
 
-    model_type = "text_embed"
+    model_type = "text_encoder"
 
     def __init__(
         self,

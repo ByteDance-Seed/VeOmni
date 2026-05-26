@@ -186,7 +186,7 @@ class PrintTextEmbed(_PrintBase):
         """Reset the token-script cursor.  Call between independent generate runs."""
         self._cursor = 0
 
-    # ── Janus boundary-token emitters (mirrors JanusTextEmbed) ───────────────
+    # ── Janus boundary-token emitters (mirrors JanusTextEncoder) ───────────────
     def emit_image_start(self, **kwargs: Any) -> Dict[str, Any]:
         return self._emit("boi", 100016, **kwargs)
 

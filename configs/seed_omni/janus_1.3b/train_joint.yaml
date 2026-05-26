@@ -34,7 +34,7 @@
 #     --model_path /mnt/hdfs/veomni/models/transformers/Janus-1.3B \
 #     --output_dir /mnt/hdfs/veomni/models/seed_omni/janus_1.3b
 #
-# Why a separate `text_embed` (model_type=janus_text_embed) module?
+# Why a separate `text_encoder` (model_type=janus_text_encoder) module?
 # -----------------------------------------------------------------
 # * Word-token embedding (`wte`) and the LM head are vocabulary-dependent —
 #   they conceptually mirror the discrete-image VQ codec on the text side.
@@ -43,7 +43,7 @@
 # * Janus also needs to *emit* `<begin_of_image>` / `<end_of_image>`
 #   boundary tokens around a VQ image span.  That knowledge is
 #   model-specific (vocabulary IDs differ across model families), so the
-#   `JanusTextEmbed` subclass adds two more call-site methods —
+#   `JanusTextEncoder` subclass adds two more call-site methods —
 #   `emit_image_start` and `emit_image_end` — used by the inference
 #   bridge states (`image_vq_start` / `image_vq_end`).  The framework FSM
 #   has zero special-cased behaviour around boundary tokens.
@@ -53,9 +53,9 @@ tokenizer_path: /mnt/hdfs/veomni/models/seed_omni/janus_1.3b/tokenizer
 
 # ── Module registry ───────────────────────────────────────────────────────────
 # Module names match the registered HF model_type strings:
-#   janus_siglip / janus_vqvae / janus_llama / janus_text_embed
+#   janus_siglip / janus_vqvae / janus_llama / janus_text_encoder
 # At build-time the trainer resolves each `weights_path/config.json` →
-# model_type → MODULE_MIXIN_REGISTRY[model_type] and instantiates via
+# model_type → OMNI_MODEL_REGISTRY[model_type]() and instantiates via
 # HF `from_pretrained`.  See `veomni/models/seed_omni/modules/__init__.py`.
 modules:
   janus_siglip:
@@ -65,10 +65,10 @@ modules:
     weights_path: /mnt/hdfs/veomni/models/seed_omni/janus_1.3b/janus_vqvae
     freeze_vqvae: true
 
-  text_embed:
-    weights_path: /mnt/hdfs/veomni/models/seed_omni/janus_1.3b/text_embed
+  text_encoder:
+    weights_path: /mnt/hdfs/veomni/models/seed_omni/janus_1.3b/text_encoder
     # `vocab_size` / `hidden_size` / `tie_word_embeddings` come from
-    # `text_embed/config.json` (written by `scripts/split_janus.py`).
+    # `text_encoder/config.json` (written by `scripts/split_janus.py`).
     # The split script also writes `begin_of_image_token_id` /
     # `end_of_image_token_id` read from the actual tokenizer.
 
@@ -97,16 +97,16 @@ nodes:
                                                             #   inference (FSM): hidden → sample → vq_token_id + embed
                                                             #   inference (alt): token_id → embed (codebook lookup only)
 
-  tok_encode: { module: text_embed.encode }                 # input_ids → inputs_embeds (wte)
-  tok_decode: { module: text_embed.decode }                 # unified text head:
+  tok_encode: { module: text_encoder.encode }                 # input_ids → inputs_embeds (wte)
+  tok_decode: { module: text_encoder.decode }                 # unified text head:
                                                             #   training:  hidden_states + labels → _loss
                                                             #   inference: hidden_states → sample → next token (input_ids)
 
   janus_llama: { module: janus_llama }                      # backbone — no wte, no lm_head
 
   # ── Inference-only: Janus-specific boundary-token emitters.
-  emit_image_start: { module: text_embed.emit_image_start } # produces <begin_of_image> token (id from janus_text_embed config)
-  emit_image_end:   { module: text_embed.emit_image_end }   # produces <end_of_image> token
+  emit_image_start: { module: text_encoder.emit_image_start } # produces <begin_of_image> token (id from janus_text_encoder config)
+  emit_image_end:   { module: text_encoder.emit_image_end }   # produces <end_of_image> token
 
 # ── Graph edges (data dependencies) ───────────────────────────────────────────
 edges:
@@ -177,6 +177,6 @@ training_graph:
 #        edges: [vae_enc_to_ar, tok_enc_to_ar, ar_to_tok_decode, ar_to_vae_decode,
 #                vae_token_to_decode, tok_decode_sink, vae_decode_sink]
 #
-#   C) Train only janus_llama + text_embed with pre-cached image embeddings
+#   C) Train only janus_llama + text_encoder with pre-cached image embeddings
 #        edges: [tok_enc_to_ar, ar_to_tok_decode, tok_decode_sink]
 #      Batch already carries und_image_embeds / gen_image_embeds from disk.

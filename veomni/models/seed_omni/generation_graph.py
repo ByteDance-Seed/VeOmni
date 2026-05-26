@@ -400,7 +400,7 @@ class GenerationGraph:
 
         Method dispatch: a node whose declared method is ``forward``
         invokes ``module.generate_step``; any other method name dispatches
-        as-is (e.g. ``vqvae.decode``, ``text_embed.emit_image_start``).
+        as-is (e.g. ``vqvae.decode``, ``text_encoder.emit_image_start``).
         This keeps the same node usable for both the training DAG
         (``forward``/explicit method) and the inference FSM
         (``generate_step``/explicit method) without YAML duplication.

@@ -76,21 +76,21 @@ def _config_dict() -> Dict[str, Any]:
     """
     return {
         "modules": {
-            "text_embed": {"micro_batch_size": 4},
+            "text_encoder": {"micro_batch_size": 4},
             "vision": {"micro_batch_size": 4},
             "vqvae": {"micro_batch_size": 4},
             "ar": {"micro_batch_size": 2},
         },
         "nodes": {
-            "tok_encode": {"module": "text_embed.encode"},
-            "tok_decode": {"module": "text_embed.decode"},
+            "tok_encode": {"module": "text_encoder.encode"},
+            "tok_decode": {"module": "text_encoder.decode"},
             "vis_encode": {"module": "vision"},
             "vae_encode": {"module": "vqvae.encode"},
             "vae_decode": {"module": "vqvae.decode"},
             "run_ar": {"module": "ar"},
             # Inference-only Janus boundary-token emitters (model-owned).
-            "emit_image_start": {"module": "text_embed.emit_image_start"},
-            "emit_image_end": {"module": "text_embed.emit_image_end"},
+            "emit_image_start": {"module": "text_encoder.emit_image_start"},
+            "emit_image_end": {"module": "text_encoder.emit_image_end"},
         },
         "edges": {
             # ── training (and shared with inference)
@@ -298,7 +298,7 @@ def _build_model(
         cfg_dict["generation_graph"] = generation_graph
     cfg = OmniConfig.from_dict(cfg_dict)
     modules = {
-        "text_embed": PrintTextEmbed("text_embed", log, token_script=token_script),
+        "text_encoder": PrintTextEmbed("text_encoder", log, token_script=token_script),
         "vision": PrintVisionEncoder("vision", log),
         "vqvae": PrintVQVAE("vqvae", log, image_steps=image_steps),
         "ar": PrintARBackbone("ar", log),
@@ -461,8 +461,8 @@ def test_fsm_emit_image_start_runs_inside_bridge_body():
         max_new_tokens=10,
     )
     # The emit_image_start was actually invoked (proves model-side ownership).
-    assert any(evt.startswith("text_embed.emit_boi(") for evt in log)
-    assert any(evt.startswith("text_embed.emit_eoi(") for evt in log)
+    assert any(evt.startswith("text_encoder.emit_boi(") for evt in log)
+    assert any(evt.startswith("text_encoder.emit_eoi(") for evt in log)
     # The boundary token id flowed into ctx, not magically appended by FSM.
     assert final_ctx["last_token_id"] in (TOK_BOI, TOK_EOI, TOK_EOS, 2)
 
@@ -751,9 +751,9 @@ def test_finalize_hook_fires_on_done_and_collects_outputs():
     assert "finalize" not in ctx_default
     assert not any(e.startswith("finalize:") for e in trace_default)
 
-    # Inject a custom finalize on `text_embed`.
-    text_embed = model.modules_dict["text_embed"]
-    text_embed.finalize = lambda *, ctx, request: {"decoded": "hello world", "n_tokens": 1}
+    # Inject a custom finalize on `text_encoder`.
+    text_encoder = model.modules_dict["text_encoder"]
+    text_encoder.finalize = lambda *, ctx, request: {"decoded": "hello world", "n_tokens": 1}
 
     trace_custom: List[str] = []
     ctx_custom = model.generate(
@@ -762,8 +762,8 @@ def test_finalize_hook_fires_on_done_and_collects_outputs():
         max_new_tokens=5,
         trace=trace_custom,
     )
-    assert ctx_custom["finalize"] == {"text_embed": {"decoded": "hello world", "n_tokens": 1}}
-    assert "finalize:text_embed" in trace_custom
+    assert ctx_custom["finalize"] == {"text_encoder": {"decoded": "hello world", "n_tokens": 1}}
+    assert "finalize:text_encoder" in trace_custom
 
 
 def test_finalize_hook_rejects_non_dict_return():
@@ -771,8 +771,8 @@ def test_finalize_hook_rejects_non_dict_return():
     import pytest
 
     model, _ = _build_model(token_script=[TOK_EOS], generation_graph=_interleave_generation_graph())
-    text_embed = model.modules_dict["text_embed"]
-    text_embed.finalize = lambda *, ctx, request: "not a dict"
+    text_encoder = model.modules_dict["text_encoder"]
+    text_encoder.finalize = lambda *, ctx, request: "not a dict"
 
     with pytest.raises(TypeError, match="must return a dict"):
         model.generate(request={}, context={"input_ids": "<bos>"}, max_new_tokens=5)
@@ -783,13 +783,13 @@ def test_finalize_hook_receives_ctx_and_request():
     captured: List[Dict[str, Any]] = []
 
     model, _ = _build_model(token_script=[TOK_EOS], generation_graph=_interleave_generation_graph())
-    text_embed = model.modules_dict["text_embed"]
+    text_encoder = model.modules_dict["text_encoder"]
 
     def _capture_finalize(*, ctx: Dict[str, Any], request: Dict[str, Any]) -> Dict[str, Any]:
         captured.append({"ctx_keys": sorted(ctx), "request": dict(request)})
         return {}
 
-    text_embed.finalize = _capture_finalize
+    text_encoder.finalize = _capture_finalize
 
     request = {"prompt": "describe", "max_new_tokens": 5}
     model.generate(request=request, context={"input_ids": "<bos>"}, max_new_tokens=5)
@@ -811,7 +811,7 @@ def test_training_graph_mermaid_renders_end_sink():
     assert txt.startswith("---\ntitle: print-flow training\n---\n")
     assert "flowchart LR" in txt
     # Active nodes labelled with module.method.
-    assert "tok_decode<br/><i>text_embed.decode</i>" in txt
+    assert "tok_decode<br/><i>text_encoder.decode</i>" in txt
     assert "vae_encode<br/><i>vqvae.encode</i>" in txt
     # `end` sink is rendered when at least one edge points to it.
     assert "end_sink" in txt
@@ -884,7 +884,7 @@ def test_omni_model_named_children_yields_submodules_directly():
     names = [name for name, _ in model.named_children()]
 
     # Order matches OmniConfig.module_names declaration order.
-    assert names == ["text_embed", "vision", "vqvae", "ar"]
+    assert names == ["text_encoder", "vision", "vqvae", "ar"]
 
     # No nn.ModuleDict middle attribute leaks into the children iteration.
     assert "modules_dict" not in names
@@ -906,7 +906,7 @@ def test_omni_model_named_parameters_fqn_lacks_modules_dict_prefix():
     if fqns:
         for fqn in fqns:
             head = fqn.split(".", 1)[0]
-            assert head in {"text_embed", "vision", "vqvae", "ar"}, (
+            assert head in {"text_encoder", "vision", "vqvae", "ar"}, (
                 f"fqn {fqn!r} starts with {head!r} — should be a top-level "
                 f"sub-module name, not 'modules_dict' or any wrapper."
             )
@@ -922,7 +922,7 @@ def test_omni_model_modules_dict_is_back_compat_view():
     view = model.modules_dict
     # Plain dict view — not an nn.ModuleDict that would re-register children.
     assert isinstance(view, dict)
-    assert set(view) == {"text_embed", "vision", "vqvae", "ar"}
+    assert set(view) == {"text_encoder", "vision", "vqvae", "ar"}
     for name, mod in view.items():
         assert mod is getattr(model, name)
 
@@ -933,7 +933,7 @@ def test_omni_model_rejects_module_name_colliding_with_framework_attr():
     overwriting ``self.config`` (the kind of bug that surfaces only when
     something downstream reads it).
 
-    Renames ``text_embed → config`` everywhere in the print-flow YAML
+    Renames ``text_encoder → config`` everywhere in the print-flow YAML
     fixture (modules, every node's ``module`` reference, every edge's
     ``from`` / ``to`` reference) to construct a config that *would*
     succeed without the guard, then asserts the guard fires.
@@ -941,8 +941,8 @@ def test_omni_model_rejects_module_name_colliding_with_framework_attr():
     import pytest
 
     def _rename(s: str, old: str, new: str) -> str:
-        # `text_embed` may appear as either the bare module name (`module: text_embed`)
-        # or as the prefix in `module: text_embed.encode` etc.  Replace conservatively
+        # `text_encoder` may appear as either the bare module name (`module: text_encoder`)
+        # or as the prefix in `module: text_encoder.encode` etc.  Replace conservatively
         # at word boundaries so we don't touch `text_ar` etc.
         if s == old:
             return new
@@ -951,9 +951,9 @@ def test_omni_model_rejects_module_name_colliding_with_framework_attr():
         return s
 
     cfg_dict = _config_dict()
-    cfg_dict["modules"] = {("config" if k == "text_embed" else k): v for k, v in cfg_dict["modules"].items()}
+    cfg_dict["modules"] = {("config" if k == "text_encoder" else k): v for k, v in cfg_dict["modules"].items()}
     cfg_dict["nodes"] = {
-        n_name: {**n_def, "module": _rename(n_def["module"], "text_embed", "config")}
+        n_name: {**n_def, "module": _rename(n_def["module"], "text_encoder", "config")}
         for n_name, n_def in cfg_dict["nodes"].items()
     }
     cfg = OmniConfig.from_dict(cfg_dict)
