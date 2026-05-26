@@ -57,7 +57,6 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
-from typing import List, Tuple
 
 import yaml
 
@@ -245,7 +244,7 @@ def main() -> None:
 
     title = args.title or f"{train_yaml.stem}+{infer_yaml.stem}"
 
-    diagrams: List[Tuple[str, str]] = []  # (heading, mermaid_body)
+    diagrams: list[tuple[str, str]] = []  # (heading, mermaid_body)
 
     if args.only in ("train", "both"):
         diagrams.append(

@@ -19,7 +19,6 @@ python src/transformers/models/janus/convert_janus_weights_to_hf.py --repo_id de
 Using provided local directory: tmp/hub_code_in
 """
 
-import argparse
 import gc
 import json
 import os
@@ -27,7 +26,6 @@ import re
 
 import torch
 from huggingface_hub import snapshot_download
-
 from transformers import (
     AutoTokenizer,
     JanusConfig,
@@ -207,7 +205,7 @@ def ensure_model_downloaded(
 def _load_sharded_state_dict(input_path: str, index_path: str, loader) -> dict:
     """Load a sharded checkpoint described by *index_path* using *loader(shard_path)*."""
     state_dict = {}
-    with open(index_path, "r") as f:
+    with open(index_path) as f:
         index = json.load(f)
 
     unique_shard_files = sorted(set(index["weight_map"].values()))
@@ -300,13 +298,13 @@ def convert_model(
             "Please ensure you have downloaded all necessary model files."
         )
 
-    with open(os.path.join(input_path, "config.json"), "r") as f:
+    with open(os.path.join(input_path, "config.json")) as f:
         config_data = json.load(f)
-    with open(os.path.join(input_path, "preprocessor_config.json"), "r") as f:
+    with open(os.path.join(input_path, "preprocessor_config.json")) as f:
         preprocessor_config = json.load(f)
-    with open(os.path.join(input_path, "special_tokens_map.json"), "r") as f:
+    with open(os.path.join(input_path, "special_tokens_map.json")) as f:
         special_tokens_map = json.load(f)
-    with open(os.path.join(input_path, "tokenizer_config.json"), "r") as f:
+    with open(os.path.join(input_path, "tokenizer_config.json")) as f:
         tokenizer_config = json.load(f)
 
     # Create tokenizer directly from tokenizer.json if it exists

@@ -37,7 +37,7 @@ Coverage
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 import torch
 
@@ -60,7 +60,7 @@ TOK_EOS = 2  # text_ar → done
 # ── Config builder ───────────────────────────────────────────────────────────
 
 
-def _config_dict() -> Dict[str, Any]:
+def _config_dict() -> dict[str, Any]:
     """Janus-style schema used by both training and inference scenarios.
 
     Notes
@@ -176,7 +176,7 @@ def _config_dict() -> Dict[str, Any]:
 # ── Inference YAML builders (mirrors configs/seed_omni/janus_1.3b/infer_*.yaml) ──
 
 
-def _interleave_generation_graph() -> Dict[str, Any]:
+def _interleave_generation_graph() -> dict[str, Any]:
     """Interleave T2T+T2I FSM (matches infer_interleave.yaml shape).
 
     ``image_vq`` runs ``token_length: variable`` and exits when
@@ -216,7 +216,7 @@ def _interleave_generation_graph() -> Dict[str, Any]:
     }
 
 
-def _t2i_generation_graph() -> Dict[str, Any]:
+def _t2i_generation_graph() -> dict[str, Any]:
     """T2I-only FSM (matches infer_t2i.yaml shape).
 
     ``image_vq`` is variable-length and listens for the
@@ -251,7 +251,7 @@ def _t2i_generation_graph() -> Dict[str, Any]:
     }
 
 
-def _understanding_generation_graph() -> Dict[str, Any]:
+def _understanding_generation_graph() -> dict[str, Any]:
     """I2T / VQA FSM (matches infer_understanding.yaml shape).
 
     The initial ``prompt_to_text`` state has TWO incoming routing edges
@@ -282,8 +282,8 @@ def _understanding_generation_graph() -> Dict[str, Any]:
 
 def _build_model(
     token_script,
-    generation_graph: Optional[Dict[str, Any]] = None,
-    image_steps: Optional[int] = None,
+    generation_graph: dict[str, Any] | None = None,
+    image_steps: int | None = None,
 ):
     """Construct an OmniModel with the print-only modules.
 
@@ -292,7 +292,7 @@ def _build_model(
     VQ decoder's "image complete" signal that drives the
     ``image_vq → image_vq_end`` transition via ``ctx_flag``.
     """
-    log: List[str] = []
+    log: list[str] = []
     cfg_dict = _config_dict()
     if generation_graph is not None:
         cfg_dict["generation_graph"] = generation_graph
@@ -329,7 +329,7 @@ def test_training_graph_topology_and_active_nodes():
 def test_training_forward_calls_each_node_once_in_order():
     model, log = _build_model(token_script=[])
 
-    trace: List[str] = []
+    trace: list[str] = []
     model(
         trace=trace,
         input_ids=10,
@@ -393,7 +393,7 @@ def test_fsm_interleave_text_to_image_to_text():
         image_steps=3,  # PrintVQVAE emits `image_complete` on the 3rd decode
     )
 
-    trace: List[str] = []
+    trace: list[str] = []
     final_ctx = model.generate(
         request={"max_new_tokens": 50},
         context={"input_ids": "<bos>", "attention_mask": "<mask>"},
@@ -478,7 +478,7 @@ def test_fsm_t2i_only_starts_with_prompt_state_and_ends_after_image():
         image_steps=2,
     )
 
-    trace: List[str] = []
+    trace: list[str] = []
     model.generate(
         request={"max_new_tokens": 50},
         context={"input_ids": "<bos>"},
@@ -517,7 +517,7 @@ def test_fsm_understanding_multi_source_runs_ar_after_both_inputs_route():
         generation_graph=_understanding_generation_graph(),
     )
 
-    trace: List[str] = []
+    trace: list[str] = []
     model.generate(
         request={"max_new_tokens": 10},
         context={"input_ids": "<bos>", "pixel_values": "<pix>"},
@@ -610,7 +610,7 @@ def test_fsm_ctx_flag_transition_fires_on_module_signal():
         image_steps=n_patches,
     )
 
-    trace: List[str] = []
+    trace: list[str] = []
     model.generate(
         request={"max_new_tokens": 50},
         context={"input_ids": "<bos>"},
@@ -657,7 +657,7 @@ def test_fsm_ctx_flag_does_not_fire_until_module_writes_it():
         image_steps=None,
     )
 
-    trace: List[str] = []
+    trace: list[str] = []
     model.generate(
         request={"max_new_tokens": 6},
         context={"input_ids": "<bos>"},
@@ -746,7 +746,7 @@ def test_finalize_hook_fires_on_done_and_collects_outputs():
     model, _ = _build_model(token_script=[TOK_EOS], generation_graph=_interleave_generation_graph())
 
     # Default behaviour: no finalize outputs.
-    trace_default: List[str] = []
+    trace_default: list[str] = []
     ctx_default = model.generate(request={}, context={"input_ids": "<bos>"}, max_new_tokens=5, trace=trace_default)
     assert "finalize" not in ctx_default
     assert not any(e.startswith("finalize:") for e in trace_default)
@@ -755,7 +755,7 @@ def test_finalize_hook_fires_on_done_and_collects_outputs():
     text_encoder = model.modules_dict["text_encoder"]
     text_encoder.finalize = lambda *, ctx, request: {"decoded": "hello world", "n_tokens": 1}
 
-    trace_custom: List[str] = []
+    trace_custom: list[str] = []
     ctx_custom = model.generate(
         request={"prompt": "hi"},
         context={"input_ids": "<bos>"},
@@ -780,12 +780,12 @@ def test_finalize_hook_rejects_non_dict_return():
 
 def test_finalize_hook_receives_ctx_and_request():
     """The hook can read final ctx + the original request — accumulation is the module's job."""
-    captured: List[Dict[str, Any]] = []
+    captured: list[dict[str, Any]] = []
 
     model, _ = _build_model(token_script=[TOK_EOS], generation_graph=_interleave_generation_graph())
     text_encoder = model.modules_dict["text_encoder"]
 
-    def _capture_finalize(*, ctx: Dict[str, Any], request: Dict[str, Any]) -> Dict[str, Any]:
+    def _capture_finalize(*, ctx: dict[str, Any], request: dict[str, Any]) -> dict[str, Any]:
         captured.append({"ctx_keys": sorted(ctx), "request": dict(request)})
         return {}
 
@@ -958,7 +958,7 @@ def test_omni_model_rejects_module_name_colliding_with_framework_attr():
     }
     cfg = OmniConfig.from_dict(cfg_dict)
 
-    log: List[str] = []
+    log: list[str] = []
     modules = {
         "config": PrintTextEmbed("config", log, token_script=[]),
         "vision": PrintVisionEncoder("vision", log),

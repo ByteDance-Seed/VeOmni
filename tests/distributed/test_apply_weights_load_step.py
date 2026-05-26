@@ -21,7 +21,7 @@ FSDP2 equivalence tests + D2.3's smoke tests under real FSDP).
 
 from __future__ import annotations
 
-from typing import Any, List, Mapping, Tuple
+from typing import Any, Mapping
 from unittest.mock import MagicMock
 
 import pytest
@@ -134,8 +134,8 @@ def test_apply_load_step_none_calls_to_empty_and_init(monkeypatch):
     """``weights_path=None`` → ``model.to_empty(device=...)`` then
     ``model.init_weights()`` — no loader functions invoked."""
     model = _Container()
-    to_empty_calls: List[Tuple[Any, Any]] = []
-    init_calls: List[int] = []
+    to_empty_calls: list[tuple[Any, Any]] = []
+    init_calls: list[int] = []
 
     def _fake_to_empty(self, *, device):
         to_empty_calls.append((self, device))

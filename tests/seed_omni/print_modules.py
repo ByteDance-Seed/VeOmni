@@ -24,7 +24,7 @@ without committing to specific module classes.
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Sequence
 
 import torch
 import torch.nn as nn
@@ -43,7 +43,7 @@ class _PrintBase(OmniModule, nn.Module):
     is the canonical record of what happened — assert against it.
     """
 
-    def __init__(self, name: str, log: List[str]):
+    def __init__(self, name: str, log: list[str]):
         super().__init__()
         self._mod_name = name
         self._log = log
@@ -70,13 +70,13 @@ class PrintVisionEncoder(_PrintBase):
     other path) is the trainer's responsibility — Step 2 territory.
     """
 
-    def forward(self, **kwargs: Any) -> Dict[str, Any]:
+    def forward(self, **kwargs: Any) -> dict[str, Any]:
         self._record("forward", **kwargs)
         if kwargs.get("pixel_values") is None:
             return {}
         return {"image_embeds": "<vis_embeds>"}
 
-    def generate_step(self, **kwargs: Any) -> Dict[str, Any]:
+    def generate_step(self, **kwargs: Any) -> dict[str, Any]:
         return self.forward(**kwargs)
 
 
@@ -109,28 +109,28 @@ class PrintVQVAE(_PrintBase):
     def __init__(
         self,
         name: str,
-        log: List[str],
-        image_steps: Optional[int] = None,
+        log: list[str],
+        image_steps: int | None = None,
     ):
         super().__init__(name, log)
-        self._image_steps: Optional[int] = image_steps
+        self._image_steps: int | None = image_steps
         self._decode_calls: int = 0
 
-    def encode(self, **kwargs: Any) -> Dict[str, Any]:
+    def encode(self, **kwargs: Any) -> dict[str, Any]:
         self._record("encode", **kwargs)
         return {
             "gen_embeds": "<vq_gen_embeds>",
             "vq_token_ids": "<vq_token_ids>",
         }
 
-    def decode(self, **kwargs: Any) -> Dict[str, Any]:
+    def decode(self, **kwargs: Any) -> dict[str, Any]:
         self._record("decode", **kwargs)
         if kwargs.get("gt_token_ids") is not None:
             return {"_loss": _scalar_loss(0.7)}
         # Inference path — emit `image_complete` on the last patch of the
         # simulated grid, then reset the counter for the next image span.
         self._decode_calls += 1
-        out: Dict[str, Any] = {"embed": "<vq_decode_embed>"}
+        out: dict[str, Any] = {"embed": "<vq_decode_embed>"}
         if self._image_steps is not None and self._decode_calls >= self._image_steps:
             out["image_complete"] = True
             self._decode_calls = 0
@@ -159,18 +159,18 @@ class PrintTextEmbed(_PrintBase):
     def __init__(
         self,
         name: str,
-        log: List[str],
-        token_script: Optional[Sequence[int]] = None,
+        log: list[str],
+        token_script: Sequence[int] | None = None,
     ):
         super().__init__(name, log)
-        self._token_script: List[int] = list(token_script or [])
+        self._token_script: list[int] = list(token_script or [])
         self._cursor: int = 0
 
-    def encode(self, **kwargs: Any) -> Dict[str, Any]:
+    def encode(self, **kwargs: Any) -> dict[str, Any]:
         self._record("encode", **kwargs)
         return {"inputs_embeds": f"<wte:{kwargs.get('input_ids', '?')}>"}
 
-    def decode(self, **kwargs: Any) -> Dict[str, Any]:
+    def decode(self, **kwargs: Any) -> dict[str, Any]:
         self._record("decode", **kwargs)
         if kwargs.get("labels") is not None:
             return {"_loss": _scalar_loss(0.3)}
@@ -187,13 +187,13 @@ class PrintTextEmbed(_PrintBase):
         self._cursor = 0
 
     # ── Janus boundary-token emitters (mirrors JanusTextEncoder) ───────────────
-    def emit_image_start(self, **kwargs: Any) -> Dict[str, Any]:
+    def emit_image_start(self, **kwargs: Any) -> dict[str, Any]:
         return self._emit("boi", 100016, **kwargs)
 
-    def emit_image_end(self, **kwargs: Any) -> Dict[str, Any]:
+    def emit_image_end(self, **kwargs: Any) -> dict[str, Any]:
         return self._emit("eoi", 100593, **kwargs)
 
-    def _emit(self, label: str, token_id: int, **kwargs: Any) -> Dict[str, Any]:
+    def _emit(self, label: str, token_id: int, **kwargs: Any) -> dict[str, Any]:
         self._record(f"emit_{label}", **kwargs)
         return {
             "input_ids": token_id,
@@ -213,13 +213,13 @@ class PrintARBackbone(_PrintBase):
     * Inference: ``generate_step(...)`` → ``hidden_states`` only (no loss).
     """
 
-    def forward(self, **kwargs: Any) -> Dict[str, Any]:
+    def forward(self, **kwargs: Any) -> dict[str, Any]:
         self._record("forward", **kwargs)
         return {
             "hidden_states": "<ar_hidden>",
             "_loss": _scalar_loss(0.2),
         }
 
-    def generate_step(self, **kwargs: Any) -> Dict[str, Any]:
+    def generate_step(self, **kwargs: Any) -> dict[str, Any]:
         self._record("generate_step", **kwargs)
         return {"hidden_states": "<ar_hidden_gen>"}

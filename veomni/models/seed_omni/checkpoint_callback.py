@@ -45,7 +45,6 @@ non-FSDP modules.
 from __future__ import annotations
 
 import os
-from typing import Optional
 
 import torch.distributed as dist
 from transformers import PreTrainedModel
@@ -87,7 +86,7 @@ class OmniModuleCheckpointCallback:
         self,
         module: PreTrainedModel,
         module_name: str,
-        processor: Optional[ProcessorMixin] = None,
+        processor: ProcessorMixin | None = None,
         is_rank_0: bool = True,
     ) -> None:
         self.module = module

@@ -63,7 +63,7 @@ Registered as ``data_type: seedomni`` in
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Tuple
+from typing import Any, List
 
 import numpy as np
 import torch
@@ -99,9 +99,9 @@ def _pil_to_uint8_tensor(image: Image.Image) -> torch.Tensor:
 
 
 def _build_conversation_list(
-    constructed: List[_TupleTurn],
-    image_tensors: List[torch.Tensor],
-) -> List[Dict[str, Any]]:
+    constructed: list[_TupleTurn],
+    image_tensors: list[torch.Tensor],
+) -> list[dict[str, Any]]:
     """Flatten ``[[role, (type, value), ...], ...]`` into a list of
     per-item dicts and pair image-typed turns with ``image_tensors`` in
     source order.
@@ -114,7 +114,7 @@ def _build_conversation_list(
     """
     image_iter = iter(image_tensors)
     image_consumed = 0
-    out: List[Dict[str, Any]] = []
+    out: list[dict[str, Any]] = []
     for turn in constructed:
         if not turn:
             continue
@@ -166,7 +166,7 @@ def _build_conversation_list(
     return out
 
 
-def _modalities_in(constructed: List[_TupleTurn]) -> Tuple[bool, bool]:
+def _modalities_in(constructed: list[_TupleTurn]) -> tuple[bool, bool]:
     """Quick scan: does this sample reference any image / vq_image turns?
 
     Returns ``(has_image, has_video)`` — kept simple, used only to skip
@@ -187,9 +187,9 @@ def _modalities_in(constructed: List[_TupleTurn]) -> Tuple[bool, bool]:
 
 @DATA_TRANSFORM_REGISTRY.register("seedomni")
 def process_seedomni_example(
-    example: Dict[str, Any],
+    example: dict[str, Any],
     **kwargs,
-) -> List[Dict[str, Any]]:
+) -> list[dict[str, Any]]:
     """SeedOmni V2 transform — emit a single-key sample ``{"conversation_list": [...]}``.
 
     Args:

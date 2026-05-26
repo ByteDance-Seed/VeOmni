@@ -30,6 +30,7 @@ lightweight modules live under ``modules/base/<sub_module>/``.
 
 from ....utils.registry import Registry
 
+
 OMNI_CONFIG_REGISTRY = Registry("OmniConfig")
 OMNI_MODEL_REGISTRY = Registry("OmniModel")
 OMNI_PROCESSOR_REGISTRY = Registry("OmniProcessor")
