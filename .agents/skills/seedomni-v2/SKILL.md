@@ -10,7 +10,7 @@ description: "Use this skill when adding or modifying anything inside `veomni/mo
    - `to: end` reserved keyword (no orphans, no cycles).
    - OmniModule is a **mixin**, not a base class.
    - `_loss` suffix collection (single key): each module loops all micro-batches inside one `forward`, `post_forward` does the token-level mean, and emits a scalar `<name>_loss`. OmniModel just sums.
-   - **Data is 100% model-agnostic**: `raw_batch` starts with a single key `conversation_list` (`list[list[dict]]` of `{type, value, loss_mask, from_assistant}` items). All chat templating, tokenization, image processing, audio feature extraction, and boundary-marker injection happen **inside model modules** during forward. The same dataset can feed any ug model — Janus / Qwen-Omni / Bagel — without changes.
+   - **Data is 100% model-agnostic**: `raw_batch` starts with a single key `conversation_list` (`list[list[dict]]` of `{type, value, role, loss_mask}` items). All chat templating, tokenization, image processing, audio feature extraction, and boundary-marker injection happen **inside model modules** during forward. The same dataset can feed any ug model — Janus / Qwen-Omni / Bagel — without changes.
    - **Per-module assets including tokenizer**: every processor (vision / image / audio) AND the tokenizer live inside their owning module's subfolder. There is **no top-level `tokenizer_path`** field — the tokenizer is owned by the family-specific `text_encoder` module (`modules/<family>/text_encoder/tokenizer/`). Pure DiT models without a text encoder have no tokenizer at all.
    - **Module forward → mutates raw_batch**: every module's `forward(**kwargs) -> Dict` return dict is **immediately written back into raw_batch** by OmniModel (keyed by `edge.output`). Data does **not** flow through edge channels to downstream modules — downstream reads the same `raw_batch` by its own input keys. Edges are dependency / topology contracts, not data conduits.
    - **No global collator final-step, no global SP slice node**: each module calls collator helpers and applies SP slicing **inside its own `pre_forward`** for the fields it owns. ViT slices the image batch dimension; text encoder slices the sequence dimension; nothing gets sliced twice.
@@ -34,7 +34,7 @@ V2 has **no framework-level chat template, no modality slot router, no top-level
 ```
 Layer 1: jsonl on disk
          ──────────────────────────────────────────
-         each line = list[dict]  (type / value / loss_mask / from_assistant)
+         each line = list[dict]  (type / value / role / loss_mask)
 
 Layer 2: multimodal_transform.py (lightweight tool layer)
          ──────────────────────────────────────────
@@ -65,7 +65,7 @@ Layer 4: vision / audio encoder modules (forward stage)
               → image_embeds / vq_token_ids / audio_embeds
            3. mutate conversation_list: insert {type:"boi"} / {type:"eoi"}
               before/after each image item; audio modules insert audio_bos/eos;
-              boundary markers inherit from_assistant / loss_mask from the
+              boundary markers inherit role / loss_mask from the
               original modality item
            4. return dict written back to raw_batch by framework
 
@@ -88,12 +88,12 @@ Layer 5: text_encoder module (base provides default; family overrides chat-templ
                                                    (backbone splice expands it)
               - append EOS
            2. compute labels (image/audio segments → -100; text segments use
-              from_assistant + loss_mask)
+              role + loss_mask)
            3. compute attention_mask
            4. wte → flat inputs_embeds (each modality item still 1 placeholder slot)
            5. SPLIT: emit a NEW conversation_list, sliced by the original item
               boundaries. Each segment carries:
-                {type, value: <Tensor (L_seg, D)>, from_assistant, loss_mask}
+                {type, value: <Tensor (L_seg, D)>, role, loss_mask}
               text segment value = wte embeddings of all its tokens (multi-token)
               modality segment value = 1 placeholder embedding (single-token tensor)
               boundary marker segment value = 1 marker token embedding
@@ -196,7 +196,7 @@ These rules are enforced by the framework. Violate them and you'll fight the des
 13. **SP slicing is a backbone-internal concern.** SP `pad_and_slice` happens in the backbone's `pre_forward`; SP `gather` happens in its `post_forward`. Pre-LLM nodes (e.g. `tok_encode`) and post-LLM nodes (e.g. `tok_decode`, `vae_decode`) operate on full-length tensors — they are SP-agnostic.
 14. **Per-module checkpoint callback, per-module subfolder; tokenizer is per-module too.** Every module has its own `CheckpointCallback` writing to `<output_ckpt_dir>/<module_name>/{config.json, model.safetensors, [optional asset]}`. **All processors AND tokenizers stay per-module** (vision processor, image processor, audio feature extractor, AND the tokenizer → live inside their owning module's subfolder). The tokenizer specifically lives in the family's `text_encoder` module (`<output_ckpt_dir>/<family>_text_encoder/tokenizer/`). **OmniConfig has no top-level `tokenizer_path` field.** Pure DiT models without a text encoder have no tokenizer in their config at all.
 
-15. **raw_batch = single field `conversation_list` at entry; module-driven processing thereafter.** raw_batch is a mutable dict whose only initial key is `conversation_list` (`list[list[dict]]` of `{type, value, loss_mask, from_assistant}` items). All derived fields (input_ids, image_embeds, attention_mask, labels, position_ids, hidden_states, ...) are produced by modules during forward and written back into raw_batch via return dicts. `multimodal_transform.py` only does basic IO + resize (path → tensor into item.value) — no chat templating, no tokenization, no image processing. The same dataset can feed any ug model — chat template / tokenize / image processor / boundary marker injection are all owned by the relevant module.
+15. **raw_batch = single field `conversation_list` at entry; module-driven processing thereafter.** raw_batch is a mutable dict whose only initial key is `conversation_list` (`list[list[dict]]` of `{type, value, role, loss_mask}` items). All derived fields (input_ids, image_embeds, attention_mask, labels, position_ids, hidden_states, ...) are produced by modules during forward and written back into raw_batch via return dicts. `multimodal_transform.py` only does basic IO + resize (path → tensor into item.value) — no chat templating, no tokenization, no image processing. The same dataset can feed any ug model — chat template / tokenize / image processor / boundary marker injection are all owned by the relevant module.
 
 16. **Module forward = kwargs + Dict return; data flows 100% through raw_batch.** Each module's `forward(**kwargs) -> Dict[str, Any]` keeps the HF-compatible signature, but OmniModel **immediately writes the return dict back into raw_batch** (keyed by `edge.output`). Edges do **not** carry data to downstream modules — downstream reads the same `raw_batch` by its own input keys. Edges are dependency contracts and topology markers. Collator helpers and SP slicing are called **inside each module's `pre_forward`** for the fields it owns: ViT slices the image batch dim; text_encoder slices the sequence dim. There is no global collator final-step and no global SP slice node.
 
