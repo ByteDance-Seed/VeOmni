@@ -252,9 +252,30 @@ class OptimizerState(Stateful):
             for key, val in template.items():
                 if isinstance(val, torch.Tensor):
                     if val.ndim == 0:
+                        # Scalar (e.g. ``step``): cheap, keep on the template's device.
                         placeholder[key] = torch.zeros_like(val)
                     else:
-                        placeholder[key] = torch.zeros_like(param.data, dtype=val.dtype, device=val.device)
+                        # MoE / VLM training reaches the first save (often
+                        # ``save_steps=100``) before every expert / modality has
+                        # seen a gradient, so ``missing`` can hold tens of
+                        # parameter-sized Adam state entries (typically
+                        # ``exp_avg`` + ``exp_avg_sq`` in fp32 — 2x bf16 param
+                        # bytes each). Allocating these on GPU under DCP save
+                        # tipped 35B-a3b VL on H100x16 over: residual forward
+                        # activations + the fresh fp32 zeros + NCCL collective
+                        # buffers ⇒ ``NCCL WARN Cuda failure 2 'out of memory'``
+                        # inside the gather. Placeholders are zeros that DCP
+                        # writes straight to disk; their device doesn't matter
+                        # — keep them on CPU so the save path doesn't fight the
+                        # training process for HBM. ``param.data`` returns the
+                        # local shard tensor for FSDP2 DTensor params, so
+                        # ``zeros_like`` preserves the correct per-rank shape
+                        # (NOT the global ``param.shape``).
+                        placeholder[key] = torch.zeros_like(
+                            param.data,
+                            dtype=val.dtype,
+                            device="cpu",
+                        )
                 elif isinstance(val, (int, float)):
                     placeholder[key] = type(val)(0)
                 else:
