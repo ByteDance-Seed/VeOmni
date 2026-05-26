@@ -1,9 +1,16 @@
 """
 Split a Janus-1.3B checkpoint into four SeedOmni V2 sub-module checkpoints.
 
+Two-phase entry point (``__main__``)
+------------------------------------
+1. ``convert_janus_weight_to_hf.convert_model`` — rewrites the upstream
+   Janus checkpoint into a HuggingFace-layout directory (``<model_path>-hf``).
+2. ``split_janus`` — loads that HF checkpoint and writes the four module
+   subfolders plus the global tokenizer.
+
 Usage
 -----
-  python scripts/split_janus.py \
+  python scripts/multimodal/convert_model/split_janus.py \
       --model_path /mnt/hdfs/veomni/models/transformers/Janus-1.3B \
       --output_dir /mnt/hdfs/veomni/models/seed_omni/janus_1.3b
 
@@ -24,11 +31,23 @@ Output structure (matches ``design.md`` §11)
     text_encoder/
       config.json                     # JanusTextEncoderConfig (model_type=janus_text_encoder)
       model.safetensors               # embed_tokens.* (+ lm_head.* if untied)
-    tokenizer/                        # global asset (one tokenizer per Omni model)
+    tokenizer.json                    # global tokenizer (written to output_dir root;
+    tokenizer_config.json             #   referenced by OmniConfig ``tokenizer_path``)
+    special_tokens_map.json
+    ...
 
 The OmniConfig YAML side then reads each module from
 ``<output_dir>/<module_name>``; ``OMNI_CONFIG_REGISTRY`` / ``OMNI_MODEL_REGISTRY``
 resolve ``model_type`` from each ``config.json`` to the mixin class.
+``tokenizer_path`` in the YAML points at ``<output_dir>`` (the directory that
+holds ``tokenizer.json``), not a module subfolder.
+
+Weight extraction
+-----------------
+Each sub-module is built on the meta device via ``_from_config`` under
+``no_init_weights`` / ``init_empty_weights``, then populated with
+``load_state_dict(..., assign=True)`` from the monolithic Janus checkpoint.
+This avoids allocating full-weight tensors twice during the split.
 
 Why a separate ``text_encoder``?
 ------------------------------
@@ -45,9 +64,12 @@ boundary tokens around a VQ image span (the framework has no notion of
 these; emitting them is a model concern).  We use
 :class:`JanusTextEncoder` (model_type ``janus_text_encoder``) — a thin
 subclass of :class:`TextEncoder` that adds ``emit_image_start`` /
-``emit_image_end`` call-site methods plus the two boundary token ids.
-Boundary / placeholder token ids are resolved at runtime from the module
-tokenizer (not stored in ``config.json``).
+``emit_image_end`` call-site methods.
+
+Special-token ids (boi / eoi / image placeholder) are **not** written into
+any module ``config.json``.  At runtime the trainer wires the global
+tokenizer into each module (``set_tokenizer``); the module resolves the
+ids from the tokenizer during ``post_init``.
 """
 
 import argparse
@@ -74,7 +96,14 @@ def _save_state_dict(state_dict: dict, output_dir: str) -> None:
 
 
 def split_janus(model_path: str, output_dir: str) -> None:
-    """Split the Janus checkpoint into the four sub-module folders."""
+    """Split an HF-layout Janus checkpoint into four module subfolders + tokenizer.
+
+    ``model_path`` must already be the HuggingFace directory produced by
+    ``convert_janus_weight_to_hf.convert_model`` (the ``__main__`` block
+    handles this automatically).  Writes module weights under
+    ``<output_dir>/<module_name>/`` and the global tokenizer files directly
+    under ``<output_dir>/``.
+    """
     print(f"Loading Janus from: {model_path}")
     from transformers import AutoTokenizer, JanusForConditionalGeneration, JanusProcessor
 
@@ -100,6 +129,8 @@ def split_janus(model_path: str, output_dir: str) -> None:
     inner = model.model
 
     # ── 1. janus_siglip (vision_model + aligner) ────────────────────────────
+    # Image processor constants come from JanusProcessor; saved as a per-module
+    # asset so the siglip checkpoint is self-contained for vision encode.
     print("Extracting janus_siglip ...")
     vision_cfg_dict = cfg.vision_config.to_dict()
     siglip_cfg = JanusSiglipConfig(vision_config=vision_cfg_dict)
@@ -116,6 +147,8 @@ def split_janus(model_path: str, output_dir: str) -> None:
     print(f"  saved → {siglip_dir}")
 
     # ── 2. janus_vqvae (vqmodel + generation_*) ───────────────────────────
+    # Reuses the same image processor as siglip (Janus shares one resize /
+    # normalise pipeline for both understanding and generation paths).
     print("Extracting janus_vqvae ...")
     vq_cfg_dict = cfg.vq_config.to_dict()
     vqvae_cfg = JanusVqvaeConfig(vq_config=vq_cfg_dict, freeze_vqvae=True)
@@ -133,11 +166,11 @@ def split_janus(model_path: str, output_dir: str) -> None:
     print(f"  saved → {vqvae_dir}")
 
     # ── 3. text_encoder (language_model.embed_tokens + lm_head) ──────────────
-    # Saved as JanusTextEncoder (model_type=janus_text_encoder) so the model
+    # Saved as JanusTextEncoder (model_type=janus_text_encoder) so the module
     # owns the boi/eoi emitter methods used by the inference FSM bridge
-    # states.  The config is a JanusTextEncoderConfig — vocab_size /
-    # hidden_size / tie_word_embeddings come from the original LLaMA
-    # config; boi/eoi ids are resolved at runtime from the module tokenizer.
+    # states.  Config carries only vocab / hidden / tie_word_embeddings from
+    # the original LLaMA text_config — no special-token ids (those come from
+    # the global tokenizer at runtime via set_tokenizer).
     print("Extracting text_encoder (as janus_text_encoder) ...")
     text_cfg: LlamaConfig = cfg.text_config
     text_cfg_dict = text_cfg.to_dict()
@@ -160,6 +193,9 @@ def split_janus(model_path: str, output_dir: str) -> None:
     print(f"  saved → {te_dir} (tie_word_embeddings={text_cfg.tie_word_embeddings})")
 
     # ── 4. janus_llama (LlamaModel backbone, no embed_tokens / no lm_head) ─
+    # text_config is copied verbatim from the monolithic Janus config.
+    # image_token_id / gen_image_token_id are not stored here — JanusLlama
+    # resolves them from the global tokenizer at runtime (same as boi/eoi).
     print("Extracting janus_llama ...")
     llama_cfg = JanusLlamaConfig(text_config=text_cfg_dict)
     with no_init_weights(), init_empty_weights():
@@ -173,22 +209,25 @@ def split_janus(model_path: str, output_dir: str) -> None:
     print(f"  saved → {llama_dir} (no embed_tokens / no lm_head)")
 
     # ── 5. global tokenizer ─────────────────────────────────────────────────
-    # One tokenizer per Omni model; lives at the root rather than per-module.
+    # One tokenizer per Omni model.  Written to output_dir root (tokenizer.json,
+    # tokenizer_config.json, …) so OmniConfig.tokenizer_path can point at the
+    # split output directory directly.
     print(f"Copying global tokenizer to {output_dir} ...")
     tokenizer = AutoTokenizer.from_pretrained(model_path)
     tokenizer.save_pretrained(output_dir)
     print(f"  tokenizer → {output_dir}")
 
     print(f"\nDone.  Split checkpoint saved to: {output_dir}")
-    print("janus_1.3b.yaml (V2) should reference:")
-    print(f"  tokenizer_path : {output_dir}")
-    print(f"  modules.janus_siglip : {siglip_dir}")
-    print(f"  modules.janus_vqvae : {vqvae_dir}")
-    print(f"  modules.text_encoder : {te_dir}")
-    print(f"  modules.janus_llama : {llama_dir}")
+    print("configs/seed_omni/janus_1.3b/train_joint.yaml should reference:")
+    print(f"  tokenizer_path              : {output_dir}")
+    print(f"  modules.janus_siglip.weights_path : {siglip_dir}")
+    print(f"  modules.janus_vqvae.weights_path  : {vqvae_dir}")
+    print(f"  modules.text_encoder.weights_path : {te_dir}")
+    print(f"  modules.janus_llama.weights_path  : {llama_dir}")
 
 
 if __name__ == "__main__":
+    # Phase 1: upstream Janus → HF layout; phase 2: HF → four V2 sub-checkpoints.
     parser = argparse.ArgumentParser(description="Split Janus-1.3B into SeedOmni V2 sub-checkpoints")
     parser.add_argument(
         "--model_path",
