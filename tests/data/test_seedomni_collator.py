@@ -230,28 +230,13 @@ def test_pipeline_dataset_to_micro_batch(tmp_path):
 # ─────────────────────────── OmniTrainer._build_collate_fn ───────────────────────────
 
 
-# ``OmniTrainer`` currently references a few stale symbols at module
-# import time (``OmniBuildArgs``, ``OmniModel.build_from_args`` — both
-# no longer exist after the V2 model refactor).  Fixing those is a
-# trainer-level cleanup that's deliberately out of D1's scope.  The
-# tests below attempt the import once; if it fails we ``skip`` rather
-# than ``error`` so D1's data-layer tests stay green.  When trainer
-# build flow is fixed in a later PR these tests will auto-unskip.
-_omni_trainer_module = None
-_omni_trainer_skip_reason = None
-try:
-    from veomni.trainer import omni_trainer as _omni_trainer_module
-except ImportError as e:
-    _omni_trainer_skip_reason = f"OmniTrainer module not importable yet: {e}"
+from veomni.trainer.omni_trainer import OmniTrainer  # noqa: E402  (deliberate, isolates the import here)
 
 
-@pytest.mark.skipif(_omni_trainer_module is None, reason=_omni_trainer_skip_reason or "")
 def test_omni_trainer_picks_seedomni_collator_for_seedomni_data_type():
     """Direct test of the dispatch logic: when ``data_type='seedomni'``
     the trainer must pick ``SeedOmniCollator`` (not ``MainCollator``)."""
     from types import SimpleNamespace
-
-    OmniTrainer = _omni_trainer_module.OmniTrainer
 
     # Stub the OmniTrainer just enough for ``_build_collate_fn`` —
     # we don't want to load any model or open any files.
@@ -267,14 +252,11 @@ def test_omni_trainer_picks_seedomni_collator_for_seedomni_data_type():
     )
 
 
-@pytest.mark.skipif(_omni_trainer_module is None, reason=_omni_trainer_skip_reason or "")
 def test_omni_trainer_falls_back_to_main_collator_for_other_data_types():
     """Non-``seedomni`` data_types must keep using ``BaseTrainer._build_collate_fn``
     (which builds ``MainCollator``).  Mirrors the existing text-only path
     so V1 contract isn't accidentally broken."""
     from types import SimpleNamespace
-
-    OmniTrainer = _omni_trainer_module.OmniTrainer
 
     trainer = OmniTrainer.__new__(OmniTrainer)
     base_stub = SimpleNamespace()

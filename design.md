@@ -872,6 +872,16 @@ V2 当前版本**不接受 per-module 的 `micro_batch_size` / `dp_size` / `sp_s
 - 加载时按 YAML `modules.<name>.weights_path` 读取，state_dict 套上 `<name>.` 前缀就能放到 `omni_model.modules_dict.<name>` 子树。
 - 用户在 YAML 里改 module 的 key（如把 `janus_llama` 改成 `my_backbone`），不影响加载——前缀由 YAML key 决定。
 
+**实施进度（2026-05 截至本节）**：上述"扩展 `build_foundation_model` 接 `dict[str, str]`、`build_parallelize_model` 多 path meta-init"是 **终态**，正在按 PR 拆分推进中。当前状态：
+
+| 阶段 | 状态 | 说明 |
+|------|------|------|
+| stale cleanup | ✅ 已完成 | 删 `OmniTrainer` 里 stale 的 `OmniBuildArgs` / `OmniModel.build_from_args` 引用；`_build_model` / `_build_model_assets` 留 `NotImplementedError` stub。文件可 import，D1 collator 路径 (`_build_collate_fn`) 正常单测。 |
+| `build_parallelize_model` 多 path 扩展 | 🟡 待开 PR | 给 `parallelize_model_fsdp2` 加一个 `weights_path: Mapping[str, str]` 分支（保持现有 `str` / `None` 行为字节级不变），按 sub-name 在 meta-init + FSDP wrap 之后**逐子树**调 `load_model_weights` / `rank0_load_and_broadcast_weights`。带独立 unit test 证明对 BaseTrainer / VLMTrainer / TextTrainer / DiTTrainer 等 single-path 调用方零影响。 |
+| MODELING_REGISTRY 注册 + OmniTrainer 重写 | 🟡 待开 PR | 把 `janus_siglip` / `janus_vqvae` / `janus_llama` / `janus_text_embed` / `text_embed` 注册进 `MODELING_REGISTRY`（今天它们只在 HF `AutoConfig` / `AutoModel` 注册，`build_foundation_model` 在默认 `MODELING_BACKEND='veomni'` 下找不到）；重写 `_build_model` 走 `init_device='meta'` + `weights_path=None` 拿 empty 子模块、装配 `OmniModel(config, modules_dict)`、`_build_parallelized_model` 一次性 `build_parallelize_model(model, weights_path={name: cfg["weights_path"] ...})`；端到端 smoke test 不 mock `build_foundation_model` / `build_parallelize_model` 内部，跑 fake checkpoint 验证 registry 路径。 |
+
+> 旧版本（被回退）尝试过用 single-path `build_foundation_model` 直接加载到 cpu/cuda、再让 parallelize 阶段 `weights_path=None` 跳过 weight load。这条路有三个 runtime 阻断点：(1) V2 子模块未注册到 `MODELING_REGISTRY`，`build_foundation_model` 第一次 call 就抛 `Unknown Modeling name: janus_siglip`；(2) `parallelize_model_fsdp2` 在 `weights_path=None` 时会跑 `model.to_empty + init_weights()` 重置权重；(3) `init_device='cpu'` 下 `auto.py:242` 让 rank>0 拿空权重又没后续 broadcast，多 rank 静默发散。所以直接做终态比绕道更稳。
+
 ### Save：每个 module 自己的 callback
 
 每个 module 在初始化时挂一个自己的 [`CheckpointCallback`](veomni/trainer/callbacks/checkpoint_callback.py) 实例。trainer 触发 save 时遍历所有 callback，各自写自己的 subfolder：
@@ -1100,13 +1110,18 @@ raw_batch["conversation_list"][0] = [   # 第 0 个 sample
 
 ### 与 V1 主线的迁移路径（每条 feature 独立 PR）
 
-1. **Feature D1**（基础）：multimodal_transform.py 减重——移除 chat_template + tokenize + image_processor 调用，只保留 IO + resize；输出 conversation_list 而非张量 batch。
-2. **Feature D2**（基础）：dataloader / collator 减重——只 batch list；不做任何 sequence padding。
+1. **Feature D1**（基础）：multimodal_transform.py 减重 + list-only collator——`process_seedomni_example` 移除 chat_template + tokenize + image_processor 调用，只保留 IO + resize；输出 `[{"conversation_list": [...]}]`。`SeedOmniCollator` 不做任何 batching/SP/padding，只把每个 sample 的 `conversation_list` 收集成 `list[list[dict]]`。OmniTrainer 在 `data_type='seedomni'` 时改走该 collator。
+2. **Feature D2**（基础）：OmniTrainer build flow 重写。拆三段独立 PR 推进——
+   1. **D2.1 — stale cleanup**：删 `OmniTrainer` 里失效的 `OmniBuildArgs` / `OmniModel.build_from_args` 引用；`_build_model` / `_build_model_assets` 留 `NotImplementedError` stub。让文件可 import，启用 D1 wiring tests；`OmniTrainer.__init__` 仍是软失败状态（在 `_build_model` raise）。
+   2. **D2.2 — extend `build_parallelize_model`**：给 `parallelize_model_fsdp2` 加 `weights_path: Mapping[str, str]` 分支（按 sub-name 在 meta-init + FSDP wrap 之后逐子树加载），保持现有 `str` / `None` 行为字节级不变。带独立单测证明 BaseTrainer / VLMTrainer / TextTrainer / DiTTrainer 不受影响。
+   3. **D2.3 — registry + build flow**：把 V2 子模块（`janus_siglip` / `janus_vqvae` / `janus_llama` / `janus_text_embed` / `text_embed`）注册进 `MODELING_REGISTRY`；重写 `_build_model` 走 `init_device='meta'` + `weights_path=None` 拿 empty 子模块、装配 `OmniModel`，`_build_parallelized_model` 用 D2.2 的 dict 分支一次性加载所有子树。端到端 smoke test 不 mock `build_foundation_model` / `build_parallelize_model` 内部。
+
+   **注意**：即使 D2.3 全部完成，trainer 仍**无法**端到端 train —— module forward 的输入契约仍是 V1 风格 flat tensor batch，`conversation_list` 喂不进去；这要等 D3-D5 把 chat template / image processor / splice 全部迁移到 module forward 后才能跑通。详细 build flow 设计见 § "Build & 权重加载"。
 3. **Feature D3**（vision）：把 image processor + boundary marker 注入逻辑搬进 ViT/VAE 的 forward。
 4. **Feature D4**（text）：把 chat template + tokenize 搬进 text_encoder 的 forward；text_encoder 升级为 model-specific（modules/<family>/text_encoder/）。
 5. **Feature D5**（backbone）：splice + compute_position_ids 在 backbone pre_forward 中接管最终长度对齐（这条之前讨论过）。
 
-D1-D2 是数据层减重；D3-D5 是模型层接管。每步都向后兼容（中间状态可跑），但最终目标是上述六层架构。
+D1-D2 是数据层 / 训练入口减重；D3-D5 是模型层接管。每步都向后兼容（中间状态**可 import / 可单元测**，但 D2 之前的 trainer.train() 不会跑通——这是已知的过渡期，由 D3+ 收尾）；最终目标是上述六层架构。
 
 ### Backbone `pre_forward` 完成多模态 splice + 长度对齐（target contract）
 

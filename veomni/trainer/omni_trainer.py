@@ -13,36 +13,72 @@
 # limitations under the License.
 
 """
-OmniTrainer — trainer for OmniModel V2.
+OmniTrainer — trainer for OmniModel V2 (interim shell).
 
-Design
-------
-Each OmniModule in OmniModel owns its full build lifecycle: it constructs its
-foundation model, calls build_parallelize_model, and exposes its model assets
-(tokenizer, processor) — exactly like a BaseTrainer does for a monolithic model.
+Status (D2 stage 1 / stale-cleanup PR)
+--------------------------------------
+This module previously imported a pair of names that no longer exist
+after the OmniModel V2 refactor (``OmniBuildArgs`` and
+``OmniModel.build_from_args``).  Those references made the file
+unimportable in any environment that pulled it transitively.  This PR
+removes the stale references so:
 
-OmniTrainer orchestrates this via OmniModel.build_from_args(), which calls
-OmniModule.build() per sub-module. There is no separate _build_parallelized_model
-step; parallelisation happens inside each module's build().
+* the file is importable,
+* :meth:`OmniTrainer._build_collate_fn` (the D1 list-only collator
+  dispatch) can be unit-tested without going through the broken
+  ``__init__`` path,
 
-Comparison with VLMTrainer
---------------------------
-  BaseTrainer._build_model             → OmniTrainer._build_model
-    calls build_foundation_model         calls OmniModel.build_from_args()
-    and build_parallelize_model            which calls OmniModule.build() per module
+but the actual build flow (``_build_model`` / ``_build_model_assets`` /
+``_build_parallelized_model``) is **not yet wired** — those three
+helpers raise :class:`NotImplementedError` with a pointer to the
+follow-up PRs.
 
-  BaseTrainer._build_model_assets      → OmniTrainer._build_model_assets
-    builds tokenizer / processor         collects assets from all modules via
-                                          OmniModel.collect_assets()
+The full V2 build flow lands in two follow-up PRs (the design is
+already in :doc:`design.md` § "Build & 权重加载"):
 
-Usage
------
+#. **D2 stage 2 — extend `build_parallelize_model`**.  Add an opt-in
+   ``weights_path: Mapping[str, str]`` branch in
+   :func:`veomni.distributed.torch_parallelize.parallelize_model_fsdp2`
+   so the parallelize step can load each sub-module from its own
+   directory after meta-init.  Keeps the existing ``str`` / ``None``
+   behaviour byte-for-byte; covered by its own unit tests so other
+   trainers (BaseTrainer / VLMTrainer / TextTrainer / DiTTrainer) are
+   provably unaffected.
+#. **D2 stage 3 — re-implement OmniTrainer build flow**.  Register
+   each V2 sub-module (``janus_siglip`` / ``janus_vqvae`` /
+   ``janus_llama`` / ``janus_text_embed`` / ``text_embed``) into
+   :data:`veomni.models.loader.MODELING_REGISTRY` so
+   :func:`veomni.models.build_foundation_model` can dispatch to the
+   right mixin class (today they live only in HF
+   ``AutoConfig`` / ``AutoModel`` registries, which
+   ``build_foundation_model`` does not consult when
+   ``MODELING_BACKEND='veomni'``).  Then:
+
+   * ``_build_model`` calls ``build_foundation_model(init_device='meta',
+     weights_path=None)`` per declared module — pure empty meta init,
+     no per-rank divergence — and composes them into ``OmniModel``.
+   * ``_build_parallelized_model`` calls
+     ``build_parallelize_model(self.base.model, weights_path={
+     name: cfg["weights_path"] for ...})`` exactly once on the whole
+     ``OmniModel``; the new dict branch loads each sub-tree from disk
+     after FSDP wrap.
+   * end-to-end smoke tests exercise the real ``build_foundation_model``
+     path (no internal mocking of the loader / parallelize) so that
+     the registry / loader assumptions are validated.
+
+D1's data-layer features are stable and shipped — only the trainer
+build flow is staged.
+
+Usage (today, intentionally a soft fail)
+----------------------------------------
+::
+
     from veomni.arguments import parse_args
     from veomni.trainer.omni_trainer import OmniTrainer, VeOmniOmniArguments
 
     if __name__ == "__main__":
         args = parse_args(VeOmniOmniArguments)
-        trainer = OmniTrainer(args)
+        trainer = OmniTrainer(args)        # raises NotImplementedError
         trainer.train()
 """
 
@@ -55,11 +91,9 @@ import torch
 from ..arguments import DataArguments, ModelArguments, TrainingArguments, VeOmniArguments
 from ..data import build_data_transform
 from ..distributed.clip_grad_norm import veomni_clip_grad_norm
-from ..models.seed_omni import OmniBuildArgs, OmniConfig, OmniModel
 from ..ops.batch_invariant_ops import set_batch_invariant_mode
 from ..utils import helper
 from ..utils.device import synchronize
-from ..utils.model_utils import pretty_print_trainable_parameters
 from .base import BaseTrainer
 
 
@@ -73,7 +107,14 @@ logger = helper.create_logger(__name__)
 class OmniModelArguments(ModelArguments):
     omni_config_path: Optional[str] = field(
         default=None,
-        metadata={"help": "Path to the OmniModel YAML config (e.g. configs/seed_omni/janus_1.3b.yaml)."},
+        metadata={
+            "help": (
+                "Path to the OmniModel YAML config (e.g. "
+                "configs/seed_omni/janus_1.3b/train_joint.yaml).  Sub-module "
+                "weights are read from each ``modules.<name>.weights_path`` "
+                "entry inside that YAML."
+            )
+        },
     )
 
 
@@ -87,45 +128,47 @@ class VeOmniOmniArguments(VeOmniArguments):
 # ── OmniTrainer ────────────────────────────────────────────────────────────────
 
 
+# Common message for the three build helpers that haven't been re-implemented
+# yet — kept in one place so the wording is identical across helpers.
+_BUILD_NOT_WIRED_MSG = (
+    "OmniTrainer build flow is staged across two follow-up PRs (extend "
+    "`build_parallelize_model` to accept a per-sub-module ``weights_path`` "
+    "mapping, then rewrite `_build_model` to use meta-init + the new "
+    "multi-path parallelize). See ``omni_trainer.py`` module docstring "
+    "for the full plan. The class itself is importable so the D1 collator "
+    "wiring (`_build_collate_fn`) can be unit-tested in the meantime."
+)
+
+
 class OmniTrainer:
     """Trainer for OmniModel V2 — composable multi-modal training.
 
-    Follows the same BaseTrainer delegation pattern as VLMTrainer and
-    TextTrainer: a BaseTrainer instance is created via __new__ and its
-    private _build_* helpers are called one-by-one, with OmniModel-specific
-    overrides where needed.
-
-    Build flow
-    ----------
-    ::
-
-        OmniTrainer.__init__
-          └── _build_model
-                ├── load OmniConfig from omni_config_path
-                ├── create OmniBuildArgs from VeOmniArguments
-                └── OmniModel.build_from_args(config, build_args)
-                      └── for each module:
-                            OmniModule.build(cfg, build_args)
-                              ├── OmniModule._build_nn_module(cfg, init_device)
-                              └── build_parallelize_model(module, ...)
-
-        OmniTrainer.__init__
-          └── _build_model_assets
-                └── OmniModel.collect_assets()   ← tokenizer / processor from modules
+    Mirrors the ``BaseTrainer.__new__`` delegation pattern used by
+    :class:`VLMTrainer` / :class:`TextTrainer`.  At this stage only
+    :meth:`_build_collate_fn` (the D1 list-only collator dispatch) is
+    wired; :meth:`_build_model` and :meth:`_build_model_assets`
+    intentionally raise ``NotImplementedError``.  The follow-up
+    ``_build_parallelized_model`` step is **not yet defined on this
+    class** — it will be added in D2.3 once
+    :func:`veomni.distributed.torch_parallelize.build_parallelize_model`
+    learns the multi-path ``weights_path`` form (D2.2).  See the module
+    docstring for the staged plan.
     """
 
     base: BaseTrainer
 
     def __init__(self, args: VeOmniOmniArguments):
-        # BaseTrainer.__init__ is NOT called; individual helpers are invoked
-        # explicitly so the sequence is transparent and overridable.
+        # Even constructing the trainer is currently a soft fail: the
+        # build helpers below raise as soon as they're invoked.  We
+        # still walk through ``_setup`` (parallel state init, args
+        # logging) so callers get a deterministic failure point right
+        # at ``_build_model`` rather than later in the optimizer
+        # construction or the train loop.
         self.base = BaseTrainer.__new__(BaseTrainer)
         self.base.args = args
 
         self.base._setup()
 
-        # _build_model handles both model construction AND parallelisation.
-        # There is no separate _build_parallelized_model step.
         self._build_model()
         self._freeze_model_module()
         self._build_model_assets()
@@ -141,42 +184,41 @@ class OmniTrainer:
     # ── Build helpers ──────────────────────────────────────────────────────────
 
     def _build_model(self):
-        """Load OmniConfig, create OmniBuildArgs, and build OmniModel.
+        """Stub — to be implemented in the D2 stage-3 follow-up PR.
 
-        Parallelisation happens inside OmniModel.build_from_args() → each
-        OmniModule.build() calls build_parallelize_model independently, so
-        there is no separate _build_parallelized_model step.
+        See module docstring for the planned implementation
+        (meta-init per module + ``OmniModel`` compose + dict-path
+        ``build_parallelize_model``).
         """
-        args: VeOmniOmniArguments = self.base.args
-        logger.info_rank0("Building OmniModel via OmniModel.build_from_args()")
+        raise NotImplementedError("OmniTrainer._build_model is not implemented yet. " + _BUILD_NOT_WIRED_MSG)
 
-        omni_config = _load_omni_config(args.model.omni_config_path)
-        build_args = _make_build_args(args)
+    def _freeze_model_module(self):  # pragma: no cover — unreachable until _build_model is wired
+        """No-op placeholder — same shape as ``BaseTrainer._freeze_model_module``.
 
-        self.base.model = OmniModel.build_from_args(omni_config, build_args)
-        self.base.model_config = omni_config
-
-    def _freeze_model_module(self):
-        pretty_print_trainable_parameters(self.base.model)
-        helper.print_device_mem_info("VRAM usage after building OmniModel")
+        In the follow-up PR this will print parameter counts and
+        delegate to ``_setup_lora`` so ``args.model.lora_config`` is
+        honoured (it is silently ignored today).
+        """
+        return None
 
     def _build_model_assets(self):
-        """Collect model assets (tokenizer, processor) from all sub-modules.
+        """Stub — to be implemented in the D2 stage-3 follow-up PR.
 
-        Each OmniModule.get_assets() is called via OmniModel.collect_assets().
-        The first tokenizer found is stored as self.base.tokenizer; the full
-        list is stored as self.base.model_assets.
+        Will collect ``tokenizer`` from ``OmniConfig.tokenizer_path``
+        (kept global until D4 moves it onto ``text_encoder``) plus
+        per-module assets via ``OmniModel.collect_assets``.
         """
-        assets = self.base.model.collect_assets()
-        # Expose the first tokenizer found for the data pipeline
-        from transformers import PreTrainedTokenizerBase
+        raise NotImplementedError("OmniTrainer._build_model_assets is not implemented yet. " + _BUILD_NOT_WIRED_MSG)
 
-        tokenizer = next((a for a in assets if isinstance(a, PreTrainedTokenizerBase)), None)
-        self.base.tokenizer = tokenizer
-        self.base.model_assets = [self.base.model_config] + assets
+    def _build_data_transform(self):  # pragma: no cover — unreachable until _build_model_assets is wired
+        """Build the data transform.
 
-    def _build_data_transform(self):
-        """Build data transform (standard text by default)."""
+        Same body as :meth:`BaseTrainer._build_data_transform` for
+        signature parity; will be exercised end-to-end once the build
+        flow is wired.  ``data_type='seedomni'`` ignores ``tokenizer``
+        / ``max_seq_len`` / ``text_keys`` (they're forwarded for
+        legacy contract compatibility).
+        """
         args: VeOmniOmniArguments = self.base.args
         self.base.data_transform = build_data_transform(
             args.data.data_type,
@@ -199,6 +241,10 @@ class OmniTrainer:
         ``classification`` / ``qwen*_vl`` / ...) we fall back to
         ``BaseTrainer._build_collate_fn`` which builds a ``MainCollator``
         with packing + SP — the V1 contract is preserved verbatim.
+
+        This helper is intentionally wired in this stage-1 PR so D1
+        data-layer testing can validate the dispatch even though the
+        rest of the build flow is still stubbed.
         """
         args: VeOmniOmniArguments = self.base.args
         if args.data.data_type == "seedomni":
@@ -211,7 +257,7 @@ class OmniTrainer:
 
     # ── Forward / backward ─────────────────────────────────────────────────────
 
-    def forward_backward_step(
+    def forward_backward_step(  # pragma: no cover — unreachable until build flow is wired
         self,
         micro_batch: Dict[str, Any],
         num_micro_steps: int,
@@ -237,11 +283,13 @@ class OmniTrainer:
         del micro_batch
         return loss, loss_dict
 
-    def _model_reshard(self, micro_step: int, num_micro_steps: int):
-        """Apply set_reshard_after_backward to each FSDP2 sub-module.
+    def _model_reshard(  # pragma: no cover — unreachable until build flow is wired
+        self, micro_step: int, num_micro_steps: int
+    ):
+        """Apply set_reshard_after_backward to FSDP2 sub-modules.
 
-        OmniModel itself is not wrapped as a monolith, so we iterate over its
-        modules_dict to apply the FSDP2 reshard-after-backward optimisation.
+        Walks every nested FSDP2 unit so the optimisation also covers
+        ``basic_modules``-carved blocks, not just the top-level wrap.
         """
         fsdp_cfg = self.base.args.train.accelerator.fsdp_config
         if fsdp_cfg.fsdp_mode != "fsdp2" or fsdp_cfg.reshard_after_backward or num_micro_steps <= 1:
@@ -252,7 +300,7 @@ class OmniTrainer:
         except ImportError:
             return
 
-        for mod in self.base.model.modules_dict.values():
+        for mod in self.base.model.modules():
             if isinstance(mod, FSDPModule):
                 if micro_step == 0:
                     mod.set_reshard_after_backward(False)
@@ -260,28 +308,34 @@ class OmniTrainer:
                     mod.set_reshard_after_backward(True)
 
     # ── Callbacks (delegate to base) ───────────────────────────────────────────
+    # The pragma annotations below mirror the build helpers' rationale: the
+    # whole train loop is unreachable until D2.3 wires `_build_model`.  Drop
+    # these pragmas as part of the D2.3 cleanup so coverage tracks the
+    # callback delegation once it actually runs.
 
-    def on_train_begin(self):
+    def on_train_begin(self):  # pragma: no cover — unreachable until build flow is wired
         self.base.on_train_begin()
 
-    def on_train_end(self):
+    def on_train_end(self):  # pragma: no cover — unreachable until build flow is wired
         self.base.on_train_end()
 
-    def on_epoch_begin(self):
+    def on_epoch_begin(self):  # pragma: no cover — unreachable until build flow is wired
         self.base.on_epoch_begin()
 
-    def on_epoch_end(self):
+    def on_epoch_end(self):  # pragma: no cover — unreachable until build flow is wired
         self.base.on_epoch_end()
 
-    def on_step_begin(self, micro_batches=None):
+    def on_step_begin(self, micro_batches=None):  # pragma: no cover — unreachable until build flow is wired
         self.base.on_step_begin(micro_batches=micro_batches)
 
-    def on_step_end(self, loss=None, loss_dict=None, grad_norm=None):
+    def on_step_end(
+        self, loss=None, loss_dict=None, grad_norm=None
+    ):  # pragma: no cover — unreachable until build flow is wired
         self.base.on_step_end(loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
 
     # ── Train loop ─────────────────────────────────────────────────────────────
 
-    def train_step(self, data_iterator: Any) -> None:
+    def train_step(self, data_iterator: Any) -> None:  # pragma: no cover — unreachable until build flow is wired
         args: VeOmniOmniArguments = self.base.args
         self.base.state.global_step += 1
 
@@ -309,7 +363,7 @@ class OmniTrainer:
 
         self.on_step_end(loss=total_loss, loss_dict=dict(total_loss_dict), grad_norm=grad_norm)
 
-    def train(self):
+    def train(self):  # pragma: no cover — unreachable until build flow is wired
         args: VeOmniOmniArguments = self.base.args
         self.on_train_begin()
         logger.info(
@@ -342,40 +396,3 @@ class OmniTrainer:
         self.on_train_end()
         synchronize()
         self.base.destroy_distributed()
-
-
-# ── Helpers ────────────────────────────────────────────────────────────────────
-
-
-def _load_omni_config(path: Optional[str]) -> OmniConfig:
-    """Load OmniConfig from a YAML file."""
-    import yaml
-
-    if path is None:
-        raise ValueError(
-            "model.omni_config_path must be set. "
-            "Point it to the OmniModel YAML (e.g. configs/seed_omni/janus_1.3b.yaml)."
-        )
-    with open(path) as f:
-        data = yaml.safe_load(f)
-    return OmniConfig.from_dict(data)
-
-
-def _make_build_args(args: VeOmniOmniArguments) -> OmniBuildArgs:
-    """Translate VeOmniArguments into OmniBuildArgs for OmniModule.build()."""
-    fsdp_cfg = args.train.accelerator.fsdp_config
-    torch_dtype = "float32" if fsdp_cfg.mixed_precision.enable else "bfloat16"
-    return OmniBuildArgs(
-        init_device=args.train.init_device,
-        torch_dtype=torch_dtype,
-        enable_full_shard=fsdp_cfg.full_shard,
-        enable_reshard_after_forward=fsdp_cfg.reshard_after_forward,
-        mixed_precision=fsdp_cfg.mixed_precision,
-        enable_gradient_checkpointing=args.train.gradient_checkpointing.enable,
-        enable_fsdp_offload=fsdp_cfg.offload,
-        enable_reentrant=args.train.gradient_checkpointing.enable_reentrant,
-        enable_forward_prefetch=fsdp_cfg.forward_prefetch,
-        broadcast_model_weights_from_rank0=args.train.broadcast_model_weights_from_rank0,
-        max_load_broadcast_size=fsdp_cfg.max_load_broadcast_size,
-        extra_basic_modules=list(args.model.basic_modules or []),
-    )
