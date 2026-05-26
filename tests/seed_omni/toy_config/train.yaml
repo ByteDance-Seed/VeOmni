@@ -1,0 +1,59 @@
+# Print-flow toy master YAML — graph vocabulary for test_print_flow.py.
+#
+# Uses print_modules stand-ins (text_encoder / vision / vqvae / ar), not real
+# Janus weights.  Inference scenarios live in sibling infer_*.yaml files and
+# deep-merge over this vocabulary via OmniConfig.from_yamls().
+
+modules:
+  text_encoder: {}
+  vision: {}
+  vqvae: {}
+  ar: {}
+
+nodes:
+  tok_encode: { module: text_encoder.encode }
+  tok_decode: { module: text_encoder.decode }
+  vis_encode: { module: vision }
+  vae_encode: { module: vqvae.encode }
+  vae_decode: { module: vqvae.decode }
+  run_ar: { module: ar }
+  emit_image_start: { module: text_encoder.emit_image_start }
+  emit_image_end: { module: text_encoder.emit_image_end }
+
+edges:
+  # ── training (and shared with inference)
+  vis_to_ar:
+    { from: vis_encode, output: image_embeds, to: run_ar, as: und_image_embeds }
+  vae_enc_to_ar:
+    { from: vae_encode, output: gen_embeds, to: run_ar, as: gen_image_embeds }
+  tok_enc_to_ar:
+    { from: tok_encode, output: inputs_embeds, to: run_ar, as: inputs_embeds }
+  ar_to_tok_dec:
+    { from: run_ar, output: hidden_states, to: tok_decode, as: hidden_states }
+  ar_to_vae_dec:
+    { from: run_ar, output: hidden_states, to: vae_decode, as: hidden_states }
+  vae_token_to_dec:
+    { from: vae_encode, output: vq_token_ids, to: vae_decode, as: gt_token_ids }
+  tok_dec_sink: { from: tok_decode, to: end }
+  vae_dec_sink: { from: vae_decode, to: end }
+  # ── inference-only
+  vae_dec_to_ar:
+    { from: vae_decode, output: embed, to: run_ar, as: inputs_embeds }
+  emit_start_to_ar:
+    { from: emit_image_start, output: inputs_embeds, to: run_ar, as: inputs_embeds }
+  emit_end_to_ar:
+    { from: emit_image_end, output: inputs_embeds, to: run_ar, as: inputs_embeds }
+  emit_start_sink: { from: emit_image_start, to: end }
+  emit_end_sink: { from: emit_image_end, to: end }
+  ar_run_sink: { from: run_ar, to: end }
+
+training_graph:
+  edges:
+    - vis_to_ar
+    - vae_enc_to_ar
+    - tok_enc_to_ar
+    - ar_to_tok_dec
+    - ar_to_vae_dec
+    - vae_token_to_dec
+    - tok_dec_sink
+    - vae_dec_sink

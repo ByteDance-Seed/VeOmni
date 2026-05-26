@@ -28,7 +28,12 @@ from veomni.models.seed_omni import (
     OmniModule,
     OmniModuleCheckpointCallback,
 )
+from veomni.models.seed_omni.generation_graph import FSM_SIGNAL_KEY
 from veomni.models.seed_omni.modules import OMNI_CONFIG_REGISTRY
+from veomni.models.seed_omni.modules.janus.text_encoder.modeling import (
+    SIGNAL_START_IMAGE_GEN,
+    SIGNAL_TEXT_DONE,
+)
 
 
 def _config_cls(model_type: str):
@@ -207,7 +212,7 @@ def test_janus_text_encoder_emit_methods_return_expected_shapes():
 
 
 def test_janus_text_encoder_decode_emits_module_signals():
-    """``decode`` writes one-shot FSM ``module_signal`` keys for boi / eos."""
+    """``decode`` writes ``ctx[module_signal]`` string for boi / eos."""
     JanusTextEncoder = _model_cls("janus_text_encoder")
     JanusTextEncoderConfig = _config_cls("janus_text_encoder")
 
@@ -228,15 +233,13 @@ def test_janus_text_encoder_decode_emits_module_signals():
     jte.lm_head.weight.data[42] = 1.0
     out = jte.decode(hidden_states=h)
     assert out["last_token_id"].item() == 42
-    assert out["start_image_gen"] is True
-    assert "text_done" not in out
+    assert out[FSM_SIGNAL_KEY] == SIGNAL_START_IMAGE_GEN
 
     jte.lm_head.weight.data.zero_()
     jte.lm_head.weight.data[2] = 1.0
     out = jte.decode(hidden_states=h)
     assert out["last_token_id"].item() == 2
-    assert out["text_done"] is True
-    assert "start_image_gen" not in out
+    assert out[FSM_SIGNAL_KEY] == SIGNAL_TEXT_DONE
 
 
 # ── Mixin call-site contracts (loss key, shapes) ──────────────────────────────

@@ -30,11 +30,13 @@ import torch
 import torch.nn as nn
 
 from veomni.models.seed_omni import OmniModule
+from veomni.models.seed_omni.generation_graph import FSM_SIGNAL_KEY
 
 
-# FSM ``module_signal`` keys emitted by PrintTextEmbed.decode (mirrors JanusTextEncoder).
+# Signal *values* for ``ctx[FSM_SIGNAL_KEY]`` (mirrors JanusTextEncoder).
 SIGNAL_START_IMAGE_GEN = "start_image_gen"
 SIGNAL_TEXT_DONE = "text_done"
+SIGNAL_IMAGE_COMPLETE = "image_complete"
 TOK_BOI = 100016
 TOK_EOI = 100593
 TOK_EOS = 2
@@ -109,7 +111,7 @@ class PrintVQVAE(_PrintBase):
 
     Tests configure the simulated grid size via ``image_steps`` — after
     ``image_steps`` consecutive inference ``decode()`` calls the module
-    appends ``image_complete=True`` to its output dict and resets the
+    appends ``module_signal=<image_complete>`` to its output dict and resets the
     counter (so the next image span starts fresh).  ``image_steps=None``
     (the default) disables the signal entirely.
     """
@@ -140,7 +142,7 @@ class PrintVQVAE(_PrintBase):
         self._decode_calls += 1
         out: dict[str, Any] = {"embed": "<vq_decode_embed>"}
         if self._image_steps is not None and self._decode_calls >= self._image_steps:
-            out["image_complete"] = True
+            out[FSM_SIGNAL_KEY] = SIGNAL_IMAGE_COMPLETE
             self._decode_calls = 0
         return out
 
@@ -190,9 +192,9 @@ class PrintTextEmbed(_PrintBase):
             tok = TOK_EOS
         out: dict[str, Any] = {"input_ids": tok, "last_token_id": tok}
         if tok == TOK_BOI:
-            out[SIGNAL_START_IMAGE_GEN] = True
+            out[FSM_SIGNAL_KEY] = SIGNAL_START_IMAGE_GEN
         elif tok == TOK_EOS:
-            out[SIGNAL_TEXT_DONE] = True
+            out[FSM_SIGNAL_KEY] = SIGNAL_TEXT_DONE
         return out
 
     def reset_cursor(self) -> None:

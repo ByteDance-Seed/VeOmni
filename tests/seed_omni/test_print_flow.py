@@ -10,6 +10,10 @@ module is a :mod:`print_modules` stand-in that records its calls into
 a shared log; assertions then read the log to verify the framework
 executes things in the expected order.
 
+Graph vocabulary and inference FSMs live in :mod:`tests.seed_omni.toy_config`
+(``train.yaml`` + ``infer_{interleave,gen,und}.yaml``) and are loaded via
+``OmniConfig.from_yamls`` — same layout as ``configs/seed_omni/janus_1.3b/``.
+
 Coverage
 --------
 * **Training**: a 4-module DAG (text-embed, vision, vqvae, AR backbone)
@@ -37,11 +41,15 @@ Coverage
 
 from __future__ import annotations
 
+from copy import deepcopy
+from pathlib import Path
 from typing import Any
 
 import torch
+import yaml
 
 from veomni.models.seed_omni import OmniConfig, OmniModel
+from veomni.models.seed_omni.generation_graph import FSM_SIGNAL_KEY
 
 from .print_modules import (
     SIGNAL_START_IMAGE_GEN,
@@ -56,252 +64,55 @@ from .print_modules import (
 )
 
 
-# ── Special token ids used in the print token script ─────────────────────────
+# ── Toy YAML configs (tests/seed_omni/toy_config/) ───────────────────────────
+
+_TOY_INFER_FILES = {
+    "interleave": "infer_interleave.yaml",
+    "gen": "infer_gen.yaml",
+    "und": "infer_und.yaml",
+}
 
 
-# ── Config builder ───────────────────────────────────────────────────────────
+def _toy_config_dir() -> Path:
+    return Path(__file__).resolve().parent / "toy_config"
 
 
-def _config_dict() -> dict[str, Any]:
-    """Janus-style schema used by both training and inference scenarios.
-
-    Notes
-    -----
-    * ``training_graph.edges`` lists every edge the trainer should walk —
-      including two ``to: end`` sinks (``tok_dec_sink``, ``vae_dec_sink``)
-      that pin the leaf nodes into the active set without routing
-      anywhere.
-    * ``generation_graph.states.<name>.body`` lists ONLY edges (the
-      design forbids node names in body).
-    * Token-length ``fixed: 3`` for ``image_vq`` keeps the test trace
-      compact while still exercising the steps_complete transition.
-    """
-    return {
-        "modules": {
-            "text_encoder": {"micro_batch_size": 4},
-            "vision": {"micro_batch_size": 4},
-            "vqvae": {"micro_batch_size": 4},
-            "ar": {"micro_batch_size": 2},
-        },
-        "nodes": {
-            "tok_encode": {"module": "text_encoder.encode"},
-            "tok_decode": {"module": "text_encoder.decode"},
-            "vis_encode": {"module": "vision"},
-            "vae_encode": {"module": "vqvae.encode"},
-            "vae_decode": {"module": "vqvae.decode"},
-            "run_ar": {"module": "ar"},
-            # Inference-only Janus boundary-token emitters (model-owned).
-            "emit_image_start": {"module": "text_encoder.emit_image_start"},
-            "emit_image_end": {"module": "text_encoder.emit_image_end"},
-        },
-        "edges": {
-            # ── training (and shared with inference)
-            "vis_to_ar": {
-                "from": "vis_encode",
-                "output": "image_embeds",
-                "to": "run_ar",
-                "as": "und_image_embeds",
-            },
-            "vae_enc_to_ar": {
-                "from": "vae_encode",
-                "output": "gen_embeds",
-                "to": "run_ar",
-                "as": "gen_image_embeds",
-            },
-            "tok_enc_to_ar": {
-                "from": "tok_encode",
-                "output": "inputs_embeds",
-                "to": "run_ar",
-                "as": "inputs_embeds",
-            },
-            "ar_to_tok_dec": {
-                "from": "run_ar",
-                "output": "hidden_states",
-                "to": "tok_decode",
-                "as": "hidden_states",
-            },
-            "ar_to_vae_dec": {
-                "from": "run_ar",
-                "output": "hidden_states",
-                "to": "vae_decode",
-                "as": "hidden_states",
-            },
-            "vae_token_to_dec": {
-                "from": "vae_encode",
-                "output": "vq_token_ids",
-                "to": "vae_decode",
-                "as": "gt_token_ids",
-            },
-            "tok_dec_sink": {"from": "tok_decode", "to": "end"},
-            "vae_dec_sink": {"from": "vae_decode", "to": "end"},
-            # ── inference-only edges
-            "vae_dec_to_ar": {
-                "from": "vae_decode",
-                "output": "embed",
-                "to": "run_ar",
-                "as": "inputs_embeds",
-            },
-            "emit_start_to_ar": {
-                "from": "emit_image_start",
-                "output": "inputs_embeds",
-                "to": "run_ar",
-                "as": "inputs_embeds",
-            },
-            "emit_end_to_ar": {
-                "from": "emit_image_end",
-                "output": "inputs_embeds",
-                "to": "run_ar",
-                "as": "inputs_embeds",
-            },
-            "emit_start_sink": {"from": "emit_image_start", "to": "end"},
-            "emit_end_sink": {"from": "emit_image_end", "to": "end"},
-            # Body terminal for `run_ar` in bridge / prompt-priming states
-            # where the LLM updates its KV cache without any same-body
-            # consumer (image_vq_start, image_vq_end, prompt_to_image).
-            "ar_run_sink": {"from": "run_ar", "to": "end"},
-        },
-        "training_graph": {
-            "edges": [
-                "vis_to_ar",
-                "vae_enc_to_ar",
-                "tok_enc_to_ar",
-                "ar_to_tok_dec",
-                "ar_to_vae_dec",
-                "vae_token_to_dec",
-                "tok_dec_sink",
-                "vae_dec_sink",
-            ],
-        },
-    }
+def _load_config(*, infer: str | None = None) -> OmniConfig:
+    """Load train vocabulary, optionally merged with an inference scenario."""
+    paths = [_toy_config_dir() / "train.yaml"]
+    if infer is not None:
+        paths.append(_toy_config_dir() / _TOY_INFER_FILES[infer])
+    return OmniConfig.from_yamls(*paths)
 
 
-# ── Inference YAML builders (mirrors configs/seed_omni/janus_1.3b/infer_*.yaml) ──
+def _load_train_dict() -> dict[str, Any]:
+    data = yaml.safe_load((_toy_config_dir() / "train.yaml").read_text())
+    return data if isinstance(data, dict) else {}
 
 
-def _interleave_generation_graph() -> dict[str, Any]:
-    """Interleave T2T+T2I FSM (matches infer_interleave.yaml shape).
-
-    ``image_vq`` runs ``token_length: variable`` and exits when
-    ``vae_decode`` writes ``ctx['image_complete'] = True`` — the
-    PrintVQVAE module fakes this signal after ``image_steps`` consecutive
-    decode calls (the test fixture wires that via ``_build_model``).
-    """
-    return {
-        "initial": "text_ar",
-        "states": {
-            "text_ar": {
-                "body": ["tok_enc_to_ar", "ar_to_tok_dec", "tok_dec_sink"],
-                "token_length": {"type": "variable"},
-                "transitions": [
-                    {
-                        "condition": {"type": "module_signal", "key": SIGNAL_START_IMAGE_GEN},
-                        "next_state": "image_vq_start",
-                    },
-                    {"condition": {"type": "module_signal", "key": SIGNAL_TEXT_DONE}, "next_state": "done"},
-                ],
-            },
-            "image_vq_start": {
-                "body": ["emit_start_to_ar", "emit_start_sink", "ar_run_sink"],
-                "token_length": {"type": "fixed", "value": 1},
-                "transitions": [{"condition": {"type": "steps_complete"}, "next_state": "image_vq"}],
-            },
-            "image_vq": {
-                "body": ["ar_to_vae_dec", "vae_dec_to_ar"],
-                "token_length": {"type": "variable"},
-                "transitions": [
-                    {"condition": {"type": "module_signal", "key": "image_complete"}, "next_state": "image_vq_end"},
-                ],
-            },
-            "image_vq_end": {
-                "body": ["emit_end_to_ar", "emit_end_sink", "ar_run_sink"],
-                "token_length": {"type": "fixed", "value": 1},
-                "transitions": [{"condition": {"type": "steps_complete"}, "next_state": "text_ar"}],
-            },
-        },
-    }
-
-
-def _t2i_generation_graph() -> dict[str, Any]:
-    """T2I-only FSM (matches infer_t2i.yaml shape).
-
-    ``image_vq`` is variable-length and listens for the
-    ``image_complete`` signal — same contract as `_interleave_generation_graph`.
-    """
-    return {
-        "initial": "prompt_to_image",
-        "states": {
-            "prompt_to_image": {
-                "body": ["tok_enc_to_ar", "ar_run_sink"],  # seed KV cache; no decoding
-                "token_length": {"type": "fixed", "value": 1},
-                "transitions": [{"condition": {"type": "steps_complete"}, "next_state": "image_vq_start"}],
-            },
-            "image_vq_start": {
-                "body": ["emit_start_to_ar", "emit_start_sink", "ar_run_sink"],
-                "token_length": {"type": "fixed", "value": 1},
-                "transitions": [{"condition": {"type": "steps_complete"}, "next_state": "image_vq"}],
-            },
-            "image_vq": {
-                "body": ["ar_to_vae_dec", "vae_dec_to_ar"],
-                "token_length": {"type": "variable"},
-                "transitions": [
-                    {"condition": {"type": "module_signal", "key": "image_complete"}, "next_state": "image_vq_end"},
-                ],
-            },
-            "image_vq_end": {
-                "body": ["emit_end_to_ar", "emit_end_sink", "ar_run_sink"],
-                "token_length": {"type": "fixed", "value": 1},
-                "transitions": [{"condition": {"type": "steps_complete"}, "next_state": "done"}],
-            },
-        },
-    }
-
-
-def _understanding_generation_graph() -> dict[str, Any]:
-    """I2T / VQA FSM (matches infer_understanding.yaml shape).
-
-    The initial ``prompt_to_text`` state has TWO incoming routing edges
-    into ``run_ar`` (vision_to_ar + tok_enc_to_ar) — exercises the
-    topological body-execution rule.
-    """
-    return {
-        "initial": "prompt_to_text",
-        "states": {
-            "prompt_to_text": {
-                "body": ["vis_to_ar", "tok_enc_to_ar", "ar_to_tok_dec", "tok_dec_sink"],
-                "token_length": {"type": "fixed", "value": 1},
-                "transitions": [
-                    {"condition": {"type": "module_signal", "key": SIGNAL_TEXT_DONE}, "next_state": "done"},
-                    {"condition": {"type": "steps_complete"}, "next_state": "text_ar"},
-                ],
-            },
-            "text_ar": {
-                "body": ["tok_enc_to_ar", "ar_to_tok_dec", "tok_dec_sink"],
-                "token_length": {"type": "variable"},
-                "transitions": [
-                    {"condition": {"type": "module_signal", "key": SIGNAL_TEXT_DONE}, "next_state": "done"},
-                ],
-            },
-        },
-    }
+def _load_generation_graph(infer: str) -> dict[str, Any]:
+    """Deep-copy the merged ``generation_graph`` for a scenario (for mutation tests)."""
+    cfg = _load_config(infer=infer)
+    assert cfg.generation_graph is not None
+    return deepcopy(cfg.generation_graph)
 
 
 def _build_model(
     token_script,
+    *,
+    infer: str | None = None,
     generation_graph: dict[str, Any] | None = None,
     image_steps: int | None = None,
 ):
     """Construct an OmniModel with the print-only modules.
 
-    ``image_steps`` configures PrintVQVAE to emit ``image_complete=True``
-    after that many inference ``decode()`` calls — mirrors the real Janus
-    VQ decoder's "image complete" signal that drives the
-    ``image_vq → image_vq_end`` transition via ``module_signal``.
+    ``infer`` selects a sibling ``infer_*.yaml`` under ``toy_config/``.
+    Pass ``generation_graph`` to override the merged FSM (e.g. negative tests).
     """
-    log: list[str] = []
-    cfg_dict = _config_dict()
+    cfg = _load_config(infer=infer if generation_graph is None else None)
     if generation_graph is not None:
-        cfg_dict["generation_graph"] = generation_graph
-    cfg = OmniConfig.from_dict(cfg_dict)
+        cfg.generation_graph = deepcopy(generation_graph)
+    log: list[str] = []
     modules = {
         "text_encoder": PrintTextEmbed("text_encoder", log, token_script=token_script),
         "vision": PrintVisionEncoder("vision", log),
@@ -394,7 +205,7 @@ def test_fsm_interleave_text_to_image_to_text():
     """
     model, _ = _build_model(
         token_script=[10, 11, TOK_BOI, 20, 21, TOK_EOS],
-        generation_graph=_interleave_generation_graph(),
+        infer="interleave",
         image_steps=3,  # PrintVQVAE emits `image_complete` on the 3rd decode
     )
 
@@ -429,15 +240,15 @@ def test_fsm_interleave_text_to_image_to_text():
 
     assert model.generation_graph.is_done()
     assert final_ctx["last_token_id"] == TOK_EOS
-    # The `image_complete` flag was popped on transition — never leaks.
-    assert "image_complete" not in final_ctx
+    # The signal was popped on transition — never leaks.
+    assert FSM_SIGNAL_KEY not in final_ctx
 
 
 def test_fsm_image_vq_routes_embed_back_into_inputs_embeds():
     """In ``image_vq``, edge ``vae_dec_to_ar`` writes ctx['embed'] → ctx['inputs_embeds']."""
     model, _ = _build_model(
         token_script=[TOK_BOI],
-        generation_graph=_interleave_generation_graph(),
+        infer="interleave",
         image_steps=3,
     )
 
@@ -457,7 +268,7 @@ def test_fsm_emit_image_start_runs_inside_bridge_body():
     """The boundary-token emitter is just another node — no FSM magic."""
     model, log = _build_model(
         token_script=[TOK_BOI],
-        generation_graph=_interleave_generation_graph(),
+        infer="interleave",
         image_steps=1,
     )
     final_ctx = model.generate(
@@ -479,7 +290,7 @@ def test_fsm_t2i_only_starts_with_prompt_state_and_ends_after_image():
     """T2I-only FSM: prompt_to_image → bridges → image_vq → done."""
     model, _ = _build_model(
         token_script=[],  # never decode text
-        generation_graph=_t2i_generation_graph(),
+        infer="gen",
         image_steps=2,
     )
 
@@ -519,7 +330,7 @@ def test_fsm_understanding_multi_source_runs_ar_after_both_inputs_route():
     """
     model, log = _build_model(
         token_script=[42, TOK_EOS],
-        generation_graph=_understanding_generation_graph(),
+        infer="und",
     )
 
     trace: list[str] = []
@@ -557,7 +368,7 @@ def test_fsm_understanding_text_only_prompt_uses_permissive_routing():
     """
     model, log = _build_model(
         token_script=[7, TOK_EOS],
-        generation_graph=_understanding_generation_graph(),
+        infer="und",
     )
 
     model.generate(
@@ -586,7 +397,7 @@ def test_fsm_state_node_sequence_derived():
     """text_ar's body lists three edges; node sequence dedups endpoints."""
     model, _ = _build_model(
         token_script=[],
-        generation_graph=_interleave_generation_graph(),
+        infer="interleave",
     )
     g = model.generation_graph
 
@@ -611,7 +422,7 @@ def test_fsm_module_signal_transition_fires_on_module_signal():
     n_patches = 5
     model, _ = _build_model(
         token_script=[TOK_BOI],  # first text_ar step emits boi → enters image_vq
-        generation_graph=_interleave_generation_graph(),
+        infer="interleave",
         image_steps=n_patches,
     )
 
@@ -636,7 +447,7 @@ def test_fsm_module_signal_cleared_after_transition():
     """Once ``module_signal`` fires, the framework pops the key — no stale reuse."""
     model, _ = _build_model(
         token_script=[TOK_BOI, TOK_EOS],  # → image, → done
-        generation_graph=_interleave_generation_graph(),
+        infer="interleave",
         image_steps=2,
     )
 
@@ -645,10 +456,8 @@ def test_fsm_module_signal_cleared_after_transition():
         context={"input_ids": "<bos>"},
         max_new_tokens=50,
     )
-    # If the framework didn't pop, image_complete would still be True in the
-    # final ctx — and worse, would have re-fired the flag check in subsequent
-    # states had any of them listened for it.
-    assert "image_complete" not in final_ctx
+    # If the framework didn't pop, module_signal would still be in final ctx.
+    assert FSM_SIGNAL_KEY not in final_ctx
 
 
 def test_fsm_module_signal_does_not_fire_until_module_writes_it():
@@ -658,7 +467,7 @@ def test_fsm_module_signal_does_not_fire_until_module_writes_it():
     # never transitioned.
     model, _ = _build_model(
         token_script=[TOK_BOI],
-        generation_graph=_interleave_generation_graph(),
+        infer="interleave",
         image_steps=None,
     )
 
@@ -680,7 +489,7 @@ def test_fsm_module_signal_condition_requires_key():
     """``module_signal`` without a non-empty ``key`` is rejected at FSM build time."""
     import pytest
 
-    fsm = _interleave_generation_graph()
+    fsm = _load_generation_graph("interleave")
     fsm["states"]["image_vq"]["transitions"] = [
         {"condition": {"type": "module_signal"}, "next_state": "image_vq_end"},
     ]
@@ -692,7 +501,7 @@ def test_fsm_unknown_condition_type_rejected():
     """Typos / unsupported condition kinds fail loud at FSM build time."""
     import pytest
 
-    fsm = _interleave_generation_graph()
+    fsm = _load_generation_graph("interleave")
     fsm["states"]["image_vq"]["transitions"] = [
         {"condition": {"type": "ctx_flagg", "key": "image_complete"}, "next_state": "image_vq_end"},
     ]
@@ -705,7 +514,7 @@ def test_fsm_unknown_condition_type_rejected():
 
 def test_fsm_done_state_is_framework_injected():
     """`done` is added by GenerationGraph even when the YAML never mentions it."""
-    fsm = _interleave_generation_graph()
+    fsm = _load_generation_graph("interleave")
     # Sanity-check the fixture: the YAML does NOT carry a `done:` block.
     assert "done" not in fsm["states"]
     assert "done_state" not in fsm
@@ -724,7 +533,7 @@ def test_fsm_user_declared_done_state_rejected():
     """Authoring a `done:` block must raise — that's a stale-YAML signal."""
     import pytest
 
-    fsm = _interleave_generation_graph()
+    fsm = _load_generation_graph("interleave")
     fsm["states"]["done"] = {"body": [], "token_length": {"type": "fixed", "value": 0}, "transitions": []}
     with pytest.raises(ValueError, match="reserved and auto-injected"):
         _build_model(token_script=[], generation_graph=fsm)
@@ -734,7 +543,7 @@ def test_fsm_done_state_config_knob_rejected():
     """`generation_graph.done_state` is gone — must raise to surface stale YAML."""
     import pytest
 
-    fsm = _interleave_generation_graph()
+    fsm = _load_generation_graph("interleave")
     fsm["done_state"] = "done"
     with pytest.raises(ValueError, match="no longer configurable"):
         _build_model(token_script=[], generation_graph=fsm)
@@ -748,7 +557,7 @@ def test_finalize_hook_fires_on_done_and_collects_outputs():
     dynamically attach a custom finalize on one module and verify the
     framework collects its output.
     """
-    model, _ = _build_model(token_script=[TOK_EOS], generation_graph=_interleave_generation_graph())
+    model, _ = _build_model(token_script=[TOK_EOS], infer="interleave")
 
     # Default behaviour: no finalize outputs.
     trace_default: list[str] = []
@@ -775,7 +584,7 @@ def test_finalize_hook_rejects_non_dict_return():
     """Modules that mis-implement finalize get a clear error, not silent corruption."""
     import pytest
 
-    model, _ = _build_model(token_script=[TOK_EOS], generation_graph=_interleave_generation_graph())
+    model, _ = _build_model(token_script=[TOK_EOS], infer="interleave")
     text_encoder = model.modules_dict["text_encoder"]
     text_encoder.finalize = lambda *, ctx, request: "not a dict"
 
@@ -787,7 +596,7 @@ def test_finalize_hook_receives_ctx_and_request():
     """The hook can read final ctx + the original request — accumulation is the module's job."""
     captured: list[dict[str, Any]] = []
 
-    model, _ = _build_model(token_script=[TOK_EOS], generation_graph=_interleave_generation_graph())
+    model, _ = _build_model(token_script=[TOK_EOS], infer="interleave")
     text_encoder = model.modules_dict["text_encoder"]
 
     def _capture_finalize(*, ctx: dict[str, Any], request: dict[str, Any]) -> dict[str, Any]:
@@ -828,7 +637,7 @@ def test_training_graph_mermaid_renders_end_sink():
 def test_generation_graph_mermaid_renders_body_subgraphs_and_loops():
     model, _ = _build_model(
         token_script=[],
-        generation_graph=_interleave_generation_graph(),
+        infer="interleave",
     )
     txt = model.generation_graph.to_mermaid(title="print-flow inference FSM")
 
@@ -955,7 +764,7 @@ def test_omni_model_rejects_module_name_colliding_with_framework_attr():
             return new + s[len(old) :]
         return s
 
-    cfg_dict = _config_dict()
+    cfg_dict = _load_train_dict()
     cfg_dict["modules"] = {("config" if k == "text_encoder" else k): v for k, v in cfg_dict["modules"].items()}
     cfg_dict["nodes"] = {
         n_name: {**n_def, "module": _rename(n_def["module"], "text_encoder", "config")}

@@ -24,10 +24,10 @@ FSM transition signals (inference)
 ----------------------------------
 After :meth:`decode` samples a token, this module — not the outer FSM —
 decides whether the token means "start image generation" or "text done"
-and writes one-shot ``module_signal`` keys into the return dict:
+and writes a one-shot string into ``ctx["module_signal"]``:
 
-* ``start_image_gen`` — sampled token is ``<begin_of_image>``
-* ``text_done``       — sampled token is ``</s>`` (eos)
+* ``"start_image_gen"`` — sampled token is ``<begin_of_image>``
+* ``"text_done"``       — sampled token is ``</s>`` (eos)
 
 Token ids are resolved from the wired tokenizer via :meth:`set_tokenizer`.
 
@@ -49,11 +49,13 @@ from typing import Any, Dict, Optional
 
 import torch
 
+from veomni.models.seed_omni.generation_graph import FSM_SIGNAL_KEY
+
 from ...base.text_encoder.modeling import TextEncoder
 from .configuration import JanusTextEncoderConfig
 
 
-# One-shot FSM ``module_signal`` keys written by :meth:`decode`.
+# Signal *values* written to ``ctx[FSM_SIGNAL_KEY]`` by :meth:`decode`.
 SIGNAL_START_IMAGE_GEN = "start_image_gen"
 SIGNAL_TEXT_DONE = "text_done"
 
@@ -111,9 +113,9 @@ class JanusTextEncoder(TextEncoder):
         token_id = _scalar_token_id(out["last_token_id"])
         if token_id is not None:
             if self._boi_token_id is not None and token_id == self._boi_token_id:
-                out[SIGNAL_START_IMAGE_GEN] = True
+                out[FSM_SIGNAL_KEY] = SIGNAL_START_IMAGE_GEN
             elif self._eos_token_id is not None and token_id == self._eos_token_id:
-                out[SIGNAL_TEXT_DONE] = True
+                out[FSM_SIGNAL_KEY] = SIGNAL_TEXT_DONE
         return out
 
     # ── Janus boundary-token emitters ─────────────────────────────────────────

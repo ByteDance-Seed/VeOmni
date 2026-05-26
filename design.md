@@ -563,7 +563,7 @@ generation_graph:
 | `token_match` | *(deprecated)* YAML 硬编码 token id | `{type: token_match, token_id: T}` | 旧图兼容；新 Janus 图勿用 |
 | `always` | 无条件 | `{type: always}` | 极少用 |
 
-> **关于 `variable` + `module_signal`**：VQ 图像、audio EOS、video frame end 等"由模块决定何时停"的场景，标准做法是 `token_length: {type: variable}` 配 `transitions: [{condition: {type: module_signal, key: <K>}, next_state: ...}]`。模块在 return dict 写 `ctx[<K>] = True`，FSM 检测到 truthy 后触发转移并**自动 pop** 该 key。**不要**在 YAML 写 `fixed: 576` 硬编码 patch budget——patch 数由模型内部 grid 算术决定。Text 侧**不要**用 `token_match(boi_id)`——由 `JanusTextEncoder.decode` 在 `set_tokenizer()` 之后根据采样 token 写 `start_image_gen` / `text_done`。
+> **关于 `variable` + `module_signal`**：模块在 return dict 写 ``ctx["module_signal"] = "<K>"``（字符串），YAML 的 ``module_signal.key: K`` 做字符串相等匹配；转移后框架 pop ``module_signal``。
 
 ### Token Length 策略
 

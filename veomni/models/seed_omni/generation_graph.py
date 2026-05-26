@@ -70,14 +70,15 @@ expose specialised inference routines.
             reaches ``None``).
 
         ``{type: module_signal, key: K}``  (alias: ``ctx_flag``)
-            Fires when ``context[K]`` is truthy.  Modules write one-shot
-            boolean signals into ``ctx`` from inside ``generate_step`` /
-            ``decode`` — e.g. ``JanusTextEncoder.decode`` sets
-            ``start_image_gen`` / ``text_done`` after sampling; a VQ decoder
-            sets ``image_complete`` on the final patch.  The framework
-            **auto-clears** ``ctx[K]`` once the transition fires.  Pair
-            with ``token_length: variable``.  The FSM never inspects raw
-            token ids — vocabulary semantics stay inside the module.
+            Fires when ``context["module_signal"] == K``.  Modules write a
+            one-shot string signal into ``ctx["module_signal"]`` from inside
+            ``generate_step`` / ``decode`` — e.g. ``JanusTextEncoder.decode``
+            sets ``"start_image_gen"`` / ``"text_done"`` after sampling; a VQ
+            decoder sets ``"image_complete"`` on the final patch.  The
+            framework **auto-clears** ``ctx["module_signal"]`` once the
+            transition fires.  Pair with ``token_length: variable``.  The FSM
+            never inspects raw token ids — vocabulary semantics stay inside
+            the module.
 
         ``{type: token_match, token_id: T}``  *(deprecated)*
             Legacy: fires when ``context["last_token_id"] == T``.  Prefer
@@ -115,6 +116,11 @@ from .graph import END, EdgeDef, NodeDef, is_end
 # :meth:`OmniModule.finalize` hook once the FSM enters it.
 DONE_STATE_NAME: str = "done"
 
+# Single ctx slot for module-driven FSM transitions.  Modules set
+# ``ctx[FSM_SIGNAL_KEY] = "<signal_name>"``; YAML ``module_signal.key``
+# matches that string value (not a separate boolean flag per signal).
+FSM_SIGNAL_KEY: str = "module_signal"
+
 
 # ── Condition helpers ─────────────────────────────────────────────────────────
 
@@ -149,7 +155,7 @@ class _Condition:
         if self.type == "steps_complete":
             return total_steps is not None and steps_done >= total_steps
         if self.type in _MODULE_SIGNAL_TYPES:
-            return bool(context.get(self.key))
+            return context.get(FSM_SIGNAL_KEY) == self.key
         if self.type == "always":
             return True
         return False
@@ -522,19 +528,16 @@ class GenerationGraph:
 
         Returns True if a transition fired (state changed).
 
-        For ``module_signal`` / ``ctx_flag`` transitions the matched key is
-        popped from ``context`` *after* logging the trace and *before* the
-        state switch — this keeps a one-shot signal from re-firing the same
-        transition (or unintentionally firing a transition with the same
-        flag in the next state).
+        For ``module_signal`` / ``ctx_flag`` transitions ``context["module_signal"]``
+        is popped after logging the trace and before the state switch.
         """
         state = self._current_state
         for trans in state.transitions:
             if trans.condition.check(context, self._steps_in_state, self._total_steps):
                 if trace is not None:
                     trace.append(f"transition: {state.name} -> {trans.next_state} [{trans.condition.describe()}]")
-                if trans.condition.type in _MODULE_SIGNAL_TYPES and trans.condition.key is not None:
-                    context.pop(trans.condition.key, None)
+                if trans.condition.type in _MODULE_SIGNAL_TYPES:
+                    context.pop(FSM_SIGNAL_KEY, None)
                 self._transition_to(trans.next_state, context)
                 return True
         return False
