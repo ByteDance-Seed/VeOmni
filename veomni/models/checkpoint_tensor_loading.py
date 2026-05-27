@@ -118,7 +118,9 @@ def parse_fqn_to_index_mapping_from_json(safetensor_idx_path: str) -> Dict[str, 
     return {fqn: shard_index_from_filename(filename) for fqn, filename in weight_map.items()}
 
 
-def _unwrap_model_for_fqn_mapping(model: Union["nn.Module", "PreTrainedModel"]) -> Union["nn.Module", "PreTrainedModel"]:
+def _unwrap_model_for_fqn_mapping(
+    model: Union["nn.Module", "PreTrainedModel"],
+) -> Union["nn.Module", "PreTrainedModel"]:
     """Unwrap PEFT wrappers so class-level converters registered on the base model are found."""
     if hasattr(model, "get_base_model"):
         return model.get_base_model()
@@ -153,8 +155,7 @@ def maybe_convert_fqn_to_index_mapping(
     converted = converter(fqn_to_index_mapping)
     if len(converted) != original_size:
         logger.info_rank0(
-            f"Converted fqn_to_index_mapping for {type(model).__name__} "
-            f"({original_size} -> {len(converted)} entries)."
+            f"Converted fqn_to_index_mapping for {type(model).__name__} ({original_size} -> {len(converted)} entries)."
         )
     return converted
 

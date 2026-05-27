@@ -18,27 +18,25 @@ from __future__ import annotations
 
 import re
 from collections import defaultdict
-from typing import Dict, Pattern
+from typing import Pattern
 
 
 # Default pattern for flat MoE towers (qwen3_moe, deepseek_v3, qwen3_omni thinker, etc.).
-PER_EXPERT_SPLIT_TO_FUSED_PATTERN = re.compile(
-    r"^(.+\.mlp)\.experts\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight$"
-)
+PER_EXPERT_SPLIT_TO_FUSED_PATTERN = re.compile(r"^(.+\.mlp)\.experts\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight$")
 
 
 def convert_per_expert_fqn_mapping_to_fused(
-    fqn_to_index_mapping: Dict[str, int],
+    fqn_to_index_mapping: dict[str, int],
     pattern: Pattern[str] = PER_EXPERT_SPLIT_TO_FUSED_PATTERN,
-) -> Dict[str, int]:
+) -> dict[str, int]:
     """Map per-expert HF index keys to fused expert FQNs for a given regex *pattern*.
 
     Output keys match ``CheckpointTensorConverter`` emit names (no ``.weight`` suffix).
     Non-matching keys are copied unchanged.
     """
-    gate_up_shard_indices: Dict[str, list[int]] = defaultdict(list)
-    down_shard_indices: Dict[str, list[int]] = defaultdict(list)
-    converted: Dict[str, int] = {}
+    gate_up_shard_indices: dict[str, list[int]] = defaultdict(list)
+    down_shard_indices: dict[str, list[int]] = defaultdict(list)
+    converted: dict[str, int] = {}
 
     for fqn, shard_idx in fqn_to_index_mapping.items():
         match = pattern.match(fqn)
