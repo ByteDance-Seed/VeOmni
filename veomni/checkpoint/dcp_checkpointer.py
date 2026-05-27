@@ -164,9 +164,17 @@ class OptimizerState(Stateful):
     base weights) are simply absent from the checkpoint.
 
     On load, ``allow_partial_load=True`` is passed to the DCP load planner
-    so missing entries are skipped.  ``set_optimizer_state_dict`` initialises
-    default state (step=0, zero moments) for any param not present in the
-    checkpoint, matching what AdamW would create on the next ``step()`` call.
+    so missing optimizer entries are skipped.  For a fresh optimizer (the
+    normal resume path), ``set_optimizer_state_dict`` internally calls
+    ``_init_optim_state`` which pre-fills zero/default state for every
+    param; DCP then overwrites the entries that exist in the checkpoint.
+    Params absent from the checkpoint keep their default-initialised state,
+    equivalent to what AdamW would create on the next ``step()`` call.
+
+    Note: ``allow_partial_load`` is set globally on the DCP planner (it
+    cannot be scoped to optimizer-only).  Model-weight integrity is still
+    enforced by ``set_model_state_dict(strict=True)`` inside
+    ``ModelState.load_state_dict`` for non-LoRA loads.
     """
 
     def __init__(self, model, optimizer):

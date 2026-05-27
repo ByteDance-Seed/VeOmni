@@ -96,20 +96,12 @@ class TestAllowPartialLoad:
         with patch.object(DistributedCheckpointer, "_load_extra_state"):
             with patch.object(DistributedCheckpointer, "_create_storage_reader") as mock_reader:
                 mock_reader.return_value = MagicMock()
-                try:
-                    DistributedCheckpointer.load(path="/fake", state=state)
-                except Exception:
-                    pass
+                DistributedCheckpointer.load(path="/fake", state=state)
 
-                if mock_dcp.load.called:
-                    call_kwargs = mock_dcp.load.call_args
-                    planner = call_kwargs.kwargs.get("planner") or (
-                        call_kwargs[1].get("planner") if len(call_kwargs) > 1 else None
-                    )
-                    assert planner is not None, "load must pass a planner"
-                    assert planner.allow_partial_load is True, (
-                        "load must use DefaultLoadPlanner(allow_partial_load=True)"
-                    )
+        mock_dcp.load.assert_called_once()
+        planner = mock_dcp.load.call_args.kwargs.get("planner")
+        assert planner is not None, "load must pass a planner"
+        assert planner.allow_partial_load is True, "load must use DefaultLoadPlanner(allow_partial_load=True)"
 
 
 # ---------------------------------------------------------------------------
