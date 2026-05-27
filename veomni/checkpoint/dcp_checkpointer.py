@@ -16,7 +16,7 @@
 import gc
 import os
 from collections import OrderedDict
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, List, Optional, Set, Union
 
 import torch
 import torch.distributed as dist
@@ -205,14 +205,17 @@ class OptimizerState(Stateful):
 
         Adam/AdamW creates state lazily on first ``step()`` with a non-None
         gradient.  Params that never received a gradient (e.g. LoRA on unused
-        modalities) will have no state.  Additionally, ``get_optimizer_state_dict``
-        deduplicates aliased parameters (same ``id()``), emitting only one
-        canonical FQN per unique tensor.  DCP strict load fails when these
-        entries are absent at resume time.
+        modalities, or MoE experts that haven't been routed to yet) will have
+        no state.  Additionally, ``get_optimizer_state_dict`` deduplicates
+        aliased parameters (same ``id()``), emitting only one canonical FQN
+        per unique tensor.  DCP strict load fails when these entries are
+        absent at resume time.
 
-        We enumerate expected FQNs directly from the raw optimizer param_groups
-        + model FQN mapping, bypassing any dedup that ``get_optimizer_state_dict``
-        may have performed.
+        We enumerate expected FQNs directly from the raw optimizer
+        param_groups + model FQN mapping, bypassing any dedup that
+        ``get_optimizer_state_dict`` may have performed, then synchronize the
+        missing set across DP ranks so every rank fills the SAME placeholders
+        (see the inline comment below for why this is required for MoE).
         """
         if "state" not in sd or not isinstance(sd["state"], dict):
             return sd
@@ -232,7 +235,27 @@ class OptimizerState(Stateful):
                 fqn_to_param[fqn] = param
 
         expected_fqns = set(fqn_to_param.keys())
-        missing = expected_fqns - optim_fqns
+        local_missing = expected_fqns - optim_fqns
+
+        # MoE training: experts fire on different ranks across the first few
+        # steps, so each rank's ``local_missing`` set is rank-asymmetric. If
+        # we let that through, ``sd["state"]`` ends up with rank-asymmetric
+        # keys -- DCP's ``_save_state_dict`` then broadcasts metadata of
+        # unequal pickled size across ranks, producing NCCL buffer corruption
+        # (manifests as UnpicklingError variants or a Watchdog timeout at the
+        # first save). Sync the missing set across ranks so every rank fills
+        # the SAME placeholders. The collective is tiny (FQN strings only) and
+        # runs at most once per save -- negligible overhead.
+        if dist.is_initialized() and dist.get_world_size() > 1:
+            gathered: List[Optional[Set[str]]] = [None] * dist.get_world_size()
+            dist.all_gather_object(gathered, local_missing)
+            missing: Set[str] = set().union(*(g or set() for g in gathered))
+            # Defensive: drop any FQN this rank doesn't recognize. With FSDP2
+            # ``model.named_parameters()`` is rank-symmetric, so this is a
+            # no-op in practice but guards against unusual parallelism setups.
+            missing &= expected_fqns
+        else:
+            missing = local_missing
 
         if not missing:
             return sd
