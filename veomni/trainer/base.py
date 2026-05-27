@@ -383,6 +383,9 @@ class BaseTrainer(Stateful, ABC):
 
         muon_expert_zero_comm = args.train.optimizer.type == "muon" and args.train.optimizer.muon_expert_zero_comm
 
+        if args.model.fqn_to_index_mapping is not None:
+            kwargs["fqn_to_index_mapping"] = args.model.fqn_to_index_mapping
+
         # Parallelize model
         self.model = build_parallelize_model(
             self.model,
