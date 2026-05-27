@@ -40,7 +40,7 @@ from torch.distributed.checkpoint.stateful import Stateful
 from ..distributed.parallel_state import get_parallel_state
 from ..utils import logging
 from ..utils.checkpoint_utils import _GLOBAL_STEP_PREFIX
-from ..utils.device import empty_cache, synchronize
+from ..utils.device import IS_CUDA_AVAILABLE, empty_cache, synchronize
 from .checkpointer import CheckpointerBase
 
 
@@ -90,6 +90,58 @@ if TensorProperties.__hash__ is None:
             self.pin_memory,
         )
     )
+
+
+# Workaround for a second class of DCP save hangs distinct from the
+# unhashable TensorProperties one above. The smoking gun is ranks reporting
+# DIFFERENT first-byte values in ``_pickle.UnpicklingError`` after the
+# Metadata broadcast — e.g. rank{1,2,3,11,12,13,14,15} see ``'\x00'``,
+# rank4 sees ``'\x0c'``, rank6 sees ``'\x9b'`` (observed on production
+# job 531fa7c5432d7e07, Qwen3-VL-30B-A3B-Instruct ep_size=1 H100x16).
+#
+# If the broadcast had really synchronized, every receiver would see the
+# SAME bytes (and either all pass or all fail at the same opcode). Each
+# rank seeing different garbage means the broadcast returned to Python
+# before NCCL actually delivered the data to that rank's buffer — the
+# receivers then call ``_tensor_to_object`` which copies the GPU buffer
+# to CPU memory and feeds it to ``_unpickler``. The CPU copy reads
+# whatever uninitialized memory the GPU side has at that moment.
+#
+# This is a known shape of NCCL + caching-allocator stream tracking bug
+# that fires on multi-node setups (where the broadcast traverses RDMA)
+# but doesn't fire on single-node (where NVLink delivery is effectively
+# synchronous). Single-node A100 and H100 verify runs both pass; only
+# the multi-node prod jobs reproduce it.
+#
+# Fix: monkey-patch ``_tensor_to_object`` (the helper PyTorch uses inside
+# ``broadcast_object_list`` to read each object out of the broadcast
+# buffer) to call ``synchronize()`` first. That forces the host stream
+# to wait on the device's collective stream before the buffer is read —
+# closing the race. Cost: one extra device sync per gathered object during
+# DCP save; negligible against the save's collective latency.
+# ``synchronize`` is the device-agnostic helper (CUDA / NPU) from
+# ``veomni.utils.device``; the ``IS_CUDA_AVAILABLE`` guard keeps the
+# patch a no-op on CPU-only hosts.
+try:
+    import torch.distributed.distributed_c10d as _c10d  # noqa: E402
+
+    _orig_tensor_to_object = _c10d._tensor_to_object
+
+    def _veomni_tensor_to_object_with_sync(tensor, tensor_size, group):
+        if IS_CUDA_AVAILABLE:
+            # Wait for any in-flight collective ops to actually deliver
+            # bytes into ``tensor`` before we read them. On single-node
+            # NVLink builds this is essentially a no-op; on multi-node
+            # RDMA builds this is the load-bearing fence.
+            synchronize()
+        return _orig_tensor_to_object(tensor, tensor_size, group)
+
+    # Guard so re-importing the module doesn't stack the wrapper.
+    if not getattr(_c10d._tensor_to_object, "_veomni_dcp_sync_patched", False):
+        _veomni_tensor_to_object_with_sync._veomni_dcp_sync_patched = True
+        _c10d._tensor_to_object = _veomni_tensor_to_object_with_sync
+except (ImportError, AttributeError):  # pragma: no cover — defensive
+    pass
 
 
 class ModelState(Stateful):
