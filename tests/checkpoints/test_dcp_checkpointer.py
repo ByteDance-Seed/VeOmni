@@ -113,6 +113,58 @@ class TestAllowPartialLoad:
 
 
 # ---------------------------------------------------------------------------
+# Partial save/load (LoRA / trainable_only path)
+# ---------------------------------------------------------------------------
+
+
+@patch("veomni.checkpoint.dcp_checkpointer.get_parallel_state")
+class TestPartialSaveLoad:
+    """When trainable_only=True (LoRA), the checkpoint contains only adapter
+    weights.  On load, allow_partial_load=True lets DCP skip the missing
+    frozen-base entries.  The optimizer checkpoint is similarly partial:
+    only trainable params that received gradients have state."""
+
+    def test_trainable_only_model_state_excludes_frozen(self, mock_gps):
+        """ModelState with trainable_only=True should skip frozen params."""
+        mock_gps.return_value = SimpleNamespace(dp_mode="fsdp2")
+        from veomni.checkpoint.dcp_checkpointer import ModelState
+
+        model = nn.Sequential(nn.Linear(8, 8, bias=False), nn.Linear(8, 8, bias=False))
+        model[0].weight.requires_grad_(False)  # freeze first layer
+
+        ms = ModelState(model, trainable_only=True)
+        sd = ms.state_dict()
+
+        assert "1.weight" in sd, "trainable param should be in state dict"
+        assert "0.weight" not in sd, "frozen param should be excluded with trainable_only=True"
+
+    def test_optimizer_state_only_has_trained_params(self, mock_gps):
+        """OptimizerState.state_dict() should only contain params that
+        received gradients — no synthetic placeholders for frozen or
+        unused params."""
+        mock_gps.return_value = SimpleNamespace(dp_mode="fsdp2")
+        from veomni.checkpoint.dcp_checkpointer import OptimizerState
+
+        model = nn.Sequential(nn.Linear(8, 8, bias=False), nn.Linear(8, 8, bias=False))
+        # Simulate LoRA: optimizer only has trainable params
+        trainable = [p for p in model.parameters() if p.requires_grad]
+        optimizer = torch.optim.AdamW(trainable, lr=1e-3)
+
+        # Step on first layer only
+        optimizer.zero_grad()
+        loss = model[0](torch.randn(2, 8)).sum()
+        loss.backward()
+        optimizer.step()
+
+        os = OptimizerState(model, optimizer)
+        sd = os.state_dict()
+
+        assert len(sd.get("state", {})) > 0, "should have at least one param with state"
+        for fqn in sd.get("state", {}):
+            assert "0.weight" in fqn, f"only layer 0 was stepped, but found state for {fqn}"
+
+
+# ---------------------------------------------------------------------------
 # Bug 4 (PR #798): global_step inflated before data fetch
 # ---------------------------------------------------------------------------
 
