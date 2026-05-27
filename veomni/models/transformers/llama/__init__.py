@@ -19,11 +19,14 @@ def register_llama_modeling(architecture: str):
     from .generated.patched_modeling_llama_gpu import (
         LlamaForCausalLM,
         LlamaForSequenceClassification,
+        LlamaForTokenClassification,
         LlamaModel,
     )
 
     if "ForCausalLM" in architecture:
         return LlamaForCausalLM
+    elif "ForTokenClassification" in architecture:
+        return LlamaForTokenClassification
     elif "ForSequenceClassification" in architecture:
         return LlamaForSequenceClassification
     elif "Model" in architecture:

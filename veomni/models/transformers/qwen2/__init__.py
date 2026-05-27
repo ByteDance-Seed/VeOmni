@@ -19,11 +19,14 @@ def register_qwen2_modeling(architecture: str):
     from .generated.patched_modeling_qwen2_gpu import (
         Qwen2ForCausalLM,
         Qwen2ForSequenceClassification,
+        Qwen2ForTokenClassification,
         Qwen2Model,
     )
 
     if "ForCausalLM" in architecture:
         return Qwen2ForCausalLM
+    elif "ForTokenClassification" in architecture:
+        return Qwen2ForTokenClassification
     elif "ForSequenceClassification" in architecture:
         return Qwen2ForSequenceClassification
     elif "Model" in architecture:

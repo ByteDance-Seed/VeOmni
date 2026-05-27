@@ -21,17 +21,21 @@ def register_qwen3_modeling(architecture: str):
         from .generated.patched_modeling_qwen3_npu import (
             Qwen3ForCausalLM,
             Qwen3ForSequenceClassification,
+            Qwen3ForTokenClassification,
             Qwen3Model,
         )
     else:
         from .generated.patched_modeling_qwen3_gpu import (
             Qwen3ForCausalLM,
             Qwen3ForSequenceClassification,
+            Qwen3ForTokenClassification,
             Qwen3Model,
         )
 
     if "ForCausalLM" in architecture:
         return Qwen3ForCausalLM
+    elif "ForTokenClassification" in architecture:
+        return Qwen3ForTokenClassification
     elif "ForSequenceClassification" in architecture:
         return Qwen3ForSequenceClassification
     elif "Model" in architecture:

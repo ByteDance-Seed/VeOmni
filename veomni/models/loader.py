@@ -25,6 +25,7 @@ from transformers import (
     AutoModelForImageTextToText,
     AutoModelForSequenceClassification,
     AutoModelForTextToWaveform,
+    AutoModelForTokenClassification,
     AutoProcessor,
     PretrainedConfig,
     PreTrainedModel,
@@ -152,6 +153,12 @@ def get_model_class(model_config: PretrainedConfig):
         and type(model_config) in AutoModelForCausalLM._model_mapping.keys()
     ):
         load_class = AutoModelForCausalLM
+    elif (
+        arch_name is not None
+        and "ForTokenClassification" in arch_name
+        and type(model_config) in AutoModelForTokenClassification._model_mapping.keys()
+    ):
+        load_class = AutoModelForTokenClassification
     elif (
         arch_name is not None
         and "ForSequenceClassification" in arch_name
