@@ -593,9 +593,11 @@ class BaseTrainer(Stateful, ABC):
         data_iterator: Any,
     ) -> Dict[str, float]:
         args = self.args
-        self.state.global_step += 1
 
+        # Bump global_step only after next() succeeds, so a StopIteration from
+        # a half-resumed dataloader does not leave global_step inflated.
         micro_batches: List[Dict[str, Any]] = next(data_iterator)
+        self.state.global_step += 1
 
         self.on_step_begin(micro_batches=micro_batches)
 
