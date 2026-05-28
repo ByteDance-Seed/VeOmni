@@ -1,109 +1,61 @@
 # Janus-1.3B inference — interleave T2T + T2I (mid-stream image generation).
 #
-# Use (via launcher YAML)::
-#
-#   OmniConfig.from_launcher("configs/seed_omni/janus_1.3b/veomni_janus.yaml",
-#                            infer_type="infer_interleave")
+# Same machinery as `infer_gen.yaml` for the image span; the only difference
+# is that `image_vq_end` falls back to `text_ar` (not `done`) so the model
+# keeps talking after each image.  Text continues until the LM emits
+# <eos> (`text_done`) or another <begin_of_image> (`start_image_gen` →
+# another image span).
 #
 # Flow
 # ----
-#   text_ar
-#     ├─ module_signal text_done       → done
-#     ├─ module_signal start_image_gen → image_vq_start
-#     └─ otherwise                     → text_ar (continue)
-#
-#   image_vq_start (1 step: emit <begin_of_image> + feed into LLM, run AR once)
-#     → image_vq
-#
-#   image_vq (576 fixed steps: AR → vae_decode.sample → feed embed back)
-#     → image_vq_end
-#
-#   image_vq_end (1 step: emit <end_of_image> + feed into LLM, run AR once)
-#     → text_ar
-#
-# Bridge states (`image_vq_start` / `image_vq_end`) own the boundary-token
-# emission via `JanusTextEncoder.emit_image_start` / `emit_image_end`.  The
-# framework FSM has no special-cased boundary logic — these are normal
-# nodes that happen to produce a single fixed token.
+#   prompt_encode → text_ar     (force_image_gen=False, default path)
+#                 → image_vq    (force_image_gen=True OR natural <boi>)
+#   text_ar       → image_vq    on <boi>
+#                 → done        on <eos>
+#                 → text_ar     loop otherwise
+#   image_vq      → image_vq_end  on `image_complete`
+#   image_vq_end  → text_ar       (the one difference vs. infer_gen)
 
 generation_graph:
-  # `done` is auto-injected by the framework — never declare it here, never
-  # set `done_state`.  Transitions whose `next_state: done` will land on the
-  # built-in terminal state which then triggers each module's `finalize`
-  # hook (text decode / image save / etc).
-
-  initial: prompt_to_text
+  initial: prompt_encode
 
   states:
-    prompt_to_text:
-      # Multi-source: siglip_encode + tok_encode both feed janus_llama.
-      # The order in `body` defines edge processing order; janus_llama
-      # only executes after both `vision_to_ar` and `tok_enc_to_ar` have
-      # been processed (topological execution rule).  ar_to_tok_decode
-      # then samples the first reply token.
+    prompt_encode:
       body:
-        - vision_to_ar          # siglip_encode → janus_llama (und_image_embeds)
-        - tok_enc_to_ar         # tok_encode    → janus_llama (inputs_embeds)
-        - ar_to_tok_decode      # janus_llama   → tok_decode  (hidden_states)
+        - vision_to_llm
+        - tokenc_to_llm
+        - llm_to_tokdec
         - tok_decode_sink
       token_length: { type: fixed, value: 1 }
       transitions:
+        - { condition: { type: module_signal, key: start_image_gen }, next_state: image_vq }
         - { condition: { type: module_signal, key: text_done }, next_state: done }
         - { condition: { type: steps_complete }, next_state: text_ar }
 
     text_ar:
-      # tok_encode → janus_llama → tok_decode (variable, until transition fires).
-      # tok_decode emits a (B, 1) next token; the framework appends it onto
-      # ctx["input_ids"] at step end (HF generate style).  With KV cache,
-      # tok_encode embeds only input_ids[:, -1:].  JanusTextEncoder.decode
-      # also writes one-shot module_signal keys (start_image_gen / text_done).
       body:
-        - tok_enc_to_ar       # tok_encode  → janus_llama (inputs_embeds)
-        - ar_to_tok_decode    # janus_llama → tok_decode  (hidden_states)
-        - tok_decode_sink     # leaf
+        - tokenc_to_llm
+        - llm_to_tokdec
+        - tok_decode_sink
       token_length: { type: variable }
       transitions:
-        - { condition: { type: module_signal, key: start_image_gen }, next_state: image_vq_start }
+        - { condition: { type: module_signal, key: start_image_gen }, next_state: image_vq }
         - { condition: { type: module_signal, key: text_done }, next_state: done }
 
-    image_vq_start:
-      # Emit <begin_of_image>, feed it through janus_llama.  Single step:
-      # the LLM produces hidden_states which the next state's first edge
-      # (ar_to_vae_decode) consumes.  ar_run_sink is the body-terminal
-      # marker that triggers janus_llama (which has no downstream node
-      # in this body — its hidden_states is consumed by the *next*
-      # state).
-      body:
-        - emit_start_to_ar    # emit_image_start (boi token) → janus_llama
-        - emit_start_sink     # leaf — pin emit_image_start into the body
-        - ar_run_sink         # leaf — triggers janus_llama (KV cache update)
-      token_length: { type: fixed, value: 1 }
-      transitions:
-        - { condition: { type: steps_complete }, next_state: image_vq }
-
     image_vq:
-      # No fixed budget — loop until vae_decode signals image completion.
-      # vae_decode in inference mode samples from its generation head AND
-      # looks up the codebook embedding in one call; vae_decode_to_ar feeds
-      # that embedding back into the next iteration's janus_llama call as
-      # inputs_embeds.  On the final patch (e.g. 576-th of a 24×24 grid)
-      # JanusVqvae.decode appends `image_complete=True` to its output dict,
-      # which lands in ctx and fires the module_signal transition below.  The
-      # framework auto-clears the flag on transition so it never stale-fires
-      # in image_vq_end.
       body:
-        - ar_to_vae_decode    # janus_llama  → vae_decode    (hidden_states)
-        - vae_decode_to_ar    # vae_decode   → janus_llama   (embed → inputs_embeds)
+        - llm_to_vaegen
+        - vaegen_to_llm
       token_length: { type: variable }
       transitions:
         - { condition: { type: module_signal, key: image_complete }, next_state: image_vq_end }
 
     image_vq_end:
-      # Emit <end_of_image>, run AR once on it.  Mirrors image_vq_start.
+      # After eoi, fall back to text_ar so the model can keep speaking
+      # (or emit eos / another <boi>).  The eoi part's `inputs_embeds`
+      # is consumed by text_ar's first llama tail-only forward.
       body:
-        - emit_end_to_ar      # emit_image_end (eoi token) → janus_llama
-        - emit_end_sink       # leaf
-        - ar_run_sink         # leaf — triggers janus_llama
+        - emit_end_sink
       token_length: { type: fixed, value: 1 }
       transitions:
         - { condition: { type: steps_complete }, next_state: text_ar }

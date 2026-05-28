@@ -1,77 +1,64 @@
 # Janus-1.3B inference — image understanding (I2T / VQA).  Uni-directional;
 # never emits an image mid-stream.
 #
-# Use (via launcher YAML)::
-#
-#   OmniConfig.from_launcher("configs/seed_omni/janus_1.3b/veomni_janus.yaml",
-#                            infer_type="infer_und")
+# Conversation-list inference path (V2 .generate methods)
+# -------------------------------------------------------
+# * The user passes a `conversation_list` (image_und parts first, then a
+#   user text part, then an empty assistant text part — see
+#   :func:`veomni.models.seed_omni.build_conversation`).
+# * `text_encoder.generate` owns bos placement and tokenises every text
+#   part — there is no chat-template tokenisation upstream; the text
+#   encoder fully decides the on-the-wire layout.
+# * `janus_llama.generate` concats every part's `inputs_embeds` on the
+#   prompt pass and uses the tail-only fast path on every subsequent AR
+#   step (KV cache present).
 #
 # Flow
 # ----
-#   prompt_to_text  (1 step: read both `pixel_values` and `input_ids`.
-#                   siglip_encode produces understanding image embeddings;
-#                   tok_encode produces text embeds; janus_llama consumes
-#                   BOTH via masked_scatter at the image-placeholder
-#                   positions, runs once, and tok_decode samples the
-#                   first reply token.)
-#     → text_ar
+#   prompt_encode  (1 step: siglip_generate + tok_encode_generate +
+#                   janus_llama_gen.generate(prompt) + tok_decode
+#                   samples the first reply token)
+#     ├─ module_signal text_done → done   (eos came out immediately, rare)
+#     └─ steps_complete           → text_ar
 #
-#   text_ar         (variable length: tok_encode → janus_llama → tok_decode.
-#                   Framework appends each sampled token onto ctx["input_ids"]
-#                   at step end; tok_encode embeds input_ids[:, -1:] when KV
-#                   cache is present.
-#     ├─ token == </s> → done
-#     └─ otherwise     → text_ar (continue)
-#
-# Multi-source initial state
-# --------------------------
-# `prompt_to_text` is the first FSM state that exercises the topological
-# body-execution rule: `janus_llama` has TWO incoming routing edges
-# (`vision_to_ar` and `tok_enc_to_ar`).  The runtime decrements the
-# fan-in counter on each routing edge and only executes `janus_llama`
-# after the second one has been processed — both kwargs are present in
-# ctx by the time the backbone runs.
-#
-# Permissive routing for text-only prompts
-# ----------------------------------------
-# When the user submits a text-only prompt (no image), `pixel_values` is
-# absent from the initial context.  `siglip_encode` returns `{}` — its
-# `forward` short-circuits on `pixel_values is None`.  The
-# `vision_to_ar` edge then permissively skips routing (no
-# `image_embeds` to copy) and `janus_llama` runs without
-# `und_image_embeds`.  Its `pre_forward` skips the masked_scatter
-# branch when `und_image_embeds is None`.  No errors, no special-cased
-# YAML — just permissive edges + model-side `is None` guards.
+#   text_ar        (variable length: tok_encode_generate embeds the
+#                   tail token part appended by tok_decode → janus_llama_gen
+#                   AR step → tok_decode samples the next token.)
+#     └─ module_signal text_done → done
 
 generation_graph:
   # `done` is auto-injected by the framework — never declare it here, never
-  # set `done_state`.  Transitions whose `next_state: done` will land on the
-  # built-in terminal state which then triggers each module's `finalize`
-  # hook.
+  # set `done_state`.
 
-  initial: prompt_to_text
+  initial: prompt_encode
 
   states:
-    prompt_to_text:
-      # Multi-source: siglip_encode + tok_encode both feed janus_llama.
-      # The order in `body` defines edge processing order; janus_llama
-      # only executes after both `vision_to_ar` and `tok_enc_to_ar` have
-      # been processed (topological execution rule).  ar_to_tok_decode
-      # then samples the first reply token.
+    prompt_encode:
+      # First step: full encode pipeline (vision + text) + LLM forward +
+      # tok_decode (samples the first reply token).  janus_llama_gen has
+      # fan-in 2 (vision_to_llm + tokenc_to_llm) — the topological body
+      # execution rule fires it only after BOTH routing edges have run,
+      # so the conversation_list it receives already has every part's
+      # inputs_embeds populated.
       body:
-        - vision_to_ar          # siglip_encode → janus_llama (und_image_embeds)
-        - tok_enc_to_ar         # tok_encode    → janus_llama (inputs_embeds)
-        - ar_to_tok_decode      # janus_llama   → tok_decode  (hidden_states)
-        - tok_decode_sink
+        - vision_to_llm         # siglip_generate    → janus_llama_gen
+        - tokenc_to_llm         # tok_encode_generate → janus_llama_gen
+        - llm_to_tokdec         # janus_llama_gen   → tok_decode
+        - tok_decode_sink       # leaf — pin tok_decode into the body
       token_length: { type: fixed, value: 1 }
       transitions:
         - { condition: { type: module_signal, key: text_done }, next_state: done }
         - { condition: { type: steps_complete }, next_state: text_ar }
 
     text_ar:
+      # Subsequent AR steps.  tok_encode_generate sees a non-None
+      # past_key_values (set by the prompt pass) → walks the conversation
+      # tail, embeds only the newly-appended `token` part from the last
+      # tok_decode.  janus_llama_gen then uses the tail-only fast path
+      # (only the trailing part's inputs_embeds is fed to the LM).
       body:
-        - tok_enc_to_ar
-        - ar_to_tok_decode
+        - tokenc_to_llm
+        - llm_to_tokdec
         - tok_decode_sink
       token_length: { type: variable }
       transitions:

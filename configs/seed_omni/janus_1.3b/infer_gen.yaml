@@ -1,79 +1,89 @@
-# Janus-1.3B inference — text-to-image only (no preceding text generation).
+# Janus-1.3B inference — text-to-image only (no trailing text).
 #
-# Use (via launcher YAML)::
+# Conversation-list inference path (V2 .generate methods)
+# -------------------------------------------------------
+# Step 1 — `prompt_encode`:
+#   Runs the full encode pipeline once:
+#     siglip_generate (vision parts) + tok_encode_generate (bos + text parts)
+#     + janus_llama_gen (prompt-mode: concat every part's inputs_embeds, no KV cache yet)
+#     + tok_decode (samples first reply token, appends a `kind=token`
+#                   part with its embed into the conversation tail).
 #
-#   OmniConfig.from_launcher("configs/seed_omni/janus_1.3b/veomni_janus.yaml",
-#                            infer_type="infer_gen")
+#   When the caller sets `request['force_image_gen']=True`, `tok_decode`
+#   ignores the LM-head sample and appends `<begin_of_image>` instead —
+#   see :meth:`JanusTextEncoder.decode`.  It also clears `force_image_gen`
+#   on ctx so the forced boi only fires once.  Either way the boi part
+#   is already in the conversation tail by the time the FSM transitions
+#   into `image_vq`, so no extra "image_vq_start" bridge state is needed
+#   (the boi's embed is consumed by `image_vq`'s first llama tail-only
+#   forward).
 #
-# Flow
-# ----
-#   prompt_to_image  (1 step: encode prompt input_ids, run AR once on the
-#                    *full* prompt, no token sampling — the next state
-#                    consumes the AR's hidden states directly.)
-#     → image_vq_start (1 step: emit <begin_of_image>, AR once)
-#     → image_vq       (576 steps: AR ↔ vae_decode feedback)
-#     → image_vq_end   (1 step: emit <end_of_image>, AR once)
-#     → done           (no subsequent text generation in T2I-only mode)
-#
-# The user prompt is provided as `input_ids` in the initial generation
-# context; `prompt_to_image` runs `tok_encode → janus_llama` once over the
-# whole prompt to populate the KV cache, then the bridge state appends
-# the boundary token and the FSM enters the VQ loop.
+# After the image span:
+#   image_vq        (variable: llama tail-only → vae samples → repeat,
+#                    until `vae_generate` accumulates the full grid and
+#                    raises `image_complete`)
+#     → image_vq_end (1 step: emit `<end_of_image>` into the conversation
+#                     — no llama forward; T2I-only never speaks after eoi)
+#     → done
 
 generation_graph:
-  # `done` is auto-injected by the framework — never declare it here, never
-  # set `done_state`.  The `image_vq_end → done` transition lands on the
-  # built-in terminal state which then triggers each module's `finalize`
-  # hook (e.g. `janus_vqvae.finalize` saves the accumulated VQ patches as
-  # an image on disk).
-
-  initial: prompt_to_image
+  initial: prompt_encode
 
   states:
-    prompt_to_image:
-      # One pass over the user prompt: tok_encode → janus_llama.  We DO NOT
-      # decode here — the goal is to seed the LLM's KV cache with the
-      # prompt before the first <begin_of_image> token.  ar_to_tok_decode
-      # is intentionally absent; ar_run_sink triggers janus_llama as a
-      # body terminal.
+    prompt_encode:
       body:
-        - tok_enc_to_ar       # tok_encode  → janus_llama
-        - ar_run_sink         # leaf — triggers janus_llama
+        - vision_to_llm         # siglip_generate    → janus_llama_gen
+        - tokenc_to_llm         # tok_encode_generate → janus_llama_gen
+        - llm_to_tokdec         # janus_llama_gen   → tok_decode
+        - tok_decode_sink       # leaf — pin tok_decode in the active set
       token_length: { type: fixed, value: 1 }
       transitions:
-        - { condition: { type: steps_complete }, next_state: image_vq_start }
+        # Force-image path (force_image_gen=True) OR a natural <boi>
+        # sample — both land here via the same signal.
+        - { condition: { type: module_signal, key: start_image_gen }, next_state: image_vq }
+        - { condition: { type: module_signal, key: text_done }, next_state: done }
+        - { condition: { type: steps_complete }, next_state: text_ar }
 
-    image_vq_start:
+    text_ar:
+      # Reached only when force_image_gen=False AND the LM didn't emit
+      # <boi> on the first sample.  Loops until <boi> (start image gen)
+      # or <eos> (text_done).  T2I-only never wants trailing text — a
+      # natural text_done here lands on `done`.
       body:
-        - emit_start_to_ar    # emit_image_start → janus_llama
-        - emit_start_sink
-        - ar_run_sink         # leaf — triggers janus_llama
-      token_length: { type: fixed, value: 1 }
+        - tokenc_to_llm         # defensive embed of any un-embedded tail part
+        - llm_to_tokdec
+        - tok_decode_sink
+      token_length: { type: variable }
       transitions:
-        - { condition: { type: steps_complete }, next_state: image_vq }
+        - { condition: { type: module_signal, key: start_image_gen }, next_state: image_vq }
+        - { condition: { type: module_signal, key: text_done }, next_state: done }
 
     image_vq:
-      # No fixed budget — loop until vae_decode signals image completion.
-      # JanusVqvae.decode tracks its own grid position internally; on the
-      # final patch (e.g. 576-th for a 24×24 grid, or whenever the model
-      # decides via its own EOS-of-image logic) it appends
-      # `image_complete=True` to its output dict, which lands in ctx and
-      # fires the module_signal transition below.  The framework auto-clears
-      # the flag on transition so it never stale-fires in image_vq_end.
+      # 576-step loop (configurable via vq_config.num_image_tokens).
+      # Per iteration: llama runs tail-only on the latest conversation
+      # part (boi on iter 0, the vq token from the previous iter
+      # afterwards) → vae_generate samples one VQ token and appends a
+      # `kind=token` part carrying the codebook embedding back onto the
+      # conversation tail.  On the final patch vae_generate decodes the
+      # image and raises `image_complete`; the framework auto-clears
+      # the signal on transition and drains `ctx['generated_image']`
+      # into `ctx['generated_images_collected']`.
       body:
-        - ar_to_vae_decode
-        - vae_decode_to_ar
+        - llm_to_vaegen         # janus_llama_gen → vae_generate
+        - vaegen_to_llm         # vae_generate    → janus_llama_gen (next iter input)
       token_length: { type: variable }
       transitions:
         - { condition: { type: module_signal, key: image_complete }, next_state: image_vq_end }
 
     image_vq_end:
-      # Janus T2I-only: emit <end_of_image> for symmetry, then stop.  No
-      # transition back to text_ar (this scenario never produces text).
+      # Close the image span with an <end_of_image> token (appended to
+      # the conversation by emit_image_end).  No llama forward here —
+      # T2I-only never samples after eoi, and the next state (`done`)
+      # never reads the eoi back.  Interleave overrides this state's
+      # `transitions` to land back on `text_ar`, where llama tail-only
+      # picks up eoi on its first iteration.
       body:
-        - emit_end_to_ar
-        - emit_end_sink
-        - ar_run_sink
+        - emit_end_sink         # leaf — _run(emit_image_end) appends eoi part
       token_length: { type: fixed, value: 1 }
       transitions:
         - { condition: { type: steps_complete }, next_state: done }

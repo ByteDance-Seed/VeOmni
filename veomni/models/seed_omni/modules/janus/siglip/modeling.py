@@ -22,13 +22,14 @@ Batch inputs (read from raw batch)
     shape is flattened by :meth:`pre_forward`.
 """
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import torch
 from transformers import PreTrainedModel
 from transformers.models.janus.configuration_janus import JanusVisionConfig
 from transformers.models.janus.modeling_janus import JanusVisionAlignerMLP, JanusVisionModel
 
+from ....conversation import ConversationPart
 from ....module import OmniModule
 from .configuration import JanusSiglipConfig
 
@@ -58,16 +59,24 @@ class JanusSiglip(OmniModule, PreTrainedModel):
         self.post_init()
 
     def _init_weights(self, module: torch.nn.Module) -> None:
-        """Defer to the inner SigLIP modules' own initialisers."""
+        """Defer to the inner SigLIP modules' own initialisers.
+
+        Dispatch through ``torch.nn.init.*`` (NOT the tensor in-place
+        ``.normal_`` / ``.zero_`` methods) so the
+        :func:`transformers.initialization.guard_torch_init_functions`
+        monkey-patch can skip already-loaded weights — see the matching
+        comment in
+        :meth:`veomni.models.seed_omni.modules.base.text_encoder.modeling.TextEncoder._init_weights`.
+        """
         if hasattr(module, "_init_weights"):
             return
         std = 0.02
         if isinstance(module, torch.nn.Linear):
-            module.weight.data.normal_(mean=0.0, std=std)
+            torch.nn.init.normal_(module.weight, mean=0.0, std=std)
             if module.bias is not None:
-                module.bias.data.zero_()
+                torch.nn.init.zeros_(module.bias)
         elif isinstance(module, torch.nn.Embedding):
-            module.weight.data.normal_(mean=0.0, std=std)
+            torch.nn.init.normal_(module.weight, mean=0.0, std=std)
 
     # ── OmniModule interface ───────────────────────────────────────────────────
 
@@ -105,6 +114,57 @@ class JanusSiglip(OmniModule, PreTrainedModel):
             image_embeds = image_embeds.reshape(b, n * p, image_embeds.size(2))
 
         return {"image_embeds": image_embeds}
+
+    # ── Inference (conversation-list) ─────────────────────────────────────────
+
+    def generate(
+        self,
+        *,
+        conversation_list: Optional[List[ConversationPart]] = None,
+        past_key_values: Optional[Any] = None,
+        **_: Any,
+    ) -> Dict[str, Any]:
+        """Encode every ``image_und`` part that doesn't yet carry an ``inputs_embeds``.
+
+        Inference-only entry — training still goes through
+        :meth:`forward` (input_ids + masked_scatter contract).  Called once
+        on the prompt pass; subsequent FSM iterations short-circuit
+        because ``past_key_values is not None`` (no new images get
+        injected mid-AR).
+
+        Each ``image_und`` part must carry a 3D ``pixel_values`` tensor
+        ``(C, H, W)`` (filled by the inference processor before
+        :meth:`OmniInferencer.generate` hands the conversation off to
+        the FSM).  The aligner-projected output is written back into
+        the same part so downstream
+        :meth:`JanusLlama.generate` can concat it next to the text
+        embeddings.
+        """
+        if conversation_list is None or past_key_values is not None:
+            return {"conversation_list": conversation_list} if conversation_list is not None else {}
+
+        device = self._param_device()
+        dtype = self._param_dtype()
+        for part in conversation_list:
+            if part.kind != "image_und" or part.inputs_embeds is not None:
+                continue
+            pv = part.pixel_values
+            if pv is None:
+                continue
+            if pv.dim() == 3:
+                pv = pv.unsqueeze(0)
+            pv = pv.to(device=device, dtype=dtype, non_blocking=True)
+            vision_out = self.vision_model(pv, return_dict=True)
+            part.inputs_embeds = self.aligner(vision_out.last_hidden_state)
+        return {"conversation_list": conversation_list}
+
+    # ── Internal device / dtype helpers ───────────────────────────────────────
+
+    def _param_device(self) -> torch.device:
+        return next(self.parameters()).device
+
+    def _param_dtype(self) -> torch.dtype:
+        return next(self.parameters()).dtype
 
     # ── Training-side dummy forward ────────────────────────────────────────────
 

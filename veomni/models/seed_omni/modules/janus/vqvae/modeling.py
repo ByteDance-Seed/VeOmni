@@ -34,10 +34,11 @@ allowed loss key per the V2 ``OmniModel`` contract).  Inference paths
 return ``vq_token_id`` / ``embed`` and never set ``_loss``.
 """
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from transformers import PreTrainedModel
 from transformers.models.janus.configuration_janus import JanusVQVAEConfig
 from transformers.models.janus.modeling_janus import (
@@ -46,8 +47,14 @@ from transformers.models.janus.modeling_janus import (
     JanusVQVAEHead,
 )
 
+from ....conversation import ConversationPart
+from ....generation_graph import FSM_SIGNAL_KEY
 from ....module import OmniModule
 from .configuration import JanusVqvaeConfig
+
+
+# Default Janus-1.3B grid: 24 x 24 = 576 VQ tokens per image.
+_DEFAULT_NUM_IMAGE_TOKENS = 576
 
 
 class JanusVqvae(OmniModule, PreTrainedModel):
@@ -77,18 +84,35 @@ class JanusVqvae(OmniModule, PreTrainedModel):
         if config.freeze_vqvae:
             self.vqmodel.requires_grad_(False)
 
+        # Per-image VQ-token buffer used by :meth:`generate` to accumulate
+        # sampled tokens between FSM iterations.  Reset on each
+        # ``image_complete`` signal; finalize keeps the decoded image
+        # tensors so the caller can collect them after the run.
+        self._gen_buffer: List[int] = []
+        self._collected_images: List[torch.Tensor] = []
+
         self.post_init()
 
     def _init_weights(self, module: nn.Module) -> None:
+        """Initialiser for layers added on top of the upstream Janus
+        VQ encoder/decoder modules (which carry their own ``_init_weights``).
+
+        Dispatch through ``torch.nn.init.*`` rather than the tensor's
+        own in-place methods so the
+        :func:`transformers.initialization.guard_torch_init_functions`
+        monkey-patch can skip already-loaded weights — see the matching
+        comment in
+        :meth:`veomni.models.seed_omni.modules.base.text_encoder.modeling.TextEncoder._init_weights`.
+        """
         if hasattr(module, "_init_weights"):
             return
         std = 0.02
         if isinstance(module, nn.Linear):
-            module.weight.data.normal_(mean=0.0, std=std)
+            nn.init.normal_(module.weight, mean=0.0, std=std)
             if module.bias is not None:
-                module.bias.data.zero_()
+                nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
-            module.weight.data.normal_(mean=0.0, std=std)
+            nn.init.normal_(module.weight, mean=0.0, std=std)
 
     # ── OmniModule interface ───────────────────────────────────────────────────
 
@@ -190,6 +214,148 @@ class JanusVqvae(OmniModule, PreTrainedModel):
         """Decode a sequence of VQ token IDs to pixel values ``(B, H, W, 3)``."""
         pixel_values = self.vqmodel.decode(vq_token_ids)
         return pixel_values.permute(0, 2, 3, 1)
+
+    # ── Inference (conversation-list aware) ───────────────────────────────────
+
+    def generate(
+        self,
+        *,
+        hidden_states: Optional[torch.Tensor] = None,
+        conversation_list: Optional[List[ConversationPart]] = None,
+        generation_kwargs: Optional[Dict[str, Any]] = None,
+        **_: Any,
+    ) -> Dict[str, Any]:
+        """Sample one VQ token, buffer it, decode the image when full.
+
+        Each FSM ``image_vq`` iteration calls this with the latest LLM
+        hidden states.  We:
+
+        1. Sample a VQ token id from ``generation_head`` (multinomial /
+           greedy, controlled by ``generation_kwargs``).
+        2. Append it to :attr:`_gen_buffer` and emit a ``token``-kind
+           ``ConversationPart`` carrying the codebook-lookup embedding
+           (the ``vaegen_to_llm`` edge feeds that embed back as the
+           next iteration's ``inputs_embeds``).
+        3. On the ``num_image_tokens``-th call (default 576) we decode
+           the buffered tokens to pixels via ``vqmodel.decode``, clear
+           the buffer, stash the image in :attr:`_collected_images`
+           for :meth:`finalize`, expose it via ``ctx['generated_image']``
+           and raise ``module_signal = 'image_complete'`` so the FSM
+           transitions to ``image_vq_end``.
+
+        Batch contract
+        --------------
+        Single-image generation (B == 1) is the only supported path
+        today — the FSM driver and conversation-list shape both assume
+        one image stream per request.  We assert it explicitly rather
+        than silently mis-broadcast for B > 1 (the legacy ``decode()``
+        below quietly assumed the same).
+        """
+        if hidden_states is None:
+            return {"conversation_list": conversation_list} if conversation_list is not None else {}
+
+        batch_size = hidden_states.size(0)
+        if batch_size != 1:
+            raise NotImplementedError(
+                f"JanusVqvae.generate supports B == 1 only (got B={batch_size}). "
+                "Batched VQ generation is not yet wired into the conversation-list FSM."
+            )
+
+        # (B, 1, vocab) → (B, vocab) for sampling, then back to (B, 1)
+        # for the embedding lookup — keep shapes parallel to legacy decode().
+        last_logits = self.generation_head(hidden_states[:, -1:, :]).squeeze(1)
+        sampling = self._extract_sampling_kwargs(generation_kwargs)
+        sampled = self._sample_vq_token(last_logits, **sampling).unsqueeze(-1)  # (B, 1)
+        token_id_int = int(sampled[0, 0].item())
+        self._gen_buffer.append(token_id_int)
+
+        embed_raw = self.generation_embeddings(sampled)
+        embed = self.generation_aligner(embed_raw)  # (B, 1, H)
+
+        out: Dict[str, Any] = {
+            "vq_token_id": sampled.squeeze(-1),
+            "embed": embed,
+        }
+
+        if conversation_list is not None:
+            conversation_list.append(
+                ConversationPart(
+                    kind="token",
+                    role="assistant",
+                    token_id=token_id_int,
+                    inputs_embeds=embed,
+                    meta={"source": "vqvae"},
+                )
+            )
+            out["conversation_list"] = conversation_list
+
+        target = self._num_image_tokens()
+        if len(self._gen_buffer) >= target:
+            token_ids = torch.tensor([self._gen_buffer], dtype=torch.long, device=embed.device)
+            with torch.inference_mode():
+                image = self.vqmodel.decode(token_ids).permute(0, 2, 3, 1)  # (1, H, W, 3)
+            self._gen_buffer.clear()
+            self._collected_images.append(image.detach())
+            out["generated_image"] = image
+            out[FSM_SIGNAL_KEY] = "image_complete"
+
+        return out
+
+    def reset_inference_state(self) -> None:
+        """Wipe per-request buffers — called by :class:`OmniInferencer` between runs."""
+        self._gen_buffer.clear()
+        self._collected_images.clear()
+
+    def finalize(self, *, ctx: Dict[str, Any], request: Dict[str, Any]) -> Dict[str, Any]:
+        """Hand off accumulated images to the caller via the framework's finalize hook."""
+        del request
+        images = list(ctx.get("generated_images_collected", []) or self._collected_images)
+        if not images:
+            return {}
+        return {"images": images}
+
+    # ── Internal helpers ─────────────────────────────────────────────────────
+
+    def _num_image_tokens(self) -> int:
+        cfg = self.config.vq_config
+        if isinstance(cfg, dict):
+            return int(cfg.get("num_image_tokens", _DEFAULT_NUM_IMAGE_TOKENS))
+        val = getattr(cfg, "num_image_tokens", None)
+        return int(val) if val is not None else _DEFAULT_NUM_IMAGE_TOKENS
+
+    @staticmethod
+    def _extract_sampling_kwargs(generation_kwargs: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        merged: Dict[str, Any] = {"temperature": 1.0, "top_p": 1.0, "do_sample": True}
+        if generation_kwargs:
+            for k in ("temperature", "top_p", "do_sample"):
+                if k in generation_kwargs:
+                    merged[k] = generation_kwargs[k]
+        return merged
+
+    @staticmethod
+    def _sample_vq_token(
+        logits: torch.Tensor,
+        temperature: float = 1.0,
+        top_p: float = 1.0,
+        do_sample: bool = True,
+    ) -> torch.Tensor:
+        """Sample one VQ token id per row.  ``logits`` is ``(B, vocab)``;
+        returns ``(B,)`` so the caller can ``unsqueeze(-1)`` for the
+        codebook embedding lookup (matching the legacy ``decode()``
+        ``(B, 1)`` shape contract)."""
+        if not do_sample:
+            return logits.argmax(dim=-1)
+        if temperature != 1.0:
+            logits = logits / max(temperature, 1e-6)
+        if top_p < 1.0:
+            sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+            sorted_probs = F.softmax(sorted_logits, dim=-1)
+            cumulative = torch.cumsum(sorted_probs, dim=-1)
+            to_remove = cumulative - sorted_probs > top_p
+            sorted_logits = sorted_logits.masked_fill(to_remove, float("-inf"))
+            logits = logits.scatter(1, sorted_indices, sorted_logits)
+        probs = F.softmax(logits, dim=-1)
+        return torch.multinomial(probs, num_samples=1).squeeze(-1)
 
     # ── Training-side dummy forward ────────────────────────────────────────────
 

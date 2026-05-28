@@ -300,6 +300,11 @@ class OmniModel(nn.Module):
 
         self.generation_graph.reset(request=request)
         ctx: Dict[str, Any] = dict(context if context is not None else request)
+        # Per-request output accumulator for decoded multi-modal artefacts
+        # (VQ images today, audio waveforms tomorrow).  Drained from
+        # ``ctx['generated_image']`` after each FSM step so the key never
+        # leaks into the next iteration's module kwargs.
+        ctx.setdefault("generated_images_collected", [])
 
         modules = {name: _unwrap_module(getattr(self, name)) for name in self._module_names}
 
@@ -307,6 +312,14 @@ class OmniModel(nn.Module):
         while not self.generation_graph.is_done() and total_steps < max_new_tokens:
             ctx = self.generation_graph.step(modules, ctx, trace=trace)
             total_steps += 1
+
+            # Drain per-step generated images.  Pop so a module's
+            # ``generate`` call on the *next* iteration doesn't see a
+            # stale image tensor as a kwarg (the FSM passes every ctx
+            # key as a kwarg, see GenerationGraph.step).
+            image = ctx.pop("generated_image", None)
+            if image is not None:
+                ctx["generated_images_collected"].append(image)
 
             if stop_token_ids:
                 last_id = scalar_token_id(ctx.get("input_ids"))

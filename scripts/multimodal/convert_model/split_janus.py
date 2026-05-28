@@ -185,8 +185,17 @@ def split_janus(model_path: str, output_dir: str) -> None:
         te = JanusTextEncoder._from_config(te_cfg)
     te.embed_tokens.load_state_dict(inner.language_model.embed_tokens.state_dict(), assign=True)
     if not text_cfg.tie_word_embeddings:
-        # Untied: load the original lm_head linear.
-        te.lm_head.load_state_dict(model.lm_head.state_dict(), assign=True)
+        # Untied: load the original lm_head linear.  Janus's upstream
+        # implementation often ends up with ``embed_tokens.weight`` and
+        # ``lm_head.weight`` sharing storage even when the config says
+        # ``tie_word_embeddings=False`` (`from_pretrained` ties them when
+        # only one is present in the checkpoint).  We must ``clone()`` the
+        # tensor before assigning into ``te.lm_head``, otherwise both keys
+        # in ``te.state_dict()`` point at the same storage and
+        # :func:`transformers.modeling_utils.remove_tied_weights_from_state_dict`
+        # raises because the model declares no ``_tied_weights_keys``.
+        src_sd = {k: v.detach().clone() for k, v in model.lm_head.state_dict().items()}
+        te.lm_head.load_state_dict(src_sd, assign=True)
 
     te_dir = os.path.join(output_dir, "janus_text_encoder")
     te.save_pretrained(te_dir, safe_serialization=True)

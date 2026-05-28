@@ -105,6 +105,16 @@ nodes:
   emit_image_start: { module: janus_text_encoder.emit_image_start } # produces <begin_of_image> token
   emit_image_end:   { module: janus_text_encoder.emit_image_end }   # produces <end_of_image> token
 
+  # ── Inference-only (conversation-list path).  Distinct nodes from the
+  #    training-side encode/decode so the graph FSM dispatches to
+  #    `<module>.generate` (the conversation-list-aware entry) rather than
+  #    to the legacy training `encode` / `forward`.  Training still uses
+  #    `siglip_encode` / `tok_encode` / `tok_decode` / `janus_llama` above.
+  siglip_generate:     { module: janus_siglip.generate }                # writes inputs_embeds into image_und parts
+  tok_encode_generate: { module: janus_text_encoder.generate }          # bos + tokenise text parts + tail-embed
+  janus_llama_gen:     { module: janus_llama.generate }                 # concat parts on prompt; tail-only on AR
+  vae_generate:        { module: janus_vqvae.generate }                 # sample VQ token + on-complete decode image
+
 # ── Graph edges (data dependencies) ───────────────────────────────────────────
 edges:
   # ── Training (and shared with inference where it makes sense)
@@ -133,6 +143,28 @@ edges:
   #    consumers (tok_decode / vae_decode), so this edge is unused
   #    there.  Same pattern as `tok_decode_sink` / `vae_decode_sink`.
   ar_run_sink:         { from: janus_llama, to: end }
+
+  # ── Inference-only (conversation-list path).
+  #    All edges below route a single `conversation_list` slot — every
+  #    encoder mutates the same list (filling per-part `inputs_embeds`)
+  #    so multiple writes are idempotent on the shared Python object.
+  #    Routed by name + `as` so the FSM body order alone determines
+  #    which module gets to mutate next; janus_llama_gen runs once all
+  #    upstream encoders have filled their parts (topological fan-in).
+  vision_to_llm:       { from: siglip_generate,     output: conversation_list, to: janus_llama_gen, as: conversation_list }
+  tokenc_to_llm:       { from: tok_encode_generate, output: conversation_list, to: janus_llama_gen, as: conversation_list }
+  llm_to_tokdec:       { from: janus_llama_gen,     output: hidden_states,     to: tok_decode,      as: hidden_states }
+  llm_to_vaegen:       { from: janus_llama_gen,     output: hidden_states,     to: vae_generate,    as: hidden_states }
+  vaegen_to_llm:       { from: vae_generate,        output: conversation_list, to: janus_llama_gen, as: conversation_list }
+  tokdec_to_llm:       { from: tok_decode,          output: conversation_list, to: janus_llama_gen, as: conversation_list }
+  emit_start_to_llm:   { from: emit_image_start,    output: conversation_list, to: janus_llama_gen, as: conversation_list }
+  emit_end_to_llm:     { from: emit_image_end,      output: conversation_list, to: janus_llama_gen, as: conversation_list }
+  vaegen_sink:         { from: vae_generate,    to: end }
+  llm_run_sink:        { from: janus_llama_gen, to: end }
+  # Reuse the existing `tok_decode_sink` (declared above for the training
+  # graph) and the existing `emit_*_sink` edges as the conversation-list
+  # bodies' sinks — they pin the producing node into the active set
+  # without routing any data, which is exactly what we need here too.
 
 # ── Training DAG ──────────────────────────────────────────────────────────────
 # Default = Janus joint understanding + image-generation SFT.

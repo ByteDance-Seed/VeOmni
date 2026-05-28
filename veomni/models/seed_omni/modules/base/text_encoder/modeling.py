@@ -58,6 +58,7 @@ from typing import Any, Dict, Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.nn.init as init
 from transformers import PreTrainedModel
 
 from ....module import OmniModule
@@ -74,7 +75,18 @@ class TextEncoder(OmniModule, PreTrainedModel):
     """
 
     config_class = TextEncoderConfig
-    base_model_prefix = "text_encoder"
+    # Intentionally empty: this *is* the base model — there is no inner
+    # ``self.text_encoder`` attribute to redirect to.  HF's
+    # :meth:`PreTrainedModel.from_pretrained` uses ``base_model_prefix``
+    # to decide whether to strip a prefix from the checkpoint keys when
+    # loading; setting it to ``"text_encoder"`` (the old value) made HF
+    # think the checkpoint should be loaded into a sub-module called
+    # ``text_encoder`` and silently leave ``embed_tokens.weight`` /
+    # ``lm_head.weight`` at their random init — verified against
+    # ``output_loading_info=True`` which reports empty missing /
+    # unexpected sets yet the weights end up unchanged.  Keep this
+    # empty unless you genuinely add a sub-module.
+    base_model_prefix = ""
     _no_split_modules: list = []
     main_input_name = "input_ids"
 
@@ -90,14 +102,28 @@ class TextEncoder(OmniModule, PreTrainedModel):
         self.post_init()
 
     def _init_weights(self, module: nn.Module) -> None:
-        """HF ``PreTrainedModel`` requires this; mirrors LLaMA's init."""
+        """HF ``PreTrainedModel`` requires this; mirrors LLaMA's init.
+
+        Must dispatch through ``torch.nn.init.*`` (NOT the in-place
+        ``tensor.normal_`` / ``tensor.zero_`` methods).  Transformers
+        v5's :func:`transformers.initialization.guard_torch_init_functions`
+        monkey-patches ``torch.nn.init`` primitives to no-op on tensors
+        flagged ``_is_hf_initialized = True`` (the loader sets that
+        attribute on every parameter it writes to from a checkpoint).
+        Bypassing the guard — by calling the tensor's own ``.normal_``
+        method — silently overwrites every loaded weight with random
+        noise.  Verified failure mode: ``from_pretrained`` reports zero
+        missing / unexpected keys, ``output_loading_info`` looks clean,
+        but the resulting model produces garbage logits because every
+        param was re-initialised after load.
+        """
         std = 0.02
         if isinstance(module, nn.Linear):
-            module.weight.data.normal_(mean=0.0, std=std)
+            init.normal_(module.weight, mean=0.0, std=std)
             if module.bias is not None:
-                module.bias.data.zero_()
+                init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
-            module.weight.data.normal_(mean=0.0, std=std)
+            init.normal_(module.weight, mean=0.0, std=std)
 
     # ── Call-site methods ─────────────────────────────────────────────────────
 

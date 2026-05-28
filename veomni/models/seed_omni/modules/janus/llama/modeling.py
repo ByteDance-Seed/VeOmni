@@ -33,7 +33,7 @@ Connection outputs
                      live in the head modules.
 """
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import torch
 import torch.nn as nn
@@ -43,6 +43,7 @@ from transformers.models.llama.modeling_llama import LlamaModel
 from veomni.distributed.parallel_state import get_parallel_state
 from veomni.distributed.sequence_parallel.data import gather_outputs, sp_pad_and_slice
 
+from ....conversation import ConversationPart
 from ....module import OmniModule
 from .configuration import JanusLlamaConfig
 
@@ -212,6 +213,70 @@ class JanusLlama(OmniModule, PreTrainedModel):
         return {
             "hidden_states": lm_out.last_hidden_state,
             "past_key_values": lm_out.past_key_values,
+        }
+
+    # ── Inference (conversation-list aware) ──────────────────────────────────
+
+    def generate(
+        self,
+        *,
+        conversation_list: Optional[List[ConversationPart]] = None,
+        past_key_values: Optional[Any] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
+        """Auto-regressive backbone step driven by a conversation list.
+
+        First pass (no KV cache): concatenate every part's
+        ``inputs_embeds`` along the sequence dimension and run a single
+        full prompt forward.  Subsequent passes (KV cache hot):
+        consume **only** the trailing part's ``inputs_embeds`` — the
+        same tail-only convention HuggingFace ``generate`` uses to
+        avoid re-feeding the prefix.
+
+        Any part without ``inputs_embeds`` (e.g. an empty assistant
+        marker, a token whose embedding the upstream module hasn't yet
+        populated) is skipped.  Routing edges may carry the same
+        ``conversation_list`` object from multiple upstream encoders
+        (siglip + text_encoder) — by the time this method runs the
+        topological body-execution rule guarantees every relevant part
+        has been filled.
+        """
+        if conversation_list is None:
+            raise ValueError(
+                "JanusLlama.generate expects `conversation_list` — call OmniInferencer.generate "
+                "(or build a conversation manually with veomni.models.seed_omni.build_conversation)."
+            )
+
+        if past_key_values is None:
+            embed_chunks = [p.inputs_embeds for p in conversation_list if p.inputs_embeds is not None]
+            if not embed_chunks:
+                raise ValueError(
+                    "JanusLlama.generate: conversation_list has no embedded parts. "
+                    "Run siglip + text_encoder generate first."
+                )
+            inputs_embeds = torch.cat(embed_chunks, dim=1)
+        else:
+            tail = conversation_list[-1] if conversation_list else None
+            if tail is None or tail.inputs_embeds is None:
+                raise ValueError(
+                    "JanusLlama.generate (AR step) expects the trailing conversation part to carry "
+                    "`inputs_embeds`. Upstream module (text_encoder.decode / vqvae.generate / emit_*) "
+                    "did not populate it."
+                )
+            inputs_embeds = tail.inputs_embeds
+
+        lm_out = self.language_model(
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            use_cache=True,
+            **{k: v for k, v in kwargs.items() if k in ("cache_position",)},
+        )
+        return {
+            "hidden_states": lm_out.last_hidden_state,
+            "past_key_values": lm_out.past_key_values,
+            "conversation_list": conversation_list,
         }
 
     # ── Internal helpers ─────────────────────────────────────────────────────

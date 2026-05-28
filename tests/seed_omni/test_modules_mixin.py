@@ -511,4 +511,9 @@ def test_from_launcher_resolves_relative_module_paths():
     assert cfg.modules["janus_siglip"]["weights_path"] == f"{root}/janus_siglip"
     assert cfg.modules["janus_text_encoder"]["weights_path"] == f"{root}/janus_text_encoder"
     assert cfg.has_generation_graph()
-    assert cfg.generation_graph["initial"] == "prompt_to_image"
+    # The V2 conversation-list inference path always starts with
+    # ``prompt_encode`` (vision + text + LLM + first sample).  The
+    # legacy ``prompt_to_image`` name was retired alongside the
+    # bridge-state-based image_vq_start (now consumed by the boi
+    # token's appearance in the conversation list).
+    assert cfg.generation_graph["initial"] == "prompt_encode"
