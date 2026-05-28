@@ -32,6 +32,7 @@ from transformers.models.janus.modeling_janus import JanusVisionAlignerMLP, Janu
 from ....conversation import ConversationPart
 from ....module import OmniModule
 from .configuration import JanusSiglipConfig
+from .processing import JanusSiglipProcessor
 
 
 class JanusSiglip(OmniModule, PreTrainedModel):
@@ -45,6 +46,7 @@ class JanusSiglip(OmniModule, PreTrainedModel):
     """
 
     config_class = JanusSiglipConfig
+    processor_class = JanusSiglipProcessor
     base_model_prefix = "janus_siglip"
     main_input_name = "pixel_values"
     _no_split_modules = ["JanusVisionEncoderLayer"]
@@ -55,6 +57,14 @@ class JanusSiglip(OmniModule, PreTrainedModel):
         vision_cfg = JanusVisionConfig(**config.vision_config) if config.vision_config else JanusVisionConfig()
         self.vision_model = JanusVisionModel._from_config(vision_cfg)
         self.aligner = JanusVisionAlignerMLP(vision_cfg)
+
+        # Auto-populated by :meth:`OmniModule.from_pretrained` from
+        # ``<weights_path>/preprocessor_config.json`` when loading via
+        # the HF lifecycle.  Stays ``None`` in trainer-side meta-init
+        # paths (training feeds pre-tensorised ``pixel_values`` via the
+        # data collator) and when no processor JSON ships next to the
+        # weights.
+        self._processor: Optional[Any] = None
 
         self.post_init()
 
@@ -132,11 +142,12 @@ class JanusSiglip(OmniModule, PreTrainedModel):
         because ``past_key_values is not None`` (no new images get
         injected mid-AR).
 
-        Each ``image_und`` part must carry a 3D ``pixel_values`` tensor
-        ``(C, H, W)`` (filled by the inference processor before
-        :meth:`OmniInferencer.generate` hands the conversation off to
-        the FSM).  The aligner-projected output is written back into
-        the same part so downstream
+        Each ``image_und`` part must either carry a 3D ``pixel_values``
+        tensor ``(C, H, W)`` already, or carry a raw PIL ``image`` so we
+        can tensorise on the fly via ``self._processor`` — auto-loaded
+        from the same checkpoint folder by
+        :meth:`OmniModule.from_pretrained`.  The aligner-projected output
+        is written back into the same part so downstream
         :meth:`JanusLlama.generate` can concat it next to the text
         embeddings.
         """
@@ -150,7 +161,24 @@ class JanusSiglip(OmniModule, PreTrainedModel):
                 continue
             pv = part.pixel_values
             if pv is None:
-                continue
+                # Fall back to raw PIL → tensor via the wired processor.
+                # Cache the result back on the part so a re-run / trace sees
+                # the same numerics, and so the FSM's bookkeeping (which may
+                # serialise the conversation) stays consistent.
+                if part.image is None:
+                    continue
+                if self._processor is None:
+                    raise RuntimeError(
+                        "JanusSiglip.generate: image_und part has no `pixel_values` and no "
+                        "processor was loaded.  Either pre-tensorise the part or ensure "
+                        "`preprocessor_config.json` ships next to the weights checkpoint so "
+                        "OmniModule.from_pretrained can auto-load it."
+                    )
+                out = self._processor(images=[part.image], return_tensors="pt")
+                pv = out["pixel_values"]
+                if pv.dim() == 4 and pv.size(0) == 1:
+                    pv = pv.squeeze(0)
+                part.pixel_values = pv
             if pv.dim() == 3:
                 pv = pv.unsqueeze(0)
             pv = pv.to(device=device, dtype=dtype, non_blocking=True)

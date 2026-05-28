@@ -23,7 +23,11 @@ This module exposes three call-site methods that map 1-to-1 to YAML
                          lookup → ``embed`` (when sampling lives outside
                          the FSM body).
 
-  ``decode_pixels``— Image rendering (post-FSM): ``vq_token_ids`` → pixels.
+  ``decode_pixels``— Image rendering (post-FSM): ``vq_token_ids`` →
+                     pixels (raw ``[-1, 1]`` tensor — for callers that
+                     want to do their own postprocess; the FSM
+                     :meth:`generate` path uses :class:`JanusVqvaeProcessor`
+                     to surface PIL images directly).
 
 ``forward`` aliases :meth:`encode` (the most common training default).
 
@@ -39,6 +43,7 @@ from typing import Any, Dict, List, Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from PIL import Image
 from transformers import PreTrainedModel
 from transformers.models.janus.configuration_janus import JanusVQVAEConfig
 from transformers.models.janus.modeling_janus import (
@@ -51,6 +56,7 @@ from ....conversation import ConversationPart
 from ....generation_graph import FSM_SIGNAL_KEY
 from ....module import OmniModule
 from .configuration import JanusVqvaeConfig
+from .processing import JanusVqvaeProcessor
 
 
 # Default Janus-1.3B grid: 24 x 24 = 576 VQ tokens per image.
@@ -67,6 +73,7 @@ class JanusVqvae(OmniModule, PreTrainedModel):
     """
 
     config_class = JanusVqvaeConfig
+    processor_class = JanusVqvaeProcessor
     base_model_prefix = "janus_vqvae"
     main_input_name = "gen_image_patches"
     _no_split_modules: list = []
@@ -86,10 +93,16 @@ class JanusVqvae(OmniModule, PreTrainedModel):
 
         # Per-image VQ-token buffer used by :meth:`generate` to accumulate
         # sampled tokens between FSM iterations.  Reset on each
-        # ``image_complete`` signal; finalize keeps the decoded image
-        # tensors so the caller can collect them after the run.
+        # ``image_complete`` signal; finalize keeps the decoded PIL
+        # images so the caller can collect them after the run.
         self._gen_buffer: List[int] = []
-        self._collected_images: List[torch.Tensor] = []
+        self._collected_images: List[Image.Image] = []
+
+        # Auto-populated by :meth:`OmniModule.from_pretrained` from
+        # ``<weights_path>/preprocessor_config.json``.  Used by
+        # :meth:`generate` to convert the VQVAE's ``[-1, 1]`` float output
+        # back into a PIL image — see :class:`JanusVqvaeProcessor`.
+        self._processor: Optional[Any] = None
 
         self.post_init()
 
@@ -238,8 +251,10 @@ class JanusVqvae(OmniModule, PreTrainedModel):
            next iteration's ``inputs_embeds``).
         3. On the ``num_image_tokens``-th call (default 576) we decode
            the buffered tokens to pixels via ``vqmodel.decode``, clear
-           the buffer, stash the image in :attr:`_collected_images`
-           for :meth:`finalize`, expose it via ``ctx['generated_image']``
+           the buffer, hand the ``[-1, 1]`` reconstruction to
+           :meth:`JanusVqvaeProcessor.postprocess` to get a PIL image,
+           stash that PIL image in :attr:`_collected_images` for
+           :meth:`finalize`, expose it via ``ctx['generated_image']``
            and raise ``module_signal = 'image_complete'`` so the FSM
            transitions to ``image_vq_end``.
 
@@ -315,10 +330,23 @@ class JanusVqvae(OmniModule, PreTrainedModel):
         if len(self._gen_buffer) >= target:
             token_ids = torch.tensor([self._gen_buffer], dtype=torch.long, device=embed.device)
             with torch.inference_mode():
-                image = self.vqmodel.decode(token_ids).permute(0, 2, 3, 1)  # (1, H, W, 3)
+                decoded = self.vqmodel.decode(token_ids).permute(0, 2, 3, 1)  # (1, H, W, 3) in [-1, 1]
             self._gen_buffer.clear()
-            self._collected_images.append(image.detach())
-            out["generated_image"] = image
+
+            # Postprocess into a directly-savable PIL image via the
+            # processor (it owns the Janus-specific [-1, 1] → uint8
+            # inverse-normalisation).  We require it here because the
+            # convention is module-specific and shipped next to the
+            # weights — see :class:`JanusVqvaeProcessor`.
+            if self._processor is None:
+                raise RuntimeError(
+                    "JanusVqvae.generate: cannot postprocess VQVAE output — no processor was "
+                    "loaded.  Ensure `preprocessor_config.json` ships next to the weights "
+                    "checkpoint so OmniModule.from_pretrained can auto-load it."
+                )
+            image_pil = self._processor.postprocess(decoded)[0]
+            self._collected_images.append(image_pil)
+            out["generated_image"] = image_pil
             out[FSM_SIGNAL_KEY] = "image_complete"
 
         return out

@@ -134,7 +134,7 @@ import-safe in a torch-free / cpu-only environment so ``test_print_flow.py``
 can exercise the graph runtime without GPUs.
 """
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Type
 
 
 class OmniModule:
@@ -148,6 +148,20 @@ class OmniModule:
     Only the hooks the module actually needs must be overridden.  All
     defaults below are safe identity passes.
     """
+
+    # ── Per-module asset wiring ───────────────────────────────────────────────
+    #
+    # A subclass that consumes raw PIL / waveform inputs at inference time
+    # declares its processor class here (e.g.
+    # ``processor_class = JanusSiglipProcessor``).  :meth:`from_pretrained`
+    # then loads it from the same weights folder and stashes it on
+    # ``self._processor`` so the module's ``generate`` can tensorise its
+    # own inputs — no external wiring step required.
+    #
+    # Leave as ``None`` (default) for modules that only consume already-
+    # tokenised / already-tensorised inputs (the LLM head, the text
+    # encoder, the VQ decoder).
+    processor_class: Optional[Type[Any]] = None
 
     # ── Training hooks ────────────────────────────────────────────────────────
 
@@ -209,6 +223,34 @@ class OmniModule:
         them in ``config.json``.  Default: no-op.
         """
         return None
+
+    # ── HF lifecycle override ─────────────────────────────────────────────────
+
+    @classmethod
+    def from_pretrained(cls, pretrained_model_name_or_path: Any, *args: Any, **kwargs: Any):
+        """Load weights, then auto-load the per-module processor if declared.
+
+        Loads weights via the next-in-MRO ``from_pretrained`` (the
+        concrete HF base — :class:`PreTrainedModel` or
+        :class:`ModelMixin`).  When :attr:`processor_class` is set, also
+        loads the processor from the same path and stashes it on
+        ``model._processor`` so the module's :meth:`generate` can
+        tensorise its own inputs — there's no external wiring step.
+
+        A missing / unreadable processor folder is a silent no-op; the
+        module's ``generate`` is responsible for raising a clear error if
+        it actually needs the processor at call time.  This keeps stripped
+        training checkpoints (no preprocessor JSON shipped) loadable.
+        """
+        model = super().from_pretrained(pretrained_model_name_or_path, *args, **kwargs)
+        if cls.processor_class is not None:
+            try:
+                model._processor = cls.processor_class.from_pretrained(pretrained_model_name_or_path)
+            except Exception:
+                # Best-effort: defer the "missing processor" error to ``generate``
+                # where the message can reference the actual call site.
+                model._processor = None
+        return model
 
     def finalize(self, *, ctx: Dict[str, Any], request: Dict[str, Any]) -> Dict[str, Any]:
         """Post-generation hook called once when the FSM enters ``done``.

@@ -37,8 +37,11 @@ Lifecycle
 3. The global tokenizer is loaded from ``OmniConfig.tokenizer_path`` and
    wired into every module that exposes ``set_tokenizer`` (notably
    :class:`JanusTextEncoder`, which resolves bos / boi / eoi / eos ids at
-   this point).  Per-module processors (vision / vqvae) come from
-   :data:`OMNI_PROCESSOR_REGISTRY`.
+   this point).  Per-module processors (vision / audio / …) are auto-
+   loaded inside :meth:`OmniModule.from_pretrained` from the same
+   weights folder when the subclass declares ``processor_class`` —
+   each module owns its own raw-input tensorisation in
+   :meth:`generate`.
 
 4. Inference is a three-layer call stack:
 
@@ -50,13 +53,15 @@ Lifecycle
      :class:`InferenceRequest`, returns the raw ``ctx`` dict without
      touching the filesystem.  Use for programmatic / batched flows.
    * :meth:`_run` — internal: resets per-module state, builds the
-     :class:`ConversationPart` list via :func:`build_conversation`,
-     attaches per-image ``pixel_values`` via the matching processor,
-     packs the inputs as a ``request`` / ``context`` dict and hands off
-     to :meth:`OmniModel.generate`.
+     conversation-part list via :func:`build_conversation`, packs it
+     into a ``request`` / ``context`` dict and hands off to
+     :meth:`OmniModel.generate`.  Raw-PIL → tensor conversion is the
+     receiving module's responsibility (see :class:`JanusSiglip`).
 
    The returned ``ctx`` carries the FSM trace, the accumulated
-   ``generated_images_collected`` tensors, and the per-module
+   ``generated_images_collected`` PIL images (already postprocessed
+   by each emitting module's processor — e.g.
+   :meth:`JanusVqvaeProcessor.postprocess`), and the per-module
    ``finalize`` outputs (e.g. decoded text under
    ``finalize['janus_text_encoder']['text']``).
 
@@ -80,11 +85,9 @@ import torch
 from transformers import AutoTokenizer
 
 from ..arguments import InferArguments
-from ..data.multimodal.image_utils import load_image, save_image_tensors_to_file
+from ..data.multimodal.image_utils import load_image
 from ..models.seed_omni import (
     OMNI_MODEL_REGISTRY,
-    OMNI_PROCESSOR_REGISTRY,
-    ConversationPart,
     OmniConfig,
     OmniModel,
     build_conversation,
@@ -321,14 +324,12 @@ class OmniInferencer:
         )
 
         self.modules: dict[str, torch.nn.Module] = self._build_modules()
-        self.processors: dict[str, Any] = self._build_processors()
 
         # Tokenizer is best-effort — diffusion-only checkpoints have none.
         try:
             self.tokenizer = AutoTokenizer.from_pretrained(self.omni_config.tokenizer_path)
             for module in self.modules.values():
-                if hasattr(module, "set_tokenizer"):
-                    module.set_tokenizer(self.tokenizer)
+                module.set_tokenizer(self.tokenizer)
         except Exception as e:
             self.tokenizer = None
             logger.warning_rank0(
@@ -377,31 +378,6 @@ class OmniInferencer:
             module = module.to(self.device).eval()
             modules[name] = module
         return modules
-
-    def _build_processors(self) -> dict[str, Any]:
-        """Best-effort load of per-module processors.
-
-        Modules without a registered processor (``janus_llama``,
-        ``janus_text_encoder``) are silently skipped — they consume
-        already-tokenised / already-tensorised inputs.
-        """
-        processors: dict[str, Any] = {}
-        proc_keys = set(OMNI_PROCESSOR_REGISTRY.valid_keys())
-        for name in self.omni_config.module_names:
-            mod_cfg = self.omni_config.module_config(name)
-            weights_path = mod_cfg.get("weights_path")
-            if not weights_path:
-                continue
-            model_type = read_model_type(weights_path)
-            if model_type not in proc_keys:
-                continue
-            proc_cls = OMNI_PROCESSOR_REGISTRY[model_type]()
-            try:
-                processors[name] = proc_cls.from_pretrained(weights_path)
-                logger.info_rank0(f"  loaded processor for '{name}' ({proc_cls.__name__})")
-            except Exception as exc:  # noqa: BLE001 — processors are best-effort
-                logger.warning_rank0(f"  skipping processor for '{name}' ({proc_cls.__name__}): {exc}")
-        return processors
 
     # ── Inference entry point ─────────────────────────────────────────────────
 
@@ -494,12 +470,13 @@ class OmniInferencer:
           existence signals "the FSM ran to completion".  When non-empty,
           also echoed to stdout via the logger (rank-0 gated) so CLI users
           see it without opening the file.
-        * ``generated_image_{i}.png`` — every tensor in
-          ``ctx['generated_images_collected']``, one PNG per image.  Each
-          tensor is squeezed to ``(H, W, 3)``, mapped from VQVAE's ``[-1, 1]``
-          range to ``[0, 1]``, then handed to
-          :func:`veomni.data.multimodal.image_utils.save_image_tensors_to_file`
-          (which does ``×255 → round → uint8 → PIL``).
+        * ``generated_image_{i}.png`` — every PIL image in
+          ``ctx['generated_images_collected']``, one PNG per image.  The
+          per-module ``generate`` (e.g. :class:`JanusVqvae`) already
+          delegated the model-specific denormalisation to its own
+          processor (:meth:`JanusVqvaeProcessor.postprocess`) so the
+          inferencer just calls ``img.save(path)`` — no model-specific
+          tensor math here.
         * ``trace.txt`` — FSM step / transition log (when ``trace`` was
           collected during this run).
 
@@ -529,10 +506,10 @@ class OmniInferencer:
             # doesn't multiplex on a future multi-rank dispatch.
             logger.info_rank0(f"--- reply ---\n{reply}\n-------------")
 
-        images_out: list[torch.Tensor] = list(ctx.get("generated_images_collected") or [])
-        for idx, tensor in enumerate(images_out):
+        images_out = list(ctx.get("generated_images_collected") or [])
+        for idx, image in enumerate(images_out):
             out_path = os.path.join(output_dir, f"generated_image_{idx}.png")
-            _save_generated_image(tensor, out_path)
+            image.save(out_path)
             logger.info_rank0(f"finalize: image #{idx} → {out_path}")
 
         if trace is not None:
@@ -560,7 +537,6 @@ class OmniInferencer:
                 module.reset_inference_state()
 
         conversation = build_conversation(prompt=req.prompt, images=req.images)
-        self._attach_pixel_values(conversation)
 
         request_dict: dict[str, Any] = {
             "conversation_list": conversation,
@@ -578,34 +554,6 @@ class OmniInferencer:
             progress=progress,
         )
         return ctx
-
-    def _attach_pixel_values(self, conversation: list[ConversationPart]) -> None:
-        """Tensorise every ``image_und`` part's raw PIL via the siglip processor.
-
-        Modules consume already-tensor ``pixel_values`` so we run the
-        processor here (single-process, CPU is fine) and let the
-        :meth:`JanusSiglip.generate` per-part loop move the tensors to
-        the model's device.  Skipped silently for parts that already
-        carry a ``pixel_values`` tensor (callers may pre-process).
-        """
-        proc = self.processors.get("janus_siglip")
-        for part in conversation:
-            if part.kind != "image_und" or part.pixel_values is not None:
-                continue
-            if part.image is None:
-                continue
-            if proc is None:
-                raise RuntimeError(
-                    "OmniInferencer: an `image_und` part has no `pixel_values` and no "
-                    "siglip processor was registered. Either pre-tensorise the part or "
-                    "ensure `janus_siglip/preprocessor_config.json` exists in the split "
-                    "checkpoint."
-                )
-            out = proc(images=[part.image], return_tensors="pt")
-            pv = out["pixel_values"]
-            if pv.dim() == 4 and pv.size(0) == 1:
-                pv = pv.squeeze(0)
-            part.pixel_values = pv
 
 
 # ── Module helpers ───────────────────────────────────────────────────────────
@@ -638,33 +586,6 @@ def _extract_reply(ctx: dict[str, Any]) -> str:
     if text_payloads:
         return text_payloads[0][1]["text"]
     return ""
-
-
-def _save_generated_image(tensor: torch.Tensor, out_path: str) -> None:
-    """Save a Janus-VQVAE-decoded image tensor as PNG.
-
-    Janus emits ``(1, H, W, 3)`` (or ``(H, W, 3)``) float tensors in ``[-1, 1]``.
-    We squeeze the batch dim, map ``[-1, 1] → [0, 1]``, then delegate to
-    :func:`veomni.data.multimodal.image_utils.save_image_tensors_to_file`
-    (which expects ``[0, 1]`` H×W×3 and does the
-    ``×255 → clamp → round → uint8 → PIL`` dance — note the rounding step
-    is what keeps the saved PNG bit-exact against the HF baseline
-    ``scripts/multimodal/infer/janus_hf_infer_gen.py`` reference encoder).
-
-    Lives here rather than in ``image_utils`` because the ``[-1, 1]`` range
-    convention is Janus-specific — other decoders (SD VAE, MAGVIT, ...) emit
-    different ranges and would do their own normalisation before calling the
-    shared sink.
-    """
-    img = tensor.detach().to(dtype=torch.float32, device="cpu")
-    if img.dim() == 4 and img.size(0) == 1:
-        img = img.squeeze(0)
-    if img.dim() != 3 or img.size(-1) != 3:
-        raise ValueError(f"Cannot save image with shape {tuple(img.shape)}; expected (H, W, 3).")
-    # `clamp` guards against out-of-range entries from a misbehaving decoder;
-    # the +1/2 mapping is the exact inverse of Janus' ``2x - 1`` preprocess.
-    img = (img.clamp(-1.0, 1.0) + 1.0) / 2.0
-    save_image_tensors_to_file(img, out_path)
 
 
 __all__ = [

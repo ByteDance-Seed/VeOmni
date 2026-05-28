@@ -327,10 +327,12 @@ class OmniModel(nn.Module):
 
         self.generation_graph.reset(request=request)
         ctx: Dict[str, Any] = dict(context if context is not None else request)
-        # Per-request output accumulator for decoded multi-modal artefacts
-        # (VQ images today, audio waveforms tomorrow).  Drained from
-        # ``ctx['generated_image']`` after each FSM step so the key never
-        # leaks into the next iteration's module kwargs.
+        # Per-request output accumulator for decoded multi-modal artefacts —
+        # already postprocessed by each emitting module's processor into a
+        # directly-savable form (PIL.Image for vision; audio waveform / etc.
+        # to come).  Drained from ``ctx['generated_image']`` after each FSM
+        # step so the key never leaks into the next iteration's module
+        # kwargs.
         ctx.setdefault("generated_images_collected", [])
 
         modules = {name: _unwrap_module(getattr(self, name)) for name in self._module_names}
