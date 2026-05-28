@@ -331,8 +331,17 @@ def parallelize_model_fsdp2(
             layer_mod._fsdp_modules.append(layer_mod)
         logger.info_rank0(f"{layer_fqn=}, {layer_mod._fsdp_modules=}")
 
-    # shard root model
-    fully_shard(model, **fsdp_kwargs)
+    # Shard root WITHOUT explicit `reshard_after_forward` so FSDP2's
+    # auto-no-reshard for the root kicks in (`_fsdp_state.py:_lazy_init`).
+    # This keeps the root's params (lm_head + embeddings + final norm)
+    # unsharded between forward and backward, which is what fused-linear
+    # kernels (chunk_logprobs / chunk_topk_distill) need — they save the
+    # lm_head weight via `save_for_backward` and would otherwise hit
+    # `setStorage … storage of size 0` when the saved reference points
+    # to a freed buffer. Decoder layers reshard normally (their calls
+    # above pass `reshard_after_forward` explicitly).
+    root_fsdp_kwargs = {k: v for k, v in fsdp_kwargs.items() if k != "reshard_after_forward"}
+    fully_shard(model, **root_fsdp_kwargs)
 
     # configure manual prefetching when needed
     need_manual_prefetch = (
