@@ -53,6 +53,7 @@ from veomni.models.transformers.qwen3_vl.qwen3_vl_gpu_patch_gen_config import (
     qwen3_vl_model_get_placeholder_mask_patched,
     qwen3_vl_rmsnorm_forward_patched,
     qwen3_vl_text_attention_forward_patched,
+    qwen3_vl_text_attention_init_patched,
     qwen3_vl_text_deepstack_process_patched,
     qwen3_vl_vision_attention_forward_patched,
     qwen3_vl_vision_block_forward_patched,
@@ -98,11 +99,10 @@ config.drop_import_names("Qwen3VLMoeCausalLMOutputWithPast")
 
 config.add_post_import_block(
     """
-    # ── OpSlot declarations ──────────────────────────────────────────────────
-    # These are bound at model-build time by _bind_veomni_ops() in auto.py.
+    # ── OpSlot declarations (MoE-specific; ``veomni_causal_lm_loss`` is
+    # already injected via the inherited qwen3_vl post_import_block above) ──
     from veomni.ops.dispatch import OpSlot
     veomni_moe_experts_forward = OpSlot("moe_experts", "standard")
-    veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
     veomni_load_balancing_loss = OpSlot("load_balancing_loss", "standard")
     """
 )
@@ -155,6 +155,10 @@ config.override_method(
     name_map=_NAME_MAP,
     description="Provide dummy vision forward for FSDP path with SP-aware shape",
 )
+config.modify_init(
+    "Qwen3VLMoeTextAttention",
+    description="Replace separate q/k/v_proj Linears with a single FusedQKVLinear to skip per-forward QKV cat in the ws_push fused path",
+)(qwen3_vl_text_attention_init_patched)
 config.override_method(
     "Qwen3VLMoeTextAttention.forward",
     replacement=qwen3_vl_text_attention_forward_patched,
@@ -203,15 +207,6 @@ config.replace_function(
 )
 
 
-# ================================================================
-# Patch: Qwen3VLMoeTextExperts
-# 1. drop the upstream `@use_experts_implementation` decorator — routing
-#    through `ALL_EXPERTS_FUNCTIONS` bypasses our fused kernel
-# 2. add VeOmni fused MoE dispatch via the module-level
-#    ``veomni_moe_experts_forward`` OpSlot; pass `gate_up_proj` directly
-#    as `fc1_1_2_weight` (the v5 modeling already stores it in the
-#    `[E, 2*I, H]` fused layout, so no chunk + contiguous overhead is needed)
-# ================================================================
 @config.replace_class(
     "Qwen3VLMoeTextExperts",
     description="Drop @use_experts_implementation decorator and add VeOmni fused MoE dispatch path",
@@ -242,7 +237,6 @@ class PatchedQwen3VLMoeTextExperts(nn.Module):
         top_k_weights: torch.Tensor,
     ) -> torch.Tensor:
         final_hidden_states = torch.zeros_like(hidden_states)
-        # --- Patch.2 ---
         if veomni_moe_experts_forward.use_non_eager_impl:
             return veomni_moe_experts_forward(self, hidden_states, top_k_index, top_k_weights)
         # --- Patch.2 ---
@@ -267,16 +261,6 @@ class PatchedQwen3VLMoeTextExperts(nn.Module):
         return final_hidden_states
 
 
-# ================================================================
-# Patch: Qwen3VLMoeModel.forward
-# MoE-specific clone of the dense qwen3_vl model forward. The shared
-# body (SP + precomputed position-id + dummy-forward + deepstack) is
-# identical, but the return type is `Qwen3VLMoeModelOutputWithPast`
-# which carries an extra `router_logits` field — dropping it on the
-# return statement would silence the MoE load-balancing loss (router
-# collapse) since `Qwen3VLMoeForConditionalGeneration.forward` reads
-# `outputs.router_logits`.
-# ================================================================
 @config.override_method(
     "Qwen3VLMoeModel.forward",
     description="VeOmni SP + precomputed position-id + dummy-forward + deepstack; preserve MoE router_logits",
@@ -307,7 +291,6 @@ def qwen3_vl_moe_model_forward_patched(
     if inputs_embeds is None:
         inputs_embeds = self.get_input_embeddings()(input_ids)
 
-    # --- Patch.2 ---
     image_mask = kwargs.pop("image_mask", None)
     video_mask = kwargs.pop("video_mask", None)
     if video_mask is None and image_mask is None:
@@ -318,19 +301,14 @@ def qwen3_vl_moe_model_forward_patched(
         else:
             input_ids_full = input_ids
         image_mask, video_mask = self.get_placeholder_mask(input_ids_full)
-    # --- Patch.2 ---
 
-    # --- Patch.3 ---
     flash_attn_kwargs = {}
     for key in ["cu_seq_lens_q", "cu_seq_lens_k", "max_length_q", "max_length_k"]:
         if key in kwargs:
             flash_attn_kwargs[key] = kwargs.pop(key)
-    # --- Patch.3 ---
 
-    # --- Patch.1 ---
     if get_parallel_state().sp_enabled:
         inputs_embeds = gather_outputs(inputs_embeds, gather_dim=1, group=get_parallel_state().sp_group)
-    # --- Patch.1 ---
 
     # --- Patch.6 ---
     # Mirror of qwen3_vl: unpack per-modality ViT kwargs from
@@ -363,14 +341,12 @@ def qwen3_vl_moe_model_forward_patched(
         image_embeds = image_outputs.pooler_output
         deepstack_image_embeds = image_outputs.deepstack_features
 
-        # --- Patch.1 ---
         if get_parallel_state().sp_enabled:
             image_embeds = gather_outputs(image_embeds, gather_dim=0, group=get_parallel_state().sp_group)
             deepstack_image_embeds = [
                 gather_outputs(embed, gather_dim=0, group=get_parallel_state().sp_group)
                 for embed in deepstack_image_embeds
             ]
-        # --- Patch.1 ---
 
         embeds_image_mask = (
             image_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device, non_blocking=True)
@@ -381,7 +357,6 @@ def qwen3_vl_moe_model_forward_patched(
         image_embeds = image_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
         inputs_embeds = inputs_embeds.masked_scatter(embeds_image_mask, image_embeds)
 
-        # --- Patch.1 ---
         if get_parallel_state().sp_enabled:
             seq_len = image_mask.shape[1]
             seq_per_rank = seq_len // get_parallel_state().sp_size
@@ -395,16 +370,13 @@ def qwen3_vl_moe_model_forward_patched(
             deepstack_image_embeds = [
                 embed[deepstack_offset : deepstack_offset + deepstack_len] for embed in deepstack_image_embeds
             ]
-        # --- Patch.1 ---
 
     elif get_parallel_state().fsdp_enabled:
-        # --- Patch.4 ---
         fake_vision = self.visual.dummy_forward()
         fake_embeds = fake_vision.pooler_output.mean() * 0.0
         fake_embeds = fake_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
         inputs_embeds = inputs_embeds + fake_embeds
         fake_deepstack = fake_vision.deepstack_features
-        # --- Patch.4 ---
 
     if pixel_values_videos is not None:
         video_outputs: BaseModelOutputWithDeepstackFeatures = self.get_video_features(
@@ -413,14 +385,12 @@ def qwen3_vl_moe_model_forward_patched(
         video_embeds = video_outputs.pooler_output
         deepstack_video_embeds = video_outputs.deepstack_features
 
-        # --- Patch.1 ---
         if get_parallel_state().sp_enabled:
             video_embeds = gather_outputs(video_embeds, gather_dim=0, group=get_parallel_state().sp_group)
             deepstack_video_embeds = [
                 gather_outputs(embed, gather_dim=0, group=get_parallel_state().sp_group)
                 for embed in deepstack_video_embeds
             ]
-        # --- Patch.1 ---
 
         embeds_video_mask = (
             video_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device, non_blocking=True)
@@ -430,7 +400,6 @@ def qwen3_vl_moe_model_forward_patched(
         video_embeds = video_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
         inputs_embeds = inputs_embeds.masked_scatter(embeds_video_mask, video_embeds)
 
-        # --- Patch.1 ---
         if get_parallel_state().sp_enabled:
             seq_len = video_mask.shape[1]
             seq_per_rank = seq_len // get_parallel_state().sp_size
@@ -444,22 +413,16 @@ def qwen3_vl_moe_model_forward_patched(
             deepstack_video_embeds = [
                 embed[deepstack_offset : deepstack_offset + deepstack_len] for embed in deepstack_video_embeds
             ]
-        # --- Patch.1 ---
 
     elif get_parallel_state().fsdp_enabled:
-        # --- Patch.4 ---
         fake_vision = self.visual.dummy_forward()
         fake_embeds = fake_vision.pooler_output.mean() * 0.0
         fake_embeds = fake_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
         inputs_embeds = inputs_embeds + fake_embeds
         fake_deepstack = fake_vision.deepstack_features
-        # --- Patch.4 ---
 
-    # --- Patch.1 ---
     if get_parallel_state().sp_enabled:
         inputs_embeds = slice_input_tensor(inputs_embeds, dim=1, group=get_parallel_state().sp_group)
-
-    # --- Patch.1 ---
 
     visual_pos_masks = None
     deepstack_visual_embeds = None
@@ -481,13 +444,10 @@ def qwen3_vl_moe_model_forward_patched(
         visual_pos_masks = video_mask
         deepstack_visual_embeds = deepstack_video_embeds
     else:
-        # --- Patch.4 ---
         if fake_deepstack is not None:
             deepstack_visual_embeds = fake_deepstack
-        # --- Patch.4 ---
 
     if position_ids is None:
-        # --- Patch.5 ---
         if isinstance(attention_mask, dict):
             attention_mask_tensor = attention_mask.get("full_attention", None)
         else:
@@ -506,16 +466,11 @@ def qwen3_vl_moe_model_forward_patched(
             attention_mask=attention_mask_tensor,
             past_key_values=past_key_values,
         )
-        # --- Patch.5 ---
     else:
-        # --- Patch.5 ---
         if position_ids.dim() == 3 and position_ids.shape[1] == 3:
             position_ids = position_ids.transpose(0, 1).contiguous()
-        # --- Patch.5 ---
 
-    # --- Patch.3 ---
     kwargs.update(flash_attn_kwargs)
-    # --- Patch.3 ---
 
     outputs = self.language_model(
         input_ids=None,
@@ -539,14 +494,6 @@ def qwen3_vl_moe_model_forward_patched(
     )
 
 
-# ================================================================
-# Patch: Qwen3VLMoeForConditionalGeneration.forward
-# 1. use the unified VeOmni fused loss_function path — avoids
-#    materializing full-vocab logits when labels is provided
-# 2. compute MoE aux_loss via upstream `load_balancing_loss_func` when
-#    `output_router_logits=True`; read config from `config.text_config`
-#    since the VLM top-level wraps a nested text config
-# ================================================================
 @config.override_method(
     "Qwen3VLMoeForConditionalGeneration.forward",
     description="Use VeOmni fused loss_function and MoE aux_loss path",
@@ -585,7 +532,6 @@ def qwen3_vl_moe_for_conditional_generation_forward_patched(
     slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
     hidden_states = hidden_states[:, slice_indices, :]
 
-    # --- Patch.1 ---
     loss = None
     logits = None
     fused_linear_aux = None
@@ -619,9 +565,7 @@ def qwen3_vl_moe_for_conditional_generation_forward_patched(
                 logits = None
     else:
         logits = self.lm_head(hidden_states)
-    # --- Patch.1 ---
 
-    # --- Patch.2 ---
     aux_loss = None
     if kwargs.get("output_router_logits", False):
         # Modification: OpSlot guard for load-balancing loss.
@@ -641,7 +585,6 @@ def qwen3_vl_moe_for_conditional_generation_forward_patched(
             )
         if labels is not None and isinstance(aux_loss, torch.Tensor):
             loss = loss + self.config.text_config.router_aux_loss_coef * aux_loss.to(loss.device)
-    # --- Patch.2 ---
 
     return Qwen3VLMoeCausalLMOutputWithLogProbs(
         loss=loss,
@@ -656,18 +599,11 @@ def qwen3_vl_moe_for_conditional_generation_forward_patched(
     )
 
 
-# ================================================================
-# Patch: Qwen3VLMoeForConditionalGeneration.get_parallel_plan
-# 1. register the expert parallel plan on the v5 generated modeling so
-#    `.mlp.experts.gate_up_proj` / `.down_proj` get `Shard(0)` under EP
-# ================================================================
 @config.override_method(
     "Qwen3VLMoeForConditionalGeneration.get_parallel_plan",
     description="Register Qwen3VLMoe expert parallel plan for v5 generated modeling",
 )
 def qwen3_vl_moe_get_parallel_plan_patched(self):
-    # --- Patch.1 ---
     from ..parallel_plan import get_parallel_plan as _get_parallel_plan
 
     return _get_parallel_plan()
-    # --- Patch.1 ---

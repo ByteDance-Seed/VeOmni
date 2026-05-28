@@ -23,6 +23,8 @@
 #      VeOmni SP + deepstack + precomputed max_seqlen; return BaseModelOutputWithDeepstackFeatures
 #    - method_override: Qwen3VLMoeVisionModel.dummy_forward
 #      Provide dummy vision forward for FSDP path with SP-aware shape
+#    - init_modification: Qwen3VLMoeTextAttention
+#      Replace separate q/k/v_proj Linears with a single FusedQKVLinear to skip per-forward QKV cat in the ws_push fused path
 #    - method_override: Qwen3VLMoeTextAttention.forward
 #      Route through async Ulysses fused QKV/Output projection when async_enabled
 #    - method_override: Qwen3VLMoeTextModel._deepstack_process
@@ -103,6 +105,7 @@ from veomni.distributed.sequence_parallel.async_ulysses import (
     async_ulysses_output_projection,
     async_ulysses_qkv_projection,
 )
+from veomni.models.modules.fused_qkv_linear import FusedQKVLinear
 
 # ── OpSlot declarations ──────────────────────────────────────────────────
 # Bound at model-build time by _bind_veomni_ops() in auto.py.
@@ -124,13 +127,12 @@ veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
 veomni_apply_rotary_pos_emb = OpSlot("rotary_pos_emb", "full")
 veomni_apply_rotary_pos_emb_vision = OpSlot("rotary_pos_emb_vision", "full")
 
-# ── OpSlot declarations ──────────────────────────────────────────────────
-# These are bound at model-build time by _bind_veomni_ops() in auto.py.
+# ── OpSlot declarations (MoE-specific; ``veomni_causal_lm_loss`` is
+# already injected via the inherited qwen3_vl post_import_block above) ──
 from veomni.ops.dispatch import OpSlot
 
 
 veomni_moe_experts_forward = OpSlot("moe_experts", "standard")
-veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
 veomni_load_balancing_loss = OpSlot("load_balancing_loss", "standard")
 
 
@@ -195,16 +197,18 @@ def _qwen3_vl_async_ulysses_attention_forward(
 
     unpadded_seq_len = hidden_states.size(1)
 
+    # ``self.qkv_proj`` is the FusedQKVLinear installed by the modify_init
+    # patch below — pass its single packed weight straight into the kernel
+    # to avoid the per-forward cat that the legacy three-Linear path would
+    # have done inside ``WsPushStateManager.get_or_build_for``.
     q, k, v = async_ulysses_qkv_projection(
         hidden_states=hidden_states,
         seq_dimension=1,
         head_dimension=2,
-        q_weight=self.q_proj.weight,
-        q_bias=self.q_proj.bias,
-        k_weight=self.k_proj.weight,
-        k_bias=self.k_proj.bias,
-        v_weight=self.v_proj.weight,
-        v_bias=self.v_proj.bias,
+        qkv_weight=self.qkv_proj.weight,
+        qkv_bias=self.qkv_proj.bias,
+        n_q=self.qkv_proj.n_q,
+        n_kv=self.qkv_proj.n_kv,
         norm_type="rmsnorm",
         norm_q_weight=self.q_norm.weight,
         norm_q_bias=None,
@@ -317,12 +321,6 @@ def collate_multimodal_metadata(batch, sp_pad):
         batch["multimodal_metadata"] = md
 
 
-# ======================================================================
-# [MODIFIED CLASS] Qwen3VLMoeTextRMSNorm
-# Methods patched: forward
-# ======================================================================
-
-
 @use_kernel_forward_from_hub("RMSNorm")
 class Qwen3VLMoeTextRMSNorm(nn.Module):
     def __init__(self, hidden_size, eps: float = 1e-6) -> None:
@@ -355,15 +353,6 @@ class Qwen3VLMoeTextRMSNorm(nn.Module):
 # Reason: Drop @use_experts_implementation decorator and add VeOmni fused MoE dispatch path
 # Source: veomni.models.transformers.qwen3_vl_moe.qwen3_vl_moe_gpu_patch_gen_config
 # ======================================================================
-# ================================================================
-# Patch: Qwen3VLMoeTextExperts
-# 1. drop the upstream `@use_experts_implementation` decorator — routing
-#    through `ALL_EXPERTS_FUNCTIONS` bypasses our fused kernel
-# 2. add VeOmni fused MoE dispatch via the module-level
-#    ``veomni_moe_experts_forward`` OpSlot; pass `gate_up_proj` directly
-#    as `fc1_1_2_weight` (the v5 modeling already stores it in the
-#    `[E, 2*I, H]` fused layout, so no chunk + contiguous overhead is needed)
-# ================================================================
 class Qwen3VLMoeTextExperts(nn.Module):
     """Collection of expert weights stored as 3D tensors.
 
@@ -390,7 +379,6 @@ class Qwen3VLMoeTextExperts(nn.Module):
         top_k_weights: torch.Tensor,
     ) -> torch.Tensor:
         final_hidden_states = torch.zeros_like(hidden_states)
-        # --- Patch.2 ---
         if veomni_moe_experts_forward.use_non_eager_impl:
             return veomni_moe_experts_forward(self, hidden_states, top_k_index, top_k_weights)
         # --- Patch.2 ---
@@ -516,12 +504,6 @@ def apply_rotary_pos_emb(
     return q_embed, k_embed
 
 
-# ======================================================================
-# [MODIFIED CLASS] Qwen3VLMoeTextAttention
-# Methods patched: forward
-# ======================================================================
-
-
 @use_kernelized_func(apply_rotary_pos_emb)
 class Qwen3VLMoeTextAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
@@ -556,13 +538,6 @@ class Qwen3VLMoeTextAttention(nn.Module):
             self.head_dim, eps=config.rms_norm_eps
         )  # thus post q_norm does not need reshape
 
-    # ================================================================
-    # Patch: Qwen3VLMoeTextAttention.forward
-    # 1. route through the async Ulysses fused QKV/Output projection path
-    #    (defined via add_post_import_block as a module-level helper) when
-    #    `get_parallel_state().async_enabled` is True; otherwise fall
-    #    through to the upstream logic unchanged
-    # ================================================================
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -572,7 +547,6 @@ class Qwen3VLMoeTextAttention(nn.Module):
         cache_position: torch.LongTensor | None = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        # --- Patch.1 ---
         if get_parallel_state().async_enabled:
             return _qwen3_vl_async_ulysses_attention_forward(  # noqa: F821 defined via add_post_import_block
                 self,
@@ -581,14 +555,17 @@ class Qwen3VLMoeTextAttention(nn.Module):
                 position_embeddings=position_embeddings,
                 **kwargs,
             )
-        # --- Patch.1 ---
 
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
 
-        query_states = self.q_norm(self.q_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
-        key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
-        value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        # FusedQKVLinear: one F.linear + 3-way output slice replaces the prior
+        # three independent ``self.q_proj / k_proj / v_proj`` calls. The fused
+        # module exposes the same on-disk state_dict layout via its hooks.
+        q_raw, k_raw, v_raw = self.qkv_proj(hidden_states)
+        query_states = self.q_norm(q_raw.view(hidden_shape)).transpose(1, 2)
+        key_states = self.k_norm(k_raw.view(hidden_shape)).transpose(1, 2)
+        value_states = v_raw.view(hidden_shape).transpose(1, 2)
 
         cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
@@ -755,12 +732,6 @@ def apply_rotary_pos_emb_vision(q, k, cos, sin, position_ids=None, unsqueeze_dim
     return q_embed, k_embed
 
 
-# ======================================================================
-# [MODIFIED CLASS] Qwen3VLMoeVisionAttention
-# Methods patched: forward
-# ======================================================================
-
-
 class Qwen3VLMoeVisionAttention(nn.Module):
     def __init__(self, config: Qwen3VLMoeVisionConfig) -> None:
         super().__init__()
@@ -775,19 +746,11 @@ class Qwen3VLMoeVisionAttention(nn.Module):
         self.attention_dropout = 0.0
         self.is_causal = False
 
-    # ================================================================
-    # Patch: Qwen3VLMoeVisionAttention.forward
-    # 1. accept precomputed max_seqlen from outer forward so the
-    #    `(cu_seqlens[1:] - cu_seqlens[:-1]).max()` CPU-GPU sync happens once
-    #    (hoisted to the outer visual forward) instead of once per layer
-    # ================================================================
     def forward(
         self,
         hidden_states: torch.Tensor,
         cu_seqlens: torch.Tensor,
-        # --- Patch.1 ---
         max_seqlen: int,
-        # --- Patch.1 ---
         rotary_pos_emb: torch.Tensor | None = None,
         position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
         **kwargs,
@@ -808,9 +771,7 @@ class Qwen3VLMoeVisionAttention(nn.Module):
         )
 
         if is_flash_attention_requested(self.config):
-            # --- Patch.1 ---
             # max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
-            # --- Patch.1 ---
             attn_output, _ = attention_interface(
                 self,
                 query_states,
@@ -865,12 +826,6 @@ class Qwen3VLMoeVisionMLP(nn.Module):
         return self.linear_fc2(self.act_fn(self.linear_fc1(hidden_state)))
 
 
-# ======================================================================
-# [MODIFIED CLASS] Qwen3VLMoeVisionBlock
-# Methods patched: forward
-# ======================================================================
-
-
 class Qwen3VLMoeVisionBlock(GradientCheckpointingLayer):
     def __init__(self, config, attn_implementation: str = "sdpa") -> None:
         super().__init__()
@@ -879,18 +834,11 @@ class Qwen3VLMoeVisionBlock(GradientCheckpointingLayer):
         self.attn = Qwen3VLMoeVisionAttention(config=config)
         self.mlp = Qwen3VLMoeVisionMLP(config=config)
 
-    # ================================================================
-    # Patch: Qwen3VLMoeVisionBlock.forward
-    # 1. thread the precomputed max_seqlen down into the attention call
-    #    (paired with the Qwen3VLMoeVisionAttention.forward patch above)
-    # ================================================================
     def forward(
         self,
         hidden_states: torch.Tensor,
         cu_seqlens: torch.Tensor,
-        # --- Patch.1 ---
         max_seqlen: int,
-        # --- Patch.1 ---
         rotary_pos_emb: torch.Tensor | None = None,
         position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
         **kwargs,
@@ -898,9 +846,7 @@ class Qwen3VLMoeVisionBlock(GradientCheckpointingLayer):
         hidden_states = hidden_states + self.attn(
             self.norm1(hidden_states),
             cu_seqlens=cu_seqlens,
-            # --- Patch.1 ---
             max_seqlen=max_seqlen,
-            # --- Patch.1 ---
             rotary_pos_emb=rotary_pos_emb,
             position_embeddings=position_embeddings,
             **kwargs,
@@ -956,12 +902,6 @@ class Qwen3VLMoeVisionPatchMerger(nn.Module):
         return x
 
 
-# ======================================================================
-# [MODIFIED CLASS] Qwen3VLMoeVisionModel
-# Methods patched: rot_pos_emb, fast_pos_embed_interpolate, forward, dummy_forward
-# ======================================================================
-
-
 class Qwen3VLMoeVisionModel(Qwen3VLMoePreTrainedModel):
     config: Qwen3VLMoeVisionConfig
     _no_split_modules = ["Qwen3VLMoeVisionBlock"]
@@ -1008,12 +948,6 @@ class Qwen3VLMoeVisionModel(Qwen3VLMoePreTrainedModel):
 
         self.post_init()
 
-    # ================================================================
-    # Patch: Qwen3VLMoeVisionModel.rot_pos_emb
-    # 1. swap the upstream Python-list-indexed grid builder for a vllm-style
-    #    lru_cached `rot_pos_ids` helper keyed on `(h, w, merge_size)` so
-    #    repeated (h, w) tiles across a batch hit the cache
-    # ================================================================
     def rot_pos_emb(self, grid_thw) -> torch.Tensor:
         # --- Patch.1 ---
         merge_size = self.spatial_merge_size
@@ -1047,17 +981,8 @@ class Qwen3VLMoeVisionModel(Qwen3VLMoePreTrainedModel):
         embeddings = freq_table[pos_ids]
         embeddings = embeddings.flatten(1)
         return embeddings
-        # --- Patch.1 ---
 
-    # ================================================================
-    # Patch: Qwen3VLMoeVisionModel.fast_pos_embed_interpolate
-    # 1. a fully-tensorized vllm-adapted implementation — replaces the
-    #    upstream per-image Python list extend / tolist path with
-    #    meshgrid-based bilinear weight synthesis so the whole batch stays
-    #    on device (also avoids the final torch.split + per-image permute)
-    # ================================================================
     def fast_pos_embed_interpolate(self, grid_thw):
-        # --- Patch.1 ---
         num_grid_per_side = self.num_grid_per_side
         m_size = self.spatial_merge_size
         hidden_dim = self.pos_embed.embedding_dim
@@ -1111,22 +1036,7 @@ class Qwen3VLMoeVisionModel(Qwen3VLMoePreTrainedModel):
             outputs.append(repeated)
 
         return torch.cat(outputs, dim=0)
-        # --- Patch.1 ---
 
-    # ================================================================
-    # Patch: Qwen3VLMoeVisionModel.forward
-    # 1. SP pad pos_embeds / cos / sin so sharded hidden_states get the
-    #    matching pos embedding (pad_scale=4 matches the upstream SP
-    #    sharding scale used for ViT inputs)
-    # 2. use pre-padding cu_seqlens[-1] as the un-sliced total seq length
-    # 3. when SP is enabled, extend cu_seqlens with the SP-padded sentinel
-    #    so the padded tokens belong to a valid attention window
-    # 4. precompute max_seqlen once here (single CPU-GPU sync hoisted out
-    #    of the attention layer loop) and thread it into each block
-    # 5. on NPU, move cu_seqlens to CPU — NPU FA2 varlen path requires it
-    # 6. return BaseModelOutputWithDeepstackFeatures (v5 contract: the v4
-    #    path returned `(merged, deepstack_list)` as a bare tuple)
-    # ================================================================
     @merge_with_config_defaults
     @capture_outputs
     def forward(
@@ -1155,10 +1065,8 @@ class Qwen3VLMoeVisionModel(Qwen3VLMoePreTrainedModel):
 
         pos_embeds = self.fast_pos_embed_interpolate(grid_thw_list)
 
-        # --- Patch.1 ---
         if get_parallel_state().sp_enabled:
             pos_embeds = sp_pad_and_slice(pos_embeds, dim=0, pad_value=0, pad_scale=4)
-        # --- Patch.1 ---
 
         hidden_states = hidden_states + pos_embeds
 
@@ -1196,21 +1104,17 @@ class Qwen3VLMoeVisionModel(Qwen3VLMoePreTrainedModel):
         # --- Patch.2 ---
         # total_seq_len is already a Python int — no sync to use it as a shape arg.
         rotary_pos_emb = rotary_pos_emb.reshape(total_seq_len, -1)
-        # --- Patch.2 ---
 
         emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
         position_embeddings = (emb.cos(), emb.sin())
 
         sp_pad_seq_len = 0
         if get_parallel_state().sp_enabled:
-            # --- Patch.1 ---
             cos, sin = position_embeddings
             cos = sp_pad_and_slice(cos, dim=0, pad_value=0, pad_scale=4)
             sin = sp_pad_and_slice(sin, dim=0, pad_value=0, pad_scale=4)
             position_embeddings = (cos, sin)
-            # --- Patch.1 ---
 
-            # --- Patch.3 ---
             sp_size = get_parallel_state().sp_size
             # total_seq_len is already a host int — no `.item()` sync needed here.
             sp_pad_seq_len = seq_len * sp_size - total_seq_len
@@ -1220,7 +1124,6 @@ class Qwen3VLMoeVisionModel(Qwen3VLMoePreTrainedModel):
             if sp_pad_seq_len > 0 and precomputed_cu_seqlens is None:
                 new_cumsum = cu_seqlens[-1] + sp_pad_seq_len
                 cu_seqlens = torch.cat([cu_seqlens, new_cumsum.unsqueeze(0)], dim=0)
-            # --- Patch.3 ---
 
         deepstack_feature_lists = []
 
@@ -1235,18 +1138,14 @@ class Qwen3VLMoeVisionModel(Qwen3VLMoePreTrainedModel):
                 max_seqlen = max(max_seqlen, sp_pad_seq_len)
         # --- Patch.4 ---
 
-        # --- Patch.5 ---
         if IS_NPU_AVAILABLE:
             cu_seqlens = cu_seqlens.cpu()
-        # --- Patch.5 ---
 
         for layer_num, blk in enumerate(self.blocks):
             hidden_states = blk(
                 hidden_states,
                 cu_seqlens=cu_seqlens,
-                # --- Patch.4 ---
                 max_seqlen=max_seqlen,
-                # --- Patch.4 ---
                 position_embeddings=position_embeddings,
                 **kwargs,
             )
@@ -1258,31 +1157,13 @@ class Qwen3VLMoeVisionModel(Qwen3VLMoePreTrainedModel):
 
         merged_hidden_states = self.merger(hidden_states)
 
-        # --- Patch.6 ---
         return BaseModelOutputWithDeepstackFeatures(
             last_hidden_state=hidden_states,
             pooler_output=merged_hidden_states,
             deepstack_features=deepstack_feature_lists,
         )
-        # --- Patch.6 ---
 
-    # ================================================================
-    # Patch: Qwen3VLMoeVisionModel.dummy_forward (new)
-    # 1. add dummy_forward so ranks without pixel_values can still run the
-    #    visual encoder under FSDP — otherwise reduce-scatter hangs when
-    #    some ranks get None pixel_values while others have real images
-    # 2. SP-aware shape: grid_thw is built at the FULL un-sliced size (height
-    #    scaled by sp_size) and pixel_values are then SP-pre-sliced with
-    #    pad_scale=4, mirroring what MainCollator does for real pixel_values
-    #    via DataCollateInfo(0, True, 0, 4). This keeps hidden_states (after
-    #    patch_embed) and pos_embeds (which fast_pos_embed_interpolate computes
-    #    from the FULL grid_thw and forward.sp_pad_and_slice's down to per-rank)
-    #    at the same dim-0 size for the `hidden_states + pos_embeds` add. Shapes
-    #    are derived from the vision config (patch_size / temporal_patch_size /
-    #    in_channels / spatial_merge_size) so model variants don't break.
-    # ================================================================
     def dummy_forward(self):
-        # --- Patch.1 ---
         # Derive dummy shape from config so variants with different patch sizes /
         # channel counts work without silent breakage:
         #   - pixel row:  in_channels * temporal_patch_size * patch_size**2
@@ -1298,19 +1179,16 @@ class Qwen3VLMoeVisionModel(Qwen3VLMoePreTrainedModel):
         h_base = 2 * merge_size
         w = 2 * merge_size
 
-        # --- Patch.2 ---
         if get_parallel_state().sp_enabled:
             h = h_base * get_parallel_state().sp_size
         else:
             h = h_base
-        # --- Patch.2 ---
 
         num_patches = t * h * w
         pixel_row_size = in_channels * temporal_patch_size * patch_size * patch_size
         pixel_values = torch.zeros((num_patches, pixel_row_size), dtype=self.dtype, device=self.device)
         grid_thw = torch.tensor([[t, h, w]], dtype=torch.int32, device=self.device)
 
-        # --- Patch.3 ---
         # Match MainCollator's per-rank slicing of `pixel_values` (DataCollateInfo
         # pack_dim=0, sp_slice=True, sp_pad_value=0, sp_pad_scale=4) so that the
         # synthesized batch enters forward at the same per-rank size the real
@@ -1319,7 +1197,6 @@ class Qwen3VLMoeVisionModel(Qwen3VLMoePreTrainedModel):
         # `hidden_states + pos_embeds` mismatches at dim 0 by sp_size.
         if get_parallel_state().sp_enabled:
             pixel_values = sp_pad_and_slice(pixel_values, dim=0, pad_value=0, pad_scale=4)
-        # --- Patch.3 ---
 
         # --- Patch.4 ---
         # Precompute the ViT metadata host-side and pass it straight to forward.
@@ -1429,12 +1306,6 @@ class Qwen3VLMoeTextRotaryEmbedding(nn.Module):
             idx = slice(offset, length, 3)
             freqs_t[..., idx] = freqs[dim, ..., idx]
         return freqs_t
-
-
-# ======================================================================
-# [MODIFIED CLASS] Qwen3VLMoeTextModel
-# Methods patched: _deepstack_process
-# ======================================================================
 
 
 @auto_docstring(
@@ -1558,22 +1429,13 @@ class Qwen3VLMoeTextModel(Qwen3VLMoePreTrainedModel):
             past_key_values=past_key_values,
         )
 
-    # ================================================================
-    # Patch: Qwen3VLMoeTextModel._deepstack_process
-    # 1. handle the case where `visual_pos_masks is None` (both image and
-    #    video pixel_values were None on this rank) — still touch
-    #    visual_embeds so FSDP sees the params; add 0.0 so gradients flow
-    #    without mutating hidden_states
-    # ================================================================
     def _deepstack_process(
         self, hidden_states: torch.Tensor, visual_pos_masks: torch.Tensor, visual_embeds: torch.Tensor
     ):
-        # --- Patch.1 ---
         if visual_pos_masks is None:
             visual_embeds = visual_embeds.to(hidden_states.device, hidden_states.dtype)
             hidden_states = hidden_states + visual_embeds.mean() * 0.0
             return hidden_states
-        # --- Patch.1 ---
 
         visual_pos_masks = visual_pos_masks.to(hidden_states.device)
         visual_embeds = visual_embeds.to(hidden_states.device, hidden_states.dtype)
@@ -1637,12 +1499,6 @@ class Qwen3VLMoeCausalLMOutputWithPast(ModelOutput):
     rope_deltas: torch.LongTensor | None = None
     router_logits: tuple[torch.FloatTensor] | None = None
     aux_loss: torch.FloatTensor | None = None
-
-
-# ======================================================================
-# [MODIFIED CLASS] Qwen3VLMoeModel
-# Methods patched: get_image_features, get_placeholder_mask, forward
-# ======================================================================
 
 
 @auto_docstring
@@ -1775,13 +1631,6 @@ class Qwen3VLMoeModel(Qwen3VLMoePreTrainedModel):
         # Same implementation as for images
         return self.get_image_features(pixel_values_videos, video_grid_thw, **kwargs)
 
-    # ================================================================
-    # Patch: Qwen3VLMoeModel.get_image_features
-    # 1. skip the upstream `torch.split(image_embeds, split_sizes)` — VeOmni
-    #    needs the flat tensor for SP all-to-all, and the downstream
-    #    masked_scatter is indexed by a single n_image_tokens slice rather
-    #    than a per-image tuple
-    # ================================================================
     @can_return_tuple
     @auto_docstring
     def get_image_features(
@@ -1798,20 +1647,11 @@ class Qwen3VLMoeModel(Qwen3VLMoePreTrainedModel):
         vision_output: BaseModelOutputWithDeepstackFeatures = self.visual(
             pixel_values, grid_thw=image_grid_thw, return_dict=True, **kwargs
         )
-        # --- Patch.1 ---
         # image_embeds = vision_output.pooler_output
         # split_sizes = (image_grid_thw.prod(-1) // self.visual.spatial_merge_size**2).tolist()
         # vision_output.pooler_output = torch.split(image_embeds, split_sizes)
-        # --- Patch.1 ---
         return vision_output
 
-    # ================================================================
-    # Patch: Qwen3VLMoeModel.get_placeholder_mask
-    # 1. return raw (image_mask, video_mask) bool tensors without the
-    #    HF v5 `inputs_embeds` / `*_features` shape-validation branch —
-    #    VeOmni needs the masks on the *full* all-gathered input_ids,
-    #    which have a different seq-len than the SP-sliced inputs_embeds
-    # ================================================================
     def get_placeholder_mask(
         self,
         input_ids: torch.LongTensor,
@@ -1819,10 +1659,8 @@ class Qwen3VLMoeModel(Qwen3VLMoePreTrainedModel):
         image_features: torch.FloatTensor | None = None,
         video_features: torch.FloatTensor | None = None,
     ):
-        # --- Patch.1 ---
         special_image_mask = input_ids == self.config.image_token_id
         special_video_mask = input_ids == self.config.video_token_id
-        # --- Patch.1 ---
         return special_image_mask, special_video_mask
 
     def compute_3d_position_ids(
@@ -1862,16 +1700,6 @@ class Qwen3VLMoeModel(Qwen3VLMoePreTrainedModel):
             position_ids = None
         return position_ids
 
-    # ================================================================
-    # Patch: Qwen3VLMoeModel.forward
-    # MoE-specific clone of the dense qwen3_vl model forward. The shared
-    # body (SP + precomputed position-id + dummy-forward + deepstack) is
-    # identical, but the return type is `Qwen3VLMoeModelOutputWithPast`
-    # which carries an extra `router_logits` field — dropping it on the
-    # return statement would silence the MoE load-balancing loss (router
-    # collapse) since `Qwen3VLMoeForConditionalGeneration.forward` reads
-    # `outputs.router_logits`.
-    # ================================================================
     @auto_docstring
     @can_return_tuple
     def forward(
@@ -1900,7 +1728,6 @@ class Qwen3VLMoeModel(Qwen3VLMoePreTrainedModel):
         if inputs_embeds is None:
             inputs_embeds = self.get_input_embeddings()(input_ids)
 
-        # --- Patch.2 ---
         image_mask = kwargs.pop("image_mask", None)
         video_mask = kwargs.pop("video_mask", None)
         if video_mask is None and image_mask is None:
@@ -1911,19 +1738,14 @@ class Qwen3VLMoeModel(Qwen3VLMoePreTrainedModel):
             else:
                 input_ids_full = input_ids
             image_mask, video_mask = self.get_placeholder_mask(input_ids_full)
-        # --- Patch.2 ---
 
-        # --- Patch.3 ---
         flash_attn_kwargs = {}
         for key in ["cu_seq_lens_q", "cu_seq_lens_k", "max_length_q", "max_length_k"]:
             if key in kwargs:
                 flash_attn_kwargs[key] = kwargs.pop(key)
-        # --- Patch.3 ---
 
-        # --- Patch.1 ---
         if get_parallel_state().sp_enabled:
             inputs_embeds = gather_outputs(inputs_embeds, gather_dim=1, group=get_parallel_state().sp_group)
-        # --- Patch.1 ---
 
         # --- Patch.6 ---
         # Mirror of qwen3_vl: unpack per-modality ViT kwargs from
@@ -1956,14 +1778,12 @@ class Qwen3VLMoeModel(Qwen3VLMoePreTrainedModel):
             image_embeds = image_outputs.pooler_output
             deepstack_image_embeds = image_outputs.deepstack_features
 
-            # --- Patch.1 ---
             if get_parallel_state().sp_enabled:
                 image_embeds = gather_outputs(image_embeds, gather_dim=0, group=get_parallel_state().sp_group)
                 deepstack_image_embeds = [
                     gather_outputs(embed, gather_dim=0, group=get_parallel_state().sp_group)
                     for embed in deepstack_image_embeds
                 ]
-            # --- Patch.1 ---
 
             embeds_image_mask = (
                 image_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device, non_blocking=True)
@@ -1974,7 +1794,6 @@ class Qwen3VLMoeModel(Qwen3VLMoePreTrainedModel):
             image_embeds = image_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
             inputs_embeds = inputs_embeds.masked_scatter(embeds_image_mask, image_embeds)
 
-            # --- Patch.1 ---
             if get_parallel_state().sp_enabled:
                 seq_len = image_mask.shape[1]
                 seq_per_rank = seq_len // get_parallel_state().sp_size
@@ -1988,16 +1807,13 @@ class Qwen3VLMoeModel(Qwen3VLMoePreTrainedModel):
                 deepstack_image_embeds = [
                     embed[deepstack_offset : deepstack_offset + deepstack_len] for embed in deepstack_image_embeds
                 ]
-            # --- Patch.1 ---
 
         elif get_parallel_state().fsdp_enabled:
-            # --- Patch.4 ---
             fake_vision = self.visual.dummy_forward()
             fake_embeds = fake_vision.pooler_output.mean() * 0.0
             fake_embeds = fake_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
             inputs_embeds = inputs_embeds + fake_embeds
             fake_deepstack = fake_vision.deepstack_features
-            # --- Patch.4 ---
 
         if pixel_values_videos is not None:
             video_outputs: BaseModelOutputWithDeepstackFeatures = self.get_video_features(
@@ -2006,14 +1822,12 @@ class Qwen3VLMoeModel(Qwen3VLMoePreTrainedModel):
             video_embeds = video_outputs.pooler_output
             deepstack_video_embeds = video_outputs.deepstack_features
 
-            # --- Patch.1 ---
             if get_parallel_state().sp_enabled:
                 video_embeds = gather_outputs(video_embeds, gather_dim=0, group=get_parallel_state().sp_group)
                 deepstack_video_embeds = [
                     gather_outputs(embed, gather_dim=0, group=get_parallel_state().sp_group)
                     for embed in deepstack_video_embeds
                 ]
-            # --- Patch.1 ---
 
             embeds_video_mask = (
                 video_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device, non_blocking=True)
@@ -2023,7 +1837,6 @@ class Qwen3VLMoeModel(Qwen3VLMoePreTrainedModel):
             video_embeds = video_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
             inputs_embeds = inputs_embeds.masked_scatter(embeds_video_mask, video_embeds)
 
-            # --- Patch.1 ---
             if get_parallel_state().sp_enabled:
                 seq_len = video_mask.shape[1]
                 seq_per_rank = seq_len // get_parallel_state().sp_size
@@ -2037,22 +1850,16 @@ class Qwen3VLMoeModel(Qwen3VLMoePreTrainedModel):
                 deepstack_video_embeds = [
                     embed[deepstack_offset : deepstack_offset + deepstack_len] for embed in deepstack_video_embeds
                 ]
-            # --- Patch.1 ---
 
         elif get_parallel_state().fsdp_enabled:
-            # --- Patch.4 ---
             fake_vision = self.visual.dummy_forward()
             fake_embeds = fake_vision.pooler_output.mean() * 0.0
             fake_embeds = fake_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
             inputs_embeds = inputs_embeds + fake_embeds
             fake_deepstack = fake_vision.deepstack_features
-            # --- Patch.4 ---
 
-        # --- Patch.1 ---
         if get_parallel_state().sp_enabled:
             inputs_embeds = slice_input_tensor(inputs_embeds, dim=1, group=get_parallel_state().sp_group)
-
-        # --- Patch.1 ---
 
         visual_pos_masks = None
         deepstack_visual_embeds = None
@@ -2074,13 +1881,10 @@ class Qwen3VLMoeModel(Qwen3VLMoePreTrainedModel):
             visual_pos_masks = video_mask
             deepstack_visual_embeds = deepstack_video_embeds
         else:
-            # --- Patch.4 ---
             if fake_deepstack is not None:
                 deepstack_visual_embeds = fake_deepstack
-            # --- Patch.4 ---
 
         if position_ids is None:
-            # --- Patch.5 ---
             if isinstance(attention_mask, dict):
                 attention_mask_tensor = attention_mask.get("full_attention", None)
             else:
@@ -2099,16 +1903,11 @@ class Qwen3VLMoeModel(Qwen3VLMoePreTrainedModel):
                 attention_mask=attention_mask_tensor,
                 past_key_values=past_key_values,
             )
-            # --- Patch.5 ---
         else:
-            # --- Patch.5 ---
             if position_ids.dim() == 3 and position_ids.shape[1] == 3:
                 position_ids = position_ids.transpose(0, 1).contiguous()
-            # --- Patch.5 ---
 
-        # --- Patch.3 ---
         kwargs.update(flash_attn_kwargs)
-        # --- Patch.3 ---
 
         outputs = self.language_model(
             input_ids=None,
@@ -2214,12 +2013,6 @@ def load_balancing_loss_func(
     return overall_loss * num_experts
 
 
-# ======================================================================
-# [MODIFIED CLASS] Qwen3VLMoeForConditionalGeneration
-# Methods patched: get_position_id_func, get_metadata_collate_func, forward, get_parallel_plan
-# ======================================================================
-
-
 class Qwen3VLMoeForConditionalGeneration(Qwen3VLMoePreTrainedModel, GenerationMixin):
     _checkpoint_conversion_mapping = {}
     _tied_weights_keys = {"lm_head.weight": "model.language_model.embed_tokens.weight"}
@@ -2272,14 +2065,6 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLMoePreTrainedModel, GenerationMi
         """
         return self.model.get_image_features(pixel_values=pixel_values, image_grid_thw=image_grid_thw, **kwargs)
 
-    # ================================================================
-    # Patch: Qwen3VLMoeForConditionalGeneration.forward
-    # 1. use the unified VeOmni fused loss_function path — avoids
-    #    materializing full-vocab logits when labels is provided
-    # 2. compute MoE aux_loss via upstream `load_balancing_loss_func` when
-    #    `output_router_logits=True`; read config from `config.text_config`
-    #    since the VLM top-level wraps a nested text config
-    # ================================================================
     @can_return_tuple
     def forward(
         self,
@@ -2315,7 +2100,6 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLMoePreTrainedModel, GenerationMi
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
         hidden_states = hidden_states[:, slice_indices, :]
 
-        # --- Patch.1 ---
         loss = None
         logits = None
         fused_linear_aux = None
@@ -2349,9 +2133,7 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLMoePreTrainedModel, GenerationMi
                     logits = None
         else:
             logits = self.lm_head(hidden_states)
-        # --- Patch.1 ---
 
-        # --- Patch.2 ---
         aux_loss = None
         if kwargs.get("output_router_logits", False):
             # Modification: OpSlot guard for load-balancing loss.
@@ -2371,7 +2153,6 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLMoePreTrainedModel, GenerationMi
                 )
             if labels is not None and isinstance(aux_loss, torch.Tensor):
                 loss = loss + self.config.text_config.router_aux_loss_coef * aux_loss.to(loss.device)
-        # --- Patch.2 ---
 
         return Qwen3VLMoeCausalLMOutputWithLogProbs(
             loss=loss,
@@ -2609,24 +2390,12 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLMoePreTrainedModel, GenerationMi
 
         return input_ids, model_kwargs
 
-    # ================================================================
-    # Patch: Qwen3VLMoeForConditionalGeneration.get_position_id_func (new)
-    # 1. wrap Qwen3VLMoeModel.get_rope_index so the VeOmni data pipeline can
-    #    precompute multimodal position_ids on CPU worker processes
-    # 2. overwrite multimodal token ids with VeOmni constants
-    #    (IMAGE_INPUT_INDEX / VIDEO_INPUT_INDEX) so input_ids produced by
-    #    our data pipeline match the fake config here
-    # ================================================================
     def get_position_id_func(self):
-        # --- Patch.1 ---
         fake_config = copy.copy(self.config)
-        # --- Patch.2 ---
         fake_config.image_token_id = IMAGE_INPUT_INDEX
         fake_config.video_token_id = VIDEO_INPUT_INDEX
-        # --- Patch.2 ---
         fake_model = SimpleNamespace(config=fake_config)
         return partial(get_position_id, Qwen3VLMoeModel.get_rope_index, fake_model)  # noqa: F821 defined via add_post_import_block
-        # --- Patch.1 ---
 
     # ================================================================
     # Patch: Qwen3VLMoeForConditionalGeneration.get_metadata_collate_func (new)
@@ -2642,17 +2411,10 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLMoePreTrainedModel, GenerationMi
         # DataLoader workers; the Qwen3-VL-family formula needs no model config.
         return collate_multimodal_metadata  # noqa: F821 defined via add_helper
 
-    # ================================================================
-    # Patch: Qwen3VLMoeForConditionalGeneration.get_parallel_plan
-    # 1. register the expert parallel plan on the v5 generated modeling so
-    #    `.mlp.experts.gate_up_proj` / `.down_proj` get `Shard(0)` under EP
-    # ================================================================
     def get_parallel_plan(self):
-        # --- Patch.1 ---
         from ..parallel_plan import get_parallel_plan as _get_parallel_plan
 
         return _get_parallel_plan()
-        # --- Patch.1 ---
 
 
 __all__ = [
@@ -2662,3 +2424,53 @@ __all__ = [
     "Qwen3VLMoePreTrainedModel",
     "Qwen3VLMoeTextModel",
 ]
+
+
+# ======================================================================
+# [INIT MODIFICATION] Qwen3VLMoeTextAttention
+# Reason: Replace separate q/k/v_proj Linears with a single FusedQKVLinear to skip per-forward QKV cat in the ws_push fused path
+# ======================================================================
+
+
+# ================================================================
+# Init patch: Qwen3VLTextAttention — fuse q/k/v_proj into FusedQKVLinear
+# 1. let original_init create the three separate ``nn.Linear`` modules
+#    (and o_proj / q_norm / k_norm, which we keep unchanged)
+# 2. cat their initialized weights into a single FusedQKVLinear, then
+#    delete the three originals so FSDP2 wraps only the fused Parameter
+#    (otherwise we'd waste HBM with three sharded shadows of the same
+#    weight). The state_dict translation hooks on FusedQKVLinear keep
+#    the HF on-disk ``q_proj/k_proj/v_proj.weight`` layout intact.
+#
+# The function lives at module scope (rather than as an inline decorator
+# call) so the NPU / MoE configs can import it and re-register the same
+# init patch against ``Qwen3VLMoeTextAttention`` via name_map.
+# ================================================================
+def qwen3_vl_text_attention_init_patched(original_init, self, *args, **kwargs):
+    """Replace separate q_proj/k_proj/v_proj with FusedQKVLinear.
+
+    Called by patchgen's INIT_MODIFICATION machinery after wrapping the
+    upstream ``__init__``; ``original_init`` is the source-module's bound
+    initializer.
+    """
+    original_init(self, *args, **kwargs)
+    # Build the fused module from the just-initialized Linears so that
+    # the fresh random init in HF's source code is preserved bit-exactly.
+    qkv = FusedQKVLinear.from_separate_linears(
+        self.q_proj,
+        self.k_proj,
+        self.v_proj,
+        head_dim=self.head_dim,
+    )
+    self.qkv_proj = qkv
+    del self.q_proj, self.k_proj, self.v_proj
+
+
+_orig_init_Qwen3VLMoeTextAttention = Qwen3VLMoeTextAttention.__init__
+
+
+def _patched_init_Qwen3VLMoeTextAttention(self, *args, **kwargs):
+    return qwen3_vl_text_attention_init_patched(_orig_init_Qwen3VLMoeTextAttention, self, *args, **kwargs)
+
+
+Qwen3VLMoeTextAttention.__init__ = _patched_init_Qwen3VLMoeTextAttention
