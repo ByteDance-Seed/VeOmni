@@ -28,9 +28,12 @@ The generated file will:
 
 import ast
 import importlib
+import importlib.util
 import inspect
 import re
+import sys
 import textwrap
+import types
 from pathlib import Path
 from typing import Any, Optional
 
@@ -41,6 +44,24 @@ class CodegenError(Exception):
     """Exception raised during code generation."""
 
     pass
+
+
+def _find_module_file(module_name: str) -> Optional[Path]:
+    """Walk ``sys.path`` (and CWD) to locate ``module_name`` as a ``.py`` file.
+
+    Returns the first matching path or ``None`` when nothing is found. We do
+    not import the module — important for drift checking from CI lint envs
+    where the upstream HF modeling file would otherwise pull in ``torch`` /
+    GPU kernels just to read its source.
+    """
+    parts = module_name.split(".")
+    rel = Path(*parts).with_suffix(".py")
+    candidates = [Path(root) / rel for root in sys.path if root]
+    candidates.append(Path.cwd() / rel)
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    return None
 
 
 def get_module_source(module_name: str) -> str:
@@ -54,8 +75,24 @@ def get_module_source(module_name: str) -> str:
         The source code as a string.
 
     Raises:
-        CodegenError: If the module cannot be imported or source cannot be obtained.
+        CodegenError: If the source cannot be obtained.
+
+    Resolution order:
+        1. File-walk ``sys.path`` (and CWD) for ``module_name``'s ``.py`` file
+           and read it directly — does NOT import the module. This lets drift
+           checks run in lightweight envs that don't have the module's runtime
+           dependencies (torch, transformers) installed.
+        2. Fall back to ``importlib.import_module`` + ``inspect.getsource`` for
+           namespace packages, ``.pyc``-only installs, or anything else that
+           the file walk cannot resolve.
     """
+    file_path = _find_module_file(module_name)
+    if file_path is not None:
+        try:
+            return file_path.read_text()
+        except OSError as e:
+            raise CodegenError(f"Cannot read source for '{module_name}' at {file_path}: {e}") from e
+
     try:
         module = importlib.import_module(module_name)
     except ImportError as e:
@@ -67,6 +104,75 @@ def get_module_source(module_name: str) -> str:
         raise CodegenError(f"Cannot get source for module '{module_name}': {e}") from e
 
     return source
+
+
+def load_patch_config_module(module_name: str, search_roots: Optional[list[Path]] = None) -> types.ModuleType:
+    """Load a patch-config module via ``spec_from_file_location`` when possible.
+
+    The benefit kicks in when the patch config is **self-contained** —
+    i.e. its body only imports from ``veomni.patchgen`` and third-party
+    libraries, with no imports from its own package or siblings. In that
+    case the loader skips executing the config's package ``__init__.py``
+    (which a downstream project might use to register custom HF models,
+    pull in custom CUDA kernels, etc.).
+
+    Configs that **do** import siblings under the same package re-trigger
+    that package's ``__init__.py``. This is unavoidable: Python's import
+    machinery always materializes parent packages when resolving any
+    sub-package name, whether the import is relative
+    (``from .sibling import ...``) or fully qualified
+    (``from <pkg>.sibling import ...``). Once a parent is cached in
+    ``sys.modules`` (e.g. an earlier config under the same parent was
+    already loaded), subsequent loads no-op the parent.
+
+    Note: importing the patchgen library itself still runs
+    ``veomni/__init__.py``, so VeOmni's own runtime (torch, op patches) is
+    a hard prerequisite for using this function. The "skip parent
+    ``__init__``" benefit is scoped to the patch config's own package.
+
+    Resolution order:
+      1. If ``module_name`` maps to a file on disk under ``search_roots`` /
+         ``sys.path`` / CWD, load it via ``importlib.util.spec_from_file_location``.
+      2. Otherwise fall back to ordinary ``importlib.import_module``.
+
+    Contract: every call re-executes the file and overwrites
+    ``sys.modules[module_name]``. Callers must not cache class objects
+    returned from one call and reuse them after a subsequent call for the
+    same name — the cached classes belong to a stale module instance.
+    """
+    parts = module_name.split(".")
+    rel = Path(*parts).with_suffix(".py")
+    candidates: list[Path] = []
+    if search_roots:
+        candidates.extend(root / rel for root in search_roots)
+    candidates.extend(Path(p) / rel for p in sys.path if p)
+    candidates.append(Path.cwd() / rel)
+
+    file_path = next((p for p in candidates if p.is_file()), None)
+    if file_path is None:
+        return importlib.import_module(module_name)
+
+    spec = importlib.util.spec_from_file_location(module_name, file_path)
+    if spec is None or spec.loader is None:
+        return importlib.import_module(module_name)
+
+    mod = importlib.util.module_from_spec(spec)
+    # Register in sys.modules BEFORE exec so:
+    #   1. inspect.getsource(cls) on classes defined inside ``mod`` succeeds
+    #      — inspect resolves source via ``sys.modules[cls.__module__].__file__``,
+    #      so an unregistered leaf breaks ``@config.replace_class`` codegen.
+    #   2. classes inside ``mod`` that reference each other via dotted name
+    #      can resolve those references during decoration.
+    # Skipping parent ``__init__.py`` execution (the whole point of this
+    # loader) still works: Python does not lazily import parents when the
+    # leaf is already registered.
+    sys.modules[module_name] = mod
+    try:
+        spec.loader.exec_module(mod)
+    except Exception:
+        sys.modules.pop(module_name, None)
+        raise
+    return mod
 
 
 def _unwrap_to_inspectable(obj: Any) -> Any:

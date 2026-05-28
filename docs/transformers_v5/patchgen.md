@@ -415,6 +415,109 @@ python -m veomni.patchgen.run_codegen --list
 4. Verify the generated output in `veomni/models/transformers/<model>/generated/`
 5. Run `python -m veomni.patchgen.check_patchgen` to confirm CI will pass
 
+## Using patchgen from a dependent project
+
+`veomni.patchgen` is designed to be reused as a library by projects that
+depend on VeOmni and want to patch their own models — i.e. projects that
+hold patch configs **outside** the `veomni/models/transformers/` tree.
+Maintaining a separate patchgen copy per project is unnecessary — wire
+your own discovery root + CLI on top of the upstream library instead.
+
+### Transformers version
+
+The codegen layer is **transformers-version-agnostic**:
+`get_module_source(module_name)` walks `sys.path` for the module's `.py`
+file and reads it directly — it does **not** `import transformers`. A
+caller on transformers v4 can use `veomni.patchgen` the same way a v5
+caller does, provided the patch config's `source_module` resolves to an
+actual file on the installed transformers. (Patch config decorators
+themselves are free to live under `if TYPE_CHECKING:` blocks if their
+replacement bodies reference torch / version-specific HF symbols only at
+codegen time.)
+
+### Pattern: thin wrapper around library entry points
+
+The two public CLI factories are
+`veomni.patchgen.run_codegen.build_cli(discovery, prog_name=...)` and
+`veomni.patchgen.check_patchgen.build_cli(discovery, prog_name=...)`. Both
+return a `main()`-shaped callable that mounts the same arguments as the
+upstream CLIs but rooted at the caller's `DiscoveryConfig`.
+
+```python
+# <your_project>/patchgen/__main__.py
+from pathlib import Path
+from veomni.patchgen import DiscoveryConfig, build_run_codegen_cli
+
+PROJECT_DISCOVERY = DiscoveryConfig(
+    search_root=Path(__file__).resolve().parents[1] / "models",
+    package_prefix="<your_project>.models",
+    # If your project's pyproject does NOT globally ignore E501, generated
+    # files may still contain occasional long lines from upstream HF. Pass
+    # the code explicitly so the drift-checker's tmp normalization matches
+    # the per-file-ignore the checked-in generated/ files get from your
+    # pyproject.
+    ruff_extra_ignore=("E501",),
+)
+
+main = build_run_codegen_cli(PROJECT_DISCOVERY, prog_name="<your_project>.patchgen")
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+```
+
+The matching drift checker:
+
+```python
+# <your_project>/patchgen/check_main.py
+from veomni.patchgen import build_check_cli
+from .__main__ import PROJECT_DISCOVERY
+
+main = build_check_cli(PROJECT_DISCOVERY, prog_name="<your_project>.patchgen.check")
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+```
+
+This gives dependent projects the full upstream surface
+(`--list / --all / --dry-run / --diff / <module>` and `--fix`) without
+copy-pasting argparse or duplicating the codegen / drift-check
+implementations. Bug fixes and new patch-spec features flow in
+automatically when the caller bumps their `veomni` dependency.
+
+### What the library guarantees
+
+- `run_codegen` writes ruff-normalized output, then builds the `.diff`
+  against that normalized output. `check_patchgen` regenerates the same
+  way. The two are byte-for-byte identical, so a fresh regen never
+  produces immediate drift.
+- `load_patch_config_module` loads patch configs via
+  `importlib.util.spec_from_file_location`, so the **patch config's own
+  package `__init__.py`** (e.g. a project-specific `models/<name>/__init__.py`
+  that registers a custom HF model or pulls in heavy 3rdparty kernels) is
+  **not** executed — *provided the config is self-contained*. Configs that
+  import siblings under the same package (relative `from .sibling import …`
+  or fully-qualified `from <pkg>.sibling import …`) re-trigger that
+  package's `__init__.py`, because Python's import machinery materializes
+  parent packages when resolving any sub-package name. Once cached in
+  `sys.modules`, subsequent loads no-op the parent. Note: importing
+  `veomni.patchgen` itself still triggers `veomni/__init__.py`, which
+  imports torch and runs VeOmni's op patches — torch is therefore a hard
+  prerequisite. The loader's lightweight-env benefit is scoped to the
+  patch config's own package tree.
+- `get_module_source` reads source from disk; it does not import the
+  patched module. This is what makes the layer transformers-version
+  agnostic.
+
+### When to pass `ruff_extra_ignore`
+
+Upstream VeOmni's `pyproject.toml` globally ignores `E501` and
+per-file-ignores `E402,B007` for `generated/*.py`. The shared
+`ruff_fix_and_format` mirrors only the per-file-ignores (E402, B007),
+relying on the **caller project's** ruff config to handle E501. Projects
+whose ruff config does not globally ignore E501 must opt into the same
+treatment for the tmp-file the drift checker writes by passing
+`ruff_extra_ignore=("E501",)` on their `DiscoveryConfig`.
+
 ## Background: Why Not Monkey Patching?
 
 ### Existing Approaches and Their Trade-offs
