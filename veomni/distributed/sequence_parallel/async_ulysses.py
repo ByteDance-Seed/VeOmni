@@ -14,7 +14,7 @@
 
 import importlib
 import numbers
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 import torch.nn.functional as F
@@ -22,6 +22,7 @@ from torch import Tensor
 from torch.distributed import ProcessGroup
 
 from veomni.utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE
+from veomni.utils.logging import get_logger
 
 from .comm import get_ulysses_sequence_parallel_group, get_ulysses_sequence_parallel_world_size
 from .ulysses import all_to_all_tensor
@@ -29,8 +30,13 @@ from .utils import padding_tensor_for_seqeunce_parallel, unpadding_tensor_for_se
 
 
 if IS_NPU_AVAILABLE:
-    import torch_npu
+    import torch_npu  # noqa: F401  (used in the IS_CUDA_AVAILABLE-else branches)
 
+
+if TYPE_CHECKING:
+    from veomni.ops.kernels.fused_ulysses_projection.ws_push import WsPushDispatch
+
+logger = get_logger(__name__)
 fused_layer_norm_cuda = None
 
 
@@ -43,6 +49,135 @@ def divide_qkv_linear_bias(bias: Tensor, dim: int):
         return bias.chunk(3, dim=dim)
     else:
         return None, None, None
+
+
+def _split_fused_qkv_views(
+    qkv_weight: Tensor,
+    qkv_bias: Optional[Tensor],
+    n_q: int,
+    n_kv: int,
+    head_dim: int,
+) -> tuple[
+    Tensor,
+    Tensor,
+    Tensor,
+    Optional[Tensor],
+    Optional[Tensor],
+    Optional[Tensor],
+    int,
+    int,
+]:
+    """Slice a packed ``[n_q*hd | n_kv*hd | n_kv*hd, in_dim]`` ``qkv_weight``
+    (and matching ``qkv_bias``) into the three q/k/v views the eager-fallback
+    path and the backward GEMMs expect.
+    """
+    q_out = n_q * head_dim
+    kv_out = n_kv * head_dim
+    expected_out = q_out + 2 * kv_out
+    if qkv_weight.shape[0] != expected_out:
+        raise ValueError(
+            f"qkv_weight.shape[0]={qkv_weight.shape[0]} != (n_q + 2*n_kv) * head_dim "
+            f"= ({n_q} + 2*{n_kv}) * {head_dim} = {expected_out}"
+        )
+    if qkv_bias is not None and qkv_bias.shape[0] != expected_out:
+        raise ValueError(
+            f"qkv_bias.shape[0]={qkv_bias.shape[0]} != (n_q + 2*n_kv) * head_dim = {expected_out}"
+        )
+    q_w = qkv_weight[:q_out]
+    k_w = qkv_weight[q_out : q_out + kv_out]
+    v_w = qkv_weight[q_out + kv_out :]
+    q_b = k_b = v_b = None
+    if qkv_bias is not None:
+        q_b = qkv_bias[:q_out]
+        k_b = qkv_bias[q_out : q_out + kv_out]
+        v_b = qkv_bias[q_out + kv_out :]
+    return q_w, k_w, v_w, q_b, k_b, v_b, q_out, kv_out
+
+
+def _qkv_via_ws_push(
+    hidden_states: Tensor,
+    dispatch: "WsPushDispatch",
+    seq_dimension: int,
+    unpadded_dim_size: int,
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Run the WS-PUSH fused GEMM + Ulysses a2a and return ``(q, k, v)`` in the
+    unified (already unpad'd + contiguous) shape the rest of forward expects.
+
+    The kernel itself owns the clone (``ws_push_forward_impl`` returns
+    detached copies by default), so this helper only does the
+    unpad + ``.contiguous()`` finalization to mirror the eager branch.
+    """
+    from veomni.ops.kernels.fused_ulysses_projection.ws_push import ws_push_forward_impl
+
+    q, k, v = ws_push_forward_impl(
+        hidden_states,
+        None,  # W_qkv unused when W_qkv_B is provided
+        dispatch.state,
+        W_qkv_B=dispatch.W_qkv_B,
+        bias_B=dispatch.bias_B,
+    )
+    q = unpadding_tensor_for_seqeunce_parallel(q, seq_dimension, unpadded_dim_size)
+    k = unpadding_tensor_for_seqeunce_parallel(k, seq_dimension, unpadded_dim_size)
+    v = unpadding_tensor_for_seqeunce_parallel(v, seq_dimension, unpadded_dim_size)
+    q = q.contiguous()
+    k = k.contiguous()
+    # v left as-is to mirror the eager branch.
+    return q, k, v
+
+
+def _qkv_via_eager(
+    hidden_states: Tensor,
+    q_weight: Tensor,
+    q_bias: Optional[Tensor],
+    k_weight: Tensor,
+    k_bias: Optional[Tensor],
+    v_weight: Tensor,
+    v_bias: Optional[Tensor],
+    num_q_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    seq_dimension: int,
+    head_dimension: int,
+    unpadded_dim_size: int,
+    sp_group: Optional[ProcessGroup],
+    need_repeat_kv: bool,
+    n_repeat: int,
+    batch_size: int,
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Run the eager 3xF.linear + 3x async-a2a path. Mirrors the original
+    behaviour: q & k a2a + unpad + ``.contiguous()`` before return; v a2a
+    launches here but is collected inside this helper (no caller-side guard)."""
+    # q projection + launch
+    q = F.linear(hidden_states, q_weight, q_bias)
+    q = q.view(batch_size, -1, num_q_heads, head_dim)
+    q_res = all_to_all_tensor(q, scatter_dim=head_dimension, gather_dim=seq_dimension, group=sp_group, async_op=True)
+
+    # k projection + launch
+    k = F.linear(hidden_states, k_weight, k_bias)
+    k = k.view(batch_size, -1, num_kv_heads, head_dim)
+    if need_repeat_kv:
+        k = torch.repeat_interleave(k, dim=2, repeats=n_repeat)
+    k_res = all_to_all_tensor(k, scatter_dim=head_dimension, gather_dim=seq_dimension, group=sp_group, async_op=True)
+
+    # v projection + launch
+    v = F.linear(hidden_states, v_weight, v_bias)
+    v = v.view(batch_size, -1, num_kv_heads, head_dim)
+    if need_repeat_kv:
+        v = torch.repeat_interleave(v, dim=2, repeats=n_repeat)
+    v_res = all_to_all_tensor(v, scatter_dim=head_dimension, gather_dim=seq_dimension, group=sp_group, async_op=True)
+
+    # collect q, k
+    q = q_res()
+    q = unpadding_tensor_for_seqeunce_parallel(q, seq_dimension, unpadded_dim_size)
+    k = k_res()
+    k = unpadding_tensor_for_seqeunce_parallel(k, seq_dimension, unpadded_dim_size)
+    q = q.contiguous()
+    k = k.contiguous()
+
+    # collect v
+    v = v_res()
+    v = unpadding_tensor_for_seqeunce_parallel(v, seq_dimension, unpadded_dim_size)
+    return q, k, v
 
 
 class AsyncUlyssesQKVProjection(torch.autograd.Function):
@@ -68,7 +203,42 @@ class AsyncUlyssesQKVProjection(torch.autograd.Function):
         unpadded_dim_size: int,
         head_dim: int,
         group: ProcessGroup,
+        dispatch: Optional["WsPushDispatch"] = None,
+        # --- Fused signature: when ``qkv_weight`` is provided, the legacy
+        # q/k/v_weight/bias args must all be None. Views into qkv_weight are
+        # derived locally for the eager fallback and backward GEMMs; the
+        # backward returns ``grad_qkv_weight`` (not three separate grads).
+        qkv_weight: Optional[Tensor] = None,
+        qkv_bias: Optional[Tensor] = None,
+        n_q: Optional[int] = None,
+        n_kv: Optional[int] = None,
     ):
+        # ---------- Signature dispatch ----------
+        fused_signature = qkv_weight is not None
+        if fused_signature:
+            if any(t is not None for t in (q_weight, k_weight, v_weight, q_bias, k_bias, v_bias)):
+                raise ValueError(
+                    "AsyncUlyssesQKVProjection: pass either ``qkv_weight`` OR the "
+                    "separate q/k/v_weight kwargs, not both."
+                )
+            if n_q is None or n_kv is None or head_dim is None:
+                raise ValueError("AsyncUlyssesQKVProjection fused signature requires n_q, n_kv, head_dim.")
+            (
+                q_weight,
+                k_weight,
+                v_weight,
+                q_bias,
+                k_bias,
+                v_bias,
+                _q_out,
+                _kv_out,
+            ) = _split_fused_qkv_views(qkv_weight, qkv_bias, n_q, n_kv, head_dim)
+            ctx._fused_signature = True
+            ctx._fused_q_out = _q_out
+            ctx._fused_kv_out = _kv_out
+        else:
+            ctx._fused_signature = False
+
         sp_group = get_ulysses_sequence_parallel_group() if group is None else group
         ulysses_size = get_ulysses_sequence_parallel_world_size()
 
@@ -90,49 +260,45 @@ class AsyncUlyssesQKVProjection(torch.autograd.Function):
         else:
             ctx.need_repeat_kv = False
 
-        # q projection
-        q = F.linear(hidden_states, q_weight, q_bias)
-        q = q.view(batch_size, -1, num_q_heads, head_dim)
+        if dispatch is not None:
+            from veomni.ops.kernels.fused_ulysses_projection.ws_push import (
+                validate_ws_push_dispatch,
+            )
 
-        # q communication launch
-        q_res = all_to_all_tensor(
-            q, scatter_dim=head_dimension, gather_dim=seq_dimension, group=sp_group, async_op=True
-        )
-
-        # k projection
-        k = F.linear(hidden_states, k_weight, k_bias)
-        k = k.view(batch_size, -1, num_kv_heads, head_dim)
-
-        if ctx.need_repeat_kv:
-            k = torch.repeat_interleave(k, dim=2, repeats=ctx.n_repeat)
-
-        # k communication launch
-        k_res = all_to_all_tensor(
-            k, scatter_dim=head_dimension, gather_dim=seq_dimension, group=sp_group, async_op=True
-        )
-
-        # v projection
-        v = F.linear(hidden_states, v_weight, v_bias)
-        v = v.view(batch_size, -1, num_kv_heads, head_dim)
-
-        if ctx.need_repeat_kv:
-            v = torch.repeat_interleave(v, dim=2, repeats=ctx.n_repeat)
-
-        # v communication launch
-        v_res = all_to_all_tensor(
-            v, scatter_dim=head_dimension, gather_dim=seq_dimension, group=sp_group, async_op=True
-        )
-
-        # q communication collect
-        q = q_res()
-        q = unpadding_tensor_for_seqeunce_parallel(q, seq_dimension, unpadded_dim_size)
-
-        # k communication collect
-        k = k_res()
-        k = unpadding_tensor_for_seqeunce_parallel(k, seq_dimension, unpadded_dim_size)
-
-        q = q.contiguous()
-        k = k.contiguous()
+            validate_ws_push_dispatch(
+                dispatch,
+                hidden_states,
+                num_q_heads,
+                num_kv_heads,
+                seq_dimension,
+                head_dimension,
+                unpadded_dim_size,
+                q_bias,
+                k_bias,
+                v_bias,
+                group,
+            )
+            q, k, v = _qkv_via_ws_push(hidden_states, dispatch, seq_dimension, unpadded_dim_size)
+        else:
+            q, k, v = _qkv_via_eager(
+                hidden_states,
+                q_weight,
+                q_bias,
+                k_weight,
+                k_bias,
+                v_weight,
+                v_bias,
+                num_q_heads,
+                num_kv_heads,
+                head_dim,
+                seq_dimension,
+                head_dimension,
+                unpadded_dim_size,
+                sp_group,
+                ctx.need_repeat_kv,
+                ctx.n_repeat if ctx.need_repeat_kv else 1,
+                batch_size,
+            )
 
         # qk normalization (if needed)
         if norm_type is not None:
@@ -174,10 +340,6 @@ class AsyncUlyssesQKVProjection(torch.autograd.Function):
             mean_k = None
             invvar_q = None
             invvar_k = None
-
-        # v communication collect
-        v = v_res()
-        v = unpadding_tensor_for_seqeunce_parallel(v, seq_dimension, unpadded_dim_size)
 
         # save ctx for backward
         ctx.sp_group = sp_group
@@ -393,6 +555,48 @@ class AsyncUlyssesQKVProjection(torch.autograd.Function):
         # grad
         grad_hidden_states = grad_q_input + grad_k_input + grad_v_input
 
+        # ---------- Fused-signature grad assembly ----------
+        # When the caller passed a single ``qkv_weight`` Parameter (see
+        # FusedQKVLinear), grads must land on it as one tensor rather than
+        # three separate q/k/v_weight grads.
+        grad_qkv_weight = None
+        grad_qkv_bias = None
+        if getattr(ctx, "_fused_signature", False):
+            _q_out = ctx._fused_q_out
+            _kv_out = ctx._fused_kv_out
+            total_out = _q_out + 2 * _kv_out
+            # backward emitted: per-batch outer products kept separate (the
+            # autograd engine reduces across leading dims during accumulate).
+            ref = grad_q_weight  # legacy partial grad to crib shape & dtype from
+            in_dim = ref.shape[-1]
+            grad_qkv_weight = torch.empty(
+                *ref.shape[:-2],
+                total_out,
+                in_dim,
+                dtype=ref.dtype,
+                device=ref.device,
+            )
+            grad_qkv_weight[..., :_q_out, :].copy_(grad_q_weight)
+            grad_qkv_weight[..., _q_out : _q_out + _kv_out, :].copy_(grad_k_weight)
+            grad_qkv_weight[..., _q_out + _kv_out :, :].copy_(grad_v_weight)
+            if grad_q_bias is not None and grad_k_bias is not None and grad_v_bias is not None:
+                ref_b = grad_q_bias
+                grad_qkv_bias = torch.empty(
+                    *ref_b.shape[:-1],
+                    total_out,
+                    dtype=ref_b.dtype,
+                    device=ref_b.device,
+                )
+                grad_qkv_bias[..., :_q_out].copy_(grad_q_bias)
+                grad_qkv_bias[..., _q_out : _q_out + _kv_out].copy_(grad_k_bias)
+                grad_qkv_bias[..., _q_out + _kv_out :].copy_(grad_v_bias)
+            # In fused mode the original q/k/v_weight inputs are None, so
+            # their grad slots must also be None to avoid PyTorch crashing
+            # on a non-None grad for a None input.
+            grad_q_weight = grad_q_bias = None
+            grad_k_weight = grad_k_bias = None
+            grad_v_weight = grad_v_bias = None
+
         return (
             grad_hidden_states,
             None,
@@ -413,6 +617,11 @@ class AsyncUlyssesQKVProjection(torch.autograd.Function):
             None,
             None,
             None,
+            None,  # dispatch
+            grad_qkv_weight,
+            grad_qkv_bias,
+            None,  # n_q
+            None,  # n_kv
         )
 
 
@@ -523,7 +732,29 @@ def async_ulysses_qkv_projection(
     unpadded_dim_size: int = None,
     head_dim: int = None,
     group: Optional[ProcessGroup] = None,
+    dispatch: Optional["WsPushDispatch"] = None,
+    # ---------- Fused signature (FusedQKVLinear callers) ----------
+    qkv_weight: Optional[Tensor] = None,
+    qkv_bias: Optional[Tensor] = None,
+    n_q: Optional[int] = None,
+    n_kv: Optional[int] = None,
 ):
+    # Transparent dispatch: when the caller exposes a fused ``qkv_weight``
+    # (the FusedQKVLinear path used by qwen3_vl / qwen3_vl_moe) and did not
+    # explicitly hand us a ``WsPushDispatch``, consult the process-wide
+    # active manager via ``WsPushDispatch.try_resolve_auto``. Returns None
+    # when no manager is published / shape mismatch / non-symm-mem host /
+    # the caller is on the legacy three-weight signature, in which case
+    # forward falls through to the eager path.
+    if dispatch is None and hidden_states is not None and qkv_weight is not None:
+        from veomni.ops.kernels.fused_ulysses_projection.ws_push import WsPushDispatch
+
+        dispatch = WsPushDispatch.try_resolve_auto(
+            hidden_states,
+            qkv_weight=qkv_weight,
+            qkv_bias=qkv_bias,
+        )
+
     return AsyncUlyssesQKVProjection.apply(
         hidden_states,
         seq_dimension,
@@ -544,6 +775,11 @@ def async_ulysses_qkv_projection(
         unpadded_dim_size,
         head_dim,
         group,
+        dispatch,
+        qkv_weight,
+        qkv_bias,
+        n_q,
+        n_kv,
     )
 
 
