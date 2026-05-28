@@ -105,6 +105,80 @@ class TestAllowPartialLoad:
 
 
 # ---------------------------------------------------------------------------
+# Async save lifecycle: wait_for_pending_save()
+# ---------------------------------------------------------------------------
+
+
+class TestWaitForPendingSave:
+    """``DistributedCheckpointer.wait_for_pending_save()`` is the single
+    entrypoint for coordinating with an in-flight async save."""
+
+    def teardown_method(self):
+        """Reset class state between tests."""
+        from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
+
+        DistributedCheckpointer.save_future = None
+
+    def test_noop_when_no_pending_save(self):
+        from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
+
+        DistributedCheckpointer.save_future = None
+        # Should be a clean no-op — no exceptions, no barrier
+        DistributedCheckpointer.wait_for_pending_save()
+        assert DistributedCheckpointer.save_future is None
+
+    @patch("veomni.checkpoint.dcp_checkpointer.dist")
+    def test_waits_and_clears_future(self, mock_dist):
+        from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
+
+        mock_dist.is_initialized.return_value = True
+        mock_dist.get_rank.return_value = 0
+
+        future = MagicMock()
+        future.result.return_value = None
+        DistributedCheckpointer.save_future = future
+
+        DistributedCheckpointer.wait_for_pending_save()
+
+        future.result.assert_called_once()
+        assert DistributedCheckpointer.save_future is None
+        mock_dist.barrier.assert_called_once()
+
+    @patch("veomni.checkpoint.dcp_checkpointer.dist")
+    def test_propagates_exception_and_clears_future(self, mock_dist):
+        """If the pending save raised, the exception propagates AND the
+        future is cleared so retry on the next call is possible."""
+        from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
+
+        mock_dist.is_initialized.return_value = True
+        mock_dist.get_rank.return_value = 0
+
+        future = MagicMock()
+        future.result.side_effect = RuntimeError("save failed")
+        DistributedCheckpointer.save_future = future
+
+        with pytest.raises(RuntimeError, match="save failed"):
+            DistributedCheckpointer.wait_for_pending_save()
+
+        # Future must be cleared even on failure — otherwise stuck forever
+        assert DistributedCheckpointer.save_future is None
+
+    @patch("veomni.checkpoint.dcp_checkpointer.dist")
+    def test_no_barrier_when_dist_not_initialized(self, mock_dist):
+        from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
+
+        mock_dist.is_initialized.return_value = False
+
+        future = MagicMock()
+        DistributedCheckpointer.save_future = future
+
+        DistributedCheckpointer.wait_for_pending_save()
+
+        future.result.assert_called_once()
+        mock_dist.barrier.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
 # Partial save/load (LoRA / trainable_only path)
 # ---------------------------------------------------------------------------
 

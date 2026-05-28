@@ -451,6 +451,32 @@ class DistributedCheckpointer(CheckpointerBase):
         return state
 
     @classmethod
+    def wait_for_pending_save(cls) -> None:
+        """Block until any pending async DCP save completes.
+
+        Safe to call when no save is pending (no-op).  Re-raises any
+        exception from the pending save after logging which rank saw it.
+        After completion, all ranks synchronize via a barrier so callers
+        can safely begin a new collective operation.
+
+        This is the single entrypoint for all async-save coordination —
+        prefer calling this over poking ``save_future`` directly.
+        """
+        if cls.save_future is None:
+            return
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        try:
+            logger.info(f"[RANK {rank}] waiting for previous DCP saving session to end...")
+            cls.save_future.result()
+        except Exception:
+            logger.error(f"[RANK {rank}] previous async DCP save raised; propagating")
+            raise
+        finally:
+            cls.save_future = None
+        if dist.is_initialized():
+            dist.barrier()
+
+    @classmethod
     def execute_save(
         cls,
         save_state: Dict[str, Any],
@@ -463,12 +489,7 @@ class DistributedCheckpointer(CheckpointerBase):
             if cls._async_process_group is None:
                 cls._async_process_group = dist.new_group(backend="gloo")
 
-            if cls.save_future is not None:
-                logger.info(f"[RANK {dist.get_rank()}] waiting for previous DCP saving session to end...")
-                cls.save_future.result()
-                cls.save_future = None
-                # block until all the ranks resolve their previous dcp async saving
-                dist.barrier()
+            cls.wait_for_pending_save()
 
             cls.save_future = dcp.async_save(
                 state_dict=save_state,

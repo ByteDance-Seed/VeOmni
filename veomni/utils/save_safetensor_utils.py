@@ -210,13 +210,9 @@ def save_hf_safetensor(
     # Ensure all GPU operations are complete before reading tensor data for saving
     synchronize()
 
-    # Wait for any pending async DCP save
-    if ckpt_manager == "dcp" and DistributedCheckpointer.save_future is not None:
-        logger.info_rank0("Waiting for pending async DCP save to complete before HF safetensor save...")
-        DistributedCheckpointer.save_future.result()
-        DistributedCheckpointer.save_future = None
-        if dist.is_initialized():
-            dist.barrier()
+    # Wait for any pending async DCP save before HF safetensor save
+    if ckpt_manager == "dcp":
+        DistributedCheckpointer.wait_for_pending_save()
 
     if use_distributed:
         _save_hf_safetensor_distributed(model, save_hf_safetensor_path, fqn_to_index_mapping, model_assets)

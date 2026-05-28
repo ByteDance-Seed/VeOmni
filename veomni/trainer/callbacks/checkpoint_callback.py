@@ -72,8 +72,7 @@ class CheckpointerCallback(Callback):
             "extra_state": {},
         }
 
-        if getattr(self.trainer.checkpointer, "save_future", None) is not None:  # async save
-            self.trainer.checkpointer.save_future.result()
+        self.trainer.checkpointer.wait_for_pending_save()
 
         self.trainer.checkpointer.load(
             args.train.checkpoint.load_path,
@@ -196,8 +195,7 @@ class HuggingfaceCkptCallback(CheckpointerCallback):
             dist.barrier()
             super()._save_checkpoint(state)
 
-        if getattr(self.trainer.checkpointer, "save_future", None) is not None:  # async save
-            self.trainer.checkpointer.save_future.result()
+        self.trainer.checkpointer.wait_for_pending_save()
 
         if stage == "train_end":
             self.trainer.optimizer = None
@@ -233,8 +231,7 @@ class HFLoraCkptCallback(HuggingfaceCkptCallback):
             dist.barrier()
             CheckpointerCallback._save_checkpoint(self, state)
 
-        if getattr(self.trainer.checkpointer, "save_future", None) is not None:  # async save
-            self.trainer.checkpointer.save_future.result()
+        self.trainer.checkpointer.wait_for_pending_save()
 
         if stage == "train_end":
             self.trainer.optimizer = None
