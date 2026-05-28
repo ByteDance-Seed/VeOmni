@@ -179,6 +179,7 @@ def WanTransformer3DModel_forward(
 ):
     batch_size, num_channels, num_frames, height, width = hidden_states.shape
     p_t, p_h, p_w = self.config.patch_size
+
     post_patch_num_frames = num_frames // p_t
     post_patch_height = height // p_h
     post_patch_width = width // p_w
