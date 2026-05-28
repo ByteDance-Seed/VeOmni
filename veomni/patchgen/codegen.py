@@ -166,11 +166,18 @@ def load_patch_config_module(module_name: str, search_roots: Optional[list[Path]
     # Skipping parent ``__init__.py`` execution (the whole point of this
     # loader) still works: Python does not lazily import parents when the
     # leaf is already registered.
+    # Stash the previous entry (if any) so we restore it on exec failure
+    # instead of leaking a missing key — otherwise a partially-loaded
+    # second call would wipe out the previous successful load.
+    previous = sys.modules.get(module_name)
     sys.modules[module_name] = mod
     try:
         spec.loader.exec_module(mod)
     except Exception:
-        sys.modules.pop(module_name, None)
+        if previous is None:
+            sys.modules.pop(module_name, None)
+        else:
+            sys.modules[module_name] = previous
         raise
     return mod
 

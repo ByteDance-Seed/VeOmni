@@ -80,5 +80,20 @@ def ruff_fix_and_format(
         format_cmd.append("--isolated")
     check_cmd.extend(["--ignore", ",".join(ignore), str(path)])
     format_cmd.append(str(path))
-    subprocess.run(check_cmd, check=True, capture_output=True)
-    subprocess.run(format_cmd, check=True, capture_output=True)
+    try:
+        subprocess.run(check_cmd, check=True, capture_output=True)
+        subprocess.run(format_cmd, check=True, capture_output=True)
+    except subprocess.CalledProcessError as exc:
+        # ``capture_output=True`` swallows ruff's diagnostics into the
+        # exception object, where they're invisible by default. Re-raise
+        # with stdout + stderr inlined so syntax errors in generated files
+        # (or a missing ruff binary path quirk) show up directly in the
+        # caller's traceback.
+        stdout = exc.stdout.decode("utf-8", errors="replace") if exc.stdout else ""
+        stderr = exc.stderr.decode("utf-8", errors="replace") if exc.stderr else ""
+        raise RuntimeError(
+            f"ruff normalization failed (exit {exc.returncode})\n"
+            f"command: {' '.join(exc.cmd)}\n"
+            f"stdout:\n{stdout}\n"
+            f"stderr:\n{stderr}"
+        ) from exc

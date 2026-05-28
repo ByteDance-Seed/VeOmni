@@ -72,14 +72,22 @@ def check_config(
     fix: bool = False,
     ruff_extra_ignore: tuple[str, ...] = (),
     ruff_isolated: bool = False,
+    search_roots: Optional[list[Path]] = None,
 ) -> bool:
     """Check a single config for drift.
 
     Returns True when the checked-in files are up to date (or were fixed).
+
+    Args:
+        search_roots: optional list of filesystem roots to prepend to the
+            loader's file-walk. Pass ``[discovery.package_root]`` from a
+            caller that drives discovery via ``DiscoveryConfig`` so the
+            loader still resolves the config file when the project isn't
+            installed on ``sys.path``.
     """
     # Use the patchgen-aware loader so parent ``__init__.py`` side effects
     # (heavy 3rdparty imports) don't gate the drift check.
-    module = load_patch_config_module(module_name)
+    module = load_patch_config_module(module_name, search_roots=search_roots)
     config = module.config
 
     output_dir = default_output_dir_for_module(module)
@@ -182,6 +190,7 @@ def run_check(
             fix=fix,
             ruff_extra_ignore=discovery.ruff_extra_ignore,
             ruff_isolated=discovery.ruff_isolated,
+            search_roots=[discovery.package_root],
         )
         if not ok:
             all_ok = False

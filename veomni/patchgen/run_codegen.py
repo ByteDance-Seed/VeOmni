@@ -98,6 +98,21 @@ class DiscoveryConfig:
     ruff_extra_ignore: tuple[str, ...] = ()
     ruff_isolated: bool = False  # pass --isolated to ruff (line-length 88, no project config)
 
+    @property
+    def package_root(self) -> Path:
+        """Filesystem directory that holds the **first segment** of
+        ``package_prefix`` — i.e. the directory that must be on ``sys.path``
+        for the package's modules to import normally.
+
+        Used to seed ``load_patch_config_module(search_roots=...)`` so the
+        file-walk works even when the project is not installed on
+        ``sys.path`` (e.g. fresh clone, sandboxed CI). For
+        ``DiscoveryConfig(search_root=Path('X/myproj/models'),
+        package_prefix='myproj.models')`` this returns ``Path('X')``.
+        """
+        depth = len(self.package_prefix.split("."))
+        return self.search_root.parents[depth - 1] if depth > 0 else self.search_root
+
 
 # VeOmni's own discovery — used by this module's CLI.
 VEOMNI_DISCOVERY = DiscoveryConfig(
@@ -158,13 +173,14 @@ def list_patch_configs(discovery: DiscoveryConfig = VEOMNI_DISCOVERY) -> list[st
     if not discovery.search_root.exists():
         return configs
 
+    search_roots = [discovery.package_root]
     for py_file in sorted(discovery.search_root.rglob("*_patch_gen_config.py")):
         if py_file.name.startswith("_"):
             continue
         rel_path = py_file.relative_to(discovery.search_root).with_suffix("")
         module_name = ".".join((discovery.package_prefix, *rel_path.parts))
         try:
-            module = load_patch_config_module(module_name)
+            module = load_patch_config_module(module_name, search_roots=search_roots)
         except ImportError:
             continue
         if hasattr(module, "config") and isinstance(module.config, PatchConfig):
@@ -279,8 +295,10 @@ def run_codegen(
             print(f"Loading patch module: {patch_module}")
         # Use spec_from_file_location so heavy parent __init__.py side effects
         # (model registries, torch kernels, ...) are not triggered just to read
-        # the config object.
-        module = load_patch_config_module(patch_module)
+        # the config object. ``discovery.package_root`` seeds the loader's
+        # search path so projects that aren't installed on ``sys.path`` still
+        # resolve the patch config file.
+        module = load_patch_config_module(patch_module, search_roots=[discovery.package_root])
         config = getattr(module, config_name)
 
         if output_dir is None:
