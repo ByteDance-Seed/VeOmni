@@ -469,7 +469,7 @@ class DistributedCheckpointer(CheckpointerBase):
             logger.info(f"[RANK {rank}] waiting for previous DCP saving session to end...")
             cls.save_future.result()
         except Exception:
-            logger.error(f"[RANK {rank}] previous async DCP save raised; propagating")
+            logger.error(f"[RANK {rank}] previous async DCP save raised; propagating", exc_info=True)
             raise
         finally:
             cls.save_future = None
