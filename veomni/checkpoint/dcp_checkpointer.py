@@ -51,6 +51,94 @@ _EXTRA_STATE_FORMAT = "extra_state_rank_{}.pt"
 _EXTRA_STATE_DIR = "extra_state"
 
 
+def _validate_extra_parallel_meshes(parallel_state) -> None:
+    """Fail-fast precondition for ExtraParallel state dict preprocessing.
+
+    At least one ExtraParallel mesh must be non-None, and at least one
+    of those meshes must be 2D (the ExtraParallel + FSDP composition).
+    """
+    extra_parallel_mesh = {
+        para: parallel_state.extra_parallel_fsdp_device_mesh[para][para]
+        if parallel_state.extra_parallel_fsdp_device_mesh[para] is not None
+        else None
+        for para in parallel_state.extra_parallel_names
+    }
+    assert any(m is not None for m in extra_parallel_mesh.values()), (
+        "At least one extra_parallel mesh should be not None"
+    )
+    assert any(
+        parallel_state.extra_parallel_fsdp_device_mesh[para] is not None
+        and parallel_state.extra_parallel_fsdp_device_mesh[para].ndim == 2
+        for para in parallel_state.extra_parallel_names
+    ), "At least one extra_parallel fsdp_device_mesh should be not None"
+
+
+def _apply_extra_parallel_dim(
+    state_dict: Dict[str, Any],
+    extra_parallel_fqn2spec_info: Dict[str, Any],
+    parallel_state,
+    action: str,
+    *,
+    key_match: str,
+) -> Dict[str, Any]:
+    """Drop or restore the ExtraParallel dimension on each tensor in a state dict.
+
+    Shared by ``ModelState`` and ``OptimizerState``.  The only meaningful
+    difference between the two callers is how state-dict keys map to
+    ExtraParallel FQNs:
+
+    * ``"exact"`` (model): the state-dict key IS the FQN,
+      e.g. ``"model.layers.0.mlp.experts.gate_proj"``.
+    * ``"substring"`` (optimizer): the state-dict key contains the FQN
+      with extra prefix/suffix, e.g.
+      ``"state.model.layers.0.mlp.experts.gate_proj.exp_avg"``.
+
+    Non-tensor values and 0-D tensors are skipped unconditionally — they
+    appear only in optimizer state dicts (param-group hyperparams, scalar
+    ``step`` tensors); model state dicts never contain them, so the guard
+    is a safe no-op there.
+    """
+    assert action in ("drop", "restore"), f"action must be 'drop' or 'restore', got {action!r}"
+    assert key_match in ("exact", "substring"), f"key_match must be 'exact' or 'substring', got {key_match!r}"
+    assert extra_parallel_fqn2spec_info is not None, "fqn2spec_info must not be None"
+
+    _validate_extra_parallel_meshes(parallel_state)
+
+    extra_parallel_keys = list(extra_parallel_fqn2spec_info.keys()) if key_match == "substring" else None
+
+    for name in sorted(state_dict.keys()):
+        if key_match == "exact":
+            if name not in extra_parallel_fqn2spec_info:
+                continue
+            spec_info = extra_parallel_fqn2spec_info[name]
+        else:  # "substring"
+            matches = [k for k in extra_parallel_keys if k in name]
+            if not matches:
+                continue
+            assert len(matches) == 1, f"Ambiguous ExtraParallel spec match for state key '{name}': {matches}"
+            spec_info = extra_parallel_fqn2spec_info[matches[0]]
+
+        if not isinstance(spec_info.placement, Shard):
+            continue
+
+        tensor = state_dict[name]
+        if not torch.is_tensor(tensor):
+            continue
+        if tensor.ndim == 0:
+            continue
+
+        assert spec_info.para_fsdp_mesh is not None, f"ExtraParallel spec {name} must have an ExtraParallel FSDP mesh"
+
+        fsdp_submesh = spec_info.para_fsdp_mesh[f"{spec_info.para_name}_fsdp"]
+        if action == "drop":
+            tensor = drop_extra_parallel_dim(tensor, fsdp_submesh)
+        else:
+            tensor = restore_extra_parallel_dim(tensor, spec_info.para_fsdp_mesh, fsdp_submesh)
+        state_dict[name] = tensor
+
+    return state_dict
+
+
 class ModelState(Stateful):
     """A wrapper around a model to make it stateful.
 
@@ -104,56 +192,13 @@ class ModelState(Stateful):
         set_model_state_dict(model=self.model, model_state_dict=model_state_dict, options=options)
 
     def get_state_dict_with_extra_parallel_dim_preprocess(self, state_dict, action):
-        extra_parallel_fqn2spec_info = self.extra_parallel_fqn2spec_info
-        assert extra_parallel_fqn2spec_info is not None, "if fqn2spec_info is None it should not be patch"
-
-        extra_parallel_mesh = {
-            para: self.parallel_state.extra_parallel_fsdp_device_mesh[para][para]
-            if self.parallel_state.extra_parallel_fsdp_device_mesh[para] is not None
-            else None
-            for para in self.parallel_state.extra_parallel_names
-        }
-
-        assert any(para_mesh is not None for para_mesh in extra_parallel_mesh.values()), (
-            "At least one extra_parallel mesh should be not None"
+        return _apply_extra_parallel_dim(
+            state_dict,
+            self.extra_parallel_fqn2spec_info,
+            self.parallel_state,
+            action,
+            key_match="exact",
         )
-
-        global_extra_parallel_device_mesh = {
-            para: self.parallel_state.extra_parallel_fsdp_device_mesh[para]
-            for para in self.parallel_state.extra_parallel_names
-        }
-        assert any(
-            global_para_device_mesh is not None and global_para_device_mesh.ndim == 2
-            for global_para_device_mesh in global_extra_parallel_device_mesh.values()
-        ), "At least one extra_parallel fsdp_device_mesh should be not None"
-
-        assert action in ["restore", "drop"]
-
-        keys = list(state_dict.keys())
-        for name in sorted(keys):
-            if name in extra_parallel_fqn2spec_info and isinstance(
-                extra_parallel_fqn2spec_info[name].placement, Shard
-            ):
-                cur_spec_info = extra_parallel_fqn2spec_info[name]
-                assert cur_spec_info.para_fsdp_mesh is not None, (
-                    f"ExtraParallel spec {name} must have either ExtraParallel FSDP mesh"
-                )
-
-                tensor = state_dict[name]
-
-                if action == "drop":
-                    tensor = drop_extra_parallel_dim(
-                        tensor, cur_spec_info.para_fsdp_mesh[f"{cur_spec_info.para_name}_fsdp"]
-                    )
-                else:
-                    tensor = restore_extra_parallel_dim(
-                        tensor,
-                        cur_spec_info.para_fsdp_mesh,
-                        cur_spec_info.para_fsdp_mesh[f"{cur_spec_info.para_name}_fsdp"],
-                    )
-                state_dict[name] = tensor
-
-        return state_dict
 
 
 class OptimizerState(Stateful):
@@ -221,78 +266,13 @@ class OptimizerState(Stateful):
         )
 
     def get_state_dict_with_extra_parallel_dim_preprocess(self, state_dict, action):
-        extra_parallel_fqn2spec_info = self.extra_parallel_fqn2spec_info
-        assert extra_parallel_fqn2spec_info is not None, "if fqn2spec_info is None it should not be patch"
-
-        extra_parallel_mesh = {
-            para: self.parallel_state.extra_parallel_fsdp_device_mesh[para][para]
-            if self.parallel_state.extra_parallel_fsdp_device_mesh[para] is not None
-            else None
-            for para in self.parallel_state.extra_parallel_names
-        }
-
-        assert any(para_mesh is not None for para_mesh in extra_parallel_mesh.values()), (
-            "At least one extra_parallel mesh should be not None"
+        return _apply_extra_parallel_dim(
+            state_dict,
+            self.extra_parallel_fqn2spec_info,
+            self.parallel_state,
+            action,
+            key_match="substring",
         )
-
-        global_extra_parallel_device_mesh = {
-            para: self.parallel_state.extra_parallel_fsdp_device_mesh[para]
-            for para in self.parallel_state.extra_parallel_names
-        }
-        assert any(
-            global_para_device_mesh is not None and global_para_device_mesh.ndim == 2
-            for global_para_device_mesh in global_extra_parallel_device_mesh.values()
-        ), "At least one extra_parallel fsdp_device_mesh should be not None"
-
-        assert action in ["drop", "restore"]
-
-        keys = list(state_dict.keys())
-        extra_parallel_keys = list(extra_parallel_fqn2spec_info.keys())
-
-        for name in sorted(keys):
-            # Find ExtraParallel spec whose FQN appears in the state_dict key
-            # e.g. name = "state.model.layers.0.mlp.experts.gate_proj.step"
-            #      extra_parallel_key = "model.layers.0.mlp.experts.gate_proj"
-            matches = [extra_parallel_key for extra_parallel_key in extra_parallel_keys if extra_parallel_key in name]
-            if not matches:
-                # ignore non-extra_parallel tensor
-                continue
-
-            # each tensor in the state dict should only belong to one ExtraParallel entry
-            assert len(matches) == 1, f"Ambiguous ExtraParallel spec match for state key '{name}': {matches}"
-
-            extra_parallel_key = matches[0]
-            cur_spec_info = extra_parallel_fqn2spec_info[extra_parallel_key]
-
-            # skip non-extra_parallel params which has Replicate placement in model spec info
-            if not isinstance(cur_spec_info.placement, Shard):
-                continue
-
-            tensor = state_dict[name]
-            if not torch.is_tensor(tensor):
-                # we skip param-group hyperparams like `param_groups.model.layers.0.mlp.experts.down_proj.amsgrad`
-                continue
-            # Skip scalars (0-D tensors) – cannot be sharded on dim 0
-            if tensor.ndim == 0:
-                continue
-
-            assert cur_spec_info.para_fsdp_mesh is not None, (
-                f"ExtraParallel spec {name} must have either ExtraParallel FSDP mesh"
-            )
-
-            if action == "drop":
-                tensor = drop_extra_parallel_dim(
-                    tensor, cur_spec_info.para_fsdp_mesh[f"{cur_spec_info.para_name}_fsdp"]
-                )
-            elif action == "restore":
-                tensor = restore_extra_parallel_dim(
-                    tensor,
-                    cur_spec_info.para_fsdp_mesh,
-                    cur_spec_info.para_fsdp_mesh[f"{cur_spec_info.para_name}_fsdp"],
-                )
-            state_dict[name] = tensor
-
-        return state_dict
 
 
 def drop_extra_parallel_dim(loaded_tensor: torch.Tensor, device_mesh: DeviceMesh):
