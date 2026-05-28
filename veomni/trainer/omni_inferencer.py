@@ -85,7 +85,7 @@ HuggingFace ``GenerationMixin._prepare_generation_config``.
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from typing import Any
 
 import torch
@@ -301,6 +301,27 @@ class OmniInferenceArguments:
     ``encoders``, ``lora_config``, ...) are silently ignored because they're
     not declared on :class:`OmniInferModelArguments`.
 
+    ``__post_init__`` self-normalises the parsed args into a single source of
+    truth before they're handed to the inferencer:
+
+    * Validates the two CLI mandatories (non-empty ``--infer.prompt`` and a
+      set ``--model.model_path``) — fails fast at parse time, before any slow
+      module construction kicks in.
+    * Resolves the inference scenario (CLI/YAML ``omni_infer_type`` → auto
+      from ``has_image`` → fallback to first declared scenario) and writes
+      the resolved value back to :attr:`model.omni_infer_type` so every
+      downstream consumer sees a frozen, validated string.  The diagnostic
+      "where did this come from" label is stashed on :attr:`_scenario_source`
+      for the inferencer's startup log.
+    * Joins the resolved scenario onto :attr:`infer.output_dir` so artefacts
+      from different scenarios don't clobber each other when the user re-runs
+      with the same ``--infer.output_dir``.
+
+    All three steps are idempotent only relative to a single construction —
+    re-parsing or replacing fields after the fact will NOT re-trigger
+    resolution.  Build a fresh :class:`OmniInferenceArguments` if you change
+    ``infer.image`` between runs and want the scenario to re-auto-pick.
+
     Use::
 
         from veomni.arguments import parse_args
@@ -313,9 +334,44 @@ class OmniInferenceArguments:
     model: OmniInferModelArguments = field(default_factory=OmniInferModelArguments)
     infer: OmniInferRunArguments = field(default_factory=OmniInferRunArguments)
 
+    def __post_init__(self):
+        # ── Mandatory CLI checks ──────────────────────────────────────────
+        # Fail fast — these mistakes are common (forgetting --infer.prompt,
+        # leaving model_path unset in the launcher YAML) and we want the
+        # error before module construction starts (which loads weights and
+        # takes ~10s for Janus 1.3B).
+        if not self.infer.prompt:
+            raise ValueError(
+                "`--infer.prompt` is required (use a non-empty string).  Example: --infer.prompt 'a cat'."
+            )
+        if not self.model.model_path:
+            raise ValueError("`--model.model_path` is required (launcher YAML must declare `model.model_path`).")
+
+        # ── Scenario resolution ───────────────────────────────────────────
+        # Freezes ``model.omni_infer_type`` to the resolved value so all
+        # downstream consumers (load_omni_config, output_dir join, the
+        # inferencer's startup log) read a single source of truth.
+        scenario, source = _select_scenario(self.model, has_image=bool(self.infer.image))
+        self.model.omni_infer_type = scenario
+        # Private (not a dataclass field — would otherwise pollute the CLI
+        # via _add_arguments_recursive).  Read by OmniInferencer.from_args
+        # for its diagnostic startup banner.
+        self._scenario_source: str = source
+
+        # ── Output-dir scoping ────────────────────────────────────────────
+        # Same motivation as the previous from_args-side join: prevent T2I
+        # / I2T / interleave re-runs from clobbering each other when the
+        # user re-runs with the same --infer.output_dir.
+        self.infer.output_dir = os.path.join(self.infer.output_dir, scenario)
+
 
 def _select_scenario(model_args: OmniInferModelArguments, *, has_image: bool) -> tuple[str, str]:
     """Pick the inference scenario (an entry in ``model.omni_infer_yaml_path``).
+
+    Pure helper called from :meth:`OmniInferenceArguments.__post_init__` —
+    factored out as a free function so it's unit-testable in isolation (no
+    need to spin up the full args dataclass tree just to assert priority
+    rules).
 
     Priority:
 
@@ -479,45 +535,28 @@ class OmniInferencer:
     ) -> OmniInferencer:
         """Build an :class:`OmniInferencer` from a fully-parsed root config.
 
-        One-stop constructor for CLI / script entry points: resolves the
-        inference scenario, loads the merged :class:`OmniConfig`, builds the
-        per-module weights, and stashes :attr:`args.infer` so subsequent
+        One-stop constructor for CLI / script entry points: loads the merged
+        :class:`OmniConfig` (using the scenario already resolved by
+        :meth:`OmniInferenceArguments.__post_init__`), builds the per-module
+        weights, and stashes :attr:`args.infer` so subsequent
         ``inferencer.generate()`` calls without arguments use that payload.
 
-        Validates the two CLI mandatories (``--infer.prompt`` non-empty,
-        ``--model.model_path`` set) up front so the user sees a clear error
-        before module construction starts (which is the slow / expensive part).
-
-        Side-effect on the stashed ``infer_args``: the resolved scenario name
-        is joined onto :attr:`OmniInferRunArguments.output_dir` (via
-        :func:`dataclasses.replace`, so the caller's ``args`` is NOT mutated)
-        so artefacts land under ``<output_dir>/<scenario>/`` — e.g.
-        ``output/infer_gen/generated_image_0.png`` instead of
-        ``output/generated_image_0.png``.  Avoids T2I / I2T runs clobbering
-        each other when the user re-runs with the same ``--infer.output_dir``
-        but a different scenario (a common workflow when comparing modes).
+        Validation and resolution live in :meth:`OmniInferenceArguments.__post_init__`
+        — by the time we get here ``args.model.omni_infer_type`` is guaranteed
+        non-empty (and known to the YAML's ``omni_infer_yaml_path``) and
+        ``args.infer.output_dir`` already carries the ``/<scenario>`` suffix.
         Programmatic callers that hit :meth:`OmniInferencer.__init__` directly
-        bypass this join and own their output paths.
+        bypass all of that and own their own args plumbing.
         """
-        if not args.infer.prompt:
-            raise ValueError(
-                "`--infer.prompt` is required (use a non-empty string).  Example: --infer.prompt 'a cat'."
-            )
-        if not args.model.model_path:
-            raise ValueError("`--model.model_path` is required (launcher YAML must declare `model.model_path`).")
-
-        scenario, source = _select_scenario(args.model, has_image=bool(args.infer.image))
-        # Non-destructive copy via ``replace`` — the caller's ``args.infer``
-        # stays untouched (important for batched callers that reuse the
-        # same ``args`` object across multiple inferencer constructions).
-        infer_args = replace(args.infer, output_dir=os.path.join(args.infer.output_dir, scenario))
+        scenario = args.model.omni_infer_type
+        source = getattr(args, "_scenario_source", "?")
 
         logger.info_rank0(f"OmniInferencer.from_args: model_path = {args.model.model_path}")
         logger.info_rank0(f"OmniInferencer.from_args: scenario = {scenario}  (source: {source})")
-        logger.info_rank0(f"OmniInferencer.from_args: output_dir = {infer_args.output_dir}")
+        logger.info_rank0(f"OmniInferencer.from_args: output_dir = {args.infer.output_dir}")
 
         cfg = args.model.load_omni_config(infer_type=scenario)
-        return cls(cfg, dtype=dtype, seed=args.infer.seed, infer_args=infer_args)
+        return cls(cfg, dtype=dtype, seed=args.infer.seed, infer_args=args.infer)
 
     @classmethod
     def from_launcher(
