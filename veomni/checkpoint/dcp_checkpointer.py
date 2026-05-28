@@ -13,8 +13,10 @@
 # limitations under the License.
 
 
+import contextlib
 import gc
 import os
+import threading
 from collections import OrderedDict
 from typing import Any, Dict, Optional, Union
 
@@ -41,7 +43,14 @@ from torch.distributed.checkpoint.stateful import Stateful
 from ..distributed.parallel_state import get_parallel_state
 from ..utils import logging
 from ..utils.checkpoint_utils import _GLOBAL_STEP_PREFIX
-from ..utils.device import empty_cache, synchronize
+from ..utils.device import (
+    IS_CUDA_AVAILABLE,
+    IS_NPU_AVAILABLE,
+    empty_cache,
+    get_device_id,
+    get_device_type,
+    synchronize,
+)
 from .checkpointer import CheckpointerBase
 
 
@@ -49,6 +58,203 @@ logger = logging.get_logger(__name__)
 
 _EXTRA_STATE_FORMAT = "extra_state_rank_{}.pt"
 _EXTRA_STATE_DIR = "extra_state"
+
+
+# Workaround for a class of DCP save/load hangs on multi-node setups. The
+# smoking gun is ranks reporting DIFFERENT first-byte values in
+# ``_pickle.UnpicklingError`` after the Metadata broadcast — e.g.
+# rank{1,2,3,11,12,13,14,15} see ``'\x00'``, rank4 sees ``'\x0c'``,
+# rank6 sees ``'\x9b'`` (observed on production
+# Qwen3-VL-30B-A3B-Instruct ep_size=1 H100x16).
+#
+# If the broadcast had really synchronized, every receiver would see the
+# SAME bytes (and either all pass or all fail at the same opcode). Each
+# rank seeing different garbage means the broadcast returned to Python
+# before NCCL actually delivered the data to that rank's buffer — the
+# receivers then call ``_tensor_to_object`` which copies the GPU buffer
+# to CPU memory and feeds it to ``_unpickler``. The CPU copy reads
+# whatever uninitialized memory the GPU side has at that moment.
+#
+# This is a known shape of NCCL + caching-allocator stream tracking bug
+# that fires on multi-node setups (where the broadcast traverses RDMA)
+# but doesn't fire on single-node (where NVLink delivery is effectively
+# synchronous). Single-node A100 and H100 verify runs both pass; only
+# the multi-node prod jobs reproduce it.
+#
+# Fix: monkey-patch ``_tensor_to_object`` (the helper PyTorch uses inside
+# ``broadcast_object_list`` to read each object out of the broadcast
+# buffer) to call ``synchronize()`` first — but ONLY while a DCP save /
+# load is in progress on the current thread, gated by the thread-local
+# ``_in_dcp_op`` flag. This keeps the patch a no-op for every other
+# ``broadcast_object_list`` caller in the process (per-step micro-batch
+# broadcast in DiT trainer, weight-metadata broadcasts in
+# ``models/module_utils.py`` / ``utils/lora_utils.py``, etc.), so
+# importing this module doesn't inject a device sync into unrelated
+# training paths. Scope is entered via the ``_dcp_sync_scope`` context
+# manager wrapped around the actual ``dcp.save`` / ``dcp.async_save`` /
+# ``dcp.load`` calls below. The ``IS_CUDA_AVAILABLE`` guard keeps the
+# patch a no-op on CPU-only hosts.
+_in_dcp_op = threading.local()
+
+
+@contextlib.contextmanager
+def _dcp_sync_scope():
+    """Enable the ``_tensor_to_object`` device-sync workaround for the
+    duration of a DCP save/load call on the current thread.
+
+    Re-entrant: nested scopes restore the previous flag value on exit, so
+    accidentally nesting (e.g. a save inside a load callback) is safe.
+    """
+    prev = getattr(_in_dcp_op, "active", False)
+    _in_dcp_op.active = True
+    try:
+        yield
+    finally:
+        _in_dcp_op.active = prev
+
+
+try:
+    import torch.distributed.distributed_c10d as _c10d  # noqa: E402
+
+    _orig_tensor_to_object = _c10d._tensor_to_object
+
+    def _veomni_tensor_to_object_with_sync(*args, **kwargs):
+        # ``*args, **kwargs`` instead of a pinned ``(tensor, tensor_size,
+        # group)`` signature: ``_tensor_to_object`` is a private PyTorch
+        # API and fair game to add args to in future releases. With a
+        # pinned signature, a torch upgrade that added a kwarg would
+        # silently install at import time and then crash every DCP save
+        # in the process with a ``TypeError``.
+        if (IS_CUDA_AVAILABLE or IS_NPU_AVAILABLE) and getattr(_in_dcp_op, "active", False):
+            # Only fires inside ``_dcp_sync_scope``. Wait for any in-flight
+            # collective ops to actually deliver bytes into ``tensor``
+            # before we read them. On single-node NVLink builds this is
+            # essentially a no-op; on multi-node RDMA builds this is the
+            # load-bearing fence. Also gated on NPU because HCCL on
+            # multi-node has structurally the same async-completion
+            # semantics as NCCL — the receive buffer can be readable from
+            # CPU before the device-side write is fully delivered — so
+            # the same workaround applies. ``synchronize()`` is the
+            # device-agnostic helper from ``veomni.utils.device``.
+            synchronize()
+        return _orig_tensor_to_object(*args, **kwargs)
+
+    # Guard so re-importing the module doesn't stack the wrapper.
+    if not getattr(_c10d._tensor_to_object, "_veomni_dcp_sync_patched", False):
+        _veomni_tensor_to_object_with_sync._veomni_dcp_sync_patched = True
+        _c10d._tensor_to_object = _veomni_tensor_to_object_with_sync
+except (ImportError, AttributeError):  # pragma: no cover — defensive
+    pass
+
+
+# Companion patch for ``async_save``: ``torch.distributed.checkpoint.async_save``
+# offloads the actual ``save`` call to a ``ThreadPoolExecutor`` worker
+# (see ``_async_thread_executor._ThreadBasedAsyncCheckpointExecutor.execute_save``,
+# which imports ``state_dict_saver.save`` at call time and ``submit``s
+# it). The metadata broadcast — i.e. the ``_tensor_to_object`` call we
+# care about — therefore runs on the WORKER thread, not on the main
+# thread that entered ``_dcp_sync_scope``. Because the scope flag is
+# thread-local, the worker would see ``_in_dcp_op.active`` as False and
+# the sync workaround would be silently skipped, leaving async saves
+# exposed to exactly the multi-node broadcast corruption this patch
+# fixes. Wrap ``state_dict_saver.save`` itself so the scope is entered
+# on whichever thread ends up running it — this also makes the sync-path
+# explicit scope below redundant-but-safe (the scope is re-entrant).
+try:
+    import torch.distributed.checkpoint as _dcp_pkg  # noqa: E402
+    import torch.distributed.checkpoint.state_dict_saver as _sds  # noqa: E402
+
+    _orig_state_dict_saver_save = _sds.save
+
+    def _veomni_state_dict_saver_save_with_scope(*args, **kwargs):
+        with _dcp_sync_scope():
+            return _orig_state_dict_saver_save(*args, **kwargs)
+
+    # Guard so re-importing the module doesn't stack the wrapper.
+    if not getattr(_sds.save, "_veomni_dcp_save_scoped", False):
+        _veomni_state_dict_saver_save_with_scope._veomni_dcp_save_scoped = True
+        _sds.save = _veomni_state_dict_saver_save_with_scope
+        # ``torch.distributed.checkpoint.__init__.py`` does
+        # ``from .state_dict_saver import save`` at import time, so
+        # ``dcp.save`` is a separate binding from ``_sds.save`` after
+        # that import has run. Patching only ``_sds.save`` misses every
+        # direct ``dcp.save(...)`` caller (e.g.
+        # ``save_lora_adapter_with_dcp`` in
+        # ``veomni/utils/save_safetensor_utils.py``). Rebind the public
+        # name too so the multi-node broadcast-corruption fix covers all
+        # callers, not just the async path that dispatches through
+        # ``state_dict_saver.save`` at call time.
+        if getattr(_dcp_pkg, "save", None) is _orig_state_dict_saver_save:
+            _dcp_pkg.save = _veomni_state_dict_saver_save_with_scope
+except (ImportError, AttributeError):  # pragma: no cover — defensive
+    pass
+
+
+def _torch_save_with_no_progress_timeout(
+    obj: Any,
+    path: str,
+    no_progress_timeout: Optional[float] = None,
+    poll_interval: float = 10.0,
+) -> None:
+    """``torch.save(obj, path)`` guarded by a no-progress watchdog.
+
+    HDFS-FUSE has a "soft hang" failure mode where the write syscall
+    blocks indefinitely without raising — observed in production as a
+    rank going silent until the 10-min NCCL Watchdog fires. The
+    watchdog converts this into a ``TimeoutError`` so the calling code
+    can surface a clear error and the cross-rank coordination layer
+    can clean up uniformly.
+
+    Raises ``TimeoutError`` only when ``path``'s size has not increased
+    for ``no_progress_timeout`` seconds — distinguishing a stuck FUSE
+    syscall from a legitimately slow but progressing write.
+    """
+    import queue as _queue
+    import threading as _threading
+    import time as _time
+
+    if no_progress_timeout is None:
+        no_progress_timeout = float(os.environ.get("VEOMNI_DCP_COPY_NO_PROGRESS_SEC", "180"))
+
+    result_q: "_queue.Queue[tuple[str, Optional[BaseException]]]" = _queue.Queue()
+
+    def _worker():
+        try:
+            torch.save(obj, path)
+            result_q.put(("ok", None))
+        except BaseException as exc:
+            result_q.put(("err", exc))
+
+    t = _threading.Thread(target=_worker, daemon=True)
+    t.start()
+
+    last_size = -1
+    last_progress_t = _time.monotonic()
+    while True:
+        t.join(poll_interval)
+        if not t.is_alive():
+            break
+        try:
+            cur_size = os.path.getsize(path)
+        except OSError:
+            cur_size = 0
+        if cur_size > last_size:
+            last_size = cur_size
+            last_progress_t = _time.monotonic()
+        elif _time.monotonic() - last_progress_t > no_progress_timeout:
+            # Leaked thread is acceptable here — the FUSE syscall is
+            # blocked in the kernel and can't be interrupted from Python
+            # anyway.
+            raise TimeoutError(
+                f"torch.save({path!r}) made no progress for "
+                f"{no_progress_timeout:.0f}s at size {cur_size} (HDFS FUSE soft hang)"
+            )
+    try:
+        status, exc = result_q.get_nowait()
+    except _queue.Empty:
+        raise RuntimeError(f"torch.save({path!r}) worker thread exited without reporting a result") from None
+    if status == "err":
+        raise exc  # type: ignore[misc]
 
 
 class ModelState(Stateful):
@@ -346,8 +552,19 @@ class DistributedCheckpointer(CheckpointerBase):
     """
 
     save_future: Optional[Any] = None
-    # Dedicated process group for async saves (created on first use)
+    # Checkpoint directory associated with ``save_future`` — used by the
+    # cross-rank failure-coordination cleanup so we can ``rmtree`` the
+    # actually-broken directory when the previous async save raised on
+    # drain (instead of the *current* iteration's directory, which is
+    # what a naive cleanup would target).
+    _async_checkpoint_dir: Optional[str] = None
+    # Dedicated process group for async saves and extra_state failure
+    # coordination (created on first use, gloo backend preferred).
     _async_process_group: Optional[Any] = None
+    # Sticky flag: if we tried to create the gloo group and it failed
+    # (e.g. on HCCL/NPU deployments without gloo support), don't keep
+    # retrying on subsequent saves — fall back to the default backend.
+    _gloo_creation_failed: bool = False
 
     @classmethod
     def save(
@@ -383,8 +600,161 @@ class DistributedCheckpointer(CheckpointerBase):
         checkpoint_dir = f"{path}/{_GLOBAL_STEP_PREFIX}{global_steps}" if global_steps else path
         cls._create_checkpoint_dir(checkpoint_dir)
 
-        # saving extra_state first to gurantee that every saved model/optimizer ckpts have their extra_state saved before them
-        cls._save_extra_state(checkpoint_dir=checkpoint_dir, state=state)
+        # Eagerly create the gloo process group so the lazy creation
+        # inside ``_coord_save_failures`` cannot interleave with a slow
+        # rank's ``_save_extra_state`` retry chain. Without this, the
+        # first save of a job would have the fast ranks blocking
+        # silently inside ``dist.new_group(backend="gloo")`` (itself a
+        # collective) for as long as the slowest rank's retry loop
+        # takes — potentially minutes, with no log line explaining the
+        # apparent hang. Same try/except + sticky-flag pattern as
+        # ``_coord_save_failures``: gloo-unavailable deployments (some
+        # HCCL/NPU envs) flip the flag and fall through to the default
+        # backend later.
+        if dist.is_initialized() and cls._async_process_group is None and not cls._gloo_creation_failed:
+            try:
+                cls._async_process_group = dist.new_group(backend="gloo")
+            except Exception as e:
+                cls._gloo_creation_failed = True
+                logger.warning(
+                    f"Could not create gloo process group at save() entry ({e}); "
+                    f"_coord_save_failures will fall back to the default backend."
+                )
+
+        # Decide WHEN to drain the previous async-save future:
+        #
+        # - If the previous async save is writing into the SAME directory
+        #   we're about to write into (rare — happens only when the caller
+        #   reuses ``path`` / passes ``global_steps=None`` while the prior
+        #   future is still in flight), drain FIRST. Otherwise
+        #   ``_save_extra_state`` could write its file while the worker
+        #   thread is still flushing model/optimizer shards into the same
+        #   dir → mismatched checkpoint where extra_state is from
+        #   iteration N+1 but model data is from iteration N.
+        #
+        # - Otherwise (typical case: ``global_step`` monotonically
+        #   increases → unique dir per iteration), drain AFTER
+        #   ``_save_extra_state`` so per-rank local I/O can overlap with
+        #   the previous future for the common (no-failure) case.
+        prev_async_exc: Optional[BaseException] = None
+        prev_async_dir: Optional[str] = None
+        drain_first = cls.save_future is not None and cls._async_checkpoint_dir == checkpoint_dir
+        if drain_first:
+            prev_async_exc, prev_async_dir = cls._drain_previous_async_save()
+
+        # saving extra_state first to guarantee that every saved model/optimizer ckpts have their extra_state saved before them
+        #
+        # IMPORTANT: ``_save_extra_state`` is per-rank (no collective inside),
+        # but ``execute_save`` below IS a collective. If ``_save_extra_state``
+        # raises on only a subset of ranks (e.g. the no-progress watchdog
+        # fires in the local→HDFS fallback for one rank, or direct retries
+        # exhaust for another), those ranks would bail out before reaching
+        # ``execute_save`` and the surviving ranks would hang on the NCCL
+        # collective until the 10-min Watchdog fires — the exact deadlock
+        # this patch is supposed to prevent.
+        #
+        # Strategy: catch the IO failure modes locally, then do a
+        # cross-rank all_reduce on the failure flag. If ANY rank failed,
+        # all ranks skip ``execute_save`` together (so no ``.metadata``
+        # is published — ``dcp_get_last_iteration`` won't pick this dir
+        # for auto-resume) and rank 0 best-effort cleans up the partial
+        # directory. The failing rank's exception is then re-raised on
+        # all ranks (surfaced on the failing one, synthesized on the
+        # others so the caller sees a uniform "checkpoint not saved"
+        # signal). If NO rank failed, all proceed to ``execute_save``
+        # normally.
+        extra_state_exc: Optional[BaseException] = None
+        try:
+            cls._save_extra_state(checkpoint_dir=checkpoint_dir, state=state)
+        except Exception as e:
+            # Catch broadly. ``torch.save`` underneath can raise
+            # ``pickle.PicklingError``, ``TypeError`` (unpicklable object
+            # in ``extra_state``: lambda in ``lr_scheduler``, unhashable
+            # dataloader state, etc.), ``AttributeError`` (cloudpickle
+            # quirk), ``MemoryError`` on top of the I/O families
+            # (``TimeoutError`` / ``OSError`` / ``RuntimeError``). Any
+            # uncaught raise here would let this rank bail out before
+            # the cross-rank coordination, and peers would hang on the
+            # next collective in ``execute_save`` for 10 min until the
+            # NCCL Watchdog fires — the exact deadlock the rest of this
+            # code is engineered to prevent. The downstream cleanup path
+            # handles every kind of failure uniformly, so a broad catch
+            # is safe.
+            rank = dist.get_rank() if dist.is_initialized() else 0
+            logger.error(
+                f"[rank {rank}] _save_extra_state raised {type(e).__name__}: {e}. "
+                f"Coordinating with peer ranks; if any rank failed, dcp.save will be skipped "
+                f"and the partial checkpoint dir will be cleaned up to avoid silent corruption."
+            )
+            extra_state_exc = e
+
+        # Drain any previous async-save future (deferred case) BEFORE the
+        # coordination ``all_reduce`` — which shares ``cls._async_process_group``
+        # with the in-flight ``dcp.async_save`` worker thread. Two threads
+        # issuing overlapping collectives on one PG can deadlock or corrupt
+        # the next save. If we already drained above (same-dir case), this
+        # is a no-op via the ``cls.save_future is None`` guard.
+        #
+        # ``_drain_previous_async_save`` does NOT raise on per-rank
+        # failures — it captures the local exception and returns it,
+        # along with the directory that was being written by the failed
+        # future (so the cleanup below targets the right dir).
+        if not drain_first:
+            prev_async_exc, prev_async_dir = cls._drain_previous_async_save()
+
+        any_es_failed, any_prev_failed = cls._coord_save_failures(
+            local_extra_state_failure=extra_state_exc is not None,
+            local_prev_async_failure=prev_async_exc is not None,
+        )
+        any_failed = any_es_failed or any_prev_failed
+
+        if any_failed:
+            # Skip the dcp.save collective entirely → no ``.metadata`` lands
+            # on disk for the current iteration → ``dcp_get_last_iteration``
+            # cannot mis-pick it as the latest checkpoint. Rank 0 best-
+            # effort cleans up partial files.
+            #
+            # We may need to clean up TWO different directories:
+            #
+            # 1. ``prev_async_dir`` — the previous iteration's async-save
+            #    directory, which the failed future was writing into. Only
+            #    cleaned when ``any_prev_failed`` (the previous save
+            #    actually failed). If only the current extra_state failed,
+            #    the previous async-save dir is a *valid* checkpoint and
+            #    must be preserved.
+            # 2. ``checkpoint_dir`` — the current iteration's directory.
+            #    Always cleaned when ``any_failed`` (we skip dcp.save, so
+            #    it has at most some extra_state files and no .metadata).
+            if (not dist.is_initialized()) or dist.get_rank() == 0:
+                import shutil
+
+                dirs_to_clean = []
+                if any_prev_failed and prev_async_dir:
+                    dirs_to_clean.append(("previous async-save dir", prev_async_dir))
+                dirs_to_clean.append(("current iteration dir", checkpoint_dir))
+                for label, dir_path in dirs_to_clean:
+                    try:
+                        shutil.rmtree(dir_path, ignore_errors=True)
+                        logger.error(
+                            f"Removed partial checkpoint dir {dir_path} ({label}) after save failure; "
+                            f"dcp.save was NOT run for the current iteration."
+                        )
+                    except OSError as cleanup_exc:
+                        logger.warning(f"Could not clean up {dir_path}: {cleanup_exc}")
+            if dist.is_initialized():
+                dist.barrier(group=cls._async_process_group)
+            # Surface the earliest-causally-relevant local exception. If
+            # this rank itself failed (either previous async drain OR
+            # current extra_state), raise that. Otherwise synthesize a
+            # generic peer-failure error.
+            if prev_async_exc is not None:
+                raise prev_async_exc
+            if extra_state_exc is not None:
+                raise extra_state_exc
+            raise RuntimeError(
+                "Save failed on a peer rank; skipped dcp.save and removed "
+                "partial checkpoint dir(s) to avoid silent corruption."
+            )
 
         save_state = {"model": ModelState(state["model"], trainable_only=trainable_only)}
         if "optimizer" in state:
@@ -437,12 +807,15 @@ class DistributedCheckpointer(CheckpointerBase):
         if storage_reader is None:
             storage_reader = cls._create_storage_reader(checkpoint_dir)
 
-        dcp.load(
-            state_dict=load_state,
-            storage_reader=storage_reader,
-            process_group=process_group,
-            planner=DefaultLoadPlanner(allow_partial_load=True),
-        )
+        # DCP load also uses broadcast_object_list internally to share the
+        # Metadata; gate the sync workaround the same way as save.
+        with _dcp_sync_scope():
+            dcp.load(
+                state_dict=load_state,
+                storage_reader=storage_reader,
+                process_group=process_group,
+                planner=DefaultLoadPlanner(allow_partial_load=True),
+            )
 
         cls._load_extra_state(checkpoint_dir=checkpoint_dir, state=state)
 
@@ -459,27 +832,70 @@ class DistributedCheckpointer(CheckpointerBase):
     ) -> None:
         """Execute DCP save with optional async support."""
         if save_async:
-            # Lazily create a dedicated Gloo process group for async DCP saves
+            # Lazily create a dedicated Gloo process group for async DCP
+            # saves. ``dcp.async_save`` REQUIRES a CPU backend in the
+            # process group (it asserts ``torch.device("cpu") in pg._device_types``
+            # internally), so unlike the soft-fallback in
+            # ``_coord_save_failures`` we cannot silently degrade to the
+            # default backend here — async save just doesn't work without
+            # gloo. ``_gloo_creation_failed`` is the same sticky flag that
+            # ``_coord_save_failures`` sets; honor it so we don't retry a
+            # collective ``new_group`` call that already failed once.
             if cls._async_process_group is None:
-                cls._async_process_group = dist.new_group(backend="gloo")
+                if cls._gloo_creation_failed:
+                    raise RuntimeError(
+                        "dcp.async_save requires a gloo process group, but a prior "
+                        "dist.new_group(backend='gloo') already failed in this process. "
+                        "Use save_async=False, or initialize the default process group with "
+                        "a CPU backend (e.g. 'cpu:gloo,cuda:nccl')."
+                    )
+                try:
+                    cls._async_process_group = dist.new_group(backend="gloo")
+                except Exception as e:
+                    cls._gloo_creation_failed = True
+                    raise RuntimeError(
+                        f"dcp.async_save requires a gloo process group, but "
+                        f"dist.new_group(backend='gloo') failed: {e}. "
+                        f"Use save_async=False, or initialize the default process group with "
+                        f"a CPU backend (e.g. 'cpu:gloo,cuda:nccl')."
+                    ) from e
 
-            if cls.save_future is not None:
-                logger.info(f"[RANK {dist.get_rank()}] waiting for previous DCP saving session to end...")
-                cls.save_future.result()
-                cls.save_future = None
-                # block until all the ranks resolve their previous dcp async saving
-                dist.barrier()
+            # ``save()`` already drained-and-coordinated at its entry, so
+            # for the common path this is a no-op via the ``save_future is
+            # None`` guard inside the helper. The helper variant is used
+            # (rather than the bare drain) so that direct ``execute_save``
+            # callers — i.e. anyone bypassing ``save()`` — also get the
+            # coordinated raise-uniformly-or-not-at-all semantics; without
+            # it a stranded previous-future failure would be silently
+            # swallowed here for those callers.
+            cls.drain_and_coordinate_previous_async_save()
 
-            cls.save_future = dcp.async_save(
-                state_dict=save_state,
-                storage_writer=storage_writer,
-                process_group=cls._async_process_group,
-            )
+            # Scope the _tensor_to_object sync workaround to just this DCP
+            # call. async_save's metadata broadcast happens synchronously
+            # during the in-thread stage phase (before the future is
+            # returned); the background file-write thread doesn't broadcast,
+            # so thread-local scoping is sufficient.
+            with _dcp_sync_scope():
+                cls.save_future = dcp.async_save(
+                    state_dict=save_state,
+                    storage_writer=storage_writer,
+                    process_group=cls._async_process_group,
+                )
+            # Track the dir associated with this in-flight future so the
+            # next save's failure-coordination cleanup can ``rmtree`` it
+            # (rather than the wrong / current iteration's dir) if the
+            # future ends up raising on drain. Pulled off ``storage_writer``
+            # so this works for direct ``execute_save`` callers too —
+            # ``FileSystemWriter.path`` is the public attribute.
+            cls._async_checkpoint_dir = str(getattr(storage_writer, "path", None) or "")
+            if not cls._async_checkpoint_dir:
+                cls._async_checkpoint_dir = None  # type: ignore[assignment]
         else:
-            dcp.save(
-                state_dict=save_state,
-                storage_writer=storage_writer,
-            )
+            with _dcp_sync_scope():
+                dcp.save(
+                    state_dict=save_state,
+                    storage_writer=storage_writer,
+                )
             if dist.is_initialized():
                 dist.barrier()
             gc.collect()
@@ -508,31 +924,338 @@ class DistributedCheckpointer(CheckpointerBase):
         )
 
     @classmethod
+    def _drain_previous_async_save(cls) -> tuple:
+        """Block until any in-flight ``dcp.async_save`` future completes,
+        returning ``(local_exc, prev_dir)``.
+
+        - ``local_exc`` is the exception raised by ``save_future.result()``
+          on this rank, or ``None`` if it succeeded.
+        - ``prev_dir`` is the checkpoint directory that was being written
+          by the in-flight future (captured at submission time in
+          ``execute_save`` from ``storage_writer.path``), or ``None`` if
+          there was no future. The caller uses this to ``rmtree`` the
+          actually-broken directory in the failure-coordination cleanup;
+          using the current iteration's ``checkpoint_dir`` instead (what
+          the previous version of this code did) would leave the broken
+          previous-iteration directory on disk for ``dcp_get_last_iteration``
+          to mis-pick on the next auto-resume.
+
+        Idempotent: if ``cls.save_future`` is ``None`` returns
+        ``(None, None)``.
+
+        IMPORTANT — does not raise: the previous async save can raise on
+        only a subset of ranks (e.g. writer-thread I/O failure on one
+        host), and propagating that here would let those ranks bail out
+        before reaching the subsequent ``_coord_save_failures`` all_reduce
+        while the survivors blocked there forever. Instead we capture the
+        local exception and let the caller coordinate cross-rank.
+
+        Critical for correctness: ``_coord_save_failures``' all_reduce
+        shares ``cls._async_process_group`` with the ``dcp.async_save``
+        worker thread; without this drain the two threads could issue
+        overlapping collectives on one PG and deadlock or corrupt the
+        save. The drain itself no longer issues a ``barrier`` — the
+        subsequent all_reduce serves as the cross-rank synchronization
+        point.
+        """
+        if cls.save_future is None:
+            return None, None
+        if dist.is_initialized():
+            logger.info(f"[RANK {dist.get_rank()}] waiting for previous DCP saving session to end...")
+        local_exc: Optional[BaseException] = None
+        try:
+            cls.save_future.result()
+        except Exception as e:
+            rank = dist.get_rank() if dist.is_initialized() else 0
+            logger.error(
+                f"[rank {rank}] previous dcp.async_save future raised on drain: "
+                f"{type(e).__name__}: {e}. Will coordinate with peer ranks; the current "
+                f"save will be aborted."
+            )
+            local_exc = e
+        prev_dir = cls._async_checkpoint_dir
+        cls.save_future = None
+        cls._async_checkpoint_dir = None
+        return local_exc, prev_dir
+
+    @classmethod
+    def drain_and_coordinate_previous_async_save(cls) -> None:
+        """Public coordinated drain for callers outside of ``save()``.
+
+        Use this anywhere code would previously have done a raw
+        ``cls.save_future.result()`` (e.g. ``CheckpointerCallback._load_checkpoint``
+        before ``load()``, the HF safetensor export, etc.). It captures
+        the local exception via ``_drain_previous_async_save``, coordinates
+        cross-rank via ``_coord_save_failures``, best-effort ``rmtree``s
+        the failed directory on rank 0, and raises a uniform error on all
+        ranks if any rank's previous save failed.
+
+        Why this matters: a raw ``.result()`` re-raises the worker
+        thread's exception synchronously, but distributed save failures
+        are typically asymmetric (one rank's HDFS write fails, others
+        succeed). Without coordination the failing rank exits the
+        function while peers continue into the next collective (``load``,
+        ``barrier``, HF export's collective save), and the whole job
+        deadlocks. The coordinated wrapper guarantees that either all
+        ranks raise or none do.
+
+        No-op if there's no in-flight async save.
+        """
+        prev_exc, prev_dir = cls._drain_previous_async_save()
+        _, any_prev_failed = cls._coord_save_failures(
+            local_extra_state_failure=False,
+            local_prev_async_failure=prev_exc is not None,
+        )
+        if not any_prev_failed:
+            return
+        # Best-effort cleanup of the broken previous-iteration dir on rank 0.
+        if prev_dir and ((not dist.is_initialized()) or dist.get_rank() == 0):
+            import shutil
+
+            try:
+                shutil.rmtree(prev_dir, ignore_errors=True)
+                logger.error(f"Removed broken previous async-save dir {prev_dir} after a peer-rank failure.")
+            except OSError as cleanup_exc:
+                logger.warning(f"Could not clean up {prev_dir}: {cleanup_exc}")
+        if dist.is_initialized():
+            dist.barrier(group=cls._async_process_group)
+        if prev_exc is not None:
+            raise prev_exc
+        raise RuntimeError("Previous dcp.async_save failed on a peer rank.")
+
+    @classmethod
+    def _coord_save_failures(cls, local_extra_state_failure: bool, local_prev_async_failure: bool) -> tuple:
+        """All-reduce two local failure flags across ranks in a single
+        collective.
+
+        Returns ``(any_extra_state_failed, any_prev_async_failed)``.
+        Distinguishing the two failure kinds is necessary because the
+        cleanup logic differs: ``any_prev_async_failed`` triggers
+        ``rmtree`` of the *previous iteration's* dir; ``any_extra_state_failed``
+        only triggers ``rmtree`` of the *current* dir.
+
+        Tries to use a gloo process group (lazily created here) instead
+        of NCCL/HCCL so this collective is not subject to the NCCL/HCCL
+        Watchdog timeout — it can follow a long-running
+        ``_save_extra_state`` retry chain that may itself approach or
+        exceed the default 10-min Watchdog.
+
+        On deployments where gloo is not available (notably some HCCL/NPU
+        environments — see the codex review #7 finding), we silently fall
+        back to the default process group. The all_reduce still works,
+        just under the default backend's watchdog policy. Lazy creation
+        is safe because EVERY rank goes through this helper on every
+        save (regardless of which ranks failed), so ``dist.new_group``
+        is called in lockstep.
+
+        Single-process / dist-not-initialized path just returns the local
+        flags unchanged.
+        """
+        if not dist.is_initialized():
+            return local_extra_state_failure, local_prev_async_failure
+        if cls._async_process_group is None and not cls._gloo_creation_failed:
+            try:
+                cls._async_process_group = dist.new_group(backend="gloo")
+            except Exception as e:
+                # Gloo backend not available — fall through to default group.
+                # Cached so subsequent saves don't retry the new_group call
+                # (which would itself be a redundant collective).
+                cls._gloo_creation_failed = True
+                logger.warning(
+                    f"Could not create gloo process group for save failure coordination ({e}); "
+                    f"falling back to the default backend. NCCL/HCCL Watchdog may fire on this "
+                    f"all_reduce if _save_extra_state took an unusually long time on some ranks."
+                )
+        # ``cls._async_process_group`` is either a gloo group, or None (use default).
+        # Gloo all_reduce wants a CPU tensor; NCCL needs CUDA; HCCL needs NPU.
+        # Pick the device by which path we're on so the fallback (default
+        # PG = NCCL/HCCL on accelerator deployments) doesn't crash with a
+        # backend/device mismatch — that would defeat the whole point of
+        # the fallback (which exists specifically for HCCL/NPU envs).
+        if cls._async_process_group is None and (IS_CUDA_AVAILABLE or IS_NPU_AVAILABLE):
+            flag_device = torch.device(f"{get_device_type()}:{get_device_id()}")
+        else:
+            flag_device = torch.device("cpu")
+        # Single tensor, two slots → one collective, both kinds decoded.
+        flag = torch.tensor(
+            [1 if local_extra_state_failure else 0, 1 if local_prev_async_failure else 0],
+            dtype=torch.long,
+            device=flag_device,
+        )
+        dist.all_reduce(flag, op=dist.ReduceOp.SUM, group=cls._async_process_group)
+        return flag[0].item() > 0, flag[1].item() > 0
+
+    @classmethod
     def _save_extra_state(cls, checkpoint_dir: str, state: Dict[str, Any]) -> None:
-        """Save extra_state to checkpoint directory."""
+        """Save extra_state to checkpoint directory.
+
+        Direct ``torch.save`` to the HDFS path with retry-and-backoff plus
+        a no-progress watchdog. The watchdog (``_torch_save_with_no_progress_timeout``)
+        converts an HDFS-FUSE soft-hang (write syscall blocks forever
+        without raising) into a ``TimeoutError`` so the rank doesn't
+        wedge silently until the 10-min NCCL Watchdog fires.
+
+        Recovery strategy:
+
+        1. Try the watchdog-wrapped ``torch.save`` directly to the HDFS
+           path. On success: return.
+        2. On ``TimeoutError`` (soft hang): propagate immediately with
+           NO cleanup and NO retry — the leaked worker thread still
+           owns the path and any retry would race with it. The outer
+           ``save()`` catches it, coordinates cross-rank via
+           ``_coord_save_failures``, and all ranks raise uniformly.
+        3. On ``RuntimeError`` / ``OSError`` (zip-writer enforce-fail,
+           errno-5/75/107, etc.): clean up the half-written file,
+           sleep with exponential backoff (1s, 2s), retry up to
+           ``_DIRECT_RETRIES`` total attempts. On exhaustion: re-raise
+           the last error. ``save()``'s cross-rank coordination handles
+           the rest (any-rank failure → all ranks skip ``dcp.save`` and
+           clean up the partial dir).
+
+        The trainer's next checkpoint iteration provides the recovery
+        path: a single FUSE flake fails this save, but training
+        continues and the next save typically succeeds.
+        """
         if "extra_state" not in state:
             logger.warning_rank0("extra_state not found in state, skipping extra_state save")
             return
 
         extra_state_dir = os.path.join(checkpoint_dir, _EXTRA_STATE_DIR)
         os.makedirs(extra_state_dir, exist_ok=True)
-        extra_state_path = os.path.join(extra_state_dir, _EXTRA_STATE_FORMAT.format(dist.get_rank()))
-        torch.save(
-            state["extra_state"],
-            extra_state_path,
-        )
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        extra_state_path = os.path.join(extra_state_dir, _EXTRA_STATE_FORMAT.format(rank))
+
+        _DIRECT_RETRIES = 3  # 1 initial + 2 retries
+        _DIRECT_BACKOFF_BASE_SEC = 1.0  # 1s, 2s
+        import time
+
+        last_exc: Optional[BaseException] = None
+
+        for attempt in range(_DIRECT_RETRIES):
+            try:
+                # Watchdog wrap: soft hang surfaces as TimeoutError
+                # rather than wedging the rank for the NCCL Watchdog
+                # window.
+                _torch_save_with_no_progress_timeout(state["extra_state"], extra_state_path)
+                if attempt > 0:
+                    logger.info(
+                        f"[rank {rank}] _save_extra_state: torch.save succeeded on retry "
+                        f"attempt {attempt + 1}/{_DIRECT_RETRIES} after earlier error ({last_exc!r})"
+                    )
+                return
+            except TimeoutError as e:
+                # Worker thread is still blocked in the FUSE syscall
+                # and STILL OWNS ``extra_state_path``. Retry would race
+                # with the leaked thread. Propagate immediately; outer
+                # save() coordinates cross-rank.
+                logger.error(
+                    f"[rank {rank}] _save_extra_state: torch.save soft-hang on attempt "
+                    f"{attempt + 1}/{_DIRECT_RETRIES} for {extra_state_path}: {e}. "
+                    f"NOT retrying — leaked write thread still holds the destination."
+                )
+                raise
+            except (RuntimeError, OSError) as e:
+                last_exc = e
+                is_last = attempt == _DIRECT_RETRIES - 1
+                backoff = _DIRECT_BACKOFF_BASE_SEC * (2**attempt)
+                logger.warning(
+                    f"[rank {rank}] _save_extra_state: torch.save attempt "
+                    f"{attempt + 1}/{_DIRECT_RETRIES} failed with {type(e).__name__}: {e}."
+                    + ("" if is_last else f" Cleaning up partial file and sleeping {backoff:.1f}s before retry.")
+                )
+                # Safe to clean up: torch.save raised synchronously (not
+                # via the watchdog), so no leaked thread owns the path.
+                try:
+                    if os.path.exists(extra_state_path):
+                        os.remove(extra_state_path)
+                except OSError as cleanup_exc:
+                    logger.warning(
+                        f"[rank {rank}] _save_extra_state: cleanup of {extra_state_path} "
+                        f"failed: {cleanup_exc}; subsequent retry may inherit junk bytes."
+                    )
+                if not is_last:
+                    time.sleep(backoff)
+
+        # All direct retries exhausted — re-raise. save()'s cross-rank
+        # coordination takes it from here.
+        raise last_exc if last_exc is not None else RuntimeError("_save_extra_state exhausted")
 
     @classmethod
     def _load_extra_state(cls, checkpoint_dir: str, state: Dict[str, Any]) -> None:
-        """Load extra_state from checkpoint directory."""
+        """Load extra_state from checkpoint directory.
+
+        Hardened against HDFS-FUSE flakiness and against asymmetric raise
+        across ranks. A bare ``torch.load`` failure on a single rank's
+        HDFS-FUSE path would let that rank bail out while peer ranks
+        proceed past this call into the next collective (e.g. the next
+        ``dist.barrier`` inside the load callback) and hang on the NCCL
+        Watchdog — the same shape of deadlock the save path is engineered
+        to avoid.
+
+        Retry policy (mirrors ``_save_extra_state``'s direct retry):
+        - Try ``torch.load`` up to ``_DIRECT_RETRIES`` times. Errno-5 /
+          errno-75 / errno-107 / zip-writer enforce-fails seen on save
+          can also intermittently affect read.
+        - On exhaustion: capture the local exception, coordinate across
+          ranks via ``_coord_save_failures``, raise uniformly.
+        """
         if "extra_state" not in state:
             logger.warning_rank0("extra_state not found in state, skipping extra_state load")
             return
 
         extra_state_dir = os.path.join(checkpoint_dir, _EXTRA_STATE_DIR)
         os.makedirs(extra_state_dir, exist_ok=True)
-        extra_state_path = os.path.join(extra_state_dir, _EXTRA_STATE_FORMAT.format(dist.get_rank()))
-        state["extra_state"] = torch.load(extra_state_path, weights_only=False)
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        extra_state_path = os.path.join(extra_state_dir, _EXTRA_STATE_FORMAT.format(rank))
+
+        _DIRECT_RETRIES = 3  # 1 initial + 2 retries
+        _DIRECT_BACKOFF_BASE_SEC = 1.0
+        import time
+
+        last_exc: Optional[BaseException] = None
+        loaded = False
+        for attempt in range(_DIRECT_RETRIES):
+            try:
+                state["extra_state"] = torch.load(extra_state_path, weights_only=False)
+                if attempt > 0:
+                    logger.info(
+                        f"[rank {rank}] _load_extra_state: torch.load succeeded on retry "
+                        f"attempt {attempt + 1}/{_DIRECT_RETRIES} after earlier error ({last_exc!r})"
+                    )
+                loaded = True
+                break
+            except Exception as e:
+                # Broad catch for the same reasons documented in save()'s
+                # ``_save_extra_state`` wrapper — any uncaught raise here
+                # would be asymmetric across ranks and hang the next
+                # collective.
+                last_exc = e
+                is_last = attempt == _DIRECT_RETRIES - 1
+                backoff = _DIRECT_BACKOFF_BASE_SEC * (2**attempt)
+                logger.warning(
+                    f"[rank {rank}] _load_extra_state: torch.load attempt "
+                    f"{attempt + 1}/{_DIRECT_RETRIES} failed with {type(e).__name__}: {e}."
+                    + ("" if is_last else f" Sleeping {backoff:.1f}s before retry to let the FUSE mount settle.")
+                )
+                if not is_last:
+                    time.sleep(backoff)
+
+        # Coordinate cross-rank. Reuse ``_coord_save_failures``'s
+        # "prev_async_failure" slot to carry the load failure flag — the
+        # semantics (any-rank-failed → all raise) are the same; only the
+        # name is save-flavored. Keep the local-extra-state-failure flag
+        # at False since that's a save-only concept.
+        _, any_failed = cls._coord_save_failures(
+            local_extra_state_failure=False,
+            local_prev_async_failure=not loaded,
+        )
+        if any_failed:
+            if last_exc is not None:
+                raise last_exc
+            raise RuntimeError(
+                f"_load_extra_state failed on a peer rank (rank {rank} succeeded). "
+                f"Checkpoint at {checkpoint_dir} is unloadable."
+            )
 
 
 def get_dtype_size(dtype: torch.dtype) -> int:
