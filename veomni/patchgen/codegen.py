@@ -89,7 +89,7 @@ def get_module_source(module_name: str) -> str:
     file_path = _find_module_file(module_name)
     if file_path is not None:
         try:
-            return file_path.read_text()
+            return file_path.read_text(encoding="utf-8")
         except OSError as e:
             raise CodegenError(f"Cannot read source for '{module_name}' at {file_path}: {e}") from e
 
@@ -1230,7 +1230,7 @@ class ModelingCodeGenerator:
         # 5. Write to file if path provided
         if output_path:
             output_path.parent.mkdir(parents=True, exist_ok=True)
-            output_path.write_text(output)
+            output_path.write_text(output, encoding="utf-8")
             print(f"Generated: {output_path}")
 
         return output

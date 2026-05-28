@@ -109,9 +109,17 @@ class DiscoveryConfig:
         ``sys.path`` (e.g. fresh clone, sandboxed CI). For
         ``DiscoveryConfig(search_root=Path('X/myproj/models'),
         package_prefix='myproj.models')`` this returns ``Path('X')``.
+
+        ``search_root`` is ``.resolve()``-d first so a relative input like
+        ``Path('models')`` whose ``parents`` chain is shorter than
+        ``len(package_prefix.split('.'))`` does not raise ``IndexError``.
+        Resolving against CWD also matches how a user would normally
+        construct a relative path here (e.g. running the CLI from the
+        project root).
         """
         depth = len(self.package_prefix.split("."))
-        return self.search_root.parents[depth - 1] if depth > 0 else self.search_root
+        resolved = self.search_root.resolve()
+        return resolved.parents[depth - 1] if depth > 0 else resolved
 
 
 # VeOmni's own discovery — used by this module's CLI.
@@ -340,7 +348,7 @@ def run_codegen(
             extra_ignore=ruff_extra_ignore or None,
             isolated=ruff_isolated,
         )
-        output = output_path.read_text()
+        output = output_path.read_text(encoding="utf-8")
 
         print(f"\n✓ Generated: {output_path}")
         print(f"  Lines: {len(output.splitlines())}")
@@ -355,7 +363,7 @@ def run_codegen(
                 )
             )
             diff_path = default_diff_path(output_dir, config.target_file)
-            diff_path.write_text(diff_output)
+            diff_path.write_text(diff_output, encoding="utf-8")
             print(f"✓ Diff: {diff_path}")
             print(f"  Lines: {len(diff_output.splitlines())}")
 

@@ -105,7 +105,7 @@ def check_config(
 
     try:
         ruff_fix_and_format(tmp_path, extra_ignore=ruff_extra_ignore or None, isolated=ruff_isolated)
-        normalized_py = tmp_path.read_text()
+        normalized_py = tmp_path.read_text(encoding="utf-8")
     finally:
         tmp_path.unlink(missing_ok=True)
 
@@ -122,11 +122,11 @@ def check_config(
     # -- compare ----------------------------------------------------------------
     ok = True
 
-    existing_py = checked_in_py.read_text() if checked_in_py.exists() else ""
+    existing_py = checked_in_py.read_text(encoding="utf-8") if checked_in_py.exists() else ""
     if existing_py != normalized_py:
         if fix:
             checked_in_py.parent.mkdir(parents=True, exist_ok=True)
-            checked_in_py.write_text(normalized_py)
+            checked_in_py.write_text(normalized_py, encoding="utf-8")
             print(f"  FIXED {checked_in_py}")
         else:
             ok = False
@@ -140,11 +140,13 @@ def check_config(
             print(f"  DRIFT {checked_in_py}")
             sys.stdout.writelines(diff)
 
-    existing_diff = strip_diff_trailing_ws(checked_in_diff.read_text()) if checked_in_diff.exists() else ""
+    existing_diff = (
+        strip_diff_trailing_ws(checked_in_diff.read_text(encoding="utf-8")) if checked_in_diff.exists() else ""
+    )
     if existing_diff != normalized_diff:
         if fix:
             checked_in_diff.parent.mkdir(parents=True, exist_ok=True)
-            checked_in_diff.write_text(normalized_diff)
+            checked_in_diff.write_text(normalized_diff, encoding="utf-8")
             print(f"  FIXED {checked_in_diff}")
         else:
             ok = False
