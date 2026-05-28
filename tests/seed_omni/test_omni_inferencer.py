@@ -1,10 +1,11 @@
-"""Smoke tests for :mod:`veomni.trainer.omni_inferencer`.
+"""Smoke tests for :mod:`veomni.trainer.omni_inferencer` and the
+:func:`veomni.models.seed_omni.read_model_type` registry-dispatch helper.
 
 Scope
 -----
 * :class:`InferenceRequest` carries the expected default shape and the
-  module's public surface (``__all__``) exports it.
-* :func:`_read_model_type` (validation gate before ``from_pretrained``)
+  inferencer module's public surface (``__all__``) exports it.
+* :func:`read_model_type` (validation gate before ``from_pretrained``)
   rejects unknown / missing ``model_type`` with a useful message.
 
 Full end-to-end (real Janus weights) inference is covered by
@@ -21,10 +22,8 @@ from pathlib import Path
 
 import pytest
 
-from veomni.trainer.omni_inferencer import (
-    InferenceRequest,
-    _read_model_type,
-)
+from veomni.models.seed_omni import read_model_type
+from veomni.trainer.omni_inferencer import InferenceRequest
 
 
 # ── InferenceRequest ─────────────────────────────────────────────────────────
@@ -61,7 +60,7 @@ def test_inference_request_is_a_plain_dataclass():
     }
 
 
-# ── _read_model_type ────────────────────────────────────────────────────────
+# ── read_model_type ─────────────────────────────────────────────────────────
 
 
 def test_read_model_type_rejects_unregistered_family(tmp_path: Path):
@@ -75,7 +74,7 @@ def test_read_model_type_rejects_unregistered_family(tmp_path: Path):
     cfg = {"model_type": "llama", "hidden_size": 8, "num_attention_heads": 1, "num_hidden_layers": 1}
     (tmp_path / "config.json").write_text(json.dumps(cfg))
     with pytest.raises(KeyError, match="not registered in OMNI_MODEL_REGISTRY"):
-        _read_model_type(str(tmp_path))
+        read_model_type(str(tmp_path))
 
 
 def test_read_model_type_rejects_completely_unknown_family(tmp_path: Path):
@@ -84,7 +83,7 @@ def test_read_model_type_rejects_completely_unknown_family(tmp_path: Path):
     cfg = {"model_type": "definitely_not_registered_xyz"}
     (tmp_path / "config.json").write_text(json.dumps(cfg))
     with pytest.raises((ValueError, KeyError)):
-        _read_model_type(str(tmp_path))
+        read_model_type(str(tmp_path))
 
 
 # ── Public surface ──────────────────────────────────────────────────────────

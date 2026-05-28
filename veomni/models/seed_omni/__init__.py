@@ -32,6 +32,7 @@ from .modules import (
     OMNI_CONFIG_REGISTRY,
     OMNI_MODEL_REGISTRY,
     OMNI_PROCESSOR_REGISTRY,
+    read_model_type,
 )
 from .training_graph import TrainingGraph
 
@@ -53,6 +54,7 @@ __all__ = [
     "OMNI_CONFIG_REGISTRY",
     "OMNI_MODEL_REGISTRY",
     "OMNI_PROCESSOR_REGISTRY",
+    "read_model_type",
     # Lifecycle
     "OmniModuleCheckpointCallback",
 ]

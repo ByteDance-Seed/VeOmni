@@ -77,18 +77,18 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import torch
-from transformers import AutoTokenizer, PretrainedConfig
+from transformers import AutoTokenizer
 
 from ..arguments import InferArguments
 from ..data.multimodal.image_utils import load_image, save_image_tensors_to_file
 from ..models.seed_omni import (
-    OMNI_CONFIG_REGISTRY,
     OMNI_MODEL_REGISTRY,
     OMNI_PROCESSOR_REGISTRY,
     ConversationPart,
     OmniConfig,
     OmniModel,
     build_conversation,
+    read_model_type,
 )
 from ..utils import helper
 from ..utils.device import get_device_type
@@ -361,7 +361,7 @@ class OmniInferencer:
                 raise FileNotFoundError(
                     f"Module '{name}' weights_path does not exist or is not a directory: {weights_path}"
                 )
-            model_type = _read_model_type(weights_path)
+            model_type = read_model_type(weights_path)
             cls = OMNI_MODEL_REGISTRY[model_type]()
             logger.info_rank0(
                 f"  building module '{name}' (model_type={model_type}, cls={cls.__name__}) from {weights_path}"
@@ -392,7 +392,7 @@ class OmniInferencer:
             weights_path = mod_cfg.get("weights_path")
             if not weights_path:
                 continue
-            model_type = _read_model_type(weights_path)
+            model_type = read_model_type(weights_path)
             if model_type not in proc_keys:
                 continue
             proc_cls = OMNI_PROCESSOR_REGISTRY[model_type]()
@@ -665,42 +665,6 @@ def _save_generated_image(tensor: torch.Tensor, out_path: str) -> None:
     # the +1/2 mapping is the exact inverse of Janus' ``2x - 1`` preprocess.
     img = (img.clamp(-1.0, 1.0) + 1.0) / 2.0
     save_image_tensors_to_file(img, out_path)
-
-
-def _read_model_type(weights_path: str) -> str:
-    """Read ``model_type`` from a module's ``config.json``.
-
-    Uses :meth:`PretrainedConfig.get_config_dict` (not
-    :class:`AutoConfig.from_pretrained`) because Janus split-checkpoint
-    configs declare custom ``model_type`` values
-    (``janus_siglip`` / ``janus_text_encoder`` / ``janus_llama`` /
-    ``janus_vqvae``) that are not in HF's :data:`CONFIG_MAPPING`.
-    ``AutoConfig`` would raise on those families before we even get a
-    chance to consult :data:`OMNI_MODEL_REGISTRY`; reading the raw dict
-    sidesteps that.  See :mod:`veomni.models.loader` for the same
-    pattern in the foundation-model loader.
-    """
-    config_dict, _ = PretrainedConfig.get_config_dict(weights_path)
-    model_type = config_dict.get("model_type")
-    if not model_type:
-        raise ValueError(f"Module config at {weights_path} has no `model_type` — cannot resolve OmniModule class.")
-    # Note: :class:`Registry.__getitem__` raises ``ValueError`` (not
-    # ``KeyError``) on miss, so the default ``in`` test on a MutableMapping
-    # subclass would mis-route the exception.  Use ``valid_keys()`` to
-    # decide registration explicitly.
-    config_keys = set(OMNI_CONFIG_REGISTRY.valid_keys())
-    model_keys = set(OMNI_MODEL_REGISTRY.valid_keys())
-    if model_type in config_keys:
-        # Validate the config can be re-read by the registered subclass so
-        # downstream `from_pretrained` doesn't hit a surprise schema gap.
-        cfg_cls = OMNI_CONFIG_REGISTRY[model_type]()
-        cfg_cls.from_pretrained(weights_path)
-    if model_type not in model_keys:
-        raise KeyError(
-            f"Module model_type {model_type!r} (from {weights_path}) is not registered in "
-            f"OMNI_MODEL_REGISTRY. Known: {sorted(model_keys)}."
-        )
-    return model_type
 
 
 __all__ = [
