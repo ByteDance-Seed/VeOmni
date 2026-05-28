@@ -231,8 +231,17 @@ try:
             # Phase 2: bulk-copy local → HDFS. This is where the HDFS write
             # actually happens — but it's one continuous read+write loop,
             # not the zip writer's interleaved seek/write/checksum that
-            # provoked the FUSE bugs. Retry on the same failure family.
-            _COPY_RETRIES = 3
+            # provoked the FUSE bugs. Retry on the same failure family
+            # with **exponential backoff** — observed in production that
+            # the same file can hit several errno-75/errno-5 attempts in
+            # quick succession before the FUSE mount recovers, so the
+            # first few retries firing instantly aren't useful; we need
+            # to give the mount a few seconds to settle.
+            _COPY_RETRIES = 10
+            _BACKOFF_BASE_SEC = 1.0  # 1s, 2s, 4s, 8s, 16s, 30s, 30s, 30s, 30s
+            _BACKOFF_CAP_SEC = 30.0
+            import time
+
             last_exc: Optional[BaseException] = None
             for attempt in range(_COPY_RETRIES):
                 try:
@@ -246,16 +255,20 @@ try:
                     return
                 except (OSError, RuntimeError) as e:
                     last_exc = e
+                    backoff = min(_BACKOFF_BASE_SEC * (2**attempt), _BACKOFF_CAP_SEC)
+                    is_last = attempt == _COPY_RETRIES - 1
                     logger.warning(
                         f"DCP create_stream: shutil.copy attempt {attempt + 1}/{_COPY_RETRIES} "
-                        f"failed for {path_str}: {type(e).__name__}: {e}. "
-                        f"Removing partial dest and retrying."
+                        f"failed for {path_str}: {type(e).__name__}: {e}."
+                        + ("" if is_last else f" Removing partial dest and sleeping {backoff:.1f}s before retry.")
                     )
                     try:
                         if os.path.exists(path_str):
                             os.remove(path_str)
                     except OSError as cleanup_exc:
                         logger.warning(f"DCP create_stream: cleanup of partial {path_str} failed: {cleanup_exc}")
+                    if not is_last:
+                        time.sleep(backoff)
 
             # All copy retries exhausted — surface the exception. The
             # outer DCP machinery's writer thread will die, which is
