@@ -29,7 +29,6 @@ from __future__ import annotations
 
 import argparse
 import os
-from pathlib import Path
 
 import requests
 import torch
@@ -150,8 +149,8 @@ def _select_scenario(has_image: bool, infer_map: dict) -> str:
 def main() -> None:
     args = _parse_args()
 
-    launcher_path = Path(args.yaml).resolve()
-    if not launcher_path.exists():
+    launcher_path = os.path.realpath(args.yaml)
+    if not os.path.isfile(launcher_path):
         raise FileNotFoundError(f"Launcher YAML not found: {launcher_path}")
 
     model_section = load_launcher_model_section(launcher_path)
@@ -196,7 +195,11 @@ def main() -> None:
 
     reply = _extract_reply(ctx)
     reply_path = os.path.join(args.output_dir, "reply.txt")
-    Path(reply_path).write_text(reply + ("\n" if reply and not reply.endswith("\n") else ""))
+    # encoding="utf-8" is load-bearing — Janus is multilingual so reply text
+    # may carry CJK / emoji.  Default-locale opens crash on `LANG=C` images
+    # (the common slim-base case).
+    with open(reply_path, "w", encoding="utf-8") as f:
+        f.write(reply + ("\n" if reply and not reply.endswith("\n") else ""))
     print(f"[infer_omni] reply ({len(reply)} chars) → {reply_path}")
     if reply:
         print(f"--- reply ---\n{reply}\n-------------")
@@ -209,7 +212,8 @@ def main() -> None:
 
     if trace_buf is not None:
         trace_path = os.path.join(args.output_dir, "trace.txt")
-        Path(trace_path).write_text("\n".join(trace_buf) + "\n")
+        with open(trace_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(trace_buf) + "\n")
         print(f"[infer_omni] FSM trace ({len(trace_buf)} lines) → {trace_path}")
 
     if not reply and not images_out:

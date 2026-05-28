@@ -75,7 +75,6 @@ YAML structure (maps 1-to-1 to this class):
 
 import os
 from copy import deepcopy
-from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Union
 
 from transformers import PretrainedConfig
@@ -106,17 +105,17 @@ def apply_model_path(cfg: "OmniConfig", model_path: str) -> "OmniConfig":
     return cfg
 
 
-def load_launcher_model_section(launcher_yaml: Union[str, Path]) -> Dict[str, Any]:
+def load_launcher_model_section(launcher_yaml: Union[str, os.PathLike]) -> Dict[str, Any]:
     """Return the ``model:`` block from a VeOmni launcher YAML."""
     import yaml
 
-    path = Path(launcher_yaml)
-    data = yaml.safe_load(path.read_text()) or {}
+    with open(launcher_yaml, encoding="utf-8") as f:
+        data = yaml.safe_load(f) or {}
     if not isinstance(data, dict):
-        raise TypeError(f"YAML at '{path}' must be a top-level mapping.")
+        raise TypeError(f"YAML at '{launcher_yaml}' must be a top-level mapping.")
     model = data.get("model")
     if not isinstance(model, dict):
-        raise ValueError(f"YAML at '{path}' must declare a top-level `model:` mapping.")
+        raise ValueError(f"YAML at '{launcher_yaml}' must declare a top-level `model:` mapping.")
     return model
 
 
@@ -181,7 +180,7 @@ class OmniConfig(PretrainedConfig):
         return cls(**accepted, **kwargs)
 
     @classmethod
-    def from_yamls(cls, *paths: Union[str, Path], **kwargs) -> "OmniConfig":
+    def from_yamls(cls, *paths: Union[str, os.PathLike], **kwargs) -> "OmniConfig":
         """Load + deep-merge multiple YAML configs (later overrides earlier).
 
         SeedOmni V2 splits configuration into a **training YAML** that
@@ -230,8 +229,8 @@ class OmniConfig(PretrainedConfig):
 
         merged: Dict[str, Any] = {}
         for p in paths:
-            text = Path(p).read_text()
-            data = yaml.safe_load(text) or {}
+            with open(p, encoding="utf-8") as f:
+                data = yaml.safe_load(f) or {}
             if not isinstance(data, dict):
                 raise TypeError(f"YAML at '{p}' must be a top-level mapping; got {type(data).__name__}.")
             merged = _deep_merge(merged, data)
@@ -240,7 +239,7 @@ class OmniConfig(PretrainedConfig):
     @classmethod
     def from_launcher(
         cls,
-        launcher_yaml: Union[str, Path],
+        launcher_yaml: Union[str, os.PathLike],
         *,
         infer_type: Optional[str] = None,
         **kwargs,
@@ -263,7 +262,7 @@ class OmniConfig(PretrainedConfig):
 
         infer_map: Mapping[str, str] = model.get("omni_infer_yaml_path") or {}
         selected = infer_type or model.get("omni_infer_type")
-        paths: List[Union[str, Path]] = [train_yaml]
+        paths: List[Union[str, os.PathLike]] = [train_yaml]
         if selected is not None:
             if selected not in infer_map:
                 known = ", ".join(sorted(infer_map)) or "(none)"

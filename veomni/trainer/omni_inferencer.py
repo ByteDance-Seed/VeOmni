@@ -65,7 +65,6 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any, Mapping
 
 import torch
@@ -199,7 +198,7 @@ class OmniInferencer:
     @classmethod
     def from_launcher(
         cls,
-        launcher_yaml: str | Path,
+        launcher_yaml: str | os.PathLike,
         *,
         infer_type: str | None = None,
         model_path: str | None = None,
