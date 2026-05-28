@@ -255,22 +255,44 @@ class JanusVqvae(OmniModule, PreTrainedModel):
             return {"conversation_list": conversation_list} if conversation_list is not None else {}
 
         batch_size = hidden_states.size(0)
-        if batch_size != 1:
+        sampling = self._extract_sampling_kwargs(generation_kwargs)
+        cfg_w = float(sampling.pop("guidance_scale", 1.0) or 1.0)
+
+        # Classifier-free guidance mix.
+        #
+        # When ``JanusLlama.generate`` expanded the KV cache to bs=2 on the
+        # first ``image_vq`` step, every subsequent step delivers bs=2
+        # hidden states here: row 0 = conditional, row 1 = unconditional.
+        # We project both, mix via the standard ``uncond + w*(cond-uncond)``
+        # formula (same as HF's ``ClassifierFreeGuidanceLogitsProcessor``
+        # — see ``transformers/models/janus/modeling_janus.py:1250``), then
+        # sample ONE token shared across both branches and broadcast it
+        # back to bs=2 for the next AR step's ``inputs_embeds`` (matching
+        # ``modeling_janus.py:1352``).  Single-branch bs=1 mode (no CFG)
+        # keeps the legacy fast path.
+        if batch_size == 2 and cfg_w > 1.0:
+            cond_logits = self.generation_head(hidden_states[:1, -1:, :]).squeeze(1)
+            uncond_logits = self.generation_head(hidden_states[1:, -1:, :]).squeeze(1)
+            last_logits = uncond_logits + cfg_w * (cond_logits - uncond_logits)
+        elif batch_size == 1:
+            last_logits = self.generation_head(hidden_states[:, -1:, :]).squeeze(1)
+        else:
             raise NotImplementedError(
-                f"JanusVqvae.generate supports B == 1 only (got B={batch_size}). "
-                "Batched VQ generation is not yet wired into the conversation-list FSM."
+                f"JanusVqvae.generate received hidden_states with B={batch_size}. "
+                "Supported: B=1 (no CFG) or B=2 (CFG cond/uncond pair). "
+                "Multi-image batched generation is not yet wired into the conversation-list FSM."
             )
 
-        # (B, 1, vocab) → (B, vocab) for sampling, then back to (B, 1)
-        # for the embedding lookup — keep shapes parallel to legacy decode().
-        last_logits = self.generation_head(hidden_states[:, -1:, :]).squeeze(1)
-        sampling = self._extract_sampling_kwargs(generation_kwargs)
-        sampled = self._sample_vq_token(last_logits, **sampling).unsqueeze(-1)  # (B, 1)
+        sampled = self._sample_vq_token(last_logits, **sampling).unsqueeze(-1)  # (1, 1)
         token_id_int = int(sampled[0, 0].item())
         self._gen_buffer.append(token_id_int)
 
         embed_raw = self.generation_embeddings(sampled)
-        embed = self.generation_aligner(embed_raw)  # (B, 1, H)
+        embed = self.generation_aligner(embed_raw)  # (1, 1, H)
+        if batch_size == 2:
+            # Feed the next AR step as bs=2 so the JanusLlama KV cache
+            # (also bs=2) sees a matching tail.
+            embed = embed.expand(2, *embed.shape[1:]).contiguous()
 
         out: Dict[str, Any] = {
             "vq_token_id": sampled.squeeze(-1),
@@ -325,9 +347,17 @@ class JanusVqvae(OmniModule, PreTrainedModel):
 
     @staticmethod
     def _extract_sampling_kwargs(generation_kwargs: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-        merged: Dict[str, Any] = {"temperature": 1.0, "top_p": 1.0, "do_sample": True}
+        # `guidance_scale` rides in this dict but is consumed by the CFG
+        # mix above (not by `_sample_vq_token`), so we whitelist it here
+        # and pop it before sampling.
+        merged: Dict[str, Any] = {
+            "temperature": 1.0,
+            "top_p": 1.0,
+            "do_sample": True,
+            "guidance_scale": 1.0,
+        }
         if generation_kwargs:
-            for k in ("temperature", "top_p", "do_sample"):
+            for k in ("temperature", "top_p", "do_sample", "guidance_scale"):
                 if k in generation_kwargs:
                     merged[k] = generation_kwargs[k]
         return merged

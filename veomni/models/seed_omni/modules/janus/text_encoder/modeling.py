@@ -44,6 +44,7 @@ fits naturally into the FSM step body without needing an explicit
 ``batch_size`` argument.
 """
 
+import logging
 from typing import Any, Dict, List, Optional
 
 import torch
@@ -54,6 +55,9 @@ from ....generation_graph import FSM_SIGNAL_KEY
 from ....graph import scalar_token_id
 from ...base.text_encoder.modeling import TextEncoder
 from .configuration import JanusTextEncoderConfig
+
+
+logger = logging.getLogger(__name__)
 
 
 # Signal *values* written to ``ctx[FSM_SIGNAL_KEY]`` by :meth:`decode`.
@@ -109,6 +113,7 @@ class JanusTextEncoder(TextEncoder):
         self._boi_token_id: Optional[int] = None
         self._eoi_token_id: Optional[int] = None
         self._eos_token_id: Optional[int] = None
+        self._pad_token_id: Optional[int] = None
 
     def set_tokenizer(self, tokenizer: Any) -> None:
         """Resolve Janus special-token ids from the global tokenizer."""
@@ -125,6 +130,13 @@ class JanusTextEncoder(TextEncoder):
         )
         eos = getattr(tokenizer, "eos_token_id", None)
         self._eos_token_id = int(eos) if eos is not None else None
+        pad = getattr(tokenizer, "pad_token_id", None)
+        # Pad falls back to eos when the tokenizer doesn't ship one — same
+        # convention HF uses when building uncond inputs in
+        # `JanusForConditionalGeneration.generate`
+        # (`modeling_janus.py:1282-1285`).  We need a real id here, otherwise
+        # the CFG uncond branch can't replace non-BOS positions.
+        self._pad_token_id = int(pad) if pad is not None else self._eos_token_id
         if self._boi_token_id is not None:
             self.config.begin_of_image_token_id = self._boi_token_id
         if self._eoi_token_id is not None:
@@ -137,6 +149,7 @@ class JanusTextEncoder(TextEncoder):
         *,
         conversation_list: Optional[List[ConversationPart]] = None,
         past_key_values: Optional[Any] = None,
+        generation_kwargs: Optional[Dict[str, Any]] = None,
         **_: Any,
     ) -> Dict[str, Any]:
         """Embed every text / token part that lacks ``inputs_embeds``.
@@ -152,9 +165,26 @@ class JanusTextEncoder(TextEncoder):
         Subsequent calls (KV cache present): walks the tail of the list
         embedding any newly-appended ``token`` part whose ``inputs_embeds``
         is still ``None``.  This is the AR fast path used by ``text_ar``.
+
+        Classifier-free guidance (CFG) prep
+        -----------------------------------
+        When ``generation_kwargs['guidance_scale'] > 1.0`` and we're on
+        the prompt pass (no KV cache yet), we also build the matching
+        unconditional ``inputs_embeds`` and stash it under
+        ``cfg_uncond_inputs_embeds`` in the return dict so
+        :meth:`JanusLlama.generate` can build a bs=2 KV cache lazily on
+        the first ``image_vq`` AR step.  Construction follows the HF
+        reference (``modeling_janus.py:1282-1285``): same length as the
+        cond prompt, every non-``<bos>`` position replaced by
+        ``pad_token_id`` before the embedding lookup.  ``<begin_of_image>``
+        is also kept when present, but at this point in the FSM (prompt
+        pass) the boi has not yet been appended to the conversation, so
+        the rule reduces to "keep BOS, pad everything else".
         """
         if conversation_list is None:
             return {}
+
+        out: Dict[str, Any] = {"conversation_list": conversation_list}
 
         if past_key_values is None:
             self._inject_bos(conversation_list)
@@ -163,6 +193,9 @@ class JanusTextEncoder(TextEncoder):
                 if part.inputs_embeds is not None:
                     continue
                 self._embed_part(part)
+            uncond = self._maybe_build_cfg_uncond_embeds(conversation_list, generation_kwargs)
+            if uncond is not None:
+                out["cfg_uncond_inputs_embeds"] = uncond
         else:
             # AR fast path: every prior part is already embedded; walk
             # backward from the tail until we hit a populated part so
@@ -176,7 +209,7 @@ class JanusTextEncoder(TextEncoder):
                 tail_to_embed.append(part)
             for part in reversed(tail_to_embed):
                 self._embed_part(part)
-        return {"conversation_list": conversation_list}
+        return out
 
     # ── Inference: decode + FSM signals (conversation-list aware) ────────────
 
@@ -331,6 +364,65 @@ class JanusTextEncoder(TextEncoder):
             )
             out["conversation_list"] = conversation_list
         return out
+
+    # ── CFG: build the unconditional inputs_embeds ───────────────────────────
+
+    def _maybe_build_cfg_uncond_embeds(
+        self,
+        conversation_list: List[ConversationPart],
+        generation_kwargs: Optional[Dict[str, Any]],
+    ) -> Optional[torch.Tensor]:
+        """Build ``(1, T_prompt, hidden)`` uncond inputs_embeds, or ``None``.
+
+        Returns ``None`` (skip CFG) when:
+
+        * ``guidance_scale`` is missing / <= 1.0;
+        * the tokenizer wasn't wired in (``set_tokenizer`` not called) — we
+          can't resolve ``pad_token_id`` then;
+        * any conversation part already carries non-text content (image_und
+          parts have ``input_ids = None``); Janus's CFG protocol is only
+          defined for the T2I path so we conservatively bail out.
+        """
+        if not generation_kwargs:
+            return None
+        cfg_w = generation_kwargs.get("guidance_scale")
+        if cfg_w is None or float(cfg_w) <= 1.0:
+            return None
+        if self._tokenizer is None or self._pad_token_id is None or self._bos_token_id is None:
+            return None
+
+        bos_id = int(self._bos_token_id)
+        pad_id = int(self._pad_token_id)
+        boi_id = self._boi_token_id  # may be None if not registered
+        device = self.embed_tokens.weight.device
+        dtype = self.embed_tokens.weight.dtype
+
+        uncond_chunks: List[torch.Tensor] = []
+        for part in conversation_list:
+            if part.inputs_embeds is None:
+                continue
+            ids = part.input_ids
+            if ids is None or ids.numel() == 0:
+                # image_und / image_gen part — CFG masking rule undefined for
+                # multi-modal prompts in Janus.  Abort the whole uncond build
+                # and warn so users don't silently get noise-quality samples
+                # (the failure mode CFG is meant to fix).
+                logger.warning(
+                    "JanusTextEncoder: guidance_scale > 1 was requested but the prompt "
+                    "contains a non-text part (kind=%r) with no input_ids — CFG only "
+                    "supports T2I prompts (text-only). Skipping uncond branch; the LLM "
+                    "will run with cond logits only.",
+                    part.kind,
+                )
+                return None
+            keep_mask = ids == bos_id
+            if boi_id is not None:
+                keep_mask = keep_mask | (ids == int(boi_id))
+            masked = torch.where(keep_mask, ids, torch.full_like(ids, pad_id))
+            uncond_chunks.append(self.embed_tokens(masked).to(dtype=dtype, device=device))
+        if not uncond_chunks:
+            return None
+        return torch.cat(uncond_chunks, dim=1)
 
     # ── Finalize: decode the accumulated assistant text ──────────────────────
 

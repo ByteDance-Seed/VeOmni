@@ -77,6 +77,18 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--max_new_tokens", type=int, default=1024, help="FSM iteration cap.")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument(
+        "--guidance_scale",
+        type=float,
+        default=5.0,
+        help=(
+            "Classifier-free guidance weight for text-to-image generation (Janus default = 5.0). "
+            "Ignored in I2T scenarios and when <= 1.0. Same shape as `--guidance_scale` on the HF "
+            "baseline `scripts/multimodal/infer/janus_hf_infer_gen.py`."
+        ),
+    )
+    p.add_argument("--temperature", type=float, default=1.0, help="Sampling temperature.")
+    p.add_argument("--top_p", type=float, default=1.0, help="Nucleus-sampling top-p threshold.")
+    p.add_argument(
         "--trace",
         action="store_true",
         help="Dump FSM step / transition log to <output_dir>/trace.txt (debugging aid).",
@@ -161,11 +173,23 @@ def main() -> None:
     images: list[Image.Image] = [_load_image(args.image)] if args.image else []
     force_image_gen = not args.image  # T2I scenarios should steer to image-VQ immediately
 
+    # CFG only kicks in for T2I — for I2T we squelch it back to 1.0 so the
+    # janus_text_encoder skips building the uncond branch entirely (its
+    # construction rule isn't well-defined for prompts containing
+    # image_und parts; see `_maybe_build_cfg_uncond_embeds`).
+    guidance_scale = float(args.guidance_scale) if force_image_gen else 1.0
+    generation_kwargs = {
+        "temperature": args.temperature,
+        "top_p": args.top_p,
+        "guidance_scale": guidance_scale,
+    }
+
     trace_buf: list[str] = [] if args.trace else None
     ctx = inferencer.generate(
         prompt=args.prompt,
         images=images,
         force_image_gen=force_image_gen,
+        generation_kwargs=generation_kwargs,
         max_new_tokens=args.max_new_tokens,
         trace=trace_buf,
     )
