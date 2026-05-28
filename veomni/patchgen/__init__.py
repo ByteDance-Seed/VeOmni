@@ -26,11 +26,25 @@ required) and rewrites its AST. Dependent projects that pin transformers
 v4 can use this library the same way v5 callers do — provided their patch
 config targets a module file that actually exists on their installed
 transformers.
+
+Lazy submodule loading
+----------------------
+
+``check_patchgen`` and ``run_codegen`` are CLI entry points designed to
+be invoked via ``python -m veomni.patchgen.<sub>``. Eagerly re-exporting
+their contents here would force ``runpy`` to load each submodule twice
+(once as a regular module via this ``__init__``, then again as
+``__main__``) and emit a confusing
+``RuntimeWarning: found in sys.modules after import of package ...``.
+
+PEP 562 ``__getattr__`` defers the import until the symbol is actually
+accessed, so the warning never fires while top-level
+``from veomni.patchgen import DiscoveryConfig`` still works.
 """
 
+from typing import TYPE_CHECKING
+
 from ._normalize import ruff_fix_and_format
-from .check_patchgen import build_cli as build_check_cli
-from .check_patchgen import check_config, run_check
 from .codegen import (
     CodegenError,
     ModelingCodeGenerator,
@@ -46,18 +60,78 @@ from .patch_spec import (
     PositionedHelper,
     create_patch_from_external,
 )
-from .run_codegen import (
-    DiscoveryConfig,
-    build_unified_diff,
-    default_diff_path,
-    default_output_dir_for_module,
-    list_patch_configs,
-    normalize_patch_module,
-    run_codegen,
-)
-from .run_codegen import (
-    build_cli as build_run_codegen_cli,
-)
+
+
+# Lazy re-exports for the CLI-bearing submodules. Mapping is
+# ``<public name in this package>: (<submodule>, <attr in submodule>)``.
+_LAZY_EXPORTS: dict[str, tuple[str, str]] = {
+    # check_patchgen
+    "build_check_cli": ("check_patchgen", "build_cli"),
+    "check_config": ("check_patchgen", "check_config"),
+    "run_check": ("check_patchgen", "run_check"),
+    # run_codegen
+    "DiscoveryConfig": ("run_codegen", "DiscoveryConfig"),
+    "build_run_codegen_cli": ("run_codegen", "build_cli"),
+    "build_unified_diff": ("run_codegen", "build_unified_diff"),
+    "default_diff_path": ("run_codegen", "default_diff_path"),
+    "default_output_dir_for_module": ("run_codegen", "default_output_dir_for_module"),
+    "list_patch_configs": ("run_codegen", "list_patch_configs"),
+    "normalize_patch_module": ("run_codegen", "normalize_patch_module"),
+    "run_codegen": ("run_codegen", "run_codegen"),
+}
+
+
+def __getattr__(name: str):
+    """PEP 562 lazy attribute lookup.
+
+    Resolves names in ``_LAZY_EXPORTS`` by importing the backing submodule
+    on first access, then caches the resolved value in ``globals()`` so
+    subsequent accesses skip ``__getattr__`` entirely.
+
+    Subtlety: ``run_codegen`` is both a public function AND the name of
+    the submodule that defines it. Python's import machinery executes
+    ``setattr(parent_pkg, submodule_name, submodule)`` after loading a
+    submodule, which would leave ``veomni.patchgen.run_codegen`` pointing
+    at the submodule (overriding any prior function binding) whenever
+    *any* lazy lookup imports that submodule for *any* symbol. We work
+    around it by pre-binding **all** re-exports from the just-imported
+    submodule, so the function shadows the submodule entry before
+    control returns to the caller.
+    """
+    if name in _LAZY_EXPORTS:
+        from importlib import import_module
+
+        submod_name = _LAZY_EXPORTS[name][0]
+        submod = import_module(f".{submod_name}", __name__)
+        for export_name, (sm, sm_attr) in _LAZY_EXPORTS.items():
+            if sm == submod_name:
+                globals()[export_name] = getattr(submod, sm_attr)
+        return globals()[name]
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__() -> list[str]:
+    return sorted(__all__)
+
+
+# Re-import the lazy names under TYPE_CHECKING so static analysers, IDE
+# autocomplete, and Sphinx see them as ordinary re-exports. These imports
+# are skipped at runtime — the only runtime path is __getattr__ above.
+if TYPE_CHECKING:
+    from .check_patchgen import build_cli as build_check_cli
+    from .check_patchgen import check_config, run_check
+    from .run_codegen import (
+        DiscoveryConfig,
+        build_unified_diff,
+        default_diff_path,
+        default_output_dir_for_module,
+        list_patch_configs,
+        normalize_patch_module,
+        run_codegen,
+    )
+    from .run_codegen import (
+        build_cli as build_run_codegen_cli,
+    )
 
 
 __all__ = [
@@ -76,7 +150,7 @@ __all__ = [
     "load_patch_config_module",
     # Normalization
     "ruff_fix_and_format",
-    # Discovery + run_codegen
+    # Discovery + run_codegen (lazy)
     "DiscoveryConfig",
     "build_run_codegen_cli",
     "build_unified_diff",
@@ -85,7 +159,7 @@ __all__ = [
     "list_patch_configs",
     "normalize_patch_module",
     "run_codegen",
-    # Drift check
+    # Drift check (lazy)
     "build_check_cli",
     "check_config",
     "run_check",
