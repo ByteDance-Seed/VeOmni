@@ -215,8 +215,10 @@ def main() -> None:
     launcher_label = _yaml_stem(launcher_yaml) if launcher_yaml else _yaml_stem(train_yaml)
     ext = ".html" if fmt == "html" else ".mmd"
 
-    # 1. Training graph (train YAML only).
-    cfg_train = OmniConfig.from_yamls(train_yaml)
+    # 1. Training graph (train YAML only).  Empty ``model_path`` keeps the
+    # diagram labels short — visualization doesn't load weights, so relative
+    # ``weights_path`` values stay relative (e.g. ``janus_siglip``).
+    cfg_train = OmniConfig.from_paths(model_path="", tokenizer_path="", train_yaml_path=train_yaml)
     train_title = f"{launcher_label} — training"
     train_body, train_meta = _render_training(cfg_train, title=train_title)
     train_path = os.path.join(out_dir, "training" + ext)
@@ -225,7 +227,12 @@ def main() -> None:
 
     # 2. One FSM per inference scenario.
     for infer_key, infer_path in sorted(infer_map.items()):
-        cfg = OmniConfig.from_yamls(train_yaml, infer_path)
+        cfg = OmniConfig.from_paths(
+            model_path="",
+            tokenizer_path="",
+            train_yaml_path=train_yaml,
+            infer_yaml_path=infer_path,
+        )
         fsm_title = f"{launcher_label} — {infer_key}"
         fsm_body, fsm_meta = _render_fsm(cfg, title=fsm_title)
         fsm_path = os.path.join(out_dir, infer_key + ext)

@@ -122,8 +122,9 @@ class OmniModelArguments(ModelArguments):
         metadata={
             "help": (
                 "Mapping of inference scenario name → inference YAML path.  "
-                "Each value is deep-merged over ``omni_train_yaml_path`` at "
-                "runtime.  Example keys: infer_gen, infer_und, infer_interleave."
+                "The selected scenario's YAML overlays ``omni_train_yaml_path`` "
+                "at runtime (flat ``dict.update``; only top-level keys can be "
+                "replaced).  Example keys: infer_gen, infer_und, infer_interleave."
             )
         },
     )
@@ -145,24 +146,28 @@ class OmniModelArguments(ModelArguments):
 
     def load_omni_config(self, *, infer_type: Optional[str] = None):
         """Build :class:`OmniConfig` with resolved module paths."""
-        from ..models.seed_omni.configuration_seed_omni import OmniConfig, apply_model_path
+        from ..models.seed_omni.configuration_seed_omni import OmniConfig
 
         if not self.omni_train_yaml_path:
             raise ValueError("`model.omni_train_yaml_path` is required for OmniModel V2.")
         if not self.model_path:
             raise ValueError("`model.model_path` is required for OmniModel V2.")
 
-        paths = [self.omni_train_yaml_path]
+        infer_yaml_path = None
         selected = infer_type or self.omni_infer_type
         if selected is not None:
             infer_map = self.omni_infer_yaml_path or {}
             if selected not in infer_map:
                 known = ", ".join(sorted(infer_map)) or "(none)"
                 raise KeyError(f"Unknown omni_infer_type {selected!r}; expected one of: {known}.")
-            paths.append(infer_map[selected])
+            infer_yaml_path = infer_map[selected]
 
-        cfg = OmniConfig.from_yamls(*paths)
-        return apply_model_path(cfg, self.model_path)
+        return OmniConfig.from_paths(
+            model_path=self.model_path,
+            tokenizer_path=self.tokenizer_path,
+            train_yaml_path=self.omni_train_yaml_path,
+            infer_yaml_path=infer_yaml_path,
+        )
 
 
 @dataclass

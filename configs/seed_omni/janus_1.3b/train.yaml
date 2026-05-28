@@ -22,8 +22,8 @@
 # ``model.model_path`` in the launcher YAML (``veomni_janus.yaml``).
 #
 # For inference, the launcher YAML selects one of the sibling ``infer_*.yaml``
-# files via ``model.omni_infer_type``; each file deep-merges its
-# ``generation_graph`` over this vocabulary.  See ``OmniConfig.from_launcher``.
+# files via ``model.omni_infer_type``; the selected file overlays its
+# ``generation_graph`` onto this vocabulary.  See ``OmniConfig.from_paths``.
 #
 # Split the upstream Janus checkpoint first (creates the sub-folders
 # referenced by relative ``modules.*.weights_path``)::

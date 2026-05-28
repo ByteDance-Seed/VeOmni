@@ -410,10 +410,14 @@ def _janus_cfg_dir() -> Path:
 
 
 def test_janus_train_yaml_loads_with_v2_module_names():
-    """The shipped training YAML must round-trip through ``OmniConfig.from_yamls``."""
+    """The shipped training YAML must round-trip through ``OmniConfig.from_paths``."""
     from veomni.models.seed_omni.configuration_seed_omni import OmniConfig
 
-    cfg = OmniConfig.from_yamls(_janus_cfg_dir() / "train.yaml")
+    cfg = OmniConfig.from_paths(
+        model_path="",
+        tokenizer_path="",
+        train_yaml_path=_janus_cfg_dir() / "train.yaml",
+    )
 
     assert set(cfg.modules) == {"janus_siglip", "janus_vqvae", "janus_llama", "janus_text_encoder"}
     assert cfg.modules["janus_siglip"]["weights_path"] == "janus_siglip"
@@ -434,9 +438,11 @@ def test_janus_train_plus_infer_merges_generation_graph(infer_yaml: str):
     """Two-file load: training vocabulary + inference scenario merge cleanly."""
     from veomni.models.seed_omni.configuration_seed_omni import OmniConfig
 
-    cfg = OmniConfig.from_yamls(
-        _janus_cfg_dir() / "train.yaml",
-        _janus_cfg_dir() / infer_yaml,
+    cfg = OmniConfig.from_paths(
+        model_path="",
+        tokenizer_path="",
+        train_yaml_path=_janus_cfg_dir() / "train.yaml",
+        infer_yaml_path=_janus_cfg_dir() / infer_yaml,
     )
     # Training vocabulary still present.
     assert set(cfg.modules) == {"janus_siglip", "janus_vqvae", "janus_llama", "janus_text_encoder"}
@@ -464,56 +470,25 @@ def test_janus_train_plus_infer_merges_generation_graph(infer_yaml: str):
             assert e in cfg.edges, f"state '{state_name}' body edge '{e}' not in pool"
 
 
-def test_from_yamls_deep_merge_overrides_specific_keys(tmp_path: Path):
-    """Override semantics: dict merge, scalar replace, ``None`` no-op."""
+def test_from_paths_resolves_relative_module_paths():
+    """``from_paths`` joins relative ``weights_path`` under the given ``model_path``."""
     from veomni.models.seed_omni.configuration_seed_omni import OmniConfig
-
-    base = tmp_path / "base.yaml"
-    over = tmp_path / "over.yaml"
-    base.write_text(
-        "tokenizer_path: /a\n"
-        "modules:\n"
-        "  foo: {weights_path: /x, micro_batch_size: 4}\n"
-        "  bar: {weights_path: /y}\n"
-        "nodes:\n"
-        "  enc: {module: foo}\n"
-        "edges:\n"
-        "  e1: {from: enc, to: end}\n"
-        "training_graph:\n"
-        "  edges: [e1]\n"
-    )
-    over.write_text(
-        "tokenizer_path: /b\n"
-        "modules:\n"
-        "  foo: {micro_batch_size: 8}\n"  # only override one knob; weights_path kept
-        "generation_graph:\n"
-        "  initial: s\n"
-        "  states: {s: {body: [], token_length: {type: variable}, transitions: []}}\n"
-    )
-    cfg = OmniConfig.from_yamls(base, over)
-
-    assert cfg.tokenizer_path == "/b"  # scalar replaced
-    assert cfg.modules["foo"]["weights_path"] == "/x"  # base survived
-    assert cfg.modules["foo"]["micro_batch_size"] == 8  # override applied
-    assert cfg.modules["bar"]["weights_path"] == "/y"  # untouched module preserved
-    assert cfg.has_generation_graph()  # painted on
-    assert cfg.training_edges == ["e1"]  # not stomped
-
-
-def test_from_launcher_resolves_relative_module_paths():
-    from veomni.models.seed_omni.configuration_seed_omni import OmniConfig
-
-    launcher = _janus_cfg_dir() / "veomni_janus.yaml"
-    cfg = OmniConfig.from_launcher(launcher, infer_type="infer_gen")
 
     root = "seed_omni/janus_1.3b"
+    cfg = OmniConfig.from_paths(
+        model_path=root,
+        tokenizer_path=root,
+        train_yaml_path=_janus_cfg_dir() / "train.yaml",
+        infer_yaml_path=_janus_cfg_dir() / "infer_gen.yaml",
+    )
+
     assert cfg.tokenizer_path == root
     assert cfg.modules["janus_siglip"]["weights_path"] == f"{root}/janus_siglip"
     assert cfg.modules["janus_text_encoder"]["weights_path"] == f"{root}/janus_text_encoder"
     assert cfg.has_generation_graph()
     # The V2 conversation-list inference path always starts with
-    # ``prompt_encode`` (vision + text + LLM + first sample).  The
-    # legacy ``prompt_to_image`` name was retired alongside the
-    # bridge-state-based image_vq_start (now consumed by the boi
-    # token's appearance in the conversation list).
+    # ``prompt_encode`` (vision + text + LLM + first sample).  The legacy
+    # ``prompt_to_image`` name was retired alongside the bridge-state-based
+    # image_vq_start (now consumed by the boi token's appearance in the
+    # conversation list).
     assert cfg.generation_graph["initial"] == "prompt_encode"

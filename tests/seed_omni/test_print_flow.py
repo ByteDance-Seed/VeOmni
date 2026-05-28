@@ -12,7 +12,7 @@ executes things in the expected order.
 
 Graph vocabulary and inference FSMs live in :mod:`tests.seed_omni.toy_config`
 (``train.yaml`` + ``infer_{interleave,gen,und}.yaml``) and are loaded via
-``OmniConfig.from_yamls`` — same layout as ``configs/seed_omni/janus_1.3b/``.
+``OmniConfig.from_paths`` — same layout as ``configs/seed_omni/janus_1.3b/``.
 
 Coverage
 --------
@@ -79,11 +79,14 @@ def _toy_config_dir() -> Path:
 
 
 def _load_config(*, infer: str | None = None) -> OmniConfig:
-    """Load train vocabulary, optionally merged with an inference scenario."""
-    paths = [_toy_config_dir() / "train.yaml"]
-    if infer is not None:
-        paths.append(_toy_config_dir() / _TOY_INFER_FILES[infer])
-    return OmniConfig.from_yamls(*paths)
+    """Load train vocabulary, optionally overlaid with an inference scenario."""
+    infer_path = _toy_config_dir() / _TOY_INFER_FILES[infer] if infer is not None else None
+    return OmniConfig.from_paths(
+        model_path="",
+        tokenizer_path="",
+        train_yaml_path=_toy_config_dir() / "train.yaml",
+        infer_yaml_path=infer_path,
+    )
 
 
 def _load_train_dict() -> dict[str, Any]:
@@ -787,6 +790,9 @@ def test_omni_model_rejects_module_name_colliding_with_framework_attr():
         n_name: {**n_def, "module": _rename(n_def["module"], "text_encoder", "config")}
         for n_name, n_def in cfg_dict["nodes"].items()
     }
+    # ``from_dict`` requires ``model_path`` (pops it for weights-path resolution);
+    # empty string is fine here because no relative weights_path joins are exercised.
+    cfg_dict.setdefault("model_path", "")
     cfg = OmniConfig.from_dict(cfg_dict)
 
     log: list[str] = []

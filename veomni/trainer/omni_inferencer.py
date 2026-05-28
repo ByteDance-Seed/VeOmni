@@ -14,57 +14,46 @@
 
 """OmniInferencer — SeedOmni V2 single-process inference driver.
 
+Usage::
+
+    args = parse_args(OmniInferenceArguments)
+    OmniInferencer(args).generate()
+
 Lifecycle
 ---------
-1. ``OmniInferencer(cfg)`` takes a fully-resolved :class:`OmniConfig`
-   (already deep-merged with the desired ``generation_graph`` from
-   training + inference YAMLs, with module ``weights_path`` values
-   joined under the split-checkpoint root).  Two convenience factories
-   build a ready inferencer in one call:
+1. :class:`OmniInferenceArguments` is parsed by
+   :func:`veomni.arguments.parse_args`.  Its ``__post_init__`` copies
+   ``--infer.model_path`` / ``--infer.tokenizer_path`` onto :attr:`model`
+   and nests ``infer.output_dir`` under the active ``omni_infer_type``.
 
-   * :meth:`OmniInferencer.from_args` — preferred for CLI / script
-     entry points.  Accepts a :class:`OmniInferenceArguments` produced
-     by :func:`veomni.arguments.parse_args`; resolves the scenario,
-     loads the merged :class:`OmniConfig`, and stashes ``args.infer``
-     so :meth:`generate` can be called with no arguments.
-   * :meth:`OmniInferencer.from_launcher` — programmatic alternative
-     that takes a launcher YAML path + optional ``infer_type`` /
-     ``model_path`` overrides.  Does NOT stash run-time args, so the
-     caller must pass an :class:`OmniInferRunArguments` to
-     :meth:`generate` (or use :meth:`run_request` instead).
+2. ``OmniInferencer(args)`` builds the merged :class:`OmniConfig` from
+   ``model.omni_train_yaml_path`` + ``omni_infer_yaml_path[omni_infer_type]``
+   (see :meth:`OmniConfig.from_paths`), then constructs each declared
+   module by reading its ``weights_path/config.json`` for ``model_type``
+   and dispatching through :data:`OMNI_MODEL_REGISTRY`.  Modules load
+   eagerly on a single device via ``cls.from_pretrained`` — no FSDP, no
+   meta init, ``device_map`` deferred to a follow-up PR.
 
-2. The constructor builds each declared module by reading its
-   ``weights_path/config.json`` to look up ``model_type`` and
-   dispatching through :data:`OMNI_MODEL_REGISTRY` to the right
-   :class:`PreTrainedModel`-derived class.  Modules are loaded eagerly
-   on a single device via ``cls.from_pretrained(weights_path,
-   torch_dtype, **module_overrides)`` — no FSDP, no meta init,
-   ``device_map`` deferred to a follow-up PR.
+3. The global tokenizer is loaded from ``OmniConfig.tokenizer_path`` and
+   wired into every module that exposes ``set_tokenizer`` (notably
+   :class:`JanusTextEncoder`, which resolves bos / boi / eoi / eos ids at
+   this point).  Per-module processors (vision / vqvae) come from
+   :data:`OMNI_PROCESSOR_REGISTRY`.
 
-3. The global tokenizer is loaded from ``OmniConfig.tokenizer_path``
-   and wired into every module that exposes ``set_tokenizer``
-   (notably :class:`JanusTextEncoder`, which resolves bos / boi / eoi /
-   eos ids at this point).
+4. Inference is a three-layer call stack:
 
-4. Per-module processors (vision / vqvae) are loaded the same way via
-   :data:`OMNI_PROCESSOR_REGISTRY` and stashed for use by
-   :meth:`_run` to turn raw PIL images into ``pixel_values``
-   before the FSM runs.
-
-5. Inference is a three-layer call stack:
-
-   * :meth:`generate` — high-level: reads :class:`OmniInferRunArguments`
-     (passed explicitly or stashed via :meth:`from_args`), loads any
-     image, applies the CFG / sampling knobs, calls :meth:`run_request`,
-     then writes every artifact to disk via :meth:`finalize`.
+   * :meth:`generate` — high-level: reads :attr:`self.args.infer`, loads
+     any image, applies the CFG / sampling knobs, calls
+     :meth:`run_request`, then writes every artifact to disk via
+     :meth:`finalize`.
    * :meth:`run_request` — mid-level: accepts a built
      :class:`InferenceRequest`, returns the raw ``ctx`` dict without
      touching the filesystem.  Use for programmatic / batched flows.
    * :meth:`_run` — internal: resets per-module state, builds the
      :class:`ConversationPart` list via :func:`build_conversation`,
      attaches per-image ``pixel_values`` via the matching processor,
-     packs the inputs as a ``request`` / ``context`` dict and hands
-     off to :meth:`OmniModel.generate`.
+     packs the inputs as a ``request`` / ``context`` dict and hands off
+     to :meth:`OmniModel.generate`.
 
    The returned ``ctx`` carries the FSM trace, the accumulated
    ``generated_images_collected`` tensors, and the per-module
@@ -73,12 +62,11 @@ Lifecycle
 
 Generation kwargs distribution
 ------------------------------
-``generation_kwargs`` is a plain dict that :meth:`run_request` (and
-the public :meth:`generate` wrapper) forwards into ``request`` /
-``ctx``.  Every module's ``generate`` reads the slot from kwargs and
-filters by the keys it recognises
-(:meth:`JanusTextEncoder._extract_sampling_kwargs` /
-:meth:`JanusVqvae._extract_sampling_kwargs`) — same shape as
+``generation_kwargs`` is a plain dict that :meth:`run_request` (and the
+public :meth:`generate` wrapper) forwards into ``request`` / ``ctx``.
+Every module's ``generate`` reads the slot from kwargs and filters by
+the keys it recognises (:meth:`JanusTextEncoder._extract_sampling_kwargs`
+/ :meth:`JanusVqvae._extract_sampling_kwargs`) — same shape as
 HuggingFace ``GenerationMixin._prepare_generation_config``.
 """
 
@@ -113,38 +101,28 @@ logger = helper.create_logger(__name__)
 class OmniInferModelArguments:
     """``model.*`` — slim model arguments for SeedOmni V2 inference / visualization.
 
-    Carries ONLY the four fields actually consumed by the FSM-driven inference
-    path: ``model_path`` + the three ``omni_*`` graph pointers.  Intentionally
-    does NOT inherit from :class:`ModelArguments` / :class:`OmniModelArguments`
-    (which carry training-only knobs like ``ops_implementation``, ``encoders``
-    /``decoders``, ``lora_config``, ``safetensor_idx_path``, ``basic_modules``,
-    etc.) — dragging those into an inference CLI would bloat ``--help`` with
-    dozens of irrelevant flags and silently honour training defaults that have
-    no effect at inference time.
-
-    Use with :func:`veomni.arguments.parse_args` like::
-
-        from veomni.arguments import parse_args
-        from veomni.trainer.omni_inferencer import OmniInferenceArguments, OmniInferencer
-
-        args = parse_args(OmniInferenceArguments)
-        OmniInferencer.from_args(args).generate()  # writes outputs to args.infer.output_dir
+    Carries ONLY the fields actually consumed by the FSM-driven inference
+    path: the three ``omni_*`` graph pointers + ``model_path`` /
+    ``tokenizer_path`` (which :class:`OmniInferenceArguments.__post_init__`
+    auto-fills from ``args.infer.*`` so users only set them once on the CLI).
+    Intentionally does NOT inherit from :class:`ModelArguments` /
+    :class:`OmniModelArguments` — dragging their training-only knobs
+    (``ops_implementation``, ``encoders`` / ``decoders``, ``lora_config``,
+    ``safetensor_idx_path``, ``basic_modules``, …) into an inference CLI
+    would bloat ``--help`` with dozens of irrelevant flags.
 
     See :class:`veomni.trainer.omni_trainer.OmniModelArguments` for the
-    training-side analogue (which DOES inherit ``ModelArguments`` because the
-    trainer needs the full surface).
+    training-side analogue (which DOES inherit ``ModelArguments`` because
+    the trainer needs the full surface).
     """
 
     model_path: str | None = field(
         default=None,
-        metadata={
-            "help": (
-                "Local/HDFS path to the split-checkpoint root (e.g. "
-                "``/tmp/janus_1.3b_split``).  Required for inference (the global "
-                "tokenizer and per-module weights are loaded from here); "
-                "optional for graph visualization (which doesn't load weights)."
-            )
-        },
+        metadata={"help": "Auto-filled from --infer.model_path by OmniInferenceArguments.__post_init__."},
+    )
+    tokenizer_path: str | None = field(
+        default=None,
+        metadata={"help": "Auto-filled from --infer.tokenizer_path by OmniInferenceArguments.__post_init__."},
     )
     omni_train_yaml_path: str | None = field(
         default=None,
@@ -161,51 +139,20 @@ class OmniInferModelArguments:
         default_factory=dict,
         metadata={
             "help": (
-                "Mapping of inference scenario name → inference YAML path.  Each "
-                "scenario YAML deep-merges over ``omni_train_yaml_path`` to inject "
-                "a ``generation_graph``.  Example keys: ``infer_gen`` (T2I), "
-                "``infer_und`` (I2T), ``infer_interleave``."
+                "Mapping of inference scenario name → inference YAML path.  The "
+                "selected scenario's YAML overlays ``omni_train_yaml_path`` to "
+                "inject a ``generation_graph``.  Example keys: ``infer_gen`` "
+                "(T2I), ``infer_und`` (I2T), ``infer_interleave``."
             )
         },
     )
     omni_infer_type: str | None = field(
         default=None,
-        metadata={
-            "help": (
-                "Active scenario key into ``omni_infer_yaml_path``.  If unset, the "
-                "calling script may auto-pick from context (e.g. ``infer_omni.py`` "
-                "picks ``infer_und`` when ``--infer.image`` is given, ``infer_gen`` "
-                "otherwise)."
-            )
-        },
+        metadata={"help": "Active scenario key into ``omni_infer_yaml_path`` (required for inference)."},
     )
 
-    def load_omni_config(self, *, infer_type: str | None = None) -> OmniConfig:
-        """Build an :class:`OmniConfig` with per-module ``weights_path`` resolved.
-
-        Mirrors :meth:`veomni.trainer.omni_trainer.OmniModelArguments.load_omni_config`
-        so the inference path doesn't drift from training-side path resolution.
-        ``infer_type`` (if provided) overrides :attr:`omni_infer_type` for this
-        call only — the dataclass field is not mutated.
-        """
-        from ..models.seed_omni.configuration_seed_omni import apply_model_path
-
-        if not self.omni_train_yaml_path:
-            raise ValueError("`model.omni_train_yaml_path` is required for OmniModel V2 inference.")
-        if not self.model_path:
-            raise ValueError("`model.model_path` is required for OmniModel V2 inference.")
-
-        paths = [self.omni_train_yaml_path]
-        selected = infer_type or self.omni_infer_type
-        if selected is not None:
-            infer_map = self.omni_infer_yaml_path or {}
-            if selected not in infer_map:
-                known = ", ".join(sorted(infer_map)) or "(none)"
-                raise KeyError(f"Unknown omni_infer_type {selected!r}; expected one of: {known}.")
-            paths.append(infer_map[selected])
-
-        cfg = OmniConfig.from_yamls(*paths)
-        return apply_model_path(cfg, self.model_path)
+    def __post_init__(self):
+        assert self.omni_train_yaml_path is not None, "model.omni_train_yaml_path is required"
 
 
 @dataclass
@@ -213,31 +160,16 @@ class OmniInferRunArguments(InferArguments):
     """``infer.*`` — per-invocation inference knobs for ``infer_omni``.
 
     Extends framework :class:`~veomni.arguments.InferArguments` with the
-    SeedOmni V2 driver's prompt / image / output / CFG fields.
-
-    Inherited and used: ``seed``, ``temperature``, ``top_p``, ``max_tokens``,
-    ``do_sample``.
-
-    Inherited and silently ignored: ``model_path`` / ``tokenizer_path``.
-    The V2 entry-point sources the model from the launcher YAML's ``model:``
-    section via :class:`OmniInferModelArguments`, so ``--model.model_path`` is
-    the canonical override.  These two fields are overridden here to default
-    to ``None`` (the base class declares ``model_path`` as mandatory) and are
-    documented as "ignored" so users don't reach for the wrong flag.
+    SeedOmni V2 driver's prompt / image / output / CFG fields.  Inherits
+    ``model_path`` / ``tokenizer_path`` (the canonical CLI flags) plus
+    standard sampling knobs (``seed``, ``temperature``, ``top_p``,
+    ``max_tokens``, ``do_sample``).
 
     Lives in this module (not the script) so other drivers (RL eval,
     batched-prompt benchmarks, future REST shims) can reuse the same CLI
     surface without copy-pasting the dataclass.
     """
 
-    model_path: str | None = field(
-        default=None,
-        metadata={"help": "Ignored — use --model.model_path to override the launcher YAML."},
-    )
-    tokenizer_path: str | None = field(
-        default=None,
-        metadata={"help": "Ignored — tokenizer is loaded from --model.model_path (the split-ckpt root)."},
-    )
     prompt: str = field(
         default="",
         metadata={"help": "User text prompt (required; non-empty)."},
@@ -250,10 +182,9 @@ class OmniInferRunArguments(InferArguments):
         default="output",
         metadata={
             "help": (
-                "Root output directory.  :meth:`OmniInferencer.from_args` joins the "
-                "resolved scenario onto this path, so the actual artefacts land under "
-                "``<output_dir>/<omni_infer_type>/`` — e.g. ``output/infer_gen/`` for T2I, "
-                "``output/infer_und/`` for I2T.  Created if missing."
+                "Root output directory.  ``OmniInferenceArguments.__post_init__`` nests artefacts "
+                "under ``<output_dir>/<omni_infer_type>/`` so different scenarios don't clobber "
+                "each other on re-runs."
             )
         },
     )
@@ -283,130 +214,44 @@ class OmniInferRunArguments(InferArguments):
     )
 
     def __post_init__(self):
-        # Base-class __post_init__ tries `self.tokenizer_path = self.model_path`
-        # when tokenizer_path is None.  That's harmless when both are None
-        # (which is the V2 case), but we skip the super call to make the
-        # "both ignored" semantics explicit and avoid mutating an unused field.
-        pass
+        super().__post_init__()
+        assert self.prompt, "--infer.prompt is required (use a non-empty string)."
+        # TODO: diffusion-only modules have no tokenizer — relax this when we add such a scenario.
 
 
 @dataclass
 class OmniInferenceArguments:
     """Root config for SeedOmni V2 inference — consumed by :func:`parse_args`.
 
-    The launcher YAML's top-level ``model:`` section populates :attr:`model`,
-    keeping only the four fields that actually drive inference (model path +
-    graph YAML pointers).  ``data:`` / ``train:`` and every other training-only
-    ``model.*`` field declared in the launcher YAML (``ops_implementation``,
-    ``encoders``, ``lora_config``, ...) are silently ignored because they're
-    not declared on :class:`OmniInferModelArguments`.
+    The launcher YAML's top-level ``model:`` section populates :attr:`model`
+    (graph YAML pointers + the active scenario key).  ``data:`` / ``train:``
+    and every other training-only ``model.*`` field declared in the launcher
+    YAML are silently ignored because they're not declared on
+    :class:`OmniInferModelArguments`.
 
-    ``__post_init__`` self-normalises the parsed args into a single source of
-    truth before they're handed to the inferencer:
-
-    * Validates the two CLI mandatories (non-empty ``--infer.prompt`` and a
-      set ``--model.model_path``) — fails fast at parse time, before any slow
-      module construction kicks in.
-    * Resolves the inference scenario (CLI/YAML ``omni_infer_type`` → auto
-      from ``has_image`` → fallback to first declared scenario) and writes
-      the resolved value back to :attr:`model.omni_infer_type` so every
-      downstream consumer sees a frozen, validated string.  The diagnostic
-      "where did this come from" label is stashed on :attr:`_scenario_source`
-      for the inferencer's startup log.
-    * Joins the resolved scenario onto :attr:`infer.output_dir` so artefacts
-      from different scenarios don't clobber each other when the user re-runs
-      with the same ``--infer.output_dir``.
-
-    All three steps are idempotent only relative to a single construction —
-    re-parsing or replacing fields after the fact will NOT re-trigger
-    resolution.  Build a fresh :class:`OmniInferenceArguments` if you change
-    ``infer.image`` between runs and want the scenario to re-auto-pick.
+    ``__post_init__`` does the minimum bookkeeping to give every downstream
+    consumer a single source of truth: copies ``--infer.{model_path,
+    tokenizer_path}`` onto :attr:`model` (so the user only sets them once
+    on the CLI) and nests :attr:`infer.output_dir` under the active
+    ``omni_infer_type`` (so different scenarios don't clobber each other on
+    re-runs against the same ``--infer.output_dir``).
 
     Use::
 
-        from veomni.arguments import parse_args
-        from veomni.trainer.omni_inferencer import OmniInferenceArguments, OmniInferencer
-
         args = parse_args(OmniInferenceArguments)
-        OmniInferencer.from_args(args).generate()
+        OmniInferencer(args).generate()
     """
 
     model: OmniInferModelArguments = field(default_factory=OmniInferModelArguments)
     infer: OmniInferRunArguments = field(default_factory=OmniInferRunArguments)
 
     def __post_init__(self):
-        # ── Mandatory CLI checks ──────────────────────────────────────────
-        # Fail fast — these mistakes are common (forgetting --infer.prompt,
-        # leaving model_path unset in the launcher YAML) and we want the
-        # error before module construction starts (which loads weights and
-        # takes ~10s for Janus 1.3B).
-        if not self.infer.prompt:
-            raise ValueError(
-                "`--infer.prompt` is required (use a non-empty string).  Example: --infer.prompt 'a cat'."
-            )
-        if not self.model.model_path:
-            raise ValueError("`--model.model_path` is required (launcher YAML must declare `model.model_path`).")
-
-        # ── Scenario resolution ───────────────────────────────────────────
-        # Freezes ``model.omni_infer_type`` to the resolved value so all
-        # downstream consumers (load_omni_config, output_dir join, the
-        # inferencer's startup log) read a single source of truth.
-        scenario, source = _select_scenario(self.model, has_image=bool(self.infer.image))
-        self.model.omni_infer_type = scenario
-        # Private (not a dataclass field — would otherwise pollute the CLI
-        # via _add_arguments_recursive).  Read by OmniInferencer.from_args
-        # for its diagnostic startup banner.
-        self._scenario_source: str = source
-
-        # ── Output-dir scoping ────────────────────────────────────────────
-        # Same motivation as the previous from_args-side join: prevent T2I
-        # / I2T / interleave re-runs from clobbering each other when the
-        # user re-runs with the same --infer.output_dir.
-        self.infer.output_dir = os.path.join(self.infer.output_dir, scenario)
-
-
-def _select_scenario(model_args: OmniInferModelArguments, *, has_image: bool) -> tuple[str, str]:
-    """Pick the inference scenario (an entry in ``model.omni_infer_yaml_path``).
-
-    Pure helper called from :meth:`OmniInferenceArguments.__post_init__` —
-    factored out as a free function so it's unit-testable in isolation (no
-    need to spin up the full args dataclass tree just to assert priority
-    rules).
-
-    Priority:
-
-    1. ``model.omni_infer_type`` if set (via CLI ``--model.omni_infer_type`` or YAML).
-       An unknown value raises ``KeyError`` — silently falling through to auto-pick
-       would mask typos (e.g. ``--model.omni_infer_type infrr_gen``) that the user
-       would otherwise want to catch immediately.
-    2. Auto: image present → ``infer_und``, absent → ``infer_gen``.
-    3. Any scenario declared in ``omni_infer_yaml_path`` (first key).
-
-    Returns
-    -------
-    ``(scenario, source)`` where ``source`` is one of ``"yaml/cli"`` / ``"auto"``
-    / ``"fallback"`` — the caller logs this so users can tell which priority
-    path fired (especially important since the launcher YAML may declare
-    ``omni_infer_type`` for training-time generation samples, which now also
-    applies to inference).
-    """
-    infer_map = dict(model_args.omni_infer_yaml_path or {})
-    if not infer_map:
-        raise ValueError(
-            "Launcher YAML declares no `model.omni_infer_yaml_path` entries — cannot pick an inference scenario."
-        )
-    if model_args.omni_infer_type:
-        if model_args.omni_infer_type not in infer_map:
-            known = ", ".join(sorted(infer_map)) or "(none)"
-            raise KeyError(
-                f"Unknown model.omni_infer_type {model_args.omni_infer_type!r}; expected one of: {known}.  "
-                f"Set via CLI: --model.omni_infer_type <key>."
-            )
-        return model_args.omni_infer_type, "yaml/cli (model.omni_infer_type)"
-    preferred = "infer_und" if has_image else "infer_gen"
-    if preferred in infer_map:
-        return preferred, f"auto (has_image={has_image})"
-    return next(iter(infer_map)), "fallback (first available)"
+        self.model.model_path = self.infer.model_path
+        self.model.tokenizer_path = self.infer.tokenizer_path
+        self.infer.output_dir = os.path.join(self.infer.output_dir, self.model.omni_infer_type)
+        logger.info_rank0(f"OmniInferencer: model_path = {self.model.model_path}")
+        logger.info_rank0(f"OmniInferencer: scenario = {self.model.omni_infer_type}")
+        logger.info_rank0(f"OmniInferencer: output_dir = {self.infer.output_dir}")
 
 
 @dataclass
@@ -444,166 +289,53 @@ class InferenceRequest:
 class OmniInferencer:
     """SeedOmni V2 inference driver — per-module ``from_pretrained`` + FSM.
 
-    Single-process, single-device, no FSDP.  Designed to be the
-    inference twin of :class:`OmniTrainer`; both share the
-    registry-based module construction contract documented in
-    :mod:`veomni.models.seed_omni.modules`, but the inferencer takes a
-    pre-built :class:`OmniConfig` directly (the trainer-side dataclass
-    plumbing is irrelevant for one-shot inference scripts).
+    Single-process, single-device, no FSDP.  Designed to be the inference twin
+    of :class:`OmniTrainer`; both share the registry-based module construction
+    contract documented in :mod:`veomni.models.seed_omni.modules`.
 
-    Parameters
-    ----------
-    cfg:
-        Fully resolved :class:`OmniConfig` — must already carry
-        ``modules`` with absolute / resolved ``weights_path`` values,
-        a ``tokenizer_path``, and a ``generation_graph``.  Use
-        :meth:`from_launcher` to build one from a launcher YAML.
-    dtype:
-        ``"float16"`` / ``"bfloat16"`` / ``"float32"``.  Defaults to
-        ``"bfloat16"`` on GPU / NPU and ``"float32"`` on CPU.
-    seed:
-        Random seed for the sampler.  Forwarded to
-        :func:`veomni.utils.helper.set_seed`.
+    Usage::
+
+        args = parse_args(OmniInferenceArguments)
+        OmniInferencer(args).generate()
+
+    The tokenizer is best-effort: if loading fails (e.g. a diffusion-only
+    split-checkpoint with no ``tokenizer.json`` at the root) the inferencer
+    warns and leaves ``self.tokenizer = None`` — only modules that need it
+    via ``set_tokenizer`` are affected.
     """
 
-    def __init__(
-        self,
-        cfg: OmniConfig,
-        *,
-        dtype: str | None = None,
-        seed: int = 42,
-        infer_args: OmniInferRunArguments | None = None,
-    ):
+    def __init__(self, args: OmniInferenceArguments):
+        self.args: OmniInferenceArguments = args
         self.device = torch.device(get_device_type())
-        self.dtype = _resolve_dtype(dtype or "bfloat16", self.device)
-        helper.set_seed(seed)
+        helper.set_seed(args.infer.seed)
 
-        if not isinstance(cfg, OmniConfig):
-            raise TypeError(f"OmniInferencer expects an OmniConfig, got {type(cfg).__name__}.")
-        if not cfg.tokenizer_path:
-            raise ValueError(
-                "OmniConfig.tokenizer_path is unset — use OmniInferencer.from_launcher() or "
-                "apply_model_path(cfg, model_path) before constructing OmniInferencer."
-            )
-        if not cfg.has_generation_graph():
-            raise ValueError(
-                "OmniInferencer requires an OmniConfig with a `generation_graph` (deep-merge an "
-                "infer_*.yaml on top of the training YAML, or pass `infer_type=...` to "
-                "OmniInferencer.from_launcher)."
-            )
-        self.cfg = cfg
-
-        # Stashed per-run knobs (set by :meth:`from_args`).  ``generate()``
-        # consults this when no explicit overrides are passed — the common
-        # "script just calls ``inferencer.generate()``" flow.  None for
-        # programmatic constructions; explicit args on ``generate()`` are
-        # required in that case.
-        self.infer_args: OmniInferRunArguments | None = infer_args
-
+        self.omni_config = OmniConfig.from_paths(
+            model_path=args.model.model_path,
+            tokenizer_path=args.model.tokenizer_path,
+            train_yaml_path=args.model.omni_train_yaml_path,
+            infer_yaml_path=args.model.omni_infer_yaml_path[args.model.omni_infer_type],
+        )
         logger.info_rank0(
-            f"OmniInferencer: loaded OmniConfig with {len(self.cfg.module_names)} modules ({self.cfg.module_names})."
+            f"OmniInferencer: loaded OmniConfig with {len(self.omni_config.module_names)} "
+            f"modules ({self.omni_config.module_names})."
         )
 
-        # Per-module HF PreTrainedModel instances (eager init, single device).
         self.modules: dict[str, torch.nn.Module] = self._build_modules()
-        # Per-module ProcessorMixin (only modules with a registered processor).
         self.processors: dict[str, Any] = self._build_processors()
 
-        # Global tokenizer — wired into every text-aware module so they can
-        # resolve special-token ids (bos / boi / eoi / eos) at runtime
-        # instead of baking them into config.json.
-        self.tokenizer = AutoTokenizer.from_pretrained(self.cfg.tokenizer_path)
-        for module in self.modules.values():
-            if hasattr(module, "set_tokenizer"):
-                module.set_tokenizer(self.tokenizer)
+        # Tokenizer is best-effort — diffusion-only checkpoints have none.
+        try:
+            self.tokenizer = AutoTokenizer.from_pretrained(self.omni_config.tokenizer_path)
+            for module in self.modules.values():
+                if hasattr(module, "set_tokenizer"):
+                    module.set_tokenizer(self.tokenizer)
+        except Exception as e:
+            self.tokenizer = None
+            logger.warning_rank0(
+                f"OmniInferencer: tokenizer load failed ({e}); modules that need set_tokenizer will be skipped."
+            )
 
-        # Compose the runtime OmniModel.  The runtime is the same one the
-        # trainer uses — graph traversal + finalize hook + per-step
-        # image collection.
-        self.model = OmniModel(self.cfg, self.modules).eval()
-        # `OmniModel.modules_dict` is a back-compat view; module instances
-        # are already on-device from `_build_modules`, no `.to()` cascade.
-
-    # ── Factories ────────────────────────────────────────────────────────────
-
-    @classmethod
-    def from_args(
-        cls,
-        args: OmniInferenceArguments,
-        *,
-        dtype: str | None = None,
-    ) -> OmniInferencer:
-        """Build an :class:`OmniInferencer` from a fully-parsed root config.
-
-        One-stop constructor for CLI / script entry points: loads the merged
-        :class:`OmniConfig` (using the scenario already resolved by
-        :meth:`OmniInferenceArguments.__post_init__`), builds the per-module
-        weights, and stashes :attr:`args.infer` so subsequent
-        ``inferencer.generate()`` calls without arguments use that payload.
-
-        Validation and resolution live in :meth:`OmniInferenceArguments.__post_init__`
-        — by the time we get here ``args.model.omni_infer_type`` is guaranteed
-        non-empty (and known to the YAML's ``omni_infer_yaml_path``) and
-        ``args.infer.output_dir`` already carries the ``/<scenario>`` suffix.
-        Programmatic callers that hit :meth:`OmniInferencer.__init__` directly
-        bypass all of that and own their own args plumbing.
-        """
-        scenario = args.model.omni_infer_type
-        source = getattr(args, "_scenario_source", "?")
-
-        logger.info_rank0(f"OmniInferencer.from_args: model_path = {args.model.model_path}")
-        logger.info_rank0(f"OmniInferencer.from_args: scenario = {scenario}  (source: {source})")
-        logger.info_rank0(f"OmniInferencer.from_args: output_dir = {args.infer.output_dir}")
-
-        cfg = args.model.load_omni_config(infer_type=scenario)
-        return cls(cfg, dtype=dtype, seed=args.infer.seed, infer_args=args.infer)
-
-    @classmethod
-    def from_launcher(
-        cls,
-        launcher_yaml: str | os.PathLike,
-        *,
-        infer_type: str | None = None,
-        model_path: str | None = None,
-        dtype: str | None = None,
-        seed: int = 42,
-    ) -> OmniInferencer:
-        """Build an :class:`OmniInferencer` from a launcher YAML path.
-
-        Reads the launcher's ``model:`` section to discover the split
-        checkpoint root, the training YAML, and the inference YAML
-        catalogue.  ``infer_type`` overrides the launcher's
-        ``omni_infer_type`` so callers can swap scenarios per request
-        without touching the YAML on disk.  ``model_path`` overrides
-        the launcher's ``model.model_path`` for the same reason
-        (typical use: the in-repo YAML points at a placeholder under
-        ``seed_omni/janus_1.3b`` and the real split lives somewhere
-        else on the host).
-        """
-        from ..models.seed_omni.configuration_seed_omni import apply_model_path, load_launcher_model_section
-
-        if model_path is None:
-            cfg = OmniConfig.from_launcher(launcher_yaml, infer_type=infer_type)
-        else:
-            # Mirror OmniConfig.from_launcher but apply the override before
-            # path resolution so relative module paths join under the new root.
-            model = load_launcher_model_section(launcher_yaml)
-            train_yaml = model.get("omni_train_yaml_path")
-            if not train_yaml:
-                raise ValueError(f"`model.omni_train_yaml_path` is required in {launcher_yaml!s}.")
-            infer_map = model.get("omni_infer_yaml_path") or {}
-            selected = infer_type or model.get("omni_infer_type")
-            paths = [train_yaml]
-            if selected is not None:
-                if selected not in infer_map:
-                    known = ", ".join(sorted(infer_map)) or "(none)"
-                    raise KeyError(
-                        f"Unknown omni_infer_type {selected!r} in {launcher_yaml!s}; expected one of: {known}."
-                    )
-                paths.append(infer_map[selected])
-            cfg = apply_model_path(OmniConfig.from_yamls(*paths), str(model_path))
-
-        return cls(cfg, dtype=dtype, seed=seed)
+        self.model = OmniModel(self.omni_config, self.modules).eval()
 
     # ── Build helpers ─────────────────────────────────────────────────────────
 
@@ -620,8 +352,8 @@ class OmniInferencer:
         already uses (e.g. ``freeze_vqvae: true``).
         """
         modules: dict[str, torch.nn.Module] = {}
-        for name in self.cfg.module_names:
-            mod_cfg = self.cfg.module_config(name)
+        for name in self.omni_config.module_names:
+            mod_cfg = self.omni_config.module_config(name)
             weights_path = mod_cfg.pop("weights_path", None)
             if not weights_path:
                 raise ValueError(f"Module '{name}' is missing `weights_path` in OmniConfig.modules.")
@@ -636,14 +368,12 @@ class OmniInferencer:
             )
             module = cls.from_pretrained(
                 weights_path,
-                torch_dtype=self.dtype,
+                torch_dtype=torch.bfloat16,
                 **{k: v for k, v in mod_cfg.items() if not k.startswith("_")},
             )
-            # TODO(omni-inferencer): weights materialise on CPU first and
-            # then get copied to the accelerator, doubling peak host RAM
-            # while a module is in flight.  Once we add multi-device
-            # dispatch we should switch to `device_map={"": self.device}`
-            # on `from_pretrained` so weights land directly on-device.
+            # TODO(omni-inferencer): weights materialise on CPU then copy to
+            # the accelerator, doubling peak host RAM per module.  Switch to
+            # ``device_map={"": self.device}`` once multi-device dispatch lands.
             module = module.to(self.device).eval()
             modules[name] = module
         return modules
@@ -657,8 +387,8 @@ class OmniInferencer:
         """
         processors: dict[str, Any] = {}
         proc_keys = set(OMNI_PROCESSOR_REGISTRY.valid_keys())
-        for name in self.cfg.module_names:
-            mod_cfg = self.cfg.module_config(name)
+        for name in self.omni_config.module_names:
+            mod_cfg = self.omni_config.module_config(name)
             weights_path = mod_cfg.get("weights_path")
             if not weights_path:
                 continue
@@ -675,15 +405,13 @@ class OmniInferencer:
 
     # ── Inference entry point ─────────────────────────────────────────────────
 
-    def generate(self, infer_args: OmniInferRunArguments | None = None) -> dict[str, Any]:
+    def generate(self) -> dict[str, Any]:
         """Run one inference request end-to-end (FSM + save outputs).
 
-        High-level convenience method matching the "build inferencer, call
-        ``generate()``" usage pattern.  Reads :class:`OmniInferRunArguments`
-        from ``infer_args`` (when provided) or from :attr:`self.infer_args`
-        (set by :meth:`from_args`).  After the FSM completes, :meth:`finalize`
-        writes ``reply.txt`` / ``generated_image_*.png`` / ``trace.txt`` under
-        ``infer_args.output_dir``.
+        Reads ``self.args.infer``, loads any image, applies CFG / sampling
+        knobs, runs the FSM, and finally writes ``reply.txt`` /
+        ``generated_image_*.png`` / ``trace.txt`` under
+        ``self.args.infer.output_dir`` via :meth:`finalize`.
 
         Returned ``ctx`` carries (at minimum):
 
@@ -700,40 +428,31 @@ class OmniInferencer:
         eval, RL rollouts), call :meth:`run_request` directly with a
         :class:`InferenceRequest`.
         """
-        args = infer_args or self.infer_args
-        if args is None:
-            raise ValueError(
-                "OmniInferencer.generate() requires either an explicit `infer_args` argument "
-                "or a prior `OmniInferencer.from_args(...)` to stash one.  For programmatic "
-                "use without on-disk artifacts, call `OmniInferencer.run_request(InferenceRequest(...))` instead."
-            )
-        if not args.prompt:
-            raise ValueError("OmniInferRunArguments.prompt is empty — set a non-empty prompt.")
+        infer_args: OmniInferRunArguments = self.args.infer
 
-        has_image = bool(args.image)
+        has_image = bool(infer_args.image)
         # T2I scenarios steer to image-VQ immediately; I2T stays in text_ar.
         force_image_gen = not has_image
-        # CFG only kicks in for T2I — for I2T we squelch back to 1.0 so the
-        # janus_text_encoder skips the uncond branch (its construction rule
-        # isn't well-defined for prompts containing image_und parts; see
-        # `_maybe_build_cfg_uncond_embeds`).
-        guidance_scale = float(args.guidance_scale) if force_image_gen else 1.0
+        # CFG only kicks in for T2I — squelch to 1.0 for I2T because the
+        # janus_text_encoder uncond branch isn't well-defined for prompts
+        # containing image_und parts (see `_maybe_build_cfg_uncond_embeds`).
+        guidance_scale = float(infer_args.guidance_scale) if force_image_gen else 1.0
 
         request = InferenceRequest(
-            prompt=args.prompt,
-            images=[load_image(args.image)] if has_image else [],
+            prompt=infer_args.prompt,
+            images=[load_image(infer_args.image)] if has_image else [],
             force_image_gen=force_image_gen,
             generation_kwargs={
-                "temperature": args.temperature,
-                "top_p": args.top_p,
-                "do_sample": args.do_sample,
+                "temperature": infer_args.temperature,
+                "top_p": infer_args.top_p,
+                "do_sample": infer_args.do_sample,
                 "guidance_scale": guidance_scale,
             },
-            max_new_tokens=args.max_tokens,
+            max_new_tokens=infer_args.max_tokens,
         )
-        trace_buf: list[str] | None = [] if args.trace else None
-        ctx = self.run_request(request, trace=trace_buf, progress=args.progress)
-        self.finalize(ctx, output_dir=args.output_dir, trace=trace_buf)
+        trace_buf: list[str] | None = [] if infer_args.trace else None
+        ctx = self.run_request(request, trace=trace_buf, progress=infer_args.progress)
+        self.finalize(ctx, output_dir=infer_args.output_dir, trace=trace_buf)
         return ctx
 
     def run_request(
@@ -750,11 +469,9 @@ class OmniInferencer:
         output persistence.  For one-shot script use, prefer :meth:`generate`
         (which also calls :meth:`finalize`).
 
-        ``progress`` opts into :class:`OmniModel.generate`'s per-state
-        stdout trail (e.g. ``[FSM] step    0: prompt_encode``).  Defaults
-        to ``False`` here so programmatic batched callers stay quiet; the
-        :meth:`generate` wrapper passes ``args.progress`` (default True)
-        for CLI use.
+        ``progress`` opts into :class:`OmniModel.generate`'s per-state stdout
+        trail (e.g. ``[FSM] step    0: prompt_encode``).  Defaults to
+        ``False`` here so programmatic batched callers stay quiet.
         """
         return self._run(request, trace=trace, progress=progress)
 
@@ -850,12 +567,9 @@ class OmniInferencer:
             "force_image_gen": req.force_image_gen,
             "generation_kwargs": req.generation_kwargs,
         }
-        # ``OmniModel.generate`` initialises ``ctx`` from ``context``
-        # (or from ``request`` when ``context`` is None) — we pass the
-        # same dict for both so every key is visible to module kwargs.
-        # ``progress`` flows from the caller (False by default for
-        # batched / programmatic flows; the CLI :meth:`generate` wrapper
-        # forwards ``args.progress`` which defaults to True).
+        # ``OmniModel.generate`` initialises ``ctx`` from ``context`` (or
+        # from ``request`` when ``context`` is None) — we pass the same dict
+        # for both so every key is visible to module kwargs.
         ctx = self.model.generate(
             request=request_dict,
             context=request_dict,
@@ -987,15 +701,6 @@ def _read_model_type(weights_path: str) -> str:
             f"OMNI_MODEL_REGISTRY. Known: {sorted(model_keys)}."
         )
     return model_type
-
-
-def _resolve_dtype(name: str, device: torch.device) -> torch.dtype:
-    if device.type == "cpu":
-        return torch.float32
-    mapping = {"float16": torch.float16, "bfloat16": torch.bfloat16, "float32": torch.float32}
-    if name not in mapping:
-        raise ValueError(f"Unsupported dtype {name!r}; choose from {sorted(mapping)}.")
-    return mapping[name]
 
 
 __all__ = [

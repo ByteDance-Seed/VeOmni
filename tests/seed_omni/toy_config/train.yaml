@@ -2,7 +2,7 @@
 #
 # Uses print_modules stand-ins (text_encoder / vision / vqvae / ar), not real
 # Janus weights.  Inference scenarios live in sibling infer_*.yaml files and
-# deep-merge over this vocabulary via OmniConfig.from_yamls().
+# overlay this vocabulary via OmniConfig.from_paths().
 
 modules:
   text_encoder: {}

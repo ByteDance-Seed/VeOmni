@@ -400,12 +400,14 @@ configs/seed_omni/janus_1.3b/
 Loading rules:
 
 - **Training only**: load just `train_joint.yaml`.
-- **Inference**: load `train_joint.yaml` + the chosen `infer_<scenario>.yaml`. Use `OmniConfig.from_yamls(*paths)` — the second-and-later files **deep-merge** over the first (dict-vs-dict recurse, scalars/lists replace wholesale, `None` is a no-op).
+- **Inference**: load `train_joint.yaml` + the chosen `infer_<scenario>.yaml`. Use `OmniConfig.from_paths(...)` — the inference YAML is **flat-overlaid** onto the training YAML via `dict.update`, so only top-level keys (in practice just `generation_graph`) can be replaced; partial overrides of nested blocks (e.g. one field inside `modules.foo`) are not supported.
 
 ```python
-cfg = OmniConfig.from_yamls(
-    "configs/seed_omni/janus_1.3b/train_joint.yaml",
-    "configs/seed_omni/janus_1.3b/infer_interleave.yaml",
+cfg = OmniConfig.from_paths(
+    model_path="/tmp/janus_1.3b_split",
+    tokenizer_path="/tmp/janus_1.3b_split",
+    train_yaml_path="configs/seed_omni/janus_1.3b/train_joint.yaml",
+    infer_yaml_path="configs/seed_omni/janus_1.3b/infer_interleave.yaml",
 )
 ```
 
@@ -416,7 +418,7 @@ Naming conventions:
 | `train_<scope>.yaml` | `train_joint.yaml`, `train_und_only.yaml` | Master file — defines vocabulary AND a specific `training_graph.edges` subset |
 | `infer_<scenario>.yaml` | `infer_interleave.yaml`, `infer_t2i.yaml`, `infer_understanding.yaml` | Scenario-specific FSM — `generation_graph` only |
 
-**Don't hide inference-only nodes / edges in the inference YAML.** They live in the master training YAML's `nodes` / `edges` pool (the inference YAML cannot add new ones to the pool because deep-merge over an absent key is a no-op for nested dicts only — and even then, having all nodes / edges in one place is a readability win). The training YAML simply omits them from `training_graph.edges`.
+**Don't hide inference-only nodes / edges in the inference YAML.** They live in the master training YAML's `nodes` / `edges` pool (the inference YAML cannot partially extend pool dicts via the flat overlay, and having all nodes / edges in one place is a readability win). The training YAML simply omits them from `training_graph.edges`.
 
 ### What goes in each YAML
 

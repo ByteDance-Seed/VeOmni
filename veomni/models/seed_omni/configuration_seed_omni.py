@@ -75,48 +75,9 @@ YAML structure (maps 1-to-1 to this class):
 
 import os
 from copy import deepcopy
-from typing import Any, Dict, List, Mapping, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 from transformers import PretrainedConfig
-
-
-def resolve_module_weights_path(weights_path: str, model_path: str) -> str:
-    """Resolve a module ``weights_path`` against the split checkpoint root.
-
-    Relative paths (e.g. ``janus_siglip``) join under ``model_path``.
-    Absolute paths are returned unchanged.
-    """
-    if os.path.isabs(weights_path):
-        return weights_path
-    return os.path.join(model_path, weights_path)
-
-
-def apply_model_path(cfg: "OmniConfig", model_path: str) -> "OmniConfig":
-    """Resolve relative module ``weights_path`` values and set ``tokenizer_path``.
-
-    The global tokenizer lives at ``model_path`` (``tokenizer.json`` etc. sit
-    next to the per-module subfolders written by ``split_janus.py``).
-    """
-    for mod_cfg in cfg.modules.values():
-        weights_path = mod_cfg.get("weights_path")
-        if weights_path is not None:
-            mod_cfg["weights_path"] = resolve_module_weights_path(str(weights_path), model_path)
-    cfg.tokenizer_path = model_path
-    return cfg
-
-
-def load_launcher_model_section(launcher_yaml: Union[str, os.PathLike]) -> Dict[str, Any]:
-    """Return the ``model:`` block from a VeOmni launcher YAML."""
-    import yaml
-
-    with open(launcher_yaml, encoding="utf-8") as f:
-        data = yaml.safe_load(f) or {}
-    if not isinstance(data, dict):
-        raise TypeError(f"YAML at '{launcher_yaml}' must be a top-level mapping.")
-    model = data.get("model")
-    if not isinstance(model, dict):
-        raise ValueError(f"YAML at '{launcher_yaml}' must declare a top-level `model:` mapping.")
-    return model
 
 
 class OmniConfig(PretrainedConfig):
@@ -176,124 +137,55 @@ class OmniConfig(PretrainedConfig):
 
     @classmethod
     def from_dict(cls, config_dict: Dict, **kwargs) -> "OmniConfig":
+        """Build an :class:`OmniConfig` from a YAML-shaped dict.
+
+        Pops ``model_path`` (required) and resolves every relative
+        ``modules.*.weights_path`` under it; absolute paths pass through
+        unchanged.  Unknown top-level keys are dropped silently so the
+        same launcher YAML can carry training-only fields without
+        polluting the inference config.
+        """
+        model_path = config_dict.pop("model_path")
         accepted = {k: v for k, v in config_dict.items() if k in cls.__init__.__code__.co_varnames}
+        for mod_cfg in accepted.get("modules", {}).values():
+            weights_path = mod_cfg.get("weights_path")
+            if weights_path is not None and not os.path.isabs(weights_path):
+                mod_cfg["weights_path"] = os.path.join(model_path, weights_path)
         return cls(**accepted, **kwargs)
 
     @classmethod
-    def from_yamls(cls, *paths: Union[str, os.PathLike], **kwargs) -> "OmniConfig":
-        """Load + deep-merge multiple YAML configs (later overrides earlier).
+    def from_paths(
+        cls,
+        model_path: Union[str, os.PathLike],
+        tokenizer_path: Union[str, os.PathLike],
+        train_yaml_path: Union[str, os.PathLike],
+        infer_yaml_path: Union[str, os.PathLike] = None,
+        **kwargs,
+    ) -> "OmniConfig":
+        """Load an :class:`OmniConfig` from a training YAML + optional inference YAML.
 
         SeedOmni V2 splits configuration into a **training YAML** that
-        carries the master vocabulary (``tokenizer_path``, ``modules``,
-        ``nodes``, ``edges``, ``training_graph``) and one or more
-        **inference YAMLs** that only carry a ``generation_graph`` for a
-        specific scenario (interleave / T2I-only / understanding).  See
-        ``configs/seed_omni/janus_1.3b/`` for the canonical layout.
+        carries the master vocabulary (``modules``, ``nodes``, ``edges``,
+        ``training_graph``) and one or more **inference YAMLs** that only
+        carry a ``generation_graph`` for a specific scenario (interleave /
+        T2I-only / understanding).  See ``configs/seed_omni/janus_1.3b/``
+        for the canonical layout.
 
-        Merge semantics
-        ---------------
-        Top-level keys are merged depth-first:
-
-        * **Dict-vs-dict**: recursive merge.  ``modules.foo.weights_path``
-          in the inference YAML overrides the training YAML's value while
-          keeping every other ``modules.foo.*`` field intact.
-        * **List-vs-list / scalar-vs-scalar**: later wins outright (no
-          element-wise merge — that would be ambiguous for ordered
-          ``training_graph.edges``).
-        * **None-vs-anything**: anything wins; ``None`` never overwrites
-          a real value.
-
-        Examples
-        --------
-        Load training-only (single file)::
-
-            cfg = OmniConfig.from_yamls("configs/seed_omni/janus_1.3b/train.yaml")
-
-        Load training + an inference scenario (paint a generation_graph
-        on top)::
-
-            cfg = OmniConfig.from_yamls(
-                "configs/seed_omni/janus_1.3b/train.yaml",
-                "configs/seed_omni/janus_1.3b/infer_interleave.yaml",
-            )
-
-        Load from a VeOmni launcher YAML (``veomni_*.yaml``) with runtime
-        path resolution::
-
-            cfg = OmniConfig.from_launcher("configs/seed_omni/janus_1.3b/veomni_janus.yaml")
+        The two YAMLs are flat-merged via ``dict.update`` — the inference
+        YAML's top-level keys (in practice just ``generation_graph``)
+        replace anything with the same name in the training YAML.  Anything
+        deeper (``modules.foo.*``) cannot be partially overridden; declare
+        the full block in whichever YAML owns it.
         """
         import yaml
 
-        if not paths:
-            raise ValueError("OmniConfig.from_yamls requires at least one path.")
-
-        merged: Dict[str, Any] = {}
-        for p in paths:
-            with open(p, encoding="utf-8") as f:
-                data = yaml.safe_load(f) or {}
-            if not isinstance(data, dict):
-                raise TypeError(f"YAML at '{p}' must be a top-level mapping; got {type(data).__name__}.")
-            merged = _deep_merge(merged, data)
-        return cls.from_dict(merged, **kwargs)
-
-    @classmethod
-    def from_launcher(
-        cls,
-        launcher_yaml: Union[str, os.PathLike],
-        *,
-        infer_type: Optional[str] = None,
-        **kwargs,
-    ) -> "OmniConfig":
-        """Load OmniConfig from a VeOmni launcher YAML with path resolution.
-
-        Reads ``model.model_path``, ``model.omni_train_yaml_path``, and
-        optionally ``model.omni_infer_yaml_path[omni_infer_type]`` from the
-        launcher file.  Relative ``modules.*.weights_path`` values in the
-        training YAML are joined under ``model_path``; absolute paths are kept
-        as-is.  ``tokenizer_path`` is set to ``model_path``.
-        """
-        model = load_launcher_model_section(launcher_yaml)
-        model_path = model.get("model_path")
-        train_yaml = model.get("omni_train_yaml_path")
-        if not model_path:
-            raise ValueError(f"`model.model_path` is required in {launcher_yaml!s}.")
-        if not train_yaml:
-            raise ValueError(f"`model.omni_train_yaml_path` is required in {launcher_yaml!s}.")
-
-        infer_map: Mapping[str, str] = model.get("omni_infer_yaml_path") or {}
-        selected = infer_type or model.get("omni_infer_type")
-        paths: List[Union[str, os.PathLike]] = [train_yaml]
-        if selected is not None:
-            if selected not in infer_map:
-                known = ", ".join(sorted(infer_map)) or "(none)"
-                raise KeyError(f"Unknown omni_infer_type {selected!r} in {launcher_yaml!s}; expected one of: {known}.")
-            paths.append(infer_map[selected])
-
-        cfg = cls.from_yamls(*paths, **kwargs)
-        return apply_model_path(cfg, str(model_path))
+        base_cfg = {"model_path": model_path, "tokenizer_path": tokenizer_path}
+        with open(train_yaml_path, encoding="utf-8") as f:
+            base_cfg.update(yaml.safe_load(f))
+        if infer_yaml_path is not None:
+            with open(infer_yaml_path, encoding="utf-8") as f:
+                base_cfg.update(yaml.safe_load(f))
+        return cls.from_dict(base_cfg, **kwargs)
 
 
-def _deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
-    """Recursively merge ``override`` into a deep-copy of ``base`` and return it.
-
-    Dict values merge recursively; non-dict values from ``override``
-    replace the base wholesale.  ``None`` in ``override`` does NOT clear
-    the base — use an explicit empty dict / list / scalar to override.
-    """
-    out: Dict[str, Any] = deepcopy(base)
-    for k, v in override.items():
-        if v is None:
-            continue
-        if k in out and isinstance(out[k], dict) and isinstance(v, dict):
-            out[k] = _deep_merge(out[k], v)
-        else:
-            out[k] = deepcopy(v)
-    return out
-
-
-__all__ = [
-    "OmniConfig",
-    "apply_model_path",
-    "load_launcher_model_section",
-    "resolve_module_weights_path",
-]
+__all__ = ["OmniConfig"]

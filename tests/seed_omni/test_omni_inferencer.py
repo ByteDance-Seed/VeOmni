@@ -2,18 +2,16 @@
 
 Scope
 -----
-* :class:`InferenceRequest` carries the expected default shape.
-* Public module surface: :class:`OmniInferencer` + :class:`InferenceRequest`
-  are exported and constructible-without-weights raises a clear error.
+* :class:`InferenceRequest` carries the expected default shape and the
+  module's public surface (``__all__``) exports it.
 * :func:`_read_model_type` (validation gate before ``from_pretrained``)
-  rejects unknown / missing ``model_type`` with a useful message —
-  exercised via the public ``OmniInferencer`` path with a hand-built
-  config.json on disk.
+  rejects unknown / missing ``model_type`` with a useful message.
 
 Full end-to-end (real Janus weights) inference is covered by
-``tasks/infer/infer_omni.py`` and exercised in the broader integration
-suite; this file pins the boundary error contracts and stays runnable
-without GPU / weights.
+``tasks/infer/infer_omni.py`` and the broader integration suite; this file
+stays runnable without GPU / weights and assumes the caller passes a
+well-formed :class:`OmniInferenceArguments` (no construction-time
+defensive checks to pin).
 """
 
 from __future__ import annotations
@@ -23,10 +21,8 @@ from pathlib import Path
 
 import pytest
 
-from veomni.models.seed_omni import OmniConfig
 from veomni.trainer.omni_inferencer import (
     InferenceRequest,
-    OmniInferencer,
     _read_model_type,
 )
 
@@ -63,32 +59,6 @@ def test_inference_request_is_a_plain_dataclass():
         "generation_kwargs",
         "max_new_tokens",
     }
-
-
-# ── OmniInferencer construction error contracts ──────────────────────────────
-
-
-def test_omni_inferencer_rejects_non_omni_config():
-    with pytest.raises(TypeError, match=r"OmniConfig"):
-        OmniInferencer("not-a-config")  # type: ignore[arg-type]
-
-
-def test_omni_inferencer_requires_tokenizer_path(tmp_path: Path):
-    cfg = OmniConfig(
-        modules={"x": {"weights_path": str(tmp_path)}},
-        generation_graph={"initial": "s", "states": {"s": {}}},
-    )
-    with pytest.raises(ValueError, match=r"tokenizer_path"):
-        OmniInferencer(cfg)
-
-
-def test_omni_inferencer_requires_generation_graph(tmp_path: Path):
-    cfg = OmniConfig(
-        modules={"x": {"weights_path": str(tmp_path)}},
-        tokenizer_path=str(tmp_path),
-    )
-    with pytest.raises(ValueError, match=r"generation_graph"):
-        OmniInferencer(cfg)
 
 
 # ── _read_model_type ────────────────────────────────────────────────────────

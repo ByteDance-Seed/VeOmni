@@ -23,7 +23,8 @@ model:
   model_path: seed_omni/janus_1.3b
   # Master training vocabulary: modules / nodes / edges / training_graph.
   omni_train_yaml_path: configs/seed_omni/janus_1.3b/train.yaml
-  # Inference scenarios — each YAML deep-merges over omni_train_yaml_path.
+  # Inference scenarios — the selected YAML overlays omni_train_yaml_path
+  # (flat dict.update; only top-level keys, in practice generation_graph).
   omni_infer_yaml_path:
     infer_gen: configs/seed_omni/janus_1.3b/infer_gen.yaml
     infer_und: configs/seed_omni/janus_1.3b/infer_und.yaml
