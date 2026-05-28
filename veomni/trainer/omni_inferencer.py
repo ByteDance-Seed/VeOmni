@@ -85,7 +85,7 @@ HuggingFace ``GenerationMixin._prepare_generation_config``.
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 import torch
@@ -248,7 +248,14 @@ class OmniInferRunArguments(InferArguments):
     )
     output_dir: str = field(
         default="output",
-        metadata={"help": "Directory for reply.txt + generated_image_*.png + trace.txt (created if missing)."},
+        metadata={
+            "help": (
+                "Root output directory.  :meth:`OmniInferencer.from_args` joins the "
+                "resolved scenario onto this path, so the actual artefacts land under "
+                "``<output_dir>/<omni_infer_type>/`` — e.g. ``output/infer_gen/`` for T2I, "
+                "``output/infer_und/`` for I2T.  Created if missing."
+            )
+        },
     )
     guidance_scale: float = field(
         default=5.0,
@@ -480,6 +487,17 @@ class OmniInferencer:
         Validates the two CLI mandatories (``--infer.prompt`` non-empty,
         ``--model.model_path`` set) up front so the user sees a clear error
         before module construction starts (which is the slow / expensive part).
+
+        Side-effect on the stashed ``infer_args``: the resolved scenario name
+        is joined onto :attr:`OmniInferRunArguments.output_dir` (via
+        :func:`dataclasses.replace`, so the caller's ``args`` is NOT mutated)
+        so artefacts land under ``<output_dir>/<scenario>/`` — e.g.
+        ``output/infer_gen/generated_image_0.png`` instead of
+        ``output/generated_image_0.png``.  Avoids T2I / I2T runs clobbering
+        each other when the user re-runs with the same ``--infer.output_dir``
+        but a different scenario (a common workflow when comparing modes).
+        Programmatic callers that hit :meth:`OmniInferencer.__init__` directly
+        bypass this join and own their output paths.
         """
         if not args.infer.prompt:
             raise ValueError(
@@ -489,11 +507,17 @@ class OmniInferencer:
             raise ValueError("`--model.model_path` is required (launcher YAML must declare `model.model_path`).")
 
         scenario, source = _select_scenario(args.model, has_image=bool(args.infer.image))
+        # Non-destructive copy via ``replace`` — the caller's ``args.infer``
+        # stays untouched (important for batched callers that reuse the
+        # same ``args`` object across multiple inferencer constructions).
+        infer_args = replace(args.infer, output_dir=os.path.join(args.infer.output_dir, scenario))
+
         logger.info_rank0(f"OmniInferencer.from_args: model_path = {args.model.model_path}")
         logger.info_rank0(f"OmniInferencer.from_args: scenario = {scenario}  (source: {source})")
+        logger.info_rank0(f"OmniInferencer.from_args: output_dir = {infer_args.output_dir}")
 
         cfg = args.model.load_omni_config(infer_type=scenario)
-        return cls(cfg, dtype=dtype, seed=args.infer.seed, infer_args=args.infer)
+        return cls(cfg, dtype=dtype, seed=args.infer.seed, infer_args=infer_args)
 
     @classmethod
     def from_launcher(
