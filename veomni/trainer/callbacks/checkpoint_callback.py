@@ -73,7 +73,9 @@ class CheckpointerCallback(Callback):
         }
 
         if getattr(self.trainer.checkpointer, "save_future", None) is not None:  # async save
-            self.trainer.checkpointer.save_future.result()
+            # Coordinated drain — see DistributedCheckpointer.drain_and_coordinate_previous_async_save.
+            # Avoids the asymmetric-raise deadlock if the worker thread failed on only some ranks.
+            self.trainer.checkpointer.drain_and_coordinate_previous_async_save()
 
         self.trainer.checkpointer.load(
             args.train.checkpoint.load_path,
@@ -197,7 +199,9 @@ class HuggingfaceCkptCallback(CheckpointerCallback):
             super()._save_checkpoint(state)
 
         if getattr(self.trainer.checkpointer, "save_future", None) is not None:  # async save
-            self.trainer.checkpointer.save_future.result()
+            # Coordinated drain — see DistributedCheckpointer.drain_and_coordinate_previous_async_save.
+            # Avoids the asymmetric-raise deadlock if the worker thread failed on only some ranks.
+            self.trainer.checkpointer.drain_and_coordinate_previous_async_save()
 
         if stage == "train_end":
             self.trainer.optimizer = None
@@ -234,7 +238,9 @@ class HFLoraCkptCallback(HuggingfaceCkptCallback):
             CheckpointerCallback._save_checkpoint(self, state)
 
         if getattr(self.trainer.checkpointer, "save_future", None) is not None:  # async save
-            self.trainer.checkpointer.save_future.result()
+            # Coordinated drain — see DistributedCheckpointer.drain_and_coordinate_previous_async_save.
+            # Avoids the asymmetric-raise deadlock if the worker thread failed on only some ranks.
+            self.trainer.checkpointer.drain_and_coordinate_previous_async_save()
 
         if stage == "train_end":
             self.trainer.optimizer = None
