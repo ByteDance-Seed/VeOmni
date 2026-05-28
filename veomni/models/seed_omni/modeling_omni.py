@@ -74,8 +74,16 @@ report cost nothing.
 Both ``step`` and ``maybe_transition`` accept an optional ``trace`` list —
 print-driven flow tests collect the visit log from there to assert the
 expected node order and transition timing.
+
+``OmniModel.generate`` additionally accepts a ``progress`` flag (default
+``False``) that, when enabled, prints one stdout line per FSM state entry
+(``[FSM] step <N>: <state_name>``) so CLI users get a coarse progress
+indicator for long-running spans (e.g. Janus T2I's 576-step ``image_vq``
+loop).  :class:`OmniInferencer` opts into this by default; unit tests
+keep it off so stdout stays quiet.
 """
 
+import os
 from typing import Any, Dict, Iterator, List, Mapping, Optional, Tuple
 
 import torch
@@ -272,6 +280,7 @@ class OmniModel(nn.Module):
         stop_token_ids: Optional[List[int]] = None,
         *,
         trace: Optional[List[str]] = None,
+        progress: bool = False,
     ) -> Dict[str, Any]:
         """Run inference using the FSM.
 
@@ -292,6 +301,24 @@ class OmniModel(nn.Module):
             state (e.g. ``</s>``).
         trace:
             Optional list — receives FSM step / transition log for testing.
+        progress:
+            When ``True``, prints a one-liner to stdout every time the FSM
+            enters a new state — the initial state at step 0, every state
+            reached via :meth:`GenerationGraph.maybe_transition`, and the
+            terminal ``done`` state.  Also fires once after the loop exits
+            so the user sees the final resting state regardless of how the
+            loop terminated (normal ``done``, ``max_new_tokens`` cap, or
+            ``stop_token_ids`` early-stop).  Rank-0 gated via
+            ``LOCAL_RANK`` so multi-rank dispatch doesn't multiplex the
+            output.  Default ``False`` so the runtime stays quiet for
+            unit / print-flow tests.
+
+            Functions as a coarse progress indicator for long-running
+            inference — Janus T2I e.g. shows ``prompt_encode → image_vq →
+            image_vq_end → done`` so the user can see which FSM span is
+            currently in flight (the 576-step ``image_vq`` loop is by far
+            the slowest, and the user reads the breakdown from the step
+            deltas between consecutive lines).
         """
         if self.generation_graph is None:
             raise RuntimeError(
@@ -308,8 +335,33 @@ class OmniModel(nn.Module):
 
         modules = {name: _unwrap_module(getattr(self, name)) for name in self._module_names}
 
+        # State-transition tracker for the optional ``progress`` print.
+        # ``maybe_transition`` flips the FSM's current state at the END of
+        # each iteration body, so checking at the START of the NEXT body
+        # is what catches every state change (including the initial state
+        # at step 0, where ``last_printed_state`` is still None).  A second
+        # check after the loop catches the transition into ``done`` (the
+        # while-cond exits the loop before the body iterates that state).
+        last_printed_state: Optional[str] = None
+        # Mirror :func:`veomni.utils.logging.info_rank0`'s rank-gate so the
+        # progress trail doesn't multiplex on multi-rank dispatch.  We
+        # deliberately bypass the logger and use ``print`` so the line lands
+        # without the ``[INFO|file:line] timestamp >>`` formatter prefix
+        # diluting the signal — the user asked for a clean progress bar.
+        progress_is_rank0 = int(os.getenv("LOCAL_RANK", "0")) == 0
+
+        def _emit_progress() -> None:
+            nonlocal last_printed_state
+            if not progress or not progress_is_rank0:
+                return
+            current = self.generation_graph.current_state_name
+            if current != last_printed_state:
+                print(f"[FSM] step {total_steps:>4}: {current}", flush=True)
+                last_printed_state = current
+
         total_steps = 0
         while not self.generation_graph.is_done() and total_steps < max_new_tokens:
+            _emit_progress()
             ctx = self.generation_graph.step(modules, ctx, trace=trace)
             total_steps += 1
 
@@ -329,6 +381,12 @@ class OmniModel(nn.Module):
                     break
 
             self.generation_graph.maybe_transition(ctx, trace=trace)
+
+        # Final emit — captures the state the FSM is in after the loop
+        # exits.  Usually ``done`` (max_new_tokens not exhausted, normal
+        # termination); otherwise the state the FSM got stuck in
+        # (max_new_tokens cap or stop_token_ids hit).
+        _emit_progress()
 
         # Finalize: hand ctx + request to every active module's `finalize`
         # hook.  This is the framework's contract for "what does the built-in

@@ -264,6 +264,16 @@ class OmniInferRunArguments(InferArguments):
         default=False,
         metadata={"help": "Dump FSM step / transition log to <output_dir>/trace.txt (debugging aid)."},
     )
+    progress: bool = field(
+        default=True,
+        metadata={
+            "help": (
+                "Print one ``[FSM] step <N>: <state>`` line per FSM state entry to stdout "
+                "(coarse progress bar — see :meth:`OmniModel.generate`).  Default true for "
+                "CLI runs; set false for CI / notebook embeds that don't want the stdout spam."
+            )
+        },
+    )
 
     def __post_init__(self):
         # Base-class __post_init__ tries `self.tokenizer_path = self.model_path`
@@ -659,7 +669,7 @@ class OmniInferencer:
             max_new_tokens=args.max_tokens,
         )
         trace_buf: list[str] | None = [] if args.trace else None
-        ctx = self.run_request(request, trace=trace_buf)
+        ctx = self.run_request(request, trace=trace_buf, progress=args.progress)
         self.finalize(ctx, output_dir=args.output_dir, trace=trace_buf)
         return ctx
 
@@ -668,6 +678,7 @@ class OmniInferencer:
         request: InferenceRequest,
         *,
         trace: list[str] | None = None,
+        progress: bool = False,
     ) -> dict[str, Any]:
         """Low-level entry: accept a fully-built :class:`InferenceRequest`.
 
@@ -675,8 +686,14 @@ class OmniInferencer:
         this for programmatic / batched flows where the caller manages
         output persistence.  For one-shot script use, prefer :meth:`generate`
         (which also calls :meth:`finalize`).
+
+        ``progress`` opts into :class:`OmniModel.generate`'s per-state
+        stdout trail (e.g. ``[FSM] step    0: prompt_encode``).  Defaults
+        to ``False`` here so programmatic batched callers stay quiet; the
+        :meth:`generate` wrapper passes ``args.progress`` (default True)
+        for CLI use.
         """
-        return self._run(request, trace=trace)
+        return self._run(request, trace=trace, progress=progress)
 
     # ── Output persistence ────────────────────────────────────────────────────
 
@@ -750,7 +767,13 @@ class OmniInferencer:
     # ── Internal ──────────────────────────────────────────────────────────────
 
     @torch.inference_mode()
-    def _run(self, req: InferenceRequest, *, trace: list[str] | None = None) -> dict[str, Any]:
+    def _run(
+        self,
+        req: InferenceRequest,
+        *,
+        trace: list[str] | None = None,
+        progress: bool = False,
+    ) -> dict[str, Any]:
         # Reset per-call buffers held inside modules (VQ token grid, etc.).
         for module in self.modules.values():
             if hasattr(module, "reset_inference_state"):
@@ -767,11 +790,15 @@ class OmniInferencer:
         # ``OmniModel.generate`` initialises ``ctx`` from ``context``
         # (or from ``request`` when ``context`` is None) — we pass the
         # same dict for both so every key is visible to module kwargs.
+        # ``progress`` flows from the caller (False by default for
+        # batched / programmatic flows; the CLI :meth:`generate` wrapper
+        # forwards ``args.progress`` which defaults to True).
         ctx = self.model.generate(
             request=request_dict,
             context=request_dict,
             max_new_tokens=req.max_new_tokens,
             trace=trace,
+            progress=progress,
         )
         return ctx
 
