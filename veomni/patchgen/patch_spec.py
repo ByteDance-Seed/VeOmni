@@ -400,6 +400,10 @@ class PatchConfig:
         """Get all function replacement patches as a dict."""
         return {p.target: p for p in self.patches if p.patch_type == PatchType.FUNCTION_REPLACEMENT}
 
+    def get_init_modifications(self) -> dict[str, Patch]:
+        """Get all init modification patches as a dict (keyed by class name)."""
+        return {p.target: p for p in self.patches if p.patch_type == PatchType.INIT_MODIFICATION}
+
 
 def get_source_code(obj: Any) -> str:
     """

@@ -751,6 +751,69 @@ class ModelingCodeGenerator:
 
         return modified_class, cleaned_replacement_source, applied
 
+    def _apply_init_modification(self, patch: Patch) -> str:
+        """Emit a monkey-patch block for an INIT_MODIFICATION patch.
+
+        The patch's replacement function has signature
+        ``(original_init, self, *args, **kwargs)``. We emit, at module
+        scope, three pieces of code:
+
+        1. The patch function itself (source preserved, decorators stripped).
+        2. A stash of the original ``__init__`` to a module-level name.
+        3. A wrapper ``__init__`` that forwards to the patch function with
+           ``original_init`` bound to the stash, then re-assigns it to
+           ``<ClassName>.__init__`` so all subsequent instantiations run
+           through the patched path.
+
+        This must be emitted AFTER the class definition itself (otherwise
+        the ``ClassName.__init__`` reference would be unresolved at import
+        time). See ``generate()`` for the call site.
+        """
+        if not patch.replacement:
+            return ""
+
+        target_class = patch.target
+        replacement_source = get_object_source_with_leading_comments(patch.replacement)
+        if not replacement_source:
+            return ""
+
+        replacement_source = textwrap.dedent(replacement_source)
+        replacement_source = _apply_name_map(replacement_source, patch.name_map)
+        cleaned_source = strip_patch_decorators(replacement_source)
+        patch_fn_name = patch.replacement.__name__
+
+        # Use class name (sanitized) for the stash so multiple init mods
+        # in the same file don't collide on a shared "_orig_init" symbol.
+        stash_var = f"_orig_init_{target_class}"
+        wrapper_name = f"_patched_init_{target_class}"
+
+        lines = [
+            "",
+            f"# {'=' * 70}",
+            f"# [INIT MODIFICATION] {target_class}",
+        ]
+        if patch.description:
+            lines.append(f"# Reason: {patch.description}")
+        lines.extend(
+            [
+                f"# {'=' * 70}",
+                "",
+                cleaned_source.rstrip(),
+                "",
+                "",
+                f"{stash_var} = {target_class}.__init__",
+                "",
+                "",
+                f"def {wrapper_name}(self, *args, **kwargs):",
+                f"    return {patch_fn_name}({stash_var}, self, *args, **kwargs)",
+                "",
+                "",
+                f"{target_class}.__init__ = {wrapper_name}",
+                "",
+            ]
+        )
+        return "\n".join(lines)
+
     def _apply_function_replacement(
         self,
         original_func: ast.FunctionDef,
@@ -977,11 +1040,6 @@ class ModelingCodeGenerator:
         # Generate output
         lines = []
         if methods_patched:
-            lines.append("")
-            lines.append(f"# {'=' * 70}")
-            lines.append(f"# [MODIFIED CLASS] {class_name}")
-            lines.append(f"# Methods patched: {', '.join(methods_patched)}")
-            lines.append(f"# {'=' * 70}")
             # Preserve original class formatting/comments for untouched methods,
             # and replace only the patched methods in-place.
             end_line = get_node_end_line(class_node, self.source_lines)
@@ -1110,7 +1168,16 @@ class ModelingCodeGenerator:
                 "Positioned helper target(s) not found in generated output: " + ", ".join(missing_positioned_targets)
             )
 
-        # 4. Join and format output
+        # 4. Emit init-modification monkey-patches AFTER all class
+        # definitions have been written. INIT_MODIFICATION patches install
+        # at module load time by wrapping the source class's ``__init__``;
+        # they would fail to resolve the class name if emitted earlier.
+        for patch in self.config.get_init_modifications().values():
+            init_block = self._apply_init_modification(patch)
+            if init_block:
+                output_parts.append(init_block)
+
+        # 5. Join and format output
         output = "\n".join(output_parts)
         output = _collapse_blank_lines(output, max_consecutive=2)
 
