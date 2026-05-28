@@ -188,6 +188,44 @@ except (ImportError, AttributeError):  # pragma: no cover — defensive
 # Peak local disk = one in-flight file per writer thread × thread_count
 # ≈ 8 × ~500MB = 4GB on a typical 8-GPU node. We always delete the
 # local file in a ``finally`` block so peak is bounded.
+
+# Soft-hang guard: HDFS FUSE has a second failure mode beyond hard errnos
+# — ``shutil.copy`` can hang indefinitely (the underlying syscall blocks
+# forever instead of raising). This was the qwen3_text and qwen3_VL_target
+# prod failure mode: no error logged, no retry triggered, just a long
+# silence followed by the NCCL 10-min Watchdog ALLGATHER timeout. Wrap
+# ``shutil.copy`` in a thread with a hard timeout so the hang case turns
+# into a ``TimeoutError`` that the surrounding retry loop can catch.
+_COPY_TIMEOUT_SEC = float(os.environ.get("VEOMNI_DCP_COPY_TIMEOUT_SEC", "180"))
+
+
+def _copy_with_timeout(src: str, dst: str, timeout: float = _COPY_TIMEOUT_SEC) -> None:
+    import queue as _queue
+    import shutil as _shutil
+    import threading as _threading
+
+    result_q: "_queue.Queue[tuple[str, Optional[BaseException]]]" = _queue.Queue()
+
+    def _worker():
+        try:
+            _shutil.copy(src, dst)
+            result_q.put(("ok", None))
+        except BaseException as exc:
+            result_q.put(("err", exc))
+
+    t = _threading.Thread(target=_worker, daemon=True)
+    t.start()
+    t.join(timeout)
+    if t.is_alive():
+        # Leaked thread is acceptable here — the FUSE syscall is blocked
+        # in the kernel and can't be interrupted from Python anyway. The
+        # thread will eventually return (or the process will exit).
+        raise TimeoutError(f"shutil.copy({src!r}, {dst!r}) did not return within {timeout:.0f}s (HDFS FUSE soft hang)")
+    status, exc = result_q.get_nowait()
+    if status == "err":
+        raise exc  # type: ignore[misc]
+
+
 try:
     import contextlib  # noqa: E402
     import io  # noqa: E402
@@ -214,7 +252,6 @@ try:
                 yield stream
             return
 
-        import shutil
         import tempfile
         import uuid
 
@@ -245,7 +282,7 @@ try:
             last_exc: Optional[BaseException] = None
             for attempt in range(_COPY_RETRIES):
                 try:
-                    shutil.copy(local_tmp, path_str)
+                    _copy_with_timeout(local_tmp, path_str)
                     if attempt > 0:
                         logger.info(
                             f"DCP create_stream: shutil.copy local→HDFS succeeded "
@@ -253,7 +290,7 @@ try:
                             f"(local: {local_tmp})"
                         )
                     return
-                except (OSError, RuntimeError) as e:
+                except (OSError, RuntimeError, TimeoutError) as e:
                     last_exc = e
                     backoff = min(_BACKOFF_BASE_SEC * (2**attempt), _BACKOFF_CAP_SEC)
                     is_last = attempt == _COPY_RETRIES - 1
@@ -907,7 +944,6 @@ class DistributedCheckpointer(CheckpointerBase):
                     )
 
         # Direct retries exhausted — write locally then copy to HDFS.
-        import shutil
         import tempfile
 
         local_tmp_root = os.environ.get("VEOMNI_EXTRA_STATE_TMPDIR", tempfile.gettempdir())
@@ -920,7 +956,12 @@ class DistributedCheckpointer(CheckpointerBase):
         )
         try:
             torch.save(state["extra_state"], local_tmp_path)
-            shutil.copy(local_tmp_path, extra_state_path)
+            # Use the timeout-wrapped copy so a FUSE soft-hang on this
+            # fallback path also surfaces as a TimeoutError instead of
+            # silently waiting for the NCCL Watchdog. The default 180s
+            # timeout is plenty for one rank's extra_state (typically
+            # 100MB-3GB) over HDFS.
+            _copy_with_timeout(local_tmp_path, extra_state_path)
             logger.info(
                 f"[rank {rank}] _save_extra_state: local-then-copy fallback "
                 f"succeeded — wrote {local_tmp_path} (local) → {extra_state_path} (HDFS)."
