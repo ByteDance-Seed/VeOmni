@@ -61,15 +61,12 @@ def _segment_per_rank(n_clusters: int, world_size: int) -> int:
     """
     if n_clusters < world_size:
         return 0
-    assert n_clusters % world_size == 0, (
-        f"n_clusters={n_clusters} >= world_size={world_size} but not divisible"
-    )
+    assert n_clusters % world_size == 0, f"n_clusters={n_clusters} >= world_size={world_size} but not divisible"
     return n_clusters // world_size
 
 
 def _segment_remap(c_in_segment: int, n_pr: int, world_size: int) -> int:
-    """Round-robin remap inside one segment.
-    """
+    """Round-robin remap inside one segment."""
     round_idx, rank = divmod(c_in_segment, world_size)
     return rank * n_pr + round_idx
 
@@ -107,25 +104,20 @@ class PackQKVTileScheduler(TileScheduler):
 
         @staticmethod
         @cute.jit
-        def create(
-            args: "PackQKVTileSchedulerArguments", *, loc=None, ip=None
-        ) -> "PackQKVTileScheduler.Params":
-            # Reject the sentinel defaults: callers MUST set all four explicitly. 
+        def create(args: "PackQKVTileSchedulerArguments", *, loc=None, ip=None) -> "PackQKVTileScheduler.Params":
+            # Reject the sentinel defaults: callers MUST set all four explicitly.
             assert args.world_size_const >= 1, (
                 f"PackQKVTileSchedulerArguments.world_size_const must be set explicitly "
                 f"(>=1); got {args.world_size_const}"
             )
             assert args.n_clusters_q >= 1, (
-                f"PackQKVTileSchedulerArguments.n_clusters_q must be set explicitly "
-                f"(>=1); got {args.n_clusters_q}"
+                f"PackQKVTileSchedulerArguments.n_clusters_q must be set explicitly (>=1); got {args.n_clusters_q}"
             )
             assert args.n_clusters_k >= 1, (
-                f"PackQKVTileSchedulerArguments.n_clusters_k must be set explicitly "
-                f"(>=1); got {args.n_clusters_k}"
+                f"PackQKVTileSchedulerArguments.n_clusters_k must be set explicitly (>=1); got {args.n_clusters_k}"
             )
             assert args.n_clusters_v >= 1, (
-                f"PackQKVTileSchedulerArguments.n_clusters_v must be set explicitly "
-                f"(>=1); got {args.n_clusters_v}"
+                f"PackQKVTileSchedulerArguments.n_clusters_v must be set explicitly (>=1); got {args.n_clusters_v}"
             )
             # Cluster N must be 1 for the cluster-level remap to coincide with
             # the per-CTA tile_n dst_rank routing in ``epi_begin_loop``.
@@ -172,9 +164,7 @@ class PackQKVTileScheduler(TileScheduler):
         return PackQKVTileScheduler.Params.create(args, loc=loc, ip=ip)
 
     @cute.jit
-    def _swizzle_cta(
-        self, cluster_id_in_problem: Int32, *, loc=None, ip=None
-    ) -> Tuple[Int32, Int32]:
+    def _swizzle_cta(self, cluster_id_in_problem: Int32, *, loc=None, ip=None) -> Tuple[Int32, Int32]:
         # Step 1 — defer to quack's L2-aware serpentine swizzle for the
         # base (cid_m, cid_n) decision. The super call honours raster_order,
         # max_swizzle_size and serpentine inner ordering exactly as upstream.
@@ -187,9 +177,7 @@ class PackQKVTileScheduler(TileScheduler):
             if const_expr(params.n_clusters_q_per_rank == 0):
                 cid_n_remapped = cid_n_default
             else:
-                cid_n_remapped = _segment_remap(
-                    cid_n_default, params.n_clusters_q_per_rank, W
-                )
+                cid_n_remapped = _segment_remap(cid_n_default, params.n_clusters_q_per_rank, W)
         elif cid_n_default < params.n_clusters_qk:
             if const_expr(params.n_clusters_k_per_rank == 0):
                 cid_n_remapped = cid_n_default

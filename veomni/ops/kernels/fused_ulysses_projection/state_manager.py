@@ -29,7 +29,7 @@ manager is intentionally ``None`` and dispatch falls back to eager.
 from __future__ import annotations
 
 import threading
-from typing import TYPE_CHECKING, Optional, Tuple
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -52,7 +52,7 @@ if TYPE_CHECKING:
 # config resolution.
 
 _active_impl_name: str = "eager"
-_active_manager: Optional["WsPushStateManager"] = None
+_active_manager: WsPushStateManager | None = None
 _lock = threading.Lock()
 
 
@@ -61,7 +61,7 @@ def get_active_impl_name() -> str:
     return _active_impl_name
 
 
-def set_active_manager(manager: "WsPushStateManager") -> None:
+def set_active_manager(manager: WsPushStateManager) -> None:
     """Publish a manager so transparent dispatch can pick it up."""
     global _active_manager
     with _lock:
@@ -74,7 +74,7 @@ def set_active_manager(manager: "WsPushStateManager") -> None:
         _active_manager = manager
 
 
-def get_active_manager() -> Optional["WsPushStateManager"]:
+def get_active_manager() -> WsPushStateManager | None:
     """Return the currently published manager, or ``None`` if not initialized.
 
     Lock-free read: reference assignment is atomic under the GIL, so a
@@ -159,7 +159,7 @@ class WsPushStateManager:
         # tile config chosen by global sequence length — see choose_tile_config.
         world_size = dist.get_world_size(sp_group)
         tile_n, pingpong = choose_tile_config(local_seq, world_size)
-        self._state: Optional["WsPushState"] = init_ws_push_state(
+        self._state: WsPushState | None = init_ws_push_state(
             sp_group=sp_group,
             device=device,
             bs=bs,
@@ -174,13 +174,13 @@ class WsPushStateManager:
         )
 
     @property
-    def state(self) -> "WsPushState":
+    def state(self) -> WsPushState:
         if self._state is None:
             raise RuntimeError("WsPushStateManager has been torn down; cannot access state.")
         return self._state
 
     @property
-    def shape(self) -> Tuple[int, int, int, int, int, int, torch.dtype]:
+    def shape(self) -> tuple[int, int, int, int, int, int, torch.dtype]:
         return (
             self.bs,
             self.local_seq,

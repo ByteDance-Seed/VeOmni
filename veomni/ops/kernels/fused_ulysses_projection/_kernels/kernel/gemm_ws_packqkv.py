@@ -1,12 +1,12 @@
-from typing import NamedTuple
-from dataclasses import dataclass
 from collections.abc import Callable
+from dataclasses import dataclass
+from typing import NamedTuple
 
 import cutlass
 import cutlass.cute as cute
 import quack.copy_utils as copy_utils
 import quack.sm90_utils as quack_sm90_utils
-from cutlass import Boolean, Int32, Int64, Float32, const_expr
+from cutlass import Boolean, Float32, Int32, Int64, const_expr
 from quack.cute_dsl_utils import ParamsBase, mlir_namedtuple
 
 # Base class import. The Ulysses extension hooks and the PackQKV scheduler
@@ -27,7 +27,7 @@ def _rank_seq_offset(
 
 
 @cute.jit
-def input_nh_to_dst_rank_and_pack_head(     # segment-blockwise: raw W_qkv layout, no host shuffle
+def input_nh_to_dst_rank_and_pack_head(  # segment-blockwise: raw W_qkv layout, no host shuffle
     input_nh: Int32,
     nheads_q: Int32,
     nheads_k: Int32,
@@ -475,9 +475,9 @@ class PackQKVEpilogueMixin:
         copy_D: Callable | None,
         peer_copy_Ds,
         epi_buffer: Int32,
-        epi_idx: Int32 = Int32(0),
+        epi_idx: Int32 = Int32(0),  # noqa: B008  # mirrors upstream quack signature
     ) -> None:
-        del params, gmem_coord, epi_idx
+        del params, epi_idx
         if const_expr(len(peer_copy_Ds) > 0):
             flat_idx, dst_tm, dst_tn, _tDrBias = epi_loop_tensors
             s2g_cache_hint = Int64(Int64(1).ir_value())  # CU_ACCESS_PROPERTY_STREAMING

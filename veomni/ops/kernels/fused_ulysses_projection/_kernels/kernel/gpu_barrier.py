@@ -2,14 +2,14 @@
 #
 # Self-contained: bundles `_compile_gpu_barrier` with every PTX inline-asm
 
+import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
-import cuda.bindings.driver as cuda
 from cutlass import Int32, Int64
-from quack.cache_utils import jit_cache
-from cutlass.cutlass_dsl import dsl_user_op
-from quack.compile_utils import make_fake_tensor as fake_tensor
 from cutlass._mlir.dialects import llvm
+from cutlass.cutlass_dsl import dsl_user_op
+from quack.cache_utils import jit_cache
+from quack.compile_utils import make_fake_tensor as fake_tensor
 
 
 # ============================================================================

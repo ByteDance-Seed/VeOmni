@@ -123,7 +123,7 @@ def _epi_store_subtile(
     copy_D,
     peer_copy_Ds,
     epi_buffer,
-    epi_idx=Int32(0),
+    epi_idx=Int32(0),  # noqa: B008  # mirrors upstream quack signature
 ):
     """Default: forward to ``copy_D`` (matches upstream inline store)."""
     del params, epi_loop_tensors, peer_copy_Ds, epi_idx
@@ -336,9 +336,7 @@ def _patched_kernel(
     # Fail fast: gather_A path calls ``self._make_gather_A_copy`` which is
     # absent on quack 0.3.4 (also omitted from ``_REQUIRED_GEMMSM90_METHODS``);
     # without this assert the failure would surface deep inside MLIR.
-    assert not self.gather_A, (
-        "patched _patched_kernel does not support gather_A on quack 0.3.4"
-    )
+    assert not self.gather_A, "patched _patched_kernel does not support gather_A on quack 0.3.4"
     if const_expr(self.gather_A):
         assert varlen_m or varlen_k
     has_D = const_expr(mD_mnl is not None or self.epi_has_output_stage(epilogue_params))
@@ -853,10 +851,7 @@ def _check_quack_compatibility() -> None:
                 stacklevel=2,
             )
         else:
-            raise RuntimeError(
-                msg + f" Set {_ALLOW_QUACK_DRIFT_ENV}=1 to bypass for an "
-                f"investigative run."
-            )
+            raise RuntimeError(msg + f" Set {_ALLOW_QUACK_DRIFT_ENV}=1 to bypass for an investigative run.")
 
     missing = [m for m in _REQUIRED_GEMMSM90_METHODS if not hasattr(_GemmSm90, m)]
     if missing:
@@ -926,12 +921,8 @@ def _install_packqkv_scheduler_overrides() -> None:
         assert not varlen_m, "PackQKVTileScheduler does not support varlen_m"
         return PackQKVTileScheduler
 
-    def _packqkv_get_scheduler_arguments(
-        self, mA, mB, mD, scheduler_args, varlen_args, epilogue_args
-    ):
-        base_args = _orig_get_scheduler_arguments(
-            self, mA, mB, mD, scheduler_args, varlen_args, epilogue_args
-        )
+    def _packqkv_get_scheduler_arguments(self, mA, mB, mD, scheduler_args, varlen_args, epilogue_args):
+        base_args = _orig_get_scheduler_arguments(self, mA, mB, mD, scheduler_args, varlen_args, epilogue_args)
         # Read head shapes from instance attrs (Python ints, set by
         # _compile_ws_gemm_packqkv) — they participate in the @jit_cache key,
         # so the cache never returns a binary built for a different head layout.
@@ -952,15 +943,9 @@ def _install_packqkv_scheduler_overrides() -> None:
         n_q_cols = nheads_q * head_dim
         n_k_cols = nheads_k * head_dim
         n_v_cols = nheads_v * head_dim
-        assert n_q_cols % unit == 0, (
-            f"Q segment cols={n_q_cols} not divisible by cta_tile_n*cluster_n={unit}"
-        )
-        assert n_k_cols % unit == 0, (
-            f"K segment cols={n_k_cols} not divisible by cta_tile_n*cluster_n={unit}"
-        )
-        assert n_v_cols % unit == 0, (
-            f"V segment cols={n_v_cols} not divisible by cta_tile_n*cluster_n={unit}"
-        )
+        assert n_q_cols % unit == 0, f"Q segment cols={n_q_cols} not divisible by cta_tile_n*cluster_n={unit}"
+        assert n_k_cols % unit == 0, f"K segment cols={n_k_cols} not divisible by cta_tile_n*cluster_n={unit}"
+        assert n_v_cols % unit == 0, f"V segment cols={n_v_cols} not divisible by cta_tile_n*cluster_n={unit}"
         return PackQKVTileSchedulerArguments(
             problem_shape_ntile_mnl=base_args.problem_shape_ntile_mnl,
             raster_order=base_args.raster_order,
