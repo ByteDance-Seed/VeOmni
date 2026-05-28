@@ -87,6 +87,108 @@ logger = helper.create_logger(__name__)
 
 
 @dataclass
+class OmniInferModelArguments:
+    """``model.*`` — slim model arguments for SeedOmni V2 inference / visualization.
+
+    Carries ONLY the four fields actually consumed by the FSM-driven inference
+    path: ``model_path`` + the three ``omni_*`` graph pointers.  Intentionally
+    does NOT inherit from :class:`ModelArguments` / :class:`OmniModelArguments`
+    (which carry training-only knobs like ``ops_implementation``, ``encoders``
+    /``decoders``, ``lora_config``, ``safetensor_idx_path``, ``basic_modules``,
+    etc.) — dragging those into an inference CLI would bloat ``--help`` with
+    dozens of irrelevant flags and silently honour training defaults that have
+    no effect at inference time.
+
+    Use with :func:`veomni.arguments.parse_args` like::
+
+        @dataclass
+        class Arguments:
+            model: OmniInferModelArguments = field(default_factory=OmniInferModelArguments)
+            infer: ...                       # script-local per-invocation knobs
+
+        args = parse_args(Arguments)
+        cfg = args.model.load_omni_config(infer_type=...)
+        inferencer = OmniInferencer(cfg, seed=args.infer.seed)
+
+    See :class:`veomni.trainer.omni_trainer.OmniModelArguments` for the
+    training-side analogue (which DOES inherit ``ModelArguments`` because the
+    trainer needs the full surface).
+    """
+
+    model_path: str | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Local/HDFS path to the split-checkpoint root (e.g. "
+                "``/tmp/janus_1.3b_split``).  Required for inference (the global "
+                "tokenizer and per-module weights are loaded from here); "
+                "optional for graph visualization (which doesn't load weights)."
+            )
+        },
+    )
+    omni_train_yaml_path: str | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Path to the master training YAML (carries ``modules / nodes / "
+                "edges / training_graph``).  Read at inference time strictly for "
+                "the graph topology — the rest of the train YAML's training-only "
+                "fields (optimizer / wandb / dataloader / ...) are ignored."
+            )
+        },
+    )
+    omni_infer_yaml_path: dict[str, str] | None = field(
+        default_factory=dict,
+        metadata={
+            "help": (
+                "Mapping of inference scenario name → inference YAML path.  Each "
+                "scenario YAML deep-merges over ``omni_train_yaml_path`` to inject "
+                "a ``generation_graph``.  Example keys: ``infer_gen`` (T2I), "
+                "``infer_und`` (I2T), ``infer_interleave``."
+            )
+        },
+    )
+    omni_infer_type: str | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Active scenario key into ``omni_infer_yaml_path``.  If unset, the "
+                "calling script may auto-pick from context (e.g. ``infer_omni.py`` "
+                "picks ``infer_und`` when ``--infer.image`` is given, ``infer_gen`` "
+                "otherwise)."
+            )
+        },
+    )
+
+    def load_omni_config(self, *, infer_type: str | None = None) -> OmniConfig:
+        """Build an :class:`OmniConfig` with per-module ``weights_path`` resolved.
+
+        Mirrors :meth:`veomni.trainer.omni_trainer.OmniModelArguments.load_omni_config`
+        so the inference path doesn't drift from training-side path resolution.
+        ``infer_type`` (if provided) overrides :attr:`omni_infer_type` for this
+        call only — the dataclass field is not mutated.
+        """
+        from ..models.seed_omni.configuration_seed_omni import apply_model_path
+
+        if not self.omni_train_yaml_path:
+            raise ValueError("`model.omni_train_yaml_path` is required for OmniModel V2 inference.")
+        if not self.model_path:
+            raise ValueError("`model.model_path` is required for OmniModel V2 inference.")
+
+        paths = [self.omni_train_yaml_path]
+        selected = infer_type or self.omni_infer_type
+        if selected is not None:
+            infer_map = self.omni_infer_yaml_path or {}
+            if selected not in infer_map:
+                known = ", ".join(sorted(infer_map)) or "(none)"
+                raise KeyError(f"Unknown omni_infer_type {selected!r}; expected one of: {known}.")
+            paths.append(infer_map[selected])
+
+        cfg = OmniConfig.from_yamls(*paths)
+        return apply_model_path(cfg, self.model_path)
+
+
+@dataclass
 class InferenceRequest:
     """A single inference call.
 
@@ -459,4 +561,4 @@ def _resolve_dtype(name: str, device: torch.device) -> torch.dtype:
     return mapping[name]
 
 
-__all__ = ["OmniInferencer", "InferenceRequest"]
+__all__ = ["OmniInferencer", "InferenceRequest", "OmniInferModelArguments"]

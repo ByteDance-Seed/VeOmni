@@ -3,8 +3,10 @@ Visualize OmniModel graphs from a VeOmni launcher YAML.
 
 Contract
 --------
-Pass a single launcher YAML (e.g. ``configs/seed_omni/janus_1.3b/veomni_janus.yaml``).
-The script reads:
+Pass a single launcher YAML (e.g. ``configs/seed_omni/janus_1.3b/veomni_janus.yaml``)
+as the positional ``config_file`` argument.  Its ``model:`` section is consumed
+by :class:`OmniInferModelArguments` (slim: only the four graph-pointing fields),
+specifically:
 
 * ``model.omni_train_yaml_path`` — master training vocabulary
 * ``model.omni_infer_yaml_path`` — dict of scenario → inference YAML
@@ -21,21 +23,29 @@ Usage
   python scripts/visualize_omni_graph.py configs/seed_omni/janus_1.3b/veomni_janus.yaml
 
   # Browser-renderable HTML instead
-  python scripts/visualize_omni_graph.py configs/seed_omni/janus_1.3b/veomni_janus.yaml --format html
+  python scripts/visualize_omni_graph.py configs/seed_omni/janus_1.3b/veomni_janus.yaml \\
+      --visualize.format html
+
+  # Inspect a single training YAML directly (override the graph pointers on CLI)
+  python scripts/visualize_omni_graph.py \\
+      --model.omni_train_yaml_path configs/seed_omni/janus_1.3b/train.yaml \\
+      --model.omni_infer_yaml_path '{}'
 """
 
 from __future__ import annotations
 
-import argparse
 import os
 import sys
+from dataclasses import dataclass, field
 from typing import Literal
 
 import yaml
 
-from veomni.models.seed_omni.configuration_seed_omni import OmniConfig, load_launcher_model_section
+from veomni.arguments import parse_args
+from veomni.models.seed_omni.configuration_seed_omni import OmniConfig
 from veomni.models.seed_omni.generation_graph import GenerationGraph
 from veomni.models.seed_omni.training_graph import TrainingGraph
+from veomni.trainer.omni_inferencer import OmniInferModelArguments
 
 
 OutputFormat = Literal["html", "mmd"]
@@ -68,6 +78,30 @@ _HTML_TEMPLATE = """<!doctype html>
 """
 
 _MASTER_KEYS = ("nodes", "edges", "training_graph")
+
+
+# ── Argument dataclasses ─────────────────────────────────────────────────────
+
+
+@dataclass
+class VisualizeArguments:
+    """``visualize.*`` — per-invocation knobs for the graph visualizer."""
+
+    format: Literal["html", "mmd"] = field(
+        default="mmd",
+        metadata={"help": "Output format: raw Mermaid (.mmd, default) or browser HTML (.html)."},
+    )
+
+
+@dataclass
+class Arguments:
+    """Root config for ``visualize_omni_graph`` — consumed by :func:`parse_args`."""
+
+    model: OmniInferModelArguments = field(default_factory=OmniInferModelArguments)
+    visualize: VisualizeArguments = field(default_factory=VisualizeArguments)
+
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
 
 
 def _yaml_stem(yaml_path: str) -> str:
@@ -143,54 +177,42 @@ def _render_fsm(cfg: OmniConfig, *, title: str) -> tuple[str, str]:
     return body, meta
 
 
-def _output_dir(launcher_yaml: str) -> str:
-    """``graphs/<yaml_stem>/`` — folder name matches the launcher YAML basename."""
-    return os.path.join("graphs", _yaml_stem(launcher_yaml))
+def _output_dir(launcher_yaml: str | None, fallback_train_yaml: str) -> str:
+    """Pick the output directory for the diagrams.
+
+    Prefer ``graphs/<launcher_yaml_stem>/`` (matches the V1 convention so
+    existing docs / references keep working); fall back to ``graphs/<train_yaml_stem>/``
+    when the visualizer was invoked without a launcher YAML (e.g. with
+    explicit ``--model.omni_train_yaml_path`` overrides).
+    """
+    stem = _yaml_stem(launcher_yaml) if launcher_yaml else _yaml_stem(fallback_train_yaml)
+    return os.path.join("graphs", stem)
 
 
-def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument(
-        "launcher_yaml",
-        help=(
-            "VeOmni launcher YAML (e.g. configs/seed_omni/janus_1.3b/veomni_janus.yaml).  "
-            "Must declare model.omni_train_yaml_path and model.omni_infer_yaml_path."
-        ),
-    )
-    parser.add_argument(
-        "--format",
-        choices=("html", "mmd"),
-        default="mmd",
-        help="Output format: raw Mermaid (.mmd, default) or browser HTML (.html).",
-    )
-    return parser
+# ── Main ─────────────────────────────────────────────────────────────────────
 
 
 def main() -> None:
-    args = _build_parser().parse_args()
-    launcher_yaml: str = args.launcher_yaml
-    fmt: OutputFormat = args.format
-    if not os.path.isfile(launcher_yaml):
-        sys.exit(f"config not found: {launcher_yaml}")
+    args, launcher_yaml = parse_args(Arguments, return_config_path=True)
+    fmt: OutputFormat = args.visualize.format
 
-    model = load_launcher_model_section(launcher_yaml)
-    train_yaml = model.get("omni_train_yaml_path") or ""
-    infer_map: dict[str, str] = dict(model.get("omni_infer_yaml_path") or {})
+    train_yaml = args.model.omni_train_yaml_path or ""
+    infer_map: dict[str, str] = dict(args.model.omni_infer_yaml_path or {})
+
     if not train_yaml:
-        sys.exit(f"`model.omni_train_yaml_path` is missing in {launcher_yaml}")
+        sys.exit(
+            "`model.omni_train_yaml_path` is missing (set in launcher YAML or pass via --model.omni_train_yaml_path)."
+        )
     if not os.path.isfile(train_yaml):
         sys.exit(f"training YAML not found: {train_yaml}")
-    if not infer_map:
-        sys.exit(f"`model.omni_infer_yaml_path` is empty in {launcher_yaml}")
-
     _validate_train_yaml(train_yaml)
     for infer_key, infer_path in infer_map.items():
         if not os.path.isfile(infer_path):
             sys.exit(f"inference YAML not found for {infer_key!r}: {infer_path}")
         _validate_infer_yaml(infer_path)
 
-    out_dir = _output_dir(launcher_yaml)
-    launcher_label = _yaml_stem(launcher_yaml)
+    out_dir = _output_dir(launcher_yaml, train_yaml)
+    launcher_label = _yaml_stem(launcher_yaml) if launcher_yaml else _yaml_stem(train_yaml)
     ext = ".html" if fmt == "html" else ".mmd"
 
     # 1. Training graph (train YAML only).
