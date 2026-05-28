@@ -144,6 +144,142 @@ except (ImportError, AttributeError):  # pragma: no cover — defensive
     pass
 
 
+# Workaround for HDFS-FUSE flakiness during the MAIN DCP write phase
+# (distinct from the ``_save_extra_state`` retry below). PyTorch DCP's
+# ``FileSystemWriter`` opens each distcp shard via
+# ``FileSystem.create_stream(path, "wb")`` and writes records into the
+# stream via ``torch.save``. On multi-node H100x16 prod runs (and
+# occasionally on single-node H100/A100), HDFS FUSE intermittently fails
+# the per-stream writes with one of:
+#
+#     OSError: [Errno 5] Input/output error
+#     OSError: [Errno 75] Value too large for defined data type
+#     OSError: [Errno 107] Transport endpoint is not connected
+#     RuntimeError: [enforce fail at inline_container.cc:664] .
+#         unexpected pos X vs Y           (zip writer position-check)
+#     RuntimeError: [enforce fail at inline_container.cc:858] .
+#         PytorchStreamWriter failed writing file data/N
+#
+# Each of these kills the DCP writer thread on one rank → the surviving
+# ranks block at the next NCCL collective in ``_save_state_dict`` →
+# 10-min watchdog timeout (the symptom we kept tracking in production).
+#
+# The fix is to stage writes through local SSD instead of streaming
+# directly to HDFS-FUSE: ``with create_stream(path, "wb") as stream``
+# now yields a stream backed by a local tempfile; on context exit, the
+# local file is ``shutil.copy``'d to the real HDFS path with retry, and
+# the local tempfile is unlinked. ``shutil.copy`` is a single
+# uninterrupted bulk read+write — much simpler than the zip writer's
+# many seek/write/checksum interactions — and consequently far less
+# likely to trigger FUSE's position-tracking flakiness. On retry
+# failure of the copy itself we delete the (possibly partial) HDFS
+# destination and try again.
+#
+# Activation:
+# - mode startswith "w" AND path under /mnt/hdfs/ → local stage + copy.
+# - Anything else (reads, local writes): zero-overhead passthrough.
+# - ``VEOMNI_DCP_USE_LOCAL_STAGING=0`` env var: disable the staging,
+#   useful for A/B comparison or to opt out on systems where it's not
+#   needed.
+# - ``VEOMNI_DCP_STAGING_DIR`` env var: override the local staging
+#   directory (defaults to ``tempfile.gettempdir()``).
+#
+# Cost: each HDFS write does one local-disk write + one bulk-copy.
+# Peak local disk = one in-flight file per writer thread × thread_count
+# ≈ 8 × ~500MB = 4GB on a typical 8-GPU node. We always delete the
+# local file in a ``finally`` block so peak is bounded.
+try:
+    import contextlib  # noqa: E402
+    import io  # noqa: E402
+    from typing import Generator, Union  # noqa: E402
+
+    import torch.distributed.checkpoint.filesystem as _dcp_fs  # noqa: E402
+
+    _orig_FileSystem_create_stream = _dcp_fs.FileSystem.create_stream
+
+    def _is_hdfs_fuse_path(path: Union[str, os.PathLike]) -> bool:
+        return str(path).startswith("/mnt/hdfs/")
+
+    @contextlib.contextmanager
+    def _veomni_create_stream_with_staging(
+        self, path: Union[str, os.PathLike], mode: str
+    ) -> Generator[io.IOBase, None, None]:
+        # Opt-out via env var, and skip staging for reads and non-HDFS paths.
+        if (
+            os.environ.get("VEOMNI_DCP_USE_LOCAL_STAGING", "1") == "0"
+            or not mode.startswith("w")
+            or not _is_hdfs_fuse_path(path)
+        ):
+            with _orig_FileSystem_create_stream(self, path, mode) as stream:
+                yield stream
+            return
+
+        import shutil
+        import tempfile
+        import uuid
+
+        staging_root = os.environ.get("VEOMNI_DCP_STAGING_DIR", tempfile.gettempdir())
+        os.makedirs(staging_root, exist_ok=True)
+        local_tmp = os.path.join(staging_root, f"veomni_dcp_stage_{uuid.uuid4().hex}.bin")
+        path_str = str(path)
+
+        try:
+            # Phase 1: write to local SSD. Stable; doesn't touch HDFS FUSE.
+            with open(local_tmp, mode) as stream:
+                yield stream
+
+            # Phase 2: bulk-copy local → HDFS. This is where the HDFS write
+            # actually happens — but it's one continuous read+write loop,
+            # not the zip writer's interleaved seek/write/checksum that
+            # provoked the FUSE bugs. Retry on the same failure family.
+            _COPY_RETRIES = 3
+            last_exc: Optional[BaseException] = None
+            for attempt in range(_COPY_RETRIES):
+                try:
+                    shutil.copy(local_tmp, path_str)
+                    if attempt > 0:
+                        logger.info(
+                            f"DCP create_stream: shutil.copy local→HDFS succeeded "
+                            f"on retry attempt {attempt + 1}/{_COPY_RETRIES} for {path_str} "
+                            f"(local: {local_tmp})"
+                        )
+                    return
+                except (OSError, RuntimeError) as e:
+                    last_exc = e
+                    logger.warning(
+                        f"DCP create_stream: shutil.copy attempt {attempt + 1}/{_COPY_RETRIES} "
+                        f"failed for {path_str}: {type(e).__name__}: {e}. "
+                        f"Removing partial dest and retrying."
+                    )
+                    try:
+                        if os.path.exists(path_str):
+                            os.remove(path_str)
+                    except OSError as cleanup_exc:
+                        logger.warning(f"DCP create_stream: cleanup of partial {path_str} failed: {cleanup_exc}")
+
+            # All copy retries exhausted — surface the exception. The
+            # outer DCP machinery's writer thread will die, which is
+            # already what happens today without this patch. At least
+            # the operator gets clear "copy retried N times" log lines
+            # in the failure case.
+            raise last_exc if last_exc is not None else RuntimeError("create_stream copy exhausted")
+        finally:
+            # Always unlink the local staging file. Bounds peak local
+            # disk usage to one file per writer thread.
+            try:
+                if os.path.exists(local_tmp):
+                    os.remove(local_tmp)
+            except OSError as cleanup_exc:
+                logger.warning(f"DCP create_stream: failed to clean up local staging {local_tmp}: {cleanup_exc}")
+
+    # Guard so re-importing the module doesn't stack the wrapper.
+    if not getattr(_dcp_fs.FileSystem.create_stream, "_veomni_dcp_staging_patched", False):
+        _veomni_create_stream_with_staging._veomni_dcp_staging_patched = True
+        _dcp_fs.FileSystem.create_stream = _veomni_create_stream_with_staging
+except (ImportError, AttributeError):  # pragma: no cover — defensive
+    pass
+
+
 class ModelState(Stateful):
     """A wrapper around a model to make it stateful.
 
