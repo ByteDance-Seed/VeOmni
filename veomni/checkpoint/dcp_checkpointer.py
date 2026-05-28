@@ -681,18 +681,112 @@ class DistributedCheckpointer(CheckpointerBase):
 
     @classmethod
     def _save_extra_state(cls, checkpoint_dir: str, state: Dict[str, Any]) -> None:
-        """Save extra_state to checkpoint directory."""
+        """Save extra_state to checkpoint directory.
+
+        Robust against HDFS FUSE zip-writer flakiness. The ``torch.save``-on-
+        HDFS-FUSE failure mode is "torch.save raises RuntimeError at
+        ``inline_container.cc:664 unexpected pos X vs Y`` (file is ~one zip
+        local-file-header ahead of the writer's tracker), then the rank dies
+        in ``_save_extra_state`` and the surviving ranks wait at the next
+        NCCL collective inside ``execute_save`` → 10-min Watchdog timeout.
+        Reproduced on production Qwen3.5-35B-a3b VL h100x16 ep_size=1 and on
+        single-node H100 with the full prod yaml (1 of 5 iterations).
+
+        Recovery strategy:
+
+        1. Try ``torch.save`` directly to the HDFS path (happy path, no
+           overhead).
+        2. On ``RuntimeError`` (the zip-writer enforce-fail or
+           ``OSError [Errno 75] Value too large``, both seen): clean up the
+           half-written file, log a WARN, retry up to ``_DIRECT_RETRIES``
+           more times. Log INFO if a retry eventually succeeds.
+        3. If direct retries are exhausted: fall back to writing
+           ``torch.save`` into a local-disk staging path
+           (``tempfile.gettempdir()`` by default, overridable via the
+           ``VEOMNI_EXTRA_STATE_TMPDIR`` env var) and then ``shutil.copy``
+           to the HDFS path. The local file is deleted as soon as the copy
+           finishes, so peak local disk usage is one rank's extra_state.
+           Log INFO on the fallback success.
+
+        Notes on cost:
+
+        - Direct write succeeds: zero added cost.
+        - Direct retry on flake: just a re-do of the write, plus a small
+          probability of triggering the same flake again.
+        - Local-then-copy fallback: roughly one extra GB-per-sec local
+          write + one HDFS copy (same wire time as direct HDFS write), so
+          end-to-end maybe 10-20% slower than the direct path. Only fires
+          on the rare iteration where every retry also flakes.
+        """
         if "extra_state" not in state:
             logger.warning_rank0("extra_state not found in state, skipping extra_state save")
             return
 
         extra_state_dir = os.path.join(checkpoint_dir, _EXTRA_STATE_DIR)
         os.makedirs(extra_state_dir, exist_ok=True)
-        extra_state_path = os.path.join(extra_state_dir, _EXTRA_STATE_FORMAT.format(dist.get_rank()))
-        torch.save(
-            state["extra_state"],
-            extra_state_path,
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        extra_state_path = os.path.join(extra_state_dir, _EXTRA_STATE_FORMAT.format(rank))
+
+        _DIRECT_RETRIES = 3  # 1 initial + 2 retries
+        last_exc: Optional[BaseException] = None
+
+        for attempt in range(_DIRECT_RETRIES):
+            try:
+                torch.save(state["extra_state"], extra_state_path)
+                if attempt > 0:
+                    logger.info(
+                        f"[rank {rank}] _save_extra_state: direct torch.save succeeded "
+                        f"on retry attempt {attempt + 1}/{_DIRECT_RETRIES} "
+                        f"after earlier RuntimeError ({last_exc!r})"
+                    )
+                return
+            except (RuntimeError, OSError) as e:
+                last_exc = e
+                logger.warning(
+                    f"[rank {rank}] _save_extra_state: direct torch.save attempt "
+                    f"{attempt + 1}/{_DIRECT_RETRIES} failed with {type(e).__name__}: {e}. "
+                    f"Cleaning up partial file and retrying."
+                )
+                # Remove the half-written file so the next attempt starts fresh.
+                try:
+                    if os.path.exists(extra_state_path):
+                        os.remove(extra_state_path)
+                except OSError as cleanup_exc:
+                    logger.warning(
+                        f"[rank {rank}] _save_extra_state: cleanup of {extra_state_path} "
+                        f"failed: {cleanup_exc}; subsequent retry may inherit junk bytes."
+                    )
+
+        # Direct retries exhausted — write locally then copy to HDFS.
+        import shutil
+        import tempfile
+
+        local_tmp_root = os.environ.get("VEOMNI_EXTRA_STATE_TMPDIR", tempfile.gettempdir())
+        os.makedirs(local_tmp_root, exist_ok=True)
+        local_tmp_path = os.path.join(local_tmp_root, _EXTRA_STATE_FORMAT.format(rank) + ".staging")
+        logger.warning(
+            f"[rank {rank}] _save_extra_state: {_DIRECT_RETRIES} direct attempts all "
+            f"failed (last error: {last_exc!r}). Falling back to local-then-copy via "
+            f"{local_tmp_path}."
         )
+        try:
+            torch.save(state["extra_state"], local_tmp_path)
+            shutil.copy(local_tmp_path, extra_state_path)
+            logger.info(
+                f"[rank {rank}] _save_extra_state: local-then-copy fallback "
+                f"succeeded — wrote {local_tmp_path} (local) → {extra_state_path} (HDFS)."
+            )
+        finally:
+            # Always delete the local staging file, even if the copy raised,
+            # so we don't leak ~GB-scale disk space on the worker between saves.
+            try:
+                if os.path.exists(local_tmp_path):
+                    os.remove(local_tmp_path)
+            except OSError as cleanup_exc:
+                logger.warning(
+                    f"[rank {rank}] _save_extra_state: failed to clean up local "
+                    f"staging file {local_tmp_path}: {cleanup_exc}"
+                )
 
     @classmethod
     def _load_extra_state(cls, checkpoint_dir: str, state: Dict[str, Any]) -> None:
