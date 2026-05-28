@@ -21,6 +21,7 @@ Provides callback system for customizing trainer behavior at various stages of t
 from .base import Callback, TrainerState
 from .checkpoint_callback import CheckpointerCallback, HFLoraCkptCallback, HuggingfaceCkptCallback
 from .evaluate_callback import EvaluateCallback
+from .fused_ulysses_state_callback import FusedUlyssesStateCallback
 from .trace_callback import (
     EnvironMeterCallback,
     MoERouterMonitorCallback,
@@ -37,6 +38,7 @@ __all__ = [
     "HuggingfaceCkptCallback",
     "HFLoraCkptCallback",
     "EvaluateCallback",
+    "FusedUlyssesStateCallback",
     "WandbTraceCallback",
     "ProfileTraceCallback",
     "EnvironMeterCallback",
