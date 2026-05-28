@@ -17,6 +17,7 @@ Violating any of these causes silent bugs, crashes, or incorrect training result
    - Files under `veomni/models/transformers/*/generated/` are created by `python -m veomni.patchgen.run_codegen`.
    - Manual edits are silently overwritten on the next patchgen run.
    - To change generated behavior, edit the patch spec (`patch_spec.py`) or the modeling patch file (`modeling_*_patch.py`).
+   - **`INIT_MODIFICATION` patch type** (see `veomni/patchgen/codegen.py:_apply_init_modification`) emits a module-level monkey-patch block AFTER the class definition in the generated file. It is currently the only patch type that performs runtime `__init__` rebinding (the wrapper still lives inside `generated/*.py`, so the "all v5 modeling in `generated/`" invariant holds). Use it when you need to wrap a class's `__init__` (e.g. install `FusedQKVLinear` after the HF Linears have been built).
 
 4. **Transformers version: pinned to v5.2.0**
    - VeOmni installs `transformers==5.2.0` via the `transformers-stable`
@@ -62,6 +63,7 @@ Core entry points:
    - Data slicing: `veomni/distributed/sequence_parallel/data.py` — `sp_pad_and_slice()`, `slice_input_tensor()`, `gather_outputs()`.
    - Loss reduction: `reduce_sequence_parallel_loss()` in `loss.py` aggregates across SP ranks.
    - Process groups: `comm.py` sets `ulysses_sequence_parallel_group`, `context_parallel_group`, `unified_sequence_parallel_group` from the device mesh.
+   - **Fused `ws_push` variant** (opt-in via `model.ops_implementation.ulysses_qkv_projection_implementation=ws_push`, Hopper SM90+ only): the kernel at `veomni/ops/kernels/fused_ulysses_projection/` sizes its symmetric-memory buffer at `on_train_begin` for shape `(micro_batch_size, max_seq_len / sp_size, ...)`. `args.train.dyn_bsz=True` (dynamic batching produces `[1, packed_seq, ...]`) and `args.train.pad_to_length != max_seq_len` both cause silent fallback to the eager 3× F.linear + 3× a2a path. `FusedUlyssesStateCallback._prepare_init_kwargs` emits `warning_rank0` on these combinations. NPU is rejected at config validation via the `arguments_types.py` allowlist.
 
 ### Expert Parallel (MoE)
 

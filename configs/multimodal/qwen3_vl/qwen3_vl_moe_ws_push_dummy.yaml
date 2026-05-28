@@ -1,0 +1,77 @@
+# Single-node Qwen3-VL-MoE 30B-A3B on dummy data, Ulysses sp_size=4, WS-PUSH
+# fused QKV + Ulysses a2a kernel. Pair with tasks/train_qwen3_vl_moe_dummy.py
+# and scripts/multimodal/train_qwen3_vl_moe_ws_push.sh.
+
+model:
+  # RoboVQA-5K is a Qwen3-VL-30B-A3B-Instruct fine-tune; weights are not
+  # load-bearing — only used to exercise ws_push on dummy data.
+  model_path: /data/models/Qwen3-VL-30B-A3B-RoboVQA-5K
+  ops_implementation:
+    moe_implementation: fused_triton
+    # Rewritten to veomni_flash_attention_3_with_sp in TrainingArguments.__post_init__.
+    attn_implementation: flash_attention_3
+    # Hopper SM90+, quack 0.3.4, _symmetric_memory; preflight hard-fails if missing.
+    ulysses_qkv_projection_implementation: ws_push
+
+data:
+  # DummyVLMTrainer substitutes build_dummy_dataset; train_path is never read.
+  train_path: dummy
+  data_type: conversation
+  chat_template: qwen3vl
+  max_seq_len: 131072
+
+train:
+  # ws_push sizes its symm-mem buffer at (micro_batch_size, max_seq_len / sp_size, ...).
+  # dyn_bsz=True yields [1, packed_seq, ...] tensors that miss this shape and cause
+  # AsyncUlyssesQKVProjection to silently fall back to the eager 3xLinear+3xA2A path.
+  dyn_bsz: false
+  pad_to_length: false
+  accelerator:
+    ep_size: 1
+    # Capped at num_key_value_heads (Qwen3-VL-MoE text_config: 4): the fused kernel
+    # has no equivalent of the eager path's need_repeat_kv workaround
+    # (async_ulysses.py:219-225), and init_ws_push_state asserts
+    # nheads_k % world_size == 0 (ws_push.py:549).
+    ulysses_size: 4
+    # Required: routes attention through AsyncUlyssesQKVProjection.
+    enable_async: true
+    fsdp_config:
+      fsdp_mode: fsdp2
+  gradient_checkpointing:
+    enable_reentrant: false
+  wandb:
+    enable: false
+    project: qwen3_vl_moe_ws_push
+    name: qwen3_vl_moe_ws_push_dummy
+  freeze_vit: true
+  optimizer:
+    lr: 1.0e-5
+    lr_decay_style: cosine
+  # WsPushStateManager freezes (bs, local_seq, dtype) at on_train_begin; mismatched
+  # batches silently fall back to eager.
+  micro_batch_size: 1
+  global_batch_size: 1
+  # Must outlast profile.end_step so on_trace_ready has a clean shutdown step.
+  max_steps: 23
+  init_device: meta
+  profile:
+    enable: true
+    start_step: 20
+    end_step: 22
+    trace_dir: ./profile_output_ws_push
+    record_shapes: true
+    profile_memory: true
+    with_stack: true
+    with_modules: true
+    rank0_only: true
+  # Lock out every weight-save path for the dummy run:
+  #   save_steps/save_epochs=999999 → DCP on_step_end/on_epoch_end never fire
+  #   save_hf_weights=false         → HF safetensors on_train_end suppressed
+  # on_train_begin._save_model_assets still writes tokenizer/processor config —
+  # that's not weights.
+  checkpoint:
+    output_dir: qwen3_vl_moe_ws_push_dummy
+    manager: dcp
+    save_steps: 999999
+    save_epochs: 999999
+    save_hf_weights: false
