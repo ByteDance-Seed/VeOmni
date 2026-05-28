@@ -52,9 +52,9 @@ def test_inference_request_preserves_generation_kwargs():
 
 
 def test_inference_request_is_a_plain_dataclass():
-    # ``OmniInferencer.generate_from_request`` accepts an InferenceRequest;
-    # we want it to be JSON-loggable for traceability so the dataclass
-    # MUST NOT carry private state (only the documented fields).
+    # ``OmniInferencer.run_request`` accepts an InferenceRequest; we want it
+    # to be JSON-loggable for traceability so the dataclass MUST NOT carry
+    # private state (only the documented fields).
     fields = InferenceRequest.__dataclass_fields__
     assert set(fields) == {
         "prompt",

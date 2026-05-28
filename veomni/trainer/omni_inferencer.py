@@ -19,9 +19,19 @@ Lifecycle
 1. ``OmniInferencer(cfg)`` takes a fully-resolved :class:`OmniConfig`
    (already deep-merged with the desired ``generation_graph`` from
    training + inference YAMLs, with module ``weights_path`` values
-   joined under the split-checkpoint root).  Use
-   :meth:`OmniInferencer.from_launcher` to build one from a launcher
-   YAML path in one call.
+   joined under the split-checkpoint root).  Two convenience factories
+   build a ready inferencer in one call:
+
+   * :meth:`OmniInferencer.from_args` — preferred for CLI / script
+     entry points.  Accepts a :class:`OmniInferenceArguments` produced
+     by :func:`veomni.arguments.parse_args`; resolves the scenario,
+     loads the merged :class:`OmniConfig`, and stashes ``args.infer``
+     so :meth:`generate` can be called with no arguments.
+   * :meth:`OmniInferencer.from_launcher` — programmatic alternative
+     that takes a launcher YAML path + optional ``infer_type`` /
+     ``model_path`` overrides.  Does NOT stash run-time args, so the
+     caller must pass an :class:`OmniInferRunArguments` to
+     :meth:`generate` (or use :meth:`run_request` instead).
 
 2. The constructor builds each declared module by reading its
    ``weights_path/config.json`` to look up ``model_type`` and
@@ -38,24 +48,35 @@ Lifecycle
 
 4. Per-module processors (vision / vqvae) are loaded the same way via
    :data:`OMNI_PROCESSOR_REGISTRY` and stashed for use by
-   :meth:`generate` to turn raw PIL images into ``pixel_values``
+   :meth:`_run` to turn raw PIL images into ``pixel_values``
    before the FSM runs.
 
-5. :meth:`generate` builds a :class:`ConversationPart` list from the
-   user payload, attaches per-image ``pixel_values`` via the matching
-   processor, packs the inputs as a ``request`` / ``context`` dict
-   (including ``force_image_gen`` and a free-form
-   ``generation_kwargs`` payload), and hands off to
-   :meth:`OmniModel.generate`.  The returned ``ctx`` carries the FSM
-   trace, the accumulated ``generated_images_collected`` tensors, and
-   the per-module ``finalize`` outputs (e.g. decoded text under
+5. Inference is a three-layer call stack:
+
+   * :meth:`generate` — high-level: reads :class:`OmniInferRunArguments`
+     (passed explicitly or stashed via :meth:`from_args`), loads any
+     image, applies the CFG / sampling knobs, calls :meth:`run_request`,
+     then writes every artifact to disk via :meth:`finalize`.
+   * :meth:`run_request` — mid-level: accepts a built
+     :class:`InferenceRequest`, returns the raw ``ctx`` dict without
+     touching the filesystem.  Use for programmatic / batched flows.
+   * :meth:`_run` — internal: resets per-module state, builds the
+     :class:`ConversationPart` list via :func:`build_conversation`,
+     attaches per-image ``pixel_values`` via the matching processor,
+     packs the inputs as a ``request`` / ``context`` dict and hands
+     off to :meth:`OmniModel.generate`.
+
+   The returned ``ctx`` carries the FSM trace, the accumulated
+   ``generated_images_collected`` tensors, and the per-module
+   ``finalize`` outputs (e.g. decoded text under
    ``finalize['janus_text_encoder']['text']``).
 
 Generation kwargs distribution
 ------------------------------
-``generation_kwargs`` is a plain dict that the inferencer simply
-forwards into ``request`` / ``ctx``.  Every module's ``generate``
-reads the slot from kwargs and filters by the keys it recognises
+``generation_kwargs`` is a plain dict that :meth:`run_request` (and
+the public :meth:`generate` wrapper) forwards into ``request`` /
+``ctx``.  Every module's ``generate`` reads the slot from kwargs and
+filters by the keys it recognises
 (:meth:`JanusTextEncoder._extract_sampling_kwargs` /
 :meth:`JanusVqvae._extract_sampling_kwargs`) — same shape as
 HuggingFace ``GenerationMixin._prepare_generation_config``.
@@ -65,11 +86,13 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
-from typing import Any, Mapping
+from typing import Any
 
 import torch
 from transformers import AutoTokenizer, PretrainedConfig
 
+from ..arguments import InferArguments
+from ..data.multimodal.image_utils import load_image, save_image_tensors_to_file
 from ..models.seed_omni import (
     OMNI_CONFIG_REGISTRY,
     OMNI_MODEL_REGISTRY,
@@ -101,14 +124,11 @@ class OmniInferModelArguments:
 
     Use with :func:`veomni.arguments.parse_args` like::
 
-        @dataclass
-        class Arguments:
-            model: OmniInferModelArguments = field(default_factory=OmniInferModelArguments)
-            infer: ...                       # script-local per-invocation knobs
+        from veomni.arguments import parse_args
+        from veomni.trainer.omni_inferencer import OmniInferenceArguments, OmniInferencer
 
-        args = parse_args(Arguments)
-        cfg = args.model.load_omni_config(infer_type=...)
-        inferencer = OmniInferencer(cfg, seed=args.infer.seed)
+        args = parse_args(OmniInferenceArguments)
+        OmniInferencer.from_args(args).generate()  # writes outputs to args.infer.output_dir
 
     See :class:`veomni.trainer.omni_trainer.OmniModelArguments` for the
     training-side analogue (which DOES inherit ``ModelArguments`` because the
@@ -189,6 +209,134 @@ class OmniInferModelArguments:
 
 
 @dataclass
+class OmniInferRunArguments(InferArguments):
+    """``infer.*`` — per-invocation inference knobs for ``infer_omni``.
+
+    Extends framework :class:`~veomni.arguments.InferArguments` with the
+    SeedOmni V2 driver's prompt / image / output / CFG fields.
+
+    Inherited and used: ``seed``, ``temperature``, ``top_p``, ``max_tokens``,
+    ``do_sample``.
+
+    Inherited and silently ignored: ``model_path`` / ``tokenizer_path``.
+    The V2 entry-point sources the model from the launcher YAML's ``model:``
+    section via :class:`OmniInferModelArguments`, so ``--model.model_path`` is
+    the canonical override.  These two fields are overridden here to default
+    to ``None`` (the base class declares ``model_path`` as mandatory) and are
+    documented as "ignored" so users don't reach for the wrong flag.
+
+    Lives in this module (not the script) so other drivers (RL eval,
+    batched-prompt benchmarks, future REST shims) can reuse the same CLI
+    surface without copy-pasting the dataclass.
+    """
+
+    model_path: str | None = field(
+        default=None,
+        metadata={"help": "Ignored — use --model.model_path to override the launcher YAML."},
+    )
+    tokenizer_path: str | None = field(
+        default=None,
+        metadata={"help": "Ignored — tokenizer is loaded from --model.model_path (the split-ckpt root)."},
+    )
+    prompt: str = field(
+        default="",
+        metadata={"help": "User text prompt (required; non-empty)."},
+    )
+    image: str | None = field(
+        default=None,
+        metadata={"help": "Optional path or http(s) URL to an image.  Omit for text-to-image generation."},
+    )
+    output_dir: str = field(
+        default="output",
+        metadata={"help": "Directory for reply.txt + generated_image_*.png + trace.txt (created if missing)."},
+    )
+    guidance_scale: float = field(
+        default=5.0,
+        metadata={
+            "help": (
+                "Classifier-free guidance weight for text-to-image generation (Janus default = 5.0). "
+                "Ignored for I2T scenarios and when ≤ 1.0.  Same shape as the HF baseline "
+                "`scripts/multimodal/infer/janus_hf_infer_gen.py`."
+            )
+        },
+    )
+    trace: bool = field(
+        default=False,
+        metadata={"help": "Dump FSM step / transition log to <output_dir>/trace.txt (debugging aid)."},
+    )
+
+    def __post_init__(self):
+        # Base-class __post_init__ tries `self.tokenizer_path = self.model_path`
+        # when tokenizer_path is None.  That's harmless when both are None
+        # (which is the V2 case), but we skip the super call to make the
+        # "both ignored" semantics explicit and avoid mutating an unused field.
+        pass
+
+
+@dataclass
+class OmniInferenceArguments:
+    """Root config for SeedOmni V2 inference — consumed by :func:`parse_args`.
+
+    The launcher YAML's top-level ``model:`` section populates :attr:`model`,
+    keeping only the four fields that actually drive inference (model path +
+    graph YAML pointers).  ``data:`` / ``train:`` and every other training-only
+    ``model.*`` field declared in the launcher YAML (``ops_implementation``,
+    ``encoders``, ``lora_config``, ...) are silently ignored because they're
+    not declared on :class:`OmniInferModelArguments`.
+
+    Use::
+
+        from veomni.arguments import parse_args
+        from veomni.trainer.omni_inferencer import OmniInferenceArguments, OmniInferencer
+
+        args = parse_args(OmniInferenceArguments)
+        OmniInferencer.from_args(args).generate()
+    """
+
+    model: OmniInferModelArguments = field(default_factory=OmniInferModelArguments)
+    infer: OmniInferRunArguments = field(default_factory=OmniInferRunArguments)
+
+
+def _select_scenario(model_args: OmniInferModelArguments, *, has_image: bool) -> tuple[str, str]:
+    """Pick the inference scenario (an entry in ``model.omni_infer_yaml_path``).
+
+    Priority:
+
+    1. ``model.omni_infer_type`` if set (via CLI ``--model.omni_infer_type`` or YAML).
+       An unknown value raises ``KeyError`` — silently falling through to auto-pick
+       would mask typos (e.g. ``--model.omni_infer_type infrr_gen``) that the user
+       would otherwise want to catch immediately.
+    2. Auto: image present → ``infer_und``, absent → ``infer_gen``.
+    3. Any scenario declared in ``omni_infer_yaml_path`` (first key).
+
+    Returns
+    -------
+    ``(scenario, source)`` where ``source`` is one of ``"yaml/cli"`` / ``"auto"``
+    / ``"fallback"`` — the caller logs this so users can tell which priority
+    path fired (especially important since the launcher YAML may declare
+    ``omni_infer_type`` for training-time generation samples, which now also
+    applies to inference).
+    """
+    infer_map = dict(model_args.omni_infer_yaml_path or {})
+    if not infer_map:
+        raise ValueError(
+            "Launcher YAML declares no `model.omni_infer_yaml_path` entries — cannot pick an inference scenario."
+        )
+    if model_args.omni_infer_type:
+        if model_args.omni_infer_type not in infer_map:
+            known = ", ".join(sorted(infer_map)) or "(none)"
+            raise KeyError(
+                f"Unknown model.omni_infer_type {model_args.omni_infer_type!r}; expected one of: {known}.  "
+                f"Set via CLI: --model.omni_infer_type <key>."
+            )
+        return model_args.omni_infer_type, "yaml/cli (model.omni_infer_type)"
+    preferred = "infer_und" if has_image else "infer_gen"
+    if preferred in infer_map:
+        return preferred, f"auto (has_image={has_image})"
+    return next(iter(infer_map)), "fallback (first available)"
+
+
+@dataclass
 class InferenceRequest:
     """A single inference call.
 
@@ -251,6 +399,7 @@ class OmniInferencer:
         *,
         dtype: str | None = None,
         seed: int = 42,
+        infer_args: OmniInferRunArguments | None = None,
     ):
         self.device = torch.device(get_device_type())
         self.dtype = _resolve_dtype(dtype or "bfloat16", self.device)
@@ -270,6 +419,13 @@ class OmniInferencer:
                 "OmniInferencer.from_launcher)."
             )
         self.cfg = cfg
+
+        # Stashed per-run knobs (set by :meth:`from_args`).  ``generate()``
+        # consults this when no explicit overrides are passed — the common
+        # "script just calls ``inferencer.generate()``" flow.  None for
+        # programmatic constructions; explicit args on ``generate()`` are
+        # required in that case.
+        self.infer_args: OmniInferRunArguments | None = infer_args
 
         logger.info_rank0(
             f"OmniInferencer: loaded OmniConfig with {len(self.cfg.module_names)} modules ({self.cfg.module_names})."
@@ -296,6 +452,38 @@ class OmniInferencer:
         # are already on-device from `_build_modules`, no `.to()` cascade.
 
     # ── Factories ────────────────────────────────────────────────────────────
+
+    @classmethod
+    def from_args(
+        cls,
+        args: OmniInferenceArguments,
+        *,
+        dtype: str | None = None,
+    ) -> OmniInferencer:
+        """Build an :class:`OmniInferencer` from a fully-parsed root config.
+
+        One-stop constructor for CLI / script entry points: resolves the
+        inference scenario, loads the merged :class:`OmniConfig`, builds the
+        per-module weights, and stashes :attr:`args.infer` so subsequent
+        ``inferencer.generate()`` calls without arguments use that payload.
+
+        Validates the two CLI mandatories (``--infer.prompt`` non-empty,
+        ``--model.model_path`` set) up front so the user sees a clear error
+        before module construction starts (which is the slow / expensive part).
+        """
+        if not args.infer.prompt:
+            raise ValueError(
+                "`--infer.prompt` is required (use a non-empty string).  Example: --infer.prompt 'a cat'."
+            )
+        if not args.model.model_path:
+            raise ValueError("`--model.model_path` is required (launcher YAML must declare `model.model_path`).")
+
+        scenario, source = _select_scenario(args.model, has_image=bool(args.infer.image))
+        logger.info_rank0(f"OmniInferencer.from_args: model_path = {args.model.model_path}")
+        logger.info_rank0(f"OmniInferencer.from_args: scenario = {scenario}  (source: {source})")
+
+        cfg = args.model.load_omni_config(infer_type=scenario)
+        return cls(cfg, dtype=dtype, seed=args.infer.seed, infer_args=args.infer)
 
     @classmethod
     def from_launcher(
@@ -414,47 +602,150 @@ class OmniInferencer:
 
     # ── Inference entry point ─────────────────────────────────────────────────
 
-    def generate(
-        self,
-        *,
-        prompt: str,
-        images: list[Any] | None = None,
-        force_image_gen: bool = False,
-        generation_kwargs: Mapping[str, Any] | None = None,
-        max_new_tokens: int = 2048,
-        trace: list[str] | None = None,
-    ) -> dict[str, Any]:
-        """Run one inference request through the FSM, return ``ctx``.
+    def generate(self, infer_args: OmniInferRunArguments | None = None) -> dict[str, Any]:
+        """Run one inference request end-to-end (FSM + save outputs).
 
-        The returned dict carries (at minimum):
+        High-level convenience method matching the "build inferencer, call
+        ``generate()``" usage pattern.  Reads :class:`OmniInferRunArguments`
+        from ``infer_args`` (when provided) or from :attr:`self.infer_args`
+        (set by :meth:`from_args`).  After the FSM completes, :meth:`finalize`
+        writes ``reply.txt`` / ``generated_image_*.png`` / ``trace.txt`` under
+        ``infer_args.output_dir``.
+
+        Returned ``ctx`` carries (at minimum):
 
         * ``conversation_list`` — the final list of parts (prompt +
           assistant-side sampled tokens).
         * ``generated_images_collected`` — every image decoded by
-          :class:`JanusVqvae` during the run (each ``(1, H, W, 3)``
-          float tensor in ``[-1, 1]``).
-        * ``finalize`` — per-module dict from each
-          :meth:`OmniModule.finalize` hook (notably
-          ``finalize['janus_text_encoder']['text']`` for the decoded
-          reply).
-        """
-        request = InferenceRequest(
-            prompt=prompt,
-            images=list(images or []),
-            force_image_gen=force_image_gen,
-            generation_kwargs=dict(generation_kwargs or {}),
-            max_new_tokens=max_new_tokens,
-        )
-        return self._run(request, trace=trace)
+          :class:`JanusVqvae` during the run (each ``(1, H, W, 3)`` float
+          tensor in ``[-1, 1]``).
+        * ``finalize`` — per-module dict from each :meth:`OmniModule.finalize`
+          hook (notably ``finalize['janus_text_encoder']['text']`` for the
+          decoded reply).
 
-    def generate_from_request(
+        For programmatic use that doesn't need on-disk artifacts (e.g. batched
+        eval, RL rollouts), call :meth:`run_request` directly with a
+        :class:`InferenceRequest`.
+        """
+        args = infer_args or self.infer_args
+        if args is None:
+            raise ValueError(
+                "OmniInferencer.generate() requires either an explicit `infer_args` argument "
+                "or a prior `OmniInferencer.from_args(...)` to stash one.  For programmatic "
+                "use without on-disk artifacts, call `OmniInferencer.run_request(InferenceRequest(...))` instead."
+            )
+        if not args.prompt:
+            raise ValueError("OmniInferRunArguments.prompt is empty — set a non-empty prompt.")
+
+        has_image = bool(args.image)
+        # T2I scenarios steer to image-VQ immediately; I2T stays in text_ar.
+        force_image_gen = not has_image
+        # CFG only kicks in for T2I — for I2T we squelch back to 1.0 so the
+        # janus_text_encoder skips the uncond branch (its construction rule
+        # isn't well-defined for prompts containing image_und parts; see
+        # `_maybe_build_cfg_uncond_embeds`).
+        guidance_scale = float(args.guidance_scale) if force_image_gen else 1.0
+
+        request = InferenceRequest(
+            prompt=args.prompt,
+            images=[load_image(args.image)] if has_image else [],
+            force_image_gen=force_image_gen,
+            generation_kwargs={
+                "temperature": args.temperature,
+                "top_p": args.top_p,
+                "do_sample": args.do_sample,
+                "guidance_scale": guidance_scale,
+            },
+            max_new_tokens=args.max_tokens,
+        )
+        trace_buf: list[str] | None = [] if args.trace else None
+        ctx = self.run_request(request, trace=trace_buf)
+        self.finalize(ctx, output_dir=args.output_dir, trace=trace_buf)
+        return ctx
+
+    def run_request(
         self,
         request: InferenceRequest,
         *,
         trace: list[str] | None = None,
     ) -> dict[str, Any]:
-        """Lower-level entry: accept a fully-built :class:`InferenceRequest`."""
+        """Low-level entry: accept a fully-built :class:`InferenceRequest`.
+
+        Returns the raw ``ctx`` dict without touching the filesystem — use
+        this for programmatic / batched flows where the caller manages
+        output persistence.  For one-shot script use, prefer :meth:`generate`
+        (which also calls :meth:`finalize`).
+        """
         return self._run(request, trace=trace)
+
+    # ── Output persistence ────────────────────────────────────────────────────
+
+    def finalize(
+        self,
+        ctx: dict[str, Any],
+        *,
+        output_dir: str,
+        trace: list[str] | None = None,
+    ) -> None:
+        """Persist every multimodal artifact produced by one ``generate`` call.
+
+        Writes (under ``output_dir``, created if missing):
+
+        * ``reply.txt`` — decoded assistant text from
+          ``ctx['finalize'][...]['text']`` (UTF-8; Janus is multilingual).
+          Always written, even when the reply is empty, so the file's
+          existence signals "the FSM ran to completion".  When non-empty,
+          also echoed to stdout via the logger (rank-0 gated) so CLI users
+          see it without opening the file.
+        * ``generated_image_{i}.png`` — every tensor in
+          ``ctx['generated_images_collected']``, one PNG per image.  Each
+          tensor is squeezed to ``(H, W, 3)``, mapped from VQVAE's ``[-1, 1]``
+          range to ``[0, 1]``, then handed to
+          :func:`veomni.data.multimodal.image_utils.save_image_tensors_to_file`
+          (which does ``×255 → round → uint8 → PIL``).
+        * ``trace.txt`` — FSM step / transition log (when ``trace`` was
+          collected during this run).
+
+        Stale-files behaviour: ``finalize`` does NOT clear existing
+        ``generated_image_*.png`` / ``reply.txt`` / ``trace.txt`` from
+        ``output_dir`` before writing.  A re-run that produces fewer images
+        than the previous run will leave the extras on disk.  Callers that
+        need a clean slate should ``rm -rf`` the directory themselves
+        beforehand — keeping that policy in the caller's hands lets eval
+        harnesses choose between "overwrite" and "append with separate dir".
+
+        Logs a warning when the FSM produced no reply AND no images — that's
+        usually a sign that the launcher YAML / scenario don't match the
+        prompt (e.g. I2T scenario with no ``--infer.image``).
+        """
+        os.makedirs(output_dir, exist_ok=True)
+
+        reply = _extract_reply(ctx)
+        reply_path = os.path.join(output_dir, "reply.txt")
+        # encoding="utf-8" is load-bearing — Janus is multilingual so reply
+        # text may carry CJK / emoji.  Default-locale opens crash on `LANG=C`.
+        with open(reply_path, "w", encoding="utf-8") as f:
+            f.write(reply + ("\n" if reply and not reply.endswith("\n") else ""))
+        logger.info_rank0(f"finalize: reply ({len(reply)} chars) → {reply_path}")
+        if reply:
+            # Long-form echo for CLI users — rank-0 gated via logger so it
+            # doesn't multiplex on a future multi-rank dispatch.
+            logger.info_rank0(f"--- reply ---\n{reply}\n-------------")
+
+        images_out: list[torch.Tensor] = list(ctx.get("generated_images_collected") or [])
+        for idx, tensor in enumerate(images_out):
+            out_path = os.path.join(output_dir, f"generated_image_{idx}.png")
+            _save_generated_image(tensor, out_path)
+            logger.info_rank0(f"finalize: image #{idx} → {out_path}")
+
+        if trace is not None:
+            trace_path = os.path.join(output_dir, "trace.txt")
+            with open(trace_path, "w", encoding="utf-8") as f:
+                f.write("\n".join(trace) + "\n")
+            logger.info_rank0(f"finalize: FSM trace ({len(trace)} lines) → {trace_path}")
+
+        if not reply and not images_out:
+            logger.warning_rank0("finalize: FSM produced no reply and no images.")
 
     # ── Internal ──────────────────────────────────────────────────────────────
 
@@ -516,6 +807,62 @@ class OmniInferencer:
 # ── Module helpers ───────────────────────────────────────────────────────────
 
 
+def _extract_reply(ctx: dict[str, Any]) -> str:
+    """Pluck the decoded text from any module's ``finalize`` payload.
+
+    The FSM exposes per-module finalize outputs at ``ctx['finalize'][name]``.
+    Janus' text encoder writes the decoded reply under
+    ``ctx['finalize']['janus_text_encoder']['text']`` but other models may
+    name their module differently — so we scan every payload that's a dict
+    carrying a ``"text"`` key.  Returns ``""`` when none are found (e.g. for
+    pure T2I where the FSM never enters ``text_ar`` after the prompt).
+
+    Contract for multi-module futures: when MORE than one finalize payload
+    carries a ``"text"`` key, the FIRST one (by FSM finalize-call order,
+    which is dict-insertion order) wins and a warning is logged.  Callers
+    needing deterministic disambiguation should read ``ctx['finalize']``
+    directly with an explicit module name.
+    """
+    finalize = ctx.get("finalize") or {}
+    text_payloads = [(name, p) for name, p in finalize.items() if isinstance(p, dict) and "text" in p]
+    if len(text_payloads) > 1:
+        names = ", ".join(name for name, _ in text_payloads)
+        logger.warning_rank0(
+            f"_extract_reply: multiple modules produced text ({names}); returning "
+            f"the first ('{text_payloads[0][0]}').  Read ctx['finalize'] directly to disambiguate."
+        )
+    if text_payloads:
+        return text_payloads[0][1]["text"]
+    return ""
+
+
+def _save_generated_image(tensor: torch.Tensor, out_path: str) -> None:
+    """Save a Janus-VQVAE-decoded image tensor as PNG.
+
+    Janus emits ``(1, H, W, 3)`` (or ``(H, W, 3)``) float tensors in ``[-1, 1]``.
+    We squeeze the batch dim, map ``[-1, 1] → [0, 1]``, then delegate to
+    :func:`veomni.data.multimodal.image_utils.save_image_tensors_to_file`
+    (which expects ``[0, 1]`` H×W×3 and does the
+    ``×255 → clamp → round → uint8 → PIL`` dance — note the rounding step
+    is what keeps the saved PNG bit-exact against the HF baseline
+    ``scripts/multimodal/infer/janus_hf_infer_gen.py`` reference encoder).
+
+    Lives here rather than in ``image_utils`` because the ``[-1, 1]`` range
+    convention is Janus-specific — other decoders (SD VAE, MAGVIT, ...) emit
+    different ranges and would do their own normalisation before calling the
+    shared sink.
+    """
+    img = tensor.detach().to(dtype=torch.float32, device="cpu")
+    if img.dim() == 4 and img.size(0) == 1:
+        img = img.squeeze(0)
+    if img.dim() != 3 or img.size(-1) != 3:
+        raise ValueError(f"Cannot save image with shape {tuple(img.shape)}; expected (H, W, 3).")
+    # `clamp` guards against out-of-range entries from a misbehaving decoder;
+    # the +1/2 mapping is the exact inverse of Janus' ``2x - 1`` preprocess.
+    img = (img.clamp(-1.0, 1.0) + 1.0) / 2.0
+    save_image_tensors_to_file(img, out_path)
+
+
 def _read_model_type(weights_path: str) -> str:
     """Read ``model_type`` from a module's ``config.json``.
 
@@ -561,4 +908,10 @@ def _resolve_dtype(name: str, device: torch.device) -> torch.dtype:
     return mapping[name]
 
 
-__all__ = ["OmniInferencer", "InferenceRequest", "OmniInferModelArguments"]
+__all__ = [
+    "OmniInferencer",
+    "InferenceRequest",
+    "OmniInferModelArguments",
+    "OmniInferRunArguments",
+    "OmniInferenceArguments",
+]
