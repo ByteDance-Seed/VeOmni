@@ -90,7 +90,6 @@ import torch.nn as nn
 from ...utils import helper
 from .configuration_seed_omni import OmniConfig
 from .generation_graph import GenerationGraph
-from .graph import scalar_token_id
 from .module import OmniModule
 from .training_graph import TrainingGraph
 
@@ -279,7 +278,6 @@ class OmniModel(nn.Module):
         request: Dict[str, Any],
         context: Optional[Dict[str, Any]] = None,
         max_new_tokens: int = 512,
-        stop_token_ids: Optional[List[int]] = None,
         *,
         trace: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
@@ -297,11 +295,16 @@ class OmniModel(nn.Module):
             the FSM appends each iteration.
         max_new_tokens:
             Hard upper bound on total FSM iterations across all states.
-        stop_token_ids:
-            Token ids that unconditionally stop generation regardless of FSM
-            state (e.g. ``</s>``).
         trace:
             Optional list — receives FSM step / transition log for testing.
+
+        Termination is fully FSM-driven: a state reaches ``done`` only when a
+        module raises the ``module_signal`` its transition is waiting on
+        (e.g. the text encoder emits ``text_done`` on ``</s>``, the VQ
+        decoder emits ``image_complete`` when the grid is full).  There is no
+        token-level stop list — EOS handling lives inside the emitting module,
+        not here.  ``max_new_tokens`` is only a hard safety cap on total FSM
+        iterations.
 
         A coarse progress trail is always emitted via
         :meth:`logger.info_rank0` — one ``[FSM] step <N>: <state>`` line
@@ -309,8 +312,8 @@ class OmniModel(nn.Module):
         every state reached via :meth:`GenerationGraph.maybe_transition`,
         and the terminal ``done`` state).  It fires once more after the loop
         exits so the final resting state is always reported regardless of
-        how the loop terminated (normal ``done``, ``max_new_tokens`` cap, or
-        ``stop_token_ids`` early-stop).  This lets the user follow which FSM
+        how the loop terminated (normal ``done`` or ``max_new_tokens`` cap).
+        This lets the user follow which FSM
         span is in flight for long-running inference — Janus T2I e.g. shows
         ``prompt_encode → image_vq → image_vq_end → done``, where the
         576-step ``image_vq`` loop dominates and is read off the step deltas
@@ -363,19 +366,12 @@ class OmniModel(nn.Module):
             if image is not None:
                 ctx["generated_images_collected"].append(image)
 
-            if stop_token_ids:
-                last_id = scalar_token_id(ctx.get("input_ids"))
-                if last_id is not None and last_id in stop_token_ids:
-                    if trace is not None:
-                        trace.append(f"stop:{last_id}")
-                    break
-
             self.generation_graph.maybe_transition(ctx, trace=trace)
 
         # Final emit — captures the state the FSM is in after the loop
-        # exits.  Usually ``done`` (max_new_tokens not exhausted, normal
-        # termination); otherwise the state the FSM got stuck in
-        # (max_new_tokens cap or stop_token_ids hit).
+        # exits.  Usually ``done`` (a module raised its terminating signal);
+        # otherwise the state the FSM got stuck in when the ``max_new_tokens``
+        # safety cap tripped.
         _emit_progress()
 
         # Finalize: hand ctx + request to every active module's `finalize`

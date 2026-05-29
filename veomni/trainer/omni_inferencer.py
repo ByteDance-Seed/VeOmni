@@ -397,22 +397,9 @@ class OmniInferencer:
             },
             max_new_tokens=infer_args.max_tokens,
         )
-        ctx = self.run_request(request)
+        ctx = self._run(request)
         self.finalize(ctx, output_dir=infer_args.output_dir)
         return ctx
-
-    def run_request(self, request: InferenceRequest) -> dict[str, Any]:
-        """Low-level entry: accept a fully-built :class:`InferenceRequest`.
-
-        Returns the raw ``ctx`` dict without touching the filesystem — use
-        this for programmatic / batched flows where the caller manages
-        output persistence.  For one-shot script use, prefer :meth:`generate`
-        (which also calls :meth:`finalize`).
-
-        The FSM step / transition log is always collected and returned under
-        ``ctx['trace']``.
-        """
-        return self._run(request)
 
     # ── Output persistence ────────────────────────────────────────────────────
 
