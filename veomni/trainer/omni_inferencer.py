@@ -370,12 +370,9 @@ class OmniInferencer:
             module = cls.from_pretrained(
                 weights_path,
                 torch_dtype=torch.bfloat16,
+                device_map="auto",
                 **{k: v for k, v in mod_cfg.items() if not k.startswith("_")},
-            )
-            # TODO(omni-inferencer): weights materialise on CPU then copy to
-            # the accelerator, doubling peak host RAM per module.  Switch to
-            # ``device_map={"": self.device}`` once multi-device dispatch lands.
-            module = module.to(self.device).eval()
+            ).eval()
             modules[name] = module
         return modules
 

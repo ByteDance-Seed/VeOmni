@@ -269,6 +269,7 @@ class JanusVqvae(OmniModule, PreTrainedModel):
         if hidden_states is None:
             return {"conversation_list": conversation_list} if conversation_list is not None else {}
 
+        hidden_states = hidden_states.to(self.device)
         batch_size = hidden_states.size(0)
         sampling = self._extract_sampling_kwargs(generation_kwargs)
         cfg_w = float(sampling.pop("guidance_scale", 1.0) or 1.0)

@@ -292,7 +292,7 @@ class JanusLlama(OmniModule, PreTrainedModel):
         cache_kwargs = {k: v for k, v in kwargs.items() if k in ("cache_position",)}
 
         if past_key_values is None:
-            embed_chunks = [p.inputs_embeds for p in conversation_list if p.inputs_embeds is not None]
+            embed_chunks = [p.inputs_embeds.to(self.device) for p in conversation_list if p.inputs_embeds is not None]
             if not embed_chunks:
                 raise ValueError(
                     "JanusLlama.generate: conversation_list has no embedded parts. "

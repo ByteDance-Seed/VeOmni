@@ -608,6 +608,7 @@ class JanusTextEncoder(TextEncoder):
         top_p: float = 1.0,
         do_sample: bool = True,
     ) -> int:
+        hidden_states = hidden_states.to(self.device)
         last = hidden_states[:, -1, :]
         logits = self._project(last) if last.dim() == 2 else self._project(last.squeeze(0))
         if logits.dim() == 3:
