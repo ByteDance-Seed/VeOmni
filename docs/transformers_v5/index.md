@@ -1,7 +1,7 @@
 # Transformers v5 Notes
 
 This section documents VeOmni's integration with HuggingFace
-`transformers==5.2.0` (the only supported transformers version).
+`transformers==5.9.0` (the only supported transformers version).
 
 ## Included Notes
 

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-Patch configuration for Qwen3-VL-MoE transformers>=5.2.0 code generation.
+Patch configuration for Qwen3-VL-MoE transformers>=5.9.0 code generation.
 
 Reuses the full set of qwen3_vl VLM patches via `name_map={"Qwen3VL": "Qwen3VLMoe"}`
 (vision SP, deepstack, async Ulysses attention, precomputed position-ids, fused
@@ -25,6 +25,8 @@ loss) and layers the MoE-specific patches on top:
 Regen command:
 python -m veomni.patchgen.run_codegen veomni.models.transformers.qwen3_vl_moe.qwen3_vl_moe_gpu_patch_gen_config -o veomni/models/transformers/qwen3_vl_moe/generated --diff
 """
+
+from types import SimpleNamespace
 
 import torch
 import torch.distributed as dist
@@ -79,9 +81,16 @@ config = PatchConfig(
 # reused VLM patches depends on these helpers (`rot_pos_ids`,
 # `_qwen3_vl_async_ulysses_attention_forward`, `get_position_id`) being
 # available at module scope in the generated modeling.
+#
+# We deliberately filter out `_Qwen3VLFakeForPosID`: helpers are emitted
+# verbatim by patchgen and bypass the per-patch `name_map`, so the qwen3_vl
+# class would land here with its body still referencing `Qwen3VLModel`
+# (undefined in this generated file). A Moe-specific helper is registered
+# below via `@config.add_helper`, mirroring qwen3_vl's helper but binding
+# to `Qwen3VLMoeModel`.
 config.additional_imports.extend(qwen3_vl_config.additional_imports)
 config.post_import_blocks.extend(qwen3_vl_config.post_import_blocks)
-config.helpers.extend(qwen3_vl_config.helpers)
+config.helpers.extend(h for h in qwen3_vl_config.helpers if h.__name__ != "_Qwen3VLFakeForPosID")
 
 # Surface ``Qwen3VLMoeCausalLMOutputWithLogProbs`` so the patched multimodal
 # ``forward`` can return per-token log-probs / entropy as constructor fields
@@ -106,6 +115,30 @@ config.add_post_import_block(
     veomni_load_balancing_loss = OpSlot("load_balancing_loss", "standard")
     """
 )
+
+
+# ================================================================
+# Helper: _Qwen3VLMoeFakeForPosID  (emitted into the generated file via
+# add_helper). Picklable fake `self` used by `get_position_id_func`.
+# Mirrors qwen3_vl's `_Qwen3VLFakeForPosID` but binds to `Qwen3VLMoeModel`
+# — patchgen emits helpers verbatim (bypassing the per-patch `name_map`),
+# so a Moe-specific version is required here.
+# ================================================================
+@config.add_helper
+class _Qwen3VLMoeFakeForPosID(SimpleNamespace):  # noqa: F821 SimpleNamespace declared in qwen3_vl's add_post_import_block which we inherit above
+    """Picklable fake `self` used by `get_position_id_func` — must be a
+    module-level class so `get_vision_position_ids` survives the pickle
+    round-trip that happens when this object reaches a dataloader worker
+    via `multiprocessing.spawn`. Assigning a bound method to a plain
+    `SimpleNamespace` instance deadlocks on unpickle (`AttributeError:
+    'types.SimpleNamespace' object has no attribute 'get_vision_position_ids'`)
+    because pickle reduces a bound method to `getattr(self.__self__, name)`
+    and `name` is the very attribute being restored from `__dict__`. As a
+    class attribute, the method is resolved via class lookup and never has
+    to be pickled."""
+
+    def get_vision_position_ids(self, *args, **kwargs):
+        return Qwen3VLMoeModel.get_vision_position_ids(self, *args, **kwargs)  # noqa: F821 defined in generated modeling file
 
 
 # ================================================================
@@ -310,6 +343,9 @@ def qwen3_vl_moe_model_forward_patched(
     # --- Patch.2 ---
     image_mask = kwargs.pop("image_mask", None)
     video_mask = kwargs.pop("video_mask", None)
+    # v5 multimodal RoPE input; consumed here so it is not forwarded to the
+    # language model. Derived from input_ids below when not supplied.
+    mm_token_type_ids = kwargs.pop("mm_token_type_ids", None)
     if video_mask is None and image_mask is None:
         if get_parallel_state().sp_enabled:
             input_ids_list = [torch.zeros_like(input_ids) for _ in range(get_parallel_state().sp_size)]
@@ -498,6 +534,20 @@ def qwen3_vl_moe_model_forward_patched(
                 "is enabled; multimodal position_ids must be precomputed via "
                 "`get_position_id_func` in the VeOmni data pipeline."
             )
+        # v5 `compute_3d_position_ids` gates M-RoPE on `mm_token_type_ids`
+        # via its `can_compute_mrope` check; without it the multimodal
+        # branch silently falls through and the call returns `None`,
+        # leaving `position_ids=None` for the language model. Derive
+        # `mm_token_type_ids` from `input_ids` here so the M-RoPE branch
+        # actually runs whenever multimodal grids are present.
+        if (
+            mm_token_type_ids is None
+            and input_ids is not None
+            and (image_grid_thw is not None or video_grid_thw is not None)
+        ):
+            mm_token_type_ids = mm_token_type_ids_from_input_ids(  # noqa: F821 defined via add_helper
+                input_ids, self.config
+            )
         position_ids = self.compute_3d_position_ids(
             input_ids=input_ids,
             image_grid_thw=image_grid_thw,
@@ -505,6 +555,7 @@ def qwen3_vl_moe_model_forward_patched(
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask_tensor,
             past_key_values=past_key_values,
+            mm_token_type_ids=mm_token_type_ids,
         )
         # --- Patch.5 ---
     else:

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-Patch configuration for Qwen2.5-Omni transformers>=5.2.0 code generation.
+Patch configuration for Qwen2.5-Omni transformers>=5.9.0 code generation.
 
 Covers the thinker training path (text + vision + audio, dense — no MoE):
   - PreTrained.get_rope_index with per-video use_audio_in_video derived from
@@ -551,6 +551,17 @@ def qwen2_5_omni_audio_forward_patched(self, input_features, feature_lens=None, 
     aftercnn_lens (`torch.LongTensor` of shape `(batch_size,)`):
         mel length after cnn
     """
+    # The LM-level FlashAttentionKwargs (``cu_seq_lens_q/k``, ``max_length_q/k``)
+    # are injected by the data collator for packed-sequence attention and ride
+    # through Thinker.forward's ``**kwargs``. They must not reach the audio
+    # encoder layers — upstream's ``Qwen2_5OmniAudioAttention.forward`` passes
+    # vision-local ``cu_seq_lens_q=cu_seqlens`` explicitly AND forwards
+    # ``**kwargs``, which would otherwise raise ``TypeError: got multiple
+    # values for keyword argument 'cu_seq_lens_q'`` (mirrors the strip we do
+    # in the qwen3_vl / qwen2_5_vl / qwen3_omni_moe ViT forwards).
+    for key in ["cu_seq_lens_q", "cu_seq_lens_k", "max_length_q", "max_length_k"]:
+        kwargs.pop(key, None)
+
     # --- Patch.1 ---
     input_features = input_features.permute(1, 0)  # (len, num_mel_bins) -> (num_mel_bins, len)
     # --- Patch.1 ---
@@ -592,8 +603,6 @@ def qwen2_5_omni_audio_forward_patched(self, input_features, feature_lens=None, 
             padded_mask_after_cnn.sum(1).cumsum(0),
         )
     ).to(torch.int32)
-    attention_mask = self._prepare_attention_mask(hidden_states, cu_seqlens)
-
     # --- Patch.3 ---
     if get_parallel_state().sp_enabled:
         unpadded_dim_len = cu_seqlens[-1]
@@ -608,10 +617,19 @@ def qwen2_5_omni_audio_forward_patched(self, input_features, feature_lens=None, 
     # --- Patch.3 ---
 
     for encoder_layer in self.layers:
+        # NB: ``attention_mask`` is intentionally not forwarded here. The
+        # audio attention path is varlen (cu_seqlens-driven, flash-attn)
+        # and does not consume an explicit 4D mask; upstream encoder_layer
+        # in 5.9 also calls ``encoder_layer(hidden_states, cu_seqlens=...)``
+        # without an ``attention_mask`` kwarg. Passing it here used to
+        # work pre-5.9 but now collides with ``attention_mask=None``
+        # explicitly passed by ``*VisionAttention.forward`` in
+        # ``attention_interface(..., attention_mask=None, ..., **kwargs)``,
+        # raising ``TypeError: got multiple values for keyword argument
+        # 'attention_mask'``.
         layer_outputs = encoder_layer(
             hidden_states,
             cu_seqlens=cu_seqlens,
-            attention_mask=attention_mask,
             **kwargs,
         )
         hidden_states = layer_outputs[0]
@@ -795,7 +813,28 @@ def qwen2_5_omni_vision_forward_patched(
     use_precompute = precomputed_cu_seqlens is not None
 
     hidden_states = self.patch_embed(hidden_states)
-    rotary_pos_emb = self.rot_pos_emb(grid_thw)
+
+    # `grid_thw_list` — host-side list reused for rotary position-id
+    # construction, unpadded_dim_size, and the cu_seqlens fallback below.
+    # Materialise once here so the rotary path shares the same tolist sync.
+    grid_thw_list = precomputed_grid_thw_list
+    if grid_thw_list is None:
+        grid_thw_list = grid_thw.tolist()
+
+    # Build ``position_ids`` host-driven, mirroring upstream's
+    # ``get_vision_position_ids``. Replaces ``self.rot_pos_emb(grid_thw)`` which
+    # in transformers 5.9 is a deprecated shim that (a) emits a per-forward
+    # ``FutureWarning`` and (b) re-runs ``grid_thw.tolist()`` internally.
+    ms = self.spatial_merge_size
+    device = hidden_states.device
+    position_ids_list = []
+    for t, h, w in grid_thw_list:
+        hpos_ids = torch.arange(h, device=device).reshape(h, 1).expand(h, w)
+        hpos_ids = hpos_ids.reshape(h // ms, ms, w // ms, ms).transpose(1, 2).flatten()
+        wpos_ids = torch.arange(w, device=device).reshape(1, w).expand(h, w)
+        wpos_ids = wpos_ids.reshape(h // ms, ms, w // ms, ms).transpose(1, 2).flatten()
+        position_ids_list.append(torch.stack([hpos_ids, wpos_ids], dim=-1).repeat(t, 1))
+    rotary_pos_emb = self.rotary_pos_emb(torch.cat(position_ids_list, dim=0))
 
     if use_precompute:
         # Collator-precomputed: window_index / cu_seqlens / cu_window_seqlens
@@ -833,13 +872,10 @@ def qwen2_5_omni_vision_forward_patched(
         cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
 
     # `unpadded_dim_size` (pre-SP-pad patch count) — derived host-side from
-    # `grid_thw_list` so the SP padding math below stays a Python int and
-    # doesn't read `cu_seqlens[-1]` (a 0-D GPU scalar → sync). Precomputed
-    # `cu_seqlens` already carries the SP-pad tail, so `cu_seqlens[-1]` is no
-    # longer the unpadded count anyway.
-    grid_thw_list = precomputed_grid_thw_list
-    if grid_thw_list is None:
-        grid_thw_list = grid_thw.tolist()
+    # the `grid_thw_list` materialised above so the SP padding math stays a
+    # Python int and doesn't read `cu_seqlens[-1]` (a 0-D GPU scalar → sync).
+    # Precomputed `cu_seqlens` already carries the SP-pad tail, so
+    # `cu_seqlens[-1]` is no longer the unpadded count anyway.
     unpadded_dim_size = sum(t * h * w for t, h, w in grid_thw_list)
 
     # --- Patch.1 ---

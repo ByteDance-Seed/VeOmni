@@ -26,9 +26,9 @@ dependencies = [
   # Comment out transformers version so pip users do not accidentally pull in a
   # version that conflicts with the uv-managed setup.
   # For uv user: the actual version is pinned by the "transformers-stable"
-  # default dependency-group (==5.2.0).
-  # For pip user: please install 5.2.0 manually via `pip install transformers==5.2.0`.
-  # "transformers==5.2.0",
+  # default dependency-group (==5.9.0).
+  # For pip user: please install 5.9.0 manually via `pip install transformers==5.9.0`.
+  # "transformers==5.9.0",
   "psutil",
   "timm",
   "wandb",
@@ -148,13 +148,13 @@ test = [
 ]
 # Pin the default transformers version via a dependency group. This is a
 # default group (see default-groups below), so `uv sync` always installs
-# transformers==5.2.0.
+# transformers==5.9.0.
 #
 # Why a dependency group instead of `[project.dependencies]`? It keeps the
 # transformers version out of the wheel metadata so pip users are not forced
 # into a specific 5.x patch release.
 transformers-stable = [
-  "transformers==5.2.0"
+  "transformers==5.9.0"
 ]
 
 [tool.uv]
@@ -171,7 +171,7 @@ no-build-isolation-package = [
 ]
 
 # The "transformers-stable" dependency group is synced by default, ensuring
-# that `uv sync` (with no extra flags) installs transformers==5.2.0.
+# that `uv sync` (with no extra flags) installs transformers==5.9.0.
 default-groups = ["transformers-stable"]
 
 override-dependencies = [

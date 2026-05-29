@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-Patch configuration for Qwen3-VL transformers>=5.2.0 code generation.
+Patch configuration for Qwen3-VL transformers>=5.9.0 code generation.
 
 Regen command:
 python -m veomni.patchgen.run_codegen veomni.models.transformers.qwen3_vl.qwen3_vl_gpu_patch_gen_config -o veomni/models/transformers/qwen3_vl/generated --diff
@@ -303,8 +303,30 @@ def _qwen3_vl_async_ulysses_attention_forward(
 
 
 @config.add_helper
+def mm_token_type_ids_from_input_ids(input_ids, config):
+    # transformers v5 VLMs require `mm_token_type_ids` to compute multimodal
+    # RoPE (M-RoPE): text=0, image=1, video=2 per token. HF's processor emits
+    # it, but VeOmni's data pipeline carries modality only via the multimodal
+    # token ids inside `input_ids`, so derive the type ids from those here.
+    # `config` selects the token-id namespace and must match `input_ids`: the
+    # live model config on the `forward` path, the IMAGE/VIDEO_INPUT_INDEX fake
+    # config in the `get_position_id` precompute path. Do not unify the two
+    # call sites onto one config.
+    mm_token_type_ids = torch.zeros_like(input_ids)
+    mm_token_type_ids[input_ids == config.image_token_id] = 1
+    mm_token_type_ids[input_ids == config.video_token_id] = 2
+    return mm_token_type_ids
+
+
+@config.add_helper
 def get_position_id(main_func, self, **kwargs):
     # Must be a module-level function for multiprocessing pickle
+    # v5 `get_rope_index` requires `mm_token_type_ids`; derive it from
+    # `input_ids` when the data pipeline did not pass it explicitly.
+    if kwargs.get("mm_token_type_ids") is None and kwargs.get("input_ids") is not None:
+        kwargs["mm_token_type_ids"] = mm_token_type_ids_from_input_ids(  # noqa: F821 defined via add_helper
+            kwargs["input_ids"], self.config
+        )
     position_ids, rope_deltas = main_func(self, **kwargs)
     return {"position_ids": position_ids, "rope_deltas": rope_deltas}
 
@@ -502,10 +524,13 @@ def qwen3_vl_vision_rot_pos_emb_patched(self, grid_thw) -> torch.Tensor:
     # `if num_frames > 1`, plus per-image `int(h.item())` inside rot_pos_ids
     # when passed GPU 0-D scalars). Now: 0 syncs.
     grid_thw_list = grid_thw.tolist() if torch.is_tensor(grid_thw) else grid_thw
-    max_hw = max(max(h, w) for _, h, w in grid_thw_list)
-    freq_table = self.rotary_pos_emb(max_hw)  # (max_hw, dim // 2)
-    device = freq_table.device
-
+    # transformers 5.9 dropped the legacy ``rotary_pos_emb(seqlen: int) -> (seqlen, dim//2)``
+    # API in favour of ``rotary_pos_emb(position_ids: Tensor) -> position_ids * inv_freq``
+    # (see ``Qwen3VLVisionRotaryEmbedding.forward``). We now hand the full ``pos_ids``
+    # tensor in directly; the upstream module's broadcast (``pos_ids * inv_freq``)
+    # produces identical math to the old ``freq_table[pos_ids].flatten(1)`` lookup,
+    # so the host-side caching optimization is preserved without a max_hw scan.
+    device = self.rotary_pos_emb.inv_freq.device
     total_tokens = sum(t * h * w for t, h, w in grid_thw_list)
     pos_ids = torch.empty((total_tokens, 2), dtype=torch.long, device=device)
 
@@ -518,9 +543,7 @@ def qwen3_vl_vision_rot_pos_emb_patched(self, grid_thw) -> torch.Tensor:
         pos_ids[offset : offset + num_tokens] = coords
         offset += num_tokens
 
-    embeddings = freq_table[pos_ids]
-    embeddings = embeddings.flatten(1)
-    return embeddings
+    return self.rotary_pos_emb(pos_ids)
     # --- Patch.1 ---
 
 
@@ -1032,6 +1055,9 @@ def qwen3_vl_model_forward_patched(
     # --- Patch.2 ---
     image_mask = kwargs.pop("image_mask", None)
     video_mask = kwargs.pop("video_mask", None)
+    # v5 multimodal RoPE input; consumed here so it is not forwarded to the
+    # language model. Derived from input_ids below when not supplied.
+    mm_token_type_ids = kwargs.pop("mm_token_type_ids", None)
     if video_mask is None and image_mask is None:
         if get_parallel_state().sp_enabled:
             input_ids_list = [torch.zeros_like(input_ids) for _ in range(get_parallel_state().sp_size)]
@@ -1233,6 +1259,20 @@ def qwen3_vl_model_forward_patched(
                 "is enabled; multimodal position_ids must be precomputed via "
                 "`get_position_id_func` in the VeOmni data pipeline."
             )
+        # v5 `compute_3d_position_ids` gates M-RoPE on `mm_token_type_ids`
+        # via its `can_compute_mrope` check; without it the multimodal
+        # branch silently falls through and the call returns `None`,
+        # leaving `position_ids=None` for the language model. Derive
+        # `mm_token_type_ids` from `input_ids` here so the M-RoPE branch
+        # actually runs whenever multimodal grids are present.
+        if (
+            mm_token_type_ids is None
+            and input_ids is not None
+            and (image_grid_thw is not None or video_grid_thw is not None)
+        ):
+            mm_token_type_ids = mm_token_type_ids_from_input_ids(  # noqa: F821 defined via add_helper
+                input_ids, self.config
+            )
         position_ids = self.compute_3d_position_ids(
             input_ids=input_ids,
             image_grid_thw=image_grid_thw,
@@ -1240,6 +1280,7 @@ def qwen3_vl_model_forward_patched(
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask_tensor,
             past_key_values=past_key_values,
+            mm_token_type_ids=mm_token_type_ids,
         )
         # --- Patch.5 ---
     else:
@@ -1274,6 +1315,29 @@ def qwen3_vl_model_forward_patched(
 
 
 # ================================================================
+# Helper: _Qwen3VLFakeForPosID  (emitted into the generated file via
+# add_helper). Picklable fake `self` used by `get_position_id_func`.
+# ================================================================
+@config.add_helper
+class _Qwen3VLFakeForPosID(SimpleNamespace):
+    """Picklable fake `self` used by `get_position_id_func` — must be a
+    module-level class so `get_vision_position_ids` survives the pickle
+    round-trip that happens when this object reaches a dataloader worker
+    via `multiprocessing.spawn`. Assigning a bound method to a plain
+    `SimpleNamespace` instance deadlocks on unpickle (`AttributeError:
+    'types.SimpleNamespace' object has no attribute 'get_vision_position_ids'`)
+    because pickle reduces a bound method to `getattr(self.__self__, name)`
+    and `name` is the very attribute being restored from `__dict__`. As a
+    class attribute, the method is resolved via class lookup and never has
+    to be pickled. The qwen3_vl_moe config reuses this template via
+    `name_map={"Qwen3VL": "Qwen3VLMoe"}`, which rewrites both the class
+    name and the `Qwen3VLModel` reference to their Moe counterparts."""
+
+    def get_vision_position_ids(self, *args, **kwargs):
+        return Qwen3VLModel.get_vision_position_ids(self, *args, **kwargs)
+
+
+# ================================================================
 # Patch: Qwen3VLForConditionalGeneration.get_position_id_func (new)
 # 1. wrap Qwen3VLModel.get_rope_index so the VeOmni data pipeline can
 #    precompute multimodal position_ids on CPU worker processes
@@ -1292,7 +1356,15 @@ def qwen3_vl_get_position_id_func_patched(self):
     fake_config.image_token_id = IMAGE_INPUT_INDEX
     fake_config.video_token_id = VIDEO_INPUT_INDEX
     # --- Patch.2 ---
-    fake_model = SimpleNamespace(config=fake_config)
+    # Use a module-level fake-self class (declared in the add_post_import_block
+    # at the top of this file) instead of `SimpleNamespace + bound-method on
+    # instance`. The bound-method form survives single-process callers (e.g.,
+    # the test suite) but deadlocks on `multiprocessing.spawn`'s pickle
+    # round-trip used by the streaming dataloader workers — see the class's
+    # docstring for the full rationale. The qwen3_vl_moe config reuses this
+    # template via `name_map={"Qwen3VL": "Qwen3VLMoe"}`, which rewrites both
+    # `_Qwen3VLFakeForPosID` and `Qwen3VLModel` to their Moe counterparts.
+    fake_model = _Qwen3VLFakeForPosID(config=fake_config)  # noqa: F821 defined via add_post_import_block
     return partial(get_position_id, Qwen3VLModel.get_rope_index, fake_model)  # noqa: F821 defined via add_post_import_block
     # --- Patch.1 ---
 

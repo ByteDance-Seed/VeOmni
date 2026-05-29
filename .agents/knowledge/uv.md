@@ -31,7 +31,7 @@ pyproject.toml
 │   ├── dev                  includes lint + test
 │   ├── lint                 pre-commit, ruff
 │   ├── test                 pytest, expecttest, rich
-│   └── transformers-stable  transformers==5.2.0 (default, in default-groups)
+│   └── transformers-stable  transformers==5.9.0 (default, in default-groups)
 ├── [tool.uv]
 │   ├── required-version     Pinned uv version
 │   ├── override-dependencies  Per-extra torch/CUDA pins + cudnn override
@@ -53,11 +53,11 @@ uv sync --extra npu_aarch64 --dev   # Ascend NPU (ARM)
 
 ## Transformers Version
 
-`transformers==5.2.0` is pinned by the `transformers-stable` dependency
+`transformers==5.9.0` is pinned by the `transformers-stable` dependency
 group, which is listed in `[tool.uv] default-groups`. `uv sync` (no extra
 flags) installs it automatically. We keep the version out of
 `[project.dependencies]` so pip users are not forced into a specific 5.x
-patch release; pip users should `pip install transformers==5.2.0` manually.
+patch release; pip users should `pip install transformers==5.9.0` manually.
 
 ## torch Source Pinning
 
@@ -70,7 +70,7 @@ torch, torchvision, torchaudio use custom sources:
 ## Common Commands
 
 ```bash
-# Initial setup (transformers==5.2.0 via the default dependency group)
+# Initial setup (transformers==5.9.0 via the default dependency group)
 uv sync --extra gpu --extra audio --dev
 
 # Regenerate lockfile after pyproject.toml changes
@@ -90,4 +90,4 @@ uv sync --locked --all-packages --extra gpu --dev
 3. **flash-attn wheels are torch-version-specific** — bumping torch requires new wheels.
 4. **uv version changes require Docker rebuilds** — update Dockerfiles and release new images.
 5. **`override-dependencies` markers are load-bearing** — the `extra == 'gpu'` guards prevent uv from downloading wrong torch variants.
-6. **`transformers==5.2.0` is the only supported version** — pinned via the `transformers-stable` default dependency group. New code targets v5 APIs (FSDP2 + patchgen-generated modeling) only.
+6. **`transformers==5.9.0` is the only supported version** — pinned via the `transformers-stable` default dependency group. New code targets v5 APIs (FSDP2 + patchgen-generated modeling) only.

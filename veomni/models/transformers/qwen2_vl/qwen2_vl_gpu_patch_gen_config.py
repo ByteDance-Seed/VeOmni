@@ -61,6 +61,10 @@ config = PatchConfig(
 config.add_import("copy", is_from_import=False)
 config.add_import("functools", names=["partial"])
 config.add_import("types", names=["SimpleNamespace"])
+# transformers 5.9 dropped ``import torch.nn.functional as F`` from the upstream
+# qwen2_vl modeling file; the patched ViT forward still calls ``F.pad`` to build
+# cu_seqlens, so re-add the alias here.
+config.add_import("torch.nn.functional", alias="F", is_from_import=False)
 config.add_import("veomni.distributed.parallel_state", names=["get_parallel_state"])
 config.add_import(
     "veomni.distributed.sequence_parallel",
@@ -183,16 +187,30 @@ def qwen2_vit_forward_patched(
     precomputed_max_seqlen = vit_metadata.get("max_seqlen")
 
     hidden_states = self.patch_embed(hidden_states)
-    rotary_pos_emb = self.rot_pos_emb(grid_thw)
-    emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
 
-    # `total_seq_len` (pre-SP-pad patch count) — derived host-side from
-    # `grid_thw_list` so the SP padding math below stays a Python int and
-    # doesn't read `cu_seqlens[-1]` (a 0-D GPU scalar → sync).
+    # `grid_thw_list` — host-side list reused for rotary position-id construction,
+    # total_seq_len, and the cu_seqlens fallback below. Materialise once here so
+    # the rotary path and the SP-pad arithmetic share the same tolist sync.
     grid_thw_list = precomputed_grid_thw_list
     if grid_thw_list is None:
         grid_thw_list = grid_thw.tolist()
     total_seq_len = sum(t * h * w for t, h, w in grid_thw_list)
+
+    # Build ``position_ids`` host-driven, mirroring upstream's
+    # ``get_vision_position_ids``. Replaces ``self.rot_pos_emb(grid_thw)`` which
+    # in transformers 5.9 is a deprecated shim that (a) emits a per-forward
+    # ``FutureWarning`` and (b) re-runs ``grid_thw.tolist()`` internally.
+    ms = self.spatial_merge_size
+    device = hidden_states.device
+    position_ids_list = []
+    for t, h, w in grid_thw_list:
+        hpos_ids = torch.arange(h, device=device).reshape(h, 1).expand(h, w)
+        hpos_ids = hpos_ids.reshape(h // ms, ms, w // ms, ms).transpose(1, 2).flatten()
+        wpos_ids = torch.arange(w, device=device).reshape(1, w).expand(h, w)
+        wpos_ids = wpos_ids.reshape(h // ms, ms, w // ms, ms).transpose(1, 2).flatten()
+        position_ids_list.append(torch.stack([hpos_ids, wpos_ids], dim=-1).repeat(t, 1))
+    rotary_pos_emb = self.rotary_pos_emb(torch.cat(position_ids_list, dim=0))
+    emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
 
     # Prefer the collator-precomputed cu_seqlens (already includes any SP-pad
     # tail entry). Fallback builds it host-side from grid_thw and extends it
@@ -378,6 +396,9 @@ def qwen2vl_model_forward_patched(
     # Extract image and video masks from kwargs
     image_mask = kwargs.pop("image_mask", None)
     video_mask = kwargs.pop("video_mask", None)
+    # v5 multimodal RoPE input; consumed here so it is not forwarded to the
+    # language model. Derived from input_ids below when not supplied.
+    mm_token_type_ids = kwargs.pop("mm_token_type_ids", None)
 
     # Bundle the per-modality ViT metadata from `multimodal_metadata`
     # (collator-precomputed; see .agents/knowledge/multimodal_metadata.md)
@@ -452,6 +473,21 @@ def qwen2vl_model_forward_patched(
         inputs_embeds = slice_input_tensor(inputs_embeds, dim=1, group=get_parallel_state().sp_group)
 
     if position_ids is None:
+        # v5 `compute_3d_position_ids` gates M-RoPE on `mm_token_type_ids`
+        # via its `can_compute_mrope` check; without it the multimodal
+        # branch silently falls through and the call returns `None`,
+        # leaving `position_ids=None` for the language model. Derive
+        # `mm_token_type_ids` from `input_ids` (text=0, image=1, video=2)
+        # here so the M-RoPE branch actually runs whenever multimodal
+        # grids are present.
+        if (
+            mm_token_type_ids is None
+            and input_ids is not None
+            and (image_grid_thw is not None or video_grid_thw is not None)
+        ):
+            mm_token_type_ids = torch.zeros_like(input_ids)
+            mm_token_type_ids[input_ids == self.config.image_token_id] = 1
+            mm_token_type_ids[input_ids == self.config.video_token_id] = 2
         position_ids = self.compute_3d_position_ids(
             input_ids=input_ids,
             image_grid_thw=image_grid_thw,
@@ -459,6 +495,7 @@ def qwen2vl_model_forward_patched(
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
             past_key_values=past_key_values,
+            mm_token_type_ids=mm_token_type_ids,
         )
     # Use VeOmni precomputed position ids
     else:
@@ -490,6 +527,27 @@ def qwen2vl_model_forward_patched(
 
 
 # ================================================================
+# Helper: _Qwen2VLFakeForPosID  (emitted into the generated file via
+# add_helper). Picklable fake `self` used by `get_position_id_func`.
+# ================================================================
+@config.add_helper
+class _Qwen2VLFakeForPosID(SimpleNamespace):
+    """Picklable fake `self` used by `get_position_id_func` — must be a
+    module-level class so `get_vision_position_ids` survives the pickle
+    round-trip that happens when this object reaches a dataloader worker
+    via `multiprocessing.spawn`. Assigning a bound method to a plain
+    `SimpleNamespace` instance deadlocks on unpickle (`AttributeError:
+    'types.SimpleNamespace' object has no attribute 'get_vision_position_ids'`)
+    because pickle reduces a bound method to `getattr(self.__self__, name)`
+    and `name` is the very attribute being restored from `__dict__`. As a
+    class attribute, the method is resolved via class lookup and never has
+    to be pickled."""
+
+    def get_vision_position_ids(self, *args, **kwargs):
+        return Qwen2VLModel.get_vision_position_ids(self, *args, **kwargs)
+
+
+# ================================================================
 # Patch: Qwen2VLForConditionalGeneration.get_position_id_func
 # ================================================================
 @config.override_method(
@@ -498,13 +556,26 @@ def qwen2vl_model_forward_patched(
 )
 def qwen2vl_get_position_id_func_patched(self):
     def get_position_id(main_func, self, **kwargs):
+        # v5 `get_rope_index` requires `mm_token_type_ids`; derive it from
+        # `input_ids` (text=0, image=1, video=2) when not passed explicitly.
+        if kwargs.get("mm_token_type_ids") is None and kwargs.get("input_ids") is not None:
+            ids = kwargs["input_ids"]
+            mm_token_type_ids = torch.zeros_like(ids)
+            mm_token_type_ids[ids == self.config.image_token_id] = 1
+            mm_token_type_ids[ids == self.config.video_token_id] = 2
+            kwargs["mm_token_type_ids"] = mm_token_type_ids
         position_ids, rope_deltas = main_func(self, **kwargs)  # position_ids (dim, 1, l), rope_deltas (1, 1)
         return {"position_ids": position_ids.squeeze(1), "rope_deltas": rope_deltas.squeeze(0)}
 
     fake_config = copy.copy(self.config)
     fake_config.image_token_id = IMAGE_INPUT_INDEX
     fake_config.video_token_id = VIDEO_INPUT_INDEX
-    fake_model = SimpleNamespace(config=fake_config)
+    # Use a module-level fake-self class (see `_Qwen2VLFakeForPosID`
+    # above) instead of `SimpleNamespace + bound-method on instance`. The
+    # bound-method form survives single-process callers but deadlocks on
+    # `multiprocessing.spawn`'s pickle round-trip used by the streaming
+    # dataloader workers — see the class's docstring for the full rationale.
+    fake_model = _Qwen2VLFakeForPosID(config=fake_config)
     return partial(get_position_id, Qwen2VLModel.get_rope_index, fake_model)
 
 

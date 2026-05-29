@@ -172,12 +172,14 @@ def qwen3_moe_topk_router_forward_patched(self, hidden_states: torch.Tensor):
     router_top_value, router_indices = torch.topk(routing_weights, self.top_k, dim=-1)
     if self.norm_topk_prob:
         router_top_value /= router_top_value.sum(dim=-1, keepdim=True)
-    # Modification: keep ``router_top_value`` in the softmax's fp32 dtype to
-    # match HF's reference path (HF re-binds ``router_logits`` to the post-
-    # softmax fp32 tensor and then casts back to that dtype, which is a
-    # no-op). The fused MoE call site casts to ``final_hidden_states.dtype``
-    # itself, so leaving fp32 here is harmless.
-    router_top_value = router_top_value.to(routing_weights.dtype)
+    # Cast ``router_top_value`` back to the raw-logits dtype, matching HF's
+    # reference ``Qwen3MoeTopKRouter.forward``: transformers v5.8 keeps
+    # ``router_logits`` bound to the pre-softmax ``F.linear`` output (it no
+    # longer re-binds it to the fp32 post-softmax tensor), so this cast lands
+    # on the model dtype rather than being a no-op. The fused MoE call site
+    # casts to ``final_hidden_states.dtype`` regardless; matching HF here
+    # keeps the generated modeling bitwise-equal to vanilla HF.
+    router_top_value = router_top_value.to(router_logits.dtype)
     return router_logits, router_top_value, router_indices
 
 
@@ -236,11 +238,12 @@ def qwen3_moe_model_forward_patched(
         position_ids = cache_position.unsqueeze(0)
 
     mask_function = create_causal_mask if self.config.sliding_window is None else create_sliding_window_causal_mask
+    # transformers 5.9 dropped ``cache_position`` from these constructors
+    # ("Deprecated and unused" — see masking_utils.py:917).
     causal_mask = mask_function(
         config=self.config,
         inputs_embeds=inputs_embeds,
         attention_mask=attention_mask,
-        cache_position=cache_position,
         past_key_values=past_key_values,
         position_ids=position_ids,
     )

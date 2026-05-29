@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-Patch configuration for Qwen3-VL-MoE NPU build (transformers>=5.2.0).
+Patch configuration for Qwen3-VL-MoE NPU build (transformers>=5.9.0).
 
 Inherits every GPU patch from `qwen3_vl_moe_gpu_patch_gen_config` (which in
 turn reuses the qwen3_vl VLM patches) and layers NPU kernel replacements on
