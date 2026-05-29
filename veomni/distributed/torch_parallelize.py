@@ -384,6 +384,7 @@ def parallelize_model_fsdp2(
             else:
                 logger.info_rank0("also init peft model lora weights...")
 
+        fqn_to_index_mapping = kwargs.get("fqn_to_index_mapping")
         if kwargs.get("broadcast_model_weights_from_rank0"):
             logger.info_rank0("Loading model weights from disk on rank0 then broadcasting to other ranks...")
             rank0_load_and_broadcast_weights(
@@ -395,6 +396,7 @@ def parallelize_model_fsdp2(
                 max_load_broadcast_size=kwargs.get("max_load_broadcast_size", 20.0),
                 is_peft_model=is_peft_model,
                 adapter_path=adapter_path,
+                fqn_to_index_mapping=fqn_to_index_mapping,
             )
         else:
             logger.info_rank0("Every rank would read weights from disk and expect this to be slow!")
@@ -406,6 +408,7 @@ def parallelize_model_fsdp2(
                 dtensor_factory=_dt_local_split,
                 is_peft_model=is_peft_model,
                 adapter_path=adapter_path,
+                fqn_to_index_mapping=fqn_to_index_mapping,
             )
 
     # Register grad norm clipping method for FSDP2

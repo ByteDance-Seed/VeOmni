@@ -28,19 +28,22 @@ at load time, eliminating the need for offline checkpoint merging.
         model.layers.{i}.mlp.experts.down_proj     [E, H, I]
 """
 
-import re
 from typing import Dict, List, Optional, Tuple
 
 import torch
 
 from ....utils import logging
+from ..._moe_fused_weight_map import (
+    PER_EXPERT_SPLIT_TO_FUSED_PATTERN,
+    convert_per_expert_fqn_mapping_to_fused,
+)
 from ...checkpoint_tensor_loading import ConvertedCheckpointTensor
 
 
 logger = logging.get_logger(__name__)
 
 # Matches per-expert split keys like: model.layers.0.mlp.experts.3.gate_proj.weight
-_EXPERT_PATTERN = re.compile(r"^(.+\.mlp)\.experts\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight$")
+_EXPERT_PATTERN = PER_EXPERT_SPLIT_TO_FUSED_PATTERN
 
 
 class Qwen3MoeCheckpointTensorConverter:
@@ -128,3 +131,8 @@ def create_qwen3_moe_checkpoint_tensor_converter(model):
     return Qwen3MoeCheckpointTensorConverter(
         num_experts=model.config.num_experts,
     )
+
+
+def convert_qwen3_moe_fqn_to_index_mapping(fqn_to_index_mapping: Dict[str, int]) -> Dict[str, int]:
+    """Align HF safetensors index keys with fused expert parameter names."""
+    return convert_per_expert_fqn_mapping_to_fused(fqn_to_index_mapping, _EXPERT_PATTERN)
