@@ -299,6 +299,7 @@ class OmniInferencer:
             train_yaml_path=args.model.omni_train_yaml_path,
             infer_yaml_path=args.model.omni_infer_yaml_path[args.model.omni_infer_type],
         )
+        assert self.omni_config.has_generation_graph(), "Generation graph is required for inference"
         logger.info_rank0(
             f"OmniInferencer: loaded OmniConfig with {len(self.omni_config.module_names)} "
             f"modules ({self.omni_config.module_names})."

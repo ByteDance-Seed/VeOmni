@@ -188,6 +188,10 @@ class OmniModel(nn.Module):
             else None
         )
 
+        # Last FSM state printed by :meth:`_emit_progress` — its private
+        # dedup cursor (reset on each fresh ``generate`` run).
+        self._last_printed_state: Optional[str] = None
+
     @property
     def modules_dict(self) -> Dict[str, nn.Module]:
         """Back-compat dict view of the sub-modules.
@@ -273,6 +277,23 @@ class OmniModel(nn.Module):
 
     # ── Inference ─────────────────────────────────────────────────────────────
 
+    def _emit_progress(self, total_steps: int) -> None:
+        """Log one ``[FSM] step <N>: <state>`` line on a state change.
+
+        Owns its own dedup cursor (:attr:`_last_printed_state`) so the caller
+        doesn't thread it around: emits via :meth:`logger.info_rank0` only
+        when the FSM's current state differs from the last printed one.  The
+        cursor is reset at ``total_steps == 0`` (the first call of every
+        :meth:`generate` run) so a fresh run always re-prints its initial
+        state.
+        """
+        if total_steps == 0:
+            self._last_printed_state = None
+        current = self.generation_graph.current_state_name
+        if current != self._last_printed_state:
+            logger.info_rank0(f"[FSM] step {total_steps:>4}: {current}")
+            self._last_printed_state = current
+
     def generate(
         self,
         request: Dict[str, Any],
@@ -319,11 +340,6 @@ class OmniModel(nn.Module):
         576-step ``image_vq`` loop dominates and is read off the step deltas
         between consecutive lines.
         """
-        if self.generation_graph is None:
-            raise RuntimeError(
-                "OmniModel has no GenerationGraph. Set generation_graph in OmniConfig to enable inference."
-            )
-
         self.generation_graph.reset(request=request)
         ctx: Dict[str, Any] = dict(context if context is not None else request)
         # Per-request output accumulator for decoded multi-modal artefacts —
@@ -336,25 +352,15 @@ class OmniModel(nn.Module):
 
         modules = {name: _unwrap_module(getattr(self, name)) for name in self._module_names}
 
-        # State-transition tracker for the progress trail.
-        # ``maybe_transition`` flips the FSM's current state at the END of
-        # each iteration body, so checking at the START of the NEXT body
-        # is what catches every state change (including the initial state
-        # at step 0, where ``last_printed_state`` is still None).  A second
-        # check after the loop catches the transition into ``done`` (the
-        # while-cond exits the loop before the body iterates that state).
-        last_printed_state: Optional[str] = None
-
-        def _emit_progress() -> None:
-            nonlocal last_printed_state
-            current = self.generation_graph.current_state_name
-            if current != last_printed_state:
-                logger.info_rank0(f"[FSM] step {total_steps:>4}: {current}")
-                last_printed_state = current
-
+        # Progress trail.  ``maybe_transition`` flips the FSM's current state
+        # at the END of each iteration body, so emitting at the START of the
+        # NEXT body catches every state change (including the initial state at
+        # step 0).  A final emit after the loop catches the transition into
+        # ``done`` (the while-cond exits before the body iterates that state).
+        # :meth:`_emit_progress` owns the dedup cursor — nothing to thread.
         total_steps = 0
         while not self.generation_graph.is_done() and total_steps < max_new_tokens:
-            _emit_progress()
+            self._emit_progress(total_steps)
             ctx = self.generation_graph.step(modules, ctx, trace=trace)
             total_steps += 1
 
@@ -372,7 +378,7 @@ class OmniModel(nn.Module):
         # exits.  Usually ``done`` (a module raised its terminating signal);
         # otherwise the state the FSM got stuck in when the ``max_new_tokens``
         # safety cap tripped.
-        _emit_progress()
+        self._emit_progress(total_steps)
 
         # Finalize: hand ctx + request to every active module's `finalize`
         # hook.  This is the framework's contract for "what does the built-in
