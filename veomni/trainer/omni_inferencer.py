@@ -201,20 +201,6 @@ class OmniInferRunArguments(InferArguments):
             )
         },
     )
-    trace: bool = field(
-        default=False,
-        metadata={"help": "Dump FSM step / transition log to <output_dir>/trace.txt (debugging aid)."},
-    )
-    progress: bool = field(
-        default=True,
-        metadata={
-            "help": (
-                "Print one ``[FSM] step <N>: <state>`` line per FSM state entry to stdout "
-                "(coarse progress bar — see :meth:`OmniModel.generate`).  Default true for "
-                "CLI runs; set false for CI / notebook embeds that don't want the stdout spam."
-            )
-        },
-    )
 
     def __post_init__(self):
         super().__post_init__()
@@ -411,18 +397,11 @@ class OmniInferencer:
             },
             max_new_tokens=infer_args.max_tokens,
         )
-        trace_buf: list[str] | None = [] if infer_args.trace else None
-        ctx = self.run_request(request, trace=trace_buf, progress=infer_args.progress)
-        self.finalize(ctx, output_dir=infer_args.output_dir, trace=trace_buf)
+        ctx = self.run_request(request)
+        self.finalize(ctx, output_dir=infer_args.output_dir)
         return ctx
 
-    def run_request(
-        self,
-        request: InferenceRequest,
-        *,
-        trace: list[str] | None = None,
-        progress: bool = False,
-    ) -> dict[str, Any]:
+    def run_request(self, request: InferenceRequest) -> dict[str, Any]:
         """Low-level entry: accept a fully-built :class:`InferenceRequest`.
 
         Returns the raw ``ctx`` dict without touching the filesystem — use
@@ -430,11 +409,12 @@ class OmniInferencer:
         output persistence.  For one-shot script use, prefer :meth:`generate`
         (which also calls :meth:`finalize`).
 
-        ``progress`` opts into :class:`OmniModel.generate`'s per-state stdout
-        trail (e.g. ``[FSM] step    0: prompt_encode``).  Defaults to
-        ``False`` here so programmatic batched callers stay quiet.
+        The FSM step / transition log is always collected and returned under
+        ``ctx['trace']``, and :class:`OmniModel.generate`'s per-state stdout
+        progress trail (``[FSM] step    0: prompt_encode``) is always emitted
+        — no opt-in flags.
         """
-        return self._run(request, trace=trace, progress=progress)
+        return self._run(request)
 
     # ── Output persistence ────────────────────────────────────────────────────
 
@@ -443,7 +423,6 @@ class OmniInferencer:
         ctx: dict[str, Any],
         *,
         output_dir: str,
-        trace: list[str] | None = None,
     ) -> None:
         """Persist every multimodal artifact produced by one ``generate`` call.
 
@@ -462,8 +441,8 @@ class OmniInferencer:
           processor (:meth:`JanusVqvaeProcessor.postprocess`) so the
           inferencer just calls ``img.save(path)`` — no model-specific
           tensor math here.
-        * ``trace.txt`` — FSM step / transition log (when ``trace`` was
-          collected during this run).
+        * ``trace.txt`` — FSM step / transition log (always written; read
+          from ``ctx['trace']``, which :meth:`_run` populates on every run).
 
         Stale-files behaviour: ``finalize`` does NOT clear existing
         ``generated_image_*.png`` / ``reply.txt`` / ``trace.txt`` from
@@ -497,11 +476,11 @@ class OmniInferencer:
             image.save(out_path)
             logger.info_rank0(f"finalize: image #{idx} → {out_path}")
 
-        if trace is not None:
-            trace_path = os.path.join(output_dir, "trace.txt")
-            with open(trace_path, "w", encoding="utf-8") as f:
-                f.write("\n".join(trace) + "\n")
-            logger.info_rank0(f"finalize: FSM trace ({len(trace)} lines) → {trace_path}")
+        trace = ctx.get("trace") or []
+        trace_path = os.path.join(output_dir, "trace.txt")
+        with open(trace_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(trace) + "\n")
+        logger.info_rank0(f"finalize: FSM trace ({len(trace)} lines) → {trace_path}")
 
         if not reply and not images_out:
             logger.warning_rank0("finalize: FSM produced no reply and no images.")
@@ -509,13 +488,7 @@ class OmniInferencer:
     # ── Internal ──────────────────────────────────────────────────────────────
 
     @torch.inference_mode()
-    def _run(
-        self,
-        req: InferenceRequest,
-        *,
-        trace: list[str] | None = None,
-        progress: bool = False,
-    ) -> dict[str, Any]:
+    def _run(self, req: InferenceRequest) -> dict[str, Any]:
         # Reset per-call buffers held inside modules (VQ token grid, etc.).
         for module in self.modules.values():
             if hasattr(module, "reset_inference_state"):
@@ -527,6 +500,9 @@ class OmniInferencer:
             "conversation_list": conversation,
             "generation_kwargs": req.generation_kwargs,
         }
+        # FSM trace + stdout progress trail are always on (no opt-in flags);
+        # the trace buffer rides back on ``ctx`` for :meth:`finalize`.
+        trace_buf: list[str] = []
         # ``OmniModel.generate`` initialises ``ctx`` from ``context`` (or
         # from ``request`` when ``context`` is None) — we pass the same dict
         # for both so every key is visible to module kwargs.
@@ -534,9 +510,10 @@ class OmniInferencer:
             request=request_dict,
             context=request_dict,
             max_new_tokens=req.max_new_tokens,
-            trace=trace,
-            progress=progress,
+            trace=trace_buf,
+            progress=True,
         )
+        ctx["trace"] = trace_buf
         return ctx
 
 
