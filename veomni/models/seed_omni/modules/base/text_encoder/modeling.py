@@ -58,7 +58,6 @@ from typing import Any, Dict, Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.nn.init as init
 from transformers import PreTrainedModel
 
 from ....module import OmniModule
@@ -100,30 +99,6 @@ class TextEncoder(OmniModule, PreTrainedModel):
             self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=config.lm_head_bias)
 
         self.post_init()
-
-    def _init_weights(self, module: nn.Module) -> None:
-        """HF ``PreTrainedModel`` requires this; mirrors LLaMA's init.
-
-        Must dispatch through ``torch.nn.init.*`` (NOT the in-place
-        ``tensor.normal_`` / ``tensor.zero_`` methods).  Transformers
-        v5's :func:`transformers.initialization.guard_torch_init_functions`
-        monkey-patches ``torch.nn.init`` primitives to no-op on tensors
-        flagged ``_is_hf_initialized = True`` (the loader sets that
-        attribute on every parameter it writes to from a checkpoint).
-        Bypassing the guard — by calling the tensor's own ``.normal_``
-        method — silently overwrites every loaded weight with random
-        noise.  Verified failure mode: ``from_pretrained`` reports zero
-        missing / unexpected keys, ``output_loading_info`` looks clean,
-        but the resulting model produces garbage logits because every
-        param was re-initialised after load.
-        """
-        std = 0.02
-        if isinstance(module, nn.Linear):
-            init.normal_(module.weight, mean=0.0, std=std)
-            if module.bias is not None:
-                init.zeros_(module.bias)
-        elif isinstance(module, nn.Embedding):
-            init.normal_(module.weight, mean=0.0, std=std)
 
     # ── Call-site methods ─────────────────────────────────────────────────────
 

@@ -86,10 +86,6 @@ class JanusLlama(OmniModule, PreTrainedModel):
 
         self.post_init()
 
-    def _init_weights(self, module: nn.Module) -> None:
-        if hasattr(module, "_init_weights"):
-            return
-
     # ── OmniModule interface ───────────────────────────────────────────────────
 
     def pre_forward(

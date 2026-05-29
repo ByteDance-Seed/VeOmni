@@ -106,27 +106,6 @@ class JanusVqvae(OmniModule, PreTrainedModel):
 
         self.post_init()
 
-    def _init_weights(self, module: nn.Module) -> None:
-        """Initialiser for layers added on top of the upstream Janus
-        VQ encoder/decoder modules (which carry their own ``_init_weights``).
-
-        Dispatch through ``torch.nn.init.*`` rather than the tensor's
-        own in-place methods so the
-        :func:`transformers.initialization.guard_torch_init_functions`
-        monkey-patch can skip already-loaded weights — see the matching
-        comment in
-        :meth:`veomni.models.seed_omni.modules.base.text_encoder.modeling.TextEncoder._init_weights`.
-        """
-        if hasattr(module, "_init_weights"):
-            return
-        std = 0.02
-        if isinstance(module, nn.Linear):
-            nn.init.normal_(module.weight, mean=0.0, std=std)
-            if module.bias is not None:
-                nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.Embedding):
-            nn.init.normal_(module.weight, mean=0.0, std=std)
-
     # ── OmniModule interface ───────────────────────────────────────────────────
 
     def pre_forward(self, gen_image_patches: Optional[torch.Tensor] = None, **kwargs) -> Dict[str, Any]:

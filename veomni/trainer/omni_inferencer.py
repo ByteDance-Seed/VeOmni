@@ -371,7 +371,7 @@ class OmniInferencer:
                 weights_path,
                 torch_dtype=torch.bfloat16,
                 device_map="auto",
-                **{k: v for k, v in mod_cfg.items() if not k.startswith("_")},
+                **{k: v for k, v in mod_cfg.items()},
             ).eval()
             modules[name] = module
         return modules

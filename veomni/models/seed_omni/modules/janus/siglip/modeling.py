@@ -68,26 +68,6 @@ class JanusSiglip(OmniModule, PreTrainedModel):
 
         self.post_init()
 
-    def _init_weights(self, module: torch.nn.Module) -> None:
-        """Defer to the inner SigLIP modules' own initialisers.
-
-        Dispatch through ``torch.nn.init.*`` (NOT the tensor in-place
-        ``.normal_`` / ``.zero_`` methods) so the
-        :func:`transformers.initialization.guard_torch_init_functions`
-        monkey-patch can skip already-loaded weights — see the matching
-        comment in
-        :meth:`veomni.models.seed_omni.modules.base.text_encoder.modeling.TextEncoder._init_weights`.
-        """
-        if hasattr(module, "_init_weights"):
-            return
-        std = 0.02
-        if isinstance(module, torch.nn.Linear):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=std)
-            if module.bias is not None:
-                torch.nn.init.zeros_(module.bias)
-        elif isinstance(module, torch.nn.Embedding):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=std)
-
     # ── OmniModule interface ───────────────────────────────────────────────────
 
     def pre_forward(self, pixel_values: Optional[torch.Tensor] = None, **kwargs) -> Dict[str, Any]:
