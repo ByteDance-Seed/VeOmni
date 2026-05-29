@@ -33,7 +33,7 @@ from ..ops.batch_invariant_ops import set_batch_invariant_mode
 from ..utils import helper, logging
 from ..utils.constants import IGNORE_INDEX
 from ..utils.device import synchronize
-from .base import BaseTrainer
+from .base import BaseTrainer, VeOmniIter
 
 
 logger = logging.get_logger(__name__)
@@ -378,11 +378,14 @@ class TextDPOTrainer:
 
             self.on_epoch_begin()
 
-            data_iterator = iter(self.base.train_dataloader)
+            # Create a batch generator
+            self.base.data_iterator = VeOmniIter(
+                self.base.train_dataloader, use_background_prefetcher=args.data.dataloader.use_background_prefetcher
+            )
 
             for _ in range(self.base.start_step, args.train_steps):
                 try:
-                    self.train_step(data_iterator)
+                    self.train_step(self.base.data_iterator)
                 except StopIteration:
                     logger.info(f"epoch:{epoch} Dataloader finished with drop_last {args.data.dataloader.drop_last}")
                     break
@@ -391,8 +394,13 @@ class TextDPOTrainer:
 
             self.base.start_step = 0
             helper.print_device_mem_info(f"VRAM usage after epoch {epoch + 1}")
+            if args.data.dataloader.use_background_prefetcher:
+                self.base.data_iterator.stop()
 
         self.on_train_end()
+
+        if args.data.dataloader.use_background_prefetcher:
+            self.base.data_iterator.stop()
 
         synchronize()
 

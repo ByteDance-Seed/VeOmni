@@ -1055,6 +1055,10 @@ class DataloaderConfig:
         default=True,
         metadata={"help": "Whether to pin memory for dataloader."},
     )
+    use_background_prefetcher: bool = field(
+        default=False,
+        metadata={"help": "Whether to use BackgroundPrefetcher for dataloader."},
+    )
 
 
 @dataclass
