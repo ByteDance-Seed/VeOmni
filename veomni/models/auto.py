@@ -29,7 +29,6 @@ from ..distributed.parallel_state import get_parallel_state
 from ..ops.dispatch import OpSlot
 from ..utils import logging
 from ..utils.device import is_torch_npu_available
-from ..utils.import_utils import is_transformers_version_greater_or_equal_to
 from .loader import BaseModelLoader, get_loader, get_model_config, get_model_processor
 
 
@@ -224,12 +223,6 @@ def build_foundation_model(
         "trust_remote_code": True,
     }
 
-    if attn_implementation == "flash_attention_4" and not is_transformers_version_greater_or_equal_to("5.0.0"):
-        raise RuntimeError(
-            f"attn_implementation '{attn_implementation}' bare name requires Transformers>=5.0.0. "
-            'For Transformers v4, please use attn_implementation="veomni_flash_attention_4_with_sp".'
-        )
-
     if attn_implementation not in (
         "veomni_flash_attention_2_with_sp",
         "veomni_flash_attention_3_with_sp",
@@ -269,11 +262,10 @@ def build_foundation_model(
 
         model.forward = wrapped_forward
 
-    if is_transformers_version_greater_or_equal_to("5.0.0"):
-        assert not getattr(model, "use_kernels", False), (
-            "Still evaluating HF kernels hub integration with VeOmni patches; keep use_kernels disabled for now "
-            "to avoid unexpected kernel loading side effects."
-        )
+    assert not getattr(model, "use_kernels", False), (
+        "Still evaluating HF kernels hub integration with VeOmni patches; keep use_kernels disabled for now "
+        "to avoid unexpected kernel loading side effects."
+    )
 
     model_class_path = f"{model.__class__.__module__}.{model.__class__.__name__}"
     logger.info_rank0(f"Built foundation model class: {model_class_path}")

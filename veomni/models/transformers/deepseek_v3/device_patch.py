@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import torch
-import transformers.models.deepseek_v3.modeling_deepseek_v3 as hf_deepseek_v3
 
 from ....ops.config.registry import BackendSpec, apply_per_model_patches
 
@@ -77,38 +76,19 @@ _TRITON_RMS_NORM_BACKEND = BackendSpec(
 )
 
 
-def apply_veomni_deepseek_v3_device_patch():
-    apply_per_model_patches(
-        hf_module=hf_deepseek_v3,
-        model_name="DeepSeek-V3",
-        targets={
-            "rotary_pos_emb": "apply_rotary_pos_emb",
-            "rms_norm": "DeepseekV3RMSNorm",
-            "swiglu_mlp": "DeepseekV3MLP",
-        },
-        extra_backends={
-            "rotary_pos_emb": {"triton": _TRITON_ROPE_BACKEND},
-            "rms_norm": {"triton": _TRITON_RMS_NORM_BACKEND},
-        },
-    )
-
-
-def apply_veomni_deepseek_v3_v5_device_patch(gen_module):
-    """Backend selection for the v5 patchgen-generated module.
+def apply_veomni_deepseek_v3_device_patch(gen_module):
+    """Backend selection for the patchgen-generated module.
 
     Only ``rotary_pos_emb`` and ``rms_norm`` are patched here. ``swiglu_mlp``
     is intentionally skipped: ``DeepseekV3MoE.__init__`` (in the generated
     module) constructs ``shared_experts = DeepseekV3MLP(config, intermediate_size=...)``
     via the module's global lookup, so swapping ``gen_module.DeepseekV3MLP``
     to ``LigerSwiGLUMLP`` (which rejects the ``intermediate_size`` kwarg)
-    would break instantiation. The v4 monkey-patch path escapes this because
-    its ``modeling_deepseek_v3.py`` captures ``DeepseekV3MLP`` via ``from ...
-    import`` at module scope *before* ``apply_per_model_patches`` runs, so
-    its local reference stays bound to the original class.
+    would break instantiation.
     """
     apply_per_model_patches(
         hf_module=gen_module,
-        model_name="DeepSeek-V3 (v5)",
+        model_name="DeepSeek-V3",
         targets={
             "rotary_pos_emb": "apply_rotary_pos_emb",
             "rms_norm": "DeepseekV3RMSNorm",

@@ -15,9 +15,9 @@
 """
 CI check script for patchgen determinism.
 
-Discovers all patch gen configs, regenerates each one, runs ruff check --fix
-and ruff format on the output, then compares against the checked-in .py and
-.diff files.  Exits 1 if any drift is detected.
+Discovers all patch gen configs (default: VeOmni's own), regenerates each
+one, normalizes the output through the shared ruff pipeline, and compares
+against the checked-in ``.py`` and ``.diff`` files. Exits 1 on any drift.
 
 Usage:
     # Check mode (CI) - exits 1 on drift
@@ -25,64 +25,69 @@ Usage:
 
     # Fix mode - overwrite checked-in files with regenerated output
     python -m veomni.patchgen.check_patchgen --fix
+
+Projects that depend on VeOmni get the same CLI rooted at their own search
+path via :func:`build_cli`, so they can drift-check their own patch configs::
+
+    # <your_project>/patchgen/check_main.py
+    from pathlib import Path
+    from veomni.patchgen.check_patchgen import build_cli
+    from veomni.patchgen.run_codegen import DiscoveryConfig
+
+    main = build_cli(
+        DiscoveryConfig(
+            search_root=Path(__file__).resolve().parent.parent / "models",
+            package_prefix="<your_project>.models",
+            ruff_extra_ignore=("E501",),
+        ),
+        prog_name="<your_project>.patchgen.check",
+    )
 """
+
+from __future__ import annotations
 
 import argparse
 import difflib
-import importlib
-import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from typing import Callable, Optional
 
-from .codegen import ModelingCodeGenerator
+from ._normalize import ruff_fix_and_format
+from .codegen import ModelingCodeGenerator, load_patch_config_module
 from .run_codegen import (
+    VEOMNI_DISCOVERY,
+    DiscoveryConfig,
     build_unified_diff,
     default_diff_path,
     default_output_dir_for_module,
     list_patch_configs,
+    strip_diff_trailing_ws,
 )
 
 
-def _ruff_fix_and_format(path: Path) -> None:
-    """Run ``ruff check --fix`` and ``ruff format`` on *path*.
-
-    We pass ``--ignore E402,B007`` because generated files may have imports
-    after non-import code (e.g. ``create_patch_from_external`` inline
-    import aliases) which is unavoidable, and upstream Transformers
-    sources may contain unused loop variables that trigger ``B007``.
-    In the real repo this is handled by per-file-ignores in
-    pyproject.toml, but temp files live outside the project tree so the
-    config does not apply.
-    """
-    subprocess.run(
-        ["ruff", "check", "--fix", "--quiet", "--ignore", "E402,B007", str(path)],
-        check=True,
-        capture_output=True,
-    )
-    subprocess.run(
-        ["ruff", "format", "--quiet", str(path)],
-        check=True,
-        capture_output=True,
-    )
-
-
-def _strip_trailing_ws(text: str) -> str:
-    """Strip trailing whitespace from every line.
-
-    Unified diffs produced by :func:`difflib.unified_diff` leave trailing
-    spaces on context lines which editors and pre-commit hooks may strip,
-    causing spurious drift.
-    """
-    return "\n".join(line.rstrip() for line in text.splitlines()) + "\n" if text else text
-
-
-def check_config(module_name: str, *, fix: bool = False) -> bool:
+def check_config(
+    module_name: str,
+    *,
+    fix: bool = False,
+    ruff_extra_ignore: tuple[str, ...] = (),
+    ruff_isolated: bool = False,
+    search_roots: Optional[list[Path]] = None,
+) -> bool:
     """Check a single config for drift.
 
     Returns True when the checked-in files are up to date (or were fixed).
+
+    Args:
+        search_roots: optional list of filesystem roots to prepend to the
+            loader's file-walk. Pass ``[discovery.package_root]`` from a
+            caller that drives discovery via ``DiscoveryConfig`` so the
+            loader still resolves the config file when the project isn't
+            installed on ``sys.path``.
     """
-    module = importlib.import_module(module_name)
+    # Use the patchgen-aware loader so parent ``__init__.py`` side effects
+    # (heavy 3rdparty imports) don't gate the drift check.
+    module = load_patch_config_module(module_name, search_roots=search_roots)
     config = module.config
 
     output_dir = default_output_dir_for_module(module)
@@ -99,14 +104,13 @@ def check_config(module_name: str, *, fix: bool = False) -> bool:
         tmp_path = Path(tmp.name)
 
     try:
-        # -- run ruff on temp file to normalize style ---------------------------
-        _ruff_fix_and_format(tmp_path)
-        normalized_py = tmp_path.read_text()
+        ruff_fix_and_format(tmp_path, extra_ignore=ruff_extra_ignore or None, isolated=ruff_isolated)
+        normalized_py = tmp_path.read_text(encoding="utf-8")
     finally:
         tmp_path.unlink(missing_ok=True)
 
     # -- generate diff ----------------------------------------------------------
-    normalized_diff = _strip_trailing_ws(
+    normalized_diff = strip_diff_trailing_ws(
         build_unified_diff(
             original_source=generator.source_code,
             generated_source=normalized_py,
@@ -118,15 +122,11 @@ def check_config(module_name: str, *, fix: bool = False) -> bool:
     # -- compare ----------------------------------------------------------------
     ok = True
 
-    if checked_in_py.exists():
-        existing_py = checked_in_py.read_text()
-    else:
-        existing_py = ""
-
+    existing_py = checked_in_py.read_text(encoding="utf-8") if checked_in_py.exists() else ""
     if existing_py != normalized_py:
         if fix:
             checked_in_py.parent.mkdir(parents=True, exist_ok=True)
-            checked_in_py.write_text(normalized_py)
+            checked_in_py.write_text(normalized_py, encoding="utf-8")
             print(f"  FIXED {checked_in_py}")
         else:
             ok = False
@@ -140,15 +140,13 @@ def check_config(module_name: str, *, fix: bool = False) -> bool:
             print(f"  DRIFT {checked_in_py}")
             sys.stdout.writelines(diff)
 
-    if checked_in_diff.exists():
-        existing_diff = _strip_trailing_ws(checked_in_diff.read_text())
-    else:
-        existing_diff = ""
-
+    existing_diff = (
+        strip_diff_trailing_ws(checked_in_diff.read_text(encoding="utf-8")) if checked_in_diff.exists() else ""
+    )
     if existing_diff != normalized_diff:
         if fix:
             checked_in_diff.parent.mkdir(parents=True, exist_ok=True)
-            checked_in_diff.write_text(normalized_diff)
+            checked_in_diff.write_text(normalized_diff, encoding="utf-8")
             print(f"  FIXED {checked_in_diff}")
         else:
             ok = False
@@ -167,16 +165,20 @@ def check_config(module_name: str, *, fix: bool = False) -> bool:
     return ok
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description="Check patchgen generated files for drift")
-    parser.add_argument(
-        "--fix",
-        action="store_true",
-        help="Overwrite checked-in files with regenerated output",
-    )
-    args = parser.parse_args()
+def run_check(
+    discovery: DiscoveryConfig = VEOMNI_DISCOVERY,
+    *,
+    fix: bool = False,
+    configs: Optional[list[str]] = None,
+) -> int:
+    """Run a drift check across ``configs`` (or auto-discover via ``discovery``).
 
-    configs = list_patch_configs()
+    Returns a process exit code (0 = clean / fixed, 1 = drift in check mode,
+    0 if no configs found at all).
+    """
+    if configs is None:
+        configs = list_patch_configs(discovery)
+
     if not configs:
         print("No patch configs found.")
         return 0
@@ -185,7 +187,13 @@ def main() -> int:
     all_ok = True
     for cfg in configs:
         print(f"[{cfg}]")
-        ok = check_config(cfg, fix=args.fix)
+        ok = check_config(
+            cfg,
+            fix=fix,
+            ruff_extra_ignore=discovery.ruff_extra_ignore,
+            ruff_isolated=discovery.ruff_isolated,
+            search_roots=[discovery.package_root],
+        )
         if not ok:
             all_ok = False
 
@@ -193,9 +201,46 @@ def main() -> int:
     if all_ok:
         print("All generated files are up to date.")
         return 0
-    else:
-        print("Generated files are out of date. Run: python -m veomni.patchgen.check_patchgen --fix")
-        return 1
+    print("Generated files are out of date. Re-run with --fix.")
+    return 1
+
+
+def _build_parser(prog_name: Optional[str] = None) -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog=prog_name,
+        description="Check patchgen generated files for drift",
+    )
+    parser.add_argument(
+        "--fix",
+        action="store_true",
+        help="Overwrite checked-in files with regenerated output",
+    )
+    return parser
+
+
+def build_cli(
+    discovery: DiscoveryConfig,
+    prog_name: Optional[str] = None,
+) -> Callable[[Optional[list[str]]], int]:
+    """Return a ``main()``-shaped callable that runs a drift check rooted at
+    ``discovery``.
+
+    Downstream projects mount their own ``python -m <pkg>.patchgen.check``
+    CLI without copy-pasting argparse.
+    """
+    parser = _build_parser(prog_name=prog_name)
+
+    def _main(argv: Optional[list[str]] = None) -> int:
+        args = parser.parse_args(argv)
+        return run_check(discovery, fix=args.fix)
+
+    return _main
+
+
+def main() -> int:
+    parser = _build_parser()
+    args = parser.parse_args()
+    return run_check(VEOMNI_DISCOVERY, fix=args.fix)
 
 
 if __name__ == "__main__":

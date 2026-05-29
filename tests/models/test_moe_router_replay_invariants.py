@@ -229,9 +229,9 @@ def _build_patched_qwen3_moe_block(config, device=_DEVICE, dtype=torch.bfloat16)
 def _build_vanilla_qwen3_moe_block(config, device=_DEVICE, dtype=torch.bfloat16):
     """Build vanilla HF ``Qwen3MoeSparseMoeBlock`` for use as the Test B oracle.
 
-    For transformers v5+, VeOmni's qwen3_moe registration does not mutate
-    the HF module (the always-on monkey-patch only fires on
-    transformers <5.0), so this import returns the pristine HF class.
+    VeOmni's qwen3_moe registration does not mutate the HF module — patches
+    live in the patchgen-generated path under ``generated/`` — so importing
+    from ``transformers.models.qwen3_moe`` returns the pristine HF class.
     """
     from transformers.models.qwen3_moe.modeling_qwen3_moe import (
         Qwen3MoeSparseMoeBlock as VanillaQwen3MoeSparseMoeBlock,
@@ -253,8 +253,8 @@ def _build_patched_qwen3_5_moe_block(config, device=_DEVICE, dtype=torch.bfloat1
 
 
 def _build_vanilla_qwen3_5_moe_block(config, device=_DEVICE, dtype=torch.bfloat16):
-    """qwen3_5_moe never has any HF-side monkey-patch in VeOmni — vanilla HF
-    import is always pristine, no unpatch dance required."""
+    """qwen3_5_moe ships only the patchgen-generated path in VeOmni — vanilla
+    HF import is always pristine, no unpatch dance required."""
     from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
         Qwen3_5MoeSparseMoeBlock as VanillaQwen3_5MoeSparseMoeBlock,
     )

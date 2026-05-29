@@ -11,6 +11,7 @@ on:
       - v0.*
     paths:
       - "**/*.py"
+      - "!scripts/**/*.py"
       - .github/workflows/gpu_e2e_test.yml
       - "pyproject.toml"
       - "uv.lock"
@@ -19,6 +20,7 @@ on:
       - main
     paths:
       - "**/*.py"
+      - "!scripts/**/*.py"
       - .github/workflows/gpu_e2e_test.yml
       - "pyproject.toml"
       - "uv.lock"
@@ -33,7 +35,7 @@ permissions:
   contents: read
 
 env:
-  IMAGE: "verl-ci-cn-beijing.cr.volces.com/veomni/open_veomni-gpu:pytorch_25_03_py3_cuda12_9"
+  IMAGE: "verl-ci-cn-beijing.cr.volces.com/veomni/open_veomni-gpu:pytorch_25_06_py3_cuda12_9.post2"
   NCCL_DEBUG: "WARN"
   # uv's default 30s timeout is too short for the ~617 MiB
   # nvidia-cudnn-cu12 wheel on the CN runners; bump to 5 min so a
@@ -53,22 +55,15 @@ jobs:
   lint:
     uses: ./.github/workflows/check_pr_lint.yml
 
-  # The v4 (transformers 4.57.3) job has been retired — v5 is now the
-  # default install and v4 is sunset (see pyproject.toml comments). The
-  # diffusers e2e step (test_wan_dit_parallel_align) has been moved
-  # into the v5 job below; it ran under v4 historically because the
-  # diffusers extra wasn't yet validated against v5.
-
   gpu_e2e_tests_v5:
     if: github.repository_owner == 'ByteDance-Seed'
     needs: lint
     # Self-hosted L20-8 fleet managed by github_runner/ (ansible).
     runs-on: [self-hosted, l20-8]
-    # Bumped to 120m to fit the diffusers e2e step merged from the former
-    # v4 job.
+    # 120m budget fits the e2e suite plus the diffusers e2e step.
     timeout-minutes: 120
     container:
-      image: verl-ci-cn-beijing.cr.volces.com/veomni/open_veomni-gpu:pytorch_25_03_py3_cuda12_9
+      image: verl-ci-cn-beijing.cr.volces.com/veomni/open_veomni-gpu:pytorch_25_06_py3_cuda12_9.post2
       volumes:
         - /mnt/veomni_ci:/mnt/veomni_ci:ro
       options: >-

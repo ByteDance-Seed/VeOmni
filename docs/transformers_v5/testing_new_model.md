@@ -1,19 +1,26 @@
-# Testing a New Model for Transformers v5
+# Testing a New Model
 
-When adding a new model with `transformers>=5.0.0` support, two test suites need updating:
+When adding a new model under `veomni/models/transformers/<model>/`, two test
+suites need updating:
 
-1. **`tests/models/test_models_patch.py`** — single-GPU forward/backward correctness across attention and MoE backends
-2. **`tests/e2e/test_e2e_parallel.py`** — multi-GPU e2e training with FSDP2, sequence parallelism (SP), and expert parallelism (EP)
+1. **`tests/models/test_models_patch.py`** — single-GPU forward/backward
+   correctness across attention and MoE backends.
+2. **`tests/e2e/test_e2e_parallel.py`** — multi-GPU e2e training with FSDP2,
+   sequence parallelism (SP), and expert parallelism (EP).
 
-Both files gate v5-only cases so they are skipped on v4 environments.
+For VLM models, there is also a lightweight trainer-level smoke test for
+`freeze_vit`:
 
-For VLM models, there is also a lightweight trainer-level smoke test for `freeze_vit`:
+3. **`tests/models/test_vlm_trainer.py`** — builds a real toy VLM model on
+   CPU and checks that vision parameters stay trainable when `freeze_vit=False`
+   and are frozen when `freeze_vit=True`.
 
-3. **`tests/models/test_vlm_trainer.py`** — builds a real toy VLM model on CPU and checks that vision parameters stay trainable when `freeze_vit=False` and are frozen when `freeze_vit=True`
+For VLM / Omni models, an additional multi-GPU test covers the FSDP2
+asymmetric-forward path:
 
-For VLM / Omni models, an additional multi-GPU test covers the FSDP2 asymmetric-forward path:
-
-4. **`tests/distributed/test_dummy_forward.py`** — verifies rank-asymmetric multimodal batches (rank 0 has images/video/audio, others text-only) do not hang NCCL under FSDP2, exercising the model's `dummy_forward()` hook.
+4. **`tests/distributed/test_dummy_forward.py`** — verifies rank-asymmetric
+   multimodal batches (rank 0 has images/video/audio, others text-only) do
+   not hang NCCL under FSDP2, exercising the model's `dummy_forward()` hook.
 
 ## 1. `tests/models/test_models_patch.py`
 
@@ -22,42 +29,36 @@ For VLM / Omni models, an additional multi-GPU test covers the FSDP2 asymmetric-
 Runs one forward + backward step on dummy data for every combination of:
 
 - HF attention backends (`eager`, `flash_attention_2`, `flash_attention_3`)
-- VeOmni attention backends (`veomni_flash_attention_2_with_sp`, `veomni_flash_attention_3_with_sp`)
+- VeOmni attention backends (`veomni_flash_attention_2_with_sp`,
+  `veomni_flash_attention_3_with_sp`)
 - MoE backends (for MoE models: `eager`, `fused`)
 
-Then asserts that loss and grad norm match across all combinations within `(rtol, atol)`.
+Then asserts that loss and grad norm match across all combinations within
+`(rtol, atol)`.
 
 ### How to add a case
 
-Add an entry to `_TEST_CASES_TRANSFORMERS_V5`:
+Append a `pytest.param(...)` to the test-cases list:
 
 ```python
-_TEST_CASES_TRANSFORMERS_V5 = [
-    pytest.param(
-        "./tests/toy_config/qwen3_5_toy/config.json",
-        False,  # is_moe
-        _DEFAULT_RTOL,
-        _DEFAULT_ATOL,
-        id="qwen3_5",
-    ),
-    # ← add your new model here
-    pytest.param(
-        "./tests/toy_config/<new_model>_toy/config.json",
-        False,  # is_moe — set True for MoE models
-        _DEFAULT_RTOL,
-        _DEFAULT_ATOL,
-        id="<new_model>",
-    ),
-]
+pytest.param(
+    "./tests/toy_config/<new_model>_toy/config.json",
+    False,  # is_moe — set True for MoE models
+    _DEFAULT_RTOL,
+    _DEFAULT_ATOL,
+    id="<new_model>",
+),
 ```
 
 The `id=` string is used as a key for:
 - Test node naming (`pytest -k <id>`)
-- Looking up custom weight sync functions in `weight_sync_adapters.py` (only needed if the model has non-standard state dict keys)
+- Looking up custom weight sync functions in `weight_sync_adapters.py` (only
+  needed if the model has non-standard state dict keys)
 
 ### Filtering unsupported modes
 
-If the model doesn't support certain attention backends yet, add a filter block in `test_models_patch_fwd_bwd` keyed on `case_id`:
+If the model doesn't support certain attention backends yet, add a filter
+block in `test_models_patch_fwd_bwd` keyed on `case_id`:
 
 ```python
 if case_id == "<new_model>":
@@ -69,7 +70,8 @@ if case_id == "<new_model>":
 
 ### Toy config
 
-Create a minimal config under `tests/toy_config/<new_model>_toy/config.json` with few layers. Add a README.md under the same folder to indicate:
+Create a minimal config under `tests/toy_config/<new_model>_toy/config.json`
+with few layers. Add a `README.md` under the same folder to indicate:
 
 1. Where the original config is from
 2. What changes are made from the original config
@@ -78,32 +80,30 @@ Create a minimal config under `tests/toy_config/<new_model>_toy/config.json` wit
 
 ### What it tests
 
-Launches full `torchrun` training runs (2 epochs, 2 steps) across parallel configurations (fsdp2 always enabled):
+Launches full `torchrun` training runs (2 epochs, 2 steps) across parallel
+configurations (FSDP2 always enabled):
 
 | Parameter | Values |
 |-----------|--------|
 | `sp_size` | 1, 2 |
 | `ep_size` | 1 (base models), 1×2 (MoE models) |
 
-Each run produces a `log_dict.json`. The test asserts that loss and grad norm match across all SP/EP configurations within `(rtol, atol)`.
+Each run produces a `log_dict.json`. The test asserts that loss and grad norm
+match across all SP/EP configurations within `(rtol, atol)`.
 
 ### How to add a case
 
-Add an entry to `text_test_cases` (for text-only models) with `marks=_v5_only`:
+Add an entry to `text_test_cases` (for text-only models):
 
 ```python
-text_test_cases = [
-    # ... existing v4 cases ...
-    pytest.param(
-        "<new_model>",
-        "./tests/toy_config/<new_model>_toy/config.json",
-        False,  # is_moe
-        _DEFAULT_RTOL,
-        _DEFAULT_ATOL,
-        None,  # max_sp_size
-        marks=_v5_only,
-    ),
-]
+pytest.param(
+    "<new_model>",
+    "./tests/toy_config/<new_model>_toy/config.json",
+    False,  # is_moe
+    _DEFAULT_RTOL,
+    _DEFAULT_ATOL,
+    None,  # max_sp_size
+),
 ```
 
 ### Parametrize fields
@@ -124,7 +124,8 @@ The `text_test_cases` parametrize string is:
 
 ### Limiting sequence parallelism
 
-If the model does not support SP yet, set `max_sp_size=1` to only run with `sp_size=1`:
+If the model does not support SP yet, set `max_sp_size=1` to only run with
+`sp_size=1`:
 
 ```python
 pytest.param(
@@ -134,37 +135,35 @@ pytest.param(
     _DEFAULT_RTOL,
     _DEFAULT_ATOL,
     1,  # max_sp_size — remove once SP is supported
-    marks=_v5_only,
 ),
 ```
 
 ### VLM / multimodal models
 
-For vision-language or multimodal models, add to the appropriate test case list (`qwen2vl_test_cases`, `qwen3vl_test_cases`, etc.) and pair with the matching fixture and test function. The same `max_sp_size` field is available.
+For vision-language or multimodal models, add to the appropriate test case
+list (`qwen2vl_test_cases`, `qwen3vl_test_cases`, etc.) and pair with the
+matching fixture and test function. The same `max_sp_size` field is available.
 
 ## 3. `tests/models/test_vlm_trainer.py`
 
 ### What it tests
 
-Builds a real toy VLM model and calls `VLMTrainer._freeze_model_module()` directly. The test only checks one behavior:
+Builds a real toy VLM model and calls `VLMTrainer._freeze_model_module()`
+directly. The test only checks one behavior:
 
 - `freeze_vit=False` -> the vision tower parameters remain trainable
 - `freeze_vit=True` -> the vision tower parameters are frozen
 
-This is intentionally simpler than an e2e training test. It is meant to catch model wrapper path changes such as `model.visual` vs `model.model.visual`.
+This is intentionally simpler than an e2e training test. It is meant to
+catch model wrapper path changes such as `model.visual` vs `model.model.visual`.
 
 ### How to add a case
 
-Add your toy config to the matching case list:
+Add your toy config to the freeze-ViT VLM cases list:
 
 ```python
-_FREEZE_VIT_VLM_CASES_TRANSFORMERS_V5 = [
-    pytest.param("./tests/toy_config/qwen3_5_toy/config.json", id="qwen3_5"),
-    pytest.param("./tests/toy_config/<new_vlm_model>_toy/config.json", id="<new_vlm_model>"),
-]
+pytest.param("./tests/toy_config/<new_vlm_model>_toy/config.json", id="<new_vlm_model>"),
 ```
-
-For transformers v4 VLMs, add to `_FREEZE_VIT_VLM_CASES_TRANSFORMERS_V4` instead.
 
 ## 4. `tests/distributed/test_dummy_forward.py` (VLM / Omni only)
 
@@ -176,44 +175,40 @@ Both ranks must complete forward + backward without an NCCL timeout, which
 proves that the model's `dummy_forward()` hook (or equivalent) fires on
 text-only ranks so every rank participates in FSDP collectives.
 
-Any v5 migration that overrides `<M>VisionTransformerPretrainedModel.dummy_forward`
-(or similar) must add a v5 case here — this suite is the only coverage for
-that override on multi-GPU.
+Any model whose patchgen-generated modeling overrides
+`<M>VisionTransformerPretrainedModel.dummy_forward` (or similar) must add a
+case here — this suite is the only coverage for that override on multi-GPU.
 
 ### How to add a case
 
-Append a sibling entry to `_vlm_cases` (VLM) or `_omni_cases` (Omni) marked
-`_v5_only`, using a distinct `id` so pytest `-k` can disambiguate v4 vs v5:
+Append an entry to `_vlm_cases` (VLM) or `_omni_cases` (Omni):
 
 ```python
-_vlm_cases = [
-    # ... existing v4 cases ...
-    pytest.param(
-        "<new_vlm_model>",
-        "./tests/toy_config/<new_vlm_model>_toy",
-        partial(_vlm_batch, patch_size=<P>),
-        id="<new_vlm_model>_v5",
-        marks=_v5_only,
-    ),
-]
+pytest.param(
+    "<new_vlm_model>",
+    "./tests/toy_config/<new_vlm_model>_toy",
+    partial(_vlm_batch, patch_size=<P>),
+    id="<new_vlm_model>",
+),
 ```
 
-`patch_size` must match the model's vision patch size (e.g. 14 for Qwen2.5-VL,
-16 for Qwen3-VL). Run with `pytest tests/distributed/test_dummy_forward.py -k <new_vlm_model>_v5`
-on a 2-GPU host.
+`patch_size` must match the model's vision patch size (e.g. 14 for
+Qwen2.5-VL, 16 for Qwen3-VL). Run with
+`pytest tests/distributed/test_dummy_forward.py -k <new_vlm_model>` on a
+2-GPU host.
 
 ## Checklist
 
-When adding a new v5 model, verify:
+When adding a new model, verify:
 
 - [ ] Toy config created under `tests/toy_config/<model>_toy/`
-- [ ] Entry added to `_TEST_CASES_TRANSFORMERS_V5` in `test_models_patch.py`
+- [ ] Entry added to the test-cases list in `test_models_patch.py`
 - [ ] Unsupported attention/MoE modes filtered in `test_models_patch_fwd_bwd` if needed
-- [ ] Entry added to `text_test_cases` (or VLM equivalent) in `test_e2e_parallel.py` with `marks=_v5_only`
-- [ ] For VLM models, toy config added to `_FREEZE_VIT_VLM_CASES_TRANSFORMERS_V5` in `tests/models/test_vlm_trainer.py`
+- [ ] Entry added to `text_test_cases` (or VLM equivalent) in `test_e2e_parallel.py`
+- [ ] For VLM models, toy config added to the freeze-ViT VLM cases list in `tests/models/test_vlm_trainer.py`
 - [ ] `max_sp_size` set appropriately (use `1` if SP not supported, `None` otherwise)
 - [ ] `pytest --collect-only -k <model>` shows expected test cases
 - [ ] Tests pass: `pytest tests/models/test_models_patch.py -k <model>` and `pytest tests/e2e/test_e2e_parallel.py -k <model>`
 - [ ] For VLM models, `pytest tests/models/test_vlm_trainer.py -k <model>` passes
-- [ ] For VLM / Omni models, a `_v5_only` sibling added to `_vlm_cases` / `_omni_cases` in `tests/distributed/test_dummy_forward.py` (required on any model that overrides `dummy_forward`)
-- [ ] `pytest tests/distributed/test_dummy_forward.py -k <model>_v5` passes on 2 GPUs
+- [ ] For VLM / Omni models, an entry added to `_vlm_cases` / `_omni_cases` in `tests/distributed/test_dummy_forward.py` (required on any model that overrides `dummy_forward`)
+- [ ] `pytest tests/distributed/test_dummy_forward.py -k <model>` passes on 2 GPUs

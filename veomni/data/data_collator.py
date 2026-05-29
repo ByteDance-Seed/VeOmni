@@ -15,7 +15,7 @@
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from dataclasses import asdict, dataclass, field
-from typing import Any, Dict, List, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -27,6 +27,15 @@ from ..distributed.sequence_parallel import gather_outputs
 from ..utils import logging
 from ..utils.constants import IGNORE_INDEX, MODALITY
 from ..utils.seqlen_pos_transform_utils import prepare_fa_kwargs_from_position_ids, valid_seqlens_from_cu_seqlens
+
+
+# A model-provided hook that derives ``multimodal_metadata`` from a packed +
+# SP-padded batch. It mirrors ``get_position_id_func``: a picklable callable
+# (``partial`` over a module-level patchgen helper closed over config constants,
+# never an ``nn.Module``) so it survives shipping to DataLoader workers.
+# Signature: ``fn(batch: dict, sp_pad: dict[str, int]) -> None`` — mutates
+# ``batch`` in place, writing ``batch["multimodal_metadata"]``.
+MetadataCollateFunc = Callable[[Dict[str, Any], Dict[str, int]], None]
 
 
 logger = logging.get_logger(__name__)
@@ -183,6 +192,9 @@ class PackingCollator(DataCollator):
     seq_classification: bool = (
         False  # whether the training task is sequence classification, if true, do not mask boundary labels
     )
+    # Model-provided hook (see ``MetadataCollateFunc``). ``None`` for text
+    # models / pipelines without multimodal metadata — then this is a no-op.
+    metadata_collate_func: Optional[MetadataCollateFunc] = None
 
     def __post_init__(self):
         self.sp_enabled = get_parallel_state().sp_enabled
@@ -256,6 +268,13 @@ class PackingCollator(DataCollator):
 
         if not self.sp_enabled:
             add_flash_attention_kwargs_from_position_ids(batch)
+            # No SP downstream → no sp-pad. Hand the packed batch to the
+            # model-provided hook (if any), which derives ``multimodal_metadata``
+            # from the packed ``*_grid_thw`` tensors using its own config. When
+            # SP is enabled this is deferred to ``SequenceParallelCollator`` so
+            # the hook sees the SP-padded batch + per-modality pad counts.
+            if self.metadata_collate_func is not None:
+                self.metadata_collate_func(batch, {"pixel_values": 0, "pixel_values_videos": 0})
         return batch
 
 
@@ -265,6 +284,9 @@ class SequenceParallelCollator(DataCollator):
     seq_classification: bool = (
         False  # whether the training task is sequence classification, if true, do not shift labels
     )
+    # Model-provided hook (see ``MetadataCollateFunc``). ``None`` for text
+    # models / pipelines without multimodal metadata — then this is a no-op.
+    metadata_collate_func: Optional[MetadataCollateFunc] = None
 
     def __post_init__(self):
         self.sp_size = get_parallel_state().sp_size
@@ -318,6 +340,12 @@ class SequenceParallelCollator(DataCollator):
             labels = F.pad(labels, (0, 1), "constant", IGNORE_INDEX)
             batch["labels"] = labels
 
+        # Track sp_pad sizes for pixel_values{,_videos} so the ViT metadata
+        # ``cu_seqlens`` can be extended with the sp-pad tail entry (mirrors
+        # how the text-side cu_seq_lens picks up sp-pad via the position_ids==0
+        # convention in ``add_flash_attention_kwargs_from_position_ids``).
+        vit_sp_pad: Dict[str, int] = {"pixel_values": 0, "pixel_values_videos": 0}
+
         for key in batch.keys():
             collate_info: DataCollateInfo = self.collate_infos.get(key, None)
             if collate_info is None:
@@ -328,6 +356,7 @@ class SequenceParallelCollator(DataCollator):
             sp_pad_scale = collate_info.sp_pad_scale
             if sp_pad_value is not None:
                 # sp padding
+                pre_pad_len = len(batch[key]) if isinstance(batch[key], list) else batch[key].size(pack_dim)
                 batch[key] = self.sp_padding(
                     key,
                     batch[key],
@@ -335,6 +364,9 @@ class SequenceParallelCollator(DataCollator):
                     pad_value=sp_pad_value,
                     pad_scale=sp_pad_scale,
                 )
+                post_pad_len = len(batch[key]) if isinstance(batch[key], list) else batch[key].size(pack_dim)
+                if key in vit_sp_pad:
+                    vit_sp_pad[key] = post_pad_len - pre_pad_len
 
             if sp_slice and key != "position_ids":  # position_ids should be sp sliced after precompute fa kwargs
                 # sp slice
@@ -346,6 +378,13 @@ class SequenceParallelCollator(DataCollator):
             "position_ids", batch["position_ids"], dim=self.collate_infos["position_ids"].pack_dim
         )
 
+        # Hand the SP-padded batch + per-modality sp-pad patch counts to the
+        # model-provided hook, which derives ``multimodal_metadata`` (cu_seqlens,
+        # window cu_seqlens, …) using its own config — including the sp-pad tail.
+        # No-op for text models / third-party pipelines without a hook.
+        if self.metadata_collate_func is not None:
+            self.metadata_collate_func(batch, vit_sp_pad)
+
         return batch
 
 
@@ -354,6 +393,7 @@ class MainCollator(DataCollator):
     data_collate_info: Dict[str, Union[DataCollateInfo, tuple, Dict]] = field(default_factory=lambda: {})
     pad_to_length: bool = False
     seq_classification: bool = False
+    metadata_collate_func: Optional[MetadataCollateFunc] = None
 
     """
     Data collator pipeline with a unified collate info.
@@ -365,6 +405,10 @@ class MainCollator(DataCollator):
             Whether to pad sequence to a fixed length. Default is False.
         seq_classification:
             If True, sequence classification task. Default is False.
+        metadata_collate_func:
+            Optional model-provided hook (``model.get_metadata_collate_func()``)
+            that derives ``multimodal_metadata`` from the packed + SP-padded
+            batch. ``None`` for text models. See ``MetadataCollateFunc``.
     """
 
     def __post_init__(self):
@@ -396,11 +440,16 @@ class MainCollator(DataCollator):
                 collate_infos=self.collate_infos,
                 pad_to_length=self.pad_to_length,
                 seq_classification=self.seq_classification,
+                metadata_collate_func=self.metadata_collate_func,
             )
         )
         if get_parallel_state().sp_enabled:
             self.preforward_pipeline.append(
-                SequenceParallelCollator(collate_infos=self.collate_infos, seq_classification=self.seq_classification)
+                SequenceParallelCollator(
+                    collate_infos=self.collate_infos,
+                    seq_classification=self.seq_classification,
+                    metadata_collate_func=self.metadata_collate_func,
+                )
             )
         logger.info_rank0(self.log_collate_infos())
 

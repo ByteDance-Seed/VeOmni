@@ -16,17 +16,16 @@ from ..tools.training_utils import make_eager_ops_config
 from .utils import prepare_exec_cmd
 
 
-# transformers v5 only — the v4 CI lane was retired together with the
-# broader transformers v4 wind-down. v4-only models that have not yet
-# been migrated to patchgen (currently llama3.1 and qwen2_5_omni) are
-# commented out in their respective case lists with a TODO; uncomment
-# once the corresponding model gains a v5 patchgen path.
+# Models without a patchgen path are commented out in their respective case
+# lists with a TODO; uncomment once the corresponding model gains a v5
+# patchgen path.
 _dit_only = pytest.mark.skipif(not is_diffusers_available(), reason="Requires diffusers")
 # Qwen3.5 GatedDeltaNet has no NPU kernel today; eager-only path also requires
 # non-varlen training (dyn_bsz=False), but the e2e command uses dyn_bsz=True.
 _qwen3_5_npu_skip = pytest.mark.skipif(
     IS_NPU_AVAILABLE, reason="Qwen3.5 GatedDeltaNet has no NPU backend (varlen path)"
 )
+_qwen_image_npu_skip = pytest.mark.skipif(IS_NPU_AVAILABLE, reason="Qwen-Image training is GPU-only for now")
 
 
 def _materialize_weights_dir(config_path: str, output_path: str, save_original_format: bool = True) -> Path:
@@ -108,16 +107,14 @@ _DEFAULT_RTOL = 1e-1
 _DEFAULT_ATOL = 1e-1
 
 text_test_cases = [
-    # TODO(transformers v5 migration): re-enable llama3.1 once it is
-    # ported to the patchgen pipeline (currently v4-only).
-    # pytest.param(
-    #     "llama3.1",
-    #     "./tests/toy_config/llama31_toy",
-    #     False,  # is_moe
-    #     _DEFAULT_RTOL,
-    #     _DEFAULT_ATOL,
-    #     None,  # max_sp_size
-    # ),
+    pytest.param(
+        "llama3.1",
+        "./tests/toy_config/llama31_toy",
+        False,  # is_moe
+        _DEFAULT_RTOL,
+        _DEFAULT_ATOL,
+        None,  # max_sp_size
+    ),
     pytest.param(
         "qwen2",
         "./tests/toy_config/qwen2_toy/config.json",
@@ -206,18 +203,14 @@ qwen3vl_test_cases = [
     ),
 ]
 
-# TODO(transformers v5 migration): re-enable qwen2_5_omni once it is
-# ported to the patchgen pipeline (currently v4-only). The
-# ``test_qwen2omni_parallel_align`` test below collects 0 items until
-# this list has at least one entry.
 qwen2omni_test_cases = [
-    # pytest.param(
-    #     "qwen25_omni",
-    #     "./tests/toy_config/qwen25omni_toy",
-    #     False,
-    #     _DEFAULT_RTOL,
-    #     _DEFAULT_ATOL,
-    # ),
+    pytest.param(
+        "qwen2_5_omni",
+        "./tests/toy_config/qwen25omni_toy",
+        False,
+        _DEFAULT_RTOL,
+        _DEFAULT_ATOL,
+    ),
 ]
 
 qwen3omni_test_cases = [
@@ -238,6 +231,18 @@ wan_dit_test_cases = [
         _DEFAULT_RTOL,
         _DEFAULT_ATOL,
         marks=_dit_only,
+    ),
+]
+
+qwen_image_dit_test_cases = [
+    pytest.param(
+        "qwen_image",
+        "./tests/toy_config/qwen_image_toy/config.json",
+        False,
+        _DEFAULT_RTOL,
+        _DEFAULT_ATOL,
+        1,  # Ulysses SP for Qwen-Image needs a model-specific joint-attention patch.
+        marks=[_dit_only, _qwen_image_npu_skip],
     ),
 ]
 
@@ -285,6 +290,14 @@ def dummy_qwen3omni_dataset():
 @pytest.fixture(scope="session")
 def dummy_wan_t2v_dataset():
     dummy_dataset = DummyDataset(seq_len=2048, dataset_type="wan_t2v")
+    train_path = dummy_dataset.save_path
+    yield train_path
+    del dummy_dataset
+
+
+@pytest.fixture(scope="session")
+def dummy_qwen_image_dataset():
+    dummy_dataset = DummyDataset(seq_len=2048, dataset_type="qwen_image")
     train_path = dummy_dataset.save_path
     yield train_path
     del dummy_dataset
@@ -394,4 +407,27 @@ def test_wan_dit_parallel_align(
         rtol=rtol,
         atol=atol,
         train_path=dummy_wan_t2v_dataset,
+    )
+
+
+@pytest.mark.parametrize("model_name, config_path, is_moe, rtol, atol, max_sp_size", qwen_image_dit_test_cases)
+def test_qwen_image_dit_parallel_align(
+    model_name: str,
+    config_path: str,
+    is_moe: bool,
+    rtol: float,
+    atol: float,
+    max_sp_size: int,
+    dummy_qwen_image_dataset,
+):
+    """Validate Qwen-Image toy training under FSDP2 without Ulysses SP."""
+    main(
+        task_name="train_dit_test",
+        model_name=model_name,
+        config_path=config_path,
+        is_moe=is_moe,
+        rtol=rtol,
+        atol=atol,
+        train_path=dummy_qwen_image_dataset,
+        max_sp_size=max_sp_size,
     )

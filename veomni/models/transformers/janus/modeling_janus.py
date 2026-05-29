@@ -55,7 +55,6 @@ from timm.layers import (
 )
 from timm.models._manipulate import checkpoint_seq, named_apply
 from torch.nn import CrossEntropyLoss
-from transformers import PreTrainedModel
 from transformers.modeling_outputs import ModelOutput
 
 from ....distributed.parallel_state import get_parallel_state
@@ -64,7 +63,7 @@ from ....distributed.sequence_parallel import (
     reduce_sequence_parallel_loss,
     slice_input_tensor,
 )
-from ..llama.modeling_llama import LlamaForCausalLM
+from ..llama.generated.patched_modeling_llama_gpu import LlamaForCausalLM, PreTrainedModel
 from .configuration_janus import JanusConfig, JanusGenVisionConfig, JanusVisionConfig
 
 

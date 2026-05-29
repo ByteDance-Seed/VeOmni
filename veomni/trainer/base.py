@@ -513,11 +513,22 @@ class BaseTrainer(Stateful, ABC):
         self.moe_monitor_callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
 
     def preforward(self, micro_batch: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """Preprocess micro batches before forward pass."""
-        micro_batch = {
-            k: v.to(self.device, non_blocking=True) if isinstance(v, torch.Tensor) else v
-            for k, v in micro_batch.items()
-        }
+        """Preprocess micro batches before forward pass.
+
+        Tensors are moved to ``self.device`` non-blockingly. Nested dicts
+        (e.g. ``multimodal_metadata`` emitted by ``PackingCollator``) are
+        recursed so inner tensor values land on the device too; Python ints
+        / lists / etc. pass through unchanged.
+        """
+
+        def _to_device(v: Any) -> Any:
+            if isinstance(v, torch.Tensor):
+                return v.to(self.device, non_blocking=True)
+            if isinstance(v, dict):
+                return {k: _to_device(vv) for k, vv in v.items()}
+            return v
+
+        micro_batch = {k: _to_device(v) for k, v in micro_batch.items()}
         if getattr(self, "LOG_SAMPLE", True):
             helper.print_example(example=micro_batch, rank=self.args.train.local_rank)
             self.LOG_SAMPLE = False
@@ -565,6 +576,18 @@ class BaseTrainer(Stateful, ABC):
             elif micro_step == num_micro_steps - 1:
                 self.model.set_reshard_after_backward(True)
 
+    def _configure_hsdp_allreduce(self, micro_step: int, num_micro_steps: int):
+        args: VeOmniArguments = self.args
+        if (
+            args.train.accelerator.fsdp_config.fsdp_mode == "fsdp2"
+            and args.train.accelerator.dp_replicate_size > 1
+            and num_micro_steps > 1
+        ):
+            if micro_step == 0:
+                self.model.set_requires_all_reduce(False)
+            elif micro_step == num_micro_steps - 1:
+                self.model.set_requires_all_reduce(True)
+
     def train_step(
         self,
         data_iterator: Any,
@@ -588,6 +611,7 @@ class BaseTrainer(Stateful, ABC):
         # forward and backward pass with gradient_accumulationsteps
         for micro_step, micro_batch in enumerate(micro_batches):
             self.model_reshard(micro_step, num_micro_steps)
+            self._configure_hsdp_allreduce(micro_step, num_micro_steps)
             loss: torch.Tensor
             loss_dict: Dict[str, torch.Tensor]
             # token num for fixed_ce_loss in postforward

@@ -33,6 +33,7 @@ import os
 from typing import Any, Dict, List, Optional
 
 import torch
+from torch.distributed.checkpoint import FileSystemReader
 
 from veomni.arguments import VeOmniArguments, parse_args
 from veomni.data import build_dummy_dataset
@@ -49,6 +50,9 @@ torch.multiprocessing.set_sharing_strategy("file_system")
 logger = helper.create_logger(__name__)
 
 _LORA_KEYS = ("lora_A", "lora_B")
+# Arbitrary non-zero sentinel for the frozen-base canary perturbation; any
+# non-zero value works — we only need to detect whether load overwrote it.
+_CANARY_PERTURBATION = 3.14159
 
 
 def _local(tensor: torch.Tensor) -> torch.Tensor:
@@ -102,12 +106,39 @@ class _LoraCheckpointerCallback(CheckpointerCallback):
                 if any(k in n for k in _LORA_KEYS)
             }
             assert self.trainer.golden_lora, "No LoRA parameters found in model!"
+
+            # Snapshot frozen base local shards + pick a canary param.
+            # Used at train_end to verify that loading a LoRA-only DCP does NOT
+            # overwrite frozen base weights (``StateDictOptions(strict=False)``).
+            self.trainer.golden_base = {
+                n: _local(p).detach().clone() for n, p in self.trainer.model.named_parameters() if not p.requires_grad
+            }
+            assert self.trainer.golden_base, "No frozen base parameters found in model!"
+            self.trainer.canary_name = next(iter(self.trainer.golden_base.keys()))
+
             self._save_checkpoint(state)
             self.trainer.dcp_ckpt_path = os.path.join(
                 self.trainer.args.train.checkpoint.save_path,
                 f"global_step_{state.global_step}",
             )
             logger.info_rank0(f"[test] step-1 checkpoint saved → {self.trainer.dcp_ckpt_path}")
+
+            # Invariant for trainable_only=True: the DCP must contain only LoRA
+            # tensors under the ``model.*`` namespace; any frozen base key would
+            # silently get restored on load and defeat the size optimisation.
+            model_keys = [
+                k
+                for k in FileSystemReader(self.trainer.dcp_ckpt_path).read_metadata().state_dict_metadata
+                if k.startswith("model.")
+            ]
+            base_keys_in_dcp = [k for k in model_keys if "lora_" not in k]
+            assert not base_keys_in_dcp, (
+                f"trainable_only=True should drop frozen base from the DCP, "
+                f"but found {len(base_keys_in_dcp)} non-LoRA model key(s); "
+                f"first 5: {base_keys_in_dcp[:5]}"
+            )
+            assert any("lora_" in k for k in model_keys), f"DCP contains no LoRA tensors: {model_keys[:5]}"
+            logger.info_rank0(f"[test] DCP holds {len(model_keys)} model tensors, all LoRA (no frozen base leaked).")
 
 
 # ---------------------------------------------------------------------------
@@ -138,9 +169,22 @@ class _LoraCheckCallback(Callback):
     trainer: "LoraTrainerSaveLoadTest"
 
     def on_train_end(self, state: TrainerState, **kwargs) -> None:
+        canary_name = self.trainer.canary_name
+        canary_param = dict(self.trainer.model.named_parameters())[canary_name]
+        with torch.no_grad():
+            _local(canary_param).add_(_CANARY_PERTURBATION)
+        expected_canary = self.trainer.golden_base[canary_name] + _CANARY_PERTURBATION
+
         # Restore model to the step-1 checkpoint.
         self.trainer.args.train.checkpoint.load_path = self.trainer.dcp_ckpt_path
         self.trainer.checkpointer_callback._load_checkpoint()
+
+        if not torch.allclose(_local(canary_param), expected_canary, atol=0, rtol=0):
+            raise AssertionError(
+                f"strict=False failed: frozen base param '{canary_name}' was "
+                f"overwritten by _load_checkpoint (the in-place perturbation "
+                f"of size {_CANARY_PERTURBATION} should have survived the load)."
+            )
 
         # Compare each LoRA local shard with the golden snapshot.
         mismatches = []
@@ -156,7 +200,8 @@ class _LoraCheckCallback(Callback):
             raise AssertionError(f"LoRA weight mismatch after checkpoint reload for: {mismatches}")
 
         logger.info_rank0(
-            f"[test] PASS — {len(self.trainer.golden_lora)} LoRA tensors verified identical after save/load."
+            f"[test] PASS — {len(self.trainer.golden_lora)} LoRA tensors restored from DCP; "
+            f"frozen base canary '{canary_name}' preserved across load."
         )
 
 
@@ -168,6 +213,8 @@ class _LoraCheckCallback(Callback):
 class LoraTrainerSaveLoadTest(BaseTrainer):
     # Set in _LoraCheckpointerCallback.on_step_end
     golden_lora: Dict[str, torch.Tensor]
+    golden_base: Dict[str, torch.Tensor]
+    canary_name: str
     dcp_ckpt_path: str
 
     # -- dataset / asset overrides -----------------------------------------

@@ -1,101 +1,113 @@
 ---
 name: veomni-new-op
-description: "Use this skill when adding a new optimized kernel or operator to veomni/ops/. Covers the full lifecycle: understanding VeOmni's ops architecture (monkey-patch + global function pointer pattern), implementing the kernel, registering it, adding tests, and documenting it. Trigger: 'add op', 'new kernel', 'add attention variant', 'new fused op', 'add triton kernel', 'optimize operator'."
+description: "Use this skill when adding a new optimized kernel or operator to veomni/ops/. Covers the full lifecycle: understanding VeOmni's ops architecture (KERNEL_REGISTRY + OpSlot dispatch, with a thin function-pointer shim for a few legacy global ops), implementing the kernel, registering it, adding tests, and documenting it. Trigger: 'add op', 'new kernel', 'add attention variant', 'new fused op', 'add triton kernel', 'optimize operator'."
 ---
 
 ## Before You Start
 
 1. Read `.agents/knowledge/constraints.md` — especially rules about NPU guards (#19, #20).
-2. Read `docs/design/kernel_selection.md` — understand the kernel lifecycle and selection mechanisms.
+2. Read `docs/design/kernel_selection.md` and `docs/design/unified_kernel_registry.md` — understand the kernel lifecycle, the `KERNEL_REGISTRY`, and `OpSlot` dispatch.
 3. Familiarize yourself with the ops architecture below.
 
 ## VeOmni Ops Architecture
 
-VeOmni ops use a **global function pointer + monkey-patch** pattern:
+Most VeOmni ops in v5 are **registry-driven**: a kernel registers itself in
+`veomni.ops.kernel_registry.KERNEL_REGISTRY` and is dispatched at model-build
+time through `OpSlot` instances declared in the patchgen-generated modeling
+files (see `veomni/ops/dispatch.py` and `_bind_veomni_ops()` in
+`veomni/models/auto.py`).
 
 ```
-veomni/ops/<op_name>/
-├── __init__.py          # Public API function + apply_veomni_*_patch()
-├── <impl_a>.py          # Implementation A (e.g., triton kernel)
-├── <impl_b>.py          # Implementation B (e.g., eager PyTorch fallback)
-└── <npu_impl>.py        # NPU variant (optional)
+veomni/ops/
+├── __init__.py          # apply_ops_patch / apply_ops_config entry points
+├── kernel_registry.py   # KERNEL_REGISTRY (the single source of truth)
+├── dispatch.py          # OpSlot + binding helpers
+├── config/              # OpsImplementationConfig + per-op registry helpers
+├── kernels/             # all registry-driven kernels
+│   ├── attention/       # FA2/3/4 + sequence-parallel wrappers
+│   ├── cross_entropy/   # eager + liger fused CE
+│   ├── load_balancing_loss/
+│   ├── moe/             # fused MoE (group_gemm / quack / npu_group_gemm)
+│   ├── rms_norm/        # eager / liger / batch-invariant
+│   ├── rotary/          # default / triton-deterministic
+│   ├── swiglu/          # eager / liger
+│   └── gated_delta_rule/
+├── batch_invariant_ops/ # ATen-level interception for bitwise determinism
+├── liger/               # Liger kernel adapters
+└── platform/            # NPU-specific helpers
 ```
 
-**Key pattern**: Each op module defines:
-1. A **global function pointer** (e.g., `_fused_moe_forward = None`) — starts as None.
-2. A **public API function** (e.g., `fused_moe_forward()`) — dispatches through the pointer.
-3. A **patch function** (e.g., `apply_veomni_fused_moe_patch()`) — binds the pointer to a concrete implementation at runtime.
+**Two complementary mechanisms** coexist:
 
-Patch functions are called from:
-- `veomni/ops/__init__.py` -> `apply_ops_patch()` (import time, for attention/loss/load-balancing)
-- `veomni/models/auto.py` -> `build_foundation_model()` (model build time, for MoE)
+1. **`KERNEL_REGISTRY` + `OpSlot`** (preferred for new ops). Each kernel
+   registers itself under a `(slot_name, variant)` pair (e.g.
+   `("cross_entropy_loss", "causal")`, `("moe_experts", "standard")`).
+   Patchgen-generated modeling code declares matching `OpSlot` instances; at
+   model-build time `_bind_veomni_ops()` walks the generated module, finds
+   each `OpSlot`, and binds it to the concrete registry entry chosen by
+   `OpsImplementationConfig` (`config/registry.py`).
+2. **Legacy global function pointer shim** (kept for a few global ops that
+   are dispatched outside generated modeling). Public-API functions like
+   `fused_moe_forward` and `load_balancing_loss` still expose a thin pointer
+   that is rebound by `apply_ops_config()` so call sites in non-patchgen code
+   (DeepSeek MLA inference paths, NPU custom forwards) can keep importing the
+   public name without going through an `OpSlot`.
 
-### Existing Ops
-
-| Op | Directory | Patch time | Implementations |
-|----|-----------|------------|-----------------|
-| Flash Attention (FA2/3/4 + SP) | `flash_attn/` | import | transformers FA, with sequence parallel wrappers |
-| Cross-Entropy Loss | `fused_cross_entropy/` | import | eager (PyTorch), liger_kernel (fused) |
-| Load Balancing Loss | `fused_load_balancing_loss/` | import | torch_native, triton_kernel |
-| Fused MoE | `fused_moe/` | model build | group_gemm (triton), quack_gemm (CUTLASS), npu_group_gemm |
-| Group GEMM | `group_gemm/` | N/A (library) | triton kernels + benchmark utils |
-| Batch Invariant Ops | `batch_invariant_ops/` | N/A (utility) | numerical stability helpers |
-| DiT RoPE | `dit/rope_wan/` | N/A (direct import) | Wan rotary embedding |
-| NPU Patches | `npu_patch/` | conditional | hccl_premul_sum, npu_fused_operator |
+Pick mechanism 1 for any kernel that lives inside a patchgen-generated
+modeling file. Use mechanism 2 only when the kernel must be callable from
+unpatched (or non-Transformers) Python code.
 
 ## Phase 1: Design
 
 1. **Determine op category**:
-   - **Monkey-patch op** (replaces a transformers/torch function globally): follow the function pointer pattern. Registered in `apply_ops_patch()` or `build_foundation_model()`.
-   - **Library op** (called directly by model code): just create the module, no patch needed.
-   - **NPU variant**: add alongside GPU implementation with `is_torch_npu_available()` guard.
+   - **Registry-driven kernel** (the common case, used inside patchgen-generated modeling): register under a `(slot_name, variant)` in `KERNEL_REGISTRY` and add a matching `OpSlot` in the relevant `<model>_patch_gen_config.py`. No global mutation; selection is driven by `OpsImplementationConfig`.
+   - **Global op with public API** (e.g. `fused_moe_forward`, `load_balancing_loss`): expose a public function in `veomni/ops/__init__.py` and rebind it from `apply_ops_config()` based on the active `OpsImplementationConfig`. Only use this when a non-patchgen call site (NPU MLA forward, manual inference scripts, etc.) needs to import the kernel directly.
+   - **Library op** (no dispatch — called directly by model code): just create the module, no registry entry needed.
+   - **NPU variant**: add alongside the GPU implementation behind an `is_torch_npu_available()` guard.
 
-2. **Decide selection mechanism**: read `docs/design/kernel_selection.md` to determine if you need:
+2. **Decide selection mechanism**: read `docs/design/kernel_selection.md` and `docs/design/unified_kernel_registry.md` to determine if you need:
    - Config field in `OpsImplementationConfig` (`veomni/arguments/arguments_types.py`)
    - Environment variable
    - Both
 
-3. **Determine patch timing**:
-   - **Import time**: for ops that replace transformers internals globally (attention, loss). Add to `apply_ops_patch()` in `veomni/ops/__init__.py`.
-   - **Model build time**: for ops that depend on model config (MoE implementation). Add to `build_foundation_model()`.
+3. **Determine binding timing**:
+   - **Model build time** (default): registry entries are resolved by `_bind_veomni_ops()` in `veomni/models/auto.py` when a model is constructed. New kernels just need to register themselves at import time.
+   - **`apply_ops_config()` time**: legacy global ops (rebound function pointers) are wired in `veomni/ops/__init__.py::apply_ops_config(ops_config)`.
 
 ## Phase 2: Implement
 
-1. **Create the op directory**: `veomni/ops/<op_name>/`
+1. **Create the op directory** under `veomni/ops/kernels/<op_name>/`.
 
-2. **Write `__init__.py`** following the pattern:
+2. **Implement each kernel variant** in its own file (e.g. `triton_kernel.py`, `eager.py`, `npu_kernel.py`). Each variant declares a concrete function with the kernel's canonical signature.
+
+3. **Register the kernel** in `veomni/ops/kernels/<op_name>/__init__.py`:
    ```python
-   _my_op = None  # global function pointer
+   from veomni.ops.kernel_registry import KERNEL_REGISTRY
 
-   def my_op(...):
-       """Public API — dispatches through the pointer."""
-       if _my_op is None:
-           raise NotImplementedError("...")
-       return _my_op(...)
+   from .eager import my_op_eager
+   from .triton_kernel import my_op_triton
 
-   def apply_veomni_my_op_patch():
-       """Bind the function pointer to a concrete implementation."""
-       global _my_op
-       if is_torch_npu_available():
-           from .npu_impl import npu_my_op
-           _my_op = npu_my_op
-       else:
-           from .default_impl import default_my_op
-           _my_op = default_my_op
+   KERNEL_REGISTRY.register(slot="my_op", variant="eager")(my_op_eager)
+   KERNEL_REGISTRY.register(slot="my_op", variant="triton")(my_op_triton)
    ```
 
-3. **Write implementations** in separate files (e.g., `triton_impl.py`, `eager.py`, `npu_impl.py`).
+   Then declare a matching `OpSlot` in the patchgen config of every model that uses it:
+   ```python
+   from veomni.ops.dispatch import OpSlot
+   veomni_my_op = OpSlot("my_op", "eager")  # default variant
+   ```
+   `_bind_veomni_ops()` will swap this for the registry entry selected by `OpsImplementationConfig`.
 
-4. **Register in the ops system**:
-   - Add import to `veomni/ops/__init__.py`
-   - If monkey-patch op: add the `(alias, function_pointer)` tuple to `build_ALL_OPS()`
-   - If import-time patch: call `apply_veomni_*_patch()` from `apply_ops_patch()`
-   - If build-time patch: call from `build_foundation_model()` in `veomni/models/auto.py`
+4. **Wire the config field** (if the user needs to choose a variant):
+   - Add a field to `OpsImplementationConfig` in `veomni/arguments/arguments_types.py`.
+   - In `veomni/ops/config/registry.py`, map the new config field to the `(slot, variant)` tuple consumed by `_bind_veomni_ops()`.
 
-5. **NPU support**:
-   - Always guard NPU imports with `is_torch_npu_available()`
-   - Put NPU implementations in a separate file (e.g., `npu_impl.py`)
-   - NPU patches live in `veomni/ops/npu_patch/` if they are general-purpose
+5. **For legacy global ops** (only when needed): add the public function to `veomni/ops/__init__.py` and rebind it from `apply_ops_config(ops_config)`.
+
+6. **NPU support**:
+   - Always guard NPU imports with `is_torch_npu_available()`.
+   - Put NPU implementations in a separate file (e.g., `npu_kernel.py`).
+   - Register the NPU variant under the same slot with a distinct variant name.
 
 ## Phase 3: Test
 
@@ -122,13 +134,14 @@ Patch functions are called from:
 
 1. Run `/veomni-review` skill.
 2. Run `make quality`.
-3. Verify `build_ALL_OPS()` and `format_kernel_functions()` include the new op.
+3. Verify the new variant shows up in `KERNEL_REGISTRY.dump()` and that the relevant `OpSlot` is rebound after `build_foundation_model`.
 
 ## Common Pitfalls
 
-- **Forgetting to register in `build_ALL_OPS()`**: the op will work but won't appear in the ops format output, making debugging harder.
-- **Unconditional NPU imports**: importing NPU modules without `is_torch_npu_available()` guard crashes on GPU-only environments.
-- **Patching at wrong time**: import-time patches happen before model config is available. If your op depends on model config, it must be patched at model build time.
+- **Forgetting to register in `KERNEL_REGISTRY`**: the variant is invisible to `_bind_veomni_ops()` and `OpSlot` will fall through to its default — you'll silently exercise the wrong kernel.
+- **Forgetting to add the matching `OpSlot` to the patchgen config**: registering a kernel alone has no effect — generated modeling code must declare an `OpSlot` for it to be picked up.
+- **Unconditional NPU imports**: importing NPU modules without an `is_torch_npu_available()` guard crashes on GPU-only environments.
+- **Binding at wrong time**: registry entries are resolved when `build_foundation_model` runs `_bind_veomni_ops()`. Kernels that depend on per-model config must be picked at that point — not at module-import time.
 - **Sequence parallel interaction**: ops that touch attention or loss must handle sequence parallel correctly — use `get_parallel_state().sp_enabled` to check and dispatch.
 - **Mixed precision**: fused kernels often require specific dtypes (bf16/fp16). Add assertions at the public API level to catch dtype mismatches early.
-- **Not updating `__all__`**: if the op provides a public API function, export it from `veomni/ops/__init__.py`.
+- **Not exporting public APIs**: if the op provides a public function (legacy global ops), export it from `veomni/ops/__init__.py`'s `__all__`.

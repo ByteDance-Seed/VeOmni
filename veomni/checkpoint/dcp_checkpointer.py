@@ -27,8 +27,10 @@ from torch.distributed.checkpoint import (
     FileSystemWriter,
     load,
 )
+from torch.distributed.checkpoint.default_planner import DefaultLoadPlanner
 from torch.distributed.checkpoint.metadata import STATE_DICT_TYPE, Metadata
 from torch.distributed.checkpoint.state_dict import (
+    StateDictOptions,
     get_model_state_dict,
     get_optimizer_state_dict,
     set_model_state_dict,
@@ -49,15 +51,109 @@ _EXTRA_STATE_FORMAT = "extra_state_rank_{}.pt"
 _EXTRA_STATE_DIR = "extra_state"
 
 
-class ModelState(Stateful):
+def _validate_extra_parallel_meshes(parallel_state) -> None:
+    """Fail-fast precondition for ExtraParallel state dict preprocessing.
+
+    At least one ExtraParallel mesh must be non-None, and at least one
+    of those meshes must be 2D (the ExtraParallel + FSDP composition).
     """
-    A wrapper around a model to make it stateful.
+    extra_parallel_mesh = {
+        para: parallel_state.extra_parallel_fsdp_device_mesh[para][para]
+        if parallel_state.extra_parallel_fsdp_device_mesh[para] is not None
+        else None
+        for para in parallel_state.extra_parallel_names
+    }
+    assert any(m is not None for m in extra_parallel_mesh.values()), (
+        "At least one extra_parallel mesh should be not None"
+    )
+    assert any(
+        parallel_state.extra_parallel_fsdp_device_mesh[para] is not None
+        and parallel_state.extra_parallel_fsdp_device_mesh[para].ndim == 2
+        for para in parallel_state.extra_parallel_names
+    ), "At least one extra_parallel fsdp_device_mesh should be not None"
+
+
+def _apply_extra_parallel_dim(
+    state_dict: Dict[str, Any],
+    extra_parallel_fqn2spec_info: Dict[str, Any],
+    parallel_state,
+    action: str,
+    *,
+    key_match: str,
+) -> Dict[str, Any]:
+    """Drop or restore the ExtraParallel dimension on each tensor in a state dict.
+
+    Shared by ``ModelState`` and ``OptimizerState``.  The only meaningful
+    difference between the two callers is how state-dict keys map to
+    ExtraParallel FQNs:
+
+    * ``"exact"`` (model): the state-dict key IS the FQN,
+      e.g. ``"model.layers.0.mlp.experts.gate_proj"``.
+    * ``"substring"`` (optimizer): the state-dict key contains the FQN
+      with extra prefix/suffix, e.g.
+      ``"state.model.layers.0.mlp.experts.gate_proj.exp_avg"``.
+
+    Non-tensor values and 0-D tensors are skipped unconditionally — they
+    appear only in optimizer state dicts (param-group hyperparams, scalar
+    ``step`` tensors); model state dicts never contain them, so the guard
+    is a safe no-op there.
+    """
+    assert action in ("drop", "restore"), f"action must be 'drop' or 'restore', got {action!r}"
+    assert key_match in ("exact", "substring"), f"key_match must be 'exact' or 'substring', got {key_match!r}"
+    assert extra_parallel_fqn2spec_info is not None, "fqn2spec_info must not be None"
+
+    _validate_extra_parallel_meshes(parallel_state)
+
+    extra_parallel_keys = list(extra_parallel_fqn2spec_info.keys()) if key_match == "substring" else None
+
+    for name in sorted(state_dict.keys()):
+        if key_match == "exact":
+            if name not in extra_parallel_fqn2spec_info:
+                continue
+            spec_info = extra_parallel_fqn2spec_info[name]
+        else:  # "substring"
+            matches = [k for k in extra_parallel_keys if k in name]
+            if not matches:
+                continue
+            assert len(matches) == 1, f"Ambiguous ExtraParallel spec match for state key '{name}': {matches}"
+            spec_info = extra_parallel_fqn2spec_info[matches[0]]
+
+        if not isinstance(spec_info.placement, Shard):
+            continue
+
+        tensor = state_dict[name]
+        if not torch.is_tensor(tensor):
+            continue
+        if tensor.ndim == 0:
+            continue
+
+        assert spec_info.para_fsdp_mesh is not None, f"ExtraParallel spec {name} must have an ExtraParallel FSDP mesh"
+
+        fsdp_submesh = spec_info.para_fsdp_mesh[f"{spec_info.para_name}_fsdp"]
+        if action == "drop":
+            tensor = drop_extra_parallel_dim(tensor, fsdp_submesh)
+        else:
+            tensor = restore_extra_parallel_dim(tensor, spec_info.para_fsdp_mesh, fsdp_submesh)
+        state_dict[name] = tensor
+
+    return state_dict
+
+
+class ModelState(Stateful):
+    """A wrapper around a model to make it stateful.
+
     Args:
-        model (Model): model to wrap.
+        model: model to wrap.
+        trainable_only: when ``True`` the state_dict only contains parameters with
+            ``requires_grad=True`` (uses ``StateDictOptions(ignore_frozen_params=True)``).
+            This is the LoRA / PEFT path: frozen base weights are skipped on save and
+            ``set_model_state_dict`` runs in ``strict=False`` mode on load so the
+            (already populated from ``model_path``) base params are left untouched.
     """
 
-    def __init__(self, model):
+    def __init__(self, model, trainable_only: bool = False):
         self.model = model
+        self.trainable_only = trainable_only
 
         # Determine whether this is ExtraParallel+FSDP2 case
         # If so, we need to restore Para(e.g. EP)-dim before saving to DCP
@@ -69,7 +165,8 @@ class ModelState(Stateful):
 
     @torch.no_grad()
     def state_dict(self):
-        model_state_dict = get_model_state_dict(model=self.model)
+        options = StateDictOptions(ignore_frozen_params=True) if self.trainable_only else None
+        model_state_dict = get_model_state_dict(model=self.model, options=options)
         if self.should_extra_parallel_aware:
             logger.info_rank0(
                 "Getting model state_dict from ModelState wrapper, would restore ExtraParallel dim for ExtraParallel (e.g. Experts/Embeds) module"
@@ -91,78 +188,43 @@ class ModelState(Stateful):
         if self.should_extra_parallel_aware:
             model_state_dict = self.get_state_dict_with_extra_parallel_dim_preprocess(model_state_dict, "drop")
 
-        set_model_state_dict(model=self.model, model_state_dict=model_state_dict)
+        options = StateDictOptions(strict=False) if self.trainable_only else None
+        set_model_state_dict(model=self.model, model_state_dict=model_state_dict, options=options)
 
     def get_state_dict_with_extra_parallel_dim_preprocess(self, state_dict, action):
-        extra_parallel_fqn2spec_info = self.extra_parallel_fqn2spec_info
-        assert extra_parallel_fqn2spec_info is not None, "if fqn2spec_info is None it should not be patch"
-
-        extra_parallel_mesh = {
-            para: self.parallel_state.extra_parallel_fsdp_device_mesh[para][para]
-            if self.parallel_state.extra_parallel_fsdp_device_mesh[para] is not None
-            else None
-            for para in self.parallel_state.extra_parallel_names
-        }
-
-        assert any(para_mesh is not None for para_mesh in extra_parallel_mesh.values()), (
-            "At least one extra_parallel mesh should be not None"
+        return _apply_extra_parallel_dim(
+            state_dict,
+            self.extra_parallel_fqn2spec_info,
+            self.parallel_state,
+            action,
+            key_match="exact",
         )
-
-        global_extra_parallel_device_mesh = {
-            para: self.parallel_state.extra_parallel_fsdp_device_mesh[para]
-            for para in self.parallel_state.extra_parallel_names
-        }
-        assert any(
-            global_para_device_mesh is not None and global_para_device_mesh.ndim == 2
-            for global_para_device_mesh in global_extra_parallel_device_mesh.values()
-        ), "At least one extra_parallel fsdp_device_mesh should be not None"
-
-        assert action in ["restore", "drop"]
-
-        keys = list(state_dict.keys())
-        for name in sorted(keys):
-            if name in extra_parallel_fqn2spec_info and isinstance(
-                extra_parallel_fqn2spec_info[name].placement, Shard
-            ):
-                cur_spec_info = extra_parallel_fqn2spec_info[name]
-                assert cur_spec_info.para_fsdp_mesh is not None, (
-                    f"ExtraParallel spec {name} must have either ExtraParallel FSDP mesh"
-                )
-
-                tensor = state_dict[name]
-
-                if action == "drop":
-                    tensor = drop_extra_parallel_dim(
-                        tensor, cur_spec_info.para_fsdp_mesh[f"{cur_spec_info.para_name}_fsdp"]
-                    )
-                else:
-                    tensor = restore_extra_parallel_dim(
-                        tensor,
-                        cur_spec_info.para_fsdp_mesh,
-                        cur_spec_info.para_fsdp_mesh[f"{cur_spec_info.para_name}_fsdp"],
-                    )
-                state_dict[name] = tensor
-
-        return state_dict
 
 
 class OptimizerState(Stateful):
-    """
-    A wrapper around an optimizer to make it stateful.
+    """A wrapper around an optimizer to make it stateful.
 
-    Args:
-        optimizer (Optimizer): optimizer to wrap.
-        fill_missing_optimizer_states (bool): When True (save path), synthesize zero-filled
-            placeholder states for params that never received a gradient (e.g. weights on
-            unused modalities). This prevents DCP strict-load failures at resume time when those
-            entries are expected but absent. Should be False on the load path (default).
+    On save, only optimizer state that actually exists is persisted — params
+    that never received a gradient (e.g. unused MoE experts, frozen LoRA
+    base weights) are simply absent from the checkpoint.
+
+    On load, ``allow_partial_load=True`` is passed to the DCP load planner
+    so missing optimizer entries are skipped.  For a fresh optimizer (the
+    normal resume path), ``set_optimizer_state_dict`` internally calls
+    ``_init_optim_state`` which pre-fills zero/default state for every
+    param; DCP then overwrites the entries that exist in the checkpoint.
+    Params absent from the checkpoint keep their default-initialised state,
+    equivalent to what AdamW would create on the next ``step()`` call.
+
+    Note: ``allow_partial_load`` is set globally on the DCP planner (it
+    cannot be scoped to optimizer-only).  Model-weight integrity is still
+    enforced by ``set_model_state_dict(strict=True)`` inside
+    ``ModelState.load_state_dict`` for non-LoRA loads.
     """
 
-    def __init__(self, model, optimizer, *, fill_missing_optimizer_states: bool = False):
+    def __init__(self, model, optimizer):
         self.model = model
         self.optimizer = optimizer
-        self.fill_missing_optimizer_states = fill_missing_optimizer_states
-        # Similar to ModelState, OptimizerState also need to be ExtraParallel+FSDP2 aware
         self.parallel_state = get_parallel_state()
         self.extra_parallel_fqn2spec_info = getattr(self.model, "_fqn2spec_info", None)
         self.should_extra_parallel_aware = (
@@ -174,8 +236,6 @@ class OptimizerState(Stateful):
             logger.info_rank0(
                 "Getting optimizer state_dict from OptimizerState wrapper, would restore ExtraParallel dim for Experts module"
             )
-            # MultiOptimizer is only used for ExtraParallel+FSDP2 case for now,
-            # and it knows how to produce a merged, flattened dict already
             assert self.optimizer._is_multi_optimizer, (
                 "ExtraParallel is enabled but optimizer is not a MultiOptimizer instance"
             )
@@ -185,79 +245,7 @@ class OptimizerState(Stateful):
             )
             return optim_sd_with_extra_parallel_dim
 
-        # Single torch optimizer
-        sd = get_optimizer_state_dict(model=self.model, optimizers=self.optimizer)
-        if self.fill_missing_optimizer_states:
-            sd = self._fill_missing_optimizer_states(sd)
-        return sd
-
-    def _fill_missing_optimizer_states(self, sd):
-        """Ensure every optimizer param has state entries in the state dict.
-
-        Adam/AdamW creates state lazily on first ``step()`` with a non-None
-        gradient.  Params that never received a gradient (e.g. LoRA on unused
-        modalities) will have no state.  Additionally, ``get_optimizer_state_dict``
-        deduplicates aliased parameters (same ``id()``), emitting only one
-        canonical FQN per unique tensor.  DCP strict load fails when these
-        entries are absent at resume time.
-
-        We enumerate expected FQNs directly from the raw optimizer param_groups
-        + model FQN mapping, bypassing any dedup that ``get_optimizer_state_dict``
-        may have performed.
-        """
-        if "state" not in sd or not isinstance(sd["state"], dict):
-            return sd
-
-        optim_fqns = set(sd["state"].keys())
-
-        # Build expected FQNs from raw optimizer param_groups, not from the
-        # already-deduped sd["param_groups"].
-        optim_param_ids = set()
-        for group in self.optimizer.param_groups:
-            for p in group["params"]:
-                optim_param_ids.add(id(p))
-
-        fqn_to_param = {}
-        for fqn, param in self.model.named_parameters():
-            if id(param) in optim_param_ids:
-                fqn_to_param[fqn] = param
-
-        expected_fqns = set(fqn_to_param.keys())
-        missing = expected_fqns - optim_fqns
-
-        if not missing:
-            return sd
-
-        if not sd["state"]:
-            logger.warning_rank0(
-                "OptimizerState: state dict is empty, cannot create template for missing optimizer states"
-            )
-            return sd
-
-        template_fqn = next(iter(sd["state"]))
-        template = sd["state"][template_fqn]
-
-        for fqn in missing:
-            param = fqn_to_param[fqn]
-            placeholder = {}
-            for key, val in template.items():
-                if isinstance(val, torch.Tensor):
-                    if val.ndim == 0:
-                        placeholder[key] = torch.zeros_like(val)
-                    else:
-                        placeholder[key] = torch.zeros_like(param.data, dtype=val.dtype, device=val.device)
-                elif isinstance(val, (int, float)):
-                    placeholder[key] = type(val)(0)
-                else:
-                    placeholder[key] = val
-            sd["state"][fqn] = placeholder
-
-        logger.info_rank0(
-            f"OptimizerState: filled default state for {len(missing)} param(s) "
-            f"without optimizer state (no gradient received or aliased): "
-            f"{sorted(missing)}"
-        )
-        return sd
+        return get_optimizer_state_dict(model=self.model, optimizers=self.optimizer)
 
     def load_state_dict(self, state_dict):
         optim_state_from_dcp_load = state_dict
@@ -278,78 +266,13 @@ class OptimizerState(Stateful):
         )
 
     def get_state_dict_with_extra_parallel_dim_preprocess(self, state_dict, action):
-        extra_parallel_fqn2spec_info = self.extra_parallel_fqn2spec_info
-        assert extra_parallel_fqn2spec_info is not None, "if fqn2spec_info is None it should not be patch"
-
-        extra_parallel_mesh = {
-            para: self.parallel_state.extra_parallel_fsdp_device_mesh[para][para]
-            if self.parallel_state.extra_parallel_fsdp_device_mesh[para] is not None
-            else None
-            for para in self.parallel_state.extra_parallel_names
-        }
-
-        assert any(para_mesh is not None for para_mesh in extra_parallel_mesh.values()), (
-            "At least one extra_parallel mesh should be not None"
+        return _apply_extra_parallel_dim(
+            state_dict,
+            self.extra_parallel_fqn2spec_info,
+            self.parallel_state,
+            action,
+            key_match="substring",
         )
-
-        global_extra_parallel_device_mesh = {
-            para: self.parallel_state.extra_parallel_fsdp_device_mesh[para]
-            for para in self.parallel_state.extra_parallel_names
-        }
-        assert any(
-            global_para_device_mesh is not None and global_para_device_mesh.ndim == 2
-            for global_para_device_mesh in global_extra_parallel_device_mesh.values()
-        ), "At least one extra_parallel fsdp_device_mesh should be not None"
-
-        assert action in ["drop", "restore"]
-
-        keys = list(state_dict.keys())
-        extra_parallel_keys = list(extra_parallel_fqn2spec_info.keys())
-
-        for name in sorted(keys):
-            # Find ExtraParallel spec whose FQN appears in the state_dict key
-            # e.g. name = "state.model.layers.0.mlp.experts.gate_proj.step"
-            #      extra_parallel_key = "model.layers.0.mlp.experts.gate_proj"
-            matches = [extra_parallel_key for extra_parallel_key in extra_parallel_keys if extra_parallel_key in name]
-            if not matches:
-                # ignore non-extra_parallel tensor
-                continue
-
-            # each tensor in the state dict should only belong to one ExtraParallel entry
-            assert len(matches) == 1, f"Ambiguous ExtraParallel spec match for state key '{name}': {matches}"
-
-            extra_parallel_key = matches[0]
-            cur_spec_info = extra_parallel_fqn2spec_info[extra_parallel_key]
-
-            # skip non-extra_parallel params which has Replicate placement in model spec info
-            if not isinstance(cur_spec_info.placement, Shard):
-                continue
-
-            tensor = state_dict[name]
-            if not torch.is_tensor(tensor):
-                # we skip param-group hyperparams like `param_groups.model.layers.0.mlp.experts.down_proj.amsgrad`
-                continue
-            # Skip scalars (0-D tensors) – cannot be sharded on dim 0
-            if tensor.ndim == 0:
-                continue
-
-            assert cur_spec_info.para_fsdp_mesh is not None, (
-                f"ExtraParallel spec {name} must have either ExtraParallel FSDP mesh"
-            )
-
-            if action == "drop":
-                tensor = drop_extra_parallel_dim(
-                    tensor, cur_spec_info.para_fsdp_mesh[f"{cur_spec_info.para_name}_fsdp"]
-                )
-            elif action == "restore":
-                tensor = restore_extra_parallel_dim(
-                    tensor,
-                    cur_spec_info.para_fsdp_mesh,
-                    cur_spec_info.para_fsdp_mesh[f"{cur_spec_info.para_name}_fsdp"],
-                )
-            state_dict[name] = tensor
-
-        return state_dict
 
 
 def drop_extra_parallel_dim(loaded_tensor: torch.Tensor, device_mesh: DeviceMesh):
@@ -414,6 +337,7 @@ class DistributedCheckpointer(CheckpointerBase):
         save_async: bool = False,
         global_steps: int = None,
         storage_writer: Optional[FileSystemWriter] = None,
+        trainable_only: bool = False,
     ) -> None:
         """
         save training state to distributed checkpoint
@@ -424,6 +348,12 @@ class DistributedCheckpointer(CheckpointerBase):
             save_async: whether to save asynchronously
             global_steps: global steps
             storage_writer: storage writer backend for dcp.save and dcp.async_save. If None, will use FileSystemWriter
+            trainable_only: when True, only persist parameters with ``requires_grad=True``
+                (LoRA / PEFT path). Frozen base weights are skipped on save and must be
+                re-materialised from ``model.model_path`` at resume time. The optimizer
+                state is already trainable-only by construction (the optimizer is built
+                from ``filter(lambda p: p.requires_grad, ...)``), so this flag only
+                affects the model state dump.
         return:
             None
         """
@@ -436,11 +366,9 @@ class DistributedCheckpointer(CheckpointerBase):
         # saving extra_state first to gurantee that every saved model/optimizer ckpts have their extra_state saved before them
         cls._save_extra_state(checkpoint_dir=checkpoint_dir, state=state)
 
-        save_state = {"model": ModelState(state["model"])}
+        save_state = {"model": ModelState(state["model"], trainable_only=trainable_only)}
         if "optimizer" in state:
-            save_state["optimizer"] = OptimizerState(
-                model=state["model"], optimizer=state["optimizer"], fill_missing_optimizer_states=True
-            )  # type: ignore[index]
+            save_state["optimizer"] = OptimizerState(model=state["model"], optimizer=state["optimizer"])
 
         if storage_writer is None:
             storage_writer = cls._create_storage_writer(checkpoint_dir)
@@ -456,6 +384,7 @@ class DistributedCheckpointer(CheckpointerBase):
         state: Dict[str, Any],
         process_group=None,
         storage_reader: Optional[FileSystemReader] = None,
+        trainable_only: bool = False,
     ) -> Dict[str, Any]:
         """
         load training state from distributed checkpoint
@@ -464,6 +393,11 @@ class DistributedCheckpointer(CheckpointerBase):
             state: state to load, "model" are required,  "optimizer" and "extra_state" are optional
             process_group: process group for loading checkpoint
             storage_reader: storage reader backend for dcp.load. If None, will use FileSystemReader
+            trainable_only: when True, ``set_model_state_dict`` runs in non-strict
+                mode (``StateDictOptions(strict=False)``). Use this for LoRA / PEFT
+                resumes where the DCP only contains trainable adapter weights and the
+                frozen base must come from ``model.model_path``. Safe to enable when
+                the DCP is full (extra strictness is just dropped).
 
         return:
             state: state loaded
@@ -476,7 +410,7 @@ class DistributedCheckpointer(CheckpointerBase):
         if "model" not in state:
             raise ValueError("Model must be provided to load a distributed checkpoint.")
 
-        load_state = {"model": ModelState(state["model"])}
+        load_state = {"model": ModelState(state["model"], trainable_only=trainable_only)}
         if "optimizer" in state:
             load_state["optimizer"] = OptimizerState(model=state["model"], optimizer=state["optimizer"])  # type: ignore[index]
 
@@ -487,14 +421,40 @@ class DistributedCheckpointer(CheckpointerBase):
             state_dict=load_state,
             storage_reader=storage_reader,
             process_group=process_group,
+            planner=DefaultLoadPlanner(allow_partial_load=True),
         )
-        # Note: further per-param DTensor alignment and device fixes happen inside OptimizerState.load_state_dict
 
         cls._load_extra_state(checkpoint_dir=checkpoint_dir, state=state)
 
         logger.info_rank0(f"Loaded checkpoint from {checkpoint_dir}")
 
         return state
+
+    @classmethod
+    def wait_for_pending_save(cls) -> None:
+        """Block until any pending async DCP save completes.
+
+        Safe to call when no save is pending (no-op).  Re-raises any
+        exception from the pending save after logging which rank saw it.
+        After completion, all ranks synchronize via a barrier so callers
+        can safely begin a new collective operation.
+
+        This is the single entrypoint for all async-save coordination —
+        prefer calling this over poking ``save_future`` directly.
+        """
+        if cls.save_future is None:
+            return
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        try:
+            logger.info(f"[RANK {rank}] waiting for previous DCP saving session to end...")
+            cls.save_future.result()
+        except Exception:
+            logger.error(f"[RANK {rank}] previous async DCP save raised; propagating", exc_info=True)
+            raise
+        finally:
+            cls.save_future = None
+        if dist.is_initialized():
+            dist.barrier()
 
     @classmethod
     def execute_save(
@@ -509,12 +469,7 @@ class DistributedCheckpointer(CheckpointerBase):
             if cls._async_process_group is None:
                 cls._async_process_group = dist.new_group(backend="gloo")
 
-            if cls.save_future is not None:
-                logger.info(f"[RANK {dist.get_rank()}] waiting for previous DCP saving session to end...")
-                cls.save_future.result()
-                cls.save_future = None
-                # block until all the ranks resolve their previous dcp async saving
-                dist.barrier()
+            cls.wait_for_pending_save()
 
             cls.save_future = dcp.async_save(
                 state_dict=save_state,

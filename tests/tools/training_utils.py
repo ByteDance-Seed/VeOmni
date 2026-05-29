@@ -45,16 +45,26 @@ _NPU_PER_MODEL_OVERRIDES: Dict[str, Dict[str, str]] = {
     # Multimodal RoPE has no NPU backend in the Qwen-VL family.
     "qwen2vl": {"rotary_pos_emb_implementation": "eager"},
     "qwen25vl": {"rotary_pos_emb_implementation": "eager"},
-    "qwen25_omni": {"rotary_pos_emb_implementation": "eager"},
-    # qwen2 / qwen3_moe v5 patched modeling declares OpSlots for
-    # rotary_pos_emb and rms_norm but KERNEL_REGISTRY has no `npu`
-    # KernelSpec for either — only `liger_kernel` (GPU). Pin both to
-    # eager until NPU KernelSpecs are registered.
+    # qwen2 / qwen3_moe / llama3.1 / qwen2_5_omni patchgen-generated modeling
+    # declares OpSlots for rotary_pos_emb and rms_norm but KERNEL_REGISTRY
+    # has no ``npu`` KernelSpec for either — only ``liger_kernel`` (GPU). Pin
+    # both to eager until NPU KernelSpecs are registered.
     "qwen2": {
         "rms_norm_implementation": "eager",
         "rotary_pos_emb_implementation": "eager",
     },
     "qwen3_moe": {
+        "rms_norm_implementation": "eager",
+        "rotary_pos_emb_implementation": "eager",
+    },
+    "llama3.1": {
+        "rms_norm_implementation": "eager",
+        "rotary_pos_emb_implementation": "eager",
+    },
+    # qwen2_5_omni inherits the same KERNEL_REGISTRY gap; mm RoPE has no
+    # NPU backend either, so pinning both keeps the thinker text path on
+    # eager kernels on NPU.
+    "qwen2_5_omni": {
         "rms_norm_implementation": "eager",
         "rotary_pos_emb_implementation": "eager",
     },
@@ -68,6 +78,10 @@ _NPU_PER_MODEL_OVERRIDES: Dict[str, Dict[str, str]] = {
 # args directly (no training YAML), so we pin here as well.
 _GPU_PER_MODEL_OVERRIDES: Dict[str, Dict[str, str]] = {
     "wan_t2v": {"rotary_pos_emb_implementation": "eager"},
+    # Diffusers currently gates QwenImageTransformer2DModel out of FA2, and
+    # the baseline VeOmni integration does not yet add an SP/FA2 attention
+    # patch for its dual-stream joint attention.
+    "qwen_image": {"attn_implementation": "eager", "rotary_pos_emb_implementation": "eager"},
     # qwen3_5 / qwen3_5_moe peak GPU memory on the toy config is dominated
     # by the fused Liger cross-entropy kernel materializing the full
     # ``[B, S, V]`` logits buffer. Use ``chunk_loss`` instead: it

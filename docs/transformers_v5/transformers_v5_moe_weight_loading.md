@@ -1,15 +1,19 @@
 # Transformers v5 MoE Weight Loading
 
-This note documents VeOmni MoE weight-loading expectations for `transformers>=5.0.0`.
+This note documents VeOmni MoE weight-loading expectations under
+`transformers==5.2.0` (the only supported transformers version).
 
 ## Background
 
 Transformers v5 introduced expert-dispatch integration points (`use_experts_implementation` and `ALL_EXPERTS_FUNCTIONS`).
 
-For VeOmni qwen3_moe transformers v5 path, we use a simpler path:
-- patch experts behavior in generated modeling;
+For VeOmni's qwen3_moe path, we use a simpler approach:
+- patch experts behavior in patchgen-generated modeling;
 - call `veomni.ops.fused_moe_forward(...)` explicitly in the patched forward;
-- gate the call on a module-level `OpSlot("moe_experts", "standard")` whose `use_non_eager_impl` flag is bound from `OpsImplementationConfig.moe_implementation` by `_bind_veomni_ops` at model-build time.
+- gate the call on a module-level `OpSlot("moe_experts", "standard")` whose
+  `use_non_eager_impl` flag is bound from
+  `OpsImplementationConfig.moe_implementation` by `_bind_veomni_ops` at
+  model-build time.
 
 ## Survey: Qwen MoE Weight Formats
 
@@ -27,7 +31,7 @@ model.layers.0.mlp.experts.0.up_proj.weight    [I, H]
 model.layers.0.mlp.experts.0.down_proj.weight  [H, I]
 ```
 
-- Transformers v5 modeling layout:
+- VeOmni modeling layout:
 
 ```python
 self.gate_up_proj = nn.Parameter(torch.empty(self.num_experts, 2 * self.intermediate_dim, self.hidden_dim))
@@ -35,8 +39,10 @@ self.down_proj = nn.Parameter(torch.empty(self.num_experts, self.hidden_dim, sel
 ```
 
 Handling summary:
-- safetensor keys are per expert, while v5 expects merged expert tensors;
-- for VeOmni qwen3_moe training, run offline merge first via `scripts/moe_ckpt_merge/moe_merge.py`.
+- safetensor keys are per expert, while VeOmni's patchgen modeling holds
+  merged expert tensors;
+- a runtime `CheckpointTensorConverter` performs the per-expert -> fused
+  conversion on load — no offline preprocessing required.
 
 Other Qwen3 family models with similar layout like qwen3_moe (i.e., per-expert split keys in safetensors):
 - Qwen3 Next: https://huggingface.co/Qwen/Qwen3-Next-80B-A3B-Instruct
@@ -52,7 +58,7 @@ model.language_model.layers.0.mlp.experts.gate_up_proj  [num_experts, H, 2 * I]
 model.language_model.layers.0.mlp.experts.down_proj     [num_experts, I, H]
 ```
 
-- Transformers v5 modeling layout:
+- VeOmni modeling layout:
 
 ```python
 self.gate_up_proj = nn.Parameter(torch.empty(self.num_experts, 2 * self.intermediate_dim, self.hidden_dim))
@@ -60,8 +66,9 @@ self.down_proj = nn.Parameter(torch.empty(self.num_experts, self.hidden_dim, sel
 ```
 
 Handling summary:
-- v5 layout is transposed vs the safetensor dimension order for these tensors;
-- tensor transpose/conversion is required before direct v5 loading.
+- VeOmni's modeling layout is transposed vs the safetensor dimension order
+  for these tensors;
+- tensor transpose/conversion is required before direct loading.
 
 ### qwen3_5_moe
 
@@ -73,7 +80,7 @@ model.language_model.layers.0.mlp.experts.gate_up_proj  [num_experts, 2 * I, H]
 model.language_model.layers.0.mlp.experts.down_proj     [num_experts, H, I]
 ```
 
-- Transformers v5 modeling layout:
+- VeOmni modeling layout:
 
 ```python
 self.gate_up_proj = nn.Parameter(torch.empty(self.num_experts, 2 * self.intermediate_dim, self.hidden_dim))
@@ -85,57 +92,21 @@ Handling summary:
 
 ## Qwen3Moe Handling in VeOmni
 
-### Transformers v4 (stable, `transformers==4.57.3`)
-
-VeOmni keeps split expert tensors in patched modeling:
-- `gate_proj` `[E, I, H]`
-- `up_proj` `[E, I, H]`
-- `down_proj` `[E, H, I]`
-
-This differs from native Transformers v5 `gate_up_proj` layout.
-
-Checkpoint loading behavior:
-- HuggingFace safetensor checkpoints store expert weights in per-expert form
-  (`experts.{j}.gate_proj.weight`, etc.).
-- A runtime `CheckpointTensorConverter` is now registered on each v4 MoE model
-  class (`qwen3_moe`, `deepseek_v3`, and `qwen3_omni_moe` in fused mode), so
-  HF checkpoints load directly into VeOmni's three stacked nn.Parameters
-  without offline preprocessing. The shared converter lives at
-  `veomni/models/transformers/_moe_v4_converter.py`; per-model factories sit
-  alongside their v5 counterparts as `checkpoint_tensor_converter_v4.py`.
-- Output keys mirror what the offline merge script produces:
-  - `experts.gate_proj` `[E, I, H]`
-  - `experts.up_proj` `[E, I, H]`
-  - `experts.down_proj` `[E, H, I]`
-  Unlike the v5 converter, the v4 converter does **not** cat gate+up — v4
-  modeling holds them as separate parameters.
-- For Qwen3-Omni-MoE the converter only fires for the **thinker** tower.
-  Both eager and fused modes share the same stacked-parameter storage now
-  (the eager path runs the standard expert loop over the stacked tensors
-  via `F.linear`), so the converter always fires for thinker keys regardless
-  of the runtime `ops_implementation.moe_implementation` selection. The
-  talker tower keeps `nn.ModuleList` experts and consumes HF per-expert
-  keys natively.
-
-The offline `scripts/moe_ckpt_merge/moe_merge.py` script is **deprecated** but
-retained for cases where you want to amortize the stacking cost across many
-runs (e.g. very large checkpoints).
-
-### Transformers v5 (`transformers>=5.0.0`)
-
-VeOmni v5 patchgen modeling uses the native v5 fused expert layout:
+VeOmni's patchgen-generated modeling uses the native v5 fused expert layout:
 - `gate_up_proj` `[E, 2*I, H]`
 - `down_proj` `[E, H, I]`
 
 See `veomni/models/transformers/qwen3_moe/qwen3_moe_gpu_patch_gen_config.py` for the patchgen config.
 
-#### Loading (HF safetensors -> v5 modeling)
+### Loading (HF safetensors -> VeOmni modeling)
 
-A runtime `CheckpointTensorConverter` (`veomni/models/transformers/qwen3_moe/checkpoint_tensor_converter.py`)
-is registered on model classes when `transformers>=5.0.0`. It converts per-expert HF keys at load time:
+A runtime `CheckpointTensorConverter`
+(`veomni/models/transformers/qwen3_moe/checkpoint_tensor_converter.py`) is
+registered on every patchgen-generated model class. It converts per-expert HF
+keys at load time:
 
 ```
-HF per-expert:                             v5 fused:
+HF per-expert:                             VeOmni fused:
   experts.{j}.gate_proj.weight [I, H]   ->   experts.gate_up_proj [E, 2*I, H]
   experts.{j}.up_proj.weight   [I, H]   ->     (merged via torch.cat)
   experts.{j}.down_proj.weight [H, I]   ->   experts.down_proj    [E, H, I]
@@ -143,34 +114,33 @@ HF per-expert:                             v5 fused:
 
 This eliminates the need for offline `moe_merge.py` preprocessing.
 
-#### Saving (v5 modeling -> checkpoint)
+### Saving (VeOmni modeling -> checkpoint)
 
-Training saves the model state dict as-is, producing v5 fused format:
+Training saves the model state dict as-is, producing the fused VeOmni format:
 
 ```
 model.layers.{i}.mlp.experts.gate_up_proj  [E, 2*I, H]
 model.layers.{i}.mlp.experts.down_proj     [E, H, I]
 ```
 
-This format can be loaded directly by v5 VeOmni (the converter's regex does not match
-`gate_up_proj` keys so they pass through without conversion). However, it is **not**
-compatible with v4 VeOmni, standard HF `from_pretrained()`, or inference engines
-(vLLM/SGLang) which expect per-expert keys.
+This format can be loaded directly by VeOmni (the converter's regex does not
+match `gate_up_proj` keys so they pass through without conversion). However,
+it is **not** compatible with standard HF `from_pretrained()` or inference
+engines (vLLM/SGLang) which expect per-expert keys.
 
-#### Offline reverse conversion (v5 fused -> per-expert HF)
+### Offline reverse conversion (fused -> per-expert HF)
 
-To convert a v5-format checkpoint back to the standard HF per-expert format:
+To convert a VeOmni-format checkpoint back to the standard HF per-expert
+format:
 
 ```bash
 python scripts/moe_ckpt_merge/moe_split.py \
-    --merge_hf_path <v5_checkpoint> \
+    --merge_hf_path <fused_checkpoint> \
     --split_hf_path <output_dir>
 ```
 
-The script auto-detects the input format (v5 `gate_up_proj` or v4 separate `gate_proj`/`up_proj`)
-and splits back to per-expert keys. The output is compatible with:
-- v4 VeOmni (after running `moe_merge.py` if needed)
-- v5 VeOmni (runtime converter handles per-expert keys)
+The output is compatible with:
+- VeOmni (runtime converter handles per-expert keys)
 - HuggingFace `from_pretrained()`
 - Inference engines (vLLM, SGLang)
 
@@ -201,12 +171,11 @@ Expected tensor interface:
 - `fc1_1_weight` (gate): shape `[num_experts, intermediate_dim, hidden_dim]`;
 - `fc1_2_weight` (up): shape `[num_experts, intermediate_dim, hidden_dim]`;
 - `fc2_weight` (down): shape `[num_experts, hidden_dim, intermediate_dim]`;
-- `fc1_1_2_weight` (fused gate_up): shape `[num_experts, 2 * intermediate_dim, hidden_dim]`, used by v5 path.
+- `fc1_1_2_weight` (fused gate_up): shape `[num_experts, 2 * intermediate_dim, hidden_dim]`, used by the fused path.
 
 ## Weight Format Compatibility Matrix
 
-| Checkpoint Format | v4 VeOmni Load | v5 VeOmni Load | HF `from_pretrained()` | vLLM/SGLang |
-|---|---|---|---|---|
-| HF per-expert (original) | runtime converter | runtime converter | direct | direct |
-| v4 merged (gate/up/down separate) | direct | needs re-merge with v5 format | needs `moe_split.py` | needs `moe_split.py` |
-| v5 fused (gate_up_proj) | incompatible | direct | needs `moe_split.py` | needs `moe_split.py` |
+| Checkpoint Format | VeOmni Load | HF `from_pretrained()` | vLLM/SGLang |
+|---|---|---|---|
+| HF per-expert (original) | runtime converter | direct | direct |
+| VeOmni fused (`gate_up_proj`) | direct | needs `moe_split.py` | needs `moe_split.py` |

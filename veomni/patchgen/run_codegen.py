@@ -33,24 +33,101 @@ Usage:
 
     # Generate modeling code and save unified diff alongside it
     python -m veomni.patchgen.run_codegen veomni.models.transformers.qwen3.qwen3_gpu_patch_gen_config --diff
+
+Projects that depend on VeOmni can mount their own CLI rooted at their own
+search path via :func:`build_cli`, so they patch their own models without
+copy-pasting the runner::
+
+    # <your_project>/patchgen/__main__.py
+    from pathlib import Path
+    from veomni.patchgen.run_codegen import build_cli, DiscoveryConfig
+
+    main = build_cli(
+        DiscoveryConfig(
+            search_root=Path(__file__).resolve().parent.parent / "models",
+            package_prefix="<your_project>.models",
+        ),
+        prog_name="<your_project>.patchgen",
+    )
+    if __name__ == "__main__":
+        raise SystemExit(main())
 """
+
+from __future__ import annotations
 
 import argparse
 import difflib
-import importlib
 import sys
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
-from .codegen import CodegenError, ModelingCodeGenerator
+from ._normalize import ruff_fix_and_format
+from .codegen import CodegenError, ModelingCodeGenerator, load_patch_config_module
 from .patch_spec import PatchConfig
 
 
 MODULE_DIR = Path(__file__).parent
 VEOMNI_DIR = MODULE_DIR.parent
-MODELS_DIR = VEOMNI_DIR / "models" / "transformers"
 PACKAGE_NAME = __package__ or "veomni.patchgen"
-PATCHES_PACKAGE = "veomni.models.transformers.qwen3.patches"
+
+
+@dataclass(frozen=True)
+class DiscoveryConfig:
+    """Where to find ``*_patch_gen_config.py`` files and how to name them.
+
+    Args:
+        search_root: directory to walk for ``*_patch_gen_config.py`` files.
+        package_prefix: dotted package prefix prepended to each file's path
+            relative to ``search_root`` to form an importable module name.
+            For VeOmni's own configs: ``search_root=veomni/models/transformers``
+            + ``package_prefix="veomni.models.transformers"``.
+        legacy_patches_prefix: optional shortcut prefix that callers can use on
+            the CLI. VeOmni keeps ``"patches.<name>"`` as legacy shorthand for
+            ``"veomni.models.transformers.qwen3.patches.<name>"``; downstream
+            projects typically leave this ``None``.
+        ruff_extra_ignore: ruff codes to add on top of the default
+            ``E402,B007`` when normalizing generated files. Downstream callers
+            whose ``pyproject.toml`` does NOT globally ignore ``E501`` should
+            set ``("E501",)`` here.
+    """
+
+    search_root: Path
+    package_prefix: str
+    legacy_patches_prefix: Optional[str] = None
+    ruff_extra_ignore: tuple[str, ...] = ()
+    ruff_isolated: bool = False  # pass --isolated to ruff (line-length 88, no project config)
+
+    @property
+    def package_root(self) -> Path:
+        """Filesystem directory that holds the **first segment** of
+        ``package_prefix`` — i.e. the directory that must be on ``sys.path``
+        for the package's modules to import normally.
+
+        Used to seed ``load_patch_config_module(search_roots=...)`` so the
+        file-walk works even when the project is not installed on
+        ``sys.path`` (e.g. fresh clone, sandboxed CI). For
+        ``DiscoveryConfig(search_root=Path('X/myproj/models'),
+        package_prefix='myproj.models')`` this returns ``Path('X')``.
+
+        ``search_root`` is ``.resolve()``-d first so a relative input like
+        ``Path('models')`` whose ``parents`` chain is shorter than
+        ``len(package_prefix.split('.'))`` does not raise ``IndexError``.
+        Resolving against CWD also matches how a user would normally
+        construct a relative path here (e.g. running the CLI from the
+        project root).
+        """
+        depth = len(self.package_prefix.split("."))
+        resolved = self.search_root.resolve()
+        return resolved.parents[depth - 1] if depth > 0 else resolved
+
+
+# VeOmni's own discovery — used by this module's CLI.
+VEOMNI_DISCOVERY = DiscoveryConfig(
+    search_root=VEOMNI_DIR / "models" / "transformers",
+    package_prefix="veomni.models.transformers",
+    legacy_patches_prefix="veomni.models.transformers.qwen3.patches",
+)
 
 
 def build_unified_diff(
@@ -79,41 +156,69 @@ def default_diff_path(output_dir: Path, target_file: str) -> Path:
     return output_dir / Path(target_file).with_suffix(".diff").name
 
 
-def list_patch_configs(models_dir: Path = MODELS_DIR) -> list[str]:
-    """List all available patch configurations under veomni/models/transformers.
+def strip_diff_trailing_ws(text: str) -> str:
+    """Strip trailing whitespace from every line.
 
-    Configs live at the model root (e.g. ``qwen3/qwen3_gpu_patch_gen_config.py``),
-    not inside ``patches/`` subdirectories.  We discover them by globbing for
-    ``*_patch_gen_config.py`` recursively.
+    Unified diffs produced by :func:`difflib.unified_diff` leave a single
+    trailing space on context lines whose source line was empty. Editors
+    and pre-commit hooks routinely strip that, so without this normalization
+    the freshly-written ``.diff`` would drift the moment any editor touches
+    it.
     """
-    configs = []
-    if not models_dir.exists():
+    return "\n".join(line.rstrip() for line in text.splitlines()) + "\n" if text else text
+
+
+def list_patch_configs(discovery: DiscoveryConfig = VEOMNI_DISCOVERY) -> list[str]:
+    """Discover ``*_patch_gen_config.py`` files under ``discovery.search_root``.
+
+    Each file's path relative to ``search_root`` is joined with
+    ``discovery.package_prefix`` to form the importable module name. The
+    module is then imported (via :func:`load_patch_config_module`, so parent
+    ``__init__.py`` side effects are bypassed) and kept only if it exposes a
+    ``config`` attribute of type :class:`PatchConfig`.
+    """
+    configs: list[str] = []
+    if not discovery.search_root.exists():
         return configs
 
-    for py_file in sorted(models_dir.rglob("*_patch_gen_config.py")):
+    search_roots = [discovery.package_root]
+    for py_file in sorted(discovery.search_root.rglob("*_patch_gen_config.py")):
         if py_file.name.startswith("_"):
             continue
-        module_path = py_file.relative_to(VEOMNI_DIR).with_suffix("")
-        module_name = ".".join(("veomni",) + module_path.parts)
+        rel_path = py_file.relative_to(discovery.search_root).with_suffix("")
+        module_name = ".".join((discovery.package_prefix, *rel_path.parts))
         try:
-            module = importlib.import_module(module_name)
-            if hasattr(module, "config") and isinstance(module.config, PatchConfig):
-                configs.append(module_name)
+            module = load_patch_config_module(module_name, search_roots=search_roots)
         except ImportError:
             continue
+        if hasattr(module, "config") and isinstance(module.config, PatchConfig):
+            configs.append(module_name)
 
     return configs
 
 
-def normalize_patch_module(patch_module: str) -> str:
+def normalize_patch_module(patch_module: str, discovery: DiscoveryConfig = VEOMNI_DISCOVERY) -> str:
+    """Apply VeOmni-flavored shortcuts to ``patch_module``.
+
+    - Fully-qualified ``veomni.patchgen.<X>`` is returned unchanged.
+    - ``patches.<X>`` is expanded to ``discovery.legacy_patches_prefix.<X>``
+      when a ``legacy_patches_prefix`` is defined.
+    - Anything else is returned unchanged.
+    """
     if patch_module.startswith(f"{PACKAGE_NAME}."):
         return patch_module
-    if patch_module.startswith("patches."):
-        return f"{PATCHES_PACKAGE}.{patch_module.removeprefix('patches.')}"
+    if discovery.legacy_patches_prefix and patch_module.startswith("patches."):
+        return f"{discovery.legacy_patches_prefix}.{patch_module.removeprefix('patches.')}"
     return patch_module
 
 
 def default_output_dir_for_module(module: object) -> Path:
+    """``<patch_module_dir>/generated/``, with ``patches/`` parents collapsed.
+
+    If the patch module lives in a ``patches/`` subdirectory (the legacy
+    VeOmni layout), the generated/ dir sits next to that subdir. Otherwise
+    it sits directly next to the config file.
+    """
     module_path = Path(module.__file__).resolve()
     if module_path.parent.name == "patches":
         return module_path.parent.parent / "generated"
@@ -152,6 +257,9 @@ def run_codegen(
     dry_run: bool = False,
     save_diff: bool = False,
     verbose: bool = False,
+    ruff_extra_ignore: tuple[str, ...] = (),
+    ruff_isolated: bool = False,
+    discovery: DiscoveryConfig = VEOMNI_DISCOVERY,
 ) -> Optional[str]:
     """
     Run code generation for a patch configuration.
@@ -163,15 +271,42 @@ def run_codegen(
         dry_run: If True, don't write files
         save_diff: If True, save a unified diff alongside the generated modeling file
         verbose: If True, print detailed progress
+        ruff_extra_ignore: extra ruff codes passed through to
+            :func:`ruff_fix_and_format`. Use this when the caller's
+            ``pyproject.toml`` differs from VeOmni's (e.g. no global E501
+            ignore).
+        discovery: discovery config used to expand the legacy
+            ``patches.<name>`` shorthand. Defaults to ``VEOMNI_DISCOVERY``
+            so direct VeOmni Python-API callers keep working unchanged.
+            Projects depending on VeOmni that hold their own legacy
+            shorthand should pass their own ``DiscoveryConfig``.
 
     Returns:
-        The generated source code, or None on error
+        The generated source code (post-normalization), or None on error.
+
+    Notes:
+        The written file is normalized via ``ruff check --fix`` + ``ruff
+        format`` before this function returns, and the ``.diff`` (when
+        ``save_diff=True``) is built from the normalized form. This guarantees
+        ``run_codegen`` output matches what :mod:`check_patchgen` validates
+        against — so a fresh regen never produces immediate drift.
     """
     try:
-        # Import the patch module
+        # Preserve the legacy ``patches.<name>`` shorthand for direct
+        # Python-API callers (the pre-refactor ``run_codegen`` used to do
+        # this internally). CLI entrypoints already normalize earlier
+        # against their own ``DiscoveryConfig``; for them this call is a
+        # no-op because the input is already fully qualified. Projects whose
+        # discovery sets no ``legacy_patches_prefix`` are also unaffected.
+        patch_module = normalize_patch_module(patch_module, discovery)
         if verbose:
             print(f"Loading patch module: {patch_module}")
-        module = importlib.import_module(normalize_patch_module(patch_module))
+        # Use spec_from_file_location so heavy parent __init__.py side effects
+        # (model registries, torch kernels, ...) are not triggered just to read
+        # the config object. ``discovery.package_root`` seeds the loader's
+        # search path so projects that aren't installed on ``sys.path`` still
+        # resolve the patch config file.
+        module = load_patch_config_module(patch_module, search_roots=[discovery.package_root])
         config = getattr(module, config_name)
 
         if output_dir is None:
@@ -202,20 +337,33 @@ def run_codegen(
 
         # Actually generate
         output_path = output_dir / config.target_file
-        output = generator.generate(output_path)
+        generator.generate(output_path)
+
+        # Normalize via the same ruff pipeline that check_patchgen validates
+        # against. Without this, raw codegen output can drift from the
+        # committed form whenever ruff would rewrite a single line, and a
+        # contributor running run_codegen would commit immediate drift.
+        ruff_fix_and_format(
+            output_path,
+            extra_ignore=ruff_extra_ignore or None,
+            isolated=ruff_isolated,
+        )
+        output = output_path.read_text(encoding="utf-8")
 
         print(f"\n✓ Generated: {output_path}")
         print(f"  Lines: {len(output.splitlines())}")
 
         if save_diff:
-            diff_output = build_unified_diff(
-                original_source=generator.source_code,
-                generated_source=output,
-                source_module=config.source_module,
-                target_file=config.target_file,
+            diff_output = strip_diff_trailing_ws(
+                build_unified_diff(
+                    original_source=generator.source_code,
+                    generated_source=output,
+                    source_module=config.source_module,
+                    target_file=config.target_file,
+                )
             )
             diff_path = default_diff_path(output_dir, config.target_file)
-            diff_path.write_text(diff_output)
+            diff_path.write_text(diff_output, encoding="utf-8")
             print(f"✓ Diff: {diff_path}")
             print(f"  Lines: {len(diff_output.splitlines())}")
 
@@ -236,16 +384,17 @@ def run_codegen(
         return None
 
 
-def main():
+def _build_parser(prog_name: Optional[str] = None) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
+        prog=prog_name,
         description="Modeling Code Generator - Generate patched HuggingFace modeling code",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  %(prog)s veomni.models.transformers.qwen3.qwen3_gpu_patch_gen_config
-  %(prog)s veomni.models.transformers.qwen3.qwen3_gpu_patch_gen_config -o /path/to/output
-  %(prog)s veomni.models.transformers.qwen3.qwen3_gpu_patch_gen_config --dry-run
-  %(prog)s veomni.models.transformers.qwen3.qwen3_gpu_patch_gen_config --diff
+  %(prog)s <patch_module>
+  %(prog)s <patch_module> -o /path/to/output
+  %(prog)s <patch_module> --dry-run
+  %(prog)s <patch_module> --diff
   %(prog)s --list
         """,
     )
@@ -294,27 +443,30 @@ Examples:
         action="store_true",
         help="Print detailed progress",
     )
+    return parser
 
-    args = parser.parse_args()
 
-    # List mode
+def _run_with_discovery(
+    args: argparse.Namespace,
+    discovery: DiscoveryConfig,
+    parser: argparse.ArgumentParser,
+) -> int:
     if args.list:
         print("Available patch configurations:")
-        configs = list_patch_configs()
+        configs = list_patch_configs(discovery)
         if configs:
-            for config in configs:
-                print(f"  • {config}")
+            for cfg in configs:
+                print(f"  • {cfg}")
         else:
             print("  (none found)")
         return 0
 
-    # --all mode: regenerate every discovered config
     if args.all:
-        configs = list_patch_configs()
+        configs = list_patch_configs(discovery)
         if not configs:
             print("No patch configs found.", file=sys.stderr)
             return 1
-        failed = []
+        failed: list[str] = []
         for cfg in configs:
             print(f"\n{'=' * 70}")
             print(f"Generating: {cfg}")
@@ -326,6 +478,9 @@ Examples:
                 dry_run=args.dry_run,
                 save_diff=args.diff,
                 verbose=args.verbose,
+                ruff_extra_ignore=discovery.ruff_extra_ignore,
+                ruff_isolated=discovery.ruff_isolated,
+                discovery=discovery,
             )
             if result is None:
                 failed.append(cfg)
@@ -335,21 +490,50 @@ Examples:
         print(f"\nAll {len(configs)} configs generated successfully.")
         return 0
 
-    # Require patch_module for generation
     if not args.patch_module:
+        # ``parser.error`` writes the standard ``usage:`` line and exits 2,
+        # matching argparse's own missing-argument behavior so the CLI UX
+        # stays consistent across the various error paths.
         parser.error("patch_module is required unless using --list or --all")
 
-    # Run generation
     result = run_codegen(
-        patch_module=normalize_patch_module(args.patch_module),
+        patch_module=args.patch_module,
         output_dir=args.output_dir,
         config_name=args.config_name,
         dry_run=args.dry_run,
         save_diff=args.diff,
         verbose=args.verbose,
+        ruff_extra_ignore=discovery.ruff_extra_ignore,
+        ruff_isolated=discovery.ruff_isolated,
+        discovery=discovery,
     )
 
     return 0 if result else 1
+
+
+def build_cli(
+    discovery: DiscoveryConfig,
+    prog_name: Optional[str] = None,
+) -> Callable[[Optional[list[str]]], int]:
+    """Return a ``main()``-shaped callable that runs a run_codegen CLI rooted
+    at ``discovery``.
+
+    Projects that depend on VeOmni mount their own ``python -m <pkg>.patchgen``
+    CLI without copy-pasting argparse. See module docstring for the recipe.
+    """
+    parser = _build_parser(prog_name=prog_name)
+
+    def _main(argv: Optional[list[str]] = None) -> int:
+        args = parser.parse_args(argv)
+        return _run_with_discovery(args, discovery, parser)
+
+    return _main
+
+
+def main() -> int:
+    parser = _build_parser()
+    args = parser.parse_args()
+    return _run_with_discovery(args, VEOMNI_DISCOVERY, parser)
 
 
 if __name__ == "__main__":

@@ -30,7 +30,7 @@ jobs:
           python-version: "3.11"
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v6
+        uses: astral-sh/setup-uv@v8.1.0
 
       - name: Check patchgen drift
         run: uv run --extra gpu --dev python -m veomni.patchgen.check_patchgen

@@ -34,6 +34,7 @@ from .deepseek_v3_gpu_patch_gen_config import (
     PatchedDeepseekV3NaiveMoe,
     deepseek_v3_forcausallm_forward_patched,
     deepseek_v3_get_parallel_plan_patched,
+    deepseek_v3_moe_forward_patched,
     deepseek_v3_topk_router_forward_patched,
 )
 
@@ -45,11 +46,15 @@ config = PatchConfig(
 )
 
 config.add_import("veomni.ops", names=["fused_moe_forward"])
+config.add_import("veomni.utils.moe_monitor", names=["record_router_indices"])
 
 # Surface ``CausalLMOutputWithLogProbs`` in the generated file so the patched
 # ``forward`` (reused from the GPU config) can return per-token log-probs in
 # the unified output dataclass.
-config.add_import("veomni.utils.model_outputs", names=["CausalLMOutputWithLogProbs"])
+config.add_import(
+    "veomni.utils.model_outputs",
+    names=["FusedLinearAuxOutput", "FusedLinearAuxOutputMixin", "CausalLMOutputWithLogProbs"],
+)
 
 # Mirror the GPU config's OpSlot declarations: the patched experts.forward and
 # ForCausalLM.forward look these up as module-global names, so the generated
@@ -108,6 +113,12 @@ config.override_method(
     "DeepseekV3TopkRouter.forward",
     replacement=deepseek_v3_topk_router_forward_patched,
     description="Disable autocast around fp32 router linear for VeRL actor/rollout parity",
+)
+
+config.override_method(
+    "DeepseekV3MoE.forward",
+    replacement=deepseek_v3_moe_forward_patched,
+    description="Report top-k indices to the MoE load-balance monitor",
 )
 
 config.override_method(

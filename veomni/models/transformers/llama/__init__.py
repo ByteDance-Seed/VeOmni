@@ -11,21 +11,22 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from ...loader import MODELING_REGISTRY, raise_if_not_migrated_to_v5
+from ...loader import MODELING_REGISTRY
 
 
 @MODELING_REGISTRY.register("llama")
 def register_llama_modeling(architecture: str):
-    raise_if_not_migrated_to_v5("llama")
-
-    from transformers import LlamaForCausalLM, LlamaForSequenceClassification, LlamaModel
-
-    from .modeling_llama import apply_veomni_llama_patch
-
-    apply_veomni_llama_patch()
+    from .generated.patched_modeling_llama_gpu import (
+        LlamaForCausalLM,
+        LlamaForSequenceClassification,
+        LlamaForTokenClassification,
+        LlamaModel,
+    )
 
     if "ForCausalLM" in architecture:
         return LlamaForCausalLM
+    elif "ForTokenClassification" in architecture:
+        return LlamaForTokenClassification
     elif "ForSequenceClassification" in architecture:
         return LlamaForSequenceClassification
     elif "Model" in architecture:

@@ -184,9 +184,7 @@ def _run_fsdp_equivalence(
 
 # --- Text model test cases ---
 
-# transformers v5 only — the v4 CI lane was retired together with the
-# broader transformers v4 wind-down. v4-only models that have not yet
-# been migrated to patchgen are commented out below; uncomment a case
+# Models without a patchgen path are commented out below; uncomment a case
 # once the corresponding model gains a v5 patchgen path.
 #
 # NOTE: these tests use ``*_fsdp_equiv_toy`` configs (vocab_size=2048)
@@ -197,16 +195,14 @@ def _run_fsdp_equivalence(
 # DummyDataset emits tokens in [0, 1024) and this test is text-only
 # equivalence — image/video/vision special tokens are never embedded.
 _text_test_cases = [
-    # TODO(transformers v5 migration): re-enable llama3.1 once it is
-    # ported to the patchgen pipeline (currently v4-only).
-    # pytest.param(
-    #     "llama3.1",
-    #     "./tests/toy_config/llama31_toy",
-    #     False,
-    #     _DEFAULT_RTOL,
-    #     _DEFAULT_ATOL,
-    #     id="llama3.1",
-    # ),
+    pytest.param(
+        "llama3.1",
+        "./tests/toy_config/llama31_toy",
+        False,
+        _DEFAULT_RTOL,
+        _DEFAULT_ATOL,
+        id="llama3.1",
+    ),
     pytest.param(
         "qwen3_5",
         "./tests/toy_config/qwen3_5_fsdp_equiv_toy/config.json",

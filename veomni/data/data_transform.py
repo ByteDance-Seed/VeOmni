@@ -18,11 +18,7 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Sequence, Union
 import torch
 
 from veomni.utils.constants import AUDIO_INPUT_INDEX, IGNORE_INDEX, IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
-from veomni.utils.import_utils import is_transformers_version_greater_or_equal_to
 from veomni.utils.registry import Registry
-
-
-_is_transformers_v5 = is_transformers_version_greater_or_equal_to("5.0.0")
 
 
 if TYPE_CHECKING:
@@ -279,7 +275,6 @@ def _process_sample_qwen_vl_base(
     processor: "ProcessorMixin",
     chat_template: "ChatTemplate",
     position_id_func: "Callable",
-    use_mm_token_type_ids: bool = False,
     **kwargs,
 ):
     from .multimodal import conv_preprocess
@@ -344,21 +339,31 @@ def _process_sample_qwen_vl_base(
         "attention_mask": attention_mask.unsqueeze(0),
     }
 
-    if use_mm_token_type_ids:
-        mm_token_type_ids = torch.zeros_like(input_ids)
-        mm_token_type_ids[tokenized_example["image_mask"]] = 1
-        mm_token_type_ids[tokenized_example["video_mask"]] = 2
-        tokenized_example["mm_token_type_ids"] = mm_token_type_ids
-        position_id_func_kwargs["mm_token_type_ids"] = mm_token_type_ids.unsqueeze(0)
+    mm_token_type_ids = torch.zeros_like(input_ids)
+    mm_token_type_ids[tokenized_example["image_mask"]] = 1
+    mm_token_type_ids[tokenized_example["video_mask"]] = 2
+    tokenized_example["mm_token_type_ids"] = mm_token_type_ids
+    position_id_func_kwargs["mm_token_type_ids"] = mm_token_type_ids.unsqueeze(0)
 
-    tokenized_example["position_ids"] = position_id_func(**position_id_func_kwargs)["position_ids"]
-    tokenized_example["position_ids"] = tokenized_example["position_ids"].squeeze().clone()
+    position_id_returns = position_id_func(**position_id_func_kwargs)
+    # Squeeze position_ids to match the per-sample (no batch dim) convention
+    # used everywhere else in this dict.
+    position_id_returns["position_ids"] = position_id_returns["position_ids"].squeeze().clone()
+    # Only position_ids is propagated into the training feature dict. The
+    # rope_deltas position_id_func also returns is generation-only (KV-cache
+    # decode); the training forward always receives a precomputed
+    # position_ids and never derives or reads rope_deltas.
+    tokenized_example["position_ids"] = position_id_returns["position_ids"]
 
     # Final cleanup
     tokenized_example["input_ids"][tokenized_example["image_mask"]] = 0
     tokenized_example["input_ids"][tokenized_example["video_mask"]] = 0
     tokenized_example.update(image_inputs)
     tokenized_example.update(video_inputs)
+    # image_inputs / video_inputs carry the HF processor's CPU `image_grid_thw`
+    # / `video_grid_thw` tensors; the collator packs them (DataCollateInfo
+    # pack_dim=0) and the model's metadata_collate_func hook derives the ViT
+    # metadata from them. No per-sample `.tolist()` sidecar needed here.
 
     return [tokenized_example]
 
@@ -385,7 +390,6 @@ def process_sample_qwen_vl(
         processor,
         chat_template,
         position_id_func,
-        use_mm_token_type_ids=_is_transformers_v5,
         **kwargs,
     )
 
@@ -509,16 +513,20 @@ def process_sample_qwen_omni(
     input_ids[video_mask] = VIDEO_INPUT_INDEX
     input_ids[audio_mask] = AUDIO_INPUT_INDEX
 
-    model_inputs["position_ids"] = position_id_func(
+    position_id_returns = position_id_func(
         input_ids=input_ids.unsqueeze(0),
         image_grid_thw=model_inputs.get("image_grid_thw", None),
         video_grid_thw=model_inputs.get("video_grid_thw", None),
         attention_mask=model_inputs["attention_mask"],
         audio_seqlens=audio_feature_lengths,
         second_per_grids=model_inputs.pop("video_second_per_grid", None),
-    )["position_ids"]
+    )
+    position_id_returns["position_ids"] = position_id_returns["position_ids"].clone()
+    # Only position_ids is propagated — rope_deltas is generation-only; see
+    # _process_sample_qwen_vl_base for the rationale. grid_thw tensors flow
+    # through model_inputs and are packed by the collator.
+    model_inputs["position_ids"] = position_id_returns["position_ids"]
 
-    model_inputs["position_ids"] = model_inputs["position_ids"].clone()
     model_inputs["image_mask"] = image_mask
     model_inputs["video_mask"] = video_mask
     model_inputs["audio_mask"] = audio_mask

@@ -71,29 +71,25 @@ uv sync --extra gpu --dev
 
 ## Scenario 4: Update transformers Version
 
-transformers uses a **dual-track** setup: default `5.2.0` (group `transformers-stable`) and legacy `4.57.3` (extra `transformers-v4-legacy`), declared as conflicts in `[tool.uv.conflicts]`.
+transformers is pinned by the `transformers-stable` dependency group
+(`pyproject.toml` -> `[dependency-groups] transformers-stable`), which is
+listed in `[tool.uv] default-groups` so `uv sync` installs it automatically.
 
-**Bump within a track** (e.g. 5.2.0 → 5.3.0, or 4.57.3 → 4.58.0):
-1. Edit the pinned version in the relevant section of `pyproject.toml`:
-   - Default (v5): `[dependency-groups]` -> `transformers-stable`
-   - Legacy (v4): `[project.optional-dependencies]` -> `transformers-v4-legacy`
+**Bump within v5** (e.g. 5.2.0 → 5.3.0):
+1. Edit the pinned version in `[dependency-groups] transformers-stable`.
 2. Regenerate lockfile and sync:
 
 ```bash
 uv lock
-# Default (v5):
 uv sync --extra gpu --dev
-# Or legacy v4:
-uv sync --no-group transformers-stable --extra transformers-v4-legacy --extra gpu --dev
 ```
 
-3. Check for API breakage — key v4→v5 differences:
-   - `AutoModelForVision2Seq` removed (use `AutoModelForImageTextToText`)
-   - `no_init_weights` moved from `transformers.modeling_utils` to `transformers.initialization`
-   - Model `__init__.py` version gates: `is_transformers_version_greater_or_equal_to("5.0.0")` chooses `generated/` (v5) vs upstream + `apply_*_patch()` (v4)
-   - Some models (e.g. `qwen3_5`, `glm_moe_dsa`) only register on `>= 5.2.0`
+3. Check for API breakage and adjust `veomni/` accordingly. Forward-looking
+   guards may be expressed with
+   `is_transformers_version_greater_or_equal_to()` from
+   `veomni/utils/import_utils.py`.
 4. Run tests: `pytest tests/models/ tests/e2e/`
-5. Regenerate model patches if needed: `make patchgen` (with the target transformers installed)
+5. Regenerate model patches: `make patchgen` (with the target transformers installed)
 
 ## Scenario 5: Regenerate Lockfile Only
 

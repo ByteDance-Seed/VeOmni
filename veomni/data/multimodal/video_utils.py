@@ -17,12 +17,9 @@ import math
 import subprocess
 from typing import ByteString, Dict, List, Optional, Union
 
-import av
-import librosa
 import numpy as np
 import PIL
 import torch
-from torchcodec.decoders import VideoDecoder
 from torchvision.transforms import InterpolationMode, functional
 
 from ...utils import logging
@@ -219,6 +216,8 @@ def smart_audio_nframes(
         (audio, metadata): Resampled audio and metadata dict with 'fps', 'total_num_frames'
     """
     if audio is not None and audio_fps != sample_rate:
+        import librosa
+
         audio = librosa.resample(audio, orig_sr=audio_fps, target_sr=sample_rate)
     num_frames = len(audio) if audio is not None else 0
     return audio, {"fps": sample_rate, "total_num_frames": num_frames}
@@ -430,6 +429,8 @@ def _load_and_process_video_with_codec(video_input: VideoInput, use_audio_in_vid
         return video, audio, audio_fps, frames_indices
 
     # video_input is str (path/URL) or bytes
+    from torchcodec.decoders import VideoDecoder
+
     try:
         decoder = VideoDecoder(video_input, device="cpu", num_ffmpeg_threads=0)
     except Exception as e:
@@ -744,6 +745,8 @@ def save_video_tensors_to_file(
     # -----------------------------
     # encode video
     # -----------------------------
+    import av
+
     container = av.open(output_path, mode="w")
     stream = container.add_stream("libx264", rate=fps)
 

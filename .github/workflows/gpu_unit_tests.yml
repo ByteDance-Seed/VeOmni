@@ -11,6 +11,7 @@ on:
       - v0.*
     paths:
       - "**/*.py"
+      - "!scripts/**/*.py"
       - .github/workflows/gpu_unit_tests.yml
       - "pyproject.toml"
       - "uv.lock"
@@ -19,6 +20,7 @@ on:
       - main
     paths:
       - "**/*.py"
+      - "!scripts/**/*.py"
       - .github/workflows/gpu_unit_tests.yml
       - "pyproject.toml"
       - "uv.lock"
@@ -33,7 +35,7 @@ permissions:
   contents: read
 
 env:
-  IMAGE: "verl-ci-cn-beijing.cr.volces.com/veomni/open_veomni-gpu:pytorch_25_03_py3_cuda12_9"
+  IMAGE: "verl-ci-cn-beijing.cr.volces.com/veomni/open_veomni-gpu:pytorch_25_06_py3_cuda12_9.post2"
   NCCL_DEBUG: "WARN"
   # uv's default 30s timeout is too short for the ~617 MiB
   # nvidia-cudnn-cu12 wheel on the CN runners; bump to 5 min so a
@@ -56,12 +58,6 @@ jobs:
   lint:
     uses: ./.github/workflows/check_pr_lint.yml
 
-  # The v4 (transformers 4.57.3) job has been retired — v5 is now the
-  # default install and v4 is sunset (see pyproject.toml comments). All
-  # previously v4-only test invocations have been moved into the v5
-  # job below; tests that are gated by a transformers-v4 check skip
-  # themselves on v5 and become no-ops.
-
   gpu_unit_tests_v5:
     if: github.repository_owner == 'ByteDance-Seed'
     needs: lint
@@ -69,12 +65,11 @@ jobs:
     # `l20-8` runner is picked; use `[self-hosted, l20-N]` to pin to a specific
     # box. See github_runner/README.md for the full label scheme.
     runs-on: [self-hosted, l20-8]
-    # Bumped to 120m after merging the former v4 job's test steps into this
-    # job — the combined suite (parallel/ulysses, data, ops, fsdp utils,
-    # checkpoint callback, etc.) doesn't fit the previous 90m budget.
+    # 120m budget covers the combined suite (parallel/ulysses, data, ops,
+    # fsdp utils, checkpoint callback, etc.).
     timeout-minutes: 120
     container:
-      image: verl-ci-cn-beijing.cr.volces.com/veomni/open_veomni-gpu:pytorch_25_03_py3_cuda12_9
+      image: verl-ci-cn-beijing.cr.volces.com/veomni/open_veomni-gpu:pytorch_25_06_py3_cuda12_9.post2
       volumes:
         - /mnt/veomni_ci:/mnt/veomni_ci:ro
       options: >-
@@ -140,6 +135,7 @@ jobs:
           uv run --frozen pytest -s -x tests/models/test_vlm_trainer.py
           uv run --frozen pytest -s -x tests/models/test_padded_packed_loss.py
           uv run --frozen pytest -s -x tests/models/test_models_logits_equal_v5.py
+          uv run --frozen pytest -s -x tests/models/test_model_forward_no_implicit_sync.py
           uv run --frozen pytest -s -x tests/models/test_checkpoint_tensor_converter.py
           uv run --frozen pytest -s -x tests/models/test_return_log_probs_e2e.py
       - name: Run Qwen3.5 GatedDeltaNet Ulysses SP tests

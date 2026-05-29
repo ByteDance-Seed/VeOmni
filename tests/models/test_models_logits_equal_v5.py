@@ -1,23 +1,24 @@
 """Bitwise logits-equal tests for transformers v5 models.
 
-v5 ships self-contained generated modeling under
+Every VeOmni-supported model ships self-contained generated modeling under
 ``veomni/models/transformers/<model>/generated/``, so pristine
 ``transformers.*`` classes stay untouched and HF + VeOmni can be built
-side-by-side without an unpatch helper. The transformers v4 lane (and its
-sibling logits-equal file) was retired — v4-only models that have not yet
-been migrated to patchgen no longer have logits-equal coverage.
+side-by-side without an unpatch helper.
 
 Coverage
 --------
 Models under ``veomni/models/transformers/`` that register a patchgen-generated
-class via the ``transformers >= 5.2.0`` branch (the version pinned by the
-``transformers-stable`` default group in ``pyproject.toml``):
+class (``transformers-stable`` default group in ``pyproject.toml`` pins
+``transformers==5.2.0``):
 
 - Causal-LM (text-only):           qwen2, qwen3, qwen3_moe, deepseek_v3
 - VLM via text-only sub-config
   (``*ForCausalLM`` registered):   qwen3_5, qwen3_5_moe
-- VLM full forward (image + text): qwen2_vl, qwen2_5_vl, qwen3_vl, qwen3_vl_moe
-- Omni thinker forward:            qwen3_omni_moe (forward on ``model.thinker``)
+- VLM full forward (image + text): qwen2_vl, qwen2_5_vl, qwen3_vl, qwen3_vl_moe,
+                                   qwen3_5, qwen3_5_moe (the latter two reuse
+                                   the same toy config as the text sub-config
+                                   cases above, just with the vision tower
+                                   exercised via dummy 2x2 image input)
 - Causal-LM with MLA + DSA:        glm_moe_dsa (eager + sdpa only — the
   upstream class sets ``_supports_flash_attn = False``)
 - Causal-LM with MLA + MoE:        deepseek_v3 (eager + fp32 only — MLA SDPA
@@ -75,11 +76,15 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__fi
 _DTYPE_MAP = {"float32": torch.float32, "bfloat16": torch.bfloat16}
 
 # How a case maps to (config preparation, forward target, input shape):
-#   "causal_lm"     — toy config IS the text config; no extraction.
-#   "qwen3_5_text"  — extract text_config + force full_attention + cu_seq_lens_q.
-#   "vlm_full"      — full VLM forward with a dummy 2x2 image.
-#   "omni_thinker"  — full Omni model; forward runs on ``model.thinker``.
-_KINDS = ("causal_lm", "qwen3_5_text", "vlm_full", "omni_thinker")
+#   "causal_lm"         — toy config IS the text config; no extraction.
+#   "qwen3_5_text"      — extract text_config + force full_attention + cu_seq_lens_q.
+#   "qwen3_5_vlm_full"  — full multimodal forward with dummy 2x2 image *and* the
+#                         same text-config overrides as "qwen3_5_text" applied
+#                         in-place (so the text tower stays runnable without
+#                         causal_conv1d/grouped_mm installed).
+#   "vlm_full"          — full VLM forward with a dummy 2x2 image.
+#   "omni_thinker"      — full Omni model; forward runs on ``model.thinker``.
+_KINDS = ("causal_lm", "qwen3_5_text", "qwen3_5_vlm_full", "vlm_full", "omni_thinker")
 
 
 @dataclass(frozen=True)
@@ -195,6 +200,42 @@ CASES = [
         attn_implementation="sdpa",
         dtype="bfloat16",
     ),
+    # ── Qwen3.5 (full multimodal forward; same toy configs as above) ────
+    # Reuses the qwen3_5{,_moe}_toy configs but runs ``*ForConditionalGeneration``
+    # over the whole config (text + vision tower) instead of the extracted text
+    # sub-config. Text-tower constraints (full_attention + eager experts +
+    # cu_seq_lens_q) are mirrored from the text-only cases — without them HF's
+    # linear-attention / grouped-mm paths diverge from VeOmni's patched ones.
+    # The image input is the same dummy 2x2 patch the other VLMs use, large
+    # enough to fire ``fast_pos_embed_interpolate`` / ``rot_pos_emb`` / the
+    # patched ``Qwen3_5VisionModel.forward`` host-side ``cu_seqlens`` build.
+    #
+    # sdpa+bf16 (not fa2) because:
+    #   - eager+fp32 fails at ``lm_head`` with dtype mismatch: HF init forces
+    #     bf16 on the vision tower (init_zeros for the offset RMSNorm) and
+    #     ``masked_scatter`` propagates bf16 into the language tower, so
+    #     eager+fp32 would just test a half-cast model.
+    #   - fa2+bf16 produces NaN on the toy config (HF side too, not VeOmni's
+    #     fault): same upstream FA-on-tiny-shape issue that already pushed
+    #     ``qwen3_5_moe-text`` from fa2 to sdpa above.
+    # sdpa+bf16 has consistent dtype end-to-end and avoids the FA toy crash,
+    # while still covering everything we actually patch in the ViT.
+    Case(
+        "qwen3_5_vl-sdpa",
+        _toy("qwen3_5_toy"),
+        "Qwen3_5ForConditionalGeneration",
+        "qwen3_5_vlm_full",
+        attn_implementation="sdpa",
+        dtype="bfloat16",
+    ),
+    Case(
+        "qwen3_5_moe_vl-sdpa",
+        _toy("qwen3_5_moe_toy"),
+        "Qwen3_5MoeForConditionalGeneration",
+        "qwen3_5_vlm_full",
+        attn_implementation="sdpa",
+        dtype="bfloat16",
+    ),
     # ── VLMs (full forward with a dummy 2x2 image) ───────────────────────
     Case("qwen2_vl-eager", _toy("qwen2vl_toy"), "Qwen2VLForConditionalGeneration", "vlm_full"),
     Case(
@@ -239,6 +280,15 @@ CASES = [
     ),
     # ── Omni (forward on ``model.thinker`` so talker stays out of scope) ──
     Case(
+        "qwen2_5_omni-fa2",
+        _toy("qwen25omni_toy"),
+        "Qwen2_5OmniForConditionalGeneration",
+        "omni_thinker",
+        attn_implementation="flash_attention_2",
+        dtype="bfloat16",
+        forward_attr="thinker",
+    ),
+    Case(
         "qwen3_omni_moe-fa2",
         _toy("qwen3omni_toy"),
         "Qwen3OmniMoeForConditionalGeneration",
@@ -265,9 +315,7 @@ def _single_rank_process_group():
     Only init/teardown if we created the group; gated on the same skip
     conditions as the test bodies so a skip-only run doesn't pay the cost.
     """
-    from veomni.utils.import_utils import is_transformers_version_greater_or_equal_to
-
-    if not IS_CUDA_AVAILABLE or not is_transformers_version_greater_or_equal_to("5.2.0"):
+    if not IS_CUDA_AVAILABLE:
         yield
         return
 
@@ -296,6 +344,22 @@ def _release():
 # ── config preparation ───────────────────────────────────────────────────
 
 
+def _apply_qwen3_5_text_overrides(text_cfg) -> None:
+    """In-place: force full-attention layers and eager experts on a qwen3_5 text config.
+
+    The qwen3_5 family's linear-attention layers diverge bitwise from HF without
+    ``causal_conv1d`` installed (HF: ``F.silu(self.conv1d(...))``; VeOmni: fla
+    Triton ``causal_conv1d``). The MoE variant's default ``"grouped_mm"`` routes
+    through ``torch._grouped_mm`` and crashes on the toy's tiny expert tensors;
+    eager runs the per-expert loop on both sides. Both fixes apply to ``text_cfg``
+    whether we consume it standalone (``qwen3_5_text``) or in-place inside the
+    full multimodal config (``qwen3_5_vlm_full``).
+    """
+    if hasattr(text_cfg, "layer_types") and text_cfg.layer_types is not None:
+        text_cfg.layer_types = ["full_attention"] * len(text_cfg.layer_types)
+    text_cfg._experts_implementation = "eager"
+
+
 def _make_config(case: Case):
     """Return the config the test will hand to both HF and VeOmni."""
     from transformers import AutoConfig
@@ -303,15 +367,14 @@ def _make_config(case: Case):
     full_config = AutoConfig.from_pretrained(case.toy_config_dir)
 
     if case.kind == "qwen3_5_text":
-        # Extract the text sub-config and force full-attention layers
-        # (see module docstring) before applying any other overrides.
         cfg = copy.deepcopy(full_config.text_config)
-        if hasattr(cfg, "layer_types") and cfg.layer_types is not None:
-            cfg.layer_types = ["full_attention"] * len(cfg.layer_types)
-        # HF's default ``"grouped_mm"`` routes through ``torch._grouped_mm``
-        # and crashes on the toy's tiny expert tensors; eager runs the
-        # per-expert loop on both sides.
-        cfg._experts_implementation = "eager"
+        _apply_qwen3_5_text_overrides(cfg)
+    elif case.kind == "qwen3_5_vlm_full":
+        # Keep the full multimodal config (text + vision) but mutate the text
+        # sub-config in-place so the text tower has the same bitwise-equal
+        # ground rules as ``qwen3_5_text``.
+        cfg = full_config
+        _apply_qwen3_5_text_overrides(cfg.text_config)
     else:
         cfg = full_config
 
@@ -358,9 +421,11 @@ def _make_inputs(case: Case, config, device, dtype) -> tuple[torch.Tensor, dict]
     base_input_ids = torch.randint(32000, (1, seq_len), device=device, dtype=torch.long, generator=base_gen)
 
     fwd_kwargs: dict = {}
-    if case.kind == "qwen3_5_text":
+    if case.kind in ("qwen3_5_text", "qwen3_5_vlm_full"):
         # VeOmni's patched ``Qwen3_5DecoderLayer.forward`` ``assert``s on it;
-        # HF ignores it via ``**kwargs``.
+        # HF ignores it via ``**kwargs``. Fires for every text-tower layer
+        # regardless of whether the surrounding forward is text-only or
+        # multimodal.
         fwd_kwargs["cu_seq_lens_q"] = torch.tensor([0, seq_len], dtype=torch.int32, device=device)
 
     vision_config, image_token_id = _vision_section(config)
@@ -470,10 +535,6 @@ def _forward_target(model, case: Case):
 @pytest.mark.parametrize("case", CASES, ids=[c.case_id for c in CASES])
 def test_logits_bitwise_equal_v5(case: Case):
     """Bitwise-equal forward: pristine HF vs VeOmni patched modeling."""
-    from veomni.utils.import_utils import is_transformers_version_greater_or_equal_to
-
-    if not is_transformers_version_greater_or_equal_to("5.2.0"):
-        pytest.skip("Scope is transformers v5 model definition only (v5 stack pins >= 5.2.0).")
     if not IS_CUDA_AVAILABLE:
         pytest.skip("CUDA required.")
     if not os.path.isdir(case.toy_config_dir):
@@ -536,8 +597,7 @@ def test_logits_bitwise_equal_v5(case: Case):
 # ``init_empty_weights()`` + safetensors round-trip + non-persistent buffer
 # rematerialisation. The loader test below writes the HF state-dict to a
 # tmpdir and lets ``build_foundation_model(weights_path=<dir>)`` rehydrate
-# the model — the same shape of test as v4's
-# ``test_logits_bitwise_equal_via_runtime_converter``.
+# the model end-to-end through the on-disk loader pipeline.
 #
 # Coverage: every v5 MoE family with one ``fa2+bf16`` (or ``sdpa+bf16`` for
 # ``glm_moe_dsa``, which sets ``_supports_flash_attn = False``) representative,
@@ -609,10 +669,19 @@ _LOADER_CASES = [
         dtype="bfloat16",
         config_overrides={"_experts_implementation": "eager"},
     ),
-    # qwen3_omni_moe: forward on ``model.thinker`` so the talker stays
-    # out of scope — same as the in-memory CASES entry. State-dict load
-    # still happens at the root, so talker / vision / audio sub-modules
-    # round-trip through safetensors with the rest.
+    # qwen2_5_omni / qwen3_omni_moe: forward on ``model.thinker`` so the
+    # talker stays out of scope — same as the in-memory CASES entries.
+    # State-dict load still happens at the root, so talker / vision /
+    # audio sub-modules round-trip through safetensors with the rest.
+    Case(
+        "qwen2_5_omni-fa2-loader",
+        _toy("qwen25omni_toy"),
+        "Qwen2_5OmniForConditionalGeneration",
+        "omni_thinker",
+        attn_implementation="flash_attention_2",
+        dtype="bfloat16",
+        forward_attr="thinker",
+    ),
     Case(
         "qwen3_omni_moe-fa2-loader",
         _toy("qwen3omni_toy"),
@@ -640,9 +709,9 @@ def _save_hf_checkpoint(state_dict: dict, config, dst_dir: str) -> None:
 def _build_veomni_model_from_disk(case: Case, config, hf_state_dict, hf_buffers, weights_dir: str):
     """Build a VeOmni model by routing load through the disk-backed loader.
 
-    Mirrors v4's ``_build_veomni_model_via_runtime_converter``: this is the
-    path real users hit (``build_foundation_model(weights_path=<dir>)``).
-    For v5 MoE the on-disk layout already matches VeOmni's stacked layout,
+    This is the path real users hit
+    (``build_foundation_model(weights_path=<dir>)``).
+    For MoE the on-disk layout already matches VeOmni's stacked layout,
     so no expert-stacking converter fires here — the value of this test
     is exercising the loader pipeline itself (``init_empty_weights`` +
     safetensors deserialisation + non-persistent buffer rematerialisation),
@@ -650,8 +719,8 @@ def _build_veomni_model_from_disk(case: Case, config, hf_state_dict, hf_buffers,
 
     Why we restore HF's non-persistent buffers after load
     -----------------------------------------------------
-    Same loader-level quirk that v4 documents on its sibling test:
-    rotary ``inv_freq`` is registered ``persistent=False``, so it isn't in
+    Loader-level quirk: rotary ``inv_freq`` is registered
+    ``persistent=False``, so it isn't in
     the safetensors. On the ``weights_path != None`` path the model is
     built under ``init_empty_weights()``, which patches ``register_parameter``
     but not ``register_buffer`` — so ``inv_freq`` is computed on CPU during
@@ -721,10 +790,6 @@ def test_logits_bitwise_equal_v5_via_loader(case: Case):
     See ``_build_veomni_model_from_disk`` for why HF's non-persistent
     buffers are restored before the forward.
     """
-    from veomni.utils.import_utils import is_transformers_version_greater_or_equal_to
-
-    if not is_transformers_version_greater_or_equal_to("5.2.0"):
-        pytest.skip("Scope is transformers v5 model definition only (v5 stack pins >= 5.2.0).")
     if not IS_CUDA_AVAILABLE:
         pytest.skip("CUDA required.")
     if not os.path.isdir(case.toy_config_dir):

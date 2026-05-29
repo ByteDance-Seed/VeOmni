@@ -38,17 +38,25 @@ from veomni.models.transformers.qwen3_5.qwen3_5_gpu_patch_gen_config import (
     qwen3_5_decoder_layer_forward_patched,
     qwen3_5_forcausallm_forward_patched,
     qwen3_5_forconditional_generation_forward_patched,
+    qwen3_5_forconditional_generation_get_metadata_collate_func,
     qwen3_5_forconditional_generation_get_position_id_func,
     qwen3_5_gated_deltanet_get_local_conv1d_weight,
     qwen3_5_gated_deltanet_init_patched,
     qwen3_5_model_forward,
     qwen3_5_model_get_image_features,
     qwen3_5_model_get_placeholder_mask,
+    qwen3_5_rmsnorm_forward_patched,
+    qwen3_5_text_model_update_linear_attn_mask,
     qwen3_5_vision_model_dummy_forward,
     qwen3_5_vision_model_fast_pos_embed_interpolate,
     qwen3_5_vision_model_forward,
+    qwen3_5_vision_model_rot_pos_emb,
 )
 from veomni.patchgen.patch_spec import PatchConfig
+from veomni.utils.model_outputs import (  # noqa: F401  consumed by in-config dataclass + emitted forward
+    FusedLinearAuxOutput,
+    FusedLinearAuxOutputMixin,
+)
 
 
 config = PatchConfig(
@@ -60,7 +68,6 @@ config = PatchConfig(
 config.add_import("copy", names=["copy"])
 config.add_import("functools", names=["partial"])
 config.add_import("types", names=["SimpleNamespace"])
-config.add_import("torch_npu", names=["torch_npu"])
 config.add_import("torch.distributed", alias="dist", is_from_import=False)
 config.add_import("veomni.distributed.parallel_state", names=["get_parallel_state"])
 config.add_import("veomni.utils.device", names=["get_device_id"])
@@ -68,6 +75,7 @@ config.add_import(
     "veomni.distributed.sequence_parallel.ulysses",
     names=["gather_seq_scatter_heads", "gather_heads_scatter_seq"],
 )
+
 # gather_outputs / slice_input_tensor live in veomni.distributed.sequence_parallel.data
 # (re-exported by the package __init__), not in .ulysses.
 config.add_import(
@@ -77,7 +85,10 @@ config.add_import("veomni.utils.constants", names=["IMAGE_INPUT_INDEX", "VIDEO_I
 # Surface ``CausalLMOutputWithLogProbs`` so the patched ``forward`` (re-used
 # from the GPU config) can return per-token log-probs in the unified output
 # dataclass.
-config.add_import("veomni.utils.model_outputs", names=["CausalLMOutputWithLogProbs"])  # noqa: F401
+config.add_import(
+    "veomni.utils.model_outputs",
+    names=["FusedLinearAuxOutput", "FusedLinearAuxOutputMixin", "CausalLMOutputWithLogProbs"],
+)  # noqa: F401
 config.drop_import_names(
     "FusedRMSNormGated",
     "causal_conv1d_fn",
@@ -107,7 +118,11 @@ config.add_post_import_block(
     # ── OpSlot declarations ──────────────────────────────────────────────────
     # Bound at model-build time by _bind_veomni_ops() in auto.py.
     from veomni.ops.dispatch import OpSlot
+    veomni_rms_norm = OpSlot("rms_norm", "qwen3_5")
+    veomni_apply_rotary_pos_emb = OpSlot("rotary_pos_emb", "partial")
+    veomni_apply_rotary_pos_emb_vision = OpSlot("rotary_pos_emb_vision", "full")
     veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
+    veomni_rms_norm = OpSlot("rms_norm", "qwen3_5")
     veomni_rms_norm_gated = OpSlot("rms_norm_gated", "standard")
     veomni_causal_conv1d = OpSlot("causal_conv1d", "standard")
     veomni_chunk_gated_delta_rule = OpSlot("chunk_gated_delta_rule", "standard")
@@ -117,7 +132,6 @@ config.add_post_import_block(
 
 # Dummy definitions for names that exist in the generated file's scope but not here.
 # The patchgen only extracts the function body; these are resolved at codegen time.
-torch_npu = None
 torch_chunk_gated_delta_rule = None  # noqa: F811 — also imported above for the forward patch
 gather_seq_scatter_heads = None
 gather_heads_scatter_seq = None
@@ -135,24 +149,11 @@ veomni_chunk_gated_delta_rule = None  # OpSlot, declared in post-import block ab
 config.add_post_import_block("_VEOMNI_VISION_ATTENTION_PATCHED = False")
 
 
-@config.override_method(
+config.override_method(
     "Qwen3_5RMSNorm.forward",
+    replacement=qwen3_5_rmsnorm_forward_patched,
     description="Use fused rmsnorm to impl zero-centered rmsnorm (1+weight centered formulation)",
 )
-def qwen3_5_rmsnorm_forward_patched(self, x):
-    return torch_npu.npu_rms_norm(x, 1.0 + self.weight, self.eps)[0]
-
-
-@config.override_method(
-    "Qwen3_5RMSNormGated.forward",
-    description="Use fused rmsnorm and fused swiglu to impl gated rmsnorm",
-)
-def qwen3_5_rmsnorm_gated_forward_patched(self, hidden_states, gate=None):
-    hidden_states = torch_npu.npu_rms_norm(hidden_states, self.weight, self.variance_epsilon)[0]
-    hidden_states = torch.cat([gate, hidden_states], dim=-1)
-    hidden_states = torch_npu.npu_swiglu(hidden_states, dim=-1)
-
-    return hidden_states
 
 
 @config.replace_function(
@@ -160,6 +161,8 @@ def qwen3_5_rmsnorm_gated_forward_patched(self, hidden_states, gate=None):
     description="Use fused rope to impl partial rotary postion embedding",
 )
 def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
+    if veomni_apply_rotary_pos_emb.use_non_eager_impl:
+        return veomni_apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=unsqueeze_dim)
     cos = cos.unsqueeze(unsqueeze_dim)
     sin = sin.unsqueeze(unsqueeze_dim)
 
@@ -168,8 +171,9 @@ def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
     q_rot, q_pass = q[..., :rotary_dim], q[..., rotary_dim:]
     k_rot, k_pass = k[..., :rotary_dim], k[..., rotary_dim:]
 
-    q_embed = torch_npu.npu_rotary_mul(q_rot, cos, sin)
-    k_embed = torch_npu.npu_rotary_mul(k_rot, cos, sin)
+    # Apply rotary embeddings on the first half or full tensor
+    q_embed = (q_rot * cos) + (rotate_half(q_rot) * sin)
+    k_embed = (k_rot * cos) + (rotate_half(k_rot) * sin)
 
     # Concatenate back to full shape
     q_embed = torch.cat([q_embed, q_pass], dim=-1)
@@ -183,12 +187,16 @@ def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
 def apply_rotary_pos_emb_vision(
     q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    q, k = q.unsqueeze(0), k.unsqueeze(0)
-    cos = cos.unsqueeze(0).unsqueeze(2).float()
-    sin = sin.unsqueeze(0).unsqueeze(2).float()
-    q_embed = torch_npu.npu_rotary_mul(q, cos, sin)
-    k_embed = torch_npu.npu_rotary_mul(k, cos, sin)
-    q_embed, k_embed = q_embed.squeeze(0), k_embed.squeeze(0)
+    if veomni_apply_rotary_pos_emb_vision.use_non_eager_impl:
+        return veomni_apply_rotary_pos_emb_vision(q, k, cos, sin)
+    orig_q_dtype = q.dtype
+    orig_k_dtype = k.dtype
+    q, k = q.float(), k.float()
+    cos, sin = cos.unsqueeze(-2).float(), sin.unsqueeze(-2).float()
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+    q_embed = q_embed.to(orig_q_dtype)
+    k_embed = k_embed.to(orig_k_dtype)
     return q_embed, k_embed
 
 
@@ -406,6 +414,13 @@ config.override_method(
 
 
 config.override_method(
+    "Qwen3_5TextModel._update_linear_attn_mask",
+    replacement=qwen3_5_text_model_update_linear_attn_mask,
+    description="Avoid host-device sync: decide linear-attention padding-mask zeroing without reading GPU scalars.",
+)
+
+
+config.override_method(
     "Qwen3_5Model.get_image_features",
     replacement=qwen3_5_model_get_image_features,
     description="Remove unnecessary split operation to maintain contiguous memory layout.",
@@ -416,6 +431,13 @@ config.override_method(
     "Qwen3_5Model.get_placeholder_mask",
     replacement=qwen3_5_model_get_placeholder_mask,
     description="Extract multimodal placeholder masks from input_ids using self-defined placeholder IDs.",
+)
+
+
+config.override_method(
+    "Qwen3_5VisionModel.rot_pos_emb",
+    replacement=qwen3_5_vision_model_rot_pos_emb,
+    description="Accept pre-materialized grid_thw metadata to avoid redundant host sync in vision RoPE setup.",
 )
 
 
@@ -463,6 +485,41 @@ def get_position_id(main_func, self, **kwargs):
     # Must be a module-level function for multiprocessing pickle
     position_ids, rope_deltas = main_func(self, **kwargs)
     return {"position_ids": position_ids, "rope_deltas": rope_deltas}
+
+
+def collate_multimodal_metadata(batch, sp_pad):
+    \"\"\"Derive ``multimodal_metadata`` for the Qwen3.5-VL ViT (CPU-side).
+
+    Module-level so ``get_metadata_collate_func`` can hand it to VeOmni's
+    collator as a picklable callable. See the GPU config for the full
+    rationale. Mutates ``batch`` in place, writing ``multimodal_metadata``.
+    \"\"\"
+    md = {}
+    for list_key in ("image_grid_thw_list", "video_grid_thw_list"):
+        if list_key in batch:
+            md[list_key] = batch.pop(list_key)
+    for modality, list_key, pad_key in (
+        ("image", "image_grid_thw_list", "pixel_values"),
+        ("video", "video_grid_thw_list", "pixel_values_videos"),
+    ):
+        grid_list = md.get(list_key)
+        if not grid_list:
+            continue
+        cu = [0]
+        max_hw = 0
+        for t, h, w in grid_list:
+            hw = h * w
+            max_hw = max(max_hw, hw)
+            for _ in range(t):
+                cu.append(cu[-1] + hw)
+        pad = sp_pad.get(pad_key, 0)
+        if pad > 0:
+            cu.append(cu[-1] + pad)
+            max_hw = max(max_hw, pad)
+        md[f"vit_{modality}_cu_seqlens"] = torch.tensor(cu, dtype=torch.int32, device="cpu")
+        md[f"vit_{modality}_max_seqlen"] = max_hw
+    if md:
+        batch["multimodal_metadata"] = md
 """)
 
 
@@ -470,6 +527,13 @@ config.override_method(
     "Qwen3_5ForConditionalGeneration.get_position_id_func",
     replacement=qwen3_5_forconditional_generation_get_position_id_func,
     description="Expose get_position_id_func to pre-computes position IDs per sample during data preprocessing in worker processes.",
+)
+
+
+config.override_method(
+    "Qwen3_5ForConditionalGeneration.get_metadata_collate_func",
+    replacement=qwen3_5_forconditional_generation_get_metadata_collate_func,
+    description="Expose CPU-side ViT multimodal-metadata derivation to the VeOmni collator",
 )
 
 
@@ -484,14 +548,12 @@ config.override_method(
 # for why @auto_docstring is intentionally skipped here.
 @config.add_helper_after("Qwen3_5CausalLMOutputWithPast")
 @dataclass
-class Qwen3_5CausalLMOutputWithLogProbs(Qwen3_5CausalLMOutputWithPast):
-    """``Qwen3_5CausalLMOutputWithPast`` extended with per-token log-prob fields.
+class Qwen3_5CausalLMOutputWithLogProbs(FusedLinearAuxOutputMixin, Qwen3_5CausalLMOutputWithPast):
+    """``Qwen3_5CausalLMOutputWithPast`` + ``fused_linear_aux`` payload.
 
-    log_probs (`torch.FloatTensor`, *optional*):
-        Per-token log probabilities returned by VeOmni's fused loss path.
-    entropy (`torch.FloatTensor`, *optional*):
-        Per-token softmax entropy returned by VeOmni's fused loss path.
+    fused_linear_aux (`FusedLinearAuxOutput`, *optional*):
+        Per-token tensors produced by the fused-linear loss path
+        (``log_probs`` / ``entropy``; plus ``distillation_losses`` /
+        ``student_mass`` / ``teacher_mass`` on the top-k distillation path).
+        ``None`` on the plain loss path; populated when ``return_log_probs=True``.
     """
-
-    log_probs: torch.FloatTensor | None = None
-    entropy: torch.FloatTensor | None = None

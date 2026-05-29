@@ -374,6 +374,49 @@ class WanT2VDataset(Dataset):
         ]
 
 
+class QwenImageDataset(Dataset):
+    """
+    Generates ready-to-use Qwen-Image transformer inputs for FSDP2 smoke tests.
+
+    Dimensions match ``tests/toy_config/qwen_image_toy/config.json``:
+    ``in_channels = 16``, ``joint_attention_dim = 32``, and a packed image
+    sequence of 16 latent patches.
+    """
+
+    IN_CHANNELS = 16
+    IMAGE_SEQ_LEN = 16
+    TEXT_SEQ_LEN = 8
+    TEXT_DIM = 32
+    TIMESTEP = 0.5
+
+    def __init__(self, size: int = 16) -> None:
+        self.size = size
+
+    def __len__(self) -> int:
+        return self.size
+
+    def __getitem__(self, index: int) -> Dict[str, Any]:
+        gen = torch.Generator().manual_seed(index)
+        hidden_states = torch.randn(1, self.IMAGE_SEQ_LEN, self.IN_CHANNELS, generator=gen)
+        training_target = torch.randn(1, self.IMAGE_SEQ_LEN, self.IN_CHANNELS, generator=gen)
+        encoder_hidden_states = torch.randn(1, self.TEXT_SEQ_LEN, self.TEXT_DIM, generator=gen)
+        encoder_hidden_states_mask = torch.ones(1, self.TEXT_SEQ_LEN, dtype=torch.long)
+        latents = torch.randn(1, self.IMAGE_SEQ_LEN, self.IN_CHANNELS, generator=gen)
+        timestep = torch.tensor([self.TIMESTEP])
+        img_shapes = torch.tensor([[1, 4, 4]], dtype=torch.long)
+        return [
+            {
+                "hidden_states": hidden_states,
+                "training_target": training_target,
+                "encoder_hidden_states": encoder_hidden_states,
+                "encoder_hidden_states_mask": encoder_hidden_states_mask,
+                "timestep": timestep,
+                "img_shapes": img_shapes,
+                "latents": latents,
+            }
+        ]
+
+
 def build_dummy_dataset(task_type: str, size: int, max_seq_len: int) -> "Dataset":
     if task_type == "text":
         return DummyTextDataset(size=size, seq_length=max_seq_len)
@@ -389,5 +432,7 @@ def build_dummy_dataset(task_type: str, size: int, max_seq_len: int) -> "Dataset
         return DummyUGDataset(size=size, seq_length=max_seq_len)
     elif task_type == "wan_t2v":
         return WanT2VDataset(size=size)
+    elif task_type == "qwen_image":
+        return QwenImageDataset(size=size)
     else:
         raise ValueError(f"Dummy dataset type ({task_type}) is not supported.")

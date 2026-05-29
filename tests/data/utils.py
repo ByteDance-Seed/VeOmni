@@ -76,8 +76,7 @@ class StepAwareTestCheckpointerCallback(CheckpointerCallback):
             "extra_state": {},
         }
 
-        if getattr(self.trainer.checkpointer, "save_future", None) is not None:
-            self.trainer.checkpointer.save_future.result()
+        self.trainer.checkpointer.wait_for_pending_save()
 
         self.trainer.checkpointer.load(args.train.checkpoint.load_path, state)
 

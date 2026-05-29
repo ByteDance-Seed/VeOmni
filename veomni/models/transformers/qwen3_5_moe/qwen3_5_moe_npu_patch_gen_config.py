@@ -40,16 +40,17 @@ from veomni.models.transformers.qwen3_5.qwen3_5_gpu_patch_gen_config import (
     qwen3_5_gated_deltanet_init_patched,
     qwen3_5_model_get_image_features,
     qwen3_5_model_get_placeholder_mask,
+    qwen3_5_text_model_update_linear_attn_mask,
     qwen3_5_vision_model_dummy_forward,
     qwen3_5_vision_model_fast_pos_embed_interpolate,
     qwen3_5_vision_model_forward,
+    qwen3_5_vision_model_rot_pos_emb,
 )
 from veomni.models.transformers.qwen3_5.qwen3_5_npu_patch_gen_config import (
     apply_rotary_pos_emb,
     apply_rotary_pos_emb_vision,
     qwen3_5_gated_deltanet_forward_patched,
     qwen3_5_rmsnorm_forward_patched,
-    qwen3_5_rmsnorm_gated_forward_patched,
 )
 from veomni.models.transformers.qwen3_5_moe.qwen3_5_moe_gpu_patch_gen_config import (
     PatchedQwen3_5MoeExperts,
@@ -57,6 +58,7 @@ from veomni.models.transformers.qwen3_5_moe.qwen3_5_moe_gpu_patch_gen_config imp
     qwen3_5_moe_decoder_layer_forward_patched,
     qwen3_5_moe_forcausallm_forward_patched,
     qwen3_5_moe_forconditional_generation_forward_patched,
+    qwen3_5_moe_forconditional_generation_get_metadata_collate_func,
     qwen3_5_moe_forconditional_generation_get_position_id_func,
     qwen3_5_moe_get_parallel_plan_patched,
     qwen3_5_moe_model_forward_patched,
@@ -75,10 +77,8 @@ config = PatchConfig(
 config.add_import("copy", names=["copy"])
 config.add_import("functools", names=["partial"])
 config.add_import("types", names=["SimpleNamespace"])
-config.add_import("torch_npu", names=["torch_npu"])
 config.add_import("torch.distributed", alias="dist", is_from_import=False)
 config.add_import("veomni.distributed.parallel_state", names=["get_parallel_state"])
-config.add_import("veomni.ops", names=["fused_moe_forward"])
 config.add_import("veomni.utils.device", names=["get_device_id"])
 config.add_import(
     "veomni.distributed.sequence_parallel.ulysses",
@@ -93,7 +93,10 @@ config.add_import("veomni.utils.constants", names=["IMAGE_INPUT_INDEX", "VIDEO_I
 # Surface ``MoeCausalLMOutputWithLogProbs`` so the patched text ``forward``
 # (re-used from the GPU config) can return per-token log-probs in the unified
 # MoE output dataclass.
-config.add_import("veomni.utils.model_outputs", names=["MoeCausalLMOutputWithLogProbs"])
+config.add_import(
+    "veomni.utils.model_outputs",
+    names=["FusedLinearAuxOutput", "FusedLinearAuxOutputMixin", "MoeCausalLMOutputWithLogProbs"],
+)
 config.add_import("veomni.utils.moe_router_replay", names=["get_active_replay", "maybe_replay_indices"])
 config.drop_import_names(
     "FusedRMSNormGated",
@@ -122,6 +125,9 @@ config.add_post_import_block(
     # ── OpSlot declarations ──────────────────────────────────────────────────
     # Bound at model-build time by _bind_veomni_ops() in auto.py.
     from veomni.ops.dispatch import OpSlot
+    veomni_rms_norm = OpSlot("rms_norm", "qwen3_5")
+    veomni_apply_rotary_pos_emb = OpSlot("rotary_pos_emb", "partial")
+    veomni_apply_rotary_pos_emb_vision = OpSlot("rotary_pos_emb_vision", "full")
     veomni_moe_experts_forward = OpSlot("moe_experts", "standard")
     veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
     veomni_load_balancing_loss = OpSlot("load_balancing_loss", "standard")
@@ -152,12 +158,6 @@ config.override_method(
     "Qwen3_5MoeRMSNorm.forward",
     replacement=qwen3_5_rmsnorm_forward_patched,
     description="Use fused rmsnorm to impl zero-centered rmsnorm (1+weight centered formulation)",
-)
-
-config.override_method(
-    "Qwen3_5MoeRMSNormGated.forward",
-    replacement=qwen3_5_rmsnorm_gated_forward_patched,
-    description="Use fused rmsnorm and fused swiglu to impl gated rmsnorm",
 )
 
 config.replace_function(
@@ -207,6 +207,12 @@ config.override_method(
 )
 
 config.override_method(
+    "Qwen3_5MoeVisionModel.rot_pos_emb",
+    replacement=qwen3_5_vision_model_rot_pos_emb,
+    description="Accept pre-materialized grid_thw metadata to avoid redundant host sync in vision RoPE setup.",
+)
+
+config.override_method(
     "Qwen3_5MoeVisionModel.fast_pos_embed_interpolate",
     replacement=qwen3_5_vision_model_fast_pos_embed_interpolate,
     description="Optimized bilinear interpolation for high-resolution vision embeddings, adapted from vLLM.",
@@ -244,6 +250,41 @@ def get_position_id(main_func, self, **kwargs):
     # Must be a module-level function for multiprocessing pickle
     position_ids, rope_deltas = main_func(self, **kwargs)
     return {"position_ids": position_ids, "rope_deltas": rope_deltas}
+
+
+def collate_multimodal_metadata(batch, sp_pad):
+    \"\"\"Derive ``multimodal_metadata`` for the Qwen3.5-VL-MoE ViT (CPU-side).
+
+    Module-level so ``get_metadata_collate_func`` can hand it to VeOmni's
+    collator as a picklable callable. See the GPU config for the full
+    rationale. Mutates ``batch`` in place, writing ``multimodal_metadata``.
+    \"\"\"
+    md = {}
+    for list_key in ("image_grid_thw_list", "video_grid_thw_list"):
+        if list_key in batch:
+            md[list_key] = batch.pop(list_key)
+    for modality, list_key, pad_key in (
+        ("image", "image_grid_thw_list", "pixel_values"),
+        ("video", "video_grid_thw_list", "pixel_values_videos"),
+    ):
+        grid_list = md.get(list_key)
+        if not grid_list:
+            continue
+        cu = [0]
+        max_hw = 0
+        for t, h, w in grid_list:
+            hw = h * w
+            max_hw = max(max_hw, hw)
+            for _ in range(t):
+                cu.append(cu[-1] + hw)
+        pad = sp_pad.get(pad_key, 0)
+        if pad > 0:
+            cu.append(cu[-1] + pad)
+            max_hw = max(max_hw, pad)
+        md[f"vit_{modality}_cu_seqlens"] = torch.tensor(cu, dtype=torch.int32, device="cpu")
+        md[f"vit_{modality}_max_seqlen"] = max_hw
+    if md:
+        batch["multimodal_metadata"] = md
 """)
 
 
@@ -251,6 +292,13 @@ config.override_method(
     "Qwen3_5MoeForConditionalGeneration.get_position_id_func",
     replacement=qwen3_5_moe_forconditional_generation_get_position_id_func,
     description="Expose get_position_id_func to pre-computes position IDs per sample during data preprocessing in worker processes.",
+)
+
+
+config.override_method(
+    "Qwen3_5MoeForConditionalGeneration.get_metadata_collate_func",
+    replacement=qwen3_5_moe_forconditional_generation_get_metadata_collate_func,
+    description="Expose CPU-side ViT multimodal-metadata derivation to the VeOmni collator",
 )
 
 
@@ -287,6 +335,12 @@ config.override_method(
     replacement=qwen3_5_gated_deltanet_forward_patched,
     name_map=_NAME_MAP,
     description="Support varlen flash linear attention and Ulysses SP in Qwen3_5MoeGatedDeltaNet.forward",
+)
+
+config.override_method(
+    "Qwen3_5MoeTextModel._update_linear_attn_mask",
+    replacement=qwen3_5_text_model_update_linear_attn_mask,
+    description="Avoid host-device sync: decide linear-attention padding-mask zeroing without reading GPU scalars.",
 )
 
 
