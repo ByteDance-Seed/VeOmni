@@ -241,7 +241,7 @@ qwen_image_dit_test_cases = [
         False,
         _DEFAULT_RTOL,
         _DEFAULT_ATOL,
-        1,  # Ulysses SP for Qwen-Image needs a model-specific joint-attention patch.
+        2,  # Ulysses SP enabled via QwenImageSPAttnProcessor + forward patch.
         marks=[_dit_only, _qwen_image_npu_skip],
     ),
 ]
@@ -420,7 +420,9 @@ def test_qwen_image_dit_parallel_align(
     max_sp_size: int,
     dummy_qwen_image_dataset,
 ):
-    """Validate Qwen-Image toy training under FSDP2 without Ulysses SP."""
+    """Validate that QwenImageTransformer2DModel loss and grad_norm are identical
+    with and without Ulysses sequence-parallelism at equal DP sizes.
+    """
     main(
         task_name="train_dit_test",
         model_name=model_name,
