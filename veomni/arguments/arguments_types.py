@@ -694,6 +694,7 @@ _NPU_ALLOWED: Dict[str, frozenset] = {
     "load_balancing_loss_implementation": frozenset({"triton"}),
     "cross_entropy_loss_implementation": frozenset({"chunk_loss", "npu"}),
     "moe_implementation": frozenset({"fused_npu"}),
+    "ulysses_qkv_projection_implementation": frozenset(),
 }
 
 _NPU_REQUIRED: Dict[str, frozenset] = {
@@ -826,6 +827,18 @@ class OpsImplementationConfig:
             "'eager' uses transformers' torch_chunk_gated_delta_rule, which does NOT support "
             "cu_seqlens; varlen training therefore raises at runtime. "
             "Qwen3.5 has no NPU backend today — selecting any non-eager value on NPU raises at OpSlot bind time."
+        },
+    )
+    ulysses_qkv_projection_implementation: str = field(
+        default="eager",
+        metadata={
+            "help": "Ulysses sequence-parallel QKV projection + all-to-all path. "
+            "'eager' (default; 3x F.linear + 3x async all_to_all, hardware-agnostic) | "
+            "'ws_push' (Hopper SM90+ single-kernel GEMM with TMA push to NVSHMEM "
+            "symmetric memory; requires CUDA, a PyTorch build exposing "
+            "torch.distributed._symmetric_memory, plus 'cutlass' and 'quack' Python packages; "
+            "GQA with ulysses_size > num_kv_heads is not supported by the fused kernel). "
+            "Selecting 'ws_push' raises at config-validation time on hosts that cannot host the kernel."
         },
     )
 

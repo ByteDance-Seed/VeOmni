@@ -17,7 +17,11 @@ from ...loader import MODELING_REGISTRY
 
 @MODELING_REGISTRY.register("qwen3_vl_moe")
 def register_qwen3_vl_moe_modeling(architecture: str):
-    from .checkpoint_tensor_converter import create_qwen3_vl_moe_checkpoint_tensor_converter
+    # Composite converter: expert layout normalization (existing) + QKV
+    # fusion (mirrors qwen3_vl). The original expert-only factory in
+    # ``checkpoint_tensor_converter.py`` is preserved untouched and reused
+    # internally by the composite below.
+    from .qkv_checkpoint_tensor_converter import create_qwen3_vl_moe_full_checkpoint_tensor_converter
 
     if IS_NPU_AVAILABLE:
         from .generated.patched_modeling_qwen3_vl_moe_npu import (
@@ -33,7 +37,9 @@ def register_qwen3_vl_moe_modeling(architecture: str):
         )
 
     for model_cls in (Qwen3VLMoeForConditionalGeneration, Qwen3VLMoeModel, Qwen3VLMoeTextModel):
-        model_cls._create_checkpoint_tensor_converter = staticmethod(create_qwen3_vl_moe_checkpoint_tensor_converter)
+        model_cls._create_checkpoint_tensor_converter = staticmethod(
+            create_qwen3_vl_moe_full_checkpoint_tensor_converter
+        )
 
     if "ForConditionalGeneration" in architecture:
         return Qwen3VLMoeForConditionalGeneration

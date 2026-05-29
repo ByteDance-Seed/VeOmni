@@ -55,7 +55,9 @@ veomni/
 │   │   ├── rms_norm/   Liger/NPU/batch-invariant Triton RMSNorm
 │   │   ├── rotary/     Liger/NPU + DeepSeek V3 deterministic + Wan Triton
 │   │   ├── swiglu_mlp/ Liger SwiGLU MLP
-│   │   └── moe/        Fused MoE kernels + group_gemm sub-kernels
+│   │   ├── moe/        Fused MoE kernels + group_gemm sub-kernels
+│   │   └── fused_ulysses_projection/  Hopper SM90+ cute-DSL GEMM with PackQKV epilogue +
+│   │                   symm-mem all-to-all (replaces eager QKV-proj + first a2a in Ulysses pre-attention)
 │   ├── platform/       Platform-specific runtime patches
 │   │   └── npu/        HCCL pre-mul sum patch
 │   └── batch_invariant_ops/  Mode switch for deterministic ops
@@ -140,6 +142,12 @@ VeOmni uses FSDP2 exclusively.
    - `fully_shard()` on root model
 4. SP is orthogonal to FSDP2 — models call Ulysses all-to-all (`gather_seq_scatter_heads` / `gather_heads_scatter_seq`) around attention; the FSDP shard mesh fuses with SP mesh (`dp_shard_sp`)
 5. EP token routing is in model MoE code + `moe_layer.py` using `ep_group` from `ParallelState`
+
+## Fused Ulysses Pre-attention Kernel (opt-in, Hopper SM90+)
+
+When `model.ops_implementation.ulysses_qkv_projection_implementation: ws_push` is set, Ulysses pre-attention QKV projection + first all-to-all is replaced by a single fused kernel at `veomni/ops/kernels/fused_ulysses_projection/`. The kernel uses PyTorch symmetric memory to push the per-rank Q/K/V tile directly to peer buffers in the GEMM epilogue (one system-scope CAS barrier instead of NCCL a2a). Lifecycle is owned by `FusedUlyssesStateCallback` (`on_train_begin` allocates symm-mem, `on_step_end` invalidates cached `W_qkv_B`, `on_train_end` tears down). Dispatch is transparent: `async_ulysses_qkv_projection(qkv_weight=...)` queries `WsPushDispatch.try_resolve_fused` and falls back silently to the eager 3× a2a path when the active manager is absent or batch shape is incompatible. Models opt in by installing `FusedQKVLinear` (single `[n_q*hd + 2*n_kv*hd, H]` Parameter) via the patchgen `INIT_MODIFICATION` primitive; on-disk checkpoints stay in fused layout, with HF-format export handled by the offline `scripts/qkv_split.py` (mirroring `scripts/moe_ckpt_merge/moe_split.py`).
+
+The patchgen `INIT_MODIFICATION` primitive (added alongside this kernel; see `codegen.py:_apply_init_modification`) emits a module-level monkey-patch block AFTER the class definition in the generated file. It is currently the only patch type that performs runtime `__init__` rebinding rather than pure source rewriting — the rebinding still lives inside the `generated/*.py` file, so the "all v5 modeling in `generated/`" invariant is preserved.
 
 ## Config Structure
 

@@ -73,6 +73,7 @@ from .callbacks import (
     CheckpointerCallback,
     EnvironMeterCallback,
     EvaluateCallback,
+    FusedUlyssesStateCallback,
     HFLoraCkptCallback,
     HuggingfaceCkptCallback,
     MoERouterMonitorCallback,
@@ -453,6 +454,12 @@ class BaseTrainer(Stateful, ABC):
             self.hf_ckpt_callback = HuggingfaceCkptCallback(self)
         self.evaluate_callback = EvaluateCallback(self)
         self.moe_monitor_callback = MoERouterMonitorCallback(self)
+        # Lifecycle for the ``ws_push`` fused QKV-proj + Ulysses a2a kernel.
+        # The callback is only meaningful when the user picked
+        # ``ulysses_qkv_projection_implementation='ws_push'`` in their YAML;
+        # otherwise it self-disables in ``__init__`` and the eager async path
+        # remains in effect transparently.
+        self.fused_ulysses_callback = FusedUlyssesStateCallback(self)
         self.state = TrainerState()
 
     def on_train_begin(self):
@@ -464,6 +471,7 @@ class BaseTrainer(Stateful, ABC):
         self.hf_ckpt_callback.on_train_begin(self.state)
         self.evaluate_callback.on_train_begin(self.state)
         self.moe_monitor_callback.on_train_begin(self.state)
+        self.fused_ulysses_callback.on_train_begin(self.state)
 
     def on_train_end(self):
         self.environ_meter_callback.on_train_end(self.state)
@@ -474,6 +482,7 @@ class BaseTrainer(Stateful, ABC):
         self.hf_ckpt_callback.on_train_end(self.state)
         self.evaluate_callback.on_train_end(self.state)
         self.moe_monitor_callback.on_train_end(self.state)
+        self.fused_ulysses_callback.on_train_end(self.state)
 
     def on_epoch_begin(self):
         self.environ_meter_callback.on_epoch_begin(self.state)
@@ -511,6 +520,7 @@ class BaseTrainer(Stateful, ABC):
         self.hf_ckpt_callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
         self.evaluate_callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
         self.moe_monitor_callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
+        self.fused_ulysses_callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
 
     def preforward(self, micro_batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         """Preprocess micro batches before forward pass.
