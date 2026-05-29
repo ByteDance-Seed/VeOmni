@@ -270,10 +270,6 @@ class InferenceRequest:
         image).  Placed at the head of the conversation list by
         :func:`build_conversation` per the V2 layout contract (images
         first, then user text, then assistant marker).
-    force_image_gen:
-        When ``True`` the FSM is steered into the image-VQ branch on
-        the first sampling step regardless of the LM head output.  See
-        :meth:`JanusTextEncoder.decode`.
     generation_kwargs:
         Free-form keyword arguments forwarded to every module's
         ``generate`` (each module filters by signature).  Common keys:
@@ -284,7 +280,6 @@ class InferenceRequest:
 
     prompt: str
     images: list[Any] = field(default_factory=list)
-    force_image_gen: bool = False
     generation_kwargs: dict[str, Any] = field(default_factory=dict)
     max_new_tokens: int = 2048
 
@@ -371,7 +366,7 @@ class OmniInferencer:
                 weights_path,
                 torch_dtype=torch.bfloat16,
                 device_map="auto",
-                **{k: v for k, v in mod_cfg.items()},
+                **dict(mod_cfg),
             ).eval()
             modules[name] = module
         return modules
@@ -404,22 +399,15 @@ class OmniInferencer:
         infer_args: OmniInferRunArguments = self.args.infer
 
         has_image = bool(infer_args.image)
-        # T2I scenarios steer to image-VQ immediately; I2T stays in text_ar.
-        force_image_gen = not has_image
-        # CFG only kicks in for T2I — squelch to 1.0 for I2T because the
-        # janus_text_encoder uncond branch isn't well-defined for prompts
-        # containing image_und parts (see `_maybe_build_cfg_uncond_embeds`).
-        guidance_scale = float(infer_args.guidance_scale) if force_image_gen else 1.0
-
         request = InferenceRequest(
             prompt=infer_args.prompt,
             images=[load_image(infer_args.image)] if has_image else [],
-            force_image_gen=force_image_gen,
             generation_kwargs={
                 "temperature": infer_args.temperature,
                 "top_p": infer_args.top_p,
                 "do_sample": infer_args.do_sample,
-                "guidance_scale": guidance_scale,
+                # TODO: more cfg_scale for different modality
+                "guidance_scale": float(infer_args.guidance_scale),
             },
             max_new_tokens=infer_args.max_tokens,
         )
@@ -537,7 +525,6 @@ class OmniInferencer:
 
         request_dict: dict[str, Any] = {
             "conversation_list": conversation,
-            "force_image_gen": req.force_image_gen,
             "generation_kwargs": req.generation_kwargs,
         }
         # ``OmniModel.generate`` initialises ``ctx`` from ``context`` (or

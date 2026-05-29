@@ -51,7 +51,7 @@ import difflib
 import sys
 import tempfile
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable
 
 from ._normalize import ruff_fix_and_format
 from .codegen import ModelingCodeGenerator, load_patch_config_module
@@ -72,7 +72,7 @@ def check_config(
     fix: bool = False,
     ruff_extra_ignore: tuple[str, ...] = (),
     ruff_isolated: bool = False,
-    search_roots: Optional[list[Path]] = None,
+    search_roots: list[Path] | None = None,
 ) -> bool:
     """Check a single config for drift.
 
@@ -169,7 +169,7 @@ def run_check(
     discovery: DiscoveryConfig = VEOMNI_DISCOVERY,
     *,
     fix: bool = False,
-    configs: Optional[list[str]] = None,
+    configs: list[str] | None = None,
 ) -> int:
     """Run a drift check across ``configs`` (or auto-discover via ``discovery``).
 
@@ -205,7 +205,7 @@ def run_check(
     return 1
 
 
-def _build_parser(prog_name: Optional[str] = None) -> argparse.ArgumentParser:
+def _build_parser(prog_name: str | None = None) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog=prog_name,
         description="Check patchgen generated files for drift",
@@ -220,8 +220,8 @@ def _build_parser(prog_name: Optional[str] = None) -> argparse.ArgumentParser:
 
 def build_cli(
     discovery: DiscoveryConfig,
-    prog_name: Optional[str] = None,
-) -> Callable[[Optional[list[str]]], int]:
+    prog_name: str | None = None,
+) -> Callable[[list[str] | None], int]:
     """Return a ``main()``-shaped callable that runs a drift check rooted at
     ``discovery``.
 
@@ -230,7 +230,7 @@ def build_cli(
     """
     parser = _build_parser(prog_name=prog_name)
 
-    def _main(argv: Optional[list[str]] = None) -> int:
+    def _main(argv: list[str] | None = None) -> int:
         args = parser.parse_args(argv)
         return run_check(discovery, fix=args.fix)
 

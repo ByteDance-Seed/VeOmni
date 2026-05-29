@@ -84,7 +84,6 @@ def build_conversation(
     *,
     prompt: str,
     images: list[Any] | None = None,
-    force_image_gen: bool = False,
 ) -> list[ConversationPart]:
     """Build the canonical conversation list for a single inference request.
 
@@ -94,12 +93,10 @@ def build_conversation(
     * One ``text`` user part holding the full prompt.
     * One empty ``text`` assistant part as the completion marker.
 
-    ``force_image_gen`` is consumed by :class:`OmniInferencer` at the
-    ``request`` level and does not change the conversation layout.  The
-    parameter is accepted here purely for caller convenience so callers can
-    forward a single kwargs dict.
+    Whether the run generates an image is decided by the scenario graph
+    (``omni_infer_type`` selects the ``generation_graph``), not by the
+    conversation layout — so this helper has no image-generation knob.
     """
-    del force_image_gen  # handled upstream via request["force_image_gen"]
     parts: list[ConversationPart] = []
     for img in images or []:
         parts.append(ConversationPart(kind="image_und", role="user", image=img))

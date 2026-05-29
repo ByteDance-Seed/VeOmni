@@ -33,7 +33,6 @@ def test_inference_request_defaults_are_empty_or_zero():
     req = InferenceRequest(prompt="hi")
     assert req.prompt == "hi"
     assert req.images == []
-    assert req.force_image_gen is False
     assert req.generation_kwargs == {}
     assert req.max_new_tokens == 2048
 
@@ -54,7 +53,6 @@ def test_inference_request_is_a_plain_dataclass():
     assert set(fields) == {
         "prompt",
         "images",
-        "force_image_gen",
         "generation_kwargs",
         "max_new_tokens",
     }

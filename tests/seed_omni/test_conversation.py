@@ -70,15 +70,6 @@ def test_build_conversation_assistant_marker_is_empty_text_part():
     assert marker.inputs_embeds is None
 
 
-def test_build_conversation_force_image_gen_does_not_change_layout():
-    # The flag is consumed upstream via ``request['force_image_gen']``,
-    # not by reshaping the conversation — we accept it here purely so
-    # callers can forward a single kwargs dict.
-    a = build_conversation(prompt="x", force_image_gen=False)
-    b = build_conversation(prompt="x", force_image_gen=True)
-    assert [(p.kind, p.role) for p in a] == [(p.kind, p.role) for p in b]
-
-
 # ── ConversationPart shape ───────────────────────────────────────────────────
 
 

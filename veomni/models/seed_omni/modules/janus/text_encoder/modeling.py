@@ -225,28 +225,22 @@ class JanusTextEncoder(TextEncoder):
         temperature: float = 1.0,
         top_p: float = 1.0,
         conversation_list: Optional[List[ConversationPart]] = None,
-        force_image_gen: bool = False,
         generation_kwargs: Optional[Dict[str, Any]] = None,
         **kwargs: Any,
     ) -> Dict[str, Any]:
-        """Sample the next text token (or force-emit ``boi``) and append a part.
+        """Sample the next text token and append a conversation part.
 
         Training pass-through: if ``labels`` is present we delegate to the
         base :class:`TextEncoder.decode` (CE-only path) — training code
         never sees ``conversation_list``.
 
-        Inference modes:
-
-        * ``force_image_gen=True`` — bypass sampling entirely, emit the
-          ``<begin_of_image>`` token, append a part, raise
-          ``module_signal = "start_image_gen"`` and clear the
-          ``force_image_gen`` flag in ctx so the FSM only routes the
-          forced boi once.
-        * Normal sampling — temperature / top-p (read from kwargs or
-          from ``generation_kwargs``), append a sampled-token part with
-          its embed, and emit ``"text_done"`` when the eos / pad token
-          comes out or ``"start_image_gen"`` when the model naturally
-          emits ``<boi>``.
+        Inference (normal sampling): temperature / top-p (read from kwargs
+        or from ``generation_kwargs``), append a sampled-token part with
+        its embed, and emit ``"text_done"`` when the eos / pad token comes
+        out or ``"start_image_gen"`` when the model naturally emits
+        ``<boi>``.  Deterministic T2I image generation is driven by the
+        scenario graph (``infer_gen.yaml``'s ``image_vq_start`` state runs
+        ``emit_image_start``), not by this sampler.
         """
         if labels is not None:
             return super().decode(
@@ -277,21 +271,6 @@ class JanusTextEncoder(TextEncoder):
             return base_out
 
         out: Dict[str, Any] = {"conversation_list": conversation_list}
-
-        if force_image_gen:
-            tok = self._boi_token_id if self._boi_token_id is not None else self.config.begin_of_image_token_id
-            if tok is None:
-                raise RuntimeError(
-                    "JanusTextEncoder.decode(force_image_gen=True) requires begin_of_image_token_id — "
-                    "call set_tokenizer() before inference."
-                )
-            self._append_token_part(conversation_list, int(tok))
-            out["input_ids"] = self._token_id_tensor(int(tok))
-            out[FSM_SIGNAL_KEY] = SIGNAL_START_IMAGE_GEN
-            # Consume the request-level flag so the next iteration falls
-            # back to normal sampling (image_vq_start -> image_vq path).
-            out["force_image_gen"] = False
-            return out
 
         if hidden_states is None:
             return out

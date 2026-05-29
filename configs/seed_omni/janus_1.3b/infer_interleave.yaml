@@ -1,15 +1,16 @@
 # Janus-1.3B inference — interleave T2T + T2I (mid-stream image generation).
 #
-# Same machinery as `infer_gen.yaml` for the image span; the only difference
-# is that `image_vq_end` falls back to `text_ar` (not `done`) so the model
-# keeps talking after each image.  Text continues until the LM emits
-# <eos> (`text_done`) or another <begin_of_image> (`start_image_gen` →
-# another image span).
+# Unlike `infer_gen.yaml` (deterministic T2I), the model itself decides when
+# to start an image: `tok_decode` samples normally and the image span opens
+# only on a natural <begin_of_image> (`start_image_gen` signal).  After each
+# image span `image_vq_end` falls back to `text_ar` (not `done`) so the model
+# keeps talking.  Text continues until the LM emits <eos> (`text_done`) or
+# another <begin_of_image> (`start_image_gen` → another image span).
 #
 # Flow
 # ----
-#   prompt_encode → text_ar     (force_image_gen=False, default path)
-#                 → image_vq    (force_image_gen=True OR natural <boi>)
+#   prompt_encode → text_ar     (default path)
+#                 → image_vq    on natural <boi>
 #   text_ar       → image_vq    on <boi>
 #                 → done        on <eos>
 #                 → text_ar     loop otherwise
