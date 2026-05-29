@@ -410,9 +410,7 @@ class OmniInferencer:
         (which also calls :meth:`finalize`).
 
         The FSM step / transition log is always collected and returned under
-        ``ctx['trace']``, and :class:`OmniModel.generate`'s per-state stdout
-        progress trail (``[FSM] step    0: prompt_encode``) is always emitted
-        — no opt-in flags.
+        ``ctx['trace']``.
         """
         return self._run(request)
 
@@ -500,8 +498,6 @@ class OmniInferencer:
             "conversation_list": conversation,
             "generation_kwargs": req.generation_kwargs,
         }
-        # FSM trace + stdout progress trail are always on (no opt-in flags);
-        # the trace buffer rides back on ``ctx`` for :meth:`finalize`.
         trace_buf: list[str] = []
         # ``OmniModel.generate`` initialises ``ctx`` from ``context`` (or
         # from ``request`` when ``context`` is None) — we pass the same dict
@@ -511,7 +507,6 @@ class OmniInferencer:
             context=request_dict,
             max_new_tokens=req.max_new_tokens,
             trace=trace_buf,
-            progress=True,
         )
         ctx["trace"] = trace_buf
         return ctx
