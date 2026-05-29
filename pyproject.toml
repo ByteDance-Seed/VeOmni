@@ -158,13 +158,19 @@ transformers-stable = [
 ]
 
 [tool.uv]
-# This locks the uv version so that we have a consistent uv behavior across the board.
-# Inconsistent uv versions might generate different uv lock files which creates chaos.
+# Accept a range of uv versions rather than an exact pin. Supported range:
+# 0.9.8 through 0.11.x; developers are encouraged to stay reasonably current
+# within it. An exact pin goes stale almost immediately (uv ships weekly —
+# 0.11.17 landed days after we pinned 0.11.16) and needlessly blocks local
+# devs whose uv differs by a patch release. This window will be tightened
+# again later.
 #
-# NOTE 1: Update this at least once per month as uv releases new version every week.
-# NOTE 2: When updating this line, make sure to update Dockerfile under docker/ to the same
-#         version and release new docker images.
-required-version = "==0.11.16"
+# Reproducibility is preserved because CI and the docker/ images install a
+# concrete, in-range uv (currently 0.11.16) and never re-resolve the lockfile
+# (docker: `uv sync --locked`; CI: `uv run --frozen`). Those concrete uv pins
+# — the docker/ Dockerfiles and .github/workflows/check_patchgen.yml — must
+# stay inside this range.
+required-version = ">=0.9.8,<0.12"
 no-build-isolation-package = [
     "flash-attn",
     "flash-attn-3",

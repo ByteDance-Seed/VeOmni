@@ -4,13 +4,22 @@ VeOmni uses [uv](https://docs.astral.sh/uv/) for dependency management. This doc
 
 ## uv Version
 
-Pinned to a specific version for reproducibility. **Three locations must stay in sync:**
+`pyproject.toml` constrains uv to a **range** (currently `>=0.9.8,<0.12`, i.e.
+0.9.8 through 0.11.x) so local devs aren't forced onto one weekly uv build —
+they're encouraged to stay reasonably current within it, and the window will be
+tightened later. Reproducibility is preserved because every place that produces
+or consumes the lockfile installs a **concrete**, in-range uv and never
+re-resolves: the Dockerfiles `COPY` a fixed uv and `uv sync --locked`, the
+container CI jobs `uv run --frozen`, and the `check_patchgen` CI job (which runs
+on `ubuntu-latest`, not a prebuilt image) pins uv via `setup-uv`'s `version:`
+input. **Every concrete uv pin must stay inside the pyproject range.**
 
 | Location | Format |
 |----------|--------|
-| `pyproject.toml` -> `[tool.uv]` -> `required-version` | `"==X.Y.Z"` |
-| `docker/cuda/Dockerfile.cu129` | `COPY --from=ghcr.io/astral-sh/uv:X.Y.Z` |
+| `pyproject.toml` -> `[tool.uv]` -> `required-version` | range, e.g. `">=0.9.8,<0.12"` |
+| `docker/cuda/Dockerfile.cu129` | `COPY --from=ghcr.io/astral-sh/uv:X.Y.Z` (concrete, inside range) |
 | `docker/ascend/Dockerfile.*` | same pattern |
+| `.github/workflows/check_patchgen.yml` | `setup-uv` `version: "X.Y.Z"` (concrete, inside range) |
 
 ## Dependency Layout
 
@@ -88,6 +97,6 @@ uv sync --locked --all-packages --extra gpu --dev
 1. **Always commit `uv.lock` with `pyproject.toml`** — Docker builds use `--locked`.
 2. **torch version changes touch 4+ places** in pyproject.toml (extras, overrides, sources, wheel URL).
 3. **flash-attn wheels are torch-version-specific** — bumping torch requires new wheels.
-4. **uv version changes require Docker rebuilds** — update Dockerfiles and release new images.
+4. **uv version changes require Docker rebuilds** — update Dockerfiles and release new images. The Dockerfile uv pin must stay inside the `required-version` range in `pyproject.toml`.
 5. **`override-dependencies` markers are load-bearing** — the `extra == 'gpu'` guards prevent uv from downloading wrong torch variants.
 6. **`transformers==5.9.0` is the only supported version** — pinned via the `transformers-stable` default dependency group. New code targets v5 APIs (FSDP2 + patchgen-generated modeling) only.
