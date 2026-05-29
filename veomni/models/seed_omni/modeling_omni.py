@@ -75,25 +75,27 @@ Both ``step`` and ``maybe_transition`` accept an optional ``trace`` list —
 print-driven flow tests collect the visit log from there to assert the
 expected node order and transition timing.
 
-``OmniModel.generate`` additionally accepts a ``progress`` flag (default
-``False``) that, when enabled, prints one stdout line per FSM state entry
-(``[FSM] step <N>: <state_name>``) so CLI users get a coarse progress
-indicator for long-running spans (e.g. Janus T2I's 576-step ``image_vq``
-loop).  :class:`OmniInferencer` opts into this by default; unit tests
-keep it off so stdout stays quiet.
+``OmniModel.generate`` always emits a coarse progress trail via
+:meth:`logger.info_rank0` — one line per FSM state entry
+(``[FSM] step <N>: <state_name>``) so CLI users can follow long-running
+spans (e.g. Janus T2I's 576-step ``image_vq`` loop).  Rank-0 gating is
+handled by the logger.
 """
 
-import os
 from typing import Any, Dict, Iterator, List, Mapping, Optional, Tuple
 
 import torch
 import torch.nn as nn
 
+from ...utils import helper
 from .configuration_seed_omni import OmniConfig
 from .generation_graph import GenerationGraph
 from .graph import scalar_token_id
 from .module import OmniModule
 from .training_graph import TrainingGraph
+
+
+logger = helper.create_logger(__name__)
 
 
 _LOSS_KEY: str = "_loss"
@@ -280,7 +282,6 @@ class OmniModel(nn.Module):
         stop_token_ids: Optional[List[int]] = None,
         *,
         trace: Optional[List[str]] = None,
-        progress: bool = False,
     ) -> Dict[str, Any]:
         """Run inference using the FSM.
 
@@ -301,24 +302,19 @@ class OmniModel(nn.Module):
             state (e.g. ``</s>``).
         trace:
             Optional list — receives FSM step / transition log for testing.
-        progress:
-            When ``True``, prints a one-liner to stdout every time the FSM
-            enters a new state — the initial state at step 0, every state
-            reached via :meth:`GenerationGraph.maybe_transition`, and the
-            terminal ``done`` state.  Also fires once after the loop exits
-            so the user sees the final resting state regardless of how the
-            loop terminated (normal ``done``, ``max_new_tokens`` cap, or
-            ``stop_token_ids`` early-stop).  Rank-0 gated via
-            ``LOCAL_RANK`` so multi-rank dispatch doesn't multiplex the
-            output.  Default ``False`` so the runtime stays quiet for
-            unit / print-flow tests.
 
-            Functions as a coarse progress indicator for long-running
-            inference — Janus T2I e.g. shows ``prompt_encode → image_vq →
-            image_vq_end → done`` so the user can see which FSM span is
-            currently in flight (the 576-step ``image_vq`` loop is by far
-            the slowest, and the user reads the breakdown from the step
-            deltas between consecutive lines).
+        A coarse progress trail is always emitted via
+        :meth:`logger.info_rank0` — one ``[FSM] step <N>: <state>`` line
+        each time the FSM enters a new state (the initial state at step 0,
+        every state reached via :meth:`GenerationGraph.maybe_transition`,
+        and the terminal ``done`` state).  It fires once more after the loop
+        exits so the final resting state is always reported regardless of
+        how the loop terminated (normal ``done``, ``max_new_tokens`` cap, or
+        ``stop_token_ids`` early-stop).  This lets the user follow which FSM
+        span is in flight for long-running inference — Janus T2I e.g. shows
+        ``prompt_encode → image_vq → image_vq_end → done``, where the
+        576-step ``image_vq`` loop dominates and is read off the step deltas
+        between consecutive lines.
         """
         if self.generation_graph is None:
             raise RuntimeError(
@@ -337,7 +333,7 @@ class OmniModel(nn.Module):
 
         modules = {name: _unwrap_module(getattr(self, name)) for name in self._module_names}
 
-        # State-transition tracker for the optional ``progress`` print.
+        # State-transition tracker for the progress trail.
         # ``maybe_transition`` flips the FSM's current state at the END of
         # each iteration body, so checking at the START of the NEXT body
         # is what catches every state change (including the initial state
@@ -345,20 +341,12 @@ class OmniModel(nn.Module):
         # check after the loop catches the transition into ``done`` (the
         # while-cond exits the loop before the body iterates that state).
         last_printed_state: Optional[str] = None
-        # Mirror :func:`veomni.utils.logging.info_rank0`'s rank-gate so the
-        # progress trail doesn't multiplex on multi-rank dispatch.  We
-        # deliberately bypass the logger and use ``print`` so the line lands
-        # without the ``[INFO|file:line] timestamp >>`` formatter prefix
-        # diluting the signal — the user asked for a clean progress bar.
-        progress_is_rank0 = int(os.getenv("LOCAL_RANK", "0")) == 0
 
         def _emit_progress() -> None:
             nonlocal last_printed_state
-            if not progress or not progress_is_rank0:
-                return
             current = self.generation_graph.current_state_name
             if current != last_printed_state:
-                print(f"[FSM] step {total_steps:>4}: {current}", flush=True)
+                logger.info_rank0(f"[FSM] step {total_steps:>4}: {current}")
                 last_printed_state = current
 
         total_steps = 0
