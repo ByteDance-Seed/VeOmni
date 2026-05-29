@@ -158,8 +158,9 @@ class EdgeDef:
 def scalar_token_id(value: Any) -> Optional[int]:
     """Extract one token id from ``input_ids`` (scalar, tensor, or nested list).
 
-    Used by the FSM (``token_match``), ``OmniModel.generate`` stop checks,
-    and modules that inspect the sampled token after ``decode``.
+    Used by modules that inspect the sampled token after ``decode`` (e.g.
+    ``JanusTextEncoder.decode`` reads the last id to decide which one-shot
+    ``module_signal`` to emit).
     """
     if isinstance(value, torch.Tensor):
         if value.numel() == 0:

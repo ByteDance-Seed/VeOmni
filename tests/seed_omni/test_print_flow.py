@@ -200,9 +200,9 @@ def test_fsm_interleave_text_to_image_to_text():
         text_ar         iter 1: tok=10         → no transition
         text_ar         iter 2: tok=11         → no transition
         text_ar         iter 3: tok=<boi>      → image_vq_start
-        image_vq_start  iter 1                  → steps_complete → image_vq
-        image_vq        iter 1..3               → steps_complete → image_vq_end
-        image_vq_end    iter 1                  → steps_complete → text_ar
+        image_vq_start  iter 1                  → default → image_vq
+        image_vq        iter 1..3               → image_complete → image_vq_end
+        image_vq_end    iter 1                  → default → text_ar
         text_ar         iter 4: tok=20         → no transition
         text_ar         iter 5: tok=21         → no transition
         text_ar         iter 6: tok=</s>       → done
@@ -232,11 +232,11 @@ def test_fsm_interleave_text_to_image_to_text():
         text_ar_step * 3
         + [f"transition: text_ar -> image_vq_start [module_signal({SIGNAL_START_IMAGE_GEN})]"]
         + vq_start_step * 1
-        + ["transition: image_vq_start -> image_vq [steps_complete]"]
+        + ["transition: image_vq_start -> image_vq [default]"]
         + image_vq_step * 3
         + ["transition: image_vq -> image_vq_end [module_signal(image_complete)]"]
         + vq_end_step * 1
-        + ["transition: image_vq_end -> text_ar [steps_complete]"]
+        + ["transition: image_vq_end -> text_ar [default]"]
         + text_ar_step * 3
         + [f"transition: text_ar -> done [module_signal({SIGNAL_TEXT_DONE})]"]
     )
@@ -325,13 +325,13 @@ def test_fsm_t2i_only_starts_with_prompt_state_and_ends_after_image():
     expected = (
         # prompt_to_image: tok_encode → run_ar (ar_run_sink triggers run_ar; no decode).
         ["prompt_to_image:tok_encode", "prompt_to_image:run_ar"]
-        + ["transition: prompt_to_image -> image_vq_start [steps_complete]"]
+        + ["transition: prompt_to_image -> image_vq_start [default]"]
         + ["image_vq_start:emit_image_start", "image_vq_start:run_ar"]
-        + ["transition: image_vq_start -> image_vq [steps_complete]"]
+        + ["transition: image_vq_start -> image_vq [default]"]
         + ["image_vq:run_ar", "image_vq:vae_decode"] * 2
         + ["transition: image_vq -> image_vq_end [module_signal(image_complete)]"]
         + ["image_vq_end:emit_image_end", "image_vq_end:run_ar"]
-        + ["transition: image_vq_end -> done [steps_complete]"]
+        + ["transition: image_vq_end -> done [default]"]
     )
     assert trace == expected, "trace mismatch:\n" + "\n".join(trace)
     assert model.generation_graph.is_done()
@@ -459,7 +459,7 @@ def test_fsm_module_signal_transition_fires_on_module_signal():
     image_vq_decodes = [e for e in trace if e == "image_vq:vae_decode"]
     assert len(image_vq_decodes) == n_patches
 
-    # The transition fired with the module_signal condition (not steps_complete).
+    # The transition fired with the module_signal condition.
     assert "transition: image_vq -> image_vq_end [module_signal(image_complete)]" in trace
 
 
@@ -529,6 +529,21 @@ def test_fsm_unknown_condition_type_rejected():
         _build_model(token_script=[], generation_graph=fsm)
 
 
+def test_fsm_default_condition_must_be_last():
+    """A `default` matches unconditionally; anything after it is dead code."""
+    import pytest
+
+    fsm = _load_generation_graph("interleave")
+    # Put the catch-all `default` BEFORE the signal checks — the signal
+    # transitions would never fire, so the FSM must reject it at build time.
+    fsm["states"]["text_ar"]["transitions"] = [
+        {"condition": {"type": "default"}, "next_state": "done"},
+        {"condition": {"type": "module_signal", "key": "start_image_gen"}, "next_state": "image_vq_start"},
+    ]
+    with pytest.raises(ValueError, match="must be last"):
+        _build_model(token_script=[], generation_graph=fsm)
+
+
 # ── Built-in `done` state + finalize hook ────────────────────────────────────
 
 
@@ -554,7 +569,7 @@ def test_fsm_user_declared_done_state_rejected():
     import pytest
 
     fsm = _load_generation_graph("interleave")
-    fsm["states"]["done"] = {"body": [], "token_length": {"type": "fixed", "value": 0}, "transitions": []}
+    fsm["states"]["done"] = {"body": [], "transitions": []}
     with pytest.raises(ValueError, match="reserved and auto-injected"):
         _build_model(token_script=[], generation_graph=fsm)
 
@@ -589,6 +604,9 @@ def test_finalize_hook_fires_on_done_and_collects_outputs():
     text_encoder = model.modules_dict["text_encoder"]
     text_encoder.finalize = lambda *, ctx, request: {"decoded": "hello world", "n_tokens": 1}
 
+    # `generate` no longer resets the FSM — the caller owns request
+    # boundaries, so re-prime before this second independent run.
+    model.reset()
     trace_custom: list[str] = []
     ctx_custom = model.generate(
         request={"prompt": "hi"},
@@ -688,13 +706,13 @@ def test_generation_graph_mermaid_renders_body_subgraphs_and_loops():
     # Transitions whose target is the `done` state route to the terminal node.
     assert f'state_text_ar ==>|"module_signal({SIGNAL_TEXT_DONE})"| fsm_done' in txt
 
-    # Self-loop iteration counts: `fixed: N` → label `×N`; `variable` → unlabelled.
-    # `image_vq` is variable (loops until module_signal fires), `text_ar` is variable
-    # (loops until module_signal fires) → both unlabelled.
+    # Self-loops are always unlabelled now — states have no iteration budget;
+    # a body iterates until a transition fires (module_signal or `default`).
     assert "state_image_vq -.-> state_image_vq" in txt
     assert "state_text_ar -.-> state_text_ar" in txt
-    # Bridge state has fixed=1 → labelled `×1`.
-    assert 'state_image_vq_start -.->|"×1"| state_image_vq_start' in txt
+    assert "state_image_vq_start -.-> state_image_vq_start" in txt
+    # No `×N` iteration-count labels remain.
+    assert "×" not in txt
 
 
 # ── OmniModel topology contract ──────────────────────────────────────────────

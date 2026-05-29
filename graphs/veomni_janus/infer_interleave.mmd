@@ -5,57 +5,48 @@ title: veomni_janus — infer_interleave
 flowchart LR
     fsm_start(("▶")):::fsm_start
     fsm_done(("⏹")):::fsm_terminal
-    subgraph state_prompt_to_text [prompt_to_text]
+    subgraph state_prompt_encode [prompt_encode]
         direction LR
-        prompt_to_text__siglip_encode["siglip_encode<br/><i>janus_siglip.forward</i>"]:::body_node
-        prompt_to_text__janus_llama["janus_llama<br/><i>janus_llama.forward</i>"]:::body_node
-        prompt_to_text__tok_encode["tok_encode<br/><i>janus_text_encoder.encode</i>"]:::body_node
-        prompt_to_text__tok_decode["tok_decode<br/><i>janus_text_encoder.decode</i>"]:::body_node
-        prompt_to_text__siglip_encode -->|"image_embeds → und_image_embeds"| prompt_to_text__janus_llama
-        prompt_to_text__tok_encode -->|"inputs_embeds"| prompt_to_text__janus_llama
-        prompt_to_text__janus_llama -->|"hidden_states"| prompt_to_text__tok_decode
+        prompt_encode__siglip_generate["siglip_generate<br/><i>janus_siglip.generate</i>"]:::body_node
+        prompt_encode__janus_llama_gen["janus_llama_gen<br/><i>janus_llama.generate</i>"]:::body_node
+        prompt_encode__tok_encode_generate["tok_encode_generate<br/><i>janus_text_encoder.generate</i>"]:::body_node
+        prompt_encode__tok_decode["tok_decode<br/><i>janus_text_encoder.decode</i>"]:::body_node
+        prompt_encode__siglip_generate -->|"conversation_list"| prompt_encode__janus_llama_gen
+        prompt_encode__tok_encode_generate -->|"conversation_list"| prompt_encode__janus_llama_gen
+        prompt_encode__janus_llama_gen -->|"hidden_states"| prompt_encode__tok_decode
     end
     subgraph state_text_ar [text_ar]
         direction LR
-        text_ar__tok_encode["tok_encode<br/><i>janus_text_encoder.encode</i>"]:::body_node
-        text_ar__janus_llama["janus_llama<br/><i>janus_llama.forward</i>"]:::body_node
+        text_ar__tok_encode_generate["tok_encode_generate<br/><i>janus_text_encoder.generate</i>"]:::body_node
+        text_ar__janus_llama_gen["janus_llama_gen<br/><i>janus_llama.generate</i>"]:::body_node
         text_ar__tok_decode["tok_decode<br/><i>janus_text_encoder.decode</i>"]:::body_node
-        text_ar__tok_encode -->|"inputs_embeds"| text_ar__janus_llama
-        text_ar__janus_llama -->|"hidden_states"| text_ar__tok_decode
-    end
-    subgraph state_image_vq_start [image_vq_start]
-        direction LR
-        image_vq_start__emit_image_start["emit_image_start<br/><i>janus_text_encoder.emit_image_start</i>"]:::body_node
-        image_vq_start__janus_llama["janus_llama<br/><i>janus_llama.forward</i>"]:::body_node
-        image_vq_start__emit_image_start -->|"inputs_embeds"| image_vq_start__janus_llama
+        text_ar__tok_encode_generate -->|"conversation_list"| text_ar__janus_llama_gen
+        text_ar__janus_llama_gen -->|"hidden_states"| text_ar__tok_decode
     end
     subgraph state_image_vq [image_vq]
         direction LR
-        image_vq__janus_llama["janus_llama<br/><i>janus_llama.forward</i>"]:::body_node
-        image_vq__vae_decode["vae_decode<br/><i>janus_vqvae.decode</i>"]:::body_node
-        image_vq__janus_llama -->|"hidden_states"| image_vq__vae_decode
-        image_vq__vae_decode -->|"embed → inputs_embeds"| image_vq__janus_llama
+        image_vq__janus_llama_gen["janus_llama_gen<br/><i>janus_llama.generate</i>"]:::body_node
+        image_vq__vae_generate["vae_generate<br/><i>janus_vqvae.generate</i>"]:::body_node
+        image_vq__janus_llama_gen -->|"hidden_states"| image_vq__vae_generate
+        image_vq__vae_generate -->|"conversation_list"| image_vq__janus_llama_gen
     end
     subgraph state_image_vq_end [image_vq_end]
         direction LR
         image_vq_end__emit_image_end["emit_image_end<br/><i>janus_text_encoder.emit_image_end</i>"]:::body_node
-        image_vq_end__janus_llama["janus_llama<br/><i>janus_llama.forward</i>"]:::body_node
-        image_vq_end__emit_image_end -->|"inputs_embeds"| image_vq_end__janus_llama
     end
-    state_prompt_to_text -.->|"×1"| state_prompt_to_text
+    state_prompt_encode -.-> state_prompt_encode
     state_text_ar -.-> state_text_ar
-    state_image_vq_start -.->|"×1"| state_image_vq_start
     state_image_vq -.-> state_image_vq
-    state_image_vq_end -.->|"×1"| state_image_vq_end
-    fsm_start ==> state_prompt_to_text
-    state_prompt_to_text ==>|"module_signal(text_done)"| fsm_done
-    state_prompt_to_text ==>|"steps_complete"| state_text_ar
-    state_text_ar ==>|"module_signal(start_image_gen)"| state_image_vq_start
+    state_image_vq_end -.-> state_image_vq_end
+    fsm_start ==> state_prompt_encode
+    state_prompt_encode ==>|"module_signal(start_image_gen)"| state_image_vq
+    state_prompt_encode ==>|"module_signal(text_done)"| fsm_done
+    state_prompt_encode ==>|"default"| state_text_ar
+    state_text_ar ==>|"module_signal(start_image_gen)"| state_image_vq
     state_text_ar ==>|"module_signal(text_done)"| fsm_done
-    state_image_vq_start ==>|"steps_complete"| state_image_vq
     state_image_vq ==>|"module_signal(image_complete)"| state_image_vq_end
-    state_image_vq_end ==>|"steps_complete"| state_text_ar
+    state_image_vq_end ==>|"default"| state_text_ar
     classDef body_node fill:#fff,stroke:#666
     classDef fsm_start fill:#dff,stroke:#06c,stroke-width:2px
     classDef fsm_terminal fill:#eee,stroke:#333,stroke-width:1px,stroke-dasharray:3 3
-    style state_prompt_to_text fill:#eef,stroke:#06c,stroke-width:2px
+    style state_prompt_encode fill:#eef,stroke:#06c,stroke-width:2px

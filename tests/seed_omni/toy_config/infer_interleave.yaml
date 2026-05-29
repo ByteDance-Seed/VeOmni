@@ -5,25 +5,21 @@ generation_graph:
   states:
     text_ar:
       body: [tok_enc_to_ar, ar_to_tok_dec, tok_dec_sink]
-      token_length: { type: variable }
       transitions:
         - { condition: { type: module_signal, key: start_image_gen }, next_state: image_vq_start }
         - { condition: { type: module_signal, key: text_done }, next_state: done }
 
     image_vq_start:
       body: [emit_start_to_ar, emit_start_sink, ar_run_sink]
-      token_length: { type: fixed, value: 1 }
       transitions:
-        - { condition: { type: steps_complete }, next_state: image_vq }
+        - { condition: { type: default }, next_state: image_vq }
 
     image_vq:
       body: [ar_to_vae_dec, vae_dec_to_ar]
-      token_length: { type: variable }
       transitions:
         - { condition: { type: module_signal, key: image_complete }, next_state: image_vq_end }
 
     image_vq_end:
       body: [emit_end_to_ar, emit_end_sink, ar_run_sink]
-      token_length: { type: fixed, value: 1 }
       transitions:
-        - { condition: { type: steps_complete }, next_state: text_ar }
+        - { condition: { type: default }, next_state: text_ar }

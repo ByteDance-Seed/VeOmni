@@ -486,6 +486,11 @@ class OmniInferencer:
             "conversation_list": conversation,
             "generation_kwargs": req.generation_kwargs,
         }
+        # Each ``_run`` is an independent request, so reset the FSM to its
+        # initial state here (the request boundary).  ``generate`` itself
+        # never resets — that's reserved for the caller so a future
+        # multi-turn conversation can keep cache across turns.
+        self.model.reset()
         trace_buf: list[str] = []
         # ``OmniModel.generate`` initialises ``ctx`` from ``context`` (or
         # from ``request`` when ``context`` is None) — we pass the same dict

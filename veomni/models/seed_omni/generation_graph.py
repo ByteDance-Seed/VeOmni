@@ -49,48 +49,47 @@ method name (e.g. ``vq_decoder.decode``) dispatch to that method as-is.  This
 keeps training and inference consuming the same pool while letting modules
 expose specialised inference routines.
 
-  token_length
-      How many auto-regressive iterations to spend in this state:
-
-        ``{type: fixed, value: N}``        — always N iterations.
-        ``{type: variable}``               — run until a transition fires.
-        ``{type: from_request, key: K}``   — read N from the generation
-                                             request dict.
-        ``{type: from_generated_text, key: K}``
-                                           — parse N from a previously
-                                             generated text field in ctx.
-
   transitions
       Ordered list of ``{condition: ..., next_state: S}`` items checked after
-      every iteration.  First matching condition wins.  Supported conditions:
+      every iteration of the state body.  First matching condition wins.
 
-        ``{type: steps_complete}``
-            Fires when the current state has run its allotted iterations.
-            Useless on a ``token_length: variable`` state (steps_done never
-            reaches ``None``).
+      A state has **no iteration-count budget**: its body runs once and then
+      keeps iterating until one of its transitions fires.  Modules — not the
+      FSM — decide when a state ends, either by raising a signal (the AR
+      loop case) or implicitly after a single pass (the bridge/leaf case,
+      via a ``default`` transition).  Supported conditions:
 
-        ``{type: module_signal, key: K}``  (alias: ``ctx_flag``)
+        ``{type: module_signal, key: K}``
             Fires when ``context["module_signal"] == K``.  Modules write a
             one-shot string signal into ``ctx["module_signal"]`` from inside
             ``generate_step`` / ``decode`` — e.g. ``JanusTextEncoder.decode``
             sets ``"start_image_gen"`` / ``"text_done"`` after sampling; a VQ
             decoder sets ``"image_complete"`` on the final patch.  The
             framework **auto-clears** ``ctx["module_signal"]`` once the
-            transition fires.  Pair with ``token_length: variable``.  The FSM
-            never inspects raw token ids — vocabulary semantics stay inside
-            the module.
+            transition fires.  This is how an AR loop state (e.g. ``image_vq``)
+            keeps iterating until its module says "done".  The FSM never
+            inspects raw token ids — vocabulary semantics stay inside the
+            module.
 
-        ``{type: token_match, token_id: T}``  *(deprecated)*
-            Legacy: fires when the last ``input_ids`` token equals ``T``.  Prefer
-            ``module_signal`` so token ids are not duplicated in YAML.
+        ``{type: default}``
+            The catch-all (switch-``default``) branch — matches
+            unconditionally.  Because transitions are evaluated in order and
+            the first match wins, a ``default`` is the lowest-priority
+            **fallback**: it fires only when none of the conditions listed
+            *before* it matched.  It MUST therefore be the last transition in
+            a state (the FSM rejects a ``default`` that isn't, since any
+            transition after it would be dead code).  Two uses:
 
-        ``{type: always}``
-            Unconditional — useful as a fallback / terminal transition.
+            * sole transition on a deterministic single-pass bridge / leaf
+              state (prompt encode, ``<boi>`` / ``<eoi>`` emit) — run the
+              body once, then advance;
+            * the else-branch after one or more ``module_signal`` checks
+              (e.g. "sampled a normal text token → keep decoding").
 
 Usage
 -----
   >>> fsm = GenerationGraph(config["generation_graph"], config["nodes"], config["edges"])
-  >>> fsm.reset(request={"max_new_tokens": 512})
+  >>> fsm.reset()
   >>> ctx = {"input_ids": ..., "attention_mask": ...}
   >>> while not fsm.is_done():
   ...     ctx = fsm.step(modules, ctx)
@@ -108,20 +107,18 @@ from typing import Any, Callable, Dict, List, Optional
 import torch
 
 from .graph import (
-    END,
     EdgeDef,
     NodeDef,
     append_input_ids,
     is_end,
     is_step_input_ids,
     normalize_step_input_ids,
-    scalar_token_id,
 )
 
 
 # Reserved name for the framework-injected terminal state.  Every FSM
-# automatically gains a ``done`` state with empty body, no transitions, and
-# zero-length token budget — users must NOT declare it in their YAML.  All
+# automatically gains a ``done`` state with empty body and no transitions —
+# users must NOT declare it in their YAML.  All
 # transitions whose ``next_state`` is ``"done"`` therefore land on this
 # built-in state, and ``OmniModel.generate`` calls each active module's
 # :meth:`OmniModule.finalize` hook once the FSM enters it.
@@ -136,45 +133,33 @@ FSM_SIGNAL_KEY: str = "module_signal"
 # ── Condition helpers ─────────────────────────────────────────────────────────
 
 
-_KNOWN_CONDITION_TYPES = frozenset({"token_match", "steps_complete", "module_signal", "ctx_flag", "always"})
-_MODULE_SIGNAL_TYPES = frozenset({"module_signal", "ctx_flag"})
+_KNOWN_CONDITION_TYPES = frozenset({"module_signal", "default"})
 
 
 @dataclass
 class _Condition:
     type: str
-    token_id: Optional[int] = None
-    key: Optional[str] = None  # used by module_signal / ctx_flag
+    key: Optional[str] = None  # required by `module_signal`, forbidden otherwise
 
     def __post_init__(self) -> None:
         # Catch malformed YAML at FSM build time, not at first transition
         # check (which would otherwise silently never fire).
         if self.type not in _KNOWN_CONDITION_TYPES:
             raise ValueError(f"Unknown FSM condition type '{self.type}'. Supported: {sorted(_KNOWN_CONDITION_TYPES)}.")
-        if self.type == "token_match" and self.token_id is None:
-            raise ValueError("Condition `token_match` requires `token_id`.")
-        if self.type in _MODULE_SIGNAL_TYPES and not self.key:
-            raise ValueError(f"Condition `{self.type}` requires a non-empty `key`.")
-        if self.type != "token_match" and self.token_id is not None:
-            raise ValueError(f"Condition `{self.type}` does not accept `token_id`.")
-        if self.type not in _MODULE_SIGNAL_TYPES and self.key is not None:
+        if self.type == "module_signal" and not self.key:
+            raise ValueError("Condition `module_signal` requires a non-empty `key`.")
+        if self.type != "module_signal" and self.key is not None:
             raise ValueError(f"Condition `{self.type}` does not accept `key`.")
 
-    def check(self, context: Dict[str, Any], steps_done: int, total_steps: Optional[int]) -> bool:
-        if self.type == "token_match":
-            return scalar_token_id(context.get("input_ids")) == self.token_id
-        if self.type == "steps_complete":
-            return total_steps is not None and steps_done >= total_steps
-        if self.type in _MODULE_SIGNAL_TYPES:
+    def check(self, context: Dict[str, Any]) -> bool:
+        if self.type == "module_signal":
             return context.get(FSM_SIGNAL_KEY) == self.key
-        if self.type == "always":
+        if self.type == "default":
             return True
         return False
 
     def describe(self) -> str:
-        if self.type == "token_match":
-            return f"token_match({self.token_id})"
-        if self.type in _MODULE_SIGNAL_TYPES:
+        if self.type == "module_signal":
             return f"module_signal({self.key})"
         return self.type
 
@@ -183,36 +168,6 @@ class _Condition:
 class _Transition:
     condition: _Condition
     next_state: str
-
-
-# ── TokenLength spec ──────────────────────────────────────────────────────────
-
-
-@dataclass
-class _TokenLength:
-    type: str
-    value: Optional[int] = None
-    key: Optional[str] = None
-
-    def resolve(self, request: Dict[str, Any], context: Dict[str, Any]) -> Optional[int]:
-        """Return the number of iterations for this state, or ``None`` for variable."""
-        if self.type == "fixed":
-            return self.value
-        if self.type == "from_request":
-            return int(request.get(self.key, 0)) if self.key else None
-        if self.type == "from_generated_text":
-            val = context.get(self.key)
-            return int(val) if val is not None else None
-        return None  # variable
-
-    def describe(self) -> str:
-        if self.type == "fixed":
-            return f"fixed={self.value}"
-        if self.type == "from_request":
-            return f"from_request[{self.key}]"
-        if self.type == "from_generated_text":
-            return f"from_generated_text[{self.key}]"
-        return "variable"
 
 
 # ── State ─────────────────────────────────────────────────────────────────────
@@ -268,7 +223,6 @@ class _State:
                 sequence.append(endpoint)
         self.node_sequence: List[str] = sequence
 
-        self.token_length = _TokenLength(**spec.get("token_length", {"type": "variable"}))
         self.transitions: List[_Transition] = [
             _Transition(
                 condition=_Condition(**t["condition"]),
@@ -276,6 +230,17 @@ class _State:
             )
             for t in spec.get("transitions", [])
         ]
+
+        # A `default` condition matches unconditionally, so with first-match
+        # ordering it is the lowest-priority fallback — anything after it is
+        # dead code.  Reject that at build time so the priority is explicit.
+        for i, trans in enumerate(self.transitions[:-1]):
+            if trans.condition.type == "default":
+                raise ValueError(
+                    f"State '{name}': a `default` transition must be last (it fires "
+                    f"unconditionally, so the {len(self.transitions) - i - 1} transition(s) after "
+                    f"it would never run). Move `default` to the end of `{name}.transitions`."
+                )
 
 
 # ── GenerationGraph ───────────────────────────────────────────────────────────
@@ -340,12 +305,12 @@ class GenerationGraph:
             name: _State(name, spec, node_pool, edge_pool) for name, spec in fsm_config["states"].items()
         }
 
-        # Inject the built-in terminal state.  Empty body, zero-length token
-        # budget, no outgoing transitions: the FSM "rests" here and the
-        # orchestrator picks up the post-processing baton via finalize hooks.
+        # Inject the built-in terminal state.  Empty body, no outgoing
+        # transitions: the FSM "rests" here and the orchestrator picks up the
+        # post-processing baton via finalize hooks.
         self._states[DONE_STATE_NAME] = _State(
             DONE_STATE_NAME,
-            {"body": [], "token_length": {"type": "fixed", "value": 0}, "transitions": []},
+            {"body": [], "transitions": []},
             node_pool,
             edge_pool,
         )
@@ -365,18 +330,12 @@ class GenerationGraph:
 
         # Runtime state — reset before each generate call.
         self._current: str = self._initial
-        self._steps_in_state: int = 0
-        self._total_steps: Optional[int] = None
-        self._request: Dict[str, Any] = {}
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
-    def reset(self, request: Optional[Dict[str, Any]] = None) -> None:
+    def reset(self) -> None:
         """Reset FSM to the initial state for a new generation request."""
         self._current = self._initial
-        self._steps_in_state = 0
-        self._request = request or {}
-        self._total_steps = self._current_state.token_length.resolve(self._request, {})
 
     def is_done(self) -> bool:
         """Return True when the FSM has reached the framework-injected terminal state."""
@@ -540,7 +499,6 @@ class GenerationGraph:
                 if i < fi:
                     pending[edge.to] -= 1
 
-        self._steps_in_state += 1
         if pending_step_ids is not None:
             ctx["input_ids"] = append_input_ids(context.get("input_ids"), pending_step_ids)
             prev_mask = context.get("attention_mask")
@@ -559,15 +517,15 @@ class GenerationGraph:
 
         Returns True if a transition fired (state changed).
 
-        For ``module_signal`` / ``ctx_flag`` transitions ``context["module_signal"]``
-        is popped after logging the trace and before the state switch.
+        For ``module_signal`` transitions ``context["module_signal"]`` is
+        popped after logging the trace and before the state switch.
         """
         state = self._current_state
         for trans in state.transitions:
-            if trans.condition.check(context, self._steps_in_state, self._total_steps):
+            if trans.condition.check(context):
                 if trace is not None:
                     trace.append(f"transition: {state.name} -> {trans.next_state} [{trans.condition.describe()}]")
-                if trans.condition.type in _MODULE_SIGNAL_TYPES:
+                if trans.condition.type == "module_signal":
                     context.pop(FSM_SIGNAL_KEY, None)
                 self._transition_to(trans.next_state, context)
                 return True
@@ -586,10 +544,6 @@ class GenerationGraph:
     @property
     def current_state_name(self) -> str:
         return self._current
-
-    @property
-    def steps_in_current_state(self) -> int:
-        return self._steps_in_state
 
     def state_node_sequence(self, state_name: str) -> List[str]:
         """Return the derived node-execution sequence for a given state."""
@@ -610,15 +564,12 @@ class GenerationGraph:
         subgraph are namespaced as ``<state>__<node>`` so the same node
         can appear in multiple states without ID collisions.
 
-        A dashed self-loop on each subgraph carries the iteration count:
-
-        * ``token_length: fixed: N``  → label ``×N``
-        * ``variable`` / ``from_request[K]`` / ``from_generated_text[K]``
-          → no label.  These have no static upper bound, matching
-          "如果没有次数限制那就不写数字".
+        A dashed (unlabelled) self-loop on each subgraph marks that the
+        state body iterates until one of its transitions fires — there is no
+        static iteration count to display (modules decide when to leave).
 
         State transitions are thick arrows (``==>``) carrying the firing
-        condition (e.g. ``module_signal(start_image_gen)``, ``steps_complete``).
+        condition (e.g. ``module_signal(start_image_gen)``, ``default``).
         The line weight + simpler label distinguishes them visually from
         the intra-body data edges.
 
@@ -669,13 +620,9 @@ class GenerationGraph:
                 lines.append(f"        {name}__{e.from_} {arrow} {name}__{e.to}")
             lines.append("    end")
 
-        # ── Self-loops carrying the per-state iteration count ─────────────────
+        # ── Self-loops marking that a state body iterates until a transition ──
         for name in drawn:
-            loop_label = self._loop_label(self._states[name].token_length)
-            if loop_label:
-                lines.append(f'    state_{name} -.->|"{loop_label}"| state_{name}')
-            else:
-                lines.append(f"    state_{name} -.-> state_{name}")
+            lines.append(f"    state_{name} -.-> state_{name}")
 
         # ── Entry edge ────────────────────────────────────────────────────────
         if self._initial in self._states and self._initial != done_name:
@@ -713,18 +660,6 @@ class GenerationGraph:
             return f'"{e.output_key}"'
         return ""
 
-    @staticmethod
-    def _loop_label(tl: _TokenLength) -> str:
-        """Self-loop label encoding the iteration count.
-
-        Only ``fixed: N`` produces a static count (``×N``).  Variable and
-        runtime-resolved kinds (``from_request`` / ``from_generated_text``)
-        return an empty string — the loop arrow is drawn unlabelled.
-        """
-        if tl.type == "fixed" and tl.value is not None:
-            return f"×{tl.value}"
-        return ""
-
     # ── Internal ──────────────────────────────────────────────────────────────
 
     @property
@@ -733,8 +668,6 @@ class GenerationGraph:
 
     def _transition_to(self, next_state: str, context: Dict[str, Any]) -> None:
         self._current = next_state
-        self._steps_in_state = 0
-        self._total_steps = self._current_state.token_length.resolve(self._request, context)
 
 
-__all__ = ["GenerationGraph", "END"]
+__all__ = ["GenerationGraph"]

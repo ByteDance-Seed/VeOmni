@@ -192,6 +192,12 @@ class OmniModel(nn.Module):
         # dedup cursor (reset on each fresh ``generate`` run).
         self._last_printed_state: Optional[str] = None
 
+        # Prime per-request inference runtime state (FSM at its initial
+        # state).  :meth:`generate` deliberately does NOT reset, so a future
+        # multi-turn conversation can keep cache across turns and only wipe
+        # it when the caller explicitly invokes :meth:`reset`.
+        self.reset()
+
     @property
     def modules_dict(self) -> Dict[str, nn.Module]:
         """Back-compat dict view of the sub-modules.
@@ -277,6 +283,20 @@ class OmniModel(nn.Module):
 
     # ── Inference ─────────────────────────────────────────────────────────────
 
+    def reset(self) -> None:
+        """Clear per-conversation inference runtime state.
+
+        Re-points the generation FSM to its initial state (and is the future
+        home for clearing per-module KV / VQ caches).  Called once at
+        construction; afterwards the *caller* drives it at request
+        boundaries — :class:`OmniInferencer` resets before each independent
+        request, while a multi-turn conversation would reset only on an
+        explicit ``clear`` so cache survives across turns.  :meth:`generate`
+        never resets on its own.
+        """
+        if self.generation_graph is not None:
+            self.generation_graph.reset()
+
     def _emit_progress(self, total_steps: int) -> None:
         """Log one ``[FSM] step <N>: <state>`` line on a state change.
 
@@ -307,7 +327,8 @@ class OmniModel(nn.Module):
         Parameters
         ----------
         request:
-            Generation request dict (used for ``token_length.from_request``).
+            Generation request dict — seeds ``ctx`` when ``context`` is
+            ``None`` and is forwarded to each module's ``finalize`` hook.
         context:
             Initial generation context (input_ids, attention_mask, ...).  If
             ``None``, starts from a copy of ``request``.  During generation
@@ -339,8 +360,11 @@ class OmniModel(nn.Module):
         ``prompt_encode → image_vq → image_vq_end → done``, where the
         576-step ``image_vq`` loop dominates and is read off the step deltas
         between consecutive lines.
+
+        Note this does **not** reset the FSM — the caller owns request
+        boundaries via :meth:`reset` (so multi-turn conversations can keep
+        cache across turns).  The FSM runs from whatever state it is in.
         """
-        self.generation_graph.reset(request=request)
         ctx: Dict[str, Any] = dict(context if context is not None else request)
         # Per-request output accumulator for decoded multi-modal artefacts —
         # already postprocessed by each emitting module's processor into a

@@ -5,13 +5,11 @@ generation_graph:
   states:
     prompt_to_text:
       body: [vis_to_ar, tok_enc_to_ar, ar_to_tok_dec, tok_dec_sink]
-      token_length: { type: fixed, value: 1 }
       transitions:
         - { condition: { type: module_signal, key: text_done }, next_state: done }
-        - { condition: { type: steps_complete }, next_state: text_ar }
+        - { condition: { type: default }, next_state: text_ar }
 
     text_ar:
       body: [tok_enc_to_ar, ar_to_tok_dec, tok_dec_sink]
-      token_length: { type: variable }
       transitions:
         - { condition: { type: module_signal, key: text_done }, next_state: done }

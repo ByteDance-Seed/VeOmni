@@ -113,8 +113,9 @@ class PrintVQVAE(_PrintBase):
     ----------------------------
     A real Janus VQ decoder loops over a fixed grid (24×24 = 576 patches)
     and raises an internal "image complete" event on the final patch; the
-    FSM's ``image_vq`` state runs ``token_length: variable`` and listens
-    for that event via a ``module_signal(image_complete)`` transition.
+    FSM's ``image_vq`` state has no iteration budget — it keeps looping and
+    exits only when it sees that event via a ``module_signal(image_complete)``
+    transition.
 
     Tests configure the simulated grid size via ``image_steps`` — after
     ``image_steps`` consecutive inference ``decode()`` calls the module

@@ -58,19 +58,20 @@ YAML structure (maps 1-to-1 to this class):
   #    `next_state: done` land on the built-in terminal state which then
   #    triggers each active module's `finalize` hook (text decode /
   #    image save / etc).
+  #    States carry no iteration budget — a state body iterates until one of
+  #    its transitions fires, and modules decide when via signals (the AR
+  #    loop) or after a single pass via `default` (bridge/leaf states).
   generation_graph:
     initial: text_ar
     states:
       text_ar:
         body: [tok_enc_to_ar, ar_to_tok_dec, tok_dec_sink]
-        token_length: {type: variable}
         transitions:
-          - {condition: {type: token_match, token_id: 100578}, next_state: image_vq}
+          - {condition: {type: module_signal, key: start_image_gen}, next_state: image_vq}
       image_vq:
         body: [ar_to_vae_dec, vae_dec_to_ar]
-        token_length: {type: fixed, value: 576}
         transitions:
-          - {condition: {type: steps_complete}, next_state: text_ar}
+          - {condition: {type: module_signal, key: image_complete}, next_state: text_ar}
 """
 
 import os

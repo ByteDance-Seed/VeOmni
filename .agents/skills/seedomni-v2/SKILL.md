@@ -467,38 +467,50 @@ Editing `infer_<scenario>.yaml`:
 
 8. **`done` is framework-injected** — never declare a `done:` state block, never set `done_state`. `GenerationGraph` auto-injects a `done` state with empty body, no transitions, zero token budget; transitions whose `next_state: done` land on it. Authoring either knob is a hard error (raised at FSM build time). When the FSM enters `done`, `OmniModel.generate` walks every active module and calls its **`finalize(ctx, request)` hook**, merging non-empty returns into `ctx['finalize'][<module_name>]`. Override `finalize` on a module when you need to dump accumulated outputs — tokenizer-decode all generated `input_ids`, save accumulated VQ patches as images, write audio waveforms. The framework imposes no accumulation scheme: modules that need cross-step history append into a running list inside `ctx` during their own `generate_step`, then read it back in `finalize`.
 
-9. **FSM transition conditions** — two primary types for inference:
+9. **FSM transition conditions** — states carry **no iteration-count budget**. A state body runs once and then keeps iterating until one of its transitions fires; *modules* decide when a state ends. Two primary types for inference:
 
    | Type | Who decides | YAML shape | Example |
    |------|-------------|------------|---------|
-   | `steps_complete` | Framework outer loop (fixed token budget) | `{ type: steps_complete }` | Image VQ span with known patch count |
    | `module_signal` | Module writes a one-shot flag in its return dict | `{ type: module_signal, key: K }` | VQ decoder emits `image_complete`; text decoder emits `start_image_gen` / `text_done` |
+   | `default` | Catch-all fallback — matches unconditionally, **must be listed last** | `{ type: default }` | Single-pass bridge/leaf states (prompt encode, `<boi>` / `<eoi>` emit) or the else-branch after `module_signal` checks |
 
-   **`module_signal`** (alias: `ctx_flag` for backward compat) — when a state's exit condition is "the module decided it's finished" (e.g. VQ decoder hit the last patch of a 24×24 grid; text decoder sampled `<begin_of_image>` or `</s>`), use `token_length: { type: variable }` paired with a `module_signal` transition:
+   **`module_signal`** — when a state's exit condition is "the module decided it's finished" (e.g. VQ decoder hit the last patch of a 24×24 grid; text decoder sampled `<begin_of_image>` or `</s>`), the state simply loops on a `module_signal` transition:
 
     ```yaml
     image_vq:
       body: [ar_to_vae_decode, vae_decode_to_ar]
-      token_length: { type: variable }
       transitions:
         - { condition: { type: module_signal, key: image_complete }, next_state: image_vq_end }
 
     text_ar:
       body: [tok_encode, janus_llama, tok_decode]
-      token_length: { type: variable }
       transitions:
         - { condition: { type: module_signal, key: start_image_gen }, next_state: image_vq_start }
         - { condition: { type: module_signal, key: text_done }, next_state: done }
     ```
 
-    The module writes the signal key (`True`) from inside its `generate_step` (or `decode`/`encode`/etc). For text transitions, **do not** use `token_match` with hard-coded token ids in YAML — resolve ids via `set_tokenizer()` on the module and emit `module_signal` keys instead (see `JanusTextEncoder.decode`).
+    The module writes the signal key from inside its `generate_step` (or `decode`/`encode`/etc). The FSM never inspects raw token ids — resolve ids via `set_tokenizer()` on the module and emit `module_signal` keys instead (see `JanusTextEncoder.decode`).
 
-    The framework checks `ctx[<key>]` after each step and **automatically pops the key** once the transition fires — so a one-shot signal never stale-fires the next state. Hard rules:
+   **`default`** — the switch-`default` catch-all: it matches unconditionally, so with first-match ordering it is the lowest-priority **fallback**. Use it for a deterministic single-pass state (run the body once, then advance) or as the else-branch after `module_signal` checks. It **must be the last** transition in a state — the FSM raises at build time otherwise, since any transition after a `default` is dead code:
 
-    - **Don't** use `token_length: fixed: 576` for VQ image generation — the patch budget belongs to the *model* (real VQ decoders carry their own grid arithmetic), not the YAML.
-    - **Don't** mix `module_signal` with `token_length: fixed: N` — match `variable` with `module_signal` to express "loop until the module says stop" cleanly.
-    - **Naming**: pick a key that is unique across the FSM lifetime (`image_complete`, `start_image_gen`, `text_done`, …).
-    - `token_match` is deprecated for new graphs — prefer `module_signal`. Build-time validation rejects unknown types and missing `key` / `token_id` fields.
+    ```yaml
+    image_vq_start:           # leaf — append <begin_of_image>, then advance
+      body: [emit_start_sink]
+      transitions:
+        - { condition: { type: default }, next_state: image_vq }
+
+    prompt_encode:            # branch on the sampled token, else fall through
+      body: [vision_to_llm, tokenc_to_llm, llm_to_tokdec, tok_decode_sink]
+      transitions:
+        - { condition: { type: module_signal, key: text_done }, next_state: done }
+        - { condition: { type: default }, next_state: text_ar }
+    ```
+
+    The framework checks `ctx[<key>]` after each step and **automatically pops the key** once a `module_signal` transition fires — so a one-shot signal never stale-fires the next state. Hard rules:
+
+    - **Don't** try to express a fixed patch budget (e.g. 576) in YAML — there is no `token_length` knob anymore. The patch budget belongs to the *model* (real VQ decoders carry their own grid arithmetic); the FSM loops until the module raises `image_complete`.
+    - **Naming**: pick a signal key that is unique across the FSM lifetime (`image_complete`, `start_image_gen`, `text_done`, …).
+    - Only two condition types exist: `module_signal` and `default`. Build-time validation rejects unknown types, a missing `key` on `module_signal`, and a `default` that isn't listed last.
 
 ## Phase 6 — Validate
 

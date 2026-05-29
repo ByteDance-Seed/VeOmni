@@ -22,41 +22,45 @@ generation_graph:
 
   states:
     prompt_encode:
+      # Single body pass that samples the first token: branch on the module
+      # signal it raises, else fall through (`default`) to text_ar.  `default`
+      # is the lowest-priority fallback and must be last — the signal checks
+      # above win first.
       body:
         - vision_to_llm
         - tokenc_to_llm
         - llm_to_tokdec
         - tok_decode_sink
-      token_length: { type: fixed, value: 1 }
       transitions:
         - { condition: { type: module_signal, key: start_image_gen }, next_state: image_vq }
         - { condition: { type: module_signal, key: text_done }, next_state: done }
-        - { condition: { type: steps_complete }, next_state: text_ar }
+        - { condition: { type: default }, next_state: text_ar }
 
     text_ar:
+      # AR loop: repeats (no transition fires) until the LM samples <boi>
+      # (start_image_gen) or <eos> (text_done).
       body:
         - tokenc_to_llm
         - llm_to_tokdec
         - tok_decode_sink
-      token_length: { type: variable }
       transitions:
         - { condition: { type: module_signal, key: start_image_gen }, next_state: image_vq }
         - { condition: { type: module_signal, key: text_done }, next_state: done }
 
     image_vq:
+      # AR loop: repeats until vae_generate raises `image_complete`.
       body:
         - llm_to_vaegen
         - vaegen_to_llm
-      token_length: { type: variable }
       transitions:
         - { condition: { type: module_signal, key: image_complete }, next_state: image_vq_end }
 
     image_vq_end:
-      # After eoi, fall back to text_ar so the model can keep speaking
-      # (or emit eos / another <boi>).  The eoi part's `inputs_embeds`
-      # is consumed by text_ar's first llama tail-only forward.
+      # Single pass: after eoi, fall back to text_ar so the model can keep
+      # speaking (or emit eos / another <boi>).  The eoi part's
+      # `inputs_embeds` is consumed by text_ar's first llama tail-only
+      # forward.
       body:
         - emit_end_sink
-      token_length: { type: fixed, value: 1 }
       transitions:
-        - { condition: { type: steps_complete }, next_state: text_ar }
+        - { condition: { type: default }, next_state: text_ar }

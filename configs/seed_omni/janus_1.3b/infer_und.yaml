@@ -15,15 +15,15 @@
 #
 # Flow
 # ----
-#   prompt_encode  (1 step: siglip_generate + tok_encode_generate +
+#   prompt_encode  (single pass: siglip_generate + tok_encode_generate +
 #                   janus_llama_gen.generate(prompt) + tok_decode
 #                   samples the first reply token)
 #     ├─ module_signal text_done → done   (eos came out immediately, rare)
-#     └─ steps_complete           → text_ar
+#     └─ default                  → text_ar
 #
-#   text_ar        (variable length: tok_encode_generate embeds the
-#                   tail token part appended by tok_decode → janus_llama_gen
-#                   AR step → tok_decode samples the next token.)
+#   text_ar        (AR loop: tok_encode_generate embeds the tail token part
+#                   appended by tok_decode → janus_llama_gen AR step →
+#                   tok_decode samples the next token; repeats until eos.)
 #     └─ module_signal text_done → done
 
 generation_graph:
@@ -45,10 +45,9 @@ generation_graph:
         - tokenc_to_llm         # tok_encode_generate → janus_llama_gen
         - llm_to_tokdec         # janus_llama_gen   → tok_decode
         - tok_decode_sink       # leaf — pin tok_decode into the body
-      token_length: { type: fixed, value: 1 }
       transitions:
         - { condition: { type: module_signal, key: text_done }, next_state: done }
-        - { condition: { type: steps_complete }, next_state: text_ar }
+        - { condition: { type: default }, next_state: text_ar }
 
     text_ar:
       # Subsequent AR steps.  tok_encode_generate sees a non-None
@@ -60,6 +59,5 @@ generation_graph:
         - tokenc_to_llm
         - llm_to_tokdec
         - tok_decode_sink
-      token_length: { type: variable }
       transitions:
         - { condition: { type: module_signal, key: text_done }, next_state: done }
