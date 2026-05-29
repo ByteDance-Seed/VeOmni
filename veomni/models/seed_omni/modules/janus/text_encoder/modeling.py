@@ -68,29 +68,34 @@ SIGNAL_TEXT_DONE = "text_done"
 # set is ignored when filtering ``generation_kwargs`` for the LM head.
 _SAMPLING_KWARGS = ("temperature", "top_p", "do_sample")
 
-# Janus DeepSeek prompt-format markers (lifted from the upstream
-# ``JanusProcessor`` chat template + tokenizer output).  Owned by this
-# module because per the V2 design the text encoder fully dictates the
-# on-the-wire layout — no upstream ``apply_chat_template`` call.
+# Janus DeepSeek prompt-format markers — byte-for-byte mirror of the
+# upstream Jinja chat template at
+# ``transformers.models.janus``'s ``chat_template.jinja``.  Owned by
+# this module because per the V2 design the text encoder fully dictates
+# the on-the-wire layout — no upstream ``apply_chat_template`` call.
 #
-# We intentionally drop the ``\n`` / ``\n\n`` separators that the
-# string-mode chat template emits: the Janus BPE tokenizer collapses
-# them to zero tokens in practice (verified against
-# ``JanusProcessor.apply_chat_template(..., tokenize=True)``), so they
-# are pure noise in the embedding stream.
+# Whitespace is baked into the marker strings themselves so the BPE
+# tokenizer sees the same byte stream HF does (each ``\n`` becomes a
+# real token id ``185`` — they are NOT zero-cost separators):
+#   * Trailing ``\n\n`` on the system prompt → turn separator.
+#   * Trailing ``" "`` on ``<|User|>:``       → matches ``"<|User|>: "``.
+#   * Leading ``\n\n`` on ``<|Assistant|>:`` → turn separator.
+# Plus :meth:`_inject_chat_template` lookahead-inserts a ``"\n"`` between
+# consecutive same-role parts (image → user_text) to match the per-
+# content ``\n`` the Jinja template emits inside a single message.
 #
-# Default system prompt mirrors
+# The default system prompt mirrors
 # :data:`transformers.models.janus.processing_janus.DEFAULT_SYSTEM_PROMPT`.
-# Janus checkpoints were trained / aligned with this prompt prepended;
-# omitting it produces incoherent generations (verified empirically
-# against the HF reference inference).
+# Janus checkpoints were aligned with this prompt prepended; omitting it
+# produces incoherent generations (verified empirically against HF).
 _JANUS_SYSTEM_PROMPT = (
     "You are a helpful language and vision assistant. "
     "You are able to understand the visual content that the user provides, "
     "and assist the user with a variety of tasks using natural language."
+    "\n\n"
 )
-_JANUS_USER_PREFIX = "<|User|>:"
-_JANUS_ASSISTANT_PREFIX = "<|Assistant|>:"
+_JANUS_USER_PREFIX = "<|User|>: "
+_JANUS_ASSISTANT_PREFIX = "\n\n<|Assistant|>:"
 
 
 class JanusTextEncoder(TextEncoder):
@@ -476,13 +481,13 @@ class JanusTextEncoder(TextEncoder):
         We walk the conversation once and produce the canonical Janus
         prompt format::
 
-            <bos><system_prompt><|User|>:<boi>[image]<eoi><user_text><|Assistant|>:[<assistant_text>]
+            <bos><system_prompt>\\n\\n<|User|>: <boi>[image]<eoi>\\n<user_text>\\n\\n<|Assistant|>:[<assistant_text>]
 
-        (Whitespace separators present in the string-mode chat template
-        — ``\\n`` between image and text, ``\\n\\n`` between user and
-        assistant — are intentionally omitted: Janus's BPE tokenizer
-        collapses them to zero tokens in the tokenized output, so
-        they're noise in the embedding stream.)
+        The ``\\n`` separators are baked into the role markers (see the
+        ``_JANUS_*`` constants above) except the per-content ``\\n``
+        between an image and a same-role text part, which is inserted
+        here via a one-step lookahead — same rule as the upstream Jinja
+        ``{%if not loop.last%}\\n{%endif%}``.
 
         Idempotent: runs once on the prompt pass (``past_key_values is
         None`` branch only) and tags each inserted marker part with
@@ -508,7 +513,7 @@ class JanusTextEncoder(TextEncoder):
 
         new_list: List[ConversationPart] = []
         prev_role: Optional[str] = None
-        for part in conversation_list:
+        for idx, part in enumerate(conversation_list):
             # Bos sits at the very front; system prompt rides right after.
             if part.kind == "token" and part.role == "system" and part.token_id == self._bos_token_id:
                 new_list.append(part)
@@ -523,15 +528,19 @@ class JanusTextEncoder(TextEncoder):
                 prev_role = part.role
 
             # Wrap each image_und with <begin_of_image> / <end_of_image>
-            # boundary tokens — matches the official tokenizer output
-            # for image-understanding (see comparison against
-            # JanusProcessor.apply_chat_template(..., tokenize=True)).
+            # boundary tokens, then insert a "\n" separator iff the next
+            # part is in the SAME role (i.e. image followed by user
+            # text) — mirrors the per-content "\n" the upstream Jinja
+            # template emits inside a single message.
             if part.kind == "image_und":
                 if self._boi_token_id is not None:
                     new_list.append(_token_marker("user", self._boi_token_id))
                 new_list.append(part)
                 if self._eoi_token_id is not None:
                     new_list.append(_token_marker("user", self._eoi_token_id))
+                next_part = conversation_list[idx + 1] if idx + 1 < len(conversation_list) else None
+                if next_part is not None and next_part.role == part.role:
+                    new_list.append(_text_marker(part.role, "\n"))
                 continue
 
             new_list.append(part)
