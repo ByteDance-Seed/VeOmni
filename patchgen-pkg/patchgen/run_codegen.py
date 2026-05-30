@@ -344,6 +344,11 @@ Examples:
   %(prog)s <patch_module> --dry-run
   %(prog)s <patch_module> --diff
   %(prog)s --list
+
+Drift check:
+  %(prog)s --check          # exit non-zero if generated files are stale
+  %(prog)s --check --fix    # overwrite checked-in files to match regen
+  See `%(prog)s --check --help` for drift-check-mode options.
         """,
     )
 
