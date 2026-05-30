@@ -17,7 +17,7 @@ Patch configuration for Qwen3_5Moe NPU/SP patched modeling generation.
 Regen command (preferred): `make patchgen` — runs all gen_configs together.
 
 Do NOT regenerate this file in isolation via
-``python -m veomni.patchgen.run_codegen veomni.models.transformers.qwen3_5_moe.qwen3_5_moe_npu_patch_gen_config ...``
+``patchgen veomni.models.transformers.qwen3_5_moe.qwen3_5_moe_npu_patch_gen_config ...``
 This gen_config imports helpers from
 ``qwen3_5_moe_gpu_patch_gen_config``; when patchgen runs it alone without
 first running the GPU config, the generated file drops several imports

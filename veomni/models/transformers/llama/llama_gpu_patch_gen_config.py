@@ -15,7 +15,7 @@
 Patch configuration for Llama GPU OpSlot-based kernel replacements.
 
 Regen command:
-python -m veomni.patchgen.run_codegen veomni.models.transformers.llama.llama_gpu_patch_gen_config -o veomni/models/transformers/llama/generated
+patchgen veomni.models.transformers.llama.llama_gpu_patch_gen_config -o veomni/models/transformers/llama/generated
 
 Patches:
 - OpSlot guards for RMSNorm, SwiGLU MLP, RoPE, and (sequence-classification +

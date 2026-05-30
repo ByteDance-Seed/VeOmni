@@ -29,7 +29,7 @@ Covers the thinker training path (text + vision + audio + MoE):
     VeOmni parallel plan.
 
 Regen command:
-python -m veomni.patchgen.run_codegen veomni.models.transformers.qwen3_omni_moe.qwen3_omni_moe_gpu_patch_gen_config -o veomni/models/transformers/qwen3_omni_moe/generated --diff
+patchgen veomni.models.transformers.qwen3_omni_moe.qwen3_omni_moe_gpu_patch_gen_config -o veomni/models/transformers/qwen3_omni_moe/generated --diff
 """
 
 import copy

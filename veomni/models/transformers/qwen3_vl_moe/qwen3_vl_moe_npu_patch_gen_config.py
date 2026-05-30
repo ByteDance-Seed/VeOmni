@@ -19,7 +19,7 @@ turn reuses the qwen3_vl VLM patches) and layers NPU kernel replacements on
 top (npu_rms_norm, npu_rotary_mul for text + vision).
 
 Regen command:
-python -m veomni.patchgen.run_codegen veomni.models.transformers.qwen3_vl_moe.qwen3_vl_moe_npu_patch_gen_config -o veomni/models/transformers/qwen3_vl_moe/generated --diff
+patchgen veomni.models.transformers.qwen3_vl_moe.qwen3_vl_moe_npu_patch_gen_config -o veomni/models/transformers/qwen3_vl_moe/generated --diff
 """
 
 from veomni.models.transformers.qwen3_vl.qwen3_vl_gpu_patch_gen_config import (

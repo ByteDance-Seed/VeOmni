@@ -3,7 +3,8 @@ name: Check Patchgen Drift
 on:
   pull_request:
     paths:
-      - "veomni/patchgen/**"
+      - "patchgen-pkg/**"
+      - "veomni/patchgen.py"
       - "veomni/models/transformers/**"
       - "pyproject.toml"
       - "uv.lock"
@@ -11,7 +12,8 @@ on:
     branches:
       - main
     paths:
-      - "veomni/patchgen/**"
+      - "patchgen-pkg/**"
+      - "veomni/patchgen.py"
       - "veomni/models/transformers/**"
       - "pyproject.toml"
       - "uv.lock"
@@ -33,4 +35,4 @@ jobs:
         uses: astral-sh/setup-uv@v8.1.0
 
       - name: Check patchgen drift
-        run: uv run --extra gpu --dev python -m veomni.patchgen.check_patchgen
+        run: uv run --extra gpu --dev patchgen --check

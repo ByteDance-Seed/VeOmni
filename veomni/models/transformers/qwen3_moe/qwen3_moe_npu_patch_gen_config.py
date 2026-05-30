@@ -15,7 +15,7 @@
 Patch configuration for Qwen3Moe NPU/SP patched modeling generation.
 
 Regen command:
-python -m veomni.patchgen.run_codegen veomni.models.transformers.qwen3_moe.qwen3_moe_npu_patch_gen_config -o veomni/models/transformers/qwen3_moe/generated --diff
+patchgen veomni.models.transformers.qwen3_moe.qwen3_moe_npu_patch_gen_config -o veomni/models/transformers/qwen3_moe/generated --diff
 
 This keeps only the needed v5 patches:
 1. NPU replacements for rotary/rms_norm/mlp.

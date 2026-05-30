@@ -14,7 +14,7 @@ Violating any of these causes silent bugs, crashes, or incorrect training result
    - Mismatches cause fallback to vanilla HuggingFace loading, which misses VeOmni patches (flash attention, sequence parallel).
 
 3. **Patchgen-generated files must not be edited manually**
-   - Files under `veomni/models/transformers/*/generated/` are created by `python -m veomni.patchgen.run_codegen`.
+   - Files under `veomni/models/transformers/*/generated/` are created by the `patchgen` CLI (entry point installed by the `patchgen` package).
    - Manual edits are silently overwritten on the next patchgen run.
    - To change generated behavior, edit the patch spec (`patch_spec.py`) or the modeling patch file (`modeling_*_patch.py`).
 

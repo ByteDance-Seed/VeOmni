@@ -11,35 +11,19 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""VeOmni patch generation utilities.
+"""AST-based patchgen for HuggingFace modeling files.
 
-This package is designed to be reused as a library by projects that depend
-on VeOmni so they can patch their own models in their own repos. Callers
-wire up their own discovery root + CLI via :func:`run_codegen.build_cli`
-and :func:`check_patchgen.build_cli`. See
-``docs/transformers_v5/patchgen.md`` section "Using patchgen from a
-dependent project" for the full recipe.
+Discovers ``*_patch_gen_config.py`` files under the caller's
+:class:`DiscoveryConfig`, rewrites the targeted ``transformers`` modeling
+module, and writes the result to a ``generated/`` sibling dir.
+
+The unified ``patchgen`` console script (``patchgen.cli:main``) is the
+intended entrypoint. Direct downstream callers can also build their own
+CLI via :func:`run_codegen.build_cli` and :func:`check_patchgen.build_cli`.
 
 The patchgen layer itself is transformers-version-agnostic: it only reads
 the source ``.py`` file off ``sys.path`` (no ``import transformers``
-required) and rewrites its AST. Dependent projects that pin transformers
-v4 can use this library the same way v5 callers do — provided their patch
-config targets a module file that actually exists on their installed
-transformers.
-
-Lazy submodule loading
-----------------------
-
-``check_patchgen`` and ``run_codegen`` are CLI entry points designed to
-be invoked via ``python -m veomni.patchgen.<sub>``. Eagerly re-exporting
-their contents here would force ``runpy`` to load each submodule twice
-(once as a regular module via this ``__init__``, then again as
-``__main__``) and emit a confusing
-``RuntimeWarning: found in sys.modules after import of package ...``.
-
-PEP 562 ``__getattr__`` defers the import until the symbol is actually
-accessed, so the warning never fires while top-level
-``from veomni.patchgen import DiscoveryConfig`` still works.
+required) and rewrites its AST.
 """
 
 from typing import TYPE_CHECKING
@@ -91,12 +75,12 @@ def __getattr__(name: str):
     Subtlety: ``run_codegen`` is both a public function AND the name of
     the submodule that defines it. Python's import machinery executes
     ``setattr(parent_pkg, submodule_name, submodule)`` after loading a
-    submodule, which would leave ``veomni.patchgen.run_codegen`` pointing
-    at the submodule (overriding any prior function binding) whenever
-    *any* lazy lookup imports that submodule for *any* symbol. We work
-    around it by pre-binding **all** re-exports from the just-imported
-    submodule, so the function shadows the submodule entry before
-    control returns to the caller.
+    submodule, which would leave ``patchgen.run_codegen`` pointing at the
+    submodule (overriding any prior function binding) whenever *any* lazy
+    lookup imports that submodule for *any* symbol. We work around it by
+    pre-binding **all** re-exports from the just-imported submodule, so
+    the function shadows the submodule entry before control returns to
+    the caller.
     """
     if name in _LAZY_EXPORTS:
         from importlib import import_module

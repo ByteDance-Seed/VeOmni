@@ -15,7 +15,7 @@
 Patch configuration for Qwen3_5 GPU/SP patched modeling generation.
 
 Regen command:
-python -m veomni.patchgen.run_codegen veomni.models.transformers.qwen3_5.qwen3_5_gpu_patch_gen_config -o veomni/models/transformers/qwen3_5/generated --diff
+patchgen veomni.models.transformers.qwen3_5.qwen3_5_gpu_patch_gen_config -o veomni/models/transformers/qwen3_5/generated --diff
 
 Language-model focused patches from qwen3_next example:
 1. Device-agnostic GatedDeltaNet init and varlen FLA forward.

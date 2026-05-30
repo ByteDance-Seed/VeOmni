@@ -110,7 +110,7 @@ def load_patch_config_module(module_name: str, search_roots: Optional[list[Path]
     """Load a patch-config module via ``spec_from_file_location`` when possible.
 
     The benefit kicks in when the patch config is **self-contained** —
-    i.e. its body only imports from ``veomni.patchgen`` and third-party
+    i.e. its body only imports from ``patchgen`` and third-party
     libraries, with no imports from its own package or siblings. In that
     case the loader skips executing the config's package ``__init__.py``
     (which a downstream project might use to register custom HF models,
@@ -125,10 +125,10 @@ def load_patch_config_module(module_name: str, search_roots: Optional[list[Path]
     ``sys.modules`` (e.g. an earlier config under the same parent was
     already loaded), subsequent loads no-op the parent.
 
-    Note: importing the patchgen library itself still runs
-    ``veomni/__init__.py``, so VeOmni's own runtime (torch, op patches) is
-    a hard prerequisite for using this function. The "skip parent
-    ``__init__``" benefit is scoped to the patch config's own package.
+    The "skip parent ``__init__``" benefit is scoped to the patch
+    config's own package — importing ``patchgen`` itself only loads
+    stdlib + this package's own modules and has no side effects on the
+    consuming project's runtime.
 
     Resolution order:
       1. If ``module_name`` maps to a file on disk under ``search_roots`` /
@@ -1254,59 +1254,3 @@ def generate_from_config(config: PatchConfig, output_dir: Optional[Path] = None)
         output_path = output_dir / config.target_file
 
     return generator.generate(output_path)
-
-
-# CLI interface
-if __name__ == "__main__":
-    import argparse
-    import sys
-
-    parser = argparse.ArgumentParser(description="Generate patched modeling code from a patch configuration.")
-    parser.add_argument(
-        "patch_module",
-        help="Python module containing the PatchConfig (e.g., 'veomni.models.transformers.qwen3.patches.qwen3_gpu_patches')",
-    )
-    parser.add_argument(
-        "-o",
-        "--output-dir",
-        type=Path,
-        default=None,
-        help="Output directory for generated files (default: sibling generated/ next to patch module)",
-    )
-    parser.add_argument(
-        "-c",
-        "--config-name",
-        default="config",
-        help="Name of the PatchConfig variable in the patch module (default: config)",
-    )
-
-    args = parser.parse_args()
-
-    try:
-        # Import the patch module
-        patch_module = importlib.import_module(args.patch_module)
-        config = getattr(patch_module, args.config_name)
-
-        output_dir = args.output_dir
-        if output_dir is None:
-            module_path = Path(patch_module.__file__).resolve()
-            if module_path.parent.name == "patches":
-                output_dir = module_path.parent.parent / "generated"
-            else:
-                output_dir = Path("generated")
-
-        if not isinstance(config, PatchConfig):
-            print(f"Error: {args.config_name} is not a PatchConfig instance", file=sys.stderr)
-            sys.exit(1)
-
-        # Generate the code
-        output = generate_from_config(config, output_dir)
-        print("\nGeneration complete!")
-        print(f"Output written to: {output_dir / config.target_file}")
-
-    except ImportError as e:
-        print(f"Error importing patch module: {e}", file=sys.stderr)
-        sys.exit(1)
-    except AttributeError as e:
-        print(f"Error: {e}", file=sys.stderr)
-        sys.exit(1)

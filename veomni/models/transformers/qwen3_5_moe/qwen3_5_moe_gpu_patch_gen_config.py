@@ -15,7 +15,7 @@
 Patch configuration for Qwen3_5Moe GPU/SP patched modeling generation.
 
 Regen command:
-python -m veomni.patchgen.run_codegen veomni.models.transformers.qwen3_5_moe.qwen3_5_moe_gpu_patch_gen_config -o veomni/models/transformers/qwen3_5_moe/generated --diff
+patchgen veomni.models.transformers.qwen3_5_moe.qwen3_5_moe_gpu_patch_gen_config -o veomni/models/transformers/qwen3_5_moe/generated --diff
 
 Patches applied:
 1. Fused MoE expert replacement (merged gate_up_proj layout).

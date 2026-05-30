@@ -15,7 +15,7 @@
 Patch configuration for Qwen2 GPU LigerKernel replacements.
 
 Regen command:
-python -m veomni.patchgen.run_codegen veomni.models.transformers.qwen2.qwen2_gpu_patch_gen_config -o veomni/models/transformers/qwen2/generated
+patchgen veomni.models.transformers.qwen2.qwen2_gpu_patch_gen_config -o veomni/models/transformers/qwen2/generated
 
 This mirrors the current runtime Qwen2 patches while moving the v5 path to an
 explicit patched modeling module.

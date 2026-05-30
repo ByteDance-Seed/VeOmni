@@ -26,8 +26,8 @@ Supported patch types:
 
 Example usage:
 
-    # veomni/models/transformers/qwen3/patches/qwen3_gpu_patches.py
-    from veomni.patchgen.patch_spec import PatchConfig, replace_class, override_method, replace_function
+    # <your_project>/models/qwen3/qwen3_patches.py
+    from patchgen import PatchConfig, replace_class, override_method, replace_function
 
     config = PatchConfig(
         source_module="transformers.models.qwen3.modeling_qwen3",

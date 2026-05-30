@@ -18,7 +18,7 @@ Inherits every GPU patch from `qwen3_vl_gpu_patch_gen_config` and layers NPU
 kernel replacements on top (npu_rms_norm, npu_rotary_mul for text + vision).
 
 Regen command:
-python -m veomni.patchgen.run_codegen veomni.models.transformers.qwen3_vl.qwen3_vl_npu_patch_gen_config -o veomni/models/transformers/qwen3_vl/generated --diff
+patchgen veomni.models.transformers.qwen3_vl.qwen3_vl_npu_patch_gen_config -o veomni/models/transformers/qwen3_vl/generated --diff
 """
 
 from veomni.models.transformers.qwen3_vl.qwen3_vl_gpu_patch_gen_config import (

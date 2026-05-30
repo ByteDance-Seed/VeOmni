@@ -136,6 +136,7 @@ flash-qla = [
 dev = [
   {include-group = "lint"},
   {include-group = "test"},
+  {include-group = "patchgen"},
 ]
 lint = [
   "pre-commit",
@@ -145,6 +146,19 @@ test = [
   "rich",
   "pytest",
   "expecttest",
+]
+# AST-based patchgen library. Build-time tool for regenerating modeling
+# patches under veomni/models/transformers/*/generated/; not imported on
+# the runtime path. Lives as a sibling project under ./patchgen-pkg/ for
+# monorepo dev; `[tool.uv.sources].patchgen` points uv at the path.
+# (Outer dir is ``patchgen-pkg`` rather than ``patchgen`` because Python's
+# namespace-package finder would otherwise treat the sibling dir as
+# ``import patchgen`` and shadow the editable install when cwd is the
+# VeOmni repo root.) When patchgen lands on PyPI / a byted SCM mirror,
+# move this entry to [project.optional-dependencies].dev so pip users can
+# install it via `pip install veomni[dev]`.
+patchgen = [
+  "patchgen>=0.1.0",
 ]
 # Pin the default transformers version via a dependency group. This is a
 # default group (see default-groups below), so `uv sync` always installs
@@ -209,6 +223,9 @@ conflicts = [
 ]
 
 [tool.uv.sources]
+# Sibling patchgen project under ./patchgen-pkg — once published, drop
+# this entry and uv resolves the version pin from the registry instead.
+patchgen = { path = "patchgen-pkg", editable = true }
 # To support override-dependencies for multiple extras, one package can only have one index.
 # Using pytorch index for all variants since it has both regular and +cpu versions
 torch = [
@@ -279,7 +296,19 @@ version = {attr = "veomni._version.__version__"}
 
 [tool.setuptools.packages.find]
 where = ["."]
-exclude = ["tests*", "ci*", "configs*", "veomni_patch", "tasks", "scripts"]
+# ``patchgen-pkg*`` keeps the sibling patchgen project from being bundled into
+# the veomni wheel — it ships separately. (The outer dir name carries the
+# ``-pkg`` suffix so setuptools' namespace-package finder doesn't see it as a
+# top-level ``patchgen`` package and shadow the editable install at dev time.)
+exclude = ["tests*", "ci*", "configs*", "veomni_patch", "tasks", "scripts", "patchgen-pkg*"]
+
+# VeOmni's own discovery config — used when running ``patchgen --check`` /
+# ``patchgen --all`` from this repo. Downstream projects override it in
+# their own pyproject.toml.
+[tool.patchgen]
+search_root = "veomni/models/transformers"
+package_prefix = "veomni.models.transformers"
+legacy_patches_prefix = "veomni.models.transformers.qwen3.patches"
 
 [tool.ruff]
 target-version = "py311"

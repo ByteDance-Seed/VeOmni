@@ -12,45 +12,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""
-Runner script for the Modeling Code Generator.
+"""Runner for the Modeling Code Generator.
 
-This script provides a convenient way to run the code generator with
-common configurations. It can be used as a CLI tool or imported.
-
-Usage:
-    # Generate from a specific patch configuration
-    python -m veomni.patchgen.run_codegen veomni.models.transformers.qwen3.qwen3_gpu_patch_gen_config
-
-    # Generate to a specific output directory
-    python -m veomni.patchgen.run_codegen veomni.models.transformers.qwen3.qwen3_gpu_patch_gen_config -o /path/to/output
-
-    # List available patch configurations
-    python -m veomni.patchgen.run_codegen --list
-
-    # Dry run (show what would be generated without writing)
-    python -m veomni.patchgen.run_codegen veomni.models.transformers.qwen3.qwen3_gpu_patch_gen_config --dry-run
-
-    # Generate modeling code and save unified diff alongside it
-    python -m veomni.patchgen.run_codegen veomni.models.transformers.qwen3.qwen3_gpu_patch_gen_config --diff
-
-Projects that depend on VeOmni can mount their own CLI rooted at their own
-search path via :func:`build_cli`, so they patch their own models without
-copy-pasting the runner::
-
-    # <your_project>/patchgen/__main__.py
-    from pathlib import Path
-    from veomni.patchgen.run_codegen import build_cli, DiscoveryConfig
-
-    main = build_cli(
-        DiscoveryConfig(
-            search_root=Path(__file__).resolve().parent.parent / "models",
-            package_prefix="<your_project>.models",
-        ),
-        prog_name="<your_project>.patchgen",
-    )
-    if __name__ == "__main__":
-        raise SystemExit(main())
+The unified ``patchgen`` console script (``patchgen.cli``) is the user
+entrypoint; this module exposes the :func:`build_cli` factory that
+``patchgen.cli`` and any direct downstream caller can use to drive
+codegen against their own :class:`DiscoveryConfig`.
 """
 
 from __future__ import annotations
@@ -67,11 +34,6 @@ from .codegen import CodegenError, ModelingCodeGenerator, load_patch_config_modu
 from .patch_spec import PatchConfig
 
 
-MODULE_DIR = Path(__file__).parent
-VEOMNI_DIR = MODULE_DIR.parent
-PACKAGE_NAME = __package__ or "veomni.patchgen"
-
-
 @dataclass(frozen=True)
 class DiscoveryConfig:
     """Where to find ``*_patch_gen_config.py`` files and how to name them.
@@ -80,16 +42,17 @@ class DiscoveryConfig:
         search_root: directory to walk for ``*_patch_gen_config.py`` files.
         package_prefix: dotted package prefix prepended to each file's path
             relative to ``search_root`` to form an importable module name.
-            For VeOmni's own configs: ``search_root=veomni/models/transformers``
-            + ``package_prefix="veomni.models.transformers"``.
-        legacy_patches_prefix: optional shortcut prefix that callers can use on
-            the CLI. VeOmni keeps ``"patches.<name>"`` as legacy shorthand for
-            ``"veomni.models.transformers.qwen3.patches.<name>"``; downstream
-            projects typically leave this ``None``.
+            E.g. ``search_root=<project>/models/transformers`` +
+            ``package_prefix="<project>.models.transformers"``.
+        legacy_patches_prefix: optional shortcut prefix that callers can use
+            on the CLI: ``patches.<name>`` is expanded to
+            ``<legacy_patches_prefix>.<name>``. Most projects leave this
+            ``None``; it exists to support trees that historically stored
+            patch bodies under a ``patches/`` subdirectory.
         ruff_extra_ignore: ruff codes to add on top of the default
-            ``E402,B007`` when normalizing generated files. Downstream callers
-            whose ``pyproject.toml`` does NOT globally ignore ``E501`` should
-            set ``("E501",)`` here.
+            ``E402,B007`` when normalizing generated files. Callers whose
+            ``pyproject.toml`` does NOT globally ignore ``E501`` should set
+            ``("E501",)`` here.
     """
 
     search_root: Path
@@ -120,14 +83,6 @@ class DiscoveryConfig:
         depth = len(self.package_prefix.split("."))
         resolved = self.search_root.resolve()
         return resolved.parents[depth - 1] if depth > 0 else resolved
-
-
-# VeOmni's own discovery — used by this module's CLI.
-VEOMNI_DISCOVERY = DiscoveryConfig(
-    search_root=VEOMNI_DIR / "models" / "transformers",
-    package_prefix="veomni.models.transformers",
-    legacy_patches_prefix="veomni.models.transformers.qwen3.patches",
-)
 
 
 def build_unified_diff(
@@ -168,7 +123,7 @@ def strip_diff_trailing_ws(text: str) -> str:
     return "\n".join(line.rstrip() for line in text.splitlines()) + "\n" if text else text
 
 
-def list_patch_configs(discovery: DiscoveryConfig = VEOMNI_DISCOVERY) -> list[str]:
+def list_patch_configs(discovery: DiscoveryConfig) -> list[str]:
     """Discover ``*_patch_gen_config.py`` files under ``discovery.search_root``.
 
     Each file's path relative to ``search_root`` is joined with
@@ -197,16 +152,13 @@ def list_patch_configs(discovery: DiscoveryConfig = VEOMNI_DISCOVERY) -> list[st
     return configs
 
 
-def normalize_patch_module(patch_module: str, discovery: DiscoveryConfig = VEOMNI_DISCOVERY) -> str:
-    """Apply VeOmni-flavored shortcuts to ``patch_module``.
+def normalize_patch_module(patch_module: str, discovery: DiscoveryConfig) -> str:
+    """Expand the ``patches.<X>`` shorthand into a fully-qualified module name.
 
-    - Fully-qualified ``veomni.patchgen.<X>`` is returned unchanged.
-    - ``patches.<X>`` is expanded to ``discovery.legacy_patches_prefix.<X>``
-      when a ``legacy_patches_prefix`` is defined.
-    - Anything else is returned unchanged.
+    If ``discovery.legacy_patches_prefix`` is set and ``patch_module`` starts
+    with ``patches.``, the prefix is replaced with the discovery's
+    ``legacy_patches_prefix``. Anything else is returned unchanged.
     """
-    if patch_module.startswith(f"{PACKAGE_NAME}."):
-        return patch_module
     if discovery.legacy_patches_prefix and patch_module.startswith("patches."):
         return f"{discovery.legacy_patches_prefix}.{patch_module.removeprefix('patches.')}"
     return patch_module
@@ -216,8 +168,9 @@ def default_output_dir_for_module(module: object) -> Path:
     """``<patch_module_dir>/generated/``, with ``patches/`` parents collapsed.
 
     If the patch module lives in a ``patches/`` subdirectory (the legacy
-    VeOmni layout), the generated/ dir sits next to that subdir. Otherwise
-    it sits directly next to the config file.
+    layout — see ``legacy_patches_prefix`` on :class:`DiscoveryConfig`),
+    the generated/ dir sits next to that subdir. Otherwise it sits
+    directly next to the config file.
     """
     module_path = Path(module.__file__).resolve()
     if module_path.parent.name == "patches":
@@ -259,7 +212,7 @@ def run_codegen(
     verbose: bool = False,
     ruff_extra_ignore: tuple[str, ...] = (),
     ruff_isolated: bool = False,
-    discovery: DiscoveryConfig = VEOMNI_DISCOVERY,
+    discovery: Optional[DiscoveryConfig] = None,
 ) -> Optional[str]:
     """
     Run code generation for a patch configuration.
@@ -273,13 +226,12 @@ def run_codegen(
         verbose: If True, print detailed progress
         ruff_extra_ignore: extra ruff codes passed through to
             :func:`ruff_fix_and_format`. Use this when the caller's
-            ``pyproject.toml`` differs from VeOmni's (e.g. no global E501
-            ignore).
-        discovery: discovery config used to expand the legacy
-            ``patches.<name>`` shorthand. Defaults to ``VEOMNI_DISCOVERY``
-            so direct VeOmni Python-API callers keep working unchanged.
-            Projects depending on VeOmni that hold their own legacy
-            shorthand should pass their own ``DiscoveryConfig``.
+            ``pyproject.toml`` does not globally ignore those codes.
+        discovery: optional discovery config used to expand the legacy
+            ``patches.<name>`` shorthand and seed ``sys.path`` for the
+            patch-config import. If ``None``, the legacy shorthand is
+            disabled and the import relies on whatever is already on
+            ``sys.path``.
 
     Returns:
         The generated source code (post-normalization), or None on error.
@@ -292,13 +244,8 @@ def run_codegen(
         against — so a fresh regen never produces immediate drift.
     """
     try:
-        # Preserve the legacy ``patches.<name>`` shorthand for direct
-        # Python-API callers (the pre-refactor ``run_codegen`` used to do
-        # this internally). CLI entrypoints already normalize earlier
-        # against their own ``DiscoveryConfig``; for them this call is a
-        # no-op because the input is already fully qualified. Projects whose
-        # discovery sets no ``legacy_patches_prefix`` are also unaffected.
-        patch_module = normalize_patch_module(patch_module, discovery)
+        if discovery is not None:
+            patch_module = normalize_patch_module(patch_module, discovery)
         if verbose:
             print(f"Loading patch module: {patch_module}")
         # Use spec_from_file_location so heavy parent __init__.py side effects
@@ -306,7 +253,8 @@ def run_codegen(
         # the config object. ``discovery.package_root`` seeds the loader's
         # search path so projects that aren't installed on ``sys.path`` still
         # resolve the patch config file.
-        module = load_patch_config_module(patch_module, search_roots=[discovery.package_root])
+        search_roots = [discovery.package_root] if discovery is not None else None
+        module = load_patch_config_module(patch_module, search_roots=search_roots)
         config = getattr(module, config_name)
 
         if output_dir is None:
@@ -402,7 +350,7 @@ Examples:
     parser.add_argument(
         "patch_module",
         nargs="?",
-        help="Patch module to use (e.g., 'veomni.models.transformers.qwen3.qwen3_gpu_patch_gen_config')",
+        help="Dotted patch-config module name (e.g., '<project>.models.qwen3.qwen3_patch_gen_config')",
     )
     parser.add_argument(
         "-o",
@@ -515,11 +463,13 @@ def build_cli(
     discovery: DiscoveryConfig,
     prog_name: Optional[str] = None,
 ) -> Callable[[Optional[list[str]]], int]:
-    """Return a ``main()``-shaped callable that runs a run_codegen CLI rooted
-    at ``discovery``.
+    """Return a ``main()``-shaped callable that runs the run_codegen CLI
+    rooted at ``discovery``.
 
-    Projects that depend on VeOmni mount their own ``python -m <pkg>.patchgen``
-    CLI without copy-pasting argparse. See module docstring for the recipe.
+    The unified ``patchgen`` console script uses this to mount its own
+    CLI; downstream projects that want a differently-named entry (e.g.
+    ``python -m <pkg>.patchgen``) can do the same without copy-pasting
+    argparse.
     """
     parser = _build_parser(prog_name=prog_name)
 
@@ -530,11 +480,16 @@ def build_cli(
     return _main
 
 
-def main() -> int:
-    parser = _build_parser()
-    args = parser.parse_args()
-    return _run_with_discovery(args, VEOMNI_DISCOVERY, parser)
-
-
 if __name__ == "__main__":
-    sys.exit(main())
+    # Reject `python -m patchgen.run_codegen ...` loudly. Without this guard
+    # the module imports cleanly and exits 0 without parsing argv — a silent
+    # no-op that's easy for automation to misread as success.
+    import sys
+
+    sys.stderr.write(
+        "patchgen.run_codegen is library code, not an executable entry point.\n"
+        "Use the `patchgen` console script (or `python -m patchgen`) instead:\n"
+        "  patchgen <module> -o <output_dir> [--diff]\n"
+        "  patchgen --all --diff\n"
+    )
+    sys.exit(2)

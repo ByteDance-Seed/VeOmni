@@ -15,7 +15,7 @@
 Patch configuration for Qwen2-VL transformers>=5.0.0 code generation.
 
 Regen command:
-python -m veomni.patchgen.run_codegen veomni.models.transformers.qwen2_vl.qwen2_vl_gpu_patch_gen_config -o veomni/models/transformers/qwen2_vl/generated --diff
+patchgen veomni.models.transformers.qwen2_vl.qwen2_vl_gpu_patch_gen_config -o veomni/models/transformers/qwen2_vl/generated --diff
 """
 
 import copy

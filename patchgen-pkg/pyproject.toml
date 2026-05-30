@@ -1,0 +1,32 @@
+[project]
+name = "patchgen"
+version = "0.1.0"
+description = "AST-based patchgen for HuggingFace modeling files"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [{ name = "ByteDance Seed" }]
+dependencies = [
+  # `patchgen.cli` reads the consuming repo's pyproject.toml. `tomllib` is
+  # stdlib from 3.11; on 3.10 we need the back-port. Keep this conditional
+  # so 3.11+ installs stay zero-dep.
+  "tomli>=2.0; python_version < '3.11'",
+  # `_normalize.ruff_fix_and_format` shells out to the `ruff` CLI on every
+  # patchgen run. It's a hard runtime requirement, not a dev tool — without
+  # it, `patchgen <module>` and `patchgen --check` fail with FileNotFoundError
+  # before producing any output.
+  "ruff>=0.7",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[project.scripts]
+patchgen = "patchgen.cli:main"
+
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["patchgen*"]

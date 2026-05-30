@@ -436,7 +436,7 @@ Guidelines:
 **Regen command** (put at top of file as docstring, mirror qwen3):
 
 ```
-python -m veomni.patchgen.run_codegen \
+patchgen \
     veomni.models.transformers.<m>.<m>_gpu_patch_gen_config \
     -o veomni/models/transformers/<m>/generated --diff
 ```
@@ -615,7 +615,7 @@ def register_<m>_modeling(architecture: str):
 
 1. Regenerate:
    ```bash
-   python -m veomni.patchgen.run_codegen \
+   patchgen \
        veomni.models.transformers.<m>.<m>_gpu_patch_gen_config \
        -o veomni/models/transformers/<m>/generated --diff -v
    ```
@@ -631,7 +631,7 @@ def register_<m>_modeling(architecture: str):
    ruff, but double-check).
 5. Check CI drift guard:
    ```bash
-   python -m veomni.patchgen.check_patchgen
+   patchgen --check
    ```
    Must exit 0. `--fix` overwrites checked-in files if drift is intentional.
 6. If `make style` / `ruff --fix` auto-removed unused imports from the generated
@@ -640,12 +640,12 @@ def register_<m>_modeling(architecture: str):
    v5.2), the sibling `*.diff` file becomes stale against the post-fix `*.py`.
    Re-sync with:
    ```bash
-   python -m veomni.patchgen.check_patchgen --fix
+   patchgen --check --fix
    ```
-   Do NOT manually re-run `run_codegen` to "fix" it — that would re-introduce
-   the unused imports and you'd ping-pong between ruff and patchgen.
-   `check_patchgen --fix` writes the diff against the post-style-fix `.py`,
-   which is what CI expects.
+   Do NOT manually re-run `patchgen` (without `--check`) to "fix" it — that
+   would re-introduce the unused imports and you'd ping-pong between ruff and
+   patchgen. `patchgen --check --fix` writes the diff against the
+   post-style-fix `.py`, which is what CI expects.
 
 **Never edit `generated/*.py` by hand** — always go back to the patchgen config
 and regenerate. This is a hard rule called out in `AGENTS.md`.

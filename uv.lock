@@ -2116,6 +2116,22 @@ wheels = [
 ]
 
 [[package]]
+name = "patchgen"
+version = "0.1.0"
+source = { editable = "patchgen-pkg" }
+dependencies = [
+    { name = "ruff" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "pytest", marker = "extra == 'dev'", specifier = ">=8" },
+    { name = "ruff", specifier = ">=0.7" },
+    { name = "tomli", marker = "python_full_version < '3.11'", specifier = ">=2.0" },
+]
+provides-extras = ["dev"]
+
+[[package]]
 name = "peft"
 version = "0.18.1"
 source = { registry = "https://pypi.org/simple" }
@@ -3680,6 +3696,7 @@ video = [
 [package.dev-dependencies]
 dev = [
     { name = "expecttest" },
+    { name = "patchgen" },
     { name = "pre-commit" },
     { name = "pytest" },
     { name = "rich" },
@@ -3688,6 +3705,9 @@ dev = [
 lint = [
     { name = "pre-commit" },
     { name = "ruff" },
+]
+patchgen = [
+    { name = "patchgen" },
 ]
 test = [
     { name = "expecttest" },
@@ -3776,6 +3796,7 @@ provides-extras = ["dev", "audio", "video", "dit", "npu-aarch64", "npu", "gpu", 
 [package.metadata.requires-dev]
 dev = [
     { name = "expecttest" },
+    { name = "patchgen", editable = "patchgen-pkg" },
     { name = "pre-commit" },
     { name = "pytest" },
     { name = "rich" },
@@ -3785,6 +3806,7 @@ lint = [
     { name = "pre-commit" },
     { name = "ruff" },
 ]
+patchgen = [{ name = "patchgen", editable = "patchgen-pkg" }]
 test = [
     { name = "expecttest" },
     { name = "pytest" },

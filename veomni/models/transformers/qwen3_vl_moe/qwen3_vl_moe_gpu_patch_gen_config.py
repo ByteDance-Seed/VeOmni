@@ -23,7 +23,7 @@ loss) and layers the MoE-specific patches on top:
     through fused loss + aux_loss and register the expert parallel plan.
 
 Regen command:
-python -m veomni.patchgen.run_codegen veomni.models.transformers.qwen3_vl_moe.qwen3_vl_moe_gpu_patch_gen_config -o veomni/models/transformers/qwen3_vl_moe/generated --diff
+patchgen veomni.models.transformers.qwen3_vl_moe.qwen3_vl_moe_gpu_patch_gen_config -o veomni/models/transformers/qwen3_vl_moe/generated --diff
 """
 
 from types import SimpleNamespace

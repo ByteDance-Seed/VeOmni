@@ -45,7 +45,7 @@ Covers the thinker training path (text + vision + audio, dense — no MoE):
   - ForConditionalGeneration.get_position_id_func: delegate to thinker
 
 Regen command:
-python -m veomni.patchgen.run_codegen veomni.models.transformers.qwen2_5_omni.qwen2_5_omni_gpu_patch_gen_config -o veomni/models/transformers/qwen2_5_omni/generated --diff
+patchgen veomni.models.transformers.qwen2_5_omni.qwen2_5_omni_gpu_patch_gen_config -o veomni/models/transformers/qwen2_5_omni/generated --diff
 """
 
 import copy

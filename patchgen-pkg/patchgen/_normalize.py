@@ -19,18 +19,19 @@ paths agree byte-for-byte. Without this, a contributor running ``run_codegen``
 could commit a file that immediately fails ``check_patchgen`` whenever ruff
 would rewrite a single line of the raw codegen output.
 
-The ``--ignore`` set mirrors the per-file-ignores VeOmni's ``pyproject.toml``
-declares for ``veomni/models/transformers/**/generated/*.py``:
+The default ``--ignore`` set covers the two codes that legitimately appear
+in code regenerated from upstream HuggingFace modeling files:
 
 - ``E402`` — generated files paste external imports at original class
   positions (e.g. ``create_patch_from_external`` inline aliases), not at
   the top of the file.
 - ``B007`` — upstream Transformers occasionally has unused loop variables.
 
-``E501`` is already in the project-wide ``[tool.ruff].ignore`` list and so is
-not repeated here. Downstream projects whose ``pyproject.toml`` does NOT
-ignore ``E501`` globally should pass their own ``extra_ignore`` instead of
-relying on this default.
+``E501`` (long lines) is NOT in this set. Projects whose own ``pyproject.toml``
+does not globally ignore ``E501`` should pass ``extra_ignore=("E501",)`` (or
+set the same on :class:`DiscoveryConfig.ruff_extra_ignore`) so the temp file
+the drift checker writes is normalized against the same rule set as the
+checked-in artifact.
 """
 
 from __future__ import annotations
@@ -54,21 +55,20 @@ def ruff_fix_and_format(
     Args:
         path: file to normalize in-place.
         extra_ignore: additional ruff codes to suppress on top of
-            :data:`DEFAULT_IGNORE`. Downstream callers whose project ``ruff``
-            config differs from VeOmni's (e.g. no global ``E501`` ignore) can
-            pass ``("E501",)`` here so the temp file the drift checker writes
-            is normalized against the same effective rule set as the
-            checked-in generated file.
+            :data:`DEFAULT_IGNORE`. Callers whose project ``ruff`` config
+            does not globally ignore ``E501`` should pass ``("E501",)``
+            here so the temp file the drift checker writes is normalized
+            against the same effective rule set as the checked-in
+            generated file.
         isolated: if True, pass ``--isolated`` to ``ruff`` so the project's
             ``pyproject.toml`` is ignored — ruff falls back to its built-in
             defaults (line-length 88, no per-file-ignores). This gives
             location-independent output: the same temp file produces the
-            same normalized form regardless of where ``ruff`` happens to
-            discover a ``pyproject.toml``. Recommended for dependent
-            projects whose generated files were originally produced under
-            ``--isolated``. VeOmni's own files were generated without
-            ``--isolated``, so the upstream CLI keeps the False default to
-            preserve byte-identity with the checked-in artifacts.
+            same normalized form regardless of which ``pyproject.toml``
+            ruff happens to discover. Recommended unless your project was
+            originally normalized without ``--isolated`` (in which case
+            keep it False to preserve byte-identity with the checked-in
+            artifacts).
     """
     ignore = list(DEFAULT_IGNORE)
     if extra_ignore:

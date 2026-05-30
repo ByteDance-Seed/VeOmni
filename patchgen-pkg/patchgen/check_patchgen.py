@@ -12,36 +12,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""
-CI check script for patchgen determinism.
+"""Drift gate for patchgen-generated files.
 
-Discovers all patch gen configs (default: VeOmni's own), regenerates each
-one, normalizes the output through the shared ruff pipeline, and compares
-against the checked-in ``.py`` and ``.diff`` files. Exits 1 on any drift.
+Discovers all patch gen configs under the caller's
+:class:`DiscoveryConfig`, regenerates each, normalizes through the shared
+ruff pipeline, and compares against the checked-in ``.py`` / ``.diff``.
 
-Usage:
-    # Check mode (CI) - exits 1 on drift
-    python -m veomni.patchgen.check_patchgen
-
-    # Fix mode - overwrite checked-in files with regenerated output
-    python -m veomni.patchgen.check_patchgen --fix
-
-Projects that depend on VeOmni get the same CLI rooted at their own search
-path via :func:`build_cli`, so they can drift-check their own patch configs::
-
-    # <your_project>/patchgen/check_main.py
-    from pathlib import Path
-    from veomni.patchgen.check_patchgen import build_cli
-    from veomni.patchgen.run_codegen import DiscoveryConfig
-
-    main = build_cli(
-        DiscoveryConfig(
-            search_root=Path(__file__).resolve().parent.parent / "models",
-            package_prefix="<your_project>.models",
-            ruff_extra_ignore=("E501",),
-        ),
-        prog_name="<your_project>.patchgen.check",
-    )
+The unified ``patchgen --check`` console script (``patchgen.cli``) is the
+user entrypoint. This module exposes :func:`build_cli` for any direct
+downstream caller that wants to mount its own drift gate.
 """
 
 from __future__ import annotations
@@ -56,7 +35,6 @@ from typing import Callable, Optional
 from ._normalize import ruff_fix_and_format
 from .codegen import ModelingCodeGenerator, load_patch_config_module
 from .run_codegen import (
-    VEOMNI_DISCOVERY,
     DiscoveryConfig,
     build_unified_diff,
     default_diff_path,
@@ -166,7 +144,7 @@ def check_config(
 
 
 def run_check(
-    discovery: DiscoveryConfig = VEOMNI_DISCOVERY,
+    discovery: DiscoveryConfig,
     *,
     fix: bool = False,
     configs: Optional[list[str]] = None,
@@ -237,11 +215,16 @@ def build_cli(
     return _main
 
 
-def main() -> int:
-    parser = _build_parser()
-    args = parser.parse_args()
-    return run_check(VEOMNI_DISCOVERY, fix=args.fix)
-
-
 if __name__ == "__main__":
-    sys.exit(main())
+    # Reject `python -m patchgen.check_patchgen ...` loudly. Without this
+    # guard the module imports cleanly and exits 0 without parsing argv — a
+    # silent no-op that's easy for automation to misread as a passing drift
+    # check.
+    import sys
+
+    sys.stderr.write(
+        "patchgen.check_patchgen is library code, not an executable entry point.\n"
+        "Use the `patchgen` console script (or `python -m patchgen`) instead:\n"
+        "  patchgen --check [--fix]\n"
+    )
+    sys.exit(2)
