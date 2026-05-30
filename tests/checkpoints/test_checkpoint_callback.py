@@ -125,6 +125,38 @@ class TestCheckpointerCallbackLastSavedStep:
         # Should skip — no new save call
         trainer.checkpointer.save.assert_not_called()
 
+    def test_epoch_end_skips_when_no_step_ran(self, mock_helper, mock_dist, mock_build_ckpt):
+        trainer = _make_mock_trainer()
+        mock_build_ckpt.return_value = trainer.checkpointer
+        cb = CheckpointerCallback(trainer)
+        cb.every_n_epochs = 1
+
+        state = TrainerState(global_step=35, epoch=1)
+        cb.on_epoch_begin(state)
+        assert cb._epoch_start_global_step == 35
+
+        # Simulate the empty-epoch case: no on_step_end calls, global_step
+        # untouched.
+        cb.on_epoch_end(state)
+        trainer.checkpointer.save.assert_not_called()
+        assert cb._last_saved_step == -1
+
+    def test_epoch_end_saves_when_step_ran(self, mock_helper, mock_dist, mock_build_ckpt):
+        trainer = _make_mock_trainer()
+        mock_build_ckpt.return_value = trainer.checkpointer
+        cb = CheckpointerCallback(trainer)
+        cb.every_n_steps = None  # disable step-end saves to isolate epoch-end
+        cb.every_n_epochs = 1
+
+        state = TrainerState(global_step=10, epoch=0)
+        cb.on_epoch_begin(state)
+
+        # Advance state to simulate a few successful train_step calls.
+        state.global_step = 12
+        cb.on_epoch_end(state)
+        assert trainer.checkpointer.save.call_count == 1
+        assert cb._last_saved_step == 12
+
 
 @patch("veomni.trainer.callbacks.checkpoint_callback.save_hf_safetensor")
 @patch("veomni.trainer.callbacks.checkpoint_callback.build_checkpointer")
@@ -202,3 +234,19 @@ class TestHuggingfaceCkptCallbackLastSavedStep:
         mock_save_hf.reset_mock()
         cb.on_train_end(state)
         mock_save_hf.assert_not_called()
+
+    def test_hf_epoch_end_skips_when_no_step_ran(
+        self, mock_exists, mock_helper, mock_dist, mock_build_ckpt, mock_save_hf
+    ):
+        """HF callback must also suppress epoch_end save when no step ran."""
+        trainer = _make_mock_trainer()
+        mock_build_ckpt.return_value = trainer.checkpointer
+        cb = HuggingfaceCkptCallback(trainer)
+        cb.every_n_epochs = 1
+
+        state = TrainerState(global_step=35, epoch=1)
+        cb.on_epoch_begin(state)
+
+        cb.on_epoch_end(state)
+        mock_save_hf.assert_not_called()
+        assert cb._last_saved_step == -1
