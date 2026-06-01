@@ -224,6 +224,26 @@ class OmniModule:
         """
         return None
 
+    # ── Freeze ────────────────────────────────────────────────────────────────
+
+    def freeze_model(self) -> None:
+        """Freeze (a subset of) this module's parameters from its own config.
+
+        The trainer owns *when* (called once after build, before the FSDP2
+        wrap / optimizer build, so the optimizer only ever sees the
+        still-trainable params); the **module owns the policy** — i.e. *what*
+        to freeze and how to read the knob off ``self.config``.
+
+        Default policy: freeze the *whole* module when ``config.freeze`` is
+        truthy (a plain pretrained backbone used read-only).  Override to
+        freeze only a sub-part — e.g. :class:`JanusVqvae` freezes only its
+        inner codec while keeping the generation heads trainable.  A module
+        that left every parameter frozen is detected by the trainer (no
+        trainable params) and simply gets no optimizer / scheduler.
+        """
+        if getattr(getattr(self, "config", None), "freeze", False):
+            self.requires_grad_(False)
+
     # ── HF lifecycle override ─────────────────────────────────────────────────
 
     @classmethod

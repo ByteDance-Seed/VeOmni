@@ -331,11 +331,14 @@ class OmniModuleTrainer(BaseTrainer):
     * ``_build_model``            — meta-init the sub-model from its
       ``config.json`` via the shared (OMNI-registry-aware) loader.
     * ``_freeze_model_module`` / ``_setup_lora`` — LoRA wrap + trainable-param
-      report (extended here to honour the module's ``freeze`` knob).
+      report.  Freeze itself is **delegated to the module** here: we call the
+      module's :meth:`OmniModule.freeze_model`, which reads its own
+      ``config.freeze`` and decides what to freeze (whole module, or a
+      sub-part — e.g. JanusVqvae freezes only its codec).
     * ``_build_parallelized_model`` — wrap in its own FSDP2 unit + load the
       module's on-disk weights.
     * ``_build_optimizer`` / ``_build_lr_scheduler`` — one each, over this
-      module's params.
+      module's still-trainable params.
 
     The *global* concerns (distributed ``_setup``, data pipeline, callbacks, the
     train loop) are **never** run here — they are owned once by
@@ -343,32 +346,29 @@ class OmniModuleTrainer(BaseTrainer):
     optimizer / lr-scheduler are built later by the orchestrator (after the
     shared dataset fixes ``args.train_steps``).
 
-    ``args`` is a per-module copy of the global arguments whose
-    ``model.{config_path,model_path}`` point at this module's split-checkpoint
-    subfolder, and whose ``model.model_config`` carries the module's YAML config
-    overrides — so the shared loader resolves the right OmniModule classes and
-    the standard meta-init → FSDP2 → weight-load path is reused verbatim.
+    ``args`` (:class:`VeOmniModuleArguments`) is a per-module copy of the global
+    arguments whose ``model.{config_path,model_path}`` point at this module's
+    split-checkpoint subfolder, and whose ``model.model_config`` carries the
+    module's YAML ``model_config:`` overrides — so the shared loader resolves the
+    right OmniModule classes and the standard meta-init → FSDP2 → weight-load
+    path is reused verbatim.
     """
 
     def __init__(
         self,
-        args: VeOmniArguments,
-        name: str,
+        args: "VeOmniArguments",
         tokenizer: Any = None,
-        frozen: bool = False,
     ):
         # NB: BaseTrainer.__init__ is deliberately NOT called — it would re-run
         # the global setup (distributed / data / callbacks).  We invoke only the
         # per-model build helpers, in order.
         self.args = args
-        self.name = name
-        self.frozen = frozen
 
         self._build_model()  # base: meta-init the sub-model from its config.json
         if tokenizer is not None and hasattr(self.model, "set_tokenizer"):
             self.model.set_tokenizer(tokenizer)
         self._load_processor()
-        self._freeze_model_module()  # freeze (if any) + lora + pretty-print + mem
+        self._freeze_model_module()  # module self-freezes + lora + pretty-print + mem
 
         # FSDP2 (and the meta-init weight load) preserve ``requires_grad``: the
         # shard carries it (torch ``_fsdp_param.py``: ``sharded_param.requires_grad_(
@@ -379,14 +379,14 @@ class OmniModuleTrainer(BaseTrainer):
 
         # Optimizer / lr-scheduler are built by the orchestrator once the shared
         # dataset has fixed ``args.train_steps`` (see OmniTrainer._build_optimizer
-        # / _build_lr_scheduler).  Frozen modules never get either.
+        # / _build_lr_scheduler).  Fully-frozen modules never get either.
         self.optimizer = None
         self.lr_scheduler = None
 
     def _freeze_model_module(self):
-        """Clear grads on a frozen module, then run the base report (+ lora)."""
-        if self.frozen:
-            self.model.requires_grad_(False)
+        """Let the module freeze itself (its policy), then run the base report (+ lora)."""
+        if hasattr(self.model, "freeze_model"):
+            self.model.freeze_model()
         super()._freeze_model_module()
 
     def _load_processor(self):
@@ -398,13 +398,14 @@ class OmniModuleTrainer(BaseTrainer):
         processor_cls = getattr(type(self.model), "processor_class", None)
         if processor_cls is None or getattr(self.model, "_processor", None) is not None:
             return
+        label = type(self.model).__name__
         weights_path = self.args.model.model_path
         try:
             self.model._processor = processor_cls.from_pretrained(weights_path)
-            logger.info_rank0(f"OmniModuleTrainer '{self.name}': loaded {processor_cls.__name__}.")
+            logger.info_rank0(f"OmniModuleTrainer '{label}': loaded {processor_cls.__name__}.")
         except Exception as e:  # noqa: BLE001 — surfaced lazily by the module if truly needed
             logger.warning_once(
-                f"OmniModuleTrainer '{self.name}': could not load processor from {weights_path}: {e}. "
+                f"OmniModuleTrainer '{label}': could not load processor from {weights_path}: {e}. "
                 "Training will fail if this modality's images are actually present."
             )
 
@@ -447,7 +448,7 @@ class OmniTrainer:
     # lives directly on the wrapper rather than on ``self.base``.
     omni_config: "OmniConfig"  # parsed modules / nodes / edges / training graph
     module_names: List[str]  # ordered names of every declared module
-    frozen_modules: set[str]  # modules carrying a truthy freeze / freeze_* knob
+    frozen_modules: set[str]  # modules left with no trainable params (no optimizer/scheduler)
     module_trainers: Dict[str, OmniModuleTrainer]  # one BaseTrainer subclass per module
     optimizers: Dict[str, torch.optim.Optimizer]  # one per trainable module (aggregated into base.optimizer)
     lr_schedulers: Dict[str, Any]  # one per trainable module (aggregated into base.lr_scheduler)
@@ -475,27 +476,25 @@ class OmniTrainer:
 
     # ── Build: per-module trainers + compose ───────────────────────────────────
 
-    @staticmethod
-    def _is_frozen(mod_cfg: Dict[str, Any]) -> bool:
-        """A module is frozen when its YAML block carries a truthy freeze knob."""
-        return any((k == "freeze" or k.startswith("freeze_")) and bool(v) for k, v in mod_cfg.items())
-
-    def _module_args(self, weights_path: str, mod_cfg: Dict[str, Any]) -> VeOmniArguments:
+    def _module_args(self, weights_path: str, mod_cfg: Dict[str, Any]) -> "VeOmniOmniArguments":
         """Per-module copy of the global args, retargeted at this module.
 
         The module-trainer reuses ``BaseTrainer._build_model`` /
         ``_build_parallelized_model``, which read ``args.model.{config_path,
         model_path}`` and ``args.model.model_config``.  Point those at the
-        module's split-checkpoint subfolder; the remaining ``mod_cfg`` keys
-        (incl. freeze flags) become config overrides (PretrainedConfig stores
-        unknown kwargs harmlessly).  A deep copy keeps per-module mutations
-        (e.g. the GC flag) from leaking across modules.
+        module's split-checkpoint subfolder; the module's YAML ``model_config:``
+        sub-block becomes the config overrides (forwarded to the OmniModule's
+        config — e.g. ``freeze``).  A deep copy keeps per-module mutations
+        (e.g. the GC flag) from leaking across modules; we retype the copy to
+        :class:`VeOmniModuleArguments` directly (rather than reconstructing)
+        to avoid re-running ``ModelArguments.__post_init__`` (safetensors-index
+        I/O) on every module.
         """
         a = copy.deepcopy(self.base.args)
-        overrides = {k: v for k, v in mod_cfg.items() if k not in ("weights_path", "config_path")}
         a.model.config_path = weights_path
         a.model.model_path = weights_path
-        a.model.model_config = overrides
+        a.model.model_config = dict(mod_cfg.get("model_config") or {})
+        a.__class__ = VeOmniOmniArguments
         return a
 
     def _build_model(self):
@@ -524,20 +523,25 @@ class OmniTrainer:
             weights_path = mod_cfg.get("weights_path")
             if weights_path is None:
                 raise ValueError(f"OmniTrainer: module '{name}' has no `weights_path` in the training YAML.")
-            frozen = self._is_frozen(mod_cfg)
-            if frozen:
-                self.frozen_modules.add(name)
 
             module_trainer = OmniModuleTrainer(
                 self._module_args(weights_path, mod_cfg),
-                name=name,
                 tokenizer=base.tokenizer,
-                frozen=frozen,
             )
             self.module_trainers[name] = module_trainer
             modules[name] = module_trainer.model
+
+            # The module froze itself (its policy) inside the trainer above.  A
+            # module left with *no* trainable params gets no optimizer/scheduler;
+            # a partially-frozen one (e.g. JanusVqvae) still trains its remaining
+            # params.  ``requires_grad`` survives the FSDP2 wrap (see
+            # OmniModuleTrainer.__init__), so this read is accurate post-build.
+            trainable = any(p.requires_grad for p in module_trainer.model.parameters())
+            if not trainable:
+                self.frozen_modules.add(name)
             logger.info_rank0(
-                f"OmniTrainer: built module-trainer '{name}' from {weights_path}" + (" [FROZEN]" if frozen else "")
+                f"OmniTrainer: built module-trainer '{name}' from {weights_path}"
+                + ("" if trainable else " [FROZEN — no trainable params]")
             )
 
         base.model = OmniModel(self.omni_config, modules)

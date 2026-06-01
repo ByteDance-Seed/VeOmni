@@ -4,9 +4,12 @@ The whole VQVAE-side hyper-parameters travel under ``vq_config`` — that
 mirrors the original :class:`transformers.JanusVQVAEConfig` schema so the
 ``scripts/split_janus.py`` extractor can dump the field unchanged.
 
-``freeze_vqvae`` (default ``True``) matches the published Janus recipe —
-only the generation projection layers (``generation_embeddings``,
-``generation_aligner``, ``generation_head``) are trained.
+``freeze`` (default ``True``) matches the published Janus recipe — the
+module freezes only its inner VQVAE codec (``vqmodel``) and keeps the
+generation projection layers (``generation_embeddings``,
+``generation_aligner``, ``generation_head``) trainable.  The freeze itself
+is applied by :meth:`JanusVqvae.freeze_model` (the trainer calls it once
+after build); this config only carries the knob.
 """
 
 from typing import Any, Dict, Optional
@@ -22,9 +25,12 @@ class JanusVqvaeConfig(PretrainedConfig):
     def __init__(
         self,
         vq_config: Optional[Dict[str, Any]] = None,
-        freeze_vqvae: bool = True,
+        freeze: bool = True,
         **kwargs,
     ):
         self.vq_config = vq_config or {}
-        self.freeze_vqvae = freeze_vqvae
+        # Module-level freeze knob.  ``JanusVqvae.freeze_model`` interprets it
+        # as a *partial* freeze (only the inner ``vqmodel``); the generation
+        # heads stay trainable.
+        self.freeze = freeze
         super().__init__(**kwargs)

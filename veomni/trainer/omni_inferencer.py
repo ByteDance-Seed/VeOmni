@@ -328,11 +328,12 @@ class OmniInferencer:
         ``model_type`` is read from each ``<weights_path>/config.json`` via
         :func:`transformers.AutoConfig.from_pretrained` (so the YAML
         ``modules:`` block never has to repeat it) and dispatched through
-        :data:`OMNI_MODEL_REGISTRY`.  Module-level overrides (everything in
-        the YAML other than ``weights_path``) are forwarded as kwargs to
+        :data:`OMNI_MODEL_REGISTRY`.  Per-module config overrides live under
+        the YAML ``model_config:`` sub-block (mirroring
+        :attr:`ModelArguments.model_config`) and are forwarded as kwargs to
         the underlying ``__init__`` via ``from_pretrained``'s
-        ``**model_kwargs`` mechanism — same shape ``OmniConfig.modules``
-        already uses (e.g. ``freeze_vqvae: true``).
+        ``**model_kwargs`` mechanism — same shape the trainer's
+        ``OmniTrainer._module_args`` uses (e.g. ``model_config: {freeze: true}``).
         """
         modules: dict[str, torch.nn.Module] = {}
         for name in self.omni_config.module_names:
@@ -344,6 +345,7 @@ class OmniInferencer:
                 raise FileNotFoundError(
                     f"Module '{name}' weights_path does not exist or is not a directory: {weights_path}"
                 )
+            overrides = dict(mod_cfg.get("model_config") or {})
             model_type = read_model_type(weights_path)
             cls = OMNI_MODEL_REGISTRY[model_type]()
             logger.info_rank0(
@@ -353,7 +355,7 @@ class OmniInferencer:
                 weights_path,
                 torch_dtype=torch.bfloat16,
                 device_map="auto",
-                **dict(mod_cfg),
+                **overrides,
             ).eval()
             modules[name] = module
         return modules

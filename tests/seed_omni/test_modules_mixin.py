@@ -282,7 +282,7 @@ def test_janus_vqvae_decode_branches():
     """Three input-driven dispatch paths in JanusVqvae.decode."""
     JanusVqvae = _model_cls("janus_vqvae")
     JanusVqvaeConfig = _config_cls("janus_vqvae")
-    jv = JanusVqvae(JanusVqvaeConfig(vq_config=_tiny_vq_cfg(), freeze_vqvae=True))
+    jv = JanusVqvae(JanusVqvaeConfig(vq_config=_tiny_vq_cfg()))
 
     # Path 1: training (hidden + gt_token_ids → _loss).
     h = torch.randn(1, 4, 64)  # janus_llama hidden_size

@@ -60,7 +60,8 @@ modules:
 
   janus_vqvae:
     weights_path: janus_vqvae
-    freeze_vqvae: true
+    # Add a `model_config:` sub-block to override the module config, e.g.
+    # `model_config: {freeze: false}` (defaults to True: freeze codec only).
 
   janus_text_encoder:
     weights_path: janus_text_encoder

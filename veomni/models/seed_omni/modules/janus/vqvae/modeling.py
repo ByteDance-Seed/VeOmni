@@ -100,14 +100,15 @@ class JanusVqvae(OmniModule, PreTrainedModel):
     _no_split_modules: list = []
     # The inner ``JanusVQVAE`` declares gradient-checkpointing support, so the
     # mixin advertises it too (keeps the wrapper's capability accurate and lets
-    # the trainer's GC guard pass).  Note: the VQVAE is frozen by default
-    # (``freeze_vqvae``) and runs under ``no_grad`` in training, so GC here is
-    # effectively inert — only the trainable generation_* heads see grads.
+    # the trainer's GC guard pass).  Note: the codec is frozen by default
+    # (``config.freeze`` → :meth:`freeze_model`) and runs under ``no_grad`` in
+    # training, so GC here is effectively inert — only the trainable
+    # generation_* heads see grads.
     supports_gradient_checkpointing = True
 
     def __init__(self, config: JanusVqvaeConfig):
         super().__init__(config)
-
+        self.config = config
         vq_cfg = JanusVQVAEConfig(**config.vq_config) if config.vq_config else JanusVQVAEConfig()
         self._vq_cfg = vq_cfg
         self.vqmodel = JanusVQVAE._from_config(vq_cfg)
@@ -115,8 +116,8 @@ class JanusVqvae(OmniModule, PreTrainedModel):
         self.generation_aligner = JanusVQVAEAlignerMLP(vq_cfg)
         self.generation_head = JanusVQVAEHead(vq_cfg)
 
-        if config.freeze_vqvae:
-            self.vqmodel.requires_grad_(False)
+        # NB: the ``config.freeze`` knob is honoured by :meth:`freeze_model`
+        # (called once by the trainer after build), not here.
 
         # Per-image VQ-token buffer used by :meth:`generate` to accumulate
         # sampled tokens between FSM iterations.  Reset on each
@@ -132,6 +133,18 @@ class JanusVqvae(OmniModule, PreTrainedModel):
         self._processor: Optional[Any] = None
 
         self.post_init()
+
+    def freeze_model(self) -> None:
+        """Partial freeze: only the inner VQVAE codec (``vqmodel``).
+
+        Matches the Janus recipe — the generation projection heads
+        (``generation_embeddings`` / ``generation_aligner`` /
+        ``generation_head``) stay trainable, so this module still gets an
+        optimizer (over those heads).  Overrides the base whole-module
+        default; gated on ``config.freeze`` (default ``True``).
+        """
+        if self.config.freeze:
+            self.vqmodel.requires_grad_(False)
 
     # ── OmniModule interface ───────────────────────────────────────────────────
 
@@ -200,8 +213,8 @@ class JanusVqvae(OmniModule, PreTrainedModel):
 
         Legacy / pre-tensorised path returns
         ``{"gen_embeds", "vq_token_ids"}`` unchanged.  Returns ``{}`` for
-        text-only batches.  When ``self.config.freeze_vqvae`` is ``True`` the
-        VQVAE is wrapped in ``torch.no_grad()``.
+        text-only batches.  When ``self.config.freeze`` is ``True`` the
+        VQVAE codec is wrapped in ``torch.no_grad()``.
         """
         conversation = kwargs.get("conversation_list")
         if gen_image_patches is None:
@@ -209,7 +222,7 @@ class JanusVqvae(OmniModule, PreTrainedModel):
 
         b_n = kwargs.pop("_gpatch_batch_n_images", None)
 
-        with torch.no_grad() if self.config.freeze_vqvae else torch.enable_grad():
+        with torch.no_grad() if self.config.freeze else torch.enable_grad():
             vq_out = self.vqmodel.encode(gen_image_patches)
         vq_token_ids = vq_out.image_tokens
 

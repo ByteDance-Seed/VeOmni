@@ -13,7 +13,9 @@ YAML structure (maps 1-to-1 to this class):
     siglip:        {weights_path: ..., config_path: ...}
     janus_llama:   {weights_path: ...}
     text_encoder:  {weights_path: ...}
-    vqvae:         {weights_path: ..., freeze: true}
+    # Per-module config overrides live under `model_config:` (mirrors
+    # ModelArguments.model_config) — forwarded to the module's config.
+    vqvae:         {weights_path: ..., model_config: {freeze: true}}
 
   # NOTE: ``micro_batch_size`` / DP / SP / TP / CP are NOT per-module — they
   # live globally under ``train.*`` in the launcher YAML.  All modules share

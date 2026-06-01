@@ -151,7 +151,7 @@ def split_janus(model_path: str, output_dir: str) -> None:
     # normalise pipeline for both understanding and generation paths).
     print("Extracting janus_vqvae ...")
     vq_cfg_dict = cfg.vq_config.to_dict()
-    vqvae_cfg = JanusVqvaeConfig(vq_config=vq_cfg_dict, freeze_vqvae=True)
+    vqvae_cfg = JanusVqvaeConfig(vq_config=vq_cfg_dict)
     with no_init_weights(), init_empty_weights():
         vqvae = JanusVqvae._from_config(vqvae_cfg)
     vqvae.vqmodel.load_state_dict(inner.vqmodel.state_dict(), assign=True)
