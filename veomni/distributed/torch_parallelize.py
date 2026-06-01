@@ -32,6 +32,7 @@ from ..utils import logging
 from ..utils.device import IS_NPU_AVAILABLE, get_device_type
 from .checkpoint import CheckpointFunction
 from .parallel_state import get_parallel_state
+from .torch_compile import compile_module_forwards, select_leaf_compile_modules
 from .utils import sort_fqn_by_submodule_first
 
 
@@ -80,6 +81,11 @@ def parallelize_model_fsdp2(
     mixed_precision: MixedPrecisionConfig = MixedPrecisionConfig(enable=True),  # noqa
     basic_modules: Optional[List[str]] = None,
     muon_expert_zero_comm: bool = False,
+    enable_compile: bool = False,
+    compile_backend: Optional[str] = None,
+    compile_mode: Optional[str] = "reduce-overhead",
+    compile_fullgraph: bool = False,
+    compile_dynamic: bool = False,
     **kwargs,
 ) -> "nn.Module":
     """
@@ -122,6 +128,8 @@ def parallelize_model_fsdp2(
         (fqn, mod) for fqn, mod in model.named_modules() if mod.__class__.__name__ in target_classes
     ]
     logger.info_rank0(f"target classes to shard: {target_classes}")
+
+    model._veomni_compile_enabled = False
 
     # Step 1: Apply ExtraParallel
     #   e.g. Apply expert parallelism (slice expert tensors [128,H,I] -> [16,H,I])
@@ -191,6 +199,24 @@ def parallelize_model_fsdp2(
         layer_pairs[layer_fqn] = tuple(layer_pair)
 
     logger.info_rank0(f"extra_parallel layer pairs: {layer_pairs}")
+
+    if enable_compile:
+        if get_device_type() != "cuda":
+            logger.warning_rank0("train.enable_compile is CUDA-only for now; skip torch.compile on this device.")
+        elif parallel_state.any_extra_parallel_enabled:
+            logger.warning_rank0(
+                "train.enable_compile currently skips ExtraParallel models to avoid capturing EP all-to-all "
+                "communication inside compiled blocks."
+            )
+        else:
+            compiled_count = compile_module_forwards(
+                select_leaf_compile_modules(target_modules),
+                backend=compile_backend,
+                mode=compile_mode,
+                fullgraph=compile_fullgraph,
+                dynamic=compile_dynamic,
+            )
+            model._veomni_compile_enabled = compiled_count > 0
 
     # Step 2: Update fsdp2 kwargs
     fsdp_kwargs = {"mesh": parallel_state.fsdp_mesh, "reshard_after_forward": enable_reshard_after_forward}
@@ -427,6 +453,11 @@ def build_parallelize_model(
     enable_gradient_checkpointing: bool = True,
     basic_modules: Optional[List[str]] = None,
     muon_expert_zero_comm: bool = False,
+    enable_compile: bool = False,
+    compile_backend: Optional[str] = None,
+    compile_mode: Optional[str] = "reduce-overhead",
+    compile_fullgraph: bool = False,
+    compile_dynamic: bool = False,
     **kwargs,
 ) -> "nn.Module":
     """Apply parallel strategies to the model.
@@ -475,9 +506,18 @@ def build_parallelize_model(
                 mixed_precision=mixed_precision,
                 basic_modules=basic_modules,
                 muon_expert_zero_comm=muon_expert_zero_comm,
+                enable_compile=enable_compile,
+                compile_backend=compile_backend,
+                compile_mode=compile_mode,
+                compile_fullgraph=compile_fullgraph,
+                compile_dynamic=compile_dynamic,
                 **kwargs,
             )
         else:
+            if enable_compile:
+                logger.warning_rank0("train.enable_compile is only wired for fsdp2; skip compile for DDP.")
             model = DDP(model, device_ids=[parallel_state.local_rank], process_group=parallel_state.dp_group)
+    elif enable_compile:
+        logger.warning_rank0("train.enable_compile is only wired for fsdp2; skip compile without FSDP.")
 
     return model

@@ -225,7 +225,11 @@ NPU validation runs at two times:
 | eval_steps | `int` | `0` | Steps between evaluations. `0` to disable. |
 | eval_epochs | `int` | `1` | Epochs between evaluations. `0` to disable. |
 | seed | `int` | `42` | Random seed. |
-| enable_compile | `bool` | `False` | Enable `torch.compile`. |
+| enable_compile | `bool` | `False` | Enable per-block `torch.compile` for CUDA Graph friendly training. This requires `dyn_bsz=True` and `pad_to_length=True` so packed inputs have stable shapes. Training steps call `torch.compiler.cudagraph_mark_step_begin()` when available so CUDA Graph Trees can separate iterations. |
+| compile_backend | `Optional[str]` | `None` | Backend passed to `torch.compile`; `None` uses PyTorch's default backend. |
+| compile_mode | `Optional[str]` | `"reduce-overhead"` | Mode passed to `torch.compile`; `"reduce-overhead"` enables CUDA Graphs when possible. |
+| compile_fullgraph | `bool` | `False` | Whether to pass `fullgraph=True` to `torch.compile`. |
+| compile_dynamic | `bool` | `False` | Whether to pass `dynamic=True` to `torch.compile`. |
 | max_steps | `Optional[int]` | `None` | Max training steps per epoch (debug only). |
 | optimizer | `OptimizerConfig` | — | Optimizer and learning-rate schedule. |
 | wandb | `WandbConfig` | — | Weights & Biases logging. |

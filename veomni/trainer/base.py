@@ -58,6 +58,7 @@ from ..data.data_transform import build_data_transform
 from ..distributed.clip_grad_norm import veomni_clip_grad_norm
 from ..distributed.offloading import build_activation_offloading_context
 from ..distributed.parallel_state import init_parallel_state
+from ..distributed.torch_compile import mark_compile_step_begin
 from ..distributed.torch_parallelize import build_parallelize_model
 from ..models import build_foundation_model, build_tokenizer
 from ..ops.batch_invariant_ops import set_batch_invariant_mode
@@ -511,6 +512,11 @@ class BaseTrainer(Stateful, ABC):
             broadcast_model_weights_from_rank0=args.train.broadcast_model_weights_from_rank0,
             max_load_broadcast_size=args.train.accelerator.fsdp_config.max_load_broadcast_size,
             muon_expert_zero_comm=muon_expert_zero_comm,
+            enable_compile=args.train.enable_compile,
+            compile_backend=args.train.compile_backend,
+            compile_mode=args.train.compile_mode,
+            compile_fullgraph=args.train.compile_fullgraph,
+            compile_dynamic=args.train.compile_dynamic,
             **kwargs,
         )
         self.model.train()
@@ -706,6 +712,7 @@ class BaseTrainer(Stateful, ABC):
         args = self.args
         self.state.global_step += 1
 
+        mark_compile_step_begin(getattr(self.model, "_veomni_compile_enabled", False))
         micro_batches: List[Dict[str, Any]] = next(data_iterator)
 
         self.on_step_begin(micro_batches=micro_batches)

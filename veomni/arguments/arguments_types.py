@@ -510,7 +510,23 @@ class TrainingArguments:
     )
     enable_compile: bool = field(
         default=False,
-        metadata={"help": "Enable torch compile."},
+        metadata={"help": "Enable per-block torch.compile for CUDA Graph friendly training."},
+    )
+    compile_backend: Optional[str] = field(
+        default=None,
+        metadata={"help": "Backend passed to torch.compile. None uses PyTorch's default backend."},
+    )
+    compile_mode: Optional[str] = field(
+        default="reduce-overhead",
+        metadata={"help": "Mode passed to torch.compile. 'reduce-overhead' enables CUDA Graphs when possible."},
+    )
+    compile_fullgraph: bool = field(
+        default=False,
+        metadata={"help": "Whether to pass fullgraph=True to torch.compile."},
+    )
+    compile_dynamic: bool = field(
+        default=False,
+        metadata={"help": "Whether to pass dynamic=True to torch.compile."},
     )
     max_steps: Optional[int] = field(
         default=None,
@@ -1165,6 +1181,13 @@ class VeOmniArguments:
             else:
                 self.train.pad_to_length = self.train.micro_batch_size * self.data.max_seq_len
                 logger.info_rank0(f"set pad_to_length = micro_batch_size * max_seq_len = {self.train.pad_to_length}")
+
+        if self.train.enable_compile and (not self.train.dyn_bsz or not self.train.pad_to_length):
+            raise ValueError(
+                "train.enable_compile requires train.dyn_bsz=True and train.pad_to_length=True. "
+                "Variable packed lengths trigger recompilation and prevent stable CUDA Graph capture; "
+                "see https://github.com/ByteDance-Seed/VeOmni/issues/401."
+            )
 
     def compute_train_steps(self, dataset_length: Optional[int] = None):
         if self.train.dyn_bsz:
