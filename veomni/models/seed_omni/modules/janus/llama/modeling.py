@@ -88,6 +88,24 @@ class JanusLlama(OmniModule, PreTrainedModel):
 
     # ── OmniModule interface ───────────────────────────────────────────────────
 
+    def set_tokenizer(self, tokenizer: Any) -> None:
+        """Resolve image-placeholder ids used by the ``masked_scatter`` merge.
+
+        ``image_token_id`` (``<image_placeholder>``) marks where SigLIP
+        understanding patches are injected; ``gen_image_token_id`` marks
+        VQ generation-image positions.  Stored on ``config`` so
+        :meth:`pre_forward` can build the scatter mask from ``input_ids``.
+        Resolved from the wired tokenizer rather than ``config.json`` so a
+        single source of truth (the vocabulary) drives both the text
+        encoder's placeholder expansion and the backbone's scatter.
+        """
+        und = _resolve_token_id(tokenizer, ("<image_placeholder>", getattr(tokenizer, "image_token", None)))
+        if und is not None:
+            self.config.image_token_id = und
+        gen = _resolve_token_id(tokenizer, (getattr(tokenizer, "gen_image_token", None),))
+        if gen is not None:
+            self.config.gen_image_token_id = gen
+
     def pre_forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
@@ -400,6 +418,18 @@ class JanusLlama(OmniModule, PreTrainedModel):
         mask = (input_ids == placeholder_token_id).unsqueeze(-1).expand_as(inputs_embeds)
         flat_embeds = image_embeds.reshape(-1, inputs_embeds.size(-1))
         return inputs_embeds.masked_scatter(mask, flat_embeds)
+
+
+def _resolve_token_id(tokenizer: Any, candidates: tuple) -> Optional[int]:
+    """Return the first candidate token string that maps to a real (non-unk) id."""
+    unk = getattr(tokenizer, "unk_token_id", None)
+    for cand in candidates:
+        if not cand:
+            continue
+        tid = tokenizer.convert_tokens_to_ids(cand)
+        if tid is not None and tid != unk:
+            return int(tid)
+    return None
 
 
 def _concat_kv_caches(cond: Any, uncond: Any) -> Any:

@@ -12,95 +12,75 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""
-OmniTrainer — trainer for OmniModel V2 (interim shell).
+"""OmniTrainer — trainer for OmniModel V2 (per-module FSDP2).
 
-Status (D2 stage 1 / stale-cleanup PR)
---------------------------------------
-This module previously imported a pair of names that no longer exist
-after the OmniModel V2 refactor (``OmniBuildArgs`` and
-``OmniModel.build_from_args``).  Those references made the file
-unimportable in any environment that pulled it transitively.  This PR
-removes the stale references so:
+Unlike single-model trainers (BaseTrainer / VLMTrainer), OmniModel is a
+*composition* of several independent OmniModule sub-models (Janus: siglip /
+vqvae / text_encoder / llama).  This trainer wraps **each sub-module in its
+own FSDP2 unit**, builds **one optimizer per trainable module**, and saves /
+resumes **each module independently**.
 
-* the file is importable,
-* :meth:`OmniTrainer._build_collate_fn` (the D1 list-only collator
-  dispatch) can be unit-tested without going through the broken
-  ``__init__`` path,
+Why per-module FSDP2 (vs. one wrapper over ``OmniModel``)?
 
-but the actual build flow (``_build_model`` / ``_build_model_assets`` /
-``_build_parallelized_model``) is **not yet wired** — those three
-helpers raise :class:`NotImplementedError` with a pointer to the
-follow-up PRs.
+* Each module is a self-contained HF model with its own ``_no_split_modules``
+  and its own on-disk snapshot — wrapping per child lets us load weights from
+  the per-module ``weights_path`` and save/resume each module's DCP folder
+  independently.
+* The training DAG (``OmniModel.forward``) chains hidden states across
+  modules; a **single** ``loss.backward()`` still propagates across every
+  FSDP2 unit because the autograd graph connects them.  Each module's FSDP2
+  reduce-scatter fires from its own backward hooks.
+* Gradient clipping is **global** (over ``OmniModel``'s full DTensor param
+  set); the optimizer step iterates every per-module optimizer.
 
-The full V2 build flow lands in two follow-up PRs (the design is
-already in :doc:`design.md` § "Build & 权重加载"):
-
-#. **D2 stage 2 — extend `build_parallelize_model`**.  Add an opt-in
-   ``weights_path: Mapping[str, str]`` branch in
-   :func:`veomni.distributed.torch_parallelize.parallelize_model_fsdp2`
-   so the parallelize step can load each sub-module from its own
-   directory after meta-init.  Keeps the existing ``str`` / ``None``
-   behaviour byte-for-byte; covered by its own unit tests so other
-   trainers (BaseTrainer / VLMTrainer / TextTrainer / DiTTrainer) are
-   provably unaffected.
-#. **D2 stage 3 — re-implement OmniTrainer build flow**.  Register
-   each V2 sub-module (``janus_siglip`` / ``janus_vqvae`` /
-   ``janus_llama`` / ``janus_text_encoder`` / ``text_encoder``) into
-   :data:`veomni.models.loader.MODELING_REGISTRY` so
-   :func:`veomni.models.build_foundation_model` can dispatch to the
-   right mixin class (today they live only in HF
-   ``AutoConfig`` / ``AutoModel`` registries, which
-   ``build_foundation_model`` does not consult when
-   ``MODELING_BACKEND='veomni'``).  Then:
-
-   * ``_build_model`` calls ``build_foundation_model(init_device='meta',
-     weights_path=None)`` per declared module — pure empty meta init,
-     no per-rank divergence — and composes them into ``OmniModel``.
-   * ``_build_parallelized_model`` calls
-     ``build_parallelize_model(self.base.model, weights_path={
-     name: cfg["weights_path"] for ...})`` exactly once on the whole
-     ``OmniModel``; the new dict branch loads each sub-tree from disk
-     after FSDP wrap.
-   * end-to-end smoke tests exercise the real ``build_foundation_model``
-     path (no internal mocking of the loader / parallelize) so that
-     the registry / loader assumptions are validated.
-
-D1's data-layer features are stable and shipped — only the trainer
-build flow is staged.
-
-Usage (today, intentionally a soft fail)
-----------------------------------------
-::
-
-    from veomni.arguments import parse_args
-    from veomni.trainer.omni_trainer import OmniTrainer, VeOmniOmniArguments
-
-    if __name__ == "__main__":
-        args = parse_args(VeOmniOmniArguments)
-        trainer = OmniTrainer(args)        # raises NotImplementedError
-        trainer.train()
+Build flow (``BaseTrainer.__init__`` order, overridden here)
+------------------------------------------------------------
+1. ``_build_model``             — meta-init each declared module from its
+                                  ``OMNI_*_REGISTRY`` class + ``config.json``;
+                                  compose into ``OmniModel`` (no weights yet).
+                                  Frozen modules get ``requires_grad=False``.
+2. ``_build_model_assets``      — load the global tokenizer + wire it into
+                                  every module that wants it.
+3. ``_build_collate_fn``        — ``seedomni`` → list-only ``SeedOmniCollator``.
+4. ``_build_parallelized_model`` — wrap **each child** with
+                                  ``build_parallelize_model`` (own FSDP2 unit,
+                                  per-module weight load from disk).
+5. ``_build_optimizer`` / ``_build_lr_scheduler`` — one per trainable module.
+6. ``_init_callbacks``          — swap the single-model checkpoint callback
+                                  for a per-module DCP callback.
 """
 
+import os
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import torch
+import torch.distributed as dist
 
 from ..arguments import DataArguments, ModelArguments, TrainingArguments, VeOmniArguments
-from ..data import build_data_transform
+from ..data import SeedOmniCollator
 from ..distributed.clip_grad_norm import veomni_clip_grad_norm
+from ..distributed.torch_parallelize import build_parallelize_model
+from ..models import build_tokenizer
+from ..models.seed_omni.modeling_omni import OmniModel
+from ..models.seed_omni.modules import OMNI_CONFIG_REGISTRY, OMNI_MODEL_REGISTRY, read_model_type
 from ..ops.batch_invariant_ops import set_batch_invariant_mode
-from ..utils import helper
+from ..optim import build_lr_scheduler, build_optimizer
+from ..utils import helper, logging
 from ..utils.device import synchronize
-from .base import BaseTrainer
+from .base import BaseTrainer, _collect_muon_kwargs
+from .callbacks import Callback
 
 
-logger = helper.create_logger(__name__)
+if TYPE_CHECKING:
+    from ..models.seed_omni.configuration_seed_omni import OmniConfig
 
 
-# ── Custom argument dataclasses ────────────────────────────────────────────────
+logger = logging.get_logger(__name__)
+
+
+# ── Argument dataclasses ────────────────────────────────────────────────────────
 
 
 @dataclass
@@ -123,28 +103,24 @@ class OmniModelArguments(ModelArguments):
             "help": (
                 "Mapping of inference scenario name → inference YAML path.  "
                 "The selected scenario's YAML overlays ``omni_train_yaml_path`` "
-                "at runtime (flat ``dict.update``; only top-level keys can be "
-                "replaced).  Example keys: infer_gen, infer_und, infer_interleave."
+                "at runtime (flat dict.update; only top-level keys, in practice "
+                "generation_graph).  Example keys: infer_gen / infer_und / "
+                "infer_interleave."
             )
         },
     )
     omni_infer_type: Optional[str] = field(
         default=None,
-        metadata={
-            "help": (
-                "Active inference scenario key into ``omni_infer_yaml_path``.  "
-                "Used at runtime to select which ``generation_graph`` to load."
-            )
-        },
+        metadata={"help": "Active inference scenario key into omni_infer_yaml_path (inference only)."},
     )
 
     def __post_init__(self):
         super().__post_init__()
-        if self.model_path is not None:
-            # Global tokenizer lives at the split checkpoint root.
+        if self.model_path is not None and self.tokenizer_path is None:
+            # Global tokenizer lives at the split-checkpoint root.
             self.tokenizer_path = self.model_path
 
-    def load_omni_config(self, *, infer_type: Optional[str] = None):
+    def load_omni_config(self, *, infer_type: Optional[str] = None) -> "OmniConfig":
         """Build :class:`OmniConfig` with resolved module paths."""
         from ..models.seed_omni.configuration_seed_omni import OmniConfig
 
@@ -177,223 +153,395 @@ class VeOmniOmniArguments(VeOmniArguments):
     train: "TrainingArguments" = field(default_factory=TrainingArguments)
 
 
+# ── Multi-optimizer / multi-scheduler proxies ──────────────────────────────────
+
+
+class MultiOptimizer:
+    """Thin proxy over ``{module_name: torch.optim.Optimizer}``.
+
+    Exposes the minimal :class:`torch.optim.Optimizer` surface the metering /
+    logging callbacks read (``param_groups``) and the train loop drives
+    (``step`` / ``zero_grad``).  Checkpointing is per-module (handled by
+    :class:`OmniPerModuleCheckpointCallback` against the real per-module
+    optimizers), so no ``state_dict`` is needed here.
+    """
+
+    def __init__(self, optimizers: Dict[str, torch.optim.Optimizer]):
+        self.optimizers = optimizers
+
+    @property
+    def param_groups(self) -> List[Dict[str, Any]]:
+        groups: List[Dict[str, Any]] = []
+        for opt in self.optimizers.values():
+            groups.extend(opt.param_groups)
+        return groups
+
+    def step(self) -> None:
+        for opt in self.optimizers.values():
+            opt.step()
+
+    def zero_grad(self, set_to_none: bool = True) -> None:
+        for opt in self.optimizers.values():
+            opt.zero_grad(set_to_none=set_to_none)
+
+
+class MultiLRScheduler:
+    """Thin proxy over ``{module_name: LRScheduler}`` (step-all / lr-read)."""
+
+    def __init__(self, schedulers: Dict[str, Any]):
+        self.schedulers = schedulers
+
+    def step(self) -> None:
+        for sched in self.schedulers.values():
+            sched.step()
+
+    def get_last_lr(self) -> List[float]:
+        lrs: List[float] = []
+        for sched in self.schedulers.values():
+            lrs.extend(sched.get_last_lr())
+        return lrs or [0.0]
+
+    def state_dict(self) -> Dict[str, Any]:
+        return {name: sched.state_dict() for name, sched in self.schedulers.items()}
+
+    def load_state_dict(self, state: Dict[str, Any]) -> None:
+        for name, sched in self.schedulers.items():
+            if name in state:
+                sched.load_state_dict(state[name])
+
+
+# ── Per-module checkpoint callback ──────────────────────────────────────────────
+
+
+class OmniPerModuleCheckpointCallback(Callback):
+    """Save / resume **each FSDP2 module independently**.
+
+    On-disk layout::
+
+        <save_path>/global_step_{N}/
+        ├── <module_a>/        # DCP: {model, optimizer, extra_state}
+        ├── <module_b>/        # DCP: {model}            (frozen → no optimizer)
+        └── trainer_state.pt   # global: step / lr_scheds / dataloader / rng
+
+    Each ``<module>/`` is a self-contained DCP produced by the shared
+    :class:`DistributedCheckpointer` over that single child + its optimizer,
+    so modules can be resharded / resumed in isolation.
+    """
+
+    def __init__(self, trainer: "OmniTrainer") -> None:
+        super().__init__(trainer)
+        args = trainer.args
+        self.every_n_steps = args.train.checkpoint.save_steps
+        self.every_n_epochs = args.train.checkpoint.save_epochs
+        self._last_saved_step: int = -1
+
+    def on_step_end(self, state, **kwargs) -> None:
+        if self.every_n_steps and state.global_step % self.every_n_steps == 0:
+            self._save(state.global_step)
+
+    def on_epoch_end(self, state, **kwargs) -> None:
+        if self.every_n_epochs and (state.epoch + 1) % self.every_n_epochs == 0:
+            if state.global_step != self._last_saved_step:
+                self._save(state.global_step)
+
+    def on_train_begin(self, state, **kwargs) -> None:
+        self._load()
+
+    def _save(self, global_step: int) -> None:
+        trainer: "OmniTrainer" = self.trainer
+        args = trainer.args
+        save_dir = os.path.join(args.train.checkpoint.save_path, f"global_step_{global_step}")
+        trainer.checkpointer.wait_for_pending_save()
+        helper.empty_cache()
+
+        for name in trainer.module_names:
+            child = trainer.model.get_module(name)
+            module_state: Dict[str, Any] = {"model": child, "extra_state": {}}
+            if name in trainer.optimizers:
+                module_state["optimizer"] = trainer.optimizers[name]
+            trainer.checkpointer.save(os.path.join(save_dir, name), module_state, save_async=False)
+
+        if args.train.global_rank == 0:
+            torch.save(
+                {
+                    "global_step": global_step,
+                    "lr_scheduler": trainer.lr_scheduler.state_dict(),
+                    "train_dataloader": trainer.train_dataloader.state_dict()
+                    if trainer.train_dataloader is not None
+                    else {},
+                    "torch_rng_state": torch.get_rng_state(),
+                },
+                os.path.join(save_dir, "trainer_state.pt"),
+            )
+
+        helper.empty_cache()
+        if dist.is_initialized():
+            dist.barrier()
+        self._last_saved_step = global_step
+        logger.info_rank0(f"OmniTrainer: per-module checkpoint saved at {save_dir}")
+
+    def _load(self) -> None:
+        trainer: "OmniTrainer" = self.trainer
+        args = trainer.args
+        load_path = args.train.checkpoint.load_path
+        if load_path is None:
+            return
+
+        trainer.checkpointer.wait_for_pending_save()
+        for name in trainer.module_names:
+            child = trainer.model.get_module(name)
+            module_state: Dict[str, Any] = {"model": child, "extra_state": {}}
+            if name in trainer.optimizers:
+                module_state["optimizer"] = trainer.optimizers[name]
+            trainer.checkpointer.load(os.path.join(load_path, name), module_state)
+
+        trainer_state_path = os.path.join(load_path, "trainer_state.pt")
+        if os.path.exists(trainer_state_path):
+            ts = torch.load(trainer_state_path, map_location="cpu", weights_only=False)
+            trainer.state.global_step = ts["global_step"]
+            trainer.start_epoch = trainer.state.global_step // args.train_steps
+            trainer.start_step = trainer.state.global_step % args.train_steps
+            trainer.lr_scheduler.load_state_dict(ts["lr_scheduler"])
+            if trainer.train_dataloader is not None and ts.get("train_dataloader"):
+                trainer.train_dataloader.load_state_dict(ts["train_dataloader"])
+            torch.set_rng_state(ts["torch_rng_state"])
+
+        if dist.is_initialized():
+            dist.barrier()
+        logger.info_rank0(f"OmniTrainer: resumed per-module checkpoint from {load_path}")
+
+
 # ── OmniTrainer ────────────────────────────────────────────────────────────────
 
 
-# Common message for the three build helpers that haven't been re-implemented
-# yet — kept in one place so the wording is identical across helpers.
-_BUILD_NOT_WIRED_MSG = (
-    "OmniTrainer build flow is staged across two follow-up PRs (extend "
-    "`build_parallelize_model` to accept a per-sub-module ``weights_path`` "
-    "mapping, then rewrite `_build_model` to use meta-init + the new "
-    "multi-path parallelize). See ``omni_trainer.py`` module docstring "
-    "for the full plan. The class itself is importable so the D1 collator "
-    "wiring (`_build_collate_fn`) can be unit-tested in the meantime."
-)
-
-
-class OmniTrainer:
-    """Trainer for OmniModel V2 — composable multi-modal training.
-
-    Mirrors the ``BaseTrainer.__new__`` delegation pattern used by
-    :class:`VLMTrainer` / :class:`TextTrainer`.  At this stage only
-    :meth:`_build_collate_fn` (the D1 list-only collator dispatch) is
-    wired; :meth:`_build_model` and :meth:`_build_model_assets`
-    intentionally raise ``NotImplementedError``.  The follow-up
-    ``_build_parallelized_model`` step is **not yet defined on this
-    class** — it will be added in D2.3 once
-    :func:`veomni.distributed.torch_parallelize.build_parallelize_model`
-    learns the multi-path ``weights_path`` form (D2.2).  See the module
-    docstring for the staged plan.
-    """
-
-    base: BaseTrainer
+class OmniTrainer(BaseTrainer):
+    """Trainer for OmniModel V2 — per-module FSDP2 + per-module optimizer."""
 
     def __init__(self, args: VeOmniOmniArguments):
-        # Even constructing the trainer is currently a soft fail: the
-        # build helpers below raise as soon as they're invoked.  We
-        # still walk through ``_setup`` (parallel state init, args
-        # logging) so callers get a deterministic failure point right
-        # at ``_build_model`` rather than later in the optimizer
-        # construction or the train loop.
-        self.base = BaseTrainer.__new__(BaseTrainer)
-        self.base.args = args
+        self.omni_config: "OmniConfig" = None
+        self.module_names: List[str] = []
+        self.frozen_modules: set[str] = set()
+        self.optimizers: Dict[str, torch.optim.Optimizer] = {}
+        self.lr_schedulers: Dict[str, Any] = {}
+        super().__init__(args)
 
-        self.base._setup()
-
-        self._build_model()
-        self._freeze_model_module()
-        self._build_model_assets()
-        self._build_data_transform()
-        self.base._build_dataset()
-        self._build_collate_fn()
-        self.base._build_dataloader()
-        self.base._build_optimizer()
-        self.base._build_lr_scheduler()
-        self.base._build_training_context()
-        self.base._init_callbacks()
-
-    # ── Build helpers ──────────────────────────────────────────────────────────
+    # ── Build: model (meta-init + compose) ─────────────────────────────────────
 
     def _build_model(self):
-        """Stub — to be implemented in the D2 stage-3 follow-up PR.
+        """Meta-init every declared module and compose into ``OmniModel``.
 
-        See module docstring for the planned implementation
-        (meta-init per module + ``OmniModel`` compose + dict-path
-        ``build_parallelize_model``).
+        Each module is instantiated from its registered class on the ``meta``
+        device (no real allocation, no per-rank divergence); real weights are
+        loaded per-module later by :meth:`_build_parallelized_model`.
         """
-        raise NotImplementedError("OmniTrainer._build_model is not implemented yet. " + _BUILD_NOT_WIRED_MSG)
+        args: VeOmniOmniArguments = self.args
+        self.omni_config = args.model.load_omni_config()
+        self.module_names = list(self.omni_config.module_names)
 
-    def _freeze_model_module(self):  # pragma: no cover — unreachable until _build_model is wired
-        """No-op placeholder — same shape as ``BaseTrainer._freeze_model_module``.
+        modules: Dict[str, torch.nn.Module] = {}
+        for name in self.module_names:
+            mod_cfg = self.omni_config.module_config(name)  # deep-copied
+            weights_path = mod_cfg.pop("weights_path", None)
+            mod_cfg.pop("config_path", None)
+            if weights_path is None:
+                raise ValueError(f"OmniTrainer: module '{name}' has no `weights_path` in the training YAML.")
 
-        In the follow-up PR this will print parameter counts and
-        delegate to ``_setup_lora`` so ``args.model.lora_config`` is
-        honoured (it is silently ignored today).
-        """
-        return None
+            # Freeze signal: any truthy ``freeze`` / ``freeze_*`` knob.
+            if any((k == "freeze" or k.startswith("freeze_")) and bool(v) for k, v in mod_cfg.items()):
+                self.frozen_modules.add(name)
 
-    def _build_model_assets(self):
-        """Stub — to be implemented in the D2 stage-3 follow-up PR.
+            model_type = read_model_type(weights_path)
+            cfg_cls = OMNI_CONFIG_REGISTRY[model_type]()
+            model_cls = OMNI_MODEL_REGISTRY[model_type]()
+            # Remaining mod_cfg keys are config overrides (freeze flags pass
+            # through harmlessly — PretrainedConfig stores unknown kwargs).
+            module_config = cfg_cls.from_pretrained(weights_path, **mod_cfg)
+            with torch.device("meta"):
+                module = model_cls(module_config)
+            if name in self.frozen_modules:
+                for p in module.parameters():
+                    p.requires_grad_(False)
+            modules[name] = module
+            logger.info_rank0(
+                f"OmniTrainer: meta-init module '{name}' (model_type={model_type}, cls={model_cls.__name__})"
+                + (" [FROZEN]" if name in self.frozen_modules else "")
+            )
 
-        Will collect ``tokenizer`` from ``OmniConfig.tokenizer_path``
-        (kept global until D4 moves it onto ``text_encoder``) plus
-        per-module assets via ``OmniModel.collect_assets``.
-        """
-        raise NotImplementedError("OmniTrainer._build_model_assets is not implemented yet. " + _BUILD_NOT_WIRED_MSG)
-
-    def _build_data_transform(self):  # pragma: no cover — unreachable until _build_model_assets is wired
-        """Build the data transform.
-
-        Same body as :meth:`BaseTrainer._build_data_transform` for
-        signature parity; will be exercised end-to-end once the build
-        flow is wired.  ``data_type='seedomni'`` ignores ``tokenizer``
-        / ``max_seq_len`` / ``text_keys`` (they're forwarded for
-        legacy contract compatibility).
-        """
-        args: VeOmniOmniArguments = self.base.args
-        self.base.data_transform = build_data_transform(
-            args.data.data_type,
-            tokenizer=self.base.tokenizer,
-            max_seq_len=args.data.max_seq_len,
-            text_keys=args.data.text_keys,
+        self.model = OmniModel(self.omni_config, modules)
+        self.model_config = self.omni_config
+        logger.info_rank0(
+            f"OmniTrainer: composed OmniModel with {len(self.module_names)} modules "
+            f"({self.module_names}); frozen: {sorted(self.frozen_modules) or '(none)'}."
         )
 
+    # ── Build: assets (tokenizer + set_tokenizer) ──────────────────────────────
+
+    def _build_model_assets(self):
+        args: VeOmniOmniArguments = self.args
+        tokenizer_path = self.omni_config.tokenizer_path or args.model.tokenizer_path
+        self.tokenizer = build_tokenizer(tokenizer_path)
+        # Wire the global tokenizer into every module that wants it
+        # (e.g. JanusTextEncoder resolves boi/eoi/bos/eos ids here).
+        for name, raw in self.model.named_omni_modules():
+            if hasattr(raw, "set_tokenizer"):
+                raw.set_tokenizer(self.tokenizer)
+                logger.info_rank0(f"OmniTrainer: set_tokenizer on module '{name}'.")
+        self.model_assets = [self.omni_config, self.tokenizer]
+
+    # ── Build: collator ─────────────────────────────────────────────────────────
+
     def _build_collate_fn(self):
-        """Pick the collator that matches the active ``data_type``.
-
-        For ``data_type == "seedomni"`` the per-sample shape is
-        ``{"conversation_list": [...]}`` (list of dicts with possibly
-        heterogeneous image tensor shapes), and the V2 design contract
-        defers all sequence packing / SP slicing to module
-        ``pre_forward`` hooks — so we use the list-only
-        ``SeedOmniCollator``.
-
-        For all other ``data_type``s (legacy ``conversation`` / ``dpo`` /
-        ``classification`` / ``qwen*_vl`` / ...) we fall back to
-        ``BaseTrainer._build_collate_fn`` which builds a ``MainCollator``
-        with packing + SP — the V1 contract is preserved verbatim.
-
-        This helper is intentionally wired in this stage-1 PR so D1
-        data-layer testing can validate the dispatch even though the
-        rest of the build flow is still stubbed.
-        """
-        args: VeOmniOmniArguments = self.base.args
-        if args.data.data_type == "seedomni":
-            from ..data import SeedOmniCollator
-
-            self.base.collate_fn = SeedOmniCollator()
+        """``seedomni`` → list-only ``SeedOmniCollator``; else BaseTrainer default."""
+        if self.args.data.data_type == "seedomni":
+            self.collate_fn = SeedOmniCollator()
             logger.info_rank0("OmniTrainer: using SeedOmniCollator (list-only) for data_type='seedomni'")
         else:
-            self.base._build_collate_fn()
+            super()._build_collate_fn()
 
-    # ── Forward / backward ─────────────────────────────────────────────────────
+    # ── Build: per-module FSDP2 wrap ───────────────────────────────────────────
 
-    def forward_backward_step(  # pragma: no cover — unreachable until build flow is wired
-        self,
-        micro_batch: Dict[str, Any],
-        num_micro_steps: int,
-    ) -> tuple:
-        """Forward + backward for one gradient-accumulation micro-batch.
+    def _build_parallelized_model(self):
+        """Wrap each OmniModel child in its own FSDP2 unit + load its weights.
 
-        OmniModel.forward() returns ``{"loss": tensor, "loss_dict": {...}, ...}``.
-        The loss is divided by *num_micro_steps* for gradient accumulation.
+        Calling :func:`build_parallelize_model` once per child makes every
+        sub-module an independent FSDP2 root over the shared DP mesh.  The
+        per-module ``weights_path`` is loaded after the wrap (meta → sharded
+        DTensor).  Frozen modules are still wrapped (so weights load) but get
+        ``requires_grad`` cleared and grad-checkpointing disabled.
         """
-        micro_batch = self.base.preforward(micro_batch)
+        args: VeOmniOmniArguments = self.args
+        model: OmniModel = self.model
 
-        with self.base.model_fwd_context, set_batch_invariant_mode(self.base.args.train.enable_batch_invariant_mode):
-            result: Dict[str, Any] = self.base.model(**micro_batch)
+        for name in self.module_names:
+            child = model.get_module(name)
+            weights_path = self.omni_config.module_config(name).get("weights_path")
+            frozen = name in self.frozen_modules
+            basic_modules = list(set(getattr(child, "_no_split_modules", None) or []) | set(args.model.basic_modules))
+            logger.info_rank0(f"OmniTrainer: FSDP2-wrapping module '{name}' from {weights_path}...")
+            wrapped = build_parallelize_model(
+                child,
+                init_device=args.train.init_device,
+                weights_path=weights_path,
+                enable_reshard_after_forward=args.train.accelerator.fsdp_config.reshard_after_forward,
+                mixed_precision=args.train.accelerator.fsdp_config.mixed_precision,
+                enable_gradient_checkpointing=(args.train.gradient_checkpointing.enable and not frozen),
+                basic_modules=basic_modules,
+                enable_reentrant=args.train.gradient_checkpointing.enable_reentrant,
+                enable_forward_prefetch=args.train.accelerator.fsdp_config.forward_prefetch,
+                enable_fsdp_offload=args.train.accelerator.fsdp_config.offload,
+                broadcast_model_weights_from_rank0=args.train.broadcast_model_weights_from_rank0,
+                max_load_broadcast_size=args.train.accelerator.fsdp_config.max_load_broadcast_size,
+            )
+            # Re-attach the (in-place wrapped) child under the same name.
+            model.add_module(name, wrapped)
+            if frozen:
+                for p in wrapped.parameters():
+                    p.requires_grad_(False)
+
+        model.train()
+
+    # ── Build: per-module optimizers + schedulers ──────────────────────────────
+
+    def _build_optimizer(self):
+        args: VeOmniOmniArguments = self.args
+        muon_kwargs = _collect_muon_kwargs(args.train.optimizer)
+        for name in self.module_names:
+            if name in self.frozen_modules:
+                continue
+            child = self.model.get_module(name)
+            self.optimizers[name] = build_optimizer(
+                child,
+                lr=args.train.optimizer.lr,
+                weight_decay=args.train.optimizer.weight_decay,
+                fused=True,
+                optimizer_type=args.train.optimizer.type,
+                no_decay_modules=args.train.optimizer.no_decay_modules,
+                no_decay_params=args.train.optimizer.no_decay_params,
+                muon_kwargs=muon_kwargs,
+            )
+        if not self.optimizers:
+            raise ValueError("OmniTrainer: no trainable modules — every module is frozen.")
+        self.optimizer = MultiOptimizer(self.optimizers)
+        logger.info_rank0(f"OmniTrainer: built {len(self.optimizers)} optimizer(s): {list(self.optimizers)}.")
+
+    def _build_lr_scheduler(self):
+        args: VeOmniOmniArguments = self.args
+        for name, opt in self.optimizers.items():
+            self.lr_schedulers[name] = build_lr_scheduler(
+                opt,
+                train_steps=args.train_steps * args.train.num_train_epochs,
+                lr=args.train.optimizer.lr,
+                lr_min=args.train.optimizer.lr_min,
+                lr_decay_style=args.train.optimizer.lr_decay_style,
+                lr_decay_ratio=args.train.optimizer.lr_decay_ratio,
+                lr_warmup_ratio=args.train.optimizer.lr_warmup_ratio,
+                lr_start=args.train.optimizer.lr_start,
+            )
+        self.lr_scheduler = MultiLRScheduler(self.lr_schedulers)
+
+    # ── Callbacks (reuse base metering; swap in per-module checkpoint) ─────────
+
+    def _init_callbacks(self):
+        super()._init_callbacks()
+        # Replace the single-model checkpoint callbacks with per-module DCP.
+        self.checkpointer_callback = OmniPerModuleCheckpointCallback(self)
+        self.hf_ckpt_callback = Callback(self)  # no-op; per-module HF export is a follow-up
+
+    # ── Forward / backward (override single-model path) ────────────────────────
+
+    def forward_backward_step(self, micro_batch: Dict[str, Any]):
+        """One gradient-accumulation micro-batch over the training DAG.
+
+        ``OmniModel.forward`` returns ``{"loss", "losses", "outputs"}`` where
+        ``loss`` is the summed per-node ``_loss``; a single backward then
+        propagates across every FSDP2 unit.
+        """
+        micro_batch = self.preforward(micro_batch)
+
+        with self.model_fwd_context, set_batch_invariant_mode(self.args.train.enable_batch_invariant_mode):
+            result: Dict[str, Any] = self.model(**micro_batch)
 
         total_loss: torch.Tensor = result["loss"]
-        loss_dict: Dict[str, torch.Tensor] = result.get("loss_dict", {})
+        if total_loss is None:
+            raise RuntimeError(
+                "OmniModel.forward produced no loss — no training node emitted a `_loss`. "
+                "Check that the training data + per-module training forwards are wired (D4/D5)."
+            )
+        loss_dict: Dict[str, torch.Tensor] = result.get("losses", {})
 
-        loss = total_loss / num_micro_steps
-
-        with self.base.model_bwd_context, set_batch_invariant_mode(self.base.args.train.enable_batch_invariant_mode):
-            loss.backward()
+        with self.model_bwd_context, set_batch_invariant_mode(self.args.train.enable_batch_invariant_mode):
+            total_loss.backward()
 
         del micro_batch
-        return loss, loss_dict
+        return total_loss, loss_dict
 
-    def _model_reshard(  # pragma: no cover — unreachable until build flow is wired
-        self, micro_step: int, num_micro_steps: int
-    ):
-        """Apply set_reshard_after_backward to FSDP2 sub-modules.
+    def model_reshard(self, micro_step: int, num_micro_steps: int):
+        """Toggle ``set_reshard_after_backward`` on every *nested* FSDP2 unit.
 
-        Walks every nested FSDP2 unit so the optimisation also covers
-        ``basic_modules``-carved blocks, not just the top-level wrap.
+        The ``OmniModel`` root is a plain ``nn.Module`` (not an ``FSDPModule``),
+        so — unlike the single-model path — we walk its sub-modules and toggle
+        each FSDP2 child individually.
         """
-        fsdp_cfg = self.base.args.train.accelerator.fsdp_config
+        fsdp_cfg = self.args.train.accelerator.fsdp_config
         if fsdp_cfg.fsdp_mode != "fsdp2" or fsdp_cfg.reshard_after_backward or num_micro_steps <= 1:
             return
-
         try:
-            from torch.distributed._composable.fsdp import FSDPModule
+            from torch.distributed.fsdp import FSDPModule
         except ImportError:
             return
-
-        for mod in self.base.model.modules():
+        for mod in self.model.modules():
             if isinstance(mod, FSDPModule):
                 if micro_step == 0:
                     mod.set_reshard_after_backward(False)
                 elif micro_step == num_micro_steps - 1:
                     mod.set_reshard_after_backward(True)
 
-    # ── Callbacks (delegate to base) ───────────────────────────────────────────
-    # The pragma annotations below mirror the build helpers' rationale: the
-    # whole train loop is unreachable until D2.3 wires `_build_model`.  Drop
-    # these pragmas as part of the D2.3 cleanup so coverage tracks the
-    # callback delegation once it actually runs.
-
-    def on_train_begin(self):  # pragma: no cover — unreachable until build flow is wired
-        self.base.on_train_begin()
-
-    def on_train_end(self):  # pragma: no cover — unreachable until build flow is wired
-        self.base.on_train_end()
-
-    def on_epoch_begin(self):  # pragma: no cover — unreachable until build flow is wired
-        self.base.on_epoch_begin()
-
-    def on_epoch_end(self):  # pragma: no cover — unreachable until build flow is wired
-        self.base.on_epoch_end()
-
-    def on_step_begin(self, micro_batches=None):  # pragma: no cover — unreachable until build flow is wired
-        self.base.on_step_begin(micro_batches=micro_batches)
-
-    def on_step_end(
-        self, loss=None, loss_dict=None, grad_norm=None
-    ):  # pragma: no cover — unreachable until build flow is wired
-        self.base.on_step_end(loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
-
-    # ── Train loop ─────────────────────────────────────────────────────────────
-
-    def train_step(self, data_iterator: Any) -> None:  # pragma: no cover — unreachable until build flow is wired
-        args: VeOmniOmniArguments = self.base.args
-        self.base.state.global_step += 1
+    def train_step(self, data_iterator: Any) -> None:
+        args: VeOmniOmniArguments = self.args
+        self.state.global_step += 1
 
         micro_batches: List[Dict[str, Any]] = next(data_iterator)
         self.on_step_begin(micro_batches=micro_batches)
-
         synchronize()
 
         total_loss = 0.0
@@ -401,50 +549,17 @@ class OmniTrainer:
         num_micro_steps = len(micro_batches)
 
         for micro_step, micro_batch in enumerate(micro_batches):
-            self._model_reshard(micro_step, num_micro_steps)
-            loss, loss_dict = self.forward_backward_step(micro_batch, num_micro_steps)
-            total_loss += loss.item()
+            self.model_reshard(micro_step, num_micro_steps)
+            loss, loss_dict = self.forward_backward_step(micro_batch)
+            total_loss += loss.item() / num_micro_steps
             for k, v in loss_dict.items():
                 total_loss_dict[k] += v.item() / num_micro_steps
 
-        grad_norm = veomni_clip_grad_norm(self.base.model, args.train.optimizer.max_grad_norm)
-
-        self.base.optimizer.step()
-        self.base.lr_scheduler.step()
-        self.base.optimizer.zero_grad()
+        # Global gradient clip across every module's DTensor parameters, then
+        # step every per-module optimizer + scheduler.
+        grad_norm = veomni_clip_grad_norm(self.model, args.train.optimizer.max_grad_norm)
+        self.optimizer.step()
+        self.lr_scheduler.step()
+        self.optimizer.zero_grad()
 
         self.on_step_end(loss=total_loss, loss_dict=dict(total_loss_dict), grad_norm=grad_norm)
-
-    def train(self):  # pragma: no cover — unreachable until build flow is wired
-        args: VeOmniOmniArguments = self.base.args
-        self.on_train_begin()
-        logger.info(
-            f"Rank{args.train.local_rank} Start training. "
-            f"Start step: {self.base.start_step}. "
-            f"Train steps: {args.train_steps}. "
-            f"Start epoch: {self.base.start_epoch}. "
-            f"Train epochs: {args.train.num_train_epochs}."
-        )
-
-        for epoch in range(self.base.start_epoch, args.train.num_train_epochs):
-            if hasattr(self.base.train_dataloader, "set_epoch"):
-                self.base.train_dataloader.set_epoch(epoch)
-            self.base.state.epoch = epoch
-
-            self.on_epoch_begin()
-            data_iterator = iter(self.base.train_dataloader)
-
-            for _ in range(self.base.start_step, args.train_steps):
-                try:
-                    self.train_step(data_iterator)
-                except StopIteration:
-                    logger.info(f"epoch:{epoch} Dataloader finished with drop_last {args.data.dataloader.drop_last}")
-                    break
-
-            self.on_epoch_end()
-            self.base.start_step = 0
-            helper.print_device_mem_info(f"VRAM usage after epoch {epoch + 1}")
-
-        self.on_train_end()
-        synchronize()
-        self.base.destroy_distributed()

@@ -20,7 +20,7 @@
 #      is loaded from ``model_path`` (``tokenizer.json`` lives at the root).
 
 model:
-  model_path: seed_omni/janus_1.3b
+  model_path: /mnt/hdfs/user_dir/veomni_omni/models/seed_omni/Janus-1.3B
   # Master training vocabulary: modules / nodes / edges / training_graph.
   omni_train_yaml_path: configs/seed_omni/janus_1.3b/train.yaml
   # Inference scenarios — the selected YAML overlays omni_train_yaml_path
@@ -38,9 +38,9 @@ model:
     cross_entropy_loss_implementation: default
 
 data:
-  data_type: omni
+  data_type: seedomni
   max_seq_len: 4096
-  train_path: /mnt/hdfs/veomni/data/janus_sft
+  train_path: /mnt/hdfs/user_dir/veomni_omni/data
   datasets_type: mapping
   chat_template: default
   dataloader:

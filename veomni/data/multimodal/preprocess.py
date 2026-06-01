@@ -373,6 +373,42 @@ def tulu_3_sft_mixture_preprocess(conversations, **kwargs):
     return constructed_conversation
 
 
+@PREPROCESSOR_REGISTRY.register("veomni_omni_demo")
+def veomni_omni_demo_preprocess(conversations, **kwargs):
+    """Unified SeedOmni V2 demo schema — one shape for every UG scenario.
+
+    Each message is ``{"role": <system|user|assistant>, "content": [...]}``
+    where every content item is a typed dict::
+
+        {"type": "text",     "value": "..."}
+        {"type": "image"}        # understanding input  → consumes one image
+        {"type": "vq_image"}     # generation target    → consumes one image
+
+    ``image`` / ``vq_image`` items carry no inline value — the actual pixel
+    tensor is pulled from the sample's parallel ``images`` list in source
+    order by :func:`process_seedomni_example`.  This keeps a single, model-
+    agnostic conversation layout that covers I2T (understanding), T2I
+    (generation) and interleaved turns without per-scenario preprocessors.
+    """
+    constructed = []
+    for message in conversations:
+        role = message["role"]
+        turn = [role]
+        for item in message.get("content", []):
+            type_ = item["type"]
+            if type_ == "text":
+                turn.append(("text", item.get("value", "")))
+            elif type_ in ("image", "vq_image"):
+                turn.append((type_, None))
+            else:
+                raise ValueError(
+                    f"veomni_omni_demo: unsupported content type {type_!r}; "
+                    "expected one of 'text' / 'image' / 'vq_image'."
+                )
+        constructed.append(turn)
+    return constructed
+
+
 # @PREPROCESSOR_REGISTRY.register("your_dataset_name")
 # def your_dataset_preprocess(conversations, **kwargs):
 #     ...
