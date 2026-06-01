@@ -52,8 +52,16 @@ from transformers.models.janus.modeling_janus import (
     JanusVQVAEHead,
 )
 
-from ....conversation import ConversationPart
+from ....conversation import (
+    ConversationPart,
+    TrainConversation,
+    assemble_labels,
+    collect_modality_values,
+    is_raw_training_conversation,
+    is_train_conversation,
+)
 from ....generation_graph import FSM_SIGNAL_KEY
+from ....image_inputs import build_pixel_values_batch
 from ....module import OmniModule
 from .configuration import JanusVqvaeConfig
 from .processing import JanusVqvaeProcessor
@@ -61,6 +69,19 @@ from .processing import JanusVqvaeProcessor
 
 # Default Janus-1.3B grid: 24 x 24 = 576 VQ tokens per image.
 _DEFAULT_NUM_IMAGE_TOKENS = 576
+
+
+def _raw_of(conversation: Any) -> Optional[List[List[dict]]]:
+    """Raw ``list[list[dict]]`` view of a training conversation, else ``None``.
+
+    Accepts either the :class:`TrainConversation` carrier (built upstream by
+    ``JanusSiglip``) or the bare raw conversation (standalone / test path).
+    """
+    if is_train_conversation(conversation):
+        return conversation.raw
+    if is_raw_training_conversation(conversation):
+        return conversation
+    return None
 
 
 class JanusVqvae(OmniModule, PreTrainedModel):
@@ -108,13 +129,55 @@ class JanusVqvae(OmniModule, PreTrainedModel):
 
     # ── OmniModule interface ───────────────────────────────────────────────────
 
-    def pre_forward(self, gen_image_patches: Optional[torch.Tensor] = None, **kwargs) -> Dict[str, Any]:
-        """Flatten ``(B, N_images, 3, H, W)`` → ``(B*N_images, 3, H, W)``."""
+    def pre_forward(
+        self,
+        gen_image_patches: Optional[torch.Tensor] = None,
+        hidden_states: Optional[torch.Tensor] = None,
+        **kwargs,
+    ) -> Dict[str, Any]:
+        """Extract generation images (encode node) + ``(B, N, ...)`` flatten.
+
+        On the **encode** node during training (``hidden_states is None`` and
+        a raw ``conversation_list`` is present), pull every ``vq_image``
+        turn's raw ``(C, H, W)`` uint8 tensor and process it into the
+        VQVAE-normalised ``(B, 3, H, W)`` batch (zero placeholder for
+        gen-image-free samples → keeps FSDP aligned).  The **decode** node
+        (``hidden_states`` present) skips extraction and passes its tensors
+        through untouched.
+        """
+        if gen_image_patches is None and hidden_states is None:
+            conversation = kwargs.get("conversation_list")
+            raw = _raw_of(conversation)
+            if raw is not None:
+                gen_image_patches = self._extract_gen_patches(raw)
+                # Keep ``conversation_list`` in kwargs so :meth:`encode` can fill
+                # the carrier's ``gen_embeds`` / ``gen_token_ids``.
+
         if gen_image_patches is not None and gen_image_patches.ndim == 5:
             b, n = gen_image_patches.shape[:2]
             gen_image_patches = gen_image_patches.reshape(b * n, *gen_image_patches.shape[2:])
             kwargs["_gpatch_batch_n_images"] = (b, n)
-        return dict(gen_image_patches=gen_image_patches, **kwargs)
+
+        result = dict(gen_image_patches=gen_image_patches, **kwargs)
+        if hidden_states is not None:
+            result["hidden_states"] = hidden_states
+        return result
+
+    def _extract_gen_patches(self, conversation_list: List[List[dict]]) -> torch.Tensor:
+        """Raw ``vq_image`` turns → VQVAE-normalised ``(B, 3, H, W)`` batch."""
+        cfg = self.config.vq_config or {}
+        image_size = cfg.get("resolution", 384) if isinstance(cfg, dict) else getattr(cfg, "resolution", 384)
+        num_channels = cfg.get("in_channels", 3) if isinstance(cfg, dict) else getattr(cfg, "in_channels", 3)
+        per_sample = collect_modality_values(conversation_list, ("vq_image",))
+        param = next(self.parameters())
+        return build_pixel_values_batch(
+            per_sample,
+            processor=self._processor,
+            image_size=image_size,
+            num_channels=num_channels,
+            device=param.device,
+            dtype=param.dtype,
+        )
 
     def forward(self, **kwargs) -> Dict[str, Any]:  # type: ignore[override]
         """Default forward — alias for :meth:`encode`."""
@@ -123,12 +186,20 @@ class JanusVqvae(OmniModule, PreTrainedModel):
     def encode(self, gen_image_patches: Optional[torch.Tensor] = None, **kwargs) -> Dict[str, Any]:
         """VQVAE encode pass: pixels → ground-truth tokens + teacher-forcing embeds.
 
-        Returns ``{}`` for text-only batches.  When ``self.config.freeze_vqvae``
-        is ``True`` the VQVAE is wrapped in ``torch.no_grad()`` to avoid
-        tracking gradients on frozen parameters.
+        Training (``conversation_list`` is a :class:`TrainConversation`): fill
+        the carrier's ``gen_embeds`` ``(B, P, D)`` + ``gen_token_ids`` ``(B, P)``
+        and route the carrier on (``{"conversation_list": carrier}``).  The text
+        encoder slices per-sample rows into ``vq_image`` segments; the backbone
+        uses the whole ``gen_embeds`` tensor as an FSDP grad-sync anchor.
+
+        Legacy / pre-tensorised path returns
+        ``{"gen_embeds", "vq_token_ids"}`` unchanged.  Returns ``{}`` for
+        text-only batches.  When ``self.config.freeze_vqvae`` is ``True`` the
+        VQVAE is wrapped in ``torch.no_grad()``.
         """
+        conversation = kwargs.get("conversation_list")
         if gen_image_patches is None:
-            return {}
+            return {"conversation_list": conversation} if is_train_conversation(conversation) else {}
 
         b_n = kwargs.pop("_gpatch_batch_n_images", None)
 
@@ -139,28 +210,57 @@ class JanusVqvae(OmniModule, PreTrainedModel):
         gen_embeds_raw = self.generation_embeddings(vq_token_ids)
         gen_embeds = self.generation_aligner(gen_embeds_raw)
 
+        # HF ``JanusVQVAE.encode`` returns the quantizer ``indices`` flattened
+        # to ``(B*P,)`` (P = patches/grid positions per image), so
+        # ``gen_embeds`` is ``(B*P, D)``.  Restore the per-sample ``(B, P[, D])``
+        # layout the backbone scatter (``_scatter_by_mask``) and the gen-loss
+        # alignment expect.
+        if vq_token_ids.dim() == 1:
+            b = gen_image_patches.size(0)
+            vq_token_ids = vq_token_ids.reshape(b, -1)
+            gen_embeds = gen_embeds.reshape(b, vq_token_ids.size(1), gen_embeds.size(-1))
+
         if b_n is not None:
             b, n = b_n
             p = vq_token_ids.size(1)
             vq_token_ids = vq_token_ids.reshape(b, n * p)
             gen_embeds = gen_embeds.reshape(b, n * p, gen_embeds.size(2))
 
+        if is_train_conversation(conversation):
+            conversation.gen_embeds = gen_embeds
+            conversation.gen_token_ids = vq_token_ids
+            return {"conversation_list": conversation}
+        if is_raw_training_conversation(conversation):
+            return {
+                "conversation_list": TrainConversation(
+                    raw=conversation, gen_embeds=gen_embeds, gen_token_ids=vq_token_ids
+                )
+            }
         return {"gen_embeds": gen_embeds, "vq_token_ids": vq_token_ids}
 
     def decode(
         self,
         hidden_states: Optional[torch.Tensor] = None,
         gt_token_ids: Optional[torch.Tensor] = None,
+        gen_image_mask: Optional[torch.Tensor] = None,
         token_id: Optional[torch.Tensor] = None,
+        conversation_list: Optional[Any] = None,
         **kwargs,
     ) -> Dict[str, Any]:
         """Unified VQ head — training loss + inference sample + lookup.
 
         Three input-driven dispatch paths:
 
-          * **Training** (``hidden_states`` + ``gt_token_ids``):
-              ``logits = generation_head(hidden_states)``, then token-mean
-              CE w.r.t. ``gt_token_ids``.  Returns ``{"_loss"}``.
+          * **Training** (``hidden_states`` + ``gt_token_ids`` +
+            ``gen_image_mask``): next-token VQ CE.  ``hidden_states`` is the
+            *full-sequence* backbone output ``(B, T, D)``; ``gen_image_mask``
+            ``(B, T)`` marks the ``<image_k>`` generation-grid positions and
+            ``gt_token_ids`` ``(B, num_image_tokens)`` are the teacher VQ ids
+            from :meth:`encode`.  We scatter the VQ ids into a full-length
+            ``gen_labels`` (``-100`` elsewhere) and run the *same* shifted CE
+            the text head uses, so ``hidden[<image_{k-1}>]`` predicts
+            ``vq[k]`` (and ``hidden[<boi>]`` predicts ``vq[0]``).  Returns
+            ``{"_loss"}``.
 
           * **Inference sample** (``hidden_states`` alone, no
             ``gt_token_ids``): project the last position, sample with
@@ -175,13 +275,19 @@ class JanusVqvae(OmniModule, PreTrainedModel):
         """
         out: Dict[str, Any] = {}
 
+        # V2 training: gen-labels are built from the carrier's per-sample
+        # ``vq_image`` segments (``gen_ids``); the backbone already assembled
+        # ``hidden_states`` from the *same* segment order + right-pad, so the
+        # shifted CE lines up position-for-position with no mask plumbing.
+        if hidden_states is not None and is_train_conversation(conversation_list):
+            segments = conversation_list.segments
+            if segments is None:
+                raise ValueError("JanusVqvae.decode: TrainConversation has no segments (text encoder must run first).")
+            out["_loss"] = self._gen_loss_from_segments(hidden_states, segments)
+            return out
+
         if hidden_states is not None and gt_token_ids is not None:
-            logits = self.generation_head(hidden_states)
-            out["_loss"] = nn.functional.cross_entropy(
-                logits.reshape(-1, logits.size(-1)),
-                gt_token_ids.reshape(-1).long(),
-                ignore_index=-100,
-            )
+            out["_loss"] = self._gen_loss(hidden_states, gt_token_ids, gen_image_mask)
             return out
 
         if hidden_states is not None:
@@ -201,6 +307,66 @@ class JanusVqvae(OmniModule, PreTrainedModel):
             return out
 
         return out
+
+    def _gen_loss(
+        self,
+        hidden_states: torch.Tensor,
+        gt_token_ids: torch.Tensor,
+        gen_image_mask: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Next-token VQ cross-entropy over the generation-grid positions.
+
+        ``gen_image_mask`` aligns the teacher VQ ids onto the full sequence;
+        only **present rows** (``mask.any``) contribute teacher ids, so the
+        per-sample dummy-forward of text-only / understanding micro-batches
+        stays a no-op while keeping the FSDP graph aligned (the trailing
+        ``+ logits.sum() * 0`` anchor guarantees a grad path even when the
+        whole micro-batch has zero gen tokens).
+        """
+        logits = self.generation_head(hidden_states)  # (B, T, V)
+        b, t, v = logits.shape
+        gen_labels = torch.full((b, t), -100, dtype=torch.long, device=logits.device)
+        if gen_image_mask is not None:
+            gen_image_mask = gen_image_mask.bool()
+            gen_rows = gen_image_mask.any(dim=1)
+            if bool(gen_rows.any()):
+                gen_labels[gen_image_mask] = gt_token_ids[gen_rows].reshape(-1).long()
+        shift_logits = logits[:, :-1, :].contiguous()
+        shift_labels = gen_labels[:, 1:].contiguous()
+        ce_sum = nn.functional.cross_entropy(
+            shift_logits.reshape(-1, v),
+            shift_labels.reshape(-1),
+            ignore_index=-100,
+            reduction="sum",
+        )
+        n_valid = (shift_labels != -100).sum().clamp(min=1)
+        return ce_sum / n_valid + logits.sum() * 0.0
+
+    def _gen_loss_from_segments(self, hidden_states: torch.Tensor, segments: List[List[Any]]) -> torch.Tensor:
+        """Next-token VQ CE from carrier segments (V2 segment-driven path).
+
+        ``gen_ids`` is ``-100`` everywhere except the ``vq_image`` segment
+        positions, where it holds the teacher VQ token ids.  The standard
+        causal shift then makes ``hidden[<boi>]`` predict ``vq[0]`` and
+        ``hidden[vq_{k-1}]`` predict ``vq[k]``.  The trailing
+        ``+ logits.sum() * 0`` keeps a grad path through the generation head
+        even on a micro-batch with zero gen tokens (FSDP DP alignment).
+        """
+        gen_labels = assemble_labels(segments, key="gen_ids").to(hidden_states.device)  # (B, T)
+        # Trim any SP right-pad so logits/labels align (no-op when SP off).
+        hidden_states = hidden_states[:, : gen_labels.size(1)]
+        logits = self.generation_head(hidden_states)  # (B, T, V)
+        v = logits.size(-1)
+        shift_logits = logits[:, :-1, :].contiguous()
+        shift_labels = gen_labels[:, 1:].contiguous()
+        ce_sum = nn.functional.cross_entropy(
+            shift_logits.reshape(-1, v),
+            shift_labels.reshape(-1),
+            ignore_index=-100,
+            reduction="sum",
+        )
+        n_valid = (shift_labels != -100).sum().clamp(min=1)
+        return ce_sum / n_valid + logits.sum() * 0.0
 
     def decode_pixels(self, vq_token_ids: torch.Tensor) -> torch.Tensor:
         """Decode a sequence of VQ token IDs to pixel values ``(B, H, W, 3)``."""

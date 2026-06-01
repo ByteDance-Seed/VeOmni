@@ -160,11 +160,22 @@ class TextEncoder(OmniModule, PreTrainedModel):
         if labels is not None:
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
-            out["_loss"] = F.cross_entropy(
+            # Token-summed CE / valid-token count (invariant 9).  Using
+            # ``reduction="sum"`` + an explicit denominator avoids the NaN that
+            # ``reduction="mean"`` returns when a micro-batch has zero
+            # supervised text tokens (e.g. a pure image-generation micro-batch
+            # whose only assistant turn is a VQ image).  The ``clamp(min=1)``
+            # makes that degenerate case a hard 0 instead of 0/0; the loss
+            # still flows through ``logits`` so every DP rank's FSDP graph
+            # stays aligned.
+            ce_sum = F.cross_entropy(
                 shift_logits.view(-1, shift_logits.size(-1)),
                 shift_labels.view(-1),
                 ignore_index=-100,
+                reduction="sum",
             )
+            n_valid = (shift_labels != -100).sum().clamp(min=1)
+            out["_loss"] = ce_sum / n_valid
         else:
             next_token_logits = logits[:, -1, :]
             if temperature != 1.0:

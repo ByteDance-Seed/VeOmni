@@ -63,6 +63,7 @@ from ..data import SeedOmniCollator
 from ..distributed.clip_grad_norm import veomni_clip_grad_norm
 from ..distributed.torch_parallelize import build_parallelize_model
 from ..models import build_tokenizer
+from ..models.module_utils import init_empty_weights
 from ..models.seed_omni.modeling_omni import OmniModel
 from ..models.seed_omni.modules import OMNI_CONFIG_REGISTRY, OMNI_MODEL_REGISTRY, read_model_type
 from ..ops.batch_invariant_ops import set_batch_invariant_mode
@@ -356,7 +357,14 @@ class OmniTrainer(BaseTrainer):
             # Remaining mod_cfg keys are config overrides (freeze flags pass
             # through harmlessly — PretrainedConfig stores unknown kwargs).
             module_config = cfg_cls.from_pretrained(weights_path, **mod_cfg)
-            with torch.device("meta"):
+            # ``init_empty_weights`` meta-izes *parameters* only (real weights are
+            # loaded per-module later), but keeps *buffers* on the real device
+            # with their computed values. A raw ``torch.device("meta")`` would
+            # also meta-ize non-persistent buffers (e.g. SigLIP ``position_ids =
+            # arange(...)``), which are absent from the checkpoint and would then
+            # never materialize — breaking weight loading. Mirror the standard
+            # loader path (veomni/models/loader.py).
+            with init_empty_weights():
                 module = model_cls(module_config)
             if name in self.frozen_modules:
                 for p in module.parameters():
@@ -381,11 +389,26 @@ class OmniTrainer(BaseTrainer):
         tokenizer_path = self.omni_config.tokenizer_path or args.model.tokenizer_path
         self.tokenizer = build_tokenizer(tokenizer_path)
         # Wire the global tokenizer into every module that wants it
-        # (e.g. JanusTextEncoder resolves boi/eoi/bos/eos ids here).
+        # (e.g. JanusTextEncoder resolves boi/eoi/bos/eos/image ids here).
         for name, raw in self.model.named_omni_modules():
             if hasattr(raw, "set_tokenizer"):
                 raw.set_tokenizer(self.tokenizer)
                 logger.info_rank0(f"OmniTrainer: set_tokenizer on module '{name}'.")
+            # Meta-init builds modules from config (not from_pretrained), so the
+            # per-module image processor is not auto-loaded.  Vision modules
+            # (SigLIP / VQVAE) need it at training time to normalise the raw
+            # uint8 images carried in conversation_list — load + attach here.
+            processor_cls = getattr(type(raw), "processor_class", None)
+            if processor_cls is not None and getattr(raw, "_processor", None) is None:
+                weights_path = self.omni_config.module_config(name).get("weights_path")
+                try:
+                    raw._processor = processor_cls.from_pretrained(weights_path)
+                    logger.info_rank0(f"OmniTrainer: loaded {processor_cls.__name__} for module '{name}'.")
+                except Exception as e:  # noqa: BLE001 — surfaced lazily by the module if truly needed
+                    logger.warning_once(
+                        f"OmniTrainer: could not load processor for module '{name}' from {weights_path}: {e}. "
+                        "Training will fail if this modality's images are actually present."
+                    )
         self.model_assets = [self.omni_config, self.tokenizer]
 
     # ── Build: collator ─────────────────────────────────────────────────────────
@@ -417,6 +440,16 @@ class OmniTrainer(BaseTrainer):
             weights_path = self.omni_config.module_config(name).get("weights_path")
             frozen = name in self.frozen_modules
             basic_modules = list(set(getattr(child, "_no_split_modules", None) or []) | set(args.model.basic_modules))
+            # Some modules (e.g. SigLIP/VQVAE vision encoders) declare
+            # ``supports_gradient_checkpointing = False``; enabling GC on them
+            # raises inside ``gradient_checkpointing_enable``. Only enable GC on
+            # trainable modules that actually support it.
+            supports_gc = bool(getattr(child, "supports_gradient_checkpointing", False))
+            enable_gc = args.train.gradient_checkpointing.enable and not frozen and supports_gc
+            if args.train.gradient_checkpointing.enable and not frozen and not supports_gc:
+                logger.info_rank0(
+                    f"OmniTrainer: module '{name}' does not support gradient checkpointing; skipping GC for it."
+                )
             logger.info_rank0(f"OmniTrainer: FSDP2-wrapping module '{name}' from {weights_path}...")
             wrapped = build_parallelize_model(
                 child,
@@ -424,7 +457,7 @@ class OmniTrainer(BaseTrainer):
                 weights_path=weights_path,
                 enable_reshard_after_forward=args.train.accelerator.fsdp_config.reshard_after_forward,
                 mixed_precision=args.train.accelerator.fsdp_config.mixed_precision,
-                enable_gradient_checkpointing=(args.train.gradient_checkpointing.enable and not frozen),
+                enable_gradient_checkpointing=enable_gc,
                 basic_modules=basic_modules,
                 enable_reentrant=args.train.gradient_checkpointing.enable_reentrant,
                 enable_forward_prefetch=args.train.accelerator.fsdp_config.forward_prefetch,

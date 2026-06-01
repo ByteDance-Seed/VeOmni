@@ -1133,6 +1133,11 @@ class DataArguments:
                 self.text_keys = "text"
             elif self.data_type == "dpo":
                 self.text_keys = "chosen"
+            elif self.data_type == "seedomni":
+                # SeedOmni V2 modules own their own tokenization; the transform
+                # reads ``conversations`` / ``images`` columns directly and
+                # ignores ``text_keys``. Leave it unset.
+                pass
             else:
                 raise ValueError(f"Unknown data type: {self.data_type}")
 

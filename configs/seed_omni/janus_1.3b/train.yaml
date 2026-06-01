@@ -117,15 +117,31 @@ nodes:
 
 # ── Graph edges (data dependencies) ───────────────────────────────────────────
 edges:
-  # ── Training (and shared with inference where it makes sense)
-  vision_to_ar:        { from: siglip_encode, output: image_embeds, to: janus_llama, as: und_image_embeds }
-  vae_enc_to_ar:       { from: vae_encode,    output: gen_embeds,   to: janus_llama, as: gen_image_embeds }
-  tok_enc_to_ar:       { from: tok_encode,    output: inputs_embeds, to: janus_llama, as: inputs_embeds }
-  ar_to_tok_decode:    { from: janus_llama,   output: hidden_states, to: tok_decode,  as: hidden_states }
-  ar_to_vae_decode:    { from: janus_llama,   output: hidden_states, to: vae_decode,  as: hidden_states }
-  vae_token_to_decode: { from: vae_encode,    output: vq_token_ids,  to: vae_decode,  as: gt_token_ids }
-  tok_decode_sink:     { from: tok_decode,    to: end }
-  vae_decode_sink:     { from: vae_decode,    to: end }
+  # ── Training: the conversation_list carrier (D5 backbone splice).
+  #
+  # A single `conversation_list` object (a `TrainConversation`) is the ONLY
+  # thing entering the backbone.  Each module fills its own segments' value
+  # (= embedding) into it and `OmniModel.forward` writes the evolving carrier
+  # back into the shared batch, so these chain edges are pure `{from, to}`
+  # topology contracts — no `output`/`as` plumbing for the per-modality
+  # fields (`input_ids` / `attention_mask` / `position_ids` / `gen_image_mask`
+  # / `labels` / `vq_token_ids` no longer ride their own edges):
+  #
+  #   * siglip_encode  → fills carrier.und_embeds   (understanding patches)
+  #   * vae_encode     → fills carrier.gen_embeds + gen_token_ids (VQ patches)
+  #   * tok_encode     → chat-template + tokenise + wte + boi/eoi → carrier.segments
+  #   * janus_llama    → segment-order splice → inputs_embeds; derives
+  #                      attention_mask / position_ids; emits hidden_states
+  #   * tok_decode / vae_decode → rebuild their labels from carrier.segments
+  siglip_to_vae:  { from: siglip_encode, to: vae_encode }
+  vae_to_tok:     { from: vae_encode,     to: tok_encode }
+  tok_to_ar:      { from: tok_encode,     to: janus_llama }
+  # Only hidden_states still rides an explicit edge (the carrier reaches the
+  # heads via the shared-batch write-back above).
+  ar_to_tok_decode: { from: janus_llama, output: hidden_states, to: tok_decode, as: hidden_states }
+  ar_to_vae_decode: { from: janus_llama, output: hidden_states, to: vae_decode, as: hidden_states }
+  tok_decode_sink:  { from: tok_decode,  to: end }
+  vae_decode_sink:  { from: vae_decode,  to: end }
 
   # ── Inference-only (cyclic; not in training subset).
   vae_decode_to_ar:    { from: vae_decode,    output: embed,         to: janus_llama, as: inputs_embeds }
@@ -169,43 +185,45 @@ edges:
 # ── Training DAG ──────────────────────────────────────────────────────────────
 # Default = Janus joint understanding + image-generation SFT.
 #
-# Active nodes are derived from these edges' endpoints (excluding `end`):
-#   sources : siglip_encode, vae_encode, tok_encode
-#   middle  : janus_llama
-#   sinks   : tok_decode, vae_decode  (both flow to `end`)
+# The conversation_list carrier turns the graph into a chain (active nodes
+# derived from the edge endpoints below, excluding `end`):
 #
-# Each module emits at most one `_loss` (token-mean over its own micro-
-# batches); OmniModel.forward sums them.  See design.md §9.
+#   siglip_encode → vae_encode → tok_encode → janus_llama → tok_decode → end
+#                                                        └─→ vae_decode → end
+#
+#   source : siglip_encode            (reads the raw conversation_list)
+#   middle : vae_encode, tok_encode, janus_llama
+#   sinks  : tok_decode, vae_decode   (both flow to `end`)
+#
+# siglip/vae/tok each fill their own segments' embedding into the single
+# carrier (written back into the shared batch by OmniModel.forward); the
+# backbone splices the segments and the heads rebuild their labels from the
+# same segments.  Each module emits at most one `_loss` (token-mean over its
+# own micro-batches); OmniModel.forward sums them.  See design.md §9.
 #
 # Training-side dummy forward
 # ---------------------------
 # Every active node MUST forward on every micro-batch, including ones where
 # its primary input is missing (text-only sample → no pixel_values).  The
-# trainer fills missing kwargs from each module's `dummy_inputs(...)`
-# before dispatch, keeping FSDP DP/SP graphs aligned across ranks.  This
-# is the *only* asymmetry between training and inference: inference
-# permits empty `{}` returns and lets edge routing skip silently.
+# vision / VQ modules feed a zero placeholder image so the encoder still runs;
+# the backbone folds the full-batch und_embeds / gen_embeds into a
+# `sum() * 0.0` autograd anchor so every encoder receives a (zero) gradient,
+# keeping FSDP DP/SP graphs aligned across ranks.  This is the *only*
+# asymmetry between training and inference: inference permits empty `{}`
+# returns and lets edge routing skip silently.
 training_graph:
   edges:
-    - vision_to_ar
-    - vae_enc_to_ar
-    - tok_enc_to_ar
+    - siglip_to_vae
+    - vae_to_tok
+    - tok_to_ar
     - ar_to_tok_decode
     - ar_to_vae_decode
-    - vae_token_to_decode
     - tok_decode_sink
     - vae_decode_sink
 
-# Alternative training scenarios (override `training_graph.edges` in a
-# sibling YAML to activate a different subset):
-#
-#   A) Understanding-only SFT (no image generation)
-#        edges: [vision_to_ar, tok_enc_to_ar, ar_to_tok_decode, tok_decode_sink]
-#
-#   B) Generation-only SFT (skip vision understanding side)
-#        edges: [vae_enc_to_ar, tok_enc_to_ar, ar_to_tok_decode, ar_to_vae_decode,
-#                vae_token_to_decode, tok_decode_sink, vae_decode_sink]
-#
-#   C) Train only janus_llama + janus_text_encoder with pre-cached image embeddings
-#        edges: [tok_enc_to_ar, ar_to_tok_decode, tok_decode_sink]
-#      Batch already carries und_image_embeds / gen_image_embeds from disk.
+# Alternative training scenarios: because every modality now flows through the
+# single conversation_list carrier (siglip → vae → tok → llama), an
+# understanding-only or generation-only subset is selected by what the data
+# actually contains (text-only / image-only samples drive the zero-placeholder
+# dummy path), not by dropping edges.  Keep the full chain; curate the dataset
+# for the scenario you want.

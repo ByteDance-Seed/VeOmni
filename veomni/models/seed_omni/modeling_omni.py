@@ -252,7 +252,7 @@ class OmniModel(nn.Module):
             kwargs = raw_module.pre_forward(**kwargs) if isinstance(raw_module, OmniModule) else kwargs
 
             if method == "forward":
-                # Through the FSDP wrapper so backward hooks fire.
+                # Through the FSDP wrapper so unshard + backward hooks fire.
                 out = module(**kwargs)
             else:
                 fn = getattr(raw_module, method, None)
@@ -261,7 +261,20 @@ class OmniModel(nn.Module):
                         f"Node '{node_name}' requires {module_name}.{method}() "
                         f"but {type(raw_module).__name__} has no such method."
                     )
-                out = fn(**kwargs)
+                # FSDP2 installs its all-gather (unshard) pre-forward hook and the
+                # post-forward/backward reduce-scatter hooks on ``module.__call__``
+                # only. Calling a non-``forward`` method directly would run the op
+                # against still-sharded DTensor params (-> "mixed Tensor and
+                # DTensor" errors) and skip gradient sync. Route the call through
+                # ``module(**kwargs)`` by temporarily pointing ``forward`` at the
+                # target method so every node — regardless of method name — gets
+                # the same FSDP2 lifecycle as a plain ``forward`` node.
+                orig_forward = raw_module.forward
+                try:
+                    raw_module.forward = fn
+                    out = module(**kwargs)
+                finally:
+                    raw_module.forward = orig_forward
 
             if isinstance(raw_module, OmniModule):
                 out = raw_module.post_forward(out)
@@ -271,6 +284,19 @@ class OmniModel(nn.Module):
                     f"Node '{node_name}' ({module_name}.{method}) returned {type(out).__name__}; expected dict."
                 )
             node_outputs[node_name] = out
+
+            # V2 segment-driven carrier: the single ``conversation_list`` object
+            # is mutated/replaced in place as it flows
+            # ``siglip → vae → text_encoder → backbone → decoders``.  Write it
+            # back into the shared batch so downstream nodes read the evolving
+            # carrier directly — the chain edges are then pure ``{from, to}``
+            # topology contracts (no ``output``/``as`` plumbing for the
+            # per-modality fields).  Only this one key is written back, so the
+            # ``as``-renaming the inference FSM / legacy edges rely on is
+            # untouched (inference runs through ``generate``, not here).
+            convo = out.get("conversation_list")
+            if convo is not None:
+                batch["conversation_list"] = convo
 
             if _LOSS_KEY in out and out[_LOSS_KEY] is not None:
                 losses[node_name] = out[_LOSS_KEY]

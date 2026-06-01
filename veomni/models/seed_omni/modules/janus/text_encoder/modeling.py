@@ -50,7 +50,14 @@ from typing import Any, Dict, List, Optional
 import torch
 import torch.nn.functional as F
 
-from ....conversation import ConversationPart, latest_assistant_text_token_ids
+from ....conversation import (
+    ConversationPart,
+    TrainConversation,
+    TrainSegment,
+    assemble_labels,
+    is_train_conversation,
+    latest_assistant_text_token_ids,
+)
 from ....generation_graph import FSM_SIGNAL_KEY
 from ....graph import scalar_token_id
 from ...base.text_encoder.modeling import TextEncoder
@@ -124,6 +131,15 @@ class JanusTextEncoder(TextEncoder):
         # the training ``input_ids`` so the backbone's ``masked_scatter``
         # injects the SigLIP patch embeddings at exactly those positions.
         self._image_token_id: Optional[int] = None
+        # Base id of the 576 positional generation tokens ``<image_0>``..
+        # ``<image_575>`` (Janus: 100017..100592).  A ``vq_image`` turn
+        # expands to ``[gen_base + k for k in range(num_image_tokens)]`` so
+        # the gen-image placeholder ids are *distinct* from the understanding
+        # placeholder (no ``masked_scatter`` collision in mixed batches) and
+        # self-describe their grid position.  ``gen_image_mask`` (returned by
+        # :meth:`encode`) marks exactly these positions for the backbone
+        # scatter + the VQ gen-loss.
+        self._gen_image_base: Optional[int] = None
 
     def set_tokenizer(self, tokenizer: Any) -> None:
         """Resolve Janus special-token ids from the global tokenizer."""
@@ -151,6 +167,7 @@ class JanusTextEncoder(TextEncoder):
             tokenizer,
             ("<image_placeholder>", getattr(tokenizer, "image_token", None)),
         )
+        self._gen_image_base = _resolve_token_id(tokenizer, ("<image_0>",))
         if self._boi_token_id is not None:
             self.config.begin_of_image_token_id = self._boi_token_id
         if self._eoi_token_id is not None:
@@ -159,73 +176,59 @@ class JanusTextEncoder(TextEncoder):
     # ── Training: conversation-list → tokenised batch (D4) ────────────────────
 
     def pre_forward(self, **kwargs: Any) -> Dict[str, Any]:  # type: ignore[override]
-        """Tokenise the raw training ``conversation_list`` in place.
+        """Pass the training carrier through to :meth:`encode`.
 
-        The SeedOmni V2 data pipeline hands every node the raw
-        ``conversation_list`` (``list[list[dict]]`` of
-        ``{type, value, role, loss_mask}`` — see
-        :mod:`veomni.data.multimodal.seedomni_transform`).  The text
-        encoder owns chat-templating + tokenisation, so here we convert
-        that raw structure into the flat ``input_ids`` / ``labels`` /
-        ``attention_mask`` / ``position_ids`` the backbone + LM head
-        consume, expanding each ``image`` turn to ``num_image_tokens``
-        copies of ``<image_placeholder>`` (the backbone scatters SigLIP
-        patches onto those positions).
-
-        Inference (``conversation_list`` of :class:`ConversationPart`, or a
-        batch that already carries ``input_ids``) is passed through
-        untouched — :meth:`generate` / :meth:`encode`'s AR path handle it.
+        In the V2 segment-driven contract the text encoder no longer emits flat
+        ``input_ids`` / ``attention_mask`` / ``position_ids`` / ``gen_image_mask``
+        tensors.  All tokenisation + wte embedding happens in :meth:`encode`,
+        which fills the :class:`TrainConversation` carrier's per-sample segment
+        list.  Inference (``ConversationPart`` list / ``input_ids`` batch) is
+        passed through untouched — :meth:`generate` handles it.
         """
-        conversation = kwargs.get("conversation_list")
-        if kwargs.get("input_ids") is not None or not _is_training_conversation(conversation):
-            return kwargs
-        batch = self._tokenize_training_batch(conversation)
-        kwargs.pop("conversation_list", None)
-        kwargs.update(batch)
         return kwargs
 
     def encode(  # type: ignore[override]
         self,
         input_ids: Optional[torch.LongTensor] = None,
-        labels: Optional[torch.LongTensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
+        conversation_list: Optional[Any] = None,
         past_key_values: Any = None,
         **kwargs: Any,
     ) -> Dict[str, Any]:
-        """wte lookup + echo the tokenised fields produced by :meth:`pre_forward`.
+        """Build the per-sample embedding segments on the training carrier.
 
-        Delegates the embedding lookup to :class:`TextEncoder.encode`, then
-        re-emits ``input_ids`` / ``labels`` / ``attention_mask`` /
-        ``position_ids`` in the return dict so the training edges can route
-        them to ``janus_llama`` (scatter mask + masks) and ``tok_decode``
-        (CE labels).  ``OmniModel`` only propagates a node's *return* dict.
+        Training (``conversation_list`` is a :class:`TrainConversation`): walk
+        each sample's raw conversation, apply the Janus chat template, tokenise
+        + wte-embed the text runs, splice in the SigLIP / VQ patch embeds for
+        ``image`` / ``vq_image`` turns (wrapped in ``<boi>``/``<eoi>``), and
+        write the ordered :class:`TrainSegment` list back onto the carrier.
+        No flat ``input_ids`` / masks are emitted — the backbone derives
+        everything from the segments.  Returns ``{"conversation_list": carrier}``.
+
+        Legacy / inference path (``input_ids`` only): delegate to
+        :class:`TextEncoder.encode` (wte lookup → ``inputs_embeds``).
         """
-        base = super().encode(input_ids=input_ids, past_key_values=past_key_values, **kwargs)
-        if not base:
-            return base
-        out: Dict[str, Any] = dict(base)
-        out["input_ids"] = input_ids
-        if labels is not None:
-            out["labels"] = labels
-        if attention_mask is not None:
-            out["attention_mask"] = attention_mask
-        if position_ids is not None:
-            out["position_ids"] = position_ids
-        return out
+        if is_train_conversation(conversation_list):
+            self._build_segments(conversation_list)
+            return {"conversation_list": conversation_list}
+        return super().encode(input_ids=input_ids, past_key_values=past_key_values, **kwargs)
 
     def _num_image_tokens(self) -> int:
         """Understanding-image placeholder count per image (Janus: 24×24=576)."""
         return int(getattr(self.config, "num_image_tokens", 576))
 
-    def _tokenize_training_batch(self, conversation_list: List[List[Dict[str, Any]]]) -> Dict[str, torch.Tensor]:
-        """Tokenise N raw conversations into a right-padded training batch.
+    def _build_segments(self, conv: TrainConversation) -> None:
+        """Fill ``conv.segments`` — one ordered ``TrainSegment`` list per sample.
 
         Mirrors the inference chat template (:meth:`_inject_chat_template`):
         ``<bos><system>\\n\\n<|User|>: [<boi>img<eoi>\\n]<user_text>\\n\\n
-        <|Assistant|>:<assistant_text><eos>``.  Loss is taken only on
+        <|Assistant|>:<assistant_text><eos>``.  Text runs become wte-embedded
+        segments; ``image`` / ``vq_image`` turns become patch-embed segments
+        sourced from ``conv.und_embeds`` / ``conv.gen_embeds`` (one row per
+        sample — at most one image of each modality per sample, see
+        ``image_inputs.build_pixel_values_batch``).  Loss is taken only on
         assistant-role text turns flagged ``loss_mask=1`` (plus the closing
-        ``<eos>``); every prompt / image / boundary position is ``-100``.
+        ``<eos>``); image / boundary / prompt positions get ``label_ids=-100``,
+        and ``vq_image`` positions carry the teacher VQ ids in ``gen_ids``.
         """
         if self._tokenizer is None:
             raise RuntimeError(
@@ -234,46 +237,46 @@ class JanusTextEncoder(TextEncoder):
             )
         if self._bos_token_id is None or self._eos_token_id is None:
             raise RuntimeError("JanusTextEncoder.set_tokenizer did not resolve bos/eos ids.")
+        conv.segments = [self._segment_one(sample, conv, i) for i, sample in enumerate(conv.raw)]
 
-        seqs: List[List[int]] = []
-        label_seqs: List[List[int]] = []
-        for sample in conversation_list:
-            ids, labels = self._tokenize_one(sample)
-            seqs.append(ids)
-            label_seqs.append(labels)
-
-        max_len = max(len(s) for s in seqs)
-        pad_id = self._pad_token_id if self._pad_token_id is not None else self._eos_token_id
+    def _segment_one(
+        self, sample: List[Dict[str, Any]], conv: TrainConversation, sample_idx: int
+    ) -> List[TrainSegment]:
+        """Build the ordered ``TrainSegment`` list for one raw conversation."""
         device = self.embed_tokens.weight.device
+        segs: List[TrainSegment] = []
 
-        input_ids = torch.full((len(seqs), max_len), pad_id, dtype=torch.long)
-        labels = torch.full((len(seqs), max_len), -100, dtype=torch.long)
-        attention_mask = torch.zeros((len(seqs), max_len), dtype=torch.long)
-        for i, (ids, lab) in enumerate(zip(seqs, label_seqs)):
-            n = len(ids)
-            input_ids[i, :n] = torch.tensor(ids, dtype=torch.long)
-            labels[i, :n] = torch.tensor(lab, dtype=torch.long)
-            attention_mask[i, :n] = 1
-        position_ids = torch.arange(max_len, dtype=torch.long).unsqueeze(0).expand(len(seqs), -1)
+        def _add_text(token_ids: List[int], supervised: bool) -> None:
+            if not token_ids:
+                return
+            ids_t = torch.tensor(token_ids, dtype=torch.long, device=device)
+            embeds = self.embed_tokens(ids_t)  # (L, D)
+            label_ids = ids_t.clone() if supervised else torch.full_like(ids_t, -100)
+            gen_ids = torch.full_like(ids_t, -100)
+            segs.append(TrainSegment(embeds=embeds, label_ids=label_ids, gen_ids=gen_ids))
 
-        return {
-            "input_ids": input_ids.to(device),
-            "labels": labels.to(device),
-            "attention_mask": attention_mask.to(device),
-            "position_ids": position_ids.to(device),
-        }
+        def _add_image(typ: str) -> None:
+            if typ == "image":
+                if conv.und_embeds is None:
+                    raise RuntimeError(
+                        "JanusTextEncoder: `image` turn but carrier has no und_embeds (run JanusSiglip)."
+                    )
+                embeds = conv.und_embeds[sample_idx]  # (P, D)
+                p = embeds.size(0)
+                gen_ids = torch.full((p,), -100, dtype=torch.long, device=device)
+            else:  # vq_image
+                if conv.gen_embeds is None or conv.gen_token_ids is None:
+                    raise RuntimeError(
+                        "JanusTextEncoder: `vq_image` turn but carrier has no gen_embeds (run JanusVqvae)."
+                    )
+                embeds = conv.gen_embeds[sample_idx]  # (P, D)
+                p = embeds.size(0)
+                gen_ids = conv.gen_token_ids[sample_idx].to(device=device, dtype=torch.long)  # (P,)
+            label_ids = torch.full((p,), -100, dtype=torch.long, device=device)
+            segs.append(TrainSegment(embeds=embeds, label_ids=label_ids, gen_ids=gen_ids))
 
-    def _tokenize_one(self, sample: List[Dict[str, Any]]) -> tuple[List[int], List[int]]:
-        """Tokenise one raw conversation → (input_ids, labels) python lists."""
-        n_img = self._num_image_tokens()
-        ids: List[int] = [int(self._bos_token_id)]
-        labels: List[int] = [-100]
-
-        def _emit(token_ids: List[int], supervised: bool) -> None:
-            ids.extend(token_ids)
-            labels.extend(token_ids if supervised else [-100] * len(token_ids))
-
-        _emit(self._encode_text(_JANUS_SYSTEM_PROMPT), supervised=False)
+        _add_text([int(self._bos_token_id)], supervised=False)
+        _add_text(self._encode_text(_JANUS_SYSTEM_PROMPT), supervised=False)
 
         prev_role: Optional[str] = None
         last_supervised = False
@@ -285,38 +288,34 @@ class JanusTextEncoder(TextEncoder):
 
             if role != prev_role:
                 if role == "user":
-                    _emit(self._encode_text(_JANUS_USER_PREFIX), supervised=False)
+                    _add_text(self._encode_text(_JANUS_USER_PREFIX), supervised=False)
                 elif role == "assistant":
-                    _emit(self._encode_text(_JANUS_ASSISTANT_PREFIX), supervised=False)
+                    _add_text(self._encode_text(_JANUS_ASSISTANT_PREFIX), supervised=False)
                 prev_role = role
 
             if typ == "text":
-                _emit(self._encode_text(value or ""), supervised=supervised)
+                _add_text(self._encode_text(value or ""), supervised=supervised)
                 last_supervised = supervised
             elif typ in ("image", "vq_image"):
-                placeholder = self._image_token_id if typ == "image" else self._image_token_id
-                if placeholder is None or self._boi_token_id is None or self._eoi_token_id is None:
+                if self._boi_token_id is None or self._eoi_token_id is None:
                     raise RuntimeError(
-                        "JanusTextEncoder training tokenisation needs boi/eoi/image placeholder ids — "
-                        "call set_tokenizer() first."
+                        "JanusTextEncoder training tokenisation needs boi/eoi ids — call set_tokenizer() first."
                     )
-                _emit(
-                    [int(self._boi_token_id)] + [int(placeholder)] * n_img + [int(self._eoi_token_id)],
-                    supervised=False,
-                )
+                _add_text([int(self._boi_token_id)], supervised=False)
+                _add_image(typ)
+                _add_text([int(self._eoi_token_id)], supervised=False)
                 # Per-content "\n" between an image and a following same-role
                 # part (mirrors the inference chat template lookahead).
                 nxt = sample[idx + 1] if idx + 1 < len(sample) else None
                 if nxt is not None and nxt.get("role") == role:
-                    _emit(self._encode_text("\n"), supervised=False)
+                    _add_text(self._encode_text("\n"), supervised=False)
                 last_supervised = False
             else:
                 raise NotImplementedError(f"JanusTextEncoder training tokenisation: unsupported turn type {typ!r}.")
 
         # Closing eos — supervised iff the final content turn carried loss.
-        ids.append(int(self._eos_token_id))
-        labels.append(int(self._eos_token_id) if last_supervised else -100)
-        return ids, labels
+        _add_text([int(self._eos_token_id)], supervised=last_supervised)
+        return segs
 
     def _encode_text(self, text: str) -> List[int]:
         if not text:
@@ -406,9 +405,13 @@ class JanusTextEncoder(TextEncoder):
     ) -> Dict[str, Any]:
         """Sample the next text token and append a conversation part.
 
-        Training pass-through: if ``labels`` is present we delegate to the
-        base :class:`TextEncoder.decode` (CE-only path) — training code
-        never sees ``conversation_list``.
+        Training (V2 segment-driven): when ``conversation_list`` is a
+        :class:`TrainConversation`, build the per-position text labels from its
+        segments (``label_ids``) and delegate to the base
+        :class:`TextEncoder.decode` shifted-CE path.  The backbone assembled
+        ``hidden_states`` from the same segment order + right-pad, so labels
+        and logits line up position-for-position.  Legacy ``labels``-tensor
+        callers (unit tests) still work via the branch below.
 
         Inference (normal sampling): temperature / top-p (read from kwargs
         or from ``generation_kwargs``), append a sampled-token part with
@@ -418,6 +421,14 @@ class JanusTextEncoder(TextEncoder):
         scenario graph (``infer_gen.yaml``'s ``image_vq_start`` state runs
         ``emit_image_start``), not by this sampler.
         """
+        if hidden_states is not None and is_train_conversation(conversation_list):
+            if conversation_list.segments is None:
+                raise ValueError("JanusTextEncoder.decode: TrainConversation has no segments (encode must run first).")
+            labels = assemble_labels(conversation_list.segments, key="label_ids").to(hidden_states.device)
+            # Trim any SP right-pad so logits/labels align (no-op when SP off).
+            hidden_states = hidden_states[:, : labels.size(1)]
+            return super().decode(hidden_states=hidden_states, labels=labels, **kwargs)
+
         if labels is not None:
             return super().decode(
                 hidden_states=hidden_states,
@@ -796,29 +807,17 @@ class JanusTextEncoder(TextEncoder):
         return merged
 
 
-def _is_training_conversation(conversation: Any) -> bool:
-    """True iff ``conversation`` is the raw training shape ``list[list[dict]]``.
-
-    The training data pipeline emits per-sample lists of plain
-    ``{type, value, role, loss_mask}`` dicts; inference uses
-    :class:`ConversationPart` objects.  We dispatch the training
-    tokenisation only on the former.
-    """
-    return (
-        isinstance(conversation, list)
-        and len(conversation) > 0
-        and isinstance(conversation[0], list)
-        and len(conversation[0]) > 0
-        and isinstance(conversation[0][0], dict)
-    )
-
-
 def _resolve_token_id(tokenizer: Any, candidates: tuple) -> Optional[int]:
     unk = getattr(tokenizer, "unk_token_id", None)
     for cand in candidates:
         if not cand:
             continue
-        tid = tokenizer.convert_tokens_to_ids(cand)
+        try:
+            tid = tokenizer.convert_tokens_to_ids(cand)
+        except (KeyError, ValueError):
+            # Some (mock / minimal) tokenizers raise on unknown tokens rather
+            # than returning unk — treat as unresolved and try the next.
+            continue
         if tid is not None and tid != unk:
             return int(tid)
     return None

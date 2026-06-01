@@ -43,7 +43,7 @@ from transformers.models.llama.modeling_llama import LlamaModel
 from veomni.distributed.parallel_state import get_parallel_state
 from veomni.distributed.sequence_parallel.data import gather_outputs, sp_pad_and_slice
 
-from ....conversation import ConversationPart
+from ....conversation import ConversationPart, assemble_embeds, is_train_conversation
 from ....module import OmniModule
 from .configuration import JanusLlamaConfig
 
@@ -115,21 +115,32 @@ class JanusLlama(OmniModule, PreTrainedModel):
         position_ids: Optional[torch.LongTensor] = None,
         und_image_embeds: Optional[torch.FloatTensor] = None,
         gen_image_embeds: Optional[torch.FloatTensor] = None,
+        gen_image_mask: Optional[torch.Tensor] = None,
+        conversation_list: Optional[Any] = None,
         **kwargs,
     ) -> Dict[str, Any]:
-        """Multi-modal merge + SP slice (when enabled).
+        """Segment-driven splice (V2) or legacy masked_scatter merge, then SP slice.
 
-        Steps (in order):
+        V2 (``conversation_list`` is a :class:`TrainConversation`): concatenate
+        every per-sample segment's ``embeds`` in order → ``inputs_embeds``
+        (NO ``masked_scatter``, NO placeholder ids), and derive
+        ``attention_mask`` / ``position_ids`` from the assembled lengths.  The
+        full-batch ``und_embeds`` / ``gen_embeds`` on the carrier are folded in
+        as ``sum() * 0.0`` autograd anchors so every encoder always receives a
+        (zero) gradient even on image-free micro-batches (FSDP DP alignment).
+        The carrier is forwarded on so ``tok_decode`` / ``vae_decode`` rebuild
+        their labels from the same segments.
 
-          1. Scatter ``und_image_embeds`` / ``gen_image_embeds`` into
-             ``inputs_embeds`` at placeholder token positions.  Done here
-             rather than in :meth:`forward` so the SP slice (step 2) sees
-             a fully-merged sequence — otherwise an image whose tokens
-             span an SP boundary would lose its embedding.
-          2. SP pad-and-slice every sequence-domain tensor.
-          3. Forward pass through the LLaMA backbone and post-forward
-             gather (the latter in :meth:`post_forward`).
+        Legacy (``input_ids`` + ``*_image_embeds`` + ``gen_image_mask``):
+        ``masked_scatter`` at placeholder positions — kept for any
+        pre-tensorised / test callers.
+
+        SP ``pad_and_slice`` is applied last so an image span crossing an SP
+        boundary keeps its embedding; :meth:`post_forward` gathers back.
         """
+        if is_train_conversation(conversation_list):
+            return self._pre_forward_segments(conversation_list, kwargs)
+
         if inputs_embeds is None:
             raise ValueError("JanusLlama.pre_forward expects `inputs_embeds` from `tok_encode`.")
 
@@ -144,15 +155,12 @@ class JanusLlama(OmniModule, PreTrainedModel):
         # contribution that *is* part of the autograd graph, so the
         # upstream module always receives a (zero) gradient.
         if und_image_embeds is not None and input_ids is not None:
-            inputs_embeds = self._scatter_image_embeds(
-                inputs_embeds, input_ids, und_image_embeds, self.config.image_token_id
-            )
+            und_mask = input_ids == self.config.image_token_id
+            inputs_embeds = self._scatter_by_mask(inputs_embeds, und_mask, und_image_embeds)
             if self.training:
                 inputs_embeds = inputs_embeds + und_image_embeds.sum() * 0.0
-        if gen_image_embeds is not None and input_ids is not None:
-            inputs_embeds = self._scatter_image_embeds(
-                inputs_embeds, input_ids, gen_image_embeds, self.config.gen_image_token_id
-            )
+        if gen_image_embeds is not None and gen_image_mask is not None:
+            inputs_embeds = self._scatter_by_mask(inputs_embeds, gen_image_mask.bool(), gen_image_embeds)
             if self.training:
                 inputs_embeds = inputs_embeds + gen_image_embeds.sum() * 0.0
 
@@ -177,6 +185,37 @@ class JanusLlama(OmniModule, PreTrainedModel):
             **kwargs,
         )
 
+    def _pre_forward_segments(self, conv: Any, kwargs: Dict[str, Any]) -> Dict[str, Any]:
+        """Assemble inputs from the :class:`TrainConversation` segments + anchors."""
+        if conv.segments is None:
+            raise ValueError(
+                "JanusLlama.pre_forward: TrainConversation has no segments (text encoder must run first)."
+            )
+        inputs_embeds, attention_mask, position_ids = assemble_embeds(conv.segments)
+
+        # FSDP grad-sync anchors over the FULL encoder batch tensors — a
+        # micro-batch with no image of a modality still drives a (zero)
+        # gradient through that encoder so DP grad-reduce stays aligned.
+        if self.training:
+            if conv.und_embeds is not None:
+                inputs_embeds = inputs_embeds + conv.und_embeds.sum() * 0.0
+            if conv.gen_embeds is not None:
+                inputs_embeds = inputs_embeds + conv.gen_embeds.sum() * 0.0
+
+        ps = get_parallel_state()
+        if ps.sp_enabled:
+            inputs_embeds = sp_pad_and_slice(inputs_embeds, dim=1, pad_value=0)
+            attention_mask = sp_pad_and_slice(attention_mask, dim=1, pad_value=0)
+            position_ids = sp_pad_and_slice(position_ids, dim=1, pad_value=0)
+
+        return dict(
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            conversation_list=conv,
+            **kwargs,
+        )
+
     def post_forward(self, outputs: Dict[str, Any]) -> Dict[str, Any]:
         """All-gather ``hidden_states`` across SP ranks (when SP enabled)."""
         ps = get_parallel_state()
@@ -191,9 +230,15 @@ class JanusLlama(OmniModule, PreTrainedModel):
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values=None,
         use_cache: Optional[bool] = None,
+        conversation_list: Optional[Any] = None,
         **kwargs,
     ) -> Dict[str, Any]:
-        """Backbone forward.  ``inputs_embeds`` is required (no internal wte)."""
+        """Backbone forward.  ``inputs_embeds`` is required (no internal wte).
+
+        In V2 training the :class:`TrainConversation` carrier is echoed in the
+        output so the loss heads (``tok_decode`` / ``vae_decode``) rebuild their
+        labels from the same per-sample segments the backbone spliced.
+        """
         if inputs_embeds is None:
             raise ValueError(
                 "JanusLlama.forward expects `inputs_embeds` (produced by "
@@ -209,10 +254,13 @@ class JanusLlama(OmniModule, PreTrainedModel):
             use_cache=use_cache,
             **{k: v for k, v in kwargs.items() if k in ("cache_position",)},
         )
-        return {
+        out: Dict[str, Any] = {
             "hidden_states": lm_out.last_hidden_state,
             "past_key_values": lm_out.past_key_values,
         }
+        if conversation_list is not None:
+            out["conversation_list"] = conversation_list
+        return out
 
     def generate_step(
         self,
@@ -408,16 +456,26 @@ class JanusLlama(OmniModule, PreTrainedModel):
     # ── Internal helpers ─────────────────────────────────────────────────────
 
     @staticmethod
-    def _scatter_image_embeds(
+    def _scatter_by_mask(
         inputs_embeds: torch.Tensor,
-        input_ids: torch.LongTensor,
+        mask: torch.Tensor,
         image_embeds: torch.Tensor,
-        placeholder_token_id: int,
     ) -> torch.Tensor:
-        """Replace placeholder positions in ``inputs_embeds`` with ``image_embeds``."""
-        mask = (input_ids == placeholder_token_id).unsqueeze(-1).expand_as(inputs_embeds)
-        flat_embeds = image_embeds.reshape(-1, inputs_embeds.size(-1))
-        return inputs_embeds.masked_scatter(mask, flat_embeds)
+        """Replace ``mask`` positions in ``inputs_embeds`` with ``image_embeds``.
+
+        ``mask`` is ``(B, T)`` bool; ``image_embeds`` is ``(B, K, D)`` where
+        every sample carries ``K`` patch embeddings (real for present rows,
+        dummy zeros for absent rows — the training dummy-forward keeps the
+        FSDP graph aligned).  We select only the **present rows** (``mask``
+        has any True) before flattening so ``masked_scatter`` consumes each
+        present sample's own embeddings: a naïve full flatten would feed an
+        absent row's dummy embeds into a present row when the two are not in
+        ascending order within the batch (mixed und/gen/text micro-batches).
+        """
+        present = mask.any(dim=1)
+        flat = image_embeds[present].reshape(-1, inputs_embeds.size(-1)).to(inputs_embeds.dtype)
+        m = mask.unsqueeze(-1).expand_as(inputs_embeds)
+        return inputs_embeds.masked_scatter(m, flat)
 
 
 def _resolve_token_id(tokenizer: Any, candidates: tuple) -> Optional[int]:
@@ -426,7 +484,10 @@ def _resolve_token_id(tokenizer: Any, candidates: tuple) -> Optional[int]:
     for cand in candidates:
         if not cand:
             continue
-        tid = tokenizer.convert_tokens_to_ids(cand)
+        try:
+            tid = tokenizer.convert_tokens_to_ids(cand)
+        except (KeyError, ValueError):
+            continue
         if tid is not None and tid != unk:
             return int(tid)
     return None

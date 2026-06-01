@@ -29,7 +29,13 @@ from transformers import PreTrainedModel
 from transformers.models.janus.configuration_janus import JanusVisionConfig
 from transformers.models.janus.modeling_janus import JanusVisionAlignerMLP, JanusVisionModel
 
-from ....conversation import ConversationPart
+from ....conversation import (
+    ConversationPart,
+    TrainConversation,
+    collect_modality_values,
+    is_raw_training_conversation,
+)
+from ....image_inputs import build_pixel_values_batch
 from ....module import OmniModule
 from .configuration import JanusSiglipConfig
 from .processing import JanusSiglipProcessor
@@ -71,12 +77,27 @@ class JanusSiglip(OmniModule, PreTrainedModel):
     # ── OmniModule interface ───────────────────────────────────────────────────
 
     def pre_forward(self, pixel_values: Optional[torch.Tensor] = None, **kwargs) -> Dict[str, Any]:
-        """Flatten ``(B, N_images, C, H, W)`` → ``(B*N_images, C, H, W)``.
+        """Extract + tensorise understanding images, then SP/shape-normalise.
 
-        The original ``(B, N_images)`` shape is stored in
-        ``_pv_batch_n_images`` so :meth:`forward` can reshape the output
-        back.  ``(B, C, H, W)`` shapes pass through.
+        Training (raw ``conversation_list``): pull every ``image`` turn's raw
+        ``(C, H, W)`` uint8 tensor, process it to the SigLIP-normalised
+        ``(B, 3, H, W)`` batch (zero placeholder for image-free samples) so
+        the encoder runs on every micro-batch (FSDP alignment).  Inference /
+        pre-tensorised paths pass ``pixel_values`` straight through.
+
+        Then flatten ``(B, N_images, C, H, W)`` → ``(B*N_images, C, H, W)``
+        (the original ``(B, N_images)`` shape is stashed in
+        ``_pv_batch_n_images`` so :meth:`forward` can reshape back).
         """
+        if pixel_values is None:
+            conversation = kwargs.get("conversation_list")
+            if is_raw_training_conversation(conversation):
+                pixel_values = self._extract_und_pixel_values(conversation)
+                # Keep ``conversation_list`` in kwargs: :meth:`forward` wraps the
+                # raw conversation into a :class:`TrainConversation` carrier (the
+                # single object that flows down the graph) and fills its
+                # ``und_embeds``.
+
         if pixel_values is not None and pixel_values.ndim == 5:
             b, n = pixel_values.shape[:2]
             pixel_values = pixel_values.reshape(b * n, *pixel_values.shape[2:])
@@ -86,10 +107,21 @@ class JanusSiglip(OmniModule, PreTrainedModel):
     def forward(self, pixel_values: Optional[torch.Tensor] = None, **kwargs) -> Dict[str, Any]:  # type: ignore[override]
         """Encode understanding image patches to LLM-space embeddings.
 
-        Returns ``{}`` for text-only batches (``pixel_values is None``) —
-        this is the *inference* fast path.  In training the trainer fills
+        Training (raw ``conversation_list`` present): build the
+        :class:`TrainConversation` carrier and stash the full-batch
+        understanding embeds (``(B, P, D)``) on it as ``und_embeds`` —
+        ``JanusTextEncoder`` later slices per-sample rows into image segments
+        and the backbone uses the whole tensor as an FSDP grad-sync anchor.
+        Returns ``{"conversation_list": carrier}``.
+
+        Legacy / pre-tensorised path (``pixel_values`` passed directly, no raw
+        conversation): returns ``{"image_embeds": (B, P, D)}`` unchanged.
+
+        Returns ``{}`` for text-only batches (``pixel_values is None``) — the
+        *inference* fast path; in training the trainer fills
         :meth:`dummy_inputs` so this branch is never reached.
         """
+        conversation = kwargs.get("conversation_list")
         if pixel_values is None:
             return {}
 
@@ -103,7 +135,24 @@ class JanusSiglip(OmniModule, PreTrainedModel):
             p = image_embeds.size(1)
             image_embeds = image_embeds.reshape(b, n * p, image_embeds.size(2))
 
+        if is_raw_training_conversation(conversation):
+            return {"conversation_list": TrainConversation(raw=conversation, und_embeds=image_embeds)}
         return {"image_embeds": image_embeds}
+
+    def _extract_und_pixel_values(self, conversation_list: List[List[dict]]) -> torch.Tensor:
+        """Raw ``image`` turns → SigLIP-normalised ``(B, 3, H, W)`` batch."""
+        cfg = self.config.vision_config or {}
+        image_size = cfg.get("image_size", 384) if isinstance(cfg, dict) else getattr(cfg, "image_size", 384)
+        num_channels = cfg.get("num_channels", 3) if isinstance(cfg, dict) else getattr(cfg, "num_channels", 3)
+        per_sample = collect_modality_values(conversation_list, ("image",))
+        return build_pixel_values_batch(
+            per_sample,
+            processor=self._processor,
+            image_size=image_size,
+            num_channels=num_channels,
+            device=self._param_device(),
+            dtype=self._param_dtype(),
+        )
 
     # ── Inference (conversation-list) ─────────────────────────────────────────
 

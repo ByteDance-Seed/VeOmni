@@ -56,6 +56,11 @@ train:
   global_batch_size: 32
   micro_batch_size: 2          # gradient-accumulation steps per train_step
   init_device: meta            # meta → weights loaded lazily by build_parallelize_model
+  # SeedOmni samples carry only ``conversation_list`` (tokenization is
+  # module-side, in each module's pre_forward), so there are no per-item
+  # ``input_ids`` at the dataset stage for token-based dynamic batching.
+  # Use the fixed micro_batch_size path instead.
+  dyn_bsz: false
 
   accelerator:
     fsdp_config:
