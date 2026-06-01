@@ -12,44 +12,48 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""OmniTrainer — trainer for OmniModel V2 (per-module FSDP2).
+"""OmniTrainer — orchestrator for OmniModel V2 (one trainer per sub-module).
 
 Unlike single-model trainers (BaseTrainer / VLMTrainer), OmniModel is a
 *composition* of several independent OmniModule sub-models (Janus: siglip /
-vqvae / text_encoder / llama).  This trainer wraps **each sub-module in its
-own FSDP2 unit**, builds **one optimizer per trainable module**, and saves /
-resumes **each module independently**.
+vqvae / text_encoder / llama).  Each sub-model is backed by its **own**
+:class:`OmniModuleTrainer` — a thin :class:`BaseTrainer` subclass that reuses
+the base per-model build helpers (``_build_model`` / ``_setup_lora`` /
+``_build_parallelized_model`` / ``_build_optimizer`` / ``_build_lr_scheduler``)
+to give that module its own FSDP2 unit, optimizer, lr-scheduler and on-disk
+snapshot.
 
-Why per-module FSDP2 (vs. one wrapper over ``OmniModel``)?
+:class:`OmniTrainer` then **strings the module-trainers together**: it owns the
+*global* concerns once (distributed ``_setup``, the shared data pipeline,
+callbacks/metering, the train loop) and drives the graph — composing the
+sub-models into one ``OmniModel``, running the DAG forward, a single
+``loss.backward()`` (the autograd graph connects every FSDP2 unit), the
+per-module optimizer step, and per-module checkpoint save/resume.
+
+Why one trainer per module (vs. one wrapper over ``OmniModel``)?
 
 * Each module is a self-contained HF model with its own ``_no_split_modules``
-  and its own on-disk snapshot — wrapping per child lets us load weights from
-  the per-module ``weights_path`` and save/resume each module's DCP folder
-  independently.
-* The training DAG (``OmniModel.forward``) chains hidden states across
-  modules; a **single** ``loss.backward()`` still propagates across every
-  FSDP2 unit because the autograd graph connects them.  Each module's FSDP2
-  reduce-scatter fires from its own backward hooks.
+  and on-disk snapshot — a per-module ``BaseTrainer`` loads its weights from
+  the module ``weights_path`` and reuses base build/optimizer/lora logic.
+* The training DAG chains hidden states across modules; a **single**
+  ``loss.backward()`` still propagates across every FSDP2 unit.  Each module's
+  FSDP2 reduce-scatter fires from its own backward hooks.
 * Gradient clipping is **global** (over ``OmniModel``'s full DTensor param
   set); the optimizer step iterates every per-module optimizer.
 
-Build flow (``BaseTrainer.__init__`` order, overridden here)
-------------------------------------------------------------
-1. ``_build_model``             — meta-init each declared module from its
-                                  ``OMNI_*_REGISTRY`` class + ``config.json``;
-                                  compose into ``OmniModel`` (no weights yet).
-                                  Frozen modules get ``requires_grad=False``.
-2. ``_build_model_assets``      — load the global tokenizer + wire it into
-                                  every module that wants it.
-3. ``_build_collate_fn``        — ``seedomni`` → list-only ``SeedOmniCollator``.
-4. ``_build_parallelized_model`` — wrap **each child** with
-                                  ``build_parallelize_model`` (own FSDP2 unit,
-                                  per-module weight load from disk).
-5. ``_build_optimizer`` / ``_build_lr_scheduler`` — one per trainable module.
-6. ``_init_callbacks``          — swap the single-model checkpoint callback
-                                  for a per-module DCP callback.
+Division of labour
+------------------
+* :class:`OmniModuleTrainer` (per module): ``_build_model`` →
+  ``_freeze_model_module`` → ``_build_parallelized_model`` (FSDP2 wrap + weight
+  load), then ``_build_optimizer`` / ``_build_lr_scheduler`` (driven later by
+  the orchestrator once ``args.train_steps`` is known).
+* :class:`OmniTrainer` (orchestrator): global ``_setup`` + data pipeline +
+  callbacks + train loop; builds the module-trainers, composes ``OmniModel``,
+  aggregates their optimizers / schedulers behind ``MultiOptimizer`` /
+  ``MultiLRScheduler``, and owns the graph forward/backward + per-module DCP.
 """
 
+import copy
 import os
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -61,15 +65,13 @@ import torch.distributed as dist
 from ..arguments import DataArguments, ModelArguments, TrainingArguments, VeOmniArguments
 from ..data import SeedOmniCollator
 from ..distributed.clip_grad_norm import veomni_clip_grad_norm
-from ..distributed.torch_parallelize import build_parallelize_model
-from ..models import build_foundation_model, build_tokenizer
+from ..models import build_tokenizer
 from ..models.seed_omni.modeling_omni import OmniModel
 from ..ops.batch_invariant_ops import set_batch_invariant_mode
-from ..optim import build_lr_scheduler, build_optimizer
 from ..utils import helper, logging
 from ..utils.device import synchronize
 from ..utils.model_utils import pretty_print_trainable_parameters
-from .base import BaseTrainer, _collect_muon_kwargs
+from .base import BaseTrainer
 from .callbacks import Callback
 
 
@@ -317,26 +319,133 @@ class OmniPerModuleCheckpointCallback(Callback):
         logger.info_rank0(f"OmniTrainer: resumed per-module checkpoint from {load_path}")
 
 
+# ── Per-module trainer ──────────────────────────────────────────────────────────
+
+
+class OmniModuleTrainer(BaseTrainer):
+    """One OmniModule's training unit (model + optimizer + lr_scheduler + FSDP2).
+
+    Subclasses :class:`BaseTrainer` to **reuse its per-model build helpers** for
+    a single OmniModule sub-model:
+
+    * ``_build_model``            — meta-init the sub-model from its
+      ``config.json`` via the shared (OMNI-registry-aware) loader.
+    * ``_freeze_model_module`` / ``_setup_lora`` — LoRA wrap + trainable-param
+      report (extended here to honour the module's ``freeze`` knob).
+    * ``_build_parallelized_model`` — wrap in its own FSDP2 unit + load the
+      module's on-disk weights.
+    * ``_build_optimizer`` / ``_build_lr_scheduler`` — one each, over this
+      module's params.
+
+    The *global* concerns (distributed ``_setup``, data pipeline, callbacks, the
+    train loop) are **never** run here — they are owned once by
+    :class:`OmniTrainer`.  Construction runs only the per-model build subset; the
+    optimizer / lr-scheduler are built later by the orchestrator (after the
+    shared dataset fixes ``args.train_steps``).
+
+    ``args`` is a per-module copy of the global arguments whose
+    ``model.{config_path,model_path}`` point at this module's split-checkpoint
+    subfolder, and whose ``model.model_config`` carries the module's YAML config
+    overrides — so the shared loader resolves the right OmniModule classes and
+    the standard meta-init → FSDP2 → weight-load path is reused verbatim.
+    """
+
+    def __init__(
+        self,
+        args: VeOmniArguments,
+        name: str,
+        tokenizer: Any = None,
+        frozen: bool = False,
+    ):
+        # NB: BaseTrainer.__init__ is deliberately NOT called — it would re-run
+        # the global setup (distributed / data / callbacks).  We invoke only the
+        # per-model build helpers, in order.
+        self.args = args
+        self.name = name
+        self.frozen = frozen
+
+        self._build_model()  # base: meta-init the sub-model from its config.json
+        if tokenizer is not None and hasattr(self.model, "set_tokenizer"):
+            self.model.set_tokenizer(tokenizer)
+        self._load_processor()
+        self._freeze_model_module()  # freeze (if any) + lora + pretty-print + mem
+
+        # Some encoders (SigLIP / VQVAE) declare ``supports_gradient_checkpointing
+        # = False``; enabling GC on them raises inside the wrap.  Frozen modules
+        # never need it.  ``args`` is a private per-module copy, so mutating the
+        # GC flag here does not leak to sibling modules.
+        supports_gc = bool(getattr(self.model, "supports_gradient_checkpointing", False))
+        if self.frozen or not supports_gc:
+            if args.train.gradient_checkpointing.enable and not self.frozen and not supports_gc:
+                logger.info_rank0(f"OmniModuleTrainer '{name}': no gradient-checkpointing support; skipping it.")
+            args.train.gradient_checkpointing.enable = False
+
+        # FSDP2 (and the meta-init weight load) preserve ``requires_grad``: the
+        # shard carries it (torch ``_fsdp_param.py``: ``sharded_param.requires_grad_(
+        # param.requires_grad)``) and the loader writes weights in-place
+        # (``param.data.copy_``), so the freeze applied in ``_freeze_model_module``
+        # above survives the wrap — no need to re-assert it here.
+        self._build_parallelized_model()  # base: FSDP2 wrap + per-module weight load
+
+        # Optimizer / lr-scheduler are built by the orchestrator once the shared
+        # dataset has fixed ``args.train_steps`` (see OmniTrainer._build_optimizer
+        # / _build_lr_scheduler).  Frozen modules never get either.
+        self.optimizer = None
+        self.lr_scheduler = None
+
+    def _freeze_model_module(self):
+        """Clear grads on a frozen module, then run the base report (+ lora)."""
+        if self.frozen:
+            self.model.requires_grad_(False)
+        super()._freeze_model_module()
+
+    def _load_processor(self):
+        """Attach the per-module image processor (meta-init skips ``from_pretrained``).
+
+        Vision modules (SigLIP / VQVAE) need their processor at train time to
+        normalise the raw uint8 images carried in ``conversation_list``.
+        """
+        processor_cls = getattr(type(self.model), "processor_class", None)
+        if processor_cls is None or getattr(self.model, "_processor", None) is not None:
+            return
+        weights_path = self.args.model.model_path
+        try:
+            self.model._processor = processor_cls.from_pretrained(weights_path)
+            logger.info_rank0(f"OmniModuleTrainer '{self.name}': loaded {processor_cls.__name__}.")
+        except Exception as e:  # noqa: BLE001 — surfaced lazily by the module if truly needed
+            logger.warning_once(
+                f"OmniModuleTrainer '{self.name}': could not load processor from {weights_path}: {e}. "
+                "Training will fail if this modality's images are actually present."
+            )
+
+
 # ── OmniTrainer ────────────────────────────────────────────────────────────────
 
 
 class OmniTrainer:
-    """Trainer for OmniModel V2 — per-module FSDP2 + per-module optimizer.
+    """Orchestrator for OmniModel V2 — one :class:`OmniModuleTrainer` per module.
 
     Composition over inheritance (mirrors :class:`VLMTrainer`): instead of
-    subclassing :class:`BaseTrainer` and relying on ``super().__init__`` +
-    selective overrides, we hold a bare ``BaseTrainer`` instance in
-    ``self.base`` and drive its private ``_build_*`` / ``on_*`` helpers
-    one-by-one.  This makes the (heavily customised) build sequence explicit
-    and decoupled from ``BaseTrainer.__init__``'s call order.
+    subclassing :class:`BaseTrainer`, we hold a bare ``BaseTrainer`` instance in
+    ``self.base`` for the *global* concerns (distributed ``_setup``, the shared
+    data pipeline, callbacks/metering, the train loop) and drive its private
+    ``_build_*`` / ``on_*`` helpers one-by-one.
 
-    Canonical ``BaseTrainer`` state (``model`` / ``optimizer`` /
-    ``lr_scheduler`` / ``state`` / ``checkpointer`` / dataloaders / callbacks)
-    lives on ``self.base``.  Omni-specific bookkeeping that is **not** part of
+    Each OmniModule sub-model is built + owned by its own
+    :class:`OmniModuleTrainer` (``self.module_trainers``); this orchestrator
+    composes their models into one ``OmniModel`` (``self.base.model``) and
+    aggregates their per-module optimizers / schedulers behind
+    :class:`MultiOptimizer` / :class:`MultiLRScheduler` (``self.base.optimizer``
+    / ``self.base.lr_scheduler``).
+
+    Canonical ``BaseTrainer`` state (``model`` / ``optimizer`` / ``lr_scheduler``
+    / ``state`` / ``checkpointer`` / dataloaders / callbacks) lives on
+    ``self.base``.  Omni-specific bookkeeping that is **not** part of
     ``BaseTrainer``'s interface (``omni_config`` / ``module_names`` /
-    ``frozen_modules`` / per-module ``optimizers`` / ``lr_schedulers``) lives
-    directly on ``self``.      The per-module checkpoint callback therefore binds
-    to the ``OmniTrainer`` wrapper and reads base state via ``trainer.base``.
+    ``frozen_modules`` / ``module_trainers`` / per-module ``optimizers`` /
+    ``lr_schedulers``) lives directly on ``self``.  The per-module checkpoint
+    callback therefore binds to the ``OmniTrainer`` wrapper and reads base state
+    via ``trainer.base``.
     """
 
     # Composition: the underlying single-model trainer. Holds all
@@ -349,6 +458,7 @@ class OmniTrainer:
     omni_config: "OmniConfig"  # parsed modules / nodes / edges / training graph
     module_names: List[str]  # ordered names of every declared module
     frozen_modules: set[str]  # modules carrying a truthy freeze / freeze_* knob
+    module_trainers: Dict[str, OmniModuleTrainer]  # one BaseTrainer subclass per module
     optimizers: Dict[str, torch.optim.Optimizer]  # one per trainable module (aggregated into base.optimizer)
     lr_schedulers: Dict[str, Any]  # one per trainable module (aggregated into base.lr_scheduler)
 
@@ -359,124 +469,105 @@ class OmniTrainer:
         self.base.args = args
 
         self.base._setup()
-        self._build_model()  # build each module via build_foundation_model + compose
-        self._freeze_model_module()  # apply per-module freeze + pretty-print params
-        self._build_model_assets()  # global tokenizer + per-module wiring
+        # Each module-trainer builds + FSDP2-wraps its own sub-model (weights
+        # loaded), then we compose them into one OmniModel.
+        self._build_model()
+        self._freeze_model_module()  # aggregate trainable-param report
+        self._build_model_assets()  # expose [omni_config, tokenizer]
         self.base._build_data_transform()
-        self.base._build_dataset()
+        self.base._build_dataset()  # fixes args.train_steps (needed by schedulers)
         self._build_collate_fn()  # seedomni → SeedOmniCollator
         self.base._build_dataloader()
-        self._build_parallelized_model()  # per-module FSDP2 wrap + weight load
-        self._build_optimizer()  # one optimizer per trainable module
-        self._build_lr_scheduler()  # one scheduler per optimizer
+        self._build_optimizer()  # drive each module-trainer's optimizer
+        self._build_lr_scheduler()  # drive each module-trainer's lr-scheduler
         self.base._build_training_context()
         self._init_callbacks()  # swap single-model ckpt → per-module DCP
 
-    # ── Build: model (meta-init + compose) ─────────────────────────────────────
+    # ── Build: per-module trainers + compose ───────────────────────────────────
+
+    @staticmethod
+    def _is_frozen(mod_cfg: Dict[str, Any]) -> bool:
+        """A module is frozen when its YAML block carries a truthy freeze knob."""
+        return any((k == "freeze" or k.startswith("freeze_")) and bool(v) for k, v in mod_cfg.items())
+
+    def _module_args(self, weights_path: str, mod_cfg: Dict[str, Any]) -> VeOmniArguments:
+        """Per-module copy of the global args, retargeted at this module.
+
+        The module-trainer reuses ``BaseTrainer._build_model`` /
+        ``_build_parallelized_model``, which read ``args.model.{config_path,
+        model_path}`` and ``args.model.model_config``.  Point those at the
+        module's split-checkpoint subfolder; the remaining ``mod_cfg`` keys
+        (incl. freeze flags) become config overrides (PretrainedConfig stores
+        unknown kwargs harmlessly).  A deep copy keeps per-module mutations
+        (e.g. the GC flag) from leaking across modules.
+        """
+        a = copy.deepcopy(self.base.args)
+        overrides = {k: v for k, v in mod_cfg.items() if k not in ("weights_path", "config_path")}
+        a.model.config_path = weights_path
+        a.model.model_path = weights_path
+        a.model.model_config = overrides
+        return a
 
     def _build_model(self):
-        """Build every declared module via ``build_foundation_model`` and compose.
+        """Build one :class:`OmniModuleTrainer` per module and compose ``OmniModel``.
 
-        Each module is a self-contained HF model living in its own
-        split-checkpoint subfolder.  We reuse the shared loader
-        (:func:`build_foundation_model`) per module — exactly like the
-        single-model trainers (``BaseTrainer`` / ``VLMTrainer``) — so the
-        OmniModule config / modeling classes resolve through the
-        registry-aware loader (``get_model_config`` / ``get_model_class``
-        consult ``OMNI_*_REGISTRY``).  ``model_type`` is auto-detected from
-        each module's ``config.json`` by the loader, so we no longer read it
-        explicitly here.
-
-        Weights are **not** loaded at this step: ``weights_path=None`` plus a
-        ``meta`` ``init_device`` meta-inits each module (``init_empty_weights``
-        inside the loader keeps non-persistent buffers real).  Real per-module
-        weights load later in :meth:`_build_parallelized_model`.
-
-        The global tokenizer is built here too, and each module is fully wired
-        as it is built — :meth:`set_tokenizer` (so e.g. ``JanusTextEncoder``
-        resolves boi/eoi/bos/eos/image ids) and its image ``processor`` (vision
-        modules need it to normalise the raw uint8 images carried in
-        ``conversation_list``).  :meth:`_build_model_assets` then only exposes
-        the already-built assets.
+        Each module-trainer meta-inits its sub-model (via the shared,
+        OMNI-registry-aware loader — ``model_type`` auto-detected from
+        ``config.json``), wires the global tokenizer + image processor, and
+        FSDP2-wraps + loads its weights.  We then compose the (wrapped)
+        sub-models into one ``OmniModel`` on ``base.model``.
         """
         base = self.base
         args: VeOmniOmniArguments = base.args
         self.omni_config: "OmniConfig" = args.model.load_omni_config()
         self.module_names: List[str] = list(self.omni_config.module_names)
+        self.frozen_modules: set[str] = set()
+        self.module_trainers: Dict[str, OmniModuleTrainer] = {}
 
-        # Global tokenizer (wired into every module that wants it below).
+        # Global tokenizer (wired into every module-trainer that wants it).
         tokenizer_path = self.omni_config.tokenizer_path or args.model.tokenizer_path
         base.tokenizer = build_tokenizer(tokenizer_path)
-
-        torch_dtype = "float32" if args.train.accelerator.fsdp_config.mixed_precision.enable else "bfloat16"
 
         modules: Dict[str, torch.nn.Module] = {}
         for name in self.module_names:
             mod_cfg = self.omni_config.module_config(name)  # deep-copied
-            weights_path = mod_cfg.pop("weights_path", None)
-            mod_cfg.pop("config_path", None)
+            weights_path = mod_cfg.get("weights_path")
             if weights_path is None:
                 raise ValueError(f"OmniTrainer: module '{name}' has no `weights_path` in the training YAML.")
+            frozen = self._is_frozen(mod_cfg)
+            if frozen:
+                self.frozen_modules.add(name)
 
-            # Remaining ``mod_cfg`` keys are config overrides (freeze flags pass
-            # through harmlessly — PretrainedConfig stores unknown kwargs; the
-            # freeze knobs are interpreted in :meth:`_freeze_model_module`).
-            module = build_foundation_model(
-                config_path=weights_path,
-                weights_path=None,  # meta-init only; weights load in _build_parallelized_model
-                torch_dtype=torch_dtype,
-                init_device=args.train.init_device,
-                ops_implementation=args.model.ops_implementation,
-                config_kwargs=mod_cfg,
+            module_trainer = OmniModuleTrainer(
+                self._module_args(weights_path, mod_cfg),
+                name=name,
+                tokenizer=base.tokenizer,
+                frozen=frozen,
             )
-
-            # Wire the global tokenizer into the module (if it wants it).
-            if hasattr(module, "set_tokenizer"):
-                module.set_tokenizer(base.tokenizer)
-            # Meta-init builds from config (not from_pretrained), so the
-            # per-module image processor is not auto-loaded — attach it here.
-            processor_cls = getattr(type(module), "processor_class", None)
-            if processor_cls is not None and getattr(module, "_processor", None) is None:
-                try:
-                    module._processor = processor_cls.from_pretrained(weights_path)
-                    logger.info_rank0(f"OmniTrainer: loaded {processor_cls.__name__} for module '{name}'.")
-                except Exception as e:  # noqa: BLE001 — surfaced lazily by the module if truly needed
-                    logger.warning_once(
-                        f"OmniTrainer: could not load processor for module '{name}' from {weights_path}: {e}. "
-                        "Training will fail if this modality's images are actually present."
-                    )
-
-            modules[name] = module
-            logger.info_rank0(f"OmniTrainer: built module '{name}' from {weights_path}")
+            self.module_trainers[name] = module_trainer
+            modules[name] = module_trainer.model
+            logger.info_rank0(
+                f"OmniTrainer: built module-trainer '{name}' from {weights_path}" + (" [FROZEN]" if frozen else "")
+            )
 
         base.model = OmniModel(self.omni_config, modules)
         base.model_config = self.omni_config
         logger.info_rank0(
-            f"OmniTrainer: composed OmniModel with {len(self.module_names)} modules ({self.module_names})."
+            f"OmniTrainer: composed OmniModel with {len(self.module_names)} modules "
+            f"({self.module_names}); frozen: {sorted(self.frozen_modules) or '(none)'}."
         )
 
-    # ── Freeze (per-module) ─────────────────────────────────────────────────────
+    # ── Freeze (aggregate report) ───────────────────────────────────────────────
 
     def _freeze_model_module(self):
-        """Detect + apply per-module freeze, then report trainable params.
+        """Report aggregate trainable params over the composed model.
 
-        Mirrors :meth:`VLMTrainer._freeze_model_module` (runs right after
-        :meth:`_build_model`, pre-parallelize).  A module is frozen when its
-        YAML block carries any truthy ``freeze`` / ``freeze_*`` knob — both the
-        detection (``self.frozen_modules``) and the ``requires_grad=False``
-        application live here.  :meth:`_build_parallelized_model` re-applies the
-        flag after the FSDP2 wrap (and skips gradient checkpointing on them).
+        Per-module freeze (``requires_grad=False``) and LoRA wrapping already
+        happened inside each :class:`OmniModuleTrainer`; here we only print the
+        composed-model view + memory, mirroring the position of
+        ``_freeze_model_module`` in the base build order.
         """
-        base = self.base
-        self.frozen_modules: set[str] = set()
-        for name in self.module_names:
-            mod_cfg = self.omni_config.module_config(name)  # deep-copied
-            if any((k == "freeze" or k.startswith("freeze_")) and bool(v) for k, v in mod_cfg.items()):
-                self.frozen_modules.add(name)
-                for p in base.model.get_module(name).parameters():
-                    p.requires_grad_(False)
-        logger.info_rank0(f"OmniTrainer: frozen modules: {sorted(self.frozen_modules) or '(none)'}.")
-        pretty_print_trainable_parameters(base.model)
+        pretty_print_trainable_parameters(self.base.model)
         helper.print_device_mem_info("VRAM usage after building model")
 
     # ── Build: assets ───────────────────────────────────────────────────────────
@@ -497,102 +588,43 @@ class OmniTrainer:
         else:
             self.base._build_collate_fn()
 
-    # ── Build: per-module FSDP2 wrap ───────────────────────────────────────────
-
-    def _build_parallelized_model(self):
-        """Wrap each OmniModel child in its own FSDP2 unit + load its weights.
-
-        Calling :func:`build_parallelize_model` once per child makes every
-        sub-module an independent FSDP2 root over the shared DP mesh.  The
-        per-module ``weights_path`` is loaded after the wrap (meta → sharded
-        DTensor).  Frozen modules are still wrapped (so weights load) but get
-        ``requires_grad`` cleared and grad-checkpointing disabled.
-        """
-        base = self.base
-        args: VeOmniOmniArguments = base.args
-        model: OmniModel = base.model
-
-        for name in self.module_names:
-            child = model.get_module(name)
-            weights_path = self.omni_config.module_config(name).get("weights_path")
-            frozen = name in self.frozen_modules
-            basic_modules = list(set(getattr(child, "_no_split_modules", None) or []) | set(args.model.basic_modules))
-            # Some modules (e.g. SigLIP/VQVAE vision encoders) declare
-            # ``supports_gradient_checkpointing = False``; enabling GC on them
-            # raises inside ``gradient_checkpointing_enable``. Only enable GC on
-            # trainable modules that actually support it.
-            supports_gc = bool(getattr(child, "supports_gradient_checkpointing", False))
-            enable_gc = args.train.gradient_checkpointing.enable and not frozen and supports_gc
-            if args.train.gradient_checkpointing.enable and not frozen and not supports_gc:
-                logger.info_rank0(
-                    f"OmniTrainer: module '{name}' does not support gradient checkpointing; skipping GC for it."
-                )
-            logger.info_rank0(f"OmniTrainer: FSDP2-wrapping module '{name}' from {weights_path}...")
-            wrapped = build_parallelize_model(
-                child,
-                init_device=args.train.init_device,
-                weights_path=weights_path,
-                enable_reshard_after_forward=args.train.accelerator.fsdp_config.reshard_after_forward,
-                mixed_precision=args.train.accelerator.fsdp_config.mixed_precision,
-                enable_gradient_checkpointing=enable_gc,
-                basic_modules=basic_modules,
-                enable_reentrant=args.train.gradient_checkpointing.enable_reentrant,
-                enable_forward_prefetch=args.train.accelerator.fsdp_config.forward_prefetch,
-                enable_fsdp_offload=args.train.accelerator.fsdp_config.offload,
-                broadcast_model_weights_from_rank0=args.train.broadcast_model_weights_from_rank0,
-                max_load_broadcast_size=args.train.accelerator.fsdp_config.max_load_broadcast_size,
-            )
-            # Re-attach the (in-place wrapped) child under the same name.
-            model.add_module(name, wrapped)
-            if frozen:
-                for p in wrapped.parameters():
-                    p.requires_grad_(False)
-
-        model.train()
-
-    # ── Build: per-module optimizers + schedulers ──────────────────────────────
+    # ── Build: per-module optimizers + schedulers (drive the module-trainers) ──
 
     def _build_optimizer(self):
+        """Drive each trainable module-trainer's ``_build_optimizer`` + aggregate.
+
+        Reuses ``BaseTrainer._build_optimizer`` per module (over that module's
+        params, with the same optimizer config); the resulting per-module
+        optimizers are aggregated behind :class:`MultiOptimizer` so the metering
+        callbacks and train loop see the canonical ``base.optimizer`` surface.
+        """
         base = self.base
-        args: VeOmniOmniArguments = base.args
         self.optimizers: Dict[str, torch.optim.Optimizer] = {}
-        muon_kwargs = _collect_muon_kwargs(args.train.optimizer)
-        for name in self.module_names:
+        for name, module_trainer in self.module_trainers.items():
             if name in self.frozen_modules:
                 continue
-            child = base.model.get_module(name)
-            self.optimizers[name] = build_optimizer(
-                child,
-                lr=args.train.optimizer.lr,
-                weight_decay=args.train.optimizer.weight_decay,
-                fused=True,
-                optimizer_type=args.train.optimizer.type,
-                no_decay_modules=args.train.optimizer.no_decay_modules,
-                no_decay_params=args.train.optimizer.no_decay_params,
-                muon_kwargs=muon_kwargs,
-            )
+            module_trainer._build_optimizer()
+            self.optimizers[name] = module_trainer.optimizer
         if not self.optimizers:
             raise ValueError("OmniTrainer: no trainable modules — every module is frozen.")
-        # ``optimizer`` is a BaseTrainer-declared attr (read by metering /
-        # train loop); the per-module dict is omni-specific → kept on ``self``.
         base.optimizer = MultiOptimizer(self.optimizers)
         logger.info_rank0(f"OmniTrainer: built {len(self.optimizers)} optimizer(s): {list(self.optimizers)}.")
 
     def _build_lr_scheduler(self):
+        """Drive each trainable module-trainer's ``_build_lr_scheduler`` + aggregate.
+
+        ``BaseTrainer._build_lr_scheduler`` reads ``args.train_steps`` (fixed by
+        the shared dataset); propagate the global value into each module-trainer's
+        private args copy before reusing it.
+        """
         base = self.base
-        args: VeOmniOmniArguments = base.args
         self.lr_schedulers: Dict[str, Any] = {}
-        for name, opt in self.optimizers.items():
-            self.lr_schedulers[name] = build_lr_scheduler(
-                opt,
-                train_steps=args.train_steps * args.train.num_train_epochs,
-                lr=args.train.optimizer.lr,
-                lr_min=args.train.optimizer.lr_min,
-                lr_decay_style=args.train.optimizer.lr_decay_style,
-                lr_decay_ratio=args.train.optimizer.lr_decay_ratio,
-                lr_warmup_ratio=args.train.optimizer.lr_warmup_ratio,
-                lr_start=args.train.optimizer.lr_start,
-            )
+        for name, module_trainer in self.module_trainers.items():
+            if name in self.frozen_modules:
+                continue
+            module_trainer.args.train_steps = base.args.train_steps
+            module_trainer._build_lr_scheduler()
+            self.lr_schedulers[name] = module_trainer.lr_scheduler
         base.lr_scheduler = MultiLRScheduler(self.lr_schedulers)
 
     # ── Callbacks (reuse base metering; swap in per-module checkpoint) ─────────

@@ -83,8 +83,8 @@ def build_pixel_values_batch(
         if processor is None:
             raise RuntimeError(
                 "build_pixel_values_batch: samples carry images but the module has no image "
-                "processor. OmniTrainer must load the module's `processor_class` and assign it to "
-                "`module._processor` before training (see OmniTrainer._build_model_assets)."
+                "processor. The module trainer must load the module's `processor_class` and assign "
+                "it to `module._processor` before training (see OmniModuleTrainer._load_processor)."
             )
         processed = processor(images=present_pil, return_tensors="pt")["pixel_values"]  # (n, C, H, W)
         for slot, i in enumerate(present_idx):
