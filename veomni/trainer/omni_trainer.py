@@ -342,13 +342,6 @@ class OmniTrainer:
         # helpers one-by-one so the (overridden) build sequence is explicit.
         self.base = BaseTrainer.__new__(BaseTrainer)
         self.base.args = args
-        # Omni-specific bookkeeping, kept on ``self.base`` alongside the base
-        # attributes (see class docstring).
-        self.base.omni_config: "OmniConfig" = None
-        self.base.module_names: List[str] = []
-        self.base.frozen_modules: set[str] = set()
-        self.base.optimizers: Dict[str, torch.optim.Optimizer] = {}
-        self.base.lr_schedulers: Dict[str, Any] = {}
 
         self.base._setup()
         self._build_model()  # meta-init each module + compose OmniModel
@@ -375,8 +368,9 @@ class OmniTrainer:
         """
         base = self.base
         args: VeOmniOmniArguments = base.args
-        base.omni_config = args.model.load_omni_config()
-        base.module_names = list(base.omni_config.module_names)
+        base.omni_config: "OmniConfig" = args.model.load_omni_config()
+        base.module_names: List[str] = list(base.omni_config.module_names)
+        base.frozen_modules: set[str] = set()
 
         modules: Dict[str, torch.nn.Module] = {}
         for name in base.module_names:
@@ -519,6 +513,7 @@ class OmniTrainer:
     def _build_optimizer(self):
         base = self.base
         args: VeOmniOmniArguments = base.args
+        base.optimizers: Dict[str, torch.optim.Optimizer] = {}
         muon_kwargs = _collect_muon_kwargs(args.train.optimizer)
         for name in base.module_names:
             if name in base.frozen_modules:
@@ -542,6 +537,7 @@ class OmniTrainer:
     def _build_lr_scheduler(self):
         base = self.base
         args: VeOmniOmniArguments = base.args
+        base.lr_schedulers: Dict[str, Any] = {}
         for name, opt in base.optimizers.items():
             base.lr_schedulers[name] = build_lr_scheduler(
                 opt,
