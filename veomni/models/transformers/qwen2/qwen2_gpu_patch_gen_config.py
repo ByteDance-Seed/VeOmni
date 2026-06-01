@@ -15,7 +15,7 @@
 Patch configuration for Qwen2 GPU LigerKernel replacements.
 
 Regen command:
-python -m veomni.patchgen.run_codegen veomni.models.transformers.qwen2.qwen2_gpu_patch_gen_config -o veomni/models/transformers/qwen2/generated
+patchgen veomni.models.transformers.qwen2.qwen2_gpu_patch_gen_config -o veomni/models/transformers/qwen2/generated
 
 This mirrors the current runtime Qwen2 patches while moving the v5 path to an
 explicit patched modeling module.
@@ -157,11 +157,13 @@ def qwen2_model_forward_patched(
         position_ids = cache_position.unsqueeze(0)
 
     if not isinstance(causal_mask_mapping := attention_mask, dict):
+        # transformers 5.9 dropped ``cache_position`` from ``create_causal_mask``'s
+        # signature ("Deprecated and unused" — see masking_utils.py:917). Keep the
+        # kwargs aligned with upstream 5.9 so the patch loads cleanly.
         mask_kwargs = {
             "config": self.config,
             "inputs_embeds": inputs_embeds,
             "attention_mask": attention_mask,
-            "cache_position": cache_position,
             "past_key_values": past_key_values,
             "position_ids": position_ids,
         }
@@ -175,10 +177,10 @@ def qwen2_model_forward_patched(
 
     position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
-    for decoder_layer in self.layers[: self.config.num_hidden_layers]:
+    for i, decoder_layer in enumerate(self.layers[: self.config.num_hidden_layers]):
         hidden_states = decoder_layer(
             hidden_states,
-            attention_mask=causal_mask_mapping[decoder_layer.attention_type],
+            attention_mask=causal_mask_mapping[self.config.layer_types[i]],
             position_embeddings=position_embeddings,
             position_ids=position_ids,
             past_key_values=past_key_values,

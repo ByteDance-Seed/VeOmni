@@ -15,7 +15,7 @@
 Patch configuration for SeedOss NPU fused-operator replacements.
 
 Regen command:
-python -m veomni.patchgen.run_codegen veomni.models.transformers.seed_oss.seed_oss_npu_patch_gen_config -o veomni/models/transformers/seed_oss/generated
+patchgen veomni.models.transformers.seed_oss.seed_oss_npu_patch_gen_config -o veomni/models/transformers/seed_oss/generated
 
 Patches:
 - ``apply_rotary_pos_emb`` -> ``veomni.ops.kernels.rotary.npu.apply_rotary_pos_emb_npu``

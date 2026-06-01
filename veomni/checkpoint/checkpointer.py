@@ -73,6 +73,15 @@ class CheckpointerBase(ABC):
     ):
         return
 
+    @classmethod
+    def wait_for_pending_save(cls) -> None:
+        """Block until any in-flight async save completes.
+
+        Default: no-op for backends that do not support async saves.
+        Backends with async support (e.g. DCP) override this.
+        """
+        return
+
 
 @CHECKPOINTER_REGISTRY.register("dcp")
 def dcp_checkpointer(dist_backend: str):

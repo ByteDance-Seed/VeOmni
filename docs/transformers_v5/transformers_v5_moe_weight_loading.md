@@ -1,7 +1,7 @@
 # Transformers v5 MoE Weight Loading
 
 This note documents VeOmni MoE weight-loading expectations under
-`transformers==5.2.0` (the only supported transformers version).
+`transformers==5.9.0` (the only supported transformers version).
 
 ## Background
 
@@ -18,7 +18,7 @@ For VeOmni's qwen3_moe path, we use a simpler approach:
 ## Survey: Qwen MoE Weight Formats
 
 Reference mapping from HF:
-- https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/conversion_mapping.py
+- https://github.com/huggingface/transformers/blob/v5.9.0/src/transformers/conversion_mapping.py
 
 ### qwen3_moe
 

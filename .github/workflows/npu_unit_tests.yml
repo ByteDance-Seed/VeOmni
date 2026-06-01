@@ -49,7 +49,7 @@ jobs:
     runs-on: [self-hosted, 910b-8]
     timeout-minutes: 90
     container:
-      image: quay.io/ascend/veomni:veomni-8.3.rc2-910b-ubuntu22.04-py3.11-latest
+      image: quay.io/ascend/veomni:veomni-8.3.rc2-910b-ubuntu22.04-py3.11-tingyang_chore_bump_uv
       volumes:
         - /usr/local/dcmi:/usr/local/dcmi
         - /usr/local/bin/npu-smi:/usr/local/bin/npu-smi

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-Patch configuration for Qwen3-Omni-MoE transformers>=5.2.0 code generation.
+Patch configuration for Qwen3-Omni-MoE transformers>=5.9.0 code generation.
 
 Covers the thinker training path (text + vision + audio + MoE):
   - Vision SP slicing with pad_scale=4 + varlen-aware attention
@@ -29,7 +29,7 @@ Covers the thinker training path (text + vision + audio + MoE):
     VeOmni parallel plan.
 
 Regen command:
-python -m veomni.patchgen.run_codegen veomni.models.transformers.qwen3_omni_moe.qwen3_omni_moe_gpu_patch_gen_config -o veomni/models/transformers/qwen3_omni_moe/generated --diff
+patchgen veomni.models.transformers.qwen3_omni_moe.qwen3_omni_moe_gpu_patch_gen_config -o veomni/models/transformers/qwen3_omni_moe/generated --diff
 """
 
 import copy
@@ -646,7 +646,14 @@ def qwen3_omni_moe_vision_forward_patched(
     if grid_thw_list is None:
         grid_thw_list = grid_thw.tolist()
 
-    pos_embeds = self.fast_pos_embed_interpolate(grid_thw)
+    # transformers 5.9's upstream ViT forward (see ``Qwen3OmniMoeVisionEncoder.forward``)
+    # casts the interpolated positional embedding back to ``hidden_states.dtype`` — the
+    # ``self.pos_embed(...) * bilinear_weights`` product promotes bf16 weights × fp32
+    # bilinear weights to fp32, which would then break the bf16 LayerNorm inside each
+    # vision block. Match the upstream cast here too; otherwise the patched ViT
+    # crashes with ``expected scalar type Float but found BFloat16`` at the first
+    # ``norm1(hidden_states)``.
+    pos_embeds = self.fast_pos_embed_interpolate(grid_thw).to(hidden_states.dtype)
 
     sp_group = get_parallel_state().sp_group if get_parallel_state().sp_enabled else None
 
@@ -679,7 +686,20 @@ def qwen3_omni_moe_vision_forward_patched(
             dtype=grid_thw.dtype if torch.jit.is_tracing() else torch.int32,
         )
 
-    rotary_pos_emb = self.rot_pos_emb(grid_thw)
+    # Build ``position_ids`` host-driven, mirroring upstream's
+    # ``get_vision_position_ids``. Replaces ``self.rot_pos_emb(grid_thw)`` which
+    # in transformers 5.9 is a deprecated shim that (a) emits a per-forward
+    # ``FutureWarning`` and (b) re-runs ``grid_thw.tolist()`` internally.
+    ms = self.spatial_merge_size
+    device = hidden_states.device
+    position_ids_list = []
+    for t, h, w in grid_thw_list:
+        hpos_ids = torch.arange(h, device=device).reshape(h, 1).expand(h, w)
+        hpos_ids = hpos_ids.reshape(h // ms, ms, w // ms, ms).transpose(1, 2).flatten()
+        wpos_ids = torch.arange(w, device=device).reshape(1, w).expand(h, w)
+        wpos_ids = wpos_ids.reshape(h // ms, ms, w // ms, ms).transpose(1, 2).flatten()
+        position_ids_list.append(torch.stack([hpos_ids, wpos_ids], dim=-1).repeat(t, 1))
+    rotary_pos_emb = self.rotary_pos_emb(torch.cat(position_ids_list, dim=0))
     seq_len, _ = hidden_states.size()
     hidden_states = hidden_states.reshape(seq_len, -1)
     # total_seq_len is already a Python int — no sync to use as a shape arg.
@@ -799,6 +819,17 @@ def qwen3_omni_moe_audio_forward_patched(
     aftercnn_lens (`torch.LongTensor` of shape `(batch_size,)`):
         mel length after cnn
     """
+    # The LM-level FlashAttentionKwargs (``cu_seq_lens_q/k``, ``max_length_q/k``)
+    # are injected by the data collator for packed-sequence attention and ride
+    # through Thinker.forward's ``**kwargs``. They must not reach the audio
+    # encoder layers — upstream's ``Qwen3OmniMoeAudioAttention.forward`` passes
+    # vision-local ``cu_seq_lens_q=cu_seqlens`` explicitly AND forwards
+    # ``**kwargs``, which would otherwise raise ``TypeError: got multiple
+    # values for keyword argument 'cu_seq_lens_q'`` (mirrors the strip we do
+    # in the qwen3_vl / qwen2_5_vl / qwen3_omni_moe ViT forwards).
+    for key in ["cu_seq_lens_q", "cu_seq_lens_k", "max_length_q", "max_length_k"]:
+        kwargs.pop(key, None)
+
     # --- Patch.1 ---
     input_features = input_features.permute(1, 0)  # (len, num_mel_bins) -> (num_mel_bins, len)
     # --- Patch.1 ---
@@ -959,11 +990,12 @@ def qwen3_omni_moe_thinker_text_model_forward_patched(
     else:
         text_position_ids = position_ids[0]
 
+    # transformers 5.9 dropped ``cache_position`` from ``create_causal_mask``
+    # ("Deprecated and unused" — see masking_utils.py:917).
     attention_mask = create_causal_mask(
         config=self.config,
         inputs_embeds=inputs_embeds,
         attention_mask=attention_mask,
-        cache_position=cache_position,
         past_key_values=past_key_values,
         position_ids=text_position_ids,
     )

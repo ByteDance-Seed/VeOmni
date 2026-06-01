@@ -15,7 +15,7 @@
 Patch configuration for SeedOss GPU LigerKernel replacements.
 
 Regen command:
-python -m veomni.patchgen.run_codegen veomni.models.transformers.seed_oss.seed_oss_gpu_patch_gen_config -o veomni/models/transformers/seed_oss/generated
+patchgen veomni.models.transformers.seed_oss.seed_oss_gpu_patch_gen_config -o veomni/models/transformers/seed_oss/generated
 
 Patches:
 - ``SeedOssRMSNorm`` -> ``LigerRMSNorm`` (functional fused RMSNorm).
