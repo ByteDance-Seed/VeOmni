@@ -43,6 +43,13 @@ Optional hooks
     Per-call post-processing — e.g. SP gather of routed tensors, computing
     the final ``_loss`` mean across micro-batches.  Default: identity.
 
+``freeze_model() -> None``
+    Optionally freeze a subset of this module's params (the trainer calls it
+    once after build, before the FSDP2 wrap / optimizer build).  There is no
+    base default and no generic policy — only modules that actually freeze
+    something implement it (e.g. ``JanusVqvae`` freezes its inner codec via
+    its own ``config.freeze`` knob; the LLM backbone never overrides it).
+
 ``get_parallel_plan() -> Any | None``
     Per-module FSDP / EP / SP plan.  Default: ``None`` (inherit OmniModel
     defaults).
@@ -223,26 +230,6 @@ class OmniModule:
         them in ``config.json``.  Default: no-op.
         """
         return None
-
-    # ── Freeze ────────────────────────────────────────────────────────────────
-
-    def freeze_model(self) -> None:
-        """Freeze (a subset of) this module's parameters from its own config.
-
-        The trainer owns *when* (called once after build, before the FSDP2
-        wrap / optimizer build, so the optimizer only ever sees the
-        still-trainable params); the **module owns the policy** — i.e. *what*
-        to freeze and how to read the knob off ``self.config``.
-
-        Default policy: freeze the *whole* module when ``config.freeze`` is
-        truthy (a plain pretrained backbone used read-only).  Override to
-        freeze only a sub-part — e.g. :class:`JanusVqvae` freezes only its
-        inner codec while keeping the generation heads trainable.  A module
-        that left every parameter frozen is detected by the trainer (no
-        trainable params) and simply gets no optimizer / scheduler.
-        """
-        if getattr(getattr(self, "config", None), "freeze", False):
-            self.requires_grad_(False)
 
     # ── HF lifecycle override ─────────────────────────────────────────────────
 

@@ -433,8 +433,8 @@ class OmniTrainer:
     / ``state`` / ``checkpointer`` / dataloaders / callbacks) lives on
     ``self.base``.  Omni-specific bookkeeping that is **not** part of
     ``BaseTrainer``'s interface (``omni_config`` / ``module_names`` /
-    ``frozen_modules`` / ``module_trainers`` / per-module ``optimizers`` /
-    ``lr_schedulers``) lives directly on ``self``.  The per-module checkpoint
+    ``module_trainers`` / per-module ``optimizers`` / ``lr_schedulers``) lives
+    directly on ``self``.  The per-module checkpoint
     callback therefore binds to the ``OmniTrainer`` wrapper and reads base state
     via ``trainer.base``.
     """
@@ -448,7 +448,6 @@ class OmniTrainer:
     # lives directly on the wrapper rather than on ``self.base``.
     omni_config: "OmniConfig"  # parsed modules / nodes / edges / training graph
     module_names: List[str]  # ordered names of every declared module
-    frozen_modules: set[str]  # modules left with no trainable params (no optimizer/scheduler)
     module_trainers: Dict[str, OmniModuleTrainer]  # one BaseTrainer subclass per module
     optimizers: Dict[str, torch.optim.Optimizer]  # one per trainable module (aggregated into base.optimizer)
     lr_schedulers: Dict[str, Any]  # one per trainable module (aggregated into base.lr_scheduler)
@@ -510,7 +509,6 @@ class OmniTrainer:
         args: VeOmniOmniArguments = base.args
         self.omni_config: "OmniConfig" = args.model.load_omni_config()
         self.module_names: List[str] = list(self.omni_config.module_names)
-        self.frozen_modules: set[str] = set()
         self.module_trainers: Dict[str, OmniModuleTrainer] = {}
 
         # Global tokenizer (wired into every module-trainer that wants it).
@@ -530,25 +528,12 @@ class OmniTrainer:
             )
             self.module_trainers[name] = module_trainer
             modules[name] = module_trainer.model
-
-            # The module froze itself (its policy) inside the trainer above.  A
-            # module left with *no* trainable params gets no optimizer/scheduler;
-            # a partially-frozen one (e.g. JanusVqvae) still trains its remaining
-            # params.  ``requires_grad`` survives the FSDP2 wrap (see
-            # OmniModuleTrainer.__init__), so this read is accurate post-build.
-            trainable = any(p.requires_grad for p in module_trainer.model.parameters())
-            if not trainable:
-                self.frozen_modules.add(name)
-            logger.info_rank0(
-                f"OmniTrainer: built module-trainer '{name}' from {weights_path}"
-                + ("" if trainable else " [FROZEN — no trainable params]")
-            )
+            logger.info_rank0(f"OmniTrainer: built module-trainer '{name}' from {weights_path}")
 
         base.model = OmniModel(self.omni_config, modules)
         base.model_config = self.omni_config
         logger.info_rank0(
-            f"OmniTrainer: composed OmniModel with {len(self.module_names)} modules "
-            f"({self.module_names}); frozen: {sorted(self.frozen_modules) or '(none)'}."
+            f"OmniTrainer: composed OmniModel with {len(self.module_names)} modules ({self.module_names})."
         )
 
     # ── Freeze (aggregate report) ───────────────────────────────────────────────
@@ -585,27 +570,26 @@ class OmniTrainer:
     # ── Build: per-module optimizers + schedulers (drive the module-trainers) ──
 
     def _build_optimizer(self):
-        """Drive each trainable module-trainer's ``_build_optimizer`` + aggregate.
+        """Drive each module-trainer's ``_build_optimizer`` + aggregate.
 
-        Reuses ``BaseTrainer._build_optimizer`` per module (over that module's
-        params, with the same optimizer config); the resulting per-module
-        optimizers are aggregated behind :class:`MultiOptimizer` so the metering
-        callbacks and train loop see the canonical ``base.optimizer`` surface.
+        Reuses ``BaseTrainer._build_optimizer`` per module; ``build_optimizer``
+        only ever puts ``requires_grad`` params into the optimizer, so a
+        partially-frozen module just trains its remaining params and a
+        fully-frozen one yields a harmless empty optimizer (``step()`` is a
+        no-op) — no per-module freeze bookkeeping needed.  Aggregated behind
+        :class:`MultiOptimizer` so the metering callbacks and train loop see
+        the canonical ``base.optimizer`` surface.
         """
         base = self.base
         self.optimizers: Dict[str, torch.optim.Optimizer] = {}
         for name, module_trainer in self.module_trainers.items():
-            if name in self.frozen_modules:
-                continue
             module_trainer._build_optimizer()
             self.optimizers[name] = module_trainer.optimizer
-        if not self.optimizers:
-            raise ValueError("OmniTrainer: no trainable modules — every module is frozen.")
         base.optimizer = MultiOptimizer(self.optimizers)
         logger.info_rank0(f"OmniTrainer: built {len(self.optimizers)} optimizer(s): {list(self.optimizers)}.")
 
     def _build_lr_scheduler(self):
-        """Drive each trainable module-trainer's ``_build_lr_scheduler`` + aggregate.
+        """Drive each module-trainer's ``_build_lr_scheduler`` + aggregate.
 
         ``BaseTrainer._build_lr_scheduler`` reads ``args.train_steps`` (fixed by
         the shared dataset); propagate the global value into each module-trainer's
@@ -614,8 +598,6 @@ class OmniTrainer:
         base = self.base
         self.lr_schedulers: Dict[str, Any] = {}
         for name, module_trainer in self.module_trainers.items():
-            if name in self.frozen_modules:
-                continue
             module_trainer.args.train_steps = base.args.train_steps
             module_trainer._build_lr_scheduler()
             self.lr_schedulers[name] = module_trainer.lr_scheduler
