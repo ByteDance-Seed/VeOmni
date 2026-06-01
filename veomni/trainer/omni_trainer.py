@@ -370,16 +370,6 @@ class OmniModuleTrainer(BaseTrainer):
         self._load_processor()
         self._freeze_model_module()  # freeze (if any) + lora + pretty-print + mem
 
-        # Some encoders (SigLIP / VQVAE) declare ``supports_gradient_checkpointing
-        # = False``; enabling GC on them raises inside the wrap.  Frozen modules
-        # never need it.  ``args`` is a private per-module copy, so mutating the
-        # GC flag here does not leak to sibling modules.
-        supports_gc = bool(getattr(self.model, "supports_gradient_checkpointing", False))
-        if self.frozen or not supports_gc:
-            if args.train.gradient_checkpointing.enable and not self.frozen and not supports_gc:
-                logger.info_rank0(f"OmniModuleTrainer '{name}': no gradient-checkpointing support; skipping it.")
-            args.train.gradient_checkpointing.enable = False
-
         # FSDP2 (and the meta-init weight load) preserve ``requires_grad``: the
         # shard carries it (torch ``_fsdp_param.py``: ``sharded_param.requires_grad_(
         # param.requires_grad)``) and the loader writes weights in-place

@@ -88,6 +88,17 @@ class TextEncoder(OmniModule, PreTrainedModel):
     base_model_prefix = ""
     _no_split_modules: list = []
     main_input_name = "input_ids"
+    # This module is a plain embedding (+ optional ``lm_head``): it has no
+    # transformer layers whose activations are worth recomputing, so gradient
+    # checkpointing is meaningless here.  We still *accept* an ``enable`` call
+    # (declare support + override the enable/disable hooks to no-ops) so the
+    # OmniTrainer can uniformly turn GC on across every module without
+    # special-casing the GC-less ones.  Without this, HF's
+    # ``PreTrainedModel.gradient_checkpointing_enable`` would raise — first
+    # because the inherited flag is ``False``, and even if forced ``True`` it
+    # would still raise since there is no ``gradient_checkpointing``-bearing
+    # submodule for ``_set_gradient_checkpointing`` to flip.
+    supports_gradient_checkpointing = True
 
     def __init__(self, config: TextEncoderConfig):
         super().__init__(config)
@@ -99,6 +110,20 @@ class TextEncoder(OmniModule, PreTrainedModel):
             self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=config.lm_head_bias)
 
         self.post_init()
+
+    # ── Gradient checkpointing (no-op — nothing to recompute) ──────────────────
+
+    def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None) -> None:
+        """No-op: an embedding/head has no activations worth checkpointing.
+
+        Overridden so a uniform ``enable`` call from the trainer is accepted
+        silently instead of raising in ``PreTrainedModel`` (see class note).
+        """
+        return
+
+    def gradient_checkpointing_disable(self) -> None:
+        """No-op counterpart to :meth:`gradient_checkpointing_enable`."""
+        return
 
     # ── Call-site methods ─────────────────────────────────────────────────────
 

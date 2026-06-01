@@ -98,6 +98,12 @@ class JanusVqvae(OmniModule, PreTrainedModel):
     base_model_prefix = "janus_vqvae"
     main_input_name = "gen_image_patches"
     _no_split_modules: list = []
+    # The inner ``JanusVQVAE`` declares gradient-checkpointing support, so the
+    # mixin advertises it too (keeps the wrapper's capability accurate and lets
+    # the trainer's GC guard pass).  Note: the VQVAE is frozen by default
+    # (``freeze_vqvae``) and runs under ``no_grad`` in training, so GC here is
+    # effectively inert — only the trainable generation_* heads see grads.
+    supports_gradient_checkpointing = True
 
     def __init__(self, config: JanusVqvaeConfig):
         super().__init__(config)

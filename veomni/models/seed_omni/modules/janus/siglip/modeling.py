@@ -56,6 +56,12 @@ class JanusSiglip(OmniModule, PreTrainedModel):
     base_model_prefix = "janus_siglip"
     main_input_name = "pixel_values"
     _no_split_modules = ["JanusVisionEncoderLayer"]
+    # The understanding tower (``JanusVisionModel`` → ``JanusVisionEncoder``)
+    # supports gradient checkpointing.  ``PreTrainedModel`` defaults this flag to
+    # ``False`` and the mixin would otherwise inherit that, so the trainer would
+    # needlessly skip GC; advertise the (real) capability so its encoder layers
+    # actually checkpoint.
+    supports_gradient_checkpointing = True
 
     def __init__(self, config: JanusSiglipConfig):
         super().__init__(config)
