@@ -165,6 +165,33 @@ def test_dict_to_video_audio_missing_frames_and_video_raises():
         _dict_to_video_audio({"audio": _make_silent_wav()})
 
 
+def test_dict_to_video_audio_ndarray_audio_without_fps_raises():
+    """ndarray audio without explicit audio_fps would otherwise be silently
+    dropped by fetch_videos (audio is not None and audio_fps is not None gate),
+    which would inversely flip the recipe back to the non-interleaved path.
+    """
+    from veomni.data.multimodal.video_utils import _dict_to_video_audio
+
+    frames = [_make_png_frame(color=c) for c in (10, 80, 150, 220)]
+    audio_array = np.zeros(16000, dtype=np.float32)  # ndarray, no audio_fps
+
+    with pytest.raises(ValueError, match="requires an explicit `audio_fps`"):
+        _dict_to_video_audio({"frames": frames, "audio": audio_array})
+
+
+def test_dict_to_video_audio_ndarray_audio_with_fps_ok():
+    from veomni.data.multimodal.video_utils import _dict_to_video_audio
+
+    frames = [_make_png_frame(color=c) for c in (10, 80, 150, 220)]
+    audio_array = np.zeros(16000, dtype=np.float32)
+
+    video, video_fps, audio, audio_fps = _dict_to_video_audio(
+        {"frames": frames, "audio": audio_array, "audio_fps": 16000}
+    )
+    assert audio is audio_array  # passed through unchanged
+    assert audio_fps == 16000
+
+
 # ----------------------------------------------------------------------------
 # 3. Full processor path — gated on QWEN3_OMNI_MODEL_PATH
 # ----------------------------------------------------------------------------

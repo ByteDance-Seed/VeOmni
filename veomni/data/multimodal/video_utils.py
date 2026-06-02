@@ -387,6 +387,16 @@ def _dict_to_video_audio(video_dict: Dict[str, "np.ndarray"]) -> tuple:
             audio_array = audio_array.mean(axis=1)
         audio = audio_array.astype(np.float32)
         audio_fps = audio_fps or native_sr
+    elif isinstance(audio, np.ndarray):
+        # Pre-decoded audio — caller MUST provide audio_fps, otherwise fetch_videos
+        # would silently drop this audio (its `audio_fps is not None` gate) and the
+        # Qwen-Omni processor would fall back to the non-interleaved path.
+        if audio_fps is None:
+            raise ValueError(
+                "Offline-A/V dict with ndarray `audio` requires an explicit `audio_fps`; "
+                "either set `audio_fps` on the dict or pass the audio as WAV-encoded bytes "
+                "(soundfile reads the native sample rate for you)."
+            )
 
     return video, video_fps, audio, audio_fps
 
@@ -473,7 +483,16 @@ def _load_and_process_video_with_codec(video_input: VideoInput, use_audio_in_vid
         frames_indices = torch.arange(video.shape[0])
         return video, audio, audio_fps, frames_indices
 
-    # video_input is str (path/URL) or bytes
+    # video_input is str (path/URL) or bytes — the only branch that needs the
+    # ffmpeg / torchcodec stack. dict / List[bytes] / List[PIL.Image] inputs above
+    # never reach this point, so they work in ffmpeg-less environments.
+    if not is_ffmpeg_available():
+        raise RuntimeError(
+            "ffmpeg is not available; required for decoding str/bytes video containers. "
+            "Install with `apt-get install ffmpeg` / `brew install ffmpeg`, or feed the "
+            "video as pre-decoded frames (dict / List[bytes] / List[PIL.Image] — see "
+            "docs/examples/qwen3_omni_offline_av.md)."
+        )
     from torchcodec.decoders import VideoDecoder
 
     try:
@@ -542,11 +561,13 @@ def fetch_videos(videos: List[VideoInput], **kwargs):
 
     Note: Does NOT return frames_indices. Use fetch_videos_metadata() for temporal modeling
     (e.g., Qwen3-VL timestamp calculation).
-    """
-    if not is_ffmpeg_available():
-        raise RuntimeError("ffmpeg is not available. Please install it: apt-get install ffmpeg or brew install ffmpeg")
 
-    logger.info_once("Using torchcodec for video loading.")
+    ffmpeg / torchcodec is only required for ``str`` / ``bytes`` (raw container)
+    inputs — ``dict`` / ``List[bytes]`` / ``List[PIL.Image]`` inputs are handled
+    by the PIL + soundfile path inside ``_load_and_process_video_with_codec`` and
+    work in ffmpeg-less environments.
+    """
+    logger.info_once("Loading videos via _load_and_process_video_with_codec.")
 
     video_inputs, audio_inputs, audio_fps_list = [], [], []
 
@@ -572,6 +593,9 @@ def fetch_videos_metadata(videos: List[VideoInput], **kwargs):
 
     IMPORTANT: For Qwen3-VL, this returns frames_indices needed for timestamp calculation.
 
+    ffmpeg / torchcodec is only required for ``str`` / ``bytes`` (raw container)
+    inputs — see ``fetch_videos`` for the same note.
+
     Args:
         videos: List of video inputs (paths, bytes, PIL images, or dicts)
         **kwargs: Processing parameters (fps, min_frames, max_frames, etc.)
@@ -579,10 +603,7 @@ def fetch_videos_metadata(videos: List[VideoInput], **kwargs):
     Returns:
         (videos, video_metadata, audios, audio_metadata): Processed videos and audios with metadata
     """
-    if not is_ffmpeg_available():
-        raise RuntimeError("ffmpeg is not available. Please install it: apt-get install ffmpeg or brew install ffmpeg")
-
-    logger.info_once("Using torchcodec for video loading with metadata.")
+    logger.info_once("Loading videos with metadata via _load_and_process_video_with_codec.")
 
     video_inputs, video_metadata_list = [], []
     audio_inputs, audio_metadata_list = [], []
@@ -626,9 +647,6 @@ def load_video_from_path(video_path: str, use_audio_in_video: bool = True, **kwa
     Returns:
         (video, video_metadata, audio, audio_metadata)
     """
-    if not is_ffmpeg_available():
-        raise RuntimeError("ffmpeg is not available. Please install it: apt-get install ffmpeg or brew install ffmpeg")
-
     videos, video_meta, audios, audio_meta = fetch_videos_metadata(
         [video_path], use_audio_in_video=use_audio_in_video, **kwargs
     )
@@ -646,9 +664,6 @@ def load_video_from_bytes(video_bytes: bytes, use_audio_in_video: bool = True, *
     Returns:
         (video, video_metadata, audio, audio_metadata)
     """
-    if not is_ffmpeg_available():
-        raise RuntimeError("ffmpeg is not available. Please install it: apt-get install ffmpeg or brew install ffmpeg")
-
     videos, video_meta, audios, audio_meta = fetch_videos_metadata(
         [video_bytes], use_audio_in_video=use_audio_in_video, **kwargs
     )
@@ -684,9 +699,6 @@ def load_video_from_bytes_list(video_frames: Union[List[bytes], np.ndarray], **k
                 img = img.convert("RGB")
             pil_images.append(img.copy())
 
-    if not is_ffmpeg_available():
-        raise RuntimeError("ffmpeg is not available. Please install it: apt-get install ffmpeg or brew install ffmpeg")
-
     videos, video_meta, audios, audio_meta = fetch_videos_metadata([pil_images], **kwargs)
     return videos[0], video_meta[0], audios[0], audio_meta[0]
 
@@ -709,17 +721,9 @@ def load_video(video: VideoInput, **kwargs):
         if len(video) > 0:
             if isinstance(video[0], bytes):
                 return load_video_from_bytes_list(video, **kwargs)
-            if not is_ffmpeg_available():
-                raise RuntimeError(
-                    "ffmpeg is not available. Please install it: apt-get install ffmpeg or brew install ffmpeg"
-                )
             videos, video_meta, audios, audio_meta = fetch_videos_metadata([video], **kwargs)
             return videos[0], video_meta[0], audios[0], audio_meta[0]
     elif isinstance(video, dict):
-        if not is_ffmpeg_available():
-            raise RuntimeError(
-                "ffmpeg is not available. Please install it: apt-get install ffmpeg or brew install ffmpeg"
-            )
         videos, video_meta, audios, audio_meta = fetch_videos_metadata([video], **kwargs)
         return videos[0], video_meta[0], audios[0], audio_meta[0]
 

@@ -48,9 +48,11 @@ Key points:
 
 - `videos[i]` is a dict with at least `frames` (`List[bytes]` of PNG/JPEG-encoded
   frames) and `audio` (WAV-encoded bytes, or a 1-D `np.ndarray` of mono
-  samples). Optional `video_fps` / `audio_fps` override the defaults
-  (`video_fps` falls back to `mm_configs.fps`; `audio_fps` falls back to the
-  native sample rate of the WAV bytes).
+  samples). `video_fps` falls back to `mm_configs.fps`.  For `audio_fps`:
+  - WAV bytes → `audio_fps` is read from the WAV header automatically; you
+    can still override by setting `audio_fps` explicitly.
+  - 1-D ndarray → `audio_fps` is **required** (we raise rather than silently
+    drop the audio downstream).
 - The single `<video>` marker per A/V item binds the entire dict — there is
   no separate `<audio>` marker for the paired audio. The Qwen3-Omni processor
   sees a non-empty per-video `audio_length` and emits an **interleaved**
