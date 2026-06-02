@@ -192,6 +192,36 @@ def test_dict_to_video_audio_ndarray_audio_with_fps_ok():
     assert audio_fps == 16000
 
 
+def test_dict_to_video_audio_frames_layout_honors_default_video_fps():
+    """Frame dicts without `video_fps` must fall back to the caller's configured
+    fps (plumbed from `mm_configs.fps`), not a hard-coded 2.0 — otherwise an
+    `mm_configs.fps: 1.0` recipe would re-sample the offline frames as if they
+    were captured at 2 fps and silently halve the frame count downstream.
+    """
+    from veomni.data.multimodal.video_utils import _dict_to_video_audio
+
+    frames = [_make_png_frame(color=c) for c in (10, 80, 150, 220)]
+
+    _, video_fps, _, _ = _dict_to_video_audio({"frames": frames, "audio": _make_silent_wav()}, default_video_fps=1.0)
+    assert video_fps == 1.0
+
+
+def test_dict_to_video_audio_video_layout_ndarray_audio_no_fps_silent_drop():
+    """The decoded-video (`{"video": ndarray}`) layout predates the offline-A/V
+    recipe and historically dropped ndarray audio without `audio_fps` silently
+    (via the downstream `audio_fps is not None` gate). The stricter guard added
+    for the new `frames` layout must not regress that path.
+    """
+    from veomni.data.multimodal.video_utils import _dict_to_video_audio
+
+    video_np = np.zeros((4, 8, 8, 3), dtype=np.uint8)
+    audio_array = np.zeros(16000, dtype=np.float32)  # ndarray, no audio_fps
+
+    _, _, audio, audio_fps = _dict_to_video_audio({"video": video_np, "audio": audio_array})
+    assert audio is audio_array
+    assert audio_fps is None
+
+
 # ----------------------------------------------------------------------------
 # 3. Full processor path — gated on QWEN3_OMNI_MODEL_PATH
 # ----------------------------------------------------------------------------

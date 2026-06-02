@@ -314,7 +314,7 @@ def _pil_images_to_tensor(images: List["PIL.Image.Image"]) -> torch.Tensor:
     return torch.stack(tensors)
 
 
-def _dict_to_video_audio(video_dict: Dict[str, "np.ndarray"]) -> tuple:
+def _dict_to_video_audio(video_dict: Dict[str, "np.ndarray"], default_video_fps: float = 2.0) -> tuple:
     """Convert a paired-A/V dict to (video tensor, video_fps, audio array, audio_fps).
 
     Accepted layouts:
@@ -351,7 +351,8 @@ def _dict_to_video_audio(video_dict: Dict[str, "np.ndarray"]) -> tuple:
                     img = img.convert("RGB")
                 pil_images.append(img.copy())
         video = _pil_images_to_tensor(pil_images)
-        video_fps = video_dict.get("video_fps", video_dict.get("fps", 2.0))
+        video_fps = video_dict.get("video_fps", default_video_fps)
+        is_offline_av = True
     elif "video" in video_dict:
         video_np = video_dict["video"]
         logger.debug(f"Processing video array with shape: {video_np.shape}, dtype: {video_np.dtype}")
@@ -369,6 +370,7 @@ def _dict_to_video_audio(video_dict: Dict[str, "np.ndarray"]) -> tuple:
             )
             raise ValueError(f"Video array must be 4D, got shape {video_np.shape}")
         video_fps = video_dict.get("video_fps", 30.0)
+        is_offline_av = False
     else:
         logger.error(f"Dict input missing both 'video' and 'frames' keys. Available keys: {list(video_dict.keys())}")
         raise ValueError("Dict input must contain either 'video' (ndarray) or 'frames' (List[bytes])")
@@ -387,16 +389,16 @@ def _dict_to_video_audio(video_dict: Dict[str, "np.ndarray"]) -> tuple:
             audio_array = audio_array.mean(axis=1)
         audio = audio_array.astype(np.float32)
         audio_fps = audio_fps or native_sr
-    elif isinstance(audio, np.ndarray):
-        # Pre-decoded audio — caller MUST provide audio_fps, otherwise fetch_videos
-        # would silently drop this audio (its `audio_fps is not None` gate) and the
-        # Qwen-Omni processor would fall back to the non-interleaved path.
-        if audio_fps is None:
-            raise ValueError(
-                "Offline-A/V dict with ndarray `audio` requires an explicit `audio_fps`; "
-                "either set `audio_fps` on the dict or pass the audio as WAV-encoded bytes "
-                "(soundfile reads the native sample rate for you)."
-            )
+    elif isinstance(audio, np.ndarray) and is_offline_av and audio_fps is None:
+        # Offline-A/V (frames) layout treats audio as required by the interleaved
+        # Qwen-Omni processor path; refuse to silently drop it. The decoded-video
+        # ({"video": ndarray}) layout keeps the historical silent-drop behavior
+        # via the `audio_fps is not None` gate downstream in fetch_videos_metadata.
+        raise ValueError(
+            "Offline-A/V dict with ndarray `audio` requires an explicit `audio_fps`; "
+            "either set `audio_fps` on the dict or pass the audio as WAV-encoded bytes "
+            "(soundfile reads the native sample rate for you)."
+        )
 
     return video, video_fps, audio, audio_fps
 
@@ -475,7 +477,9 @@ def _load_and_process_video_with_codec(video_input: VideoInput, use_audio_in_vid
         return video, audio, audio_fps, frames_indices
 
     elif isinstance(video_input, dict):
-        video, video_fps, audio, audio_fps = _dict_to_video_audio(video_input)
+        video, video_fps, audio, audio_fps = _dict_to_video_audio(
+            video_input, default_video_fps=kwargs.get("fps", 2.0)
+        )
         # Pre-compute nframes for dynamic max_pixels before spatial resize
         indices, pad_count = calculate_frame_indices(total_frames=video.shape[0], video_fps=video_fps, **kwargs)
         resize_kwargs = _apply_dynamic_video_max_pixels(len(indices) + pad_count, kwargs)
