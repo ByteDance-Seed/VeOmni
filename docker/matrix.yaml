@@ -1,0 +1,76 @@
+# Matrix used by docker/generate.py to render docker/cuda/Dockerfile.* (and
+# eventually docker/ascend/Dockerfile.*) from docker/templates/*.j2. Keep
+# cu129 as the "default shape" of the cuda template; other variants override
+# only what differs.
+#
+# To add or update a variant:
+#   1. Edit defaults, a preset, or an entry below (or add a new one under `images:`).
+#   2. Run: python docker/generate.py
+#   3. Commit both this file and the regenerated Dockerfile.
+
+# Extras synced by `uv sync` per backend/architecture. Each image picks one
+# via `uv_extras_preset: <name>`. Keeping all presets here (even unused ones)
+# documents what each variant will install, and makes a future ascend
+# templating PR just a matter of adding ascend.Dockerfile.j2 + new `images`
+# entries — no generate.py changes.
+#
+# Why not `uv sync --all-extras`? Because [tool.uv].conflicts in
+# pyproject.toml declares `gpu` / `npu` / `npu_aarch64` mutually exclusive,
+# and uv would refuse the resolution. Each preset picks exactly one of those
+# three and adds the rest of the platform-agnostic extras.
+uv_extras_presets:
+
+  cuda:
+    - gpu        # cu129 torch + flash-attn 2/3 + liger-kernel + FLA + DLPack
+    - audio      # torchcodec, av, librosa, soundfile
+    - video      # alias of audio (declared explicitly so this list mirrors pyproject.toml)
+    - dit        # diffusion: diffusers + audio deps + ftfy (superset of audio)
+    - trl        # trl
+    - lora       # peft
+    - fa4        # flash-attn-4 + nvidia-cutlass-dsl (built from git; adds build time)
+    - flash-qla  # FlashQLA chunk_gated_delta_rule (built from git)
+#   - megatron   # megatron-energon
+
+  ascend_x86:
+    - npu          # torch+cpu + torch-npu (mutually exclusive with gpu via [tool.uv].conflicts)
+
+  ascend_arm:
+    - npu_aarch64  # torch + torch-npu aarch64 (mutually exclusive with gpu and npu)
+
+defaults:
+  # uv version pinned for the docker image. This is intentionally a single
+  # concrete version rather than the range declared in pyproject.toml's
+  # [tool.uv].required-version: the range exists for local devs (uv ships
+  # weekly), but the image must install one specific build at docker-build
+  # time. Bump in lockstep with pyproject.toml when raising the floor or
+  # tightening the ceiling.
+  uv_version: "0.11.16"
+
+  # Mirrors and paths shared across CUDA variants. apt_source / pip_index are
+  # also exposed as `ARG APT_SOURCE` / `ARG PIP_INDEX` in the generated
+  # Dockerfile, so a user can override them at `docker build` time with
+  # `--build-arg APT_SOURCE=... --build-arg PIP_INDEX=...` (e.g. to switch to
+  # a regional mirror like Tsinghua) without regenerating.
+  apt_source: "http://archive.ubuntu.com/ubuntu/"
+  pip_index: "https://pypi.org/simple"
+  python_dist_packages: "/usr/local/lib/python3.12/dist-packages/"
+  workdir: "/app"
+
+  # `uv sync` flags. `uv_extras` is resolved per-image from `uv_extras_preset`
+  # against `uv_extras_presets` above.
+  uv_dev: true
+
+images:
+  - name: cu128
+    output: docker/cuda/Dockerfile.cu128
+    template: cuda.Dockerfile.j2
+    base_image: "nvcr.io/nvidia/pytorch:25.03-py3"
+    release_notes_url: "https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-25-03.html"
+    uv_extras_preset: cuda
+
+  - name: cu129
+    output: docker/cuda/Dockerfile.cu129
+    template: cuda.Dockerfile.j2
+    base_image: "nvcr.io/nvidia/pytorch:25.06-py3"
+    release_notes_url: "https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-25-06.html"
+    uv_extras_preset: cuda

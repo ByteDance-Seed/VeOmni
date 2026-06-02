@@ -1,5 +1,5 @@
-# https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-25-03.html
-from nvcr.io/nvidia/pytorch:25.03-py3
+# {{ release_notes_url }}
+from {{ base_image }}
 
 # Define environments
 ENV MAX_JOBS=16
@@ -7,14 +7,14 @@ ENV DEBIAN_FRONTEND=noninteractive
 ENV PIP_ROOT_USER_ACTION=ignore
 
 # Define installation arguments
-ARG APT_SOURCE=http://archive.ubuntu.com/ubuntu/
-ARG PIP_INDEX=https://pypi.org/simple
+ARG APT_SOURCE={{ apt_source }}
+ARG PIP_INDEX={{ pip_index }}
 
 # Set apt source
 # ubuntu 24.04
 # Only override the base image's sources.list when the user passed
 # a non-default --build-arg APT_SOURCE=...
-RUN if [ "${APT_SOURCE}" != "http://archive.ubuntu.com/ubuntu/" ]; then \
+RUN if [ "${APT_SOURCE}" != "{{ apt_source }}" ]; then \
     cp /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list.d/ubuntu.sources.bak && \
     { \
     echo "Types: deb"; \
@@ -26,7 +26,7 @@ RUN if [ "${APT_SOURCE}" != "http://archive.ubuntu.com/ubuntu/" ]; then \
     fi
 
 # Change pip source (only when --build-arg PIP_INDEX=... is overridden)
-RUN if [ "${PIP_INDEX}" != "https://pypi.org/simple" ]; then \
+RUN if [ "${PIP_INDEX}" != "{{ pip_index }}" ]; then \
         pip config set global.index-url "${PIP_INDEX}" && \
         pip config set global.extra-index-url "${PIP_INDEX}"; \
     fi && \
@@ -70,31 +70,20 @@ RUN mkdir -p /etc/sudoers.d && \
 RUN groupadd python-users && \
     usermod -aG python-users root && \
     usermod -aG python-users tiger && \
-    chown -R root:python-users /usr/local/lib/python3.12/dist-packages/ && \
-    chmod -R g+w /usr/local/lib/python3.12/dist-packages/ && \
-    chmod g+s /usr/local/lib/python3.12/dist-packages/
+    chown -R root:python-users {{ python_dist_packages }} && \
+    chmod -R g+w {{ python_dist_packages }} && \
+    chmod g+s {{ python_dist_packages }}
 
 USER tiger
 
 # Install uv
-COPY --from=ghcr.io/astral-sh/uv:0.11.16 /uv /uvx /bin/
+COPY --from=ghcr.io/astral-sh/uv:{{ uv_version }} /uv /uvx /bin/
 ENV PATH="/bin/:$PATH"
 ENV UV_CACHE_DIR=/home/tiger/.cache/uv
 
 # uv sync
-WORKDIR /app
+WORKDIR {{ workdir }}
 COPY --chown=tiger:tiger . ./
-RUN uv sync \
-    --locked \
-    --all-packages \
-    --extra gpu \
-    --extra audio \
-    --extra video \
-    --extra dit \
-    --extra trl \
-    --extra lora \
-    --extra fa4 \
-    --extra flash-qla \
-    --dev
+RUN {{ uv_sync_command }}
 
 USER root
