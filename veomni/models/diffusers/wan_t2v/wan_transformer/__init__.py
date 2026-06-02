@@ -2,7 +2,6 @@ from ....loader import MODEL_CONFIG_REGISTRY, MODELING_REGISTRY
 
 
 @MODEL_CONFIG_REGISTRY.register("WanTransformer3DModel")
-@MODEL_CONFIG_REGISTRY.register("dit")
 def register_wan_diffusers_transformer_config():
     from .configuration_wan_transformer import WanTransformer3DModelConfig
 
@@ -10,7 +9,6 @@ def register_wan_diffusers_transformer_config():
 
 
 @MODELING_REGISTRY.register("WanTransformer3DModel")
-@MODELING_REGISTRY.register("dit")
 def register_wan_diffusers_transformer_modeling(architecture: str):
     from .modeling_wan_transformer import WanTransformer3DModel as VeOmniWanTransformer3DModel
     from .modeling_wan_transformer import apply_veomni_wan_transformer_patch
