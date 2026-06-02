@@ -1,0 +1,23 @@
+# Data manifest for Qwen3-Omni decoupled video frames + standalone audio recipe.
+#
+# Replace the placeholder source path below with your own dataset that follows
+# the shape documented in docs/examples/qwen3_omni_decoupled_av.md:
+#
+#   {
+#     "videos":  [[png_bytes_0, png_bytes_1, ...]],   # List[List[bytes]] — pre-extracted frames
+#     "audios":  ["<path-or-bytes>"],                  # standalone audio
+#     "conversations": [
+#       {"from": "human", "value": "<video>\n<audio>\nWhat happens?"},
+#       {"from": "gpt",   "value": "..."}
+#     ]
+#   }
+#
+# Mix multiple sources by adding more entries to `sources` / `names` and
+# rebalancing `weights`.
+sources:
+- /path/to/your_decoupled_av_dataset
+names:
+- qwen_omni_decoupled_av
+schedule:
+- schedule_type: const
+  weights: [1.0]

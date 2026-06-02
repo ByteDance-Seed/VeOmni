@@ -373,6 +373,54 @@ def tulu_3_sft_mixture_preprocess(conversations, **kwargs):
     return constructed_conversation
 
 
+@PREPROCESSOR_REGISTRY.register("qwen_omni_decoupled_av")
+def qwen_omni_decoupled_av_preprocess(conversations, **kwargs):
+    """Decoupled multimodal shape for Qwen-Omni (offline-extracted frames + separate audio).
+
+    Each turn ``value`` may contain inline markers ``<image>``, ``<video>``, and
+    ``<audio>`` that get promoted to separate content items. The sample is expected
+    to carry pre-extracted frames under ``sample["videos"]`` (each item ``List[bytes]``),
+    audio under ``sample["audios"]`` (path / bytes), and images under ``sample["images"]``.
+    Marker order in ``value`` determines order relative to text. Multiple markers per
+    turn are supported.
+
+    The caller is responsible for keeping the per-modality marker count in each
+    conversation aligned with the corresponding ``sample["<modality>"]`` list
+    length — a mismatch surfaces as a ``StopIteration`` deep inside
+    ``process_sample_qwen_omni`` when content items are bound left-to-right.
+
+    Example sample::
+
+        {
+            "videos": [[png_bytes_0, png_bytes_1, ...]],
+            "audios": ["/path/audio.wav"],
+            "conversations": [
+                {"from": "human", "value": "<video>\\n<audio>\\nWhat happens?"},
+                {"from": "gpt",   "value": "Someone is speaking ..."},
+            ],
+        }
+    """
+    role_mapping = {"human": "user", "gpt": "assistant"}
+    constructed = []
+    marker_re = re.compile(r"<video>|<audio>|<image>")
+    for message in conversations:
+        role = role_mapping[message["from"]]
+        value = message["value"]
+        items = []
+        cursor = 0
+        for match in marker_re.finditer(value):
+            text_chunk = value[cursor : match.start()]
+            if text_chunk:
+                items.append(("text", text_chunk))
+            items.append((match.group()[1:-1], None))  # "<video>" -> "video"
+            cursor = match.end()
+        tail = value[cursor:]
+        if tail:
+            items.append(("text", tail))
+        constructed.append([role, *items])
+    return constructed
+
+
 # @PREPROCESSOR_REGISTRY.register("your_dataset_name")
 # def your_dataset_preprocess(conversations, **kwargs):
 #     ...
