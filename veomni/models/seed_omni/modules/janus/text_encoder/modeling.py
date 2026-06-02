@@ -29,7 +29,8 @@ and writes a one-shot string into ``ctx["module_signal"]``:
 * ``"start_image_gen"`` — sampled token is ``<begin_of_image>``
 * ``"text_done"``       — sampled token is ``</s>`` (eos)
 
-Token ids are resolved from the wired tokenizer via :meth:`set_tokenizer`.
+Token ids are resolved from the wired conversation tokenizer via
+:meth:`set_conversation_tokenizer`.
 
 Output protocol (emit methods)
 ------------------------------
@@ -120,7 +121,7 @@ class JanusTextEncoder(TextEncoder):
 
     def __init__(self, config: JanusTextEncoderConfig):
         super().__init__(config)
-        self._tokenizer: Any = None
+        self._conversation_tokenizer: Any = None
         self._bos_token_id: Optional[int] = None
         self._boi_token_id: Optional[int] = None
         self._eoi_token_id: Optional[int] = None
@@ -141,22 +142,22 @@ class JanusTextEncoder(TextEncoder):
         # scatter + the VQ gen-loss.
         self._gen_image_base: Optional[int] = None
 
-    def set_tokenizer(self, tokenizer: Any) -> None:
-        """Resolve Janus special-token ids from the global tokenizer."""
-        self._tokenizer = tokenizer
-        bos = getattr(tokenizer, "bos_token_id", None)
+    def set_conversation_tokenizer(self, conversation_tokenizer: Any) -> None:
+        """Resolve Janus special-token ids from the global conversation tokenizer."""
+        self._conversation_tokenizer = conversation_tokenizer
+        bos = getattr(conversation_tokenizer, "bos_token_id", None)
         self._bos_token_id = int(bos) if bos is not None else None
         self._boi_token_id = _resolve_token_id(
-            tokenizer,
-            ("<begin_of_image>", getattr(tokenizer, "boi_token", None)),
+            conversation_tokenizer,
+            ("<begin_of_image>", getattr(conversation_tokenizer, "boi_token", None)),
         )
         self._eoi_token_id = _resolve_token_id(
-            tokenizer,
-            ("<end_of_image>", getattr(tokenizer, "eoi_token", None)),
+            conversation_tokenizer,
+            ("<end_of_image>", getattr(conversation_tokenizer, "eoi_token", None)),
         )
-        eos = getattr(tokenizer, "eos_token_id", None)
+        eos = getattr(conversation_tokenizer, "eos_token_id", None)
         self._eos_token_id = int(eos) if eos is not None else None
-        pad = getattr(tokenizer, "pad_token_id", None)
+        pad = getattr(conversation_tokenizer, "pad_token_id", None)
         # Pad falls back to eos when the tokenizer doesn't ship one — same
         # convention HF uses when building uncond inputs in
         # `JanusForConditionalGeneration.generate`
@@ -164,10 +165,10 @@ class JanusTextEncoder(TextEncoder):
         # the CFG uncond branch can't replace non-BOS positions.
         self._pad_token_id = int(pad) if pad is not None else self._eos_token_id
         self._image_token_id = _resolve_token_id(
-            tokenizer,
-            ("<image_placeholder>", getattr(tokenizer, "image_token", None)),
+            conversation_tokenizer,
+            ("<image_placeholder>", getattr(conversation_tokenizer, "image_token", None)),
         )
-        self._gen_image_base = _resolve_token_id(tokenizer, ("<image_0>",))
+        self._gen_image_base = _resolve_token_id(conversation_tokenizer, ("<image_0>",))
         if self._boi_token_id is not None:
             self.config.begin_of_image_token_id = self._boi_token_id
         if self._eoi_token_id is not None:
@@ -230,13 +231,13 @@ class JanusTextEncoder(TextEncoder):
         ``<eos>``); image / boundary / prompt positions get ``label_ids=-100``,
         and ``vq_image`` positions carry the teacher VQ ids in ``gen_ids``.
         """
-        if self._tokenizer is None:
+        if self._conversation_tokenizer is None:
             raise RuntimeError(
                 "JanusTextEncoder training tokenisation needs a tokenizer — "
-                "call set_tokenizer(global_tokenizer) on the module first."
+                "call set_conversation_tokenizer(conversation_tokenizer) on the module first."
             )
         if self._bos_token_id is None or self._eos_token_id is None:
-            raise RuntimeError("JanusTextEncoder.set_tokenizer did not resolve bos/eos ids.")
+            raise RuntimeError("JanusTextEncoder.set_conversation_tokenizer did not resolve bos/eos ids.")
         conv.segments = [self._segment_one(sample, conv, i) for i, sample in enumerate(conv.raw)]
 
     def _segment_one(
@@ -299,7 +300,7 @@ class JanusTextEncoder(TextEncoder):
             elif typ in ("image", "vq_image"):
                 if self._boi_token_id is None or self._eoi_token_id is None:
                     raise RuntimeError(
-                        "JanusTextEncoder training tokenisation needs boi/eoi ids — call set_tokenizer() first."
+                        "JanusTextEncoder training tokenisation needs boi/eoi ids — call set_conversation_tokenizer() first."
                     )
                 _add_text([int(self._boi_token_id)], supervised=False)
                 _add_image(typ)
@@ -320,7 +321,7 @@ class JanusTextEncoder(TextEncoder):
     def _encode_text(self, text: str) -> List[int]:
         if not text:
             return []
-        return self._tokenizer(text, add_special_tokens=False)["input_ids"]
+        return self._conversation_tokenizer(text, add_special_tokens=False)["input_ids"]
 
     # ── Inference: conversation-list aware encode ─────────────────────────────
 
@@ -486,7 +487,7 @@ class JanusTextEncoder(TextEncoder):
         if token_id is None:
             raise RuntimeError(
                 "JanusTextEncoder.emit_image_start requires begin_of_image_token_id — "
-                "call set_tokenizer() before inference."
+                "call set_conversation_tokenizer() before inference."
             )
         return self._emit(int(token_id), conversation_list, ctx)
 
@@ -500,7 +501,7 @@ class JanusTextEncoder(TextEncoder):
         if token_id is None:
             raise RuntimeError(
                 "JanusTextEncoder.emit_image_end requires end_of_image_token_id — "
-                "call set_tokenizer() before inference."
+                "call set_conversation_tokenizer() before inference."
             )
         return self._emit(int(token_id), conversation_list, ctx)
 
@@ -548,7 +549,7 @@ class JanusTextEncoder(TextEncoder):
         Returns ``None`` (skip CFG) when:
 
         * ``guidance_scale`` is missing / <= 1.0;
-        * the tokenizer wasn't wired in (``set_tokenizer`` not called) — we
+        * the tokenizer wasn't wired in (``set_conversation_tokenizer`` not called) — we
           can't resolve ``pad_token_id`` then;
         * any conversation part already carries non-text content (image_und
           parts have ``input_ids = None``); Janus's CFG protocol is only
@@ -559,7 +560,7 @@ class JanusTextEncoder(TextEncoder):
         cfg_w = generation_kwargs.get("guidance_scale")
         if cfg_w is None or float(cfg_w) <= 1.0:
             return None
-        if self._tokenizer is None or self._pad_token_id is None or self._bos_token_id is None:
+        if self._conversation_tokenizer is None or self._pad_token_id is None or self._bos_token_id is None:
             return None
 
         bos_id = int(self._bos_token_id)
@@ -614,9 +615,9 @@ class JanusTextEncoder(TextEncoder):
         token_ids = latest_assistant_text_token_ids(conversation)
         if not token_ids:
             return {}
-        if self._tokenizer is None:
+        if self._conversation_tokenizer is None:
             return {"token_ids": token_ids}
-        text = self._tokenizer.decode(token_ids, skip_special_tokens=True)
+        text = self._conversation_tokenizer.decode(token_ids, skip_special_tokens=True)
         return {"text": text, "token_ids": token_ids}
 
     # ── Internal helpers ─────────────────────────────────────────────────────
@@ -722,12 +723,12 @@ class JanusTextEncoder(TextEncoder):
             if not part.text:
                 # Empty assistant marker: nothing to embed yet.
                 return
-            if self._tokenizer is None:
+            if self._conversation_tokenizer is None:
                 raise RuntimeError(
                     "JanusTextEncoder.generate needs a tokenizer for text parts — "
-                    "call set_tokenizer(global_tokenizer) on the module first."
+                    "call set_conversation_tokenizer(conversation_tokenizer) on the module first."
                 )
-            ids = self._tokenizer(part.text, return_tensors="pt", add_special_tokens=False)["input_ids"]
+            ids = self._conversation_tokenizer(part.text, return_tensors="pt", add_special_tokens=False)["input_ids"]
             ids = ids.to(device=device)
             part.input_ids = ids
             part.inputs_embeds = self.embed_tokens(ids).to(dtype=dtype)

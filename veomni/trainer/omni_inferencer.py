@@ -34,8 +34,8 @@ Lifecycle
    eagerly on a single device via ``cls.from_pretrained`` — no FSDP, no
    meta init, ``device_map`` deferred to a follow-up PR.
 
-3. The global tokenizer is loaded from ``OmniConfig.tokenizer_path`` and
-   wired into every module that exposes ``set_tokenizer`` (notably
+3. The global conversation tokenizer is loaded from ``OmniConfig.tokenizer_path``
+   and wired into every module that exposes ``set_conversation_tokenizer`` (notably
    :class:`JanusTextEncoder`, which resolves bos / boi / eoi / eos ids at
    this point).  Per-module processors (vision / audio / …) are auto-
    loaded inside :meth:`OmniModule.from_pretrained` from the same
@@ -285,7 +285,7 @@ class OmniInferencer:
     The tokenizer is best-effort: if loading fails (e.g. a diffusion-only
     split-checkpoint with no ``tokenizer.json`` at the root) the inferencer
     warns and leaves ``self.tokenizer = None`` — only modules that need it
-    via ``set_tokenizer`` are affected.
+    via ``set_conversation_tokenizer`` are affected.
     """
 
     def __init__(self, args: OmniInferenceArguments):
@@ -307,15 +307,17 @@ class OmniInferencer:
 
         self.modules: dict[str, torch.nn.Module] = self._build_modules()
 
-        # Tokenizer is best-effort — diffusion-only checkpoints have none.
+        # Conversation tokenizer is best-effort — diffusion-only checkpoints have none.
         try:
             self.tokenizer = AutoTokenizer.from_pretrained(self.omni_config.tokenizer_path)
             for module in self.modules.values():
-                module.set_tokenizer(self.tokenizer)
+                if hasattr(module, "set_conversation_tokenizer"):
+                    module.set_conversation_tokenizer(self.tokenizer)
         except Exception as e:
             self.tokenizer = None
             logger.warning_rank0(
-                f"OmniInferencer: tokenizer load failed ({e}); modules that need set_tokenizer will be skipped."
+                f"OmniInferencer: conversation tokenizer load failed ({e}); "
+                "modules that need set_conversation_tokenizer will be skipped."
             )
 
         self.model = OmniModel(self.omni_config, self.modules).eval()

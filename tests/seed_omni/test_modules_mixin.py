@@ -194,7 +194,7 @@ def test_janus_text_encoder_emit_methods_return_expected_shapes():
         def convert_tokens_to_ids(self, token: str) -> int:
             return {"<begin_of_image>": 42, "<end_of_image>": 43}[token]
 
-    jte.set_tokenizer(_MockTokenizer())
+    jte.set_conversation_tokenizer(_MockTokenizer())
 
     # No batch_size hint in ctx → defaults to 1.
     out = jte.emit_image_start()
@@ -223,7 +223,7 @@ def test_janus_text_encoder_decode_emits_module_signals():
         def convert_tokens_to_ids(self, token: str) -> int:
             return {"<begin_of_image>": 42, "<end_of_image>": 43}[token]
 
-    jte.set_tokenizer(_MockTokenizer())
+    jte.set_conversation_tokenizer(_MockTokenizer())
 
     h = torch.ones(1, 1, 16)
     jte.lm_head.weight.data.zero_()

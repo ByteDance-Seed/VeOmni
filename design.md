@@ -132,10 +132,12 @@ class OmniModule:
     def post_forward(self, outputs: Dict[str, Any]) -> Dict[str, Any]:
         """SP gather；token-level loss scale（按 sum + token_count 形式吐出）。"""
 
-    # ── tokenizer 共享（可选；vocab-bound 模块用）────────────────────────
-    def set_tokenizer(self, tokenizer: "PreTrainedTokenizer") -> None:
+    # ── conversation tokenizer 共享（可选；vocab-bound 模块用）─────────────
+    # 注意：这是全局「对话」tokenizer（存为 self._conversation_tokenizer），
+    # 与模块自带 tokenizer（self._tokenizer，如 DiT 的 T5）是两个概念。
+    def set_conversation_tokenizer(self, conversation_tokenizer: "PreTrainedTokenizer") -> None:
         """
-        Optional. 全局 tokenizer 由 ``OmniConfig.tokenizer_path`` 指向 split
+        Optional. 全局 conversation tokenizer 由 ``OmniConfig.tokenizer_path`` 指向 split
         checkpoint 根目录（``tokenizer.json`` 与 ``janus_siglip/`` 等子目录
         同级）。``train.yaml`` **不**声明 tokenizer；launcher 的
         ``model.model_path`` 经 ``OmniConfig.from_paths(...)`` 透传到
@@ -1354,9 +1356,9 @@ JanusLlama 的实现（伪码）：
 
 ```python
 class JanusLlama(LlamaModel, OmniModule):
-    def set_tokenizer(self, tokenizer):
-        self._pad_id = tokenizer.pad_token_id
-        self._image_start_id = tokenizer.convert_tokens_to_ids("<begin_of_image>")
+    def set_conversation_tokenizer(self, conversation_tokenizer):
+        self._pad_id = conversation_tokenizer.pad_token_id
+        self._image_start_id = conversation_tokenizer.convert_tokens_to_ids("<begin_of_image>")
 
     def build_cfg_uncond_inputs(self, *, input_ids, attention_mask, **_):
         uncond_ids = input_ids.clone()

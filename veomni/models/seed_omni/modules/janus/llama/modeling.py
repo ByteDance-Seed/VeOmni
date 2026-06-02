@@ -88,21 +88,24 @@ class JanusLlama(OmniModule, PreTrainedModel):
 
     # ── OmniModule interface ───────────────────────────────────────────────────
 
-    def set_tokenizer(self, tokenizer: Any) -> None:
+    def set_conversation_tokenizer(self, conversation_tokenizer: Any) -> None:
         """Resolve image-placeholder ids used by the ``masked_scatter`` merge.
 
         ``image_token_id`` (``<image_placeholder>``) marks where SigLIP
         understanding patches are injected; ``gen_image_token_id`` marks
         VQ generation-image positions.  Stored on ``config`` so
         :meth:`pre_forward` can build the scatter mask from ``input_ids``.
-        Resolved from the wired tokenizer rather than ``config.json`` so a
-        single source of truth (the vocabulary) drives both the text
-        encoder's placeholder expansion and the backbone's scatter.
+        Resolved from the wired conversation tokenizer rather than
+        ``config.json`` so a single source of truth (the vocabulary) drives
+        both the text encoder's placeholder expansion and the backbone's
+        scatter.
         """
-        und = _resolve_token_id(tokenizer, ("<image_placeholder>", getattr(tokenizer, "image_token", None)))
+        und = _resolve_token_id(
+            conversation_tokenizer, ("<image_placeholder>", getattr(conversation_tokenizer, "image_token", None))
+        )
         if und is not None:
             self.config.image_token_id = und
-        gen = _resolve_token_id(tokenizer, (getattr(tokenizer, "gen_image_token", None),))
+        gen = _resolve_token_id(conversation_tokenizer, (getattr(conversation_tokenizer, "gen_image_token", None),))
         if gen is not None:
             self.config.gen_image_token_id = gen
 

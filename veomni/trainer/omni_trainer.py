@@ -69,7 +69,7 @@ import torch.distributed as dist
 from ..arguments import DataArguments, ModelArguments, TrainingArguments, VeOmniArguments
 from ..data import SeedOmniCollator
 from ..distributed.clip_grad_norm import veomni_clip_grad_norm
-from ..models import build_tokenizer
+from ..models import build_processor, build_tokenizer
 from ..models.seed_omni.modeling_omni import OmniModel
 from ..ops.batch_invariant_ops import set_batch_invariant_mode
 from ..utils import helper, logging
@@ -409,7 +409,7 @@ class OmniModuleTrainer:
     def __init__(
         self,
         args: "VeOmniArguments",
-        tokenizer: Any = None,
+        conversation_tokenizer: Any = None,
     ):
         # Composition (mirrors OmniTrainer): a bare BaseTrainer whose global
         # _setup() is deliberately skipped (owned by OmniTrainer); we call only
@@ -423,9 +423,14 @@ class OmniModuleTrainer:
         self.base.name = None
 
         self.base._build_model()  # meta-init the sub-model from its config.json
-        if tokenizer is not None and hasattr(self.base.model, "set_tokenizer"):
-            self.base.model.set_tokenizer(tokenizer)
-        self._load_processor()
+        # Wire the global *conversation* tokenizer (resolves special-token ids /
+        # tokenises the conversation).  This is **not** a module asset — the
+        # orchestrator owns it; the module's *own* assets are loaded below.
+        if conversation_tokenizer is not None and hasattr(self.base.model, "set_conversation_tokenizer"):
+            self.base.model.set_conversation_tokenizer(conversation_tokenizer)
+        # Load this module's own processor / tokenizer and assemble
+        # ``base.model_assets`` (mirrors ``BaseTrainer._build_model_assets``).
+        self._build_model_assets()
         self._freeze_model_module()  # module self-freezes + lora + pretty-print + mem
 
         # FSDP2 (and the meta-init weight load) preserve ``requires_grad``: the
@@ -437,29 +442,15 @@ class OmniModuleTrainer:
 
         # Make ``base`` look enough like a single-model trainer for the reused
         # checkpoint callbacks: the dataloader is global (owned by the
-        # orchestrator, never here) and the HF/asset export needs this module's
-        # config / processor / tokenizer.
+        # orchestrator, never here).  ``base.model_assets`` was already
+        # assembled in :meth:`_build_model_assets` above.
         self.base.train_dataloader = None
-        self.base.model_assets = self._collect_model_assets(tokenizer)
 
         # This module's own checkpoint callbacks (DCP resume + HF/LoRA export),
         # reusing the shared single-model callbacks.  Optimizer / lr-scheduler
         # are built later via :meth:`_build_optimizer` / :meth:`_build_lr_scheduler`
         # (the orchestrator calls them once ``args.train_steps`` is known).
         self._init_callbacks()
-
-    def _collect_model_assets(self, tokenizer: Any) -> List[Any]:
-        """This module's savable assets (config + processor + tokenizer, if any)."""
-        assets: List[Any] = []
-        cfg = getattr(self.base.model, "config", None)
-        if cfg is not None:
-            assets.append(cfg)
-        processor = getattr(self.base.model, "_processor", None)
-        if processor is not None:
-            assets.append(processor)
-        if tokenizer is not None:
-            assets.append(tokenizer)
-        return assets
 
     # ── Optimizer / lr-scheduler (built here; the orchestrator only calls) ─────
 
@@ -518,26 +509,61 @@ class OmniModuleTrainer:
             model.freeze_model()
         self.base._freeze_model_module()
 
-    def _load_processor(self):
-        """Attach the per-module image processor (meta-init skips ``from_pretrained``).
+    def _build_model_assets(self):
+        """Load this module's **own** processor / tokenizer and assemble ``base.model_assets``.
 
-        Vision modules (SigLIP / VQVAE) need their processor at train time to
-        normalise the raw uint8 images carried in ``conversation_list``.
+        Mirrors :meth:`BaseTrainer._build_model_assets` (which sets
+        ``self.model_assets``), but for a sub-module — here it sets
+        ``self.base.model_assets`` so the reused HF/asset-export callbacks ship the
+        right files to the module's ``<module>/`` subdir.
+
+        Meta-init skips ``from_pretrained``, so the module's own assets are loaded
+        here: vision modules (SigLIP / VQVAE) need their processor at train time to
+        normalise the raw uint8 images carried in ``conversation_list``; a module
+        that owns its own tokenizer (e.g. a T5 text encoder for a DiT) needs that
+        too.  Both are loaded from this module's weights path via the
+        registry-aware :func:`build_processor` / :func:`build_tokenizer` — the same
+        loaders used everywhere else — and are this module's *own* assets, distinct
+        from the global conversation tokenizer (the orchestrator owns / saves that).
+
+        A missing / unreadable asset folder is a best-effort no-op; the module's
+        ``generate`` / ``forward`` raises a clear error later if it truly needs it.
         """
         model = self.base.model
-        processor_cls = getattr(type(model), "processor_class", None)
-        if processor_cls is None or getattr(model, "_processor", None) is not None:
-            return
         label = type(model).__name__
         weights_path = self.base.args.model.model_path
-        try:
-            model._processor = processor_cls.from_pretrained(weights_path)
-            logger.info_rank0(f"OmniModuleTrainer '{label}': loaded {processor_cls.__name__}.")
-        except Exception as e:  # noqa: BLE001 — surfaced lazily by the module if truly needed
-            logger.warning_once(
-                f"OmniModuleTrainer '{label}': could not load processor from {weights_path}: {e}. "
-                "Training will fail if this modality's images are actually present."
-            )
+
+        if getattr(type(model), "processor_class", None) is not None and getattr(model, "_processor", None) is None:
+            try:
+                model._processor = build_processor(weights_path)
+                logger.info_rank0(f"OmniModuleTrainer '{label}': loaded processor.")
+            except Exception as e:  # noqa: BLE001 — surfaced lazily by the module if truly needed
+                logger.warning_once(
+                    f"OmniModuleTrainer '{label}': could not load processor from {weights_path}: {e}. "
+                    "Training will fail if this modality's images are actually present."
+                )
+
+        if getattr(type(model), "tokenizer_class", None) is not None and getattr(model, "_tokenizer", None) is None:
+            try:
+                model._tokenizer = build_tokenizer(weights_path)
+                logger.info_rank0(f"OmniModuleTrainer '{label}': loaded own tokenizer.")
+            except Exception as e:  # noqa: BLE001 — surfaced lazily by the module if truly needed
+                logger.warning_once(
+                    f"OmniModuleTrainer '{label}': could not load own tokenizer from {weights_path}: {e}."
+                )
+
+        # Assemble the savable assets (config + own processor + own tokenizer).  The
+        # global conversation tokenizer is deliberately excluded — it is the
+        # orchestrator's asset, saved once, not this module's.
+        assets: List[Any] = []
+        cfg = getattr(model, "config", None)
+        if cfg is not None:
+            assets.append(cfg)
+        if getattr(model, "_processor", None) is not None:
+            assets.append(model._processor)
+        if getattr(model, "_tokenizer", None) is not None:
+            assets.append(model._tokenizer)
+        self.base.model_assets = assets
 
 
 # ── OmniTrainer ────────────────────────────────────────────────────────────────
@@ -652,7 +678,7 @@ class OmniTrainer:
 
             module_trainer = OmniModuleTrainer(
                 self._module_args(weights_path, mod_cfg),
-                tokenizer=base.tokenizer,
+                conversation_tokenizer=base.tokenizer,
             )
             module_trainer.name = name  # YAML key → ``<module>/`` checkpoint subdir
             module_trainer.base.name = name  # the reused checkpoint callbacks read it off ``base``
@@ -682,9 +708,10 @@ class OmniTrainer:
     # ── Build: assets ───────────────────────────────────────────────────────────
 
     def _build_model_assets(self):
-        # Nothing to build here — the tokenizer and per-module set_tokenizer /
-        # processor wiring already happened in :meth:`_build_model`.  Just
-        # expose the assets that BaseTrainer callbacks read.
+        # Nothing to build here — the global conversation tokenizer wiring
+        # (set_conversation_tokenizer) and per-module own-asset loading already
+        # happened in :meth:`_build_model`.  Just expose the global assets that
+        # BaseTrainer callbacks read.
         self.base.model_assets = [self.omni_config, self.base.tokenizer]
 
     # ── Build: collator ─────────────────────────────────────────────────────────

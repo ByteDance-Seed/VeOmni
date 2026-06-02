@@ -165,10 +165,19 @@ class OmniModule:
     # ``self._processor`` so the module's ``generate`` can tensorise its
     # own inputs — no external wiring step required.
     #
-    # Leave as ``None`` (default) for modules that only consume already-
+    # Likewise, a module that owns its **own** tokenizer (e.g. a T5 text
+    # encoder driving a DiT video generator) declares ``tokenizer_class`` and
+    # gets it on ``self._tokenizer``.  This is the module's *own* vocabulary —
+    # an asset saved with the module — and is **distinct** from the global
+    # *conversation* tokenizer wired in via :meth:`set_conversation_tokenizer`
+    # (``self._conversation_tokenizer``), which the orchestrator owns and saves
+    # once, not per module.
+    #
+    # Leave both as ``None`` (default) for modules that only consume already-
     # tokenised / already-tensorised inputs (the LLM head, the text
     # encoder, the VQ decoder).
     processor_class: Optional[Type[Any]] = None
+    tokenizer_class: Optional[Type[Any]] = None
 
     # ── Training hooks ────────────────────────────────────────────────────────
 
@@ -222,12 +231,15 @@ class OmniModule:
         """
         return self.forward(**kwargs)
 
-    def set_tokenizer(self, tokenizer: Any) -> None:
-        """Wire the global tokenizer and resolve vocabulary-specific token ids.
+    def set_conversation_tokenizer(self, conversation_tokenizer: Any) -> None:
+        """Wire the global **conversation** tokenizer and resolve token ids.
 
         Optional.  Text-side modules use this to learn special-token ids
         (boi / eoi / eos / image placeholder) at runtime instead of storing
-        them in ``config.json``.  Default: no-op.
+        them in ``config.json``, and to tokenise the conversation text.  The
+        argument is the orchestrator's shared LLM tokenizer — store it on
+        ``self._conversation_tokenizer`` (not ``self._tokenizer``, which is the
+        module's *own* tokenizer asset, if any).  Default: no-op.
         """
         return None
 
@@ -235,28 +247,44 @@ class OmniModule:
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path: Any, *args: Any, **kwargs: Any):
-        """Load weights, then auto-load the per-module processor if declared.
+        """Load weights, then auto-load the per-module processor / tokenizer if declared.
 
         Loads weights via the next-in-MRO ``from_pretrained`` (the
         concrete HF base — :class:`PreTrainedModel` or
-        :class:`ModelMixin`).  When :attr:`processor_class` is set, also
-        loads the processor from the same path and stashes it on
-        ``model._processor`` so the module's :meth:`generate` can
-        tensorise its own inputs — there's no external wiring step.
+        :class:`ModelMixin`).  When :attr:`processor_class` / :attr:`tokenizer_class`
+        is set, also loads that asset from the same path and stashes it on
+        ``model._processor`` / ``model._tokenizer`` so the module's
+        :meth:`generate` can tensorise its own inputs — there's no external
+        wiring step.
 
-        A missing / unreadable processor folder is a silent no-op; the
-        module's ``generate`` is responsible for raising a clear error if
-        it actually needs the processor at call time.  This keeps stripped
-        training checkpoints (no preprocessor JSON shipped) loadable.
+        The assets are loaded via the registry-aware ``build_processor`` /
+        ``build_tokenizer`` — the *same* loaders the training path
+        (``OmniModuleTrainer._build_model_assets``) uses — so the inference and
+        training paths produce identical processor / tokenizer objects.
+
+        A missing / unreadable asset folder is a silent no-op; the module's
+        ``generate`` is responsible for raising a clear error if it actually
+        needs the asset at call time.  This keeps stripped training checkpoints
+        (no preprocessor / tokenizer JSON shipped) loadable.
         """
+        # Lazy import to avoid an import cycle (``veomni.models.auto`` pulls in
+        # the loader / ops stack at import time, while this module is imported
+        # while that stack is still initialising).
+        from ..auto import build_processor, build_tokenizer
+
         model = super().from_pretrained(pretrained_model_name_or_path, *args, **kwargs)
         if cls.processor_class is not None:
             try:
-                model._processor = cls.processor_class.from_pretrained(pretrained_model_name_or_path)
+                model._processor = build_processor(pretrained_model_name_or_path)
             except Exception:
                 # Best-effort: defer the "missing processor" error to ``generate``
                 # where the message can reference the actual call site.
                 model._processor = None
+        if cls.tokenizer_class is not None:
+            try:
+                model._tokenizer = build_tokenizer(pretrained_model_name_or_path)
+            except Exception:
+                model._tokenizer = None
         return model
 
     def finalize(self, *, ctx: Dict[str, Any], request: Dict[str, Any]) -> Dict[str, Any]:
