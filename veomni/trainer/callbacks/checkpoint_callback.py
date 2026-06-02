@@ -13,7 +13,7 @@
 # limitations under the License.
 
 import os
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Dict, Optional
 
 import torch
 import torch.distributed as dist
@@ -60,10 +60,63 @@ class CheckpointerCallback(Callback):
     def on_train_begin(self, state: TrainerState, **kwargs) -> None:
         self._load_checkpoint()
 
+    # ── Overridable seams ──────────────────────────────────────────────────────
+    # Subclasses (e.g. the per-OmniModule callbacks) override these to retarget
+    # the on-disk location and slim the non-model payload, while reusing the DCP
+    # save / load / HF / LoRA machinery below.  Defaults reproduce the original
+    # single-model behaviour verbatim, so every existing trainer is unaffected.
+
+    def _save_dir(self, state: TrainerState) -> str:
+        """Directory the DCP (and HF weights) are written to for this step."""
+        return os.path.join(self.trainer.args.train.checkpoint.save_path, f"global_step_{state.global_step}")
+
+    def _load_dir(self) -> Optional[str]:
+        """Directory to resume the DCP from (``None`` → no resume)."""
+        return self.trainer.args.train.checkpoint.load_path
+
+    def _output_dir(self, state: TrainerState) -> str:
+        """Output directory for HF / LoRA exports for this step."""
+        return os.path.join(self.trainer.args.train.checkpoint.output_dir, f"global_step_{state.global_step}")
+
+    def _extra_state(self, state: TrainerState) -> Dict[str, Any]:
+        """Non-``model``/``optimizer`` payload to persist alongside the DCP.
+
+        The default bundles per-model (``lr_scheduler``) **and** global (step /
+        dataloader / environ-meter / rng) state.  Per-module subclasses override
+        this to keep only the per-model bits; the global bits are saved once by
+        the orchestrator.
+        """
+        return {
+            "global_step": state.global_step,
+            "lr_scheduler": self.trainer.lr_scheduler.state_dict(),
+            "train_dataloader": self.trainer.train_dataloader.state_dict()
+            if self.trainer.train_dataloader is not None
+            else {},
+            "environ_meter": self.trainer.environ_meter.state_dict(),
+            "torch_rng_state": torch.get_rng_state(),
+        }
+
+    def _load_extra_state(self, extra_state: Dict[str, Any]) -> None:
+        """Restore the payload produced by :meth:`_extra_state` (inverse op)."""
+        args: "VeOmniArguments" = self.trainer.args
+        self.trainer.state.global_step = extra_state["global_step"]
+        self.trainer.start_epoch = self.trainer.state.global_step // args.train_steps
+        self.trainer.start_step = self.trainer.state.global_step % args.train_steps
+        self.trainer.lr_scheduler.load_state_dict(extra_state["lr_scheduler"])
+        # dataloader may only init on sp_rank_0 to save memory
+        if self.trainer.train_dataloader is not None and extra_state.get("train_dataloader", None) is not None:
+            self.trainer.train_dataloader.load_state_dict(extra_state["train_dataloader"])
+        self.trainer.environ_meter.load_state_dict(extra_state["environ_meter"])
+        torch.set_rng_state(extra_state["torch_rng_state"])
+        if self.trainer.start_step == 0:
+            # If resume at the end of epoch, clear resume state and prefetch data
+            iter(self.trainer.train_dataloader)
+
     def _load_checkpoint(self):
         """Load checkpoint from path."""
         args: "VeOmniArguments" = self.trainer.args
-        if args.train.checkpoint.load_path is None:
+        load_dir = self._load_dir()
+        if load_dir is None:
             return
 
         state = {
@@ -75,51 +128,26 @@ class CheckpointerCallback(Callback):
         self.trainer.checkpointer.wait_for_pending_save()
 
         self.trainer.checkpointer.load(
-            args.train.checkpoint.load_path,
+            load_dir,
             state,
             trainable_only=bool(getattr(args.model, "lora_config", None)),
         )
 
-        self.trainer.state.global_step = state["extra_state"]["global_step"]
-        self.trainer.start_epoch = self.trainer.state.global_step // args.train_steps
-        self.trainer.start_step = self.trainer.state.global_step % args.train_steps
-
-        self.trainer.lr_scheduler.load_state_dict(state["extra_state"]["lr_scheduler"])
-
-        # dataloader may only init on sp_rank_0 to save memory
-        if (
-            self.trainer.train_dataloader is not None
-            and state["extra_state"].get("train_dataloader", None) is not None
-        ):
-            self.trainer.train_dataloader.load_state_dict(state["extra_state"]["train_dataloader"])
-
-        self.trainer.environ_meter.load_state_dict(state["extra_state"]["environ_meter"])
-        torch.set_rng_state(state["extra_state"]["torch_rng_state"])
-        if self.trainer.start_step == 0:
-            # If resume at the end of epoch, clear resume state and prefetch data
-            iter(self.trainer.train_dataloader)
+        self._load_extra_state(state["extra_state"])
 
         dist.barrier()
-        logger.info_rank0(f"Load distributed checkpoint from {args.train.checkpoint.load_path} successfully!")
+        logger.info_rank0(f"Load distributed checkpoint from {load_dir} successfully!")
 
     def _save_checkpoint(self, state: TrainerState):
         """Save distributed checkpoint and optimizer state at each save_steps."""
         args: "VeOmniArguments" = self.trainer.args
 
-        save_checkpoint_path = os.path.join(args.train.checkpoint.save_path, f"global_step_{state.global_step}")
+        save_checkpoint_path = self._save_dir(state)
 
         ckpt_state = {
             "model": self.trainer.model,
             "optimizer": self.trainer.optimizer,
-            "extra_state": {
-                "global_step": state.global_step,
-                "lr_scheduler": self.trainer.lr_scheduler.state_dict(),
-                "train_dataloader": self.trainer.train_dataloader.state_dict()
-                if self.trainer.train_dataloader is not None
-                else {},
-                "environ_meter": self.trainer.environ_meter.state_dict(),
-                "torch_rng_state": torch.get_rng_state(),
-            },
+            "extra_state": self._extra_state(state),
         }
 
         # Free the training step's residual activations / autograd buffers
@@ -181,16 +209,20 @@ class HuggingfaceCkptCallback(CheckpointerCallback):
     def on_train_begin(self, state: TrainerState, **kwargs) -> None:
         self._save_model_assets()
 
+    def _model_assets_dir(self) -> str:
+        """Directory the model assets (config / processor / tokenizer) are written to."""
+        return self.trainer.args.train.checkpoint.model_assets_dir
+
     def _save_model_assets(self):
         args: "VeOmniArguments" = self.trainer.args
         if args.train.global_rank == 0:
-            save_model_assets(args.train.checkpoint.model_assets_dir, self.trainer.model_assets)
+            save_model_assets(self._model_assets_dir(), self.trainer.model_assets)
         dist.barrier()
 
     def _save_checkpoint(self, state: TrainerState, stage: str = "step_end"):
         """Save model in HuggingFace format."""
         args: "VeOmniArguments" = self.trainer.args
-        save_checkpoint_path = os.path.join(args.train.checkpoint.save_path, f"global_step_{state.global_step}")
+        save_checkpoint_path = self._save_dir(state)
         if not os.path.exists(save_checkpoint_path):
             dist.barrier()
             super()._save_checkpoint(state)
@@ -225,8 +257,7 @@ class HFLoraCkptCallback(HuggingfaceCkptCallback):
 
     def _save_checkpoint(self, state: TrainerState, stage: str = "step_end"):
         """Save LoRA checkpoint in HuggingFace format at train end."""
-        args: "VeOmniArguments" = self.trainer.args
-        save_checkpoint_path = os.path.join(args.train.checkpoint.save_path, f"global_step_{state.global_step}")
+        save_checkpoint_path = self._save_dir(state)
         if not os.path.exists(save_checkpoint_path):
             dist.barrier()
             CheckpointerCallback._save_checkpoint(self, state)
@@ -237,7 +268,7 @@ class HFLoraCkptCallback(HuggingfaceCkptCallback):
             self.trainer.optimizer = None
             self.trainer.lr_scheduler = None
 
-        lora_save_path = os.path.join(args.train.checkpoint.output_dir, f"global_step_{state.global_step}")
+        lora_save_path = self._output_dir(state)
         save_lora_adapter_with_dcp(
             model=self.trainer.model,
             save_path=lora_save_path,

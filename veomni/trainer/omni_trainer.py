@@ -17,18 +17,19 @@
 Unlike single-model trainers (BaseTrainer / VLMTrainer), OmniModel is a
 *composition* of several independent OmniModule sub-models (Janus: siglip /
 vqvae / text_encoder / llama).  Each sub-model is backed by its **own**
-:class:`OmniModuleTrainer` — a thin :class:`BaseTrainer` subclass that reuses
-the base per-model build helpers (``_build_model`` / ``_setup_lora`` /
+:class:`OmniModuleTrainer` — which (by composition over a bare ``BaseTrainer``)
+reuses the base per-model build helpers (``_build_model`` / ``_setup_lora`` /
 ``_build_parallelized_model`` / ``_build_optimizer`` / ``_build_lr_scheduler``)
-to give that module its own FSDP2 unit, optimizer, lr-scheduler and on-disk
-snapshot.
+to give that module its own FSDP2 unit, optimizer, lr-scheduler, **checkpoint
+callback** and on-disk snapshot.
 
 :class:`OmniTrainer` then **strings the module-trainers together**: it owns the
-*global* concerns once (distributed ``_setup``, the shared data pipeline,
-callbacks/metering, the train loop) and drives the graph — composing the
-sub-models into one ``OmniModel``, running the DAG forward, a single
-``loss.backward()`` (the autograd graph connects every FSDP2 unit), the
-per-module optimizer step, and per-module checkpoint save/resume.
+*global* concerns once (distributed ``_setup``, the shared data pipeline, trace
+metering, the train loop) and drives the graph — composing the sub-models into
+one ``OmniModel``, running the DAG forward, a single ``loss.backward()`` (the
+autograd graph connects every FSDP2 unit), and the per-module optimizer step.
+Its ``on_{train,epoch,step}_*`` cascade into every module-trainer so each runs
+its own checkpoint save/resume.
 
 Why one trainer per module (vs. one wrapper over ``OmniModel``)?
 
@@ -45,12 +46,15 @@ Division of labour
 ------------------
 * :class:`OmniModuleTrainer` (per module): ``_build_model`` →
   ``_freeze_model_module`` → ``_build_parallelized_model`` (FSDP2 wrap + weight
-  load), then ``_build_optimizer`` / ``_build_lr_scheduler`` (driven later by
-  the orchestrator once ``args.train_steps`` is known).
-* :class:`OmniTrainer` (orchestrator): global ``_setup`` + data pipeline +
+  load) → ``_init_callbacks`` (its own per-module DCP callback), then
+  ``_build_optimizer`` / ``_build_lr_scheduler`` (called by the orchestrator
+  once ``args.train_steps`` is known).  Saves / resumes itself when the
+  orchestrator cascades ``on_*`` into it.
+* :class:`OmniTrainer` (orchestrator): global ``_setup`` + data pipeline + trace
   callbacks + train loop; builds the module-trainers, composes ``OmniModel``,
   aggregates their optimizers / schedulers behind ``MultiOptimizer`` /
-  ``MultiLRScheduler``, and owns the graph forward/backward + per-module DCP.
+  ``MultiLRScheduler``, owns the graph forward/backward + the global optimizer
+  step, and cascades the callback lifecycle into each module-trainer.
 """
 
 import copy
@@ -72,7 +76,7 @@ from ..utils import helper, logging
 from ..utils.device import synchronize
 from ..utils.model_utils import pretty_print_trainable_parameters
 from .base import BaseTrainer
-from .callbacks import Callback
+from .callbacks import Callback, CheckpointerCallback, HFLoraCkptCallback, HuggingfaceCkptCallback, TrainerState
 
 
 if TYPE_CHECKING:
@@ -163,9 +167,9 @@ class MultiOptimizer:
 
     Exposes the minimal :class:`torch.optim.Optimizer` surface the metering /
     logging callbacks read (``param_groups``) and the train loop drives
-    (``step`` / ``zero_grad``).  Checkpointing is per-module (handled by
-    :class:`OmniPerModuleCheckpointCallback` against the real per-module
-    optimizers), so no ``state_dict`` is needed here.
+    (``step`` / ``zero_grad``).  Checkpointing is per-module (handled by each
+    module-trainer's :class:`OmniModuleCheckpointCallback` against the real
+    per-module optimizer), so no ``state_dict`` is needed here.
     """
 
     def __init__(self, optimizers: Dict[str, torch.optim.Optimizer]):
@@ -212,29 +216,87 @@ class MultiLRScheduler:
                 sched.load_state_dict(state[name])
 
 
-# ── Per-module checkpoint callback ──────────────────────────────────────────────
+# ── Per-module checkpoint callbacks (reuse the single-model callbacks) ──────────
+#
+# Rather than re-implement DCP / HF / LoRA save-load, each OmniModule reuses the
+# shared ``CheckpointerCallback`` / ``HuggingfaceCkptCallback`` / ``HFLoraCkptCallback``
+# bound to its own ``module_trainer.base``.  The only per-module differences are
+# captured by the overridable seams those classes expose:
+#
+#   * directory  → ``…/global_step_{N}/<module>/`` (DCP + HF) and the LoRA export,
+#   * extra_state → **per-model only** (``lr_scheduler``); the global resume state
+#     (step / dataloader / environ-meter / rng) is owned once by the orchestrator
+#     (:class:`OmniGlobalStateCallback`).
+#
+# On-disk layout::
+#
+#     <save_path>/global_step_{N}/
+#     ├── <module_a>/        # DCP {model, optimizer, extra_state={lr_scheduler}} (+ hf_ckpt/)
+#     ├── <module_b>/        # …
+#     └── trainer_state.pt   # global: step / dataloader / environ-meter / rng
 
 
-class OmniPerModuleCheckpointCallback(Callback):
-    """Save / resume **each FSDP2 module independently**.
+class _OmniModulePayloadMixin:
+    """Retarget a single-model checkpoint callback at one OmniModule sub-tree.
 
-    On-disk layout::
+    Mixed in **before** the concrete base callback so these overrides win.
+    ``self.trainer`` is the module-trainer's ``base`` (a bare ``BaseTrainer``)
+    whose ``name`` is the module's YAML key.
+    """
 
-        <save_path>/global_step_{N}/
-        ├── <module_a>/        # DCP: {model, optimizer, extra_state}
-        ├── <module_b>/        # DCP: {model}            (frozen → no optimizer)
-        └── trainer_state.pt   # global: step / lr_scheds / dataloader / rng
+    def _module_subdir(self, root: str, state: "TrainerState") -> str:
+        return os.path.join(root, f"global_step_{state.global_step}", self.trainer.name)
 
-    Each ``<module>/`` is a self-contained DCP produced by the shared
-    :class:`DistributedCheckpointer` over that single child + its optimizer,
-    so modules can be resharded / resumed in isolation.
+    def _save_dir(self, state: "TrainerState") -> str:
+        return self._module_subdir(self.trainer.args.train.checkpoint.save_path, state)
+
+    def _output_dir(self, state: "TrainerState") -> str:
+        return self._module_subdir(self.trainer.args.train.checkpoint.output_dir, state)
+
+    def _load_dir(self) -> Optional[str]:
+        load_path = self.trainer.args.train.checkpoint.load_path
+        return None if load_path is None else os.path.join(load_path, self.trainer.name)
+
+    def _model_assets_dir(self) -> str:
+        return os.path.join(self.trainer.args.train.checkpoint.model_assets_dir, self.trainer.name)
+
+    def _extra_state(self, state: "TrainerState") -> Dict[str, Any]:
+        # Per-model only — the global step / dataloader / environ-meter / rng are
+        # saved once by OmniGlobalStateCallback on the orchestrator.
+        return {"lr_scheduler": self.trainer.lr_scheduler.state_dict()}
+
+    def _load_extra_state(self, extra_state: Dict[str, Any]) -> None:
+        lr_sd = extra_state.get("lr_scheduler")
+        if lr_sd is not None:
+            self.trainer.lr_scheduler.load_state_dict(lr_sd)
+
+
+class OmniModuleDcpCallback(_OmniModulePayloadMixin, CheckpointerCallback):
+    """Per-module DCP resume checkpoint (model + optimizer + lr_scheduler)."""
+
+
+class OmniModuleHfCallback(_OmniModulePayloadMixin, HuggingfaceCkptCallback):
+    """Per-module HuggingFace safetensors export."""
+
+
+class OmniModuleLoraCallback(_OmniModulePayloadMixin, HFLoraCkptCallback):
+    """Per-module LoRA-adapter export."""
+
+
+# ── Orchestrator's global resume state ──────────────────────────────────────────
+
+
+class OmniGlobalStateCallback(Callback):
+    """Save / resume the **module-agnostic** global state, once, on the orchestrator.
+
+    Holds exactly what is *not* per-model: ``global_step`` + dataloader position
+    + environ-meter + the single torch RNG.  Written to
+    ``<save_path>/global_step_{N}/trainer_state.pt`` on rank-0 and read back at
+    ``on_train_begin`` (the per-module callbacks restore their own weights /
+    optimizer / lr_scheduler from their ``<module>/`` DCPs).
     """
 
     def __init__(self, trainer: "OmniTrainer") -> None:
-        # ``trainer`` is the ``OmniTrainer`` wrapper: base-declared state lives
-        # on ``trainer.base`` (model / optimizer / checkpointer / state / ...),
-        # while the omni bookkeeping (``module_names`` / ``optimizers``) lives
-        # directly on ``trainer``.
         super().__init__(trainer)
         args = trainer.base.args
         self.every_n_steps = args.train.checkpoint.save_steps
@@ -253,70 +315,48 @@ class OmniPerModuleCheckpointCallback(Callback):
     def on_train_begin(self, state, **kwargs) -> None:
         self._load()
 
+    def _state_path(self, root: str, global_step: int) -> str:
+        return os.path.join(root, f"global_step_{global_step}", "trainer_state.pt")
+
     def _save(self, global_step: int) -> None:
-        trainer: "OmniTrainer" = self.trainer
-        base = trainer.base
+        base = self.trainer.base
         args = base.args
-        save_dir = os.path.join(args.train.checkpoint.save_path, f"global_step_{global_step}")
-        base.checkpointer.wait_for_pending_save()
-        helper.empty_cache()
-
-        for name in trainer.module_names:
-            child = base.model.get_module(name)
-            module_state: Dict[str, Any] = {"model": child, "extra_state": {}}
-            if name in trainer.optimizers:
-                module_state["optimizer"] = trainer.optimizers[name]
-            base.checkpointer.save(os.path.join(save_dir, name), module_state, save_async=False)
-
         if args.train.global_rank == 0:
             torch.save(
                 {
                     "global_step": global_step,
-                    "lr_scheduler": base.lr_scheduler.state_dict(),
                     "train_dataloader": base.train_dataloader.state_dict()
                     if base.train_dataloader is not None
                     else {},
+                    "environ_meter": base.environ_meter.state_dict(),
                     "torch_rng_state": torch.get_rng_state(),
                 },
-                os.path.join(save_dir, "trainer_state.pt"),
+                self._state_path(args.train.checkpoint.save_path, global_step),
             )
-
-        helper.empty_cache()
         if dist.is_initialized():
             dist.barrier()
         self._last_saved_step = global_step
-        logger.info_rank0(f"OmniTrainer: per-module checkpoint saved at {save_dir}")
 
     def _load(self) -> None:
-        trainer: "OmniTrainer" = self.trainer
-        base = trainer.base
+        base = self.trainer.base
         args = base.args
         load_path = args.train.checkpoint.load_path
         if load_path is None:
             return
-
-        base.checkpointer.wait_for_pending_save()
-        for name in trainer.module_names:
-            child = base.model.get_module(name)
-            module_state: Dict[str, Any] = {"model": child, "extra_state": {}}
-            if name in trainer.optimizers:
-                module_state["optimizer"] = trainer.optimizers[name]
-            base.checkpointer.load(os.path.join(load_path, name), module_state)
-
         trainer_state_path = os.path.join(load_path, "trainer_state.pt")
-        if os.path.exists(trainer_state_path):
-            ts = torch.load(trainer_state_path, map_location="cpu", weights_only=False)
-            base.state.global_step = ts["global_step"]
-            base.start_epoch = base.state.global_step // args.train_steps
-            base.start_step = base.state.global_step % args.train_steps
-            base.lr_scheduler.load_state_dict(ts["lr_scheduler"])
-            if base.train_dataloader is not None and ts.get("train_dataloader"):
-                base.train_dataloader.load_state_dict(ts["train_dataloader"])
-            torch.set_rng_state(ts["torch_rng_state"])
-
-        if dist.is_initialized():
-            dist.barrier()
-        logger.info_rank0(f"OmniTrainer: resumed per-module checkpoint from {load_path}")
+        if not os.path.exists(trainer_state_path):
+            return
+        ts = torch.load(trainer_state_path, map_location="cpu", weights_only=False)
+        base.state.global_step = ts["global_step"]
+        base.start_epoch = base.state.global_step // args.train_steps
+        base.start_step = base.state.global_step % args.train_steps
+        if base.train_dataloader is not None and ts.get("train_dataloader"):
+            base.train_dataloader.load_state_dict(ts["train_dataloader"])
+        if ts.get("environ_meter") is not None:
+            base.environ_meter.load_state_dict(ts["environ_meter"])
+        torch.set_rng_state(ts["torch_rng_state"])
+        if base.start_step == 0 and base.train_dataloader is not None:
+            iter(base.train_dataloader)
 
 
 # ── Per-module trainer ──────────────────────────────────────────────────────────
@@ -339,14 +379,19 @@ class OmniModuleTrainer:
       its codec; most modules don't define it and train in full).
     * ``base._build_parallelized_model`` — wrap in its own FSDP2 unit + load the
       module's on-disk weights.
-    * ``base._build_optimizer`` / ``base._build_lr_scheduler`` — one each, over
-      this module's still-trainable params (driven later by the orchestrator).
+    * :meth:`_build_optimizer` / :meth:`_build_lr_scheduler` — one each, over this
+      module's still-trainable params.  These wrap ``base._build_*`` so the
+      *build* lives on the module-trainer; the orchestrator only *calls* them
+      (after the shared dataset has fixed ``args.train_steps``).
+    * :meth:`_init_callbacks` — builds this module's **own** checkpoint callback
+      (:class:`OmniModuleCheckpointCallback`, per-module DCP); trace / metering
+      callbacks belong to the orchestrator, never here.
 
-    The *global* concerns (distributed ``_setup``, data pipeline, callbacks, the
-    train loop) are **never** run here — they are owned once by
-    :class:`OmniTrainer`.  Construction runs only the per-model build subset; the
-    optimizer / lr-scheduler are built later by the orchestrator (after the
-    shared dataset fixes ``base.args.train_steps``).
+    The *global* concerns (distributed ``_setup``, data pipeline, trace
+    metering, the train loop) are **never** run here — they are owned once by
+    :class:`OmniTrainer`.  The orchestrator's ``on_{train,epoch,step}_*`` cascade
+    into this trainer's matching :meth:`on_step_end` & co. so each module
+    checkpoints itself.
 
     ``args`` is a per-module copy of the global arguments whose
     ``model.{config_path,model_path}`` point at this module's split-checkpoint
@@ -357,6 +402,9 @@ class OmniModuleTrainer:
     """
 
     base: BaseTrainer
+    # On-disk name (the module's YAML key), assigned by the orchestrator right
+    # after construction; used for the ``<module>/`` checkpoint subdir.
+    name: Optional[str]
 
     def __init__(
         self,
@@ -368,6 +416,11 @@ class OmniModuleTrainer:
         # its per-model build helpers, in order.
         self.base = BaseTrainer.__new__(BaseTrainer)
         self.base.args = args
+        # On-disk name (module YAML key) is assigned by the orchestrator right
+        # after construction; the checkpoint callbacks read it (off ``base``) at
+        # save time, so ``None`` here is fine.
+        self.name = None
+        self.base.name = None
 
         self.base._build_model()  # meta-init the sub-model from its config.json
         if tokenizer is not None and hasattr(self.base.model, "set_tokenizer"):
@@ -382,9 +435,81 @@ class OmniModuleTrainer:
         # above survives the wrap — no need to re-assert it here.
         self.base._build_parallelized_model()  # FSDP2 wrap + per-module weight load
 
-        # Optimizer / lr-scheduler (``base.optimizer`` / ``base.lr_scheduler``)
-        # are built by the orchestrator once the shared dataset has fixed
-        # ``base.args.train_steps`` (see OmniTrainer._build_optimizer / _lr_scheduler).
+        # Make ``base`` look enough like a single-model trainer for the reused
+        # checkpoint callbacks: the dataloader is global (owned by the
+        # orchestrator, never here) and the HF/asset export needs this module's
+        # config / processor / tokenizer.
+        self.base.train_dataloader = None
+        self.base.model_assets = self._collect_model_assets(tokenizer)
+
+        # This module's own checkpoint callbacks (DCP resume + HF/LoRA export),
+        # reusing the shared single-model callbacks.  Optimizer / lr-scheduler
+        # are built later via :meth:`_build_optimizer` / :meth:`_build_lr_scheduler`
+        # (the orchestrator calls them once ``args.train_steps`` is known).
+        self._init_callbacks()
+
+    def _collect_model_assets(self, tokenizer: Any) -> List[Any]:
+        """This module's savable assets (config + processor + tokenizer, if any)."""
+        assets: List[Any] = []
+        cfg = getattr(self.base.model, "config", None)
+        if cfg is not None:
+            assets.append(cfg)
+        processor = getattr(self.base.model, "_processor", None)
+        if processor is not None:
+            assets.append(processor)
+        if tokenizer is not None:
+            assets.append(tokenizer)
+        return assets
+
+    # ── Optimizer / lr-scheduler (built here; the orchestrator only calls) ─────
+
+    def _build_optimizer(self):
+        """Build this module's optimizer over its still-trainable params."""
+        self.base._build_optimizer()
+
+    def _build_lr_scheduler(self):
+        """Build this module's lr-scheduler (needs ``base.args.train_steps`` set)."""
+        self.base._build_lr_scheduler()
+
+    # ── Callbacks (checkpoint only; trace lives on the orchestrator) ───────────
+
+    def _init_callbacks(self):
+        """Build this module's DCP resume + HF/LoRA export callbacks.
+
+        Mirrors :meth:`BaseTrainer._init_callbacks` (the DCP + HF/LoRA half),
+        bound to ``self.base`` so the shared callbacks save / load **this**
+        module's weights to its ``<module>/`` subdir.
+        """
+        base = self.base
+        self.checkpointer_callback = OmniModuleDcpCallback(base)
+        if base.args.model.lora_config:
+            self.hf_ckpt_callback = OmniModuleLoraCallback(base)
+        else:
+            self.hf_ckpt_callback = OmniModuleHfCallback(base)
+
+    def on_train_begin(self, state):
+        self.checkpointer_callback.on_train_begin(state)
+        self.hf_ckpt_callback.on_train_begin(state)
+
+    def on_train_end(self, state):
+        self.checkpointer_callback.on_train_end(state)
+        self.hf_ckpt_callback.on_train_end(state)
+
+    def on_epoch_begin(self, state):
+        self.checkpointer_callback.on_epoch_begin(state)
+        self.hf_ckpt_callback.on_epoch_begin(state)
+
+    def on_epoch_end(self, state):
+        self.checkpointer_callback.on_epoch_end(state)
+        self.hf_ckpt_callback.on_epoch_end(state)
+
+    def on_step_begin(self, state, **kwargs):
+        self.checkpointer_callback.on_step_begin(state, **kwargs)
+        self.hf_ckpt_callback.on_step_begin(state, **kwargs)
+
+    def on_step_end(self, state, **kwargs):
+        self.checkpointer_callback.on_step_end(state, **kwargs)
+        self.hf_ckpt_callback.on_step_end(state, **kwargs)
 
     def _freeze_model_module(self):
         """Let the module freeze itself (its policy), then run the base report (+ lora)."""
@@ -435,13 +560,14 @@ class OmniTrainer:
     / ``self.base.lr_scheduler``).
 
     Canonical ``BaseTrainer`` state (``model`` / ``optimizer`` / ``lr_scheduler``
-    / ``state`` / ``checkpointer`` / dataloaders / callbacks) lives on
-    ``self.base``.  Omni-specific bookkeeping that is **not** part of
-    ``BaseTrainer``'s interface (``omni_config`` / ``module_names`` /
-    ``module_trainers`` / per-module ``optimizers`` / ``lr_schedulers``) lives
-    directly on ``self``.  The per-module checkpoint
-    callback therefore binds to the ``OmniTrainer`` wrapper and reads base state
-    via ``trainer.base``.
+    / ``state`` / dataloaders / **trace** callbacks) lives on ``self.base``.
+    Omni-specific bookkeeping that is **not** part of ``BaseTrainer``'s interface
+    (``omni_config`` / ``module_names`` / ``module_trainers`` / per-module
+    ``optimizers`` / ``lr_schedulers``) lives directly on ``self``.
+
+    Checkpointing is **not** owned here: each :class:`OmniModuleTrainer` builds
+    its own :class:`OmniModuleCheckpointCallback` and the orchestrator's ``on_*``
+    cascade drives them; the orchestrator keeps only trace / metering callbacks.
     """
 
     # Composition: the underlying single-model trainer. Holds all
@@ -528,6 +654,8 @@ class OmniTrainer:
                 self._module_args(weights_path, mod_cfg),
                 tokenizer=base.tokenizer,
             )
+            module_trainer.name = name  # YAML key → ``<module>/`` checkpoint subdir
+            module_trainer.base.name = name  # the reused checkpoint callbacks read it off ``base``
             self.module_trainers[name] = module_trainer
             modules[name] = module_trainer.base.model
             logger.info_rank0(f"OmniTrainer: built module-trainer '{name}' from {weights_path}")
@@ -572,51 +700,57 @@ class OmniTrainer:
     # ── Build: per-module optimizers + schedulers (drive the module-trainers) ──
 
     def _build_optimizer(self):
-        """Drive each module-trainer's ``_build_optimizer`` + aggregate.
+        """Call each module-trainer's :meth:`OmniModuleTrainer._build_optimizer` + aggregate.
 
-        Reuses ``BaseTrainer._build_optimizer`` per module; ``build_optimizer``
-        only ever puts ``requires_grad`` params into the optimizer, so a
-        partially-frozen module just trains its remaining params and a
-        fully-frozen one yields a harmless empty optimizer (``step()`` is a
-        no-op) — no per-module freeze bookkeeping needed.  Aggregated behind
-        :class:`MultiOptimizer` so the metering callbacks and train loop see
-        the canonical ``base.optimizer`` surface.
+        The build lives on the module-trainer; here we only invoke it and
+        collect the result.  ``build_optimizer`` only ever puts ``requires_grad``
+        params into the optimizer, so a partially-frozen module just trains its
+        remaining params and a fully-frozen one yields a harmless empty optimizer
+        (``step()`` is a no-op) — no per-module freeze bookkeeping needed.
+        Aggregated behind :class:`MultiOptimizer` so the metering callbacks and
+        train loop see the canonical ``base.optimizer`` surface.
         """
         base = self.base
         self.optimizers: Dict[str, torch.optim.Optimizer] = {}
         for name, module_trainer in self.module_trainers.items():
-            module_trainer.base._build_optimizer()
+            module_trainer._build_optimizer()
             self.optimizers[name] = module_trainer.base.optimizer
         base.optimizer = MultiOptimizer(self.optimizers)
         logger.info_rank0(f"OmniTrainer: built {len(self.optimizers)} optimizer(s): {list(self.optimizers)}.")
 
     def _build_lr_scheduler(self):
-        """Drive each module-trainer's ``_build_lr_scheduler`` + aggregate.
+        """Call each module-trainer's :meth:`OmniModuleTrainer._build_lr_scheduler` + aggregate.
 
-        ``BaseTrainer._build_lr_scheduler`` reads ``args.train_steps`` (fixed by
-        the shared dataset); propagate the global value into each module-trainer's
-        private args copy before reusing it.
+        Module-trainer schedulers read ``args.train_steps`` (fixed by the shared
+        dataset); propagate the global value into each module-trainer's private
+        args copy before invoking the build.
         """
         base = self.base
         self.lr_schedulers: Dict[str, Any] = {}
         for name, module_trainer in self.module_trainers.items():
             module_trainer.base.args.train_steps = base.args.train_steps
-            module_trainer.base._build_lr_scheduler()
+            module_trainer._build_lr_scheduler()
             self.lr_schedulers[name] = module_trainer.base.lr_scheduler
         base.lr_scheduler = MultiLRScheduler(self.lr_schedulers)
 
-    # ── Callbacks (reuse base metering; swap in per-module checkpoint) ─────────
+    # ── Callbacks (orchestrator owns trace; each module owns its checkpoint) ───
 
     def _init_callbacks(self):
+        """Build the orchestrator's trace callbacks + the global-state saver.
+
+        Per-model checkpointing (DCP / HF / LoRA) is **not** the orchestrator's
+        job: each :class:`OmniModuleTrainer` owns its own callbacks (built in its
+        ``__init__``), driven by the ``on_*`` cascade below.  We reuse
+        ``base._init_callbacks`` for the metering / logging / profiling stack,
+        then repurpose the single-model checkpoint slots: ``checkpointer_callback``
+        becomes the module-agnostic :class:`OmniGlobalStateCallback` (step /
+        dataloader / environ-meter / rng), and ``hf_ckpt_callback`` is a no-op
+        (per-module HF/LoRA lives on each module-trainer).
+        """
         base = self.base
         base._init_callbacks()
-        # Replace the single-model checkpoint callbacks with per-module DCP.
-        # The per-module callback binds to the ``OmniTrainer`` wrapper (``self``)
-        # so it can read omni bookkeeping (``module_names`` / ``optimizers``)
-        # directly and base state via ``trainer.base``.  ``base.on_step_end`` &
-        # co. still drive it through ``base.checkpointer_callback``.
-        base.checkpointer_callback = OmniPerModuleCheckpointCallback(self)
-        base.hf_ckpt_callback = Callback(base)  # no-op; per-module HF export is a follow-up
+        base.checkpointer_callback = OmniGlobalStateCallback(self)
+        base.hf_ckpt_callback = Callback(base)
 
     # ── Forward / backward (override single-model path) ────────────────────────
 
@@ -697,25 +831,42 @@ class OmniTrainer:
 
         self.on_step_end(loss=total_loss, loss_dict=dict(total_loss_dict), grad_norm=grad_norm)
 
-    # ── Callback delegators (forward to base callbacks bound to ``self.base``) ──
+    # ── Callback delegators (trace via base; cascade ckpt into module-trainers) ─
+    #
+    # ``base.on_*`` fires the orchestrator's trace callbacks (its checkpoint
+    # callbacks were neutralised in ``_init_callbacks``); we then cascade the
+    # same lifecycle into every module-trainer so each runs its own checkpoint
+    # callback (the global ``base.state`` is the single source of step / epoch).
 
     def on_train_begin(self):
         self.base.on_train_begin()
+        for module_trainer in self.module_trainers.values():
+            module_trainer.on_train_begin(self.base.state)
 
     def on_train_end(self):
         self.base.on_train_end()
+        for module_trainer in self.module_trainers.values():
+            module_trainer.on_train_end(self.base.state)
 
     def on_epoch_begin(self):
         self.base.on_epoch_begin()
+        for module_trainer in self.module_trainers.values():
+            module_trainer.on_epoch_begin(self.base.state)
 
     def on_epoch_end(self):
         self.base.on_epoch_end()
+        for module_trainer in self.module_trainers.values():
+            module_trainer.on_epoch_end(self.base.state)
 
     def on_step_begin(self, micro_batches=None):
         self.base.on_step_begin(micro_batches=micro_batches)
+        for module_trainer in self.module_trainers.values():
+            module_trainer.on_step_begin(self.base.state, micro_batches=micro_batches)
 
     def on_step_end(self, loss=None, loss_dict=None, grad_norm=None):
         self.base.on_step_end(loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
+        for module_trainer in self.module_trainers.values():
+            module_trainer.on_step_end(self.base.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
 
     # ── Train loop (mirrors BaseTrainer.train / VLMTrainer.train) ──────────────
 
