@@ -72,6 +72,15 @@ _TOY_INFER_FILES = {
     "und": "infer_und.yaml",
 }
 
+# ``OmniModel.generate`` appends one ``finalize:<module>`` trace line per
+# OmniModule whenever a step raises ``module_signal``.
+_FINALIZE_TRACE = [
+    "finalize:text_encoder",
+    "finalize:vision",
+    "finalize:vqvae",
+    "finalize:ar",
+]
+
 
 def _toy_config_dir() -> Path:
     return Path(__file__).resolve().parent / "toy_config"
@@ -236,14 +245,17 @@ def test_fsm_interleave_text_to_image_to_text():
 
     expected = (
         text_ar_step * 3
+        + _FINALIZE_TRACE
         + [f"transition: text_ar -> image_vq_start [module_signal({SIGNAL_START_IMAGE_GEN})]"]
         + vq_start_step * 1
         + ["transition: image_vq_start -> image_vq [default]"]
         + image_vq_step * 3
+        + _FINALIZE_TRACE
         + ["transition: image_vq -> image_vq_end [module_signal(image_complete)]"]
         + vq_end_step * 1
         + ["transition: image_vq_end -> text_ar [default]"]
         + text_ar_step * 3
+        + _FINALIZE_TRACE
         + [f"transition: text_ar -> done [module_signal({SIGNAL_TEXT_DONE})]"]
     )
     assert trace == expected, "trace mismatch:\n" + "\n".join(trace)
@@ -333,6 +345,7 @@ def test_fsm_t2i_only_starts_with_prompt_state_and_ends_after_image():
         + ["image_vq_start:emit_image_start", "image_vq_start:run_ar"]
         + ["transition: image_vq_start -> image_vq [default]"]
         + ["image_vq:run_ar", "image_vq:vae_decode"] * 2
+        + _FINALIZE_TRACE
         + ["transition: image_vq -> image_vq_end [module_signal(image_complete)]"]
         + ["image_vq_end:emit_image_end", "image_vq_end:run_ar"]
         + ["transition: image_vq_end -> done [default]"]
@@ -587,27 +600,23 @@ def test_fsm_done_state_config_knob_rejected():
 
 
 def test_finalize_hook_fires_on_done_and_collects_outputs():
-    """`OmniModule.finalize` is called once when the FSM enters `done`.
+    """`OmniModule.finalize` runs when a step raises ``module_signal``.
 
-    The print modules don't override finalize → default no-op → empty
-    `finalize` dict in the trace and no `ctx['finalize']` injected.  We
-    dynamically attach a custom finalize on one module and verify the
-    framework collects its output.
+    Modules emit artefacts via a one-shot ``generated`` payload; the framework
+    drains them into :attr:`OmniModel.generated` (not ``ctx['finalize']``).
     """
     model, _ = _build_model(token_script=[TOK_EOS], infer="interleave")
 
-    # Default behaviour: no finalize outputs.
     trace_default: list[str] = []
     ctx_default = model.generate(request={}, context={"input_ids": "<bos>"}, max_new_tokens=5, trace=trace_default)
     assert "finalize" not in ctx_default
-    assert not any(e.startswith("finalize:") for e in trace_default)
+    assert model.generated == []
 
-    # Inject a custom finalize on `text_encoder`.
     text_encoder = model.modules_dict["text_encoder"]
-    text_encoder.finalize = lambda *, ctx, request: {"decoded": "hello world", "n_tokens": 1}
+    text_encoder.finalize = lambda *, ctx: {
+        "generated": {"type": "text", "value": "hello world", "meta": {"n_tokens": 1}},
+    }
 
-    # `generate` no longer resets the FSM — the caller owns request
-    # boundaries, so re-prime before this second independent run.
     model.reset()
     trace_custom: list[str] = []
     ctx_custom = model.generate(
@@ -616,7 +625,8 @@ def test_finalize_hook_fires_on_done_and_collects_outputs():
         max_new_tokens=5,
         trace=trace_custom,
     )
-    assert ctx_custom["finalize"] == {"text_encoder": {"decoded": "hello world", "n_tokens": 1}}
+    assert "finalize" not in ctx_custom
+    assert model.generated == [{"type": "text", "value": "hello world", "meta": {"n_tokens": 1}}]
     assert "finalize:text_encoder" in trace_custom
 
 
@@ -626,31 +636,32 @@ def test_finalize_hook_rejects_non_dict_return():
 
     model, _ = _build_model(token_script=[TOK_EOS], infer="interleave")
     text_encoder = model.modules_dict["text_encoder"]
-    text_encoder.finalize = lambda *, ctx, request: "not a dict"
+    text_encoder.finalize = lambda *, ctx: "not a dict"
 
     with pytest.raises(TypeError, match="must return a dict"):
         model.generate(request={}, context={"input_ids": "<bos>"}, max_new_tokens=5)
 
 
-def test_finalize_hook_receives_ctx_and_request():
-    """The hook can read final ctx + the original request — accumulation is the module's job."""
+def test_finalize_hook_receives_ctx():
+    """The hook can read ``ctx`` at hand-off — accumulation is the module's job."""
     captured: list[dict[str, Any]] = []
 
     model, _ = _build_model(token_script=[TOK_EOS], infer="interleave")
     text_encoder = model.modules_dict["text_encoder"]
 
-    def _capture_finalize(*, ctx: dict[str, Any], request: dict[str, Any]) -> dict[str, Any]:
-        captured.append({"ctx_keys": sorted(ctx), "request": dict(request)})
+    def _capture_finalize(*, ctx: dict[str, Any]) -> dict[str, Any]:
+        captured.append({"ctx_keys": sorted(ctx)})
         return {}
 
     text_encoder.finalize = _capture_finalize
 
-    request = {"prompt": "describe", "max_new_tokens": 5}
-    model.generate(request=request, context={"input_ids": "<bos>"}, max_new_tokens=5)
+    model.generate(
+        request={"prompt": "describe", "max_new_tokens": 5}, context={"input_ids": "<bos>"}, max_new_tokens=5
+    )
 
     assert len(captured) == 1
-    assert captured[0]["request"] == request
     assert "input_ids" in captured[0]["ctx_keys"]
+    assert FSM_SIGNAL_KEY in captured[0]["ctx_keys"]
 
 
 # ── Visualization smoke tests ────────────────────────────────────────────────

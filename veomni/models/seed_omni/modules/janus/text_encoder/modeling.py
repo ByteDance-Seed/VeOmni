@@ -655,29 +655,37 @@ class JanusTextEncoder(TextEncoder):
 
     # ── Finalize: decode the accumulated assistant text ──────────────────────
 
-    def finalize(self, *, ctx: Dict[str, Any], request: Dict[str, Any]) -> Dict[str, Any]:
-        """Detokenize every assistant-role text token sampled in this run.
+    def finalize(self, *, ctx: Dict[str, Any]) -> Dict[str, Any]:
+        """Detokenize and flush the module-private text token cache.
 
-        The framework calls this when the FSM enters ``done`` (see
-        :meth:`OmniModel.generate`); the result lands under
-        ``ctx['finalize'][<module_name>]`` so the caller can read the
-        full reply.  When no tokenizer was wired in (e.g. minimal tests),
-        we return the raw token ids instead of decoded text so the hook
-        is still useful.
+        Flushes when this module raised ``text_done`` / ``start_image_gen``,
+        or when ``module_signal`` is absent (``max_new_tokens`` forced cleanup)
+        and tokens remain buffered.
         """
-        del request
-        conversation = ctx.get("conversation_list")
-        if not isinstance(conversation, list):
+        if not self._text_token_cache:
             return {}
+        signal = ctx.get(FSM_SIGNAL_KEY)
+        if signal is not None and signal not in (SIGNAL_TEXT_DONE, SIGNAL_START_IMAGE_GEN):
+            return {}
+        return self._flush_text_generated(ctx)
+
+    def _flush_text_generated(self, ctx: Dict[str, Any]) -> Dict[str, Any]:
+        """Decode cached token ids, clear the cache, return a ``generated`` payload."""
+        conversation = ctx.get("conversation_list")
         token_ids = list(self._text_token_cache)
-        if not token_ids:
+        self._text_token_cache.clear()
+        boundary = {t for t in (self._eos_token_id, self._boi_token_id) if t is not None}
+        while token_ids and token_ids[-1] in boundary:
+            token_ids.pop()
+        if not token_ids and isinstance(conversation, list):
             token_ids = latest_assistant_text_token_ids(conversation)
         if not token_ids:
             return {}
+        meta = {"token_ids": token_ids}
         if self._conversation_tokenizer is None:
-            return {"token_ids": token_ids}
+            return {"generated": {"type": "text", "value": "", "meta": meta}}
         text = self._conversation_tokenizer.decode(token_ids, skip_special_tokens=True)
-        return {"text": text, "token_ids": token_ids}
+        return {"generated": {"type": "text", "value": text, "meta": meta}}
 
     # ── Internal helpers ─────────────────────────────────────────────────────
 

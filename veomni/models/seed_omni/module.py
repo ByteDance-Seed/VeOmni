@@ -287,23 +287,22 @@ class OmniModule:
                 model._tokenizer = None
         return model
 
-    def finalize(self, *, ctx: Dict[str, Any], request: Dict[str, Any]) -> Dict[str, Any]:
-        """Post-generation hook called once when the FSM enters ``done``.
+    def finalize(self, *, ctx: Dict[str, Any]) -> Dict[str, Any]:
+        """Flush module-private generation buffers into a one-shot ``generated`` payload.
 
-        ``OmniModel.generate`` invokes this on every active module after the
-        FSM loop terminates, then merges any non-empty return values into
-        ``ctx['finalize'][<module_name>]``.  Use it to dump the module's
-        accumulated outputs to a usable form — e.g. tokenizer-decode
-        ``input_ids`` to text, save VQ patch sequences as images on disk,
-        write audio waveforms.
+        ``OmniModel.generate`` calls this when a step raises ``module_signal``
+        (segment hand-off) and again on every module when the ``max_new_tokens``
+        safety cap trips before ``done``.  The module inspects its own buffers
+        and ``ctx`` (e.g. ``module_signal``) to decide whether to emit, discard,
+        or no-op — the framework does not pass a separate completion flag.
 
-        The framework imposes **no accumulation scheme**: modules that need
-        per-step history (which most generative modules do — text, images,
-        audio) are responsible for appending into a running list inside
-        ``ctx`` during their ``generate_step``, then reading it back here.
+        Return ``{"generated": {"type": ..., "value": ...}}`` to append to
+        :attr:`~veomni.models.seed_omni.modeling_omni.OmniModel.generated`,
+        or ``{}`` when there is nothing to emit.  Modules must clear their
+        private caches inside this hook so artefacts do not linger across
+        later FSM spans or multi-turn turns.
 
-        Inference-only.  Default: ``{}`` (no-op — module has nothing to
-        finalize).
+        Inference-only.  Default: ``{}`` (no-op).
         """
         return {}
 

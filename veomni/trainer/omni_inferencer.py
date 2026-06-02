@@ -58,10 +58,9 @@ Lifecycle
      :meth:`OmniModel.generate`.  Raw-PIL → tensor conversion is the
      receiving module's responsibility (see :class:`JanusSiglip`).
 
-   The returned ``ctx`` carries the FSM trace and the per-module
-   ``finalize`` outputs (e.g. decoded text under
-   ``finalize['janus_text_encoder']['text']``).  Generated images live on
-   ``OmniInferencer.model.generated`` (``[{type, value}, ...]``).
+   The returned ``ctx`` carries the FSM trace.  Generated artefacts
+   (text, images, …) live on ``OmniInferencer.model.generated``
+   (``[{type, value}, ...]``).
 
 Generation kwargs distribution
 ------------------------------
@@ -374,12 +373,10 @@ class OmniInferencer:
 
         * ``conversation_list`` — the final list of parts (prompt +
           assistant-side sampled tokens).
-        * ``finalize`` — per-module dict from each :meth:`OmniModule.finalize`
-          hook (notably ``finalize['janus_text_encoder']['text']`` for the
-          decoded reply).
+        * ``trace`` — populated by :meth:`_run` after the FSM run.
 
-        Decoded images are **not** on ``ctx`` — read
-        ``self.model.generated`` (``[{"type": "image", "value": PIL}, ...]``).
+        Decoded text and images are on ``self.model.generated``
+        (``type="text"`` / ``type="image"``).
 
         For programmatic use that doesn't need on-disk artifacts (e.g. batched
         eval, RL rollouts), call :meth:`run_request` directly with a
@@ -416,8 +413,8 @@ class OmniInferencer:
 
         Writes (under ``output_dir``, created if missing):
 
-        * ``reply.txt`` — decoded assistant text from
-          ``ctx['finalize'][...]['text']`` (UTF-8; Janus is multilingual).
+        * ``reply.txt`` — decoded assistant text from ``type="text"`` entries
+          in ``self.model.generated`` (UTF-8; Janus is multilingual).
           Always written, even when the reply is empty, so the file's
           existence signals "the FSM ran to completion".  When non-empty,
           also echoed to stdout via the logger (rank-0 gated) so CLI users
@@ -443,7 +440,7 @@ class OmniInferencer:
         """
         os.makedirs(output_dir, exist_ok=True)
 
-        reply = _extract_reply(ctx)
+        reply = _extract_generated_text(self.model.generated)
         reply_path = os.path.join(output_dir, "reply.txt")
         # encoding="utf-8" is load-bearing — Janus is multilingual so reply
         # text may carry CJK / emoji.  Default-locale opens crash on `LANG=C`.
@@ -511,33 +508,19 @@ class OmniInferencer:
 # ── Module helpers ───────────────────────────────────────────────────────────
 
 
-def _extract_reply(ctx: dict[str, Any]) -> str:
-    """Pluck the decoded text from any module's ``finalize`` payload.
-
-    The FSM exposes per-module finalize outputs at ``ctx['finalize'][name]``.
-    Janus' text encoder writes the decoded reply under
-    ``ctx['finalize']['janus_text_encoder']['text']`` but other models may
-    name their module differently — so we scan every payload that's a dict
-    carrying a ``"text"`` key.  Returns ``""`` when none are found (e.g. for
-    pure T2I where the FSM never enters ``text_ar`` after the prompt).
-
-    Contract for multi-module futures: when MORE than one finalize payload
-    carries a ``"text"`` key, the FIRST one (by FSM finalize-call order,
-    which is dict-insertion order) wins and a warning is logged.  Callers
-    needing deterministic disambiguation should read ``ctx['finalize']``
-    directly with an explicit module name.
-    """
-    finalize = ctx.get("finalize") or {}
-    text_payloads = [(name, p) for name, p in finalize.items() if isinstance(p, dict) and "text" in p]
-    if len(text_payloads) > 1:
-        names = ", ".join(name for name, _ in text_payloads)
-        logger.warning_rank0(
-            f"_extract_reply: multiple modules produced text ({names}); returning "
-            f"the first ('{text_payloads[0][0]}').  Read ctx['finalize'] directly to disambiguate."
-        )
-    if text_payloads:
-        return text_payloads[0][1]["text"]
-    return ""
+def _extract_generated_text(generated: list[dict[str, Any]]) -> str:
+    """Join every ``type=\"text\"`` entry from :attr:`OmniModel.generated`."""
+    parts: list[str] = []
+    for item in generated:
+        if not isinstance(item, dict) or item.get("type") != "text":
+            continue
+        value = item.get("value")
+        if value is None:
+            continue
+        text = str(value)
+        if text:
+            parts.append(text)
+    return "\n".join(parts)
 
 
 __all__ = [

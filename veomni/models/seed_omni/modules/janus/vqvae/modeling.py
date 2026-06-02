@@ -52,6 +52,7 @@ from transformers.models.janus.modeling_janus import (
     JanusVQVAEHead,
 )
 
+from ......utils import helper
 from ....conversation import (
     TrainConversation,
     assemble_labels,
@@ -67,6 +68,8 @@ from ....module import OmniModule
 from .configuration import JanusVqvaeConfig
 from .processing import JanusVqvaeProcessor
 
+
+logger = helper.create_logger(__name__)
 
 # Default Janus-1.3B grid: 24 x 24 = 576 VQ tokens per image.
 _DEFAULT_NUM_IMAGE_TOKENS = 576
@@ -475,31 +478,56 @@ class JanusVqvae(OmniModule, PreTrainedModel):
 
         target = self._num_image_tokens()
         if len(self._gen_buffer) >= target:
-            token_ids = torch.tensor([self._gen_buffer], dtype=torch.long, device=embed.device)
-            with torch.inference_mode():
-                decoded = self.vqmodel.decode(token_ids).permute(0, 2, 3, 1)
-            self._gen_buffer.clear()
-
-            if self._processor is None:
-                raise RuntimeError(
-                    "JanusVqvae.ar_step: cannot postprocess VQVAE output — no processor was "
-                    "loaded. Ensure `preprocessor_config.json` ships next to the weights."
-                )
-            image_pil = self._processor.postprocess(decoded)[0]
-            self._collected_images.append(image_pil)
-            out["generated"] = {"type": "image", "value": image_pil}
-            out[FSM_SIGNAL_KEY] = "image_complete"
+            generated = self._emit_buffered_image(device=embed.device)
+            if generated is not None:
+                out["generated"] = generated
+                out[FSM_SIGNAL_KEY] = "image_complete"
 
         return out
+
+    def _emit_buffered_image(self, *, device: torch.device) -> Optional[Dict[str, Any]]:
+        """Decode a full VQ grid from ``_gen_buffer`` and clear it."""
+        target = self._num_image_tokens()
+        if len(self._gen_buffer) < target:
+            return None
+        token_ids = torch.tensor([self._gen_buffer[:target]], dtype=torch.long, device=device)
+        self._gen_buffer.clear()
+        with torch.inference_mode():
+            decoded = self.vqmodel.decode(token_ids).permute(0, 2, 3, 1)
+        if self._processor is None:
+            raise RuntimeError(
+                "JanusVqvae: cannot postprocess VQVAE output — no processor was "
+                "loaded. Ensure `preprocessor_config.json` ships next to the weights."
+            )
+        image_pil = self._processor.postprocess(decoded)[0]
+        self._collected_images.append(image_pil)
+        return {"type": "image", "value": image_pil}
 
     def reset_inference_state(self) -> None:
         """Wipe per-request buffers — called by :class:`OmniInferencer` between runs."""
         self._gen_buffer.clear()
         self._collected_images.clear()
 
-    def finalize(self, *, ctx: Dict[str, Any], request: Dict[str, Any]) -> Dict[str, Any]:
-        """VQ artefacts are collected on :class:`OmniModel.generated` — no-op here."""
-        del ctx, request
+    def finalize(self, *, ctx: Dict[str, Any]) -> Dict[str, Any]:
+        """Flush or discard the VQ token buffer based on its fill level.
+
+        Buffer empty → no-op (image may already have been emitted from
+        :meth:`ar_step`).  Buffer full → decode and emit.  Partial grid →
+        log a warning, discard, emit nothing.
+        """
+        del ctx
+        if not self._gen_buffer:
+            return {}
+        target = self._num_image_tokens()
+        n = len(self._gen_buffer)
+        if n >= target:
+            generated = self._emit_buffered_image(device=self.device)
+            return {"generated": generated} if generated is not None else {}
+        logger.warning_rank0(
+            f"JanusVqvae.finalize: incomplete VQ grid ({n}/{target} tokens) — "
+            "discarding partial sequence (no image emitted)."
+        )
+        self._gen_buffer.clear()
         return {}
 
     # ── Internal helpers ─────────────────────────────────────────────────────

@@ -154,10 +154,11 @@ class PrintVQVAE(_PrintBase):
 
     def decode(self, **kwargs: Any) -> dict[str, Any]:
         self._record("decode", **kwargs)
-        carrier = _carrier(kwargs)
-        hidden_states = kwargs.get("hidden_states") or carrier.get("hidden_states")
-        if hidden_states is not None:
+        if kwargs.get("labels") is not None:
             return {"_loss": _scalar_loss(0.7)}
+        hidden_states = kwargs.get("hidden_states") or _carrier(kwargs).get("hidden_states")
+        if hidden_states is None:
+            return {}
         # Inference path — emit `image_complete` on the last patch of the
         # simulated grid, then reset the counter for the next image span.
         self._decode_calls += 1
@@ -204,11 +205,16 @@ class PrintTextEmbed(_PrintBase):
 
     def decode(self, **kwargs: Any) -> dict[str, Any]:
         self._record("decode", **kwargs)
-        carrier = _carrier(kwargs)
-        hidden_states = kwargs.get("hidden_states") or carrier.get("hidden_states")
-        if kwargs.get("labels") is not None or hidden_states is not None:
+        if kwargs.get("labels") is not None:
             return {"_loss": _scalar_loss(0.3)}
-        # Inference: sample from the canned script, then emit module_signal flags.
+        # Inference AR sampling — ``run_ar`` supplies ``hidden_states`` each FSM step.
+        hidden_states = kwargs.get("hidden_states") or _carrier(kwargs).get("hidden_states")
+        if hidden_states is not None:
+            return self._decode_inference_step(kwargs, hidden_states)
+        return self._decode_inference_step(kwargs, None)
+
+    def _decode_inference_step(self, kwargs: dict[str, Any], hidden_states: Any) -> dict[str, Any]:
+        del hidden_states
         if self._cursor < len(self._token_script):
             tok = self._token_script[self._cursor]
             self._cursor += 1

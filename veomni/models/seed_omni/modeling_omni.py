@@ -61,13 +61,14 @@ Inference
   * ``fsm.maybe_transition(ctx)`` — first matching condition wins.
   * Stop when ``fsm.is_done()`` or ``max_new_tokens`` exhausts.
 
-Once the FSM reaches the built-in ``done`` state (auto-injected by
-``GenerationGraph`` — never declared in YAML), ``generate`` calls
-:meth:`OmniModule.finalize` on every active module and merges any non-empty
-return values into ``ctx['finalize'][<module_name>]``.  Multi-modal
-artefacts emitted during the run are drained from one-shot
-``ctx['generated'] = {type, value}`` payloads into
-:attr:`OmniModel.generated` — they are not persisted on ``ctx``.
+Once a step raises ``module_signal``, ``generate`` calls
+:meth:`OmniModule.finalize` on every active module so segment buffers flush
+at hand-off time.  If the ``max_new_tokens`` safety cap trips first, every
+module gets a second ``finalize`` pass — each module decides from its own
+buffer state whether to emit, warn-and-discard, or no-op.  Modules may also
+emit a one-shot ``generated`` payload (``{type, value}``) from ``finalize``
+or from any FSM step; everything is drained into :attr:`OmniModel.generated`
+and is not persisted on ``ctx``.
 
 Both ``step`` and ``maybe_transition`` accept an optional ``trace`` list —
 print-driven flow tests collect the visit log from there to assert the
@@ -87,7 +88,7 @@ import torch.nn as nn
 
 from ...utils import helper
 from .configuration_seed_omni import OmniConfig
-from .generation_graph import GenerationGraph
+from .generation_graph import FSM_SIGNAL_KEY, GenerationGraph
 from .module import OmniModule
 from .training_graph import TrainingGraph
 
@@ -337,14 +338,44 @@ class OmniModel(nn.Module):
         if item is None:
             return None
         if isinstance(item, dict) and "type" in item and "value" in item:
-            return {"type": item["type"], "value": item["value"]}
+            normalized: Dict[str, Any] = {"type": item["type"], "value": item["value"]}
+            if item.get("meta") is not None:
+                normalized["meta"] = item["meta"]
+            return normalized
         return None
+
+    def _append_generated(self, item: Any) -> None:
+        """Append a normalized ``{type, value}`` entry to :attr:`_generated`."""
+        normalized = self._normalize_generated(item)
+        if normalized is not None:
+            self._generated.append(normalized)
 
     def _collect_generated(self, ctx: Dict[str, Any]) -> None:
         """Drain ``ctx["generated"]`` into :attr:`_generated` (one-shot)."""
-        item = self._normalize_generated(ctx.pop("generated", None))
-        if item is not None:
-            self._generated.append(item)
+        self._append_generated(ctx.pop("generated", None))
+
+    def _invoke_module_finalize(
+        self,
+        ctx: Dict[str, Any],
+        *,
+        force: bool = False,
+        trace: Optional[List[str]] = None,
+    ) -> None:
+        """Call :meth:`OmniModule.finalize` and drain any ``generated`` payload.
+
+        By default only runs when the step just raised ``module_signal``.
+        ``force=True`` skips that guard — used when ``max_new_tokens`` trips
+        before ``done``.
+        """
+        if not force and FSM_SIGNAL_KEY not in ctx:
+            return
+        for name, raw in self.named_omni_modules():
+            out = raw.finalize(ctx=ctx)
+            if not isinstance(out, dict):
+                raise TypeError(f"{type(raw).__name__}.finalize must return a dict, got {type(out).__name__}.")
+            self._append_generated(out.pop("generated", None))
+            if trace is not None:
+                trace.append(f"finalize:{name}")
 
     def _emit_progress(self, total_steps: int) -> None:
         """Log one ``[FSM] step <N>: <state>`` line on a state change.
@@ -377,7 +408,7 @@ class OmniModel(nn.Module):
         ----------
         request:
             Generation request dict — seeds ``ctx`` when ``context`` is
-            ``None`` and is forwarded to each module's ``finalize`` hook.
+            ``None``.
         context:
             Initial generation context (input_ids, attention_mask, ...).  If
             ``None``, starts from a copy of ``request``.  During generation
@@ -432,6 +463,7 @@ class OmniModel(nn.Module):
             total_steps += 1
 
             self._collect_generated(ctx)
+            self._invoke_module_finalize(ctx, trace=trace)
 
             self.generation_graph.maybe_transition(ctx, trace=trace)
 
@@ -441,23 +473,8 @@ class OmniModel(nn.Module):
         # safety cap tripped.
         self._emit_progress(total_steps)
 
-        # Finalize: hand ctx + request to every active module's `finalize`
-        # hook.  This is the framework's contract for "what does the built-in
-        # `done` state actually do" — modules turn accumulated step outputs
-        # into usable artefacts (decoded text, saved images, waveforms).
-        # We collect non-empty returns under a single `finalize` sub-dict so
-        # callers have one place to look without polluting the main ctx.
-        finalize_outputs: Dict[str, Dict[str, Any]] = {}
-        for name, raw in self.named_omni_modules():
-            out = raw.finalize(ctx=ctx, request=request)
-            if not isinstance(out, dict):
-                raise TypeError(f"{type(raw).__name__}.finalize must return a dict, got {type(out).__name__}.")
-            if out:
-                finalize_outputs[name] = out
-                if trace is not None:
-                    trace.append(f"finalize:{name}")
-        if finalize_outputs:
-            ctx["finalize"] = finalize_outputs
+        if not self.generation_graph.is_done():
+            self._invoke_module_finalize(ctx, force=True, trace=trace)
 
         return ctx
 
