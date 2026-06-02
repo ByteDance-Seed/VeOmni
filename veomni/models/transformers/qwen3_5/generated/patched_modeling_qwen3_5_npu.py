@@ -633,17 +633,30 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         # Set up dimensions for reshapes later
         batch_size, seq_len, _ = hidden_states.shape
 
+        # transformers 5.x layered DynamicCache API (see GPU config): per-layer state on
+        # `cache_params.layers[layer_idx]`, accessed via `has_previous_state` / `update_conv_state`
+        # / `update_recurrent_state`.
+        # `use_precomputed_states` picks the cached-decode fast path (reuse the stored conv /
+        # recurrent state) over recomputing the whole sequence (prefill). Heads-up on the
+        # `cache_position is not None` term: transformers 5.x no longer has the model's forward
+        # materialize `cache_position`, so a caller that continues from `past_key_values`
+        # without passing `cache_position` explicitly would make this term False and wrongly
+        # fall back to the prefill path mid-decode (ignoring the recurrent state, overwriting
+        # the conv cache). That is harmless TODAY because the cached path below is intentionally
+        # disabled — it raises NotImplementedError — so Qwen3.5 here is training-only. When
+        # decode support is added, drop this term and let the host-side
+        # `has_previous_state(self.layer_idx)` flag decide on its own (matches upstream).
         use_precomputed_states = (
             cache_params is not None
-            and cache_params.has_previous_state
+            and cache_params.has_previous_state(self.layer_idx)
             and seq_len == 1
             and cache_position is not None
         )
 
         # getting projected states from cache if it exists
-        if cache_params is not None:
-            conv_state = cache_params.conv_states[self.layer_idx]
-            recurrent_state = cache_params.recurrent_states[self.layer_idx]
+        if use_precomputed_states:
+            conv_state = cache_params.layers[self.layer_idx].conv_states
+            recurrent_state = cache_params.layers[self.layer_idx].recurrent_states
 
         mixed_qkv = self.in_proj_qkv(hidden_states)
 
@@ -703,7 +716,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             if cache_params is not None:
                 mixed_qkv_t = mixed_qkv.transpose(1, 2)
                 conv_state = F.pad(mixed_qkv_t, (self.conv_kernel_size - mixed_qkv_t.shape[-1], 0))
-                cache_params.conv_states[self.layer_idx] = conv_state
+                cache_params.update_conv_state(conv_state, self.layer_idx)
             if self.causal_conv1d_fn is not None:
                 # Modification: shard conv1d weights per Ulysses rank to match head-sharded channels.
                 if ulysses_enabled:
@@ -791,7 +804,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
         # Update cache
         if cache_params is not None:
-            cache_params.recurrent_states[self.layer_idx] = last_recurrent_state
+            cache_params.update_recurrent_state(last_recurrent_state, self.layer_idx)
 
         # Modification: gather attention output back to sequence-sharded layout before gated norm.
         if ulysses_enabled:
@@ -1785,7 +1798,7 @@ class Qwen3_5TextModel(Qwen3_5PreTrainedModel):
             past_key_values=past_key_values,
         )
 
-    def _update_linear_attn_mask(self, attention_mask, cache_position):
+    def _update_linear_attn_mask(self, attention_mask, past_key_values):
         """
         Build the attention mask passed to the linear-attention (gated DeltaNet) layers.
 
@@ -1799,20 +1812,25 @@ class Qwen3_5TextModel(Qwen3_5PreTrainedModel):
         ``apply_mask_to_padding_states`` does ``hidden_states * attention_mask[:, :, None]``, and in a
         cached forward the 2-D ``attention_mask`` spans ``past + current`` tokens while ``hidden_states``
         only covers the current chunk, so the shapes wouldn't broadcast (or would broadcast wrongly for
-        a 1-token decode step). But we detect it host-side from tensor shapes — ``attention_mask`` has
-        ``shape[-1] == past + current`` whereas ``cache_position`` has ``shape[-1] == current`` — rather
-        than reading ``cache_position[0]``, so no sync.
+        a 1-token decode step). But we detect it host-side via the cache's ``has_previous_state()`` flag
+        — a Python bool on the linear-attention cache layer — rather than reading ``cache_position[0]``,
+        so no sync.
 
         The all-ones short-circuit is the one we drop: returning the all-ones mask makes
         ``apply_mask_to_padding_states`` a no-op multiply, so it is equivalent to upstream's ``None``
         while avoiding the ``torch.all`` reduction + sync. A genuinely padded mask is still returned and
         correctly zeroed.
+
+        NOTE: transformers 5.x changed this method's 2nd arg from ``cache_position`` (a tensor) to
+        ``past_key_values`` (a layered ``DynamicCache``); the regenerated ``Qwen3_5TextModel.forward``
+        now calls ``self._update_linear_attn_mask(attention_mask, past_key_values)``.
         """
         if attention_mask is None:
             return None
         # Cached forward (decode / continuation): see docstring — shapes wouldn't line up in
-        # apply_mask_to_padding_states, and upstream returns None here. Detected from shapes only.
-        if cache_position is not None and attention_mask.shape[-1] != cache_position.shape[-1]:
+        # apply_mask_to_padding_states, and upstream returns None here. `has_previous_state()` reads a
+        # host-side flag on the linear-attention cache layer (no 0-D GPU scalar), so this stays sync-free.
+        if past_key_values is not None and past_key_values.has_previous_state():
             return None
         return attention_mask
 

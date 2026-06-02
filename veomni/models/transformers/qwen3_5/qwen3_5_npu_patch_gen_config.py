@@ -251,14 +251,30 @@ def qwen3_5_gated_deltanet_forward_patched(
     # Set up dimensions for reshapes later
     batch_size, seq_len, _ = hidden_states.shape
 
+    # transformers 5.x layered DynamicCache API (see GPU config): per-layer state on
+    # `cache_params.layers[layer_idx]`, accessed via `has_previous_state` / `update_conv_state`
+    # / `update_recurrent_state`.
+    # `use_precomputed_states` picks the cached-decode fast path (reuse the stored conv /
+    # recurrent state) over recomputing the whole sequence (prefill). Heads-up on the
+    # `cache_position is not None` term: transformers 5.x no longer has the model's forward
+    # materialize `cache_position`, so a caller that continues from `past_key_values`
+    # without passing `cache_position` explicitly would make this term False and wrongly
+    # fall back to the prefill path mid-decode (ignoring the recurrent state, overwriting
+    # the conv cache). That is harmless TODAY because the cached path below is intentionally
+    # disabled — it raises NotImplementedError — so Qwen3.5 here is training-only. When
+    # decode support is added, drop this term and let the host-side
+    # `has_previous_state(self.layer_idx)` flag decide on its own (matches upstream).
     use_precomputed_states = (
-        cache_params is not None and cache_params.has_previous_state and seq_len == 1 and cache_position is not None
+        cache_params is not None
+        and cache_params.has_previous_state(self.layer_idx)
+        and seq_len == 1
+        and cache_position is not None
     )
 
     # getting projected states from cache if it exists
-    if cache_params is not None:
-        conv_state = cache_params.conv_states[self.layer_idx]
-        recurrent_state = cache_params.recurrent_states[self.layer_idx]
+    if use_precomputed_states:
+        conv_state = cache_params.layers[self.layer_idx].conv_states
+        recurrent_state = cache_params.layers[self.layer_idx].recurrent_states
 
     mixed_qkv = self.in_proj_qkv(hidden_states)
 
@@ -318,7 +334,7 @@ def qwen3_5_gated_deltanet_forward_patched(
         if cache_params is not None:
             mixed_qkv_t = mixed_qkv.transpose(1, 2)
             conv_state = F.pad(mixed_qkv_t, (self.conv_kernel_size - mixed_qkv_t.shape[-1], 0))
-            cache_params.conv_states[self.layer_idx] = conv_state
+            cache_params.update_conv_state(conv_state, self.layer_idx)
         if self.causal_conv1d_fn is not None:
             # Modification: shard conv1d weights per Ulysses rank to match head-sharded channels.
             if ulysses_enabled:
@@ -406,7 +422,7 @@ def qwen3_5_gated_deltanet_forward_patched(
 
     # Update cache
     if cache_params is not None:
-        cache_params.recurrent_states[self.layer_idx] = last_recurrent_state
+        cache_params.update_recurrent_state(last_recurrent_state, self.layer_idx)
 
     # Modification: gather attention output back to sequence-sharded layout before gated norm.
     if ulysses_enabled:
