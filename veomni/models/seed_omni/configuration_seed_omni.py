@@ -38,12 +38,12 @@ YAML structure (maps 1-to-1 to this class):
   #    `to: end` declares a leaf node (virtual sink) — every node MUST
   #    appear on at least one edge.
   edges:
-    siglip_to_ar:    {from: siglip_encode, output: image_embeds, to: janus_llama, as: und_image_embeds}
-    vae_enc_to_ar:   {from: vae_encode,    output: gen_embeds,   to: janus_llama, as: gen_image_embeds}
-    tok_enc_to_ar:   {from: tok_encode,    output: inputs_embeds, to: janus_llama, as: inputs_embeds}
-    ar_to_tok_dec:   {from: janus_llama,   output: hidden_states, to: tok_decode,  as: hidden_states}
-    ar_to_vae_dec:   {from: janus_llama,   output: hidden_states, to: vae_decode,  as: hidden_states}
-    vae_token_to_dec:{from: vae_encode,    output: vq_token_ids,  to: vae_decode,  as: gt_token_ids}
+    siglip_to_ar:    {from: siglip_encode, to: janus_llama}
+    vae_enc_to_ar:   {from: vae_encode,    to: janus_llama}
+    tok_enc_to_ar:   {from: tok_encode,    to: janus_llama}
+    ar_to_tok_dec:   {from: janus_llama,   to: tok_decode}
+    ar_to_vae_dec:   {from: janus_llama,   to: vae_decode}
+    vae_token_to_dec:{from: vae_encode,    to: vae_decode}
     tok_dec_sink:    {from: tok_decode,    to: end}
     vae_dec_sink:    {from: vae_decode,    to: end}
 

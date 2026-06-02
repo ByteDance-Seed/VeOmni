@@ -53,12 +53,13 @@ from transformers.models.janus.modeling_janus import (
 )
 
 from ....conversation import (
-    ConversationPart,
     TrainConversation,
     assemble_labels,
     collect_modality_values,
     is_raw_training_conversation,
     is_train_conversation,
+    maybe_merge_outputs,
+    set_llm_embed,
 )
 from ....generation_graph import FSM_SIGNAL_KEY
 from ....image_inputs import build_pixel_values_batch
@@ -294,6 +295,9 @@ class JanusVqvae(OmniModule, PreTrainedModel):
         """
         out: Dict[str, Any] = {}
 
+        if hidden_states is None and is_train_conversation(conversation_list):
+            hidden_states = conversation_list.hidden_states
+
         # V2 training: gen-labels are built from the carrier's per-sample
         # ``vq_image`` segments (``gen_ids``); the backbone already assembled
         # ``hidden_states`` from the *same* segment order + right-pad, so the
@@ -398,58 +402,46 @@ class JanusVqvae(OmniModule, PreTrainedModel):
         self,
         *,
         hidden_states: Optional[torch.Tensor] = None,
-        conversation_list: Optional[List[ConversationPart]] = None,
+        conversation_list: Optional[List[Any]] = None,
         generation_kwargs: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
+        """Alias for :meth:`ar_step` (backward-compatible FSM node name)."""
+        return self.ar_step(
+            hidden_states=hidden_states,
+            conversation_list=conversation_list,
+            generation_kwargs=generation_kwargs,
+            **kwargs,
+        )
+
+    def ar_step(
+        self,
+        *,
+        hidden_states: Optional[torch.Tensor] = None,
+        conversation_list: Optional[List[Any]] = None,
+        generation_kwargs: Optional[Dict[str, Any]] = None,
+        cfg: Optional[Dict[str, Any]] = None,
         **_: Any,
     ) -> Dict[str, Any]:
-        """Sample one VQ token, buffer it, decode the image when full.
+        """Monolithic VQ AR step: decode hidden → id → embed → merge.
 
-        Each FSM ``image_vq`` iteration calls this with the latest LLM
-        hidden states.  We:
-
-        1. Sample a VQ token id from ``generation_head`` (multinomial /
-           greedy, controlled by ``generation_kwargs``).
-        2. Append it to :attr:`_gen_buffer` and emit a ``token``-kind
-           ``ConversationPart`` carrying the codebook-lookup embedding
-           (the ``vaegen_to_llm`` edge feeds that embed back as the
-           next iteration's ``inputs_embeds``).
-        3. On the ``num_image_tokens``-th call (default 576) we decode
-           the buffered tokens to pixels via ``vqmodel.decode``, clear
-           the buffer, hand the ``[-1, 1]`` reconstruction to
-           :meth:`JanusVqvaeProcessor.postprocess` to get a PIL image,
-           stash that PIL image in :attr:`_collected_images` for
-           :meth:`finalize`, expose it via ``ctx['generated_image']``
-           and raise ``module_signal = 'image_complete'`` so the FSM
-           transitions to ``image_vq_end``.
-
-        Batch contract
-        --------------
-        Single-image generation (B == 1) is the only supported path
-        today — the FSM driver and conversation-list shape both assume
-        one image stream per request.  We assert it explicitly rather
-        than silently mis-broadcast for B > 1 (the legacy ``decode()``
-        below quietly assumed the same).
+        VQ token ids accumulate in :attr:`_gen_buffer`.  The trailing
+        ``output`` item's ``value`` is replaced with the codebook embed for
+        the next LLM step.  Adjacent ``vq``-phase outputs are merged in-place.
         """
         if hidden_states is None:
             return {"conversation_list": conversation_list} if conversation_list is not None else {}
+        if conversation_list is None or not conversation_list:
+            raise ValueError("JanusVqvae.ar_step expects a non-empty `conversation_list`.")
 
         hidden_states = hidden_states.to(self.device)
         batch_size = hidden_states.size(0)
         sampling = self._extract_sampling_kwargs(generation_kwargs)
-        cfg_w = float(sampling.pop("guidance_scale", 1.0) or 1.0)
+        sampling.pop("guidance_scale", None)
+        cfg_w = 1.0
+        if isinstance(cfg, dict):
+            cfg_w = float(cfg.get("guidance_scale", 1.0) or 1.0)
 
-        # Classifier-free guidance mix.
-        #
-        # When ``JanusLlama.generate`` expanded the KV cache to bs=2 on the
-        # first ``image_vq`` step, every subsequent step delivers bs=2
-        # hidden states here: row 0 = conditional, row 1 = unconditional.
-        # We project both, mix via the standard ``uncond + w*(cond-uncond)``
-        # formula (same as HF's ``ClassifierFreeGuidanceLogitsProcessor``
-        # — see ``transformers/models/janus/modeling_janus.py:1250``), then
-        # sample ONE token shared across both branches and broadcast it
-        # back to bs=2 for the next AR step's ``inputs_embeds`` (matching
-        # ``modeling_janus.py:1352``).  Single-branch bs=1 mode (no CFG)
-        # keeps the legacy fast path.
         if batch_size == 2 and cfg_w > 1.0:
             cond_logits = self.generation_head(hidden_states[:1, -1:, :]).squeeze(1)
             uncond_logits = self.generation_head(hidden_states[1:, -1:, :]).squeeze(1)
@@ -458,9 +450,8 @@ class JanusVqvae(OmniModule, PreTrainedModel):
             last_logits = self.generation_head(hidden_states[:, -1:, :]).squeeze(1)
         else:
             raise NotImplementedError(
-                f"JanusVqvae.generate received hidden_states with B={batch_size}. "
-                "Supported: B=1 (no CFG) or B=2 (CFG cond/uncond pair). "
-                "Multi-image batched generation is not yet wired into the conversation-list FSM."
+                f"JanusVqvae.ar_step received hidden_states with B={batch_size}. "
+                "Supported: B=1 (no CFG) or B=2 (CFG cond/uncond pair)."
             )
 
         sampled = self._sample_vq_token(last_logits, **sampling).unsqueeze(-1)  # (1, 1)
@@ -470,48 +461,33 @@ class JanusVqvae(OmniModule, PreTrainedModel):
         embed_raw = self.generation_embeddings(sampled)
         embed = self.generation_aligner(embed_raw)  # (1, 1, H)
         if batch_size == 2:
-            # Feed the next AR step as bs=2 so the JanusLlama KV cache
-            # (also bs=2) sees a matching tail.
             embed = embed.expand(2, *embed.shape[1:]).contiguous()
 
-        out: Dict[str, Any] = {
-            "vq_token_id": sampled.squeeze(-1),
-            "embed": embed,
-        }
-
-        if conversation_list is not None:
-            conversation_list.append(
-                ConversationPart(
-                    kind="token",
-                    role="assistant",
-                    token_id=token_id_int,
-                    inputs_embeds=embed,
-                    meta={"source": "vqvae"},
-                )
+        tail = conversation_list[-1]
+        if tail.type != "output":
+            raise ValueError(
+                f"JanusVqvae.ar_step expects the conversation tail to be type='output', got {tail.type!r}."
             )
-            out["conversation_list"] = conversation_list
+        set_llm_embed(tail, embed)
+        maybe_merge_outputs(conversation_list, phase="vq")
+
+        out: Dict[str, Any] = {"conversation_list": conversation_list}
 
         target = self._num_image_tokens()
         if len(self._gen_buffer) >= target:
             token_ids = torch.tensor([self._gen_buffer], dtype=torch.long, device=embed.device)
             with torch.inference_mode():
-                decoded = self.vqmodel.decode(token_ids).permute(0, 2, 3, 1)  # (1, H, W, 3) in [-1, 1]
+                decoded = self.vqmodel.decode(token_ids).permute(0, 2, 3, 1)
             self._gen_buffer.clear()
 
-            # Postprocess into a directly-savable PIL image via the
-            # processor (it owns the Janus-specific [-1, 1] → uint8
-            # inverse-normalisation).  We require it here because the
-            # convention is module-specific and shipped next to the
-            # weights — see :class:`JanusVqvaeProcessor`.
             if self._processor is None:
                 raise RuntimeError(
-                    "JanusVqvae.generate: cannot postprocess VQVAE output — no processor was "
-                    "loaded.  Ensure `preprocessor_config.json` ships next to the weights "
-                    "checkpoint so OmniModule.from_pretrained can auto-load it."
+                    "JanusVqvae.ar_step: cannot postprocess VQVAE output — no processor was "
+                    "loaded. Ensure `preprocessor_config.json` ships next to the weights."
                 )
             image_pil = self._processor.postprocess(decoded)[0]
             self._collected_images.append(image_pil)
-            out["generated_image"] = image_pil
+            out["generated"] = {"type": "image", "value": image_pil}
             out[FSM_SIGNAL_KEY] = "image_complete"
 
         return out
@@ -522,12 +498,9 @@ class JanusVqvae(OmniModule, PreTrainedModel):
         self._collected_images.clear()
 
     def finalize(self, *, ctx: Dict[str, Any], request: Dict[str, Any]) -> Dict[str, Any]:
-        """Hand off accumulated images to the caller via the framework's finalize hook."""
-        del request
-        images = list(ctx.get("generated_images_collected", []) or self._collected_images)
-        if not images:
-            return {}
-        return {"images": images}
+        """VQ artefacts are collected on :class:`OmniModel.generated` — no-op here."""
+        del ctx, request
+        return {}
 
     # ── Internal helpers ─────────────────────────────────────────────────────
 

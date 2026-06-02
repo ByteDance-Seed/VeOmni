@@ -35,7 +35,6 @@ model:
   model_config: {}
   ops_implementation:
     attn_implementation: flash_attention_2
-    cross_entropy_loss_implementation: default
 
 data:
   data_type: seedomni

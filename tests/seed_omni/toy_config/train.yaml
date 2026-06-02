@@ -21,39 +21,30 @@ nodes:
   emit_image_end: { module: text_encoder.emit_image_end }
 
 edges:
-  # ── training (and shared with inference)
-  vis_to_ar:
-    { from: vis_encode, output: image_embeds, to: run_ar, as: und_image_embeds }
-  vae_enc_to_ar:
-    { from: vae_encode, output: gen_embeds, to: run_ar, as: gen_image_embeds }
-  tok_enc_to_ar:
-    { from: tok_encode, output: inputs_embeds, to: run_ar, as: inputs_embeds }
-  ar_to_tok_dec:
-    { from: run_ar, output: hidden_states, to: tok_decode, as: hidden_states }
-  ar_to_vae_dec:
-    { from: run_ar, output: hidden_states, to: vae_decode, as: hidden_states }
-  vae_token_to_dec:
-    { from: vae_encode, output: vq_token_ids, to: vae_decode, as: gt_token_ids }
+  # ── training (and shared with inference) — topology-only; data flows via
+  # the shared ``conversation_list`` dict carrier mutated by each module.
+  vis_to_vae: { from: vis_encode, to: vae_encode }
+  vae_to_tok: { from: vae_encode, to: tok_encode }
+  tok_to_ar: { from: tok_encode, to: run_ar }
+  ar_to_tok_dec: { from: run_ar, to: tok_decode }
+  ar_to_vae_dec: { from: run_ar, to: vae_decode }
   tok_dec_sink: { from: tok_decode, to: end }
   vae_dec_sink: { from: vae_decode, to: end }
-  # ── inference-only
-  vae_dec_to_ar:
-    { from: vae_decode, output: embed, to: run_ar, as: inputs_embeds }
-  emit_start_to_ar:
-    { from: emit_image_start, output: inputs_embeds, to: run_ar, as: inputs_embeds }
-  emit_end_to_ar:
-    { from: emit_image_end, output: inputs_embeds, to: run_ar, as: inputs_embeds }
+  # ── inference-only (topology-only; modules merge into ctx directly)
+  vis_to_ar: { from: vis_encode, to: run_ar }
+  vae_dec_to_ar: { from: vae_decode, to: run_ar }
+  emit_start_to_ar: { from: emit_image_start, to: run_ar }
+  emit_end_to_ar: { from: emit_image_end, to: run_ar }
   emit_start_sink: { from: emit_image_start, to: end }
   emit_end_sink: { from: emit_image_end, to: end }
   ar_run_sink: { from: run_ar, to: end }
 
 training_graph:
   edges:
-    - vis_to_ar
-    - vae_enc_to_ar
-    - tok_enc_to_ar
+    - vis_to_vae
+    - vae_to_tok
+    - tok_to_ar
     - ar_to_tok_dec
     - ar_to_vae_dec
-    - vae_token_to_dec
     - tok_dec_sink
     - vae_dec_sink

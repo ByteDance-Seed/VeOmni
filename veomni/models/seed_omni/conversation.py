@@ -1,148 +1,302 @@
-"""ConversationPart and helpers for SeedOmni V2 inference.
+"""ConversationItem and helpers for SeedOmni V2 inference.
 
-Inference-only data structure (training still rides input_ids + masked_scatter
+Inference-only data structure (training still rides :class:`TrainConversation`
 on the existing ``forward`` / ``pre_forward`` paths — see
 :mod:`veomni.models.seed_omni.module`).  The :class:`OmniInferencer` walks a
-flat ``List[ConversationPart]`` from input through the FSM; every module's
+flat ``List[ConversationItem]`` from input through the FSM; every module's
 ``generate`` reads / mutates that list and routes it as a single ``ctx``
-slot.  No chat template is used: the text encoder owns bos / boi / eoi
-placement and decides the on-the-wire layout.
+slot.
 
-Lifecycle of a part
--------------------
-A part is born holding raw content (``text``, ``image``, ``token_id``) and
-becomes "encoded" once a module fills in ``inputs_embeds``.  The backbone
-LLM concatenates every part's ``inputs_embeds`` on the prompt pass and only
-the latest part's ``inputs_embeds`` on each AR step (KV cache hot path).
+Unified item shape
+------------------
+Each item is ``{type, value, meta}``:
 
-Layout invariants enforced by :func:`build_conversation`
---------------------------------------------------------
-1. Images come first.  Every user image is appended as an
-   ``image_und`` part (``role=user``) before any text part.
-2. A single user text part follows (``role=user``).
-3. A trailing empty assistant text part is appended as the completion
-   marker (``role=assistant``).  ``text_encoder.generate`` will append
-   sampled-token parts under this assistant role; emitted boundary
-   tokens (``boi`` / ``eoi``) and VQ tokens piggy-back on the same
-   role.
+* ``type``: ``"text"`` | ``"image"`` | ``"token"`` | ``"output"`` | ``"soi"`` | ``"eoi"``
+* ``value``: polymorphic payload (raw content or embedded tensor)
+* ``meta``: ``role`` (``user`` / ``assistant`` / ``system`` / ``dummy``), plus
+  optional ``source``, ``input_ids``, ``token_id``, ``phase``, etc.
 
-These invariants mean the conversation list is monotonically growing
-during a generate call — no part is ever removed.  ``token``-kind parts
-that follow the trailing assistant marker form the assistant's response.
+Lifecycle
+---------
+A part is born with raw ``value`` (``str``, PIL image, token id) and becomes
+"embedded" once an encoder overwrites ``value`` with an ``(L, D)`` or
+``(1, L, D)`` tensor.
 
-Sampled-token parts
--------------------
-``kind="token"`` parts are produced by:
+AR workspace
+------------
+During auto-regressive decoding the backbone appends ``type="output"`` items
+carrying hidden states or embeds.  Modality heads (text / VQ) decode the
+hidden, replace ``value`` with an embed, and merge adjacent ``output`` items
+**within the same** ``meta["phase"]`` only (``"text"`` or ``"vq"``).
 
-* :meth:`JanusTextEncoder.decode`        — one part per sampled text token,
-                                            also for the t2i-forced boi.
-* :meth:`JanusTextEncoder.emit_image_*`  — one part per boundary token.
-* :meth:`JanusVqvae.generate`            — one part per sampled VQ token.
+Phase boundaries are sealed by renaming completed ``output`` spans to
+``type="text"`` or ``type="image"`` so CFG can drop text vs image spans
+independently.  ``<begin_of_image>`` / ``<end_of_image>`` are ``soi`` / ``eoi``
+items — never merged into text output history.
 
-Each carries ``inputs_embeds`` pre-filled by the producing module so the
-next FSM step can re-use it through ``janus_llama.generate``'s "tail-only"
-fast path without re-embedding.
+Sampled token ids live in module-private caches, not in the conversation list.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Iterator
+from typing import Any, Iterator, Literal
 
 import torch
 
 
-PartKind = str  # "text" | "image_und" | "image_gen" | "token"
-Role = str  # "system" | "user" | "assistant"
+ItemType = str  # "text" | "image" | "token" | "output" | "soi" | "eoi"
+Role = str  # "system" | "user" | "assistant" | "dummy"
+ArPhase = Literal["text", "vq"]
 
 
 @dataclass
-class ConversationPart:
-    """One element of a conversation list.
+class ConversationItem:
+    """One element of a conversation list — unified ``{type, value, meta}``."""
 
-    The dataclass is intentionally a flat record (no nested Union types) so
-    a quick check on ``part.kind`` is the source of truth for which fields
-    are populated.  All inputs / outputs of every inference module are
-    expressed in terms of this single shape.
-    """
-
-    kind: PartKind
-    role: Role
-    # ── Raw content (one of these is set at construction) ────────────────────
-    text: str | None = None
-    image: Any | None = None  # PIL.Image, numpy array, or pre-computed pixel tensor
-    pixel_values: torch.Tensor | None = None  # filled by the inference processor
-    token_id: int | None = None
-    # ── Encoded form (filled by encoder modules at runtime) ──────────────────
-    input_ids: torch.Tensor | None = None  # (1, T) for text parts after tokenisation
-    inputs_embeds: torch.Tensor | None = None  # (1, T, hidden_size) after embedding
-    # ── Free-form metadata (e.g. processor flags, generated image tensor) ────
+    type: ItemType
+    value: Any = None
     meta: dict = field(default_factory=dict)
+
+
+# Backward-compatible alias used across the codebase and tests.
+ConversationPart = ConversationItem
+
+
+def item_role(item: ConversationItem) -> str:
+    """Return ``meta["role"]``, defaulting to ``"user"``."""
+    return str(item.meta.get("role", "user"))
+
+
+def is_dummy(item: ConversationItem) -> bool:
+    return item_role(item) == "dummy"
+
+
+def _is_chw_image_tensor(value: torch.Tensor) -> bool:
+    """True for raw ``(C, H, W)`` pixels — not ``(1, P, D)`` SigLIP patch embeds."""
+    if value.dim() != 3:
+        return False
+    c, _h, w = (int(value.size(0)), int(value.size(1)), int(value.size(2)))
+    if c not in (1, 3):
+        return False
+    # SigLIP writes ``(1, num_patches, hidden)`` back onto the item — the last
+    # axis is the LLM hidden size (≫ any spatial extent), not image width.
+    if c == 1 and w > 512:
+        return False
+    return True
+
+
+def is_embedded(item: ConversationItem) -> bool:
+    """True when ``value`` holds an LLM-space embedding tensor."""
+    value = item.value
+    if not isinstance(value, torch.Tensor):
+        return False
+    if item.type in ("text", "output", "soi", "eoi"):
+        return value.dim() == 3
+    if item.type == "image":
+        if _is_chw_image_tensor(value):
+            return False
+        return value.dim() >= 2
+    if item.type == "token":
+        if isinstance(value, int):
+            return False
+        if value.numel() == 1:
+            return False
+        return value.dim() >= 2
+    return False
+
+
+def needs_embedding(item: ConversationItem) -> bool:
+    """True when an encoder still needs to fill ``value`` with an embed."""
+    if is_dummy(item) or is_embedded(item):
+        return False
+    if item.type == "text":
+        return bool(item.value)
+    if item.type == "token":
+        tid = get_token_id(item)
+        return tid is not None
+    return False
+
+
+def get_token_id(item: ConversationItem) -> int | None:
+    """Extract a scalar token id from a ``type="token"`` item."""
+    if item.type != "token":
+        return None
+    if "token_id" in item.meta:
+        return int(item.meta["token_id"])
+    value = item.value
+    if isinstance(value, int):
+        return value
+    if isinstance(value, torch.Tensor) and value.numel() == 1:
+        return int(value.reshape(-1)[0].item())
+    return None
+
+
+def get_llm_embed(item: ConversationItem) -> torch.Tensor | None:
+    """Return ``(B, T, D)`` embed for LLM consumption, or ``None``."""
+    if not is_embedded(item):
+        return None
+    value = item.value
+    assert isinstance(value, torch.Tensor)
+    if item.type == "image":
+        if value.dim() == 2:
+            return value.unsqueeze(0)
+        if value.dim() == 3:
+            return value
+    if item.type in ("text", "output", "soi", "eoi") and value.dim() == 3:
+        return value
+    if item.type == "token":
+        if value.dim() == 3:
+            return value
+        if value.dim() == 2:
+            return value.unsqueeze(1)
+    return None
+
+
+def set_llm_embed(item: ConversationItem, embed: torch.Tensor, *, token_id: int | None = None) -> None:
+    """Write an embed into ``value``, preserving ``token_id`` in ``meta`` when given."""
+    if token_id is not None:
+        item.meta["token_id"] = int(token_id)
+    elif item.type == "token":
+        existing = get_token_id(item)
+        if existing is not None:
+            item.meta["token_id"] = existing
+    item.value = embed
+
+
+def item_phase(item: ConversationItem) -> str | None:
+    """Return ``meta["phase"]`` for ``output`` items, else ``None``."""
+    phase = item.meta.get("phase")
+    return str(phase) if phase is not None else None
+
+
+def collect_prompt_embeds(parts: list[ConversationItem]) -> list[torch.Tensor]:
+    """Embedded history for the backbone prompt pass — excludes active ``output`` items."""
+    chunks: list[torch.Tensor] = []
+    for part in parts:
+        if is_dummy(part) or part.type == "output":
+            continue
+        emb = get_llm_embed(part)
+        if emb is not None:
+            chunks.append(emb)
+    return chunks
+
+
+def get_ar_tail_embed(parts: list[ConversationItem]) -> torch.Tensor | None:
+    """Last-position embed from the conversation tail for one AR step."""
+    if not parts:
+        return None
+    emb = get_llm_embed(parts[-1])
+    if emb is None:
+        return None
+    return emb[:, -1:, :]
+
+
+def append_output_hidden(
+    parts: list[ConversationItem],
+    hidden: torch.Tensor,
+    *,
+    phase: ArPhase,
+    role: str = "assistant",
+) -> ConversationItem:
+    """Append a new ``output`` item carrying backbone hidden states."""
+    item = ConversationItem(
+        type="output",
+        value=hidden,
+        meta={"role": role, "phase": phase},
+    )
+    parts.append(item)
+    return item
+
+
+def maybe_merge_outputs(parts: list[ConversationItem], *, phase: ArPhase) -> bool:
+    """Concatenate the last two ``output`` items when they share ``phase``.
+
+    Returns ``True`` when a merge occurred.
+    """
+    if len(parts) < 2:
+        return False
+    a, b = parts[-2], parts[-1]
+    if a.type != "output" or b.type != "output":
+        return False
+    if item_phase(a) != phase or item_phase(b) != phase:
+        return False
+    emb_a = get_llm_embed(a)
+    emb_b = get_llm_embed(b)
+    if emb_a is None or emb_b is None:
+        return False
+    a.value = torch.cat([emb_a, emb_b], dim=1)
+    parts.pop()
+    return True
+
+
+def seal_phase_outputs(parts: list[ConversationItem], *, phase: ArPhase, new_type: ItemType) -> int:
+    """Rename every ``output`` item with ``meta.phase == phase`` to ``new_type``.
+
+    Returns the number of items renamed.
+    """
+    count = 0
+    for part in parts:
+        if part.type != "output":
+            continue
+        if item_phase(part) != phase:
+            continue
+        part.type = new_type
+        part.meta.pop("phase", None)
+        count += 1
+    return count
 
 
 def build_conversation(
     *,
     prompt: str,
     images: list[Any] | None = None,
-) -> list[ConversationPart]:
-    """Build the canonical conversation list for a single inference request.
-
-    Layout (fixed):
-
-    * ``image_und`` parts for every user image (in order).
-    * One ``text`` user part holding the full prompt.
-    * One empty ``text`` assistant part as the completion marker.
-
-    Whether the run generates an image is decided by the scenario graph
-    (``omni_infer_type`` selects the ``generation_graph``), not by the
-    conversation layout — so this helper has no image-generation knob.
-    """
-    parts: list[ConversationPart] = []
+) -> list[ConversationItem]:
+    """Build the canonical conversation list for a single inference request."""
+    parts: list[ConversationItem] = []
     for img in images or []:
-        parts.append(ConversationPart(kind="image_und", role="user", image=img))
-    parts.append(ConversationPart(kind="text", role="user", text=prompt))
-    parts.append(ConversationPart(kind="text", role="assistant", text=""))
+        parts.append(ConversationItem(type="image", value=img, meta={"role": "user"}))
+    parts.append(ConversationItem(type="text", value=prompt, meta={"role": "user"}))
+    parts.append(ConversationItem(type="text", value="", meta={"role": "assistant"}))
     return parts
 
 
-def iter_kind(parts: list[ConversationPart], kind: PartKind) -> Iterator[ConversationPart]:
-    """Yield parts of a given kind in declaration order."""
-    for p in parts:
-        if p.kind == kind:
-            yield p
+def iter_type(parts: list[ConversationItem], item_type: ItemType) -> Iterator[ConversationItem]:
+    """Yield parts of a given ``type`` in declaration order."""
+    for part in parts:
+        if part.type == item_type:
+            yield part
 
 
-def unembedded_parts(parts: list[ConversationPart]) -> list[ConversationPart]:
-    """Parts that still need an encoder pass (no ``inputs_embeds`` yet)."""
-    return [p for p in parts if p.inputs_embeds is None]
+def iter_kind(parts: list[ConversationItem], kind: ItemType) -> Iterator[ConversationItem]:
+    """Alias for :func:`iter_type` (legacy name)."""
+    yield from iter_type(parts, kind)
 
 
-def latest_assistant_text_token_ids(parts: list[ConversationPart]) -> list[int]:
-    """Token ids contributed by ``text_encoder.decode`` for the current turn.
+def unembedded_parts(parts: list[ConversationItem]) -> list[ConversationItem]:
+    """Parts that still need an encoder pass."""
+    return [p for p in parts if needs_embedding(p)]
 
-    Pulled out so :meth:`JanusTextEncoder.finalize` can detokenize the
-    response without re-walking the whole list itself.  Excludes parts
-    written by non-text producers (the VQVAE tags its parts with
-    ``meta["source"] == "vqvae"``) — VQ codebook ids share the
-    ``role="assistant"`` namespace but live in a different vocab and
-    must not be fed to the text tokenizer's ``decode``.
+
+def latest_assistant_text_token_ids(parts: list[ConversationItem]) -> list[int]:
+    """Token ids from the text decoder cache mirrored on ``token`` parts.
+
+    Legacy path: reads ``type="token"`` assistant parts (excluding VQ-sourced).
+    Prefer :func:`merge_token_cache_into_parts` when using module-private caches.
     """
-    return [
-        int(p.token_id)
-        for p in parts
-        if p.kind == "token" and p.role == "assistant" and p.token_id is not None and p.meta.get("source") != "vqvae"
-    ]
+    out: list[int] = []
+    for part in parts:
+        if part.type != "token" or item_role(part) != "assistant":
+            continue
+        if part.meta.get("source") == "vqvae":
+            continue
+        tid = get_token_id(part)
+        if tid is not None:
+            out.append(tid)
+    return out
 
 
 # ── Raw training conversation helpers (D3/D4/D5) ────────────────────────────
-#
-# Training feeds modules the *raw* conversation produced by
-# ``seedomni_transform`` — ``list[list[dict]]`` where each per-sample list
-# holds ``{type, value, role, loss_mask}`` items (``value`` is a string for
-# ``text`` and a ``(C, H, W)`` uint8 tensor for ``image`` / ``vq_image``).
-# This is distinct from the inference :class:`ConversationPart` objects, so
-# modules dispatch their training tokenisation / image extraction on the
-# shape below.
 
 
 def is_raw_training_conversation(conversation: Any) -> bool:
@@ -160,13 +314,7 @@ def collect_modality_values(
     conversation_list: list[list[dict]],
     types: tuple[str, ...],
 ) -> list[list[Any]]:
-    """Per-sample list of ``item['value']`` for items whose ``type`` matches.
-
-    Preserves source order so a sample's k-th image lines up with the k-th
-    placeholder span the text encoder emits.  Samples without any matching
-    modality yield an empty list (the caller fills a zero placeholder so the
-    batch dimension — and thus the FSDP graph — stays aligned).
-    """
+    """Per-sample list of ``item['value']`` for items whose ``type`` matches."""
     out: list[list[Any]] = []
     for sample in conversation_list:
         out.append([item.get("value") for item in sample if item.get("type") in types])
@@ -174,43 +322,11 @@ def collect_modality_values(
 
 
 # ── Training: the embedding-segment conversation (D5 backbone splice) ────────
-#
-# In the V2 target contract (seedomni-v2 SKILL.md, Layer 5/6 + invariants
-# 16 & 18) training data does NOT flow as flat ``input_ids`` / ``attention_mask``
-# / ``position_ids`` / ``gen_image_mask`` / ``labels`` tensors routed through
-# separate edges.  Instead a single object — a :class:`TrainConversation` — is
-# the only thing entering the backbone.  Every module fills its own segments'
-# ``value`` (= embedding) into it:
-#
-#   * ``JanusSiglip``  → understanding patch embeds (``und_embeds``)
-#   * ``JanusVqvae``   → generation patch embeds + teacher VQ ids
-#                        (``gen_embeds`` / ``gen_token_ids``)
-#   * ``JanusTextEncoder`` → walks the raw conversation, applies the chat
-#                        template, tokenises text + wte-embeds it, wraps images
-#                        with ``<boi>``/``<eoi>`` and emits the ordered
-#                        per-sample :class:`TrainSegment` list.
-#
-# The backbone then just concatenates ``segment.embeds`` (segment-order-driven
-# splice — NO ``masked_scatter``, NO ``<image_k>`` positional tokens) and
-# derives ``attention_mask`` / ``position_ids`` from segment lengths.  Each
-# loss head concatenates the matching per-segment label vector
-# (``label_ids`` for the text CE, ``gen_ids`` for the VQ CE).  Because the
-# backbone and the heads both walk the **same** segment order with the **same**
-# right-pad, the assembled ``inputs_embeds`` and the label tensors are aligned
-# by construction — no position bookkeeping needed.
 
 
 @dataclass
 class TrainSegment:
-    """One contiguous run of token positions with a shared embedding source.
-
-    ``embeds`` is the segment ``value`` (``(L, D)`` — wte embeddings for a text
-    run, SigLIP / VQ patch embeddings for an image run, a single wte row for a
-    ``<boi>``/``<eoi>`` boundary).  ``label_ids`` / ``gen_ids`` are the
-    per-position CE targets for the text head and the VQ head respectively
-    (``-100`` where the head should ignore the position).  All three are the
-    same length ``L``.
-    """
+    """One contiguous run of token positions with a shared embedding source."""
 
     embeds: torch.Tensor  # (L, D)
     label_ids: torch.Tensor  # (L,) long — text CE target (-100 = ignore)
@@ -219,24 +335,14 @@ class TrainSegment:
 
 @dataclass
 class TrainConversation:
-    """Single training carrier — the only object that enters the backbone.
-
-    Flows ``siglip → vae → text_encoder → janus_llama → {tok_decode,
-    vae_decode}`` as one ``conversation_list`` edge.  ``raw`` is kept so the
-    vision / VQ / text modules can still extract their modality items.  The
-    full-batch ``und_embeds`` / ``gen_embeds`` are retained even after the
-    text encoder slices them into segments: the backbone adds a
-    ``embeds.sum() * 0.0`` autograd anchor over the **whole** batch tensor so a
-    micro-batch with no image of a given modality still drives a (zero)
-    gradient through the encoder, keeping FSDP DP grad-reduce aligned
-    (seedomni-v2 invariant 10 / the grad-sync anchor).
-    """
+    """Single training carrier — the only object that enters the backbone."""
 
     raw: list[list[dict[str, Any]]]
-    und_embeds: torch.Tensor | None = None  # (B, P, D) understanding patch embeds (also FSDP anchor)
-    gen_embeds: torch.Tensor | None = None  # (B, P, D) generation patch embeds (also FSDP anchor)
-    gen_token_ids: torch.Tensor | None = None  # (B, P) teacher VQ ids
-    segments: list[list[TrainSegment]] | None = None  # per-sample ordered segments (text encoder fills)
+    und_embeds: torch.Tensor | None = None
+    gen_embeds: torch.Tensor | None = None
+    gen_token_ids: torch.Tensor | None = None
+    segments: list[list[TrainSegment]] | None = None
+    hidden_states: torch.Tensor | None = None
 
 
 def is_train_conversation(x: Any) -> bool:
@@ -247,14 +353,7 @@ def is_train_conversation(x: Any) -> bool:
 def assemble_embeds(
     segments: list[list[TrainSegment]],
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Concatenate per-sample segment embeds → right-padded ``(B, T, D)`` batch.
-
-    Returns ``(inputs_embeds, attention_mask, position_ids)`` where
-    ``attention_mask`` is ``1`` over real tokens (``0`` on the right pad) and
-    ``position_ids`` is ``arange(T)`` per row.  ``T`` is the max assembled
-    length across the batch — the *same* ``T`` :func:`assemble_labels` uses, so
-    the heads' label tensors line up with these embeds position-for-position.
-    """
+    """Concatenate per-sample segment embeds → right-padded ``(B, T, D)`` batch."""
     if not segments:
         raise ValueError("assemble_embeds: empty segments list.")
     per_sample = [torch.cat([seg.embeds for seg in sample], dim=0) if sample else None for sample in segments]
@@ -275,12 +374,7 @@ def assemble_embeds(
 
 
 def assemble_labels(segments: list[list[TrainSegment]], *, key: str) -> torch.Tensor:
-    """Concatenate the per-segment ``key`` label vectors → right-padded ``(B, T)``.
-
-    ``key`` is ``"label_ids"`` (text CE) or ``"gen_ids"`` (VQ CE).  Pads with
-    ``-100`` so the right pad is ignored by ``cross_entropy``.  Uses the same
-    segment order + ``T`` as :func:`assemble_embeds`.
-    """
+    """Concatenate the per-segment ``key`` label vectors → right-padded ``(B, T)``."""
     per_sample = [torch.cat([getattr(seg, key) for seg in sample], dim=0) if sample else None for sample in segments]
     if any(x is None for x in per_sample):
         raise ValueError("assemble_labels: a sample has zero segments.")
@@ -294,10 +388,26 @@ def assemble_labels(segments: list[list[TrainSegment]], *, key: str) -> torch.Te
 
 
 __all__ = [
+    "ArPhase",
+    "ConversationItem",
     "ConversationPart",
-    "PartKind",
+    "ItemType",
     "Role",
+    "append_output_hidden",
     "build_conversation",
+    "collect_prompt_embeds",
+    "get_ar_tail_embed",
+    "item_phase",
+    "item_role",
+    "is_dummy",
+    "is_embedded",
+    "maybe_merge_outputs",
+    "needs_embedding",
+    "get_token_id",
+    "get_llm_embed",
+    "set_llm_embed",
+    "seal_phase_outputs",
+    "iter_type",
     "iter_kind",
     "unembedded_parts",
     "latest_assistant_text_token_ids",

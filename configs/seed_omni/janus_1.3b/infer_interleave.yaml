@@ -1,54 +1,34 @@
 # Janus-1.3B inference — interleave T2T + T2I (mid-stream image generation).
 #
 # Unlike `infer_gen.yaml` (deterministic T2I), the model itself decides when
-# to start an image: `tok_decode` samples normally and the image span opens
+# to start an image: ``tok_ar_step`` samples normally and the image span opens
 # only on a natural <begin_of_image> (`start_image_gen` signal).  After each
-# image span `image_vq_end` falls back to `text_ar` (not `done`) so the model
-# keeps talking.  Text continues until the LM emits <eos> (`text_done`) or
-# another <begin_of_image> (`start_image_gen` → another image span).
-#
-# Flow
-# ----
-#   prompt_encode → text_ar     (default path)
-#                 → image_vq    on natural <boi>
-#   text_ar       → image_vq    on <boi>
-#                 → done        on <eos>
-#                 → text_ar     loop otherwise
-#   image_vq      → image_vq_end  on `image_complete`
-#   image_vq_end  → text_ar       (the one difference vs. infer_gen)
+# image span ``image_vq_end`` falls back to ``text_ar`` (not ``done``).
 
 generation_graph:
   initial: prompt_encode
 
   states:
     prompt_encode:
-      # Single body pass that samples the first token: branch on the module
-      # signal it raises, else fall through (`default`) to text_ar.  `default`
-      # is the lowest-priority fallback and must be last — the signal checks
-      # above win first.
       body:
         - vision_to_llm
         - tokenc_to_llm
-        - llm_to_tokdec
-        - tok_decode_sink
+        - llm_to_text_ar
+        - text_ar_sink
       transitions:
         - { condition: { type: module_signal, key: start_image_gen }, next_state: image_vq }
         - { condition: { type: module_signal, key: text_done }, next_state: done }
         - { condition: { type: default }, next_state: text_ar }
 
     text_ar:
-      # AR loop: repeats (no transition fires) until the LM samples <boi>
-      # (start_image_gen) or <eos> (text_done).
       body:
-        - tokenc_to_llm
-        - llm_to_tokdec
-        - tok_decode_sink
+        - llm_to_text_ar
+        - text_ar_sink
       transitions:
         - { condition: { type: module_signal, key: start_image_gen }, next_state: image_vq }
         - { condition: { type: module_signal, key: text_done }, next_state: done }
 
     image_vq:
-      # AR loop: repeats until vae_generate raises `image_complete`.
       body:
         - llm_to_vaegen
         - vaegen_to_llm
@@ -56,10 +36,6 @@ generation_graph:
         - { condition: { type: module_signal, key: image_complete }, next_state: image_vq_end }
 
     image_vq_end:
-      # Single pass: after eoi, fall back to text_ar so the model can keep
-      # speaking (or emit eos / another <boi>).  The eoi part's
-      # `inputs_embeds` is consumed by text_ar's first llama tail-only
-      # forward.
       body:
         - emit_end_sink
       transitions:

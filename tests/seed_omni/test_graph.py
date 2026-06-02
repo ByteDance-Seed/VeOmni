@@ -53,12 +53,8 @@ def test_parse_node_rejects_reserved_end_name():
 
 
 def test_parse_edge():
-    e = EdgeDef.parse(
-        "vision_to_ar",
-        {"from": "vision_encoder", "output": "image_embeds", "to": "run_ar", "as": "und_image_embeds"},
-    )
+    e = EdgeDef.parse("vision_to_ar", {"from": "vision_encoder", "to": "run_ar"})
     assert e.from_ == "vision_encoder" and e.to == "run_ar"
-    assert e.output_key == "image_embeds" and e.as_ == "und_image_embeds"
     assert not e.is_sink()
 
 
@@ -98,24 +94,9 @@ def _janus_joint_pools() -> tuple[dict, dict]:
         "vq_loss": {"module": "vq_decoder.gen_loss"},
     }
     edges = {
-        "vision_to_ar": {
-            "from": "vision_encoder",
-            "output": "image_embeds",
-            "to": "run_ar",
-            "as": "und_image_embeds",
-        },
-        "vae_enc_to_ar": {
-            "from": "vq_encode",
-            "output": "gen_embeds",
-            "to": "run_ar",
-            "as": "gen_image_embeds",
-        },
-        "ar_to_vq_loss": {
-            "from": "run_ar",
-            "output": "hidden_states",
-            "to": "vq_loss",
-            "as": "hidden_states",
-        },
+        "vision_to_ar": {"from": "vision_encoder", "to": "run_ar"},
+        "vae_enc_to_ar": {"from": "vq_encode", "to": "run_ar"},
+        "ar_to_vq_loss": {"from": "run_ar", "to": "vq_loss"},
         "vq_loss_sink": {"from": "vq_loss", "to": "end"},
     }
     return nodes, edges
@@ -132,18 +113,8 @@ def _understanding_only_pools() -> tuple[dict, dict]:
         "run_ar": {"module": "ar_llm"},
     }
     edges = {
-        "vision_to_ar": {
-            "from": "vision_encoder",
-            "output": "image_embeds",
-            "to": "run_ar",
-            "as": "und_image_embeds",
-        },
-        "vae_to_ar": {
-            "from": "vq_encode",
-            "output": "gen_embeds",
-            "to": "run_ar",
-            "as": "gen_image_embeds",
-        },
+        "vision_to_ar": {"from": "vision_encoder", "to": "run_ar"},
+        "vae_to_ar": {"from": "vq_encode", "to": "run_ar"},
         "ar_sink": {"from": "run_ar", "to": "end"},
     }
     return nodes, edges
@@ -166,7 +137,7 @@ def test_unknown_training_edge_raises():
 
 def test_edge_referencing_unknown_node_raises():
     nodes = {"run_ar": {"module": "ar_llm"}}
-    edges = {"stale": {"from": "ghost", "output": "x", "to": "run_ar", "as": "x"}}
+    edges = {"stale": {"from": "ghost", "to": "run_ar"}}
     with pytest.raises(KeyError, match="`from: ghost`"):
         TrainingGraph(nodes=nodes, edges=edges, training_edges=["stale"])
 
@@ -235,8 +206,8 @@ def test_active_subset_excludes_inference_cycle():
     edges = {
         **edges,
         # Cyclic inference edges (training_edges does NOT include them).
-        "ar_to_vae_infer": {"from": "run_ar", "output": "h", "to": "vq_encode", "as": "h"},
-        "vae_to_ar_infer": {"from": "vq_encode", "output": "embed", "to": "run_ar", "as": "inputs_embeds"},
+        "ar_to_vae_infer": {"from": "run_ar", "to": "vq_encode"},
+        "vae_to_ar_infer": {"from": "vq_encode", "to": "run_ar"},
     }
     g = TrainingGraph(
         nodes=nodes,
@@ -252,8 +223,8 @@ def test_cycle_in_active_set_raises():
         "ar": {"module": "ar_llm"},
     }
     edges = {
-        "vae_to_ar": {"from": "vae", "output": "x", "to": "ar", "as": "x"},
-        "ar_to_vae": {"from": "ar", "output": "y", "to": "vae", "as": "y"},
+        "vae_to_ar": {"from": "vae", "to": "ar"},
+        "ar_to_vae": {"from": "ar", "to": "vae"},
     }
     with pytest.raises(ValueError, match="Circular dependency"):
         TrainingGraph(
@@ -309,33 +280,34 @@ def test_module_lookup_raises_for_unknown():
 # ── collect_inputs ────────────────────────────────────────────────────────────
 
 
-def test_collect_inputs_routes_outputs_with_renaming():
-    """Fan-in: run_ar receives both vision and vq embeds via two distinct edges."""
+def test_collect_inputs_returns_raw_batch_copy():
+    """Topology-only edges: every node sees the same shared batch dict."""
     nodes, edges = _janus_joint_pools()
     g = TrainingGraph(nodes=nodes, edges=edges, training_edges=_JANUS_TRAIN_EDGES)
-    raw_batch = {"input_ids": "X"}
+    raw_batch = {"conversation_list": {"hidden_states": "HID"}, "input_ids": "X"}
+    upstream = {"run_ar": {"hidden_states": "SHOULD_NOT_ROUTE"}}
+    kwargs = g.collect_inputs("vq_loss", upstream, raw_batch)
+    assert kwargs is not raw_batch
+    assert kwargs == raw_batch
+    assert kwargs["conversation_list"]["hidden_states"] == "HID"
+
+
+def test_collect_inputs_ignores_upstream_outputs():
+    """Upstream node output dicts are not merged into kwargs — carrier holds cross-node state."""
+    nodes, edges = _understanding_only_pools()
+    g = TrainingGraph(
+        nodes=nodes,
+        edges=edges,
+        training_edges=["vision_to_ar", "vae_to_ar", "ar_sink"],
+    )
     upstream = {
         "vision_encoder": {"image_embeds": "VIS"},
         "vq_encode": {"gen_embeds": "GEN"},
     }
-    kwargs = g.collect_inputs("run_ar", upstream, raw_batch)
-    assert kwargs["input_ids"] == "X"
-    assert kwargs["und_image_embeds"] == "VIS"
-    assert kwargs["gen_image_embeds"] == "GEN"
-
-
-def test_collect_inputs_for_vq_loss_uses_run_ar_output():
-    """vq_loss takes hidden_states from run_ar's output dict."""
-    nodes, edges = _janus_joint_pools()
-    g = TrainingGraph(nodes=nodes, edges=edges, training_edges=_JANUS_TRAIN_EDGES)
-    upstream = {
-        "vision_encoder": {"image_embeds": "VIS"},
-        "vq_encode": {"gen_embeds": "GEN"},
-        "run_ar": {"hidden_states": "HID", "_loss": 0.7},
-    }
-    kwargs = g.collect_inputs("vq_loss", upstream, {"vq_token_ids": "GT"})
-    assert kwargs["vq_token_ids"] == "GT"
-    assert kwargs["hidden_states"] == "HID"
+    kwargs = g.collect_inputs("run_ar", upstream, {"input_ids": "X"})
+    assert kwargs == {"input_ids": "X"}
+    assert "und_image_embeds" not in kwargs
+    assert "gen_image_embeds" not in kwargs
 
 
 # ── module-name alias on edge endpoints ──────────────────────────────────────
@@ -348,7 +320,7 @@ def test_module_alias_when_unique_node():
         "run_ar": {"module": "ar_llm"},
     }
     edges = {
-        "v2a": {"from": "vision_encoder", "output": "image_embeds", "to": "run_ar", "as": "und"},
+        "v2a": {"from": "vision_encoder", "to": "run_ar"},
         "ar_sink": {"from": "run_ar", "to": "end"},
     }
     g = TrainingGraph(
@@ -368,7 +340,7 @@ def test_module_alias_ambiguous_raises():
         "run_ar": {"module": "ar_llm"},
     }
     edges = {
-        "edge": {"from": "vq_decoder", "output": "x", "to": "run_ar", "as": "x"},
+        "edge": {"from": "vq_decoder", "to": "run_ar"},
     }
     with pytest.raises(ValueError, match="ambiguous"):
         TrainingGraph(nodes=nodes, edges=edges, training_edges=["edge"])
@@ -392,9 +364,9 @@ def test_to_mermaid_janus_joint_contains_node_labels_and_end_sink():
     assert re.search(r'\brun_ar\["run_ar<br/><i>ar_llm\.forward</i>"\]', out)
     assert re.search(r'\bvq_loss\["vq_loss<br/><i>vq_decoder\.gen_loss</i>"\]', out)
 
-    assert "vision_encoder -->|" in out and "image_embeds → und_image_embeds" in out
-    assert "vq_encode -->|" in out and "gen_embeds → gen_image_embeds" in out
-    assert "run_ar -->|" in out and "hidden_states" in out
+    assert "vision_encoder -->" in out and "run_ar" in out
+    assert "vq_encode -->" in out and "run_ar" in out
+    assert "run_ar -->" in out and "vq_loss" in out
 
     # `end` rendered as the dashed terminal.
     assert "end_sink" in out and "vq_loss --> end_sink" in out

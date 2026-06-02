@@ -4,7 +4,7 @@ generation_graph:
   initial: prompt_to_image
   states:
     prompt_to_image:
-      body: [tok_enc_to_ar, ar_run_sink]
+      body: [tok_to_ar, ar_run_sink]
       transitions:
         - { condition: { type: default }, next_state: image_vq_start }
 

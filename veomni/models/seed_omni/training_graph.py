@@ -128,8 +128,6 @@ class TrainingGraph:
                     name=raw.name,
                     from_=from_,
                     to=to,
-                    output_key=raw.output_key,
-                    as_=raw.as_,
                 )
             )
             for endpoint in (from_, to):
@@ -203,24 +201,18 @@ class TrainingGraph:
     ) -> Dict[str, Any]:
         """Build the kwargs dict for ``node``'s forward call.
 
-        Priority (last wins):
+        Returns a shallow copy of ``raw_batch`` — the shared
+        ``conversation_list`` carrier (and any other batch keys) is visible to
+        every node.  Modules mutate the carrier in place; :meth:`OmniModel.forward`
+        writes the updated carrier back into ``batch`` after each node.  Edges
+        declare execution order only — they do not route individual fields.
 
-        1. ``raw_batch`` — globally transparent to every node.
-        2. Edge-routed values from already-executed predecessor nodes.
-
-        ``outputs`` is keyed by **node name**.
+        ``outputs`` is accepted for API compatibility but is not used for
+        kwargs assembly (downstream heads read ``conversation_list.hidden_states``
+        etc. from the carrier instead).
         """
-        kwargs: Dict[str, Any] = dict(raw_batch)
-        for e in self._active_edges:
-            if e.to != node:
-                continue
-            src_out = outputs.get(e.from_)
-            if src_out is None:
-                continue
-            val = src_out.get(e.output_key)
-            if val is not None and e.as_ is not None:
-                kwargs[e.as_] = val
-        return kwargs
+        del node, outputs  # topology-only edges; carrier holds cross-node state.
+        return dict(raw_batch)
 
     # ── pool accessors (used by FSM) ─────────────────────────────────────────
 
@@ -390,10 +382,7 @@ class TrainingGraph:
 
     @staticmethod
     def _edge_label(e: EdgeDef) -> str:
-        if e.output_key and e.as_ and e.output_key != e.as_:
-            return f'"{e.output_key} → {e.as_}"'
-        if e.output_key:
-            return f'"{e.output_key}"'
+        """Render a body edge label (topology-only — no field routing)."""
         return ""
 
     def _topological_sort(self) -> List[str]:

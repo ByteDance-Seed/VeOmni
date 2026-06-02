@@ -3,11 +3,10 @@
 Scope
 -----
 These tests exercise the *graph behaviour* — TrainingGraph topo order,
-GenerationGraph FSM step / transition / topo-execution / permissive
-edge routing semantics, ``_loss`` aggregation, edge routing including
-the virtual ``end`` keyword — without any real ML modules.  Every
-module is a :mod:`print_modules` stand-in that records its calls into
-a shared log; assertions then read the log to verify the framework
+GenerationGraph FSM step / transition / topo-execution semantics,
+``_loss`` aggregation, and the virtual ``end`` keyword — without any real ML
+modules.  Every module is a :mod:`print_modules` stand-in that records its
+calls into a shared log; assertions then read the log to verify the framework
 executes things in the expected order.
 
 Graph vocabulary and inference FSMs live in :mod:`tests.seed_omni.toy_config`
@@ -32,11 +31,11 @@ Coverage
   subsequent text generation.
 
 * **Inference (understanding)**: tests the **multi-source** initial
-  state (``prompt_to_text`` with both vision_to_ar and tok_enc_to_ar
+  state (``prompt_to_text`` with both ``vis_to_ar`` and ``tok_to_ar``
   feeding ``run_ar``) — verifies the topological body-execution rule
   (run_ar fires only after BOTH incoming edges have been processed),
-  and the **permissive routing** behaviour when no image is present
-  (siglip returns ``{}``, edge silently skips, run_ar still executes).
+  and the behaviour when no image is present (siglip returns ``{}``,
+  run_ar still executes without ``und_image_embeds``).
 """
 
 from __future__ import annotations
@@ -148,10 +147,12 @@ def test_training_graph_topology_and_active_nodes():
 
 def test_training_forward_calls_each_node_once_in_order():
     model, log = _build_model(token_script=[])
+    carrier: dict[str, Any] = {}
 
     trace: list[str] = []
     model(
         trace=trace,
+        conversation_list=carrier,
         input_ids=10,
         pixel_values="<pix>",
         labels="<labels>",
@@ -167,16 +168,21 @@ def test_training_forward_calls_each_node_once_in_order():
     assert any("vqvae.encode(" in evt for evt in vqvae_calls)
     assert any("vqvae.decode(" in evt for evt in vqvae_calls)
 
-    # Edge routing carried strings unchanged into run_ar.
-    ar_kwargs = next(evt for evt in log if evt.startswith("ar.forward("))
-    for k in ("inputs_embeds", "und_image_embeds", "gen_image_embeds"):
-        assert k in ar_kwargs
+    # Modules mutate the shared carrier in place — no edge field routing.
+    assert carrier["inputs_embeds"] == "<wte:10>"
+    assert carrier["gen_embeds"] == "<vq_gen_embeds>"
+    assert carrier["hidden_states"] == "<ar_hidden>"
 
 
 def test_training_forward_aggregates_single_loss_per_module():
     model, _ = _build_model(token_script=[])
 
-    out = model(input_ids=10, pixel_values="<pix>", labels="<labels>")
+    out = model(
+        conversation_list={},
+        input_ids=10,
+        pixel_values="<pix>",
+        labels="<labels>",
+    )
 
     # Each loss-emitting node contributes one scalar; they are summed.
     losses = out["losses"]
@@ -264,8 +270,8 @@ def test_generate_appends_input_ids_to_full_sequence():
     assert scalar_token_id(ids) == TOK_EOS
 
 
-def test_fsm_image_vq_routes_embed_back_into_inputs_embeds():
-    """In ``image_vq``, edge ``vae_dec_to_ar`` writes ctx['embed'] → ctx['inputs_embeds']."""
+def test_fsm_image_vq_leaves_vae_embed_in_ctx():
+    """In ``image_vq``, ``vae_decode`` writes ``embed`` into ``ctx`` for the next AR step."""
     model, _ = _build_model(
         token_script=[TOK_BOI],
         infer="interleave",
@@ -279,9 +285,7 @@ def test_fsm_image_vq_routes_embed_back_into_inputs_embeds():
         max_new_tokens=3,
     )
 
-    # The vae_dec_to_ar edge fires AFTER vae_decode runs in image_vq.
     assert final_ctx["embed"] == "<vq_decode_embed>"
-    assert final_ctx["inputs_embeds"] == "<vq_decode_embed>"
 
 
 def test_fsm_emit_image_start_runs_inside_bridge_body():
@@ -341,11 +345,11 @@ def test_fsm_t2i_only_starts_with_prompt_state_and_ends_after_image():
 
 
 def test_fsm_understanding_multi_source_runs_ar_after_both_inputs_route():
-    """``prompt_to_text`` body: vis_to_ar → tok_enc_to_ar → ar_to_tok_dec → sink.
+    """``prompt_to_text`` body: vis_to_ar → tok_to_ar → ar_to_tok_dec → sink.
 
     Topological execution rule: ``run_ar`` has fan-in 2 (vis_to_ar +
-    tok_enc_to_ar).  It must execute exactly ONCE, **after** the second
-    routing edge has been processed — at which point both
+    tok_to_ar).  It must execute exactly ONCE, **after** the second
+    in-body edge has been processed — at which point both
     ``und_image_embeds`` and ``inputs_embeds`` are present in ctx.
     """
     model, log = _build_model(
@@ -363,7 +367,7 @@ def test_fsm_understanding_multi_source_runs_ar_after_both_inputs_route():
 
     # Each visited node should appear once per FSM iteration.  The order
     # within `prompt_to_text` is: vis_encode (when vis_to_ar starts),
-    # tok_encode (when tok_enc_to_ar starts), then run_ar (after BOTH
+    # tok_encode (when tok_to_ar starts), then run_ar (after BOTH
     # incoming edges have been processed), then tok_decode.
     assert trace[:4] == [
         "prompt_to_text:vis_encode",
@@ -378,13 +382,12 @@ def test_fsm_understanding_multi_source_runs_ar_after_both_inputs_route():
     assert "und_image_embeds" in ar_call
 
 
-def test_fsm_understanding_text_only_prompt_uses_permissive_routing():
+def test_fsm_understanding_text_only_prompt_skips_missing_vision_embeds():
     """Text-only initial context (no ``pixel_values``).
 
-    siglip returns ``{}``; the ``vis_to_ar`` edge has no ``image_embeds``
-    in ctx so routing silently skips.  ``run_ar`` still executes (its
-    fan-in counter still decrements regardless of whether the route
-    succeeded), and ``und_image_embeds`` simply isn't passed as a kwarg.
+    siglip returns ``{}``; ``und_image_embeds`` never lands in ctx.
+    ``run_ar`` still executes after both fan-in edges complete, and simply
+    omits ``und_image_embeds`` from its kwargs.
     """
     model, log = _build_model(
         token_script=[7, TOK_EOS],
@@ -404,8 +407,7 @@ def test_fsm_understanding_text_only_prompt_uses_permissive_routing():
     assert len(vis_calls) == 1
     assert "pixel_values" not in vis_calls[0]
 
-    # vis_to_ar therefore had nothing to route — `image_embeds` was never
-    # in ctx — and run_ar ran without `und_image_embeds`.
+    # vis_encode returned nothing — `und_image_embeds` was never written.
     ar_calls = [evt for evt in log if "ar.generate_step(" in evt]
     assert any("inputs_embeds" in c and "und_image_embeds" not in c for c in ar_calls), ar_calls
 
@@ -698,8 +700,7 @@ def test_generation_graph_mermaid_renders_body_subgraphs_and_loops():
     assert 'text_ar__run_ar["run_ar<br/><i>ar.forward</i>"]' in txt
     assert "text_ar__tok_encode -->" in txt and "text_ar__run_ar" in txt
 
-    # State transitions: thick `==>` arrows + quoted condition labels (so the
-    # styling is visually distinct from intra-body `output → as` data edges).
+    # State transitions: thick `==>` arrows + quoted condition labels.
     assert f'state_text_ar ==>|"module_signal({SIGNAL_START_IMAGE_GEN})"| state_image_vq_start' in txt
     # `image_vq` runs until vae_decode signals completion via `module_signal`.
     assert 'state_image_vq ==>|"module_signal(image_complete)"| state_image_vq_end' in txt

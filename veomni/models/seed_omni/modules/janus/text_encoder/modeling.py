@@ -45,27 +45,31 @@ fits naturally into the FSM step body without needing an explicit
 ``batch_size`` argument.
 """
 
-import logging
 from typing import Any, Dict, List, Optional
 
 import torch
 import torch.nn.functional as F
 
 from ....conversation import (
-    ConversationPart,
+    ConversationItem,
     TrainConversation,
     TrainSegment,
     assemble_labels,
+    get_llm_embed,
+    get_token_id,
+    is_embedded,
     is_train_conversation,
+    item_role,
     latest_assistant_text_token_ids,
+    maybe_merge_outputs,
+    needs_embedding,
+    seal_phase_outputs,
+    set_llm_embed,
 )
 from ....generation_graph import FSM_SIGNAL_KEY
 from ....graph import scalar_token_id
 from ...base.text_encoder.modeling import TextEncoder
 from .configuration import JanusTextEncoderConfig
-
-
-logger = logging.getLogger(__name__)
 
 
 # Signal *values* written to ``ctx[FSM_SIGNAL_KEY]`` by :meth:`decode`.
@@ -141,6 +145,13 @@ class JanusTextEncoder(TextEncoder):
         # :meth:`encode`) marks exactly these positions for the backbone
         # scatter + the VQ gen-loss.
         self._gen_image_base: Optional[int] = None
+        # Sampled text token ids for the current assistant turn (not stored
+        # on the conversation list — only embeds live there).
+        self._text_token_cache: list[int] = []
+
+    def reset_inference_state(self) -> None:
+        """Clear per-request text token cache."""
+        self._text_token_cache.clear()
 
     def set_conversation_tokenizer(self, conversation_tokenizer: Any) -> None:
         """Resolve Janus special-token ids from the global conversation tokenizer."""
@@ -328,39 +339,21 @@ class JanusTextEncoder(TextEncoder):
     def generate(
         self,
         *,
-        conversation_list: Optional[List[ConversationPart]] = None,
+        conversation_list: Optional[List[ConversationItem]] = None,
         past_key_values: Optional[Any] = None,
         generation_kwargs: Optional[Dict[str, Any]] = None,
         **_: Any,
     ) -> Dict[str, Any]:
-        """Embed every text / token part that lacks ``inputs_embeds``.
+        """Embed every text / token part that is not yet embedded.
 
         First call (no KV cache): tokenises each user / assistant ``text``
-        part with the global tokenizer, prepends a ``bos`` token part at
-        the very front of the list, and fills ``inputs_embeds`` for every
-        part that doesn't already have one (boundary-token parts emitted
-        by :meth:`emit_image_start` / :meth:`emit_image_end` already
-        carry their embed; sampled-token parts appended by
-        :meth:`decode` / :meth:`JanusVqvae.generate` likewise).
+        part, prepends a ``bos`` token at the front, and embeds every part
+        that still needs embedding (boundary-token parts from
+        :meth:`emit_image_start` / :meth:`emit_image_end` already carry
+        embeds in ``value``).
 
-        Subsequent calls (KV cache present): walks the tail of the list
-        embedding any newly-appended ``token`` part whose ``inputs_embeds``
-        is still ``None``.  This is the AR fast path used by ``text_ar``.
-
-        Classifier-free guidance (CFG) prep
-        -----------------------------------
-        When ``generation_kwargs['guidance_scale'] > 1.0`` and we're on
-        the prompt pass (no KV cache yet), we also build the matching
-        unconditional ``inputs_embeds`` and stash it under
-        ``cfg_uncond_inputs_embeds`` in the return dict so
-        :meth:`JanusLlama.generate` can build a bs=2 KV cache lazily on
-        the first ``image_vq`` AR step.  Construction follows the HF
-        reference (``modeling_janus.py:1282-1285``): same length as the
-        cond prompt, every non-``<bos>`` position replaced by
-        ``pad_token_id`` before the embedding lookup.  ``<begin_of_image>``
-        is also kept when present, but at this point in the FSM (prompt
-        pass) the boi has not yet been appended to the conversation, so
-        the rule reduces to "keep BOS, pad everything else".
+        Subsequent calls (KV cache present): embeds newly-appended ``token``
+        parts whose ``value`` is still a scalar id.
         """
         if conversation_list is None:
             return {}
@@ -371,25 +364,62 @@ class JanusTextEncoder(TextEncoder):
             self._inject_bos(conversation_list)
             self._inject_chat_template(conversation_list)
             for part in conversation_list:
-                if part.inputs_embeds is not None:
+                if not needs_embedding(part):
                     continue
                 self._embed_part(part)
-            uncond = self._maybe_build_cfg_uncond_embeds(conversation_list, generation_kwargs)
-            if uncond is not None:
-                out["cfg_uncond_inputs_embeds"] = uncond
-        else:
-            # AR fast path: every prior part is already embedded; walk
-            # backward from the tail until we hit a populated part so
-            # the cost is O(new_parts), not O(total_parts).  Without
-            # this guard the cost is quadratic in the number of
-            # generated tokens (esp. after a 576-step image_vq span).
-            tail_to_embed: List[ConversationPart] = []
-            for part in reversed(conversation_list):
-                if part.inputs_embeds is not None:
-                    break
-                tail_to_embed.append(part)
-            for part in reversed(tail_to_embed):
-                self._embed_part(part)
+        return out
+
+    def ar_step(
+        self,
+        hidden_states: Optional[torch.Tensor] = None,
+        conversation_list: Optional[List[ConversationItem]] = None,
+        generation_kwargs: Optional[Dict[str, Any]] = None,
+        temperature: float = 1.0,
+        top_p: float = 1.0,
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
+        """Monolithic text AR step: decode hidden → id → embed → merge.
+
+        Reads backbone ``hidden_states``, samples one text token, stores the
+        id in the module-private cache, replaces the trailing ``output``
+        item's ``value`` with the wte embed, merges adjacent text-phase
+        outputs, and raises FSM signals on boundary tokens.
+        """
+        if conversation_list is None:
+            return {}
+        out: Dict[str, Any] = {"conversation_list": conversation_list}
+        if hidden_states is None or not conversation_list:
+            return out
+
+        sampling = self._extract_sampling_kwargs(generation_kwargs, temperature, top_p, kwargs)
+        tok = self._sample_token(hidden_states, **sampling)
+        self._text_token_cache.append(int(tok))
+
+        device = self.embed_tokens.weight.device
+        dtype = self.embed_tokens.weight.dtype
+        ids = torch.tensor([[int(tok)]], dtype=torch.long, device=device)
+        embed = self.embed_tokens(ids).to(dtype=dtype)
+
+        tail = conversation_list[-1]
+        if tail.type != "output":
+            raise ValueError(
+                f"JanusTextEncoder.ar_step expects the conversation tail to be type='output', got {tail.type!r}."
+            )
+        set_llm_embed(tail, embed, token_id=int(tok))
+        tail.meta["input_ids"] = ids
+        maybe_merge_outputs(conversation_list, phase="text")
+
+        if self._boi_token_id is not None and tok == self._boi_token_id:
+            self._maybe_arm_cfg_for_image_gen(conversation_list, generation_kwargs, out)
+            seal_phase_outputs(conversation_list, phase="text", new_type="text")
+            tail.type = "soi"
+            tail.meta.pop("phase", None)
+            out[FSM_SIGNAL_KEY] = SIGNAL_START_IMAGE_GEN
+            out["ar_phase"] = "vq"
+        elif self._eos_token_id is not None and tok == self._eos_token_id:
+            seal_phase_outputs(conversation_list, phase="text", new_type="text")
+            out[FSM_SIGNAL_KEY] = SIGNAL_TEXT_DONE
+
         return out
 
     # ── Inference: decode + FSM signals (conversation-list aware) ────────────
@@ -400,7 +430,7 @@ class JanusTextEncoder(TextEncoder):
         labels: Optional[torch.LongTensor] = None,
         temperature: float = 1.0,
         top_p: float = 1.0,
-        conversation_list: Optional[List[ConversationPart]] = None,
+        conversation_list: Optional[List[ConversationItem]] = None,
         generation_kwargs: Optional[Dict[str, Any]] = None,
         **kwargs: Any,
     ) -> Dict[str, Any]:
@@ -422,6 +452,8 @@ class JanusTextEncoder(TextEncoder):
         scenario graph (``infer_gen.yaml``'s ``image_vq_start`` state runs
         ``emit_image_start``), not by this sampler.
         """
+        if hidden_states is None and is_train_conversation(conversation_list):
+            hidden_states = conversation_list.hidden_states
         if hidden_states is not None and is_train_conversation(conversation_list):
             if conversation_list.segments is None:
                 raise ValueError("JanusTextEncoder.decode: TrainConversation has no segments (encode must run first).")
@@ -479,36 +511,52 @@ class JanusTextEncoder(TextEncoder):
 
     def emit_image_start(
         self,
-        conversation_list: Optional[List[ConversationPart]] = None,
+        conversation_list: Optional[List[ConversationItem]] = None,
         **ctx: Any,
     ) -> Dict[str, Any]:
-        """Emit a single ``<begin_of_image>`` step + append a part."""
+        """Emit ``<begin_of_image>`` as a standalone ``soi`` conversation item."""
         token_id = self._boi_token_id if self._boi_token_id is not None else self.config.begin_of_image_token_id
         if token_id is None:
             raise RuntimeError(
                 "JanusTextEncoder.emit_image_start requires begin_of_image_token_id — "
                 "call set_conversation_tokenizer() before inference."
             )
-        return self._emit(int(token_id), conversation_list, ctx)
+        if conversation_list is not None:
+            seal_phase_outputs(conversation_list, phase="text", new_type="text")
+        out: Dict[str, Any] = {}
+        self._maybe_arm_cfg_for_image_gen(
+            conversation_list,
+            ctx.get("generation_kwargs"),
+            out,
+        )
+        out.update(self._emit_boundary(int(token_id), "soi", conversation_list, ctx))
+        out["ar_phase"] = "vq"
+        return out
 
     def emit_image_end(
         self,
-        conversation_list: Optional[List[ConversationPart]] = None,
+        conversation_list: Optional[List[ConversationItem]] = None,
         **ctx: Any,
     ) -> Dict[str, Any]:
-        """Emit a single ``<end_of_image>`` step + append a part."""
+        """Emit ``<end_of_image>`` as a standalone ``eoi`` conversation item."""
         token_id = self._eoi_token_id if self._eoi_token_id is not None else self.config.end_of_image_token_id
         if token_id is None:
             raise RuntimeError(
                 "JanusTextEncoder.emit_image_end requires end_of_image_token_id — "
                 "call set_conversation_tokenizer() before inference."
             )
-        return self._emit(int(token_id), conversation_list, ctx)
+        if conversation_list is not None:
+            seal_phase_outputs(conversation_list, phase="vq", new_type="image")
+        out = self._emit_boundary(int(token_id), "eoi", conversation_list, ctx)
+        out["ar_phase"] = "text"
+        out["collapse_cfg"] = True
+        return out
 
-    def _emit(
+    def _emit_boundary(
         self,
         token_id: int,
-        conversation_list: Optional[List[ConversationPart]],
+        item_type: str,
+        conversation_list: Optional[List[ConversationItem]],
         ctx: Dict[str, Any],
     ) -> Dict[str, Any]:
         device = self.embed_tokens.weight.device
@@ -518,49 +566,64 @@ class JanusTextEncoder(TextEncoder):
         inputs_embeds = self.embed_tokens(ids).to(dtype=dtype)
         out: Dict[str, Any] = {"input_ids": ids, "inputs_embeds": inputs_embeds}
         if conversation_list is not None:
-            # Reuse the just-built tensors so the conversation part and
-            # the FSM step-token share the same backing storage (and
-            # batch shape) — avoids the shape drift that would happen
-            # if ``_append_token_part`` rebuilt a hard-coded ``(1, 1)``
-            # tensor under a B > 1 ctx.  Single-process inference still
-            # forces B == 1, but the contract should not silently
-            # diverge if that ever changes.
             conversation_list.append(
-                ConversationPart(
-                    kind="token",
-                    role="assistant",
-                    token_id=token_id,
-                    input_ids=ids,
-                    inputs_embeds=inputs_embeds,
+                ConversationItem(
+                    type=item_type,
+                    value=inputs_embeds,
+                    meta={"role": "assistant", "token_id": int(token_id), "input_ids": ids},
                 )
             )
             out["conversation_list"] = conversation_list
         return out
 
-    # ── CFG: build the unconditional inputs_embeds ───────────────────────────
-
-    def _maybe_build_cfg_uncond_embeds(
+    def _emit(
         self,
-        conversation_list: List[ConversationPart],
+        token_id: int,
+        conversation_list: Optional[List[ConversationItem]],
+        ctx: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Legacy emit helper — prefer :meth:`_emit_boundary`."""
+        return self._emit_boundary(token_id, "token", conversation_list, ctx)
+
+    # ── CFG: arm at SOI from ``generation_kwargs`` ────────────────────────────
+
+    def _maybe_arm_cfg_for_image_gen(
+        self,
+        conversation_list: Optional[List[ConversationItem]],
         generation_kwargs: Optional[Dict[str, Any]],
+        out: Dict[str, Any],
+    ) -> None:
+        """Opt into CFG when ``<soi>`` opens the image span.
+
+        Reads ``guidance_scale`` from ``generation_kwargs`` (opaque to the
+        framework).  When ``> 1``, writes a one-shot ``ctx["cfg"]`` arm signal
+        plus ``cfg_uncond_inputs_embeds`` for the backbone to expand KV on its
+        next forward.  Llama clears ``cfg["enabled"]`` after the cache is built.
+        """
+        if conversation_list is None or not generation_kwargs:
+            return
+        cfg_w = generation_kwargs.get("guidance_scale")
+        if cfg_w is None or float(cfg_w) <= 1.0:
+            return
+        uncond = self._build_cfg_uncond_embeds(conversation_list)
+        if uncond is None:
+            return
+        out["cfg"] = {"enabled": True, "guidance_scale": float(cfg_w)}
+        out["cfg_uncond_inputs_embeds"] = uncond
+
+    def _build_cfg_uncond_embeds(
+        self,
+        conversation_list: List[ConversationItem],
     ) -> Optional[torch.Tensor]:
         """Build ``(1, T_prompt, hidden)`` uncond inputs_embeds, or ``None``.
 
-        Returns ``None`` (skip CFG) when:
-
-        * ``guidance_scale`` is missing / <= 1.0;
-        * the tokenizer wasn't wired in (``set_conversation_tokenizer`` not called) — we
-          can't resolve ``pad_token_id`` then;
-        * any conversation part already carries non-text content (image_und
-          parts have ``input_ids = None``); Janus's CFG protocol is only
-          defined for the T2I path so we conservatively bail out.
+        Returns ``None`` when the tokenizer is unavailable or the prompt is
+        not text-only (e.g. I2T with an ``image`` part).
         """
-        if not generation_kwargs:
-            return None
-        cfg_w = generation_kwargs.get("guidance_scale")
-        if cfg_w is None or float(cfg_w) <= 1.0:
-            return None
         if self._conversation_tokenizer is None or self._pad_token_id is None or self._bos_token_id is None:
+            return None
+
+        if any(p.type == "image" for p in conversation_list):
             return None
 
         bos_id = int(self._bos_token_id)
@@ -571,22 +634,16 @@ class JanusTextEncoder(TextEncoder):
 
         uncond_chunks: List[torch.Tensor] = []
         for part in conversation_list:
-            if part.inputs_embeds is None:
+            if part.type == "output":
                 continue
-            ids = part.input_ids
-            if ids is None or ids.numel() == 0:
-                # image_und / image_gen part — CFG masking rule undefined for
-                # multi-modal prompts in Janus.  Abort the whole uncond build
-                # and warn so users don't silently get noise-quality samples
-                # (the failure mode CFG is meant to fix).
-                logger.warning(
-                    "JanusTextEncoder: guidance_scale > 1 was requested but the prompt "
-                    "contains a non-text part (kind=%r) with no input_ids — CFG only "
-                    "supports T2I prompts (text-only). Skipping uncond branch; the LLM "
-                    "will run with cond logits only.",
-                    part.kind,
-                )
-                return None
+            embed = get_llm_embed(part)
+            if embed is None:
+                continue
+            ids = part.meta.get("input_ids")
+            if ids is None:
+                if part.type == "image":
+                    return None
+                continue
             keep_mask = ids == bos_id
             if boi_id is not None:
                 keep_mask = keep_mask | (ids == int(boi_id))
@@ -612,7 +669,9 @@ class JanusTextEncoder(TextEncoder):
         conversation = ctx.get("conversation_list")
         if not isinstance(conversation, list):
             return {}
-        token_ids = latest_assistant_text_token_ids(conversation)
+        token_ids = list(self._text_token_cache)
+        if not token_ids:
+            token_ids = latest_assistant_text_token_ids(conversation)
         if not token_ids:
             return {}
         if self._conversation_tokenizer is None:
@@ -622,25 +681,31 @@ class JanusTextEncoder(TextEncoder):
 
     # ── Internal helpers ─────────────────────────────────────────────────────
 
-    def _inject_bos(self, conversation_list: List[ConversationPart]) -> None:
+    def _inject_bos(self, conversation_list: List[ConversationItem]) -> None:
         if self._bos_token_id is None:
             return
         already_bos = (
             conversation_list
-            and conversation_list[0].kind == "token"
-            and conversation_list[0].token_id == self._bos_token_id
+            and conversation_list[0].type == "token"
+            and item_role(conversation_list[0]) == "system"
+            and get_token_id(conversation_list[0]) == self._bos_token_id
         )
         if already_bos:
             return
-        bos = ConversationPart(kind="token", role="system", token_id=int(self._bos_token_id))
         device = self.embed_tokens.weight.device
         dtype = self.embed_tokens.weight.dtype
         ids = torch.tensor([[self._bos_token_id]], dtype=torch.long, device=device)
-        bos.input_ids = ids
-        bos.inputs_embeds = self.embed_tokens(ids).to(dtype=dtype)
-        conversation_list.insert(0, bos)
+        embed = self.embed_tokens(ids).to(dtype=dtype)
+        conversation_list.insert(
+            0,
+            ConversationItem(
+                type="token",
+                value=embed,
+                meta={"role": "system", "token_id": int(self._bos_token_id), "input_ids": ids},
+            ),
+        )
 
-    def _inject_chat_template(self, conversation_list: List[ConversationPart]) -> None:
+    def _inject_chat_template(self, conversation_list: List[ConversationItem]) -> None:
         """Insert Janus role markers + image boundaries in-place on the prompt pass.
 
         The text encoder is the sole authority on the on-the-wire prompt
@@ -667,47 +732,41 @@ class JanusTextEncoder(TextEncoder):
         if any(p.meta.get("source") == "chat_template" for p in conversation_list):
             return
 
-        def _text_marker(role: str, text: str) -> ConversationPart:
-            return ConversationPart(kind="text", role=role, text=text, meta={"source": "chat_template"})
+        def _text_marker(role: str, text: str) -> ConversationItem:
+            return ConversationItem(type="text", value=text, meta={"role": role, "source": "chat_template"})
 
-        def _token_marker(role: str, token_id: int) -> ConversationPart:
-            return ConversationPart(
-                kind="token",
-                role=role,
-                token_id=int(token_id),
-                meta={"source": "chat_template"},
+        def _token_marker(role: str, token_id: int) -> ConversationItem:
+            return ConversationItem(
+                type="token",
+                value=int(token_id),
+                meta={"role": role, "source": "chat_template", "token_id": int(token_id)},
             )
 
-        new_list: List[ConversationPart] = []
+        new_list: List[ConversationItem] = []
         prev_role: Optional[str] = None
         for idx, part in enumerate(conversation_list):
-            # Bos sits at the very front; system prompt rides right after.
-            if part.kind == "token" and part.role == "system" and part.token_id == self._bos_token_id:
+            role = item_role(part)
+            if part.type == "token" and role == "system" and get_token_id(part) == self._bos_token_id:
                 new_list.append(part)
                 new_list.append(_text_marker("system", _JANUS_SYSTEM_PROMPT))
                 continue
 
-            if part.role != prev_role:
-                if part.role == "user":
+            if role != prev_role:
+                if role == "user":
                     new_list.append(_text_marker("user", _JANUS_USER_PREFIX))
-                elif part.role == "assistant":
+                elif role == "assistant":
                     new_list.append(_text_marker("assistant", _JANUS_ASSISTANT_PREFIX))
-                prev_role = part.role
+                prev_role = role
 
-            # Wrap each image_und with <begin_of_image> / <end_of_image>
-            # boundary tokens, then insert a "\n" separator iff the next
-            # part is in the SAME role (i.e. image followed by user
-            # text) — mirrors the per-content "\n" the upstream Jinja
-            # template emits inside a single message.
-            if part.kind == "image_und":
+            if part.type == "image" and role == "user":
                 if self._boi_token_id is not None:
                     new_list.append(_token_marker("user", self._boi_token_id))
                 new_list.append(part)
                 if self._eoi_token_id is not None:
                     new_list.append(_token_marker("user", self._eoi_token_id))
                 next_part = conversation_list[idx + 1] if idx + 1 < len(conversation_list) else None
-                if next_part is not None and next_part.role == part.role:
-                    new_list.append(_text_marker(part.role, "\n"))
+                if next_part is not None and item_role(next_part) == role:
+                    new_list.append(_text_marker(role, "\n"))
                 continue
 
             new_list.append(part)
@@ -715,54 +774,62 @@ class JanusTextEncoder(TextEncoder):
         conversation_list.clear()
         conversation_list.extend(new_list)
 
-    def _embed_part(self, part: ConversationPart) -> None:
+    def _embed_part(self, part: ConversationItem) -> None:
         device = self.embed_tokens.weight.device
         dtype = self.embed_tokens.weight.dtype
 
-        if part.kind == "text":
-            if not part.text:
-                # Empty assistant marker: nothing to embed yet.
+        if part.type == "text":
+            if not part.value:
                 return
             if self._conversation_tokenizer is None:
                 raise RuntimeError(
                     "JanusTextEncoder.generate needs a tokenizer for text parts — "
                     "call set_conversation_tokenizer(conversation_tokenizer) on the module first."
                 )
-            ids = self._conversation_tokenizer(part.text, return_tensors="pt", add_special_tokens=False)["input_ids"]
+            ids = self._conversation_tokenizer(part.value, return_tensors="pt", add_special_tokens=False)["input_ids"]
             ids = ids.to(device=device)
-            part.input_ids = ids
-            part.inputs_embeds = self.embed_tokens(ids).to(dtype=dtype)
+            embed = self.embed_tokens(ids).to(dtype=dtype)
+            part.meta["input_ids"] = ids
+            part.value = embed
             return
 
-        if part.kind == "token":
-            if part.token_id is None:
+        if part.type == "token":
+            tid = get_token_id(part)
+            if tid is None:
                 return
-            ids = torch.tensor([[int(part.token_id)]], dtype=torch.long, device=device)
-            part.input_ids = ids
-            part.inputs_embeds = self.embed_tokens(ids).to(dtype=dtype)
-
-        # image_und / image_gen parts are not the text encoder's responsibility.
+            if is_embedded(part):
+                return
+            ids = torch.tensor([[int(tid)]], dtype=torch.long, device=device)
+            embed = self.embed_tokens(ids).to(dtype=dtype)
+            set_llm_embed(part, embed, token_id=int(tid))
+            part.meta["input_ids"] = ids
 
     def _append_token_part(
         self,
-        conversation_list: List[ConversationPart],
+        conversation_list: List[ConversationItem],
         token_id: int,
         inputs_embeds: Optional[torch.Tensor] = None,
     ) -> None:
         device = self.embed_tokens.weight.device
         dtype = self.embed_tokens.weight.dtype
-        ids = torch.tensor([[int(token_id)]], dtype=torch.long, device=device)
         if inputs_embeds is None:
+            ids = torch.tensor([[int(token_id)]], dtype=torch.long, device=device)
             inputs_embeds = self.embed_tokens(ids).to(dtype=dtype)
-        conversation_list.append(
-            ConversationPart(
-                kind="token",
-                role="assistant",
-                token_id=int(token_id),
-                input_ids=ids,
-                inputs_embeds=inputs_embeds,
+            conversation_list.append(
+                ConversationItem(
+                    type="token",
+                    value=inputs_embeds,
+                    meta={"role": "assistant", "token_id": int(token_id), "input_ids": ids},
+                )
             )
-        )
+        else:
+            conversation_list.append(
+                ConversationItem(
+                    type="token",
+                    value=inputs_embeds,
+                    meta={"role": "assistant", "token_id": int(token_id)},
+                )
+            )
 
     def _token_id_tensor(self, token_id: int) -> torch.Tensor:
         device = self.embed_tokens.weight.device

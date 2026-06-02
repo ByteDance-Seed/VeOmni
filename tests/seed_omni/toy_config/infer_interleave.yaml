@@ -4,7 +4,7 @@ generation_graph:
   initial: text_ar
   states:
     text_ar:
-      body: [tok_enc_to_ar, ar_to_tok_dec, tok_dec_sink]
+      body: [tok_to_ar, ar_to_tok_dec, tok_dec_sink]
       transitions:
         - { condition: { type: module_signal, key: start_image_gen }, next_state: image_vq_start }
         - { condition: { type: module_signal, key: text_done }, next_state: done }

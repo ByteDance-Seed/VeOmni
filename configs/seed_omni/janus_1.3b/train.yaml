@@ -113,8 +113,10 @@ nodes:
   #    `siglip_encode` / `tok_encode` / `tok_decode` / `janus_llama` above.
   siglip_generate:     { module: janus_siglip.generate }                # writes inputs_embeds into image_und parts
   tok_encode_generate: { module: janus_text_encoder.generate }          # bos + tokenise text parts + tail-embed
+  tok_ar_step:         { module: janus_text_encoder.ar_step }          # decode+encode+merge (text AR)
   janus_llama_gen:     { module: janus_llama.generate }                 # concat parts on prompt; tail-only on AR
-  vae_generate:        { module: janus_vqvae.generate }                 # sample VQ token + on-complete decode image
+  vae_generate:        { module: janus_vqvae.generate }                 # alias → ar_step (VQ decode+encode+merge)
+  vae_ar_step:         { module: janus_vqvae.ar_step }                  # decode+encode+merge (VQ AR)
 
 # ── Graph edges (data dependencies) ───────────────────────────────────────────
 edges:
@@ -137,19 +139,19 @@ edges:
   siglip_to_vae:  { from: siglip_encode, to: vae_encode }
   vae_to_tok:     { from: vae_encode,     to: tok_encode }
   tok_to_ar:      { from: tok_encode,     to: janus_llama }
-  # Only hidden_states still rides an explicit edge (the carrier reaches the
-  # heads via the shared-batch write-back above).
-  ar_to_tok_decode: { from: janus_llama, output: hidden_states, to: tok_decode, as: hidden_states }
-  ar_to_vae_decode: { from: janus_llama, output: hidden_states, to: vae_decode, as: hidden_states }
+  # Decode heads read ``TrainConversation.hidden_states`` from the carrier
+  # (written by janus_llama.post_forward) — edges are topology-only.
+  ar_to_tok_decode: { from: janus_llama, to: tok_decode }
+  ar_to_vae_decode: { from: janus_llama, to: vae_decode }
   tok_decode_sink:  { from: tok_decode,  to: end }
   vae_decode_sink:  { from: vae_decode,  to: end }
 
   # ── Inference-only (cyclic; not in training subset).
-  vae_decode_to_ar:    { from: vae_decode,    output: embed,         to: janus_llama, as: inputs_embeds }
+  vae_decode_to_ar:    { from: vae_decode,    to: janus_llama }
 
   # ── Inference bridge edges: emit boundary token + feed it into the LLM.
-  emit_start_to_ar:    { from: emit_image_start, output: inputs_embeds, to: janus_llama, as: inputs_embeds }
-  emit_end_to_ar:      { from: emit_image_end,   output: inputs_embeds, to: janus_llama, as: inputs_embeds }
+  emit_start_to_ar:    { from: emit_image_start, to: janus_llama }
+  emit_end_to_ar:      { from: emit_image_end,   to: janus_llama }
   emit_start_sink:     { from: emit_image_start, to: end }
   emit_end_sink:       { from: emit_image_end,   to: end }
 
@@ -162,21 +164,21 @@ edges:
   ar_run_sink:         { from: janus_llama, to: end }
 
   # ── Inference-only (conversation-list path).
-  #    All edges below route a single `conversation_list` slot — every
-  #    encoder mutates the same list (filling per-part `inputs_embeds`)
-  #    so multiple writes are idempotent on the shared Python object.
-  #    Routed by name + `as` so the FSM body order alone determines
-  #    which module gets to mutate next; janus_llama_gen runs once all
-  #    upstream encoders have filled their parts (topological fan-in).
-  vision_to_llm:       { from: siglip_generate,     output: conversation_list, to: janus_llama_gen, as: conversation_list }
-  tokenc_to_llm:       { from: tok_encode_generate, output: conversation_list, to: janus_llama_gen, as: conversation_list }
-  llm_to_tokdec:       { from: janus_llama_gen,     output: hidden_states,     to: tok_decode,      as: hidden_states }
-  llm_to_vaegen:       { from: janus_llama_gen,     output: hidden_states,     to: vae_generate,    as: hidden_states }
-  vaegen_to_llm:       { from: vae_generate,        output: conversation_list, to: janus_llama_gen, as: conversation_list }
-  tokdec_to_llm:       { from: tok_decode,          output: conversation_list, to: janus_llama_gen, as: conversation_list }
-  emit_start_to_llm:   { from: emit_image_start,    output: conversation_list, to: janus_llama_gen, as: conversation_list }
-  emit_end_to_llm:     { from: emit_image_end,      output: conversation_list, to: janus_llama_gen, as: conversation_list }
-  vaegen_sink:         { from: vae_generate,    to: end }
+  #    All edges below are topology-only — encoders mutate the shared
+  #    ``conversation_list`` object in ``ctx``; later AR steps use
+  #    ``input_ids`` / ``past_key_values`` / ``hidden_states`` directly.
+  vision_to_llm:       { from: siglip_generate,     to: janus_llama_gen }
+  tokenc_to_llm:       { from: tok_encode_generate, to: janus_llama_gen }
+  llm_to_text_ar:      { from: janus_llama_gen,     to: tok_ar_step }
+  text_ar_sink:        { from: tok_ar_step,         to: end }
+  llm_to_vaegen:       { from: janus_llama_gen,     to: vae_ar_step }
+  vaegen_to_llm:       { from: vae_ar_step,         to: janus_llama_gen }
+  # Legacy training / test edges (pre-v2 conversation AR path).
+  llm_to_tokdec:       { from: janus_llama_gen,     to: tok_decode }
+  tokdec_to_llm:       { from: tok_decode,          to: janus_llama_gen }
+  emit_start_to_llm:   { from: emit_image_start,    to: janus_llama_gen }
+  emit_end_to_llm:     { from: emit_image_end,      to: janus_llama_gen }
+  vaegen_sink:         { from: vae_ar_step,         to: end }
   llm_run_sink:        { from: janus_llama_gen, to: end }
   # Reuse the existing `tok_decode_sink` (declared above for the training
   # graph) and the existing `emit_*_sink` edges as the conversation-list

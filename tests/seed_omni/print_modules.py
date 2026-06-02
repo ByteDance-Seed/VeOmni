@@ -10,8 +10,8 @@ Conventions
 -----------
 * Every module records ``"<name>.<method>(<sorted-kwarg-keys>)"`` on call.
 * Real-shaped outputs are stand-in strings (e.g. ``"<embed:input_ids=10>"``)
-  so downstream nodes can carry them through edge routing without relying
-  on tensor maths.
+  written into the shared ``conversation_list`` dict carrier so downstream
+  nodes read cross-module state without edge field routing.
 * Modules that take part in the *training* graph emit a ``_loss`` key whose
   value is a zero-dim ``torch.Tensor`` — :class:`OmniModel.forward` sums
   them into the total scalar.  Modules that only run in inference omit
@@ -47,6 +47,20 @@ def _infer_batch_size(kwargs: dict[str, Any]) -> int:
     if isinstance(v, torch.Tensor) and v.dim() >= 1:
         return int(v.size(0))
     return 1
+
+
+def _carrier(kwargs: dict[str, Any]) -> dict[str, Any]:
+    """Shared mutable dict carrier (mirrors :class:`TrainConversation` role)."""
+    carrier = kwargs.get("conversation_list")
+    if carrier is None:
+        carrier = {}
+    return carrier
+
+
+def _with_carrier(kwargs: dict[str, Any], **updates: Any) -> dict[str, Any]:
+    carrier = _carrier(kwargs)
+    carrier.update(updates)
+    return {"conversation_list": carrier, **updates}
 
 
 # ── Base ──────────────────────────────────────────────────────────────────────
@@ -91,7 +105,7 @@ class PrintVisionEncoder(_PrintBase):
         self._record("forward", **kwargs)
         if kwargs.get("pixel_values") is None:
             return {}
-        return {"image_embeds": "<vis_embeds>"}
+        return _with_carrier(kwargs, und_image_embeds="<vis_embeds>")
 
     def generate_step(self, **kwargs: Any) -> dict[str, Any]:
         return self.forward(**kwargs)
@@ -136,14 +150,13 @@ class PrintVQVAE(_PrintBase):
 
     def encode(self, **kwargs: Any) -> dict[str, Any]:
         self._record("encode", **kwargs)
-        return {
-            "gen_embeds": "<vq_gen_embeds>",
-            "vq_token_ids": "<vq_token_ids>",
-        }
+        return _with_carrier(kwargs, gen_embeds="<vq_gen_embeds>", vq_token_ids="<vq_token_ids>")
 
     def decode(self, **kwargs: Any) -> dict[str, Any]:
         self._record("decode", **kwargs)
-        if kwargs.get("gt_token_ids") is not None:
+        carrier = _carrier(kwargs)
+        hidden_states = kwargs.get("hidden_states") or carrier.get("hidden_states")
+        if hidden_states is not None:
             return {"_loss": _scalar_loss(0.7)}
         # Inference path — emit `image_complete` on the last patch of the
         # simulated grid, then reset the counter for the next image span.
@@ -187,11 +200,13 @@ class PrintTextEmbed(_PrintBase):
     def encode(self, **kwargs: Any) -> dict[str, Any]:
         self._record("encode", **kwargs)
         ids = kwargs.get("input_ids", "?")
-        return {"inputs_embeds": f"<wte:{ids}>"}
+        return _with_carrier(kwargs, inputs_embeds=f"<wte:{ids}>")
 
     def decode(self, **kwargs: Any) -> dict[str, Any]:
         self._record("decode", **kwargs)
-        if kwargs.get("labels") is not None:
+        carrier = _carrier(kwargs)
+        hidden_states = kwargs.get("hidden_states") or carrier.get("hidden_states")
+        if kwargs.get("labels") is not None or hidden_states is not None:
             return {"_loss": _scalar_loss(0.3)}
         # Inference: sample from the canned script, then emit module_signal flags.
         if self._cursor < len(self._token_script):
@@ -242,10 +257,9 @@ class PrintARBackbone(_PrintBase):
 
     def forward(self, **kwargs: Any) -> dict[str, Any]:
         self._record("forward", **kwargs)
-        return {
-            "hidden_states": "<ar_hidden>",
-            "_loss": _scalar_loss(0.2),
-        }
+        out = _with_carrier(kwargs, hidden_states="<ar_hidden>")
+        out["_loss"] = _scalar_loss(0.2)
+        return out
 
     def generate_step(self, **kwargs: Any) -> dict[str, Any]:
         self._record("generate_step", **kwargs)

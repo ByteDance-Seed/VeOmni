@@ -58,12 +58,10 @@ Lifecycle
      :meth:`OmniModel.generate`.  Raw-PIL → tensor conversion is the
      receiving module's responsibility (see :class:`JanusSiglip`).
 
-   The returned ``ctx`` carries the FSM trace, the accumulated
-   ``generated_images_collected`` PIL images (already postprocessed
-   by each emitting module's processor — e.g.
-   :meth:`JanusVqvaeProcessor.postprocess`), and the per-module
+   The returned ``ctx`` carries the FSM trace and the per-module
    ``finalize`` outputs (e.g. decoded text under
-   ``finalize['janus_text_encoder']['text']``).
+   ``finalize['janus_text_encoder']['text']``).  Generated images live on
+   ``OmniInferencer.model.generated`` (``[{type, value}, ...]``).
 
 Generation kwargs distribution
 ------------------------------
@@ -376,12 +374,12 @@ class OmniInferencer:
 
         * ``conversation_list`` — the final list of parts (prompt +
           assistant-side sampled tokens).
-        * ``generated_images_collected`` — every image decoded by
-          :class:`JanusVqvae` during the run (each ``(1, H, W, 3)`` float
-          tensor in ``[-1, 1]``).
         * ``finalize`` — per-module dict from each :meth:`OmniModule.finalize`
           hook (notably ``finalize['janus_text_encoder']['text']`` for the
           decoded reply).
+
+        Decoded images are **not** on ``ctx`` — read
+        ``self.model.generated`` (``[{"type": "image", "value": PIL}, ...]``).
 
         For programmatic use that doesn't need on-disk artifacts (e.g. batched
         eval, RL rollouts), call :meth:`run_request` directly with a
@@ -424,13 +422,10 @@ class OmniInferencer:
           existence signals "the FSM ran to completion".  When non-empty,
           also echoed to stdout via the logger (rank-0 gated) so CLI users
           see it without opening the file.
-        * ``generated_image_{i}.png`` — every PIL image in
-          ``ctx['generated_images_collected']``, one PNG per image.  The
-          per-module ``generate`` (e.g. :class:`JanusVqvae`) already
-          delegated the model-specific denormalisation to its own
-          processor (:meth:`JanusVqvaeProcessor.postprocess`) so the
-          inferencer just calls ``img.save(path)`` — no model-specific
-          tensor math here.
+        * ``generated_image_{i}.png`` — every ``type="image"`` entry in
+          ``self.model.generated``, one PNG per image.  The emitting module
+          (e.g. :class:`JanusVqvae`) already postprocesses via its processor
+          so the inferencer just calls ``img.save(path)``.
         * ``trace.txt`` — FSM step / transition log (always written; read
           from ``ctx['trace']``, which :meth:`_run` populates on every run).
 
@@ -460,7 +455,11 @@ class OmniInferencer:
             # doesn't multiplex on a future multi-rank dispatch.
             logger.info_rank0(f"--- reply ---\n{reply}\n-------------")
 
-        images_out = list(ctx.get("generated_images_collected") or [])
+        images_out = [
+            item["value"]
+            for item in self.model.generated
+            if isinstance(item, dict) and item.get("type") == "image" and item.get("value") is not None
+        ]
         for idx, image in enumerate(images_out):
             out_path = os.path.join(output_dir, f"generated_image_{idx}.png")
             image.save(out_path)

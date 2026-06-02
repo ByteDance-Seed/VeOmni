@@ -753,7 +753,7 @@ class OmniTrainer:
         base = self.base
         self.lr_schedulers: Dict[str, Any] = {}
         for name, module_trainer in self.module_trainers.items():
-            module_trainer.base.args.train_steps = base.args.train_steps
+            module_trainer.base.args._train_steps = base.args._train_steps
             module_trainer._build_lr_scheduler()
             self.lr_schedulers[name] = module_trainer.base.lr_scheduler
         base.lr_scheduler = MultiLRScheduler(self.lr_schedulers)

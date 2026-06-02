@@ -43,7 +43,16 @@ from transformers.models.llama.modeling_llama import LlamaModel
 from veomni.distributed.parallel_state import get_parallel_state
 from veomni.distributed.sequence_parallel.data import gather_outputs, sp_pad_and_slice
 
-from ....conversation import ConversationPart, assemble_embeds, is_train_conversation
+from ....conversation import (
+    ArPhase,
+    ConversationItem,
+    append_output_hidden,
+    assemble_embeds,
+    collect_prompt_embeds,
+    get_ar_tail_embed,
+    is_dummy,
+    is_train_conversation,
+)
 from ....module import OmniModule
 from .configuration import JanusLlamaConfig
 
@@ -83,6 +92,8 @@ class JanusLlama(OmniModule, PreTrainedModel):
         # Both are reset by :meth:`reset_inference_state` between requests.
         self._cfg_active: bool = False
         self._cfg_seen_vqvae: bool = False
+        self._past_key_values: Any = None
+        self._ar_phase: ArPhase = "text"
 
         self.post_init()
 
@@ -220,10 +231,18 @@ class JanusLlama(OmniModule, PreTrainedModel):
         )
 
     def post_forward(self, outputs: Dict[str, Any]) -> Dict[str, Any]:
-        """All-gather ``hidden_states`` across SP ranks (when SP enabled)."""
+        """All-gather ``hidden_states`` across SP ranks (when SP enabled).
+
+        Also stash the gathered tensor on the :class:`TrainConversation` carrier
+        so downstream decode heads read it from ``conversation_list.hidden_states``
+        — no edge ``output``/``as`` routing needed.
+        """
         ps = get_parallel_state()
         if ps.sp_enabled and "hidden_states" in outputs:
             outputs["hidden_states"] = gather_outputs(outputs["hidden_states"], gather_dim=1, scale_grad=True)
+        convo = outputs.get("conversation_list")
+        if is_train_conversation(convo) and "hidden_states" in outputs:
+            convo.hidden_states = outputs["hidden_states"]
         return outputs
 
     def forward(  # type: ignore[override]
@@ -295,7 +314,7 @@ class JanusLlama(OmniModule, PreTrainedModel):
     # ── Inference (conversation-list aware) ──────────────────────────────────
 
     def reset_inference_state(self) -> None:
-        """Wipe per-request runtime state — CFG flag, etc.
+        """Wipe per-request runtime state — CFG flag, KV cache, etc.
 
         Called by :class:`OmniInferencer` between requests so the next
         prompt starts fresh (no leftover ``_cfg_active`` from a previous
@@ -303,50 +322,44 @@ class JanusLlama(OmniModule, PreTrainedModel):
         """
         self._cfg_active = False
         self._cfg_seen_vqvae = False
+        self._past_key_values = None
+        self._ar_phase = "text"
+
+    def set_ar_phase(self, phase: ArPhase) -> None:
+        """Switch the active AR phase (``text`` vs ``vq``) for ``output`` tagging."""
+        self._ar_phase = phase
+
+    def collapse_cfg_cache(self) -> None:
+        """Drop the unconditional half of a bs=2 KV cache after image generation."""
+        if not self._cfg_active or self._past_key_values is None:
+            return
+        self._past_key_values = _slice_kv_cache(self._past_key_values, slice(0, 1))
+        self._cfg_active = False
+        self._cfg_seen_vqvae = False
 
     def generate(
         self,
         *,
-        conversation_list: Optional[List[ConversationPart]] = None,
+        conversation_list: Optional[List[ConversationItem]] = None,
         past_key_values: Optional[Any] = None,
         attention_mask: Optional[torch.Tensor] = None,
         cfg_uncond_inputs_embeds: Optional[torch.Tensor] = None,
+        ar_phase: Optional[ArPhase] = None,
+        cfg: Optional[Dict[str, Any]] = None,
+        collapse_cfg: bool = False,
         **kwargs: Any,
     ) -> Dict[str, Any]:
         """Auto-regressive backbone step driven by a conversation list.
 
-        First pass (no KV cache): concatenate every part's
-        ``inputs_embeds`` along the sequence dimension and run a single
-        full prompt forward.  Subsequent passes (KV cache hot):
-        consume **only** the trailing part's ``inputs_embeds`` — the
-        same tail-only convention HuggingFace ``generate`` uses to
-        avoid re-feeding the prefix.
+        Prompt pass (internal KV empty): concatenate every sealed embedded
+        part (``text`` / ``image`` / ``soi`` / ``eoi`` / ``token``), prime
+        the KV cache, and append an ``output`` item with backbone hidden
+        states.
 
-        Any part without ``inputs_embeds`` (e.g. an empty assistant
-        marker, a token whose embedding the upstream module hasn't yet
-        populated) is skipped.  Routing edges may carry the same
-        ``conversation_list`` object from multiple upstream encoders
-        (siglip + text_encoder) — by the time this method runs the
-        topological body-execution rule guarantees every relevant part
-        has been filled.
-
-        Classifier-free guidance (CFG)
-        ------------------------------
-        When ``cfg_uncond_inputs_embeds`` is present in ctx (built by
-        :meth:`JanusTextEncoder.generate`) and ``self._cfg_active`` is
-        False, the first AR call after the prompt pass runs a *separate*
-        full-prompt forward on the uncond embeds, then batch-concats the
-        resulting KV cache with the existing cond cache to form a bs=2
-        cache.  The tail input (``boi`` from ``tok_decode`` or any
-        subsequent VQ-token embed) is broadcast from bs=1 to bs=2 so the
-        backbone stays bs=2 for the rest of ``image_vq``.  The cond /
-        uncond logits split + CFG mix lives downstream in
-        :meth:`JanusVqvae.generate`.
-
-        Invariant 17 (SeedOmni V2): graph nodes / FSM topology stay
-        unchanged; the bs=2 expansion is fully hidden inside this module.
-        See ``.agents/skills/seedomni-v2/SKILL.md`` for the design
-        rationale.
+        AR passes: read the last position of the conversation tail embed,
+        run one forward step, append a fresh ``output`` hidden item.
+        ``past_key_values`` is kept on the module — callers should not
+        rely on routing KV through ``ctx``.
         """
         if conversation_list is None:
             raise ValueError(
@@ -354,20 +367,27 @@ class JanusLlama(OmniModule, PreTrainedModel):
                 "(or build a conversation manually with veomni.models.seed_omni.build_conversation)."
             )
 
-        cache_kwargs = {k: v for k, v in kwargs.items() if k in ("cache_position",)}
+        if collapse_cfg:
+            self.collapse_cfg_cache()
 
-        if past_key_values is None:
-            embed_chunks = [p.inputs_embeds.to(self.device) for p in conversation_list if p.inputs_embeds is not None]
+        if ar_phase is not None:
+            self._ar_phase = ar_phase
+
+        cache_kwargs = {k: v for k, v in kwargs.items() if k in ("cache_position",)}
+        past_kv = self._past_key_values
+
+        if past_kv is None:
+            embed_chunks = [emb.to(self.device) for emb in collect_prompt_embeds(conversation_list)]
             if not embed_chunks:
                 raise ValueError(
                     "JanusLlama.generate: conversation_list has no embedded parts. "
                     "Run siglip + text_encoder generate first."
                 )
             inputs_embeds = torch.cat(embed_chunks, dim=1)
+            for part in conversation_list:
+                if is_dummy(part) and isinstance(part.value, torch.Tensor):
+                    inputs_embeds = inputs_embeds + part.value.sum() * 0.0
 
-            # Cond pass first — keep its hidden states for downstream
-            # `tok_decode` (which only ever sees bs=1 — CFG mixing is a
-            # `vae_generate`-side concern in the seed_omni V2 contract).
             lm_out = self.language_model(
                 inputs_embeds=inputs_embeds,
                 attention_mask=attention_mask,
@@ -375,86 +395,69 @@ class JanusLlama(OmniModule, PreTrainedModel):
                 use_cache=True,
                 **cache_kwargs,
             )
-            past_kv_out = lm_out.past_key_values
-
-            if cfg_uncond_inputs_embeds is not None:
-                if cfg_uncond_inputs_embeds.shape[:2] != inputs_embeds.shape[:2]:
-                    raise ValueError(
-                        "JanusLlama.generate: `cfg_uncond_inputs_embeds` shape "
-                        f"{tuple(cfg_uncond_inputs_embeds.shape)} does not match the cond prompt "
-                        f"{tuple(inputs_embeds.shape)} (text_encoder mis-built the uncond branch)."
-                    )
-                uncond_out = self.language_model(
-                    inputs_embeds=cfg_uncond_inputs_embeds,
-                    attention_mask=attention_mask,
-                    past_key_values=None,
-                    use_cache=True,
-                    **cache_kwargs,
-                )
-                past_kv_out = _concat_kv_caches(past_kv_out, uncond_out.past_key_values)
-                self._cfg_active = True
-
+            self._past_key_values = lm_out.past_key_values
+            hidden = lm_out.last_hidden_state
+            append_output_hidden(conversation_list, hidden, phase=self._ar_phase)
             return {
-                "hidden_states": lm_out.last_hidden_state,
-                "past_key_values": past_kv_out,
+                "hidden_states": hidden,
                 "conversation_list": conversation_list,
             }
-            # Note: ``cfg_uncond_inputs_embeds`` lingers in ctx after this
-            # branch returns (the FSM ``ctx.update(out)`` only adds keys,
-            # doesn't drain).  That is intentional: it is harmless because
-            # the AR branch below never reads it (it dispatches on
-            # ``self._cfg_active`` instead), and every other module's
-            # ``generate`` signature absorbs unknown kwargs via ``**_``.
 
-        tail = conversation_list[-1] if conversation_list else None
-        if tail is None or tail.inputs_embeds is None:
+        tail_embed = get_ar_tail_embed(conversation_list)
+        if tail_embed is None:
             raise ValueError(
-                "JanusLlama.generate (AR step) expects the trailing conversation part to carry "
-                "`inputs_embeds`. Upstream module (text_encoder.decode / vqvae.generate / emit_*) "
-                "did not populate it."
+                "JanusLlama.generate (AR step) expects an embedded conversation tail. "
+                "Upstream module (text_encoder.ar_step / vqvae.ar_step / emit_*) did not provide one."
             )
 
-        # CFG state machine, AR branch
-        # ----------------------------
-        # ``_cfg_seen_vqvae`` flips True the moment we observe a vqvae-sourced
-        # tail (i.e. we're inside ``image_vq``).  If we *later* see a tail that
-        # is NOT vqvae-sourced while ``_cfg_seen_vqvae`` is True, the FSM has
-        # left ``image_vq`` and routed the bs=2 KV cache into ``text_ar`` /
-        # interleave — that requires collapsing the cache to the cond half
-        # first, which is not yet implemented.  Fail loudly rather than
-        # silently feeding bs=2 hidden states into ``tok_decode`` (which
-        # would crash inside ``int(token.item())`` on a ``(2,1)`` tensor).
+        cfg_out: Optional[Dict[str, Any]] = None
+        if (
+            isinstance(cfg, dict)
+            and cfg.get("enabled")
+            and cfg_uncond_inputs_embeds is not None
+            and not self._cfg_active
+        ):
+            uncond = cfg_uncond_inputs_embeds.to(self.device)
+            uncond_out = self.language_model(
+                inputs_embeds=uncond,
+                attention_mask=attention_mask,
+                past_key_values=None,
+                use_cache=True,
+                **cache_kwargs,
+            )
+            past_kv = _concat_kv_caches(past_kv, uncond_out.past_key_values)
+            self._past_key_values = past_kv
+            self._cfg_active = True
+            cfg_out = {"enabled": False, "guidance_scale": float(cfg.get("guidance_scale", 1.0) or 1.0)}
+
         if self._cfg_active:
-            tail_is_vqvae = tail.meta.get("source") == "vqvae"
-            if tail_is_vqvae:
+            if self._ar_phase == "vq":
                 self._cfg_seen_vqvae = True
             elif self._cfg_seen_vqvae:
-                raise NotImplementedError(
-                    "JanusLlama.generate: CFG (guidance_scale>1) is active and the FSM has left "
-                    "the `image_vq` span — routing the bs=2 KV cache into `text_ar` / interleave "
-                    "states is not supported yet (need to collapse the cache to the cond half). "
-                    "Run inference with `guidance_scale<=1` for interleave / I2T graphs, or "
-                    "extend `JanusLlama` with a `_collapse_cfg_cache()` helper. "
-                    "See seedomni-v2 invariant 17."
-                )
+                self.collapse_cfg_cache()
+                past_kv = self._past_key_values
 
-        inputs_embeds = tail.inputs_embeds
-
+        inputs_embeds = tail_embed.to(self.device)
         if self._cfg_active and inputs_embeds.size(0) == 1:
             inputs_embeds = inputs_embeds.expand(2, *inputs_embeds.shape[1:]).contiguous()
 
         lm_out = self.language_model(
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
-            past_key_values=past_key_values,
+            past_key_values=past_kv,
             use_cache=True,
             **cache_kwargs,
         )
-        return {
-            "hidden_states": lm_out.last_hidden_state,
-            "past_key_values": lm_out.past_key_values,
+        self._past_key_values = lm_out.past_key_values
+        hidden = lm_out.last_hidden_state
+        append_output_hidden(conversation_list, hidden, phase=self._ar_phase)
+        out: Dict[str, Any] = {
+            "hidden_states": hidden,
             "conversation_list": conversation_list,
         }
+        if cfg_out is not None:
+            out["cfg"] = cfg_out
+        return out
 
     # ── Internal helpers ─────────────────────────────────────────────────────
 
@@ -494,6 +497,26 @@ def _resolve_token_id(tokenizer: Any, candidates: tuple) -> Optional[int]:
         if tid is not None and tid != unk:
             return int(tid)
     return None
+
+
+def _slice_kv_cache(cache: Any, index: slice) -> Any:
+    """Slice a ``DynamicCache`` along batch dim 0."""
+    if cache is None:
+        return None
+    sliced = type(cache)()
+    layers = getattr(cache, "layers", None)
+    if layers is None:
+        n_layers = len(getattr(cache, "key_cache", []))
+        for i in range(n_layers):
+            k = cache.key_cache[i][index]
+            v = cache.value_cache[i][index]
+            sliced.update(k, v, i)
+        return sliced
+    for i, _ in enumerate(layers):
+        k = cache.layers[i].keys[index]
+        v = cache.layers[i].values[index]
+        sliced.update(k, v, i)
+    return sliced
 
 
 def _concat_kv_caches(cond: Any, uncond: Any) -> Any:

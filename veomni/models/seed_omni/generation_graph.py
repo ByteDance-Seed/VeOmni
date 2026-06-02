@@ -14,14 +14,15 @@ Each state specifies:
 
          a. Ensure ``e.from_`` is executed.  If it has any unprocessed
             in-body fan-in, that's a body-ordering bug — error.
-         b. Apply edge routing **permissively**: ``ctx[e.output] →
-            ctx[e.as_]`` only if ``e.output`` is currently in ``ctx``.
-            When the source node returned ``{}`` (e.g. SigLIP with no
-            ``pixel_values`` on a text-only inference prompt) the
-            routing silently skips — the destination still executes.
-         c. Decrement ``e.to``'s pending fan-in.  When it hits zero
+         b. Decrement ``e.to``'s pending fan-in.  When it hits zero
             (i.e. all body edges into ``e.to`` have been processed),
             execute ``e.to``.
+
+      Each executed node merges its return dict into ``ctx`` directly
+      (``ctx.update(out)``).  Edges declare execution order only — they
+      do not route individual fields.  Early FSM steps use
+      ``conversation_list``; later AR steps use ``input_ids`` /
+      ``past_key_values`` / ``hidden_states`` as modules write them.
 
       This rule generalises "first-encounter execution":
 
@@ -31,12 +32,12 @@ Each state specifies:
         * For multi-source nodes (e.g. understanding/I2T where
           ``janus_llama`` consumes both ``inputs_embeds`` and
           ``und_image_embeds``) the backbone executes only after the
-          last incoming routing edge has fired — both inputs are
-          present in ``ctx`` first.
+          last in-body fan-in edge has fired — both keys are already
+          in ``ctx`` from upstream ``ctx.update(out)`` calls.
         * For self-feedback bodies (``image_vq`` =
-          ``ar_to_vae_dec, vae_dec_to_ar``) the second edge re-routes
-          ``vae_decode``'s output back into ``inputs_embeds`` for the
-          next iteration's ``janus_llama`` call.
+          ``ar_to_vae_dec, vae_dec_to_ar``) ``vae_decode`` writes
+          ``embed`` (or ``inputs_embeds``) into ``ctx``; the next
+          ``janus_llama`` step reads it directly — no edge renaming.
 
       An edge with ``to: end`` is purely declarative — it pins the producing
       node into the active set without routing anywhere.
@@ -364,11 +365,6 @@ class GenerationGraph:
            a. If ``e.from_`` hasn't been executed yet, execute it now.
               (If it still has unprocessed in-body fan-in, that's a
               body-ordering bug — raise.)
-           b. Apply permissive routing: ``ctx[e.output] → ctx[e.as_]``
-              **only if** ``e.output`` is in ``ctx``.  An absent key
-              means the source returned ``{}`` (e.g. SigLIP with no
-              ``pixel_values``); the routing silently skips and the
-              destination still executes when its other inputs land.
            c. Decrement ``pending[e.to]``.  When it reaches zero (and
               ``e.to`` is not ``end`` and not yet executed), execute it.
 
@@ -477,21 +473,7 @@ class GenerationGraph:
             # 1. Execute the source node (idempotent for repeated `from_`).
             _run(edge.from_)
 
-            # 2. Permissive routing — skip if the source returned no such
-            #    key (or returned None for it; downstream treats both as
-            #    absent).  This is the "no input → empty dict" inference
-            #    fast-path: e.g. SigLIP with no `pixel_values` returns
-            #    ``{}``; the routing edge silently drops; the destination
-            #    still executes when its other inputs land.
-            if (
-                edge.output_key is not None
-                and edge.as_ is not None
-                and edge.output_key in ctx
-                and ctx[edge.output_key] is not None
-            ):
-                ctx[edge.as_] = ctx[edge.output_key]
-
-            # 3. Decrement the destination's feed-forward pending count;
+            # 2. Decrement the destination's feed-forward pending count;
             #    if the node has no later appearance as a source (it's a
             #    body sink), trigger it now once all its inputs are in.
             if not is_end(edge.to):
@@ -557,8 +539,7 @@ class GenerationGraph:
         Visual conventions
         ------------------
         Each non-``done`` state is rendered as a labelled subgraph whose
-        interior is a mini-flow over the body's data edges (same
-        ``output → as`` labels as the training graph; ``to: end`` sink
+        interior is a mini-flow over the body's topology edges (``to: end`` sink
         edges are filtered out since they don't carry data — they only
         pin a node into the body).  The body's node names inside the
         subgraph are namespaced as ``<state>__<node>`` so the same node
@@ -615,9 +596,7 @@ class GenerationGraph:
                     # `to: end` sinks are declarative pins — they don't carry
                     # data, so they don't appear inside the body's mini-flow.
                     continue
-                edge_label = self._edge_label(e)
-                arrow = f"-->|{edge_label}|" if edge_label else "-->"
-                lines.append(f"        {name}__{e.from_} {arrow} {name}__{e.to}")
+                lines.append(f"        {name}__{e.from_} --> {name}__{e.to}")
             lines.append("    end")
 
         # ── Self-loops marking that a state body iterates until a transition ──
@@ -650,15 +629,6 @@ class GenerationGraph:
             lines.append(f"    style state_{self._initial} fill:#eef,stroke:#06c,stroke-width:2px")
 
         return "\n".join(lines)
-
-    @staticmethod
-    def _edge_label(e: EdgeDef) -> str:
-        """Render a body edge's data-routing label — same shape as the training graph's."""
-        if e.output_key and e.as_ and e.output_key != e.as_:
-            return f'"{e.output_key} → {e.as_}"'
-        if e.output_key:
-            return f'"{e.output_key}"'
-        return ""
 
     # ── Internal ──────────────────────────────────────────────────────────────
 

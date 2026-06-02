@@ -30,10 +30,12 @@ from transformers.models.janus.configuration_janus import JanusVisionConfig
 from transformers.models.janus.modeling_janus import JanusVisionAlignerMLP, JanusVisionModel
 
 from ....conversation import (
-    ConversationPart,
+    ConversationItem,
     TrainConversation,
     collect_modality_values,
+    is_embedded,
     is_raw_training_conversation,
+    item_role,
 )
 from ....image_inputs import build_pixel_values_batch
 from ....module import OmniModule
@@ -165,26 +167,20 @@ class JanusSiglip(OmniModule, PreTrainedModel):
     def generate(
         self,
         *,
-        conversation_list: Optional[List[ConversationPart]] = None,
+        conversation_list: Optional[List[ConversationItem]] = None,
         past_key_values: Optional[Any] = None,
         **_: Any,
     ) -> Dict[str, Any]:
-        """Encode every ``image_und`` part that doesn't yet carry an ``inputs_embeds``.
+        """Encode every user ``image`` part that is not yet embedded.
 
         Inference-only entry — training still goes through
-        :meth:`forward` (input_ids + masked_scatter contract).  Called once
-        on the prompt pass; subsequent FSM iterations short-circuit
-        because ``past_key_values is not None`` (no new images get
-        injected mid-AR).
+        :meth:`forward`.  Called once on the prompt pass; subsequent FSM
+        iterations short-circuit because ``past_key_values is not None``.
 
-        Each ``image_und`` part must either carry a 3D ``pixel_values``
-        tensor ``(C, H, W)`` already, or carry a raw PIL ``image`` so we
-        can tensorise on the fly via ``self._processor`` — auto-loaded
-        from the same checkpoint folder by
-        :meth:`OmniModule.from_pretrained`.  The aligner-projected output
-        is written back into the same part so downstream
-        :meth:`JanusLlama.generate` can concat it next to the text
-        embeddings.
+        Each ``type="image"`` part with ``meta.role="user"`` must carry a
+        raw PIL / numpy image or a ``(C, H, W)`` tensor in ``value``.  The
+        aligner-projected output ``(1, P, D)`` is written back into
+        ``value`` so downstream :meth:`JanusLlama.generate` can concat it.
         """
         if conversation_list is None or past_key_values is not None:
             return {"conversation_list": conversation_list} if conversation_list is not None else {}
@@ -192,33 +188,32 @@ class JanusSiglip(OmniModule, PreTrainedModel):
         device = self._param_device()
         dtype = self._param_dtype()
         for part in conversation_list:
-            if part.kind != "image_und" or part.inputs_embeds is not None:
+            if part.type != "image" or item_role(part) != "user" or is_embedded(part):
                 continue
-            pv = part.pixel_values
-            if pv is None:
-                # Fall back to raw PIL → tensor via the wired processor.
-                # Cache the result back on the part so a re-run / trace sees
-                # the same numerics, and so the FSM's bookkeeping (which may
-                # serialise the conversation) stays consistent.
-                if part.image is None:
-                    continue
+            raw = part.value
+            if isinstance(raw, torch.Tensor) and _is_chw_image_tensor(raw):
+                pv = raw
+            elif isinstance(raw, torch.Tensor) and raw.dim() == 4:
+                pv = raw.squeeze(0) if raw.size(0) == 1 else raw
+            elif raw is not None:
                 if self._processor is None:
                     raise RuntimeError(
-                        "JanusSiglip.generate: image_und part has no `pixel_values` and no "
+                        "JanusSiglip.generate: image part has no tensor `value` and no "
                         "processor was loaded.  Either pre-tensorise the part or ensure "
                         "`preprocessor_config.json` ships next to the weights checkpoint so "
                         "OmniModule.from_pretrained can auto-load it."
                     )
-                out = self._processor(images=[part.image], return_tensors="pt")
+                out = self._processor(images=[raw], return_tensors="pt")
                 pv = out["pixel_values"]
                 if pv.dim() == 4 and pv.size(0) == 1:
                     pv = pv.squeeze(0)
-                part.pixel_values = pv
+            else:
+                continue
             if pv.dim() == 3:
                 pv = pv.unsqueeze(0)
             pv = pv.to(device=device, dtype=dtype, non_blocking=True)
             vision_out = self.vision_model(pv, return_dict=True)
-            part.inputs_embeds = self.aligner(vision_out.last_hidden_state)
+            part.value = self.aligner(vision_out.last_hidden_state)
         return {"conversation_list": conversation_list}
 
     # ── Internal device / dtype helpers ───────────────────────────────────────
@@ -248,3 +243,14 @@ class JanusSiglip(OmniModule, PreTrainedModel):
         return {
             "pixel_values": torch.zeros(batch_size, c, h, h, device=device, dtype=dtype),
         }
+
+
+def _is_chw_image_tensor(value: torch.Tensor) -> bool:
+    if value.dim() != 3:
+        return False
+    c, _h, w = (int(value.size(0)), int(value.size(1)), int(value.size(2)))
+    if c not in (1, 3):
+        return False
+    if c == 1 and w > 512:
+        return False
+    return True

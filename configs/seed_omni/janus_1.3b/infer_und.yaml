@@ -1,63 +1,26 @@
 # Janus-1.3B inference — image understanding (I2T / VQA).  Uni-directional;
 # never emits an image mid-stream.
 #
-# Conversation-list inference path (V2 .generate methods)
-# -------------------------------------------------------
-# * The user passes a `conversation_list` (image_und parts first, then a
-#   user text part, then an empty assistant text part — see
-#   :func:`veomni.models.seed_omni.build_conversation`).
-# * `text_encoder.generate` owns bos placement and tokenises every text
-#   part — there is no chat-template tokenisation upstream; the text
-#   encoder fully decides the on-the-wire layout.
-# * `janus_llama.generate` concats every part's `inputs_embeds` on the
-#   prompt pass and uses the tail-only fast path on every subsequent AR
-#   step (KV cache present).
-#
-# Flow
-# ----
-#   prompt_encode  (single pass: siglip_generate + tok_encode_generate +
-#                   janus_llama_gen.generate(prompt) + tok_decode
-#                   samples the first reply token)
-#     ├─ module_signal text_done → done   (eos came out immediately, rare)
-#     └─ default                  → text_ar
-#
-#   text_ar        (AR loop: tok_encode_generate embeds the tail token part
-#                   appended by tok_decode → janus_llama_gen AR step →
-#                   tok_decode samples the next token; repeats until eos.)
-#     └─ module_signal text_done → done
+# V2 AR path: ``tok_ar_step`` monolithically decode→encode→merge on the
+# conversation ``output`` workspace; token ids live in the text encoder cache.
 
 generation_graph:
-  # `done` is auto-injected by the framework — never declare it here, never
-  # set `done_state`.
-
   initial: prompt_encode
 
   states:
     prompt_encode:
-      # First step: full encode pipeline (vision + text) + LLM forward +
-      # tok_decode (samples the first reply token).  janus_llama_gen has
-      # fan-in 2 (vision_to_llm + tokenc_to_llm) — the topological body
-      # execution rule fires it only after BOTH routing edges have run,
-      # so the conversation_list it receives already has every part's
-      # inputs_embeds populated.
       body:
-        - vision_to_llm         # siglip_generate    → janus_llama_gen
-        - tokenc_to_llm         # tok_encode_generate → janus_llama_gen
-        - llm_to_tokdec         # janus_llama_gen   → tok_decode
-        - tok_decode_sink       # leaf — pin tok_decode into the body
+        - vision_to_llm
+        - tokenc_to_llm
+        - llm_to_text_ar
+        - text_ar_sink
       transitions:
         - { condition: { type: module_signal, key: text_done }, next_state: done }
         - { condition: { type: default }, next_state: text_ar }
 
     text_ar:
-      # Subsequent AR steps.  tok_encode_generate sees a non-None
-      # past_key_values (set by the prompt pass) → walks the conversation
-      # tail, embeds only the newly-appended `token` part from the last
-      # tok_decode.  janus_llama_gen then uses the tail-only fast path
-      # (only the trailing part's inputs_embeds is fed to the LM).
       body:
-        - tokenc_to_llm
-        - llm_to_tokdec
-        - tok_decode_sink
+        - llm_to_text_ar
+        - text_ar_sink
       transitions:
         - { condition: { type: module_signal, key: text_done }, next_state: done }

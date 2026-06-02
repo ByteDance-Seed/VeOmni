@@ -14,10 +14,14 @@ Shared pool data types for the SeedOmni V2 graph.
   ``decode`` node (LLM hidden → CE loss / token_id → embed).  These are
   independent graph nodes that happen to share weights.
 
-- ``edges`` — graph edges (data dependencies).  Each routes one output key
-  from a source node into one kwarg of a destination node::
+- ``edges`` — graph edges (execution-order / topology only).  Each edge
+  declares that node ``from`` must run before node ``to``::
 
-      {from: A, output: k, to: B, as: m}
+      {from: A, to: B}
+
+  Data flows through the shared ``conversation_list`` carrier (training) or
+  the FSM ``ctx`` dict (inference) — modules read/write keys directly on
+  those shared objects; edges do **not** route individual tensor fields.
 
   ``from``/``to`` reference node names; for convenience a *module name* is
   accepted when that module has exactly one active node (alias shorthand).
@@ -107,18 +111,19 @@ class NodeDef:
 
 @dataclass
 class EdgeDef:
-    """Parsed graph edge — routes ``output_key`` of ``from_`` into ``to``'s ``as_`` kwarg.
+    """Parsed graph edge — declares ``from_`` must execute before ``to``.
 
     ``to`` may be the reserved keyword :data:`END` (``"end"``) to mark the edge
     as a virtual sink.  ``from`` must always reference a real node name (or an
     unambiguous module alias resolved at TrainingGraph build time).
+
+    Data is **not** routed through edges — training modules share the
+    ``conversation_list`` carrier; inference modules merge outputs into ``ctx``.
     """
 
     name: str
     from_: str
     to: str
-    output_key: Optional[str] = None
-    as_: Optional[str] = None
 
     @classmethod
     def parse(cls, name: str, spec: Dict) -> "EdgeDef":
@@ -146,8 +151,6 @@ class EdgeDef:
             name=name,
             from_=from_,
             to=to,
-            output_key=spec.get("output"),
-            as_=spec.get("as"),
         )
 
     def is_sink(self) -> bool:

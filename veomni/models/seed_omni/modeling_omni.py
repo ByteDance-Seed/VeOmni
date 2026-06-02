@@ -64,12 +64,10 @@ Inference
 Once the FSM reaches the built-in ``done`` state (auto-injected by
 ``GenerationGraph`` — never declared in YAML), ``generate`` calls
 :meth:`OmniModule.finalize` on every active module and merges any non-empty
-return values into ``ctx['finalize'][<module_name>]``.  This is where
-modules turn their accumulated step outputs into something usable:
-``TextEncoder.finalize`` tokenizer-decodes all generated ``input_ids``,
-``JanusVqvae.finalize`` saves accumulated VQ patches as images on disk,
-etc.  The default ``finalize`` is a no-op so modules that have nothing to
-report cost nothing.
+return values into ``ctx['finalize'][<module_name>]``.  Multi-modal
+artefacts emitted during the run are drained from one-shot
+``ctx['generated'] = {type, value}`` payloads into
+:attr:`OmniModel.generated` — they are not persisted on ``ctx``.
 
 Both ``step`` and ``maybe_transition`` accept an optional ``trace`` list —
 print-driven flow tests collect the visit log from there to assert the
@@ -191,6 +189,10 @@ class OmniModel(nn.Module):
         # Last FSM state printed by :meth:`_emit_progress` — its private
         # dedup cursor (reset on each fresh ``generate`` run).
         self._last_printed_state: Optional[str] = None
+        # Per-``generate`` artefacts emitted by modules as one-shot
+        # ``ctx["generated"] = {type, value}`` payloads — drained into this
+        # list and never persisted back onto ``ctx``.
+        self._generated: List[Dict[str, Any]] = []
 
         # Prime per-request inference runtime state (FSM at its initial
         # state).  :meth:`generate` deliberately does NOT reset, so a future
@@ -208,6 +210,15 @@ class OmniModel(nn.Module):
         the deprecated middle-attribute path.
         """
         return {name: getattr(self, name) for name in self._module_names}
+
+    @property
+    def generated(self) -> List[Dict[str, Any]]:
+        """Artefacts collected during the latest :meth:`generate` run.
+
+        Each entry is ``{"type": <str>, "value": <any>}`` — e.g.
+        ``{"type": "image", "value": PIL.Image}``.  Not mirrored on ``ctx``.
+        """
+        return list(self._generated)
 
     # ── Training ──────────────────────────────────────────────────────────────
 
@@ -289,11 +300,7 @@ class OmniModel(nn.Module):
             # is mutated/replaced in place as it flows
             # ``siglip → vae → text_encoder → backbone → decoders``.  Write it
             # back into the shared batch so downstream nodes read the evolving
-            # carrier directly — the chain edges are then pure ``{from, to}``
-            # topology contracts (no ``output``/``as`` plumbing for the
-            # per-modality fields).  Only this one key is written back, so the
-            # ``as``-renaming the inference FSM / legacy edges rely on is
-            # untouched (inference runs through ``generate``, not here).
+            # carrier directly — edges are pure ``{from, to}`` topology.
             convo = out.get("conversation_list")
             if convo is not None:
                 batch["conversation_list"] = convo
@@ -322,6 +329,22 @@ class OmniModel(nn.Module):
         """
         if self.generation_graph is not None:
             self.generation_graph.reset()
+        self._generated.clear()
+
+    @staticmethod
+    def _normalize_generated(item: Any) -> Optional[Dict[str, Any]]:
+        """Normalize a one-shot module ``generated`` payload to ``{type, value}``."""
+        if item is None:
+            return None
+        if isinstance(item, dict) and "type" in item and "value" in item:
+            return {"type": item["type"], "value": item["value"]}
+        return None
+
+    def _collect_generated(self, ctx: Dict[str, Any]) -> None:
+        """Drain ``ctx["generated"]`` into :attr:`_generated` (one-shot)."""
+        item = self._normalize_generated(ctx.pop("generated", None))
+        if item is not None:
+            self._generated.append(item)
 
     def _emit_progress(self, total_steps: int) -> None:
         """Log one ``[FSM] step <N>: <state>`` line on a state change.
@@ -392,13 +415,7 @@ class OmniModel(nn.Module):
         cache across turns).  The FSM runs from whatever state it is in.
         """
         ctx: Dict[str, Any] = dict(context if context is not None else request)
-        # Per-request output accumulator for decoded multi-modal artefacts —
-        # already postprocessed by each emitting module's processor into a
-        # directly-savable form (PIL.Image for vision; audio waveform / etc.
-        # to come).  Drained from ``ctx['generated_image']`` after each FSM
-        # step so the key never leaks into the next iteration's module
-        # kwargs.
-        ctx.setdefault("generated_images_collected", [])
+        self._generated.clear()
 
         modules = {name: _unwrap_module(getattr(self, name)) for name in self._module_names}
 
@@ -414,13 +431,7 @@ class OmniModel(nn.Module):
             ctx = self.generation_graph.step(modules, ctx, trace=trace)
             total_steps += 1
 
-            # Drain per-step generated images.  Pop so a module's
-            # ``generate`` call on the *next* iteration doesn't see a
-            # stale image tensor as a kwarg (the FSM passes every ctx
-            # key as a kwarg, see GenerationGraph.step).
-            image = ctx.pop("generated_image", None)
-            if image is not None:
-                ctx["generated_images_collected"].append(image)
+            self._collect_generated(ctx)
 
             self.generation_graph.maybe_transition(ctx, trace=trace)
 

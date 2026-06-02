@@ -4,12 +4,12 @@ generation_graph:
   initial: prompt_to_text
   states:
     prompt_to_text:
-      body: [vis_to_ar, tok_enc_to_ar, ar_to_tok_dec, tok_dec_sink]
+      body: [vis_to_ar, tok_to_ar, ar_to_tok_dec, tok_dec_sink]
       transitions:
         - { condition: { type: module_signal, key: text_done }, next_state: done }
         - { condition: { type: default }, next_state: text_ar }
 
     text_ar:
-      body: [tok_enc_to_ar, ar_to_tok_dec, tok_dec_sink]
+      body: [tok_to_ar, ar_to_tok_dec, tok_dec_sink]
       transitions:
         - { condition: { type: module_signal, key: text_done }, next_state: done }
