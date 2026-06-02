@@ -1,0 +1,145 @@
+# =============================================================================
+# LTX-2.3 Audio-Video LoRA Training Configuration (Low VRAM)
+# =============================================================================
+#
+# Entry point: tasks/train_dit.py  (DiTTrainer + VeOmniDiTArguments)
+# Usage: bash train.sh tasks/train_dit.py configs/dit/ltx2_av_lora_low_vram.yaml
+#
+# This is a memory-optimized variant of the standard audio-video LoRA config.
+# It uses reduced LoRA rank to minimize GPU memory usage while maintaining
+# good training quality.
+#
+# Memory optimizations applied:
+#   - Lower LoRA rank (16 vs 32, reduces trainable parameters)
+#   - Gradient checkpointing enabled
+#
+# Recommended for GPUs with limited VRAM.
+#
+# Dataset structure for text-to-video training:
+#   preprocessed_data_root/
+#   ├── latents/        # Video latents (VAE-encoded videos)
+#   ├── conditions/     # Text embeddings for each video
+#   └── audio_latents/  # Audio latents (only if with_audio: true)
+#
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Model Configuration
+# -----------------------------------------------------------------------------
+model:
+  # Path to the LTX-2.3 transformer weights
+  model_path: "path/to/ltx-2.3-model.safetensors"
+
+  # Path to the condition model (text encoder + scheduler + VAE)
+  condition_model_path: "path/to/gemma-text-encoder"
+
+  config_path: ./configs/model_configs/ltx2_3/ltx2_3_av.json
+
+  # LoRA configuration — lower rank (16) for memory-constrained setups
+  lora_config:
+    rank: 16
+    alpha: 16
+    dropout: 0.0
+    lora_modules:
+      # Attention layers (matches both video and audio branches)
+      - "to_k"
+      - "to_q"
+      - "to_v"
+      - "to_out.0"
+      # Uncomment below to also train feed-forward layers:
+      # - "ff.net.0.proj"
+      # - "ff.net.2"
+      # - "audio_ff.net.0.proj"
+      # - "audio_ff.net.2"
+
+  # LTX-2.3 has non-standard RoPE, pin to eager
+  ops_implementation:
+    rotary_pos_emb_implementation: eager
+
+# -----------------------------------------------------------------------------
+# Data Configuration
+# -----------------------------------------------------------------------------
+data:
+  train_path: "/path/to/preprocessed/data"
+
+  data_type: diffusion
+  datasets_type: iterable
+  text_keys: text
+  max_seq_len: 8192
+  dataloader:
+    type: native
+    num_workers: 2
+    drop_last: true
+
+  mm_configs:
+    name: "text_to_video"
+    first_frame_conditioning_p: 0.5
+    with_audio: true
+    audio_latents_dir: "audio_latents"
+    timestep_sampling_mode: "shifted_logit_normal"
+
+# -----------------------------------------------------------------------------
+# Training Configuration
+# -----------------------------------------------------------------------------
+train:
+  training_task: online_training
+
+  global_batch_size: 8
+  micro_batch_size: 1
+  dyn_bsz: false
+
+  init_device: meta
+  seed: 42
+
+  num_train_epochs: 1
+  max_steps: 2000
+
+  gradient_checkpointing:
+    enable: true
+
+  optimizer:
+    # NOTE: "adamw8bit" is not a supported OptimizerConfig.type in VeOmni.
+    # VeOmni supports: "adamw", "anyprecision_adamw", "muon".
+    # For memory-efficient training, consider "anyprecision_adamw" or reduce
+    # global_batch_size / use gradient checkpointing.
+    type: adamw
+    lr: 1.0e-4
+    lr_decay_style: linear
+    max_grad_norm: 1.0
+
+  accelerator:
+    ulysses_size: 1
+    fsdp_config:
+      fsdp_mode: fsdp2
+      mixed_precision:
+        enable: true
+        param_dtype: bfloat16
+        cast_forward_inputs: false
+
+  checkpoint:
+    output_dir: "outputs/ltx2_av_lora_low_vram"
+    save_steps: 250
+    save_hf_weights: true
+
+  wandb:
+    enable: false
+    project: "ltx2_av_lora_low_vram"
+
+# --- NOTE: Fields below have NO direct VeOmni equivalent ---
+#
+# acceleration.quantization: "int8-quanto"
+#   (VeOmni does not expose a quantization config in YAML.)
+# acceleration.load_text_encoder_in_8bit: true
+# acceleration.offload_optimizer_during_validation: true
+#
+# validation.* (prompts, video_dims, guidance_scale, stg_scale, etc.)
+#   (VeOmni's DiTTrainer does not have a validation config section.)
+#
+# hub.push_to_hub / hub.hub_model_id
+#   (VeOmni does not have a Hub config section.)
+#
+# wandb.entity / wandb.tags / wandb.log_validation_videos
+#   (VeOmni's WandbConfig only has: enable, project, name, id.)
+#
+# checkpoints.keep_last_n / checkpoints.precision
+#   (VeOmni's CheckpointConfig does not have keep_last_n or precision fields.)

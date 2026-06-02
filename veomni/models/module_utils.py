@@ -153,6 +153,15 @@ def _load_state_dict(weights_path: str, **kwargs) -> List["StateDictIterator"]:
             shard_files, _ = get_checkpoint_shard_files(weights_path, resolved_weight_file, **kwargs)
             return [StateDictIterator(shard_file) for shard_file in shard_files]
 
+    if os.path.isdir(weights_path):
+        safetensors_files = [f for f in os.listdir(weights_path) if f.endswith(".safetensors")]
+        if len(safetensors_files) < 1:
+            raise ValueError(f"No safetensors file found in {weights_path}.")
+        if len(safetensors_files) > 1:
+            raise ValueError(f"Multiple safetensors files found in {weights_path}: {safetensors_files}.")
+        resolved_weight_file = os.path.join(weights_path, safetensors_files[0])
+        return [StateDictIterator(resolved_weight_file)]
+
     raise ValueError(f"Cannot find checkpoint files in {weights_path}.")
 
 

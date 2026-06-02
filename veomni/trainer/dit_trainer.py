@@ -27,7 +27,7 @@ from transformers.modeling_outputs import ModelOutput
 
 from ..arguments import DataArguments, ModelArguments, TrainingArguments, VeOmniArguments
 from ..data import build_data_transform, build_dataloader
-from ..data.data_collator import DataCollator
+from ..data.data_collator import DataCollator, MakeMicroBatchCollator
 from ..distributed.clip_grad_norm import veomni_clip_grad_norm
 from ..distributed.parallel_state import get_parallel_state
 from ..models import build_foundation_model
@@ -321,6 +321,36 @@ class DiTTrainer:
         if get_parallel_state().sp_enabled and get_parallel_state().sp_rank != 0:
             self.base.train_dataset = None
 
+        if (
+            not get_parallel_state().sp_enabled or get_parallel_state().sp_rank == 0
+        ) and self.base.train_dataset is not None:
+            inner = (
+                self.base.train_dataset._data if hasattr(self.base.train_dataset, "_data") else self.base.train_dataset
+            )
+            if hasattr(inner, "__len__"):
+                dataset_len = len(inner)
+                corrected_steps = max(1, dataset_len // args.train.global_batch_size)
+                if args.train.max_steps is not None:
+                    corrected_steps = min(corrected_steps, args.train.max_steps)
+                args._train_steps = corrected_steps
+                self.base.train_steps = args.train_steps
+                logger.info_rank0(
+                    f"Corrected train_steps based on actual dataset size: "
+                    f"dataset_len={dataset_len}, global_batch_size={args.train.global_batch_size}, "
+                    f"train_steps={corrected_steps}."
+                )
+
+                dp_size = get_parallel_state().dp_size
+                per_rank_count = max(1, math.ceil(dataset_len / dp_size))
+                if args.train.dataloader_batch_size > per_rank_count:
+                    old_bs = args.train.dataloader_batch_size
+                    args.train.dataloader_batch_size = per_rank_count
+                    logger.info_rank0(
+                        f"Capped dataloader_batch_size from {old_bs} to {per_rank_count} "
+                        f"(dataset_len={dataset_len}, dp_size={dp_size}, per_rank_count={per_rank_count}) "
+                        f"to ensure DataLoader can form batches with drop_last=True."
+                    )
+
         if self.training_task == "offline_embedding":
             if not get_parallel_state().sp_enabled or get_parallel_state().sp_rank == 0:
                 dp_rank = get_parallel_state().dp_rank
@@ -343,6 +373,16 @@ class DiTTrainer:
                 self.base.train_steps = args.train_steps
             else:
                 self.offline_embedding_saver = None
+
+        # Sync _train_steps across the DP group so every rank agrees on step count.
+        # Iterable datasets (e.g. PreprocessedIterableDataset) may yield different sample counts per rank after
+        # sharding, which would cause some ranks to exit the training loop earlier than others
+        # and deadlock at the next FSDP collective.
+        if get_parallel_state().dp_enabled and hasattr(args, "_train_steps"):
+            steps_t = torch.tensor([args._train_steps], dtype=torch.long, device=torch.device(get_device_type()))
+            dist.all_reduce(steps_t, op=dist.ReduceOp.MIN, group=get_parallel_state().dp_group)
+            args._train_steps = int(steps_t.item())
+            self.base.train_steps = args.train_steps
 
         # Sync _train_steps across the SP group AFTER padding so every rank
         # agrees on step count (required to avoid deadlocks in broadcast_object_list).
@@ -387,6 +427,21 @@ class DiTTrainer:
             )
         else:
             self.base.train_dataloader = None
+
+        if self.base.train_dataloader is not None and not args.train.dyn_bsz:
+            num_micro_batch = args.train.global_batch_size // (
+                args.train.micro_batch_size * get_parallel_state().dp_size
+            )
+            if num_micro_batch > args.train.dataloader_batch_size:
+                capped_nmb = max(1, args.train.dataloader_batch_size)
+                logger.info_rank0(
+                    f"Capping num_micro_batch from {num_micro_batch} to {capped_nmb} "
+                    f"(dataloader_batch_size={args.train.dataloader_batch_size}) "
+                    f"to avoid empty micro-batches."
+                )
+                collate_fn = self.base.train_dataloader.collate_fn
+                if isinstance(collate_fn, MakeMicroBatchCollator):
+                    collate_fn.num_micro_batch = capped_nmb
 
     def on_train_begin(self):
         self.base.on_train_begin()
@@ -433,6 +488,50 @@ class DiTTrainer:
         loss = torch.stack(list(loss_dict.values())).sum()
         return loss, loss_dict
 
+    def _compute_dit_loss(
+        self,
+        predictions: list[torch.Tensor],
+        training_targets: list[torch.Tensor],
+        video_loss_masks: list[torch.Tensor] | None,
+        audio_predictions: list[torch.Tensor] | None = None,
+        audio_training_targets: list[torch.Tensor] | None = None,
+        audio_loss_masks: list[torch.Tensor] | None = None,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        per_sample_losses = []
+
+        for i, (prediction, target) in enumerate(zip(predictions, training_targets)):
+            prediction = prediction.to(dtype=torch.float32)
+            target = target.to(dtype=torch.float32)
+            per_element_loss = (prediction - target).pow(2)
+
+            B, C, F, H, W = prediction.shape
+
+            sample_vlm = None
+            if video_loss_masks is not None and i < len(video_loss_masks):
+                sample_vlm = video_loss_masks[i]
+
+            if sample_vlm is not None:
+                sample_vlm = sample_vlm.to(device=prediction.device, dtype=torch.bool)
+                loss_mask = sample_vlm.view(1, 1, F, H, W).float()
+                masked_loss = per_element_loss * loss_mask
+                valid_count = loss_mask.reshape(1, 1, -1).sum(dim=-1).clamp(min=1e-8)
+                per_sample_loss = masked_loss.reshape(B, C, -1).sum(dim=-1).mean(dim=-1) / valid_count
+            else:
+                per_sample_loss = per_element_loss.reshape(B, -1).mean(dim=1)
+
+            if audio_predictions is not None and audio_training_targets is not None and i < len(audio_predictions):
+                audio_pred = audio_predictions[i].to(dtype=torch.float32)
+                audio_target = audio_training_targets[i].to(dtype=torch.float32)
+                audio_loss = (audio_pred - audio_target).pow(2).mean(dim=tuple(range(1, audio_pred.dim())))
+                per_sample_loss = per_sample_loss + audio_loss
+
+            per_sample_losses.append(per_sample_loss)
+
+        loss = torch.stack(per_sample_losses).mean()
+        loss_dict = {"mse_loss": loss}
+        total_loss = torch.stack(list(loss_dict.values())).sum()
+        return total_loss, loss_dict
+
     @staticmethod
     def _unpack_dict_of_list(batch: Dict[str, Any]) -> list[Dict[str, Any]]:
         if not isinstance(batch, dict) or len(batch) == 0:
@@ -443,7 +542,111 @@ class DiTTrainer:
 
     def forward_backward_step(self, micro_batch: Dict[str, torch.Tensor]) -> tuple:
         micro_batch = self.preforward(micro_batch)
-        if self.training_task == "online_training" or self.training_task == "offline_embedding":
+        device = get_device_type()
+
+        is_ltx2_precomputed = "video_prompt_embeds" in micro_batch
+        is_preprocessed = ("conditions" in micro_batch and "inputs" not in micro_batch) or is_ltx2_precomputed
+        fps_list = None
+
+        if is_ltx2_precomputed:
+            micro_batch.pop("idx", None)
+            latents_raw = micro_batch.pop("latents", None)
+            video_features = micro_batch.pop("video_prompt_embeds")
+            audio_features = micro_batch.pop("audio_prompt_embeds", None)
+            prompt_mask = micro_batch.pop("prompt_attention_mask", None)
+            for extra_key in list(micro_batch.keys()):
+                micro_batch.pop(extra_key)
+
+            if latents_raw is not None:
+                if isinstance(latents_raw, list) and len(latents_raw) > 0 and isinstance(latents_raw[0], dict):
+                    fps_list = [float(d.get("fps", 24)) for d in latents_raw]
+                    micro_batch["latents"] = [
+                        (d["latents"].unsqueeze(0) if d["latents"].dim() == 4 else d["latents"]).to(device)
+                        for d in latents_raw
+                    ]
+                elif isinstance(latents_raw, list):
+                    micro_batch["latents"] = [t.to(device) if isinstance(t, torch.Tensor) else t for t in latents_raw]
+                else:
+                    micro_batch["latents"] = (
+                        latents_raw.to(device) if isinstance(latents_raw, torch.Tensor) else latents_raw
+                    )
+
+            if isinstance(video_features, list):
+                micro_batch["context"] = [(f.unsqueeze(0) if f.dim() == 2 else f).to(device) for f in video_features]
+            else:
+                micro_batch["context"] = [video_features.to(device)]
+
+            if audio_features is not None:
+                if isinstance(audio_features, list):
+                    micro_batch["audio_context"] = [
+                        (f.unsqueeze(0) if f.dim() == 2 else f).to(device) for f in audio_features
+                    ]
+                else:
+                    micro_batch["audio_context"] = [audio_features.to(device)]
+
+            if prompt_mask is not None:
+                if isinstance(prompt_mask, list):
+                    micro_batch["context_mask"] = [
+                        (m.unsqueeze(0) if m.dim() == 1 else m).to(device) for m in prompt_mask
+                    ]
+                else:
+                    micro_batch["context_mask"] = [prompt_mask.to(device)]
+
+        elif is_preprocessed:
+            conditions_raw = micro_batch.pop("conditions")
+            audio_latents_raw = micro_batch.pop("audio_latents", None)
+            micro_batch.pop("idx", None)
+            for extra_key in list(micro_batch.keys()):
+                if extra_key not in ("latents",):
+                    micro_batch.pop(extra_key)
+            if micro_batch.get("latents") and isinstance(micro_batch["latents"][0], dict):
+                fps_list = [float(d.get("fps", 24)) for d in micro_batch["latents"]]
+                micro_batch["latents"] = [
+                    (d["latents"].unsqueeze(0) if d["latents"].dim() == 4 else d["latents"]).to(device)
+                    for d in micro_batch["latents"]
+                ]
+            elif micro_batch.get("latents"):
+                micro_batch["latents"] = [
+                    t.to(device) if isinstance(t, torch.Tensor) else t for t in micro_batch["latents"]
+                ]
+            first_cond = conditions_raw[0]
+            if isinstance(first_cond, dict) and "video_prompt_embeds" in first_cond:
+                video_features = [c["video_prompt_embeds"] for c in conditions_raw]
+                micro_batch["context"] = [(f.unsqueeze(0) if f.dim() == 2 else f).to(device) for f in video_features]
+                audio_features_list = [c.get("audio_prompt_embeds") for c in conditions_raw]
+                if any(a is not None for a in audio_features_list):
+                    micro_batch["audio_context"] = [
+                        (f.unsqueeze(0) if f.dim() == 2 else f).to(device)
+                        for f in audio_features_list
+                        if f is not None
+                    ]
+                prompt_mask_list = [c.get("prompt_attention_mask") for c in conditions_raw]
+                if any(m is not None for m in prompt_mask_list):
+                    micro_batch["context_mask"] = [
+                        (m.unsqueeze(0) if m.dim() == 1 else m).to(device) for m in prompt_mask_list if m is not None
+                    ]
+            elif isinstance(first_cond, dict):
+                micro_batch["context"] = [
+                    c.get("last_hidden_state", next(iter(c.values()))).unsqueeze(0).to(device) for c in conditions_raw
+                ]
+            elif isinstance(first_cond, torch.Tensor):
+                micro_batch["context"] = [(c.unsqueeze(0) if c.dim() == 2 else c).to(device) for c in conditions_raw]
+
+            if audio_latents_raw is not None:
+                if isinstance(audio_latents_raw, list) and len(audio_latents_raw) > 0:
+                    if isinstance(audio_latents_raw[0], dict):
+                        micro_batch["audio_latents"] = [
+                            (d["latents"].unsqueeze(0) if d["latents"].dim() == 3 else d["latents"]).to(device)
+                            for d in audio_latents_raw
+                        ]
+                    else:
+                        micro_batch["audio_latents"] = [
+                            (t.to(device) if isinstance(t, torch.Tensor) else t) for t in audio_latents_raw
+                        ]
+
+        if (
+            self.training_task == "online_training" or self.training_task == "offline_embedding"
+        ) and not is_preprocessed:
             with torch.no_grad():
                 micro_batch = self.condition_model.get_condition(**micro_batch)
 
@@ -454,14 +657,45 @@ class DiTTrainer:
             del micro_batch
             return 0.0, {}
 
+        first_frame_p = self.base.args.data.mm_configs.get("first_frame_conditioning_p", 0.5)
+        timestep_sampling_mode = self.base.args.data.mm_configs.get("timestep_sampling_mode", "shifted_logit_normal")
+        with_audio = self.base.args.data.mm_configs.get("with_audio", False)
         with torch.no_grad():
-            micro_batch = self.condition_model.process_condition(**micro_batch)
+            if is_preprocessed:
+                micro_batch = self.condition_model.process_condition(
+                    latents=micro_batch["latents"],
+                    context=micro_batch["context"],
+                    context_mask=micro_batch.get("context_mask"),
+                    audio_context=micro_batch.get("audio_context"),
+                    audio_latents=micro_batch.get("audio_latents") if with_audio else None,
+                    first_frame_conditioning_p=first_frame_p,
+                    timestep_sampling_mode=timestep_sampling_mode,
+                    fps=fps_list,
+                )
+            else:
+                micro_batch = self.condition_model.process_condition(**micro_batch)
+
+        if is_preprocessed:
+            training_targets = micro_batch.pop("training_target", None)
+            audio_training_targets = micro_batch.pop("audio_training_target", None)
+            micro_batch.pop("latents", None)
+
         with self.base.model_fwd_context:
             outputs = self.base.model(**micro_batch)
 
         loss: torch.Tensor
         loss_dict: Dict[str, torch.Tensor]
-        loss, loss_dict = self.postforward(outputs, micro_batch)
+        if is_preprocessed:
+            loss, loss_dict = self._compute_dit_loss(
+                outputs.predictions,
+                training_targets,
+                micro_batch.get("video_loss_mask"),
+                audio_predictions=outputs.audio_predictions,
+                audio_training_targets=audio_training_targets,
+                audio_loss_masks=micro_batch.get("audio_loss_mask"),
+            )
+        else:
+            loss, loss_dict = self.postforward(outputs, micro_batch)
 
         # Backward pass
         with self.base.model_bwd_context:
