@@ -1,5 +1,4 @@
 import torch
-
 from ltx_core.model.transformer.attention import Attention
 from ltx_core.model.transformer.feed_forward import FeedForward
 from ltx_core.model.transformer.rope import (
@@ -172,13 +171,17 @@ class Embeddings1DConnectorConfigurator:
 
     @classmethod
     def from_config(cls, config: dict) -> Embeddings1DConnector:
-        transformer_config = config.get("transformer", {})
+        transformer_config = config.get("transformer", config)
         rope_type = LTXRopeType(transformer_config.get("rope_type", "split"))
         double_precision_rope = transformer_config.get("frequencies_precision", False) == "float64"
         pe_max_pos = transformer_config.get("connector_positional_embedding_max_pos", [1])
 
-        num_attention_heads = transformer_config.get("connector_num_attention_heads", 30)
-        attention_head_dim = transformer_config.get("connector_attention_head_dim", 128)
+        is_v2 = "caption_proj_before_connector" in transformer_config
+        default_heads = transformer_config.get("num_attention_heads", 30) if is_v2 else 30
+        default_head_dim = transformer_config.get("attention_head_dim", 128) if is_v2 else 128
+
+        num_attention_heads = transformer_config.get("connector_num_attention_heads", default_heads)
+        attention_head_dim = transformer_config.get("connector_attention_head_dim", default_head_dim)
         num_layers = transformer_config.get("connector_num_layers", 2)
 
         connector = Embeddings1DConnector(
@@ -198,18 +201,22 @@ class AudioEmbeddings1DConnectorConfigurator:
 
     @classmethod
     def from_config(cls, config: dict) -> Embeddings1DConnector:
-        transformer_config = config.get("transformer", {})
+        transformer_config = config.get("transformer", config)
         rope_type = LTXRopeType(transformer_config.get("rope_type", "split"))
         double_precision_rope = transformer_config.get("frequencies_precision", False) == "float64"
         pe_max_pos = transformer_config.get("connector_positional_embedding_max_pos", [1])
 
+        is_v2 = "caption_proj_before_connector" in transformer_config
+        default_heads = transformer_config.get("audio_num_attention_heads", 30) if is_v2 else 30
+        default_head_dim = transformer_config.get("audio_attention_head_dim", 128) if is_v2 else 128
+
         num_attention_heads = transformer_config.get(
             "audio_connector_num_attention_heads",
-            transformer_config.get("connector_num_attention_heads", 30),
+            transformer_config.get("connector_num_attention_heads", default_heads),
         )
         attention_head_dim = transformer_config.get(
             "audio_connector_attention_head_dim",
-            transformer_config.get("connector_attention_head_dim", 128),
+            transformer_config.get("connector_attention_head_dim", default_head_dim),
         )
         num_layers = transformer_config.get(
             "audio_connector_num_layers",

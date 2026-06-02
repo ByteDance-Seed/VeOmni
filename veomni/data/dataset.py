@@ -1224,6 +1224,203 @@ class DynamicBatchingSizeDataset(IterableDataset):
             self.dataset.set_epoch(epoch)
 
 
+class PreprocessedIterableDataset(IterableDataset):
+    def __init__(
+        self,
+        data_root: str,
+        shuffle: bool = True,
+        split_by_node: bool = True,
+        seed: int = 42,
+    ):
+        super().__init__()
+        from pathlib import Path
+
+        data_root_path = Path(data_root).expanduser().resolve()
+        if not data_root_path.exists():
+            raise FileNotFoundError(f"Data root directory does not exist: {data_root_path}")
+        precomputed = data_root_path / ".precomputed"
+        self.root = precomputed if precomputed.is_dir() else data_root_path
+
+        self.shuffle = shuffle
+        self.split_by_node = split_by_node
+        self.seed = seed
+        self._epoch = 0
+
+        self.source_dirs = {}
+        for entry in sorted(self.root.iterdir()):
+            if entry.is_dir():
+                self.source_dirs[entry.name] = entry
+
+        if not self.source_dirs:
+            raise ValueError(f"No source directories found in {self.root}")
+
+        self.primary_key = "latents" if "latents" in self.source_dirs else next(iter(self.source_dirs))
+        primary_path = self.source_dirs[self.primary_key]
+
+        self._rel_paths = sorted(p.relative_to(primary_path) for p in primary_path.glob("**/*.pt"))
+        if not self._rel_paths:
+            raise FileNotFoundError(f"No .pt files found in {primary_path}")
+
+        self._path_sets: Dict[str, set] = {}
+        for dir_name, dir_path in self.source_dirs.items():
+            if dir_name != self.primary_key:
+                self._path_sets[dir_name] = {str(p.relative_to(dir_path)) for p in dir_path.glob("**/*.pt")}
+
+    def _get_expected_rel_path(self, dir_name: str, filename: str, rel_path):
+        if dir_name == "conditions" and filename.startswith("latent_"):
+            stem = filename[:-3] if filename.endswith(".pt") else filename
+            return rel_path.parent / f"condition_{stem[7:]}.pt"
+        return rel_path
+
+    @staticmethod
+    def _normalize_video_latents(data: dict) -> dict:
+        latents = data["latents"]
+        if latents.dim() == 2:
+            from einops import rearrange
+
+            num_frames = data["num_frames"]
+            height = data["height"]
+            width = data["width"]
+            latents = rearrange(latents, "(f h w) c -> c f h w", f=num_frames, h=height, w=width)
+            data = data.copy()
+            data["latents"] = latents
+        return data
+
+    def __len__(self) -> int:
+        return len(self._rel_paths)
+
+    def set_epoch(self, epoch: int):
+        self._epoch = epoch
+
+    def state_dict(self):
+        return {"epoch": self._epoch}
+
+    def load_state_dict(self, state_dict):
+        self._epoch = state_dict.get("epoch", 0)
+
+    def __iter__(self):
+        worker_info = get_worker_info()
+        worker_id = worker_info.id if worker_info is not None else 0
+        num_workers = worker_info.num_workers if worker_info is not None else 1
+
+        dp_rank = 0
+        dp_size = 1
+        if self.split_by_node:
+            parallel_state = get_parallel_state()
+            dp_rank = max(0, int(getattr(parallel_state, "dp_rank", 0)))
+            dp_size = max(1, int(getattr(parallel_state, "dp_size", 1)))
+
+        total_shards = dp_size * num_workers
+        shard_id = dp_rank * num_workers + worker_id
+
+        indices = list(range(len(self._rel_paths)))
+        if self.shuffle:
+            rng = random.Random(self.seed + self._epoch)
+            rng.shuffle(indices)
+
+        valid_indices = []
+        for idx in indices:
+            rel_path = self._rel_paths[idx]
+            filename = rel_path.name
+
+            all_exist = True
+            for dir_name in self.source_dirs:
+                if dir_name == self.primary_key:
+                    continue
+                expected_rel = self._get_expected_rel_path(dir_name, filename, rel_path)
+                if str(expected_rel) not in self._path_sets[dir_name]:
+                    all_exist = False
+                    break
+
+            if all_exist:
+                valid_indices.append(idx)
+
+        per_shard = (len(valid_indices) + total_shards - 1) // total_shards
+        shard_indices = valid_indices[shard_id::total_shards]
+        if len(shard_indices) == 0:
+            shard_indices = list(valid_indices)
+        while len(shard_indices) < per_shard:
+            shard_indices.extend(valid_indices[shard_id::total_shards] or valid_indices)
+        shard_indices = shard_indices[:per_shard]
+
+        for idx in shard_indices:
+            rel_path = self._rel_paths[idx]
+            filename = rel_path.name
+
+            result = {}
+            for dir_name, dir_path in self.source_dirs.items():
+                if dir_name == self.primary_key:
+                    file_path = dir_path / rel_path
+                else:
+                    expected_rel = self._get_expected_rel_path(dir_name, filename, rel_path)
+                    file_path = dir_path / expected_rel
+
+                data = torch.load(file_path, map_location="cpu", weights_only=True)
+                if "latent" in dir_name.lower() and isinstance(data, dict) and "latents" in data:
+                    data = self._normalize_video_latents(data)
+                result[dir_name] = data
+
+            result["idx"] = idx
+            yield result
+
+
+def _is_preprocessed_data_root(data_path: str) -> bool:
+    if not os.path.isdir(data_path):
+        return False
+    precomputed = os.path.join(data_path, ".precomputed")
+    root = precomputed if os.path.isdir(precomputed) else data_path
+    return os.path.isdir(os.path.join(root, "latents"))
+
+
+def _resolve_preprocessed_root(data_path: str) -> str:
+    precomputed = os.path.join(data_path, ".precomputed")
+    if os.path.isdir(precomputed):
+        return precomputed
+    return data_path
+
+
+def _discover_preprocessed_pt_files(data_path: str) -> List[str]:
+    from pathlib import Path
+
+    root = Path(_resolve_preprocessed_root(data_path))
+    primary_dir = root / "latents"
+    if not primary_dir.is_dir():
+        raise FileNotFoundError(f"Primary latents directory does not exist: {primary_dir}")
+
+    pt_files = sorted(str(p) for p in primary_dir.glob("**/*.pt"))
+    if not pt_files:
+        raise FileNotFoundError(f"No .pt files found in {primary_dir}")
+
+    data_sources = {}
+    for entry in root.iterdir():
+        if entry.is_dir() and entry.name != "latents":
+            data_sources[entry.name] = entry
+
+    if data_sources:
+        other_path_sets = {}
+        for dir_name, dir_path in data_sources.items():
+            other_path_sets[dir_name] = {str(p) for p in dir_path.glob("**/*.pt")}
+
+        valid_files = []
+        for pt_file in pt_files:
+            rel_path = Path(pt_file).relative_to(primary_dir)
+            all_exist = True
+            for dir_name, dir_path in data_sources.items():
+                expected = dir_path / rel_path
+                if str(expected) not in other_path_sets[dir_name]:
+                    all_exist = False
+                    break
+            if all_exist:
+                valid_files.append(pt_file)
+
+        skipped = len(pt_files) - len(valid_files)
+        if skipped > 0:
+            logger.info(f"Preprocessed data: {len(valid_files)} valid samples ({skipped} skipped)")
+        pt_files = valid_files
+
+    return pt_files
+
+
 def get_data_files(train_path):
     data_files = []
     data_paths = train_path.split(",")
@@ -1237,6 +1434,8 @@ def get_data_files(train_path):
 
                 data_files.append(hf_hub_download(data_path, os.path.split(filename)[-1], cache_dir=get_cache_dir()))
 
+        elif _is_preprocessed_data_root(data_path):
+            data_files.extend(_discover_preprocessed_pt_files(data_path))
         elif os.path.isdir(data_path):
             data_files.extend([os.path.join(data_path, fn) for fn in sorted(os.listdir(data_path))])
         elif os.path.isfile(data_path):
@@ -1244,7 +1443,7 @@ def get_data_files(train_path):
         else:
             raise FileNotFoundError(f"Dataset {data_path} not exists.")
     file_extenstion = os.path.splitext(data_files[0])[-1][1:]
-    if file_extenstion not in ["parquet", "jsonl", "json", "csv", "arrow"]:
+    if file_extenstion not in ["parquet", "jsonl", "json", "csv", "arrow", "pt"]:
         raise ValueError(f"{file_extenstion} files are not supported.")
 
     file_extenstion = "json" if file_extenstion == "jsonl" else file_extenstion
@@ -1302,6 +1501,18 @@ def build_iterable_dataset(
         IterableDataset: iterative dataset
     """
     logger.info_rank0("Start building iterative dataset")
+
+    data_paths = train_path.split(",")
+    if len(data_paths) == 1 and _is_preprocessed_data_root(data_paths[0]):
+        logger.info_rank0(f"Detected preprocessed data root: {data_paths[0]}")
+        dataset = PreprocessedIterableDataset(
+            data_root=data_paths[0],
+            shuffle=shuffle,
+            split_by_node=split_by_node,
+            seed=seed,
+        )
+        return IterativeDataset(dataset, transform=None)
+
     data_files, file_extenstion = get_data_files(train_path)
     dataset = load_dataset(file_extenstion, data_files=data_files, split=namespace, streaming=True)
     if shuffle:

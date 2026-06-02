@@ -60,7 +60,7 @@ def build_embeddings_processor(config: dict, with_feature_extractor: bool = Fals
         config: Model config dict (must contain 'transformer' key with connector params).
         with_feature_extractor: If True, also creates the feature extractor (for precompute).
     """
-    transformer_config = config.get("transformer", {})
+    transformer_config = config.get("transformer", config)
 
     video_connector = Embeddings1DConnectorConfigurator.from_config(config)
     audio_connector = AudioEmbeddings1DConnectorConfigurator.from_config(config)

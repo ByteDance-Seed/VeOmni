@@ -2,10 +2,9 @@ from typing import Tuple, Union
 
 import torch
 from einops import rearrange
+from ltx_core.model.video_vae.enums import PaddingModeType
 from torch import nn
 from torch.nn import functional as F
-
-from ltx_core.model.video_vae.enums import PaddingModeType
 
 
 def make_conv_nd(  # noqa: PLR0913
@@ -100,7 +99,7 @@ class DualConv3d(nn.Module):
         bias: bool = True,
         padding_mode: str = "zeros",
     ) -> None:
-        super(DualConv3d, self).__init__()
+        super().__init__()
 
         self.in_channels = in_channels
         self.out_channels = out_channels
