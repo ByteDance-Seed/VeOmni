@@ -146,10 +146,16 @@ multi-source example).
 ```bash
 bash train.sh tasks/train_vlm.py \
     configs/multimodal/qwen3_omni/qwen3_omni_decoupled_av.yaml \
-    --model.model_path Qwen3-Omni-30B-A3B-Instruct-merge
+    --model.model_path Qwen3-Omni-30B-A3B-Instruct
 ```
 
-(Use the same MoE-merged checkpoint as the default recipe.)
+Point `model_path` at the stock HF checkpoint — no offline MoE merge required.
+The runtime `CheckpointTensorConverter` registered on the Qwen3-Omni modeling
+class folds per-expert HF safetensor keys into VeOmni's fused
+`gate_up_proj` / `down_proj` layout at load time. See
+`docs/transformers_v5/transformers_v5_moe_weight_loading.md` for the format
+matrix and how to convert a VeOmni-format checkpoint back to per-expert HF
+keys for inference engines.
 
 ---
 
