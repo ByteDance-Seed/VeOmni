@@ -240,12 +240,16 @@ class _OmniModulePayloadMixin:
     """Retarget a single-model checkpoint callback at one OmniModule sub-tree.
 
     Mixed in **before** the concrete base callback so these overrides win.
-    ``self.trainer`` is the module-trainer's ``base`` (a bare ``BaseTrainer``)
-    whose ``name`` is the module's YAML key.
+    ``self.subfolder_name`` (the module's YAML key, passed in at construction)
+    is the ``<module>/`` subdir every save / load path is nested under.
     """
 
+    def __init__(self, trainer: "BaseTrainer", subfolder_name: str) -> None:
+        self.subfolder_name = subfolder_name
+        super().__init__(trainer)
+
     def _module_subdir(self, root: str, state: "TrainerState") -> str:
-        return os.path.join(root, f"global_step_{state.global_step}", self.trainer.name)
+        return os.path.join(root, f"global_step_{state.global_step}", self.subfolder_name)
 
     def _save_dir(self, state: "TrainerState") -> str:
         return self._module_subdir(self.trainer.args.train.checkpoint.save_path, state)
@@ -255,10 +259,10 @@ class _OmniModulePayloadMixin:
 
     def _load_dir(self) -> Optional[str]:
         load_path = self.trainer.args.train.checkpoint.load_path
-        return None if load_path is None else os.path.join(load_path, self.trainer.name)
+        return None if load_path is None else os.path.join(load_path, self.subfolder_name)
 
     def _model_assets_dir(self) -> str:
-        return os.path.join(self.trainer.args.train.checkpoint.model_assets_dir, self.trainer.name)
+        return os.path.join(self.trainer.args.train.checkpoint.model_assets_dir, self.subfolder_name)
 
     def _extra_state(self, state: "TrainerState") -> Dict[str, Any]:
         # Per-model only — the global step / dataloader / environ-meter / rng are
@@ -402,25 +406,18 @@ class OmniModuleTrainer:
     """
 
     base: BaseTrainer
-    # On-disk name (the module's YAML key), assigned by the orchestrator right
-    # after construction; used for the ``<module>/`` checkpoint subdir.
-    name: Optional[str]
 
     def __init__(
         self,
         args: "VeOmniArguments",
         conversation_tokenizer: Any = None,
+        subfolder_name: str = "",
     ):
         # Composition (mirrors OmniTrainer): a bare BaseTrainer whose global
         # _setup() is deliberately skipped (owned by OmniTrainer); we call only
         # its per-model build helpers, in order.
         self.base = BaseTrainer.__new__(BaseTrainer)
         self.base.args = args
-        # On-disk name (module YAML key) is assigned by the orchestrator right
-        # after construction; the checkpoint callbacks read it (off ``base``) at
-        # save time, so ``None`` here is fine.
-        self.name = None
-        self.base.name = None
 
         self.base._build_model()  # meta-init the sub-model from its config.json
         # Wire the global *conversation* tokenizer (resolves special-token ids /
@@ -447,10 +444,12 @@ class OmniModuleTrainer:
         self.base.train_dataloader = None
 
         # This module's own checkpoint callbacks (DCP resume + HF/LoRA export),
-        # reusing the shared single-model callbacks.  Optimizer / lr-scheduler
-        # are built later via :meth:`_build_optimizer` / :meth:`_build_lr_scheduler`
-        # (the orchestrator calls them once ``args.train_steps`` is known).
-        self._init_callbacks()
+        # reusing the shared single-model callbacks.  ``subfolder_name`` (the
+        # module's YAML key) is the ``<module>/`` checkpoint subdir.  Optimizer /
+        # lr-scheduler are built later via :meth:`_build_optimizer` /
+        # :meth:`_build_lr_scheduler` (the orchestrator calls them once
+        # ``args.train_steps`` is known).
+        self._init_callbacks(subfolder_name)
 
     # ── Optimizer / lr-scheduler (built here; the orchestrator only calls) ─────
 
@@ -464,19 +463,19 @@ class OmniModuleTrainer:
 
     # ── Callbacks (checkpoint only; trace lives on the orchestrator) ───────────
 
-    def _init_callbacks(self):
+    def _init_callbacks(self, subfolder_name: str):
         """Build this module's DCP resume + HF/LoRA export callbacks.
 
         Mirrors :meth:`BaseTrainer._init_callbacks` (the DCP + HF/LoRA half),
         bound to ``self.base`` so the shared callbacks save / load **this**
-        module's weights to its ``<module>/`` subdir.
+        module's weights to its ``<subfolder_name>/`` subdir.
         """
         base = self.base
-        self.checkpointer_callback = OmniModuleDcpCallback(base)
+        self.checkpointer_callback = OmniModuleDcpCallback(base, subfolder_name)
         if base.args.model.lora_config:
-            self.hf_ckpt_callback = OmniModuleLoraCallback(base)
+            self.hf_ckpt_callback = OmniModuleLoraCallback(base, subfolder_name)
         else:
-            self.hf_ckpt_callback = OmniModuleHfCallback(base)
+            self.hf_ckpt_callback = OmniModuleHfCallback(base, subfolder_name)
 
     def on_train_begin(self, state):
         self.checkpointer_callback.on_train_begin(state)
@@ -679,9 +678,8 @@ class OmniTrainer:
             module_trainer = OmniModuleTrainer(
                 self._module_args(weights_path, mod_cfg),
                 conversation_tokenizer=base.tokenizer,
+                subfolder_name=name,  # YAML key → ``<module>/`` checkpoint subdir
             )
-            module_trainer.name = name  # YAML key → ``<module>/`` checkpoint subdir
-            module_trainer.base.name = name  # the reused checkpoint callbacks read it off ``base``
             self.module_trainers[name] = module_trainer
             modules[name] = module_trainer.base.model
             logger.info_rank0(f"OmniTrainer: built module-trainer '{name}' from {weights_path}")
