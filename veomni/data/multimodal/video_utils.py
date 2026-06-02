@@ -315,33 +315,78 @@ def _pil_images_to_tensor(images: List["PIL.Image.Image"]) -> torch.Tensor:
 
 
 def _dict_to_video_audio(video_dict: Dict[str, "np.ndarray"]) -> tuple:
-    """Convert dict to video tensor and audio array.
+    """Convert a paired-A/V dict to (video tensor, video_fps, audio array, audio_fps).
 
-    Expected keys: 'video' (required), 'audio', 'video_fps', 'audio_fps' (optional).
+    Accepted layouts:
+
+    1. **Decoded ndarrays** (existing): ``{"video": np.ndarray, "audio": np.ndarray?,
+       "video_fps": float?, "audio_fps": float?}`` — ``video`` is 4D ``(T, H, W, C)``
+       or ``(T, C, H, W)``.
+
+    2. **Offline-extracted bytes** (new): ``{"frames": List[bytes], "audio": bytes?,
+       "video_fps": float?, "audio_fps": float?}`` — ``frames`` is a list of
+       PNG/JPEG-encoded image bytes representing the temporally-sampled frames
+       of a single A/V clip, and ``audio`` is WAV-encoded bytes (or an ndarray)
+       for the same clip. Used by the Qwen-Omni offline-A/V recipe — the
+       per-video audio slot is non-empty, so the processor treats the result as
+       an audio-enabled video and interleaves video/audio tokens.
+
+    Either ``video`` or ``frames`` must be present.
     """
-    if "video" not in video_dict:
-        logger.error(f"Dict input missing 'video' key. Available keys: {list(video_dict.keys())}")
-        raise ValueError("Dict input must contain 'video' key")
+    if "frames" in video_dict:
+        from io import BytesIO
 
-    video_np = video_dict["video"]
-    logger.debug(f"Processing video array with shape: {video_np.shape}, dtype: {video_np.dtype}")
+        frames = video_dict["frames"]
+        if isinstance(frames, np.ndarray):
+            frames = frames.tolist()
+        if not frames or not isinstance(frames[0], (bytes, bytearray)):
+            raise ValueError(
+                "Dict input with 'frames' key must be a non-empty List[bytes] of "
+                f"PNG/JPEG-encoded frames; got {type(frames[0]) if frames else 'empty'}."
+            )
+        pil_images = []
+        for frame_bytes in frames:
+            with PIL.Image.open(BytesIO(frame_bytes)) as img:
+                if img.mode != "RGB":
+                    img = img.convert("RGB")
+                pil_images.append(img.copy())
+        video = _pil_images_to_tensor(pil_images)
+        video_fps = video_dict.get("video_fps", video_dict.get("fps", 2.0))
+    elif "video" in video_dict:
+        video_np = video_dict["video"]
+        logger.debug(f"Processing video array with shape: {video_np.shape}, dtype: {video_np.dtype}")
 
-    if video_np.ndim == 4:
-        if video_np.shape[-1] == 3:
-            logger.debug(f"Converting (T, H, W, C) format: {video_np.shape} -> permute to (T, C, H, W)")
-            video = torch.from_numpy(video_np).permute(0, 3, 1, 2)
+        if video_np.ndim == 4:
+            if video_np.shape[-1] == 3:
+                logger.debug(f"Converting (T, H, W, C) format: {video_np.shape} -> permute to (T, C, H, W)")
+                video = torch.from_numpy(video_np).permute(0, 3, 1, 2)
+            else:
+                logger.debug(f"Assuming (T, C, H, W) format: {video_np.shape}, no permutation needed")
+                video = torch.from_numpy(video_np)
         else:
-            logger.debug(f"Assuming (T, C, H, W) format: {video_np.shape}, no permutation needed")
-            video = torch.from_numpy(video_np)
+            logger.error(
+                f"Invalid video array dimensions. Expected 4D array, got shape: {video_np.shape} (ndim={video_np.ndim})"
+            )
+            raise ValueError(f"Video array must be 4D, got shape {video_np.shape}")
+        video_fps = video_dict.get("video_fps", 30.0)
     else:
-        logger.error(
-            f"Invalid video array dimensions. Expected 4D array, got shape: {video_np.shape} (ndim={video_np.ndim})"
-        )
-        raise ValueError(f"Video array must be 4D, got shape {video_np.shape}")
+        logger.error(f"Dict input missing both 'video' and 'frames' keys. Available keys: {list(video_dict.keys())}")
+        raise ValueError("Dict input must contain either 'video' (ndarray) or 'frames' (List[bytes])")
 
     audio = video_dict.get("audio", None)
-    video_fps = video_dict.get("video_fps", 30.0)
     audio_fps = video_dict.get("audio_fps", None)
+    if isinstance(audio, (bytes, bytearray)):
+        # WAV bytes — decode at native sample rate. smart_audio_nframes will resample.
+        from io import BytesIO
+
+        import soundfile as sf
+
+        audio_array, native_sr = sf.read(BytesIO(audio))
+        if audio_array.ndim == 2:
+            # multi-channel (T, C) -> mono
+            audio_array = audio_array.mean(axis=1)
+        audio = audio_array.astype(np.float32)
+        audio_fps = audio_fps or native_sr
 
     return video, video_fps, audio, audio_fps
 

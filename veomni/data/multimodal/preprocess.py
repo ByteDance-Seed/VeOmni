@@ -373,32 +373,47 @@ def tulu_3_sft_mixture_preprocess(conversations, **kwargs):
     return constructed_conversation
 
 
-@PREPROCESSOR_REGISTRY.register("qwen_omni_decoupled_av")
-def qwen_omni_decoupled_av_preprocess(conversations, **kwargs):
-    """Decoupled multimodal shape for Qwen-Omni (offline-extracted frames + separate audio).
+@PREPROCESSOR_REGISTRY.register("qwen_omni_offline_av")
+def qwen_omni_offline_av_preprocess(conversations, **kwargs):
+    """Offline-extracted audio-enabled video shape for Qwen-Omni.
 
-    Each turn ``value`` may contain inline markers ``<image>``, ``<video>``, and
-    ``<audio>`` that get promoted to separate content items. The sample is expected
-    to carry pre-extracted frames under ``sample["videos"]`` (each item ``List[bytes]``),
-    audio under ``sample["audios"]`` (path / bytes), and images under ``sample["images"]``.
-    Marker order in ``value`` determines order relative to text. Multiple markers per
-    turn are supported.
+    Use this preprocessor when each sample carries an **audio-enabled video**
+    that has been offline-decoded into a list of frame bytes plus a matching
+    audio track — for example, because frame sampling / shot detection / audio
+    extraction is done in a preceding data pipeline. The video and audio are
+    treated as a single A/V unit aligned in time, **not** as two independent
+    streams, and the Qwen-Omni processor interleaves their tokens via the
+    standard ``use_audio_in_video=True`` path.
 
-    The caller is responsible for keeping the per-modality marker count in each
-    conversation aligned with the corresponding ``sample["<modality>"]`` list
-    length — a mismatch surfaces as a ``StopIteration`` deep inside
-    ``process_sample_qwen_omni`` when content items are bound left-to-right.
-
-    Example sample::
+    Sample shape::
 
         {
-            "videos": [[png_bytes_0, png_bytes_1, ...]],
-            "audios": ["/path/audio.wav"],
+            "videos": [
+                {
+                    "frames": [png_bytes_0, png_bytes_1, ...],   # List[bytes]
+                    "audio":  wav_bytes,                          # bytes or np.ndarray
+                    # optional: "video_fps": 2.0, "audio_fps": 16000
+                }
+            ],
+            "audios": ["/path/voice_query.wav"],   # optional, for standalone audio turns
+            "images": ["/path/image.jpg"],         # optional, for image content
             "conversations": [
-                {"from": "human", "value": "<video>\\n<audio>\\nWhat happens?"},
+                {"from": "human", "value": "<video>\\nWhat is happening?"},
                 {"from": "gpt",   "value": "Someone is speaking ..."},
             ],
         }
+
+    Each ``<video>`` marker consumes one paired-A/V dict from ``sample["videos"]``;
+    each ``<audio>`` marker consumes one standalone audio entry from
+    ``sample["audios"]`` (independent of any video); each ``<image>`` marker
+    consumes one entry from ``sample["images"]``. Marker order in ``value``
+    determines the order of content items. Multiple markers per turn are
+    supported.
+
+    The caller is responsible for keeping the per-modality marker count in each
+    conversation aligned with the corresponding ``sample[...]`` list length —
+    a mismatch surfaces as a ``StopIteration`` deep inside
+    ``process_sample_qwen_omni`` when content items are bound left-to-right.
     """
     role_mapping = {"human": "user", "gpt": "assistant"}
     constructed = []

@@ -5,11 +5,11 @@ model:
     attn_implementation: flash_attention_2
 
 data:
-  train_path: configs/multimodal/data/qwen3_omni_decoupled_av.yaml
+  train_path: configs/multimodal/data/qwen3_omni_offline_av.yaml
   data_type: conversation
   max_seq_len: 8196
   train_size: 80000000
-  source_name: qwen_omni_decoupled_av
+  source_name: qwen_omni_offline_av
   dataloader:
     num_workers: 0
   mm_configs:
@@ -24,13 +24,12 @@ data:
     frame_factor: 2
     sample_rate: 16000
     fps: 2.0
-    # Decoupled mode: video frames come pre-extracted in sample["videos"]
-    # (List[List[bytes]]) and audio comes from sample["audios"] (List[path|bytes]).
-    # Per-video audio is always None for frame-list inputs, so Qwen3-Omni emits
-    # video and audio tokens as separate runs (no interleaving). The flag below
-    # only affects raw-video path/bytes inputs (PyAV audio extraction), and is a
-    # no-op for frame-list inputs.
-    use_audio_in_video: False
+    # Offline-A/V mode: each sample["videos"][i] is a dict carrying both the
+    # pre-extracted frames (List[bytes]) and the paired audio (bytes / ndarray)
+    # for one audio-enabled video clip. The per-video audio is non-empty, so
+    # Qwen3-Omni interleaves video and audio tokens via the standard omni path
+    # (use_audio_in_video=True). See docs/examples/qwen3_omni_offline_av.md.
+    use_audio_in_video: True
 
 train:
   accelerator:
@@ -46,7 +45,7 @@ train:
   max_steps: 20
   init_device: meta
   checkpoint:
-    output_dir: qwen3_omni_decoupled_av_sft
+    output_dir: qwen3_omni_offline_av_sft
   wandb:
     project: qwen3_omni
-    name: qwen3_omni_decoupled_av
+    name: qwen3_omni_offline_av
