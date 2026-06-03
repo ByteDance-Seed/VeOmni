@@ -38,7 +38,6 @@ import torch
 import veomni.ops  # noqa: F401  — trigger every KERNEL_REGISTRY.register() at import
 from veomni.ops.dispatch import OpSlot
 from veomni.ops.kernel_registry import (
-    HARDWARE_GPU_REJECT_MSG,
     KERNEL_REGISTRY,
     HardwareRequirement,
     KernelRegistry,
@@ -367,21 +366,26 @@ class TestNPUMoEExperts:
                 B, T, H = hidden_states.shape
                 flat_x = hidden_states.reshape(-1, H)
                 out = torch.zeros_like(flat_x)
+                flat_top_k_index = top_k_index.reshape(-1, top_k_index.shape[-1])
+                flat_top_k_weights = top_k_weights.reshape(-1, top_k_weights.shape[-1])
                 for e in range(self.num_experts):
-                    mask = (top_k_index.reshape(-1) == e)
-                    if not mask.any():
+                    mask = (flat_top_k_index == e)  # (B*T, top_k) bool
+                    token_mask = mask.any(dim=-1)  # (B*T,) bool: token selects expert e
+                    if not token_mask.any():
                         continue
-                    tokens = flat_x[mask]
+                    tokens = flat_x[token_mask]  # (N, H)
                     gu = self.gate_up_proj[e]  # (2*ffn, H)
                     down = self.down_proj[e]  # (ffn, H)
                     # Split gate / up
                     gate = gu[:ffn]
                     up = gu[ffn:]
-                    inter = torch.nn.functional.silu(flat_x[mask] @ gate.T) * (flat_x[mask] @ up.T)
-                    routed = inter @ down.T
-                    # Weight by routing probability (sum across top-k)
-                    w = top_k_weights.reshape(-1, top_k_index.shape[-1])[mask].sum(-1).to(routed.dtype)
-                    out[mask] += w.unsqueeze(-1) * routed
+                    inter = torch.nn.functional.silu(tokens @ gate.T) * (tokens @ up.T)
+                    routed = inter @ down.T  # (N, H)
+                    # Weight by routing probability for this expert
+                    # (a token may select expert e in multiple top_k slots; sum the
+                    # corresponding weights — the kernel's scatter-add does the same).
+                    w = (flat_top_k_weights * mask).sum(dim=-1)[token_mask].to(routed.dtype)
+                    out[token_mask] += w.unsqueeze(-1) * routed
                 return out.view(B, T, H)
 
         return _EagerExperts().to(device=DEVICE, dtype=dtype)
@@ -606,7 +610,12 @@ class TestHcclPremulSumExtra:
 
         from veomni.ops.platform.npu.hccl_premul_sum import apply_hccl_premul_sum_patch
 
-        original = dist.all_reduce
+        # The patcher monkey-patches all three of these — save each so the
+        # test never leaks a wrapped function into the rest of the session
+        # (would break any subsequent test that calls dist.* directly).
+        original_all_reduce = dist.all_reduce
+        original_reduce_scatter = getattr(dist, "reduce_scatter", None)
+        original_reduce_scatter_tensor = getattr(dist, "reduce_scatter_tensor", None)
         try:
             apply_hccl_premul_sum_patch()
             first_patched = dist.all_reduce
@@ -614,15 +623,16 @@ class TestHcclPremulSumExtra:
             second_patched = dist.all_reduce
             # Each patch should produce a new wrapper; the wrapped function
             # is still callable even if it's wrapped twice.
-            assert first_patched is not original
+            assert first_patched is not original_all_reduce
             assert second_patched is not first_patched
             # And it's still a function (callable).
             assert callable(second_patched)
         finally:
-            # Restore (no perfect undo since the wrapper chain is opaque, but
-            # at minimum we make sure the test doesn't leak a wrapped function
-            # into the rest of the test session).
-            dist.all_reduce = original
+            dist.all_reduce = original_all_reduce
+            if original_reduce_scatter is not None:
+                dist.reduce_scatter = original_reduce_scatter
+            if original_reduce_scatter_tensor is not None:
+                dist.reduce_scatter_tensor = original_reduce_scatter_tensor
 
 
 # ---------------------------------------------------------------------------
@@ -742,25 +752,20 @@ class TestKernelRegistryContract:
             KERNEL_REGISTRY.resolve("rms_norm", "standard", "definitely_not_a_real_kernel")
 
     def test_resolve_wrong_hardware_raises_runtimeerror(self):
-        """Resolving an NPU kernel on a non-NPU host must raise RuntimeError,
+        """Resolving a GPU-only kernel on an NPU host must raise RuntimeError,
         not silently return ``None`` (which the slot would treat as eager
-        and silently skip)."""
+        and silently skip the kernel).
+
+        The module-level ``pytestmark`` already guarantees we're on an NPU
+        host. We pick ``moe_experts.standard.triton`` — the Triton backend
+        is registered with ``device_type='gpu', min_compute_capability=70``,
+        so its ``HardwareRequirement.is_satisfied()`` returns False on
+        Ascend and ``KERNEL_REGISTRY.resolve`` raises a cross-device error.
+        """
         from veomni.ops.kernel_registry import KERNEL_REGISTRY
 
-        # Force the hardware gate to look at the *actual* current device by
-        # querying an op that only ships an NPU backend. If we're on an NPU
-        # host, this whole test is skipped at module level — so the call
-        # below is expected to either succeed (and we re-assert) or raise a
-        # non-RuntimeError type that we map to a soft pass.
-        try:
-            KERNEL_REGISTRY.resolve("rms_norm", "standard", "npu")
-        except RuntimeError as e:
-            # Acceptable: the kernel's hardware gate rejected the call.
-            assert "device_type='npu'" in str(e), f"unexpected RuntimeError message: {e}"
-        except Exception:
-            # Some other path (e.g. import error) — re-raise so the test
-            # fails loudly instead of silently passing.
-            raise
+        with pytest.raises(RuntimeError, match="device_type='gpu'"):
+            KERNEL_REGISTRY.resolve("moe_experts", "standard", "triton")
 
     def test_register_duplicate_raises(self):
         """Re-registering an existing (op, variant, name) without ``force=True``
