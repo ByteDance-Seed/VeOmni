@@ -356,9 +356,7 @@ class TestNPUMoEExperts:
                 self.gate_up_proj = nn.Parameter(
                     torch.randn(num_experts, 2 * ffn, hidden, device=DEVICE, dtype=dtype) * 0.02
                 )
-                self.down_proj = nn.Parameter(
-                    torch.randn(num_experts, ffn, hidden, device=DEVICE, dtype=dtype) * 0.02
-                )
+                self.down_proj = nn.Parameter(torch.randn(num_experts, ffn, hidden, device=DEVICE, dtype=dtype) * 0.02)
 
             def forward(self, hidden_states, top_k_index, top_k_weights):
                 # Eager reference: route each token to its assigned expert,
@@ -369,7 +367,7 @@ class TestNPUMoEExperts:
                 flat_top_k_index = top_k_index.reshape(-1, top_k_index.shape[-1])
                 flat_top_k_weights = top_k_weights.reshape(-1, top_k_weights.shape[-1])
                 for e in range(self.num_experts):
-                    mask = (flat_top_k_index == e)  # (B*T, top_k) bool
+                    mask = flat_top_k_index == e  # (B*T, top_k) bool
                     token_mask = mask.any(dim=-1)  # (B*T,) bool: token selects expert e
                     if not token_mask.any():
                         continue
