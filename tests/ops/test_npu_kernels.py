@@ -115,12 +115,15 @@ class TestNPURmsNorm:
         w = torch.randn(hidden, device=DEVICE, dtype=torch.bfloat16)
         out_kernel = slot(x, w, 1e-6)
         out_eager = _eager_rms_norm_standard(x, w, 1e-6)
-        # bf16 RMSNorm on Ascend 910 drifts by 1-2 bf16 ULPs (~7e-3 at hidden=128)
-        # from the eager reference due to rounding in the final elementwise mul.
-        # We use a per-hidden tolerance that stays well below the 0.5 gap a wrong
-        # kernel variant (e.g. qwen3_5 bound into a standard slot) would produce.
-        atol = 2e-3 if hidden <= 64 else 1e-2
-        assert torch.allclose(out_kernel, out_eager, atol=atol, rtol=atol)
+        # bf16 RMSNorm on Ascend 910 drifts by 1-2 bf16 ULPs from the eager
+        # reference due to rounding in the final elementwise mul.  The ULP at
+        # value 4.0 is 0.031, so 1e-2 atol + 1e-2 rtol covers the worst case
+        # (1 ULP at any value <= 4) while still being 50x smaller than the 0.5
+        # gap a wrong kernel variant (e.g. qwen3_5 bound into a standard slot)
+        # would produce.
+        atol = 1e-2
+        rtol = 1e-2
+        assert torch.allclose(out_kernel, out_eager, atol=atol, rtol=rtol)
 
     @pytest.mark.parametrize("batch,seq,hidden", [(2, 16, 128), (1, 8, 64)])
     def test_standard_matches_eager_fp32(self, batch, seq, hidden):
@@ -140,10 +143,14 @@ class TestNPURmsNorm:
         x = torch.randn(batch, seq, hidden, device=DEVICE, dtype=torch.bfloat16)
         w = torch.zeros(hidden, device=DEVICE, dtype=torch.bfloat16)  # Qwen3.5 init to zeros
         w += 0.01 * torch.randn_like(w)
-        # Both sides up-cast to fp32 before the comparison
+        # bf16 RMSNorm on Ascend 910 drifts by 1-2 bf16 ULPs from the eager
+        # reference even after up-casting to fp32, because the rounding happens
+        # in the bf16 multiply before the cast.  1e-2 atol + 1e-2 rtol covers
+        # 1 ULP at any normalized value while staying well below the gap a
+        # wrong kernel variant would produce.
         out_kernel = slot(x, w, 1e-6).to(torch.float32)
         out_eager = _eager_rms_norm_qwen3_5(x, w, 1e-6).to(torch.float32)
-        assert torch.allclose(out_kernel, out_eager, atol=1e-4, rtol=1e-4)
+        assert torch.allclose(out_kernel, out_eager, atol=1e-2, rtol=1e-2)
 
 
 # ---------------------------------------------------------------------------
@@ -167,10 +174,12 @@ class TestNPURotaryPosEmb:
         sin = torch.cat([half_s, half_s], dim=-1)
         q_k, k_k = slot(q, k, cos, sin)
         q_e, k_e = _eager_rope(q, k, cos, sin)
-        # Compound bf16 op: (q * cos) + (rotate_half(q) * sin) — 1e-2 covers
-        # worst-case bf16 rounding per op.
-        assert torch.allclose(q_k, q_e, atol=1e-2, rtol=1e-2)
-        assert torch.allclose(k_k, k_e, atol=1e-2, rtol=1e-2)
+        # Cast to fp32 because torch.allclose lowers to aclnnIsClose on NPU,
+        # which only supports DT_FLOAT (raises EZ1001 on bf16 inputs).
+        # bf16 RoPE compounds two rounds (q*cos) + (rotate_half(q)*sin); on
+        # larger shapes (e.g. (2,4,16,64)) the bf16 ULP drift stacks to ~2e-2.
+        assert torch.allclose(q_k.float(), q_e.float(), atol=2e-2, rtol=2e-2)
+        assert torch.allclose(k_k.float(), k_e.float(), atol=2e-2, rtol=2e-2)
 
     @pytest.mark.parametrize("S,H,D", [(16, 4, 64), (8, 2, 32)])
     def test_vision_matches_eager_bf16(self, S, H, D):
@@ -184,8 +193,9 @@ class TestNPURotaryPosEmb:
         sin = torch.cat([half_s, half_s], dim=-1)
         q_k, k_k = slot(q, k, cos, sin)
         q_e, k_e = _eager_rope_vision(q, k, cos, sin)
-        assert torch.allclose(q_k, q_e, atol=1e-2, rtol=1e-2)
-        assert torch.allclose(k_k, k_e, atol=1e-2, rtol=1e-2)
+        # Cast to fp32 + 2e-2 tolerance (see comment in test_full_matches_eager_bf16).
+        assert torch.allclose(q_k.float(), q_e.float(), atol=2e-2, rtol=2e-2)
+        assert torch.allclose(k_k.float(), k_e.float(), atol=2e-2, rtol=2e-2)
 
     @pytest.mark.parametrize("B,H,S,D,rotary_dim", [(2, 4, 16, 128, 64), (1, 2, 8, 64, 32)])
     def test_partial_matches_eager_bf16(self, B, H, S, D, rotary_dim):
@@ -200,8 +210,9 @@ class TestNPURotaryPosEmb:
         sin = torch.cat([half_s, half_s], dim=-1)
         q_k, k_k = slot(q, k, cos, sin)
         q_e, k_e = _eager_partial_rope(q, k, cos, sin)
-        assert torch.allclose(q_k, q_e, atol=1e-2, rtol=1e-2)
-        assert torch.allclose(k_k, k_e, atol=1e-2, rtol=1e-2)
+        # Cast to fp32 + 2e-2 tolerance (see comment in test_full_matches_eager_bf16).
+        assert torch.allclose(q_k.float(), q_e.float(), atol=2e-2, rtol=2e-2)
+        assert torch.allclose(k_k.float(), k_e.float(), atol=2e-2, rtol=2e-2)
 
 
 # ---------------------------------------------------------------------------
@@ -216,8 +227,9 @@ class TestNPURmsNormGated:
     def test_matches_eager_bf16(self, batch, seq, hidden, ffn_dim):
         slot = OpSlot("rms_norm_gated", "standard")
         slot.bind("npu")
-        # The slot returns the class itself; instantiate it
-        fused_cls = slot.resolve()
+        # The bound kernel is the NPUFusedRMSNormGated class; instantiate it.
+        # (OpSlot exposes bound_kernel(); resolve() is on the KERNEL_REGISTRY.)
+        fused_cls = slot.bound_kernel()
         fused_module = fused_cls(hidden_size=hidden, eps=1e-6).to(device=DEVICE, dtype=torch.bfloat16)
 
         hidden_states = torch.randn(batch, seq, hidden, device=DEVICE, dtype=torch.bfloat16)
@@ -225,8 +237,9 @@ class TestNPURmsNormGated:
 
         out_fused = fused_module(hidden_states, gate=gate)
         out_eager = _eager_rms_norm_gated(hidden_states, fused_module.weight, fused_module.variance_epsilon, gate)
-        # Compound op: RMSNorm + concat + SiLU gate — multiple bf16 roundings
-        assert torch.allclose(out_fused, out_eager, atol=5e-3, rtol=5e-3)
+        # Compound op: RMSNorm + concat + SiLU gate — multiple bf16 roundings.
+        # 1e-2 atol+rtol covers 1-2 bf16 ULPs at typical normalized values.
+        assert torch.allclose(out_fused.float(), out_eager.float(), atol=1e-2, rtol=1e-2)
 
 
 # ---------------------------------------------------------------------------
@@ -244,13 +257,25 @@ class TestHcclPremulSum:
 
     def test_premul_sum_decomposes_to_sum_plus_mul(self):
         """PREMUL_SUM should be converted to SUM followed by scalar multiplication."""
+        from torch.distributed import ReduceOp
+
         from veomni.ops.platform.npu.hccl_premul_sum import hccl_premul_sum_wrapper
 
         factor = 0.5
-        # Create a mock PREMUL_SUM op with __getstate__
-        mock_op = type("MockPremulSum", (), {})()
-        mock_op.__eq__ = lambda self, other: isinstance(other, type(mock_op))
-        mock_op.__getstate__ = lambda self: ("PREMUL_SUM", factor)
+
+        # Build the mock as a real class so that ``op == ReduceOp.PREMUL_SUM``
+        # dispatches to our ``__eq__`` (Python only consults class-level
+        # ``__eq__`` for the ``==`` operator; an attribute set on the instance
+        # is ignored).  ``__getstate__`` returns the tuple shape the wrapper
+        # expects: ``("PREMUL_SUM", factor)`` and the wrapper reads ``[1]``.
+        class MockPremulSum:
+            def __eq__(self, other):
+                return other is ReduceOp.PREMUL_SUM
+
+            def __getstate__(self):
+                return ("PREMUL_SUM", factor)
+
+        mock_op = MockPremulSum()
 
         # Track calls to the original op
         calls = []
