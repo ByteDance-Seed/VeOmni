@@ -15,6 +15,7 @@
 import transformers
 
 from . import (
+    bagel_foundation,
     janus_foundation,
     llama_foundation,
     qwen2_5_omni_foundation,
@@ -34,6 +35,7 @@ __all__ = [
     "BaseFoundationModelMixin",
     "BaseFoundationConfigMixin",
     "qwen3_moe_foundation",
+    "bagel_foundation",
 ]
 
 if transformers.__version__ >= "4.56.0":

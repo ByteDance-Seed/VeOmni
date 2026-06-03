@@ -13,7 +13,7 @@
 # limitations under the License.
 
 
-from . import cosmos, instruct_pix2pix, janusvq16, movqgan, ultra_edit
+from . import bagel_vision_decoder, cosmos, instruct_pix2pix, janusvq16, movqgan, ultra_edit
 from .base import BaseDecoderConfigMixin, BaseDecoderModelMixin, BaseDecoderOutput
 
 
@@ -26,4 +26,5 @@ __all__ = [
     "janusvq16",
     "ultra_edit",
     "instruct_pix2pix",
+    "bagel_vision_decoder",
 ]

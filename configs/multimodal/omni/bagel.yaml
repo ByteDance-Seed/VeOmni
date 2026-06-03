@@ -1,0 +1,46 @@
+# Unified Bagel training (understanding + generation) on the seed_omni stack.
+#
+# Prepare the per-submodule weights first:
+#   python scripts/multimodal/convert_bagel.py --model_path /path/to/BAGEL-7B --output_dir bagel_veomni
+#
+# The bagel data path uses BagelPackedCollator + BagelSampleTransform (auto-selected when
+# the foundation is `bagel_foundation`). Each dataset record should provide either:
+#   - understanding: {"task": "understanding", "prompt": str, "response": str, "image": PIL}
+#   - generation:    {"task": "generation",    "prompt": str, "image": PIL}
+model:
+  config_path: bagel_veomni/bagel_foundation
+  model_path: bagel_veomni/bagel_foundation
+  input_encoder: encoder      # SigLIP NaViT understanding encoder
+  output_encoder: decoder     # FLUX-VAE / rectified-flow generation decoder
+  encoders:
+    image:
+      config_path: bagel_veomni/bagel_vision_encoder
+      model_path: bagel_veomni/bagel_vision_encoder
+  decoders:
+    image:
+      config_path: bagel_veomni/bagel_vision_decoder
+      model_path: bagel_veomni/bagel_vision_decoder
+
+data:
+  dataloader:
+    type: native
+  datasets_type: iterable
+  train_path: bagel_unified
+  data_type: conversation
+  chat_template: qwen2vl
+  max_seq_len: 8192
+
+train:
+  accelerator:
+    fsdp_config:
+      fsdp_mode: fsdp2
+  optimizer:
+    lr: 1.0e-5
+    lr_decay_style: cosine
+  num_train_epochs: 3
+  micro_batch_size: 2
+  global_batch_size: 64
+  freeze_decoder: true        # keep the frozen VAE frozen; train the flow projections
+  checkpoint:
+    output_dir: bagel_sft
+    manager: dcp

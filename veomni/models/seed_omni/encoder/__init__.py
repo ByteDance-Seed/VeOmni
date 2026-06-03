@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from . import (
+    bagel_vision_encoder,
     janus_siglip,
     qwen2_5_omni_audio_model,
     qwen2_5_omni_vision_model,
@@ -29,4 +30,5 @@ __all__ = [
     "qwen2_5_omni_audio_model",
     "qwen2_5_omni_vision_model",
     "BaseEncoderModelMixin",
+    "bagel_vision_encoder",
 ]

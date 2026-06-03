@@ -151,17 +151,45 @@ def main():
     chat_template = build_multimodal_chat_template(args.data.chat_template, processor.tokenizer)
     position_id_func = model.get_position_id_func()
     modality_info = model.get_modality()
-    transform = partial(
-        encode_multimodal_sample,
-        processor=processor,
-        chat_template=chat_template,
-        position_id_func=position_id_func,
-        modality_info=modality_info,
-        max_image_nums=args.data.max_image_nums,
-        max_pixel_size=args.data.max_pixel_size,
-        generation_ratio=args.data.generation_ratio,
-        scale_factor=args.data.scale_factor,
-    )
+
+    # Bagel uses a packed unified pipeline (text + ViT understanding + VAE generation) that
+    # is incompatible with the dense encode_multimodal_sample / MainCollator path, so swap in
+    # the bagel transform + collator. This branch is a no-op for all other foundations.
+    is_bagel = getattr(model.config.foundation_config, "model_type", "") == "bagel_foundation"
+    bagel_collate_fn = None
+    if is_bagel:
+        from veomni.data.multimodal.bagel_collator import BagelPackedCollator
+        from veomni.data.multimodal.bagel_transform import BagelSampleTransform, add_special_tokens
+
+        processor.tokenizer, new_token_ids, _ = add_special_tokens(processor.tokenizer)
+        image_decoder = getattr(model.decoder, "image_decoder", None)
+        image_encoder = getattr(model.encoder, "image_encoder", None)
+        transform = BagelSampleTransform(
+            tokenizer=processor.tokenizer,
+            new_token_ids=new_token_ids,
+            vit_patch_size=getattr(getattr(image_encoder, "config", None), "patch_size", 14),
+        )
+        bagel_collate_fn = BagelPackedCollator(
+            vit_patch_size=getattr(getattr(image_encoder, "config", None), "patch_size", 14),
+            vit_max_num_patch_per_side=getattr(
+                getattr(image_encoder, "config", None), "vit_max_num_patch_per_side", 70
+            ),
+            latent_patch_size=getattr(getattr(image_decoder, "config", None), "latent_patch_size", 2),
+            latent_downsample=getattr(image_decoder, "latent_downsample", 16),
+            max_latent_size=getattr(getattr(image_decoder, "config", None), "max_latent_size", 32),
+        )
+    else:
+        transform = partial(
+            encode_multimodal_sample,
+            processor=processor,
+            chat_template=chat_template,
+            position_id_func=position_id_func,
+            modality_info=modality_info,
+            max_image_nums=args.data.max_image_nums,
+            max_pixel_size=args.data.max_pixel_size,
+            generation_ratio=args.data.generation_ratio,
+            scale_factor=args.data.scale_factor,
+        )
 
     train_dataset = build_dataset(
         dataset_name=args.data.dataset_name,
@@ -215,6 +243,7 @@ def main():
         pin_memory=args.data.dataloader.pin_memory,
         prefetch_factor=args.data.dataloader.prefetch_factor,
         seed=args.train.seed,
+        collate_fn=bagel_collate_fn,
         collate_fn_kwargs=collate_fn_kwargs,
     )
 

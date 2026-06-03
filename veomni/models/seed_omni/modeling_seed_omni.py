@@ -55,6 +55,7 @@ def extract_model_inputs(prefix: str, kwargs: Dict[str, "torch.Tensor"]):
 
 @dataclass
 class SeedOmniOutput(ModelOutput):
+    loss: Optional[torch.FloatTensor] = None
     logits: Optional[torch.FloatTensor] = None
     hidden_states: Optional[torch.FloatTensor] = None
     losses: Optional[Dict[str, torch.FloatTensor]] = None
@@ -478,6 +479,9 @@ class SeedOmniModel(SeedOmniPreTrainedModel, GenerationMixin):
         return self.foundation.position_id_func
 
     def forward(self, **inputs: torch.Tensor):
+        if getattr(self.config.foundation_config, "model_type", "") == "bagel_foundation":
+            return self._bagel_forward(**inputs)
+
         decoder_inputs = {}
 
         if "inputs_embeds" not in inputs:
@@ -503,11 +507,143 @@ class SeedOmniModel(SeedOmniPreTrainedModel, GenerationMixin):
                 losses[key] = v
 
             return SeedOmniOutput(
+                loss=sum(losses.values()),
                 losses=losses,
                 logits=outputs.logits,
                 hidden_states=outputs.hidden_states,
             )
         return outputs
+
+    def _bagel_forward(
+        self,
+        sequence_length: int,
+        packed_text_ids: torch.LongTensor,
+        packed_text_indexes: torch.LongTensor,
+        sample_lens: List[int],
+        packed_position_ids: torch.LongTensor,
+        nested_attention_masks: Optional[List[torch.Tensor]] = None,
+        split_lens: Optional[List[int]] = None,
+        attn_modes: Optional[List[str]] = None,
+        # visual understanding (ViT)
+        ce_loss_indexes: Optional[torch.BoolTensor] = None,
+        packed_label_ids: Optional[torch.LongTensor] = None,
+        packed_vit_tokens: Optional[torch.Tensor] = None,
+        packed_vit_token_indexes: Optional[torch.LongTensor] = None,
+        packed_vit_position_ids: Optional[torch.LongTensor] = None,
+        vit_token_seqlens: Optional[torch.IntTensor] = None,
+        # visual generation (VAE latent + rectified flow)
+        padded_latent: Optional[torch.Tensor] = None,
+        vae_pixel_values: Optional[torch.Tensor] = None,
+        patchified_vae_latent_shapes: Optional[List] = None,
+        packed_latent_position_ids: Optional[torch.LongTensor] = None,
+        packed_vae_token_indexes: Optional[torch.LongTensor] = None,
+        packed_timesteps: Optional[torch.Tensor] = None,
+        mse_loss_indexes: Optional[torch.BoolTensor] = None,
+        **kwargs,
+    ) -> SeedOmniOutput:
+        """Packed unified forward for the Bagel composition.
+
+        Reproduces the upstream ``Bagel.forward``: it assembles a single packed sequence
+        from text / ViT-understanding / VAE-generation tokens, runs the MoT language model,
+        and returns the cross-entropy (understanding) and rectified-flow MSE (generation)
+        losses. The packed fields are produced by the bagel data collator.
+        """
+        foundation = self.foundation
+        hidden_size = foundation.config.hidden_size
+        use_moe = foundation.model.use_moe
+        image_encoder = getattr(self.encoder, "image_encoder", None)
+        image_decoder = getattr(self.decoder, "image_decoder", None)
+
+        packed_text_embedding = foundation.model.embed_tokens(packed_text_ids)
+        packed_sequence = packed_text_embedding.new_zeros((sequence_length, hidden_size))
+        packed_sequence[packed_text_indexes] = packed_text_embedding
+
+        # Visual understanding: scatter ViT token embeddings.
+        if packed_vit_tokens is not None and image_encoder is not None:
+            cu_seqlens = F.pad(torch.cumsum(vit_token_seqlens, dim=0), (1, 0)).to(torch.int32)
+            max_seqlen = torch.max(vit_token_seqlens).item()
+            packed_vit_token_embed = image_encoder(
+                packed_pixel_values=packed_vit_tokens,
+                packed_flattened_position_ids=packed_vit_position_ids,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
+            )
+            packed_sequence[packed_vit_token_indexes] = packed_vit_token_embed.to(packed_sequence.dtype)
+
+        # Visual generation: VAE-encode (frozen), patchify, noise along the flow, scatter.
+        noise = packed_latent_clean = shifted_timesteps = None
+        if packed_vae_token_indexes is not None and image_decoder is not None:
+            if padded_latent is None:
+                padded_latent = image_decoder.vae_encode(vae_pixel_values)
+            packed_latent_list = [
+                image_decoder.patchify_latent(latent, h, w)
+                for latent, (h, w) in zip(padded_latent, patchified_vae_latent_shapes)
+            ]
+            packed_latent_clean = torch.cat(packed_latent_list, dim=0).to(packed_sequence.dtype)
+            packed_latent_embed, noise, shifted_timesteps = image_decoder.prepare_gen_embeds(
+                packed_latent_clean, packed_timesteps, packed_latent_position_ids
+            )
+            packed_sequence[packed_vae_token_indexes] = packed_latent_embed.to(packed_sequence.dtype)
+
+        # Attention mask: prefer dense per-sample masks (SDPA path); otherwise build a
+        # flex-attention block mask from the split lengths / attention modes.
+        if nested_attention_masks is not None:
+            # The dataloader only moves tensors (not lists) to the device, so move the
+            # per-sample masks here. This keeps the robust per-sample SDPA attention path.
+            attention_mask = [m.to(packed_sequence.device) for m in nested_attention_masks]
+        else:
+            from torch.nn.attention.flex_attention import create_block_mask
+
+            from .foundation.bagel_foundation.packing_utils import create_sparse_mask
+
+            sparse_mask = create_sparse_mask(sample_lens, split_lens, attn_modes, packed_sequence.device)
+            seqlen = sum(sample_lens)
+            attention_mask = create_block_mask(
+                sparse_mask,
+                B=1,
+                H=foundation.config.num_attention_heads,
+                Q_LEN=seqlen,
+                KV_LEN=seqlen,
+                device=packed_sequence.device,
+                BLOCK_SIZE=128,
+                _compile=True,
+            )
+
+        extra_inputs = {}
+        if use_moe:
+            packed_und_token_indexes = packed_text_indexes
+            if packed_vit_token_indexes is not None:
+                packed_und_token_indexes = torch.cat([packed_text_indexes, packed_vit_token_indexes], dim=0)
+            gen_indexes = (
+                packed_vae_token_indexes
+                if packed_vae_token_indexes is not None
+                else packed_text_indexes.new_zeros((0,))
+            )
+            extra_inputs.update(
+                packed_und_token_indexes=packed_und_token_indexes,
+                packed_gen_token_indexes=gen_indexes,
+            )
+
+        last_hidden_state = foundation(
+            packed_sequence=packed_sequence,
+            sample_lens=sample_lens,
+            attention_mask=attention_mask,
+            packed_position_ids=packed_position_ids,
+            **extra_inputs,
+        )
+
+        losses = {}
+        if mse_loss_indexes is not None and image_decoder is not None and noise is not None:
+            mse = image_decoder.flow_loss(
+                last_hidden_state[mse_loss_indexes], noise, packed_latent_clean, shifted_timesteps
+            )
+            losses["image_decoder_mse_loss"] = mse.mean()
+        if ce_loss_indexes is not None and packed_label_ids is not None:
+            packed_ce_preds = foundation.lm_head(last_hidden_state[ce_loss_indexes])
+            losses["foundation_ce_loss"] = F.cross_entropy(packed_ce_preds, packed_label_ids)
+
+        total_loss = sum(losses.values()) if losses else None
+        return SeedOmniOutput(loss=total_loss, losses=losses, logits=None, hidden_states=last_hidden_state)
 
     def _prepare_image_generation_config(
         self,
