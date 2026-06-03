@@ -587,6 +587,12 @@ class VeomniFlopsCounter:
                     "`layer_types` (transformers v5) nor `full_attention_interval` (legacy). "
                     "Verify this is a hybrid-attention (Qwen3.5-style) config."
                 )
+            # A non-positive interval would divide-by-zero or yield negative counts that the
+            # sum check below cannot catch (the legacy branch derives linear = total - full).
+            if full_attention_interval <= 0:
+                raise ValueError(
+                    f"Invalid `full_attention_interval`: {full_attention_interval}. It must be a positive integer."
+                )
             num_full_attn_layers = num_hidden_layers // full_attention_interval
             num_linear_attn_layers = num_hidden_layers - num_full_attn_layers
 
