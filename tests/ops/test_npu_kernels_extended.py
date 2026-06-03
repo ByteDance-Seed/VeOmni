@@ -315,8 +315,9 @@ class TestNPURmsNormGatedExtended:
 
     def test_gating_module_is_nn_module(self):
         """NPUFusedRMSNormGated must behave like a regular nn.Module."""
-        from veomni.ops.kernels.gated_delta_rule.npu_rms_norm_gated import NPUFusedRMSNormGated
         import torch.nn as nn
+
+        from veomni.ops.kernels.gated_delta_rule.npu_rms_norm_gated import NPUFusedRMSNormGated
 
         m = NPUFusedRMSNormGated(hidden_size=16, eps=1e-6)
         assert isinstance(m, nn.Module)

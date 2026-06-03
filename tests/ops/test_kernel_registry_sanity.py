@@ -35,7 +35,7 @@ import torch
 
 import veomni.ops  # noqa: F401 -- trigger KERNEL_REGISTRY registrations
 from veomni.ops.dispatch import OpSlot
-from veomni.ops.kernel_registry import KERNEL_REGISTRY, HardwareRequirement, KernelSpec
+from veomni.ops.kernel_registry import KERNEL_REGISTRY, HardwareRequirement
 
 
 # ---------------------------------------------------------------------------
@@ -217,7 +217,7 @@ class TestKernelSpecValidation:
     def test_kernelspec_is_frozen(self):
         """KernelSpec is a frozen dataclass; mutation should raise."""
         spec = KERNEL_REGISTRY._specs[("rms_norm", "standard")]["npu"]
-        with pytest.raises(Exception):  # FrozenInstanceError or AttributeError
+        with pytest.raises(AttributeError):  # FrozenInstanceError is a subclass of AttributeError
             spec.op_name = "mutated"  # type: ignore[misc]
 
     def test_all_registered_specs_have_factory(self):
@@ -230,9 +230,7 @@ class TestKernelSpecValidation:
         """
         for (op_name, variant), bucket in KERNEL_REGISTRY._specs.items():
             for impl_name, spec in bucket.items():
-                assert callable(spec.factory), (
-                    f"Spec for ({op_name}, {variant}, {impl_name}) has non-callable factory"
-                )
+                assert callable(spec.factory), f"Spec for ({op_name}, {variant}, {impl_name}) has non-callable factory"
 
     def test_all_registered_specs_have_hardware_requirement(self):
         """Every registered spec must have a non-None hardware requirement."""

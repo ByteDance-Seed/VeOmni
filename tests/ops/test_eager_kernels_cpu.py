@@ -32,12 +32,11 @@ assigned to e.  With uniform probs (1/E), f_e = top_k / E, P_e = 1/E,
 so loss = E * E * (top_k/E) * (1/E) = top_k.
 """
 
-import pytest
 import torch
 
 import veomni.ops  # noqa: F401 -- trigger KERNEL_REGISTRY registrations
-from veomni.ops.kernels.load_balancing_loss.eager import load_balancing_loss_pytorch
 from veomni.ops.dispatch import OpSlot
+from veomni.ops.kernels.load_balancing_loss.eager import load_balancing_loss_pytorch
 
 
 # ---------------------------------------------------------------------------
@@ -56,9 +55,7 @@ class TestLoadBalancingLossEager:
         """With uniform random gate logits, the loss is in (0, top_k + 1)."""
         num_experts, top_k, num_layers, N = 8, 2, 3, 1024
         torch.manual_seed(0)
-        gate_logits = tuple(
-            torch.randn(N, num_experts, dtype=torch.float32) for _ in range(num_layers)
-        )
+        gate_logits = tuple(torch.randn(N, num_experts, dtype=torch.float32) for _ in range(num_layers))
         loss = load_balancing_loss_pytorch(gate_logits, num_experts, top_k, None)
         assert loss.item() > 0
         assert loss.item() < 5.0
