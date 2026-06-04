@@ -175,19 +175,47 @@ patchify happen inside each SeedOmni module at forward time (see `design.md`
 
 ```bash
 python scripts/multimodal/convert_data/make_janus_omni_demo.py \
+    --dataset_mode understanding \
     --gen_image janus_out/infer_gen/generated_image_0.png \
     --und_reply janus_out/infer_und/reply.txt \
     --gen_prompt "A close-up high-contrast photo of Sydney Opera House at night." \
     --out_dir outputs/janus_demo/data \
-    --include_interleave
+    --num_repeat 32
 ```
 
-Flags:
+Dataset modes (`--dataset_mode`):
+
+| Mode | Rows emitted | Typical loss routing |
+|------|----------------|----------------------|
+| `understanding` | I2T only | `tok_decode` > 0, `vae_decode` == 0 (dummy) |
+| `t2i` | T2I only | `vae_decode` > 0 |
+| `mixed` | interleave UG | both heads > 0 |
+| `all` | all three kinds | both heads > 0 on mixed rows |
+
+Output file: ``<out_dir>/janus_omni_demo_<mode>.parquet``.
+
+Verify loss routing (5-step overfit + checker):
+
+```bash
+bash scripts/seed_omni/verify_janus_demo_loss.sh understanding
+bash scripts/seed_omni/verify_janus_demo_loss.sh t2i
+bash scripts/seed_omni/verify_janus_demo_loss.sh mixed
+```
+
+Debug with ipdb (pick dataset as first arg or ``DATASET_MODE=`` env):
+
+```bash
+bash scripts/seed_omni/debug_conversation_ipdb.sh understanding
+bash scripts/seed_omni/debug_conversation_ipdb.sh t2i
+DATASET_MODE=mixed bash scripts/seed_omni/debug_conversation_ipdb.sh
+```
+
+Legacy flags:
 
 | Flag | Effect |
 |------|--------|
-| `--include_interleave` | Add one interleave (UG) row alongside I2T and T2I |
-| `--only_interleave` | Emit only interleave rows (handy for encoder routing debug) |
+| `--include_interleave` | Alias for `--dataset_mode all` |
+| `--only_interleave` | Alias for `--dataset_mode mixed` |
 | `--num_repeat N` | Repeat each base row `N` times |
 
 Point training at the output:
@@ -195,12 +223,7 @@ Point training at the output:
 ```yaml
 data:
   data_type: seedomni
-  train_path: outputs/janus_demo/data/janus_omni_demo.parquet
-  datasets:
-    - name: janus_demo
-      source_name: veomni_omni_demo
-      data_path: outputs/janus_demo/data/janus_omni_demo.parquet
-      weight: 1.0
+  train_path: outputs/janus_demo/data/janus_omni_demo_understanding.parquet
 ```
 
 ## Custom datasets

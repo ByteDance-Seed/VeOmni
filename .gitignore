@@ -146,6 +146,7 @@ preprocessor_config.json
 special_tokens_map.json
 vocab.json
 processor_config.json
+chat_template.jinja
 
 # trace file
 *.pt.trace.json

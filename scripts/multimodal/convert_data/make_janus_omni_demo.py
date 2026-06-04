@@ -5,16 +5,13 @@ into self-consistent (input → model-own-output) conversations so that
 training on them drives the loss low — a clean correctness check for the
 OmniTrainer build/forward/backward path.
 
-Three base conversations, all in the unified ``veomni_omni_demo`` schema
-(see ``docs/usage/seedomni_data_format.md``):
+Four dataset modes (``--dataset_mode``):
 
-* **Understanding (I2T)** — user sends the image + "Describe this image in
-  detail."; assistant replies with text.
-* **Generation (T2I)** — user sends the prompt; assistant replies with
-  ``type="image"`` (generation target).
-* **Interleave (UG)** — two messages only (like a flat chat JSON): user
-  ``text + image + text``, assistant ``image + text``; ``images[0]`` pairs
-  the user image, ``images[1]`` pairs the assistant image.
+* **understanding** — pure I2T: user image + question → assistant text.
+* **t2i** — pure text-to-image: user prompt → assistant image target.
+* **mixed** — one interleave (UG) row: user ``text+image+text``, assistant
+  ``image+text`` (understanding + generation in one sample).
+* **all** — all three base row kinds (default for broad smoke tests).
 
 Rows are stored with ``conversations`` as JSON-encoded bytes and ``images``
 as a list of PNG bytes, so the parquet is fully self-contained (no external
@@ -22,12 +19,19 @@ file path dependencies at train time).
 
 Usage::
 
-    python scripts/multimodal/convert_data/make_janus_omni_demo.py \
-        --gen_image janus_out/infer_gen/generated_image_0.png \
-        --und_reply janus_out/infer_und/reply.txt \
-        --gen_prompt "A close-up high-contrast photo of Sydney Opera House at night." \
-        --out_dir outputs/janus_conversation_ipdb_debug/data \
-        --only_interleave --num_repeat 4
+    python scripts/multimodal/convert_data/make_janus_omni_demo.py \\
+        --dataset_mode understanding \\
+        --out_dir outputs/janus_demo/data \\
+        --num_repeat 32
+
+    python scripts/multimodal/convert_data/make_janus_omni_demo.py \\
+        --dataset_mode t2i --out_dir outputs/janus_demo/data
+
+    python scripts/multimodal/convert_data/make_janus_omni_demo.py \\
+        --dataset_mode mixed --out_dir outputs/janus_demo/data
+
+Legacy flags ``--only_interleave`` / ``--include_interleave`` remain as
+aliases for ``--dataset_mode mixed`` / ``--dataset_mode all``.
 """
 
 from __future__ import annotations
@@ -36,10 +40,14 @@ import argparse
 import json
 import os
 from io import BytesIO
+from typing import Literal
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 from PIL import Image
+
+
+DatasetMode = Literal["understanding", "t2i", "mixed", "all"]
 
 
 _UND_PROMPT = "Describe this image in detail."
@@ -134,21 +142,38 @@ def _build_interleave_row(
     }
 
 
-def _build_rows(
+def _base_rows_for_mode(
+    mode: DatasetMode,
     user_image_bytes: bytes,
     gen_image_bytes: bytes,
     und_reply: str,
     gen_prompt: str,
-    *,
-    include_interleave: bool,
 ) -> list[dict]:
-    rows = [
+    if mode == "understanding":
+        return [_build_understanding_row(user_image_bytes, und_reply)]
+    if mode == "t2i":
+        return [_build_generation_row(gen_image_bytes, gen_prompt)]
+    if mode == "mixed":
+        return [_build_interleave_row(user_image_bytes, gen_image_bytes, und_reply, gen_prompt)]
+    return [
         _build_understanding_row(user_image_bytes, und_reply),
         _build_generation_row(gen_image_bytes, gen_prompt),
+        _build_interleave_row(user_image_bytes, gen_image_bytes, und_reply, gen_prompt),
     ]
-    if include_interleave:
-        rows.append(_build_interleave_row(user_image_bytes, gen_image_bytes, und_reply, gen_prompt))
-    return rows
+
+
+def _resolve_dataset_mode(args: argparse.Namespace) -> DatasetMode:
+    if args.only_interleave:
+        return "mixed"
+    if args.dataset_mode is not None:
+        return args.dataset_mode
+    if args.include_interleave:
+        return "all"
+    return "all"
+
+
+def _parquet_name(mode: DatasetMode) -> str:
+    return f"janus_omni_demo_{mode}.parquet"
 
 
 def main() -> None:
@@ -159,6 +184,12 @@ def main() -> None:
     parser.add_argument("--gen_prompt", default=_DEFAULT_GEN_PROMPT)
     parser.add_argument("--out_dir", default="/mnt/hdfs/user_dir/veomni_omni/data")
     parser.add_argument(
+        "--dataset_mode",
+        choices=("understanding", "t2i", "mixed", "all"),
+        default=None,
+        help="Which demo rows to emit (writes janus_omni_demo_<mode>.parquet).",
+    )
+    parser.add_argument(
         "--num_repeat",
         type=int,
         default=64,
@@ -167,12 +198,12 @@ def main() -> None:
     parser.add_argument(
         "--include_interleave",
         action="store_true",
-        help="Add the mixed user-image + assistant-image row to the dataset.",
+        help="Deprecated alias for --dataset_mode all.",
     )
     parser.add_argument(
         "--only_interleave",
         action="store_true",
-        help="Emit only the interleave row (handy for ipdb / encoder routing debug).",
+        help="Deprecated alias for --dataset_mode mixed.",
     )
     args = parser.parse_args()
 
@@ -180,18 +211,9 @@ def main() -> None:
     user_image_bytes = _load_image_bytes(und_image_path)
     gen_image_bytes = _load_image_bytes(args.gen_image)
     und_reply = _load_und_reply(args.und_reply)
+    mode = _resolve_dataset_mode(args)
 
-    if args.only_interleave:
-        base_rows = [_build_interleave_row(user_image_bytes, gen_image_bytes, und_reply, args.gen_prompt)]
-    else:
-        base_rows = _build_rows(
-            user_image_bytes,
-            gen_image_bytes,
-            und_reply,
-            args.gen_prompt,
-            include_interleave=args.include_interleave,
-        )
-
+    base_rows = _base_rows_for_mode(mode, user_image_bytes, gen_image_bytes, und_reply, args.gen_prompt)
     rows = [base_rows[i % len(base_rows)] for i in range(len(base_rows) * args.num_repeat)]
 
     table = pa.Table.from_pydict(
@@ -203,8 +225,9 @@ def main() -> None:
     )
 
     os.makedirs(args.out_dir, exist_ok=True)
-    out_path = os.path.join(args.out_dir, "janus_omni_demo.parquet")
+    out_path = os.path.join(args.out_dir, _parquet_name(mode))
     pq.write_table(table, out_path)
+    print(f"[make_janus_omni_demo] dataset_mode={mode}")
     print(f"[make_janus_omni_demo] wrote {table.num_rows} rows → {out_path}")
     print(f"[make_janus_omni_demo]   base row kinds: {len(base_rows)}")
     print(f"[make_janus_omni_demo]   understanding reply chars: {len(und_reply)}")

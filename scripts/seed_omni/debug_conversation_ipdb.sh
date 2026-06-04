@@ -7,13 +7,15 @@
 # VEOMNI_DEBUG_CONV_IPDB=1.
 #
 # Usage:
-#   bash scripts/seed_omni/debug_conversation_ipdb.sh
+#   bash scripts/seed_omni/debug_conversation_ipdb.sh [understanding|t2i|mixed|all]
 #
-# Dataset: builds a tiny parquet with one **interleave** sample per row —
-# two messages total (flat chat JSON):
-#   user:      text + image + text
-#   assistant: image + text
-# images: [user_png, assistant_png] in conversation order.
+# Dataset modes (see make_janus_omni_demo.py --dataset_mode):
+#   understanding — pure I2T (user image + question → assistant text)
+#   t2i           — pure T2I (user prompt → assistant image)
+#   mixed         — interleave UG (user text+image+text, assistant image+text)
+#   all           — all three row kinds (default: mixed for compact ipdb)
+#
+# Override with env: DATASET_MODE=t2i bash scripts/seed_omni/debug_conversation_ipdb.sh
 #
 # ipdb cheatsheet (rank 0 terminal):
 #   conversation_list          # raw batch carrier
@@ -41,6 +43,13 @@
 #   janus_vqvae.pre_forward (decode) → janus_vqvae.decode
 
 set -o pipefail
+
+DATASET_MODE="${DATASET_MODE:-}"
+if [[ $# -gt 0 && "$1" =~ ^(understanding|t2i|mixed|all)$ ]]; then
+  DATASET_MODE="$1"
+  shift
+fi
+DATASET_MODE="${DATASET_MODE:-mixed}"
 
 cd "$(dirname "$0")/../.." || exit 1
 REPO_ROOT="$(pwd)"
@@ -95,15 +104,15 @@ export VEOMNI_DEBUG_CONV_IPDB=1
 DEBUG_DATA="${REPO_ROOT}/outputs/janus_conversation_ipdb_debug/data"
 mkdir -p "${DEBUG_DATA}"
 
-echo "[debug_conversation_ipdb] building interleave demo parquet (user+assistant image) ..."
+echo "[debug_conversation_ipdb] building demo parquet (dataset_mode=${DATASET_MODE}) ..."
 python "${REPO_ROOT}/scripts/multimodal/convert_data/make_janus_omni_demo.py" \
+  --dataset_mode "${DATASET_MODE}" \
   --out_dir "${DEBUG_DATA}" \
-  --only_interleave \
   --num_repeat 4 \
   --und_reply "${REPO_ROOT}/janus_out/infer_und/reply.txt" \
   --gen_image "${REPO_ROOT}/janus_out/infer_gen/generated_image_0.png"
 
-PARQUET="${DEBUG_DATA}/janus_omni_demo.parquet"
+PARQUET="${DEBUG_DATA}/janus_omni_demo_${DATASET_MODE}.parquet"
 if [[ ! -f "${PARQUET}" ]]; then
   echo "[debug_conversation_ipdb] ERROR: parquet not found at ${PARQUET}" >&2
   exit 1
@@ -124,7 +133,7 @@ torchrun \
   --train.checkpoint.save_epochs 0 \
   --train.checkpoint.hf_save_steps 100000000 \
   --train.checkpoint.save_hf_weights false \
-  --train.checkpoint.output_dir outputs/janus_conversation_ipdb_debug \
+  --train.checkpoint.output_dir "outputs/janus_conversation_ipdb_debug/${DATASET_MODE}" \
   --data.train_path "${PARQUET}" \
   --data.dataloader.num_workers 0 \
   "$@"
