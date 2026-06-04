@@ -219,7 +219,6 @@ class JanusVqvae(OmniModule, PreTrainedModel):
         hidden_chunks: list[torch.Tensor] = []
         label_chunks: list[torch.Tensor] = []
         dummy_data: bool = False
-
         for sample in conversation_list:
             prev_hidden: torch.Tensor | None = None
             for part in sample:

@@ -58,10 +58,9 @@ def apply_janus_chat_template(
 ) -> list[ConversationItem]:
     """Apply Janus chat template to a raw conversation (text + image parts)."""
     out: list[ConversationItem] = []
-
+    dummy_parts: list[ConversationItem] = []  # dummy from other modules
     out.append(_template_item("text", markers.bos_token, "system"))
     out.append(_template_item("text", markers.system_prompt, "system"))
-
     prev_role: str | None = None
     for item in sample:
         role = item.role
@@ -74,14 +73,17 @@ def apply_janus_chat_template(
 
         if item.type == "text":
             out.append(_template_item("text", item.value, role))
-        elif item.type == "image":
+        elif item.type == "image" and role != "dummy":
             out.append(_template_item("text", markers.boi_token, role))
             out.append(_template_item("image", item.value, role, meta=dict(item.meta)))
             out.append(_template_item("text", markers.eoi_token, role))
+        elif role == "dummy":
+            dummy_parts.append(item)
         else:
             out.append(_template_item(item.type, item.value, role, meta=dict(item.meta)))
 
     out.append(_template_item("text", markers.eos_token, "assistant"))
+    out.extend(dummy_parts)
     return out
 
 
