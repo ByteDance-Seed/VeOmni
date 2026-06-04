@@ -32,6 +32,7 @@ dependencies = [
   "psutil",
   "timm",
   "wandb",
+  "tensorboard",
   "setuptools",
   "einops>=0.8.1",
   # matplotlib is used by veomni.utils.moe_monitor to render the per-step

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 import time
 from typing import TYPE_CHECKING, Any, Dict, List
 
@@ -156,6 +157,58 @@ class WandbTraceCallback(Callback):
             import wandb
 
             wandb.log(self.trainer.step_env_metrics, step=state.global_step)
+
+
+class TensorBoardTraceCallback(Callback):
+    """Writes scalar training metrics to TensorBoard event files.
+
+    Runs on global rank 0 only. Enabled independently from wandb via
+    ``train.tensorboard.enable``.
+    """
+
+    def __init__(self, trainer: "BaseTrainer") -> None:
+        super().__init__(trainer)
+        self.writer = None
+
+    def on_train_begin(self, state: TrainerState, **kwargs) -> None:
+        args: "VeOmniArguments" = self.trainer.args
+        if not (args.train.global_rank == 0 and args.train.tensorboard.enable):
+            return
+
+        try:
+            from torch.utils.tensorboard import SummaryWriter
+        except ImportError:
+            logger.warning_rank0(
+                "TensorBoard logging is enabled but the 'tensorboard' package is not installed. "
+                "Install it with: pip install tensorboard. Skipping TensorBoard logging."
+            )
+            return
+
+        save_dir = args.train.tensorboard.save_dir or os.path.join(args.train.checkpoint.output_dir, "tensorboard")
+        os.makedirs(save_dir, exist_ok=True)
+
+        self.writer = SummaryWriter(log_dir=save_dir)
+        logger.info_rank0(f"TensorBoard logging enabled. Event files: {save_dir}")
+
+    def on_step_end(self, state: TrainerState, **kwargs) -> None:
+        if self.writer is None:
+            return
+
+        metrics = getattr(self.trainer, "step_env_metrics", None)
+        if not metrics:
+            return
+
+        for tag, value in metrics.items():
+            if isinstance(value, (int, float)):
+                self.writer.add_scalar(tag, value, global_step=state.global_step)
+            elif hasattr(value, "item"):
+                self.writer.add_scalar(tag, value.item(), global_step=state.global_step)
+
+    def on_train_end(self, state: TrainerState, **kwargs) -> None:
+        if self.writer is not None:
+            self.writer.flush()
+            self.writer.close()
+            self.writer = None
 
 
 class ProfileTraceCallback(Callback):

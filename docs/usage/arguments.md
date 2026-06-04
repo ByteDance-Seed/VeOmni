@@ -63,6 +63,7 @@ Training loop, optimizer, parallelism, checkpointing, profiling, and logging.
 * `TrainingArguments` — `train.*`
     * `OptimizerConfig` — `train.optimizer.*`
     * `WandbConfig` — `train.wandb.*`
+    * `TensorBoardConfig` — `train.tensorboard.*`
     * `ProfileConfig` — `train.profile.*`
     * `GradientCheckpointingConfig` — `train.gradient_checkpointing.*`
     * `AcceleratorConfig` — `train.accelerator.*`
@@ -229,6 +230,7 @@ NPU validation runs at two times:
 | max_steps | `Optional[int]` | `None` | Max training steps per epoch (debug only). |
 | optimizer | `OptimizerConfig` | — | Optimizer and learning-rate schedule. |
 | wandb | `WandbConfig` | — | Weights & Biases logging. |
+| tensorboard | `TensorBoardConfig` | — | TensorBoard logging. |
 | profile | `ProfileConfig` | — | Torch profiler settings. |
 | gradient_checkpointing | `GradientCheckpointingConfig` | — | Gradient checkpointing settings. |
 | accelerator | `AcceleratorConfig` | — | Parallelism and distributed-training topology. |
@@ -262,6 +264,15 @@ NPU validation runs at two times:
 | project | `str` | `"VeOmni"` | W&B project name. |
 | name | `Optional[str]` | `None` | W&B experiment name. |
 | id | `Optional[str]` | `None` | W&B run ID for resuming a previous run. |
+
+### TensorBoardConfig
+
+`train.tensorboard.*` — TensorBoard logging via `torch.utils.tensorboard.SummaryWriter`. Independent from wandb; both can be enabled simultaneously. Scalar metrics are written on rank 0 only.
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| enable | `bool` | `False` | Enable TensorBoard logging. |
+| save_dir | `Optional[str]` | `None` | Event-file directory. Defaults to `<train.checkpoint.output_dir>/tensorboard`. |
 
 ### ProfileConfig
 

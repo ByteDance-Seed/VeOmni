@@ -25,6 +25,7 @@ from .trace_callback import (
     EnvironMeterCallback,
     MoERouterMonitorCallback,
     ProfileTraceCallback,
+    TensorBoardTraceCallback,
     TqdmCallback,
     WandbTraceCallback,
 )
@@ -38,6 +39,7 @@ __all__ = [
     "HFLoraCkptCallback",
     "EvaluateCallback",
     "WandbTraceCallback",
+    "TensorBoardTraceCallback",
     "ProfileTraceCallback",
     "EnvironMeterCallback",
     "MoERouterMonitorCallback",

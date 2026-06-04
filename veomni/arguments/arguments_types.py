@@ -32,6 +32,7 @@ logger = logging.get_logger(__name__)
 #   train.*
 #   ├── optimizer.*          → OptimizerConfig
 #   ├── wandb.*              → WandbConfig
+#   ├── tensorboard.*        → TensorBoardConfig
 #   ├── profile.*            → ProfileConfig
 #   ├── gradient_checkpointing.*  → GradientCheckpointingConfig
 #   ├── accelerator.*        → AcceleratorConfig
@@ -170,6 +171,27 @@ class WandbConfig:
     id: Optional[str] = field(
         default=None,
         metadata={"help": "Wandb run ID for resuming a previous run."},
+    )
+
+
+@dataclass
+class TensorBoardConfig:
+    """train.tensorboard.* — TensorBoard logging (torch.utils.tensorboard.SummaryWriter).
+
+    Independent from wandb; both can run simultaneously. Scalar metrics are
+    written on global rank 0 only.
+    """
+
+    enable: bool = field(
+        default=False,
+        metadata={"help": "Enable TensorBoard logging."},
+    )
+    save_dir: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "Directory to write TensorBoard event files. "
+            "Defaults to `<train.checkpoint.output_dir>/tensorboard` when None."
+        },
     )
 
 
@@ -531,6 +553,7 @@ class TrainingArguments:
     # sub-argument groups
     optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
     wandb: WandbConfig = field(default_factory=WandbConfig)
+    tensorboard: TensorBoardConfig = field(default_factory=TensorBoardConfig)
     profile: ProfileConfig = field(default_factory=ProfileConfig)
     gradient_checkpointing: GradientCheckpointingConfig = field(default_factory=GradientCheckpointingConfig)
     accelerator: AcceleratorConfig = field(default_factory=AcceleratorConfig)

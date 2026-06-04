@@ -77,6 +77,7 @@ from .callbacks import (
     HuggingfaceCkptCallback,
     MoERouterMonitorCallback,
     ProfileTraceCallback,
+    TensorBoardTraceCallback,
     TqdmCallback,
     TrainerState,
     WandbTraceCallback,
@@ -445,6 +446,7 @@ class BaseTrainer(Stateful, ABC):
         self.environ_meter_callback = EnvironMeterCallback(self)
         self.tqdm_callback = TqdmCallback(self)
         self.wandb_callback = WandbTraceCallback(self)
+        self.tensorboard_callback = TensorBoardTraceCallback(self)
         self.profile_callback = ProfileTraceCallback(self)
         self.checkpointer_callback = CheckpointerCallback(self)
         if self.args.model.lora_config:
@@ -459,6 +461,7 @@ class BaseTrainer(Stateful, ABC):
         self.environ_meter_callback.on_train_begin(self.state)
         self.tqdm_callback.on_train_begin(self.state)
         self.wandb_callback.on_train_begin(self.state)
+        self.tensorboard_callback.on_train_begin(self.state)
         self.profile_callback.on_train_begin(self.state)
         self.checkpointer_callback.on_train_begin(self.state)
         self.hf_ckpt_callback.on_train_begin(self.state)
@@ -469,6 +472,7 @@ class BaseTrainer(Stateful, ABC):
         self.environ_meter_callback.on_train_end(self.state)
         self.tqdm_callback.on_train_end(self.state)
         self.wandb_callback.on_train_end(self.state)
+        self.tensorboard_callback.on_train_end(self.state)
         self.profile_callback.on_train_end(self.state)
         self.checkpointer_callback.on_train_end(self.state)
         self.hf_ckpt_callback.on_train_end(self.state)
@@ -479,6 +483,7 @@ class BaseTrainer(Stateful, ABC):
         self.environ_meter_callback.on_epoch_begin(self.state)
         self.tqdm_callback.on_epoch_begin(self.state)
         self.wandb_callback.on_epoch_begin(self.state)
+        self.tensorboard_callback.on_epoch_begin(self.state)
         self.profile_callback.on_epoch_begin(self.state)
         self.checkpointer_callback.on_epoch_begin(self.state)
         self.hf_ckpt_callback.on_epoch_begin(self.state)
@@ -488,6 +493,7 @@ class BaseTrainer(Stateful, ABC):
         self.environ_meter_callback.on_epoch_end(self.state)
         self.tqdm_callback.on_epoch_end(self.state)
         self.wandb_callback.on_epoch_end(self.state)
+        self.tensorboard_callback.on_epoch_end(self.state)
         self.profile_callback.on_epoch_end(self.state)
         self.checkpointer_callback.on_epoch_end(self.state)
         self.hf_ckpt_callback.on_epoch_end(self.state)
@@ -497,6 +503,7 @@ class BaseTrainer(Stateful, ABC):
         self.environ_meter_callback.on_step_begin(self.state, micro_batches=micro_batches)
         self.tqdm_callback.on_step_begin(self.state, micro_batches=micro_batches)
         self.wandb_callback.on_step_begin(self.state, micro_batches=micro_batches)
+        self.tensorboard_callback.on_step_begin(self.state, micro_batches=micro_batches)
         self.profile_callback.on_step_begin(self.state, micro_batches=micro_batches)
         self.checkpointer_callback.on_step_begin(self.state, micro_batches=micro_batches)
         self.hf_ckpt_callback.on_step_begin(self.state, micro_batches=micro_batches)
@@ -506,6 +513,7 @@ class BaseTrainer(Stateful, ABC):
         self.environ_meter_callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
         self.tqdm_callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
         self.wandb_callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
+        self.tensorboard_callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
         self.profile_callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
         self.checkpointer_callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
         self.hf_ckpt_callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
