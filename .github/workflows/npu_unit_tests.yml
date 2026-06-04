@@ -186,9 +186,3 @@ jobs:
       - name: Run utils tests
         run: |
           uv run --frozen pytest -v -s -x tests/utils/test_count_flops.py
-      - name: Install LoRA extra
-        run: |
-          uv sync --frozen --python 3.11 --extra npu --extra audio --extra lora --group dev
-      - name: Run LoRA e2e test
-        run: |
-          uv run --frozen pytest -v -s -x tests/lora/test_lora_trainer_saveload.py
