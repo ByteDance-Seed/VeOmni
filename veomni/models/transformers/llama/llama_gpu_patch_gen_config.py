@@ -22,6 +22,8 @@ Patches:
   causal) cross-entropy loss. Each guard falls through to the original HF eager
   code when no fused kernel is bound, so the generated file is safe to import
   even when ``_bind_veomni_ops()`` does not run (e.g. seed_omni wrappers).
+- ``LlamaModel.forward`` drops the deprecated ``cache_position`` argument to
+  ``create_causal_mask`` (transformers >= 5.9).
 - ``LlamaForCausalLM.forward`` returns the unified
   ``CausalLMOutputWithLogProbs`` dataclass so callers can surface per-token
   log-probs / entropy alongside the loss.
@@ -32,8 +34,10 @@ the runnable explicitly-patched modeling file
 """
 
 import torch
-from transformers.cache_utils import Cache
+from transformers.cache_utils import Cache, DynamicCache
+from transformers.masking_utils import create_causal_mask
 from transformers.modeling_outputs import (
+    BaseModelOutputWithPast,
     CausalLMOutputWithPast,
     SequenceClassifierOutputWithPast,
 )
@@ -132,6 +136,66 @@ def apply_rotary_pos_emb_patched(
 rotate_half = None  # noqa: E305
 
 
+# ── LlamaModel.forward (transformers >= 5.9 create_causal_mask API) ──────────
+
+
+@config.override_method(
+    "LlamaModel.forward",
+    description="Drop deprecated cache_position kwarg from create_causal_mask (transformers >= 5.9)",
+)
+def llama_model_forward_patched(
+    self,
+    input_ids: torch.LongTensor | None = None,
+    attention_mask: torch.Tensor | None = None,
+    position_ids: torch.LongTensor | None = None,
+    past_key_values: Cache | None = None,
+    inputs_embeds: torch.FloatTensor | None = None,
+    use_cache: bool | None = None,
+    **kwargs: Unpack[TransformersKwargs],
+) -> BaseModelOutputWithPast:
+    if (input_ids is None) ^ (inputs_embeds is not None):
+        raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
+
+    if inputs_embeds is None:
+        inputs_embeds = self.embed_tokens(input_ids)
+
+    if use_cache and past_key_values is None:
+        past_key_values = DynamicCache(config=self.config)
+
+    if position_ids is None:
+        past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
+        position_ids = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device) + past_seen_tokens
+        position_ids = position_ids.unsqueeze(0)
+
+    causal_mask = create_causal_mask(
+        config=self.config,
+        inputs_embeds=inputs_embeds,
+        attention_mask=attention_mask,
+        past_key_values=past_key_values,
+        position_ids=position_ids,
+    )
+
+    hidden_states = inputs_embeds
+    position_embeddings = self.rotary_emb(hidden_states, position_ids=position_ids)
+
+    for decoder_layer in self.layers[: self.config.num_hidden_layers]:
+        hidden_states = decoder_layer(
+            hidden_states,
+            attention_mask=causal_mask,
+            position_embeddings=position_embeddings,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+            **kwargs,
+        )
+
+    hidden_states = self.norm(hidden_states)
+    return BaseModelOutputWithPast(
+        last_hidden_state=hidden_states,
+        past_key_values=past_key_values,
+    )
+
+
 # ── LlamaForCausalLM.forward (fused cross-entropy via OpSlot) ────────────────
 
 
@@ -148,7 +212,6 @@ def llama_forcausallm_forward_patched(
     inputs_embeds: torch.FloatTensor | None = None,
     labels: torch.LongTensor | None = None,
     use_cache: bool | None = None,
-    cache_position: torch.LongTensor | None = None,
     logits_to_keep: int | torch.Tensor = 0,
     **kwargs: Unpack[TransformersKwargs],
 ) -> CausalLMOutputWithPast:
@@ -159,7 +222,6 @@ def llama_forcausallm_forward_patched(
         past_key_values=past_key_values,
         inputs_embeds=inputs_embeds,
         use_cache=use_cache,
-        cache_position=cache_position,
         **kwargs,
     )
 
@@ -223,7 +285,6 @@ def llamaforsequenceclassification_forward_patched(
     inputs_embeds=None,
     labels=None,
     use_cache=None,
-    cache_position=None,
     **kwargs,
 ):
     outputs = self.model(
@@ -233,7 +294,6 @@ def llamaforsequenceclassification_forward_patched(
         past_key_values=past_key_values,
         inputs_embeds=inputs_embeds,
         use_cache=use_cache,
-        cache_position=cache_position,
         **kwargs,
     )
     hidden_states = outputs.last_hidden_state

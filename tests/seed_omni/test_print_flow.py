@@ -91,7 +91,6 @@ def _load_config(*, infer: str | None = None) -> OmniConfig:
     infer_path = _toy_config_dir() / _TOY_INFER_FILES[infer] if infer is not None else None
     return OmniConfig.from_paths(
         model_path="",
-        tokenizer_path="",
         train_yaml_path=_toy_config_dir() / "train.yaml",
         infer_yaml_path=infer_path,
     )

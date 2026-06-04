@@ -18,8 +18,7 @@
 #                            file selects the **joint understanding +
 #                            generation** SFT setup by default.
 #
-# The global tokenizer is **not** declared here — it is loaded from
-# ``model.model_path`` in the launcher YAML (``veomni_janus.yaml``).
+# The LLM tokenizer lives in ``janus_text_encoder/`` (split checkpoint asset).
 #
 # For inference, the launcher YAML selects one of the sibling ``infer_*.yaml``
 # files via ``model.omni_infer_type``; the selected file overlays its
@@ -67,13 +66,11 @@ modules:
     weights_path: janus_text_encoder
     # `vocab_size` / `hidden_size` / `tie_word_embeddings` come from
     # `janus_text_encoder/config.json` (written by `scripts/split_janus.py`).
-    # `begin_of_image_token_id` / `end_of_image_token_id` are resolved at
-    # runtime from the module tokenizer (not stored in config.json).
+    # Tokenizer + special-token ids: ``janus_text_encoder/tokenizer.json``.
 
   janus_llama:
     weights_path: janus_llama
-    # `image_token_id` / `gen_image_token_id` are resolved at runtime from
-    # the module tokenizer (not stored in config.json).
+    # `image_token_id` / `gen_image_token_id` are written into config.json at split time.
 
 # NOTE: ``micro_batch_size`` / DP / SP / TP / CP knobs are **not** per-module
 # in V2 — they live globally under ``train.*`` in the launcher YAML
@@ -120,27 +117,22 @@ nodes:
 
 # ── Graph edges (data dependencies) ───────────────────────────────────────────
 edges:
-  # ── Training: the conversation_list carrier (D5 backbone splice).
+  # ── Training: the conversation_list carrier (in-place embed mutation).
   #
-  # A single `conversation_list` object (a `TrainConversation`) is the ONLY
-  # thing entering the backbone.  Each module fills its own segments' value
-  # (= embedding) into it and `OmniModel.forward` writes the evolving carrier
-  # back into the shared batch, so these chain edges are pure `{from, to}`
-  # topology contracts — no `output`/`as` plumbing for the per-modality
-  # fields (`input_ids` / `attention_mask` / `position_ids` / `gen_image_mask`
-  # / `labels` / `vq_token_ids` no longer ride their own edges):
+  # Batched ``conversation_list`` (``list[list[ConversationItem]]``) is the
+  # only thing entering the backbone.  Each module embeds its modality in
+  # place on the items; ``OmniModel.forward`` writes the list back into the
+  # shared batch.  Edges are pure ``{from, to}`` topology — no per-field routing.
   #
-  #   * siglip_encode  → fills carrier.und_embeds   (understanding patches)
-  #   * vae_encode     → fills carrier.gen_embeds + gen_token_ids (VQ patches)
-  #   * tok_encode     → chat-template + tokenise + wte + boi/eoi → carrier.segments
-  #   * janus_llama    → segment-order splice → inputs_embeds; derives
-  #                      attention_mask / position_ids; emits hidden_states
-  #   * tok_decode / vae_decode → rebuild their labels from carrier.segments
+  #   * siglip_encode  → embeds user ``image`` items in place
+  #   * vae_encode     → embeds assistant ``image`` items + ``meta.janus_vqvae_labels``
+  #   * tok_encode     → chat-template tokenise + wte → expanded item list
+  #   * janus_llama    → splices item embeds → inputs_embeds; hidden_states → batch
+  #   * tok_decode / vae_decode → labels from ``meta.label_ids`` / ``meta.gen_ids``
   siglip_to_vae:  { from: siglip_encode, to: vae_encode }
   vae_to_tok:     { from: vae_encode,     to: tok_encode }
   tok_to_ar:      { from: tok_encode,     to: janus_llama }
-  # Decode heads read ``TrainConversation.hidden_states`` from the carrier
-  # (written by janus_llama.post_forward) — edges are topology-only.
+  # Decode heads read ``hidden_states`` and ``conversation_list`` from the batch.
   ar_to_tok_decode: { from: janus_llama, to: tok_decode }
   ar_to_vae_decode: { from: janus_llama, to: vae_decode }
   tok_decode_sink:  { from: tok_decode,  to: end }

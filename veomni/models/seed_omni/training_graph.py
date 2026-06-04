@@ -201,17 +201,10 @@ class TrainingGraph:
     ) -> Dict[str, Any]:
         """Build the kwargs dict for ``node``'s forward call.
 
-        Returns a shallow copy of ``raw_batch`` — the shared
-        ``conversation_list`` carrier (and any other batch keys) is visible to
-        every node.  Modules mutate the carrier in place; :meth:`OmniModel.forward`
-        writes the updated carrier back into ``batch`` after each node.  Edges
-        declare execution order only — they do not route individual fields.
-
-        ``outputs`` is accepted for API compatibility but is not used for
-        kwargs assembly (downstream heads read ``conversation_list.hidden_states``
-        etc. from the carrier instead).
+        Returns a shallow copy of ``raw_batch``.  Modules mutate
+        ``conversation_list`` in place; edges declare execution order only.
         """
-        del node, outputs  # topology-only edges; carrier holds cross-node state.
+        del node, outputs
         return dict(raw_batch)
 
     # ── pool accessors (used by FSM) ─────────────────────────────────────────

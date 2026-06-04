@@ -1,20 +1,17 @@
-"""ConversationItem and helpers for SeedOmni V2 inference.
+"""ConversationItem and helpers for SeedOmni V2 (training + inference).
 
-Inference-only data structure (training still rides :class:`TrainConversation`
-on the existing ``forward`` / ``pre_forward`` paths — see
-:mod:`veomni.models.seed_omni.module`).  The :class:`OmniInferencer` walks a
-flat ``List[ConversationItem]`` from input through the FSM; every module's
-``generate`` reads / mutates that list and routes it as a single ``ctx``
-slot.
+Both training and inference walk a flat ``List[ConversationItem]`` (or a batch
+``list[list[ConversationItem]]``).  Modules read / mutate ``value`` in place
+(embeds, hidden states) and route the list as a single ``ctx`` / batch slot.
 
 Unified item shape
 ------------------
-Each item is ``{type, value, meta}``:
+Each item is ``{type, value, role, meta}``:
 
 * ``type``: ``"text"`` | ``"image"`` | ``"token"`` | ``"output"`` | ``"soi"`` | ``"eoi"``
 * ``value``: polymorphic payload (raw content or embedded tensor)
-* ``meta``: ``role`` (``user`` / ``assistant`` / ``system`` / ``dummy``), plus
-  optional ``source``, ``input_ids``, ``token_id``, ``phase``, etc.
+* ``role``: ``"system"`` | ``"user"`` | ``"assistant"`` | ``"dummy"``
+* ``meta``: opaque per-module baggage written during forward (``input_ids``, ``phase``, …)
 
 Lifecycle
 ---------
@@ -52,10 +49,11 @@ ArPhase = Literal["text", "vq"]
 
 @dataclass
 class ConversationItem:
-    """One element of a conversation list — unified ``{type, value, meta}``."""
+    """One element of a conversation list — ``{type, value, role, meta}``."""
 
     type: ItemType
     value: Any = None
+    role: Role = "user"
     meta: dict = field(default_factory=dict)
 
 
@@ -64,8 +62,8 @@ ConversationPart = ConversationItem
 
 
 def item_role(item: ConversationItem) -> str:
-    """Return ``meta["role"]``, defaulting to ``"user"``."""
-    return str(item.meta.get("role", "user"))
+    """Return ``item.role``."""
+    return str(item.role)
 
 
 def is_dummy(item: ConversationItem) -> bool:
@@ -200,11 +198,7 @@ def append_output_hidden(
     role: str = "assistant",
 ) -> ConversationItem:
     """Append a new ``output`` item carrying backbone hidden states."""
-    item = ConversationItem(
-        type="output",
-        value=hidden,
-        meta={"role": role, "phase": phase},
-    )
+    item = ConversationItem(type="output", value=hidden, role=role, meta={"phase": phase})
     parts.append(item)
     return item
 
@@ -255,9 +249,9 @@ def build_conversation(
     """Build the canonical conversation list for a single inference request."""
     parts: list[ConversationItem] = []
     for img in images or []:
-        parts.append(ConversationItem(type="image", value=img, meta={"role": "user"}))
-    parts.append(ConversationItem(type="text", value=prompt, meta={"role": "user"}))
-    parts.append(ConversationItem(type="text", value="", meta={"role": "assistant"}))
+        parts.append(ConversationItem(type="image", value=img, role="user"))
+    parts.append(ConversationItem(type="text", value=prompt, role="user"))
+    parts.append(ConversationItem(type="text", value="", role="assistant"))
     return parts
 
 
@@ -296,69 +290,99 @@ def latest_assistant_text_token_ids(parts: list[ConversationItem]) -> list[int]:
     return out
 
 
-# ── Raw training conversation helpers (D3/D4/D5) ────────────────────────────
+# ── Training batch helpers (unified with inference ConversationItem) ────────
 
 
-def is_raw_training_conversation(conversation: Any) -> bool:
-    """True iff ``conversation`` is the raw training shape ``list[list[dict]]``."""
-    return (
-        isinstance(conversation, list)
-        and len(conversation) > 0
-        and isinstance(conversation[0], list)
-        and len(conversation[0]) > 0
-        and isinstance(conversation[0][0], dict)
-    )
+def is_batched_conversation_list(conversation: Any) -> bool:
+    """True iff ``conversation`` is ``list[list[ConversationItem]]``."""
+    return isinstance(conversation, list) and len(conversation) > 0 and isinstance(conversation[0], list)
 
 
 def collect_modality_values(
-    conversation_list: list[list[dict]],
-    types: tuple[str, ...],
+    conversation_list: list[list[ConversationItem]],
+    types: list[str],
+    roles: list[str] | None = None,
 ) -> list[list[Any]]:
-    """Per-sample list of ``item['value']`` for items whose ``type`` matches."""
+    """Per-sample list of ``item.value`` for items whose ``type`` (and optional ``role``) match."""
     out: list[list[Any]] = []
     for sample in conversation_list:
-        out.append([item.get("value") for item in sample if item.get("type") in types])
+        row: list[Any] = []
+        for item in sample:
+            if item.type not in types:
+                continue
+            if roles is not None and item_role(item) not in roles:
+                continue
+            row.append(item.value)
+        out.append(row)
     return out
 
 
-# ── Training: the embedding-segment conversation (D5 backbone splice) ────────
+def iter_modality_items(
+    conversation_list: list[list[ConversationItem]],
+    types: list[str],
+    roles: list[str] | None = None,
+) -> Iterator[ConversationItem]:
+    """Yield matching items in micro-batch order (sample 0, then sample 1, …)."""
+    for sample in conversation_list:
+        for item in sample:
+            if item.type not in types:
+                continue
+            if roles is not None and item_role(item) not in roles:
+                continue
+            yield item
 
 
-@dataclass
-class TrainSegment:
-    """One contiguous run of token positions with a shared embedding source."""
-
-    embeds: torch.Tensor  # (L, D)
-    label_ids: torch.Tensor  # (L,) long — text CE target (-100 = ignore)
-    gen_ids: torch.Tensor  # (L,) long — VQ CE target  (-100 = ignore)
-
-
-@dataclass
-class TrainConversation:
-    """Single training carrier — the only object that enters the backbone."""
-
-    raw: list[list[dict[str, Any]]]
-    und_embeds: torch.Tensor | None = None
-    gen_embeds: torch.Tensor | None = None
-    gen_token_ids: torch.Tensor | None = None
-    segments: list[list[TrainSegment]] | None = None
-    hidden_states: torch.Tensor | None = None
+def sample_indices_with_modality(
+    conversation_list: list[list[ConversationItem]],
+    types: list[str],
+    roles: list[str] | None = None,
+) -> set[int]:
+    """Micro-batch row indices that contain at least one matching item."""
+    found: set[int] = set()
+    for sample_idx, sample in enumerate(conversation_list):
+        for item in sample:
+            if item.type not in types:
+                continue
+            if roles is not None and item_role(item) not in roles:
+                continue
+            found.add(sample_idx)
+            break
+    return found
 
 
-def is_train_conversation(x: Any) -> bool:
-    """True iff ``x`` is the V2 training carrier :class:`TrainConversation`."""
-    return isinstance(x, TrainConversation)
+def collect_modality_batch(
+    conversation_list: list[list[ConversationItem]],
+    types: list[str],
+    roles: list[str] | None = None,
+) -> list[Any]:
+    """Flat ``item.value`` list for matching items in micro-batch order."""
+    return [item.value for item in iter_modality_items(conversation_list, types, roles)]
 
 
-def assemble_embeds(
-    segments: list[list[TrainSegment]],
+def iter_embed_chunks(sample: list[ConversationItem]) -> list[torch.Tensor]:
+    """Concat-ready ``(L, D)`` embed chunks for one sample (training backbone splice)."""
+    chunks: list[torch.Tensor] = []
+    for part in sample:
+        emb = get_llm_embed(part)
+        if emb is None and isinstance(part.value, torch.Tensor) and part.value.dim() == 2:
+            emb = part.value.unsqueeze(0)
+        if emb is None:
+            continue
+        if emb.dim() == 3:
+            emb = emb.squeeze(0)
+        chunks.append(emb)
+    return chunks
+
+
+def assemble_batch_embeds(
+    conversations: list[list[ConversationItem]],
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Concatenate per-sample segment embeds → right-padded ``(B, T, D)`` batch."""
-    if not segments:
-        raise ValueError("assemble_embeds: empty segments list.")
-    per_sample = [torch.cat([seg.embeds for seg in sample], dim=0) if sample else None for sample in segments]
+    """Right-pad per-sample embed chains → ``(inputs_embeds, attention_mask, position_ids)``."""
+    if not conversations:
+        raise ValueError("assemble_batch_embeds: empty batch.")
+    per_sample = [torch.cat(iter_embed_chunks(sample), dim=0) if sample else None for sample in conversations]
     if any(x is None for x in per_sample):
-        raise ValueError("assemble_embeds: a sample has zero segments — text encoder must emit at least bos+eos.")
+        raise ValueError("assemble_batch_embeds: a sample has zero embedded items.")
     lengths = [x.size(0) for x in per_sample]
     max_len = max(lengths)
     ref = per_sample[0]
@@ -373,18 +397,110 @@ def assemble_embeds(
     return inputs_embeds, attention_mask, position_ids
 
 
-def assemble_labels(segments: list[list[TrainSegment]], *, key: str) -> torch.Tensor:
-    """Concatenate the per-segment ``key`` label vectors → right-padded ``(B, T)``."""
-    per_sample = [torch.cat([getattr(seg, key) for seg in sample], dim=0) if sample else None for sample in segments]
+def assemble_batch_labels(
+    conversations: list[list[ConversationItem]],
+    *,
+    key: str,
+) -> torch.Tensor:
+    """Concat per-item ``meta[key]`` vectors → right-padded ``(B, T)``."""
+    per_sample: list[torch.Tensor | None] = []
+    for sample in conversations:
+        parts: list[torch.Tensor] = []
+        for part in sample:
+            lab = part.meta.get(key)
+            if lab is None:
+                continue
+            if not isinstance(lab, torch.Tensor):
+                raise TypeError(f"ConversationItem.meta[{key!r}] must be a tensor, got {type(lab).__name__}.")
+            parts.append(lab.to(torch.long))
+        per_sample.append(torch.cat(parts, dim=0) if parts else None)
     if any(x is None for x in per_sample):
-        raise ValueError("assemble_labels: a sample has zero segments.")
+        raise ValueError(f"assemble_batch_labels: a sample has no meta[{key!r}] segments.")
     lengths = [x.size(0) for x in per_sample]
     max_len = max(lengths)
     device = per_sample[0].device
     labels = torch.full((len(per_sample), max_len), -100, dtype=torch.long, device=device)
     for i, (lab, n) in enumerate(zip(per_sample, lengths)):
-        labels[i, :n] = lab.to(torch.long)
+        labels[i, :n] = lab
     return labels
+
+
+def assemble_batch_gen_image_mask(
+    conversations: list[list[ConversationItem]],
+) -> torch.Tensor:
+    """``(B, T)`` bool mask — True wherever ``meta.gen_ids`` is supervised."""
+    gen_labels = assemble_batch_labels(conversations, key="gen_ids")
+    return gen_labels.ne(-100)
+
+
+def _value_shape(value: Any) -> str:
+    if isinstance(value, torch.Tensor):
+        return str(tuple(value.shape))
+    if isinstance(value, str):
+        preview = value[:40] + "..." if len(value) > 40 else value
+        return f"str({len(value)}):{preview!r}"
+    if value is None:
+        return "None"
+    return type(value).__name__
+
+
+def summarize_conversation_batch(conversations: Any) -> str:
+    """One-line-per-item debug view: ``sample[i] type shape role=… dummy=…``."""
+    if not isinstance(conversations, list) or not conversations:
+        return "(empty conversation_list)"
+    lines: list[str] = []
+    for si, sample in enumerate(conversations):
+        if not isinstance(sample, list):
+            lines.append(f"  sample[{si}]: {type(sample).__name__}")
+            continue
+        lines.append(f"  sample[{si}] ({len(sample)} items):")
+        for j, item in enumerate(sample):
+            typ = str(item.type)
+            role = item_role(item)
+            dummy = is_dummy(item)
+            val = item.value
+            lines.append(f"    [{j}] type={typ!r} shape={_value_shape(val)} role={role!r} dummy={dummy}")
+    return "\n".join(lines)
+
+
+def dummy_modality_anchor_mean(
+    conversations: list[list[ConversationItem]],
+    *,
+    item_type: str,
+) -> torch.Tensor | None:
+    """Mean of ``role='dummy'`` rows for one modality — QwenVL-style FSDP anchor."""
+    total: torch.Tensor | None = None
+    count = 0
+    for sample in conversations:
+        for part in sample:
+            if part.type != item_type or not is_dummy(part):
+                continue
+            if not isinstance(part.value, torch.Tensor):
+                continue
+            total = part.value.mean() if total is None else total + part.value.mean()
+            count += 1
+    if total is None or count == 0:
+        return None
+    return total / count
+
+
+def modality_embed_anchor_mean(
+    conversations: list[list[ConversationItem]],
+    *,
+    item_type: str,
+) -> torch.Tensor | None:
+    """Mean of every ``item_type`` embed on the carrier (real + dummy rows)."""
+    total: torch.Tensor | None = None
+    count = 0
+    for sample in conversations:
+        for part in sample:
+            if part.type != item_type or not isinstance(part.value, torch.Tensor):
+                continue
+            total = part.value.mean() if total is None else total + part.value.mean()
+            count += 1
+    if total is None or count == 0:
+        return None
+    return total / count
 
 
 __all__ = [
@@ -411,11 +527,16 @@ __all__ = [
     "iter_kind",
     "unembedded_parts",
     "latest_assistant_text_token_ids",
-    "is_raw_training_conversation",
+    "is_batched_conversation_list",
     "collect_modality_values",
-    "TrainSegment",
-    "TrainConversation",
-    "is_train_conversation",
-    "assemble_embeds",
-    "assemble_labels",
+    "iter_modality_items",
+    "sample_indices_with_modality",
+    "collect_modality_batch",
+    "iter_embed_chunks",
+    "assemble_batch_embeds",
+    "assemble_batch_labels",
+    "assemble_batch_gen_image_mask",
+    "summarize_conversation_batch",
+    "dummy_modality_anchor_mean",
+    "modality_embed_anchor_mean",
 ]

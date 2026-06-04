@@ -22,12 +22,11 @@ For a model with three modules (``janus_siglip``, ``janus_vqvae``,
     ├── janus_llama/
     │   ├── config.json
     │   └── model.safetensors            # no per-module asset
-    ├── text_encoder/
+    ├── janus_text_encoder/
     │   ├── config.json
-    │   └── model.safetensors
-    ├── tokenizer/                        # global; written by OmniTrainer top-level callback
-    │   ├── tokenizer.json
-    │   └── special_tokens_map.json
+    │   ├── model.safetensors
+    │   ├── tokenizer.json                # module-owned LLM tokenizer
+    │   └── tokenizer_config.json
     └── omni_config.yaml                  # OmniConfig snapshot (top-level)
 
 This matches the design in ``design.md`` §11.

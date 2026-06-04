@@ -3,20 +3,21 @@ JanusLlama — Janus' LLaMA backbone (no wte, no lm_head) as one OmniModule.
 
 Mixin form: ``class JanusLlama(OmniModule, PreTrainedModel)``.
 
-The backbone *contains* a vanilla :class:`transformers.LlamaModel` whose
+The backbone *contains* VeOmni's patched :class:`~veomni.models.transformers.llama.generated.patched_modeling_llama_gpu.LlamaModel` whose
 ``embed_tokens`` has been replaced with an :class:`nn.Identity` — the
 word-token embedding lives in the sibling
 :class:`~veomni.models.seed_omni.modules.base.TextEncoder` module.  This
 keeps the LLaMA forward path unchanged; ``inputs_embeds`` (passed in by
 the graph from the ``tok_encode`` node) is what actually flows through.
 
-Multi-modal embedding scatter
+Multi-modal embedding packing
 -----------------------------
-:meth:`pre_forward` is the only place that knows how to merge image
-embeddings into ``inputs_embeds``: ``masked_scatter`` at
-``input_ids == config.image_token_id`` (understanding) or
-``config.gen_image_token_id`` (generation) positions.  This is the
-"backbone owns the multimodal merge" pattern from design.md §10.
+:meth:`pre_forward` concatenates each sample's embedded conversation items
+into one packed sequence (``bs=1``), builds per-sample ``position_ids``
+(``range(0, len)`` per sample), and precomputes Flash-Attention varlen
+kwargs (``cu_seq_lens_*`` / ``max_length_*``) for the patched LLaMA
+backbone.  :meth:`post_forward` unpacks ``hidden_states`` back to
+right-padded ``(B, T, D)`` for the decode heads.
 
 Sequence parallelism
 --------------------
@@ -38,20 +39,19 @@ from typing import Any, Dict, List, Optional
 import torch
 import torch.nn as nn
 from transformers import LlamaConfig, PreTrainedModel
-from transformers.models.llama.modeling_llama import LlamaModel
 
 from veomni.distributed.parallel_state import get_parallel_state
-from veomni.distributed.sequence_parallel.data import gather_outputs, sp_pad_and_slice
+from veomni.models.transformers.llama.generated.patched_modeling_llama_gpu import LlamaModel
+from veomni.utils.seqlen_pos_transform_utils import prepare_fa_kwargs_from_position_ids
+from veomni.utils.tensor_utils import naflatten, unflatten
 
 from ....conversation import (
     ArPhase,
     ConversationItem,
     append_output_hidden,
-    assemble_embeds,
     collect_prompt_embeds,
     get_ar_tail_embed,
     is_dummy,
-    is_train_conversation,
 )
 from ....module import OmniModule
 from .configuration import JanusLlamaConfig
@@ -71,6 +71,8 @@ class JanusLlama(OmniModule, PreTrainedModel):
     base_model_prefix = "janus_llama"
     main_input_name = "inputs_embeds"
     _no_split_modules = ["LlamaDecoderLayer"]
+    # Inner ``language_model`` is VeOmni's patched ``LlamaModel`` (fused ops + SP).
+    supports_gradient_checkpointing = True
 
     def __init__(self, config: JanusLlamaConfig):
         super().__init__(config)
@@ -81,6 +83,7 @@ class JanusLlama(OmniModule, PreTrainedModel):
         # Drop the embed_tokens parameters — owned by sibling TextEncoder.
         self.language_model.set_input_embeddings(nn.Identity())
 
+        # Inference state
         # Classifier-free guidance runtime state — set to True the first
         # time :meth:`generate` consumes a ``cfg_uncond_inputs_embeds`` from
         # ctx and expands the KV cache to bs=2.  ``_cfg_seen_vqvae`` flips
@@ -95,156 +98,13 @@ class JanusLlama(OmniModule, PreTrainedModel):
         self._past_key_values: Any = None
         self._ar_phase: ArPhase = "text"
 
+        # Training state
+        self._conversation_carrier: Optional[list[list[ConversationItem]]] = None
+        self._pack_inputs_embeds_shape: Optional[torch.Tensor] = None
+
         self.post_init()
 
-    # ── OmniModule interface ───────────────────────────────────────────────────
-
-    def set_conversation_tokenizer(self, conversation_tokenizer: Any) -> None:
-        """Resolve image-placeholder ids used by the ``masked_scatter`` merge.
-
-        ``image_token_id`` (``<image_placeholder>``) marks where SigLIP
-        understanding patches are injected; ``gen_image_token_id`` marks
-        VQ generation-image positions.  Stored on ``config`` so
-        :meth:`pre_forward` can build the scatter mask from ``input_ids``.
-        Resolved from the wired conversation tokenizer rather than
-        ``config.json`` so a single source of truth (the vocabulary) drives
-        both the text encoder's placeholder expansion and the backbone's
-        scatter.
-        """
-        und = _resolve_token_id(
-            conversation_tokenizer, ("<image_placeholder>", getattr(conversation_tokenizer, "image_token", None))
-        )
-        if und is not None:
-            self.config.image_token_id = und
-        gen = _resolve_token_id(conversation_tokenizer, (getattr(conversation_tokenizer, "gen_image_token", None),))
-        if gen is not None:
-            self.config.gen_image_token_id = gen
-
-    def pre_forward(
-        self,
-        input_ids: Optional[torch.LongTensor] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        labels: Optional[torch.LongTensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        und_image_embeds: Optional[torch.FloatTensor] = None,
-        gen_image_embeds: Optional[torch.FloatTensor] = None,
-        gen_image_mask: Optional[torch.Tensor] = None,
-        conversation_list: Optional[Any] = None,
-        **kwargs,
-    ) -> Dict[str, Any]:
-        """Segment-driven splice (V2) or legacy masked_scatter merge, then SP slice.
-
-        V2 (``conversation_list`` is a :class:`TrainConversation`): concatenate
-        every per-sample segment's ``embeds`` in order → ``inputs_embeds``
-        (NO ``masked_scatter``, NO placeholder ids), and derive
-        ``attention_mask`` / ``position_ids`` from the assembled lengths.  The
-        full-batch ``und_embeds`` / ``gen_embeds`` on the carrier are folded in
-        as ``sum() * 0.0`` autograd anchors so every encoder always receives a
-        (zero) gradient even on image-free micro-batches (FSDP DP alignment).
-        The carrier is forwarded on so ``tok_decode`` / ``vae_decode`` rebuild
-        their labels from the same segments.
-
-        Legacy (``input_ids`` + ``*_image_embeds`` + ``gen_image_mask``):
-        ``masked_scatter`` at placeholder positions — kept for any
-        pre-tensorised / test callers.
-
-        SP ``pad_and_slice`` is applied last so an image span crossing an SP
-        boundary keeps its embedding; :meth:`post_forward` gathers back.
-        """
-        if is_train_conversation(conversation_list):
-            return self._pre_forward_segments(conversation_list, kwargs)
-
-        if inputs_embeds is None:
-            raise ValueError("JanusLlama.pre_forward expects `inputs_embeds` from `tok_encode`.")
-
-        # Multi-modal merge.  The ``+ x.sum() * 0.0`` anchor below is the
-        # FSDP grad-sync guard for training-side dummy forward (see module-
-        # doc "Training vs. inference no input semantics" in
-        # :mod:`veomni.models.seed_omni.module`): when the placeholder mask
-        # is all-False (text-only micro-batch with dummy zero image
-        # embeds), ``masked_scatter`` would otherwise drop the gradient
-        # path back to the upstream encoder and FSDP grad-reduce would
-        # mismatch across DP ranks.  The anchor adds a zero-valued
-        # contribution that *is* part of the autograd graph, so the
-        # upstream module always receives a (zero) gradient.
-        if und_image_embeds is not None and input_ids is not None:
-            und_mask = input_ids == self.config.image_token_id
-            inputs_embeds = self._scatter_by_mask(inputs_embeds, und_mask, und_image_embeds)
-            if self.training:
-                inputs_embeds = inputs_embeds + und_image_embeds.sum() * 0.0
-        if gen_image_embeds is not None and gen_image_mask is not None:
-            inputs_embeds = self._scatter_by_mask(inputs_embeds, gen_image_mask.bool(), gen_image_embeds)
-            if self.training:
-                inputs_embeds = inputs_embeds + gen_image_embeds.sum() * 0.0
-
-        ps = get_parallel_state()
-        if ps.sp_enabled:
-            if input_ids is not None:
-                input_ids = sp_pad_and_slice(input_ids, dim=1, pad_value=0)
-            inputs_embeds = sp_pad_and_slice(inputs_embeds, dim=1, pad_value=0)
-            if labels is not None:
-                labels = sp_pad_and_slice(labels, dim=1, pad_value=-100)
-            if attention_mask is not None:
-                attention_mask = sp_pad_and_slice(attention_mask, dim=1, pad_value=0)
-            if position_ids is not None:
-                position_ids = sp_pad_and_slice(position_ids, dim=1, pad_value=0)
-
-        return dict(
-            input_ids=input_ids,
-            inputs_embeds=inputs_embeds,
-            labels=labels,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            **kwargs,
-        )
-
-    def _pre_forward_segments(self, conv: Any, kwargs: Dict[str, Any]) -> Dict[str, Any]:
-        """Assemble inputs from the :class:`TrainConversation` segments + anchors."""
-        if conv.segments is None:
-            raise ValueError(
-                "JanusLlama.pre_forward: TrainConversation has no segments (text encoder must run first)."
-            )
-        inputs_embeds, attention_mask, position_ids = assemble_embeds(conv.segments)
-
-        # FSDP grad-sync anchors over the FULL encoder batch tensors — a
-        # micro-batch with no image of a modality still drives a (zero)
-        # gradient through that encoder so DP grad-reduce stays aligned.
-        if self.training:
-            if conv.und_embeds is not None:
-                inputs_embeds = inputs_embeds + conv.und_embeds.sum() * 0.0
-            if conv.gen_embeds is not None:
-                inputs_embeds = inputs_embeds + conv.gen_embeds.sum() * 0.0
-
-        ps = get_parallel_state()
-        if ps.sp_enabled:
-            inputs_embeds = sp_pad_and_slice(inputs_embeds, dim=1, pad_value=0)
-            attention_mask = sp_pad_and_slice(attention_mask, dim=1, pad_value=0)
-            position_ids = sp_pad_and_slice(position_ids, dim=1, pad_value=0)
-
-        return dict(
-            inputs_embeds=inputs_embeds,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            conversation_list=conv,
-            **kwargs,
-        )
-
-    def post_forward(self, outputs: Dict[str, Any]) -> Dict[str, Any]:
-        """All-gather ``hidden_states`` across SP ranks (when SP enabled).
-
-        Also stash the gathered tensor on the :class:`TrainConversation` carrier
-        so downstream decode heads read it from ``conversation_list.hidden_states``
-        — no edge ``output``/``as`` routing needed.
-        """
-        ps = get_parallel_state()
-        if ps.sp_enabled and "hidden_states" in outputs:
-            outputs["hidden_states"] = gather_outputs(outputs["hidden_states"], gather_dim=1, scale_grad=True)
-        convo = outputs.get("conversation_list")
-        if is_train_conversation(convo) and "hidden_states" in outputs:
-            convo.hidden_states = outputs["hidden_states"]
-        return outputs
-
+    # ── JanusLlama Main Function ─────────────────────────────────────────────────────
     def forward(  # type: ignore[override]
         self,
         inputs_embeds: Optional[torch.FloatTensor] = None,
@@ -252,37 +112,84 @@ class JanusLlama(OmniModule, PreTrainedModel):
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values=None,
         use_cache: Optional[bool] = None,
-        conversation_list: Optional[Any] = None,
         **kwargs,
     ) -> Dict[str, Any]:
-        """Backbone forward.  ``inputs_embeds`` is required (no internal wte).
-
-        In V2 training the :class:`TrainConversation` carrier is echoed in the
-        output so the loss heads (``tok_decode`` / ``vae_decode``) rebuild their
-        labels from the same per-sample segments the backbone spliced.
-        """
-        if inputs_embeds is None:
-            raise ValueError(
-                "JanusLlama.forward expects `inputs_embeds` (produced by "
-                "`text_encoder.encode`). Word-token embedding has moved to "
-                "the TextEncoder module."
-            )
-
-        lm_out = self.language_model(
+        """Backbone forward — ``inputs_embeds`` in, ``hidden_states`` out."""
+        outputs = self.language_model(
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_values=past_key_values,
             use_cache=use_cache,
-            **{k: v for k, v in kwargs.items() if k in ("cache_position",)},
+            **kwargs,
         )
-        out: Dict[str, Any] = {
-            "hidden_states": lm_out.last_hidden_state,
-            "past_key_values": lm_out.past_key_values,
+        return {
+            "hidden_states": outputs.last_hidden_state,
+            "past_key_values": outputs.past_key_values,
         }
-        if conversation_list is not None:
-            out["conversation_list"] = conversation_list
-        return out
+
+    # ── OmniModule interface ───────────────────────────────────────────────────
+
+    def pre_forward(
+        self,
+        method: str,
+        conversation_list: Optional[list[list[ConversationItem]]] = None,
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
+        """Pack embedded ``conversation_list`` into a single bs=1 sequence.
+
+        Per sample: concatenate every embedded item's ``value`` in order.
+        Across samples: pack into one sequence with per-sample ``position_ids``
+        ``range(0, len)``.  Precompute Flash-Attention varlen kwargs
+        (``cu_seq_lens_*`` / ``max_length_*``) so decoder layers skip the
+        per-layer host sync.  SP ``pad_and_slice`` is applied last;
+        :meth:`post_forward` gathers and unpacks back to ``(B, T, D)``.
+        """
+        assert method == "forward"
+        inputs_embeds, attention_mask, position_ids, inputs_embeds_shape = self._pack_conversations_for_forward(
+            conversation_list
+        )
+
+        if self.training and get_parallel_state().fsdp_enabled:
+            inputs_embeds = _fold_fsdp_dummy_anchors(inputs_embeds, conversation_list)
+
+        self._conversation_carrier = conversation_list
+        self._pack_inputs_embeds_shape = inputs_embeds_shape
+
+        if get_parallel_state().sp_enabled:
+            raise NotImplementedError("SP is not supported yet")
+        else:
+            (cu_seq_lens_q, cu_seq_lens_k), (max_length_q, max_length_k) = prepare_fa_kwargs_from_position_ids(
+                position_ids
+            )
+        return dict(
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            cu_seq_lens_q=cu_seq_lens_q,
+            cu_seq_lens_k=cu_seq_lens_k,
+            max_length_q=max_length_q,
+            max_length_k=max_length_k,
+            **kwargs,
+        )
+
+    def post_forward(self, method: str, **outputs: Any) -> Dict[str, Any]:
+        """Unflatten packed hidden states and write them back onto ``conversation_list``."""
+        assert method == "forward"
+        hidden_states = outputs.get("hidden_states")
+
+        if get_parallel_state().sp_enabled:
+            raise NotImplementedError("SP is not supported yet")
+
+        conversation = self._conversation_carrier
+        pack_shape = self._pack_inputs_embeds_shape
+        self._conversation_carrier = None
+        self._pack_inputs_embeds_shape = None
+
+        if hidden_states.dim() == 3 and hidden_states.size(0) == 1:
+            hidden_states = hidden_states.squeeze(0)
+        self._scatter_hidden_states(conversation, unflatten(hidden_states, pack_shape))
+        return {"conversation_list": conversation}
 
     def generate_step(
         self,
@@ -384,9 +291,7 @@ class JanusLlama(OmniModule, PreTrainedModel):
                     "Run siglip + text_encoder generate first."
                 )
             inputs_embeds = torch.cat(embed_chunks, dim=1)
-            for part in conversation_list:
-                if is_dummy(part) and isinstance(part.value, torch.Tensor):
-                    inputs_embeds = inputs_embeds + part.value.sum() * 0.0
+            inputs_embeds = _fold_fsdp_dummy_anchors(inputs_embeds, [conversation_list])
 
             lm_out = self.language_model(
                 inputs_embeds=inputs_embeds,
@@ -483,20 +388,113 @@ class JanusLlama(OmniModule, PreTrainedModel):
         m = mask.unsqueeze(-1).expand_as(inputs_embeds)
         return inputs_embeds.masked_scatter(m, flat)
 
+    def _pack_conversations_for_forward(
+        self,
+        conversations: list[list[ConversationItem]],
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        int,
+        int,
+        list[int],
+    ]:
+        """Pack embedded conversations → bs=1 tensors + precomputed FA2 kwargs."""
+        inputs_embeds_list = []
+        attention_mask = []
+        position_ids = []
+        for sample in conversations:
+            sample_lengths = 0
+            for item in sample:
+                role = item.role
+                if role != "dummy":  # skip dummy items
+                    embeds = item.value
+                    embeds_length = embeds.size(0)
+                    chunk_attention_mask = item.meta.pop("attention_mask", None)
+                    if chunk_attention_mask is None:
+                        chunk_attention_mask = torch.ones(embeds_length, dtype=torch.long, device=self.device)
+                    inputs_embeds_list.append(embeds)
+                    attention_mask.append(chunk_attention_mask)
+                    sample_lengths += embeds_length
+            sample_position_ids = torch.arange(sample_lengths, dtype=torch.long, device=self.device)
+            position_ids.append(sample_position_ids)
+        inputs_embeds, inputs_embeds_shape = naflatten(inputs_embeds_list)
+        position_ids = torch.cat(position_ids, dim=0)
+        attention_mask = torch.cat(attention_mask, dim=0)
 
-def _resolve_token_id(tokenizer: Any, candidates: tuple) -> Optional[int]:
-    """Return the first candidate token string that maps to a real (non-unk) id."""
-    unk = getattr(tokenizer, "unk_token_id", None)
-    for cand in candidates:
-        if not cand:
-            continue
-        try:
-            tid = tokenizer.convert_tokens_to_ids(cand)
-        except (KeyError, ValueError):
-            continue
-        if tid is not None and tid != unk:
-            return int(tid)
-    return None
+        # Packed varlen path: one logical batch row for Llama + FA2 kwargs.
+        if inputs_embeds.dim() == 2:
+            inputs_embeds = inputs_embeds.unsqueeze(0)
+        if attention_mask.dim() == 1:
+            attention_mask = attention_mask.unsqueeze(0)
+        if position_ids.dim() == 1:
+            position_ids = position_ids.unsqueeze(0)
+
+        return inputs_embeds, attention_mask, position_ids, inputs_embeds_shape
+
+    def _scatter_hidden_states(
+        self,
+        conversation_list: list[list[ConversationItem]],
+        hidden_states_list: list[torch.Tensor],
+    ) -> None:
+        """Write backbone hidden segments back onto non-dummy items in pack order."""
+        hidden_states_list_iter = iter(hidden_states_list)
+        for sample in conversation_list:
+            for part in sample:
+                if is_dummy(part):
+                    continue
+                part.value = next(hidden_states_list_iter)
+        if next(hidden_states_list_iter, None) is not None:
+            raise RuntimeError(
+                "JanusLlama._scatter_hidden_states: segment count exceeds non-dummy conversation items."
+            )
+
+
+def _fold_fsdp_dummy_anchors(
+    inputs_embeds: torch.Tensor,
+    conversations: list[list[ConversationItem]],
+) -> torch.Tensor:
+    """``inputs_embeds + dummy.value.mean() * 0.0`` for each dummy item."""
+    for sample in conversations:
+        for part in sample:
+            if not is_dummy(part):
+                continue
+            if not isinstance(part.value, torch.Tensor):
+                continue
+            fake = part.value.mean().to(device=inputs_embeds.device, dtype=inputs_embeds.dtype) * 0.0
+            inputs_embeds = inputs_embeds + fake
+    return inputs_embeds
+
+
+def _sp_pad_tensor(
+    tensor: torch.Tensor,
+    dim: int,
+    pad_value: int,
+    pad_scale: int = 1,
+) -> torch.Tensor:
+    """Pad a sequence tensor so its length is divisible by ``sp_size * pad_scale``."""
+    sp_size = get_parallel_state().sp_size
+    seq_length = tensor.size(dim)
+    scale_sp_size = sp_size * pad_scale
+    sp_chunk_size = (seq_length + scale_sp_size - 1) // scale_sp_size
+    pad_size = sp_chunk_size * scale_sp_size - seq_length
+    if pad_size == 0:
+        return tensor
+    pad_shape = list(tensor.shape)
+    pad_shape[dim] = pad_size
+    pad = torch.full(pad_shape, fill_value=pad_value, dtype=tensor.dtype, device=tensor.device)
+    return torch.cat((tensor, pad), dim=dim)
+
+
+def _sp_slice_tensor(tensor: torch.Tensor, dim: int) -> torch.Tensor:
+    """Extract this SP rank's slice from an already padded sequence tensor."""
+    sp_size = get_parallel_state().sp_size
+    sp_rank = get_parallel_state().sp_rank
+    seq_length = tensor.size(dim)
+    sp_chunk_size = (seq_length + sp_size - 1) // sp_size
+    return tensor.narrow(dim, sp_rank * sp_chunk_size, sp_chunk_size)
 
 
 def _slice_kv_cache(cache: Any, index: slice) -> Any:

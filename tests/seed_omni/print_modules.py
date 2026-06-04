@@ -79,9 +79,10 @@ class _PrintBase(OmniModule, nn.Module):
         self._mod_name = name
         self._log = log
 
-    def _record(self, method: str, **kwargs: Any) -> None:
+    def _record(self, call_site: str, **kwargs: Any) -> None:
+        kwargs.pop("method", None)
         keys = sorted(kwargs.keys())
-        self._log.append(f"{self._mod_name}.{method}({','.join(keys)})")
+        self._log.append(f"{self._mod_name}.{call_site}({','.join(keys)})")
 
 
 def _scalar_loss(value: float = 0.5) -> torch.Tensor:

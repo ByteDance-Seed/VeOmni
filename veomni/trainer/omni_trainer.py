@@ -119,12 +119,19 @@ class OmniModelArguments(ModelArguments):
         default=None,
         metadata={"help": "Active inference scenario key into omni_infer_yaml_path (inference only)."},
     )
+    infer_use_fsdp: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "When True, inference builds each module through the same FSDP2 "
+                "path as training (requires distributed init).  Default False uses "
+                "eager ``from_pretrained`` on a single device."
+            )
+        },
+    )
 
     def __post_init__(self):
         super().__post_init__()
-        if self.model_path is not None and self.tokenizer_path is None:
-            # Global tokenizer lives at the split-checkpoint root.
-            self.tokenizer_path = self.model_path
 
     def load_omni_config(self, *, infer_type: Optional[str] = None) -> "OmniConfig":
         """Build :class:`OmniConfig` with resolved module paths."""
@@ -146,7 +153,6 @@ class OmniModelArguments(ModelArguments):
 
         return OmniConfig.from_paths(
             model_path=self.model_path,
-            tokenizer_path=self.tokenizer_path,
             train_yaml_path=self.omni_train_yaml_path,
             infer_yaml_path=infer_yaml_path,
         )
@@ -410,7 +416,6 @@ class OmniModuleTrainer:
     def __init__(
         self,
         args: "VeOmniArguments",
-        conversation_tokenizer: Any = None,
         subfolder_name: str = "",
     ):
         # Composition (mirrors OmniTrainer): a bare BaseTrainer whose global
@@ -420,11 +425,6 @@ class OmniModuleTrainer:
         self.base.args = args
 
         self.base._build_model()  # meta-init the sub-model from its config.json
-        # Wire the global *conversation* tokenizer (resolves special-token ids /
-        # tokenises the conversation).  This is **not** a module asset — the
-        # orchestrator owns it; the module's *own* assets are loaded below.
-        if conversation_tokenizer is not None and hasattr(self.base.model, "set_conversation_tokenizer"):
-            self.base.model.set_conversation_tokenizer(conversation_tokenizer)
         # Load this module's own processor / tokenizer and assemble
         # ``base.model_assets`` (mirrors ``BaseTrainer._build_model_assets``).
         self._build_model_assets()
@@ -522,8 +522,7 @@ class OmniModuleTrainer:
         that owns its own tokenizer (e.g. a T5 text encoder for a DiT) needs that
         too.  Both are loaded from this module's weights path via the
         registry-aware :func:`build_processor` / :func:`build_tokenizer` — the same
-        loaders used everywhere else — and are this module's *own* assets, distinct
-        from the global conversation tokenizer (the orchestrator owns / saves that).
+        loaders used everywhere else.
 
         A missing / unreadable asset folder is a best-effort no-op; the module's
         ``generate`` / ``forward`` raises a clear error later if it truly needs it.
@@ -542,18 +541,13 @@ class OmniModuleTrainer:
                     "Training will fail if this modality's images are actually present."
                 )
 
-        if getattr(type(model), "tokenizer_class", None) is not None and getattr(model, "_tokenizer", None) is None:
-            try:
-                model._tokenizer = build_tokenizer(weights_path)
-                logger.info_rank0(f"OmniModuleTrainer '{label}': loaded own tokenizer.")
-            except Exception as e:  # noqa: BLE001 — surfaced lazily by the module if truly needed
-                logger.warning_once(
-                    f"OmniModuleTrainer '{label}': could not load own tokenizer from {weights_path}: {e}."
-                )
+        try:
+            model.tokenizer = build_tokenizer(weights_path)
+            logger.info_rank0(f"OmniModuleTrainer '{label}': loaded tokenizer.")
+        except Exception as e:  # noqa: BLE001 — no tokenizer asset in this module dir
+            logger.warning_once(f"OmniModuleTrainer '{label}': could not load tokenizer from {weights_path}: {e}.")
 
-        # Assemble the savable assets (config + own processor + own tokenizer).  The
-        # global conversation tokenizer is deliberately excluded — it is the
-        # orchestrator's asset, saved once, not this module's.
+        # Assemble the savable assets (config + own processor + own tokenizer).
         assets: List[Any] = []
         cfg = getattr(model, "config", None)
         if cfg is not None:
@@ -608,26 +602,36 @@ class OmniTrainer:
     optimizers: Dict[str, torch.optim.Optimizer]  # one per trainable module (aggregated into base.optimizer)
     lr_schedulers: Dict[str, Any]  # one per trainable module (aggregated into base.lr_scheduler)
 
-    def __init__(self, args: VeOmniOmniArguments):
+    def __init__(self, args: VeOmniOmniArguments, *, runtime: str = "train"):
         # BaseTrainer.__init__ is NOT called here; we call its private
         # helpers one-by-one so the (overridden) build sequence is explicit.
+        self.runtime = runtime
         self.base = BaseTrainer.__new__(BaseTrainer)
         self.base.args = args
 
-        self.base._setup()
-        # Each module-trainer builds + FSDP2-wraps its own sub-model (weights
-        # loaded), then we compose them into one OmniModel.
-        self._build_model()
-        self._freeze_model_module()  # aggregate trainable-param report
-        self._build_model_assets()  # expose [omni_config, tokenizer]
-        self.base._build_data_transform()
-        self.base._build_dataset()  # fixes args.train_steps (needed by schedulers)
-        self._build_collate_fn()  # seedomni → SeedOmniCollator
-        self.base._build_dataloader()
-        self._build_optimizer()  # drive each module-trainer's optimizer
-        self._build_lr_scheduler()  # drive each module-trainer's lr-scheduler
-        self.base._build_training_context()
-        self._init_callbacks()  # swap single-model ckpt → per-module DCP
+        if runtime == "train":
+            self.base._setup()
+            self._build_model(use_fsdp=True)
+            self._freeze_model_module()
+            self._build_model_assets()
+            self.base._build_data_transform()
+            self.base._build_dataset()
+            self._build_collate_fn()
+            self.base._build_dataloader()
+            self._build_optimizer()
+            self._build_lr_scheduler()
+            self.base._build_training_context()
+            self._init_callbacks()
+        elif runtime == "infer":
+            use_fsdp = bool(args.model.infer_use_fsdp)
+            if use_fsdp:
+                self.base._setup()
+            self._build_model(use_fsdp=use_fsdp)
+            self._freeze_model_module()
+            self._build_model_assets()
+            self.base.model.eval()
+        else:
+            raise ValueError(f"Unknown OmniTrainer runtime {runtime!r}; expected 'train' or 'infer'.")
 
     # ── Build: per-module trainers + compose ───────────────────────────────────
 
@@ -649,46 +653,76 @@ class OmniTrainer:
         a.model.model_config = dict(mod_cfg.get("model_config") or {})
         return a
 
-    def _build_model(self):
-        """Build one :class:`OmniModuleTrainer` per module and compose ``OmniModel``.
+    def _build_model(self, *, use_fsdp: bool = True):
+        """Build one :class:`OmniModuleTrainer` per module (FSDP) or eager load (infer).
 
-        Each module-trainer meta-inits its sub-model (via the shared,
-        OMNI-registry-aware loader — ``model_type`` auto-detected from
-        ``config.json``), wires the global tokenizer + image processor, and
-        FSDP2-wraps + loads its weights.  We then compose the (wrapped)
-        sub-models into one ``OmniModel`` on ``base.model``.
+        Training always uses ``use_fsdp=True``.  Inference defaults to eager
+        ``from_pretrained``; set ``model.infer_use_fsdp=True`` to reuse the
+        training FSDP2 build path.
         """
         base = self.base
         args: VeOmniOmniArguments = base.args
-        self.omni_config: "OmniConfig" = args.model.load_omni_config()
-        self.module_names: List[str] = list(self.omni_config.module_names)
+        self.omni_config = args.model.load_omni_config(
+            infer_type=args.model.omni_infer_type if self.runtime == "infer" else None
+        )
+        self.module_names = list(self.omni_config.module_names)
         self.module_trainers: Dict[str, OmniModuleTrainer] = {}
 
-        # Global tokenizer (wired into every module-trainer that wants it).
-        tokenizer_path = self.omni_config.tokenizer_path or args.model.tokenizer_path
-        base.tokenizer = build_tokenizer(tokenizer_path)
-
-        modules: Dict[str, torch.nn.Module] = {}
-        for name in self.module_names:
-            mod_cfg = self.omni_config.module_config(name)  # deep-copied
-            weights_path = mod_cfg.get("weights_path")
-            if weights_path is None:
-                raise ValueError(f"OmniTrainer: module '{name}' has no `weights_path` in the training YAML.")
-
-            module_trainer = OmniModuleTrainer(
-                self._module_args(weights_path, mod_cfg),
-                conversation_tokenizer=base.tokenizer,
-                subfolder_name=name,  # YAML key → ``<module>/`` checkpoint subdir
-            )
-            self.module_trainers[name] = module_trainer
-            modules[name] = module_trainer.base.model
-            logger.info_rank0(f"OmniTrainer: built module-trainer '{name}' from {weights_path}")
+        if use_fsdp:
+            modules = self._build_fsdp_modules()
+        else:
+            modules = self._build_eager_modules()
 
         base.model = OmniModel(self.omni_config, modules)
         base.model_config = self.omni_config
         logger.info_rank0(
             f"OmniTrainer: composed OmniModel with {len(self.module_names)} modules ({self.module_names})."
         )
+
+    def _build_fsdp_modules(self) -> Dict[str, torch.nn.Module]:
+        modules: Dict[str, torch.nn.Module] = {}
+        for name in self.module_names:
+            mod_cfg = self.omni_config.module_config(name)
+            weights_path = mod_cfg.get("weights_path")
+            if weights_path is None:
+                raise ValueError(f"OmniTrainer: module '{name}' has no `weights_path` in the training YAML.")
+
+            module_trainer = OmniModuleTrainer(
+                self._module_args(weights_path, mod_cfg),
+                subfolder_name=name,
+            )
+            self.module_trainers[name] = module_trainer
+            modules[name] = module_trainer.base.model
+            logger.info_rank0(f"OmniTrainer: built module-trainer '{name}' from {weights_path}")
+        return modules
+
+    def _build_eager_modules(self) -> Dict[str, torch.nn.Module]:
+        from ..models.seed_omni import OMNI_MODEL_REGISTRY, read_model_type
+
+        modules: Dict[str, torch.nn.Module] = {}
+        for name in self.module_names:
+            mod_cfg = self.omni_config.module_config(name)
+            weights_path = mod_cfg.pop("weights_path", None)
+            if not weights_path:
+                raise ValueError(f"Module '{name}' is missing `weights_path` in OmniConfig.modules.")
+            overrides = dict(mod_cfg.get("model_config") or {})
+            model_type = read_model_type(weights_path)
+            cls = OMNI_MODEL_REGISTRY[model_type]()
+            logger.info_rank0(
+                f"OmniTrainer: eager-build module '{name}' (model_type={model_type}, cls={cls.__name__}) from {weights_path}"
+            )
+            module = cls.from_pretrained(
+                weights_path,
+                torch_dtype=torch.bfloat16,
+                device_map="auto",
+                **overrides,
+            ).eval()
+            try:
+                module.tokenizer = build_tokenizer(weights_path)
+            except Exception:
+                pass
+            modules[name] = module
+        return modules
 
     # ── Freeze (aggregate report) ───────────────────────────────────────────────
 
@@ -706,11 +740,9 @@ class OmniTrainer:
     # ── Build: assets ───────────────────────────────────────────────────────────
 
     def _build_model_assets(self):
-        # Nothing to build here — the global conversation tokenizer wiring
-        # (set_conversation_tokenizer) and per-module own-asset loading already
-        # happened in :meth:`_build_model`.  Just expose the global assets that
-        # BaseTrainer callbacks read.
-        self.base.model_assets = [self.omni_config, self.base.tokenizer]
+        # Per-module assets (processor / tokenizer) are loaded in each
+        # :class:`OmniModuleTrainer`; the orchestrator only snapshots OmniConfig.
+        self.base.model_assets = [self.omni_config]
 
     # ── Build: collator ─────────────────────────────────────────────────────────
 

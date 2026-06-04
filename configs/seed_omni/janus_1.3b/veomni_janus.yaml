@@ -16,8 +16,8 @@
 #   2. Set ``model.model_path`` below to that split output directory.
 #      Relative ``modules.*.weights_path`` entries in ``train.yaml`` (e.g.
 #      ``janus_siglip``) resolve to ``<model_path>/janus_siglip`` at runtime.
-#      Absolute ``weights_path`` values are used as-is.  The global tokenizer
-#      is loaded from ``model_path`` (``tokenizer.json`` lives at the root).
+#      Absolute ``weights_path`` values are used as-is.  The LLM tokenizer
+#      lives under ``<model_path>/janus_text_encoder/``.
 
 model:
   model_path: /mnt/hdfs/user_dir/veomni_omni/models/seed_omni/Janus-1.3B

@@ -27,8 +27,8 @@ class JanusTextEncoderConfig(TextEncoderConfig):
     """TextEncoder config + Janus image-boundary token ids.
 
     ``begin_of_image_token_id`` / ``end_of_image_token_id`` are **not**
-    constructor parameters — they are resolved at runtime when the global
-    conversation tokenizer is wired in (``set_conversation_tokenizer``).
+    constructor parameters — they are resolved at runtime from the module's
+    own tokenizer asset (``tokenizer.json`` in the checkpoint folder).
     """
 
     model_type = "janus_text_encoder"

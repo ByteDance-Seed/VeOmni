@@ -81,6 +81,7 @@ spans (e.g. Janus T2I's 576-step ``image_vq`` loop).  Rank-0 gating is
 handled by the logger.
 """
 
+import os
 from typing import Any, Dict, Iterator, List, Mapping, Optional, Tuple
 
 import torch
@@ -88,6 +89,7 @@ import torch.nn as nn
 
 from ...utils import helper
 from .configuration_seed_omni import OmniConfig
+from .conversation import summarize_conversation_batch
 from .generation_graph import FSM_SIGNAL_KEY, GenerationGraph
 from .module import OmniModule
 from .training_graph import TrainingGraph
@@ -96,7 +98,7 @@ from .training_graph import TrainingGraph
 logger = helper.create_logger(__name__)
 
 
-_LOSS_KEY: str = "_loss"
+_LOSS_KEY = "_loss"
 
 
 class OmniModel(nn.Module):
@@ -261,7 +263,15 @@ class OmniModel(nn.Module):
             raw_module = _unwrap_module(module)
 
             kwargs = self.training_graph.collect_inputs(node_name, node_outputs, batch)
-            kwargs = raw_module.pre_forward(**kwargs) if isinstance(raw_module, OmniModule) else kwargs
+            if os.environ.get("VEOMNI_DEBUG_CONV") == "1":
+                extra = sorted(k for k in kwargs if k != "conversation_list")
+                convo = kwargs.get("conversation_list")
+                helper.logger.info_rank0(
+                    f"[conv-debug] BEFORE {node_name} ({module_name}.{method})\n"
+                    f"  kwargs keys (excl. conversation_list): {extra}\n"
+                    f"{summarize_conversation_batch(convo)}"
+                )
+            kwargs = raw_module.pre_forward(method=method, **kwargs) if isinstance(raw_module, OmniModule) else kwargs
 
             if method == "forward":
                 # Through the FSDP wrapper so unshard + backward hooks fire.
@@ -289,24 +299,20 @@ class OmniModel(nn.Module):
                     raw_module.forward = orig_forward
 
             if isinstance(raw_module, OmniModule):
-                out = raw_module.post_forward(out)
+                out = raw_module.post_forward(method=method, **out)
 
-            if not isinstance(out, dict):
-                raise TypeError(
-                    f"Node '{node_name}' ({module_name}.{method}) returned {type(out).__name__}; expected dict."
-                )
             node_outputs[node_name] = out
 
             # V2 segment-driven carrier: the single ``conversation_list`` object
             # is mutated/replaced in place as it flows
-            # ``siglip → vae → text_encoder → backbone → decoders``.  Write it
+            # through the training graph. Write it
             # back into the shared batch so downstream nodes read the evolving
             # carrier directly — edges are pure ``{from, to}`` topology.
             convo = out.get("conversation_list")
             if convo is not None:
                 batch["conversation_list"] = convo
 
-            if _LOSS_KEY in out and out[_LOSS_KEY] is not None:
+            if _LOSS_KEY in out:
                 losses[node_name] = out[_LOSS_KEY]
 
             if trace is not None:
@@ -496,9 +502,8 @@ class OmniModel(nn.Module):
     def collect_assets(self) -> List[Any]:
         """Collect per-module assets (vision/audio processors, codebooks).
 
-        The global tokenizer (``OmniConfig.tokenizer_path``) is *not*
-        returned here — it is loaded by ``OmniTrainer`` and saved at the
-        checkpoint root, separate from per-module subfolders.
+        Tokenizers (e.g. ``janus_text_encoder``) are module-owned assets assigned
+        on ``_tokenizer`` by :class:`~veomni.trainer.omni_trainer.OmniModuleTrainer`.
         """
         assets: List[Any] = []
         for _, raw in self.named_omni_modules():

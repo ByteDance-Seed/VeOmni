@@ -6,7 +6,7 @@ Two-phase entry point (``__main__``)
 1. ``convert_janus_weight_to_hf.convert_model`` — rewrites the upstream
    Janus checkpoint into a HuggingFace-layout directory (``<model_path>-hf``).
 2. ``split_janus`` — loads that HF checkpoint and writes the four module
-   subfolders plus the global tokenizer.
+   subfolders (tokenizer under ``janus_text_encoder/``).
 
 Usage
 -----
@@ -31,16 +31,16 @@ Output structure (matches ``design.md`` §11)
     janus_text_encoder/
       config.json                     # JanusTextEncoderConfig (model_type=janus_text_encoder)
       model.safetensors               # embed_tokens.* (+ lm_head.* if untied)
-    tokenizer.json                    # global tokenizer (written to output_dir root;
-    tokenizer_config.json             #   referenced by OmniConfig ``tokenizer_path``)
-    special_tokens_map.json
+      tokenizer.json                  # Janus LLM tokenizer (module-owned asset)
+      tokenizer_config.json
+      special_tokens_map.json
     ...
 
 The OmniConfig YAML side then reads each module from
 ``<output_dir>/<module_name>``; ``OMNI_CONFIG_REGISTRY`` / ``OMNI_MODEL_REGISTRY``
 resolve ``model_type`` from each ``config.json`` to the mixin class.
-``tokenizer_path`` in the YAML points at ``<output_dir>`` (the directory that
-holds ``tokenizer.json``), not a module subfolder.
+The LLM tokenizer lives under ``janus_text_encoder/`` (same pattern as
+SigLIP's ``preprocessor_config.json``).
 
 Weight extraction
 -----------------
@@ -67,9 +67,9 @@ subclass of :class:`TextEncoder` that adds ``emit_image_start`` /
 ``emit_image_end`` call-site methods.
 
 Special-token ids (boi / eoi / image placeholder) are **not** written into
-any module ``config.json``.  At runtime the trainer wires the global
-tokenizer into each module (``set_tokenizer``); the module resolves the
-ids from the tokenizer during ``post_init``.
+any module ``config.json``.  ``janus_text_encoder`` loads the tokenizer from
+its checkpoint folder; ``janus_llama`` stores ``image_token_id`` /
+``gen_image_token_id`` in ``config.json`` at split time.
 """
 
 import argparse
@@ -199,14 +199,20 @@ def split_janus(model_path: str, output_dir: str) -> None:
 
     te_dir = os.path.join(output_dir, "janus_text_encoder")
     te.save_pretrained(te_dir, safe_serialization=True)
+    tokenizer = AutoTokenizer.from_pretrained(model_path)
+    tokenizer.save_pretrained(te_dir)
     print(f"  saved → {te_dir} (tie_word_embeddings={text_cfg.tie_word_embeddings})")
 
     # ── 4. janus_llama (LlamaModel backbone, no embed_tokens / no lm_head) ─
     # text_config is copied verbatim from the monolithic Janus config.
-    # image_token_id / gen_image_token_id are not stored here — JanusLlama
-    # resolves them from the global tokenizer at runtime (same as boi/eoi).
+    # image_token_id / gen_image_token_id are baked in at split time for scatter.
     print("Extracting janus_llama ...")
-    llama_cfg = JanusLlamaConfig(text_config=text_cfg_dict)
+    gen_image_token_id = int(tokenizer.convert_tokens_to_ids("<image_0>"))
+    llama_cfg = JanusLlamaConfig(
+        text_config=text_cfg_dict,
+        image_token_id=int(tokenizer.image_token_id),
+        gen_image_token_id=gen_image_token_id,
+    )
     with no_init_weights(), init_empty_weights():
         llama = JanusLlama._from_config(llama_cfg)
     src = inner.language_model.state_dict()
@@ -216,15 +222,6 @@ def split_janus(model_path: str, output_dir: str) -> None:
     llama_dir = os.path.join(output_dir, "janus_llama")
     llama.save_pretrained(llama_dir, safe_serialization=True)
     print(f"  saved → {llama_dir} (no embed_tokens / no lm_head)")
-
-    # ── 5. global tokenizer ─────────────────────────────────────────────────
-    # One tokenizer per Omni model.  Written to output_dir root (tokenizer.json,
-    # tokenizer_config.json, …) so OmniConfig.tokenizer_path can point at the
-    # split output directory directly.
-    print(f"Copying global tokenizer to {output_dir} ...")
-    tokenizer = AutoTokenizer.from_pretrained(model_path)
-    tokenizer.save_pretrained(output_dir)
-    print(f"  tokenizer → {output_dir}")
 
     print(f"\nDone.  Split checkpoint saved to: {output_dir}")
     print("configs/seed_omni/janus_1.3b/veomni_janus.yaml should reference:")
@@ -236,12 +233,13 @@ def split_janus(model_path: str, output_dir: str) -> None:
 
 
 if __name__ == "__main__":
-    # Phase 1: upstream Janus → HF layout; phase 2: HF → four V2 sub-checkpoints.
+    # Phase 1 (optional): upstream Janus → HF layout when ``model_path`` lacks a ``-hf`` suffix.
+    # Phase 2: HF → four V2 sub-checkpoints.
     parser = argparse.ArgumentParser(description="Split Janus-1.3B into SeedOmni V2 sub-checkpoints")
     parser.add_argument(
         "--model_path",
         default="transformers/Janus-1.3B",
-        help="Path to the original Janus checkpoint directory",
+        help="Upstream Janus dir, or an existing ``*-hf`` HuggingFace layout (skips convert)",
     )
     parser.add_argument(
         "--output_dir",
@@ -250,9 +248,12 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
     origin_model_path = args.model_path
-    hf_model_path = args.model_path + "-hf"
-    convert_model(
-        local_dir=origin_model_path,
-        output_dir=hf_model_path,
-    )
+    if not origin_model_path.endswith("-hf"):
+        hf_model_path = args.model_path + "-hf"
+        convert_model(
+            local_dir=origin_model_path,
+            output_dir=hf_model_path,
+        )
+    else:
+        hf_model_path = origin_model_path
     split_janus(hf_model_path, args.output_dir)

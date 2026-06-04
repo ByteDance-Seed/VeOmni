@@ -23,8 +23,8 @@ Two layers:
    ``MakeMicroBatchCollator(internal=SeedOmniCollator())`` →
    ``torch.utils.data.DataLoader`` and verifies the resulting micro-batch
    shape matches the V2 contract: heterogeneous image tensors stay as a
-   list (no torch.stack), ``conversation_list`` is ``list[list[dict]]``,
-   and all per-item dicts carry exactly ``{type, value, role, loss_mask}``.
+   list (no torch.stack), ``conversation_list`` is ``list[list[ConversationItem]]``,
+   and all items are :class:`ConversationItem` with ``role`` at the data boundary.
 
 This avoids spinning up the full ``OmniTrainer`` (which would try to
 load real Janus weights from HDFS) — instead we exercise the data layer
@@ -42,18 +42,16 @@ from torch.utils.data import DataLoader
 from veomni.data.data_collator import MakeMicroBatchCollator, SeedOmniCollator
 from veomni.data.dataset import MappingDataset
 from veomni.data.multimodal.seedomni_transform import process_seedomni_example
+from veomni.models.seed_omni.conversation import ConversationItem, item_role
 
 
 # ─────────────────────────── unit: SeedOmniCollator ───────────────────────────
 
 
 def _make_sample(text="hi", role="user"):
-    """Return a sample shaped like ``process_seedomni_example`` would emit
-    (modulo the outer 1-element list wrapping that ``MappingDataset``
-    keeps and ``MakeMicroBatchCollator`` later strips)."""
     return {
         "conversation_list": [
-            {"type": "text", "value": text, "role": role, "loss_mask": int(role == "assistant")},
+            ConversationItem(type="text", value=text, role=role),
         ],
     }
 
@@ -66,11 +64,12 @@ def test_collator_happy_path_two_samples():
     assert isinstance(out["conversation_list"], list)
     assert len(out["conversation_list"]) == 2  # batch size
 
-    # Each entry is the per-sample list of items
-    assert out["conversation_list"][0][0]["value"] == "a"
-    assert out["conversation_list"][0][0]["role"] == "user"
-    assert out["conversation_list"][1][0]["value"] == "b"
-    assert out["conversation_list"][1][0]["role"] == "assistant"
+    # Each entry is the per-sample list of ConversationItem
+    assert isinstance(out["conversation_list"][0][0], ConversationItem)
+    assert out["conversation_list"][0][0].value == "a"
+    assert item_role(out["conversation_list"][0][0]) == "user"
+    assert out["conversation_list"][1][0].value == "b"
+    assert item_role(out["conversation_list"][1][0]) == "assistant"
 
 
 def test_collator_passes_through_extra_keys():
@@ -120,20 +119,20 @@ def test_collator_does_not_stack_image_tensors():
     samples = [
         {
             "conversation_list": [
-                {"type": "image", "value": img_small, "role": "user", "loss_mask": 0},
+                ConversationItem(type="image", value=img_small, role="user"),
             ]
         },
         {
             "conversation_list": [
-                {"type": "image", "value": img_big, "role": "user", "loss_mask": 0},
+                ConversationItem(type="image", value=img_big, role="user"),
             ]
         },
     ]
     out = SeedOmniCollator()(samples)
 
     # Items should keep their original shapes.
-    assert out["conversation_list"][0][0]["value"].shape == (3, 8, 8)
-    assert out["conversation_list"][1][0]["value"].shape == (3, 16, 16)
+    assert out["conversation_list"][0][0].value.shape == (3, 8, 8)
+    assert out["conversation_list"][1][0].value.shape == (3, 16, 16)
 
 
 # ─────────────────────────── integration: dataset → transform → collator ───────────────────────────
@@ -211,20 +210,20 @@ def test_pipeline_dataset_to_micro_batch(tmp_path):
 
     # Sample 0: should contain an image item (uint8 (C, H, W)) plus text turns.
     sample0_items = mb0["conversation_list"][0]
-    types = [it["type"] for it in sample0_items]
+    types = [it.type for it in sample0_items]
     assert "image" in types
 
-    img_item = next(it for it in sample0_items if it["type"] == "image")
-    assert isinstance(img_item["value"], torch.Tensor)
-    assert img_item["value"].dtype == torch.uint8
-    assert img_item["value"].shape[0] == 3  # channels
+    img_item = next(it for it in sample0_items if it.type == "image")
+    assert isinstance(img_item.value, torch.Tensor)
+    assert img_item.value.dtype == torch.uint8
+    assert img_item.value.shape[0] == 3  # channels
 
-    # Schema check: every item across both micro-batches carries exactly
-    # the four V2 fields and nothing else.
+    # Schema check: every item across both micro-batches is a ConversationItem with role.
     for mb in micro_batches:
         for sample_items in mb["conversation_list"]:
             for it in sample_items:
-                assert set(it.keys()) == {"type", "value", "role", "loss_mask"}, it.keys()
+                assert isinstance(it, ConversationItem)
+                assert it.type and it.role in ("system", "user", "assistant")
 
 
 # ─────────────────────────── OmniTrainer._build_collate_fn ───────────────────────────

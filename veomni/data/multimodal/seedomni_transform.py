@@ -15,15 +15,12 @@
 """SeedOmni V2 multimodal data transform — Feature D1.
 
 Reads a raw jsonl-style sample (already source-tagged conversations + media
-paths/bytes) and returns ``[{"conversation_list": [...]}]`` where each item
-in ``conversation_list`` is the V2 unified per-turn dict::
+paths/bytes) and returns ``[{"conversation_list": [...]}]`` where each
+item is a :class:`~veomni.models.seed_omni.conversation.ConversationItem`
+with ``type`` / ``value`` / ``role`` (empty ``meta`` at the data boundary).
 
-    {
-        "type":      "text" | "image" | "vq_image",
-        "value":     str | torch.Tensor (C, H, W) uint8,
-        "role":      "system" | "user" | "assistant",
-        "loss_mask": 0 | 1,
-    }
+Understanding vs generation images both use ``type="image"``; ``role`` distinguishes
+them (``user`` = SigLIP input, ``assistant`` = VQVAE target).
 
 This transform is intentionally minimal — it does **only**:
 
@@ -37,8 +34,7 @@ This transform is intentionally minimal — it does **only**:
    processor-specific feature dict — those steps are owned by the vision
    encoder module (e.g. ``JanusSiglip`` / ``JanusVqvae``) at forward time.
 3. Conversation list assembly — pair each ``("image", None)`` tuple with the
-   next image tensor in source order, attach ``role`` and a default
-   ``loss_mask = int(role == "assistant")`` per item.
+   next image tensor in source order and attach ``role`` per item.
 
 Anything else (chat-template formatting, tokenization, boundary marker
 emission, ``input_ids`` / ``labels`` / ``attention_mask`` construction,
@@ -69,14 +65,15 @@ import numpy as np
 import torch
 from PIL import Image
 
+from ...models.seed_omni.conversation import ConversationItem
 from ..data_transform import DATA_TRANSFORM_REGISTRY
 from .image_utils import fetch_images
 from .preprocess import conv_preprocess
 
 
 # Tuple-form turn entry used by ``conv_preprocess``: ``(type, value)``.
-# For ``type in {"image", "vq_image"}`` the inline ``value`` is always ``None``
-# — the actual tensor is pulled from the per-sample image list in source order.
+# For ``type == "image"`` the inline ``value`` is always ``None`` — the actual
+# tensor is pulled from the per-sample image list in source order.
 _TupleTurn = List  # ``[role: str, (type, value), ...]``
 
 
@@ -101,10 +98,10 @@ def _pil_to_uint8_tensor(image: Image.Image) -> torch.Tensor:
 def _build_conversation_list(
     constructed: list[_TupleTurn],
     image_tensors: list[torch.Tensor],
-) -> list[dict[str, Any]]:
-    """Flatten ``[[role, (type, value), ...], ...]`` into a list of
-    per-item dicts and pair image-typed turns with ``image_tensors`` in
-    source order.
+) -> list[ConversationItem]:
+    """Flatten ``[[role, (type, value), ...], ...]`` into
+    :class:`ConversationItem` rows and pair image turns with
+    ``image_tensors`` in source order.
 
     Raises:
         ValueError: if the number of ``("image", _)`` turns doesn't match
@@ -114,7 +111,7 @@ def _build_conversation_list(
     """
     image_iter = iter(image_tensors)
     image_consumed = 0
-    out: list[dict[str, Any]] = []
+    out: list[ConversationItem] = []
     for turn in constructed:
         if not turn:
             continue
@@ -125,12 +122,12 @@ def _build_conversation_list(
             if not (isinstance(entry, (tuple, list)) and len(entry) == 2):
                 raise TypeError(f"turn entry must be a (type, value) pair, got {entry!r}")
             type_, value = entry
-            if type_ in ("image", "vq_image"):
+            if type_ == "image":
                 try:
                     value = next(image_iter)
                 except StopIteration as e:
                     raise ValueError(
-                        f"conversation has more {type_!r} turns than supplied images "
+                        f"conversation has more image turns than supplied images "
                         f"({image_consumed} consumed before this one)"
                     ) from e
                 image_consumed += 1
@@ -146,14 +143,7 @@ def _build_conversation_list(
                     f"transform; extend ``seedomni_transform.py`` and ensure a matching "
                     f"encoder module exists."
                 )
-            out.append(
-                {
-                    "type": type_,
-                    "value": value,
-                    "role": role,
-                    "loss_mask": int(role == "assistant"),
-                }
-            )
+            out.append(ConversationItem(type=type_, value=value, role=role))
     # Validate that we consumed exactly the supplied images — leftover
     # images mean the dataset has unreferenced media which is almost
     # always a bug in upstream data prep.
@@ -167,19 +157,18 @@ def _build_conversation_list(
 
 
 def _modalities_in(constructed: list[_TupleTurn]) -> tuple[bool, bool]:
-    """Quick scan: does this sample reference any image / vq_image turns?
+    """Quick scan: does this sample reference any image turns?
 
     Returns ``(has_image, has_video)`` — kept simple, used only to skip
     media IO when the modality is absent.  ``has_video`` is a stub for
-    when video support lands; today the function never returns True for
-    it.
+    when video support lands; today the function never returns True for it.
     """
     has_image = False
     for turn in constructed:
         for entry in turn[1:]:
             if not (isinstance(entry, (tuple, list)) and len(entry) == 2):
                 continue
-            if entry[0] in ("image", "vq_image"):
+            if entry[0] == "image":
                 has_image = True
                 break
     return has_image, False

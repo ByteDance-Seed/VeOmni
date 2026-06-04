@@ -44,13 +44,11 @@ Connection outputs
 ``encode``:
   ``inputs_embeds``    Float tensor ``(B, T, hidden_size)``.
 
-  ``decode``:
-  ``logits``           Float tensor ``(B, T, vocab_size)``.
-  ``_loss``            Scalar token-mean CE loss (training, when
-                       ``labels`` is given).
-  ``input_ids``        Long tensor ``(B, 1)`` — sampled next token for the
-                       next FSM step (HF ``generate``-aligned; same field
-                       name as encode input).
+``decode``:
+  :class:`~veomni.utils.model_outputs.CausalLMOutputWithLogProbs` with
+  ``logits`` and optional ``loss`` (training).  Inference sampling lives in
+  ``generate`` / ``ar_step``, not here.  :meth:`post_forward` maps ``loss`` →
+  ``_loss`` for the OmniModel graph.
 """
 
 from typing import Any, Dict, Optional
@@ -161,57 +159,55 @@ class TextEncoder(OmniModule, PreTrainedModel):
         self,
         hidden_states: Optional[torch.Tensor] = None,
         labels: Optional[torch.LongTensor] = None,
-        temperature: float = 1.0,
-        top_p: float = 1.0,
+        shift_labels: Optional[torch.LongTensor] = None,
         **_,
-    ) -> Dict[str, Any]:
-        """Unified LM-head projection — training (loss) + inference (sample).
+    ) -> dict:
+        """LM-head projection — training CE only.
 
-        * **Training** (``hidden_states`` + ``labels``):
-            project to vocab logits, compute next-token-shifted CE.
-            Returns ``{"logits", "_loss"}`` (token-mean over non-ignored
-            positions).
-        * **Inference** (``hidden_states`` only):
-            project the last position to logits, sample (temperature /
-            top-p) and return the next token.  Returns
-            ``{"logits", "input_ids"}`` where ``input_ids`` is ``(B, 1)``.
+        Projects ``hidden_states`` to vocab logits.  When ``shift_labels`` or
+        ``labels`` is given, returns token-mean CE in ``loss``.  Inference
+        sampling is handled by ``generate`` / ``ar_step`` on model-specific
+        subclasses, not here.
         """
-        if hidden_states is None:
-            return {}
-
         logits = self._project(hidden_states)
-        out: Dict[str, Any] = {"logits": logits}
+        loss: torch.Tensor | None = None
 
-        if labels is not None:
-            shift_logits = logits[..., :-1, :].contiguous()
-            shift_labels = labels[..., 1:].contiguous()
-            # Token-summed CE / valid-token count (invariant 9).  Using
-            # ``reduction="sum"`` + an explicit denominator avoids the NaN that
-            # ``reduction="mean"`` returns when a micro-batch has zero
-            # supervised text tokens (e.g. a pure image-generation micro-batch
-            # whose only assistant turn is a VQ image).  The ``clamp(min=1)``
-            # makes that degenerate case a hard 0 instead of 0/0; the loss
-            # still flows through ``logits`` so every DP rank's FSDP graph
-            # stays aligned.
+        if shift_labels is not None:
             ce_sum = F.cross_entropy(
-                shift_logits.view(-1, shift_logits.size(-1)),
+                logits.view(-1, logits.size(-1)),
                 shift_labels.view(-1),
                 ignore_index=-100,
                 reduction="sum",
             )
-            n_valid = (shift_labels != -100).sum().clamp(min=1)
-            out["_loss"] = ce_sum / n_valid
-        else:
-            next_token_logits = logits[:, -1, :]
-            if temperature != 1.0:
-                next_token_logits = next_token_logits / temperature
-            if top_p < 1.0:
-                next_token_logits = self._top_p_filter(next_token_logits, top_p)
-            probs = torch.softmax(next_token_logits, dim=-1)
-            next_token = torch.multinomial(probs, num_samples=1)
-            out["input_ids"] = next_token
+            n_valid = (shift_labels.view(-1) != -100).sum().clamp(min=1)
+            loss = ce_sum / n_valid
+        elif labels is not None:
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_targets = labels[..., 1:].contiguous()
+            ce_sum = F.cross_entropy(
+                shift_logits.view(-1, shift_logits.size(-1)),
+                shift_targets.view(-1),
+                ignore_index=-100,
+                reduction="sum",
+            )
+            n_valid = (shift_targets != -100).sum().clamp(min=1)
+            loss = ce_sum / n_valid
 
-        return out
+        return {
+            "loss": loss,
+            "logits": logits,
+        }
+
+    def post_forward(self, method: str, **outputs: Any) -> Dict[str, Any]:
+        """Map :meth:`decode` ``loss`` → ``_loss`` for the Omni graph protocol."""
+        if method == "decode":
+            outputs.pop("logits", None)
+            loss = outputs.pop("loss", None)
+            if loss is not None:
+                outputs["_loss"] = loss
+            return outputs
+        else:
+            raise ValueError(f"TextEncoder.post_forward: unexpected method {method}")
 
     # ── Internal helpers ─────────────────────────────────────────────────────
 

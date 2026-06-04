@@ -28,6 +28,7 @@ from veomni.models.seed_omni import (
     OmniModule,
     OmniModuleCheckpointCallback,
 )
+from veomni.models.seed_omni.conversation import ConversationItem, get_token_id
 from veomni.models.seed_omni.generation_graph import FSM_SIGNAL_KEY
 from veomni.models.seed_omni.modules import OMNI_CONFIG_REGISTRY
 from veomni.models.seed_omni.modules.janus.text_encoder.modeling import (
@@ -191,10 +192,14 @@ def test_janus_text_encoder_emit_methods_return_expected_shapes():
     jte = JanusTextEncoder(cfg)
 
     class _MockTokenizer:
-        def convert_tokens_to_ids(self, token: str) -> int:
-            return {"<begin_of_image>": 42, "<end_of_image>": 43}[token]
+        bos_token_id = 0
+        eos_token_id = 1
+        pad_token_id = 3
+        boi_token_id = 42
+        eoi_token_id = 43
+        image_token_id = 99
 
-    jte.set_conversation_tokenizer(_MockTokenizer())
+    jte.tokenizer = _MockTokenizer()
 
     # No batch_size hint in ctx → defaults to 1.
     out = jte.emit_image_start()
@@ -209,8 +214,8 @@ def test_janus_text_encoder_emit_methods_return_expected_shapes():
     assert out["inputs_embeds"].shape == (3, 1, 16)
 
 
-def test_janus_text_encoder_decode_emits_module_signals():
-    """``decode`` writes ``ctx[module_signal]`` string for boi / eos."""
+def test_janus_text_encoder_ar_step_emits_module_signals():
+    """``ar_step`` writes ``ctx[module_signal]`` string for boi / eos."""
     JanusTextEncoder = _model_cls("janus_text_encoder")
     JanusTextEncoderConfig = _config_cls("janus_text_encoder")
 
@@ -218,25 +223,29 @@ def test_janus_text_encoder_decode_emits_module_signals():
     jte = JanusTextEncoder(cfg)
 
     class _MockTokenizer:
+        bos_token_id = 0
         eos_token_id = 2
+        pad_token_id = 3
+        boi_token_id = 42
+        eoi_token_id = 43
+        image_token_id = 99
 
-        def convert_tokens_to_ids(self, token: str) -> int:
-            return {"<begin_of_image>": 42, "<end_of_image>": 43}[token]
-
-    jte.set_conversation_tokenizer(_MockTokenizer())
+    jte.tokenizer = _MockTokenizer()
 
     h = torch.ones(1, 1, 16)
     jte.lm_head.weight.data.zero_()
 
     jte.lm_head.weight.data[42] = 1.0
-    out = jte.decode(hidden_states=h)
-    assert out["input_ids"].item() == 42
+    conv = [ConversationItem(type="output", value=h.clone(), role="assistant", meta={"phase": "text"})]
+    out = jte.ar_step(hidden_states=h, conversation_list=conv)
+    assert get_token_id(conv[-1]) == 42
     assert out[FSM_SIGNAL_KEY] == SIGNAL_START_IMAGE_GEN
 
     jte.lm_head.weight.data.zero_()
     jte.lm_head.weight.data[2] = 1.0
-    out = jte.decode(hidden_states=h)
-    assert out["input_ids"].item() == 2
+    conv = [ConversationItem(type="output", value=h.clone(), role="assistant", meta={"phase": "text"})]
+    out = jte.ar_step(hidden_states=h, conversation_list=conv)
+    assert get_token_id(conv[-1]) == 2
     assert out[FSM_SIGNAL_KEY] == SIGNAL_TEXT_DONE
 
 
@@ -244,16 +253,17 @@ def test_janus_text_encoder_decode_emits_module_signals():
 
 
 def test_text_encoder_decode_returns_single_loss_key():
-    """V2 single-loss protocol: only the ``_loss`` key is allowed."""
+    """V2 single-loss protocol: ``post_forward`` maps ``loss`` → ``_loss``."""
     TextEncoder = _model_cls("text_encoder")
     TextEncoderConfig = _config_cls("text_encoder")
     te = TextEncoder(TextEncoderConfig(vocab_size=64, hidden_size=16))
     h = torch.randn(2, 4, 16)
     labels = torch.randint(0, 64, (2, 4))
     out = te.decode(hidden_states=h, labels=labels)
-    assert "_loss" in out and out["_loss"].dim() == 0
-    # The pre-V2 ``lm_loss`` alias must not appear.
-    assert "lm_loss" not in out
+    assert out.loss is not None and out.loss.dim() == 0
+    graph_out = te.post_forward("decode", **out.to_dict())
+    assert "_loss" in graph_out and graph_out["_loss"].dim() == 0
+    assert "lm_loss" not in graph_out
 
 
 def test_text_encoder_encode_uses_last_token_with_kv_cache():
@@ -267,15 +277,15 @@ def test_text_encoder_encode_uses_last_token_with_kv_cache():
     assert torch.equal(out["inputs_embeds"], te.embed_tokens(torch.tensor([[42]])))
 
 
-def test_text_encoder_encode_inference_loop_keys():
-    """Inference path returns the exact keys the FSM body expects."""
+def test_text_encoder_decode_inference_returns_logits_only():
+    """Inference ``decode`` projects logits only; sampling lives in ``ar_step`` / ``generate``."""
     TextEncoder = _model_cls("text_encoder")
     TextEncoderConfig = _config_cls("text_encoder")
     te = TextEncoder(TextEncoderConfig(vocab_size=64, hidden_size=16))
     h = torch.randn(2, 4, 16)
     out = te.decode(hidden_states=h)
-    assert set(out.keys()) >= {"logits", "input_ids"}
-    assert out["input_ids"].shape == (2, 1)
+    assert out.logits is not None and out.logits.shape == (2, 4, 64)
+    assert out.loss is None
 
 
 def test_janus_vqvae_decode_branches():
@@ -415,7 +425,6 @@ def test_janus_train_yaml_loads_with_v2_module_names():
 
     cfg = OmniConfig.from_paths(
         model_path="",
-        tokenizer_path="",
         train_yaml_path=_janus_cfg_dir() / "train.yaml",
     )
 
@@ -440,7 +449,6 @@ def test_janus_train_plus_infer_merges_generation_graph(infer_yaml: str):
 
     cfg = OmniConfig.from_paths(
         model_path="",
-        tokenizer_path="",
         train_yaml_path=_janus_cfg_dir() / "train.yaml",
         infer_yaml_path=_janus_cfg_dir() / infer_yaml,
     )
@@ -477,12 +485,10 @@ def test_from_paths_resolves_relative_module_paths():
     root = "seed_omni/janus_1.3b"
     cfg = OmniConfig.from_paths(
         model_path=root,
-        tokenizer_path=root,
         train_yaml_path=_janus_cfg_dir() / "train.yaml",
         infer_yaml_path=_janus_cfg_dir() / "infer_gen.yaml",
     )
 
-    assert cfg.tokenizer_path == root
     assert cfg.modules["janus_siglip"]["weights_path"] == f"{root}/janus_siglip"
     assert cfg.modules["janus_text_encoder"]["weights_path"] == f"{root}/janus_text_encoder"
     assert cfg.has_generation_graph()

@@ -14,7 +14,8 @@
 
 """Unit tests for SeedOmni V2 ``data_type=seedomni`` transform (Feature D1).
 
-Covers the per-item dict schema (`type` / `value` / `role` / `loss_mask`),
+Covers the :class:`ConversationItem` schema at the data boundary
+(``type`` / ``value`` / ``role``),
 image IO + uint8 tensor shape, ordering between conversation turns and
 the supplied image list, mismatch detection, and unsupported-modality
 errors.  These tests use the existing sharegpt4v preprocessors as a
@@ -38,6 +39,7 @@ from veomni.data.multimodal.seedomni_transform import (
     _pil_to_uint8_tensor,
     process_seedomni_example,
 )
+from veomni.models.seed_omni.conversation import ConversationItem, item_role
 
 
 _TEST_IMAGE = Path(__file__).resolve().parents[1].parent / "testdata" / "qwen-vl-demo.jpeg"
@@ -51,17 +53,11 @@ def _solid_image(color: tuple, size=(64, 48)) -> Image.Image:
     return Image.new("RGB", size, color)
 
 
-def _check_item_schema(item: dict) -> None:
-    """The per-item dict must carry exactly the four V2 fields and nothing else.
-
-    Extra fields would hint at the data layer leaking model-specific info
-    (e.g. token ids, chat-template prefixes) which violates D1's contract.
-    """
-    assert set(item.keys()) == {"type", "value", "role", "loss_mask"}, (
-        f"unexpected keys in conversation_list item: {set(item.keys()) - {'type', 'value', 'role', 'loss_mask'}}"
-    )
-    assert item["role"] in ("system", "user", "assistant"), item["role"]
-    assert item["loss_mask"] in (0, 1), item["loss_mask"]
+def _check_item_schema(item: ConversationItem) -> None:
+    """Data-layer items carry only ``type`` / ``value`` / ``role`` (empty ``meta``)."""
+    assert isinstance(item, ConversationItem)
+    assert item.meta == {}, f"unexpected meta at data boundary: {item.meta}"
+    assert item_role(item) in ("system", "user", "assistant")
 
 
 # ─────────────────────────── _pil_to_uint8_tensor ───────────────────────────
@@ -101,8 +97,8 @@ def test_build_conversation_list_text_only():
     assert len(items) == 2
     for it in items:
         _check_item_schema(it)
-    assert items[0] == {"type": "text", "value": "hello", "role": "user", "loss_mask": 0}
-    assert items[1] == {"type": "text", "value": "hi there", "role": "assistant", "loss_mask": 1}
+    assert items[0].type == "text" and items[0].value == "hello" and item_role(items[0]) == "user"
+    assert items[1].type == "text" and items[1].value == "hi there" and items[1].role == "assistant"
 
 
 def test_build_conversation_list_pairs_images_in_order():
@@ -115,17 +111,17 @@ def test_build_conversation_list_pairs_images_in_order():
     img2 = torch.full((3, 8, 8), 255, dtype=torch.uint8)
     items = _build_conversation_list(constructed, image_tensors=[img1, img2])
 
-    assert [it["type"] for it in items] == ["image", "text", "text", "image"]
-    assert torch.equal(items[0]["value"], img1)
-    assert items[1]["role"] == "user" and items[1]["value"] == "describe"
-    assert items[2]["role"] == "assistant" and items[2]["loss_mask"] == 1
-    assert torch.equal(items[3]["value"], img2)
-    assert items[3]["loss_mask"] == 1  # assistant turn → supervised by default
+    assert [it.type for it in items] == ["image", "text", "text", "image"]
+    assert torch.equal(items[0].value, img1)
+    assert item_role(items[1]) == "user" and items[1].value == "describe"
+    assert items[2].role == "assistant"
+    assert torch.equal(items[3].value, img2)
+    assert items[3].role == "assistant"
 
 
 def test_build_conversation_list_missing_image_raises():
     constructed = [["user", ("image", None), ("image", None)]]
-    with pytest.raises(ValueError, match="more 'image' turns than supplied images"):
+    with pytest.raises(ValueError, match="more image turns than supplied images"):
         _build_conversation_list(constructed, image_tensors=[torch.zeros(3, 4, 4, dtype=torch.uint8)])
 
 
@@ -147,7 +143,7 @@ def test_build_conversation_list_text_value_none_becomes_empty_string():
     coerce that to empty string so the downstream tokenizer doesn't choke
     on a None value."""
     items = _build_conversation_list([["user", ("text", None)]], image_tensors=[])
-    assert items[0]["value"] == ""
+    assert items[0].value == ""
 
 
 # ─────────────────────────── _modalities_in ───────────────────────────
@@ -155,7 +151,6 @@ def test_build_conversation_list_text_value_none_becomes_empty_string():
 
 def test_modalities_in_detects_image():
     assert _modalities_in([["user", ("image", None), ("text", "x")]]) == (True, False)
-    assert _modalities_in([["user", ("vq_image", None)]]) == (True, False)
     assert _modalities_in([["user", ("text", "x")]]) == (False, False)
 
 
@@ -180,16 +175,16 @@ def test_process_seedomni_example_with_real_image():
     assert set(raw_batch_entry.keys()) == {"conversation_list"}
 
     conv_list = raw_batch_entry["conversation_list"]
-    types = [it["type"] for it in conv_list]
-    roles = [it["role"] for it in conv_list]
+    types = [it.type for it in conv_list]
+    roles = [item_role(it) for it in conv_list]
     assert "image" in types, "image turn was lost"
     assert "assistant" in roles
     for it in conv_list:
         _check_item_schema(it)
 
-    img_items = [it for it in conv_list if it["type"] == "image"]
+    img_items = [it for it in conv_list if it.type == "image"]
     assert len(img_items) == 1
-    img_tensor = img_items[0]["value"]
+    img_tensor = img_items[0].value
     assert isinstance(img_tensor, torch.Tensor)
     assert img_tensor.dtype == torch.uint8
     assert img_tensor.dim() == 3 and img_tensor.shape[0] == 3, img_tensor.shape
@@ -209,8 +204,9 @@ def test_process_seedomni_example_text_only():
     conv_list = out[0]["conversation_list"]
 
     assert len(conv_list) == 2
-    assert conv_list[0] == {"type": "text", "value": "What is 2 + 2?", "role": "user", "loss_mask": 0}
-    assert conv_list[1] == {"type": "text", "value": "4", "role": "assistant", "loss_mask": 1}
+    assert conv_list[0].value == "What is 2 + 2?" and item_role(conv_list[0]) == "user"
+    assert conv_list[1].value == "4" and item_role(conv_list[1]) == "assistant"
+    assert conv_list[1].role == "assistant"
 
 
 def test_process_seedomni_example_resize_kwargs_propagate(tmp_path):
@@ -226,7 +222,7 @@ def test_process_seedomni_example_resize_kwargs_propagate(tmp_path):
     }
     # Cap at 64*64 = 4096 pixels — far below 1024*768.
     out = process_seedomni_example(sample, image_max_pixels=64 * 64)
-    img_tensor = out[0]["conversation_list"][0]["value"]
+    img_tensor = out[0]["conversation_list"][0].value
 
     assert img_tensor.shape[1] * img_tensor.shape[2] <= 64 * 64, img_tensor.shape
 
@@ -267,4 +263,4 @@ def test_seedomni_is_registered_and_callable_via_build():
         "conversations": [{"from": "human", "value": "hello"}],
     }
     out = transform(sample)
-    assert out[0]["conversation_list"][0]["value"] == "hello"
+    assert out[0]["conversation_list"][0].value == "hello"

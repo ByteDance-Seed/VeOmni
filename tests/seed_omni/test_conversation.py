@@ -8,11 +8,13 @@ from veomni.models.seed_omni.conversation import (
     ConversationItem,
     append_output_hidden,
     build_conversation,
+    collect_modality_batch,
     collect_prompt_embeds,
     get_ar_tail_embed,
     get_llm_embed,
     get_token_id,
     is_embedded,
+    iter_modality_items,
     iter_type,
     latest_assistant_text_token_ids,
     maybe_merge_outputs,
@@ -25,7 +27,7 @@ from veomni.models.seed_omni.conversation import (
 
 def test_build_conversation_text_only_yields_two_parts():
     parts = build_conversation(prompt="hello")
-    assert [(p.type, p.meta["role"], p.value) for p in parts] == [
+    assert [(p.type, p.role, p.value) for p in parts] == [
         ("text", "user", "hello"),
         ("text", "assistant", ""),
     ]
@@ -34,7 +36,7 @@ def test_build_conversation_text_only_yields_two_parts():
 def test_build_conversation_with_images_places_them_first():
     img_a, img_b = object(), object()
     parts = build_conversation(prompt="describe", images=[img_a, img_b])
-    assert [(p.type, p.meta["role"]) for p in parts] == [
+    assert [(p.type, p.role) for p in parts] == [
         ("image", "user"),
         ("image", "user"),
         ("text", "user"),
@@ -48,7 +50,7 @@ def test_build_conversation_with_images_places_them_first():
 
 def test_build_conversation_assistant_marker_is_empty_text_part():
     parts = build_conversation(prompt="hi")
-    assistant_markers = [p for p in parts if p.meta.get("role") == "assistant"]
+    assistant_markers = [p for p in parts if p.role == "assistant"]
     assert len(assistant_markers) == 1
     marker = assistant_markers[0]
     assert marker.type == "text"
@@ -57,9 +59,9 @@ def test_build_conversation_assistant_marker_is_empty_text_part():
 
 
 def test_conversation_item_defaults():
-    p = ConversationItem(type="text", meta={"role": "user"})
+    p = ConversationItem(type="text", role="user")
     assert p.value is None
-    assert p.meta == {"role": "user"}
+    assert p.meta == {}
 
 
 def test_conversation_item_embedded_token():
@@ -67,7 +69,8 @@ def test_conversation_item_embedded_token():
     p = ConversationItem(
         type="token",
         value=embed,
-        meta={"role": "assistant", "token_id": 42, "source": "tok_decode"},
+        role="assistant",
+        meta={"token_id": 42, "source": "tok_decode"},
     )
     assert p.type == "token"
     assert get_token_id(p) == 42
@@ -76,10 +79,10 @@ def test_conversation_item_embedded_token():
 
 def test_iter_type_filters_by_type_in_order():
     parts = [
-        ConversationItem(type="image", meta={"role": "user"}),
-        ConversationItem(type="text", value="a", meta={"role": "user"}),
-        ConversationItem(type="image", meta={"role": "user"}),
-        ConversationItem(type="text", value="", meta={"role": "assistant"}),
+        ConversationItem(type="image", role="user"),
+        ConversationItem(type="text", value="a", role="user"),
+        ConversationItem(type="image", role="user"),
+        ConversationItem(type="text", value="", role="assistant"),
     ]
     images = list(iter_type(parts, "image"))
     texts = list(iter_type(parts, "text"))
@@ -90,9 +93,9 @@ def test_iter_type_filters_by_type_in_order():
 def test_unembedded_parts_returns_parts_without_embed():
     embed = torch.zeros(1, 1, 4)
     parts = [
-        ConversationItem(type="text", value="a", meta={"role": "user"}),
-        ConversationItem(type="text", value=embed, meta={"role": "user"}),
-        ConversationItem(type="text", value="", meta={"role": "assistant"}),
+        ConversationItem(type="text", value="a", role="user"),
+        ConversationItem(type="text", value=embed, role="user"),
+        ConversationItem(type="text", value="", role="assistant"),
     ]
     remaining = unembedded_parts(parts)
     assert remaining == [parts[0]]
@@ -100,11 +103,11 @@ def test_unembedded_parts_returns_parts_without_embed():
 
 def test_latest_assistant_text_token_ids_filters_role_and_type():
     parts = [
-        ConversationItem(type="text", value="prompt", meta={"role": "user"}),
-        ConversationItem(type="token", value=5, meta={"role": "assistant", "token_id": 5}),
-        ConversationItem(type="token", value=7, meta={"role": "assistant", "token_id": 7}),
-        ConversationItem(type="token", value=99, meta={"role": "assistant", "token_id": 99, "source": "vqvae"}),
-        ConversationItem(type="token", value=1, meta={"role": "system", "token_id": 1}),
+        ConversationItem(type="text", value="prompt", role="user"),
+        ConversationItem(type="token", value=5, role="assistant", meta={"token_id": 5}),
+        ConversationItem(type="token", value=7, role="assistant", meta={"token_id": 7}),
+        ConversationItem(type="token", value=99, role="assistant", meta={"token_id": 99, "source": "vqvae"}),
+        ConversationItem(type="token", value=1, role="system", meta={"token_id": 1}),
     ]
     ids = latest_assistant_text_token_ids(parts)
     assert ids == [5, 7]
@@ -112,8 +115,8 @@ def test_latest_assistant_text_token_ids_filters_role_and_type():
 
 def test_latest_assistant_text_token_ids_empty_when_no_assistant_tokens():
     parts = [
-        ConversationItem(type="text", value="hello", meta={"role": "user"}),
-        ConversationItem(type="text", value="", meta={"role": "assistant"}),
+        ConversationItem(type="text", value="hello", role="user"),
+        ConversationItem(type="text", value="", role="assistant"),
     ]
     assert latest_assistant_text_token_ids(parts) == []
 
@@ -121,14 +124,14 @@ def test_latest_assistant_text_token_ids_empty_when_no_assistant_tokens():
 def test_is_embedded_recognizes_siglip_patch_tensor():
     """``(1, P, D)`` patch embeds must not be mistaken for ``(1, H, W)`` pixels."""
     embed = torch.zeros(1, 576, 2048)
-    item = ConversationItem(type="image", value=embed, meta={"role": "user"})
+    item = ConversationItem(type="image", value=embed, role="user")
     assert is_embedded(item)
     assert get_llm_embed(item).shape == (1, 576, 2048)
 
 
 def test_is_embedded_rejects_chw_pixels():
     pixels = torch.zeros(3, 384, 384)
-    item = ConversationItem(type="image", value=pixels, meta={"role": "user"})
+    item = ConversationItem(type="image", value=pixels, role="user")
     assert not is_embedded(item)
 
 
@@ -147,7 +150,7 @@ def test_output_merge_and_seal():
 def test_collect_prompt_embeds_skips_output():
     embed = torch.zeros(1, 2, 4)
     parts = [
-        ConversationItem(type="text", value=embed, meta={"role": "user"}),
+        ConversationItem(type="text", value=embed, role="user"),
         ConversationItem(type="output", value=torch.ones(1, 1, 4), meta={"phase": "text"}),
     ]
     chunks = collect_prompt_embeds(parts)
@@ -157,7 +160,7 @@ def test_collect_prompt_embeds_skips_output():
 
 def test_get_ar_tail_embed_reads_last_position():
     parts = [
-        ConversationItem(type="soi", value=torch.tensor([[[1.0], [2.0], [3.0]]]), meta={"role": "assistant"}),
+        ConversationItem(type="soi", value=torch.tensor([[[1.0], [2.0], [3.0]]]), role="assistant"),
     ]
     tail = get_ar_tail_embed(parts)
     assert tail is not None
@@ -175,9 +178,23 @@ def test_append_output_hidden():
 
 
 def test_set_llm_embed_on_token():
-    item = ConversationItem(type="token", value=11, meta={"role": "assistant"})
+    item = ConversationItem(type="token", value=11, role="assistant")
     embed = torch.zeros(1, 1, 8)
     set_llm_embed(item, embed)
     assert get_token_id(item) == 11
     assert torch.equal(get_llm_embed(item), embed)
     assert not needs_embedding(item)
+
+
+def test_iter_modality_items_allows_multiple_images_per_sample():
+    img_a, img_b, img_c = object(), object(), object()
+    batch = [
+        [
+            ConversationItem(type="image", value=img_a, role="user"),
+            ConversationItem(type="image", value=img_b, role="user"),
+        ],
+        [ConversationItem(type="image", value=img_c, role="user")],
+    ]
+    items = list(iter_modality_items(batch, ["image"], roles=["user"]))
+    assert [item.value for item in items] == [img_a, img_b, img_c]
+    assert collect_modality_batch(batch, ["image"], roles=["user"]) == [img_a, img_b, img_c]

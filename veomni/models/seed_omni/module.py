@@ -35,13 +35,15 @@ Optional hooks
     diffusion-loss in ``forward``; an LM head samples a token here but
     computes CE in ``forward``).
 
-``pre_forward(**kwargs) -> dict``
-    Per-micro-batch packing / SP slice / data-routing prep.  Default:
-    identity.  Called by the runtime *before* ``forward``.
+``pre_forward(method, **kwargs) -> dict``
+    Per-micro-batch packing / SP slice / data-routing prep.  ``method`` is
+    the graph node entry point (``"forward"``, ``"encode"``, ``"decode"``, …).
+    Default: identity.
 
-``post_forward(outputs: dict) -> dict``
-    Per-call post-processing — e.g. SP gather of routed tensors, computing
-    the final ``_loss`` mean across micro-batches.  Default: identity.
+``post_forward(method, **outputs) -> dict``
+    Per-call post-processing — e.g. SP gather, final ``_loss`` mean,
+    conversation write-back.  ``method`` matches the active graph node.
+    Default: identity.
 
 ``freeze_model() -> None``
     Optionally freeze a subset of this module's params (the trainer calls it
@@ -57,8 +59,8 @@ Optional hooks
 ``get_assets() -> list``
     Module-owned tooling that should be saved alongside the module weights
     (vision processor, audio feature extractor, codebook lookup tables, ...).
-    The global tokenizer lives at ``OmniConfig.tokenizer_path`` and is NOT
-    returned here.  Default: ``[]``.
+    Tokenizers belong on the module that needs them (e.g. ``janus_text_encoder``).
+    Default: ``[]``.
 
 ``finalize(*, ctx, request) -> dict``
     Inference-only post-processing hook called *once* when the FSM
@@ -165,28 +167,24 @@ class OmniModule:
     # ``self._processor`` so the module's ``generate`` can tensorise its
     # own inputs — no external wiring step required.
     #
-    # Likewise, a module that owns its **own** tokenizer (e.g. a T5 text
-    # encoder driving a DiT video generator) declares ``tokenizer_class`` and
-    # gets it on ``self._tokenizer``.  This is the module's *own* vocabulary —
-    # an asset saved with the module — and is **distinct** from the global
-    # *conversation* tokenizer wired in via :meth:`set_conversation_tokenizer`
-    # (``self._conversation_tokenizer``), which the orchestrator owns and saves
-    # once, not per module.
+    # Likewise, a module that owns its **own** tokenizer (e.g. Janus
+    # ``janus_text_encoder``) keeps ``self._tokenizer = None`` in ``__init__``
+    # a ``tokenizer`` property setter (``OmniModuleTrainer`` assigns
+    # ``model.tokenizer = build_tokenizer(...)``, same slot as SigLIP ``_processor``).
     #
     # Leave both as ``None`` (default) for modules that only consume already-
-    # tokenised / already-tensorised inputs (the LLM head, the text
-    # encoder, the VQ decoder).
+    # tensorised inputs (SigLIP, VQVAE, LLaMA backbone).
     processor_class: Optional[Type[Any]] = None
     tokenizer_class: Optional[Type[Any]] = None
 
     # ── Training hooks ────────────────────────────────────────────────────────
 
-    def pre_forward(self, **kwargs: Any) -> Dict[str, Any]:
-        """Pre-process inputs before :meth:`forward`.
+    def pre_forward(self, method: str, **kwargs: Any) -> Dict[str, Any]:
+        """Pre-process inputs before the graph node's call-site method.
 
-        Override to add packing (reshape multi-image pixel_values, compute
-        cu_seqlens, build chat-template-aware position_ids, ...) and/or SP
-        slicing.
+        ``method`` names the entry point configured on the active node
+        (``"forward"``, ``"encode"``, ``"decode"``, …).  Override to route
+        packing / SP slice / conversation extraction per call site.
 
         Default: identity pass-through.
         """
@@ -212,13 +210,10 @@ class OmniModule:
             "Override it on the OmniModule mixin if this module appears in the training graph."
         )
 
-    def post_forward(self, outputs: Dict[str, Any]) -> Dict[str, Any]:
-        """Post-process :meth:`forward` outputs.
+    def post_forward(self, method: str, **outputs: Any) -> Dict[str, Any]:
+        """Per-call post-processing — e.g. SP gather, final ``_loss`` mean.
 
-        Override to add SP gather, final token-mean reduction of ``_loss``,
-        cleanup of book-keeping fields, etc.
-
-        Default: identity.
+        Default: identity pass-through of the call-site return dict.
         """
         return outputs
 
@@ -230,18 +225,6 @@ class OmniModule:
         LM head samples a token here.
         """
         return self.forward(**kwargs)
-
-    def set_conversation_tokenizer(self, conversation_tokenizer: Any) -> None:
-        """Wire the global **conversation** tokenizer and resolve token ids.
-
-        Optional.  Text-side modules use this to learn special-token ids
-        (boi / eoi / eos / image placeholder) at runtime instead of storing
-        them in ``config.json``, and to tokenise the conversation text.  The
-        argument is the orchestrator's shared LLM tokenizer — store it on
-        ``self._conversation_tokenizer`` (not ``self._tokenizer``, which is the
-        module's *own* tokenizer asset, if any).  Default: no-op.
-        """
-        return None
 
     # ── HF lifecycle override ─────────────────────────────────────────────────
 
@@ -315,9 +298,7 @@ class OmniModule:
     def get_assets(self) -> List[Any]:
         """Module-owned auxiliary artefacts to save alongside the weights.
 
-        Vision / audio processors, codebooks, BPE pieces, etc.  The global
-        tokenizer is stored at ``OmniConfig.tokenizer_path`` and is *not*
-        returned here.  Default: ``[]``.
+        Vision / audio processors, tokenizers, codebooks, etc.  Default: ``[]``.
         """
         return []
 

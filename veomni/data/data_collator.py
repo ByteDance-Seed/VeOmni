@@ -521,11 +521,10 @@ class SeedOmniCollator(DataCollator):
 
     Pairs with ``data_type: seedomni`` (see
     ``veomni/data/multimodal/seedomni_transform.py``) which emits
-    per-sample dicts of the form ``{"conversation_list": [items, ...]}``.
+    per-sample ``{"conversation_list": [ConversationItem, ...]}``.
     This collator turns ``N`` such dicts into a single batched dict
-    ``{"conversation_list": [[items_0], [items_1], ..., [items_{N-1}]]}``
-    plus any extra keys present in the samples (passed through
-    unchanged as a per-sample list).
+    ``{"conversation_list": [[ConversationItem, ...], ...]}`` plus any extra
+    keys present in the samples (passed through unchanged as a per-sample list).
 
     No stacking, no padding, no sequence-parallel slicing — the V2 design
     contract puts all of that inside model modules' ``pre_forward``,
@@ -552,7 +551,7 @@ class SeedOmniCollator(DataCollator):
             {"conversation_list": [{"type": "text", "value": "hi", ...}]},
             {"conversation_list": [{"type": "image", "value": <Tensor>, ...}]},
         ])
-        # batch == {"conversation_list": [[{"type": "text", ...}], [{"type": "image", ...}]]}
+        # batch == {"conversation_list": [[ConversationItem(...)], ...]}
     """
 
     def __call__(self, features: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
@@ -576,4 +575,5 @@ class SeedOmniCollator(DataCollator):
                 f"got {first_keys}"
             )
 
-        return {key: [f[key] for f in features] for key in first_keys}
+        batch = {key: [f[key] for f in features] for key in first_keys}
+        return batch

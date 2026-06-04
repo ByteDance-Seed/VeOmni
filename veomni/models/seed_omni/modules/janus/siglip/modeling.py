@@ -1,25 +1,18 @@
 """
 JanusSiglip — Janus' SigLIP vision tower + MLP aligner as one OmniModule.
 
-Mixin form: ``class JanusSiglip(OmniModule, PreTrainedModel)``.  HuggingFace
-``from_pretrained`` / ``save_pretrained`` work natively against
-``<weights_path>/{config.json, model.safetensors[, preprocessor_config.
-json]}``; the SeedOmni V2 graph runtime (:class:`OmniModel`) calls
-:meth:`forward` / :meth:`pre_forward` / :meth:`post_forward` per
-``OmniModule`` mixin protocol.
+Mixin form: ``class JanusSiglip(OmniModule, PreTrainedModel)``.  The vision
+stack reuses HuggingFace :class:`~transformers.JanusVisionModel` and
+:class:`~transformers.JanusVisionAlignerMLP` — the same pair wired inside
+``JanusForConditionalGeneration`` (``aligner(vision_model(pixel_values))``).
 
-Connection outputs
-------------------
-``image_embeds``
-    Float tensor of shape ``(batch, num_patches, llm_hidden_size)`` ready
-    to be injected into the AR-LLM as understanding image embeddings.
-
-Batch inputs (read from raw batch)
-----------------------------------
-``pixel_values``
-    Float tensor of shape ``(B, 3, H, W)`` — single image per sample, or
-    ``(B, N_images, 3, H, W)`` — multiple images per sample.  The latter
-    shape is flattened by :meth:`pre_forward`.
+Call-site split (V2)
+--------------------
+* :meth:`pre_forward` — pull raw ``(C,H,W)`` images from ``conversation_list``
+  → ``pixel_values``; stash the carrier for :meth:`post_forward`.
+* :meth:`forward` — pure encoder: ``pixel_values`` → ``image_embeds`` (HF path).
+* :meth:`post_forward` — write ``image_embeds`` back onto ``conversation_list``
+  ``type="image"`` items in place.
 """
 
 from typing import Any, Dict, List, Optional
@@ -31,13 +24,11 @@ from transformers.models.janus.modeling_janus import JanusVisionAlignerMLP, Janu
 
 from ....conversation import (
     ConversationItem,
-    TrainConversation,
-    collect_modality_values,
+    collect_modality_batch,
     is_embedded,
-    is_raw_training_conversation,
     item_role,
+    iter_modality_items,
 )
-from ....image_inputs import build_pixel_values_batch
 from ....module import OmniModule
 from .configuration import JanusSiglipConfig
 from .processing import JanusSiglipProcessor
@@ -46,11 +37,9 @@ from .processing import JanusSiglipProcessor
 class JanusSiglip(OmniModule, PreTrainedModel):
     """SigLIP vision tower + MLP aligner for image understanding.
 
-    Multi-inherits :class:`OmniModule` (V2 mixin) and
-    :class:`PreTrainedModel` so HF lifecycle methods work natively.
-    Loaded from the ``model.vision_model`` and ``model.aligner`` sub-
-    modules of the original ``JanusForConditionalGeneration`` checkpoint
-    (split into a standalone folder by ``scripts/split_janus.py``).
+    Composes HF :class:`JanusVisionModel` + :class:`JanusVisionAlignerMLP`
+    (weights split from ``JanusForConditionalGeneration`` by
+    ``scripts/split_janus.py``).
     """
 
     config_class = JanusSiglipConfig
@@ -58,111 +47,94 @@ class JanusSiglip(OmniModule, PreTrainedModel):
     base_model_prefix = "janus_siglip"
     main_input_name = "pixel_values"
     _no_split_modules = ["JanusVisionEncoderLayer"]
-    # The understanding tower (``JanusVisionModel`` → ``JanusVisionEncoder``)
-    # supports gradient checkpointing.  ``PreTrainedModel`` defaults this flag to
-    # ``False`` and the mixin would otherwise inherit that, so the trainer would
-    # needlessly skip GC; advertise the (real) capability so its encoder layers
-    # actually checkpoint.
     supports_gradient_checkpointing = True
 
     def __init__(self, config: JanusSiglipConfig):
         super().__init__(config)
+        self.config = config
 
         vision_cfg = JanusVisionConfig(**config.vision_config) if config.vision_config else JanusVisionConfig()
-        self.vision_model = JanusVisionModel._from_config(vision_cfg)
+        self.vision_model = JanusVisionModel(vision_cfg)
         self.aligner = JanusVisionAlignerMLP(vision_cfg)
 
-        # Auto-populated by :meth:`OmniModule.from_pretrained` from
-        # ``<weights_path>/preprocessor_config.json`` when loading via
-        # the HF lifecycle.  Stays ``None`` in trainer-side meta-init
-        # paths (training feeds pre-tensorised ``pixel_values`` via the
-        # data collator) and when no processor JSON ships next to the
-        # weights.
         self._processor: Optional[Any] = None
+        self._conversation_carrier: Any = None
 
         self.post_init()
 
+    # ── JanusSiglip Main Function ───────────────────────────────────────────────────
+    def _encode_pixel_values(self, pixel_values: torch.Tensor) -> torch.Tensor:
+        """``aligner(vision_model(pixels))`` — mirrors Janus understanding path."""
+        vision_out = self.vision_model(pixel_values, return_dict=True)
+        return self.aligner(vision_out.last_hidden_state)
+
+    def forward(
+        self,
+        pixel_values: Optional[torch.Tensor] = None,
+    ) -> Dict[str, Any]:
+        """HF-style vision encode: ``pixel_values`` → ``image_embeds``."""
+        if pixel_values is None:
+            return {"image_embeds": self._encode_pixel_values(self.dummy_inputs()), "is_dummy": True}
+        return {"image_embeds": self._encode_pixel_values(pixel_values)}
+
     # ── OmniModule interface ───────────────────────────────────────────────────
 
-    def pre_forward(self, pixel_values: Optional[torch.Tensor] = None, **kwargs) -> Dict[str, Any]:
-        """Extract + tensorise understanding images, then SP/shape-normalise.
-
-        Training (raw ``conversation_list``): pull every ``image`` turn's raw
-        ``(C, H, W)`` uint8 tensor, process it to the SigLIP-normalised
-        ``(B, 3, H, W)`` batch (zero placeholder for image-free samples) so
-        the encoder runs on every micro-batch (FSDP alignment).  Inference /
-        pre-tensorised paths pass ``pixel_values`` straight through.
-
-        Then flatten ``(B, N_images, C, H, W)`` → ``(B*N_images, C, H, W)``
-        (the original ``(B, N_images)`` shape is stashed in
-        ``_pv_batch_n_images`` so :meth:`forward` can reshape back).
-        """
-        if pixel_values is None:
-            conversation = kwargs.get("conversation_list")
-            if is_raw_training_conversation(conversation):
-                pixel_values = self._extract_und_pixel_values(conversation)
-                # Keep ``conversation_list`` in kwargs: :meth:`forward` wraps the
-                # raw conversation into a :class:`TrainConversation` carrier (the
-                # single object that flows down the graph) and fills its
-                # ``und_embeds``.
-
-        if pixel_values is not None and pixel_values.ndim == 5:
-            b, n = pixel_values.shape[:2]
-            pixel_values = pixel_values.reshape(b * n, *pixel_values.shape[2:])
-            kwargs["_pv_batch_n_images"] = (b, n)
-        return dict(pixel_values=pixel_values, **kwargs)
-
-    def forward(self, pixel_values: Optional[torch.Tensor] = None, **kwargs) -> Dict[str, Any]:  # type: ignore[override]
-        """Encode understanding image patches to LLM-space embeddings.
-
-        Training (raw ``conversation_list`` present): build the
-        :class:`TrainConversation` carrier and stash the full-batch
-        understanding embeds (``(B, P, D)``) on it as ``und_embeds`` —
-        ``JanusTextEncoder`` later slices per-sample rows into image segments
-        and the backbone uses the whole tensor as an FSDP grad-sync anchor.
-        Returns ``{"conversation_list": carrier}``.
-
-        Legacy / pre-tensorised path (``pixel_values`` passed directly, no raw
-        conversation): returns ``{"image_embeds": (B, P, D)}`` unchanged.
-
-        Returns ``{}`` for text-only batches (``pixel_values is None``) — the
-        *inference* fast path; in training the trainer fills
-        :meth:`dummy_inputs` so this branch is never reached.
-        """
-        conversation = kwargs.get("conversation_list")
-        if pixel_values is None:
-            return {}
-
-        vision_out = self.vision_model(pixel_values, return_dict=True)
-        feats = vision_out.last_hidden_state
-        image_embeds = self.aligner(feats)
-
-        b_n = kwargs.pop("_pv_batch_n_images", None)
-        if b_n is not None:
-            b, n = b_n
-            p = image_embeds.size(1)
-            image_embeds = image_embeds.reshape(b, n * p, image_embeds.size(2))
-
-        if is_raw_training_conversation(conversation):
-            return {"conversation_list": TrainConversation(raw=conversation, und_embeds=image_embeds)}
-        return {"image_embeds": image_embeds}
-
-    def _extract_und_pixel_values(self, conversation_list: List[List[dict]]) -> torch.Tensor:
-        """Raw ``image`` turns → SigLIP-normalised ``(B, 3, H, W)`` batch."""
-        cfg = self.config.vision_config or {}
-        image_size = cfg.get("image_size", 384) if isinstance(cfg, dict) else getattr(cfg, "image_size", 384)
-        num_channels = cfg.get("num_channels", 3) if isinstance(cfg, dict) else getattr(cfg, "num_channels", 3)
-        per_sample = collect_modality_values(conversation_list, ("image",))
-        return build_pixel_values_batch(
-            per_sample,
-            processor=self._processor,
-            image_size=image_size,
-            num_channels=num_channels,
-            device=self._param_device(),
-            dtype=self._param_dtype(),
+    def pre_forward(
+        self,
+        method: str,
+        conversation_list: Optional[list[list[ConversationItem]]] = None,
+    ) -> Dict[str, Any]:
+        """Extract ``pixel_values`` from the carrier; stash ``conversation_list``."""
+        assert method == "forward"
+        self._conversation_carrier = conversation_list
+        pixel_values = self._pixels_from_raw_images(
+            collect_modality_batch(conversation_list, ["image"], roles=["user"])
         )
+        return {"pixel_values": pixel_values}
 
-    # ── Inference (conversation-list) ─────────────────────────────────────────
+    def post_forward(
+        self,
+        method: str,
+        image_embeds: torch.Tensor,  # n_image_cross_all_batch, 576, 2048
+        is_dummy: bool = False,
+    ) -> Dict[str, Any]:
+        """Write ``image_embeds`` onto the stashed ``conversation_list`` carrier."""
+        assert method == "forward"
+        conversation = self._conversation_carrier
+        self._conversation_carrier = None
+        if is_dummy:
+            assert image_embeds.shape[0] == 1
+            image_embeds = image_embeds.squeeze(0)
+            for sample in conversation:
+                sample.append(
+                    ConversationItem(
+                        type="image",
+                        value=image_embeds,
+                        role="dummy",
+                        meta={"source": "janus_siglip"},
+                    )
+                )
+        else:
+            items = list(iter_modality_items(conversation, ["image"], roles=["user"]))
+            for item, emb in zip(items, image_embeds, strict=True):
+                item.value = emb
+        return {"conversation_list": conversation}
+
+    def _pixels_from_raw_images(self, raw_images: list[Any]) -> torch.Tensor:
+        """Raw images (uint8 ``(C,H,W)`` or PIL) → SigLIP-normalised ``(N, 3, H, W)``."""
+        cfg = self.config.vision_config
+        if not raw_images:
+            return torch.zeros(
+                1,
+                cfg["num_channels"],
+                cfg["image_size"],
+                cfg["image_size"],
+                device=self.device,
+                dtype=self.dtype,
+            )
+        return self._processor(images=raw_images, return_tensors="pt")["pixel_values"].to(
+            device=self.device, dtype=self.dtype
+        )
 
     def generate(
         self,
@@ -171,86 +143,30 @@ class JanusSiglip(OmniModule, PreTrainedModel):
         past_key_values: Optional[Any] = None,
         **_: Any,
     ) -> Dict[str, Any]:
-        """Encode every user ``image`` part that is not yet embedded.
-
-        Inference-only entry — training still goes through
-        :meth:`forward`.  Called once on the prompt pass; subsequent FSM
-        iterations short-circuit because ``past_key_values is not None``.
-
-        Each ``type="image"`` part with ``meta.role="user"`` must carry a
-        raw PIL / numpy image or a ``(C, H, W)`` tensor in ``value``.  The
-        aligner-projected output ``(1, P, D)`` is written back into
-        ``value`` so downstream :meth:`JanusLlama.generate` can concat it.
-        """
+        """Encode every user ``image`` part that is not yet embedded."""
         if conversation_list is None or past_key_values is not None:
             return {"conversation_list": conversation_list} if conversation_list is not None else {}
 
-        device = self._param_device()
-        dtype = self._param_dtype()
-        for part in conversation_list:
-            if part.type != "image" or item_role(part) != "user" or is_embedded(part):
-                continue
-            raw = part.value
-            if isinstance(raw, torch.Tensor) and _is_chw_image_tensor(raw):
-                pv = raw
-            elif isinstance(raw, torch.Tensor) and raw.dim() == 4:
-                pv = raw.squeeze(0) if raw.size(0) == 1 else raw
-            elif raw is not None:
-                if self._processor is None:
-                    raise RuntimeError(
-                        "JanusSiglip.generate: image part has no tensor `value` and no "
-                        "processor was loaded.  Either pre-tensorise the part or ensure "
-                        "`preprocessor_config.json` ships next to the weights checkpoint so "
-                        "OmniModule.from_pretrained can auto-load it."
-                    )
-                out = self._processor(images=[raw], return_tensors="pt")
-                pv = out["pixel_values"]
-                if pv.dim() == 4 and pv.size(0) == 1:
-                    pv = pv.squeeze(0)
-            else:
-                continue
-            if pv.dim() == 3:
-                pv = pv.unsqueeze(0)
-            pv = pv.to(device=device, dtype=dtype, non_blocking=True)
-            vision_out = self.vision_model(pv, return_dict=True)
-            part.value = self.aligner(vision_out.last_hidden_state)
+        pending = [
+            part
+            for part in conversation_list
+            if part.type == "image" and item_role(part) == "user" and not is_embedded(part)
+        ]
+        if not pending:
+            return {"conversation_list": conversation_list}
+
+        embeds = self._encode_pixel_values(self._pixels_from_raw_images([part.value for part in pending]))
+        for part, emb in zip(pending, embeds, strict=True):
+            part.value = emb if emb.dim() == 2 else emb.squeeze(0)
         return {"conversation_list": conversation_list}
-
-    # ── Internal device / dtype helpers ───────────────────────────────────────
-
-    def _param_device(self) -> torch.device:
-        return next(self.parameters()).device
-
-    def _param_dtype(self) -> torch.dtype:
-        return next(self.parameters()).dtype
 
     # ── Training-side dummy forward ────────────────────────────────────────────
 
-    def dummy_inputs(self, *, batch_size: int, device: Any, dtype: Any) -> Dict[str, Any]:
-        """Return zero ``pixel_values`` so the full vision path forwards.
-
-        Used by the trainer for micro-batches that have no understanding
-        images — keeps the FSDP graph aligned across DP/SP ranks.  The
-        zero output flows through the LLM's ``masked_scatter`` as a
-        no-op (mask is all-False) and contributes no gradient; the LLM's
-        ``pre_forward`` adds an ``image_embeds.sum() * 0.0`` anchor so
-        the upstream params still receive a (zero) gradient and FSDP
-        sync stays consistent.
-        """
+    def dummy_inputs(self) -> Dict[str, Any]:
+        """Zero ``pixel_values`` for image-free micro-batches (FSDP alignment)."""
         cfg = self.config.vision_config or {}
-        h = cfg.get("image_size", 384) if isinstance(cfg, dict) else getattr(cfg, "image_size", 384)
-        c = cfg.get("num_channels", 3) if isinstance(cfg, dict) else getattr(cfg, "num_channels", 3)
+        h = cfg["image_size"]
+        c = cfg["num_channels"]
         return {
-            "pixel_values": torch.zeros(batch_size, c, h, h, device=device, dtype=dtype),
+            "pixel_values": torch.zeros(1, c, h, h, device=self.device, dtype=self.dtype),
         }
-
-
-def _is_chw_image_tensor(value: torch.Tensor) -> bool:
-    if value.dim() != 3:
-        return False
-    c, _h, w = (int(value.size(0)), int(value.size(1)), int(value.size(2)))
-    if c not in (1, 3):
-        return False
-    if c == 1 and w > 512:
-        return False
-    return True

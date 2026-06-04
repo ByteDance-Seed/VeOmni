@@ -377,18 +377,15 @@ def tulu_3_sft_mixture_preprocess(conversations, **kwargs):
 def veomni_omni_demo_preprocess(conversations, **kwargs):
     """Unified SeedOmni V2 demo schema — one shape for every UG scenario.
 
-    Each message is ``{"role": <system|user|assistant>, "content": [...]}``
-    where every content item is a typed dict::
+    Flat chat JSON: each message is
+    ``{"role": <system|user|assistant>, "content": [...]}`` with typed items::
 
-        {"type": "text",     "value": "..."}
-        {"type": "image"}        # understanding input  → consumes one image
-        {"type": "vq_image"}     # generation target    → consumes one image
+        {"type": "text",  "value": "..."}
+        {"type": "image"}   # placeholder; bytes live in parallel ``images`` list
 
-    ``image`` / ``vq_image`` items carry no inline value — the actual pixel
-    tensor is pulled from the sample's parallel ``images`` list in source
-    order by :func:`process_seedomni_example`.  This keeps a single, model-
-    agnostic conversation layout that covers I2T (understanding), T2I
-    (generation) and interleaved turns without per-scenario preprocessors.
+    Understanding vs generation is encoded by ``role`` (``user`` vs ``assistant``),
+    not by item type.  See ``docs/usage/seedomni_data_format.md`` for I2T / T2I /
+    interleave (UG) examples.
     """
     constructed = []
     for message in conversations:
@@ -398,12 +395,11 @@ def veomni_omni_demo_preprocess(conversations, **kwargs):
             type_ = item["type"]
             if type_ == "text":
                 turn.append(("text", item.get("value", "")))
-            elif type_ in ("image", "vq_image"):
-                turn.append((type_, None))
+            elif type_ == "image":
+                turn.append(("image", None))
             else:
                 raise ValueError(
-                    f"veomni_omni_demo: unsupported content type {type_!r}; "
-                    "expected one of 'text' / 'image' / 'vq_image'."
+                    f"veomni_omni_demo: unsupported content type {type_!r}; expected one of 'text' / 'image'."
                 )
         constructed.append(turn)
     return constructed

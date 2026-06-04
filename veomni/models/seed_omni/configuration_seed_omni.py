@@ -4,7 +4,7 @@ OmniConfig — central configuration for OmniModel V2.
 YAML structure (maps 1-to-1 to this class):
 
   # ── Global asset (the ONLY global asset; everything else is per-module).
-  tokenizer_path: /path/to/tokenizer
+  model_path: /path/to/split/checkpoint/root
 
   # ── Modules: one entry per OmniModule.  `model_type` is read from each
   #    module's `config.json` (model_type read by OMNI_*_REGISTRY) and is NOT specified
@@ -90,8 +90,8 @@ class OmniConfig(PretrainedConfig):
     Typed accessors (``module_config``, ``training_edges``) provide a stable
     surface for the runtime / visualisation tools.
 
-    The single global asset is :attr:`tokenizer_path`; everything else is
-    per-module and saved alongside the module's checkpoint.
+    Tokenizers and processors are per-module assets saved alongside each
+    module's checkpoint (e.g. ``janus_text_encoder/tokenizer.json``).
     """
 
     model_type = "omni"
@@ -160,9 +160,9 @@ class OmniConfig(PretrainedConfig):
     def from_paths(
         cls,
         model_path: Union[str, os.PathLike],
-        tokenizer_path: Union[str, os.PathLike],
         train_yaml_path: Union[str, os.PathLike],
         infer_yaml_path: Union[str, os.PathLike] = None,
+        tokenizer_path: Optional[Union[str, os.PathLike]] = None,
         **kwargs,
     ) -> "OmniConfig":
         """Load an :class:`OmniConfig` from a training YAML + optional inference YAML.
@@ -182,7 +182,9 @@ class OmniConfig(PretrainedConfig):
         """
         import yaml
 
-        base_cfg = {"model_path": model_path, "tokenizer_path": tokenizer_path}
+        base_cfg = {"model_path": model_path}
+        if tokenizer_path is not None:
+            base_cfg["tokenizer_path"] = tokenizer_path
         with open(train_yaml_path, encoding="utf-8") as f:
             base_cfg.update(yaml.safe_load(f))
         if infer_yaml_path is not None:
