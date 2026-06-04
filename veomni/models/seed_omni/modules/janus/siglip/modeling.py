@@ -74,7 +74,7 @@ class JanusSiglip(OmniModule, PreTrainedModel):
     ) -> Dict[str, Any]:
         """HF-style vision encode: ``pixel_values`` → ``image_embeds``."""
         if pixel_values is None:
-            return {"image_embeds": self._encode_pixel_values(self.dummy_inputs()), "is_dummy": True}
+            return {"image_embeds": self._encode_pixel_values(**self.dummy_inputs()), "is_dummy": True}
         return {"image_embeds": self._encode_pixel_values(pixel_values)}
 
     # ── OmniModule interface ───────────────────────────────────────────────────
@@ -122,16 +122,8 @@ class JanusSiglip(OmniModule, PreTrainedModel):
 
     def _pixels_from_raw_images(self, raw_images: list[Any]) -> torch.Tensor:
         """Raw images (uint8 ``(C,H,W)`` or PIL) → SigLIP-normalised ``(N, 3, H, W)``."""
-        cfg = self.config.vision_config
         if not raw_images:
-            return torch.zeros(
-                1,
-                cfg["num_channels"],
-                cfg["image_size"],
-                cfg["image_size"],
-                device=self.device,
-                dtype=self.dtype,
-            )
+            return None
         return self._processor(images=raw_images, return_tensors="pt")["pixel_values"].to(
             device=self.device, dtype=self.dtype
         )
