@@ -474,6 +474,7 @@ class BaseTrainer(Stateful, ABC):
             dyn_bsz_buffer_size=args.data.dyn_bsz_buffer_size,
             seed=args.train.seed,
             collate_fn=self.collate_fn,
+            save_steps=args.train.checkpoint.save_steps,
             **dataloader_kwargs,
         )
 
