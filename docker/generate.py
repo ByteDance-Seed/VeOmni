@@ -6,7 +6,7 @@
 #     "pyyaml>=6.0",
 # ]
 # ///
-"""Render docker/cuda/Dockerfile.* from docker/matrix.yaml + docker/templates/*.j2.
+"""Render docker/{cuda,ascend}/Dockerfile.* from docker/matrix.yaml + docker/templates/*.j2.
 
 Usage::
 
@@ -44,13 +44,23 @@ def build_env() -> Environment:
 
 def build_uv_sync_command(ctx: dict) -> str:
     """Render a multi-line ``uv sync ...`` shell command with ``\\``
-    continuation, so a long extras list stays readable in the Dockerfile."""
+    continuation, so a long extras list stays readable in the Dockerfile.
+
+    ``uv_extra_flags`` (optional, per-image) appends raw flags after the
+    extras / ``--dev`` block. Ascend images need
+    ``--allow-insecure-host github.com`` /
+    ``--allow-insecure-host pythonhosted.org`` because the CANN base image's
+    CA bundle can't validate the github.com (flash-attn) and
+    files.pythonhosted.org (av) wheel sources that ``--locked`` revalidates.
+    CUDA images omit the field, so this is a no-op for them."""
     extras = ctx.get("uv_extras") or []
     dev = bool(ctx.get("uv_dev", False))
+    extra_flags = ctx.get("uv_extra_flags") or []
     parts = ["uv sync", "--locked", "--all-packages"]
     parts.extend(f"--extra {e}" for e in extras)
     if dev:
         parts.append("--dev")
+    parts.extend(extra_flags)
     return " \\\n    ".join(parts)
 
 
