@@ -17,7 +17,10 @@ from ...loader import MODELING_REGISTRY
 
 @MODELING_REGISTRY.register("deepseek_v3")
 def register_deepseek_v3_modeling(architecture: str):
-    from .checkpoint_tensor_converter import create_deepseek_v3_checkpoint_tensor_converter
+    from .checkpoint_tensor_converter import (
+        convert_deepseek_v3_fqn_to_index_mapping,
+        create_deepseek_v3_checkpoint_tensor_converter,
+    )
     from .device_patch import apply_veomni_deepseek_v3_device_patch
 
     if IS_NPU_AVAILABLE:
@@ -29,13 +32,22 @@ def register_deepseek_v3_modeling(architecture: str):
 
     DeepseekV3ForCausalLM = gen.DeepseekV3ForCausalLM
     DeepseekV3ForSequenceClassification = gen.DeepseekV3ForSequenceClassification
+    DeepseekV3ForTokenClassification = gen.DeepseekV3ForTokenClassification
     DeepseekV3Model = gen.DeepseekV3Model
 
-    for model_cls in (DeepseekV3ForCausalLM, DeepseekV3ForSequenceClassification, DeepseekV3Model):
+    for model_cls in (
+        DeepseekV3ForCausalLM,
+        DeepseekV3ForSequenceClassification,
+        DeepseekV3ForTokenClassification,
+        DeepseekV3Model,
+    ):
         model_cls._create_checkpoint_tensor_converter = staticmethod(create_deepseek_v3_checkpoint_tensor_converter)
+        model_cls._convert_fqn_to_index_mapping = staticmethod(convert_deepseek_v3_fqn_to_index_mapping)
 
     if "ForCausalLM" in architecture:
         return DeepseekV3ForCausalLM
+    elif "ForTokenClassification" in architecture:
+        return DeepseekV3ForTokenClassification
     elif "ForSequenceClassification" in architecture:
         return DeepseekV3ForSequenceClassification
     elif "Model" in architecture:

@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import json
 import math
 import os
 from dataclasses import dataclass, field
@@ -519,7 +518,13 @@ class TrainingArguments:
     )
     moe_load_balance_monitor_interval: int = field(
         default=0,
-        metadata={"help": "Log MoE expert load heatmap every N steps. 0 = disabled. Requires wandb.enable=True."},
+        metadata={
+            "help": (
+                "Log MoE expert load heatmap every N steps. 0 = disabled. Counts are "
+                "all-reduced across EP and DP groups so the heatmap is global. "
+                "Wandb logging is performed only when train.wandb.enable=True."
+            )
+        },
     )
 
     # sub-argument groups
@@ -683,6 +688,7 @@ class TrainingArguments:
 _NPU_ALLOWED: Dict[str, frozenset] = {
     "rms_norm_implementation": frozenset({"npu"}),
     "rotary_pos_emb_implementation": frozenset({"npu"}),
+    "rotary_pos_emb_vision_implementation": frozenset({"npu"}),
     "swiglu_mlp_implementation": frozenset(),
     "load_balancing_loss_implementation": frozenset({"triton"}),
     "cross_entropy_loss_implementation": frozenset({"chunk_loss", "npu"}),
@@ -692,6 +698,7 @@ _NPU_ALLOWED: Dict[str, frozenset] = {
 _NPU_REQUIRED: Dict[str, frozenset] = {
     "rms_norm_implementation": frozenset({"npu"}),
     "rotary_pos_emb_implementation": frozenset({"npu"}),
+    "rotary_pos_emb_vision_implementation": frozenset({"npu"}),
     "cross_entropy_loss_implementation": frozenset({"npu"}),
     "moe_implementation": frozenset({"fused_npu"}),
 }
@@ -778,6 +785,10 @@ class OpsImplementationConfig:
             "'npu' | 'triton' (DeepSeek-V3 deterministic; GPU only) | 'eager'."
         },
     )
+    rotary_pos_emb_vision_implementation: str = field(
+        default="eager",
+        metadata={"help": "Rotary positional embedding in vision part. 'npu' | 'eager' (default)."},
+    )
     load_balancing_loss_implementation: str = field(
         default="triton",
         metadata={
@@ -791,7 +802,7 @@ class OpsImplementationConfig:
             "help": "Gated RMSNorm implementation (Qwen3.5 GatedDeltaNet `self.norm`). "
             "'fla' (default) uses fla.modules.FusedRMSNormGated (requires flash-linear-attention, GPU). "
             "'eager' uses the HuggingFace Qwen3_5RMSNormGated. "
-            "Qwen3.5 has no NPU backend today — selecting any non-eager value on NPU raises at OpSlot bind time."
+            "'npu' uses the VeOmni NPUFusedRMSNormGated."
         },
     )
     causal_conv1d_implementation: str = field(
@@ -969,12 +980,12 @@ class ModelArguments:
             if os.path.exists(default_idx_path):
                 self.safetensor_idx_path = default_idx_path
 
-        # Parse fqn_to_index_mapping from safetensor index json
+        # Parse raw HF weight_map from safetensor index json (MoE key renames happen at runtime).
         self.fqn_to_index_mapping = None
         if self.safetensor_idx_path is not None:
-            with open(self.safetensor_idx_path) as f:
-                weight_map = json.load(f)["weight_map"]
-            self.fqn_to_index_mapping = {fqn: int(filename.split("-")[1]) for fqn, filename in weight_map.items()}
+            from ..models.checkpoint_tensor_loading import parse_fqn_to_index_mapping_from_json
+
+            self.fqn_to_index_mapping = parse_fqn_to_index_mapping_from_json(self.safetensor_idx_path)
         if self.fqn_to_index_mapping is None:
             logger.warning_rank0(
                 "fqn_to_index_mapping is None, saved safetensor will be a single file instead of sharded."
@@ -1042,6 +1053,10 @@ class DataloaderConfig:
     pin_memory: bool = field(
         default=True,
         metadata={"help": "Whether to pin memory for dataloader."},
+    )
+    use_background_prefetcher: bool = field(
+        default=False,
+        metadata={"help": "Whether to use BackgroundPrefetcher for dataloader."},
     )
 
 

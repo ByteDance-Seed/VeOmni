@@ -82,6 +82,7 @@ key_features/lora.md
 :caption: Design
 
 design/kernel_selection.md
+design/patchgen.md
 ```
 
 ```{toctree}

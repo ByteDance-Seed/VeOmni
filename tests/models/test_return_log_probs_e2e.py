@@ -26,7 +26,7 @@ Builds a tiny Qwen3 from ``tests/toy_config/qwen3_toy/`` via
    determinism + batch-invariant mode are enabled and ``chunk_size``
    covers the whole sequence (so the chunked ``F.linear`` reduces to
    a single call against the same weight).
-3. Backward through ``output.log_probs`` flows gradients into
+3. Backward through ``output.fused_linear_aux.log_probs`` flows gradients into
    ``model.lm_head.weight``.
 """
 
@@ -222,17 +222,20 @@ def test_return_log_probs_bitwise_matches_logits_reference(ce_impl, toy_path, fa
 
             # New path: model wrapper installed by ``build_foundation_model``
             # makes ``model(..., return_log_probs=True)`` return
-            # ``output.log_probs`` (actual log-probabilities, sign already
-            # flipped) and ``output.entropy`` (per-token softmax entropy)
-            # and clear ``output.logits``. ``chunk_size=L+1`` forces a
-            # single chunk so the matmul boundary matches the reference
-            # forward exactly.
+            # ``output.fused_linear_aux.log_probs`` (actual log-probabilities, sign already
+            # flipped) and ``output.fused_linear_aux.entropy`` (per-token softmax entropy)
+            # and clear ``output.logits``. ``chunk_size=B*L+1`` forces a
+            # single chunk over the whole packed batch so the matmul
+            # boundary matches the reference forward exactly — using
+            # ``L+1`` alone would split B=2 into 2 chunks and surface
+            # fp32 epsilon drift from cuBLAS algorithm selection at the
+            # chunk boundary (qwen3_vl-vlm hits this; text doesn't).
             out = model(
                 input_ids=input_ids,
                 labels=labels,
                 use_cache=False,
                 return_log_probs=True,
-                chunk_size=L + 1,
+                chunk_size=B * L + 1,
             )
     finally:
         if bi_ctx is not None:
@@ -240,38 +243,40 @@ def test_return_log_probs_bitwise_matches_logits_reference(ce_impl, toy_path, fa
 
     assert out.loss is None, "loss must be None when return_log_probs=True"
     assert out.logits is None, "logits must be cleared when return_log_probs=True"
-    assert out.log_probs is not None, "log_probs must be populated when return_log_probs=True"
-    assert out.log_probs.shape == labels.shape, (
-        f"shape mismatch: got {tuple(out.log_probs.shape)} expected {tuple(labels.shape)}"
+    assert out.fused_linear_aux.log_probs is not None, "log_probs must be populated when return_log_probs=True"
+    assert out.fused_linear_aux.log_probs.shape == labels.shape, (
+        f"shape mismatch: got {tuple(out.fused_linear_aux.log_probs.shape)} expected {tuple(labels.shape)}"
     )
-    assert out.log_probs.dtype == ref_log_probs.dtype, (
-        f"dtype mismatch: got {out.log_probs.dtype} expected {ref_log_probs.dtype}"
+    assert out.fused_linear_aux.log_probs.dtype == ref_log_probs.dtype, (
+        f"dtype mismatch: got {out.fused_linear_aux.log_probs.dtype} expected {ref_log_probs.dtype}"
     )
 
-    if not torch.equal(out.log_probs, ref_log_probs):
-        diff = (out.log_probs - ref_log_probs).abs()
-        ne = out.log_probs != ref_log_probs
+    if not torch.equal(out.fused_linear_aux.log_probs, ref_log_probs):
+        diff = (out.fused_linear_aux.log_probs - ref_log_probs).abs()
+        ne = out.fused_linear_aux.log_probs != ref_log_probs
         first_idx = torch.nonzero(ne, as_tuple=False)[:5].tolist()
         raise AssertionError(
             f"[{family}/{ce_impl}] per-token log_probs not bitwise equal: "
-            f"{int(ne.sum().item())}/{out.log_probs.numel()} mismatched, "
+            f"{int(ne.sum().item())}/{out.fused_linear_aux.log_probs.numel()} mismatched, "
             f"max_abs_diff={diff.max().item():.3e}, first_idx={first_idx}"
         )
 
     # Entropy contract: same shape as log_probs, populated, bitwise equal
     # to the reference (same ``_per_token_entropy_from_logits`` helper on
     # the same fp32 logits).
-    assert out.entropy is not None, f"[{family}/{ce_impl}] entropy must be populated when return_log_probs=True"
-    assert out.entropy.shape == labels.shape, (
-        f"[{family}/{ce_impl}] entropy shape {tuple(out.entropy.shape)} != labels shape {tuple(labels.shape)}"
+    assert out.fused_linear_aux.entropy is not None, (
+        f"[{family}/{ce_impl}] entropy must be populated when return_log_probs=True"
     )
-    if not torch.equal(out.entropy, ref_entropy):
-        diff = (out.entropy - ref_entropy).abs()
-        ne = out.entropy != ref_entropy
+    assert out.fused_linear_aux.entropy.shape == labels.shape, (
+        f"[{family}/{ce_impl}] entropy shape {tuple(out.fused_linear_aux.entropy.shape)} != labels shape {tuple(labels.shape)}"
+    )
+    if not torch.equal(out.fused_linear_aux.entropy, ref_entropy):
+        diff = (out.fused_linear_aux.entropy - ref_entropy).abs()
+        ne = out.fused_linear_aux.entropy != ref_entropy
         first_idx = torch.nonzero(ne, as_tuple=False)[:5].tolist()
         raise AssertionError(
             f"[{family}/{ce_impl}] per-token entropy not bitwise equal: "
-            f"{int(ne.sum().item())}/{out.entropy.numel()} mismatched, "
+            f"{int(ne.sum().item())}/{out.fused_linear_aux.entropy.numel()} mismatched, "
             f"max_abs_diff={diff.max().item():.3e}, first_idx={first_idx}"
         )
 
@@ -281,10 +286,10 @@ def test_return_log_probs_bitwise_matches_logits_reference(ce_impl, toy_path, fa
     # ``labels[k]`` zeros output position ``k-1``. Both log_probs and
     # entropy follow the same masking contract.
     shifted_target_is_ign = F.pad(labels[..., 1:] == IGNORE_INDEX, (0, 1), value=True)
-    masked_lp = out.log_probs[shifted_target_is_ign]
-    valid_lp = out.log_probs[~shifted_target_is_ign]
-    masked_ent = out.entropy[shifted_target_is_ign]
-    valid_ent = out.entropy[~shifted_target_is_ign]
+    masked_lp = out.fused_linear_aux.log_probs[shifted_target_is_ign]
+    valid_lp = out.fused_linear_aux.log_probs[~shifted_target_is_ign]
+    masked_ent = out.fused_linear_aux.entropy[shifted_target_is_ign]
+    valid_ent = out.fused_linear_aux.entropy[~shifted_target_is_ign]
     assert torch.all(masked_lp == 0.0), (
         f"[{family}/{ce_impl}] IGN-target positions must emit 0.0 log_probs, got max_abs={masked_lp.abs().max().item():.3e}"
     )
@@ -310,8 +315,8 @@ def test_plain_forward_matches_verl_consumer_contract(toy_path, family):
     """Pin the verl-consumer contract on the **plain model forward path**.
 
     Verl's ``FSDPEngineWithLMHead.prepare_model_outputs`` does
-    ``log_probs = output.log_probs.squeeze(0)`` and
-    ``entropy_rmpad = output.entropy.squeeze(0)`` in its
+    ``log_probs = output.fused_linear_aux.log_probs.squeeze(0)`` and
+    ``entropy_rmpad = output.fused_linear_aux.entropy.squeeze(0)`` in its
     ``use_fused_kernels=True`` branch and expects actual
     log-probabilities (non-positive) plus per-token entropy
     (non-negative). The integration story is: verl calls
@@ -322,12 +327,12 @@ def test_plain_forward_matches_verl_consumer_contract(toy_path, family):
 
     This test pins exactly that contract:
 
-    1. ``output.log_probs`` and ``output.entropy`` are populated, finite,
+    1. ``output.fused_linear_aux.log_probs`` and ``output.fused_linear_aux.entropy`` are populated, finite,
        shape matches labels.
     2. ``output.logits`` is None — wrapper cleared it after promotion.
     3. ``output.loss`` is None.
-    4. ``output.log_probs <= 0`` everywhere (actual log-probabilities).
-    5. ``output.entropy >= 0`` everywhere (softmax entropy).
+    4. ``output.fused_linear_aux.log_probs <= 0`` everywhere (actual log-probabilities).
+    5. ``output.fused_linear_aux.entropy >= 0`` everywhere (softmax entropy).
     """
     _skip_unless_cuda(toy_path)
     _apply_determinism()
@@ -347,18 +352,26 @@ def test_plain_forward_matches_verl_consumer_contract(toy_path, family):
 
     assert out.loss is None, f"[{family}] loss must be None when return_log_probs=True"
     assert out.logits is None, f"[{family}] logits must be cleared by the build_foundation_model wrapper"
-    assert out.log_probs is not None, f"[{family}] log_probs must be populated by the build_foundation_model wrapper"
-    assert out.entropy is not None, f"[{family}] entropy must be populated by the build_foundation_model wrapper"
-    assert out.log_probs.shape == labels.shape, (
-        f"[{family}] log_probs shape {tuple(out.log_probs.shape)} != labels shape {tuple(labels.shape)}"
+    assert out.fused_linear_aux.log_probs is not None, (
+        f"[{family}] log_probs must be populated by the build_foundation_model wrapper"
     )
-    assert out.entropy.shape == labels.shape, (
-        f"[{family}] entropy shape {tuple(out.entropy.shape)} != labels shape {tuple(labels.shape)}"
+    assert out.fused_linear_aux.entropy is not None, (
+        f"[{family}] entropy must be populated by the build_foundation_model wrapper"
     )
-    assert torch.isfinite(out.log_probs).all(), f"[{family}] log_probs has non-finite values"
-    assert torch.isfinite(out.entropy).all(), f"[{family}] entropy has non-finite values"
-    assert (out.log_probs <= 0).all(), f"[{family}] log_probs must be <= 0; got max={out.log_probs.max().item():.3e}"
-    assert (out.entropy >= 0).all(), f"[{family}] entropy must be >= 0; got min={out.entropy.min().item():.3e}"
+    assert out.fused_linear_aux.log_probs.shape == labels.shape, (
+        f"[{family}] log_probs shape {tuple(out.fused_linear_aux.log_probs.shape)} != labels shape {tuple(labels.shape)}"
+    )
+    assert out.fused_linear_aux.entropy.shape == labels.shape, (
+        f"[{family}] entropy shape {tuple(out.fused_linear_aux.entropy.shape)} != labels shape {tuple(labels.shape)}"
+    )
+    assert torch.isfinite(out.fused_linear_aux.log_probs).all(), f"[{family}] log_probs has non-finite values"
+    assert torch.isfinite(out.fused_linear_aux.entropy).all(), f"[{family}] entropy has non-finite values"
+    assert (out.fused_linear_aux.log_probs <= 0).all(), (
+        f"[{family}] log_probs must be <= 0; got max={out.fused_linear_aux.log_probs.max().item():.3e}"
+    )
+    assert (out.fused_linear_aux.entropy >= 0).all(), (
+        f"[{family}] entropy must be >= 0; got min={out.fused_linear_aux.entropy.min().item():.3e}"
+    )
 
     del model, out
     _release()
@@ -384,7 +397,7 @@ def test_return_log_probs_backward_flows_gradients(toy_path, family):
     labels[0, 0] = IGNORE_INDEX
 
     out = model(input_ids=input_ids, labels=labels, use_cache=False, return_log_probs=True)
-    log_probs = out.log_probs  # [B, L], non-positive
+    log_probs = out.fused_linear_aux.log_probs  # [B, L], non-positive
     mask = (labels != IGNORE_INDEX).float()
     # Surrogate scalar: a PPO-style per-token-weighted sum of NLL
     # (== -log_probs * mask, mean over valid tokens).
@@ -397,4 +410,162 @@ def test_return_log_probs_backward_flows_gradients(toy_path, family):
     assert lm_head_grad.abs().max().item() > 0, f"[{family}] lm_head.weight.grad is all zero"
 
     del model, out, log_probs, scalar
+    _release()
+
+
+@pytest.mark.parametrize("toy_path,family", _MODELS)
+def test_return_log_probs_with_topk_distill_populates_three_fields(toy_path, family):
+    """Pin the **distillation consumer contract** on the plain model forward path.
+
+    The integration story for verl's VeOmni engine: it calls
+    ``self.module(..., return_log_probs=True, teacher_topk_ids=...,
+    teacher_topk_log_probs=...)`` directly — no helper imports, no
+    engine override — and the ``build_foundation_model``-installed
+    wrapper routes through ``chunk_topk_distill_function`` and assigns
+    ``output.fused_linear_aux.distillation_losses`` / ``output.fused_linear_aux.student_mass`` /
+    ``output.fused_linear_aux.teacher_mass`` automatically.
+
+    This test pins exactly that contract end-to-end on a real toy model
+    (both text and VLM families):
+
+    1. The three new ``output`` fields are populated, finite, and have
+       the same shape as the existing ``log_probs`` / ``entropy``.
+    2. ``output.fused_linear_aux.distillation_losses >= 0`` (forward KL is non-negative).
+    3. ``output.fused_linear_aux.student_mass`` and ``output.fused_linear_aux.teacher_mass`` are in
+       ``[0, 1]`` (sums of softmax probabilities on the top-k support).
+    4. ``output.fused_linear_aux.student_mass`` and ``output.fused_linear_aux.teacher_mass`` are detached
+       (``requires_grad=False``) — verl reports them as metrics.
+    5. ``output.fused_linear_aux.distillation_losses`` matches the same kernel computed
+       on the model's penultimate hidden state directly — bitwise on
+       fp32 under determinism. Proves the per-model patchgen wiring is
+       correct.
+    6. Backward through ``output.fused_linear_aux.distillation_losses`` flows gradients
+       into ``model.lm_head.weight``.
+    """
+    _skip_unless_cuda(toy_path)
+    _apply_determinism()
+
+    from veomni.ops.kernels.cross_entropy.chunk_topk_distill import chunk_topk_distill_function
+
+    torch.manual_seed(0)
+    model = _build_model(toy_path, ce_impl="chunk_loss").train()
+    model.zero_grad(set_to_none=True)
+
+    B, L, K = 2, 16, 4
+    # VLM configs nest vocab_size under config.text_config; pull it from
+    # the lm_head weight to stay model-family-agnostic.
+    V = model.lm_head.weight.shape[0]
+    input_ids = torch.randint(0, 32000, (B, L), device=model.device, dtype=torch.long)
+    labels = input_ids.clone()
+    labels[0, 0] = IGNORE_INDEX
+    labels[1, ::5] = IGNORE_INDEX
+
+    # Teacher tensors: derive from a fresh logits draw + log_softmax + topk
+    # so the per-position teacher_mass sums to <= 1 (matches verl's source
+    # which gets them from a real teacher forward).
+    teacher_logits = torch.randn(B, L, V, device=model.device, dtype=torch.float32)
+    teacher_log_probs = teacher_logits.log_softmax(dim=-1)
+    teacher_topk_log_probs, teacher_topk_ids = teacher_log_probs.topk(K, dim=-1)
+    teacher_topk_log_probs = teacher_topk_log_probs.contiguous()
+    teacher_topk_ids = teacher_topk_ids.contiguous()
+
+    out = model(
+        input_ids=input_ids,
+        labels=labels,
+        use_cache=False,
+        return_log_probs=True,
+        teacher_topk_ids=teacher_topk_ids,
+        teacher_topk_log_probs=teacher_topk_log_probs,
+    )
+
+    # 1) Three new fields populated, finite, correct shape.
+    assert out.fused_linear_aux.distillation_losses is not None, f"[{family}] distillation_losses must be populated"
+    assert out.fused_linear_aux.student_mass is not None, f"[{family}] student_mass must be populated"
+    assert out.fused_linear_aux.teacher_mass is not None, f"[{family}] teacher_mass must be populated"
+    for name, t in [
+        ("distillation_losses", out.fused_linear_aux.distillation_losses),
+        ("student_mass", out.fused_linear_aux.student_mass),
+        ("teacher_mass", out.fused_linear_aux.teacher_mass),
+    ]:
+        assert t.shape == labels.shape, f"[{family}] {name} shape {tuple(t.shape)} != labels {tuple(labels.shape)}"
+        assert torch.isfinite(t).all(), f"[{family}] {name} has non-finite values"
+
+    # 2) Forward KL is non-negative *in this synthetic setting*. Top-k
+    #    forward KL on truncated support is only guaranteed >= 0 in the
+    #    full-support limit; here we condition on (peaky teacher
+    #    log_softmax topk) vs (random-init student near log(1/V)) so
+    #    log p_t,k > log q_s,k holds per top-k slot. This both pins the
+    #    expected sign and surfaces a regression if the kernel ever
+    #    flips the (log p_t - log q_s) sign convention.
+    assert (out.fused_linear_aux.distillation_losses >= 0).all(), (
+        f"[{family}] distillation_losses must be >= 0; got min={out.fused_linear_aux.distillation_losses.min().item():.3e}"
+    )
+
+    # 3) Mass values live on [0, 1].
+    assert (out.fused_linear_aux.student_mass >= 0).all() and (out.fused_linear_aux.student_mass <= 1 + 1e-5).all(), (
+        f"[{family}] student_mass out of [0, 1]; "
+        f"got [{out.fused_linear_aux.student_mass.min().item():.3e}, {out.fused_linear_aux.student_mass.max().item():.3e}]"
+    )
+    assert (out.fused_linear_aux.teacher_mass >= 0).all() and (out.fused_linear_aux.teacher_mass <= 1 + 1e-5).all(), (
+        f"[{family}] teacher_mass out of [0, 1]; "
+        f"got [{out.fused_linear_aux.teacher_mass.min().item():.3e}, {out.fused_linear_aux.teacher_mass.max().item():.3e}]"
+    )
+
+    # 4) Mass tensors detached.
+    assert not out.fused_linear_aux.student_mass.requires_grad, f"[{family}] student_mass must be detached"
+    assert not out.fused_linear_aux.teacher_mass.requires_grad, f"[{family}] teacher_mass must be detached"
+
+    # 5) Bitwise equivalence vs the same kernel called directly on the
+    #    model's penultimate hidden state. Best-effort hidden-state extraction
+    #    via output_hidden_states=True; if a model family hides the lm_head
+    #    input we just skip this check (the forward-population coverage from
+    #    steps 1-4 already proves the dispatch wiring).
+    with torch.no_grad():
+        hidden_out = model(
+            input_ids=input_ids,
+            use_cache=False,
+            output_hidden_states=True,
+        )
+    last_hidden = getattr(hidden_out, "hidden_states", None)
+    if last_hidden is not None and len(last_hidden) >= 1:
+        last_hidden_t = last_hidden[-1]  # [B, L, H]
+        _ref_lp, _ref_ent, ref_dist, ref_smass, ref_tmass = chunk_topk_distill_function(
+            last_hidden_t,
+            model.lm_head.weight,
+            labels,
+            teacher_topk_ids,
+            teacher_topk_log_probs,
+        )
+        torch.testing.assert_close(
+            out.fused_linear_aux.distillation_losses,
+            ref_dist,
+            rtol=0,
+            atol=0,
+            msg=lambda m: f"[{family}] distillation_losses != kernel direct: {m}",
+        )
+        torch.testing.assert_close(
+            out.fused_linear_aux.student_mass,
+            ref_smass,
+            rtol=0,
+            atol=0,
+            msg=lambda m: f"[{family}] student_mass != kernel direct: {m}",
+        )
+        torch.testing.assert_close(
+            out.fused_linear_aux.teacher_mass,
+            ref_tmass,
+            rtol=0,
+            atol=0,
+            msg=lambda m: f"[{family}] teacher_mass != kernel direct: {m}",
+        )
+
+    # 6) Backward through distillation_losses reaches lm_head.weight.
+    mask = (labels != IGNORE_INDEX).float()
+    scalar = (out.fused_linear_aux.distillation_losses * mask).sum() / mask.sum().clamp_min(1)
+    scalar.backward()
+    lm_head_grad = model.lm_head.weight.grad
+    assert lm_head_grad is not None, f"[{family}] lm_head.weight.grad must be populated by distillation backward"
+    assert torch.isfinite(lm_head_grad).all(), f"[{family}] lm_head.weight.grad has non-finite values"
+    assert lm_head_grad.abs().max().item() > 0, f"[{family}] lm_head.weight.grad is all zero"
+
+    del model, out
     _release()

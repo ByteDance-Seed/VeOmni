@@ -72,10 +72,13 @@ class CheckpointerCallback(Callback):
             "extra_state": {},
         }
 
-        if getattr(self.trainer.checkpointer, "save_future", None) is not None:  # async save
-            self.trainer.checkpointer.save_future.result()
+        self.trainer.checkpointer.wait_for_pending_save()
 
-        self.trainer.checkpointer.load(args.train.checkpoint.load_path, state)
+        self.trainer.checkpointer.load(
+            args.train.checkpoint.load_path,
+            state,
+            trainable_only=bool(getattr(args.model, "lora_config", None)),
+        )
 
         self.trainer.state.global_step = state["extra_state"]["global_step"]
         self.trainer.start_epoch = self.trainer.state.global_step // args.train_steps
@@ -105,20 +108,40 @@ class CheckpointerCallback(Callback):
 
         save_checkpoint_path = os.path.join(args.train.checkpoint.save_path, f"global_step_{state.global_step}")
 
+        if hasattr(self.trainer, "data_iterator") and hasattr(self.trainer.data_iterator, "state_dict"):
+            train_dataloader_state = self.trainer.data_iterator.state_dict()
+        elif self.trainer.train_dataloader is not None:
+            train_dataloader_state = self.trainer.train_dataloader.state_dict()
+        else:
+            train_dataloader_state = {}
+
         ckpt_state = {
             "model": self.trainer.model,
             "optimizer": self.trainer.optimizer,
             "extra_state": {
                 "global_step": state.global_step,
                 "lr_scheduler": self.trainer.lr_scheduler.state_dict(),
-                "train_dataloader": self.trainer.train_dataloader.state_dict()
-                if self.trainer.train_dataloader is not None
-                else {},
+                "train_dataloader": train_dataloader_state,
                 "environ_meter": self.trainer.environ_meter.state_dict(),
                 "torch_rng_state": torch.get_rng_state(),
             },
         }
-        self.trainer.checkpointer.save(save_checkpoint_path, ckpt_state, save_async=args.train.checkpoint.save_async)
+
+        # Free the training step's residual activations / autograd buffers
+        # before DCP allocates NCCL collective buffers for the gather.
+        # Mirrors the existing post-save ``empty_cache()`` below; without
+        # this pre-save call the save can fight the training step for HBM
+        # (observed as ``NCCL WARN Cuda failure 2 'out of memory'`` inside
+        # dcp.save on Qwen3.5-35B-a3b VL h100x16). Cost: one ``cudaFree``
+        # per ``save_steps``, well below noise.
+        helper.empty_cache()
+
+        self.trainer.checkpointer.save(
+            save_checkpoint_path,
+            ckpt_state,
+            save_async=args.train.checkpoint.save_async,
+            trainable_only=bool(getattr(args.model, "lora_config", None)),
+        )
 
         # Empty cache and barrier
         helper.empty_cache()
@@ -177,8 +200,7 @@ class HuggingfaceCkptCallback(CheckpointerCallback):
             dist.barrier()
             super()._save_checkpoint(state)
 
-        if getattr(self.trainer.checkpointer, "save_future", None) is not None:  # async save
-            self.trainer.checkpointer.save_future.result()
+        self.trainer.checkpointer.wait_for_pending_save()
 
         if stage == "train_end":
             self.trainer.optimizer = None
@@ -214,8 +236,7 @@ class HFLoraCkptCallback(HuggingfaceCkptCallback):
             dist.barrier()
             CheckpointerCallback._save_checkpoint(self, state)
 
-        if getattr(self.trainer.checkpointer, "save_future", None) is not None:  # async save
-            self.trainer.checkpointer.save_future.result()
+        self.trainer.checkpointer.wait_for_pending_save()
 
         if stage == "train_end":
             self.trainer.optimizer = None

@@ -15,10 +15,12 @@
 
 import enum
 from contextlib import nullcontext
-from typing import Tuple, Union
+from typing import Iterable, Optional, Tuple, Union
 
 import torch
 from torch.autograd.graph import saved_tensors_hooks
+
+from ..utils.device import empty_cache, get_device_id, get_device_type
 
 
 class OffloadPolicy(enum.Enum):
@@ -85,3 +87,113 @@ def build_activation_offloading_context(
             model_fwd_context = custom_save_on_cpu(gpu_limit_in_gb=activation_gpu_limit, pin_memory=False)
 
     return model_fwd_context, model_bwd_context
+
+
+def _reset_training_state(model: "torch.nn.Module") -> None:
+    """Force every FSDP2 param-group on ``model`` back to the IDLE training state.
+
+    FSDP2's per-param-group ``_training_state`` is normally advanced by the
+    forward / pre-backward hooks. In RL training loops where the same actor
+    module is repeatedly placed on / off GPU between rollouts and optimizer
+    steps, the training state can be stranded in ``FORWARD`` / ``PRE_BACKWARD``
+    if an outer code path errors out or the engine swaps to vLLM mid-call.
+    The next ``reshard()`` then trips an internal assert.
+
+    This helper is intentionally defensive: the FSDP2 module / training-state
+    APIs are private, so we tolerate ``ImportError`` / ``AttributeError`` to
+    avoid breaking offloading on PyTorch versions where the layout shifts.
+    """
+    try:
+        from torch.distributed.fsdp._fully_shard._fsdp_common import TrainingState
+        from torch.distributed.fsdp._fully_shard._fsdp_state import _get_module_fsdp_state
+    except ImportError:
+        return
+
+    for module in model.modules():
+        state = _get_module_fsdp_state(module)
+        param_group = getattr(state, "_fsdp_param_group", None) if state is not None else None
+        if param_group is None:
+            continue
+        try:
+            param_group._training_state = TrainingState.IDLE
+        except AttributeError:
+            continue
+
+
+@torch.no_grad()
+def offload_model_to_cpu(model: "torch.nn.Module", empty_device_cache: bool = True) -> None:
+    """Move a model wrapped by FSDP2 ``fully_shard`` to CPU.
+
+    Resets any stranded FSDP2 training state, calls ``reshard()`` to drop
+    unsharded parameter all-gathers, and moves remaining parameters to CPU.
+
+    Args:
+        model: Root module returned by :func:`parallelize_model_fsdp2`.
+        empty_device_cache: If ``True``, calls
+            :func:`veomni.utils.device.empty_cache` after the move so the
+            released device memory becomes available to peers (e.g. a
+            co-located vLLM rollout).
+    """
+    _reset_training_state(model)
+    reshard = getattr(model, "reshard", None)
+    if callable(reshard):
+        reshard()
+    model.cpu()
+    if empty_device_cache and get_device_type() != "cpu":
+        empty_cache()
+
+
+@torch.no_grad()
+def load_model_to_gpu(model: "torch.nn.Module", device: Optional[Union[str, "torch.device", int]] = None) -> None:
+    """Move a model wrapped by FSDP2 ``fully_shard`` back to a device.
+
+    Args:
+        model: Root module returned by :func:`parallelize_model_fsdp2`.
+        device: Target device. Defaults to the current CUDA device.
+    """
+    if device is None:
+        device = get_device_id() if get_device_type() != "cpu" else "cpu"
+    model.to(device)
+
+
+def _iter_inner_optimizers(optimizer: "torch.optim.Optimizer") -> "Iterable[torch.optim.Optimizer]":
+    if optimizer is None:
+        return ()
+    if getattr(optimizer, "_is_multi_optimizer", False):
+        return optimizer.optimizers_dict.values()
+    return (optimizer,)
+
+
+@torch.no_grad()
+def offload_optimizer(optimizer: "torch.optim.Optimizer") -> None:
+    """Move all optimizer state tensors to CPU in place.
+
+    Compatible with VeOmni's ``MultiOptimizer`` wrapper as well as a plain
+    :class:`torch.optim.Optimizer`.
+    """
+    for opt in _iter_inner_optimizers(optimizer):
+        if not opt.state:
+            continue
+        for param_group in opt.param_groups:
+            for param in param_group["params"]:
+                state = opt.state[param]
+                for key, value in state.items():
+                    if isinstance(value, torch.Tensor):
+                        state[key] = value.to("cpu", non_blocking=True)
+
+
+@torch.no_grad()
+def load_optimizer(
+    optimizer: "torch.optim.Optimizer",
+    device: Union[str, "torch.device", int],
+) -> None:
+    """Move all optimizer state tensors back to ``device`` in place."""
+    for opt in _iter_inner_optimizers(optimizer):
+        if not opt.state:
+            continue
+        for param_group in opt.param_groups:
+            for param in param_group["params"]:
+                state = opt.state[param]
+                for key, value in state.items():
+                    if isinstance(value, torch.Tensor):
+                        state[key] = value.to(device, non_blocking=True)

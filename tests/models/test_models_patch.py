@@ -1,5 +1,7 @@
 import copy
+import functools
 import gc
+import importlib
 import os
 import sys
 from typing import Dict
@@ -39,6 +41,108 @@ from .utils import (
 os.environ["NCCL_DEBUG"] = "OFF"
 # os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 # enable_full_determinism(42)
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Test-scope shim for a transformers 5.9 upstream bug in qwen-family multimodal
+# `Model.forward(**kwargs)` paths.
+#
+# The bug: upstream Qwen*VLModel / Qwen*OmniModel-style `forward` accepts
+# `**kwargs` and forwards them as-is into `self.visual(..., **kwargs)`. When
+# the outer caller has populated `FlashAttentionKwargs` (`cu_seq_lens_q/k`,
+# `max_length_q/k`) for the LM packed-sequence path — which VeOmni's data
+# pipeline always does — those LM-level keys ride through the ViT block
+# chain and reach `*VisionAttention.forward`, which then does:
+#
+#     attention_interface(..., cu_seq_lens_q=cu_seqlens, ..., **kwargs)
+#
+# Same key on both sides → `TypeError: got multiple values for keyword
+# argument 'cu_seq_lens_q'` at the Python call site, before any function body
+# even runs.
+#
+# We do NOT hit this in production. VeOmni's own patched `Model.forward`
+# (loaded via patchgen at `veomni/models/transformers/<m>/generated/`) builds
+# a clean `image_vit_kwargs = {"vit_metadata": ...}` and never forwards the
+# LM kwargs into the visual call — see e.g.
+# `qwen2_vl_gpu_patch_gen_config.py:409` (`image_vit_kwargs`). So the
+# `MODELING_BACKEND=veomni` mode in this test passes without any patching.
+#
+# But this test ALSO exercises `MODELING_BACKEND=hf` (raw upstream modeling)
+# for HF↔VeOmni numerics parity, and that path imports the upstream modeling
+# files directly — patchgen never runs. To keep the `hf` arm running on
+# transformers 5.9, we wrap the upstream ViT classes' `.forward` here and pop
+# the leaked keys at the ViT entrypoint. The wrap is scoped to this test
+# module — the runtime VeOmni stack (`veomni/ops/...`) ships with no such
+# monkey-patch, on purpose (see `docs/transformers_v5/patchgen.md`: VeOmni
+# avoids runtime monkey-patching of upstream model code).
+#
+# Drop this shim when upstream stops leaking the LM-level FlashAttentionKwargs
+# into the visual call (it would also need to filter them out of the
+# `Model.forward(**kwargs)` → `self.visual(**kwargs)` chain).
+# ────────────────────────────────────────────────────────────────────────────
+_HF_VIT_FORWARDS_PATCHED = False
+_LEAKED_LM_FLASH_KWARGS = (
+    "cu_seq_lens_q",
+    "cu_seq_lens_k",
+    "max_length_q",
+    "max_length_k",
+)
+# Both the visual and (for omni models) audio encoder forwards leak — the
+# `forward` of each receives `**kwargs` from the outer `Model.forward` and
+# threads them into the per-block attention call. Wrap both at the encoder
+# entrypoint.
+_HF_VIT_CLASSES_TO_STRIP: tuple[tuple[str, str], ...] = (
+    ("transformers.models.qwen2_vl.modeling_qwen2_vl", "Qwen2VisionTransformerPretrainedModel"),
+    ("transformers.models.qwen2_5_vl.modeling_qwen2_5_vl", "Qwen2_5_VisionTransformerPretrainedModel"),
+    ("transformers.models.qwen3_vl.modeling_qwen3_vl", "Qwen3VLVisionModel"),
+    ("transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe", "Qwen3VLMoeVisionModel"),
+    ("transformers.models.qwen3_5.modeling_qwen3_5", "Qwen3_5VisionModel"),
+    ("transformers.models.qwen3_5_moe.modeling_qwen3_5_moe", "Qwen3_5MoeVisionModel"),
+    ("transformers.models.qwen2_5_omni.modeling_qwen2_5_omni", "Qwen2_5OmniVisionEncoder"),
+    ("transformers.models.qwen2_5_omni.modeling_qwen2_5_omni", "Qwen2_5OmniAudioEncoder"),
+    ("transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe", "Qwen3OmniMoeVisionEncoder"),
+    ("transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe", "Qwen3OmniMoeAudioEncoder"),
+)
+
+
+def _patch_hf_vit_forwards_for_5_9_flash_kwargs_leak() -> None:
+    """Wrap upstream qwen-family ViT ``forward`` to pop LM-level flash kwargs.
+
+    See the module-level comment block above for the full rationale. Idempotent
+    via ``_HF_VIT_FORWARDS_PATCHED`` and a per-method marker, and a no-op for
+    VeOmni's patchgen-generated classes (they are different Python objects).
+    """
+    global _HF_VIT_FORWARDS_PATCHED
+    if _HF_VIT_FORWARDS_PATCHED:
+        return
+
+    def _strip_leaked(forward):
+        @functools.wraps(forward)
+        def wrapped(*args, **kwargs):
+            for key in _LEAKED_LM_FLASH_KWARGS:
+                kwargs.pop(key, None)
+            return forward(*args, **kwargs)
+
+        wrapped._hf_vit_kwargs_strip = True
+        return wrapped
+
+    for module_path, class_name in _HF_VIT_CLASSES_TO_STRIP:
+        try:
+            mod = importlib.import_module(module_path)
+        except ImportError:
+            continue
+        cls = getattr(mod, class_name, None)
+        if cls is None:
+            continue
+        if getattr(cls.forward, "_hf_vit_kwargs_strip", False):
+            continue
+        cls.forward = _strip_leaked(cls.forward)
+
+    _HF_VIT_FORWARDS_PATCHED = True
+
+
+# Apply at module import — test-scope, idempotent.
+_patch_hf_vit_forwards_for_5_9_flash_kwargs_leak()
 
 
 def _release_device_memory():

@@ -129,3 +129,10 @@ def create_deepseek_v3_checkpoint_tensor_converter(model):
     return DeepseekV3CheckpointTensorConverter(
         num_experts=model.config.n_routed_experts,
     )
+
+
+def convert_deepseek_v3_fqn_to_index_mapping(fqn_to_index_mapping: Dict[str, int]) -> Dict[str, int]:
+    """Align HF safetensors index keys with fused expert parameter names."""
+    from ..._moe_fused_weight_map import convert_per_expert_fqn_mapping_to_fused
+
+    return convert_per_expert_fqn_mapping_to_fused(fqn_to_index_mapping, _EXPERT_PATTERN)

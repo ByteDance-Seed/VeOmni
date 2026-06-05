@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-Patch configuration for Qwen3-VL-MoE transformers>=5.2.0 code generation.
+Patch configuration for Qwen3-VL-MoE transformers>=5.9.0 code generation.
 
 Reuses the full set of qwen3_vl VLM patches via `name_map={"Qwen3VL": "Qwen3VLMoe"}`
 (vision SP, deepstack, async Ulysses attention, precomputed position-ids, fused
@@ -23,8 +23,10 @@ loss) and layers the MoE-specific patches on top:
     through fused loss + aux_loss and register the expert parallel plan.
 
 Regen command:
-python -m veomni.patchgen.run_codegen veomni.models.transformers.qwen3_vl_moe.qwen3_vl_moe_gpu_patch_gen_config -o veomni/models/transformers/qwen3_vl_moe/generated --diff
+patchgen veomni.models.transformers.qwen3_vl_moe.qwen3_vl_moe_gpu_patch_gen_config -o veomni/models/transformers/qwen3_vl_moe/generated --diff
 """
+
+from types import SimpleNamespace
 
 import torch
 import torch.distributed as dist
@@ -45,12 +47,13 @@ from veomni.distributed.sequence_parallel import (
     slice_input_tensor,
 )
 from veomni.models.transformers.qwen3_vl.qwen3_vl_gpu_patch_gen_config import (
-    config as qwen3_vl_config,
-)
-from veomni.models.transformers.qwen3_vl.qwen3_vl_gpu_patch_gen_config import (
+    apply_rotary_pos_emb_patched,
+    apply_rotary_pos_emb_vision_patched,
+    qwen3_vl_get_metadata_collate_func_patched,
     qwen3_vl_get_position_id_func_patched,
     qwen3_vl_model_get_image_features_patched,
     qwen3_vl_model_get_placeholder_mask_patched,
+    qwen3_vl_rmsnorm_forward_patched,
     qwen3_vl_text_attention_forward_patched,
     qwen3_vl_text_deepstack_process_patched,
     qwen3_vl_vision_attention_forward_patched,
@@ -60,7 +63,9 @@ from veomni.models.transformers.qwen3_vl.qwen3_vl_gpu_patch_gen_config import (
     qwen3_vl_vision_forward_patched,
     qwen3_vl_vision_rot_pos_emb_patched,
 )
-from veomni.ops import fused_moe_forward
+from veomni.models.transformers.qwen3_vl.qwen3_vl_gpu_patch_gen_config import (
+    config as qwen3_vl_config,
+)
 from veomni.patchgen.patch_spec import PatchConfig
 from veomni.utils.model_outputs import Qwen3VLMoeCausalLMOutputWithLogProbs
 
@@ -76,12 +81,17 @@ config = PatchConfig(
 # reused VLM patches depends on these helpers (`rot_pos_ids`,
 # `_qwen3_vl_async_ulysses_attention_forward`, `get_position_id`) being
 # available at module scope in the generated modeling.
+#
+# We deliberately filter out `_Qwen3VLFakeForPosID`: helpers are emitted
+# verbatim by patchgen and bypass the per-patch `name_map`, so the qwen3_vl
+# class would land here with its body still referencing `Qwen3VLModel`
+# (undefined in this generated file). A Moe-specific helper is registered
+# below via `@config.add_helper`, mirroring qwen3_vl's helper but binding
+# to `Qwen3VLMoeModel`.
 config.additional_imports.extend(qwen3_vl_config.additional_imports)
 config.post_import_blocks.extend(qwen3_vl_config.post_import_blocks)
-config.helpers.extend(qwen3_vl_config.helpers)
+config.helpers.extend(h for h in qwen3_vl_config.helpers if h.__name__ != "_Qwen3VLFakeForPosID")
 
-# Additional import for the fused MoE dispatch in `PatchedQwen3VLMoeTextExperts`.
-config.add_import("veomni.ops", names=["fused_moe_forward"])
 # Surface ``Qwen3VLMoeCausalLMOutputWithLogProbs`` so the patched multimodal
 # ``forward`` can return per-token log-probs / entropy as constructor fields
 # while preserving ``aux_loss`` and ``rope_deltas``. Mutating
@@ -89,7 +99,10 @@ config.add_import("veomni.ops", names=["fused_moe_forward"])
 # would bypass ``ModelOutput`` pytree flattening, breaking FSDP2's pre-backward
 # unshard hook on ``lm_head`` and triggering ``setStorage … storage of size 0``
 # in ``chunk_logprobs.backward`` (parallels VeOmni #731's qwen3_5_moe fix).
-config.add_import("veomni.utils.model_outputs", names=["Qwen3VLMoeCausalLMOutputWithLogProbs"])
+config.add_import(
+    "veomni.utils.model_outputs",
+    names=["FusedLinearAuxOutput", "FusedLinearAuxOutputMixin", "Qwen3VLMoeCausalLMOutputWithLogProbs"],
+)
 config.drop_import_names("Qwen3VLMoeCausalLMOutputWithPast")
 
 config.add_post_import_block(
@@ -105,11 +118,40 @@ config.add_post_import_block(
 
 
 # ================================================================
+# Helper: _Qwen3VLMoeFakeForPosID  (emitted into the generated file via
+# add_helper). Picklable fake `self` used by `get_position_id_func`.
+# Mirrors qwen3_vl's `_Qwen3VLFakeForPosID` but binds to `Qwen3VLMoeModel`
+# — patchgen emits helpers verbatim (bypassing the per-patch `name_map`),
+# so a Moe-specific version is required here.
+# ================================================================
+@config.add_helper
+class _Qwen3VLMoeFakeForPosID(SimpleNamespace):  # noqa: F821 SimpleNamespace declared in qwen3_vl's add_post_import_block which we inherit above
+    """Picklable fake `self` used by `get_position_id_func` — must be a
+    module-level class so `get_vision_position_ids` survives the pickle
+    round-trip that happens when this object reaches a dataloader worker
+    via `multiprocessing.spawn`. Assigning a bound method to a plain
+    `SimpleNamespace` instance deadlocks on unpickle (`AttributeError:
+    'types.SimpleNamespace' object has no attribute 'get_vision_position_ids'`)
+    because pickle reduces a bound method to `getattr(self.__self__, name)`
+    and `name` is the very attribute being restored from `__dict__`. As a
+    class attribute, the method is resolved via class lookup and never has
+    to be pickled."""
+
+    def get_vision_position_ids(self, *args, **kwargs):
+        return Qwen3VLMoeModel.get_vision_position_ids(self, *args, **kwargs)  # noqa: F821 defined in generated modeling file
+
+
+# ================================================================
 # Reused VLM patches from qwen3_vl (name_map rewrites Qwen3VL* -> Qwen3VLMoe*
 # inside the patch bodies so they target the sibling classes).
 # ================================================================
 _NAME_MAP = {"Qwen3VL": "Qwen3VLMoe"}
-
+config.override_method(
+    "Qwen3VLMoeTextRMSNorm.forward",
+    replacement=qwen3_vl_rmsnorm_forward_patched,
+    name_map=_NAME_MAP,
+    description="OpSlot guard for Liger fused RMSNorm (standard formulation)",
+)
 config.override_method(
     "Qwen3VLMoeVisionAttention.forward",
     replacement=qwen3_vl_vision_attention_forward_patched,
@@ -176,6 +218,22 @@ config.override_method(
     name_map=_NAME_MAP,
     description="Use VeOmni precomputed position-id function and unified multimodal token ids",
 )
+config.override_method(
+    "Qwen3VLMoeForConditionalGeneration.get_metadata_collate_func",
+    replacement=qwen3_vl_get_metadata_collate_func_patched,
+    name_map=_NAME_MAP,
+    description="Expose CPU-side ViT multimodal-metadata derivation to the VeOmni collator",
+)
+config.replace_function(
+    "apply_rotary_pos_emb",
+    replacement=apply_rotary_pos_emb_patched,
+    description="OpSlot guard for Liger fused RoPE",
+)
+config.replace_function(
+    "apply_rotary_pos_emb_vision",
+    replacement=apply_rotary_pos_emb_vision_patched,
+    description="OpSlot guard for Liger fused vision RoPE",
+)
 
 
 # ================================================================
@@ -219,16 +277,7 @@ class PatchedQwen3VLMoeTextExperts(nn.Module):
         final_hidden_states = torch.zeros_like(hidden_states)
         # --- Patch.2 ---
         if veomni_moe_experts_forward.use_non_eager_impl:
-            return fused_moe_forward(
-                num_experts=self.num_experts,
-                routing_weights=top_k_weights.to(final_hidden_states.dtype),
-                selected_experts=top_k_index,
-                hidden_states=hidden_states,
-                fc1_1_weight=None,
-                fc1_2_weight=None,
-                fc2_weight=self.down_proj,
-                fc1_1_2_weight=self.gate_up_proj,
-            )
+            return veomni_moe_experts_forward(self, hidden_states, top_k_index, top_k_weights)
         # --- Patch.2 ---
 
         with torch.no_grad():
@@ -294,6 +343,9 @@ def qwen3_vl_moe_model_forward_patched(
     # --- Patch.2 ---
     image_mask = kwargs.pop("image_mask", None)
     video_mask = kwargs.pop("video_mask", None)
+    # v5 multimodal RoPE input; consumed here so it is not forwarded to the
+    # language model. Derived from input_ids below when not supplied.
+    mm_token_type_ids = kwargs.pop("mm_token_type_ids", None)
     if video_mask is None and image_mask is None:
         if get_parallel_state().sp_enabled:
             input_ids_list = [torch.zeros_like(input_ids) for _ in range(get_parallel_state().sp_size)]
@@ -316,11 +368,33 @@ def qwen3_vl_moe_model_forward_patched(
         inputs_embeds = gather_outputs(inputs_embeds, gather_dim=1, group=get_parallel_state().sp_group)
     # --- Patch.1 ---
 
+    # --- Patch.6 ---
+    # Mirror of qwen3_vl: unpack per-modality ViT kwargs from
+    # `multimodal_metadata` (collator-precomputed) so the patched ViT
+    # forward can skip the in-forward .tolist() / cu_seqlens build.
+    # See .agents/knowledge/multimodal_metadata.md.
+    multimodal_metadata = kwargs.pop("multimodal_metadata", None) or {}
+    image_vit_kwargs = {
+        "vit_metadata": {
+            "grid_thw_list": multimodal_metadata.get("image_grid_thw_list"),
+            "cu_seqlens": multimodal_metadata.get("vit_image_cu_seqlens"),
+            "max_seqlen": multimodal_metadata.get("vit_image_max_seqlen"),
+        }
+    }
+    video_vit_kwargs = {
+        "vit_metadata": {
+            "grid_thw_list": multimodal_metadata.get("video_grid_thw_list"),
+            "cu_seqlens": multimodal_metadata.get("vit_video_cu_seqlens"),
+            "max_seqlen": multimodal_metadata.get("vit_video_max_seqlen"),
+        }
+    }
+    # --- Patch.6 ---
+
     fake_deepstack = None
 
     if pixel_values is not None:
         image_outputs: BaseModelOutputWithDeepstackFeatures = self.get_image_features(
-            pixel_values, image_grid_thw, return_dict=True
+            pixel_values, image_grid_thw, return_dict=True, **image_vit_kwargs
         )
         image_embeds = image_outputs.pooler_output
         deepstack_image_embeds = image_outputs.deepstack_features
@@ -370,7 +444,7 @@ def qwen3_vl_moe_model_forward_patched(
 
     if pixel_values_videos is not None:
         video_outputs: BaseModelOutputWithDeepstackFeatures = self.get_video_features(
-            pixel_values_videos, video_grid_thw, return_dict=True
+            pixel_values_videos, video_grid_thw, return_dict=True, **video_vit_kwargs
         )
         video_embeds = video_outputs.pooler_output
         deepstack_video_embeds = video_outputs.deepstack_features
@@ -460,6 +534,20 @@ def qwen3_vl_moe_model_forward_patched(
                 "is enabled; multimodal position_ids must be precomputed via "
                 "`get_position_id_func` in the VeOmni data pipeline."
             )
+        # v5 `compute_3d_position_ids` gates M-RoPE on `mm_token_type_ids`
+        # via its `can_compute_mrope` check; without it the multimodal
+        # branch silently falls through and the call returns `None`,
+        # leaving `position_ids=None` for the language model. Derive
+        # `mm_token_type_ids` from `input_ids` here so the M-RoPE branch
+        # actually runs whenever multimodal grids are present.
+        if (
+            mm_token_type_ids is None
+            and input_ids is not None
+            and (image_grid_thw is not None or video_grid_thw is not None)
+        ):
+            mm_token_type_ids = mm_token_type_ids_from_input_ids(  # noqa: F821 defined via add_helper
+                input_ids, self.config
+            )
         position_ids = self.compute_3d_position_ids(
             input_ids=input_ids,
             image_grid_thw=image_grid_thw,
@@ -467,6 +555,7 @@ def qwen3_vl_moe_model_forward_patched(
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask_tensor,
             past_key_values=past_key_values,
+            mm_token_type_ids=mm_token_type_ids,
         )
         # --- Patch.5 ---
     else:
@@ -550,12 +639,11 @@ def qwen3_vl_moe_for_conditional_generation_forward_patched(
     # --- Patch.1 ---
     loss = None
     logits = None
-    log_probs = None
-    entropy = None
+    fused_linear_aux = None
     if labels is not None:
         # Modification: OpSlot guard for cross-entropy loss.
         if veomni_causal_lm_loss.use_non_eager_impl:
-            loss, logits, log_probs, entropy = veomni_causal_lm_loss(
+            loss, logits, fused_linear_aux = veomni_causal_lm_loss(
                 logits=logits,
                 labels=labels,
                 vocab_size=self.config.text_config.vocab_size,
@@ -566,9 +654,9 @@ def qwen3_vl_moe_for_conditional_generation_forward_patched(
         else:
             logits = self.lm_head(hidden_states)
             # Modification: VeOmni's patched `loss_function` (via LOSS_MAPPING)
-            # returns (loss, logits, log_probs, entropy); unpack to match the
+            # returns (loss, logits, fused_linear_aux); unpack to match the
             # OpSlot branch above.
-            loss, logits, log_probs, entropy = self.loss_function(
+            loss, _, fused_linear_aux = self.loss_function(
                 logits=logits,
                 labels=labels,
                 vocab_size=self.config.text_config.vocab_size,
@@ -576,6 +664,10 @@ def qwen3_vl_moe_for_conditional_generation_forward_patched(
                 weights=self.lm_head.weight,
                 **kwargs,
             )
+            if fused_linear_aux is not None:
+                # fused_linear_aux path empties loss/logits slots; clear the local 3D
+                # logits so output mirrors the OpSlot branch's contract.
+                logits = None
     else:
         logits = self.lm_head(hidden_states)
     # --- Patch.1 ---
@@ -611,8 +703,7 @@ def qwen3_vl_moe_for_conditional_generation_forward_patched(
         attentions=outputs.attentions,
         rope_deltas=outputs.rope_deltas,
         router_logits=getattr(outputs, "router_logits", None),
-        log_probs=log_probs,
-        entropy=entropy,
+        fused_linear_aux=fused_linear_aux,
     )
 
 

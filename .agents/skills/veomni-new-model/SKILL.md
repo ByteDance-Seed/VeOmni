@@ -90,6 +90,15 @@ Phase 6: Test                          -> pending
 3. If the model needs custom collator logic:
    - Extend `veomni/data/data_collator.py`
 
+4. **VLM only — multimodal metadata precompute**: to keep the ViT forward free
+   of host-device CUDA syncs, derive ViT `cu_seqlens` / `max_seqlen` in the
+   collator rather than the forward. Follow the checklist in
+   `.agents/knowledge/multimodal_metadata.md` ("Adding the hook to a new model"):
+   a `collate_multimodal_metadata` patchgen helper + a `get_metadata_collate_func`
+   override, the per-modality `vit_metadata` sub-dict threaded through
+   Model.forward → ViT.forward (with a runtime fallback), and the model added to
+   `_MM_METADATA_WIRED_CASES` in the sync gate test.
+
 ## Phase 6: Test
 
 1. **Create toy config**: Add `tests/toy_config/<model_name>_toy/config.json` with minimal parameters for fast testing.
@@ -113,4 +122,4 @@ Phase 6: Test                          -> pending
 - **Model registry**: Registration must happen at import time in `__init__.py`. If the model's `AutoConfig` type is not registered, `build_foundation_model()` will fail.
 - **Generated files**: Never edit files in `generated/` directories — they are overwritten by patchgen. Edit the matching `<model>_{gpu,npu}_patch_gen_config.py` and re-run `make patchgen` instead.
 - **Tokenizer compatibility**: Some models require specific tokenizer versions or custom chat templates — verify in `veomni/data/chat_template.py`.
-- **Transformers version**: All modeling targets `transformers==5.2.0` (pinned by the `transformers-stable` default dependency group). Models register through the patchgen-generated path under `generated/`; do not introduce legacy `modeling_<m>.py` files or `apply_veomni_<m>_patch()` helpers.
+- **Transformers version**: All modeling targets `transformers==5.9.0` (pinned by the `transformers-stable` default dependency group). Models register through the patchgen-generated path under `generated/`; do not introduce legacy `modeling_<m>.py` files or `apply_veomni_<m>_patch()` helpers.

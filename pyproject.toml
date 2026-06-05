@@ -26,14 +26,18 @@ dependencies = [
   # Comment out transformers version so pip users do not accidentally pull in a
   # version that conflicts with the uv-managed setup.
   # For uv user: the actual version is pinned by the "transformers-stable"
-  # default dependency-group (==5.2.0).
-  # For pip user: please install 5.2.0 manually via `pip install transformers==5.2.0`.
-  # "transformers==5.2.0",
+  # default dependency-group (==5.9.0).
+  # For pip user: please install 5.9.0 manually via `pip install transformers==5.9.0`.
+  # "transformers==5.9.0",
   "psutil",
   "timm",
   "wandb",
   "setuptools",
   "einops>=0.8.1",
+  # matplotlib is used by veomni.utils.moe_monitor to render the per-step
+  # MoE expert-load heatmap that gets logged to wandb. Falls back to scalar
+  # metrics only if matplotlib is missing.
+  "matplotlib>=3.7",
 ]
 
 [project.optional-dependencies]
@@ -59,7 +63,7 @@ video = [
   "soundfile>=0.13.1,<0.14"
 ]
 dit = [
-  "diffusers==0.36.0",
+  "diffusers==0.37.0",
   "torchcodec",
   "av>=14.3.0,<15.0; python_version == '3.11'",
   "av>=14.0.0,<14.3; python_version == '3.12'",
@@ -132,6 +136,7 @@ flash-qla = [
 dev = [
   {include-group = "lint"},
   {include-group = "test"},
+  {include-group = "patchgen"},
 ]
 lint = [
   "pre-commit",
@@ -142,32 +147,51 @@ test = [
   "pytest",
   "expecttest",
 ]
+# AST-based patchgen library. Build-time tool for regenerating modeling
+# patches under veomni/models/transformers/*/generated/; not imported on
+# the runtime path. Lives as a sibling project under ./patchgen-pkg/ for
+# monorepo dev; `[tool.uv.sources].patchgen` points uv at the path.
+# (Outer dir is ``patchgen-pkg`` rather than ``patchgen`` because Python's
+# namespace-package finder would otherwise treat the sibling dir as
+# ``import patchgen`` and shadow the editable install when cwd is the
+# VeOmni repo root.) When patchgen lands on PyPI / a byted SCM mirror,
+# move this entry to [project.optional-dependencies].dev so pip users can
+# install it via `pip install veomni[dev]`.
+patchgen = [
+  "patchgen>=0.1.0",
+]
 # Pin the default transformers version via a dependency group. This is a
 # default group (see default-groups below), so `uv sync` always installs
-# transformers==5.2.0.
+# transformers==5.9.0.
 #
 # Why a dependency group instead of `[project.dependencies]`? It keeps the
 # transformers version out of the wheel metadata so pip users are not forced
 # into a specific 5.x patch release.
 transformers-stable = [
-  "transformers==5.2.0"
+  "transformers==5.9.0"
 ]
 
 [tool.uv]
-# This locks the uv version so that we have a consistent uv behavior across the board.
-# Inconsistent uv versions might generate different uv lock files which creates chaos.
+# Accept a range of uv versions rather than an exact pin. Supported range:
+# 0.9.8 through 0.11.x; developers are encouraged to stay reasonably current
+# within it. An exact pin goes stale almost immediately (uv ships weekly —
+# 0.11.17 landed days after we pinned 0.11.16) and needlessly blocks local
+# devs whose uv differs by a patch release. This window will be tightened
+# again later.
 #
-# NOTE 1: Update this at least once per month as uv releases new version every week.
-# NOTE 2: When updating this line, make sure to update Dockerfile under docker/ to the same
-#         version and release new docker images.
-required-version = "==0.9.8"
+# Reproducibility is preserved because CI and the docker/ images install a
+# concrete, in-range uv (currently 0.11.16) and never re-resolve the lockfile
+# (docker: `uv sync --locked`; CI: `uv run --frozen`). Those concrete uv pins
+# — the docker/ Dockerfiles and .github/workflows/check_patchgen.yml — must
+# stay inside this range.
+required-version = ">=0.9.8,<0.12"
 no-build-isolation-package = [
     "flash-attn",
     "flash-attn-3",
 ]
 
 # The "transformers-stable" dependency group is synced by default, ensuring
-# that `uv sync` (with no extra flags) installs transformers==5.2.0.
+# that `uv sync` (with no extra flags) installs transformers==5.9.0.
 default-groups = ["transformers-stable"]
 
 override-dependencies = [
@@ -205,6 +229,9 @@ conflicts = [
 ]
 
 [tool.uv.sources]
+# Sibling patchgen project under ./patchgen-pkg — once published, drop
+# this entry and uv resolves the version pin from the registry instead.
+patchgen = { path = "patchgen-pkg", editable = true }
 # To support override-dependencies for multiple extras, one package can only have one index.
 # Using pytorch index for all variants since it has both regular and +cpu versions
 torch = [
@@ -275,7 +302,19 @@ version = {attr = "veomni._version.__version__"}
 
 [tool.setuptools.packages.find]
 where = ["."]
-exclude = ["tests*", "ci*", "configs*", "veomni_patch", "tasks", "scripts"]
+# ``patchgen-pkg*`` keeps the sibling patchgen project from being bundled into
+# the veomni wheel — it ships separately. (The outer dir name carries the
+# ``-pkg`` suffix so setuptools' namespace-package finder doesn't see it as a
+# top-level ``patchgen`` package and shadow the editable install at dev time.)
+exclude = ["tests*", "ci*", "configs*", "veomni_patch", "tasks", "scripts", "patchgen-pkg*"]
+
+# VeOmni's own discovery config — used when running ``patchgen --check`` /
+# ``patchgen --all`` from this repo. Downstream projects override it in
+# their own pyproject.toml.
+[tool.patchgen]
+search_root = "veomni/models/transformers"
+package_prefix = "veomni.models.transformers"
+legacy_patches_prefix = "veomni.models.transformers.qwen3.patches"
 
 [tool.ruff]
 target-version = "py311"

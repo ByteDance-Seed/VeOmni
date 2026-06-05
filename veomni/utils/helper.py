@@ -119,6 +119,10 @@ def _compute_wan_seqlens(micro_batch: Dict[str, "torch.Tensor"]) -> List[int]:
     dit_latents_seqlens = []
     for latents in micro_batch["latents"]:
         latent_shape = latents.shape
+        if len(latent_shape) == 3:
+            B, seq_len, _C = latent_shape
+            dit_latents_seqlens.append(B * seq_len)
+            continue
         if len(latent_shape) == 5:
             B = latent_shape[0]
         else:
@@ -569,8 +573,13 @@ def unwrap_model(model: "nn.Module") -> "nn.Module":
 def print_example(example: Dict[str, "torch.Tensor"], rank: int, print_tensor: bool = True) -> None:
     """
     Logs a single example to screen.
+
+    Nested dicts (e.g. ``multimodal_metadata`` from ``PackingCollator``)
+    are expanded one level so inner tensor shapes/devices stay visible
+    instead of being collapsed into a single dict-repr line.
     """
-    for key, value in example.items():
+
+    def _log(key: str, value: Any) -> None:
         if isinstance(value, torch.Tensor):
             if print_tensor:
                 logger.info(f"[rank {rank}]: {key}'s shape: {value.shape}, device: {value.device}, {value}")
@@ -578,6 +587,13 @@ def print_example(example: Dict[str, "torch.Tensor"], rank: int, print_tensor: b
                 logger.info(f"[rank {rank}]: {key}'s shape: {value.shape}, device: {value.device}")
         else:
             logger.info(f"[rank {rank}]: {key}'s value: {value}")
+
+    for key, value in example.items():
+        if isinstance(value, dict):
+            for inner_key, inner_value in value.items():
+                _log(f"{key}[{inner_key!r}]", inner_value)
+        else:
+            _log(key, value)
 
 
 def dict2device(input_dict: dict):

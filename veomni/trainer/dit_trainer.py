@@ -39,7 +39,7 @@ from ..utils.device import (
     get_device_type,
     synchronize,
 )
-from .base import BaseTrainer
+from .base import BaseTrainer, VeOmniIter
 
 
 logger = helper.create_logger(__name__)
@@ -409,6 +409,8 @@ class DiTTrainer:
         def _to_device(v: Any) -> Any:
             if isinstance(v, torch.Tensor):
                 return v.to(self.base.device, non_blocking=True)
+            if isinstance(v, dict):
+                return {k: _to_device(vv) for k, vv in v.items()}
             if isinstance(v, list):
                 return [_to_device(item) for item in v]
             return v
@@ -539,13 +541,16 @@ class DiTTrainer:
             self.on_epoch_begin()
 
             if self.base.train_dataloader is not None:
-                data_iterator = iter(self.base.train_dataloader)
+                self.base.data_iterator = VeOmniIter(
+                    self.base.train_dataloader,
+                    use_background_prefetcher=args.data.dataloader.use_background_prefetcher,
+                )
             else:
-                data_iterator = None
+                self.base.data_iterator = None
 
             for _ in range(self.base.start_step, args.train_steps):
                 try:
-                    self.train_step(data_iterator)
+                    self.train_step(self.base.data_iterator)
                 except StopIteration:
                     logger.info(f"epoch:{epoch} Dataloader finished with drop_last {args.data.dataloader.drop_last}")
                     break
@@ -553,8 +558,13 @@ class DiTTrainer:
             self.on_epoch_end()
             self.base.start_step = 0
             helper.print_device_mem_info(f"VRAM usage after epoch {epoch + 1}")
+            if args.data.dataloader.use_background_prefetcher:
+                self.base.data_iterator.stop()
 
         self.on_train_end()
+
+        if args.data.dataloader.use_background_prefetcher:
+            self.base.data_iterator.stop()
 
         synchronize()
 

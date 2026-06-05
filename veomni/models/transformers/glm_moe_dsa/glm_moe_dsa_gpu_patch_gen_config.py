@@ -15,7 +15,10 @@ config = PatchConfig(
 
 # Surface ``CausalLMOutputWithLogProbs`` so the patched ``forward`` can
 # return per-token log-probs in the unified output dataclass.
-config.add_import("veomni.utils.model_outputs", names=["CausalLMOutputWithLogProbs"])
+config.add_import(
+    "veomni.utils.model_outputs",
+    names=["FusedLinearAuxOutput", "FusedLinearAuxOutputMixin", "CausalLMOutputWithLogProbs"],
+)
 
 # TODO: glm_moe_dsa GPU and NPU configs are currently full copies of each
 # other. Consider consolidating (NPU config imports shared patch functions
@@ -63,12 +66,11 @@ def glm_moe_dsa_forcausallm_forward_patched(
 
     loss = None
     logits = None
-    log_probs = None
-    entropy = None
+    fused_linear_aux = None
     if labels is not None:
         # Modification: OpSlot guard for cross-entropy loss.
         if veomni_causal_lm_loss.use_non_eager_impl:
-            loss, logits, log_probs, entropy = veomni_causal_lm_loss(
+            loss, logits, fused_linear_aux = veomni_causal_lm_loss(
                 logits=logits,
                 labels=labels,
                 vocab_size=self.config.vocab_size,
@@ -78,7 +80,7 @@ def glm_moe_dsa_forcausallm_forward_patched(
             )
         else:
             logits = self.lm_head(hidden_states)
-            loss, _, log_probs, entropy = self.loss_function(
+            loss, _, fused_linear_aux = self.loss_function(
                 logits=logits,
                 labels=labels,
                 vocab_size=self.config.vocab_size,
@@ -86,8 +88,8 @@ def glm_moe_dsa_forcausallm_forward_patched(
                 weights=self.lm_head.weight,
                 **kwargs,
             )
-            if log_probs is not None:
-                # log_probs path empties loss/logits slots; clear the local 3D
+            if fused_linear_aux is not None:
+                # fused_linear_aux path empties loss/logits slots; clear the local 3D
                 # logits so output mirrors the OpSlot branch's contract.
                 logits = None
     else:
@@ -96,8 +98,7 @@ def glm_moe_dsa_forcausallm_forward_patched(
     return CausalLMOutputWithLogProbs(
         loss=loss,
         logits=logits,
-        log_probs=log_probs,
-        entropy=entropy,
+        fused_linear_aux=fused_linear_aux,
         past_key_values=outputs.past_key_values,
         hidden_states=outputs.hidden_states,
         attentions=outputs.attentions,

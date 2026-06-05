@@ -60,6 +60,7 @@ class CheckpointerBase(ABC):
         state: Dict[str, Any],
         save_async: Optional[bool],
         global_steps: Optional[int],
+        trainable_only: bool = False,
     ):
         return
 
@@ -68,7 +69,17 @@ class CheckpointerBase(ABC):
         cls,
         path: str,
         state: Dict[str, Any],
+        trainable_only: bool = False,
     ):
+        return
+
+    @classmethod
+    def wait_for_pending_save(cls) -> None:
+        """Block until any in-flight async save completes.
+
+        Default: no-op for backends that do not support async saves.
+        Backends with async support (e.g. DCP) override this.
+        """
         return
 
 

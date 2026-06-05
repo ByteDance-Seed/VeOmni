@@ -21,7 +21,7 @@ test:
 	pytest tests/
 
 patchgen:
-	python -m veomni.patchgen.run_codegen --all --diff
+	patchgen --all --diff
 
 check-patchgen:
-	python -m veomni.patchgen.check_patchgen
+	patchgen --check

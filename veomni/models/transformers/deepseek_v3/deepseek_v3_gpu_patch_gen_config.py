@@ -15,7 +15,7 @@
 Patch configuration for DeepseekV3 GPU patched modeling generation.
 
 Regen command:
-python -m veomni.patchgen.run_codegen veomni.models.transformers.deepseek_v3.deepseek_v3_gpu_patch_gen_config -o veomni/models/transformers/deepseek_v3/generated --diff
+patchgen veomni.models.transformers.deepseek_v3.deepseek_v3_gpu_patch_gen_config -o veomni/models/transformers/deepseek_v3/generated --diff
 
 Patches:
 1. ``DeepseekV3NaiveMoe`` — drops upstream ``@use_experts_implementation``
@@ -57,6 +57,7 @@ from veomni.ops import fused_moe_forward
 from veomni.ops.dispatch import OpSlot
 from veomni.patchgen.patch_spec import PatchConfig
 from veomni.utils.model_outputs import CausalLMOutputWithLogProbs
+from veomni.utils.moe_monitor import record_router_indices
 
 
 # ── OpSlot declarations ──────────────────────────────────────────────────────
@@ -76,10 +77,14 @@ config = PatchConfig(
 )
 
 config.add_import("veomni.ops", names=["fused_moe_forward"])
+config.add_import("veomni.utils.moe_monitor", names=["record_router_indices"])
 
 # Surface ``CausalLMOutputWithLogProbs`` in the generated file so the patched
 # ``forward`` can return per-token log-probs in the unified output dataclass.
-config.add_import("veomni.utils.model_outputs", names=["CausalLMOutputWithLogProbs"])
+config.add_import(
+    "veomni.utils.model_outputs",
+    names=["FusedLinearAuxOutput", "FusedLinearAuxOutputMixin", "CausalLMOutputWithLogProbs"],
+)
 
 config.add_post_import_block(
     """
@@ -188,6 +193,36 @@ def deepseek_v3_topk_router_forward_patched(self, hidden_states):
 
 
 # ================================================================
+# Patch: DeepseekV3MoE.forward
+# 1. After the family-specific top-k math in ``route_tokens_to_experts``
+#    (sigmoid + bias correction + group routing) produces ``topk_indices``,
+#    feed those indices into the MoE load-balance monitor. Symmetric to the
+#    ``maybe_replay_indices`` call other families make in their SparseMoeBlock
+#    patches. No-op when no monitor is active.
+# ================================================================
+@config.override_method(
+    "DeepseekV3MoE.forward",
+    description="Report top-k indices to the MoE load-balance monitor",
+)
+def deepseek_v3_moe_forward_patched(self, hidden_states):
+    residuals = hidden_states
+    orig_shape = hidden_states.shape
+    router_logits = self.gate(hidden_states)
+    topk_indices, topk_weights = self.route_tokens_to_experts(router_logits)
+    # --- Patch.1 ---
+    # Hand the actual top-k indices used by this layer to the load-balance
+    # monitor. The router itself only produces logits; the chosen experts
+    # come out of ``route_tokens_to_experts``. Keyed on ``self.gate`` so the
+    # monitor's layer order matches the router module identity.
+    record_router_indices(self.gate, topk_indices)
+    # --- Patch.1 ---
+    hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
+    hidden_states = self.experts(hidden_states, topk_indices, topk_weights).view(*orig_shape)
+    hidden_states = hidden_states + self.shared_experts(residuals)
+    return hidden_states
+
+
+# ================================================================
 # Patch: DeepseekV3ForCausalLM.forward
 # 1. OpSlot guard for fused cross-entropy loss; falls back to the eager
 #    HF loss path when no fused kernel is bound. Returns the unified
@@ -228,12 +263,11 @@ def deepseek_v3_forcausallm_forward_patched(
     # --- Patch.1 ---
     loss = None
     logits = None
-    log_probs = None
-    entropy = None
+    fused_linear_aux = None
     if labels is not None:
         # Modification: OpSlot guard for cross-entropy loss.
         if veomni_causal_lm_loss.use_non_eager_impl:
-            loss, logits, log_probs, entropy = veomni_causal_lm_loss(
+            loss, logits, fused_linear_aux = veomni_causal_lm_loss(
                 logits=logits,
                 labels=labels,
                 vocab_size=self.config.vocab_size,
@@ -246,11 +280,11 @@ def deepseek_v3_forcausallm_forward_patched(
             # Modification: VeOmni's patched ``loss_function`` (via LOSS_MAPPING,
             # installed by ``install_loss_mapping`` in
             # ``veomni/ops/kernels/cross_entropy/__init__.py``) returns
-            # ``(loss, logits, log_probs, entropy)`` — *not* HF's stock single
+            # ``(loss, logits, fused_linear_aux)`` — *not* HF's stock single
             # ``Tensor``. Unpack 4 values to match the OpSlot branch above; we
             # discard the wrapper's flattened ``logits`` and keep the ones we
             # already computed at full shape.
-            loss, _, log_probs, entropy = self.loss_function(
+            loss, _, fused_linear_aux = self.loss_function(
                 logits=logits,
                 labels=labels,
                 vocab_size=self.config.vocab_size,
@@ -258,8 +292,8 @@ def deepseek_v3_forcausallm_forward_patched(
                 weights=self.lm_head.weight,
                 **kwargs,
             )
-            if log_probs is not None:
-                # log_probs path empties loss/logits slots; clear the local 3D
+            if fused_linear_aux is not None:
+                # fused_linear_aux path empties loss/logits slots; clear the local 3D
                 # logits so output mirrors the OpSlot branch's contract.
                 logits = None
     else:
@@ -269,8 +303,7 @@ def deepseek_v3_forcausallm_forward_patched(
     return CausalLMOutputWithLogProbs(
         loss=loss,
         logits=logits,
-        log_probs=log_probs,
-        entropy=entropy,
+        fused_linear_aux=fused_linear_aux,
         past_key_values=outputs.past_key_values,
         hidden_states=outputs.hidden_states,
         attentions=outputs.attentions,

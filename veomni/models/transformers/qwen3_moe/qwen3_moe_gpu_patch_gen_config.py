@@ -15,7 +15,7 @@
 Patch configuration for Qwen3Moe GPU/SP patched modeling generation.
 
 Regen command:
-python -m veomni.patchgen.run_codegen veomni.models.transformers.qwen3_moe.qwen3_moe_gpu_patch_gen_config -o veomni/models/transformers/qwen3_moe/generated --diff
+patchgen veomni.models.transformers.qwen3_moe.qwen3_moe_gpu_patch_gen_config -o veomni/models/transformers/qwen3_moe/generated --diff
 
 This keeps only the needed v5 patches:
 1. Liger replacements for rotary/rms_norm/mlp.
@@ -34,7 +34,6 @@ from transformers.models.qwen3_moe.modeling_qwen3_moe import load_balancing_loss
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs
 
-from veomni.ops import fused_moe_forward
 from veomni.patchgen.patch_spec import PatchConfig
 from veomni.utils.model_outputs import MoeCausalLMOutputWithLogProbs
 from veomni.utils.moe_router_replay import get_active_replay, maybe_replay_indices
@@ -46,14 +45,16 @@ config = PatchConfig(
     description="Qwen3Moe with LigerKernel GPU replacements and VeOmni SP/fused loss patches",
 )
 
-config.add_import("veomni.ops", names=["fused_moe_forward"])
 # Surface ``MoeCausalLMOutputWithLogProbs`` so the patched ``forward`` can return
 # per-token log-probs / entropy as constructor fields. Mutating ``output.log_probs``
 # / ``output.entropy`` after constructing ``MoeCausalLMOutputWithPast`` would
 # bypass ModelOutput pytree flattening, breaking FSDP2's pre-backward unshard
 # hook on ``lm_head`` and triggering ``setStorage … storage of size 0`` in
 # ``chunk_logprobs.backward`` (parallels VeOmni #731's qwen3_5_moe fix).
-config.add_import("veomni.utils.model_outputs", names=["MoeCausalLMOutputWithLogProbs"])
+config.add_import(
+    "veomni.utils.model_outputs",
+    names=["FusedLinearAuxOutput", "FusedLinearAuxOutputMixin", "MoeCausalLMOutputWithLogProbs"],
+)
 config.drop_import_names("MoeCausalLMOutputWithPast")
 config.add_import("veomni.utils.moe_router_replay", names=["get_active_replay", "maybe_replay_indices"])
 
@@ -130,16 +131,7 @@ class PatchedQwen3MoeExperts(torch.nn.Module):
     ) -> torch.Tensor:
         final_hidden_states = torch.zeros_like(hidden_states)
         if veomni_moe_experts_forward.use_non_eager_impl:
-            return fused_moe_forward(
-                num_experts=self.num_experts,
-                routing_weights=top_k_weights.to(final_hidden_states.dtype),
-                selected_experts=top_k_index,
-                hidden_states=hidden_states,
-                fc1_1_weight=None,
-                fc1_2_weight=None,
-                fc2_weight=self.down_proj,
-                fc1_1_2_weight=self.gate_up_proj,
-            )
+            return veomni_moe_experts_forward(self, hidden_states, top_k_index, top_k_weights)
 
         with torch.no_grad():
             expert_mask = torch.nn.functional.one_hot(top_k_index, num_classes=self.num_experts)
@@ -180,12 +172,14 @@ def qwen3_moe_topk_router_forward_patched(self, hidden_states: torch.Tensor):
     router_top_value, router_indices = torch.topk(routing_weights, self.top_k, dim=-1)
     if self.norm_topk_prob:
         router_top_value /= router_top_value.sum(dim=-1, keepdim=True)
-    # Modification: keep ``router_top_value`` in the softmax's fp32 dtype to
-    # match HF's reference path (HF re-binds ``router_logits`` to the post-
-    # softmax fp32 tensor and then casts back to that dtype, which is a
-    # no-op). The fused MoE call site casts to ``final_hidden_states.dtype``
-    # itself, so leaving fp32 here is harmless.
-    router_top_value = router_top_value.to(routing_weights.dtype)
+    # Cast ``router_top_value`` back to the raw-logits dtype, matching HF's
+    # reference ``Qwen3MoeTopKRouter.forward``: transformers v5.8 keeps
+    # ``router_logits`` bound to the pre-softmax ``F.linear`` output (it no
+    # longer re-binds it to the fp32 post-softmax tensor), so this cast lands
+    # on the model dtype rather than being a no-op. The fused MoE call site
+    # casts to ``final_hidden_states.dtype`` regardless; matching HF here
+    # keeps the generated modeling bitwise-equal to vanilla HF.
+    router_top_value = router_top_value.to(router_logits.dtype)
     return router_logits, router_top_value, router_indices
 
 
@@ -244,11 +238,12 @@ def qwen3_moe_model_forward_patched(
         position_ids = cache_position.unsqueeze(0)
 
     mask_function = create_causal_mask if self.config.sliding_window is None else create_sliding_window_causal_mask
+    # transformers 5.9 dropped ``cache_position`` from these constructors
+    # ("Deprecated and unused" — see masking_utils.py:917).
     causal_mask = mask_function(
         config=self.config,
         inputs_embeds=inputs_embeds,
         attention_mask=attention_mask,
-        cache_position=cache_position,
         past_key_values=past_key_values,
         position_ids=position_ids,
     )
@@ -316,12 +311,11 @@ def qwen3_moe_forcausallm_forward_patched(
 
     loss = None
     logits = None
-    log_probs = None
-    entropy = None
+    fused_linear_aux = None
     if labels is not None:
         # Modification: OpSlot guard for cross-entropy loss.
         if veomni_causal_lm_loss.use_non_eager_impl:
-            loss, logits, log_probs, entropy = veomni_causal_lm_loss(
+            loss, logits, fused_linear_aux = veomni_causal_lm_loss(
                 logits=logits,
                 labels=labels,
                 vocab_size=self.config.vocab_size,
@@ -332,9 +326,9 @@ def qwen3_moe_forcausallm_forward_patched(
         else:
             logits = self.lm_head(hidden_states)
             # Modification: VeOmni's patched `loss_function` (via LOSS_MAPPING)
-            # returns (loss, logits, log_probs, entropy); unpack to match the
+            # returns (loss, logits, fused_linear_aux); unpack to match the
             # OpSlot branch above.
-            loss, logits, log_probs, entropy = self.loss_function(
+            loss, _, fused_linear_aux = self.loss_function(
                 logits=logits,
                 labels=labels,
                 vocab_size=self.config.vocab_size,
@@ -342,6 +336,10 @@ def qwen3_moe_forcausallm_forward_patched(
                 weights=self.lm_head.weight,
                 **kwargs,
             )
+            if fused_linear_aux is not None:
+                # fused_linear_aux path empties loss/logits slots; clear the local 3D
+                # logits so output mirrors the OpSlot branch's contract.
+                logits = None
     else:
         logits = self.lm_head(hidden_states)
 
@@ -373,8 +371,7 @@ def qwen3_moe_forcausallm_forward_patched(
         hidden_states=outputs.hidden_states,
         attentions=outputs.attentions,
         router_logits=outputs.router_logits,
-        log_probs=log_probs,
-        entropy=entropy,
+        fused_linear_aux=fused_linear_aux,
     )
 
 

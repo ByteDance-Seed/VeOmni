@@ -7,7 +7,7 @@ description: "Use this skill when adding or refreshing a patchgen-generated mode
 
 Purpose: add or refresh a model's patchgen-generated modeling under
 `veomni/models/transformers/<model>/generated/`. VeOmni pins
-`transformers==5.2.0` and ships patchgen-generated modeling for every
+`transformers==5.9.0` and ships patchgen-generated modeling for every
 supported model; legacy v4 monkey-patches have been retired.
 
 **References (read first, load on demand):**
@@ -59,14 +59,14 @@ Examples grouped by complexity / capability — pick the closest one and adapt:
 
 ### 0.1 Verify transformers venv
 
-Patchgen runs against `transformers==5.2.0`. Before touching code:
+Patchgen runs against `transformers==5.9.0`. Before touching code:
 
 ```bash
 source .venv/bin/activate
 python -c "import transformers; print(transformers.__version__)"
 ```
 
-If not `5.2.0`, re-sync the default env:
+If not `5.9.0`, re-sync the default env:
 
 ```bash
 uv sync --frozen --extra gpu --extra audio --group dev
@@ -80,25 +80,27 @@ patchgen config is the single biggest accelerator for catching subtle
 signature/contract drift while iterating.
 
 ```bash
-mkdir -p .agents_workspace/hf_reference/<m>/v5_2_0
+mkdir -p .agents_workspace/hf_reference/<m>/v5_8_1
 
-curl -sL -o .agents_workspace/hf_reference/<m>/v5_2_0/modeling_<m>.py \
-  "https://github.com/huggingface/transformers/raw/v5.2.0/src/transformers/models/<m>/modeling_<m>.py"
+curl -sL -o .agents_workspace/hf_reference/<m>/v5_8_1/modeling_<m>.py \
+  "https://github.com/huggingface/transformers/raw/v5.9.0/src/transformers/models/<m>/modeling_<m>.py"
 ```
 
 For VLMs also grab `processing_<m>.py` / `image_processing_<m>.py` /
 `configuration_<m>.py` if you expect processor-side or config-shape work.
 
 If you are **refreshing** an existing patchgen-generated file across a
-transformers minor bump (e.g. `5.2.0 → 5.3.0`), pull both versions side-by-side
-and diff to spot contract drift:
+transformers minor bump (e.g. the current pin `5.9.0 → 5.9.0`), pull both
+versions side-by-side and diff to spot contract drift — substitute the
+`<old_ver>` / `<new_ver>` tags with the actual versions you are migrating
+between:
 
 ```bash
 mkdir -p .agents_workspace/hf_reference/<m>/{old,new}
 curl -sL -o .agents_workspace/hf_reference/<m>/old/modeling_<m>.py \
-  "https://github.com/huggingface/transformers/raw/v5.2.0/src/transformers/models/<m>/modeling_<m>.py"
+  "https://github.com/huggingface/transformers/raw/<old_ver>/src/transformers/models/<m>/modeling_<m>.py"
 curl -sL -o .agents_workspace/hf_reference/<m>/new/modeling_<m>.py \
-  "https://github.com/huggingface/transformers/raw/v5.3.0/src/transformers/models/<m>/modeling_<m>.py"
+  "https://github.com/huggingface/transformers/raw/<new_ver>/src/transformers/models/<m>/modeling_<m>.py"
 diff -u .agents_workspace/hf_reference/<m>/{old,new}/modeling_<m>.py | less
 ```
 
@@ -352,6 +354,27 @@ duplicating ~hundreds of lines per sibling model.
   `@config.override_method("<M>ForConditionalGeneration.get_position_id_func")`
   via an `add_post_import_block` that defines the helper `get_position_id` in
   generated scope (module-level, so multiprocessing can pickle it).
+- **Multimodal metadata precompute** — to keep the ViT forward host-device-sync
+  free, derive ViT `cu_seqlens` / `max_seqlen` in the collator, not the forward.
+  See `.agents/knowledge/multimodal_metadata.md` for the full contract. Checklist
+  for a new VLM:
+  1. Add a module-level `collate_multimodal_metadata(batch, sp_pad)` helper
+     (`@config.add_helper`) — read `batch["image_grid_thw"]` / `["video_grid_thw"]`,
+     `.tolist()`, derive `vit_*_cu_seqlens` / `vit_*_max_seqlen` (+ the `sp_pad`
+     tail entry), write `batch["multimodal_metadata"]`.
+  2. `@config.override_method("<M>ForConditionalGeneration.get_metadata_collate_func")`
+     returning that helper (or a `partial` over it if the formula needs config).
+  3. Optional `get_extra_collate_infos` `override_method` for audio / extra
+     feature tensors (Omni).
+  4. Model.forward: pop `multimodal_metadata`, build the per-modality
+     `vit_metadata` sub-dict (`grid_thw_list` / `cu_seqlens` / `max_seqlen`),
+     pass to `get_image_features` / `get_video_features`.
+  5. ViT.forward: pop the single `vit_metadata` kwarg; consume the precomputed
+     values **with a runtime fallback** (in-forward `.tolist()` / cu_seqlens
+     build) for callers that bypass `MainCollator`.
+  6. `dummy_forward` (FSDP path): build the `vit_metadata` sub-dict host-side.
+  7. Add the model to `_MM_METADATA_WIRED_CASES` in
+     `tests/models/test_model_forward_no_implicit_sync.py`.
   When SP is enabled and you need to all-gather `input_ids` (or any tensor that
   went through `MainCollator`'s `pack_dim=-1` path) back to full seq on each
   rank, use `torch.cat(list, dim=1)` — the collator's `PackingCollator.__call__`
@@ -413,7 +436,7 @@ Guidelines:
 **Regen command** (put at top of file as docstring, mirror qwen3):
 
 ```
-python -m veomni.patchgen.run_codegen \
+patchgen \
     veomni.models.transformers.<m>.<m>_gpu_patch_gen_config \
     -o veomni/models/transformers/<m>/generated --diff
 ```
@@ -592,7 +615,7 @@ def register_<m>_modeling(architecture: str):
 
 1. Regenerate:
    ```bash
-   python -m veomni.patchgen.run_codegen \
+   patchgen \
        veomni.models.transformers.<m>.<m>_gpu_patch_gen_config \
        -o veomni/models/transformers/<m>/generated --diff -v
    ```
@@ -608,7 +631,7 @@ def register_<m>_modeling(architecture: str):
    ruff, but double-check).
 5. Check CI drift guard:
    ```bash
-   python -m veomni.patchgen.check_patchgen
+   patchgen --check
    ```
    Must exit 0. `--fix` overwrites checked-in files if drift is intentional.
 6. If `make style` / `ruff --fix` auto-removed unused imports from the generated
@@ -617,12 +640,12 @@ def register_<m>_modeling(architecture: str):
    v5.2), the sibling `*.diff` file becomes stale against the post-fix `*.py`.
    Re-sync with:
    ```bash
-   python -m veomni.patchgen.check_patchgen --fix
+   patchgen --check --fix
    ```
-   Do NOT manually re-run `run_codegen` to "fix" it — that would re-introduce
-   the unused imports and you'd ping-pong between ruff and patchgen.
-   `check_patchgen --fix` writes the diff against the post-style-fix `.py`,
-   which is what CI expects.
+   Do NOT manually re-run `patchgen` (without `--check`) to "fix" it — that
+   would re-introduce the unused imports and you'd ping-pong between ruff and
+   patchgen. `patchgen --check --fix` writes the diff against the
+   post-style-fix `.py`, which is what CI expects.
 
 **Never edit `generated/*.py` by hand** — always go back to the patchgen config
 and regenerate. This is a hard rule called out in `AGENTS.md`.

@@ -9,7 +9,7 @@ Coverage
 --------
 Models under ``veomni/models/transformers/`` that register a patchgen-generated
 class (``transformers-stable`` default group in ``pyproject.toml`` pins
-``transformers==5.2.0``):
+``transformers==5.9.0``):
 
 - Causal-LM (text-only):           qwen2, qwen3, qwen3_moe, deepseek_v3
 - VLM via text-only sub-config
@@ -460,6 +460,10 @@ def _make_inputs(case: Case, config, device, dtype) -> tuple[torch.Tensor, dict]
             # recompute them.
             "image_mask": image_mask,
             "video_mask": video_mask,
+            # transformers v5 VLMs require ``mm_token_type_ids`` (text=0,
+            # image=1, video=2) to compute multimodal RoPE; the HF processor
+            # emits it alongside ``input_ids``.
+            "mm_token_type_ids": (image_mask.int() + 2 * video_mask.int()),
         }
     )
     if case.kind == "omni_thinker":

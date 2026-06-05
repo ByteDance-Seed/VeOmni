@@ -119,17 +119,22 @@ python3 scripts/download_hf_model.py \
     --local_dir .
 ```
 
-## Merge MoE
-
-```shell
-python3 scripts/moe_ckpt_merge/moe_merge.py \
-    --raw_hf_path Qwen3-Omni-30B-A3B-Instruct \
-    --merge_hf_path Qwen3-Omni-30B-A3B-Instruct-merge
-```
-
 ## Start training on GPU
 
 ```shell
 bash train.sh tasks/train_vlm.py configs/multimodal/qwen3_omni/qwen3_omni.yaml \
-    --model.model_path Qwen3-Omni-30B-A3B-Instruct-merge
+    --model.model_path Qwen3-Omni-30B-A3B-Instruct
 ```
+
+> **Note.** VeOmni's runtime `CheckpointTensorConverter` folds per-expert HF
+> safetensor keys into VeOmni's fused `gate_up_proj` / `down_proj` layout at
+> load time, so the stock HF checkpoint can be passed directly to training —
+> no offline merge step is required. See
+> `docs/transformers_v5/transformers_v5_moe_weight_loading.md` for the full
+> format matrix and how to convert a VeOmni-format training checkpoint back
+> to per-expert HF keys for inference engines.
+>
+> `scripts/moe_ckpt_merge/moe_merge.py` is deprecated. It still works and may
+> be useful as a one-time optimization for very large checkpoints (e.g.
+> Qwen3-235B) where you want to amortize the per-load stacking cost across
+> many runs, but it is no longer a prerequisite.

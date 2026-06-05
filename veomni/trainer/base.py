@@ -27,6 +27,8 @@ Features:
 """
 
 import json
+import queue
+import threading
 from abc import ABC
 from collections import defaultdict
 from dataclasses import asdict
@@ -83,6 +85,111 @@ from .callbacks import (
 
 
 logger = logging.get_logger(__name__)
+
+
+class BackgroundPrefetcher:
+    """
+    Prefetches batches from a dataloader in a background thread to overlap data loading
+    with GPU computation. Synchronizes dataloader state for correct checkpointing.
+    """
+
+    def __init__(self, dataloader, maxsize=1):
+        self.dataloader = dataloader
+        self.iterator = iter(dataloader)
+        self.queue = queue.Queue(maxsize=maxsize)
+        self.stop_event = threading.Event()
+        self.original_state_dict = getattr(dataloader, "state_dict", None)
+        self.current_state = None
+        self.thread = threading.Thread(target=self._worker)
+        self.thread.daemon = True
+        self.thread.start()
+
+    def _worker(self):
+        try:
+            while not self.stop_event.is_set():
+                try:
+                    item = next(self.iterator)
+                except StopIteration:
+                    self.queue.put((StopIteration, None))
+                    break
+
+                # Ensure we capture the state so that subsequent dataloader advances
+                # don't mutate the captured state in-place. The underlying dataloader's
+                # state_dict() should handle deepcopying if necessary.
+                state = self.original_state_dict() if self.original_state_dict else None
+                self.queue.put((item, state))
+        except Exception as e:
+            self.queue.put((e, None))
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        res = self.queue.get()
+        if isinstance(res, tuple) and len(res) == 2:
+            item, state = res
+            if item is StopIteration:
+                raise StopIteration
+            if isinstance(item, Exception):
+                raise item
+            self.current_state = state
+            return item
+        else:
+            if res is StopIteration:
+                raise StopIteration
+            if isinstance(res, Exception):
+                raise res
+            return res
+
+    def state_dict(self):
+        if self.current_state is not None:
+            return self.current_state
+        if self.original_state_dict:
+            return self.original_state_dict()
+        return {}
+
+    def stop(self, timeout: float = 5.0):
+        self.stop_event.set()
+        try:
+            while not self.queue.empty():
+                self.queue.get_nowait()
+        except queue.Empty:
+            pass
+        if self.thread.is_alive():
+            self.thread.join(timeout=timeout)
+            if self.thread.is_alive():
+                logger.warning("BackgroundPrefetcher worker thread did not terminate within timeout.")
+
+
+class VeOmniIter:
+    """
+    A unified iterator wrapper that handles both standard iteration and background prefetching.
+    """
+
+    def __init__(self, dataloader, use_background_prefetcher: bool = False, maxsize: int = 1):
+        self.dataloader = dataloader
+        self.use_background_prefetcher = use_background_prefetcher
+        if use_background_prefetcher:
+            self.iterator = BackgroundPrefetcher(dataloader, maxsize=maxsize)
+        else:
+            self.iterator = iter(dataloader)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        return next(self.iterator)
+
+    def stop(self, timeout: float = 5.0):
+        if self.use_background_prefetcher and hasattr(self.iterator, "stop"):
+            self.iterator.stop(timeout=timeout)
+
+    def state_dict(self):
+        if self.use_background_prefetcher and hasattr(self.iterator, "state_dict"):
+            return self.iterator.state_dict()
+        if hasattr(self.dataloader, "state_dict"):
+            return self.dataloader.state_dict()
+        return {}
 
 
 def _collect_muon_kwargs(optimizer_cfg) -> Dict[str, Any]:
@@ -395,6 +502,7 @@ class BaseTrainer(Stateful, ABC):
         args: VeOmniArguments = self.args
         dataloader_kwargs = asdict(args.data.dataloader)
         dataloader_type = dataloader_kwargs.pop("type")
+        dataloader_kwargs.pop("use_background_prefetcher", None)
         self.train_dataloader = build_dataloader(
             dataloader_type=dataloader_type,
             dataset=self.train_dataset,
@@ -426,6 +534,9 @@ class BaseTrainer(Stateful, ABC):
             kwargs["is_peft_model"] = True
 
         muon_expert_zero_comm = args.train.optimizer.type == "muon" and args.train.optimizer.muon_expert_zero_comm
+
+        if args.model.fqn_to_index_mapping is not None:
+            kwargs["fqn_to_index_mapping"] = args.model.fqn_to_index_mapping
 
         # Parallelize model
         self.model = build_parallelize_model(
@@ -557,11 +668,22 @@ class BaseTrainer(Stateful, ABC):
         self.moe_monitor_callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
 
     def preforward(self, micro_batch: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """Preprocess micro batches before forward pass."""
-        micro_batch = {
-            k: v.to(self.device, non_blocking=True) if isinstance(v, torch.Tensor) else v
-            for k, v in micro_batch.items()
-        }
+        """Preprocess micro batches before forward pass.
+
+        Tensors are moved to ``self.device`` non-blockingly. Nested dicts
+        (e.g. ``multimodal_metadata`` emitted by ``PackingCollator``) are
+        recursed so inner tensor values land on the device too; Python ints
+        / lists / etc. pass through unchanged.
+        """
+
+        def _to_device(v: Any) -> Any:
+            if isinstance(v, torch.Tensor):
+                return v.to(self.device, non_blocking=True)
+            if isinstance(v, dict):
+                return {k: _to_device(vv) for k, vv in v.items()}
+            return v
+
+        micro_batch = {k: _to_device(v) for k, v in micro_batch.items()}
         if getattr(self, "LOG_SAMPLE", True):
             helper.print_example(example=micro_batch, rank=self.args.train.local_rank)
             self.LOG_SAMPLE = False
@@ -609,6 +731,18 @@ class BaseTrainer(Stateful, ABC):
             elif micro_step == num_micro_steps - 1:
                 self.model.set_reshard_after_backward(True)
 
+    def _configure_hsdp_allreduce(self, micro_step: int, num_micro_steps: int):
+        args: VeOmniArguments = self.args
+        if (
+            args.train.accelerator.fsdp_config.fsdp_mode == "fsdp2"
+            and args.train.accelerator.dp_replicate_size > 1
+            and num_micro_steps > 1
+        ):
+            if micro_step == 0:
+                self.model.set_requires_all_reduce(False)
+            elif micro_step == num_micro_steps - 1:
+                self.model.set_requires_all_reduce(True)
+
     def train_step(
         self,
         data_iterator: Any,
@@ -632,6 +766,7 @@ class BaseTrainer(Stateful, ABC):
         # forward and backward pass with gradient_accumulationsteps
         for micro_step, micro_batch in enumerate(micro_batches):
             self.model_reshard(micro_step, num_micro_steps)
+            self._configure_hsdp_allreduce(micro_step, num_micro_steps)
             loss: torch.Tensor
             loss_dict: Dict[str, torch.Tensor]
             # token num for fixed_ce_loss in postforward
@@ -676,11 +811,13 @@ class BaseTrainer(Stateful, ABC):
             self.on_epoch_begin()
 
             # Create a batch generator
-            data_iterator = iter(self.train_dataloader)
+            self.data_iterator = VeOmniIter(
+                self.train_dataloader, use_background_prefetcher=args.data.dataloader.use_background_prefetcher
+            )
 
             for _ in range(self.start_step, args.train_steps):
                 try:
-                    self.train_step(data_iterator)
+                    self.train_step(self.data_iterator)
                 except StopIteration:
                     logger.info(f"epoch:{epoch} Dataloader finished with drop_last {args.data.dataloader.drop_last}")
                     break
@@ -691,7 +828,13 @@ class BaseTrainer(Stateful, ABC):
 
             helper.print_device_mem_info(f"VRAM usage after epoch {epoch + 1}")
 
+            if args.data.dataloader.use_background_prefetcher:
+                self.data_iterator.stop()
+
         self.on_train_end()
+
+        if "data_iterator" in locals() and args.data.dataloader.use_background_prefetcher:
+            self.data_iterator.stop()
 
         synchronize()
 

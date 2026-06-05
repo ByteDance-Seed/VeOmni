@@ -11,19 +11,31 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from ....utils.device import IS_NPU_AVAILABLE
 from ...loader import MODELING_REGISTRY
 
 
 @MODELING_REGISTRY.register("qwen3")
 def register_qwen3_modeling(architecture: str):
-    from .generated.patched_modeling_qwen3_gpu import (
-        Qwen3ForCausalLM,
-        Qwen3ForSequenceClassification,
-        Qwen3Model,
-    )
+    if IS_NPU_AVAILABLE:
+        from .generated.patched_modeling_qwen3_npu import (
+            Qwen3ForCausalLM,
+            Qwen3ForSequenceClassification,
+            Qwen3ForTokenClassification,
+            Qwen3Model,
+        )
+    else:
+        from .generated.patched_modeling_qwen3_gpu import (
+            Qwen3ForCausalLM,
+            Qwen3ForSequenceClassification,
+            Qwen3ForTokenClassification,
+            Qwen3Model,
+        )
 
     if "ForCausalLM" in architecture:
         return Qwen3ForCausalLM
+    elif "ForTokenClassification" in architecture:
+        return Qwen3ForTokenClassification
     elif "ForSequenceClassification" in architecture:
         return Qwen3ForSequenceClassification
     elif "Model" in architecture:

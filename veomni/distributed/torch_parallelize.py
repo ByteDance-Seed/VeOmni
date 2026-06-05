@@ -332,8 +332,17 @@ def parallelize_model_fsdp2(
             layer_mod._fsdp_modules.append(layer_mod)
         logger.info_rank0(f"{layer_fqn=}, {layer_mod._fsdp_modules=}")
 
-    # shard root model
-    fully_shard(model, **fsdp_kwargs)
+    # Shard root WITHOUT explicit `reshard_after_forward` so FSDP2's
+    # auto-no-reshard for the root kicks in (`_fsdp_state.py:_lazy_init`).
+    # This keeps the root's params (lm_head + embeddings + final norm)
+    # unsharded between forward and backward, which is what fused-linear
+    # kernels (chunk_logprobs / chunk_topk_distill) need — they save the
+    # lm_head weight via `save_for_backward` and would otherwise hit
+    # `setStorage … storage of size 0` when the saved reference points
+    # to a freed buffer. Decoder layers reshard normally (their calls
+    # above pass `reshard_after_forward` explicitly).
+    root_fsdp_kwargs = {k: v for k, v in fsdp_kwargs.items() if k != "reshard_after_forward"}
+    fully_shard(model, **root_fsdp_kwargs)
 
     # configure manual prefetching when needed
     need_manual_prefetch = (
@@ -376,6 +385,7 @@ def parallelize_model_fsdp2(
             else:
                 logger.info_rank0("also init peft model lora weights...")
 
+        fqn_to_index_mapping = kwargs.get("fqn_to_index_mapping")
         if kwargs.get("broadcast_model_weights_from_rank0"):
             logger.info_rank0("Loading model weights from disk on rank0 then broadcasting to other ranks...")
             rank0_load_and_broadcast_weights(
@@ -387,6 +397,7 @@ def parallelize_model_fsdp2(
                 max_load_broadcast_size=kwargs.get("max_load_broadcast_size", 20.0),
                 is_peft_model=is_peft_model,
                 adapter_path=adapter_path,
+                fqn_to_index_mapping=fqn_to_index_mapping,
             )
         else:
             logger.info_rank0("Every rank would read weights from disk and expect this to be slow!")
@@ -398,6 +409,7 @@ def parallelize_model_fsdp2(
                 dtensor_factory=_dt_local_split,
                 is_peft_model=is_peft_model,
                 adapter_path=adapter_path,
+                fqn_to_index_mapping=fqn_to_index_mapping,
             )
 
     # Register grad norm clipping method for FSDP2

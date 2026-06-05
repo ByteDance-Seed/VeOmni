@@ -27,7 +27,7 @@ from ..utils import helper
 from ..utils.device import synchronize
 from ..utils.loss_utils import count_loss_token
 from ..utils.model_utils import pretty_print_trainable_parameters
-from .base import BaseTrainer, _collect_muon_kwargs
+from .base import BaseTrainer, VeOmniIter, _collect_muon_kwargs
 
 
 logger = helper.create_logger(__name__)
@@ -200,20 +200,27 @@ class VLMTrainer:
         )
 
     def _build_collate_fn(self):
-        if self.base.model_config.model_type in ("qwen2_5_omni", "qwen3_omni_moe"):
-            data_collate_info = {
-                "audio_feature_lengths": (0, False, None, None),
-                "input_features": (0, True, 0, 1),
-                "audio_mask": (-1, False, 0, 1),
-            }
-        else:
-            data_collate_info = {}
+        model = self.base.model
+        # The model owns its modality-specific collate topology — mirrors
+        # get_position_id_func. Both hooks are optional capabilities: text
+        # models / pipelines that don't wire them simply fall back (the ViT
+        # forward keeps its in-forward derivation; see multimodal_metadata.md).
+        #   * get_extra_collate_infos() — extra collate rules (e.g. omni audio
+        #     feature tensors); replaces the former model_type hardcode here.
+        #   * get_metadata_collate_func() — picklable CPU-side hook the collator
+        #     runs after SP padding to derive multimodal_metadata.
+        get_extra_infos = getattr(model, "get_extra_collate_infos", None)
+        data_collate_info = get_extra_infos() if get_extra_infos is not None else {}
+        get_metadata_func = getattr(model, "get_metadata_collate_func", None)
+        metadata_collate_func = get_metadata_func() if get_metadata_func is not None else None
+
         seq_classification = self.base.args.data.data_type == "classification"
         pad_to_length = self.base.args.train.pad_to_length
         self.base.collate_fn = MainCollator(
             pad_to_length=pad_to_length,
             seq_classification=seq_classification,
             data_collate_info=data_collate_info,
+            metadata_collate_func=metadata_collate_func,
         )
 
     def _build_optimizer(self):
@@ -325,11 +332,13 @@ class VLMTrainer:
             self.on_epoch_begin()
 
             # Create a batch generator
-            data_iterator = iter(self.base.train_dataloader)
+            self.base.data_iterator = VeOmniIter(
+                self.base.train_dataloader, use_background_prefetcher=args.data.dataloader.use_background_prefetcher
+            )
 
             for _ in range(self.base.start_step, args.train_steps):
                 try:
-                    self.train_step(data_iterator)
+                    self.train_step(self.base.data_iterator)
                 except StopIteration:
                     logger.info(f"epoch:{epoch} Dataloader finished with drop_last {args.data.dataloader.drop_last}")
                     break
@@ -338,8 +347,13 @@ class VLMTrainer:
 
             self.base.start_step = 0
             helper.print_device_mem_info(f"VRAM usage after epoch {epoch + 1}")
+            if args.data.dataloader.use_background_prefetcher:
+                self.base.data_iterator.stop()
 
         self.on_train_end()
+
+        if args.data.dataloader.use_background_prefetcher:
+            self.base.data_iterator.stop()
 
         synchronize()
 
