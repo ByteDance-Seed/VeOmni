@@ -931,30 +931,6 @@ class ModelArguments:
             "help": "Path to model.safetensors.index.json. Defaults to `model_path`/model.safetensors.index.json."
         },
     )
-    foundation: Dict[str, str] = field(
-        default_factory=dict,
-        metadata={"help": "Foundation model extra config."},
-    )
-    encoders: Dict[Literal["image"], Dict[str, str]] = field(
-        default_factory=dict,
-        metadata={"help": "Multimodal encoder config and weights."},
-    )
-    decoders: Dict[Literal["image"], Dict[str, str]] = field(
-        default_factory=dict,
-        metadata={"help": "Multimodal decoder config and weights."},
-    )
-    input_encoder: Literal["encoder", "decoder"] = field(
-        default="encoder",
-        metadata={"help": "Use encoder to encode input images or use decoder.encoder to encode input images."},
-    )
-    output_encoder: Literal["encoder", "decoder"] = field(
-        default="decoder",
-        metadata={"help": "Use encoder to encode output images or use decoder.encoder to encode output images."},
-    )
-    encode_target: bool = field(
-        default=False,
-        metadata={"help": "Whether to encode target with decoder. Only supports stable diffusion as decoder."},
-    )
     basic_modules: Optional[List[str]] = field(
         default_factory=list,
         metadata={"help": "Basic modules beyond model._no_split_modules to be sharded in FSDP."},
@@ -991,32 +967,6 @@ class ModelArguments:
             logger.warning_rank0(
                 "fqn_to_index_mapping is None, saved safetensor will be a single file instead of sharded."
             )
-
-        suppoerted_encoder_types = ["image", "video", "audio"]
-        for encoder_type, encoder_args in self.encoders.items():
-            if encoder_type not in suppoerted_encoder_types:
-                raise ValueError(
-                    f"Unsupported encoder type: {encoder_type}. Should be one of {suppoerted_encoder_types}."
-                )
-
-            if encoder_args.get("config_path") is None and encoder_args.get("model_path") is None:
-                raise ValueError("`config_path` and `model_path` cannot be both empty.")
-
-            if encoder_args.get("config_path") is None:
-                encoder_args["config_path"] = encoder_args["model_path"]
-
-        supported_decoder_types = ["image"]
-        for decoder_type, decoder_args in self.decoders.items():
-            if decoder_type not in supported_decoder_types:
-                raise ValueError(
-                    f"Unsupported decoder type: {decoder_type}. Should be one of {supported_decoder_types}."
-                )
-
-            if decoder_args.get("config_path") is None and decoder_args.get("model_path") is None:
-                raise ValueError("`config_path` and `model_path` cannot be both empty.")
-
-            if decoder_args.get("config_path") is None:
-                decoder_args["config_path"] = decoder_args["model_path"]
 
 
 # ================================ Data Arguments ======================================
