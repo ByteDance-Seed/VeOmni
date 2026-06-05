@@ -205,33 +205,29 @@ class TestNPURmsNormEdgeCases:
         # that held across the parametrize matrix in local runs.
         assert torch.allclose(out_kernel, out_eager, atol=5e-3, rtol=5e-3)
 
-    @pytest.mark.parametrize("eps,atol,rtol", [(1e-3, 5e-2, 5e-2), (1e-5, 5e-3, 5e-3), (1e-8, 5e-3, 5e-3)])
-    def test_standard_eps_sweep(self, eps, atol, rtol):
+    @pytest.mark.parametrize("eps", [1e-3, 1e-5, 1e-8])
+    def test_standard_eps_sweep(self, eps):
         """eps is a runtime parameter — make sure it actually flows through
         the kernel (a common bug is hard-coding the default eps).
 
-        Per-eps tolerances because the eps value is added to the variance
-        before the rsqrt, so a large eps (1e-3) dominates low-variance
-        tokens and amplifies the bf16 1-ULP rounding in the NPU
-        reduction. Default-like eps values (1e-5, 1e-8) keep the
-        tight 5e-3 bound. Test goal is verifying the *flow* of eps,
-        not numerical precision — any output diff > 0.1 between
-        different eps values would catch an "eps ignored" bug.
+        Use the RMSNorm-wide bf16 NPU tolerance here: this case is meant
+        to verify the eps argument path, not enforce a stricter precision
+        contract than torch_npu.npu_rms_norm provides.
         """
         slot = _fresh_slot("rms_norm", "standard", "npu")
         x = torch.randn(2, 16, 128, device=DEVICE, dtype=torch.bfloat16)
         w = torch.randn(128, device=DEVICE, dtype=torch.bfloat16)
         out_kernel = slot(x, w, eps)
         out_eager = _eager_rms_norm_standard(x, w, eps)
-        assert torch.allclose(out_kernel, out_eager, atol=atol, rtol=rtol)
+        assert torch.allclose(out_kernel, out_eager, atol=5e-2, rtol=5e-2)
 
     def test_qwen3_5_nonzero_weight(self):
         """PR 818 only tests Qwen3.5 with near-zero weight. Verify the (1 + w)
         rescaling path is exercised by a nonzero weight too.
 
         Tolerance widened to 5e-2 (from PR 818's 1e-4) for the same NPU
-        bf16 1-ULP-drift reason as \`test_standard_non_power_of_two_shapes\`:
-        the qwen3_5 kernel wraps the same \`torch_npu.npu_rms_norm\`,
+        bf16 1-ULP-drift reason as test_standard_non_power_of_two_shapes:
+        the qwen3_5 kernel wraps the same torch_npu.npu_rms_norm,
         so the final cast occasionally rounds by 1 ULP (~0.03 at v=4).
         PR 818's 1e-4 was tight enough to pass with a near-zero weight
         (output magnitudes stay small); full random weight pushes the
