@@ -122,7 +122,7 @@ torchrun \
   --standalone \
   --nnodes=1 \
   --nproc-per-node=2 \
-  tasks/train_omni.py configs/seed_omni/janus_1.3b/veomni_janus.yaml \
+  tasks/omni/train_omni.py configs/seed_omni/janus_1.3b/veomni_janus.yaml \
   --train.global_batch_size 2 \
   --train.micro_batch_size 1 \
   --train.max_steps 1 \
