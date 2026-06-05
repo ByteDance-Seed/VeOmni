@@ -48,9 +48,6 @@ from veomni.utils.tensor_utils import naflatten, unflatten
 from ....conversation import (
     ArPhase,
     ConversationItem,
-    append_output_hidden,
-    collect_prompt_embeds,
-    get_ar_tail_embed,
     is_dummy,
 )
 from ....module import OmniModule
@@ -191,33 +188,6 @@ class JanusLlama(OmniModule, PreTrainedModel):
         self._scatter_hidden_states(conversation, unflatten(hidden_states, pack_shape))
         return {"conversation_list": conversation}
 
-    def generate_step(
-        self,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        past_key_values=None,
-        **kwargs,
-    ) -> Dict[str, Any]:
-        """Single auto-regressive backbone step (FSM ``image_vq`` / ``text_ar``).
-
-        Returns hidden states only; sampling lives downstream in
-        ``text_encoder.decode`` / :meth:`JanusVqvae.decode`.
-        """
-        if inputs_embeds is None:
-            raise ValueError(
-                "JanusLlama.generate_step expects `inputs_embeds` (from text_encoder.encode or vqvae.decode)."
-            )
-        lm_out = self.language_model(
-            inputs_embeds=inputs_embeds,
-            attention_mask=attention_mask,
-            past_key_values=past_key_values,
-            use_cache=True,
-        )
-        return {
-            "hidden_states": lm_out.last_hidden_state,
-            "past_key_values": lm_out.past_key_values,
-        }
-
     # ── Inference (conversation-list aware) ──────────────────────────────────
 
     def reset_inference_state(self) -> None:
@@ -246,14 +216,8 @@ class JanusLlama(OmniModule, PreTrainedModel):
 
     def generate(
         self,
-        *,
         conversation_list: Optional[List[ConversationItem]] = None,
-        past_key_values: Optional[Any] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        cfg_uncond_inputs_embeds: Optional[torch.Tensor] = None,
-        ar_phase: Optional[ArPhase] = None,
-        cfg: Optional[Dict[str, Any]] = None,
-        collapse_cfg: bool = False,
+        generation_kwargs: Dict[str, Any] = dict,
         **kwargs: Any,
     ) -> Dict[str, Any]:
         """Auto-regressive backbone step driven by a conversation list.
@@ -268,101 +232,78 @@ class JanusLlama(OmniModule, PreTrainedModel):
         ``past_key_values`` is kept on the module — callers should not
         rely on routing KV through ``ctx``.
         """
-        if conversation_list is None:
-            raise ValueError(
-                "JanusLlama.generate expects `conversation_list` — call OmniInferencer.generate "
-                "(or build a conversation manually with veomni.models.seed_omni.build_conversation)."
+        if "_output" not in conversation_list[-1].type:
+            inputs_embeds, attention_mask, position_ids, _ = self._pack_conversations_for_forward([conversation_list])
+            (cu_seq_lens_q, cu_seq_lens_k), (max_length_q, max_length_k) = prepare_fa_kwargs_from_position_ids(
+                position_ids
             )
 
-        if collapse_cfg:
-            self.collapse_cfg_cache()
-
-        if ar_phase is not None:
-            self._ar_phase = ar_phase
-
-        cache_kwargs = {k: v for k, v in kwargs.items() if k in ("cache_position",)}
-        past_kv = self._past_key_values
-
-        if past_kv is None:
-            embed_chunks = [emb.to(self.device) for emb in collect_prompt_embeds(conversation_list)]
-            if not embed_chunks:
-                raise ValueError(
-                    "JanusLlama.generate: conversation_list has no embedded parts. "
-                    "Run siglip + text_encoder generate first."
-                )
-            inputs_embeds = torch.cat(embed_chunks, dim=1)
-            inputs_embeds = _fold_fsdp_dummy_anchors(inputs_embeds, [conversation_list])
-
-            lm_out = self.language_model(
+            outputs = self.forward(
                 inputs_embeds=inputs_embeds,
                 attention_mask=attention_mask,
-                past_key_values=None,
+                past_key_values=self._past_key_values,
+                cu_seq_lens_q=cu_seq_lens_q,
+                cu_seq_lens_k=cu_seq_lens_k,
+                max_length_q=max_length_q,
+                max_length_k=max_length_k,
                 use_cache=True,
-                **cache_kwargs,
             )
-            self._past_key_values = lm_out.past_key_values
-            hidden = lm_out.last_hidden_state
-            append_output_hidden(conversation_list, hidden, phase=self._ar_phase)
+            self._past_key_values = outputs["past_key_values"]
+
+            hidden_states = outputs["hidden_states"]
+
+            if hidden_states.dim() == 3 and hidden_states.size(0) == 1:
+                hidden_states = hidden_states.squeeze(0)
+            conversation_list.append(ConversationItem(type="text_output", value=hidden_states[-1:], role="assistant"))
             return {
-                "hidden_states": hidden,
                 "conversation_list": conversation_list,
             }
+        else:
+            inputs_embeds = conversation_list[-1].value[-1:].to(self.device)
+            if inputs_embeds.dim() == 2:
+                inputs_embeds = inputs_embeds.unsqueeze(0)
+            past_kv = self._past_key_values
+            # cfg_out: Optional[Dict[str, Any]] = None
+            # if (
+            #     isinstance(cfg, dict)
+            #     and cfg.get("enabled")
+            #     and cfg_uncond_inputs_embeds is not None
+            #     and not self._cfg_active
+            # ):
+            #     uncond = cfg_uncond_inputs_embeds.to(self.device)
+            #     uncond_out = self.language_model(
+            #         inputs_embeds=uncond,
+            #         attention_mask=attention_mask,
+            #         past_key_values=None,
+            #         use_cache=True,
+            #         **cache_kwargs,
+            #     )
+            #     past_kv = _concat_kv_caches(past_kv, uncond_out.past_key_values)
+            #     self._past_key_values = past_kv
+            #     self._cfg_active = True
+            #     cfg_out = {"enabled": False, "guidance_scale": float(cfg.get("guidance_scale", 1.0) or 1.0)}
 
-        tail_embed = get_ar_tail_embed(conversation_list)
-        if tail_embed is None:
-            raise ValueError(
-                "JanusLlama.generate (AR step) expects an embedded conversation tail. "
-                "Upstream module (text_encoder.ar_step / vqvae.ar_step / emit_*) did not provide one."
-            )
+            # if self._cfg_active:
+            #     if self._ar_phase == "vq":
+            #         self._cfg_seen_vqvae = True
+            #     elif self._cfg_seen_vqvae:
+            #         self.collapse_cfg_cache()
+            #         past_kv = self._past_key_values
 
-        cfg_out: Optional[Dict[str, Any]] = None
-        if (
-            isinstance(cfg, dict)
-            and cfg.get("enabled")
-            and cfg_uncond_inputs_embeds is not None
-            and not self._cfg_active
-        ):
-            uncond = cfg_uncond_inputs_embeds.to(self.device)
-            uncond_out = self.language_model(
-                inputs_embeds=uncond,
-                attention_mask=attention_mask,
-                past_key_values=None,
+            # if self._cfg_active and inputs_embeds.size(0) == 1:
+            #     inputs_embeds = inputs_embeds.expand(2, *inputs_embeds.shape[1:]).contiguous()
+            outputs = self.forward(
+                inputs_embeds=inputs_embeds,
+                attention_mask=None,
+                past_key_values=past_kv,
                 use_cache=True,
-                **cache_kwargs,
             )
-            past_kv = _concat_kv_caches(past_kv, uncond_out.past_key_values)
-            self._past_key_values = past_kv
-            self._cfg_active = True
-            cfg_out = {"enabled": False, "guidance_scale": float(cfg.get("guidance_scale", 1.0) or 1.0)}
-
-        if self._cfg_active:
-            if self._ar_phase == "vq":
-                self._cfg_seen_vqvae = True
-            elif self._cfg_seen_vqvae:
-                self.collapse_cfg_cache()
-                past_kv = self._past_key_values
-
-        inputs_embeds = tail_embed.to(self.device)
-        if self._cfg_active and inputs_embeds.size(0) == 1:
-            inputs_embeds = inputs_embeds.expand(2, *inputs_embeds.shape[1:]).contiguous()
-
-        lm_out = self.language_model(
-            inputs_embeds=inputs_embeds,
-            attention_mask=attention_mask,
-            past_key_values=past_kv,
-            use_cache=True,
-            **cache_kwargs,
-        )
-        self._past_key_values = lm_out.past_key_values
-        hidden = lm_out.last_hidden_state
-        append_output_hidden(conversation_list, hidden, phase=self._ar_phase)
-        out: Dict[str, Any] = {
-            "hidden_states": hidden,
-            "conversation_list": conversation_list,
-        }
-        if cfg_out is not None:
-            out["cfg"] = cfg_out
-        return out
+            self._past_key_values = outputs["past_key_values"]
+            hidden_states = outputs["hidden_states"]
+            if hidden_states.dim() == 3 and hidden_states.size(0) == 1:
+                hidden_states = hidden_states.squeeze(0)
+            conversation_list.append(ConversationItem(type="text_output", value=hidden_states[-1:], role="assistant"))
+            return {"conversation_list": conversation_list}
 
     # ── Internal helpers ─────────────────────────────────────────────────────
 
@@ -415,8 +356,8 @@ class JanusLlama(OmniModule, PreTrainedModel):
                     chunk_attention_mask = item.meta.pop("attention_mask", None)
                     if chunk_attention_mask is None:
                         chunk_attention_mask = torch.ones(embeds_length, dtype=torch.long, device=self.device)
-                    inputs_embeds_list.append(embeds)
-                    attention_mask.append(chunk_attention_mask)
+                    inputs_embeds_list.append(embeds.to(self.device))
+                    attention_mask.append(chunk_attention_mask.to(self.device))
                     sample_lengths += embeds_length
             sample_position_ids = torch.arange(sample_lengths, dtype=torch.long, device=self.device)
             position_ids.append(sample_position_ids)

@@ -1,8 +1,20 @@
-# Janus-1.3B inference — image understanding (I2T / VQA).  Uni-directional;
-# never emits an image mid-stream.
+# Janus-1.3B inference — image understanding (I2T / VQA).
 #
-# V2 AR path: ``tok_ar_step`` monolithically decode→encode→merge on the
-# conversation ``output`` workspace; token ids live in the text encoder cache.
+# Optional per-module load overrides — see ``infer_gen.yaml`` header for the
+# ``modules:`` deep-merge pattern (e.g. FSDP2 for a large vision encoder).
+#
+# Conversation-list path: each AR step appends one ``type='text'`` item
+# (``meta.generated=True``) to ``conversation_list``; the backbone reads
+# the tail embed on subsequent steps.
+
+modules:
+  janus_siglip:
+    model:
+      model_path: janus_siglip
+    train:
+      accelerator:
+        fsdp_config:
+          fsdp_mode: eager
 
 generation_graph:
   initial: prompt_encode
@@ -10,17 +22,24 @@ generation_graph:
   states:
     prompt_encode:
       body:
-        - vision_to_llm
-        - tokenc_to_llm
-        - llm_to_text_ar
-        - text_ar_sink
+        - siglip_to_janus_llama
+        - token_generate_to_janus_llama
+        - janus_llama_to_token_generate
+        - token_generate_sink
       transitions:
         - { condition: { type: module_signal, key: text_done }, next_state: done }
         - { condition: { type: default }, next_state: text_ar }
 
     text_ar:
       body:
-        - llm_to_text_ar
-        - text_ar_sink
+        - token_generate_to_janus_llama
+        - janus_llama_to_token_generate
+        - token_generate_sink
       transitions:
         - { condition: { type: module_signal, key: text_done }, next_state: done }
+
+generation_kwargs:
+  max_new_tokens: 2048
+  temperature: 0.0
+  top_p: 1.0
+  do_sample: False

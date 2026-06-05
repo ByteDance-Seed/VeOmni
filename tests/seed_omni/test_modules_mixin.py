@@ -28,13 +28,7 @@ from veomni.models.seed_omni import (
     OmniModule,
     OmniModuleCheckpointCallback,
 )
-from veomni.models.seed_omni.conversation import ConversationItem, get_token_id
-from veomni.models.seed_omni.generation_graph import FSM_SIGNAL_KEY
 from veomni.models.seed_omni.modules import OMNI_CONFIG_REGISTRY
-from veomni.models.seed_omni.modules.janus.text_encoder.modeling import (
-    SIGNAL_START_IMAGE_GEN,
-    SIGNAL_TEXT_DONE,
-)
 
 
 def _config_cls(model_type: str):
@@ -214,41 +208,6 @@ def test_janus_text_encoder_emit_methods_return_expected_shapes():
     assert out["inputs_embeds"].shape == (3, 1, 16)
 
 
-def test_janus_text_encoder_ar_step_emits_module_signals():
-    """``ar_step`` writes ``ctx[module_signal]`` string for boi / eos."""
-    JanusTextEncoder = _model_cls("janus_text_encoder")
-    JanusTextEncoderConfig = _config_cls("janus_text_encoder")
-
-    cfg = JanusTextEncoderConfig(vocab_size=128, hidden_size=16, tie_word_embeddings=False)
-    jte = JanusTextEncoder(cfg)
-
-    class _MockTokenizer:
-        bos_token_id = 0
-        eos_token_id = 2
-        pad_token_id = 3
-        boi_token_id = 42
-        eoi_token_id = 43
-        image_token_id = 99
-
-    jte.tokenizer = _MockTokenizer()
-
-    h = torch.ones(1, 1, 16)
-    jte.lm_head.weight.data.zero_()
-
-    jte.lm_head.weight.data[42] = 1.0
-    conv = [ConversationItem(type="output", value=h.clone(), role="assistant", meta={"phase": "text"})]
-    out = jte.ar_step(hidden_states=h, conversation_list=conv)
-    assert get_token_id(conv[-1]) == 42
-    assert out[FSM_SIGNAL_KEY] == SIGNAL_START_IMAGE_GEN
-
-    jte.lm_head.weight.data.zero_()
-    jte.lm_head.weight.data[2] = 1.0
-    conv = [ConversationItem(type="output", value=h.clone(), role="assistant", meta={"phase": "text"})]
-    out = jte.ar_step(hidden_states=h, conversation_list=conv)
-    assert get_token_id(conv[-1]) == 2
-    assert out[FSM_SIGNAL_KEY] == SIGNAL_TEXT_DONE
-
-
 # ── Mixin call-site contracts (loss key, shapes) ──────────────────────────────
 
 
@@ -278,7 +237,7 @@ def test_text_encoder_encode_uses_last_token_with_kv_cache():
 
 
 def test_text_encoder_decode_inference_returns_logits_only():
-    """Inference ``decode`` projects logits only; sampling lives in ``ar_step`` / ``generate``."""
+    """Base ``TextEncoder.decode`` without labels returns logits only."""
     TextEncoder = _model_cls("text_encoder")
     TextEncoderConfig = _config_cls("text_encoder")
     te = TextEncoder(TextEncoderConfig(vocab_size=64, hidden_size=16))
@@ -288,30 +247,17 @@ def test_text_encoder_decode_inference_returns_logits_only():
     assert out.loss is None
 
 
-def test_janus_vqvae_decode_branches():
-    """Three input-driven dispatch paths in JanusVqvae.decode."""
+def test_janus_vqvae_decode_training_loss():
+    """Training ``decode``: hidden_states + labels → scalar loss."""
     JanusVqvae = _model_cls("janus_vqvae")
     JanusVqvaeConfig = _config_cls("janus_vqvae")
     jv = JanusVqvae(JanusVqvaeConfig(vq_config=_tiny_vq_cfg()))
 
-    # Path 1: training (hidden + gt_token_ids → _loss).
     h = torch.randn(1, 4, 64)  # janus_llama hidden_size
-    gt = torch.randint(0, 64, (1, 4))
-    out = jv.decode(hidden_states=h, gt_token_ids=gt)
-    assert set(out.keys()) == {"_loss"}
-    assert out["_loss"].dim() == 0
-
-    # Path 2: inference sample (hidden → vq_token_id + embed).
-    out = jv.decode(hidden_states=h)
-    assert set(out.keys()) == {"vq_token_id", "embed"}
-    assert out["vq_token_id"].shape == (1,)
-    assert out["embed"].shape == (1, 1, 64)
-
-    # Path 3: pre-sampled lookup (token_id → embed).
-    tok = torch.tensor([5])
-    out = jv.decode(token_id=tok)
-    assert set(out.keys()) == {"embed"}
-    assert out["embed"].shape == (1, 1, 64)
+    labels = torch.randint(0, 64, (1, 4))
+    out = jv.decode(hidden_states=h, labels=labels)
+    assert set(out.keys()) == {"loss"}
+    assert out["loss"].dim() == 0
 
 
 def test_janus_siglip_forward_passes_dummy_pixel_path():
@@ -429,7 +375,7 @@ def test_janus_train_yaml_loads_with_v2_module_names():
     )
 
     assert set(cfg.modules) == {"janus_siglip", "janus_vqvae", "janus_llama", "janus_text_encoder"}
-    assert cfg.modules["janus_siglip"]["weights_path"] == "janus_siglip"
+    assert cfg.modules["janus_siglip"]["model"]["weights_path"] == "janus_siglip"
     # Sanity: every training-graph edge is declared in the edges pool.
     edge_names = set(cfg.edges)
     for e in cfg.training_edges:
@@ -437,9 +383,9 @@ def test_janus_train_yaml_loads_with_v2_module_names():
     # Inference-only nodes / edges live in the pool but are NOT in training_edges.
     assert "emit_image_start" in cfg.nodes
     assert "emit_image_end" in cfg.nodes
-    assert "emit_start_to_ar" in cfg.edges
-    assert "emit_end_to_ar" in cfg.edges
-    assert "emit_start_to_ar" not in cfg.training_edges
+    assert "emit_start_to_janus_llama" in cfg.edges
+    assert "emit_end_to_janus_llama" in cfg.edges
+    assert "emit_start_to_janus_llama" not in cfg.training_edges
 
 
 @pytest.mark.parametrize("infer_yaml", ["infer_interleave.yaml", "infer_gen.yaml", "infer_und.yaml"])
@@ -478,8 +424,68 @@ def test_janus_train_plus_infer_merges_generation_graph(infer_yaml: str):
             assert e in cfg.edges, f"state '{state_name}' body edge '{e}' not in pool"
 
 
-def test_from_paths_resolves_relative_module_paths():
-    """``from_paths`` joins relative ``weights_path`` under the given ``model_path``."""
+def test_from_paths_deep_merges_infer_module_overrides():
+    """Infer YAML ``modules:`` patches train YAML per module without restating ``weights_path``."""
+    import yaml
+
+    from veomni.models.seed_omni.configuration_seed_omni import OmniConfig
+
+    train_yaml = _janus_cfg_dir() / "train.yaml"
+    infer_yaml = _janus_cfg_dir() / "infer_gen.yaml"
+    with open(infer_yaml, encoding="utf-8") as f:
+        infer_cfg = yaml.safe_load(f)
+    infer_cfg["modules"] = {
+        "janus_siglip": {
+            "train": {
+                "accelerator": {"fsdp_config": {"fsdp_mode": "fsdp2", "full_shard": False}},
+            },
+            "model": {"model_config": {"freeze": True}},
+        }
+    }
+
+    import tempfile
+
+    with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as tmp:
+        yaml.safe_dump(infer_cfg, tmp)
+        patched_infer = tmp.name
+
+    try:
+        cfg = OmniConfig.from_paths(
+            model_path="/tmp/janus",
+            train_yaml_path=train_yaml,
+            infer_yaml_path=patched_infer,
+        )
+    finally:
+        Path(patched_infer).unlink(missing_ok=True)
+
+    siglip = cfg.modules["janus_siglip"]
+    assert siglip["model"]["weights_path"] == "janus_siglip"
+    assert "model_path" not in siglip["model"]
+    assert siglip["train"]["accelerator"]["fsdp_config"]["fsdp_mode"] == "fsdp2"
+    assert siglip["train"]["accelerator"]["fsdp_config"]["full_shard"] is False
+    assert siglip["model"]["model_config"]["freeze"] is True
+    # Unaffected modules keep the train YAML block only.
+    assert "train" not in cfg.modules["janus_llama"]
+
+
+def test_build_module_args_resolves_relative_weights_path():
+    """Relative ``model.weights_path`` joins the launcher ``model.model_path``."""
+    from veomni.arguments import DataArguments
+    from veomni.trainer.omni_trainer import OmniModelArguments, VeOmniOmniArguments, build_module_args
+
+    root = "seed_omni/janus_1.3b"
+    global_args = VeOmniOmniArguments(
+        model=OmniModelArguments(model_path=root),
+        data=DataArguments(train_path="/tmp/unused"),
+    )
+    mod_cfg = {"model": {"weights_path": "janus_siglip"}}
+    module_args = build_module_args(global_args, mod_cfg)
+    assert module_args.model.model_path == f"{root}/janus_siglip"
+    assert module_args.model.config_path == f"{root}/janus_siglip"
+
+
+def test_from_paths_keeps_relative_module_weights_in_omni_config():
+    """``OmniConfig`` stores raw module blocks; path join happens in ``build_module_args``."""
     from veomni.models.seed_omni.configuration_seed_omni import OmniConfig
 
     root = "seed_omni/janus_1.3b"
@@ -489,12 +495,8 @@ def test_from_paths_resolves_relative_module_paths():
         infer_yaml_path=_janus_cfg_dir() / "infer_gen.yaml",
     )
 
-    assert cfg.modules["janus_siglip"]["weights_path"] == f"{root}/janus_siglip"
-    assert cfg.modules["janus_text_encoder"]["weights_path"] == f"{root}/janus_text_encoder"
+    assert cfg.modules["janus_siglip"]["model"]["weights_path"] == "janus_siglip"
+    assert cfg.modules["janus_text_encoder"]["model"]["weights_path"] == "janus_text_encoder"
+    assert "model_path" not in cfg.modules["janus_siglip"]["model"]
     assert cfg.has_generation_graph()
-    # The V2 conversation-list inference path always starts with
-    # ``prompt_encode`` (vision + text + LLM + first sample).  The legacy
-    # ``prompt_to_image`` name was retired alongside the bridge-state-based
-    # image_vq_start (now consumed by the boi token's appearance in the
-    # conversation list).
     assert cfg.generation_graph["initial"] == "prompt_encode"

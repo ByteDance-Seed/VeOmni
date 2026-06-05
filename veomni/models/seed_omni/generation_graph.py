@@ -44,11 +44,9 @@ Each state specifies:
 
 Method dispatch
 ---------------
-A node whose YAML-declared method is ``forward`` dispatches to the module's
-``generate_step`` (the conventional inference entry).  Nodes with an explicit
-method name (e.g. ``vq_decoder.decode``) dispatch to that method as-is.  This
-keeps training and inference consuming the same pool while letting modules
-expose specialised inference routines.
+Bare ``{module: X}`` nodes parse as ``forward`` for training; the FSM maps
+that default to ``generate`` at runtime.  Any other method (``encode``,
+``decode``, ``emit_image_start``, …) is taken from YAML as-is.
 
   transitions
       Ordered list of ``{condition: ..., next_state: S}`` items checked after
@@ -105,15 +103,10 @@ See also
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional
 
-import torch
-
 from .graph import (
     EdgeDef,
     NodeDef,
-    append_input_ids,
     is_end,
-    is_step_input_ids,
-    normalize_step_input_ids,
 )
 
 
@@ -129,6 +122,15 @@ DONE_STATE_NAME: str = "done"
 # ``ctx[FSM_SIGNAL_KEY] = "<signal_name>"``; YAML ``module_signal.key``
 # matches that string value (not a separate boolean flag per signal).
 FSM_SIGNAL_KEY: str = "module_signal"
+
+
+def _fsm_dispatch_method(node: NodeDef) -> str:
+    """Resolve the module method invoked for one FSM node execution.
+
+    Training defaults bare nodes to ``forward`` (see :class:`NodeDef`); inference
+    defaults the same nodes to ``generate``.  Explicit YAML methods are unchanged.
+    """
+    return "generate" if node.method == "forward" else node.method
 
 
 # ── Condition helpers ─────────────────────────────────────────────────────────
@@ -347,9 +349,9 @@ class GenerationGraph:
     def step(
         self,
         modules: Dict[str, Any],
-        context: Dict[str, Any],
-        *,
+        ctx: Dict[str, Any],
         trace: Optional[List[str]] = None,
+        generation_kwargs: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Execute one iteration of the current state.
 
@@ -372,12 +374,8 @@ class GenerationGraph:
         ``to: end`` only pins its ``from_`` node into the active set.
         The same node never re-executes within one step.
 
-        Method dispatch: a node whose declared method is ``forward``
-        invokes ``module.generate_step``; any other method name dispatches
-        as-is (e.g. ``vqvae.decode``, ``text_encoder.emit_image_start``).
-        This keeps the same node usable for both the training DAG
-        (``forward``/explicit method) and the inference FSM
-        (``generate_step``/explicit method) without YAML duplication.
+        Method dispatch: bare nodes (YAML default ``forward``) invoke
+        ``module.generate``; explicit YAML methods dispatch as-is.
 
         Parameters
         ----------
@@ -398,7 +396,6 @@ class GenerationGraph:
         -------
         Updated context dict.
         """
-        ctx = dict(context)
         state = self._current_state
         executed: set = set()
         pending_step_ids: Any = None
@@ -410,9 +407,9 @@ class GenerationGraph:
         # for the next iteration / state).  Nodes that never appear as
         # `from_` in body get ``len(body)`` so every incoming edge
         # counts as feed-forward — this is the "to-only sink" case
-        # (e.g. ``run_ar`` in ``image_vq_start`` whose body is
-        # ``[emit_start_to_ar, ar_run_sink]`` — ``ar_run_sink`` triggers
-        # ``run_ar``).
+        # (e.g. ``janus_llama`` in ``image_vq_start`` whose body is
+        # ``[emit_start_to_janus_llama, janus_llama_sink]`` — the sink edge
+        # triggers ``janus_llama``).
         first_from_idx: Dict[str, int] = {}
         for i, e in enumerate(state.body):
             if not is_end(e.from_) and e.from_ not in first_from_idx:
@@ -450,28 +447,27 @@ class GenerationGraph:
                     f"FSM step: module '{node.module}' (node '{node_name}') missing "
                     f"from modules dict. Provided: {sorted(modules)}."
                 )
-            method_name = "generate_step" if node.method == "forward" else node.method
+            method_name = _fsm_dispatch_method(node)
             method_fn: Optional[Callable] = getattr(module, method_name, None)
             if method_fn is None:
                 raise AttributeError(f"FSM node '{node_name}': {type(module).__name__} has no method '{method_name}'.")
             if trace is not None:
-                trace.append(f"{state.name}:{node_name}")
-            out = method_fn(**ctx)
+                trace.append(f"[State|{state.name}] {node_name}: {node.module}.{method_name}")
+            out = method_fn(**ctx, generation_kwargs=generation_kwargs)
             if not isinstance(out, dict):
                 raise TypeError(f"FSM node '{node_name}'.{method_name} must return a dict; got {type(out).__name__}.")
-            step_ids = out.get("input_ids")
-            if step_ids is not None and is_step_input_ids(step_ids):
-                pending_step_ids = normalize_step_input_ids(step_ids)
-                for key, val in out.items():
-                    if key != "input_ids":
-                        ctx[key] = val
-            else:
-                ctx.update(out)
+            ctx.update(out)
             executed.add(node_name)
 
         for i, edge in enumerate(state.body):
             # 1. Execute the source node (idempotent for repeated `from_`).
             _run(edge.from_)
+
+            # A terminating ``module_signal`` (e.g. ``text_done`` on ``</s>``)
+            # means no further nodes in this body should run — transition is
+            # evaluated in :meth:`maybe_transition` after the step returns.
+            if FSM_SIGNAL_KEY in ctx:
+                break
 
             # 2. Decrement the destination's feed-forward pending count;
             #    if the node has no later appearance as a source (it's a
@@ -481,17 +477,6 @@ class GenerationGraph:
                 if i < fi:
                     pending[edge.to] -= 1
 
-        if pending_step_ids is not None:
-            ctx["input_ids"] = append_input_ids(context.get("input_ids"), pending_step_ids)
-            prev_mask = context.get("attention_mask")
-            if isinstance(prev_mask, torch.Tensor) and isinstance(pending_step_ids, torch.Tensor):
-                ones = torch.ones(
-                    pending_step_ids.size(0),
-                    1,
-                    dtype=prev_mask.dtype,
-                    device=prev_mask.device,
-                )
-                ctx["attention_mask"] = torch.cat([prev_mask, ones], dim=-1)
         return ctx
 
     def maybe_transition(self, context: Dict[str, Any], *, trace: Optional[List[str]] = None) -> bool:

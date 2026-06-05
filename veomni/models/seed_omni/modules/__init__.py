@@ -42,7 +42,7 @@ OMNI_PROCESSOR_REGISTRY = Registry("OmniProcessor")
 from . import base, janus  # noqa: F401  E402
 
 
-def read_model_type(weights_path: str) -> str:
+def read_model_type(model_path: str) -> str:
     """Read ``model_type`` from a module's ``config.json`` and validate registration.
 
     Shared helper for any caller that needs to dispatch from a
@@ -62,10 +62,10 @@ def read_model_type(weights_path: str) -> str:
     sidesteps that.  See :mod:`veomni.models.loader` for the same
     pattern in the foundation-model loader.
     """
-    config_dict, _ = PretrainedConfig.get_config_dict(weights_path)
+    config_dict, _ = PretrainedConfig.get_config_dict(model_path)
     model_type = config_dict.get("model_type")
     if not model_type:
-        raise ValueError(f"Module config at {weights_path} has no `model_type` — cannot resolve OmniModule class.")
+        raise ValueError(f"Module config at {model_path} has no `model_type` — cannot resolve OmniModule class.")
     # Note: :class:`Registry.__getitem__` raises ``ValueError`` (not
     # ``KeyError``) on miss, so the default ``in`` test on a MutableMapping
     # subclass would mis-route the exception.  Use ``valid_keys()`` to
@@ -76,10 +76,10 @@ def read_model_type(weights_path: str) -> str:
         # Validate the config can be re-read by the registered subclass so
         # downstream `from_pretrained` doesn't hit a surprise schema gap.
         cfg_cls = OMNI_CONFIG_REGISTRY[model_type]()
-        cfg_cls.from_pretrained(weights_path)
+        cfg_cls.from_pretrained(model_path)
     if model_type not in model_keys:
         raise KeyError(
-            f"Module model_type {model_type!r} (from {weights_path}) is not registered in "
+            f"Module model_type {model_type!r} (from {model_path}) is not registered in "
             f"OMNI_MODEL_REGISTRY. Known: {sorted(model_keys)}."
         )
     return model_type

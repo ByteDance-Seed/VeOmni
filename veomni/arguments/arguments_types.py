@@ -276,7 +276,8 @@ class MixedPrecisionConfig:
 class FSDPConfig:
     """train.accelerator.fsdp_config.* — FSDP sharding configuration."""
 
-    fsdp_mode: Literal["ddp", "fsdp2"] = field(
+    # eager mode use HF.from_pretrained(..., device_map='auto') for inference
+    fsdp_mode: Literal["ddp", "fsdp2", "eager"] = field(
         default="fsdp2",
         metadata={"help": "Data parallel mode."},
     )
@@ -305,7 +306,7 @@ class FSDPConfig:
     mixed_precision: MixedPrecisionConfig = field(default_factory=MixedPrecisionConfig)
 
     def __post_init__(self):
-        if self.fsdp_mode not in ("ddp", "fsdp2"):
+        if self.fsdp_mode not in ("ddp", "fsdp2", "eager"):
             raise ValueError(
                 f"Unsupported fsdp_mode={self.fsdp_mode!r}. FSDP1 has been removed; "
                 "switch to fsdp_mode='fsdp2' (with train.init_device='meta') or 'ddp'."

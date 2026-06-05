@@ -22,7 +22,7 @@ convention, no special kwargs, no on_exit / on_enter hooks.
 
 FSM transition signals (inference)
 ----------------------------------
-After :meth:`ar_step` samples a token, this module — not the outer FSM —
+After :meth:`decode` samples a token, this module — not the outer FSM —
 decides whether the token means "start image generation" or "text done"
 and writes a one-shot string into ``ctx["module_signal"]``:
 
@@ -55,28 +55,24 @@ from veomni.utils.tensor_utils import naflatten, unflatten
 
 from ....conversation import (
     ConversationItem,
+    drop_trailing_lm_hidden,
     get_llm_embed,
-    get_token_id,
     is_dummy,
-    is_embedded,
     item_role,
-    latest_assistant_text_token_ids,
-    maybe_merge_outputs,
-    needs_embedding,
     seal_phase_outputs,
-    set_llm_embed,
 )
 from ....generation_graph import FSM_SIGNAL_KEY
 from ...base.text_encoder.modeling import TextEncoder
 from .chat_template import (
     JanusChatMarkers,
+    _template_item,
     apply_janus_chat_template,
     pack_text_input_ids,
 )
 from .configuration import JanusTextEncoderConfig
 
 
-# Signal *values* written to ``ctx[FSM_SIGNAL_KEY]`` by :meth:`ar_step`.
+# Signal *values* written to ``ctx[FSM_SIGNAL_KEY]`` by :meth:`decode`.
 SIGNAL_START_IMAGE_GEN = "start_image_gen"
 SIGNAL_TEXT_DONE = "text_done"
 
@@ -144,14 +140,20 @@ class JanusTextEncoder(TextEncoder):
         # Sampled text token ids for the current assistant turn (not stored
         # on the conversation list — only embeds live there).
         self._text_token_cache: list[int] = []
+        self._bos_injected: bool = False
 
         # training cache
         self._conversation_carrier: Any = None
         self._encode_batch_shape: torch.LongTensor | None = None
 
-    def reset_inference_state(self) -> None:
-        """Clear per-request text token cache."""
+    def reset_local_inference_state(self) -> None:
+        """Get a new request in the current conversation."""
         self._text_token_cache.clear()
+
+    def reset_global_inference_state(self) -> None:
+        """Start a new conversation."""
+        self.reset_local_inference_state()
+        self._bos_injected = False
 
     @property
     def tokenizer(self) -> Any:
@@ -179,7 +181,6 @@ class JanusTextEncoder(TextEncoder):
     def encode(  # type: ignore[override]
         self,
         input_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Any = None,
         **kwargs: Any,
     ) -> Dict[str, Any]:
         """Wte lookup only: ``input_ids`` → ``inputs_embeds``."""
@@ -265,10 +266,15 @@ class JanusTextEncoder(TextEncoder):
         sample.extend(parts)
 
     def _merge_consecutive_text_parts(self, parts: list[ConversationItem]) -> list[ConversationItem]:
-        """Merge adjacent ``type='text'`` rows (concat token ids, labels, attention_mask)."""
+        """Merge adjacent ``type='text'`` rows with the same role (concat ids, labels, mask)."""
         merged: list[ConversationItem] = []
         for part in parts:
-            if merged and merged[-1].type == "text" and part.type == "text":
+            if (
+                merged
+                and merged[-1].type == "text"
+                and part.type == "text"
+                and item_role(merged[-1]) == item_role(part)
+            ):
                 prev = merged[-1]
                 prev.value = torch.cat([prev.value, part.value])
                 prev.meta["labels"] = torch.cat([prev.meta["labels"], part.meta["labels"]])
@@ -349,11 +355,9 @@ class JanusTextEncoder(TextEncoder):
 
     def generate(
         self,
-        *,
         conversation_list: Optional[List[ConversationItem]] = None,
-        past_key_values: Optional[Any] = None,
-        generation_kwargs: Optional[Dict[str, Any]] = None,
-        **_: Any,
+        generation_kwargs: Dict[str, Any] = dict,
+        **kwargs: Any,
     ) -> Dict[str, Any]:
         """Embed every text / token part that is not yet embedded.
 
@@ -366,72 +370,54 @@ class JanusTextEncoder(TextEncoder):
         Subsequent calls (KV cache present): embeds newly-appended ``token``
         parts whose ``value`` is still a scalar id.
         """
-        if conversation_list is None:
-            return {}
-
-        out: Dict[str, Any] = {"conversation_list": conversation_list}
-
-        if past_key_values is None:
-            self._inject_bos(conversation_list)
-            self._inject_chat_template(conversation_list)
+        if not self._bos_injected:
+            conversation_list = apply_janus_chat_template(conversation_list, self._chat_markers)
+            self._bos_injected = True
+        if conversation_list[-1].role == "user":
+            # a new request in the same conversation, only add an assistant response
+            conversation_list.append(_template_item("text", self._chat_markers.assistant_prefix, "assistant"))
+            # TODO: a new request when [user_content, assistant_content, new_user_content], no need to encode the whole conversation
+            self._tokenize_template_parts(conversation_list)
+            conversation_list = self._merge_consecutive_text_parts(conversation_list)
             for part in conversation_list:
-                if not needs_embedding(part):
-                    continue
-                self._embed_part(part)
-        return out
+                part.meta.pop("labels", None)
+            input_ids = pack_text_input_ids(conversation_list)
+            input_ids, _encode_batch_shape = naflatten(input_ids)
+            inputs_embeds = self.encode(input_ids)["inputs_embeds"]
+            self._scatter_text_embeds([conversation_list], unflatten(inputs_embeds, _encode_batch_shape))
+            return {"conversation_list": conversation_list}
+        elif conversation_list[-1].type == "text_output":  # ar step
+            outputs: Dict[str, Any] = {"conversation_list": conversation_list}
+            tail = conversation_list[-1]
+            hidden_states = tail.value
+            if hidden_states.dim() == 2:
+                hidden_states = hidden_states.unsqueeze(0)
+            elif hidden_states.dim() == 1:
+                hidden_states = hidden_states.unsqueeze(0).unsqueeze(0)
 
-    def ar_step(
-        self,
-        hidden_states: Optional[torch.Tensor] = None,
-        conversation_list: Optional[List[ConversationItem]] = None,
-        generation_kwargs: Optional[Dict[str, Any]] = None,
-        temperature: float = 1.0,
-        top_p: float = 1.0,
-        **kwargs: Any,
-    ) -> Dict[str, Any]:
-        """Monolithic text AR step: decode hidden → id → embed → merge.
+            token_id = self._sample_token(hidden_states, **generation_kwargs)
+            self._text_token_cache.append(token_id)
 
-        Reads backbone ``hidden_states``, samples one text token, stores the
-        id in the module-private cache, replaces the trailing ``output``
-        item's ``value`` with the wte embed, merges adjacent text-phase
-        outputs, and raises FSM signals on boundary tokens.
-        """
-        if conversation_list is None:
-            return {}
-        out: Dict[str, Any] = {"conversation_list": conversation_list}
-        if hidden_states is None or not conversation_list:
-            return out
+            input_ids = self._token_id_tensor(token_id)
+            inputs_embeds = self.encode(input_ids)["inputs_embeds"]
+            tail.value = inputs_embeds
 
-        sampling = self._extract_sampling_kwargs(generation_kwargs, temperature, top_p, kwargs)
-        tok = self._sample_token(hidden_states, **sampling)
-        self._text_token_cache.append(int(tok))
+            if len(conversation_list) >= 2:
+                prev = conversation_list[-2]
+                if prev.type == "text_output":
+                    prev.value = torch.cat([prev.value, tail.value], dim=0)
+                    conversation_list.pop()
 
-        device = self.device
-        dtype = self.dtype
-        ids = torch.tensor([[int(tok)]], dtype=torch.long, device=device)
-        embed = self.embed_tokens(ids).to(dtype=dtype)
+            if token_id == self._boi_token_id:
+                # TODO: check this
+                self._maybe_arm_cfg_for_image_gen(conversation_list, generation_kwargs, outputs)
+                outputs[FSM_SIGNAL_KEY] = SIGNAL_START_IMAGE_GEN
+            elif token_id == self._eos_token_id:
+                outputs[FSM_SIGNAL_KEY] = SIGNAL_TEXT_DONE
 
-        tail = conversation_list[-1]
-        if tail.type != "output":
-            raise ValueError(
-                f"JanusTextEncoder.ar_step expects the conversation tail to be type='output', got {tail.type!r}."
-            )
-        set_llm_embed(tail, embed, token_id=int(tok))
-        tail.meta["input_ids"] = ids
-        maybe_merge_outputs(conversation_list, phase="text")
-
-        if tok == self._boi_token_id:
-            self._maybe_arm_cfg_for_image_gen(conversation_list, generation_kwargs, out)
-            seal_phase_outputs(conversation_list, phase="text", new_type="text")
-            tail.type = "soi"
-            tail.meta.pop("phase", None)
-            out[FSM_SIGNAL_KEY] = SIGNAL_START_IMAGE_GEN
-            out["ar_phase"] = "vq"
-        elif tok == self._eos_token_id:
-            seal_phase_outputs(conversation_list, phase="text", new_type="text")
-            out[FSM_SIGNAL_KEY] = SIGNAL_TEXT_DONE
-
-        return out
+            if FSM_SIGNAL_KEY in outputs and outputs[FSM_SIGNAL_KEY] in (SIGNAL_TEXT_DONE, SIGNAL_START_IMAGE_GEN):
+                outputs["generated"] = self._flush_text_generated(conversation_list)
+            return outputs
 
     # ── Janus boundary-token emitters (conversation-list aware) ──────────────
 
@@ -443,6 +429,7 @@ class JanusTextEncoder(TextEncoder):
         """Emit ``<begin_of_image>`` as a standalone ``soi`` conversation item."""
         token_id = self._boi_token_id
         if conversation_list is not None:
+            drop_trailing_lm_hidden(conversation_list)
             seal_phase_outputs(conversation_list, phase="text", new_type="text")
         out: Dict[str, Any] = {}
         self._maybe_arm_cfg_for_image_gen(
@@ -450,7 +437,7 @@ class JanusTextEncoder(TextEncoder):
             ctx.get("generation_kwargs"),
             out,
         )
-        out.update(self._emit_boundary(int(token_id), "soi", conversation_list, ctx))
+        out.update(self._emit_boundary(int(token_id), "boi", conversation_list, ctx))
         out["ar_phase"] = "vq"
         return out
 
@@ -462,6 +449,7 @@ class JanusTextEncoder(TextEncoder):
         """Emit ``<end_of_image>`` as a standalone ``eoi`` conversation item."""
         token_id = self._eoi_token_id
         if conversation_list is not None:
+            drop_trailing_lm_hidden(conversation_list)
             seal_phase_outputs(conversation_list, phase="vq", new_type="image")
         out = self._emit_boundary(int(token_id), "eoi", conversation_list, ctx)
         out["ar_phase"] = "text"
@@ -471,7 +459,7 @@ class JanusTextEncoder(TextEncoder):
     def _emit_boundary(
         self,
         token_id: int,
-        item_type: str,
+        boundary: str,
         conversation_list: Optional[List[ConversationItem]],
         ctx: Dict[str, Any],
     ) -> Dict[str, Any]:
@@ -482,25 +470,22 @@ class JanusTextEncoder(TextEncoder):
         inputs_embeds = self.embed_tokens(ids).to(dtype=dtype)
         out: Dict[str, Any] = {"input_ids": ids, "inputs_embeds": inputs_embeds}
         if conversation_list is not None:
+            item_type = {"boi": "soi", "eoi": "eoi"}.get(boundary, "token")
             conversation_list.append(
                 ConversationItem(
                     type=item_type,
                     value=inputs_embeds,
                     role="assistant",
-                    meta={"token_id": int(token_id), "input_ids": ids},
+                    meta={
+                        "generated": True,
+                        "token_id": int(token_id),
+                        "input_ids": ids,
+                        "boundary": boundary,
+                    },
                 )
             )
             out["conversation_list"] = conversation_list
         return out
-
-    def _emit(
-        self,
-        token_id: int,
-        conversation_list: Optional[List[ConversationItem]],
-        ctx: Dict[str, Any],
-    ) -> Dict[str, Any]:
-        """Legacy emit helper — prefer :meth:`_emit_boundary`."""
-        return self._emit_boundary(token_id, "token", conversation_list, ctx)
 
     # ── CFG: arm at SOI from ``generation_kwargs`` ────────────────────────────
 
@@ -568,184 +553,21 @@ class JanusTextEncoder(TextEncoder):
 
     # ── Finalize: decode the accumulated assistant text ──────────────────────
 
-    def finalize(self, *, ctx: Dict[str, Any]) -> Dict[str, Any]:
-        """Detokenize and flush the module-private text token cache.
+    def finalize(self, ctx: Dict[str, Any]) -> Dict[str, Any]:
+        """Forcing to flush the text generated."""
+        return self._flush_text_generated(ctx["conversation_list"])
 
-        Flushes when this module raised ``text_done`` / ``start_image_gen``,
-        or when ``module_signal`` is absent (``max_new_tokens`` forced cleanup)
-        and tokens remain buffered.
-        """
-        if not self._text_token_cache:
-            return {}
-        signal = ctx.get(FSM_SIGNAL_KEY)
-        if signal is not None and signal not in (SIGNAL_TEXT_DONE, SIGNAL_START_IMAGE_GEN):
-            return {}
-        return self._flush_text_generated(ctx)
-
-    def _flush_text_generated(self, ctx: Dict[str, Any]) -> Dict[str, Any]:
+    def _flush_text_generated(self, conversation_list: List[ConversationItem]) -> Dict[str, Any]:
         """Decode cached token ids, clear the cache, return a ``generated`` payload."""
-        conversation = ctx.get("conversation_list")
         token_ids = list(self._text_token_cache)
         self._text_token_cache.clear()
-        boundary = {t for t in (self._eos_token_id, self._boi_token_id) if t is not None}
-        while token_ids and token_ids[-1] in boundary:
-            token_ids.pop()
-        if not token_ids and isinstance(conversation, list):
-            token_ids = latest_assistant_text_token_ids(conversation)
-        if not token_ids:
-            return {}
         meta = {"token_ids": token_ids}
         text = self._tokenizer.decode(token_ids, skip_special_tokens=True)
-        return {"generated": {"type": "text", "value": text, "meta": meta}}
+        assert conversation_list[-1].type == "text_output"
+        conversation_list[-1].type = "text"
+        return {"type": "text", "value": text, "meta": meta}
 
     # ── Internal helpers ─────────────────────────────────────────────────────
-
-    def _inject_bos(self, conversation_list: List[ConversationItem]) -> None:
-        if self._bos_token_id is None:
-            return
-        already_bos = (
-            conversation_list
-            and conversation_list[0].type == "token"
-            and item_role(conversation_list[0]) == "system"
-            and get_token_id(conversation_list[0]) == self._bos_token_id
-        )
-        if already_bos:
-            return
-        device = self.device
-        dtype = self.dtype
-        ids = torch.tensor([[self._bos_token_id]], dtype=torch.long, device=device)
-        embed = self.embed_tokens(ids).to(dtype=dtype)
-        conversation_list.insert(
-            0,
-            ConversationItem(
-                type="token",
-                value=embed,
-                role="system",
-                meta={"token_id": int(self._bos_token_id), "input_ids": ids},
-            ),
-        )
-
-    def _inject_chat_template(self, conversation_list: List[ConversationItem]) -> None:
-        """Insert Janus role markers + image boundaries in-place on the prompt pass.
-
-        The text encoder is the sole authority on the on-the-wire prompt
-        layout (per the V2 design — no upstream ``apply_chat_template``).
-        We walk the conversation once and produce the canonical Janus
-        prompt format::
-
-            <bos><system_prompt>\\n\\n<|User|>: <boi>[image]<eoi>\\n<user_text>\\n\\n<|Assistant|>:[<assistant_text>]
-
-        The ``\\n`` separators are baked into the role markers (see the
-        ``_JANUS_*`` constants above) except the per-content ``\\n``
-        between an image and a same-role text part, which is inserted
-        here via a one-step lookahead — same rule as the upstream Jinja
-        ``{%if not loop.last%}\\n{%endif%}``.
-
-        Idempotent: runs once on the prompt pass (``past_key_values is
-        None`` branch only) and tags each inserted marker part with
-        ``meta['source'] = 'chat_template'`` so a re-run wouldn't double-
-        insert (defensive; the AR fast path doesn't call us again).
-        """
-        if not conversation_list:
-            return
-        # Skip if we've already injected markers in this conversation.
-        if any(p.meta.get("source") == "chat_template" for p in conversation_list):
-            return
-
-        def _text_marker(role: str, text: str) -> ConversationItem:
-            return ConversationItem(type="text", value=text, role=role, meta={"source": "chat_template"})
-
-        def _token_marker(role: str, token_id: int) -> ConversationItem:
-            return ConversationItem(
-                type="token",
-                value=int(token_id),
-                role=role,
-                meta={"source": "chat_template", "token_id": int(token_id)},
-            )
-
-        new_list: List[ConversationItem] = []
-        prev_role: Optional[str] = None
-        for idx, part in enumerate(conversation_list):
-            role = item_role(part)
-            if part.type == "token" and role == "system" and get_token_id(part) == self._bos_token_id:
-                new_list.append(part)
-                new_list.append(_text_marker("system", _JANUS_SYSTEM_PROMPT))
-                continue
-
-            if role != prev_role:
-                if role == "user":
-                    new_list.append(_text_marker("user", _JANUS_USER_PREFIX))
-                elif role == "assistant":
-                    new_list.append(_text_marker("assistant", _JANUS_ASSISTANT_PREFIX))
-                prev_role = role
-
-            if part.type == "image" and role == "user":
-                new_list.append(_token_marker("user", self._boi_token_id))
-                new_list.append(part)
-                new_list.append(_token_marker("user", self._eoi_token_id))
-                next_part = conversation_list[idx + 1] if idx + 1 < len(conversation_list) else None
-                if next_part is not None and item_role(next_part) == role:
-                    new_list.append(_text_marker(role, "\n"))
-                continue
-
-            new_list.append(part)
-
-        conversation_list.clear()
-        conversation_list.extend(new_list)
-
-    def _embed_part(self, part: ConversationItem) -> None:
-        device = self.device
-        dtype = self.dtype
-
-        if part.type == "text":
-            if not part.value:
-                return
-            ids = self._tokenizer(part.value, return_tensors="pt", add_special_tokens=False)["input_ids"]
-            ids = ids.to(device=device)
-            embed = self.embed_tokens(ids).to(dtype=dtype)
-            part.meta["input_ids"] = ids
-            part.value = embed
-            return
-
-        if part.type == "token":
-            tid = get_token_id(part)
-            if tid is None:
-                return
-            if is_embedded(part):
-                return
-            ids = torch.tensor([[int(tid)]], dtype=torch.long, device=device)
-            embed = self.embed_tokens(ids).to(dtype=dtype)
-            set_llm_embed(part, embed, token_id=int(tid))
-            part.meta["input_ids"] = ids
-
-    def _append_token_part(
-        self,
-        conversation_list: List[ConversationItem],
-        token_id: int,
-        inputs_embeds: Optional[torch.Tensor] = None,
-    ) -> None:
-        device = self.device
-        dtype = self.dtype
-        if inputs_embeds is None:
-            ids = torch.tensor([[int(token_id)]], dtype=torch.long, device=device)
-            inputs_embeds = self.embed_tokens(ids).to(dtype=dtype)
-            conversation_list.append(
-                ConversationItem(
-                    type="token",
-                    value=inputs_embeds,
-                    role="assistant",
-                    meta={"token_id": int(token_id), "input_ids": ids},
-                )
-            )
-        else:
-            conversation_list.append(
-                ConversationItem(
-                    type="token",
-                    value=inputs_embeds,
-                    role="assistant",
-                    meta={"token_id": int(token_id)},
-                )
-            )
 
     def _token_id_tensor(self, token_id: int) -> torch.Tensor:
         device = self.device
@@ -757,6 +579,7 @@ class JanusTextEncoder(TextEncoder):
         temperature: float = 1.0,
         top_p: float = 1.0,
         do_sample: bool = True,
+        **kwargs,
     ) -> int:
         hidden_states = hidden_states.to(self.device)
         last = hidden_states[:, -1, :]
@@ -772,23 +595,6 @@ class JanusTextEncoder(TextEncoder):
         probs = F.softmax(logits, dim=-1)
         token = torch.multinomial(probs, num_samples=1)
         return int(token.item())
-
-    @staticmethod
-    def _extract_sampling_kwargs(
-        generation_kwargs: Optional[Dict[str, Any]],
-        temperature: float,
-        top_p: float,
-        kwargs: Dict[str, Any],
-    ) -> Dict[str, Any]:
-        merged: Dict[str, Any] = {"temperature": temperature, "top_p": top_p, "do_sample": True}
-        if generation_kwargs:
-            for k in _SAMPLING_KWARGS:
-                if k in generation_kwargs:
-                    merged[k] = generation_kwargs[k]
-        for k in _SAMPLING_KWARGS:
-            if k in kwargs:
-                merged[k] = kwargs[k]
-        return merged
 
 
 def _infer_batch_size(ctx: Dict[str, Any]) -> int:

@@ -1,9 +1,21 @@
 # Janus-1.3B inference — text-to-image only (no trailing text).
 #
-# Flow: prompt_encode → image_vq_start → image_vq (576 AR steps) →
-# image_vq_end → done.  VQ ids live in the VQVAE private buffer; embeds
-# accumulate in ``type=output`` items (``meta.phase=vq``) and are sealed
-# to ``type=image`` at ``emit_image_end``.
+# Optional per-module load overrides (deep-merged into ``train.yaml`` modules)::
+#
+#   modules:
+#     janus_siglip:
+#       train:
+#         accelerator:
+#           fsdp_config:
+#             fsdp_mode: fsdp2
+#
+# Modules without ``accelerator.fsdp_config`` load eagerly (``device_map='auto'``).
+#
+# After ``prompt_encode`` primes the KV cache, ``image_vq_start`` drops the
+# trailing LM hidden tail, emits ``<begin_of_image>`` (SOI), and runs one
+# ``janus_llama`` KV step.  ``image_vq`` loops ``vqvae.generate`` (lm_head →
+# codebook embed → merge ``output`` rows) ↔ ``janus_llama`` until the 576th
+# VQ token; ``image_vq_end`` emits EOI the same way.
 
 generation_graph:
   initial: prompt_encode
@@ -11,27 +23,36 @@ generation_graph:
   states:
     prompt_encode:
       body:
-        - vision_to_llm
-        - tokenc_to_llm
-        - llm_run_sink
+        - siglip_to_janus_llama
+        - token_generate_to_janus_llama
+        - janus_llama_sink
+        # do not token decode, as we force image gen here
       transitions:
         - { condition: { type: default }, next_state: image_vq_start }
 
     image_vq_start:
       body:
-        - emit_start_sink
+        - emit_start_to_janus_llama
+        - janus_llama_sink
       transitions:
         - { condition: { type: default }, next_state: image_vq }
 
     image_vq:
       body:
-        - llm_to_vaegen
-        - vaegen_to_llm
+        - vqvae_to_janus_llama
+        - janus_llama_to_vqvae
       transitions:
         - { condition: { type: module_signal, key: image_complete }, next_state: image_vq_end }
 
     image_vq_end:
       body:
-        - emit_end_sink
+        - emit_end_to_janus_llama
+        - janus_llama_sink
       transitions:
         - { condition: { type: default }, next_state: done }
+
+generation_kwargs:
+  max_new_tokens: 2048
+  temperature: 0.0
+  top_p: 1.0
+  do_sample: False

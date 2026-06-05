@@ -10,17 +10,16 @@ Call-site split (V2)
   ``gen_ids`` labels.
 * :meth:`encode` — pure encoder: ``pixel_values`` → ``image_embeds`` +
   ``vq_token_ids``.
-* :meth:`decode` — pure head: ``hidden_states`` (+ ``gt_token_ids`` in training)
-  → ``_loss`` or ``vq_token_id`` / ``embed``.
+* :meth:`decode` — training CE head: ``hidden_states`` + ``labels`` → ``_loss``.
 * :meth:`post_forward` — write ``image_embeds`` / ``janus_vqvae_labels`` back onto
   ``conversation_list`` (encode path).
 
 Graph entry points (YAML ``module: janus_vqvae.<method>``):
 
   ``encode``        — training encode node.
-  ``decode``        — training loss + inference sample / lookup.
+  ``decode``        — training loss head.
   ``decode_pixels`` — ``vq_token_ids`` → pixels.
-  ``generate`` / ``ar_step`` — inference VQ AR (unchanged).
+  ``generate``      — inference VQ AR (lm_head → embed → merge).
 """
 
 from typing import Any, Dict, List, Optional
@@ -45,7 +44,6 @@ from ....conversation import (
     is_dummy,
     iter_modality_items,
     maybe_merge_outputs,
-    set_llm_embed,
 )
 from ....generation_graph import FSM_SIGNAL_KEY
 from ....module import OmniModule
@@ -149,29 +147,16 @@ class JanusVqvae(OmniModule, PreTrainedModel):
         self,
         hidden_states: Optional[torch.Tensor] = None,
         labels: Optional[torch.Tensor] = None,
-        token_id: Optional[torch.Tensor] = None,
         is_dummy: bool = False,
+        **kwargs: Any,
     ) -> Dict[str, Any]:
-        """Unified VQ head — training ``_loss`` + inference sample / lookup."""
-        if hidden_states is not None and labels is not None:
-            if is_dummy:
-                return {"loss": hidden_states.sum() * 0.0}
-            return {"loss": self._vq_loss(hidden_states, labels)}
-        if hidden_states is not None:
-            last_logits = self.generation_head(hidden_states[:, -1:, :])
-            probs = torch.softmax(last_logits.squeeze(1), dim=-1)
-            sampled = torch.multinomial(probs, num_samples=1)
-            embed_raw = self.generation_embeddings(sampled)
-            return {
-                "vq_token_id": sampled.squeeze(-1),
-                "embed": self.generation_aligner(embed_raw),
-            }
-        if token_id is not None:
-            if token_id.ndim == 1:
-                token_id = token_id.unsqueeze(1)
-            embed_raw = self.generation_embeddings(token_id)
-            return {"embed": self.generation_aligner(embed_raw)}
-        return {}
+        """Training VQ CE head — ``hidden_states`` + ``labels`` → ``loss``."""
+        del kwargs
+        if hidden_states is None or labels is None:
+            return {}
+        if is_dummy:
+            return {"loss": hidden_states.sum() * 0.0}
+        return {"loss": self._vq_loss(hidden_states, labels)}
 
     def decode_pixels(self, vq_token_ids: torch.Tensor) -> torch.Tensor:
         """Decode a sequence of VQ token IDs to pixel values ``(B, H, W, 3)``."""
@@ -330,35 +315,18 @@ class JanusVqvae(OmniModule, PreTrainedModel):
         hidden_states: Optional[torch.Tensor] = None,
         conversation_list: Optional[List[Any]] = None,
         generation_kwargs: Optional[Dict[str, Any]] = None,
-        **kwargs: Any,
-    ) -> Dict[str, Any]:
-        """Alias for :meth:`ar_step` (backward-compatible FSM node name)."""
-        return self.ar_step(
-            hidden_states=hidden_states,
-            conversation_list=conversation_list,
-            generation_kwargs=generation_kwargs,
-            **kwargs,
-        )
-
-    def ar_step(
-        self,
-        *,
-        hidden_states: Optional[torch.Tensor] = None,
-        conversation_list: Optional[List[Any]] = None,
-        generation_kwargs: Optional[Dict[str, Any]] = None,
         cfg: Optional[Dict[str, Any]] = None,
         **_: Any,
     ) -> Dict[str, Any]:
-        """Monolithic VQ AR step: decode hidden → id → embed → merge.
+        """VQ AR step: lm_head → sample → embed → merge ``output`` rows.
 
-        VQ token ids accumulate in :attr:`_vq_buffer`.  The trailing
-        ``output`` item's ``value`` is replaced with the codebook embed for
-        the next LLM step.  Adjacent ``vq``-phase outputs are merged in-place.
+        VQ token ids accumulate in :attr:`_vq_buffer`.  On the final patch
+        the buffer is decoded to a PIL image and ``image_complete`` is raised.
         """
         if hidden_states is None:
             return {"conversation_list": conversation_list} if conversation_list is not None else {}
         if conversation_list is None or not conversation_list:
-            raise ValueError("JanusVqvae.ar_step expects a non-empty `conversation_list`.")
+            raise ValueError("JanusVqvae.generate expects a non-empty `conversation_list`.")
 
         hidden_states = hidden_states.to(self.device)
         batch_size = hidden_states.size(0)
@@ -376,7 +344,7 @@ class JanusVqvae(OmniModule, PreTrainedModel):
             last_logits = self.generation_head(hidden_states[:, -1:, :]).squeeze(1)
         else:
             raise NotImplementedError(
-                f"JanusVqvae.ar_step received hidden_states with B={batch_size}. "
+                f"JanusVqvae.generate received hidden_states with B={batch_size}. "
                 "Supported: B=1 (no CFG) or B=2 (CFG cond/uncond pair)."
             )
 
@@ -389,15 +357,29 @@ class JanusVqvae(OmniModule, PreTrainedModel):
         if batch_size == 2:
             embed = embed.expand(2, *embed.shape[1:]).contiguous()
 
-        tail = conversation_list[-1]
-        if tail.type != "output":
-            raise ValueError(
-                f"JanusVqvae.ar_step expects the conversation tail to be type='output', got {tail.type!r}."
+        ids = sampled.to(device=embed.device, dtype=torch.long)
+        conversation_list.append(
+            ConversationItem(
+                type="output",
+                value=embed,
+                role="assistant",
+                meta={
+                    "generated": True,
+                    "phase": "vq",
+                    "vq_token": True,
+                    "token_id": token_id_int,
+                    "input_ids": ids,
+                    "source": "janus_vqvae",
+                },
             )
-        set_llm_embed(tail, embed)
+        )
         maybe_merge_outputs(conversation_list, phase="vq")
 
-        out: Dict[str, Any] = {"conversation_list": conversation_list}
+        out: Dict[str, Any] = {
+            "conversation_list": conversation_list,
+            "embed": embed,
+            "vq_token_id": sampled.squeeze(-1),
+        }
 
         target = self._num_image_tokens()
         if len(self._vq_buffer) >= target:
@@ -435,7 +417,7 @@ class JanusVqvae(OmniModule, PreTrainedModel):
         """Flush or discard the VQ token buffer based on its fill level.
 
         Buffer empty → no-op (image may already have been emitted from
-        :meth:`ar_step`).  Buffer full → decode and emit.  Partial grid →
+        :meth:`generate`).  Buffer full → decode and emit.  Partial grid →
         log a warning, discard, emit nothing.
         """
         del ctx

@@ -139,8 +139,8 @@ Build / save lifecycle
      <assets...>}`` — each module's directory is self-contained.
 
 These functions are imported lazily by the trainer; the mixin itself stays
-import-safe in a torch-free / cpu-only environment so ``test_print_flow.py``
-can exercise the graph runtime without GPUs.
+import-safe in a torch-free / cpu-only environment so graph-runtime
+tests can exercise the FSM without GPUs.
 """
 
 from typing import Any, Dict, List, Optional, Type

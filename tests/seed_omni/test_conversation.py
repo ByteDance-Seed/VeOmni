@@ -6,7 +6,6 @@ import torch
 
 from veomni.models.seed_omni.conversation import (
     ConversationItem,
-    append_output_hidden,
     build_conversation,
     collect_modality_batch,
     collect_prompt_embeds,
@@ -166,15 +165,6 @@ def test_get_ar_tail_embed_reads_last_position():
     assert tail is not None
     assert tail.shape == (1, 1, 1)
     assert tail.item() == 3.0
-
-
-def test_append_output_hidden():
-    parts: list[ConversationItem] = []
-    hidden = torch.zeros(1, 1, 8)
-    item = append_output_hidden(parts, hidden, phase="vq")
-    assert item.type == "output"
-    assert item.meta["phase"] == "vq"
-    assert parts[-1] is item
 
 
 def test_set_llm_embed_on_token():

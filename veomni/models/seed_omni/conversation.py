@@ -10,7 +10,7 @@ Each item is ``{type, value, role, meta}``:
 
 * ``type``: ``"text"`` | ``"image"`` | ``"token"`` | ``"output"`` | ``"soi"`` | ``"eoi"``
 * ``value``: polymorphic payload (raw content or embedded tensor)
-* ``role``: ``"system"`` | ``"user"`` | ``"assistant"`` | ``"dummy"``
+* ``role``: ``"user"`` | ``"assistant"`` | ``"dummy"``
 * ``meta``: opaque per-module baggage written during forward (``input_ids``, ``phase``, …)
 
 Lifecycle
@@ -43,7 +43,7 @@ import torch
 
 
 ItemType = str  # "text" | "image" | "token" | "output" | "soi" | "eoi"
-Role = str  # "system" | "user" | "assistant" | "dummy"
+Role = str  # "user" | "assistant" | "dummy"
 ArPhase = Literal["text", "vq"]
 
 
@@ -190,24 +190,27 @@ def get_ar_tail_embed(parts: list[ConversationItem]) -> torch.Tensor | None:
     return emb[:, -1:, :]
 
 
-def append_output_hidden(
-    parts: list[ConversationItem],
-    hidden: torch.Tensor,
-    *,
-    phase: ArPhase,
-    role: str = "assistant",
-) -> ConversationItem:
-    """Append a new ``output`` item carrying backbone hidden states."""
-    item = ConversationItem(type="output", value=hidden, role=role, meta={"phase": phase})
-    parts.append(item)
-    return item
+def drop_trailing_lm_hidden(parts: list[ConversationItem]) -> None:
+    """Drop the last single-token assistant row before a boundary emit (SOI/EOI).
+
+    After ``janus_llama`` runs, the tail is often a one-position embed that must
+    not be fed into the backbone again when opening/closing an image span.
+    """
+    if not parts:
+        return
+    tail = parts[-1]
+    if tail.type == "output":
+        parts.pop()
+        return
+    if tail.role != "assistant" or not tail.meta.get("generated"):
+        return
+    emb = get_llm_embed(tail)
+    if emb is not None and emb.size(1) == 1:
+        parts.pop()
 
 
 def maybe_merge_outputs(parts: list[ConversationItem], *, phase: ArPhase) -> bool:
-    """Concatenate the last two ``output`` items when they share ``phase``.
-
-    Returns ``True`` when a merge occurred.
-    """
+    """Merge the last two ``output`` rows in the same AR phase (concat on seq dim)."""
     if len(parts) < 2:
         return False
     a, b = parts[-2], parts[-1]
@@ -215,29 +218,25 @@ def maybe_merge_outputs(parts: list[ConversationItem], *, phase: ArPhase) -> boo
         return False
     if item_phase(a) != phase or item_phase(b) != phase:
         return False
-    emb_a = get_llm_embed(a)
-    emb_b = get_llm_embed(b)
+    emb_a, emb_b = get_llm_embed(a), get_llm_embed(b)
     if emb_a is None or emb_b is None:
         return False
     a.value = torch.cat([emb_a, emb_b], dim=1)
+    ids_a, ids_b = a.meta.get("input_ids"), b.meta.get("input_ids")
+    if isinstance(ids_a, torch.Tensor) and isinstance(ids_b, torch.Tensor):
+        a.meta["input_ids"] = torch.cat([ids_a, ids_b], dim=1)
     parts.pop()
     return True
 
 
 def seal_phase_outputs(parts: list[ConversationItem], *, phase: ArPhase, new_type: ItemType) -> int:
-    """Rename every ``output`` item with ``meta.phase == phase`` to ``new_type``.
-
-    Returns the number of items renamed.
-    """
+    """Rename completed ``output`` spans to a sealed type (``text`` / ``image``)."""
     count = 0
     for part in parts:
-        if part.type != "output":
-            continue
-        if item_phase(part) != phase:
-            continue
-        part.type = new_type
-        part.meta.pop("phase", None)
-        count += 1
+        if part.type == "output" and item_phase(part) == phase:
+            part.type = new_type
+            part.meta.pop("phase", None)
+            count += 1
     return count
 
 
@@ -251,7 +250,6 @@ def build_conversation(
     for img in images or []:
         parts.append(ConversationItem(type="image", value=img, role="user"))
     parts.append(ConversationItem(type="text", value=prompt, role="user"))
-    parts.append(ConversationItem(type="text", value="", role="assistant"))
     return parts
 
 
@@ -273,20 +271,22 @@ def unembedded_parts(parts: list[ConversationItem]) -> list[ConversationItem]:
 
 
 def latest_assistant_text_token_ids(parts: list[ConversationItem]) -> list[int]:
-    """Token ids from the text decoder cache mirrored on ``token`` parts.
-
-    Legacy path: reads ``type="token"`` assistant parts (excluding VQ-sourced).
-    Prefer :func:`merge_token_cache_into_parts` when using module-private caches.
-    """
+    """Token ids from generated assistant ``text`` rows (``meta.generated=True``)."""
     out: list[int] = []
     for part in parts:
-        if part.type != "token" or item_role(part) != "assistant":
+        if part.type != "text" or item_role(part) != "assistant":
             continue
-        if part.meta.get("source") == "vqvae":
+        if not part.meta.get("generated"):
             continue
-        tid = get_token_id(part)
+        if part.meta.get("vq_token"):
+            continue
+        tid = part.meta.get("token_id")
         if tid is not None:
-            out.append(tid)
+            out.append(int(tid))
+            continue
+        ids = part.meta.get("input_ids")
+        if isinstance(ids, torch.Tensor) and ids.numel() == 1:
+            out.append(int(ids.reshape(-1)[0].item()))
     return out
 
 
@@ -509,8 +509,8 @@ __all__ = [
     "ConversationPart",
     "ItemType",
     "Role",
-    "append_output_hidden",
     "build_conversation",
+    "drop_trailing_lm_hidden",
     "collect_prompt_embeds",
     "get_ar_tail_embed",
     "item_phase",

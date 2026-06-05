@@ -34,7 +34,6 @@ def test_inference_request_defaults_are_empty_or_zero():
     assert req.prompt == "hi"
     assert req.images == []
     assert req.generation_kwargs == {}
-    assert req.max_new_tokens == 2048
 
 
 def test_inference_request_preserves_generation_kwargs():
@@ -54,7 +53,6 @@ def test_inference_request_is_a_plain_dataclass():
         "prompt",
         "images",
         "generation_kwargs",
-        "max_new_tokens",
     }
 
 
@@ -91,4 +89,46 @@ def test_module_exports_inferencer_and_request():
     import veomni.trainer.omni_inferencer as module
 
     assert "OmniInferencer" in module.__all__
+    assert "OmniModuleInferencer" in module.__all__
     assert "InferenceRequest" in module.__all__
+
+
+def test_module_uses_fsdp_only_when_declared_in_module_yaml():
+    from veomni.trainer.omni_inferencer import _module_uses_fsdp
+
+    assert not _module_uses_fsdp({"model": {"weights_path": "janus_siglip"}})
+    assert _module_uses_fsdp(
+        {
+            "model": {"weights_path": "janus_siglip"},
+            "train": {"accelerator": {"fsdp_config": {"fsdp_mode": "fsdp2"}}},
+        }
+    )
+    assert not _module_uses_fsdp(
+        {
+            "model": {"weights_path": "janus_siglip"},
+            "train": {"accelerator": {"fsdp_config": {"fsdp_mode": "none"}}},
+        }
+    )
+
+
+def test_omni_config_module_config_merges_model_and_train_blocks():
+    from veomni.models.seed_omni.configuration_seed_omni import OmniConfig
+
+    omni_config = OmniConfig.from_dict(
+        {
+            "modules": {
+                "janus_siglip": {
+                    "model": {
+                        "model_path": "/tmp/global/janus_siglip",
+                        "model_config": {"freeze": True},
+                    },
+                    "data": {"train_path": "/tmp/unused"},
+                    "train": {"init_device": "meta"},
+                }
+            }
+        }
+    )
+    module_args = omni_config.module_config("janus_siglip")
+    assert module_args.model.model_path == "/tmp/global/janus_siglip"
+    assert module_args.model.model_config == {"freeze": True}
+    assert module_args.train.init_device == "meta"

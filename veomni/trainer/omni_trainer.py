@@ -57,10 +57,9 @@ Division of labour
   step, and cascades the callback lifecycle into each module-trainer.
 """
 
-import copy
 import os
 from collections import defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import torch
@@ -91,7 +90,7 @@ logger = logging.get_logger(__name__)
 
 @dataclass
 class OmniModelArguments(ModelArguments):
-    """Model arguments for OmniModel V2 training / inference."""
+    """Model arguments for OmniModel V2 training."""
 
     omni_train_yaml_path: Optional[str] = field(
         default=None,
@@ -103,38 +102,9 @@ class OmniModelArguments(ModelArguments):
             )
         },
     )
-    omni_infer_yaml_path: Optional[Dict[str, str]] = field(
-        default_factory=dict,
-        metadata={
-            "help": (
-                "Mapping of inference scenario name → inference YAML path.  "
-                "The selected scenario's YAML overlays ``omni_train_yaml_path`` "
-                "at runtime (flat dict.update; only top-level keys, in practice "
-                "generation_graph).  Example keys: infer_gen / infer_und / "
-                "infer_interleave."
-            )
-        },
-    )
-    omni_infer_type: Optional[str] = field(
-        default=None,
-        metadata={"help": "Active inference scenario key into omni_infer_yaml_path (inference only)."},
-    )
-    infer_use_fsdp: bool = field(
-        default=False,
-        metadata={
-            "help": (
-                "When True, inference builds each module through the same FSDP2 "
-                "path as training (requires distributed init).  Default False uses "
-                "eager ``from_pretrained`` on a single device."
-            )
-        },
-    )
 
-    def __post_init__(self):
-        super().__post_init__()
-
-    def load_omni_config(self, *, infer_type: Optional[str] = None) -> "OmniConfig":
-        """Build :class:`OmniConfig` with resolved module paths."""
+    def load_omni_config(self, global_args: VeOmniArguments) -> "OmniConfig":
+        """Build :class:`OmniConfig` (graph vocabulary + raw module override blocks)."""
         from ..models.seed_omni.configuration_seed_omni import OmniConfig
 
         if not self.omni_train_yaml_path:
@@ -142,19 +112,10 @@ class OmniModelArguments(ModelArguments):
         if not self.model_path:
             raise ValueError("`model.model_path` is required for OmniModel V2.")
 
-        infer_yaml_path = None
-        selected = infer_type or self.omni_infer_type
-        if selected is not None:
-            infer_map = self.omni_infer_yaml_path or {}
-            if selected not in infer_map:
-                known = ", ".join(sorted(infer_map)) or "(none)"
-                raise KeyError(f"Unknown omni_infer_type {selected!r}; expected one of: {known}.")
-            infer_yaml_path = infer_map[selected]
-
-        return OmniConfig.from_paths(
+        return OmniConfig._init(
+            global_args=global_args,
             model_path=self.model_path,
             train_yaml_path=self.omni_train_yaml_path,
-            infer_yaml_path=infer_yaml_path,
         )
 
 
@@ -163,6 +124,15 @@ class VeOmniOmniArguments(VeOmniArguments):
     model: "OmniModelArguments" = field(default_factory=OmniModelArguments)
     data: "DataArguments" = field(default_factory=DataArguments)
     train: "TrainingArguments" = field(default_factory=TrainingArguments)
+
+    def _to_base_args(self) -> VeOmniArguments:
+        omni_model = self.model
+        model_kwargs = {f.name: getattr(omni_model, f.name) for f in fields(ModelArguments)}
+        return VeOmniArguments(
+            model=ModelArguments(**model_kwargs),
+            data=self.data,
+            train=self.train,
+        )
 
 
 # ── Multi-optimizer / multi-scheduler proxies ──────────────────────────────────
@@ -602,127 +572,52 @@ class OmniTrainer:
     optimizers: Dict[str, torch.optim.Optimizer]  # one per trainable module (aggregated into base.optimizer)
     lr_schedulers: Dict[str, Any]  # one per trainable module (aggregated into base.lr_scheduler)
 
-    def __init__(self, args: VeOmniOmniArguments, *, runtime: str = "train"):
+    def __init__(self, args: VeOmniOmniArguments):
         # BaseTrainer.__init__ is NOT called here; we call its private
         # helpers one-by-one so the (overridden) build sequence is explicit.
-        self.runtime = runtime
         self.base = BaseTrainer.__new__(BaseTrainer)
         self.base.args = args
 
-        if runtime == "train":
-            self.base._setup()
-            self._build_model(use_fsdp=True)
-            self._freeze_model_module()
-            self._build_model_assets()
-            self.base._build_data_transform()
-            self.base._build_dataset()
-            self._build_collate_fn()
-            self.base._build_dataloader()
-            self._build_optimizer()
-            self._build_lr_scheduler()
-            self.base._build_training_context()
-            self._init_callbacks()
-        elif runtime == "infer":
-            use_fsdp = bool(args.model.infer_use_fsdp)
-            if use_fsdp:
-                self.base._setup()
-            self._build_model(use_fsdp=use_fsdp)
-            self._freeze_model_module()
-            self._build_model_assets()
-            self.base.model.eval()
-        else:
-            raise ValueError(f"Unknown OmniTrainer runtime {runtime!r}; expected 'train' or 'infer'.")
+        self.base._setup()
+        self._build_model()
+        self._freeze_model_module()
+        self._build_model_assets()
+        self.base._build_data_transform()
+        self.base._build_dataset()
+        self._build_collate_fn()
+        self.base._build_dataloader()
+        self._build_optimizer()
+        self._build_lr_scheduler()
+        self.base._build_training_context()
+        self._init_callbacks()
 
     # ── Build: per-module trainers + compose ───────────────────────────────────
 
-    def _module_args(self, weights_path: str, mod_cfg: Dict[str, Any]) -> "VeOmniOmniArguments":
-        """Per-module copy of the global args, retargeted at this module.
-
-        The module-trainer reuses ``BaseTrainer._build_model`` /
-        ``_build_parallelized_model``, which read ``args.model.{config_path,
-        model_path}`` and ``args.model.model_config``.  Point those at the
-        module's split-checkpoint subfolder; the module's YAML ``model_config:``
-        sub-block becomes the config overrides (forwarded to the OmniModule's
-        config — e.g. ``freeze``).  A deep copy keeps per-module mutations
-        (e.g. the GC flag) from leaking across modules and avoids re-running
-        ``ModelArguments.__post_init__`` (safetensors-index I/O) on every module.
-        """
-        a = copy.deepcopy(self.base.args)
-        a.model.config_path = weights_path
-        a.model.model_path = weights_path
-        a.model.model_config = dict(mod_cfg.get("model_config") or {})
-        return a
-
-    def _build_model(self, *, use_fsdp: bool = True):
-        """Build one :class:`OmniModuleTrainer` per module (FSDP) or eager load (infer).
-
-        Training always uses ``use_fsdp=True``.  Inference defaults to eager
-        ``from_pretrained``; set ``model.infer_use_fsdp=True`` to reuse the
-        training FSDP2 build path.
-        """
+    def _build_model(self):
+        """Build one :class:`OmniModuleTrainer` (FSDP2) per declared module."""
         base = self.base
         args: VeOmniOmniArguments = base.args
-        self.omni_config = args.model.load_omni_config(
-            infer_type=args.model.omni_infer_type if self.runtime == "infer" else None
-        )
-        self.module_names = list(self.omni_config.module_names)
+
+        self.omni_config = args.model.load_omni_config(args._to_base_args())
+        self.module_names = self.omni_config.module_names
         self.module_trainers: Dict[str, OmniModuleTrainer] = {}
 
-        if use_fsdp:
-            modules = self._build_fsdp_modules()
-        else:
-            modules = self._build_eager_modules()
+        modules: Dict[str, torch.nn.Module] = {}
+        for name in self.module_names:
+            module_config = self.omni_config.module_config(name)
+            module_trainer = OmniModuleTrainer(
+                module_config,
+                subfolder_name=name,
+            )
+            self.module_trainers[name] = module_trainer
+            modules[name] = module_trainer.base.model
+            logger.info_rank0(f"OmniTrainer: built module-trainer '{name}' from {module_config.model.model_path}")
 
         base.model = OmniModel(self.omni_config, modules)
         base.model_config = self.omni_config
         logger.info_rank0(
             f"OmniTrainer: composed OmniModel with {len(self.module_names)} modules ({self.module_names})."
         )
-
-    def _build_fsdp_modules(self) -> Dict[str, torch.nn.Module]:
-        modules: Dict[str, torch.nn.Module] = {}
-        for name in self.module_names:
-            mod_cfg = self.omni_config.module_config(name)
-            weights_path = mod_cfg.get("weights_path")
-            if weights_path is None:
-                raise ValueError(f"OmniTrainer: module '{name}' has no `weights_path` in the training YAML.")
-
-            module_trainer = OmniModuleTrainer(
-                self._module_args(weights_path, mod_cfg),
-                subfolder_name=name,
-            )
-            self.module_trainers[name] = module_trainer
-            modules[name] = module_trainer.base.model
-            logger.info_rank0(f"OmniTrainer: built module-trainer '{name}' from {weights_path}")
-        return modules
-
-    def _build_eager_modules(self) -> Dict[str, torch.nn.Module]:
-        from ..models.seed_omni import OMNI_MODEL_REGISTRY, read_model_type
-
-        modules: Dict[str, torch.nn.Module] = {}
-        for name in self.module_names:
-            mod_cfg = self.omni_config.module_config(name)
-            weights_path = mod_cfg.pop("weights_path", None)
-            if not weights_path:
-                raise ValueError(f"Module '{name}' is missing `weights_path` in OmniConfig.modules.")
-            overrides = dict(mod_cfg.get("model_config") or {})
-            model_type = read_model_type(weights_path)
-            cls = OMNI_MODEL_REGISTRY[model_type]()
-            logger.info_rank0(
-                f"OmniTrainer: eager-build module '{name}' (model_type={model_type}, cls={cls.__name__}) from {weights_path}"
-            )
-            module = cls.from_pretrained(
-                weights_path,
-                torch_dtype=torch.bfloat16,
-                device_map="auto",
-                **overrides,
-            ).eval()
-            try:
-                module.tokenizer = build_tokenizer(weights_path)
-            except Exception:
-                pass
-            modules[name] = module
-        return modules
 
     # ── Freeze (aggregate report) ───────────────────────────────────────────────
 

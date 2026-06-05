@@ -108,6 +108,9 @@ class PrintVisionEncoder(_PrintBase):
             return {}
         return _with_carrier(kwargs, und_image_embeds="<vis_embeds>")
 
+    def generate(self, **kwargs: Any) -> dict[str, Any]:
+        return self.forward(**kwargs)
+
     def generate_step(self, **kwargs: Any) -> dict[str, Any]:
         return self.forward(**kwargs)
 
@@ -204,6 +207,9 @@ class PrintTextEmbed(_PrintBase):
         ids = kwargs.get("input_ids", "?")
         return _with_carrier(kwargs, inputs_embeds=f"<wte:{ids}>")
 
+    def generate(self, **kwargs: Any) -> dict[str, Any]:
+        return self.encode(**kwargs)
+
     def decode(self, **kwargs: Any) -> dict[str, Any]:
         self._record("decode", **kwargs)
         if kwargs.get("labels") is not None:
@@ -268,6 +274,9 @@ class PrintARBackbone(_PrintBase):
         out["_loss"] = _scalar_loss(0.2)
         return out
 
-    def generate_step(self, **kwargs: Any) -> dict[str, Any]:
-        self._record("generate_step", **kwargs)
+    def generate(self, **kwargs: Any) -> dict[str, Any]:
+        self._record("generate", **kwargs)
         return {"hidden_states": "<ar_hidden_gen>"}
+
+    def generate_step(self, **kwargs: Any) -> dict[str, Any]:
+        return self.generate(**kwargs)

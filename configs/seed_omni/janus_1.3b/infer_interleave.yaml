@@ -1,7 +1,7 @@
 # Janus-1.3B inference — interleave T2T + T2I (mid-stream image generation).
 #
 # Unlike `infer_gen.yaml` (deterministic T2I), the model itself decides when
-# to start an image: ``tok_ar_step`` samples normally and the image span opens
+# to start an image: ``token_decode`` samples normally and the image span opens
 # only on a natural <begin_of_image> (`start_image_gen` signal).  After each
 # image span ``image_vq_end`` falls back to ``text_ar`` (not ``done``).
 
@@ -11,10 +11,10 @@ generation_graph:
   states:
     prompt_encode:
       body:
-        - vision_to_llm
-        - tokenc_to_llm
-        - llm_to_text_ar
-        - text_ar_sink
+        - siglip_to_janus_llama
+        - token_generate_to_janus_llama
+        - janus_llama_to_token_generate
+        - token_generate_sink
       transitions:
         - { condition: { type: module_signal, key: start_image_gen }, next_state: image_vq }
         - { condition: { type: module_signal, key: text_done }, next_state: done }
@@ -22,21 +22,28 @@ generation_graph:
 
     text_ar:
       body:
-        - llm_to_text_ar
-        - text_ar_sink
+        - janus_llama_to_token_generate
+        - token_generate_sink
       transitions:
         - { condition: { type: module_signal, key: start_image_gen }, next_state: image_vq }
         - { condition: { type: module_signal, key: text_done }, next_state: done }
 
     image_vq:
       body:
-        - llm_to_vaegen
-        - vaegen_to_llm
+        - vqvae_to_janus_llama
+        - janus_llama_to_vqvae
       transitions:
         - { condition: { type: module_signal, key: image_complete }, next_state: image_vq_end }
 
     image_vq_end:
       body:
-        - emit_end_sink
+        - emit_end_to_janus_llama
+        - janus_llama_sink
       transitions:
         - { condition: { type: default }, next_state: text_ar }
+
+generation_kwargs:
+  max_new_tokens: 2048
+  temperature: 0.0
+  top_p: 1.0
+  do_sample: False

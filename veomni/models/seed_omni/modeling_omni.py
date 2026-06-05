@@ -90,7 +90,7 @@ import torch.nn as nn
 from ...utils import helper
 from .configuration_seed_omni import OmniConfig
 from .conversation import summarize_conversation_batch
-from .generation_graph import FSM_SIGNAL_KEY, GenerationGraph
+from .generation_graph import GenerationGraph
 from .module import OmniModule
 from .training_graph import TrainingGraph
 
@@ -356,15 +356,16 @@ class OmniModel(nn.Module):
         if normalized is not None:
             self._generated.append(normalized)
 
-    def _collect_generated(self, ctx: Dict[str, Any]) -> None:
+    def _collect_generated(self, ctx: Dict[str, Any], trace: Optional[List[str]] = None) -> None:
         """Drain ``ctx["generated"]`` into :attr:`_generated` (one-shot)."""
-        self._append_generated(ctx.pop("generated", None))
+        generated = ctx.pop("generated", None)
+        self._append_generated(generated)
+        if trace is not None and generated is not None:
+            trace.append(f"finalize:{generated['type']}")
 
-    def _invoke_module_finalize(
+    def _force_invoke_module_finalize(
         self,
         ctx: Dict[str, Any],
-        *,
-        force: bool = False,
         trace: Optional[List[str]] = None,
     ) -> None:
         """Call :meth:`OmniModule.finalize` and drain any ``generated`` payload.
@@ -373,14 +374,13 @@ class OmniModel(nn.Module):
         ``force=True`` skips that guard — used when ``max_new_tokens`` trips
         before ``done``.
         """
-        if not force and FSM_SIGNAL_KEY not in ctx:
-            return
         for name, raw in self.named_omni_modules():
             out = raw.finalize(ctx=ctx)
             if not isinstance(out, dict):
                 raise TypeError(f"{type(raw).__name__}.finalize must return a dict, got {type(out).__name__}.")
-            self._append_generated(out.pop("generated", None))
-            if trace is not None:
+            generated = out.pop("generated", None)
+            self._append_generated(generated)
+            if trace is not None and generated is not None:
                 trace.append(f"finalize:{name}")
 
     def _emit_progress(self, total_steps: int) -> None:
@@ -403,10 +403,8 @@ class OmniModel(nn.Module):
     def generate(
         self,
         request: Dict[str, Any],
-        context: Optional[Dict[str, Any]] = None,
-        max_new_tokens: int = 512,
-        *,
         trace: Optional[List[str]] = None,
+        generation_kwargs: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Run inference using the FSM.
 
@@ -451,7 +449,7 @@ class OmniModel(nn.Module):
         boundaries via :meth:`reset` (so multi-turn conversations can keep
         cache across turns).  The FSM runs from whatever state it is in.
         """
-        ctx: Dict[str, Any] = dict(context if context is not None else request)
+        ctx: Dict[str, Any] = request
         self._generated.clear()
 
         modules = {name: _unwrap_module(getattr(self, name)) for name in self._module_names}
@@ -462,15 +460,14 @@ class OmniModel(nn.Module):
         # step 0).  A final emit after the loop catches the transition into
         # ``done`` (the while-cond exits before the body iterates that state).
         # :meth:`_emit_progress` owns the dedup cursor — nothing to thread.
+        max_new_tokens = generation_kwargs.get("max_new_tokens", 2048)
         total_steps = 0
+
         while not self.generation_graph.is_done() and total_steps < max_new_tokens:
             self._emit_progress(total_steps)
-            ctx = self.generation_graph.step(modules, ctx, trace=trace)
+            ctx = self.generation_graph.step(modules, ctx, trace=trace, generation_kwargs=generation_kwargs)
             total_steps += 1
-
-            self._collect_generated(ctx)
-            self._invoke_module_finalize(ctx, trace=trace)
-
+            self._collect_generated(ctx, trace)
             self.generation_graph.maybe_transition(ctx, trace=trace)
 
         # Final emit — captures the state the FSM is in after the loop

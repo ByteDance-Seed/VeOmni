@@ -6,8 +6,8 @@ Shared pool data types for the SeedOmni V2 graph.
 - ``nodes``  — graph nodes (a.k.a. call-sites).  Each maps a node name to one
   ``module.method`` pair::
 
-      {module: <name>}              # runs <name>.forward(**kwargs)
-      {module: <name>.<method>}     # runs <name>.<method>(**kwargs)
+      {module: <name>}              # training: <name>.forward; FSM inference: <name>.generate
+      {module: <name>.<method>}     # runs <name>.<method>(**kwargs) in both views
 
   The same underlying ``nn.Module`` may appear under multiple node names — for
   example a VQ module with both an ``encode`` node (pixels → embeds) and a

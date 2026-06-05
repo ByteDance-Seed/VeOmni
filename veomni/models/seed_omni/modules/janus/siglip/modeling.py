@@ -25,7 +25,6 @@ from transformers.models.janus.modeling_janus import JanusVisionAlignerMLP, Janu
 from ....conversation import (
     ConversationItem,
     collect_modality_batch,
-    is_embedded,
     item_role,
     iter_modality_items,
 )
@@ -130,26 +129,29 @@ class JanusSiglip(OmniModule, PreTrainedModel):
 
     def generate(
         self,
-        *,
         conversation_list: Optional[List[ConversationItem]] = None,
-        past_key_values: Optional[Any] = None,
-        **_: Any,
+        **kwargs: Any,
     ) -> Dict[str, Any]:
         """Encode every user ``image`` part that is not yet embedded."""
-        if conversation_list is None or past_key_values is not None:
-            return {"conversation_list": conversation_list} if conversation_list is not None else {}
 
         pending = [
             part
             for part in conversation_list
-            if part.type == "image" and item_role(part) == "user" and not is_embedded(part)
+            if part.type == "image_output"  # newly generated images
         ]
+        if not pending:
+            pending = [part for part in conversation_list if part.type == "image" and item_role(part) == "user"]
+
         if not pending:
             return {"conversation_list": conversation_list}
 
         embeds = self._encode_pixel_values(self._pixels_from_raw_images([part.value for part in pending]))
         for part, emb in zip(pending, embeds, strict=True):
             part.value = emb if emb.dim() == 2 else emb.squeeze(0)
+            if part.type == "image_output":
+                part.type = "image"
+                assert part.role == "assistant"  # debug check
+
         return {"conversation_list": conversation_list}
 
     # ── Training-side dummy forward ────────────────────────────────────────────

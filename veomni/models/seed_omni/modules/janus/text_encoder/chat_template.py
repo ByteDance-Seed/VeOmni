@@ -2,9 +2,9 @@
 
 Training flow
 -------------
-1. :func:`apply_janus_chat_template` — insert bos / system / role markers /
-   boi–image–eoi spans; set ``meta["loss_mask"]`` on template rows that differ
-   from the default ``int(role == "assistant")``.
+1. :func:`apply_janus_chat_template` — insert bos / (optional) system / role
+   markers / boi–image–eoi spans; set ``meta["loss_mask"]`` on template rows
+   that differ from the default ``int(role == "assistant")``.
 2. :func:`render_template_string` — concatenate the human-readable wire string.
 3. Text encoder tokenizes (token ids in ``value``), merges adjacent text, then packs text rows.
 4. :func:`pack_text_input_ids` — ``list[Tensor]`` of per-text-row token ids (for ``naflatten``).
@@ -52,6 +52,11 @@ def _template_item(
     return ConversationItem(type=item_type, value=value, role=role, meta=part_meta)
 
 
+def sample_has_user_image(sample: list[ConversationItem]) -> bool:
+    """Return True when the raw conversation includes a user ``image`` row."""
+    return any(item.type == "image" and item.role == "user" for item in sample)
+
+
 def apply_janus_chat_template(
     sample: list[ConversationItem],
     markers: JanusChatMarkers,
@@ -59,8 +64,13 @@ def apply_janus_chat_template(
     """Apply Janus chat template to a raw conversation (text + image parts)."""
     out: list[ConversationItem] = []
     dummy_parts: list[ConversationItem] = []  # dummy from other modules
-    out.append(_template_item("text", markers.bos_token, "system"))
-    out.append(_template_item("text", markers.system_prompt, "system"))
+    out.append(_template_item("text", markers.bos_token, "user"))
+    # TODO: shared by training + inference.  Official Janus I2T prepends the VL
+    # system preamble; T2I does not.  Current micro-batches are either pure I2T
+    # (user image present) or pure T2I (text-only user turn) — use that as a
+    # proxy.  Ideally every sample would carry an explicit system row upstream.
+    if sample_has_user_image(sample):
+        out.append(_template_item("text", markers.system_prompt, "user"))
     prev_role: str | None = None
     for item in sample:
         role = item.role
@@ -81,8 +91,8 @@ def apply_janus_chat_template(
             dummy_parts.append(item)
         else:
             out.append(_template_item(item.type, item.value, role, meta=dict(item.meta)))
-
-    out.append(_template_item("text", markers.eos_token, "assistant"))
+    if prev_role == "assistant":
+        out.append(_template_item("text", markers.eos_token, "assistant"))
     out.extend(dummy_parts)
     return out
 

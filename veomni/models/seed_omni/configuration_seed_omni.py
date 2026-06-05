@@ -6,22 +6,22 @@ YAML structure (maps 1-to-1 to this class):
   # ── Global asset (the ONLY global asset; everything else is per-module).
   model_path: /path/to/split/checkpoint/root
 
-  # ── Modules: one entry per OmniModule.  `model_type` is read from each
-  #    module's `config.json` (model_type read by OMNI_*_REGISTRY) and is NOT specified
-  #    here — the YAML carries only the location and overrides.
+  # ── Modules: one entry per OmniModule.  Each block mirrors a mini
+  #    ``VeOmniOmniArguments`` (``model`` / ``train`` / ``data``).  ``model_type``
+  #    is read from each module's ``config.json`` and is NOT specified here.
   modules:
-    siglip:        {weights_path: ..., config_path: ...}
-    janus_llama:   {weights_path: ...}
-    text_encoder:  {weights_path: ...}
-    # Per-module config overrides live under `model_config:` (mirrors
-    # ModelArguments.model_config) — forwarded to the module's config.
-    vqvae:         {weights_path: ..., model_config: {freeze: true}}
-
-  # NOTE: ``micro_batch_size`` / DP / SP / TP / CP are NOT per-module — they
-  # live globally under ``train.*`` in the launcher YAML.  All modules share
-  # the same global micro_batch_size and parallel mesh; per-module parallel
-  # customisation will be revisited after the OmniTrainer build flow is
-  # fully working.
+    siglip:
+      model: {weights_path: ...}
+    janus_llama:
+      model: {weights_path: ...}
+    vqvae:
+      model:
+        weights_path: ...
+        model_config: {freeze: true}
+      train:
+        init_device: meta
+        accelerator:
+          fsdp_config: {fsdp_mode: fsdp2}
 
   # ── Graph nodes (call-sites): one entry per `module.method` invocation.
   #    The same module may appear under multiple node names.
@@ -77,10 +77,12 @@ YAML structure (maps 1-to-1 to this class):
 """
 
 import os
-from copy import deepcopy
 from typing import Any, Dict, List, Optional, Union
 
 from transformers import PretrainedConfig
+
+from ...arguments.arguments_types import VeOmniArguments
+from ...arguments.parser import _deep_update, _instantiate_recursive
 
 
 class OmniConfig(PretrainedConfig):
@@ -103,26 +105,27 @@ class OmniConfig(PretrainedConfig):
         edges: Optional[Dict[str, Dict]] = None,
         training_graph: Optional[Dict] = None,
         generation_graph: Optional[Dict] = None,
-        tokenizer_path: Optional[str] = None,
+        generation_kwargs: Optional[Dict] = None,
         **kwargs,
     ):
         self.modules: Dict[str, Dict] = modules or {}
         self.nodes: Dict[str, Dict] = nodes or {}
         self.edges: Dict[str, Dict] = edges or {}
         self.training_graph: Dict = training_graph or {"edges": []}
+
         self.generation_graph: Optional[Dict] = generation_graph
-        self.tokenizer_path: Optional[str] = tokenizer_path
+        self.generation_kwargs: Optional[Dict] = generation_kwargs
 
         super().__init__(**kwargs)
 
     # ── Accessors ─────────────────────────────────────────────────────────────
 
-    def module_config(self, name: str) -> Dict[str, Any]:
+    def module_config(self, name: str) -> VeOmniArguments:
         """Return the raw config dict for a module by name (deep-copied)."""
-        cfg = self.modules.get(name)
+        cfg = self.modules.get(name, None)
         if cfg is None:
             raise KeyError(f"Module '{name}' not found in OmniConfig.modules")
-        return deepcopy(cfg)
+        return _instantiate_recursive(VeOmniArguments, cfg)
 
     @property
     def training_edges(self) -> List[str]:
@@ -142,28 +145,23 @@ class OmniConfig(PretrainedConfig):
     def from_dict(cls, config_dict: Dict, **kwargs) -> "OmniConfig":
         """Build an :class:`OmniConfig` from a YAML-shaped dict.
 
-        Pops ``model_path`` (required) and resolves every relative
-        ``modules.*.weights_path`` under it; absolute paths pass through
-        unchanged.  Unknown top-level keys are dropped silently so the
-        same launcher YAML can carry training-only fields without
-        polluting the inference config.
+        Pops ``model_path`` (the split-checkpoint root from the launcher YAML —
+        consumed by :func:`build_module_args`, not stored here).  Module blocks
+        are kept verbatim; path resolution happens when merging each module onto
+        the global :class:`VeOmniOmniArguments`.  Unknown top-level keys are
+        dropped silently so the launcher YAML can carry training-only fields.
         """
-        model_path = config_dict.pop("model_path")
+        config_dict = dict(config_dict)
         accepted = {k: v for k, v in config_dict.items() if k in cls.__init__.__code__.co_varnames}
-        for mod_cfg in accepted.get("modules", {}).values():
-            weights_path = mod_cfg.get("weights_path")
-            if weights_path is not None and not os.path.isabs(weights_path):
-                mod_cfg["weights_path"] = os.path.join(model_path, weights_path)
         return cls(**accepted, **kwargs)
 
     @classmethod
-    def from_paths(
+    def _init(
         cls,
+        global_args: VeOmniArguments,
         model_path: Union[str, os.PathLike],
         train_yaml_path: Union[str, os.PathLike],
         infer_yaml_path: Union[str, os.PathLike] = None,
-        tokenizer_path: Optional[Union[str, os.PathLike]] = None,
-        **kwargs,
     ) -> "OmniConfig":
         """Load an :class:`OmniConfig` from a training YAML + optional inference YAML.
 
@@ -174,23 +172,101 @@ class OmniConfig(PretrainedConfig):
         T2I-only / understanding).  See ``configs/seed_omni/janus_1.3b/``
         for the canonical layout.
 
-        The two YAMLs are flat-merged via ``dict.update`` — the inference
-        YAML's top-level keys (in practice just ``generation_graph``)
-        replace anything with the same name in the training YAML.  Anything
-        deeper (``modules.foo.*``) cannot be partially overridden; declare
-        the full block in whichever YAML owns it.
+        Per-module args are built from the launcher ``global_args``
+        (:class:`VeOmniArguments` parsed from ``veomni_janus.yaml``).  Train
+        and infer YAML ``modules:`` blocks are deep-merged into one override
+        dict per module name, then merged onto ``global_args`` (same path as
+        :func:`parse_args` via ``_deep_update`` + ``_instantiate_recursive``).
+
+        Relative ``model.weights_path`` subfolders are joined with ``model_path``
+        before the merge sets ``model.model_path`` / ``config_path``.
         """
+        from dataclasses import asdict
+
         import yaml
 
-        base_cfg = {"model_path": model_path}
-        if tokenizer_path is not None:
-            base_cfg["tokenizer_path"] = tokenizer_path
         with open(train_yaml_path, encoding="utf-8") as f:
-            base_cfg.update(yaml.safe_load(f))
+            omni_train_config = yaml.safe_load(f)
+
+        modules_overrides: Dict[str, Any] = omni_train_config.pop("modules")
+        modules_overrides = cls._resolve_model_path(model_path, modules_overrides)
+        base_cfg = {
+            "nodes": omni_train_config.pop("nodes"),
+            "edges": omni_train_config.pop("edges"),
+            "training_graph": omni_train_config.pop("training_graph"),
+        }
         if infer_yaml_path is not None:
             with open(infer_yaml_path, encoding="utf-8") as f:
-                base_cfg.update(yaml.safe_load(f))
-        return cls.from_dict(base_cfg, **kwargs)
+                omni_infer_config = yaml.safe_load(f)
+            infer_modules_overrides = omni_infer_config.pop("modules", {})
+            if infer_modules_overrides:
+                infer_modules_overrides = cls._resolve_model_path(model_path, infer_modules_overrides)
+            infer_modules_overrides = cls._resolve_default_accelerator(modules_overrides, infer_modules_overrides)
+            modules_overrides = _deep_update(modules_overrides, infer_modules_overrides)
+            _deep_update(
+                base_cfg,
+                {
+                    "generation_graph": omni_infer_config.pop("generation_graph"),
+                    "generation_kwargs": omni_infer_config.pop("generation_kwargs"),
+                },
+            )
+        base_cfg["modules"] = {
+            name: _deep_update(asdict(global_args), override) for name, override in modules_overrides.items()
+        }
+        return cls.from_dict(base_cfg)
+
+    @staticmethod
+    def _resolve_model_path(
+        model_path: Union[str, os.PathLike],
+        modules_config: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """Join relative ``model.model_path`` under ``model_path``."""
+        if not modules_config:
+            return {}
+        checkpoint_root = str(model_path)
+        for mod_cfg in modules_config.values():
+            model = mod_cfg.setdefault("model", {})
+            resolved = model.get("model_path") or model.get("weights_path")
+            if resolved is None:
+                continue
+            if not os.path.isabs(resolved):
+                resolved = os.path.join(checkpoint_root, resolved)
+            _deep_update(
+                model,
+                {
+                    "model_path": resolved,
+                    "config_path": resolved,
+                    "tokenizer_path": resolved,
+                },
+            )
+        return modules_config
+
+    @staticmethod
+    def _resolve_default_accelerator(
+        train_modules_config: Dict[str, Any],
+        infer_modules_overrides: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """Default inference load: eager (``fsdp_mode: eager``) for every train module.
+
+        Infer YAMLs usually omit ``modules:`` entirely.  Build one override per
+        module name from ``train_modules_config``, each setting
+        ``train.accelerator.fsdp_config.fsdp_mode`` to ``eager``.  Non-empty
+        ``infer_modules_overrides`` deep-merge on top (e.g. opt-in FSDP2 for one
+        module).
+        """
+        eager_by_module = {
+            name: {
+                "train": {
+                    "accelerator": {
+                        "fsdp_config": {
+                            "fsdp_mode": "eager",
+                        }
+                    }
+                }
+            }
+            for name in train_modules_config
+        }
+        return _deep_update(eager_by_module, infer_modules_overrides)
 
 
 __all__ = ["OmniConfig"]

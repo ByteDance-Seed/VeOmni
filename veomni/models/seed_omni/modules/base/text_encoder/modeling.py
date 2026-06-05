@@ -47,7 +47,8 @@ Connection outputs
 ``decode``:
   :class:`~veomni.utils.model_outputs.CausalLMOutputWithLogProbs` with
   ``logits`` and optional ``loss`` (training).  Inference sampling lives in
-  ``generate`` / ``ar_step``, not here.  :meth:`post_forward` maps ``loss`` →
+  model-specific subclasses (e.g. Janus ``decode`` with ``conversation_list``).
+  :meth:`post_forward` maps ``loss`` →
   ``_loss`` for the OmniModel graph.
 """
 
@@ -166,8 +167,8 @@ class TextEncoder(OmniModule, PreTrainedModel):
 
         Projects ``hidden_states`` to vocab logits.  When ``shift_labels`` or
         ``labels`` is given, returns token-mean CE in ``loss``.  Inference
-        sampling is handled by ``generate`` / ``ar_step`` on model-specific
-        subclasses, not here.
+        sampling is handled by model-specific subclasses (e.g. Janus
+        ``decode`` with ``conversation_list``), not here.
         """
         logits = self._project(hidden_states)
         loss: torch.Tensor | None = None
