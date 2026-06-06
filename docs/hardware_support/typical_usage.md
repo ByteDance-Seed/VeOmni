@@ -2,10 +2,12 @@
 
 This document provides a complete step-by-step guide for training the Qwen3-VL 8B model on Ascend NPUs. Follow these instructions carefully to ensure a successful training experience.
 
+> **Note**: This guide is validated on Ascend A2 (910B) and Ascend 950 (A5) products. For A5-specific operator configuration, see the NPU-friendly operator block below.
+
 ## Prerequisites
 
 - Ascend NPU environment with CANN 9.0.0 installed
-- VeOmni framework installed (see [Installation](get_started_npu.md#installation) section)
+- VeOmni framework installed (see [Installation](../get_started/installation/install_ascend_x86.md) section)
 - Sufficient storage space for dataset and model weights
 
 ## Step 1: Download Dataset
@@ -75,6 +77,8 @@ model:
     causal_conv1d_implementation: eager
     chunk_gated_delta_rule_implementation: eager
 ```
+
+> **A5 (Ascend 950) Note**: If you are running on A5 hardware, replace `attn_implementation: flash_attention_2` with `attn_implementation: "sdpa"`. The Flash Attention 2 Triton backend is pending validation on A5. See [A5 Features Pending Validation](../a5_unsupported_features.md) for details.
 
 These configurations specify the optimal implementation for each operator type when running on NPUs:
 - Use NPU-optimized implementations where available (rms_norm_implementation: npu)

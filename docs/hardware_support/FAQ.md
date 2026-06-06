@@ -30,7 +30,7 @@ NODE_RANK=${NODE_RANK:=0}
 MASTER_ADDR=${MASTER_ADDR:=192.168.1.100}
 # Master node port (default works for most cases)
 MASTER_PORT=${MASTER_PORT:=12345}
-# Number of NPUs per node (A2: max 8, A3: max 16)
+# Number of NPUs per node (A2/A5: max 8, A3: max 16)
 NPROC_PER_NODE=${NPROC_PER_NODE:=8}
 ```
 
@@ -41,7 +41,7 @@ NPROC_PER_NODE=${NPROC_PER_NODE:=8}
 - `NODE_RANK`: Unique identifier for each node (0 to NNODES-1)
 - `MASTER_ADDR`: IP address of the master node (same for all machines)
 - `MASTER_PORT`: Communication port (default: 12345)
-- `NPROC_PER_NODE`: NPUs per node (A2: max 8, A3: max 16)
+- `NPROC_PER_NODE`: NPUs per node (A2/A5: max 8, A3: max 16)
 
 **Important Notes**:
 - All nodes must communicate via `MASTER_ADDR:MASTER_PORT`
@@ -126,3 +126,27 @@ pip install transformers==5.9.0
 **Version Recommendations**:
 - VeOmni pins Transformers `5.9.0` (see `pyproject.toml`). Other v5 minor
   versions may work but are not exercised in CI.
+
+## Q: What is the support status of Ascend 950 (A5) products?
+
+### A: A5 is supported; most features are validated, some scenarios are pending further verification
+
+Ascend 950 (A5) products are Ascend 950 series NPUs. VeOmni has verified that all existing unit tests and system tests pass on A5 hardware. Most features are theoretically supported; some scenarios require additional validation due to differences in memory capacity, inter-chip bandwidth, and compute capabilities compared to A2 (910B).
+
+**Validated on A5:**
+- Qwen3 8B / Qwen3-VL 8B (FSDP2 + SP)
+- Basic training workflows (pre-training, SFT)
+- All NPU-optimized operators (RMSNorm, RoPE, GroupGEMM, chunked cross-entropy)
+
+**Scenarios pending further validation on A5:**
+- Multi-node Expert Parallelism (EP) for MoE models > 8B
+- Wan2.1 training (uses FSDP1 backend)
+- Training models > 8B parameters
+- Sequence length > 32K for models ≥ 30B
+- `flash_attention_2` with Triton backend — use `sdpa` on A5 for now
+- `liger_kernel` MoE backend — use `moe_implementation: fused_npu` on A5 for now
+
+For details, see:
+[A5 Features Pending Validation](a5_unsupported_features.md)
+
+> **Note**: When running on A5, configure `attn_implementation: "sdpa"` in your YAML config. As validation progresses, additional operator backends may become available on A5.

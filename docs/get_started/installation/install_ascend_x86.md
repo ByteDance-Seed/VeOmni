@@ -1,8 +1,20 @@
 # Installation with Ascend NPU (x86)
 
+## Supported Hardware and Operating Systems
+
+This installation guide applies to the following Ascend NPU products on x86_64 architecture:
+
+| Hardware | Operating System | CANN Version | Status |
+|----------|-----------------|--------------|--------|
+| Ascend A2 (910B) | Ubuntu 22.04 | 8.3.RC2 / 9.0.0 | ✅ Supported |
+| Ascend 950 (A5) | Ubuntu 22.04 | 9.0.0 | ✅ Supported |
+
+> **Note**: A5 refers to the Ascend 950 series products. All existing unit tests and system tests pass on A5.
+> For scenarios pending further validation on A5, please refer to [A5 Features Pending Validation](../../hardware_support/a5_unsupported_features.md).
+
 ## Required Environment
 
-CANN == 8.3.RC1
+CANN == 8.3.RC1 (9.0.0 recommended for A5)
 
 ## Prepare CANN
 
@@ -11,6 +23,8 @@ Choose one of the following methods to use CANN:
 1. Install CANN according to the [official documentation](https://www.hiascend.com/document/detail/zh/canncommercial/83RC1/softwareinst/instg/instg_quick.html?Mode=PmIns&InstallType=local&OS=openEuler&Software=cannToolKit)
 
 2. Download and use [the CANN image](https://www.hiascend.com/developer/ascendhub/detail/17da20d1c2b6493cb38765adeba85884)
+
+> **Note**: For Ascend 950 (A5) products, please use CANN 9.0.0.
 
 ## Install with uv or pip
 
