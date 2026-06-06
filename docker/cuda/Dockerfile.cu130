@@ -6,6 +6,19 @@ ENV MAX_JOBS=16
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PIP_ROOT_USER_ACTION=ignore
 
+# flash-attn 2.x and flash-attn-3 (hopper) setup.py default behaviour is to
+# guess a prebuilt wheel URL on github.com and download it (compilation is
+# the *fallback*). Both fail for cu130 today: (a) the upstream prebuilt wheel
+# index only goes up to `cu12torch2.X` — there is no `cu13` variant, so even
+# a successful download would yield an ABI-incompatible wheel; (b) github.com
+# is frequently unreachable from build hosts behind corporate firewalls, so
+# the download itself dies with `Remote end closed connection without
+# response`. Setting FLASH_ATTENTION_FORCE_BUILD=TRUE makes setup.py skip the
+# wheel download path and compile from source against the locked +cu130 torch
+# (which is what we want anyway). The cxx11 ABI is auto-detected from torch
+# (`torch._C._GLIBCXX_USE_CXX11_ABI`) so we don't force it explicitly.
+ENV FLASH_ATTENTION_FORCE_BUILD=TRUE
+
 # Define installation arguments
 ARG APT_SOURCE=http://archive.ubuntu.com/ubuntu/
 ARG PIP_INDEX=https://pypi.org/simple

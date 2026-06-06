@@ -34,7 +34,12 @@ On session start, read the following:
 ## Setup
 
 ```bash
-uv sync --extra gpu --dev
+# FLASH_ATTENTION_FORCE_BUILD=TRUE makes flash-attn / flash-attn-3 setup.py
+# compile from source instead of trying to download a prebuilt cu12 wheel
+# from github (no cu13 wheels exist; github is also blocked behind the
+# corporate firewall). The cuda Dockerfile sets this env globally; local
+# devs need to prefix it on the command line. See .agents/knowledge/uv.md.
+FLASH_ATTENTION_FORCE_BUILD=TRUE uv sync --extra gpu --dev
 source .venv/bin/activate
 ```
 

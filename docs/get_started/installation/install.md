@@ -18,8 +18,11 @@ CUDA 13.0 (the `gpu` extra targets `+cu130` torch wheels and the `nvcr.io/nvidia
 git clone https://github.com/ByteDance-Seed/VeOmni.git
 cd VeOmni
 
-# use the locked uv env
-uv sync --locked --extra gpu
+# Use the locked uv env. FLASH_ATTENTION_FORCE_BUILD=TRUE forces flash-attn
+# 2.x and flash-attn-3 (Hopper) to compile from source instead of trying to
+# download a prebuilt wheel from github (no cu13 prebuilt wheels exist;
+# github is also frequently unreachable from build hosts behind firewalls).
+FLASH_ATTENTION_FORCE_BUILD=TRUE uv sync --locked --extra gpu
 source .venv/bin/activate
 ```
 

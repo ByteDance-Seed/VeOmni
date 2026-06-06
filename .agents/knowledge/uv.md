@@ -90,21 +90,56 @@ torch, torchvision, torchaudio use custom sources:
 
 - **GPU**: torch uses a direct wheel URL (not the pytorch index) to avoid uv resolving to incompatible cu128_full wheels. The URL must be updated manually when bumping torch.
 - **NPU**: uses the `pytorch` index (`https://download.pytorch.org/whl/`)
-- **flash-attn / flash-attn-3**: direct wheel URLs tied to specific torch+CUDA combinations. Listed under `no-build-isolation-package`.
+
+## Source-Built Attention Kernels
+
+The `gpu` extra source-builds four kernels (no prebuilt cu130+torch2.11
+wheels exist as of 2026-06):
+
+| Package | Source | Listed in `no-build-isolation-package` |
+|---|---|---|
+| `flash-attn` (FA2) | PyPI sdist | yes |
+| `flash-attn-3` (Hopper) | git: Dao-AILab/flash-attention/hopper | yes |
+| `flash-attn-4` (cute) | git: Dao-AILab/flash-attention/flash_attn/cute | no (build isolation) |
+| `flash-qla` | git: QwenLM/FlashQLA | no (build isolation) |
+
+Three pyproject knobs cooperate to make a fresh `uv sync --extra gpu` succeed:
+
+1. **`[[tool.uv.dependency-metadata]]`** with `name` + `version` + `requires-dist`
+   for `flash-attn-3` (`3.0.0`) and `flash-qla` (`0.1.0`). These two have no
+   `pyproject.toml`, only a `setup.py` whose top-level body imports `torch` /
+   `wheel.bdist_wheel` / `packaging.version.parse`. With static metadata uv
+   skips the metadata hook entirely during resolution. **Without `version`,
+   uv falls back to invoking the build system to determine it, which crashes
+   on a fresh venv with `ModuleNotFoundError: No module named 'setuptools'`.**
+
+2. **`[tool.uv.extra-build-dependencies]`** seeds `setuptools / wheel /
+   packaging / ninja` (and `torch` for the build-isolation packages) into the
+   build env, since uv-created venvs are not seeded by default.
+
+3. **`FLASH_ATTENTION_FORCE_BUILD=TRUE`** (env var, not pyproject) forces the
+   FA2 / FA3 setup.py to compile from source instead of trying to download a
+   prebuilt wheel from `github.com/Dao-AILab/flash-attention/releases`. Their
+   default wheel guesser only knows `cu11torch*` / `cu12torch*` (no `cu13`
+   variants), and even an ABI-correct match would still die over corporate
+   firewalls that can't reach github. The cuda Dockerfile sets this env
+   globally; local devs must export it (or prefix the `uv sync` command).
 
 ## Common Commands
 
 ```bash
-# Initial setup (transformers==5.9.0 via the default dependency group)
-uv sync --extra gpu --dev
+# Initial setup (transformers==5.9.0 via the default dependency group).
+# FLASH_ATTENTION_FORCE_BUILD bypasses FA2/FA3's prebuilt-wheel download
+# (no cu130 prebuilt exists; github.com is also blocked from corp networks).
+FLASH_ATTENTION_FORCE_BUILD=TRUE uv sync --extra gpu --dev
 
 # Regenerate lockfile after pyproject.toml changes
 uv lock
 
 # Sync after lockfile update
-uv sync --extra gpu --dev
+FLASH_ATTENTION_FORCE_BUILD=TRUE uv sync --extra gpu --dev
 
-# Docker builds (CI)
+# Docker builds (CI) — Dockerfile.cu130 already exports the env via ENV
 uv sync --locked --all-packages --extra gpu --dev
 ```
 
@@ -112,7 +147,7 @@ uv sync --locked --all-packages --extra gpu --dev
 
 1. **Always commit `uv.lock` with `pyproject.toml`** — Docker builds use `--locked`.
 2. **torch version changes touch 4+ places** in pyproject.toml (extras, overrides, sources, wheel URL).
-3. **flash-attn wheels are torch-version-specific** — bumping torch requires new wheels.
+3. **flash-attn / flash-attn-3 / flash-attn-4 / flash-qla compile from source on every fresh sync** (no cu13+torch2.11 prebuilts exist). Plan for ~15-30 min of nvcc time. Use `FLASH_ATTENTION_FORCE_BUILD=TRUE` to skip the FA2/FA3 prebuilt-wheel guesser; static metadata in `[[tool.uv.dependency-metadata]]` (with explicit `version`) keeps `uv lock` from re-invoking their `setup.py` for metadata.
 4. **uv version changes require Docker rebuilds** — update Dockerfiles and release new images. The Dockerfile uv pin must stay inside the `required-version` range in `pyproject.toml`.
 5. **`override-dependencies` markers are load-bearing** — the `extra == 'gpu'` guards prevent uv from downloading wrong torch variants.
 6. **`transformers==5.9.0` is the only supported version** — pinned via the `transformers-stable` default dependency group. New code targets v5 APIs (FSDP2 + patchgen-generated modeling) only.
