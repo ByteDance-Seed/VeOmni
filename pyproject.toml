@@ -335,6 +335,12 @@ requires-dist = ["torch"]
 name = "flash-attn-3"
 requires-dist = ["torch"]
 
+[tool.uv.extra-build-dependencies]
+flash-attn = ["setuptools", "wheel", "packaging", "ninja"]
+flash-attn-3 = ["setuptools", "wheel", "packaging", "ninja"]
+flash-attn-4 = ["setuptools", "wheel", "packaging", "ninja", "torch"]
+flash-qla = ["setuptools", "wheel", "packaging", "ninja", "torch"]
+
 [tool.setuptools.dynamic]
 version = {attr = "veomni._version.__version__"}
 
