@@ -327,12 +327,44 @@ name = "pytorch-cpu"
 url = "https://download.pytorch.org/whl/cpu/"
 explicit = true
 
+# Static metadata so uv can plan the resolution / build graph WITHOUT invoking
+# the package's build hook. Critical for the git-based attention kernels:
+#  - flash-attn-3 (Dao-AILab/flash-attention/hopper) has no pyproject.toml,
+#    only a setup.py whose top-level body does `import torch`, `import wheel`,
+#    and `from packaging.version import parse`. Without static metadata, uv
+#    invokes `setuptools.build_meta:__legacy__.prepare_metadata_for_build_wheel`
+#    on a freshly created venv and explodes with `ModuleNotFoundError: No
+#    module named 'setuptools'` (uv's default venvs are not seeded). With
+#    `version` + `requires-dist` set, uv treats the package as resolvable
+#    statically and only invokes the build hook for the actual wheel build,
+#    AFTER the regular `gpu` extra deps (including torch) have populated the
+#    venv via `no-build-isolation-package` ordering.
+#  - flash-qla (QwenLM/FlashQLA) likewise has no pyproject.toml and a setup.py
+#    whose `install_requires` lists tilelang / apache-tvm-ffi at versions that
+#    uv would otherwise pull from PyPI. `requires-dist = ["torch"]` suppresses
+#    those — the kernel uses tilelang at runtime only when explicitly opted in
+#    via `chunk_gated_delta_rule_implementation: flash_qla`, and we don't
+#    install the runtime tilelang here (out of scope for the docker image).
+#  - flash-attn (FA2) ships an sdist on PyPI that already contains METADATA
+#    in the tarball, so uv doesn't have to run setup.py for metadata. The
+#    entry below is kept (without `version`) because we still want the
+#    `requires-dist = ["torch"]` override during resolution.
+#
+# Versions are read from each upstream:
+#  - flash_attn_3 hopper/__init__.py:__version__ = "3.0.0"
+#  - flash_qla  setup.py:version = "0.1.0+<git short sha>" (we pin "0.1.0").
 [[tool.uv.dependency-metadata]]
 name = "flash-attn"
 requires-dist = ["torch"]
 
 [[tool.uv.dependency-metadata]]
 name = "flash-attn-3"
+version = "3.0.0"
+requires-dist = ["torch"]
+
+[[tool.uv.dependency-metadata]]
+name = "flash-qla"
+version = "0.1.0"
 requires-dist = ["torch"]
 
 [tool.uv.extra-build-dependencies]
