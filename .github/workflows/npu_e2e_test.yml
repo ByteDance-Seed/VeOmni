@@ -141,6 +141,37 @@ jobs:
       - name: Run e2e training test
         run: |
           uv run --frozen pytest -v -s -x tests/e2e/test_e2e_parallel.py
+      - name: Free NPUs between test steps
+        # pytest's mp.spawn / torchrun workers sometimes outlive the pytest
+        # session — they hold tens of GiB on NPU and OOM the next test.
+        # Kill stale Python processes and verify NPU memory is freed.
+        if: always()
+        run: |
+          npu-smi info || true
+          pids=$(ps -eo pid,args | grep -E 'python.*torchrun|python.*pytest' | grep -v grep | awk '{print $1}' | sort -u | tr '\n' ' ')
+          if [ -n "$pids" ]; then
+            echo "Killing stale NPU processes: $pids"
+            kill -9 $pids 2>/dev/null || true
+            sleep 3
+            npu-smi info || true
+          fi
       - name: Run FSDP equivalence tests
         run: |
           uv run --frozen pytest -v -s -x tests/distributed/test_fsdp_equivalence.py
+      - name: Free NPUs between test steps
+        if: always()
+        run: |
+          npu-smi info || true
+          pids=$(ps -eo pid,args | grep -E 'python.*torchrun|python.*pytest' | grep -v grep | awk '{print $1}' | sort -u | tr '\n' ' ')
+          if [ -n "$pids" ]; then
+            echo "Killing stale NPU processes: $pids"
+            kill -9 $pids 2>/dev/null || true
+            sleep 3
+            npu-smi info || true
+          fi
+      - name: Sync dependencies [diffusers]
+        run: |
+          uv sync --frozen --python 3.11 --extra npu --extra dit --group dev
+      - name: Run diffusers tests
+        run: |
+          uv run --frozen pytest -v -s -x tests/e2e/test_e2e_parallel.py::test_wan_dit_parallel_align
