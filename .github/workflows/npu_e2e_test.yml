@@ -134,7 +134,7 @@ jobs:
           clean: true
       - name: Sync dependencies
         run: |
-          uv sync --frozen --python 3.11 --extra npu --extra audio --group dev
+          uv sync --frozen --python 3.11 --extra npu --group dev
       - name: Check final pip list
         run: |
           uv pip list

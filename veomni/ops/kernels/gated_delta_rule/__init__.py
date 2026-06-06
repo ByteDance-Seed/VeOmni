@@ -31,8 +31,9 @@ Selection is driven by three fields on ``OpsImplementationConfig``:
 
 Currently ``rms_norm_gated`` and ``causal_conv1d`` ship a single non-eager
 backend (``fla``); ``chunk_gated_delta_rule`` additionally accepts
-``flash_qla`` for users who install the optional ``flash-qla`` extra
-(``pip install veomni[flash-qla]`` / ``uv sync --extra flash-qla``).
+``flash_qla``. The ``flash-qla`` package rides along inside the ``gpu``
+extra (it was rolled in when the older standalone ``flash-qla`` extra was
+removed), so a plain ``uv sync --extra gpu`` already provides it.
 """
 
 from __future__ import annotations

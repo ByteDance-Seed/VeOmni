@@ -10,8 +10,7 @@ docker/
 │   ├── cuda.Dockerfile.j2
 │   └── ascend.Dockerfile.j2
 ├── cuda/                  ← generated, do not hand-edit
-│   ├── Dockerfile.cu128
-│   └── Dockerfile.cu129
+│   └── Dockerfile.cu130
 └── ascend/                mix of generated + hand-maintained (see "Ascend" below)
     ├── Dockerfile.ascend_8.3.rc2_a2.x86   ← generated, do not hand-edit
     └── Dockerfile.ascend_*                  hand-maintained (pip-based)
@@ -22,7 +21,7 @@ docker/
 `docker/cuda/Dockerfile.*` are **generated** from
 [`docker/templates/cuda.Dockerfile.j2`](templates/cuda.Dockerfile.j2) +
 [`docker/matrix.yaml`](matrix.yaml). The default shape of the template is the
-`cu129` variant; other variants override only the bits that differ
+`cu130` variant; other variants would override only the bits that differ
 (`base_image`, `release_notes_url`).
 
 CI runs [`check_docker_generate.yml`](../.github/workflows/check_docker_generate.yml)
@@ -53,11 +52,11 @@ flagged.
 Add an entry under `images:` in [`matrix.yaml`](matrix.yaml). Example:
 
 ```yaml
-- name: cu130
-  output: docker/cuda/Dockerfile.cu130
+- name: cu131
+  output: docker/cuda/Dockerfile.cu131
   template: cuda.Dockerfile.j2
-  base_image: "nvcr.io/nvidia/pytorch:25.09-py3"
-  release_notes_url: "https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-25-09.html"
+  base_image: "nvcr.io/nvidia/pytorch:26.02-py3"
+  release_notes_url: "https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-26-02.html"
   uv_extras_preset: cuda
 ```
 

@@ -34,14 +34,16 @@ On session start, read the following:
 ## Setup
 
 ```bash
-uv sync --extra gpu --extra audio --dev
+uv sync --extra gpu --dev
 source .venv/bin/activate
 ```
 
 This installs `transformers==5.9.0` (pinned by the `transformers-stable`
-default dependency group in `pyproject.toml`). Always activate `.venv/`
-before running any commands. New code must target transformers v5 and FSDP2.
-See `.agents/knowledge/constraints.md` for details.
+default dependency group in `pyproject.toml`). The `gpu` extra is a single
+full superset (cu130 torch + every attention kernel + diffusion/audio/trl/peft);
+there is no separate `--extra audio` / `--extra dit` / etc. any more. Always
+activate `.venv/` before running any commands. New code must target
+transformers v5 and FSDP2. See `.agents/knowledge/constraints.md` for details.
 
 ---
 

@@ -139,9 +139,10 @@ def test_swiglu_mlp_liger_matches_eager():
 @pytest.mark.skipif(
     get_gpu_compute_capability() != 90 or importlib.util.find_spec("flash_qla") is None,
     reason="flash_qla today only ships Hopper SM90 kernels (SM10x WIP upstream — "
-    "https://github.com/QwenLM/FlashQLA/issues/2) and needs the optional `flash-qla` "
-    "extra (`uv sync --extra gpu --extra flash-qla`). Skipped on Ampere/L20 CI runners "
-    "and on Blackwell.",
+    "https://github.com/QwenLM/FlashQLA/issues/2). The flash-qla package now ships "
+    "as part of the `gpu` extra (`uv sync --extra gpu`); this test still skips on "
+    "non-Hopper runners (Ampere / L20 / Blackwell) because the kernel itself only "
+    "targets SM90.",
 )
 def test_chunk_gated_delta_rule_flash_qla_matches_fla():
     # Both `fla` and `flash_qla` are non-eager Triton implementations of the

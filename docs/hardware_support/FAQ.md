@@ -117,7 +117,7 @@ Ensure you're using a compatible Transformers version:
 python -c "import transformers; print(transformers.__version__)"
 
 # Install using uv
-uv sync --locked --extra npu --extra audio --group dev
+uv sync --locked --extra npu --group dev
 
 # Or install using pip
 pip install transformers==5.9.0

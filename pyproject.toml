@@ -41,92 +41,129 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Hardware-shaped extras. The whole project funnels into three mutually-exclusive
+# extras (declared in `[tool.uv].conflicts` below) so that a typical install is
+# `uv sync --extra <gpu|npu|npu_aarch64>` — one flag, no à la carte feature
+# extras to remember. Earlier revisions split the Python-level deps (audio,
+# video, dit, trl, lora, fa3, fa4, flash-qla, megatron) into nine separate
+# extras, which forced docker / CI / docs to chain seven-plus `--extra` flags
+# and made the `pip install veomni[<???>]` UX a maze. Those splits are gone:
+# everything that's CUDA-safe lives in `gpu`, everything that's NPU-safe lives
+# in `npu`, and the aarch64 NPU build stays minimal (the aarch64 wheel set for
+# av / torchcodec is incomplete on PyPI as of 2026-06).
+#
+# Trade-off: a fresh `uv sync --extra gpu` source-builds flash-attn (FA2),
+# flash-attn-3, flash-attn-4, and flash-qla — collectively ~60–90 min the
+# first time. uv caches the built wheels under ~/.cache/uv, so subsequent
+# syncs (and CI runners with a populated cache) are fast. The cuda docker
+# image bakes the cache into the layer.
+#
+# The `dev` extra below is the legacy pip-style entry point; modern uv users
+# should pull dev tooling via the `dev` dependency-group (`uv sync --dev`) —
+# see `[dependency-groups]` further down.
 dev = [
   "pre-commit>=4.0.0,<5.0",
   "ruff>=0.7.0,<1.0",
   "pytest>=6.0.0,<8.0",
   "expecttest>=0.3.0,<0.4"
 ]
-audio = [
-  "torchcodec",
-  "av>=14.3.0,<15.0; python_version == '3.11'",
-  "av>=14.0.0,<14.3; python_version == '3.12'",
-  "librosa>=0.11.0,<0.12",
-  "soundfile>=0.13.1,<0.14"
-]
-# Alias for audio extra - includes both video and audio processing dependencies
-video = [
-  "torchcodec",
-  "av>=14.3.0,<15.0; python_version == '3.11'",
-  "av>=14.0.0,<14.3; python_version == '3.12'",
-  "librosa>=0.11.0,<0.12",
-  "soundfile>=0.13.1,<0.14"
-]
-dit = [
-  "diffusers==0.37.0",
-  "torchcodec",
+
+# NVIDIA GPU on x86_64 — full superset.
+#
+# Toolchain: targets the cu130 docker image (NGC PyTorch 25.11 base; CUDA
+# 13.0.2 + cuDNN 9.x). Pinned to torch 2.11 — the latest stable +cu130 wheel
+# on download.pytorch.org. NGC 25.11 ships torch 2.10.0a0; uv overrides it
+# with 2.11.0+cu130 at sync time.
+#
+# Source builds (all gated by `no-build-isolation-package` below so the build
+# picks up the locked torch ABI):
+#   - flash-attn 2.8.3        — PyPI sdist (no Luosuu prebuilt cu130+torch2.11
+#                                wheel exists as of 2026-06).
+#   - flash-attn-3            — Dao-AILab/flash-attention/hopper (Hopper sm_90;
+#                                used by Wan / Flux DiT paths).
+#   - flash-attn-4            — Dao-AILab/flash-attention/flash_attn/cute
+#                                (Blackwell + cute kernels).
+#   - flash-qla               — QwenLM/FlashQLA (alt chunk_gated_delta_rule
+#                                kernel for Qwen3.5 linear attention; default
+#                                `eager` / `fla` paths work without it).
+gpu = [
+  # cu130 torch stack
+  "torch==2.11.0+cu130",
+  "torchvision==0.26.0+cu130",
+  "torchaudio==2.11.0+cu130",
+  "torchcodec==0.12.0", # 0.12.x is compatible with torch 2.11
+  # NVIDIA libraries
+  "nvidia-cusparselt-cu13",
+  "nvidia-nccl-cu13",
+  "nvidia-cutlass-dsl>=4.4.2", # for flash-attn-4 cute kernels
+  "cuda-python==13.0.3",
+  # Attention kernels (source-built — see header note)
+  "flash-attn",
+  "flash-attn-3",
+  "flash-attn-4",
+  "flash-qla",
+  # Linear-attention / loss / DLPack kernels
+  "liger-kernel",
+  "flash-linear-attention", # FLA backend for Qwen3.5 chunk_gated_delta_rule
+  "quack-kernels[cu13]==0.5.0",
+  "torch-c-dlpack-ext",
+  # Audio / video data loading
   "av>=14.3.0,<15.0; python_version == '3.11'",
   "av>=14.0.0,<14.3; python_version == '3.12'",
   "librosa>=0.11.0,<0.12",
   "soundfile>=0.13.1,<0.14",
+  # Diffusion / RLHF / LoRA
+  "diffusers==0.37.0",
   "ftfy",
+  "trl<=0.9.6",
+  "peft==0.18.1",
+  # Misc runtime
+  "hf_transfer",
 ]
+
+# Ascend NPU on x86_64 — full superset, minus CUDA-only kernels.
+#
+# Pinned to torch 2.7.1 + torch-npu 2.7.1 (CANN 8.3.rc2 / 9.0.0). The +cpu
+# torch wheels bring the standard PyTorch package without a CUDA stack;
+# torch-npu provides the Ascend backend. flash-attn / flash-attn-3 /
+# flash-attn-4 / flash-qla are intentionally absent — they are CUDA-only.
+npu = [
+  "torch==2.7.1+cpu",
+  "torch-npu==2.7.1",
+  "torchvision==0.22.1+cpu",
+  "torchaudio==2.7.1+cpu",
+  "torchcodec>=0.4.0,<0.6.0",
+  "decorator>=5.2.1",
+  "scipy>=1.16.2",
+  # Audio / video data loading (av wheel pulled from files.pythonhosted.org;
+  # x86_64 only — see `[tool.uv.sources].av`).
+  "av>=14.3.0,<15.0; python_version == '3.11'",
+  "av>=14.0.0,<14.3; python_version == '3.12'",
+  "librosa>=0.11.0,<0.12",
+  "soundfile>=0.13.1,<0.14",
+  # Diffusion / RLHF / LoRA
+  "diffusers==0.37.0",
+  "ftfy",
+  "trl<=0.9.6",
+  "peft==0.18.1",
+  # Misc runtime
+  "hf_transfer",
+]
+
+# Ascend NPU on aarch64 — minimal.
+#
+# av / torchcodec / soundfile / librosa do not all publish aarch64 manylinux
+# wheels (the URL-pinned av wheel under `[tool.uv.sources]` is x86_64 only),
+# so the aarch64 NPU build deliberately ships only the torch + torch-npu
+# core. Users training DiT / running audio pipelines on arm64 NPU need to
+# `pip install diffusers librosa soundfile ...` separately.
 npu_aarch64 = [
   "torch==2.7.1",
   "torch-npu==2.7.1",
   "torchvision==0.22.1",
   "torchaudio==2.7.1",
   "decorator>=5.2.1",
-  "scipy>=1.16.2"
-]
-npu = [
-  "torch==2.7.1+cpu",
-  "torch-npu==2.7.1",
-  "torchvision==0.22.1+cpu",
-  "torchaudio==2.7.1+cpu",
-  "decorator>=5.2.1",
   "scipy>=1.16.2",
-  "torchcodec>=0.4.0,<0.6.0"
-]
-gpu = [
-  "torch==2.9.1+cu129",
-  "torchvision==0.24.1+cu129",
-  "torchaudio==2.9.1+cu129",
-  "nvidia-cusparselt-cu12",
-  "nvidia-nccl-cu12",
-  "liger-kernel",
-  "flash-attn",
-  "flash-attn-3",
-  "hf_transfer",
-  "torchcodec==0.8.1", # 0.8.1 is compatible with torch 2.9
-  "cuda-python==12.9.1",
-  "torch-c-dlpack-ext",
-  # For models with linear attention like Qwen 3.5
-  "flash-linear-attention",
-  "quack-kernels==0.3.4",
-]
-megatron = [
-  "megatron-energon>=7.2.1"
-]
-trl = [
-  "trl<=0.9.6"
-]
-lora = [
-  "peft==0.18.1"
-]
-
-fa4 = [
-  "flash-attn-4",
-  "nvidia-cutlass-dsl>=4.4.2"
-]
-
-# Optional alternative chunk_gated_delta_rule kernel for Qwen3.5 linear attention.
-# Opt in by selecting `chunk_gated_delta_rule_implementation: flash_qla` in
-# OpsImplementationConfig — the default `eager` and the `fla` backend
-# (shipped under the `gpu` extra via `flash-linear-attention`) work without
-# this extra. Source: https://github.com/QwenLM/FlashQLA
-flash-qla = [
-  "flash-qla"
 ]
 
 [dependency-groups]
@@ -197,12 +234,12 @@ default-groups = ["transformers-stable"]
 override-dependencies = [
     # Adding the (extra == 'gpu') mark to declare this override is only for gpu extra.
     # Without this mark, uv would download torch/torchaudio/torchvision unexpectedly from
-    # PyPI without using the cu128 versions.
+    # PyPI without using the cu130 versions.
     # Ref: https://github.com/astral-sh/uv/issues/11153
-    "torch==2.9.1+cu129; (extra == 'gpu')",
-    "torchaudio==2.9.1+cu129; (extra == 'gpu')",
-    "torchvision==0.24.1+cu129; (extra == 'gpu')",
-    "torchcodec==0.8.1; (extra == 'gpu')",
+    "torch==2.11.0+cu130; (extra == 'gpu')",
+    "torchaudio==2.11.0+cu130; (extra == 'gpu')",
+    "torchvision==0.26.0+cu130; (extra == 'gpu')",
+    "torchcodec==0.12.0; (extra == 'gpu')",
     # Adding explicit override for NPU backends - aarch64 variant
     "torch==2.7.1; (extra == 'npu_aarch64')",
     "torchaudio==2.7.1; (extra == 'npu_aarch64')",
@@ -213,11 +250,6 @@ override-dependencies = [
     "torchaudio==2.7.1+cpu; (extra == 'npu')",
     "torchvision==0.22.1+cpu; (extra == 'npu')",
     "torchcodec>=0.4.0,<0.6.0; (extra == 'npu')",
-
-    # Force to use 9.15+ cudnn to avoid torch 2.9 conv3d performance regression issue:
-    # https://github.com/pytorch/pytorch/releases/tag/v2.9.1
-    # TODO: remove this override after we upgrade to torch 2.10.
-    "nvidia-cudnn-cu12==9.15.1.9",
 ]
 
 conflicts = [
@@ -243,25 +275,29 @@ torch = [
   # By forcing it to the proper package here, we avoid the problem that uv could randomly resolve to other packages.
   #
   # NOTE: WHEN UPDATE TORCH VERSIONS, PLEASE UPDATE THIS TO THE CORRESPONDING WHEEL URL.
-  { url = "https://download.pytorch.org/whl/cu129/torch-2.9.1%2Bcu129-cp311-cp311-manylinux_2_28_x86_64.whl", extra = 'gpu', marker = "python_version == '3.11'" },
-  { url = "https://download.pytorch.org/whl/cu129/torch-2.9.1%2Bcu129-cp312-cp312-manylinux_2_28_x86_64.whl", extra = 'gpu', marker = "python_version == '3.12'" },
+  { url = "https://download.pytorch.org/whl/cu130/torch-2.11.0%2Bcu130-cp311-cp311-manylinux_2_28_x86_64.whl", extra = 'gpu', marker = "python_version == '3.11'" },
+  { url = "https://download.pytorch.org/whl/cu130/torch-2.11.0%2Bcu130-cp312-cp312-manylinux_2_28_x86_64.whl", extra = 'gpu', marker = "python_version == '3.12'" },
 ]
 torchvision = { index = "pytorch" }
 torchaudio = { index = "pytorch" }
-# Download fa2 and fa3 wheels directly to avoid build issues.
-# Both wheels are built against torch 2.9+cu129. From
-# https://github.com/Luosuu/flash-attention-prebuild-wheels since there is no official
-# FA2 prebuilt wheel for torch 2.9+.
-flash-attn = [
-  { url = "https://github.com/Luosuu/flash-attention3-wheels/releases/download/v0.0.1/flash_attn-2.8.4-cp311-cp311-linux_x86_64.whl", marker = "extra == 'gpu' and python_version == '3.11'"},
-  { url = "https://github.com/Luosuu/flash-attention-prebuild-wheels/releases/download/fa2cu129/flash_attn-2.8.3+cu129torch2.9-cp312-cp312-linux_x86_64.whl", marker = "extra == 'gpu' and python_version == '3.12'"},
-]
-flash-attn-3 = [
-  # torch 2.9+cu129 — cp39-abi3 (stable ABI) works on both 3.11 and 3.12.
-  { url = "https://github.com/Luosuu/flash-attention3-wheels/releases/download/v0.0.1/flash_attn_3-3.0.0+20260313.cu129torch291cxx11abitrue.3a0d6b-cp39-abi3-linux_x86_64.whl", marker = "extra == 'gpu'"},
-]
-# FlashAttention 4 is developed under flash-attention/flash-attn/cute folder as a standalone python project.
-# Pinned to 03/18/2026 latest main commit.
+# flash-attn (FA2) is intentionally NOT pinned to a prebuilt wheel here:
+# upstream Dao-AILab does not publish +cu130 wheels for the 2.8.x line, and
+# Luosuu's `fa2cu130` release only covers torch 2.9 / 2.10 — there is no
+# cu130+torch2.11 prebuilt wheel as of 2026-06. Instead, uv resolves the
+# `flash-attn` registry entry on PyPI (`flash_attn-2.8.3.tar.gz` sdist) and
+# source-builds it against the locked torch via `no-build-isolation-package`
+# above. This adds ~15-30 min to the docker build the first time but is
+# guaranteed to match torch's ABI; re-add a `[tool.uv.sources].flash-attn`
+# entry pointing at a Luosuu (or upstream) cu130+torch2.11 wheel here when
+# one ships.
+# FlashAttention 3 (Hopper sm_90) and FlashAttention 4 (Blackwell, etc.) are
+# both developed in Dao-AILab/flash-attention as standalone python projects.
+# FA3 lives under hopper/ (PACKAGE_NAME = flash_attn_3 in setup.py); FA4 lives
+# under flash_attn/cute/. Both pinned to the same 03/18/2026 commit so they
+# stay coherent. Source builds are slow (~30 min each); both ride along inside
+# the `gpu` extra so `uv sync --extra gpu` produces a complete training image.
+# uv caches the built wheels under ~/.cache/uv, so subsequent syncs are fast.
+flash-attn-3 = { git = "https://github.com/Dao-AILab/flash-attention", subdirectory = "hopper", rev = "9397816f6094f5ba0de52c221093637054590d0d" }
 flash-attn-4 = { git = "https://github.com/Dao-AILab/flash-attention", subdirectory = "flash_attn/cute", rev = "9397816f6094f5ba0de52c221093637054590d0d" }
 # FlashQLA — alternative chunk_gated_delta_rule implementation for Qwen3.5 linear attention.
 # Pinned to 05/08/2026 main HEAD (PR #13 "preserve input dtype in l2norm helper"). Includes
@@ -274,9 +310,11 @@ flash-qla = { git = "https://github.com/QwenLM/FlashQLA", rev = "6ef4858b5446e05
 # Download av wheels directly to avoid FFmpeg build dependency issues in CI.
 # 3.11 uses av 14.4.0 (latest 14.x with cp311 wheel). 3.12 falls back to av 14.2.0 — the
 # newest 14.x release with a cp312 wheel on pypi (14.3.0 and 14.4.0 are 3.11-only).
+# Wheel URLs are x86_64 manylinux; the `npu_aarch64` extra deliberately omits av
+# (no aarch64 wheel pinned) so it does not match these markers.
 av = [
-  { url = "https://files.pythonhosted.org/packages/f8/9a/8ffabfcafb42154b4b3a67d63f9b69e68fa8c34cb39ddd5cb813dd049ed4/av-14.4.0-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", marker = "(extra == 'audio' or extra == 'video' or extra == 'dit') and python_version == '3.11'" },
-  { url = "https://files.pythonhosted.org/packages/ed/e8/cf60f3fcde3d0eedee3e9ff66b674a9b85bffc907dccebbc56fb5ac4a954/av-14.2.0-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", marker = "(extra == 'audio' or extra == 'video' or extra == 'dit') and python_version == '3.12'" },
+  { url = "https://files.pythonhosted.org/packages/f8/9a/8ffabfcafb42154b4b3a67d63f9b69e68fa8c34cb39ddd5cb813dd049ed4/av-14.4.0-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", marker = "(extra == 'gpu' or extra == 'npu') and python_version == '3.11'" },
+  { url = "https://files.pythonhosted.org/packages/ed/e8/cf60f3fcde3d0eedee3e9ff66b674a9b85bffc907dccebbc56fb5ac4a954/av-14.2.0-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", marker = "(extra == 'gpu' or extra == 'npu') and python_version == '3.12'" },
 ]
 
 [[tool.uv.index]]

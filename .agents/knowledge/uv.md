@@ -17,7 +17,7 @@ input. **Every concrete uv pin must stay inside the pyproject range.**
 | Location | Format |
 |----------|--------|
 | `pyproject.toml` -> `[tool.uv]` -> `required-version` | range, e.g. `">=0.9.8,<0.12"` |
-| `docker/cuda/Dockerfile.cu129` | `COPY --from=ghcr.io/astral-sh/uv:X.Y.Z` (concrete, inside range) |
+| `docker/cuda/Dockerfile.cu130` | `COPY --from=ghcr.io/astral-sh/uv:X.Y.Z` (concrete, inside range) |
 | `docker/ascend/Dockerfile.*` | same pattern |
 | `.github/workflows/check_patchgen.yml` | `setup-uv` `version: "X.Y.Z"` (concrete, inside range) |
 
@@ -26,39 +26,55 @@ input. **Every concrete uv pin must stay inside the pyproject range.**
 ```
 pyproject.toml
 ├── [project.dependencies]              Core deps (always installed, transformers NOT included here)
-├── [project.optional-dependencies]     Hardware & feature extras
-│   ├── gpu          torch 2.9.1+cu129, flash-attn, liger-kernel, etc.
-│   ├── npu          torch 2.7.1+cpu, torch-npu
-│   ├── npu_aarch64  torch 2.7.1 (native)
-│   ├── audio/video  torchcodec, av, librosa, soundfile
-│   ├── dit          diffusers, av, peft
-│   ├── megatron     megatron-energon
-│   ├── trl          trl
-│   ├── fa4          flash-attn-4, nvidia-cutlass-dsl
-│   └── dev          pre-commit, ruff, pytest (legacy pip compat)
+├── [project.optional-dependencies]     Hardware-shaped extras (deliberately just three + legacy `dev`)
+│   ├── gpu          NVIDIA x86_64 — full superset:
+│   │                  torch 2.11.0+cu130 + cu130 nvidia stack + cuda-python
+│   │                  + FA2 / FA3 / FA4 / FlashQLA (all source-built)
+│   │                  + liger-kernel + FLA + quack + DLPack ext
+│   │                  + diffusers / av / librosa / soundfile / ftfy / trl / peft
+│   ├── npu          Ascend NPU x86_64 — full superset, minus CUDA-only kernels:
+│   │                  torch 2.7.1+cpu + torch-npu + diffusers / av / trl / peft
+│   ├── npu_aarch64  Ascend NPU aarch64 — minimal (torch + torch-npu only;
+│   │                  av/torchcodec lack pinned aarch64 wheels)
+│   └── dev          pre-commit, ruff, pytest (legacy pip-style; modern uv path is the dev group)
 ├── [dependency-groups]                 Dev-only (uv-native)
-│   ├── dev                  includes lint + test
+│   ├── dev                  includes lint + test + patchgen
 │   ├── lint                 pre-commit, ruff
 │   ├── test                 pytest, expecttest, rich
+│   ├── patchgen             patchgen (path source under patchgen-pkg/)
 │   └── transformers-stable  transformers==5.9.0 (default, in default-groups)
 ├── [tool.uv]
 │   ├── required-version     Pinned uv version
-│   ├── override-dependencies  Per-extra torch/CUDA pins + cudnn override
+│   ├── override-dependencies  Per-extra torch/CUDA pins (markers scoped to gpu/npu/npu_aarch64)
 │   ├── conflicts            gpu/npu/npu_aarch64 mutual exclusion
 │   ├── no-build-isolation-package  flash-attn, flash-attn-3
-│   └── sources              Custom indexes and direct wheel URLs
+│   └── sources              Custom indexes, direct wheel URLs (av, torch),
+│                            git sources (flash-attn-3 / flash-attn-4 / flash-qla)
 └── uv.lock                  Lockfile (committed, used by Docker --locked)
 ```
 
+History note: an earlier revision split the Python-level deps (`audio`, `video`,
+`dit`, `trl`, `lora`, `fa3`, `fa4`, `flash-qla`, `megatron`) into nine separate
+extras, which forced docker / CI / docs to chain seven-plus `--extra` flags.
+Those have all been folded into `gpu` / `npu` so a typical install is a single
+`--extra <gpu|npu|npu_aarch64>`.
+
 ## Hardware Extras (Mutually Exclusive)
 
-`gpu`, `npu`, and `npu_aarch64` are declared as conflicts — only one can be installed at a time.
+`gpu`, `npu`, and `npu_aarch64` are declared as conflicts — only one can be
+installed at a time. There are no other extras to chain alongside them; each
+is a complete superset.
 
 ```bash
-uv sync --extra gpu --dev           # NVIDIA GPU
-uv sync --extra npu --dev           # Ascend NPU (x86)
-uv sync --extra npu_aarch64 --dev   # Ascend NPU (ARM)
+uv sync --extra gpu --dev           # NVIDIA GPU — torch+cu130, FA2/3/4/FlashQLA, diffusion, audio, trl, peft
+uv sync --extra npu --dev           # Ascend NPU x86 — torch+cpu, torch-npu, diffusion, audio, trl, peft
+uv sync --extra npu_aarch64 --dev   # Ascend NPU ARM — minimal (torch + torch-npu)
 ```
+
+A fresh `uv sync --extra gpu` source-builds flash-attn, flash-attn-3,
+flash-attn-4, and flash-qla (~60–90 min combined the first time). uv caches
+the built wheels under `~/.cache/uv`, so subsequent syncs and CI runners with
+a populated cache are fast.
 
 ## Transformers Version
 
@@ -80,7 +96,7 @@ torch, torchvision, torchaudio use custom sources:
 
 ```bash
 # Initial setup (transformers==5.9.0 via the default dependency group)
-uv sync --extra gpu --extra audio --dev
+uv sync --extra gpu --dev
 
 # Regenerate lockfile after pyproject.toml changes
 uv lock

@@ -9,16 +9,20 @@ significantly reduced GPU memory.
 
 ## Installation
 
-LoRA support requires the `peft` library. Install it via the `lora` optional extra:
+LoRA support requires the `peft` library, which is bundled into the `gpu` /
+`npu` extras. A standard install is sufficient — there is no separate `lora`
+extra any more:
 
 ```shell
-uv sync --extra gpu --extra lora --group dev
+uv sync --extra gpu --group dev
+# or for Ascend NPU x86:
+uv sync --extra npu --group dev
 ```
 
 Or with pip:
 
 ```shell
-pip install peft==0.18.0
+pip install peft==0.18.1
 ```
 
 ---
