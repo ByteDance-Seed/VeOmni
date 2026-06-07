@@ -56,7 +56,7 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Janus HF text-to-image reference script")
     p.add_argument("--model_path", type=str, default=None, help="Hub id or local dir")
     p.add_argument("--prompt", type=str, default=DEFAULT_PROMPT)
-    p.add_argument("--num_images", type=int, default=4, help="``num_return_sequences`` (official parallel_size)")
+    p.add_argument("--num_images", type=int, default=1, help="``num_return_sequences`` (official parallel_size)")
     p.add_argument(
         "--guidance_scale",
         type=float,

@@ -53,69 +53,6 @@ from ....module import OmniModule
 from .configuration import JanusLlamaConfig
 
 
-# ── Internal helpers for KV cache manipulation ───────────────────────────────
-def _slice_kv_cache(cache: Any, index: slice) -> Any:
-    """Slice a ``DynamicCache`` along batch dim 0."""
-    if cache is None:
-        return None
-    sliced = type(cache)()
-    layers = getattr(cache, "layers", None)
-    if layers is None:
-        n_layers = len(getattr(cache, "key_cache", []))
-        for i in range(n_layers):
-            k = cache.key_cache[i][index]
-            v = cache.value_cache[i][index]
-            sliced.update(k, v, i)
-        return sliced
-    for i, _ in enumerate(layers):
-        k = cache.layers[i].keys[index]
-        v = cache.layers[i].values[index]
-        sliced.update(k, v, i)
-    return sliced
-
-
-def _concat_kv_caches(cond: Any, uncond: Any) -> Any:
-    """Batch-concat two ``DynamicCache``s along dim 0.
-
-    Scoped to ``DynamicCache`` with all-``DynamicLayer`` layers — which is
-    what plain ``LlamaModel`` produces on Janus today.  Other cache classes
-    (``StaticCache``, ``HybridCache``, ``SlidingWindowCache``) require
-    constructor args and / or carry per-layer state (``is_sliding``,
-    ``_sliding_window_tensor``, ``cumulative_length``) that this helper does
-    NOT preserve — passing them in is a bug and will either raise on the
-    ``type(cond)()`` call or silently lose layer metadata.  Janus has no
-    sliding-window attention so we don't hit that path; revisit when
-    extending CFG to backbones that do.
-
-    Supports both the v5.9 ``.layers[i].keys`` schema and the older
-    ``.key_cache[i]`` / ``.value_cache[i]`` lists via ``getattr`` probe,
-    because the transformers cache module is still in flux and we want
-    the helper to keep working through minor bumps.
-    """
-    if cond is None or uncond is None:
-        return cond or uncond
-    if type(cond) is not type(uncond):
-        raise TypeError(
-            f"_concat_kv_caches: cond ({type(cond).__name__}) and uncond ({type(uncond).__name__}) "
-            "must be the same cache class."
-        )
-    merged = type(cond)()
-    layers = getattr(cond, "layers", None)
-    if layers is None:
-        # Pre-5.9 DynamicCache exposed `key_cache` / `value_cache` lists.
-        n_layers = len(getattr(cond, "key_cache", []))
-        for i in range(n_layers):
-            k = torch.cat([cond.key_cache[i], uncond.key_cache[i]], dim=0)
-            v = torch.cat([cond.value_cache[i], uncond.value_cache[i]], dim=0)
-            merged.update(k, v, i)
-        return merged
-    for i, _ in enumerate(layers):
-        k = torch.cat([cond.layers[i].keys, uncond.layers[i].keys], dim=0)
-        v = torch.cat([cond.layers[i].values, uncond.layers[i].values], dim=0)
-        merged.update(k, v, i)
-    return merged
-
-
 class JanusLlama(OmniModule, PreTrainedModel):
     """LLaMA backbone with multi-modal embedding scatter (no wte, no lm_head).
 
@@ -148,6 +85,9 @@ class JanusLlama(OmniModule, PreTrainedModel):
         # ctx and expands the KV cache to bs=2.
         self._cfg_active: bool = False
         self._past_key_values: Any = None
+        # Separate unconditional KV cache for CFG (bs=1, run alongside the
+        # conditional cache — see :meth:`generate`).
+        self._uncond_past_key_values: Any = None
 
         # Training state
         self._conversation_carrier: Optional[list[list[ConversationItem]]] = None
@@ -253,21 +193,7 @@ class JanusLlama(OmniModule, PreTrainedModel):
         """
         self._cfg_active = False
         self._past_key_values = None
-
-    def config_cfg_cache(self, uncond_past_key_values: Any) -> None:
-        """Configure the KV cache for CFG.
-
-        uncond_past_key_values: the past key values of the unconditional branch
-        """
-        self._past_key_values = _concat_kv_caches(self._past_key_values, uncond_past_key_values)
-        self._cfg_active = True
-
-    def collapse_cfg_cache(self) -> None:
-        """Drop the unconditional half of a bs=2 KV cache after image generation."""
-        if not self._cfg_active or self._past_key_values is None:
-            return
-        self._past_key_values = _slice_kv_cache(self._past_key_values, slice(0, 1))
-        self._cfg_active = False
+        self._uncond_past_key_values = None
 
     def generate(
         self,
@@ -331,27 +257,55 @@ class JanusLlama(OmniModule, PreTrainedModel):
                 past_key_values=None,
                 use_cache=True,
             )
-            self.config_cfg_cache(uncond_out["past_key_values"])
+            self._uncond_past_key_values = uncond_out["past_key_values"]
+            self._cfg_active = True
         elif tail_part.meta.get("collapse_cfg", False):
-            self.collapse_cfg_cache()
+            self._uncond_past_key_values = None
+            self._cfg_active = False
 
         inputs_embeds: torch.Tensor = tail_part.value[-1:].to(self.device)  # 1, dim
         inputs_embeds = inputs_embeds.unsqueeze(0)  # 1, 1, dim
 
         if self._cfg_active:
-            inputs_embeds = inputs_embeds.expand(2, *inputs_embeds.shape[1:]).contiguous()  # 2, 1, dim
+            # CFG is a bs=2 (cond / uncond) decode step.  We deliberately run the
+            # two branches as two **separate bs=1 forwards** rather than one bs=2
+            # forward: VeOmni's fused rotary / attention kernels are only
+            # validated for the bs=1 packed-sequence path and return wrong hidden
+            # states for bs>1 decoding against a ``DynamicCache`` (verified — the
+            # unconditional row diverges from the HF reference; running each
+            # branch at bs=1 matches HF token-for-token).  ``cond`` reads the
+            # conditional cache, ``uncond`` the unconditional one; both advance
+            # independently, then we stack ``(cond, uncond)`` on the batch dim so
+            # downstream CFG mixing sees the expected ``(2, 1, D)`` layout.
+            cond_out = self.forward(
+                inputs_embeds=inputs_embeds,
+                attention_mask=None,
+                past_key_values=self._past_key_values,
+                use_cache=True,
+            )
+            uncond_out = self.forward(
+                inputs_embeds=inputs_embeds,
+                attention_mask=None,
+                past_key_values=self._uncond_past_key_values,
+                use_cache=True,
+            )
+            self._past_key_values = cond_out["past_key_values"]
+            self._uncond_past_key_values = uncond_out["past_key_values"]
+            hidden_states = torch.cat([cond_out["hidden_states"], uncond_out["hidden_states"]], dim=0)  # 2, 1, dim
+        else:
+            outputs = self.forward(
+                inputs_embeds=inputs_embeds,
+                attention_mask=None,
+                past_key_values=self._past_key_values,
+                use_cache=True,
+            )
+            self._past_key_values = outputs["past_key_values"]
+            hidden_states = outputs["hidden_states"]
 
-        outputs = self.forward(
-            inputs_embeds=inputs_embeds,
-            attention_mask=None,
-            past_key_values=self._past_key_values,
-            use_cache=True,
-        )
-        self._past_key_values = outputs["past_key_values"]
         conversation_list.append(
             ConversationItem(
                 type="output",
-                value=self._tail_hidden_from_forward(outputs["hidden_states"]),
+                value=self._tail_hidden_from_forward(hidden_states),
                 role="assistant",
             )
         )
