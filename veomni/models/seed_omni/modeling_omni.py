@@ -61,14 +61,10 @@ Inference
   * ``fsm.maybe_transition(ctx)`` — first matching condition wins.
   * Stop when ``fsm.is_done()`` or ``max_new_tokens`` exhausts.
 
-Once a step raises ``module_signal``, ``generate`` calls
-:meth:`OmniModule.finalize` on every active module so segment buffers flush
-at hand-off time.  If the ``max_new_tokens`` safety cap trips first, every
-module gets a second ``finalize`` pass — each module decides from its own
-buffer state whether to emit, warn-and-discard, or no-op.  Modules may also
-emit a one-shot ``generated`` payload (``{type, value}``) from ``finalize``
-or from any FSM step; everything is drained into :attr:`OmniModel.generated`
-and is not persisted on ``ctx``.
+Modules emit one-shot ``generated`` payloads (``{type, value}``) from their
+FSM step return dict when a span ends; :meth:`OmniModel.generate` drains
+those into :attr:`OmniModel.generated` via :meth:`_collect_generated` and
+does not persist them on ``ctx``.
 
 Both ``step`` and ``maybe_transition`` accept an optional ``trace`` list —
 print-driven flow tests collect the visit log from there to assert the
@@ -361,18 +357,16 @@ class OmniModel(nn.Module):
         generated = ctx.pop("generated", None)
         self._append_generated(generated)
         if trace is not None and generated is not None:
-            trace.append(f"finalize:{generated['type']}")
+            trace.append(f"generated:{generated['type']}")
 
-    def _force_invoke_module_finalize(
+    def _invoke_module_finalize(
         self,
         ctx: Dict[str, Any],
         trace: Optional[List[str]] = None,
     ) -> None:
         """Call :meth:`OmniModule.finalize` and drain any ``generated`` payload.
 
-        By default only runs when the step just raised ``module_signal``.
-        ``force=True`` skips that guard — used when ``max_new_tokens`` trips
-        before ``done``.
+        Runs on every module when ``max_new_tokens`` trips before ``done``.
         """
         for name, raw in self.named_omni_modules():
             out = raw.finalize(ctx=ctx)
@@ -381,7 +375,7 @@ class OmniModel(nn.Module):
             generated = out.pop("generated", None)
             self._append_generated(generated)
             if trace is not None and generated is not None:
-                trace.append(f"finalize:{name}")
+                trace.append(f"finalize:{name} | generated:{generated['type']}")
 
     def _emit_progress(self, total_steps: int) -> None:
         """Log one ``[FSM] step <N>: <state>`` line on a state change.
@@ -477,7 +471,7 @@ class OmniModel(nn.Module):
         self._emit_progress(total_steps)
 
         if not self.generation_graph.is_done():
-            self._invoke_module_finalize(ctx, force=True, trace=trace)
+            self._invoke_module_finalize(ctx, trace=trace)
 
         return ctx
 

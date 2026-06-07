@@ -9,7 +9,7 @@ from veomni.models.seed_omni.modules.janus.text_encoder.chat_template import (
 )
 
 
-def test_expand_user_text_image_text_renders_placeholder():
+def test_expand_user_text_image_text_uses_boi_eoi_spans():
     sample = [
         ConversationItem(type="text", value="describe", role="user"),
         ConversationItem(type="image", value=None, role="user"),
@@ -27,16 +27,19 @@ def test_expand_user_text_image_text_renders_placeholder():
     )
     parts = apply_janus_chat_template(sample, markers)
     rendered = render_template_string(parts)
-    assert rendered.startswith("<s>SYS")
+    assert rendered.startswith("<s>")
+    assert "SYS" in rendered
     assert "<|User|>: " in rendered
+    assert IMAGE_PLACEHOLDER not in rendered
     assert "<boi>" in rendered
-    assert IMAGE_PLACEHOLDER in rendered
     assert "<eoi>" in rendered
     assert "describe" in rendered
+    assert "\nmore" in rendered
     assert "\n\n<|Assistant|>:" in rendered
     assert "hi" in rendered
     assert rendered.endswith("</s>")
     assert all(p.type in ("text", "image") for p in parts)
+    assert not any(p.meta.get("image_slot") for p in parts)
 
 
 def test_expand_text_only_t2i_skips_system_prompt():

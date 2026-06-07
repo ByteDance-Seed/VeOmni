@@ -61,10 +61,17 @@ def apply_janus_chat_template(
     sample: list[ConversationItem],
     markers: JanusChatMarkers,
 ) -> list[ConversationItem]:
-    """Apply Janus chat template to a raw conversation (text + image parts)."""
+    """Apply Janus chat template to a raw conversation (text + image parts).
+
+    User and assistant images both use explicit ``<boi>`` … ``<eoi>`` text
+    rows bracketing a sibling ``image`` row (SigLIP patch embeds).  No
+    ``<image_placeholder>`` text row — nothing in the inference graph
+    tokenises or embeds that literal.
+    """
     out: list[ConversationItem] = []
     dummy_parts: list[ConversationItem] = []  # dummy from other modules
     out.append(_template_item("text", markers.bos_token, "user"))
+    # HF Janus ``task != "gen"`` prepends the default system prompt for I2T.
     # TODO: shared by training + inference.  Official Janus I2T prepends the VL
     # system preamble; T2I does not.  Current micro-batches are either pure I2T
     # (user image present) or pure T2I (text-only user turn) — use that as a
@@ -72,6 +79,9 @@ def apply_janus_chat_template(
     if sample_has_user_image(sample):
         out.append(_template_item("text", markers.system_prompt, "user"))
     prev_role: str | None = None
+    prev_was_user_image = (
+        False  # True after a user image; prepend \n to the next user text (HF Jinja same-turn layout).
+    )
     for item in sample:
         role = item.role
         if role != prev_role:
@@ -80,24 +90,30 @@ def apply_janus_chat_template(
             elif role == "assistant":
                 out.append(_template_item("text", markers.assistant_prefix, "assistant", loss_mask=0))
             prev_role = role
+            prev_was_user_image = False
 
         if item.type == "text":
-            out.append(_template_item("text", item.value, role))
+            text = str(item.value)
+            if prev_was_user_image and role == "user" and not text.startswith("\n"):
+                text = "\n" + text
+            out.append(_template_item("text", text, role))
+            prev_was_user_image = False
         elif item.type == "image" and role != "dummy":
             out.append(_template_item("text", markers.boi_token, role))
             out.append(_template_item("image", item.value, role, meta=dict(item.meta)))
             out.append(_template_item("text", markers.eoi_token, role))
+            prev_was_user_image = role == "user"
         elif role == "dummy":
             dummy_parts.append(item)
         else:
-            out.append(_template_item(item.type, item.value, role, meta=dict(item.meta)))
+            raise ValueError(f"Unsupported part type: {item.type}")
     if prev_role == "assistant":
         out.append(_template_item("text", markers.eos_token, "assistant"))
     out.extend(dummy_parts)
     return out
 
 
-def render_template_string(parts: list[ConversationItem]) -> str:
+def render_template_string(parts: list[ConversationItem]) -> str:  # for debug or demo
     """Build the on-the-wire prompt string (Jinja-visible layout)."""
     chunks: list[str] = []
     for part in parts:

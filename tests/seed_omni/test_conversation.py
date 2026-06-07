@@ -9,7 +9,6 @@ from veomni.models.seed_omni.conversation import (
     build_conversation,
     collect_modality_batch,
     collect_prompt_embeds,
-    get_ar_tail_embed,
     get_llm_embed,
     get_token_id,
     is_embedded,
@@ -17,9 +16,7 @@ from veomni.models.seed_omni.conversation import (
     iter_type,
     latest_assistant_text_token_ids,
     maybe_merge_outputs,
-    needs_embedding,
-    seal_phase_outputs,
-    set_llm_embed,
+    seal_outputs,
     unembedded_parts,
 )
 
@@ -141,7 +138,7 @@ def test_output_merge_and_seal():
     assert maybe_merge_outputs(parts, phase="text")
     assert len(parts) == 1
     assert parts[0].value.shape == (1, 3, 4)
-    assert seal_phase_outputs(parts, phase="text", new_type="text") == 1
+    assert seal_outputs(parts, new_type="text") == 1
     assert parts[0].type == "text"
     assert "phase" not in parts[0].meta
 
@@ -155,25 +152,6 @@ def test_collect_prompt_embeds_skips_output():
     chunks = collect_prompt_embeds(parts)
     assert len(chunks) == 1
     assert torch.equal(chunks[0], embed)
-
-
-def test_get_ar_tail_embed_reads_last_position():
-    parts = [
-        ConversationItem(type="soi", value=torch.tensor([[[1.0], [2.0], [3.0]]]), role="assistant"),
-    ]
-    tail = get_ar_tail_embed(parts)
-    assert tail is not None
-    assert tail.shape == (1, 1, 1)
-    assert tail.item() == 3.0
-
-
-def test_set_llm_embed_on_token():
-    item = ConversationItem(type="token", value=11, role="assistant")
-    embed = torch.zeros(1, 1, 8)
-    set_llm_embed(item, embed)
-    assert get_token_id(item) == 11
-    assert torch.equal(get_llm_embed(item), embed)
-    assert not needs_embedding(item)
 
 
 def test_iter_modality_items_allows_multiple_images_per_sample():

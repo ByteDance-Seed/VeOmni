@@ -11,11 +11,9 @@
 #
 # Modules without ``accelerator.fsdp_config`` load eagerly (``device_map='auto'``).
 #
-# After ``prompt_encode`` primes the KV cache, ``image_vq_start`` drops the
-# trailing LM hidden tail, emits ``<begin_of_image>`` (SOI), and runs one
-# ``janus_llama`` KV step.  ``image_vq`` loops ``vqvae.generate`` (lm_head →
-# codebook embed → merge ``output`` rows) ↔ ``janus_llama`` until the 576th
-# VQ token; ``image_vq_end`` emits EOI the same way.
+# Flow: ``prompt_encode`` primes KV → ``image_vq_start`` emits ``<boi>`` (no
+# llama forward) → ``image_vq`` loops ``janus_llama`` on the tail embed then
+# ``vqvae.generate`` (576 steps) → ``image_vq_end`` emits ``<eoi>`` (no llama).
 
 generation_graph:
   initial: prompt_encode
@@ -26,28 +24,25 @@ generation_graph:
         - siglip_to_janus_llama
         - token_generate_to_janus_llama
         - janus_llama_sink
-        # do not token decode, as we force image gen here
       transitions:
         - { condition: { type: default }, next_state: image_vq_start }
 
     image_vq_start:
       body:
-        - emit_start_to_janus_llama
-        - janus_llama_sink
+        - emit_start_sink
       transitions:
         - { condition: { type: default }, next_state: image_vq }
 
     image_vq:
       body:
-        - vqvae_to_janus_llama
         - janus_llama_to_vqvae
+        - vqvae_to_janus_llama
       transitions:
         - { condition: { type: module_signal, key: image_complete }, next_state: image_vq_end }
 
     image_vq_end:
       body:
-        - emit_end_to_janus_llama
-        - janus_llama_sink
+        - emit_end_sink
       transitions:
         - { condition: { type: default }, next_state: done }
 

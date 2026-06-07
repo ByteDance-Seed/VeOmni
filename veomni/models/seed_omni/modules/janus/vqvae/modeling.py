@@ -44,6 +44,7 @@ from ....conversation import (
     is_dummy,
     iter_modality_items,
     maybe_merge_outputs,
+    seal_outputs,
 )
 from ....generation_graph import FSM_SIGNAL_KEY
 from ....module import OmniModule
@@ -323,18 +324,11 @@ class JanusVqvae(OmniModule, PreTrainedModel):
         VQ token ids accumulate in :attr:`_vq_buffer`.  On the final patch
         the buffer is decoded to a PIL image and ``image_complete`` is raised.
         """
-        if hidden_states is None:
-            return {"conversation_list": conversation_list} if conversation_list is not None else {}
-        if conversation_list is None or not conversation_list:
-            raise ValueError("JanusVqvae.generate expects a non-empty `conversation_list`.")
 
         hidden_states = hidden_states.to(self.device)
         batch_size = hidden_states.size(0)
         sampling = self._extract_sampling_kwargs(generation_kwargs)
-        sampling.pop("guidance_scale", None)
-        cfg_w = 1.0
-        if isinstance(cfg, dict):
-            cfg_w = float(cfg.get("guidance_scale", 1.0) or 1.0)
+        cfg_w = sampling.pop("guidance_scale", None)
 
         if batch_size == 2 and cfg_w > 1.0:
             cond_logits = self.generation_head(hidden_states[:1, -1:, :]).squeeze(1)
@@ -385,6 +379,7 @@ class JanusVqvae(OmniModule, PreTrainedModel):
         if len(self._vq_buffer) >= target:
             generated = self._emit_buffered_image(device=embed.device)
             if generated is not None:
+                seal_outputs(conversation_list, new_type="image")
                 out["generated"] = generated
                 out[FSM_SIGNAL_KEY] = "image_complete"
 
@@ -420,22 +415,25 @@ class JanusVqvae(OmniModule, PreTrainedModel):
         :meth:`generate`).  Buffer full → decode and emit.  Partial grid →
         log a warning, discard, emit nothing.
         """
-        del ctx
-        if not self._vq_buffer:
-            return {}
         target = self._num_image_tokens()
         n = len(self._vq_buffer)
-        if n >= target:
+        if n == 0:  # image generation not invoked yet
+            return {}
+        if n < target:
+            logger.warning_rank0(
+                f"JanusVqvae.finalize: incomplete VQ grid ({n}/{target} tokens) — "
+                "discarding partial sequence (no image emitted)."
+            )
+            self._vq_buffer.clear()
+            return {}
+        elif n == target:
             generated = self._emit_buffered_image(device=self.device)
-            return {"generated": generated} if generated is not None else {}
-        logger.warning_rank0(
-            f"JanusVqvae.finalize: incomplete VQ grid ({n}/{target} tokens) — "
-            "discarding partial sequence (no image emitted)."
-        )
-        self._vq_buffer.clear()
-        return {}
-
-    # ── Internal helpers ─────────────────────────────────────────────────────
+            return {"generated": generated}
+        else:
+            raise RuntimeError(
+                "There's a bug in JanusVqvae.finalize, emit_buffered_image must be invoked when n == target in during generate"
+            )
+        # ── Internal helpers ─────────────────────────────────────────────────────
 
     def _num_image_tokens(self) -> int:
         cfg = self.config.vq_config

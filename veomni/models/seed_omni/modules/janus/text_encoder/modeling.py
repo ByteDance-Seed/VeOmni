@@ -55,11 +55,10 @@ from veomni.utils.tensor_utils import naflatten, unflatten
 
 from ....conversation import (
     ConversationItem,
-    drop_trailing_lm_hidden,
-    get_llm_embed,
     is_dummy,
     item_role,
-    seal_phase_outputs,
+    maybe_merge_outputs,
+    seal_outputs,
 )
 from ....generation_graph import FSM_SIGNAL_KEY
 from ...base.text_encoder.modeling import TextEncoder
@@ -370,11 +369,16 @@ class JanusTextEncoder(TextEncoder):
         Subsequent calls (KV cache present): embeds newly-appended ``token``
         parts whose ``value`` is still a scalar id.
         """
-        if not self._bos_injected:
-            conversation_list = apply_janus_chat_template(conversation_list, self._chat_markers)
-            self._bos_injected = True
-        if conversation_list[-1].role == "user":
-            # a new request in the same conversation, only add an assistant response
+
+        tail = conversation_list[-1]
+        if tail.role == "user":
+            # input raw conversation, tokenize & encode
+            if not self._bos_injected:
+                # start of a conversation
+                conversation_list = apply_janus_chat_template(conversation_list, self._chat_markers)
+                self._bos_injected = True
+
+            # start of assistant turn
             conversation_list.append(_template_item("text", self._chat_markers.assistant_prefix, "assistant"))
             # TODO: a new request when [user_content, assistant_content, new_user_content], no need to encode the whole conversation
             self._tokenize_template_parts(conversation_list)
@@ -386,55 +390,50 @@ class JanusTextEncoder(TextEncoder):
             inputs_embeds = self.encode(input_ids)["inputs_embeds"]
             self._scatter_text_embeds([conversation_list], unflatten(inputs_embeds, _encode_batch_shape))
             return {"conversation_list": conversation_list}
-        elif conversation_list[-1].type == "text_output":  # ar step
+
+        elif tail.type == "output":
+            # input hidden_states, decode & encode
             outputs: Dict[str, Any] = {"conversation_list": conversation_list}
-            tail = conversation_list[-1]
-            hidden_states = tail.value
+            hidden_states: torch.Tensor = tail.value
             if hidden_states.dim() == 2:
                 hidden_states = hidden_states.unsqueeze(0)
-            elif hidden_states.dim() == 1:
-                hidden_states = hidden_states.unsqueeze(0).unsqueeze(0)
+            sampling = self._extract_sampling_kwargs(generation_kwargs, 1.0, 1.0, kwargs)
+            output_token_id = self._sample_token(hidden_states, **sampling)
+            self._text_token_cache.append(output_token_id)
+            input_ids = self._token_id_tensor(output_token_id)
+            inputs_embeds = self.encode(input_ids)["inputs_embeds"]  # n, dim
 
-            token_id = self._sample_token(hidden_states, **generation_kwargs)
-            self._text_token_cache.append(token_id)
-
-            input_ids = self._token_id_tensor(token_id)
-            inputs_embeds = self.encode(input_ids)["inputs_embeds"]
             tail.value = inputs_embeds
+            maybe_merge_outputs(conversation_list)
 
-            if len(conversation_list) >= 2:
-                prev = conversation_list[-2]
-                if prev.type == "text_output":
-                    prev.value = torch.cat([prev.value, tail.value], dim=0)
-                    conversation_list.pop()
-
-            if token_id == self._boi_token_id:
-                # TODO: check this
+            if output_token_id == self._boi_token_id:
+                # import ipdb;ipdb.set_trace()
                 self._maybe_arm_cfg_for_image_gen(conversation_list, generation_kwargs, outputs)
                 outputs[FSM_SIGNAL_KEY] = SIGNAL_START_IMAGE_GEN
-            elif token_id == self._eos_token_id:
+            elif output_token_id == self._eos_token_id:
                 outputs[FSM_SIGNAL_KEY] = SIGNAL_TEXT_DONE
 
             if FSM_SIGNAL_KEY in outputs and outputs[FSM_SIGNAL_KEY] in (SIGNAL_TEXT_DONE, SIGNAL_START_IMAGE_GEN):
                 outputs["generated"] = self._flush_text_generated(conversation_list)
             return outputs
+        else:
+            raise ValueError(f"Invalid type: {tail.type}")
 
     # ── Janus boundary-token emitters (conversation-list aware) ──────────────
 
     def emit_image_start(
         self,
         conversation_list: Optional[List[ConversationItem]] = None,
+        generation_kwargs: Optional[Dict[str, Any]] = None,
         **ctx: Any,
     ) -> Dict[str, Any]:
         """Emit ``<begin_of_image>`` as a standalone ``soi`` conversation item."""
         token_id = self._boi_token_id
-        if conversation_list is not None:
-            drop_trailing_lm_hidden(conversation_list)
-            seal_phase_outputs(conversation_list, phase="text", new_type="text")
+        # import ipdb;ipdb.set_trace()
         out: Dict[str, Any] = {}
         self._maybe_arm_cfg_for_image_gen(
             conversation_list,
-            ctx.get("generation_kwargs"),
+            generation_kwargs,
             out,
         )
         out.update(self._emit_boundary(int(token_id), "boi", conversation_list, ctx))
@@ -448,9 +447,7 @@ class JanusTextEncoder(TextEncoder):
     ) -> Dict[str, Any]:
         """Emit ``<end_of_image>`` as a standalone ``eoi`` conversation item."""
         token_id = self._eoi_token_id
-        if conversation_list is not None:
-            drop_trailing_lm_hidden(conversation_list)
-            seal_phase_outputs(conversation_list, phase="vq", new_type="image")
+        # import ipdb;ipdb.set_trace()
         out = self._emit_boundary(int(token_id), "eoi", conversation_list, ctx)
         out["ar_phase"] = "text"
         out["collapse_cfg"] = True
@@ -521,6 +518,7 @@ class JanusTextEncoder(TextEncoder):
 
         Returns ``None`` when the prompt is not text-only (e.g. I2T with an ``image`` part).
         """
+        # import ipdb;ipdb.set_trace()
         if any(p.type == "image" for p in conversation_list):
             return None
 
@@ -534,14 +532,13 @@ class JanusTextEncoder(TextEncoder):
         for part in conversation_list:
             if part.type == "output":
                 continue
-            embed = get_llm_embed(part)
-            if embed is None:
-                continue
             ids = part.meta.get("input_ids")
             if ids is None:
                 if part.type == "image":
                     return None
                 continue
+            if ids.dim() == 1:
+                ids = ids.unsqueeze(0)
             keep_mask = ids == bos_id
             if boi_id is not None:
                 keep_mask = keep_mask | (ids == int(boi_id))
@@ -553,25 +550,34 @@ class JanusTextEncoder(TextEncoder):
 
     # ── Finalize: decode the accumulated assistant text ──────────────────────
 
-    def finalize(self, ctx: Dict[str, Any]) -> Dict[str, Any]:
-        """Forcing to flush the text generated."""
-        return self._flush_text_generated(ctx["conversation_list"])
+    def finalize(self, *, ctx: Dict[str, Any]) -> Dict[str, Any]:
+        """Force-flush buffered assistant text (e.g. when the FSM hits ``max_new_tokens``)."""
+        if not self._text_token_cache:
+            return {}
+        flushed = self._flush_text_generated(ctx["conversation_list"])
+        if not flushed:
+            return {}
+        return {"generated": flushed}
 
     def _flush_text_generated(self, conversation_list: List[ConversationItem]) -> Dict[str, Any]:
         """Decode cached token ids, clear the cache, return a ``generated`` payload."""
         token_ids = list(self._text_token_cache)
         self._text_token_cache.clear()
+        boundary = {self._eos_token_id, self._boi_token_id}
+        while token_ids and token_ids[-1] in boundary:
+            token_ids.pop()
+        if not token_ids:
+            return {}
         meta = {"token_ids": token_ids}
         text = self._tokenizer.decode(token_ids, skip_special_tokens=True)
-        assert conversation_list[-1].type == "text_output"
-        conversation_list[-1].type = "text"
+        seal_outputs(conversation_list, new_type="text")
         return {"type": "text", "value": text, "meta": meta}
 
     # ── Internal helpers ─────────────────────────────────────────────────────
 
     def _token_id_tensor(self, token_id: int) -> torch.Tensor:
         device = self.device
-        return torch.tensor([[int(token_id)]], dtype=torch.long, device=device)
+        return torch.tensor([[token_id]], dtype=torch.long, device=device)
 
     def _sample_token(
         self,
@@ -584,8 +590,6 @@ class JanusTextEncoder(TextEncoder):
         hidden_states = hidden_states.to(self.device)
         last = hidden_states[:, -1, :]
         logits = self._project(last) if last.dim() == 2 else self._project(last.squeeze(0))
-        if logits.dim() == 3:
-            logits = logits.squeeze(1)
         if not do_sample:
             return int(logits.argmax(dim=-1).item())
         if temperature != 1.0:
@@ -594,7 +598,24 @@ class JanusTextEncoder(TextEncoder):
             logits = self._top_p_filter(logits, top_p)
         probs = F.softmax(logits, dim=-1)
         token = torch.multinomial(probs, num_samples=1)
-        return int(token.item())
+        return token
+
+    @staticmethod
+    def _extract_sampling_kwargs(
+        generation_kwargs: Optional[Dict[str, Any]],
+        temperature: float,
+        top_p: float,
+        kwargs: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        merged: Dict[str, Any] = {"temperature": temperature, "top_p": top_p, "do_sample": True}
+        if generation_kwargs:
+            for k in _SAMPLING_KWARGS:
+                if k in generation_kwargs:
+                    merged[k] = generation_kwargs[k]
+        for k in _SAMPLING_KWARGS:
+            if k in kwargs:
+                merged[k] = kwargs[k]
+        return merged
 
 
 def _infer_batch_size(ctx: Dict[str, Any]) -> int:

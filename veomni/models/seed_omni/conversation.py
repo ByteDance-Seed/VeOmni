@@ -21,17 +21,10 @@ A part is born with raw ``value`` (``str``, PIL image, token id) and becomes
 
 AR workspace
 ------------
-During auto-regressive decoding the backbone appends ``type="output"`` items
-carrying hidden states or embeds.  Modality heads (text / VQ) decode the
-hidden, replace ``value`` with an embed, and merge adjacent ``output`` items
-**within the same** ``meta["phase"]`` only (``"text"`` or ``"vq"``).
+During auto-regressive decoding the backbone and modality heads share
+``type="output"`` rows.
 
-Phase boundaries are sealed by renaming completed ``output`` spans to
-``type="text"`` or ``type="image"`` so CFG can drop text vs image spans
-independently.  ``<begin_of_image>`` / ``<end_of_image>`` are ``soi`` / ``eoi``
-items — never merged into text output history.
-
-Sampled token ids live in module-private caches, not in the conversation list.
+When a modality span ends, finalize renames completed ``output`` rows to ``type="text"`` or ``type="image"``.
 """
 
 from __future__ import annotations
@@ -42,7 +35,7 @@ from typing import Any, Iterator, Literal
 import torch
 
 
-ItemType = str  # "text" | "image" | "token" | "output" | "soi" | "eoi"
+ItemType = str  # "text" | "image" | "output"
 Role = str  # "user" | "assistant" | "dummy"
 ArPhase = Literal["text", "vq"]
 
@@ -151,17 +144,6 @@ def get_llm_embed(item: ConversationItem) -> torch.Tensor | None:
     return None
 
 
-def set_llm_embed(item: ConversationItem, embed: torch.Tensor, *, token_id: int | None = None) -> None:
-    """Write an embed into ``value``, preserving ``token_id`` in ``meta`` when given."""
-    if token_id is not None:
-        item.meta["token_id"] = int(token_id)
-    elif item.type == "token":
-        existing = get_token_id(item)
-        if existing is not None:
-            item.meta["token_id"] = existing
-    item.value = embed
-
-
 def item_phase(item: ConversationItem) -> str | None:
     """Return ``meta["phase"]`` for ``output`` items, else ``None``."""
     phase = item.meta.get("phase")
@@ -180,64 +162,24 @@ def collect_prompt_embeds(parts: list[ConversationItem]) -> list[torch.Tensor]:
     return chunks
 
 
-def get_ar_tail_embed(parts: list[ConversationItem]) -> torch.Tensor | None:
-    """Last-position embed from the conversation tail for one AR step."""
-    if not parts:
-        return None
-    emb = get_llm_embed(parts[-1])
-    if emb is None:
-        return None
-    return emb[:, -1:, :]
-
-
-def drop_trailing_lm_hidden(parts: list[ConversationItem]) -> None:
-    """Drop the last single-token assistant row before a boundary emit (SOI/EOI).
-
-    After ``janus_llama`` runs, the tail is often a one-position embed that must
-    not be fed into the backbone again when opening/closing an image span.
-    """
-    if not parts:
-        return
-    tail = parts[-1]
-    if tail.type == "output":
-        parts.pop()
-        return
-    if tail.role != "assistant" or not tail.meta.get("generated"):
-        return
-    emb = get_llm_embed(tail)
-    if emb is not None and emb.size(1) == 1:
-        parts.pop()
-
-
-def maybe_merge_outputs(parts: list[ConversationItem], *, phase: ArPhase) -> bool:
+def maybe_merge_outputs(parts: list[ConversationItem]) -> bool:
     """Merge the last two ``output`` rows in the same AR phase (concat on seq dim)."""
     if len(parts) < 2:
         return False
     a, b = parts[-2], parts[-1]
     if a.type != "output" or b.type != "output":
         return False
-    if item_phase(a) != phase or item_phase(b) != phase:
-        return False
-    emb_a, emb_b = get_llm_embed(a), get_llm_embed(b)
-    if emb_a is None or emb_b is None:
-        return False
-    a.value = torch.cat([emb_a, emb_b], dim=1)
-    ids_a, ids_b = a.meta.get("input_ids"), b.meta.get("input_ids")
-    if isinstance(ids_a, torch.Tensor) and isinstance(ids_b, torch.Tensor):
-        a.meta["input_ids"] = torch.cat([ids_a, ids_b], dim=1)
+    emb_a, emb_b = a.value, b.value
+    emb_b = emb_b.to(device=emb_a.device, dtype=emb_a.dtype)
+    a.value = torch.cat([emb_a, emb_b], dim=0)
     parts.pop()
     return True
 
 
-def seal_phase_outputs(parts: list[ConversationItem], *, phase: ArPhase, new_type: ItemType) -> int:
+def seal_outputs(parts: list[ConversationItem], new_type: ItemType) -> int:
     """Rename completed ``output`` spans to a sealed type (``text`` / ``image``)."""
-    count = 0
-    for part in parts:
-        if part.type == "output" and item_phase(part) == phase:
-            part.type = new_type
-            part.meta.pop("phase", None)
-            count += 1
-    return count
+    assert parts[-1].type == "output"
+    parts[-1].type = new_type
 
 
 def build_conversation(
@@ -510,9 +452,7 @@ __all__ = [
     "ItemType",
     "Role",
     "build_conversation",
-    "drop_trailing_lm_hidden",
     "collect_prompt_embeds",
-    "get_ar_tail_embed",
     "item_phase",
     "item_role",
     "is_dummy",
@@ -521,8 +461,7 @@ __all__ = [
     "needs_embedding",
     "get_token_id",
     "get_llm_embed",
-    "set_llm_embed",
-    "seal_phase_outputs",
+    "seal_outputs",
     "iter_type",
     "iter_kind",
     "unembedded_parts",

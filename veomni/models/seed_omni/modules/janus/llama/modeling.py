@@ -232,7 +232,7 @@ class JanusLlama(OmniModule, PreTrainedModel):
         ``past_key_values`` is kept on the module — callers should not
         rely on routing KV through ``ctx``.
         """
-        if "_output" not in conversation_list[-1].type:
+        if self._past_key_values is None:  # first AR step
             inputs_embeds, attention_mask, position_ids, _ = self._pack_conversations_for_forward([conversation_list])
             (cu_seq_lens_q, cu_seq_lens_k), (max_length_q, max_length_k) = prepare_fa_kwargs_from_position_ids(
                 position_ids
@@ -251,59 +251,73 @@ class JanusLlama(OmniModule, PreTrainedModel):
             self._past_key_values = outputs["past_key_values"]
 
             hidden_states = outputs["hidden_states"]
-
-            if hidden_states.dim() == 3 and hidden_states.size(0) == 1:
-                hidden_states = hidden_states.squeeze(0)
-            conversation_list.append(ConversationItem(type="text_output", value=hidden_states[-1:], role="assistant"))
+            conversation_list.append(
+                ConversationItem(
+                    type="output",
+                    value=self._tail_hidden_from_forward(hidden_states),
+                    role="assistant",
+                )
+            )
             return {
                 "conversation_list": conversation_list,
             }
-        else:
-            inputs_embeds = conversation_list[-1].value[-1:].to(self.device)
-            if inputs_embeds.dim() == 2:
-                inputs_embeds = inputs_embeds.unsqueeze(0)
-            past_kv = self._past_key_values
-            # cfg_out: Optional[Dict[str, Any]] = None
-            # if (
-            #     isinstance(cfg, dict)
-            #     and cfg.get("enabled")
-            #     and cfg_uncond_inputs_embeds is not None
-            #     and not self._cfg_active
-            # ):
-            #     uncond = cfg_uncond_inputs_embeds.to(self.device)
-            #     uncond_out = self.language_model(
-            #         inputs_embeds=uncond,
-            #         attention_mask=attention_mask,
-            #         past_key_values=None,
-            #         use_cache=True,
-            #         **cache_kwargs,
-            #     )
-            #     past_kv = _concat_kv_caches(past_kv, uncond_out.past_key_values)
-            #     self._past_key_values = past_kv
-            #     self._cfg_active = True
-            #     cfg_out = {"enabled": False, "guidance_scale": float(cfg.get("guidance_scale", 1.0) or 1.0)}
+        tail_part = conversation_list[-1]
+        past_kv = self._past_key_values
+        assert tail_part.type == "output"
 
-            # if self._cfg_active:
-            #     if self._ar_phase == "vq":
-            #         self._cfg_seen_vqvae = True
-            #     elif self._cfg_seen_vqvae:
-            #         self.collapse_cfg_cache()
-            #         past_kv = self._past_key_values
-
-            # if self._cfg_active and inputs_embeds.size(0) == 1:
-            #     inputs_embeds = inputs_embeds.expand(2, *inputs_embeds.shape[1:]).contiguous()
-            outputs = self.forward(
-                inputs_embeds=inputs_embeds,
+        # CFG
+        cfg_uncond_inputs_embeds = tail_part.meta.get("cfg_uncond_inputs_embeds", None)
+        if cfg_uncond_inputs_embeds is not None and not self._cfg_active:
+            uncond = cfg_uncond_inputs_embeds.to(self.device)
+            inputs_embeds = tail_part.value[:, -1:].to(self.device)
+            if uncond.dim() == 2:
+                uncond = uncond.unsqueeze(0)
+            uncond_out = self.forward(
+                inputs_embeds=uncond,
                 attention_mask=None,
-                past_key_values=past_kv,
+                past_key_values=None,
                 use_cache=True,
             )
-            self._past_key_values = outputs["past_key_values"]
-            hidden_states = outputs["hidden_states"]
-            if hidden_states.dim() == 3 and hidden_states.size(0) == 1:
-                hidden_states = hidden_states.squeeze(0)
-            conversation_list.append(ConversationItem(type="text_output", value=hidden_states[-1:], role="assistant"))
-            return {"conversation_list": conversation_list}
+            past_kv = _concat_kv_caches(past_kv, uncond_out["past_key_values"])
+            self._past_key_values = past_kv
+            self._cfg_active = True
+            tail_part.meta.pop("cfg_uncond_inputs_embeds", None)
+
+        inputs_embeds: torch.Tensor = tail_part.value[-1:].to(self.device)  # 1, dim
+        inputs_embeds = inputs_embeds.unsqueeze(0)  # 1, 1, dim
+        # if self._cfg_active:
+        #     if self._ar_phase == "vq":
+        #         self._cfg_seen_vqvae = True
+        #     elif self._cfg_seen_vqvae:
+        #         self.collapse_cfg_cache()
+        #         past_kv = self._past_key_values
+
+        if self._cfg_active:
+            inputs_embeds = inputs_embeds.expand(2, *inputs_embeds.shape[1:]).contiguous()  # 2, 1, dim
+
+        outputs = self.forward(
+            inputs_embeds=inputs_embeds,
+            attention_mask=None,
+            past_key_values=past_kv,
+            use_cache=True,
+        )
+        self._past_key_values = outputs["past_key_values"]
+        conversation_list.append(
+            ConversationItem(
+                type="output",
+                value=self._tail_hidden_from_forward(outputs["hidden_states"]),
+                role="assistant",
+            )
+        )
+        return {"conversation_list": conversation_list}
+
+    @staticmethod
+    def _tail_hidden_from_forward(hidden_states: torch.Tensor) -> torch.Tensor:
+        """Last-position backbone hidden for an ``output`` row (keeps CFG batch)."""
+        if hidden_states.dim() == 3 and hidden_states.size(0) == 1:
+            hidden_states = hidden_states.squeeze(0)
+            return hidden_states[-1:].contiguous()
+        return hidden_states[:, -1:, :].contiguous()
 
     # ── Internal helpers ─────────────────────────────────────────────────────
 

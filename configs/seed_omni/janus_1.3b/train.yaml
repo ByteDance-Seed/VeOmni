@@ -145,18 +145,21 @@ edges:
   token_decode_sink:              { from: token_decode, to: end }
   vqvae_decode_sink:              { from: vqvae_decode, to: end }
 
-  # ── Inference VQ AR loop (``vqvae.generate`` → ``janus_llama`` per FSM step).
-  #    ``image_vq`` body order: ``vqvae_to_janus_llama`` then ``janus_llama_to_vqvae``
-  #    — llama already ran on SOI in ``image_vq_start`` before the loop opens.
+  # ── Inference VQ AR loop: ``janus_llama`` tail-forward → ``vqvae.generate``
+  #    per FSM step.  ``image_vq`` body order: ``janus_llama_to_vqvae`` then
+  #    ``vqvae_to_janus_llama`` — the first llama forward on ``<boi>`` happens
+  #    inside the loop (``image_vq_start`` only emits the token).
   janus_llama_to_vqvae:           { from: janus_llama, to: vqvae }
   vqvae_to_janus_llama:           { from: vqvae, to: janus_llama }
   token_generate_to_janus_llama:  { from: token_generate, to: janus_llama }
   janus_llama_to_token_generate:  { from: janus_llama, to: token_generate }
   token_generate_sink:            { from: token_generate, to: end }
 
-  # ── Inference bridge edges: emit boundary token + feed it into the LLM.
+  # ── Inference bridge edges: emit boundary tokens (with / without llama).
   emit_start_to_janus_llama:    { from: emit_image_start, to: janus_llama }
   emit_end_to_janus_llama:      { from: emit_image_end,   to: janus_llama }
+  emit_start_sink:              { from: emit_image_start, to: end }
+  emit_end_sink:                { from: emit_image_end,   to: end }
 
   # ── Inference body sinks: pin ``janus_llama`` into the active set when the
   #    backbone updates KV cache without a downstream consumer in the same body
