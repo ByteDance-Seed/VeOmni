@@ -312,19 +312,17 @@ class JanusVqvae(OmniModule, PreTrainedModel):
 
     def generate(
         self,
-        *,
-        hidden_states: Optional[torch.Tensor] = None,
-        conversation_list: Optional[List[Any]] = None,
+        conversation_list: Optional[List[ConversationItem]] = None,
         generation_kwargs: Optional[Dict[str, Any]] = None,
-        cfg: Optional[Dict[str, Any]] = None,
-        **_: Any,
+        **kwargs: Any,
     ) -> Dict[str, Any]:
         """VQ AR step: lm_head → sample → embed → merge ``output`` rows.
 
         VQ token ids accumulate in :attr:`_vq_buffer`.  On the final patch
         the buffer is decoded to a PIL image and ``image_complete`` is raised.
         """
-
+        tail_part = conversation_list[-1]
+        hidden_states: torch.Tensor = tail_part.value
         hidden_states = hidden_states.to(self.device)
         batch_size = hidden_states.size(0)
         sampling = self._extract_sampling_kwargs(generation_kwargs)
@@ -342,55 +340,34 @@ class JanusVqvae(OmniModule, PreTrainedModel):
                 "Supported: B=1 (no CFG) or B=2 (CFG cond/uncond pair)."
             )
 
-        sampled = self._sample_vq_token(last_logits, **sampling).unsqueeze(-1)  # (1, 1)
-        token_id_int = int(sampled[0, 0].item())
+        sampled = self._sample_vq_token(last_logits, **sampling)
+        token_id_int = int(sampled[0].item())
         self._vq_buffer.append(token_id_int)
 
-        embed_raw = self.generation_embeddings(sampled)
-        embed = self.generation_aligner(embed_raw)  # (1, 1, H)
-        if batch_size == 2:
-            embed = embed.expand(2, *embed.shape[1:]).contiguous()
-
-        ids = sampled.to(device=embed.device, dtype=torch.long)
-        conversation_list.append(
-            ConversationItem(
-                type="output",
-                value=embed,
-                role="assistant",
-                meta={
-                    "generated": True,
-                    "phase": "vq",
-                    "vq_token": True,
-                    "token_id": token_id_int,
-                    "input_ids": ids,
-                    "source": "janus_vqvae",
-                },
-            )
-        )
-        maybe_merge_outputs(conversation_list, phase="vq")
-
-        out: Dict[str, Any] = {
-            "conversation_list": conversation_list,
-            "embed": embed,
-            "vq_token_id": sampled.squeeze(-1),
-        }
-
+        outputs: Dict[str, Any] = {}
         target = self._num_image_tokens()
-        if len(self._vq_buffer) >= target:
-            generated = self._emit_buffered_image(device=embed.device)
-            if generated is not None:
-                seal_outputs(conversation_list, new_type="image")
-                out["generated"] = generated
-                out[FSM_SIGNAL_KEY] = "image_complete"
+        if len(self._vq_buffer) == target:
+            # end of image generation, so the hidden states is for the next text ar step
+            # do not need to do aligner(embeddings)
+            generated = self._emit_buffered_image()
 
-        return out
+            tail_part = conversation_list.pop()
+            seal_outputs(conversation_list, new_type="image")
+            conversation_list.append(tail_part)
 
-    def _emit_buffered_image(self, *, device: torch.device) -> Optional[Dict[str, Any]]:
+            outputs["generated"] = generated
+            outputs[FSM_SIGNAL_KEY] = "image_complete"
+        else:
+            input_embeds = self.generation_aligner(self.generation_embeddings(sampled))
+            tail_part.value = input_embeds
+            maybe_merge_outputs(conversation_list)
+
+        outputs["conversation_list"] = conversation_list
+        return outputs
+
+    def _emit_buffered_image(self) -> Optional[Dict[str, Any]]:
         """Decode a full VQ grid from ``_vq_buffer`` and clear it."""
-        target = self._num_image_tokens()
-        if len(self._vq_buffer) < target:
-            return None
-        token_ids = torch.tensor([self._vq_buffer[:target]], dtype=torch.long, device=device)
+        token_ids = torch.tensor([self._vq_buffer], dtype=torch.long, device=self.device)
         self._vq_buffer.clear()
         with torch.inference_mode():
             decoded = self.vqmodel.decode(token_ids).permute(0, 2, 3, 1)

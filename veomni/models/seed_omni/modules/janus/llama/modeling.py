@@ -46,12 +46,74 @@ from veomni.utils.seqlen_pos_transform_utils import prepare_fa_kwargs_from_posit
 from veomni.utils.tensor_utils import naflatten, unflatten
 
 from ....conversation import (
-    ArPhase,
     ConversationItem,
     is_dummy,
 )
 from ....module import OmniModule
 from .configuration import JanusLlamaConfig
+
+
+# ── Internal helpers for KV cache manipulation ───────────────────────────────
+def _slice_kv_cache(cache: Any, index: slice) -> Any:
+    """Slice a ``DynamicCache`` along batch dim 0."""
+    if cache is None:
+        return None
+    sliced = type(cache)()
+    layers = getattr(cache, "layers", None)
+    if layers is None:
+        n_layers = len(getattr(cache, "key_cache", []))
+        for i in range(n_layers):
+            k = cache.key_cache[i][index]
+            v = cache.value_cache[i][index]
+            sliced.update(k, v, i)
+        return sliced
+    for i, _ in enumerate(layers):
+        k = cache.layers[i].keys[index]
+        v = cache.layers[i].values[index]
+        sliced.update(k, v, i)
+    return sliced
+
+
+def _concat_kv_caches(cond: Any, uncond: Any) -> Any:
+    """Batch-concat two ``DynamicCache``s along dim 0.
+
+    Scoped to ``DynamicCache`` with all-``DynamicLayer`` layers — which is
+    what plain ``LlamaModel`` produces on Janus today.  Other cache classes
+    (``StaticCache``, ``HybridCache``, ``SlidingWindowCache``) require
+    constructor args and / or carry per-layer state (``is_sliding``,
+    ``_sliding_window_tensor``, ``cumulative_length``) that this helper does
+    NOT preserve — passing them in is a bug and will either raise on the
+    ``type(cond)()`` call or silently lose layer metadata.  Janus has no
+    sliding-window attention so we don't hit that path; revisit when
+    extending CFG to backbones that do.
+
+    Supports both the v5.9 ``.layers[i].keys`` schema and the older
+    ``.key_cache[i]`` / ``.value_cache[i]`` lists via ``getattr`` probe,
+    because the transformers cache module is still in flux and we want
+    the helper to keep working through minor bumps.
+    """
+    if cond is None or uncond is None:
+        return cond or uncond
+    if type(cond) is not type(uncond):
+        raise TypeError(
+            f"_concat_kv_caches: cond ({type(cond).__name__}) and uncond ({type(uncond).__name__}) "
+            "must be the same cache class."
+        )
+    merged = type(cond)()
+    layers = getattr(cond, "layers", None)
+    if layers is None:
+        # Pre-5.9 DynamicCache exposed `key_cache` / `value_cache` lists.
+        n_layers = len(getattr(cond, "key_cache", []))
+        for i in range(n_layers):
+            k = torch.cat([cond.key_cache[i], uncond.key_cache[i]], dim=0)
+            v = torch.cat([cond.value_cache[i], uncond.value_cache[i]], dim=0)
+            merged.update(k, v, i)
+        return merged
+    for i, _ in enumerate(layers):
+        k = torch.cat([cond.layers[i].keys, uncond.layers[i].keys], dim=0)
+        v = torch.cat([cond.layers[i].values, uncond.layers[i].values], dim=0)
+        merged.update(k, v, i)
+    return merged
 
 
 class JanusLlama(OmniModule, PreTrainedModel):
@@ -83,17 +145,9 @@ class JanusLlama(OmniModule, PreTrainedModel):
         # Inference state
         # Classifier-free guidance runtime state — set to True the first
         # time :meth:`generate` consumes a ``cfg_uncond_inputs_embeds`` from
-        # ctx and expands the KV cache to bs=2.  ``_cfg_seen_vqvae`` flips
-        # the moment we observe a ``meta.source == "vqvae"`` tail (i.e. we
-        # entered the body of ``image_vq``) — used by the AR-branch guard
-        # to detect "leaving image_vq" and raise a clear error instead of
-        # silently feeding a bs=2 cache into ``text_ar`` / interleave
-        # states (where ``tok_decode`` would crash on bs=2 hidden states).
-        # Both are reset by :meth:`reset_inference_state` between requests.
+        # ctx and expands the KV cache to bs=2.
         self._cfg_active: bool = False
-        self._cfg_seen_vqvae: bool = False
         self._past_key_values: Any = None
-        self._ar_phase: ArPhase = "text"
 
         # Training state
         self._conversation_carrier: Optional[list[list[ConversationItem]]] = None
@@ -198,13 +252,15 @@ class JanusLlama(OmniModule, PreTrainedModel):
         T2I call carrying over into an I2T call).
         """
         self._cfg_active = False
-        self._cfg_seen_vqvae = False
         self._past_key_values = None
-        self._ar_phase = "text"
 
-    def set_ar_phase(self, phase: ArPhase) -> None:
-        """Switch the active AR phase (``text`` vs ``vq``) for ``output`` tagging."""
-        self._ar_phase = phase
+    def config_cfg_cache(self, uncond_past_key_values: Any) -> None:
+        """Configure the KV cache for CFG.
+
+        uncond_past_key_values: the past key values of the unconditional branch
+        """
+        self._past_key_values = _concat_kv_caches(self._past_key_values, uncond_past_key_values)
+        self._cfg_active = True
 
     def collapse_cfg_cache(self) -> None:
         """Drop the unconditional half of a bs=2 KV cache after image generation."""
@@ -212,12 +268,10 @@ class JanusLlama(OmniModule, PreTrainedModel):
             return
         self._past_key_values = _slice_kv_cache(self._past_key_values, slice(0, 1))
         self._cfg_active = False
-        self._cfg_seen_vqvae = False
 
     def generate(
         self,
         conversation_list: Optional[List[ConversationItem]] = None,
-        generation_kwargs: Dict[str, Any] = dict,
         **kwargs: Any,
     ) -> Dict[str, Any]:
         """Auto-regressive backbone step driven by a conversation list.
@@ -262,11 +316,10 @@ class JanusLlama(OmniModule, PreTrainedModel):
                 "conversation_list": conversation_list,
             }
         tail_part = conversation_list[-1]
-        past_kv = self._past_key_values
         assert tail_part.type == "output"
 
         # CFG
-        cfg_uncond_inputs_embeds = tail_part.meta.get("cfg_uncond_inputs_embeds", None)
+        cfg_uncond_inputs_embeds = tail_part.meta.pop("cfg_uncond_inputs_embeds", None)
         if cfg_uncond_inputs_embeds is not None and not self._cfg_active:
             uncond = cfg_uncond_inputs_embeds.to(self.device)
             inputs_embeds = tail_part.value[:, -1:].to(self.device)
@@ -278,19 +331,12 @@ class JanusLlama(OmniModule, PreTrainedModel):
                 past_key_values=None,
                 use_cache=True,
             )
-            past_kv = _concat_kv_caches(past_kv, uncond_out["past_key_values"])
-            self._past_key_values = past_kv
-            self._cfg_active = True
-            tail_part.meta.pop("cfg_uncond_inputs_embeds", None)
+            self.config_cfg_cache(uncond_out["past_key_values"])
+        elif tail_part.meta.get("collapse_cfg", False):
+            self.collapse_cfg_cache()
 
         inputs_embeds: torch.Tensor = tail_part.value[-1:].to(self.device)  # 1, dim
         inputs_embeds = inputs_embeds.unsqueeze(0)  # 1, 1, dim
-        # if self._cfg_active:
-        #     if self._ar_phase == "vq":
-        #         self._cfg_seen_vqvae = True
-        #     elif self._cfg_seen_vqvae:
-        #         self.collapse_cfg_cache()
-        #         past_kv = self._past_key_values
 
         if self._cfg_active:
             inputs_embeds = inputs_embeds.expand(2, *inputs_embeds.shape[1:]).contiguous()  # 2, 1, dim
@@ -298,7 +344,7 @@ class JanusLlama(OmniModule, PreTrainedModel):
         outputs = self.forward(
             inputs_embeds=inputs_embeds,
             attention_mask=None,
-            past_key_values=past_kv,
+            past_key_values=self._past_key_values,
             use_cache=True,
         )
         self._past_key_values = outputs["past_key_values"]
@@ -421,94 +467,3 @@ def _fold_fsdp_dummy_anchors(
             fake = part.value.mean().to(device=inputs_embeds.device, dtype=inputs_embeds.dtype) * 0.0
             inputs_embeds = inputs_embeds + fake
     return inputs_embeds
-
-
-def _sp_pad_tensor(
-    tensor: torch.Tensor,
-    dim: int,
-    pad_value: int,
-    pad_scale: int = 1,
-) -> torch.Tensor:
-    """Pad a sequence tensor so its length is divisible by ``sp_size * pad_scale``."""
-    sp_size = get_parallel_state().sp_size
-    seq_length = tensor.size(dim)
-    scale_sp_size = sp_size * pad_scale
-    sp_chunk_size = (seq_length + scale_sp_size - 1) // scale_sp_size
-    pad_size = sp_chunk_size * scale_sp_size - seq_length
-    if pad_size == 0:
-        return tensor
-    pad_shape = list(tensor.shape)
-    pad_shape[dim] = pad_size
-    pad = torch.full(pad_shape, fill_value=pad_value, dtype=tensor.dtype, device=tensor.device)
-    return torch.cat((tensor, pad), dim=dim)
-
-
-def _sp_slice_tensor(tensor: torch.Tensor, dim: int) -> torch.Tensor:
-    """Extract this SP rank's slice from an already padded sequence tensor."""
-    sp_size = get_parallel_state().sp_size
-    sp_rank = get_parallel_state().sp_rank
-    seq_length = tensor.size(dim)
-    sp_chunk_size = (seq_length + sp_size - 1) // sp_size
-    return tensor.narrow(dim, sp_rank * sp_chunk_size, sp_chunk_size)
-
-
-def _slice_kv_cache(cache: Any, index: slice) -> Any:
-    """Slice a ``DynamicCache`` along batch dim 0."""
-    if cache is None:
-        return None
-    sliced = type(cache)()
-    layers = getattr(cache, "layers", None)
-    if layers is None:
-        n_layers = len(getattr(cache, "key_cache", []))
-        for i in range(n_layers):
-            k = cache.key_cache[i][index]
-            v = cache.value_cache[i][index]
-            sliced.update(k, v, i)
-        return sliced
-    for i, _ in enumerate(layers):
-        k = cache.layers[i].keys[index]
-        v = cache.layers[i].values[index]
-        sliced.update(k, v, i)
-    return sliced
-
-
-def _concat_kv_caches(cond: Any, uncond: Any) -> Any:
-    """Batch-concat two ``DynamicCache``s along dim 0.
-
-    Scoped to ``DynamicCache`` with all-``DynamicLayer`` layers — which is
-    what plain ``LlamaModel`` produces on Janus today.  Other cache classes
-    (``StaticCache``, ``HybridCache``, ``SlidingWindowCache``) require
-    constructor args and / or carry per-layer state (``is_sliding``,
-    ``_sliding_window_tensor``, ``cumulative_length``) that this helper does
-    NOT preserve — passing them in is a bug and will either raise on the
-    ``type(cond)()`` call or silently lose layer metadata.  Janus has no
-    sliding-window attention so we don't hit that path; revisit when
-    extending CFG to backbones that do.
-
-    Supports both the v5.9 ``.layers[i].keys`` schema and the older
-    ``.key_cache[i]`` / ``.value_cache[i]`` lists via ``getattr`` probe,
-    because the transformers cache module is still in flux and we want
-    the helper to keep working through minor bumps.
-    """
-    if cond is None or uncond is None:
-        return cond or uncond
-    if type(cond) is not type(uncond):
-        raise TypeError(
-            f"_concat_kv_caches: cond ({type(cond).__name__}) and uncond ({type(uncond).__name__}) "
-            "must be the same cache class."
-        )
-    merged = type(cond)()
-    layers = getattr(cond, "layers", None)
-    if layers is None:
-        # Pre-5.9 DynamicCache exposed `key_cache` / `value_cache` lists.
-        n_layers = len(getattr(cond, "key_cache", []))
-        for i in range(n_layers):
-            k = torch.cat([cond.key_cache[i], uncond.key_cache[i]], dim=0)
-            v = torch.cat([cond.value_cache[i], uncond.value_cache[i]], dim=0)
-            merged.update(k, v, i)
-        return merged
-    for i, _ in enumerate(layers):
-        k = torch.cat([cond.layers[i].keys, uncond.layers[i].keys], dim=0)
-        v = torch.cat([cond.layers[i].values, uncond.layers[i].values], dim=0)
-        merged.update(k, v, i)
-    return merged

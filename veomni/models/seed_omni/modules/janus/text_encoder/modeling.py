@@ -414,6 +414,7 @@ class JanusTextEncoder(TextEncoder):
                 outputs[FSM_SIGNAL_KEY] = SIGNAL_TEXT_DONE
 
             if FSM_SIGNAL_KEY in outputs and outputs[FSM_SIGNAL_KEY] in (SIGNAL_TEXT_DONE, SIGNAL_START_IMAGE_GEN):
+                # type: outputs -> type :text
                 outputs["generated"] = self._flush_text_generated(conversation_list)
             return outputs
         else:
@@ -425,64 +426,51 @@ class JanusTextEncoder(TextEncoder):
         self,
         conversation_list: Optional[List[ConversationItem]] = None,
         generation_kwargs: Optional[Dict[str, Any]] = None,
-        **ctx: Any,
     ) -> Dict[str, Any]:
         """Emit ``<begin_of_image>`` as a standalone ``soi`` conversation item."""
-        token_id = self._boi_token_id
-        # import ipdb;ipdb.set_trace()
-        out: Dict[str, Any] = {}
-        self._maybe_arm_cfg_for_image_gen(
+        assert conversation_list[-1].type == "output" and conversation_list[-1].value.shape[0] == 1
+        conversation_list.pop()  # no matter what generated, we don't need it anymore
+        output_token_id = self._boi_token_id
+        input_ids = self._token_id_tensor(output_token_id)
+        inputs_embeds = self.encode(input_ids)["inputs_embeds"]
+        cfg_uncond_inputs_embeds = self._maybe_arm_cfg_for_image_gen(
             conversation_list,
             generation_kwargs,
-            out,
         )
-        out.update(self._emit_boundary(int(token_id), "boi", conversation_list, ctx))
-        out["ar_phase"] = "vq"
-        return out
+        conversation_list.append(
+            ConversationItem(
+                type="output",
+                value=inputs_embeds,
+                role="assistant",
+                meta={
+                    "cfg_uncond_inputs_embeds": cfg_uncond_inputs_embeds,
+                },
+            )
+        )
+        return {"conversation_list": conversation_list}
 
     def emit_image_end(
         self,
         conversation_list: Optional[List[ConversationItem]] = None,
-        **ctx: Any,
+        **kwargs: Any,
     ) -> Dict[str, Any]:
         """Emit ``<end_of_image>`` as a standalone ``eoi`` conversation item."""
-        token_id = self._eoi_token_id
-        # import ipdb;ipdb.set_trace()
-        out = self._emit_boundary(int(token_id), "eoi", conversation_list, ctx)
-        out["ar_phase"] = "text"
-        out["collapse_cfg"] = True
-        return out
-
-    def _emit_boundary(
-        self,
-        token_id: int,
-        boundary: str,
-        conversation_list: Optional[List[ConversationItem]],
-        ctx: Dict[str, Any],
-    ) -> Dict[str, Any]:
-        device = self.device
-        dtype = self.dtype
-        batch_size = _infer_batch_size(ctx)
-        ids = torch.full((batch_size, 1), token_id, dtype=torch.long, device=device)
-        inputs_embeds = self.embed_tokens(ids).to(dtype=dtype)
-        out: Dict[str, Any] = {"input_ids": ids, "inputs_embeds": inputs_embeds}
-        if conversation_list is not None:
-            item_type = {"boi": "soi", "eoi": "eoi"}.get(boundary, "token")
-            conversation_list.append(
-                ConversationItem(
-                    type=item_type,
-                    value=inputs_embeds,
-                    role="assistant",
-                    meta={
-                        "generated": True,
-                        "token_id": int(token_id),
-                        "input_ids": ids,
-                        "boundary": boundary,
-                    },
-                )
+        assert conversation_list[-1].type == "output" and conversation_list[-1].value.shape[-2] == 1
+        conversation_list.pop()  # no matter what generated, we don't need it anymore
+        output_token_id = self._eoi_token_id
+        input_ids = self._token_id_tensor(output_token_id)
+        inputs_embeds = self.encode(input_ids)["inputs_embeds"]
+        conversation_list.append(
+            ConversationItem(
+                type="output",
+                value=inputs_embeds,
+                role="assistant",
+                meta={
+                    "collapse_cfg": True,
+                },
             )
-            out["conversation_list"] = conversation_list
-        return out
+        )
+        return {"conversation_list": conversation_list}
 
     # ── CFG: arm at SOI from ``generation_kwargs`` ────────────────────────────
 
@@ -490,7 +478,6 @@ class JanusTextEncoder(TextEncoder):
         self,
         conversation_list: Optional[List[ConversationItem]],
         generation_kwargs: Optional[Dict[str, Any]],
-        out: Dict[str, Any],
     ) -> None:
         """Opt into CFG when ``<soi>`` opens the image span.
 
@@ -499,54 +486,35 @@ class JanusTextEncoder(TextEncoder):
         plus ``cfg_uncond_inputs_embeds`` for the backbone to expand KV on its
         next forward.  Llama clears ``cfg["enabled"]`` after the cache is built.
         """
-        if conversation_list is None or not generation_kwargs:
-            return
         cfg_w = generation_kwargs.get("guidance_scale")
         if cfg_w is None or float(cfg_w) <= 1.0:
             return
         uncond = self._build_cfg_uncond_embeds(conversation_list)
-        if uncond is None:
-            return
-        out["cfg"] = {"enabled": True, "guidance_scale": float(cfg_w)}
-        out["cfg_uncond_inputs_embeds"] = uncond
+        return uncond
 
     def _build_cfg_uncond_embeds(
         self,
         conversation_list: List[ConversationItem],
     ) -> Optional[torch.Tensor]:
-        """Build ``(1, T_prompt, hidden)`` uncond inputs_embeds, or ``None``.
-
-        Returns ``None`` when the prompt is not text-only (e.g. I2T with an ``image`` part).
-        """
-        # import ipdb;ipdb.set_trace()
-        if any(p.type == "image" for p in conversation_list):
-            return None
-
-        bos_id = int(self._bos_token_id)
-        pad_id = int(self._pad_token_id)
-        boi_id = self._boi_token_id  # may be None if not registered
+        """Build ``(1, T_prompt, hidden)`` uncond inputs_embeds, or ``None``."""
+        bos_id = self._bos_token_id
+        pad_id = self._pad_token_id
         device = self.device
         dtype = self.dtype
 
-        uncond_chunks: List[torch.Tensor] = []
-        for part in conversation_list:
+        input_ids: List[int] = [bos_id]
+        assert conversation_list[0].type == "text"
+        input_ids.extend([pad_id] * (len(conversation_list[0].value) - 1))
+
+        for part in conversation_list[1:]:
             if part.type == "output":
-                continue
-            ids = part.meta.get("input_ids")
-            if ids is None:
-                if part.type == "image":
-                    return None
-                continue
-            if ids.dim() == 1:
-                ids = ids.unsqueeze(0)
-            keep_mask = ids == bos_id
-            if boi_id is not None:
-                keep_mask = keep_mask | (ids == int(boi_id))
-            masked = torch.where(keep_mask, ids, torch.full_like(ids, pad_id))
-            uncond_chunks.append(self.embed_tokens(masked).to(dtype=dtype, device=device))
-        if not uncond_chunks:
-            return None
-        return torch.cat(uncond_chunks, dim=1)
+                break
+            input_ids.extend([pad_id] * len(part.value))
+
+        uncond_inputs_embeds = self.embed_tokens(torch.tensor(input_ids, dtype=torch.long, device=device)).to(
+            dtype=dtype, device=device
+        )
+        return uncond_inputs_embeds
 
     # ── Finalize: decode the accumulated assistant text ──────────────────────
 
@@ -616,12 +584,3 @@ class JanusTextEncoder(TextEncoder):
             if k in kwargs:
                 merged[k] = kwargs[k]
         return merged
-
-
-def _infer_batch_size(ctx: Dict[str, Any]) -> int:
-    """Best-effort batch-size inference from tensors already in ``ctx``."""
-    for key in ("input_ids", "inputs_embeds", "hidden_states", "attention_mask"):
-        v = ctx.get(key)
-        if isinstance(v, torch.Tensor) and v.dim() >= 1:
-            return int(v.size(0))
-    return 1

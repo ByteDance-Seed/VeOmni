@@ -51,3 +51,4 @@ generation_kwargs:
   temperature: 0.0
   top_p: 1.0
   do_sample: False
+  guidance_scale: 5.0
