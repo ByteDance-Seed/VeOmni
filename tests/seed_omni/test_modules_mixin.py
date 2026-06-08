@@ -367,7 +367,7 @@ def _janus_cfg_dir() -> Path:
 
 def test_janus_train_yaml_loads_with_v2_module_names():
     """The shipped training YAML must round-trip through ``OmniConfig.from_paths``."""
-    from veomni.models.seed_omni.configuration_seed_omni import OmniConfig
+    from veomni.models.seed_omni.configuration_omni import OmniConfig
 
     cfg = OmniConfig.from_paths(
         model_path="",
@@ -391,7 +391,7 @@ def test_janus_train_yaml_loads_with_v2_module_names():
 @pytest.mark.parametrize("infer_yaml", ["infer_interleave.yaml", "infer_gen.yaml", "infer_und.yaml"])
 def test_janus_train_plus_infer_merges_generation_graph(infer_yaml: str):
     """Two-file load: training vocabulary + inference scenario merge cleanly."""
-    from veomni.models.seed_omni.configuration_seed_omni import OmniConfig
+    from veomni.models.seed_omni.configuration_omni import OmniConfig
 
     cfg = OmniConfig.from_paths(
         model_path="",
@@ -428,7 +428,7 @@ def test_from_paths_deep_merges_infer_module_overrides():
     """Infer YAML ``modules:`` patches train YAML per module without restating ``weights_path``."""
     import yaml
 
-    from veomni.models.seed_omni.configuration_seed_omni import OmniConfig
+    from veomni.models.seed_omni.configuration_omni import OmniConfig
 
     train_yaml = _janus_cfg_dir() / "train.yaml"
     infer_yaml = _janus_cfg_dir() / "infer_gen.yaml"
@@ -486,7 +486,7 @@ def test_build_module_args_resolves_relative_weights_path():
 
 def test_from_paths_keeps_relative_module_weights_in_omni_config():
     """``OmniConfig`` stores raw module blocks; path join happens in ``build_module_args``."""
-    from veomni.models.seed_omni.configuration_seed_omni import OmniConfig
+    from veomni.models.seed_omni.configuration_omni import OmniConfig
 
     root = "seed_omni/janus_1.3b"
     cfg = OmniConfig.from_paths(

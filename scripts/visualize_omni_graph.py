@@ -42,10 +42,12 @@ from typing import Literal
 import yaml
 
 from veomni.arguments import parse_args
-from veomni.models.seed_omni.configuration_seed_omni import OmniConfig
+from veomni.arguments.arguments_types import DataArguments
+from veomni.models.seed_omni.configuration_omni import OmniConfig
 from veomni.models.seed_omni.generation_graph import GenerationGraph
 from veomni.models.seed_omni.training_graph import TrainingGraph
 from veomni.trainer.omni_inferencer import OmniInferModelArguments
+from veomni.trainer.omni_trainer import OmniModelArguments, VeOmniOmniArguments
 
 
 OutputFormat = Literal["html", "mmd"]
@@ -214,11 +216,25 @@ def main() -> None:
     out_dir = _output_dir(launcher_yaml, train_yaml)
     launcher_label = _yaml_stem(launcher_yaml) if launcher_yaml else _yaml_stem(train_yaml)
     ext = ".html" if fmt == "html" else ".mmd"
+    model_root = args.model.model_path or ""
+    model_args = OmniModelArguments(
+        model_path=model_root,
+        config_path=model_root or ".",
+        tokenizer_path=getattr(args.model, "tokenizer_path", None),
+        omni_train_yaml_path=train_yaml,
+    )
+    global_args = VeOmniOmniArguments(
+        model=model_args,
+        data=DataArguments(train_path=""),
+    )._to_base_args()
 
-    # 1. Training graph (train YAML only).  Empty ``model_path`` keeps the
-    # diagram labels short — visualization doesn't load weights, so relative
-    # ``weights_path`` values stay relative (e.g. ``janus_siglip``).
-    cfg_train = OmniConfig.from_paths(model_path="", train_yaml_path=train_yaml)
+    # 1. Training graph (train YAML only). Use the same loader path as
+    # trainer/inferencer so visualisation stays in sync with runtime config merge.
+    cfg_train = OmniConfig._init(
+        global_args=global_args,
+        model_path=global_args.model.model_path,
+        train_yaml_path=train_yaml,
+    )
     train_title = f"{launcher_label} — training"
     train_body, train_meta = _render_training(cfg_train, title=train_title)
     train_path = os.path.join(out_dir, "training" + ext)
@@ -227,8 +243,9 @@ def main() -> None:
 
     # 2. One FSM per inference scenario.
     for infer_key, infer_path in sorted(infer_map.items()):
-        cfg = OmniConfig.from_paths(
-            model_path="",
+        cfg = OmniConfig._init(
+            global_args=global_args,
+            model_path=global_args.model.model_path,
             train_yaml_path=train_yaml,
             infer_yaml_path=infer_path,
         )

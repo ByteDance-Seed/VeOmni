@@ -49,11 +49,11 @@ from ....conversation import (
     ConversationItem,
     is_dummy,
 )
-from ....module import OmniModule
+from ....module import InferModuleMixin, TrainModuleMixin
 from .configuration import JanusLlamaConfig
 
 
-class JanusLlama(OmniModule, PreTrainedModel):
+class JanusLlama(TrainModuleMixin, InferModuleMixin, PreTrainedModel):
     """LLaMA backbone (no wte, no lm_head).
 
     Multi-modal inputs are already embedded by the sibling encoder modules
@@ -185,7 +185,7 @@ class JanusLlama(OmniModule, PreTrainedModel):
 
     # ── Inference (conversation-list aware) ──────────────────────────────────
 
-    def reset_inference_state(self) -> None:
+    def reset_local_inference_state(self) -> None:
         """Wipe per-request runtime state — CFG flag, KV cache, etc.
 
         Called by :class:`OmniInferencer` between requests so the next

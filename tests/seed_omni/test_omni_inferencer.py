@@ -112,7 +112,7 @@ def test_module_uses_fsdp_only_when_declared_in_module_yaml():
 
 
 def test_omni_config_module_config_merges_model_and_train_blocks():
-    from veomni.models.seed_omni.configuration_seed_omni import OmniConfig
+    from veomni.models.seed_omni.configuration_omni import OmniConfig
 
     omni_config = OmniConfig.from_dict(
         {

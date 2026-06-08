@@ -7,32 +7,31 @@ flowchart LR
     fsm_done(("⏹")):::fsm_terminal
     subgraph state_prompt_encode [prompt_encode]
         direction LR
-        prompt_encode__siglip_generate["siglip_generate<br/><i>janus_siglip.generate</i>"]:::body_node
-        prompt_encode__janus_llama_gen["janus_llama_gen<br/><i>janus_llama.generate</i>"]:::body_node
-        prompt_encode__tok_encode_generate["tok_encode_generate<br/><i>janus_text_encoder.generate</i>"]:::body_node
-        prompt_encode__tok_decode["tok_decode<br/><i>janus_text_encoder.decode</i>"]:::body_node
-        prompt_encode__siglip_generate -->|"conversation_list"| prompt_encode__janus_llama_gen
-        prompt_encode__tok_encode_generate -->|"conversation_list"| prompt_encode__janus_llama_gen
-        prompt_encode__janus_llama_gen -->|"hidden_states"| prompt_encode__tok_decode
+        prompt_encode__siglip_encode["siglip_encode<br/><i>janus_siglip.forward</i>"]:::body_node
+        prompt_encode__janus_llama["janus_llama<br/><i>janus_llama.forward</i>"]:::body_node
+        prompt_encode__token_generate["token_generate<br/><i>janus_text_encoder.forward</i>"]:::body_node
+        prompt_encode__siglip_encode --> prompt_encode__janus_llama
+        prompt_encode__token_generate --> prompt_encode__janus_llama
+        prompt_encode__janus_llama --> prompt_encode__token_generate
     end
     subgraph state_text_ar [text_ar]
         direction LR
-        text_ar__tok_encode_generate["tok_encode_generate<br/><i>janus_text_encoder.generate</i>"]:::body_node
-        text_ar__janus_llama_gen["janus_llama_gen<br/><i>janus_llama.generate</i>"]:::body_node
-        text_ar__tok_decode["tok_decode<br/><i>janus_text_encoder.decode</i>"]:::body_node
-        text_ar__tok_encode_generate -->|"conversation_list"| text_ar__janus_llama_gen
-        text_ar__janus_llama_gen -->|"hidden_states"| text_ar__tok_decode
+        text_ar__janus_llama["janus_llama<br/><i>janus_llama.forward</i>"]:::body_node
+        text_ar__token_generate["token_generate<br/><i>janus_text_encoder.forward</i>"]:::body_node
+        text_ar__janus_llama --> text_ar__token_generate
     end
     subgraph state_image_vq [image_vq]
         direction LR
-        image_vq__janus_llama_gen["janus_llama_gen<br/><i>janus_llama.generate</i>"]:::body_node
-        image_vq__vae_generate["vae_generate<br/><i>janus_vqvae.generate</i>"]:::body_node
-        image_vq__janus_llama_gen -->|"hidden_states"| image_vq__vae_generate
-        image_vq__vae_generate -->|"conversation_list"| image_vq__janus_llama_gen
+        image_vq__vqvae["vqvae<br/><i>janus_vqvae.forward</i>"]:::body_node
+        image_vq__janus_llama["janus_llama<br/><i>janus_llama.forward</i>"]:::body_node
+        image_vq__vqvae --> image_vq__janus_llama
+        image_vq__janus_llama --> image_vq__vqvae
     end
     subgraph state_image_vq_end [image_vq_end]
         direction LR
         image_vq_end__emit_image_end["emit_image_end<br/><i>janus_text_encoder.emit_image_end</i>"]:::body_node
+        image_vq_end__janus_llama["janus_llama<br/><i>janus_llama.forward</i>"]:::body_node
+        image_vq_end__emit_image_end --> image_vq_end__janus_llama
     end
     state_prompt_encode -.-> state_prompt_encode
     state_text_ar -.-> state_text_ar

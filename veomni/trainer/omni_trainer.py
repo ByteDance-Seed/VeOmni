@@ -79,7 +79,7 @@ from .callbacks import Callback, CheckpointerCallback, HFLoraCkptCallback, Huggi
 
 
 if TYPE_CHECKING:
-    from ..models.seed_omni.configuration_seed_omni import OmniConfig
+    from ..models.seed_omni.configuration_omni import OmniConfig
 
 
 logger = logging.get_logger(__name__)
@@ -105,7 +105,7 @@ class OmniModelArguments(ModelArguments):
 
     def load_omni_config(self, global_args: VeOmniArguments) -> "OmniConfig":
         """Build :class:`OmniConfig` (graph vocabulary + raw module override blocks)."""
-        from ..models.seed_omni.configuration_seed_omni import OmniConfig
+        from ..models.seed_omni.configuration_omni import OmniConfig
 
         if not self.omni_train_yaml_path:
             raise ValueError("`model.omni_train_yaml_path` is required for OmniModel V2.")

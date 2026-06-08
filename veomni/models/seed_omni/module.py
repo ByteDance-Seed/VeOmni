@@ -139,36 +139,17 @@ tests can exercise the FSM without GPUs.
 from typing import Any, Dict, List, Optional, Type
 
 
-class OmniModule:
-    """Mixin for SeedOmni V2 modules.
+class TrainModuleMixin:
+    """Training-side mixin for SeedOmni V2 modules.
 
     Multi-inherit alongside the real HF / diffusers backbone class::
 
-        class JanusVisionEncoder(OmniModule, SiglipVisionModel):
+        class VeOmniModule(TrainModuleMixin, InferModuleMixin, HFModel):
             ...
 
-    Only the hooks the module actually needs must be overridden.  All
-    defaults below are safe identity passes.
+    Only training hooks live here: ``pre_forward`` / ``forward`` /
+    ``post_forward`` / ``dummy_inputs`` plus parallel-plan/assets helpers.
     """
-
-    # ── Per-module asset wiring ───────────────────────────────────────────────
-    #
-    # A subclass that consumes raw PIL / waveform inputs at inference time
-    # declares its processor class here (e.g.
-    # ``processor_class = JanusSiglipProcessor``).  :meth:`from_pretrained`
-    # then loads it from the same weights folder and stashes it on
-    # ``self._processor`` so the module's ``generate`` can tensorise its
-    # own inputs — no external wiring step required.
-    #
-    # Likewise, a module that owns its **own** tokenizer (e.g. Janus
-    # ``janus_text_encoder``) keeps ``self._tokenizer = None`` in ``__init__``
-    # a ``tokenizer`` property setter (``OmniModuleTrainer`` assigns
-    # ``model.tokenizer = build_tokenizer(...)``, same slot as SigLIP ``_processor``).
-    #
-    # Leave both as ``None`` (default) for modules that only consume already-
-    # tensorised inputs (SigLIP, VQVAE, LLaMA backbone).
-    processor_class: Optional[Type[Any]] = None
-    tokenizer_class: Optional[Type[Any]] = None
 
     # ── Training hooks ────────────────────────────────────────────────────────
 
@@ -210,77 +191,6 @@ class OmniModule:
         """
         return outputs
 
-    def generate_step(self, **kwargs: Any) -> Dict[str, Any]:
-        """Single FSM-driven generation step.
-
-        Default: delegate to :meth:`forward`.  Override when inference logic
-        differs from training — e.g. a DiT runs its denoising loop here, an
-        LM head samples a token here.
-        """
-        return self.forward(**kwargs)
-
-    # ── HF lifecycle override ─────────────────────────────────────────────────
-
-    @classmethod
-    def from_pretrained(cls, pretrained_model_name_or_path: Any, *args: Any, **kwargs: Any):
-        """Load weights, then auto-load the per-module processor / tokenizer if declared.
-
-        Loads weights via the next-in-MRO ``from_pretrained`` (the
-        concrete HF base — :class:`PreTrainedModel` or
-        :class:`ModelMixin`).  When :attr:`processor_class` / :attr:`tokenizer_class`
-        is set, also loads that asset from the same path and stashes it on
-        ``model._processor`` / ``model._tokenizer`` so the module's
-        :meth:`generate` can tensorise its own inputs — there's no external
-        wiring step.
-
-        The assets are loaded via the registry-aware ``build_processor`` /
-        ``build_tokenizer`` — the *same* loaders the training path
-        (``OmniModuleTrainer._build_model_assets``) uses — so the inference and
-        training paths produce identical processor / tokenizer objects.
-
-        A missing / unreadable asset folder is a silent no-op; the module's
-        ``generate`` is responsible for raising a clear error if it actually
-        needs the asset at call time.  This keeps stripped training checkpoints
-        (no preprocessor / tokenizer JSON shipped) loadable.
-        """
-        # Lazy import to avoid an import cycle (``veomni.models.auto`` pulls in
-        # the loader / ops stack at import time, while this module is imported
-        # while that stack is still initialising).
-        from ..auto import build_processor, build_tokenizer
-
-        model = super().from_pretrained(pretrained_model_name_or_path, *args, **kwargs)
-        if cls.processor_class is not None:
-            try:
-                model._processor = build_processor(pretrained_model_name_or_path)
-            except Exception:
-                # Best-effort: defer the "missing processor" error to ``generate``
-                # where the message can reference the actual call site.
-                model._processor = None
-        if cls.tokenizer_class is not None:
-            try:
-                model._tokenizer = build_tokenizer(pretrained_model_name_or_path)
-            except Exception:
-                model._tokenizer = None
-        return model
-
-    def finalize(self, *, ctx: Dict[str, Any]) -> Dict[str, Any]:
-        """Flush module-private generation buffers into a one-shot ``generated`` payload.
-
-        ``OmniModel.generate`` calls this on *every* module exactly once, but
-        **only** when the ``max_new_tokens`` safety cap trips before the FSM
-        reaches ``done`` (normal completion emits per-step instead).  The
-        module inspects its own buffers to decide whether to emit or no-op.
-
-        Return ``{"generated": {"type": ..., "value": ...}}`` to append to
-        :attr:`~veomni.models.seed_omni.modeling_omni.OmniModel.generated`,
-        or ``{}`` when there is nothing to emit.  Modules must clear their
-        private caches inside this hook so artefacts do not linger across
-        later FSM spans or multi-turn turns.
-
-        Inference-only.  Default: ``{}`` (no-op).
-        """
-        return {}
-
     # ── Parallelism / assets ──────────────────────────────────────────────────
 
     def get_parallel_plan(self) -> Optional[Any]:
@@ -315,4 +225,67 @@ class OmniModule:
         return {}
 
 
-__all__ = ["OmniModule"]
+class InferModuleMixin:
+    """Inference-side mixin for SeedOmni V2 modules.
+
+    Provides FSM step defaults and asset-aware ``from_pretrained`` logic.
+    """
+
+    processor_class: Optional[Type[Any]] = None
+    tokenizer_class: Optional[Type[Any]] = None
+
+    def generate_step(self, **kwargs: Any) -> Dict[str, Any]:
+        """Single FSM-driven generation step.
+
+        Default: delegate to :meth:`forward`.  Override when inference logic
+        differs from training — e.g. a DiT runs its denoising loop here, an
+        LM head samples a token here.
+        """
+        return self.forward(**kwargs)
+
+    def reset_local_inference_state(self) -> None:
+        """Reset per-turn state inside an ongoing conversation.
+
+        Local reset is used when starting a new user query while keeping
+        conversation-level state (e.g. BOS/session flags) intact.
+        """
+        return None
+
+    def reset_global_inference_state(self) -> None:
+        """Reset the full conversation-level inference state.
+
+        Global reset starts a fresh conversation from BOS; default delegates
+        to local reset for modules without extra global state.
+        """
+        self.reset_local_inference_state()
+
+    @classmethod
+    def from_pretrained(cls, pretrained_model_name_or_path: Any, *args: Any, **kwargs: Any):
+        """Load weights, then auto-load the per-module processor / tokenizer if declared."""
+        # Lazy import to avoid an import cycle (``veomni.models.auto`` pulls in
+        # the loader / ops stack at import time, while this module is imported
+        # while that stack is still initialising).
+        from ..auto import build_processor, build_tokenizer
+
+        model = super().from_pretrained(pretrained_model_name_or_path, *args, **kwargs)
+        if cls.processor_class is not None:
+            try:
+                model._processor = build_processor(pretrained_model_name_or_path)
+            except Exception:
+                # Best-effort: defer the "missing processor" error to ``generate``
+                # where the message can reference the actual call site.
+                model._processor = None
+        if cls.tokenizer_class is not None:
+            try:
+                model._tokenizer = build_tokenizer(pretrained_model_name_or_path)
+            except Exception:
+                model._tokenizer = None
+        return model
+
+    def finalize(self, *, ctx: Dict[str, Any]) -> Dict[str, Any]:
+        """Flush module-private generation buffers into a one-shot ``generated`` payload."""
+        del ctx
+        return {}
+
+
+__all__ = ["TrainModuleMixin", "InferModuleMixin"]

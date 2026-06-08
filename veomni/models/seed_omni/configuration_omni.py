@@ -118,8 +118,6 @@ class OmniConfig(PretrainedConfig):
 
         super().__init__(**kwargs)
 
-    # ── Accessors ─────────────────────────────────────────────────────────────
-
     def module_config(self, name: str) -> VeOmniArguments:
         """Return the raw config dict for a module by name (deep-copied)."""
         cfg = self.modules.get(name, None)
@@ -138,8 +136,6 @@ class OmniConfig(PretrainedConfig):
 
     def has_generation_graph(self) -> bool:
         return self.generation_graph is not None
-
-    # ── Factory: load from YAML dict ──────────────────────────────────────────
 
     @classmethod
     def from_dict(cls, config_dict: Dict, **kwargs) -> "OmniConfig":

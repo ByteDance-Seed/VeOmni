@@ -22,12 +22,12 @@
 #      ``model_type → class`` lazily at runtime.
 #   3. Per-module checkpoint callback for the trainer's save lifecycle.
 from .checkpoint_callback import OmniModuleCheckpointCallback
-from .configuration_seed_omni import OmniConfig
+from .configuration_omni import OmniConfig
 from .conversation import build_conversation
 from .generation_graph import GenerationGraph
 from .graph import END, EdgeDef, NodeDef
 from .modeling_omni import OmniModel
-from .module import OmniModule
+from .module import InferModuleMixin, TrainModuleMixin
 from .modules import (
     OMNI_CONFIG_REGISTRY,
     OMNI_MODEL_REGISTRY,
@@ -41,7 +41,8 @@ __all__ = [
     # Core
     "OmniConfig",
     "OmniModel",
-    "OmniModule",
+    "TrainModuleMixin",
+    "InferModuleMixin",
     "TrainingGraph",
     "GenerationGraph",
     "NodeDef",

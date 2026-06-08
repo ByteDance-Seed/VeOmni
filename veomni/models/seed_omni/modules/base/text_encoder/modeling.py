@@ -59,11 +59,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers import PreTrainedModel
 
-from ....module import OmniModule
+from ....module import InferModuleMixin, TrainModuleMixin
 from .configuration import TextEncoderConfig
 
 
-class TextEncoder(OmniModule, PreTrainedModel):
+class TextEncoder(TrainModuleMixin, InferModuleMixin, PreTrainedModel):
     """Word-token embedding + LM head as a single OmniModule.
 
     Multi-inherits :class:`OmniModule` (V2 mixin) and HuggingFace

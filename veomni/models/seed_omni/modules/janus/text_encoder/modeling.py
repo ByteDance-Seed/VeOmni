@@ -145,7 +145,7 @@ class JanusTextEncoder(TextEncoder):
         self._conversation_carrier: Any = None
         self._encode_batch_shape: torch.LongTensor | None = None
 
-    def reset_inference_state(self) -> None:
+    def reset_local_inference_state(self) -> None:
         """Get a new request in the current conversation."""
         self._text_token_cache.clear()
 

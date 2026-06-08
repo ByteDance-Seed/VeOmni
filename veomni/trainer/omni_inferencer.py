@@ -41,7 +41,7 @@ from .omni_trainer import OmniModelArguments, OmniModuleTrainer, OmniTrainer
 
 
 if TYPE_CHECKING:
-    from ..models.seed_omni.configuration_seed_omni import OmniConfig
+    from ..models.seed_omni.configuration_omni import OmniConfig
 
 
 logger = helper.create_logger(__name__)
@@ -130,7 +130,7 @@ class OmniInferModelArguments(OmniModelArguments):
     )
 
     def load_omni_config(self, global_args: VeOmniArguments) -> OmniConfig:
-        from ..models.seed_omni.configuration_seed_omni import OmniConfig
+        from ..models.seed_omni.configuration_omni import OmniConfig
 
         infer_map = self.omni_infer_yaml_path
         selected = self.omni_infer_type
@@ -360,8 +360,10 @@ class OmniInferencer(OmniTrainer):
     @torch.inference_mode()
     def _run(self, req: InferenceRequest) -> dict[str, Any]:
         for module in self.modules.values():
-            if hasattr(module, "reset_inference_state"):
-                module.reset_inference_state()
+            if hasattr(module, "reset_global_inference_state"):
+                module.reset_global_inference_state()
+            elif hasattr(module, "reset_local_inference_state"):
+                module.reset_local_inference_state()
 
         conversation = build_conversation(prompt=req.prompt, images=req.images)
         request_dict: dict[str, Any] = {

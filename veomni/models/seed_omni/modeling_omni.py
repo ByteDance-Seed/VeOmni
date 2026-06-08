@@ -86,9 +86,9 @@ import torch
 import torch.nn as nn
 
 from ...utils import helper
-from .configuration_seed_omni import OmniConfig
+from .configuration_omni import OmniConfig
 from .generation_graph import GenerationGraph
-from .module import OmniModule
+from .module import InferModuleMixin, TrainModuleMixin
 from .training_graph import TrainingGraph
 
 
@@ -260,7 +260,7 @@ class OmniModel(nn.Module):
             raw_module = _unwrap_module(module)
 
             kwargs = self.training_graph.collect_inputs(node_name, node_outputs, batch)
-            kwargs = raw_module.pre_forward(method=method, **kwargs) if isinstance(raw_module, OmniModule) else kwargs
+            kwargs = raw_module.pre_forward(method=method, **kwargs) if _is_omni_module(raw_module) else kwargs
 
             if method == "forward":
                 # Through the FSDP wrapper so unshard + backward hooks fire.
@@ -287,7 +287,7 @@ class OmniModel(nn.Module):
                 finally:
                     raw_module.forward = orig_forward
 
-            if isinstance(raw_module, OmniModule):
+            if _is_omni_module(raw_module):
                 out = raw_module.post_forward(method=method, **out)
 
             node_outputs[node_name] = out
@@ -469,12 +469,12 @@ class OmniModel(nn.Module):
 
     # ── Utilities ─────────────────────────────────────────────────────────────
 
-    def named_omni_modules(self) -> Iterator[Tuple[str, OmniModule]]:
+    def named_omni_modules(self) -> Iterator[Tuple[str, nn.Module]]:
         """Yield ``(name, raw_module)`` for every entry whose unwrapped form
         is an :class:`OmniModule` mixin instance."""
         for name in self._module_names:
             raw = _unwrap_module(getattr(self, name))
-            if isinstance(raw, OmniModule):
+            if _is_omni_module(raw):
                 yield name, raw  # type: ignore[misc]
 
     def get_module(self, name: str) -> nn.Module:
@@ -508,6 +508,10 @@ def _unwrap_module(mod: nn.Module) -> nn.Module:
         # DDP-style wrapper.
         return inner
     return mod
+
+
+def _is_omni_module(mod: nn.Module) -> bool:
+    return isinstance(mod, (TrainModuleMixin, InferModuleMixin))
 
 
 def _sum_losses(losses: Mapping[str, torch.Tensor]) -> Optional[torch.Tensor]:

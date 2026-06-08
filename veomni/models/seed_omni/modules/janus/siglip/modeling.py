@@ -27,12 +27,12 @@ from ....conversation import (
     collect_desired_values,
     iter_desired_items,
 )
-from ....module import OmniModule
+from ....module import InferModuleMixin, TrainModuleMixin
 from .configuration import JanusSiglipConfig
 from .processing import JanusSiglipProcessor
 
 
-class JanusSiglip(OmniModule, PreTrainedModel):
+class JanusSiglip(TrainModuleMixin, InferModuleMixin, PreTrainedModel):
     """SigLIP vision tower + MLP aligner for image understanding.
 
     Composes HF :class:`JanusVisionModel` + :class:`JanusVisionAlignerMLP`

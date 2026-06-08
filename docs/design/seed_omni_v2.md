@@ -13,7 +13,8 @@ SeedOmni V2 is a **model-agnostic runtime** for multi-modal models. The
 framework (`OmniModel`) knows *nothing* about Janus, vision towers, VQ codecs,
 or boundary tokens. It only knows how to:
 
-1. Build a set of independent sub-models (each an `OmniModule`).
+1. Build a set of independent sub-models (each combines train/infer mixins with
+   a real HF model class).
 2. Walk a **graph** declared in YAML, calling one sub-model per node.
 3. Pass a single shared data object — the **conversation list** — through
    those calls, and sum up a single `_loss` per node during training.
@@ -40,24 +41,27 @@ flowchart LR
 
 ## 2. The four building blocks
 
-### 2.1 `OmniModule` — the module mixin (`module.py`)
+### 2.1 Train/Infer mixins (`module.py`)
 
-Every sub-model multi-inherits from `OmniModule` **and** a real HuggingFace /
-diffusers model:
+Every sub-model multi-inherits from `TrainModuleMixin` +
+`InferModuleMixin` **and** a real HuggingFace / diffusers model:
 
 ```python
-class JanusSiglip(OmniModule, SiglipVisionModel): ...
-class JanusLlama(OmniModule, PreTrainedModel): ...
+class JanusSiglip(TrainModuleMixin, InferModuleMixin, SiglipVisionModel): ...
+class JanusLlama(TrainModuleMixin, InferModuleMixin, PreTrainedModel): ...
 ```
 
-`OmniModule` has **zero required overrides** — only optional hooks, each with a
-safe default:
+`module.py` still exports `OmniModule` as a compatibility alias
+(`OmniModule = TrainModuleMixin + InferModuleMixin`), but new modules should
+prefer explicit dual-mixin inheritance.
+
+The mixins expose **optional hooks** with safe defaults:
 
 | Hook | When | Purpose |
 |------|------|---------|
 | `forward(**kwargs)` | training | the node's main compute; may return one `_loss` |
-| `pre_forward(method, **kwargs)` | both | prep inputs (read from conversation list) |
-| `post_forward(method, **outputs)` | both | write results back onto conversation list |
+| `pre_forward(method, **kwargs)` | training | prep inputs (read from conversation list) |
+| `post_forward(method, **outputs)` | training | write results back onto conversation list |
 | `generate(...)` / `generate_step` | inference | one FSM step (sample / embed) |
 | `finalize(*, ctx)` | inference | flush buffered output if `max_new_tokens` hit |
 | `freeze_model()` | build | freeze a parameter subset |
@@ -248,11 +252,15 @@ Use the `/seedomni-v2` skill for the full checklist. The shape of the work:
 2. **Write each module triplet** under
    `veomni/models/seed_omni/modules/<family>/<sub>/`:
    - `configuration.py` — a `PretrainedConfig` with a unique `model_type`.
-   - `modeling.py` — `class X(OmniModule, <HFBase>)`; implement the hooks you
-     need (at minimum `forward` for a training node, `pre_forward` /
-     `post_forward` to read/write the conversation list, `generate` for an
-     inference node).
+   - `modeling.py` — `class X(TrainModuleMixin, InferModuleMixin, <HFBase>)`;
+     implement the hooks you need (at minimum `forward` for a training node,
+     `pre_forward` / `post_forward` to read/write the conversation list,
+     `generate` for an inference node).
    - `processing.py` (optional) — if the module consumes raw images / audio.
+   - `modulemixin.py` (optional, recommended for large modules) — put
+     module-specific `XTrainModuleMixin` / `XInferModuleMixin` here, and keep
+     `modeling.py` focused on model structure/init. `janus/vqvae` is the
+     reference pattern.
 
    Reuse cross-family helpers in `modules/base/` where possible.
 
@@ -288,15 +296,15 @@ Use the `/seedomni-v2` skill for the full checklist. The shape of the work:
 
 | Path | Responsibility |
 |------|----------------|
-| `module.py` | `OmniModule` mixin + optional hooks |
+| `module.py` | generic `TrainModuleMixin` / `InferModuleMixin` + compatibility `OmniModule` |
 | `conversation.py` | `ConversationItem` + carrier helpers |
 | `graph.py` | shared `NodeDef` / `EdgeDef` / `END` |
 | `training_graph.py` | DAG view (topological forward order) |
 | `generation_graph.py` | FSM view (states / transitions / signals) |
-| `configuration_seed_omni.py` | parse + merge the YAML into `OmniConfig` |
+| `configuration_omni.py` | parse + merge the YAML into `OmniConfig` |
 | `modeling_omni.py` | `OmniModel` runtime (train DAG + infer FSM + loss sum) |
 | `checkpoint_callback.py` | per-module checkpoint layout |
-| `modules/<family>/<sub>/` | per-module config / modeling / processing |
+| `modules/<family>/<sub>/` | per-module config / modeling / processing (optional `modulemixin.py`) |
 | `veomni/trainer/omni_trainer.py` | build + FSDP-wrap modules, drive the loop |
 | `veomni/trainer/omni_inferencer.py` | request loop, `reset` + `finalize` |
 | `configs/seed_omni/<model>/` | `train.yaml` + `infer_*.yaml` |
