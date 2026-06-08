@@ -139,17 +139,36 @@ tests can exercise the FSM without GPUs.
 from typing import Any, Dict, List, Optional, Type
 
 
-class TrainModuleMixin:
-    """Training-side mixin for SeedOmni V2 modules.
+class ModuleMixin:
+    """Unified SeedOmni V2 mixin for both training and inference hooks."""
 
-    Multi-inherit alongside the real HF / diffusers backbone class::
+    processor_class: Optional[Type[Any]] = None
+    tokenizer_class: Optional[Type[Any]] = None
 
-        class VeOmniModule(TrainModuleMixin, InferModuleMixin, HFModel):
-            ...
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        """Route construction through the HF base, then init omni state.
 
-    Only training hooks live here: ``pre_forward`` / ``forward`` /
-    ``post_forward`` / ``dummy_inputs`` plus parallel-plan/assets helpers.
-    """
+        ``ModuleMixin`` sits *before* the co-inherited ``PreTrainedModel`` in
+        the MRO, so a concrete module's ``super().__init__(config)`` lands
+        here first.  We forward to ``PreTrainedModel.__init__`` (which sets up
+        ``self.config`` and the ``nn.Module`` machinery) and then run
+        :meth:`init_omni_state`, so subclasses never need a separate
+        ``init_omni_state()`` call — just ``super().__init__(config)`` and the
+        standard HuggingFace ``self.post_init()`` after building submodules.
+        """
+        super().__init__(*args, **kwargs)
+        self.init_omni_state()
+
+    def init_omni_state(self) -> None:
+        """Initialize per-module runtime state (training/inference caches).
+
+        Override this on a module mixin to set up instance attributes such as
+        ``self._conversation_carrier`` / KV caches / sampling buffers.  It is
+        invoked automatically by :meth:`__init__`.  This is a **leaf hook**:
+        do *not* call ``super().init_omni_state()`` unless a parent mixin
+        (e.g. the base text encoder) defines extra shared state worth chaining.
+        """
+        return None
 
     # ── Training hooks ────────────────────────────────────────────────────────
 
@@ -157,7 +176,7 @@ class TrainModuleMixin:
         """Pre-process inputs before the graph node's call-site method.
 
         ``method`` names the entry point configured on the active node
-        (``"forward"``, ``"encode"``, ``"decode"``, …).  Override to route
+        (``"forward"``, ``"encode"``, ``"decode"``, ...).  Override to route
         packing / SP slice / conversation extraction per call site.
 
         Default: identity pass-through.
@@ -167,21 +186,12 @@ class TrainModuleMixin:
     def forward(self, **kwargs: Any) -> Dict[str, Any]:  # type: ignore[override]
         """Training forward pass.
 
-        Override to provide module-specific behaviour.  The default raises —
-        any module that participates in the *training* graph must implement
-        this.  Inference-only modules may override only :meth:`generate_step`
-        and leave ``forward`` un-implemented.
-
-        Returns
-        -------
-        dict
-            Arbitrary keys consumed by downstream edges.  May contain at
-            most one ``_loss`` scalar (token-mean reduced across all
-            micro-batches consumed in this call).
+        Override to provide module-specific behaviour. The default raises:
+        every module that participates in the training graph must implement it.
         """
         raise NotImplementedError(
             f"{type(self).__name__}.forward(**kwargs) is not implemented. "
-            "Override it on the OmniModule mixin if this module appears in the training graph."
+            "Override it on the module mixin if this module appears in the training graph."
         )
 
     def post_forward(self, method: str, **outputs: Any) -> Dict[str, Any]:
@@ -191,48 +201,20 @@ class TrainModuleMixin:
         """
         return outputs
 
-    # ── Parallelism / assets ──────────────────────────────────────────────────
-
     def get_parallel_plan(self) -> Optional[Any]:
         """Return a per-module VeOmni parallel plan, or ``None`` for default."""
         return None
 
     def get_assets(self) -> List[Any]:
-        """Module-owned auxiliary artefacts to save alongside the weights.
-
-        Vision / audio processors, tokenizers, codebooks, etc.  Default: ``[]``.
-        """
+        """Module-owned auxiliary artefacts to save alongside the weights."""
         return []
 
     def dummy_inputs(self, *, batch_size: int, device: Any, dtype: Any) -> Dict[str, Any]:
-        """Zero-tensor placeholders for training-side dummy forward.
-
-        Called by :class:`~veomni.trainer.omni_trainer.OmniTrainer` when a
-        micro-batch is missing one of this module's required inputs.
-        Override to return zero tensors with the **right shape** so the
-        full forward path runs and FSDP DP/SP graphs stay aligned across
-        ranks (see module-doc "Training vs. inference no input
-        semantics").
-
-        Inference runners do NOT call this; they let the model
-        ``return {}`` and rely on permissive edge routing.
-
-        Default: ``{}`` (no dummies — appropriate for modules whose
-        inputs always come from upstream nodes inside the graph; the
-        upstream node's own ``dummy_inputs`` populates the kwargs that
-        eventually reach this module).
-        """
+        """Zero-tensor placeholders for training-side dummy forward."""
+        del batch_size, device, dtype
         return {}
 
-
-class InferModuleMixin:
-    """Inference-side mixin for SeedOmni V2 modules.
-
-    Provides FSM step defaults and asset-aware ``from_pretrained`` logic.
-    """
-
-    processor_class: Optional[Type[Any]] = None
-    tokenizer_class: Optional[Type[Any]] = None
+    # ── Inference hooks ───────────────────────────────────────────────────────
 
     def generate_step(self, **kwargs: Any) -> Dict[str, Any]:
         """Single FSM-driven generation step.
@@ -288,4 +270,4 @@ class InferModuleMixin:
         return {}
 
 
-__all__ = ["TrainModuleMixin", "InferModuleMixin"]
+__all__ = ["ModuleMixin"]

@@ -3,7 +3,6 @@ from typing import Any, Dict, List, Optional
 import torch
 import torch.nn.functional as F
 
-from ......distributed.parallel_state import get_parallel_state
 from ......utils import helper
 from ....conversation import (
     ConversationItem,
@@ -14,53 +13,26 @@ from ....conversation import (
     seal_outputs,
 )
 from ....generation_graph import FSM_SIGNAL_KEY
-from ....module import InferModuleMixin, TrainModuleMixin
+from ....module import ModuleMixin
 
 
 logger = helper.create_logger(__name__)
 
 
-class JanusVqvaeTrainModuleMixin(TrainModuleMixin):
-    def _encode_pixels(self, pixel_values: torch.Tensor) -> Dict[str, torch.Tensor]:
-        """``vqmodel.encode`` -> ``image_embeds`` + ``vq_token_ids``."""
-        with torch.no_grad() if self.config.freeze else torch.enable_grad():
-            vq_out = self.vqmodel.encode(pixel_values)
-        vq_token_ids = vq_out.image_tokens
-        image_embeds = self.generation_aligner(self.generation_embeddings(vq_token_ids))
-        if vq_token_ids.dim() == 1:
-            b = pixel_values.size(0)
-            vq_token_ids = vq_token_ids.reshape(b, -1)
-            image_embeds = image_embeds.reshape(b, vq_token_ids.size(1), image_embeds.size(-1))
-        return {"image_embeds": image_embeds, "vq_token_ids": vq_token_ids}
+class JanusVqvaeModuleMixin(ModuleMixin):
+    def init_omni_state(self) -> None:
+        # Training state
+        self._conversation_carrier: Any = None
 
-    def encode(self, pixel_values: Optional[torch.Tensor] = None) -> Dict[str, Any]:
-        """VQVAE encode: ``pixel_values`` -> ``image_embeds`` + ``vq_token_ids``."""
-        if pixel_values is None and get_parallel_state().fsdp_enabled:
-            dummy = self.dummy_inputs()
-            return {**self._encode_pixels(dummy["pixel_values"]), "is_dummy": True}
-        return self._encode_pixels(pixel_values)
+        # Inference state
+        self._vq_buffer: List[int] = []
 
-    def decode(
-        self,
-        hidden_states: Optional[torch.Tensor] = None,
-        labels: Optional[torch.Tensor] = None,
-        is_dummy: bool = False,
-        **kwargs: Any,
-    ) -> Dict[str, Any]:
-        """Training VQ CE head — ``hidden_states`` + ``labels`` -> ``loss``."""
-        del kwargs
-        if hidden_states is None or labels is None:
-            return {}
-        if is_dummy:
-            return {"loss": hidden_states.sum() * 0.0}
-        return {"loss": self._vq_loss(hidden_states, labels)}
-
+    # Training hooks
     def pre_forward(
         self,
         method: str,
         conversation_list: Optional[list[list[ConversationItem]]] = None,
     ) -> Dict[str, Any]:
-        """Stash ``conversation_list``; route by graph call-site ``method``."""
         self._conversation_carrier = conversation_list
         if method == "encode":
             pixel_values = self._pixels_from_raw_images(
@@ -78,7 +50,6 @@ class JanusVqvaeTrainModuleMixin(TrainModuleMixin):
         self,
         conversation_list: Optional[list[list[ConversationItem]]],
     ) -> tuple[torch.Tensor, torch.Tensor, bool]:
-        """Flat concat of VQ hidden rows + ``janus_vqvae_labels`` for CE."""
         hidden_chunks: list[torch.Tensor] = []
         label_chunks: list[torch.Tensor] = []
         dummy_data: bool = False
@@ -119,12 +90,7 @@ class JanusVqvaeTrainModuleMixin(TrainModuleMixin):
             and isinstance(part.meta.get("janus_vqvae_labels"), torch.Tensor)
         )
 
-    def post_forward(
-        self,
-        method: str,
-        **outputs: Any,
-    ) -> Dict[str, Any]:
-        """Write encode outputs onto the stashed ``conversation_list`` carrier."""
+    def post_forward(self, method: str, **outputs: Any) -> Dict[str, Any]:
         assert method in ["encode", "decode"]
         conversation = self._conversation_carrier
         self._conversation_carrier = None
@@ -165,32 +131,9 @@ class JanusVqvaeTrainModuleMixin(TrainModuleMixin):
             return outputs
         raise ValueError(f"JanusVqvae.post_forward: unsupported method {method!r}")
 
-    def _vq_loss(self, hidden_states: torch.Tensor, gt_token_ids: torch.Tensor) -> torch.Tensor:
-        """Token-mean VQ CE from ``hidden_states`` and padded ``gt_token_ids``."""
-        labels = gt_token_ids.to(hidden_states.device)
-        hidden_states = hidden_states[:, : labels.size(1)]
-        logits = self.generation_head(hidden_states)
-        v = logits.size(-1)
-
-        if not labels.ne(-100).any():
-            return logits[:, -1:, :].mean() * 0.0
-
-        shift_logits = logits[:, :-1, :].contiguous()
-        shift_labels = labels[:, 1:].contiguous()
-        ce_sum = F.cross_entropy(
-            shift_logits.reshape(-1, v),
-            shift_labels.reshape(-1),
-            ignore_index=-100,
-            reduction="sum",
-        )
-        n_valid = (shift_labels != -100).sum().clamp(min=1)
-        return ce_sum / n_valid
-
     def _pixels_from_raw_images(self, raw_images: list[Any]) -> Optional[torch.Tensor]:
-        """Raw images -> VQVAE-normalised ``(N, 3, H, W)``."""
         if not raw_images:
             return None
-
         if self._processor is None:
             raise RuntimeError(
                 "JanusVqvae: samples carry images but no image processor is loaded. "
@@ -200,7 +143,6 @@ class JanusVqvaeTrainModuleMixin(TrainModuleMixin):
         return processed.to(device=self.device, dtype=self.dtype)
 
     def dummy_inputs(self) -> Dict[str, Any]:
-        """Zero ``pixel_values`` for image-free micro-batches."""
         size = self._processor.size
         height = size.get("height")
         width = size.get("width")
@@ -209,15 +151,13 @@ class JanusVqvaeTrainModuleMixin(TrainModuleMixin):
             "pixel_values": torch.zeros(1, c, height, width, device=self.device, dtype=self.dtype),
         }
 
-
-class JanusVqvaeInferModuleMixin(InferModuleMixin):
+    # Inference hooks
     def generate(
         self,
         conversation_list: Optional[List[ConversationItem]] = None,
         generation_kwargs: Optional[Dict[str, Any]] = None,
         **kwargs: Any,
     ) -> Dict[str, Any]:
-        """VQ AR step: lm_head -> sample -> embed -> merge ``output`` rows."""
         del kwargs
         tail_part = conversation_list[-1]
         hidden_states: torch.Tensor = tail_part.value
@@ -262,7 +202,6 @@ class JanusVqvaeInferModuleMixin(InferModuleMixin):
         return outputs
 
     def _emit_buffered_image(self) -> Optional[Dict[str, Any]]:
-        """Decode a full VQ grid from ``_vq_buffer`` and clear it."""
         token_ids = torch.tensor([self._vq_buffer], dtype=torch.long, device=self.device)
         self._vq_buffer.clear()
         with torch.inference_mode():
@@ -276,11 +215,9 @@ class JanusVqvaeInferModuleMixin(InferModuleMixin):
         return {"type": "image", "value": image_pil}
 
     def reset_local_inference_state(self) -> None:
-        """Wipe per-request buffers — called by :class:`OmniInferencer` between runs."""
         self._vq_buffer.clear()
 
     def finalize(self, *, ctx: Dict[str, Any]) -> Dict[str, Any]:
-        """Flush or discard the VQ token buffer based on its fill level."""
         del ctx
         target = self._processor.num_image_tokens
         n = len(self._vq_buffer)
@@ -322,7 +259,6 @@ class JanusVqvaeInferModuleMixin(InferModuleMixin):
         top_p: float = 1.0,
         do_sample: bool = True,
     ) -> torch.Tensor:
-        """Sample one VQ token id per row from ``(B, vocab)`` logits."""
         if not do_sample:
             return logits.argmax(dim=-1)
         if temperature != 1.0:
@@ -338,4 +274,4 @@ class JanusVqvaeInferModuleMixin(InferModuleMixin):
         return torch.multinomial(probs, num_samples=1).squeeze(-1)
 
 
-__all__ = ["JanusVqvaeTrainModuleMixin", "JanusVqvaeInferModuleMixin"]
+__all__ = ["JanusVqvaeModuleMixin"]

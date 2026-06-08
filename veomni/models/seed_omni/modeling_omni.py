@@ -88,7 +88,7 @@ import torch.nn as nn
 from ...utils import helper
 from .configuration_omni import OmniConfig
 from .generation_graph import GenerationGraph
-from .module import InferModuleMixin, TrainModuleMixin
+from .module import ModuleMixin
 from .training_graph import TrainingGraph
 
 
@@ -511,7 +511,7 @@ def _unwrap_module(mod: nn.Module) -> nn.Module:
 
 
 def _is_omni_module(mod: nn.Module) -> bool:
-    return isinstance(mod, (TrainModuleMixin, InferModuleMixin))
+    return isinstance(mod, ModuleMixin)
 
 
 def _sum_losses(losses: Mapping[str, torch.Tensor]) -> Optional[torch.Tensor]:

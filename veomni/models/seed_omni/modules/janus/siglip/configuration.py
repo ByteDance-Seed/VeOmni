@@ -11,6 +11,7 @@ the ``scripts/split_janus.py`` extractor can dump the field unchanged.
 from typing import Any, Dict, Optional
 
 from transformers import PretrainedConfig
+from transformers.models.janus.configuration_janus import JanusVisionConfig
 
 
 class JanusSiglipConfig(PretrainedConfig):
@@ -23,5 +24,5 @@ class JanusSiglipConfig(PretrainedConfig):
         vision_config: Optional[Dict[str, Any]] = None,
         **kwargs,
     ):
-        self.vision_config = vision_config or {}
+        self.vision_config = JanusVisionConfig(**vision_config) if vision_config else JanusVisionConfig()
         super().__init__(**kwargs)
