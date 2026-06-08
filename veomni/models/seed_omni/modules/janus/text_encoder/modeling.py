@@ -55,7 +55,6 @@ from veomni.utils.tensor_utils import naflatten, unflatten
 from ....conversation import (
     ConversationItem,
     is_dummy,
-    item_role,
     maybe_merge_outputs,
     seal_outputs,
 )
@@ -254,12 +253,7 @@ class JanusTextEncoder(TextEncoder):
         """Merge adjacent ``type='text'`` rows with the same role (concat ids, labels, mask)."""
         merged: list[ConversationItem] = []
         for part in parts:
-            if (
-                merged
-                and merged[-1].type == "text"
-                and part.type == "text"
-                and item_role(merged[-1]) == item_role(part)
-            ):
+            if merged and merged[-1].type == "text" and part.type == "text" and merged[-1].role == part.role:
                 prev = merged[-1]
                 prev.value = torch.cat([prev.value, part.value])
                 prev.meta["labels"] = torch.cat([prev.meta["labels"], part.meta["labels"]])

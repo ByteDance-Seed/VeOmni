@@ -42,7 +42,7 @@ from torch.utils.data import DataLoader
 from veomni.data.data_collator import MakeMicroBatchCollator, SeedOmniCollator
 from veomni.data.dataset import MappingDataset
 from veomni.data.multimodal.seedomni_transform import process_seedomni_example
-from veomni.models.seed_omni.conversation import ConversationItem, item_role
+from veomni.models.seed_omni.conversation import ConversationItem
 
 
 # ─────────────────────────── unit: SeedOmniCollator ───────────────────────────
@@ -67,9 +67,9 @@ def test_collator_happy_path_two_samples():
     # Each entry is the per-sample list of ConversationItem
     assert isinstance(out["conversation_list"][0][0], ConversationItem)
     assert out["conversation_list"][0][0].value == "a"
-    assert item_role(out["conversation_list"][0][0]) == "user"
+    assert out["conversation_list"][0][0].role == "user"
     assert out["conversation_list"][1][0].value == "b"
-    assert item_role(out["conversation_list"][1][0]) == "assistant"
+    assert out["conversation_list"][1][0].role == "assistant"
 
 
 def test_collator_passes_through_extra_keys():

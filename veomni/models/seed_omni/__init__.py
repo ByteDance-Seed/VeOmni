@@ -23,7 +23,7 @@
 #   3. Per-module checkpoint callback for the trainer's save lifecycle.
 from .checkpoint_callback import OmniModuleCheckpointCallback
 from .configuration_seed_omni import OmniConfig
-from .conversation import ConversationPart, build_conversation
+from .conversation import build_conversation
 from .generation_graph import GenerationGraph
 from .graph import END, EdgeDef, NodeDef
 from .modeling_omni import OmniModel
@@ -47,8 +47,6 @@ __all__ = [
     "NodeDef",
     "EdgeDef",
     "END",
-    # Inference data structure
-    "ConversationPart",
     "build_conversation",
     # Module registry
     "OMNI_CONFIG_REGISTRY",

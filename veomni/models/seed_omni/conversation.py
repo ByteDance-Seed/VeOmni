@@ -12,7 +12,6 @@ Item shape
 Each item is ``{type, value, role, meta}``:
 
 * ``type``  — ``"text"`` | ``"image"`` | ``"output"`` (and the legacy
-  ``"token"`` shape consumed by :func:`get_token_id`).
 * ``value`` — polymorphic: raw content (``str`` / PIL image / pixel tensor)
   before encoding, an ``(L, D)`` / ``(1, L, D)`` embedding tensor after.
 * ``role``  — ``"user"`` | ``"assistant"`` | ``"dummy"`` (``"dummy"`` rows are
@@ -35,13 +34,15 @@ Lifecycle
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Iterator
+from typing import Any, Iterator, Union
 
 import torch
+from PIL import Image
 
 
-ItemType = str  # "text" | "image" | "output" | "token"
-Role = str  # "user" | "assistant" | "dummy"
+ItemType = str  # "text" | "image" | "output"
+ItemRole = str  # "user" | "assistant" | "dummy"
+ItemValue = Union[str, torch.Tensor, Image.Image]
 
 
 @dataclass
@@ -49,115 +50,31 @@ class ConversationItem:
     """One element of a conversation list — ``{type, value, role, meta}``."""
 
     type: ItemType
-    value: Any = None
-    role: Role = "user"
+    value: ItemValue
+    role: ItemRole = "user"
+    source: str | None = None
     meta: dict = field(default_factory=dict)
 
+    def __value_repr__(self) -> str:
+        if isinstance(self.value, str):
+            return f"[str]{repr(self.value)}"
+        elif isinstance(self.value, torch.Tensor):
+            return f"[torch.Tensor]{tuple(self.value.shape)}"
+        elif isinstance(self.value, Image.Image):
+            return f"[PIL.Image]{self.value.size}"
+        else:
+            return f"[UnknownType]{type(self.value).__name__}"
 
-# Public alias kept for callers that import the older name.
-ConversationPart = ConversationItem
+    def __meta_repr__(self) -> str:
+        meta_items = [f"{key}={self.__value_repr__(value)}" for key, value in self.meta.items()]
+        return f"{{{','.join(meta_items)}}}"
 
-
-def item_role(item: ConversationItem) -> str:
-    """Return ``item.role``."""
-    return str(item.role)
+    def __repr__(self) -> str:
+        return f"ConversationItem(type={self.type}, value={self.__value_repr__()}, role={self.role}, source={self.source}, meta={self.__meta_repr__()}"
 
 
 def is_dummy(item: ConversationItem) -> bool:
-    return item_role(item) == "dummy"
-
-
-def _is_chw_image_tensor(value: torch.Tensor) -> bool:
-    """True for raw ``(C, H, W)`` pixels — not ``(1, P, D)`` SigLIP patch embeds."""
-    if value.dim() != 3:
-        return False
-    c, _h, w = (int(value.size(0)), int(value.size(1)), int(value.size(2)))
-    if c not in (1, 3):
-        return False
-    # SigLIP writes ``(1, num_patches, hidden)`` back onto the item — the last
-    # axis is the LLM hidden size (≫ any spatial extent), not image width.
-    if c == 1 and w > 512:
-        return False
-    return True
-
-
-def is_embedded(item: ConversationItem) -> bool:
-    """True when ``value`` holds an LLM-space embedding tensor."""
-    value = item.value
-    if not isinstance(value, torch.Tensor):
-        return False
-    if item.type in ("text", "output", "soi", "eoi"):
-        return value.dim() == 3
-    if item.type == "image":
-        if _is_chw_image_tensor(value):
-            return False
-        return value.dim() >= 2
-    if item.type == "token":
-        if isinstance(value, int):
-            return False
-        if value.numel() == 1:
-            return False
-        return value.dim() >= 2
-    return False
-
-
-def needs_embedding(item: ConversationItem) -> bool:
-    """True when an encoder still needs to fill ``value`` with an embed."""
-    if is_dummy(item) or is_embedded(item):
-        return False
-    if item.type == "text":
-        return bool(item.value)
-    if item.type == "token":
-        tid = get_token_id(item)
-        return tid is not None
-    return False
-
-
-def get_token_id(item: ConversationItem) -> int | None:
-    """Extract a scalar token id from a ``type="token"`` item."""
-    if item.type != "token":
-        return None
-    if "token_id" in item.meta:
-        return int(item.meta["token_id"])
-    value = item.value
-    if isinstance(value, int):
-        return value
-    if isinstance(value, torch.Tensor) and value.numel() == 1:
-        return int(value.reshape(-1)[0].item())
-    return None
-
-
-def get_llm_embed(item: ConversationItem) -> torch.Tensor | None:
-    """Return ``(B, T, D)`` embed for LLM consumption, or ``None``."""
-    if not is_embedded(item):
-        return None
-    value = item.value
-    assert isinstance(value, torch.Tensor)
-    if item.type == "image":
-        if value.dim() == 2:
-            return value.unsqueeze(0)
-        if value.dim() == 3:
-            return value
-    if item.type in ("text", "output", "soi", "eoi") and value.dim() == 3:
-        return value
-    if item.type == "token":
-        if value.dim() == 3:
-            return value
-        if value.dim() == 2:
-            return value.unsqueeze(1)
-    return None
-
-
-def collect_prompt_embeds(parts: list[ConversationItem]) -> list[torch.Tensor]:
-    """Embedded history for the backbone prompt pass — excludes active ``output`` items."""
-    chunks: list[torch.Tensor] = []
-    for part in parts:
-        if is_dummy(part) or part.type == "output":
-            continue
-        emb = get_llm_embed(part)
-        if emb is not None:
-            chunks.append(emb)
-    return chunks
+    return item.role == "dummy"
 
 
 def maybe_merge_outputs(parts: list[ConversationItem]) -> bool:
@@ -169,7 +86,7 @@ def maybe_merge_outputs(parts: list[ConversationItem]) -> bool:
         return False
     emb_a, emb_b = a.value, b.value
     emb_b = emb_b.to(device=emb_a.device, dtype=emb_a.dtype)
-    a.value = torch.cat([emb_a, emb_b], dim=0)
+    a.value = torch.cat([emb_a, emb_b], dim=-2)
     parts.pop()
     return True
 
@@ -193,114 +110,43 @@ def build_conversation(
     return parts
 
 
-def iter_type(parts: list[ConversationItem], item_type: ItemType) -> Iterator[ConversationItem]:
-    """Yield parts of a given ``type`` in declaration order."""
-    for part in parts:
-        if part.type == item_type:
-            yield part
-
-
-def unembedded_parts(parts: list[ConversationItem]) -> list[ConversationItem]:
-    """Parts that still need an encoder pass."""
-    return [p for p in parts if needs_embedding(p)]
-
-
-def latest_assistant_text_token_ids(parts: list[ConversationItem]) -> list[int]:
-    """Token ids from generated assistant ``text`` rows (``meta.generated=True``)."""
-    out: list[int] = []
-    for part in parts:
-        if part.type != "text" or item_role(part) != "assistant":
-            continue
-        if not part.meta.get("generated"):
-            continue
-        if part.meta.get("vq_token"):
-            continue
-        tid = part.meta.get("token_id")
-        if tid is not None:
-            out.append(int(tid))
-            continue
-        ids = part.meta.get("input_ids")
-        if isinstance(ids, torch.Tensor) and ids.numel() == 1:
-            out.append(int(ids.reshape(-1)[0].item()))
-    return out
-
-
 # ── Training batch helpers (unified with inference ConversationItem) ────────
 
 
-def iter_modality_items(
+def iter_desired_items(
     conversation_list: list[list[ConversationItem]],
-    types: list[str],
+    types: list[str] | None = None,
     roles: list[str] | None = None,
+    sources: list[str] | None = None,
 ) -> Iterator[ConversationItem]:
     """Yield matching items in micro-batch order (sample 0, then sample 1, …)."""
     for sample in conversation_list:
         for item in sample:
-            if item.type not in types:
+            if types is not None and item.type not in types:
                 continue
-            if roles is not None and item_role(item) not in roles:
+            if roles is not None and item.role not in roles:
+                continue
+            if sources is not None and item.source not in sources:
                 continue
             yield item
 
 
-def collect_modality_batch(
+def collect_desired_values(
     conversation_list: list[list[ConversationItem]],
-    types: list[str],
+    types: list[str] | None = None,
     roles: list[str] | None = None,
+    sources: list[str] | None = None,
 ) -> list[Any]:
     """Flat ``item.value`` list for matching items in micro-batch order."""
-    return [item.value for item in iter_modality_items(conversation_list, types, roles)]
-
-
-def _value_shape(value: Any) -> str:
-    if isinstance(value, torch.Tensor):
-        return str(tuple(value.shape))
-    if isinstance(value, str):
-        preview = value[:40] + "..." if len(value) > 40 else value
-        return f"str({len(value)}):{preview!r}"
-    if value is None:
-        return "None"
-    return type(value).__name__
-
-
-def summarize_conversation_batch(conversations: Any) -> str:
-    """One-line-per-item debug view: ``sample[i] type shape role=… dummy=…``."""
-    if not isinstance(conversations, list) or not conversations:
-        return "(empty conversation_list)"
-    lines: list[str] = []
-    for si, sample in enumerate(conversations):
-        if not isinstance(sample, list):
-            lines.append(f"  sample[{si}]: {type(sample).__name__}")
-            continue
-        lines.append(f"  sample[{si}] ({len(sample)} items):")
-        for j, item in enumerate(sample):
-            typ = str(item.type)
-            role = item_role(item)
-            dummy = is_dummy(item)
-            val = item.value
-            lines.append(f"    [{j}] type={typ!r} shape={_value_shape(val)} role={role!r} dummy={dummy}")
-    return "\n".join(lines)
+    return [item.value for item in iter_desired_items(conversation_list, types, roles, sources)]
 
 
 __all__ = [
     "ConversationItem",
-    "ConversationPart",
-    "ItemType",
-    "Role",
     "build_conversation",
-    "collect_prompt_embeds",
-    "item_role",
     "is_dummy",
-    "is_embedded",
     "maybe_merge_outputs",
-    "needs_embedding",
-    "get_token_id",
-    "get_llm_embed",
     "seal_outputs",
-    "iter_type",
-    "unembedded_parts",
-    "latest_assistant_text_token_ids",
-    "iter_modality_items",
-    "collect_modality_batch",
-    "summarize_conversation_batch",
+    "iter_desired_items",
+    "collect_desired_values",
 ]

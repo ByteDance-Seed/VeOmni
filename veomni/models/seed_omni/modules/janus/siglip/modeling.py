@@ -24,9 +24,8 @@ from transformers.models.janus.modeling_janus import JanusVisionAlignerMLP, Janu
 
 from ....conversation import (
     ConversationItem,
-    collect_modality_batch,
-    item_role,
-    iter_modality_items,
+    collect_desired_values,
+    iter_desired_items,
 )
 from ....module import OmniModule
 from .configuration import JanusSiglipConfig
@@ -87,7 +86,7 @@ class JanusSiglip(OmniModule, PreTrainedModel):
         assert method == "forward"
         self._conversation_carrier = conversation_list
         pixel_values = self._pixels_from_raw_images(
-            collect_modality_batch(conversation_list, ["image"], roles=["user"])
+            collect_desired_values(conversation_list, types=["image"], roles=["user"])
         )
         return {"pixel_values": pixel_values}
 
@@ -114,7 +113,7 @@ class JanusSiglip(OmniModule, PreTrainedModel):
                     )
                 )
         else:
-            items = list(iter_modality_items(conversation, ["image"], roles=["user"]))
+            items = list(iter_desired_items(conversation, types=["image"], roles=["user"]))
             for item, emb in zip(items, image_embeds, strict=True):
                 item.value = emb
         return {"conversation_list": conversation}
@@ -140,7 +139,7 @@ class JanusSiglip(OmniModule, PreTrainedModel):
             if part.type == "image_output"  # newly generated images
         ]
         if not pending:
-            pending = [part for part in conversation_list if part.type == "image" and item_role(part) == "user"]
+            pending = [part for part in conversation_list if part.type == "image" and part.role == "user"]
 
         if not pending:
             return {"conversation_list": conversation_list}

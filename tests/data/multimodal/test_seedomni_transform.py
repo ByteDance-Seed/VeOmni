@@ -39,7 +39,7 @@ from veomni.data.multimodal.seedomni_transform import (
     _pil_to_uint8_tensor,
     process_seedomni_example,
 )
-from veomni.models.seed_omni.conversation import ConversationItem, item_role
+from veomni.models.seed_omni.conversation import ConversationItem
 
 
 _TEST_IMAGE = Path(__file__).resolve().parents[1].parent / "testdata" / "qwen-vl-demo.jpeg"
@@ -57,7 +57,7 @@ def _check_item_schema(item: ConversationItem) -> None:
     """Data-layer items carry only ``type`` / ``value`` / ``role`` (empty ``meta``)."""
     assert isinstance(item, ConversationItem)
     assert item.meta == {}, f"unexpected meta at data boundary: {item.meta}"
-    assert item_role(item) in ("system", "user", "assistant")
+    assert item.role in ("user", "assistant")
 
 
 # ─────────────────────────── _pil_to_uint8_tensor ───────────────────────────
@@ -97,7 +97,7 @@ def test_build_conversation_list_text_only():
     assert len(items) == 2
     for it in items:
         _check_item_schema(it)
-    assert items[0].type == "text" and items[0].value == "hello" and item_role(items[0]) == "user"
+    assert items[0].type == "text" and items[0].value == "hello" and items[0].role == "user"
     assert items[1].type == "text" and items[1].value == "hi there" and items[1].role == "assistant"
 
 
@@ -113,7 +113,7 @@ def test_build_conversation_list_pairs_images_in_order():
 
     assert [it.type for it in items] == ["image", "text", "text", "image"]
     assert torch.equal(items[0].value, img1)
-    assert item_role(items[1]) == "user" and items[1].value == "describe"
+    assert items[1].role == "user" and items[1].value == "describe"
     assert items[2].role == "assistant"
     assert torch.equal(items[3].value, img2)
     assert items[3].role == "assistant"
@@ -176,7 +176,7 @@ def test_process_seedomni_example_with_real_image():
 
     conv_list = raw_batch_entry["conversation_list"]
     types = [it.type for it in conv_list]
-    roles = [item_role(it) for it in conv_list]
+    roles = [it.role for it in conv_list]
     assert "image" in types, "image turn was lost"
     assert "assistant" in roles
     for it in conv_list:
@@ -204,8 +204,8 @@ def test_process_seedomni_example_text_only():
     conv_list = out[0]["conversation_list"]
 
     assert len(conv_list) == 2
-    assert conv_list[0].value == "What is 2 + 2?" and item_role(conv_list[0]) == "user"
-    assert conv_list[1].value == "4" and item_role(conv_list[1]) == "assistant"
+    assert conv_list[0].value == "What is 2 + 2?" and conv_list[0].role == "user"
+    assert conv_list[1].value == "4" and conv_list[1].role == "assistant"
     assert conv_list[1].role == "assistant"
 
 

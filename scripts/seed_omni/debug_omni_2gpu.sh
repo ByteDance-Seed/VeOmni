@@ -1,86 +1,117 @@
 #!/bin/bash
-# Minimal 2-GPU launcher for stepping through OmniModel V2 training with ipdb.
-# (FSDP2 + sharded meta-init needs a real >1-rank device mesh, so this runs 2 ranks.)
+# Step through Janus training one graph node at a time — inspect conversation_list
+# in ipdb (rank 0 only).
 #
-# Why this exists (vs. train.sh):
-#   - train.sh pipes through `| tee log.txt`, so stdout is NOT a TTY and
-#     interactive ipdb/pdb prompts break (no readline, no prompt flush).
-#   - This script runs 2 ranks (nproc=2, required for FSDP2 meta-init) with
-#     stdio inherited from your terminal, so `breakpoint()` / `ipdb.set_trace()`
-#     attach. See the rank-guard note below to debug a single process cleanly.
+# Breakpoints live in each Janus module entry (siglip / vqvae / text_encoder /
+# llama) via conversation.ipdb_conversation_break().  They fire when
+# VEOMNI_DEBUG_CONV_IPDB=1.
 #
 # Usage:
-#   1. Drop a breakpoint anywhere in the code you want to inspect, e.g.
-#        breakpoint()                      # uses ipdb via PYTHONBREAKPOINT below
-#      or explicitly:
-#        import ipdb; ipdb.set_trace()
-#   2. Run:
-#        bash scripts/seed_omni/debug_omni_2gpu.sh
-#   3. Step with ipdb (n / s / c / p <expr> / w / l ...).
+#   bash scripts/seed_omni/debug_conversation_ipdb.sh [understanding|t2i|mixed|all]
 #
-# Notes:
-#   - DP=2 (two ranks): FSDP2 + meta-init shards parameters across a real device
-#     mesh, so a single rank can't materialise the model — we need >1 GPU.
-#   - micro_batch_size=1, global_batch_size=2  → with dp_size=2 that's exactly
-#     ONE micro-batch per rank, grad-accum = 1. Easiest flow to follow.
-#   - ipdb with 2 ranks: both processes share this terminal, so prompts/stdout
-#     from rank 0 and rank 1 interleave. Guard breakpoints by rank to debug one
-#     process cleanly, e.g.:
-#         import torch.distributed as dist
-#         if not dist.is_initialized() or dist.get_rank() == 0:
-#             breakpoint()
-#   - gradient_checkpointing is DISABLED — GC re-runs the forward under
-#     torch.utils.checkpoint, which double-executes module code and makes
-#     stepping very confusing. Re-enable only when you specifically debug GC.
-#   - dataloader.num_workers=1: the seedomni transform runs in a *worker*
-#     process, so breakpoints inside the transform will NOT attach. Module
-#     forward/pre_forward/encode/decode run in THIS (main) process, so model
-#     breakpoints work. To also step the transform, set num_workers=0 — but
-#     note PyTorch forbids prefetch_factor with 0 workers, so you'd also need
-#     to patch veomni/data/data_loader.py to drop prefetch_factor in that case.
+# Dataset modes (see make_janus_omni_demo.py --dataset_mode):
+#   understanding — pure I2T (user image + question → assistant text)
+#   t2i           — pure T2I (user prompt → assistant image)
+#   mixed         — interleave UG (user text+image+text, assistant image+text)
+#   all           — all three row kinds (default: mixed for compact ipdb)
+#
+# Requirements:
+#   - 2 GPUs (FSDP2 meta-init needs >1 rank in this repo)
+#   - TTY attached (do NOT pipe through tee — breaks ipdb readline)
+#   - pip install ipdb  (usually already in dev extras)
+#
+# Expected breakpoint order (one training step, Janus train.yaml):
+#   janus_siglip.pre_forward → janus_siglip.post_forward
+#   janus_vqvae.pre_forward (encode) → janus_vqvae.encode → janus_vqvae.post_forward
+#   janus_text_encoder.pre_forward → janus_text_encoder.encode
+#   janus_llama.pre_forward → janus_llama.forward
+#   janus_text_encoder.decode
+#   janus_vqvae.pre_forward (decode) → janus_vqvae.decode
 
 set -o pipefail
+
+DATASET_MODE="${DATASET_MODE:-}"
+if [[ $# -gt 0 && "$1" =~ ^(understanding|t2i|mixed|all)$ ]]; then
+  DATASET_MODE="$1"
+  shift
+fi
+DATASET_MODE="${DATASET_MODE:-mixed}"
 
 cd "$(dirname "$0")/../.." || exit 1
 REPO_ROOT="$(pwd)"
 
-# --- environment -----------------------------------------------------------
-# Activate venv (try the in-repo .venv first, then the known /app path).
-if [[ -f "${REPO_ROOT}/.venv/bin/activate" ]]; then
-  source "${REPO_ROOT}/.venv/bin/activate"
-elif [[ -f /app/VeOmni/submodules/Open-VeOmni/.venv/bin/activate ]]; then
-  source /app/VeOmni/submodules/Open-VeOmni/.venv/bin/activate
+# Activate a venv only when none is active.  Do not override the user's
+# ``(veomni)`` shell — a bare repo ``.venv`` may lack pyarrow / gpu extras.
+if [[ -z "${VIRTUAL_ENV:-}" ]]; then
+  _pick_venv() {
+    local activate_path="$1"
+    if [[ -f "${activate_path}" ]]; then
+      # shellcheck source=/dev/null
+      source "${activate_path}"
+      return 0
+    fi
+    return 1
+  }
+  if _pick_venv "${REPO_ROOT}/.venv/bin/activate"; then
+    :
+  elif _pick_venv "/app/VeOmni/submodules/Open-VeOmni/.venv/bin/activate"; then
+    :
+  else
+    echo "[debug_conversation_ipdb] warning: no venv found; using PATH python: $(command -v python || echo missing)" >&2
+  fi
 fi
 
-# Clear any torch-elastic / rank env inherited from a previous multi-proc run.
-# Otherwise torchrun (or the arg parser) can pick up a stale WORLD_SIZE / nproc
-# and spawn rank 1 onto cuda:1 — which fails with "invalid device ordinal" when
-# only one GPU is exposed below.
+if ! python -c "import pyarrow" 2>/dev/null; then
+  echo "[debug_conversation_ipdb] ERROR: pyarrow is not installed in the active Python:" >&2
+  python -c "import sys; print('  ', sys.executable)" 2>/dev/null || true
+  echo "[debug_conversation_ipdb] Install into this venv, e.g.:" >&2
+  echo "  uv pip install pyarrow" >&2
+  echo "Or activate the full VeOmni env first:" >&2
+  echo "  source /app/VeOmni/submodules/Open-VeOmni/.venv/bin/activate" >&2
+  exit 1
+fi
+
 unset WORLD_SIZE RANK LOCAL_RANK LOCAL_WORLD_SIZE GROUP_RANK ROLE_RANK \
       NPROC_PER_NODE NNODES MASTER_ADDR MASTER_PORT \
       PET_NPROC_PER_NODE PET_NNODES PET_MASTER_ADDR PET_MASTER_PORT \
       TORCHELASTIC_RUN_ID
 
 export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH}"
-# Pin to two valid GPUs (FSDP2 needs >1 for the sharded meta-init). Override with
-# e.g. `CUDA_VISIBLE_DEVICES=2,3 bash ...`; keep it to TWO ids to match nproc=2.
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1}
 export TOKENIZERS_PARALLELISM=false
 export TORCH_NCCL_AVOID_RECORD_STREAMS=1
 export NCCL_DEBUG=WARN
 export PYTHONUNBUFFERED=1
-# Make bare `breakpoint()` calls open ipdb instead of pdb.
-export PYTHONBREAKPOINT=${PYTHONBREAKPOINT:-ipdb.set_trace}
+export WANDB_MODE=disabled
 
-# --- launch (2 ranks for FSDP2, stdio attached → ipdb works) ---------------
-# No `| tee`, no `> log.txt` redirect: keep stdout/stdin as the terminal.
+# Enable conversation-list ipdb breakpoints (rank 0 only).
+export VEOMNI_DEBUG_CONV_IPDB=1
+
+DEBUG_DATA="${REPO_ROOT}/outputs/janus_conversation_ipdb_debug/data"
+mkdir -p "${DEBUG_DATA}"
+
+echo "[debug_conversation_ipdb] building demo parquet (dataset_mode=${DATASET_MODE}) ..."
+python "${REPO_ROOT}/scripts/multimodal/convert_data/make_janus_omni_demo.py" \
+  --dataset_mode "${DATASET_MODE}" \
+  --out_dir "${DEBUG_DATA}" \
+  --num_repeat 4 \
+  --und_reply "${REPO_ROOT}/janus_out/infer_und/reply.txt" \
+  --gen_image "${REPO_ROOT}/janus_out/infer_gen/generated_image_0.png"
+
+PARQUET="${DEBUG_DATA}/janus_omni_demo_${DATASET_MODE}.parquet"
+if [[ ! -f "${PARQUET}" ]]; then
+  echo "[debug_conversation_ipdb] ERROR: parquet not found at ${PARQUET}" >&2
+  exit 1
+fi
+
 torchrun \
   --standalone \
   --nnodes=1 \
   --nproc-per-node=2 \
-  tasks/train_omni.py configs/seed_omni/janus_1.3b/veomni_janus.yaml \
+  tasks/omni/train_omni.py configs/seed_omni/janus_1.3b/veomni_janus.yaml \
   --train.global_batch_size 2 \
   --train.micro_batch_size 1 \
+  --train.max_steps 1 \
   --train.num_train_epochs 1 \
   --train.gradient_checkpointing.enable false \
   --train.wandb.enable false \
@@ -88,6 +119,7 @@ torchrun \
   --train.checkpoint.save_epochs 0 \
   --train.checkpoint.hf_save_steps 100000000 \
   --train.checkpoint.save_hf_weights false \
-  --train.checkpoint.output_dir outputs/janus_omni_debug \
-  --data.dataloader.num_workers 1 \
+  --train.checkpoint.output_dir "outputs/janus_conversation_ipdb_debug/${DATASET_MODE}" \
+  --data.train_path "${PARQUET}" \
+  --data.dataloader.num_workers 0 \
   "$@"

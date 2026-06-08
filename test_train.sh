@@ -1,3 +1,3 @@
-bash scripts/seed_omni/debug_conversation_ipdb.sh mixed
-bash scripts/seed_omni/debug_conversation_ipdb.sh understanding
-bash scripts/seed_omni/debug_conversation_ipdb.sh t2i
+bash scripts/seed_omni/debug_omni_2gpu.sh mixed
+bash scripts/seed_omni/debug_omni_2gpu.sh understanding
+bash scripts/seed_omni/debug_omni_2gpu.sh t2i

@@ -39,9 +39,9 @@ from ......distributed.parallel_state import get_parallel_state
 from ......utils import helper
 from ....conversation import (
     ConversationItem,
-    collect_modality_batch,
+    collect_desired_values,
     is_dummy,
-    iter_modality_items,
+    iter_desired_items,
     maybe_merge_outputs,
     seal_outputs,
 )
@@ -169,7 +169,7 @@ class JanusVqvae(OmniModule, PreTrainedModel):
         self._conversation_carrier = conversation_list
         if method == "encode":
             pixel_values = self._pixels_from_raw_images(
-                collect_modality_batch(conversation_list, ["image"], roles=["assistant"])
+                collect_desired_values(conversation_list, types=["image"], roles=["assistant"])
             )
             return {"pixel_values": pixel_values}
 
@@ -266,7 +266,7 @@ class JanusVqvae(OmniModule, PreTrainedModel):
                         )
                     )
             else:
-                items = list(iter_modality_items(conversation, ["image"], roles=["assistant"]))
+                items = list(iter_desired_items(conversation, types=["image"], roles=["assistant"]))
                 for item, emb, ids in zip(items, image_embeds, vq_token_ids, strict=True):
                     item.value = emb
                     item.meta["janus_vqvae_labels"] = ids.to(dtype=torch.long)

@@ -80,7 +80,6 @@ spans (e.g. Janus T2I's 576-step ``image_vq`` loop).  Rank-0 gating is
 handled by the logger.
 """
 
-import os
 from typing import Any, Dict, Iterator, List, Mapping, Optional, Tuple
 
 import torch
@@ -88,7 +87,6 @@ import torch.nn as nn
 
 from ...utils import helper
 from .configuration_seed_omni import OmniConfig
-from .conversation import summarize_conversation_batch
 from .generation_graph import GenerationGraph
 from .module import OmniModule
 from .training_graph import TrainingGraph
@@ -262,14 +260,6 @@ class OmniModel(nn.Module):
             raw_module = _unwrap_module(module)
 
             kwargs = self.training_graph.collect_inputs(node_name, node_outputs, batch)
-            if os.environ.get("VEOMNI_DEBUG_CONV") == "1":
-                extra = sorted(k for k in kwargs if k != "conversation_list")
-                convo = kwargs.get("conversation_list")
-                helper.logger.info_rank0(
-                    f"[conv-debug] BEFORE {node_name} ({module_name}.{method})\n"
-                    f"  kwargs keys (excl. conversation_list): {extra}\n"
-                    f"{summarize_conversation_batch(convo)}"
-                )
             kwargs = raw_module.pre_forward(method=method, **kwargs) if isinstance(raw_module, OmniModule) else kwargs
 
             if method == "forward":
