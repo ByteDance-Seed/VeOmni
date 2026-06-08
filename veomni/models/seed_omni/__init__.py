@@ -20,7 +20,7 @@
 #   2. Module registries — :data:`OMNI_CONFIG_REGISTRY`,
 #      :data:`OMNI_MODEL_REGISTRY`, :data:`OMNI_PROCESSOR_REGISTRY` — resolve
 #      ``model_type → class`` lazily at runtime.
-#   3. Per-module checkpoint callback for Step-2 trainer integration.
+#   3. Per-module checkpoint callback for the trainer's save lifecycle.
 from .checkpoint_callback import OmniModuleCheckpointCallback
 from .configuration_seed_omni import OmniConfig
 from .conversation import ConversationPart, build_conversation

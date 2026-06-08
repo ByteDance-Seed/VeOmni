@@ -183,7 +183,7 @@ edges:
 # carrier (written back into the shared batch by OmniModel.forward); the
 # backbone splices the segments and the heads rebuild their labels from the
 # same segments.  Each module emits at most one `_loss` (token-mean over its
-# own micro-batches); OmniModel.forward sums them.  See design.md §9.
+# own micro-batches); OmniModel.forward sums them.
 #
 # Training-side dummy forward
 # ---------------------------

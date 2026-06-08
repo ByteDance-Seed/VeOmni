@@ -1,9 +1,9 @@
 """Per-module checkpoint callback for SeedOmni V2.
 
 Each :class:`OmniModule` participating in the V2 graph owns a dedicated
-:class:`OmniModuleCheckpointCallback` instance.  The callback is
-trainer-agnostic by design — Step 2 of the migration wires it into
-:class:`OmniTrainer.on_step_end` / ``on_train_end``.
+:class:`OmniModuleCheckpointCallback` instance, wired into the trainer's
+``on_step_end`` / ``on_train_end`` hooks by
+:class:`~veomni.trainer.omni_trainer.OmniTrainer`.
 
 Layout produced
 ---------------
@@ -29,16 +29,15 @@ For a model with three modules (``janus_siglip``, ``janus_vqvae``,
     │   └── tokenizer_config.json
     └── omni_config.yaml                  # OmniConfig snapshot (top-level)
 
-This matches the design in ``design.md`` §11.
+Every module directory is self-contained — it can be reloaded on its own via
+``OmniModule.from_pretrained(<save_root>/.../<module_name>)``.
 
 FSDP consolidation contract
 ---------------------------
 The callback writes via :meth:`PreTrainedModel.save_pretrained`, which
-expects materialised parameters.  Under FSDP2 the trainer must call
-:func:`gather_full_state_dict` (or equivalent) **before** invoking the
-callback so the raw module sees fully-rematerialised weights.  Step 2
-plumbs this; step 1 only validates the layout / asset wiring against
-non-FSDP modules.
+expects materialised parameters.  Under FSDP2 the trainer gathers the full
+state dict **before** invoking the callback so the raw module sees
+fully-rematerialised weights.
 """
 
 from __future__ import annotations

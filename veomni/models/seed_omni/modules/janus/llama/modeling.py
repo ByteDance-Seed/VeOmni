@@ -54,13 +54,14 @@ from .configuration import JanusLlamaConfig
 
 
 class JanusLlama(OmniModule, PreTrainedModel):
-    """LLaMA backbone with multi-modal embedding scatter (no wte, no lm_head).
+    """LLaMA backbone (no wte, no lm_head).
 
-    Image-embedding injection (``und_image_embeds`` / ``gen_image_embeds``)
-    is performed via ``masked_scatter`` using a boolean mask derived from
-    ``input_ids`` placeholder tokens — same strategy as the original Janus.
-    ``inputs_embeds`` is required: there is no fallback ``embed_tokens``
-    lookup inside this module.
+    Multi-modal inputs are already embedded by the sibling encoder modules
+    (text wte / SigLIP / VQVAE) and live on the ``conversation_list`` items.
+    :meth:`pre_forward` simply **concatenates** every non-dummy item's
+    ``value`` in order into one packed bs=1 sequence — there is no
+    ``masked_scatter`` and no placeholder-token mask.  ``inputs_embeds`` is
+    required; this module never falls back to an ``embed_tokens`` lookup.
     """
 
     config_class = JanusLlamaConfig
@@ -202,10 +203,9 @@ class JanusLlama(OmniModule, PreTrainedModel):
     ) -> Dict[str, Any]:
         """Auto-regressive backbone step driven by a conversation list.
 
-        Prompt pass (internal KV empty): concatenate every sealed embedded
-        part (``text`` / ``image`` / ``soi`` / ``eoi`` / ``token``), prime
-        the KV cache, and append an ``output`` item with backbone hidden
-        states.
+        Prompt pass (internal KV empty): concatenate every embedded part
+        (``text`` / ``image`` and any boundary ``output`` rows), prime the
+        KV cache, and append an ``output`` item with backbone hidden states.
 
         AR passes: read the last position of the conversation tail embed,
         run one forward step, append a fresh ``output`` hidden item.
@@ -321,42 +321,11 @@ class JanusLlama(OmniModule, PreTrainedModel):
 
     # ── Internal helpers ─────────────────────────────────────────────────────
 
-    @staticmethod
-    def _scatter_by_mask(
-        inputs_embeds: torch.Tensor,
-        mask: torch.Tensor,
-        image_embeds: torch.Tensor,
-    ) -> torch.Tensor:
-        """Replace ``mask`` positions in ``inputs_embeds`` with ``image_embeds``.
-
-        ``mask`` is ``(B, T)`` bool; ``image_embeds`` is ``(B, K, D)`` where
-        every sample carries ``K`` patch embeddings (real for present rows,
-        dummy zeros for absent rows — the training dummy-forward keeps the
-        FSDP graph aligned).  We select only the **present rows** (``mask``
-        has any True) before flattening so ``masked_scatter`` consumes each
-        present sample's own embeddings: a naïve full flatten would feed an
-        absent row's dummy embeds into a present row when the two are not in
-        ascending order within the batch (mixed und/gen/text micro-batches).
-        """
-        present = mask.any(dim=1)
-        flat = image_embeds[present].reshape(-1, inputs_embeds.size(-1)).to(inputs_embeds.dtype)
-        m = mask.unsqueeze(-1).expand_as(inputs_embeds)
-        return inputs_embeds.masked_scatter(m, flat)
-
     def _pack_conversations_for_forward(
         self,
         conversations: list[list[ConversationItem]],
-    ) -> tuple[
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        int,
-        int,
-        list[int],
-    ]:
-        """Pack embedded conversations → bs=1 tensors + precomputed FA2 kwargs."""
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Pack embedded conversations → ``(inputs_embeds, attention_mask, position_ids, pack_shape)``."""
         inputs_embeds_list = []
         attention_mask = []
         position_ids = []

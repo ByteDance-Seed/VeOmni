@@ -4,10 +4,8 @@ OmniModel V2 — composable multi-modal model driven by config-specified graphs.
 This file holds the *minimal* runtime — graph traversal for training, FSM
 walk for inference, and a single ``_loss`` aggregation step.  It deliberately
 contains **no** build / weight-loading / FSDP wiring; that lives in
-``OmniTrainer`` (yet to be migrated) which calls
-:func:`veomni.distributed.torch_parallelize.build_foundation_model` and
-:func:`...build_parallelize_model` per module and hands the resulting dict
-to :class:`OmniModel`.
+:class:`~veomni.trainer.omni_trainer.OmniTrainer`, which builds and
+FSDP-wraps each module independently and attaches them to :class:`OmniModel`.
 
 Architecture
 ------------
@@ -41,8 +39,11 @@ Training
 For each node in ``training_graph.execution_order``:
 
   1. Look up the OmniModule via ``training_graph.module_of(node)``.
-  2. ``training_graph.collect_inputs(node, outputs, batch)`` assembles
-     kwargs (raw_batch + edge-routed values from earlier nodes).
+  2. ``training_graph.collect_inputs(node, outputs, batch)`` returns a shallow
+     copy of the shared ``batch`` (which carries the mutable
+     ``conversation_list``).  Edges declare execution order only — they do
+     **not** route per-field values; modules read and mutate
+     ``conversation_list`` in place.
   3. Dispatch on ``training_graph.method_of(node)``:
        * ``forward`` → call the (possibly FSDP-wrapped) module so backward
          hooks fire correctly.
@@ -55,11 +56,13 @@ Returns ``{"loss": scalar_or_None, "losses": {node: scalar}, "outputs": {node: d
 
 Inference
 ---------
-``generate(request, context, max_new_tokens)`` resets the FSM, then loops:
+``generate(request, trace, generation_kwargs)`` loops (it does **not** reset
+the FSM — the caller owns request boundaries via :meth:`reset`):
 
-  * ``ctx = fsm.step(modules_dict, ctx)`` — one iteration of the current state.
+  * ``ctx = fsm.step(modules, ctx)`` — one iteration of the current state.
   * ``fsm.maybe_transition(ctx)`` — first matching condition wins.
-  * Stop when ``fsm.is_done()`` or ``max_new_tokens`` exhausts.
+  * Stop when ``fsm.is_done()`` or the ``generation_kwargs["max_new_tokens"]``
+    safety cap (default 2048) is reached.
 
 Modules emit one-shot ``generated`` payloads (``{type, value}``) from their
 FSM step return dict when a span ends; :meth:`OmniModel.generate` drains
@@ -154,11 +157,11 @@ class OmniModel(nn.Module):
         # Sub-modules are attached as **direct attributes** of OmniModel (not
         # via an `nn.ModuleDict` middle layer) so that:
         #   * ``model.named_children()`` directly yields ``[(name, mod), ...]``
-        #     — needed by ``build_parallelize_model`` (D2.2) to dispatch a
+        #     — needed by ``build_parallelize_model`` to dispatch a
         #     per-sub-module ``weights_path`` mapping;
         #   * ``model.named_parameters()`` fqns shape as ``<name>.<rest>``
-        #     instead of ``modules_dict.<name>.<rest>`` — matches the design
-        #     contract in design.md § "FQN 视角对齐";
+        #     instead of ``modules_dict.<name>.<rest>`` — so per-module
+        #     checkpoint subfolders map 1:1 to parameter-fqn prefixes;
         #   * downstream save/load callbacks that target subfolder names can
         #     reuse those names verbatim without stripping a prefix.
         # ``_module_names`` is a plain list (not an ``nn.Module``) so it
@@ -246,8 +249,8 @@ class OmniModel(nn.Module):
         * ``"loss"``    : scalar tensor (sum of all node ``_loss`` values),
                           or ``None`` if no node emitted a loss.
         * ``"losses"``  : ``{node_name: scalar tensor}``.
-        * ``"outputs"`` : ``{node_name: full output dict}`` (includes
-                          tensors routed by edges plus any extras).
+        * ``"outputs"`` : ``{node_name: full output dict}`` as returned by
+                          each node's ``post_forward``.
         """
         node_outputs: Dict[str, Dict[str, Any]] = {}
         losses: Dict[str, torch.Tensor] = {}
@@ -405,18 +408,17 @@ class OmniModel(nn.Module):
         Parameters
         ----------
         request:
-            Generation request dict — seeds ``ctx`` when ``context`` is
-            ``None``.
-        context:
-            Initial generation context (input_ids, attention_mask, ...).  If
-            ``None``, starts from a copy of ``request``.  During generation
-            ``input_ids`` grows as a full ``(B, T)`` sequence (HF
-            ``generate`` style); modules emit ``(B, 1)`` step tokens which
-            the FSM appends each iteration.
-        max_new_tokens:
-            Hard upper bound on total FSM iterations across all states.
+            Generation request dict — used directly as the initial ``ctx``.
+            Built by :class:`OmniInferencer` and contains the seed
+            ``conversation_list`` (see :func:`build_conversation`).  Modules
+            read and mutate it in place each FSM step.
         trace:
             Optional list — receives FSM step / transition log for testing.
+        generation_kwargs:
+            Opaque per-request knobs forwarded to every module's FSM step
+            (e.g. ``temperature`` / ``top_p`` / ``guidance_scale``).  The
+            framework only reads ``max_new_tokens`` (default 2048) as the
+            hard safety cap on total FSM iterations.
 
         Termination is fully FSM-driven: a state reaches ``done`` only when a
         module raises the ``module_signal`` its transition is waiting on

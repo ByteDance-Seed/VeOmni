@@ -13,8 +13,7 @@ The plain :class:`TextEncoder` is vocab-bound but model-agnostic and has
 *no* notion of boundary tokens.  Emitting :code:`<begin_of_image>` /
 :code:`<end_of_image>` around a VQ image span is a Janus-specific
 behaviour — that knowledge lives in the model, not in the FSM
-framework.  See the design discussion under "Boundary tokens are model
-state" in ``design.md``.
+framework (see :class:`JanusTextEncoder` for the emit methods).
 
 The framework reaches these emit methods via dedicated graph nodes
 (``emit_image_start`` / ``emit_image_end``) declared in the YAML.

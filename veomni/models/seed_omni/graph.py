@@ -46,7 +46,9 @@ Two execution views consume these pools (see ``training_graph.py`` and
   names; the unique nodes appearing as endpoints (excluding ``end``) execute
   once per FSM step in declaration order.
 
-See ``design.md`` §1 for the full schema.
+See the :class:`~veomni.models.seed_omni.training_graph.TrainingGraph` and
+:class:`~veomni.models.seed_omni.generation_graph.GenerationGraph` module
+docstrings for the full schema.
 """
 
 from dataclasses import dataclass

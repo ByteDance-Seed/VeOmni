@@ -10,7 +10,7 @@ flow is::
     cls     = OMNI_MODEL_REGISTRY[model_type]()
     cfg     = cfg_cls.from_pretrained(<weights_path>)
     module  = cls.from_pretrained(<weights_path>)       # HF PreTrainedModel API
-    # → wrapped by build_parallelize_model in OmniTrainer (Step 2)
+    # → FSDP-wrapped by build_parallelize_model inside OmniTrainer
 
 These modules are **not** registered with HuggingFace ``AutoConfig`` /
 ``AutoModel`` — always resolve the class via ``OMNI_*_REGISTRY`` first,

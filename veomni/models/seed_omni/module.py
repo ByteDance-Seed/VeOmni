@@ -62,18 +62,15 @@ Optional hooks
     Tokenizers belong on the module that needs them (e.g. ``janus_text_encoder``).
     Default: ``[]``.
 
-``finalize(*, ctx, request) -> dict``
-    Inference-only post-processing hook called *once* when the FSM
-    enters the framework-injected ``done`` state.  Override to dump
-    accumulated outputs — e.g. tokenizer-decode all generated text,
-    save accumulated VQ patches as images, write audio waveforms.
-    The framework does not impose an accumulation scheme; modules that
-    need cross-step history are responsible for maintaining it inside
-    ``ctx`` during ``generate_step`` (typical shape: append the current
-    step's ``input_ids`` / ``vq_token_id`` into a running list).
-    Return value is collected under ``ctx['finalize'][<module_name>]``
-    so callers can read decoded text, image paths, etc.  Default:
-    ``{}`` (no-op — module has nothing to finalize).
+``finalize(*, ctx) -> dict``
+    Inference-only flush hook.  ``OmniModel.generate`` calls it on *every*
+    module exactly once, but **only** when the ``max_new_tokens`` safety cap
+    trips before the FSM reaches ``done`` (the normal-completion path emits
+    via each module's per-step ``generated`` payload instead).  Override to
+    flush any partially-accumulated output the module still holds — e.g. the
+    text encoder decodes its buffered token cache, the VQVAE decodes a full
+    VQ grid.  Return ``{"generated": {"type": ..., "value": ...}}`` to append
+    to :attr:`OmniModel.generated`, or ``{}`` for nothing.  Default: ``{}``.
 
 ``dummy_inputs(*, batch_size, device, dtype) -> dict``
     Zero-tensor placeholders the trainer fills in **during training** for
@@ -81,28 +78,24 @@ Optional hooks
     text-only sample missing ``pixel_values``).  This is the
     "training-side dummy forward" mechanism — every active node must
     forward on every micro-batch to keep FSDP DP/SP graphs aligned (see
-    invariant 10).  Inference runners do NOT call this; they let the
-    model fast-skip via ``if x is None: return {}`` and rely on
-    permissive edge routing (an absent ``ctx[output]`` simply skips the
-    edge).  Default: ``{}`` (no dummies — the trainer raises if a
-    required input is missing).
+    "Training vs. inference no input semantics" below).  Inference runners
+    do NOT call this; they let the model fast-skip via
+    ``if x is None: return {}``.  Default: ``{}`` (no dummies).
 
 Training vs. inference "no input" semantics
 -------------------------------------------
 The two runtimes treat a missing optional input differently — by design:
 
 * **Training** (FSDP).  Every active node MUST forward on every
-  micro-batch or DP/SP all-reduce hangs.  The trainer asks each module
-  for ``dummy_inputs(...)`` and fills missing kwargs with zero tensors
-  *before* dispatch.  The model's ``forward``/``encode``/``decode``
-  therefore never sees ``None`` for a required input during training —
-  the ``if x is None: return {}`` short-circuit is an inference-only
-  fast path.  Important corner case: when the dummy zero output flows
-  through ``masked_scatter`` with an all-False mask (no real placeholder
-  positions), autograd drops the gradient back to the upstream module
-  and FSDP grad-sync may mismatch.  The downstream backbone must add a
-  ``+ x.sum() * 0.0`` "anchor" term in its ``pre_forward`` to force a
-  zero-gradient path through the upstream module; see ``JanusLlama``.
+  micro-batch or DP/SP all-reduce hangs.  When a micro-batch lacks one
+  of a module's inputs (e.g. a text-only sample with no image), the
+  encoder runs its :meth:`dummy_inputs` zero tensors and appends a
+  ``role="dummy"`` placeholder item to ``conversation_list`` instead of
+  ``return {}``.  The backbone skips dummy rows when packing but folds a
+  ``+ dummy.value.mean() * 0.0`` "anchor" term into ``inputs_embeds``
+  (see ``JanusLlama._fold_fsdp_dummy_anchors``) so a zero-gradient path
+  still flows back through the dummy-producing encoder and FSDP grad-sync
+  stays aligned across ranks.
 
 * **Inference** (no FSDP).  No grad sync, no DP alignment.  The runtime
   does **not** fill dummies; ``GenerationGraph.step`` permissively
@@ -273,11 +266,10 @@ class OmniModule:
     def finalize(self, *, ctx: Dict[str, Any]) -> Dict[str, Any]:
         """Flush module-private generation buffers into a one-shot ``generated`` payload.
 
-        ``OmniModel.generate`` calls this when a step raises ``module_signal``
-        (segment hand-off) and again on every module when the ``max_new_tokens``
-        safety cap trips before ``done``.  The module inspects its own buffers
-        and ``ctx`` (e.g. ``module_signal``) to decide whether to emit, discard,
-        or no-op — the framework does not pass a separate completion flag.
+        ``OmniModel.generate`` calls this on *every* module exactly once, but
+        **only** when the ``max_new_tokens`` safety cap trips before the FSM
+        reaches ``done`` (normal completion emits per-step instead).  The
+        module inspects its own buffers to decide whether to emit or no-op.
 
         Return ``{"generated": {"type": ..., "value": ...}}`` to append to
         :attr:`~veomni.models.seed_omni.modeling_omni.OmniModel.generated`,
@@ -305,7 +297,7 @@ class OmniModule:
     def dummy_inputs(self, *, batch_size: int, device: Any, dtype: Any) -> Dict[str, Any]:
         """Zero-tensor placeholders for training-side dummy forward.
 
-        Called by the trainer (Step 2 ``OmniTrainer`` hook) when a
+        Called by :class:`~veomni.trainer.omni_trainer.OmniTrainer` when a
         micro-batch is missing one of this module's required inputs.
         Override to return zero tensors with the **right shape** so the
         full forward path runs and FSDP DP/SP graphs stay aligned across

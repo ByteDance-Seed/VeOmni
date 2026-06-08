@@ -82,6 +82,7 @@ key_features/lora.md
 :maxdepth: 1
 :caption: Design
 
+design/seed_omni_v2.md
 design/kernel_selection.md
 ```
 

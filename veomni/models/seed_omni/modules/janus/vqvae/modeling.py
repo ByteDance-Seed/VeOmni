@@ -16,10 +16,9 @@ Call-site split (V2)
 
 Graph entry points (YAML ``module: janus_vqvae.<method>``):
 
-  ``encode``        — training encode node.
-  ``decode``        — training loss head.
-  ``decode_pixels`` — ``vq_token_ids`` → pixels.
-  ``generate``      — inference VQ AR (lm_head → embed → merge).
+  ``encode``   — training encode node (pixels → image embeds + VQ ids).
+  ``decode``   — training VQ cross-entropy loss head.
+  ``generate`` — inference VQ AR step (lm_head → sample → embed → merge).
 """
 
 from typing import Any, Dict, List, Optional
@@ -158,11 +157,6 @@ class JanusVqvae(OmniModule, PreTrainedModel):
         if is_dummy:
             return {"loss": hidden_states.sum() * 0.0}
         return {"loss": self._vq_loss(hidden_states, labels)}
-
-    def decode_pixels(self, vq_token_ids: torch.Tensor) -> torch.Tensor:
-        """Decode a sequence of VQ token IDs to pixel values ``(B, H, W, 3)``."""
-        pixel_values = self.vqmodel.decode(vq_token_ids)
-        return pixel_values.permute(0, 2, 3, 1)
 
     # ── OmniModule interface ───────────────────────────────────────────────────
 
@@ -404,13 +398,15 @@ class JanusVqvae(OmniModule, PreTrainedModel):
             self._vq_buffer.clear()
             return {}
         elif n == target:
-            generated = self._emit_buffered_image(device=self.device)
+            generated = self._emit_buffered_image()
             return {"generated": generated}
         else:
             raise RuntimeError(
-                "There's a bug in JanusVqvae.finalize, emit_buffered_image must be invoked when n == target in during generate"
+                "JanusVqvae.finalize: VQ buffer overflowed the grid — "
+                "_emit_buffered_image should have fired inside generate() when n == target."
             )
-        # ── Internal helpers ─────────────────────────────────────────────────────
+
+    # ── Internal helpers ─────────────────────────────────────────────────────
 
     def _num_image_tokens(self) -> int:
         cfg = self.config.vq_config

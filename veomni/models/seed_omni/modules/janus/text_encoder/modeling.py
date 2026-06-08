@@ -50,7 +50,6 @@ from typing import Any, Dict, List, Optional
 import torch
 import torch.nn.functional as F
 
-from veomni.utils.model_outputs import CausalLMOutputWithLogProbs
 from veomni.utils.tensor_utils import naflatten, unflatten
 
 from ....conversation import (
@@ -116,13 +115,15 @@ MODALITY_SLOT_ID = 0
 class JanusTextEncoder(TextEncoder):
     """:class:`TextEncoder` + ``emit_image_start`` / ``emit_image_end``.
 
-    Inference contract (``generate`` / ``decode`` / ``emit_image_*``)
-    ----------------------------------------------------------------
-    All inference call-sites consume / produce a ``conversation_list``
-    (see :mod:`veomni.models.seed_omni.conversation`).  Training uses
-    :meth:`pre_forward` → :meth:`encode` → :meth:`post_forward` on the same
-    carrier; inference still uses :meth:`generate` until it shares
-    :meth:`_prepare_sample_training`.
+    Call-sites (all operate on the shared ``conversation_list``; see
+    :mod:`veomni.models.seed_omni.conversation`):
+
+    * Training — ``encode`` (chat-template + wte) and ``decode`` (LM-head CE,
+      inherited from :class:`TextEncoder`), each wrapped by
+      :meth:`pre_forward` / :meth:`post_forward`.
+    * Inference — :meth:`generate` (tokenise + sample the next text token, emit
+      ``start_image_gen`` / ``text_done`` FSM signals) plus the boundary
+      emitters :meth:`emit_image_start` / :meth:`emit_image_end`.
     """
 
     config_class = JanusTextEncoderConfig
@@ -145,7 +146,7 @@ class JanusTextEncoder(TextEncoder):
         self._conversation_carrier: Any = None
         self._encode_batch_shape: torch.LongTensor | None = None
 
-    def reset_local_inference_state(self) -> None:
+    def reset_inference_state(self) -> None:
         """Get a new request in the current conversation."""
         self._text_token_cache.clear()
 
@@ -188,21 +189,6 @@ class JanusTextEncoder(TextEncoder):
         return {
             "inputs_embeds": embeds.squeeze(0) if embeds.size(0) == 1 else embeds,
         }
-
-    # ── Inference: decode + FSM signals (conversation-list aware) ────────────
-
-    def decode(  # type: ignore[override]
-        self,
-        hidden_states: Optional[torch.Tensor] = None,
-        shift_labels: Optional[torch.LongTensor] = None,
-        **kwargs: Any,
-    ) -> CausalLMOutputWithLogProbs:
-        """LM-head projection for training; inference sampling uses :meth:`ar_step`."""
-        return super().decode(
-            hidden_states=hidden_states,
-            shift_labels=shift_labels,
-            **kwargs,
-        )
 
     # ── Training: conversation-list carrier (pre → encode → post) ─────────────
 
@@ -407,7 +393,6 @@ class JanusTextEncoder(TextEncoder):
             maybe_merge_outputs(conversation_list)
 
             if output_token_id == self._boi_token_id:
-                # import ipdb;ipdb.set_trace()
                 self._maybe_arm_cfg_for_image_gen(conversation_list, generation_kwargs, outputs)
                 outputs[FSM_SIGNAL_KEY] = SIGNAL_START_IMAGE_GEN
             elif output_token_id == self._eos_token_id:
