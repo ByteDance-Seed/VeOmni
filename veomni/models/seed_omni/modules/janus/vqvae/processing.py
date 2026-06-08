@@ -27,6 +27,8 @@ from transformers.models.janus.image_processing_janus import JanusImageProcessor
 class JanusVqvaeProcessor(JanusImageProcessor):
     """Janus VQVAE image processor — encode preprocess + decode postprocess."""
 
+    num_image_tokens: int = 576
+
     def postprocess(
         self,
         images: Union[torch.Tensor, List[torch.Tensor]],

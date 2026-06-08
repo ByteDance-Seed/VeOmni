@@ -15,6 +15,7 @@ after build); this config only carries the knob.
 from typing import Any, Dict, Optional
 
 from transformers import PretrainedConfig
+from transformers.models.janus.configuration_janus import JanusVQVAEConfig as _hfvqconfig
 
 
 class JanusVqvaeConfig(PretrainedConfig):
@@ -28,7 +29,7 @@ class JanusVqvaeConfig(PretrainedConfig):
         freeze: bool = True,
         **kwargs,
     ):
-        self.vq_config = vq_config or {}
+        self.vq_config = _hfvqconfig(**vq_config) if vq_config else _hfvqconfig()
         # Module-level freeze knob.  ``JanusVqvae.freeze_model`` interprets it
         # as a *partial* freeze (only the inner ``vqmodel``); the generation
         # heads stay trainable.

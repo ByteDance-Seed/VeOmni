@@ -26,9 +26,7 @@ from typing import Any, Dict, List, Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from PIL import Image
 from transformers import PreTrainedModel
-from transformers.models.janus.configuration_janus import JanusVQVAEConfig
 from transformers.models.janus.modeling_janus import (
     JanusVQVAE,
     JanusVQVAEAlignerMLP,
@@ -83,12 +81,11 @@ class JanusVqvae(OmniModule, PreTrainedModel):
     def __init__(self, config: JanusVqvaeConfig):
         super().__init__(config)
         self.config = config
-        vq_cfg = JanusVQVAEConfig(**config.vq_config) if config.vq_config else JanusVQVAEConfig()
-        self._vq_cfg = vq_cfg
-        self.vqmodel = JanusVQVAE._from_config(vq_cfg)
-        self.generation_embeddings = nn.Embedding(vq_cfg.num_embeddings, vq_cfg.embed_dim)
-        self.generation_aligner = JanusVQVAEAlignerMLP(vq_cfg)
-        self.generation_head = JanusVQVAEHead(vq_cfg)
+        self.vqmodel = JanusVQVAE._from_config(config.vq_config)
+        self.generation_embeddings = nn.Embedding(config.vq_config.num_embeddings, config.vq_config.embed_dim)
+        self.generation_aligner = JanusVQVAEAlignerMLP(config.vq_config)
+        self.generation_head = JanusVQVAEHead(config.vq_config)
+        self._processor: JanusVqvaeProcessor = None
 
         # NB: the ``config.freeze`` knob is honoured by :meth:`freeze_model`
         # (called once by the trainer after build), not here.
@@ -97,16 +94,15 @@ class JanusVqvae(OmniModule, PreTrainedModel):
         # sampled tokens between FSM iterations.  Reset on each
         # ``image_complete`` signal; finalize keeps the decoded PIL
         # images so the caller can collect them after the run.
+        # Inference cache
         self._vq_buffer: List[int] = []
-        self._collected_images: List[Image.Image] = []
 
         # Auto-populated by :meth:`OmniModule.from_pretrained` from
         # ``<weights_path>/preprocessor_config.json``.  Used by
         # :meth:`generate` to convert the VQVAE's ``[-1, 1]`` float output
         # back into a PIL image — see :class:`JanusVqvaeProcessor`.
-        self._processor: Optional[Any] = None
+        # Training cache
         self._conversation_carrier: Any = None
-        self._decode_is_dummy: bool = False
 
         self.post_init()
 
@@ -339,7 +335,7 @@ class JanusVqvae(OmniModule, PreTrainedModel):
         self._vq_buffer.append(token_id_int)
 
         outputs: Dict[str, Any] = {}
-        target = self._num_image_tokens()
+        target = self._processor.num_image_tokens
         if len(self._vq_buffer) == target:
             # end of image generation, so the hidden states is for the next text ar step
             # do not need to do aligner(embeddings)
@@ -371,13 +367,11 @@ class JanusVqvae(OmniModule, PreTrainedModel):
                 "loaded. Ensure `preprocessor_config.json` ships next to the weights."
             )
         image_pil = self._processor.postprocess(decoded)[0]
-        self._collected_images.append(image_pil)
         return {"type": "image", "value": image_pil}
 
     def reset_inference_state(self) -> None:
         """Wipe per-request buffers — called by :class:`OmniInferencer` between runs."""
         self._vq_buffer.clear()
-        self._collected_images.clear()
 
     def finalize(self, *, ctx: Dict[str, Any]) -> Dict[str, Any]:
         """Flush or discard the VQ token buffer based on its fill level.
@@ -386,7 +380,7 @@ class JanusVqvae(OmniModule, PreTrainedModel):
         :meth:`generate`).  Buffer full → decode and emit.  Partial grid →
         log a warning, discard, emit nothing.
         """
-        target = self._num_image_tokens()
+        target = self._processor.num_image_tokens
         n = len(self._vq_buffer)
         if n == 0:  # image generation not invoked yet
             return {}
@@ -407,13 +401,6 @@ class JanusVqvae(OmniModule, PreTrainedModel):
             )
 
     # ── Internal helpers ─────────────────────────────────────────────────────
-
-    def _num_image_tokens(self) -> int:
-        cfg = self.config.vq_config
-        if isinstance(cfg, dict):
-            return int(cfg.get("num_image_tokens", _DEFAULT_NUM_IMAGE_TOKENS))
-        val = getattr(cfg, "num_image_tokens", None)
-        return int(val) if val is not None else _DEFAULT_NUM_IMAGE_TOKENS
 
     @staticmethod
     def _extract_sampling_kwargs(generation_kwargs: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -457,19 +444,6 @@ class JanusVqvae(OmniModule, PreTrainedModel):
         probs = F.softmax(logits, dim=-1)
         return torch.multinomial(probs, num_samples=1).squeeze(-1)
 
-    def _image_size(self) -> int:
-        """VQ spatial side length — from processor ``size`` or ``num_patches * 16``."""
-        proc = self._processor
-        if proc is not None:
-            size = getattr(proc, "size", None)
-            if isinstance(size, dict):
-                side = size.get("height") or size.get("width")
-                if side is not None:
-                    return int(side)
-            elif size is not None and getattr(size, "height", None) is not None:
-                return int(size.height)
-        return int(getattr(self._vq_cfg, "num_patches", 24)) * 16
-
     def _pixels_from_raw_images(self, raw_images: list[Any]) -> torch.Tensor:
         """Raw images → VQVAE-normalised ``(N, 3, H, W)`` (``N=1`` zero row when empty)."""
         if not raw_images:
@@ -487,8 +461,10 @@ class JanusVqvae(OmniModule, PreTrainedModel):
 
     def dummy_inputs(self) -> Dict[str, Any]:
         """Zero ``pixel_values`` for image-free micro-batches."""
-        h = self._image_size()
-        c = int(getattr(self._vq_cfg, "in_channels", 3))
+        size = self._processor.size
+        height = size.get("height")
+        width = size.get("width")
+        c = self.config.vq_config.get["in_channels"]
         return {
-            "pixel_values": torch.zeros(1, c, h, h, device=self.device, dtype=self.dtype),
+            "pixel_values": torch.zeros(1, c, height, width, device=self.device, dtype=self.dtype),
         }
