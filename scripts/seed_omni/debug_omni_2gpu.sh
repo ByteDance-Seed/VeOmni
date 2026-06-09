@@ -52,11 +52,7 @@ if [[ -z "${VIRTUAL_ENV:-}" ]]; then
     fi
     return 1
   }
-  if _pick_venv "${REPO_ROOT}/.venv/bin/activate"; then
-    :
-  elif _pick_venv "/app/VeOmni/submodules/Open-VeOmni/.venv/bin/activate"; then
-    :
-  else
+  if ! _pick_venv "${REPO_ROOT}/.venv/bin/activate"; then
     echo "[debug_conversation_ipdb] warning: no venv found; using PATH python: $(command -v python || echo missing)" >&2
   fi
 fi
@@ -65,9 +61,7 @@ if ! python -c "import pyarrow" 2>/dev/null; then
   echo "[debug_conversation_ipdb] ERROR: pyarrow is not installed in the active Python:" >&2
   python -c "import sys; print('  ', sys.executable)" 2>/dev/null || true
   echo "[debug_conversation_ipdb] Install into this venv, e.g.:" >&2
-  echo "  uv pip install pyarrow" >&2
-  echo "Or activate the full VeOmni env first:" >&2
-  echo "  source /app/VeOmni/submodules/Open-VeOmni/.venv/bin/activate" >&2
+  echo "  cd ${REPO_ROOT} && uv sync --extra gpu --extra dit --group dev" >&2
   exit 1
 fi
 
@@ -87,7 +81,10 @@ export WANDB_MODE=disabled
 # Enable conversation-list ipdb breakpoints (rank 0 only).
 export VEOMNI_DEBUG_CONV_IPDB=1
 
-DEBUG_DATA="${REPO_ROOT}/outputs/janus_conversation_ipdb_debug/data"
+OUTPUT_ROOT="${JANUS_V2_OUTPUT_ROOT:-${REPO_ROOT}/outputs/janus_v2}"
+JANUS_OUT="${JANUS_V2_JANUS_OUT:-${OUTPUT_ROOT}/janus_out}"
+DEBUG_DATA="${JANUS_V2_DATA_DIR:-${OUTPUT_ROOT}/data}"
+TRAIN_DEBUG="${JANUS_V2_TRAIN_DEBUG_DIR:-${OUTPUT_ROOT}/train_debug}"
 mkdir -p "${DEBUG_DATA}"
 
 echo "[debug_conversation_ipdb] building demo parquet (dataset_mode=${DATASET_MODE}) ..."
@@ -95,8 +92,8 @@ python "${REPO_ROOT}/scripts/multimodal/convert_data/make_janus_omni_demo.py" \
   --dataset_mode "${DATASET_MODE}" \
   --out_dir "${DEBUG_DATA}" \
   --num_repeat 4 \
-  --und_reply "${REPO_ROOT}/janus_out/infer_und/reply.txt" \
-  --gen_image "${REPO_ROOT}/janus_out/infer_gen/generated_image_0.png"
+  --und_reply "${JANUS_OUT}/infer_und/reply.txt" \
+  --gen_image "${JANUS_OUT}/infer_gen/generated_image_0.png"
 
 PARQUET="${DEBUG_DATA}/janus_omni_demo_${DATASET_MODE}.parquet"
 if [[ ! -f "${PARQUET}" ]]; then
@@ -119,7 +116,7 @@ torchrun \
   --train.checkpoint.save_epochs 0 \
   --train.checkpoint.hf_save_steps 100000000 \
   --train.checkpoint.save_hf_weights false \
-  --train.checkpoint.output_dir "outputs/janus_conversation_ipdb_debug/${DATASET_MODE}" \
+  --train.checkpoint.output_dir "${TRAIN_DEBUG}/${DATASET_MODE}" \
   --data.train_path "${PARQUET}" \
   --data.dataloader.num_workers 0 \
   "$@"

@@ -3576,6 +3576,7 @@ wheels = [
 name = "veomni"
 source = { editable = "." }
 dependencies = [
+    { name = "accelerate" },
     { name = "blobfile" },
     { name = "datasets" },
     { name = "einops" },
@@ -3694,6 +3695,7 @@ transformers-stable = [
 
 [package.metadata]
 requires-dist = [
+    { name = "accelerate", specifier = ">=1.12.0" },
     { name = "av", marker = "python_full_version == '3.11.*' and extra == 'audio'", url = "https://files.pythonhosted.org/packages/f8/9a/8ffabfcafb42154b4b3a67d63f9b69e68fa8c34cb39ddd5cb813dd049ed4/av-14.4.0-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl" },
     { name = "av", marker = "python_full_version == '3.11.*' and extra == 'dit'", url = "https://files.pythonhosted.org/packages/f8/9a/8ffabfcafb42154b4b3a67d63f9b69e68fa8c34cb39ddd5cb813dd049ed4/av-14.4.0-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl" },
     { name = "av", marker = "python_full_version == '3.11.*' and extra == 'video'", url = "https://files.pythonhosted.org/packages/f8/9a/8ffabfcafb42154b4b3a67d63f9b69e68fa8c34cb39ddd5cb813dd049ed4/av-14.4.0-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl" },
