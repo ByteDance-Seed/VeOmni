@@ -154,7 +154,7 @@ override-dependencies = [
     "torch==2.7.1; (extra == 'npu_aarch64')",
     "torchaudio==2.7.1; (extra == 'npu_aarch64')",
     "torchvision==0.22.1; (extra == 'npu_aarch64')",
-    "torchcodec>=0.4.0,<0.6.0; (extra == 'npu_aarch64')",
+    # Adding explicit override for NPU backends - x86 variant (default npu)
     "torch==2.7.1+cpu; (extra == 'npu')",
     "torchaudio==2.7.1+cpu; (extra == 'npu')",
     "torchvision==0.22.1+cpu; (extra == 'npu')",
