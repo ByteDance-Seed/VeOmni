@@ -38,7 +38,11 @@ if [[ -z "${VIRTUAL_ENV:-}" ]]; then
     fi
     return 1
   }
-  if ! _pick_venv "${REPO_ROOT}/.venv/bin/activate"; then
+  if _pick_venv "${REPO_ROOT}/.venv/bin/activate"; then
+    :
+  elif _pick_venv "/app/VeOmni/submodules/Open-VeOmni/.venv/bin/activate"; then
+    :
+  else
     echo "[debug_omni] warning: no venv found; using PATH python: $(command -v python || echo missing)" >&2
   fi
 fi
@@ -67,6 +71,7 @@ OUTPUT_ROOT="${JANUS_V2_OUTPUT_ROOT:-${REPO_ROOT}/outputs/janus_v2}"
 JANUS_OUT="${JANUS_V2_JANUS_OUT:-${OUTPUT_ROOT}/janus_out}"
 DEBUG_DATA="${JANUS_V2_DATA_DIR:-${OUTPUT_ROOT}/data}"
 TRAIN_DEBUG="${JANUS_V2_TRAIN_DEBUG_DIR:-${OUTPUT_ROOT}/train_debug}"
+MODEL_HUB="${MODEL_HUB:-/mnt/hdfs/user_dir/veomni_omni/models}"
 mkdir -p "${DEBUG_DATA}"
 
 echo "[debug_omni] building demo parquet (mode=${DATASET_MODE}, num_repeat=${NUM_REPEAT}) ..."
@@ -91,6 +96,7 @@ torchrun \
   --nnodes=1 \
   --nproc-per-node="${NUM_GPUS}" \
   tasks/omni/train_omni.py configs/seed_omni/janus_1.3b/veomni_janus.yaml \
+  --model.model_path "${MODEL_HUB}/seed_omni/Janus-1.3B" \
   --train.global_batch_size "${GLOBAL_BATCH_SIZE}" \
   --train.micro_batch_size "${MICRO_BATCH_SIZE}" \
   --train.max_steps "${MAX_STEPS}" \
