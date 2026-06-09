@@ -1,0 +1,129 @@
+"""BAGEL connector layers between vision/VAE tokens and Qwen2 hidden states.
+
+The learned projection architecture is present for checkpoint splitting.
+Runtime flow call-sites are intentionally left unimplemented until the Bagel
+packed graph contract is ported.
+"""
+
+import math
+from typing import Any, Dict, Optional
+
+import numpy as np
+import torch
+import torch.nn as nn
+from transformers import PreTrainedModel
+from transformers.activations import ACT2FN
+
+from .configuration import BagelFlowConnectorConfig
+from .modulemixin import BagelFlowConnectorModuleMixin
+
+
+def get_1d_sincos_pos_embed_from_grid(embed_dim: int, pos: np.ndarray) -> np.ndarray:
+    omega = np.arange(embed_dim // 2, dtype=np.float64)
+    omega /= embed_dim / 2.0
+    omega = 1.0 / 10000**omega
+    out = np.einsum("m,d->md", pos.reshape(-1), omega)
+    return np.concatenate([np.sin(out), np.cos(out)], axis=1)
+
+
+def get_2d_sincos_pos_embed(embed_dim: int, grid_size: int) -> np.ndarray:
+    grid_h = np.arange(grid_size, dtype=np.float32)
+    grid_w = np.arange(grid_size, dtype=np.float32)
+    grid = np.meshgrid(grid_w, grid_h)
+    grid = np.stack(grid, axis=0).reshape([2, 1, grid_size, grid_size])
+    emb_h = get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[0])
+    emb_w = get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[1])
+    return np.concatenate([emb_h, emb_w], axis=1)
+
+
+class TimestepEmbedder(nn.Module):
+    def __init__(self, hidden_size: int, frequency_embedding_size: int = 256):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(frequency_embedding_size, hidden_size, bias=True),
+            nn.SiLU(),
+            nn.Linear(hidden_size, hidden_size, bias=True),
+        )
+        self.frequency_embedding_size = frequency_embedding_size
+
+    @staticmethod
+    def timestep_embedding(t: torch.Tensor, dim: int, max_period: int = 10000) -> torch.Tensor:
+        half = dim // 2
+        freqs = torch.exp(-math.log(max_period) * torch.arange(half, dtype=torch.float32, device=t.device) / half)
+        args = t[:, None].float() * freqs[None]
+        embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+        if dim % 2:
+            embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
+        return embedding
+
+    def forward(self, t: torch.Tensor) -> torch.Tensor:
+        return self.mlp(self.timestep_embedding(t, self.frequency_embedding_size))
+
+
+class MLPconnector(nn.Module):
+    def __init__(self, in_dim: int, out_dim: int, hidden_act: str):
+        super().__init__()
+        self.activation_fn = ACT2FN[hidden_act]
+        self.fc1 = nn.Linear(in_dim, out_dim)
+        self.fc2 = nn.Linear(out_dim, out_dim)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return self.fc2(self.activation_fn(self.fc1(hidden_states)))
+
+
+class PositionEmbedding(nn.Module):
+    def __init__(self, max_num_patch_per_side: int, hidden_size: int):
+        super().__init__()
+        self.max_num_patch_per_side = max_num_patch_per_side
+        self.hidden_size = hidden_size
+        pos_embed = get_2d_sincos_pos_embed(self.hidden_size, self.max_num_patch_per_side)
+        self.register_buffer("pos_embed", torch.from_numpy(pos_embed).float(), persistent=False)
+
+    def forward(self, position_ids: torch.LongTensor) -> torch.Tensor:
+        return self.pos_embed[position_ids]
+
+
+class BagelFlowConnector(BagelFlowConnectorModuleMixin, PreTrainedModel):
+    config_class = BagelFlowConnectorConfig
+    base_model_prefix = "bagel_flow_connector"
+    main_input_name = "hidden_states"
+    _no_split_modules: list[str] = []
+
+    def __init__(self, config: BagelFlowConnectorConfig):
+        super().__init__(config)
+        self.connector = MLPconnector(config.vit_hidden_size, config.hidden_size, config.connector_act)
+        self.vit_pos_embed = PositionEmbedding(config.vit_max_num_patch_per_side, config.hidden_size)
+        self.time_embedder = TimestepEmbedder(config.hidden_size, config.timestep_frequency_embedding_size)
+        self.vae2llm = nn.Linear(config.patch_latent_dim, config.hidden_size)
+        self.llm2vae = nn.Linear(config.hidden_size, config.patch_latent_dim)
+        self.latent_pos_embed = PositionEmbedding(config.max_latent_size, config.hidden_size)
+        self.post_init()
+
+    def encode_vision(
+        self,
+        hidden_states: torch.Tensor,
+        position_ids: Optional[torch.LongTensor] = None,
+    ) -> Dict[str, torch.Tensor]:
+        del hidden_states, position_ids
+        # TODO(bagel-v2): port Bagel visual-understanding connector call-site.
+        raise NotImplementedError("BagelFlowConnector.encode_vision is not implemented yet.")
+
+    def embed_latent(
+        self,
+        latents: torch.Tensor,
+        position_ids: Optional[torch.LongTensor] = None,
+        timesteps: Optional[torch.Tensor] = None,
+    ) -> Dict[str, torch.Tensor]:
+        del latents, position_ids, timesteps
+        # TODO(bagel-v2): port Bagel rectified-flow latent embedding semantics.
+        raise NotImplementedError("BagelFlowConnector.embed_latent is not implemented yet.")
+
+    def decode_velocity(self, hidden_states: torch.Tensor) -> Dict[str, torch.Tensor]:
+        del hidden_states
+        # TODO(bagel-v2): port Bagel velocity decode/loss call-site.
+        raise NotImplementedError("BagelFlowConnector.decode_velocity is not implemented yet.")
+
+    def forward(self, **kwargs: Any) -> Dict[str, torch.Tensor]:  # type: ignore[override]
+        del kwargs
+        # TODO(bagel-v2): route to explicit connector call-sites after graph packing is ported.
+        raise NotImplementedError("BagelFlowConnector forward is not implemented yet.")

@@ -38,8 +38,8 @@ OMNI_CONFIG_REGISTRY = Registry("OmniConfig")
 OMNI_MODEL_REGISTRY = Registry("OmniModel")
 OMNI_PROCESSOR_REGISTRY = Registry("OmniProcessor")
 
-# Side-effect only: attach @register factories under base/ and janus/.
-from . import base, janus  # noqa: F401  E402
+# Side-effect only: attach @register factories under base/, janus/, and bagel/.
+from . import bagel, base, janus  # noqa: F401  E402
 
 
 def read_model_type(model_path: str) -> str:
