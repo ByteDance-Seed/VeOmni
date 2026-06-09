@@ -202,12 +202,12 @@ bash scripts/seed_omni/verify_janus_demo_loss.sh t2i
 bash scripts/seed_omni/verify_janus_demo_loss.sh mixed
 ```
 
-Debug with ipdb (pick dataset as first arg or ``DATASET_MODE=`` env):
+8-GPU smoke train (20 steps by default):
 
 ```bash
-bash scripts/seed_omni/debug_conversation_ipdb.sh understanding
-bash scripts/seed_omni/debug_conversation_ipdb.sh t2i
-DATASET_MODE=mixed bash scripts/seed_omni/debug_conversation_ipdb.sh
+bash scripts/seed_omni/debug_omni.sh understanding
+bash scripts/seed_omni/debug_omni.sh t2i
+bash scripts/seed_omni/debug_omni.sh mixed
 ```
 
 Legacy flags:

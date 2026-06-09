@@ -1,17 +1,15 @@
-"""
-JanusVqvae — Janus' VQVAE + generation projection head as one OmniModule.
+"""Janus VQVAE codec + generation projection head.
 
-Mixin form:
-``class JanusVqvae(JanusVqvaeOmniModelMixin, PreTrainedModel)``.
+``JanusVqvae(JanusVqvaeModuleMixin, PreTrainedModel)`` — codec weights here;
+encode/decode graph hooks in ``modulemixin.py``.
 
-Call-site split (V2)
---------------------
+Call-site split
+---------------
 * :meth:`pre_forward` — stash ``conversation_list``; ``method="encode"`` pulls
   assistant ``image`` pixels, ``method="decode"`` assembles llama hidden rows +
   ``gen_ids`` labels.
-* :meth:`encode` — pure encoder: ``pixel_values`` → ``image_embeds`` +
-  ``vq_token_ids``.
-* :meth:`decode` — training CE head: ``hidden_states`` + ``labels`` → ``_loss``.
+* :meth:`encode` — ``pixel_values`` → ``image_embeds`` + ``vq_token_ids``.
+* :meth:`decode` — training CE: ``hidden_states`` + ``labels`` → ``loss``.
 * :meth:`post_forward` — write ``image_embeds`` / ``janus_vqvae_labels`` back onto
   ``conversation_list`` (encode path).
 

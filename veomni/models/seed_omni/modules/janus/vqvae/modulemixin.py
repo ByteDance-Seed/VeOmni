@@ -14,12 +14,17 @@ from ....conversation import (
 )
 from ....generation_graph import FSM_SIGNAL_KEY
 from ....module import ModuleMixin
+from .configuration import JanusVqvaeConfig
+from .processing import JanusVqvaeProcessor
 
 
 logger = helper.create_logger(__name__)
 
 
 class JanusVqvaeModuleMixin(ModuleMixin):
+    config: JanusVqvaeConfig
+    _processor: JanusVqvaeProcessor
+
     def init_omni_state(self) -> None:
         # Training state
         self._conversation_carrier: Any = None
@@ -137,7 +142,7 @@ class JanusVqvaeModuleMixin(ModuleMixin):
         if self._processor is None:
             raise RuntimeError(
                 "JanusVqvae: samples carry images but no image processor is loaded. "
-                "Assign `module._processor` via OmniModuleTrainer before training."
+                "Assign `module._processor` before training."
             )
         processed = self._processor(images=raw_images, return_tensors="pt")["pixel_values"]
         return processed.to(device=self.device, dtype=self.dtype)
@@ -146,7 +151,7 @@ class JanusVqvaeModuleMixin(ModuleMixin):
         size = self._processor.size
         height = size.get("height")
         width = size.get("width")
-        c = self.config.vq_config["in_channels"]
+        c = self.config.vq_config.in_channels
         return {
             "pixel_values": torch.zeros(1, c, height, width, device=self.device, dtype=self.dtype),
         }

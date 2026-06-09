@@ -1,14 +1,8 @@
-"""
-JanusLlama — Janus' LLaMA backbone (no wte, no lm_head) as one OmniModule.
+"""Janus LLaMA backbone (no wte / lm_head).
 
-Mixin form: ``class JanusLlama(OmniModule, PreTrainedModel)``.
-
-The backbone *contains* VeOmni's patched :class:`~veomni.models.transformers.llama.generated.patched_modeling_llama_gpu.LlamaModel` whose
-``embed_tokens`` has been replaced with an :class:`nn.Identity` — the
-word-token embedding lives in the sibling
-:class:`~veomni.models.seed_omni.modules.base.TextEncoder` module.  This
-keeps the LLaMA forward path unchanged; ``inputs_embeds`` (passed in by
-the graph from the ``tok_encode`` node) is what actually flows through.
+``JanusLlama(JanusLlamaModuleMixin, PreTrainedModel)`` — patched
+``LlamaModel`` with ``embed_tokens = Identity``; ``inputs_embeds`` come from
+the text-encoder node.  Packing / FSDP dummy anchors live in ``modulemixin.py``.
 
 Multi-modal embedding packing
 -----------------------------

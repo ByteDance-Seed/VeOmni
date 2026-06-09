@@ -1,139 +1,37 @@
 """
-OmniModule — the *mixin* every SeedOmni V2 component multi-inherits from.
+ModuleMixin — base hooks for every SeedOmni V2 sub-model.
 
-Why a mixin?
-------------
-A real SeedOmni component is almost always a HuggingFace ``transformers`` /
-``diffusers`` model — e.g. ``LlamaModel``, ``SiglipVisionModel``, a custom
-``DiT``.  Forcing those into a deep abstract base class would mean wrapping or
-re-deriving them, which fights the upstream patchgen / monkey-patch flow.
+Layout
+------
+* ``module.py`` — :class:`ModuleMixin` (shared defaults).
+* ``modules/<family>/<sub>/modulemixin.py`` — ``XxxModuleMixin(ModuleMixin)``
+  with train/infer hooks and :meth:`init_omni_state`.
+* ``modules/<family>/<sub>/modeling.py`` — HF ``PreTrainedModel`` body
+  (``__init__``, ``forward``, weight layout).
 
-Instead, ``OmniModule`` is a *plain mixin* with **zero required overrides**.
-Real classes mix it in alongside their HF base::
+Concrete classes combine mixin + HF base::
 
-    class JanusVisionEncoder(OmniModule, SiglipVisionModel):
-        def forward(self, **kwargs) -> dict:
-            ...
-        def get_parallel_plan(self) -> ParallelPlan | None:
-            ...
+    class JanusSiglip(JanusSiglipModuleMixin, PreTrainedModel):
+        def __init__(self, config):
+            super().__init__(config)   # → PreTrainedModel + init_omni_state
+            ... submodules ...
+            self.post_init()
 
-The graph runtime calls a small list of *optional* hooks (described below).
-Each hook has a sensible default so a minimal module — say a pure feature
-extractor — can implement only ``forward`` and skip everything else.
+``init_omni_state`` sets per-module caches (conversation carrier, KV / VQ
+buffers, …).  Do **not** override ``post_init`` on mixins — keep HF
+``post_init()`` in ``modeling.py`` after submodule construction.
 
-Optional hooks
---------------
-``forward(**kwargs) -> dict``
-    Training entry.  Return a dict whose keys feed downstream graph edges.
-    May contain at most one ``_loss`` key (scalar, already token-mean-reduced
-    across all micro-batches consumed inside this call).  See
-    "Loss protocol" below.
+Hooks (all optional except training-graph ``forward``)
+------------------------------------------------------
+``pre_forward`` / ``post_forward`` — read/write ``conversation_list``.
+``forward`` — training compute; may return scalar ``_loss``.
+``generate`` / ``generate_step`` — one FSM inference step.
+``dummy_inputs`` — FSDP-aligned zero tensors when a modality is absent.
+``reset_*_inference_state`` / ``finalize`` — inference lifecycle.
+``get_parallel_plan`` / ``get_assets`` — build and checkpoint.
 
-``generate_step(**kwargs) -> dict``
-    Inference entry.  Default delegates to :meth:`forward`.  Override when
-    sampling logic differs (e.g. a DiT runs a denoising loop here but a
-    diffusion-loss in ``forward``; an LM head samples a token here but
-    computes CE in ``forward``).
-
-``pre_forward(method, **kwargs) -> dict``
-    Per-micro-batch packing / SP slice / data-routing prep.  ``method`` is
-    the graph node entry point (``"forward"``, ``"encode"``, ``"decode"``, …).
-    Default: identity.
-
-``post_forward(method, **outputs) -> dict``
-    Per-call post-processing — e.g. SP gather, final ``_loss`` mean,
-    conversation write-back.  ``method`` matches the active graph node.
-    Default: identity.
-
-``freeze_model() -> None``
-    Optionally freeze a subset of this module's params (the trainer calls it
-    once after build, before the FSDP2 wrap / optimizer build).  There is no
-    base default and no generic policy — only modules that actually freeze
-    something implement it (e.g. ``JanusVqvae`` freezes its inner codec via
-    its own ``config.freeze`` knob; the LLM backbone never overrides it).
-
-``get_parallel_plan() -> Any | None``
-    Per-module FSDP / EP / SP plan.  Default: ``None`` (inherit OmniModel
-    defaults).
-
-``get_assets() -> list``
-    Module-owned tooling that should be saved alongside the module weights
-    (vision processor, audio feature extractor, codebook lookup tables, ...).
-    Tokenizers belong on the module that needs them (e.g. ``janus_text_encoder``).
-    Default: ``[]``.
-
-``finalize(*, ctx) -> dict``
-    Inference-only flush hook.  ``OmniModel.generate`` calls it on *every*
-    module exactly once, but **only** when the ``max_new_tokens`` safety cap
-    trips before the FSM reaches ``done`` (the normal-completion path emits
-    via each module's per-step ``generated`` payload instead).  Override to
-    flush any partially-accumulated output the module still holds — e.g. the
-    text encoder decodes its buffered token cache, the VQVAE decodes a full
-    VQ grid.  Return ``{"generated": {"type": ..., "value": ...}}`` to append
-    to :attr:`OmniModel.generated`, or ``{}`` for nothing.  Default: ``{}``.
-
-``dummy_inputs(*, batch_size, device, dtype) -> dict``
-    Zero-tensor placeholders the trainer fills in **during training** for
-    micro-batches that are missing one of this module's inputs (e.g. a
-    text-only sample missing ``pixel_values``).  This is the
-    "training-side dummy forward" mechanism — every active node must
-    forward on every micro-batch to keep FSDP DP/SP graphs aligned (see
-    "Training vs. inference no input semantics" below).  Inference runners
-    do NOT call this; they let the model fast-skip via
-    ``if x is None: return {}``.  Default: ``{}`` (no dummies).
-
-Training vs. inference "no input" semantics
--------------------------------------------
-The two runtimes treat a missing optional input differently — by design:
-
-* **Training** (FSDP).  Every active node MUST forward on every
-  micro-batch or DP/SP all-reduce hangs.  When a micro-batch lacks one
-  of a module's inputs (e.g. a text-only sample with no image), the
-  encoder runs its :meth:`dummy_inputs` zero tensors and appends a
-  ``role="dummy"`` placeholder item to ``conversation_list`` instead of
-  ``return {}``.  The backbone skips dummy rows when packing but folds a
-  ``+ dummy.value.mean() * 0.0`` "anchor" term into ``inputs_embeds``
-  (see ``JanusLlama._fold_fsdp_dummy_anchors``) so a zero-gradient path
-  still flows back through the dummy-producing encoder and FSDP grad-sync
-  stays aligned across ranks.
-
-* **Inference** (no FSDP).  No grad sync, no DP alignment.  The runtime
-  does **not** fill dummies; ``GenerationGraph.step`` permissively
-  skips an edge whose source produced an empty ``{}``.  The destination
-  node still executes (with ``None`` for the absent kwarg) so its other
-  inputs route normally.
-
-Loss protocol (single ``_loss`` key)
-------------------------------------
-* A module may emit *at most one* loss term per node.
-* The loss key MUST be exactly ``"_loss"`` (no ``"text_loss"``,
-  ``"gen_loss"`` etc — module identity is already disambiguating because
-  ``OmniModel`` indexes by node name).
-* The value MUST be a **token-level mean** computed inside ``forward``
-  /``post_forward`` — i.e. the module is responsible for summing per-token
-  CE across all its micro-batches and dividing by the matching valid-token
-  count.  Returning a per-batch mean breaks gradient correctness when token
-  counts differ across micro-batches.
-* ``OmniModel.forward`` collects every node's ``_loss`` and sums them into
-  the total scalar.  Modules that produce no loss return a dict without
-  ``_loss``.
-
-Build / save lifecycle
-----------------------
-``build_*`` and ``CheckpointCallback`` are wired by ``OmniModel`` /
-``OmniTrainer`` — they walk every module and call:
-
-  1. :func:`veomni.distributed.torch_parallelize.build_foundation_model`
-     ``(module_cfg, init_device)`` — meta-device or eager construction.
-  2. :func:`veomni.distributed.torch_parallelize.build_parallelize_model`
-     ``(model, weights_path=cfg["weights_path"], plan=module.get_parallel_plan(), ...)``
-  3. Per-module :class:`~veomni.trainer.callbacks.CheckpointCallback` writes
-     to ``<ckpt_root>/<module_name>/{model.safetensors, config.json,
-     <assets...>}`` — each module's directory is self-contained.
-
-These functions are imported lazily by the trainer; the mixin itself stays
-import-safe in a torch-free / cpu-only environment so graph-runtime
-tests can exercise the FSM without GPUs.
+Training nodes must emit at most one token-mean ``_loss``; ``OmniModel``
+sums them.  See ``docs/design/seed_omni_v2.md`` for the full contract.
 """
 
 from typing import Any, Dict, List, Optional, Type

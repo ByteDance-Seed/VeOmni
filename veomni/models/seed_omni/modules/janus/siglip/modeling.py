@@ -1,18 +1,7 @@
-"""
-JanusSiglip — Janus' SigLIP vision tower + MLP aligner as one OmniModule.
+"""Janus SigLIP vision tower + MLP aligner.
 
-Mixin form: ``class JanusSiglip(OmniModule, PreTrainedModel)``.  The vision
-stack reuses HuggingFace :class:`~transformers.JanusVisionModel` and
-:class:`~transformers.JanusVisionAlignerMLP` — the same pair wired inside
-``JanusForConditionalGeneration`` (``aligner(vision_model(pixel_values))``).
-
-Call-site split (V2)
---------------------
-* :meth:`pre_forward` — pull raw ``(C,H,W)`` images from ``conversation_list``
-  → ``pixel_values``; stash the carrier for :meth:`post_forward`.
-* :meth:`forward` — pure encoder: ``pixel_values`` → ``image_embeds`` (HF path).
-* :meth:`post_forward` — write ``image_embeds`` back onto ``conversation_list``
-  ``type="image"`` items in place.
+``JanusSiglip(JanusSiglipModuleMixin, PreTrainedModel)`` — HF vision stack in
+this file; graph hooks in ``modulemixin.py``.
 """
 
 from typing import Any, Dict, Optional

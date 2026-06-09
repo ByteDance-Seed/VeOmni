@@ -6,7 +6,7 @@ YAML structure (maps 1-to-1 to this class):
   # ── Global asset (the ONLY global asset; everything else is per-module).
   model_path: /path/to/split/checkpoint/root
 
-  # ── Modules: one entry per OmniModule.  Each block mirrors a mini
+  # ── Modules: one entry per graph sub-model.  Each block mirrors a mini
   #    ``VeOmniOmniArguments`` (``model`` / ``train`` / ``data``).  ``model_type``
   #    is read from each module's ``config.json`` and is NOT specified here.
   modules:

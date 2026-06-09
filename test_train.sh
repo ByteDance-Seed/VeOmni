@@ -1,3 +1,3 @@
-bash scripts/seed_omni/debug_omni_2gpu.sh mixed
-bash scripts/seed_omni/debug_omni_2gpu.sh understanding
-bash scripts/seed_omni/debug_omni_2gpu.sh t2i
+bash scripts/seed_omni/debug_omni.sh mixed
+bash scripts/seed_omni/debug_omni.sh understanding
+bash scripts/seed_omni/debug_omni.sh t2i

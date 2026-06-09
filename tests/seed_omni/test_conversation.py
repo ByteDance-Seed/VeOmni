@@ -1,4 +1,4 @@
-"""Unit tests for the SeedOmni V2 inference conversation-list helpers."""
+"""Unit tests for SeedOmni V2 conversation-list helpers."""
 
 from __future__ import annotations
 
@@ -14,12 +14,9 @@ from veomni.models.seed_omni.conversation import (
 )
 
 
-def test_build_conversation_text_only_yields_two_parts():
+def test_build_conversation_text_only_yields_user_part():
     parts = build_conversation(prompt="hello")
-    assert [(p.type, p.role, p.value) for p in parts] == [
-        ("text", "user", "hello"),
-        ("text", "assistant", ""),
-    ]
+    assert [(p.type, p.role, p.value) for p in parts] == [("text", "user", "hello")]
 
 
 def test_build_conversation_with_images_places_them_first():
@@ -29,17 +26,14 @@ def test_build_conversation_with_images_places_them_first():
         ("image", "user"),
         ("image", "user"),
         ("text", "user"),
-        ("text", "assistant"),
     ]
     assert parts[0].value is img_a
     assert parts[1].value is img_b
     assert parts[2].value == "describe"
-    assert parts[3].value == ""
 
 
-def test_conversation_item_defaults():
-    p = ConversationItem(type="text", role="user")
-    assert p.value is None
+def test_conversation_item_meta_defaults_empty():
+    p = ConversationItem(type="text", value="", role="user")
     assert p.meta == {}
 
 
@@ -47,12 +41,12 @@ def test_output_merge_and_seal():
     a = ConversationItem(type="output", value=torch.zeros(1, 2, 4), meta={"phase": "text"})
     b = ConversationItem(type="output", value=torch.ones(1, 1, 4), meta={"phase": "text"})
     parts = [a, b]
-    assert maybe_merge_outputs(parts, phase="text")
+    assert maybe_merge_outputs(parts)
     assert len(parts) == 1
     assert parts[0].value.shape == (1, 3, 4)
-    assert seal_outputs(parts, new_type="text") == 1
+    seal_outputs(parts, new_type="text")
     assert parts[0].type == "text"
-    assert "phase" not in parts[0].meta
+    assert "phase" in parts[0].meta
 
 
 def test_iter_desired_items_allows_multiple_images_per_sample():

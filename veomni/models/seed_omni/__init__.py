@@ -16,7 +16,7 @@
 # Exports cluster around three concerns:
 #
 #   1. Core graph / runtime types (:class:`OmniConfig`, :class:`OmniModel`,
-#      :class:`OmniModule`, :class:`TrainingGraph`, :class:`GenerationGraph`).
+#      :class:`ModuleMixin`, :class:`TrainingGraph`, :class:`GenerationGraph`).
 #   2. Module registries — :data:`OMNI_CONFIG_REGISTRY`,
 #      :data:`OMNI_MODEL_REGISTRY`, :data:`OMNI_PROCESSOR_REGISTRY` — resolve
 #      ``model_type → class`` lazily at runtime.

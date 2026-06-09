@@ -11,7 +11,7 @@ Architecture
 ------------
 ``OmniModel`` carries:
 
-* sub-modules           — each named :class:`OmniModule` is attached as a
+* sub-modules           — each named :class:`ModuleMixin` is attached as a
                           **direct attribute** of ``OmniModel``, so
                           ``model.named_children()`` enumerates them in the
                           declared order and parameter fqns flatten to
@@ -38,7 +38,7 @@ Training
 --------
 For each node in ``training_graph.execution_order``:
 
-  1. Look up the OmniModule via ``training_graph.module_of(node)``.
+  1. Look up the ModuleMixin via ``training_graph.module_of(node)``.
   2. ``training_graph.collect_inputs(node, outputs, batch)`` returns a shallow
      copy of the shared ``batch`` (which carries the mutable
      ``conversation_list``).  Edges declare execution order only — they do
@@ -107,11 +107,11 @@ class OmniModel(nn.Module):
         :class:`OmniConfig` with ``modules`` / ``nodes`` / ``edges`` /
         ``training_graph`` / ``generation_graph`` populated.
     modules:
-        ``{module_name: OmniModule-mixin instance}`` — already constructed
+        ``{module_name: ModuleMixin-mixin instance}`` — already constructed
         (and parallelised, if running under FSDP).  ``OmniTrainer`` is
         responsible for building these via ``build_foundation_model`` /
         ``build_parallelize_model``.  The print-flow tests pass plain
-        :class:`OmniModule` subclasses here.
+        :class:`ModuleMixin` subclasses here.
 
     Notes
     -----
@@ -357,7 +357,7 @@ class OmniModel(nn.Module):
         ctx: Dict[str, Any],
         trace: Optional[List[str]] = None,
     ) -> None:
-        """Call :meth:`OmniModule.finalize` and drain any ``generated`` payload.
+        """Call :meth:`ModuleMixin.finalize` and drain any ``generated`` payload.
 
         Runs on every module when ``max_new_tokens`` trips before ``done``.
         """
@@ -471,7 +471,7 @@ class OmniModel(nn.Module):
 
     def named_omni_modules(self) -> Iterator[Tuple[str, nn.Module]]:
         """Yield ``(name, raw_module)`` for every entry whose unwrapped form
-        is an :class:`OmniModule` mixin instance."""
+        is an :class:`ModuleMixin` mixin instance."""
         for name in self._module_names:
             raw = _unwrap_module(getattr(self, name))
             if _is_omni_module(raw):

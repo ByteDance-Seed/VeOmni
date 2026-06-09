@@ -30,10 +30,10 @@ class TextEncoderModuleMixin(ModuleMixin):
 
     # training hooks
     def pre_forward(self, method: str, **kwargs: Any) -> Dict[str, Any]:
-        raise NotImplementedError("TextEncoderOmniModelMixin.pre_forward is not implemented")
+        raise NotImplementedError("TextEncoderModuleMixin.pre_forward is not implemented")
 
     def post_forward(self, method: str, **outputs: Any) -> Dict[str, Any]:
-        raise NotImplementedError("TextEncoderOmniModelMixin.post_forward is not implemented")
+        raise ValueError("TextEncoderModuleMixin.post_forward: is not implemented")
 
     # inference hooks
     def reset_local_inference_state(self) -> None:
@@ -44,7 +44,7 @@ class TextEncoderModuleMixin(ModuleMixin):
         self._bos_injected = False
 
     def generate(self, conversation_list: list[list[ConversationItem]], **generation_kwargs: Any) -> Dict[str, Any]:
-        raise NotImplementedError("TextEncoderOmniModelMixin.generate is not implemented")
+        raise NotImplementedError("TextEncoderModuleMixin.generate is not implemented")
 
     def _project(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if self.config.tie_word_embeddings:
