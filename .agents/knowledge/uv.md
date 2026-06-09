@@ -31,9 +31,10 @@ pyproject.toml
 │   │                  torch 2.11.0+cu130 + cu130 nvidia stack + cuda-python
 │   │                  + FA2 / FA3 / FA4 / FlashQLA (all source-built)
 │   │                  + liger-kernel + FLA + quack + DLPack ext
-│   │                  + diffusers / av / librosa / soundfile / ftfy / trl / peft
+│   │                  + diffusers / av / librosa / soundfile / ftfy / peft
+│   │                  + megatron-energon (optional dataset format)
 │   ├── npu          Ascend NPU x86_64 — full superset, minus CUDA-only kernels:
-│   │                  torch 2.7.1+cpu + torch-npu + diffusers / av / trl / peft
+│   │                  torch 2.7.1+cpu + torch-npu + diffusers / av / peft / megatron-energon
 │   ├── npu_aarch64  Ascend NPU aarch64 — minimal (torch + torch-npu only;
 │   │                  av/torchcodec lack pinned aarch64 wheels)
 │   └── dev          pre-commit, ruff, pytest (legacy pip-style; modern uv path is the dev group)
@@ -54,10 +55,15 @@ pyproject.toml
 ```
 
 History note: an earlier revision split the Python-level deps (`audio`, `video`,
-`dit`, `trl`, `lora`, `fa3`, `fa4`, `flash-qla`, `megatron`) into nine separate
+`dit`, `lora`, `fa3`, `fa4`, `flash-qla`, `megatron`) into eight separate
 extras, which forced docker / CI / docs to chain seven-plus `--extra` flags.
 Those have all been folded into `gpu` / `npu` so a typical install is a single
-`--extra <gpu|npu|npu_aarch64>`.
+`--extra <gpu|npu|npu_aarch64>`. The original `trl` extra was also dropped
+entirely (not folded): the text DPO trainer at `veomni/trainer/text_dpo_trainer.py`
+is from-scratch, never imports `trl`, and the pinned `<=0.9.6` is a transformers
+v4-era release that does not work against our pinned transformers v5. Users who
+want trl for their own experiments should `pip install trl` against a transformers
+version they control.
 
 ## Hardware Extras (Mutually Exclusive)
 
@@ -66,8 +72,8 @@ installed at a time. There are no other extras to chain alongside them; each
 is a complete superset.
 
 ```bash
-uv sync --extra gpu --dev           # NVIDIA GPU — torch+cu130, FA2/3/4/FlashQLA, diffusion, audio, trl, peft
-uv sync --extra npu --dev           # Ascend NPU x86 — torch+cpu, torch-npu, diffusion, audio, trl, peft
+uv sync --extra gpu --dev           # NVIDIA GPU — torch+cu130, FA2/3/4/FlashQLA, diffusion, audio, peft, megatron-energon
+uv sync --extra npu --dev           # Ascend NPU x86 — torch+cpu, torch-npu, diffusion, audio, peft, megatron-energon
 uv sync --extra npu_aarch64 --dev   # Ascend NPU ARM — minimal (torch + torch-npu)
 ```
 

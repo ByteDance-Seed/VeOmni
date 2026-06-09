@@ -12,7 +12,9 @@ Read `.agents/knowledge/uv.md` for the full dependency architecture. The key thi
 - hardware extras (`gpu`, `npu`, `npu_aarch64`) are **mutually conflicting**
 - there are only three feature-bearing extras (`gpu` / `npu` / `npu_aarch64`),
   each one a complete superset; the older à la carte extras (`audio`, `video`,
-  `dit`, `trl`, `lora`, `fa3`, `fa4`, `flash-qla`, `megatron`) were rolled in
+  `dit`, `lora`, `fa3`, `fa4`, `flash-qla`, `megatron`) were rolled in. The
+  original `trl<=0.9.6` extra was dropped (not folded) because nothing in
+  VeOmni imports trl and the pin is a transformers v4-era release
 
 ## Scenario 1: Update uv Version
 

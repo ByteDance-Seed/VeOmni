@@ -13,11 +13,13 @@
 # Extras synced by `uv sync` per backend/architecture. Each image picks one
 # via `uv_extras_preset: <name>`. The pyproject's `[project.optional-dependencies]`
 # was deliberately funnelled into three hardware-shaped extras (gpu / npu /
-# npu_aarch64) — the older à la carte feature extras (audio, video, dit, trl,
+# npu_aarch64) — the older à la carte feature extras (audio, video, dit,
 # lora, fa3, fa4, flash-qla, megatron) were rolled into them — so each preset
-# is just the single hardware extra. The presets layer is kept for clarity
-# and because `uv_extras_preset:` is a per-image field; renaming or adding a
-# new hardware backend (e.g. a future ROCm / TPU image) lands here.
+# is just the single hardware extra. The original `trl` extra was dropped
+# entirely (not folded) because nothing in VeOmni imports trl. The presets
+# layer is kept for clarity and because `uv_extras_preset:` is a per-image
+# field; renaming or adding a new hardware backend (e.g. a future ROCm / TPU
+# image) lands here.
 #
 # Why not `uv sync --all-extras`? Because [tool.uv].conflicts in
 # pyproject.toml declares `gpu` / `npu` / `npu_aarch64` mutually exclusive,
@@ -28,13 +30,15 @@ uv_extras_presets:
     # cu130 toolchain: torch 2.11+cu130, cudnn cu13, full attention kernel
     # stack (FA2 / FA3 / FA4 / FlashQLA — all source-built; first build is
     # ~60–90 min, uv caches subsequent syncs). Also includes diffusion +
-    # audio + trl + lora deps. See pyproject.toml `[project.optional-dependencies].gpu`.
+    # audio + lora + megatron-energon deps. See pyproject.toml
+    # `[project.optional-dependencies].gpu`.
     - gpu
 
   ascend_x86:
     # Ascend NPU on x86. torch 2.7.1+cpu + torch-npu, plus the same Python
-    # feature stack (diffusion / audio / trl / lora) — minus the CUDA-only
-    # FA3 / FA4 / FlashQLA kernels. See pyproject.toml `[project.optional-dependencies].npu`.
+    # feature stack (diffusion / audio / lora / megatron-energon) — minus the
+    # CUDA-only FA3 / FA4 / FlashQLA kernels. See pyproject.toml
+    # `[project.optional-dependencies].npu`.
     - npu
 
   ascend_arm:

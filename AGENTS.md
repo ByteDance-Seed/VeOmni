@@ -45,9 +45,12 @@ source .venv/bin/activate
 
 This installs `transformers==5.9.0` (pinned by the `transformers-stable`
 default dependency group in `pyproject.toml`). The `gpu` extra is a single
-full superset (cu130 torch + every attention kernel + diffusion/audio/trl/peft);
-there is no separate `--extra audio` / `--extra dit` / etc. any more. Always
-activate `.venv/` before running any commands. New code must target
+full superset (cu130 torch + every attention kernel + diffusion/audio/peft +
+megatron-energon for the optional energon dataset format); there is no
+separate `--extra audio` / `--extra dit` / etc. any more. The original
+`trl<=0.9.6` extra was dropped — VeOmni's DPO trainer is from-scratch and
+never imported trl, and the pin is incompatible with transformers v5 anyway.
+Always activate `.venv/` before running any commands. New code must target
 transformers v5 and FSDP2. See `.agents/knowledge/constraints.md` for details.
 
 ---

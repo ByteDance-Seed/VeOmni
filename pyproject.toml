@@ -45,12 +45,22 @@ dependencies = [
 # extras (declared in `[tool.uv].conflicts` below) so that a typical install is
 # `uv sync --extra <gpu|npu|npu_aarch64>` — one flag, no à la carte feature
 # extras to remember. Earlier revisions split the Python-level deps (audio,
-# video, dit, trl, lora, fa3, fa4, flash-qla, megatron) into nine separate
+# video, dit, lora, fa3, fa4, flash-qla, megatron) into eight separate
 # extras, which forced docker / CI / docs to chain seven-plus `--extra` flags
 # and made the `pip install veomni[<???>]` UX a maze. Those splits are gone:
 # everything that's CUDA-safe lives in `gpu`, everything that's NPU-safe lives
 # in `npu`, and the aarch64 NPU build stays minimal (the aarch64 wheel set for
 # av / torchcodec is incomplete on PyPI as of 2026-06).
+#
+# A note on what is NOT in `gpu` / `npu`: the original uv migration also
+# carried a `trl = ["trl<=0.9.6"]` extra, but nothing in VeOmni ever imported
+# trl — the text DPO trainer at veomni/trainer/text_dpo_trainer.py is a
+# from-scratch implementation. The pinned `<=0.9.6` is also a transformers
+# 4.x-era release and is not API-compatible with our pinned transformers v5.
+# Rather than fold a stale, unused dep into both supersets, the trl extra
+# was removed entirely. Users who genuinely want trl for their own DPO
+# experiments should `pip install trl` against a transformers version they
+# control.
 #
 # Trade-off: a fresh `uv sync --extra gpu` source-builds flash-attn (FA2),
 # flash-attn-3, flash-attn-4, and flash-qla — collectively ~60–90 min the
@@ -112,11 +122,10 @@ gpu = [
   "av>=14.0.0,<14.3; python_version == '3.12'",
   "librosa>=0.11.0,<0.12",
   "soundfile>=0.13.1,<0.14",
-  # Diffusion / RLHF / LoRA
   "diffusers==0.37.0",
   "ftfy",
-  "trl<=0.9.6",
   "peft==0.18.1",
+  "megatron-energon>=7.2.1",
   # Misc runtime
   "hf_transfer",
 ]
@@ -141,11 +150,10 @@ npu = [
   "av>=14.0.0,<14.3; python_version == '3.12'",
   "librosa>=0.11.0,<0.12",
   "soundfile>=0.13.1,<0.14",
-  # Diffusion / RLHF / LoRA
   "diffusers==0.37.0",
   "ftfy",
-  "trl<=0.9.6",
   "peft==0.18.1",
+  "megatron-energon>=7.2.1",
   # Misc runtime
   "hf_transfer",
 ]

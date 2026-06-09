@@ -28,12 +28,16 @@ source .venv/bin/activate
 
 The `gpu` extra is a single, full superset: it pulls in the cu130 torch
 stack, every attention kernel (FA2 / FA3 / FA4 / FlashQLA — all source-built),
-plus the diffusion / audio / video / RLHF / LoRA Python deps. There is no
-need to chain multiple `--extra` flags any more — the older `audio`, `video`,
-`dit`, `trl`, `lora`, `fa3`, `fa4`, `flash-qla` extras have been folded into
-`gpu`. A first sync is slow (the source builds for FA2/FA3/FA4/FlashQLA take
-~60–90 min combined); uv caches the built wheels under `~/.cache/uv` so
-subsequent syncs are fast. See [pyproject.toml](https://github.com/ByteDance-Seed/VeOmni/blob/main/pyproject.toml) for the exact dependency list.
+plus the diffusion / audio / video / LoRA Python deps and `megatron-energon`
+for the optional energon dataset format. There is no need to chain multiple
+`--extra` flags any more — the older `audio`, `video`, `dit`, `lora`, `fa3`,
+`fa4`, `flash-qla`, `megatron` extras have been folded into `gpu`. The
+original `trl` extra was dropped entirely because VeOmni's DPO trainer is
+from-scratch and never imported trl; if you want to use trl in your own
+scripts, install it separately (`pip install trl`) against a transformers
+version you control. A first sync is slow (the source builds for
+FA2/FA3/FA4/FlashQLA take ~60–90 min combined); uv caches the built wheels
+under `~/.cache/uv` so subsequent syncs are fast. See [pyproject.toml](https://github.com/ByteDance-Seed/VeOmni/blob/main/pyproject.toml) for the exact dependency list.
 
 > **Note**: video/audio processing also needs ffmpeg installed at the OS level:
 > ```bash
