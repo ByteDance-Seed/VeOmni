@@ -754,7 +754,7 @@ def create_profiler(
         with_stack=with_stack,
         experimental_config=experimental_config,
     )
-    if IS_CUDA_AVAILABLE and profile_memory:
+    if (IS_CUDA_AVAILABLE or IS_NPU_AVAILABLE) and profile_memory:
         return ProfilerWithMem(base_profiler)
     else:
         return base_profiler
