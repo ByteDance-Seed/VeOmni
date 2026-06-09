@@ -61,7 +61,7 @@ Phase 5: Knowledge capture           -> pending
 4. Check dependencies — different transformers version? Different PyTorch version?
 5. **If a package version upgrade is suspected**, create isolated uv environments to bisect:
    ```bash
-   # Create the default env on the default pin (`transformers-stable` → 5.2.0).
+   # Create the default env on the default pin (`transformers-stable` → 5.9.0).
    uv venv .venv-default
    VIRTUAL_ENV=.venv-default uv sync --extra gpu --dev
    ```

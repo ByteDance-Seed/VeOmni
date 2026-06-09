@@ -532,8 +532,9 @@ class VeomniFlopsCounter:
         """
         Compute hybrid attention (full + GatedDeltaNet) linear param count and layer info.
 
-        Layers alternate between full attention and GatedDeltaNet (linear attention) in groups
-        of `full_attention_interval` layers: (full_attention_interval - 1) linear layers followed
+        Layers alternate between full attention and GatedDeltaNet (linear attention). The
+        per-layer schedule is read from `config.layer_types` ("full_attention" /
+        "linear_attention"); the typical pattern is (interval - 1) linear layers followed
         by 1 full attention layer.
 
         Full attention (Qwen3_5Attention) projections:
@@ -569,8 +570,40 @@ class VeomniFlopsCounter:
         k_size = num_key_value_heads * head_dim
         v_size = num_key_value_heads * head_dim
 
-        full_attention_interval = config.full_attention_interval
-        num_full_attn_layers = config.num_hidden_layers // full_attention_interval
+        # transformers v5 no longer exposes `full_attention_interval` on the config;
+        # it normalizes the schedule into `layer_types`. Count the full / linear layers
+        # directly from `layer_types` when present (handles non-uniform schedules too),
+        # falling back to the legacy interval attribute for older configs.
+        num_hidden_layers = config.num_hidden_layers
+        layer_types = getattr(config, "layer_types", None)
+        if layer_types is not None:
+            num_full_attn_layers = sum(t == "full_attention" for t in layer_types)
+            num_linear_attn_layers = sum(t == "linear_attention" for t in layer_types)
+        else:
+            full_attention_interval = getattr(config, "full_attention_interval", None)
+            if full_attention_interval is None:
+                raise ValueError(
+                    "Cannot determine the hybrid-attention layer schedule: config exposes neither "
+                    "`layer_types` (transformers v5) nor `full_attention_interval` (legacy). "
+                    "Verify this is a hybrid-attention (Qwen3.5-style) config."
+                )
+            # A non-positive interval would divide-by-zero or yield negative counts that the
+            # sum check below cannot catch (the legacy branch derives linear = total - full).
+            if full_attention_interval <= 0:
+                raise ValueError(
+                    f"Invalid `full_attention_interval`: {full_attention_interval}. It must be a positive integer."
+                )
+            num_full_attn_layers = num_hidden_layers // full_attention_interval
+            num_linear_attn_layers = num_hidden_layers - num_full_attn_layers
+
+        # Guard against unrecognized / missing entries in `layer_types` silently
+        # under-counting params (e.g. a future third attention type).
+        if num_full_attn_layers + num_linear_attn_layers != num_hidden_layers:
+            raise ValueError(
+                f"Hybrid-attention layer count mismatch: {num_full_attn_layers} full + "
+                f"{num_linear_attn_layers} linear != {num_hidden_layers} total layers. "
+                "The config may use an unsupported entry in `config.layer_types`."
+            )
 
         # Full attention: q_proj + k_proj + v_proj + o_proj
         full_attn_linear_N = hidden_size * (q_size + k_size + v_size + num_attention_heads * head_dim)
@@ -585,14 +618,12 @@ class VeomniFlopsCounter:
         conv_N = config.linear_conv_kernel_dim * (2 * linear_k_size + linear_v_size)
         linear_attn_linear_N = hidden_size * linear_attn_size + conv_N
 
-        # Each group has 1 full attention layer + (full_attention_interval - 1) GatedDeltaNet layers
-        num_linear_attn_per_group = full_attention_interval - 1
-        attn_linear_N = (full_attn_linear_N + num_linear_attn_per_group * linear_attn_linear_N) * num_full_attn_layers
+        attn_linear_N = full_attn_linear_N * num_full_attn_layers + linear_attn_linear_N * num_linear_attn_layers
 
-        return attn_linear_N, num_full_attn_layers, head_dim, num_attention_heads
+        return attn_linear_N, num_full_attn_layers, num_linear_attn_layers, head_dim, num_attention_heads
 
     @staticmethod
-    def _compute_gdn_recurrence_flops(config, tokens_sum, num_full_attn_layers):
+    def _compute_gdn_recurrence_flops(config, tokens_sum, num_gdn_layers):
         """
         Compute FLOPs for the GatedDeltaNet recurrence across all GDN layers.
 
@@ -620,7 +651,6 @@ class VeomniFlopsCounter:
             fwd: (2 + 1 + 2) * d_v * d_k = 5 * d_v * d_k per step per head
             fwd + bwd (3x): 15 * d_v * d_k per step per head
         """
-        num_gdn_layers = config.num_hidden_layers - num_full_attn_layers
         return (
             15
             * config.linear_key_head_dim
@@ -639,8 +669,8 @@ class VeomniFlopsCounter:
         num_hidden_layers = self.config.num_hidden_layers
 
         # hybrid attention params
-        attn_linear_N, num_full_attn_layers, head_dim, num_attention_heads = self._compute_hybrid_attn_params(
-            self.config
+        attn_linear_N, num_full_attn_layers, num_linear_attn_layers, head_dim, num_attention_heads = (
+            self._compute_hybrid_attn_params(self.config)
         )
 
         # moe per layer parm
@@ -661,7 +691,7 @@ class VeomniFlopsCounter:
         attn_qkv_flops = 12 * seqlen_square_sum * head_dim * num_attention_heads * num_full_attn_layers
 
         # GatedDeltaNet recurrence flops (state update + query, for all GDN layers)
-        gdn_recurrence_flops = self._compute_gdn_recurrence_flops(self.config, tokens_sum, num_full_attn_layers)
+        gdn_recurrence_flops = self._compute_gdn_recurrence_flops(self.config, tokens_sum, num_linear_attn_layers)
 
         # all_layer & all_token fwd & bwd flops
         flops_all_token = dense_N_flops + attn_qkv_flops + gdn_recurrence_flops
@@ -711,8 +741,8 @@ class VeomniFlopsCounter:
         num_hidden_layers = text_config.num_hidden_layers
 
         # hybrid attention linear projection params (full + GatedDeltaNet)
-        attn_linear_N, num_full_attn_layers, head_dim, num_attention_heads = self._compute_hybrid_attn_params(
-            text_config
+        attn_linear_N, num_full_attn_layers, num_linear_attn_layers, head_dim, num_attention_heads = (
+            self._compute_hybrid_attn_params(text_config)
         )
 
         # MLP params: MoE or dense depending on config
@@ -739,7 +769,7 @@ class VeomniFlopsCounter:
         attn_qkv_flops = 12 * seqlen_square_sum * head_dim * num_attention_heads * num_full_attn_layers
 
         # GatedDeltaNet recurrence flops (state update + query, for all GDN layers)
-        gdn_recurrence_flops = self._compute_gdn_recurrence_flops(text_config, tokens_sum, num_full_attn_layers)
+        gdn_recurrence_flops = self._compute_gdn_recurrence_flops(text_config, tokens_sum, num_linear_attn_layers)
 
         # vit flops (Qwen3-VL ViT)
         images_seqlens = kargs.get("images_seqlens", None)

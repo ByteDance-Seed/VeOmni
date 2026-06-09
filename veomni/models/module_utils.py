@@ -379,6 +379,12 @@ def load_model_weights(
         model, buffer_dict, parameter_names_to_load, dtensor_factory, dtensor_to_cpu=dtensor_to_cpu
     )
 
+    fqn_to_index_mapping = kwargs.get("fqn_to_index_mapping")
+    if fqn_to_index_mapping is not None:
+        from .checkpoint_tensor_loading import prepare_fqn_to_index_mapping_for_model
+
+        prepare_fqn_to_index_mapping_for_model(model, fqn_to_index_mapping)
+
 
 @torch.no_grad()
 def rank0_load_and_broadcast_weights(
@@ -758,6 +764,12 @@ def rank0_load_and_broadcast_weights(
     post_process_after_weight_loading(
         model, buffer_dict, parameter_names_to_load, dtensor_factory, dtensor_to_cpu=dtensor_to_cpu
     )
+
+    fqn_to_index_mapping = kwargs.get("fqn_to_index_mapping")
+    if fqn_to_index_mapping is not None:
+        from .checkpoint_tensor_loading import prepare_fqn_to_index_mapping_for_model
+
+        prepare_fqn_to_index_mapping_for_model(model, fqn_to_index_mapping)
 
 
 def post_process_after_weight_loading(

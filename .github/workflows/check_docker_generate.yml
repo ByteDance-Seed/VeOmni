@@ -1,0 +1,36 @@
+name: Check Docker Generate Drift
+
+on:
+  pull_request:
+    paths:
+      - "docker/**"
+      - ".github/workflows/check_docker_generate.yml"
+  push:
+    branches:
+      - main
+    paths:
+      - "docker/**"
+      - ".github/workflows/check_docker_generate.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  check_docker_generate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # We deliberately invoke generate.py via plain python instead of
+      # `uv run --script`: the project pins `[tool.uv].required-version`, and
+      # `uv run` from the repo root enforces that pin even with --no-project,
+      # which would couple this drift check to the project's uv version.
+      - name: Install script dependencies
+        run: pip install jinja2 pyyaml
+
+      - name: Check generated Dockerfiles are up to date
+        run: python docker/generate.py --check

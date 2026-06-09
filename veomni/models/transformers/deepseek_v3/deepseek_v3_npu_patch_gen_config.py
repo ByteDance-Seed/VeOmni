@@ -15,7 +15,7 @@
 Patch configuration for DeepseekV3 NPU patched modeling generation.
 
 Regen command:
-python -m veomni.patchgen.run_codegen veomni.models.transformers.deepseek_v3.deepseek_v3_npu_patch_gen_config -o veomni/models/transformers/deepseek_v3/generated --diff
+patchgen veomni.models.transformers.deepseek_v3.deepseek_v3_npu_patch_gen_config -o veomni/models/transformers/deepseek_v3/generated --diff
 
 NPU differs from GPU in leaf-op kernels only:
 1. RMSNorm.forward uses ``veomni.ops.kernels.rms_norm.npu.rms_norm_forward_npu``.

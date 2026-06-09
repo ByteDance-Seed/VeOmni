@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import json
 import math
 import os
 from dataclasses import dataclass, field
@@ -958,12 +957,12 @@ class ModelArguments:
             if os.path.exists(default_idx_path):
                 self.safetensor_idx_path = default_idx_path
 
-        # Parse fqn_to_index_mapping from safetensor index json
+        # Parse raw HF weight_map from safetensor index json (MoE key renames happen at runtime).
         self.fqn_to_index_mapping = None
         if self.safetensor_idx_path is not None:
-            with open(self.safetensor_idx_path) as f:
-                weight_map = json.load(f)["weight_map"]
-            self.fqn_to_index_mapping = {fqn: int(filename.split("-")[1]) for fqn, filename in weight_map.items()}
+            from ..models.checkpoint_tensor_loading import parse_fqn_to_index_mapping_from_json
+
+            self.fqn_to_index_mapping = parse_fqn_to_index_mapping_from_json(self.safetensor_idx_path)
         if self.fqn_to_index_mapping is None:
             logger.warning_rank0(
                 "fqn_to_index_mapping is None, saved safetensor will be a single file instead of sharded."
@@ -1005,6 +1004,10 @@ class DataloaderConfig:
     pin_memory: bool = field(
         default=True,
         metadata={"help": "Whether to pin memory for dataloader."},
+    )
+    use_background_prefetcher: bool = field(
+        default=False,
+        metadata={"help": "Whether to use BackgroundPrefetcher for dataloader."},
     )
 
 

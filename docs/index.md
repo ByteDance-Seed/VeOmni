@@ -84,6 +84,7 @@ key_features/lora.md
 
 design/seed_omni_v2.md
 design/kernel_selection.md
+design/patchgen.md
 ```
 
 ```{toctree}

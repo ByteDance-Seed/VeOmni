@@ -1,7 +1,7 @@
 # Transformers v5 MoE Weight Loading
 
 This note documents VeOmni MoE weight-loading expectations under
-`transformers==5.2.0` (the only supported transformers version).
+`transformers==5.9.0` (the only supported transformers version).
 
 ## Background
 
@@ -18,7 +18,7 @@ For VeOmni's qwen3_moe path, we use a simpler approach:
 ## Survey: Qwen MoE Weight Formats
 
 Reference mapping from HF:
-- https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/conversion_mapping.py
+- https://github.com/huggingface/transformers/blob/v5.9.0/src/transformers/conversion_mapping.py
 
 ### qwen3_moe
 
@@ -116,6 +116,15 @@ This eliminates the need for offline `moe_merge.py` preprocessing.
 
 ### Saving (VeOmni modeling -> checkpoint)
 
+When `model.safetensors.index.json` from a per-expert HF checkpoint is used for
+sharded HF export, each MoE model registers
+``_convert_fqn_to_index_mapping`` on its modeling classes (next to
+``_create_checkpoint_tensor_converter`` in ``__init__.py``). Conversion runs at
+runtime after weight load (cached on the model) and again in
+``save_hf_safetensor`` via ``resolve_fqn_to_index_mapping_for_save``. Without this
+step, ``save_safetensor_utils`` would drop fused expert tensors because the raw
+index still lists ``experts.{j}.gate_proj.weight`` keys.
+
 Training saves the model state dict as-is, producing the fused VeOmni format:
 
 ```
@@ -139,7 +148,8 @@ python scripts/moe_ckpt_merge/moe_split.py \
     --split_hf_path <output_dir>
 ```
 
-The output is compatible with:
+The script auto-detects the input format (fused `gate_up_proj` or legacy separate
+`gate_proj`/`up_proj`) and splits back to per-expert keys. The output is compatible with:
 - VeOmni (runtime converter handles per-expert keys)
 - HuggingFace `from_pretrained()`
 - Inference engines (vLLM, SGLang)
@@ -178,4 +188,5 @@ Expected tensor interface:
 | Checkpoint Format | VeOmni Load | HF `from_pretrained()` | vLLM/SGLang |
 |---|---|---|---|
 | HF per-expert (original) | runtime converter | direct | direct |
+| legacy merged (gate/up/down separate) | needs fused layout | needs `moe_split.py` | needs `moe_split.py` |
 | VeOmni fused (`gate_up_proj`) | direct | needs `moe_split.py` | needs `moe_split.py` |

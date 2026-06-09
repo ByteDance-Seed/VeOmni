@@ -260,20 +260,6 @@ _ALG_ESSENTIAL_VL_GET_ROPE_INDEX = (
     "variable-shape mrope algorithm. Clean fix is to precompute position_ids in the data "
     "transform and skip the call; out-of-scope for this PR."
 )
-# The qwen2-family ViT rotary path: ``rot_pos_emb`` does a `grid_thw.tolist()`
-# D2H for its per-image position-grid loop, and the ``VisionRotaryEmbedding``
-# it feeds builds ``torch.arange(max_grid_size)`` off a GPU-derived seqlen.
-# Both are HF-verbatim and on the production ViT path. They are *fixable* —
-# qwen3_vl's ViT already derives the rotary position grid host-side — but
-# that migration is a separate effort from this PR's scope (cu_seqlens /
-# cu_window_seqlens / window_index metadata precompute, not rotary embeddings).
-# Tagged pending-fix so dead-entry detection forces cleanup once it lands.
-_PROD_PENDING_VIT_ROT_POS_EMB = (
-    "HF-prod-pending-fix: ViT rot_pos_emb `grid_thw.tolist()` D2H + the "
-    "VisionRotaryEmbedding `torch.arange(max_grid)` it feeds — HF-verbatim, production "
-    "path. Fixable by deriving the rotary position grid host-side in the collator (as "
-    "qwen3_vl's ViT does); out-of-scope for the metadata-precompute PR."
-)
 # Keyed by ``(generated-file basename, enclosing-function qualname)`` — NOT a
 # raw line number. The qualname is resolved from the sync warning's line via
 # AST (`_enclosing_qualname`), so patchgen line shifts no longer rot the
@@ -299,6 +285,7 @@ _ALLOWED_SYNCS: dict[str, dict[tuple[str, str], str]] = {
             "case runs SDPA only because FA2 NaNs on the toy config."
         ),
         ("patched_modeling_qwen3_5_gpu.py", "Qwen3_5Model.get_rope_index"): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
+        ("patched_modeling_qwen3_5_gpu.py", "Qwen3_5Model.get_vision_position_ids"): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
     },
     # qwen3_vl-fa2: the ViT forward consumes the precomputed multimodal
     # metadata — Model.forward selects the per-modality `vit_metadata` sub-dict
@@ -319,6 +306,7 @@ _ALLOWED_SYNCS: dict[str, dict[tuple[str, str], str]] = {
             "returned by the lru_cached helper; over-reported by torch sync-debug mode."
         ),
         ("patched_modeling_qwen3_vl_gpu.py", "Qwen3VLModel.get_rope_index"): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
+        ("patched_modeling_qwen3_vl_gpu.py", "Qwen3VLModel.get_vision_position_ids"): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
     },
     # qwen3_vl_moe-fa2-fused: mirrors qwen3_vl (the moe config imports the
     # vision forward / rot_pos_emb / fast_pos_embed_interpolate helpers from
@@ -328,67 +316,59 @@ _ALLOWED_SYNCS: dict[str, dict[tuple[str, str], str]] = {
             "algorithm-essential: see qwen3_vl-fa2 (rot_pos_ids H2D copy)."
         ),
         ("patched_modeling_qwen3_vl_moe_gpu.py", "Qwen3VLMoeModel.get_rope_index"): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
+        (
+            "patched_modeling_qwen3_vl_moe_gpu.py",
+            "Qwen3VLMoeModel.get_vision_position_ids",
+        ): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
     },
-    # qwen3_omni_moe-fa2-fused: Stage 2 (multimodal_metadata_precompute) wired
-    # the omni ViT forward to consume the precomputed cu_seqlens / max_seqlen,
-    # so the ViT's own `.tolist()` + `torch.tensor(cu_seqlens_list)` fallback
-    # syncs are gone. The omni ViT still calls upstream-HF
-    # `fast_pos_embed_interpolate` / `rot_pos_emb` with the GPU `grid_thw`
-    # tensor (those helpers were not migrated to the host list — unlike
-    # qwen3_vl), so algorithm-essential D2H/H2D sites remain, documented
-    # in PR #764. Full omni ViT-helper migration is tracked as follow-up.
-    "qwen3_omni_moe-fa2-fused": {
-        ("patched_modeling_qwen3_omni_moe_gpu.py", "Qwen3OmniMoeVisionEncoder.rot_pos_emb"): (
-            "algorithm-essential: D2H `grid_thw.tolist()` for the rot_pos_emb host-side loop."
-        ),
-        ("patched_modeling_qwen3_omni_moe_gpu.py", "Qwen3OmniMoeVisionEncoder.fast_pos_embed_interpolate"): (
-            "algorithm-essential: D2H `grid_thw.tolist()` + `torch.tensor(idx/weight_list, "
-            "device=cuda)` H2D copies in fast_pos_embed_interpolate; over-reported by sync-debug."
-        ),
-    },
+    # qwen3_omni_moe-fa2-fused: clean — Stage 2 (multimodal_metadata_precompute)
+    # wired the omni ViT forward to consume the precomputed cu_seqlens /
+    # max_seqlen from the collator, and this PR's transformers 5.9 port
+    # replaced the deprecated `rot_pos_emb` shim with a host-driven
+    # `position_ids` build (no `grid_thw.tolist()` left). The toy test
+    # pre-supplies `position_ids` so the patched `get_rope_index` /
+    # upstream `get_vision_position_ids` are not exercised either.
+    "qwen3_omni_moe-fa2-fused": {},
     # qwen2_vl-fa2: the (non-window) ViT forward consumes the precomputed
     # multimodal metadata — Model.forward selects the per-modality
     # `vit_metadata` sub-dict and threads it to the ViT, so the fallback
-    # `.tolist()` + host-side cu_seqlens build do not fire. Residual syncs:
-    #  - rot_pos_emb / VisionRotaryEmbedding.forward: the HF-verbatim ViT
-    #    rotary path (see _PROD_PENDING_VIT_ROT_POS_EMB).
-    #  - get_rope_index: the HF-verbatim mrope algorithm (same as qwen3_vl).
+    # `.tolist()` + host-side cu_seqlens build do not fire. The patched ViT
+    # forward also builds rotary `position_ids` host-driven from
+    # `grid_thw_list` (mirroring upstream's `get_vision_position_ids`), so
+    # the 5.9-deprecated `self.rot_pos_emb(...)` shim is bypassed entirely —
+    # no rotary-path syncs remain. Residual sync: the HF-verbatim mrope
+    # algorithm in `get_rope_index` (same as qwen3_vl).
     "qwen2_vl-fa2": {
-        ("patched_modeling_qwen2_vl_gpu.py", "Qwen2VisionTransformerPretrainedModel.rot_pos_emb"): (
-            _PROD_PENDING_VIT_ROT_POS_EMB
-        ),
-        ("patched_modeling_qwen2_vl_gpu.py", "VisionRotaryEmbedding.forward"): _PROD_PENDING_VIT_ROT_POS_EMB,
         ("patched_modeling_qwen2_vl_gpu.py", "Qwen2VLModel.get_rope_index"): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
+        ("patched_modeling_qwen2_vl_gpu.py", "Qwen2VLModel.get_vision_position_ids"): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
     },
-    # qwen2_5_vl-fa2: the window-attention ViT forward consumes the precomputed
-    # metadata — cu_seqlens + cu_window_seqlens + the get_window_index
-    # permutation are all collator-derived, so the in-forward `get_window_index`
-    # (`grid_thw.tolist()` + per-image `cu.tolist()`) and the two
-    # `.max().cpu()` reductions do not fire. Residual syncs are the same
-    # HF-verbatim ViT-rotary + mrope sites as qwen2_vl.
+    # qwen2_5_vl-fa2: the window-attention ViT forward consumes the
+    # precomputed metadata (cu_seqlens + cu_window_seqlens + the
+    # get_window_index permutation, all collator-derived), so the in-forward
+    # `get_window_index` (`grid_thw.tolist()` + per-image `cu.tolist()`) and
+    # the two `.max().cpu()` reductions do not fire. The rotary path is
+    # host-driven (same approach as qwen2_vl), so the 5.9-deprecated
+    # `rot_pos_emb` shim is bypassed. The patched Model.forward now threads
+    # the caller-supplied `mm_token_type_ids` into `compute_3d_position_ids`
+    # (previously it was silently dropped, leaving position_ids=None via
+    # upstream's `can_compute_mrope` short-circuit), so the M-RoPE branch
+    # now actually runs in this test and exposes the HF-verbatim mrope
+    # algorithm in `get_rope_index` / `get_vision_position_ids`, same as
+    # qwen2_vl.
     "qwen2_5_vl-fa2": {
-        ("patched_modeling_qwen2_5_vl_gpu.py", "Qwen2_5_VisionTransformerPretrainedModel.rot_pos_emb"): (
-            _PROD_PENDING_VIT_ROT_POS_EMB
-        ),
-        ("patched_modeling_qwen2_5_vl_gpu.py", "Qwen2_5_VisionRotaryEmbedding.forward"): (
-            _PROD_PENDING_VIT_ROT_POS_EMB
-        ),
         ("patched_modeling_qwen2_5_vl_gpu.py", "Qwen2_5_VLModel.get_rope_index"): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
+        (
+            "patched_modeling_qwen2_5_vl_gpu.py",
+            "Qwen2_5_VLModel.get_vision_position_ids",
+        ): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
     },
     # qwen2_5_omni-fa2: shares the window-attention ViT layout with
     # qwen2_5_vl — the precompute consumer eliminates the same get_window_index
-    # / cu_seqlens syncs. Residual syncs are only the HF-verbatim ViT-rotary
-    # path (the omni ViT computes its varlen `.max()` seqlen on-device, so no
-    # max-reduction sync; and the omni get_rope_index is VeOmni-patched and
-    # host-side, so it does not appear here).
-    "qwen2_5_omni-fa2": {
-        ("patched_modeling_qwen2_5_omni_gpu.py", "Qwen2_5OmniVisionEncoder.rot_pos_emb"): (
-            _PROD_PENDING_VIT_ROT_POS_EMB
-        ),
-        ("patched_modeling_qwen2_5_omni_gpu.py", "Qwen2_5_VisionRotaryEmbedding.forward"): (
-            _PROD_PENDING_VIT_ROT_POS_EMB
-        ),
-    },
+    # / cu_seqlens syncs, and the rotary path is host-driven (no deprecated
+    # `rot_pos_emb` call). The omni ViT computes its varlen `.max()` seqlen
+    # on-device (no sync) and the omni `get_rope_index` is VeOmni-patched and
+    # host-side, so no syncs remain on the production path.
+    "qwen2_5_omni-fa2": {},
 }
 
 # Cases that are *declared* in CASES but skipped at runtime because they

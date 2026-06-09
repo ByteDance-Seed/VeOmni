@@ -56,12 +56,14 @@ VeOmni supports a wide range of models on Ascend NPUs, including large language 
 
 | Model                | Model Size       | Support | FSDP1 | FSDP2 | EP | SP | Note                                           |
 |----------------------|------------------|---------|-------|-------|----|----|------------------------------------------------|
-| [Qwen3](../examples/qwen3.md) | 8B/30B               | ✅       |       | ✅     |    | ✅   |
+| [Qwen3](../examples/qwen3.md) | 8B              | ✅       |       | ✅     |    | ✅   |
+|                      | 30B               | ✅       |       | ✅     | ✅    | ✅   |
 | [Qwen3.5](../examples/qwen3.md) | 9B    |          |         | ✅    |      |✅    | supporting   |
 |                      | 35B-A3B              |         |       | ✅     |✅    |✅    |  supporting                                   |
 | [Qwen3-VL](../examples/qwen3_vl.md) | 8B               | ✅       |       | ✅     |    | ✅  |                               |
 |                      | 30B              | ✅       |       | ✅     | ✅  | ✅  |                                                |
-| [Wan2.1](../examples/wan2.1.md)    | 14B              | ✅       | ✅     |       |    | ✅  |                               |
+| [Wan2.1](../examples/wan2.1.md)    | 1.3B              | ✅       | ✅     |       |    | ✅  | prototype                              |
+| [Qwen3Omni](../examples/qwen3_omni_moe.md)    | 30B              | ✅       |   | ✅        |    | ✅  | prototype                              |
 
 **Legend:**
 - **FSDP1**: Fully Sharded Data Parallel version 1

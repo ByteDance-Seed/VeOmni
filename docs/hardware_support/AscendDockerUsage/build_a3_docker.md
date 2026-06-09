@@ -30,7 +30,7 @@ docker build \
   --build-arg https_proxy=http://<user>:<pass>@<host>:<port> \
   --build-arg no_proxy=localhost,127.0.0.1 \
   -t ascend-a3-env:v1 \
-  -f docker/ascend/Dockerfile.ascend_8.3rc2_a3 \
+  -f docker/ascend/Dockerfile.ascend_9.0.0_a3 \
   .
 ```
 
@@ -38,7 +38,7 @@ Without proxy (simplified):
 ```bash
 docker build \
   -t ascend-a3-env:v1 \
-  -f docker/ascend/Dockerfile.ascend_8.3rc2_a3 \
+  -f docker/ascend/Dockerfile.ascend_9.0.0_a3 \
   .
 ```
 

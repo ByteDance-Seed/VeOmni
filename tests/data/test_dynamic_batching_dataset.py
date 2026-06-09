@@ -479,6 +479,7 @@ class TrainerTest(BaseTrainer):
         args = self.args
         dataloader_kwargs = asdict(args.data.dataloader)
         dataloader_type = dataloader_kwargs.pop("type")
+        dataloader_kwargs.pop("use_background_prefetcher", None)
         self.train_dataloader = build_dataloader(
             dataloader_type=dataloader_type,
             dataset=self.train_dataset,

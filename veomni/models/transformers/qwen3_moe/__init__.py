@@ -17,7 +17,10 @@ from ...loader import MODELING_REGISTRY
 
 @MODELING_REGISTRY.register("qwen3_moe")
 def register_qwen3_moe_modeling(architecture: str):
-    from .checkpoint_tensor_converter import create_qwen3_moe_checkpoint_tensor_converter
+    from .checkpoint_tensor_converter import (
+        convert_qwen3_moe_fqn_to_index_mapping,
+        create_qwen3_moe_checkpoint_tensor_converter,
+    )
 
     if IS_NPU_AVAILABLE:
         from .generated.patched_modeling_qwen3_moe_npu import (
@@ -41,6 +44,7 @@ def register_qwen3_moe_modeling(architecture: str):
         Qwen3MoeModel,
     ):
         model_cls._create_checkpoint_tensor_converter = staticmethod(create_qwen3_moe_checkpoint_tensor_converter)
+        model_cls._convert_fqn_to_index_mapping = staticmethod(convert_qwen3_moe_fqn_to_index_mapping)
 
     if "ForCausalLM" in architecture:
         return Qwen3MoeForCausalLM

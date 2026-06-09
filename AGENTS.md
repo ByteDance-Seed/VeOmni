@@ -38,7 +38,7 @@ uv sync --extra gpu --extra audio --dev
 source .venv/bin/activate
 ```
 
-This installs `transformers==5.2.0` (pinned by the `transformers-stable`
+This installs `transformers==5.9.0` (pinned by the `transformers-stable`
 default dependency group in `pyproject.toml`). Always activate `.venv/`
 before running any commands. New code must target transformers v5 and FSDP2.
 See `.agents/knowledge/constraints.md` for details.
