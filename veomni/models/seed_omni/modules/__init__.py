@@ -2,7 +2,7 @@
 
 Each entry maps a HuggingFace ``model_type`` string (the ``model_type``
 field of each module's :class:`PretrainedConfig` subclass) to the
-:class:`OmniModule` mixin class that backs it.  At trainer-build time the
+:class:`~veomni.models.seed_omni.module.ModuleMixin` subclass that backs it.  At trainer-build time the
 flow is::
 
     model_type = read_model_type(<weights_path>)        # reads config.json
@@ -46,7 +46,7 @@ def read_model_type(model_path: str) -> str:
     """Read ``model_type`` from a module's ``config.json`` and validate registration.
 
     Shared helper for any caller that needs to dispatch from a
-    split-checkpoint subfolder to the matching ``OmniModule`` class —
+    split-checkpoint subfolder to the matching module class —
     today that's :class:`OmniInferencer` (eager ``from_pretrained``) and
     :meth:`OmniTrainer._build_model` (meta-init via
     :func:`build_foundation_model`).  Centralised here so both paths use
@@ -65,7 +65,7 @@ def read_model_type(model_path: str) -> str:
     config_dict, _ = PretrainedConfig.get_config_dict(model_path)
     model_type = config_dict.get("model_type")
     if not model_type:
-        raise ValueError(f"Module config at {model_path} has no `model_type` — cannot resolve OmniModule class.")
+        raise ValueError(f"Module config at {model_path} has no `model_type` — cannot resolve module class.")
     # Note: :class:`Registry.__getitem__` raises ``ValueError`` (not
     # ``KeyError``) on miss, so the default ``in`` test on a MutableMapping
     # subclass would mis-route the exception.  Use ``valid_keys()`` to

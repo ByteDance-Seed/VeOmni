@@ -1,55 +1,9 @@
-"""
-TextEncoder — generic OmniModule wrapping the word-token embedding (``wte``)
-and language-model head (``lm_head``) extracted from any causal LLM.
+"""Generic word-token embedding (``wte``) + LM head as a graph node.
 
-Why a separate module?
-----------------------
-For a unified multi-modal AR setup, the embedding lookup and the projection
-back to vocab logits are conceptually the *same* abstraction as a discrete-
-image VQ codec — pre-stage and post-stage of a backbone:
-
-    nn.Embedding (encode)  ─►  LLM backbone  ─►  lm_head (decode)
-       |     ▲                                         |     ▲
-       ▼     │                                         ▼     │
-     input_ids               hidden_states         logits / next-token
-
-By exposing this pair as an OmniModule with ``encode`` / ``decode``
-call-site methods, the same downstream graph code that handles vision-VAE
-works for text — and the backbone module no longer owns vocab-dependent
-layers.
-
-Mixin form
-----------
-``TextEncoder`` multi-inherits ``OmniModule`` (the SeedOmni V2 mixin) and
-:class:`transformers.PreTrainedModel` so HuggingFace ``from_pretrained`` /
-``save_pretrained`` work natively — no custom build hooks required.
-
-Tied vs. untied weights
------------------------
-``config.tie_word_embeddings`` (default ``True``):
-
-* ``True``  — there is no separate ``lm_head`` parameter.  Both encode and
-              decode go through ``self.embed_tokens``: encode does a lookup,
-              decode does ``F.linear(h, embed_tokens.weight)``.  Most modern
-              LLMs (Qwen-1.5 small, GPT-2, etc.) tie weights this way.
-* ``False`` — an additional ``self.lm_head: nn.Linear`` is allocated with
-              its own parameters.  Used by LLaMA / Janus / Mistral.
-
-When set to ``False`` and ``config.lm_head_bias`` is ``True`` the linear
-head gains a bias term.  Default mirrors HuggingFace causal-LM
-conventions (no bias).
-
-Connection outputs
-------------------
-``encode``:
-  ``inputs_embeds``    Float tensor ``(B, T, hidden_size)``.
-
-``decode``:
-  :class:`~veomni.utils.model_outputs.CausalLMOutputWithLogProbs` with
-  ``logits`` and optional ``loss`` (training).  Inference sampling lives in
-  model-specific subclasses (e.g. Janus ``decode`` with ``conversation_list``).
-  :meth:`post_forward` maps ``loss`` →
-  ``_loss`` for the OmniModel graph.
+``TextEncoder(TextEncoderModuleMixin, PreTrainedModel)`` — ``encode`` /
+``decode`` call-sites mirror a VQ codec pre/post stage so the backbone stays
+vocab-agnostic.  Family-specific chat template / sampling live in
+``modules/<family>/text_encoder/``.
 """
 
 from typing import Any, Dict, Optional
@@ -59,44 +13,17 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers import PreTrainedModel
 
-from ....module import InferModuleMixin, TrainModuleMixin
 from .configuration import TextEncoderConfig
+from .modulemixin import TextEncoderModuleMixin
 
 
-class TextEncoder(TrainModuleMixin, InferModuleMixin, PreTrainedModel):
-    """Word-token embedding + LM head as a single OmniModule.
-
-    Multi-inherits :class:`OmniModule` (V2 mixin) and HuggingFace
-    :class:`PreTrainedModel` so HF ``from_pretrained`` / ``save_pretrained``
-    work natively against ``<weights_path>/{config.json,
-    model.safetensors}``.
-    """
+class TextEncoder(TextEncoderModuleMixin, PreTrainedModel):
+    """Word-token embedding + LM head."""
 
     config_class = TextEncoderConfig
-    # Intentionally empty: this *is* the base model — there is no inner
-    # ``self.text_encoder`` attribute to redirect to.  HF's
-    # :meth:`PreTrainedModel.from_pretrained` uses ``base_model_prefix``
-    # to decide whether to strip a prefix from the checkpoint keys when
-    # loading; setting it to ``"text_encoder"`` (the old value) made HF
-    # think the checkpoint should be loaded into a sub-module called
-    # ``text_encoder`` and silently leave ``embed_tokens.weight`` /
-    # ``lm_head.weight`` at their random init — verified against
-    # ``output_loading_info=True`` which reports empty missing /
-    # unexpected sets yet the weights end up unchanged.  Keep this
-    # empty unless you genuinely add a sub-module.
     base_model_prefix = ""
     _no_split_modules: list = []
     main_input_name = "input_ids"
-    # This module is a plain embedding (+ optional ``lm_head``): it has no
-    # transformer layers whose activations are worth recomputing, so gradient
-    # checkpointing is meaningless here.  We still *accept* an ``enable`` call
-    # (declare support + override the enable/disable hooks to no-ops) so the
-    # OmniTrainer can uniformly turn GC on across every module without
-    # special-casing the GC-less ones.  Without this, HF's
-    # ``PreTrainedModel.gradient_checkpointing_enable`` would raise — first
-    # because the inherited flag is ``False``, and even if forced ``True`` it
-    # would still raise since there is no ``gradient_checkpointing``-bearing
-    # submodule for ``_set_gradient_checkpointing`` to flip.
     supports_gradient_checkpointing = True
 
     def __init__(self, config: TextEncoderConfig):
@@ -107,7 +34,7 @@ class TextEncoder(TrainModuleMixin, InferModuleMixin, PreTrainedModel):
             self.lm_head = None
         else:
             self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=config.lm_head_bias)
-
+        self._tokenizer: Optional[Any] = None
         self.post_init()
 
     # ── Gradient checkpointing (no-op — nothing to recompute) ──────────────────
@@ -124,37 +51,20 @@ class TextEncoder(TrainModuleMixin, InferModuleMixin, PreTrainedModel):
         """No-op counterpart to :meth:`gradient_checkpointing_enable`."""
         return
 
-    # ── Call-site methods ─────────────────────────────────────────────────────
-
     def forward(self, **kwargs) -> Dict[str, Any]:  # type: ignore[override]
-        """Default forward — alias for :meth:`encode` (the most common default)."""
         return self.encode(**kwargs)
 
     def encode(
         self,
         input_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Any = None,
-        **_,
+        **kwargs: Any,
     ) -> Dict[str, Any]:
-        """Word-token embedding lookup.
-
-        During autoregressive inference with KV cache, only the latest token
-        needs embedding — earlier positions are already in ``past_key_values``.
-        When ``past_key_values`` is set and ``input_ids`` is a growing
-        ``(B, T)`` sequence, embed ``input_ids[:, -1:]`` only.  On the first
-        prompt pass (no cache), embed the full ``input_ids`` prompt.
-
-        Returns ``{"inputs_embeds": (B, T, hidden_size)}`` — or ``{}`` when
-        ``input_ids`` is missing (text-free batch / micro-batch).
-        """
-        if input_ids is None:
-            return {}
-        ids = input_ids
-        if past_key_values is not None and isinstance(ids, torch.Tensor) and ids.ndim == 2 and ids.size(-1) > 1:
-            ids = ids[:, -1:]
-        if isinstance(ids, torch.Tensor) and ids.ndim == 1:
-            ids = ids.unsqueeze(1)
-        return {"inputs_embeds": self.embed_tokens(ids)}
+        del kwargs
+        input_ids = input_ids.unsqueeze(0) if input_ids.dim() == 1 else input_ids
+        embeds = self.embed_tokens(input_ids)
+        return {
+            "inputs_embeds": embeds.squeeze(0) if embeds.size(0) == 1 else embeds,
+        }
 
     def decode(
         self,
@@ -163,13 +73,6 @@ class TextEncoder(TrainModuleMixin, InferModuleMixin, PreTrainedModel):
         shift_labels: Optional[torch.LongTensor] = None,
         **_,
     ) -> dict:
-        """LM-head projection — training CE only.
-
-        Projects ``hidden_states`` to vocab logits.  When ``shift_labels`` or
-        ``labels`` is given, returns token-mean CE in ``loss``.  Inference
-        sampling is handled by model-specific subclasses (e.g. Janus
-        ``decode`` with ``conversation_list``), not here.
-        """
         logits = self._project(hidden_states)
         loss: torch.Tensor | None = None
 
@@ -197,49 +100,4 @@ class TextEncoder(TrainModuleMixin, InferModuleMixin, PreTrainedModel):
         return {
             "loss": loss,
             "logits": logits,
-        }
-
-    def post_forward(self, method: str, **outputs: Any) -> Dict[str, Any]:
-        """Map :meth:`decode` ``loss`` → ``_loss`` for the Omni graph protocol."""
-        if method == "decode":
-            outputs.pop("logits", None)
-            loss = outputs.pop("loss", None)
-            if loss is not None:
-                outputs["_loss"] = loss
-            return outputs
-        else:
-            raise ValueError(f"TextEncoder.post_forward: unexpected method {method}")
-
-    # ── Internal helpers ─────────────────────────────────────────────────────
-
-    def _project(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Project hidden states to vocab logits (tied or untied)."""
-        if self.config.tie_word_embeddings:
-            return F.linear(hidden_states, self.embed_tokens.weight)
-        return self.lm_head(hidden_states)
-
-    @staticmethod
-    def _top_p_filter(logits: torch.Tensor, top_p: float) -> torch.Tensor:
-        """Nucleus filtering: zero out the long tail beyond cumulative-p."""
-        sorted_logits, sorted_indices = torch.sort(logits, descending=True)
-        sorted_probs = torch.softmax(sorted_logits, dim=-1)
-        cumulative = torch.cumsum(sorted_probs, dim=-1)
-        sorted_indices_to_remove = cumulative - sorted_probs > top_p
-        sorted_logits[sorted_indices_to_remove] = float("-inf")
-        return logits.scatter(1, sorted_indices, sorted_logits)
-
-    # ── Training-side dummy forward ────────────────────────────────────────────
-
-    def dummy_inputs(self, *, batch_size: int, device: Any, dtype: Any) -> Dict[str, Any]:
-        """Return a length-1 zero ``input_ids`` placeholder.
-
-        Used by the trainer when a micro-batch is missing ``input_ids``
-        (e.g. a pure image-tokens micro-batch that pre-cached
-        ``inputs_embeds`` from disk).  See module-doc "Training vs.
-        inference no input semantics" in
-        :mod:`veomni.models.seed_omni.module`.
-        """
-        del dtype  # input_ids is always int64
-        return {
-            "input_ids": torch.zeros(batch_size, 1, dtype=torch.long, device=device),
         }

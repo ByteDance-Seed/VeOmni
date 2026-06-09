@@ -1,34 +1,15 @@
 #!/bin/bash
-# Step through Janus training one graph node at a time — inspect conversation_list
-# in ipdb (rank 0 only).
-#
-# Breakpoints live in each Janus module entry (siglip / vqvae / text_encoder /
-# llama) via conversation.ipdb_conversation_break().  They fire when
-# VEOMNI_DEBUG_CONV_IPDB=1.
+# Janus OmniTrainer smoke run — fixed 8 GPUs, default 20 optimizer steps.
 #
 # Usage:
-#   bash scripts/seed_omni/debug_conversation_ipdb.sh [understanding|t2i|mixed|all]
+#   bash scripts/seed_omni/debug_omni.sh [understanding|t2i|mixed|all]
 #
-# Dataset modes (see make_janus_omni_demo.py --dataset_mode):
-#   understanding — pure I2T (user image + question → assistant text)
-#   t2i           — pure T2I (user prompt → assistant image)
-#   mixed         — interleave UG (user text+image+text, assistant image+text)
-#   all           — all three row kinds (default: mixed for compact ipdb)
-#
-# Requirements:
-#   - 2 GPUs (FSDP2 meta-init needs >1 rank in this repo)
-#   - TTY attached (do NOT pipe through tee — breaks ipdb readline)
-#   - pip install ipdb  (usually already in dev extras)
-#
-# Expected breakpoint order (one training step, Janus train.yaml):
-#   janus_siglip.pre_forward → janus_siglip.post_forward
-#   janus_vqvae.pre_forward (encode) → janus_vqvae.encode → janus_vqvae.post_forward
-#   janus_text_encoder.pre_forward → janus_text_encoder.encode
-#   janus_llama.pre_forward → janus_llama.forward
-#   janus_text_encoder.decode
-#   janus_vqvae.pre_forward (decode) → janus_vqvae.decode
+# Dataset modes (make_janus_omni_demo.py --dataset_mode):
+#   understanding | t2i | mixed (default) | all
 
 set -o pipefail
+
+readonly NUM_GPUS=8
 
 DATASET_MODE="${DATASET_MODE:-}"
 if [[ $# -gt 0 && "$1" =~ ^(understanding|t2i|mixed|all)$ ]]; then
@@ -37,11 +18,16 @@ if [[ $# -gt 0 && "$1" =~ ^(understanding|t2i|mixed|all)$ ]]; then
 fi
 DATASET_MODE="${DATASET_MODE:-mixed}"
 
+GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-16}"
+MICRO_BATCH_SIZE="${MICRO_BATCH_SIZE:-1}"
+MAX_STEPS="${MAX_STEPS:-20}"
+
+# train_steps ≈ floor(len(dataset) / global_batch_size); need enough parquet rows.
+NUM_REPEAT="${NUM_REPEAT:-$((MAX_STEPS * GLOBAL_BATCH_SIZE))}"
+
 cd "$(dirname "$0")/../.." || exit 1
 REPO_ROOT="$(pwd)"
 
-# Activate a venv only when none is active.  Do not override the user's
-# ``(veomni)`` shell — a bare repo ``.venv`` may lack pyarrow / gpu extras.
 if [[ -z "${VIRTUAL_ENV:-}" ]]; then
   _pick_venv() {
     local activate_path="$1"
@@ -53,14 +39,14 @@ if [[ -z "${VIRTUAL_ENV:-}" ]]; then
     return 1
   }
   if ! _pick_venv "${REPO_ROOT}/.venv/bin/activate"; then
-    echo "[debug_conversation_ipdb] warning: no venv found; using PATH python: $(command -v python || echo missing)" >&2
+    echo "[debug_omni] warning: no venv found; using PATH python: $(command -v python || echo missing)" >&2
   fi
 fi
 
 if ! python -c "import pyarrow" 2>/dev/null; then
-  echo "[debug_conversation_ipdb] ERROR: pyarrow is not installed in the active Python:" >&2
+  echo "[debug_omni] ERROR: pyarrow is not installed in the active Python:" >&2
   python -c "import sys; print('  ', sys.executable)" 2>/dev/null || true
-  echo "[debug_conversation_ipdb] Install into this venv, e.g.:" >&2
+  echo "[debug_omni] Install into this venv, e.g.:" >&2
   echo "  cd ${REPO_ROOT} && uv sync --extra gpu --extra dit --group dev" >&2
   exit 1
 fi
@@ -71,15 +57,11 @@ unset WORLD_SIZE RANK LOCAL_RANK LOCAL_WORLD_SIZE GROUP_RANK ROLE_RANK \
       TORCHELASTIC_RUN_ID
 
 export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH}"
-export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1}
 export TOKENIZERS_PARALLELISM=false
 export TORCH_NCCL_AVOID_RECORD_STREAMS=1
 export NCCL_DEBUG=WARN
 export PYTHONUNBUFFERED=1
 export WANDB_MODE=disabled
-
-# Enable conversation-list ipdb breakpoints (rank 0 only).
-export VEOMNI_DEBUG_CONV_IPDB=1
 
 OUTPUT_ROOT="${JANUS_V2_OUTPUT_ROOT:-${REPO_ROOT}/outputs/janus_v2}"
 JANUS_OUT="${JANUS_V2_JANUS_OUT:-${OUTPUT_ROOT}/janus_out}"
@@ -87,28 +69,31 @@ DEBUG_DATA="${JANUS_V2_DATA_DIR:-${OUTPUT_ROOT}/data}"
 TRAIN_DEBUG="${JANUS_V2_TRAIN_DEBUG_DIR:-${OUTPUT_ROOT}/train_debug}"
 mkdir -p "${DEBUG_DATA}"
 
-echo "[debug_conversation_ipdb] building demo parquet (dataset_mode=${DATASET_MODE}) ..."
+echo "[debug_omni] building demo parquet (mode=${DATASET_MODE}, num_repeat=${NUM_REPEAT}) ..."
 python "${REPO_ROOT}/scripts/multimodal/convert_data/make_janus_omni_demo.py" \
   --dataset_mode "${DATASET_MODE}" \
   --out_dir "${DEBUG_DATA}" \
-  --num_repeat 4 \
+  --num_repeat "${NUM_REPEAT}" \
   --und_reply "${JANUS_OUT}/infer_und/reply.txt" \
   --gen_image "${JANUS_OUT}/infer_gen/generated_image_0.png"
 
 PARQUET="${DEBUG_DATA}/janus_omni_demo_${DATASET_MODE}.parquet"
 if [[ ! -f "${PARQUET}" ]]; then
-  echo "[debug_conversation_ipdb] ERROR: parquet not found at ${PARQUET}" >&2
+  echo "[debug_omni] ERROR: parquet not found at ${PARQUET}" >&2
   exit 1
 fi
+
+echo "[debug_omni] ${NUM_GPUS} GPUs, global_batch_size=${GLOBAL_BATCH_SIZE}, max_steps=${MAX_STEPS}"
+echo "[debug_omni] expected train_steps ≈ min(max_steps, floor(${NUM_REPEAT}/${GLOBAL_BATCH_SIZE}))"
 
 torchrun \
   --standalone \
   --nnodes=1 \
-  --nproc-per-node=2 \
+  --nproc-per-node="${NUM_GPUS}" \
   tasks/omni/train_omni.py configs/seed_omni/janus_1.3b/veomni_janus.yaml \
-  --train.global_batch_size 2 \
-  --train.micro_batch_size 1 \
-  --train.max_steps 1 \
+  --train.global_batch_size "${GLOBAL_BATCH_SIZE}" \
+  --train.micro_batch_size "${MICRO_BATCH_SIZE}" \
+  --train.max_steps "${MAX_STEPS}" \
   --train.num_train_epochs 1 \
   --train.gradient_checkpointing.enable false \
   --train.wandb.enable false \
@@ -119,4 +104,5 @@ torchrun \
   --train.checkpoint.output_dir "${TRAIN_DEBUG}/${DATASET_MODE}" \
   --data.train_path "${PARQUET}" \
   --data.dataloader.num_workers 0 \
+  --data.dataloader.drop_last true \
   "$@"

@@ -30,7 +30,7 @@ def test_expand_user_text_image_text_uses_boi_eoi_spans():
     assert rendered.startswith("<s>")
     assert "SYS" in rendered
     assert "<|User|>: " in rendered
-    assert IMAGE_PLACEHOLDER not in rendered
+    assert IMAGE_PLACEHOLDER in rendered
     assert "<boi>" in rendered
     assert "<eoi>" in rendered
     assert "describe" in rendered

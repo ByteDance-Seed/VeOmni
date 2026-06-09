@@ -9,8 +9,8 @@ mkdir -p "${LOG_DIR}"
 LOG_FILE="${LOG_DIR}/test_train_$(date +%Y%m%d_%H%M%S).log"
 
 {
-bash scripts/seed_omni/debug_omni_2gpu.sh mixed || exit "$?"
-bash scripts/seed_omni/debug_omni_2gpu.sh understanding || exit "$?"
-bash scripts/seed_omni/debug_omni_2gpu.sh t2i || exit "$?"
+bash scripts/seed_omni/debug_omni.sh mixed || exit "$?"
+bash scripts/seed_omni/debug_omni.sh understanding || exit "$?"
+bash scripts/seed_omni/debug_omni.sh t2i || exit "$?"
 } 2>&1 | tee "${LOG_FILE}"
 exit "${PIPESTATUS[0]}"

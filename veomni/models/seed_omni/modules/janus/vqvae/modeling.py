@@ -1,17 +1,15 @@
-"""
-JanusVqvae — Janus' VQVAE + generation projection head as one OmniModule.
+"""Janus VQVAE codec + generation projection head.
 
-Mixin form:
-``class JanusVqvae(JanusVqvaeTrainModuleMixin, JanusVqvaeInferModuleMixin, PreTrainedModel)``.
+``JanusVqvae(JanusVqvaeModuleMixin, PreTrainedModel)`` — codec weights here;
+encode/decode graph hooks in ``modulemixin.py``.
 
-Call-site split (V2)
---------------------
+Call-site split
+---------------
 * :meth:`pre_forward` — stash ``conversation_list``; ``method="encode"`` pulls
   assistant ``image`` pixels, ``method="decode"`` assembles llama hidden rows +
   ``gen_ids`` labels.
-* :meth:`encode` — pure encoder: ``pixel_values`` → ``image_embeds`` +
-  ``vq_token_ids``.
-* :meth:`decode` — training CE head: ``hidden_states`` + ``labels`` → ``_loss``.
+* :meth:`encode` — ``pixel_values`` → ``image_embeds`` + ``vq_token_ids``.
+* :meth:`decode` — training CE: ``hidden_states`` + ``labels`` → ``loss``.
 * :meth:`post_forward` — write ``image_embeds`` / ``janus_vqvae_labels`` back onto
   ``conversation_list`` (encode path).
 
@@ -22,9 +20,11 @@ Graph entry points (YAML ``module: janus_vqvae.<method>``):
   ``generate`` — inference VQ AR step (lm_head → sample → embed → merge).
 """
 
-from typing import Any, List
+from typing import Any, Dict, Optional
 
+import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from transformers import PreTrainedModel
 from transformers.models.janus.modeling_janus import (
     JanusVQVAE,
@@ -32,12 +32,13 @@ from transformers.models.janus.modeling_janus import (
     JanusVQVAEHead,
 )
 
+from ......distributed.parallel_state import get_parallel_state
 from .configuration import JanusVqvaeConfig
-from .modulemixin import JanusVqvaeInferModuleMixin, JanusVqvaeTrainModuleMixin
+from .modulemixin import JanusVqvaeModuleMixin
 from .processing import JanusVqvaeProcessor
 
 
-class JanusVqvae(JanusVqvaeTrainModuleMixin, JanusVqvaeInferModuleMixin, PreTrainedModel):
+class JanusVqvae(JanusVqvaeModuleMixin, PreTrainedModel):
     """VQVAE + generation head for Janus VQ image generation.
 
     The VQVAE encoder/decoder is frozen by default (matching the Janus
@@ -67,24 +68,6 @@ class JanusVqvae(JanusVqvaeTrainModuleMixin, JanusVqvaeInferModuleMixin, PreTrai
         self.generation_aligner = JanusVQVAEAlignerMLP(config.vq_config)
         self.generation_head = JanusVQVAEHead(config.vq_config)
         self._processor: JanusVqvaeProcessor = None
-
-        # NB: the ``config.freeze`` knob is honoured by :meth:`freeze_model`
-        # (called once by the trainer after build), not here.
-
-        # Per-image VQ-token buffer used by :meth:`generate` to accumulate
-        # sampled tokens between FSM iterations.  Reset on each
-        # ``image_complete`` signal; finalize keeps the decoded PIL
-        # images so the caller can collect them after the run.
-        # Inference cache
-        self._vq_buffer: List[int] = []
-
-        # Auto-populated by :meth:`OmniModule.from_pretrained` from
-        # ``<weights_path>/preprocessor_config.json``.  Used by
-        # :meth:`generate` to convert the VQVAE's ``[-1, 1]`` float output
-        # back into a PIL image — see :class:`JanusVqvaeProcessor`.
-        # Training cache
-        self._conversation_carrier: Any = None
-
         self.post_init()
 
     def freeze_model(self) -> None:
@@ -98,3 +81,54 @@ class JanusVqvae(JanusVqvaeTrainModuleMixin, JanusVqvaeInferModuleMixin, PreTrai
         """
         if self.config.freeze:
             self.vqmodel.requires_grad_(False)
+
+    def _encode_pixels(self, pixel_values: torch.Tensor) -> Dict[str, torch.Tensor]:
+        with torch.no_grad() if self.config.freeze else torch.enable_grad():
+            vq_out = self.vqmodel.encode(pixel_values)
+        vq_token_ids = vq_out.image_tokens
+        image_embeds = self.generation_aligner(self.generation_embeddings(vq_token_ids))
+        if vq_token_ids.dim() == 1:
+            b = pixel_values.size(0)
+            vq_token_ids = vq_token_ids.reshape(b, -1)
+            image_embeds = image_embeds.reshape(b, vq_token_ids.size(1), image_embeds.size(-1))
+        return {"image_embeds": image_embeds, "vq_token_ids": vq_token_ids}
+
+    def encode(self, pixel_values: Optional[torch.Tensor] = None) -> Dict[str, Any]:
+        if pixel_values is None and get_parallel_state().fsdp_enabled:
+            dummy = self.dummy_inputs()
+            return {**self._encode_pixels(dummy["pixel_values"]), "is_dummy": True}
+        return self._encode_pixels(pixel_values)
+
+    def decode(
+        self,
+        hidden_states: Optional[torch.Tensor] = None,
+        labels: Optional[torch.Tensor] = None,
+        is_dummy: bool = False,
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
+        del kwargs
+        if hidden_states is None or labels is None:
+            return {}
+        if is_dummy:
+            return {"loss": hidden_states.sum() * 0.0}
+        return {"loss": self._vq_loss(hidden_states, labels)}
+
+    def _vq_loss(self, hidden_states: torch.Tensor, gt_token_ids: torch.Tensor) -> torch.Tensor:
+        labels = gt_token_ids.to(hidden_states.device)
+        hidden_states = hidden_states[:, : labels.size(1)]
+        logits = self.generation_head(hidden_states)
+        v = logits.size(-1)
+
+        if not labels.ne(-100).any():
+            return logits[:, -1:, :].mean() * 0.0
+
+        shift_logits = logits[:, :-1, :].contiguous()
+        shift_labels = labels[:, 1:].contiguous()
+        ce_sum = F.cross_entropy(
+            shift_logits.reshape(-1, v),
+            shift_labels.reshape(-1),
+            ignore_index=-100,
+            reduction="sum",
+        )
+        n_valid = (shift_labels != -100).sum().clamp(min=1)
+        return ce_sum / n_valid

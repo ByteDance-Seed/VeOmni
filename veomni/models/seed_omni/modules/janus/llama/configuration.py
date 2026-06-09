@@ -21,7 +21,7 @@ The ``model_type`` literal here is the lookup key for
 
 from typing import Any, Dict, Optional
 
-from transformers import PretrainedConfig
+from transformers import LlamaConfig, PretrainedConfig
 
 
 class JanusLlamaConfig(PretrainedConfig):
@@ -34,5 +34,5 @@ class JanusLlamaConfig(PretrainedConfig):
         text_config: Optional[Dict[str, Any]] = None,
         **kwargs,
     ):
-        self.text_config = text_config or {}
+        self.text_config = LlamaConfig(**text_config) if text_config else LlamaConfig()
         super().__init__(**kwargs)
