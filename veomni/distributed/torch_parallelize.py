@@ -96,6 +96,7 @@ def _apply_weights_load_step(
     cpu_load_param_name: Optional[List[str]],
     max_load_broadcast_size: float,
     distribute_tensor_fn: Callable[..., Any],
+    fqn_to_index_mapping: Optional[Mapping[str, int]],
 ) -> None:
     """Materialise meta-initialised parameters and (optionally) load weights.
 
@@ -165,6 +166,7 @@ def _apply_weights_load_step(
                 cpu_load_param_name=cpu_load_param_name,
                 max_load_broadcast_size=max_load_broadcast_size,
                 distribute_tensor_fn=distribute_tensor_fn,
+                fqn_to_index_mapping=None,
             )
         return
 
@@ -184,6 +186,7 @@ def _apply_weights_load_step(
         cpu_load_param_name=cpu_load_param_name,
         max_load_broadcast_size=max_load_broadcast_size,
         distribute_tensor_fn=distribute_tensor_fn,
+        fqn_to_index_mapping=fqn_to_index_mapping,
     )
 
 
@@ -198,6 +201,7 @@ def _load_one(
     cpu_load_param_name: Optional[List[str]],
     max_load_broadcast_size: float,
     distribute_tensor_fn: Callable[..., Any],
+    fqn_to_index_mapping: Optional[Mapping[str, int]],
 ) -> None:
     """Materialise + load weights into one (sub-)tree from a single snapshot.
 
@@ -217,6 +221,7 @@ def _load_one(
             max_load_broadcast_size=max_load_broadcast_size,
             is_peft_model=is_peft_model,
             adapter_path=adapter_path,
+            fqn_to_index_mapping=fqn_to_index_mapping,
         )
     else:
         logger.info_rank0("Every rank would read weights from disk and expect this to be slow!")
@@ -228,6 +233,7 @@ def _load_one(
             dtensor_factory=_dt_local_split,
             is_peft_model=is_peft_model,
             adapter_path=adapter_path,
+            fqn_to_index_mapping=fqn_to_index_mapping,
         )
 
 
@@ -582,6 +588,7 @@ def parallelize_model_fsdp2(
         cpu_load_param_name=kwargs.get("cpu_load_param_name", None),
         max_load_broadcast_size=kwargs.get("max_load_broadcast_size", 20.0),
         distribute_tensor_fn=distribute_tensor,
+        fqn_to_index_mapping=kwargs.get("fqn_to_index_mapping"),
     )
 
     # Register grad norm clipping method for FSDP2

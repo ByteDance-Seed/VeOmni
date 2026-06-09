@@ -1,0 +1,51 @@
+model:
+  model_path: Qwen3-Omni-30B-A3B-Instruct
+  ops_implementation:
+    moe_implementation: fused_triton
+    attn_implementation: flash_attention_2
+
+data:
+  train_path: configs/multimodal/data/qwen3_omni_offline_av.yaml
+  data_type: conversation
+  max_seq_len: 8196
+  train_size: 80000000
+  source_name: qwen_omni_offline_av
+  dataloader:
+    num_workers: 0
+  mm_configs:
+    scale_factor: 28
+    image_min_pixels: 3136 # 4 * 28 * 28
+    image_max_pixels: 12845056 # 16384 * 28 * 28
+    video_min_pixels: 100352 # 128 * 28 * 28
+    video_max_pixels: 602112 # 768 * 28 * 28
+    max_ratio: 200
+    min_frames: 4
+    max_frames: 20
+    frame_factor: 2
+    sample_rate: 16000
+    fps: 2.0
+    # Offline-A/V mode: each sample["videos"][i] is a dict carrying both the
+    # pre-extracted frames (List[bytes]) and the paired audio (bytes / ndarray)
+    # for one audio-enabled video clip. The per-video audio is non-empty, so
+    # Qwen3-Omni interleaves video and audio tokens via the standard omni path
+    # (use_audio_in_video=True). See docs/examples/qwen3_omni_offline_av.md.
+    use_audio_in_video: True
+
+train:
+  accelerator:
+    ulysses_size: 1
+    fsdp_config:
+      fsdp_mode: fsdp2
+  optimizer:
+    lr: 1.0e-5
+    lr_decay_style: cosine
+  num_train_epochs: 3
+  micro_batch_size: 1
+  global_batch_size: 32
+  max_steps: 20
+  init_device: meta
+  checkpoint:
+    output_dir: qwen3_omni_offline_av_sft
+  wandb:
+    project: qwen3_omni
+    name: qwen3_omni_offline_av

@@ -86,12 +86,17 @@ class CheckpointerCallback(Callback):
         this to keep only the per-model bits; the global bits are saved once by
         the orchestrator.
         """
+        if hasattr(self.trainer, "data_iterator") and hasattr(self.trainer.data_iterator, "state_dict"):
+            train_dataloader_state = self.trainer.data_iterator.state_dict()
+        elif self.trainer.train_dataloader is not None:
+            train_dataloader_state = self.trainer.train_dataloader.state_dict()
+        else:
+            train_dataloader_state = {}
+
         return {
             "global_step": state.global_step,
             "lr_scheduler": self.trainer.lr_scheduler.state_dict(),
-            "train_dataloader": self.trainer.train_dataloader.state_dict()
-            if self.trainer.train_dataloader is not None
-            else {},
+            "train_dataloader": train_dataloader_state,
             "environ_meter": self.trainer.environ_meter.state_dict(),
             "torch_rng_state": torch.get_rng_state(),
         }

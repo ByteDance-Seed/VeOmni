@@ -12,13 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-Patch configuration for Qwen3-VL NPU build (transformers>=5.2.0).
+Patch configuration for Qwen3-VL NPU build (transformers>=5.9.0).
 
 Inherits every GPU patch from `qwen3_vl_gpu_patch_gen_config` and layers NPU
 kernel replacements on top (npu_rms_norm, npu_rotary_mul for text + vision).
 
 Regen command:
-python -m veomni.patchgen.run_codegen veomni.models.transformers.qwen3_vl.qwen3_vl_npu_patch_gen_config -o veomni/models/transformers/qwen3_vl/generated --diff
+patchgen veomni.models.transformers.qwen3_vl.qwen3_vl_npu_patch_gen_config -o veomni/models/transformers/qwen3_vl/generated --diff
 """
 
 from veomni.models.transformers.qwen3_vl.qwen3_vl_gpu_patch_gen_config import (

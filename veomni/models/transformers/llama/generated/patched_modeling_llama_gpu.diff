@@ -11,7 +11,7 @@
 -# original forms to accommodate minor architectural differences compared
 -# to GPT-NeoX and OPT used by the Meta AI team that trained the model.
 +#  Source: transformers.models.llama.modeling_llama
-+#  Based on: transformers==5.2.0
++#  Based on: transformers==5.9.0
  #
 -# Licensed under the Apache License, Version 2.0 (the "License");
 -# you may not use this file except in compliance with the License.
@@ -189,7 +189,7 @@
          down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
          return down_proj
 
-@@ -437,6 +478,12 @@
+@@ -425,6 +466,12 @@
          )
 
 
@@ -202,7 +202,7 @@
  @auto_docstring
  class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
      _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
-@@ -452,6 +499,7 @@
+@@ -440,6 +487,7 @@
          # Initialize weights and apply final processing
          self.post_init()
 
@@ -210,7 +210,11 @@
      @can_return_tuple
      @auto_docstring
      def forward(
-@@ -467,24 +515,7 @@
+@@ -451,55 +499,125 @@
+         inputs_embeds: torch.FloatTensor | None = None,
+         labels: torch.LongTensor | None = None,
+         use_cache: bool | None = None,
++        cache_position: torch.LongTensor | None = None,
          logits_to_keep: int | torch.Tensor = 0,
          **kwargs: Unpack[TransformersKwargs],
      ) -> CausalLMOutputWithPast:
@@ -236,7 +240,11 @@
              input_ids=input_ids,
              attention_mask=attention_mask,
              position_ids=position_ids,
-@@ -496,24 +527,109 @@
+             past_key_values=past_key_values,
+             inputs_embeds=inputs_embeds,
+             use_cache=use_cache,
++            cache_position=cache_position,
+             **kwargs,
          )
 
          hidden_states = outputs.last_hidden_state

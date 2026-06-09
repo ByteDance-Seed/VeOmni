@@ -3,6 +3,7 @@ name: Check Patchgen Drift
 on:
   pull_request:
     paths:
+      - "patchgen-pkg/**"
       - "veomni/patchgen/**"
       - "veomni/models/transformers/**"
       - "pyproject.toml"
@@ -11,6 +12,7 @@ on:
     branches:
       - main
     paths:
+      - "patchgen-pkg/**"
       - "veomni/patchgen/**"
       - "veomni/models/transformers/**"
       - "pyproject.toml"
@@ -31,6 +33,13 @@ jobs:
 
       - name: Install uv
         uses: astral-sh/setup-uv@v8.1.0
+        with:
+          # Pin a concrete uv inside the pyproject required-version range
+          # (>=0.9.8,<0.12). This job runs on ubuntu-latest (not a prebuilt
+          # image), so without a pin setup-uv floats to the newest uv and would
+          # fail the required-version check the moment uv ships a release above
+          # the range ceiling. Keep this in sync with the docker/ uv pin.
+          version: "0.11.16"
 
       - name: Check patchgen drift
-        run: uv run --extra gpu --dev python -m veomni.patchgen.check_patchgen
+        run: uv run --extra gpu --dev patchgen --check

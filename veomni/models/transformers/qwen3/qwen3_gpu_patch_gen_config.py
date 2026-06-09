@@ -15,7 +15,7 @@
 Patch configuration for Qwen3 GPU OpSlot-based kernel replacements.
 
 Regen command:
-python -m veomni.patchgen.run_codegen veomni.models.transformers.qwen3.qwen3_gpu_patch_gen_config -o veomni/models/transformers/qwen3/generated
+patchgen veomni.models.transformers.qwen3.qwen3_gpu_patch_gen_config -o veomni/models/transformers/qwen3/generated
 
 This mirrors the runtime GPU patch in
 veomni/models/transformers/qwen3/gpu_patch.py.

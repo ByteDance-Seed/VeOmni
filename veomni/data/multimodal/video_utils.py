@@ -314,34 +314,91 @@ def _pil_images_to_tensor(images: List["PIL.Image.Image"]) -> torch.Tensor:
     return torch.stack(tensors)
 
 
-def _dict_to_video_audio(video_dict: Dict[str, "np.ndarray"]) -> tuple:
-    """Convert dict to video tensor and audio array.
+def _dict_to_video_audio(video_dict: Dict[str, "np.ndarray"], default_video_fps: float = 2.0) -> tuple:
+    """Convert a paired-A/V dict to (video tensor, video_fps, audio array, audio_fps).
 
-    Expected keys: 'video' (required), 'audio', 'video_fps', 'audio_fps' (optional).
+    Accepted layouts:
+
+    1. **Decoded ndarrays** (existing): ``{"video": np.ndarray, "audio": np.ndarray?,
+       "video_fps": float?, "audio_fps": float?}`` — ``video`` is 4D ``(T, H, W, C)``
+       or ``(T, C, H, W)``.
+
+    2. **Offline-extracted bytes** (new): ``{"frames": List[bytes], "audio": bytes?,
+       "video_fps": float?, "audio_fps": float?}`` — ``frames`` is a list of
+       PNG/JPEG-encoded image bytes representing the temporally-sampled frames
+       of a single A/V clip, and ``audio`` is WAV-encoded bytes (or an ndarray)
+       for the same clip. Used by the Qwen-Omni offline-A/V recipe — the
+       per-video audio slot is non-empty, so the processor treats the result as
+       an audio-enabled video and interleaves video/audio tokens.
+
+    Either ``video`` or ``frames`` must be present.
     """
-    if "video" not in video_dict:
-        logger.error(f"Dict input missing 'video' key. Available keys: {list(video_dict.keys())}")
-        raise ValueError("Dict input must contain 'video' key")
+    if "frames" in video_dict:
+        from io import BytesIO
 
-    video_np = video_dict["video"]
-    logger.debug(f"Processing video array with shape: {video_np.shape}, dtype: {video_np.dtype}")
+        frames = video_dict["frames"]
+        if isinstance(frames, np.ndarray):
+            frames = frames.tolist()
+        if not frames or not isinstance(frames[0], (bytes, bytearray)):
+            raise ValueError(
+                "Dict input with 'frames' key must be a non-empty List[bytes] of "
+                f"PNG/JPEG-encoded frames; got {type(frames[0]) if frames else 'empty'}."
+            )
+        pil_images = []
+        for frame_bytes in frames:
+            with PIL.Image.open(BytesIO(frame_bytes)) as img:
+                if img.mode != "RGB":
+                    img = img.convert("RGB")
+                pil_images.append(img.copy())
+        video = _pil_images_to_tensor(pil_images)
+        video_fps = video_dict.get("video_fps", default_video_fps)
+        is_offline_av = True
+    elif "video" in video_dict:
+        video_np = video_dict["video"]
+        logger.debug(f"Processing video array with shape: {video_np.shape}, dtype: {video_np.dtype}")
 
-    if video_np.ndim == 4:
-        if video_np.shape[-1] == 3:
-            logger.debug(f"Converting (T, H, W, C) format: {video_np.shape} -> permute to (T, C, H, W)")
-            video = torch.from_numpy(video_np).permute(0, 3, 1, 2)
+        if video_np.ndim == 4:
+            if video_np.shape[-1] == 3:
+                logger.debug(f"Converting (T, H, W, C) format: {video_np.shape} -> permute to (T, C, H, W)")
+                video = torch.from_numpy(video_np).permute(0, 3, 1, 2)
+            else:
+                logger.debug(f"Assuming (T, C, H, W) format: {video_np.shape}, no permutation needed")
+                video = torch.from_numpy(video_np)
         else:
-            logger.debug(f"Assuming (T, C, H, W) format: {video_np.shape}, no permutation needed")
-            video = torch.from_numpy(video_np)
+            logger.error(
+                f"Invalid video array dimensions. Expected 4D array, got shape: {video_np.shape} (ndim={video_np.ndim})"
+            )
+            raise ValueError(f"Video array must be 4D, got shape {video_np.shape}")
+        video_fps = video_dict.get("video_fps", 30.0)
+        is_offline_av = False
     else:
-        logger.error(
-            f"Invalid video array dimensions. Expected 4D array, got shape: {video_np.shape} (ndim={video_np.ndim})"
-        )
-        raise ValueError(f"Video array must be 4D, got shape {video_np.shape}")
+        logger.error(f"Dict input missing both 'video' and 'frames' keys. Available keys: {list(video_dict.keys())}")
+        raise ValueError("Dict input must contain either 'video' (ndarray) or 'frames' (List[bytes])")
 
     audio = video_dict.get("audio", None)
-    video_fps = video_dict.get("video_fps", 30.0)
     audio_fps = video_dict.get("audio_fps", None)
+    if isinstance(audio, (bytes, bytearray)):
+        # WAV bytes — decode at native sample rate. smart_audio_nframes will resample.
+        from io import BytesIO
+
+        import soundfile as sf
+
+        audio_array, native_sr = sf.read(BytesIO(audio))
+        if audio_array.ndim == 2:
+            # multi-channel (T, C) -> mono
+            audio_array = audio_array.mean(axis=1)
+        audio = audio_array.astype(np.float32)
+        audio_fps = audio_fps or native_sr
+    elif isinstance(audio, np.ndarray) and is_offline_av and audio_fps is None:
+        # Offline-A/V (frames) layout treats audio as required by the interleaved
+        # Qwen-Omni processor path; refuse to silently drop it. The decoded-video
+        # ({"video": ndarray}) layout keeps the historical silent-drop behavior
+        # via the `audio_fps is not None` gate downstream in fetch_videos_metadata.
+        raise ValueError(
+            "Offline-A/V dict with ndarray `audio` requires an explicit `audio_fps`; "
+            "either set `audio_fps` on the dict or pass the audio as WAV-encoded bytes "
+            "(soundfile reads the native sample rate for you)."
+        )
 
     return video, video_fps, audio, audio_fps
 
@@ -420,7 +477,9 @@ def _load_and_process_video_with_codec(video_input: VideoInput, use_audio_in_vid
         return video, audio, audio_fps, frames_indices
 
     elif isinstance(video_input, dict):
-        video, video_fps, audio, audio_fps = _dict_to_video_audio(video_input)
+        video, video_fps, audio, audio_fps = _dict_to_video_audio(
+            video_input, default_video_fps=kwargs.get("fps", 2.0)
+        )
         # Pre-compute nframes for dynamic max_pixels before spatial resize
         indices, pad_count = calculate_frame_indices(total_frames=video.shape[0], video_fps=video_fps, **kwargs)
         resize_kwargs = _apply_dynamic_video_max_pixels(len(indices) + pad_count, kwargs)
@@ -428,7 +487,16 @@ def _load_and_process_video_with_codec(video_input: VideoInput, use_audio_in_vid
         frames_indices = torch.arange(video.shape[0])
         return video, audio, audio_fps, frames_indices
 
-    # video_input is str (path/URL) or bytes
+    # video_input is str (path/URL) or bytes — the only branch that needs the
+    # ffmpeg / torchcodec stack. dict / List[bytes] / List[PIL.Image] inputs above
+    # never reach this point, so they work in ffmpeg-less environments.
+    if not is_ffmpeg_available():
+        raise RuntimeError(
+            "ffmpeg is not available; required for decoding str/bytes video containers. "
+            "Install with `apt-get install ffmpeg` / `brew install ffmpeg`, or feed the "
+            "video as pre-decoded frames (dict / List[bytes] / List[PIL.Image] — see "
+            "docs/examples/qwen3_omni_offline_av.md)."
+        )
     from torchcodec.decoders import VideoDecoder
 
     try:
@@ -497,11 +565,13 @@ def fetch_videos(videos: List[VideoInput], **kwargs):
 
     Note: Does NOT return frames_indices. Use fetch_videos_metadata() for temporal modeling
     (e.g., Qwen3-VL timestamp calculation).
-    """
-    if not is_ffmpeg_available():
-        raise RuntimeError("ffmpeg is not available. Please install it: apt-get install ffmpeg or brew install ffmpeg")
 
-    logger.info_once("Using torchcodec for video loading.")
+    ffmpeg / torchcodec is only required for ``str`` / ``bytes`` (raw container)
+    inputs — ``dict`` / ``List[bytes]`` / ``List[PIL.Image]`` inputs are handled
+    by the PIL + soundfile path inside ``_load_and_process_video_with_codec`` and
+    work in ffmpeg-less environments.
+    """
+    logger.info_once("Loading videos via _load_and_process_video_with_codec.")
 
     video_inputs, audio_inputs, audio_fps_list = [], [], []
 
@@ -527,6 +597,9 @@ def fetch_videos_metadata(videos: List[VideoInput], **kwargs):
 
     IMPORTANT: For Qwen3-VL, this returns frames_indices needed for timestamp calculation.
 
+    ffmpeg / torchcodec is only required for ``str`` / ``bytes`` (raw container)
+    inputs — see ``fetch_videos`` for the same note.
+
     Args:
         videos: List of video inputs (paths, bytes, PIL images, or dicts)
         **kwargs: Processing parameters (fps, min_frames, max_frames, etc.)
@@ -534,10 +607,7 @@ def fetch_videos_metadata(videos: List[VideoInput], **kwargs):
     Returns:
         (videos, video_metadata, audios, audio_metadata): Processed videos and audios with metadata
     """
-    if not is_ffmpeg_available():
-        raise RuntimeError("ffmpeg is not available. Please install it: apt-get install ffmpeg or brew install ffmpeg")
-
-    logger.info_once("Using torchcodec for video loading with metadata.")
+    logger.info_once("Loading videos with metadata via _load_and_process_video_with_codec.")
 
     video_inputs, video_metadata_list = [], []
     audio_inputs, audio_metadata_list = [], []
@@ -581,9 +651,6 @@ def load_video_from_path(video_path: str, use_audio_in_video: bool = True, **kwa
     Returns:
         (video, video_metadata, audio, audio_metadata)
     """
-    if not is_ffmpeg_available():
-        raise RuntimeError("ffmpeg is not available. Please install it: apt-get install ffmpeg or brew install ffmpeg")
-
     videos, video_meta, audios, audio_meta = fetch_videos_metadata(
         [video_path], use_audio_in_video=use_audio_in_video, **kwargs
     )
@@ -601,9 +668,6 @@ def load_video_from_bytes(video_bytes: bytes, use_audio_in_video: bool = True, *
     Returns:
         (video, video_metadata, audio, audio_metadata)
     """
-    if not is_ffmpeg_available():
-        raise RuntimeError("ffmpeg is not available. Please install it: apt-get install ffmpeg or brew install ffmpeg")
-
     videos, video_meta, audios, audio_meta = fetch_videos_metadata(
         [video_bytes], use_audio_in_video=use_audio_in_video, **kwargs
     )
@@ -639,9 +703,6 @@ def load_video_from_bytes_list(video_frames: Union[List[bytes], np.ndarray], **k
                 img = img.convert("RGB")
             pil_images.append(img.copy())
 
-    if not is_ffmpeg_available():
-        raise RuntimeError("ffmpeg is not available. Please install it: apt-get install ffmpeg or brew install ffmpeg")
-
     videos, video_meta, audios, audio_meta = fetch_videos_metadata([pil_images], **kwargs)
     return videos[0], video_meta[0], audios[0], audio_meta[0]
 
@@ -664,17 +725,9 @@ def load_video(video: VideoInput, **kwargs):
         if len(video) > 0:
             if isinstance(video[0], bytes):
                 return load_video_from_bytes_list(video, **kwargs)
-            if not is_ffmpeg_available():
-                raise RuntimeError(
-                    "ffmpeg is not available. Please install it: apt-get install ffmpeg or brew install ffmpeg"
-                )
             videos, video_meta, audios, audio_meta = fetch_videos_metadata([video], **kwargs)
             return videos[0], video_meta[0], audios[0], audio_meta[0]
     elif isinstance(video, dict):
-        if not is_ffmpeg_available():
-            raise RuntimeError(
-                "ffmpeg is not available. Please install it: apt-get install ffmpeg or brew install ffmpeg"
-            )
         videos, video_meta, audios, audio_meta = fetch_videos_metadata([video], **kwargs)
         return videos[0], video_meta[0], audios[0], audio_meta[0]
 

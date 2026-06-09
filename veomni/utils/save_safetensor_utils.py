@@ -215,6 +215,9 @@ def save_hf_safetensor(
         DistributedCheckpointer.wait_for_pending_save()
 
     if use_distributed:
+        from veomni.models.checkpoint_tensor_loading import resolve_fqn_to_index_mapping_for_save
+
+        fqn_to_index_mapping = resolve_fqn_to_index_mapping_for_save(model, fqn_to_index_mapping)
         _save_hf_safetensor_distributed(model, save_hf_safetensor_path, fqn_to_index_mapping, model_assets)
     else:
         # Legacy path is rank-0 only; non-rank-0 waits at the barrier below

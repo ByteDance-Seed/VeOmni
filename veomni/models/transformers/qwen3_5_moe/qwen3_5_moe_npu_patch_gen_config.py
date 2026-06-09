@@ -17,7 +17,7 @@ Patch configuration for Qwen3_5Moe NPU/SP patched modeling generation.
 Regen command (preferred): `make patchgen` — runs all gen_configs together.
 
 Do NOT regenerate this file in isolation via
-``python -m veomni.patchgen.run_codegen veomni.models.transformers.qwen3_5_moe.qwen3_5_moe_npu_patch_gen_config ...``
+``patchgen veomni.models.transformers.qwen3_5_moe.qwen3_5_moe_npu_patch_gen_config ...``
 This gen_config imports helpers from
 ``qwen3_5_moe_gpu_patch_gen_config``; when patchgen runs it alone without
 first running the GPU config, the generated file drops several imports
@@ -55,6 +55,10 @@ from veomni.models.transformers.qwen3_5.qwen3_5_npu_patch_gen_config import (
 from veomni.models.transformers.qwen3_5_moe.qwen3_5_moe_gpu_patch_gen_config import (
     PatchedQwen3_5MoeExperts,
     Qwen3_5MoeCausalLMOutputWithLogProbs,
+    _Qwen3_5MoeFakeForPosID,
+    collate_multimodal_metadata,
+    get_position_id,
+    mm_token_type_ids_from_input_ids,
     qwen3_5_moe_decoder_layer_forward_patched,
     qwen3_5_moe_forcausallm_forward_patched,
     qwen3_5_moe_forconditional_generation_forward_patched,
@@ -154,6 +158,21 @@ veomni_chunk_gated_delta_rule = None  # OpSlot, declared in post-import block ab
 config.add_post_import_block("_VEOMNI_VISION_ATTENTION_PATCHED = False")
 
 
+# Register the multimodal helpers used by the reused get_position_id_func /
+# get_metadata_collate_func / Model.forward bodies. Defined in
+# qwen3_5_moe_gpu_patch_gen_config.py (imported above) and referenced by name
+# in the reused function bodies, so the NPU generated file must emit them.
+# qwen3_5_moe_npu picks helpers à la carte (not wholesale via
+# `config.helpers.extend(gpu_config.helpers)`), so each helper has to be
+# registered explicitly here. `mm_token_type_ids_from_input_ids` in
+# particular is called from `get_position_id` and the Model.forward
+# multimodal-RoPE path — both required since transformers v5.
+config.add_helper(mm_token_type_ids_from_input_ids)
+config.add_helper(get_position_id)
+config.add_helper(collate_multimodal_metadata)
+config.add_helper(_Qwen3_5MoeFakeForPosID)
+
+
 config.override_method(
     "Qwen3_5MoeRMSNorm.forward",
     replacement=qwen3_5_rmsnorm_forward_patched,
@@ -243,49 +262,6 @@ config.override_method(
 
 
 config.add_helper_after("Qwen3_5MoeCausalLMOutputWithPast", Qwen3_5MoeCausalLMOutputWithLogProbs)
-
-
-config.add_post_import_block("""
-def get_position_id(main_func, self, **kwargs):
-    # Must be a module-level function for multiprocessing pickle
-    position_ids, rope_deltas = main_func(self, **kwargs)
-    return {"position_ids": position_ids, "rope_deltas": rope_deltas}
-
-
-def collate_multimodal_metadata(batch, sp_pad):
-    \"\"\"Derive ``multimodal_metadata`` for the Qwen3.5-VL-MoE ViT (CPU-side).
-
-    Module-level so ``get_metadata_collate_func`` can hand it to VeOmni's
-    collator as a picklable callable. See the GPU config for the full
-    rationale. Mutates ``batch`` in place, writing ``multimodal_metadata``.
-    \"\"\"
-    md = {}
-    for list_key in ("image_grid_thw_list", "video_grid_thw_list"):
-        if list_key in batch:
-            md[list_key] = batch.pop(list_key)
-    for modality, list_key, pad_key in (
-        ("image", "image_grid_thw_list", "pixel_values"),
-        ("video", "video_grid_thw_list", "pixel_values_videos"),
-    ):
-        grid_list = md.get(list_key)
-        if not grid_list:
-            continue
-        cu = [0]
-        max_hw = 0
-        for t, h, w in grid_list:
-            hw = h * w
-            max_hw = max(max_hw, hw)
-            for _ in range(t):
-                cu.append(cu[-1] + hw)
-        pad = sp_pad.get(pad_key, 0)
-        if pad > 0:
-            cu.append(cu[-1] + pad)
-            max_hw = max(max_hw, pad)
-        md[f"vit_{modality}_cu_seqlens"] = torch.tensor(cu, dtype=torch.int32, device="cpu")
-        md[f"vit_{modality}_max_seqlen"] = max_hw
-    if md:
-        batch["multimodal_metadata"] = md
-""")
 
 
 config.override_method(

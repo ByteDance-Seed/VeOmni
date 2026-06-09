@@ -40,12 +40,15 @@ per-expert convention; the regex matches both tower prefixes so standalone
 talker tensors (if ever loaded through this converter) are handled uniformly.
 """
 
-import re
 from typing import Dict, List, Optional, Tuple
 
 import torch
 
 from ....utils import logging
+from ..._moe_fused_weight_map import (
+    PER_EXPERT_SPLIT_TO_FUSED_PATTERN,
+    convert_per_expert_fqn_mapping_to_fused,
+)
 from ...checkpoint_tensor_loading import ConvertedCheckpointTensor
 
 
@@ -53,7 +56,7 @@ logger = logging.get_logger(__name__)
 
 # Matches per-expert split keys like:
 #   thinker.model.layers.0.mlp.experts.3.gate_proj.weight
-_EXPERT_PATTERN = re.compile(r"^(.+\.mlp)\.experts\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight$")
+_EXPERT_PATTERN = PER_EXPERT_SPLIT_TO_FUSED_PATTERN
 
 
 class Qwen3OmniMoeCheckpointTensorConverter:
@@ -146,3 +149,8 @@ def create_qwen3_omni_moe_checkpoint_tensor_converter(model):
     thinker_config = getattr(config, "thinker_config", config)
     text_config = getattr(thinker_config, "text_config", thinker_config)
     return Qwen3OmniMoeCheckpointTensorConverter(num_experts=text_config.num_experts)
+
+
+def convert_qwen3_omni_moe_fqn_to_index_mapping(fqn_to_index_mapping: Dict[str, int]) -> Dict[str, int]:
+    """Align HF safetensors index keys with fused thinker expert parameter names."""
+    return convert_per_expert_fqn_mapping_to_fused(fqn_to_index_mapping, _EXPERT_PATTERN)

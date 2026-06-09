@@ -122,4 +122,4 @@ Phase 6: Test                          -> pending
 - **Model registry**: Registration must happen at import time in `__init__.py`. If the model's `AutoConfig` type is not registered, `build_foundation_model()` will fail.
 - **Generated files**: Never edit files in `generated/` directories — they are overwritten by patchgen. Edit the matching `<model>_{gpu,npu}_patch_gen_config.py` and re-run `make patchgen` instead.
 - **Tokenizer compatibility**: Some models require specific tokenizer versions or custom chat templates — verify in `veomni/data/chat_template.py`.
-- **Transformers version**: All modeling targets `transformers==5.2.0` (pinned by the `transformers-stable` default dependency group). Models register through the patchgen-generated path under `generated/`; do not introduce legacy `modeling_<m>.py` files or `apply_veomni_<m>_patch()` helpers.
+- **Transformers version**: All modeling targets `transformers==5.9.0` (pinned by the `transformers-stable` default dependency group). Models register through the patchgen-generated path under `generated/`; do not introduce legacy `modeling_<m>.py` files or `apply_veomni_<m>_patch()` helpers.
