@@ -16,7 +16,7 @@
 # Exports cluster around three concerns:
 #
 #   1. Core graph / runtime types (:class:`OmniConfig`, :class:`OmniModel`,
-#      :class:`OmniModule`, :class:`TrainingGraph`, :class:`GenerationGraph`).
+#      :class:`ModuleMixin`, :class:`TrainingGraph`, :class:`GenerationGraph`).
 #   2. Module registries — :data:`OMNI_CONFIG_REGISTRY`,
 #      :data:`OMNI_MODEL_REGISTRY`, :data:`OMNI_PROCESSOR_REGISTRY` — resolve
 #      ``model_type → class`` lazily at runtime.
@@ -27,7 +27,7 @@ from .conversation import build_conversation
 from .generation_graph import GenerationGraph
 from .graph import END, EdgeDef, NodeDef
 from .modeling_omni import OmniModel
-from .module import InferModuleMixin, TrainModuleMixin
+from .module import ModuleMixin
 from .modules import (
     OMNI_CONFIG_REGISTRY,
     OMNI_MODEL_REGISTRY,
@@ -41,8 +41,7 @@ __all__ = [
     # Core
     "OmniConfig",
     "OmniModel",
-    "TrainModuleMixin",
-    "InferModuleMixin",
+    "ModuleMixin",
     "TrainingGraph",
     "GenerationGraph",
     "NodeDef",

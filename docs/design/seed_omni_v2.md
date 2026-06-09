@@ -13,8 +13,8 @@ SeedOmni V2 is a **model-agnostic runtime** for multi-modal models. The
 framework (`OmniModel`) knows *nothing* about Janus, vision towers, VQ codecs,
 or boundary tokens. It only knows how to:
 
-1. Build a set of independent sub-models (each combines train/infer mixins with
-   a real HF model class).
+1. Build a set of independent sub-models (each is a ``*ModuleMixin`` +
+   HuggingFace ``PreTrainedModel`` pair).
 2. Walk a **graph** declared in YAML, calling one sub-model per node.
 3. Pass a single shared data object — the **conversation list** — through
    those calls, and sum up a single `_loss` per node during training.
@@ -41,19 +41,23 @@ flowchart LR
 
 ## 2. The four building blocks
 
-### 2.1 Train/Infer mixins (`module.py`)
+### 2.1 Module mixins (`module.py` + `modulemixin.py`)
 
-Every sub-model multi-inherits from `TrainModuleMixin` +
-`InferModuleMixin` **and** a real HuggingFace / diffusers model:
+Every sub-model multi-inherits a family-specific ``*ModuleMixin`` and a real
+HuggingFace / diffusers model.  Shared defaults live in
+:class:`~veomni.models.seed_omni.module.ModuleMixin`; per-module train/infer
+logic lives in ``modules/<family>/<sub>/modulemixin.py``:
 
 ```python
-class JanusSiglip(TrainModuleMixin, InferModuleMixin, SiglipVisionModel): ...
-class JanusLlama(TrainModuleMixin, InferModuleMixin, PreTrainedModel): ...
+class JanusSiglip(JanusSiglipModuleMixin, PreTrainedModel): ...
+class JanusLlama(JanusLlamaModuleMixin, PreTrainedModel): ...
 ```
 
-`module.py` still exports `OmniModule` as a compatibility alias
-(`OmniModule = TrainModuleMixin + InferModuleMixin`), but new modules should
-prefer explicit dual-mixin inheritance.
+Construction chain: ``super().__init__(config)`` → ``PreTrainedModel`` +
+:meth:`~veomni.models.seed_omni.module.ModuleMixin.init_omni_state`, then
+build submodules in ``modeling.py`` and call ``self.post_init()`` for HF
+weight init.  Core ``forward`` stays in ``modeling.py``; graph hooks
+(``pre_forward``, ``generate``, …) stay in ``modulemixin.py``.
 
 The mixins expose **optional hooks** with safe defaults:
 
@@ -252,15 +256,12 @@ Use the `/seedomni-v2` skill for the full checklist. The shape of the work:
 2. **Write each module triplet** under
    `veomni/models/seed_omni/modules/<family>/<sub>/`:
    - `configuration.py` — a `PretrainedConfig` with a unique `model_type`.
-   - `modeling.py` — `class X(TrainModuleMixin, InferModuleMixin, <HFBase>)`;
-     implement the hooks you need (at minimum `forward` for a training node,
-     `pre_forward` / `post_forward` to read/write the conversation list,
-     `generate` for an inference node).
+   - `modulemixin.py` — `class XxxModuleMixin(ModuleMixin)` with
+     `init_omni_state`, `pre_forward` / `post_forward`, `generate`, etc.
+   - `modeling.py` — `class X(XxxModuleMixin, <HFBase>)` with `__init__`,
+     `forward`, and submodule layout.  Janus modules under
+     `modules/janus/*/` are the reference pattern.
    - `processing.py` (optional) — if the module consumes raw images / audio.
-   - `modulemixin.py` (optional, recommended for large modules) — put
-     module-specific `XTrainModuleMixin` / `XInferModuleMixin` here, and keep
-     `modeling.py` focused on model structure/init. `janus/vqvae` is the
-     reference pattern.
 
    Reuse cross-family helpers in `modules/base/` where possible.
 
@@ -283,7 +284,8 @@ Use the `/seedomni-v2` skill for the full checklist. The shape of the work:
    - Implement `dummy_inputs()` for any encoder whose modality can be absent
      from a micro-batch.
    - For inference modules, emit `module_signal` strings to drive FSM
-     transitions, and clear private buffers in `reset_inference_state()` /
+     transitions, and clear private buffers in
+     `reset_local_inference_state()` / `reset_global_inference_state()` /
      `finalize()`.
 
 6. **Validate:** render the graph with `TrainingGraph.to_mermaid()`, run the
@@ -296,7 +298,7 @@ Use the `/seedomni-v2` skill for the full checklist. The shape of the work:
 
 | Path | Responsibility |
 |------|----------------|
-| `module.py` | generic `TrainModuleMixin` / `InferModuleMixin` + compatibility `OmniModule` |
+| `module.py` | base `ModuleMixin` (shared hook defaults + `init_omni_state`) |
 | `conversation.py` | `ConversationItem` + carrier helpers |
 | `graph.py` | shared `NodeDef` / `EdgeDef` / `END` |
 | `training_graph.py` | DAG view (topological forward order) |
@@ -304,7 +306,7 @@ Use the `/seedomni-v2` skill for the full checklist. The shape of the work:
 | `configuration_omni.py` | parse + merge the YAML into `OmniConfig` |
 | `modeling_omni.py` | `OmniModel` runtime (train DAG + infer FSM + loss sum) |
 | `checkpoint_callback.py` | per-module checkpoint layout |
-| `modules/<family>/<sub>/` | per-module config / modeling / processing (optional `modulemixin.py`) |
+| `modules/<family>/<sub>/` | per-module `configuration.py`, `modulemixin.py`, `modeling.py` [, `processing.py`] |
 | `veomni/trainer/omni_trainer.py` | build + FSDP-wrap modules, drive the loop |
 | `veomni/trainer/omni_inferencer.py` | request loop, `reset` + `finalize` |
 | `configs/seed_omni/<model>/` | `train.yaml` + `infer_*.yaml` |

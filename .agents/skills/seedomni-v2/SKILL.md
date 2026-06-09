@@ -1,6 +1,6 @@
 ---
 name: seedomni-v2
-description: "Use this skill when adding or modifying anything inside `veomni/models/seed_omni/` (the SeedOmni V2 graph-based multi-modal model). Covers: writing a new OmniModule mixin (HF/diffusers model + OmniModule multi-inheritance), wiring it into the YAML graph (`modules` / `nodes` / `edges` / `training_graph` / `generation_graph`), writing the `configuration_xxx.py` + `modeling_xxx.py` (+ optional `processing_xxx.py`) triplet, updating the corresponding split-checkpoint script, registering with `MODULE_MIXIN_REGISTRY`, and validating with the visualization script + tests. Trigger: 'add seedomni module', 'new omnimodule', 'extend seed_omni', 'add encode/decode module', 'wire into omni graph', 'split <model> checkpoint into omni modules', 'modify training_graph / generation_graph', 'add SeedOmni V2 backbone'."
+description: "Use this skill when adding or modifying anything inside `veomni/models/seed_omni/` (the SeedOmni V2 graph-based multi-modal model). Covers: writing a new `XxxModuleMixin` (subclass `ModuleMixin` + HF/diffusers model multi-inheritance), wiring it into the YAML graph (`modules` / `nodes` / `edges` / `training_graph` / `generation_graph`), writing `configuration.py` + `modulemixin.py` + `modeling.py` (+ optional `processing.py`), updating the split-checkpoint script, registering with `OMNI_*_REGISTRY`, and validating with the visualization script + tests. Trigger: 'add seedomni module', 'new omnimodule', 'extend seed_omni', 'add encode/decode module', 'wire into omni graph', 'split <model> checkpoint into omni modules', 'modify training_graph / generation_graph', 'add SeedOmni V2 backbone'."
 ---
 
 ## Required Reading (before any code change)
@@ -8,14 +8,14 @@ description: "Use this skill when adding or modifying anything inside `veomni/mo
 1. `design.md` — full SeedOmni V2 design rationale. The skill assumes you've internalized:
    - Two-pool model (`nodes` = call-sites, `edges` = data routes; independent namespaces).
    - `to: end` reserved keyword (no orphans, no cycles).
-   - OmniModule is a **mixin**, not a base class.
+   - `ModuleMixin` is a **mixin**, not a base class; per-module hooks live in `*ModuleMixin`.
    - `_loss` suffix collection (single key): each module loops all micro-batches inside one `forward`, `post_forward` does the token-level mean, and emits a scalar `<name>_loss`. OmniModel just sums.
    - **Data is 100% model-agnostic**: `raw_batch` starts with a single key `conversation_list` (`list[list[dict]]` of `{type, value, role, loss_mask}` items). All chat templating, tokenization, image processing, audio feature extraction, and boundary-marker injection happen **inside model modules** during forward. The same dataset can feed any ug model — Janus / Qwen-Omni / Bagel — without changes.
    - **Per-module assets including tokenizer**: every processor (vision / image / audio) AND the tokenizer live inside their owning module's subfolder. There is **no top-level `tokenizer_path`** field — the tokenizer is owned by the family-specific `text_encoder` module (`modules/<family>/text_encoder/tokenizer/`). Pure DiT models without a text encoder have no tokenizer at all.
    - **Module forward → mutates raw_batch**: every module's `forward(**kwargs) -> Dict` return dict is **immediately written back into raw_batch** by OmniModel (keyed by `edge.output`). Data does **not** flow through edge channels to downstream modules — downstream reads the same `raw_batch` by its own input keys. Edges are dependency / topology contracts, not data conduits.
    - **No global collator final-step, no global SP slice node**: each module calls collator helpers and applies SP slicing **inside its own `pre_forward`** for the fields it owns. ViT slices the image batch dimension; text encoder slices the sequence dimension; nothing gets sliced twice.
    - **Status**: this is the target contract; the current code still runs the V1-compatible path (`multimodal_chat_template.py` does chat templating + N pre-expanded placeholders; `JanusLlama.pre_forward` uses `masked_scatter`). Migration happens feature-by-feature (D1: lighter `multimodal_transform`; D2: lighter collator; D3: vision modules take over image processing + boundary markers; D4: `text_encoder` takes over chat template + tokenize; D5: backbone splice). Don't try to land it all in one PR.
-2. `veomni/models/seed_omni/module.py` — the `OmniModule` mixin contract.
+2. `veomni/models/seed_omni/module.py` — the `ModuleMixin` base contract.
 3. `veomni/models/seed_omni/graph.py` + `training_graph.py` + `generation_graph.py` — `NodeDef` / `EdgeDef` schema and the DAG / FSM views.
 4. An existing module that matches your shape:
    - **Generic / cross-family** → `modules/base/text_encoder/modeling.py` (and the planned `modules/base/mlp_adapter/modeling.py`).
@@ -179,7 +179,7 @@ Common pitfall: `if foo is None: return {}` works during inference but breaks tr
 These rules are enforced by the framework. Violate them and you'll fight the design.
 
 1. **`module` ≠ `node` ≠ `edge`.** Three layers: instance, call-site, data flow. Never conflate.
-2. **`OmniModule` is a mixin.** Your model class inherits from `(HFModelClass, OmniModule)` (or just `OmniModule` for from-scratch modules). All hooks (`forward` / `generate_step` / `pre_forward` / `post_forward` / `get_parallel_plan`) are **optional**.
+2. **`ModuleMixin` is a mixin.** Each module adds `XxxModuleMixin(ModuleMixin)` in `modulemixin.py` and inherits `(XxxModuleMixin, HFModelClass)` in `modeling.py`. Hooks (`forward` / `generate` / `pre_forward` / `post_forward` / `init_omni_state`) are **optional** except training-graph `forward`.
 3. **`model_type` lives in `configuration_xxx.py`, not in YAML.** YAML `modules:` only declares `weights_path` (or `config_path`). HF `AutoConfig.from_pretrained(<weights_path>)` reads `model_type` from `<weights_path>/config.json`, then `MODULE_MIXIN_REGISTRY[model_type]` maps it to the combined class.
 4. **Default node method**: training defaults to `forward`, inference defaults to `generate_step`. Specify `method:` only when both training and inference share a non-default method (e.g. `vae_encode` uses `encode` for both).
 5. **Single forward, multi-role via kwargs**: a method may serve multiple roles by input-driven dispatch. Present-input → run, absent-input → return dummy or empty dict (never raise). Examples:
@@ -254,16 +254,17 @@ from typing import Any, Dict, Optional
 import torch
 import torch.nn as nn
 from transformers import PreTrainedModel
-from veomni.models.seed_omni.module import OmniModule
 from .configuration_bar_foo import BarFooConfig
+from .modulemixin import BarFooModuleMixin
 
-class BarFoo(PreTrainedModel, OmniModule):  # multi-inherit
-    """One-line summary. Full schema in module docstring."""
+class BarFoo(BarFooModuleMixin, PreTrainedModel):
+    """HF weights / forward in modeling.py; graph hooks in modulemixin.py."""
     config_class = BarFooConfig
 
     def __init__(self, config: BarFooConfig):
         super().__init__(config)
         # build sub-modules from config
+        self.post_init()
 
     # ── Call-site methods ───────────────────────────────────────────
     def forward(self, **kwargs) -> Dict[str, Any]:
@@ -400,7 +401,7 @@ configs/seed_omni/janus_1.3b/
 Loading rules:
 
 - **Training only**: load just `train_joint.yaml`.
-- **Inference**: load `train_joint.yaml` + the chosen `infer_<scenario>.yaml`. Use `OmniConfig.from_paths(...)` — the inference YAML is **flat-overlaid** onto the training YAML via `dict.update`, so only top-level keys (in practice just `generation_graph`) can be replaced; partial overrides of nested blocks (e.g. one field inside `modules.foo`) are not supported.
+- **Inference**: load `train.yaml` + the chosen `infer_<scenario>.yaml` via `OmniConfig._init(global_args, model_path, train_yaml_path, infer_yaml_path)` — train and infer `modules:` blocks are deep-merged per module name.
 
 ```python
 cfg = OmniConfig.from_paths(
