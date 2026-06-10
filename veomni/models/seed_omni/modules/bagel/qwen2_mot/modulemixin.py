@@ -14,6 +14,8 @@ class BagelQwen2MoTModuleMixin(ModuleMixin):
     def init_omni_state(self) -> None:
         self._conversation_carrier: Optional[list[list[ConversationItem]]] = None
         self._pack_inputs_embeds_shape: Optional[torch.Tensor] = None
+        self._past_key_values: Optional[Any] = None
+        self._key_values_lens: Optional[torch.Tensor] = None
 
     def pre_forward(
         self,
@@ -29,6 +31,162 @@ class BagelQwen2MoTModuleMixin(ModuleMixin):
         del method, outputs
         # TODO(bagel-v2): scatter packed hidden states after the real backbone forward.
         raise NotImplementedError("BagelQwen2MoT graph hooks are not implemented yet.")
+
+    def reset_local_inference_state(self) -> None:
+        self._past_key_values = None
+        self._key_values_lens = None
+
+    @torch.no_grad()
+    def generate(
+        self,
+        conversation_list: Optional[list[ConversationItem]] = None,
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
+        del kwargs
+        if conversation_list is None:
+            raise ValueError("BagelQwen2MoT.generate requires conversation_list.")
+        if not conversation_list or conversation_list[-1].type != "output":
+            raise ValueError(
+                "BagelQwen2MoT.generate expects an output start/generated token at the conversation tail."
+            )
+
+        if self._past_key_values is None:
+            self._prefill_prompt(conversation_list[:-1])
+
+        tail = conversation_list[-1]
+        hidden_states = self._decode_tail(tail)
+        tail.value = hidden_states
+        return {
+            "conversation_list": conversation_list,
+            "bagel_last_hidden_state": hidden_states.detach(),
+            "past_key_values": self._past_key_values,
+            "key_values_lens": None if self._key_values_lens is None else self._key_values_lens.detach(),
+        }
+
+    def _prefill_prompt(self, prompt_items: list[ConversationItem]) -> None:
+        packed_query_sequence, query_lens, position_ids, query_indexes, key_values_lens, key_value_indexes = (
+            self._pack_prompt_items(prompt_items)
+        )
+        outputs = self.forward_inference(
+            packed_query_sequence=packed_query_sequence,
+            query_lens=query_lens,
+            packed_query_position_ids=position_ids,
+            packed_query_indexes=query_indexes,
+            past_key_values=None,
+            key_values_lens=key_values_lens,
+            packed_key_value_indexes=key_value_indexes,
+            update_past_key_values=True,
+            is_causal=True,
+            mode="und",
+        )
+        self._past_key_values = outputs.past_key_values
+        self._key_values_lens = query_lens.detach().to(device=self.device, dtype=torch.int32)
+
+    def _decode_tail(self, tail: ConversationItem) -> torch.Tensor:
+        packed_query_sequence = tail.value
+        if packed_query_sequence.dim() == 3 and packed_query_sequence.size(0) == 1:
+            packed_query_sequence = packed_query_sequence.squeeze(0)
+        packed_query_sequence = packed_query_sequence[-1:].to(device=self.device, dtype=self.dtype)
+
+        query_lens = self._tail_meta_tensor(tail, "query_lens", default=[1], dtype=torch.int32)
+        position_ids = self._tail_meta_tensor(tail, "position_ids", default=None, dtype=torch.long)
+        if position_ids is None:
+            if self._key_values_lens is None:
+                raise ValueError("Cannot infer BAGEL decode position without key_values_lens.")
+            position_ids = self._key_values_lens.to(device=self.device, dtype=torch.long)
+        key_values_lens = self._tail_meta_tensor(tail, "key_value_lens", default=None, dtype=torch.int32)
+        if key_values_lens is None:
+            if self._key_values_lens is None:
+                raise ValueError("Cannot infer BAGEL decode KV length without prefill cache.")
+            key_values_lens = self._key_values_lens.to(device=self.device, dtype=torch.int32)
+        query_indexes = self._tail_meta_tensor(tail, "query_indexes", default=None, dtype=torch.long)
+        if query_indexes is None:
+            query_indexes = key_values_lens.to(device=self.device, dtype=torch.long)
+        key_value_indexes = self._tail_meta_tensor(tail, "context_indexes", default=None, dtype=torch.long)
+        if key_value_indexes is None:
+            key_value_indexes = torch.arange(int(key_values_lens.sum().item()), device=self.device, dtype=torch.long)
+
+        outputs = self.forward_inference(
+            packed_query_sequence=packed_query_sequence,
+            query_lens=query_lens,
+            packed_query_position_ids=position_ids,
+            packed_query_indexes=query_indexes,
+            past_key_values=self._past_key_values,
+            key_values_lens=key_values_lens,
+            packed_key_value_indexes=key_value_indexes,
+            update_past_key_values=True,
+            is_causal=True,
+            mode="und",
+        )
+        self._past_key_values = outputs.past_key_values
+        self._key_values_lens = key_values_lens + query_lens
+        tail.meta["key_value_lens_after_qwen"] = self._key_values_lens.detach()
+        return outputs.packed_query_sequence
+
+    def _pack_prompt_items(
+        self,
+        prompt_items: list[ConversationItem],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        segments: list[torch.Tensor] = []
+        position_ids: list[torch.Tensor] = []
+        query_indexes: list[torch.Tensor] = []
+        for item in prompt_items:
+            if is_dummy(item) or item.type == "output":
+                continue
+            value = item.value
+            if not torch.is_tensor(value):
+                continue
+            if value.dim() == 3 and value.size(0) == 1:
+                value = value.squeeze(0)
+            value = value.to(device=self.device, dtype=self.dtype)
+            segments.append(value)
+            length = int(value.shape[-2])
+            position_ids.append(self._item_meta_tensor(item, "position_ids", length, dtype=torch.long))
+            query_indexes.append(self._item_meta_tensor(item, "sequence_indexes", length, dtype=torch.long))
+        if not segments:
+            raise ValueError("BAGEL qwen2_mot prompt prefill found no tensor prompt segments.")
+        packed_query_sequence = torch.cat(segments, dim=0)
+        query_lens = torch.tensor([packed_query_sequence.shape[0]], device=self.device, dtype=torch.int32)
+        packed_position_ids = torch.cat(position_ids, dim=0)
+        packed_query_indexes = torch.cat(query_indexes, dim=0)
+        key_values_lens = torch.tensor([0], device=self.device, dtype=torch.int32)
+        key_value_indexes = torch.empty(0, device=self.device, dtype=torch.long)
+        return (
+            packed_query_sequence,
+            query_lens,
+            packed_position_ids,
+            packed_query_indexes,
+            key_values_lens,
+            key_value_indexes,
+        )
+
+    def _item_meta_tensor(
+        self,
+        item: ConversationItem,
+        key: str,
+        length: int,
+        *,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        value = item.meta.get(key)
+        if torch.is_tensor(value):
+            return value.detach().to(device=self.device, dtype=dtype).reshape(-1)
+        return torch.arange(length, device=self.device, dtype=dtype)
+
+    def _tail_meta_tensor(
+        self,
+        tail: ConversationItem,
+        key: str,
+        *,
+        default: Optional[list[int]],
+        dtype: torch.dtype,
+    ) -> Optional[torch.Tensor]:
+        value = tail.meta.get(key)
+        if torch.is_tensor(value):
+            return value.detach().to(device=self.device, dtype=dtype).reshape(-1)
+        if default is None:
+            return None
+        return torch.tensor(default, device=self.device, dtype=dtype)
 
     def _pack_conversations(
         self,

@@ -3,6 +3,9 @@
 model:
   model_path: /mnt/hdfs/shizhelun/veomni_omni/models/seed_omni/BAGEL-7B-MoT
   omni_train_yaml_path: configs/seed_omni/bagel_7b_mot/train.yaml
+  omni_infer_yaml_path:
+    infer_und: configs/seed_omni/bagel_7b_mot/infer_und.yaml
+  omni_infer_type: infer_und
   model_config: {}
   ops_implementation:
     attn_implementation: flash_attention_2

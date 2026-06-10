@@ -1,0 +1,33 @@
+# BAGEL-7B-MoT inference - understanding to text (text/image -> text).
+#
+# This graph family mirrors Janus V2 `infer_und`: prompt_encode consumes
+# available text and image context, then text_ar autoregressively emits text.
+# The first graph-level parity case is text-only; text+image understanding
+# should use the same FSM once the visual-understanding fixture and hooks land.
+
+generation_graph:
+  initial: prompt_encode
+
+  states:
+    prompt_encode:
+      body:
+        - siglip_encode_to_qwen2
+        - token_prompt_encode_to_qwen2
+        - qwen2_to_token_generate
+        - token_generate_sink
+      transitions:
+        - { condition: { type: module_signal, key: text_done }, next_state: done }
+        - { condition: { type: default }, next_state: text_ar }
+
+    text_ar:
+      body:
+        - qwen2_to_token_generate
+        - token_generate_sink
+      transitions:
+        - { condition: { type: module_signal, key: text_done }, next_state: done }
+
+generation_kwargs:
+  max_new_tokens: 2048
+  temperature: 0.0
+  top_p: 1.0
+  do_sample: false

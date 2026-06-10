@@ -2,7 +2,8 @@
 
 from ...base.text_encoder.modeling import TextEncoder
 from .configuration import BagelTextEncoderConfig
+from .modulemixin import BagelTextEncoderModuleMixin
 
 
-class BagelTextEncoder(TextEncoder):
+class BagelTextEncoder(BagelTextEncoderModuleMixin, TextEncoder):
     config_class = BagelTextEncoderConfig

@@ -23,7 +23,9 @@ modules:
 
 nodes:
   token_encode: { module: bagel_text_encoder.encode }
-  siglip_encode: { module: bagel_siglip_navit.encode }
+  token_prompt_encode: { module: bagel_text_encoder }
+  token_generate: { module: bagel_text_encoder }
+  siglip_encode: { module: bagel_siglip_navit }
   vae_encode: { module: bagel_vae.encode }
   flow_embed: { module: bagel_flow_connector.embed_latent }
   qwen2_mot: { module: bagel_qwen2_mot }
@@ -39,6 +41,13 @@ edges:
   qwen2_to_flow_decode: { from: qwen2_mot, to: flow_decode }
   token_decode_sink: { from: token_decode, to: end }
   flow_decode_sink: { from: flow_decode, to: end }
+
+  # Inference-only understanding path: text/image context -> text token.
+  token_prompt_encode_to_qwen2: { from: token_prompt_encode, to: qwen2_mot }
+  token_generate_to_qwen2: { from: token_generate, to: qwen2_mot }
+  qwen2_to_token_generate: { from: qwen2_mot, to: token_generate }
+  token_generate_sink: { from: token_generate, to: end }
+  qwen2_sink: { from: qwen2_mot, to: end }
 
 training_graph:
   edges:

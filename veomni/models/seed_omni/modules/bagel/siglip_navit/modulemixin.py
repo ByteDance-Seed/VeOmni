@@ -34,5 +34,18 @@ class BagelSiglipNavitModuleMixin(ModuleMixin):
             "packed_flattened_position_ids": torch.zeros(1, dtype=torch.long, device=self.device),
         }
 
+    def generate(
+        self,
+        conversation_list: Optional[list[ConversationItem]] = None,
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
+        del kwargs
+        if conversation_list is None:
+            raise ValueError("BagelSiglipNavit.generate requires conversation_list.")
+        pending = [item for item in conversation_list if item.type == "image" and item.role == "user"]
+        if not pending:
+            return {"conversation_list": conversation_list}
+        raise NotImplementedError("BagelSiglipNavit.generate for image prompts is not implemented yet.")
+
 
 __all__ = ["BagelSiglipNavitModuleMixin"]
