@@ -1,4 +1,4 @@
-"""BAGEL connector layers between vision/VAE tokens and Qwen2 hidden states.
+"""BAGEL flow-generation connector layers between VAE tokens and Qwen2 hidden states.
 
 The learned projection architecture is present for checkpoint splitting.
 Runtime flow call-sites are intentionally left unimplemented until the Bagel
@@ -12,7 +12,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 from transformers import PreTrainedModel
-from transformers.activations import ACT2FN
 
 from .configuration import BagelFlowConnectorConfig
 from .modulemixin import BagelFlowConnectorModuleMixin
@@ -60,17 +59,6 @@ class TimestepEmbedder(nn.Module):
         return self.mlp(self.timestep_embedding(t, self.frequency_embedding_size))
 
 
-class MLPconnector(nn.Module):
-    def __init__(self, in_dim: int, out_dim: int, hidden_act: str):
-        super().__init__()
-        self.activation_fn = ACT2FN[hidden_act]
-        self.fc1 = nn.Linear(in_dim, out_dim)
-        self.fc2 = nn.Linear(out_dim, out_dim)
-
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return self.fc2(self.activation_fn(self.fc1(hidden_states)))
-
-
 class PositionEmbedding(nn.Module):
     def __init__(self, max_num_patch_per_side: int, hidden_size: int):
         super().__init__()
@@ -91,22 +79,11 @@ class BagelFlowConnector(BagelFlowConnectorModuleMixin, PreTrainedModel):
 
     def __init__(self, config: BagelFlowConnectorConfig):
         super().__init__(config)
-        self.connector = MLPconnector(config.vit_hidden_size, config.hidden_size, config.connector_act)
-        self.vit_pos_embed = PositionEmbedding(config.vit_max_num_patch_per_side, config.hidden_size)
         self.time_embedder = TimestepEmbedder(config.hidden_size, config.timestep_frequency_embedding_size)
         self.vae2llm = nn.Linear(config.patch_latent_dim, config.hidden_size)
         self.llm2vae = nn.Linear(config.hidden_size, config.patch_latent_dim)
         self.latent_pos_embed = PositionEmbedding(config.max_latent_size, config.hidden_size)
         self.post_init()
-
-    def encode_vision(
-        self,
-        hidden_states: torch.Tensor,
-        position_ids: Optional[torch.LongTensor] = None,
-    ) -> Dict[str, torch.Tensor]:
-        del hidden_states, position_ids
-        # TODO(bagel-v2): port Bagel visual-understanding connector call-site.
-        raise NotImplementedError("BagelFlowConnector.encode_vision is not implemented yet.")
 
     def embed_latent(
         self,

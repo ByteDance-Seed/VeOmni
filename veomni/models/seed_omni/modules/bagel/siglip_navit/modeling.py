@@ -1,4 +1,4 @@
-"""BAGEL SigLIP NaViT structural module.
+"""BAGEL SigLIP NaViT and visual connector structural module.
 
 The weight-owning architecture is present for checkpoint splitting. Runtime
 vision forward parity is intentionally left for the Bagel graph/parity phase.
@@ -6,6 +6,7 @@ vision forward parity is intentionally left for the Bagel graph/parity phase.
 
 from typing import Any, Dict, Optional
 
+import numpy as np
 import torch
 import torch.nn as nn
 from transformers import PreTrainedModel
@@ -13,6 +14,47 @@ from transformers.activations import ACT2FN
 
 from .configuration import BagelSiglipNavitConfig
 from .modulemixin import BagelSiglipNavitModuleMixin
+
+
+def get_1d_sincos_pos_embed_from_grid(embed_dim: int, pos: np.ndarray) -> np.ndarray:
+    omega = np.arange(embed_dim // 2, dtype=np.float64)
+    omega /= embed_dim / 2.0
+    omega = 1.0 / 10000**omega
+    out = np.einsum("m,d->md", pos.reshape(-1), omega)
+    return np.concatenate([np.sin(out), np.cos(out)], axis=1)
+
+
+def get_2d_sincos_pos_embed(embed_dim: int, grid_size: int) -> np.ndarray:
+    grid_h = np.arange(grid_size, dtype=np.float32)
+    grid_w = np.arange(grid_size, dtype=np.float32)
+    grid = np.meshgrid(grid_w, grid_h)
+    grid = np.stack(grid, axis=0).reshape([2, 1, grid_size, grid_size])
+    emb_h = get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[0])
+    emb_w = get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[1])
+    return np.concatenate([emb_h, emb_w], axis=1)
+
+
+class PositionEmbedding(nn.Module):
+    def __init__(self, max_num_patch_per_side: int, hidden_size: int):
+        super().__init__()
+        self.max_num_patch_per_side = max_num_patch_per_side
+        self.hidden_size = hidden_size
+        pos_embed = get_2d_sincos_pos_embed(self.hidden_size, self.max_num_patch_per_side)
+        self.register_buffer("pos_embed", torch.from_numpy(pos_embed).float(), persistent=False)
+
+    def forward(self, position_ids: torch.LongTensor) -> torch.Tensor:
+        return self.pos_embed[position_ids]
+
+
+class MLPconnector(nn.Module):
+    def __init__(self, in_dim: int, out_dim: int, hidden_act: str):
+        super().__init__()
+        self.activation_fn = ACT2FN[hidden_act]
+        self.fc1 = nn.Linear(in_dim, out_dim)
+        self.fc2 = nn.Linear(out_dim, out_dim)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return self.fc2(self.activation_fn(self.fc1(hidden_states)))
 
 
 class BagelSiglipVisionEmbeddings(nn.Module):
@@ -107,6 +149,8 @@ class BagelSiglipNavit(BagelSiglipNavitModuleMixin, PreTrainedModel):
     def __init__(self, config: BagelSiglipNavitConfig):
         super().__init__(config)
         self.vision_model = BagelSiglipVisionTransformer(config)
+        self.connector = MLPconnector(config.hidden_size, config.output_size, config.connector_act)
+        self.vit_pos_embed = PositionEmbedding(config.vit_max_num_patch_per_side, config.output_size)
         self.post_init()
 
     def forward(  # type: ignore[override]
