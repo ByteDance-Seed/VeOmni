@@ -110,7 +110,7 @@ def _copy_tokenizer_assets(model_root: Path, target_dir: Path) -> None:
             shutil.copy2(src, target_dir / name)
 
 
-def split_bagel(model_path: str, output_dir: str, *, force: bool = False, max_latent_size: int = 64) -> None:
+def split_bagel(model_path: str, output_dir: str, *, force: bool = False, max_latent_size: int = 32) -> None:
     model_root = Path(model_path)
     target_root = Path(output_dir)
     _prepare_output_dir(target_root, force=force)
@@ -222,7 +222,7 @@ def main() -> None:
     parser.add_argument("--model_path", required=True, help="Path to the upstream BAGEL checkpoint")
     parser.add_argument("--output_dir", required=True, help="Directory to write split SeedOmni modules")
     parser.add_argument("--force", action="store_true", help="Overwrite output_dir if it already exists")
-    parser.add_argument("--max_latent_size", type=int, default=64, help="BAGEL latent position grid size")
+    parser.add_argument("--max_latent_size", type=int, default=32, help="BAGEL latent position grid size")
     args = parser.parse_args()
 
     split_bagel(

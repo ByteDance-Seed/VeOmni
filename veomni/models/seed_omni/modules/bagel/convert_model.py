@@ -10,7 +10,7 @@ def convert_bagel_checkpoint(
     output_dir: str,
     *,
     force: bool = False,
-    max_latent_size: int = 64,
+    max_latent_size: int = 32,
     **kwargs,
 ) -> None:
     """Split an upstream BAGEL checkpoint into five V2 module subfolders."""

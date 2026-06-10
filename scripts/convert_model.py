@@ -31,27 +31,11 @@ def main() -> None:
         required=True,
         help="Directory to write split module sub-checkpoints",
     )
-    parser.add_argument(
-        "--force",
-        action="store_true",
-        help="Overwrite output_dir if the selected converter supports it",
-    )
-    parser.add_argument(
-        "--max_latent_size",
-        type=int,
-        default=64,
-        help="BAGEL latent position grid size; ignored by converters that do not use it",
-    )
     args = parser.parse_args()
 
     model_type = read_hf_model_type(args.model_path)
     print(f"Detected model_type={model_type!r} from {args.model_path}")
-    convert_checkpoint(
-        args.model_path,
-        args.output_dir,
-        force=args.force,
-        max_latent_size=args.max_latent_size,
-    )
+    convert_checkpoint(args.model_path, args.output_dir)
     print(f"Conversion complete → {args.output_dir}")
 
 

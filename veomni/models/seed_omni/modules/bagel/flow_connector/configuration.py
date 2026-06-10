@@ -11,7 +11,7 @@ class BagelFlowConnectorConfig(PretrainedConfig):
         hidden_size: int = 3584,
         vit_hidden_size: int = 1152,
         patch_latent_dim: int = 64,
-        max_latent_size: int = 64,
+        max_latent_size: int = 32,
         vit_max_num_patch_per_side: int = 70,
         connector_act: str = "gelu_pytorch_tanh",
         timestep_frequency_embedding_size: int = 256,
