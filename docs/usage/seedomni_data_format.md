@@ -1,28 +1,30 @@
 # SeedOmni V2 Data Format
 
 This guide describes the **on-disk conversation schema** used by SeedOmni V2
-(`data_type: seedomni`) and the Janus demo dataset builder. The design goal is
-a **flat chat JSON** — a small number of `user` / `assistant` messages, each
-with an ordered `content` list — so preprocess stays simple and the same sample
-can feed understanding (I2T), generation (T2I), or mixed (UG) training.
+(`data_type: seedomni`) and the multisource preprocessors under
+``veomni/data/seed_omni/preprocess.py``. The design goal is a **flat chat JSON**
+— a small number of `user` / `assistant` messages, each with an ordered
+`content` list — so preprocess stays simple and the same sample can feed
+understanding (I2T), generation (T2I), or mixed (UG) training.
 
 ## Pipeline overview
 
 ```
 parquet row (conversations + images)
         │
-        ▼  conv_preprocess("veomni_omni_demo", …)
-        │  veomni/data/multimodal/preprocess.py
+        ▼  conv_preprocess(<source_name>, …)
+        │  veomni/data/seed_omni/preprocess.py
         ▼
 seedomni_transform.process_seedomni_example
-        │  veomni/data/multimodal/seedomni_transform.py
+        │  veomni/data/seed_omni/seedomni_transform.py
         ▼
 raw_batch["conversation_list"]  →  OmniModel modules (SigLIP / VQVAE / …)
 ```
 
-Set `data.data_type: seedomni` and register the sample with
-`source_name: veomni_omni_demo` (or add your own preprocessor — see
-[Preprocessor Registry](../key_features/preprocessor_registry.md)).
+Set `data.data_type: seedomni` and point `data.train_path` at a multisource YAML
+(see ``configs/seed_omni/janus_1.3b/data.yaml``). Each source's ``names`` entry
+must match a key in ``SEED_OMNI_PREPROCESSOR_REGISTRY`` (or add your own
+preprocessor in ``veomni/data/seed_omni/preprocess.py``).
 
 ## On-disk row schema (parquet / jsonl)
 
@@ -30,7 +32,7 @@ Each training sample is one row with three fields:
 
 | Column | Type | Description |
 |--------|------|-------------|
-| `source_name` | `str` | Preprocessor id, e.g. `veomni_omni_demo` |
+| `source_name` | `str` | Preprocessor id, e.g. `imagenet1k`, `tulu-3-sft-mixture`, `sharegpt4v_cap_100k` |
 | `conversations` | JSON bytes / list | Chat messages (see below) |
 | `images` | `list[bytes]` | PNG/JPEG bytes, consumed **in conversation order** for every `{"type": "image"}` placeholder |
 
@@ -38,7 +40,7 @@ Image bytes are **not** embedded inside `conversations`. Each
 `{"type": "image"}` item is a placeholder; `seedomni_transform` pairs them
 with `images[0]`, `images[1]`, … in order.
 
-## Message format (`veomni_omni_demo`)
+## Message format (ShareGPT4V-style sources)
 
 Each message:
 
@@ -171,64 +173,21 @@ Modules read this list directly — chat template, tokenize, normalize, and
 patchify happen inside each SeedOmni module at forward time (see `design.md`
 § "数据路由").
 
-## Build a demo parquet
+## Janus multisource training
+
+Data sources are declared in ``configs/seed_omni/janus_1.3b/data.yaml`` (ImageNet1k
+T2I + ShareGPT4V caption I2T). Launch with the bundled YAML:
 
 ```bash
-python scripts/multimodal/convert_data/make_janus_omni_demo.py \
-    --dataset_mode understanding \
-    --gen_image janus_out/infer_gen/generated_image_0.png \
-    --und_reply janus_out/infer_und/reply.txt \
-    --gen_prompt "A close-up high-contrast photo of Sydney Opera House at night." \
-    --out_dir outputs/janus_demo/data \
-    --num_repeat 32
+bash train.sh tasks/omni/train_omni.py configs/seed_omni/janus_1.3b/veomni_janus.yaml
 ```
 
-Dataset modes (`--dataset_mode`):
-
-| Mode | Rows emitted | Typical loss routing |
-|------|----------------|----------------------|
-| `understanding` | I2T only | `tok_decode` > 0, `vae_decode` == 0 (dummy) |
-| `t2i` | T2I only | `vae_decode` > 0 |
-| `mixed` | interleave UG | both heads > 0 |
-| `all` | all three kinds | both heads > 0 on mixed rows |
-
-Output file: ``<out_dir>/janus_omni_demo_<mode>.parquet``.
-
-Verify loss routing (5-step overfit + checker):
-
-```bash
-bash scripts/seed_omni/verify_janus_demo_loss.sh understanding
-bash scripts/seed_omni/verify_janus_demo_loss.sh t2i
-bash scripts/seed_omni/verify_janus_demo_loss.sh mixed
-```
-
-8-GPU smoke train (20 steps by default):
-
-```bash
-bash scripts/seed_omni/debug_omni.sh understanding
-bash scripts/seed_omni/debug_omni.sh t2i
-bash scripts/seed_omni/debug_omni.sh mixed
-```
-
-Legacy flags:
-
-| Flag | Effect |
-|------|--------|
-| `--include_interleave` | Alias for `--dataset_mode all` |
-| `--only_interleave` | Alias for `--dataset_mode mixed` |
-| `--num_repeat N` | Repeat each base row `N` times |
-
-Point training at the output:
-
-```yaml
-data:
-  data_type: seedomni
-  train_path: outputs/janus_demo/data/janus_omni_demo_understanding.parquet
-```
+See [`docs/seed_omni/example_models/janus.md`](../seed_omni/example_models/janus.md)
+for the full convert → train → resume → infer pipeline.
 
 ## Custom datasets
 
-Implement a preprocessor in `veomni/data/multimodal/preprocess.py` that
+Implement a preprocessor in `veomni/data/seed_omni/preprocess.py` that
 returns the internal tuple form:
 
 ```python
@@ -238,6 +197,6 @@ returns the internal tuple form:
 ]
 ```
 
-Register with `@PREPROCESSOR_REGISTRY.register("your_source")` and set
+Register with `@SEED_OMNI_PREPROCESSOR_REGISTRY.register("your_source")` and set
 `source_name: your_source` in the dataset config. Keep the same rules: one
 `type="image"`, route by `role`, images in a parallel list consumed in order.

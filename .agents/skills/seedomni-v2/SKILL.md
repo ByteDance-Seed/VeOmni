@@ -382,7 +382,7 @@ If the new module's weights come from extracting a subset of an existing Hugging
 5. Save the asset (if any) to the same subfolder via the appropriate `save_pretrained` (e.g. `image_processor.save_pretrained(<output_dir>/<sub_name>/)`).
 6. Print the new `weights_path` in the final summary so the YAML can be updated by copy-paste.
 
-The `text_encoder` extraction in `scripts/split_janus.py` (especially the `tie_word_embeddings`-aware lm_head save) is the reference.
+The `text_encoder` extraction in `veomni/models/seed_omni/modules/janus/convert_model.py` (especially the `tie_word_embeddings`-aware lm_head save) is the reference.
 
 ## Phase 5 — Wire into the YAML graph
 

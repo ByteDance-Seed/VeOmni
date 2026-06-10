@@ -1383,10 +1383,11 @@ def build_weighted_multisource_dataset(
             train_path=source,
             seed=seed,
             transform=transform,
+            source_name=source_names[idx],
             split_by_node=split_by_node,
             shuffle=shuffle,
         )
-        for source in sources
+        for idx, source in enumerate(sources)
     ]
 
     return WeightedMultiSourceDataset(

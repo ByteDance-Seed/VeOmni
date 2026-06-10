@@ -58,15 +58,18 @@ Division of labour
 """
 
 import os
+import random
 from collections import defaultdict
 from dataclasses import dataclass, field, fields
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
+import numpy as np
 import torch
 import torch.distributed as dist
 
 from ..arguments import DataArguments, ModelArguments, TrainingArguments, VeOmniArguments
 from ..data import SeedOmniCollator
+from ..data.data_transform import build_data_transform
 from ..distributed.clip_grad_norm import veomni_clip_grad_norm
 from ..models import build_processor, build_tokenizer
 from ..models.seed_omni.modeling_omni import OmniModel
@@ -302,6 +305,10 @@ class OmniGlobalStateCallback(Callback):
         base = self.trainer.base
         args = base.args
         if args.train.global_rank == 0:
+            state_path = self._state_path(args.train.checkpoint.save_path, global_step)
+            # Create the step dir here: callback order vs. per-module DCP saves
+            # is not guaranteed, so we can't assume it already exists.
+            os.makedirs(os.path.dirname(state_path), exist_ok=True)
             torch.save(
                 {
                     "global_step": global_step,
@@ -310,8 +317,10 @@ class OmniGlobalStateCallback(Callback):
                     else {},
                     "environ_meter": base.environ_meter.state_dict(),
                     "torch_rng_state": torch.get_rng_state(),
+                    "numpy_rng_state": np.random.get_state(),
+                    "python_rng_state": random.getstate(),
                 },
-                self._state_path(args.train.checkpoint.save_path, global_step),
+                state_path,
             )
         if dist.is_initialized():
             dist.barrier()
@@ -335,6 +344,10 @@ class OmniGlobalStateCallback(Callback):
         if ts.get("environ_meter") is not None:
             base.environ_meter.load_state_dict(ts["environ_meter"])
         torch.set_rng_state(ts["torch_rng_state"])
+        if ts.get("numpy_rng_state") is not None:
+            np.random.set_state(ts["numpy_rng_state"])
+        if ts.get("python_rng_state") is not None:
+            random.setstate(ts["python_rng_state"])
         if base.start_step == 0 and base.train_dataloader is not None:
             iter(base.train_dataloader)
 
@@ -639,15 +652,16 @@ class OmniTrainer:
         # :class:`OmniModuleTrainer`; the orchestrator only snapshots OmniConfig.
         self.base.model_assets = [self.omni_config]
 
+    # —— Build: data_transform ───────────────────────────────────────────────────────────
+    def _build_data_transform(self):
+        self.base.data_transform = build_data_transform("seedomni")
+
     # ── Build: collator ─────────────────────────────────────────────────────────
 
     def _build_collate_fn(self):
-        """``seedomni`` → list-only ``SeedOmniCollator``; else BaseTrainer default."""
-        if self.base.args.data.data_type == "seedomni":
-            self.base.collate_fn = SeedOmniCollator()
-            logger.info_rank0("OmniTrainer: using SeedOmniCollator (list-only) for data_type='seedomni'")
-        else:
-            self.base._build_collate_fn()
+        """list-only ``SeedOmniCollator`` for data_type='seedomni'."""
+        self.base.collate_fn = SeedOmniCollator()
+        logger.info_rank0("OmniTrainer: using SeedOmniCollator (list-only) for data_type='seedomni'")
 
     # ── Build: per-module optimizers + schedulers (drive the module-trainers) ──
 

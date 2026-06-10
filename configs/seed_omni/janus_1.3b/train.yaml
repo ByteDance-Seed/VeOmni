@@ -28,7 +28,7 @@
 # Split the upstream Janus checkpoint first (creates the sub-folders
 # referenced by relative ``modules.*.weights_path``)::
 #
-#   python scripts/multimodal/convert_model/split_janus.py \
+#   python scripts/convert_model.py \
 #     --model_path /mnt/hdfs/veomni/models/transformers/Janus-1.3B \
 #     --output_dir /mnt/hdfs/veomni/models/seed_omni/janus_1.3b
 #
@@ -69,7 +69,7 @@ modules:
     model:
       model_path: janus_text_encoder
     # `vocab_size` / `hidden_size` / `tie_word_embeddings` come from
-    # `janus_text_encoder/config.json` (written by `scripts/split_janus.py`).
+    # `janus_text_encoder/config.json` (written by `scripts/convert_model.py`).
     # Tokenizer + special-token ids: ``janus_text_encoder/tokenizer.json``.
 
   janus_llama:

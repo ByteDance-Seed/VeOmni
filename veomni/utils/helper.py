@@ -141,11 +141,13 @@ def _get_multisource_ds_idx(micro_batch: Dict[str, "torch.Tensor"]) -> List[int]
     micro_batch.pop("source_name", None)
     micro_batch.pop("cur_token_num", None)
     if isinstance(ds_idx, torch.Tensor):
-        # packed micro batch
+        # packed micro batch (e.g. PackingCollator)
         return ds_idx.tolist()
-    else:
-        # unpacked sample
-        return [ds_idx]
+    if isinstance(ds_idx, list):
+        # SeedOmniCollator gathers per-sample ds_idx into a list
+        return [int(idx) for idx in ds_idx]
+    # single-sample micro batch
+    return [int(ds_idx)]
 
 
 class EnvironMeter:
@@ -383,8 +385,9 @@ class MultiSourceInfoTracker:
                     / max(self.accumulate_counter[ds_idx].num_samples, 1),
                     f"multi_source/step_consumed_tokens(M)/{self.names[ds_idx]}": global_counter[ds_idx].num_tokens
                     / 1e6,
-                    f"multi_source/step_consumed_ratio/{self.names[ds_idx]}": global_counter[ds_idx].num_tokens
-                    / step_consumed_tokens,
+                    # TODO: fix tokens count for omniv2
+                    # f"multi_source/step_consumed_ratio/{self.names[ds_idx]}": global_counter[ds_idx].num_tokens
+                    # / step_consumed_tokens,
                 }
             )
 

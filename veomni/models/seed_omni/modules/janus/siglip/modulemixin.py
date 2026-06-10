@@ -61,8 +61,8 @@ class JanusSiglipModuleMixin(ModuleMixin):
 
     def dummy_inputs(self) -> Dict[str, Any]:
         cfg = self.config.vision_config or {}
-        h = cfg["image_size"]
-        c = cfg["num_channels"]
+        h = cfg.image_size
+        c = cfg.num_channels
         return {
             "pixel_values": torch.zeros(1, c, h, h, device=self.device, dtype=self.dtype),
         }

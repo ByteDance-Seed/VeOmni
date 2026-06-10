@@ -5,7 +5,7 @@ The ``model_type`` literal here is the lookup key for
 
 The whole vision-side hyper-parameters travel under ``vision_config`` —
 that mirrors the original :class:`transformers.JanusVisionConfig` schema so
-the ``scripts/split_janus.py`` extractor can dump the field unchanged.
+the ``scripts/convert_model.py`` extractor can dump the field unchanged.
 """
 
 from typing import Any, Dict, Optional

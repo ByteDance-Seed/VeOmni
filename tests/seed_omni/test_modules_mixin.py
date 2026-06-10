@@ -240,6 +240,31 @@ def test_janus_vqvae_decode_training_loss():
     assert out["loss"].dim() == 0
 
 
+def test_janus_vqvae_dummy_decode_keeps_generation_head_in_graph():
+    """FSDP2 regression: the dummy decode path must route through
+    ``generation_head`` so its grad/reduce_scatter fires on every rank (ranks
+    with no assistant image would otherwise skip it and dead-lock NCCL)."""
+    JanusVqvae = _model_cls("janus_vqvae")
+    JanusVqvaeConfig = _config_cls("janus_vqvae")
+    jv = JanusVqvae(JanusVqvaeConfig(vq_config=_tiny_vq_cfg()))
+
+    # generation_head must be trainable (only the inner vqmodel is frozen).
+    jv.freeze_model()
+    assert all(p.requires_grad for p in jv.generation_head.parameters())
+
+    h = torch.randn(1, 4, 64, requires_grad=True)
+    labels = torch.randint(0, 64, (1, 4))
+    out = jv.decode(hidden_states=h, labels=labels, is_dummy=True)
+
+    # Zero loss contribution, but the head's params must be in the graph.
+    assert out["loss"].dim() == 0
+    assert out["loss"].detach().item() == 0.0
+
+    out["loss"].backward()
+    head_grads = [p.grad for p in jv.generation_head.parameters() if p.grad is not None]
+    assert head_grads, "dummy decode must produce a gradient path through generation_head"
+
+
 def test_janus_siglip_forward_returns_image_embeds():
     JanusSiglip = _model_cls("janus_siglip")
     JanusSiglipConfig = _config_cls("janus_siglip")
