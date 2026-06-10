@@ -1,0 +1,28 @@
+# Qwen3-0.6B inference — text-only chat generation.
+
+generation_graph:
+  initial: prompt_encode
+
+  states:
+    prompt_encode:
+      body:
+        - token_generate_to_qwen3_llm
+        - qwen3_llm_to_token_generate
+        - token_generate_sink
+      transitions:
+        - { condition: { type: module_signal, key: text_done }, next_state: done }
+        - { condition: { type: default }, next_state: text_ar }
+
+    text_ar:
+      body:
+        - token_generate_to_qwen3_llm
+        - qwen3_llm_to_token_generate
+        - token_generate_sink
+      transitions:
+        - { condition: { type: module_signal, key: text_done }, next_state: done }
+
+generation_kwargs:
+  max_new_tokens: 2048
+  temperature: 0.0
+  top_p: 1.0
+  do_sample: false

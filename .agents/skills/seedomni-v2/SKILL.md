@@ -373,7 +373,7 @@ Only for modules that own a processor (vision processor, image processor, audio 
 
 ## Phase 4 — Update / write the split-checkpoint script
 
-If the new module's weights come from extracting a subset of an existing HuggingFace checkpoint, update `scripts/split_<family>.py`:
+If the new module's weights come from extracting a subset of an existing HuggingFace checkpoint, update `scripts/convert_model/split_<family>.py`:
 
 1. Add a new output directory `<output_dir>/<sub_name>/`.
 2. Walk the source state dict and write only the keys that belong to this module (filter by prefix, e.g. `embed_tokens.*` for `text_encoder`).

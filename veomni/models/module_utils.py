@@ -808,7 +808,11 @@ def post_process_after_weight_loading(
         try:
             input_embeddings = model.get_input_embeddings()
             output_embeddings = model.get_output_embeddings()
-            output_embeddings._parameters["weight"] = input_embeddings._parameters["weight"]
+            # Nothing to tie when there is no distinct output projection (e.g.
+            # SeedOmni ``TextEncoder`` with tied weights reuses the input
+            # embedding directly via ``F.linear`` and exposes no ``lm_head``).
+            if output_embeddings is not None and output_embeddings is not input_embeddings:
+                output_embeddings._parameters["weight"] = input_embeddings._parameters["weight"]
         except Exception as e:
             logger.info_rank0(f"Failed to tie embeddings: {e}")
             raise RuntimeError("Failed to tie input/output embeddings") from e

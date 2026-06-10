@@ -37,6 +37,27 @@ class TextEncoder(TextEncoderModuleMixin, PreTrainedModel):
         self._tokenizer: Optional[Any] = None
         self.post_init()
 
+    # ── Embedding accessors ────────────────────────────────────────────────────
+
+    def get_input_embeddings(self) -> nn.Module:
+        return self.embed_tokens
+
+    def set_input_embeddings(self, value: nn.Module) -> None:
+        self.embed_tokens = value
+
+    def get_output_embeddings(self) -> Optional[nn.Module]:
+        # When tied there is no separate ``lm_head`` — ``_project`` reuses
+        # ``embed_tokens.weight`` directly. Returning ``embed_tokens`` makes the
+        # generic load-time weight-tie a harmless self-assignment instead of
+        # crashing on a ``None`` output module.
+        if self.config.tie_word_embeddings:
+            return self.embed_tokens
+        return self.lm_head
+
+    def set_output_embeddings(self, new_embeddings: nn.Module) -> None:
+        if not self.config.tie_word_embeddings:
+            self.lm_head = new_embeddings
+
     # ── Gradient checkpointing (no-op — nothing to recompute) ──────────────────
 
     def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None) -> None:
