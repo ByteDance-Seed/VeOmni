@@ -1032,7 +1032,7 @@ class DataArguments:
             "help": "Number of samples for training to compute training steps for non-dynamic batch dataloader."
         },
     )
-    data_type: Literal["plaintext", "conversation", "diffusion", "classification", "dpo"] = field(
+    data_type: Literal["plaintext", "conversation", "diffusion", "classification", "dpo", "seedomni"] = field(
         default="conversation",
         metadata={"help": "Type of the training data."},
     )

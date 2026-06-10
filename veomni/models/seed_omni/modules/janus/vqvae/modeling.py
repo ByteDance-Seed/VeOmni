@@ -110,7 +110,7 @@ class JanusVqvae(JanusVqvaeModuleMixin, PreTrainedModel):
         if hidden_states is None or labels is None:
             return {}
         if is_dummy:
-            return {"loss": hidden_states.sum() * 0.0}
+            return {"loss": self.generation_head(hidden_states).sum() * 0.0}
         return {"loss": self._vq_loss(hidden_states, labels)}
 
     def _vq_loss(self, hidden_states: torch.Tensor, gt_token_ids: torch.Tensor) -> torch.Tensor:

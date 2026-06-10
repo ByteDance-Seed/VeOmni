@@ -9,4 +9,4 @@ The BAGEL checkpoint is split into five module-owned state dicts:
 * ``bagel_flow_connector``: VAE/LLM flow connector and positional/timestep layers
 """
 
-from . import flow_connector, qwen2_mot, siglip_navit, text_encoder, vae  # noqa: F401
+from . import convert_model, flow_connector, qwen2_mot, siglip_navit, text_encoder, vae  # noqa: F401

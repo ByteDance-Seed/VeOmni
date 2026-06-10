@@ -3,7 +3,7 @@
 Mirrors HuggingFace :class:`transformers.LlamaConfig` (dropping nothing —
 the backbone re-uses every Llama hyper-parameter), wrapped in
 ``text_config`` so the checkpoint payload matches the original
-``JanusForConditionalGeneration`` schema and ``scripts/split_janus.py``
+``JanusForConditionalGeneration`` schema and ``scripts/convert_model.py``
 can copy it verbatim.
 
 Adds two Janus-specific token IDs at the top level:

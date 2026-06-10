@@ -175,7 +175,7 @@ python scripts/visualize_omni_graph.py configs/seed_omni/janus_1.3b/veomni_janus
 >
 > Janus 子类额外提供 ``emit_image_start`` / ``emit_image_end`` 两个 call-site（推理 bridge state 用），边界 token id 由 ``module._tokenizer`` 解析。
 >
-> 跟 V1 的"通用 wte + lm_head"不同，V2 的 `text_encoder` 是 **model-specific**——每个 family 一份 `modules/<family>/text_encoder/`。``scripts/multimodal/convert_model/split_janus.py`` 把 ``embed_tokens`` + ``lm_head`` 拆到 ``text_encoder/`` 子目录，**全局 tokenizer 写到 output 根**。
+> 跟 V1 的"通用 wte + lm_head"不同，V2 的 `text_encoder` 是 **model-specific**——每个 family 一份 `modules/<family>/text_encoder/`。``scripts/convert_model.py``（family 实现见 ``modules/janus/convert_model.py``）把 ``embed_tokens`` + ``lm_head`` 拆到 ``text_encoder/`` 子目录，**全局 tokenizer 写到 output 根**。
 
 ```yaml
 # ── 模块注册表（不写 model_type，HF AutoConfig 自动读）──────────────
@@ -563,7 +563,7 @@ stateDiagram-v2
 
 `janus_llama` 自身不再持有 `wte` / `lm_head`——就是个纯 backbone（`inputs_embeds → hidden_states`）。
 
-`scripts/multimodal/convert_model/split_janus.py` 把原始 Janus checkpoint 拆成 4 份 module 子目录：`janus_siglip/`、`janus_vqvae/`、`janus_text_encoder/`（含 tokenizer 资产）、`janus_llama/`。YAML 里 ``model.model_path`` 写相对名（如 `janus_siglip`），launcher 的 ``model.model_path`` 指向 split 根。
+`scripts/convert_model.py` 把原始 Janus checkpoint 拆成 4 份 module 子目录：`janus_siglip/`、`janus_vqvae/`、`janus_text_encoder/`（含 tokenizer 资产）、`janus_llama/`。YAML 里 ``model.model_path`` 写相对名（如 `janus_siglip`），launcher 的 ``model.model_path`` 指向 split 根。
 
 ```yaml
 # model.model_path 相对 launcher model.model_path

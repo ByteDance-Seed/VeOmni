@@ -2,7 +2,7 @@
 
 The whole VQVAE-side hyper-parameters travel under ``vq_config`` — that
 mirrors the original :class:`transformers.JanusVQVAEConfig` schema so the
-``scripts/split_janus.py`` extractor can dump the field unchanged.
+``scripts/convert_model.py`` extractor can dump the field unchanged.
 
 ``freeze`` (default ``True``) matches the published Janus recipe — the
 module freezes only its inner VQVAE codec (``vqmodel``) and keeps the

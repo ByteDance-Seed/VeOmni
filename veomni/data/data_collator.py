@@ -520,7 +520,7 @@ class SeedOmniCollator(DataCollator):
     """List-only collator for the SeedOmni V2 ``conversation_list`` schema.
 
     Pairs with ``data_type: seedomni`` (see
-    ``veomni/data/multimodal/seedomni_transform.py``) which emits
+    ``veomni/data/seed_omni/seedomni_transform.py``) which emits
     per-sample ``{"conversation_list": [ConversationItem, ...]}``.
     This collator turns ``N`` such dicts into a single batched dict
     ``{"conversation_list": [[ConversationItem, ...], ...]}`` plus any extra

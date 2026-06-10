@@ -14,4 +14,4 @@ Resolve concrete classes at runtime via
 import modeling modules directly from this package.
 """
 
-from . import llama, siglip, text_encoder, vqvae  # noqa: F401
+from . import convert_model, llama, siglip, text_encoder, vqvae  # noqa: F401

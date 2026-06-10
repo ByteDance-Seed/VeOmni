@@ -1,37 +1,23 @@
-# VeOmni training config for OmniModel V2 — Janus-1.3B
+# Janus-1.3B SeedOmni V2 training launcher.
 #
 # Launch:
-#   bash train.sh tasks/train_omni.py configs/seed_omni/janus_1.3b/veomni_janus.yaml
-#
-# Visualize graphs (training + all inference scenarios):
-#   python scripts/visualize_omni_graph.py configs/seed_omni/janus_1.3b/veomni_janus.yaml
-#   → graphs/veomni_janus/{training,infer_gen,infer_und,infer_interleave}.mmd
+#   bash train.sh tasks/omni/train_omni.py configs/seed_omni/janus_1.3b/veomni_janus.yaml
 #
 # Prerequisites:
-#   1. Split Janus checkpoint:
-#      python scripts/multimodal/convert_model/split_janus.py \
-#        --model_path /mnt/hdfs/veomni/models/transformers/Janus-1.3B \
-#        --output_dir /mnt/hdfs/veomni/models/seed_omni/janus_1.3b
+#   python scripts/convert_model.py \
+#     --model_path /mnt/hdfs/user_dir/veomni_omni/models/transformers/Janus-1.3B \
+#     --output_dir /mnt/hdfs/user_dir/veomni_omni/models/seed_omni/Janus-1.3B
 #
-#   2. Set ``model.model_path`` below to that split output directory.
-#      Relative ``modules.*.weights_path`` entries in ``train.yaml`` (e.g.
-#      ``janus_siglip``) resolve to ``<model_path>/janus_siglip`` at runtime.
-#      Absolute ``weights_path`` values are used as-is.  The LLM tokenizer
-#      lives under ``<model_path>/janus_text_encoder/``.
+# See docs/seed_omni/example_models/janus.md for the full pipeline.
 
 model:
   model_path: /mnt/hdfs/user_dir/veomni_omni/models/seed_omni/Janus-1.3B
-  # Master training vocabulary: modules / nodes / edges / training_graph.
   omni_train_yaml_path: configs/seed_omni/janus_1.3b/train.yaml
-  # Inference scenarios — the selected YAML overlays omni_train_yaml_path
-  # (flat dict.update; only top-level keys, in practice generation_graph).
   omni_infer_yaml_path:
     infer_gen: configs/seed_omni/janus_1.3b/infer_gen.yaml
     infer_und: configs/seed_omni/janus_1.3b/infer_und.yaml
     infer_interleave: configs/seed_omni/janus_1.3b/infer_interleave.yaml
-  # Active scenario at inference time (must be a key in omni_infer_yaml_path).
   omni_infer_type: infer_interleave
-
   model_config: {}
   ops_implementation:
     attn_implementation: flash_attention_2
@@ -39,9 +25,12 @@ model:
 data:
   data_type: seedomni
   max_seq_len: 4096
-  train_path: /mnt/hdfs/user_dir/veomni_omni/data
-  datasets_type: mapping
-  chat_template: default
+  train_path: configs/seed_omni/janus_1.3b/data.yaml
+  # Streaming + VeOmni weighted multisource: no HF schema merge across sources.
+  datasets_type: iterable
+  multisource_datasets_type: veomni_weighted_multisource
+  # Iterable has no __len__; train_steps = ceil(train_sample / global_batch_size).
+  train_sample: 1000000
   dataloader:
     type: native
     num_workers: 4
@@ -53,12 +42,8 @@ train:
   seed: 42
   num_train_epochs: 1
   global_batch_size: 32
-  micro_batch_size: 2          # gradient-accumulation steps per train_step
-  init_device: meta            # meta → weights loaded lazily by build_parallelize_model
-  # SeedOmni samples carry only ``conversation_list`` (tokenization is
-  # module-side, in each module's pre_forward), so there are no per-item
-  # ``input_ids`` at the dataset stage for token-based dynamic batching.
-  # Use the fixed micro_batch_size path instead.
+  micro_batch_size: 1
+  init_device: meta
   dyn_bsz: false
 
   accelerator:

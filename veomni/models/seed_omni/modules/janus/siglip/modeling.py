@@ -21,7 +21,7 @@ class JanusSiglip(JanusSiglipModuleMixin, PreTrainedModel):
 
     Composes HF :class:`JanusVisionModel` + :class:`JanusVisionAlignerMLP`
     (weights split from ``JanusForConditionalGeneration`` by
-    ``scripts/split_janus.py``).
+    ``scripts/convert_model.py``).
     """
 
     config_class = JanusSiglipConfig

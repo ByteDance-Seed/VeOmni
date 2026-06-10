@@ -24,10 +24,10 @@ them (``user`` = SigLIP input, ``assistant`` = VQVAE target).
 
 This transform is intentionally minimal — it does **only**:
 
-1. Source-specific conversation normalization (delegated to the existing
-   ``conv_preprocess`` registry under ``veomni/data/multimodal/preprocess.py``)
-   so that downstream code sees a uniform ``[[role, (type, value), ...], ...]``
-   structure regardless of the upstream dataset.
+1. Source-specific conversation normalization (delegated to
+   ``veomni.data.seed_omni.preprocess``) so that downstream code sees a uniform
+   ``[[role, (type, value), ...], ...]`` structure regardless of the upstream
+   dataset.
 2. Image IO + ``smart_resize`` (delegated to ``image_utils.fetch_images``),
    followed by PIL → uint8 ``torch.Tensor`` of shape ``(C, H, W)``.  Images are
    **not** normalized, **not** patchified, and **not** wrapped in any
@@ -67,7 +67,7 @@ from PIL import Image
 
 from ...models.seed_omni.conversation import ConversationItem
 from ..data_transform import DATA_TRANSFORM_REGISTRY
-from .image_utils import fetch_images
+from ..multimodal.image_utils import fetch_images
 from .preprocess import conv_preprocess
 
 
@@ -184,8 +184,8 @@ def process_seedomni_example(
     Args:
         example: a dataset sample dict.  Required keys:
             - ``"source_name"`` (or pass ``source_name=...`` via ``kwargs``):
-              key into ``PREPROCESSOR_REGISTRY`` from
-              ``veomni/data/multimodal/preprocess.py``.
+              key into ``SEED_OMNI_PREPROCESSOR_REGISTRY`` from
+              ``veomni/data/seed_omni/preprocess.py``.
             - ``"conversations"``: list of message dicts in the source's
               native schema (``conv_preprocess`` translates it).  May be
               JSON-encoded ``bytes`` for parquet/arrow formats.

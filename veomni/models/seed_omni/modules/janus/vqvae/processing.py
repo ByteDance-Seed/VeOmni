@@ -43,9 +43,7 @@ class JanusVqvaeProcessor(JanusImageProcessor):
         ``(x + 1) / 2 → ×255 → clamp → round → uint8 → PIL.fromarray`` —
         the ``.round()`` before the uint8 cast is load-bearing: uint8
         TRUNCATES toward zero (127.5 → 127, not 128), so dropping the
-        round would drift the saved PNG ±1 LSB from the HF baseline
-        ``scripts/multimodal/infer/janus_hf_infer_gen.py`` which does
-        the same dance via numpy.
+        round would drift the saved PNG ±1 LSB from the HF baseline.
         """
         if isinstance(images, torch.Tensor):
             images = [images]

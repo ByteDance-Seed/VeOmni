@@ -249,7 +249,7 @@ boundary-token logic without the framework knowing about it.
 
 Use the `/seedomni-v2` skill for the full checklist. The shape of the work:
 
-1. **Split the checkpoint.** Write `scripts/multimodal/convert_model/split_<model>.py`
+1. **Split the checkpoint.** Register a converter in `modules/<family>/convert_model.py` (dispatched by `scripts/convert_model.py`)
    to break the upstream HF checkpoint into one self-contained subfolder per
    module (`config.json` + `model.safetensors` + any processor/tokenizer JSON).
 
@@ -289,8 +289,8 @@ Use the `/seedomni-v2` skill for the full checklist. The shape of the work:
      `finalize()`.
 
 6. **Validate:** render the graph with `TrainingGraph.to_mermaid()`, run the
-   unit tests in `tests/seed_omni/`, then the end-to-end scripts
-   (`test_und.sh` / `test_gen.sh` / `test_train.sh`).
+   unit tests in `tests/seed_omni/`, then the end-to-end train/infer pipeline
+   (see `docs/seed_omni/example_models/janus.md`).
 
 ---
 
