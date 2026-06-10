@@ -3,6 +3,8 @@ from typing import Any, Dict, List, Optional
 import torch
 import torch.nn.functional as F
 
+from veomni.utils.tensor_utils import unflatten
+
 from ....conversation import ConversationItem, seal_outputs
 from ....module import ModuleMixin
 
@@ -33,7 +35,39 @@ class TextEncoderModuleMixin(ModuleMixin):
         raise NotImplementedError("TextEncoderModuleMixin.pre_forward is not implemented")
 
     def post_forward(self, method: str, **outputs: Any) -> Dict[str, Any]:
-        raise ValueError("TextEncoderModuleMixin.post_forward: is not implemented")
+        assert method in ("encode", "decode")
+        conversation = self._conversation_carrier
+        self._conversation_carrier = None
+        if method == "encode":
+            batch_shape = self._encode_batch_shape
+            self._encode_batch_shape = None
+            inputs_embeds = outputs.get("inputs_embeds")
+            if conversation is not None and inputs_embeds is not None and batch_shape is not None:
+                self._scatter_text_embeds(conversation, unflatten(inputs_embeds, batch_shape))
+            return {"conversation_list": conversation}
+
+        # V2 single-loss protocol: drop logits, rename ``loss`` → ``_loss``.
+        outputs.pop("logits", None)
+        loss = outputs.pop("loss", None)
+        if loss is not None:
+            outputs["_loss"] = loss
+        outputs["conversation_list"] = conversation
+        return outputs
+
+    def _scatter_text_embeds(
+        self,
+        conversation_list: list[list[ConversationItem]],
+        segment_embeds: list[torch.Tensor],
+    ) -> None:
+        dtype = self.dtype
+        segment_embeds_iterator = iter(segment_embeds)
+        for sample in conversation_list:
+            for part in sample:
+                if part.type != "text":
+                    continue
+                part.value = next(segment_embeds_iterator).to(device=self.device, dtype=dtype)
+        if next(segment_embeds_iterator, None) is not None:
+            raise RuntimeError("TextEncoder text segment count mismatch during embed scatter.")
 
     # inference hooks
     def reset_local_inference_state(self) -> None:
