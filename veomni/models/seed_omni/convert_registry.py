@@ -7,6 +7,7 @@ entry point is :func:`convert_checkpoint` (CLI: ``scripts/convert_model.py``).
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Callable
 
 from transformers import PretrainedConfig
@@ -21,7 +22,13 @@ ConvertFn = Callable[..., None]
 
 def read_hf_model_type(model_path: str) -> str:
     """Read upstream ``model_type`` from a HuggingFace checkpoint directory."""
-    config_dict, _ = PretrainedConfig.get_config_dict(model_path)
+    try:
+        config_dict, _ = PretrainedConfig.get_config_dict(model_path)
+    except OSError:
+        config_text = (Path(model_path) / "config.json").read_text(encoding="utf-8")
+        if "BAGEL-7B-MoT" in config_text:
+            return "bagel"
+        raise
     model_type = config_dict.get("model_type")
     if not model_type and "BAGEL-7B-MoT" in config_dict.get("name", []):
         return "bagel"
