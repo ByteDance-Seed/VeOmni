@@ -1,0 +1,32 @@
+---
+title: veomni_qwen3 — training
+---
+%%{init: {'flowchart': {'defaultRenderer': 'elk'}}}%%
+flowchart LR
+    data[(data)]:::io
+    subgraph col0 [ ]
+        direction TB
+        token_encode["token_encode<br/><i>qwen3_text_encoder.encode</i>"]:::source
+    end
+    subgraph col1 [ ]
+        direction TB
+        qwen3_llm["qwen3_llm<br/><i>qwen3_llm.forward</i>"]:::middle
+    end
+    subgraph col2 [ ]
+        direction TB
+        token_decode["token_decode<br/><i>qwen3_text_encoder.decode</i>"]:::sink
+    end
+    end_sink(("end")):::end_sink
+    data -.-> token_encode
+    token_encode --> qwen3_llm
+    qwen3_llm --> token_decode
+    token_decode --> end_sink
+    style col0 fill:transparent,stroke:none
+    style col1 fill:transparent,stroke:none
+    style col2 fill:transparent,stroke:none
+    classDef source fill:#dff,stroke:#06c,stroke-width:2px
+    classDef sink fill:#fdd,stroke:#c06,stroke-width:2px
+    classDef both fill:#efe,stroke:#693,stroke-width:2px
+    classDef middle fill:#fff,stroke:#666
+    classDef io fill:#eef,stroke:#669,stroke-dasharray:3 3
+    classDef end_sink fill:#eee,stroke:#333,stroke-width:1px,stroke-dasharray:3 3

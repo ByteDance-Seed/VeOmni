@@ -40,7 +40,7 @@ Anything else (chat-template formatting, tokenization, boundary marker
 emission, ``input_ids`` / ``labels`` / ``attention_mask`` construction,
 position id calculation, image normalization, image patchification) is
 deliberately **not** done here — it belongs in model modules per the V2
-design contract (see ``design.md`` § "数据路由" and the per-module
+design contract (see ``docs/seed_omni/design.md`` § "数据路由" and the per-module
 responsibility table).
 
 Video / audio modalities are not yet handled — Feature D1 covers the

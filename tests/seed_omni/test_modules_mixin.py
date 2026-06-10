@@ -12,7 +12,6 @@ from veomni.models.seed_omni import (
     OMNI_MODEL_REGISTRY,
     OMNI_PROCESSOR_REGISTRY,
     ModuleMixin,
-    OmniModuleCheckpointCallback,
 )
 from veomni.models.seed_omni.configuration_omni import OmniConfig
 from veomni.models.seed_omni.conversation import ConversationItem
@@ -63,6 +62,19 @@ def _tiny_text_cfg() -> dict:
     )
 
 
+def _tiny_qwen3_cfg() -> dict:
+    return dict(
+        vocab_size=128,
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=4,
+        head_dim=16,
+        max_position_embeddings=64,
+    )
+
+
 def _tiny_vision_cfg() -> dict:
     return dict(
         hidden_size=32,
@@ -104,13 +116,23 @@ def _tiny_vq_cfg() -> dict:
 
 
 def test_mixin_registry_contains_all_v2_modules():
-    expected = {"text_encoder", "janus_siglip", "janus_vqvae", "janus_llama", "janus_text_encoder"}
+    expected = {
+        "text_encoder",
+        "janus_siglip",
+        "janus_vqvae",
+        "janus_llama",
+        "janus_text_encoder",
+        "qwen3_llm",
+        "qwen3_text_encoder",
+    }
     assert expected.issubset(set(OMNI_MODEL_REGISTRY.valid_keys()))
     assert _model_cls("text_encoder").__name__ == "TextEncoder"
     assert _model_cls("janus_siglip").__name__ == "JanusSiglip"
     assert _model_cls("janus_vqvae").__name__ == "JanusVqvae"
     assert _model_cls("janus_llama").__name__ == "JanusLlama"
     assert _model_cls("janus_text_encoder").__name__ == "JanusTextEncoder"
+    assert _model_cls("qwen3_llm").__name__ == "Qwen3Llm"
+    assert _model_cls("qwen3_text_encoder").__name__ == "Qwen3TextEncoder"
 
 
 def test_processor_registry_only_for_vision_modules():
@@ -283,67 +305,36 @@ def test_janus_llama_forward_returns_hidden_states():
     assert out["hidden_states"].shape == (1, 4, 64)
 
 
-# ── Per-module CheckpointCallback ─────────────────────────────────────────────
+def test_qwen3_llm_save_reload_via_registry(tmp_path: Path):
+    Qwen3Llm = _model_cls("qwen3_llm")
+    Qwen3LlmConfig = _config_cls("qwen3_llm")
+
+    llm = Qwen3Llm(Qwen3LlmConfig(text_config=_tiny_qwen3_cfg()))
+    llm.save_pretrained(tmp_path)
+
+    cfg = Qwen3LlmConfig.from_pretrained(tmp_path)
+    assert cfg.model_type == "qwen3_llm"
+
+    llm2 = Qwen3Llm.from_pretrained(tmp_path)
+    assert isinstance(llm2, Qwen3Llm)
+    from torch.nn import Identity
+
+    assert isinstance(llm2.language_model.get_input_embeddings(), Identity)
 
 
-def test_callback_writes_module_subfolder(tmp_path: Path):
-    TextEncoder = _model_cls("text_encoder")
-    TextEncoderConfig = _config_cls("text_encoder")
-    te = TextEncoder(TextEncoderConfig(vocab_size=64, hidden_size=16))
-    cb = OmniModuleCheckpointCallback(module=te, module_name="text_encoder", processor=None, is_rank_0=True)
-    cb.save(str(tmp_path))
+def test_qwen3_text_encoder_save_reload_via_registry(tmp_path: Path):
+    Qwen3TextEncoder = _model_cls("qwen3_text_encoder")
+    Qwen3TextEncoderConfig = _config_cls("qwen3_text_encoder")
 
-    out = tmp_path / "text_encoder"
-    assert out.is_dir()
-    files = sorted(p.name for p in out.iterdir())
-    assert "config.json" in files
-    assert "model.safetensors" in files
-    # No processor → no preprocessor_config.json should appear.
-    assert "preprocessor_config.json" not in files
+    te = Qwen3TextEncoder(Qwen3TextEncoderConfig(vocab_size=128, hidden_size=64, tie_word_embeddings=True))
+    te.save_pretrained(tmp_path)
 
+    rcfg = Qwen3TextEncoderConfig.from_pretrained(tmp_path)
+    assert rcfg.model_type == "qwen3_text_encoder"
 
-def test_callback_with_processor_writes_asset(tmp_path: Path):
-    """Verifies the per-module asset (vision processor) is saved alongside."""
-    JanusSiglip = _model_cls("janus_siglip")
-    JanusSiglipConfig = _config_cls("janus_siglip")
-    js = JanusSiglip(JanusSiglipConfig(vision_config=_tiny_vision_cfg()))
-
-    proc_cls = OMNI_PROCESSOR_REGISTRY["janus_siglip"]()
-    proc = proc_cls()  # default-constructed; tests only that save/load round-trips
-
-    cb = OmniModuleCheckpointCallback(module=js, module_name="janus_siglip", processor=proc, is_rank_0=True)
-    cb.save(str(tmp_path))
-
-    out = tmp_path / "janus_siglip"
-    files = sorted(p.name for p in out.iterdir())
-    assert "config.json" in files
-    assert "model.safetensors" in files
-    assert "preprocessor_config.json" in files
-
-
-def test_callback_round_trip_via_registry(tmp_path: Path):
-    """Save with callback → reload via OMNI registry class → still a TextEncoder."""
-    TextEncoder = _model_cls("text_encoder")
-    TextEncoderConfig = _config_cls("text_encoder")
-
-    te = TextEncoder(TextEncoderConfig(vocab_size=64, hidden_size=16))
-    cb = OmniModuleCheckpointCallback(module=te, module_name="text_encoder", is_rank_0=True)
-    cb.save(str(tmp_path))
-
-    reloaded = TextEncoder.from_pretrained(str(tmp_path / "text_encoder"))
-    assert isinstance(reloaded, TextEncoder)
-    assert reloaded.config.vocab_size == 64
-    assert reloaded.config.hidden_size == 16
-
-
-def test_callback_non_rank_0_is_noop(tmp_path: Path):
-    TextEncoder = _model_cls("text_encoder")
-    TextEncoderConfig = _config_cls("text_encoder")
-    te = TextEncoder(TextEncoderConfig(vocab_size=32, hidden_size=8))
-    cb = OmniModuleCheckpointCallback(module=te, module_name="text_encoder", is_rank_0=False)
-    cb.save(str(tmp_path))
-    # Non-rank-0 must not write anything.
-    assert not (tmp_path / "text_encoder").exists()
+    te2 = Qwen3TextEncoder.from_pretrained(tmp_path)
+    assert isinstance(te2, Qwen3TextEncoder)
+    assert te2.config.vocab_size == 128
 
 
 # ── _no_split_modules preservation ────────────────────────────────────────────
@@ -472,3 +463,28 @@ def test_init_resolves_relative_module_paths():
     assert cfg.modules["janus_text_encoder"]["model"]["model_path"] == f"{root}/janus_text_encoder"
     assert cfg.has_generation_graph()
     assert cfg.generation_graph["initial"] == "prompt_encode"
+
+
+def _qwen3_cfg_dir() -> Path:
+    return Path(__file__).resolve().parents[2] / "configs" / "seed_omni" / "qwen3_0.6b"
+
+
+def test_qwen3_train_yaml_loads_with_v2_module_names():
+    cfg = _load_omni_config(train_yaml_path=_qwen3_cfg_dir() / "train.yaml")
+
+    assert set(cfg.modules) == {"qwen3_text_encoder", "qwen3_llm"}
+    assert cfg.modules["qwen3_text_encoder"]["model"]["model_path"] == "qwen3_text_encoder"
+    edge_names = set(cfg.edges)
+    for e in cfg.training_edges:
+        assert e in edge_names
+
+
+def test_qwen3_train_plus_infer_merges_generation_graph():
+    cfg = _load_omni_config(
+        train_yaml_path=_qwen3_cfg_dir() / "train.yaml",
+        infer_yaml_path=_qwen3_cfg_dir() / "infer_text.yaml",
+    )
+    assert set(cfg.modules) == {"qwen3_text_encoder", "qwen3_llm"}
+    assert cfg.has_generation_graph()
+    assert cfg.generation_graph["initial"] == "prompt_encode"
+    assert "done" not in cfg.generation_graph["states"]

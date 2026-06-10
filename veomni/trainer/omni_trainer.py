@@ -147,8 +147,8 @@ class MultiOptimizer:
     Exposes the minimal :class:`torch.optim.Optimizer` surface the metering /
     logging callbacks read (``param_groups``) and the train loop drives
     (``step`` / ``zero_grad``).  Checkpointing is per-module (handled by each
-    module-trainer's :class:`OmniModuleCheckpointCallback` against the real
-    per-module optimizer), so no ``state_dict`` is needed here.
+    module-trainer's :class:`OmniModuleHfCallback` / :class:`OmniModuleLoraCallback`
+    against the real per-module optimizer), so no ``state_dict`` is needed here.
     """
 
     def __init__(self, optimizers: Dict[str, torch.optim.Optimizer]):
@@ -377,8 +377,8 @@ class OmniModuleTrainer:
       *build* lives on the module-trainer; the orchestrator only *calls* them
       (after the shared dataset has fixed ``args.train_steps``).
     * :meth:`_init_callbacks` — builds this module's **own** checkpoint callback
-      (:class:`OmniModuleCheckpointCallback`, per-module DCP); trace / metering
-      callbacks belong to the orchestrator, never here.
+      (:class:`OmniModuleHfCallback` / :class:`OmniModuleLoraCallback`, per-module
+      DCP); trace / metering callbacks belong to the orchestrator, never here.
 
     The *global* concerns (distributed ``_setup``, data pipeline, trace
     metering, the train loop) are **never** run here — they are owned once by
@@ -568,8 +568,9 @@ class OmniTrainer:
     ``optimizers`` / ``lr_schedulers``) lives directly on ``self``.
 
     Checkpointing is **not** owned here: each :class:`OmniModuleTrainer` builds
-    its own :class:`OmniModuleCheckpointCallback` and the orchestrator's ``on_*``
-    cascade drives them; the orchestrator keeps only trace / metering callbacks.
+    its own :class:`OmniModuleHfCallback` / :class:`OmniModuleLoraCallback` and the
+    orchestrator's ``on_*`` cascade drives them; the orchestrator keeps only trace
+    / metering callbacks.
     """
 
     # Composition: the underlying single-model trainer. Holds all

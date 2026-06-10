@@ -20,8 +20,6 @@
 #   2. Module registries — :data:`OMNI_CONFIG_REGISTRY`,
 #      :data:`OMNI_MODEL_REGISTRY`, :data:`OMNI_PROCESSOR_REGISTRY` — resolve
 #      ``model_type → class`` lazily at runtime.
-#   3. Per-module checkpoint callback for the trainer's save lifecycle.
-from .checkpoint_callback import OmniModuleCheckpointCallback
 from .configuration_omni import OmniConfig
 from .conversation import build_conversation
 from .generation_graph import GenerationGraph
@@ -53,6 +51,4 @@ __all__ = [
     "OMNI_MODEL_REGISTRY",
     "OMNI_PROCESSOR_REGISTRY",
     "read_model_type",
-    # Lifecycle
-    "OmniModuleCheckpointCallback",
 ]

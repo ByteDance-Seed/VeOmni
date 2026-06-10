@@ -31,7 +31,7 @@ def read_hf_model_type(model_path: str) -> str:
 def convert_checkpoint(model_path: str, output_dir: str, **kwargs) -> None:
     """Dispatch to the registered converter for ``model_path``'s ``model_type``."""
     # Side-effect: family packages register their converters on import.
-    from .modules import bagel, janus  # noqa: F401
+    from .modules import bagel, janus, qwen3  # noqa: F401
 
     model_type = read_hf_model_type(model_path)
     if model_type not in set(OMNI_CONVERT_REGISTRY.valid_keys()):

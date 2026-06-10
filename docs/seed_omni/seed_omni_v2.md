@@ -305,7 +305,6 @@ Use the `/seedomni-v2` skill for the full checklist. The shape of the work:
 | `generation_graph.py` | FSM view (states / transitions / signals) |
 | `configuration_omni.py` | parse + merge the YAML into `OmniConfig` |
 | `modeling_omni.py` | `OmniModel` runtime (train DAG + infer FSM + loss sum) |
-| `checkpoint_callback.py` | per-module checkpoint layout |
 | `modules/<family>/<sub>/` | per-module `configuration.py`, `modulemixin.py`, `modeling.py` [, `processing.py`] |
 | `veomni/trainer/omni_trainer.py` | build + FSDP-wrap modules, drive the loop |
 | `veomni/trainer/omni_inferencer.py` | request loop, `reset` + `finalize` |
