@@ -53,11 +53,6 @@ name = "flash-attn"
 requires-dist = ["torch"]
 
 [[manifest.dependency-metadata]]
-name = "flash-attn-3"
-version = "3.0.0"
-requires-dist = ["torch"]
-
-[[manifest.dependency-metadata]]
 name = "flash-qla"
 version = "0.1.0"
 requires-dist = ["torch"]
@@ -280,8 +275,7 @@ name = "blobfile"
 version = "3.0.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "filelock", version = "3.19.1", source = { registry = "https://pypi.org/simple" }, marker = "(extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (extra != 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64')" },
-    { name = "filelock", version = "3.29.1", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-6-veomni-gpu' or extra == 'extra-6-veomni-npu' or extra != 'extra-6-veomni-npu-aarch64'" },
+    { name = "filelock" },
     { name = "lxml" },
     { name = "pycryptodomex" },
     { name = "urllib3" },
@@ -562,8 +556,7 @@ source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "aiohttp" },
     { name = "dill" },
-    { name = "filelock", version = "3.19.1", source = { registry = "https://pypi.org/simple" }, marker = "(extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (extra != 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64')" },
-    { name = "filelock", version = "3.29.1", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-6-veomni-gpu' or extra == 'extra-6-veomni-npu' or extra != 'extra-6-veomni-npu-aarch64'" },
+    { name = "filelock" },
     { name = "fsspec", extra = ["http"] },
     { name = "huggingface-hub" },
     { name = "multiprocess" },
@@ -607,7 +600,7 @@ name = "diffusers"
 version = "0.37.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "filelock", version = "3.29.1", source = { registry = "https://pypi.org/simple" } },
+    { name = "filelock" },
     { name = "httpx" },
     { name = "huggingface-hub" },
     { name = "importlib-metadata" },
@@ -660,33 +653,8 @@ wheels = [
 
 [[package]]
 name = "filelock"
-version = "3.19.1"
-source = { registry = "https://pypi.org/simple" }
-resolution-markers = [
-    "(python_full_version >= '3.12' and platform_machine != 'aarch64' and sys_platform == 'linux') or (python_full_version >= '3.12' and platform_python_implementation != 'CPython' and sys_platform == 'linux')",
-    "python_full_version >= '3.12' and sys_platform != 'darwin' and sys_platform != 'linux'",
-    "python_full_version >= '3.12' and platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux'",
-    "python_full_version >= '3.12' and sys_platform == 'darwin'",
-    "(python_full_version < '3.12' and platform_machine != 'aarch64' and sys_platform == 'linux') or (python_full_version < '3.12' and platform_python_implementation != 'CPython' and sys_platform == 'linux')",
-    "python_full_version < '3.12' and sys_platform != 'darwin' and sys_platform != 'linux'",
-    "python_full_version < '3.12' and platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux'",
-    "python_full_version < '3.12' and sys_platform == 'darwin'",
-]
-sdist = { url = "https://files.pythonhosted.org/packages/40/bb/0ab3e58d22305b6f5440629d20683af28959bf793d98d11950e305c1c326/filelock-3.19.1.tar.gz", hash = "sha256:66eda1888b0171c998b35be2bcc0f6d75c388a7ce20c3f3f37aa8e96c2dddf58", size = 17687, upload-time = "2025-08-14T16:56:03.016Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/42/14/42b2651a2f46b022ccd948bca9f2d5af0fd8929c4eec235b8d6d844fbe67/filelock-3.19.1-py3-none-any.whl", hash = "sha256:d38e30481def20772f5baf097c122c3babc4fcdb7e14e57049eb9d88c6dc017d", size = 15988, upload-time = "2025-08-14T16:56:01.633Z" },
-]
-
-[[package]]
-name = "filelock"
 version = "3.29.1"
 source = { registry = "https://pypi.org/simple" }
-resolution-markers = [
-    "python_full_version >= '3.12' and sys_platform == 'linux'",
-    "python_full_version >= '3.12' and sys_platform != 'linux'",
-    "python_full_version < '3.12' and sys_platform == 'linux'",
-    "python_full_version < '3.12' and sys_platform != 'linux'",
-]
 sdist = { url = "https://files.pythonhosted.org/packages/1f/f9/f38573ed5844586db374d085911740a501ccfa373b455fc9413f09f85237/filelock-3.29.1.tar.gz", hash = "sha256:d97e6b1b9757569626c58caa07dc4beb1613f4a2938b1e8cc81afca398906c9e", size = 59335, upload-time = "2026-06-03T15:19:04.053Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/4c/a0/614c5fe402fd88951df45f4dda2fa3b4e17a99ecd92340771929169b3b95/filelock-3.29.1-py3-none-any.whl", hash = "sha256:85199dfd706869641b72b2e8955d5416a4b2b7dc4b0e8e6d97b4cc1299a6983b", size = 40750, upload-time = "2026-06-03T15:19:02.959Z" },
@@ -721,8 +689,24 @@ sdist = { url = "https://files.pythonhosted.org/packages/3b/b2/8d76c41ad7974ee26
 
 [[package]]
 name = "flash-attn-3"
-version = "3.0.0"
-source = { git = "https://github.com/Dao-AILab/flash-attention?subdirectory=hopper&rev=9397816f6094f5ba0de52c221093637054590d0d#9397816f6094f5ba0de52c221093637054590d0d" }
+version = "3.0.0+20260609.cu130torch2110cxx11abitrue.bc58ab.sm90"
+source = { url = "https://github.com/Luosuu/flash-attention3-wheels/releases/download/v0.0.3/flash_attn_3-3.0.0+20260609.cu130torch2110cxx11abitrue.bc58ab.sm90-cp310-abi3-linux_x86_64.whl" }
+dependencies = [
+    { name = "einops" },
+    { name = "ninja" },
+    { name = "packaging" },
+]
+wheels = [
+    { url = "https://github.com/Luosuu/flash-attention3-wheels/releases/download/v0.0.3/flash_attn_3-3.0.0+20260609.cu130torch2110cxx11abitrue.bc58ab.sm90-cp310-abi3-linux_x86_64.whl", hash = "sha256:812004b170b0d4fb7022d930fb97cea4b013776494fdce2301ff5b37b4396a13" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "einops" },
+    { name = "ninja" },
+    { name = "packaging" },
+    { name = "torch" },
+]
 
 [[package]]
 name = "flash-attn-4"
@@ -952,8 +936,7 @@ name = "huggingface-hub"
 version = "1.15.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "filelock", version = "3.19.1", source = { registry = "https://pypi.org/simple" }, marker = "(extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (extra != 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64')" },
-    { name = "filelock", version = "3.29.1", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-6-veomni-gpu' or extra == 'extra-6-veomni-npu' or extra != 'extra-6-veomni-npu-aarch64'" },
+    { name = "filelock" },
     { name = "fsspec" },
     { name = "hf-xet", marker = "platform_machine == 'AMD64' or platform_machine == 'aarch64' or platform_machine == 'amd64' or platform_machine == 'arm64' or platform_machine == 'x86_64' or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64')" },
     { name = "httpx" },
@@ -1396,7 +1379,7 @@ name = "multi-storage-client"
 version = "0.50.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "filelock", version = "3.29.1", source = { registry = "https://pypi.org/simple" } },
+    { name = "filelock" },
     { name = "jmespath" },
     { name = "jsonschema" },
     { name = "lark" },
@@ -1487,6 +1470,32 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/6c/4f/ccdb8ad3a38e583f214547fd2f7ff1fc160c43a75af88e6aec213404b96a/networkx-3.5.tar.gz", hash = "sha256:d4c6f9cf81f52d69230866796b82afbccdec3db7ae4fbd1b65ea750feed50037", size = 2471065, upload-time = "2025-05-29T11:35:07.804Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/eb/8d/776adee7bbf76365fdd7f2552710282c79a4ead5d2a46408c9043a2b70ba/networkx-3.5-py3-none-any.whl", hash = "sha256:0030d386a9a06dee3565298b4a734b68589749a544acbb6c412dc9e2489ec6ec", size = 2034406, upload-time = "2025-05-29T11:35:04.961Z" },
+]
+
+[[package]]
+name = "ninja"
+version = "1.13.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/43/73/79a0b22fc731989c708068427579e840a6cf4e937fe7ae5c5d0b7356ac22/ninja-1.13.0.tar.gz", hash = "sha256:4a40ce995ded54d9dc24f8ea37ff3bf62ad192b547f6c7126e7e25045e76f978", size = 242558, upload-time = "2025-08-11T15:10:19.421Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/3c/74/d02409ed2aa865e051b7edda22ad416a39d81a84980f544f8de717cab133/ninja-1.13.0-py3-none-macosx_10_9_universal2.whl", hash = "sha256:fa2a8bfc62e31b08f83127d1613d10821775a0eb334197154c4d6067b7068ff1", size = 310125, upload-time = "2025-08-11T15:09:50.971Z" },
+    { url = "https://files.pythonhosted.org/packages/8e/de/6e1cd6b84b412ac1ef327b76f0641aeb5dcc01e9d3f9eee0286d0c34fd93/ninja-1.13.0-py3-none-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:3d00c692fb717fd511abeb44b8c5d00340c36938c12d6538ba989fe764e79630", size = 177467, upload-time = "2025-08-11T15:09:52.767Z" },
+    { url = "https://files.pythonhosted.org/packages/c8/83/49320fb6e58ae3c079381e333575fdbcf1cca3506ee160a2dcce775046fa/ninja-1.13.0-py3-none-manylinux2014_i686.manylinux_2_17_i686.whl", hash = "sha256:be7f478ff9f96a128b599a964fc60a6a87b9fa332ee1bd44fa243ac88d50291c", size = 187834, upload-time = "2025-08-11T15:09:54.115Z" },
+    { url = "https://files.pythonhosted.org/packages/56/c7/ba22748fb59f7f896b609cd3e568d28a0a367a6d953c24c461fe04fc4433/ninja-1.13.0-py3-none-manylinux2014_ppc64le.manylinux_2_17_ppc64le.whl", hash = "sha256:60056592cf495e9a6a4bea3cd178903056ecb0943e4de45a2ea825edb6dc8d3e", size = 202736, upload-time = "2025-08-11T15:09:55.745Z" },
+    { url = "https://files.pythonhosted.org/packages/79/22/d1de07632b78ac8e6b785f41fa9aad7a978ec8c0a1bf15772def36d77aac/ninja-1.13.0-py3-none-manylinux2014_s390x.manylinux_2_17_s390x.whl", hash = "sha256:1c97223cdda0417f414bf864cfb73b72d8777e57ebb279c5f6de368de0062988", size = 179034, upload-time = "2025-08-11T15:09:57.394Z" },
+    { url = "https://files.pythonhosted.org/packages/ed/de/0e6edf44d6a04dabd0318a519125ed0415ce437ad5a1ec9b9be03d9048cf/ninja-1.13.0-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:fb46acf6b93b8dd0322adc3a4945452a4e774b75b91293bafcc7b7f8e6517dfa", size = 180716, upload-time = "2025-08-11T15:09:58.696Z" },
+    { url = "https://files.pythonhosted.org/packages/54/28/938b562f9057aaa4d6bfbeaa05e81899a47aebb3ba6751e36c027a7f5ff7/ninja-1.13.0-py3-none-manylinux_2_28_armv7l.manylinux_2_31_armv7l.whl", hash = "sha256:4be9c1b082d244b1ad7ef41eb8ab088aae8c109a9f3f0b3e56a252d3e00f42c1", size = 146843, upload-time = "2025-08-11T15:10:00.046Z" },
+    { url = "https://files.pythonhosted.org/packages/2a/fb/d06a3838de4f8ab866e44ee52a797b5491df823901c54943b2adb0389fbb/ninja-1.13.0-py3-none-manylinux_2_31_riscv64.whl", hash = "sha256:6739d3352073341ad284246f81339a384eec091d9851a886dfa5b00a6d48b3e2", size = 154402, upload-time = "2025-08-11T15:10:01.657Z" },
+    { url = "https://files.pythonhosted.org/packages/31/bf/0d7808af695ceddc763cf251b84a9892cd7f51622dc8b4c89d5012779f06/ninja-1.13.0-py3-none-musllinux_1_2_aarch64.whl", hash = "sha256:11be2d22027bde06f14c343f01d31446747dbb51e72d00decca2eb99be911e2f", size = 552388, upload-time = "2025-08-11T15:10:03.349Z" },
+    { url = "https://files.pythonhosted.org/packages/9d/70/c99d0c2c809f992752453cce312848abb3b1607e56d4cd1b6cded317351a/ninja-1.13.0-py3-none-musllinux_1_2_armv7l.whl", hash = "sha256:aa45b4037b313c2f698bc13306239b8b93b4680eb47e287773156ac9e9304714", size = 472501, upload-time = "2025-08-11T15:10:04.735Z" },
+    { url = "https://files.pythonhosted.org/packages/9f/43/c217b1153f0e499652f5e0766da8523ce3480f0a951039c7af115e224d55/ninja-1.13.0-py3-none-musllinux_1_2_i686.whl", hash = "sha256:5f8e1e8a1a30835eeb51db05cf5a67151ad37542f5a4af2a438e9490915e5b72", size = 638280, upload-time = "2025-08-11T15:10:06.512Z" },
+    { url = "https://files.pythonhosted.org/packages/8c/45/9151bba2c8d0ae2b6260f71696330590de5850e5574b7b5694dce6023e20/ninja-1.13.0-py3-none-musllinux_1_2_ppc64le.whl", hash = "sha256:3d7d7779d12cb20c6d054c61b702139fd23a7a964ec8f2c823f1ab1b084150db", size = 642420, upload-time = "2025-08-11T15:10:08.35Z" },
+    { url = "https://files.pythonhosted.org/packages/3c/fb/95752eb635bb8ad27d101d71bef15bc63049de23f299e312878fc21cb2da/ninja-1.13.0-py3-none-musllinux_1_2_riscv64.whl", hash = "sha256:d741a5e6754e0bda767e3274a0f0deeef4807f1fec6c0d7921a0244018926ae5", size = 585106, upload-time = "2025-08-11T15:10:09.818Z" },
+    { url = "https://files.pythonhosted.org/packages/c1/31/aa56a1a286703800c0cbe39fb4e82811c277772dc8cd084f442dd8e2938a/ninja-1.13.0-py3-none-musllinux_1_2_s390x.whl", hash = "sha256:e8bad11f8a00b64137e9b315b137d8bb6cbf3086fbdc43bf1f90fd33324d2e96", size = 707138, upload-time = "2025-08-11T15:10:11.366Z" },
+    { url = "https://files.pythonhosted.org/packages/34/6f/5f5a54a1041af945130abdb2b8529cbef0cdcbbf9bcf3f4195378319d29a/ninja-1.13.0-py3-none-musllinux_1_2_x86_64.whl", hash = "sha256:b4f2a072db3c0f944c32793e91532d8948d20d9ab83da9c0c7c15b5768072200", size = 581758, upload-time = "2025-08-11T15:10:13.295Z" },
+    { url = "https://files.pythonhosted.org/packages/95/97/51359c77527d45943fe7a94d00a3843b81162e6c4244b3579fe8fc54cb9c/ninja-1.13.0-py3-none-win32.whl", hash = "sha256:8cfbb80b4a53456ae8a39f90ae3d7a2129f45ea164f43fadfa15dc38c4aef1c9", size = 267201, upload-time = "2025-08-11T15:10:15.158Z" },
+    { url = "https://files.pythonhosted.org/packages/29/45/c0adfbfb0b5895aa18cec400c535b4f7ff3e52536e0403602fc1a23f7de9/ninja-1.13.0-py3-none-win_amd64.whl", hash = "sha256:fb8ee8719f8af47fed145cced4a85f0755dd55d45b2bddaf7431fa89803c5f3e", size = 309975, upload-time = "2025-08-11T15:10:16.697Z" },
+    { url = "https://files.pythonhosted.org/packages/df/93/a7b983643d1253bb223234b5b226e69de6cda02b76cdca7770f684b795f5/ninja-1.13.0-py3-none-win_arm64.whl", hash = "sha256:3c0b40b1f0bba764644385319028650087b4c1b18cdfa6f45cb39a3669b81aa9", size = 290806, upload-time = "2025-08-11T15:10:18.018Z" },
 ]
 
 [[package]]
@@ -2834,7 +2843,7 @@ resolution-markers = [
     "python_full_version < '3.12' and sys_platform == 'darwin'",
 ]
 dependencies = [
-    { name = "filelock", version = "3.19.1", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'darwin'" },
+    { name = "filelock", marker = "sys_platform == 'darwin'" },
     { name = "fsspec", marker = "sys_platform == 'darwin'" },
     { name = "jinja2", marker = "sys_platform == 'darwin'" },
     { name = "networkx", marker = "sys_platform == 'darwin'" },
@@ -2858,7 +2867,7 @@ resolution-markers = [
     "python_full_version < '3.12' and sys_platform != 'linux'",
 ]
 dependencies = [
-    { name = "filelock", version = "3.29.1", source = { registry = "https://pypi.org/simple" } },
+    { name = "filelock" },
     { name = "fsspec" },
     { name = "jinja2" },
     { name = "networkx" },
@@ -2889,7 +2898,7 @@ resolution-markers = [
     "python_full_version < '3.12' and platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux'",
 ]
 dependencies = [
-    { name = "filelock", version = "3.19.1", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'darwin'" },
+    { name = "filelock", marker = "sys_platform != 'darwin'" },
     { name = "fsspec", marker = "sys_platform != 'darwin'" },
     { name = "jinja2", marker = "sys_platform != 'darwin'" },
     { name = "networkx", marker = "sys_platform != 'darwin'" },
@@ -2932,7 +2941,7 @@ resolution-markers = [
 dependencies = [
     { name = "cuda-bindings", marker = "python_full_version < '3.12' and sys_platform == 'linux'" },
     { name = "cuda-toolkit", extra = ["cublas", "cudart", "cufft", "cufile", "cupti", "curand", "cusolver", "cusparse", "nvjitlink", "nvrtc", "nvtx"], marker = "(python_full_version < '3.12' and sys_platform == 'linux' and extra == 'extra-6-veomni-gpu') or (python_full_version >= '3.12' and extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (python_full_version >= '3.12' and extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform != 'linux' and extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (sys_platform != 'linux' and extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform != 'linux' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (extra != 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64')" },
-    { name = "filelock", version = "3.29.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
+    { name = "filelock", marker = "python_full_version < '3.12'" },
     { name = "fsspec", marker = "python_full_version < '3.12'" },
     { name = "jinja2", marker = "python_full_version < '3.12'" },
     { name = "networkx", marker = "python_full_version < '3.12'" },
@@ -2982,7 +2991,7 @@ resolution-markers = [
 dependencies = [
     { name = "cuda-bindings", marker = "python_full_version >= '3.12' and sys_platform == 'linux'" },
     { name = "cuda-toolkit", extra = ["cublas", "cudart", "cufft", "cufile", "cupti", "curand", "cusolver", "cusparse", "nvjitlink", "nvrtc", "nvtx"], marker = "(python_full_version >= '3.12' and sys_platform == 'linux' and extra == 'extra-6-veomni-gpu') or (python_full_version < '3.12' and extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (python_full_version < '3.12' and extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (python_full_version < '3.12' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform != 'linux' and extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (sys_platform != 'linux' and extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform != 'linux' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (extra != 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64')" },
-    { name = "filelock", version = "3.29.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
+    { name = "filelock", marker = "python_full_version >= '3.12'" },
     { name = "fsspec", marker = "python_full_version >= '3.12'" },
     { name = "jinja2", marker = "python_full_version >= '3.12'" },
     { name = "networkx", marker = "python_full_version >= '3.12'" },
@@ -3496,7 +3505,7 @@ requires-dist = [
     { name = "einops", specifier = ">=0.8.1" },
     { name = "expecttest", marker = "extra == 'dev'", specifier = ">=0.3.0,<0.4" },
     { name = "flash-attn", marker = "extra == 'gpu'" },
-    { name = "flash-attn-3", marker = "extra == 'gpu'", git = "https://github.com/Dao-AILab/flash-attention?subdirectory=hopper&rev=9397816f6094f5ba0de52c221093637054590d0d" },
+    { name = "flash-attn-3", marker = "extra == 'gpu'", url = "https://github.com/Luosuu/flash-attention3-wheels/releases/download/v0.0.3/flash_attn_3-3.0.0+20260609.cu130torch2110cxx11abitrue.bc58ab.sm90-cp310-abi3-linux_x86_64.whl" },
     { name = "flash-attn-4", marker = "extra == 'gpu'", git = "https://github.com/Dao-AILab/flash-attention?subdirectory=flash_attn%2Fcute&rev=9397816f6094f5ba0de52c221093637054590d0d" },
     { name = "flash-linear-attention", marker = "extra == 'gpu'" },
     { name = "flash-qla", marker = "extra == 'gpu'", git = "https://github.com/QwenLM/FlashQLA?rev=6ef4858b5446e05bd461d9658d877e548182dbcb" },
@@ -3577,8 +3586,7 @@ version = "20.34.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "distlib" },
-    { name = "filelock", version = "3.19.1", source = { registry = "https://pypi.org/simple" }, marker = "(extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (extra != 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64')" },
-    { name = "filelock", version = "3.29.1", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-6-veomni-gpu' or extra == 'extra-6-veomni-npu' or extra != 'extra-6-veomni-npu-aarch64'" },
+    { name = "filelock" },
     { name = "platformdirs" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/1c/14/37fcdba2808a6c615681cd216fecae00413c9dab44fb2e57805ecf3eaee3/virtualenv-20.34.0.tar.gz", hash = "sha256:44815b2c9dee7ed86e387b842a84f20b93f7f417f95886ca1996a72a4138eb1a", size = 6003808, upload-time = "2025-08-13T14:24:07.464Z" }

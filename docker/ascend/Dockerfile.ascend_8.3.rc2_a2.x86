@@ -12,14 +12,14 @@ ENV PIP_ROOT_USER_ACTION=ignore
 ARG APT_SOURCE=http://archive.ubuntu.com/ubuntu/
 ARG PIP_INDEX=https://pypi.org/simple
 
-# ubuntu 22.04 uses line-format /etc/apt/sources.list (not the deb822
-# format used by Ubuntu 24.04+). Only override on non-default APT_SOURCE.
+# ubuntu 22.04 line-format /etc/apt/sources.list (not the deb822 format used
+# by 24.04+). Only override on non-default APT_SOURCE. Wider regex matches any
+# `…/ubuntu[/]` URL so CANN bases preconfigured with Huawei Cloud / Aliyun
+# mirrors get rewritten too — anchoring on archive.ubuntu.com would silently
+# no-op there.
 RUN if [ "${APT_SOURCE}" != "http://archive.ubuntu.com/ubuntu/" ]; then \
     cp /etc/apt/sources.list /etc/apt/sources.list.bak && \
-    sed -i \
-        -e "s|http://archive.ubuntu.com/ubuntu/|${APT_SOURCE}|g" \
-        -e "s|http://security.ubuntu.com/ubuntu/|${APT_SOURCE}|g" \
-        /etc/apt/sources.list; \
+    sed -E -i "s#https?://[^[:space:]]+/ubuntu/?#${APT_SOURCE}#g" /etc/apt/sources.list; \
     fi
 
 # Change pip source (only when --build-arg PIP_INDEX=... is overridden)

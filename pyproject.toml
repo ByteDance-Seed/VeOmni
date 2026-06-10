@@ -54,7 +54,8 @@ gpu = [
   "nvidia-nccl-cu13",
   "nvidia-cutlass-dsl>=4.4.2",
   "cuda-python==13.0.3",
-  # Source-built — see `no-build-isolation-package` and `[tool.uv.sources]`.
+  # See `[tool.uv.sources]` — flash-attn-3 is a sm90 prebuilt wheel; the rest
+  # source-build (flash-attn from PyPI sdist; flash-attn-4 / flash-qla from git).
   "flash-attn",
   "flash-attn-3",
   "flash-attn-4",
@@ -142,7 +143,6 @@ transformers-stable = [
 required-version = ">=0.9.8,<0.12"
 no-build-isolation-package = [
     "flash-attn",
-    "flash-attn-3",
 ]
 
 default-groups = ["transformers-stable"]
@@ -184,10 +184,17 @@ torch = [
 ]
 torchvision = { index = "pytorch" }
 torchaudio = { index = "pytorch" }
-# FA2 is resolved from PyPI sdist (no cu130+torch2.11 prebuilt wheel exists
-# as of 2026-06) — re-add a wheel URL here when one ships.
-# FA3/FA4 share a single Dao-AILab pin to keep them coherent.
-flash-attn-3 = { git = "https://github.com/Dao-AILab/flash-attention", subdirectory = "hopper", rev = "9397816f6094f5ba0de52c221093637054590d0d" }
+# FA2 is resolved from PyPI sdist (no cu130+torch2.11 cp312 prebuilt wheel
+# exists as of 2026-06) — re-add a wheel URL here when one ships.
+# FA3 uses a Hopper-only sm90 wheel hosted by @Luosuu, ABI-aligned with our
+# torch 2.11.0+cu130 cxx11-ABI=true stack. abi3 means it loads on cp310+ so
+# both NGC25.11 (cp312) and the cp311 Ascend base (unused there) are covered.
+# Non-Hopper users never import flash_attn_interface (lazy in
+# veomni/ops/kernels/attention/__init__.py), so sm90-only is no-loss.
+# FA4 still source-built from Dao-AILab to keep coverage on non-Hopper cards.
+flash-attn-3 = [
+    { url = "https://github.com/Luosuu/flash-attention3-wheels/releases/download/v0.0.3/flash_attn_3-3.0.0+20260609.cu130torch2110cxx11abitrue.bc58ab.sm90-cp310-abi3-linux_x86_64.whl", marker = "extra == 'gpu'" },
+]
 flash-attn-4 = { git = "https://github.com/Dao-AILab/flash-attention", subdirectory = "flash_attn/cute", rev = "9397816f6094f5ba0de52c221093637054590d0d" }
 # Strictly newer than v0.1.0 — picks up fixes for backward gradient count (#10),
 # auto_cp UnboundLocalError (#8), and l2norm dtype preservation (#13).
@@ -211,21 +218,16 @@ name = "pytorch-cpu"
 url = "https://download.pytorch.org/whl/cpu/"
 explicit = true
 
-# Static metadata bypasses the build hook during resolution. flash-attn-3 and
-# flash-qla have no pyproject.toml, so without explicit `version` uv runs
-# their setup.py on a fresh (unseeded) venv and crashes with
-# `ModuleNotFoundError: No module named 'setuptools'`. flash-qla's setup.py
-# also lists tilelang/apache-tvm-ffi in install_requires; `requires-dist =
-# ["torch"]` overrides that (tilelang is only needed at runtime when the
-# user opts into `chunk_gated_delta_rule_implementation: flash_qla`).
-# Versions: flash_attn_3 hopper/__init__.py = "3.0.0"; flash_qla setup.py = "0.1.0".
+# Static metadata bypasses the build hook during resolution. flash-qla has no
+# pyproject.toml, so without explicit `version` uv runs its setup.py on a
+# fresh (unseeded) venv and crashes with `ModuleNotFoundError: No module
+# named 'setuptools'`. flash-qla's setup.py also lists tilelang/apache-tvm-ffi
+# in install_requires; `requires-dist = ["torch"]` overrides that (tilelang
+# is only needed at runtime when the user opts into
+# `chunk_gated_delta_rule_implementation: flash_qla`).
+# Version: flash_qla setup.py = "0.1.0".
 [[tool.uv.dependency-metadata]]
 name = "flash-attn"
-requires-dist = ["torch"]
-
-[[tool.uv.dependency-metadata]]
-name = "flash-attn-3"
-version = "3.0.0"
 requires-dist = ["torch"]
 
 [[tool.uv.dependency-metadata]]
@@ -236,7 +238,6 @@ requires-dist = ["torch"]
 # Seeds the build env (uv-created venvs are not seeded by default).
 [tool.uv.extra-build-dependencies]
 flash-attn = ["setuptools", "wheel", "packaging", "ninja"]
-flash-attn-3 = ["setuptools", "wheel", "packaging", "ninja"]
 flash-attn-4 = ["setuptools", "wheel", "packaging", "ninja", "torch"]
 flash-qla = ["setuptools", "wheel", "packaging", "ninja", "torch"]
 
