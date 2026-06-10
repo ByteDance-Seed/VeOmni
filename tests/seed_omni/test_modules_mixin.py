@@ -12,7 +12,6 @@ from veomni.models.seed_omni import (
     OMNI_MODEL_REGISTRY,
     OMNI_PROCESSOR_REGISTRY,
     ModuleMixin,
-    OmniModuleCheckpointCallback,
 )
 from veomni.models.seed_omni.configuration_omni import OmniConfig
 from veomni.models.seed_omni.conversation import ConversationItem
@@ -336,69 +335,6 @@ def test_qwen3_text_encoder_save_reload_via_registry(tmp_path: Path):
     te2 = Qwen3TextEncoder.from_pretrained(tmp_path)
     assert isinstance(te2, Qwen3TextEncoder)
     assert te2.config.vocab_size == 128
-
-
-# ── Per-module CheckpointCallback ─────────────────────────────────────────────
-
-
-def test_callback_writes_module_subfolder(tmp_path: Path):
-    TextEncoder = _model_cls("text_encoder")
-    TextEncoderConfig = _config_cls("text_encoder")
-    te = TextEncoder(TextEncoderConfig(vocab_size=64, hidden_size=16))
-    cb = OmniModuleCheckpointCallback(module=te, module_name="text_encoder", processor=None, is_rank_0=True)
-    cb.save(str(tmp_path))
-
-    out = tmp_path / "text_encoder"
-    assert out.is_dir()
-    files = sorted(p.name for p in out.iterdir())
-    assert "config.json" in files
-    assert "model.safetensors" in files
-    # No processor → no preprocessor_config.json should appear.
-    assert "preprocessor_config.json" not in files
-
-
-def test_callback_with_processor_writes_asset(tmp_path: Path):
-    """Verifies the per-module asset (vision processor) is saved alongside."""
-    JanusSiglip = _model_cls("janus_siglip")
-    JanusSiglipConfig = _config_cls("janus_siglip")
-    js = JanusSiglip(JanusSiglipConfig(vision_config=_tiny_vision_cfg()))
-
-    proc_cls = OMNI_PROCESSOR_REGISTRY["janus_siglip"]()
-    proc = proc_cls()  # default-constructed; tests only that save/load round-trips
-
-    cb = OmniModuleCheckpointCallback(module=js, module_name="janus_siglip", processor=proc, is_rank_0=True)
-    cb.save(str(tmp_path))
-
-    out = tmp_path / "janus_siglip"
-    files = sorted(p.name for p in out.iterdir())
-    assert "config.json" in files
-    assert "model.safetensors" in files
-    assert "preprocessor_config.json" in files
-
-
-def test_callback_round_trip_via_registry(tmp_path: Path):
-    """Save with callback → reload via OMNI registry class → still a TextEncoder."""
-    TextEncoder = _model_cls("text_encoder")
-    TextEncoderConfig = _config_cls("text_encoder")
-
-    te = TextEncoder(TextEncoderConfig(vocab_size=64, hidden_size=16))
-    cb = OmniModuleCheckpointCallback(module=te, module_name="text_encoder", is_rank_0=True)
-    cb.save(str(tmp_path))
-
-    reloaded = TextEncoder.from_pretrained(str(tmp_path / "text_encoder"))
-    assert isinstance(reloaded, TextEncoder)
-    assert reloaded.config.vocab_size == 64
-    assert reloaded.config.hidden_size == 16
-
-
-def test_callback_non_rank_0_is_noop(tmp_path: Path):
-    TextEncoder = _model_cls("text_encoder")
-    TextEncoderConfig = _config_cls("text_encoder")
-    te = TextEncoder(TextEncoderConfig(vocab_size=32, hidden_size=8))
-    cb = OmniModuleCheckpointCallback(module=te, module_name="text_encoder", is_rank_0=False)
-    cb.save(str(tmp_path))
-    # Non-rank-0 must not write anything.
-    assert not (tmp_path / "text_encoder").exists()
 
 
 # ── _no_split_modules preservation ────────────────────────────────────────────
