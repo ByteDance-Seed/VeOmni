@@ -384,7 +384,7 @@ def veomni_omni_demo_preprocess(conversations, **kwargs):
         {"type": "image"}   # placeholder; bytes live in parallel ``images`` list
 
     Understanding vs generation is encoded by ``role`` (``user`` vs ``assistant``),
-    not by item type.  See ``docs/usage/seedomni_data_format.md`` for I2T / T2I /
+    not by item type.  See ``docs/seed_omni/data_format.md`` for I2T / T2I /
     interleave (UG) examples.
     """
     constructed = []

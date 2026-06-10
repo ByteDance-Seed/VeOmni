@@ -28,7 +28,6 @@ get_started/installation/install_ascend_arm.md
 usage/arguments.md
 usage/basic_modules.md
 usage/multimodal_data_processing.md
-usage/seedomni_data_format.md
 usage/data_packing_and_dyn_bsz.md
 usage/support_new_models/guide_and_checklist.md
 usage/support_new_models/qwen3_vl_example.md
@@ -80,9 +79,18 @@ key_features/lora.md
 
 ```{toctree}
 :maxdepth: 1
+:caption: SeedOmni V2
+
+seed_omni/seed_omni_v2.md
+seed_omni/data_format.md
+seed_omni/design.md
+seed_omni/example_models/janus.md
+```
+
+```{toctree}
+:maxdepth: 1
 :caption: Design
 
-design/seed_omni_v2.md
 design/kernel_selection.md
 design/patchgen.md
 ```

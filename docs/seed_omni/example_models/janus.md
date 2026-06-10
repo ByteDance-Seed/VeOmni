@@ -60,7 +60,7 @@ upstream_sharded: true
 Sources have heterogeneous schemas, so we use the VeOmni weighted multisource
 sampler (`multisource_datasets_type: veomni_weighted_multisource`) instead of an
 HF interleave. The on-disk row schema is documented in
-[`docs/usage/seedomni_data_format.md`](../../usage/seedomni_data_format.md).
+[`docs/seed_omni/data_format.md`](../data_format.md).
 
 ---
 
