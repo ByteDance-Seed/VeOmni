@@ -10,11 +10,8 @@ ENV PIP_ROOT_USER_ACTION=ignore
 ARG APT_SOURCE={{ apt_source }}
 ARG PIP_INDEX={{ pip_index }}
 
-# Set apt source
-# ubuntu 22.04 (jammy) — uses the line-format /etc/apt/sources.list, not the
-# deb822 /etc/apt/sources.list.d/ubuntu.sources used by Ubuntu 24.04+ (CUDA).
-# Only override the base image's sources.list when the user passed a
-# non-default --build-arg APT_SOURCE=...
+# ubuntu 22.04 uses line-format /etc/apt/sources.list (not the deb822
+# format used by Ubuntu 24.04+). Only override on non-default APT_SOURCE.
 RUN if [ "${APT_SOURCE}" != "{{ apt_source }}" ]; then \
     cp /etc/apt/sources.list /etc/apt/sources.list.bak && \
     sed -i \
@@ -31,9 +28,7 @@ RUN if [ "${PIP_INDEX}" != "{{ pip_index }}" ]; then \
     pip config set global.no-cache-dir "true" && \
     python -m pip install --upgrade pip
 
-# Set timezone
-# (Ubuntu 22.04 base does not preinstall tzdata, unlike the CUDA NVIDIA
-# PyTorch base, so we apt-install it here before running dpkg-reconfigure.)
+# Ubuntu 22.04 base does not preinstall tzdata, unlike the CUDA base.
 RUN apt-get update -y && \
     DEBIAN_FRONTEND=noninteractive apt-get install -y tzdata && \
     echo "Setting timezone to CST (China Standard Time)..." && \
@@ -41,10 +36,8 @@ RUN apt-get update -y && \
     echo "Asia/Shanghai" > /etc/timezone && \
     dpkg-reconfigure -f noninteractive tzdata
 
-# Install apt packages.
-# Ascend base needs more compiler/build toolchain than the CUDA NVIDIA PyTorch
-# base: gcc/g++/cmake/build-essential to compile sdists when no NPU/aarch64
-# wheel exists, and libnuma-dev for the Ascend runtime.
+# gcc/g++/cmake/build-essential — compile sdists with no NPU/aarch64 wheel.
+# libnuma-dev — required by the Ascend runtime.
 RUN apt-get update -y \
     && apt-get install -y --no-install-recommends \
         gcc g++ cmake libnuma-dev sudo wget git curl jq vim build-essential ssh ca-certificates ffmpeg \

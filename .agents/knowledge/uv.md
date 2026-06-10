@@ -4,22 +4,15 @@ VeOmni uses [uv](https://docs.astral.sh/uv/) for dependency management. This doc
 
 ## uv Version
 
-`pyproject.toml` constrains uv to a **range** (currently `>=0.9.8,<0.12`, i.e.
-0.9.8 through 0.11.x) so local devs aren't forced onto one weekly uv build —
-they're encouraged to stay reasonably current within it, and the window will be
-tightened later. Reproducibility is preserved because every place that produces
-or consumes the lockfile installs a **concrete**, in-range uv and never
-re-resolves: the Dockerfiles `COPY` a fixed uv and `uv sync --locked`, the
-container CI jobs `uv run --frozen`, and the `check_patchgen` CI job (which runs
-on `ubuntu-latest`, not a prebuilt image) pins uv via `setup-uv`'s `version:`
-input. **Every concrete uv pin must stay inside the pyproject range.**
+`pyproject.toml` declares a **range** (`>=0.9.8,<0.12`); the Dockerfiles and
+CI install a concrete pin and use `--locked` / `--frozen` for reproducibility.
+**Every concrete uv pin must stay inside the pyproject range.**
 
 | Location | Format |
 |----------|--------|
-| `pyproject.toml` -> `[tool.uv]` -> `required-version` | range, e.g. `">=0.9.8,<0.12"` |
-| `docker/cuda/Dockerfile.cu130` | `COPY --from=ghcr.io/astral-sh/uv:X.Y.Z` (concrete, inside range) |
-| `docker/ascend/Dockerfile.*` | same pattern |
-| `.github/workflows/check_patchgen.yml` | `setup-uv` `version: "X.Y.Z"` (concrete, inside range) |
+| `pyproject.toml` -> `[tool.uv]` -> `required-version` | range |
+| `docker/cuda/Dockerfile.cu130`, `docker/ascend/Dockerfile.*` | `COPY --from=ghcr.io/astral-sh/uv:X.Y.Z` |
+| `.github/workflows/check_patchgen.yml` | `setup-uv` `version: "X.Y.Z"` |
 
 ## Dependency Layout
 
@@ -54,106 +47,70 @@ pyproject.toml
 └── uv.lock                  Lockfile (committed, used by Docker --locked)
 ```
 
-History note: an earlier revision split the Python-level deps (`audio`, `video`,
-`dit`, `lora`, `fa3`, `fa4`, `flash-qla`, `megatron`) into eight separate
-extras, which forced docker / CI / docs to chain seven-plus `--extra` flags.
-Those have all been folded into `gpu` / `npu` so a typical install is a single
-`--extra <gpu|npu|npu_aarch64>`. The original `trl` extra was also dropped
-entirely (not folded): the text DPO trainer at `veomni/trainer/text_dpo_trainer.py`
-is from-scratch, never imports `trl`, and the pinned `<=0.9.6` is a transformers
-v4-era release that does not work against our pinned transformers v5. Users who
-want trl for their own experiments should `pip install trl` against a transformers
-version they control.
-
 ## Hardware Extras (Mutually Exclusive)
 
-`gpu`, `npu`, and `npu_aarch64` are declared as conflicts — only one can be
-installed at a time. There are no other extras to chain alongside them; each
-is a complete superset.
+`gpu` / `npu` / `npu_aarch64` are declared as conflicts. trl is not included
+— VeOmni's DPO trainer is from-scratch.
 
 ```bash
-uv sync --extra gpu --dev           # NVIDIA GPU — torch+cu130, FA2/3/4/FlashQLA, diffusion, audio, peft, megatron-energon
-uv sync --extra npu --dev           # Ascend NPU x86 — torch+cpu, torch-npu, diffusion, audio, peft, megatron-energon
-uv sync --extra npu_aarch64 --dev   # Ascend NPU ARM — minimal (torch + torch-npu)
+uv sync --extra gpu --dev           # NVIDIA GPU
+uv sync --extra npu --dev           # Ascend NPU x86
+uv sync --extra npu_aarch64 --dev   # Ascend NPU ARM (minimal)
 ```
 
-A fresh `uv sync --extra gpu` source-builds flash-attn, flash-attn-3,
-flash-attn-4, and flash-qla (~60–90 min combined the first time). uv caches
-the built wheels under `~/.cache/uv`, so subsequent syncs and CI runners with
-a populated cache are fast.
+A fresh `--extra gpu` source-builds FA2/FA3/FA4/FlashQLA (~60–90 min total).
+uv caches the wheels under `~/.cache/uv` for subsequent syncs.
 
 ## Transformers Version
 
-`transformers==5.9.0` is pinned by the `transformers-stable` dependency
-group, which is listed in `[tool.uv] default-groups`. `uv sync` (no extra
-flags) installs it automatically. We keep the version out of
-`[project.dependencies]` so pip users are not forced into a specific 5.x
-patch release; pip users should `pip install transformers==5.9.0` manually.
+`transformers==5.9.0` is pinned by the `transformers-stable` group (in
+`default-groups`). Kept out of `[project.dependencies]` so pip users are not
+forced into a specific 5.x patch.
 
 ## torch Source Pinning
 
-torch, torchvision, torchaudio use custom sources:
-
-- **GPU**: torch uses a direct wheel URL (not the pytorch index) to avoid uv resolving to incompatible cu128_full wheels. The URL must be updated manually when bumping torch.
-- **NPU**: uses the `pytorch` index (`https://download.pytorch.org/whl/`)
+- **GPU**: direct wheel URL (not the pytorch index) — avoids uv resolving
+  cu128_full wheels that drop nvidia-* deps.
+- **NPU**: pytorch index (`https://download.pytorch.org/whl/`).
 
 ## Source-Built Attention Kernels
 
-The `gpu` extra source-builds four kernels (no prebuilt cu130+torch2.11
-wheels exist as of 2026-06):
-
-| Package | Source | Listed in `no-build-isolation-package` |
+| Package | Source | `no-build-isolation-package` |
 |---|---|---|
 | `flash-attn` (FA2) | PyPI sdist | yes |
 | `flash-attn-3` (Hopper) | git: Dao-AILab/flash-attention/hopper | yes |
-| `flash-attn-4` (cute) | git: Dao-AILab/flash-attention/flash_attn/cute | no (build isolation) |
-| `flash-qla` | git: QwenLM/FlashQLA | no (build isolation) |
+| `flash-attn-4` (cute) | git: Dao-AILab/flash-attention/flash_attn/cute | no |
+| `flash-qla` | git: QwenLM/FlashQLA | no |
 
-Three pyproject knobs cooperate to make a fresh `uv sync --extra gpu` succeed:
+Three pyproject knobs make a fresh `uv sync --extra gpu` succeed:
 
-1. **`[[tool.uv.dependency-metadata]]`** with `name` + `version` + `requires-dist`
-   for `flash-attn-3` (`3.0.0`) and `flash-qla` (`0.1.0`). These two have no
-   `pyproject.toml`, only a `setup.py` whose top-level body imports `torch` /
-   `wheel.bdist_wheel` / `packaging.version.parse`. With static metadata uv
-   skips the metadata hook entirely during resolution. **Without `version`,
-   uv falls back to invoking the build system to determine it, which crashes
-   on a fresh venv with `ModuleNotFoundError: No module named 'setuptools'`.**
+1. **`[[tool.uv.dependency-metadata]]`** with `version` for `flash-attn-3`
+   and `flash-qla`. They have no `pyproject.toml`; without static metadata
+   uv runs their setup.py on a fresh venv and crashes with
+   `ModuleNotFoundError: No module named 'setuptools'`.
 
 2. **`[tool.uv.extra-build-dependencies]`** seeds `setuptools / wheel /
-   packaging / ninja` (and `torch` for the build-isolation packages) into the
-   build env, since uv-created venvs are not seeded by default.
+   packaging / ninja` (+ `torch` where needed) — uv venvs are not seeded.
 
-3. **`FLASH_ATTENTION_FORCE_BUILD=TRUE`** (env var, not pyproject) forces the
-   FA2 / FA3 setup.py to compile from source instead of trying to download a
-   prebuilt wheel from `github.com/Dao-AILab/flash-attention/releases`. Their
-   default wheel guesser only knows `cu11torch*` / `cu12torch*` (no `cu13`
-   variants), and even an ABI-correct match would still die over corporate
-   firewalls that can't reach github. The cuda Dockerfile sets this env
-   globally; local devs must export it (or prefix the `uv sync` command).
+3. **`FLASH_ATTENTION_FORCE_BUILD=TRUE`** (env var) forces FA2/FA3 setup.py
+   to source-build instead of guessing a github prebuilt wheel URL (no cu13
+   variants exist). Set in the cuda Dockerfile; export locally.
 
 ## Common Commands
 
 ```bash
-# Initial setup (transformers==5.9.0 via the default dependency group).
-# FLASH_ATTENTION_FORCE_BUILD bypasses FA2/FA3's prebuilt-wheel download
-# (no cu130 prebuilt exists; github.com is also blocked from corp networks).
-FLASH_ATTENTION_FORCE_BUILD=TRUE uv sync --extra gpu --dev
-
-# Regenerate lockfile after pyproject.toml changes
-uv lock
-
-# Sync after lockfile update
-FLASH_ATTENTION_FORCE_BUILD=TRUE uv sync --extra gpu --dev
-
-# Docker builds (CI) — Dockerfile.cu130 already exports the env via ENV
-uv sync --locked --all-packages --extra gpu --dev
+FLASH_ATTENTION_FORCE_BUILD=TRUE uv sync --extra gpu --dev   # local dev
+uv lock                                                       # after pyproject edits
+uv sync --locked --all-packages --extra gpu --dev            # docker / CI
 ```
 
 ## Key Rules
 
-1. **Always commit `uv.lock` with `pyproject.toml`** — Docker builds use `--locked`.
-2. **torch version changes touch 4+ places** in pyproject.toml (extras, overrides, sources, wheel URL).
-3. **flash-attn / flash-attn-3 / flash-attn-4 / flash-qla compile from source on every fresh sync** (no cu13+torch2.11 prebuilts exist). Plan for ~15-30 min of nvcc time. Use `FLASH_ATTENTION_FORCE_BUILD=TRUE` to skip the FA2/FA3 prebuilt-wheel guesser; static metadata in `[[tool.uv.dependency-metadata]]` (with explicit `version`) keeps `uv lock` from re-invoking their `setup.py` for metadata.
-4. **uv version changes require Docker rebuilds** — update Dockerfiles and release new images. The Dockerfile uv pin must stay inside the `required-version` range in `pyproject.toml`.
-5. **`override-dependencies` markers are load-bearing** — the `extra == 'gpu'` guards prevent uv from downloading wrong torch variants.
-6. **`transformers==5.9.0` is the only supported version** — pinned via the `transformers-stable` default dependency group. New code targets v5 APIs (FSDP2 + patchgen-generated modeling) only.
+1. **Always commit `uv.lock` with `pyproject.toml`** — Docker uses `--locked`.
+2. **torch bumps touch 4+ places** (extras, overrides, sources wheel URL).
+3. **All four flash-attn/qla kernels compile from source every fresh sync.**
+   `FLASH_ATTENTION_FORCE_BUILD=TRUE` is required for FA2/FA3.
+4. **uv bumps require Docker rebuilds**; concrete pins must stay in range.
+5. **`override-dependencies` `extra == '...'` markers are load-bearing.**
+6. **`transformers==5.9.0` is the only supported version.** New code targets
+   v5 + FSDP2 + patchgen-generated modeling.

@@ -34,24 +34,16 @@ On session start, read the following:
 ## Setup
 
 ```bash
-# FLASH_ATTENTION_FORCE_BUILD=TRUE makes flash-attn / flash-attn-3 setup.py
-# compile from source instead of trying to download a prebuilt cu12 wheel
-# from github (no cu13 wheels exist; github is also blocked behind the
-# corporate firewall). The cuda Dockerfile sets this env globally; local
-# devs need to prefix it on the command line. See .agents/knowledge/uv.md.
+# FLASH_ATTENTION_FORCE_BUILD=TRUE forces FA2/FA3 source build (no cu13
+# prebuilt wheels exist). The cuda Dockerfile sets this env globally.
 FLASH_ATTENTION_FORCE_BUILD=TRUE uv sync --extra gpu --dev
 source .venv/bin/activate
 ```
 
-This installs `transformers==5.9.0` (pinned by the `transformers-stable`
-default dependency group in `pyproject.toml`). The `gpu` extra is a single
-full superset (cu130 torch + every attention kernel + diffusion/audio/peft +
-megatron-energon for the optional energon dataset format); there is no
-separate `--extra audio` / `--extra dit` / etc. any more. The original
-`trl<=0.9.6` extra was dropped — VeOmni's DPO trainer is from-scratch and
-never imported trl, and the pin is incompatible with transformers v5 anyway.
-Always activate `.venv/` before running any commands. New code must target
-transformers v5 and FSDP2. See `.agents/knowledge/constraints.md` for details.
+This installs `transformers==5.9.0` via the `transformers-stable` dependency
+group. `gpu` / `npu` / `npu_aarch64` are the only extras — each a complete
+superset, mutually exclusive. New code must target transformers v5 and FSDP2.
+See `.agents/knowledge/uv.md` and `.agents/knowledge/constraints.md`.
 
 ---
 

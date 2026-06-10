@@ -1,84 +1,36 @@
-# Matrix used by docker/generate.py to render docker/cuda/Dockerfile.* and the
-# uv-based docker/ascend/Dockerfile.* from docker/templates/*.j2. cu130 (NGC
-# PyTorch 25.11, CUDA 13.0.2) is the only CUDA variant; cu128 / cu129 were
-# removed when the project bumped to torch 2.11+cu130. (The pip-based ascend
-# variants — *_a2.arm, *_a3 — build torchcodec from source and stay
-# hand-maintained; only the uv-based x86 image is templated.)
-#
-# To add or update a variant:
-#   1. Edit defaults, a preset, or an entry below (or add a new one under `images:`).
-#   2. Run: python docker/generate.py
-#   3. Commit both this file and the regenerated Dockerfile.
+# Matrix consumed by docker/generate.py to render docker/cuda/Dockerfile.* and
+# docker/ascend/Dockerfile.* from docker/templates/*.j2. The pip-based
+# *_a2.arm / *_a3 ascend variants are hand-maintained and not in this matrix.
+# Edit -> `python docker/generate.py` -> commit both this file and the regen.
 
-# Extras synced by `uv sync` per backend/architecture. Each image picks one
-# via `uv_extras_preset: <name>`. The pyproject's `[project.optional-dependencies]`
-# was deliberately funnelled into three hardware-shaped extras (gpu / npu /
-# npu_aarch64) — the older à la carte feature extras (audio, video, dit,
-# lora, fa3, fa4, flash-qla, megatron) were rolled into them — so each preset
-# is just the single hardware extra. The original `trl` extra was dropped
-# entirely (not folded) because nothing in VeOmni imports trl. The presets
-# layer is kept for clarity and because `uv_extras_preset:` is a per-image
-# field; renaming or adding a new hardware backend (e.g. a future ROCm / TPU
-# image) lands here.
-#
-# Why not `uv sync --all-extras`? Because [tool.uv].conflicts in
-# pyproject.toml declares `gpu` / `npu` / `npu_aarch64` mutually exclusive,
-# and uv would refuse the resolution.
+# Each image picks one preset via `uv_extras_preset:`. gpu/npu/npu_aarch64
+# are mutually exclusive (see [tool.uv].conflicts in pyproject.toml), so we
+# can't `--all-extras`.
 uv_extras_presets:
-
   cuda:
-    # cu130 toolchain: torch 2.11+cu130, cudnn cu13, full attention kernel
-    # stack (FA2 / FA3 / FA4 / FlashQLA — all source-built; first build is
-    # ~60–90 min, uv caches subsequent syncs). Also includes diffusion +
-    # audio + lora + megatron-energon deps. See pyproject.toml
-    # `[project.optional-dependencies].gpu`.
     - gpu
-
   ascend_x86:
-    # Ascend NPU on x86. torch 2.7.1+cpu + torch-npu, plus the same Python
-    # feature stack (diffusion / audio / lora / megatron-energon) — minus the
-    # CUDA-only FA3 / FA4 / FlashQLA kernels. See pyproject.toml
-    # `[project.optional-dependencies].npu`.
     - npu
-
   ascend_arm:
-    # Ascend NPU on aarch64. Deliberately minimal (torch + torch-npu only):
-    # av / torchcodec / soundfile do not have aarch64 wheels pinned, so the
-    # extras stack is intentionally trimmed. See pyproject.toml
-    # `[project.optional-dependencies].npu_aarch64`.
     - npu_aarch64
 
 defaults:
-  # uv version pinned for the docker image. This is intentionally a single
-  # concrete version rather than the range declared in pyproject.toml's
-  # [tool.uv].required-version: the range exists for local devs (uv ships
-  # weekly), but the image must install one specific build at docker-build
-  # time. Bump in lockstep with pyproject.toml when raising the floor or
-  # tightening the ceiling.
+  # Concrete pin (not the pyproject range) — must stay inside required-version.
   uv_version: "0.11.16"
 
-  # Mirrors and paths shared across CUDA variants. apt_source / pip_index are
-  # also exposed as `ARG APT_SOURCE` / `ARG PIP_INDEX` in the generated
-  # Dockerfile, so a user can override them at `docker build` time with
-  # `--build-arg APT_SOURCE=... --build-arg PIP_INDEX=...` (e.g. to switch to
-  # a regional mirror like Tsinghua) without regenerating.
+  # Exposed as ARG APT_SOURCE / ARG PIP_INDEX so users can swap mirrors at
+  # `docker build` time without regenerating.
   apt_source: "http://archive.ubuntu.com/ubuntu/"
   pip_index: "https://pypi.org/simple"
   python_dist_packages: "/usr/local/lib/python3.12/dist-packages/"
   workdir: "/app"
 
-  # `uv sync` flags. `uv_extras` is resolved per-image from `uv_extras_preset`
-  # against `uv_extras_presets` above.
   uv_dev: true
 
 images:
-  # CUDA 13.0.2 + cuDNN 9.x + Python 3.12 from NGC PyTorch 25.11. The base
-  # ships PyTorch 2.10.0a0; uv override-dependencies replaces it with stable
-  # torch 2.11.0+cu130 from download.pytorch.org. NGC 25.11 (rather than
-  # 25.10/25.12) gives us a CUDA 13.0 toolchain that is also available as a
-  # public `nvidia/cuda:13.0.2-...` tag (forward-compat path), while torch
-  # 2.11 (≥ 2.10) fixes the 2.9.1 conv3d cuDNN regression that the previous
-  # cu129 line had to work around with an `nvidia-cudnn-cu12` pin.
+  # NGC 25.11 ships torch 2.10.0a0; uv override-dependencies upgrades to
+  # 2.11.0+cu130 (fixes the 2.9.1 conv3d cuDNN regression that cu129 worked
+  # around with nvidia-cudnn-cu12).
   - name: cu130
     output: docker/cuda/Dockerfile.cu130
     template: cuda.Dockerfile.j2
@@ -86,17 +38,13 @@ images:
     release_notes_url: "https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-25-11.html"
     uv_extras_preset: cuda
 
-  # Ascend 910B (A2), x86 host, CANN 8.3.rc2. uv-based, unlike the pip-based
-  # arm / a3 ascend Dockerfiles. `uv_extra_flags` carries the insecure-host
-  # allowances the CANN base image needs to fetch github / pythonhosted wheels
-  # under `--locked` (see build_uv_sync_command in generate.py).
+  # uv_extra_flags allow github / pythonhosted under --locked (CANN base has
+  # stricter cert handling); see build_uv_sync_command in generate.py.
   - name: ascend_8.3.rc2_a2.x86
     output: docker/ascend/Dockerfile.ascend_8.3.rc2_a2.x86
     template: ascend.Dockerfile.j2
     base_image: "swr.cn-south-1.myhuaweicloud.com/ascendhub/cann:8.3.rc2-910b-ubuntu22.04-py3.11"
-    # Override the cuda default (/usr/local/lib/python3.12/dist-packages/):
-    # this base ships Python 3.11.13 at /usr/local/python3.11.13/. Bump this
-    # path if Huawei rolls a new Python patch into the same CANN tag.
+    # CANN base ships Python 3.11.13; bump if Huawei rolls a new patch.
     python_dist_packages: "/usr/local/python3.11.13/lib/python3.11/site-packages/"
     header_comments:
       - "docker hub: https://hub.docker.com/layers/ascendai/cann/8.3.rc2-910b-ubuntu22.04-py3.11/images/sha256-9efee6a0bb1e8cb6d5dd5170a4a51837d3783e79e2c57c6f4cb5b9ed58598e3e"

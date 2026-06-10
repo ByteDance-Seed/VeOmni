@@ -27,15 +27,11 @@ uv sync --locked --extra npu
 source .venv/bin/activate
 ```
 
-The `npu` extra is a single, full superset for x86 Ascend NPU: it pulls in
-torch 2.7.1+cpu / torch-npu and the diffusion / audio / video / LoRA Python
-deps plus `megatron-energon` for the optional energon dataset format. The
-older `audio`, `video`, `dit`, `lora`, `megatron` extras have been folded
-into `npu`, so a typical install is just `--extra npu`. The original `trl`
-extra was dropped entirely (VeOmni's DPO trainer is from-scratch and never
-imported trl). CUDA-only kernels (FA3 / FA4 / FlashQLA) are intentionally
-absent. See [pyproject.toml](https://github.com/ByteDance-Seed/VeOmni/blob/main/pyproject.toml)
-for the exact dependency list.
+`npu` is a single full superset for x86 Ascend: torch 2.7.1+cpu / torch-npu,
+diffusion / audio / video / LoRA deps, and `megatron-energon`. CUDA-only
+kernels (FA3 / FA4 / FlashQLA) are intentionally absent. See
+[pyproject.toml](https://github.com/ByteDance-Seed/VeOmni/blob/main/pyproject.toml)
+for the full list.
 
 > **Note**: video/audio processing also needs ffmpeg installed at the OS level:
 > ```bash

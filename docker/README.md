@@ -33,12 +33,8 @@ flagged.
 ### Updating
 
 1. Edit one of:
-   - [`matrix.yaml`](matrix.yaml) — `defaults.uv_version` (the pinned uv
-     version baked into the image), base image, mirrors, extras list, etc.
-     `uv_version` here is the docker-image pin, intentionally a single
-     concrete release rather than the range declared in `pyproject.toml`'s
-     `[tool.uv].required-version`. Bump in lockstep with that range when
-     raising the floor or tightening the ceiling.
+   - [`matrix.yaml`](matrix.yaml) — base image, mirrors, `uv_version`
+     (concrete pin; must stay inside `pyproject.toml` `required-version`).
    - [`templates/cuda.Dockerfile.j2`](templates/cuda.Dockerfile.j2) —
      structural change shared by all variants.
 2. Regenerate:
