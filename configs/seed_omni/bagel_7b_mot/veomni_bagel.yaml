@@ -1,0 +1,76 @@
+# VeOmni training config for OmniModel V2 - BAGEL-7B-MoT.
+
+model:
+  model_path: /mnt/hdfs/shizhelun/veomni_omni/models/seed_omni/BAGEL-7B-MoT
+  omni_train_yaml_path: configs/seed_omni/bagel_7b_mot/train.yaml
+  model_config: {}
+  ops_implementation:
+    attn_implementation: flash_attention_2
+
+data:
+  data_type: seedomni
+  max_seq_len: 4096
+  train_path: /mnt/hdfs/shizhelun/veomni_omni/data
+  datasets_type: mapping
+  chat_template: default
+  dataloader:
+    type: native
+    num_workers: 4
+    drop_last: true
+    pin_memory: true
+    prefetch_factor: 2
+
+train:
+  seed: 42
+  num_train_epochs: 1
+  global_batch_size: 32
+  micro_batch_size: 2
+  init_device: meta
+  dyn_bsz: false
+
+  accelerator:
+    fsdp_config:
+      fsdp_mode: fsdp2
+      full_shard: true
+      reshard_after_forward: true
+      reshard_after_backward: true
+      forward_prefetch: true
+      offload: false
+      max_load_broadcast_size: 20.0
+      mixed_precision:
+        enable: true
+        param_dtype: bfloat16
+        reduce_dtype: float32
+    offload_config:
+      enable_activation: false
+      activation_gpu_limit: 0.0
+
+  gradient_checkpointing:
+    enable: true
+    enable_reentrant: false
+
+  optimizer:
+    type: adamw
+    lr: 1.0e-4
+    lr_min: 1.0e-6
+    lr_start: 0.0
+    lr_warmup_ratio: 0.03
+    lr_decay_style: cosine
+    lr_decay_ratio: 1.0
+    weight_decay: 0.01
+    max_grad_norm: 1.0
+    no_decay_params: []
+    no_decay_modules: []
+
+  checkpoint:
+    output_dir: outputs/bagel_7b_mot_omni_sft
+    save_steps: 500
+    save_epochs: 0
+    save_hf_weights: true
+    hf_save_steps: 500
+    hf_save_epochs: 0
+
+  wandb:
+    enable: true
+    project: VeOmni_omni
+    name: bagel_7b_mot_omni_sft

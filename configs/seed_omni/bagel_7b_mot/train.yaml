@@ -1,0 +1,52 @@
+# OmniModel V2 - BAGEL-7B-MoT training graph vocabulary.
+
+modules:
+  bagel_text_encoder:
+    model:
+      model_path: bagel_text_encoder
+
+  bagel_siglip_navit:
+    model:
+      model_path: bagel_siglip_navit
+
+  bagel_vae:
+    model:
+      model_path: bagel_vae
+
+  bagel_flow_connector:
+    model:
+      model_path: bagel_flow_connector
+
+  bagel_qwen2_mot:
+    model:
+      model_path: bagel_qwen2_mot
+
+nodes:
+  token_encode: { module: bagel_text_encoder.encode }
+  siglip_encode: { module: bagel_siglip_navit.encode }
+  vae_encode: { module: bagel_vae.encode }
+  flow_embed: { module: bagel_flow_connector.embed_latent }
+  qwen2_mot: { module: bagel_qwen2_mot }
+  token_decode: { module: bagel_text_encoder.decode }
+  flow_decode: { module: bagel_flow_connector.decode_velocity }
+
+edges:
+  token_encode_to_qwen2: { from: token_encode, to: qwen2_mot }
+  siglip_encode_to_qwen2: { from: siglip_encode, to: qwen2_mot }
+  vae_encode_to_flow_embed: { from: vae_encode, to: flow_embed }
+  flow_embed_to_qwen2: { from: flow_embed, to: qwen2_mot }
+  qwen2_to_token_decode: { from: qwen2_mot, to: token_decode }
+  qwen2_to_flow_decode: { from: qwen2_mot, to: flow_decode }
+  token_decode_sink: { from: token_decode, to: end }
+  flow_decode_sink: { from: flow_decode, to: end }
+
+training_graph:
+  edges:
+    - token_encode_to_qwen2
+    - siglip_encode_to_qwen2
+    - vae_encode_to_flow_embed
+    - flow_embed_to_qwen2
+    - qwen2_to_token_decode
+    - qwen2_to_flow_decode
+    - token_decode_sink
+    - flow_decode_sink
