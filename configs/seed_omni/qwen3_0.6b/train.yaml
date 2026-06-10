@@ -1,0 +1,42 @@
+# OmniModel V2 — Qwen3-0.6B master training YAML.
+#
+# Pure text SFT: token_encode → qwen3_llm → token_decode.
+#
+# Split the upstream Qwen3 checkpoint first::
+#
+#   python scripts/convert_model.py \
+#     --model_path /mnt/hdfs/veomni/models/transformers/Qwen/Qwen3-0.6B \
+#     --output_dir /mnt/hdfs/veomni/models/seed_omni/Qwen3-0.6B
+#
+# The LLM tokenizer lives in ``qwen3_text_encoder/`` (split checkpoint asset).
+
+modules:
+  qwen3_text_encoder:
+    model:
+      model_path: qwen3_text_encoder
+
+  qwen3_llm:
+    model:
+      model_path: qwen3_llm
+
+nodes:
+  token_encode:   { module: qwen3_text_encoder.encode }
+  token_generate: { module: qwen3_text_encoder }
+  token_decode:   { module: qwen3_text_encoder.decode }
+  qwen3_llm:      { module: qwen3_llm }
+
+edges:
+  token_encode_to_qwen3_llm:    { from: token_encode,  to: qwen3_llm }
+  qwen3_llm_to_token_decode:    { from: qwen3_llm, to: token_decode }
+  token_decode_sink:            { from: token_decode, to: end }
+
+  token_generate_to_qwen3_llm:  { from: token_generate, to: qwen3_llm }
+  qwen3_llm_to_token_generate:  { from: qwen3_llm, to: token_generate }
+  token_generate_sink:          { from: token_generate, to: end }
+  qwen3_llm_sink:               { from: qwen3_llm, to: end }
+
+training_graph:
+  edges:
+    - token_encode_to_qwen3_llm
+    - qwen3_llm_to_token_decode
+    - token_decode_sink

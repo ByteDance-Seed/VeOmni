@@ -31,7 +31,7 @@ Hooks (all optional except training-graph ``forward``)
 ``get_parallel_plan`` / ``get_assets`` — build and checkpoint.
 
 Training nodes must emit at most one token-mean ``_loss``; ``OmniModel``
-sums them.  See ``docs/design/seed_omni_v2.md`` for the full contract.
+sums them.  See ``docs/seed_omni/seed_omni_v2.md`` for the full contract.
 """
 
 from typing import Any, Dict, List, Optional, Type

@@ -182,7 +182,7 @@ T2I + ShareGPT4V caption I2T). Launch with the bundled YAML:
 bash train.sh tasks/omni/train_omni.py configs/seed_omni/janus_1.3b/veomni_janus.yaml
 ```
 
-See [`docs/seed_omni/example_models/janus.md`](../seed_omni/example_models/janus.md)
+See [`docs/seed_omni/example_models/janus.md`](example_models/janus.md)
 for the full convert → train → resume → infer pipeline.
 
 ## Custom datasets
