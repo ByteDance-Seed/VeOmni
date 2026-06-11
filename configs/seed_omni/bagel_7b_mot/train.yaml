@@ -27,6 +27,7 @@ nodes:
   token_generate: { module: bagel_text_encoder }
   siglip_encode: { module: bagel_siglip_navit }
   vae_encode: { module: bagel_vae.encode }
+  vae_decode: { module: bagel_vae.decode }
   flow_embed: { module: bagel_flow_connector.embed_latent }
   qwen2_mot: { module: bagel_qwen2_mot }
   token_decode: { module: bagel_text_encoder.decode }
@@ -39,6 +40,7 @@ edges:
   flow_embed_to_qwen2: { from: flow_embed, to: qwen2_mot }
   qwen2_to_token_decode: { from: qwen2_mot, to: token_decode }
   qwen2_to_flow_decode: { from: qwen2_mot, to: flow_decode }
+  vae_decode_sink: { from: vae_decode, to: end }
   token_decode_sink: { from: token_decode, to: end }
   flow_decode_sink: { from: flow_decode, to: end }
 

@@ -46,6 +46,10 @@ class BagelTextEncoderModuleMixin(TextEncoderModuleMixin):
             token_ids = self._prompt_token_ids(tail)
             tail.value = self.encode(token_ids)["inputs_embeds"].to(device=self.device, dtype=self.dtype)
             self._ensure_prompt_meta(tail, int(token_ids.numel()))
+            if self._is_image_generation_request(conversation_list, generation_kwargs):
+                self._ensure_image_generation_latent_item(conversation_list, tail, generation_kwargs)
+                self._materialize_image_generation_items(conversation_list)
+                return {"conversation_list": conversation_list}
 
             start_ids = self._start_token_ids(tail)
             start_embeds = self.encode(start_ids)["inputs_embeds"].to(device=self.device, dtype=self.dtype)
@@ -126,6 +130,61 @@ class BagelTextEncoderModuleMixin(TextEncoderModuleMixin):
             item.value = sequence
             item.meta["query_lens"] = query_lens
             item.meta["image_sequence_ready"] = True
+
+    def _is_image_generation_request(
+        self,
+        conversation_list: list[ConversationItem],
+        generation_kwargs: Optional[Dict[str, Any]],
+    ) -> bool:
+        if generation_kwargs and generation_kwargs.get("infer_mode") == "gen":
+            return True
+        return any(item.meta.get("bagel_role") == "image_gen_latent" for item in conversation_list)
+
+    def _materialize_image_generation_items(self, conversation_list: list[ConversationItem]) -> None:
+        for item in conversation_list:
+            if item.meta.get("bagel_role") != "image_gen_latent":
+                continue
+            if item.meta.get("text_embeds_ready"):
+                continue
+            text_token_ids = item.meta.get("text_token_ids")
+            if not torch.is_tensor(text_token_ids):
+                raise ValueError("BAGEL image generation item requires text_token_ids metadata.")
+            text_token_ids = text_token_ids.detach().to(device=self.device, dtype=torch.long).reshape(-1)
+            item.meta["text_embeds"] = self.encode(text_token_ids)["inputs_embeds"].to(
+                device=self.device, dtype=self.dtype
+            )
+            item.meta["text_embeds_ready"] = True
+
+    def _ensure_image_generation_latent_item(
+        self,
+        conversation_list: list[ConversationItem],
+        prompt_item: ConversationItem,
+        generation_kwargs: Optional[Dict[str, Any]],
+    ) -> None:
+        if any(item.meta.get("bagel_role") == "image_gen_latent" for item in conversation_list):
+            return
+        kwargs = generation_kwargs or {}
+        height = int(kwargs.get("image_height", 1024))
+        width = int(kwargs.get("image_width", 1024))
+        prompt_kv_len = self._scalar_meta_int(prompt_item.meta.get("key_value_lens_after"))
+        prompt_rope = self._scalar_meta_int(prompt_item.meta.get("rope_after"), default=prompt_kv_len)
+        text_token_ids = torch.tensor(self._image_boundary_token_ids(), device=self.device, dtype=torch.long)
+        conversation_list.append(
+            ConversationItem(
+                type="image",
+                value=torch.empty(0, device=self.device, dtype=torch.float32),
+                role="assistant",
+                source="bagel_generation_request",
+                meta={
+                    "bagel_role": "image_gen_latent",
+                    "raw_image_size": [height, width],
+                    "text_token_ids": text_token_ids,
+                    "key_value_lens": torch.tensor([prompt_kv_len], device=self.device, dtype=torch.int32),
+                    "context_indexes": torch.arange(prompt_kv_len, device=self.device, dtype=torch.long),
+                    "rope_after_prompt": torch.tensor([prompt_rope], device=self.device, dtype=torch.long),
+                },
+            )
+        )
 
     def _prompt_token_ids(self, item: ConversationItem) -> torch.Tensor:
         value = item.value
@@ -244,6 +303,27 @@ class BagelTextEncoderModuleMixin(TextEncoderModuleMixin):
             self._eos_token_id = int(self._tokenizer.eos_token_id)
             return int(self._eos_token_id)
         raise ValueError("Unable to resolve BAGEL EOS token id.")
+
+    def _image_boundary_token_ids(self) -> list[int]:
+        if self._tokenizer is None:
+            raise ValueError("BAGEL image generation requires tokenizer-owned image boundary tokens.")
+        start = self._resolve_token_id(self._tokenizer, "<|vision_start|>", fallback=None)
+        end = self._resolve_token_id(self._tokenizer, "<|vision_end|>", fallback=None)
+        if start is None or end is None:
+            raise ValueError("Unable to resolve BAGEL image boundary token ids.")
+        return [start, end]
+
+    @staticmethod
+    def _scalar_meta_int(value: Any, default: Optional[int] = None) -> int:
+        if torch.is_tensor(value):
+            return int(value.detach().reshape(-1)[0].item())
+        if isinstance(value, (list, tuple)) and value:
+            return int(value[0])
+        if isinstance(value, int):
+            return value
+        if default is not None:
+            return default
+        raise ValueError("Expected scalar integer metadata.")
 
     @staticmethod
     def _resolve_token_id(tokenizer: Any, token: str, fallback: Optional[int]) -> Optional[int]:

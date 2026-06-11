@@ -217,6 +217,18 @@ def _first_flow_timestep(num_timesteps: int, timestep_shift: float, device: torc
     }
 
 
+def _flow_step_count(args: argparse.Namespace, num_available_steps: int) -> int:
+    flow_steps = int(args.capture_flow_steps)
+    if flow_steps < 1:
+        raise ValueError("capture_flow_steps must be at least 1.")
+    if flow_steps > num_available_steps:
+        raise ValueError(
+            f"capture_flow_steps={flow_steps} exceeds available denoise steps {num_available_steps} "
+            f"from num_timesteps={args.num_timesteps}."
+        )
+    return flow_steps
+
+
 @torch.no_grad()
 def _forward_flow_base(
     model: Any,
@@ -312,6 +324,7 @@ def capture(args: argparse.Namespace) -> dict[str, Any]:
     latent_input = _move_tensors(latent_input, device)
 
     timestep_fields = _first_flow_timestep(args.num_timesteps, args.timestep_shift, device)
+    flow_steps = _flow_step_count(args, int(timestep_fields["dts"].numel()))
     x_t0 = latent_input["packed_init_noises"]
     with _autocast_context(device, torch_dtype):
         flow_output = _forward_flow_base(
@@ -322,6 +335,20 @@ def capture(args: argparse.Namespace) -> dict[str, Any]:
             past_key_values=past_key_values,
         )
     x_t1 = x_t0 - flow_output["velocity"].to(x_t0.device) * timestep_fields["dt"][0]
+    x_t_final = x_t0
+    last_flow_output = flow_output
+    # Capture the official Euler chain as the graph-level oracle for multi-step denoise parity.
+    for step_index in range(flow_steps):
+        timestep = timestep_fields["timesteps"][step_index : step_index + 1]
+        with _autocast_context(device, torch_dtype):
+            last_flow_output = _forward_flow_base(
+                model,
+                x_t=x_t_final,
+                timestep=timestep,
+                latent_input=latent_input,
+                past_key_values=past_key_values,
+            )
+        x_t_final = x_t_final - last_flow_output["velocity"].to(x_t_final.device) * timestep_fields["dts"][step_index]
 
     return {
         "metadata": {
@@ -333,6 +360,7 @@ def capture(args: argparse.Namespace) -> dict[str, Any]:
             "official_repo": str(args.official_repo),
             "official_checkpoint": str(args.model_root),
             "device": str(device),
+            "multi_step_flow_steps": flow_steps,
         },
         "raw_input": {
             "prompt": args.prompt,
@@ -372,6 +400,11 @@ def capture(args: argparse.Namespace) -> dict[str, Any]:
             "velocity": flow_output["velocity"].detach().cpu(),
             "x_t1": x_t1.detach().cpu(),
         },
+        "multi_step": {
+            "flow_steps": flow_steps,
+            "x_t_final": x_t_final.detach().cpu(),
+            "last_velocity": last_flow_output["velocity"].detach().cpu(),
+        },
         "tolerances": {
             "bf16": {
                 "v2_parity": {
@@ -406,6 +439,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cfg-renorm-type", default="global")
     parser.add_argument("--latent-patch-size", type=int, default=2)
     parser.add_argument("--max-latent-size", type=int, default=64)
+    parser.add_argument("--capture-flow-steps", type=int, default=1)
     return parser.parse_args()
 
 

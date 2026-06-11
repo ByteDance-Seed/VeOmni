@@ -1,0 +1,51 @@
+# BAGEL-7B-MoT inference - text to image.
+#
+# This graph is the target FSM for image-generation graph parity. It mirrors
+# official BAGEL's base path:
+#
+#   prepare_prompts -> forward_cache_update_text -> denoise loop -> VAE decode
+#
+# Each denoise iteration should prepare the current latent/timestep, run Qwen2
+# MoT in generation mode, decode velocity, and update the latent state. The
+# module hooks still own CFG, timestep scheduling, latent updates, and the
+# final image materialization.
+
+generation_graph:
+  initial: prompt_encode
+
+  states:
+    prompt_encode:
+      body:
+        - token_prompt_encode_to_qwen2
+        - qwen2_sink
+      transitions:
+        - { condition: { type: default }, next_state: image_flow }
+
+    image_flow:
+      body:
+        - flow_embed_to_qwen2
+        - qwen2_to_flow_decode
+        - flow_decode_sink
+      transitions:
+        - { condition: { type: module_signal, key: image_complete }, next_state: image_decode }
+
+    image_decode:
+      body:
+        - vae_decode_sink
+      transitions:
+        - { condition: { type: default }, next_state: done }
+
+generation_kwargs:
+  infer_mode: gen
+  max_new_tokens: 2048
+  image_height: 1024
+  image_width: 1024
+  latent_downsample: 16
+  num_timesteps: 50
+  timestep_shift: 3.0
+  cfg_text_scale: 1.0
+  cfg_img_scale: 1.0
+  cfg_interval: [0.0, 1.0]
+  cfg_renorm_min: 0.0
+  cfg_renorm_type: global
+  enable_taylorseer: false

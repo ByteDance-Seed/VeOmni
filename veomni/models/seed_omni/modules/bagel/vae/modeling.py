@@ -280,10 +280,9 @@ class BagelVAE(BagelVAEModuleMixin, PreTrainedModel):
         latents = self.config.scale_factor * (latents - self.config.shift_factor)
         return {"latents": latents}
 
-    def decode(self, latents: Optional[torch.Tensor] = None, **kwargs: Any) -> Dict[str, torch.Tensor]:
-        del kwargs
+    def decode(self, latents: Optional[torch.Tensor] = None, **kwargs: Any) -> Dict[str, Any]:
         if latents is None:
-            return {}
+            return self._decode_image_graph(**kwargs)
         latents = latents / self.config.scale_factor + self.config.shift_factor
         return {"pixel_values": self.decoder(latents)}
 

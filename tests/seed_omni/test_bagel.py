@@ -10,9 +10,11 @@ import torch
 
 from tests.seed_omni.fixtures.bagel.adapter import (
     adapt_text_only_fixture,
+    assert_image_gen_fixture_schema,
     assert_text_fixture_schema,
     assert_text_image_fixture_schema,
 )
+from tests.seed_omni.fixtures.bagel.compare_image_gen import compare_image_gen_graph, smoke_image_gen_full_loop_decode
 from tests.seed_omni.fixtures.bagel.compare_text_image_und import compare_text_image_und_graph
 from tests.seed_omni.fixtures.bagel.compare_text_only_graph import compare_text_graph
 
@@ -48,6 +50,52 @@ def test_bagel_text_graph_matches_official_fixture() -> None:
         Path(fixture_path),
         Path(model_root),
         config_dir=repo_root / "configs/seed_omni/bagel_7b_mot",
+    )
+    assert report["all_pass"], report
+
+
+def test_bagel_image_generation_fixture_schema() -> None:
+    fixture_path = os.environ.get("BAGEL_IMAGE_GEN_PARITY_FIXTURE")
+    if not fixture_path:
+        pytest.skip("Set BAGEL_IMAGE_GEN_PARITY_FIXTURE to validate a generated BAGEL image-generation fixture.")
+
+    fixture = torch.load(Path(fixture_path), map_location="cpu", weights_only=False)
+    assert_image_gen_fixture_schema(fixture)
+
+
+def test_bagel_image_generation_graph_matches_official_fixture() -> None:
+    fixture_path = os.environ.get("BAGEL_IMAGE_GEN_PARITY_FIXTURE")
+    model_root = os.environ.get("BAGEL_SPLIT_MODEL_ROOT")
+    if not fixture_path or not model_root:
+        pytest.skip(
+            "Set BAGEL_IMAGE_GEN_PARITY_FIXTURE and BAGEL_SPLIT_MODEL_ROOT to run BAGEL image-generation graph parity."
+        )
+
+    repo_root = Path(__file__).resolve().parents[2]
+    report = compare_image_gen_graph(
+        Path(fixture_path),
+        Path(model_root),
+        config_dir=repo_root / "configs/seed_omni/bagel_7b_mot",
+    )
+    assert report["all_pass"], report
+
+
+def test_bagel_image_generation_full_loop_decode_smoke() -> None:
+    fixture_path = os.environ.get("BAGEL_IMAGE_GEN_PARITY_FIXTURE")
+    model_root = os.environ.get("BAGEL_SPLIT_MODEL_ROOT")
+    max_flow_steps = os.environ.get("BAGEL_IMAGE_GEN_FULL_LOOP_STEPS")
+    if not fixture_path or not model_root or not max_flow_steps:
+        pytest.skip(
+            "Set BAGEL_IMAGE_GEN_PARITY_FIXTURE, BAGEL_SPLIT_MODEL_ROOT, and "
+            "BAGEL_IMAGE_GEN_FULL_LOOP_STEPS to run BAGEL full-loop decode smoke."
+        )
+
+    repo_root = Path(__file__).resolve().parents[2]
+    report = smoke_image_gen_full_loop_decode(
+        Path(fixture_path),
+        Path(model_root),
+        config_dir=repo_root / "configs/seed_omni/bagel_7b_mot",
+        max_flow_steps=int(max_flow_steps),
     )
     assert report["all_pass"], report
 

@@ -96,10 +96,13 @@ class BagelFlowConnector(BagelFlowConnectorModuleMixin, PreTrainedModel):
 
     def embed_latent(
         self,
-        latents: torch.Tensor,
+        latents: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         timesteps: Optional[torch.Tensor] = None,
-    ) -> Dict[str, torch.Tensor]:
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
+        if latents is None:
+            return self._embed_latent_graph(**kwargs)
         if position_ids is None or timesteps is None:
             raise ValueError("BagelFlowConnector.embed_latent requires position_ids and timesteps.")
         latents = latents.to(device=self.device, dtype=self.dtype)
@@ -113,8 +116,10 @@ class BagelFlowConnector(BagelFlowConnectorModuleMixin, PreTrainedModel):
         latent_embeds = self.vae2llm(latents) + self.time_embedder(timesteps) + self.latent_pos_embed(position_ids)
         return {"latent_embeds": latent_embeds.to(dtype=self.dtype)}
 
-    def decode_velocity(self, hidden_states: torch.Tensor) -> Dict[str, torch.Tensor]:
+    def decode_velocity(self, hidden_states: Optional[torch.Tensor] = None, **kwargs: Any) -> Dict[str, Any]:
+        if hidden_states is None:
+            return self._decode_velocity_graph(**kwargs)
         return {"velocity": self.llm2vae(hidden_states.to(device=self.device, dtype=self.dtype))}
 
-    def forward(self, **kwargs: Any) -> Dict[str, torch.Tensor]:  # type: ignore[override]
+    def forward(self, **kwargs: Any) -> Dict[str, Any]:  # type: ignore[override]
         return self.embed_latent(**kwargs)

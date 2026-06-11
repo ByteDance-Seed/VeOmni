@@ -40,11 +40,25 @@ class BagelQwen2MoTModuleMixin(ModuleMixin):
     def generate(
         self,
         conversation_list: Optional[list[ConversationItem]] = None,
+        generation_kwargs: Optional[Dict[str, Any]] = None,
         **kwargs: Any,
     ) -> Dict[str, Any]:
         del kwargs
         if conversation_list is None:
             raise ValueError("BagelQwen2MoT.generate requires conversation_list.")
+        image_gen_item = self._ready_image_gen_item(conversation_list)
+        if image_gen_item is not None:
+            return self._decode_image_flow(image_gen_item, conversation_list)
+
+        if self._is_image_generation_request(conversation_list, generation_kwargs):
+            if self._past_key_values is None:
+                self._prefill_prompt(conversation_list)
+            return {
+                "conversation_list": conversation_list,
+                "past_key_values": self._past_key_values,
+                "key_values_lens": None if self._key_values_lens is None else self._key_values_lens.detach(),
+            }
+
         if not conversation_list or conversation_list[-1].type != "output":
             raise ValueError(
                 "BagelQwen2MoT.generate expects an output start/generated token at the conversation tail."
@@ -109,6 +123,60 @@ class BagelQwen2MoTModuleMixin(ModuleMixin):
 
         if not saw_prompt:
             raise ValueError("BAGEL qwen2_mot prompt prefill found no tensor prompt segments.")
+
+    def _decode_image_flow(
+        self,
+        item: ConversationItem,
+        conversation_list: list[ConversationItem],
+    ) -> Dict[str, Any]:
+        packed_query_sequence = item.value
+        if not torch.is_tensor(packed_query_sequence):
+            raise ValueError("BAGEL image generation flow item requires a packed sequence tensor.")
+        if packed_query_sequence.dim() == 3 and packed_query_sequence.size(0) == 1:
+            packed_query_sequence = packed_query_sequence.squeeze(0)
+        packed_query_sequence = packed_query_sequence.to(device=self.device, dtype=self.dtype)
+
+        query_lens = self._item_meta_tensor(item, "query_lens", int(packed_query_sequence.shape[0]), dtype=torch.int32)
+        position_ids = self._prompt_meta_tensor(item, ("position_ids",), None, dtype=torch.long)
+        if position_ids is None:
+            raise ValueError("BAGEL image generation flow item requires position_ids metadata.")
+        query_indexes = self._prompt_meta_tensor(item, ("sequence_indexes",), None, dtype=torch.long)
+        if query_indexes is None:
+            raise ValueError("BAGEL image generation flow item requires sequence_indexes metadata.")
+        key_values_lens = self._prompt_meta_tensor(item, ("key_value_lens",), None, dtype=torch.int32)
+        if key_values_lens is None:
+            if self._key_values_lens is None:
+                raise ValueError("BAGEL image generation flow requires prompt key_values_lens.")
+            key_values_lens = self._key_values_lens.to(device=self.device, dtype=torch.int32)
+        key_value_indexes = self._prompt_meta_tensor(item, ("context_indexes",), [], dtype=torch.long)
+        vae_token_indexes = self._prompt_meta_tensor(item, ("vae_token_indexes",), None, dtype=torch.long)
+        text_indexes = self._prompt_meta_tensor(item, ("text_indexes",), None, dtype=torch.long)
+        if vae_token_indexes is None or text_indexes is None:
+            raise ValueError("BAGEL image generation flow item requires VAE and text token indexes.")
+
+        outputs = self._forward_packed_inference(
+            packed_query_sequence=packed_query_sequence,
+            query_lens=query_lens,
+            packed_query_position_ids=position_ids,
+            packed_query_indexes=query_indexes,
+            past_key_values=self._past_key_values,
+            key_values_lens=key_values_lens,
+            packed_key_value_indexes=key_value_indexes,
+            update_past_key_values=False,
+            is_causal=False,
+            mode="gen",
+            packed_vae_token_indexes=vae_token_indexes,
+            packed_text_indexes=text_indexes,
+        )
+        hidden_states = outputs.packed_query_sequence
+        item.value = hidden_states
+        item.meta["flow_hidden_ready"] = True
+        return {
+            "conversation_list": conversation_list,
+            "bagel_last_hidden_state": hidden_states.detach(),
+            "past_key_values": self._past_key_values,
+            "key_values_lens": None if self._key_values_lens is None else self._key_values_lens.detach(),
+        }
 
     def _decode_tail(self, tail: ConversationItem) -> torch.Tensor:
         packed_query_sequence = tail.value
@@ -191,6 +259,8 @@ class BagelQwen2MoTModuleMixin(ModuleMixin):
     def _prompt_item_value(self, item: ConversationItem) -> Optional[torch.Tensor]:
         if is_dummy(item) or item.type == "output":
             return None
+        if item.meta.get("bagel_role") == "image_gen_latent":
+            return None
         value = item.value
         if not torch.is_tensor(value):
             return None
@@ -217,6 +287,21 @@ class BagelQwen2MoTModuleMixin(ModuleMixin):
         if default is None:
             return None
         return torch.tensor(default, device=self.device, dtype=dtype)
+
+    def _is_image_generation_request(
+        self,
+        conversation_list: list[ConversationItem],
+        generation_kwargs: Optional[Dict[str, Any]],
+    ) -> bool:
+        if generation_kwargs and generation_kwargs.get("infer_mode") == "gen":
+            return True
+        return any(item.meta.get("bagel_role") == "image_gen_latent" for item in conversation_list)
+
+    def _ready_image_gen_item(self, conversation_list: list[ConversationItem]) -> Optional[ConversationItem]:
+        for item in conversation_list:
+            if item.meta.get("bagel_role") == "image_gen_latent" and item.meta.get("flow_packed_sequence_ready"):
+                return item
+        return None
 
     def _item_meta_tensor(
         self,
