@@ -7,6 +7,7 @@ import re
 import pytest
 
 from veomni.models.seed_omni import EdgeDef, NodeDef
+from veomni.models.seed_omni.generation_graph import GenerationGraph
 from veomni.models.seed_omni.graph import END
 from veomni.models.seed_omni.training_graph import TrainingGraph
 
@@ -397,6 +398,33 @@ def test_to_mermaid_always_draws_data_pseudo_node():
     assert "losses" not in out
     assert "vision_encoder" in out
     assert "end_sink" in out
+
+
+def test_generation_graph_mermaid_stacks_state_body_nodes():
+    nodes = {
+        "encode": {"module": "encoder"},
+        "decode": {"module": "decoder"},
+    }
+    edges = {"encode_to_decode": {"from": "encode", "to": "decode"}}
+    g = GenerationGraph(
+        {
+            "initial": "prompt",
+            "states": {
+                "prompt": {
+                    "body": ["encode_to_decode"],
+                    "transitions": [{"condition": {"type": "default"}, "next_state": "done"}],
+                }
+            },
+        },
+        nodes,
+        edges,
+    )
+
+    out = g.to_mermaid(title="Compact FSM")
+
+    assert "flowchart LR" in out
+    assert "subgraph state_prompt [prompt]\n        direction TB" in out
+    assert "prompt__encode --> prompt__decode" in out
 
 
 # ── input_ids sequence helpers (HF generate alignment) ───────────────────────
