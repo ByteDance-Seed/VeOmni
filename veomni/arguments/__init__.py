@@ -31,4 +31,11 @@ from .arguments_types import (
     VeOmniArguments,
     WandbConfig,
 )
+from .arguments_types_omni import (
+    OmniArguments,
+    OmniInferArguments,
+    OmniModelArguments,
+    OmniTrainingArguments,
+)
+from .omni_parser import parse_omni_args
 from .parser import parse_args, save_args

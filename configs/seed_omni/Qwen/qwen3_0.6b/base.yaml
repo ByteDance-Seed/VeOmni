@@ -1,11 +1,23 @@
-# Compatibility launcher for BAGEL-7B-MoT.
+# VeOmni training / inference config for OmniModel V2 — Qwen3-0.6B.
 #
-# Prefer configs/seed_omni/Bagel/bagel_7b_mot/base.yaml for new work.
+# Launch training:
+#   bash train.sh tasks/omni/train_omni.py configs/seed_omni/Qwen/qwen3_0.6b/base.yaml
+#
+# Launch inference (text-only chat):
+#   python tasks/omni/infer_omni.py configs/seed_omni/Qwen/qwen3_0.6b/base.yaml \
+#     --infer.infer_type infer_text \
+#     --infer.prompt "What is 2+2?" \
+#     --infer.output_dir qwen3_out
+#
+# Prerequisite — split the upstream Qwen3 checkpoint:
+#   python scripts/convert_model.py \
+#     --model_path /mnt/hdfs/veomni/models/transformers/Qwen/Qwen3-0.6B \
+#     --output_dir /mnt/hdfs/veomni/models/seed_omni/Qwen3-0.6B
 
 model:
-  model_path: /mnt/hdfs/shizhelun/veomni_omni/models/seed_omni/BAGEL-7B-MoT
-  modules: configs/seed_omni/Bagel/bagel_7b_mot/modules_train.yaml
-  train_graph: configs/seed_omni/Bagel/bagel_7b_mot/graph_train.yaml
+  model_path: /mnt/hdfs/veomni/models/seed_omni/Qwen3-0.6B
+  modules: configs/seed_omni/Qwen/qwen3_0.6b/modules_train.yaml
+  train_graph: configs/seed_omni/Qwen/qwen3_0.6b/graph_train.yaml
   ops_implementation:
     attn_implementation: flash_attention_2
 
@@ -29,9 +41,10 @@ accelerator:
 data:
   data_type: seedomni
   max_seq_len: 4096
-  train_path: /mnt/hdfs/shizhelun/veomni_omni/data
-  datasets_type: mapping
-  chat_template: default
+  train_path: configs/seed_omni/Qwen/data.yaml
+  datasets_type: iterable
+  multisource_datasets_type: veomni_weighted_multisource
+  train_sample: 1000000
   dataloader:
     type: native
     num_workers: 4
@@ -65,26 +78,21 @@ train:
     no_decay_modules: []
 
   checkpoint:
-    output_dir: outputs/bagel_7b_mot_omni_sft
+    output_dir: outputs/qwen3_0.6b_omni_sft
     save_steps: 500
     save_epochs: 0
     save_hf_weights: true
     hf_save_steps: 500
     hf_save_epochs: 0
-
   wandb:
     enable: true
     project: VeOmni_omni
-    name: bagel_7b_mot_omni_sft
+    name: qwen3_0.6b_omni_sft
 
 infer:
-  model_path: /mnt/hdfs/shizhelun/veomni_omni/models/seed_omni/BAGEL-7B-MoT
-  modules: configs/seed_omni/Bagel/bagel_7b_mot/modules_infer.yaml
   infer_graph:
-    infer_gen: configs/seed_omni/Bagel/bagel_7b_mot/graph_infer_gen.yaml
-    infer_interleave: configs/seed_omni/Bagel/bagel_7b_mot/graph_infer_interleave.yaml
-    infer_und: configs/seed_omni/Bagel/bagel_7b_mot/graph_infer_und.yaml
-  infer_type: infer_und
+    infer_text: configs/seed_omni/Qwen/qwen3_0.6b/graph_infer.yaml
+  infer_type: infer_text
   generation_kwargs:
     max_new_tokens: 2048
     temperature: 0.0

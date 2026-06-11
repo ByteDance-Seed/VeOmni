@@ -1,5 +1,4 @@
 # Qwen3-0.6B inference — text-only chat generation.
-
 generation_graph:
   initial: text_ar
 
@@ -14,9 +13,3 @@ generation_graph:
         - { from: qwen3_text_encoder, to: end }
       transitions:
         - { condition: { type: module_signal, key: text_done }, next_state: done }
-
-generation_kwargs:
-  max_new_tokens: 2048
-  temperature: 0.0
-  top_p: 1.0
-  do_sample: false

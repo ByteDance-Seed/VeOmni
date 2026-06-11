@@ -24,24 +24,18 @@ overrides deep-merged into ``train.yaml``.
 from __future__ import annotations
 
 import os
-from copy import deepcopy
-from dataclasses import asdict, dataclass, field, fields
-from typing import TYPE_CHECKING, Any
+from dataclasses import dataclass, field
+from typing import Any
 
 import torch
 
-from ..arguments import DataArguments, TrainingArguments, VeOmniArguments
-from ..arguments.arguments_types import ModelArguments
+from ..arguments import OmniArguments, VeOmniArguments
 from ..data.multimodal.image_utils import load_image
 from ..models.seed_omni import build_conversation
 from ..models.seed_omni.modeling_omni import OmniModel
 from ..utils import helper
 from .base import BaseTrainer
-from .omni_trainer import OmniModelArguments, OmniModuleTrainer, OmniTrainer
-
-
-if TYPE_CHECKING:
-    from ..models.seed_omni.configuration_omni import OmniConfig
+from .omni_trainer import OmniModuleTrainer, OmniTrainer
 
 
 logger = helper.create_logger(__name__)
@@ -108,141 +102,6 @@ class OmniModuleInferencer(OmniModuleTrainer):
 
 
 @dataclass
-class OmniInferModelArguments(OmniModelArguments):
-    """``model.*`` for SeedOmni V2 inference — extends :class:`OmniModelArguments`."""
-
-    omni_infer_yaml_path: dict[str, str] | None = field(
-        default_factory=dict,
-        metadata={
-            "help": (
-                "Mapping of inference scenario name → inference YAML path.  "
-                "The selected scenario's YAML overlays ``omni_train_yaml_path`` "
-                "at runtime (``generation_graph`` via flat dict.update; "
-                "``modules`` deep-merged per module name for per-module "
-                "inference load overrides).  Example keys: infer_gen / infer_und / "
-                "infer_interleave."
-            )
-        },
-    )
-    omni_infer_type: str | None = field(
-        default=None,
-        metadata={"help": "Active inference scenario key into omni_infer_yaml_path (inference only)."},
-    )
-
-    def load_omni_config(self, global_args: VeOmniArguments) -> OmniConfig:
-        from ..models.seed_omni.configuration_omni import OmniConfig
-
-        infer_map = self.omni_infer_yaml_path
-        selected = self.omni_infer_type
-        if selected is not None:
-            if selected not in infer_map:
-                known = ", ".join(sorted(infer_map)) or "(none)"
-                raise KeyError(f"Unknown omni_infer_type {selected!r}; expected one of: {known}.")
-            infer_yaml_path = infer_map[selected]
-        else:
-            selected = next(iter(infer_map))
-            self.omni_infer_type = selected
-            infer_yaml_path = infer_map[selected]
-
-        return OmniConfig._init(
-            global_args=global_args,
-            model_path=self.model_path,
-            train_yaml_path=self.omni_train_yaml_path,
-            infer_yaml_path=infer_yaml_path,
-        )
-
-
-@dataclass
-class GenerationKwargsArguments:
-    """``generation_kwargs.*`` — per-invocation generation knobs for ``infer_omni``."""
-
-    max_new_tokens: int = field(
-        default=2048,
-        metadata={"help": "Maximum number of new tokens to generate."},
-    )
-    temperature: float = field(
-        default=0.0,
-        metadata={"help": "Temperature for sampling."},
-    )
-    top_p: float = field(
-        default=1.0,
-        metadata={"help": "Top-p for sampling."},
-    )
-    do_sample: bool = field(
-        default=False,
-        metadata={"help": "Whether to sample."},
-    )
-    guidance_scale: float = field(
-        default=1.0,
-        metadata={"help": "Guidance scale for sampling."},
-    )
-
-
-@dataclass
-class OmniInferArguments:
-    """``infer.*`` — per-invocation inference knobs for ``infer_omni``."""
-
-    model_path: str = field(
-        metadata={"help": "Local path/HDFS path to the pre-trained model."},
-    )
-    prompt: str = field(
-        default="",
-        metadata={"help": "User text prompt (required; non-empty)."},
-    )
-    image: str | None = field(
-        default=None,
-        metadata={"help": "Optional path or http(s) URL to an image.  Omit for text-to-image generation."},
-    )
-    output_dir: str = field(
-        default="output",
-        metadata={
-            "help": (
-                "Root output directory.  ``OmniInferenceArguments.__post_init__`` nests artefacts "
-                "under ``<output_dir>/<omni_infer_type>/``."
-            )
-        },
-    )
-    seed: int = field(
-        default=42,
-        metadata={"help": "Random seed."},
-    )
-    generation_kwargs: GenerationKwargsArguments | dict[str, Any] | None = field(
-        default_factory=GenerationKwargsArguments,
-        metadata={"help": "Generation kwargs."},
-    )
-
-    def __post_init__(self):
-        assert self.prompt, "--infer.prompt is required (use a non-empty string)."
-
-
-@dataclass
-class OmniInferenceArguments:
-    """Root config for SeedOmni V2 inference — consumed by :func:`parse_args`."""
-
-    model: OmniInferModelArguments = field(default_factory=OmniInferModelArguments)
-    data: DataArguments = field(default_factory=DataArguments)
-    train: TrainingArguments = field(default_factory=TrainingArguments)
-    # train offload config / fsdp config / parallel config could be used for inference
-    infer: OmniInferArguments = field(default_factory=OmniInferArguments)
-
-    def __post_init__(self):
-        self.model.model_path = self.infer.model_path
-        self.infer.output_dir = os.path.join(self.infer.output_dir, self.model.omni_infer_type)
-        logger.info_rank0(f"OmniInferencer: model_path = {self.model.model_path}")
-        logger.info_rank0(f"OmniInferencer: scenario = {self.model.omni_infer_type}")
-        logger.info_rank0(f"OmniInferencer: output_dir = {self.infer.output_dir}")
-
-    def _to_base_args(self) -> VeOmniArguments:
-        omni_model = self.model
-        model_kwargs = {f.name: getattr(omni_model, f.name) for f in fields(ModelArguments)}
-        return VeOmniArguments(
-            model=ModelArguments(**model_kwargs),
-            data=self.data,
-            train=self.train,
-        )
-
-
-@dataclass
 class InferenceRequest:
     """A single inference call."""
 
@@ -256,12 +115,19 @@ class OmniInferencer(OmniTrainer):
 
     module_inferencers: dict[str, OmniModuleInferencer]
 
-    def __init__(self, args: OmniInferenceArguments):
+    def __init__(self, args: OmniArguments):
         self.base = BaseTrainer.__new__(BaseTrainer)
         self.base.args = args
 
         helper.set_seed(args.infer.seed)
         self._build_model()
+
+        # Nest artefacts under <output_dir>/<infer_type>/ (infer_type is resolved
+        # during load_omni_infer_config when left unset).
+        args.infer.output_dir = os.path.join(args.infer.output_dir, args.infer.infer_type)
+        logger.info_rank0(f"OmniInferencer: model_path = {args.infer.model_path or args.model.model_path}")
+        logger.info_rank0(f"OmniInferencer: scenario = {args.infer.infer_type}")
+        logger.info_rank0(f"OmniInferencer: output_dir = {args.infer.output_dir}")
 
     @property
     def model(self) -> OmniModel:
@@ -272,20 +138,16 @@ class OmniInferencer(OmniTrainer):
         return self.base.model.modules_dict
 
     @property
-    def args(self) -> OmniInferenceArguments:
+    def args(self) -> OmniArguments:
         return self.base.args
 
     def _build_model(self) -> None:
         base = self.base
-        args: OmniInferenceArguments = base.args
-        self.omni_config = args.model.load_omni_config(args._to_base_args())
+        args: OmniArguments = base.args
+        self.omni_config = args.load_omni_infer_config()
 
         if not self.omni_config.has_generation_graph():
-            raise ValueError("OmniConfig has no generation_graph — inference requires an infer YAML scenario.")
-
-        default_generation_kwargs = deepcopy(self.omni_config.generation_kwargs)
-        default_generation_kwargs.update(asdict(args.infer.generation_kwargs))
-        args.infer.generation_kwargs = default_generation_kwargs
+            raise ValueError("OmniConfig has no generation_graph — inference requires an infer graph scenario.")
 
         self.module_names = self.omni_config.module_names
         self.module_inferencers: dict[str, OmniModuleInferencer] = {}
@@ -312,6 +174,7 @@ class OmniInferencer(OmniTrainer):
     def generate(self) -> dict[str, Any]:
         """Run one inference request end-to-end (FSM + save outputs)."""
         infer_args = self.args.infer
+        assert infer_args.prompt, "--infer.prompt is required (use a non-empty string)."
         request = InferenceRequest(
             prompt=infer_args.prompt,
             images=[load_image(infer_args.image)] if infer_args.image else [],
@@ -398,8 +261,4 @@ __all__ = [
     "OmniInferencer",
     "OmniModuleInferencer",
     "InferenceRequest",
-    "GenerationKwargsArguments",
-    "OmniInferArguments",
-    "OmniInferModelArguments",
-    "OmniInferenceArguments",
 ]

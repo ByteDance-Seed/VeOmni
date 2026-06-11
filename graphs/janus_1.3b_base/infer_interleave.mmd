@@ -1,5 +1,5 @@
 ---
-title: veomni_janus — infer_gen
+title: janus_1.3b_base — infer_interleave
 ---
 %%{init: {'flowchart': {'defaultRenderer': 'elk'}}}%%
 flowchart LR
@@ -12,27 +12,35 @@ flowchart LR
         prompt_encode__janus_text_encoder_generate["<i>janus_text_encoder.generate</i>"]:::body_node
         prompt_encode__janus_siglip_generate --> prompt_encode__janus_llama_generate
         prompt_encode__janus_text_encoder_generate --> prompt_encode__janus_llama_generate
+        prompt_encode__janus_llama_generate --> prompt_encode__janus_text_encoder_generate
     end
-    subgraph state_image_vq_start [image_vq_start]
+    subgraph state_text_ar [text_ar]
         direction TB
-        image_vq_start__janus_text_encoder_emit_image_start["<i>janus_text_encoder.emit_image_start</i>"]:::body_node
+        text_ar__janus_llama_generate["<i>janus_llama.generate</i>"]:::body_node
+        text_ar__janus_text_encoder_generate["<i>janus_text_encoder.generate</i>"]:::body_node
+        text_ar__janus_llama_generate --> text_ar__janus_text_encoder_generate
     end
     subgraph state_image_vq [image_vq]
         direction TB
-        image_vq__janus_llama_generate["<i>janus_llama.generate</i>"]:::body_node
         image_vq__janus_vqvae_generate["<i>janus_vqvae.generate</i>"]:::body_node
-        image_vq__janus_llama_generate --> image_vq__janus_vqvae_generate
+        image_vq__janus_llama_generate["<i>janus_llama.generate</i>"]:::body_node
         image_vq__janus_vqvae_generate --> image_vq__janus_llama_generate
+        image_vq__janus_llama_generate --> image_vq__janus_vqvae_generate
     end
     subgraph state_image_vq_end [image_vq_end]
         direction TB
         image_vq_end__janus_text_encoder_emit_image_end["<i>janus_text_encoder.emit_image_end</i>"]:::body_node
+        image_vq_end__janus_llama_generate["<i>janus_llama.generate</i>"]:::body_node
+        image_vq_end__janus_text_encoder_emit_image_end --> image_vq_end__janus_llama_generate
     end
     fsm_start ==> state_prompt_encode
-    state_prompt_encode ==>|"default"| state_image_vq_start
-    state_image_vq_start ==>|"default"| state_image_vq
+    state_prompt_encode ==>|"module_signal(start_image_gen)"| state_image_vq
+    state_prompt_encode ==>|"module_signal(text_done)"| fsm_done
+    state_prompt_encode ==>|"default"| state_text_ar
+    state_text_ar ==>|"module_signal(start_image_gen)"| state_image_vq
+    state_text_ar ==>|"module_signal(text_done)"| fsm_done
     state_image_vq ==>|"module_signal(image_complete)"| state_image_vq_end
-    state_image_vq_end ==>|"default"| fsm_done
+    state_image_vq_end ==>|"default"| state_text_ar
     classDef body_node fill:#fff,stroke:#666
     classDef fsm_start fill:#dff,stroke:#06c,stroke-width:2px
     classDef fsm_terminal fill:#eee,stroke:#333,stroke-width:1px,stroke-dasharray:3 3

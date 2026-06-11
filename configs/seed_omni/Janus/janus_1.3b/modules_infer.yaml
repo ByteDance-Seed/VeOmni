@@ -1,0 +1,19 @@
+janus_siglip:
+  model:
+    model_path: janus_siglip
+
+  accelerator:
+    fsdp_config:
+      fsdp_mode: eager
+
+janus_vqvae:
+  model:
+    model_path: janus_vqvae
+
+janus_text_encoder:
+  model:
+    model_path: janus_text_encoder
+
+janus_llama:
+  model:
+    model_path: janus_llama

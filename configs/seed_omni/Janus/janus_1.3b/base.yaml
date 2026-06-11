@@ -1,7 +1,7 @@
 # Janus-1.3B SeedOmni V2 training launcher.
 #
 # Launch:
-#   bash train.sh tasks/omni/train_omni.py configs/seed_omni/janus_1.3b/veomni_janus.yaml
+#   bash train.sh tasks/omni/train_omni.py configs/seed_omni/Janus/janus_1.3b/base.yaml
 #
 # Prerequisites:
 #   python scripts/convert_model.py \
@@ -12,20 +12,33 @@
 
 model:
   model_path: /mnt/hdfs/user_dir/veomni_omni/models/seed_omni/Janus-1.3B
-  omni_train_yaml_path: configs/seed_omni/janus_1.3b/train.yaml
-  omni_infer_yaml_path:
-    infer_gen: configs/seed_omni/janus_1.3b/infer_gen.yaml
-    infer_und: configs/seed_omni/janus_1.3b/infer_und.yaml
-    infer_interleave: configs/seed_omni/janus_1.3b/infer_interleave.yaml
-  omni_infer_type: infer_interleave
-  model_config: {}
+  modules: configs/seed_omni/Janus/janus_1.3b/modules_train.yaml
+  train_graph: configs/seed_omni/Janus/janus_1.3b/graph_train.yaml
   ops_implementation:
     attn_implementation: flash_attention_2
+
+accelerator:
+  fsdp_config:
+    fsdp_mode: fsdp2
+    full_shard: true
+    reshard_after_forward: true
+    reshard_after_backward: true
+    forward_prefetch: true
+    offload: false
+    max_load_broadcast_size: 20.0
+    mixed_precision:
+      enable: true
+      param_dtype: bfloat16
+      reduce_dtype: float32
+  offload_config:
+    enable_activation: false
+    activation_gpu_limit: 0.0
+
 
 data:
   data_type: seedomni
   max_seq_len: 4096
-  train_path: configs/seed_omni/janus_1.3b/data.yaml
+  train_path: configs/seed_omni/Janus/data.yaml
   # Streaming + VeOmni weighted multisource: no HF schema merge across sources.
   datasets_type: iterable
   multisource_datasets_type: veomni_weighted_multisource
@@ -38,6 +51,7 @@ data:
     pin_memory: true
     prefetch_factor: 2
 
+
 train:
   seed: 42
   num_train_epochs: 1
@@ -45,23 +59,6 @@ train:
   micro_batch_size: 1
   init_device: meta
   dyn_bsz: false
-
-  accelerator:
-    fsdp_config:
-      fsdp_mode: fsdp2
-      full_shard: true
-      reshard_after_forward: true
-      reshard_after_backward: true
-      forward_prefetch: true
-      offload: false
-      max_load_broadcast_size: 20.0
-      mixed_precision:
-        enable: true
-        param_dtype: bfloat16
-        reduce_dtype: float32
-    offload_config:
-      enable_activation: false
-      activation_gpu_limit: 0.0
 
   gradient_checkpointing:
     enable: true
@@ -91,3 +88,18 @@ train:
     enable: true
     project: VeOmni_omni
     name: janus_1.3b_omni_sft
+
+infer:
+  model_path: /mnt/hdfs/user_dir/veomni_omni/models/seed_omni/Janus-1.3B
+  modules: configs/seed_omni/Janus/janus_1.3b/modules_infer.yaml
+  infer_graph:
+    infer_gen: configs/seed_omni/Janus/janus_1.3b/graph_infer_gen.yaml
+    infer_und: configs/seed_omni/Janus/janus_1.3b/graph_infer_und.yaml
+    infer_interleave: configs/seed_omni/Janus/janus_1.3b/graph_infer_interleave.yaml
+  infer_type: infer_interleave
+  generation_kwargs:
+    max_new_tokens: 2048
+    temperature: 0.0
+    top_p: 1.0
+    do_sample: False
+    guidance_scale: 5.0

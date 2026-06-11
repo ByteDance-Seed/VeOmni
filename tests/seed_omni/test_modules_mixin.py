@@ -9,6 +9,7 @@ import torch
 import torch.nn as nn
 from PIL import Image
 
+from veomni.arguments import OmniArguments, OmniModelArguments
 from veomni.arguments.arguments_types import DataArguments
 from veomni.models.seed_omni import (
     OMNI_MODEL_REGISTRY,
@@ -20,7 +21,6 @@ from veomni.models.seed_omni.conversation import ConversationItem
 from veomni.models.seed_omni.generation_graph import FSM_SIGNAL_KEY
 from veomni.models.seed_omni.modeling_omni import OmniModel
 from veomni.models.seed_omni.modules import OMNI_CONFIG_REGISTRY
-from veomni.trainer.omni_trainer import OmniModelArguments, VeOmniOmniArguments
 
 
 def _config_cls(model_type: str):
@@ -34,19 +34,29 @@ def _model_cls(model_type: str):
 def _load_omni_config(
     *,
     model_path: str = "",
-    train_yaml_path: Path,
-    infer_yaml_path: Path | None = None,
+    modules_path: Path,
+    train_graph_path: Path | None = None,
+    infer_modules: dict | None = None,
+    infer_graph_path: Path | None = None,
+    generation_kwargs: dict | None = None,
 ) -> OmniConfig:
-    model_args = OmniModelArguments(model_path=model_path, config_path=model_path or ".")
-    global_args = VeOmniOmniArguments(
+    model_args = OmniModelArguments(
+        model_path=model_path or ".",
+        config_path=model_path or ".",
+        modules=str(modules_path),
+    )
+    base = OmniArguments(
         model=model_args,
         data=DataArguments(train_path=""),
     )._to_base_args()
-    return OmniConfig._init(
-        global_args=global_args,
-        model_path=global_args.model.model_path,
-        train_yaml_path=train_yaml_path,
-        infer_yaml_path=infer_yaml_path,
+    return OmniConfig.from_omni_args(
+        global_args=base,
+        model_path=model_path,
+        modules=str(modules_path),
+        train_graph=str(train_graph_path) if train_graph_path else None,
+        infer_modules=infer_modules,
+        infer_graph=str(infer_graph_path) if infer_graph_path else None,
+        generation_kwargs=generation_kwargs,
     )
 
 
@@ -399,11 +409,14 @@ def test_fsdp_no_split_modules_preserved():
 
 
 def _janus_cfg_dir() -> Path:
-    return Path(__file__).resolve().parents[2] / "configs" / "seed_omni" / "janus_1.3b"
+    return Path(__file__).resolve().parents[2] / "configs" / "seed_omni" / "Janus" / "janus_1.3b"
 
 
 def test_janus_train_yaml_loads_with_v2_module_names():
-    cfg = _load_omni_config(train_yaml_path=_janus_cfg_dir() / "train.yaml")
+    cfg = _load_omni_config(
+        modules_path=_janus_cfg_dir() / "modules_train.yaml",
+        train_graph_path=_janus_cfg_dir() / "graph_train.yaml",
+    )
 
     assert set(cfg.modules) == {"janus_siglip", "janus_vqvae", "janus_llama", "janus_text_encoder"}
     assert cfg.modules["janus_siglip"]["model"]["model_path"] == "janus_siglip"
@@ -419,11 +432,15 @@ def test_janus_train_yaml_loads_with_v2_module_names():
     assert not any("emit_image" in e["from"] or "emit_image" in e["to"] for e in cfg.training_graph)
 
 
-@pytest.mark.parametrize("infer_yaml", ["infer_interleave.yaml", "infer_gen.yaml", "infer_und.yaml"])
-def test_janus_train_plus_infer_merges_generation_graph(infer_yaml: str):
+@pytest.mark.parametrize(
+    "infer_graph", ["graph_infer_interleave.yaml", "graph_infer_gen.yaml", "graph_infer_und.yaml"]
+)
+def test_janus_train_plus_infer_merges_generation_graph(infer_graph: str):
     cfg = _load_omni_config(
-        train_yaml_path=_janus_cfg_dir() / "train.yaml",
-        infer_yaml_path=_janus_cfg_dir() / infer_yaml,
+        modules_path=_janus_cfg_dir() / "modules_train.yaml",
+        train_graph_path=_janus_cfg_dir() / "graph_train.yaml",
+        infer_modules=_janus_cfg_dir() / "modules_infer.yaml",
+        infer_graph_path=_janus_cfg_dir() / infer_graph,
     )
     # Training vocabulary still present.
     assert set(cfg.modules) == {"janus_siglip", "janus_vqvae", "janus_llama", "janus_text_encoder"}
@@ -432,7 +449,7 @@ def test_janus_train_plus_infer_merges_generation_graph(infer_yaml: str):
     assert "states" in cfg.generation_graph
     # `done` is framework-injected — must NOT be authored in YAML.
     assert "done" not in cfg.generation_graph["states"], (
-        f"`done` should be auto-injected by GenerationGraph, not declared in {infer_yaml}. "
+        f"`done` should be auto-injected by GenerationGraph, not declared in {infer_graph}. "
         "Remove the `done:` block from the inference YAML."
     )
     assert "done_state" not in cfg.generation_graph, (
@@ -444,7 +461,7 @@ def test_janus_train_plus_infer_merges_generation_graph(infer_yaml: str):
         t.get("next_state") == "done"
         for state in cfg.generation_graph["states"].values()
         for t in state.get("transitions", [])
-    ), f"{infer_yaml} has no transition to `done` — the FSM cannot terminate."
+    ), f"{infer_graph} has no transition to `done` — the FSM cannot terminate."
     # Each inference body is a list of inline `{from, to}` edge dicts.
     for state_name, state in cfg.generation_graph["states"].items():
         for e in state.get("body", []):
@@ -454,39 +471,25 @@ def test_janus_train_plus_infer_merges_generation_graph(infer_yaml: str):
 
 
 def test_init_deep_merges_infer_module_overrides():
-    """Infer YAML ``modules:`` patches train YAML per module."""
-    import tempfile
-
-    import yaml
-
-    train_yaml = _janus_cfg_dir() / "train.yaml"
-    infer_yaml = _janus_cfg_dir() / "infer_gen.yaml"
-    with open(infer_yaml, encoding="utf-8") as f:
-        infer_cfg = yaml.safe_load(f)
-    infer_cfg["modules"] = {
+    """Infer module overrides patch the training modules per module name."""
+    infer_modules = {
         "janus_siglip": {
-            "train": {
-                "accelerator": {"fsdp_config": {"fsdp_mode": "fsdp2", "full_shard": False}},
-            },
+            "accelerator": {"fsdp_config": {"fsdp_mode": "fsdp2", "full_shard": False}},
             "model": {"model_config": {"freeze": True}},
         }
     }
 
-    with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as tmp:
-        yaml.safe_dump(infer_cfg, tmp)
-        patched_infer = tmp.name
-
-    try:
-        cfg = _load_omni_config(
-            model_path="/tmp/janus",
-            train_yaml_path=train_yaml,
-            infer_yaml_path=Path(patched_infer),
-        )
-    finally:
-        Path(patched_infer).unlink(missing_ok=True)
+    cfg = _load_omni_config(
+        model_path="/tmp/janus",
+        modules_path=_janus_cfg_dir() / "modules_train.yaml",
+        train_graph_path=_janus_cfg_dir() / "graph_train.yaml",
+        infer_modules=infer_modules,
+        infer_graph_path=_janus_cfg_dir() / "graph_infer_gen.yaml",
+    )
 
     siglip = cfg.modules["janus_siglip"]
     assert siglip["model"]["model_path"] == "/tmp/janus/janus_siglip"
+    # Top-level per-module `accelerator` is lifted under `train.accelerator`.
     assert siglip["train"]["accelerator"]["fsdp_config"]["fsdp_mode"] == "fsdp2"
     assert siglip["train"]["accelerator"]["fsdp_config"]["full_shard"] is False
     assert siglip["model"]["model_config"]["freeze"] is True
@@ -498,8 +501,10 @@ def test_init_resolves_relative_module_paths():
     root = "seed_omni/janus_1.3b"
     cfg = _load_omni_config(
         model_path=root,
-        train_yaml_path=_janus_cfg_dir() / "train.yaml",
-        infer_yaml_path=_janus_cfg_dir() / "infer_gen.yaml",
+        modules_path=_janus_cfg_dir() / "modules_train.yaml",
+        train_graph_path=_janus_cfg_dir() / "graph_train.yaml",
+        infer_modules=_janus_cfg_dir() / "modules_infer.yaml",
+        infer_graph_path=_janus_cfg_dir() / "graph_infer_gen.yaml",
     )
 
     assert cfg.modules["janus_siglip"]["model"]["model_path"] == f"{root}/janus_siglip"
@@ -509,11 +514,14 @@ def test_init_resolves_relative_module_paths():
 
 
 def _qwen3_cfg_dir() -> Path:
-    return Path(__file__).resolve().parents[2] / "configs" / "seed_omni" / "qwen3_0.6b"
+    return Path(__file__).resolve().parents[2] / "configs" / "seed_omni" / "Qwen" / "qwen3_0.6b"
 
 
 def test_qwen3_train_yaml_loads_with_v2_module_names():
-    cfg = _load_omni_config(train_yaml_path=_qwen3_cfg_dir() / "train.yaml")
+    cfg = _load_omni_config(
+        modules_path=_qwen3_cfg_dir() / "modules_train.yaml",
+        train_graph_path=_qwen3_cfg_dir() / "graph_train.yaml",
+    )
 
     assert set(cfg.modules) == {"qwen3_text_encoder", "qwen3_llm"}
     assert cfg.modules["qwen3_text_encoder"]["model"]["model_path"] == "qwen3_text_encoder"
@@ -524,8 +532,9 @@ def test_qwen3_train_yaml_loads_with_v2_module_names():
 
 def test_qwen3_train_plus_infer_merges_generation_graph():
     cfg = _load_omni_config(
-        train_yaml_path=_qwen3_cfg_dir() / "train.yaml",
-        infer_yaml_path=_qwen3_cfg_dir() / "infer_text.yaml",
+        modules_path=_qwen3_cfg_dir() / "modules_train.yaml",
+        train_graph_path=_qwen3_cfg_dir() / "graph_train.yaml",
+        infer_graph_path=_qwen3_cfg_dir() / "graph_infer.yaml",
     )
     assert set(cfg.modules) == {"qwen3_text_encoder", "qwen3_llm"}
     assert cfg.has_generation_graph()
@@ -534,11 +543,14 @@ def test_qwen3_train_plus_infer_merges_generation_graph():
 
 
 def _bagel_cfg_dir() -> Path:
-    return Path(__file__).resolve().parents[2] / "configs" / "seed_omni" / "bagel_7b_mot"
+    return Path(__file__).resolve().parents[2] / "configs" / "seed_omni" / "Bagel" / "bagel_7b_mot"
 
 
 def test_bagel_train_yaml_loads_with_v2_module_names():
-    cfg = _load_omni_config(train_yaml_path=_bagel_cfg_dir() / "train.yaml")
+    cfg = _load_omni_config(
+        modules_path=_bagel_cfg_dir() / "modules_train.yaml",
+        train_graph_path=_bagel_cfg_dir() / "graph_train.yaml",
+    )
 
     assert set(cfg.modules) == {
         "bagel_text_encoder",
@@ -558,11 +570,15 @@ def test_bagel_train_yaml_loads_with_v2_module_names():
     assert "end" in endpoints
 
 
-@pytest.mark.parametrize("infer_yaml", ["infer_und.yaml", "infer_gen.yaml", "infer_interleave.yaml"])
-def test_bagel_train_plus_infer_merges_generation_graph(infer_yaml: str):
+@pytest.mark.parametrize(
+    "infer_graph", ["graph_infer_und.yaml", "graph_infer_gen.yaml", "graph_infer_interleave.yaml"]
+)
+def test_bagel_train_plus_infer_merges_generation_graph(infer_graph: str):
     cfg = _load_omni_config(
-        train_yaml_path=_bagel_cfg_dir() / "train.yaml",
-        infer_yaml_path=_bagel_cfg_dir() / infer_yaml,
+        modules_path=_bagel_cfg_dir() / "modules_train.yaml",
+        train_graph_path=_bagel_cfg_dir() / "graph_train.yaml",
+        infer_modules=_bagel_cfg_dir() / "modules_infer.yaml",
+        infer_graph_path=_bagel_cfg_dir() / infer_graph,
     )
     assert set(cfg.modules) == {
         "bagel_text_encoder",
@@ -578,7 +594,7 @@ def test_bagel_train_plus_infer_merges_generation_graph(infer_yaml: str):
         t.get("next_state") == "done"
         for state in cfg.generation_graph["states"].values()
         for t in state.get("transitions", [])
-    ), f"{infer_yaml} has no transition to `done`."
+    ), f"{infer_graph} has no transition to `done`."
     for state_name, state in cfg.generation_graph["states"].items():
         for e in state.get("body", []):
             assert isinstance(e, dict) and "from" in e and "to" in e, (
@@ -744,8 +760,10 @@ def test_bagel_interleave_image_branch_signal_smoke():
         text_encoder.lm_head.weight[2, 1] = 1.0  # eos
 
     cfg = _load_omni_config(
-        train_yaml_path=_bagel_cfg_dir() / "train.yaml",
-        infer_yaml_path=_bagel_cfg_dir() / "infer_interleave.yaml",
+        modules_path=_bagel_cfg_dir() / "modules_train.yaml",
+        train_graph_path=_bagel_cfg_dir() / "graph_train.yaml",
+        infer_modules=_bagel_cfg_dir() / "modules_infer.yaml",
+        infer_graph_path=_bagel_cfg_dir() / "graph_infer_interleave.yaml",
     )
     model = OmniModel(
         cfg,

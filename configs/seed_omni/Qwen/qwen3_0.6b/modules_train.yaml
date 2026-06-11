@@ -1,0 +1,15 @@
+# Per-module training overrides for Qwen3-0.6B (OmniModel V2).
+#
+# Module names match the registered HF model_type strings. Relative
+# ``model.model_path`` joins ``model.model_path`` (split-checkpoint root) from
+# base.yaml. Modules without an ``accelerator`` block inherit the global
+# (fsdp2) accelerator from base.yaml.
+#
+# The LLM tokenizer lives in ``qwen3_text_encoder/`` (split checkpoint asset).
+qwen3_text_encoder:
+  model:
+    model_path: qwen3_text_encoder
+
+qwen3_llm:
+  model:
+    model_path: qwen3_llm

@@ -40,6 +40,10 @@ def _env_flag(suffix: str) -> bool:
     return value is not None and value.lower() in {"1", "true", "yes", "on"}
 
 
+def _bagel_cfg_dir() -> Path:
+    return Path(__file__).resolve().parents[2] / "configs" / "seed_omni" / "Bagel" / "bagel_7b_mot"
+
+
 pytestmark = pytest.mark.skipif(
     not _env_flag("ENABLE_PARITY_CHECK"),
     reason=f"Set {_env_name('ENABLE_PARITY_CHECK')}=1 to run BAGEL official parity checks.",
@@ -75,11 +79,10 @@ def test_bagel_text_graph_matches_official_fixture() -> None:
             "to run BAGEL text graph parity."
         )
 
-    repo_root = Path(__file__).resolve().parents[2]
     report = compare_text_graph(
         Path(fixture_path),
         Path(model_root),
-        config_dir=repo_root / "configs/seed_omni/bagel_7b_mot",
+        config_dir=_bagel_cfg_dir(),
     )
     assert report["all_pass"], report
 
@@ -93,11 +96,10 @@ def test_bagel_interleave_text_graph_matches_official_fixture() -> None:
             "to run BAGEL interleave text graph parity."
         )
 
-    repo_root = Path(__file__).resolve().parents[2]
     report = compare_text_graph(
         Path(fixture_path),
         Path(model_root),
-        config_dir=repo_root / "configs/seed_omni/bagel_7b_mot",
+        config_dir=_bagel_cfg_dir(),
         infer_yaml_name="infer_interleave.yaml",
     )
     assert report["all_pass"], report
@@ -123,11 +125,10 @@ def test_bagel_image_generation_graph_matches_official_fixture() -> None:
             "to run BAGEL image-generation graph parity."
         )
 
-    repo_root = Path(__file__).resolve().parents[2]
     report = compare_image_gen_graph(
         Path(fixture_path),
         Path(model_root),
-        config_dir=repo_root / "configs/seed_omni/bagel_7b_mot",
+        config_dir=_bagel_cfg_dir(),
     )
     assert report["all_pass"], report
 
@@ -141,11 +142,10 @@ def test_bagel_interleave_image_span_graph_matches_official_fixture() -> None:
             "to run BAGEL interleave image-span graph parity."
         )
 
-    repo_root = Path(__file__).resolve().parents[2]
     report = compare_image_gen_graph(
         Path(fixture_path),
         Path(model_root),
-        config_dir=repo_root / "configs/seed_omni/bagel_7b_mot",
+        config_dir=_bagel_cfg_dir(),
         infer_yaml_name="infer_interleave.yaml",
         generation_kwargs_override={"infer_mode": "gen"},
     )
@@ -170,11 +170,10 @@ def test_bagel_image_edit_vae_context_graph_matches_official_fixture() -> None:
             "to run BAGEL input-image VAE-context graph parity."
         )
 
-    repo_root = Path(__file__).resolve().parents[2]
     report = compare_image_edit_graph(
         Path(fixture_path),
         Path(model_root),
-        config_dir=repo_root / "configs/seed_omni/bagel_7b_mot",
+        config_dir=_bagel_cfg_dir(),
     )
     assert report["all_pass"], report
 
@@ -188,11 +187,10 @@ def test_bagel_image_generation_cfg_text_graph_matches_official_fixture() -> Non
             "to run BAGEL CFG-text image-generation graph parity."
         )
 
-    repo_root = Path(__file__).resolve().parents[2]
     report = compare_image_gen_graph(
         Path(fixture_path),
         Path(model_root),
-        config_dir=repo_root / "configs/seed_omni/bagel_7b_mot",
+        config_dir=_bagel_cfg_dir(),
     )
     assert report["all_pass"], report
 
@@ -207,11 +205,10 @@ def test_bagel_image_generation_cfg_text_full_loop_decode_smoke() -> None:
             f"{_env_name('IMAGE_GEN_CFG_TEXT_FULL_LOOP_STEPS')} to run BAGEL CFG-text full-loop decode smoke."
         )
 
-    repo_root = Path(__file__).resolve().parents[2]
     report = smoke_image_gen_full_loop_decode(
         Path(fixture_path),
         Path(model_root),
-        config_dir=repo_root / "configs/seed_omni/bagel_7b_mot",
+        config_dir=_bagel_cfg_dir(),
         max_flow_steps=int(max_flow_steps),
     )
     assert report["all_pass"], report
@@ -226,11 +223,10 @@ def test_bagel_image_generation_cfg_image_graph_matches_official_fixture() -> No
             "to run BAGEL CFG-image graph parity."
         )
 
-    repo_root = Path(__file__).resolve().parents[2]
     report = compare_image_gen_graph(
         Path(fixture_path),
         Path(model_root),
-        config_dir=repo_root / "configs/seed_omni/bagel_7b_mot",
+        config_dir=_bagel_cfg_dir(),
     )
     assert report["all_pass"], report
 
@@ -245,11 +241,10 @@ def test_bagel_image_generation_cfg_image_full_loop_decode_smoke() -> None:
             f"{_env_name('IMAGE_GEN_CFG_IMAGE_FULL_LOOP_STEPS')} to run BAGEL CFG-image full-loop decode smoke."
         )
 
-    repo_root = Path(__file__).resolve().parents[2]
     report = smoke_image_gen_full_loop_decode(
         Path(fixture_path),
         Path(model_root),
-        config_dir=repo_root / "configs/seed_omni/bagel_7b_mot",
+        config_dir=_bagel_cfg_dir(),
         max_flow_steps=int(max_flow_steps),
     )
     assert report["all_pass"], report
@@ -264,11 +259,10 @@ def test_bagel_image_generation_cfg_renorm_graph_matches_official_fixture() -> N
             "to run BAGEL CFG renorm graph parity."
         )
 
-    repo_root = Path(__file__).resolve().parents[2]
     report = compare_image_gen_graph(
         Path(fixture_path),
         Path(model_root),
-        config_dir=repo_root / "configs/seed_omni/bagel_7b_mot",
+        config_dir=_bagel_cfg_dir(),
     )
     assert report["all_pass"], report
 
@@ -283,11 +277,10 @@ def test_bagel_image_generation_full_loop_decode_smoke() -> None:
             f"{_env_name('IMAGE_GEN_FULL_LOOP_STEPS')} to run BAGEL full-loop decode smoke."
         )
 
-    repo_root = Path(__file__).resolve().parents[2]
     report = smoke_image_gen_full_loop_decode(
         Path(fixture_path),
         Path(model_root),
-        config_dir=repo_root / "configs/seed_omni/bagel_7b_mot",
+        config_dir=_bagel_cfg_dir(),
         max_flow_steps=int(max_flow_steps),
     )
     assert report["all_pass"], report
@@ -311,11 +304,10 @@ def test_bagel_text_image_graph_matches_official_fixture() -> None:
             "to run BAGEL text+image graph parity."
         )
 
-    repo_root = Path(__file__).resolve().parents[2]
     report = compare_text_image_und_graph(
         Path(fixture_path),
         Path(model_root),
-        config_dir=repo_root / "configs/seed_omni/bagel_7b_mot",
+        config_dir=_bagel_cfg_dir(),
     )
     assert report["all_pass"], report
 
@@ -329,11 +321,10 @@ def test_bagel_text_image_raw_image_graph_matches_official_fixture() -> None:
             "to run BAGEL raw-image text+image graph parity."
         )
 
-    repo_root = Path(__file__).resolve().parents[2]
     report = compare_text_image_und_graph(
         Path(fixture_path),
         Path(model_root),
-        config_dir=repo_root / "configs/seed_omni/bagel_7b_mot",
+        config_dir=_bagel_cfg_dir(),
         use_raw_image=True,
     )
     assert report["all_pass"], report
@@ -344,9 +335,8 @@ def test_bagel_text_image_raw_e2e_smoke() -> None:
     if not model_root:
         pytest.skip(f"Set {_env_name('SPLIT_MODEL_ROOT')} to run BAGEL raw text/image E2E smoke.")
 
-    repo_root = Path(__file__).resolve().parents[2]
     report = smoke_text_image_raw_graph(
         Path(model_root),
-        config_dir=repo_root / "configs/seed_omni/bagel_7b_mot",
+        config_dir=_bagel_cfg_dir(),
     )
     assert report["all_pass"], report

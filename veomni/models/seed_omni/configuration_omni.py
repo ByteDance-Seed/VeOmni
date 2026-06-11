@@ -1,27 +1,33 @@
 """
 OmniConfig — central configuration for OmniModel V2.
 
-YAML structure (maps 1-to-1 to this class):
+Built from the **omni split-file layout** via :meth:`OmniConfig.from_omni_args` (see
+:class:`~veomni.arguments.arguments_types_omni.OmniArguments`):
 
-  # ── Global asset (the ONLY global asset; everything else is per-module).
-  model_path: /path/to/split/checkpoint/root
+  * ``model.model_path``   — split-checkpoint root folder (one subdir per module).
+  * ``model.modules``      — per-module training overrides (``modules_train.yaml``).
+  * ``model.train_graph``  — the training DAG (``graph_train.yaml``).
+  * ``infer.modules``      — per-module inference overrides (``modules_infer.yaml``).
+  * ``infer.infer_graph``  — scenario -> generation-graph file map.
 
-  # ── Modules: one entry per graph sub-model.  Each block mirrors a mini
-  #    ``VeOmniOmniArguments`` (``model`` / ``train`` / ``data``).  ``model_type``
-  #    is read from each module's ``config.json`` and is NOT specified here.
-  modules:
-    siglip:
-      model: {weights_path: ...}
-    janus_llama:
-      model: {weights_path: ...}
-    vqvae:
-      model:
-        weights_path: ...
-        model_config: {freeze: true}
-      train:
-        init_device: meta
-        accelerator:
-          fsdp_config: {fsdp_mode: fsdp2}
+Per-module override block (one entry per graph sub-model).  ``model_type`` is
+read from each module's ``config.json`` and is NOT specified here.  Note that
+``accelerator`` sits at the block top level (omni convention) and is lifted under
+``train.accelerator`` by :meth:`OmniConfig._lift_accelerator` before merging:
+
+  janus_siglip:
+    model: {model_path: janus_siglip}
+  janus_vqvae:
+    model:
+      model_path: janus_vqvae
+      model_config: {freeze: true}
+  janus_llama:
+    model: {model_path: janus_llama}
+    accelerator:
+      fsdp_config: {fsdp_mode: fsdp2}
+
+Internally OmniConfig still stores fully-merged per-module dicts + a training
+graph (flat edge list) + an optional generation graph.
 
   # ── Active training subset.  A flat list of edges; each endpoint is a
   #    self-describing `module[.method]` string (bare module → `.forward`).
@@ -131,72 +137,127 @@ class OmniConfig(PretrainedConfig):
         """Build an :class:`OmniConfig` from a YAML-shaped dict.
 
         Pops ``model_path`` (the split-checkpoint root from the launcher YAML —
-        consumed by :func:`build_module_args`, not stored here).  Module blocks
+        consumed by :func:`build_module_args`, not stored here).          Module blocks
         are kept verbatim; path resolution happens when merging each module onto
-        the global :class:`VeOmniOmniArguments`.  Unknown top-level keys are
-        dropped silently so the launcher YAML can carry training-only fields.
+        the projected :class:`~veomni.arguments.arguments_types.VeOmniArguments`
+        base (see :meth:`from_omni_args`).  Unknown top-level keys are dropped
+        silently so the launcher YAML can carry training-only fields.
         """
         config_dict = dict(config_dict)
         accepted = {k: v for k, v in config_dict.items() if k in cls.__init__.__code__.co_varnames}
         return cls(**accepted, **kwargs)
 
     @classmethod
-    def _init(
+    def from_omni_args(
         cls,
         global_args: VeOmniArguments,
         model_path: Union[str, os.PathLike],
-        train_yaml_path: Union[str, os.PathLike],
-        infer_yaml_path: Union[str, os.PathLike] = None,
+        modules: Union[str, os.PathLike, Dict[str, Any]],
+        train_graph: Union[str, os.PathLike, List, None] = None,
+        infer_modules: Union[str, os.PathLike, Dict[str, Any], None] = None,
+        infer_graph: Union[str, os.PathLike, Dict, None] = None,
+        generation_kwargs: Optional[Dict[str, Any]] = None,
     ) -> "OmniConfig":
-        """Load an :class:`OmniConfig` from a training YAML + optional inference YAML.
+        """Load an :class:`OmniConfig` from the **omni split-file layout**.
 
-        SeedOmni V2 splits configuration into a **training YAML** that
-        carries the master vocabulary (``modules`` + ``training_graph``, a flat
-        list of edges) and one or more **inference YAMLs** that only carry a
-        ``generation_graph`` for a specific scenario (interleave / T2I-only /
-        understanding).  See ``configs/seed_omni/janus_1.3b/`` for the
-        canonical layout.
+        SeedOmni V2 keeps the per-module overrides and the graphs in separate
+        files, referenced from
+        :class:`~veomni.arguments.arguments_types_omni.OmniArguments`:
 
-        Per-module args are built from the launcher ``global_args``
-        (:class:`VeOmniArguments` parsed from ``veomni_janus.yaml``).  Train
-        and infer YAML ``modules:`` blocks are deep-merged into one override
-        dict per module name, then merged onto ``global_args`` (same path as
-        :func:`parse_args` via ``_deep_update`` + ``_instantiate_recursive``).
+        * ``modules`` (``model.modules``) — per-module training overrides.
+        * ``train_graph`` (``model.train_graph``) — the training DAG.
+        * ``infer_modules`` (``infer.modules``) — per-module inference overrides
+          (deep-merged onto the training modules; modules default to eager
+          load).
+        * ``infer_graph`` — the selected scenario's generation-graph file.
+        * ``generation_kwargs`` — free-form generation knobs (``infer.generation_kwargs``).
 
-        Relative ``model.weights_path`` subfolders are joined with ``model_path``
-        before the merge sets ``model.model_path`` / ``config_path``.
+        Each argument may be a path (loaded here) or an already-loaded object
+        (e.g. a dict produced by CLI ``--model.modules.* ...`` overrides).
+        Per-module blocks carry ``accelerator`` at the block top level (omni
+        convention); it is lifted under ``train.accelerator`` before merging so
+        the reused per-module ``BaseTrainer`` finds it where it expects.
+
+        Per-module args are built by deep-merging each override onto
+        ``asdict(global_args)`` (the projected base) — same mechanics as
+        :func:`~veomni.arguments.parser.parse_args`.
         """
         from dataclasses import asdict
 
-        import yaml
-
-        with open(train_yaml_path, encoding="utf-8") as f:
-            omni_train_config = yaml.safe_load(f)
-
-        modules_overrides: Dict[str, Any] = omni_train_config.pop("modules")
+        modules_overrides = cls._load_modules(modules)
+        modules_overrides = cls._lift_accelerator(modules_overrides)
         modules_overrides = cls._resolve_model_path(model_path, modules_overrides)
-        base_cfg = {
-            "training_graph": omni_train_config.pop("training_graph", []),
-        }
-        if infer_yaml_path is not None:
-            with open(infer_yaml_path, encoding="utf-8") as f:
-                omni_infer_config = yaml.safe_load(f)
-            infer_modules_overrides = omni_infer_config.pop("modules", {})
-            if infer_modules_overrides:
-                infer_modules_overrides = cls._resolve_model_path(model_path, infer_modules_overrides)
-            infer_modules_overrides = cls._resolve_default_accelerator(modules_overrides, infer_modules_overrides)
-            modules_overrides = _deep_update(modules_overrides, infer_modules_overrides)
-            _deep_update(
-                base_cfg,
-                {
-                    "generation_graph": omni_infer_config.pop("generation_graph"),
-                    "generation_kwargs": omni_infer_config.pop("generation_kwargs"),
-                },
-            )
+
+        base_cfg: Dict[str, Any] = {}
+        if train_graph is not None:
+            base_cfg["training_graph"] = cls._load_graph(train_graph, "training_graph") or []
+
+        if infer_graph is not None:
+            infer_overrides = cls._load_modules(infer_modules) if infer_modules else {}
+            infer_overrides = cls._lift_accelerator(infer_overrides)
+            if infer_overrides:
+                infer_overrides = cls._resolve_model_path(model_path, infer_overrides)
+            infer_overrides = cls._resolve_default_accelerator(modules_overrides, infer_overrides)
+            modules_overrides = _deep_update(modules_overrides, infer_overrides)
+            base_cfg["generation_graph"] = cls._load_graph(infer_graph, "generation_graph")
+            base_cfg["generation_kwargs"] = dict(generation_kwargs or {})
+
         base_cfg["modules"] = {
             name: _deep_update(asdict(global_args), override) for name, override in modules_overrides.items()
         }
         return cls.from_dict(base_cfg)
+
+    @staticmethod
+    def _load_modules(modules: Union[str, os.PathLike, Dict[str, Any], None]) -> Dict[str, Any]:
+        """Return a deep-copyable module-override dict from a path or inline dict."""
+        from copy import deepcopy
+
+        if modules is None:
+            return {}
+        if isinstance(modules, (str, os.PathLike)):
+            import yaml
+
+            with open(modules, encoding="utf-8") as f:
+                loaded = yaml.safe_load(f) or {}
+            return loaded
+        return deepcopy(modules)
+
+    @staticmethod
+    def _load_graph(graph: Union[str, os.PathLike, Dict, List, None], key: str):
+        """Load a graph file (or pass through an inline object).
+
+        Graph files may wrap the payload under ``key`` (e.g. ``training_graph:``
+        / ``generation_graph:``) or declare it bare at the top level; both are
+        accepted.
+        """
+        if graph is None:
+            return None
+        if isinstance(graph, (str, os.PathLike)):
+            import yaml
+
+            with open(graph, encoding="utf-8") as f:
+                graph = yaml.safe_load(f)
+        if isinstance(graph, dict) and key in graph:
+            return graph[key]
+        return graph
+
+    @staticmethod
+    def _lift_accelerator(modules_config: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        """Move each module block's top-level ``accelerator`` under ``train``.
+
+        v2 declares ``accelerator`` as a peer of ``model`` / ``train`` (both in
+        the launcher and per-module blocks), but the reused per-module
+        ``BaseTrainer`` reads ``args.train.accelerator``.  Lift it so the merge
+        lands where the trainer expects.
+        """
+        if not modules_config:
+            return {}
+        for mod_cfg in modules_config.values():
+            if isinstance(mod_cfg, dict) and "accelerator" in mod_cfg:
+                acc = mod_cfg.pop("accelerator")
+                train = mod_cfg.setdefault("train", {})
+                train["accelerator"] = _deep_update(train.get("accelerator", {}) or {}, acc or {})
+        return modules_config
 
     @staticmethod
     def _resolve_model_path(

@@ -61,8 +61,18 @@ def _load_modules(
 
 
 def _load_graph_config(config_dir: Path) -> OmniConfig:
-    train_config = yaml.safe_load((config_dir / "train.yaml").read_text(encoding="utf-8"))
-    infer_config = yaml.safe_load((config_dir / "infer_und.yaml").read_text(encoding="utf-8"))
+    modules_path = config_dir / "modules_train.yaml"
+    if modules_path.exists():
+        train_config = {
+            "modules": yaml.safe_load(modules_path.read_text(encoding="utf-8")),
+            "training_graph": yaml.safe_load((config_dir / "graph_train.yaml").read_text(encoding="utf-8"))[
+                "training_graph"
+            ],
+        }
+        infer_config = yaml.safe_load((config_dir / "graph_infer_und.yaml").read_text(encoding="utf-8"))
+    else:
+        train_config = yaml.safe_load((config_dir / "train.yaml").read_text(encoding="utf-8"))
+        infer_config = yaml.safe_load((config_dir / "infer_und.yaml").read_text(encoding="utf-8"))
     merged = {
         "modules": train_config["modules"],
         "training_graph": train_config["training_graph"],
