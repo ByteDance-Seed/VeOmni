@@ -10,7 +10,7 @@ class BagelFlowConnectorConfig(PretrainedConfig):
         self,
         hidden_size: int = 3584,
         patch_latent_dim: int = 64,
-        max_latent_size: int = 32,
+        max_latent_size: int = 64,
         timestep_frequency_embedding_size: int = 256,
         **kwargs,
     ):

@@ -269,12 +269,6 @@ def capture(args: argparse.Namespace) -> dict[str, Any]:
         },
         "tolerances": {
             "bf16": {
-                "official_self_consistency": {
-                    "max_abs_diff": 0.0,
-                    "mean_abs_diff": 0.0,
-                    "cosine_similarity_min": 0.99998,
-                    "source": "official-native bf16 self-consistency run1/run2",
-                },
                 "v2_parity": {
                     "max_abs_diff": 1.0e-2,
                     "mean_abs_diff": 1.0e-4,

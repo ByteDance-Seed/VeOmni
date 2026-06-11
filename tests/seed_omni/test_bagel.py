@@ -1,4 +1,4 @@
-"""Schema checks for BAGEL text-only official parity fixtures."""
+"""Durable BAGEL graph-level official parity tests."""
 
 from __future__ import annotations
 
@@ -8,12 +8,12 @@ from pathlib import Path
 import pytest
 import torch
 
-from tests.seed_omni.fixtures.bagel.adapter import adapt_text_only_fixture, assert_text_fixture_schema
-from tests.seed_omni.fixtures.bagel.compare_text_image_und import compare_text_image_und_graph
-from tests.seed_omni.fixtures.bagel.compare_text_image_und_module import (
+from tests.seed_omni.fixtures.bagel.adapter import (
+    adapt_text_only_fixture,
+    assert_text_fixture_schema,
     assert_text_image_fixture_schema,
-    compare_text_image_und,
 )
+from tests.seed_omni.fixtures.bagel.compare_text_image_und import compare_text_image_und_graph
 from tests.seed_omni.fixtures.bagel.compare_text_only_graph import compare_text_graph
 
 
@@ -59,18 +59,6 @@ def test_bagel_text_image_fixture_schema() -> None:
 
     fixture = torch.load(Path(fixture_path), map_location="cpu", weights_only=False)
     assert_text_image_fixture_schema(fixture)
-
-
-def test_bagel_text_image_modules_match_official_fixture() -> None:
-    fixture_path = os.environ.get("BAGEL_TEXT_IMAGE_PARITY_FIXTURE")
-    model_root = os.environ.get("BAGEL_SPLIT_MODEL_ROOT")
-    if not fixture_path or not model_root:
-        pytest.skip(
-            "Set BAGEL_TEXT_IMAGE_PARITY_FIXTURE and BAGEL_SPLIT_MODEL_ROOT to run BAGEL text+image module parity."
-        )
-
-    report = compare_text_image_und(Path(fixture_path), Path(model_root))
-    assert report["all_pass"], report
 
 
 def test_bagel_text_image_graph_matches_official_fixture() -> None:

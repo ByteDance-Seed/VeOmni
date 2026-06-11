@@ -16,9 +16,8 @@ import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from adapter import adapt_text_image_und_fixture  # noqa: E402
-
-from tests.seed_omni.fixtures.bagel.compare_text_image_und_module import (  # noqa: E402
+from adapter import (  # noqa: E402
+    adapt_text_image_und_fixture,
     assert_text_image_fixture_schema,
 )
 from tests.seed_omni.fixtures.bagel.compare_text_only_graph import (  # noqa: E402

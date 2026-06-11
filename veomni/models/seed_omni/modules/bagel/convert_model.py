@@ -7,6 +7,7 @@ import shutil
 from pathlib import Path
 from typing import Any, Callable
 
+import torch
 from safetensors import safe_open
 from transformers.initialization import no_init_weights
 
@@ -64,13 +65,42 @@ def _instantiate(model_type: str, config: Any):
         return model_cls._from_config(config)
 
 
-def _save_module(model_type: str, config: Any, state_dict: dict[str, Any], output_dir: Path) -> None:
+def _materialize_allowed_missing_parameters(model: Any, missing: list[str]) -> None:
+    for key in missing:
+        if not key.endswith(".pos_embed"):
+            continue
+        module_name, _, param_name = key.rpartition(".")
+        module = model.get_submodule(module_name)
+        parameter = getattr(module, param_name)
+        setattr(
+            module,
+            param_name,
+            torch.nn.Parameter(torch.empty(tuple(parameter.shape)), requires_grad=parameter.requires_grad),
+        )
+        if not hasattr(module, "_init_weights"):
+            raise RuntimeError(f"Cannot initialize deterministic missing parameter: {key}")
+        module._init_weights()
+
+
+def _save_module(
+    model_type: str,
+    config: Any,
+    state_dict: dict[str, Any],
+    output_dir: Path,
+    *,
+    allowed_missing: set[str] | None = None,
+) -> None:
     from veomni.models.seed_omni.modules import read_model_type
 
     model = _instantiate(model_type, config)
-    missing, unexpected = model.load_state_dict(state_dict, strict=True, assign=True)
-    if missing or unexpected:
-        raise RuntimeError(f"{model_type} load mismatch: missing={missing}, unexpected={unexpected}")
+    allowed_missing = set() if allowed_missing is None else allowed_missing
+    missing, unexpected = model.load_state_dict(state_dict, strict=False, assign=True)
+    unexpected = list(unexpected)
+    missing = list(missing)
+    unexpected_missing = [key for key in missing if key not in allowed_missing]
+    if unexpected_missing or unexpected:
+        raise RuntimeError(f"{model_type} load mismatch: missing={unexpected_missing}, unexpected={unexpected}")
+    _materialize_allowed_missing_parameters(model, [key for key in missing if key in allowed_missing])
     module_dir = output_dir / model_type
     model.save_pretrained(module_dir, safe_serialization=True)
     resolved_type = read_model_type(str(module_dir))
@@ -99,7 +129,7 @@ def convert_bagel_checkpoint(
     output_dir: str,
     *,
     force: bool = False,
-    max_latent_size: int = 32,
+    max_latent_size: int = 64,
     **kwargs,
 ) -> None:
     """Split an upstream BAGEL checkpoint into five V2 module subfolders."""
@@ -189,7 +219,13 @@ def convert_bagel_checkpoint(
         ),
         consumed_ema_keys,
     )
-    _save_module("bagel_siglip_navit", siglip_cfg, siglip_state, target_root)
+    _save_module(
+        "bagel_siglip_navit",
+        siglip_cfg,
+        siglip_state,
+        target_root,
+        allowed_missing={"vit_pos_embed.pos_embed"},
+    )
 
     flow_cfg_cls = OMNI_CONFIG_REGISTRY["bagel_flow_connector"]()
     patch_latent_dim = 2 * 2 * 16
@@ -204,7 +240,13 @@ def convert_bagel_checkpoint(
         lambda key: key if key.startswith(flow_prefixes) else None,
         consumed_ema_keys,
     )
-    _save_module("bagel_flow_connector", flow_cfg, flow_state, target_root)
+    _save_module(
+        "bagel_flow_connector",
+        flow_cfg,
+        flow_state,
+        target_root,
+        allowed_missing={"latent_pos_embed.pos_embed"},
+    )
 
     vae_cfg_cls = OMNI_CONFIG_REGISTRY["bagel_vae"]()
     vae_cfg = vae_cfg_cls()

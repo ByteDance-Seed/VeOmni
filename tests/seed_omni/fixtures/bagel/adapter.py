@@ -184,10 +184,69 @@ def assert_text_fixture_schema(fixture: dict[str, Any]) -> None:
             raise AssertionError(f"Fixture prepared section missing tensor: {name}")
 
 
+def assert_text_image_fixture_schema(fixture: dict[str, Any]) -> None:
+    """Validate the minimal schema needed by the text+image understanding adapter."""
+
+    metadata = fixture["metadata"]
+    if metadata["case_id"] != TEXT_IMAGE_UND_FIXTURE_CASE_ID:
+        raise AssertionError(f"Unexpected case_id: {metadata['case_id']!r}")
+
+    for section in (
+        "raw_input",
+        "rng_state",
+        "tokenizer",
+        "prepared",
+        "cache_after_image",
+        "cache_after_prompt",
+        "one_step",
+    ):
+        if section not in fixture:
+            raise AssertionError(f"Fixture missing section: {section}")
+
+    image_fields = fixture["prepared"]["image"]
+    for name in (
+        "packed_text_ids",
+        "packed_text_indexes",
+        "vit_token_seqlens",
+        "packed_vit_tokens",
+        "packed_vit_position_ids",
+        "packed_vit_token_indexes",
+        "packed_position_ids",
+        "packed_seqlens",
+        "packed_indexes",
+        "packed_key_value_indexes",
+        "key_values_lens",
+    ):
+        if name not in image_fields:
+            raise AssertionError(f"Fixture image section missing tensor: {name}")
+
+    image_embeds = fixture["prepared"]["image_embeds"]
+    for name in ("image_embeds", "cu_seqlens", "max_seqlen"):
+        if name not in image_embeds:
+            raise AssertionError(f"Fixture image_embeds section missing field: {name}")
+
+    prompt_fields = fixture["prepared"]["prompt"]
+    for name in (
+        "packed_text_ids",
+        "packed_text_position_ids",
+        "text_token_lens",
+        "packed_text_indexes",
+        "packed_key_value_indexes",
+        "key_values_lens",
+    ):
+        if name not in prompt_fields:
+            raise AssertionError(f"Fixture prompt section missing tensor: {name}")
+
+    for name in ("query_lens", "packed_query_indexes", "packed_key_value_indexes_for_step"):
+        if name not in fixture["prepared"]:
+            raise AssertionError(f"Fixture prepared section missing tensor: {name}")
+
+
 __all__ = [
     "TEXT_FIXTURE_CASE_ID",
     "TEXT_IMAGE_UND_FIXTURE_CASE_ID",
     "adapt_text_image_und_fixture",
     "adapt_text_only_fixture",
+    "assert_text_image_fixture_schema",
     "assert_text_fixture_schema",
 ]
