@@ -75,6 +75,18 @@ def _tiny_qwen3_cfg() -> dict:
     )
 
 
+def _tiny_bagel_qwen2_cfg() -> dict:
+    return dict(
+        vocab_size=128,
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=4,
+        max_position_embeddings=64,
+    )
+
+
 def _tiny_vision_cfg() -> dict:
     return dict(
         hidden_size=32,
@@ -124,6 +136,11 @@ def test_mixin_registry_contains_all_v2_modules():
         "janus_text_encoder",
         "qwen3_llm",
         "qwen3_text_encoder",
+        "bagel_text_encoder",
+        "bagel_siglip_navit",
+        "bagel_qwen2_mot",
+        "bagel_flow_connector",
+        "bagel_vae",
     }
     assert expected.issubset(set(OMNI_MODEL_REGISTRY.valid_keys()))
     assert _model_cls("text_encoder").__name__ == "TextEncoder"
@@ -133,6 +150,11 @@ def test_mixin_registry_contains_all_v2_modules():
     assert _model_cls("janus_text_encoder").__name__ == "JanusTextEncoder"
     assert _model_cls("qwen3_llm").__name__ == "Qwen3Llm"
     assert _model_cls("qwen3_text_encoder").__name__ == "Qwen3TextEncoder"
+    assert _model_cls("bagel_text_encoder").__name__ == "BagelTextEncoder"
+    assert _model_cls("bagel_siglip_navit").__name__ == "BagelSiglipNavit"
+    assert _model_cls("bagel_qwen2_mot").__name__ == "BagelQwen2MoT"
+    assert _model_cls("bagel_flow_connector").__name__ == "BagelFlowConnector"
+    assert _model_cls("bagel_vae").__name__ == "BagelVAE"
 
 
 def test_processor_registry_only_for_vision_modules():
@@ -337,6 +359,21 @@ def test_qwen3_text_encoder_save_reload_via_registry(tmp_path: Path):
     assert te2.config.vocab_size == 128
 
 
+def test_bagel_qwen2_mot_gen_mode_requires_token_indexes():
+    BagelQwen2MoT = _model_cls("bagel_qwen2_mot")
+    BagelQwen2MoTConfig = _config_cls("bagel_qwen2_mot")
+    model = BagelQwen2MoT(BagelQwen2MoTConfig(**_tiny_bagel_qwen2_cfg()))
+
+    with pytest.raises(ValueError, match="mode='gen' requires"):
+        model._forward_packed_inference(
+            packed_query_sequence=torch.randn(1, 64),
+            query_lens=torch.tensor([1], dtype=torch.int32),
+            packed_query_position_ids=torch.tensor([0], dtype=torch.long),
+            packed_query_indexes=torch.tensor([0], dtype=torch.long),
+            mode="gen",
+        )
+
+
 # ── _no_split_modules preservation ────────────────────────────────────────────
 
 
@@ -488,3 +525,50 @@ def test_qwen3_train_plus_infer_merges_generation_graph():
     assert cfg.has_generation_graph()
     assert cfg.generation_graph["initial"] == "prompt_encode"
     assert "done" not in cfg.generation_graph["states"]
+
+
+def _bagel_cfg_dir() -> Path:
+    return Path(__file__).resolve().parents[2] / "configs" / "seed_omni" / "bagel_7b_mot"
+
+
+def test_bagel_train_yaml_loads_with_v2_module_names():
+    cfg = _load_omni_config(train_yaml_path=_bagel_cfg_dir() / "train.yaml")
+
+    assert set(cfg.modules) == {
+        "bagel_text_encoder",
+        "bagel_siglip_navit",
+        "bagel_qwen2_mot",
+        "bagel_flow_connector",
+        "bagel_vae",
+    }
+    edge_names = set(cfg.edges)
+    for e in cfg.training_edges:
+        assert e in edge_names
+    assert "vae_decode" in cfg.nodes
+    assert "vae_decode_sink" in cfg.edges
+
+
+@pytest.mark.parametrize("infer_yaml", ["infer_und.yaml", "infer_gen.yaml"])
+def test_bagel_train_plus_infer_merges_generation_graph(infer_yaml: str):
+    cfg = _load_omni_config(
+        train_yaml_path=_bagel_cfg_dir() / "train.yaml",
+        infer_yaml_path=_bagel_cfg_dir() / infer_yaml,
+    )
+    assert set(cfg.modules) == {
+        "bagel_text_encoder",
+        "bagel_siglip_navit",
+        "bagel_qwen2_mot",
+        "bagel_flow_connector",
+        "bagel_vae",
+    }
+    assert cfg.has_generation_graph()
+    assert cfg.generation_graph["initial"] == "prompt_encode"
+    assert "done" not in cfg.generation_graph["states"]
+    assert any(
+        t.get("next_state") == "done"
+        for state in cfg.generation_graph["states"].values()
+        for t in state.get("transitions", [])
+    ), f"{infer_yaml} has no transition to `done`."
+    for state_name, state in cfg.generation_graph["states"].items():
+        for e in state.get("body", []):
+            assert e in cfg.edges, f"state '{state_name}' body edge '{e}' not in pool"

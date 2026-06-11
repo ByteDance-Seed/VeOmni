@@ -58,6 +58,21 @@ def _apply_rotary_pos_emb(
     return q_embed, k_embed
 
 
+def _check_packed_inference_mode(
+    mode: str,
+    *,
+    packed_vae_token_indexes: Optional[torch.Tensor],
+    packed_text_indexes: Optional[torch.Tensor],
+) -> bool:
+    if mode == "und":
+        return False
+    if mode == "gen":
+        if packed_text_indexes is None or packed_vae_token_indexes is None:
+            raise ValueError("mode='gen' requires packed_text_indexes and packed_vae_token_indexes.")
+        return True
+    raise ValueError(f"Unsupported BAGEL Qwen2 MoT inference mode: {mode!r}")
+
+
 class BagelQwen2RotaryEmbedding(nn.Module):
     """Official-compatible Qwen2 RoPE for BAGEL parity."""
 
@@ -142,15 +157,18 @@ class BagelQwen2MoTAttention(nn.Module):
         packed_vae_token_indexes: Optional[torch.Tensor] = None,
         packed_text_indexes: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, Optional[NaiveCache]]:
-        if mode == "und":
+        is_gen = _check_packed_inference_mode(
+            mode,
+            packed_vae_token_indexes=packed_vae_token_indexes,
+            packed_text_indexes=packed_text_indexes,
+        )
+        if not is_gen:
             packed_query_states = self.q_proj(packed_query_sequence).view(-1, self.num_heads, self.head_dim)
             packed_key_states = self.k_proj(packed_query_sequence).view(-1, self.num_key_value_heads, self.head_dim)
             packed_value_states = self.v_proj(packed_query_sequence).view(-1, self.num_key_value_heads, self.head_dim)
             packed_query_states = self.q_norm(packed_query_states)
             packed_key_states = self.k_norm(packed_key_states)
-        elif mode == "gen":
-            if packed_text_indexes is None or packed_vae_token_indexes is None:
-                raise ValueError("mode='gen' requires packed_text_indexes and packed_vae_token_indexes.")
+        else:
             packed_query_sequence = packed_query_sequence.to(torch.bfloat16)
             packed_query_states = packed_query_sequence.new_zeros(
                 (packed_query_sequence.shape[0], self.num_heads * self.head_dim)
@@ -182,8 +200,6 @@ class BagelQwen2MoTAttention(nn.Module):
             packed_key_states[packed_vae_token_indexes] = self.k_norm_moe_gen(
                 packed_key_states[packed_vae_token_indexes]
             )
-        else:
-            raise ValueError(f"Unsupported BAGEL Qwen2 MoT inference mode: {mode!r}")
 
         packed_cos, packed_sin = packed_query_position_embeddings
         packed_query_states, packed_key_states = _apply_rotary_pos_emb(
@@ -230,7 +246,7 @@ class BagelQwen2MoTAttention(nn.Module):
             causal=is_causal,
         )
         packed_attn_output = packed_attn_output.reshape(-1, self.hidden_size)
-        if mode == "und":
+        if not is_gen:
             packed_attn_output = self.o_proj(packed_attn_output)
         else:
             packed_attn_output[packed_text_indexes] = self.o_proj(packed_attn_output[packed_text_indexes])
@@ -278,12 +294,13 @@ class BagelQwen2MoTDecoderLayer(nn.Module):
         packed_vae_token_indexes: Optional[torch.Tensor] = None,
         packed_text_indexes: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, Optional[NaiveCache]]:
-        if mode == "gen" and (packed_text_indexes is None or packed_vae_token_indexes is None):
-            raise ValueError("mode='gen' requires packed_text_indexes and packed_vae_token_indexes.")
-        if mode not in ("und", "gen"):
-            raise ValueError(f"Unsupported BAGEL Qwen2 MoT inference mode: {mode!r}")
+        is_gen = _check_packed_inference_mode(
+            mode,
+            packed_vae_token_indexes=packed_vae_token_indexes,
+            packed_text_indexes=packed_text_indexes,
+        )
         residual = packed_query_sequence
-        if mode == "und":
+        if not is_gen:
             packed_query_sequence = self.input_layernorm(packed_query_sequence)
         else:
             packed_query_sequence_ = torch.zeros_like(packed_query_sequence)
@@ -311,7 +328,7 @@ class BagelQwen2MoTDecoderLayer(nn.Module):
         packed_query_sequence = residual + packed_query_sequence
 
         residual = packed_query_sequence
-        if mode == "und":
+        if not is_gen:
             packed_query_sequence = self.post_attention_layernorm(packed_query_sequence)
             packed_query_sequence = self.mlp(packed_query_sequence)
         else:
@@ -361,10 +378,11 @@ class BagelQwen2MoTBackbone(nn.Module):
         packed_vae_token_indexes: Optional[torch.Tensor] = None,
         packed_text_indexes: Optional[torch.Tensor] = None,
     ) -> BaseNavitOutputWithPast:
-        if mode == "gen" and (packed_text_indexes is None or packed_vae_token_indexes is None):
-            raise ValueError("mode='gen' requires packed_text_indexes and packed_vae_token_indexes.")
-        if mode not in ("und", "gen"):
-            raise ValueError(f"Unsupported BAGEL Qwen2 MoT inference mode: {mode!r}")
+        is_gen = _check_packed_inference_mode(
+            mode,
+            packed_vae_token_indexes=packed_vae_token_indexes,
+            packed_text_indexes=packed_text_indexes,
+        )
         if past_key_values is None:
             past_key_values = NaiveCache(len(self.layers))
 
@@ -387,7 +405,7 @@ class BagelQwen2MoTBackbone(nn.Module):
                 packed_text_indexes=packed_text_indexes,
             )
 
-        if mode == "und":
+        if not is_gen:
             packed_query_sequence = self.norm(packed_query_sequence)
         else:
             packed_query_sequence_ = torch.zeros_like(packed_query_sequence)
@@ -480,20 +498,27 @@ class BagelQwen2MoT(BagelQwen2MoTModuleMixin, PreTrainedModel):
         **kwargs: Any,
     ) -> BaseNavitOutputWithPast:
         del kwargs
-        return self.model._forward_packed_inference(
-            packed_query_sequence=packed_query_sequence,
-            query_lens=query_lens,
-            packed_query_position_ids=packed_query_position_ids,
-            packed_query_indexes=packed_query_indexes,
-            past_key_values=past_key_values,
-            key_values_lens=key_values_lens,
-            packed_key_value_indexes=packed_key_value_indexes,
-            update_past_key_values=update_past_key_values,
-            is_causal=is_causal,
-            mode=mode,
+        is_gen = _check_packed_inference_mode(
+            mode,
             packed_vae_token_indexes=packed_vae_token_indexes,
             packed_text_indexes=packed_text_indexes,
         )
+        call_kwargs: Dict[str, Any] = {
+            "packed_query_sequence": packed_query_sequence,
+            "query_lens": query_lens,
+            "packed_query_position_ids": packed_query_position_ids,
+            "packed_query_indexes": packed_query_indexes,
+            "past_key_values": past_key_values,
+            "key_values_lens": key_values_lens,
+            "packed_key_value_indexes": packed_key_value_indexes,
+            "update_past_key_values": update_past_key_values,
+            "is_causal": is_causal,
+            "mode": mode,
+        }
+        if is_gen:
+            call_kwargs["packed_vae_token_indexes"] = packed_vae_token_indexes
+            call_kwargs["packed_text_indexes"] = packed_text_indexes
+        return self.model._forward_packed_inference(**call_kwargs)
 
 
 __all__ = ["BaseNavitOutputWithPast", "BagelQwen2MoT", "NaiveCache"]
