@@ -10,6 +10,7 @@ from veomni.models.seed_omni.conversation import ConversationItem
 
 
 TEXT_FIXTURE_CASE_ID = "text_only_one_step_logits"
+TEXT_IMAGE_UND_FIXTURE_CASE_ID = "text_image_understanding_one_step_logits"
 
 
 def adapt_text_only_fixture(fixture: dict[str, Any]) -> list[ConversationItem]:
@@ -70,6 +71,76 @@ def adapt_text_only_fixture(fixture: dict[str, Any]) -> list[ConversationItem]:
     ]
 
 
+def adapt_text_image_und_fixture(fixture: dict[str, Any]) -> list[ConversationItem]:
+    """Convert an official text+image understanding fixture into V2 conversation items."""
+
+    metadata = fixture.get("metadata", {})
+    if metadata.get("case_id") != TEXT_IMAGE_UND_FIXTURE_CASE_ID:
+        raise ValueError(f"Unsupported BAGEL fixture case: {metadata.get('case_id')!r}")
+
+    image_fields = fixture["prepared"]["image"]
+    prompt_fields = fixture["prepared"]["prompt"]
+    start_fields = fixture["prepared"]["start"]
+
+    return [
+        ConversationItem(
+            type="image",
+            value=image_fields["packed_vit_tokens"].clone().detach(),
+            role="user",
+            source="bagel_official_fixture",
+            meta={
+                "bagel_role": "image_und",
+                "raw_image_size": fixture["raw_input"]["image_size"],
+                "image_token_ids": image_fields["packed_text_ids"].clone().detach().to(dtype=torch.long),
+                "image_text_indexes": image_fields["packed_text_indexes"].clone().detach().to(dtype=torch.long),
+                "vit_position_ids": image_fields["packed_vit_position_ids"].clone().detach().to(dtype=torch.long),
+                "vit_token_indexes": image_fields["packed_vit_token_indexes"].clone().detach().to(dtype=torch.long),
+                "vit_token_lens": image_fields["vit_token_seqlens"].clone().detach().to(dtype=torch.int32),
+                "position_ids": image_fields["packed_position_ids"].clone().detach().to(dtype=torch.long),
+                "sequence_indexes": image_fields["packed_indexes"].clone().detach().to(dtype=torch.long),
+                "context_indexes": image_fields["packed_key_value_indexes"].clone().detach().to(dtype=torch.long),
+                "query_lens": image_fields["packed_seqlens"].clone().detach().to(dtype=torch.int32),
+                "key_value_lens_before": image_fields["key_values_lens"].clone().detach().to(dtype=torch.int32),
+                "is_causal": False,
+            },
+        ),
+        ConversationItem(
+            type="text",
+            value=prompt_fields["packed_text_ids"].clone().detach().to(dtype=torch.long),
+            role="user",
+            source="bagel_official_fixture",
+            meta={
+                "bagel_role": "text",
+                "raw_text": fixture["raw_input"]["prompt"],
+                "position_ids": prompt_fields["packed_text_position_ids"].clone().detach().to(dtype=torch.long),
+                "sequence_indexes": prompt_fields["packed_text_indexes"].clone().detach().to(dtype=torch.long),
+                "context_indexes": prompt_fields["packed_key_value_indexes"].clone().detach().to(dtype=torch.long),
+                "token_lens": prompt_fields["text_token_lens"].clone().detach().to(dtype=torch.int32),
+                "key_value_lens_before": prompt_fields["key_values_lens"].clone().detach().to(dtype=torch.int32),
+                "key_value_lens_after": fixture["prepared"]["kv_lens_after_prompt"],
+                "rope_after": fixture["prepared"]["ropes_after_prompt"],
+                "is_causal": True,
+                "next_token": {
+                    "input_ids": start_fields["packed_start_tokens"].clone().detach().to(dtype=torch.long),
+                    "query_lens": fixture["prepared"]["query_lens"].clone().detach().to(dtype=torch.int32),
+                    "position_ids": start_fields["packed_query_position_ids"].clone().detach().to(dtype=torch.long),
+                    "query_indexes": fixture["prepared"]["packed_query_indexes"].clone().detach().to(dtype=torch.long),
+                    "key_value_lens": start_fields["key_values_lens"].clone().detach().to(dtype=torch.int32),
+                    "context_indexes": fixture["prepared"]["packed_key_value_indexes_for_step"]
+                    .clone()
+                    .detach()
+                    .to(dtype=torch.long),
+                },
+                "expected": {
+                    "hidden_state": fixture["one_step"]["hidden_state"],
+                    "logits": fixture["one_step"]["logits"],
+                    "greedy_token": fixture["one_step"]["greedy_token"],
+                },
+            },
+        ),
+    ]
+
+
 def assert_text_fixture_schema(fixture: dict[str, Any]) -> None:
     """Validate the minimal schema needed by the text-only adapter."""
 
@@ -113,4 +184,10 @@ def assert_text_fixture_schema(fixture: dict[str, Any]) -> None:
             raise AssertionError(f"Fixture prepared section missing tensor: {name}")
 
 
-__all__ = ["TEXT_FIXTURE_CASE_ID", "adapt_text_only_fixture", "assert_text_fixture_schema"]
+__all__ = [
+    "TEXT_FIXTURE_CASE_ID",
+    "TEXT_IMAGE_UND_FIXTURE_CASE_ID",
+    "adapt_text_image_und_fixture",
+    "adapt_text_only_fixture",
+    "assert_text_fixture_schema",
+]

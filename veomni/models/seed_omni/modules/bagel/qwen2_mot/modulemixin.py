@@ -64,23 +64,51 @@ class BagelQwen2MoTModuleMixin(ModuleMixin):
         }
 
     def _prefill_prompt(self, prompt_items: list[ConversationItem]) -> None:
-        packed_query_sequence, query_lens, position_ids, query_indexes, key_values_lens, key_value_indexes = (
-            self._pack_prompt_items(prompt_items)
-        )
-        outputs = self.forward_inference(
-            packed_query_sequence=packed_query_sequence,
-            query_lens=query_lens,
-            packed_query_position_ids=position_ids,
-            packed_query_indexes=query_indexes,
-            past_key_values=None,
-            key_values_lens=key_values_lens,
-            packed_key_value_indexes=key_value_indexes,
-            update_past_key_values=True,
-            is_causal=True,
-            mode="und",
-        )
-        self._past_key_values = outputs.past_key_values
-        self._key_values_lens = query_lens.detach().to(device=self.device, dtype=torch.int32)
+        saw_prompt = False
+        self._past_key_values = None
+        self._key_values_lens = None
+        for item in prompt_items:
+            packed_query_sequence = self._prompt_item_value(item)
+            if packed_query_sequence is None:
+                continue
+            saw_prompt = True
+            length = int(packed_query_sequence.shape[-2])
+            query_lens = self._prompt_meta_tensor(item, ("query_lens", "token_lens"), [length], dtype=torch.int32)
+            position_ids = self._prompt_meta_tensor(item, ("position_ids",), None, dtype=torch.long)
+            if position_ids is None:
+                position_ids = torch.arange(length, device=self.device, dtype=torch.long)
+            query_indexes = self._prompt_meta_tensor(item, ("sequence_indexes",), None, dtype=torch.long)
+            if query_indexes is None:
+                if self._key_values_lens is None:
+                    query_indexes = torch.arange(length, device=self.device, dtype=torch.long)
+                else:
+                    start = int(self._key_values_lens.sum().item())
+                    query_indexes = torch.arange(start, start + length, device=self.device, dtype=torch.long)
+            key_values_lens = self._prompt_meta_tensor(item, ("key_value_lens_before",), None, dtype=torch.int32)
+            if key_values_lens is None:
+                key_values_lens = (
+                    torch.tensor([0], device=self.device, dtype=torch.int32)
+                    if self._key_values_lens is None
+                    else self._key_values_lens.to(device=self.device, dtype=torch.int32)
+                )
+            key_value_indexes = self._prompt_meta_tensor(item, ("context_indexes",), [], dtype=torch.long)
+            outputs = self.forward_inference(
+                packed_query_sequence=packed_query_sequence,
+                query_lens=query_lens,
+                packed_query_position_ids=position_ids,
+                packed_query_indexes=query_indexes,
+                past_key_values=self._past_key_values,
+                key_values_lens=key_values_lens,
+                packed_key_value_indexes=key_value_indexes,
+                update_past_key_values=True,
+                is_causal=bool(item.meta.get("is_causal", True)),
+                mode="und",
+            )
+            self._past_key_values = outputs.past_key_values
+            self._key_values_lens = (key_values_lens + query_lens).detach().to(device=self.device, dtype=torch.int32)
+
+        if not saw_prompt:
+            raise ValueError("BAGEL qwen2_mot prompt prefill found no tensor prompt segments.")
 
     def _decode_tail(self, tail: ConversationItem) -> torch.Tensor:
         packed_query_sequence = tail.value
@@ -159,6 +187,36 @@ class BagelQwen2MoTModuleMixin(ModuleMixin):
             key_values_lens,
             key_value_indexes,
         )
+
+    def _prompt_item_value(self, item: ConversationItem) -> Optional[torch.Tensor]:
+        if is_dummy(item) or item.type == "output":
+            return None
+        value = item.value
+        if not torch.is_tensor(value):
+            return None
+        if value.dim() == 3 and value.size(0) == 1:
+            value = value.squeeze(0)
+        return value.to(device=self.device, dtype=self.dtype)
+
+    def _prompt_meta_tensor(
+        self,
+        item: ConversationItem,
+        keys: tuple[str, ...],
+        default: Optional[list[int]],
+        *,
+        dtype: torch.dtype,
+    ) -> Optional[torch.Tensor]:
+        value: Any = None
+        for key in keys:
+            candidate = item.meta.get(key)
+            if torch.is_tensor(candidate):
+                value = candidate
+                break
+        if torch.is_tensor(value):
+            return value.detach().to(device=self.device, dtype=dtype).reshape(-1)
+        if default is None:
+            return None
+        return torch.tensor(default, device=self.device, dtype=dtype)
 
     def _item_meta_tensor(
         self,

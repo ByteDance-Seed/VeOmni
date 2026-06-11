@@ -32,6 +32,8 @@ class BagelSiglipNavitModuleMixin(ModuleMixin):
         return {
             "packed_pixel_values": torch.zeros(1, patch_dim, device=self.device, dtype=self.dtype),
             "packed_flattened_position_ids": torch.zeros(1, dtype=torch.long, device=self.device),
+            "cu_seqlens": torch.tensor([0, 1], dtype=torch.int32, device=self.device),
+            "max_seqlen": 1,
         }
 
     def generate(
@@ -45,7 +47,39 @@ class BagelSiglipNavitModuleMixin(ModuleMixin):
         pending = [item for item in conversation_list if item.type == "image" and item.role == "user"]
         if not pending:
             return {"conversation_list": conversation_list}
-        raise NotImplementedError("BagelSiglipNavit.generate for image prompts is not implemented yet.")
+        if len(pending) != 1:
+            raise NotImplementedError(
+                "BAGEL graph-level image understanding currently supports one image per request."
+            )
+
+        image_item = pending[0]
+        packed_pixel_values = image_item.value
+        if not torch.is_tensor(packed_pixel_values):
+            raise TypeError(
+                "BagelSiglipNavit.generate currently expects preprocessed packed image patch tokens in "
+                f"ConversationItem.value, got {type(packed_pixel_values).__name__}."
+            )
+        position_ids = image_item.meta.get("vit_position_ids")
+        vit_token_lens = image_item.meta.get("vit_token_lens")
+        if not torch.is_tensor(position_ids) or not torch.is_tensor(vit_token_lens):
+            raise ValueError("Image ConversationItem requires vit_position_ids and vit_token_lens metadata.")
+
+        vit_token_lens = vit_token_lens.detach().to(device=self.device, dtype=torch.int32).reshape(-1)
+        cu_seqlens = torch.nn.functional.pad(torch.cumsum(vit_token_lens, dim=0), (1, 0)).to(torch.int32)
+        outputs = self.forward(
+            packed_pixel_values=packed_pixel_values.detach().to(device=self.device, dtype=self.dtype),
+            packed_flattened_position_ids=position_ids.detach().to(device=self.device, dtype=torch.long).reshape(-1),
+            cu_seqlens=cu_seqlens,
+            max_seqlen=int(vit_token_lens.max().item()),
+        )
+        image_embeds = outputs["image_embeds"]
+        image_item.value = image_embeds
+        image_item.meta["image_embeds"] = image_embeds.detach()
+        image_item.meta["image_embeds_ready"] = True
+        return {
+            "conversation_list": conversation_list,
+            "bagel_last_image_embeds": image_embeds.detach(),
+        }
 
 
 __all__ = ["BagelSiglipNavitModuleMixin"]

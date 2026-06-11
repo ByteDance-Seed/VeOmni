@@ -40,6 +40,7 @@ class BagelTextEncoderModuleMixin(TextEncoderModuleMixin):
     ) -> Dict[str, Any]:
         if conversation_list is None:
             raise ValueError("BagelTextEncoder.generate requires conversation_list.")
+        self._materialize_image_understanding_items(conversation_list)
         tail = conversation_list[-1]
         if tail.role == "user":
             token_ids = self._prompt_token_ids(tail)
@@ -82,6 +83,49 @@ class BagelTextEncoderModuleMixin(TextEncoderModuleMixin):
         raise ValueError(
             f"Invalid conversation tail for BAGEL text generation: type={tail.type!r}, role={tail.role!r}"
         )
+
+    def _materialize_image_understanding_items(self, conversation_list: list[ConversationItem]) -> None:
+        for item in conversation_list:
+            if item.type != "image" or item.role != "user":
+                continue
+            if item.meta.get("image_sequence_ready"):
+                continue
+            if item.meta.get("bagel_role") != "image_und":
+                continue
+
+            image_embeds = item.meta.get("image_embeds", item.value)
+            if not torch.is_tensor(image_embeds):
+                raise TypeError(
+                    "BAGEL image understanding item requires image embeddings before text prompt encoding."
+                )
+            image_token_ids = item.meta.get("image_token_ids")
+            image_text_indexes = item.meta.get("image_text_indexes")
+            vit_token_indexes = item.meta.get("vit_token_indexes")
+            query_lens = item.meta.get("query_lens")
+            if (
+                not torch.is_tensor(image_token_ids)
+                or not torch.is_tensor(image_text_indexes)
+                or not torch.is_tensor(vit_token_indexes)
+                or not torch.is_tensor(query_lens)
+            ):
+                raise ValueError(
+                    "BAGEL image understanding item requires image_token_ids, image_text_indexes, "
+                    "vit_token_indexes, and query_lens metadata."
+                )
+
+            image_token_ids = image_token_ids.detach().to(device=self.device, dtype=torch.long).reshape(-1)
+            image_text_indexes = image_text_indexes.detach().to(device=self.device, dtype=torch.long).reshape(-1)
+            vit_token_indexes = vit_token_indexes.detach().to(device=self.device, dtype=torch.long).reshape(-1)
+            query_lens = query_lens.detach().to(device=self.device, dtype=torch.int32).reshape(-1)
+
+            text_embeds = self.encode(image_token_ids)["inputs_embeds"].to(device=self.device, dtype=self.dtype)
+            image_embeds = image_embeds.detach().to(device=self.device, dtype=self.dtype)
+            sequence = text_embeds.new_zeros((int(query_lens.sum().item()), self.config.hidden_size))
+            sequence[image_text_indexes] = text_embeds
+            sequence[vit_token_indexes] = image_embeds
+            item.value = sequence
+            item.meta["query_lens"] = query_lens
+            item.meta["image_sequence_ready"] = True
 
     def _prompt_token_ids(self, item: ConversationItem) -> torch.Tensor:
         value = item.value
