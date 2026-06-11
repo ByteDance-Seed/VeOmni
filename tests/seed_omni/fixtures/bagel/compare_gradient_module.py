@@ -128,8 +128,13 @@ def _load_modules(
         modules["flow_connector"] = BagelFlowConnector.from_pretrained(
             model_root / "bagel_flow_connector", torch_dtype=dtype
         )
-    for module in modules.values():
-        module.to(device=device, dtype=dtype).train()
+    for name, module in modules.items():
+        if name == "qwen2_mot":
+            # Official BAGEL loads bf16 parameters but keeps RoPE frequency buffers
+            # in fp32. A dtype cast here quantizes inv_freq and creates layer-0 drift.
+            module.to(device=device).train()
+        else:
+            module.to(device=device, dtype=dtype).train()
         module.zero_grad(set_to_none=True)
     return modules
 
@@ -168,7 +173,7 @@ def _patched_latents(batch: dict[str, Any]) -> tuple[torch.Tensor, torch.Tensor]
         patch_w,
     )
     clean = clean.permute(0, 2, 4, 3, 5, 1).flatten(0, 2).flatten(1, 3)
-    timesteps = batch["shifted_timesteps"].to(device=clean.device, dtype=clean.dtype).reshape(-1, 1)
+    timesteps = batch["shifted_timesteps"].to(device=clean.device).reshape(-1, 1)
     noise = batch["fixed_noise"].to(device=clean.device, dtype=clean.dtype)
     noised = (1.0 - timesteps) * clean + timesteps * noise
     target = noise - clean
@@ -242,7 +247,7 @@ def _run_forward_backward(
             velocity = modules["flow_connector"].decode_velocity(
                 hidden_states=hidden_states[batch["mse_loss_indexes"]]
             )["velocity"]
-            mse = (velocity.float() - mse_target.to(device=velocity.device).float()).square()
+            mse = (velocity - mse_target.to(device=velocity.device, dtype=velocity.dtype)).square()
             losses["mse_tensor"] = mse.detach().cpu()
             mse_loss = mse.mean()
             loss = mse_loss if loss is None else loss + mse_loss

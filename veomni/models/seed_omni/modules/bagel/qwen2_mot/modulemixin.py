@@ -16,21 +16,57 @@ class BagelQwen2MoTModuleMixin(ModuleMixin):
         self._pack_inputs_embeds_shape: Optional[torch.Tensor] = None
         self._past_key_values: Optional[Any] = None
         self._key_values_lens: Optional[torch.Tensor] = None
+        self._bagel_packed_batch: Optional[dict[str, Any]] = None
 
     def pre_forward(
         self,
         method: str,
         conversation_list: Optional[list[list[ConversationItem]]] = None,
+        bagel_packed_batch: Optional[dict[str, Any]] = None,
         **kwargs: Any,
     ) -> Dict[str, Any]:
-        del method, conversation_list, kwargs
-        # TODO(bagel-v2): build Bagel's packed training contract here.
-        raise NotImplementedError("BagelQwen2MoT graph hooks are not implemented yet.")
+        del conversation_list, kwargs
+        assert method in ("forward",)
+        if bagel_packed_batch is None:
+            raise NotImplementedError("BagelQwen2MoT graph hooks currently require bagel_packed_batch.")
+        self._conversation_carrier = None
+        self._bagel_packed_batch = bagel_packed_batch
+
+        text_embeds = bagel_packed_batch["packed_text_embeds"].to(device=self.device, dtype=self.dtype)
+        packed_sequence = text_embeds.new_zeros((int(bagel_packed_batch["sequence_length"]), text_embeds.shape[-1]))
+        packed_sequence[bagel_packed_batch["packed_text_indexes"]] = text_embeds
+
+        und_indexes = [bagel_packed_batch["packed_text_indexes"].to(device=self.device, dtype=torch.long)]
+        if "packed_vit_embeds" in bagel_packed_batch:
+            packed_sequence[bagel_packed_batch["packed_vit_token_indexes"]] = bagel_packed_batch[
+                "packed_vit_embeds"
+            ].to(device=self.device, dtype=self.dtype)
+            und_indexes.append(bagel_packed_batch["packed_vit_token_indexes"].to(device=self.device, dtype=torch.long))
+
+        gen_indexes = None
+        if "packed_latent_embeds" in bagel_packed_batch:
+            gen_indexes = bagel_packed_batch["packed_vae_token_indexes"].to(device=self.device, dtype=torch.long)
+            packed_sequence[gen_indexes] = bagel_packed_batch["packed_latent_embeds"].to(
+                device=self.device, dtype=self.dtype
+            )
+
+        return {
+            "packed_sequence": packed_sequence,
+            "sample_lens": bagel_packed_batch["sample_lens"],
+            "attention_mask": bagel_packed_batch["nested_attention_masks"],
+            "packed_position_ids": bagel_packed_batch["packed_position_ids"].to(device=self.device, dtype=torch.long),
+            "packed_und_token_indexes": torch.cat(und_indexes),
+            "packed_gen_token_indexes": gen_indexes,
+        }
 
     def post_forward(self, method: str, **outputs: Any) -> Dict[str, Any]:
-        del method, outputs
-        # TODO(bagel-v2): scatter packed hidden states after the real backbone forward.
-        raise NotImplementedError("BagelQwen2MoT graph hooks are not implemented yet.")
+        assert method in ("forward",)
+        batch = getattr(self, "_bagel_packed_batch", None)
+        self._bagel_packed_batch = None
+        if batch is None:
+            return outputs
+        batch["packed_hidden_states"] = outputs["hidden_states"]
+        return {"bagel_packed_batch": batch}
 
     def reset_local_inference_state(self) -> None:
         self._past_key_values = None

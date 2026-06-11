@@ -105,7 +105,9 @@ class BagelFlowConnector(BagelFlowConnectorModuleMixin, PreTrainedModel):
             return self._embed_latent_graph(**kwargs)
         if position_ids is None or timesteps is None:
             raise ValueError("BagelFlowConnector.embed_latent requires position_ids and timesteps.")
-        latents = latents.to(device=self.device, dtype=self.dtype)
+        latents = latents.to(device=self.device)
+        if not torch.is_autocast_enabled(latents.device.type):
+            latents = latents.to(dtype=self.dtype)
         position_ids = position_ids.to(device=self.device, dtype=torch.long).reshape(-1)
         timesteps = timesteps.to(device=self.device).reshape(-1)
         if timesteps.numel() == 1:

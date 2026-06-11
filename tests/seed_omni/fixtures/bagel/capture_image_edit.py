@@ -551,7 +551,7 @@ def capture(args: argparse.Namespace) -> dict[str, Any]:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--official-repo", type=Path, default=Path("../bagel-official"))
+    parser.add_argument("--official-repo", type=Path, required=True)
     parser.add_argument("--model-root", type=Path, required=True)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--prompt", default=DEFAULT_PROMPT)

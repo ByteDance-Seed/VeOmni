@@ -585,12 +585,12 @@ def capture(args: argparse.Namespace) -> dict[str, Any]:
         "gradients": _capture_gradients(model, batch),
         "tolerances": {
             "bf16": {
-                "max_abs_diff": 3e-3,
-                "mean_abs_diff": 3e-4,
-                "cosine_similarity_min": 0.997,
-                "relative_l2_max": 0.08,
-                "loss_max_abs_diff": 1e-2,
-                "near_zero_norm": 1e-4,
+                "max_abs_diff": 0.0,
+                "mean_abs_diff": 0.0,
+                "cosine_similarity_min": 0.999,
+                "relative_l2_max": 0.0,
+                "loss_max_abs_diff": 0.0,
+                "near_zero_norm": 0.0,
             },
             "fp32": {
                 "max_abs_diff": 1e-5,

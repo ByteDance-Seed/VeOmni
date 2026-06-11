@@ -1,7 +1,7 @@
 """SeedOmni graph hooks for BAGEL's latent VAE module."""
 
 import math
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 import numpy as np
 import torch
@@ -12,12 +12,33 @@ from ....module import ModuleMixin
 
 
 class BagelVAEModuleMixin(ModuleMixin):
+    def init_omni_state(self) -> None:
+        self._bagel_packed_batch: Optional[dict[str, Any]] = None
+
     def pre_forward(self, method: str, **kwargs: Any) -> Dict[str, Any]:
         assert method in ("encode", "decode", "forward")
+        bagel_packed_batch = kwargs.get("bagel_packed_batch")
+        if bagel_packed_batch is not None:
+            self._bagel_packed_batch = bagel_packed_batch
+            height = width = max(16, int(self.config.downsample) * 2)
+            return {
+                "pixel_values": torch.zeros(
+                    1,
+                    int(self.config.in_channels),
+                    height,
+                    width,
+                    device=self.device,
+                    dtype=torch.float32,
+                )
+            }
         return kwargs
 
     def post_forward(self, method: str, **outputs: Any) -> Dict[str, Any]:
         assert method in ("encode", "decode", "forward")
+        batch = self._bagel_packed_batch
+        self._bagel_packed_batch = None
+        if batch is not None:
+            return {"bagel_packed_batch": batch}
         return outputs
 
     def _decode_image_graph(

@@ -13,21 +13,41 @@ from ....module import ModuleMixin
 class BagelSiglipNavitModuleMixin(ModuleMixin):
     def init_omni_state(self) -> None:
         self._conversation_carrier: Optional[list[list[ConversationItem]]] = None
+        self._bagel_packed_batch: Optional[dict[str, Any]] = None
+        self._bagel_packed_skip: bool = False
 
     def pre_forward(
         self,
         method: str,
         conversation_list: Optional[list[list[ConversationItem]]] = None,
+        bagel_packed_batch: Optional[dict[str, Any]] = None,
         **kwargs: Any,
     ) -> Dict[str, Any]:
-        del method, conversation_list, kwargs
-        # TODO(bagel-v2): build NaViT packed pixels, position ids, cu_seqlens, and max_seqlen.
-        raise NotImplementedError("BagelSiglipNavit graph hooks are not implemented yet.")
+        del conversation_list, kwargs
+        assert method in ("forward",)
+        self._bagel_packed_batch = bagel_packed_batch
+        self._bagel_packed_skip = bagel_packed_batch is None or "packed_vit_tokens" not in bagel_packed_batch
+        if self._bagel_packed_skip:
+            return self.dummy_inputs()
+        vit_token_lens = bagel_packed_batch["vit_token_seqlens"].to(device=self.device, dtype=torch.int32).reshape(-1)
+        return {
+            "packed_pixel_values": bagel_packed_batch["packed_vit_tokens"].to(device=self.device, dtype=self.dtype),
+            "packed_flattened_position_ids": bagel_packed_batch["packed_vit_position_ids"]
+            .to(device=self.device, dtype=torch.long)
+            .reshape(-1),
+            "cu_seqlens": torch.nn.functional.pad(torch.cumsum(vit_token_lens, dim=0), (1, 0)).to(torch.int32),
+            "max_seqlen": int(vit_token_lens.max().item()),
+        }
 
     def post_forward(self, method: str, **outputs: Any) -> Dict[str, Any]:
-        del method, outputs
-        # TODO(bagel-v2): scatter packed NaViT outputs after the real vision forward.
-        raise NotImplementedError("BagelSiglipNavit graph hooks are not implemented yet.")
+        assert method in ("forward",)
+        batch = self._bagel_packed_batch
+        skip = self._bagel_packed_skip
+        self._bagel_packed_batch = None
+        self._bagel_packed_skip = False
+        if batch is not None and not skip:
+            batch["packed_vit_embeds"] = outputs["image_embeds"]
+        return {"bagel_packed_batch": batch}
 
     def dummy_inputs(self) -> Dict[str, Any]:
         patch_dim = self.config.num_channels * self.config.patch_size * self.config.patch_size

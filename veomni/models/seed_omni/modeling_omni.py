@@ -281,8 +281,15 @@ class OmniModel(nn.Module):
             # per-module executor (``OmniModuleTrainer.forward``: pre_forward →
             # method → post_forward + per-module trace meter). Inference never
             # reaches here — it goes through ``generate`` / the generation graph.
-            executor = self._node_executors.get(module_name)
-            out = executor(method, **kwargs)
+            executor = None if self._node_executors is None else self._node_executors.get(module_name)
+            if executor is None:
+                module = getattr(self, module_name)
+                call_kwargs = module.pre_forward(method, **kwargs)
+                fn = module if method == "forward" else getattr(module, method)
+                outputs = fn(**call_kwargs)
+                out = module.post_forward(method, **outputs)
+            else:
+                out = executor(method, **kwargs)
 
             node_outputs[node_name] = out
 

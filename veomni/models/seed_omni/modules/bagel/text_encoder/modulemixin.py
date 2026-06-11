@@ -3,9 +3,11 @@
 from typing import Any, Dict, Optional
 
 import torch
+import torch.nn.functional as F
 
 from ....conversation import ConversationItem, maybe_merge_outputs, seal_outputs
 from ....generation_graph import FSM_SIGNAL_KEY
+from ....module import post_forward, pre_forward
 from ...base.text_encoder.modulemixin import TextEncoderModuleMixin
 
 
@@ -23,6 +25,56 @@ class BagelTextEncoderModuleMixin(TextEncoderModuleMixin):
         self._eos_token_id: Optional[int] = None
         self._start_token_id: Optional[int] = None
         self._image_start_token_id: Optional[int] = None
+        self._bagel_packed_batch: Optional[dict[str, Any]] = None
+
+    @pre_forward("encode")
+    def encode_pre(
+        self,
+        bagel_packed_batch: Optional[dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
+        if bagel_packed_batch is None:
+            return kwargs
+        self._bagel_packed_batch = bagel_packed_batch
+        return {"input_ids": bagel_packed_batch["packed_text_ids"]}
+
+    @post_forward("encode")
+    def encode_post(self, **outputs: Any) -> Dict[str, Any]:
+        batch = self._bagel_packed_batch
+        self._bagel_packed_batch = None
+        if batch is None:
+            return super().encode_post(**outputs)
+        batch["packed_text_embeds"] = outputs["inputs_embeds"]
+        return {"bagel_packed_batch": batch}
+
+    @pre_forward("decode")
+    def decode_pre(
+        self,
+        bagel_packed_batch: Optional[dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
+        if bagel_packed_batch is None:
+            return kwargs
+        self._bagel_packed_batch = bagel_packed_batch
+        if "ce_loss_indexes" not in bagel_packed_batch:
+            hidden_size = int(self.config.hidden_size)
+            return {"hidden_states": torch.zeros(1, hidden_size, device=self.device, dtype=self.dtype)}
+        return {"hidden_states": bagel_packed_batch["packed_hidden_states"][bagel_packed_batch["ce_loss_indexes"]]}
+
+    @post_forward("decode")
+    def decode_post(self, **outputs: Any) -> Dict[str, Any]:
+        batch = self._bagel_packed_batch
+        self._bagel_packed_batch = None
+        if batch is None:
+            return super().decode_post(**outputs)
+        result: Dict[str, Any] = {"bagel_packed_batch": batch}
+        if "ce_loss_indexes" not in batch:
+            return result
+        logits = outputs["logits"]
+        ce = F.cross_entropy(logits, batch["packed_label_ids"], reduction="none")
+        batch["ce_vector"] = ce
+        result["_loss"] = ce.mean()
+        return result
 
     @property
     def tokenizer(self) -> Any:
