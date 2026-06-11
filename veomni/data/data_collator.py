@@ -240,6 +240,13 @@ class PackingCollator(DataCollator):
             for key in feature.keys():
                 batch[key].append(feature[key])
 
+        if (
+            "router_aux_loss_mask" in self.collate_infos
+            and "router_aux_loss_mask" not in batch
+            and "attention_mask" in batch
+        ):
+            batch["router_aux_loss_mask"] = [attention_mask.clone() for attention_mask in batch["attention_mask"]]
+
         for key in batch.keys():
             collate_info: DataCollateInfo = self.collate_infos.get(key, None)
             if collate_info is None:

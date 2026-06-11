@@ -50,17 +50,31 @@ config.add_import(
     "veomni.utils.model_outputs",
     names=["FusedLinearAuxOutput", "FusedLinearAuxOutputMixin", "CausalLMOutputWithLogProbs"],
 )
+config.add_import("inspect", is_from_import=False)
 
 config.add_post_import_block(
     """
-    # ── OpSlot declarations ──────────────────────────────────────────────────
-    # Bound at model-build time by _bind_veomni_ops() in auto.py.
-    from veomni.ops.dispatch import OpSlot
-    veomni_rms_norm = OpSlot("rms_norm", "standard")
-    veomni_apply_rotary_pos_emb = OpSlot("rotary_pos_emb", "full")
-    veomni_swiglu_mlp = OpSlot("swiglu_mlp", "standard")
-    veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
-    """
+# ── OpSlot declarations ──────────────────────────────────────────────────
+# Bound at model-build time by _bind_veomni_ops() in auto.py.
+from veomni.ops.dispatch import OpSlot
+veomni_rms_norm = OpSlot("rms_norm", "standard")
+veomni_apply_rotary_pos_emb = OpSlot("rotary_pos_emb", "full")
+veomni_swiglu_mlp = OpSlot("swiglu_mlp", "standard")
+veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
+
+def _veomni_mask_accepts_cache_position(mask_fn):
+    return "cache_position" in inspect.signature(mask_fn).parameters
+
+_VEOMNI_CREATE_CAUSAL_MASK_ACCEPTS_CACHE_POSITION = _veomni_mask_accepts_cache_position(create_causal_mask)
+_VEOMNI_CREATE_SLIDING_MASK_ACCEPTS_CACHE_POSITION = _veomni_mask_accepts_cache_position(
+    create_sliding_window_causal_mask
+)
+
+def _veomni_create_mask(mask_fn, accepts_cache_position, mask_kwargs, cache_position):
+    if accepts_cache_position:
+        return mask_fn(**mask_kwargs, cache_position=cache_position)
+    return mask_fn(**mask_kwargs)
+"""
 )
 
 
@@ -157,9 +171,6 @@ def qwen2_model_forward_patched(
         position_ids = cache_position.unsqueeze(0)
 
     if not isinstance(causal_mask_mapping := attention_mask, dict):
-        # transformers 5.9 dropped ``cache_position`` from ``create_causal_mask``'s
-        # signature ("Deprecated and unused" — see masking_utils.py:917). Keep the
-        # kwargs aligned with upstream 5.9 so the patch loads cleanly.
         mask_kwargs = {
             "config": self.config,
             "inputs_embeds": inputs_embeds,
@@ -168,10 +179,20 @@ def qwen2_model_forward_patched(
             "position_ids": position_ids,
         }
         causal_mask_mapping = {
-            "full_attention": create_causal_mask(**mask_kwargs),
+            "full_attention": _veomni_create_mask(
+                create_causal_mask,
+                _VEOMNI_CREATE_CAUSAL_MASK_ACCEPTS_CACHE_POSITION,
+                mask_kwargs,
+                cache_position,
+            ),
         }
         if self.has_sliding_layers:
-            causal_mask_mapping["sliding_attention"] = create_sliding_window_causal_mask(**mask_kwargs)
+            causal_mask_mapping["sliding_attention"] = _veomni_create_mask(
+                create_sliding_window_causal_mask,
+                _VEOMNI_CREATE_SLIDING_MASK_ACCEPTS_CACHE_POSITION,
+                mask_kwargs,
+                cache_position,
+            )
 
     hidden_states = inputs_embeds
 

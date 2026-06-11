@@ -78,6 +78,8 @@ Example fixed batch size = 2 samples:
 `pad_to_length` can pad the packed sequence to a fixed length. This is useful to avoid uneven lengths that can trigger kernel recompilation.
 - Related GitHub issue: [#402](https://github.com/ByteDance-Seed/VeOmni/issues/402)
 `pad_to_length` is useful only when `dyn_bsz` = True, all the packed sequences in a batch will be padded to the `max_seq_len`.
+It is recommended when `train.cuda_graph.enable=True`, because stable packed shapes reduce the number of
+shape-specialized CUDA graphs that must be captured and cached.
 
 Important details:
 

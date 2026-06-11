@@ -26,11 +26,12 @@ from torch.distributed.tensor.parallel import parallelize_module
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.checkpoint import noop_context_fn
 
-from ..arguments import MixedPrecisionConfig
+from ..arguments import CudaGraphConfig, MixedPrecisionConfig
 from ..models import load_model_weights, rank0_load_and_broadcast_weights
 from ..utils import logging
 from ..utils.device import IS_NPU_AVAILABLE, get_device_type
 from .checkpoint import CheckpointFunction
+from .cuda_graph import apply_layer_cuda_graph
 from .parallel_state import get_parallel_state
 from .utils import sort_fqn_by_submodule_first
 
@@ -427,6 +428,7 @@ def build_parallelize_model(
     enable_gradient_checkpointing: bool = True,
     basic_modules: Optional[List[str]] = None,
     muon_expert_zero_comm: bool = False,
+    cuda_graph: Optional[CudaGraphConfig] = None,
     **kwargs,
 ) -> "nn.Module":
     """Apply parallel strategies to the model.
@@ -437,6 +439,7 @@ def build_parallelize_model(
     """
 
     parallel_state = get_parallel_state()
+    cuda_graph = cuda_graph or CudaGraphConfig()
 
     if not parallel_state.fsdp_enabled:
         if kwargs.get("init_device") not in ["cuda", "npu"]:
@@ -479,5 +482,15 @@ def build_parallelize_model(
             )
         else:
             model = DDP(model, device_ids=[parallel_state.local_rank], process_group=parallel_state.dp_group)
+
+    if cuda_graph.enable:
+        apply_layer_cuda_graph(
+            model,
+            num_warmup_steps=cuda_graph.num_warmup_steps,
+            max_graphs_per_layer=cuda_graph.max_graphs_per_layer,
+            strict=cuda_graph.strict,
+            scope=cuda_graph.scope,
+            capture_module_state=parallel_state.dp_mode == "fsdp2",
+        )
 
     return model

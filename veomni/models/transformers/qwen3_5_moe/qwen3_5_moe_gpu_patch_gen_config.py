@@ -948,20 +948,21 @@ def qwen3_5_moe_forcausallm_forward_patched(
 
     aux_loss = None
     if kwargs.get("output_router_logits", False):
+        router_aux_loss_mask = kwargs.get("router_aux_loss_mask", attention_mask)
         # Modification: OpSlot guard for load-balancing loss.
         if veomni_load_balancing_loss.use_non_eager_impl:
             aux_loss = veomni_load_balancing_loss(
                 outputs.router_logits,
                 self.config.num_experts,
                 self.config.num_experts_per_tok,
-                attention_mask,
+                router_aux_loss_mask,
             )
         else:
             aux_loss = load_balancing_loss_func(
                 outputs.router_logits,
                 self.config.num_experts,
                 self.config.num_experts_per_tok,
-                attention_mask,
+                router_aux_loss_mask,
             )
         if labels is not None:
             loss += self.config.router_aux_loss_coef * aux_loss.to(loss.device)
@@ -1056,20 +1057,21 @@ def qwen3_5_moe_forconditional_generation_forward_patched(
 
     aux_loss = None
     if kwargs.get("output_router_logits", False):
+        router_aux_loss_mask = kwargs.get("router_aux_loss_mask", attention_mask)
         # Modification: OpSlot guard for load-balancing loss.
         if veomni_load_balancing_loss.use_non_eager_impl:
             aux_loss = veomni_load_balancing_loss(
                 outputs.router_logits,
                 self.config.text_config.num_experts,
                 self.config.text_config.num_experts_per_tok,
-                attention_mask,
+                router_aux_loss_mask,
             )
         else:
             aux_loss = load_balancing_loss_func(
                 outputs.router_logits,
                 self.config.text_config.num_experts,
                 self.config.text_config.num_experts_per_tok,
-                attention_mask,
+                router_aux_loss_mask,
             )
         if labels is not None:
             loss += self.config.text_config.router_aux_loss_coef * aux_loss.to(loss.device)

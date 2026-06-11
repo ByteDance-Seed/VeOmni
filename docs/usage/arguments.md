@@ -65,6 +65,7 @@ Training loop, optimizer, parallelism, checkpointing, profiling, and logging.
     * `WandbConfig` — `train.wandb.*`
     * `ProfileConfig` — `train.profile.*`
     * `GradientCheckpointingConfig` — `train.gradient_checkpointing.*`
+    * `CudaGraphConfig` — `train.cuda_graph.*`
     * `AcceleratorConfig` — `train.accelerator.*`
         * `FSDPConfig` — `train.accelerator.fsdp_config.*`
           * `MixedPrecisionConfig` — `train.accelerator.fsdp_config.mixed_precision`
@@ -208,7 +209,6 @@ NPU validation runs at two times:
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
-
 | dyn_bsz | `bool` | `True` | Enable dynamic batch size for padding-free training. |
 | micro_batch_size | `int` | `1` | Number of samples per iteration on each device. |
 | global_batch_size | `Optional[int]` | `None` | Global batch size. If `None`, uses `micro_batch_size × dp_size`. |
@@ -225,14 +225,30 @@ NPU validation runs at two times:
 | eval_steps | `int` | `0` | Steps between evaluations. `0` to disable. |
 | eval_epochs | `int` | `1` | Epochs between evaluations. `0` to disable. |
 | seed | `int` | `42` | Random seed. |
-| enable_compile | `bool` | `False` | Enable `torch.compile`. |
 | max_steps | `Optional[int]` | `None` | Max training steps per epoch (debug only). |
 | optimizer | `OptimizerConfig` | — | Optimizer and learning-rate schedule. |
 | wandb | `WandbConfig` | — | Weights & Biases logging. |
 | profile | `ProfileConfig` | — | Torch profiler settings. |
 | gradient_checkpointing | `GradientCheckpointingConfig` | — | Gradient checkpointing settings. |
+| cuda_graph | `CudaGraphConfig` | — | CUDA graph capture settings. |
 | accelerator | `AcceleratorConfig` | — | Parallelism and distributed-training topology. |
 | checkpoint | `CheckpointConfig` | — | Checkpoint saving and loading. |
+
+### CudaGraphConfig
+
+`train.cuda_graph.*` — CUDA graph capture settings.
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| enable | `bool` | `False` | Enable CUDA graph capture for text-only model decoder modules. |
+| scope | `Literal["auto", "layer", "attn"]` | `"auto"` | CUDA graph capture scope. `"auto"` captures dense decoder layers and captures only attention inside MoE layers with dynamic expert routing; `"layer"` captures whole decoder layers and requires static expert inputs for MoE layers; `"attn"` captures only attention modules. |
+| num_warmup_steps | `int` | `3` | Number of eager calls for each layer/shape before CUDA graph capture. |
+| max_graphs_per_layer | `int` | `16` | Maximum number of shape-specialized CUDA graphs cached per layer. |
+| strict | `bool` | `False` | Raise on CUDA graph capture failure instead of falling back to eager for that layer/shape. |
+
+`train.cuda_graph.enable=True` is supported for text-only models. It cannot be combined with gradient checkpointing,
+and distributed capture requires FSDP2. `scope="layer"` captures whole dense decoder layers; for MoE decoder layers,
+whole-layer capture requires static expert inputs.
 
 ### OptimizerConfig
 

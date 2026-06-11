@@ -112,6 +112,64 @@ def test_data_collator_pad_to_length_sp_disabled(monkeypatch, features_two_sampl
     assert out["max_length_k"] == exp_max_length
 
 
+def test_data_collator_pad_to_length_router_aux_loss_mask(monkeypatch, features_two_samples):
+    if IS_NPU_AVAILABLE:
+        pytest.skip("NPU does not support this padding test yet.")
+    import veomni.data.data_collator as m
+
+    monkeypatch.setattr(m, "get_parallel_state", lambda: _fake_ps(sp_enabled=False))
+    token_labels = [
+        {**features_two_samples[0], "labels": torch.tensor([2, 3, 4], dtype=torch.long)},
+        {**features_two_samples[1], "labels": torch.tensor([1, 2], dtype=torch.long)},
+    ]
+    collator = m.MainCollator(
+        pad_to_length=8,
+        data_collate_info={"router_aux_loss_mask": (-1, True, 0, 1)},
+    )
+    out = collator(token_labels)
+
+    assert torch.equal(out["attention_mask"], torch.ones((1, 8), dtype=torch.long))
+    assert torch.equal(out["router_aux_loss_mask"], torch.tensor([[1, 1, 1, 1, 1, 0, 0, 0]], dtype=torch.long))
+
+
+def test_data_collator_router_aux_loss_mask_without_padding(monkeypatch, features_two_samples):
+    import veomni.data.data_collator as m
+
+    monkeypatch.setattr(m, "get_parallel_state", lambda: _fake_ps(sp_enabled=False))
+    token_labels = [
+        {**features_two_samples[0], "labels": torch.tensor([2, 3, 4], dtype=torch.long)},
+        {**features_two_samples[1], "labels": torch.tensor([1, 2], dtype=torch.long)},
+    ]
+    collator = m.MainCollator(data_collate_info={"router_aux_loss_mask": (-1, True, 0, 1)})
+    out = collator(token_labels)
+
+    assert torch.equal(out["router_aux_loss_mask"], torch.ones((1, 5), dtype=torch.long))
+
+
+def test_data_collator_router_aux_loss_mask_sp_enabled(monkeypatch, features_two_samples):
+    import veomni.data.data_collator as m
+
+    pad_to_length = 8
+    sp_size = 2
+    token_labels = [
+        {**features_two_samples[0], "labels": torch.tensor([2, 3, 4], dtype=torch.long)},
+        {**features_two_samples[1], "labels": torch.tensor([1, 2], dtype=torch.long)},
+    ]
+    data_collate_info = {"router_aux_loss_mask": (-1, True, 0, 1)}
+
+    monkeypatch.setattr(m, "get_parallel_state", lambda: _fake_ps(sp_enabled=True, sp_size=sp_size, sp_rank=0))
+    collator = m.MainCollator(pad_to_length=pad_to_length, data_collate_info=data_collate_info)
+    out = collator(token_labels)
+    assert torch.equal(out["input_ids"], torch.tensor([[11, 12, 13, 21]], dtype=torch.long))
+    assert torch.equal(out["router_aux_loss_mask"], torch.tensor([[1, 1, 1, 1]], dtype=torch.long))
+
+    monkeypatch.setattr(m, "get_parallel_state", lambda: _fake_ps(sp_enabled=True, sp_size=sp_size, sp_rank=1))
+    collator = m.MainCollator(pad_to_length=pad_to_length, data_collate_info=data_collate_info)
+    out = collator(token_labels)
+    assert torch.equal(out["input_ids"], torch.tensor([[22, 0, 0, 0]], dtype=torch.long))
+    assert torch.equal(out["router_aux_loss_mask"], torch.tensor([[1, 0, 0, 0]], dtype=torch.long))
+
+
 def test_seqcls_collator_pad_to_length_sp_enabled(monkeypatch, features_two_samples):
     import veomni.data.data_collator as m
 

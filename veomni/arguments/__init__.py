@@ -16,6 +16,7 @@
 from .arguments_types import (
     AcceleratorConfig,
     CheckpointConfig,
+    CudaGraphConfig,
     DataArguments,
     DataloaderConfig,
     FSDPConfig,
