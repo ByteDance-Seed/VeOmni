@@ -249,7 +249,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--config-dir",
         type=Path,
-        default=Path("configs/seed_omni/bagel_7b_mot"),
+        default=Path("configs/seed_omni/Bagel/bagel_7b_mot"),
     )
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--dtype", choices=("bf16", "fp16", "fp32"), default="bf16")
