@@ -73,12 +73,20 @@ from ..data.data_transform import build_data_transform
 from ..distributed.clip_grad_norm import veomni_clip_grad_norm
 from ..models import build_processor, build_tokenizer
 from ..models.seed_omni.modeling_omni import OmniModel
+from ..models.seed_omni.tracemixin import TraceMixin, TraceResult
 from ..ops.batch_invariant_ops import set_batch_invariant_mode
 from ..utils import helper, logging
 from ..utils.device import synchronize
 from ..utils.model_utils import pretty_print_trainable_parameters
 from .base import BaseTrainer
-from .callbacks import Callback, CheckpointerCallback, HFLoraCkptCallback, HuggingfaceCkptCallback, TrainerState
+from .callbacks import (
+    Callback,
+    CheckpointerCallback,
+    HFLoraCkptCallback,
+    HuggingfaceCkptCallback,
+    OmniEnvironMeterCallback,
+    TrainerState,
+)
 
 
 if TYPE_CHECKING:
@@ -426,6 +434,12 @@ class OmniModuleTrainer:
         # assembled in :meth:`_build_model_assets` above.
         self.base.train_dataloader = None
 
+        # Last-step per-module trace contribution (theoretical_flops, seqlens),
+        # computed at on_step_end from the optional TraceMixin on
+        # ``self.base.model``.  No per-module timing — the whole-graph delta is
+        # owned by the orchestrator (a module's own wall-clock is meaningless).
+        self._trace_result: Optional[TraceResult] = None
+
         # This module's own checkpoint callbacks (DCP resume + HF/LoRA export),
         # reusing the shared single-model callbacks.  ``subfolder_name`` (the
         # module's YAML key) is the ``<module>/`` checkpoint subdir.  Optimizer /
@@ -444,7 +458,61 @@ class OmniModuleTrainer:
         """Build this module's lr-scheduler (needs ``base.args.train_steps`` set)."""
         self.base._build_lr_scheduler()
 
-    # ── Callbacks (checkpoint only; trace lives on the orchestrator) ───────────
+    # ── Per-node forward (graph entry-point) + trace metering ──────────────────
+
+    def forward(self, method: str, **kwargs: Any) -> Dict[str, Any]:
+        """Run one training-graph node for this module.
+
+        The OmniModel's training graph dispatches every node here (see
+        :meth:`OmniModel.set_node_executors`).  Every SeedOmni sub-module is an
+        OmniModule, so we always run ``pre_forward`` → ``method`` →
+        ``post_forward``; right after ``pre_forward`` — when the real input
+        tensors are in hand — we feed the *optional* per-module trace meter via
+        ``trace_add``.  This is the analogue of the base trainer's
+        ``EnvironMeterCallback.add``: token lengths are read straight from the
+        data, never hand-computed inside the module's ``pre_forward``.
+
+        Non-``forward`` methods (``encode`` / ``decode`` / …) are dispatched by
+        temporarily pointing ``model.forward`` at the target method, so every node
+        — whatever its method name — runs through ``model.__call__`` and gets the
+        same FSDP2 lifecycle (all-gather pre-hook + reduce-scatter backward hook)
+        as a plain ``forward`` node.  Calling the method directly would run
+        against still-sharded DTensor params and skip gradient sync.
+        """
+        model = self.base.model
+
+        kwargs = model.pre_forward(method=method, **kwargs)
+
+        # Tracing is opt-in via multi-inheriting a TraceMixin on the concrete
+        # model; only those modules accumulate token lengths.
+        if isinstance(model, TraceMixin):
+            model.trace_add(method, kwargs)
+
+        if method == "forward":
+            out = model(**kwargs)
+        else:
+            fn = getattr(model, method, None)
+            if fn is None:
+                raise AttributeError(f"Node method {type(model).__name__}.{method}() is not implemented.")
+            orig_forward = model.forward
+            try:
+                model.forward = fn
+                out = model(**kwargs)
+            finally:
+                model.forward = orig_forward
+
+        return model.post_forward(method=method, **out)
+
+    def collect_trace(self) -> Optional[TraceResult]:
+        """The per-module trace computed at the last :meth:`on_step_end`.
+
+        Returns ``(theoretical_flops, seqlens)`` for a tracing module, else
+        ``None``.  The orchestrator reads this once per step and rolls every
+        module's contribution into the overall throughput / MFU.
+        """
+        return self._trace_result
+
+    # ── Callbacks (checkpoint + trace; both per-module) ────────────────────────
 
     def _init_callbacks(self, subfolder_name: str):
         """Build this module's DCP resume + HF/LoRA export callbacks.
@@ -476,11 +544,15 @@ class OmniModuleTrainer:
         self.checkpointer_callback.on_epoch_end(state)
         self.hf_ckpt_callback.on_epoch_end(state)
 
-    def on_step_begin(self, state, **kwargs):
-        self.checkpointer_callback.on_step_begin(state, **kwargs)
-        self.hf_ckpt_callback.on_step_begin(state, **kwargs)
-
     def on_step_end(self, state, **kwargs):
+        # Stash this module's time-independent trace contribution
+        # (theoretical_flops, seqlens). The orchestrator applies the whole-graph
+        # delta to derive achieved FLOPs / MFU; there is no per-module timing
+        # (this fires only after the whole graph's fwd+bwd, so a module-local
+        # wall-clock would be the whole-step time, not its own).
+        # Tracing is opt-in: only modules that multi-inherit a TraceMixin report.
+        model = self.base.model
+        self._trace_result = model.trace_collect() if isinstance(model, TraceMixin) else None
         self.checkpointer_callback.on_step_end(state, **kwargs)
         self.hf_ckpt_callback.on_step_end(state, **kwargs)
 
@@ -627,8 +699,15 @@ class OmniTrainer:
             modules[name] = module_trainer.base.model
             logger.info_rank0(f"OmniTrainer: built module-trainer '{name}' from {module_config.model.model_path}")
 
-        base.model = OmniModel(self.omni_config, modules)
+        model = OmniModel(self.omni_config, modules)
         base.model_config = self.omni_config
+
+        # Route the training graph's per-node execution through each module's
+        # OmniModuleTrainer.forward, which wraps pre_forward / method /
+        # post_forward and drives the per-module trace meter.
+        model.set_node_executors({name: mt.forward for name, mt in self.module_trainers.items()})
+
+        base.model = model
         logger.info_rank0(
             f"OmniTrainer: composed OmniModel with {len(self.module_names)} modules ({self.module_names})."
         )
@@ -716,8 +795,31 @@ class OmniTrainer:
         """
         base = self.base
         base._init_callbacks()
+        # The single-model EnvironMeterCallback can't meter OmniModel (no single
+        # model_type for FLOPs, entry batch carries only conversation_list).
+        # Swap in the per-module trace meter, which delegates token / FLOPs / MFU
+        # to each module's TraceMixin and merges them under ``trace/<module>/``.
+        base.environ_meter_callback = OmniEnvironMeterCallback(self)
         base.checkpointer_callback = OmniGlobalStateCallback(self)
         base.hf_ckpt_callback = Callback(base)
+
+    # ── Trace metering (gather each module's tokens + theoretical FLOPs) ───────
+
+    def collect_module_trace(self) -> Dict[str, TraceResult]:
+        """Gather every tracing module's ``(theoretical_flops, seqlens)``.
+
+        Each :class:`OmniModuleTrainer` stashed its time-independent contribution
+        in its own ``on_step_end``; here we only read the results.  The meter
+        (:class:`~veomni.utils.omni_helper.OmniEnvironMeter`) sums the FLOPs and merges the token
+        lengths, then applies the single whole-graph time to get the overall
+        achieved FLOPs / MFU.  Non-tracing modules contribute nothing.
+        """
+        traces: Dict[str, TraceResult] = {}
+        for name, module_trainer in self.module_trainers.items():
+            result = module_trainer.collect_trace()
+            if result is not None:
+                traces[name] = result
+        return traces
 
     # ── Forward / backward (override single-model path) ────────────────────────
 
@@ -826,14 +928,21 @@ class OmniTrainer:
             module_trainer.on_epoch_end(self.base.state)
 
     def on_step_begin(self, micro_batches=None):
+        # Only the orchestrator's meter starts here (records the single
+        # whole-graph start time + multi-source ds_idx). Module-trainers do NOT
+        # run on_step_begin: per-module token counting happens inside their
+        # ``forward`` (right after each module's pre_forward), and per-module
+        # timing is meaningless (see OmniEnvironMeter).
         self.base.on_step_begin(micro_batches=micro_batches)
-        for module_trainer in self.module_trainers.values():
-            module_trainer.on_step_begin(self.base.state, micro_batches=micro_batches)
 
     def on_step_end(self, loss=None, loss_dict=None, grad_norm=None):
-        self.base.on_step_end(loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
+        # Module-trainers first: each stashes its per-module trace contribution
+        # (``trace_collect`` → theoretical_flops + seqlens) + runs its checkpoint
+        # callbacks. The orchestrator's trace callback (inside ``base.on_step_end``)
+        # then reads those results, so module-trainers must run *before* it.
         for module_trainer in self.module_trainers.values():
             module_trainer.on_step_end(self.base.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
+        self.base.on_step_end(loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
 
     # ── Train loop (mirrors BaseTrainer.train / VLMTrainer.train) ──────────────
 

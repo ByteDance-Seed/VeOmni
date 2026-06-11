@@ -14,6 +14,7 @@ from ....conversation import (
 )
 from ....generation_graph import FSM_SIGNAL_KEY
 from ....module import ModuleMixin
+from ....tracemixin import TraceMixin
 from .configuration import JanusVqvaeConfig
 from .processing import JanusVqvaeProcessor
 
@@ -279,4 +280,31 @@ class JanusVqvaeModuleMixin(ModuleMixin):
         return torch.multinomial(probs, num_samples=1).squeeze(-1)
 
 
-__all__ = ["JanusVqvaeModuleMixin"]
+class JanusVqvaeTraceMixin(TraceMixin):
+    """Per-module training-trace for the Janus VQVAE codec + generation head."""
+
+    config: JanusVqvaeConfig
+    _processor: JanusVqvaeProcessor
+
+    def trace_token_lengths(self, method: str, data: Dict[str, Any]) -> List[int]:
+        # Count VQ image tokens on encode only; decode is the generation-head /
+        # sampling path and contributes nothing (returns []).
+        if method != "encode":
+            return []
+        pixel_values = data.get("pixel_values")
+        if pixel_values is None:
+            return []
+        return [int(self._processor.num_image_tokens)] * int(pixel_values.shape[0])
+
+    def estimate_flops(self, seqlens: List[int]) -> float:
+        # The inner VQ codec (``vqmodel``) is a frozen conv stack (``config.freeze``
+        # defaults to True → forward-only, no backward) whose conv FLOPs are
+        # architecture-specific and not modeled here; the trainable generation
+        # head runs on ``decode``, which we deliberately don't count. So this
+        # module injects no FLOPs into the global MFU — only its token count is
+        # tracked above. (Add the codec conv estimate here if you need it.)
+        del seqlens
+        return 0.0
+
+
+__all__ = ["JanusVqvaeModuleMixin", "JanusVqvaeTraceMixin"]

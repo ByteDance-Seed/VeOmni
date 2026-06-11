@@ -4,6 +4,8 @@ import torch
 
 from ....conversation import ConversationItem, collect_desired_values, iter_desired_items
 from ....module import ModuleMixin
+from ....tracemixin import TraceMixin
+from .configuration import JanusSiglipConfig
 
 
 class JanusSiglipModuleMixin(ModuleMixin):
@@ -91,4 +93,45 @@ class JanusSiglipModuleMixin(ModuleMixin):
         return {"conversation_list": conversation_list}
 
 
-__all__ = ["JanusSiglipModuleMixin"]
+class JanusSiglipTraceMixin(TraceMixin):
+    """Per-module training-trace for the SigLIP vision tower."""
+
+    config: JanusSiglipConfig
+
+    def trace_token_lengths(self, method: str, data: Dict[str, Any]) -> List[int]:
+        # One ViT sequence per image; tokens = patches = (image/patch)**2.
+        # (SP would slice the image batch dim, so this is the local count — the
+        # vision tower has no full-length cu_seqlens to recover from.)
+        pixel_values = data.get("pixel_values")
+        if pixel_values is None:
+            return []
+        cfg = self.config.vision_config
+        patches = (cfg.image_size // cfg.patch_size) ** 2
+        return [patches] * int(pixel_values.shape[0])
+
+    def estimate_flops(self, seqlens: List[int]) -> float:
+        # SigLIP ViT: patch-embed conv + per-layer (q/k/v/o attn proj + GELU MLP)
+        # + quadratic attention. fwd+bwd ⇒ 6x linear, 12x attention. The small
+        # aligner MLP is negligible and omitted.
+        cfg = self.config.vision_config
+        dim = cfg.hidden_size
+        num_layers = cfg.num_hidden_layers
+        num_heads = cfg.num_attention_heads
+        head_dim = dim // num_heads
+        in_channels = getattr(cfg, "num_channels", 3)
+        # JanusVisionConfig sizes the MLP via mlp_ratio (no `intermediate_size`).
+        intermediate_size = int(dim * cfg.mlp_ratio)
+
+        patch_embed_n = dim * in_channels * cfg.patch_size * cfg.patch_size
+        attn_linear_n = dim * 4 * dim  # q, k, v, o
+        mlp_n = dim * intermediate_size * 2  # fc1 + fc2 (GELU, no GLU)
+        dense_n = patch_embed_n + (attn_linear_n + mlp_n) * num_layers
+
+        tokens = sum(seqlens)
+        seqlen_sq = sum(s * s for s in seqlens)
+        dense_flops = 6 * dense_n * tokens
+        attn_flops = 12 * seqlen_sq * head_dim * num_heads * num_layers
+        return (dense_flops + attn_flops) / 1e12
+
+
+__all__ = ["JanusSiglipModuleMixin", "JanusSiglipTraceMixin"]

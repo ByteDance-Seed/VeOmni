@@ -72,6 +72,76 @@ The mixins expose **optional hooks** with safe defaults:
 | `get_parallel_plan()` | build | per-module FSDP/SP plan |
 | `get_assets()` | save | processors / tokenizers to checkpoint |
 | `dummy_inputs(...)` | training | zero placeholders to keep FSDP aligned |
+| `trace_add(...)` / `trace_collect(...)` | training | **optional** per-module token + theoretical-FLOPs meter (`TraceMixin`; driven by the module-trainer, not `pre_forward`) |
+
+#### Optional per-module trace (`tracemixin.py`, `TraceMixin`)
+
+`OmniModel` has no single `model_type` to estimate FLOPs on, so **FLOPs / MFU
+accounting is per-module and opt-in**. The per-module meter is the optional
+`TraceMixin` living on the module itself (`self.base.model` may or may not be a
+`TraceMixin`) — the per-module analogue of how `helper.EnvironMeter` lives on the
+trainer. A module opts in by mixing in `TraceMixin` (alongside `ModuleMixin`) and
+implementing two hooks itself — `trace_token_lengths(method, data)` (its token
+count) and `estimate_flops(seqlens)` (its own theoretical-FLOPs formula). It does
+**not** touch its own `init_omni_state` / `pre_forward`. There is **no** shared
+whole-model FLOPs counter: that would mis-count at module granularity (e.g. an AR
+backbone owns no `wte` / `lm_head`, so those FLOPs belong to the `text_encoder`,
+not the backbone — each module counts only what it actually computes).
+
+A module has exactly **one** `seqlens`: a token is a token, whether it's a text
+token, an image patch, or a VQ token — the mixin does not distinguish modalities.
+A module only ever produces **time-independent** quantities (tokens + theoretical
+FLOPs); all timing / MFU lives at the orchestrator.
+
+Execution is driven by the module-trainer (not the module's `pre_forward`). The
+training graph dispatches every node through
+`OmniModuleTrainer.forward(method, **kwargs)`
+(`OmniModel.set_node_executors(...)`), which:
+
+1. runs the module's `pre_forward` → real input tensors;
+2. feeds the meter `trace_add(method, data)` — the analogue of `EnvironMeter.add`.
+   **Each module implements its own** `trace_token_lengths(method, data)` +
+   `estimate_flops(seqlens)` (no generic defaults). For Janus:
+   - `janus_llama` (backbone) — packed `cu_seq_lens_q`; FLOPs = transformer
+     layers (no `lm_head`/`wte`).
+   - `janus_text_encoder` (via base `text_encoder`) — `input_ids` on `encode`;
+     FLOPs = `lm_head` (`vocab × hidden`).
+   - `janus_siglip` — patches-per-image from `pixel_values`; FLOPs = ViT.
+   - `janus_vqvae` — VQ tokens on `encode`, `[]` on `decode`; FLOPs = 0 (frozen
+     codec, generation head not counted) — token count only.
+
+   **SP note:** the backbone (`cu_seq_lens_q`) and text encoder (`input_ids`,
+   pre-LLM full length) read full-sequence quantities, so the count is correct
+   under sequence parallelism (which is also how the single-model `EnvironMeter`
+   stays SP-safe — it counts the full `attention_mask`/`cu_seqlens` and reduces
+   over `dp_group`, which excludes SP). Vision modules count the local image
+   batch, which SP would slice — an accepted limitation;
+3. runs the requested method (through the FSDP wrapper) + `post_forward`.
+
+At the module-trainer's `on_step_end`, `trace_collect()` returns
+`(estimate_flops(seqlens), seqlens)` — **no timing, no MFU, no reduction**. The
+orchestrator (`OmniEnvironMeterCallback` + `OmniEnvironMeter`, in
+`veomni/utils/omni_helper.py`) owns the single whole-graph timing and the
+**global** roll-up. Its `add(micro_batch)` (per micro-batch) computes **only** the
+sample count + multi-source ds_idx — **not** token lengths (those come from the
+modules); its `step(...)` then:
+
+- **achieved FLOPs / MFU** — sum every module's theoretical FLOPs, DP-reduce, and
+  divide by the one forward+backward delta. (A per-module wall-clock is
+  meaningless: a module's `on_step_end` fires only after the *whole* graph, so it
+  would see the whole-step time, not its own.)
+- **merge** all modules' token lengths into one batch → token / consume-tokens /
+  tokens-per-second statistics. The **chunk count** is the real sample count from
+  `add` (one per conversation), not the merged-seqlens length;
+- **multi-source** per-dataset accounting — ds_idx from `add` zipped with the
+  per-sample seqlens of the backbone (the module whose `seqlens` has one entry
+  per sample); skipped with a warning if none aligns;
+- **device / host memory** + cache-empty / GC cadence.
+
+`OmniTrainer.on_step_begin` only records the single start time + calls `add` per
+micro-batch; it does **not** cascade to module-trainers. There is **no
+image-seqlens concept** anywhere. Modules that don't implement the trace hooks
+contribute nothing.
 
 ### 2.2 `ConversationItem` — the data carrier (`conversation.py`)
 

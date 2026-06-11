@@ -38,7 +38,13 @@ from typing import Any, Dict, List, Optional, Type
 
 
 class ModuleMixin:
-    """Unified SeedOmni V2 mixin for both training and inference hooks."""
+    """Unified SeedOmni V2 mixin for both training and inference hooks.
+
+    A module opts into the optional per-module training trace separately, by
+    multi-inheriting its own ``XxxTraceMixin(TraceMixin)`` on the concrete model
+    (``ModuleMixin`` itself does **not** inherit ``TraceMixin``).  See
+    :class:`~veomni.models.seed_omni.tracemixin.TraceMixin`.
+    """
 
     processor_class: Optional[Type[Any]] = None
     tokenizer_class: Optional[Type[Any]] = None
