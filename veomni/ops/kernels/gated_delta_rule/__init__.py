@@ -144,8 +144,8 @@ KERNEL_REGISTRY.register(
 def _flash_qla_chunk_gated_delta_rule_factory():
     """Return the FlashQLA implementation of chunk gated delta rule.
 
-    Source: https://github.com/QwenLM/FlashQLA — opt-in via the ``flash-qla``
-    pyproject extra. FlashQLA mirrors the FLA call signature
+    Source: https://github.com/QwenLM/FlashQLA — shipped under the ``gpu``
+    extra (Hopper SM90 only). FlashQLA mirrors the FLA call signature
     (``query, key, value, g, beta, initial_state, output_final_state,
     use_qk_l2norm_in_kernel, cu_seqlens``) so the call site in
     ``Qwen3_5GatedDeltaNet.forward`` does not need to branch.

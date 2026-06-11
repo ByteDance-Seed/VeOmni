@@ -222,15 +222,17 @@ explicit = true
 # Static metadata bypasses the build hook during resolution. flash-qla has no
 # pyproject.toml, so without explicit `version` uv runs its setup.py on a
 # fresh (unseeded) venv and crashes with `ModuleNotFoundError: No module
-# named 'setuptools'`. flash-qla's setup.py also lists tilelang/apache-tvm-ffi
-# in install_requires; `requires-dist = ["torch"]` overrides that (tilelang
-# is only needed at runtime when the user opts into
-# `chunk_gated_delta_rule_implementation: flash_qla`).
+# named 'setuptools'`. The `requires-dist` mirrors flash-qla's own
+# install_requires — flash_qla/__init__.py top-level imports tilelang
+# (which itself transitively requires apache-tvm-ffi), so any code that
+# imports flash_qla (including VeOmni's lazy factory in
+# veomni/ops/kernels/gated_delta_rule) needs them present, not just users
+# who opt into the kernel at runtime.
 # Version: flash_qla setup.py = "0.1.0".
 [[tool.uv.dependency-metadata]]
 name = "flash-qla"
 version = "0.1.0"
-requires-dist = ["torch"]
+requires-dist = ["torch", "tilelang==0.1.8", "apache-tvm-ffi==0.1.9"]
 
 # Seeds the build env (uv-created venvs are not seeded by default).
 [tool.uv.extra-build-dependencies]

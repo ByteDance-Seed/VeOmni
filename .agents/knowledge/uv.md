@@ -89,7 +89,11 @@ Two pyproject knobs make source builds (FA4, FlashQLA) succeed:
 1. **`[[tool.uv.dependency-metadata]]`** with `version` for `flash-qla`.
    It has no `pyproject.toml`; without static metadata uv runs its setup.py
    on a fresh venv and crashes with `ModuleNotFoundError: No module named
-   'setuptools'`.
+   'setuptools'`. The static `requires-dist` mirrors flash-qla's own
+   install_requires (`torch`, `tilelang==0.1.8`, `apache-tvm-ffi==0.1.9`)
+   — `flash_qla/__init__.py` top-level imports `tilelang`, so they have to
+   ship alongside, even though the `flash_qla` kernel itself only binds on
+   sm90 (gated by `KernelSpec(min_compute_capability=90)`).
 
 2. **`[tool.uv.extra-build-dependencies]`** seeds `setuptools / wheel /
    packaging / ninja` (+ `torch` where needed) — uv venvs are not seeded.
