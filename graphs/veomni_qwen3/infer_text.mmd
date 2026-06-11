@@ -5,27 +5,16 @@ title: veomni_qwen3 — infer_text
 flowchart LR
     fsm_start(("▶")):::fsm_start
     fsm_done(("⏹")):::fsm_terminal
-    subgraph state_prompt_encode [prompt_encode]
-        direction TB
-        prompt_encode__token_generate["token_generate<br/><i>qwen3_text_encoder.forward</i>"]:::body_node
-        prompt_encode__qwen3_llm["qwen3_llm<br/><i>qwen3_llm.forward</i>"]:::body_node
-        prompt_encode__token_generate --> prompt_encode__qwen3_llm
-        prompt_encode__qwen3_llm --> prompt_encode__token_generate
-    end
     subgraph state_text_ar [text_ar]
         direction TB
-        text_ar__token_generate["token_generate<br/><i>qwen3_text_encoder.forward</i>"]:::body_node
-        text_ar__qwen3_llm["qwen3_llm<br/><i>qwen3_llm.forward</i>"]:::body_node
-        text_ar__token_generate --> text_ar__qwen3_llm
-        text_ar__qwen3_llm --> text_ar__token_generate
+        text_ar__qwen3_text_encoder_generate["<i>qwen3_text_encoder.generate</i>"]:::body_node
+        text_ar__qwen3_llm_generate["<i>qwen3_llm.generate</i>"]:::body_node
+        text_ar__qwen3_text_encoder_generate --> text_ar__qwen3_llm_generate
+        text_ar__qwen3_llm_generate --> text_ar__qwen3_text_encoder_generate
     end
-    state_prompt_encode -.-> state_prompt_encode
-    state_text_ar -.-> state_text_ar
-    fsm_start ==> state_prompt_encode
-    state_prompt_encode ==>|"module_signal(text_done)"| fsm_done
-    state_prompt_encode ==>|"default"| state_text_ar
+    fsm_start ==> state_text_ar
     state_text_ar ==>|"module_signal(text_done)"| fsm_done
     classDef body_node fill:#fff,stroke:#666
     classDef fsm_start fill:#dff,stroke:#06c,stroke-width:2px
     classDef fsm_terminal fill:#eee,stroke:#333,stroke-width:1px,stroke-dasharray:3 3
-    style state_prompt_encode fill:#eef,stroke:#06c,stroke-width:2px
+    style state_text_ar fill:#eef,stroke:#06c,stroke-width:2px
