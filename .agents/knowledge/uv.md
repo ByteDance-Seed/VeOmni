@@ -22,7 +22,8 @@ pyproject.toml
 ├── [project.optional-dependencies]     Hardware-shaped extras (deliberately just three + legacy `dev`)
 │   ├── gpu          NVIDIA x86_64 — full superset:
 │   │                  torch 2.11.0+cu130 + cu130 nvidia stack + cuda-python
-│   │                  + FA2 / FA3 / FA4 / FlashQLA (all source-built)
+│   │                  + FA2 (cp311/cp312 wheels) / FA3 (sm90 abi3 wheel)
+│   │                  + FA4 / FlashQLA (source-built from git)
 │   │                  + liger-kernel + FLA + quack + DLPack ext
 │   │                  + diffusers / av / librosa / soundfile / ftfy / peft
 │   │                  + megatron-energon (optional dataset format)
@@ -41,9 +42,9 @@ pyproject.toml
 │   ├── required-version     Pinned uv version
 │   ├── override-dependencies  Per-extra torch/CUDA pins (markers scoped to gpu/npu/npu_aarch64)
 │   ├── conflicts            gpu/npu/npu_aarch64 mutual exclusion
-│   ├── no-build-isolation-package  flash-attn, flash-attn-3
-│   └── sources              Custom indexes, direct wheel URLs (av, torch),
-│                            git sources (flash-attn-3 / flash-attn-4 / flash-qla)
+│   └── sources              Custom indexes, direct wheel URLs (av, torch,
+│                            FA2 cp311/cp312, FA3 sm90 abi3); git sources
+│                            (flash-attn-4 / flash-qla)
 └── uv.lock                  Lockfile (committed, used by Docker --locked)
 ```
 
@@ -58,8 +59,9 @@ uv sync --extra npu --dev           # Ascend NPU x86
 uv sync --extra npu_aarch64 --dev   # Ascend NPU ARM (minimal)
 ```
 
-A fresh `--extra gpu` source-builds FA2/FA3/FA4/FlashQLA (~60–90 min total).
-uv caches the wheels under `~/.cache/uv` for subsequent syncs.
+A fresh `--extra gpu` installs FA2/FA3 from prebuilt wheels (cp311 + cp312)
+and source-builds only FA4 + FlashQLA (~10–20 min total). uv caches built
+wheels under `~/.cache/uv`.
 
 ## Transformers Version
 
@@ -73,43 +75,43 @@ forced into a specific 5.x patch.
   cu128_full wheels that drop nvidia-* deps.
 - **NPU**: pytorch index (`https://download.pytorch.org/whl/`).
 
-## Source-Built Attention Kernels
+## Attention Kernels
 
-| Package | Source | `no-build-isolation-package` |
+| Package | Source | Notes |
 |---|---|---|
-| `flash-attn` (FA2) | PyPI sdist | yes |
-| `flash-attn-3` (Hopper) | git: Dao-AILab/flash-attention/hopper | yes |
-| `flash-attn-4` (cute) | git: Dao-AILab/flash-attention/flash_attn/cute | no |
-| `flash-qla` | git: QwenLM/FlashQLA | no |
+| `flash-attn` (FA2) | cp311 wheel (v0.0.3) + cp312 wheel (v0.0.5), Luosuu cu130/torch2.11/sm80-100 | one wheel per Python minor |
+| `flash-attn-3` (Hopper) | cp310-abi3 wheel (v0.0.5), Luosuu cu130/torch2.11/sm90 | abi3 covers cp310+ |
+| `flash-attn-4` (cute) | git: Dao-AILab/flash-attention/flash_attn/cute | source-built |
+| `flash-qla` | git: QwenLM/FlashQLA | source-built |
 
-Three pyproject knobs make a fresh `uv sync --extra gpu` succeed:
+Two pyproject knobs make source builds (FA4, FlashQLA) succeed:
 
-1. **`[[tool.uv.dependency-metadata]]`** with `version` for `flash-attn-3`
-   and `flash-qla`. They have no `pyproject.toml`; without static metadata
-   uv runs their setup.py on a fresh venv and crashes with
-   `ModuleNotFoundError: No module named 'setuptools'`.
+1. **`[[tool.uv.dependency-metadata]]`** with `version` for `flash-qla`.
+   It has no `pyproject.toml`; without static metadata uv runs its setup.py
+   on a fresh venv and crashes with `ModuleNotFoundError: No module named
+   'setuptools'`.
 
 2. **`[tool.uv.extra-build-dependencies]`** seeds `setuptools / wheel /
    packaging / ninja` (+ `torch` where needed) — uv venvs are not seeded.
 
-3. **`FLASH_ATTENTION_FORCE_BUILD=TRUE`** (env var) forces FA2/FA3 setup.py
-   to source-build instead of guessing a github prebuilt wheel URL (no cu13
-   variants exist). Set in the cuda Dockerfile; export locally.
+`FLASH_ATTENTION_FORCE_BUILD=TRUE` and `[tool.uv.no-build-isolation-package]`
+are gone — no FA setup.py runs anywhere now (FA2/3 wheel, FA4 cute is a
+DSL package, flash-qla uses dependency-metadata).
 
 ## Common Commands
 
 ```bash
-FLASH_ATTENTION_FORCE_BUILD=TRUE uv sync --extra gpu --dev   # local dev
-uv lock                                                       # after pyproject edits
-uv sync --locked --all-packages --extra gpu --dev            # docker / CI
+uv sync --extra gpu --dev                          # local dev (cp311 or cp312)
+uv lock                                             # after pyproject edits
+uv sync --locked --all-packages --extra gpu --dev  # docker / CI
 ```
 
 ## Key Rules
 
 1. **Always commit `uv.lock` with `pyproject.toml`** — Docker uses `--locked`.
 2. **torch bumps touch 4+ places** (extras, overrides, sources wheel URL).
-3. **All four flash-attn/qla kernels compile from source every fresh sync.**
-   `FLASH_ATTENTION_FORCE_BUILD=TRUE` is required for FA2/FA3.
+3. **FA2/FA3 prebuilt wheels are pinned to torch 2.11 cu130 cp311/cp312/abi3.**
+   Bumping torch / Python / cuda requires a matching Luosuu release.
 4. **uv bumps require Docker rebuilds**; concrete pins must stay in range.
 5. **`override-dependencies` `extra == '...'` markers are load-bearing.**
 6. **`transformers==5.9.0` is the only supported version.** New code targets

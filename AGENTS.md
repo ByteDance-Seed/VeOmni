@@ -34,9 +34,7 @@ On session start, read the following:
 ## Setup
 
 ```bash
-# FLASH_ATTENTION_FORCE_BUILD=TRUE forces FA2/FA3 source build (no cu13
-# prebuilt wheels exist). The cuda Dockerfile sets this env globally.
-FLASH_ATTENTION_FORCE_BUILD=TRUE uv sync --extra gpu --dev
+uv sync --extra gpu --dev
 source .venv/bin/activate
 ```
 

@@ -18,15 +18,13 @@ CUDA 13.0 (the `gpu` extra targets `+cu130` torch wheels and the `nvcr.io/nvidia
 git clone https://github.com/ByteDance-Seed/VeOmni.git
 cd VeOmni
 
-# FLASH_ATTENTION_FORCE_BUILD=TRUE forces FA2/FA3 source build (no cu13
-# prebuilt wheels exist as of 2026-06).
-FLASH_ATTENTION_FORCE_BUILD=TRUE uv sync --locked --extra gpu
+uv sync --locked --extra gpu
 source .venv/bin/activate
 ```
 
-`gpu` is a single full superset: cu130 torch, FA2/3/4/FlashQLA (all
-source-built, ~60–90 min on a fresh sync — uv caches subsequent syncs),
-diffusion / audio / video / LoRA deps, and `megatron-energon` for the
+`gpu` is a single full superset: cu130 torch, FA2 (cp311/cp312 prebuilt
+wheels) / FA3 (sm90 abi3 prebuilt wheel) / FA4 / FlashQLA, diffusion / audio /
+video / LoRA deps, and `megatron-energon` for the
 optional energon dataset format. See
 [pyproject.toml](https://github.com/ByteDance-Seed/VeOmni/blob/main/pyproject.toml)
 for the full list.

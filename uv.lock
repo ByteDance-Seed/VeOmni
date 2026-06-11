@@ -49,10 +49,6 @@ overrides = [
 ]
 
 [[manifest.dependency-metadata]]
-name = "flash-attn"
-requires-dist = ["torch"]
-
-[[manifest.dependency-metadata]]
 name = "flash-qla"
 version = "0.1.0"
 requires-dist = ["torch"]
@@ -683,21 +679,57 @@ wheels = [
 
 [[package]]
 name = "flash-attn"
-version = "2.8.3"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/3b/b2/8d76c41ad7974ee264754709c22963447f7f8134613fd9ce80984ed0dab7/flash_attn-2.8.3.tar.gz", hash = "sha256:1e71dd64a9e0280e0447b8a0c2541bad4bf6ac65bdeaa2f90e51a9e57de0370d", size = 8447812, upload-time = "2025-08-15T08:28:12.911Z" }
+version = "2.8.4+20260608.cu130torch2110cxx11abitrue.bc58ab.sm80sm89sm90sm100"
+source = { url = "https://github.com/Luosuu/flash-attention3-wheels/releases/download/v0.0.3/flash_attn-2.8.4+20260608.cu130torch2110cxx11abitrue.bc58ab.sm80sm89sm90sm100-cp311-cp311-linux_x86_64.whl" }
+resolution-markers = [
+    "python_full_version < '3.12' and sys_platform == 'linux'",
+    "python_full_version < '3.12' and sys_platform != 'linux'",
+]
+dependencies = [
+    { name = "einops", marker = "python_full_version < '3.12'" },
+]
+wheels = [
+    { url = "https://github.com/Luosuu/flash-attention3-wheels/releases/download/v0.0.3/flash_attn-2.8.4+20260608.cu130torch2110cxx11abitrue.bc58ab.sm80sm89sm90sm100-cp311-cp311-linux_x86_64.whl", hash = "sha256:e3713f92c7ac5d2f3a76138c5a8fd0175a6a148e08f13254905b65db01974107" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "einops" },
+    { name = "torch" },
+]
+
+[[package]]
+name = "flash-attn"
+version = "2.8.4+20260610.cu130torch2110cxx11abitrue.fb02fc.sm80sm89sm90sm100"
+source = { url = "https://github.com/Luosuu/flash-attention3-wheels/releases/download/v0.0.5/flash_attn-2.8.4+20260610.cu130torch2110cxx11abitrue.fb02fc.sm80sm89sm90sm100-cp312-cp312-linux_x86_64.whl" }
+resolution-markers = [
+    "python_full_version >= '3.12' and sys_platform == 'linux'",
+    "python_full_version >= '3.12' and sys_platform != 'linux'",
+]
+dependencies = [
+    { name = "einops", marker = "python_full_version >= '3.12'" },
+]
+wheels = [
+    { url = "https://github.com/Luosuu/flash-attention3-wheels/releases/download/v0.0.5/flash_attn-2.8.4+20260610.cu130torch2110cxx11abitrue.fb02fc.sm80sm89sm90sm100-cp312-cp312-linux_x86_64.whl", hash = "sha256:ebb89820d634817a853a0099d62d3506c39b26a18ce20be25a41994b13ab7166" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "einops" },
+    { name = "torch" },
+]
 
 [[package]]
 name = "flash-attn-3"
-version = "3.0.0+20260609.cu130torch2110cxx11abitrue.bc58ab.sm90"
-source = { url = "https://github.com/Luosuu/flash-attention3-wheels/releases/download/v0.0.3/flash_attn_3-3.0.0+20260609.cu130torch2110cxx11abitrue.bc58ab.sm90-cp310-abi3-linux_x86_64.whl" }
+version = "3.0.0+20260610.cu130torch2110cxx11abitrue.fb02fc.sm90"
+source = { url = "https://github.com/Luosuu/flash-attention3-wheels/releases/download/v0.0.5/flash_attn_3-3.0.0+20260610.cu130torch2110cxx11abitrue.fb02fc.sm90-cp310-abi3-linux_x86_64.whl" }
 dependencies = [
     { name = "einops" },
     { name = "ninja" },
     { name = "packaging" },
 ]
 wheels = [
-    { url = "https://github.com/Luosuu/flash-attention3-wheels/releases/download/v0.0.3/flash_attn_3-3.0.0+20260609.cu130torch2110cxx11abitrue.bc58ab.sm90-cp310-abi3-linux_x86_64.whl", hash = "sha256:812004b170b0d4fb7022d930fb97cea4b013776494fdce2301ff5b37b4396a13" },
+    { url = "https://github.com/Luosuu/flash-attention3-wheels/releases/download/v0.0.5/flash_attn_3-3.0.0+20260610.cu130torch2110cxx11abitrue.fb02fc.sm90-cp310-abi3-linux_x86_64.whl", hash = "sha256:4600cc208661df284c81dac05950cf08cbc536b3f515de8c715ff796fcc4c1ee" },
 ]
 
 [package.metadata]
@@ -3411,7 +3443,8 @@ gpu = [
     { name = "av", version = "14.4.0", source = { url = "https://files.pythonhosted.org/packages/f8/9a/8ffabfcafb42154b4b3a67d63f9b69e68fa8c34cb39ddd5cb813dd049ed4/av-14.4.0-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl" }, marker = "(python_full_version < '3.12' and extra == 'extra-6-veomni-gpu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64')" },
     { name = "cuda-python" },
     { name = "diffusers" },
-    { name = "flash-attn" },
+    { name = "flash-attn", version = "2.8.4+20260608.cu130torch2110cxx11abitrue.bc58ab.sm80sm89sm90sm100", source = { url = "https://github.com/Luosuu/flash-attention3-wheels/releases/download/v0.0.3/flash_attn-2.8.4+20260608.cu130torch2110cxx11abitrue.bc58ab.sm80sm89sm90sm100-cp311-cp311-linux_x86_64.whl" }, marker = "(python_full_version < '3.12' and extra == 'extra-6-veomni-gpu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64')" },
+    { name = "flash-attn", version = "2.8.4+20260610.cu130torch2110cxx11abitrue.fb02fc.sm80sm89sm90sm100", source = { url = "https://github.com/Luosuu/flash-attention3-wheels/releases/download/v0.0.5/flash_attn-2.8.4+20260610.cu130torch2110cxx11abitrue.fb02fc.sm80sm89sm90sm100-cp312-cp312-linux_x86_64.whl" }, marker = "(python_full_version >= '3.12' and extra == 'extra-6-veomni-gpu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64')" },
     { name = "flash-attn-3" },
     { name = "flash-attn-4" },
     { name = "flash-linear-attention" },
@@ -3504,8 +3537,10 @@ requires-dist = [
     { name = "diffusers", marker = "extra == 'npu'", specifier = "==0.37.0" },
     { name = "einops", specifier = ">=0.8.1" },
     { name = "expecttest", marker = "extra == 'dev'", specifier = ">=0.3.0,<0.4" },
-    { name = "flash-attn", marker = "extra == 'gpu'" },
-    { name = "flash-attn-3", marker = "extra == 'gpu'", url = "https://github.com/Luosuu/flash-attention3-wheels/releases/download/v0.0.3/flash_attn_3-3.0.0+20260609.cu130torch2110cxx11abitrue.bc58ab.sm90-cp310-abi3-linux_x86_64.whl" },
+    { name = "flash-attn", marker = "python_full_version == '3.11.*' and extra == 'gpu'", url = "https://github.com/Luosuu/flash-attention3-wheels/releases/download/v0.0.3/flash_attn-2.8.4+20260608.cu130torch2110cxx11abitrue.bc58ab.sm80sm89sm90sm100-cp311-cp311-linux_x86_64.whl" },
+    { name = "flash-attn", marker = "(python_full_version < '3.11' and extra == 'gpu') or (python_full_version >= '3.13' and extra == 'gpu')" },
+    { name = "flash-attn", marker = "python_full_version == '3.12.*' and extra == 'gpu'", url = "https://github.com/Luosuu/flash-attention3-wheels/releases/download/v0.0.5/flash_attn-2.8.4+20260610.cu130torch2110cxx11abitrue.fb02fc.sm80sm89sm90sm100-cp312-cp312-linux_x86_64.whl" },
+    { name = "flash-attn-3", marker = "extra == 'gpu'", url = "https://github.com/Luosuu/flash-attention3-wheels/releases/download/v0.0.5/flash_attn_3-3.0.0+20260610.cu130torch2110cxx11abitrue.fb02fc.sm90-cp310-abi3-linux_x86_64.whl" },
     { name = "flash-attn-4", marker = "extra == 'gpu'", git = "https://github.com/Dao-AILab/flash-attention?subdirectory=flash_attn%2Fcute&rev=9397816f6094f5ba0de52c221093637054590d0d" },
     { name = "flash-linear-attention", marker = "extra == 'gpu'" },
     { name = "flash-qla", marker = "extra == 'gpu'", git = "https://github.com/QwenLM/FlashQLA?rev=6ef4858b5446e05bd461d9658d877e548182dbcb" },

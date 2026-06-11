@@ -6,10 +6,6 @@ ENV MAX_JOBS=16
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PIP_ROOT_USER_ACTION=ignore
 
-# Force flash-attn 2.x / FA3 setup.py to source-build instead of guessing a
-# github prebuilt wheel URL (no cu13 variants exist; github often blocked).
-ENV FLASH_ATTENTION_FORCE_BUILD=TRUE
-
 # Define installation arguments
 ARG APT_SOURCE={{ apt_source }}
 ARG PIP_INDEX={{ pip_index }}

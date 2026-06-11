@@ -58,7 +58,9 @@ This is the most complex update. torch versions are pinned in **multiple places*
 **Steps:**
 1. Identify the target torch version and matching wheel URLs from https://download.pytorch.org/whl/
 2. Update all pinned versions in `pyproject.toml` (extras, overrides, sources)
-3. Check `flash-attn` / `flash-attn-3` / `flash-attn-4` / `flash-qla` source compatibility — they are all source-built from the locked torch ABI under `no-build-isolation-package`; bumping torch may require bumping the pinned git revs in `[tool.uv.sources]`
+3. Check FA / FlashQLA wheel/source compatibility:
+   - `flash-attn` (cp311 + cp312) and `flash-attn-3` are pinned to Luosuu prebuilt wheel URLs in `[tool.uv.sources]` (cu130/torch2.11/cxx11abi=true). Bumping torch / Python / cuda requires a matching Luosuu release — see https://github.com/Luosuu/flash-attention3-wheels/releases.
+   - `flash-attn-4` and `flash-qla` source-build from git pins; torch ABI bumps may need bumping the git revs.
 4. Update `torchcodec` version if needed (compatibility note in pyproject.toml)
 5. Regenerate lockfile:
 
