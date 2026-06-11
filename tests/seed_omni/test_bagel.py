@@ -15,7 +15,10 @@ from tests.seed_omni.fixtures.bagel.adapter import (
     assert_text_image_fixture_schema,
 )
 from tests.seed_omni.fixtures.bagel.compare_image_gen import compare_image_gen_graph, smoke_image_gen_full_loop_decode
-from tests.seed_omni.fixtures.bagel.compare_text_image_und import compare_text_image_und_graph
+from tests.seed_omni.fixtures.bagel.compare_text_image_und import (
+    compare_text_image_und_graph,
+    smoke_text_image_raw_graph,
+)
 from tests.seed_omni.fixtures.bagel.compare_text_only_graph import compare_text_graph
 
 
@@ -75,6 +78,25 @@ def test_bagel_text_graph_matches_official_fixture() -> None:
         Path(fixture_path),
         Path(model_root),
         config_dir=repo_root / "configs/seed_omni/bagel_7b_mot",
+    )
+    assert report["all_pass"], report
+
+
+def test_bagel_interleave_text_graph_matches_official_fixture() -> None:
+    fixture_path = _env_value("TEXT_PARITY_FIXTURE")
+    model_root = _env_value("SPLIT_MODEL_ROOT")
+    if not fixture_path or not model_root:
+        pytest.skip(
+            f"Set {_env_name('TEXT_PARITY_FIXTURE')} and {_env_name('SPLIT_MODEL_ROOT')} "
+            "to run BAGEL interleave text graph parity."
+        )
+
+    repo_root = Path(__file__).resolve().parents[2]
+    report = compare_text_graph(
+        Path(fixture_path),
+        Path(model_root),
+        config_dir=repo_root / "configs/seed_omni/bagel_7b_mot",
+        infer_yaml_name="infer_interleave.yaml",
     )
     assert report["all_pass"], report
 
@@ -243,6 +265,38 @@ def test_bagel_text_image_graph_matches_official_fixture() -> None:
     repo_root = Path(__file__).resolve().parents[2]
     report = compare_text_image_und_graph(
         Path(fixture_path),
+        Path(model_root),
+        config_dir=repo_root / "configs/seed_omni/bagel_7b_mot",
+    )
+    assert report["all_pass"], report
+
+
+def test_bagel_text_image_raw_image_graph_matches_official_fixture() -> None:
+    fixture_path = _env_value("TEXT_IMAGE_PARITY_FIXTURE")
+    model_root = _env_value("SPLIT_MODEL_ROOT")
+    if not fixture_path or not model_root:
+        pytest.skip(
+            f"Set {_env_name('TEXT_IMAGE_PARITY_FIXTURE')} and {_env_name('SPLIT_MODEL_ROOT')} "
+            "to run BAGEL raw-image text+image graph parity."
+        )
+
+    repo_root = Path(__file__).resolve().parents[2]
+    report = compare_text_image_und_graph(
+        Path(fixture_path),
+        Path(model_root),
+        config_dir=repo_root / "configs/seed_omni/bagel_7b_mot",
+        use_raw_image=True,
+    )
+    assert report["all_pass"], report
+
+
+def test_bagel_text_image_raw_e2e_smoke() -> None:
+    model_root = _env_value("SPLIT_MODEL_ROOT")
+    if not model_root:
+        pytest.skip(f"Set {_env_name('SPLIT_MODEL_ROOT')} to run BAGEL raw text/image E2E smoke.")
+
+    repo_root = Path(__file__).resolve().parents[2]
+    report = smoke_text_image_raw_graph(
         Path(model_root),
         config_dir=repo_root / "configs/seed_omni/bagel_7b_mot",
     )

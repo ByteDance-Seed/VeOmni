@@ -6,6 +6,8 @@ from pathlib import Path
 
 import pytest
 import torch
+import torch.nn as nn
+from PIL import Image
 
 from veomni.arguments.arguments_types import DataArguments
 from veomni.models.seed_omni import (
@@ -15,6 +17,8 @@ from veomni.models.seed_omni import (
 )
 from veomni.models.seed_omni.configuration_omni import OmniConfig
 from veomni.models.seed_omni.conversation import ConversationItem
+from veomni.models.seed_omni.generation_graph import FSM_SIGNAL_KEY
+from veomni.models.seed_omni.modeling_omni import OmniModel
 from veomni.models.seed_omni.modules import OMNI_CONFIG_REGISTRY
 from veomni.trainer.omni_trainer import OmniModelArguments, VeOmniOmniArguments
 
@@ -548,7 +552,7 @@ def test_bagel_train_yaml_loads_with_v2_module_names():
     assert "vae_decode_sink" in cfg.edges
 
 
-@pytest.mark.parametrize("infer_yaml", ["infer_und.yaml", "infer_gen.yaml"])
+@pytest.mark.parametrize("infer_yaml", ["infer_und.yaml", "infer_gen.yaml", "infer_interleave.yaml"])
 def test_bagel_train_plus_infer_merges_generation_graph(infer_yaml: str):
     cfg = _load_omni_config(
         train_yaml_path=_bagel_cfg_dir() / "train.yaml",
@@ -572,3 +576,185 @@ def test_bagel_train_plus_infer_merges_generation_graph(infer_yaml: str):
     for state_name, state in cfg.generation_graph["states"].items():
         for e in state.get("body", []):
             assert e in cfg.edges, f"state '{state_name}' body edge '{e}' not in pool"
+
+
+class _BagelInterleaveTokenizer:
+    eos_token_id = 2
+    unk_token_id = 0
+
+    _token_ids = {
+        "<|im_start|>": 1,
+        "<|vision_start|>": 5,
+        "<|vision_end|>": 6,
+        "prompt": 7,
+    }
+
+    def convert_tokens_to_ids(self, token: str) -> int:
+        return self._token_ids.get(token, self.unk_token_id)
+
+    def encode(self, text: str, add_special_tokens: bool = False) -> list[int]:
+        del add_special_tokens
+        return [self._token_ids.get(part, 8) for part in text.split()]
+
+    def decode(self, token_ids: list[int], skip_special_tokens: bool = True) -> str:
+        special = {1, 2, 5, 6} if skip_special_tokens else set()
+        return " ".join(str(token_id) for token_id in token_ids if token_id not in special)
+
+
+def test_bagel_raw_image_preprocessing_builds_official_metadata():
+    BagelSiglip = _model_cls("bagel_siglip_navit")
+    BagelSiglipConfig = _config_cls("bagel_siglip_navit")
+    siglip = BagelSiglip(
+        BagelSiglipConfig(
+            hidden_size=8,
+            output_size=8,
+            image_size=28,
+            min_image_size=14,
+            max_pixels=28 * 14,
+            intermediate_size=16,
+            num_attention_heads=2,
+            num_hidden_layers=1,
+            patch_size=14,
+            vit_max_num_patch_per_side=2,
+        )
+    )
+    image_item = ConversationItem(
+        type="image",
+        value=Image.new("RGB", (20, 10), color=(255, 0, 0)),
+        role="user",
+    )
+    packed_pixels, position_ids, vit_token_lens = siglip._prepare_image_item(image_item)
+
+    assert packed_pixels.shape == (2, 14 * 14 * 3)
+    assert position_ids.tolist() == [0, 1]
+    assert vit_token_lens.tolist() == [2]
+    assert image_item.meta["preprocessed_image_size"] == [28, 14]
+    assert image_item.meta["image_text_indexes"].tolist() == [0, 3]
+    assert image_item.meta["vit_token_indexes"].tolist() == [1, 2]
+    assert image_item.meta["sequence_indexes"].tolist() == [0, 1, 2, 3]
+    assert image_item.meta["key_value_lens_after"].tolist() == [4]
+    assert image_item.meta["rope_after"].tolist() == [1]
+
+    BagelTextEncoder = _model_cls("bagel_text_encoder")
+    BagelTextEncoderConfig = _config_cls("bagel_text_encoder")
+    text_encoder = BagelTextEncoder(BagelTextEncoderConfig(vocab_size=16, hidden_size=8))
+    text_encoder.tokenizer = _BagelInterleaveTokenizer()
+    image_item.value = torch.zeros(2, 8)
+    image_item.meta["image_embeds"] = image_item.value
+    image_item.meta["image_embeds_ready"] = True
+    text_item = ConversationItem(type="text", value="prompt", role="user")
+    text_encoder.generate(conversation_list=[image_item, text_item])
+
+    assert text_item.meta["key_value_lens_before"].tolist() == [4]
+    assert text_item.meta["position_ids"].tolist() == [1, 2, 3]
+    assert text_item.meta["sequence_indexes"].tolist() == [4, 5, 6]
+
+
+class _NoopBagelSiglip(nn.Module):
+    def generate(self, conversation_list: list[ConversationItem] | None = None, **kwargs):
+        del kwargs
+        return {"conversation_list": conversation_list}
+
+
+class _InterleaveBagelQwen(nn.Module):
+    def generate(self, conversation_list: list[ConversationItem] | None = None, **kwargs):
+        del kwargs
+        assert conversation_list is not None
+        active_image = next(
+            (
+                item
+                for item in conversation_list
+                if item.meta.get("bagel_role") == "image_gen_latent" and not item.meta.get("decoded_image_ready")
+            ),
+            None,
+        )
+        if active_image is not None and active_image.meta.get("flow_packed_sequence_ready"):
+            active_image.value = torch.zeros(2, 8)
+            active_image.meta["flow_hidden_ready"] = True
+            return {"conversation_list": conversation_list, "bagel_last_hidden_state": active_image.value}
+
+        tail = conversation_list[-1]
+        assert tail.type == "output"
+        hidden = torch.zeros(1, 8)
+        if any(item.meta.get("decoded_image_ready") for item in conversation_list):
+            hidden[0, 1] = 1.0  # eos
+        else:
+            hidden[0, 0] = 1.0  # vision_start
+        tail.value = hidden
+        return {"conversation_list": conversation_list, "bagel_last_hidden_state": hidden}
+
+
+class _InterleaveBagelFlow(nn.Module):
+    def embed_latent(self, conversation_list: list[ConversationItem] | None = None, **kwargs):
+        del kwargs
+        assert conversation_list is not None
+        item = next(item for item in conversation_list if item.meta.get("bagel_role") == "image_gen_latent")
+        item.value = torch.zeros(2, 8)
+        item.meta["flow_packed_sequence_ready"] = True
+        return {"conversation_list": conversation_list}
+
+    def decode_velocity(self, conversation_list: list[ConversationItem] | None = None, **kwargs):
+        del kwargs
+        assert conversation_list is not None
+        item = next(item for item in conversation_list if item.meta.get("bagel_role") == "image_gen_latent")
+        item.value = torch.zeros(2, 8)
+        item.meta.pop("flow_packed_sequence_ready", None)
+        item.meta.pop("flow_hidden_ready", None)
+        return {"conversation_list": conversation_list, FSM_SIGNAL_KEY: "image_complete"}
+
+
+class _InterleaveBagelVAE(nn.Module):
+    def decode(self, conversation_list: list[ConversationItem] | None = None, **kwargs):
+        del kwargs
+        assert conversation_list is not None
+        item = next(item for item in conversation_list if item.meta.get("bagel_role") == "image_gen_latent")
+        item.value = "decoded-image"
+        item.meta["decoded_image_ready"] = True
+        return {
+            "conversation_list": conversation_list,
+            "generated": {"type": "image", "value": item.value, "meta": {}},
+        }
+
+
+def test_bagel_interleave_image_branch_signal_smoke():
+    BagelTextEncoder = _model_cls("bagel_text_encoder")
+    BagelTextEncoderConfig = _config_cls("bagel_text_encoder")
+    text_encoder = BagelTextEncoder(BagelTextEncoderConfig(vocab_size=16, hidden_size=8))
+    text_encoder.tokenizer = _BagelInterleaveTokenizer()
+    with torch.no_grad():
+        text_encoder.lm_head.weight.zero_()
+        text_encoder.lm_head.weight[5, 0] = 1.0  # <|vision_start|>
+        text_encoder.lm_head.weight[2, 1] = 1.0  # eos
+
+    cfg = _load_omni_config(
+        train_yaml_path=_bagel_cfg_dir() / "train.yaml",
+        infer_yaml_path=_bagel_cfg_dir() / "infer_interleave.yaml",
+    )
+    model = OmniModel(
+        cfg,
+        {
+            "bagel_text_encoder": text_encoder,
+            "bagel_siglip_navit": _NoopBagelSiglip(),
+            "bagel_qwen2_mot": _InterleaveBagelQwen(),
+            "bagel_flow_connector": _InterleaveBagelFlow(),
+            "bagel_vae": _InterleaveBagelVAE(),
+        },
+    ).eval()
+    trace: list[str] = []
+    ctx = model.generate(
+        {"conversation_list": [ConversationItem(type="text", value="prompt", role="user")]},
+        trace=trace,
+        generation_kwargs={
+            "max_new_tokens": 8,
+            "do_sample": False,
+            "image_height": 64,
+            "image_width": 64,
+        },
+    )
+
+    assert any("transition: prompt_encode -> image_flow" in entry for entry in trace)
+    assert any("transition: image_flow -> image_decode" in entry for entry in trace)
+    assert any("transition: image_decode -> text_ar" in entry for entry in trace)
+    assert any("transition: text_ar -> done" in entry for entry in trace)
+    assert any(item["type"] == "image" for item in model.generated)
+    assert ctx["conversation_list"][-1].type == "text"

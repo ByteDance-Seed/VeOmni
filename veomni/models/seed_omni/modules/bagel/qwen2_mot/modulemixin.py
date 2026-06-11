@@ -391,7 +391,10 @@ class BagelQwen2MoTModuleMixin(ModuleMixin):
     ) -> bool:
         if generation_kwargs and generation_kwargs.get("infer_mode") == "gen":
             return True
-        return any(item.meta.get("bagel_role") == "image_gen_latent" for item in conversation_list)
+        return any(
+            item.meta.get("bagel_role") == "image_gen_latent" and not item.meta.get("decoded_image_ready")
+            for item in conversation_list
+        )
 
     def _cfg_text_active(
         self,
@@ -436,7 +439,11 @@ class BagelQwen2MoTModuleMixin(ModuleMixin):
 
     def _ready_image_gen_item(self, conversation_list: list[ConversationItem]) -> Optional[ConversationItem]:
         for item in conversation_list:
-            if item.meta.get("bagel_role") == "image_gen_latent" and item.meta.get("flow_packed_sequence_ready"):
+            if (
+                item.meta.get("bagel_role") == "image_gen_latent"
+                and not item.meta.get("decoded_image_ready")
+                and item.meta.get("flow_packed_sequence_ready")
+            ):
                 return item
         return None
 

@@ -13,10 +13,13 @@ from typing import Any
 import torch
 import torch.nn as nn
 import yaml
+from PIL import Image
+from transformers import AutoTokenizer
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from adapter import (  # noqa: E402
+    _make_fixture_image,
     adapt_text_image_und_fixture,
     assert_text_image_fixture_schema,
 )
@@ -30,6 +33,7 @@ from tests.seed_omni.fixtures.bagel.compare_text_only_graph import (  # noqa: E4
     _v2_tolerance,
 )
 from veomni.models.seed_omni.configuration_omni import OmniConfig  # noqa: E402
+from veomni.models.seed_omni.conversation import build_conversation  # noqa: E402
 from veomni.models.seed_omni.modeling_omni import OmniModel  # noqa: E402
 from veomni.models.seed_omni.modules.bagel.qwen2_mot.modeling import BagelQwen2MoT  # noqa: E402
 from veomni.models.seed_omni.modules.bagel.siglip_navit.modeling import BagelSiglipNavit  # noqa: E402
@@ -76,6 +80,7 @@ def compare_text_image_und_graph(
     model_root: Path,
     *,
     config_dir: Path,
+    use_raw_image: bool = False,
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
     dtype: str = "bf16",
 ) -> dict[str, Any]:
@@ -98,7 +103,7 @@ def compare_text_image_und_graph(
         },
     ).eval()
 
-    conversation = _to_device(adapt_text_image_und_fixture(fixture), torch_device)
+    conversation = _to_device(adapt_text_image_und_fixture(fixture, use_raw_image=use_raw_image), torch_device)
     trace: list[str] = []
     generation_kwargs = dict(config.generation_kwargs or {})
     generation_kwargs.update({"max_new_tokens": 1, "do_sample": False, "temperature": 1.0, "top_p": 1.0})
@@ -136,6 +141,7 @@ def compare_text_image_und_graph(
     )
     return {
         "case_id": fixture["metadata"]["case_id"],
+        "input_mode": "raw_image" if use_raw_image else "packed_vit_tokens",
         "dtype": dtype,
         "tolerance": tolerance,
         "trace": trace,
@@ -152,6 +158,82 @@ def compare_text_image_und_graph(
     }
 
 
+@torch.no_grad()
+def smoke_text_image_raw_graph(
+    model_root: Path,
+    *,
+    config_dir: Path,
+    prompt: str = "Describe the image in one short sentence.",
+    image_size: tuple[int, int] = (448, 336),
+    max_new_tokens: int = 2,
+    device: str = "cuda" if torch.cuda.is_available() else "cpu",
+    dtype: str = "bf16",
+) -> dict[str, Any]:
+    torch_device = torch.device(device)
+    torch_dtype = _resolve_dtype(dtype)
+    text_encoder, siglip_navit, qwen2_mot = _load_modules(model_root, device=torch_device, dtype=torch_dtype)
+    text_encoder.tokenizer = AutoTokenizer.from_pretrained(
+        model_root / "bagel_text_encoder",
+        local_files_only=True,
+        trust_remote_code=True,
+    )
+    config = _load_graph_config(config_dir)
+    model = OmniModel(
+        config,
+        {
+            "bagel_text_encoder": text_encoder,
+            "bagel_siglip_navit": siglip_navit,
+            "bagel_vae": _UnusedModule(),
+            "bagel_flow_connector": _UnusedModule(),
+            "bagel_qwen2_mot": qwen2_mot,
+        },
+    ).eval()
+
+    image = _make_smoke_image(*image_size)
+    conversation = build_conversation(prompt=prompt, images=[image])
+    trace: list[str] = []
+    generation_kwargs = dict(config.generation_kwargs or {})
+    generation_kwargs.update(
+        {
+            "max_new_tokens": max_new_tokens,
+            "do_sample": False,
+            "temperature": 1.0,
+            "top_p": 1.0,
+        }
+    )
+    ctx = model.generate({"conversation_list": conversation}, trace=trace, generation_kwargs=generation_kwargs)
+    generated = model.generated
+    text_outputs = [item for item in generated if item.get("type") == "text"]
+    image_item = ctx["conversation_list"][0]
+    all_pass = bool(
+        text_outputs
+        and "bagel_last_image_embeds" in ctx
+        and image_item.meta.get("image_embeds_ready")
+        and image_item.meta.get("preprocessed_image_size")
+    )
+    return {
+        "case_id": "text_image_raw_e2e_smoke",
+        "dtype": dtype,
+        "prompt": prompt,
+        "raw_image_size": list(image_size),
+        "preprocessed_image_size": image_item.meta.get("preprocessed_image_size"),
+        "generated": [
+            {
+                "type": item.get("type"),
+                "value": item.get("value"),
+                "token_ids": item.get("meta", {}).get("token_ids"),
+            }
+            for item in generated
+        ],
+        "trace": trace,
+        "all_pass": all_pass,
+    }
+
+
+def _make_smoke_image(width: int, height: int) -> Image.Image:
+    return _make_fixture_image([width, height])
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("fixture", type=Path)
@@ -163,6 +245,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--dtype", choices=("bf16", "fp16", "fp32"), default="bf16")
+    parser.add_argument("--use-raw-image", action="store_true")
     parser.add_argument("--output", type=Path)
     return parser.parse_args()
 
@@ -173,6 +256,7 @@ def main() -> None:
         args.fixture,
         args.model_root,
         config_dir=args.config_dir,
+        use_raw_image=args.use_raw_image,
         device=args.device,
         dtype=args.dtype,
     )

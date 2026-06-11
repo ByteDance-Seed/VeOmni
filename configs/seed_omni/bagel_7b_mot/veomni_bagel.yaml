@@ -5,6 +5,7 @@ model:
   omni_train_yaml_path: configs/seed_omni/bagel_7b_mot/train.yaml
   omni_infer_yaml_path:
     infer_gen: configs/seed_omni/bagel_7b_mot/infer_gen.yaml
+    infer_interleave: configs/seed_omni/bagel_7b_mot/infer_interleave.yaml
     infer_und: configs/seed_omni/bagel_7b_mot/infer_und.yaml
   omni_infer_type: infer_und
   model_config: {}

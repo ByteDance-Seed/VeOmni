@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from typing import Any
 
+import numpy as np
 import torch
+from PIL import Image
 
 from veomni.models.seed_omni.conversation import ConversationItem
 
@@ -72,7 +74,7 @@ def adapt_text_only_fixture(fixture: dict[str, Any]) -> list[ConversationItem]:
     ]
 
 
-def adapt_text_image_und_fixture(fixture: dict[str, Any]) -> list[ConversationItem]:
+def adapt_text_image_und_fixture(fixture: dict[str, Any], *, use_raw_image: bool = False) -> list[ConversationItem]:
     """Convert an official text+image understanding fixture into V2 conversation items."""
 
     metadata = fixture.get("metadata", {})
@@ -83,15 +85,14 @@ def adapt_text_image_und_fixture(fixture: dict[str, Any]) -> list[ConversationIt
     prompt_fields = fixture["prepared"]["prompt"]
     start_fields = fixture["prepared"]["start"]
 
-    return [
-        ConversationItem(
-            type="image",
-            value=image_fields["packed_vit_tokens"].clone().detach(),
-            role="user",
-            source="bagel_official_fixture",
-            meta={
-                "bagel_role": "image_und",
-                "raw_image_size": fixture["raw_input"]["image_size"],
+    raw_image = _make_fixture_image(fixture["raw_input"]["image_size"]) if use_raw_image else None
+    image_meta: dict[str, Any] = {
+        "bagel_role": "image_und",
+        "raw_image_size": fixture["raw_input"]["image_size"],
+    }
+    if not use_raw_image:
+        image_meta.update(
+            {
                 "image_token_ids": image_fields["packed_text_ids"].clone().detach().to(dtype=torch.long),
                 "image_text_indexes": image_fields["packed_text_indexes"].clone().detach().to(dtype=torch.long),
                 "vit_position_ids": image_fields["packed_vit_position_ids"].clone().detach().to(dtype=torch.long),
@@ -103,7 +104,16 @@ def adapt_text_image_und_fixture(fixture: dict[str, Any]) -> list[ConversationIt
                 "query_lens": image_fields["packed_seqlens"].clone().detach().to(dtype=torch.int32),
                 "key_value_lens_before": image_fields["key_values_lens"].clone().detach().to(dtype=torch.int32),
                 "is_causal": False,
-            },
+            }
+        )
+
+    return [
+        ConversationItem(
+            type="image",
+            value=raw_image if use_raw_image else image_fields["packed_vit_tokens"].clone().detach(),
+            role="user",
+            source="bagel_official_fixture",
+            meta=image_meta,
         ),
         ConversationItem(
             type="text",
@@ -140,6 +150,15 @@ def adapt_text_image_und_fixture(fixture: dict[str, Any]) -> list[ConversationIt
             },
         ),
     ]
+
+
+def _make_fixture_image(image_size: list[int]) -> Image.Image:
+    width, height = image_size
+    x = np.linspace(0, 255, width, dtype=np.uint8)
+    y = np.linspace(0, 255, height, dtype=np.uint8)
+    xx, yy = np.meshgrid(x, y)
+    rgb = np.stack([xx, yy, ((xx.astype(np.uint16) + yy.astype(np.uint16)) // 2).astype(np.uint8)], axis=-1)
+    return Image.fromarray(rgb)
 
 
 def adapt_image_gen_fixture(fixture: dict[str, Any]) -> list[ConversationItem]:

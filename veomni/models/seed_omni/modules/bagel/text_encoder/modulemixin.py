@@ -10,6 +10,7 @@ from ...base.text_encoder.modulemixin import TextEncoderModuleMixin
 
 
 SIGNAL_TEXT_DONE = "text_done"
+SIGNAL_START_IMAGE_GEN = "start_image_gen"
 
 
 class BagelTextEncoderModuleMixin(TextEncoderModuleMixin):
@@ -21,6 +22,7 @@ class BagelTextEncoderModuleMixin(TextEncoderModuleMixin):
         super().init_omni_state()
         self._eos_token_id: Optional[int] = None
         self._start_token_id: Optional[int] = None
+        self._image_start_token_id: Optional[int] = None
 
     @property
     def tokenizer(self) -> Any:
@@ -31,6 +33,7 @@ class BagelTextEncoderModuleMixin(TextEncoderModuleMixin):
         self._tokenizer = tokenizer
         self._eos_token_id = int(getattr(tokenizer, "eos_token_id", 0))
         self._start_token_id = self._resolve_token_id(tokenizer, "<|im_start|>", fallback=self._eos_token_id)
+        self._image_start_token_id = self._resolve_token_id(tokenizer, "<|vision_start|>", fallback=None)
 
     def generate(
         self,
@@ -45,7 +48,7 @@ class BagelTextEncoderModuleMixin(TextEncoderModuleMixin):
         if tail.role == "user":
             token_ids = self._prompt_token_ids(tail)
             tail.value = self.encode(token_ids)["inputs_embeds"].to(device=self.device, dtype=self.dtype)
-            self._ensure_prompt_meta(tail, int(token_ids.numel()))
+            self._ensure_prompt_meta(tail, int(token_ids.numel()), conversation_list=conversation_list)
             if self._is_image_generation_request(conversation_list, generation_kwargs):
                 self._ensure_image_generation_latent_item(conversation_list, tail, generation_kwargs)
                 self._materialize_image_generation_items(conversation_list)
@@ -79,7 +82,18 @@ class BagelTextEncoderModuleMixin(TextEncoderModuleMixin):
 
             outputs["bagel_last_logits"] = logits.detach()
             outputs["bagel_last_greedy_token"] = torch.tensor([output_token_id], device=self.device, dtype=torch.long)
-            if output_token_id == self._eos_token_id:
+            image_start_token_id = self._maybe_resolve_image_start_token_id()
+            if image_start_token_id is not None and output_token_id == image_start_token_id:
+                self._ensure_image_generation_latent_item(
+                    conversation_list,
+                    tail,
+                    generation_kwargs,
+                    insert_before=tail,
+                )
+                self._materialize_image_generation_items(conversation_list)
+                outputs[FSM_SIGNAL_KEY] = SIGNAL_START_IMAGE_GEN
+                outputs["generated"] = self._flush_text_generated(conversation_list, seal_output=False)
+            elif output_token_id == self._eos_token_id:
                 outputs[FSM_SIGNAL_KEY] = SIGNAL_TEXT_DONE
                 outputs["generated"] = self._flush_text_generated(conversation_list)
             return outputs
@@ -103,12 +117,14 @@ class BagelTextEncoderModuleMixin(TextEncoderModuleMixin):
                     "BAGEL image understanding item requires image embeddings before text prompt encoding."
                 )
             image_token_ids = item.meta.get("image_token_ids")
+            if not torch.is_tensor(image_token_ids):
+                image_token_ids = torch.tensor(self._image_boundary_token_ids(), device=self.device, dtype=torch.long)
+                item.meta["image_token_ids"] = image_token_ids
             image_text_indexes = item.meta.get("image_text_indexes")
             vit_token_indexes = item.meta.get("vit_token_indexes")
             query_lens = item.meta.get("query_lens")
             if (
-                not torch.is_tensor(image_token_ids)
-                or not torch.is_tensor(image_text_indexes)
+                not torch.is_tensor(image_text_indexes)
                 or not torch.is_tensor(vit_token_indexes)
                 or not torch.is_tensor(query_lens)
             ):
@@ -160,31 +176,44 @@ class BagelTextEncoderModuleMixin(TextEncoderModuleMixin):
         conversation_list: list[ConversationItem],
         prompt_item: ConversationItem,
         generation_kwargs: Optional[Dict[str, Any]],
+        *,
+        insert_before: Optional[ConversationItem] = None,
     ) -> None:
-        if any(item.meta.get("bagel_role") == "image_gen_latent" for item in conversation_list):
+        if any(
+            item.meta.get("bagel_role") == "image_gen_latent" and not item.meta.get("decoded_image_ready")
+            for item in conversation_list
+        ):
             return
         kwargs = generation_kwargs or {}
         height = int(kwargs.get("image_height", 1024))
         width = int(kwargs.get("image_width", 1024))
-        prompt_kv_len = self._scalar_meta_int(prompt_item.meta.get("key_value_lens_after"))
+        prompt_kv_len = self._scalar_meta_int(
+            prompt_item.meta.get("key_value_lens_after", prompt_item.meta.get("key_value_lens"))
+        )
         prompt_rope = self._scalar_meta_int(prompt_item.meta.get("rope_after"), default=prompt_kv_len)
         text_token_ids = torch.tensor(self._image_boundary_token_ids(), device=self.device, dtype=torch.long)
-        conversation_list.append(
-            ConversationItem(
-                type="image",
-                value=torch.empty(0, device=self.device, dtype=torch.float32),
-                role="assistant",
-                source="bagel_generation_request",
-                meta={
-                    "bagel_role": "image_gen_latent",
-                    "raw_image_size": [height, width],
-                    "text_token_ids": text_token_ids,
-                    "key_value_lens": torch.tensor([prompt_kv_len], device=self.device, dtype=torch.int32),
-                    "context_indexes": torch.arange(prompt_kv_len, device=self.device, dtype=torch.long),
-                    "rope_after_prompt": torch.tensor([prompt_rope], device=self.device, dtype=torch.long),
-                },
-            )
+        latent_item = ConversationItem(
+            type="image",
+            value=torch.empty(0, device=self.device, dtype=torch.float32),
+            role="assistant",
+            source="bagel_generation_request",
+            meta={
+                "bagel_role": "image_gen_latent",
+                "raw_image_size": [height, width],
+                "text_token_ids": text_token_ids,
+                "key_value_lens": torch.tensor([prompt_kv_len], device=self.device, dtype=torch.int32),
+                "context_indexes": torch.arange(prompt_kv_len, device=self.device, dtype=torch.long),
+                "rope_after_prompt": torch.tensor([prompt_rope], device=self.device, dtype=torch.long),
+            },
         )
+        if insert_before is None:
+            conversation_list.append(latent_item)
+            return
+        for idx, item in enumerate(conversation_list):
+            if item is insert_before:
+                conversation_list.insert(idx, latent_item)
+                return
+        conversation_list.append(latent_item)
 
     def _prompt_token_ids(self, item: ConversationItem) -> torch.Tensor:
         value = item.value
@@ -205,13 +234,32 @@ class BagelTextEncoderModuleMixin(TextEncoderModuleMixin):
             return next_token["input_ids"].detach().to(device=self.device, dtype=torch.long).reshape(-1)
         return torch.tensor([self._resolve_start_token_id()], device=self.device, dtype=torch.long)
 
-    def _ensure_prompt_meta(self, item: ConversationItem, length: int) -> None:
-        item.meta.setdefault("position_ids", torch.arange(length, device=self.device, dtype=torch.long))
-        item.meta.setdefault("sequence_indexes", torch.arange(length, device=self.device, dtype=torch.long))
-        item.meta.setdefault("context_indexes", torch.empty(0, device=self.device, dtype=torch.long))
+    def _ensure_prompt_meta(
+        self,
+        item: ConversationItem,
+        length: int,
+        *,
+        conversation_list: Optional[list[ConversationItem]] = None,
+    ) -> None:
+        base_kv_len, base_rope = self._previous_context_offsets(item, conversation_list)
+        item.meta.setdefault(
+            "position_ids",
+            torch.arange(base_rope, base_rope + length, device=self.device, dtype=torch.long),
+        )
+        item.meta.setdefault(
+            "sequence_indexes",
+            torch.arange(base_kv_len, base_kv_len + length, device=self.device, dtype=torch.long),
+        )
+        item.meta.setdefault("context_indexes", torch.arange(base_kv_len, device=self.device, dtype=torch.long))
         item.meta.setdefault("token_lens", torch.tensor([length], device=self.device, dtype=torch.int32))
-        item.meta.setdefault("key_value_lens_before", torch.tensor([0], device=self.device, dtype=torch.int32))
-        item.meta.setdefault("key_value_lens_after", torch.tensor([length], device=self.device, dtype=torch.int32))
+        item.meta.setdefault(
+            "key_value_lens_before", torch.tensor([base_kv_len], device=self.device, dtype=torch.int32)
+        )
+        item.meta.setdefault(
+            "key_value_lens_after",
+            torch.tensor([base_kv_len + length], device=self.device, dtype=torch.int32),
+        )
+        item.meta.setdefault("rope_after", torch.tensor([base_rope + length], device=self.device, dtype=torch.long))
 
     def _start_token_meta(self, prompt_item: ConversationItem, input_ids: torch.Tensor) -> Dict[str, Any]:
         del input_ids
@@ -219,9 +267,13 @@ class BagelTextEncoderModuleMixin(TextEncoderModuleMixin):
         if isinstance(next_token, dict):
             meta = {key: self._meta_to_device(value) for key, value in next_token.items() if key != "input_ids"}
         else:
-            length = int(prompt_item.meta["token_lens"].sum().item())
+            length = self._scalar_meta_int(
+                prompt_item.meta.get("key_value_lens_after"),
+                default=int(prompt_item.meta["token_lens"].sum().item()),
+            )
+            position = self._scalar_meta_int(prompt_item.meta.get("rope_after"), default=length)
             meta = {
-                "position_ids": torch.tensor([length], device=self.device, dtype=torch.long),
+                "position_ids": torch.tensor([position], device=self.device, dtype=torch.long),
                 "key_value_lens": torch.tensor([length], device=self.device, dtype=torch.int32),
                 "context_indexes": torch.arange(length, device=self.device, dtype=torch.long),
             }
@@ -231,6 +283,26 @@ class BagelTextEncoderModuleMixin(TextEncoderModuleMixin):
             meta["query_indexes"] = torch.tensor([kv_len], device=self.device, dtype=torch.long)
         meta["token_kind"] = "bagel_start"
         return meta
+
+    def _previous_context_offsets(
+        self,
+        item: ConversationItem,
+        conversation_list: Optional[list[ConversationItem]],
+    ) -> tuple[int, int]:
+        if conversation_list is None:
+            return 0, 0
+        base_kv_len = 0
+        base_rope = 0
+        for prior in conversation_list:
+            if prior is item:
+                break
+            kv_after = prior.meta.get("key_value_lens_after")
+            rope_after = prior.meta.get("rope_after")
+            if kv_after is not None:
+                base_kv_len = self._scalar_meta_int(kv_after, default=base_kv_len)
+            if rope_after is not None:
+                base_rope = self._scalar_meta_int(rope_after, default=base_rope)
+        return base_kv_len, base_rope
 
     def _next_token_meta(self, tail: ConversationItem, output_token_id: int) -> Dict[str, Any]:
         old_meta = tail.meta
@@ -276,13 +348,18 @@ class BagelTextEncoderModuleMixin(TextEncoderModuleMixin):
         probs = torch.nn.functional.softmax(scores, dim=-1)
         return int(torch.multinomial(probs, num_samples=1).item())
 
-    def _flush_text_generated(self, conversation_list: list[ConversationItem]) -> Dict[str, Any]:
+    def _flush_text_generated(
+        self,
+        conversation_list: list[ConversationItem],
+        *,
+        seal_output: bool = True,
+    ) -> Dict[str, Any]:
         token_ids = list(self._text_token_cache)
         self._text_token_cache.clear()
         if not token_ids:
             return {}
         text = self._tokenizer.decode(token_ids, skip_special_tokens=True) if self._tokenizer is not None else ""
-        if conversation_list and conversation_list[-1].type == "output":
+        if seal_output and conversation_list and conversation_list[-1].type == "output":
             seal_outputs(conversation_list, new_type="text")
         return {"type": "text", "value": text, "meta": {"token_ids": token_ids}}
 
@@ -304,12 +381,29 @@ class BagelTextEncoderModuleMixin(TextEncoderModuleMixin):
             return int(self._eos_token_id)
         raise ValueError("Unable to resolve BAGEL EOS token id.")
 
+    def _resolve_image_start_token_id(self) -> int:
+        resolved = self._maybe_resolve_image_start_token_id()
+        if resolved is not None:
+            return resolved
+        raise ValueError("Unable to resolve BAGEL image start token id.")
+
+    def _maybe_resolve_image_start_token_id(self) -> Optional[int]:
+        if self._image_start_token_id is not None:
+            return int(self._image_start_token_id)
+        if self._tokenizer is None:
+            return None
+        resolved = self._resolve_token_id(self._tokenizer, "<|vision_start|>", fallback=None)
+        if resolved is not None:
+            self._image_start_token_id = resolved
+            return int(resolved)
+        return None
+
     def _image_boundary_token_ids(self) -> list[int]:
         if self._tokenizer is None:
             raise ValueError("BAGEL image generation requires tokenizer-owned image boundary tokens.")
-        start = self._resolve_token_id(self._tokenizer, "<|vision_start|>", fallback=None)
+        start = self._resolve_image_start_token_id()
         end = self._resolve_token_id(self._tokenizer, "<|vision_end|>", fallback=None)
-        if start is None or end is None:
+        if end is None:
             raise ValueError("Unable to resolve BAGEL image boundary token ids.")
         return [start, end]
 
@@ -349,4 +443,4 @@ class BagelTextEncoderModuleMixin(TextEncoderModuleMixin):
         return value
 
 
-__all__ = ["BagelTextEncoderModuleMixin", "SIGNAL_TEXT_DONE"]
+__all__ = ["BagelTextEncoderModuleMixin", "SIGNAL_START_IMAGE_GEN", "SIGNAL_TEXT_DONE"]

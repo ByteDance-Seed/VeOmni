@@ -1,0 +1,61 @@
+# BAGEL-7B-MoT inference - interleaved text and image generation.
+#
+# This FSM mirrors Janus V2 interleave shape while reusing BAGEL's already
+# validated `infer_und` text path and `infer_gen` image denoise/decode path.
+# The first graph-level smoke validates the text path. The image branch becomes
+# reachable once BAGEL text generation emits `start_image_gen` on image-start
+# tokens.
+
+generation_graph:
+  initial: prompt_encode
+
+  states:
+    prompt_encode:
+      body:
+        - siglip_encode_to_qwen2
+        - token_prompt_encode_to_qwen2
+        - qwen2_to_token_generate
+        - token_generate_sink
+      transitions:
+        - { condition: { type: module_signal, key: start_image_gen }, next_state: image_flow }
+        - { condition: { type: module_signal, key: text_done }, next_state: done }
+        - { condition: { type: default }, next_state: text_ar }
+
+    text_ar:
+      body:
+        - qwen2_to_token_generate
+        - token_generate_sink
+      transitions:
+        - { condition: { type: module_signal, key: start_image_gen }, next_state: image_flow }
+        - { condition: { type: module_signal, key: text_done }, next_state: done }
+
+    image_flow:
+      body:
+        - flow_embed_to_qwen2
+        - qwen2_to_flow_decode
+        - flow_decode_sink
+      transitions:
+        - { condition: { type: module_signal, key: image_complete }, next_state: image_decode }
+
+    image_decode:
+      body:
+        - vae_decode_sink
+      transitions:
+        - { condition: { type: default }, next_state: text_ar }
+
+generation_kwargs:
+  max_new_tokens: 2048
+  temperature: 0.0
+  top_p: 1.0
+  do_sample: false
+  image_height: 1024
+  image_width: 1024
+  latent_downsample: 16
+  num_timesteps: 50
+  timestep_shift: 3.0
+  cfg_text_scale: 1.0
+  cfg_img_scale: 1.0
+  cfg_interval: [0.0, 1.0]
+  cfg_renorm_min: 0.0
+  cfg_renorm_type: global
+  enable_taylorseer: false

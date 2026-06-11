@@ -168,9 +168,9 @@ def _load_modules(
     return text_encoder, qwen2_mot
 
 
-def _load_graph_config(config_dir: Path) -> OmniConfig:
+def _load_graph_config(config_dir: Path, *, infer_yaml_name: str = "infer_und.yaml") -> OmniConfig:
     train_config = yaml.safe_load((config_dir / "train.yaml").read_text(encoding="utf-8"))
-    infer_config = yaml.safe_load((config_dir / "infer_und.yaml").read_text(encoding="utf-8"))
+    infer_config = yaml.safe_load((config_dir / infer_yaml_name).read_text(encoding="utf-8"))
     merged = {
         "modules": train_config["modules"],
         "nodes": train_config["nodes"],
@@ -188,6 +188,7 @@ def compare_text_graph(
     model_root: Path,
     *,
     config_dir: Path,
+    infer_yaml_name: str = "infer_und.yaml",
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
     dtype: str = "bf16",
 ) -> dict[str, Any]:
@@ -198,7 +199,7 @@ def compare_text_graph(
     tolerance = _v2_tolerance(fixture)
 
     text_encoder, qwen2_mot = _load_modules(model_root, device=torch_device, dtype=torch_dtype)
-    config = _load_graph_config(config_dir)
+    config = _load_graph_config(config_dir, infer_yaml_name=infer_yaml_name)
     model = OmniModel(
         config,
         {
