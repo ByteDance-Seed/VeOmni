@@ -13,7 +13,7 @@ from ....conversation import (
     seal_outputs,
 )
 from ....generation_graph import FSM_SIGNAL_KEY
-from ....module import ModuleMixin
+from ....module import ModuleMixin, post_forward, pre_forward
 from ....tracemixin import TraceMixin
 from .configuration import JanusVqvaeConfig
 from .processing import JanusVqvaeProcessor
@@ -33,24 +33,27 @@ class JanusVqvaeModuleMixin(ModuleMixin):
         # Inference state
         self._vq_buffer: List[int] = []
 
-    # Training hooks
-    def pre_forward(
+    # Training hooks — one pre/post pair per call-site (tagged with its method),
+    # routed by the ModuleMixin.pre_forward / post_forward dispatchers.
+    @pre_forward("encode")
+    def encode_pre(
         self,
-        method: str,
         conversation_list: Optional[list[list[ConversationItem]]] = None,
     ) -> Dict[str, Any]:
         self._conversation_carrier = conversation_list
-        if method == "encode":
-            pixel_values = self._pixels_from_raw_images(
-                collect_desired_values(conversation_list, types=["image"], roles=["assistant"])
-            )
-            return {"pixel_values": pixel_values}
+        pixel_values = self._pixels_from_raw_images(
+            collect_desired_values(conversation_list, types=["image"], roles=["assistant"])
+        )
+        return {"pixel_values": pixel_values}
 
-        if method == "decode":
-            hidden_states, labels, dummy_data = self._prepare_decode_inputs(conversation_list)
-            return {"hidden_states": hidden_states, "labels": labels, "is_dummy": dummy_data}
-
-        raise ValueError(f"JanusVqvae.pre_forward: unsupported method {method!r}")
+    @pre_forward("decode")
+    def decode_pre(
+        self,
+        conversation_list: Optional[list[list[ConversationItem]]] = None,
+    ) -> Dict[str, Any]:
+        self._conversation_carrier = conversation_list
+        hidden_states, labels, dummy_data = self._prepare_decode_inputs(conversation_list)
+        return {"hidden_states": hidden_states, "labels": labels, "is_dummy": dummy_data}
 
     def _prepare_decode_inputs(
         self,
@@ -96,46 +99,45 @@ class JanusVqvaeModuleMixin(ModuleMixin):
             and isinstance(part.meta.get("janus_vqvae_labels"), torch.Tensor)
         )
 
-    def post_forward(self, method: str, **outputs: Any) -> Dict[str, Any]:
-        assert method in ["encode", "decode"]
+    @post_forward("encode")
+    def encode_post(self, **outputs: Any) -> Dict[str, Any]:
         conversation = self._conversation_carrier
         self._conversation_carrier = None
-        if method == "encode":
-            is_dummy = outputs.get("is_dummy", False)
-            image_embeds = outputs.get("image_embeds")
-            vq_token_ids = outputs.get("vq_token_ids")
-            if is_dummy:
-                assert image_embeds.shape[0] == 1
-                image_embeds = image_embeds.squeeze(0)
-                vq_token_ids = vq_token_ids.squeeze(0)
-                for sample in conversation:
-                    sample.append(
-                        ConversationItem(
-                            type="image",
-                            value=image_embeds,
-                            role="dummy",
-                            meta={
-                                "source": "janus_vqvae",
-                                "janus_vqvae_labels": vq_token_ids.to(dtype=torch.long),
-                            },
-                        )
+        is_dummy = outputs.get("is_dummy", False)
+        image_embeds = outputs.get("image_embeds")
+        vq_token_ids = outputs.get("vq_token_ids")
+        if is_dummy:
+            assert image_embeds.shape[0] == 1
+            image_embeds = image_embeds.squeeze(0)
+            vq_token_ids = vq_token_ids.squeeze(0)
+            for sample in conversation:
+                sample.append(
+                    ConversationItem(
+                        type="image",
+                        value=image_embeds,
+                        role="dummy",
+                        meta={
+                            "source": "janus_vqvae",
+                            "janus_vqvae_labels": vq_token_ids.to(dtype=torch.long),
+                        },
                     )
-            else:
-                items = list(iter_desired_items(conversation, types=["image"], roles=["assistant"]))
-                for item, emb, ids in zip(items, image_embeds, vq_token_ids, strict=True):
-                    item.value = emb
-                    item.meta["janus_vqvae_labels"] = ids.to(dtype=torch.long)
-            return {"conversation_list": conversation}
+                )
+        else:
+            items = list(iter_desired_items(conversation, types=["image"], roles=["assistant"]))
+            for item, emb, ids in zip(items, image_embeds, vq_token_ids, strict=True):
+                item.value = emb
+                item.meta["janus_vqvae_labels"] = ids.to(dtype=torch.long)
+        return {"conversation_list": conversation}
 
-        if method == "decode":
-            conversation = self._conversation_carrier
-            self._conversation_carrier = None
-            loss = outputs.pop("loss", None)
-            if loss is not None:
-                outputs["_loss"] = loss
-            outputs["conversation_list"] = conversation
-            return outputs
-        raise ValueError(f"JanusVqvae.post_forward: unsupported method {method!r}")
+    @post_forward("decode")
+    def decode_post(self, **outputs: Any) -> Dict[str, Any]:
+        conversation = self._conversation_carrier
+        self._conversation_carrier = None
+        loss = outputs.pop("loss", None)
+        if loss is not None:
+            outputs["_loss"] = loss
+        outputs["conversation_list"] = conversation
+        return outputs
 
     def _pixels_from_raw_images(self, raw_images: list[Any]) -> Optional[torch.Tensor]:
         if not raw_images:

@@ -6,7 +6,7 @@ import torch.nn.functional as F
 from veomni.utils.tensor_utils import unflatten
 
 from ....conversation import ConversationItem, seal_outputs
-from ....module import ModuleMixin
+from ....module import ModuleMixin, post_forward
 from ....tracemixin import TraceMixin
 from .configuration import TextEncoderConfig
 
@@ -33,21 +33,21 @@ class TextEncoderModuleMixin(ModuleMixin):
         self._tokenizer = tokenizer
 
     # training hooks
-    def pre_forward(self, method: str, **kwargs: Any) -> Dict[str, Any]:
-        raise NotImplementedError("TextEncoderModuleMixin.pre_forward is not implemented")
-
-    def post_forward(self, method: str, **outputs: Any) -> Dict[str, Any]:
-        assert method in ("encode", "decode")
+    @post_forward("encode")
+    def encode_post(self, **outputs: Any) -> Dict[str, Any]:
         conversation = self._conversation_carrier
         self._conversation_carrier = None
-        if method == "encode":
-            batch_shape = self._encode_batch_shape
-            self._encode_batch_shape = None
-            inputs_embeds = outputs.get("inputs_embeds")
-            if conversation is not None and inputs_embeds is not None and batch_shape is not None:
-                self._scatter_text_embeds(conversation, unflatten(inputs_embeds, batch_shape))
-            return {"conversation_list": conversation}
+        batch_shape = self._encode_batch_shape
+        self._encode_batch_shape = None
+        inputs_embeds = outputs.get("inputs_embeds")
+        if conversation is not None and inputs_embeds is not None and batch_shape is not None:
+            self._scatter_text_embeds(conversation, unflatten(inputs_embeds, batch_shape))
+        return {"conversation_list": conversation}
 
+    @post_forward("decode")
+    def decode_post(self, **outputs: Any) -> Dict[str, Any]:
+        conversation = self._conversation_carrier
+        self._conversation_carrier = None
         # V2 single-loss protocol: drop logits, rename ``loss`` → ``_loss``.
         outputs.pop("logits", None)
         loss = outputs.pop("loss", None)

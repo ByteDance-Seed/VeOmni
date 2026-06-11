@@ -7,7 +7,7 @@ from veomni.utils.seqlen_pos_transform_utils import prepare_fa_kwargs_from_posit
 from veomni.utils.tensor_utils import naflatten, unflatten
 
 from ....conversation import ConversationItem, is_dummy
-from ....module import ModuleMixin
+from ....module import ModuleMixin, post_forward, pre_forward
 from ....tracemixin import TraceMixin
 from .configuration import Qwen3LlmConfig
 
@@ -18,13 +18,12 @@ class Qwen3LlmModuleMixin(ModuleMixin):
         self._pack_inputs_embeds_shape: Optional[torch.Tensor] = None
         self._past_key_values: Any = None
 
-    def pre_forward(
+    @pre_forward("forward")
+    def forward_pre(
         self,
-        method: str,
         conversation_list: Optional[list[list[ConversationItem]]] = None,
         **kwargs: Any,
     ) -> Dict[str, Any]:
-        assert method == "forward"
         inputs_embeds, attention_mask, position_ids, inputs_embeds_shape = self._pack_conversations_for_forward(
             conversation_list
         )
@@ -51,8 +50,8 @@ class Qwen3LlmModuleMixin(ModuleMixin):
             **kwargs,
         )
 
-    def post_forward(self, method: str, **outputs: Any) -> Dict[str, Any]:
-        assert method == "forward"
+    @post_forward("forward")
+    def forward_post(self, **outputs: Any) -> Dict[str, Any]:
         hidden_states = outputs.get("hidden_states")
 
         if get_parallel_state().sp_enabled:

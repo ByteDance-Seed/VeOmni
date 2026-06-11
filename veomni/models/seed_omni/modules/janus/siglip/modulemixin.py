@@ -3,7 +3,7 @@ from typing import Any, Dict, List, Optional
 import torch
 
 from ....conversation import ConversationItem, collect_desired_values, iter_desired_items
-from ....module import ModuleMixin
+from ....module import ModuleMixin, post_forward, pre_forward
 from ....tracemixin import TraceMixin
 from .configuration import JanusSiglipConfig
 
@@ -15,25 +15,23 @@ class JanusSiglipModuleMixin(ModuleMixin):
 
     # Training hooks
 
-    def pre_forward(
+    @pre_forward("forward")
+    def forward_pre(
         self,
-        method: str,
         conversation_list: Optional[list[list[ConversationItem]]] = None,
     ) -> Dict[str, Any]:
-        assert method == "forward"
         self._conversation_carrier = conversation_list
         pixel_values = self._pixels_from_raw_images(
             collect_desired_values(conversation_list, types=["image"], roles=["user"])
         )
         return {"pixel_values": pixel_values}
 
-    def post_forward(
+    @post_forward("forward")
+    def forward_post(
         self,
-        method: str,
         image_embeds: torch.Tensor,
         is_dummy: bool = False,
     ) -> Dict[str, Any]:
-        assert method == "forward"
         conversation = self._conversation_carrier
         self._conversation_carrier = None
         if is_dummy:
