@@ -6,14 +6,14 @@ flowchart LR
     fsm_start(("▶")):::fsm_start
     fsm_done(("⏹")):::fsm_terminal
     subgraph state_prompt_encode [prompt_encode]
-        direction LR
+        direction TB
         prompt_encode__token_generate["token_generate<br/><i>qwen3_text_encoder.forward</i>"]:::body_node
         prompt_encode__qwen3_llm["qwen3_llm<br/><i>qwen3_llm.forward</i>"]:::body_node
         prompt_encode__token_generate --> prompt_encode__qwen3_llm
         prompt_encode__qwen3_llm --> prompt_encode__token_generate
     end
     subgraph state_text_ar [text_ar]
-        direction LR
+        direction TB
         text_ar__token_generate["token_generate<br/><i>qwen3_text_encoder.forward</i>"]:::body_node
         text_ar__qwen3_llm["qwen3_llm<br/><i>qwen3_llm.forward</i>"]:::body_node
         text_ar__token_generate --> text_ar__qwen3_llm

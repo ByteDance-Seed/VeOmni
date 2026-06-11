@@ -6,7 +6,7 @@ flowchart LR
     fsm_start(("▶")):::fsm_start
     fsm_done(("⏹")):::fsm_terminal
     subgraph state_prompt_encode [prompt_encode]
-        direction LR
+        direction TB
         prompt_encode__siglip_encode["siglip_encode<br/><i>janus_siglip.forward</i>"]:::body_node
         prompt_encode__janus_llama["janus_llama<br/><i>janus_llama.forward</i>"]:::body_node
         prompt_encode__token_generate["token_generate<br/><i>janus_text_encoder.forward</i>"]:::body_node
@@ -14,18 +14,18 @@ flowchart LR
         prompt_encode__token_generate --> prompt_encode__janus_llama
     end
     subgraph state_image_vq_start [image_vq_start]
-        direction LR
+        direction TB
         image_vq_start__emit_image_start["emit_image_start<br/><i>janus_text_encoder.emit_image_start</i>"]:::body_node
     end
     subgraph state_image_vq [image_vq]
-        direction LR
+        direction TB
         image_vq__janus_llama["janus_llama<br/><i>janus_llama.forward</i>"]:::body_node
         image_vq__vqvae["vqvae<br/><i>janus_vqvae.forward</i>"]:::body_node
         image_vq__janus_llama --> image_vq__vqvae
         image_vq__vqvae --> image_vq__janus_llama
     end
     subgraph state_image_vq_end [image_vq_end]
-        direction LR
+        direction TB
         image_vq_end__emit_image_end["emit_image_end<br/><i>janus_text_encoder.emit_image_end</i>"]:::body_node
     end
     state_prompt_encode -.-> state_prompt_encode
