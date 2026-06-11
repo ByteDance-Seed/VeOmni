@@ -10,6 +10,7 @@ import torch
 
 from tests.seed_omni.fixtures.bagel.compare_gradient_graph import compare_gradient_graph
 from tests.seed_omni.fixtures.bagel.compare_gradient_module import compare_gradient_module
+from tests.seed_omni.fixtures.bagel.compare_optimizer_trajectory_graph import compare_optimizer_trajectory_graph
 
 
 _ENV_PREFIX = "VEOMNI_V2_TEST_BAGEL_"
@@ -105,3 +106,22 @@ def test_bagel_gradient_mse_only_graph_backward_matches_official_fixture() -> No
 
 def test_bagel_gradient_ce_mse_graph_backward_matches_official_fixture() -> None:
     _assert_graph_gradient_parity("GRADIENT_CE_MSE_PARITY_FIXTURE", "CE+MSE")
+
+
+def test_bagel_optimizer_trajectory_graph_matches_official_fixture() -> None:
+    fixture_path = _env_value("OPTIMIZER_TRAJECTORY_FIXTURE")
+    model_root = _env_value("SPLIT_MODEL_ROOT")
+    if not fixture_path or not model_root:
+        pytest.skip(
+            f"Set {_env_name('OPTIMIZER_TRAJECTORY_FIXTURE')} and {_env_name('SPLIT_MODEL_ROOT')} "
+            "to run BAGEL graph-level optimizer trajectory parity."
+        )
+    if not torch.cuda.is_available():
+        pytest.skip("BAGEL graph-level optimizer trajectory parity requires CUDA efficient attention.")
+
+    report = compare_optimizer_trajectory_graph(
+        Path(fixture_path),
+        Path(model_root),
+        config_dir=_bagel_cfg_dir(),
+    )
+    assert report["all_pass"], report
