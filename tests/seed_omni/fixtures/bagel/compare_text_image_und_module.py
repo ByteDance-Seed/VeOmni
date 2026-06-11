@@ -144,7 +144,7 @@ def compare_text_image_und(
     )
     image_sequence[image_fields["packed_text_indexes"]] = packed_image_text_embedding
     image_sequence[image_fields["packed_vit_token_indexes"]] = image_embeds.to(dtype=image_sequence.dtype)
-    image_output = qwen2_mot.forward_inference(
+    image_output = qwen2_mot(
         packed_query_sequence=image_sequence,
         query_lens=image_fields["packed_seqlens"],
         packed_query_position_ids=image_fields["packed_position_ids"],
@@ -157,16 +157,16 @@ def compare_text_image_und(
         mode="und",
     )
     image_cache_metrics = _compare_cache(
-        _cache_to_cpu(image_output.past_key_values), fixture["cache_after_image"], tolerance
+        _cache_to_cpu(image_output["past_key_values"]), fixture["cache_after_image"], tolerance
     )
 
     prompt_embedding = _embed_text(text_encoder, prompt_fields["packed_text_ids"])
-    prompt_output = qwen2_mot.forward_inference(
+    prompt_output = qwen2_mot(
         packed_query_sequence=prompt_embedding,
         query_lens=prompt_fields["text_token_lens"],
         packed_query_position_ids=prompt_fields["packed_text_position_ids"],
         packed_query_indexes=prompt_fields["packed_text_indexes"],
-        past_key_values=image_output.past_key_values,
+        past_key_values=image_output["past_key_values"],
         key_values_lens=prompt_fields["key_values_lens"],
         packed_key_value_indexes=prompt_fields["packed_key_value_indexes"],
         update_past_key_values=True,
@@ -174,31 +174,31 @@ def compare_text_image_und(
         mode="und",
     )
     prompt_cache_metrics = _compare_cache(
-        _cache_to_cpu(prompt_output.past_key_values), fixture["cache_after_prompt"], tolerance
+        _cache_to_cpu(prompt_output["past_key_values"]), fixture["cache_after_prompt"], tolerance
     )
 
     start_embedding = _embed_text(text_encoder, start_fields["packed_start_tokens"])
-    one_step_output = qwen2_mot.forward_inference(
+    one_step_output = qwen2_mot(
         packed_query_sequence=start_embedding,
         query_lens=_to_device(fixture["prepared"]["query_lens"], torch_device),
         packed_query_position_ids=start_fields["packed_query_position_ids"],
         packed_query_indexes=_to_device(fixture["prepared"]["packed_query_indexes"], torch_device),
-        past_key_values=prompt_output.past_key_values,
+        past_key_values=prompt_output["past_key_values"],
         key_values_lens=start_fields["key_values_lens"],
         packed_key_value_indexes=_to_device(fixture["prepared"]["packed_key_value_indexes_for_step"], torch_device),
         update_past_key_values=True,
         is_causal=True,
         mode="und",
     )
-    logits = text_encoder.lm_head(one_step_output.packed_query_sequence)
+    logits = text_encoder.lm_head(one_step_output["hidden_states"])
     hidden_metrics = _tensor_metrics(
-        one_step_output.packed_query_sequence.detach().cpu(), fixture["one_step"]["hidden_state"]
+        one_step_output["hidden_states"].detach().cpu(), fixture["one_step"]["hidden_state"]
     )
     logits_metrics = _tensor_metrics(logits.detach().cpu(), fixture["one_step"]["logits"])
     hidden_metrics["passes"] = _passes(hidden_metrics, tolerance)
     logits_metrics["passes"] = _passes(logits_metrics, tolerance)
     cache_step_metrics = _compare_cache(
-        _cache_to_cpu(one_step_output.past_key_values), fixture["one_step"]["cache_after_step"], tolerance
+        _cache_to_cpu(one_step_output["past_key_values"]), fixture["one_step"]["cache_after_step"], tolerance
     )
 
     greedy_token = torch.argmax(logits.detach().cpu(), dim=-1)

@@ -92,7 +92,7 @@ class BagelQwen2MoTModuleMixin(ModuleMixin):
                     else self._key_values_lens.to(device=self.device, dtype=torch.int32)
                 )
             key_value_indexes = self._prompt_meta_tensor(item, ("context_indexes",), [], dtype=torch.long)
-            outputs = self.forward_inference(
+            outputs = self._forward_packed_inference(
                 packed_query_sequence=packed_query_sequence,
                 query_lens=query_lens,
                 packed_query_position_ids=position_ids,
@@ -134,7 +134,7 @@ class BagelQwen2MoTModuleMixin(ModuleMixin):
         if key_value_indexes is None:
             key_value_indexes = torch.arange(int(key_values_lens.sum().item()), device=self.device, dtype=torch.long)
 
-        outputs = self.forward_inference(
+        outputs = self._forward_packed_inference(
             packed_query_sequence=packed_query_sequence,
             query_lens=query_lens,
             packed_query_position_ids=position_ids,

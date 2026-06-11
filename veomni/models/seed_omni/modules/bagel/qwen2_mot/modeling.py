@@ -127,7 +127,7 @@ class BagelQwen2MoTAttention(nn.Module):
         self.q_norm_moe_gen = Qwen2RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm_moe_gen = Qwen2RMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
-    def forward_inference(
+    def _forward_packed_inference(
         self,
         packed_query_sequence: torch.Tensor,
         query_lens: torch.Tensor,
@@ -143,7 +143,7 @@ class BagelQwen2MoTAttention(nn.Module):
         packed_text_indexes: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, Optional[NaiveCache]]:
         if mode != "und":
-            raise NotImplementedError("BagelQwen2MoTAttention currently supports text-only mode='und'.")
+            raise NotImplementedError("BagelQwen2MoTAttention currently supports understanding mode='und'.")
         del packed_vae_token_indexes, packed_text_indexes
 
         packed_query_states = self.q_proj(packed_query_sequence).view(-1, self.num_heads, self.head_dim)
@@ -210,7 +210,7 @@ class BagelQwen2MoTAttention(nn.Module):
     def forward(self, *args: Any, **kwargs: Any) -> tuple[torch.Tensor, Optional[NaiveCache]]:
         if self.training:
             raise NotImplementedError("BagelQwen2MoTAttention training forward is not implemented yet.")
-        return self.forward_inference(*args, **kwargs)
+        return self._forward_packed_inference(*args, **kwargs)
 
 
 class BagelQwen2MoTDecoderLayer(nn.Module):
@@ -224,7 +224,7 @@ class BagelQwen2MoTDecoderLayer(nn.Module):
         self.post_attention_layernorm = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm_moe_gen = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-    def forward_inference(
+    def _forward_packed_inference(
         self,
         packed_query_sequence: torch.Tensor,
         query_lens: torch.Tensor,
@@ -240,7 +240,7 @@ class BagelQwen2MoTDecoderLayer(nn.Module):
         packed_text_indexes: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, Optional[NaiveCache]]:
         if mode != "und":
-            raise NotImplementedError("BagelQwen2MoTDecoderLayer currently supports text-only mode='und'.")
+            raise NotImplementedError("BagelQwen2MoTDecoderLayer currently supports understanding mode='und'.")
         del packed_vae_token_indexes, packed_text_indexes
 
         residual = packed_query_sequence
@@ -269,7 +269,7 @@ class BagelQwen2MoTDecoderLayer(nn.Module):
     def forward(self, *args: Any, **kwargs: Any) -> tuple[torch.Tensor, Optional[NaiveCache]]:
         if self.training:
             raise NotImplementedError("BagelQwen2MoTDecoderLayer training forward is not implemented yet.")
-        return self.forward_inference(*args, **kwargs)
+        return self._forward_packed_inference(*args, **kwargs)
 
 
 class BagelQwen2MoTBackbone(nn.Module):
@@ -283,7 +283,7 @@ class BagelQwen2MoTBackbone(nn.Module):
         self.rotary_emb = BagelQwen2RotaryEmbedding(config=config)
         self.use_moe = "Mo" in config.layer_module
 
-    def forward_inference(
+    def _forward_packed_inference(
         self,
         packed_query_sequence: torch.Tensor,
         query_lens: torch.Tensor,
@@ -299,7 +299,7 @@ class BagelQwen2MoTBackbone(nn.Module):
         packed_text_indexes: Optional[torch.Tensor] = None,
     ) -> BaseNavitOutputWithPast:
         if mode != "und":
-            raise NotImplementedError("BagelQwen2MoTBackbone currently supports text-only mode='und'.")
+            raise NotImplementedError("BagelQwen2MoTBackbone currently supports understanding mode='und'.")
         del packed_vae_token_indexes, packed_text_indexes
 
         if past_key_values is None:
@@ -331,7 +331,7 @@ class BagelQwen2MoTBackbone(nn.Module):
     def forward(self, *args: Any, **kwargs: Any) -> BaseNavitOutputWithPast:
         if self.training:
             raise NotImplementedError("BagelQwen2MoTBackbone training forward is not implemented yet.")
-        return self.forward_inference(*args, **kwargs)
+        return self._forward_packed_inference(*args, **kwargs)
 
 
 class BagelQwen2MoT(BagelQwen2MoTModuleMixin, PreTrainedModel):
@@ -369,7 +369,7 @@ class BagelQwen2MoT(BagelQwen2MoTModuleMixin, PreTrainedModel):
         if query_lens is None or packed_query_position_ids is None or packed_query_indexes is None:
             raise ValueError("query_lens, packed_query_position_ids, and packed_query_indexes are required.")
 
-        output = self.forward_inference(
+        output = self._forward_packed_inference(
             packed_query_sequence=packed_query_sequence,
             query_lens=query_lens,
             packed_query_position_ids=packed_query_position_ids,
@@ -386,7 +386,7 @@ class BagelQwen2MoT(BagelQwen2MoTModuleMixin, PreTrainedModel):
             "past_key_values": output.past_key_values,
         }
 
-    def forward_inference(
+    def _forward_packed_inference(
         self,
         packed_query_sequence: torch.Tensor,
         query_lens: torch.Tensor,
@@ -401,7 +401,7 @@ class BagelQwen2MoT(BagelQwen2MoTModuleMixin, PreTrainedModel):
         **kwargs: Any,
     ) -> BaseNavitOutputWithPast:
         del kwargs
-        return self.model.forward_inference(
+        return self.model._forward_packed_inference(
             packed_query_sequence=packed_query_sequence,
             query_lens=query_lens,
             packed_query_position_ids=packed_query_position_ids,
