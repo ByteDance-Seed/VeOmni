@@ -3,11 +3,13 @@ from typing import Any, Dict, List, Optional
 import torch
 
 from veomni.distributed.parallel_state import get_parallel_state
-from veomni.utils.seqlen_pos_transform_utils import prepare_fa_kwargs_from_position_ids
+from veomni.utils.seqlen_pos_transform_utils import prepare_fa_kwargs_from_position_ids, valid_seqlens_from_cu_seqlens
 from veomni.utils.tensor_utils import naflatten, unflatten
 
 from ....conversation import ConversationItem, is_dummy
-from ....module import ModuleMixin
+from ....module import ModuleMixin, post_forward, pre_forward
+from ....tracemixin import TraceMixin
+from .configuration import Qwen3LlmConfig
 
 
 class Qwen3LlmModuleMixin(ModuleMixin):
@@ -16,13 +18,12 @@ class Qwen3LlmModuleMixin(ModuleMixin):
         self._pack_inputs_embeds_shape: Optional[torch.Tensor] = None
         self._past_key_values: Any = None
 
-    def pre_forward(
+    @pre_forward("forward")
+    def forward_pre(
         self,
-        method: str,
         conversation_list: Optional[list[list[ConversationItem]]] = None,
         **kwargs: Any,
     ) -> Dict[str, Any]:
-        assert method == "forward"
         inputs_embeds, attention_mask, position_ids, inputs_embeds_shape = self._pack_conversations_for_forward(
             conversation_list
         )
@@ -49,8 +50,8 @@ class Qwen3LlmModuleMixin(ModuleMixin):
             **kwargs,
         )
 
-    def post_forward(self, method: str, **outputs: Any) -> Dict[str, Any]:
-        assert method == "forward"
+    @post_forward("forward")
+    def forward_post(self, **outputs: Any) -> Dict[str, Any]:
         hidden_states = outputs.get("hidden_states")
 
         if get_parallel_state().sp_enabled:
@@ -203,4 +204,41 @@ def _fold_fsdp_dummy_anchors(
     return inputs_embeds
 
 
-__all__ = ["Qwen3LlmModuleMixin"]
+class Qwen3LlmTraceMixin(TraceMixin):
+    """Per-module training-trace for the Qwen3 backbone (transformer layers only)."""
+
+    config: Qwen3LlmConfig
+
+    def trace_token_lengths(self, method: str, data: Dict[str, Any]) -> List[int]:
+        # Backbone only runs "forward"; its tokens are the packed per-sample
+        # sequence lengths (text + spliced modality tokens), read from the
+        # FlashAttention cu_seqlens its pre_forward built.
+        cu_seq_lens_q = data.get("cu_seq_lens_q")
+        if cu_seq_lens_q is None:
+            return []
+        return [int(s) for s in valid_seqlens_from_cu_seqlens(cu_seq_lens_q).tolist()]
+
+    def estimate_flops(self, seqlens: List[int]) -> float:
+        # Transformer layers only: this backbone owns no wte / lm_head (those
+        # live in the text_encoder module), so we do NOT add a vocab projection.
+        # fwd+bwd ⇒ 6x for the linear params, 12x for the quadratic attention.
+        cfg = self.config.text_config
+        hidden = cfg.hidden_size
+        num_layers = cfg.num_hidden_layers
+        num_heads = cfg.num_attention_heads
+        num_kv_heads = cfg.num_key_value_heads
+        head_dim = getattr(cfg, "head_dim", hidden // num_heads)
+
+        # SwiGLU MLP (gate/up/down) + attention projections (q, k, v, o).
+        mlp_n = hidden * cfg.intermediate_size * 3
+        attn_linear_n = hidden * (num_heads * head_dim * 2 + num_kv_heads * head_dim * 2)
+        dense_n = (mlp_n + attn_linear_n) * num_layers
+
+        tokens = sum(seqlens)
+        seqlen_sq = sum(s * s for s in seqlens)
+        dense_flops = 6 * dense_n * tokens
+        attn_flops = 12 * seqlen_sq * head_dim * num_heads * num_layers
+        return (dense_flops + attn_flops) / 1e12
+
+
+__all__ = ["Qwen3LlmModuleMixin", "Qwen3LlmTraceMixin"]

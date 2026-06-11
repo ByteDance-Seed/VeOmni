@@ -18,7 +18,7 @@ Architecture
                           ``<module_name>.<rest>`` (no ``modules_dict.``
                           middle prefix).  ``model.modules_dict`` remains as
                           a read-only dict view for back-compat.
-* ``training_graph``    — :class:`TrainingGraph` (DAG over node/edge pools).
+* ``training_graph``    — :class:`TrainingGraph` (DAG over the flat edge list).
 * ``generation_graph``  — :class:`GenerationGraph` (FSM, optional).
 
 Loss protocol (single ``_loss`` key per module)
@@ -80,7 +80,7 @@ spans (e.g. Janus T2I's 576-step ``image_vq`` loop).  Rank-0 gating is
 handled by the logger.
 """
 
-from typing import Any, Dict, Iterator, List, Mapping, Optional, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -104,8 +104,8 @@ class OmniModel(nn.Module):
     Parameters
     ----------
     config:
-        :class:`OmniConfig` with ``modules`` / ``nodes`` / ``edges`` /
-        ``training_graph`` / ``generation_graph`` populated.
+        :class:`OmniConfig` with ``modules`` / ``training_graph`` /
+        ``generation_graph`` populated.
     modules:
         ``{module_name: ModuleMixin-mixin instance}`` — already constructed
         (and parallelised, if running under FSDP).  ``OmniTrainer`` is
@@ -170,21 +170,22 @@ class OmniModel(nn.Module):
         for name in self._module_names:
             self.add_module(name, modules[name])
 
-        self.training_graph = TrainingGraph(
-            nodes=config.nodes,
-            edges=config.edges,
-            training_edges=config.training_edges,
-        )
+        # Both views are optional: an inference-only config may carry just a
+        # ``generation_graph`` (no ``training_graph``), and vice versa.
+        self.training_graph = TrainingGraph(edges=config.training_graph) if config.has_training_graph() else None
 
         self.generation_graph = (
-            GenerationGraph(
-                fsm_config=config.generation_graph,
-                nodes=config.nodes,
-                edges=config.edges,
-            )
-            if config.has_generation_graph()
-            else None
+            GenerationGraph(fsm_config=config.generation_graph) if config.has_generation_graph() else None
         )
+
+        # Optional per-node executors injected by the trainer.  When set, the
+        # training graph dispatches each node's pre_forward → method → post_forward
+        # through ``self._node_executors[module_name](method, **kwargs)`` (the
+        # OmniModuleTrainer's ``forward``, which also drives the per-module trace
+        # meter) instead of running it inline.  ``None`` ⇒ inline default — keeps
+        # the runtime importable / runnable in torch-free, trainer-free contexts
+        # (the print-flow tests, inference).
+        self._node_executors: Optional[Dict[str, Callable[..., Dict[str, Any]]]] = None
 
         # Last FSM state printed by :meth:`_emit_progress` — its private
         # dedup cursor (reset on each fresh ``generate`` run).
@@ -222,6 +223,17 @@ class OmniModel(nn.Module):
 
     # ── Training ──────────────────────────────────────────────────────────────
 
+    def set_node_executors(self, executors: Optional[Mapping[str, Callable[..., Dict[str, Any]]]]) -> None:
+        """Install per-module node executors (called by :class:`OmniTrainer`).
+
+        ``executors`` maps ``module_name → callable(method, **kwargs) -> dict``.
+        The training graph then routes each node through its module's executor
+        (the ``OmniModuleTrainer.forward``, which wraps pre_forward / method /
+        post_forward and drives the per-module trace meter).  Pass ``None`` to
+        restore the inline default.
+        """
+        self._node_executors = dict(executors) if executors is not None else None
+
     def forward(
         self,
         *,
@@ -250,45 +262,27 @@ class OmniModel(nn.Module):
         * ``"outputs"`` : ``{node_name: full output dict}`` as returned by
                           each node's ``post_forward``.
         """
+        if self.training_graph is None:
+            raise RuntimeError(
+                "OmniModel.forward requires a `training_graph`, but this config declares none "
+                "(inference-only). Use `generate` instead, or load a training YAML."
+            )
+
         node_outputs: Dict[str, Dict[str, Any]] = {}
         losses: Dict[str, torch.Tensor] = {}
 
         for node_name in self.training_graph.execution_order:
             module_name = self.training_graph.module_of(node_name)
             method = self.training_graph.method_of(node_name)
-            module = getattr(self, module_name)
-            raw_module = _unwrap_module(module)
 
             kwargs = self.training_graph.collect_inputs(node_name, node_outputs, batch)
-            kwargs = raw_module.pre_forward(method=method, **kwargs) if _is_omni_module(raw_module) else kwargs
 
-            if method == "forward":
-                # Through the FSDP wrapper so unshard + backward hooks fire.
-                out = module(**kwargs)
-            else:
-                fn = getattr(raw_module, method, None)
-                if fn is None:
-                    raise AttributeError(
-                        f"Node '{node_name}' requires {module_name}.{method}() "
-                        f"but {type(raw_module).__name__} has no such method."
-                    )
-                # FSDP2 installs its all-gather (unshard) pre-forward hook and the
-                # post-forward/backward reduce-scatter hooks on ``module.__call__``
-                # only. Calling a non-``forward`` method directly would run the op
-                # against still-sharded DTensor params (-> "mixed Tensor and
-                # DTensor" errors) and skip gradient sync. Route the call through
-                # ``module(**kwargs)`` by temporarily pointing ``forward`` at the
-                # target method so every node — regardless of method name — gets
-                # the same FSDP2 lifecycle as a plain ``forward`` node.
-                orig_forward = raw_module.forward
-                try:
-                    raw_module.forward = fn
-                    out = module(**kwargs)
-                finally:
-                    raw_module.forward = orig_forward
-
-            if _is_omni_module(raw_module):
-                out = raw_module.post_forward(method=method, **out)
+            # The training-graph path always runs through the trainer-injected
+            # per-module executor (``OmniModuleTrainer.forward``: pre_forward →
+            # method → post_forward + per-module trace meter). Inference never
+            # reaches here — it goes through ``generate`` / the generation graph.
+            executor = self._node_executors.get(module_name)
+            out = executor(method, **kwargs)
 
             node_outputs[node_name] = out
 

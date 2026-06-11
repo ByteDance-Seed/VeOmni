@@ -24,6 +24,7 @@ from .evaluate_callback import EvaluateCallback
 from .trace_callback import (
     EnvironMeterCallback,
     MoERouterMonitorCallback,
+    OmniEnvironMeterCallback,
     ProfileTraceCallback,
     TqdmCallback,
     WandbTraceCallback,
@@ -40,6 +41,7 @@ __all__ = [
     "WandbTraceCallback",
     "ProfileTraceCallback",
     "EnvironMeterCallback",
+    "OmniEnvironMeterCallback",
     "MoERouterMonitorCallback",
     "TqdmCallback",
 ]

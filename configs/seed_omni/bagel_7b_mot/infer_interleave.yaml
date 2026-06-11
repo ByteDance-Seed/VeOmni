@@ -12,13 +12,13 @@ generation_graph:
   states:
     prompt_encode:
       body:
-        - vae_encode_to_siglip_encode
-        - siglip_encode_to_token_prompt_encode
-        - token_prompt_encode_to_flow_embed
-        - flow_embed_to_qwen2
-        - token_prompt_encode_to_qwen2
-        - qwen2_to_token_generate
-        - token_generate_sink
+        - { from: bagel_vae.encode,                  to: bagel_siglip_navit }
+        - { from: bagel_siglip_navit,                 to: bagel_text_encoder }
+        - { from: bagel_text_encoder,                 to: bagel_flow_connector.embed_latent }
+        - { from: bagel_flow_connector.embed_latent,  to: bagel_qwen2_mot }
+        - { from: bagel_text_encoder,                 to: bagel_qwen2_mot }
+        - { from: bagel_qwen2_mot,                    to: bagel_text_encoder }
+        - { from: bagel_text_encoder,                 to: end }
       transitions:
         - { condition: { type: module_signal, key: start_image_gen }, next_state: image_flow }
         - { condition: { type: module_signal, key: text_done }, next_state: done }
@@ -26,23 +26,23 @@ generation_graph:
 
     text_ar:
       body:
-        - qwen2_to_token_generate
-        - token_generate_sink
+        - { from: bagel_qwen2_mot,    to: bagel_text_encoder }
+        - { from: bagel_text_encoder, to: end }
       transitions:
         - { condition: { type: module_signal, key: start_image_gen }, next_state: image_flow }
         - { condition: { type: module_signal, key: text_done }, next_state: done }
 
     image_flow:
       body:
-        - flow_embed_to_qwen2
-        - qwen2_to_flow_decode
-        - flow_decode_sink
+        - { from: bagel_flow_connector.embed_latent,    to: bagel_qwen2_mot }
+        - { from: bagel_qwen2_mot,                      to: bagel_flow_connector.decode_velocity }
+        - { from: bagel_flow_connector.decode_velocity, to: end }
       transitions:
         - { condition: { type: module_signal, key: image_complete }, next_state: image_decode }
 
     image_decode:
       body:
-        - vae_decode_sink
+        - { from: bagel_vae.decode, to: end }
       transitions:
         - { condition: { type: default }, next_state: text_ar }
 

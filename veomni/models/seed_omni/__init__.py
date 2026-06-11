@@ -32,6 +32,7 @@ from .modules import (
     OMNI_PROCESSOR_REGISTRY,
     read_model_type,
 )
+from .tracemixin import TraceMixin
 from .training_graph import TrainingGraph
 
 
@@ -40,6 +41,7 @@ __all__ = [
     "OmniConfig",
     "OmniModel",
     "ModuleMixin",
+    "TraceMixin",
     "TrainingGraph",
     "GenerationGraph",
     "NodeDef",

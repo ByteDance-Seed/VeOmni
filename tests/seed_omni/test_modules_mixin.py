@@ -407,16 +407,16 @@ def test_janus_train_yaml_loads_with_v2_module_names():
 
     assert set(cfg.modules) == {"janus_siglip", "janus_vqvae", "janus_llama", "janus_text_encoder"}
     assert cfg.modules["janus_siglip"]["model"]["model_path"] == "janus_siglip"
-    # Sanity: every training-graph edge is declared in the edges pool.
-    edge_names = set(cfg.edges)
-    for e in cfg.training_edges:
-        assert e in edge_names
-    # Inference-only nodes / edges live in the pool but are NOT in training_edges.
-    assert "emit_image_start" in cfg.nodes
-    assert "emit_image_end" in cfg.nodes
-    assert "emit_start_to_janus_llama" in cfg.edges
-    assert "emit_end_to_janus_llama" in cfg.edges
-    assert "emit_start_to_janus_llama" not in cfg.training_edges
+    # training_graph is a flat list of `{from, to}` edges; endpoints are
+    # self-describing `module[.method]` strings.
+    assert isinstance(cfg.training_graph, list) and cfg.training_graph
+    endpoints = {e["from"] for e in cfg.training_graph} | {e["to"] for e in cfg.training_graph}
+    assert "janus_siglip" in endpoints
+    assert "janus_vqvae.encode" in endpoints
+    assert "janus_text_encoder.encode" in endpoints
+    assert "end" in endpoints
+    # Inference-only call-sites (emit_image_*) are NOT in the training graph.
+    assert not any("emit_image" in e["from"] or "emit_image" in e["to"] for e in cfg.training_graph)
 
 
 @pytest.mark.parametrize("infer_yaml", ["infer_interleave.yaml", "infer_gen.yaml", "infer_und.yaml"])
@@ -445,10 +445,12 @@ def test_janus_train_plus_infer_merges_generation_graph(infer_yaml: str):
         for state in cfg.generation_graph["states"].values()
         for t in state.get("transitions", [])
     ), f"{infer_yaml} has no transition to `done` — the FSM cannot terminate."
-    # Each inference body should reference only edges that exist in the pool.
+    # Each inference body is a list of inline `{from, to}` edge dicts.
     for state_name, state in cfg.generation_graph["states"].items():
         for e in state.get("body", []):
-            assert e in cfg.edges, f"state '{state_name}' body edge '{e}' not in pool"
+            assert isinstance(e, dict) and "from" in e and "to" in e, (
+                f"state '{state_name}' body item must be a `{{from, to}}` dict: {e!r}"
+            )
 
 
 def test_init_deep_merges_infer_module_overrides():
@@ -515,9 +517,9 @@ def test_qwen3_train_yaml_loads_with_v2_module_names():
 
     assert set(cfg.modules) == {"qwen3_text_encoder", "qwen3_llm"}
     assert cfg.modules["qwen3_text_encoder"]["model"]["model_path"] == "qwen3_text_encoder"
-    edge_names = set(cfg.edges)
-    for e in cfg.training_edges:
-        assert e in edge_names
+    assert isinstance(cfg.training_graph, list) and cfg.training_graph
+    endpoints = {e["from"] for e in cfg.training_graph} | {e["to"] for e in cfg.training_graph}
+    assert "qwen3_text_encoder.encode" in endpoints and "qwen3_llm" in endpoints
 
 
 def test_qwen3_train_plus_infer_merges_generation_graph():
@@ -527,7 +529,7 @@ def test_qwen3_train_plus_infer_merges_generation_graph():
     )
     assert set(cfg.modules) == {"qwen3_text_encoder", "qwen3_llm"}
     assert cfg.has_generation_graph()
-    assert cfg.generation_graph["initial"] == "prompt_encode"
+    assert cfg.generation_graph["initial"] == "text_ar"
     assert "done" not in cfg.generation_graph["states"]
 
 
@@ -545,11 +547,11 @@ def test_bagel_train_yaml_loads_with_v2_module_names():
         "bagel_flow_connector",
         "bagel_vae",
     }
-    edge_names = set(cfg.edges)
-    for e in cfg.training_edges:
-        assert e in edge_names
-    assert "vae_decode" in cfg.nodes
-    assert "vae_decode_sink" in cfg.edges
+    assert isinstance(cfg.training_graph, list) and cfg.training_graph
+    endpoints = {e["from"] for e in cfg.training_graph} | {e["to"] for e in cfg.training_graph}
+    assert "bagel_text_encoder.encode" in endpoints
+    assert "bagel_qwen2_mot" in endpoints
+    assert "bagel_flow_connector.decode_velocity" in endpoints
 
 
 @pytest.mark.parametrize("infer_yaml", ["infer_und.yaml", "infer_gen.yaml", "infer_interleave.yaml"])
@@ -575,7 +577,7 @@ def test_bagel_train_plus_infer_merges_generation_graph(infer_yaml: str):
     ), f"{infer_yaml} has no transition to `done`."
     for state_name, state in cfg.generation_graph["states"].items():
         for e in state.get("body", []):
-            assert e in cfg.edges, f"state '{state_name}' body edge '{e}' not in pool"
+            assert set(e) == {"from", "to"}, f"state '{state_name}' body edge must be inline: {e}"
 
 
 class _BagelInterleaveTokenizer:
@@ -761,7 +763,7 @@ def test_bagel_interleave_image_branch_signal_smoke():
         },
     )
 
-    assert any("transition: prompt_encode -> image_flow" in entry for entry in trace)
+    assert any("transition: text_ar -> image_flow" in entry for entry in trace)
     assert any("transition: image_flow -> image_decode" in entry for entry in trace)
     assert any("transition: image_decode -> text_ar" in entry for entry in trace)
     assert any("transition: text_ar -> done" in entry for entry in trace)

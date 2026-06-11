@@ -1,23 +1,17 @@
 # Qwen3-0.6B inference — text-only chat generation.
 
 generation_graph:
-  initial: prompt_encode
+  initial: text_ar
 
   states:
-    prompt_encode:
-      body:
-        - token_generate_to_qwen3_llm
-        - qwen3_llm_to_token_generate
-        - token_generate_sink
-      transitions:
-        - { condition: { type: module_signal, key: text_done }, next_state: done }
-        - { condition: { type: default }, next_state: text_ar }
-
+    # Single AR loop: ``qwen3_text_encoder.generate`` embeds the prompt on the
+    # first pass and the sampled-token tail on every subsequent pass (dispatch
+    # is driven by ``ctx``), so there is no separate ``prompt_encode`` state.
     text_ar:
       body:
-        - token_generate_to_qwen3_llm
-        - qwen3_llm_to_token_generate
-        - token_generate_sink
+        - { from: qwen3_text_encoder, to: qwen3_llm }
+        - { from: qwen3_llm,          to: qwen3_text_encoder }
+        - { from: qwen3_text_encoder, to: end }
       transitions:
         - { condition: { type: module_signal, key: text_done }, next_state: done }
 

@@ -14,10 +14,10 @@ import torch.nn.functional as F
 from transformers import PreTrainedModel
 
 from .configuration import TextEncoderConfig
-from .modulemixin import TextEncoderModuleMixin
+from .modulemixin import TextEncoderModuleMixin, TextEncoderTraceMixin
 
 
-class TextEncoder(TextEncoderModuleMixin, PreTrainedModel):
+class TextEncoder(TextEncoderModuleMixin, TextEncoderTraceMixin, PreTrainedModel):
     """Word-token embedding + LM head."""
 
     config_class = TextEncoderConfig

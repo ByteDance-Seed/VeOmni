@@ -7,6 +7,7 @@ from veomni.utils.tensor_utils import naflatten, unflatten
 
 from ....conversation import ConversationItem, is_dummy, maybe_merge_outputs
 from ....generation_graph import FSM_SIGNAL_KEY
+from ....module import pre_forward
 from ...base.text_encoder.modulemixin import TextEncoderModuleMixin
 from .chat_template import (
     JanusChatMarkers,
@@ -41,43 +42,27 @@ class JanusTextEncoderModuleMixin(TextEncoderModuleMixin):
         self._pad_token_id: Optional[int] = None
 
     # training hooks
-    def pre_forward(
+    @pre_forward("encode")
+    def encode_pre(
         self,
-        method: str,
         conversation_list: Optional[list[list[ConversationItem]]] = None,
         **kwargs: Any,
     ) -> Dict[str, Any]:
         del kwargs
-        assert method in ("encode", "decode")
+        self._conversation_carrier = conversation_list
+        input_ids = self._prepare_encode_inputs(self._conversation_carrier)
+        return {"input_ids": input_ids}
 
-        if method == "encode":
-            self._conversation_carrier = conversation_list
-            input_ids = self._prepare_encode_inputs(self._conversation_carrier)
-            return {"input_ids": input_ids}
-        else:  # decode
-            self._conversation_carrier = conversation_list
-            hidden_states, shift_labels = self._prepare_decode_inputs(self._conversation_carrier)
-            return {"hidden_states": hidden_states, "shift_labels": shift_labels}
-
-    def post_forward(self, method: str, **outputs: Any) -> Dict[str, Any]:
-        assert method in ("encode", "decode")
-        if method == "encode":
-            conversation = self._conversation_carrier
-            batch_shape = self._encode_batch_shape
-            self._conversation_carrier = None
-            self._encode_batch_shape = None
-            inputs_embeds = outputs.get("inputs_embeds")
-            self._scatter_text_embeds(conversation, unflatten(inputs_embeds, batch_shape))
-            return {"conversation_list": conversation}
-        else:  # decode
-            outputs.pop("logits", None)
-            loss = outputs.pop("loss", None)
-            if loss is not None:
-                outputs["_loss"] = loss
-            conversation = self._conversation_carrier
-            self._conversation_carrier = None
-            outputs["conversation_list"] = conversation
-            return outputs
+    @pre_forward("decode")
+    def decode_pre(
+        self,
+        conversation_list: Optional[list[list[ConversationItem]]] = None,
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
+        del kwargs
+        self._conversation_carrier = conversation_list
+        hidden_states, shift_labels = self._prepare_decode_inputs(self._conversation_carrier)
+        return {"hidden_states": hidden_states, "shift_labels": shift_labels}
 
     def _prepare_encode_inputs(
         self,

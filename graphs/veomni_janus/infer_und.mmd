@@ -6,23 +6,21 @@ flowchart LR
     fsm_start(("▶")):::fsm_start
     fsm_done(("⏹")):::fsm_terminal
     subgraph state_prompt_encode [prompt_encode]
-        direction TB
-        prompt_encode__siglip_encode["siglip_encode<br/><i>janus_siglip.forward</i>"]:::body_node
-        prompt_encode__janus_llama["janus_llama<br/><i>janus_llama.forward</i>"]:::body_node
-        prompt_encode__token_generate["token_generate<br/><i>janus_text_encoder.forward</i>"]:::body_node
-        prompt_encode__siglip_encode --> prompt_encode__janus_llama
-        prompt_encode__token_generate --> prompt_encode__janus_llama
-        prompt_encode__janus_llama --> prompt_encode__token_generate
+        direction LR
+        prompt_encode__janus_siglip_generate["<i>janus_siglip.generate</i>"]:::body_node
+        prompt_encode__janus_llama_generate["<i>janus_llama.generate</i>"]:::body_node
+        prompt_encode__janus_text_encoder_generate["<i>janus_text_encoder.generate</i>"]:::body_node
+        prompt_encode__janus_siglip_generate --> prompt_encode__janus_llama_generate
+        prompt_encode__janus_text_encoder_generate --> prompt_encode__janus_llama_generate
+        prompt_encode__janus_llama_generate --> prompt_encode__janus_text_encoder_generate
     end
     subgraph state_text_ar [text_ar]
-        direction TB
-        text_ar__token_generate["token_generate<br/><i>janus_text_encoder.forward</i>"]:::body_node
-        text_ar__janus_llama["janus_llama<br/><i>janus_llama.forward</i>"]:::body_node
-        text_ar__token_generate --> text_ar__janus_llama
-        text_ar__janus_llama --> text_ar__token_generate
+        direction LR
+        text_ar__janus_text_encoder_generate["<i>janus_text_encoder.generate</i>"]:::body_node
+        text_ar__janus_llama_generate["<i>janus_llama.generate</i>"]:::body_node
+        text_ar__janus_text_encoder_generate --> text_ar__janus_llama_generate
+        text_ar__janus_llama_generate --> text_ar__janus_text_encoder_generate
     end
-    state_prompt_encode -.-> state_prompt_encode
-    state_text_ar -.-> state_text_ar
     fsm_start ==> state_prompt_encode
     state_prompt_encode ==>|"module_signal(text_done)"| fsm_done
     state_prompt_encode ==>|"default"| state_text_ar

@@ -1,4 +1,4 @@
-# OmniModel V2 - BAGEL-7B-MoT training graph vocabulary.
+# OmniModel V2 - BAGEL-7B-MoT training graph.
 
 modules:
   bagel_text_encoder:
@@ -21,46 +21,12 @@ modules:
     model:
       model_path: bagel_qwen2_mot
 
-nodes:
-  token_encode: { module: bagel_text_encoder.encode }
-  token_prompt_encode: { module: bagel_text_encoder }
-  token_generate: { module: bagel_text_encoder }
-  siglip_encode: { module: bagel_siglip_navit }
-  vae_encode: { module: bagel_vae.encode }
-  vae_decode: { module: bagel_vae.decode }
-  flow_embed: { module: bagel_flow_connector.embed_latent }
-  qwen2_mot: { module: bagel_qwen2_mot }
-  token_decode: { module: bagel_text_encoder.decode }
-  flow_decode: { module: bagel_flow_connector.decode_velocity }
-
-edges:
-  token_encode_to_qwen2: { from: token_encode, to: qwen2_mot }
-  vae_encode_to_siglip_encode: { from: vae_encode, to: siglip_encode }
-  siglip_encode_to_token_prompt_encode: { from: siglip_encode, to: token_prompt_encode }
-  token_prompt_encode_to_flow_embed: { from: token_prompt_encode, to: flow_embed }
-  siglip_encode_to_qwen2: { from: siglip_encode, to: qwen2_mot }
-  vae_encode_to_flow_embed: { from: vae_encode, to: flow_embed }
-  flow_embed_to_qwen2: { from: flow_embed, to: qwen2_mot }
-  qwen2_to_token_decode: { from: qwen2_mot, to: token_decode }
-  qwen2_to_flow_decode: { from: qwen2_mot, to: flow_decode }
-  vae_decode_sink: { from: vae_decode, to: end }
-  token_decode_sink: { from: token_decode, to: end }
-  flow_decode_sink: { from: flow_decode, to: end }
-
-  # Inference-only understanding path: text/image context -> text token.
-  token_prompt_encode_to_qwen2: { from: token_prompt_encode, to: qwen2_mot }
-  token_generate_to_qwen2: { from: token_generate, to: qwen2_mot }
-  qwen2_to_token_generate: { from: qwen2_mot, to: token_generate }
-  token_generate_sink: { from: token_generate, to: end }
-  qwen2_sink: { from: qwen2_mot, to: end }
-
 training_graph:
-  edges:
-    - token_encode_to_qwen2
-    - siglip_encode_to_qwen2
-    - vae_encode_to_flow_embed
-    - flow_embed_to_qwen2
-    - qwen2_to_token_decode
-    - qwen2_to_flow_decode
-    - token_decode_sink
-    - flow_decode_sink
+  - { from: bagel_text_encoder.encode,          to: bagel_qwen2_mot }
+  - { from: bagel_siglip_navit,                 to: bagel_qwen2_mot }
+  - { from: bagel_vae.encode,                   to: bagel_flow_connector.embed_latent }
+  - { from: bagel_flow_connector.embed_latent,  to: bagel_qwen2_mot }
+  - { from: bagel_qwen2_mot,                    to: bagel_text_encoder.decode }
+  - { from: bagel_qwen2_mot,                    to: bagel_flow_connector.decode_velocity }
+  - { from: bagel_text_encoder.decode,          to: end }
+  - { from: bagel_flow_connector.decode_velocity, to: end }

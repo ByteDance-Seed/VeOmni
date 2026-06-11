@@ -22,19 +22,19 @@ generation_graph:
   states:
     prompt_encode:
       body:
-        - siglip_to_janus_llama
-        - token_generate_to_janus_llama
-        - janus_llama_to_token_generate
-        - token_generate_sink
+        - { from: janus_siglip,       to: janus_llama }
+        - { from: janus_text_encoder, to: janus_llama }
+        - { from: janus_llama,        to: janus_text_encoder }
+        - { from: janus_text_encoder, to: end }
       transitions:
         - { condition: { type: module_signal, key: text_done }, next_state: done }
         - { condition: { type: default }, next_state: text_ar }
 
     text_ar:
       body:
-        - token_generate_to_janus_llama
-        - janus_llama_to_token_generate
-        - token_generate_sink
+        - { from: janus_text_encoder, to: janus_llama }
+        - { from: janus_llama,        to: janus_text_encoder }
+        - { from: janus_text_encoder, to: end }
       transitions:
         - { condition: { type: module_signal, key: text_done }, next_state: done }
 

@@ -6,7 +6,9 @@ import torch.nn.functional as F
 from veomni.utils.tensor_utils import unflatten
 
 from ....conversation import ConversationItem, seal_outputs
-from ....module import ModuleMixin
+from ....module import ModuleMixin, post_forward
+from ....tracemixin import TraceMixin
+from .configuration import TextEncoderConfig
 
 
 _SAMPLING_KWARGS = ("temperature", "top_p", "do_sample")
@@ -31,21 +33,21 @@ class TextEncoderModuleMixin(ModuleMixin):
         self._tokenizer = tokenizer
 
     # training hooks
-    def pre_forward(self, method: str, **kwargs: Any) -> Dict[str, Any]:
-        raise NotImplementedError("TextEncoderModuleMixin.pre_forward is not implemented")
-
-    def post_forward(self, method: str, **outputs: Any) -> Dict[str, Any]:
-        assert method in ("encode", "decode")
+    @post_forward("encode")
+    def encode_post(self, **outputs: Any) -> Dict[str, Any]:
         conversation = self._conversation_carrier
         self._conversation_carrier = None
-        if method == "encode":
-            batch_shape = self._encode_batch_shape
-            self._encode_batch_shape = None
-            inputs_embeds = outputs.get("inputs_embeds")
-            if conversation is not None and inputs_embeds is not None and batch_shape is not None:
-                self._scatter_text_embeds(conversation, unflatten(inputs_embeds, batch_shape))
-            return {"conversation_list": conversation}
+        batch_shape = self._encode_batch_shape
+        self._encode_batch_shape = None
+        inputs_embeds = outputs.get("inputs_embeds")
+        if conversation is not None and inputs_embeds is not None and batch_shape is not None:
+            self._scatter_text_embeds(conversation, unflatten(inputs_embeds, batch_shape))
+        return {"conversation_list": conversation}
 
+    @post_forward("decode")
+    def decode_post(self, **outputs: Any) -> Dict[str, Any]:
+        conversation = self._conversation_carrier
+        self._conversation_carrier = None
         # V2 single-loss protocol: drop logits, rename ``loss`` → ``_loss``.
         outputs.pop("logits", None)
         loss = outputs.pop("loss", None)
@@ -156,4 +158,29 @@ class TextEncoderModuleMixin(ModuleMixin):
         return {"type": "text", "value": text, "meta": meta}
 
 
-__all__ = ["TextEncoderModuleMixin"]
+class TextEncoderTraceMixin(TraceMixin):
+    """Per-module training-trace for the text encoder (wte + lm_head)."""
+
+    config: TextEncoderConfig
+
+    def estimate_flops(self, seqlens: List[int]) -> float:
+        # This module owns wte (an embedding lookup ≈ 0 FLOPs) + the lm_head
+        # projection (hidden → vocab); the transformer layers belong to the
+        # backbone module. fwd+bwd ⇒ 6x; lm_head params = vocab * hidden.
+        lm_head_n = self.config.vocab_size * self.config.hidden_size
+        return 6 * lm_head_n * sum(seqlens) / 1e12
+
+    def trace_token_lengths(self, method: str, data: Dict[str, Any]) -> List[int]:
+        # Count once, on encode: `input_ids` is the full packed sequence
+        # (pre-LLM, never SP-sliced → SP-safe). The decode pass runs lm_head over
+        # the same sequence, so its FLOPs are already covered by this count;
+        # decode itself contributes nothing (returns []).
+        if method != "encode":
+            return []
+        input_ids = data.get("input_ids")
+        if input_ids is None:
+            return []
+        return [int(input_ids.numel())]
+
+
+__all__ = ["TextEncoderModuleMixin", "TextEncoderTraceMixin"]

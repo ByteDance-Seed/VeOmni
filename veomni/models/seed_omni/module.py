@@ -34,11 +34,59 @@ Training nodes must emit at most one token-mean ``_loss``; ``OmniModel``
 sums them.  See ``docs/seed_omni/seed_omni_v2.md`` for the full contract.
 """
 
-from typing import Any, Dict, List, Optional, Type
+from typing import Any, Callable, Dict, List, Optional, Type
+
+
+def pre_forward(context: str) -> Callable[[Callable], Callable]:
+    """Decorator: register a **pre-hook** for the graph call-site ``context``.
+
+    Instead of one ``pre_forward(method, ...)`` that branches on ``method``, a
+    module with multiple call-sites declares one hook per call-site, each tagged
+    with its ``context`` (the method name — ``"encode"`` / ``"decode"`` /
+    ``"forward"``)::
+
+        @pre_forward("encode")
+        def encode_pre(self, conversation_list=None): ...
+
+        @pre_forward("decode")
+        def decode_pre(self, conversation_list=None): ...
+
+    The framework keeps calling :meth:`ModuleMixin.pre_forward` (the dispatcher),
+    which routes to the hook whose ``context`` matches the node's method. A
+    single-call-site module may still just override ``pre_forward`` directly.
+    """
+
+    def decorator(fn: Callable) -> Callable:
+        fn._omni_pre_context = context
+        return fn
+
+    return decorator
+
+
+def post_forward(context: str) -> Callable[[Callable], Callable]:
+    """Decorator: register a **post-hook** for the graph call-site ``context``.
+
+    The post counterpart of :func:`pre_forward` — see it for the rationale::
+
+        @post_forward("encode")
+        def encode_post(self, **outputs): ...
+    """
+
+    def decorator(fn: Callable) -> Callable:
+        fn._omni_post_context = context
+        return fn
+
+    return decorator
 
 
 class ModuleMixin:
-    """Unified SeedOmni V2 mixin for both training and inference hooks."""
+    """Unified SeedOmni V2 mixin for both training and inference hooks.
+
+    A module opts into the optional per-module training trace separately, by
+    multi-inheriting its own ``XxxTraceMixin(TraceMixin)`` on the concrete model
+    (``ModuleMixin`` itself does **not** inherit ``TraceMixin``).  See
+    :class:`~veomni.models.seed_omni.tracemixin.TraceMixin`.
+    """
 
     processor_class: Optional[Type[Any]] = None
     tokenizer_class: Optional[Type[Any]] = None
@@ -70,16 +118,38 @@ class ModuleMixin:
 
     # ── Training hooks ────────────────────────────────────────────────────────
 
-    def pre_forward(self, method: str, **kwargs: Any) -> Dict[str, Any]:
-        """Pre-process inputs before the graph node's call-site method.
+    @classmethod
+    def _omni_hook_name(cls, marker: str, context: str) -> Optional[str]:
+        """Resolve the method name tagged ``marker`` for call-site ``context``.
 
-        ``method`` names the entry point configured on the active node
-        (``"forward"``, ``"encode"``, ``"decode"``, ...).  Override to route
-        packing / SP slice / conversation extraction per call site.
-
-        Default: identity pass-through.
+        Scans the MRO base-first so a subclass's hook overrides a base hook for
+        the same ``context``; the result is cached on the class.
         """
-        return kwargs
+        cache_attr = f"__omni_hooks_{marker}__"
+        registry: Optional[Dict[str, str]] = cls.__dict__.get(cache_attr)
+        if registry is None:
+            registry = {}
+            for klass in reversed(cls.__mro__):
+                for name, attr in vars(klass).items():
+                    ctx = getattr(attr, marker, None)
+                    if ctx is not None:
+                        registry[ctx] = name
+            setattr(cls, cache_attr, registry)
+        return registry.get(context)
+
+    def pre_forward(self, method: str, **kwargs: Any) -> Dict[str, Any]:
+        """Dispatch to the ``@pre_forward(method)``-decorated hook for this node's
+        call-site (``"forward"`` / ``"encode"`` / ``"decode"`` / ...).
+
+        Routes packing / SP slice / conversation extraction per call site. A
+        module with multiple call-sites declares one ``@pre_forward(<method>)``
+        hook each; a single-call-site module may instead override this method
+        directly. Default (no hook, no override): identity pass-through.
+        """
+        name = type(self)._omni_hook_name("_omni_pre_context", method)
+        if name is None:
+            return kwargs
+        return getattr(self, name)(**kwargs)
 
     def forward(self, **kwargs: Any) -> Dict[str, Any]:  # type: ignore[override]
         """Training forward pass.
@@ -93,11 +163,16 @@ class ModuleMixin:
         )
 
     def post_forward(self, method: str, **outputs: Any) -> Dict[str, Any]:
-        """Per-call post-processing — e.g. SP gather, final ``_loss`` mean.
+        """Dispatch to the ``@post_forward(method)``-decorated hook for this node's
+        call-site — e.g. SP gather, final ``_loss`` mean, conversation write-back.
 
-        Default: identity pass-through of the call-site return dict.
+        Mirrors :meth:`pre_forward`. Default (no hook, no override): identity
+        pass-through of the call-site return dict.
         """
-        return outputs
+        name = type(self)._omni_hook_name("_omni_post_context", method)
+        if name is None:
+            return outputs
+        return getattr(self, name)(**outputs)
 
     def get_parallel_plan(self) -> Optional[Any]:
         """Return a per-module VeOmni parallel plan, or ``None`` for default."""
@@ -168,4 +243,4 @@ class ModuleMixin:
         return {}
 
 
-__all__ = ["ModuleMixin"]
+__all__ = ["ModuleMixin", "pre_forward", "post_forward"]

@@ -21,6 +21,7 @@ from ...distributed.parallel_state import get_parallel_state
 from ...utils import helper
 from ...utils.dist_utils import all_reduce
 from ...utils.logging import get_logger
+from ...utils.omni_helper import OmniEnvironMeter
 from .base import Callback, TrainerState
 
 
@@ -29,6 +30,7 @@ logger = get_logger(__name__)
 
 if TYPE_CHECKING:
     from ..base import BaseTrainer, VeOmniArguments
+    from ..omni_trainer import OmniTrainer
 
 
 class MoERouterMonitorCallback(Callback):
@@ -230,6 +232,79 @@ class EnvironMeterCallback(Callback):
 
         self.trainer.step_train_metrics = step_train_metrics
         self.trainer.step_env_metrics = step_env_metrics
+
+
+class OmniEnvironMeterCallback(Callback):
+    """Per-module trace metering for OmniModel V2.
+
+    The single-model :class:`EnvironMeterCallback` can't meter ``OmniModel``: it
+    is a composition of sub-modules with no single ``model_type`` to estimate
+    FLOPs on, and the entry batch carries only ``conversation_list`` (no
+    ``input_ids`` / ``attention_mask`` to count tokens from).  So **FLOPs / MFU**
+    are computed per-module by each module's
+    :class:`~veomni.models.seed_omni.tracemixin.TraceMixin`.  This callback drives the
+    timing, collects every module's ``(metrics, seqlens)`` via the orchestrator,
+    and hands them to :class:`~veomni.utils.omni_helper.OmniEnvironMeter`, which owns the **global**
+    roll-up — merged batch-token statistics, multi-source accounting, and
+    device/host memory.
+
+    ``self.trainer`` here is the :class:`~veomni.trainer.omni_trainer.OmniTrainer`
+    orchestrator; the canonical :class:`BaseTrainer` state it writes
+    (``environ_meter`` / ``step_env_metrics`` / ``step_train_metrics``) lives on
+    ``self.trainer.base`` where the wandb / tqdm callbacks read it.
+    """
+
+    def __init__(self, trainer: "OmniTrainer") -> None:
+        self.trainer = trainer
+        base = trainer.base
+        args: "VeOmniArguments" = base.args
+        base.environ_meter = OmniEnvironMeter(
+            global_batch_size=args.train.global_batch_size,
+            enable_multisource=args.data.enable_multisource,
+            dataloader=base.train_dataloader,
+            data_path=args.data.train_path,
+            empty_cache_steps=args.train.empty_cache_steps,
+            gc_steps=args.train.gc_steps,
+        )
+
+    def on_step_begin(self, state: TrainerState, micro_batches: List[Dict[str, Any]] = None, **kwargs) -> None:
+        for micro_batch in micro_batches or []:
+            self.trainer.base.environ_meter.add(micro_batch)
+        self.start_time = time.time()
+
+    def on_step_end(
+        self, state: TrainerState, loss: float, loss_dict: Dict[str, float], grad_norm: float, **kwargs
+    ) -> None:
+        base = self.trainer.base
+        delta_time = time.time() - self.start_time
+
+        # Each TraceMixin module stashed its time-independent contribution
+        # ``(theoretical_flops, seqlens)`` in its module-trainer's on_step_end;
+        # the meter sums the FLOPs + merges the tokens and applies this single
+        # whole-graph delta to get the overall achieved FLOPs / MFU.
+        module_traces = self.trainer.collect_module_trace()
+        step_env_metrics = base.environ_meter.step(delta_time, state.global_step, module_traces)
+
+        step_train_metrics = {
+            "total_loss": loss,
+        }
+        step_train_metrics.update(loss_dict)
+        step_train_metrics["grad_norm"] = grad_norm
+
+        # gather training_step_info from all ranks
+        step_train_metrics = {
+            f"training/{k}": all_reduce(v, group=get_parallel_state().fsdp_group)
+            for k, v in step_train_metrics.items()
+        }
+
+        if base.lr_scheduler is not None:
+            lr = max(base.lr_scheduler.get_last_lr())
+            step_train_metrics["training/lr"] = lr
+
+        step_env_metrics.update(step_train_metrics)
+
+        base.step_train_metrics = step_train_metrics
+        base.step_env_metrics = step_env_metrics
 
 
 class TqdmCallback(Callback):

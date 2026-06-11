@@ -23,40 +23,24 @@ YAML structure (maps 1-to-1 to this class):
         accelerator:
           fsdp_config: {fsdp_mode: fsdp2}
 
-  # ── Graph nodes (call-sites): one entry per `module.method` invocation.
-  #    The same module may appear under multiple node names.
-  nodes:
-    siglip_encode: {module: siglip}
-    vae_encode:    {module: vqvae.encode}
-    vae_decode:    {module: vqvae.decode}
-    tok_encode:    {module: wte_lm_head.encode}
-    tok_decode:    {module: wte_lm_head.decode}
-    janus_llama:   {module: janus_llama}
-
-  # ── Graph edges (data dependencies). `from`/`to` reference node names; a
-  #    module name is accepted when that module has exactly one declared node.
-  #    `to: end` declares a leaf node (virtual sink) — every node MUST
-  #    appear on at least one edge.
-  edges:
-    siglip_to_ar:    {from: siglip_encode, to: janus_llama}
-    vae_enc_to_ar:   {from: vae_encode,    to: janus_llama}
-    tok_enc_to_ar:   {from: tok_encode,    to: janus_llama}
-    ar_to_tok_dec:   {from: janus_llama,   to: tok_decode}
-    ar_to_vae_dec:   {from: janus_llama,   to: vae_decode}
-    vae_token_to_dec:{from: vae_encode,    to: vae_decode}
-    tok_dec_sink:    {from: tok_decode,    to: end}
-    vae_dec_sink:    {from: vae_decode,    to: end}
-
-  # ── Active training subset.  ONLY edges — active nodes are derived from
-  #    the endpoints of these edges.
+  # ── Active training subset.  A flat list of edges; each endpoint is a
+  #    self-describing `module[.method]` string (bare module → `.forward`).
+  #    Active nodes are derived from the endpoints.  `to: end` declares a leaf
+  #    node (virtual sink) — every node MUST appear on at least one edge.
   training_graph:
-    edges: [siglip_to_ar, vae_enc_to_ar, tok_enc_to_ar, ar_to_tok_dec,
-            ar_to_vae_dec, vae_token_to_dec, tok_dec_sink, vae_dec_sink]
+    - {from: siglip,            to: janus_llama}
+    - {from: vqvae.encode,      to: janus_llama}
+    - {from: wte_lm_head.encode, to: janus_llama}
+    - {from: janus_llama,       to: wte_lm_head.decode}
+    - {from: janus_llama,       to: vqvae.decode}
+    - {from: wte_lm_head.decode, to: end}
+    - {from: vqvae.decode,      to: end}
 
-  # ── Inference FSM.  Each state.body is a list of EDGE NAMES; node order
-  #    is derived (unique endpoints in declaration order, excluding `end`).
-  #    The `done` state is auto-injected by the framework — never declare
-  #    it here, never set `done_state`.  Transitions whose
+  # ── Inference FSM.  Each state.body is a list of inline `{from, to}` edges
+  #    (endpoints as `module[.method]` strings, bare module → `.generate`);
+  #    node order is derived (unique endpoints in declaration order, excluding
+  #    `end`).  The `done` state is auto-injected by the framework — never
+  #    declare it here, never set `done_state`.  Transitions whose
   #    `next_state: done` land on the built-in terminal state which then
   #    triggers each active module's `finalize` hook (text decode /
   #    image save / etc).
@@ -67,11 +51,16 @@ YAML structure (maps 1-to-1 to this class):
     initial: text_ar
     states:
       text_ar:
-        body: [tok_enc_to_ar, ar_to_tok_dec, tok_dec_sink]
+        body:
+          - {from: wte_lm_head, to: janus_llama}
+          - {from: janus_llama, to: wte_lm_head}
+          - {from: wte_lm_head, to: end}
         transitions:
           - {condition: {type: module_signal, key: start_image_gen}, next_state: image_vq}
       image_vq:
-        body: [ar_to_vae_dec, vae_dec_to_ar]
+        body:
+          - {from: janus_llama, to: vqvae}
+          - {from: vqvae,       to: janus_llama}
         transitions:
           - {condition: {type: module_signal, key: image_complete}, next_state: text_ar}
 """
@@ -89,7 +78,7 @@ class OmniConfig(PretrainedConfig):
     """Configuration for OmniModel V2.
 
     All nested dicts are stored as plain Python dicts for JSON serialisability.
-    Typed accessors (``module_config``, ``training_edges``) provide a stable
+    Typed accessors (``module_config``, ``training_graph``) provide a stable
     surface for the runtime / visualisation tools.
 
     Tokenizers and processors are per-module assets saved alongside each
@@ -101,17 +90,14 @@ class OmniConfig(PretrainedConfig):
     def __init__(
         self,
         modules: Optional[Dict[str, Dict]] = None,
-        nodes: Optional[Dict[str, Dict]] = None,
-        edges: Optional[Dict[str, Dict]] = None,
-        training_graph: Optional[Dict] = None,
+        training_graph: Optional[List[Dict]] = None,
         generation_graph: Optional[Dict] = None,
         generation_kwargs: Optional[Dict] = None,
         **kwargs,
     ):
         self.modules: Dict[str, Dict] = modules or {}
-        self.nodes: Dict[str, Dict] = nodes or {}
-        self.edges: Dict[str, Dict] = edges or {}
-        self.training_graph: Dict = training_graph or {"edges": []}
+        # Flat list of edges; each endpoint is a `module[.method]` string.
+        self.training_graph: List[Dict] = training_graph or []
 
         self.generation_graph: Optional[Dict] = generation_graph
         self.generation_kwargs: Optional[Dict] = generation_kwargs
@@ -126,13 +112,16 @@ class OmniConfig(PretrainedConfig):
         return _instantiate_recursive(VeOmniArguments, cfg)
 
     @property
-    def training_edges(self) -> List[str]:
-        """Active training subset (edge names).  Active nodes are derived."""
-        return list(self.training_graph.get("edges", []))
+    def training_edges(self) -> List[Dict]:
+        """Active training subset — the flat list of edge dicts."""
+        return list(self.training_graph)
 
     @property
     def module_names(self) -> List[str]:
         return list(self.modules.keys())
+
+    def has_training_graph(self) -> bool:
+        return bool(self.training_graph)
 
     def has_generation_graph(self) -> bool:
         return self.generation_graph is not None
@@ -162,11 +151,11 @@ class OmniConfig(PretrainedConfig):
         """Load an :class:`OmniConfig` from a training YAML + optional inference YAML.
 
         SeedOmni V2 splits configuration into a **training YAML** that
-        carries the master vocabulary (``modules``, ``nodes``, ``edges``,
-        ``training_graph``) and one or more **inference YAMLs** that only
-        carry a ``generation_graph`` for a specific scenario (interleave /
-        T2I-only / understanding).  See ``configs/seed_omni/janus_1.3b/``
-        for the canonical layout.
+        carries the master vocabulary (``modules`` + ``training_graph``, a flat
+        list of edges) and one or more **inference YAMLs** that only carry a
+        ``generation_graph`` for a specific scenario (interleave / T2I-only /
+        understanding).  See ``configs/seed_omni/janus_1.3b/`` for the
+        canonical layout.
 
         Per-module args are built from the launcher ``global_args``
         (:class:`VeOmniArguments` parsed from ``veomni_janus.yaml``).  Train
@@ -187,9 +176,7 @@ class OmniConfig(PretrainedConfig):
         modules_overrides: Dict[str, Any] = omni_train_config.pop("modules")
         modules_overrides = cls._resolve_model_path(model_path, modules_overrides)
         base_cfg = {
-            "nodes": omni_train_config.pop("nodes"),
-            "edges": omni_train_config.pop("edges"),
-            "training_graph": omni_train_config.pop("training_graph"),
+            "training_graph": omni_train_config.pop("training_graph", []),
         }
         if infer_yaml_path is not None:
             with open(infer_yaml_path, encoding="utf-8") as f:
