@@ -688,7 +688,12 @@ class _InterleaveBagelFlow(nn.Module):
     def embed_latent(self, conversation_list: list[ConversationItem] | None = None, **kwargs):
         del kwargs
         assert conversation_list is not None
-        item = next(item for item in conversation_list if item.meta.get("bagel_role") == "image_gen_latent")
+        item = next(
+            (item for item in conversation_list if item.meta.get("bagel_role") == "image_gen_latent"),
+            None,
+        )
+        if item is None:
+            return {"conversation_list": conversation_list}
         item.value = torch.zeros(2, 8)
         item.meta["flow_packed_sequence_ready"] = True
         return {"conversation_list": conversation_list}
@@ -704,6 +709,10 @@ class _InterleaveBagelFlow(nn.Module):
 
 
 class _InterleaveBagelVAE(nn.Module):
+    def encode(self, conversation_list: list[ConversationItem] | None = None, **kwargs):
+        del kwargs
+        return {"conversation_list": conversation_list}
+
     def decode(self, conversation_list: list[ConversationItem] | None = None, **kwargs):
         del kwargs
         assert conversation_list is not None

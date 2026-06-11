@@ -8,6 +8,7 @@ TODO(bagel-v2): official training keeps the VAE frozen/eval and encodes under
 ``torch.no_grad()``. Wire that runtime policy when Bagel graph parity is ported.
 """
 
+from contextlib import nullcontext
 from typing import Any, Dict, Optional
 
 import torch
@@ -273,18 +274,25 @@ class BagelVAE(BagelVAEModuleMixin, PreTrainedModel):
         self.post_init()
 
     def encode(self, pixel_values: Optional[torch.Tensor] = None, **kwargs: Any) -> Dict[str, torch.Tensor]:
-        del kwargs
         if pixel_values is None:
-            return {}
-        latents = self.reg(self.encoder(pixel_values))
-        latents = self.config.scale_factor * (latents - self.config.shift_factor)
-        return {"latents": latents}
+            return self._encode_image_graph(**kwargs)
+        with self._autocast_context(pixel_values):
+            latents = self.reg(self.encoder(pixel_values))
+            latents = self.config.scale_factor * (latents - self.config.shift_factor)
+        return {"latents": latents.to(dtype=self.dtype)}
 
     def decode(self, latents: Optional[torch.Tensor] = None, **kwargs: Any) -> Dict[str, Any]:
         if latents is None:
             return self._decode_image_graph(**kwargs)
         latents = latents / self.config.scale_factor + self.config.shift_factor
-        return {"pixel_values": self.decoder(latents)}
+        with self._autocast_context(latents):
+            pixel_values = self.decoder(latents)
+        return {"pixel_values": pixel_values}
+
+    def _autocast_context(self, tensor: torch.Tensor):
+        if tensor.device.type == "cuda" and self.dtype != torch.float32:
+            return torch.amp.autocast("cuda", enabled=True, dtype=self.dtype)
+        return nullcontext()
 
     def forward(self, **kwargs: Any) -> Dict[str, torch.Tensor]:  # type: ignore[override]
         return self.encode(**kwargs)

@@ -38,7 +38,9 @@ from veomni.models.seed_omni.modules.bagel.vae.modeling import BagelVAE  # noqa:
 
 
 class _UnusedModule(nn.Module):
-    pass
+    def generate(self, conversation_list: list[Any] | None = None, **kwargs: Any) -> dict[str, Any]:
+        del kwargs
+        return {"conversation_list": conversation_list}
 
 
 def _load_modules(
@@ -59,9 +61,9 @@ def _load_modules(
     return text_encoder, flow_connector, qwen2_mot, vae
 
 
-def _load_graph_config(config_dir: Path) -> OmniConfig:
+def _load_graph_config(config_dir: Path, *, infer_yaml_name: str = "infer_gen.yaml") -> OmniConfig:
     train_config = yaml.safe_load((config_dir / "train.yaml").read_text(encoding="utf-8"))
-    infer_config = yaml.safe_load((config_dir / "infer_gen.yaml").read_text(encoding="utf-8"))
+    infer_config = yaml.safe_load((config_dir / infer_yaml_name).read_text(encoding="utf-8"))
     merged = {
         "modules": train_config["modules"],
         "nodes": train_config["nodes"],
@@ -79,6 +81,8 @@ def compare_image_gen_graph(
     model_root: Path,
     *,
     config_dir: Path,
+    infer_yaml_name: str = "infer_gen.yaml",
+    generation_kwargs_override: dict[str, Any] | None = None,
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
     dtype: str = "bf16",
     max_flow_steps: int = 1,
@@ -90,7 +94,7 @@ def compare_image_gen_graph(
     tolerance = _v2_tolerance(fixture)
 
     text_encoder, flow_connector, qwen2_mot, vae = _load_modules(model_root, device=torch_device, dtype=torch_dtype)
-    config = _load_graph_config(config_dir)
+    config = _load_graph_config(config_dir, infer_yaml_name=infer_yaml_name)
     model = OmniModel(
         config,
         {
@@ -106,6 +110,8 @@ def compare_image_gen_graph(
     trace: list[str] = []
     generation_kwargs = dict(config.generation_kwargs or {})
     generation_kwargs.update({"max_flow_steps": max_flow_steps, "max_new_tokens": max_flow_steps + 2})
+    if generation_kwargs_override:
+        generation_kwargs.update(generation_kwargs_override)
     ctx = model.generate({"conversation_list": conversation}, trace=trace, generation_kwargs=generation_kwargs)
 
     cache_after_prompt = _compare_cache(
@@ -189,6 +195,7 @@ def compare_image_gen_graph(
     )
     return {
         "case_id": fixture["metadata"]["case_id"],
+        "infer_yaml": infer_yaml_name,
         "dtype": dtype,
         "tolerance": tolerance,
         "trace": trace,
@@ -215,6 +222,8 @@ def smoke_image_gen_full_loop_decode(
     *,
     config_dir: Path,
     max_flow_steps: int,
+    infer_yaml_name: str = "infer_gen.yaml",
+    generation_kwargs_override: dict[str, Any] | None = None,
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
     dtype: str = "bf16",
 ) -> dict[str, Any]:
@@ -226,7 +235,7 @@ def smoke_image_gen_full_loop_decode(
     torch_dtype = _resolve_dtype(dtype)
 
     text_encoder, flow_connector, qwen2_mot, vae = _load_modules(model_root, device=torch_device, dtype=torch_dtype)
-    config = _load_graph_config(config_dir)
+    config = _load_graph_config(config_dir, infer_yaml_name=infer_yaml_name)
     model = OmniModel(
         config,
         {
@@ -241,6 +250,8 @@ def smoke_image_gen_full_loop_decode(
     trace: list[str] = []
     generation_kwargs = dict(config.generation_kwargs or {})
     generation_kwargs.update({"max_flow_steps": max_flow_steps, "max_new_tokens": max_flow_steps + 2})
+    if generation_kwargs_override:
+        generation_kwargs.update(generation_kwargs_override)
     ctx = model.generate({"conversation_list": conversation}, trace=trace, generation_kwargs=generation_kwargs)
     image_report = _generated_image_report(model.generated)
     final_item = next(item for item in ctx["conversation_list"] if item.meta.get("bagel_role") == "image_gen_latent")
@@ -259,6 +270,7 @@ def smoke_image_gen_full_loop_decode(
     )
     return {
         "case_id": fixture["metadata"]["case_id"],
+        "infer_yaml": infer_yaml_name,
         "dtype": dtype,
         "trace": trace,
         "flow_steps": max_flow_steps,

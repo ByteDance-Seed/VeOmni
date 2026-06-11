@@ -27,8 +27,16 @@ class BagelFlowConnectorModuleMixin(ModuleMixin):
         generation_kwargs: Optional[Dict[str, Any]] = None,
         **kwargs: Any,
     ) -> Dict[str, Any]:
-        del kwargs
-        item = self._image_gen_item(conversation_list, require_ready_text=True)
+        context_item = self._vae_context_item(conversation_list)
+        if context_item is not None:
+            return self._embed_vae_context_graph(context_item, conversation_list)
+
+        if kwargs.get("past_key_values") is None:
+            return {"conversation_list": conversation_list}
+
+        item = self._image_gen_item(conversation_list, require_ready_text=True, allow_missing=True)
+        if item is None:
+            return {"conversation_list": conversation_list}
         self._ensure_image_gen_metadata(item, generation_kwargs)
         # At the start of a denoise iteration, item.value carries either x_t0 or the previous step's x_t1.
         latents = self._current_latents(item, prefer_value=True)
@@ -61,6 +69,44 @@ class BagelFlowConnectorModuleMixin(ModuleMixin):
             "conversation_list": conversation_list,
             "bagel_last_latent_embeds": latent_embeds.detach(),
             "bagel_last_packed_sequence": packed_sequence.detach(),
+        }
+
+    def _embed_vae_context_graph(
+        self,
+        item: ConversationItem,
+        conversation_list: Optional[list[ConversationItem]],
+    ) -> Dict[str, Any]:
+        latents = item.value
+        if not torch.is_tensor(latents):
+            raise ValueError("BAGEL VAE context item requires packed latent tensor value.")
+        latents = latents.detach().to(device=self.device, dtype=self.dtype)
+        position_ids = self._meta_tensor(item, "vae_position_ids", dtype=torch.long)
+        timestep = self._current_timestep(item)
+        latent_embeds = self.vae2llm(latents)
+        latent_embeds = latent_embeds + self.time_embedder(timestep.reshape(-1)[:1])
+        latent_embeds = latent_embeds + self.latent_pos_embed(position_ids)
+        latent_embeds = latent_embeds.to(dtype=self.dtype)
+        text_embeds = item.meta.get("text_embeds")
+        if not torch.is_tensor(text_embeds):
+            raise ValueError("BAGEL VAE context item requires text_embeds metadata.")
+        text_embeds = text_embeds.detach().to(device=self.device, dtype=self.dtype)
+        text_indexes = self._meta_tensor(item, "text_indexes", dtype=torch.long)
+        vae_token_indexes = self._meta_tensor(item, "vae_token_indexes", dtype=torch.long)
+        query_lens = self._meta_tensor(item, "query_lens", dtype=torch.int32)
+
+        packed_sequence = text_embeds.new_zeros((int(query_lens.sum().item()), self.config.hidden_size))
+        packed_sequence[text_indexes] = text_embeds
+        packed_sequence[vae_token_indexes] = latent_embeds.to(dtype=packed_sequence.dtype)
+
+        item.value = packed_sequence
+        item.meta["vae_context_latents"] = latents.detach()
+        item.meta["vae_context_latent_embeds"] = latent_embeds.detach()
+        item.meta["vae_context_packed_sequence"] = packed_sequence.detach()
+        item.meta["vae_context_sequence_ready"] = True
+        return {
+            "conversation_list": conversation_list,
+            "bagel_last_vae_context_latent_embeds": latent_embeds.detach(),
+            "bagel_last_vae_context_packed_sequence": packed_sequence.detach(),
         }
 
     def _decode_velocity_graph(
@@ -213,7 +259,8 @@ class BagelFlowConnectorModuleMixin(ModuleMixin):
         *,
         require_ready_text: bool = False,
         require_hidden: bool = False,
-    ) -> ConversationItem:
+        allow_missing: bool = False,
+    ) -> Optional[ConversationItem]:
         if conversation_list is None:
             raise ValueError("BAGEL flow connector graph path requires conversation_list.")
         for item in conversation_list:
@@ -224,7 +271,25 @@ class BagelFlowConnectorModuleMixin(ModuleMixin):
             if require_hidden and not item.meta.get("flow_hidden_ready"):
                 raise ValueError("BAGEL image generation item requires qwen hidden states before flow decode.")
             return item
+        if allow_missing:
+            return None
         raise ValueError("BAGEL flow connector graph path found no image generation latent item.")
+
+    def _vae_context_item(
+        self,
+        conversation_list: Optional[list[ConversationItem]],
+    ) -> Optional[ConversationItem]:
+        if conversation_list is None:
+            raise ValueError("BAGEL flow connector graph path requires conversation_list.")
+        for item in conversation_list:
+            if item.meta.get("bagel_role") != "image_vae_context":
+                continue
+            if item.meta.get("vae_context_sequence_ready"):
+                continue
+            if not item.meta.get("text_embeds_ready"):
+                continue
+            return item
+        return None
 
     def _current_latents(self, item: ConversationItem, *, prefer_value: bool = False) -> torch.Tensor:
         # Qwen writes hidden states into item.value, so decode_velocity must read the saved latent metadata instead.

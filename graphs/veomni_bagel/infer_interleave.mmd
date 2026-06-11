@@ -1,0 +1,56 @@
+---
+title: veomni_bagel — infer_interleave
+---
+%%{init: {'flowchart': {'defaultRenderer': 'elk'}}}%%
+flowchart LR
+    fsm_start(("▶")):::fsm_start
+    fsm_done(("⏹")):::fsm_terminal
+    subgraph state_prompt_encode [prompt_encode]
+        direction LR
+        prompt_encode__vae_encode["vae_encode<br/><i>bagel_vae.encode</i>"]:::body_node
+        prompt_encode__siglip_encode["siglip_encode<br/><i>bagel_siglip_navit.forward</i>"]:::body_node
+        prompt_encode__token_prompt_encode["token_prompt_encode<br/><i>bagel_text_encoder.forward</i>"]:::body_node
+        prompt_encode__flow_embed["flow_embed<br/><i>bagel_flow_connector.embed_latent</i>"]:::body_node
+        prompt_encode__qwen2_mot["qwen2_mot<br/><i>bagel_qwen2_mot.forward</i>"]:::body_node
+        prompt_encode__token_generate["token_generate<br/><i>bagel_text_encoder.forward</i>"]:::body_node
+        prompt_encode__vae_encode --> prompt_encode__siglip_encode
+        prompt_encode__siglip_encode --> prompt_encode__token_prompt_encode
+        prompt_encode__token_prompt_encode --> prompt_encode__flow_embed
+        prompt_encode__flow_embed --> prompt_encode__qwen2_mot
+        prompt_encode__token_prompt_encode --> prompt_encode__qwen2_mot
+        prompt_encode__qwen2_mot --> prompt_encode__token_generate
+    end
+    subgraph state_text_ar [text_ar]
+        direction LR
+        text_ar__qwen2_mot["qwen2_mot<br/><i>bagel_qwen2_mot.forward</i>"]:::body_node
+        text_ar__token_generate["token_generate<br/><i>bagel_text_encoder.forward</i>"]:::body_node
+        text_ar__qwen2_mot --> text_ar__token_generate
+    end
+    subgraph state_image_flow [image_flow]
+        direction LR
+        image_flow__flow_embed["flow_embed<br/><i>bagel_flow_connector.embed_latent</i>"]:::body_node
+        image_flow__qwen2_mot["qwen2_mot<br/><i>bagel_qwen2_mot.forward</i>"]:::body_node
+        image_flow__flow_decode["flow_decode<br/><i>bagel_flow_connector.decode_velocity</i>"]:::body_node
+        image_flow__flow_embed --> image_flow__qwen2_mot
+        image_flow__qwen2_mot --> image_flow__flow_decode
+    end
+    subgraph state_image_decode [image_decode]
+        direction LR
+        image_decode__vae_decode["vae_decode<br/><i>bagel_vae.decode</i>"]:::body_node
+    end
+    state_prompt_encode -.-> state_prompt_encode
+    state_text_ar -.-> state_text_ar
+    state_image_flow -.-> state_image_flow
+    state_image_decode -.-> state_image_decode
+    fsm_start ==> state_prompt_encode
+    state_prompt_encode ==>|"module_signal(start_image_gen)"| state_image_flow
+    state_prompt_encode ==>|"module_signal(text_done)"| fsm_done
+    state_prompt_encode ==>|"default"| state_text_ar
+    state_text_ar ==>|"module_signal(start_image_gen)"| state_image_flow
+    state_text_ar ==>|"module_signal(text_done)"| fsm_done
+    state_image_flow ==>|"module_signal(image_complete)"| state_image_decode
+    state_image_decode ==>|"default"| state_text_ar
+    classDef body_node fill:#fff,stroke:#666
+    classDef fsm_start fill:#dff,stroke:#06c,stroke-width:2px
+    classDef fsm_terminal fill:#eee,stroke:#333,stroke-width:1px,stroke-dasharray:3 3
+    style state_prompt_encode fill:#eef,stroke:#06c,stroke-width:2px

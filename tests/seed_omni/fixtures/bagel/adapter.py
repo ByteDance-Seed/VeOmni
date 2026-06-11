@@ -14,6 +14,7 @@ from veomni.models.seed_omni.conversation import ConversationItem
 TEXT_FIXTURE_CASE_ID = "text_only_one_step_logits"
 TEXT_IMAGE_UND_FIXTURE_CASE_ID = "text_image_understanding_one_step_logits"
 IMAGE_GEN_FIXTURE_CASE_ID = "image_generation_one_step_velocity"
+IMAGE_EDIT_FIXTURE_CASE_ID = "image_edit_vae_context_one_step"
 
 
 def adapt_text_only_fixture(fixture: dict[str, Any]) -> list[ConversationItem]:
@@ -260,6 +261,76 @@ def adapt_image_gen_fixture(fixture: dict[str, Any]) -> list[ConversationItem]:
     ]
 
 
+def adapt_image_edit_fixture(fixture: dict[str, Any]) -> list[ConversationItem]:
+    """Convert an official input-image VAE-context fixture into V2 conversation items."""
+
+    metadata = fixture.get("metadata", {})
+    if metadata.get("case_id") != IMAGE_EDIT_FIXTURE_CASE_ID:
+        raise ValueError(f"Unsupported BAGEL fixture case: {metadata.get('case_id')!r}")
+
+    prompt_fields = fixture["prepared"]["prompt"]
+    latent_fields = fixture["prepared"]["latent"]
+    timestep_fields = fixture["prepared"]["timesteps"]
+    raw_input = fixture["raw_input"]
+
+    input_image_item = ConversationItem(
+        type="image",
+        value=_make_fixture_image(raw_input["input_image_size"]),
+        role="user",
+        source="bagel_official_fixture",
+        meta={
+            "bagel_role": "image_vae_input",
+            "enable_vae_context": True,
+            "raw_image_size": raw_input["input_image_size"],
+        },
+    )
+    image_gen_item = ConversationItem(
+        type="image",
+        value=fixture["one_step"]["x_t0"].clone().detach(),
+        role="assistant",
+        source="bagel_official_fixture",
+        meta={
+            "bagel_role": "image_gen_latent",
+            "raw_image_size": raw_input["image_size"],
+            "text_token_ids": latent_fields["packed_text_ids"].clone().detach().to(dtype=torch.long),
+            "text_indexes": latent_fields["packed_text_indexes"].clone().detach().to(dtype=torch.long),
+            "vae_token_indexes": latent_fields["packed_vae_token_indexes"].clone().detach().to(dtype=torch.long),
+            "vae_position_ids": latent_fields["packed_vae_position_ids"].clone().detach().to(dtype=torch.long),
+            "query_lens": latent_fields["packed_seqlens"].clone().detach().to(dtype=torch.int32),
+            "position_ids": latent_fields["packed_position_ids"].clone().detach().to(dtype=torch.long),
+            "sequence_indexes": latent_fields["packed_indexes"].clone().detach().to(dtype=torch.long),
+            "context_indexes": latent_fields["packed_key_value_indexes"].clone().detach().to(dtype=torch.long),
+            "key_value_lens": latent_fields["key_values_lens"].clone().detach().to(dtype=torch.int32),
+            "timestep": timestep_fields["timestep"].clone().detach(),
+            "dt": timestep_fields["dt"].clone().detach(),
+            "timesteps": timestep_fields["timesteps"].clone().detach(),
+            "dts": timestep_fields["dts"].clone().detach(),
+            "flow_step_index": 0,
+            "max_flow_steps": 1,
+        },
+    )
+    prompt_item = ConversationItem(
+        type="text",
+        value=prompt_fields["packed_text_ids"].clone().detach().to(dtype=torch.long),
+        role="user",
+        source="bagel_official_fixture",
+        meta={
+            "bagel_role": "text",
+            "raw_text": raw_input["prompt"],
+            "image_generation_prompt": True,
+            "position_ids": prompt_fields["packed_text_position_ids"].clone().detach().to(dtype=torch.long),
+            "sequence_indexes": prompt_fields["packed_text_indexes"].clone().detach().to(dtype=torch.long),
+            "context_indexes": prompt_fields["packed_key_value_indexes"].clone().detach().to(dtype=torch.long),
+            "token_lens": prompt_fields["text_token_lens"].clone().detach().to(dtype=torch.int32),
+            "key_value_lens_before": prompt_fields["key_values_lens"].clone().detach().to(dtype=torch.int32),
+            "key_value_lens_after": fixture["prepared"]["kv_lens_after_prompt"].clone().detach().to(dtype=torch.int32),
+            "rope_after": fixture["prepared"]["ropes_after_prompt"].clone().detach().to(dtype=torch.long),
+            "is_causal": True,
+        },
+    )
+    return [input_image_item, image_gen_item, prompt_item]
+
+
 def assert_text_fixture_schema(fixture: dict[str, Any]) -> None:
     """Validate the minimal schema needed by the text-only adapter."""
 
@@ -353,6 +424,36 @@ def assert_image_gen_fixture_schema(fixture: dict[str, Any]) -> None:
             raise AssertionError(f"Fixture one_step section missing tensor: {name}")
 
 
+def assert_image_edit_fixture_schema(fixture: dict[str, Any]) -> None:
+    """Validate the minimal schema needed by the input-image VAE-context adapter."""
+
+    metadata = fixture["metadata"]
+    if metadata["case_id"] != IMAGE_EDIT_FIXTURE_CASE_ID:
+        raise AssertionError(f"Unexpected case_id: {metadata['case_id']!r}")
+
+    for section in (
+        "raw_input",
+        "rng_state",
+        "rng_state_before_vae",
+        "prepared",
+        "cache_after_vae",
+        "cache_after_vit",
+        "cache_after_prompt",
+        "vae_context",
+        "one_step",
+    ):
+        if section not in fixture:
+            raise AssertionError(f"Fixture missing section: {section}")
+
+    for name in ("packed_latents", "latent_embeds", "packed_sequence"):
+        if name not in fixture["vae_context"]:
+            raise AssertionError(f"Fixture vae_context section missing tensor: {name}")
+
+    for name in ("x_t0", "packed_sequence", "latent_embeds", "hidden_state", "velocity", "x_t1"):
+        if name not in fixture["one_step"]:
+            raise AssertionError(f"Fixture one_step section missing tensor: {name}")
+
+
 def assert_text_image_fixture_schema(fixture: dict[str, Any]) -> None:
     """Validate the minimal schema needed by the text+image understanding adapter."""
 
@@ -413,11 +514,14 @@ def assert_text_image_fixture_schema(fixture: dict[str, Any]) -> None:
 
 __all__ = [
     "IMAGE_GEN_FIXTURE_CASE_ID",
+    "IMAGE_EDIT_FIXTURE_CASE_ID",
     "TEXT_FIXTURE_CASE_ID",
     "TEXT_IMAGE_UND_FIXTURE_CASE_ID",
+    "adapt_image_edit_fixture",
     "adapt_image_gen_fixture",
     "adapt_text_image_und_fixture",
     "adapt_text_only_fixture",
+    "assert_image_edit_fixture_schema",
     "assert_image_gen_fixture_schema",
     "assert_text_image_fixture_schema",
     "assert_text_fixture_schema",

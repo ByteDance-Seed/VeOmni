@@ -12,7 +12,10 @@ generation_graph:
   states:
     prompt_encode:
       body:
-        - siglip_encode_to_qwen2
+        - vae_encode_to_siglip_encode
+        - siglip_encode_to_token_prompt_encode
+        - token_prompt_encode_to_flow_embed
+        - flow_embed_to_qwen2
         - token_prompt_encode_to_qwen2
         - qwen2_to_token_generate
         - token_generate_sink
@@ -59,3 +62,4 @@ generation_kwargs:
   cfg_renorm_min: 0.0
   cfg_renorm_type: global
   enable_taylorseer: false
+  enable_vae_context: false

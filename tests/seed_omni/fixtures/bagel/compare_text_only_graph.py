@@ -31,7 +31,13 @@ class _NoopGenerateModule(nn.Module):
 
 
 class _UnusedModule(nn.Module):
-    pass
+    def encode(self, conversation_list: list[Any] | None = None, **kwargs: Any) -> dict[str, Any]:
+        del kwargs
+        return {"conversation_list": conversation_list}
+
+    def embed_latent(self, conversation_list: list[Any] | None = None, **kwargs: Any) -> dict[str, Any]:
+        del kwargs
+        return {"conversation_list": conversation_list}
 
 
 def _resolve_dtype(dtype: str) -> torch.dtype:

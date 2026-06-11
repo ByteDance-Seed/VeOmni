@@ -46,7 +46,11 @@ class BagelSiglipNavitModuleMixin(ModuleMixin):
         del kwargs
         if conversation_list is None:
             raise ValueError("BagelSiglipNavit.generate requires conversation_list.")
-        pending = [item for item in conversation_list if item.type == "image" and item.role == "user"]
+        pending = [
+            item
+            for item in conversation_list
+            if item.type == "image" and item.role == "user" and item.meta.get("bagel_role") != "image_vae_context"
+        ]
         if not pending:
             return {"conversation_list": conversation_list}
         if len(pending) != 1:

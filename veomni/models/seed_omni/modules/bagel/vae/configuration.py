@@ -18,6 +18,12 @@ class BagelVAEConfig(PretrainedConfig):
         z_channels: int = 16,
         scale_factor: float = 0.3611,
         shift_factor: float = 0.1159,
+        max_image_size: int = 1024,
+        min_image_size: int = 512,
+        image_stride: int = 16,
+        max_pixels: int = 14 * 14 * 9 * 1024,
+        image_mean: list[float] | None = None,
+        image_std: list[float] | None = None,
         **kwargs,
     ):
         self.resolution = resolution
@@ -30,4 +36,10 @@ class BagelVAEConfig(PretrainedConfig):
         self.z_channels = z_channels
         self.scale_factor = scale_factor
         self.shift_factor = shift_factor
+        self.max_image_size = max_image_size
+        self.min_image_size = min_image_size
+        self.image_stride = image_stride
+        self.max_pixels = max_pixels
+        self.image_mean = image_mean or [0.5, 0.5, 0.5]
+        self.image_std = image_std or [0.5, 0.5, 0.5]
         super().__init__(**kwargs)

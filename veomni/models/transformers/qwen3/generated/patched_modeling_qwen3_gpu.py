@@ -517,6 +517,11 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         logits_to_keep: int | torch.Tensor = 0,
         **kwargs: Unpack[TransformersKwargs],
     ) -> CausalLMOutputWithPast:
+        r"""
+        cache_position (`torch.LongTensor` of shape `(sequence_length)`, *optional*):
+            Indices of the input sequence tokens in the KV cache. Unlike `position_ids`, this is not affected by
+            padding and is used to update the cache in generation.
+        """
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,

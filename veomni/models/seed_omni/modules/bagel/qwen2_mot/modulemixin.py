@@ -106,6 +106,17 @@ class BagelQwen2MoTModuleMixin(ModuleMixin):
                     else self._key_values_lens.to(device=self.device, dtype=torch.int32)
                 )
             key_value_indexes = self._prompt_meta_tensor(item, ("context_indexes",), [], dtype=torch.long)
+            mode = self._prompt_inference_mode(item)
+            extra_inputs: Dict[str, torch.Tensor] = {}
+            if mode == "gen":
+                vae_token_indexes = self._prompt_meta_tensor(item, ("vae_token_indexes",), None, dtype=torch.long)
+                text_indexes = self._prompt_meta_tensor(item, ("text_indexes",), None, dtype=torch.long)
+                if vae_token_indexes is None or text_indexes is None:
+                    raise ValueError("BAGEL gen-mode prompt item requires VAE and text token indexes.")
+                extra_inputs = {
+                    "packed_vae_token_indexes": vae_token_indexes,
+                    "packed_text_indexes": text_indexes,
+                }
             outputs = self._forward_packed_inference(
                 packed_query_sequence=packed_query_sequence,
                 query_lens=query_lens,
@@ -116,7 +127,8 @@ class BagelQwen2MoTModuleMixin(ModuleMixin):
                 packed_key_value_indexes=key_value_indexes,
                 update_past_key_values=True,
                 is_causal=bool(item.meta.get("is_causal", True)),
-                mode="und",
+                mode=mode,
+                **extra_inputs,
             )
             self._past_key_values = outputs.past_key_values
             self._key_values_lens = (key_values_lens + query_lens).detach().to(device=self.device, dtype=torch.int32)
@@ -363,6 +375,12 @@ class BagelQwen2MoTModuleMixin(ModuleMixin):
         if value.dim() == 3 and value.size(0) == 1:
             value = value.squeeze(0)
         return value.to(device=self.device, dtype=self.dtype)
+
+    @staticmethod
+    def _prompt_inference_mode(item: ConversationItem) -> str:
+        if item.meta.get("bagel_role") == "image_vae_context":
+            return "gen"
+        return "und"
 
     def _prompt_meta_tensor(
         self,

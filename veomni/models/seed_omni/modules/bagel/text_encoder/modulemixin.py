@@ -43,14 +43,24 @@ class BagelTextEncoderModuleMixin(TextEncoderModuleMixin):
     ) -> Dict[str, Any]:
         if conversation_list is None:
             raise ValueError("BagelTextEncoder.generate requires conversation_list.")
+        self._materialize_vae_context_items(conversation_list)
         self._materialize_image_understanding_items(conversation_list)
         tail = conversation_list[-1]
         if tail.role == "user":
+            if self._ready_to_start_image_generation(tail, generation_kwargs, kwargs):
+                self._materialize_image_generation_items(conversation_list)
+                return {"conversation_list": conversation_list, FSM_SIGNAL_KEY: SIGNAL_START_IMAGE_GEN}
+
             token_ids = self._prompt_token_ids(tail)
             tail.value = self.encode(token_ids)["inputs_embeds"].to(device=self.device, dtype=self.dtype)
             self._ensure_prompt_meta(tail, int(token_ids.numel()), conversation_list=conversation_list)
             if self._is_image_generation_request(conversation_list, generation_kwargs):
-                self._ensure_image_generation_latent_item(conversation_list, tail, generation_kwargs)
+                self._ensure_image_generation_latent_item(
+                    conversation_list,
+                    tail,
+                    generation_kwargs,
+                    insert_before=tail,
+                )
                 self._materialize_image_generation_items(conversation_list)
                 return {"conversation_list": conversation_list}
 
@@ -101,6 +111,22 @@ class BagelTextEncoderModuleMixin(TextEncoderModuleMixin):
         raise ValueError(
             f"Invalid conversation tail for BAGEL text generation: type={tail.type!r}, role={tail.role!r}"
         )
+
+    def _materialize_vae_context_items(self, conversation_list: list[ConversationItem]) -> None:
+        for item in conversation_list:
+            if item.meta.get("bagel_role") != "image_vae_context":
+                continue
+            if item.meta.get("text_embeds_ready"):
+                continue
+            text_token_ids = item.meta.get("text_token_ids")
+            if not torch.is_tensor(text_token_ids):
+                text_token_ids = torch.tensor(self._image_boundary_token_ids(), device=self.device, dtype=torch.long)
+                item.meta["text_token_ids"] = text_token_ids
+            text_token_ids = text_token_ids.detach().to(device=self.device, dtype=torch.long).reshape(-1)
+            item.meta["text_embeds"] = self.encode(text_token_ids)["inputs_embeds"].to(
+                device=self.device, dtype=self.dtype
+            )
+            item.meta["text_embeds_ready"] = True
 
     def _materialize_image_understanding_items(self, conversation_list: list[ConversationItem]) -> None:
         for item in conversation_list:
@@ -155,6 +181,27 @@ class BagelTextEncoderModuleMixin(TextEncoderModuleMixin):
         if generation_kwargs and generation_kwargs.get("infer_mode") == "gen":
             return True
         return any(item.meta.get("bagel_role") == "image_gen_latent" for item in conversation_list)
+
+    def _ready_to_start_image_generation(
+        self,
+        item: ConversationItem,
+        generation_kwargs: Optional[Dict[str, Any]],
+        ctx: Dict[str, Any],
+    ) -> bool:
+        if not self._is_image_generation_prompt(item, generation_kwargs):
+            return False
+        if not torch.is_tensor(item.value):
+            return False
+        return ctx.get("past_key_values") is not None
+
+    @staticmethod
+    def _is_image_generation_prompt(
+        item: ConversationItem,
+        generation_kwargs: Optional[Dict[str, Any]],
+    ) -> bool:
+        if item.meta.get("image_generation_prompt"):
+            return True
+        return bool(generation_kwargs and generation_kwargs.get("infer_mode") == "gen")
 
     def _materialize_image_generation_items(self, conversation_list: list[ConversationItem]) -> None:
         for item in conversation_list:

@@ -35,6 +35,9 @@ nodes:
 
 edges:
   token_encode_to_qwen2: { from: token_encode, to: qwen2_mot }
+  vae_encode_to_siglip_encode: { from: vae_encode, to: siglip_encode }
+  siglip_encode_to_token_prompt_encode: { from: siglip_encode, to: token_prompt_encode }
+  token_prompt_encode_to_flow_embed: { from: token_prompt_encode, to: flow_embed }
   siglip_encode_to_qwen2: { from: siglip_encode, to: qwen2_mot }
   vae_encode_to_flow_embed: { from: vae_encode, to: flow_embed }
   flow_embed_to_qwen2: { from: flow_embed, to: qwen2_mot }
