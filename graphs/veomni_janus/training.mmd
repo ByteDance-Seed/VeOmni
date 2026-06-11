@@ -6,30 +6,30 @@ flowchart LR
     data[(data)]:::io
     subgraph col0 [ ]
         direction TB
-        siglip_encode["siglip_encode<br/><i>janus_siglip.forward</i>"]:::source
-        vqvae_encode["vqvae_encode<br/><i>janus_vqvae.encode</i>"]:::source
-        token_encode["token_encode<br/><i>janus_text_encoder.encode</i>"]:::source
+        janus_siglip_forward["<i>janus_siglip.forward</i>"]:::source
+        janus_vqvae_encode["<i>janus_vqvae.encode</i>"]:::source
+        janus_text_encoder_encode["<i>janus_text_encoder.encode</i>"]:::source
     end
     subgraph col1 [ ]
         direction TB
-        janus_llama["janus_llama<br/><i>janus_llama.forward</i>"]:::middle
+        janus_llama_forward["<i>janus_llama.forward</i>"]:::middle
     end
     subgraph col2 [ ]
         direction TB
-        token_decode["token_decode<br/><i>janus_text_encoder.decode</i>"]:::sink
-        vqvae_decode["vqvae_decode<br/><i>janus_vqvae.decode</i>"]:::sink
+        janus_text_encoder_decode["<i>janus_text_encoder.decode</i>"]:::sink
+        janus_vqvae_decode["<i>janus_vqvae.decode</i>"]:::sink
     end
     end_sink(("end")):::end_sink
-    data -.-> siglip_encode
-    data -.-> token_encode
-    data -.-> vqvae_encode
-    siglip_encode --> janus_llama
-    vqvae_encode --> janus_llama
-    token_encode --> janus_llama
-    janus_llama --> token_decode
-    janus_llama --> vqvae_decode
-    token_decode --> end_sink
-    vqvae_decode --> end_sink
+    data -.-> janus_siglip_forward
+    data -.-> janus_text_encoder_encode
+    data -.-> janus_vqvae_encode
+    janus_siglip_forward --> janus_llama_forward
+    janus_vqvae_encode --> janus_llama_forward
+    janus_text_encoder_encode --> janus_llama_forward
+    janus_llama_forward --> janus_text_encoder_decode
+    janus_llama_forward --> janus_vqvae_decode
+    janus_text_encoder_decode --> end_sink
+    janus_vqvae_decode --> end_sink
     style col0 fill:transparent,stroke:none
     style col1 fill:transparent,stroke:none
     style col2 fill:transparent,stroke:none

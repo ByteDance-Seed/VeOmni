@@ -1,12 +1,12 @@
 ---
 name: seedomni-v2
-description: "Use this skill when adding or modifying anything inside `veomni/models/seed_omni/` (the SeedOmni V2 graph-based multi-modal model). Covers: writing a new `XxxModuleMixin` (subclass `ModuleMixin` + HF/diffusers model multi-inheritance), wiring it into the YAML graph (`modules` / `nodes` / `edges` / `training_graph` / `generation_graph`), writing `configuration.py` + `modulemixin.py` + `modeling.py` (+ optional `processing.py`), updating the split-checkpoint script, registering with `OMNI_*_REGISTRY`, and validating with the visualization script + tests. Trigger: 'add seedomni module', 'new omnimodule', 'extend seed_omni', 'add encode/decode module', 'wire into omni graph', 'split <model> checkpoint into omni modules', 'modify training_graph / generation_graph', 'add SeedOmni V2 backbone'."
+description: "Use this skill when adding or modifying anything inside `veomni/models/seed_omni/` (the SeedOmni V2 graph-based multi-modal model). Covers: writing a new `XxxModuleMixin` (subclass `ModuleMixin` + HF/diffusers model multi-inheritance), wiring it into the YAML graph (`modules` / `training_graph` / `generation_graph`, flat edge lists), writing `configuration.py` + `modulemixin.py` + `modeling.py` (+ optional `processing.py`), updating the split-checkpoint script, registering with `OMNI_*_REGISTRY`, and validating with the visualization script + tests. Trigger: 'add seedomni module', 'new omnimodule', 'extend seed_omni', 'add encode/decode module', 'wire into omni graph', 'split <model> checkpoint into omni modules', 'modify training_graph / generation_graph', 'add SeedOmni V2 backbone'."
 ---
 
 ## Required Reading (before any code change)
 
 1. `design.md` — full SeedOmni V2 design rationale. The skill assumes you've internalized:
-   - Two-pool model (`nodes` = call-sites, `edges` = data routes; independent namespaces).
+   - No shared pool: `training_graph` / `generation_graph` are flat edge lists; each `{from, to}` endpoint is a self-describing `module[.method]` string (bare → `forward` in training / `generate` in inference). A node's identity is its canonical `module.method`.
    - `to: end` reserved keyword (no orphans, no cycles).
    - `ModuleMixin` is a **mixin**, not a base class; per-module hooks live in `*ModuleMixin`.
    - `_loss` suffix collection (single key): each module loops all micro-batches inside one `forward`, `post_forward` does the token-level mean, and emits a scalar `<name>_loss`. OmniModel just sums.
@@ -188,9 +188,9 @@ These rules are enforced by the framework. Violate them and you'll fight the des
    - `vqvae.decode(token_id=...)` → just lookup `embed` (inference feedback).
 6. **Backbone modules don't own vocab layers.** `embed_tokens` and `lm_head` belong to a separate `text_encoder` module (e.g. `janus_text_encoder`). The AR backbone consumes `inputs_embeds` and returns `hidden_states` only. Replace the HF model's internal `embed_tokens` with `nn.Identity()` after `from_config`. Filter `embed_tokens.*` and `lm_head.*` out of the backbone state dict in the split script.
 7. **No orphan, no cycle.** Every node has at least one outgoing edge. If the node is a sink (e.g. produces only `*_loss`), add an explicit `{from: X, output: <loss>, to: end}` edge. Self-loops or any cycle are rejected by `TrainingGraph` construction (cycles in inference go in `generation_graph` only).
-8. **`training_graph` / `generation_graph` only list `edges`** (subset of `edges:` pool). Active nodes are the union of `from` / `to` endpoints. The execution order is derived by topo sort — never write it manually.
+8. **`training_graph` / `generation_graph` are lists of `edges`** (`{from, to}` dicts with `module[.method]` endpoints — no shared pool). Active nodes are the union of `from` / `to` endpoints (canonical `module.method`). The execution order is derived by topo sort — never write it manually.
 9. **Loss collection is by `_loss` suffix (single key).** Each module's `forward` internally iterates all micro-batches; `post_forward` computes the token-level mean (sum_loss / sum_tokens) and emits a single scalar `<name>_loss`. `OmniModel.forward()` collects all `_loss`-suffixed scalars and sums them. **No `*_loss_token_count` companion key, no per-batch mean-then-mean** (which would batch-weight the loss when token counts vary). Loss is NOT routed via edges — `to: end` is just a topology marker.
-10. **Dummy forward in training; permissive skip in inference.** Any node listed in `training_graph.edges` MUST run a forward pass on every micro-batch (FSDP backward hangs otherwise). The trainer fills missing kwargs from each module's `dummy_inputs(...)` before dispatch, so the `if x is None: return {}` short-circuit is never reached during training. Inference is the opposite: the model `return {}`, edge routing permissively skips, the destination still executes. See "Training vs. inference — no input semantics" for the full contract including the FSDP grad-sync anchor.
+10. **Dummy forward in training; permissive skip in inference.** Any node appearing in a `training_graph` edge MUST run a forward pass on every micro-batch (FSDP backward hangs otherwise). The trainer fills missing kwargs from each module's `dummy_inputs(...)` before dispatch, so the `if x is None: return {}` short-circuit is never reached during training. Inference is the opposite: the model `return {}`, edge routing permissively skips, the destination still executes. See "Training vs. inference — no input semantics" for the full contract including the FSDP grad-sync anchor.
 11. **One module instance, possibly many nodes.** Same module under multiple node names is the canonical pattern for "encode + decode" or "round-trip" use cases. Parameters are shared; gradients accumulate naturally.
 12. **One module type, one instance per OmniModel.** RL scenarios with reference + actor models build two OmniModels; within a single OmniModel a model_type maps to exactly one `nn.Module`.
 13. **SP slicing is a backbone-internal concern.** SP `pad_and_slice` happens in the backbone's `pre_forward`; SP `gather` happens in its `post_forward`. Pre-LLM nodes (e.g. `tok_encode`) and post-LLM nodes (e.g. `tok_decode`, `vae_decode`) operate on full-length tensors — they are SP-agnostic.
@@ -388,11 +388,11 @@ The `text_encoder` extraction in `veomni/models/seed_omni/modules/janus/convert_
 
 ### YAML organisation: training file vs. inference file(s)
 
-V2 splits configuration into a master **training YAML** and one or more **inference YAMLs** under `configs/seed_omni/<model>/`. The training YAML carries the master vocabulary (`modules`, `nodes`, `edges`, `training_graph` — including any inference-only nodes / edges); each inference YAML carries **only** a `generation_graph` block for one inference scenario. **There is no top-level `tokenizer_path`** — the tokenizer asset lives in the family's `text_encoder` module subfolder.
+V2 splits configuration into a master **training YAML** and one or more **inference YAMLs** under `configs/seed_omni/<model>/`. The training YAML carries `modules` + `training_graph` (a flat list of edges); each inference YAML carries **only** a `generation_graph` block for one inference scenario. There is **no shared `nodes` / `edges` pool** — edge endpoints are self-describing `module[.method]` strings, and inference-only call-sites are written inline in the relevant `generation_graph` body. **There is no top-level `tokenizer_path`** — the tokenizer asset lives in the family's `text_encoder` module subfolder.
 
 ```
 configs/seed_omni/janus_1.3b/
-├── train_joint.yaml          # master vocabulary; the only file that defines modules / nodes / edges / training_graph
+├── train_joint.yaml          # master config: modules + training_graph (flat edge list)
 ├── infer_interleave.yaml     # generation_graph only — T2T+T2I mid-stream image generation
 ├── infer_t2i.yaml            # generation_graph only — T2I-only (no preceding text)
 └── infer_understanding.yaml  # generation_graph only — I2T / VQA (uni-directional)
@@ -416,10 +416,10 @@ Naming conventions:
 
 | Pattern | Example | Purpose |
 |---|---|---|
-| `train_<scope>.yaml` | `train_joint.yaml`, `train_und_only.yaml` | Master file — defines vocabulary AND a specific `training_graph.edges` subset |
+| `train_<scope>.yaml` | `train_joint.yaml`, `train_und_only.yaml` | Master file — defines `modules` AND a specific `training_graph` edge list |
 | `infer_<scenario>.yaml` | `infer_interleave.yaml`, `infer_t2i.yaml`, `infer_understanding.yaml` | Scenario-specific FSM — `generation_graph` only |
 
-**Don't hide inference-only nodes / edges in the inference YAML.** They live in the master training YAML's `nodes` / `edges` pool (the inference YAML cannot partially extend pool dicts via the flat overlay, and having all nodes / edges in one place is a readability win). The training YAML simply omits them from `training_graph.edges`.
+**Inference-only call-sites are written inline in the inference YAML's `generation_graph` bodies** (boundary-token emitters, feedback edges, body-terminal sinks). There is no shared pool to redeclare; each `{from, to}` edge endpoint is self-describing.
 
 ### What goes in each YAML
 
@@ -432,43 +432,31 @@ Editing `train_<scope>.yaml`:
      bar_foo: {weights_path: /path/to/bar_foo}
    ```
 
-2. **`nodes:`** — add one entry per call-site, including inference-only ones (e.g. `emit_image_start`, `emit_image_end`):
-
-   ```yaml
-   nodes:
-     foo_encode: {module: bar_foo, method: encode}   # explicit method
-     foo_decode: {module: bar_foo, method: decode}
-     # or just `{module: bar_foo}` for default forward/generate_step
-   ```
-
-3. **`edges:`** — add data routes, including inference-only ones (feedback edges for VQ loops, boundary-token bridge edges, body-terminal sinks like `ar_run_sink`). Conventions:
-   - `from`/`to` reference **node** names (or `end` for sinks).
-   - `output:` is the dict key returned by the source node.
-   - `as:` is the kwarg name on the destination node.
-   - Every node MUST have at least one outgoing edge. Sinks → `to: end`.
-   - **Body terminal edges** (`<node>_run_sink: {from: <node>, to: end}`) are required for FSM bodies where a node executes but has no same-body consumer (e.g. `janus_llama` in `image_vq_start` updates its KV cache; its output is consumed by the *next* state). The runtime triggers `from_` execution via the body walk; no body sink → the node never runs.
-   - Loss values DON'T need to flow via edges (collected by suffix), but you SHOULD still add a `to: end` sink edge to keep topology complete.
-
-4. **`training_graph:`** — list the active edges only (excluding inference-only ones):
+2. **`training_graph:`** — a flat list of edges. There is **no separate `nodes:` / `edges:` pool**: each edge endpoint is a self-describing `module[.method]` string, and the active node set is *derived* from the endpoints. Conventions:
+   - `from`/`to` are `module[.method]` strings (or `end` on `to` for sinks). A **bare** module takes the view default (`forward` in training, `generate` in inference); a **dotted** `module.method` uses that method verbatim.
+   - A node's identity is its canonical `"<module>.<method>"` form — list it under several methods (`bar_foo.encode`, `bar_foo.decode`) to get distinct call-sites that share weights.
+   - Edges are **topology only** — they declare order, not data routing. There is no `output:` / `as:`; modules move data through the shared `conversation_list` carrier (training) or `ctx` (inference).
+   - Every node MUST have at least one outgoing edge. Leaves / loss-only sinks → `to: end`.
+   - Loss values DON'T need to flow via edges (collected by `_loss` suffix), but you SHOULD still add a `to: end` sink edge to keep topology complete.
 
    ```yaml
    training_graph:
-     edges: [..., foo_to_bar, foo_dec_to_end]
+     - {from: bar_foo.encode, to: backbone}
+     - {from: backbone,       to: bar_foo.decode}
+     - {from: bar_foo.decode, to: end}
    ```
 
-   Active nodes are derived from edge endpoints. Execution order is topo-sorted from edges.
-
-5. **Comment the DAG layout** at the top of the YAML (ASCII diagram or short description) — this is the canonical reference for readers.
+3. **Comment the DAG layout** at the top of the YAML (ASCII diagram or short description) — this is the canonical reference for readers.
 
 Editing `infer_<scenario>.yaml`:
 
-6. **`generation_graph:`** — only this block. Each `state.body` is an ordered list of edge names from the master pool; `from` nodes are executed on first encounter (default method → `generate_step`; explicit method → direct dispatch); edges route ctx (permissively — see below).
+4. **`generation_graph:`** — only this block. Each `state.body` is an ordered list of **inline `{from, to}` edge dicts** (endpoints as `module[.method]` strings, bare module → `.generate`); `from` nodes execute on first encounter; edges route ctx (permissively — see below). Inference-only call-sites (boundary-token emitters like `bar_foo.emit_image_start`, body-terminal sinks `{from: backbone, to: end}`) are written inline here — there is no shared pool to redeclare. A body-terminal sink (`{from: <node>, to: end}`) is required for FSM bodies where a node executes but has no same-body consumer (e.g. the backbone updating its KV cache; its output is consumed by the *next* state).
 
-7. Reference the master YAML for vocabulary; never redeclare `modules` / `nodes` / `edges` / `training_graph` in an `infer_*.yaml` (deep-merge would let it work, but it makes the file a fragile partial copy).
+5. Reference the master YAML only for `modules`; never redeclare `modules` / `training_graph` in an `infer_*.yaml` (deep-merge would let it work, but it makes the file a fragile partial copy).
 
-8. **`done` is framework-injected** — never declare a `done:` state block, never set `done_state`. `GenerationGraph` auto-injects a `done` state with empty body, no transitions, zero token budget; transitions whose `next_state: done` land on it. Authoring either knob is a hard error (raised at FSM build time). When the FSM enters `done`, `OmniModel.generate` walks every active module and calls its **`finalize(ctx, request)` hook**, merging non-empty returns into `ctx['finalize'][<module_name>]`. Override `finalize` on a module when you need to dump accumulated outputs — tokenizer-decode all generated `input_ids`, save accumulated VQ patches as images, write audio waveforms. The framework imposes no accumulation scheme: modules that need cross-step history append into a running list inside `ctx` during their own `generate_step`, then read it back in `finalize`.
+6. **`done` is framework-injected** — never declare a `done:` state block, never set `done_state`. `GenerationGraph` auto-injects a `done` state with empty body, no transitions, zero token budget; transitions whose `next_state: done` land on it. Authoring either knob is a hard error (raised at FSM build time). When the FSM enters `done`, `OmniModel.generate` walks every active module and calls its **`finalize(ctx, request)` hook**, merging non-empty returns into `ctx['finalize'][<module_name>]`. Override `finalize` on a module when you need to dump accumulated outputs — tokenizer-decode all generated `input_ids`, save accumulated VQ patches as images, write audio waveforms. The framework imposes no accumulation scheme: modules that need cross-step history append into a running list inside `ctx` during their own `generate_step`, then read it back in `finalize`.
 
-9. **FSM transition conditions** — states carry **no iteration-count budget**. A state body runs once and then keeps iterating until one of its transitions fires; *modules* decide when a state ends. Two primary types for inference:
+7. **FSM transition conditions** — states carry **no iteration-count budget**. A state body runs once and then keeps iterating until one of its transitions fires; *modules* decide when a state ends. Two primary types for inference:
 
    | Type | Who decides | YAML shape | Example |
    |------|-------------|------------|---------|
@@ -556,12 +544,12 @@ Visual sanity:
 - **Returning a tensor instead of a dict**: every OmniModule method must return `dict[str, Any]`. Tensors don't fan-in / fan-out.
 - **Forgetting `forward` alias**: `OmniModule.forward` is the FSDP wrapper entrypoint. For multi-method modules, alias it to the primary call-site (usually `encode`).
 - **Edge `output:` mismatch**: if the source node returns `{"embeds": ...}` but the edge says `output: embed`, the route silently drops to `None`. Always grep the source node's return dict for the exact key.
-- **Cycle in `training_graph.edges`**: any feedback edge (e.g. `vae_decode_to_llama`) accidentally listed in `training_graph` will fail topo sort. Feedback edges belong only in `generation_graph` state bodies.
+- **Cycle in `training_graph`**: any feedback edge (e.g. `{from: vae.decode, to: llama}`) accidentally listed in `training_graph` will fail topo sort. Feedback edges belong only in `generation_graph` state bodies.
 - **Missing `to: end` for a sink**: produces a graph orphan. The framework will reject it; add the sink edge even if loss is collected by suffix.
 - **Backbone holding vocab layers**: AR LLM modules must NOT own `embed_tokens` / `lm_head` after migration. Replace internal `embed_tokens` with `nn.Identity()` after `from_config`, route `inputs_embeds` from a sibling `text_encoder` node. Filter `embed_tokens.*` and `lm_head.*` out of the backbone's state dict in the split script.
 - **Per-batch mean then outer mean**: this batch-weights the loss when token counts vary, causing silent quality regressions. Invariant 9 — loop micro-batches inside the module, sum loss + sum tokens, divide once. Emit a single scalar `<name>_loss`. OmniModel just sums; never expect a `*_loss_token_count` companion key.
 - **Forgetting to update `MODULE_MIXIN_REGISTRY`**: instantiation will fail with "unknown model_type" — register before running any config that references the new module.
-- **Mixing `nodes` and `edges` fields in a single YAML entry**: the parser rejects entries with both `module:` and `from:` keys. Each entry belongs to exactly one pool.
+- **Writing `module:` / `method:` keys inside a `training_graph` / body edge**: the parser rejects them — endpoints are `module[.method]` strings in `from`/`to`, not nested node specs.
 - **Skipping `pre_forward`/`post_forward` for SP-capable modules**: backbones that use SP must slice in their `pre_forward` and gather in their `post_forward`. Sibling pre/post-LLM modules are SP-agnostic and stay full-length.
 - **Writing `model_type` in YAML modules**: invariant 3 — YAML only declares paths. `model_type` lives in `configuration_xxx.py` and is read automatically.
 - **Adding a top-level `tokenizer_path`**: V2 has no such field. Tokenizer is per-module (lives inside `text_encoder` module's subfolder). Pure DiT models without text encoder have no tokenizer in their config.

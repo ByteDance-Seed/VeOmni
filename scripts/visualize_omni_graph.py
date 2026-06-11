@@ -79,7 +79,7 @@ _HTML_TEMPLATE = """<!doctype html>
 </html>
 """
 
-_MASTER_KEYS = ("nodes", "edges", "training_graph")
+_MASTER_KEYS = ("modules", "training_graph")
 
 
 # ── Argument dataclasses ─────────────────────────────────────────────────────
@@ -124,9 +124,7 @@ def _safe_load_yaml(path: str) -> dict:
 def _validate_train_yaml(train_yaml: str) -> None:
     data = _safe_load_yaml(train_yaml)
     if not any(k in data for k in _MASTER_KEYS):
-        sys.exit(
-            f"`{train_yaml}` must declare at least one of `nodes` / `edges` / `training_graph` (master training YAML)."
-        )
+        sys.exit(f"`{train_yaml}` must declare `modules` / `training_graph` (master training YAML).")
 
 
 def _validate_infer_yaml(infer_yaml: str) -> None:
@@ -155,11 +153,7 @@ def _write_diagram(
 
 
 def _render_training(cfg: OmniConfig, *, title: str) -> tuple[str, str]:
-    graph = TrainingGraph(
-        nodes=cfg.nodes,
-        edges=cfg.edges,
-        training_edges=cfg.training_edges,
-    )
+    graph = TrainingGraph(edges=cfg.training_graph)
     body = graph.to_mermaid(title=title)
     meta = (
         f"<div>execution_order: <code>{', '.join(graph.execution_order)}</code></div>"
@@ -170,7 +164,7 @@ def _render_training(cfg: OmniConfig, *, title: str) -> tuple[str, str]:
 
 
 def _render_fsm(cfg: OmniConfig, *, title: str) -> tuple[str, str]:
-    fsm = GenerationGraph(fsm_config=cfg.generation_graph, nodes=cfg.nodes, edges=cfg.edges)
+    fsm = GenerationGraph(fsm_config=cfg.generation_graph)
     body = fsm.to_mermaid(title=title)
     meta = (
         f"<div>fsm_initial: <code>{fsm.initial_state}</code></div>"

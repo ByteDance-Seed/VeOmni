@@ -1,12 +1,13 @@
 """
-GenerationGraph: FSM view over the ``nodes`` / ``edges`` pools for inference.
+GenerationGraph: FSM view over inline edge lists for inference.
 
 The FSM drives multi-modal generation by cycling through *named states*.
 Each state specifies:
 
   body
-      An ordered list of **edge** names from the pool.  Per FSM step the
-      runtime walks the body in **topological order**:
+      An ordered list of inline **edges** (``{from, to}`` dicts whose endpoints
+      are ``module[.method]`` strings; a bare module defaults to ``.generate``).
+      Per FSM step the runtime walks the body in **topological order**:
 
       1. Pre-compute, per node ``X`` appearing in body, the count of
          body edges with ``to: X`` (its in-body fan-in).
@@ -44,9 +45,9 @@ Each state specifies:
 
 Method dispatch
 ---------------
-Bare ``{module: X}`` nodes parse as ``forward`` for training; the FSM maps
-that default to ``generate`` at runtime.  Any other method (``encode``,
-``decode``, ``emit_image_start``, …) is taken from YAML as-is.
+A bare endpoint (``module`` with no ``.method``) defaults to ``generate`` in the
+FSM view.  A dotted endpoint (``module.method`` — e.g. ``encode``, ``decode``,
+``emit_image_start``) is taken verbatim.
 
   transitions
       Ordered list of ``{condition: ..., next_state: S}`` items checked after
@@ -87,7 +88,7 @@ that default to ``generate`` at runtime.  Any other method (``encode``,
 
 Usage
 -----
-  >>> fsm = GenerationGraph(config["generation_graph"], config["nodes"], config["edges"])
+  >>> fsm = GenerationGraph(config["generation_graph"])
   >>> fsm.reset()
   >>> ctx = {"input_ids": ..., "attention_mask": ...}
   >>> while not fsm.is_done():
@@ -96,7 +97,7 @@ Usage
 
 See also
 --------
-``graph.py``           — NodeDef / EdgeDef / END shared pool types.
+``graph.py``           — NodeDef / EdgeDef / END shared types.
 ``training_graph.py``  — DAG view driven by ``OmniConfig.training_graph``.
 """
 
@@ -108,6 +109,16 @@ from .graph import (
     NodeDef,
     is_end,
 )
+
+
+# Default method for a bare endpoint in the inference FSM (training uses
+# ``forward``).  Dotted endpoints (``module.method``) override this.
+_FSM_DEFAULT_METHOD: str = "generate"
+
+
+def _mermaid_id(name: str) -> str:
+    """Sanitise a canonical ``module.method`` node name into a Mermaid-safe id."""
+    return name.replace(".", "_").replace("-", "_")
 
 
 # Reserved name for the framework-injected terminal state.  Every FSM
@@ -122,15 +133,6 @@ DONE_STATE_NAME: str = "done"
 # ``ctx[FSM_SIGNAL_KEY] = "<signal_name>"``; YAML ``module_signal.key``
 # matches that string value (not a separate boolean flag per signal).
 FSM_SIGNAL_KEY: str = "module_signal"
-
-
-def _fsm_dispatch_method(node: NodeDef) -> str:
-    """Resolve the module method invoked for one FSM node execution.
-
-    Training defaults bare nodes to ``forward`` (see :class:`NodeDef`); inference
-    defaults the same nodes to ``generate``.  Explicit YAML methods are unchanged.
-    """
-    return "generate" if node.method == "forward" else node.method
 
 
 # ── Condition helpers ─────────────────────────────────────────────────────────
@@ -179,51 +181,40 @@ class _Transition:
 class _State:
     """Parsed FSM state.
 
-    ``body`` is a list of :class:`EdgeDef` (resolved against the pool).  The
-    *node sequence* — the unique nodes appearing as ``from``/``to`` endpoints
-    in declaration order, excluding ``end`` — is precomputed for stable
-    iteration.
+    ``body`` is a list of inline :class:`EdgeDef` parsed from ``{from, to}``
+    dicts (endpoints are ``module[.method]`` strings, bare → ``.generate``).
+    The *node sequence* — the unique nodes appearing as ``from``/``to``
+    endpoints in declaration order, excluding ``end`` — is precomputed for
+    stable iteration.
     """
 
     def __init__(
         self,
         name: str,
         spec: Dict,
-        node_pool: Dict[str, NodeDef],
-        edge_pool: Dict[str, EdgeDef],
     ):
         self.name = name
-        body_names: List[str] = list(spec.get("body", []))
+        body_specs: List[Any] = list(spec.get("body", []))
 
         body: List[EdgeDef] = []
-        for n in body_names:
-            if n in node_pool:
+        for item in body_specs:
+            if not isinstance(item, dict):
                 raise ValueError(
-                    f"State '{name}' body item '{n}' is a graph node — only edge names are "
-                    "allowed in `body` (the active node set is derived from edge endpoints). "
-                    f"Add an edge to/from '{n}' (use `to: end` if it is a leaf)."
+                    f"State '{name}' body items must be inline `{{from, to}}` edge dicts "
+                    f"(endpoints as `module[.method]` strings). Got: {item!r}"
                 )
-            if n not in edge_pool:
-                raise KeyError(
-                    f"State '{name}' body item '{n}' is not a known edge name. Known edges: {sorted(edge_pool)}."
-                )
-            body.append(edge_pool[n])
+            body.append(EdgeDef.parse(item, default_method=_FSM_DEFAULT_METHOD))
         self.body: List[EdgeDef] = body
 
         # Derive node sequence: unique nodes by first appearance, skipping `end`.
         seen: set = set()
         sequence: List[str] = []
         for e in body:
-            for endpoint in (e.from_, e.to):
-                if is_end(endpoint) or endpoint in seen:
+            for node in (e.from_node, e.to_node):
+                if node is None or node.name in seen:
                     continue
-                if endpoint not in node_pool:
-                    raise KeyError(
-                        f"State '{name}': edge '{e.name}' references unknown node "
-                        f"'{endpoint}'. Declared nodes: {sorted(node_pool)}."
-                    )
-                seen.add(endpoint)
-                sequence.append(endpoint)
+                seen.add(node.name)
+                sequence.append(node.name)
         self.node_sequence: List[str] = sequence
 
         self.transitions: List[_Transition] = [
@@ -256,32 +247,15 @@ class GenerationGraph:
     ----------
     fsm_config:
         The ``generation_graph`` section of ``OmniConfig``.  Must have:
-        ``initial`` (str) and ``states`` (dict of state specs).
-    nodes / edges:
-        Raw pool dicts from ``OmniConfig`` (``{name: spec}``).  The FSM parses
-        them into :class:`NodeDef` / :class:`EdgeDef` and resolves each
-        ``body`` entry to an :class:`EdgeDef`.
+        ``initial`` (str) and ``states`` (dict of state specs).  Each state's
+        ``body`` is a list of inline ``{from, to}`` edge dicts; the node pool
+        is derived from their endpoints.
     """
 
     def __init__(
         self,
         fsm_config: Dict,
-        nodes: Dict[str, Any],
-        edges: Optional[Dict[str, Any]] = None,
     ):
-        node_pool = {n: NodeDef.parse(n, v) if not isinstance(v, NodeDef) else v for n, v in (nodes or {}).items()}
-        edge_pool = {n: EdgeDef.parse(n, v) if not isinstance(v, EdgeDef) else v for n, v in (edges or {}).items()}
-
-        overlap = set(node_pool) & set(edge_pool)
-        if overlap:
-            raise ValueError(
-                f"`nodes` and `edges` pools share name(s): {sorted(overlap)}. "
-                "Each name must be unique across both pools."
-            )
-
-        self._node_pool: Dict[str, NodeDef] = node_pool
-        self._edge_pool: Dict[str, EdgeDef] = edge_pool
-
         # `done` is reserved — auto-injected below.  Users must NOT redeclare
         # it; doing so silently lets a custom body/transitions override the
         # framework's terminal semantics, which is exactly the kind of magic
@@ -304,19 +278,20 @@ class GenerationGraph:
             )
 
         self._initial: str = fsm_config["initial"]
-        self._states: Dict[str, _State] = {
-            name: _State(name, spec, node_pool, edge_pool) for name, spec in fsm_config["states"].items()
-        }
+        self._states: Dict[str, _State] = {name: _State(name, spec) for name, spec in fsm_config["states"].items()}
 
         # Inject the built-in terminal state.  Empty body, no outgoing
         # transitions: the FSM "rests" here and the orchestrator picks up the
         # post-processing baton via finalize hooks.
-        self._states[DONE_STATE_NAME] = _State(
-            DONE_STATE_NAME,
-            {"body": [], "transitions": []},
-            node_pool,
-            edge_pool,
-        )
+        self._states[DONE_STATE_NAME] = _State(DONE_STATE_NAME, {"body": [], "transitions": []})
+
+        # Derive the node pool from every state's body edges (canonical names).
+        self._node_pool: Dict[str, NodeDef] = {}
+        for state in self._states.values():
+            for edge in state.body:
+                for node in (edge.from_node, edge.to_node):
+                    if node is not None and node.name not in self._node_pool:
+                        self._node_pool[node.name] = node
 
         if self._initial not in self._states:
             raise KeyError(
@@ -447,7 +422,7 @@ class GenerationGraph:
                     f"FSM step: module '{node.module}' (node '{node_name}') missing "
                     f"from modules dict. Provided: {sorted(modules)}."
                 )
-            method_name = _fsm_dispatch_method(node)
+            method_name = node.method
             method_fn: Optional[Callable] = getattr(module, method_name, None)
             if method_fn is None:
                 raise AttributeError(f"FSM node '{node_name}': {type(module).__name__} has no method '{method_name}'.")
@@ -530,10 +505,6 @@ class GenerationGraph:
         subgraph are namespaced as ``<state>__<node>`` so the same node
         can appear in multiple states without ID collisions.
 
-        A dashed (unlabelled) self-loop on each subgraph marks that the
-        state body iterates until one of its transitions fires — there is no
-        static iteration count to display (modules decide when to leave).
-
         State transitions are thick arrows (``==>``) carrying the firing
         condition (e.g. ``module_signal(start_image_gen)``, ``default``).
         The line weight + simpler label distinguishes them visually from
@@ -574,19 +545,15 @@ class GenerationGraph:
             lines.append("        direction LR")
             for n_name in state.node_sequence:
                 n = self._node_pool[n_name]
-                node_label = f"{n.name}<br/><i>{n.module}.{n.method}</i>"
-                lines.append(f'        {name}__{n.name}["{node_label}"]:::body_node')
+                node_label = f"<i>{n.module}.{n.method}</i>"
+                lines.append(f'        {name}__{_mermaid_id(n.name)}["{node_label}"]:::body_node')
             for e in state.body:
                 if is_end(e.to):
                     # `to: end` sinks are declarative pins — they don't carry
                     # data, so they don't appear inside the body's mini-flow.
                     continue
-                lines.append(f"        {name}__{e.from_} --> {name}__{e.to}")
+                lines.append(f"        {name}__{_mermaid_id(e.from_)} --> {name}__{_mermaid_id(e.to)}")
             lines.append("    end")
-
-        # ── Self-loops marking that a state body iterates until a transition ──
-        for name in drawn:
-            lines.append(f"    state_{name} -.-> state_{name}")
 
         # ── Entry edge ────────────────────────────────────────────────────────
         if self._initial in self._states and self._initial != done_name:

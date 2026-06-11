@@ -1,25 +1,24 @@
 """
-TrainingGraph: DAG view over the ``nodes`` / ``edges`` pools for training.
+TrainingGraph: DAG view over a flat list of edges for training.
 
 Schema
 ------
-The ``training_graph`` block of ``OmniConfig`` is a *single list of edge
-names*::
+The ``training_graph`` block of ``OmniConfig`` is a *single list of edges*;
+each endpoint is a self-describing ``module[.method]`` string (a bare module
+defaults to ``.forward``)::
 
     training_graph:
-      edges:
-        - vision_to_ar
-        - vae_enc_to_ar
-        - tok_enc_to_ar
-        - ar_to_tok_decode
-        - ar_to_vq_decode
-        - vq_token_to_decode
-        - tok_decode_sink     # leaf node → end
-        - vq_decode_sink      # leaf node → end
+      - {from: janus_siglip,             to: janus_llama}
+      - {from: janus_vqvae.encode,       to: janus_llama}
+      - {from: janus_text_encoder.encode, to: janus_llama}
+      - {from: janus_llama,              to: janus_text_encoder.decode}
+      - {from: janus_llama,              to: janus_vqvae.decode}
+      - {from: janus_text_encoder.decode, to: end}   # leaf → end
+      - {from: janus_vqvae.decode,       to: end}    # leaf → end
 
 Active nodes are *derived* from the endpoints of those edges (excluding the
-virtual :data:`~.graph.END` keyword).  The pool may contain inference-only
-items — they are simply ignored when computing the training subset.
+virtual :data:`~.graph.END` keyword); a node's identity is its canonical
+``"<module>.<method>"`` form.
 
 Every node (real, non-``end``) MUST appear on at least one edge — either as a
 ``from`` (data producer), as a ``to`` (data consumer), or as a leaf with
@@ -51,95 +50,64 @@ Exposed surface
 
 See also
 --------
-``graph.py``           — NodeDef / EdgeDef / END shared pool types.
+``graph.py``           — NodeDef / EdgeDef / END shared types.
 ``generation_graph.py`` — FSM view driven by ``OmniConfig.generation_graph``.
 """
 
 from collections import defaultdict, deque
 from typing import Any, Dict, List, Optional
 
-from .graph import END, EdgeDef, NodeDef, is_end
+from .graph import EdgeDef, NodeDef, is_end
+
+
+def _mermaid_id(name: str) -> str:
+    """Sanitise a canonical ``module.method`` node name into a Mermaid-safe id."""
+    return name.replace(".", "_").replace("-", "_")
 
 
 class TrainingGraph:
-    """Active training DAG over named graph nodes and edges.
+    """Active training DAG derived from a flat list of edges.
 
     See module docstring for the full schema.
     """
 
     def __init__(
         self,
-        nodes: Dict[str, Dict],
-        edges: Dict[str, Dict],
-        training_edges: List[str],
+        edges: List[Dict],
+        *,
+        default_method: str = "forward",
     ):
-        if not training_edges:
+        if not edges:
             raise ValueError(
-                "TrainingGraph requires a non-empty `training_edges` list. "
+                "TrainingGraph requires a non-empty `edges` list. "
                 "Even a single-node graph must use `to: end` to make the node visible."
             )
 
-        nodes = nodes or {}
-        edges = edges or {}
-
-        # Name-collision guard: nodes & edges share a single namespace
-        # (FSM body looks up names in both — clashes silently misroute).
-        overlap = set(nodes) & set(edges)
-        if overlap:
-            raise ValueError(
-                f"`nodes` and `edges` pools share name(s): {sorted(overlap)}. "
-                "Each name must be unique across both pools."
-            )
-        if END in nodes or END in edges:
-            raise ValueError(f"The reserved keyword '{END}' cannot appear as a node or edge name.")
-
-        self._node_pool: Dict[str, NodeDef] = {n: NodeDef.parse(n, spec) for n, spec in nodes.items()}
-        self._edge_pool: Dict[str, EdgeDef] = {n: EdgeDef.parse(n, spec) for n, spec in edges.items()}
-
-        # Resolve training_edges
-        missing_edges = [n for n in training_edges if n not in self._edge_pool]
-        if missing_edges:
-            raise KeyError(
-                f"training_edges references undefined edge name(s): {missing_edges}. "
-                f"Known edges: {sorted(self._edge_pool)}"
-            )
-
-        seen_edges: set = set()
-        for ename in training_edges:
-            if ename in seen_edges:
-                raise ValueError(f"Duplicate edge name in training_edges: '{ename}'.")
-            seen_edges.add(ename)
-
-        # Index module → nodes for alias resolution.
-        self._nodes_by_module: Dict[str, List[NodeDef]] = defaultdict(list)
-        for n in self._node_pool.values():
-            self._nodes_by_module[n.module].append(n)
-
-        # Resolve edges & derive active node set
-        active_node_names: List[str] = []  # in first-appearance order
-        active_node_set: set = set()
+        # Parse edges; endpoints are self-describing `module[.method]` strings.
         resolved_edges: List[EdgeDef] = []
-        for ename in training_edges:
-            raw = self._edge_pool[ename]
-            from_ = self._resolve_endpoint(raw.from_, edge_name=raw.name, side="from", allow_end=False)
-            to = self._resolve_endpoint(raw.to, edge_name=raw.name, side="to", allow_end=True)
-            resolved_edges.append(
-                EdgeDef(
-                    name=raw.name,
-                    from_=from_,
-                    to=to,
-                )
-            )
-            for endpoint in (from_, to):
-                if not is_end(endpoint) and endpoint not in active_node_set:
-                    active_node_set.add(endpoint)
-                    active_node_names.append(endpoint)
+        seen_edges: set = set()
+        for spec in edges:
+            edge = EdgeDef.parse(spec, default_method=default_method)
+            key = (edge.from_, edge.to)
+            if key in seen_edges:
+                raise ValueError(f"Duplicate edge in training_graph: '{edge.name}'.")
+            seen_edges.add(key)
+            resolved_edges.append(edge)
+
+        # Derive the active node set (canonical names) in first-appearance order.
+        active_node_names: List[str] = []
+        self._node_by_name: Dict[str, NodeDef] = {}
+        for edge in resolved_edges:
+            for node in (edge.from_node, edge.to_node):
+                if node is None or node.name in self._node_by_name:
+                    continue
+                self._node_by_name[node.name] = node
+                active_node_names.append(node.name)
 
         if not active_node_names:
-            raise ValueError("training_edges yielded zero real (non-`end`) nodes — every edge points to `end`.")
+            raise ValueError("training_graph yielded zero real (non-`end`) nodes — every edge points to `end`.")
 
-        self._active_nodes: List[NodeDef] = [self._node_pool[n] for n in active_node_names]
-        self._node_by_name: Dict[str, NodeDef] = {n.name: n for n in self._active_nodes}
+        self._active_nodes: List[NodeDef] = [self._node_by_name[n] for n in active_node_names]
         self._active_edges: List[EdgeDef] = resolved_edges
 
         # Sanity: every active node has *some* outgoing edge (forbidding orphans
@@ -206,16 +174,6 @@ class TrainingGraph:
         """
         del node, outputs
         return dict(raw_batch)
-
-    # ── pool accessors (used by FSM) ─────────────────────────────────────────
-
-    @property
-    def node_pool(self) -> Dict[str, NodeDef]:
-        return dict(self._node_pool)
-
-    @property
-    def edge_pool(self) -> Dict[str, EdgeDef]:
-        return dict(self._edge_pool)
 
     # ── visualization ────────────────────────────────────────────────────────
 
@@ -291,7 +249,7 @@ class TrainingGraph:
             lines.append("        direction TB")
             for n_name in rank_to_nodes[r]:
                 n = self._node_by_name[n_name]
-                label = f"{n.name}<br/><i>{n.module}.{n.method}</i>"
+                label = f"<i>{n.module}.{n.method}</i>"
                 cls = (
                     "both"
                     if n.name in sources and n.name in sinks
@@ -301,7 +259,7 @@ class TrainingGraph:
                     if n.name in sinks
                     else "middle"
                 )
-                lines.append(f'        {n.name}["{label}"]:::{cls}')
+                lines.append(f'        {_mermaid_id(n.name)}["{label}"]:::{cls}')
             lines.append("    end")
 
         has_end = any(is_end(e.to) for e in self._active_edges)
@@ -310,13 +268,13 @@ class TrainingGraph:
 
         if sources:
             for n in sorted(sources):
-                lines.append(f"    data -.-> {n}")
+                lines.append(f"    data -.-> {_mermaid_id(n)}")
 
         for e in self._active_edges:
             label = self._edge_label(e)
             arrow = f"-->|{label}|" if label else "-->"
-            target = "end_sink" if is_end(e.to) else e.to
-            lines.append(f"    {e.from_} {arrow} {target}")
+            target = "end_sink" if is_end(e.to) else _mermaid_id(e.to)
+            lines.append(f"    {_mermaid_id(e.from_)} {arrow} {target}")
 
         # Hide the rank-banding subgraph borders — they only constrain layout.
         for r in ranks:
@@ -333,45 +291,6 @@ class TrainingGraph:
         return "\n".join(lines)
 
     # ── internal ─────────────────────────────────────────────────────────────
-
-    def _resolve_endpoint(
-        self,
-        name: Optional[str],
-        edge_name: str,
-        side: str,
-        *,
-        allow_end: bool,
-    ) -> str:
-        """Resolve an edge endpoint string to an active node name.
-
-        Accepts:
-        * an exact node name from the pool;
-        * a *module name* when that module has exactly one declared node;
-        * the reserved keyword :data:`~.graph.END` when ``allow_end`` is True.
-        """
-        if name is None:
-            raise ValueError(f"Edge '{edge_name}': missing `{side}`.")
-        if name == END:
-            if not allow_end:
-                raise ValueError(
-                    f"Edge '{edge_name}': `{side}: {END}` is forbidden — the virtual sink may only appear on `to`."
-                )
-            return END
-        if name in self._node_pool:
-            return name
-        candidates = self._nodes_by_module.get(name, [])
-        if len(candidates) == 1:
-            return candidates[0].name
-        if len(candidates) > 1:
-            names = sorted(c.name for c in candidates)
-            raise ValueError(
-                f"Edge '{edge_name}': `{side}: {name}` is ambiguous — module '{name}' "
-                f"has multiple declared nodes: {names}. Use a node name."
-            )
-        raise KeyError(
-            f"Edge '{edge_name}': `{side}: {name}` references neither a declared node "
-            f"nor a uniquely-declared module. Declared nodes: {sorted(self._node_pool)}."
-        )
 
     @staticmethod
     def _edge_label(e: EdgeDef) -> str:

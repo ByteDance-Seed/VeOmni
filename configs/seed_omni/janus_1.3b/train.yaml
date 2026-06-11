@@ -7,17 +7,15 @@
 #                            (``model`` / ``train`` / ``data``).  Relative
 #                            ``model.weights_path`` joins ``model.model_path``
 #                            from the launcher YAML unless absolute.
-#   * `nodes`              — every call-site (`module.method`) the graph
-#                            engine can dispatch to, INCLUDING ones that
-#                            only fire during inference (`emit_image_start`,
-#                            `emit_image_end`).  Inference YAMLs reference
-#                            these by name; they don't redeclare them.
-#   * `edges`              — every data-routing edge available to either
-#                            graph view (DAG / FSM).  Same rule as `nodes`:
-#                            inference-only edges live here too.
-#   * `training_graph`     — the active subset of `edges` for training; this
-#                            file selects the **joint understanding +
-#                            generation** SFT setup by default.
+#   * `training_graph`     — a flat list of edges for the training DAG.  Each
+#                            endpoint is a self-describing `module[.method]`
+#                            string (bare module → `.forward`); active nodes
+#                            are derived from the endpoints.  This file selects
+#                            the **joint understanding + generation** SFT setup.
+#                            Inference-only call-sites (`emit_image_start`, …)
+#                            are written inline in the sibling `infer_*.yaml`
+#                            `generation_graph` bodies — there is no shared
+#                            node/edge pool to redeclare.
 #
 # The LLM tokenizer lives in ``janus_text_encoder/`` (split checkpoint asset).
 #
@@ -96,94 +94,28 @@ modules:
 # ``train`` / ``data`` — parsed the same way as the launcher YAML via
 # :func:`parse_args` / :func:`merge_args`.
 
-# ── Graph nodes (call-sites) ──────────────────────────────────────────────────
-# The same module may back multiple nodes (different methods).  Inference-only
-# nodes are declared here too — the training graph just doesn't activate them.
-nodes:
-  # ── Training & inference: shared
-  siglip_encode: { module: janus_siglip }                   # training: forward; inference: generate (FSM default)
-
-  vqvae_encode: { module: janus_vqvae.encode }               # pixels → gen_embeds + vq_token_ids   (training)
-  vqvae_decode: { module: janus_vqvae.decode }              # training CE head (hidden + gt_token_ids → _loss)
-  vqvae:        { module: janus_vqvae }                      # training: forward; inference: generate
-
-  token_encode:  { module: janus_text_encoder.encode }       # training: chat-template + wte
-  token_generate: { module: janus_text_encoder }   # inference: embed conversation tail
-  token_decode: { module: janus_text_encoder.decode }        # unified text head:
-                                                              #   training:  hidden_states + labels → _loss
-                                                              #   inference: hidden_states → sample → next token (input_ids)
-  janus_llama: { module: janus_llama }                        # backbone — no wte, no lm_head
-
-  # ── Inference-only: Janus-specific boundary-token emitters.
-  emit_image_start: { module: janus_text_encoder.emit_image_start } # produces <begin_of_image> token
-  emit_image_end:   { module: janus_text_encoder.emit_image_end }   # produces <end_of_image> token
-
-# ── Graph edges (data dependencies) ───────────────────────────────────────────
-edges:
-  # ── Training: the conversation_list carrier (in-place embed mutation).
-  #
-  # Batched ``conversation_list`` (``list[list[ConversationItem]]``) is the
-  # only thing entering the backbone.  Each module embeds its modality in
-  # place on the items; ``OmniModel.forward`` writes the list back into the
-  # shared batch.  Edges are pure ``{from, to}`` topology — no per-field routing.
-  #
-  #   * siglip_encode   → embeds user ``image`` items in place (no image → dummy tail)
-  #   * vqvae_encode    → embeds assistant ``image`` items + ``meta.janus_vqvae_labels`` (no image → dummy tail)
-  #   * token_encode    → chat-template tokenise + wte (text only; ignores images)
-  #   * janus_llama     → splices item embeds → inputs_embeds; hidden_states → batch
-  #   * token_decode / vqvae_decode → labels from ``meta.label_ids`` / ``meta.gen_ids``
-  #
-  # The three encoders fan in to ``janus_llama`` — execution order among them is
-  # arbitrary; each module mutates disjoint ``conversation_list`` segments.
-  siglip_to_janus_llama:          { from: siglip_encode,  to: janus_llama }
-  vqvae_encode_to_janus_llama:    { from: vqvae_encode,  to: janus_llama }
-  token_encode_to_janus_llama:    { from: token_encode,  to: janus_llama }   # training
-
-  # Decode heads read ``hidden_states`` and ``conversation_list`` from the batch.
-  janus_llama_to_token_decode:    { from: janus_llama, to: token_decode }  # training
-  janus_llama_to_vqvae_decode:    { from: janus_llama, to: vqvae_decode }  # training CE only
-  token_decode_sink:              { from: token_decode, to: end }
-  vqvae_decode_sink:              { from: vqvae_decode, to: end }
-
-  # ── Inference VQ AR loop: ``janus_llama`` tail-forward → ``vqvae.generate``
-  #    per FSM step.  ``image_vq`` body order: ``janus_llama_to_vqvae`` then
-  #    ``vqvae_to_janus_llama`` — the first llama forward on ``<boi>`` happens
-  #    inside the loop (``image_vq_start`` only emits the token).
-  janus_llama_to_vqvae:           { from: janus_llama, to: vqvae }
-  vqvae_to_janus_llama:           { from: vqvae, to: janus_llama }
-  token_generate_to_janus_llama:  { from: token_generate, to: janus_llama }
-  janus_llama_to_token_generate:  { from: janus_llama, to: token_generate }
-  token_generate_sink:            { from: token_generate, to: end }
-
-  # ── Inference bridge edges: emit boundary tokens (with / without llama).
-  emit_start_to_janus_llama:    { from: emit_image_start, to: janus_llama }
-  emit_end_to_janus_llama:      { from: emit_image_end,   to: janus_llama }
-  emit_start_sink:              { from: emit_image_start, to: end }
-  emit_end_sink:                { from: emit_image_end,   to: end }
-
-  # ── Inference body sinks: pin ``janus_llama`` into the active set when the
-  #    backbone updates KV cache without a downstream consumer in the same body
-  #    (`image_vq_start`, `image_vq_end`, `prompt_encode`).  Unused in training
-  #    where ``janus_llama`` already has real consumers (token_decode / vqvae_decode).
-  janus_llama_sink:             { from: janus_llama, to: end }
-
 # ── Training DAG ──────────────────────────────────────────────────────────────
 # Default = Janus joint understanding + image-generation SFT.
 #
-# Active nodes (derived from edge endpoints, excluding `end`):
+# A flat list of edges.  Each endpoint is a self-describing `module[.method]`
+# string (bare module → `.forward`); the active node set is *derived* from the
+# endpoints (excluding the virtual `end` sink).  Active nodes:
 #
-#   {siglip_encode, vqvae_encode, token_encode} → janus_llama → token_decode → end
-#                                                            └─→ vqvae_decode → end
+#   {janus_siglip, janus_vqvae.encode, janus_text_encoder.encode}
+#       → janus_llama → janus_text_encoder.decode → end
+#                    └─→ janus_vqvae.decode        → end
 #
-#   sources: siglip_encode, vqvae_encode, token_encode  (order-free fan-in)
+#   sources: janus_siglip, janus_vqvae.encode, janus_text_encoder.encode  (order-free fan-in)
 #   backbone: janus_llama
-#   sinks  : token_decode, vqvae_decode
+#   sinks  : janus_text_encoder.decode, janus_vqvae.decode
 #
-# siglip / vqvae / token each fill their own segments' embedding into the single
-# carrier (written back into the shared batch by OmniModel.forward); the
-# backbone splices the segments and the heads rebuild their labels from the
-# same segments.  Each module emits at most one `_loss` (token-mean over its
-# own micro-batches); OmniModel.forward sums them.
+# Batched ``conversation_list`` (``list[list[ConversationItem]]``) is the only
+# thing entering the backbone.  siglip / vqvae / token each fill their own
+# segments' embedding into the single carrier (written back into the shared
+# batch by OmniModel.forward); the backbone splices the segments and the heads
+# rebuild their labels from the same segments.  Edges are pure `{from, to}`
+# topology — no per-field routing.  Each module emits at most one `_loss`
+# (token-mean over its own micro-batches); OmniModel.forward sums them.
 #
 # Training-side dummy forward
 # ---------------------------
@@ -195,19 +127,16 @@ edges:
 # keeping FSDP DP/SP graphs aligned across ranks.  This is the *only*
 # asymmetry between training and inference: inference permits empty `{}`
 # returns and lets edge routing skip silently.
+#
+# Alternative training scenarios: because every modality flows through the
+# single conversation_list carrier (in any order), an understanding-only or
+# generation-only subset is selected by what the data actually contains, not by
+# dropping edges.  Keep the full chain; curate the dataset for the scenario.
 training_graph:
-  edges:
-    - siglip_to_janus_llama
-    - vqvae_encode_to_janus_llama
-    - token_encode_to_janus_llama
-    - janus_llama_to_token_decode
-    - janus_llama_to_vqvae_decode
-    - token_decode_sink
-    - vqvae_decode_sink
-
-# Alternative training scenarios: because every modality now flows through the
-# single conversation_list carrier (siglip / vqvae / token → llama in any order), an
-# understanding-only or generation-only subset is selected by what the data
-# actually contains (text-only / image-only samples drive the zero-placeholder
-# dummy path), not by dropping edges.  Keep the full chain; curate the dataset
-# for the scenario you want.
+  - { from: janus_siglip,              to: janus_llama }            # user image embeds → carrier
+  - { from: janus_vqvae.encode,        to: janus_llama }            # assistant image VQ embeds → carrier
+  - { from: janus_text_encoder.encode, to: janus_llama }            # chat-template tokenise + wte
+  - { from: janus_llama,               to: janus_text_encoder.decode }  # text CE head
+  - { from: janus_llama,               to: janus_vqvae.decode }     # image VQ CE head
+  - { from: janus_text_encoder.decode, to: end }
+  - { from: janus_vqvae.decode,        to: end }

@@ -19,24 +19,10 @@ modules:
     model:
       model_path: qwen3_llm
 
-nodes:
-  token_encode:   { module: qwen3_text_encoder.encode }
-  token_generate: { module: qwen3_text_encoder }
-  token_decode:   { module: qwen3_text_encoder.decode }
-  qwen3_llm:      { module: qwen3_llm }
-
-edges:
-  token_encode_to_qwen3_llm:    { from: token_encode,  to: qwen3_llm }
-  qwen3_llm_to_token_decode:    { from: qwen3_llm, to: token_decode }
-  token_decode_sink:            { from: token_decode, to: end }
-
-  token_generate_to_qwen3_llm:  { from: token_generate, to: qwen3_llm }
-  qwen3_llm_to_token_generate:  { from: qwen3_llm, to: token_generate }
-  token_generate_sink:          { from: token_generate, to: end }
-  qwen3_llm_sink:               { from: qwen3_llm, to: end }
-
+# Flat list of edges; each endpoint is a self-describing `module[.method]`
+# string (bare module → `.forward`).  Active nodes are derived from the
+# endpoints:  qwen3_text_encoder.encode → qwen3_llm → qwen3_text_encoder.decode → end
 training_graph:
-  edges:
-    - token_encode_to_qwen3_llm
-    - qwen3_llm_to_token_decode
-    - token_decode_sink
+  - { from: qwen3_text_encoder.encode, to: qwen3_llm }
+  - { from: qwen3_llm,                 to: qwen3_text_encoder.decode }
+  - { from: qwen3_text_encoder.decode, to: end }

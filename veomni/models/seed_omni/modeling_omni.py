@@ -18,7 +18,7 @@ Architecture
                           ``<module_name>.<rest>`` (no ``modules_dict.``
                           middle prefix).  ``model.modules_dict`` remains as
                           a read-only dict view for back-compat.
-* ``training_graph``    — :class:`TrainingGraph` (DAG over node/edge pools).
+* ``training_graph``    — :class:`TrainingGraph` (DAG over the flat edge list).
 * ``generation_graph``  — :class:`GenerationGraph` (FSM, optional).
 
 Loss protocol (single ``_loss`` key per module)
@@ -104,8 +104,8 @@ class OmniModel(nn.Module):
     Parameters
     ----------
     config:
-        :class:`OmniConfig` with ``modules`` / ``nodes`` / ``edges`` /
-        ``training_graph`` / ``generation_graph`` populated.
+        :class:`OmniConfig` with ``modules`` / ``training_graph`` /
+        ``generation_graph`` populated.
     modules:
         ``{module_name: ModuleMixin-mixin instance}`` — already constructed
         (and parallelised, if running under FSDP).  ``OmniTrainer`` is
@@ -170,20 +170,12 @@ class OmniModel(nn.Module):
         for name in self._module_names:
             self.add_module(name, modules[name])
 
-        self.training_graph = TrainingGraph(
-            nodes=config.nodes,
-            edges=config.edges,
-            training_edges=config.training_edges,
-        )
+        # Both views are optional: an inference-only config may carry just a
+        # ``generation_graph`` (no ``training_graph``), and vice versa.
+        self.training_graph = TrainingGraph(edges=config.training_graph) if config.has_training_graph() else None
 
         self.generation_graph = (
-            GenerationGraph(
-                fsm_config=config.generation_graph,
-                nodes=config.nodes,
-                edges=config.edges,
-            )
-            if config.has_generation_graph()
-            else None
+            GenerationGraph(fsm_config=config.generation_graph) if config.has_generation_graph() else None
         )
 
         # Optional per-node executors injected by the trainer.  When set, the
@@ -270,6 +262,12 @@ class OmniModel(nn.Module):
         * ``"outputs"`` : ``{node_name: full output dict}`` as returned by
                           each node's ``post_forward``.
         """
+        if self.training_graph is None:
+            raise RuntimeError(
+                "OmniModel.forward requires a `training_graph`, but this config declares none "
+                "(inference-only). Use `generate` instead, or load a training YAML."
+            )
+
         node_outputs: Dict[str, Dict[str, Any]] = {}
         losses: Dict[str, torch.Tensor] = {}
 

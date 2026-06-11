@@ -21,28 +21,28 @@ generation_graph:
   states:
     prompt_encode:
       body:
-        - siglip_to_janus_llama
-        - token_generate_to_janus_llama
-        - janus_llama_sink
+        - { from: janus_siglip,       to: janus_llama }
+        - { from: janus_text_encoder, to: janus_llama }
+        - { from: janus_llama,        to: end }
       transitions:
         - { condition: { type: default }, next_state: image_vq_start }
 
     image_vq_start:
       body:
-        - emit_start_sink
+        - { from: janus_text_encoder.emit_image_start, to: end }
       transitions:
         - { condition: { type: default }, next_state: image_vq }
 
     image_vq:
       body:
-        - janus_llama_to_vqvae
-        - vqvae_to_janus_llama
+        - { from: janus_llama, to: janus_vqvae }
+        - { from: janus_vqvae, to: janus_llama }
       transitions:
         - { condition: { type: module_signal, key: image_complete }, next_state: image_vq_end }
 
     image_vq_end:
       body:
-        - emit_end_sink
+        - { from: janus_text_encoder.emit_image_end, to: end }
       transitions:
         - { condition: { type: default }, next_state: done }
 

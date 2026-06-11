@@ -11,10 +11,10 @@ generation_graph:
   states:
     prompt_encode:
       body:
-        - siglip_to_janus_llama
-        - token_generate_to_janus_llama
-        - janus_llama_to_token_generate
-        - token_generate_sink
+        - { from: janus_siglip,       to: janus_llama }
+        - { from: janus_text_encoder, to: janus_llama }
+        - { from: janus_llama,        to: janus_text_encoder }
+        - { from: janus_text_encoder, to: end }
       transitions:
         - { condition: { type: module_signal, key: start_image_gen }, next_state: image_vq }
         - { condition: { type: module_signal, key: text_done }, next_state: done }
@@ -22,23 +22,23 @@ generation_graph:
 
     text_ar:
       body:
-        - janus_llama_to_token_generate
-        - token_generate_sink
+        - { from: janus_llama,        to: janus_text_encoder }
+        - { from: janus_text_encoder, to: end }
       transitions:
         - { condition: { type: module_signal, key: start_image_gen }, next_state: image_vq }
         - { condition: { type: module_signal, key: text_done }, next_state: done }
 
     image_vq:
       body:
-        - vqvae_to_janus_llama
-        - janus_llama_to_vqvae
+        - { from: janus_vqvae, to: janus_llama }
+        - { from: janus_llama, to: janus_vqvae }
       transitions:
         - { condition: { type: module_signal, key: image_complete }, next_state: image_vq_end }
 
     image_vq_end:
       body:
-        - emit_end_to_janus_llama
-        - janus_llama_sink
+        - { from: janus_text_encoder.emit_image_end, to: janus_llama }
+        - { from: janus_llama, to: end }
       transitions:
         - { condition: { type: default }, next_state: text_ar }
 

@@ -26,7 +26,7 @@ framework changes.
 
 ```mermaid
 flowchart LR
-    YAML[("YAML config<br/>modules · nodes · edges<br/>training_graph / generation_graph")] --> CFG[OmniConfig]
+    YAML[("YAML config<br/>modules<br/>training_graph / generation_graph")] --> CFG[OmniConfig]
     CFG --> TR[OmniTrainer<br/><i>build + FSDP wrap each module</i>]
     TR --> OM[OmniModel<br/><i>graph runtime</i>]
     OM --> M1[janus_siglip]
@@ -176,16 +176,21 @@ so FSDP gradient-sync stays aligned across ranks.
 
 ### 2.3 Two graph views (`graph.py`, `training_graph.py`, `generation_graph.py`)
 
-The YAML declares two shared pools — **`nodes`** (`module.method` call-sites)
-and **`edges`** (`{from, to}`) — and two views over them:
+There is **no shared `nodes` / `edges` pool**. Both views are written as plain
+lists of **edges** (`{from, to}`), and each endpoint is a self-describing
+`module[.method]` string. A bare endpoint takes the view's default method
+(`forward` for training, `generate` for inference); a dotted `module.method`
+uses that method verbatim. A node's identity is its canonical
+`"<module>.<method>"` form.
 
-- **`TrainingGraph`** — a **DAG**. Active nodes are derived from the endpoints
-  of `training_graph.edges`; a topological sort gives the forward order. Each
-  active node runs **exactly once** per forward. **Edges are pure topology** —
-  they declare order only, not data routing.
+- **`TrainingGraph`** — a **DAG**. `training_graph` is a flat list of edges;
+  active nodes are derived from the endpoints, and a topological sort gives the
+  forward order. Each active node runs **exactly once** per forward. **Edges
+  are pure topology** — they declare order only, not data routing.
 - **`GenerationGraph`** — a **finite-state machine**. Each `state.body` is a
-  list of edges to run that step; `transitions` pick the next state by
-  `module_signal` (a string a module writes into `ctx`) or `default`.
+  list of inline `{from, to}` edges to run that step; `transitions` pick the
+  next state by `module_signal` (a string a module writes into `ctx`) or
+  `default`.
 
 ### 2.4 `OmniModel` — the runtime (`modeling_omni.py`)
 
@@ -204,31 +209,32 @@ The default Janus `training_graph` (`configs/seed_omni/janus_1.3b/train.yaml`):
 
 ```mermaid
 flowchart LR
-    data[("conversation_list<br/>(batch)")] -.-> S[siglip_encode]
-    data -.-> V[vqvae_encode]
-    data -.-> T[token_encode]
+    data[("conversation_list<br/>(batch)")] -.-> S[janus_siglip]
+    data -.-> V[janus_vqvae.encode]
+    data -.-> T[janus_text_encoder.encode]
     S --> L[janus_llama]
     V --> L
     T --> L
-    L --> TD[token_decode]
-    L --> VD[vqvae_decode]
+    L --> TD[janus_text_encoder.decode]
+    L --> VD[janus_vqvae.decode]
     TD --> E((end))
     VD --> E
 ```
 
 What each node does to the shared carrier:
 
-1. **`siglip_encode`** — replaces user `image` items' raw pixels with SigLIP
+1. **`janus_siglip`** — replaces user `image` items' raw pixels with SigLIP
    patch embeddings.
-2. **`vqvae_encode`** — replaces assistant `image` items with VQ embeddings and
-   stashes `meta.janus_vqvae_labels`.
-3. **`token_encode`** — applies the Janus chat template to `text` items,
-   tokenises, runs word-token embedding (`wte`), and stores `meta.labels`.
+2. **`janus_vqvae.encode`** — replaces assistant `image` items with VQ
+   embeddings and stashes `meta.janus_vqvae_labels`.
+3. **`janus_text_encoder.encode`** — applies the Janus chat template to `text`
+   items, tokenises, runs word-token embedding (`wte`), and stores
+   `meta.labels`.
 4. **`janus_llama`** — concatenates every non-dummy item's embedding into one
    packed `bs=1` sequence, runs the LLaMA backbone (no `wte`, no `lm_head`),
    and writes the hidden state back onto each item's `value`.
-5. **`token_decode`** / **`vqvae_decode`** — read hidden states + labels off
-   the carrier and each return one `_loss`.
+5. **`janus_text_encoder.decode`** / **`janus_vqvae.decode`** — read hidden
+   states + labels off the carrier and each return one `_loss`.
 
 The runtime loop (simplified from `OmniModel.forward`):
 
@@ -341,8 +347,9 @@ Use the `/seedomni-v2` skill for the full checklist. The shape of the work:
    `config.json` → `model_type` → registry.
 
 4. **Write the YAML** (`configs/seed_omni/<model>/`):
-   - `train.yaml` — `modules`, `nodes`, `edges`, and the `training_graph` edge
-     list. Remember: edges only declare order; modules move data via the
+   - `train.yaml` — `modules` and `training_graph` (a flat list of edges whose
+     endpoints are `module[.method]` strings). Remember: edges only declare
+     order; modules move data via the
      conversation list.
    - `infer_*.yaml` — one `generation_graph` (FSM) per scenario, overlaying the
      training vocabulary.

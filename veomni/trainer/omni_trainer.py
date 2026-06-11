@@ -109,7 +109,7 @@ class OmniModelArguments(ModelArguments):
             "help": (
                 "Path to the OmniModel master training YAML (e.g. "
                 "configs/seed_omni/janus_1.3b/train.yaml).  Declares "
-                "modules / nodes / edges / training_graph."
+                "modules + training_graph (a flat list of edges)."
             )
         },
     )
