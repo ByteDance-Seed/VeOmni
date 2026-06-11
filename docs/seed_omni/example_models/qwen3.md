@@ -14,14 +14,20 @@ All paths below assume the upstream HuggingFace checkpoint (the post-trained
 chat model) lives at `/mnt/hdfs/veomni/models/transformers/Qwen/Qwen3-0.6B`. Adjust to your own
 storage.
 
-Config dir: `configs/seed_omni/qwen3_0.6b/`
+Config dir: `configs/seed_omni/Qwen/qwen3_0.6b/` (the `data.yaml` lives one level
+up at `configs/seed_omni/Qwen/data.yaml`, shared across Qwen launchers).
+
+The omni config layout splits the old monolithic launcher into a `base.yaml` plus
+per-purpose module/graph files. Both training and inference take the **same**
+`base.yaml`.
 
 | File | Role |
 |------|------|
-| `veomni_qwen3.yaml` | Top-level launcher: model paths, data, FSDP/optimizer, checkpoint, wandb. |
-| `train.yaml` | Per-module training graph (`token_encode → qwen3_llm → token_decode`). |
+| `qwen3_0.6b/base.yaml` | Top-level omni launcher: model paths, top-level `accelerator`, data, train, and the `infer` block. |
+| `qwen3_0.6b/modules_train.yaml` | Per-module training overrides. |
+| `qwen3_0.6b/graph_train.yaml` | Training DAG (`qwen3_text_encoder → qwen3_llm → qwen3_text_encoder.decode`). |
 | `data.yaml` | Weighted multisource data list (Tulu-3 SFT mixture). |
-| `infer_text.yaml` | Text chat generation graph. |
+| `qwen3_0.6b/graph_infer.yaml` | Text chat generation graph (mapped under `infer.infer_graph.infer_text`). |
 
 ---
 
@@ -37,7 +43,7 @@ python scripts/convert_model.py \
   --output_dir /mnt/hdfs/veomni/models/seed_omni/Qwen3-0.6B
 ```
 
-The `output_dir` becomes `model.model_path` in `veomni_qwen3.yaml`.
+The `output_dir` becomes `model.model_path` in `base.yaml`.
 (Qwen3-0.6B has `tie_word_embeddings=True`, so `qwen3_text_encoder` stores only
 `embed_tokens` and the decode head reuses that weight via `F.linear`.)
 
@@ -51,7 +57,7 @@ preprocessor key in `veomni/data/seed_omni/preprocess.py`
 `messages` list to a `[role, ("text", content)]` conversation.
 
 ```yaml
-# configs/seed_omni/qwen3_0.6b/data.yaml
+# configs/seed_omni/Qwen/data.yaml
 sources:
   - /mnt/hdfs/veomni/datasets/tulu-3-sft-mixture/mini_data
 names:
@@ -72,7 +78,7 @@ The on-disk row schema is documented in
 
 ```bash
 bash train.sh tasks/omni/train_omni.py \
-  configs/seed_omni/qwen3_0.6b/veomni_qwen3.yaml
+  configs/seed_omni/Qwen/qwen3_0.6b/base.yaml
 ```
 
 Key knobs (override on the CLI):
@@ -88,7 +94,7 @@ Quick 1-node smoke run (no wandb, tiny step budget):
 
 ```bash
 bash train.sh tasks/omni/train_omni.py \
-  configs/seed_omni/qwen3_0.6b/veomni_qwen3.yaml \
+  configs/seed_omni/Qwen/qwen3_0.6b/base.yaml \
   --model.model_path /mnt/hdfs/veomni/models/seed_omni/Qwen3-0.6B \
   --train.max_steps 15 \
   --train.global_batch_size 8 \
@@ -107,7 +113,7 @@ Resume by pointing `load_path` at that directory:
 
 ```bash
 bash train.sh tasks/omni/train_omni.py \
-  configs/seed_omni/qwen3_0.6b/veomni_qwen3.yaml \
+  configs/seed_omni/Qwen/qwen3_0.6b/base.yaml \
   --train.checkpoint.load_path outputs/qwen3_0.6b_omni_sft/checkpoints/global_step_500
 ```
 
@@ -115,15 +121,16 @@ bash train.sh tasks/omni/train_omni.py \
 
 ## 5. Inference
 
-`tasks/omni/infer_omni.py` runs the `infer_text` generation graph. Point
-`--infer.model_path` at a **split-checkpoint root** holding `qwen3_text_encoder/`
-and `qwen3_llm/`. The step-1 converter output already has this layout, so you can
-infer directly:
+`tasks/omni/infer_omni.py` runs the `infer_text` generation graph (the default
+and only `infer.infer_type` for Qwen3). Point `--infer.model_path` at a
+**split-checkpoint root** holding `qwen3_text_encoder/` and `qwen3_llm/`, or omit
+it to fall back to `model.model_path`. The step-1 converter output already has
+this layout, so you can infer directly:
 
 ```bash
 python tasks/omni/infer_omni.py \
-  configs/seed_omni/qwen3_0.6b/veomni_qwen3.yaml \
-  --model.omni_infer_type infer_text \
+  configs/seed_omni/Qwen/qwen3_0.6b/base.yaml \
+  --infer.infer_type infer_text \
   --infer.model_path /mnt/hdfs/veomni/models/seed_omni/Qwen3-0.6B \
   --infer.prompt "What is 2+2?" \
   --infer.output_dir qwen3_out \

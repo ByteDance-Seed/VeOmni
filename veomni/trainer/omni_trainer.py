@@ -60,14 +60,13 @@ Division of labour
 import os
 import random
 from collections import defaultdict
-from dataclasses import dataclass, field, fields
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import numpy as np
 import torch
 import torch.distributed as dist
 
-from ..arguments import DataArguments, ModelArguments, TrainingArguments, VeOmniArguments
+from ..arguments import OmniArguments, VeOmniArguments
 from ..data import SeedOmniCollator
 from ..data.data_transform import build_data_transform
 from ..distributed.clip_grad_norm import veomni_clip_grad_norm
@@ -94,56 +93,6 @@ if TYPE_CHECKING:
 
 
 logger = logging.get_logger(__name__)
-
-
-# ── Argument dataclasses ────────────────────────────────────────────────────────
-
-
-@dataclass
-class OmniModelArguments(ModelArguments):
-    """Model arguments for OmniModel V2 training."""
-
-    omni_train_yaml_path: Optional[str] = field(
-        default=None,
-        metadata={
-            "help": (
-                "Path to the OmniModel master training YAML (e.g. "
-                "configs/seed_omni/janus_1.3b/train.yaml).  Declares "
-                "modules + training_graph (a flat list of edges)."
-            )
-        },
-    )
-
-    def load_omni_config(self, global_args: VeOmniArguments) -> "OmniConfig":
-        """Build :class:`OmniConfig` (graph vocabulary + raw module override blocks)."""
-        from ..models.seed_omni.configuration_omni import OmniConfig
-
-        if not self.omni_train_yaml_path:
-            raise ValueError("`model.omni_train_yaml_path` is required for OmniModel V2.")
-        if not self.model_path:
-            raise ValueError("`model.model_path` is required for OmniModel V2.")
-
-        return OmniConfig._init(
-            global_args=global_args,
-            model_path=self.model_path,
-            train_yaml_path=self.omni_train_yaml_path,
-        )
-
-
-@dataclass
-class VeOmniOmniArguments(VeOmniArguments):
-    model: "OmniModelArguments" = field(default_factory=OmniModelArguments)
-    data: "DataArguments" = field(default_factory=DataArguments)
-    train: "TrainingArguments" = field(default_factory=TrainingArguments)
-
-    def _to_base_args(self) -> VeOmniArguments:
-        omni_model = self.model
-        model_kwargs = {f.name: getattr(omni_model, f.name) for f in fields(ModelArguments)}
-        return VeOmniArguments(
-            model=ModelArguments(**model_kwargs),
-            data=self.data,
-            train=self.train,
-        )
 
 
 # ── Multi-optimizer / multi-scheduler proxies ──────────────────────────────────
@@ -658,7 +607,7 @@ class OmniTrainer:
     optimizers: Dict[str, torch.optim.Optimizer]  # one per trainable module (aggregated into base.optimizer)
     lr_schedulers: Dict[str, Any]  # one per trainable module (aggregated into base.lr_scheduler)
 
-    def __init__(self, args: VeOmniOmniArguments):
+    def __init__(self, args: OmniArguments):
         # BaseTrainer.__init__ is NOT called here; we call its private
         # helpers one-by-one so the (overridden) build sequence is explicit.
         self.base = BaseTrainer.__new__(BaseTrainer)
@@ -682,9 +631,9 @@ class OmniTrainer:
     def _build_model(self):
         """Build one :class:`OmniModuleTrainer` (FSDP2) per declared module."""
         base = self.base
-        args: VeOmniOmniArguments = base.args
+        args: OmniArguments = base.args
 
-        self.omni_config = args.model.load_omni_config(args._to_base_args())
+        self.omni_config = args.load_omni_config()
         self.module_names = self.omni_config.module_names
         self.module_trainers: Dict[str, OmniModuleTrainer] = {}
 
@@ -873,7 +822,7 @@ class OmniTrainer:
 
     def train_step(self, data_iterator: Any) -> None:
         base = self.base
-        args: VeOmniOmniArguments = base.args
+        args: OmniArguments = base.args
         base.state.global_step += 1
 
         micro_batches: List[Dict[str, Any]] = next(data_iterator)
@@ -948,7 +897,7 @@ class OmniTrainer:
 
     def train(self):
         base = self.base
-        args: VeOmniOmniArguments = base.args
+        args: OmniArguments = base.args
         self.on_train_begin()
         logger.info(
             f"Rank{args.train.local_rank} Start training. "

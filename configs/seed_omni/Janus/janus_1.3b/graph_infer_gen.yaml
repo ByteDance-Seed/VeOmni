@@ -45,10 +45,3 @@ generation_graph:
         - { from: janus_text_encoder.emit_image_end, to: end }
       transitions:
         - { condition: { type: default }, next_state: done }
-
-generation_kwargs:
-  max_new_tokens: 2048
-  temperature: 0.0
-  top_p: 1.0
-  do_sample: False
-  guidance_scale: 5.0

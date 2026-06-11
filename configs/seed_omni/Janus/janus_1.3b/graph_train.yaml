@@ -1,0 +1,17 @@
+# Janus-1.3B training DAG — joint understanding + image-generation SFT.
+#
+# A flat list of edges.  Each endpoint is a self-describing `module[.method]`
+# string (bare module -> `.forward`); the active node set is derived from the
+# endpoints (excluding the virtual `end` sink):
+#
+#   {janus_siglip, janus_vqvae.encode, janus_text_encoder.encode}
+#       -> janus_llama -> janus_text_encoder.decode -> end
+#                     \-> janus_vqvae.decode        -> end
+training_graph:
+  - { from: janus_siglip,              to: janus_llama }            # user image embeds -> carrier
+  - { from: janus_vqvae.encode,        to: janus_llama }            # assistant image VQ embeds -> carrier
+  - { from: janus_text_encoder.encode, to: janus_llama }            # chat-template tokenise + wte
+  - { from: janus_llama,               to: janus_text_encoder.decode }  # text CE head
+  - { from: janus_llama,               to: janus_vqvae.decode }     # image VQ CE head
+  - { from: janus_text_encoder.decode, to: end }
+  - { from: janus_vqvae.decode,        to: end }

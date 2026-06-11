@@ -22,7 +22,7 @@ raw_batch["conversation_list"]  →  OmniModel modules (SigLIP / VQVAE / …)
 ```
 
 Set `data.data_type: seedomni` and point `data.train_path` at a multisource YAML
-(see ``configs/seed_omni/janus_1.3b/data.yaml``). Each source's ``names`` entry
+(see ``configs/seed_omni/Janus/janus_1.3b/data.yaml``). Each source's ``names`` entry
 must match a key in ``SEED_OMNI_PREPROCESSOR_REGISTRY`` (or add your own
 preprocessor in ``veomni/data/seed_omni/preprocess.py``).
 
@@ -175,11 +175,11 @@ patchify happen inside each SeedOmni module at forward time (see `design.md`
 
 ## Janus multisource training
 
-Data sources are declared in ``configs/seed_omni/janus_1.3b/data.yaml`` (ImageNet1k
+Data sources are declared in ``configs/seed_omni/Janus/janus_1.3b/data.yaml`` (ImageNet1k
 T2I + ShareGPT4V caption I2T). Launch with the bundled YAML:
 
 ```bash
-bash train.sh tasks/omni/train_omni.py configs/seed_omni/janus_1.3b/veomni_janus.yaml
+bash train.sh tasks/omni/train_omni.py configs/seed_omni/Janus/janus_1.3b/base.yaml
 ```
 
 See [`docs/seed_omni/example_models/janus.md`](example_models/janus.md)

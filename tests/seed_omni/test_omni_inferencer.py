@@ -11,8 +11,8 @@ Scope
 Full end-to-end (real Janus weights) inference is covered by
 ``tasks/infer/infer_omni.py`` and the broader integration suite; this file
 stays runnable without GPU / weights and assumes the caller passes a
-well-formed :class:`OmniInferenceArguments` (no construction-time
-defensive checks to pin).
+well-formed :class:`~veomni.arguments.arguments_types_omni.OmniArguments`
+(no construction-time defensive checks to pin).
 """
 
 from __future__ import annotations

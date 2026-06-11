@@ -143,7 +143,7 @@ The two runtimes treat a missing optional input differently — by design. This 
 | Phase | What happens when `module.forward(foo=None, ...)` is called | Why |
 |---|---|---|
 | **Training (FSDP)** | The trainer fills missing kwargs from `module.dummy_inputs(...)` *before* dispatch. The `if foo is None: return {}` short-circuit is **never reached** during training. | Every active node MUST forward on every micro-batch or DP/SP all-reduce hangs. Dummy zero tensors keep the FSDP graph aligned across DP ranks; backbone scatter on a placeholder mask matched zero times is a no-op (gradients are zero but the graph traverses). |
-| **Inference (no FSDP)** | The model `return {}` immediately. The `GenerationGraph` then **permissively skips** any outgoing edge whose `output:` key isn't in ctx — the destination still executes when its other inputs land. | No FSDP, no DP alignment. Skipping an empty forward saves real compute. Permissive routing handles text-only prompts in a multimodal FSM (e.g. `infer_understanding.yaml#prompt_to_text` with no `pixel_values`). |
+| **Inference (no FSDP)** | The model `return {}` immediately. The `GenerationGraph` then **permissively skips** any outgoing edge whose `output:` key isn't in ctx — the destination still executes when its other inputs land. | No FSDP, no DP alignment. Skipping an empty forward saves real compute. Permissive routing handles text-only prompts in a multimodal FSM (e.g. `graph_infer_und.yaml#prompt_to_text` with no `pixel_values`). |
 
 What you must implement:
 
@@ -203,7 +203,7 @@ These rules are enforced by the framework. Violate them and you'll fight the des
 17. **Sampling state (incl. CFG) is per-request runtime ctx, not graph state.** `temperature` / `top_p` / `cfg_weight` and friends are passed via `OmniModel.generate(request, *, sampling: dict)` and written into `ctx` (which **is** the mutable raw_batch during inference), alongside `past_key_values`. Backbones consume them locally:
     - **CFG** is a backbone-private batch-axis mechanism. When `cfg_weight != 1.0`, the backbone calls its own `build_cfg_uncond_inputs` hook, replicates `inputs_embeds` / `attention_mask` / `position_ids` to 2× along the batch dim (even rows = cond, odd rows = uncond), runs forward, splits logits, merges via `uncond + cfg_weight * (cond - uncond)`, samples, and feeds the next token back as 2× along batch. FSM / graph see batch=1× (= `parallel_size`). When the FSM exits `image_vq` state, the backbone discards the 2× KV cache (consistent with #13 "KV cache is module-managed").
     - **`build_cfg_uncond_inputs`** is an optional `OmniModule` hook. Default raises `NotImplementedError` — backbones that don't implement it are not allowed to receive `cfg_weight != 1.0` (generate-time validation throws `ValueError`). Pad / boundary token ids needed for uncond construction are taken from the backbone's tokenizer reference (typically borrowed from sibling `text_encoder` module via `set_tokenizer`).
-    - **`parallel_size`** is a backbone module's `PretrainedConfig` field (NOT a sampling parameter), and is **only supported in T2I mode** (`infer_t2i.yaml`). Interleave / understanding inference must run with `parallel_size = 1` because batch-dim expansion is incompatible with switching back to text states. The same `parallel_size` must be configured on the AR backbone and the VQ codec (e.g. `JanusLlama` and `JanusVQVAE`); `OmniModel` validates this at build time.
+    - **`parallel_size`** is a backbone module's `PretrainedConfig` field (NOT a sampling parameter), and is **only supported in T2I mode** (`graph_infer_gen.yaml`). Interleave / understanding inference must run with `parallel_size = 1` because batch-dim expansion is incompatible with switching back to text states. The same `parallel_size` must be configured on the AR backbone and the VQ codec (e.g. `JanusLlama` and `JanusVQVAE`); `OmniModel` validates this at build time.
 
     **Status**: target contract; current code does not yet implement inference CFG or `parallel_size`. To be implemented feature-by-feature.
 
@@ -386,29 +386,37 @@ The `text_encoder` extraction in `veomni/models/seed_omni/modules/janus/convert_
 
 ## Phase 5 — Wire into the YAML graph
 
-### YAML organisation: training file vs. inference file(s)
+### YAML organisation: base launcher + split module / graph files
 
-V2 splits configuration into a master **training YAML** and one or more **inference YAMLs** under `configs/seed_omni/<model>/`. The training YAML carries `modules` + `training_graph` (a flat list of edges); each inference YAML carries **only** a `generation_graph` block for one inference scenario. There is **no shared `nodes` / `edges` pool** — edge endpoints are self-describing `module[.method]` strings, and inference-only call-sites are written inline in the relevant `generation_graph` body. **There is no top-level `tokenizer_path`** — the tokenizer asset lives in the family's `text_encoder` module subfolder.
+SeedOmni V2 splits configuration into a **base launcher** plus per-purpose module / graph files under `configs/seed_omni/<model>/`. Both training and inference take the **same** `base.yaml`; the trainer reads its `model.*` block and the inferencer reads its `infer.*` block. `modules_*.yaml` carry per-module overrides; `graph_train.yaml` carries `training_graph` (a flat list of edges); each `graph_infer_*.yaml` carries **only** a `generation_graph` block for one inference scenario. There is **no shared `nodes` / `edges` pool** — edge endpoints are self-describing `module[.method]` strings, and inference-only call-sites are written inline in the relevant `generation_graph` body. **There is no top-level `tokenizer_path`** — the tokenizer asset lives in the family's `text_encoder` module subfolder.
+
+Key changes vs. the old monolithic launcher:
+- `accelerator` is a **top-level** peer of `model` / `data` / `train` (inference also needs FSDP), injected back onto `train.accelerator` for `BaseTrainer` compatibility.
+- `model.model_path` is a **split-checkpoint root folder** (one subdir per module).
+- Graphs and per-module overrides live in their own files, referenced by `model.modules` / `model.train_graph` (training) and `infer.modules` / `infer.infer_graph` / `infer.infer_type` (inference).
 
 ```
-configs/seed_omni/janus_1.3b/
-├── train_joint.yaml          # master config: modules + training_graph (flat edge list)
-├── infer_interleave.yaml     # generation_graph only — T2T+T2I mid-stream image generation
-├── infer_t2i.yaml            # generation_graph only — T2I-only (no preceding text)
-└── infer_understanding.yaml  # generation_graph only — I2T / VQA (uni-directional)
+configs/seed_omni/Janus/janus_1.3b/
+├── base.yaml                  # launcher: model / accelerator / data / train + infer block
+├── modules_train.yaml         # per-module training overrides (model / train / accelerator)
+├── graph_train.yaml           # training_graph (flat edge list)
+├── modules_infer.yaml         # per-module inference overrides (optional; default eager load)
+├── graph_infer_interleave.yaml  # generation_graph — T2T+T2I mid-stream image generation
+├── graph_infer_gen.yaml         # generation_graph — T2I-only (no preceding text)
+└── graph_infer_und.yaml         # generation_graph — I2T / VQA (uni-directional)
 ```
 
-Loading rules:
+Loading rules (driven by `OmniArguments`, parsed via `parse_omni_args`):
 
-- **Training only**: load just `train_joint.yaml`.
-- **Inference**: load `train.yaml` + the chosen `infer_<scenario>.yaml` via `OmniConfig._init(global_args, model_path, train_yaml_path, infer_yaml_path)` — train and infer `modules:` blocks are deep-merged per module name.
+- **Training**: `OmniArguments.load_omni_config()` → `OmniConfig.from_omni_args(global_args, model_path, modules, train_graph)`.
+- **Inference**: `OmniArguments.load_omni_infer_config()` → `OmniConfig.from_omni_args(..., infer_modules, infer_graph, generation_kwargs)` — train and infer module overrides are deep-merged per module name; modules default to eager load unless a module opts into FSDP.
 
 ```python
-cfg = OmniConfig.from_paths(
+cfg = OmniConfig.from_omni_args(
+    global_args=args._to_base_args(),   # OmniArguments -> VeOmniArguments base
     model_path="/tmp/janus_1.3b_split",
-    tokenizer_path="/tmp/janus_1.3b_split",
-    train_yaml_path="configs/seed_omni/janus_1.3b/train_joint.yaml",
-    infer_yaml_path="configs/seed_omni/janus_1.3b/infer_interleave.yaml",
+    modules="configs/seed_omni/Janus/janus_1.3b/modules_train.yaml",
+    train_graph="configs/seed_omni/Janus/janus_1.3b/graph_train.yaml",
 )
 ```
 
@@ -416,14 +424,16 @@ Naming conventions:
 
 | Pattern | Example | Purpose |
 |---|---|---|
-| `train_<scope>.yaml` | `train_joint.yaml`, `train_und_only.yaml` | Master file — defines `modules` AND a specific `training_graph` edge list |
-| `infer_<scenario>.yaml` | `infer_interleave.yaml`, `infer_t2i.yaml`, `infer_understanding.yaml` | Scenario-specific FSM — `generation_graph` only |
+| `base.yaml` | `base.yaml` | Launcher — `model` / top-level `accelerator` / `data` / `train` + `infer` block; references the files below |
+| `modules_<scope>.yaml` | `modules_train.yaml`, `modules_infer.yaml` | Per-module overrides (`model` / `train` / `accelerator`), deep-merged per module name |
+| `graph_train.yaml` | `graph_train.yaml` | Defines the `training_graph` edge list |
+| `graph_infer_<scenario>.yaml` | `graph_infer_interleave.yaml`, `graph_infer_gen.yaml`, `graph_infer_und.yaml` | Scenario-specific FSM — `generation_graph` only |
 
-**Inference-only call-sites are written inline in the inference YAML's `generation_graph` bodies** (boundary-token emitters, feedback edges, body-terminal sinks). There is no shared pool to redeclare; each `{from, to}` edge endpoint is self-describing.
+**Inference-only call-sites are written inline in the inference graph YAML's `generation_graph` bodies** (boundary-token emitters, feedback edges, body-terminal sinks). There is no shared pool to redeclare; each `{from, to}` edge endpoint is self-describing.
 
 ### What goes in each YAML
 
-Editing `train_<scope>.yaml`:
+Editing `modules_train.yaml` / `graph_train.yaml`:
 
 1. **`modules:`** — add an entry with `weights_path` (or `config_path`) and any module-specific knobs (`freeze`, `gradient_checkpointing`, etc). **Don't write `model_type`** — it's read from the config.json at the path. The tokenizer (if needed) sits inside one of the modules' subfolders, typically `<family>_text_encoder/tokenizer/`.
 
@@ -448,7 +458,7 @@ Editing `train_<scope>.yaml`:
 
 3. **Comment the DAG layout** at the top of the YAML (ASCII diagram or short description) — this is the canonical reference for readers.
 
-Editing `infer_<scenario>.yaml`:
+Editing `graph_infer_<scenario>.yaml`:
 
 4. **`generation_graph:`** — only this block. Each `state.body` is an ordered list of **inline `{from, to}` edge dicts** (endpoints as `module[.method]` strings, bare module → `.generate`); `from` nodes execute on first encounter; edges route ctx (permissively — see below). Inference-only call-sites (boundary-token emitters like `bar_foo.emit_image_start`, body-terminal sinks `{from: backbone, to: end}`) are written inline here — there is no shared pool to redeclare. A body-terminal sink (`{from: <node>, to: end}`) is required for FSM bodies where a node executes but has no same-body consumer (e.g. the backbone updating its KV cache; its output is consumed by the *next* state).
 
@@ -508,12 +518,12 @@ Run all four checks in order. Failing any one means stop and fix before continui
 ```bash
 source .venv/bin/activate
 
-# 1. Topo sort + FSM body resolution (no torch needed for this).  Pass the master
-#    training YAML first; subsequent files deep-merge over it.
-python scripts/visualize_omni_graph.py configs/seed_omni/<model>/train_<scope>.yaml --only train
-python scripts/visualize_omni_graph.py \
-    configs/seed_omni/<model>/train_<scope>.yaml \
-    configs/seed_omni/<model>/infer_<scenario>.yaml --only fsm
+# 1. Topo sort + FSM body resolution (no torch needed for this).  Pass the single
+#    launcher base.yaml; the script renders the training DAG plus one FSM per
+#    entry in infer.infer_graph into graphs/<base_stem>/.
+python scripts/visualize_omni_graph.py configs/seed_omni/<model>/base.yaml
+# Browser-renderable HTML instead of raw Mermaid:
+python scripts/visualize_omni_graph.py configs/seed_omni/<model>/base.yaml --visualize.format html
 
 # 2. Functional smoke test of the new module (training + inference paths, dummy fallback).
 python -c "from veomni.models.seed_omni import BarFoo, BarFooConfig; ..."
