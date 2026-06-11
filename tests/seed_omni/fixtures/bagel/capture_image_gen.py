@@ -237,6 +237,10 @@ def _forward_flow_base(
     timestep: torch.Tensor,
     latent_input: dict[str, torch.Tensor],
     past_key_values: Any,
+    packed_position_ids: torch.Tensor | None = None,
+    packed_indexes: torch.Tensor | None = None,
+    key_values_lens: torch.Tensor | None = None,
+    packed_key_value_indexes: torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor]:
     packed_text_ids = latent_input["packed_text_ids"]
     packed_text_indexes = latent_input["packed_text_indexes"]
@@ -267,11 +271,17 @@ def _forward_flow_base(
     output = model.language_model.forward_inference(
         packed_query_sequence=packed_sequence,
         query_lens=packed_seqlens,
-        packed_query_position_ids=latent_input["packed_position_ids"],
-        packed_query_indexes=latent_input["packed_indexes"],
+        packed_query_position_ids=packed_position_ids
+        if packed_position_ids is not None
+        else latent_input["packed_position_ids"],
+        packed_query_indexes=packed_indexes if packed_indexes is not None else latent_input["packed_indexes"],
         past_key_values=past_key_values,
-        key_values_lens=latent_input["key_values_lens"],
-        packed_key_value_indexes=latent_input["packed_key_value_indexes"],
+        key_values_lens=key_values_lens if key_values_lens is not None else latent_input["key_values_lens"],
+        packed_key_value_indexes=(
+            packed_key_value_indexes
+            if packed_key_value_indexes is not None
+            else latent_input["packed_key_value_indexes"]
+        ),
         update_past_key_values=False,
         is_causal=False,
         **extra_inputs,
@@ -285,10 +295,63 @@ def _forward_flow_base(
     }
 
 
+def _combine_cfg_velocity(
+    base_velocity: torch.Tensor,
+    cfg_text_velocity: torch.Tensor | None,
+    cfg_img_velocity: torch.Tensor | None,
+    *,
+    cfg_text_scale: float,
+    cfg_img_scale: float,
+    cfg_renorm_min: float,
+    cfg_renorm_type: str,
+) -> torch.Tensor:
+    if cfg_text_scale <= 1.0:
+        return base_velocity
+    if cfg_text_velocity is None:
+        raise ValueError("cfg_text_velocity is required when cfg_text_scale > 1.0.")
+    if cfg_img_scale > 1.0 and cfg_img_velocity is None:
+        raise ValueError("cfg_img_velocity is required when cfg_img_scale > 1.0.")
+
+    if cfg_renorm_type == "text_channel":
+        text_guided = cfg_text_velocity + cfg_text_scale * (base_velocity - cfg_text_velocity)
+        norm_base = torch.norm(base_velocity, dim=-1, keepdim=True)
+        norm_text_guided = torch.norm(text_guided, dim=-1, keepdim=True)
+        scale = (norm_base / (norm_text_guided + 1e-8)).clamp(min=cfg_renorm_min, max=1.0)
+        text_guided = text_guided * scale
+        if cfg_img_scale > 1.0:
+            return cfg_img_velocity + cfg_img_scale * (text_guided - cfg_img_velocity)
+        return text_guided
+
+    text_guided = cfg_text_velocity + cfg_text_scale * (base_velocity - cfg_text_velocity)
+    if cfg_img_scale > 1.0:
+        guided = cfg_img_velocity + cfg_img_scale * (text_guided - cfg_img_velocity)
+    else:
+        guided = text_guided
+    if cfg_renorm_type == "global":
+        norm_base = torch.norm(base_velocity)
+        norm_guided = torch.norm(guided)
+    elif cfg_renorm_type == "channel":
+        norm_base = torch.norm(base_velocity, dim=-1, keepdim=True)
+        norm_guided = torch.norm(guided, dim=-1, keepdim=True)
+    else:
+        raise NotImplementedError(f"{cfg_renorm_type} is not supported")
+    scale = (norm_base / (norm_guided + 1e-8)).clamp(min=cfg_renorm_min, max=1.0)
+    return guided * scale
+
+
+def _cfg_active(args: argparse.Namespace, timestep: torch.Tensor) -> bool:
+    if args.cfg_text_scale <= 1.0 and args.cfg_img_scale <= 1.0:
+        return False
+    t_value = float(timestep.detach().reshape(-1)[0].item())
+    return t_value > float(args.cfg_interval_start) and t_value <= float(args.cfg_interval_end)
+
+
 @torch.no_grad()
 def capture(args: argparse.Namespace) -> dict[str, Any]:
-    if args.cfg_text_scale != 1.0 or args.cfg_img_scale != 1.0:
-        raise ValueError("Base image-generation fixture capture requires CFG disabled: both CFG scales must be 1.0.")
+    if args.cfg_img_scale > 1.0 and args.cfg_text_scale <= 1.0:
+        raise ValueError(
+            "Official BAGEL applies CFG-image after CFG-text; use cfg_text_scale > 1.0 with cfg_img_scale."
+        )
     if args.num_timesteps < 2:
         raise ValueError("num_timesteps must be at least 2 to capture the first Euler update.")
 
@@ -322,6 +385,26 @@ def capture(args: argparse.Namespace) -> dict[str, Any]:
         new_token_ids=new_token_ids,
     )
     latent_input = _move_tensors(latent_input, device)
+    cfg_text_input = None
+    cfg_text_past_key_values = None
+    if args.cfg_text_scale > 1.0:
+        cfg_text_past_key_values = official["NaiveCache"](model.config.llm_config.num_hidden_layers)
+        cfg_text_input = model.prepare_vae_latent_cfg(
+            curr_kvlens=[0],
+            curr_rope=[0],
+            image_sizes=[(args.image_height, args.image_width)],
+        )
+        cfg_text_input = _move_tensors(cfg_text_input, device)
+    cfg_img_input = None
+    cfg_img_past_key_values = None
+    if args.cfg_img_scale > 1.0:
+        cfg_img_past_key_values = past_key_values
+        cfg_img_input = model.prepare_vae_latent_cfg(
+            curr_kvlens=kv_lens_after_prompt,
+            curr_rope=ropes_after_prompt,
+            image_sizes=[(args.image_height, args.image_width)],
+        )
+        cfg_img_input = _move_tensors(cfg_img_input, device)
 
     timestep_fields = _first_flow_timestep(args.num_timesteps, args.timestep_shift, device)
     flow_steps = _flow_step_count(args, int(timestep_fields["dts"].numel()))
@@ -334,9 +417,55 @@ def capture(args: argparse.Namespace) -> dict[str, Any]:
             latent_input=latent_input,
             past_key_values=past_key_values,
         )
-    x_t1 = x_t0 - flow_output["velocity"].to(x_t0.device) * timestep_fields["dt"][0]
+        cfg_text_flow_output = (
+            _forward_flow_base(
+                model,
+                x_t=x_t0,
+                timestep=timestep_fields["timestep"],
+                latent_input=latent_input,
+                past_key_values=cfg_text_past_key_values,
+                packed_position_ids=cfg_text_input["cfg_packed_position_ids"] if cfg_text_input is not None else None,
+                packed_indexes=cfg_text_input["cfg_packed_query_indexes"] if cfg_text_input is not None else None,
+                key_values_lens=cfg_text_input["cfg_key_values_lens"] if cfg_text_input is not None else None,
+                packed_key_value_indexes=(
+                    cfg_text_input["cfg_packed_key_value_indexes"] if cfg_text_input is not None else None
+                ),
+            )
+            if args.cfg_text_scale > 1.0 and _cfg_active(args, timestep_fields["timestep"])
+            else None
+        )
+        cfg_img_flow_output = (
+            _forward_flow_base(
+                model,
+                x_t=x_t0,
+                timestep=timestep_fields["timestep"],
+                latent_input=latent_input,
+                past_key_values=cfg_img_past_key_values,
+                packed_position_ids=cfg_img_input["cfg_packed_position_ids"] if cfg_img_input is not None else None,
+                packed_indexes=cfg_img_input["cfg_packed_query_indexes"] if cfg_img_input is not None else None,
+                key_values_lens=cfg_img_input["cfg_key_values_lens"] if cfg_img_input is not None else None,
+                packed_key_value_indexes=(
+                    cfg_img_input["cfg_packed_key_value_indexes"] if cfg_img_input is not None else None
+                ),
+            )
+            if args.cfg_img_scale > 1.0 and _cfg_active(args, timestep_fields["timestep"])
+            else None
+        )
+    one_step_velocity = _combine_cfg_velocity(
+        flow_output["velocity"],
+        None if cfg_text_flow_output is None else cfg_text_flow_output["velocity"],
+        None if cfg_img_flow_output is None else cfg_img_flow_output["velocity"],
+        cfg_text_scale=args.cfg_text_scale,
+        cfg_img_scale=args.cfg_img_scale,
+        cfg_renorm_min=args.cfg_renorm_min,
+        cfg_renorm_type=args.cfg_renorm_type,
+    )
+    x_t1 = x_t0 - one_step_velocity.to(x_t0.device) * timestep_fields["dt"][0]
     x_t_final = x_t0
     last_flow_output = flow_output
+    last_cfg_text_flow_output = cfg_text_flow_output
+    last_cfg_img_flow_output = cfg_img_flow_output
+    last_velocity = one_step_velocity
     # Capture the official Euler chain as the graph-level oracle for multi-step denoise parity.
     for step_index in range(flow_steps):
         timestep = timestep_fields["timesteps"][step_index : step_index + 1]
@@ -348,7 +477,54 @@ def capture(args: argparse.Namespace) -> dict[str, Any]:
                 latent_input=latent_input,
                 past_key_values=past_key_values,
             )
-        x_t_final = x_t_final - last_flow_output["velocity"].to(x_t_final.device) * timestep_fields["dts"][step_index]
+            last_cfg_text_flow_output = (
+                _forward_flow_base(
+                    model,
+                    x_t=x_t_final,
+                    timestep=timestep,
+                    latent_input=latent_input,
+                    past_key_values=cfg_text_past_key_values,
+                    packed_position_ids=cfg_text_input["cfg_packed_position_ids"]
+                    if cfg_text_input is not None
+                    else None,
+                    packed_indexes=cfg_text_input["cfg_packed_query_indexes"] if cfg_text_input is not None else None,
+                    key_values_lens=cfg_text_input["cfg_key_values_lens"] if cfg_text_input is not None else None,
+                    packed_key_value_indexes=(
+                        cfg_text_input["cfg_packed_key_value_indexes"] if cfg_text_input is not None else None
+                    ),
+                )
+                if args.cfg_text_scale > 1.0 and _cfg_active(args, timestep)
+                else None
+            )
+            last_cfg_img_flow_output = (
+                _forward_flow_base(
+                    model,
+                    x_t=x_t_final,
+                    timestep=timestep,
+                    latent_input=latent_input,
+                    past_key_values=cfg_img_past_key_values,
+                    packed_position_ids=cfg_img_input["cfg_packed_position_ids"]
+                    if cfg_img_input is not None
+                    else None,
+                    packed_indexes=cfg_img_input["cfg_packed_query_indexes"] if cfg_img_input is not None else None,
+                    key_values_lens=cfg_img_input["cfg_key_values_lens"] if cfg_img_input is not None else None,
+                    packed_key_value_indexes=(
+                        cfg_img_input["cfg_packed_key_value_indexes"] if cfg_img_input is not None else None
+                    ),
+                )
+                if args.cfg_img_scale > 1.0 and _cfg_active(args, timestep)
+                else None
+            )
+        last_velocity = _combine_cfg_velocity(
+            last_flow_output["velocity"],
+            None if last_cfg_text_flow_output is None else last_cfg_text_flow_output["velocity"],
+            None if last_cfg_img_flow_output is None else last_cfg_img_flow_output["velocity"],
+            cfg_text_scale=args.cfg_text_scale,
+            cfg_img_scale=args.cfg_img_scale,
+            cfg_renorm_min=args.cfg_renorm_min,
+            cfg_renorm_type=args.cfg_renorm_type,
+        )
+        x_t_final = x_t_final - last_velocity.to(x_t_final.device) * timestep_fields["dts"][step_index]
 
     return {
         "metadata": {
@@ -384,6 +560,8 @@ def capture(args: argparse.Namespace) -> dict[str, Any]:
             "kv_lens_after_prompt": list(kv_lens_after_prompt),
             "ropes_after_prompt": list(ropes_after_prompt),
             "latent": _cpu_tensors(latent_input),
+            "cfg_text": None if cfg_text_input is None else _cpu_tensors(cfg_text_input),
+            "cfg_img": None if cfg_img_input is None else _cpu_tensors(cfg_img_input),
             "timesteps": {
                 "timesteps": timestep_fields["timesteps"].detach().cpu(),
                 "dts": timestep_fields["dts"].detach().cpu(),
@@ -397,13 +575,33 @@ def capture(args: argparse.Namespace) -> dict[str, Any]:
             "packed_sequence": flow_output["packed_sequence"].detach().cpu(),
             "latent_embeds": flow_output["latent_embeds"].detach().cpu(),
             "hidden_state": flow_output["hidden_state"].detach().cpu(),
-            "velocity": flow_output["velocity"].detach().cpu(),
+            "base_velocity": flow_output["velocity"].detach().cpu(),
+            "cfg_text_hidden_state": None
+            if cfg_text_flow_output is None
+            else cfg_text_flow_output["hidden_state"].detach().cpu(),
+            "cfg_text_velocity": None
+            if cfg_text_flow_output is None
+            else cfg_text_flow_output["velocity"].detach().cpu(),
+            "cfg_img_hidden_state": None
+            if cfg_img_flow_output is None
+            else cfg_img_flow_output["hidden_state"].detach().cpu(),
+            "cfg_img_velocity": None
+            if cfg_img_flow_output is None
+            else cfg_img_flow_output["velocity"].detach().cpu(),
+            "velocity": one_step_velocity.detach().cpu(),
             "x_t1": x_t1.detach().cpu(),
         },
         "multi_step": {
             "flow_steps": flow_steps,
             "x_t_final": x_t_final.detach().cpu(),
-            "last_velocity": last_flow_output["velocity"].detach().cpu(),
+            "last_base_velocity": last_flow_output["velocity"].detach().cpu(),
+            "last_cfg_text_velocity": None
+            if last_cfg_text_flow_output is None
+            else last_cfg_text_flow_output["velocity"].detach().cpu(),
+            "last_cfg_img_velocity": None
+            if last_cfg_img_flow_output is None
+            else last_cfg_img_flow_output["velocity"].detach().cpu(),
+            "last_velocity": last_velocity.detach().cpu(),
         },
         "tolerances": {
             "bf16": {

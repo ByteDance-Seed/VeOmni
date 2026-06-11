@@ -48,7 +48,7 @@ class BagelQwen2MoTModuleMixin(ModuleMixin):
             raise ValueError("BagelQwen2MoT.generate requires conversation_list.")
         image_gen_item = self._ready_image_gen_item(conversation_list)
         if image_gen_item is not None:
-            return self._decode_image_flow(image_gen_item, conversation_list)
+            return self._decode_image_flow(image_gen_item, conversation_list, generation_kwargs)
 
         if self._is_image_generation_request(conversation_list, generation_kwargs):
             if self._past_key_values is None:
@@ -128,6 +128,7 @@ class BagelQwen2MoTModuleMixin(ModuleMixin):
         self,
         item: ConversationItem,
         conversation_list: list[ConversationItem],
+        generation_kwargs: Optional[Dict[str, Any]],
     ) -> Dict[str, Any]:
         packed_query_sequence = item.value
         if not torch.is_tensor(packed_query_sequence):
@@ -171,12 +172,107 @@ class BagelQwen2MoTModuleMixin(ModuleMixin):
         hidden_states = outputs.packed_query_sequence
         item.value = hidden_states
         item.meta["flow_hidden_ready"] = True
-        return {
+        result: Dict[str, Any] = {
             "conversation_list": conversation_list,
             "bagel_last_hidden_state": hidden_states.detach(),
             "past_key_values": self._past_key_values,
             "key_values_lens": None if self._key_values_lens is None else self._key_values_lens.detach(),
         }
+        if self._cfg_text_active(item, generation_kwargs):
+            cfg_text_hidden_states = self._decode_cfg_text_image_flow(
+                item,
+                packed_query_sequence=packed_query_sequence,
+                query_lens=query_lens,
+                vae_token_indexes=vae_token_indexes,
+                text_indexes=text_indexes,
+            )
+            item.meta["cfg_text_hidden_state"] = cfg_text_hidden_states.detach()
+            result["bagel_last_cfg_text_hidden_state"] = cfg_text_hidden_states.detach()
+        if self._cfg_img_active(item, generation_kwargs):
+            cfg_img_hidden_states = self._decode_cfg_img_image_flow(
+                item,
+                packed_query_sequence=packed_query_sequence,
+                query_lens=query_lens,
+                vae_token_indexes=vae_token_indexes,
+                text_indexes=text_indexes,
+            )
+            item.meta["cfg_img_hidden_state"] = cfg_img_hidden_states.detach()
+            result["bagel_last_cfg_img_hidden_state"] = cfg_img_hidden_states.detach()
+        return result
+
+    def _decode_cfg_text_image_flow(
+        self,
+        item: ConversationItem,
+        *,
+        packed_query_sequence: torch.Tensor,
+        query_lens: torch.Tensor,
+        vae_token_indexes: torch.Tensor,
+        text_indexes: torch.Tensor,
+    ) -> torch.Tensor:
+        position_ids = self._prompt_meta_tensor(item, ("cfg_text_position_ids",), None, dtype=torch.long)
+        query_indexes = self._prompt_meta_tensor(item, ("cfg_text_sequence_indexes",), None, dtype=torch.long)
+        key_values_lens = self._prompt_meta_tensor(item, ("cfg_text_key_value_lens",), [0], dtype=torch.int32)
+        key_value_indexes = self._prompt_meta_tensor(item, ("cfg_text_context_indexes",), [], dtype=torch.long)
+        if position_ids is None:
+            position_ids = torch.zeros(int(packed_query_sequence.shape[0]), device=self.device, dtype=torch.long)
+        if query_indexes is None:
+            query_indexes = torch.arange(int(packed_query_sequence.shape[0]), device=self.device, dtype=torch.long)
+
+        output = self._forward_packed_inference(
+            packed_query_sequence=packed_query_sequence,
+            query_lens=query_lens,
+            packed_query_position_ids=position_ids,
+            packed_query_indexes=query_indexes,
+            past_key_values=None,
+            key_values_lens=key_values_lens,
+            packed_key_value_indexes=key_value_indexes,
+            update_past_key_values=False,
+            is_causal=False,
+            mode="gen",
+            packed_vae_token_indexes=vae_token_indexes,
+            packed_text_indexes=text_indexes,
+        )
+        return output.packed_query_sequence
+
+    def _decode_cfg_img_image_flow(
+        self,
+        item: ConversationItem,
+        *,
+        packed_query_sequence: torch.Tensor,
+        query_lens: torch.Tensor,
+        vae_token_indexes: torch.Tensor,
+        text_indexes: torch.Tensor,
+    ) -> torch.Tensor:
+        position_ids = self._prompt_meta_tensor(item, ("cfg_img_position_ids",), None, dtype=torch.long)
+        query_indexes = self._prompt_meta_tensor(item, ("cfg_img_sequence_indexes",), None, dtype=torch.long)
+        key_values_lens = self._prompt_meta_tensor(item, ("cfg_img_key_value_lens",), None, dtype=torch.int32)
+        key_value_indexes = self._prompt_meta_tensor(item, ("cfg_img_context_indexes",), None, dtype=torch.long)
+        if position_ids is None:
+            position_ids = self._prompt_meta_tensor(item, ("position_ids",), None, dtype=torch.long)
+        if query_indexes is None:
+            query_indexes = self._prompt_meta_tensor(item, ("sequence_indexes",), None, dtype=torch.long)
+        if key_values_lens is None:
+            key_values_lens = self._prompt_meta_tensor(item, ("key_value_lens",), None, dtype=torch.int32)
+        if key_value_indexes is None:
+            key_value_indexes = self._prompt_meta_tensor(item, ("context_indexes",), [], dtype=torch.long)
+        if position_ids is None or query_indexes is None or key_values_lens is None:
+            raise ValueError("BAGEL CFG image guidance requires cfg_img or base prompt latent metadata.")
+
+        output = self._forward_packed_inference(
+            packed_query_sequence=packed_query_sequence,
+            query_lens=query_lens,
+            packed_query_position_ids=position_ids,
+            packed_query_indexes=query_indexes,
+            past_key_values=self._past_key_values,
+            key_values_lens=key_values_lens,
+            packed_key_value_indexes=key_value_indexes,
+            update_past_key_values=False,
+            is_causal=False,
+            mode="gen",
+            packed_vae_token_indexes=vae_token_indexes,
+            packed_text_indexes=text_indexes,
+        )
+        return output.packed_query_sequence
 
     def _decode_tail(self, tail: ConversationItem) -> torch.Tensor:
         packed_query_sequence = tail.value
@@ -296,6 +392,47 @@ class BagelQwen2MoTModuleMixin(ModuleMixin):
         if generation_kwargs and generation_kwargs.get("infer_mode") == "gen":
             return True
         return any(item.meta.get("bagel_role") == "image_gen_latent" for item in conversation_list)
+
+    def _cfg_text_active(
+        self,
+        item: ConversationItem,
+        generation_kwargs: Optional[Dict[str, Any]],
+    ) -> bool:
+        cfg_text_scale = float(item.meta.get("cfg_text_scale", (generation_kwargs or {}).get("cfg_text_scale", 1.0)))
+        if cfg_text_scale <= 1.0:
+            return False
+        interval = item.meta.get("cfg_interval", (generation_kwargs or {}).get("cfg_interval", [0.0, 1.0]))
+        if not isinstance(interval, (list, tuple)) or len(interval) < 2:
+            interval = [0.0, 1.0]
+        t_value = self._current_timestep_value(item)
+        return t_value > float(interval[0]) and t_value <= float(interval[1])
+
+    def _cfg_img_active(
+        self,
+        item: ConversationItem,
+        generation_kwargs: Optional[Dict[str, Any]],
+    ) -> bool:
+        cfg_img_scale = float(item.meta.get("cfg_img_scale", (generation_kwargs or {}).get("cfg_img_scale", 1.0)))
+        if cfg_img_scale <= 1.0:
+            return False
+        interval = item.meta.get("cfg_interval", (generation_kwargs or {}).get("cfg_interval", [0.0, 1.0]))
+        if not isinstance(interval, (list, tuple)) or len(interval) < 2:
+            interval = [0.0, 1.0]
+        t_value = self._current_timestep_value(item)
+        return t_value > float(interval[0]) and t_value <= float(interval[1])
+
+    @staticmethod
+    def _current_timestep_value(item: ConversationItem) -> float:
+        step_index = int(item.meta.get("flow_step_index", 0))
+        timesteps = item.meta.get("timesteps")
+        if torch.is_tensor(timesteps):
+            flat = timesteps.detach().reshape(-1)
+            if flat.numel() > 0:
+                return float(flat[min(step_index, flat.numel() - 1)].item())
+        timestep = item.meta.get("timestep")
+        if torch.is_tensor(timestep):
+            return float(timestep.detach().reshape(-1)[0].item())
+        return 1.0
 
     def _ready_image_gen_item(self, conversation_list: list[ConversationItem]) -> Optional[ConversationItem]:
         for item in conversation_list:

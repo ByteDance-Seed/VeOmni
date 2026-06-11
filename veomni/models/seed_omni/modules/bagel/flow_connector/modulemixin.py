@@ -67,6 +67,8 @@ class BagelFlowConnectorModuleMixin(ModuleMixin):
         self,
         conversation_list: Optional[list[ConversationItem]] = None,
         bagel_last_hidden_state: Optional[torch.Tensor] = None,
+        bagel_last_cfg_text_hidden_state: Optional[torch.Tensor] = None,
+        bagel_last_cfg_img_hidden_state: Optional[torch.Tensor] = None,
         **kwargs: Any,
     ) -> Dict[str, Any]:
         del kwargs
@@ -77,7 +79,30 @@ class BagelFlowConnectorModuleMixin(ModuleMixin):
 
         velocity_all = self.decode_velocity(hidden_states=hidden_states)["velocity"]
         vae_token_indexes = self._meta_tensor(item, "vae_token_indexes", dtype=torch.long)
-        velocity = velocity_all[vae_token_indexes]
+        base_velocity = velocity_all[vae_token_indexes]
+        velocity = base_velocity
+        cfg_text_velocity = None
+        cfg_img_velocity = None
+        cfg_text_is_active = self._cfg_text_active(item)
+        cfg_img_is_active = self._cfg_img_active(item)
+        if cfg_img_is_active and not cfg_text_is_active:
+            raise ValueError(
+                "Official BAGEL applies CFG-image after CFG-text; use cfg_text_scale > 1.0 with cfg_img_scale."
+            )
+        if cfg_text_is_active:
+            cfg_text_hidden_states = item.meta.get("cfg_text_hidden_state", bagel_last_cfg_text_hidden_state)
+            if not torch.is_tensor(cfg_text_hidden_states):
+                raise ValueError("BAGEL CFG text guidance requires cfg_text hidden states from qwen2_mot.")
+            cfg_text_velocity_all = self.decode_velocity(hidden_states=cfg_text_hidden_states)["velocity"]
+            cfg_text_velocity = cfg_text_velocity_all[vae_token_indexes]
+        if cfg_img_is_active:
+            cfg_img_hidden_states = item.meta.get("cfg_img_hidden_state", bagel_last_cfg_img_hidden_state)
+            if not torch.is_tensor(cfg_img_hidden_states):
+                raise ValueError("BAGEL CFG image guidance requires cfg_img hidden states from qwen2_mot.")
+            cfg_img_velocity_all = self.decode_velocity(hidden_states=cfg_img_hidden_states)["velocity"]
+            cfg_img_velocity = cfg_img_velocity_all[vae_token_indexes]
+        if cfg_text_velocity is not None:
+            velocity = self._combine_cfg_velocity(base_velocity, cfg_text_velocity, cfg_img_velocity, item)
         current_latents = self._current_latents(item)
         dt = self._current_dt(item)
         # Keep the Euler update shape-compatible with official BAGEL; dt is intentionally a 0-dim scalar.
@@ -86,6 +111,9 @@ class BagelFlowConnectorModuleMixin(ModuleMixin):
         step_index = int(item.meta.get("flow_step_index", 0)) + 1
         item.value = next_latents.detach()
         item.meta["flow_step_index"] = step_index
+        item.meta["base_velocity"] = base_velocity.detach()
+        item.meta["cfg_text_velocity"] = None if cfg_text_velocity is None else cfg_text_velocity.detach()
+        item.meta["cfg_img_velocity"] = None if cfg_img_velocity is None else cfg_img_velocity.detach()
         item.meta["velocity"] = velocity.detach()
         item.meta["next_latents"] = next_latents.detach()
         item.meta.pop("flow_packed_sequence_ready", None)
@@ -93,6 +121,9 @@ class BagelFlowConnectorModuleMixin(ModuleMixin):
 
         output: Dict[str, Any] = {
             "conversation_list": conversation_list,
+            "bagel_last_base_velocity": base_velocity.detach(),
+            "bagel_last_cfg_text_velocity": None if cfg_text_velocity is None else cfg_text_velocity.detach(),
+            "bagel_last_cfg_img_velocity": None if cfg_img_velocity is None else cfg_img_velocity.detach(),
             "bagel_last_velocity": velocity.detach(),
             "bagel_last_x_t": next_latents.detach(),
         }
@@ -108,6 +139,7 @@ class BagelFlowConnectorModuleMixin(ModuleMixin):
         kwargs = generation_kwargs or {}
         if "max_flow_steps" in kwargs:
             item.meta["max_flow_steps"] = int(kwargs["max_flow_steps"])
+        self._ensure_cfg_metadata(item, kwargs)
         if not torch.is_tensor(item.meta.get("timesteps")) or not torch.is_tensor(item.meta.get("dts")):
             num_timesteps = int(kwargs.get("num_timesteps", 50))
             if num_timesteps < 2:
@@ -172,6 +204,8 @@ class BagelFlowConnectorModuleMixin(ModuleMixin):
             torch.arange(int(kv_len.item()), device=self.device, dtype=torch.long),
         )
         item.meta.setdefault("flow_step_index", 0)
+        self._ensure_cfg_text_latent_metadata(item, sequence_length)
+        self._ensure_cfg_img_latent_metadata(item)
 
     def _image_gen_item(
         self,
@@ -225,6 +259,115 @@ class BagelFlowConnectorModuleMixin(ModuleMixin):
         if torch.is_tensor(dt):
             return dt.detach().reshape(-1)[0].to(device=self.device)
         raise ValueError("BAGEL image generation item requires dt metadata.")
+
+    def _cfg_text_active(self, item: ConversationItem) -> bool:
+        cfg_text_scale = float(item.meta.get("cfg_text_scale", 1.0))
+        if cfg_text_scale <= 1.0:
+            return False
+        t_value = self._current_timestep_value(item)
+        interval = item.meta.get("cfg_interval", [0.0, 1.0])
+        if not isinstance(interval, (list, tuple)) or len(interval) < 2:
+            interval = [0.0, 1.0]
+        return t_value > float(interval[0]) and t_value <= float(interval[1])
+
+    def _cfg_img_active(self, item: ConversationItem) -> bool:
+        cfg_img_scale = float(item.meta.get("cfg_img_scale", 1.0))
+        if cfg_img_scale <= 1.0:
+            return False
+        t_value = self._current_timestep_value(item)
+        interval = item.meta.get("cfg_interval", [0.0, 1.0])
+        if not isinstance(interval, (list, tuple)) or len(interval) < 2:
+            interval = [0.0, 1.0]
+        return t_value > float(interval[0]) and t_value <= float(interval[1])
+
+    def _combine_cfg_velocity(
+        self,
+        base_velocity: torch.Tensor,
+        cfg_text_velocity: torch.Tensor,
+        cfg_img_velocity: Optional[torch.Tensor],
+        item: ConversationItem,
+    ) -> torch.Tensor:
+        cfg_img_scale = float(item.meta.get("cfg_img_scale", 1.0))
+        if cfg_img_scale > 1.0 and cfg_img_velocity is None:
+            raise ValueError("BAGEL CFG image guidance requires cfg_img velocity.")
+        cfg_text_scale = float(item.meta.get("cfg_text_scale", 1.0))
+        cfg_renorm_min = float(item.meta.get("cfg_renorm_min", 0.0))
+        cfg_renorm_type = str(item.meta.get("cfg_renorm_type", "global"))
+
+        if cfg_renorm_type == "text_channel":
+            text_guided = cfg_text_velocity + cfg_text_scale * (base_velocity - cfg_text_velocity)
+            norm_base = torch.norm(base_velocity, dim=-1, keepdim=True)
+            norm_text_guided = torch.norm(text_guided, dim=-1, keepdim=True)
+            scale = (norm_base / (norm_text_guided + 1e-8)).clamp(min=cfg_renorm_min, max=1.0)
+            text_guided = text_guided * scale
+            if cfg_img_scale > 1.0:
+                return cfg_img_velocity + cfg_img_scale * (text_guided - cfg_img_velocity)
+            return text_guided
+
+        text_guided = cfg_text_velocity + cfg_text_scale * (base_velocity - cfg_text_velocity)
+        if cfg_img_scale > 1.0:
+            guided = cfg_img_velocity + cfg_img_scale * (text_guided - cfg_img_velocity)
+        else:
+            guided = text_guided
+        if cfg_renorm_type == "global":
+            norm_base = torch.norm(base_velocity)
+            norm_guided = torch.norm(guided)
+        elif cfg_renorm_type == "channel":
+            norm_base = torch.norm(base_velocity, dim=-1, keepdim=True)
+            norm_guided = torch.norm(guided, dim=-1, keepdim=True)
+        else:
+            raise NotImplementedError(f"{cfg_renorm_type} is not supported")
+        scale = (norm_base / (norm_guided + 1e-8)).clamp(min=cfg_renorm_min, max=1.0)
+        return guided * scale
+
+    def _ensure_cfg_metadata(self, item: ConversationItem, kwargs: Dict[str, Any]) -> None:
+        for key, default in (
+            ("cfg_text_scale", 1.0),
+            ("cfg_img_scale", 1.0),
+            ("cfg_renorm_min", 0.0),
+        ):
+            if key in kwargs and key not in item.meta:
+                item.meta[key] = float(kwargs[key])
+            else:
+                item.meta.setdefault(key, default)
+        if "cfg_interval" in kwargs and "cfg_interval" not in item.meta:
+            item.meta["cfg_interval"] = list(kwargs["cfg_interval"])
+        else:
+            item.meta.setdefault("cfg_interval", [0.0, 1.0])
+        if "cfg_renorm_type" in kwargs and "cfg_renorm_type" not in item.meta:
+            item.meta["cfg_renorm_type"] = str(kwargs["cfg_renorm_type"])
+        else:
+            item.meta.setdefault("cfg_renorm_type", "global")
+
+    def _ensure_cfg_text_latent_metadata(self, item: ConversationItem, sequence_length: int) -> None:
+        if float(item.meta.get("cfg_text_scale", 1.0)) <= 1.0:
+            return
+        item.meta.setdefault(
+            "cfg_text_position_ids",
+            torch.zeros(sequence_length, device=self.device, dtype=torch.long),
+        )
+        item.meta.setdefault(
+            "cfg_text_sequence_indexes",
+            torch.arange(sequence_length, device=self.device, dtype=torch.long),
+        )
+        item.meta.setdefault("cfg_text_key_value_lens", torch.tensor([0], device=self.device, dtype=torch.int32))
+        item.meta.setdefault("cfg_text_context_indexes", torch.empty(0, device=self.device, dtype=torch.long))
+
+    def _ensure_cfg_img_latent_metadata(self, item: ConversationItem) -> None:
+        if float(item.meta.get("cfg_img_scale", 1.0)) <= 1.0:
+            return
+        for cfg_key, base_key in (
+            ("cfg_img_position_ids", "position_ids"),
+            ("cfg_img_sequence_indexes", "sequence_indexes"),
+            ("cfg_img_key_value_lens", "key_value_lens"),
+            ("cfg_img_context_indexes", "context_indexes"),
+        ):
+            value = item.meta.get(base_key)
+            if torch.is_tensor(value):
+                item.meta.setdefault(cfg_key, value.detach().to(device=self.device))
+
+    def _current_timestep_value(self, item: ConversationItem) -> float:
+        return float(self._current_timestep(item).detach().reshape(-1)[0].item())
 
     def _meta_tensor(
         self,

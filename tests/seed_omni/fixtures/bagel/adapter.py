@@ -151,7 +151,11 @@ def adapt_image_gen_fixture(fixture: dict[str, Any]) -> list[ConversationItem]:
 
     prompt_fields = fixture["prepared"]["prompt"]
     latent_fields = fixture["prepared"]["latent"]
+    cfg_text_fields = fixture["prepared"].get("cfg_text")
+    cfg_img_fields = fixture["prepared"].get("cfg_img")
     timestep_fields = fixture["prepared"]["timesteps"]
+    raw_input = fixture["raw_input"]
+    cfg_interval = raw_input.get("cfg_interval", [0.0, 1.0])
 
     return [
         ConversationItem(
@@ -175,6 +179,35 @@ def adapt_image_gen_fixture(fixture: dict[str, Any]) -> list[ConversationItem]:
                 "dt": timestep_fields["dt"].clone().detach(),
                 "timesteps": timestep_fields["timesteps"].clone().detach(),
                 "dts": timestep_fields["dts"].clone().detach(),
+                "cfg_text_scale": float(raw_input.get("cfg_text_scale", 1.0)),
+                "cfg_img_scale": float(raw_input.get("cfg_img_scale", 1.0)),
+                "cfg_interval": list(cfg_interval),
+                "cfg_renorm_min": float(raw_input.get("cfg_renorm_min", 0.0)),
+                "cfg_renorm_type": raw_input.get("cfg_renorm_type", "global"),
+                "cfg_text_position_ids": None
+                if cfg_text_fields is None
+                else cfg_text_fields["cfg_packed_position_ids"].clone().detach().to(dtype=torch.long),
+                "cfg_text_sequence_indexes": None
+                if cfg_text_fields is None
+                else cfg_text_fields["cfg_packed_query_indexes"].clone().detach().to(dtype=torch.long),
+                "cfg_text_key_value_lens": None
+                if cfg_text_fields is None
+                else cfg_text_fields["cfg_key_values_lens"].clone().detach().to(dtype=torch.int32),
+                "cfg_text_context_indexes": None
+                if cfg_text_fields is None
+                else cfg_text_fields["cfg_packed_key_value_indexes"].clone().detach().to(dtype=torch.long),
+                "cfg_img_position_ids": None
+                if cfg_img_fields is None
+                else cfg_img_fields["cfg_packed_position_ids"].clone().detach().to(dtype=torch.long),
+                "cfg_img_sequence_indexes": None
+                if cfg_img_fields is None
+                else cfg_img_fields["cfg_packed_query_indexes"].clone().detach().to(dtype=torch.long),
+                "cfg_img_key_value_lens": None
+                if cfg_img_fields is None
+                else cfg_img_fields["cfg_key_values_lens"].clone().detach().to(dtype=torch.int32),
+                "cfg_img_context_indexes": None
+                if cfg_img_fields is None
+                else cfg_img_fields["cfg_packed_key_value_indexes"].clone().detach().to(dtype=torch.long),
                 "flow_step_index": 0,
                 "max_flow_steps": 1,
                 "expected": {

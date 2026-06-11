@@ -129,6 +129,30 @@ def compare_image_gen_graph(
         ctx["bagel_last_velocity"].detach().cpu(),
         fixture["one_step"]["velocity"],
     )
+    cfg_text_hidden_metrics = None
+    if fixture["one_step"].get("cfg_text_hidden_state") is not None:
+        cfg_text_hidden_metrics = _tensor_metrics(
+            ctx["bagel_last_cfg_text_hidden_state"].detach().cpu(),
+            fixture["one_step"]["cfg_text_hidden_state"],
+        )
+    cfg_text_velocity_metrics = None
+    if fixture["one_step"].get("cfg_text_velocity") is not None:
+        cfg_text_velocity_metrics = _tensor_metrics(
+            ctx["bagel_last_cfg_text_velocity"].detach().cpu(),
+            fixture["one_step"]["cfg_text_velocity"],
+        )
+    cfg_img_hidden_metrics = None
+    if fixture["one_step"].get("cfg_img_hidden_state") is not None:
+        cfg_img_hidden_metrics = _tensor_metrics(
+            ctx["bagel_last_cfg_img_hidden_state"].detach().cpu(),
+            fixture["one_step"]["cfg_img_hidden_state"],
+        )
+    cfg_img_velocity_metrics = None
+    if fixture["one_step"].get("cfg_img_velocity") is not None:
+        cfg_img_velocity_metrics = _tensor_metrics(
+            ctx["bagel_last_cfg_img_velocity"].detach().cpu(),
+            fixture["one_step"]["cfg_img_velocity"],
+        )
     x_t1_metrics = _tensor_metrics(
         ctx["bagel_last_x_t"].detach().cpu(),
         fixture["one_step"]["x_t1"],
@@ -141,6 +165,14 @@ def compare_image_gen_graph(
         x_t1_metrics,
     ):
         metrics["passes"] = _passes(metrics, tolerance)
+    for metrics in (
+        cfg_text_hidden_metrics,
+        cfg_text_velocity_metrics,
+        cfg_img_hidden_metrics,
+        cfg_img_velocity_metrics,
+    ):
+        if metrics is not None:
+            metrics["passes"] = _passes(metrics, tolerance)
 
     all_pass = bool(
         cache_after_prompt["passes"]
@@ -148,6 +180,10 @@ def compare_image_gen_graph(
         and packed_sequence_metrics["passes"]
         and hidden_metrics["passes"]
         and velocity_metrics["passes"]
+        and (cfg_text_hidden_metrics is None or cfg_text_hidden_metrics["passes"])
+        and (cfg_text_velocity_metrics is None or cfg_text_velocity_metrics["passes"])
+        and (cfg_img_hidden_metrics is None or cfg_img_hidden_metrics["passes"])
+        and (cfg_img_velocity_metrics is None or cfg_img_velocity_metrics["passes"])
         and x_t1_metrics["passes"]
         and len(model.generated) == 1
     )
@@ -162,6 +198,10 @@ def compare_image_gen_graph(
         "latent_embeds": latent_embed_metrics,
         "packed_sequence": packed_sequence_metrics,
         "hidden_state": hidden_metrics,
+        "cfg_text_hidden_state": cfg_text_hidden_metrics,
+        "cfg_text_velocity": cfg_text_velocity_metrics,
+        "cfg_img_hidden_state": cfg_img_hidden_metrics,
+        "cfg_img_velocity": cfg_img_velocity_metrics,
         "velocity": velocity_metrics,
         "x_t1": x_t1_metrics,
         "all_pass": all_pass,
