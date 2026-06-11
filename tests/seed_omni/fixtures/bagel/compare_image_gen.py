@@ -20,7 +20,7 @@ from tests.seed_omni.fixtures.bagel.adapter import (  # noqa: E402
     adapt_image_gen_fixture,
     assert_image_gen_fixture_schema,
 )
-from tests.seed_omni.fixtures.bagel.compare_text_only_graph import (  # noqa: E402
+from tests.seed_omni.fixtures.bagel.compare_text_only import (  # noqa: E402
     _cache_to_cpu,
     _compare_cache,
     _passes,

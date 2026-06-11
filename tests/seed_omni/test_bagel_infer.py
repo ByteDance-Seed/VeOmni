@@ -21,7 +21,7 @@ from tests.seed_omni.fixtures.bagel.compare_text_image_und import (
     compare_text_image_und_graph,
     smoke_text_image_raw_graph,
 )
-from tests.seed_omni.fixtures.bagel.compare_text_only_graph import compare_text_graph
+from tests.seed_omni.fixtures.bagel.compare_text_only import compare_text_graph
 
 
 _ENV_PREFIX = "VEOMNI_V2_TEST_BAGEL_"
