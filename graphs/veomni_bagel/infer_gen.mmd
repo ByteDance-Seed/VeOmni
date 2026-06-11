@@ -7,25 +7,22 @@ flowchart LR
     fsm_done(("⏹")):::fsm_terminal
     subgraph state_prompt_encode [prompt_encode]
         direction TB
-        prompt_encode__token_prompt_encode["token_prompt_encode<br/><i>bagel_text_encoder.forward</i>"]:::body_node
-        prompt_encode__qwen2_mot["qwen2_mot<br/><i>bagel_qwen2_mot.forward</i>"]:::body_node
-        prompt_encode__token_prompt_encode --> prompt_encode__qwen2_mot
+        prompt_encode__bagel_text_encoder_prompt_encode["<i>bagel_text_encoder.prompt_encode</i>"]:::body_node
+        prompt_encode__bagel_qwen2_mot_generate["<i>bagel_qwen2_mot.generate</i>"]:::body_node
+        prompt_encode__bagel_text_encoder_prompt_encode --> prompt_encode__bagel_qwen2_mot_generate
     end
     subgraph state_image_flow [image_flow]
         direction TB
-        image_flow__flow_embed["flow_embed<br/><i>bagel_flow_connector.embed_latent</i>"]:::body_node
-        image_flow__qwen2_mot["qwen2_mot<br/><i>bagel_qwen2_mot.forward</i>"]:::body_node
-        image_flow__flow_decode["flow_decode<br/><i>bagel_flow_connector.decode_velocity</i>"]:::body_node
-        image_flow__flow_embed --> image_flow__qwen2_mot
-        image_flow__qwen2_mot --> image_flow__flow_decode
+        image_flow__bagel_flow_connector_embed_latent["<i>bagel_flow_connector.embed_latent</i>"]:::body_node
+        image_flow__bagel_qwen2_mot_generate["<i>bagel_qwen2_mot.generate</i>"]:::body_node
+        image_flow__bagel_flow_connector_decode_velocity["<i>bagel_flow_connector.decode_velocity</i>"]:::body_node
+        image_flow__bagel_flow_connector_embed_latent --> image_flow__bagel_qwen2_mot_generate
+        image_flow__bagel_qwen2_mot_generate --> image_flow__bagel_flow_connector_decode_velocity
     end
     subgraph state_image_decode [image_decode]
         direction TB
-        image_decode__vae_decode["vae_decode<br/><i>bagel_vae.decode</i>"]:::body_node
+        image_decode__bagel_vae_decode["<i>bagel_vae.decode</i>"]:::body_node
     end
-    state_prompt_encode -.-> state_prompt_encode
-    state_image_flow -.-> state_image_flow
-    state_image_decode -.-> state_image_decode
     fsm_start ==> state_prompt_encode
     state_prompt_encode ==>|"default"| state_image_flow
     state_image_flow ==>|"module_signal(image_complete)"| state_image_decode

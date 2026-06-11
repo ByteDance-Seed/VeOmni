@@ -63,8 +63,6 @@ def _load_graph_config(config_dir: Path) -> OmniConfig:
     infer_config = yaml.safe_load((config_dir / "infer_interleave.yaml").read_text(encoding="utf-8"))
     merged = {
         "modules": train_config["modules"],
-        "nodes": train_config["nodes"],
-        "edges": train_config["edges"],
         "training_graph": train_config["training_graph"],
         "generation_graph": infer_config["generation_graph"],
         "generation_kwargs": infer_config.get("generation_kwargs", {}),

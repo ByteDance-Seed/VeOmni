@@ -550,8 +550,12 @@ def test_bagel_train_yaml_loads_with_v2_module_names():
     assert isinstance(cfg.training_graph, list) and cfg.training_graph
     endpoints = {e["from"] for e in cfg.training_graph} | {e["to"] for e in cfg.training_graph}
     assert "bagel_text_encoder.encode" in endpoints
-    assert "bagel_qwen2_mot" in endpoints
+    assert "bagel_siglip_navit" in endpoints
+    assert "bagel_vae.encode" in endpoints
+    assert "bagel_flow_connector.embed_latent" in endpoints
+    assert "bagel_text_encoder.decode" in endpoints
     assert "bagel_flow_connector.decode_velocity" in endpoints
+    assert "end" in endpoints
 
 
 @pytest.mark.parametrize("infer_yaml", ["infer_und.yaml", "infer_gen.yaml", "infer_interleave.yaml"])
@@ -577,7 +581,9 @@ def test_bagel_train_plus_infer_merges_generation_graph(infer_yaml: str):
     ), f"{infer_yaml} has no transition to `done`."
     for state_name, state in cfg.generation_graph["states"].items():
         for e in state.get("body", []):
-            assert set(e) == {"from", "to"}, f"state '{state_name}' body edge must be inline: {e}"
+            assert isinstance(e, dict) and "from" in e and "to" in e, (
+                f"state '{state_name}' body item must be a `{{from, to}}` dict: {e!r}"
+            )
 
 
 class _BagelInterleaveTokenizer:
@@ -763,7 +769,7 @@ def test_bagel_interleave_image_branch_signal_smoke():
         },
     )
 
-    assert any("transition: text_ar -> image_flow" in entry for entry in trace)
+    assert any("transition: prompt_encode -> image_flow" in entry for entry in trace)
     assert any("transition: image_flow -> image_decode" in entry for entry in trace)
     assert any("transition: image_decode -> text_ar" in entry for entry in trace)
     assert any("transition: text_ar -> done" in entry for entry in trace)

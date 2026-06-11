@@ -66,8 +66,6 @@ def _load_graph_config(config_dir: Path, *, infer_yaml_name: str = "infer_gen.ya
     infer_config = yaml.safe_load((config_dir / infer_yaml_name).read_text(encoding="utf-8"))
     merged = {
         "modules": train_config["modules"],
-        "nodes": train_config["nodes"],
-        "edges": train_config["edges"],
         "training_graph": train_config["training_graph"],
         "generation_graph": infer_config["generation_graph"],
         "generation_kwargs": infer_config.get("generation_kwargs", {}),

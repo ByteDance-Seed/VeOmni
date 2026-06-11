@@ -7,22 +7,20 @@ flowchart LR
     fsm_done(("⏹")):::fsm_terminal
     subgraph state_prompt_encode [prompt_encode]
         direction TB
-        prompt_encode__siglip_encode["siglip_encode<br/><i>bagel_siglip_navit.forward</i>"]:::body_node
-        prompt_encode__qwen2_mot["qwen2_mot<br/><i>bagel_qwen2_mot.forward</i>"]:::body_node
-        prompt_encode__token_prompt_encode["token_prompt_encode<br/><i>bagel_text_encoder.forward</i>"]:::body_node
-        prompt_encode__token_generate["token_generate<br/><i>bagel_text_encoder.forward</i>"]:::body_node
-        prompt_encode__siglip_encode --> prompt_encode__qwen2_mot
-        prompt_encode__token_prompt_encode --> prompt_encode__qwen2_mot
-        prompt_encode__qwen2_mot --> prompt_encode__token_generate
+        prompt_encode__bagel_siglip_navit_generate["<i>bagel_siglip_navit.generate</i>"]:::body_node
+        prompt_encode__bagel_qwen2_mot_generate["<i>bagel_qwen2_mot.generate</i>"]:::body_node
+        prompt_encode__bagel_text_encoder_prompt_encode["<i>bagel_text_encoder.prompt_encode</i>"]:::body_node
+        prompt_encode__bagel_text_encoder_token_generate["<i>bagel_text_encoder.token_generate</i>"]:::body_node
+        prompt_encode__bagel_siglip_navit_generate --> prompt_encode__bagel_qwen2_mot_generate
+        prompt_encode__bagel_text_encoder_prompt_encode --> prompt_encode__bagel_qwen2_mot_generate
+        prompt_encode__bagel_qwen2_mot_generate --> prompt_encode__bagel_text_encoder_token_generate
     end
     subgraph state_text_ar [text_ar]
         direction TB
-        text_ar__qwen2_mot["qwen2_mot<br/><i>bagel_qwen2_mot.forward</i>"]:::body_node
-        text_ar__token_generate["token_generate<br/><i>bagel_text_encoder.forward</i>"]:::body_node
-        text_ar__qwen2_mot --> text_ar__token_generate
+        text_ar__bagel_qwen2_mot_generate["<i>bagel_qwen2_mot.generate</i>"]:::body_node
+        text_ar__bagel_text_encoder_token_generate["<i>bagel_text_encoder.token_generate</i>"]:::body_node
+        text_ar__bagel_qwen2_mot_generate --> text_ar__bagel_text_encoder_token_generate
     end
-    state_prompt_encode -.-> state_prompt_encode
-    state_text_ar -.-> state_text_ar
     fsm_start ==> state_prompt_encode
     state_prompt_encode ==>|"module_signal(text_done)"| fsm_done
     state_prompt_encode ==>|"default"| state_text_ar

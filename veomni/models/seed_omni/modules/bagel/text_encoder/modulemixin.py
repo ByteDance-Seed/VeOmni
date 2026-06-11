@@ -112,6 +112,30 @@ class BagelTextEncoderModuleMixin(TextEncoderModuleMixin):
             f"Invalid conversation tail for BAGEL text generation: type={tail.type!r}, role={tail.role!r}"
         )
 
+    def prompt_encode(
+        self,
+        conversation_list: Optional[list[ConversationItem]] = None,
+        generation_kwargs: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
+        return self.generate(
+            conversation_list=conversation_list,
+            generation_kwargs=generation_kwargs,
+            **kwargs,
+        )
+
+    def token_generate(
+        self,
+        conversation_list: Optional[list[ConversationItem]] = None,
+        generation_kwargs: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
+        return self.generate(
+            conversation_list=conversation_list,
+            generation_kwargs=generation_kwargs,
+            **kwargs,
+        )
+
     def _materialize_vae_context_items(self, conversation_list: list[ConversationItem]) -> None:
         for item in conversation_list:
             if item.meta.get("bagel_role") != "image_vae_context":

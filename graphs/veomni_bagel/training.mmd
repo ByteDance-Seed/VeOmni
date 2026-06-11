@@ -6,35 +6,35 @@ flowchart LR
     data[(data)]:::io
     subgraph col0 [ ]
         direction TB
-        token_encode["token_encode<br/><i>bagel_text_encoder.encode</i>"]:::source
-        siglip_encode["siglip_encode<br/><i>bagel_siglip_navit.forward</i>"]:::source
-        vae_encode["vae_encode<br/><i>bagel_vae.encode</i>"]:::source
+        bagel_text_encoder_encode["<i>bagel_text_encoder.encode</i>"]:::source
+        bagel_siglip_navit_forward["<i>bagel_siglip_navit.forward</i>"]:::source
+        bagel_vae_encode["<i>bagel_vae.encode</i>"]:::source
     end
     subgraph col1 [ ]
         direction TB
-        flow_embed["flow_embed<br/><i>bagel_flow_connector.embed_latent</i>"]:::middle
+        bagel_flow_connector_embed_latent["<i>bagel_flow_connector.embed_latent</i>"]:::middle
     end
     subgraph col2 [ ]
         direction TB
-        qwen2_mot["qwen2_mot<br/><i>bagel_qwen2_mot.forward</i>"]:::middle
+        bagel_qwen2_mot_forward["<i>bagel_qwen2_mot.forward</i>"]:::middle
     end
     subgraph col3 [ ]
         direction TB
-        token_decode["token_decode<br/><i>bagel_text_encoder.decode</i>"]:::sink
-        flow_decode["flow_decode<br/><i>bagel_flow_connector.decode_velocity</i>"]:::sink
+        bagel_text_encoder_decode["<i>bagel_text_encoder.decode</i>"]:::sink
+        bagel_flow_connector_decode_velocity["<i>bagel_flow_connector.decode_velocity</i>"]:::sink
     end
     end_sink(("end")):::end_sink
-    data -.-> siglip_encode
-    data -.-> token_encode
-    data -.-> vae_encode
-    token_encode --> qwen2_mot
-    siglip_encode --> qwen2_mot
-    vae_encode --> flow_embed
-    flow_embed --> qwen2_mot
-    qwen2_mot --> token_decode
-    qwen2_mot --> flow_decode
-    token_decode --> end_sink
-    flow_decode --> end_sink
+    data -.-> bagel_siglip_navit_forward
+    data -.-> bagel_text_encoder_encode
+    data -.-> bagel_vae_encode
+    bagel_text_encoder_encode --> bagel_qwen2_mot_forward
+    bagel_siglip_navit_forward --> bagel_qwen2_mot_forward
+    bagel_vae_encode --> bagel_flow_connector_embed_latent
+    bagel_flow_connector_embed_latent --> bagel_qwen2_mot_forward
+    bagel_qwen2_mot_forward --> bagel_text_encoder_decode
+    bagel_qwen2_mot_forward --> bagel_flow_connector_decode_velocity
+    bagel_text_encoder_decode --> end_sink
+    bagel_flow_connector_decode_velocity --> end_sink
     style col0 fill:transparent,stroke:none
     style col1 fill:transparent,stroke:none
     style col2 fill:transparent,stroke:none
