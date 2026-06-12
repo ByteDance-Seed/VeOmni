@@ -1,0 +1,262 @@
+defaults:
+  seed: 1234
+  fixture:
+    dtype: fp32
+    tolerance:
+      max_abs_diff: 0.0
+      mean_abs_diff: 0.0
+      relative_l2_max: 0.0
+      cosine_similarity_min: 1.0
+
+input_templates:
+  causal_lm_tokens:
+    input_ids:
+      kind: randint
+      shape: [1, 4]
+      low: 0
+      high: config.vocab_size
+    labels:
+      kind: randint
+      shape: [1, 4]
+      low: 0
+      high: config.vocab_size
+
+output_templates:
+  text_lm_step:
+    text.hidden:
+      path: one_step.hidden_state
+      value: hidden_state
+    text.logits:
+      path: one_step.logits
+      value: logits
+    text.greedy_token:
+      path: one_step.greedy_token
+      value: greedy_token
+    qwen.hidden:
+      path: one_step.hidden_state
+      value: hidden_state
+    qwen.kv_cache:
+      path: one_step.cache_after_step
+      value: cache_after_step
+    loss.total:
+      path: losses.total
+      value: loss
+
+  text_gradients:
+    loss.total:
+      path: losses.total
+      value: loss
+    grad.text_embedding:
+      path: gradients.text_embedding
+      value: grad_text_embedding
+    grad.qwen.early:
+      path: gradients.qwen_early
+      value: grad_qwen_early
+    grad.qwen.late:
+      path: gradients.qwen_late
+      value: grad_qwen_late
+    grad.qwen.generation:
+      path: gradients.qwen_generation
+      value: grad_qwen_generation
+
+  multimodal_understanding:
+    image.embeds:
+      path: prepared.image_embeds.image_embeds
+      value: image_embeds
+    text.hidden:
+      path: one_step.hidden_state
+      value: hidden_state
+    text.logits:
+      path: one_step.logits
+      value: logits
+    qwen.kv_cache:
+      path: one_step.cache_after_step
+      value: cache_after_step
+    loss.total:
+      path: losses.total
+      value: loss
+    grad.text_embedding:
+      path: gradients.text_embedding
+      value: grad_text_embedding
+    grad.siglip:
+      path: gradients.siglip
+      value: grad_siglip
+    grad.qwen.early:
+      path: gradients.qwen_early
+      value: grad_qwen_early
+
+  image_generation:
+    gen.latent_embeds:
+      path: one_step.latent_embeds
+      value: latent_embeds
+    qwen.hidden:
+      path: one_step.hidden_state
+      value: hidden_state
+    gen.velocity:
+      path: one_step.velocity
+      value: velocity
+    gen.x_t1:
+      path: one_step.x_t1
+      value: x_t1
+    loss.total:
+      path: losses.total
+      value: loss
+    grad.flow:
+      path: gradients.flow
+      value: grad_flow
+    grad.qwen.generation:
+      path: gradients.qwen_generation
+      value: grad_qwen_generation
+
+  image_edit:
+    vae.latent:
+      path: prepared.vae_context.latent
+      value: vae_latent
+    gen.latent_embeds:
+      path: one_step.latent_embeds
+      value: latent_embeds
+    qwen.hidden:
+      path: one_step.hidden_state
+      value: hidden_state
+    gen.velocity:
+      path: one_step.velocity
+      value: velocity
+    gen.x_t1:
+      path: one_step.x_t1
+      value: x_t1
+    loss.total:
+      path: losses.total
+      value: loss
+    grad.text_embedding:
+      path: gradients.text_embedding
+      value: grad_text_embedding
+    grad.flow:
+      path: gradients.flow
+      value: grad_flow
+    grad.qwen.late:
+      path: gradients.qwen_late
+      value: grad_qwen_late
+    param.after_step:
+      path: steps.parameters_after_step
+      value: parameters_after_step
+    scheduler.lr:
+      path: steps.scheduler_lr
+      value: scheduler_lr
+    grad_norm:
+      path: steps.grad_norm
+      value: grad_norm
+
+scenarios:
+  text_only_one_step_logits:
+    description: Self-contained BAGEL transformers reference one-step text capture.
+    graph: infer_und
+    fixture: TEXT_PARITY_FIXTURE
+    probes: [text.hidden, text.logits, qwen.kv_cache, text.greedy_token]
+    reference:
+      action: transformers_causal_lm.forward
+      inputs:
+        templates: [causal_lm_tokens]
+      outputs:
+        templates: [text_lm_step]
+
+  gradient_ce_only:
+    description: Self-contained BAGEL transformers reference text loss and gradient capture.
+    graph: train
+    fixture: GRADIENT_CE_PARITY_FIXTURE
+    probes: [loss.total, grad.text_embedding, grad.qwen.early]
+    module_probes:
+      bagel_text_encoder.encode: [loss.total, grad.text_embedding]
+      bagel_qwen2_mot.forward: [loss.total, grad.qwen.early]
+    reference:
+      action: transformers_causal_lm.forward_backward
+      inputs:
+        templates: [causal_lm_tokens]
+      outputs:
+        templates: [text_gradients]
+
+  text_image_understanding_one_step_logits:
+    description: Placeholder for a full BAGEL-compatible multimodal understanding capture.
+    graph: infer_und
+    fixture: TEXT_IMAGE_PARITY_FIXTURE
+    probes: [image.embeds, text.hidden, text.logits, qwen.kv_cache]
+    reference:
+      action: bagel_multimodal_understanding.forward
+      outputs:
+        templates: [multimodal_understanding]
+
+  gradient_text_image_ce:
+    description: Placeholder for a full BAGEL-compatible text+image CE gradient capture.
+    graph: train
+    fixture: GRADIENT_TEXT_IMAGE_CE_PARITY_FIXTURE
+    probes: [loss.total, grad.text_embedding, grad.siglip, grad.qwen.early]
+    module_probes:
+      bagel_text_encoder.encode: [loss.total, grad.text_embedding]
+      bagel_siglip_navit.forward: [loss.total, grad.siglip]
+      bagel_qwen2_mot.forward: [loss.total, grad.qwen.early]
+    reference:
+      action: bagel_multimodal_understanding.forward
+      outputs:
+        templates: [multimodal_understanding]
+
+  image_generation_one_step_velocity:
+    description: Placeholder for a full BAGEL-compatible image generation capture.
+    graph: infer_gen
+    fixture: IMAGE_GEN_PARITY_FIXTURE
+    probes: [gen.latent_embeds, qwen.hidden, gen.velocity, gen.x_t1]
+    reference:
+      action: bagel_image_generation.forward
+      outputs:
+        templates: [image_generation]
+
+  gradient_mse_only:
+    description: Placeholder for a full BAGEL-compatible image generation MSE gradient capture.
+    graph: train
+    fixture: GRADIENT_MSE_PARITY_FIXTURE
+    probes: [loss.total, grad.flow, grad.qwen.generation]
+    module_probes:
+      bagel_flow_connector.embed_latent: [loss.total, grad.flow]
+      bagel_qwen2_mot.forward: [loss.total, grad.qwen.generation]
+      bagel_flow_connector.decode_velocity: [loss.total, grad.flow]
+    reference:
+      action: bagel_image_generation.forward
+      outputs:
+        templates: [image_generation]
+
+  image_edit_vae_context_one_step:
+    description: Placeholder for a full BAGEL-compatible image edit capture.
+    graph: infer_edit
+    fixture: IMAGE_EDIT_PARITY_FIXTURE
+    probes: [vae.latent, gen.latent_embeds, qwen.hidden, gen.velocity, gen.x_t1]
+    reference:
+      action: bagel_image_edit.forward
+      outputs:
+        templates: [image_edit]
+
+  gradient_ce_mse:
+    description: Placeholder for a full BAGEL-compatible text+image to image CE+MSE gradient capture.
+    graph: train
+    fixture: GRADIENT_CE_MSE_PARITY_FIXTURE
+    probes: [loss.total, grad.text_embedding, grad.flow, grad.qwen.late]
+    module_probes:
+      bagel_text_encoder.encode: [loss.total, grad.text_embedding]
+      bagel_flow_connector.embed_latent: [loss.total, grad.flow]
+      bagel_qwen2_mot.forward: [loss.total, grad.qwen.late]
+      bagel_flow_connector.decode_velocity: [loss.total, grad.flow]
+    reference:
+      action: bagel_image_edit.forward
+      outputs:
+        templates: [image_edit]
+
+  train_step_ce_mse:
+    description: Full trainer consistency path for BAGEL CE+MSE training.
+    domain: training
+    level: trainer
+    fixture: GRADIENT_CE_MSE_PARITY_FIXTURE
+    fixture_case_id: gradient_ce_mse
+    case_reference: v2_graph
+    requires_reference_model: false
+    probes: [loss.total, param.after_step, scheduler.lr, grad_norm]
+    reference:
+      action: bagel_image_edit.forward
+      outputs:
+        templates: [image_edit]

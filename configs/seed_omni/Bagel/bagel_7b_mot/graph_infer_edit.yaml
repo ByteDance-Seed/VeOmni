@@ -1,0 +1,60 @@
+# BAGEL-7B-MoT inference - text+image to image edit.
+generation_graph:
+  initial: prompt_encode
+
+  states:
+    prompt_encode:
+      body:
+        - { from: bagel_vae.encode,                    to: bagel_siglip_navit }
+        - { from: bagel_siglip_navit,                   to: bagel_text_encoder.prompt_encode }
+        - { from: bagel_text_encoder.prompt_encode,     to: bagel_flow_connector.embed_latent }
+        - { from: bagel_flow_connector.embed_latent,    to: bagel_qwen2_mot }
+        - { from: bagel_text_encoder.prompt_encode,     to: bagel_qwen2_mot }
+        - { from: bagel_qwen2_mot,                      to: bagel_text_encoder.token_generate }
+        - { from: bagel_text_encoder.token_generate,    to: end }
+      transitions:
+        - { condition: { type: module_signal, key: start_image_gen }, next_state: image_flow }
+        - { condition: { type: module_signal, key: text_done }, next_state: done }
+        - { condition: { type: default }, next_state: text_ar }
+
+    text_ar:
+      body:
+        - { from: bagel_qwen2_mot,                   to: bagel_text_encoder.token_generate }
+        - { from: bagel_text_encoder.token_generate, to: end }
+      transitions:
+        - { condition: { type: module_signal, key: start_image_gen }, next_state: image_flow }
+        - { condition: { type: module_signal, key: text_done }, next_state: done }
+
+    image_flow:
+      body:
+        - { from: bagel_flow_connector.embed_latent,    to: bagel_qwen2_mot }
+        - { from: bagel_qwen2_mot,                      to: bagel_flow_connector.decode_velocity }
+        - { from: bagel_flow_connector.decode_velocity, to: end }
+      transitions:
+        - { condition: { type: module_signal, key: image_complete }, next_state: image_decode }
+
+    image_decode:
+      body:
+        - { from: bagel_vae.decode, to: end }
+      transitions:
+        - { condition: { type: default }, next_state: done }
+
+generation_kwargs:
+  infer_mode: gen
+  max_new_tokens: 3
+  max_flow_steps: 1
+  temperature: 0.0
+  top_p: 1.0
+  do_sample: false
+  image_height: 1024
+  image_width: 1024
+  latent_downsample: 16
+  num_timesteps: 50
+  timestep_shift: 3.0
+  cfg_text_scale: 1.0
+  cfg_img_scale: 1.0
+  cfg_interval: [0.0, 1.0]
+  cfg_renorm_min: 0.0
+  cfg_renorm_type: global
+  enable_taylorseer: false
+  enable_vae_context: true
