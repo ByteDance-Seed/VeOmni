@@ -471,6 +471,7 @@ class BaseTrainer(Stateful, ABC):
             bsz_warmup_init_mbtoken=args.train.bsz_warmup_init_mbtoken,
             dyn_bsz=args.train.dyn_bsz,
             dyn_bsz_runtime=args.train.dyn_bsz_runtime,
+            dyn_bsz_count_mode=args.train.dyn_bsz_count_mode,
             dyn_bsz_buffer_size=args.data.dyn_bsz_buffer_size,
             seed=args.train.seed,
             collate_fn=self.collate_fn,

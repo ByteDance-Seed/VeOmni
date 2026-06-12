@@ -29,14 +29,21 @@ logger = logging.get_logger(__name__)
 class DynBszBuffer:
     """
     A buffer to store samples for dynamic batch size.
+
+    Args:
+        get_length_fn: optional callable returning the per-sample token count used to
+            decide when a micro batch is ready. Defaults to ``attention_mask.sum()``
+            (i.e. total tokens). Pass a callable counting only ``labels != IGNORE_INDEX``
+            to balance by effective (loss-contributing) tokens.
     """
 
-    def __init__(self):
+    def __init__(self, get_length_fn: Optional[Callable[[Dict[str, Any]], int]] = None):
         self._buffer = []
         self._buffer_sample_lens = []
         self.del_idxs = []
         self.cur_idx = 0
         self.all_token_cnt = 0
+        self._get_length_fn = get_length_fn
 
     def append(self, item: Dict[str, Any]):
         """
@@ -47,10 +54,14 @@ class DynBszBuffer:
                 whose ``.sum()`` gives the number of valid tokens for batching.
         """
         self._buffer.append(item)
-        if "attention_mask" not in item:
-            raise KeyError("Expected 'attention_mask' in item")
-        self._buffer_sample_lens.append(item["attention_mask"].sum())
-        self.all_token_cnt += self._buffer_sample_lens[-1]
+        if self._get_length_fn is not None:
+            length = self._get_length_fn(item)
+        else:
+            if "attention_mask" not in item:
+                raise KeyError("Expected 'attention_mask' in item")
+            length = int(item["attention_mask"].sum())
+        self._buffer_sample_lens.append(length)
+        self.all_token_cnt += length
 
     def get_samples(self, n_token_per_iter: int, force: bool = True):
         """
@@ -129,6 +140,7 @@ class TextBatchingStrategy(BaseBatchingStrategy):
         bsz_warmup_steps: the number of steps to warm up the batch size.
         bsz_warmup_init_mbtoken: the initial number of tokens to get for each request.
         buffer_size: the size of the buffer.
+        get_length_fn: optional per-sample length callable; see ``DynBszBuffer``.
     """
 
     def __init__(
@@ -137,6 +149,7 @@ class TextBatchingStrategy(BaseBatchingStrategy):
         buffer_size: int = 500,
         bsz_warmup_steps: int = 0,
         bsz_warmup_init_mbtoken: int = 200,
+        get_length_fn: Optional[Callable[[Dict[str, Any]], int]] = None,
     ) -> None:
         super().__init__()
         self._step = 0
@@ -147,7 +160,7 @@ class TextBatchingStrategy(BaseBatchingStrategy):
             assert self.bsz_warmup_init_mbtoken > 0
 
         self.buffer_size = buffer_size  # minimum samples in buffer
-        self.buffer = DynBszBuffer()
+        self.buffer = DynBszBuffer(get_length_fn=get_length_fn)
 
     def is_ready_for_micro_batch(self) -> bool:
         return len(self.buffer) >= self.buffer_size and self.buffer.all_token_cnt >= self.token_micro_bsz

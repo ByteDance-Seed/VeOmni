@@ -30,7 +30,7 @@ from .data_collator import (
     NoopDataCollator,
     UnpackDataCollator,
 )
-from .dataset import DynamicBatchingSizeDataset, get_length_by_attention_mask_fn
+from .dataset import DynamicBatchingSizeDataset, get_length_fn_by_count_mode
 from .dynamic_batching import DynamicBatchSizeDataLoader, TextBatchingStrategy
 
 
@@ -72,6 +72,7 @@ def build_native_dataloader(
     bsz_warmup_init_mbtoken: int = 200,
     dyn_bsz: bool = True,
     dyn_bsz_runtime: Literal["main", "worker"] = "main",
+    dyn_bsz_count_mode: Literal["total", "effective"] = "total",
     dyn_bsz_dataset_save_by_idx: bool = False,  # Whether to save dynamic-batching buffers by index for worker-side checkpoint/resume.
     dyn_bsz_buffer_size: int = 200,
     num_workers: int = 8,
@@ -165,12 +166,14 @@ def build_native_dataloader(
             f"bsz_warmup_init_mbtoken: {bsz_warmup_init_mbtoken}."
         )
         dyn_bsz_collate_fn = collate_fn
+        dyn_bsz_length_fn = get_length_fn_by_count_mode(dyn_bsz_count_mode)
         if dyn_bsz_runtime == "main":
             batching_strategy = TextBatchingStrategy(
                 token_micro_bsz=batching_token_len,
                 buffer_size=dyn_bsz_buffer_size,
                 bsz_warmup_steps=bsz_warmup_steps,
                 bsz_warmup_init_mbtoken=bsz_warmup_init_mbtoken,
+                get_length_fn=dyn_bsz_length_fn,
             )
 
             collate_fn = UnpackDataCollator()
@@ -179,7 +182,7 @@ def build_native_dataloader(
                 dataset=dataset,
                 micro_batch_seq_length=batching_token_len,
                 ready_for_micro_batch_threshold=dyn_bsz_buffer_size,
-                get_length_fn=get_length_by_attention_mask_fn,
+                get_length_fn=dyn_bsz_length_fn,
                 dynamic_batching_collate_fn=dyn_bsz_collate_fn,
                 save_by_idx=dyn_bsz_dataset_save_by_idx,
             )

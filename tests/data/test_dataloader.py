@@ -6,6 +6,7 @@ import pytest
 from utils import DummyDataset, process_dummy_example
 
 from veomni.data import build_dataloader, build_dataset
+from veomni.data.dynamic_batching import DynamicBatchSizeDataLoader, TextBatchingStrategy
 
 
 def _fake_ps(sp_size: int):
@@ -97,3 +98,49 @@ def test_build_dataloader_dyn_bsz_sp_filling(
         assert len(micro_batches) == global_batch_size // micro_batch_size
         for micro_batch in micro_batches:
             assert len(micro_batch["id"]) == micro_batch_size
+
+
+@pytest.mark.parametrize("dyn_bsz_runtime", ["main", "worker"])
+def test_build_dataloader_dyn_bsz_count_mode(
+    monkeypatch, dummy_dataset_ci, dyn_bsz_runtime: Literal["main", "worker"]
+):
+    import veomni.data.data_collator as m_col
+    import veomni.data.data_loader as m_dl
+    import veomni.data.dataset as m_ds
+
+    ps = _fake_ps(sp_size=1)
+    monkeypatch.setattr(m_dl, "get_parallel_state", lambda: ps)
+    monkeypatch.setattr(m_ds, "get_parallel_state", lambda: ps)
+    monkeypatch.setattr(m_col, "get_parallel_state", lambda: ps)
+
+    dataset = build_dataset(
+        dataset_name="iterable",
+        train_path=dummy_dataset_ci.save_path,
+        transform=partial(process_dummy_example, max_seq_len=16),
+        seed=0,
+    )
+    dl = build_dataloader(
+        "native",
+        dataset=dataset,
+        micro_batch_size=2,
+        global_batch_size=4,
+        dataloader_batch_size=1 if dyn_bsz_runtime == "main" else 2,
+        max_seq_len=16,
+        train_steps=1,
+        num_workers=0,
+        dyn_bsz=True,
+        dyn_bsz_runtime=dyn_bsz_runtime,
+        dyn_bsz_count_mode="effective",
+        dyn_bsz_buffer_size=1,
+        drop_last=True,
+        prefetch_factor=None,
+        seed=0,
+    )
+
+    if dyn_bsz_runtime == "main":
+        assert isinstance(dl, DynamicBatchSizeDataLoader)
+        assert isinstance(dl.batching_strategy, TextBatchingStrategy)
+        assert dl.batching_strategy.buffer._get_length_fn is m_ds.get_length_by_labels_fn
+    else:
+        assert isinstance(dl.dataset, m_ds.DynamicBatchingSizeDataset)
+        assert dl.dataset.get_length_fn is m_ds.get_length_by_labels_fn

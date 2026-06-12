@@ -468,6 +468,18 @@ class TrainingArguments:
         default="main",
         metadata={"help": "Which process dynamic batching runs in: main process or DataLoader worker."},
     )
+    dyn_bsz_count_mode: Literal["total", "effective"] = field(
+        default="total",
+        metadata={
+            "help": (
+                "How dynamic batching counts tokens when packing a micro batch. "
+                "'total' (default, legacy) sums attention_mask; 'effective' sums "
+                "only loss-contributing tokens (labels != IGNORE_INDEX), which "
+                "balances effective tokens across DP ranks at the cost of slightly "
+                "more padding."
+            )
+        },
+    )
     init_device: Literal["cpu", "cuda", "meta", "npu"] = field(
         default="meta",
         metadata={

@@ -60,11 +60,18 @@ from utils import (
 from veomni.arguments import VeOmniArguments, parse_args
 from veomni.data import build_dataloader
 from veomni.data.data_collator import MainCollator
-from veomni.data.dataset import DynamicBatchingSizeDataset
+from veomni.data.dataset import (
+    DynamicBatchingSizeDataset,
+    get_length_by_attention_mask_fn,
+    get_length_by_labels_fn,
+    get_length_fn_by_count_mode,
+)
+from veomni.data.dynamic_batching import TextBatchingStrategy
 from veomni.distributed.parallel_state import get_parallel_state
 from veomni.trainer.base import BaseTrainer
 from veomni.trainer.callbacks import Callback, EnvironMeterCallback, TrainerState
 from veomni.utils import helper
+from veomni.utils.constants import IGNORE_INDEX
 from veomni.utils.device import get_device_type
 
 
@@ -78,6 +85,16 @@ DATASET_SIZE = 50
 
 def get_length_fn(item):
     return item["attention_mask"].sum()
+
+
+def _make_sample(token_id: int, total_tokens: int = 4, effective_tokens: int = 2) -> Dict[str, torch.Tensor]:
+    labels = torch.full((total_tokens,), IGNORE_INDEX, dtype=torch.long)
+    labels[:effective_tokens] = token_id
+    return {
+        "input_ids": torch.full((total_tokens,), token_id, dtype=torch.long),
+        "attention_mask": torch.ones(total_tokens, dtype=torch.long),
+        "labels": labels,
+    }
 
 
 def single_sample_transform(sample: Dict[str, torch.Tensor]):
@@ -283,6 +300,40 @@ def test_dynamic_batching_without_get_item():
             get_length_fn=get_length_fn,
             save_by_idx=True,
         )
+
+
+def test_get_length_fn_by_count_mode():
+    sample = _make_sample(token_id=7, total_tokens=5, effective_tokens=3)
+
+    assert get_length_by_attention_mask_fn(sample) == 5
+    assert get_length_by_labels_fn(sample) == 3
+    assert get_length_fn_by_count_mode("total")(sample) == 5
+    assert get_length_fn_by_count_mode("effective")(sample) == 3
+    assert get_length_by_labels_fn({"attention_mask": sample["attention_mask"]}) == 5
+
+    with pytest.raises(ValueError, match="Unknown dyn_bsz count_mode"):
+        get_length_fn_by_count_mode("bad-mode")
+
+
+def test_text_batching_strategy_effective_count_mode():
+    total_strategy = TextBatchingStrategy(token_micro_bsz=4, buffer_size=1)
+    effective_strategy = TextBatchingStrategy(
+        token_micro_bsz=4,
+        buffer_size=1,
+        get_length_fn=get_length_by_labels_fn,
+    )
+    samples = [_make_sample(token_id=1), _make_sample(token_id=2)]
+
+    for sample in samples:
+        total_strategy.put_item(sample)
+        effective_strategy.put_item(sample)
+
+    total_batch = total_strategy.get_micro_batch(step=0)
+    effective_batch = effective_strategy.get_micro_batch(step=0)
+
+    assert len(total_batch) == 1
+    assert len(effective_batch) == 2
+    assert sum(batch_sample["attention_mask"].sum().item() for batch_sample in effective_batch) == 8
 
 
 @pytest.mark.parametrize("save_by_idx", [False, True])
@@ -492,6 +543,7 @@ class TrainerTest(BaseTrainer):
             bsz_warmup_init_mbtoken=args.train.bsz_warmup_init_mbtoken,
             dyn_bsz=args.train.dyn_bsz,
             dyn_bsz_runtime=args.train.dyn_bsz_runtime,
+            dyn_bsz_count_mode=args.train.dyn_bsz_count_mode,
             dyn_bsz_buffer_size=args.data.dyn_bsz_buffer_size,
             dyn_bsz_dataset_save_by_idx=self.save_by_idx,
             seed=args.train.seed,

@@ -37,6 +37,7 @@ except ImportError:
 
 from ..distributed.parallel_state import get_parallel_state
 from ..utils import logging
+from ..utils.constants import IGNORE_INDEX
 from ..utils.dist_utils import main_process_first
 from ..utils.multisource_utils import parse_multisource_config
 
@@ -258,6 +259,38 @@ def get_length_by_attention_mask_fn(sample):
     worker mode requires the callable to be pickleable.
     """
     return int(sample["attention_mask"].sum())
+
+
+def get_length_by_labels_fn(sample):
+    """Return effective token length from ``labels`` (i.e. tokens contributing to loss).
+
+    A token contributes to loss iff its label is not ``IGNORE_INDEX``. Falls back to
+    ``attention_mask`` when ``labels`` is absent (e.g. some unsupervised pipelines).
+
+    Note: this counts pre-pack labels; ``PackingCollator`` and SP label shifting may
+    set additional ``IGNORE_INDEX`` positions later, but balancing is decided here at
+    sample ingestion time.
+    """
+    if "labels" in sample:
+        return int((sample["labels"] != IGNORE_INDEX).sum())
+    return int(sample["attention_mask"].sum())
+
+
+def get_length_fn_by_count_mode(count_mode: str):
+    """Return the per-sample length callable selected by ``count_mode``.
+
+    - ``"total"``: count all tokens via ``attention_mask`` (legacy behavior; matches
+      the physical-token budget ``micro_batch_size * max_seq_len``).
+    - ``"effective"``: count only tokens with ``labels != IGNORE_INDEX``. Note that
+      the packing budget is still in physical tokens, so the actual packed sequence
+      may exceed ``max_seq_len`` when many prompt-heavy samples are buffered.
+      Tune ``max_seq_len`` / ``micro_batch_size`` accordingly.
+    """
+    if count_mode == "total":
+        return get_length_by_attention_mask_fn
+    if count_mode == "effective":
+        return get_length_by_labels_fn
+    raise ValueError(f"Unknown dyn_bsz count_mode: {count_mode!r} (expected 'total' or 'effective')")
 
 
 def _supports_output_index_for_resume(dataset: Any) -> bool:

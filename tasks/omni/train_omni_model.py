@@ -207,6 +207,7 @@ def main():
         max_seq_len=args.data.max_seq_len,
         train_steps=args.train_steps,
         dyn_bsz=args.train.dyn_bsz,
+        dyn_bsz_count_mode=args.train.dyn_bsz_count_mode,
         bsz_warmup_ratio=args.train.bsz_warmup_ratio,
         dyn_bsz_buffer_size=args.data.dyn_bsz_buffer_size,
         bsz_warmup_init_mbtoken=args.train.bsz_warmup_init_mbtoken,

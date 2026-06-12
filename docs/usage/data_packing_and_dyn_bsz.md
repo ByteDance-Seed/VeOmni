@@ -61,6 +61,13 @@ Example packed batch (one micro‑batch):
 
 dyn_bsz decides how many samples to pack so total tokens ~ target budget. If your target is, say, 10 tokens, it packs all 4 here.
 
+`train.dyn_bsz_count_mode` controls how that budget is measured:
+
+* `total` (default): count all packed tokens via `attention_mask.sum()`. This matches the physical sequence budget and preserves legacy behavior.
+* `effective`: count only tokens with `labels != IGNORE_INDEX`. This is useful for prompt-heavy SFT data where DP ranks can have similar packed lengths but very different amounts of loss-contributing tokens.
+
+When `dyn_bsz_count_mode=effective`, the budget is still enforced on an effective-token estimate during sample selection, so the final packed sequence can be longer than `micro_batch_size * max_seq_len` if many prompt tokens are masked from loss. Tune `micro_batch_size`, `max_seq_len`, and `dyn_bsz_buffer_size` with that tradeoff in mind.
+
 ### dyn_bsz = False (Recommended for SFT)
 
 Goal: still pack with position_ids, but batch size is fixed in number of samples, not by tokens. The num of samples in a batch is determined by the `micro_batch_size`.
