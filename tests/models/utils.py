@@ -10,6 +10,7 @@ from transformers import set_seed
 from veomni.arguments.arguments_types import OpsImplementationConfig
 from veomni.data.dummy_dataset import build_dummy_dataset
 from veomni.ops import apply_ops_config
+from veomni.utils.device import is_sm90_or_above
 from veomni.utils.import_utils import is_liger_kernel_available, is_package_available, is_torch_npu_available
 
 
@@ -44,7 +45,11 @@ class ModelMode:
 
 
 # HF uses _HF_ATTN, VeOmni uses _VEOMNI_ATTN x _USE_LIGER_KERNEL.
-# On NPU skip FA3.
+# FA3 modes are skipped on devices that can't run the Hopper kernel: NPU
+# (no FA3 port) and pre-SM90 CUDA cards (e.g. A100 sm80, L20 sm89). The
+# upstream FA3 kernel uses WGMMA/TMA which only exist on Hopper; the
+# Luosuu cu130 prebuilt wheel ships sm90-only binaries, so calling it on
+# sm89 raises CUDA "no kernel image is available for execution on the device".
 _HF_ATTN = ["flash_attention_2", "flash_attention_3"]
 _VEOMNI_ATTN = [
     "veomni_flash_attention_2_with_sp",
@@ -52,17 +57,19 @@ _VEOMNI_ATTN = [
 ]
 
 
-def _skip_fa3_npu(attn_impl: str) -> bool:
-    """Skip FA3 on NPU."""
-    if not is_torch_npu_available():
+def _skip_fa3(attn_impl: str) -> bool:
+    """Skip FA3 modes on devices without a usable Hopper FA3 kernel."""
+    if attn_impl not in ("flash_attention_3", "veomni_flash_attention_3_with_sp"):
         return False
-    return attn_impl in ("flash_attention_3", "veomni_flash_attention_3_with_sp")
+    if is_torch_npu_available():
+        return True
+    return not is_sm90_or_above()
 
 
 def _append_veomni_modes(modes: list, moe_implementation: str = "eager"):
     """Append VeOmni modes for case; every attn uses _USE_LIGER_KERNEL (True/False)."""
     for veomni_attn in _VEOMNI_ATTN:
-        if _skip_fa3_npu(veomni_attn):
+        if _skip_fa3(veomni_attn):
             continue
         for use_liger in _USE_LIGER_KERNEL:
             modes.append(
@@ -79,7 +86,7 @@ def _base_model_modes():
     """Base (non-MoE) model modes."""
     modes = []
     for hf_attn in _HF_ATTN:
-        if _skip_fa3_npu(hf_attn):
+        if _skip_fa3(hf_attn):
             continue
         modes.append(ModelMode("hf", hf_attn))
     _append_veomni_modes(modes)
@@ -90,7 +97,7 @@ def _moe_model_modes():
     """MoE model modes: same attn variants with a fused MoE backend matching the hardware."""
     modes = []
     for hf_attn in _HF_ATTN:
-        if _skip_fa3_npu(hf_attn):
+        if _skip_fa3(hf_attn):
             continue
     _append_veomni_modes(modes, moe_implementation=_FUSED_MOE_IMPL)
     return modes
