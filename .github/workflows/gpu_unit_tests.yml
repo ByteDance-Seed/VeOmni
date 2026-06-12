@@ -175,6 +175,19 @@ jobs:
       - name: Install LoRA extra
         run: |
           uv sync --frozen --extra gpu --extra audio --extra lora --group dev
-      - name: Run LoRA e2e test
+      - name: Run LoRA e2e tests
+        # Coverage:
+        #   - lora_trainer_saveload: dense Qwen3 + linear LoRA save/load smoke test
+        #   - moe_lora_eager: wrapper layout + autograd parity (Mode 1 + Mode 2, all v5 MoE configs)
+        #   - moe_lora_fused: triton kernel parity vs eager (forward + backward, EP autograd classes)
+        #   - moe_lora_trainer: production save/load/resume round-trip (DCP shard + HF adapter,
+        #     bit-exact LoRA reload, also covers linear LoRA on q_proj/v_proj since the
+        #     yaml enables both lora_modules and target_parameters)
+        #   - moe_lora_ep2: EP=1 vs EP=2 trainer-driven integration + per-step loss/grad_norm alignment
+        # Order: cheap unit tests first to fail fast, trainer/ep2 last (multi-subprocess, ~5-10 min each).
         run: |
           uv run --frozen pytest -s -x tests/lora/test_lora_trainer_saveload.py
+          uv run --frozen pytest -s -x tests/lora/test_moe_lora_eager.py
+          uv run --frozen pytest -s -x tests/lora/test_moe_lora_fused.py
+          uv run --frozen pytest -s -x tests/lora/test_moe_lora_trainer.py
+          uv run --frozen pytest -s -x tests/lora/test_moe_lora_ep2.py

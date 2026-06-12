@@ -13,13 +13,21 @@
 # limitations under the License.
 
 
-from .moe_layer import EPGroupGemm, EPMergedFc1GroupGemm, preprocess, token_pre_all2all, tokens_post_all2all
+from .moe_layer import (
+    EPGroupGemm,
+    EPMergedFc1GroupGemm,
+    dispatch_to_ep_class,
+    preprocess,
+    token_pre_all2all,
+    tokens_post_all2all,
+)
 
 
 __all__ = [
     "preprocess",
     "token_pre_all2all",
     "tokens_post_all2all",
+    "dispatch_to_ep_class",
     "EPGroupGemm",
     "EPMergedFc1GroupGemm",
 ]
