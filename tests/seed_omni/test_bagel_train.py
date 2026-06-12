@@ -12,6 +12,7 @@ from tests.seed_omni.fixtures.bagel.compare_gradient_graph import compare_gradie
 from tests.seed_omni.fixtures.bagel.compare_gradient_module import compare_gradient_module
 from tests.seed_omni.fixtures.bagel.compare_gradient_trainer import (
     compare_active_gradient_clipping_trainer,
+    compare_checkpoint_save_resume_trainer,
     compare_gradient_trainer,
     compare_optimizer_scheduler_trainer,
 )
@@ -179,6 +180,25 @@ def test_bagel_train_step_active_clipping_matches_direct_graph_fixture() -> None
         pytest.skip("BAGEL trainer active clipping smoke requires CUDA efficient attention.")
 
     report = compare_active_gradient_clipping_trainer(
+        Path(fixture_path),
+        Path(model_root),
+        config_dir=_bagel_cfg_dir(),
+    )
+    assert report["all_pass"], report
+
+
+def test_bagel_checkpoint_save_resume_trainer_smoke() -> None:
+    fixture_path = _env_value("GRADIENT_CE_MSE_PARITY_FIXTURE")
+    model_root = _env_value("SPLIT_MODEL_ROOT")
+    if not fixture_path or not model_root:
+        pytest.skip(
+            f"Set {_env_name('GRADIENT_CE_MSE_PARITY_FIXTURE')} and {_env_name('SPLIT_MODEL_ROOT')} "
+            "to run BAGEL checkpoint save/resume smoke."
+        )
+    if not torch.cuda.is_available():
+        pytest.skip("BAGEL checkpoint save/resume smoke requires CUDA efficient attention.")
+
+    report = compare_checkpoint_save_resume_trainer(
         Path(fixture_path),
         Path(model_root),
         config_dir=_bagel_cfg_dir(),
