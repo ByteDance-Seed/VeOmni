@@ -15,12 +15,12 @@ import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
 
-from tests.seed_omni.fixtures.bagel.adapter import (  # noqa: E402
+from tests.seed_omni.bagel.fixtures.adapter import (  # noqa: E402
     adapt_image_edit_fixture,
     assert_image_edit_fixture_schema,
 )
-from tests.seed_omni.fixtures.bagel.compare_image_gen import _generated_image_report  # noqa: E402
-from tests.seed_omni.fixtures.bagel.compare_text_only import (  # noqa: E402
+from tests.seed_omni.bagel.evals.compare_image_gen import _generated_image_report  # noqa: E402
+from tests.seed_omni.bagel.evals.compare_text_only import (  # noqa: E402
     _cache_to_cpu,
     _compare_cache,
     _passes,

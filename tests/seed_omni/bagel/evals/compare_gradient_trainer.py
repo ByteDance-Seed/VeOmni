@@ -6,6 +6,7 @@ import argparse
 import gc
 import json
 import os
+import runpy
 import shutil
 import sys
 from contextlib import contextmanager, nullcontext
@@ -19,12 +20,13 @@ import torch.distributed as dist
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
 
-from tests.seed_omni.fixtures.bagel.compare_gradient_graph import (
+import veomni.trainer.omni_trainer as omni_trainer_module
+from tests.seed_omni.bagel.evals.compare_gradient_graph import (
     _gradient_modules,
     _load_graph_config,
     _load_graph_modules,
 )
-from tests.seed_omni.fixtures.bagel.compare_gradient_module import (
+from tests.seed_omni.bagel.evals.compare_gradient_module import (
     _collect_gradients,
     _configure_determinism,
     _gradient_targets,
@@ -597,6 +599,127 @@ def compare_checkpoint_save_resume_trainer(
         del resume_trainer, resume_model, resume_modules, resume_batch, fixture
         _release_cuda_memory()
         return report
+
+
+def run_launcher_fixture_smoke(
+    fixture_path: Path,
+    model_root: Path,
+    *,
+    config_path: Path = Path("configs/seed_omni/Bagel/bagel_7b_mot/base.yaml"),
+    launcher_path: Path = Path("tasks/omni/train_omni.py"),
+    output_dir: Path = Path("outputs/bagel_v2/launcher_smoke"),
+    device: str = "cuda" if torch.cuda.is_available() else "cpu",
+    dtype: str = "bf16",
+    lr: float = 1.0e-4,
+) -> dict[str, Any]:
+    _release_cuda_memory()
+    fixture = torch.load(fixture_path, map_location="cpu", weights_only=False)
+    case_id = fixture.get("metadata", {}).get("case_id")
+    if case_id != "gradient_ce_mse":
+        raise ValueError(f"BAGEL launcher smoke expects gradient_ce_mse, got {case_id!r}")
+
+    seed = int(fixture["metadata"].get("seed", 1234))
+    torch_device = torch.device(device)
+    torch_dtype = _resolve_dtype(dtype)
+    report: dict[str, Any] = {
+        "case_id": case_id,
+        "dtype": dtype,
+        "config_path": str(config_path),
+        "launcher_path": str(launcher_path),
+        "output_dir": str(output_dir),
+        "train_called": False,
+    }
+
+    class FixtureBackedLauncherTrainer:
+        def __init__(self, args: Any) -> None:
+            self.args = args
+            omni_config = args.load_omni_config()
+            graph_modules = _load_graph_modules(model_root, device=torch_device, dtype=torch_dtype)
+            model = OmniModel(omni_config, graph_modules).train()
+            self.trainer = _build_minimal_trainer(model, device=torch_device, dtype=torch_dtype)
+            self.trainer.base.state = SimpleNamespace(global_step=0)
+            self.trainer.base.optimizer = _build_multi_optimizer(graph_modules, lr=lr)
+            self.trainer.base.lr_scheduler = _build_multi_scheduler(self.trainer.base.optimizer)
+            self.batch = _to_device(fixture["prepared"], torch_device)
+            self.graph_modules = graph_modules
+            report.update(
+                {
+                    "model_path": args.model.model_path,
+                    "modules_preloaded": isinstance(args.model.modules, dict),
+                    "module_count": len(omni_config.module_names),
+                    "training_edge_count": len(omni_config.training_edges),
+                    "global_batch_size": args.train.global_batch_size,
+                    "micro_batch_size": args.train.micro_batch_size,
+                    "fsdp_mode": args.train.accelerator.fsdp_config.fsdp_mode,
+                    "wandb_enabled": args.train.wandb.enable,
+                }
+            )
+
+        def train(self) -> None:
+            events = _run_trainer_optimizer_scheduler_step(self.trainer, self.batch, seed=seed)
+            report.update(
+                {
+                    "train_called": True,
+                    "loss": events["loss"],
+                    "loss_dict_keys": sorted(events["loss_dict"]),
+                    "global_step": int(self.trainer.base.state.global_step),
+                    "scheduler_lrs": self.trainer.base.lr_scheduler.get_last_lr(),
+                    "zero_grad_passes": _selected_grads_are_cleared(self.graph_modules, fixture["gradients"]),
+                }
+            )
+
+    old_argv = sys.argv[:]
+    original_trainer = omni_trainer_module.OmniTrainer
+    output_dir.mkdir(parents=True, exist_ok=True)
+    sys.argv = [
+        str(launcher_path),
+        str(config_path),
+        "--model.model_path",
+        str(model_root),
+        "--train.global_batch_size",
+        "1",
+        "--train.micro_batch_size",
+        "1",
+        "--train.max_steps",
+        "1",
+        "--train.wandb.enable",
+        "false",
+        "--train.checkpoint.output_dir",
+        str(output_dir),
+        "--train.checkpoint.save_steps",
+        "0",
+        "--train.checkpoint.save_hf_weights",
+        "false",
+        "--accelerator.fsdp_config.fsdp_mode",
+        "ddp",
+        "--accelerator.fsdp_config.mixed_precision.enable",
+        "false",
+        "--train.gradient_checkpointing.enable",
+        "false",
+        "--data.dataloader.num_workers",
+        "0",
+        "--data.dataloader.drop_last",
+        "false",
+    ]
+    omni_trainer_module.OmniTrainer = FixtureBackedLauncherTrainer
+    try:
+        runpy.run_path(str(launcher_path), run_name="__main__")
+    finally:
+        omni_trainer_module.OmniTrainer = original_trainer
+        sys.argv = old_argv
+        _release_cuda_memory()
+
+    report["all_pass"] = bool(
+        report["train_called"]
+        and report["modules_preloaded"]
+        and report["module_count"] == 5
+        and report["training_edge_count"] > 0
+        and report["global_step"] == 1
+        and report["zero_grad_passes"]
+        and report["fsdp_mode"] == "ddp"
+        and not report["wandb_enabled"]
+    )
+    return report
 
 
 def compare_gradient_trainer(

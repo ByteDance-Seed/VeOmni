@@ -391,7 +391,7 @@ class BagelQwen2MoTDecoderLayer(nn.Module):
             packed_sequence[packed_gen_token_indexes]
         )
 
-        packed_sequence_ = self.self_attn._forward_packed_train(
+        packed_sequence_, _ = self.self_attn(
             packed_sequence=packed_sequence_,
             sample_lens=sample_lens,
             attention_mask=attention_mask,
@@ -517,7 +517,7 @@ class BagelQwen2MoTBackbone(nn.Module):
             packed_gen_token_indexes = packed_und_token_indexes.new_ones(size=[0])
 
         for decoder_layer in self.layers:
-            packed_sequence = decoder_layer._forward_packed_train(
+            packed_sequence, _ = decoder_layer(
                 packed_sequence=packed_sequence,
                 sample_lens=sample_lens,
                 attention_mask=attention_mask,
@@ -638,7 +638,7 @@ class BagelQwen2MoT(BagelQwen2MoTModuleMixin, PreTrainedModel):
                 raise ValueError("BagelQwen2MoT training forward requires packed_sequence or inputs_embeds.")
             if sample_lens is None or attention_mask is None or packed_position_ids is None:
                 raise ValueError("sample_lens, attention_mask, and packed_position_ids are required for training.")
-            hidden_states = self.model._forward_packed_train(
+            output = self.model(
                 packed_sequence=packed_sequence,
                 sample_lens=sample_lens,
                 attention_mask=attention_mask,
@@ -646,6 +646,7 @@ class BagelQwen2MoT(BagelQwen2MoTModuleMixin, PreTrainedModel):
                 packed_und_token_indexes=packed_und_token_indexes,
                 packed_gen_token_indexes=packed_gen_token_indexes,
             )
+            hidden_states = output.packed_query_sequence
             return {"hidden_states": hidden_states}
 
         if packed_query_sequence is None:

@@ -17,13 +17,12 @@ from PIL import Image
 from transformers import AutoTokenizer
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from adapter import (  # noqa: E402
+from tests.seed_omni.bagel.fixtures.adapter import (  # noqa: E402
     _make_fixture_image,
     adapt_text_image_und_fixture,
     assert_text_image_fixture_schema,
 )
-from tests.seed_omni.fixtures.bagel.compare_text_only import (  # noqa: E402
+from tests.seed_omni.bagel.evals.compare_text_only import (  # noqa: E402
     _cache_to_cpu,
     _compare_cache,
     _passes,

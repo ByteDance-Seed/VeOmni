@@ -8,20 +8,20 @@ from pathlib import Path
 import pytest
 import torch
 
-from tests.seed_omni.fixtures.bagel.adapter import (
+from tests.seed_omni.bagel.evals.compare_image_edit import compare_image_edit_graph
+from tests.seed_omni.bagel.evals.compare_image_gen import compare_image_gen_graph, smoke_image_gen_full_loop_decode
+from tests.seed_omni.bagel.evals.compare_text_image_und import (
+    compare_text_image_und_graph,
+    smoke_text_image_raw_graph,
+)
+from tests.seed_omni.bagel.evals.compare_text_only import compare_text_graph
+from tests.seed_omni.bagel.fixtures.adapter import (
     adapt_text_only_fixture,
     assert_image_edit_fixture_schema,
     assert_image_gen_fixture_schema,
     assert_text_fixture_schema,
     assert_text_image_fixture_schema,
 )
-from tests.seed_omni.fixtures.bagel.compare_image_edit import compare_image_edit_graph
-from tests.seed_omni.fixtures.bagel.compare_image_gen import compare_image_gen_graph, smoke_image_gen_full_loop_decode
-from tests.seed_omni.fixtures.bagel.compare_text_image_und import (
-    compare_text_image_und_graph,
-    smoke_text_image_raw_graph,
-)
-from tests.seed_omni.fixtures.bagel.compare_text_only import compare_text_graph
 
 
 _ENV_PREFIX = "VEOMNI_V2_TEST_BAGEL_"
@@ -41,7 +41,7 @@ def _env_flag(suffix: str) -> bool:
 
 
 def _bagel_cfg_dir() -> Path:
-    return Path(__file__).resolve().parents[2] / "configs" / "seed_omni" / "Bagel" / "bagel_7b_mot"
+    return Path(__file__).resolve().parents[3] / "configs" / "seed_omni" / "Bagel" / "bagel_7b_mot"
 
 
 pytestmark = pytest.mark.skipif(

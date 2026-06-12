@@ -14,12 +14,12 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
 
-from tests.seed_omni.fixtures.bagel.compare_gradient_graph import (
+from tests.seed_omni.bagel.evals.compare_gradient_graph import (
     _gradient_modules,
     _load_graph_config,
     _load_graph_modules,
 )
-from tests.seed_omni.fixtures.bagel.compare_gradient_module import (
+from tests.seed_omni.bagel.evals.compare_gradient_module import (
     _collect_gradients,
     _configure_determinism,
     _loss_passes,

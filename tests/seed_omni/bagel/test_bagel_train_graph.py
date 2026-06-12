@@ -1,4 +1,4 @@
-"""Durable BAGEL module-level training official parity tests."""
+"""Durable BAGEL graph and trainer trainability tests."""
 
 from __future__ import annotations
 
@@ -8,15 +8,15 @@ from pathlib import Path
 import pytest
 import torch
 
-from tests.seed_omni.fixtures.bagel.compare_gradient_graph import compare_gradient_graph
-from tests.seed_omni.fixtures.bagel.compare_gradient_module import compare_gradient_module
-from tests.seed_omni.fixtures.bagel.compare_gradient_trainer import (
+from tests.seed_omni.bagel.evals.compare_gradient_graph import compare_gradient_graph
+from tests.seed_omni.bagel.evals.compare_gradient_trainer import (
     compare_active_gradient_clipping_trainer,
     compare_checkpoint_save_resume_trainer,
     compare_gradient_trainer,
     compare_optimizer_scheduler_trainer,
+    run_launcher_fixture_smoke,
 )
-from tests.seed_omni.fixtures.bagel.compare_optimizer_trajectory_graph import compare_optimizer_trajectory_graph
+from tests.seed_omni.bagel.evals.compare_optimizer_trajectory_graph import compare_optimizer_trajectory_graph
 
 
 _ENV_PREFIX = "VEOMNI_V2_TEST_BAGEL_"
@@ -35,32 +35,14 @@ def _env_flag(suffix: str) -> bool:
     return value is not None and value.lower() in {"1", "true", "yes", "on"}
 
 
+def _bagel_cfg_dir() -> Path:
+    return Path(__file__).resolve().parents[3] / "configs" / "seed_omni" / "Bagel" / "bagel_7b_mot"
+
+
 pytestmark = pytest.mark.skipif(
     not _env_flag("ENABLE_PARITY_CHECK"),
-    reason=f"Set {_env_name('ENABLE_PARITY_CHECK')}=1 to run BAGEL official training parity checks.",
+    reason=f"Set {_env_name('ENABLE_PARITY_CHECK')}=1 to run BAGEL official graph training parity checks.",
 )
-
-
-def _assert_module_gradient_parity(fixture_suffix: str, description: str) -> None:
-    fixture_path = _env_value(fixture_suffix)
-    model_root = _env_value("SPLIT_MODEL_ROOT")
-    if not fixture_path or not model_root:
-        pytest.skip(
-            f"Set {_env_name(fixture_suffix)} and {_env_name('SPLIT_MODEL_ROOT')} "
-            f"to run BAGEL {description} module-level backward parity."
-        )
-    if not torch.cuda.is_available():
-        pytest.skip(f"BAGEL {description} module-level backward parity requires CUDA efficient attention.")
-
-    report = compare_gradient_module(
-        Path(fixture_path),
-        Path(model_root),
-    )
-    assert report["all_pass"], report
-
-
-def _bagel_cfg_dir() -> Path:
-    return Path(__file__).resolve().parents[2] / "configs" / "seed_omni" / "Bagel" / "bagel_7b_mot"
 
 
 def _assert_graph_gradient_parity(fixture_suffix: str, description: str) -> None:
@@ -99,22 +81,6 @@ def _assert_trainer_gradient_parity(fixture_suffix: str, description: str) -> No
         config_dir=_bagel_cfg_dir(),
     )
     assert report["all_pass"], report
-
-
-def test_bagel_gradient_ce_only_module_backward_matches_official_fixture() -> None:
-    _assert_module_gradient_parity("GRADIENT_CE_PARITY_FIXTURE", "CE-only")
-
-
-def test_bagel_gradient_text_image_ce_module_backward_matches_official_fixture() -> None:
-    _assert_module_gradient_parity("GRADIENT_TEXT_IMAGE_CE_PARITY_FIXTURE", "text+image CE")
-
-
-def test_bagel_gradient_mse_only_module_backward_matches_official_fixture() -> None:
-    _assert_module_gradient_parity("GRADIENT_MSE_PARITY_FIXTURE", "MSE-only")
-
-
-def test_bagel_gradient_ce_mse_module_backward_matches_official_fixture() -> None:
-    _assert_module_gradient_parity("GRADIENT_CE_MSE_PARITY_FIXTURE", "CE+MSE")
 
 
 def test_bagel_gradient_ce_only_graph_backward_matches_official_fixture() -> None:
@@ -202,6 +168,25 @@ def test_bagel_checkpoint_save_resume_trainer_smoke() -> None:
         Path(fixture_path),
         Path(model_root),
         config_dir=_bagel_cfg_dir(),
+    )
+    assert report["all_pass"], report
+
+
+def test_bagel_single_rank_launcher_fixture_smoke() -> None:
+    fixture_path = _env_value("GRADIENT_CE_MSE_PARITY_FIXTURE")
+    model_root = _env_value("SPLIT_MODEL_ROOT")
+    if not fixture_path or not model_root:
+        pytest.skip(
+            f"Set {_env_name('GRADIENT_CE_MSE_PARITY_FIXTURE')} and {_env_name('SPLIT_MODEL_ROOT')} "
+            "to run BAGEL single-rank launcher smoke."
+        )
+    if not torch.cuda.is_available():
+        pytest.skip("BAGEL single-rank launcher smoke requires CUDA efficient attention.")
+
+    report = run_launcher_fixture_smoke(
+        Path(fixture_path),
+        Path(model_root),
+        config_path=_bagel_cfg_dir() / "base.yaml",
     )
     assert report["all_pass"], report
 

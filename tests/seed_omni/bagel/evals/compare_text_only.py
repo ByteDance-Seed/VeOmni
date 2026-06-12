@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import sys
 from pathlib import Path
 from typing import Any
 
@@ -15,8 +14,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import yaml
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from adapter import adapt_text_only_fixture, assert_text_fixture_schema  # noqa: E402
+from tests.seed_omni.bagel.fixtures.adapter import adapt_text_only_fixture, assert_text_fixture_schema
 
 from veomni.models.seed_omni.configuration_omni import OmniConfig  # noqa: E402
 from veomni.models.seed_omni.modeling_omni import OmniModel  # noqa: E402
