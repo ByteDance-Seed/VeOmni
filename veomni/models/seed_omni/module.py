@@ -34,7 +34,11 @@ Training nodes must emit at most one token-mean ``_loss``; ``OmniModel``
 sums them.  See ``docs/seed_omni/seed_omni_v2.md`` for the full contract.
 """
 
+from collections.abc import Iterable, Mapping
+from contextlib import AbstractContextManager
 from typing import Any, Callable, Dict, List, Optional, Type
+
+from .observer import DEFAULT_MAX_CAPTURE_TENSOR_NUMEL, ObserverRecords, arm_observer, observe_node_output
 
 
 def pre_forward(context: str) -> Callable[[Callable], Callable]:
@@ -115,6 +119,33 @@ class ModuleMixin:
         (e.g. the base text encoder) defines extra shared state worth chaining.
         """
         return None
+
+    @classmethod
+    def arm_observer(
+        cls,
+        whitelist: Mapping[tuple[str, str], Iterable[str]],
+        *,
+        sink: ObserverRecords | None = None,
+        max_tensor_numel: int = DEFAULT_MAX_CAPTURE_TENSOR_NUMEL,
+    ) -> AbstractContextManager[ObserverRecords]:
+        """Arm the generation observer under the parity-test gate.
+
+        ``whitelist`` is mandatory and keyed by ``(state, node)``. Only those
+        top-level fields are materialized, and filtering happens before any
+        tensor is copied to CPU.
+        """
+
+        del cls
+        return arm_observer(whitelist, sink=sink, max_tensor_numel=max_tensor_numel)
+
+    def observe(self, state: str, node: str, out: Mapping[str, Any]) -> None:
+        """Record whitelisted node-return values for parity tests.
+
+        The method is a no-op unless :meth:`arm_observer` is active. It never
+        reads unmapped fields, so large argument-threaded state stays on device.
+        """
+
+        observe_node_output(state, node, out)
 
     # ── Training hooks ────────────────────────────────────────────────────────
 

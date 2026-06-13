@@ -1,0 +1,114 @@
+scenarios:
+  train_ce_mse_one_step:
+    graph: train
+    driver_case: train_ce_mse
+    stimulus:
+      prompt: "Describe BAGEL in one short sentence."
+      timestep_shift: 3.0
+    probes:
+      - train.ce_loss
+      - train.mse_loss
+      - train.grad_early_q_proj
+      - train.grad_gen_q_proj
+      - train.grad_lm_head_rows
+      - train.grad_llm2vae
+    tiers:
+      - graph
+      - module
+      - framework
+  text_only_one_step:
+    graph: infer_und
+    driver_case: text_und
+    stimulus:
+      prompt: "Write a short description of a calm lake at sunrise."
+      max_new_tokens: 1
+      do_sample: false
+    probes:
+      - text.hidden
+      - text.logits
+      - text.greedy_token
+    tiers:
+      - graph
+      - module
+  image_gen_one_step:
+    graph: infer_gen
+    driver_case: image_gen
+    stimulus:
+      prompt: "A small ceramic teapot on a wooden table, soft morning light."
+      max_new_tokens: 2
+      max_flow_steps: 1
+      image_height: 1024
+      image_width: 1024
+      latent_downsample: 16
+      num_timesteps: 50
+      timestep_shift: 3.0
+      cfg_text_scale: 1.0
+      cfg_img_scale: 1.0
+      cfg_interval: [0.0, 1.0]
+      cfg_renorm_min: 0.0
+      cfg_renorm_type: global
+      enable_taylorseer: false
+    probes:
+      - image.velocity
+      - image.x_t
+    tiers:
+      - graph
+      - module
+  image_edit_one_step:
+    graph: infer_edit
+    driver_case: image_edit
+    stimulus:
+      prompt: "Turn the scene into a clean watercolor illustration."
+      input_width: 384
+      input_height: 256
+      max_new_tokens: 3
+      max_flow_steps: 1
+      num_timesteps: 50
+      timestep_shift: 3.0
+      enable_vae_context: true
+      enable_taylorseer: false
+    probes:
+      - image.velocity
+      - image.x_t
+    tiers:
+      - graph
+      - module
+  interleave_text_one_step:
+    graph: infer_interleave
+    driver_case: text_und
+    stimulus:
+      prompt: "Write one concise sentence about a mountain path after rain."
+      max_new_tokens: 1
+      do_sample: false
+    probes:
+      - text.hidden
+      - text.logits
+      - text.greedy_token
+    tiers:
+      - graph
+      - module
+  interleave_image_span_one_step:
+    graph: infer_interleave
+    driver_case: image_gen
+    stimulus:
+      prompt: "A glass greenhouse filled with tiny orange trees."
+      infer_mode: gen
+      max_new_tokens: 2
+      max_flow_steps: 1
+      image_height: 1024
+      image_width: 1024
+      latent_downsample: 16
+      num_timesteps: 50
+      timestep_shift: 3.0
+      cfg_text_scale: 1.0
+      cfg_img_scale: 1.0
+      cfg_interval: [0.0, 1.0]
+      cfg_renorm_min: 0.0
+      cfg_renorm_type: global
+      enable_taylorseer: false
+    probes:
+      - image.velocity
+      - image.x_t
+    tiers:
+      - graph
+      - module

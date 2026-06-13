@@ -12,9 +12,9 @@ from typing import Any
 import torch
 
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[5]))
 
-from tests.seed_omni.bagel.fixtures.capture_gradient import (
+from tests.seed_omni.bagel.archive.fixtures.capture_gradient import (
     DEFAULT_TEXT,
     _build_model,
     _case_settings,

@@ -1,67 +1,64 @@
-"""Common parity metrics."""
+"""Metric helpers for SeedOmni V2 parity comparisons."""
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any
 
 import torch
-import torch.nn.functional as F
 
 
-def tensor_metrics(actual: torch.Tensor, expected: torch.Tensor) -> dict[str, Any]:
-    if actual.shape != expected.shape:
-        return {
-            "shape_a": list(actual.shape),
-            "shape_b": list(expected.shape),
-            "shape_match": False,
-            "passes": False,
-        }
+@dataclass(frozen=True)
+class Tolerance:
+    name: str
+    kind: str = "numeric"
+    rtol: float = 0.0
+    atol: float = 0.0
 
-    a_float = actual.detach().float()
-    b_float = expected.detach().float()
-    diff = (a_float - b_float).abs()
-    actual_norm = float(a_float.norm().item())
-    expected_norm = float(b_float.norm().item())
-    cosine = 1.0
-    if actual.numel() > 0 and actual_norm > 0 and expected_norm > 0:
-        cosine = float(F.cosine_similarity(a_float.reshape(1, -1), b_float.reshape(1, -1), dim=-1).item())
-    return {
-        "shape": list(actual.shape),
-        "dtype_a": str(actual.dtype),
-        "dtype_b": str(expected.dtype),
-        "shape_match": True,
-        "max_abs_diff": float(diff.max().item()) if diff.numel() else 0.0,
-        "mean_abs_diff": float(diff.mean().item()) if diff.numel() else 0.0,
-        "actual_norm": actual_norm,
-        "expected_norm": expected_norm,
-        "relative_l2": float((a_float - b_float).norm().item() / max(expected_norm, 1e-12)),
-        "cosine_similarity": cosine,
-    }
+    @property
+    def exact(self) -> bool:
+        return self.kind == "exact"
 
 
-def tensor_passes(metrics: dict[str, Any], tolerance: dict[str, float]) -> bool:
-    if not metrics.get("shape_match"):
-        return False
-    near_zero_norm = tolerance.get("near_zero_norm", 0.0)
-    if metrics["actual_norm"] <= near_zero_norm and metrics["expected_norm"] <= near_zero_norm:
-        return bool(
-            metrics["max_abs_diff"] <= tolerance.get("max_abs_diff", 0.0)
-            and metrics["mean_abs_diff"] <= tolerance.get("mean_abs_diff", 0.0)
-        )
-    return bool(
-        (
-            metrics["max_abs_diff"] <= tolerance.get("max_abs_diff", 0.0)
-            and metrics["mean_abs_diff"] <= tolerance.get("mean_abs_diff", 0.0)
-            and metrics["cosine_similarity"] >= tolerance.get("cosine_similarity_min", -1.0)
-        )
-        or (
-            metrics["relative_l2"] <= tolerance.get("relative_l2_max", 0.0)
-            and metrics["cosine_similarity"] >= tolerance.get("cosine_similarity_min", -1.0)
-        )
+@dataclass(frozen=True)
+class MetricResult:
+    passed: bool
+    path: str
+    message: str = ""
+    max_abs_diff: float | None = None
+    max_rel_diff: float | None = None
+
+
+def tolerance_from_policy(name: str, policies: dict[str, Any]) -> Tolerance:
+    raw = dict(policies.get(name, {}) or {})
+    kind = str(raw.get("kind", "numeric"))
+    return Tolerance(
+        name=name,
+        kind=kind,
+        rtol=float(raw.get("rtol", 0.0) or 0.0),
+        atol=float(raw.get("atol", 0.0) or 0.0),
     )
 
 
-def compare_tensor(actual: torch.Tensor, expected: torch.Tensor, tolerance: dict[str, float]) -> dict[str, Any]:
-    metrics = tensor_metrics(actual, expected)
-    metrics["passes"] = tensor_passes(metrics, tolerance)
-    return metrics
+def compare_tensors(actual: torch.Tensor, expected: torch.Tensor, *, tolerance: Tolerance, path: str) -> MetricResult:
+    if actual.shape != expected.shape:
+        return MetricResult(
+            False, path, message=f"shape mismatch: actual={tuple(actual.shape)} expected={tuple(expected.shape)}"
+        )
+
+    actual_cpu = actual.detach().cpu()
+    expected_cpu = expected.detach().cpu()
+    if tolerance.exact:
+        passed = torch.equal(actual_cpu, expected_cpu)
+    else:
+        passed = torch.allclose(actual_cpu, expected_cpu, rtol=tolerance.rtol, atol=tolerance.atol)
+
+    diff = (actual_cpu.to(torch.float64) - expected_cpu.to(torch.float64)).abs()
+    max_abs = float(diff.max().item()) if diff.numel() else 0.0
+    denom = expected_cpu.to(torch.float64).abs().clamp_min(1e-12)
+    max_rel = float((diff / denom).max().item()) if diff.numel() else 0.0
+    message = "" if passed else f"tensor mismatch: max_abs_diff={max_abs:.6g}, max_rel_diff={max_rel:.6g}"
+    return MetricResult(passed, path, message=message, max_abs_diff=max_abs, max_rel_diff=max_rel)
+
+
+__all__ = ["MetricResult", "Tolerance", "compare_tensors", "tolerance_from_policy"]

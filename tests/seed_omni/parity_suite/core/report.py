@@ -1,31 +1,55 @@
-"""Structured reports for generated parity cases."""
+"""Structured reporting for SeedOmni V2 parity comparisons."""
 
 from __future__ import annotations
 
-import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
+from .metrics import MetricResult
 
-@dataclass
+
+@dataclass(frozen=True)
+class ProbeReport:
+    node: str
+    probe: str
+    passed: bool
+    metric: MetricResult
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "node": self.node,
+            "probe": self.probe,
+            "passed": self.passed,
+            "path": self.metric.path,
+            "message": self.metric.message,
+            "max_abs_diff": self.metric.max_abs_diff,
+            "max_rel_diff": self.metric.max_rel_diff,
+        }
+
+
+@dataclass(frozen=True)
 class ParityReport:
     case_id: str
-    category: str
-    all_pass: bool
-    probes: dict[str, Any] = field(default_factory=dict)
-    metadata: dict[str, Any] = field(default_factory=dict)
+    probes: tuple[ProbeReport, ...]
+
+    @property
+    def all_pass(self) -> bool:
+        return all(probe.passed for probe in self.probes)
+
+    @property
+    def first_failure(self) -> ProbeReport | None:
+        for probe in self.probes:
+            if not probe.passed:
+                return probe
+        return None
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "case_id": self.case_id,
-            "category": self.category,
             "all_pass": self.all_pass,
-            "metadata": self.metadata,
-            "probes": self.probes,
+            "first_failure": None if self.first_failure is None else self.first_failure.to_dict(),
+            "probes": [probe.to_dict() for probe in self.probes],
         }
 
-    def to_json(self) -> str:
-        return json.dumps(self.to_dict(), indent=2, sort_keys=True, default=str)
 
-    def __str__(self) -> str:
-        return self.to_json()
+__all__ = ["ParityReport", "ProbeReport"]

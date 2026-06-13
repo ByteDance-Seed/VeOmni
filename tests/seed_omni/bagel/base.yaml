@@ -1,0 +1,53 @@
+name: bagel
+
+reference:
+  loader: vendored
+  module: tests.seed_omni.bagel.transformers.bagel
+  checkpoint: ${MODEL_HUB}/transformers/BAGEL-7B-MoT
+
+v2_model:
+  model_root: ${MODEL_HUB}/seed_omni/BAGEL-7B-MoT
+  config_dir: configs/seed_omni/Bagel/bagel_7b_mot
+  module_dirs: auto
+  dtype_overrides:
+    bagel_qwen2_mot: keep-rope-fp32
+
+graphs:
+  include:
+    - train
+    - infer_und
+    - infer_gen
+    - infer_edit
+    - infer_interleave
+
+tiers:
+  graph: true
+  module: true
+  framework: true
+
+seed: 1234
+
+tolerance:
+  exact:
+    kind: exact
+  hidden:
+    rtol: 1.0e-2
+    atol: 1.0e-2
+  logits:
+    rtol: 1.0e-2
+    atol: 1.0e-2
+  velocity:
+    rtol: 1.0e-2
+    atol: 1.0e-2
+  latent:
+    rtol: 1.0e-2
+    atol: 1.0e-2
+  loss:
+    rtol: 1.0e-4
+    atol: 1.0e-4
+  gradient:
+    rtol: 1.0e-2
+    atol: 1.0e-2
+
+gate:
+  requires_cuda: true

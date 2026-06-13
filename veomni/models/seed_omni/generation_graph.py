@@ -109,6 +109,7 @@ from .graph import (
     NodeDef,
     is_end,
 )
+from .module import ModuleMixin
 
 
 # Default method for a bare endpoint in the inference FSM (training uses
@@ -431,6 +432,8 @@ class GenerationGraph:
             out = method_fn(**ctx, generation_kwargs=generation_kwargs)
             if not isinstance(out, dict):
                 raise TypeError(f"FSM node '{node_name}'.{method_name} must return a dict; got {type(out).__name__}.")
+            if isinstance(module, ModuleMixin):
+                module.observe(state.name, node_name, out)
             ctx.update(out)
             executed.add(node_name)
 

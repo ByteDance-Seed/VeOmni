@@ -1,0 +1,60 @@
+nodes:
+  bagel_text_encoder.decode:
+    train.ce_loss:
+      v2_field: _loss
+      ref_tap:
+        extractor: tests.seed_omni.bagel.driver:extract_train_ce_loss
+      tol: loss
+    train.grad_lm_head_rows:
+      v2_field: train_grad_lm_head_rows
+      ref_tap:
+        extractor: tests.seed_omni.bagel.driver:extract_train_grad_lm_head_rows
+      tol: gradient
+  bagel_qwen2_mot.forward:
+    train.grad_early_q_proj:
+      v2_field: train_grad_early_q_proj
+      ref_tap:
+        extractor: tests.seed_omni.bagel.driver:extract_train_grad_early_q_proj
+      tol: gradient
+    train.grad_gen_q_proj:
+      v2_field: train_grad_gen_q_proj
+      ref_tap:
+        extractor: tests.seed_omni.bagel.driver:extract_train_grad_gen_q_proj
+      tol: gradient
+  bagel_qwen2_mot.generate:
+    text.hidden:
+      v2_field: bagel_last_hidden_state
+      ref_tap:
+        extractor: tests.seed_omni.bagel.driver:extract_hidden_state
+      tol: hidden
+  bagel_text_encoder.token_generate:
+    text.logits:
+      v2_field: bagel_last_logits
+      ref_tap: model.language_model.lm_head
+      tol: logits
+    text.greedy_token:
+      v2_field: bagel_last_greedy_token
+      ref_tap:
+        extractor: tests.seed_omni.bagel.driver:extract_greedy_token
+      tol: exact
+  bagel_flow_connector.decode_velocity:
+    train.mse_loss:
+      v2_field: _loss
+      ref_tap:
+        extractor: tests.seed_omni.bagel.driver:extract_train_mse_loss
+      tol: loss
+    train.grad_llm2vae:
+      v2_field: train_grad_llm2vae
+      ref_tap:
+        extractor: tests.seed_omni.bagel.driver:extract_train_grad_llm2vae
+      tol: gradient
+    image.velocity:
+      v2_field: bagel_last_velocity
+      ref_tap:
+        extractor: tests.seed_omni.bagel.driver:extract_image_velocity
+      tol: velocity
+    image.x_t:
+      v2_field: bagel_last_x_t
+      ref_tap:
+        extractor: tests.seed_omni.bagel.driver:extract_image_x_t
+      tol: latent
