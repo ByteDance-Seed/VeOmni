@@ -31,10 +31,13 @@ python3 scripts/download_hf_model.py \
     --local_dir .
 ```
 
-Merge qwen3 moe model experts to support GroupGemm optimize.
-``` shell
-python3 scripts/moe_ckpt_merge/moe_merge.py --raw_hf_path Qwen3-30B-A3B-Instruct-2507  --merge_hf_path Qwen3-30B-A3B-Instruct-2507-merge
-```
+> **Note.** VeOmni's runtime `CheckpointTensorConverter` folds the per-expert
+> HF safetensor keys into VeOmni's fused expert layout at load time, so the
+> stock HF checkpoint can be passed directly to training — no offline merge
+> step is required. `scripts/moe_ckpt_merge/moe_merge.py` is deprecated but
+> may still be useful as a one-time optimization for very large checkpoints
+> (e.g. Qwen3-235B) to amortize per-load stacking cost. See
+> `docs/transformers_v5/transformers_v5_moe_weight_loading.md` for details.
 
 ## Start training on GPU/NPU
 
@@ -52,7 +55,7 @@ bash train.sh tasks/train_text.py configs/text/qwen3.yaml \
 
 ```shell
 bash train.sh tasks/train_text.py configs/text/qwen3.yaml \
-    --model.model_path ./Qwen3-30B-A3B-Instruct-2507-merge \
+    --model.model_path ./Qwen3-30B-A3B-Instruct-2507 \
     --model.ops_implementation.moe_implementation fused_triton \
     --data.train_path ./tulu-first2000.parquet \
     --train.accelerator.fsdp_config.fsdp_mode fsdp2 \

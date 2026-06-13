@@ -381,6 +381,7 @@ class DiTTrainer:
                 prefetch_factor=args.data.dataloader.prefetch_factor,
                 seed=args.train.seed,
                 collate_fn=DiTDataCollator(),
+                save_steps=args.train.checkpoint.save_steps,
             )
         else:
             self.base.train_dataloader = None

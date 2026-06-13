@@ -8,10 +8,20 @@ python3 scripts/download_hf_model.py \
   --local_dir .
 ```
 
-2. Merge qwen3 moe model experts to support GroupGemm optimize
-``` shell
-python3 scripts/moe_ckpt_merge/moe_merge.py --raw_hf_path Qwen3-30B-A3B  --merge_hf_path Qwen3-30B-A3B-merge
-```
+2. Train directly on the downloaded checkpoint
+
+VeOmni's runtime `CheckpointTensorConverter` folds the per-expert HF
+safetensor keys (`experts.{j}.gate_proj.weight`, …) into VeOmni's fused
+`gate_up_proj` / `down_proj` layout at load time. The stock HF checkpoint
+can be passed straight to training — no offline merge step is required.
+See `docs/transformers_v5/transformers_v5_moe_weight_loading.md` for the
+full format matrix and how to convert a VeOmni-format training checkpoint
+back to per-expert HF keys for inference engines.
+
+`scripts/moe_ckpt_merge/moe_merge.py` is deprecated. It still works and
+may be useful as a one-time optimization for very large checkpoints
+(e.g. Qwen3-235B) where you want to amortize the per-load stacking cost
+across many runs, but it is no longer a prerequisite.
 
 Most of the MoE models in Transformers referenced the open-source implementation of Mixtral MoE. In this implementation, MoE experts are divided into multiple blocks instead of being combined into a single `nn.Parameters`. Additionally, there are cpu-block operators like `torch.where()` and for loop, which are not very friendly for integrating MoE fusion operators.
 

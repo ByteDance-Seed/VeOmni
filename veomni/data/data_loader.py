@@ -85,6 +85,7 @@ def build_native_dataloader(
     build_collate_fn: bool = True,
     collate_fn_kwargs: Optional[Dict[str, Any]] = None,
     multiprocessing_context=None,
+    save_steps: int = 0,
 ) -> "DistributedDataloader":
     """Build the native training dataloader.
 
@@ -205,6 +206,11 @@ def build_native_dataloader(
         )
 
     worker_init_fn = _build_worker_init_fn(worker_num_threads) if worker_num_threads is not None else None
+    # Snapshot is only consumed at save; widen to save_steps in worker mode (1:1 next/step), else keep the every-step default so resume sees a fresh snapshot.
+    if save_steps and save_steps > 0 and not (dyn_bsz and dyn_bsz_runtime == "main"):
+        snapshot_every_n_steps = save_steps
+    else:
+        snapshot_every_n_steps = 1
     dataloader = DistributedDataloader(
         dataset,
         batch_size=dataloader_batch_size,
@@ -217,6 +223,7 @@ def build_native_dataloader(
         prefetch_factor=prefetch_factor,
         worker_init_fn=worker_init_fn,
         multiprocessing_context=multiprocessing_context,
+        snapshot_every_n_steps=snapshot_every_n_steps,
     )
 
     if dyn_bsz and dyn_bsz_runtime == "main":
