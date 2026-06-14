@@ -429,7 +429,7 @@ def test_qwen3omni_parallel_align(
 
 
 @pytest.mark.parametrize("model_name, config_path, is_moe, rtol, atol", wan_dit_test_cases)
-def test_wan_dit_uses_bfloat16_mixed_precision_and_flash_attention(
+def test_wan_dit_uses_bfloat16_and_flash_attention(
     model_name: str, config_path: str, is_moe: bool, rtol: float, atol: float
 ):
     command_list = prepare_exec_cmd(
@@ -447,9 +447,7 @@ def test_wan_dit_uses_bfloat16_mixed_precision_and_flash_attention(
     for _, cmd_kwargs in command_list:
         cmd = build_torchrun_cmd(**cmd_kwargs)
         assert cmd_kwargs["extra_args"] == [
-            "--train.accelerator.fsdp_config.mixed_precision.enable=True",
-            "--train.accelerator.fsdp_config.mixed_precision.param_dtype=bfloat16",
-            "--train.accelerator.fsdp_config.mixed_precision.cast_forward_inputs=True",
+            "--train.accelerator.fsdp_config.mixed_precision.enable=False",
             "--train.gradient_checkpointing.enable=False",
         ]
         if is_torch_npu_available():

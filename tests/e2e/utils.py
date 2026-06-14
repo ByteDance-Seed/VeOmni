@@ -82,10 +82,8 @@ class ParallelMode:
 
 _SP_SIZE = [1, 2]
 _EP_SIZE = [1, 2]
-_WAN_BFLOAT16_FSDP_ARGS = [
-    "--train.accelerator.fsdp_config.mixed_precision.enable=True",
-    "--train.accelerator.fsdp_config.mixed_precision.param_dtype=bfloat16",
-    "--train.accelerator.fsdp_config.mixed_precision.cast_forward_inputs=True",
+_WAN_BFLOAT16_TRAINING_ARGS = [
+    "--train.accelerator.fsdp_config.mixed_precision.enable=False",
     "--train.gradient_checkpointing.enable=False",
 ]
 
@@ -159,7 +157,7 @@ def prepare_exec_cmd(
                 model_name=model_name,
             )
             if model_name == "wan_t2v":
-                cmd_kwargs["extra_args"] = _WAN_BFLOAT16_FSDP_ARGS
+                cmd_kwargs["extra_args"] = _WAN_BFLOAT16_TRAINING_ARGS
             command_list.append((task_name, cmd_kwargs))
 
     return command_list
