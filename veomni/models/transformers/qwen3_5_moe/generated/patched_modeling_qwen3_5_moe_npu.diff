@@ -362,7 +362,7 @@
          self.recurrent_gated_delta_rule = fused_recurrent_gated_delta_rule or torch_recurrent_gated_delta_rule
 
          if not is_fast_path_available:
-@@ -434,27 +631,29 @@
+@@ -434,19 +631,35 @@
          self,
          hidden_states: torch.Tensor,
          cache_params: Cache | None = None,
@@ -382,27 +382,37 @@
 -        # diverge in how the conv input is assembled and which kernel consumes the states below,
 -        # which we gate locally on `seq_len`.
 -        use_precomputed_states = cache_params is not None and cache_params.has_previous_state(self.layer_idx)
++        # transformers 5.x layered DynamicCache API (see GPU config): per-layer state on
++        # `cache_params.layers[layer_idx]`, accessed via `has_previous_state` / `update_conv_state`
++        # / `update_recurrent_state`.
++        # `use_precomputed_states` picks the cached-decode fast path (reuse the stored conv /
++        # recurrent state) over recomputing the whole sequence (prefill). Heads-up on the
++        # `cache_position is not None` term: transformers 5.x no longer has the model's forward
++        # materialize `cache_position`, so a caller that continues from `past_key_values`
++        # without passing `cache_position` explicitly would make this term False and wrongly
++        # fall back to the prefill path mid-decode (ignoring the recurrent state, overwriting
++        # the conv cache). That is harmless TODAY because the cached path below is intentionally
++        # disabled — it raises NotImplementedError — so Qwen3.5 here is training-only. When
++        # decode support is added, drop this term and let the host-side
++        # `has_previous_state(self.layer_idx)` flag decide on its own (matches upstream).
 +        use_precomputed_states = (
 +            cache_params is not None
-+            and cache_params.has_previous_state
++            and cache_params.has_previous_state(self.layer_idx)
 +            and seq_len == 1
 +            and cache_position is not None
 +        )
 
          # getting projected states from cache if it exists
--        if use_precomputed_states:
--            conv_state = cache_params.layers[self.layer_idx].conv_states
--            recurrent_state = cache_params.layers[self.layer_idx].recurrent_states
-+        if cache_params is not None:
-+            conv_state = cache_params.conv_states[self.layer_idx]
-+            recurrent_state = cache_params.recurrent_states[self.layer_idx]
+         if use_precomputed_states:
+@@ -454,7 +667,6 @@
+             recurrent_state = cache_params.layers[self.layer_idx].recurrent_states
 
          mixed_qkv = self.in_proj_qkv(hidden_states)
 -        mixed_qkv = mixed_qkv.transpose(1, 2)
 
          z = self.in_proj_z(hidden_states)
          z = z.reshape(batch_size, seq_len, -1, self.head_v_dim)
-@@ -462,61 +661,131 @@
+@@ -462,61 +674,131 @@
          b = self.in_proj_b(hidden_states)
          a = self.in_proj_a(hidden_states)
 
@@ -472,7 +482,7 @@
 -                cache_params.update_conv_state(new_conv_state, self.layer_idx)
 +                mixed_qkv_t = mixed_qkv.transpose(1, 2)
 +                conv_state = F.pad(mixed_qkv_t, (self.conv_kernel_size - mixed_qkv_t.shape[-1], 0))
-+                cache_params.conv_states[self.layer_idx] = conv_state
++                cache_params.update_conv_state(conv_state, self.layer_idx)
              if self.causal_conv1d_fn is not None:
 +                # Modification: shard conv1d weights per Ulysses rank to match head-sharded channels.
 +                if ulysses_enabled:
@@ -566,7 +576,7 @@
              core_attn_out, last_recurrent_state = self.recurrent_gated_delta_rule(
                  query,
                  key,
-@@ -527,23 +796,16 @@
+@@ -527,23 +809,16 @@
                  output_final_state=cache_params is not None,
                  use_qk_l2norm_in_kernel=True,
              )
@@ -586,8 +596,7 @@
 
          # Update cache
          if cache_params is not None:
--            cache_params.update_recurrent_state(last_recurrent_state, self.layer_idx)
-+            cache_params.recurrent_states[self.layer_idx] = last_recurrent_state
+             cache_params.update_recurrent_state(last_recurrent_state, self.layer_idx)
 +
 +        # Modification: gather attention output back to sequence-sharded layout before gated norm.
 +        if ulysses_enabled:
@@ -597,7 +606,7 @@
 
          # reshape input data into 2D tensor
          core_attn_out = core_attn_out.reshape(-1, self.head_v_dim)
-@@ -554,6 +816,20 @@
+@@ -554,6 +829,20 @@
          output = self.out_proj(core_attn_out)
          return output
 
@@ -618,7 +627,7 @@
 
  def rotate_half(x):
      """Rotates half the hidden dims of the input."""
-@@ -562,27 +838,14 @@
+@@ -562,27 +851,14 @@
      return torch.cat((-x2, x1), dim=-1)
 
 
@@ -653,7 +662,7 @@
      cos = cos.unsqueeze(unsqueeze_dim)
      sin = sin.unsqueeze(unsqueeze_dim)
 
-@@ -732,12 +995,24 @@
+@@ -732,12 +1008,24 @@
          return down_proj
 
 
@@ -680,7 +689,7 @@
          self.num_experts = config.num_experts
          self.hidden_dim = config.hidden_size
          self.intermediate_dim = config.moe_intermediate_size
-@@ -751,6 +1026,11 @@
+@@ -751,6 +1039,11 @@
          top_k_index: torch.Tensor,
          top_k_weights: torch.Tensor,
      ) -> torch.Tensor:
@@ -692,7 +701,7 @@
          final_hidden_states = torch.zeros_like(hidden_states)
          with torch.no_grad():
              expert_mask = torch.nn.functional.one_hot(top_k_index, num_classes=self.num_experts)
-@@ -791,6 +1071,12 @@
+@@ -791,6 +1084,12 @@
          return router_logits, router_scores, router_indices
 
 
@@ -705,7 +714,7 @@
  class Qwen3_5MoeSparseMoeBlock(nn.Module):
      def __init__(self, config):
          super().__init__()
-@@ -799,18 +1085,47 @@
+@@ -799,18 +1098,47 @@
          self.shared_expert = Qwen3_5MoeMLP(config, intermediate_size=config.shared_expert_intermediate_size)
          self.shared_expert_gate = torch.nn.Linear(config.hidden_size, 1, bias=False)
 
@@ -754,7 +763,7 @@
 
 
  class Qwen3_5MoeRMSNorm(nn.Module):
-@@ -822,15 +1137,30 @@
+@@ -822,15 +1150,30 @@
      def _norm(self, x):
          return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
 
@@ -786,7 +795,7 @@
 
 
  class Qwen3_5MoeDecoderLayer(GradientCheckpointingLayer):
-@@ -846,6 +1176,7 @@
+@@ -846,6 +1189,7 @@
          self.input_layernorm = Qwen3_5MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
          self.post_attention_layernorm = Qwen3_5MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -794,7 +803,7 @@
      def forward(
          self,
          hidden_states: torch.Tensor,
-@@ -853,19 +1184,29 @@
+@@ -853,19 +1197,29 @@
          attention_mask: torch.Tensor | None = None,
          position_ids: torch.LongTensor | None = None,
          past_key_values: Cache | None = None,
@@ -825,7 +834,7 @@
              )
          elif self.layer_type == "full_attention":
              # Self Attention
-@@ -874,6 +1215,7 @@
+@@ -874,6 +1228,7 @@
                  attention_mask=attention_mask,
                  position_ids=position_ids,
                  past_key_values=past_key_values,
@@ -833,7 +842,7 @@
                  position_embeddings=position_embeddings,
                  **kwargs,
              )
-@@ -888,7 +1230,6 @@
+@@ -888,7 +1243,6 @@
          if isinstance(hidden_states, tuple):
              hidden_states, _ = hidden_states
          hidden_states = residual + hidden_states
@@ -841,7 +850,7 @@
          return hidden_states
 
 
-@@ -976,9 +1317,16 @@
+@@ -976,9 +1330,16 @@
          return x
 
 
@@ -858,7 +867,7 @@
      orig_q_dtype = q.dtype
      orig_k_dtype = k.dtype
      q, k = q.float(), k.float()
-@@ -1107,6 +1455,12 @@
+@@ -1107,6 +1468,12 @@
          return hidden_states
 
 
@@ -871,7 +880,7 @@
  class Qwen3_5MoeVisionModel(Qwen3_5MoePreTrainedModel):
      config: Qwen3_5MoeVisionConfig
      input_modalities = ("image", "video")
-@@ -1142,28 +1496,127 @@
+@@ -1142,28 +1509,127 @@
 
          self.post_init()
 
@@ -1019,7 +1028,7 @@
 
      @merge_with_config_defaults
      @capture_outputs
-@@ -1178,25 +1631,147 @@
+@@ -1178,25 +1644,147 @@
          Returns:
              `torch.Tensor`: hidden_states.
          """
@@ -1179,7 +1188,7 @@
 
          for blk in self.blocks:
              hidden_states = blk(
-@@ -1212,6 +1787,36 @@
+@@ -1212,6 +1800,36 @@
              last_hidden_state=hidden_states,
              pooler_output=merged_hidden_states,
          )
@@ -1216,7 +1225,7 @@
 
 
  @auto_docstring(
-@@ -1268,6 +1873,37 @@
+@@ -1268,6 +1886,37 @@
      rope_deltas: torch.LongTensor | None = None
      router_logits: tuple[torch.FloatTensor] | None = None
      aux_loss: torch.FloatTensor | None = None
@@ -1254,12 +1263,9 @@
 
 
  class Qwen3_5MoeTextModel(Qwen3_5MoePreTrainedModel):
-@@ -1353,19 +1989,42 @@
-             past_key_values=past_key_values,
-         )
+@@ -1355,17 +2004,45 @@
 
--    def _update_linear_attn_mask(self, attention_mask, past_key_values):
-+    def _update_linear_attn_mask(self, attention_mask, cache_position):
+     def _update_linear_attn_mask(self, attention_mask, past_key_values):
          """
 -        NOTE: Left-padding is used for linear attention mask.
 -        No need for zeroing states when
@@ -1277,14 +1283,18 @@
 +        ``apply_mask_to_padding_states`` does ``hidden_states * attention_mask[:, :, None]``, and in a
 +        cached forward the 2-D ``attention_mask`` spans ``past + current`` tokens while ``hidden_states``
 +        only covers the current chunk, so the shapes wouldn't broadcast (or would broadcast wrongly for
-+        a 1-token decode step). But we detect it host-side from tensor shapes — ``attention_mask`` has
-+        ``shape[-1] == past + current`` whereas ``cache_position`` has ``shape[-1] == current`` — rather
-+        than reading ``cache_position[0]``, so no sync.
++        a 1-token decode step). But we detect it host-side via the cache's ``has_previous_state()`` flag
++        — a Python bool on the linear-attention cache layer — rather than reading ``cache_position[0]``,
++        so no sync.
 +
 +        The all-ones short-circuit is the one we drop: returning the all-ones mask makes
 +        ``apply_mask_to_padding_states`` a no-op multiply, so it is equivalent to upstream's ``None``
 +        while avoiding the ``torch.all`` reduction + sync. A genuinely padded mask is still returned and
 +        correctly zeroed.
++
++        NOTE: transformers 5.x changed this method's 2nd arg from ``cache_position`` (a tensor) to
++        ``past_key_values`` (a layered ``DynamicCache``); the regenerated ``Qwen3_5TextModel.forward``
++        now calls ``self._update_linear_attn_mask(attention_mask, past_key_values)``.
          """
 -        linear_attn_mask = attention_mask
 -        if (past_key_values is not None and past_key_values.has_previous_state()) or (
@@ -1295,8 +1305,9 @@
 +        if attention_mask is None:
 +            return None
 +        # Cached forward (decode / continuation): see docstring — shapes wouldn't line up in
-+        # apply_mask_to_padding_states, and upstream returns None here. Detected from shapes only.
-+        if cache_position is not None and attention_mask.shape[-1] != cache_position.shape[-1]:
++        # apply_mask_to_padding_states, and upstream returns None here. `has_previous_state()` reads a
++        # host-side flag on the linear-attention cache layer (no 0-D GPU scalar), so this stays sync-free.
++        if past_key_values is not None and past_key_values.has_previous_state():
 +            return None
 +        return attention_mask
 +
@@ -1308,7 +1319,7 @@
 
 
  @auto_docstring
-@@ -1376,7 +2035,19 @@
+@@ -1376,7 +2053,19 @@
      config: Qwen3_5MoeConfig
      _no_split_modules = ["Qwen3_5MoeDecoderLayer", "Qwen3_5MoeVisionBlock"]
 
@@ -1328,7 +1339,7 @@
          super().__init__(config)
          self.visual = Qwen3_5MoeVisionModel._from_config(config.vision_config)
          self.language_model = Qwen3_5MoeTextModel._from_config(config.text_config)
-@@ -1561,64 +2232,43 @@
+@@ -1561,64 +2250,43 @@
          self,
          pixel_values: torch.FloatTensor,
          image_grid_thw: torch.LongTensor | None = None,
@@ -1418,7 +1429,7 @@
          return special_image_mask, special_video_mask
 
      def compute_3d_position_ids(
-@@ -1684,6 +2334,7 @@
+@@ -1684,6 +2352,7 @@
          image_grid_thw: torch.LongTensor | None = None,
          video_grid_thw: torch.LongTensor | None = None,
          mm_token_type_ids: torch.IntTensor | None = None,
@@ -1426,7 +1437,7 @@
          **kwargs: Unpack[TransformersKwargs],
      ) -> tuple | Qwen3_5MoeModelOutputWithPast:
          r"""
-@@ -1691,6 +2342,8 @@
+@@ -1691,6 +2360,8 @@
              The temporal, height and width of feature shape of each image in LLM.
          video_grid_thw (`torch.LongTensor` of shape `(num_videos, 3)`, *optional*):
              The temporal, height and width of feature shape of each video in LLM.
@@ -1435,7 +1446,7 @@
          """
          if (input_ids is None) ^ (inputs_embeds is not None):
              raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
-@@ -1698,29 +2351,170 @@
+@@ -1698,29 +2369,170 @@
          if inputs_embeds is None:
              inputs_embeds = self.get_input_embeddings()(input_ids)
 
@@ -1616,7 +1627,7 @@
              position_ids = self.compute_3d_position_ids(
                  input_ids=input_ids,
                  image_grid_thw=image_grid_thw,
-@@ -1730,6 +2524,17 @@
+@@ -1730,6 +2542,17 @@
                  past_key_values=past_key_values,
                  mm_token_type_ids=mm_token_type_ids,
              )
@@ -1634,7 +1645,7 @@
 
          outputs = self.language_model(
              input_ids=None,
-@@ -1737,6 +2542,7 @@
+@@ -1737,6 +2560,7 @@
              attention_mask=attention_mask,
              past_key_values=past_key_values,
              inputs_embeds=inputs_embeds,
@@ -1642,7 +1653,7 @@
              **kwargs,
          )
 
-@@ -1828,6 +2634,12 @@
+@@ -1828,6 +2652,12 @@
      return overall_loss * num_experts
 
 
@@ -1655,7 +1666,7 @@
  @auto_docstring
  class Qwen3_5MoeForCausalLM(Qwen3_5MoePreTrainedModel, GenerationMixin):
      _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
-@@ -1848,6 +2660,7 @@
+@@ -1848,6 +2678,7 @@
          # Initialize weights and apply final processing
          self.post_init()
 
@@ -1663,7 +1674,7 @@
      @can_return_tuple
      @auto_docstring
      def forward(
-@@ -1860,9 +2673,10 @@
+@@ -1860,9 +2691,10 @@
          labels: torch.LongTensor | None = None,
          use_cache: bool | None = None,
          output_router_logits: bool | None = None,
@@ -1675,7 +1686,7 @@
          r"""
          labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
              Labels for computing the masked language modeling loss. Indices should either be in `[0, ...,
-@@ -1899,30 +2713,70 @@
+@@ -1899,30 +2731,70 @@
              inputs_embeds=inputs_embeds,
              use_cache=use_cache,
              output_router_logits=output_router_logits,
@@ -1758,7 +1769,7 @@
              loss=loss,
              aux_loss=aux_loss,
              logits=logits,
-@@ -1930,7 +2784,14 @@
+@@ -1930,7 +2802,14 @@
              hidden_states=outputs.hidden_states,
              attentions=outputs.attentions,
              router_logits=outputs.router_logits,
@@ -1774,7 +1785,7 @@
 
 
  class Qwen3_5MoeForConditionalGeneration(Qwen3_5MoePreTrainedModel, GenerationMixin):
-@@ -1977,6 +2838,7 @@
+@@ -1977,6 +2856,7 @@
          """
          return self.model.get_image_features(pixel_values, image_grid_thw, **kwargs)
 
@@ -1782,7 +1793,7 @@
      @can_return_tuple
      def forward(
          self,
-@@ -1990,105 +2852,93 @@
+@@ -1990,105 +2870,93 @@
          pixel_values_videos: torch.FloatTensor | None = None,
          image_grid_thw: torch.LongTensor | None = None,
          video_grid_thw: torch.LongTensor | None = None,
@@ -1943,7 +1954,7 @@
          )
 
      def prepare_inputs_for_generation(
-@@ -2314,6 +3164,30 @@
+@@ -2314,6 +3182,30 @@
 
          return input_ids, model_kwargs
 
