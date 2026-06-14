@@ -487,12 +487,16 @@ def qwen3_vl_vision_block_forward_patched(
     **kwargs,
 ) -> torch.Tensor:
     r"""
+    hidden_states (`torch.Tensor`):
+        The input hidden states.
     cu_seqlens (`torch.Tensor`):
         Cumulative sequence lengths for variable-length vision attention.
     max_seqlen (`int`):
         Maximum per-image or per-video sequence length in the packed vision batch.
     rotary_pos_emb (`torch.Tensor`, *optional*):
         Precomputed rotary position embeddings for vision attention.
+    position_embeddings (`tuple[torch.Tensor, torch.Tensor]`, *optional*):
+        Precomputed rotary positional embeddings (cos, sin) for vision attention.
     """
     hidden_states = hidden_states + self.attn(
         self.norm1(hidden_states),
