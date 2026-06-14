@@ -30,7 +30,7 @@ from .data_collator import (
     NoopDataCollator,
     UnpackDataCollator,
 )
-from .dataset import DynamicBatchingSizeDataset, get_length_fn_by_count_mode
+from .dataset import DynamicBatchingSizeDataset, get_length_by_attention_mask_fn, get_length_fn_by_count_mode
 from .dynamic_batching import DynamicBatchSizeDataLoader, TextBatchingStrategy
 
 
@@ -167,6 +167,8 @@ def build_native_dataloader(
         )
         dyn_bsz_collate_fn = collate_fn
         dyn_bsz_length_fn = get_length_fn_by_count_mode(dyn_bsz_count_mode)
+        physical_token_cap = batching_token_len if dyn_bsz_count_mode == "effective" else None
+        dyn_bsz_physical_length_fn = get_length_by_attention_mask_fn if dyn_bsz_count_mode == "effective" else None
         if dyn_bsz_runtime == "main":
             batching_strategy = TextBatchingStrategy(
                 token_micro_bsz=batching_token_len,
@@ -174,6 +176,8 @@ def build_native_dataloader(
                 bsz_warmup_steps=bsz_warmup_steps,
                 bsz_warmup_init_mbtoken=bsz_warmup_init_mbtoken,
                 get_length_fn=dyn_bsz_length_fn,
+                physical_token_cap=physical_token_cap,
+                get_physical_length_fn=dyn_bsz_physical_length_fn,
             )
 
             collate_fn = UnpackDataCollator()
@@ -183,6 +187,8 @@ def build_native_dataloader(
                 micro_batch_seq_length=batching_token_len,
                 ready_for_micro_batch_threshold=dyn_bsz_buffer_size,
                 get_length_fn=dyn_bsz_length_fn,
+                physical_token_cap=physical_token_cap,
+                get_physical_length_fn=dyn_bsz_physical_length_fn,
                 dynamic_batching_collate_fn=dyn_bsz_collate_fn,
                 save_by_idx=dyn_bsz_dataset_save_by_idx,
             )

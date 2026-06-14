@@ -66,7 +66,7 @@ dyn_bsz decides how many samples to pack so total tokens ~ target budget. If you
 * `total` (default): count all packed tokens via `attention_mask.sum()`. This matches the physical sequence budget and preserves legacy behavior.
 * `effective`: count only tokens with `labels != IGNORE_INDEX`. This is useful for prompt-heavy SFT data where DP ranks can have similar packed lengths but very different amounts of loss-contributing tokens.
 
-When `dyn_bsz_count_mode=effective`, the budget is still enforced on an effective-token estimate during sample selection, so the final packed sequence can be longer than `micro_batch_size * max_seq_len` if many prompt tokens are masked from loss. Tune `micro_batch_size`, `max_seq_len`, and `dyn_bsz_buffer_size` with that tradeoff in mind.
+When `dyn_bsz_count_mode=effective`, sample selection targets the effective-token budget while also enforcing a hard physical-token cap of `micro_batch_size * max_seq_len` for each micro batch. This prevents prompt-heavy examples with very few labels from being packed into an unbounded physical sequence. A single sample can still be longer than this cap by itself, so keep preprocessing/truncation aligned with `data.max_seq_len`.
 
 ### dyn_bsz = False (Recommended for SFT)
 

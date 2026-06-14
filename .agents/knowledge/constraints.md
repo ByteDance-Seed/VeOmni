@@ -101,7 +101,7 @@ Core files:
     - Optional effective-token mode (`"effective"`) uses `(labels != IGNORE_INDEX).sum()` when `labels` are present, and falls back to `attention_mask.sum()` otherwise.
     - With FA varlen, `attention_mask` is still expected to be all-ones over packed length; boundaries come from `position_ids` and `cu_seq_lens`.
     - When SP is enabled, `attention_mask` must use `sp_pad_value=1` (asserted in `MainCollator.__post_init__`).
-    - In effective-token mode, the batching heuristic may admit a packed sequence whose physical token count exceeds `micro_batch_size * max_seq_len`; tune the token budget accordingly.
+    - In effective-token mode, dynamic batching still applies a hard physical-token cap of `micro_batch_size * max_seq_len` during micro-batch selection to avoid unbounded prompt-heavy batches; a single sample may still exceed the cap by itself and should be controlled by preprocessing.
 
 12. **`IGNORE_INDEX` (-100) for loss masking**
     - Labels set to `IGNORE_INDEX` are excluded from loss computation.

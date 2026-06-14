@@ -40,6 +40,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+import numpy as np
 import pytest
 import torch
 from tools import resolve_ops_overrides
@@ -63,6 +64,7 @@ from veomni.data.data_collator import MainCollator
 from veomni.data.dataset import (
     DynamicBatchingSizeDataset,
     get_length_by_attention_mask_fn,
+    get_length_by_input_ids_fn,
     get_length_by_labels_fn,
     get_length_fn_by_count_mode,
 )
@@ -307,9 +309,28 @@ def test_get_length_fn_by_count_mode():
 
     assert get_length_by_attention_mask_fn(sample) == 5
     assert get_length_by_labels_fn(sample) == 3
+    assert get_length_by_input_ids_fn(sample) == 5
     assert get_length_fn_by_count_mode("total")(sample) == 5
     assert get_length_fn_by_count_mode("effective")(sample) == 3
     assert get_length_by_labels_fn({"attention_mask": sample["attention_mask"]}) == 5
+
+    list_sample = {
+        "input_ids": [1, 2, 3, 4, 5],
+        "attention_mask": [1, 1, 1, 1, 0],
+        "labels": [IGNORE_INDEX, 2, IGNORE_INDEX, 4, 5],
+    }
+    assert get_length_by_attention_mask_fn(list_sample) == 4
+    assert get_length_by_labels_fn(list_sample) == 3
+    assert get_length_by_input_ids_fn(list_sample) == 5
+
+    np_sample = {
+        "input_ids": np.arange(5),
+        "attention_mask": np.array([1, 1, 1, 0, 0]),
+        "labels": np.array([IGNORE_INDEX, 1, 2, IGNORE_INDEX, IGNORE_INDEX]),
+    }
+    assert get_length_by_attention_mask_fn(np_sample) == 3
+    assert get_length_by_labels_fn(np_sample) == 2
+    assert get_length_by_input_ids_fn(np_sample) == 5
 
     with pytest.raises(ValueError, match="Unknown dyn_bsz count_mode"):
         get_length_fn_by_count_mode("bad-mode")
@@ -334,6 +355,58 @@ def test_text_batching_strategy_effective_count_mode():
     assert len(total_batch) == 1
     assert len(effective_batch) == 2
     assert sum(batch_sample["attention_mask"].sum().item() for batch_sample in effective_batch) == 8
+
+
+def test_text_batching_strategy_effective_mode_honors_physical_cap():
+    strategy = TextBatchingStrategy(
+        token_micro_bsz=4,
+        buffer_size=1,
+        get_length_fn=get_length_by_labels_fn,
+        physical_token_cap=8,
+        get_physical_length_fn=get_length_by_attention_mask_fn,
+    )
+    samples = [
+        _make_sample(token_id=1, total_tokens=6, effective_tokens=2),
+        _make_sample(token_id=2, total_tokens=6, effective_tokens=2),
+        _make_sample(token_id=3, total_tokens=2, effective_tokens=2),
+    ]
+
+    for sample in samples:
+        strategy.put_item(sample)
+
+    micro_batch = strategy.get_micro_batch(step=0)
+
+    assert [sample["input_ids"][0].item() for sample in micro_batch] == [1, 3]
+    assert sum(sample["attention_mask"].sum().item() for sample in micro_batch) == 8
+    assert strategy.buffer.all_token_cnt == 2
+    assert strategy.buffer.all_physical_token_cnt == 6
+
+
+def test_dynamic_batching_size_dataset_effective_mode_honors_physical_cap():
+    class PromptHeavyDataset(IterableDataset):
+        def __iter__(self):
+            for sample in [
+                _make_sample(token_id=1, total_tokens=6, effective_tokens=2),
+                _make_sample(token_id=2, total_tokens=6, effective_tokens=2),
+                _make_sample(token_id=3, total_tokens=2, effective_tokens=2),
+            ]:
+                yield sample
+
+    dynamic_ds = DynamicBatchingSizeDataset(
+        dataset=PromptHeavyDataset(),
+        micro_batch_seq_length=4,
+        ready_for_micro_batch_threshold=1,
+        dynamic_batching_collate_fn=lambda samples: samples,
+        get_length_fn=get_length_by_labels_fn,
+        physical_token_cap=8,
+        get_physical_length_fn=get_length_by_attention_mask_fn,
+        save_by_idx=False,
+    )
+
+    micro_batches = list(dynamic_ds)
+
+    assert [[sample["input_ids"][0].item() for sample in batch] for batch in micro_batches] == [[1], [2, 3]]
+    assert [sum(sample["attention_mask"].sum().item() for sample in batch) for batch in micro_batches] == [6, 8]
 
 
 @pytest.mark.parametrize("save_by_idx", [False, True])

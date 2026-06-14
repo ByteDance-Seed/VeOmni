@@ -211,7 +211,7 @@ NPU validation runs at two times:
 
 | dyn_bsz | `bool` | `True` | Enable dynamic batch size for padding-free training. |
 | dyn_bsz_runtime | `Literal["main", "worker"]` | `"main"` | Where dynamic batching runs. `"main"` keeps the legacy main-process batching path; `"worker"` batches inside DataLoader workers to support exact `StatefulDataLoader` resume. |
-| dyn_bsz_count_mode | `Literal["total", "effective"]` | `"total"` | How dynamic batching counts tokens. `"total"` uses `attention_mask.sum()` (legacy behavior); `"effective"` counts only `labels != IGNORE_INDEX` so DP ranks are balanced by loss-contributing tokens. |
+| dyn_bsz_count_mode | `Literal["total", "effective"]` | `"total"` | How dynamic batching counts tokens. `"total"` uses `attention_mask.sum()` (legacy behavior); `"effective"` counts only `labels != IGNORE_INDEX` for balancing while still capping each micro batch by physical tokens (`micro_batch_size * max_seq_len`). |
 | micro_batch_size | `int` | `1` | Number of samples per iteration on each device. |
 | global_batch_size | `Optional[int]` | `None` | Global batch size. If `None`, uses `micro_batch_size × dp_size`. |
 | num_train_epochs | `int` | `1` | Number of training epochs. |
