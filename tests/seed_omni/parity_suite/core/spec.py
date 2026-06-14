@@ -191,7 +191,7 @@ class RunSpec:
     kind: str
     probes: tuple[str, ...] = ()
     gate: GateSpec = field(default_factory=GateSpec)
-    module_policy: ModulePolicySpec = field(default_factory=ModulePolicySpec)
+    policy: ModulePolicySpec = field(default_factory=ModulePolicySpec)
     options: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
@@ -205,9 +205,9 @@ class RunSpec:
             values.pop("probes", None), field_name=f"scenarios.{scenario_id}.runs.{tier}.{run_id}.probes"
         )
         gate = GateSpec.from_dict(values.pop("gate", None))
-        module_policy = ModulePolicySpec.from_dict(
-            values.pop("module_policy", None),
-            field_name=f"scenarios.{scenario_id}.runs.{tier}.{run_id}.module_policy",
+        policy = ModulePolicySpec.from_dict(
+            values.pop("policy", None),
+            field_name=f"scenarios.{scenario_id}.runs.{tier}.{run_id}.policy",
         )
         return cls(
             id=run_id,
@@ -215,7 +215,7 @@ class RunSpec:
             kind=kind,
             probes=probes,
             gate=gate,
-            module_policy=module_policy,
+            policy=policy,
             options=values,
         )
 

@@ -187,7 +187,7 @@ class ParityDriver(ABC):
         """Return the module-tier FSM policy for inference parity."""
 
         del reference_output, whitelist
-        policy = self.case.run.module_policy
+        policy = self.case.run.policy
         return InferModulePolicy(
             max_steps=policy.max_steps,
             required_nodes=frozenset(policy.required_nodes),

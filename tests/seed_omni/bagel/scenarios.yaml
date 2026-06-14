@@ -170,7 +170,7 @@ scenarios:
             - text.hidden
             - text.logits
             - text.greedy_token
-          module_policy:
+          policy:
             required_nodes:
               - [prompt_encode, bagel_qwen2_mot.generate]
               - [prompt_encode, bagel_text_encoder.token_generate]
@@ -196,7 +196,7 @@ scenarios:
             - text.hidden
             - text.logits
             - text.greedy_token
-          module_policy:
+          policy:
             required_nodes:
               - [prompt_encode, bagel_qwen2_mot.generate]
               - [prompt_encode, bagel_text_encoder.token_generate]
@@ -227,7 +227,7 @@ scenarios:
             - text.hidden
             - text.logits
             - text.greedy_token
-          module_policy:
+          policy:
             required_nodes:
               - [prompt_encode, bagel_siglip_navit.generate]
               - [prompt_encode, bagel_qwen2_mot.generate]
@@ -267,7 +267,7 @@ scenarios:
             - image.hidden_sample
             - image.velocity
             - image.x_t
-          module_policy:
+          policy:
             required_nodes:
               - [image_flow, bagel_flow_connector.decode_velocity]
   infer_image_gen_wide_one_step:
@@ -305,7 +305,7 @@ scenarios:
             - image.hidden_sample
             - image.velocity
             - image.x_t
-          module_policy:
+          policy:
             required_nodes:
               - [image_flow, bagel_flow_connector.decode_velocity]
   infer_image_gen_cfg_text_one_step:
@@ -343,7 +343,7 @@ scenarios:
             - image.cfg_text_velocity
             - image.velocity
             - image.x_t
-          module_policy:
+          policy:
             required_nodes:
               - [image_flow, bagel_flow_connector.decode_velocity]
   infer_image_gen_cfg_image_one_step:
@@ -385,7 +385,7 @@ scenarios:
             - image.cfg_img_velocity
             - image.velocity
             - image.x_t
-          module_policy:
+          policy:
             required_nodes:
               - [image_flow, bagel_flow_connector.decode_velocity]
   infer_image_gen_cfg_renorm_one_step:
@@ -421,7 +421,7 @@ scenarios:
             - image.cfg_text_velocity
             - image.velocity
             - image.x_t
-          module_policy:
+          policy:
             required_nodes:
               - [image_flow, bagel_flow_connector.decode_velocity]
   infer_image_gen_multi_step_three_steps:
@@ -453,7 +453,7 @@ scenarios:
           probes:
             - image.velocity
             - image.x_t
-          module_policy:
+          policy:
             max_steps: 8
   infer_image_gen_decode_smoke:
     graph: infer_gen
@@ -485,7 +485,7 @@ scenarios:
           probes:
             - image.generated_image_count
             - image.generated_image_size
-          module_policy:
+          policy:
             max_steps: 8
   infer_image_gen_cfg_text_decode_smoke:
     graph: infer_gen
@@ -517,7 +517,7 @@ scenarios:
           probes:
             - image.generated_image_count
             - image.generated_image_size
-          module_policy:
+          policy:
             max_steps: 8
   infer_image_gen_cfg_image_decode_smoke:
     graph: infer_gen
@@ -549,7 +549,7 @@ scenarios:
           probes:
             - image.generated_image_count
             - image.generated_image_size
-          module_policy:
+          policy:
             max_steps: 8
   infer_image_edit_one_step:
     graph: infer_edit
@@ -589,7 +589,7 @@ scenarios:
             - image.hidden_sample
             - image.velocity
             - image.x_t
-          module_policy:
+          policy:
             required_nodes:
               - [image_flow, bagel_flow_connector.decode_velocity]
   infer_image_edit_text_branch_one_step:
@@ -613,7 +613,7 @@ scenarios:
             - text.hidden
             - text.logits
             - text.greedy_token
-          module_policy:
+          policy:
             required_nodes:
               - [prompt_encode, bagel_qwen2_mot.generate]
               - [prompt_encode, bagel_text_encoder.token_generate]
@@ -637,7 +637,7 @@ scenarios:
             - text.hidden
             - text.logits
             - text.greedy_token
-          module_policy:
+          policy:
             required_nodes:
               - [prompt_encode, bagel_qwen2_mot.generate]
               - [prompt_encode, bagel_text_encoder.token_generate]
@@ -663,7 +663,7 @@ scenarios:
             - text.hidden
             - text.logits
             - text.greedy_token
-          module_policy:
+          policy:
             required_nodes:
               - [prompt_encode, bagel_qwen2_mot.generate]
               - [prompt_encode, bagel_text_encoder.token_generate]
@@ -703,6 +703,6 @@ scenarios:
             - image.hidden_sample
             - image.velocity
             - image.x_t
-          module_policy:
+          policy:
             required_nodes:
               - [image_flow, bagel_flow_connector.decode_velocity]
