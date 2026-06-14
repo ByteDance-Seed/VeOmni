@@ -205,6 +205,18 @@ class WanSPAttnProcessor(WanAttnProcessor):
             key = gather_seq_scatter_heads(key, seq_dim=1, head_dim=2, group=get_parallel_state().ulysses_group)
             value = gather_seq_scatter_heads(value, seq_dim=1, head_dim=2, group=get_parallel_state().ulysses_group)
 
+        # PyTorch 2.11 + L20 can produce non-finite Wan T2V self-attention
+        # outputs through the dense FA2 path. A full-ones mask keeps semantics
+        # unchanged while routing HF/VeOmni FA2 through flash-attn varlen.
+        flash_attention_mask = attention_mask
+        if (
+            flash_attention_mask is None
+            and not is_cross_attention
+            and not use_diffusers_flash
+            and self.attn_implementation != "eager"
+        ):
+            flash_attention_mask = torch.ones(query.shape[0], key.shape[1], device=query.device, dtype=torch.int32)
+
         # I2V: additional cross-attention over image tokens (no Ulysses SP needed).
         hidden_states_img = None
         if encoder_hidden_states_img is not None:
@@ -236,7 +248,7 @@ class WanSPAttnProcessor(WanAttnProcessor):
                 query.transpose(1, 2),
                 key.transpose(1, 2),
                 value.transpose(1, 2),
-                attention_mask=None,
+                attention_mask=flash_attention_mask,
                 dropout=0.0,
                 is_causal=False,
                 skip_ulysses=True,
