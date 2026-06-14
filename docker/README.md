@@ -7,11 +7,14 @@ docker/
 ├── matrix.yaml            variant matrix (versions, toggles)
 ├── generate.py            PEP 723 script that renders Dockerfiles
 ├── templates/             Jinja2 source templates
-│   └── cuda.Dockerfile.j2
+│   ├── cuda.Dockerfile.j2
+│   └── ascend.Dockerfile.j2
 ├── cuda/                  ← generated, do not hand-edit
 │   ├── Dockerfile.cu128
 │   └── Dockerfile.cu129
-└── ascend/                hand-maintained for now (see "Ascend" below)
+└── ascend/                mix of generated + hand-maintained (see "Ascend" below)
+    ├── Dockerfile.ascend_8.3.rc2_a2.x86   ← generated, do not hand-edit
+    └── Dockerfile.ascend_*                  hand-maintained (pip-based)
 ```
 
 ## CUDA — generated from a template
@@ -23,9 +26,10 @@ docker/
 (`base_image`, `release_notes_url`).
 
 CI runs [`check_docker_generate.yml`](../.github/workflows/check_docker_generate.yml)
-on every PR that touches `docker/`. It re-renders the templates and fails if the
-on-disk Dockerfiles drift from the source — so hand-edits to `cuda/Dockerfile.*`
-will be flagged.
+on every PR that touches `docker/`. It re-renders the templates and fails if any
+on-disk generated Dockerfile drifts from the source — so hand-edits to a
+generated file (`cuda/Dockerfile.*` or the templated `ascend/` image) will be
+flagged.
 
 ### Updating
 
@@ -81,3 +85,30 @@ PEP 723 inline metadata at the top of `generate.py` also lets you do
 `uv run --no-project --script docker/generate.py` **from outside the repo
 root** (the project's `[tool.uv].required-version` pin would otherwise force
 an exact uv version on you).
+
+## Ascend
+
+The ascend images split into two groups:
+
+- **`Dockerfile.ascend_8.3.rc2_a2.x86`** — uv-based, **generated** from
+  [`templates/ascend.Dockerfile.j2`](templates/ascend.Dockerfile.j2) +
+  [`matrix.yaml`](matrix.yaml), same workflow and CI drift check as the CUDA
+  images. Don't hand-edit it; edit the template / matrix and re-run
+  `python docker/generate.py`.
+- **`Dockerfile.ascend_*_a2.arm` / `Dockerfile.ascend_*_a3`** — still
+  **hand-maintained**. They use `pip install -e .[npu_aarch64]` and build
+  `torchcodec` from source against CANN, which doesn't map onto the uv-based
+  template, so they're intentionally left out of the matrix.
+
+The ascend template reuses the same context as CUDA plus two ascend-specific
+knobs in the `matrix.yaml` image entry:
+
+- `header_comments` — the `# docker hub: ... / # cann web: ... / # git repo: ...`
+  provenance lines rendered above `FROM`.
+- `uv_extra_flags` — raw flags appended to `uv sync` (the CANN base image needs
+  `--allow-insecure-host github.com` / `--allow-insecure-host pythonhosted.org`
+  to fetch the github / pythonhosted wheel sources that `--locked` revalidates).
+
+To template another uv-based ascend variant (e.g. the `9.0.0_a2.x86` image),
+add an entry under `images:` pointing at `ascend.Dockerfile.j2` with the right
+`base_image` / `header_comments`, then re-run `python docker/generate.py`.
