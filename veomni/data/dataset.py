@@ -298,17 +298,16 @@ def get_length_by_labels_fn(sample):
     set additional ``IGNORE_INDEX`` positions later, but balancing is decided here at
     sample ingestion time.
     """
-    if "labels" not in sample:
-        return get_length_by_attention_mask_fn(sample)
+    if "labels" in sample:
+        labels = sample["labels"]
+        if isinstance(labels, torch.Tensor):
+            return int((labels != IGNORE_INDEX).sum().item())
+        if isinstance(labels, np.ndarray):
+            return int((labels != IGNORE_INDEX).sum())
+        if isinstance(labels, list):
+            return sum(1 for label in labels if label != IGNORE_INDEX)
 
-    labels = sample["labels"]
-    if isinstance(labels, torch.Tensor):
-        return int((labels != IGNORE_INDEX).sum().item())
-    if isinstance(labels, np.ndarray):
-        return int((labels != IGNORE_INDEX).sum())
-    if isinstance(labels, (list, tuple)):
-        return sum(label != IGNORE_INDEX for label in labels)
-    return int(labels != IGNORE_INDEX)
+    return get_length_by_attention_mask_fn(sample)
 
 
 def get_length_fn_by_count_mode(count_mode: str):

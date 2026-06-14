@@ -332,6 +332,13 @@ def test_get_length_fn_by_count_mode():
     assert get_length_by_labels_fn(np_sample) == 2
     assert get_length_by_input_ids_fn(np_sample) == 5
 
+    unsupported_labels_sample = {
+        "input_ids": [1, 2, 3],
+        "attention_mask": [1, 1, 0],
+        "labels": (IGNORE_INDEX, 1, 2),
+    }
+    assert get_length_by_labels_fn(unsupported_labels_sample) == 2
+
     with pytest.raises(ValueError, match="Unknown dyn_bsz count_mode"):
         get_length_fn_by_count_mode("bad-mode")
 
