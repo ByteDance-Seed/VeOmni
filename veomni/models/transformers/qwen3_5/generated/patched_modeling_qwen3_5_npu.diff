@@ -1266,7 +1266,7 @@
          return special_image_mask, special_video_mask
 
      def compute_3d_position_ids(
-@@ -1564,6 +2118,7 @@
+@@ -1564,13 +2118,18 @@
          image_grid_thw: torch.LongTensor | None = None,
          video_grid_thw: torch.LongTensor | None = None,
          mm_token_type_ids: torch.IntTensor | None = None,
@@ -1274,7 +1274,9 @@
          **kwargs: Unpack[TransformersKwargs],
      ) -> tuple | Qwen3_5ModelOutputWithPast:
          r"""
-@@ -1571,6 +2126,8 @@
++        cache_position (`torch.LongTensor`, *optional*):
++            Indices describing the positions of the input sequence tokens in the cache.
+         image_grid_thw (`torch.LongTensor` of shape `(num_images, 3)`, *optional*):
              The temporal, height and width of feature shape of each image in LLM.
          video_grid_thw (`torch.LongTensor` of shape `(num_videos, 3)`, *optional*):
              The temporal, height and width of feature shape of each video in LLM.
@@ -1283,7 +1285,7 @@
          """
          if (input_ids is None) ^ (inputs_embeds is not None):
              raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
-@@ -1578,29 +2135,169 @@
+@@ -1578,29 +2137,169 @@
          if inputs_embeds is None:
              inputs_embeds = self.get_input_embeddings()(input_ids)
 
@@ -1463,7 +1465,7 @@
              position_ids = self.compute_3d_position_ids(
                  input_ids=input_ids,
                  image_grid_thw=image_grid_thw,
-@@ -1610,6 +2307,18 @@
+@@ -1610,6 +2309,18 @@
                  past_key_values=past_key_values,
                  mm_token_type_ids=mm_token_type_ids,
              )
@@ -1482,7 +1484,7 @@
 
          outputs = self.language_model(
              input_ids=None,
-@@ -1617,6 +2326,7 @@
+@@ -1617,6 +2328,7 @@
              attention_mask=attention_mask,
              past_key_values=past_key_values,
              inputs_embeds=inputs_embeds,
@@ -1490,7 +1492,7 @@
              **kwargs,
          )
 
-@@ -1624,6 +2334,12 @@
+@@ -1624,6 +2336,12 @@
              **outputs,
              rope_deltas=self.rope_deltas,
          )
@@ -1503,7 +1505,7 @@
 
 
  @auto_docstring
-@@ -1654,6 +2370,7 @@
+@@ -1654,10 +2372,13 @@
          inputs_embeds: torch.FloatTensor | None = None,
          labels: torch.LongTensor | None = None,
          use_cache: bool | None = None,
@@ -1511,7 +1513,13 @@
          logits_to_keep: int | torch.Tensor = 0,
          **kwargs: Unpack[TransformersKwargs],
      ) -> CausalLMOutputWithPast:
-@@ -1686,21 +2403,50 @@
+         r"""
++        cache_position (`torch.LongTensor`, *optional*):
++            Indices describing the positions of the input sequence tokens in the cache.
+         labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
+             Labels for computing the masked language modeling loss. Indices should either be in `[0, ...,
+             config.vocab_size]` or -100 (see `input_ids` docstring). Tokens with indices set to `-100` are ignored
+@@ -1686,21 +2407,50 @@
              past_key_values=past_key_values,
              inputs_embeds=inputs_embeds,
              use_cache=use_cache,
@@ -1566,7 +1574,7 @@
              past_key_values=outputs.past_key_values,
              hidden_states=outputs.hidden_states,
              attentions=outputs.attentions,
-@@ -1740,6 +2486,31 @@
+@@ -1740,6 +2490,31 @@
      rope_deltas: torch.LongTensor | None = None
 
 
@@ -1598,7 +1606,7 @@
  class Qwen3_5ForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
      _tied_weights_keys = {"lm_head.weight": "model.language_model.embed_tokens.weight"}
      # Reference: fix gemma3 grad acc #37208
-@@ -1796,57 +2567,10 @@
+@@ -1796,57 +2571,10 @@
          pixel_values_videos: torch.FloatTensor | None = None,
          image_grid_thw: torch.LongTensor | None = None,
          video_grid_thw: torch.LongTensor | None = None,
@@ -1658,7 +1666,7 @@
          outputs = self.model(
              input_ids=input_ids,
              pixel_values=pixel_values,
-@@ -1857,27 +2581,54 @@
+@@ -1857,27 +2585,54 @@
              attention_mask=attention_mask,
              past_key_values=past_key_values,
              inputs_embeds=inputs_embeds,
@@ -1719,7 +1727,7 @@
          )
 
      def prepare_inputs_for_generation(
-@@ -2103,6 +2854,24 @@
+@@ -2103,6 +2858,24 @@
 
          return input_ids, model_kwargs
 

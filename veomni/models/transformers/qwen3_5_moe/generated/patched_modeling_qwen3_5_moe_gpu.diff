@@ -1433,16 +1433,18 @@
          **kwargs: Unpack[TransformersKwargs],
      ) -> tuple | Qwen3_5MoeModelOutputWithPast:
          r"""
-@@ -1691,6 +2375,8 @@
+@@ -1691,6 +2375,10 @@
              The temporal, height and width of feature shape of each image in LLM.
          video_grid_thw (`torch.LongTensor` of shape `(num_videos, 3)`, *optional*):
              The temporal, height and width of feature shape of each video in LLM.
 +        mm_token_type_ids (`torch.IntTensor` of shape `(batch_size, sequence_length)`, *optional*):
 +            Token type IDs for multimodal inputs.
++        cache_position (`torch.LongTensor`, *optional*):
++            Indices depicting the position of the input sequence tokens in the sequence.
          """
          if (input_ids is None) ^ (inputs_embeds is not None):
              raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
-@@ -1698,29 +2384,170 @@
+@@ -1698,29 +2386,170 @@
          if inputs_embeds is None:
              inputs_embeds = self.get_input_embeddings()(input_ids)
 
@@ -1623,7 +1625,7 @@
              position_ids = self.compute_3d_position_ids(
                  input_ids=input_ids,
                  image_grid_thw=image_grid_thw,
-@@ -1730,6 +2557,17 @@
+@@ -1730,6 +2559,17 @@
                  past_key_values=past_key_values,
                  mm_token_type_ids=mm_token_type_ids,
              )
@@ -1641,7 +1643,7 @@
 
          outputs = self.language_model(
              input_ids=None,
-@@ -1737,6 +2575,7 @@
+@@ -1737,6 +2577,7 @@
              attention_mask=attention_mask,
              past_key_values=past_key_values,
              inputs_embeds=inputs_embeds,
@@ -1649,7 +1651,7 @@
              **kwargs,
          )
 
-@@ -1828,6 +2667,12 @@
+@@ -1828,6 +2669,12 @@
      return overall_loss * num_experts
 
 
@@ -1662,7 +1664,7 @@
  @auto_docstring
  class Qwen3_5MoeForCausalLM(Qwen3_5MoePreTrainedModel, GenerationMixin):
      _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
-@@ -1848,6 +2693,7 @@
+@@ -1848,6 +2695,7 @@
          # Initialize weights and apply final processing
          self.post_init()
 
@@ -1670,7 +1672,7 @@
      @can_return_tuple
      @auto_docstring
      def forward(
-@@ -1860,9 +2706,10 @@
+@@ -1860,14 +2708,17 @@
          labels: torch.LongTensor | None = None,
          use_cache: bool | None = None,
          output_router_logits: bool | None = None,
@@ -1682,7 +1684,14 @@
          r"""
          labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
              Labels for computing the masked language modeling loss. Indices should either be in `[0, ...,
-@@ -1899,30 +2746,70 @@
+             config.vocab_size]` or -100 (see `input_ids` docstring). Tokens with indices set to `-100` are ignored
+             (masked), the loss is only computed for the tokens with labels in `[0, ..., config.vocab_size]`.
++        cache_position (`torch.LongTensor`, *optional*):
++            Indices depicting the position of the input sequence tokens in the sequence.
+
+         Example:
+
+@@ -1899,30 +2750,70 @@
              inputs_embeds=inputs_embeds,
              use_cache=use_cache,
              output_router_logits=output_router_logits,
@@ -1765,7 +1774,7 @@
              loss=loss,
              aux_loss=aux_loss,
              logits=logits,
-@@ -1930,7 +2817,14 @@
+@@ -1930,7 +2821,14 @@
              hidden_states=outputs.hidden_states,
              attentions=outputs.attentions,
              router_logits=outputs.router_logits,
@@ -1781,7 +1790,7 @@
 
 
  class Qwen3_5MoeForConditionalGeneration(Qwen3_5MoePreTrainedModel, GenerationMixin):
-@@ -1977,6 +2871,7 @@
+@@ -1977,6 +2875,7 @@
          """
          return self.model.get_image_features(pixel_values, image_grid_thw, **kwargs)
 
@@ -1789,7 +1798,7 @@
      @can_return_tuple
      def forward(
          self,
-@@ -1990,105 +2885,93 @@
+@@ -1990,105 +2889,93 @@
          pixel_values_videos: torch.FloatTensor | None = None,
          image_grid_thw: torch.LongTensor | None = None,
          video_grid_thw: torch.LongTensor | None = None,
@@ -1950,7 +1959,7 @@
          )
 
      def prepare_inputs_for_generation(
-@@ -2314,6 +3197,30 @@
+@@ -2314,6 +3201,30 @@
 
          return input_ids, model_kwargs
 

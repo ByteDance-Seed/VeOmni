@@ -603,6 +603,14 @@ class Qwen3VLVisionBlock(GradientCheckpointingLayer):
         position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
         **kwargs,
     ) -> torch.Tensor:
+        r"""
+        cu_seqlens (`torch.Tensor`):
+            Cumulative sequence lengths for variable-length vision attention.
+        max_seqlen (`int`):
+            Maximum per-image or per-video sequence length in the packed vision batch.
+        rotary_pos_emb (`torch.Tensor`, *optional*):
+            Precomputed rotary position embeddings for vision attention.
+        """
         hidden_states = hidden_states + self.attn(
             self.norm1(hidden_states),
             cu_seqlens=cu_seqlens,
@@ -1831,6 +1839,8 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
         **kwargs: Unpack[TransformersKwargs],
     ) -> tuple | Qwen3VLModelOutputWithPast:
         r"""
+        cache_position (`torch.LongTensor`, *optional*):
+            Indices describing the positions of the input sequence tokens in the cache.
         image_grid_thw (`torch.LongTensor` of shape `(num_images, 3)`, *optional*):
             The temporal, height and width of feature shape of each image in LLM.
         video_grid_thw (`torch.LongTensor` of shape `(num_videos, 3)`, *optional*):

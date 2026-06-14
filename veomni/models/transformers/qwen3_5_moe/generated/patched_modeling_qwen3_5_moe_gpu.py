@@ -2377,6 +2377,8 @@ class Qwen3_5MoeModel(Qwen3_5MoePreTrainedModel):
             The temporal, height and width of feature shape of each video in LLM.
         mm_token_type_ids (`torch.IntTensor` of shape `(batch_size, sequence_length)`, *optional*):
             Token type IDs for multimodal inputs.
+        cache_position (`torch.LongTensor`, *optional*):
+            Indices depicting the position of the input sequence tokens in the sequence.
         """
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
@@ -2715,6 +2717,8 @@ class Qwen3_5MoeForCausalLM(Qwen3_5MoePreTrainedModel, GenerationMixin):
             Labels for computing the masked language modeling loss. Indices should either be in `[0, ...,
             config.vocab_size]` or -100 (see `input_ids` docstring). Tokens with indices set to `-100` are ignored
             (masked), the loss is only computed for the tokens with labels in `[0, ..., config.vocab_size]`.
+        cache_position (`torch.LongTensor`, *optional*):
+            Indices depicting the position of the input sequence tokens in the sequence.
 
         Example:
 
