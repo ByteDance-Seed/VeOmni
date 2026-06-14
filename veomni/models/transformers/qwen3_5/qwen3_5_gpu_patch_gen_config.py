@@ -1107,6 +1107,8 @@ def qwen3_5_model_forward(
     **kwargs: Unpack[TransformersKwargs],
 ) -> tuple | Qwen3_5ModelOutputWithPast:
     r"""
+    cache_position (`torch.LongTensor`, *optional*):
+        Indices describing the positions of the input sequence tokens in the cache.
     image_grid_thw (`torch.LongTensor` of shape `(num_images, 3)`, *optional*):
         The temporal, height and width of feature shape of each image in LLM.
     video_grid_thw (`torch.LongTensor` of shape `(num_videos, 3)`, *optional*):
@@ -1338,6 +1340,8 @@ def qwen3_5_forcausallm_forward_patched(
     **kwargs: Unpack[TransformersKwargs],
 ) -> CausalLMOutputWithPast:
     r"""
+    cache_position (`torch.LongTensor`, *optional*):
+        Indices describing the positions of the input sequence tokens in the cache.
     labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
         Labels for computing the masked language modeling loss. Indices should either be in `[0, ...,
         config.vocab_size]` or -100 (see `input_ids` docstring). Tokens with indices set to `-100` are ignored

@@ -1110,6 +1110,8 @@ def qwen2_5_omni_thinker_forward_patched(
     **kwargs: Unpack[TransformersKwargs],
 ) -> tuple | Qwen2_5OmniThinkerCausalLMOutputWithLogProbs:
     r"""
+    cache_position (`torch.LongTensor`, *optional*):
+        Indices describing the positions of the input sequence tokens in the cache.
     image_grid_thw (`torch.LongTensor` of shape `(num_images, 3)`, *optional*):
         The temporal, height and width of feature shape of each image in LLM.
     video_grid_thw (`torch.LongTensor` of shape `(num_videos, 3)`, *optional*):

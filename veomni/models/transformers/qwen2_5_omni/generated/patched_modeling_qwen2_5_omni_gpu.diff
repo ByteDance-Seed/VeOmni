@@ -1354,7 +1354,7 @@
 
      def get_placeholder_mask(
          self,
-@@ -1875,133 +2373,202 @@
+@@ -1875,133 +2373,204 @@
          special_audio_mask = special_audio_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
          return special_image_mask, special_video_mask, special_audio_mask
 
@@ -1429,6 +1429,8 @@
 -    ) -> tuple | Qwen2_5OmniThinkerCausalLMOutputWithPast:
 +    ) -> tuple | Qwen2_5OmniThinkerCausalLMOutputWithLogProbs:
          r"""
++        cache_position (`torch.LongTensor`, *optional*):
++            Indices describing the positions of the input sequence tokens in the cache.
          image_grid_thw (`torch.LongTensor` of shape `(num_images, 3)`, *optional*):
              The temporal, height and width of feature shape of each image in LLM.
          video_grid_thw (`torch.LongTensor` of shape `(num_videos, 3)`, *optional*):
@@ -1641,7 +1643,7 @@
                      audio_feature_lengths,
                      video_second_per_grid,
                  )
-@@ -2009,11 +2576,16 @@
+@@ -2009,11 +2578,16 @@
                  self.rope_deltas = rope_deltas
              else:
                  batch_size, seq_length = input_ids.shape
@@ -1659,7 +1661,7 @@
 
          outputs = self.model(
              attention_mask=attention_mask,
-@@ -2021,27 +2593,61 @@
+@@ -2021,27 +2595,61 @@
              past_key_values=past_key_values,
              inputs_embeds=inputs_embeds,
              use_cache=use_cache,
@@ -1731,7 +1733,7 @@
 
      def prepare_inputs_for_generation(
          self,
-@@ -2090,860 +2696,54 @@
+@@ -2090,860 +2698,54 @@
 
          return model_inputs
 
@@ -2640,7 +2642,7 @@
 
 
  # Modified from Llama with a different rotate function, will fixed in next release
-@@ -2980,708 +2780,10 @@
+@@ -2980,708 +2782,10 @@
      return q_embed, k_embed
 
 
@@ -3353,7 +3355,7 @@
 
 
  ############################
-@@ -3708,22 +2810,74 @@
+@@ -3708,22 +2812,74 @@
          "Qwen2_5OmniToken2WavModel",
      ]
 
@@ -3438,7 +3440,7 @@
 
      def load_speakers(self, path):
          check_torch_load_is_safe()
-@@ -3785,244 +2939,71 @@
+@@ -3785,244 +2941,71 @@
 
          return model
 

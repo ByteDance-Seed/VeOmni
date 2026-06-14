@@ -398,7 +398,7 @@
  class Qwen2_5_VLVisionBlock(GradientCheckpointingLayer):
      def __init__(self, config, attn_implementation: str = "sdpa") -> None:
          super().__init__()
-@@ -299,24 +547,29 @@
+@@ -299,24 +547,37 @@
          self.attn = Qwen2_5_VLVisionAttention(config=config)
          self.mlp = Qwen2_5_VLMLP(config, bias=True)
 
@@ -419,12 +419,16 @@
          position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
          **kwargs,
      ) -> torch.Tensor:
--        r"""
--        cu_seqlens (`torch.Tensor`):
+         r"""
+         cu_seqlens (`torch.Tensor`):
 -            Cumulative sequence lengths used for packed variable-length attention in Flash Attention kernels.
--        rotary_pos_emb (`torch.Tensor`, *optional*):
++            Cumulative sequence lengths for variable-length vision attention.
++        max_seqlen (`int`):
++            Maximum per-image or per-video sequence length in the packed vision batch.
+         rotary_pos_emb (`torch.Tensor`, *optional*):
 -            Precomputed rotary positional embeddings applied to the vision attention query/key states.
--        """
++            Precomputed rotary position embeddings for vision attention.
+         """
          hidden_states = hidden_states + self.attn(
              self.norm1(hidden_states),
              cu_seqlens=cu_seqlens,
@@ -434,7 +438,7 @@
              rotary_pos_emb=rotary_pos_emb,
              position_embeddings=position_embeddings,
              **kwargs,
-@@ -346,6 +599,12 @@
+@@ -346,6 +607,12 @@
              init.copy_(module.inv_freq, inv_freq)
 
 
@@ -447,7 +451,7 @@
  class Qwen2_5_VisionTransformerPretrainedModel(Qwen2_5_VLPreTrainedModel):
      config: Qwen2_5_VLVisionConfig
      _no_split_modules = ["Qwen2_5_VLVisionBlock"]
-@@ -407,66 +666,248 @@
+@@ -407,66 +674,248 @@
          )
          return window_index, cu_window_seqlens.tolist()
 
@@ -722,7 +726,7 @@
 
 
  @auto_docstring(
-@@ -891,6 +1332,12 @@
+@@ -891,6 +1340,12 @@
              last_hidden_state=hidden_states,
              past_key_values=past_key_values,
          )
@@ -735,7 +739,7 @@
 
 
  @auto_docstring
-@@ -1100,13 +1547,20 @@
+@@ -1100,13 +1555,20 @@
              The temporal, height and width of feature shape of each video in LLM.
          """
          pixel_values_videos = pixel_values_videos.type(self.visual.dtype)
@@ -761,7 +765,7 @@
      @accepts_precomputed_kwargs(modality="image")
      @can_return_tuple
      @auto_docstring
-@@ -1123,52 +1577,28 @@
+@@ -1123,52 +1585,28 @@
              The temporal, height and width of feature shape of each image in LLM.
          """
          pixel_values = pixel_values.type(self.visual.dtype)
@@ -828,7 +832,7 @@
          return special_image_mask, special_video_mask
 
      def compute_3d_position_ids(
-@@ -1219,6 +1649,25 @@
+@@ -1219,6 +1657,25 @@
              position_ids = None
          return position_ids
 
@@ -854,7 +858,7 @@
      @can_return_tuple
      @auto_docstring
      def forward(
-@@ -1229,12 +1678,15 @@
+@@ -1229,16 +1686,21 @@
          past_key_values: Cache | None = None,
          inputs_embeds: torch.FloatTensor | None = None,
          use_cache: bool | None = None,
@@ -871,7 +875,13 @@
          second_per_grid_ts: torch.Tensor | None = None,
          **kwargs: Unpack[TransformersKwargs],
      ) -> tuple | Qwen2_5_VLModelOutputWithPast:
-@@ -1248,27 +1700,142 @@
+         r"""
++        cache_position (`torch.LongTensor`, *optional*):
++            Indices describing the positions of the input sequence tokens in the cache.
+         image_grid_thw (`torch.LongTensor` of shape `(num_images, 3)`, *optional*):
+             The temporal, height and width of feature shape of each image in LLM.
+         video_grid_thw (`torch.LongTensor` of shape `(num_videos, 3)`, *optional*):
+@@ -1248,27 +1710,142 @@
          second_per_grid_ts (`torch.Tensor` of shape `(num_videos)`, *optional*):
              The time interval (in seconds) for each grid along the temporal dimension in the 3D position IDs.
          """
@@ -1024,7 +1034,7 @@
              position_ids = self.compute_3d_position_ids(
                  input_ids=input_ids,
                  image_grid_thw=image_grid_thw,
-@@ -1279,6 +1846,15 @@
+@@ -1279,6 +1856,15 @@
                  past_key_values=past_key_values,
                  mm_token_type_ids=mm_token_type_ids,
              )
@@ -1040,7 +1050,7 @@
 
          outputs = self.language_model(
              input_ids=None,
-@@ -1287,16 +1863,21 @@
+@@ -1287,16 +1873,21 @@
              past_key_values=past_key_values,
              inputs_embeds=inputs_embeds,
              use_cache=use_cache,
@@ -1063,7 +1073,7 @@
 
 
  @auto_docstring(
-@@ -1328,6 +1909,12 @@
+@@ -1328,6 +1919,12 @@
      rope_deltas: torch.LongTensor | None = None
 
 
@@ -1076,7 +1086,7 @@
  class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMixin):
      _tied_weights_keys = {"lm_head.weight": "model.language_model.embed_tokens.weight"}
      # Reference: fix gemma3 grad acc #37208
-@@ -1370,6 +1957,16 @@
+@@ -1370,6 +1967,16 @@
          """
          return self.model.get_image_features(pixel_values, image_grid_thw, **kwargs)
 
@@ -1093,7 +1103,7 @@
      @can_return_tuple
      @auto_docstring
      def forward(
-@@ -1381,21 +1978,19 @@
+@@ -1381,21 +1988,21 @@
          inputs_embeds: torch.FloatTensor | None = None,
          labels: torch.LongTensor | None = None,
          use_cache: bool | None = None,
@@ -1116,10 +1126,12 @@
 -            Labels for computing the masked language modeling loss. Indices should either be in `[0, ...,
 -            config.vocab_size]` or -100 (see `input_ids` docstring). Tokens with indices set to `-100` are ignored
 -            (masked), the loss is only computed for the tokens with labels in `[0, ..., config.vocab_size]`.
++        cache_position (`torch.LongTensor`, *optional*):
++            Indices describing the positions of the input sequence tokens in the cache.
          image_grid_thw (`torch.LongTensor` of shape `(num_images, 3)`, *optional*):
              The temporal, height and width of feature shape of each image in LLM.
          video_grid_thw (`torch.LongTensor` of shape `(num_videos, 3)`, *optional*):
-@@ -1404,79 +1999,76 @@
+@@ -1404,79 +2011,76 @@
              The rope index difference between sequence length and multimodal rope.
          second_per_grid_ts (`torch.Tensor` of shape `(num_videos)`, *optional*):
              The time interval (in seconds) for each grid along the temporal dimension in the 3D position IDs.
@@ -1245,7 +1257,7 @@
          )
 
      def prepare_inputs_for_generation(
-@@ -1696,5 +2288,44 @@
+@@ -1696,5 +2300,44 @@
 
          return input_ids, model_kwargs
 
