@@ -174,17 +174,17 @@ class WanSPAttnProcessor(WanAttnProcessor):
             query = apply_rotary_emb(query, *rotary_emb)
             key = apply_rotary_emb(key, *rotary_emb)
 
-        # Route to the right attention kernel. Wan's CUDA non-SP
-        # ``flash_attention_2`` path is diffusers' flash backend; keep that for
-        # single-rank parity. The T2V SP-aware VeOmni FA2 path uses the
-        # Transformers/VeOmni attention wrapper because diffusers' direct flash
-        # backend is not stable on the L20 Wan toy fixture. I2V attention keeps
-        # the diffusers flash path to avoid changing its image-context layout.
+        # Route to the right attention kernel. Wan T2V uses the
+        # Transformers/VeOmni FA2 wrapper for both single-rank and SP training:
+        # diffusers' direct flash backend is finite in eval/no-grad parity but
+        # can produce non-finite outputs on the L20 bf16 grad-enabled path under
+        # PyTorch 2.11. I2V attention keeps the diffusers flash path to avoid
+        # changing its image-context layout.
         attention_interface: Callable = wan_eager_attention_forward
         use_fp32_attention = query.dtype == torch.float32 and attn.to_q.weight.dtype == torch.float32
         use_diffusers_flash = (
-            self.attn_implementation == "flash_attention_2"
-            or (self.attn_implementation == "veomni_flash_attention_2_with_sp" and attn.add_k_proj is not None)
+            self.attn_implementation in ("flash_attention_2", "veomni_flash_attention_2_with_sp")
+            and attn.add_k_proj is not None
         ) and not is_torch_npu_available()
         if use_diffusers_flash and not use_fp32_attention:
             attention_interface = None
