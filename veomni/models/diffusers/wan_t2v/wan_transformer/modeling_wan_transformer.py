@@ -130,8 +130,11 @@ class WanSPAttnProcessor(WanAttnProcessor):
         # Route to the right attention kernel via ALL_ATTENTION_FUNCTIONS.
         # SP has already been handled above, so skip it inside the kernel.
         attention_interface: Callable = wan_eager_attention_forward
-        if self.attn_implementation != "eager":
+        use_fp32_attention = query.dtype == torch.float32 and attn.to_q.weight.dtype == torch.float32
+        if self.attn_implementation != "eager" and not use_fp32_attention:
             attention_interface = ALL_ATTENTION_FUNCTIONS[self.attn_implementation]
+        elif self.attn_implementation != "eager":
+            logger.warning_once("Wan attention is running in fp32, so using eager SDPA instead of flash-attention.")
 
         kernel_module = WanAttentionKernelModule(self.config, attn)
 
