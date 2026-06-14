@@ -347,7 +347,7 @@ def _run_wan_sp_baseline_check() -> None:
 
 
 def _run_wan_backward_finite() -> None:
-    os.environ["MODELING_BACKEND"] = "hf"
+    os.environ["MODELING_BACKEND"] = "veomni"
     os.environ["DIFFUSERS_ATTN_BACKEND"] = "flash"
 
     from veomni.models.diffusers.wan_t2v.wan_transformer.configuration_wan_transformer import (
@@ -450,7 +450,7 @@ def test_wan_forward_bitwise_equal_to_diffusers_flash_attention_2():
 def test_wan_flash_attention_2_backward_is_finite():
     """Wan bf16 FA2 train-mode forward/backward stays finite on the e2e fixture."""
     env = os.environ.copy()
-    env["MODELING_BACKEND"] = "hf"
+    env["MODELING_BACKEND"] = "veomni"
     env[WAN_PARITY_CHILD_ENV] = "1"
     env[WAN_PARITY_MODE_ENV] = "backward_finite"
     env["PYTHONPATH"] = os.pathsep.join(part for part in (REPO_ROOT, env.get("PYTHONPATH")) if part)

@@ -188,12 +188,17 @@ class WanSPAttnProcessor(WanAttnProcessor):
         ) and not is_torch_npu_available()
         if use_diffusers_flash and not use_fp32_attention:
             attention_interface = None
+        elif self.attn_implementation == "flash_attention_2" and not use_fp32_attention:
+            attention_interface = ALL_ATTENTION_FUNCTIONS["veomni_flash_attention_2_with_sp"]
         elif self.attn_implementation != "eager" and not use_fp32_attention:
             attention_interface = ALL_ATTENTION_FUNCTIONS[self.attn_implementation]
         elif self.attn_implementation != "eager":
             logger.warning_once("Wan attention is running in fp32, so using eager SDPA instead of flash-attention.")
 
-        kernel_module = WanAttentionKernelModule(self.config, attn)
+        kernel_config = self.config
+        if self.attn_implementation == "flash_attention_2" and not use_diffusers_flash:
+            kernel_config = SimpleNamespace(_attn_implementation="veomni_flash_attention_2_with_sp")
+        kernel_module = WanAttentionKernelModule(kernel_config, attn)
 
         if not (use_diffusers_flash and not use_fp32_attention) and use_sp and not use_sp_before_rotary:
             query = gather_seq_scatter_heads(query, seq_dim=1, head_dim=2, group=get_parallel_state().ulysses_group)
