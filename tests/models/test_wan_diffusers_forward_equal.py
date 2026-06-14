@@ -523,7 +523,7 @@ def test_wan_forward_sp2_matches_no_sp_flash_attention_2():
         pytest.skip(f"Requires at least {world_size} CUDA devices.")
 
     env = os.environ.copy()
-    env["MODELING_BACKEND"] = "hf"
+    env["MODELING_BACKEND"] = "veomni"
     env[WAN_PARITY_CHILD_ENV] = "1"
     env[WAN_PARITY_MODE_ENV] = "sp_baseline_check"
     env["PYTHONPATH"] = os.pathsep.join(part for part in (REPO_ROOT, env.get("PYTHONPATH")) if part)
