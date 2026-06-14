@@ -54,6 +54,17 @@ def wan_eager_attention_forward(
     return attn_output.transpose(1, 2), None
 
 
+class WanAttentionKernelModule:
+    def __init__(self, config: SimpleNamespace, attn: WanAttention):
+        self.config = config
+        self.is_causal = False
+        self.layer_idx = getattr(attn, "layer_idx", None)
+        self._attn = attn
+
+    def modules(self):
+        return self._attn.modules()
+
+
 class WanSPAttnProcessor(WanAttnProcessor):
     def __init__(self, attn_implementation: str):
         self.attn_implementation = attn_implementation
@@ -116,6 +127,8 @@ class WanSPAttnProcessor(WanAttnProcessor):
         if self.attn_implementation != "eager":
             attention_interface = ALL_ATTENTION_FUNCTIONS[self.attn_implementation]
 
+        kernel_module = WanAttentionKernelModule(self.config, attn)
+
         # I2V: additional cross-attention over image tokens (no Ulysses SP needed).
         hidden_states_img = None
         if encoder_hidden_states_img is not None:
@@ -125,7 +138,7 @@ class WanSPAttnProcessor(WanAttnProcessor):
             key_img = key_img.unflatten(2, (attn.heads, -1))
             value_img = value_img.unflatten(2, (attn.heads, -1))
             hidden_states_img = attention_interface(
-                self,
+                kernel_module,
                 query.transpose(1, 2),
                 key_img.transpose(1, 2),
                 value_img.transpose(1, 2),
@@ -137,7 +150,7 @@ class WanSPAttnProcessor(WanAttnProcessor):
             hidden_states_img = hidden_states_img.flatten(2, 3).type_as(query)
 
         hidden_states_out = attention_interface(
-            self,
+            kernel_module,
             query.transpose(1, 2),
             key.transpose(1, 2),
             value.transpose(1, 2),
