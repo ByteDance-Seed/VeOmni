@@ -37,8 +37,10 @@ _EXPECTED_PROCESS_OUTPUT_FILE_ARGS = ("output_file", "output_data", "input_files
 _SUPPORTED_PROCESS_OUTPUT_FILE_SHA256 = {
     # torch 2.9.1
     "0837813477b4ca319890ef671b954f83bbe966f21a751875606b74e4e8e30ea8",
-    # torch 2.11.0
+    # torch 2.11.0 upstream source
     "ff25a85cc52018707334f1206760fe186146771e5357388f0b4d6bc19bdf61c1",
+    # torch 2.11.0+cu130 CI wheel
+    "433c9d026092f48f5ba02631975294de1a8ae98e020d5cb6ffd0f5db760476fe",
 }
 
 
