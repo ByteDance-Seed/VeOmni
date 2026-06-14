@@ -93,10 +93,15 @@ class BagelSiglipNavitModuleMixin(ModuleMixin):
         image_item.value = image_embeds
         image_item.meta["image_embeds"] = image_embeds.detach()
         image_item.meta["image_embeds_ready"] = True
-        return {
+        output: Dict[str, Any] = {
             "conversation_list": conversation_list,
             "bagel_last_image_embeds": image_embeds.detach(),
+            "bagel_last_image_embeds_sample": _sample_tensor(image_embeds),
         }
+        preprocessed_image_size = image_item.meta.get("preprocessed_image_size")
+        if preprocessed_image_size is not None:
+            output["bagel_preprocessed_image_size"] = torch.tensor(preprocessed_image_size, dtype=torch.long)
+        return output
 
     def _prepare_image_item(self, image_item: ConversationItem) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         value = image_item.value
@@ -280,6 +285,12 @@ class BagelSiglipNavitModuleMixin(ModuleMixin):
         if isinstance(value, int):
             return value
         return default
+
+
+def _sample_tensor(value: torch.Tensor) -> torch.Tensor:
+    if value.dim() >= 2:
+        return value.detach()[:4, :4]
+    return value.detach()[:16]
 
 
 __all__ = ["BagelSiglipNavitModuleMixin"]

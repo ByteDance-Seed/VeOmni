@@ -54,6 +54,25 @@ def _string_tuple(value: Any, *, field_name: str) -> tuple[str, ...]:
     return tuple(str(item) for item in value)
 
 
+def _node_pairs(value: Any, *, field_name: str) -> tuple[tuple[str, str], ...]:
+    if value is None:
+        return ()
+    if not isinstance(value, list):
+        raise TypeError(f"{field_name} must be a list of [state, node] pairs.")
+    pairs: list[tuple[str, str]] = []
+    for item in value:
+        if isinstance(item, dict):
+            if "state" not in item or "node" not in item:
+                raise TypeError(f"{field_name} dict entries must contain state and node.")
+            pairs.append((str(item["state"]), str(item["node"])))
+            continue
+        if isinstance(item, (list, tuple)) and len(item) == 2:
+            pairs.append((str(item[0]), str(item[1])))
+            continue
+        raise TypeError(f"{field_name} entries must be [state, node] pairs or mappings.")
+    return tuple(pairs)
+
+
 @dataclass(frozen=True)
 class ReferenceSpec:
     loader: str
@@ -149,6 +168,37 @@ class GateSpec:
 
 
 @dataclass(frozen=True)
+class ModulePolicySpec:
+    required_nodes: tuple[tuple[str, str], ...] = ()
+    max_steps: int | None = None
+    allow_finalize: bool = False
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None, *, field_name: str) -> ModulePolicySpec:
+        values = dict(data or {})
+        max_steps = values.get("max_steps")
+        return cls(
+            required_nodes=_node_pairs(values.get("required_nodes"), field_name=f"{field_name}.required_nodes"),
+            max_steps=None if max_steps is None else int(max_steps),
+            allow_finalize=bool(values.get("allow_finalize", False)),
+        )
+
+
+@dataclass(frozen=True)
+class FrameworkPolicySpec:
+    kind: str = ""
+    options: dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None, *, scenario_id: str) -> FrameworkPolicySpec:
+        values = dict(data or {})
+        kind = values.pop("kind", "")
+        if not kind:
+            raise ValueError(f"Scenario {scenario_id} framework policy must declare kind.")
+        return cls(kind=str(kind), options=values)
+
+
+@dataclass(frozen=True)
 class ScenarioSpec:
     id: str
     graph: str
@@ -156,6 +206,8 @@ class ScenarioSpec:
     stimulus: dict[str, Any] = field(default_factory=dict)
     probes: tuple[str, ...] = ()
     tiers: tuple[str, ...] = ()
+    module_policy: ModulePolicySpec = field(default_factory=ModulePolicySpec)
+    framework_policy: FrameworkPolicySpec | None = None
 
     @classmethod
     def from_dict(cls, scenario_id: str, data: dict[str, Any]) -> ScenarioSpec:
@@ -175,6 +227,15 @@ class ScenarioSpec:
             stimulus=stimulus,
             probes=_string_tuple(data.get("probes"), field_name=f"scenarios.{scenario_id}.probes"),
             tiers=_string_tuple(data.get("tiers"), field_name=f"scenarios.{scenario_id}.tiers"),
+            module_policy=ModulePolicySpec.from_dict(
+                data.get("module_policy"),
+                field_name=f"scenarios.{scenario_id}.module_policy",
+            ),
+            framework_policy=(
+                None
+                if data.get("framework") is None
+                else FrameworkPolicySpec.from_dict(data.get("framework"), scenario_id=scenario_id)
+            ),
         )
 
 

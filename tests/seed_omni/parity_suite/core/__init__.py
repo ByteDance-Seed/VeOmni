@@ -2,10 +2,18 @@
 
 from .comparator import compare_values
 from .discovery import GraphSpec, NodeSpec, ParityCase, discover_cases, discover_graph_specs, discover_nodes
-from .mapping import MappingSpec, ProbeMapping, RefTapSpec, ResolvedMapping, load_mapping_spec, resolve_mapping
+from .mapping import (
+    MappingSpec,
+    ProbeMapping,
+    RefTapSpec,
+    ResolvedMapping,
+    V2GradSpec,
+    load_mapping_spec,
+    resolve_mapping,
+)
 from .metrics import MetricResult, Tolerance, compare_tensors, tolerance_from_policy
 from .report import ParityReport, ProbeReport
-from .spec import PARITY_ENABLE_ENV, ModelSpec, ReferenceSpec, ScenarioSpec, load_model_spec
+from .spec import PARITY_ENABLE_ENV, FrameworkPolicySpec, ModelSpec, ReferenceSpec, ScenarioSpec, load_model_spec
 from .utilities import (
     autocast_for_dtype,
     configure_torch_determinism,
@@ -34,7 +42,9 @@ __all__ = [
     "RefTapSpec",
     "ResolvedMapping",
     "ScenarioSpec",
+    "FrameworkPolicySpec",
     "Tolerance",
+    "V2GradSpec",
     "autocast_for_dtype",
     "configure_torch_determinism",
     "compare_tensors",

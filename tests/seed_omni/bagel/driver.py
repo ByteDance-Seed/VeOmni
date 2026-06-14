@@ -3,57 +3,41 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import dataclass
 from typing import Any
 
 import torch
 from torch import nn
 
 from tests.seed_omni.bagel.reference_execution import (
-    extract_train_ce_loss,
-    extract_train_grad_early_q_proj,
-    extract_train_grad_gen_q_proj,
-    extract_train_grad_llm2vae,
-    extract_train_grad_lm_head_rows,
-    extract_train_mse_loss,
-)
-from tests.seed_omni.bagel.reference_execution import (
     run_reference as run_reference_execution,
 )
-from tests.seed_omni.bagel.v2_execution import (
-    build_conversation_from_canonical,
-    run_v2_infer_module,
-)
+from tests.seed_omni.bagel.v2_execution import build_conversation_from_canonical
 from tests.seed_omni.parity_suite.core import ParityCase, to_device
-from tests.seed_omni.parity_suite.core.utilities import sample_named_grad
 from tests.seed_omni.parity_suite.driver import ParityDriver
 from tests.seed_omni.parity_suite.reference.capture import ReferenceCaptureContext
 from tests.seed_omni.parity_suite.reference.loader import load_reference_model
+from tests.seed_omni.parity_suite.v2.infer_fsm import InferModulePolicy
 from tests.seed_omni.parity_suite.v2.model import load_omni_config_from_dir, load_omni_module_from_pretrained
-from tests.seed_omni.parity_suite.v2.observation import record_module_output
 from veomni.models.seed_omni.modeling_omni import OmniModel
 
 
-SUPPORTED_DRIVER_CASES = frozenset({"text_und", "image_gen", "image_edit", "train_ce_mse"})
+SUPPORTED_DRIVER_CASES = frozenset({"text_und", "text_image_und", "image_gen", "image_edit", "train_ce_mse"})
+_TRAIN_CASE = "train_ce_mse"
+_IMAGE_GENERATION_CASES = frozenset({"image_gen", "image_edit"})
+_IMAGE_UNDERSTANDING_CASES = frozenset({"text_image_und", "image_edit"})
+_FLOW_CASES = frozenset({"image_gen", "image_edit"})
+
+
+@dataclass(frozen=True)
+class _V2ModuleNeeds:
+    siglip: bool
+    flow: bool
+    vae: bool
 
 
 def create_driver(case: ParityCase) -> BagelParityDriver:
     return BagelParityDriver(case)
-
-
-def extract_hidden_state(context: ReferenceCaptureContext) -> torch.Tensor:
-    return context.output["reference"]["hidden_state"]
-
-
-def extract_greedy_token(context: ReferenceCaptureContext) -> torch.Tensor:
-    return context.output["reference"]["greedy_token"]
-
-
-def extract_image_velocity(context: ReferenceCaptureContext) -> torch.Tensor:
-    return context.output["reference"]["velocity"]
-
-
-def extract_image_x_t(context: ReferenceCaptureContext) -> torch.Tensor:
-    return context.output["reference"]["x_t"]
 
 
 class BagelParityDriver(ParityDriver):
@@ -65,13 +49,11 @@ class BagelParityDriver(ParityDriver):
             raise NotImplementedError(f"Unsupported BAGEL driver_case: {case.scenario.driver_case!r}")
 
     def load_reference(self, *, device: torch.device, dtype: torch.dtype) -> nn.Module:
-        is_train = self.case.scenario.driver_case == "train_ce_mse"
-        is_image_generation = is_train or self.case.scenario.driver_case in {"image_gen", "image_edit"}
-        is_image_edit = self.case.scenario.driver_case == "image_edit"
+        visual_gen, visual_und = self._reference_visual_flags()
         return load_reference_model(
             self.case.model.reference,
-            visual_gen=is_image_generation,
-            visual_und=is_image_edit,
+            visual_gen=visual_gen,
+            visual_und=visual_und,
             init_on_meta=True,
             torch_dtype=dtype,
             device=device,
@@ -89,23 +71,24 @@ class BagelParityDriver(ParityDriver):
         is_training = self.case.graph.domain == "training"
         graph = None if is_training else self.case.graph.name
         config = load_omni_config_from_dir(self.case.model.v2_model.config_dir, graph=graph)
-        is_image_edit = self.case.scenario.driver_case == "image_edit"
-        needs_flow = is_training or self.case.scenario.driver_case in {"image_gen", "image_edit"}
+        needs = self._v2_module_needs(is_training=is_training)
         text_encoder = load_omni_module_from_pretrained(model_root / "bagel_text_encoder", device=device, dtype=dtype)
         qwen2_mot = load_omni_module_from_pretrained(model_root / "bagel_qwen2_mot", device=device, dtype=dtype)
-        if needs_flow:
+        if needs.flow:
             flow_connector: nn.Module = load_omni_module_from_pretrained(
                 model_root / "bagel_flow_connector", device=device, dtype=dtype
             )
         else:
             flow_connector = _UnusedModule()
-        if is_training or is_image_edit:
+        if needs.siglip:
             siglip: nn.Module = load_omni_module_from_pretrained(
                 model_root / "bagel_siglip_navit", device=device, dtype=dtype
             )
-            vae: nn.Module = load_omni_module_from_pretrained(model_root / "bagel_vae", device=device, dtype=dtype)
         else:
             siglip = _NoopGenerateModule()
+        if needs.vae:
+            vae: nn.Module = load_omni_module_from_pretrained(model_root / "bagel_vae", device=device, dtype=dtype)
+        else:
             vae = _UnusedModule()
         modules: dict[str, nn.Module] = {
             "bagel_text_encoder": text_encoder.eval(),
@@ -116,10 +99,41 @@ class BagelParityDriver(ParityDriver):
         }
         return OmniModel(config, modules).eval()
 
+    def _reference_visual_flags(self) -> tuple[bool, bool]:
+        driver_case = self.case.scenario.driver_case
+        loss_mode = str(self.case.scenario.stimulus.get("loss_mode", "ce_mse"))
+        is_train = driver_case == _TRAIN_CASE
+        visual_gen = driver_case in _IMAGE_GENERATION_CASES or (is_train and loss_mode in {"ce_mse", "mse_only"})
+        visual_und = driver_case in _IMAGE_UNDERSTANDING_CASES or (is_train and loss_mode == "text_image_ce")
+        return visual_gen, visual_und
+
+    def _v2_module_needs(self, *, is_training: bool) -> _V2ModuleNeeds:
+        driver_case = self.case.scenario.driver_case
+        return _V2ModuleNeeds(
+            siglip=is_training or driver_case in _IMAGE_UNDERSTANDING_CASES,
+            flow=is_training or driver_case in _FLOW_CASES,
+            vae=is_training
+            or driver_case == "image_edit"
+            or bool(self.case.scenario.stimulus.get("enable_decode_smoke", False)),
+        )
+
     def generation_kwargs(self, model_or_config: Any) -> dict[str, Any]:
         kwargs = super().generation_kwargs(model_or_config)
-        if "infer_mode" in self.case.scenario.stimulus:
-            kwargs["infer_mode"] = self.case.scenario.stimulus["infer_mode"]
+        for key in (
+            "infer_mode",
+            "max_flow_steps",
+            "num_timesteps",
+            "timestep_shift",
+            "latent_downsample",
+            "cfg_text_scale",
+            "cfg_img_scale",
+            "cfg_interval",
+            "cfg_renorm_min",
+            "cfg_renorm_type",
+            "enable_taylorseer",
+        ):
+            if key in self.case.scenario.stimulus:
+                kwargs[key] = self.case.scenario.stimulus[key]
         return kwargs
 
     @torch.no_grad()
@@ -137,62 +151,51 @@ class BagelParityDriver(ParityDriver):
     def v2_train_batch_kwargs(self, reference_output: Mapping[str, Any], *, device: torch.device) -> dict[str, Any]:
         return {"bagel_packed_batch": to_device(reference_output["canonical"]["train_batch"], device)}
 
-    def record_v2_train_extra_observations(
-        self,
-        model: OmniModel,
-        observations: dict[tuple[str, str], list[dict[str, Any]]],
-        whitelist: Mapping[tuple[str, str], frozenset[str]],
-        *,
-        batch: Mapping[str, Any],
-    ) -> None:
-        packed_batch = batch["bagel_packed_batch"]
-        gradient_records = {
-            "bagel_qwen2_mot.forward": {
-                "train_grad_early_q_proj": sample_named_grad(
-                    model.get_module("bagel_qwen2_mot"),
-                    "model.layers.0.self_attn.q_proj.weight",
-                ),
-                "train_grad_gen_q_proj": sample_named_grad(
-                    model.get_module("bagel_qwen2_mot"),
-                    "model.layers.0.self_attn.q_proj_moe_gen.weight",
-                ),
-            },
-            "bagel_text_encoder.decode": {
-                "train_grad_lm_head_rows": sample_named_grad(
-                    model.get_module("bagel_text_encoder"),
-                    "lm_head.weight",
-                    rows=torch.unique(packed_batch["packed_label_ids"].detach().cpu()).to(dtype=torch.long),
-                ),
-            },
-            "bagel_flow_connector.decode_velocity": {
-                "train_grad_llm2vae": sample_named_grad(
-                    model.get_module("bagel_flow_connector"),
-                    "llm2vae.weight",
-                ),
-            },
-        }
-        for node, out in gradient_records.items():
-            record_module_output(observations, whitelist, state="train", node=node, out=out)
-
-    @torch.no_grad()
-    def run_v2_infer_module(
+    def v2_infer_module_policy(
         self,
         reference_output: Mapping[str, Any],
         whitelist: Mapping[tuple[str, str], frozenset[str]],
-        *,
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> dict[str, Any]:
-        model = self.load_v2_model(device=device, dtype=dtype)
-        generation_kwargs = self.generation_kwargs(model)
-        return run_v2_infer_module(
-            model,
-            self.case.scenario.driver_case,
-            reference_output,
-            whitelist,
-            generation_kwargs=generation_kwargs,
-            device=device,
-        )
+    ) -> InferModulePolicy:
+        return super().v2_infer_module_policy(reference_output, whitelist)
+
+    def sample_v2_framework_parameters(
+        self,
+        model: OmniModel,
+        batch: Mapping[str, Any],
+    ) -> Mapping[str, torch.Tensor]:
+        packed_batch = _packed_batch(batch)
+        label_rows = torch.unique(packed_batch["packed_label_ids"].detach().cpu()).to(dtype=torch.long)
+        return {
+            "qwen_early_q_proj": _sample_param(
+                model.get_module("bagel_qwen2_mot"),
+                "model.layers.0.self_attn.q_proj.weight",
+            ),
+            "lm_head_rows": _sample_param(
+                model.get_module("bagel_text_encoder"),
+                "lm_head.weight",
+                rows=label_rows,
+            ),
+            "flow_llm2vae": _sample_param(
+                model.get_module("bagel_flow_connector"),
+                "llm2vae.weight",
+            ),
+        }
+
+
+def _sample_param(module: nn.Module, name: str, rows: torch.Tensor | None = None) -> torch.Tensor:
+    value = dict(module.named_parameters())[name].detach().cpu()
+    if rows is not None:
+        return value[rows]
+    if value.dim() >= 2:
+        return value[:4, :4]
+    return value[:16]
+
+
+def _packed_batch(batch: Mapping[str, Any]) -> Mapping[str, Any]:
+    packed = batch.get("bagel_packed_batch")
+    if isinstance(packed, Mapping):
+        return packed
+    return batch
 
 
 class _NoopGenerateModule(nn.Module):
@@ -206,6 +209,10 @@ class _UnusedModule(nn.Module):
         del kwargs
         return {"conversation_list": conversation_list}
 
+    def decode(self, conversation_list: list[Any] | None = None, **kwargs: Any) -> dict[str, Any]:
+        del kwargs
+        return {"conversation_list": conversation_list}
+
     def embed_latent(self, conversation_list: list[Any] | None = None, **kwargs: Any) -> dict[str, Any]:
         del kwargs
         return {"conversation_list": conversation_list}
@@ -215,14 +222,4 @@ __all__ = [
     "BagelParityDriver",
     "SUPPORTED_DRIVER_CASES",
     "create_driver",
-    "extract_greedy_token",
-    "extract_hidden_state",
-    "extract_image_velocity",
-    "extract_image_x_t",
-    "extract_train_ce_loss",
-    "extract_train_grad_early_q_proj",
-    "extract_train_grad_gen_q_proj",
-    "extract_train_grad_lm_head_rows",
-    "extract_train_grad_llm2vae",
-    "extract_train_mse_loss",
 ]

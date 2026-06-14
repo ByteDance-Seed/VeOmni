@@ -57,6 +57,8 @@ class BagelVAEModuleMixin(ModuleMixin):
         item.meta["decoded_image_ready"] = True
         return {
             "conversation_list": conversation_list,
+            "bagel_generated_image_count": torch.tensor(1, dtype=torch.long),
+            "bagel_generated_image_size": torch.tensor([image_height, image_width], dtype=torch.long),
             "bagel_decoded_pixel_values": decoded.detach(),
             "generated": {"type": "image", "value": image, "meta": {"image_size": [image_height, image_width]}},
         }

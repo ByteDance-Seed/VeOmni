@@ -109,6 +109,7 @@ class BagelQwen2MoTModuleMixin(ModuleMixin):
         return {
             "conversation_list": conversation_list,
             "bagel_last_hidden_state": hidden_states.detach(),
+            "bagel_last_hidden_state_sample": _sample_tensor(hidden_states),
             "past_key_values": self._past_key_values,
             "key_values_lens": None if self._key_values_lens is None else self._key_values_lens.detach(),
         }
@@ -223,6 +224,7 @@ class BagelQwen2MoTModuleMixin(ModuleMixin):
         result: Dict[str, Any] = {
             "conversation_list": conversation_list,
             "bagel_last_hidden_state": hidden_states.detach(),
+            "bagel_last_hidden_state_sample": _sample_tensor(hidden_states),
             "past_key_values": self._past_key_values,
             "key_values_lens": None if self._key_values_lens is None else self._key_values_lens.detach(),
         }
@@ -236,6 +238,7 @@ class BagelQwen2MoTModuleMixin(ModuleMixin):
             )
             item.meta["cfg_text_hidden_state"] = cfg_text_hidden_states.detach()
             result["bagel_last_cfg_text_hidden_state"] = cfg_text_hidden_states.detach()
+            result["bagel_last_cfg_text_hidden_state_sample"] = _sample_tensor(cfg_text_hidden_states)
         if self._cfg_img_active(item, generation_kwargs):
             cfg_img_hidden_states = self._decode_cfg_img_image_flow(
                 item,
@@ -246,6 +249,7 @@ class BagelQwen2MoTModuleMixin(ModuleMixin):
             )
             item.meta["cfg_img_hidden_state"] = cfg_img_hidden_states.detach()
             result["bagel_last_cfg_img_hidden_state"] = cfg_img_hidden_states.detach()
+            result["bagel_last_cfg_img_hidden_state_sample"] = _sample_tensor(cfg_img_hidden_states)
         return result
 
     def _decode_cfg_text_image_flow(
@@ -560,6 +564,12 @@ class BagelQwen2MoTModuleMixin(ModuleMixin):
                 item.value = next(hidden_iter)
         if next(hidden_iter, None) is not None:
             raise RuntimeError("BagelQwen2MoT hidden-state segment count exceeds conversation items.")
+
+
+def _sample_tensor(value: torch.Tensor) -> torch.Tensor:
+    if value.dim() >= 2:
+        return value.detach()[:4, :4]
+    return value.detach()[:16]
 
 
 __all__ = ["BagelQwen2MoTModuleMixin"]

@@ -138,7 +138,9 @@ class BagelFlowConnectorModuleMixin(ModuleMixin):
         return {
             "conversation_list": conversation_list,
             "bagel_last_latent_embeds": latent_embeds.detach(),
+            "bagel_last_latent_embeds_sample": _sample_tensor(latent_embeds),
             "bagel_last_packed_sequence": packed_sequence.detach(),
+            "bagel_last_packed_sequence_sample": _sample_tensor(packed_sequence),
         }
 
     def _embed_vae_context_graph(
@@ -176,7 +178,9 @@ class BagelFlowConnectorModuleMixin(ModuleMixin):
         return {
             "conversation_list": conversation_list,
             "bagel_last_vae_context_latent_embeds": latent_embeds.detach(),
+            "bagel_last_vae_context_latent_embeds_sample": _sample_tensor(latent_embeds),
             "bagel_last_vae_context_packed_sequence": packed_sequence.detach(),
+            "bagel_last_vae_context_packed_sequence_sample": _sample_tensor(packed_sequence),
         }
 
     def _decode_velocity_graph(
@@ -197,6 +201,8 @@ class BagelFlowConnectorModuleMixin(ModuleMixin):
         vae_token_indexes = self._meta_tensor(item, "vae_token_indexes", dtype=torch.long)
         base_velocity = velocity_all[vae_token_indexes]
         velocity = base_velocity
+        cfg_text_hidden_states = None
+        cfg_img_hidden_states = None
         cfg_text_velocity = None
         cfg_img_velocity = None
         cfg_text_is_active = self._cfg_text_active(item)
@@ -238,6 +244,12 @@ class BagelFlowConnectorModuleMixin(ModuleMixin):
         output: Dict[str, Any] = {
             "conversation_list": conversation_list,
             "bagel_last_base_velocity": base_velocity.detach(),
+            "bagel_last_cfg_text_hidden_state_sample": None
+            if cfg_text_hidden_states is None
+            else _sample_tensor(cfg_text_hidden_states),
+            "bagel_last_cfg_img_hidden_state_sample": None
+            if cfg_img_hidden_states is None
+            else _sample_tensor(cfg_img_hidden_states),
             "bagel_last_cfg_text_velocity": None if cfg_text_velocity is None else cfg_text_velocity.detach(),
             "bagel_last_cfg_img_velocity": None if cfg_img_velocity is None else cfg_img_velocity.detach(),
             "bagel_last_velocity": velocity.detach(),
@@ -461,15 +473,15 @@ class BagelFlowConnectorModuleMixin(ModuleMixin):
             ("cfg_img_scale", 1.0),
             ("cfg_renorm_min", 0.0),
         ):
-            if key in kwargs and key not in item.meta:
+            if key in kwargs:
                 item.meta[key] = float(kwargs[key])
             else:
                 item.meta.setdefault(key, default)
-        if "cfg_interval" in kwargs and "cfg_interval" not in item.meta:
+        if "cfg_interval" in kwargs:
             item.meta["cfg_interval"] = list(kwargs["cfg_interval"])
         else:
             item.meta.setdefault("cfg_interval", [0.0, 1.0])
-        if "cfg_renorm_type" in kwargs and "cfg_renorm_type" not in item.meta:
+        if "cfg_renorm_type" in kwargs:
             item.meta["cfg_renorm_type"] = str(kwargs["cfg_renorm_type"])
         else:
             item.meta.setdefault("cfg_renorm_type", "global")
@@ -557,6 +569,12 @@ class BagelFlowConnectorModuleMixin(ModuleMixin):
         coords_h = torch.arange(0, num_patches_h, dtype=torch.long)
         coords_w = torch.arange(0, num_patches_w, dtype=torch.long)
         return (coords_h[:, None] * max_num_patches_per_side + coords_w).flatten()
+
+
+def _sample_tensor(value: torch.Tensor) -> torch.Tensor:
+    if value.dim() >= 2:
+        return value.detach()[:4, :4]
+    return value.detach()[:16]
 
 
 __all__ = ["BagelFlowConnectorModuleMixin", "SIGNAL_IMAGE_COMPLETE"]

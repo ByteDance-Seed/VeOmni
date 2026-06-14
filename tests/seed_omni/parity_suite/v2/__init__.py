@@ -1,6 +1,7 @@
 """V2-side observation and runner helpers for the parity suite."""
 
-from .model import ModuleNode, load_omni_config_from_dir, load_omni_module_from_pretrained, run_module_nodes
+from .infer_fsm import InferModulePolicy, ModuleNode, run_infer_module_fsm, run_module_nodes
+from .model import load_omni_config_from_dir, load_omni_module_from_pretrained
 from .observation import (
     ModuleObservationSink,
     ObserverSink,
@@ -14,6 +15,7 @@ from .observation import (
 
 __all__ = [
     "ObserverSink",
+    "InferModulePolicy",
     "ModuleObservationSink",
     "ModuleNode",
     "arm_generation_observer",
@@ -23,5 +25,6 @@ __all__ = [
     "load_omni_config_from_dir",
     "load_omni_module_from_pretrained",
     "record_module_output",
+    "run_infer_module_fsm",
     "run_module_nodes",
 ]

@@ -9,137 +9,15 @@ import torch
 
 from tests.seed_omni.bagel.transformers.bagel import make_reference_image
 from tests.seed_omni.parity_suite.core import to_device
-from tests.seed_omni.parity_suite.v2.model import (
-    ModuleNode,
-    run_module_nodes,
-)
 from veomni.models.seed_omni.conversation import ConversationItem
-from veomni.models.seed_omni.modeling_omni import OmniModel
 
 
 BAGEL_ORACLE_SOURCE = "bagel_official_oracle"
-BAGEL_MODULE_NAMES = (
-    "bagel_text_encoder",
-    "bagel_qwen2_mot",
-    "bagel_flow_connector",
-    "bagel_siglip_navit",
-    "bagel_vae",
-)
-IMAGE_EDIT_CONTEXT_NODES: tuple[ModuleNode, ...] = (
-    ("bagel_vae", "encode"),
-    ("bagel_siglip_navit", "generate"),
-)
-PROMPT_ENCODE_NODES: tuple[ModuleNode, ...] = (("bagel_text_encoder", "prompt_encode"),)
-TEXT_UND_GENERATE_NODES: tuple[ModuleNode, ...] = (("bagel_qwen2_mot", "generate"),)
-TEXT_UND_TOKEN_NODES: tuple[ModuleNode, ...] = (("bagel_text_encoder", "token_generate"),)
-IMAGE_EDIT_LATENT_PROMPT_NODES: tuple[ModuleNode, ...] = (
-    ("bagel_flow_connector", "embed_latent"),
-    ("bagel_qwen2_mot", "generate"),
-    ("bagel_text_encoder", "prompt_encode"),
-)
-IMAGE_FLOW_NODES: tuple[ModuleNode, ...] = (
-    ("bagel_flow_connector", "embed_latent"),
-    ("bagel_qwen2_mot", "generate"),
-    ("bagel_flow_connector", "decode_velocity"),
-)
-
-
-def run_v2_infer_module(
-    model: OmniModel,
-    driver_case: str,
-    reference_output: Mapping[str, Any],
-    whitelist: Mapping[tuple[str, str], frozenset[str]],
-    *,
-    generation_kwargs: Mapping[str, Any],
-    device: torch.device,
-) -> dict[str, Any]:
-    ctx: dict[str, Any] = {
-        "conversation_list": build_conversation_from_canonical(reference_output["canonical"], device=device)
-    }
-    observations: dict[tuple[str, str], list[dict[str, Any]]] = {}
-
-    bagel_modules = {name: model.get_module(name) for name in BAGEL_MODULE_NAMES}
-
-    if driver_case == "image_edit":
-        run_module_nodes(
-            IMAGE_EDIT_CONTEXT_NODES,
-            modules=bagel_modules,
-            ctx=ctx,
-            observations=observations,
-            whitelist=whitelist,
-            state="prompt_encode",
-            generation_kwargs=generation_kwargs,
-        )
-
-    run_module_nodes(
-        PROMPT_ENCODE_NODES,
-        modules=bagel_modules,
-        ctx=ctx,
-        observations=observations,
-        whitelist=whitelist,
-        state="prompt_encode",
-        generation_kwargs=generation_kwargs,
-    )
-
-    if driver_case == "image_edit":
-        run_module_nodes(
-            IMAGE_EDIT_LATENT_PROMPT_NODES,
-            modules=bagel_modules,
-            ctx=ctx,
-            observations=observations,
-            whitelist=whitelist,
-            state="prompt_encode",
-            generation_kwargs=generation_kwargs,
-        )
-        run_module_nodes(
-            IMAGE_FLOW_NODES,
-            modules=bagel_modules,
-            ctx=ctx,
-            observations=observations,
-            whitelist=whitelist,
-            state="image_flow",
-            generation_kwargs=generation_kwargs,
-        )
-        return {"observations": observations, "ctx": ctx, "trace": ["module:prompt_encode", "module:image_flow"]}
-
-    run_module_nodes(
-        TEXT_UND_GENERATE_NODES,
-        modules=bagel_modules,
-        ctx=ctx,
-        observations=observations,
-        whitelist=whitelist,
-        state="prompt_encode",
-        generation_kwargs=generation_kwargs,
-    )
-
-    if driver_case == "image_gen":
-        run_module_nodes(
-            IMAGE_FLOW_NODES,
-            modules=bagel_modules,
-            ctx=ctx,
-            observations=observations,
-            whitelist=whitelist,
-            state="image_flow",
-            generation_kwargs=generation_kwargs,
-        )
-        return {"observations": observations, "ctx": ctx, "trace": ["module:prompt_encode", "module:image_flow"]}
-
-    run_module_nodes(
-        TEXT_UND_TOKEN_NODES,
-        modules=bagel_modules,
-        ctx=ctx,
-        observations=observations,
-        whitelist=whitelist,
-        state="prompt_encode",
-        generation_kwargs=generation_kwargs,
-    )
-    return {"observations": observations, "ctx": ctx, "trace": ["module:prompt_encode"]}
 
 
 def build_conversation_from_canonical(canonical: Mapping[str, Any], *, device: torch.device) -> list[ConversationItem]:
-    if canonical.get("kind") in {"image_gen", "image_edit"}:
-        return _build_image_conversation_from_canonical(canonical, device=device)
-    return _build_text_conversation_from_canonical(canonical, device=device)
+    builder = _CONVERSATION_BUILDERS.get(str(canonical.get("kind", "")), _build_text_conversation_from_canonical)
+    return builder(canonical, device=device)
 
 
 def _build_text_conversation_from_canonical(
@@ -174,6 +52,61 @@ def _build_text_und_item(canonical: Mapping[str, Any], *, device: torch.device) 
                 "key_value_lens": start["key_values_lens"].detach().to(dtype=torch.int32),
                 "context_indexes": canonical["packed_key_value_indexes_for_step"].to(device=device, dtype=torch.long),
             },
+        },
+    )
+
+
+def _build_text_image_und_conversation_from_canonical(
+    canonical: Mapping[str, Any], *, device: torch.device
+) -> list[ConversationItem]:
+    return [
+        _build_image_und_item(canonical, device=device),
+        _build_text_und_item(canonical, device=device),
+    ]
+
+
+def _build_image_und_item(canonical: Mapping[str, Any], *, device: torch.device) -> ConversationItem:
+    if canonical.get("use_raw_image", False):
+        return _build_raw_image_und_item(canonical)
+    return _build_prepared_image_und_item(canonical, device=device)
+
+
+def _build_raw_image_und_item(canonical: Mapping[str, Any]) -> ConversationItem:
+    return ConversationItem(
+        type="image",
+        value=make_reference_image(int(canonical["image_width"]), int(canonical["image_height"])),
+        role="user",
+        source=BAGEL_ORACLE_SOURCE,
+        meta={
+            "bagel_role": "image_und",
+            "raw_image_size": [canonical["image_width"], canonical["image_height"]],
+        },
+    )
+
+
+def _build_prepared_image_und_item(canonical: Mapping[str, Any], *, device: torch.device) -> ConversationItem:
+    image = to_device(canonical["image_input"], device)
+    return ConversationItem(
+        type="image",
+        value=image["packed_vit_tokens"].detach().to(dtype=torch.float32),
+        role="user",
+        source=BAGEL_ORACLE_SOURCE,
+        meta={
+            "bagel_role": "image_und",
+            "raw_image_size": [canonical["image_width"], canonical["image_height"]],
+            "image_token_ids": image["packed_text_ids"].detach().to(dtype=torch.long),
+            "image_text_indexes": image["packed_text_indexes"].detach().to(dtype=torch.long),
+            "vit_position_ids": image["packed_vit_position_ids"].detach().to(dtype=torch.long),
+            "vit_token_indexes": image["packed_vit_token_indexes"].detach().to(dtype=torch.long),
+            "vit_token_lens": image["vit_token_seqlens"].detach().to(dtype=torch.int32),
+            "position_ids": image["packed_position_ids"].detach().to(dtype=torch.long),
+            "sequence_indexes": image["packed_indexes"].detach().to(dtype=torch.long),
+            "context_indexes": image["packed_key_value_indexes"].detach().to(dtype=torch.long),
+            "query_lens": image["packed_seqlens"].detach().to(dtype=torch.int32),
+            "key_value_lens_before": image["key_values_lens"].detach().to(dtype=torch.int32),
+            "key_value_lens_after": canonical["kv_lens_after_image"],
+            "rope_after": canonical["ropes_after_image"],
+            "is_causal": False,
         },
     )
 
@@ -259,7 +192,13 @@ def _build_image_vae_input_item(canonical: Mapping[str, Any]) -> ConversationIte
     )
 
 
+_CONVERSATION_BUILDERS = {
+    "text_image_und": _build_text_image_und_conversation_from_canonical,
+    "image_gen": _build_image_conversation_from_canonical,
+    "image_edit": _build_image_conversation_from_canonical,
+}
+
+
 __all__ = [
     "build_conversation_from_canonical",
-    "run_v2_infer_module",
 ]

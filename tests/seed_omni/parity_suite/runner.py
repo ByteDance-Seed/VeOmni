@@ -20,14 +20,29 @@ from tests.seed_omni.parity_suite.driver import ParityDriver
 from tests.seed_omni.parity_suite.reference.capture import capture_reference_taps
 
 
+_V2_DISPATCH: dict[tuple[str, str], str] = {
+    ("training", "graph"): "run_v2_train_graph",
+    ("training", "module"): "run_v2_train_module",
+    ("training", "framework"): "run_v2_train_framework",
+    ("inference", "graph"): "run_v2_infer_graph",
+    ("inference", "module"): "run_v2_infer_module",
+    ("inference", "framework"): "run_v2_infer_framework",
+}
+
+
 def run_parity_case(case: ParityCase) -> ParityReport:
     """Run one discovered graph case against its online reference oracle."""
 
     if case.tier not in {"graph", "module", "framework"}:
         raise NotImplementedError(f"Unsupported parity tier for execution: {case.tier!r}")
+    driver = _load_driver(case)
+    if case.tier == "framework" and case.scenario.framework_policy is not None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        dtype = driver.dtype()
+        driver.configure_determinism(case.model.seed)
+        return driver.run_framework_policy(device=device, dtype=dtype)
     selected = case.model.mapping.for_probe_names(case.scenario.probes)
     resolved = resolve_mapping(mappings=selected, nodes=case.nodes)
-    driver = _load_driver(case)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dtype = driver.dtype()
 
@@ -73,21 +88,10 @@ def _run_v2(
     device: torch.device,
     dtype: torch.dtype,
 ) -> dict[str, Any]:
-    if case.graph.domain == "training":
-        if case.tier == "graph":
-            return driver.run_v2_train_graph(reference_output, v2_whitelist, device=device, dtype=dtype)
-        if case.tier == "module":
-            return driver.run_v2_train_module(reference_output, v2_whitelist, device=device, dtype=dtype)
-        if case.tier == "framework":
-            return driver.run_v2_train_framework(reference_output, v2_whitelist, device=device, dtype=dtype)
-    if case.graph.domain == "inference":
-        if case.tier == "graph":
-            return driver.run_v2_infer_graph(reference_output, v2_whitelist, device=device, dtype=dtype)
-        if case.tier == "module":
-            return driver.run_v2_infer_module(reference_output, v2_whitelist, device=device, dtype=dtype)
-        if case.tier == "framework":
-            return driver.run_v2_infer_framework(reference_output, v2_whitelist, device=device, dtype=dtype)
-    raise NotImplementedError(f"Unsupported V2 dispatch for domain={case.graph.domain!r}, tier={case.tier!r}.")
+    method_name = _V2_DISPATCH.get((case.graph.domain, case.tier))
+    if method_name is None:
+        raise NotImplementedError(f"Unsupported V2 dispatch for domain={case.graph.domain!r}, tier={case.tier!r}.")
+    return getattr(driver, method_name)(reference_output, v2_whitelist, device=device, dtype=dtype)
 
 
 def _reference_probe_values(taps: dict[str, list[Any]], mapping: ProbeMapping) -> list[Any]:
@@ -106,6 +110,8 @@ def _v2_probe_values(
     values: list[Any] = []
     for node in case.nodes:
         if node.name != mapping.node or node.state is None:
+            continue
+        if mapping.state is not None and node.state != mapping.state:
             continue
         for record in observations.get((node.state, node.name), []):
             if mapping.v2_field in record:

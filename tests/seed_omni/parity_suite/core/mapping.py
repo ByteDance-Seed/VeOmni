@@ -29,7 +29,34 @@ class RefTapSpec:
             return cls(kind="hook", target=raw)
         if isinstance(raw, dict) and "extractor" in raw:
             return cls(kind="extractor", target=str(raw["extractor"]))
-        raise TypeError(f"Probe {probe} ref_tap must be a hook path string or {{extractor: entrypoint}} mapping.")
+        if isinstance(raw, dict) and "output" in raw:
+            return cls(kind="output", target=str(raw["output"]))
+        raise TypeError(
+            f"Probe {probe} ref_tap must be a hook path string, "
+            "{extractor: entrypoint}, or {output: context.output.path} mapping."
+        )
+
+
+@dataclass(frozen=True)
+class V2GradSpec:
+    module: str
+    parameter: str
+    rows_from: str | None = None
+
+    @classmethod
+    def from_raw(cls, raw: Any, *, probe: str) -> V2GradSpec | None:
+        if raw is None:
+            return None
+        if not isinstance(raw, dict):
+            raise TypeError(f"Probe {probe} v2_grad must be a mapping.")
+        if "module" not in raw or "parameter" not in raw:
+            raise ValueError(f"Probe {probe} v2_grad must declare module and parameter.")
+        rows_from = raw.get("rows_from")
+        return cls(
+            module=str(raw["module"]),
+            parameter=str(raw["parameter"]),
+            rows_from=None if rows_from is None else str(rows_from),
+        )
 
 
 @dataclass(frozen=True)
@@ -39,6 +66,8 @@ class ProbeMapping:
     v2_field: str
     ref_tap: RefTapSpec
     tol: str
+    state: str | None = None
+    v2_grad: V2GradSpec | None = None
 
     @classmethod
     def from_raw(cls, node: str, probe: str, raw: Mapping[str, Any]) -> ProbeMapping:
@@ -54,6 +83,8 @@ class ProbeMapping:
             v2_field=str(raw["v2_field"]),
             ref_tap=RefTapSpec.from_raw(raw["ref_tap"], probe=f"{node}.{probe}"),
             tol=str(raw["tol"]),
+            state=None if raw.get("state") is None else str(raw["state"]),
+            v2_grad=V2GradSpec.from_raw(raw.get("v2_grad"), probe=f"{node}.{probe}"),
         )
 
 
@@ -139,6 +170,8 @@ def resolve_mapping(
         for node in node_by_name[mapping.node]:
             if node.state is None:
                 continue
+            if mapping.state is not None and node.state != mapping.state:
+                continue
             whitelist.setdefault((node.state, node.name), set()).add(mapping.v2_field)
 
     return ResolvedMapping(
@@ -165,6 +198,11 @@ def _append_ref_tap(
     if mapping.ref_tap.kind == "extractor":
         extractor_taps.append(ExtractorTap(name=mapping.probe, extractor=_load_extractor(mapping.ref_tap.target)))
         return
+    if mapping.ref_tap.kind == "output":
+        extractor_taps.append(
+            ExtractorTap(name=mapping.probe, extractor=_load_output_extractor(mapping.ref_tap.target))
+        )
+        return
     raise ValueError(f"Unsupported ref_tap kind: {mapping.ref_tap.kind}")
 
 
@@ -174,11 +212,32 @@ def _load_extractor(entrypoint: str) -> Callable[[ReferenceCaptureContext], Any]
     return getattr(module, symbol_name)
 
 
+def _load_output_extractor(path: str) -> Callable[[ReferenceCaptureContext], Any]:
+    parts = tuple(part for part in path.split(".") if part)
+    if not parts:
+        raise ValueError("ref_tap output path must not be empty.")
+
+    def _extract(context: ReferenceCaptureContext) -> Any:
+        value: Any = context.output
+        for part in parts:
+            if isinstance(value, Mapping):
+                value = value[part]
+                continue
+            if isinstance(value, (list, tuple)):
+                value = value[int(part)]
+                continue
+            value = getattr(value, part)
+        return value
+
+    return _extract
+
+
 __all__ = [
     "MappingSpec",
     "ProbeMapping",
     "RefTapSpec",
     "ResolvedMapping",
+    "V2GradSpec",
     "load_mapping_spec",
     "resolve_mapping",
 ]

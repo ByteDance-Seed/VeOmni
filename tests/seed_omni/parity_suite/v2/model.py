@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -10,12 +9,8 @@ import torch
 import yaml
 from torch import nn
 
-from tests.seed_omni.parity_suite.v2.observation import record_module_output
 from veomni.models.seed_omni.configuration_omni import OmniConfig
 from veomni.models.seed_omni.modules import OMNI_MODEL_REGISTRY, read_model_type
-
-
-ModuleNode = tuple[str, str]
 
 
 def load_omni_config_from_dir(config_dir: str | Path, *, graph: str | None = None) -> OmniConfig:
@@ -46,35 +41,11 @@ def load_omni_module_from_pretrained(
     return module.to(device=device)
 
 
-def run_module_nodes(
-    nodes: Sequence[ModuleNode],
-    *,
-    modules: Mapping[str, nn.Module],
-    ctx: dict[str, Any],
-    observations: dict[tuple[str, str], list[dict[str, Any]]],
-    whitelist: Mapping[tuple[str, str], frozenset[str]],
-    state: str,
-    generation_kwargs: Mapping[str, Any],
-) -> None:
-    for module_name, method in nodes:
-        out = getattr(modules[module_name], method)(**ctx, generation_kwargs=generation_kwargs)
-        record_module_output(
-            observations,
-            whitelist,
-            state=state,
-            node=f"{module_name}.{method}",
-            out=out,
-        )
-        ctx.update(out)
-
-
 def _load_yaml(path: Path) -> Any:
     return yaml.safe_load(path.read_text(encoding="utf-8"))
 
 
 __all__ = [
-    "ModuleNode",
     "load_omni_config_from_dir",
     "load_omni_module_from_pretrained",
-    "run_module_nodes",
 ]
