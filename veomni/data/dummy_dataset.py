@@ -348,7 +348,6 @@ class WanT2VDataset(Dataset):
     WIDTH = 16
     TEXT_SEQ_LEN = 10
     TEXT_DIM = 512  # matches toy config text_dim
-    INPUT_SCALE = 0.01
     TIMESTEP = 0.5
 
     def __init__(self, size: int = 16) -> None:
@@ -359,12 +358,9 @@ class WanT2VDataset(Dataset):
 
     def __getitem__(self, index: int) -> Dict[str, Any]:
         gen = torch.Generator().manual_seed(index)
-        hidden_states = (
-            torch.randn(1, self.IN_CHANNELS, self.NUM_FRAMES, self.HEIGHT, self.WIDTH, generator=gen)
-            * self.INPUT_SCALE
-        )
+        hidden_states = torch.randn(1, self.IN_CHANNELS, self.NUM_FRAMES, self.HEIGHT, self.WIDTH, generator=gen)
         training_target = torch.randn(1, self.IN_CHANNELS, self.NUM_FRAMES, self.HEIGHT, self.WIDTH, generator=gen)
-        encoder_hidden_states = torch.randn(1, self.TEXT_SEQ_LEN, self.TEXT_DIM, generator=gen) * self.INPUT_SCALE
+        encoder_hidden_states = torch.randn(1, self.TEXT_SEQ_LEN, self.TEXT_DIM, generator=gen)
         latents = torch.randn(1, self.IN_CHANNELS, self.NUM_FRAMES, self.HEIGHT, self.WIDTH, generator=gen)
         timestep = torch.tensor([self.TIMESTEP])
         return [
