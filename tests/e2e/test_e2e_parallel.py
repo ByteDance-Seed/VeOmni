@@ -45,29 +45,14 @@ def _materialize_weights_dir(config_path: str, output_path: str, save_original_f
         ops_implementation=make_eager_ops_config(),
     )
 
-    def is_norm_parameter(name: str) -> bool:
-        parts = name.split(".")
-        return any(part.startswith("norm") for part in parts)
-
     if "wan_t2v" in config_path:
-        # Keep the Wan toy fixture in the same controlled finite range as the
-        # diffusers parity test; this validates FA2/SP alignment, not random
-        # unit-scale initialization stress. Preserve norm scales at their
-        # stable defaults; shrinking them with the projection weights makes the
-        # tiny e2e fixture numerically unrepresentative and can trigger bf16 FA2
-        # NaNs before the SP-vs-no-SP comparison starts. Wan forward layout
-        # sensitivity is covered by the diffusers parity unit tests; this e2e
-        # fixture keeps a finite nonzero training signal on L20 bf16 FA2.
+        # Match the Wan diffusers parity fixture: tiny deterministic weights
+        # keep this e2e focused on bf16 FA2/SP training alignment instead of
+        # random toy-init stress on shared L20 runners.
         with torch.no_grad():
-            for name, parameter in model.named_parameters():
+            for parameter in model.parameters():
                 if torch.is_floating_point(parameter):
-                    if is_norm_parameter(name):
-                        if name.endswith(".weight"):
-                            parameter.fill_(1.0)
-                        else:
-                            parameter.zero_()
-                    else:
-                        parameter.fill_(1e-3)
+                    parameter.fill_(1e-3)
     model.save_pretrained(output_path, save_original_format=save_original_format)
 
 
