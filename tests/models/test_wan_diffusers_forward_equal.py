@@ -423,6 +423,47 @@ def test_wan_forward_sp2_matches_no_sp_flash_attention_2():
             os.remove(init_file)
 
 
+def test_wan_forward_casts_nested_float_inputs_to_model_dtype():
+    """DiT e2e passes list-valued batches, so Wan casts nested tensors itself."""
+    pytest.importorskip("diffusers")
+
+    from veomni.models.diffusers.wan_t2v.wan_transformer.configuration_wan_transformer import (
+        WanTransformer3DModelConfig,
+    )
+    from veomni.models.diffusers.wan_t2v.wan_transformer.modeling_wan_transformer import (
+        WanTransformer3DModel,
+        apply_veomni_wan_transformer_patch,
+    )
+
+    apply_veomni_wan_transformer_patch()
+
+    dtype = torch.bfloat16
+    config = WanTransformer3DModelConfig.from_pretrained(WAN_TOY_CONFIG_DIR)
+    model = (
+        WanTransformer3DModel._from_config(config, attn_implementation="eager", torch_dtype=dtype)
+        .to(device="cpu", dtype=dtype)
+        .eval()
+    )
+    _initialize_floating_parameters(model)
+
+    hidden_shape = (1, 16, 10, 16, 16)
+    batch = {
+        "latents": [torch.zeros(hidden_shape, dtype=torch.float32)],
+        "hidden_states": [torch.zeros(hidden_shape, dtype=torch.float32)],
+        "timestep": [torch.tensor([0.5], dtype=torch.float32)],
+        "encoder_hidden_states": [torch.zeros(1, 10, 512, dtype=torch.float32)],
+        "training_target": [torch.zeros(hidden_shape, dtype=torch.float32)],
+    }
+
+    with torch.no_grad():
+        output = model(**batch)
+
+    loss = output.loss["mse_loss"]
+    assert torch.isfinite(loss).all()
+    assert torch.isfinite(output.predictions[0]).all()
+    assert output.predictions[0].dtype == dtype
+
+
 if __name__ == "__main__" and os.environ.get(WAN_PARITY_CHILD_ENV) == "1":
     try:
         mode = os.environ.get(WAN_PARITY_MODE_ENV, "single_rank_parity")

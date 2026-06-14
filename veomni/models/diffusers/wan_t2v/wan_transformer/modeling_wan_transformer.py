@@ -411,6 +411,25 @@ class WanTransformer3DModel(PreTrainedModel, _WanTransformerInitShim):
         encoder_hidden_states: torch.Tensor,
         training_target: torch.Tensor,
     ):
+        param_dtype = self.dtype
+
+        def _cast_floating_inputs(value):
+            if isinstance(value, torch.Tensor) and torch.is_floating_point(value):
+                return value.to(dtype=param_dtype)
+            if isinstance(value, list):
+                return [_cast_floating_inputs(item) for item in value]
+            if isinstance(value, tuple):
+                return tuple(_cast_floating_inputs(item) for item in value)
+            if isinstance(value, dict):
+                return {key: _cast_floating_inputs(item) for key, item in value.items()}
+            return value
+
+        latents = _cast_floating_inputs(latents)
+        hidden_states = _cast_floating_inputs(hidden_states)
+        timestep = _cast_floating_inputs(timestep)
+        encoder_hidden_states = _cast_floating_inputs(encoder_hidden_states)
+        training_target = _cast_floating_inputs(training_target)
+
         per_sample_losses = []
         predictions = []
         for hidden_state, ts, enc_hs, target in zip(hidden_states, timestep, encoder_hidden_states, training_target):
