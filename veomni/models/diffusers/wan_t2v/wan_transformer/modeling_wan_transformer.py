@@ -401,8 +401,10 @@ class WanTransformer3DModel(PreTrainedModel, _WanTransformerInitShim):
         PreTrainedModel.__init__(self, config, **kwargs)
         del self._internal_dict
         # Remove VeOmni-specific kwargs before passing to the diffusers init.
-        kwargs.pop("attn_implementation", None)
+        attn_implementation = kwargs.pop("attn_implementation", None)
         kwargs.pop("torch_dtype", None)
+        if attn_implementation is not None:
+            config._attn_implementation = attn_implementation
         _WanTransformer3DModel.__init__(self, **config.to_diffuser_dict())
         self.config: WanTransformer3DModelConfig = config
         self.config.tie_word_embeddings = False

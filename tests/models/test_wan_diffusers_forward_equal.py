@@ -596,6 +596,33 @@ def test_wan_forward_casts_nested_float_inputs_to_model_dtype():
     assert output.predictions[0].dtype == dtype
 
 
+def test_wan_from_config_preserves_requested_attention_implementation():
+    """Wan SP guard reads config, so _from_config must keep the requested attention."""
+    pytest.importorskip("diffusers")
+
+    from veomni.models.diffusers.wan_t2v.wan_transformer.configuration_wan_transformer import (
+        WanTransformer3DModelConfig,
+    )
+    from veomni.models.diffusers.wan_t2v.wan_transformer.modeling_wan_transformer import (
+        WanTransformer3DModel,
+        apply_veomni_wan_transformer_patch,
+    )
+
+    apply_veomni_wan_transformer_patch()
+
+    config = WanTransformer3DModelConfig.from_pretrained(WAN_TOY_CONFIG_DIR)
+    model = WanTransformer3DModel._from_config(
+        config,
+        attn_implementation="veomni_flash_attention_2_with_sp",
+        torch_dtype=torch.bfloat16,
+    )
+
+    assert model.config._attn_implementation == "veomni_flash_attention_2_with_sp"
+    for block in model.blocks:
+        assert block.attn1.processor.attn_implementation == "veomni_flash_attention_2_with_sp"
+        assert block.attn2.processor.attn_implementation == "veomni_flash_attention_2_with_sp"
+
+
 if __name__ == "__main__" and os.environ.get(WAN_PARITY_CHILD_ENV) == "1":
     try:
         mode = os.environ.get(WAN_PARITY_MODE_ENV, "single_rank_parity")
