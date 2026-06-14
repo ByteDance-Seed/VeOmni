@@ -178,6 +178,7 @@ class WanSPAttnProcessor(WanAttnProcessor):
         if hidden_states_img is not None:
             hidden_states_out = hidden_states_out + hidden_states_img
 
+        hidden_states_out = hidden_states_out.type_as(attn.to_out[0].weight)
         hidden_states_out = attn.to_out[0](hidden_states_out)
         hidden_states_out = attn.to_out[1](hidden_states_out)
         return hidden_states_out
