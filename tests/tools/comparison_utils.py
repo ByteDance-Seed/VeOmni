@@ -53,6 +53,7 @@ def compare_metrics(
     rtol: float = 0.01,
     atol: float = 0.01,
     keys: Optional[Sequence[str]] = None,
+    metric_tolerances: Optional[Dict[str, tuple[float, float]]] = None,
 ) -> None:
     """Compare metrics across multiple runs.
 
@@ -64,6 +65,8 @@ def compare_metrics(
         Tolerances for ``torch.testing.assert_close``.
     keys : sequence of str, optional
         If provided, only compare these metric keys. Otherwise compare all.
+    metric_tolerances : dict, optional
+        Per-metric ``{key: (rtol, atol)}`` overrides.
 
     Raises
     ------
@@ -78,6 +81,7 @@ def compare_metrics(
         if run_name == base_name:
             continue
         for key in check_keys:
+            key_rtol, key_atol = metric_tolerances.get(key, (rtol, atol)) if metric_tolerances else (rtol, atol)
             base_val = base[key]
             run_val = run_output[key]
             if not isinstance(base_val, torch.Tensor):
@@ -85,7 +89,7 @@ def compare_metrics(
             if not isinstance(run_val, torch.Tensor):
                 run_val = torch.tensor(run_val)
             try:
-                torch.testing.assert_close(run_val, base_val, rtol=rtol, atol=atol)
+                torch.testing.assert_close(run_val, base_val, rtol=key_rtol, atol=key_atol)
             except AssertionError as err:
                 print_comparison_table(outputs, key)
                 raise AssertionError(f"Metric '{key}' mismatch: {base_name} vs {run_name}") from err

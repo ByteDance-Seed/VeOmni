@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import torch
 import torch.nn.functional as F
 from diffusers import WanTransformer3DModel as _WanTransformer3DModel
+from diffusers.models.attention_dispatch import dispatch_attention_fn
 from diffusers.models.transformers.transformer_wan import (
     WanAttention,
     WanAttnProcessor,
@@ -26,6 +27,7 @@ from .....distributed.sequence_parallel import (
     slice_input_tensor,
 )
 from .....utils import logging
+from .....utils.device import is_torch_npu_available
 from .configuration_wan_transformer import WanTransformer3DModelConfig
 
 
@@ -78,6 +80,37 @@ class WanSPAttnProcessor(WanAttnProcessor):
         self.config = SimpleNamespace(_attn_implementation=attn_implementation)
         super().__init__()
 
+    def _flash_attention_forward(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        *,
+        apply_sp: bool,
+    ) -> torch.Tensor:
+        if apply_sp:
+            query = gather_seq_scatter_heads(query, seq_dim=1, head_dim=2, group=get_parallel_state().ulysses_group)
+            key = gather_seq_scatter_heads(key, seq_dim=1, head_dim=2, group=get_parallel_state().ulysses_group)
+            value = gather_seq_scatter_heads(value, seq_dim=1, head_dim=2, group=get_parallel_state().ulysses_group)
+
+        hidden_states = dispatch_attention_fn(
+            query,
+            key,
+            value,
+            attn_mask=None,
+            dropout_p=0.0,
+            is_causal=False,
+            backend="flash",
+            parallel_config=None,
+        )
+
+        if apply_sp:
+            hidden_states = gather_heads_scatter_seq(
+                hidden_states, seq_dim=1, head_dim=2, group=get_parallel_state().ulysses_group
+            )
+
+        return hidden_states
+
     def __call__(
         self,
         attn: WanAttention,
@@ -104,7 +137,26 @@ class WanSPAttnProcessor(WanAttnProcessor):
         key = key.unflatten(2, (attn.heads, -1))
         value = value.unflatten(2, (attn.heads, -1))
 
+        use_sp = get_parallel_state().sp_enabled and not is_cross_attention
+        use_sp_before_rotary = use_sp and self.attn_implementation == "veomni_flash_attention_2_with_sp"
+        if use_sp_before_rotary:
+            ulysses_size = get_parallel_state().ulysses_size
+            if query.shape[2] % ulysses_size != 0:
+                raise ValueError(
+                    f"Wan attention heads ({query.shape[2]}) must be divisible by Ulysses size ({ulysses_size})."
+                )
+            query = gather_seq_scatter_heads(query, seq_dim=1, head_dim=2, group=get_parallel_state().ulysses_group)
+            key = gather_seq_scatter_heads(key, seq_dim=1, head_dim=2, group=get_parallel_state().ulysses_group)
+            value = gather_seq_scatter_heads(value, seq_dim=1, head_dim=2, group=get_parallel_state().ulysses_group)
+            if query.shape[1] != key.shape[1] or query.shape[1] != value.shape[1]:
+                raise ValueError("Wan Ulysses SP requires Q/K/V to share the same post-gather sequence length.")
+
         if rotary_emb is not None:
+            if use_sp_before_rotary and query.shape[1] != rotary_emb[0].shape[1]:
+                raise ValueError(
+                    f"Wan rotary sequence length ({rotary_emb[0].shape[1]}) must match "
+                    f"post-gather attention sequence length ({query.shape[1]})."
+                )
 
             def apply_rotary_emb(
                 hidden_states: torch.Tensor,
@@ -122,21 +174,31 @@ class WanSPAttnProcessor(WanAttnProcessor):
             query = apply_rotary_emb(query, *rotary_emb)
             key = apply_rotary_emb(key, *rotary_emb)
 
-        if get_parallel_state().sp_enabled and not is_cross_attention:
-            query = gather_seq_scatter_heads(query, seq_dim=1, head_dim=2, group=get_parallel_state().ulysses_group)
-            key = gather_seq_scatter_heads(key, seq_dim=1, head_dim=2, group=get_parallel_state().ulysses_group)
-            value = gather_seq_scatter_heads(value, seq_dim=1, head_dim=2, group=get_parallel_state().ulysses_group)
-
-        # Route to the right attention kernel via ALL_ATTENTION_FUNCTIONS.
-        # SP has already been handled above, so skip it inside the kernel.
+        # Route to the right attention kernel. Wan's CUDA non-SP
+        # ``flash_attention_2`` path is diffusers' flash backend; keep that for
+        # single-rank parity. The T2V SP-aware VeOmni FA2 path uses the
+        # Transformers/VeOmni attention wrapper because diffusers' direct flash
+        # backend is not stable on the L20 Wan toy fixture. I2V attention keeps
+        # the diffusers flash path to avoid changing its image-context layout.
         attention_interface: Callable = wan_eager_attention_forward
         use_fp32_attention = query.dtype == torch.float32 and attn.to_q.weight.dtype == torch.float32
-        if self.attn_implementation != "eager" and not use_fp32_attention:
+        use_diffusers_flash = (
+            self.attn_implementation == "flash_attention_2"
+            or (self.attn_implementation == "veomni_flash_attention_2_with_sp" and attn.add_k_proj is not None)
+        ) and not is_torch_npu_available()
+        if use_diffusers_flash and not use_fp32_attention:
+            attention_interface = None
+        elif self.attn_implementation != "eager" and not use_fp32_attention:
             attention_interface = ALL_ATTENTION_FUNCTIONS[self.attn_implementation]
         elif self.attn_implementation != "eager":
             logger.warning_once("Wan attention is running in fp32, so using eager SDPA instead of flash-attention.")
 
         kernel_module = WanAttentionKernelModule(self.config, attn)
+
+        if not (use_diffusers_flash and not use_fp32_attention) and use_sp and not use_sp_before_rotary:
+            query = gather_seq_scatter_heads(query, seq_dim=1, head_dim=2, group=get_parallel_state().ulysses_group)
+            key = gather_seq_scatter_heads(key, seq_dim=1, head_dim=2, group=get_parallel_state().ulysses_group)
+            value = gather_seq_scatter_heads(value, seq_dim=1, head_dim=2, group=get_parallel_state().ulysses_group)
 
         # I2V: additional cross-attention over image tokens (no Ulysses SP needed).
         hidden_states_img = None
@@ -146,34 +208,38 @@ class WanSPAttnProcessor(WanAttnProcessor):
 
             key_img = key_img.unflatten(2, (attn.heads, -1))
             value_img = value_img.unflatten(2, (attn.heads, -1))
-            hidden_states_img = attention_interface(
+            if use_diffusers_flash and not use_fp32_attention:
+                hidden_states_img = self._flash_attention_forward(query, key_img, value_img, apply_sp=False)
+            else:
+                hidden_states_img = attention_interface(
+                    kernel_module,
+                    query.transpose(1, 2),
+                    key_img.transpose(1, 2),
+                    value_img.transpose(1, 2),
+                    attention_mask=None,
+                    dropout=0.0,
+                    is_causal=False,
+                    skip_ulysses=True,
+                )[0]
+            hidden_states_img = hidden_states_img.flatten(2, 3).type_as(query)
+
+        if use_diffusers_flash and not use_fp32_attention:
+            hidden_states_out = self._flash_attention_forward(query, key, value, apply_sp=use_sp)
+        else:
+            hidden_states_out = attention_interface(
                 kernel_module,
                 query.transpose(1, 2),
-                key_img.transpose(1, 2),
-                value_img.transpose(1, 2),
+                key.transpose(1, 2),
+                value.transpose(1, 2),
                 attention_mask=None,
                 dropout=0.0,
                 is_causal=False,
                 skip_ulysses=True,
             )[0]
-            hidden_states_img = hidden_states_img.flatten(2, 3).type_as(query)
-
-        hidden_states_out = attention_interface(
-            kernel_module,
-            query.transpose(1, 2),
-            key.transpose(1, 2),
-            value.transpose(1, 2),
-            attention_mask=None,
-            dropout=0.0,
-            is_causal=False,
-            skip_ulysses=True,
-        )[0]
-
-        # Inverse AllToAll: scatter sequence, gather heads back.
-        if get_parallel_state().sp_enabled and not is_cross_attention:
-            hidden_states_out = gather_heads_scatter_seq(
-                hidden_states_out, seq_dim=1, head_dim=2, group=get_parallel_state().ulysses_group
-            )
+            if use_sp:
+                hidden_states_out = gather_heads_scatter_seq(
+                    hidden_states_out, seq_dim=1, head_dim=2, group=get_parallel_state().ulysses_group
+                )
 
         hidden_states_out = hidden_states_out.flatten(2, 3)
         hidden_states = hidden_states.type_as(query)
@@ -231,17 +297,26 @@ def WanTransformer3DModel_forward(
         encoder_hidden_states = torch.concat([encoder_hidden_states_image, encoder_hidden_states], dim=1)
 
     if get_parallel_state().sp_enabled:
+        if get_parallel_state().cp_size != 1:
+            raise ValueError("Wan Ulysses SP does not support context parallelism.")
+        if self.config._attn_implementation != "veomni_flash_attention_2_with_sp":
+            raise ValueError("Wan Ulysses SP requires `veomni_flash_attention_2_with_sp` attention.")
+        freqs_cos, _ = rotary_emb
+        sp_size = get_parallel_state().sp_size
+        if hidden_states.shape[1] % sp_size != 0:
+            raise ValueError(
+                f"Wan hidden sequence length ({hidden_states.shape[1]}) must be divisible by SP size ({sp_size})."
+            )
+        if freqs_cos.shape[1] != hidden_states.shape[1]:
+            raise ValueError(
+                f"Wan rotary sequence length ({freqs_cos.shape[1]}) must match "
+                f"hidden sequence length ({hidden_states.shape[1]})."
+            )
+        if freqs_cos.shape[1] % sp_size != 0:
+            raise ValueError(
+                f"Wan rotary sequence length ({freqs_cos.shape[1]}) must be divisible by SP size ({sp_size})."
+            )
         hidden_states = slice_input_tensor(hidden_states, dim=1, group=get_parallel_state().sp_group)
-
-        # Slice rotary embeddings to the local rank's positions (no gradient).
-        freqs_cos, freqs_sin = rotary_emb
-        ulysses_size = get_parallel_state().ulysses_size
-        ulysses_rank = get_parallel_state().ulysses_rank
-        seq_len = freqs_cos.shape[1]
-        chunk = seq_len // ulysses_size
-        freqs_cos = freqs_cos[:, ulysses_rank * chunk : (ulysses_rank + 1) * chunk]
-        freqs_sin = freqs_sin[:, ulysses_rank * chunk : (ulysses_rank + 1) * chunk]
-        rotary_emb = (freqs_cos, freqs_sin)
     # 4. Transformer blocks
     if torch.is_grad_enabled() and self.gradient_checkpointing:
         for block in self.blocks:
@@ -303,6 +378,7 @@ class _WanTransformerInitShim(_WanTransformer3DModel):
 class WanTransformer3DModel(PreTrainedModel, _WanTransformerInitShim):
     config_class = WanTransformer3DModelConfig
     supports_gradient_checkpointing = True
+    _supports_flash_attn = True
 
     def __init__(self, config: WanTransformer3DModelConfig, **kwargs):
         PreTrainedModel.__init__(self, config, **kwargs)
@@ -383,6 +459,7 @@ def apply_veomni_wan_transformer_patch() -> None:
     # already exercises FA2 (via our SP-aware attention processor) and goes
     # through the WanAttention forward we control — opt in to FA2 here so the
     # diffusers gate doesn't refuse on our behalf.
+    _WanTransformer3DModel._supports_flash_attn = True
     _WanTransformer3DModel._supports_flash_attn_2 = True
     logger.info_rank0("Applied VeOmni SP patch to WanTransformer3DModel.forward.")
 

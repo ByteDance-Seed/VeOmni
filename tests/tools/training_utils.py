@@ -71,13 +71,18 @@ _NPU_PER_MODEL_OVERRIDES: Dict[str, Dict[str, str]] = {
 }
 
 # GPU per-model overrides for models whose patched ops disable a default
-# backend. Wan's ``rope_apply(x, **kwargs)`` signature is incompatible with
-# the registry-default Liger RoPE — ``device_patch.py`` marks ``liger_kernel``
-# as explicitly disabled, so any non-eager value would raise. Wan training
-# YAMLs pin ``rotary_pos_emb_implementation: eager``, but e2e tests build CLI
-# args directly (no training YAML), so we pin here as well.
+# backend.
+# Wan's ``rope_apply(x, **kwargs)`` signature is incompatible with the
+# registry-default Liger RoPE — ``device_patch.py`` marks ``liger_kernel`` as
+# explicitly disabled, so any non-eager value would raise. Wan also keeps its
+# RMSNorm on the reference eager implementation in these e2e tests so the
+# production FA2 attention path is isolated from fused RMSNorm numerics.
 _GPU_PER_MODEL_OVERRIDES: Dict[str, Dict[str, str]] = {
-    "wan_t2v": {"rotary_pos_emb_implementation": "eager"},
+    "wan_t2v": {
+        "attn_implementation": "flash_attention_2",
+        "rms_norm_implementation": "eager",
+        "rotary_pos_emb_implementation": "eager",
+    },
     # Qwen-Image runs its dual-stream joint attention through diffusers' own
     # attention dispatch (Ulysses SP is handled by QwenImageSPAttnProcessor, not
     # the VeOmni FA2 op), so keep the VeOmni attn/rope ops on eager.

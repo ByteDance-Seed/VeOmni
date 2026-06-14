@@ -3,13 +3,14 @@ import os
 import shutil
 import subprocess
 from pathlib import Path
+from typing import Mapping
 
 import pytest
 import torch
 
 from veomni.models.auto import build_foundation_model
 from veomni.utils.device import IS_NPU_AVAILABLE
-from veomni.utils.import_utils import is_diffusers_available
+from veomni.utils.import_utils import is_diffusers_available, is_torch_npu_available
 
 from ..tools import DummyDataset, build_torchrun_cmd, compare_metrics, print_comparison_table
 from ..tools.training_utils import make_eager_ops_config
@@ -43,6 +44,30 @@ def _materialize_weights_dir(config_path: str, output_path: str, save_original_f
         init_device="cpu",
         ops_implementation=make_eager_ops_config(),
     )
+
+    def is_norm_parameter(name: str) -> bool:
+        parts = name.split(".")
+        return any(part.startswith("norm") for part in parts)
+
+    if "wan_t2v" in config_path:
+        # Keep the Wan toy fixture in the same controlled finite range as the
+        # diffusers parity test; this validates FA2/SP alignment, not random
+        # unit-scale initialization stress. Preserve norm scales at their
+        # stable defaults; shrinking them with the projection weights makes the
+        # tiny e2e fixture numerically unrepresentative and can trigger bf16 FA2
+        # NaNs before the SP-vs-no-SP comparison starts. Wan forward layout
+        # sensitivity is covered by the diffusers parity unit tests; this e2e
+        # fixture keeps a finite nonzero training signal on L20 bf16 FA2.
+        with torch.no_grad():
+            for name, parameter in model.named_parameters():
+                if torch.is_floating_point(parameter):
+                    if is_norm_parameter(name):
+                        if name.endswith(".weight"):
+                            parameter.fill_(1.0)
+                        else:
+                            parameter.zero_()
+                    else:
+                        parameter.fill_(1e-3)
     model.save_pretrained(output_path, save_original_format=save_original_format)
 
 
@@ -55,6 +80,7 @@ def main(
     atol: float,
     train_path: str,
     max_sp_size: int | None = None,
+    metric_tolerances: Mapping[str, tuple[float, float]] | None = None,
 ):
     test_path = f"./{model_name}"
     os.makedirs(test_path, exist_ok=True)
@@ -98,13 +124,17 @@ def main(
 
     for key in log_keys:
         print_comparison_table(res, key, title=model_name)
-    compare_metrics(res, rtol=rtol, atol=atol)
+    compare_metrics(res, rtol=rtol, atol=atol, metric_tolerances=metric_tolerances)
 
     shutil.rmtree(test_path)
 
 
 _DEFAULT_RTOL = 1e-1
 _DEFAULT_ATOL = 1e-1
+_WAN_RTOL = 1e-5
+_WAN_ATOL = 1e-8
+# NPU grad-norm reduction differs at ~1e-7 while loss/mse remain bit-close.
+_WAN_GRAD_NORM_ATOL = 2e-7
 
 text_test_cases = [
     pytest.param(
@@ -228,8 +258,8 @@ wan_dit_test_cases = [
         "wan_t2v",
         "./tests/toy_config/wan_t2v_toy",
         False,
-        _DEFAULT_RTOL,
-        _DEFAULT_ATOL,
+        _WAN_RTOL,
+        _WAN_ATOL,
         marks=_dit_only,
     ),
 ]
@@ -414,6 +444,38 @@ def test_qwen3omni_parallel_align(
 
 
 @pytest.mark.parametrize("model_name, config_path, is_moe, rtol, atol", wan_dit_test_cases)
+def test_wan_dit_uses_bfloat16_mixed_precision_and_flash_attention(
+    model_name: str, config_path: str, is_moe: bool, rtol: float, atol: float
+):
+    command_list = prepare_exec_cmd(
+        ["train_dit_test"],
+        model_name,
+        config_path,
+        model_path="./wan_t2v",
+        train_path="./dummy_wan_t2v",
+        output_dir="./wan_t2v",
+        is_moe=is_moe,
+        max_sp_size=1,
+    )
+
+    assert command_list
+    for _, cmd_kwargs in command_list:
+        cmd = build_torchrun_cmd(**cmd_kwargs)
+        assert cmd_kwargs["extra_args"] == [
+            "--train.accelerator.fsdp_config.mixed_precision.enable=True",
+            "--train.accelerator.fsdp_config.mixed_precision.param_dtype=bfloat16",
+            "--train.accelerator.fsdp_config.mixed_precision.cast_forward_inputs=True",
+        ]
+        if is_torch_npu_available():
+            assert "--model.ops_implementation.attn_implementation=flash_attention_2" in cmd
+            assert "--model.ops_implementation.rotary_pos_emb_implementation=npu" in cmd
+        else:
+            assert "--model.ops_implementation.attn_implementation=flash_attention_2" in cmd
+            assert "--model.ops_implementation.rms_norm_implementation=eager" in cmd
+            assert "--model.ops_implementation.rotary_pos_emb_implementation=eager" in cmd
+
+
+@pytest.mark.parametrize("model_name, config_path, is_moe, rtol, atol", wan_dit_test_cases)
 def test_wan_dit_parallel_align(
     model_name: str, config_path: str, is_moe: bool, rtol: float, atol: float, dummy_wan_t2v_dataset
 ):
@@ -428,6 +490,7 @@ def test_wan_dit_parallel_align(
         rtol=rtol,
         atol=atol,
         train_path=dummy_wan_t2v_dataset,
+        metric_tolerances={"grad_norm": (_WAN_RTOL, _WAN_GRAD_NORM_ATOL)},
     )
 
 

@@ -301,6 +301,10 @@ def flash_attention_forward(
             f"unknown attn_implementation for veomni flash_attention with SP support: {module.config._attn_implementation}"
         )
 
+    query = query.contiguous()
+    key = key.contiguous()
+    value = value.contiguous()
+
     attn_output = _flash_attention_forward(
         query,
         key,
