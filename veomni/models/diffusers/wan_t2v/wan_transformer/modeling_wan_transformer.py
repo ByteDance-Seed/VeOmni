@@ -56,7 +56,13 @@ def wan_eager_attention_forward(
 
 class WanAttentionKernelModule:
     def __init__(self, config: SimpleNamespace, attn: WanAttention):
-        self.config = config
+        target_dtype = attn.to_q.weight.dtype
+        if target_dtype == torch.float32:
+            target_dtype = torch.bfloat16
+        self.config = SimpleNamespace(
+            _attn_implementation=config._attn_implementation,
+            _pre_quantization_dtype=target_dtype,
+        )
         self.is_causal = False
         self.layer_idx = getattr(attn, "layer_idx", None)
         self._attn = attn
