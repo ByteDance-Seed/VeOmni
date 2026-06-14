@@ -450,6 +450,7 @@ def test_wan_dit_uses_bfloat16_mixed_precision_and_flash_attention(
             "--train.accelerator.fsdp_config.mixed_precision.enable=True",
             "--train.accelerator.fsdp_config.mixed_precision.param_dtype=bfloat16",
             "--train.accelerator.fsdp_config.mixed_precision.cast_forward_inputs=True",
+            "--train.gradient_checkpointing.enable=False",
         ]
         if is_torch_npu_available():
             assert "--model.ops_implementation.attn_implementation=flash_attention_2" in cmd

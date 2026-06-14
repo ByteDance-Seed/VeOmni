@@ -86,6 +86,7 @@ _WAN_BFLOAT16_FSDP_ARGS = [
     "--train.accelerator.fsdp_config.mixed_precision.enable=True",
     "--train.accelerator.fsdp_config.mixed_precision.param_dtype=bfloat16",
     "--train.accelerator.fsdp_config.mixed_precision.cast_forward_inputs=True",
+    "--train.gradient_checkpointing.enable=False",
 ]
 
 
