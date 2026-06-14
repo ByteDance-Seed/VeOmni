@@ -346,6 +346,75 @@ def _run_wan_sp_baseline_check() -> None:
         _release()
 
 
+def _run_wan_backward_finite() -> None:
+    os.environ["MODELING_BACKEND"] = "hf"
+    os.environ["DIFFUSERS_ATTN_BACKEND"] = "flash"
+
+    from veomni.models.diffusers.wan_t2v.wan_transformer.configuration_wan_transformer import (
+        WanTransformer3DModelConfig,
+    )
+    from veomni.models.diffusers.wan_t2v.wan_transformer.modeling_wan_transformer import (
+        WanTransformer3DModel,
+        apply_veomni_wan_transformer_patch,
+    )
+    from veomni.ops.kernels.attention import apply_veomni_attention_patch
+    from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type
+
+    if not IS_CUDA_AVAILABLE:
+        raise WanParitySkip("CUDA required.")
+    if importlib.util.find_spec("flash_attn") is None:
+        raise WanParitySkip("flash_attn package not installed.")
+
+    apply_veomni_attention_patch()
+    apply_veomni_wan_transformer_patch()
+
+    device = get_device_type()
+    dtype = torch.bfloat16
+    hidden_shape = (1, 16, 10, 16, 16)
+    torch.manual_seed(0)
+    batch = {
+        "latents": [torch.zeros(hidden_shape, device=device, dtype=dtype)],
+        "hidden_states": [torch.zeros(hidden_shape, device=device, dtype=dtype)],
+        "timestep": [torch.tensor([0.5], device=device, dtype=dtype)],
+        "encoder_hidden_states": [torch.zeros(1, 10, 512, device=device, dtype=dtype)],
+        "training_target": [torch.randn(hidden_shape, device=device, dtype=dtype) * 1e-2],
+    }
+    config = WanTransformer3DModelConfig.from_pretrained(WAN_TOY_CONFIG_DIR)
+
+    for attn_implementation in ("flash_attention_2", "veomni_flash_attention_2_with_sp"):
+        torch.manual_seed(0)
+        model = (
+            WanTransformer3DModel._from_config(
+                config,
+                attn_implementation=attn_implementation,
+                torch_dtype=dtype,
+            )
+            .to(device=device, dtype=dtype)
+            .train()
+        )
+        _initialize_floating_parameters(model)
+        try:
+            output = model(**batch)
+            loss = output.loss["mse_loss"]
+            assert torch.isfinite(output.predictions[0]).all(), (
+                f"Wan {attn_implementation} train forward produced non-finite predictions."
+            )
+            assert torch.isfinite(loss).all(), f"Wan {attn_implementation} train forward produced non-finite loss."
+            loss.backward()
+
+            nonfinite_grad_names = [
+                name
+                for name, parameter in model.named_parameters()
+                if parameter.grad is not None and not torch.isfinite(parameter.grad).all()
+            ]
+            assert not nonfinite_grad_names, (
+                f"Wan {attn_implementation} backward produced non-finite gradients: {nonfinite_grad_names[:10]}"
+            )
+        finally:
+            del model
+            _release()
+
+
 def test_wan_forward_bitwise_equal_to_diffusers_flash_attention_2():
     """Wan T2V forward is bitwise-equal to pristine diffusers at sp_size=1.
 
@@ -375,6 +444,29 @@ def test_wan_forward_bitwise_equal_to_diffusers_flash_attention_2():
         pytest.skip(output.strip())
     if result.returncode == WAN_PARITY_XFAIL_EXIT_CODE:
         pytest.xfail(output.strip())
+    assert result.returncode == 0, output
+
+
+def test_wan_flash_attention_2_backward_is_finite():
+    """Wan bf16 FA2 train-mode forward/backward stays finite on the e2e fixture."""
+    env = os.environ.copy()
+    env["MODELING_BACKEND"] = "hf"
+    env[WAN_PARITY_CHILD_ENV] = "1"
+    env[WAN_PARITY_MODE_ENV] = "backward_finite"
+    env["PYTHONPATH"] = os.pathsep.join(part for part in (REPO_ROOT, env.get("PYTHONPATH")) if part)
+    result = subprocess.run(
+        [sys.executable, __file__],
+        cwd=REPO_ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=180,
+        check=False,
+    )
+
+    output = "\n".join(part for part in (result.stdout, result.stderr) if part)
+    if result.returncode == WAN_PARITY_SKIP_EXIT_CODE:
+        pytest.skip(output.strip())
     assert result.returncode == 0, output
 
 
@@ -471,6 +563,8 @@ if __name__ == "__main__" and os.environ.get(WAN_PARITY_CHILD_ENV) == "1":
             _run_wan_forward_parity()
         elif mode == "sp_baseline_check":
             _run_wan_sp_baseline_check()
+        elif mode == "backward_finite":
+            _run_wan_backward_finite()
         else:
             raise ValueError(f"Unknown {WAN_PARITY_MODE_ENV}={mode}")
     except WanParitySkip as exc:
