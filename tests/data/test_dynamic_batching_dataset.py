@@ -339,6 +339,13 @@ def test_get_length_fn_by_count_mode():
     }
     assert get_length_by_labels_fn(unsupported_labels_sample) == 2
 
+    input_ids_only_sample = {"input_ids": np.arange(4)}
+    assert get_length_by_labels_fn(input_ids_only_sample) == 4
+    assert get_length_by_labels_fn([list_sample, np_sample]) == 5
+    assert get_length_by_labels_fn(None) == 0
+    assert get_length_by_labels_fn("raw-sample") == 1
+    assert get_length_by_labels_fn({}) == 1
+
     with pytest.raises(ValueError, match="Unknown dyn_bsz count_mode"):
         get_length_fn_by_count_mode("bad-mode")
 

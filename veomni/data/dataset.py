@@ -288,7 +288,7 @@ def get_length_by_input_ids_fn(sample):
     return _numel_sequence_like(sample["input_ids"])
 
 
-def get_length_by_labels_fn(sample):
+def get_length_by_labels_fn(sample: Any) -> int:
     """Return effective token length from ``labels`` (i.e. tokens contributing to loss).
 
     A token contributes to loss iff its label is not ``IGNORE_INDEX``. Falls back to
@@ -298,6 +298,13 @@ def get_length_by_labels_fn(sample):
     set additional ``IGNORE_INDEX`` positions later, but balancing is decided here at
     sample ingestion time.
     """
+    if sample is None:
+        return 0
+    if isinstance(sample, list):
+        return sum(get_length_by_labels_fn(item) for item in sample)
+    if not isinstance(sample, dict):
+        return 1
+
     if "labels" in sample:
         labels = sample["labels"]
         if isinstance(labels, torch.Tensor):
@@ -307,7 +314,25 @@ def get_length_by_labels_fn(sample):
         if isinstance(labels, list):
             return sum(1 for label in labels if label != IGNORE_INDEX)
 
-    return get_length_by_attention_mask_fn(sample)
+    if "attention_mask" in sample:
+        attention_mask = sample["attention_mask"]
+        if isinstance(attention_mask, torch.Tensor):
+            return int(attention_mask.sum().item())
+        if isinstance(attention_mask, np.ndarray):
+            return int(attention_mask.sum())
+        if isinstance(attention_mask, list):
+            return int(sum(attention_mask))
+
+    if "input_ids" in sample:
+        input_ids = sample["input_ids"]
+        if isinstance(input_ids, torch.Tensor):
+            return int(input_ids.numel())
+        if isinstance(input_ids, np.ndarray):
+            return int(input_ids.size)
+        if isinstance(input_ids, list):
+            return len(input_ids)
+
+    return 1
 
 
 def get_length_fn_by_count_mode(count_mode: str):
