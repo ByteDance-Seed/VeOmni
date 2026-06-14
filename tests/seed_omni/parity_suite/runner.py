@@ -36,12 +36,7 @@ def run_parity_case(case: ParityCase) -> ParityReport:
     if case.tier not in {"graph", "module", "framework"}:
         raise NotImplementedError(f"Unsupported parity tier for execution: {case.tier!r}")
     driver = _load_driver(case)
-    if case.tier == "framework" and case.scenario.framework_policy is not None:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        dtype = driver.dtype()
-        driver.configure_determinism(case.model.seed)
-        return driver.run_framework_policy(device=device, dtype=dtype)
-    selected = case.model.mapping.for_probe_names(case.scenario.probes)
+    selected = () if _is_framework_policy_run(case) else case.model.mapping.for_probe_names(case.run.probes)
     resolved = resolve_mapping(mappings=selected, nodes=case.nodes)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dtype = driver.dtype()
@@ -56,6 +51,8 @@ def run_parity_case(case: ParityCase) -> ParityReport:
 
     driver.configure_determinism(case.model.seed)
     v2_result = _run_v2(driver, case, reference.run_output, resolved.v2_whitelist, device=device, dtype=dtype)
+    if isinstance(v2_result, ParityReport):
+        return v2_result
 
     reports: list[ProbeReport] = []
     for mapping in resolved.probes:
@@ -69,6 +66,10 @@ def run_parity_case(case: ParityCase) -> ParityReport:
         )
         reports.append(ProbeReport(node=mapping.node, probe=mapping.probe, passed=metric.passed, metric=metric))
     return ParityReport(case_id=case.node_id, probes=tuple(reports))
+
+
+def _is_framework_policy_run(case: ParityCase) -> bool:
+    return case.tier == "framework" and case.run.kind != "forward_backward"
 
 
 def _load_driver(case: ParityCase) -> ParityDriver:
@@ -87,7 +88,7 @@ def _run_v2(
     *,
     device: torch.device,
     dtype: torch.dtype,
-) -> dict[str, Any]:
+) -> dict[str, Any] | ParityReport:
     method_name = _V2_DISPATCH.get((case.graph.domain, case.tier))
     if method_name is None:
         raise NotImplementedError(f"Unsupported V2 dispatch for domain={case.graph.domain!r}, tier={case.tier!r}.")

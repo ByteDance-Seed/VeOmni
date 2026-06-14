@@ -17,8 +17,8 @@ from tests.seed_omni.parity_suite.core import ParityCase, to_device
 from tests.seed_omni.parity_suite.driver import ParityDriver
 from tests.seed_omni.parity_suite.reference.capture import ReferenceCaptureContext
 from tests.seed_omni.parity_suite.reference.loader import load_reference_model
-from tests.seed_omni.parity_suite.v2.infer_fsm import InferModulePolicy
 from tests.seed_omni.parity_suite.v2.model import load_omni_config_from_dir, load_omni_module_from_pretrained
+from tests.seed_omni.parity_suite.v2.module import InferModulePolicy
 from veomni.models.seed_omni.modeling_omni import OmniModel
 
 

@@ -1,4 +1,4 @@
-"""Shared V2 inference FSM helpers for parity drivers."""
+"""Default module-tier execution for SeedOmni V2 parity."""
 
 from __future__ import annotations
 
@@ -6,9 +6,12 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
+import torch
 from torch import nn
 
+from tests.seed_omni.parity_suite.core.utilities import autocast_for_dtype, sum_losses, zero_module_grads
 from tests.seed_omni.parity_suite.v2.observation import arm_generation_observer, record_module_output
+from veomni.models.seed_omni.modeling_omni import OmniModel
 
 
 ModuleNode = tuple[str, str]
@@ -21,6 +24,92 @@ class InferModulePolicy:
     max_steps: int | None = None
     required_nodes: frozenset[tuple[str, str]] = frozenset()
     allow_finalize: bool = False
+
+
+def run_v2_infer_module(
+    driver: Any,
+    reference_output: Any,
+    whitelist: Mapping[tuple[str, str], frozenset[str]],
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> dict[str, Any]:
+    """Run a V2 inference graph through direct FSM module steps."""
+
+    model = driver.load_v2_model(device=device, dtype=dtype)
+    request = driver.v2_infer_request(reference_output, device=device)
+    generation_kwargs = driver.generation_kwargs(model)
+    return run_infer_module_fsm(
+        model,
+        request,
+        whitelist,
+        generation_kwargs=generation_kwargs,
+        policy=driver.v2_infer_module_policy(reference_output, whitelist),
+    )
+
+
+def run_v2_train_module(
+    driver: Any,
+    reference_output: Any,
+    whitelist: Mapping[tuple[str, str], frozenset[str]],
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> dict[str, Any]:
+    """Run a V2 training graph one node at a time."""
+
+    return run_v2_train_module_batch(
+        driver,
+        driver.v2_train_batch_kwargs(reference_output, device=device),
+        whitelist,
+        device=device,
+        dtype=dtype,
+    )
+
+
+def run_v2_train_module_batch(
+    driver: Any,
+    batch_kwargs: Mapping[str, Any],
+    whitelist: Mapping[tuple[str, str], frozenset[str]],
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> dict[str, Any]:
+    model = driver.load_v2_model(device=device, dtype=dtype).train()
+    zero_module_grads(model.modules_dict.values())
+    batch = dict(batch_kwargs)
+    with torch.enable_grad(), autocast_for_dtype(device, dtype):
+        forward_result = run_v2_train_nodes(driver, model, batch)
+        loss = forward_result["loss"]
+        if loss is None:
+            raise RuntimeError(f"{type(driver).__name__} V2 train module tier produced no loss.")
+    loss.backward()
+    observations = driver.collect_v2_train_observations(model, forward_result, whitelist, batch=batch)
+    return {"observations": observations, "ctx": forward_result, "trace": ["train:module"]}
+
+
+def run_v2_train_nodes(driver: Any, model: OmniModel, batch: dict[str, Any]) -> dict[str, Any]:
+    del driver
+    if model.training_graph is None:
+        raise RuntimeError("Train module tier requires a training graph.")
+    node_outputs: dict[str, dict[str, Any]] = {}
+    losses: dict[str, torch.Tensor] = {}
+    for node_name in model.training_graph.execution_order:
+        module_name = model.training_graph.module_of(node_name)
+        method = model.training_graph.method_of(node_name)
+        module = model.get_module(module_name)
+        kwargs = model.training_graph.collect_inputs(node_name, node_outputs, batch)
+        call_kwargs = module.pre_forward(method, **kwargs)
+        fn = module if method == "forward" else getattr(module, method)
+        outputs = fn(**call_kwargs)
+        out = module.post_forward(method, **outputs)
+        node_outputs[node_name] = out
+        for key, value in out.items():
+            if key in batch:
+                batch[key] = value
+        if "_loss" in out:
+            losses[node_name] = out["_loss"]
+    return {"loss": sum_losses(losses), "losses": losses, "outputs": node_outputs}
 
 
 def run_module_nodes(
@@ -116,4 +205,8 @@ __all__ = [
     "ModuleNode",
     "run_infer_module_fsm",
     "run_module_nodes",
+    "run_v2_infer_module",
+    "run_v2_train_module",
+    "run_v2_train_module_batch",
+    "run_v2_train_nodes",
 ]

@@ -12,8 +12,8 @@ from veomni.models.seed_omni.training_graph import TrainingGraph
 
 from .spec import (
     PARITY_ENABLE_ENV,
-    GateSpec,
     ModelSpec,
+    RunSpec,
     ScenarioSpec,
     load_model_spec,
     load_yaml_file,
@@ -47,21 +47,27 @@ class NodeSpec:
 class ParityCase:
     model: ModelSpec
     scenario: ScenarioSpec
-    tier: str
+    run: RunSpec
     graph: GraphSpec
     nodes: tuple[NodeSpec, ...]
 
     @property
     def node_id(self) -> str:
-        return f"{self.model.name}.{self.tier}.{self.graph.name}.{self.scenario.id}"
+        return f"{self.model.name}.{self.tier}.{self.graph.name}.{self.scenario.id}.{self.run.id}"
+
+    @property
+    def tier(self) -> str:
+        return self.run.tier
 
     @property
     def requires_cuda(self) -> bool:
-        return self.model.gate.requires_cuda
+        return self.model.gate.requires_cuda or self.scenario.gate.requires_cuda or self.run.gate.requires_cuda
 
     @property
     def min_cuda_devices(self) -> int:
-        return self.model.gate.min_cuda_devices
+        return max(
+            self.model.gate.min_cuda_devices, self.scenario.gate.min_cuda_devices, self.run.gate.min_cuda_devices
+        )
 
     def static_skip_reason(self) -> str | None:
         if os.environ.get(PARITY_ENABLE_ENV) != "1":
@@ -87,7 +93,7 @@ def discover_cases(model_dirs: Iterable[str | Path] | None = None) -> tuple[Pari
     """Discover all configured parity cases without executing reference or V2 models."""
 
     cases: list[ParityCase] = []
-    seen: set[tuple[str, str, str, str]] = set()
+    seen: set[tuple[str, str, str, str, str]] = set()
     for model_dir in model_dirs or default_model_dirs():
         model = load_model_spec(model_dir)
         graph_by_name = {graph.name: graph for graph in discover_graph_specs(model)}
@@ -99,12 +105,12 @@ def discover_cases(model_dirs: Iterable[str | Path] | None = None) -> tuple[Pari
                     f"but available graphs are {sorted(graph_by_name)}."
                 )
             nodes = discover_nodes(graph)
-            for tier in _expand_tiers(model.gate, model.tiers.enabled(), scenario):
-                key = (model.name, tier, graph.name, scenario.id)
+            for run in _enabled_runs(model.tiers.enabled(), scenario):
+                key = (model.name, run.tier, graph.name, scenario.id, run.id)
                 if key in seen:
                     continue
                 seen.add(key)
-                cases.append(ParityCase(model=model, scenario=scenario, tier=tier, graph=graph, nodes=nodes))
+                cases.append(ParityCase(model=model, scenario=scenario, run=run, graph=graph, nodes=nodes))
     return tuple(cases)
 
 
@@ -170,7 +176,5 @@ def discover_nodes(graph: GraphSpec) -> tuple[NodeSpec, ...]:
     return tuple(nodes)
 
 
-def _expand_tiers(gate: GateSpec, enabled_tiers: tuple[str, ...], scenario: ScenarioSpec) -> tuple[str, ...]:
-    del gate
-    requested = scenario.tiers or enabled_tiers
-    return tuple(tier for tier in requested if tier in enabled_tiers)
+def _enabled_runs(enabled_tiers: tuple[str, ...], scenario: ScenarioSpec) -> tuple[RunSpec, ...]:
+    return tuple(run for run in scenario.runs if run.tier in enabled_tiers)

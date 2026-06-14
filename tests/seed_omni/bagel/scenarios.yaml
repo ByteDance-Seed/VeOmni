@@ -5,43 +5,67 @@ scenarios:
     stimulus:
       prompt: "Describe BAGEL in one short sentence."
       timestep_shift: 3.0
-    probes:
-      - train.ce_loss
-      - train.mse_loss
-      - train.grad_early_q_proj
-      - train.grad_gen_q_proj
-      - train.grad_lm_head_rows
-      - train.grad_llm2vae
-    tiers:
-      - graph
-      - module
-      - framework
-  train_framework_optimizer_scheduler:
-    graph: train
-    driver_case: train_ce_mse
-    stimulus:
-      prompt: "Describe BAGEL in one short sentence."
-      timestep_shift: 3.0
-    framework:
-      kind: trainer_step
-      lr: 1.0e-4
-      max_grad_norm: 1.0e9
-      require_active_clip: false
-    tiers:
-      - framework
-  train_framework_active_clipping:
-    graph: train
-    driver_case: train_ce_mse
-    stimulus:
-      prompt: "Describe BAGEL in one short sentence."
-      timestep_shift: 3.0
-    framework:
-      kind: trainer_step
-      lr: 1.0e-4
-      max_grad_norm: 1.0
-      require_active_clip: true
-    tiers:
-      - framework
+    runs:
+      graph:
+        - id: one_step
+          probes:
+            - train.ce_loss
+            - train.mse_loss
+            - train.grad_early_q_proj
+            - train.grad_gen_q_proj
+            - train.grad_lm_head_rows
+            - train.grad_llm2vae
+      module:
+        - id: one_step
+          probes:
+            - train.ce_loss
+            - train.mse_loss
+            - train.grad_early_q_proj
+            - train.grad_gen_q_proj
+            - train.grad_lm_head_rows
+            - train.grad_llm2vae
+      framework:
+        - id: forward_backward
+          kind: forward_backward
+          probes:
+            - train.ce_loss
+            - train.mse_loss
+            - train.grad_early_q_proj
+            - train.grad_gen_q_proj
+            - train.grad_lm_head_rows
+            - train.grad_llm2vae
+        - id: train_step_optimizer_scheduler
+          kind: train_step
+          lr: 1.0e-4
+          max_grad_norm: 1.0e9
+          checks:
+            - optimizer_scheduler
+        - id: train_step_active_clipping
+          kind: train_step
+          lr: 1.0e-4
+          max_grad_norm: 1.0
+          checks:
+            - active_clipping
+        - id: checkpoint_resume
+          kind: checkpoint_resume
+          lr: 1.0e-4
+          max_grad_norm: 1.0e9
+        - id: launcher
+          kind: launcher
+          launcher_path: tasks/omni/train_omni.py
+          config_path: configs/seed_omni/Bagel/bagel_7b_mot/base.yaml
+        - id: optimizer_trajectory
+          kind: optimizer_trajectory
+          lr: 1.0e-4
+          steps: 2
+        - id: fsdp2
+          kind: distributed_train
+          strategy: fsdp2
+          gate:
+            min_cuda_devices: 2
+          nproc_per_node: 2
+          config_path: configs/seed_omni/Bagel/bagel_7b_mot/base.yaml
+          timeout: 900
   train_ce_only_one_step:
     graph: train
     driver_case: train_ce_mse
@@ -49,14 +73,26 @@ scenarios:
       prompt: "Describe BAGEL in one short sentence."
       loss_mode: ce_only
       timestep_shift: 3.0
-    probes:
-      - train.ce_loss
-      - train.grad_early_q_proj
-      - train.grad_lm_head_rows
-    tiers:
-      - graph
-      - module
-      - framework
+    runs:
+      graph:
+        - id: one_step
+          probes:
+            - train.ce_loss
+            - train.grad_early_q_proj
+            - train.grad_lm_head_rows
+      module:
+        - id: one_step
+          probes:
+            - train.ce_loss
+            - train.grad_early_q_proj
+            - train.grad_lm_head_rows
+      framework:
+        - id: forward_backward
+          kind: forward_backward
+          probes:
+            - train.ce_loss
+            - train.grad_early_q_proj
+            - train.grad_lm_head_rows
   train_text_image_ce_one_step:
     graph: train
     driver_case: train_ce_mse
@@ -64,15 +100,29 @@ scenarios:
       prompt: "Describe BAGEL in one short sentence."
       loss_mode: text_image_ce
       timestep_shift: 3.0
-    probes:
-      - train.ce_loss
-      - train.grad_early_q_proj
-      - train.grad_lm_head_rows
-      - train.grad_siglip_q_proj
-    tiers:
-      - graph
-      - module
-      - framework
+    runs:
+      graph:
+        - id: one_step
+          probes:
+            - train.ce_loss
+            - train.grad_early_q_proj
+            - train.grad_lm_head_rows
+            - train.grad_siglip_q_proj
+      module:
+        - id: one_step
+          probes:
+            - train.ce_loss
+            - train.grad_early_q_proj
+            - train.grad_lm_head_rows
+            - train.grad_siglip_q_proj
+      framework:
+        - id: forward_backward
+          kind: forward_backward
+          probes:
+            - train.ce_loss
+            - train.grad_early_q_proj
+            - train.grad_lm_head_rows
+            - train.grad_siglip_q_proj
   train_mse_only_one_step:
     graph: train
     driver_case: train_ce_mse
@@ -80,14 +130,26 @@ scenarios:
       prompt: "Describe BAGEL in one short sentence."
       loss_mode: mse_only
       timestep_shift: 3.0
-    probes:
-      - train.mse_loss
-      - train.grad_gen_q_proj
-      - train.grad_llm2vae
-    tiers:
-      - graph
-      - module
-      - framework
+    runs:
+      graph:
+        - id: one_step
+          probes:
+            - train.mse_loss
+            - train.grad_gen_q_proj
+            - train.grad_llm2vae
+      module:
+        - id: one_step
+          probes:
+            - train.mse_loss
+            - train.grad_gen_q_proj
+            - train.grad_llm2vae
+      framework:
+        - id: forward_backward
+          kind: forward_backward
+          probes:
+            - train.mse_loss
+            - train.grad_gen_q_proj
+            - train.grad_llm2vae
   infer_text_only_one_step:
     graph: infer_und
     driver_case: text_und
@@ -95,17 +157,23 @@ scenarios:
       prompt: "Write a short description of a calm lake at sunrise."
       max_new_tokens: 1
       do_sample: false
-    probes:
-      - text.hidden
-      - text.logits
-      - text.greedy_token
-    module_policy:
-      required_nodes:
-        - [prompt_encode, bagel_qwen2_mot.generate]
-        - [prompt_encode, bagel_text_encoder.token_generate]
-    tiers:
-      - graph
-      - module
+    runs:
+      graph:
+        - id: one_step
+          probes:
+            - text.hidden
+            - text.logits
+            - text.greedy_token
+      module:
+        - id: one_step
+          probes:
+            - text.hidden
+            - text.logits
+            - text.greedy_token
+          module_policy:
+            required_nodes:
+              - [prompt_encode, bagel_qwen2_mot.generate]
+              - [prompt_encode, bagel_text_encoder.token_generate]
   infer_text_image_und_one_step:
     graph: infer_und
     driver_case: text_image_und
@@ -115,17 +183,23 @@ scenarios:
       image_height: 336
       max_new_tokens: 1
       do_sample: false
-    probes:
-      - text.hidden
-      - text.logits
-      - text.greedy_token
-    module_policy:
-      required_nodes:
-        - [prompt_encode, bagel_qwen2_mot.generate]
-        - [prompt_encode, bagel_text_encoder.token_generate]
-    tiers:
-      - graph
-      - module
+    runs:
+      graph:
+        - id: one_step
+          probes:
+            - text.hidden
+            - text.logits
+            - text.greedy_token
+      module:
+        - id: one_step
+          probes:
+            - text.hidden
+            - text.logits
+            - text.greedy_token
+          module_policy:
+            required_nodes:
+              - [prompt_encode, bagel_qwen2_mot.generate]
+              - [prompt_encode, bagel_text_encoder.token_generate]
   infer_text_image_raw_und_one_step:
     graph: infer_und
     driver_case: text_image_und
@@ -136,20 +210,28 @@ scenarios:
       use_raw_image: true
       max_new_tokens: 1
       do_sample: false
-    probes:
-      - image.image_embeds_sample
-      - image.preprocessed_image_size
-      - text.hidden
-      - text.logits
-      - text.greedy_token
-    module_policy:
-      required_nodes:
-        - [prompt_encode, bagel_siglip_navit.generate]
-        - [prompt_encode, bagel_qwen2_mot.generate]
-        - [prompt_encode, bagel_text_encoder.token_generate]
-    tiers:
-      - graph
-      - module
+    runs:
+      graph:
+        - id: one_step
+          probes:
+            - image.image_embeds_sample
+            - image.preprocessed_image_size
+            - text.hidden
+            - text.logits
+            - text.greedy_token
+      module:
+        - id: one_step
+          probes:
+            - image.image_embeds_sample
+            - image.preprocessed_image_size
+            - text.hidden
+            - text.logits
+            - text.greedy_token
+          module_policy:
+            required_nodes:
+              - [prompt_encode, bagel_siglip_navit.generate]
+              - [prompt_encode, bagel_qwen2_mot.generate]
+              - [prompt_encode, bagel_text_encoder.token_generate]
   infer_image_gen_one_step:
     graph: infer_gen
     driver_case: image_gen
@@ -168,18 +250,26 @@ scenarios:
       cfg_renorm_min: 0.0
       cfg_renorm_type: global
       enable_taylorseer: false
-    probes:
-      - image.latent_embeds_sample
-      - image.packed_sequence_sample
-      - image.hidden_sample
-      - image.velocity
-      - image.x_t
-    module_policy:
-      required_nodes:
-        - [image_flow, bagel_flow_connector.decode_velocity]
-    tiers:
-      - graph
-      - module
+    runs:
+      graph:
+        - id: one_step
+          probes:
+            - image.latent_embeds_sample
+            - image.packed_sequence_sample
+            - image.hidden_sample
+            - image.velocity
+            - image.x_t
+      module:
+        - id: one_step
+          probes:
+            - image.latent_embeds_sample
+            - image.packed_sequence_sample
+            - image.hidden_sample
+            - image.velocity
+            - image.x_t
+          module_policy:
+            required_nodes:
+              - [image_flow, bagel_flow_connector.decode_velocity]
   infer_image_gen_wide_one_step:
     graph: infer_gen
     driver_case: image_gen
@@ -198,18 +288,26 @@ scenarios:
       cfg_renorm_min: 0.0
       cfg_renorm_type: global
       enable_taylorseer: false
-    probes:
-      - image.latent_embeds_sample
-      - image.packed_sequence_sample
-      - image.hidden_sample
-      - image.velocity
-      - image.x_t
-    module_policy:
-      required_nodes:
-        - [image_flow, bagel_flow_connector.decode_velocity]
-    tiers:
-      - graph
-      - module
+    runs:
+      graph:
+        - id: one_step
+          probes:
+            - image.latent_embeds_sample
+            - image.packed_sequence_sample
+            - image.hidden_sample
+            - image.velocity
+            - image.x_t
+      module:
+        - id: one_step
+          probes:
+            - image.latent_embeds_sample
+            - image.packed_sequence_sample
+            - image.hidden_sample
+            - image.velocity
+            - image.x_t
+          module_policy:
+            required_nodes:
+              - [image_flow, bagel_flow_connector.decode_velocity]
   infer_image_gen_cfg_text_one_step:
     graph: infer_gen
     driver_case: image_gen
@@ -228,18 +326,26 @@ scenarios:
       cfg_renorm_min: 0.0
       cfg_renorm_type: global
       enable_taylorseer: false
-    probes:
-      - image.base_velocity
-      - image.cfg_text_hidden_sample
-      - image.cfg_text_velocity
-      - image.velocity
-      - image.x_t
-    module_policy:
-      required_nodes:
-        - [image_flow, bagel_flow_connector.decode_velocity]
-    tiers:
-      - graph
-      - module
+    runs:
+      graph:
+        - id: one_step
+          probes:
+            - image.base_velocity
+            - image.cfg_text_hidden_sample
+            - image.cfg_text_velocity
+            - image.velocity
+            - image.x_t
+      module:
+        - id: one_step
+          probes:
+            - image.base_velocity
+            - image.cfg_text_hidden_sample
+            - image.cfg_text_velocity
+            - image.velocity
+            - image.x_t
+          module_policy:
+            required_nodes:
+              - [image_flow, bagel_flow_connector.decode_velocity]
   infer_image_gen_cfg_image_one_step:
     graph: infer_gen
     driver_case: image_gen
@@ -258,20 +364,30 @@ scenarios:
       cfg_renorm_min: 0.0
       cfg_renorm_type: global
       enable_taylorseer: false
-    probes:
-      - image.base_velocity
-      - image.cfg_text_hidden_sample
-      - image.cfg_img_hidden_sample
-      - image.cfg_text_velocity
-      - image.cfg_img_velocity
-      - image.velocity
-      - image.x_t
-    module_policy:
-      required_nodes:
-        - [image_flow, bagel_flow_connector.decode_velocity]
-    tiers:
-      - graph
-      - module
+    runs:
+      graph:
+        - id: one_step
+          probes:
+            - image.base_velocity
+            - image.cfg_text_hidden_sample
+            - image.cfg_img_hidden_sample
+            - image.cfg_text_velocity
+            - image.cfg_img_velocity
+            - image.velocity
+            - image.x_t
+      module:
+        - id: one_step
+          probes:
+            - image.base_velocity
+            - image.cfg_text_hidden_sample
+            - image.cfg_img_hidden_sample
+            - image.cfg_text_velocity
+            - image.cfg_img_velocity
+            - image.velocity
+            - image.x_t
+          module_policy:
+            required_nodes:
+              - [image_flow, bagel_flow_connector.decode_velocity]
   infer_image_gen_cfg_renorm_one_step:
     graph: infer_gen
     driver_case: image_gen
@@ -290,17 +406,24 @@ scenarios:
       cfg_renorm_min: 0.8
       cfg_renorm_type: channel
       enable_taylorseer: false
-    probes:
-      - image.base_velocity
-      - image.cfg_text_velocity
-      - image.velocity
-      - image.x_t
-    module_policy:
-      required_nodes:
-        - [image_flow, bagel_flow_connector.decode_velocity]
-    tiers:
-      - graph
-      - module
+    runs:
+      graph:
+        - id: one_step
+          probes:
+            - image.base_velocity
+            - image.cfg_text_velocity
+            - image.velocity
+            - image.x_t
+      module:
+        - id: one_step
+          probes:
+            - image.base_velocity
+            - image.cfg_text_velocity
+            - image.velocity
+            - image.x_t
+          module_policy:
+            required_nodes:
+              - [image_flow, bagel_flow_connector.decode_velocity]
   infer_image_gen_multi_step_three_steps:
     graph: infer_gen
     driver_case: image_gen
@@ -319,14 +442,19 @@ scenarios:
       cfg_renorm_min: 0.0
       cfg_renorm_type: global
       enable_taylorseer: false
-    probes:
-      - image.velocity
-      - image.x_t
-    module_policy:
-      max_steps: 8
-    tiers:
-      - graph
-      - module
+    runs:
+      graph:
+        - id: three_steps
+          probes:
+            - image.velocity
+            - image.x_t
+      module:
+        - id: three_steps
+          probes:
+            - image.velocity
+            - image.x_t
+          module_policy:
+            max_steps: 8
   infer_image_gen_decode_smoke:
     graph: infer_gen
     driver_case: image_gen
@@ -346,14 +474,83 @@ scenarios:
       cfg_renorm_type: global
       enable_taylorseer: false
       enable_decode_smoke: true
-    probes:
-      - image.generated_image_count
-      - image.generated_image_size
-    module_policy:
-      max_steps: 8
-    tiers:
-      - graph
-      - module
+    runs:
+      graph:
+        - id: decode_smoke
+          probes:
+            - image.generated_image_count
+            - image.generated_image_size
+      module:
+        - id: decode_smoke
+          probes:
+            - image.generated_image_count
+            - image.generated_image_size
+          module_policy:
+            max_steps: 8
+  infer_image_gen_cfg_text_decode_smoke:
+    graph: infer_gen
+    driver_case: image_gen
+    stimulus:
+      prompt: "A tiny red robot painting flowers in a quiet studio."
+      max_new_tokens: 6
+      max_flow_steps: 2
+      image_height: 512
+      image_width: 512
+      latent_downsample: 16
+      num_timesteps: 50
+      timestep_shift: 3.0
+      cfg_text_scale: 4.0
+      cfg_img_scale: 1.0
+      cfg_interval: [0.0, 1.0]
+      cfg_renorm_min: 0.0
+      cfg_renorm_type: global
+      enable_taylorseer: false
+      enable_decode_smoke: true
+    runs:
+      graph:
+        - id: decode_smoke
+          probes:
+            - image.generated_image_count
+            - image.generated_image_size
+      module:
+        - id: decode_smoke
+          probes:
+            - image.generated_image_count
+            - image.generated_image_size
+          module_policy:
+            max_steps: 8
+  infer_image_gen_cfg_image_decode_smoke:
+    graph: infer_gen
+    driver_case: image_gen
+    stimulus:
+      prompt: "A blue glass owl sitting beside a candle."
+      max_new_tokens: 6
+      max_flow_steps: 2
+      image_height: 512
+      image_width: 512
+      latent_downsample: 16
+      num_timesteps: 50
+      timestep_shift: 3.0
+      cfg_text_scale: 4.0
+      cfg_img_scale: 2.0
+      cfg_interval: [0.0, 1.0]
+      cfg_renorm_min: 0.0
+      cfg_renorm_type: global
+      enable_taylorseer: false
+      enable_decode_smoke: true
+    runs:
+      graph:
+        - id: decode_smoke
+          probes:
+            - image.generated_image_count
+            - image.generated_image_size
+      module:
+        - id: decode_smoke
+          probes:
+            - image.generated_image_count
+            - image.generated_image_size
+          module_policy:
+            max_steps: 8
   infer_image_edit_one_step:
     graph: infer_edit
     driver_case: image_edit
@@ -367,22 +564,34 @@ scenarios:
       timestep_shift: 3.0
       enable_vae_context: true
       enable_taylorseer: false
-    probes:
-      - image.image_embeds_sample
-      - image.vae_context_latents
-      - image.vae_context_latent_embeds_sample
-      - image.vae_context_packed_sequence_sample
-      - image.latent_embeds_sample
-      - image.packed_sequence_sample
-      - image.hidden_sample
-      - image.velocity
-      - image.x_t
-    module_policy:
-      required_nodes:
-        - [image_flow, bagel_flow_connector.decode_velocity]
-    tiers:
-      - graph
-      - module
+    runs:
+      graph:
+        - id: one_step
+          probes:
+            - image.image_embeds_sample
+            - image.vae_context_latents
+            - image.vae_context_latent_embeds_sample
+            - image.vae_context_packed_sequence_sample
+            - image.latent_embeds_sample
+            - image.packed_sequence_sample
+            - image.hidden_sample
+            - image.velocity
+            - image.x_t
+      module:
+        - id: one_step
+          probes:
+            - image.image_embeds_sample
+            - image.vae_context_latents
+            - image.vae_context_latent_embeds_sample
+            - image.vae_context_packed_sequence_sample
+            - image.latent_embeds_sample
+            - image.packed_sequence_sample
+            - image.hidden_sample
+            - image.velocity
+            - image.x_t
+          module_policy:
+            required_nodes:
+              - [image_flow, bagel_flow_connector.decode_velocity]
   infer_image_edit_text_branch_one_step:
     graph: infer_edit
     driver_case: text_und
@@ -391,17 +600,23 @@ scenarios:
       infer_mode: und
       max_new_tokens: 1
       do_sample: false
-    probes:
-      - text.hidden
-      - text.logits
-      - text.greedy_token
-    module_policy:
-      required_nodes:
-        - [prompt_encode, bagel_qwen2_mot.generate]
-        - [prompt_encode, bagel_text_encoder.token_generate]
-    tiers:
-      - graph
-      - module
+    runs:
+      graph:
+        - id: one_step
+          probes:
+            - text.hidden
+            - text.logits
+            - text.greedy_token
+      module:
+        - id: one_step
+          probes:
+            - text.hidden
+            - text.logits
+            - text.greedy_token
+          module_policy:
+            required_nodes:
+              - [prompt_encode, bagel_qwen2_mot.generate]
+              - [prompt_encode, bagel_text_encoder.token_generate]
   infer_interleave_text_one_step:
     graph: infer_interleave
     driver_case: text_und
@@ -409,17 +624,23 @@ scenarios:
       prompt: "Write one concise sentence about a mountain path after rain."
       max_new_tokens: 1
       do_sample: false
-    probes:
-      - text.hidden
-      - text.logits
-      - text.greedy_token
-    module_policy:
-      required_nodes:
-        - [prompt_encode, bagel_qwen2_mot.generate]
-        - [prompt_encode, bagel_text_encoder.token_generate]
-    tiers:
-      - graph
-      - module
+    runs:
+      graph:
+        - id: one_step
+          probes:
+            - text.hidden
+            - text.logits
+            - text.greedy_token
+      module:
+        - id: one_step
+          probes:
+            - text.hidden
+            - text.logits
+            - text.greedy_token
+          module_policy:
+            required_nodes:
+              - [prompt_encode, bagel_qwen2_mot.generate]
+              - [prompt_encode, bagel_text_encoder.token_generate]
   infer_interleave_text_image_und_one_step:
     graph: infer_interleave
     driver_case: text_image_und
@@ -429,17 +650,23 @@ scenarios:
       image_height: 336
       max_new_tokens: 1
       do_sample: false
-    probes:
-      - text.hidden
-      - text.logits
-      - text.greedy_token
-    module_policy:
-      required_nodes:
-        - [prompt_encode, bagel_qwen2_mot.generate]
-        - [prompt_encode, bagel_text_encoder.token_generate]
-    tiers:
-      - graph
-      - module
+    runs:
+      graph:
+        - id: one_step
+          probes:
+            - text.hidden
+            - text.logits
+            - text.greedy_token
+      module:
+        - id: one_step
+          probes:
+            - text.hidden
+            - text.logits
+            - text.greedy_token
+          module_policy:
+            required_nodes:
+              - [prompt_encode, bagel_qwen2_mot.generate]
+              - [prompt_encode, bagel_text_encoder.token_generate]
   infer_interleave_image_span_one_step:
     graph: infer_interleave
     driver_case: image_gen
@@ -459,15 +686,23 @@ scenarios:
       cfg_renorm_min: 0.0
       cfg_renorm_type: global
       enable_taylorseer: false
-    probes:
-      - image.latent_embeds_sample
-      - image.packed_sequence_sample
-      - image.hidden_sample
-      - image.velocity
-      - image.x_t
-    module_policy:
-      required_nodes:
-        - [image_flow, bagel_flow_connector.decode_velocity]
-    tiers:
-      - graph
-      - module
+    runs:
+      graph:
+        - id: one_step
+          probes:
+            - image.latent_embeds_sample
+            - image.packed_sequence_sample
+            - image.hidden_sample
+            - image.velocity
+            - image.x_t
+      module:
+        - id: one_step
+          probes:
+            - image.latent_embeds_sample
+            - image.packed_sequence_sample
+            - image.hidden_sample
+            - image.velocity
+            - image.x_t
+          module_policy:
+            required_nodes:
+              - [image_flow, bagel_flow_connector.decode_velocity]

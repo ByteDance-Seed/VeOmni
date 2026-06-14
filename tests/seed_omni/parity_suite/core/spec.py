@@ -185,17 +185,39 @@ class ModulePolicySpec:
 
 
 @dataclass(frozen=True)
-class FrameworkPolicySpec:
-    kind: str = ""
+class RunSpec:
+    id: str
+    tier: str
+    kind: str
+    probes: tuple[str, ...] = ()
+    gate: GateSpec = field(default_factory=GateSpec)
+    module_policy: ModulePolicySpec = field(default_factory=ModulePolicySpec)
     options: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any] | None, *, scenario_id: str) -> FrameworkPolicySpec:
-        values = dict(data or {})
-        kind = values.pop("kind", "")
-        if not kind:
-            raise ValueError(f"Scenario {scenario_id} framework policy must declare kind.")
-        return cls(kind=str(kind), options=values)
+    def from_dict(cls, *, scenario_id: str, tier: str, index: int, data: dict[str, Any]) -> RunSpec:
+        if not isinstance(data, dict):
+            raise TypeError(f"Scenario {scenario_id} runs.{tier}[{index}] must be a mapping.")
+        values = dict(data)
+        run_id = str(values.pop("id", f"{tier}_{index}"))
+        kind = str(values.pop("kind", _default_run_kind(tier)))
+        probes = _string_tuple(
+            values.pop("probes", None), field_name=f"scenarios.{scenario_id}.runs.{tier}.{run_id}.probes"
+        )
+        gate = GateSpec.from_dict(values.pop("gate", None))
+        module_policy = ModulePolicySpec.from_dict(
+            values.pop("module_policy", None),
+            field_name=f"scenarios.{scenario_id}.runs.{tier}.{run_id}.module_policy",
+        )
+        return cls(
+            id=run_id,
+            tier=tier,
+            kind=kind,
+            probes=probes,
+            gate=gate,
+            module_policy=module_policy,
+            options=values,
+        )
 
 
 @dataclass(frozen=True)
@@ -204,10 +226,8 @@ class ScenarioSpec:
     graph: str
     driver_case: str
     stimulus: dict[str, Any] = field(default_factory=dict)
-    probes: tuple[str, ...] = ()
-    tiers: tuple[str, ...] = ()
-    module_policy: ModulePolicySpec = field(default_factory=ModulePolicySpec)
-    framework_policy: FrameworkPolicySpec | None = None
+    gate: GateSpec = field(default_factory=GateSpec)
+    runs: tuple[RunSpec, ...] = ()
 
     @classmethod
     def from_dict(cls, scenario_id: str, data: dict[str, Any]) -> ScenarioSpec:
@@ -225,18 +245,33 @@ class ScenarioSpec:
             graph=str(data["graph"]),
             driver_case=str(data["driver_case"]),
             stimulus=stimulus,
-            probes=_string_tuple(data.get("probes"), field_name=f"scenarios.{scenario_id}.probes"),
-            tiers=_string_tuple(data.get("tiers"), field_name=f"scenarios.{scenario_id}.tiers"),
-            module_policy=ModulePolicySpec.from_dict(
-                data.get("module_policy"),
-                field_name=f"scenarios.{scenario_id}.module_policy",
-            ),
-            framework_policy=(
-                None
-                if data.get("framework") is None
-                else FrameworkPolicySpec.from_dict(data.get("framework"), scenario_id=scenario_id)
-            ),
+            gate=GateSpec.from_dict(data.get("gate")),
+            runs=_run_specs(scenario_id, data.get("runs")),
         )
+
+
+def _default_run_kind(tier: str) -> str:
+    if tier == "framework":
+        return "forward_backward"
+    return tier
+
+
+def _run_specs(scenario_id: str, raw_runs: Any) -> tuple[RunSpec, ...]:
+    if raw_runs is None:
+        raise ValueError(f"Scenario {scenario_id} must declare runs.")
+    if not isinstance(raw_runs, dict):
+        raise TypeError(f"Scenario {scenario_id} runs must be a mapping from tier to run list.")
+    runs: list[RunSpec] = []
+    for tier, raw_tier_runs in raw_runs.items():
+        if tier not in {"graph", "module", "framework"}:
+            raise ValueError(f"Scenario {scenario_id} has unsupported run tier {tier!r}.")
+        if not isinstance(raw_tier_runs, list):
+            raise TypeError(f"Scenario {scenario_id} runs.{tier} must be a list.")
+        for index, raw_run in enumerate(raw_tier_runs):
+            runs.append(RunSpec.from_dict(scenario_id=scenario_id, tier=str(tier), index=index, data=raw_run or {}))
+    if not runs:
+        raise ValueError(f"Scenario {scenario_id} must declare at least one run.")
+    return tuple(runs)
 
 
 @dataclass(frozen=True)
