@@ -205,7 +205,7 @@ def _run_wan_forward_parity() -> None:
 
 
 def _run_wan_sp_forward(rank: int, world_size: int, init_file: str) -> None:
-    os.environ["MODELING_BACKEND"] = "hf"
+    os.environ["MODELING_BACKEND"] = "veomni"
     os.environ["DIFFUSERS_ATTN_BACKEND"] = "flash"
 
     import torch.distributed as dist
@@ -301,7 +301,7 @@ def _run_wan_sp_forward(rank: int, world_size: int, init_file: str) -> None:
 
 
 def _run_wan_sp_baseline_check() -> None:
-    os.environ["MODELING_BACKEND"] = "hf"
+    os.environ["MODELING_BACKEND"] = "veomni"
     os.environ["DIFFUSERS_ATTN_BACKEND"] = "flash"
 
     from diffusers import WanTransformer3DModel as DiffusersWanTransformer3DModel
