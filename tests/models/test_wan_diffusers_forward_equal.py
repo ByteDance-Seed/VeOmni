@@ -368,6 +368,16 @@ def _run_wan_backward_finite() -> None:
     apply_veomni_attention_patch()
     apply_veomni_wan_transformer_patch()
 
+    def _iter_tensors(value):
+        if isinstance(value, torch.Tensor):
+            yield value
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                yield from _iter_tensors(item)
+        elif isinstance(value, dict):
+            for item in value.values():
+                yield from _iter_tensors(item)
+
     device = get_device_type()
     dtype = torch.bfloat16
     hidden_shape = (1, 16, 10, 16, 16)
@@ -381,7 +391,8 @@ def _run_wan_backward_finite() -> None:
     }
     config = WanTransformer3DModelConfig.from_pretrained(WAN_TOY_CONFIG_DIR)
 
-    for attn_implementation in ("flash_attention_2", "veomni_flash_attention_2_with_sp"):
+    errors = []
+    for attn_implementation in ("eager", "flash_attention_2", "veomni_flash_attention_2_with_sp"):
         torch.manual_seed(0)
         model = (
             WanTransformer3DModel._from_config(
@@ -393,13 +404,39 @@ def _run_wan_backward_finite() -> None:
             .train()
         )
         _initialize_floating_parameters(model)
+        first_nonfinite = None
+        hooks = []
+
+        def _make_hook(name):
+            def _hook(_module, _inputs, hook_output):
+                nonlocal first_nonfinite
+                if first_nonfinite is not None:
+                    return
+                for tensor in _iter_tensors(hook_output):
+                    if torch.is_floating_point(tensor) and not torch.isfinite(tensor).all():
+                        first_nonfinite = f"{name}: shape={tuple(tensor.shape)}, dtype={tensor.dtype}"
+                        return
+
+            return _hook
+
+        hooks.append(model.patch_embedding.register_forward_hook(_make_hook("patch_embedding")))
+        hooks.append(model.condition_embedder.register_forward_hook(_make_hook("condition_embedder")))
+        for block_idx, block in enumerate(model.blocks):
+            hooks.append(block.attn1.register_forward_hook(_make_hook(f"blocks.{block_idx}.attn1")))
+            hooks.append(block.attn2.register_forward_hook(_make_hook(f"blocks.{block_idx}.attn2")))
+            hooks.append(block.ffn.register_forward_hook(_make_hook(f"blocks.{block_idx}.ffn")))
+        hooks.append(model.norm_out.register_forward_hook(_make_hook("norm_out")))
+        hooks.append(model.proj_out.register_forward_hook(_make_hook("proj_out")))
+
         try:
             output = model(**batch)
             loss = output.loss["mse_loss"]
-            assert torch.isfinite(output.predictions[0]).all(), (
-                f"Wan {attn_implementation} train forward produced non-finite predictions."
-            )
-            assert torch.isfinite(loss).all(), f"Wan {attn_implementation} train forward produced non-finite loss."
+            if not torch.isfinite(output.predictions[0]).all():
+                errors.append(f"{attn_implementation}: non-finite predictions; first_nonfinite={first_nonfinite}")
+                continue
+            if not torch.isfinite(loss).all():
+                errors.append(f"{attn_implementation}: non-finite loss; first_nonfinite={first_nonfinite}")
+                continue
             loss.backward()
 
             nonfinite_grad_names = [
@@ -407,12 +444,15 @@ def _run_wan_backward_finite() -> None:
                 for name, parameter in model.named_parameters()
                 if parameter.grad is not None and not torch.isfinite(parameter.grad).all()
             ]
-            assert not nonfinite_grad_names, (
-                f"Wan {attn_implementation} backward produced non-finite gradients: {nonfinite_grad_names[:10]}"
-            )
+            if nonfinite_grad_names:
+                errors.append(f"{attn_implementation}: non-finite gradients: {nonfinite_grad_names[:10]}")
         finally:
+            for hook in hooks:
+                hook.remove()
             del model
             _release()
+
+    assert not errors, "\n".join(errors)
 
 
 def test_wan_forward_bitwise_equal_to_diffusers_flash_attention_2():
