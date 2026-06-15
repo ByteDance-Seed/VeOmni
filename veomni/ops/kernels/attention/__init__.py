@@ -188,7 +188,6 @@ def flash_attention_forward(
          Transformers v5's hub-kernel fallback is intercepted by VeOmni's
          monkey-patch of ``load_and_register_attn_kernel``, which loads
          ``flash_attn.cute`` locally instead of fetching from the hub.
-
     """
     if kwargs.get("output_attentions", False) or kwargs.get("head_mask") is not None:
         logger.warning_once(
@@ -301,10 +300,6 @@ def flash_attention_forward(
         raise ValueError(
             f"unknown attn_implementation for veomni flash_attention with SP support: {module.config._attn_implementation}"
         )
-
-    query = query.contiguous()
-    key = key.contiguous()
-    value = value.contiguous()
 
     attn_output = _flash_attention_forward(
         query,

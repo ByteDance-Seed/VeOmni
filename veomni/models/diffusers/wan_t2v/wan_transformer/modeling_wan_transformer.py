@@ -71,6 +71,42 @@ class WanAttentionKernelModule:
         return self._attn.modules()
 
 
+def _get_wan_full_sequence_varlen_kwargs(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+) -> dict[str, torch.Tensor | int]:
+    if query.ndim != 4 or key.ndim != 4 or value.ndim != 4:
+        raise ValueError("Wan flash-attention expects Q/K/V tensors with shape (batch, seq, heads, head_dim).")
+    if query.shape[0] != key.shape[0] or query.shape[0] != value.shape[0]:
+        raise ValueError(
+            "Wan flash-attention expects matching Q/K/V batch sizes; "
+            f"got {query.shape[0]}/{key.shape[0]}/{value.shape[0]}."
+        )
+
+    batch_size = query.shape[0]
+    cu_seq_lens_q = torch.arange(
+        0,
+        (batch_size + 1) * query.shape[1],
+        query.shape[1],
+        device=query.device,
+        dtype=torch.int32,
+    )
+    cu_seq_lens_k = torch.arange(
+        0,
+        (batch_size + 1) * key.shape[1],
+        key.shape[1],
+        device=key.device,
+        dtype=torch.int32,
+    )
+    return {
+        "cu_seq_lens_q": cu_seq_lens_q,
+        "cu_seq_lens_k": cu_seq_lens_k,
+        "max_length_q": query.shape[1],
+        "max_length_k": key.shape[1],
+    }
+
+
 class WanSPAttnProcessor(WanAttnProcessor):
     def __init__(self, attn_implementation: str):
         self.attn_implementation = attn_implementation
@@ -141,11 +177,9 @@ class WanSPAttnProcessor(WanAttnProcessor):
             query = apply_rotary_emb(query, *rotary_emb)
             key = apply_rotary_emb(key, *rotary_emb)
 
-        # Route Wan T2V FA2 through the unified VeOmni attention entry. The
-        # DiT trainer feeds one full sample at a time; a full-ones mask keeps
-        # self-attention semantics unchanged while selecting HF's unpad/varlen
-        # FA2 path instead of the dense path that produces non-finite T2V
-        # outputs on L20/PyTorch 2.11.
+        # DiT trainer feeds full per-sample sequences. Passing explicit sequence
+        # boundaries selects HF's varlen FA2 path without changing attention
+        # semantics or relying on a synthetic padding mask.
         attention_interface: Callable = wan_eager_attention_forward
         use_fp32_attention = query.dtype == torch.float32 and attn.to_q.weight.dtype == torch.float32
         use_flash_attention = self.attn_implementation != "eager" and not use_fp32_attention
@@ -166,10 +200,6 @@ class WanSPAttnProcessor(WanAttnProcessor):
             key = gather_seq_scatter_heads(key, seq_dim=1, head_dim=2, group=get_parallel_state().ulysses_group)
             value = gather_seq_scatter_heads(value, seq_dim=1, head_dim=2, group=get_parallel_state().ulysses_group)
 
-        flash_attention_mask = attention_mask
-        if flash_attention_mask is None and not is_cross_attention and use_flash_attention:
-            flash_attention_mask = torch.ones(query.shape[0], key.shape[1], device=query.device, dtype=torch.int32)
-
         # I2V: additional cross-attention over image tokens (no Ulysses SP needed).
         hidden_states_img = None
         if encoder_hidden_states_img is not None:
@@ -178,6 +208,9 @@ class WanSPAttnProcessor(WanAttnProcessor):
 
             key_img = key_img.unflatten(2, (attn.heads, -1))
             value_img = value_img.unflatten(2, (attn.heads, -1))
+            image_attention_kwargs = (
+                _get_wan_full_sequence_varlen_kwargs(query, key_img, value_img) if use_flash_attention else {}
+            )
             hidden_states_img = attention_interface(
                 kernel_module,
                 query.transpose(1, 2),
@@ -187,18 +220,21 @@ class WanSPAttnProcessor(WanAttnProcessor):
                 dropout=0.0,
                 is_causal=False,
                 skip_ulysses=True,
+                **image_attention_kwargs,
             )[0]
             hidden_states_img = hidden_states_img.flatten(2, 3).type_as(query)
 
+        attention_kwargs = _get_wan_full_sequence_varlen_kwargs(query, key, value) if use_flash_attention else {}
         hidden_states_out = attention_interface(
             kernel_module,
             query.transpose(1, 2),
             key.transpose(1, 2),
             value.transpose(1, 2),
-            attention_mask=flash_attention_mask,
+            attention_mask=attention_mask,
             dropout=0.0,
             is_causal=False,
             skip_ulysses=True,
+            **attention_kwargs,
         )[0]
         if use_sp:
             hidden_states_out = gather_heads_scatter_seq(
