@@ -141,25 +141,8 @@ class WanSPAttnProcessor(WanAttnProcessor):
         value = value.unflatten(2, (attn.heads, -1))
 
         use_sp = get_parallel_state().sp_enabled and not is_cross_attention
-        use_sp_before_rotary = use_sp and self.attn_implementation == "veomni_flash_attention_2_with_sp"
-        if use_sp_before_rotary:
-            ulysses_size = get_parallel_state().ulysses_size
-            if query.shape[2] % ulysses_size != 0:
-                raise ValueError(
-                    f"Wan attention heads ({query.shape[2]}) must be divisible by Ulysses size ({ulysses_size})."
-                )
-            query = gather_seq_scatter_heads(query, seq_dim=1, head_dim=2, group=get_parallel_state().ulysses_group)
-            key = gather_seq_scatter_heads(key, seq_dim=1, head_dim=2, group=get_parallel_state().ulysses_group)
-            value = gather_seq_scatter_heads(value, seq_dim=1, head_dim=2, group=get_parallel_state().ulysses_group)
-            if query.shape[1] != key.shape[1] or query.shape[1] != value.shape[1]:
-                raise ValueError("Wan Ulysses SP requires Q/K/V to share the same post-gather sequence length.")
 
         if rotary_emb is not None:
-            if use_sp_before_rotary and query.shape[1] != rotary_emb[0].shape[1]:
-                raise ValueError(
-                    f"Wan rotary sequence length ({rotary_emb[0].shape[1]}) must match "
-                    f"post-gather attention sequence length ({query.shape[1]})."
-                )
 
             def apply_rotary_emb(
                 hidden_states: torch.Tensor,
@@ -195,7 +178,7 @@ class WanSPAttnProcessor(WanAttnProcessor):
             kernel_config = SimpleNamespace(_attn_implementation="veomni_flash_attention_2_with_sp")
         kernel_module = WanAttentionKernelModule(kernel_config, attn)
 
-        if use_sp and not use_sp_before_rotary:
+        if use_sp:
             query = gather_seq_scatter_heads(query, seq_dim=1, head_dim=2, group=get_parallel_state().ulysses_group)
             key = gather_seq_scatter_heads(key, seq_dim=1, head_dim=2, group=get_parallel_state().ulysses_group)
             value = gather_seq_scatter_heads(value, seq_dim=1, head_dim=2, group=get_parallel_state().ulysses_group)
@@ -320,6 +303,10 @@ def WanTransformer3DModel_forward(
                 f"Wan rotary sequence length ({freqs_cos.shape[1]}) must be divisible by SP size ({sp_size})."
             )
         hidden_states = slice_input_tensor(hidden_states, dim=1, group=get_parallel_state().sp_group)
+        freqs_cos, freqs_sin = rotary_emb
+        freqs_cos = slice_input_tensor(freqs_cos, dim=1, group=get_parallel_state().sp_group)
+        freqs_sin = slice_input_tensor(freqs_sin, dim=1, group=get_parallel_state().sp_group)
+        rotary_emb = (freqs_cos, freqs_sin)
     # 4. Transformer blocks
     if torch.is_grad_enabled() and self.gradient_checkpointing:
         for block in self.blocks:
