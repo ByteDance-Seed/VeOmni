@@ -20,12 +20,16 @@ def compare_values(
 ) -> MetricResult:
     """Compare nested values and return the first mismatch."""
 
-    if _is_step_list(actual) and _is_step_list(expected) and compare_steps == "last":
+    if _is_step_list(actual) and _is_step_list(expected):
         if not actual or not expected:
             return MetricResult(False, path, message="empty per-step list")
-        return compare_values(
-            actual[-1], expected[-1], tolerance=tolerance, path=f"{path}[-1]", compare_steps=compare_steps
-        )
+        if compare_steps == "last":
+            return compare_values(
+                actual[-1], expected[-1], tolerance=tolerance, path=f"{path}[-1]", compare_steps=compare_steps
+            )
+        if compare_steps != "all":
+            return MetricResult(False, path, message=f"unsupported step policy: {compare_steps!r}")
+        # compare_steps == "all": fall through to per-element (per-step) comparison below.
 
     if isinstance(actual, torch.Tensor) and isinstance(expected, torch.Tensor):
         return compare_tensors(actual, expected, tolerance=tolerance, path=path)

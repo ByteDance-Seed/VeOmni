@@ -79,6 +79,7 @@ infer:
   model_path: /mnt/hdfs/shizhelun/veomni_omni/models/seed_omni/BAGEL-7B-MoT
   modules: configs/seed_omni/Bagel/bagel_7b_mot/modules_infer.yaml
   infer_graph:
+    infer_edit: configs/seed_omni/Bagel/bagel_7b_mot/graph_infer_edit.yaml
     infer_gen: configs/seed_omni/Bagel/bagel_7b_mot/graph_infer_gen.yaml
     infer_interleave: configs/seed_omni/Bagel/bagel_7b_mot/graph_infer_interleave.yaml
     infer_und: configs/seed_omni/Bagel/bagel_7b_mot/graph_infer_und.yaml

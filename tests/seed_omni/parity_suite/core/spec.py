@@ -96,7 +96,6 @@ class V2ModelSpec:
     model_root: Path | None
     config_dir: Path
     module_dirs: str = "auto"
-    dtype_overrides: dict[str, str] = field(default_factory=dict)
     extra: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
@@ -105,14 +104,10 @@ class V2ModelSpec:
         config_dir = _resolve_repo_path(values.pop("config_dir", None), repo_root=repo_root)
         if config_dir is None:
             raise ValueError("v2_model.config_dir is required.")
-        dtype_overrides = values.pop("dtype_overrides", {}) or {}
-        if not isinstance(dtype_overrides, dict):
-            raise TypeError("v2_model.dtype_overrides must be a mapping.")
         known = {
             "model_root": _resolve_repo_path(values.pop("model_root", None), repo_root=repo_root),
             "config_dir": config_dir,
             "module_dirs": str(values.pop("module_dirs", "auto")),
-            "dtype_overrides": {str(key): str(val) for key, val in dtype_overrides.items()},
         }
         return cls(**known, extra=values)
 

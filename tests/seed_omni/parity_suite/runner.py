@@ -63,6 +63,7 @@ def run_parity_case(case: ParityCase) -> ParityReport:
             expected,
             tolerance=tolerance_from_policy(mapping.tol, case.model.tolerance),
             path=mapping.probe,
+            compare_steps=mapping.step,
         )
         reports.append(ProbeReport(node=mapping.node, probe=mapping.probe, passed=metric.passed, metric=metric))
     return ParityReport(case_id=case.node_id, probes=tuple(reports))

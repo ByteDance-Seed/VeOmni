@@ -139,6 +139,7 @@ nodes:
       ref_tap:
         output: reference.velocity
       tol: velocity
+      step: all
     image.base_velocity:
       v2_field: bagel_last_base_velocity
       ref_tap:
@@ -169,3 +170,4 @@ nodes:
       ref_tap:
         output: reference.x_t
       tol: latent
+      step: all

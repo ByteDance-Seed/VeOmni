@@ -282,8 +282,8 @@ def _run_image_gen_reference(
             "cfg_img_velocity": None
             if flow_step["cfg_img_velocity"] is None
             else flow_step["cfg_img_velocity"].detach().cpu(),
-            "velocity": flow_step["velocity"].detach().cpu(),
-            "x_t": flow_step["x_t"].detach().cpu(),
+            "velocity": [tensor.detach().cpu() for tensor in flow_step["velocity_steps"]],
+            "x_t": [tensor.detach().cpu() for tensor in flow_step["x_t_steps"]],
             "latent_embeds_sample": flow_step["latent_embeds_sample"].detach().cpu(),
             "packed_sequence_sample": flow_step["packed_sequence_sample"].detach().cpu(),
             "image_hidden_state_sample": flow_step["hidden_state_sample"].detach().cpu(),
@@ -411,8 +411,8 @@ def _run_image_edit_reference(
             "cfg_img_velocity": None
             if flow_step["cfg_img_velocity"] is None
             else flow_step["cfg_img_velocity"].detach().cpu(),
-            "velocity": flow_step["velocity"].detach().cpu(),
-            "x_t": flow_step["x_t"].detach().cpu(),
+            "velocity": [tensor.detach().cpu() for tensor in flow_step["velocity_steps"]],
+            "x_t": [tensor.detach().cpu() for tensor in flow_step["x_t_steps"]],
             "image_embeds_sample": _sample_tensor(image_embeds).detach().cpu(),
             "vae_context_latents": vae_context["packed_latents"].detach().cpu(),
             "vae_context_latent_embeds_sample": vae_context["latent_embeds_sample"].detach().cpu(),
@@ -851,6 +851,13 @@ def _run_reference_image_flow_step(
         cfg_renorm_type=str(inputs.get("cfg_renorm_type", "global")),
     )
     x_t_final = x_t0 - velocity.to(x_t0.device) * timestep_fields["dt"][0]
+    # Accumulate per-step velocity / x_t so a multi-step trajectory can be compared
+    # step-by-step against the V2 observe sink (which records one record per FSM
+    # ``image_flow`` step). Each entry mirrors V2's ``bagel_last_velocity`` (the
+    # CFG-combined velocity used for the Euler step) and ``bagel_last_x_t`` (the
+    # latent after that Euler update), in the same order.
+    step_velocities = [velocity]
+    step_x_ts = [x_t_final]
     max_flow_steps = min(int(inputs.get("max_flow_steps", 1)), int(timestep_fields["dts"].numel()))
     for step_index in range(1, max_flow_steps):
         timestep = timestep_fields["timesteps"][step_index : step_index + 1]
@@ -913,6 +920,8 @@ def _run_reference_image_flow_step(
             cfg_renorm_type=str(inputs.get("cfg_renorm_type", "global")),
         )
         x_t_final = x_t_final - velocity.to(x_t_final.device) * timestep_fields["dts"][step_index]
+        step_velocities.append(velocity)
+        step_x_ts.append(x_t_final)
     return {
         "latent_input": latent_input,
         "timesteps": timestep_fields,
@@ -921,6 +930,8 @@ def _run_reference_image_flow_step(
         "cfg_img_velocity": cfg_img_velocity,
         "velocity": velocity,
         "x_t": x_t_final,
+        "velocity_steps": step_velocities,
+        "x_t_steps": step_x_ts,
         "latent_embeds_sample": _sample_tensor(flow_output["latent_embeds"]),
         "packed_sequence_sample": _sample_tensor(flow_output["packed_sequence"]),
         "hidden_state_sample": _sample_tensor(flow_output["hidden_state"]),

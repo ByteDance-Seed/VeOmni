@@ -9,8 +9,6 @@ v2_model:
   model_root: ${MODEL_HUB}/seed_omni/BAGEL-7B-MoT
   config_dir: configs/seed_omni/Bagel/bagel_7b_mot
   module_dirs: auto
-  dtype_overrides:
-    bagel_qwen2_mot: keep-rope-fp32
 
 graphs:
   include:

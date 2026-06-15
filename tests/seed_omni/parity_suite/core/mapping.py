@@ -59,6 +59,9 @@ class V2GradSpec:
         )
 
 
+_STEP_POLICIES = frozenset({"last", "all"})
+
+
 @dataclass(frozen=True)
 class ProbeMapping:
     node: str
@@ -68,6 +71,7 @@ class ProbeMapping:
     tol: str
     state: str | None = None
     v2_grad: V2GradSpec | None = None
+    step: str = "last"
 
     @classmethod
     def from_raw(cls, node: str, probe: str, raw: Mapping[str, Any]) -> ProbeMapping:
@@ -77,6 +81,11 @@ class ProbeMapping:
             raise ValueError(f"Mapping {node}.{probe} must declare ref_tap.")
         if "tol" not in raw:
             raise ValueError(f"Mapping {node}.{probe} must declare tol.")
+        step = str(raw.get("step", "last"))
+        if step not in _STEP_POLICIES:
+            raise ValueError(
+                f"Mapping {node}.{probe} has unsupported step policy {step!r}; expected one of {sorted(_STEP_POLICIES)}."
+            )
         return cls(
             node=node,
             probe=probe,
@@ -85,6 +94,7 @@ class ProbeMapping:
             tol=str(raw["tol"]),
             state=None if raw.get("state") is None else str(raw["state"]),
             v2_grad=V2GradSpec.from_raw(raw.get("v2_grad"), probe=f"{node}.{probe}"),
+            step=step,
         )
 
 
