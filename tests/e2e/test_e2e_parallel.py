@@ -429,18 +429,15 @@ def test_qwen3omni_parallel_align(
     )
 
 
-@pytest.mark.parametrize("model_name, config_path, is_moe, rtol, atol", wan_dit_test_cases)
-def test_wan_dit_uses_bfloat16_and_flash_attention(
-    model_name: str, config_path: str, is_moe: bool, rtol: float, atol: float
-):
+def test_wan_dit_uses_bfloat16_and_flash_attention():
     command_list = prepare_exec_cmd(
         ["train_dit_test"],
-        model_name,
-        config_path,
+        "wan_t2v",
+        "./tests/toy_config/wan_t2v_toy",
         model_path="./wan_t2v",
         train_path="./dummy_wan_t2v",
         output_dir="./wan_t2v",
-        is_moe=is_moe,
+        is_moe=False,
         max_sp_size=1,
     )
 

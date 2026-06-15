@@ -157,7 +157,7 @@ def prepare_exec_cmd(
                 model_name=model_name,
             )
             if model_name == "wan_t2v":
-                cmd_kwargs["extra_args"] = _WAN_BFLOAT16_TRAINING_ARGS
+                cmd_kwargs["extra_args"] = list(_WAN_BFLOAT16_TRAINING_ARGS)
             command_list.append((task_name, cmd_kwargs))
 
     return command_list
