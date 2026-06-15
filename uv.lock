@@ -42,7 +42,6 @@ overrides = [
     { name = "torchaudio", marker = "extra == 'npu-aarch64'", specifier = "==2.7.1", index = "https://download.pytorch.org/whl/" },
     { name = "torchcodec", marker = "extra == 'gpu'", specifier = "==0.12.0" },
     { name = "torchcodec", marker = "extra == 'npu'", specifier = ">=0.4.0,<0.6.0" },
-    { name = "torchcodec", marker = "extra == 'npu-aarch64'", specifier = ">=0.4.0,<0.6.0" },
     { name = "torchvision", marker = "extra == 'gpu'", specifier = "==0.26.0+cu130", index = "https://download.pytorch.org/whl/" },
     { name = "torchvision", marker = "extra == 'npu'", specifier = "==0.22.1+cpu", index = "https://download.pytorch.org/whl/" },
     { name = "torchvision", marker = "extra == 'npu-aarch64'", specifier = "==0.22.1", index = "https://download.pytorch.org/whl/" },
