@@ -31,7 +31,7 @@ class _TinyReference(nn.Module):
 
 
 class _TwoStepDriver:
-    def run_reference(
+    def run_reference_recipe(
         self,
         ref_model: nn.Module,
         inputs: Mapping[str, Any],
@@ -101,7 +101,7 @@ def test_reference_capture_releases_reference_and_checks_memory_drop() -> None:
 
 def test_reference_capture_rejects_large_hook_tap() -> None:
     class LargeDriver:
-        def run_reference(
+        def run_reference_recipe(
             self,
             ref_model: nn.Module,
             inputs: Mapping[str, Any],

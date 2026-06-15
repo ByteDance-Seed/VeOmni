@@ -1,0 +1,63 @@
+image_edit:
+  - stimulus:
+      prompt: "Turn the scene into a clean watercolor illustration."
+      input_width: 384
+      input_height: 256
+      max_new_tokens: 3
+      max_flow_steps: 1
+      num_timesteps: 50
+      timestep_shift: 3.0
+      enable_vae_context: true
+      enable_taylorseer: false
+    runs:
+      graph:
+        - id: one_step
+          probes:
+            - image.image_embeds_sample
+            - image.vae_context_latents
+            - image.vae_context_latent_embeds_sample
+            - image.vae_context_packed_sequence_sample
+            - image.latent_embeds_sample
+            - image.packed_sequence_sample
+            - image.hidden_sample
+            - image.velocity
+            - image.x_t
+      module:
+        - id: one_step
+          probes:
+            - image.image_embeds_sample
+            - image.vae_context_latents
+            - image.vae_context_latent_embeds_sample
+            - image.vae_context_packed_sequence_sample
+            - image.latent_embeds_sample
+            - image.packed_sequence_sample
+            - image.hidden_sample
+            - image.velocity
+            - image.x_t
+          options:
+            required_nodes:
+              - [image_flow, bagel_flow_connector.decode_velocity]
+
+image_edit_text_und:
+  - stimulus:
+      prompt: "Answer with one short sentence before any image edit starts."
+      infer_mode: und
+      max_new_tokens: 1
+      do_sample: false
+    runs:
+      graph:
+        - id: text_branch_one_step
+          probes:
+            - text.hidden
+            - text.logits
+            - text.greedy_token
+      module:
+        - id: text_branch_one_step
+          probes:
+            - text.hidden
+            - text.logits
+            - text.greedy_token
+          options:
+            required_nodes:
+              - [prompt_encode, bagel_qwen2_mot.generate]
+              - [prompt_encode, bagel_text_encoder.token_generate]

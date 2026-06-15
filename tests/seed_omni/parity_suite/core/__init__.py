@@ -2,6 +2,7 @@
 
 from .comparator import compare_values
 from .discovery import GraphSpec, NodeSpec, ParityCase, discover_cases, discover_graph_specs, discover_nodes
+from .gate import case_skip_reason
 from .mapping import (
     MappingSpec,
     ProbeMapping,
@@ -13,7 +14,16 @@ from .mapping import (
 )
 from .metrics import MetricResult, Tolerance, compare_tensors, tolerance_from_policy
 from .report import ParityReport, ProbeReport
-from .spec import PARITY_ENABLE_ENV, ModelSpec, ReferenceSpec, RunSpec, ScenarioSpec, load_model_spec
+from .spec import (
+    DEFAULT_GATE,
+    PARITY_ENABLE_ENV,
+    GateSpec,
+    ModelSpec,
+    RecipeSpec,
+    ReferenceSpec,
+    RunSpec,
+    load_model_spec,
+)
 from .utilities import (
     autocast_for_dtype,
     configure_torch_determinism,
@@ -28,6 +38,8 @@ from .utilities import (
 
 
 __all__ = [
+    "DEFAULT_GATE",
+    "GateSpec",
     "GraphSpec",
     "MappingSpec",
     "ModelSpec",
@@ -38,14 +50,15 @@ __all__ = [
     "MetricResult",
     "ProbeReport",
     "ProbeMapping",
+    "RecipeSpec",
     "ReferenceSpec",
     "RefTapSpec",
     "ResolvedMapping",
     "RunSpec",
-    "ScenarioSpec",
     "Tolerance",
     "V2GradSpec",
     "autocast_for_dtype",
+    "case_skip_reason",
     "configure_torch_determinism",
     "compare_tensors",
     "compare_values",

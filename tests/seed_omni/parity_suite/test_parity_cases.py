@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from .core import ParityCase, discover_cases
+from .core import ParityCase, case_skip_reason, discover_cases
 from .runner import run_parity_case
 
 
@@ -17,17 +17,9 @@ def _case_id(case: ParityCase) -> str:
 
 @pytest.mark.parametrize("case", CASES, ids=_case_id)
 def test_seed_omni_v2_parity_case(case: ParityCase) -> None:
-    reason = case.static_skip_reason()
+    reason = case_skip_reason(case)
     if reason:
         pytest.skip(reason)
-
-    if case.requires_cuda:
-        import torch
-
-        if not torch.cuda.is_available():
-            pytest.skip(f"{case.node_id} requires CUDA.")
-        if case.min_cuda_devices and torch.cuda.device_count() < case.min_cuda_devices:
-            pytest.skip(f"{case.node_id} requires {case.min_cuda_devices} CUDA devices.")
 
     report = run_parity_case(case)
     if not report.all_pass:

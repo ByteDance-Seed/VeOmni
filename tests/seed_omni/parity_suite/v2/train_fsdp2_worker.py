@@ -6,8 +6,10 @@ import json
 import math
 import os
 import sys
+from collections.abc import Mapping
 from contextlib import nullcontext
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import torch
@@ -19,11 +21,22 @@ sys.path.insert(0, str(_REPO_ROOT))
 
 from tests.seed_omni.parity_suite.core import configure_torch_determinism, to_device  # noqa: E402
 from veomni.arguments import OmniArguments, parse_omni_args  # noqa: E402
-from veomni.distributed.clip_grad_norm import veomni_clip_grad_norm  # noqa: E402
 from veomni.distributed.parallel_state import init_parallel_state  # noqa: E402
 from veomni.models.seed_omni.modeling_omni import OmniModel  # noqa: E402
-from veomni.trainer.omni_trainer import MultiLRScheduler, MultiOptimizer, OmniModuleTrainer  # noqa: E402
+from veomni.trainer.base import BaseTrainer  # noqa: E402
+from veomni.trainer.omni_trainer import (  # noqa: E402
+    MultiLRScheduler,
+    MultiOptimizer,
+    OmniModuleTrainer,
+    OmniTrainer,
+)
 from veomni.utils.device import get_device_type, get_dist_comm_backend, get_torch_device  # noqa: E402
+
+
+try:
+    from torch.distributed.tensor import DTensor
+except ImportError:  # pragma: no cover - older torch builds do not expose DTensor.
+    DTensor = None  # type: ignore[assignment]
 
 
 def _env_path(name: str) -> Path:
@@ -120,6 +133,95 @@ def _grad_stats(model: torch.nn.Module) -> dict[str, Any]:
     }
 
 
+def _all_grads_are_cleared(model: torch.nn.Module) -> bool:
+    return all(param.grad is None for param in model.parameters())
+
+
+def _build_minimal_trainer(
+    model: OmniModel,
+    optimizer: MultiOptimizer,
+    scheduler: MultiLRScheduler,
+    args: OmniArguments,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+    max_grad_norm: float,
+) -> OmniTrainer:
+    trainer = OmniTrainer.__new__(OmniTrainer)
+    base = BaseTrainer.__new__(BaseTrainer)
+    base.model = model
+    base.device = device
+    base.LOG_SAMPLE = False
+    base.args = args
+    base.args.train.optimizer.max_grad_norm = max_grad_norm
+    base.state = SimpleNamespace(global_step=0)
+    base.optimizer = optimizer
+    base.lr_scheduler = scheduler
+    base.preforward = BaseTrainer.preforward.__get__(base, BaseTrainer)
+    base.model_fwd_context = (
+        torch.amp.autocast("cuda", enabled=True, dtype=dtype)
+        if device.type == "cuda" and dtype != torch.float32
+        else nullcontext()
+    )
+    base.model_bwd_context = nullcontext()
+    trainer.base = base
+    return trainer
+
+
+def _tensor_to_full_cpu(value: torch.Tensor) -> torch.Tensor:
+    if DTensor is not None and isinstance(value, DTensor):
+        value = value.full_tensor()
+    elif hasattr(value, "full_tensor"):
+        value = value.full_tensor()
+    return value.detach().cpu()
+
+
+def _sample_param(module: torch.nn.Module, name: str, rows: torch.Tensor | None = None) -> torch.Tensor:
+    value = _tensor_to_full_cpu(dict(module.named_parameters())[name])
+    if rows is not None:
+        return value[rows.to(device=value.device)]
+    if value.dim() >= 2:
+        return value[:4, :4]
+    return value[:16]
+
+
+def _packed_batch(batch: Mapping[str, Any]) -> Mapping[str, Any]:
+    packed = batch.get("bagel_packed_batch")
+    if isinstance(packed, Mapping):
+        return packed
+    return batch
+
+
+def _sample_bagel_parameters(model: OmniModel, batch: Mapping[str, Any]) -> dict[str, torch.Tensor]:
+    packed_batch = _packed_batch(batch)
+    label_rows = torch.unique(packed_batch["packed_label_ids"].detach().cpu()).to(dtype=torch.long)
+    return {
+        "qwen_early_q_proj": _sample_param(
+            model.get_module("bagel_qwen2_mot"),
+            "model.layers.0.self_attn.q_proj.weight",
+        ),
+        "lm_head_rows": _sample_param(
+            model.get_module("bagel_text_encoder"),
+            "lm_head.weight",
+            rows=label_rows,
+        ),
+        "flow_llm2vae": _sample_param(
+            model.get_module("bagel_flow_connector"),
+            "llm2vae.weight",
+        ),
+    }
+
+
+def _jsonable(value: Any) -> Any:
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu().tolist()
+    if isinstance(value, Mapping):
+        return {str(key): _jsonable(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_jsonable(item) for item in value]
+    return value
+
+
 def main() -> None:
     os.environ.setdefault("NCCL_DEBUG", "WARN")
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
@@ -131,42 +233,53 @@ def main() -> None:
     payload = torch.load(_env_path("VEOMNI_PARITY_FSDP2_PAYLOAD"), map_location="cpu", weights_only=False)
     output_dir = _env_path("VEOMNI_PARITY_FSDP2_OUTPUT_DIR")
     dtype = torch.bfloat16 if str(payload.get("dtype", "bf16")) == "bf16" else torch.float32
+    num_micro_steps = int(payload.get("num_micro_steps", 1))
 
     configure_torch_determinism(int(payload.get("seed", 1234)))
-    batch_kwargs = to_device(payload["batch_kwargs"], device)
+    micro_batches = [to_device(payload["batch_kwargs"], device) for _ in range(num_micro_steps)]
     model = _build_fsdp_omni_model(args)
     optimizer = _build_sgd_optimizer(model, lr=float(payload.get("lr", 1.0e-4)))
     scheduler = _build_scheduler(optimizer)
-
-    optimizer.zero_grad(set_to_none=True)
-    autocast_context = (
-        torch.amp.autocast("cuda", enabled=True, dtype=dtype)
-        if device.type == "cuda" and dtype != torch.float32
-        else nullcontext()
+    trainer = _build_minimal_trainer(
+        model,
+        optimizer,
+        scheduler,
+        args,
+        device=device,
+        dtype=dtype,
+        max_grad_norm=float(payload.get("max_grad_norm", 1.0)),
     )
-    with autocast_context:
-        outputs = model(**batch_kwargs)
-        loss = outputs["loss"]
-    if loss is None:
-        raise RuntimeError("SeedOmni V2 FSDP2 smoke produced no loss.")
-    loss.backward()
 
-    grad_norm = veomni_clip_grad_norm(model, max_norm=float(payload.get("max_grad_norm", 1.0)))
-    grad_stats = _grad_stats(model)
-    optimizer.step()
-    scheduler.step()
     optimizer.zero_grad(set_to_none=True)
+    events: dict[str, Any] = {}
+    trainer.on_step_begin = lambda micro_batches=None: events.setdefault("micro_batches", micro_batches)
+    trainer.on_step_end = lambda loss=None, loss_dict=None, grad_norm=None: events.update(
+        {"loss": loss, "loss_dict": loss_dict, "grad_norm": grad_norm}
+    )
+
+    trainer.train_step(iter([micro_batches]))
+    grad_stats = _grad_stats(model)
+    zero_grad_passes = _all_grads_are_cleared(model)
+    parameters_after_step = (
+        _sample_bagel_parameters(model, micro_batches[0])
+        if bool(payload.get("collect_parameter_samples", False))
+        else {}
+    )
 
     rank_metrics = {
         "rank": rank,
         "world_size": world_size,
-        "loss": float(loss.detach().float().item()),
-        "grad_norm": float(grad_norm),
+        "loss": float(events["loss"]),
+        "grad_norm": float(events["grad_norm"]),
         "local_grad_norm": grad_stats["local_grad_norm"],
         "tensors_with_grad": grad_stats["tensors_with_grad"],
         "fsdp_module_count": _count_fsdp_modules(model),
         "optimizer_count": len(optimizer.optimizers),
         "scheduler_lrs": scheduler.get_last_lr(),
+        "scheduler_epochs": {
+            name: int(module_scheduler.last_epoch) for name, module_scheduler in scheduler.schedulers.items()
+        },
+        "zero_grad_passes": zero_grad_passes,
     }
     gathered: list[dict[str, Any] | None] = [None for _ in range(world_size)]
     dist.all_gather_object(gathered, rank_metrics)
@@ -178,16 +291,26 @@ def main() -> None:
             and math.isfinite(item["loss"])
             and math.isfinite(item["grad_norm"])
             and item["grad_norm"] > 0
-            and item["tensors_with_grad"] > 0
             and item["fsdp_module_count"] > 0
             and item["optimizer_count"] > 0
+            and item["zero_grad_passes"]
             for item in gathered
         )
         report = {
             "all_pass": all_pass,
             "dp_mode": args.train.accelerator.fsdp_config.fsdp_mode,
+            "dp_size": args.train.accelerator.dp_size,
+            "dp_replicate_size": args.train.accelerator.dp_replicate_size,
+            "dp_shard_size": args.train.accelerator.dp_shard_size,
             "global_batch_size": args.train.global_batch_size,
             "micro_batch_size": args.train.micro_batch_size,
+            "num_micro_steps": num_micro_steps,
+            "loss": rank_metrics["loss"],
+            "grad_norm": rank_metrics["grad_norm"],
+            "scheduler_lrs": rank_metrics["scheduler_lrs"],
+            "scheduler_epochs": rank_metrics["scheduler_epochs"],
+            "zero_grad_passes": rank_metrics["zero_grad_passes"],
+            "parameters_after_step": _jsonable(parameters_after_step),
             "ranks": gathered,
         }
         with (output_dir / "results.json").open("w", encoding="utf-8") as f:

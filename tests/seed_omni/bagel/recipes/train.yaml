@@ -1,0 +1,232 @@
+train_ce_mse:
+  - stimulus:
+      prompt: "Describe BAGEL in one short sentence."
+      timestep_shift: 3.0
+    runs:
+      graph:
+        - id: one_step
+          probes:
+            - train.ce_loss
+            - train.mse_loss
+            - train.grad_early_q_proj
+            - train.grad_gen_q_proj
+            - train.grad_lm_head_rows
+            - train.grad_llm2vae
+      module:
+        - id: one_step
+          probes:
+            - train.ce_loss
+            - train.mse_loss
+            - train.grad_early_q_proj
+            - train.grad_gen_q_proj
+            - train.grad_lm_head_rows
+            - train.grad_llm2vae
+      framework:
+        - id: forward_backward
+          kind: forward_backward
+          probes:
+            - train.ce_loss
+            - train.mse_loss
+            - train.grad_early_q_proj
+            - train.grad_gen_q_proj
+            - train.grad_lm_head_rows
+            - train.grad_llm2vae
+        - id: train_step_optimizer_scheduler
+          kind: train_step
+          options:
+            lr: 1.0e-4
+            max_grad_norm: 1.0e9
+            checks:
+              - optimizer_scheduler
+        - id: train_step_active_clipping
+          kind: train_step
+          options:
+            lr: 1.0e-4
+            max_grad_norm: 1.0
+            checks:
+              - active_clipping
+        - id: checkpoint_resume
+          kind: checkpoint_resume
+          options:
+            lr: 1.0e-4
+            max_grad_norm: 1.0e9
+        - id: launcher
+          kind: launcher
+          options:
+            launcher_path: tasks/omni/train_omni.py
+        - id: optimizer_trajectory
+          kind: optimizer_trajectory
+          options:
+            lr: 1.0e-4
+            steps: 2
+        - id: fsdp2
+          kind: distributed_train
+          gate:
+            min_cuda_devices: 2
+          options:
+            strategy: fsdp2
+            nproc_per_node: 2
+            timeout: 900
+        - id: fsdp2_numeric
+          kind: distributed_train
+          gate:
+            min_cuda_devices: 2
+          options:
+            strategy: fsdp2
+            compare_direct: true
+            nproc_per_node: 2
+            lr: 1.0e-4
+            max_grad_norm: 1.0e9
+            timeout: 900
+        - id: fsdp2_accum_numeric
+          kind: distributed_train
+          gate:
+            min_cuda_devices: 2
+          options:
+            strategy: fsdp2
+            compare_direct: true
+            num_micro_steps: 2
+            nproc_per_node: 2
+            lr: 1.0e-4
+            max_grad_norm: 1.0e9
+            timeout: 900
+        - id: fsdp2_8rank_smoke
+          kind: distributed_train
+          gate:
+            min_cuda_devices: 8
+          options:
+            strategy: fsdp2
+            nproc_per_node: 8
+            timeout: 900
+        - id: fsdp2_8rank_numeric
+          kind: distributed_train
+          gate:
+            min_cuda_devices: 8
+          options:
+            strategy: fsdp2
+            compare_direct: true
+            nproc_per_node: 8
+            lr: 1.0e-4
+            max_grad_norm: 1.0e9
+            timeout: 900
+        - id: hsdp_4x2_smoke
+          kind: distributed_train
+          gate:
+            min_cuda_devices: 8
+          options:
+            strategy: fsdp2
+            nproc_per_node: 8
+            dp_shard_size: 4
+            dp_replicate_size: 2
+            timeout: 900
+        - id: hsdp_4x2_numeric
+          kind: distributed_train
+          gate:
+            min_cuda_devices: 8
+          options:
+            strategy: fsdp2
+            compare_direct: true
+            nproc_per_node: 8
+            dp_shard_size: 4
+            dp_replicate_size: 2
+            lr: 1.0e-4
+            max_grad_norm: 1.0e9
+            timeout: 900
+
+train_ce:
+  - stimulus:
+      prompt: "Describe BAGEL in one short sentence."
+      timestep_shift: 3.0
+    runs:
+      graph:
+        - id: one_step
+          probes:
+            - train.ce_loss
+            - train.grad_early_q_proj
+            - train.grad_lm_head_rows
+      module:
+        - id: one_step
+          probes:
+            - train.ce_loss
+            - train.grad_early_q_proj
+            - train.grad_lm_head_rows
+      framework:
+        - id: forward_backward
+          kind: forward_backward
+          probes:
+            - train.ce_loss
+            - train.grad_early_q_proj
+            - train.grad_lm_head_rows
+        - id: fsdp2_ce_only_dummy_safety
+          kind: distributed_train
+          gate:
+            min_cuda_devices: 2
+          options:
+            strategy: fsdp2
+            nproc_per_node: 2
+            lr: 1.0e-4
+            max_grad_norm: 1.0e9
+            timeout: 900
+
+train_text_image_ce:
+  - stimulus:
+      prompt: "Describe BAGEL in one short sentence."
+      timestep_shift: 3.0
+    runs:
+      graph:
+        - id: one_step
+          probes:
+            - train.ce_loss
+            - train.grad_early_q_proj
+            - train.grad_lm_head_rows
+            - train.grad_siglip_q_proj
+      module:
+        - id: one_step
+          probes:
+            - train.ce_loss
+            - train.grad_early_q_proj
+            - train.grad_lm_head_rows
+            - train.grad_siglip_q_proj
+      framework:
+        - id: forward_backward
+          kind: forward_backward
+          probes:
+            - train.ce_loss
+            - train.grad_early_q_proj
+            - train.grad_lm_head_rows
+            - train.grad_siglip_q_proj
+
+train_mse:
+  - stimulus:
+      prompt: "Describe BAGEL in one short sentence."
+      timestep_shift: 3.0
+    runs:
+      graph:
+        - id: one_step
+          probes:
+            - train.mse_loss
+            - train.grad_gen_q_proj
+            - train.grad_llm2vae
+      module:
+        - id: one_step
+          probes:
+            - train.mse_loss
+            - train.grad_gen_q_proj
+            - train.grad_llm2vae
+      framework:
+        - id: forward_backward
+          kind: forward_backward
+          probes:
+            - train.mse_loss
+            - train.grad_gen_q_proj
+            - train.grad_llm2vae
+        - id: fsdp2_mse_only_dummy_safety
+          kind: distributed_train
+          gate:
+            min_cuda_devices: 2
+          options:
+            strategy: fsdp2
+            nproc_per_node: 2
+            lr: 1.0e-4
+            max_grad_norm: 1.0e9
+            timeout: 900

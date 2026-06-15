@@ -362,10 +362,36 @@ def _run_distributed_train_policy(
         raise NotImplementedError(f"Unsupported distributed_train strategy {strategy!r}.")
 
     nproc = int(options.get("nproc_per_node", 2))
+    lr = float(options.get("lr", 1.0e-4))
+    max_grad_norm = float(options.get("max_grad_norm", 1.0))
+    num_micro_steps = int(options.get("num_micro_steps", 1))
+    compare_direct = bool(options.get("compare_direct", False))
+    dp_replicate_size = _optional_int(options.get("dp_replicate_size"))
+    dp_shard_size = _optional_int(options.get("dp_shard_size"))
     output_dir = _policy_output_dir(driver, "distributed_train_fsdp2")
     if output_dir.exists():
         shutil.rmtree(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    direct_result: Mapping[str, Any] | None = None
+    direct_parameters: Mapping[str, torch.Tensor] | None = None
+    if compare_direct:
+        direct_batch = driver.v2_train_batch_kwargs(reference_output, device=device)
+        driver.configure_determinism(driver.case.model.seed)
+        direct_model = driver.load_v2_model(device=device, dtype=dtype).train()
+        direct_result = _run_direct_train_step(
+            direct_model,
+            direct_batch,
+            seed=driver.case.model.seed,
+            dtype=dtype,
+            lr=lr,
+            max_grad_norm=max_grad_norm,
+            num_micro_steps=num_micro_steps,
+        )
+        direct_parameters = driver.sample_v2_framework_parameters(direct_model, direct_batch)
+        del direct_model, direct_batch
+        _release_cuda_memory()
+
     batch_kwargs = driver.v2_train_batch_kwargs(reference_output, device=torch.device("cpu"))
     report = _run_v2_train_fsdp2(
         driver,
@@ -375,16 +401,64 @@ def _run_distributed_train_policy(
         dtype=dtype,
         nproc_per_node=nproc,
         timeout=int(options.get("timeout", 900)),
-        lr=float(options.get("lr", 1.0e-4)),
-        max_grad_norm=float(options.get("max_grad_norm", 1.0)),
+        lr=lr,
+        max_grad_norm=max_grad_norm,
+        num_micro_steps=num_micro_steps,
+        collect_parameter_samples=compare_direct,
+        dp_replicate_size=dp_replicate_size,
+        dp_shard_size=dp_shard_size,
     )
     reports = [
         _framework_report(driver, "framework.fsdp2_exit_code", report["exit_code"], 0, "exact"),
         _framework_report(driver, "framework.fsdp2_all_pass", bool(report.get("all_pass", False)), True, "exact"),
         _framework_report(driver, "framework.fsdp2_dp_mode", report.get("dp_mode"), "fsdp2", "exact"),
         _framework_report(driver, "framework.fsdp2_rank_count", len(report.get("ranks", [])), nproc, "exact"),
+        _framework_report(
+            driver,
+            "framework.fsdp2_num_micro_steps",
+            int(report.get("num_micro_steps", 0)),
+            num_micro_steps,
+            "exact",
+        ),
     ]
+    if dp_replicate_size is not None:
+        reports.append(
+            _framework_report(
+                driver,
+                "framework.fsdp2_dp_replicate_size",
+                int(report.get("dp_replicate_size", 0)),
+                dp_replicate_size,
+                "exact",
+            )
+        )
+    if dp_shard_size is not None:
+        reports.append(
+            _framework_report(
+                driver,
+                "framework.fsdp2_dp_shard_size",
+                int(report.get("dp_shard_size", 0)),
+                dp_shard_size,
+                "exact",
+            )
+        )
+    if compare_direct:
+        if direct_result is None or direct_parameters is None:
+            raise RuntimeError("FSDP2 numeric policy did not build a direct reference.")
+        reports.extend(
+            _fsdp2_numeric_reports(
+                driver,
+                report=report,
+                direct_result=direct_result,
+                direct_parameters=direct_parameters,
+            )
+        )
     return ParityReport(case_id=driver.case.node_id, probes=tuple(reports))
+
+
+def _optional_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    return int(value)
 
 
 def _run_direct_train_step(
@@ -395,25 +469,31 @@ def _run_direct_train_step(
     dtype: torch.dtype,
     lr: float,
     max_grad_norm: float,
+    num_micro_steps: int = 1,
 ) -> dict[str, Any]:
     zero_module_grads(model.modules_dict.values())
     optimizer = _build_multi_optimizer(model, lr=lr)
     scheduler = _build_multi_scheduler(optimizer)
     torch.manual_seed(seed)
-    device = next(model.parameters()).device
-    with torch.enable_grad(), autocast_for_dtype(device, dtype):
-        outputs = model(**dict(batch))
-        loss = outputs["loss"]
-    if loss is None:
-        raise RuntimeError("Direct framework policy produced no loss.")
-    loss.backward()
+    total_loss = 0.0
+    pristine_batch = _clone_batch(batch)
+    for _micro_step in range(num_micro_steps):
+        micro_batch = _clone_batch(pristine_batch)
+        device = next(model.parameters()).device
+        with torch.enable_grad(), autocast_for_dtype(device, dtype):
+            outputs = model(**micro_batch)
+            loss = outputs["loss"]
+        if loss is None:
+            raise RuntimeError("Direct framework policy produced no loss.")
+        loss.backward()
+        total_loss += float(loss.detach().cpu().item()) / num_micro_steps
     with _single_rank_ddp_clip_state():
         grad_norm = veomni_clip_grad_norm(model, max_grad_norm)
     optimizer.step()
     scheduler.step()
     optimizer.zero_grad()
     return {
-        "loss": loss.detach().cpu(),
+        "loss": torch.tensor(total_loss),
         "grad_norm": grad_norm,
         "scheduler_lrs": scheduler.get_last_lr(),
         "scheduler_epochs": {name: int(scheduler.last_epoch) for name, scheduler in scheduler.schedulers.items()},
@@ -512,6 +592,81 @@ def _trainer_step_reports(
             )
         )
     return reports
+
+
+def _fsdp2_numeric_reports(
+    driver: Any,
+    *,
+    report: Mapping[str, Any],
+    direct_result: Mapping[str, Any],
+    direct_parameters: Mapping[str, torch.Tensor],
+) -> list[ProbeReport]:
+    reports = [
+        _framework_report(
+            driver,
+            "framework.fsdp2_loss",
+            torch.tensor([float(report.get("loss", float("nan")))]),
+            direct_result["loss"].reshape(1),
+            "distributed_loss",
+        ),
+        _framework_report(
+            driver,
+            "framework.fsdp2_grad_norm",
+            torch.tensor([float(report.get("grad_norm", float("nan")))]),
+            torch.tensor([float(direct_result["grad_norm"])]),
+            "gradient",
+        ),
+        _framework_report(
+            driver,
+            "framework.fsdp2_scheduler_lrs",
+            torch.tensor(report.get("scheduler_lrs", [])),
+            torch.tensor(direct_result["scheduler_lrs"]),
+            "exact",
+        ),
+        _framework_report(
+            driver,
+            "framework.fsdp2_scheduler_epochs",
+            report.get("scheduler_epochs", {}),
+            direct_result["scheduler_epochs"],
+            "exact",
+        ),
+        _framework_report(
+            driver, "framework.fsdp2_zero_grad", bool(report.get("zero_grad_passes", False)), True, "exact"
+        ),
+    ]
+    if direct_parameters:
+        reports.append(
+            _framework_report(
+                driver,
+                "framework.fsdp2_parameters_after_step",
+                report.get("parameters_after_step", {}),
+                _floating_tensors_to_float32(direct_parameters),
+                "gradient",
+            )
+        )
+    return reports
+
+
+def _floating_tensors_to_float32(value: Any) -> Any:
+    if isinstance(value, torch.Tensor):
+        return value.float() if torch.is_floating_point(value) else value
+    if isinstance(value, Mapping):
+        return {key: _floating_tensors_to_float32(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return type(value)(_floating_tensors_to_float32(item) for item in value)
+    return value
+
+
+def _clone_batch(value: Any) -> Any:
+    if torch.is_tensor(value):
+        return value.clone()
+    if isinstance(value, Mapping):
+        return {key: _clone_batch(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_clone_batch(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_clone_batch(item) for item in value)
+    return value
 
 
 def _build_multi_optimizer(model: OmniModel, *, lr: float) -> MultiOptimizer:
@@ -737,7 +892,7 @@ def _run_launcher_smoke(
 
     report: dict[str, Any] = {"train_called": False}
 
-    class ScenarioBackedLauncherTrainer:
+    class RecipeBackedLauncherTrainer:
         def __init__(self, args: Any) -> None:
             self.args = args
             model = driver.load_v2_model(device=device, dtype=dtype).train()
@@ -812,7 +967,7 @@ def _run_launcher_smoke(
         "--data.dataloader.drop_last",
         "false",
     ]
-    omni_trainer_module.OmniTrainer = ScenarioBackedLauncherTrainer
+    omni_trainer_module.OmniTrainer = RecipeBackedLauncherTrainer
     try:
         runpy.run_path(str(launcher_path), run_name="__main__")
     finally:
@@ -832,6 +987,10 @@ def _run_v2_train_fsdp2(
     timeout: int,
     lr: float,
     max_grad_norm: float,
+    num_micro_steps: int,
+    collect_parameter_samples: bool,
+    dp_replicate_size: int | None,
+    dp_shard_size: int | None,
 ) -> Mapping[str, Any]:
     payload_path = output_dir / "fsdp2_payload.pt"
     torch.save(
@@ -841,6 +1000,8 @@ def _run_v2_train_fsdp2(
             "dtype": "bf16" if dtype == torch.bfloat16 else "fp32",
             "lr": lr,
             "max_grad_norm": max_grad_norm,
+            "num_micro_steps": num_micro_steps,
+            "collect_parameter_samples": collect_parameter_samples,
         },
         payload_path,
     )
@@ -882,6 +1043,10 @@ def _run_v2_train_fsdp2(
         "--data.dataloader.drop_last",
         "false",
     ]
+    if dp_replicate_size is not None:
+        cmd.extend(["--accelerator.dp_replicate_size", str(dp_replicate_size)])
+    if dp_shard_size is not None:
+        cmd.extend(["--accelerator.dp_shard_size", str(dp_shard_size)])
     env = {
         **os.environ,
         "VEOMNI_PARITY_FSDP2_PAYLOAD": str(payload_path),

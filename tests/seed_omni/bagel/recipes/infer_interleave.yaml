@@ -1,0 +1,85 @@
+interleave_text_und:
+  - stimulus:
+      prompt: "Write one concise sentence about a mountain path after rain."
+      max_new_tokens: 1
+      do_sample: false
+    runs:
+      graph:
+        - id: one_step
+          probes:
+            - text.hidden
+            - text.logits
+            - text.greedy_token
+      module:
+        - id: one_step
+          probes:
+            - text.hidden
+            - text.logits
+            - text.greedy_token
+          options:
+            required_nodes:
+              - [prompt_encode, bagel_qwen2_mot.generate]
+              - [prompt_encode, bagel_text_encoder.token_generate]
+
+interleave_text_image_und:
+  - stimulus:
+      prompt: "Describe this synthetic image as part of an interleaved response."
+      image_width: 448
+      image_height: 336
+      max_new_tokens: 1
+      do_sample: false
+    runs:
+      graph:
+        - id: one_step
+          probes:
+            - text.hidden
+            - text.logits
+            - text.greedy_token
+      module:
+        - id: one_step
+          probes:
+            - text.hidden
+            - text.logits
+            - text.greedy_token
+          options:
+            required_nodes:
+              - [prompt_encode, bagel_qwen2_mot.generate]
+              - [prompt_encode, bagel_text_encoder.token_generate]
+
+interleave_image_gen:
+  - stimulus:
+      prompt: "A glass greenhouse filled with tiny orange trees."
+      infer_mode: gen
+      max_new_tokens: 2
+      max_flow_steps: 1
+      image_height: 1024
+      image_width: 1024
+      latent_downsample: 16
+      num_timesteps: 50
+      timestep_shift: 3.0
+      cfg_text_scale: 1.0
+      cfg_img_scale: 1.0
+      cfg_interval: [0.0, 1.0]
+      cfg_renorm_min: 0.0
+      cfg_renorm_type: global
+      enable_taylorseer: false
+    runs:
+      graph:
+        - id: image_span_one_step
+          probes:
+            - image.latent_embeds_sample
+            - image.packed_sequence_sample
+            - image.hidden_sample
+            - image.velocity
+            - image.x_t
+      module:
+        - id: image_span_one_step
+          probes:
+            - image.latent_embeds_sample
+            - image.packed_sequence_sample
+            - image.hidden_sample
+            - image.velocity
+            - image.x_t
+          options:
+            required_nodes:
+              - [image_flow, bagel_flow_connector.decode_velocity]

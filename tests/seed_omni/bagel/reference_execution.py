@@ -11,26 +11,92 @@ from torch import nn
 
 from tests.seed_omni.bagel.transformers.bagel import ReferenceImageTransform, make_reference_image
 from tests.seed_omni.bagel.transformers.vendor.modeling.bagel.qwen2_navit import NaiveCache
-from tests.seed_omni.parity_suite.core import to_cpu, to_device
+from tests.seed_omni.parity_suite.core import ParityReport, to_cpu, to_device
 from tests.seed_omni.parity_suite.core.utilities import autocast_for_dtype, patched_randn_like, sample_named_grad
 from tests.seed_omni.parity_suite.reference.capture import ReferenceCaptureContext
 
 
-def run_reference(
-    driver_case: str,
+def run_reference_recipe(
+    reference_case: str,
     ref_model: nn.Module,
     inputs: Mapping[str, Any],
     context: ReferenceCaptureContext,
 ) -> dict[str, Any]:
-    if driver_case == "train_ce_mse":
+    if reference_case == "train_ce_mse":
         return _run_train_reference(ref_model, inputs, context)
-    if driver_case == "text_image_und":
+    if reference_case == "text_image_und":
         return _run_text_image_reference(ref_model, inputs, context)
-    if driver_case == "image_edit":
+    if reference_case == "image_edit":
         return _run_image_edit_reference(ref_model, inputs, context)
-    if driver_case == "image_gen":
+    if reference_case == "image_gen":
         return _run_image_gen_reference(ref_model, inputs, context)
     return _run_text_reference(ref_model, inputs, context)
+
+
+def run_reference_only_recipe(*, recipe_id: str, run_kind: str, case_id: str) -> ParityReport:
+    if run_kind != "reference_smoke":
+        raise NotImplementedError(f"Unsupported BAGEL reference run kind: {run_kind!r}")
+    if recipe_id != "transformers_reference_smoke":
+        raise NotImplementedError(f"Unsupported BAGEL reference recipe: {recipe_id!r}")
+    _run_transformers_reference_smoke()
+    return ParityReport(case_id=case_id, probes=())
+
+
+def _run_transformers_reference_smoke() -> None:
+    from tests.seed_omni.bagel.transformers import (
+        AutoEncoderParams,
+        Bagel,
+        BagelConfig,
+        BagelOfficialReference,
+        Qwen2Config,
+        Qwen2ForCausalLM,
+        Qwen2Model,
+        SiglipVisionConfig,
+        SiglipVisionModel,
+        load_vendored_model,
+    )
+
+    if Bagel.config_class is not BagelConfig:
+        raise AssertionError("BAGEL official reference did not expose BagelConfig.")
+    if not issubclass(Qwen2Config, Qwen2Model.config_class):
+        raise AssertionError("BAGEL Qwen2Config is not compatible with Qwen2Model.")
+    if not issubclass(Qwen2Config, Qwen2ForCausalLM.config_class):
+        raise AssertionError("BAGEL Qwen2Config is not compatible with Qwen2ForCausalLM.")
+    if SiglipVisionModel.config_class is not SiglipVisionConfig:
+        raise AssertionError("BAGEL SigLIP reference did not expose SiglipVisionConfig.")
+    if AutoEncoderParams.__name__ != "AutoEncoderParams":
+        raise AssertionError("BAGEL autoencoder parameters are not exposed.")
+    if not callable(load_vendored_model):
+        raise AssertionError("BAGEL vendored reference loader is not callable.")
+
+    llm_config = Qwen2Config(
+        vocab_size=32,
+        hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        layer_module="Qwen2MoTDecoderLayer",
+        qk_norm=True,
+        tie_word_embeddings=False,
+        bos_token_id=1,
+        eos_token_id=2,
+        pad_token_id=0,
+    )
+    reference = BagelOfficialReference.from_configs(
+        llm_config=llm_config,
+        visual_gen=False,
+        visual_und=False,
+        init_on_meta=True,
+    )
+    if not isinstance(reference.model, Bagel):
+        raise AssertionError("BAGEL official reference did not assemble a Bagel model.")
+    if reference.config.llm_config is not llm_config:
+        raise AssertionError("BAGEL official reference did not preserve the provided LLM config.")
+    if reference.config.visual_gen:
+        raise AssertionError("BAGEL text-only reference unexpectedly enabled visual generation.")
+    if reference.config.visual_und:
+        raise AssertionError("BAGEL text-only reference unexpectedly enabled visual understanding.")
 
 
 def _run_text_reference(
@@ -1094,5 +1160,6 @@ def _sample_tensor(value: torch.Tensor) -> torch.Tensor:
 
 
 __all__ = [
-    "run_reference",
+    "run_reference_only_recipe",
+    "run_reference_recipe",
 ]

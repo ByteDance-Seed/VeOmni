@@ -22,7 +22,12 @@ EmptyCacheFn = Callable[[], None]
 class ReferenceDriver(Protocol):
     """Protocol implemented by per-case reference drivers."""
 
-    def run_reference(self, ref_model: nn.Module, inputs: Mapping[str, Any], context: ReferenceCaptureContext) -> Any:
+    def run_reference_recipe(
+        self,
+        ref_model: nn.Module,
+        inputs: Mapping[str, Any],
+        context: ReferenceCaptureContext,
+    ) -> Any:
         """Run the official reference recipe and return its result."""
 
 
@@ -83,7 +88,7 @@ def capture_reference_taps(
     try:
         context = ReferenceCaptureContext(ref_model=ref_model, inputs=inputs, hook_taps=taps)
         with capture_hook_taps(ref_model, plan.hook_taps, sink=taps, max_tensor_numel=max_tensor_numel):
-            run_output = driver.run_reference(ref_model, inputs, context)
+            run_output = driver.run_reference_recipe(ref_model, inputs, context)
             context.output = run_output
         _capture_extractors(context, plan.extractor_taps, taps=taps, max_tensor_numel=max_tensor_numel)
         memory_before_release = _memory_allocated(memory_probe)

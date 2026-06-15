@@ -43,6 +43,9 @@ tolerance:
   loss:
     rtol: 1.0e-4
     atol: 1.0e-4
+  distributed_loss:
+    rtol: 2.0e-4
+    atol: 2.0e-3
   gradient:
     rtol: 1.0e-2
     atol: 1.0e-2

@@ -9,11 +9,9 @@ from typing import Any
 import torch
 from torch import nn
 
-from tests.seed_omni.bagel.reference_execution import (
-    run_reference as run_reference_execution,
-)
+from tests.seed_omni.bagel import reference_execution
 from tests.seed_omni.bagel.v2_execution import build_conversation_from_canonical
-from tests.seed_omni.parity_suite.core import ParityCase, to_device
+from tests.seed_omni.parity_suite.core import ParityCase, ParityReport, to_device
 from tests.seed_omni.parity_suite.driver import ParityDriver
 from tests.seed_omni.parity_suite.reference.capture import ReferenceCaptureContext
 from tests.seed_omni.parity_suite.reference.loader import load_reference_model
@@ -22,18 +20,41 @@ from tests.seed_omni.parity_suite.v2.module import InferModulePolicy
 from veomni.models.seed_omni.modeling_omni import OmniModel
 
 
-SUPPORTED_DRIVER_CASES = frozenset({"text_und", "text_image_und", "image_gen", "image_edit", "train_ce_mse"})
-_TRAIN_CASE = "train_ce_mse"
-_IMAGE_GENERATION_CASES = frozenset({"image_gen", "image_edit"})
-_IMAGE_UNDERSTANDING_CASES = frozenset({"text_image_und", "image_edit"})
-_FLOW_CASES = frozenset({"image_gen", "image_edit"})
-
-
 @dataclass(frozen=True)
-class _V2ModuleNeeds:
-    siglip: bool
-    flow: bool
-    vae: bool
+class BagelRecipe:
+    reference_case: str
+    loss_mode: str | None = None
+    training: bool = False
+    visual_gen: bool = False
+    visual_und: bool = False
+    needs_siglip: bool = False
+    needs_flow: bool = False
+    needs_vae: bool = False
+
+
+RECIPES: dict[str, BagelRecipe] = {
+    "train_ce_mse": BagelRecipe("train_ce_mse", loss_mode="ce_mse", training=True, visual_gen=True),
+    "train_ce": BagelRecipe("train_ce_mse", loss_mode="ce_only", training=True),
+    "train_text_image_ce": BagelRecipe("train_ce_mse", loss_mode="text_image_ce", training=True, visual_und=True),
+    "train_mse": BagelRecipe("train_ce_mse", loss_mode="mse_only", training=True, visual_gen=True),
+    "text_und": BagelRecipe("text_und"),
+    "text_image_und": BagelRecipe("text_image_und", visual_und=True, needs_siglip=True),
+    "image_gen": BagelRecipe("image_gen", visual_gen=True, needs_flow=True),
+    "image_edit": BagelRecipe(
+        "image_edit",
+        visual_gen=True,
+        visual_und=True,
+        needs_siglip=True,
+        needs_flow=True,
+        needs_vae=True,
+    ),
+    "image_edit_text_und": BagelRecipe("text_und"),
+    "interleave_text_und": BagelRecipe("text_und"),
+    "interleave_text_image_und": BagelRecipe("text_image_und", visual_und=True, needs_siglip=True),
+    "interleave_image_gen": BagelRecipe("image_gen", visual_gen=True, needs_flow=True),
+    "transformers_reference_smoke": BagelRecipe("transformers_reference_smoke"),
+}
+SUPPORTED_RECIPES = frozenset(RECIPES)
 
 
 def create_driver(case: ParityCase) -> BagelParityDriver:
@@ -45,21 +66,28 @@ class BagelParityDriver(ParityDriver):
 
     def __init__(self, case: ParityCase) -> None:
         super().__init__(case)
-        if case.scenario.driver_case not in SUPPORTED_DRIVER_CASES:
-            raise NotImplementedError(f"Unsupported BAGEL driver_case: {case.scenario.driver_case!r}")
+        if case.recipe.id not in SUPPORTED_RECIPES:
+            raise NotImplementedError(f"Unsupported BAGEL recipe: {case.recipe.id!r}")
+
+    def reference_inputs(self) -> Mapping[str, Any]:
+        inputs = dict(super().reference_inputs())
+        recipe = self._recipe()
+        if recipe.loss_mode is not None:
+            inputs["loss_mode"] = recipe.loss_mode
+        return inputs
 
     def load_reference(self, *, device: torch.device, dtype: torch.dtype) -> nn.Module:
-        visual_gen, visual_und = self._reference_visual_flags()
+        recipe = self._recipe()
         return load_reference_model(
             self.case.model.reference,
-            visual_gen=visual_gen,
-            visual_und=visual_und,
+            visual_gen=recipe.visual_gen,
+            visual_und=recipe.visual_und,
             init_on_meta=True,
             torch_dtype=dtype,
             device=device,
             latent_patch_size=2,
             max_latent_size=64,
-            timestep_shift=float(self.case.scenario.stimulus.get("timestep_shift", 3.0)),
+            timestep_shift=float(self.case.recipe.stimulus.get("timestep_shift", 3.0)),
             vit_max_num_patch_per_side=70,
             connector_act="gelu_pytorch_tanh",
         )
@@ -68,25 +96,24 @@ class BagelParityDriver(ParityDriver):
         model_root = self.case.model.v2_model.model_root
         if model_root is None:
             raise ValueError("BAGEL V2 model_root is required.")
-        is_training = self.case.graph.domain == "training"
-        graph = None if is_training else self.case.graph.name
+        recipe = self._recipe()
+        graph = None if recipe.training else self.case.graph.name
         config = load_omni_config_from_dir(self.case.model.v2_model.config_dir, graph=graph)
-        needs = self._v2_module_needs(is_training=is_training)
         text_encoder = load_omni_module_from_pretrained(model_root / "bagel_text_encoder", device=device, dtype=dtype)
         qwen2_mot = load_omni_module_from_pretrained(model_root / "bagel_qwen2_mot", device=device, dtype=dtype)
-        if needs.flow:
+        if recipe.training or recipe.needs_flow:
             flow_connector: nn.Module = load_omni_module_from_pretrained(
                 model_root / "bagel_flow_connector", device=device, dtype=dtype
             )
         else:
             flow_connector = _UnusedModule()
-        if needs.siglip:
+        if recipe.training or recipe.needs_siglip:
             siglip: nn.Module = load_omni_module_from_pretrained(
                 model_root / "bagel_siglip_navit", device=device, dtype=dtype
             )
         else:
             siglip = _NoopGenerateModule()
-        if needs.vae:
+        if recipe.training or recipe.needs_vae or bool(self.case.recipe.stimulus.get("enable_decode_smoke", False)):
             vae: nn.Module = load_omni_module_from_pretrained(model_root / "bagel_vae", device=device, dtype=dtype)
         else:
             vae = _UnusedModule()
@@ -99,23 +126,8 @@ class BagelParityDriver(ParityDriver):
         }
         return OmniModel(config, modules).eval()
 
-    def _reference_visual_flags(self) -> tuple[bool, bool]:
-        driver_case = self.case.scenario.driver_case
-        loss_mode = str(self.case.scenario.stimulus.get("loss_mode", "ce_mse"))
-        is_train = driver_case == _TRAIN_CASE
-        visual_gen = driver_case in _IMAGE_GENERATION_CASES or (is_train and loss_mode in {"ce_mse", "mse_only"})
-        visual_und = driver_case in _IMAGE_UNDERSTANDING_CASES or (is_train and loss_mode == "text_image_ce")
-        return visual_gen, visual_und
-
-    def _v2_module_needs(self, *, is_training: bool) -> _V2ModuleNeeds:
-        driver_case = self.case.scenario.driver_case
-        return _V2ModuleNeeds(
-            siglip=is_training or driver_case in _IMAGE_UNDERSTANDING_CASES,
-            flow=is_training or driver_case in _FLOW_CASES,
-            vae=is_training
-            or driver_case == "image_edit"
-            or bool(self.case.scenario.stimulus.get("enable_decode_smoke", False)),
-        )
+    def _recipe(self) -> BagelRecipe:
+        return RECIPES[self.case.recipe.id]
 
     def generation_kwargs(self, model_or_config: Any) -> dict[str, Any]:
         kwargs = super().generation_kwargs(model_or_config)
@@ -132,18 +144,25 @@ class BagelParityDriver(ParityDriver):
             "cfg_renorm_type",
             "enable_taylorseer",
         ):
-            if key in self.case.scenario.stimulus:
-                kwargs[key] = self.case.scenario.stimulus[key]
+            if key in self.case.recipe.stimulus:
+                kwargs[key] = self.case.recipe.stimulus[key]
         return kwargs
 
     @torch.no_grad()
-    def run_reference(
+    def run_reference_recipe(
         self,
         ref_model: nn.Module,
         inputs: Mapping[str, Any],
         context: ReferenceCaptureContext,
     ) -> dict[str, Any]:
-        return run_reference_execution(self.case.scenario.driver_case, ref_model, inputs, context)
+        return reference_execution.run_reference_recipe(self._recipe().reference_case, ref_model, inputs, context)
+
+    def run_reference_only_recipe(self) -> ParityReport:
+        return reference_execution.run_reference_only_recipe(
+            recipe_id=self.case.recipe.id,
+            run_kind=self.case.run.kind,
+            case_id=self.case.node_id,
+        )
 
     def v2_infer_request(self, reference_output: Mapping[str, Any], *, device: torch.device) -> dict[str, Any]:
         return {"conversation_list": build_conversation_from_canonical(reference_output["canonical"], device=device)}
@@ -219,7 +238,9 @@ class _UnusedModule(nn.Module):
 
 
 __all__ = [
+    "BagelRecipe",
     "BagelParityDriver",
-    "SUPPORTED_DRIVER_CASES",
+    "RECIPES",
+    "SUPPORTED_RECIPES",
     "create_driver",
 ]

@@ -21,21 +21,23 @@ from tests.seed_omni.parity_suite.reference.capture import capture_reference_tap
 
 
 _V2_DISPATCH: dict[tuple[str, str], str] = {
-    ("training", "graph"): "run_v2_train_graph",
-    ("training", "module"): "run_v2_train_module",
-    ("training", "framework"): "run_v2_train_framework",
-    ("inference", "graph"): "run_v2_infer_graph",
-    ("inference", "module"): "run_v2_infer_module",
-    ("inference", "framework"): "run_v2_infer_framework",
+    ("training", "graph"): "run_v2_train_graph_recipe",
+    ("training", "module"): "run_v2_train_module_recipe",
+    ("training", "framework"): "run_v2_train_framework_recipe",
+    ("inference", "graph"): "run_v2_infer_graph_recipe",
+    ("inference", "module"): "run_v2_infer_module_recipe",
+    ("inference", "framework"): "run_v2_infer_framework_recipe",
 }
 
 
 def run_parity_case(case: ParityCase) -> ParityReport:
     """Run one discovered graph case against its online reference oracle."""
 
+    driver = _load_driver(case)
+    if case.tier == "reference":
+        return driver.run_reference_only_recipe()
     if case.tier not in {"graph", "module", "framework"}:
         raise NotImplementedError(f"Unsupported parity tier for execution: {case.tier!r}")
-    driver = _load_driver(case)
     selected = () if _is_framework_policy_run(case) else case.model.mapping.for_probe_names(case.run.probes)
     resolved = resolve_mapping(mappings=selected, nodes=case.nodes)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

@@ -45,13 +45,13 @@ class ParityDriver(ABC):
         configure_torch_determinism(seed)
 
     def reference_inputs(self) -> Mapping[str, Any]:
-        return self.case.scenario.stimulus
+        return self.case.recipe.stimulus
 
     def generation_kwargs(self, model_or_config: Any) -> dict[str, Any]:
         config = getattr(model_or_config, "config", model_or_config)
         kwargs = dict(getattr(config, "generation_kwargs", None) or {})
         for key, default in self.generation_defaults.items():
-            kwargs[key] = self.case.scenario.stimulus.get(key, default)
+            kwargs[key] = self.case.recipe.stimulus.get(key, default)
         return kwargs
 
     @abstractmethod
@@ -63,7 +63,7 @@ class ParityDriver(ABC):
         """Load the V2 model under test."""
 
     @abstractmethod
-    def run_reference(
+    def run_reference_recipe(
         self,
         ref_model: nn.Module,
         inputs: Mapping[str, Any],
@@ -71,7 +71,12 @@ class ParityDriver(ABC):
     ) -> Any:
         """Run the reference recipe and return driver-owned canonical output."""
 
-    def run_v2_infer_graph(
+    def run_reference_only_recipe(self) -> ParityReport:
+        """Run a reference-only recipe."""
+
+        raise NotImplementedError(f"{type(self).__name__} does not implement reference-only execution.")
+
+    def run_v2_infer_graph_recipe(
         self,
         reference_output: Any,
         whitelist: Mapping[tuple[str, str], frozenset[str]],
@@ -85,7 +90,7 @@ class ParityDriver(ABC):
 
         return run_v2_infer_graph(self, reference_output, whitelist, device=device, dtype=dtype)
 
-    def run_v2_train_graph(
+    def run_v2_train_graph_recipe(
         self,
         reference_output: Any,
         whitelist: Mapping[tuple[str, str], frozenset[str]],
@@ -99,7 +104,7 @@ class ParityDriver(ABC):
 
         return run_v2_train_graph(self, reference_output, whitelist, device=device, dtype=dtype)
 
-    def run_v2_infer_module(
+    def run_v2_infer_module_recipe(
         self,
         reference_output: Any,
         whitelist: Mapping[tuple[str, str], frozenset[str]],
@@ -113,7 +118,7 @@ class ParityDriver(ABC):
 
         return run_v2_infer_module(self, reference_output, whitelist, device=device, dtype=dtype)
 
-    def run_v2_train_module(
+    def run_v2_train_module_recipe(
         self,
         reference_output: Any,
         whitelist: Mapping[tuple[str, str], frozenset[str]],
@@ -127,7 +132,7 @@ class ParityDriver(ABC):
 
         return run_v2_train_module(self, reference_output, whitelist, device=device, dtype=dtype)
 
-    def run_v2_infer_framework(
+    def run_v2_infer_framework_recipe(
         self,
         reference_output: Any,
         whitelist: Mapping[tuple[str, str], frozenset[str]],
@@ -141,7 +146,7 @@ class ParityDriver(ABC):
 
         return run_v2_infer_framework(self, reference_output, whitelist, device=device, dtype=dtype)
 
-    def run_v2_train_framework(
+    def run_v2_train_framework_recipe(
         self,
         reference_output: Any,
         whitelist: Mapping[tuple[str, str], frozenset[str]],
@@ -187,11 +192,13 @@ class ParityDriver(ABC):
         """Return the module-tier FSM policy for inference parity."""
 
         del reference_output, whitelist
-        policy = self.case.run.policy
+        options = self.case.run.options
+        required_nodes = tuple(tuple(item) for item in options.get("required_nodes", ()) or ())
+        max_steps = options.get("max_steps")
         return InferModulePolicy(
-            max_steps=policy.max_steps,
-            required_nodes=frozenset(policy.required_nodes),
-            allow_finalize=policy.allow_finalize,
+            max_steps=None if max_steps is None else int(max_steps),
+            required_nodes=frozenset((str(state), str(node)) for state, node in required_nodes),
+            allow_finalize=bool(options.get("allow_finalize", False)),
         )
 
     def collect_v2_train_observations(

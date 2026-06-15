@@ -1,0 +1,9 @@
+transformers_reference_smoke:
+  - gate:
+      requires_cuda: false
+      requires_reference_checkpoint: false
+      requires_v2_model: false
+    runs:
+      reference:
+        - id: basic
+          kind: reference_smoke

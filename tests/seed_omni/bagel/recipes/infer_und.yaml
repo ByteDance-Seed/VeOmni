@@ -1,0 +1,76 @@
+text_und:
+  - stimulus:
+      prompt: "Write a short description of a calm lake at sunrise."
+      max_new_tokens: 1
+      do_sample: false
+    runs:
+      graph:
+        - id: one_step
+          probes:
+            - text.hidden
+            - text.logits
+            - text.greedy_token
+      module:
+        - id: one_step
+          probes:
+            - text.hidden
+            - text.logits
+            - text.greedy_token
+          options:
+            required_nodes:
+              - [prompt_encode, bagel_qwen2_mot.generate]
+              - [prompt_encode, bagel_text_encoder.token_generate]
+
+text_image_und:
+  - stimulus:
+      prompt: "Describe the colors and layout of this synthetic image in one sentence."
+      image_width: 448
+      image_height: 336
+      max_new_tokens: 1
+      do_sample: false
+    runs:
+      graph:
+        - id: prepared_one_step
+          probes:
+            - text.hidden
+            - text.logits
+            - text.greedy_token
+      module:
+        - id: prepared_one_step
+          probes:
+            - text.hidden
+            - text.logits
+            - text.greedy_token
+          options:
+            required_nodes:
+              - [prompt_encode, bagel_qwen2_mot.generate]
+              - [prompt_encode, bagel_text_encoder.token_generate]
+  - stimulus:
+      prompt: "Describe the colors and layout of this synthetic image in one sentence."
+      image_width: 448
+      image_height: 336
+      use_raw_image: true
+      max_new_tokens: 1
+      do_sample: false
+    runs:
+      graph:
+        - id: raw_one_step
+          probes:
+            - image.image_embeds_sample
+            - image.preprocessed_image_size
+            - text.hidden
+            - text.logits
+            - text.greedy_token
+      module:
+        - id: raw_one_step
+          probes:
+            - image.image_embeds_sample
+            - image.preprocessed_image_size
+            - text.hidden
+            - text.logits
+            - text.greedy_token
+          options:
+            required_nodes:
+              - [prompt_encode, bagel_siglip_navit.generate]
+              - [prompt_encode, bagel_qwen2_mot.generate]
+              - [prompt_encode, bagel_text_encoder.token_generate]
