@@ -316,8 +316,11 @@ def WanTransformer3DModel_forward(
     if get_parallel_state().sp_enabled:
         if get_parallel_state().cp_size != 1:
             raise ValueError("Wan Ulysses SP does not support context parallelism.")
-        if self.config._attn_implementation != "veomni_flash_attention_2_with_sp":
-            raise ValueError("Wan Ulysses SP requires `veomni_flash_attention_2_with_sp` attention.")
+        attn_implementation = getattr(self.blocks[0].attn1.processor, "attn_implementation", None)
+        if attn_implementation != "veomni_flash_attention_2_with_sp":
+            raise ValueError(
+                f"Wan Ulysses SP requires `veomni_flash_attention_2_with_sp` attention; got `{attn_implementation}`."
+            )
         freqs_cos, _ = rotary_emb
         sp_size = get_parallel_state().sp_size
         if hidden_states.shape[1] % sp_size != 0:
