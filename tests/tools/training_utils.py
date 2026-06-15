@@ -71,16 +71,12 @@ _NPU_PER_MODEL_OVERRIDES: Dict[str, Dict[str, str]] = {
 }
 
 # GPU per-model overrides for models whose patched ops disable a default
-# backend.
-# Wan's ``rope_apply(x, **kwargs)`` signature is incompatible with the
-# registry-default Liger RoPE — ``device_patch.py`` marks ``liger_kernel`` as
-# explicitly disabled, so any non-eager value would raise. Wan also keeps its
-# RMSNorm on the reference eager implementation in these e2e tests so the
-# production FA2 attention path is isolated from fused RMSNorm numerics.
+# backend. Wan uses FA2 in real DiT configs, while RoPE stays eager because
+# its ``rope_apply(x, **kwargs)`` signature is incompatible with the
+# registry-default Liger RoPE.
 _GPU_PER_MODEL_OVERRIDES: Dict[str, Dict[str, str]] = {
     "wan_t2v": {
         "attn_implementation": "flash_attention_2",
-        "rms_norm_implementation": "eager",
         "rotary_pos_emb_implementation": "eager",
     },
     # Qwen-Image runs its dual-stream joint attention through diffusers' own

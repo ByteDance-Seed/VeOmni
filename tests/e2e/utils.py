@@ -84,7 +84,6 @@ _SP_SIZE = [1, 2]
 _EP_SIZE = [1, 2]
 _WAN_BFLOAT16_TRAINING_ARGS = [
     "--train.accelerator.fsdp_config.mixed_precision.enable=False",
-    "--train.gradient_checkpointing.enable=False",
 ]
 
 

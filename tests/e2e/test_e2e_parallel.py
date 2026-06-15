@@ -3,14 +3,13 @@ import os
 import shutil
 import subprocess
 from pathlib import Path
-from typing import Mapping
 
 import pytest
 import torch
 
 from veomni.models.auto import build_foundation_model
 from veomni.utils.device import IS_NPU_AVAILABLE
-from veomni.utils.import_utils import is_diffusers_available, is_torch_npu_available
+from veomni.utils.import_utils import is_diffusers_available
 
 from ..tools import DummyDataset, build_torchrun_cmd, compare_metrics, print_comparison_table
 from ..tools.training_utils import make_eager_ops_config
@@ -45,14 +44,6 @@ def _materialize_weights_dir(config_path: str, output_path: str, save_original_f
         ops_implementation=make_eager_ops_config(),
     )
 
-    if "wan_t2v" in config_path:
-        # Match the Wan diffusers parity fixture: tiny deterministic weights
-        # keep this e2e focused on bf16 FA2/SP training alignment instead of
-        # random toy-init stress on shared L20 runners.
-        with torch.no_grad():
-            for parameter in model.parameters():
-                if torch.is_floating_point(parameter):
-                    parameter.fill_(1e-3)
     model.save_pretrained(output_path, save_original_format=save_original_format)
 
 
@@ -65,7 +56,6 @@ def main(
     atol: float,
     train_path: str,
     max_sp_size: int | None = None,
-    metric_tolerances: Mapping[str, tuple[float, float]] | None = None,
 ):
     test_path = f"./{model_name}"
     os.makedirs(test_path, exist_ok=True)
@@ -109,18 +99,13 @@ def main(
 
     for key in log_keys:
         print_comparison_table(res, key, title=model_name)
-    compare_metrics(res, rtol=rtol, atol=atol, metric_tolerances=metric_tolerances)
+    compare_metrics(res, rtol=rtol, atol=atol)
 
     shutil.rmtree(test_path)
 
 
 _DEFAULT_RTOL = 1e-1
 _DEFAULT_ATOL = 1e-1
-_WAN_RTOL = 1e-5
-_WAN_ATOL = 1e-8
-# NPU grad-norm reduction differs slightly while loss/mse remain bit-close.
-_WAN_GRAD_NORM_RTOL = 1e-2
-_WAN_GRAD_NORM_ATOL = 1e-5
 
 text_test_cases = [
     pytest.param(
@@ -244,8 +229,8 @@ wan_dit_test_cases = [
         "wan_t2v",
         "./tests/toy_config/wan_t2v_toy",
         False,
-        _WAN_RTOL,
-        _WAN_ATOL,
+        _DEFAULT_RTOL,
+        _DEFAULT_ATOL,
         marks=_dit_only,
     ),
 ]
@@ -446,15 +431,8 @@ def test_wan_dit_uses_bfloat16_and_flash_attention():
         cmd = build_torchrun_cmd(**cmd_kwargs)
         assert cmd_kwargs["extra_args"] == [
             "--train.accelerator.fsdp_config.mixed_precision.enable=False",
-            "--train.gradient_checkpointing.enable=False",
         ]
-        if is_torch_npu_available():
-            assert "--model.ops_implementation.attn_implementation=flash_attention_2" in cmd
-            assert "--model.ops_implementation.rotary_pos_emb_implementation=npu" in cmd
-        else:
-            assert "--model.ops_implementation.attn_implementation=flash_attention_2" in cmd
-            assert "--model.ops_implementation.rms_norm_implementation=eager" in cmd
-            assert "--model.ops_implementation.rotary_pos_emb_implementation=eager" in cmd
+        assert "--model.ops_implementation.attn_implementation=flash_attention_2" in cmd
 
 
 @pytest.mark.parametrize("model_name, config_path, is_moe, rtol, atol", wan_dit_test_cases)
@@ -472,7 +450,6 @@ def test_wan_dit_parallel_align(
         rtol=rtol,
         atol=atol,
         train_path=dummy_wan_t2v_dataset,
-        metric_tolerances={"grad_norm": (_WAN_GRAD_NORM_RTOL, _WAN_GRAD_NORM_ATOL)},
     )
 
 

@@ -165,7 +165,10 @@ class WanSPAttnProcessor(WanAttnProcessor):
         # semantics or relying on a synthetic padding mask.
         attention_interface: Callable = wan_eager_attention_forward
         use_fp32_attention = query.dtype == torch.float32 and attn.to_q.weight.dtype == torch.float32
-        use_flash_attention = self.attn_implementation != "eager" and not use_fp32_attention
+        use_flash_attention = (
+            self.attn_implementation in {"flash_attention_2", "veomni_flash_attention_2_with_sp"}
+            and not use_fp32_attention
+        )
         if self.attn_implementation == "flash_attention_2" and not use_fp32_attention:
             attention_interface = ALL_ATTENTION_FUNCTIONS["veomni_flash_attention_2_with_sp"]
         elif self.attn_implementation != "eager" and not use_fp32_attention:
@@ -280,32 +283,16 @@ def WanTransformer3DModel_forward(
         encoder_hidden_states = torch.concat([encoder_hidden_states_image, encoder_hidden_states], dim=1)
 
     if get_parallel_state().sp_enabled:
-        if get_parallel_state().cp_size != 1:
-            raise ValueError("Wan Ulysses SP does not support context parallelism.")
-        attn_implementation = getattr(self.blocks[0].attn1.processor, "attn_implementation", None)
-        if attn_implementation != "veomni_flash_attention_2_with_sp":
-            raise ValueError(
-                f"Wan Ulysses SP requires `veomni_flash_attention_2_with_sp` attention; got `{attn_implementation}`."
-            )
-        freqs_cos, _ = rotary_emb
-        sp_size = get_parallel_state().sp_size
-        if hidden_states.shape[1] % sp_size != 0:
-            raise ValueError(
-                f"Wan hidden sequence length ({hidden_states.shape[1]}) must be divisible by SP size ({sp_size})."
-            )
-        if freqs_cos.shape[1] != hidden_states.shape[1]:
-            raise ValueError(
-                f"Wan rotary sequence length ({freqs_cos.shape[1]}) must match "
-                f"hidden sequence length ({hidden_states.shape[1]})."
-            )
-        if freqs_cos.shape[1] % sp_size != 0:
-            raise ValueError(
-                f"Wan rotary sequence length ({freqs_cos.shape[1]}) must be divisible by SP size ({sp_size})."
-            )
         hidden_states = slice_input_tensor(hidden_states, dim=1, group=get_parallel_state().sp_group)
+
+        # Slice rotary embeddings to the local rank's positions (no gradient).
         freqs_cos, freqs_sin = rotary_emb
-        freqs_cos = slice_input_tensor(freqs_cos, dim=1, group=get_parallel_state().sp_group)
-        freqs_sin = slice_input_tensor(freqs_sin, dim=1, group=get_parallel_state().sp_group)
+        ulysses_size = get_parallel_state().ulysses_size
+        ulysses_rank = get_parallel_state().ulysses_rank
+        seq_len = freqs_cos.shape[1]
+        chunk = seq_len // ulysses_size
+        freqs_cos = freqs_cos[:, ulysses_rank * chunk : (ulysses_rank + 1) * chunk]
+        freqs_sin = freqs_sin[:, ulysses_rank * chunk : (ulysses_rank + 1) * chunk]
         rotary_emb = (freqs_cos, freqs_sin)
     # 4. Transformer blocks
     if torch.is_grad_enabled() and self.gradient_checkpointing:
