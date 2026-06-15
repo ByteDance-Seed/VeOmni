@@ -4,12 +4,14 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from contextlib import nullcontext
+from copy import deepcopy
 from typing import Any
 
 import torch
 from torch import nn
 
 from tests.seed_omni.bagel.transformers.bagel import ReferenceImageTransform, make_reference_image
+from tests.seed_omni.bagel.transformers.vendor.inference import InterleaveInferencer
 from tests.seed_omni.bagel.transformers.vendor.modeling.bagel.qwen2_navit import NaiveCache
 from tests.seed_omni.parity_suite.core import ParityReport, to_cpu, to_device
 from tests.seed_omni.parity_suite.core.utilities import autocast_for_dtype, patched_randn_like, sample_named_grad
@@ -99,6 +101,117 @@ def _run_transformers_reference_smoke() -> None:
         raise AssertionError("BAGEL text-only reference unexpectedly enabled visual understanding.")
 
 
+def _make_interleave_inferencer(
+    ref_model: nn.Module,
+    *,
+    vae_transform: Any | None = None,
+    vit_transform: Any | None = None,
+) -> InterleaveInferencer:
+    return InterleaveInferencer(
+        model=ref_model.model,
+        vae_model=ref_model.vae_model,
+        tokenizer=ref_model.tokenizer,
+        vae_transform=vae_transform,
+        vit_transform=vit_transform,
+        new_token_ids=ref_model.new_token_ids,
+    )
+
+
+def _update_context_text_for_capture(
+    inferencer: InterleaveInferencer,
+    text: str,
+    gen_context: Mapping[str, Any],
+    *,
+    device: torch.device,
+    dtype: torch.dtype | None = None,
+) -> tuple[dict[str, torch.Tensor], dict[str, Any]]:
+    generation_input, kv_lens, ropes = inferencer.model.prepare_prompts(
+        curr_kvlens=gen_context["kv_lens"],
+        curr_rope=gen_context["ropes"],
+        prompts=[text],
+        tokenizer=inferencer.tokenizer,
+        new_token_ids=inferencer.new_token_ids,
+    )
+    generation_input = to_device(generation_input, device)
+    maybe_autocast = nullcontext() if dtype is None else autocast_for_dtype(device, dtype)
+    with maybe_autocast:
+        past_key_values = inferencer.model.forward_cache_update_text(
+            gen_context["past_key_values"],
+            **generation_input,
+        )
+    return generation_input, {
+        "kv_lens": kv_lens,
+        "ropes": ropes,
+        "past_key_values": past_key_values,
+    }
+
+
+def _update_context_image_for_capture(
+    inferencer: InterleaveInferencer,
+    image: Any,
+    gen_context: Mapping[str, Any],
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+    vae: bool,
+    vit: bool,
+) -> dict[str, Any]:
+    if not (vae or vit):
+        raise ValueError("BAGEL image context update requires vae or vit.")
+
+    model = inferencer.model
+    past_key_values = gen_context["past_key_values"]
+    kv_lens = gen_context["kv_lens"]
+    ropes = gen_context["ropes"]
+    result: dict[str, Any] = {}
+
+    if vae:
+        vae_input, kv_lens, ropes = model.prepare_vae_images(
+            curr_kvlens=kv_lens,
+            curr_rope=ropes,
+            images=[image],
+            transforms=inferencer.vae_transform,
+            new_token_ids=inferencer.new_token_ids,
+        )
+        vae_input = to_device(vae_input, device)
+        with autocast_for_dtype(device, dtype):
+            vae_context = _capture_official_cache_update_vae(
+                model,
+                inferencer.vae_model,
+                past_key_values=past_key_values,
+                vae_input=vae_input,
+            )
+        past_key_values = vae_context["past_key_values"]
+        result["vae_input"] = vae_input
+        result["vae_context"] = vae_context
+
+    if vit:
+        vit_input, kv_lens, ropes = model.prepare_vit_images(
+            curr_kvlens=kv_lens,
+            curr_rope=ropes,
+            images=[image],
+            transforms=inferencer.vit_transform,
+            new_token_ids=inferencer.new_token_ids,
+        )
+        vit_input = to_device(vit_input, device)
+        with autocast_for_dtype(device, dtype):
+            vit_context = _capture_official_cache_update_vit(
+                model,
+                past_key_values=past_key_values,
+                vit_input=vit_input,
+            )
+            past_key_values = vit_context["past_key_values"]
+        result["vit_input"] = vit_input
+        result["image_embeds"] = vit_context["image_embeds"]
+
+    result["gen_context"] = {
+        "kv_lens": kv_lens,
+        "ropes": ropes,
+        "past_key_values": past_key_values,
+    }
+    return result
+
+
 def _run_text_reference(
     ref_model: nn.Module,
     inputs: Mapping[str, Any],
@@ -106,70 +219,41 @@ def _run_text_reference(
 ) -> dict[str, Any]:
     prompt = str(inputs["prompt"])
     model = ref_model.model
-    tokenizer = ref_model.tokenizer
     new_token_ids = ref_model.new_token_ids
     device = next(model.parameters()).device
 
-    past_key_values = NaiveCache(model.config.llm_config.num_hidden_layers)
-    curr_kvlens = [0]
-    curr_rope = [0]
-
-    prompt_input, kv_lens, ropes = model.prepare_prompts(
-        curr_kvlens=curr_kvlens,
-        curr_rope=curr_rope,
-        prompts=[prompt],
-        tokenizer=tokenizer,
-        new_token_ids=new_token_ids,
-    )
-    prompt_input = to_device(prompt_input, device)
-    past_key_values = model.forward_cache_update_text(past_key_values, **prompt_input)
+    inferencer = _make_interleave_inferencer(ref_model)
+    gen_context = inferencer.init_gen_context()
+    prompt_input, gen_context = _update_context_text_for_capture(inferencer, prompt, gen_context, device=device)
+    kv_lens = gen_context["kv_lens"]
+    ropes = gen_context["ropes"]
+    past_key_values = gen_context["past_key_values"]
 
     start_input = model.prepare_start_tokens(kv_lens, ropes, new_token_ids)
     start_input = to_device(start_input, device)
-    curr_tokens = start_input["packed_start_tokens"]
-    key_values_lens = start_input["key_values_lens"]
-    packed_key_value_indexes = start_input["packed_key_value_indexes"]
-    packed_query_position_ids = start_input["packed_query_position_ids"]
-
-    packed_text_embedding = model.language_model.model.embed_tokens(curr_tokens)
-    query_lens = torch.ones_like(curr_tokens)
-    packed_query_indexes = torch.cumsum(key_values_lens, dim=0) + torch.arange(
-        0,
-        len(key_values_lens),
-        device=key_values_lens.device,
-        dtype=key_values_lens.dtype,
-    )
-    packed_key_value_indexes_for_step = _step_key_value_indexes(packed_key_value_indexes, key_values_lens)
-    extra_inputs = {"mode": "und"} if model.use_moe else {}
-    output = model.language_model.forward_inference(
-        packed_query_sequence=packed_text_embedding,
-        query_lens=query_lens,
-        packed_query_position_ids=packed_query_position_ids,
-        packed_query_indexes=packed_query_indexes,
+    text_step = _capture_official_generate_text(
+        model,
+        start_input,
         past_key_values=past_key_values,
-        key_values_lens=key_values_lens,
-        packed_key_value_indexes=packed_key_value_indexes_for_step,
-        update_past_key_values=True,
-        is_causal=True,
-        **extra_inputs,
+        new_token_ids=new_token_ids,
+        inputs=inputs,
     )
-    logits = model.language_model.lm_head(output.packed_query_sequence)
     canonical = {
         "prompt": prompt,
         "prompt_input": to_cpu(prompt_input),
         "kv_lens_after_prompt": list(kv_lens),
         "ropes_after_prompt": list(ropes),
         "start_input": to_cpu(start_input),
-        "packed_query_indexes": packed_query_indexes.detach().cpu(),
-        "packed_key_value_indexes_for_step": packed_key_value_indexes_for_step.detach().cpu(),
-        "query_lens": query_lens.detach().cpu(),
+        "packed_query_indexes": text_step["packed_query_indexes"].detach().cpu(),
+        "packed_key_value_indexes_for_step": text_step["packed_key_value_indexes"].detach().cpu(),
+        "query_lens": text_step["query_lens"].detach().cpu(),
     }
     result = {
         "canonical": canonical,
         "reference": {
-            "hidden_state": output.packed_query_sequence.detach().cpu(),
-            "logits": logits.detach().cpu(),
-            "greedy_token": torch.argmax(logits, dim=-1).detach().cpu(),
+            "hidden_state": text_step["hidden_state"].detach().cpu(),
+            "logits": text_step["logits"].detach().cpu(),
+            "greedy_token": text_step["greedy_token"].detach().cpu(),
         },
     }
     context.record_extra("canonical", canonical)
@@ -183,7 +267,6 @@ def _run_text_image_reference(
 ) -> dict[str, Any]:
     prompt = str(inputs["prompt"])
     model = ref_model.model
-    tokenizer = ref_model.tokenizer
     new_token_ids = ref_model.new_token_ids
     device = next(model.parameters()).device
     dtype = next(model.parameters()).dtype
@@ -197,64 +280,45 @@ def _run_text_image_reference(
     )
     preprocessed_image = vit_transform(raw_image.convert("RGB"))
 
-    past_key_values = NaiveCache(model.config.llm_config.num_hidden_layers)
-    curr_kvlens = [0]
-    curr_rope = [0]
-
-    image_input, kv_lens_after_image, ropes_after_image = model.prepare_vit_images(
-        curr_kvlens=curr_kvlens,
-        curr_rope=curr_rope,
-        images=[raw_image.convert("RGB")],
-        transforms=vit_transform,
-        new_token_ids=new_token_ids,
+    inferencer = _make_interleave_inferencer(ref_model, vit_transform=vit_transform)
+    gen_context = inferencer.init_gen_context()
+    image_update = _update_context_image_for_capture(
+        inferencer,
+        raw_image.convert("RGB"),
+        gen_context,
+        device=device,
+        dtype=dtype,
+        vae=False,
+        vit=True,
     )
-    image_input = to_device(image_input, device)
-    with autocast_for_dtype(device, dtype):
-        image_embeds = _official_image_embeds(model, image_input)
-        past_key_values = model.forward_cache_update_vit(past_key_values, **image_input)
+    gen_context = image_update["gen_context"]
+    image_input = image_update["vit_input"]
+    image_embeds = image_update["image_embeds"]
+    kv_lens_after_image = list(gen_context["kv_lens"])
+    ropes_after_image = list(gen_context["ropes"])
 
-    prompt_input, kv_lens, ropes = model.prepare_prompts(
-        curr_kvlens=kv_lens_after_image,
-        curr_rope=ropes_after_image,
-        prompts=[prompt],
-        tokenizer=tokenizer,
-        new_token_ids=new_token_ids,
+    prompt_input, gen_context = _update_context_text_for_capture(
+        inferencer,
+        prompt,
+        gen_context,
+        device=device,
+        dtype=dtype,
     )
-    prompt_input = to_device(prompt_input, device)
-    with autocast_for_dtype(device, dtype):
-        past_key_values = model.forward_cache_update_text(past_key_values, **prompt_input)
+    kv_lens = gen_context["kv_lens"]
+    ropes = gen_context["ropes"]
+    past_key_values = gen_context["past_key_values"]
 
     start_input = model.prepare_start_tokens(kv_lens, ropes, new_token_ids)
     start_input = to_device(start_input, device)
-    curr_tokens = start_input["packed_start_tokens"]
-    key_values_lens = start_input["key_values_lens"]
-    packed_key_value_indexes = start_input["packed_key_value_indexes"]
-    packed_query_position_ids = start_input["packed_query_position_ids"]
-
-    packed_text_embedding = model.language_model.model.embed_tokens(curr_tokens)
-    query_lens = torch.ones_like(curr_tokens)
-    packed_query_indexes = torch.cumsum(key_values_lens, dim=0) + torch.arange(
-        0,
-        len(key_values_lens),
-        device=key_values_lens.device,
-        dtype=key_values_lens.dtype,
+    text_step = _capture_official_generate_text(
+        model,
+        start_input,
+        past_key_values=past_key_values,
+        new_token_ids=new_token_ids,
+        inputs=inputs,
+        device=device,
+        dtype=dtype,
     )
-    packed_key_value_indexes_for_step = _step_key_value_indexes(packed_key_value_indexes, key_values_lens)
-    extra_inputs = {"mode": "und"} if model.use_moe else {}
-    with autocast_for_dtype(device, dtype):
-        output = model.language_model.forward_inference(
-            packed_query_sequence=packed_text_embedding,
-            query_lens=query_lens,
-            packed_query_position_ids=packed_query_position_ids,
-            packed_query_indexes=packed_query_indexes,
-            past_key_values=past_key_values,
-            key_values_lens=key_values_lens,
-            packed_key_value_indexes=packed_key_value_indexes_for_step,
-            update_past_key_values=True,
-            is_causal=True,
-            **extra_inputs,
-        )
-        logits = model.language_model.lm_head(output.packed_query_sequence)
     canonical = {
         "kind": "text_image_und",
         "use_raw_image": bool(inputs.get("use_raw_image", False)),
@@ -268,16 +332,16 @@ def _run_text_image_reference(
         "kv_lens_after_prompt": list(kv_lens),
         "ropes_after_prompt": list(ropes),
         "start_input": to_cpu(start_input),
-        "packed_query_indexes": packed_query_indexes.detach().cpu(),
-        "packed_key_value_indexes_for_step": packed_key_value_indexes_for_step.detach().cpu(),
-        "query_lens": query_lens.detach().cpu(),
+        "packed_query_indexes": text_step["packed_query_indexes"].detach().cpu(),
+        "packed_key_value_indexes_for_step": text_step["packed_key_value_indexes"].detach().cpu(),
+        "query_lens": text_step["query_lens"].detach().cpu(),
     }
     result = {
         "canonical": canonical,
         "reference": {
-            "hidden_state": output.packed_query_sequence.detach().cpu(),
-            "logits": logits.detach().cpu(),
-            "greedy_token": torch.argmax(logits, dim=-1).detach().cpu(),
+            "hidden_state": text_step["hidden_state"].detach().cpu(),
+            "logits": text_step["logits"].detach().cpu(),
+            "greedy_token": text_step["greedy_token"].detach().cpu(),
             "image_embeds_sample": _sample_tensor(image_embeds).detach().cpu(),
             "preprocessed_image_size": torch.tensor(
                 [int(preprocessed_image.shape[-1]), int(preprocessed_image.shape[-2])],
@@ -296,22 +360,34 @@ def _run_image_gen_reference(
 ) -> dict[str, Any]:
     prompt = str(inputs["prompt"])
     model = ref_model.model
-    tokenizer = ref_model.tokenizer
     new_token_ids = ref_model.new_token_ids
     device = next(model.parameters()).device
+    dtype = next(model.parameters()).dtype
 
-    past_key_values = NaiveCache(model.config.llm_config.num_hidden_layers)
-    curr_kvlens = [0]
-    curr_rope = [0]
-    prompt_input, kv_lens, ropes = model.prepare_prompts(
-        curr_kvlens=curr_kvlens,
-        curr_rope=curr_rope,
-        prompts=[prompt],
-        tokenizer=tokenizer,
-        new_token_ids=new_token_ids,
+    inferencer = _make_interleave_inferencer(ref_model)
+    gen_context = inferencer.init_gen_context()
+    cfg_img_context = deepcopy(gen_context)
+
+    # Mirror official InterleaveInferencer.interleave_inference for a text-to-image span:
+    # CFG-text keeps the pre-text context, while CFG-image receives the text prompt.
+    cfg_text_context = deepcopy(gen_context)
+    prompt_input, gen_context = _update_context_text_for_capture(
+        inferencer,
+        prompt,
+        gen_context,
+        device=device,
+        dtype=dtype,
     )
-    prompt_input = to_device(prompt_input, device)
-    past_key_values = model.forward_cache_update_text(past_key_values, **prompt_input)
+    _, cfg_img_context = _update_context_text_for_capture(
+        inferencer,
+        prompt,
+        cfg_img_context,
+        device=device,
+        dtype=dtype,
+    )
+    kv_lens = gen_context["kv_lens"]
+    ropes = gen_context["ropes"]
+    past_key_values = gen_context["past_key_values"]
 
     image_height = int(inputs.get("image_height", 1024))
     image_width = int(inputs.get("image_width", 1024))
@@ -324,7 +400,9 @@ def _run_image_gen_reference(
         image_size=(image_height, image_width),
         past_key_values=past_key_values,
         device=device,
-        dtype=next(model.parameters()).dtype,
+        dtype=dtype,
+        cfg_text_context=cfg_text_context,
+        cfg_img_context=cfg_img_context,
     )
     canonical = {
         "kind": "image_gen",
@@ -377,7 +455,6 @@ def _run_image_edit_reference(
     vae_model = ref_model.vae_model
     if vae_model is None:
         raise ValueError("BAGEL image-edit reference requires a loaded VAE model.")
-    tokenizer = ref_model.tokenizer
     new_token_ids = ref_model.new_token_ids
     device = next(model.parameters()).device
     dtype = next(model.parameters()).dtype
@@ -398,49 +475,42 @@ def _run_image_edit_reference(
     context_image = vae_transform.resize_transform(raw_image.convert("RGB"))
     image_shape = context_image.size[::-1]
 
-    past_key_values = NaiveCache(model.config.llm_config.num_hidden_layers)
-    curr_kvlens = [0]
-    curr_rope = [0]
-
-    vae_input, curr_kvlens, curr_rope = model.prepare_vae_images(
-        curr_kvlens=curr_kvlens,
-        curr_rope=curr_rope,
-        images=[context_image],
-        transforms=vae_transform,
-        new_token_ids=new_token_ids,
+    inferencer = _make_interleave_inferencer(ref_model, vae_transform=vae_transform, vit_transform=vit_transform)
+    gen_context = inferencer.init_gen_context()
+    cfg_img_context = deepcopy(gen_context)
+    image_update = _update_context_image_for_capture(
+        inferencer,
+        context_image,
+        gen_context,
+        device=device,
+        dtype=dtype,
+        vae=True,
+        vit=True,
     )
-    vae_input = to_device(vae_input, device)
-    with autocast_for_dtype(device, dtype):
-        vae_context = _forward_vae_context(
-            model,
-            vae_model,
-            past_key_values=past_key_values,
-            vae_input=vae_input,
-        )
-    past_key_values = vae_context["past_key_values"]
+    gen_context = image_update["gen_context"]
+    vae_context = image_update["vae_context"]
+    image_embeds = image_update["image_embeds"]
 
-    vit_input, curr_kvlens, curr_rope = model.prepare_vit_images(
-        curr_kvlens=curr_kvlens,
-        curr_rope=curr_rope,
-        images=[context_image],
-        transforms=vit_transform,
-        new_token_ids=new_token_ids,
+    # Mirror official image-edit interleave: after the image span, CFG-text keeps
+    # image-only context; CFG-image receives only the text prompt.
+    cfg_text_context = deepcopy(gen_context)
+    prompt_input, gen_context = _update_context_text_for_capture(
+        inferencer,
+        prompt,
+        gen_context,
+        device=device,
+        dtype=dtype,
     )
-    vit_input = to_device(vit_input, device)
-    with autocast_for_dtype(device, dtype):
-        image_embeds = _official_image_embeds(model, vit_input)
-        past_key_values = model.forward_cache_update_vit(past_key_values, **vit_input)
-
-    prompt_input, kv_lens, ropes = model.prepare_prompts(
-        curr_kvlens=curr_kvlens,
-        curr_rope=curr_rope,
-        prompts=[prompt],
-        tokenizer=tokenizer,
-        new_token_ids=new_token_ids,
+    _, cfg_img_context = _update_context_text_for_capture(
+        inferencer,
+        prompt,
+        cfg_img_context,
+        device=device,
+        dtype=dtype,
     )
-    prompt_input = to_device(prompt_input, device)
-    with autocast_for_dtype(device, dtype):
-        past_key_values = model.forward_cache_update_text(past_key_values, **prompt_input)
+    kv_lens = gen_context["kv_lens"]
+    ropes = gen_context["ropes"]
+    past_key_values = gen_context["past_key_values"]
 
     flow_step = _run_reference_image_flow_step(
         model,
@@ -452,6 +522,8 @@ def _run_image_edit_reference(
         past_key_values=past_key_values,
         device=device,
         dtype=dtype,
+        cfg_text_context=cfg_text_context,
+        cfg_img_context=cfg_img_context,
     )
     canonical = {
         "kind": "image_edit",
@@ -625,13 +697,6 @@ def _remove_fields(batch: dict[str, Any], keys: tuple[str, ...]) -> None:
         batch.pop(key, None)
 
 
-def _step_key_value_indexes(packed_key_value_indexes: torch.Tensor, key_values_lens: torch.Tensor) -> torch.Tensor:
-    unpacked = list(packed_key_value_indexes.split(key_values_lens.tolist(), dim=0))
-    for idx, indexes in enumerate(unpacked):
-        unpacked[idx] = indexes + idx
-    return torch.cat(unpacked, dim=0)
-
-
 def _prepare_ce_mse_batch(
     token_ids: torch.Tensor,
     *,
@@ -762,57 +827,51 @@ def _first_flow_timestep(num_timesteps: int, timestep_shift: float, device: torc
     }
 
 
-def _cfg_active(inputs: Mapping[str, Any], timestep: torch.Tensor) -> bool:
-    if float(inputs.get("cfg_text_scale", 1.0)) <= 1.0 and float(inputs.get("cfg_img_scale", 1.0)) <= 1.0:
-        return False
-    cfg_interval = inputs.get("cfg_interval", [0.0, 1.0])
-    start, end = float(cfg_interval[0]), float(cfg_interval[1])
-    t_value = float(timestep.detach().reshape(-1)[0].item())
-    return t_value > start and t_value <= end
-
-
-def _combine_cfg_velocity(
-    base_velocity: torch.Tensor,
-    cfg_text_velocity: torch.Tensor | None,
-    cfg_img_velocity: torch.Tensor | None,
+def _capture_official_generate_text(
+    model: Any,
+    start_input: Mapping[str, torch.Tensor],
     *,
-    cfg_text_scale: float,
-    cfg_img_scale: float,
-    cfg_renorm_min: float,
-    cfg_renorm_type: str,
-) -> torch.Tensor:
-    if cfg_text_scale <= 1.0:
-        return base_velocity
-    if cfg_text_velocity is None:
-        raise ValueError("cfg_text_velocity is required when cfg_text_scale > 1.0.")
-    if cfg_img_scale > 1.0 and cfg_img_velocity is None:
-        raise ValueError("cfg_img_velocity is required when cfg_img_scale > 1.0.")
+    past_key_values: Any,
+    new_token_ids: Mapping[str, int],
+    inputs: Mapping[str, Any],
+    device: torch.device | None = None,
+    dtype: torch.dtype | None = None,
+) -> dict[str, torch.Tensor]:
+    original_forward_inference = model.language_model.forward_inference
+    capture: dict[str, torch.Tensor] = {}
 
-    if cfg_renorm_type == "text_channel":
-        text_guided = cfg_text_velocity + cfg_text_scale * (base_velocity - cfg_text_velocity)
-        norm_base = torch.norm(base_velocity, dim=-1, keepdim=True)
-        norm_text_guided = torch.norm(text_guided, dim=-1, keepdim=True)
-        scale = (norm_base / (norm_text_guided + 1e-8)).clamp(min=cfg_renorm_min, max=1.0)
-        text_guided = text_guided * scale
-        if cfg_img_scale > 1.0:
-            return cfg_img_velocity + cfg_img_scale * (text_guided - cfg_img_velocity)
-        return text_guided
+    def wrapped_forward_inference(**forward_kwargs: Any) -> Any:
+        output = original_forward_inference(**forward_kwargs)
+        logits = model.language_model.lm_head(output.packed_query_sequence)
+        capture.update(
+            {
+                "hidden_state": output.packed_query_sequence.detach(),
+                "logits": logits.detach(),
+                "greedy_token": torch.argmax(logits, dim=-1).detach(),
+                "packed_query_indexes": forward_kwargs["packed_query_indexes"].detach(),
+                "packed_key_value_indexes": forward_kwargs["packed_key_value_indexes"].detach(),
+                "query_lens": forward_kwargs["query_lens"].detach(),
+            }
+        )
+        return output
 
-    text_guided = cfg_text_velocity + cfg_text_scale * (base_velocity - cfg_text_velocity)
-    if cfg_img_scale > 1.0:
-        guided = cfg_img_velocity + cfg_img_scale * (text_guided - cfg_img_velocity)
-    else:
-        guided = text_guided
-    if cfg_renorm_type == "global":
-        norm_base = torch.norm(base_velocity)
-        norm_guided = torch.norm(guided)
-    elif cfg_renorm_type == "channel":
-        norm_base = torch.norm(base_velocity, dim=-1, keepdim=True)
-        norm_guided = torch.norm(guided, dim=-1, keepdim=True)
-    else:
-        raise NotImplementedError(f"{cfg_renorm_type} is not supported")
-    scale = (norm_base / (norm_guided + 1e-8)).clamp(min=cfg_renorm_min, max=1.0)
-    return guided * scale
+    model.language_model.forward_inference = wrapped_forward_inference
+    context = nullcontext() if device is None or dtype is None else autocast_for_dtype(device, dtype)
+    try:
+        with context:
+            model.generate_text(
+                past_key_values=past_key_values,
+                max_length=1,
+                do_sample=bool(inputs.get("do_sample", False)),
+                temperature=float(inputs.get("temperature", inputs.get("text_temperature", 1.0))),
+                end_token_id=new_token_ids["eos_token_id"],
+                **start_input,
+            )
+    finally:
+        model.language_model.forward_inference = original_forward_inference
+    if not capture:
+        raise RuntimeError("Official BAGEL text generation produced no captured step.")
+    return capture
 
 
 def _run_reference_image_flow_step(
@@ -826,6 +885,8 @@ def _run_reference_image_flow_step(
     past_key_values: Any,
     device: torch.device,
     dtype: torch.dtype,
+    cfg_text_context: Mapping[str, Any] | None = None,
+    cfg_img_context: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     cfg_text_scale = float(inputs.get("cfg_text_scale", 1.0))
     cfg_img_scale = float(inputs.get("cfg_img_scale", 1.0))
@@ -845,312 +906,274 @@ def _run_reference_image_flow_step(
         float(inputs.get("timestep_shift", 3.0)),
         device,
     )
-    x_t0 = latent_input["packed_init_noises"]
-    cfg_text_input = None
-    cfg_text_past_key_values = None
-    if cfg_text_scale > 1.0:
-        cfg_text_past_key_values = NaiveCache(model.config.llm_config.num_hidden_layers)
-        cfg_text_input = model.prepare_vae_latent_cfg(curr_kvlens=[0], curr_rope=[0], image_sizes=[image_size])
-        cfg_text_input = to_device(cfg_text_input, device)
-    cfg_img_input = None
-    cfg_img_past_key_values = None
-    if cfg_img_scale > 1.0:
-        cfg_img_past_key_values = past_key_values
-        cfg_img_input = model.prepare_vae_latent_cfg(
-            curr_kvlens=curr_kvlens,
-            curr_rope=curr_rope,
-            image_sizes=[image_size],
-        )
-        cfg_img_input = to_device(cfg_img_input, device)
-    with autocast_for_dtype(device, dtype):
-        flow_output = _forward_flow_base(
-            model,
-            x_t=x_t0,
-            timestep=timestep_fields["timestep"],
-            latent_input=latent_input,
-            past_key_values=past_key_values,
-        )
-        cfg_text_flow_output = (
-            _forward_flow_base(
-                model,
-                x_t=x_t0,
-                timestep=timestep_fields["timestep"],
-                latent_input=latent_input,
-                past_key_values=cfg_text_past_key_values,
-                packed_position_ids=cfg_text_input["cfg_packed_position_ids"] if cfg_text_input is not None else None,
-                packed_indexes=cfg_text_input["cfg_packed_query_indexes"] if cfg_text_input is not None else None,
-                key_values_lens=cfg_text_input["cfg_key_values_lens"] if cfg_text_input is not None else None,
-                packed_key_value_indexes=(
-                    cfg_text_input["cfg_packed_key_value_indexes"] if cfg_text_input is not None else None
-                ),
-            )
-            if cfg_text_scale > 1.0 and _cfg_active(inputs, timestep_fields["timestep"])
-            else None
-        )
-        cfg_img_flow_output = (
-            _forward_flow_base(
-                model,
-                x_t=x_t0,
-                timestep=timestep_fields["timestep"],
-                latent_input=latent_input,
-                past_key_values=cfg_img_past_key_values,
-                packed_position_ids=cfg_img_input["cfg_packed_position_ids"] if cfg_img_input is not None else None,
-                packed_indexes=cfg_img_input["cfg_packed_query_indexes"] if cfg_img_input is not None else None,
-                key_values_lens=cfg_img_input["cfg_key_values_lens"] if cfg_img_input is not None else None,
-                packed_key_value_indexes=(
-                    cfg_img_input["cfg_packed_key_value_indexes"] if cfg_img_input is not None else None
-                ),
-            )
-            if cfg_img_scale > 1.0 and _cfg_active(inputs, timestep_fields["timestep"])
-            else None
-        )
-    base_velocity = flow_output["velocity"]
-    cfg_text_velocity = None if cfg_text_flow_output is None else cfg_text_flow_output["velocity"]
-    cfg_img_velocity = None if cfg_img_flow_output is None else cfg_img_flow_output["velocity"]
-    velocity = _combine_cfg_velocity(
-        base_velocity,
-        cfg_text_velocity,
-        cfg_img_velocity,
+    cfg_text_input, cfg_text_past_key_values = _prepare_cfg_latent_input(
+        model,
+        cfg_text_context,
+        image_size=image_size,
+        device=device,
+        default_kvlens=[0],
+        default_ropes=[0],
+        default_past_key_values=NaiveCache(model.config.llm_config.num_hidden_layers),
+    )
+    cfg_img_input, cfg_img_past_key_values = _prepare_cfg_latent_input(
+        model,
+        cfg_img_context,
+        image_size=image_size,
+        device=device,
+        default_kvlens=curr_kvlens,
+        default_ropes=curr_rope,
+        default_past_key_values=past_key_values,
+    )
+    captures = _capture_official_generate_image(
+        model,
+        latent_input,
+        past_key_values=past_key_values,
+        cfg_text_input=cfg_text_input,
+        cfg_text_past_key_values=cfg_text_past_key_values,
+        cfg_img_input=cfg_img_input,
+        cfg_img_past_key_values=cfg_img_past_key_values,
+        num_timesteps=int(inputs.get("num_timesteps", 50)),
+        timestep_shift=float(inputs.get("timestep_shift", 3.0)),
+        cfg_interval=inputs.get("cfg_interval", [0.0, 1.0]),
         cfg_text_scale=cfg_text_scale,
         cfg_img_scale=cfg_img_scale,
         cfg_renorm_min=float(inputs.get("cfg_renorm_min", 0.0)),
         cfg_renorm_type=str(inputs.get("cfg_renorm_type", "global")),
+        enable_taylorseer=bool(inputs.get("enable_taylorseer", False)),
+        max_flow_steps=int(inputs.get("max_flow_steps", 1)),
+        timestep_fields=timestep_fields,
+        device=device,
+        dtype=dtype,
     )
-    x_t_final = x_t0 - velocity.to(x_t0.device) * timestep_fields["dt"][0]
-    # Accumulate per-step velocity / x_t so a multi-step trajectory can be compared
-    # step-by-step against the V2 observe sink (which records one record per FSM
-    # ``image_flow`` step). Each entry mirrors V2's ``bagel_last_velocity`` (the
-    # CFG-combined velocity used for the Euler step) and ``bagel_last_x_t`` (the
-    # latent after that Euler update), in the same order.
-    step_velocities = [velocity]
-    step_x_ts = [x_t_final]
-    max_flow_steps = min(int(inputs.get("max_flow_steps", 1)), int(timestep_fields["dts"].numel()))
-    for step_index in range(1, max_flow_steps):
-        timestep = timestep_fields["timesteps"][step_index : step_index + 1]
-        with autocast_for_dtype(device, dtype):
-            flow_output = _forward_flow_base(
-                model,
-                x_t=x_t_final,
-                timestep=timestep,
-                latent_input=latent_input,
-                past_key_values=past_key_values,
-            )
-            cfg_text_flow_output = (
-                _forward_flow_base(
-                    model,
-                    x_t=x_t_final,
-                    timestep=timestep,
-                    latent_input=latent_input,
-                    past_key_values=cfg_text_past_key_values,
-                    packed_position_ids=cfg_text_input["cfg_packed_position_ids"]
-                    if cfg_text_input is not None
-                    else None,
-                    packed_indexes=cfg_text_input["cfg_packed_query_indexes"] if cfg_text_input is not None else None,
-                    key_values_lens=cfg_text_input["cfg_key_values_lens"] if cfg_text_input is not None else None,
-                    packed_key_value_indexes=(
-                        cfg_text_input["cfg_packed_key_value_indexes"] if cfg_text_input is not None else None
-                    ),
-                )
-                if cfg_text_scale > 1.0 and _cfg_active(inputs, timestep)
-                else None
-            )
-            cfg_img_flow_output = (
-                _forward_flow_base(
-                    model,
-                    x_t=x_t_final,
-                    timestep=timestep,
-                    latent_input=latent_input,
-                    past_key_values=cfg_img_past_key_values,
-                    packed_position_ids=cfg_img_input["cfg_packed_position_ids"]
-                    if cfg_img_input is not None
-                    else None,
-                    packed_indexes=cfg_img_input["cfg_packed_query_indexes"] if cfg_img_input is not None else None,
-                    key_values_lens=cfg_img_input["cfg_key_values_lens"] if cfg_img_input is not None else None,
-                    packed_key_value_indexes=(
-                        cfg_img_input["cfg_packed_key_value_indexes"] if cfg_img_input is not None else None
-                    ),
-                )
-                if cfg_img_scale > 1.0 and _cfg_active(inputs, timestep)
-                else None
-            )
-        base_velocity = flow_output["velocity"]
-        cfg_text_velocity = None if cfg_text_flow_output is None else cfg_text_flow_output["velocity"]
-        cfg_img_velocity = None if cfg_img_flow_output is None else cfg_img_flow_output["velocity"]
-        velocity = _combine_cfg_velocity(
-            base_velocity,
-            cfg_text_velocity,
-            cfg_img_velocity,
-            cfg_text_scale=cfg_text_scale,
-            cfg_img_scale=cfg_img_scale,
-            cfg_renorm_min=float(inputs.get("cfg_renorm_min", 0.0)),
-            cfg_renorm_type=str(inputs.get("cfg_renorm_type", "global")),
-        )
-        x_t_final = x_t_final - velocity.to(x_t_final.device) * timestep_fields["dts"][step_index]
-        step_velocities.append(velocity)
-        step_x_ts.append(x_t_final)
+    if not captures:
+        raise RuntimeError("Official BAGEL image generation produced no captured flow steps.")
+    first_capture = captures[0]
+    last_capture = captures[-1]
     return {
         "latent_input": latent_input,
         "timesteps": timestep_fields,
-        "base_velocity": base_velocity,
-        "cfg_text_velocity": cfg_text_velocity,
-        "cfg_img_velocity": cfg_img_velocity,
-        "velocity": velocity,
-        "x_t": x_t_final,
-        "velocity_steps": step_velocities,
-        "x_t_steps": step_x_ts,
-        "latent_embeds_sample": _sample_tensor(flow_output["latent_embeds"]),
-        "packed_sequence_sample": _sample_tensor(flow_output["packed_sequence"]),
-        "hidden_state_sample": _sample_tensor(flow_output["hidden_state"]),
+        "base_velocity": first_capture["base_velocity"],
+        "cfg_text_velocity": first_capture["cfg_text_velocity"],
+        "cfg_img_velocity": first_capture["cfg_img_velocity"],
+        "velocity": last_capture["velocity"],
+        "x_t": last_capture["x_t"],
+        "velocity_steps": [capture["velocity"] for capture in captures],
+        "x_t_steps": [capture["x_t"] for capture in captures],
+        "latent_embeds_sample": _sample_tensor(first_capture["latent_embeds"]),
+        "packed_sequence_sample": _sample_tensor(first_capture["packed_sequence"]),
+        "hidden_state_sample": _sample_tensor(first_capture["hidden_state"]),
         "cfg_text_hidden_state_sample": None
-        if cfg_text_flow_output is None
-        else _sample_tensor(cfg_text_flow_output["hidden_state"]),
+        if first_capture["cfg_text_hidden_state"] is None
+        else _sample_tensor(first_capture["cfg_text_hidden_state"]),
         "cfg_img_hidden_state_sample": None
-        if cfg_img_flow_output is None
-        else _sample_tensor(cfg_img_flow_output["hidden_state"]),
+        if first_capture["cfg_img_hidden_state"] is None
+        else _sample_tensor(first_capture["cfg_img_hidden_state"]),
     }
 
 
-def _forward_flow_base(
+def _prepare_cfg_latent_input(
     model: Any,
+    context: Mapping[str, Any] | None,
     *,
-    x_t: torch.Tensor,
-    timestep: torch.Tensor,
+    image_size: tuple[int, int],
+    device: torch.device,
+    default_kvlens: list[int],
+    default_ropes: list[int],
+    default_past_key_values: Any,
+) -> tuple[dict[str, torch.Tensor], Any]:
+    if context is None:
+        curr_kvlens = default_kvlens
+        curr_rope = default_ropes
+        past_key_values = default_past_key_values
+    else:
+        curr_kvlens = context["kv_lens"]
+        curr_rope = context["ropes"]
+        past_key_values = context["past_key_values"]
+    cfg_input = model.prepare_vae_latent_cfg(
+        curr_kvlens=curr_kvlens,
+        curr_rope=curr_rope,
+        image_sizes=[image_size],
+    )
+    return to_device(cfg_input, device), past_key_values
+
+
+class _StopFlowCapture(Exception):
+    pass
+
+
+def _capture_official_generate_image(
+    model: Any,
     latent_input: Mapping[str, torch.Tensor],
+    *,
     past_key_values: Any,
-    packed_position_ids: torch.Tensor | None = None,
-    packed_indexes: torch.Tensor | None = None,
-    key_values_lens: torch.Tensor | None = None,
-    packed_key_value_indexes: torch.Tensor | None = None,
-) -> dict[str, torch.Tensor]:
-    packed_text_ids = latent_input["packed_text_ids"]
-    packed_text_indexes = latent_input["packed_text_indexes"]
-    packed_vae_token_indexes = latent_input["packed_vae_token_indexes"]
-    packed_vae_position_ids = latent_input["packed_vae_position_ids"]
-    packed_seqlens = latent_input["packed_seqlens"]
+    cfg_text_input: Mapping[str, torch.Tensor],
+    cfg_text_past_key_values: Any,
+    cfg_img_input: Mapping[str, torch.Tensor],
+    cfg_img_past_key_values: Any,
+    num_timesteps: int,
+    timestep_shift: float,
+    cfg_interval: Any,
+    cfg_text_scale: float,
+    cfg_img_scale: float,
+    cfg_renorm_min: float,
+    cfg_renorm_type: str,
+    enable_taylorseer: bool,
+    max_flow_steps: int,
+    timestep_fields: Mapping[str, torch.Tensor],
+    device: torch.device,
+    dtype: torch.dtype,
+) -> list[dict[str, Any]]:
+    captures: list[dict[str, Any]] = []
+    max_capture_steps = min(max_flow_steps, int(timestep_fields["dts"].numel()))
+    original_forward_flow = model._forward_flow
 
-    packed_text_embedding = model.language_model.model.embed_tokens(packed_text_ids)
-    packed_sequence = packed_text_embedding.new_zeros((int(packed_seqlens.sum().item()), model.hidden_size))
-    packed_sequence[packed_text_indexes] = packed_text_embedding
+    def wrapped_forward_flow(**flow_kwargs: Any) -> torch.Tensor:
+        if len(captures) >= max_capture_steps:
+            raise _StopFlowCapture
+        step_index = len(captures)
+        original_forward_inference = model.language_model.forward_inference
+        call_records: list[dict[str, torch.Tensor]] = []
+        packed_vae_token_indexes = flow_kwargs["packed_vae_token_indexes"]
 
-    packed_timestep = torch.full((x_t.shape[0],), float(timestep.item()), device=x_t.device, dtype=x_t.dtype)
-    latent_embeds = (
-        model.vae2llm(x_t) + model.time_embedder(packed_timestep) + model.latent_pos_embed(packed_vae_position_ids)
-    )
-    if latent_embeds.dtype != packed_sequence.dtype:
-        latent_embeds = latent_embeds.to(packed_sequence.dtype)
-    packed_sequence[packed_vae_token_indexes] = latent_embeds
+        def wrapped_forward_inference(**forward_kwargs: Any) -> Any:
+            output = original_forward_inference(**forward_kwargs)
+            hidden_state = output.packed_query_sequence.detach()
+            call_records.append(
+                {
+                    "packed_sequence": forward_kwargs["packed_query_sequence"].detach(),
+                    "hidden_state": hidden_state,
+                    "velocity": model.llm2vae(hidden_state)[packed_vae_token_indexes].detach(),
+                }
+            )
+            return output
 
-    extra_inputs = {}
-    if model.use_moe:
-        extra_inputs = {
-            "mode": "gen",
-            "packed_vae_token_indexes": packed_vae_token_indexes,
-            "packed_text_indexes": packed_text_indexes,
-        }
-    output = model.language_model.forward_inference(
-        packed_query_sequence=packed_sequence,
-        query_lens=packed_seqlens,
-        packed_query_position_ids=packed_position_ids
-        if packed_position_ids is not None
-        else latent_input["packed_position_ids"],
-        packed_query_indexes=packed_indexes if packed_indexes is not None else latent_input["packed_indexes"],
-        past_key_values=past_key_values,
-        key_values_lens=key_values_lens if key_values_lens is not None else latent_input["key_values_lens"],
-        packed_key_value_indexes=(
-            packed_key_value_indexes
-            if packed_key_value_indexes is not None
-            else latent_input["packed_key_value_indexes"]
-        ),
-        update_past_key_values=False,
-        is_causal=False,
-        **extra_inputs,
-    )
-    velocity = model.llm2vae(output.packed_query_sequence)[packed_vae_token_indexes]
-    return {
-        "packed_sequence": packed_sequence.detach(),
-        "latent_embeds": latent_embeds.detach(),
-        "hidden_state": output.packed_query_sequence.detach(),
-        "velocity": velocity.detach(),
-    }
+        model.language_model.forward_inference = wrapped_forward_inference
+        try:
+            velocity = original_forward_flow(**flow_kwargs)
+        finally:
+            model.language_model.forward_inference = original_forward_inference
+
+        base_record = call_records[0]
+        cfg_text_record = call_records[1] if flow_kwargs.get("cfg_text_scale", 1.0) > 1.0 else None
+        cfg_img_offset = 2 if cfg_text_record is not None else 1
+        cfg_img_record = call_records[cfg_img_offset] if flow_kwargs.get("cfg_img_scale", 1.0) > 1.0 else None
+        x_t = flow_kwargs["x_t"]
+        comparable_velocity = velocity.to(dtype=base_record["velocity"].dtype)
+        x_t_after = x_t - comparable_velocity.to(x_t.device) * timestep_fields["dts"][step_index]
+        captures.append(
+            {
+                "base_velocity": base_record["velocity"],
+                "cfg_text_velocity": None if cfg_text_record is None else cfg_text_record["velocity"],
+                "cfg_img_velocity": None if cfg_img_record is None else cfg_img_record["velocity"],
+                "velocity": comparable_velocity.detach(),
+                "x_t": x_t_after.detach(),
+                "latent_embeds": base_record["packed_sequence"][packed_vae_token_indexes].detach(),
+                "packed_sequence": base_record["packed_sequence"],
+                "hidden_state": base_record["hidden_state"],
+                "cfg_text_hidden_state": None if cfg_text_record is None else cfg_text_record["hidden_state"],
+                "cfg_img_hidden_state": None if cfg_img_record is None else cfg_img_record["hidden_state"],
+            }
+        )
+        return velocity
+
+    model._forward_flow = wrapped_forward_flow
+    try:
+        with autocast_for_dtype(device, dtype):
+            model.generate_image(
+                past_key_values=past_key_values,
+                num_timesteps=num_timesteps,
+                timestep_shift=timestep_shift,
+                cfg_interval=cfg_interval,
+                cfg_renorm_min=cfg_renorm_min,
+                cfg_renorm_type=cfg_renorm_type,
+                cfg_text_scale=cfg_text_scale,
+                cfg_img_scale=cfg_img_scale,
+                **latent_input,
+                cfg_text_packed_position_ids=cfg_text_input["cfg_packed_position_ids"],
+                cfg_text_packed_query_indexes=cfg_text_input["cfg_packed_query_indexes"],
+                cfg_text_key_values_lens=cfg_text_input["cfg_key_values_lens"],
+                cfg_text_packed_key_value_indexes=cfg_text_input["cfg_packed_key_value_indexes"],
+                cfg_text_past_key_values=cfg_text_past_key_values,
+                cfg_img_packed_position_ids=cfg_img_input["cfg_packed_position_ids"],
+                cfg_img_packed_query_indexes=cfg_img_input["cfg_packed_query_indexes"],
+                cfg_img_key_values_lens=cfg_img_input["cfg_key_values_lens"],
+                cfg_img_packed_key_value_indexes=cfg_img_input["cfg_packed_key_value_indexes"],
+                cfg_img_past_key_values=cfg_img_past_key_values,
+                enable_taylorseer=enable_taylorseer,
+            )
+    except _StopFlowCapture:
+        pass
+    finally:
+        model._forward_flow = original_forward_flow
+        if enable_taylorseer:
+            model.language_model.model.enable_taylorseer = False
+    return captures
 
 
-def _forward_vae_context(
+def _capture_official_cache_update_vae(
     model: Any,
     vae_model: nn.Module,
     *,
     past_key_values: Any,
     vae_input: Mapping[str, Any],
 ) -> dict[str, Any]:
-    packed_text_ids = vae_input["packed_text_ids"]
-    packed_text_indexes = vae_input["packed_text_indexes"]
     packed_vae_token_indexes = vae_input["packed_vae_token_indexes"]
-    packed_seqlens = vae_input["packed_seqlens"]
+    original_forward_inference = model.language_model.forward_inference
+    capture: dict[str, Any] = {}
 
-    packed_text_embedding = model.language_model.model.embed_tokens(packed_text_ids)
-    packed_sequence = packed_text_embedding.new_zeros((int(packed_seqlens.sum().item()), model.hidden_size))
-    packed_sequence[packed_text_indexes] = packed_text_embedding
+    def capture_vae2llm_input(_module: nn.Module, args: tuple[torch.Tensor, ...]) -> None:
+        capture["packed_latents"] = args[0].detach()
 
-    padded_latent = vae_model.encode(vae_input["padded_images"])
-    packed_latents = []
-    patch_size = model.latent_patch_size
-    for latent, (height, width) in zip(padded_latent, vae_input["patchified_vae_latent_shapes"]):
-        latent = latent[:, : height * patch_size, : width * patch_size].reshape(
-            model.latent_channel,
-            height,
-            patch_size,
-            width,
-            patch_size,
-        )
-        packed_latents.append(
-            torch.einsum("chpwq->hwpqc", latent).reshape(-1, patch_size * patch_size * model.latent_channel)
-        )
-    packed_latent = torch.cat(packed_latents, dim=0)
+    def wrapped_forward_inference(**forward_kwargs: Any) -> Any:
+        output = original_forward_inference(**forward_kwargs)
+        packed_sequence = forward_kwargs["packed_query_sequence"].detach()
+        capture["packed_sequence"] = packed_sequence
+        capture["latent_embeds"] = packed_sequence[packed_vae_token_indexes].detach()
+        return output
 
-    latent_embeds = (
-        model.vae2llm(packed_latent)
-        + model.time_embedder(vae_input["packed_timesteps"])
-        + model.latent_pos_embed(vae_input["packed_vae_position_ids"])
-    )
-    if latent_embeds.dtype != packed_sequence.dtype:
-        latent_embeds = latent_embeds.to(packed_sequence.dtype)
-    packed_sequence[packed_vae_token_indexes] = latent_embeds
-
-    output = model.language_model.forward_inference(
-        packed_query_sequence=packed_sequence,
-        query_lens=packed_seqlens,
-        packed_query_position_ids=vae_input["packed_position_ids"],
-        packed_query_indexes=vae_input["packed_indexes"],
-        past_key_values=past_key_values,
-        key_values_lens=vae_input["key_values_lens"],
-        packed_key_value_indexes=vae_input["packed_key_value_indexes"],
-        update_past_key_values=True,
-        is_causal=False,
-        mode="gen",
-        packed_vae_token_indexes=packed_vae_token_indexes,
-        packed_text_indexes=packed_text_indexes,
-    )
+    hook = model.vae2llm.register_forward_pre_hook(capture_vae2llm_input)
+    model.language_model.forward_inference = wrapped_forward_inference
+    try:
+        past_key_values = model.forward_cache_update_vae(vae_model, past_key_values, **vae_input)
+    finally:
+        hook.remove()
+        model.language_model.forward_inference = original_forward_inference
+    if "packed_latents" not in capture or "packed_sequence" not in capture:
+        raise RuntimeError("Official BAGEL VAE context update produced no captured tensors.")
     return {
-        "past_key_values": output.past_key_values,
-        "packed_latents": packed_latent.detach(),
-        "latent_embeds": latent_embeds.detach(),
-        "latent_embeds_sample": _sample_tensor(latent_embeds),
-        "packed_sequence": packed_sequence.detach(),
-        "packed_sequence_sample": _sample_tensor(packed_sequence),
+        "past_key_values": past_key_values,
+        "packed_latents": capture["packed_latents"],
+        "latent_embeds": capture["latent_embeds"],
+        "latent_embeds_sample": _sample_tensor(capture["latent_embeds"]),
+        "packed_sequence": capture["packed_sequence"],
+        "packed_sequence_sample": _sample_tensor(capture["packed_sequence"]),
     }
 
 
-def _official_image_embeds(model: Any, image_input: Mapping[str, torch.Tensor]) -> torch.Tensor:
-    vit_token_seqlens = image_input["vit_token_seqlens"].detach().to(dtype=torch.int32)
-    cu_seqlens = torch.nn.functional.pad(torch.cumsum(vit_token_seqlens, dim=0), (1, 0)).to(torch.int32)
-    max_seqlen = int(torch.max(vit_token_seqlens).item())
-    image_embeds = model.vit_model(
-        packed_pixel_values=image_input["packed_vit_tokens"],
-        packed_flattened_position_ids=image_input["packed_vit_position_ids"],
-        cu_seqlens=cu_seqlens,
-        max_seqlen=max_seqlen,
-    )
-    image_embeds = model.connector(image_embeds)
-    return image_embeds + model.vit_pos_embed(image_input["packed_vit_position_ids"])
+def _capture_official_cache_update_vit(
+    model: Any,
+    *,
+    past_key_values: Any,
+    vit_input: Mapping[str, torch.Tensor],
+) -> dict[str, Any]:
+    original_forward_inference = model.language_model.forward_inference
+    packed_vit_token_indexes = vit_input["packed_vit_token_indexes"]
+    capture: dict[str, torch.Tensor] = {}
+
+    def wrapped_forward_inference(**forward_kwargs: Any) -> Any:
+        output = original_forward_inference(**forward_kwargs)
+        packed_sequence = forward_kwargs["packed_query_sequence"].detach()
+        capture["image_embeds"] = packed_sequence[packed_vit_token_indexes].detach()
+        return output
+
+    model.language_model.forward_inference = wrapped_forward_inference
+    try:
+        past_key_values = model.forward_cache_update_vit(past_key_values, **vit_input)
+    finally:
+        model.language_model.forward_inference = original_forward_inference
+    if "image_embeds" not in capture:
+        raise RuntimeError("Official BAGEL ViT context update produced no captured image embeddings.")
+    return {"past_key_values": past_key_values, "image_embeds": capture["image_embeds"]}
 
 
 def _sample_tensor(value: torch.Tensor) -> torch.Tensor:
