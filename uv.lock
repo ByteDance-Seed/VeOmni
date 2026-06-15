@@ -751,8 +751,8 @@ requires-dist = [
 
 [[package]]
 name = "flash-attn-4"
-version = "4.0.0b5.dev70+g9397816"
-source = { git = "https://github.com/Dao-AILab/flash-attention?subdirectory=flash_attn%2Fcute&rev=9397816f6094f5ba0de52c221093637054590d0d#9397816f6094f5ba0de52c221093637054590d0d" }
+version = "4.0.0b16"
+source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "apache-tvm-ffi" },
     { name = "einops" },
@@ -760,6 +760,10 @@ dependencies = [
     { name = "quack-kernels" },
     { name = "torch-c-dlpack-ext" },
     { name = "typing-extensions" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/1b/81/3f32c9f5eb427605d8dd9949f332f457b89f1d1404a72dc69995b8f481ba/flash_attn_4-4.0.0b16.tar.gz", hash = "sha256:84af5e19acf2875cafb77dcd02a582e2f70b603d1749118f4a8d65822b45a544", size = 317408, upload-time = "2026-06-03T09:45:42.209Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/bb/47/3c44b8342d14d7d8e386b4c4363c283aaa2858c6aeb9ecf6f040307d627c/flash_attn_4-4.0.0b16-py3-none-any.whl", hash = "sha256:857bd84cd5884d41b7096826b31c16c281ddde269760bbd5dfafe19a4639b250", size = 340034, upload-time = "2026-06-03T09:45:40.893Z" },
 ]
 
 [[package]]
@@ -3598,7 +3602,7 @@ requires-dist = [
     { name = "flash-attn", marker = "(python_full_version < '3.11' and extra == 'gpu') or (python_full_version >= '3.13' and extra == 'gpu')" },
     { name = "flash-attn", marker = "python_full_version == '3.12.*' and extra == 'gpu'", url = "https://github.com/Luosuu/flash-attention3-wheels/releases/download/v0.0.5/flash_attn-2.8.4+20260610.cu130torch2110cxx11abitrue.fb02fc.sm80sm89sm90sm100-cp312-cp312-linux_x86_64.whl" },
     { name = "flash-attn-3", marker = "extra == 'gpu'", url = "https://github.com/Luosuu/flash-attention3-wheels/releases/download/v0.0.5/flash_attn_3-3.0.0+20260610.cu130torch2110cxx11abitrue.fb02fc.sm90-cp310-abi3-linux_x86_64.whl" },
-    { name = "flash-attn-4", marker = "extra == 'gpu'", git = "https://github.com/Dao-AILab/flash-attention?subdirectory=flash_attn%2Fcute&rev=9397816f6094f5ba0de52c221093637054590d0d" },
+    { name = "flash-attn-4", marker = "extra == 'gpu'", specifier = "==4.0.0b16" },
     { name = "flash-linear-attention", marker = "extra == 'gpu'" },
     { name = "flash-qla", marker = "extra == 'gpu'", git = "https://github.com/QwenLM/FlashQLA?rev=6ef4858b5446e05bd461d9658d877e548182dbcb" },
     { name = "ftfy", marker = "extra == 'gpu'" },

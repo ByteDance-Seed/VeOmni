@@ -55,10 +55,12 @@ gpu = [
   "nvidia-cutlass-dsl>=4.4.2",
   "cuda-python==13.0.3",
   # See `[tool.uv.sources]` — FA2 (cp311/cp312) and FA3 (sm90 abi3) install
-  # from prebuilt wheels; FA4 + flash-qla source-build from git.
+  # from prebuilt wheels; flash-qla source-builds from git.
   "flash-attn",
   "flash-attn-3",
-  "flash-attn-4",
+  # 4.0.0b16 is available from PyPI; newer fa4-v4.0.0.beta17 is tag-only
+  # and not yet published as a package release.
+  "flash-attn-4==4.0.0b16",
   "flash-qla",
   "liger-kernel",
   "flash-linear-attention",
@@ -188,7 +190,7 @@ torchaudio = { index = "pytorch" }
 #   - FA3 cp310-abi3 sm90 (v0.0.5) — abi3 loads on cp310+. Non-Hopper users
 #     never import flash_attn_interface (lazy in
 #     veomni/ops/kernels/attention/__init__.py), so sm90-only is no-loss.
-# FA4 still source-built from Dao-AILab — no prebuilt wheel exists.
+# FA4 4.0.0b16 is resolved from PyPI.
 flash-attn = [
     { url = "https://github.com/Luosuu/flash-attention3-wheels/releases/download/v0.0.3/flash_attn-2.8.4+20260608.cu130torch2110cxx11abitrue.bc58ab.sm80sm89sm90sm100-cp311-cp311-linux_x86_64.whl", marker = "extra == 'gpu' and python_version == '3.11'" },
     { url = "https://github.com/Luosuu/flash-attention3-wheels/releases/download/v0.0.5/flash_attn-2.8.4+20260610.cu130torch2110cxx11abitrue.fb02fc.sm80sm89sm90sm100-cp312-cp312-linux_x86_64.whl", marker = "extra == 'gpu' and python_version == '3.12'" },
@@ -196,7 +198,6 @@ flash-attn = [
 flash-attn-3 = [
     { url = "https://github.com/Luosuu/flash-attention3-wheels/releases/download/v0.0.5/flash_attn_3-3.0.0+20260610.cu130torch2110cxx11abitrue.fb02fc.sm90-cp310-abi3-linux_x86_64.whl", marker = "extra == 'gpu'" },
 ]
-flash-attn-4 = { git = "https://github.com/Dao-AILab/flash-attention", subdirectory = "flash_attn/cute", rev = "9397816f6094f5ba0de52c221093637054590d0d" }
 # Strictly newer than v0.1.0 — picks up fixes for backward gradient count (#10),
 # auto_cp UnboundLocalError (#8), and l2norm dtype preservation (#13).
 flash-qla = { git = "https://github.com/QwenLM/FlashQLA", rev = "6ef4858b5446e05bd461d9658d877e548182dbcb" }
