@@ -52,3 +52,7 @@ tolerance:
 
 gate:
   requires_cuda: true
+
+launcher:
+  enable_parallel: true
+  max_cuda_devices: 8

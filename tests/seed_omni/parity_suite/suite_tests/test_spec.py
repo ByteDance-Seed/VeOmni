@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from tests.seed_omni.parity_suite.core import DEFAULT_GATE, GateSpec, RecipeSpec, RunSpec
+from tests.seed_omni.parity_suite.core import DEFAULT_GATE, GateSpec, LauncherSpec, RecipeSpec, RunSpec
 
 
 def test_run_spec_keeps_kind_specific_settings_under_options() -> None:
@@ -56,6 +56,15 @@ def test_gate_spec_merges_bool_overrides_and_device_floor() -> None:
     assert gate.requires_reference_checkpoint is True
     assert gate.requires_v2_model is False
     assert gate.min_cuda_devices == 2
+
+
+def test_launcher_spec_defaults_to_serial_and_optional_device_cap() -> None:
+    assert LauncherSpec.from_dict(None) == LauncherSpec()
+
+    launcher = LauncherSpec.from_dict({"enable_parallel": True, "max_cuda_devices": 8})
+
+    assert launcher.enable_parallel is True
+    assert launcher.max_cuda_devices == 8
 
 
 def test_recipe_spec_parses_default_graph_and_runs() -> None:

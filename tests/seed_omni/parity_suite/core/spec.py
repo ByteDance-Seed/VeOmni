@@ -184,6 +184,21 @@ def _coalesce(value: bool | None, fallback: bool | None) -> bool | None:
 
 
 @dataclass(frozen=True)
+class LauncherSpec:
+    enable_parallel: bool = False
+    max_cuda_devices: int | None = None
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> LauncherSpec:
+        values = dict(data or {})
+        max_cuda_devices = values.pop("max_cuda_devices", None)
+        return cls(
+            enable_parallel=bool(values.pop("enable_parallel", False)),
+            max_cuda_devices=None if max_cuda_devices is None else int(max_cuda_devices),
+        )
+
+
+@dataclass(frozen=True)
 class RunSpec:
     id: str
     tier: str
@@ -296,6 +311,7 @@ class ModelSpec:
     seed: int
     tolerance: dict[str, Any]
     gate: GateSpec
+    launcher: LauncherSpec
     recipes: tuple[RecipeSpec, ...]
     mapping: MappingSpec
 
@@ -318,6 +334,7 @@ def load_model_spec(model_dir: str | Path) -> ModelSpec:
         seed=int(base.get("seed", 1234)),
         tolerance=dict(base.get("tolerance", {}) or {}),
         gate=GateSpec.from_dict(base.get("gate")),
+        launcher=LauncherSpec.from_dict(base.get("launcher")),
         recipes=recipes,
         mapping=load_mapping_spec(root / "mapping.yaml"),
     )
