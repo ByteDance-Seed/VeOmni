@@ -189,10 +189,6 @@ def flash_attention_forward(
          monkey-patch of ``load_and_register_attn_kernel``, which loads
          ``flash_attn.cute`` locally instead of fetching from the hub.
 
-    4. **Packed varlen metadata** — callers that already know their packed input
-       layout can pass ``cu_seq_lens_q/k`` and ``max_length_q/k``. The wrapper
-       forwards them to Transformers' FA implementation so it takes the varlen
-       path without each model reimplementing the kernel call.
     """
     if kwargs.get("output_attentions", False) or kwargs.get("head_mask") is not None:
         logger.warning_once(
@@ -310,11 +306,6 @@ def flash_attention_forward(
     key = key.contiguous()
     value = value.contiguous()
 
-    cu_seq_lens_q = kwargs.pop("cu_seq_lens_q", None)
-    cu_seq_lens_k = kwargs.pop("cu_seq_lens_k", None)
-    max_length_q = kwargs.pop("max_length_q", None)
-    max_length_k = kwargs.pop("max_length_k", None)
-
     attn_output = _flash_attention_forward(
         query,
         key,
@@ -330,10 +321,6 @@ def flash_attention_forward(
         target_dtype=target_dtype,
         attn_implementation=fa_kernel_implementation,
         layer_idx=module.layer_idx if hasattr(module, "layer_idx") else None,
-        cu_seq_lens_q=cu_seq_lens_q,
-        cu_seq_lens_k=cu_seq_lens_k,
-        max_length_q=max_length_q,
-        max_length_k=max_length_k,
         **kwargs,
     )
 
