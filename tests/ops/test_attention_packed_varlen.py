@@ -4,6 +4,7 @@ import pytest
 import torch
 
 import veomni.ops.kernels.attention as attention
+from veomni.models.diffusers.wan_t2v.wan_transformer.modeling_wan_transformer import _get_wan_packed_varlen_kwargs
 
 
 def _attention_module():
@@ -14,7 +15,7 @@ def _attention_module():
     )
 
 
-def test_force_packed_varlen_supplies_single_sequence_metadata(monkeypatch):
+def test_flash_attention_forward_passes_explicit_varlen_metadata(monkeypatch):
     captured = {}
 
     def fake_flash_attention_forward(
@@ -54,7 +55,10 @@ def test_force_packed_varlen_supplies_single_sequence_metadata(monkeypatch):
         attention_mask=None,
         is_causal=False,
         skip_ulysses=True,
-        force_packed_varlen=True,
+        cu_seq_lens_q=torch.tensor([0, 5], dtype=torch.int32),
+        cu_seq_lens_k=torch.tensor([0, 7], dtype=torch.int32),
+        max_length_q=5,
+        max_length_k=7,
     )
 
     assert output.shape == (1, 5, 2, 4)
@@ -67,24 +71,33 @@ def test_force_packed_varlen_supplies_single_sequence_metadata(monkeypatch):
     assert captured["max_length_k"] == 7
 
 
-def test_force_packed_varlen_rejects_batched_dense_input(monkeypatch):
-    def fake_flash_attention_forward(*args, **kwargs):
-        raise AssertionError("dense flash attention should not be called for invalid packed input")
+def test_wan_packed_varlen_kwargs_rejects_batched_dense_input():
+    query = torch.randn(2, 5, 2, 4, dtype=torch.bfloat16)
+    key = torch.randn(2, 5, 2, 4, dtype=torch.bfloat16)
+    value = torch.randn(2, 5, 2, 4, dtype=torch.bfloat16)
 
-    monkeypatch.setattr(attention, "_flash_attention_forward", fake_flash_attention_forward)
+    with pytest.raises(ValueError, match="batch-size-1"):
+        _get_wan_packed_varlen_kwargs(query, key, value, None)
 
-    query = torch.randn(2, 2, 5, 4, dtype=torch.bfloat16)
-    key = torch.randn(2, 2, 5, 4, dtype=torch.bfloat16)
-    value = torch.randn(2, 2, 5, 4, dtype=torch.bfloat16)
 
-    with pytest.raises(ValueError, match="batch size 1"):
-        attention.flash_attention_forward(
-            _attention_module(),
-            query,
-            key,
-            value,
-            attention_mask=None,
-            is_causal=False,
-            skip_ulysses=True,
-            force_packed_varlen=True,
-        )
+def test_wan_packed_varlen_kwargs_rejects_dense_attention_mask():
+    query = torch.randn(1, 5, 2, 4, dtype=torch.bfloat16)
+    key = torch.randn(1, 5, 2, 4, dtype=torch.bfloat16)
+    value = torch.randn(1, 5, 2, 4, dtype=torch.bfloat16)
+    attention_mask = torch.ones(1, 1, 5, 5, dtype=torch.bool)
+
+    with pytest.raises(ValueError, match="does not accept a dense attention mask"):
+        _get_wan_packed_varlen_kwargs(query, key, value, attention_mask)
+
+
+def test_wan_packed_varlen_kwargs_supplies_single_sequence_metadata():
+    query = torch.randn(1, 5, 2, 4, dtype=torch.bfloat16)
+    key = torch.randn(1, 7, 2, 4, dtype=torch.bfloat16)
+    value = torch.randn(1, 7, 2, 4, dtype=torch.bfloat16)
+
+    kwargs = _get_wan_packed_varlen_kwargs(query, key, value, None)
+
+    torch.testing.assert_close(kwargs["cu_seq_lens_q"], torch.tensor([0, 5], dtype=torch.int32))
+    torch.testing.assert_close(kwargs["cu_seq_lens_k"], torch.tensor([0, 7], dtype=torch.int32))
+    assert kwargs["max_length_q"] == 5
+    assert kwargs["max_length_k"] == 7

@@ -159,7 +159,6 @@ def flash_attention_forward(
     sliding_window: Optional[int] = None,
     softcap: Optional[float] = None,
     skip_ulysses: bool = False,  # Skip ulysses for some ViT cases like internvl3.5
-    force_packed_varlen: bool = False,
     **kwargs,
 ) -> tuple[torch.Tensor, None]:
     """
@@ -190,11 +189,10 @@ def flash_attention_forward(
          monkey-patch of ``load_and_register_attn_kernel``, which loads
          ``flash_attn.cute`` locally instead of fetching from the hub.
 
-    4. **Packed varlen contract** — pass ``force_packed_varlen=True`` for
-       already-packed inputs that must use FlashAttention's varlen API even when
-       no padding mask is present. The wrapper asserts the packed shape contract
-       and supplies cu-seqlens to Transformers' FA forward instead of using the
-       dense kernel path.
+    4. **Packed varlen metadata** — callers that already know their packed input
+       layout can pass ``cu_seq_lens_q/k`` and ``max_length_q/k``. The wrapper
+       forwards them to Transformers' FA implementation so it takes the varlen
+       path without each model reimplementing the kernel call.
     """
     if kwargs.get("output_attentions", False) or kwargs.get("head_mask") is not None:
         logger.warning_once(
@@ -316,29 +314,6 @@ def flash_attention_forward(
     cu_seq_lens_k = kwargs.pop("cu_seq_lens_k", None)
     max_length_q = kwargs.pop("max_length_q", None)
     max_length_k = kwargs.pop("max_length_k", None)
-    if force_packed_varlen:
-        if attention_mask is not None:
-            raise ValueError("force_packed_varlen=True requires attention_mask=None.")
-        if query.ndim != 4 or key.ndim != 4 or value.ndim != 4:
-            raise ValueError(
-                "force_packed_varlen=True expects query/key/value to have shape (batch, seq, heads, head_dim)."
-            )
-        if query.shape[0] != 1 or key.shape[0] != 1 or value.shape[0] != 1:
-            raise ValueError(
-                "force_packed_varlen=True expects already-packed inputs with batch size 1; "
-                f"got query/key/value batch sizes {query.shape[0]}/{key.shape[0]}/{value.shape[0]}."
-            )
-        if any(item is not None for item in (cu_seq_lens_q, cu_seq_lens_k, max_length_q, max_length_k)):
-            if not all(item is not None for item in (cu_seq_lens_q, cu_seq_lens_k, max_length_q, max_length_k)):
-                raise ValueError(
-                    "force_packed_varlen=True requires either all or none of "
-                    "cu_seq_lens_q, cu_seq_lens_k, max_length_q, and max_length_k."
-                )
-        else:
-            cu_seq_lens_q = torch.tensor([0, query.shape[1]], device=query.device, dtype=torch.int32)
-            cu_seq_lens_k = torch.tensor([0, key.shape[1]], device=key.device, dtype=torch.int32)
-            max_length_q = query.shape[1]
-            max_length_k = key.shape[1]
 
     attn_output = _flash_attention_forward(
         query,
