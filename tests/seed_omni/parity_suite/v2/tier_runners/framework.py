@@ -27,11 +27,11 @@ from torch import nn
 from tests.seed_omni.parity_suite.core import (
     ParityReport,
     ProbeReport,
+    autocast_for_dtype,
     compare_values,
     tolerance_from_policy,
     zero_module_grads,
 )
-from tests.seed_omni.parity_suite.core.utilities import autocast_for_dtype
 from veomni.distributed import parallel_state as parallel_state_module
 from veomni.distributed.clip_grad_norm import veomni_clip_grad_norm
 from veomni.models.seed_omni.modeling_omni import OmniModel
@@ -78,7 +78,7 @@ def run_v2_train_framework(
     if run.kind == "forward_backward":
         return run_v2_train_framework_batch(
             driver,
-            driver.v2_train_batch_kwargs(reference_output, device=device),
+            driver.v2_request_kwargs(reference_output, device=device),
             whitelist,
             device=device,
             dtype=dtype,
@@ -177,8 +177,8 @@ def _run_train_step_policy(
     dtype: torch.dtype,
 ) -> ParityReport:
     options = _TrainerStepOptions.from_options(driver.case.run.options)
-    direct_batch = driver.v2_train_batch_kwargs(reference_output, device=device)
-    trainer_batch = driver.v2_train_batch_kwargs(reference_output, device=device)
+    direct_batch = driver.v2_request_kwargs(reference_output, device=device)
+    trainer_batch = driver.v2_request_kwargs(reference_output, device=device)
 
     # Compare the production trainer step against a direct optimizer step using
     # fresh models with identical seeds, batches, optimizer, and scheduler.
@@ -242,7 +242,7 @@ def _run_checkpoint_resume_policy(
         driver.configure_determinism(driver.case.model.seed)
         save_model = driver.load_v2_model(device=device, dtype=dtype).train()
         save_model.set_node_executors(build_trainer_node_executors(save_model))
-        save_batch = driver.v2_train_batch_kwargs(reference_output, device=device)
+        save_batch = driver.v2_request_kwargs(reference_output, device=device)
         save_trainer = build_minimal_omni_trainer(save_model, device=device, dtype=dtype)
         _attach_checkpoint_state(
             save_trainer,
@@ -262,7 +262,7 @@ def _run_checkpoint_resume_policy(
         driver.configure_determinism(driver.case.model.seed)
         resume_model = driver.load_v2_model(device=device, dtype=dtype).train()
         resume_model.set_node_executors(build_trainer_node_executors(resume_model))
-        resume_batch = driver.v2_train_batch_kwargs(reference_output, device=device)
+        resume_batch = driver.v2_request_kwargs(reference_output, device=device)
         resume_trainer = build_minimal_omni_trainer(resume_model, device=device, dtype=dtype)
         _attach_checkpoint_state(
             resume_trainer,
@@ -310,7 +310,7 @@ def _run_launcher_policy(
     config_path = Path(str(options.get("config_path", driver.case.model.v2_model.config_dir / "base.yaml")))
     output_dir = _policy_output_dir(driver, "launcher")
     output_dir.mkdir(parents=True, exist_ok=True)
-    batch = driver.v2_train_batch_kwargs(reference_output, device=device)
+    batch = driver.v2_request_kwargs(reference_output, device=device)
     report = _run_launcher_smoke(
         driver,
         batch,
@@ -385,7 +385,7 @@ def _run_distributed_train_policy(
         shutil.rmtree(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    batch_kwargs = driver.v2_train_batch_kwargs(reference_output, device=torch.device("cpu"))
+    batch_kwargs = driver.v2_request_kwargs(reference_output, device=torch.device("cpu"))
     baseline_report: Mapping[str, Any] | None = None
     if compare_direct:
         baseline_report = _run_v2_train_fsdp2(
@@ -959,7 +959,7 @@ def _run_optimizer_trajectory(
     parameters_after_step: list[Mapping[str, torch.Tensor]] = []
     for _step in range(steps):
         optimizer.zero_grad(set_to_none=True)
-        batch = driver.v2_train_batch_kwargs(reference_output, device=device)
+        batch = driver.v2_request_kwargs(reference_output, device=device)
         with torch.enable_grad(), autocast_for_dtype(device, dtype):
             outputs = model(**dict(batch))
             loss = outputs["loss"]

@@ -9,7 +9,7 @@ from typing import Any
 import torch
 from torch import nn
 
-from tests.seed_omni.parity_suite.core.utilities import autocast_for_dtype, sum_losses, zero_module_grads
+from tests.seed_omni.parity_suite.core import autocast_for_dtype, sum_losses, zero_module_grads
 from tests.seed_omni.parity_suite.v2.observation import arm_generation_observer, record_module_output
 from veomni.models.seed_omni.modeling_omni import OmniModel
 
@@ -41,7 +41,7 @@ def run_v2_infer_module(
     """Run a V2 inference graph through direct FSM module steps."""
 
     model = driver.load_v2_model(device=device, dtype=dtype)
-    request = driver.v2_infer_request(reference_output, device=device)
+    request = driver.v2_request_kwargs(reference_output, device=device)
     generation_kwargs = driver.generation_kwargs(model)
     return run_infer_module_fsm(
         model,
@@ -64,7 +64,7 @@ def run_v2_train_module(
 
     return run_v2_train_module_batch(
         driver,
-        driver.v2_train_batch_kwargs(reference_output, device=device),
+        driver.v2_request_kwargs(reference_output, device=device),
         whitelist,
         device=device,
         dtype=dtype,

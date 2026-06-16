@@ -8,13 +8,9 @@ from typing import Any
 import torch
 from torch import nn
 
+from tests.seed_omni.bagel import requests
 from tests.seed_omni.bagel.reference_model import run_reference_only_recipe
 from tests.seed_omni.bagel.transformers import BagelConfig
-from tests.seed_omni.bagel.v2_execution import (
-    build_infer_request_from_canonical,
-    build_train_graph_request_from_raw_fixture,
-    build_train_graph_request_from_stimulus,
-)
 from tests.seed_omni.parity_suite.core import ParityCase, ParityReport, sample_named_grad
 from tests.seed_omni.parity_suite.driver import ParityDriver
 from tests.seed_omni.parity_suite.v2.observation import record_module_output
@@ -28,6 +24,21 @@ def create_driver(case: ParityCase) -> BagelParityDriver:
 
 class BagelParityDriver(ParityDriver):
     """Own BAGEL-specific reference/V2 execution wiring."""
+
+    def build_text_und_request(self, ctx):
+        return requests.build_text_und_request(ctx)
+
+    def build_text_image_und_request(self, ctx):
+        return requests.build_text_image_und_request(ctx)
+
+    def build_image_gen_request(self, ctx):
+        return requests.build_image_gen_request(ctx)
+
+    def build_image_edit_request(self, ctx):
+        return requests.build_image_edit_request(ctx)
+
+    def build_train_request(self, ctx):
+        return requests.build_train_request(ctx)
 
     def reference_inputs(self) -> Mapping[str, Any]:
         inputs = dict(super().reference_inputs())
@@ -74,23 +85,6 @@ class BagelParityDriver(ParityDriver):
             run_kind=self.case.run.kind,
             case_id=self.case.node_id,
         )
-
-    def v2_infer_request(self, reference_output: Mapping[str, Any], *, device: torch.device) -> dict[str, Any]:
-        return build_infer_request_from_canonical(reference_output["canonical"], device=device)
-
-    def v2_train_batch_kwargs(
-        self, reference_output: Mapping[str, Any] | None, *, device: torch.device
-    ) -> dict[str, Any]:
-        if reference_output is None:
-            loss_mode = self._loss_mode()
-            if loss_mode is None:
-                raise ValueError(f"BAGEL training recipe {self.case.recipe.id!r} must declare a loss_mode.")
-            return build_train_graph_request_from_stimulus(
-                self.case.recipe.stimulus,
-                loss_mode=loss_mode,
-                device=device,
-            )
-        return build_train_graph_request_from_raw_fixture(reference_output["canonical"], device=device)
 
     def _loss_mode(self) -> str | None:
         loss_mode = self.case.recipe.reference.get("loss_mode")

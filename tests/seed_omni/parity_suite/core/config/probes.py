@@ -1,17 +1,13 @@
-"""Mapping schema and resolver for parity probes."""
+"""Probe catalog schema and resolver for parity probes."""
 
 from __future__ import annotations
 
-import importlib
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable
+from typing import TYPE_CHECKING, Any
 
 import yaml
-
-from tests.seed_omni.parity_suite.reference.capture import ExtractorTap, ReferenceCaptureContext, ReferenceCapturePlan
-from tests.seed_omni.parity_suite.reference.hooks import HookTap
 
 
 if TYPE_CHECKING:
@@ -76,15 +72,15 @@ class ProbeMapping:
     @classmethod
     def from_raw(cls, node: str, probe: str, raw: Mapping[str, Any]) -> ProbeMapping:
         if "v2_field" not in raw:
-            raise ValueError(f"Mapping {node}.{probe} must declare v2_field.")
+            raise ValueError(f"Probe {node}.{probe} must declare v2_field.")
         if "ref_tap" not in raw:
-            raise ValueError(f"Mapping {node}.{probe} must declare ref_tap.")
+            raise ValueError(f"Probe {node}.{probe} must declare ref_tap.")
         if "tol" not in raw:
-            raise ValueError(f"Mapping {node}.{probe} must declare tol.")
+            raise ValueError(f"Probe {node}.{probe} must declare tol.")
         step = str(raw.get("step", "last"))
         if step not in _STEP_POLICIES:
             raise ValueError(
-                f"Mapping {node}.{probe} has unsupported step policy {step!r}; expected one of {sorted(_STEP_POLICIES)}."
+                f"Probe {node}.{probe} has unsupported step policy {step!r}; expected one of {sorted(_STEP_POLICIES)}."
             )
         return cls(
             node=node,
@@ -99,11 +95,11 @@ class ProbeMapping:
 
 
 @dataclass(frozen=True)
-class MappingSpec:
+class ProbeCatalog:
     probes: tuple[ProbeMapping, ...] = ()
 
     def for_probe_names(self, probe_names: Iterable[str]) -> tuple[ProbeMapping, ...]:
-        """Select mappings by public probe name, preserving multi-node probes."""
+        """Select probes by public probe name, preserving multi-node probes."""
 
         requested = tuple(probe_names)
         if not requested:
@@ -125,17 +121,17 @@ class MappingSpec:
 
 
 @dataclass(frozen=True)
-class ResolvedMapping:
+class ResolvedProbes:
     probes: tuple[ProbeMapping, ...]
-    reference_plan: ReferenceCapturePlan
+    ref_taps: tuple[tuple[str, RefTapSpec], ...]
     v2_whitelist: dict[tuple[str, str], frozenset[str]]
 
 
-def load_mapping_spec(path: Path) -> MappingSpec:
+def load_probe_catalog(path: Path) -> ProbeCatalog:
     """Load a node-keyed probes.yaml file."""
 
     if not path.exists():
-        return MappingSpec()
+        return ProbeCatalog()
     data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     if not isinstance(data, dict):
         raise TypeError(f"{path} must contain a YAML mapping.")
@@ -153,107 +149,68 @@ def load_mapping_spec(path: Path) -> MappingSpec:
             if not isinstance(raw_probe, dict):
                 raise TypeError(f"probes.yaml probe {node}.{probe} must be a mapping.")
             probes.append(ProbeMapping.from_raw(str(node), str(probe), raw_probe))
-    return MappingSpec(probes=tuple(probes))
+    return ProbeCatalog(probes=tuple(probes))
 
 
-def resolve_mapping(
+def resolve_probes(
     *,
-    mappings: Iterable[ProbeMapping],
+    probes: Iterable[ProbeMapping],
     nodes: Iterable[NodeSpec],
-) -> ResolvedMapping:
-    """Resolve probe mappings to reference capture and V2 observe inputs."""
+) -> ResolvedProbes:
+    """Resolve probe declarations to reference tap data and V2 observe inputs."""
 
-    selected = tuple(mappings)
+    selected = tuple(probes)
     node_by_name: dict[str, list[NodeSpec]] = {}
     for node in nodes:
         node_by_name.setdefault(node.name, []).append(node)
 
-    missing_nodes = sorted({mapping.node for mapping in selected if mapping.node not in node_by_name})
+    missing_nodes = sorted({probe.node for probe in selected if probe.node not in node_by_name})
     if missing_nodes:
         raise KeyError(f"Mapped node(s) are not present in discovered graph: {missing_nodes}")
 
-    hook_taps: list[HookTap] = []
-    extractor_taps: list[ExtractorTap] = []
+    ref_taps: list[tuple[str, RefTapSpec]] = []
     seen_ref_taps: set[tuple[str, str, str]] = set()
     whitelist: dict[tuple[str, str], set[str]] = {}
 
-    for mapping in selected:
-        _append_ref_tap(mapping, hook_taps=hook_taps, extractor_taps=extractor_taps, seen=seen_ref_taps)
-        for node in node_by_name[mapping.node]:
+    for probe in selected:
+        _collect_ref_tap(probe, ref_taps=ref_taps, seen=seen_ref_taps)
+        for node in node_by_name[probe.node]:
             if node.state is None:
                 continue
-            if mapping.state is not None and node.state != mapping.state:
+            if probe.state is not None and node.state != probe.state:
                 continue
             # The V2 observer is armed only for fields named by selected probes,
             # so unrelated large tensors never leave the model-side execution.
-            whitelist.setdefault((node.state, node.name), set()).add(mapping.v2_field)
+            whitelist.setdefault((node.state, node.name), set()).add(probe.v2_field)
 
-    return ResolvedMapping(
+    return ResolvedProbes(
         probes=selected,
-        reference_plan=ReferenceCapturePlan(hook_taps=tuple(hook_taps), extractor_taps=tuple(extractor_taps)),
+        ref_taps=tuple(ref_taps),
         v2_whitelist={key: frozenset(fields) for key, fields in whitelist.items()},
     )
 
 
-def _append_ref_tap(
-    mapping: ProbeMapping,
+def _collect_ref_tap(
+    probe: ProbeMapping,
     *,
-    hook_taps: list[HookTap],
-    extractor_taps: list[ExtractorTap],
+    ref_taps: list[tuple[str, RefTapSpec]],
     seen: set[tuple[str, str, str]],
 ) -> None:
     # Deduplicate identical registrations while preserving distinct probe names
     # that intentionally read the same module or output target.
-    key = (mapping.ref_tap.kind, mapping.probe, mapping.ref_tap.target)
+    key = (probe.ref_tap.kind, probe.probe, probe.ref_tap.target)
     if key in seen:
         return
     seen.add(key)
-    if mapping.ref_tap.kind == "hook":
-        hook_taps.append(HookTap(name=mapping.probe, module_path=mapping.ref_tap.target))
-        return
-    if mapping.ref_tap.kind == "extractor":
-        extractor_taps.append(ExtractorTap(name=mapping.probe, extractor=_load_extractor(mapping.ref_tap.target)))
-        return
-    if mapping.ref_tap.kind == "output":
-        extractor_taps.append(
-            ExtractorTap(name=mapping.probe, extractor=_load_output_extractor(mapping.ref_tap.target))
-        )
-        return
-    raise ValueError(f"Unsupported ref_tap kind: {mapping.ref_tap.kind}")
-
-
-def _load_extractor(entrypoint: str) -> Callable[[ReferenceCaptureContext], Any]:
-    module_name, symbol_name = entrypoint.split(":", 1)
-    module = importlib.import_module(module_name)
-    return getattr(module, symbol_name)
-
-
-def _load_output_extractor(path: str) -> Callable[[ReferenceCaptureContext], Any]:
-    parts = tuple(part for part in path.split(".") if part)
-    if not parts:
-        raise ValueError("ref_tap output path must not be empty.")
-
-    def _extract(context: ReferenceCaptureContext) -> Any:
-        value: Any = context.output
-        for part in parts:
-            if isinstance(value, Mapping):
-                value = value[part]
-                continue
-            if isinstance(value, (list, tuple)):
-                value = value[int(part)]
-                continue
-            value = getattr(value, part)
-        return value
-
-    return _extract
+    ref_taps.append((probe.probe, probe.ref_tap))
 
 
 __all__ = [
-    "MappingSpec",
+    "ProbeCatalog",
     "ProbeMapping",
     "RefTapSpec",
-    "ResolvedMapping",
+    "ResolvedProbes",
     "V2GradSpec",
-    "load_mapping_spec",
-    "resolve_mapping",
+    "load_probe_catalog",
+    "resolve_probes",
 ]

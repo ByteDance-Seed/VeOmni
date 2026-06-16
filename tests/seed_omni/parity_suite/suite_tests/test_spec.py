@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from tests.seed_omni.parity_suite.core import DEFAULT_GATE, GateSpec, LauncherSpec, RecipeSpec, RunSpec
+from tests.seed_omni.parity_suite.core.config.discovery import _enabled_runs
 
 
 def test_run_spec_keeps_kind_specific_settings_under_options() -> None:
@@ -26,8 +27,30 @@ def test_run_spec_keeps_kind_specific_settings_under_options() -> None:
 
     assert run.id == "fsdp2_numeric"
     assert run.kind == "distributed_train"
+    assert run.enable is True
     assert run.gate.min_cuda_devices == 2
     assert run.options == {"strategy": "fsdp2", "compare_direct": True, "nproc_per_node": 2}
+
+
+def test_run_spec_accepts_explicit_disable() -> None:
+    run = RunSpec.from_dict(
+        recipe_id="toy",
+        tier="graph",
+        index=0,
+        data={"id": "disabled_graph", "enable": False},
+    )
+
+    assert run.enable is False
+
+
+def test_run_spec_rejects_non_bool_enable() -> None:
+    with pytest.raises(TypeError, match="enable must be a bool"):
+        RunSpec.from_dict(
+            recipe_id="toy",
+            tier="graph",
+            index=0,
+            data={"id": "disabled_graph", "enable": "false"},
+        )
 
 
 def test_run_spec_rejects_implicit_kind_specific_fields() -> None:
@@ -81,6 +104,27 @@ def test_recipe_spec_parses_default_graph_and_runs() -> None:
     assert recipe.graph == "infer_gen"
     assert recipe.stimulus == {"prompt": "A tiny robot."}
     assert recipe.runs[0].id == "base_one_step"
+
+
+def test_enabled_runs_skips_disabled_runs() -> None:
+    recipe = RecipeSpec.from_dict(
+        "image_gen_base_one_step",
+        {
+            "stimulus": {"prompt": "A tiny robot."},
+            "runs": {
+                "graph": [
+                    {"id": "enabled_graph"},
+                    {"id": "disabled_graph", "enable": False},
+                ],
+                "module": [{"id": "disabled_by_tier"}],
+            },
+        },
+        default_graph="infer_gen",
+    )
+
+    runs = _enabled_runs(("graph",), recipe)
+
+    assert [run.id for run in runs] == ["enabled_graph"]
 
 
 def test_recipe_spec_requires_graph_without_default() -> None:

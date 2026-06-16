@@ -6,7 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from tests.seed_omni.parity_suite.core import NodeSpec
-from tests.seed_omni.parity_suite.core.discovery import discover_cases
+from tests.seed_omni.parity_suite.core.config.discovery import discover_cases
 from tests.seed_omni.parity_suite.v2.model import graph_active_module_names, load_graph_active_omni_config
 
 

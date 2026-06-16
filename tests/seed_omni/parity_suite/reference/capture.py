@@ -1,22 +1,95 @@
-"""Online reference capture orchestration."""
+"""Online reference capture orchestration and hook/tensor helpers."""
 
 from __future__ import annotations
 
 import gc
-from collections.abc import Callable, Mapping, MutableMapping
+import importlib
+from collections.abc import Callable, Iterable, Iterator, Mapping, MutableMapping
+from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 from torch import nn
 
-from .hooks import HookTap, capture_hook_taps
-from .tensors import DEFAULT_MAX_CAPTURE_TENSOR_NUMEL, materialize_reference_value
+
+if TYPE_CHECKING:
+    from tests.seed_omni.parity_suite.core import RefTapSpec
+
+from veomni.models.seed_omni.observer import (
+    DEFAULT_MAX_CAPTURE_TENSOR_NUMEL,
+    _materialize_observed_value,
+)
 
 
 TapDict = dict[str, list[Any]]
 ReferenceFactory = Callable[[], nn.Module]
 MemoryProbe = Callable[[], int]
 EmptyCacheFn = Callable[[], None]
+
+
+def materialize_reference_value(
+    value: Any,
+    *,
+    max_tensor_numel: int = DEFAULT_MAX_CAPTURE_TENSOR_NUMEL,
+    field_path: str = "reference",
+) -> Any:
+    """Materialize a small reference value as CPU-owned data."""
+
+    return _materialize_observed_value(value, max_tensor_numel=max_tensor_numel, field_path=field_path)
+
+
+@dataclass(frozen=True)
+class HookTap:
+    """A reference tap captured from a submodule ``forward`` output."""
+
+    name: str
+    module_path: str
+
+
+def resolve_submodule(root: nn.Module, module_path: str) -> nn.Module:
+    """Resolve a dotted submodule path from a reference model."""
+
+    try:
+        return root.get_submodule(module_path)
+    except AttributeError:
+        module: nn.Module = root
+        for part in module_path.split("."):
+            module = getattr(module, part)
+        return module
+
+
+@contextmanager
+def capture_hook_taps(
+    reference_model: nn.Module,
+    taps: Iterable[HookTap],
+    *,
+    sink: MutableMapping[str, list[Any]],
+    max_tensor_numel: int = DEFAULT_MAX_CAPTURE_TENSOR_NUMEL,
+) -> Iterator[MutableMapping[str, list[Any]]]:
+    """Capture submodule ``forward`` outputs into ``sink``."""
+
+    handles: list[Any] = []
+
+    def _make_hook(tap: HookTap):
+        def _hook(_module: nn.Module, _args: tuple[Any, ...], output: Any) -> None:
+            sink.setdefault(tap.name, []).append(
+                materialize_reference_value(
+                    output,
+                    max_tensor_numel=max_tensor_numel,
+                    field_path=tap.name,
+                )
+            )
+
+        return _hook
+
+    try:
+        for tap in taps:
+            module = resolve_submodule(reference_model, tap.module_path)
+            handles.append(module.register_forward_hook(_make_hook(tap)))
+        yield sink
+    finally:
+        for handle in reversed(handles):
+            handle.remove()
 
 
 class ReferenceDriver(Protocol):
@@ -57,6 +130,53 @@ class ReferenceCaptureContext:
 class ReferenceCapturePlan:
     hook_taps: tuple[HookTap, ...] = ()
     extractor_taps: tuple[ExtractorTap, ...] = ()
+
+
+def build_reference_capture_plan(
+    ref_taps: Iterable[tuple[str, RefTapSpec]],
+) -> ReferenceCapturePlan:
+    """Convert pure probe ref_tap declarations into a runtime capture plan."""
+
+    hook_taps: list[HookTap] = []
+    extractor_taps: list[ExtractorTap] = []
+    for name, ref_tap in ref_taps:
+        if ref_tap.kind == "hook":
+            hook_taps.append(HookTap(name=name, module_path=ref_tap.target))
+            continue
+        if ref_tap.kind == "extractor":
+            extractor_taps.append(ExtractorTap(name=name, extractor=_load_extractor(ref_tap.target)))
+            continue
+        if ref_tap.kind == "output":
+            extractor_taps.append(ExtractorTap(name=name, extractor=_load_output_extractor(ref_tap.target)))
+            continue
+        raise ValueError(f"Unsupported ref_tap kind: {ref_tap.kind}")
+    return ReferenceCapturePlan(hook_taps=tuple(hook_taps), extractor_taps=tuple(extractor_taps))
+
+
+def _load_extractor(entrypoint: str) -> Callable[[ReferenceCaptureContext], Any]:
+    module_name, symbol_name = entrypoint.split(":", 1)
+    module = importlib.import_module(module_name)
+    return getattr(module, symbol_name)
+
+
+def _load_output_extractor(path: str) -> Callable[[ReferenceCaptureContext], Any]:
+    parts = tuple(part for part in path.split(".") if part)
+    if not parts:
+        raise ValueError("ref_tap output path must not be empty.")
+
+    def _extract(context: ReferenceCaptureContext) -> Any:
+        value: Any = context.output
+        for part in parts:
+            if isinstance(value, Mapping):
+                value = value[part]
+                continue
+            if isinstance(value, (list, tuple)):
+                value = value[int(part)]
+                continue
+            value = getattr(value, part)
+        return value
+
+    return _extract
 
 
 @dataclass(frozen=True)
@@ -181,10 +301,16 @@ def _release_module_storage(module: nn.Module) -> None:
 
 
 __all__ = [
+    "DEFAULT_MAX_CAPTURE_TENSOR_NUMEL",
     "ExtractorTap",
+    "HookTap",
     "ReferenceCaptureContext",
     "ReferenceCapturePlan",
     "ReferenceCaptureResult",
     "ReferenceDriver",
+    "build_reference_capture_plan",
+    "capture_hook_taps",
     "capture_reference_taps",
+    "materialize_reference_value",
+    "resolve_submodule",
 ]

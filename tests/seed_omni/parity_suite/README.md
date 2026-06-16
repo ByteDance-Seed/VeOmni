@@ -8,9 +8,19 @@
 tests/seed_omni/parity_suite/
 ├── test_parity_cases.py      Pytest collection entrypoint for discovered cases
 ├── runner.py                 End-to-end execution for one parity case
-├── driver.py                 Base class for model-specific parity drivers
-├── core/                     YAML spec loading, discovery, gating, mapping, metrics, reports
-├── reference/                Reference model loading, hook capture, tensor normalization
+├── driver/                   Base class package for model-specific parity drivers
+│   ├── base.py               ParityDriver composition and dtype/determinism
+│   ├── reference.py          Reference loading and recipe execution
+│   ├── v2_loading.py         V2 model/module loading
+│   ├── requests.py           V2 request dispatch via build_{kind}_request hooks
+│   ├── runners.py            Graph/module/framework tier dispatch wrappers
+│   └── observations.py       Train observation and gradient helpers
+├── core/                     Shared parity helpers
+│   ├── config/               YAML spec loading, discovery, gating, probes
+│   ├── compare.py            Metrics, comparison, and reporting
+│   ├── runtime.py            Determinism, device moves, and training helpers
+│   └── fixtures.py           Model-agnostic deterministic fixtures
+├── reference/                Reference model loading, hook capture, tensor normalization, output contract
 ├── v2/                       Shared V2 helpers
 │   ├── model.py              V2 config/module loading
 │   ├── observation.py        Observer sinks and capture hooks
@@ -32,13 +42,26 @@ tests/seed_omni/bagel/
 
 ## Data Contract Boundaries
 
-Shared `parity_suite` code is model-agnostic. It owns discovery, gating, reference capture, tier dispatch, probe mapping, tolerance comparison, reports, and abstract adapter method names. It must not require model-internal tensor layouts in recipes, mapping paths, runner logic, or base driver defaults.
+Shared `parity_suite` code is model-agnostic. It owns discovery, gating, reference capture, tier dispatch, probe resolution, tolerance comparison, reports, and abstract adapter method names. It must not require model-internal tensor layouts in recipes, probe paths, runner logic, or base driver defaults.
 
-Model drivers own concrete input adaptation. A driver may start from raw fixtures, model-owned canonical data, or reference outputs, but shared suite code treats those values as opaque. Driver adapters such as `v2_infer_request()` and `v2_train_batch_kwargs()` should return common V2 request keys, usually `{"conversation_list": ...}`, and leave model-internal conversion to model runtime hooks or model-specific helpers.
+Model drivers own concrete input adaptation. A driver may start from raw fixtures, model-owned canonical data, or reference outputs, but shared suite code treats those values as opaque. Implement ``build_{reference.kind}_request`` hook methods on ``ParityDriver`` subclasses and resolve them through ``v2_request_kwargs()``. Hook methods should return common V2 request keys, usually ``{"conversation_list": ...}``, and leave model-internal conversion to model runtime hooks or model-specific helpers.
+
+Normal reference handlers must return the suite contract defined in ``reference/contract.py``:
+
+```python
+{"canonical": {...}, "reference": {...}}
+```
+
+- ``canonical`` is the model-owned payload passed to V2 request handlers through ``canonical_from_reference_output()``.
+- ``reference`` holds values addressed by ``probes.yaml`` paths such as ``ref_tap: {output: reference.hidden_state}``.
+- ``None`` remains valid only when reference capture is skipped and request handlers build from recipe stimulus.
+- ``ParityReport`` remains valid for reference-only recipe execution and is not routed through this contract.
+
+Future models such as Janus should implement reference loading plus reference handlers that return this shape, then define ``build_{kind}_request`` hook methods keyed by ``reference.kind``.
 
 For training parity, graph and current module-tier runs execute through SeedOmni graph nodes and invoke `pre_forward` / `post_forward` hooks. The current module tier is node-level parity, not a bare packed-tensor module API test. Bare model-internal packer checks should live in model-specific unit tests outside shared suite flow.
 
-Framework-tier training checks are V2 runtime policy checks by default. They validate trainer behavior, optimizer and scheduler updates, checkpointing, distributed/FSDP execution, and data health. They should not compare to an official oracle unless a case explicitly keeps reference capture enabled and declares probe mappings for that purpose.
+Framework-tier training checks are V2 runtime policy checks by default. They validate trainer behavior, optimizer and scheduler updates, checkpointing, distributed/FSDP execution, and data health. They should not compare to an official oracle unless a case explicitly keeps reference capture enabled and declares probes for that purpose.
 
 ## Running Cases
 
@@ -75,7 +98,7 @@ Directly selecting a single parametrized case bypasses the grouped launcher so t
 1. Add or update the model test contract under `tests/seed_omni/<model>/`.
 2. Configure `base.yaml` with the reference loader, V2 model config, enabled graph names, enabled tiers, tolerances, gates, and launcher settings.
 3. Add recipe variants in `recipes/*.yaml`. Each variant declares exactly one of `stimulus` or `data`, then lists `runs` by tier. The `probes` list names entries from `probes.yaml`.
-4. Add probe mappings in `probes.yaml`. Each mapping selects the graph node, V2 observation field, reference tap, tolerance policy, and optional state or step policy.
+4. Add probes in `probes.yaml`. Each probe selects the graph node, V2 observation field, reference tap, tolerance policy, and optional state or step policy.
 5. Implement or extend `driver.py` by returning a `ParityDriver` from `create_driver(case)`. The driver owns reference loading, reference execution, V2 model loading, and any model-specific input/output adaptation.
 6. Run the harness unit tests and at least one targeted parity case before broadening to the full suite.
 

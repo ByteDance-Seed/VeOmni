@@ -1,4 +1,4 @@
-"""Generic utility helpers for parity tests."""
+"""Generic runtime helpers for parity tests."""
 
 from __future__ import annotations
 
@@ -52,6 +52,20 @@ def to_cpu(value: Any) -> Any:
     if isinstance(value, tuple):
         return tuple(to_cpu(item) for item in value)
     return value
+
+
+def resolve_torch_dtype(dtype: torch.dtype | str | None) -> torch.dtype:
+    if dtype is None:
+        return torch.float32
+    if isinstance(dtype, torch.dtype):
+        return dtype
+    if dtype in {"fp32", "float32"}:
+        return torch.float32
+    if dtype in {"fp16", "float16"}:
+        return torch.float16
+    if dtype in {"bf16", "bfloat16"}:
+        return torch.bfloat16
+    raise ValueError(f"Unsupported reference dtype: {dtype!r}")
 
 
 def autocast_for_dtype(device: torch.device, dtype: torch.dtype):
@@ -109,6 +123,7 @@ __all__ = [
     "autocast_for_dtype",
     "configure_torch_determinism",
     "patched_randn_like",
+    "resolve_torch_dtype",
     "sample_grad",
     "sample_named_grad",
     "sum_losses",

@@ -3,19 +3,16 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from contextlib import contextmanager, nullcontext
+from contextlib import nullcontext
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
-import numpy as np
 import torch
-from PIL import Image
-from safetensors import safe_open
 from torch import nn
-from transformers.initialization import no_init_weights
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
 
+from tests.seed_omni.bagel.fixtures import latent_position_ids, synthetic_latent_fixture, synthetic_vit_fixture
 from tests.seed_omni.bagel.transformers.vendor.data.data_utils import add_special_tokens
 from tests.seed_omni.bagel.transformers.vendor.data.transforms import ImageTransform
 from tests.seed_omni.bagel.transformers.vendor.inference import InterleaveInferencer
@@ -30,11 +27,23 @@ from tests.seed_omni.bagel.transformers.vendor.modeling.bagel import (
 )
 from tests.seed_omni.bagel.transformers.vendor.modeling.bagel.qwen2_navit import NaiveCache
 from tests.seed_omni.bagel.transformers.vendor.modeling.qwen2.tokenization_qwen2 import Qwen2Tokenizer
-from tests.seed_omni.parity_suite.core import ParityReport, to_cpu, to_device
-from tests.seed_omni.parity_suite.core.utilities import autocast_for_dtype, patched_randn_like, sample_named_grad
+from tests.seed_omni.parity_suite.core import (
+    ParityReport,
+    autocast_for_dtype,
+    make_reference_image,
+    patched_randn_like,
+    resolve_torch_dtype,
+    sample_named_grad,
+    to_cpu,
+    to_device,
+)
 from tests.seed_omni.parity_suite.reference.capture import ReferenceCaptureContext
-from tests.seed_omni.parity_suite.reference.model import ParityReferenceModel
-from veomni.models.module_utils import init_empty_weights
+from tests.seed_omni.parity_suite.reference.contract import make_reference_run_output
+from tests.seed_omni.parity_suite.reference.model import (
+    ParityReferenceModel,
+    empty_init_context,
+    load_safetensors_weights,
+)
 
 
 class BagelModel(ParityReferenceModel):
@@ -95,7 +104,7 @@ class BagelModel(ParityReferenceModel):
                 connector_act=connector_act,
             ),
         )
-        context = _empty_init_context() if init_on_meta else nullcontext()
+        context = empty_init_context() if init_on_meta else nullcontext()
         with context:
             language_model = Qwen2ForCausalLM(llm_config)
             vit_model = SiglipVisionModel(vit_config) if visual_und and vit_config is not None else None
@@ -125,7 +134,7 @@ class BagelModel(ParityReferenceModel):
     ) -> BagelModel:
         del model_args, config, kwargs
         root = Path(pretrained_model_name_or_path)
-        dtype = _resolve_dtype(torch_dtype)
+        dtype = resolve_torch_dtype(torch_dtype)
         target_device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
         llm_config = Qwen2Config.from_json_file(str(root / "llm_config.json"))
         _normalize_llm_config(llm_config)
@@ -155,13 +164,12 @@ class BagelModel(ParityReferenceModel):
             connector_act=connector_act,
         )
         if load_weights:
-            _load_weights(
+            load_safetensors_weights(
                 reference.model,
                 root / "ema.safetensors",
+                include_prefixes=_bagel_weight_prefixes(visual_gen, visual_und),
                 device=target_device,
                 dtype=dtype,
-                visual_gen=visual_gen,
-                visual_und=visual_und,
             )
         reference.model.to(device=target_device)
         if visual_und:
@@ -188,20 +196,18 @@ class BagelModel(ParityReferenceModel):
         return _run_image_edit_reference(self, inputs, context)
 
 
-def make_reference_image(width: int, height: int) -> Image.Image:
-    """Create the deterministic reference-side input image used by edit parity."""
-
-    x = np.linspace(0, 255, width, dtype=np.uint8)
-    y = np.linspace(0, 255, height, dtype=np.uint8)
-    xx, yy = np.meshgrid(x, y)
-    rgb = np.stack([xx, yy, ((xx.astype(np.uint16) + yy.astype(np.uint16)) // 2).astype(np.uint8)], axis=-1)
-    return Image.fromarray(rgb)
-
-
-@contextmanager
-def _empty_init_context():
-    with no_init_weights(), init_empty_weights():
-        yield
+def _bagel_weight_prefixes(visual_gen: bool, visual_und: bool) -> tuple[str, ...]:
+    prefixes: tuple[str, ...] = ("language_model",)
+    if visual_gen:
+        prefixes = ("language_model.", "vae2llm.", "llm2vae.", "time_embedder.", "latent_pos_embed.")
+    if visual_und:
+        prefixes = (
+            *prefixes,
+            "vit_model.",
+            "connector.",
+            "vit_pos_embed.",
+        )
+    return prefixes
 
 
 def _normalize_llm_config(llm_config: Qwen2Config) -> None:
@@ -217,20 +223,6 @@ def _ensure_default_rope_init() -> None:
     if "default" in ROPE_INIT_FUNCTIONS:
         return
     ROPE_INIT_FUNCTIONS["default"] = _compute_default_rope_parameters
-
-
-def _resolve_dtype(dtype: torch.dtype | str | None) -> torch.dtype:
-    if dtype is None:
-        return torch.float32
-    if isinstance(dtype, torch.dtype):
-        return dtype
-    if dtype in {"fp32", "float32"}:
-        return torch.float32
-    if dtype in {"fp16", "float16"}:
-        return torch.float16
-    if dtype in {"bf16", "bfloat16"}:
-        return torch.bfloat16
-    raise ValueError(f"Unsupported BAGEL reference dtype: {dtype!r}")
 
 
 def _default_vae_config() -> AutoEncoderParams:
@@ -268,41 +260,6 @@ def _optional_bagel_config_kwargs(
     if connector_act is not None:
         values["connector_act"] = connector_act
     return values
-
-
-def _load_weights(
-    model: Bagel,
-    weights_path: Path,
-    *,
-    device: torch.device,
-    dtype: torch.dtype,
-    visual_gen: bool,
-    visual_und: bool,
-) -> None:
-    if not weights_path.exists():
-        raise FileNotFoundError(f"BAGEL official reference weights not found: {weights_path}")
-    prefixes = ("language_model",)
-    if visual_gen:
-        prefixes = ("language_model.", "vae2llm.", "llm2vae.", "time_embedder.", "latent_pos_embed.")
-    if visual_und:
-        prefixes = (
-            *prefixes,
-            "vit_model.",
-            "connector.",
-            "vit_pos_embed.",
-        )
-    state_dict: dict[str, torch.Tensor] = {}
-    with safe_open(weights_path, framework="pt", device="cpu") as handle:
-        for key in handle.keys():
-            if key.startswith(prefixes):
-                state_dict[key] = handle.get_tensor(key).to(device=device, dtype=dtype)
-    missing, unexpected = model.load_state_dict(state_dict, strict=False, assign=True)
-    relevant_missing = [key for key in missing if key.startswith(prefixes)]
-    relevant_unexpected = [key for key in unexpected if key.startswith(prefixes)]
-    if relevant_missing:
-        raise RuntimeError(f"Missing BAGEL reference weight keys: {relevant_missing[:20]}")
-    if relevant_unexpected:
-        raise RuntimeError(f"Unexpected BAGEL reference weight keys: {relevant_unexpected[:20]}")
 
 
 def _compute_default_rope_parameters(config: Any, device: torch.device | None = None, **kwargs: Any):
@@ -532,14 +489,14 @@ def _run_text_reference(
         "packed_key_value_indexes_for_step": text_step["packed_key_value_indexes"].detach().cpu(),
         "query_lens": text_step["query_lens"].detach().cpu(),
     }
-    result = {
-        "canonical": canonical,
-        "reference": {
+    result = make_reference_run_output(
+        canonical,
+        {
             "hidden_state": text_step["hidden_state"].detach().cpu(),
             "logits": text_step["logits"].detach().cpu(),
             "greedy_token": text_step["greedy_token"].detach().cpu(),
         },
-    }
+    )
     context.record_extra("canonical", canonical)
     return result
 
@@ -620,9 +577,9 @@ def _run_text_image_reference(
         "packed_key_value_indexes_for_step": text_step["packed_key_value_indexes"].detach().cpu(),
         "query_lens": text_step["query_lens"].detach().cpu(),
     }
-    result = {
-        "canonical": canonical,
-        "reference": {
+    result = make_reference_run_output(
+        canonical,
+        {
             "hidden_state": text_step["hidden_state"].detach().cpu(),
             "logits": text_step["logits"].detach().cpu(),
             "greedy_token": text_step["greedy_token"].detach().cpu(),
@@ -632,7 +589,7 @@ def _run_text_image_reference(
                 dtype=torch.long,
             ),
         },
-    }
+    )
     context.record_extra("canonical", canonical)
     return result
 
@@ -700,9 +657,9 @@ def _run_image_gen_reference(
         "image_width": image_width,
         "max_flow_steps": int(inputs.get("max_flow_steps", 1)),
     }
-    result = {
-        "canonical": canonical,
-        "reference": {
+    result = make_reference_run_output(
+        canonical,
+        {
             "base_velocity": flow_step["base_velocity"].detach().cpu(),
             "cfg_text_velocity": None
             if flow_step["cfg_text_velocity"] is None
@@ -724,7 +681,7 @@ def _run_image_gen_reference(
             "generated_image_count": torch.tensor(1, dtype=torch.long),
             "generated_image_size": torch.tensor([image_height, image_width], dtype=torch.long),
         },
-    }
+    )
     context.record_extra("canonical", canonical)
     return result
 
@@ -823,9 +780,9 @@ def _run_image_edit_reference(
         "image_width": int(image_shape[1]),
         "max_flow_steps": int(inputs.get("max_flow_steps", 1)),
     }
-    result = {
-        "canonical": canonical,
-        "reference": {
+    result = make_reference_run_output(
+        canonical,
+        {
             "base_velocity": flow_step["base_velocity"].detach().cpu(),
             "cfg_text_velocity": None
             if flow_step["cfg_text_velocity"] is None
@@ -849,7 +806,7 @@ def _run_image_edit_reference(
             if flow_step["cfg_img_hidden_state_sample"] is None
             else flow_step["cfg_img_hidden_state_sample"].detach().cpu(),
         },
-    }
+    )
     context.record_extra("canonical", canonical)
     return result
 
@@ -895,35 +852,33 @@ def _run_train_reference(
     loss.backward()
 
     canonical = {"kind": str(fixture["kind"]), "train_fixture": to_cpu(fixture)}
-    result = {
-        "canonical": canonical,
-        "reference": {
-            "train_total_loss": loss.detach().cpu(),
-        },
+    reference: dict[str, Any] = {
+        "train_total_loss": loss.detach().cpu(),
     }
     if ce_loss is not None:
-        result["reference"]["train_ce_loss"] = ce_loss.detach().cpu()
-        result["reference"]["train_grad_early_q_proj"] = sample_named_grad(
+        reference["train_ce_loss"] = ce_loss.detach().cpu()
+        reference["train_grad_early_q_proj"] = sample_named_grad(
             model,
             "language_model.model.layers.0.self_attn.q_proj.weight",
         )
-        result["reference"]["train_grad_lm_head_rows"] = sample_named_grad(
+        reference["train_grad_lm_head_rows"] = sample_named_grad(
             model,
             "language_model.lm_head.weight",
             rows=torch.unique(batch["packed_label_ids"].detach().cpu()).to(dtype=torch.long),
         )
         if "packed_vit_tokens" in batch:
-            result["reference"]["train_grad_siglip_q_proj"] = sample_named_grad(
+            reference["train_grad_siglip_q_proj"] = sample_named_grad(
                 model,
                 "vit_model.vision_model.encoder.layers.0.self_attn.q_proj.weight",
             )
     if mse_loss is not None:
-        result["reference"]["train_mse_loss"] = mse_loss.detach().cpu()
-        result["reference"]["train_grad_gen_q_proj"] = sample_named_grad(
+        reference["train_mse_loss"] = mse_loss.detach().cpu()
+        reference["train_grad_gen_q_proj"] = sample_named_grad(
             model,
             "language_model.model.layers.0.self_attn.q_proj_moe_gen.weight",
         )
-        result["reference"]["train_grad_llm2vae"] = sample_named_grad(model, "llm2vae.weight")
+        reference["train_grad_llm2vae"] = sample_named_grad(model, "llm2vae.weight")
+    result = make_reference_run_output(canonical, reference)
     context.record_extra("canonical", canonical)
     return result
 
@@ -1011,30 +966,10 @@ def _prepare_ce_mse_fixture(
     device: torch.device,
     dtype: torch.dtype,
 ) -> dict[str, Any]:
-    latent_grid = (2, 2)
-    latent_channels = 16
-    latent_patch_size = 2
-    h, w = latent_grid
-    target_latent = torch.linspace(
-        -0.75,
-        0.75,
-        steps=latent_channels * h * latent_patch_size * w * latent_patch_size,
-        device=device,
-        dtype=dtype,
-    ).reshape(1, latent_channels, h * latent_patch_size, w * latent_patch_size)
-    num_vae_tokens = h * w
-    patch_dim = latent_channels * latent_patch_size * latent_patch_size
     return {
         "text_token_ids": token_ids,
         "compute_ce": True,
-        "target_latent": target_latent,
-        "latent_grid": latent_grid,
-        "latent_patch_size": latent_patch_size,
-        "max_latent_size": 64,
-        "flow_timesteps": torch.linspace(-0.5, 0.5, steps=num_vae_tokens, device=device),
-        "flow_noise": torch.linspace(
-            -0.25, 0.25, steps=num_vae_tokens * patch_dim, device=device, dtype=dtype
-        ).reshape(num_vae_tokens, patch_dim),
+        **synthetic_latent_fixture(device=device, dtype=dtype),
     }
 
 
@@ -1044,20 +979,10 @@ def _prepare_text_image_ce_fixture(
     device: torch.device,
     dtype: torch.dtype,
 ) -> dict[str, Any]:
-    vit_tokens = 2
-    vit_patch_dim = 3 * 14 * 14
     return {
         "text_token_ids": token_ids,
         "compute_ce": True,
-        "vit_tokens": torch.linspace(
-            -1.0,
-            1.0,
-            steps=vit_tokens * vit_patch_dim,
-            device=device,
-            dtype=dtype,
-        ).reshape(vit_tokens, vit_patch_dim),
-        "vit_position_ids": torch.arange(vit_tokens, device=device, dtype=torch.long),
-        "vit_token_lens": torch.tensor([vit_tokens], device=device, dtype=torch.int32),
+        **synthetic_vit_fixture(device=device, dtype=dtype),
     }
 
 
@@ -1088,7 +1013,7 @@ def _prepare_ce_mse_batch_from_fixture(
         "nested_attention_masks": [_causal_attention_mask(sequence_length, device)],
         "padded_latent": latent,
         "patchified_vae_latent_shapes": [(h, w)],
-        "packed_latent_position_ids": _latent_position_ids(h, w, max_latent_size=max_latent_size, device=device),
+        "packed_latent_position_ids": latent_position_ids(h, w, max_latent_size=max_latent_size, device=device),
         "packed_vae_token_indexes": vae_indexes.to(dtype=torch.long),
         "packed_timesteps": fixture["flow_timesteps"].to(device=device, dtype=torch.float32),
         "mse_loss_indexes": torch.zeros(sequence_length, device=device, dtype=torch.bool),
@@ -1152,12 +1077,6 @@ def _apply_ce(batch: dict[str, Any], text_indexes: torch.Tensor, token_ids: torc
 
 def _causal_attention_mask(length: int, device: torch.device) -> torch.Tensor:
     return torch.triu(torch.full((length, length), float("-inf"), device=device), diagonal=1)
-
-
-def _latent_position_ids(height: int, width: int, *, max_latent_size: int, device: torch.device) -> torch.Tensor:
-    rows = torch.arange(height, device=device, dtype=torch.long)[:, None] * max_latent_size
-    cols = torch.arange(width, device=device, dtype=torch.long)[None]
-    return (rows + cols).flatten()
 
 
 def _first_flow_timestep(num_timesteps: int, timestep_shift: float, device: torch.device) -> dict[str, torch.Tensor]:

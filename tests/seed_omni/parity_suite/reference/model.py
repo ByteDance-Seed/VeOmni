@@ -1,12 +1,19 @@
-"""Reference model contract for parity-suite oracle execution."""
+"""Reference model contract and loading for parity-suite oracle execution."""
 
 from __future__ import annotations
 
+import importlib
 from collections.abc import Mapping
 from contextlib import contextmanager, nullcontext
+from pathlib import Path
 from typing import Any, Iterator
 
+import torch
+from safetensors import safe_open
 from torch import nn
+from transformers.initialization import no_init_weights
+
+from veomni.models.module_utils import init_empty_weights
 
 
 class ParityReferenceModel(nn.Module):
@@ -88,4 +95,77 @@ def _config_targets(model: Any) -> tuple[Any, ...]:
     return tuple(targets)
 
 
-__all__ = ["ParityReferenceModel", "reference_options"]
+def load_transformers_reference_model(
+    *,
+    module: str | None,
+    checkpoint: Path | None,
+    **kwargs: Any,
+) -> Any:
+    """Load a reference model through Transformers ``AutoModel``."""
+
+    if module is not None:
+        _register_reference_model(module)
+    model_id = checkpoint or module
+    if model_id is None:
+        raise ValueError("Transformers reference loader requires reference.module or reference.checkpoint.")
+    from transformers import AutoModel
+
+    return AutoModel.from_pretrained(model_id, **kwargs)
+
+
+@contextmanager
+def empty_init_context() -> Iterator[None]:
+    with no_init_weights(), init_empty_weights():
+        yield
+
+
+def load_safetensors_weights(
+    model: nn.Module,
+    weights_path: str | Path,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+    include_prefixes: tuple[str, ...] | None = None,
+) -> None:
+    path = Path(weights_path)
+    if not path.exists():
+        raise FileNotFoundError(f"Reference weights not found: {path}")
+    state_dict: dict[str, torch.Tensor] = {}
+    with safe_open(path, framework="pt", device="cpu") as handle:
+        for key in handle.keys():
+            if include_prefixes is None or key.startswith(include_prefixes):
+                state_dict[key] = handle.get_tensor(key).to(device=device, dtype=dtype)
+    missing, unexpected = model.load_state_dict(state_dict, strict=False, assign=True)
+    if include_prefixes is not None:
+        relevant_missing = [key for key in missing if key.startswith(include_prefixes)]
+        relevant_unexpected = [key for key in unexpected if key.startswith(include_prefixes)]
+    else:
+        relevant_missing = list(missing)
+        relevant_unexpected = list(unexpected)
+    if relevant_missing:
+        raise RuntimeError(f"Missing reference weight keys from {path}: {relevant_missing[:20]}")
+    if relevant_unexpected:
+        raise RuntimeError(f"Unexpected reference weight keys from {path}: {relevant_unexpected[:20]}")
+
+
+def _register_reference_model(reference_module: str) -> None:
+    if ":" not in reference_module:
+        raise ValueError("reference.module must use 'module.path:ClassName' for Transformers reference registration.")
+    module_name, class_name = reference_module.rsplit(":", 1)
+    if not module_name or not class_name:
+        raise ValueError("reference.module must use 'module.path:ClassName' for Transformers reference registration.")
+
+    module = importlib.import_module(module_name)
+    reference_class = getattr(module, class_name)
+    register_auto_model = getattr(reference_class, "register_auto_model", None)
+    if register_auto_model is not None:
+        register_auto_model()
+
+
+__all__ = [
+    "ParityReferenceModel",
+    "empty_init_context",
+    "load_safetensors_weights",
+    "load_transformers_reference_model",
+    "reference_options",
+]

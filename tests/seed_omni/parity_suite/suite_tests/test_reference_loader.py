@@ -7,10 +7,8 @@ import types
 from pathlib import Path
 from typing import Any
 
-from tests.seed_omni.parity_suite.core import ReferenceSpec
-from tests.seed_omni.parity_suite.reference import loader as reference_loader
-from tests.seed_omni.parity_suite.reference.loader import load_transformers_reference_model
-from tests.seed_omni.parity_suite.reference.model import ParityReferenceModel
+from tests.seed_omni.parity_suite.reference import model as reference_model
+from tests.seed_omni.parity_suite.reference.model import ParityReferenceModel, load_transformers_reference_model
 
 
 def test_reference_model_registers_auto_classes(monkeypatch: Any) -> None:
@@ -63,11 +61,10 @@ def test_transformers_loader_registers_reference_class_before_load(monkeypatch: 
             events.append(("from_pretrained", model_id))
             return {"model_id": model_id}
 
-    monkeypatch.setattr(reference_loader.importlib, "import_module", import_module)
+    monkeypatch.setattr(reference_model.importlib, "import_module", import_module)
     monkeypatch.setitem(sys.modules, "transformers", types.SimpleNamespace(AutoModel=AutoModel))
-    spec = ReferenceSpec(module="tests.fake_reference_registration:Reference")
 
-    result = load_transformers_reference_model(spec)
+    result = load_transformers_reference_model(module="tests.fake_reference_registration:Reference", checkpoint=None)
 
     assert result == {"model_id": "tests.fake_reference_registration:Reference"}
     assert events[0] == ("import", "tests.fake_reference_registration")
@@ -89,9 +86,12 @@ def test_transformers_loader_prefers_checkpoint(monkeypatch: Any, tmp_path: Path
     monkeypatch.setitem(sys.modules, "tests.fake_reference_registration", module)
     monkeypatch.setitem(sys.modules, "transformers", types.SimpleNamespace(AutoModel=AutoModel))
     checkpoint = tmp_path / "checkpoint"
-    spec = ReferenceSpec(module="tests.fake_reference_registration:Reference", checkpoint=checkpoint)
 
-    result = load_transformers_reference_model(spec, local_files_only=True)
+    result = load_transformers_reference_model(
+        module="tests.fake_reference_registration:Reference",
+        checkpoint=checkpoint,
+        local_files_only=True,
+    )
 
     assert result == {"model_id": checkpoint}
     assert calls == [("register", {}), (checkpoint, {"local_files_only": True})]
@@ -110,19 +110,19 @@ def test_transformers_loader_falls_back_to_module(monkeypatch: Any) -> None:
     module.Reference = types.SimpleNamespace(register_auto_model=lambda: None)
     monkeypatch.setitem(sys.modules, "tests.fake_reference_registration", module)
     monkeypatch.setitem(sys.modules, "transformers", types.SimpleNamespace(AutoModel=AutoModel))
-    spec = ReferenceSpec(module="tests.fake_reference_registration:Reference")
 
-    result = load_transformers_reference_model(spec)
+    result = load_transformers_reference_model(
+        module="tests.fake_reference_registration:Reference",
+        checkpoint=None,
+    )
 
     assert result == {"model_id": "tests.fake_reference_registration:Reference"}
     assert calls == [("tests.fake_reference_registration:Reference", {})]
 
 
 def test_transformers_loader_requires_explicit_reference_class() -> None:
-    spec = ReferenceSpec(module="tests.fake_reference_registration")
-
     try:
-        load_transformers_reference_model(spec)
+        load_transformers_reference_model(module="tests.fake_reference_registration", checkpoint=None)
     except ValueError as exc:
         assert "module.path:ClassName" in str(exc)
     else:

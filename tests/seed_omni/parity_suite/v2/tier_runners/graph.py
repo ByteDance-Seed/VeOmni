@@ -7,7 +7,7 @@ from typing import Any
 
 import torch
 
-from tests.seed_omni.parity_suite.core.utilities import autocast_for_dtype, zero_module_grads
+from tests.seed_omni.parity_suite.core import autocast_for_dtype, zero_module_grads
 from tests.seed_omni.parity_suite.v2.observation import arm_generation_observer
 
 
@@ -22,7 +22,7 @@ def run_v2_infer_graph(
     """Run a V2 inference graph through ``OmniModel.generate``."""
 
     model = driver.load_v2_model(device=device, dtype=dtype)
-    request = driver.v2_infer_request(reference_output, device=device)
+    request = driver.v2_request_kwargs(reference_output, device=device)
     generation_kwargs = driver.generation_kwargs(model)
     trace: list[str] = []
     with torch.no_grad(), arm_generation_observer(whitelist) as observations:
@@ -42,7 +42,7 @@ def run_v2_train_graph(
 
     return run_v2_train_graph_batch(
         driver,
-        driver.v2_train_batch_kwargs(reference_output, device=device),
+        driver.v2_request_kwargs(reference_output, device=device),
         whitelist,
         device=device,
         dtype=dtype,

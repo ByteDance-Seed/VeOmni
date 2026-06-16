@@ -1,13 +1,65 @@
-"""Recursive comparator for parity probe values."""
+"""Metric, comparison, and reporting helpers for SeedOmni V2 parity checks."""
 
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from typing import Any
 
 import torch
 
-from .metrics import MetricResult, Tolerance, compare_tensors
+
+@dataclass(frozen=True)
+class Tolerance:
+    name: str
+    kind: str = "numeric"
+    rtol: float = 0.0
+    atol: float = 0.0
+
+    @property
+    def exact(self) -> bool:
+        return self.kind == "exact"
+
+
+@dataclass(frozen=True)
+class MetricResult:
+    passed: bool
+    path: str
+    message: str = ""
+    max_abs_diff: float | None = None
+    max_rel_diff: float | None = None
+
+
+def tolerance_from_policy(name: str, policies: dict[str, Any]) -> Tolerance:
+    raw = dict(policies.get(name, {}) or {})
+    kind = str(raw.get("kind", "numeric"))
+    return Tolerance(
+        name=name,
+        kind=kind,
+        rtol=float(raw.get("rtol", 0.0) or 0.0),
+        atol=float(raw.get("atol", 0.0) or 0.0),
+    )
+
+
+def compare_tensors(actual: torch.Tensor, expected: torch.Tensor, *, tolerance: Tolerance, path: str) -> MetricResult:
+    if actual.shape != expected.shape:
+        return MetricResult(
+            False, path, message=f"shape mismatch: actual={tuple(actual.shape)} expected={tuple(expected.shape)}"
+        )
+
+    actual_cpu = actual.detach().cpu()
+    expected_cpu = expected.detach().cpu()
+    if tolerance.exact:
+        passed = torch.equal(actual_cpu, expected_cpu)
+    else:
+        passed = torch.allclose(actual_cpu, expected_cpu, rtol=tolerance.rtol, atol=tolerance.atol)
+
+    diff = (actual_cpu.to(torch.float64) - expected_cpu.to(torch.float64)).abs()
+    max_abs = float(diff.max().item()) if diff.numel() else 0.0
+    denom = expected_cpu.to(torch.float64).abs().clamp_min(1e-12)
+    max_rel = float((diff / denom).max().item()) if diff.numel() else 0.0
+    message = "" if passed else f"tensor mismatch: max_abs_diff={max_abs:.6g}, max_rel_diff={max_rel:.6g}"
+    return MetricResult(passed, path, message=message, max_abs_diff=max_abs, max_rel_diff=max_rel)
 
 
 def compare_values(
@@ -119,4 +171,56 @@ def _is_step_list(value: Any) -> bool:
     return isinstance(value, list)
 
 
-__all__ = ["compare_values"]
+@dataclass(frozen=True)
+class ProbeReport:
+    node: str
+    probe: str
+    passed: bool
+    metric: MetricResult
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "node": self.node,
+            "probe": self.probe,
+            "passed": self.passed,
+            "path": self.metric.path,
+            "message": self.metric.message,
+            "max_abs_diff": self.metric.max_abs_diff,
+            "max_rel_diff": self.metric.max_rel_diff,
+        }
+
+
+@dataclass(frozen=True)
+class ParityReport:
+    case_id: str
+    probes: tuple[ProbeReport, ...]
+
+    @property
+    def all_pass(self) -> bool:
+        return all(probe.passed for probe in self.probes)
+
+    @property
+    def first_failure(self) -> ProbeReport | None:
+        for probe in self.probes:
+            if not probe.passed:
+                return probe
+        return None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "case_id": self.case_id,
+            "all_pass": self.all_pass,
+            "first_failure": None if self.first_failure is None else self.first_failure.to_dict(),
+            "probes": [probe.to_dict() for probe in self.probes],
+        }
+
+
+__all__ = [
+    "MetricResult",
+    "ParityReport",
+    "ProbeReport",
+    "Tolerance",
+    "compare_tensors",
+    "compare_values",
+    "tolerance_from_policy",
+]

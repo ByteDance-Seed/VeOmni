@@ -9,7 +9,7 @@ from typing import Any, Iterator
 import torch
 from torch import nn
 
-from tests.seed_omni.parity_suite.core.utilities import to_cpu
+from tests.seed_omni.parity_suite.core import to_cpu
 from veomni.models.seed_omni.module import ModuleMixin
 
 

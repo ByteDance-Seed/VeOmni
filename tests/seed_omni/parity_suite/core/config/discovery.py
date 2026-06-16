@@ -187,4 +187,4 @@ def discover_nodes(graph: GraphSpec) -> tuple[NodeSpec, ...]:
 
 
 def _enabled_runs(enabled_tiers: tuple[str, ...], recipe: RecipeSpec) -> tuple[RunSpec, ...]:
-    return tuple(run for run in recipe.runs if run.tier in enabled_tiers)
+    return tuple(run for run in recipe.runs if run.enable and run.tier in enabled_tiers)

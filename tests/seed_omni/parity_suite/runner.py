@@ -13,11 +13,11 @@ from tests.seed_omni.parity_suite.core import (
     ProbeMapping,
     ProbeReport,
     compare_values,
-    resolve_mapping,
+    resolve_probes,
     tolerance_from_policy,
 )
 from tests.seed_omni.parity_suite.driver import ParityDriver
-from tests.seed_omni.parity_suite.reference.capture import capture_reference_taps
+from tests.seed_omni.parity_suite.reference.capture import build_reference_capture_plan, capture_reference_taps
 
 
 _V2_DISPATCH: dict[tuple[str, str], str] = {
@@ -40,8 +40,9 @@ def run_parity_case(case: ParityCase) -> ParityReport:
         raise NotImplementedError(f"Unsupported parity tier for execution: {case.tier!r}")
     # Non-forward framework policies produce their own reports instead of
     # comparing node-level reference taps.
-    selected = () if _is_framework_policy_run(case) else case.model.mapping.for_probe_names(case.run.probes)
-    resolved = resolve_mapping(mappings=selected, nodes=case.nodes)
+    selected = () if _is_framework_policy_run(case) else case.model.probes.for_probe_names(case.run.probes)
+    resolved = resolve_probes(probes=selected, nodes=case.nodes)
+    reference_plan = build_reference_capture_plan(resolved.ref_taps)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dtype = driver.dtype()
 
@@ -53,7 +54,7 @@ def run_parity_case(case: ParityCase) -> ParityReport:
             reference_factory=lambda: driver.load_reference_model(device=device, dtype=dtype),
             driver=driver,
             inputs=driver.reference_inputs(),
-            plan=resolved.reference_plan,
+            plan=reference_plan,
         )
         reference_output = reference.run_output
 

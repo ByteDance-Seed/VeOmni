@@ -9,7 +9,7 @@ from typing import Any
 
 import yaml
 
-from .mapping import MappingSpec, load_mapping_spec
+from .probes import ProbeCatalog, load_probe_catalog
 
 
 PARITY_ENABLE_ENV = "VEOMNI_V2_TEST_ENABLE_PARITY_CHECK"
@@ -18,7 +18,7 @@ PARITY_ENABLE_ENV = "VEOMNI_V2_TEST_ENABLE_PARITY_CHECK"
 def repository_root() -> Path:
     """Return the Open-VeOmni repository root."""
 
-    return Path(__file__).resolve().parents[4]
+    return Path(__file__).resolve().parents[5]
 
 
 def load_yaml_file(path: Path) -> dict[str, Any]:
@@ -214,6 +214,7 @@ class RunSpec:
     id: str
     tier: str
     kind: str
+    enable: bool = True
     probes: tuple[str, ...] = ()
     gate: GateSpec = field(default_factory=GateSpec)
     options: dict[str, Any] = field(default_factory=dict)
@@ -225,6 +226,9 @@ class RunSpec:
         values = dict(data)
         run_id = str(values.pop("id", f"{tier}_{index}"))
         kind = str(values.pop("kind", _default_run_kind(tier)))
+        enable = values.pop("enable", True)
+        if not isinstance(enable, bool):
+            raise TypeError(f"Recipe {recipe_id} runs.{tier}.{run_id}.enable must be a bool.")
         probes = _string_tuple(
             values.pop("probes", None), field_name=f"recipes.{recipe_id}.runs.{tier}.{run_id}.probes"
         )
@@ -242,6 +246,7 @@ class RunSpec:
             id=run_id,
             tier=tier,
             kind=kind,
+            enable=enable,
             probes=probes,
             gate=gate,
             options=options,
@@ -340,7 +345,7 @@ class ModelSpec:
     gate: GateSpec
     launcher: LauncherSpec
     recipes: tuple[RecipeSpec, ...]
-    mapping: MappingSpec
+    probes: ProbeCatalog
 
 
 def load_model_spec(model_dir: str | Path) -> ModelSpec:
@@ -363,7 +368,7 @@ def load_model_spec(model_dir: str | Path) -> ModelSpec:
         gate=GateSpec.from_dict(base.get("gate")),
         launcher=LauncherSpec.from_dict(base.get("launcher")),
         recipes=recipes,
-        mapping=load_mapping_spec(root / "probes.yaml"),
+        probes=load_probe_catalog(root / "probes.yaml"),
     )
 
 
