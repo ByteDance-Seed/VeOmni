@@ -73,7 +73,8 @@ def _get_wan_full_sequence_varlen_kwargs(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
-    seq_len_multiplier: int = 1,
+    query_length: int | None = None,
+    key_length: int | None = None,
 ) -> dict[str, torch.Tensor | int]:
     if query.ndim != 4 or key.ndim != 4 or value.ndim != 4:
         raise ValueError("Wan flash-attention expects Q/K/V tensors with shape (batch, seq, heads, head_dim).")
@@ -84,8 +85,8 @@ def _get_wan_full_sequence_varlen_kwargs(
         )
 
     batch_size = query.shape[0]
-    query_length = query.shape[1] * seq_len_multiplier
-    key_length = key.shape[1] * seq_len_multiplier
+    query_length = query.shape[1] if query_length is None else query_length
+    key_length = key.shape[1] if key_length is None else key_length
     cu_seq_lens_q = torch.arange(
         0,
         (batch_size + 1) * query_length,
@@ -106,6 +107,30 @@ def _get_wan_full_sequence_varlen_kwargs(
         "max_length_q": query_length,
         "max_length_k": key_length,
     }
+
+
+def _assert_wan_flash_attention_bf16(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attn: WanAttention,
+) -> None:
+    tensor_dtypes = {
+        "query": query.dtype,
+        "key": key.dtype,
+        "value": value.dtype,
+    }
+    weight_dtypes = {
+        "to_q.weight": attn.to_q.weight.dtype,
+        "to_k.weight": attn.to_k.weight.dtype,
+        "to_v.weight": attn.to_v.weight.dtype,
+    }
+    assert all(dtype == torch.bfloat16 for dtype in tensor_dtypes.values()), (
+        f"Wan flash-attention expects bf16 Q/K/V tensors, got {tensor_dtypes}."
+    )
+    assert all(dtype == torch.bfloat16 for dtype in weight_dtypes.values()), (
+        f"Wan flash-attention expects bf16 projection weights, got {weight_dtypes}."
+    )
 
 
 class WanSPAttnProcessor(WanAttnProcessor):
@@ -165,15 +190,11 @@ class WanSPAttnProcessor(WanAttnProcessor):
         # boundaries selects HF's varlen FA2 path without changing attention
         # semantics or relying on a synthetic padding mask.
         attention_interface: Callable = wan_eager_attention_forward
-        use_fp32_attention = query.dtype == torch.float32 and attn.to_q.weight.dtype == torch.float32
-        use_flash_attention = (
-            self.attn_implementation in {"flash_attention_2", "veomni_flash_attention_2_with_sp"}
-            and not use_fp32_attention
-        )
-        if self.attn_implementation != "eager" and not use_fp32_attention:
+        use_flash_attention = self.attn_implementation in {"flash_attention_2", "veomni_flash_attention_2_with_sp"}
+        if use_flash_attention:
+            _assert_wan_flash_attention_bf16(query, key, value, attn)
+        if self.attn_implementation != "eager":
             attention_interface = ALL_ATTENTION_FUNCTIONS[self.attn_implementation]
-        elif self.attn_implementation != "eager":
-            logger.warning_once("Wan attention is running in fp32, so using eager SDPA instead of flash-attention.")
 
         kernel_module = WanAttentionKernelModule(self.config, attn)
 
@@ -185,6 +206,11 @@ class WanSPAttnProcessor(WanAttnProcessor):
 
             key_img = key_img.unflatten(2, (attn.heads, -1))
             value_img = value_img.unflatten(2, (attn.heads, -1))
+            if use_flash_attention:
+                assert key_img.dtype == torch.bfloat16 and value_img.dtype == torch.bfloat16, (
+                    "Wan image flash-attention expects bf16 added K/V tensors, "
+                    f"got key={key_img.dtype}, value={value_img.dtype}."
+                )
             image_attention_kwargs = (
                 _get_wan_full_sequence_varlen_kwargs(query, key_img, value_img) if use_flash_attention else {}
             )
@@ -201,9 +227,13 @@ class WanSPAttnProcessor(WanAttnProcessor):
             )[0]
             hidden_states_img = hidden_states_img.flatten(2, 3).type_as(query)
 
-        seq_len_multiplier = get_parallel_state().ulysses_size if use_sp else 1
+        query_length = query.shape[1]
+        key_length = key.shape[1]
+        if use_sp:
+            query_length *= get_parallel_state().ulysses_size
+            key_length *= get_parallel_state().ulysses_size
         attention_kwargs = (
-            _get_wan_full_sequence_varlen_kwargs(query, key, value, seq_len_multiplier=seq_len_multiplier)
+            _get_wan_full_sequence_varlen_kwargs(query, key, value, query_length=query_length, key_length=key_length)
             if use_flash_attention
             else {}
         )
