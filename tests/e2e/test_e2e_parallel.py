@@ -147,6 +147,18 @@ text_test_cases = [
         _DEFAULT_ATOL,
         None,  # max_sp_size
     ),
+    pytest.param(
+        "deepseek_v4",
+        "./tests/toy_config/deepseek_v4_toy",
+        True,  # is_moe
+        _DEFAULT_RTOL,
+        _DEFAULT_ATOL,
+        # DeepSeek-V4 is eager-only (no FA / SDPA / FlexAttention) and the
+        # 4D ``[B, S, hc_mult, D]`` HyperConnection residual stack isn't
+        # SP-aware yet. Force ``max_sp_size=1`` until a v4-specific
+        # eager-SP path lands.
+        1,
+    ),
 ]
 
 qwen2vl_test_cases = [
