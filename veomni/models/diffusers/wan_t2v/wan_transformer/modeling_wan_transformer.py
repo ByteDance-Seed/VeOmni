@@ -76,6 +76,9 @@ def _get_wan_full_sequence_varlen_kwargs(
     query_length: int | None = None,
     key_length: int | None = None,
 ) -> dict[str, torch.Tensor | int]:
+    # Wan DiT batches are already full per-sample sequences, not packed
+    # text-style ragged inputs. Still pass explicit varlen metadata so FA2 uses
+    # the same unpadded kernel path without inventing a padding mask.
     if query.ndim != 4 or key.ndim != 4 or value.ndim != 4:
         raise ValueError("Wan flash-attention expects Q/K/V tensors with shape (batch, seq, heads, head_dim).")
     if query.shape[0] != key.shape[0] or query.shape[0] != value.shape[0]:
@@ -115,6 +118,8 @@ def _assert_wan_flash_attention_bf16(
     value: torch.Tensor,
     attn: WanAttention,
 ) -> None:
+    # Wan's production FA2 coverage is bf16 mixed precision. Falling back to
+    # eager for fp32 would hide the path this PR is meant to validate.
     tensor_dtypes = {
         "query": query.dtype,
         "key": key.dtype,
@@ -230,6 +235,10 @@ class WanSPAttnProcessor(WanAttnProcessor):
         query_length = query.shape[1]
         key_length = key.shape[1]
         if use_sp:
+            # Wan forward slices hidden_states/rotary_emb before the blocks.
+            # The shared VeOmni FA wrapper gathers those local slices back to
+            # the full sequence before calling FA2, so cu_seqlens must describe
+            # the post-gather length rather than this rank's local length.
             query_length *= get_parallel_state().ulysses_size
             key_length *= get_parallel_state().ulysses_size
         attention_kwargs = (
