@@ -23,10 +23,6 @@ train_ce_mse:
           probes:
             - train.ce_loss
             - train.mse_loss
-            - train.grad_early_q_proj
-            - train.grad_gen_q_proj
-            - train.grad_lm_head_rows
-            - train.grad_llm2vae
 
   - stimulus:
       prompt: "Describe BAGEL in one short sentence."
@@ -209,8 +205,6 @@ train_ce:
         - id: one_step
           probes:
             - train.ce_loss
-            - train.grad_early_q_proj
-            - train.grad_lm_head_rows
 
   - stimulus:
       prompt: "Describe BAGEL in one short sentence."
@@ -266,9 +260,6 @@ train_text_image_ce:
         - id: one_step
           probes:
             - train.ce_loss
-            - train.grad_early_q_proj
-            - train.grad_lm_head_rows
-            - train.grad_siglip_q_proj
 
   - stimulus:
       prompt: "Describe BAGEL in one short sentence."
@@ -313,8 +304,6 @@ train_mse:
         - id: one_step
           probes:
             - train.mse_loss
-            - train.grad_gen_q_proj
-            - train.grad_llm2vae
 
   - stimulus:
       prompt: "Describe BAGEL in one short sentence."
