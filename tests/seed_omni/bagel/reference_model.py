@@ -196,6 +196,11 @@ class BagelModel(ParityReferenceModel):
     def run_reference_image_edit(self, inputs: Mapping[str, Any], context: ReferenceCaptureContext) -> dict[str, Any]:
         return _run_image_edit_reference(self, inputs, context)
 
+    def run_reference_text_image_und_then_edit_gen(
+        self, inputs: Mapping[str, Any], context: ReferenceCaptureContext
+    ) -> dict[str, Any]:
+        return _run_text_image_und_then_edit_gen_reference(self, inputs, context)
+
 
 def _bagel_weight_prefixes(visual_gen: bool, visual_und: bool) -> tuple[str, ...]:
     prefixes: tuple[str, ...] = ("language_model",)
@@ -513,7 +518,7 @@ def _run_text_image_reference(
     device = next(model.parameters()).device
     dtype = next(model.parameters()).dtype
 
-    raw_image = make_reference_image(int(inputs.get("image_width", 448)), int(inputs.get("image_height", 336)))
+    raw_image = make_reference_image(int(inputs.get("input_width", 384)), int(inputs.get("input_height", 256)))
     vit_transform = ImageTransform(
         max_image_size=int(inputs.get("vit_max_image_size", 980)),
         min_image_size=int(inputs.get("vit_min_image_size", 378)),
@@ -555,7 +560,7 @@ def _run_text_image_reference(
     text_step = _capture_official_generate_text(
         model,
         start_input,
-        past_key_values=past_key_values,
+        past_key_values=deepcopy(past_key_values),
         new_token_ids=new_token_ids,
         inputs=inputs,
         device=device,
@@ -794,6 +799,170 @@ def _run_image_edit_reference(
             "velocity": [tensor.detach().cpu() for tensor in flow_step["velocity_steps"]],
             "x_t": [tensor.detach().cpu() for tensor in flow_step["x_t_steps"]],
             "image_embeds_sample": sample_tensor(image_embeds).detach().cpu(),
+            "vae_context_latents": vae_context["packed_latents"].detach().cpu(),
+            "vae_context_latent_embeds_sample": vae_context["latent_embeds_sample"].detach().cpu(),
+            "vae_context_packed_sequence_sample": vae_context["packed_sequence_sample"].detach().cpu(),
+            "latent_embeds_sample": flow_step["latent_embeds_sample"].detach().cpu(),
+            "packed_sequence_sample": flow_step["packed_sequence_sample"].detach().cpu(),
+            "image_hidden_state_sample": flow_step["hidden_state_sample"].detach().cpu(),
+            "cfg_text_hidden_state_sample": None
+            if flow_step["cfg_text_hidden_state_sample"] is None
+            else flow_step["cfg_text_hidden_state_sample"].detach().cpu(),
+            "cfg_img_hidden_state_sample": None
+            if flow_step["cfg_img_hidden_state_sample"] is None
+            else flow_step["cfg_img_hidden_state_sample"].detach().cpu(),
+        },
+    )
+    context.record_extra("canonical", canonical)
+    return result
+
+
+def _run_text_image_und_then_edit_gen_reference(
+    ref_model: nn.Module,
+    inputs: Mapping[str, Any],
+    context: ReferenceCaptureContext,
+) -> dict[str, Any]:
+    und_prompt = str(inputs.get("und_prompt", inputs["prompt"]))
+    gen_prompt = str(inputs["prompt"])
+    model = ref_model.model
+    vae_model = ref_model.vae_model
+    if vae_model is None:
+        raise ValueError("BAGEL text-image-und-then-edit-gen reference requires a loaded VAE model.")
+    new_token_ids = ref_model.new_token_ids
+    device = next(model.parameters()).device
+    dtype = next(model.parameters()).dtype
+
+    raw_image = make_reference_image(int(inputs.get("image_width", 448)), int(inputs.get("image_height", 336)))
+    vae_transform = ImageTransform(
+        max_image_size=int(inputs.get("vae_max_image_size", 1024)),
+        min_image_size=int(inputs.get("vae_min_image_size", 512)),
+        image_stride=int(inputs.get("vae_image_stride", 16)),
+        max_pixels=int(inputs.get("vae_max_pixels", 14 * 14 * 9 * 1024)),
+    )
+    vit_transform = ImageTransform(
+        max_image_size=int(inputs.get("vit_max_image_size", 980)),
+        min_image_size=int(inputs.get("vit_min_image_size", 378)),
+        image_stride=int(inputs.get("vit_image_stride", 14)),
+        max_pixels=int(inputs.get("vit_max_pixels", 14 * 14 * 9 * 1024)),
+    )
+    context_image = vae_transform.resize_transform(raw_image.convert("RGB"))
+    preprocessed_image = vit_transform(context_image.convert("RGB"))
+    image_shape = context_image.size[::-1]
+
+    inferencer = _make_interleave_inferencer(ref_model, vae_transform=vae_transform, vit_transform=vit_transform)
+    gen_context = inferencer.init_gen_context()
+    cfg_img_context = deepcopy(gen_context)
+
+    image_update = _update_context_image_for_capture(
+        inferencer,
+        context_image,
+        gen_context,
+        device=device,
+        dtype=dtype,
+        vae=True,
+        vit=True,
+    )
+    gen_context = image_update["gen_context"]
+    image_input = image_update["vit_input"]
+    image_embeds = image_update["image_embeds"]
+    vae_context = image_update["vae_context"]
+
+    und_prompt_input, gen_context = _update_context_text_for_capture(
+        inferencer,
+        und_prompt,
+        gen_context,
+        device=device,
+        dtype=dtype,
+    )
+    kv_lens_after_und_prompt = list(gen_context["kv_lens"])
+    ropes_after_und_prompt = list(gen_context["ropes"])
+    past_key_values = gen_context["past_key_values"]
+
+    start_input = model.prepare_start_tokens(gen_context["kv_lens"], gen_context["ropes"], new_token_ids)
+    start_input = to_device(start_input, device)
+    text_step = _capture_official_generate_text(
+        model,
+        start_input,
+        past_key_values=deepcopy(past_key_values),
+        new_token_ids=new_token_ids,
+        inputs=inputs,
+        device=device,
+        dtype=dtype,
+    )
+
+    cfg_text_context = deepcopy(gen_context)
+    gen_prompt_input, gen_context = _update_context_text_for_capture(
+        inferencer,
+        gen_prompt,
+        gen_context,
+        device=device,
+        dtype=dtype,
+    )
+    _, cfg_img_context = _update_context_text_for_capture(
+        inferencer,
+        gen_prompt,
+        cfg_img_context,
+        device=device,
+        dtype=dtype,
+    )
+    kv_lens = gen_context["kv_lens"]
+    ropes = gen_context["ropes"]
+    past_key_values = gen_context["past_key_values"]
+
+    flow_step = _run_reference_image_flow_step(
+        model,
+        new_token_ids,
+        inputs,
+        curr_kvlens=kv_lens,
+        curr_rope=ropes,
+        image_size=image_shape,
+        past_key_values=past_key_values,
+        device=device,
+        dtype=dtype,
+        cfg_text_context=cfg_text_context,
+        cfg_img_context=cfg_img_context,
+    )
+    canonical = {
+        "kind": "text_image_und_then_edit_gen",
+        "und_prompt": und_prompt,
+        "prompt": gen_prompt,
+        "image_width": raw_image.width,
+        "image_height": raw_image.height,
+        "input_width": raw_image.width,
+        "input_height": raw_image.height,
+        "image_input": to_cpu(image_input),
+        "und_prompt_input": to_cpu(und_prompt_input),
+        "gen_prompt_input": to_cpu(gen_prompt_input),
+        "kv_lens_after_und_prompt": kv_lens_after_und_prompt,
+        "ropes_after_und_prompt": ropes_after_und_prompt,
+        "kv_lens_after_prompt": list(kv_lens),
+        "ropes_after_prompt": list(ropes),
+        "latent_input": to_cpu(flow_step["latent_input"]),
+        "timesteps": to_cpu(flow_step["timesteps"]),
+        "flow_image_height": int(image_shape[0]),
+        "flow_image_width": int(image_shape[1]),
+        "max_flow_steps": int(inputs.get("max_flow_steps", 1)),
+    }
+    result = make_reference_run_output(
+        canonical,
+        {
+            "hidden_state": text_step["hidden_state"].detach().cpu(),
+            "logits": text_step["logits"].detach().cpu(),
+            "greedy_token": text_step["greedy_token"].detach().cpu(),
+            "image_embeds_sample": sample_tensor(image_embeds).detach().cpu(),
+            "preprocessed_image_size": torch.tensor(
+                [int(preprocessed_image.shape[-1]), int(preprocessed_image.shape[-2])],
+                dtype=torch.long,
+            ),
+            "base_velocity": flow_step["base_velocity"].detach().cpu(),
+            "cfg_text_velocity": None
+            if flow_step["cfg_text_velocity"] is None
+            else flow_step["cfg_text_velocity"].detach().cpu(),
+            "cfg_img_velocity": None
+            if flow_step["cfg_img_velocity"] is None
+            else flow_step["cfg_img_velocity"].detach().cpu(),
+            "velocity": [tensor.detach().cpu() for tensor in flow_step["velocity_steps"]],
+            "x_t": [tensor.detach().cpu() for tensor in flow_step["x_t_steps"]],
             "vae_context_latents": vae_context["packed_latents"].detach().cpu(),
             "vae_context_latent_embeds_sample": vae_context["latent_embeds_sample"].detach().cpu(),
             "vae_context_packed_sequence_sample": vae_context["packed_sequence_sample"].detach().cpu(),

@@ -44,6 +44,21 @@ def build_image_edit_request(ctx: V2RequestContext) -> dict[str, Any]:
     )
 
 
+def build_text_image_und_then_edit_gen_request(ctx: V2RequestContext) -> dict[str, Any]:
+    builder = ConversationRequestBuilder(ctx.canonical, device=ctx.device)
+    return builder.request(
+        _build_image_vae_input_item(builder, ctx.canonical),
+        _build_und_prompt_item(builder, ctx.canonical),
+        _build_image_prompt_item(
+            builder,
+            ctx.canonical,
+            image_generation_prompt=True,
+            prompt_path="gen_prompt_input.packed_text_ids",
+            raw_text_key="prompt",
+        ),
+    )
+
+
 def build_train_request(ctx: V2RequestContext) -> dict[str, Any]:
     if ctx.reference_output is not None:
         return _build_train_graph_request_from_raw_fixture(ctx.canonical, device=ctx.device)
@@ -207,6 +222,18 @@ def _build_text_und_item(builder: ConversationRequestBuilder, canonical: Mapping
     )
 
 
+def _build_und_prompt_item(builder: ConversationRequestBuilder, canonical: Mapping[str, Any]) -> ConversationItem:
+    return builder.text(
+        builder.path("und_prompt_input.packed_text_ids", dtype=torch.long),
+        role="user",
+        source=BAGEL_ORACLE_SOURCE,
+        meta={
+            "bagel_role": "text",
+            "raw_text": canonical.get("und_prompt", canonical["prompt"]),
+        },
+    )
+
+
 def _build_image_und_item(builder: ConversationRequestBuilder, canonical: Mapping[str, Any]) -> ConversationItem:
     if canonical.get("use_raw_image", False):
         return _build_raw_image_und_item(builder, canonical)
@@ -277,14 +304,16 @@ def _build_image_prompt_item(
     canonical: Mapping[str, Any],
     *,
     image_generation_prompt: bool = False,
+    prompt_path: str = "prompt_input.packed_text_ids",
+    raw_text_key: str = "prompt",
 ) -> ConversationItem:
     return builder.text(
-        builder.path("prompt_input.packed_text_ids", dtype=torch.long),
+        builder.path(prompt_path, dtype=torch.long),
         role="user",
         source=BAGEL_ORACLE_SOURCE,
         meta={
             "bagel_role": "text",
-            "raw_text": canonical["prompt"],
+            "raw_text": canonical[raw_text_key],
             "image_generation_prompt": image_generation_prompt,
         },
     )
@@ -310,6 +339,7 @@ __all__ = [
     "build_image_edit_request",
     "build_image_gen_request",
     "build_text_image_und_request",
+    "build_text_image_und_then_edit_gen_request",
     "build_text_und_request",
     "build_train_request",
 ]

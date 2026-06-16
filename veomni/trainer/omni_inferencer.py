@@ -128,7 +128,7 @@ class OmniModuleInferencer(OmniModuleTrainer):
         overrides = dict(args.model.model_config or {})
         model_type = read_model_type(model_path)
         cls = OMNI_MODEL_REGISTRY[model_type]()
-        if dist.is_initialized():
+        if dist.is_initialized() or "LOCAL_RANK" in os.environ:
             # Distributed launch: one full replica pinned to this rank's device.
             device_map = {"": f"{get_device_type()}:{int(os.getenv('LOCAL_RANK', 0))}"}
         else:

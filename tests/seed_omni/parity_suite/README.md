@@ -104,6 +104,28 @@ Directly selecting a single parametrized case bypasses the grouped launcher so t
 1. Add or update the model test contract under `tests/seed_omni/<model>/`.
 2. Configure `base.yaml` with the reference loader, V2 model config, enabled graph names, enabled tiers, tolerances, gates, and launcher settings.
 3. Add recipe variants in `recipes/*.yaml`. Each variant declares exactly one of `stimulus` or `data`, then lists `runs` by tier. The `probes` list names public probe keys from `probes.yaml`. `stimulus` is driver-owned and opaque to the shared suite.
+
+Each run can be toggled independently with `enable`. The field is optional and defaults to `true`; when set to `false`, discovery filters the run before pytest parametrization, so it will not appear in `--collect-only` output. Use a YAML bool, not a quoted string:
+
+```yaml
+interleave_image_gen:
+  - stimulus:
+      prompt: "A glass greenhouse filled with tiny orange trees."
+    reference:
+      kind: image_gen
+    runs:
+      graph:
+        - id: image_span_one_step
+          enable: true
+          probes:
+            - image.velocity
+      module:
+        - id: image_span_one_step
+          enable: false
+          probes:
+            - image.velocity
+```
+
 4. Add probes in `probes.yaml`. Each top-level key is a public probe name. The probe maps a V2 graph node and observation field to a reference tap and tolerance policy:
 
 ```yaml

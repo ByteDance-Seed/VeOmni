@@ -40,18 +40,24 @@ class BagelParityDriver(ParityDriver):
     def build_image_edit_request(self, ctx):
         return requests.build_image_edit_request(ctx)
 
+    def build_text_image_und_then_edit_gen_request(self, ctx):
+        return requests.build_text_image_und_then_edit_gen_request(ctx)
+
     def build_train_request(self, ctx):
         return requests.build_train_request(ctx)
 
     def generation_kwargs(self, model_or_config: Any, reference_output: Any) -> dict[str, Any]:
         kwargs = super().generation_kwargs(model_or_config, reference_output)
-        if self._v2_request_kind() not in {"image_gen", "image_edit"}:
+        if self._v2_request_kind() not in {"image_gen", "image_edit", "text_image_und_then_edit_gen"}:
             return kwargs
         canonical = canonical_from_reference_output(reference_output)
         latent_input = canonical.get("latent_input")
         if isinstance(latent_input, Mapping) and "packed_init_noises" in latent_input:
             kwargs["fixed_init_noise"] = latent_input["packed_init_noises"]
-        if "image_height" in canonical and "image_width" in canonical:
+        if "flow_image_height" in canonical and "flow_image_width" in canonical:
+            kwargs["image_height"] = int(canonical["flow_image_height"])
+            kwargs["image_width"] = int(canonical["flow_image_width"])
+        elif "image_height" in canonical and "image_width" in canonical:
             kwargs["image_height"] = int(canonical["image_height"])
             kwargs["image_width"] = int(canonical["image_width"])
         return kwargs

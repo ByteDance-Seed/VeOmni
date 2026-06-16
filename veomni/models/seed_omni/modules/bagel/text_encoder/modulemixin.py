@@ -116,6 +116,7 @@ class BagelTextEncoderModuleMixin(TextEncoderModuleMixin):
         self._materialize_image_understanding_items(conversation_list)
         tail = conversation_list[-1]
         if tail.role == "user":
+            self._materialize_prior_text_prompt_items(conversation_list, tail)
             if self._ready_to_start_image_generation(tail, generation_kwargs, kwargs):
                 self._materialize_image_generation_items(conversation_list)
                 return {"conversation_list": conversation_list, FSM_SIGNAL_KEY: SIGNAL_START_IMAGE_GEN}
@@ -265,6 +266,25 @@ class BagelTextEncoderModuleMixin(TextEncoderModuleMixin):
             item.value = sequence
             item.meta["query_lens"] = query_lens
             item.meta["image_sequence_ready"] = True
+
+    def _materialize_prior_text_prompt_items(
+        self,
+        conversation_list: list[ConversationItem],
+        tail: ConversationItem,
+    ) -> None:
+        for item in conversation_list:
+            if item is tail:
+                break
+            if item.type != "text" or item.role != "user":
+                continue
+            if item.meta.get("bagel_role") != "text":
+                continue
+            value = item.value
+            if torch.is_tensor(value) and value.dim() >= 2:
+                continue
+            token_ids = self._prompt_token_ids(item)
+            item.value = self.encode(token_ids)["inputs_embeds"].to(device=self.device, dtype=self.dtype)
+            self._ensure_prompt_meta(item, int(token_ids.numel()), conversation_list=conversation_list)
 
     def _is_image_generation_request(
         self,

@@ -101,7 +101,7 @@ See also
 ``training_graph.py``  — DAG view driven by ``OmniConfig.training_graph``.
 """
 
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import Any, Callable, ContextManager, Dict, List, Optional
 
@@ -175,6 +175,25 @@ class _Condition:
 class _Transition:
     condition: _Condition
     next_state: str
+
+
+@contextmanager
+def _maybe_unshard_fsdp_module(module: Any):
+    try:
+        from torch.distributed.fsdp import FSDPModule
+    except ImportError:
+        yield
+        return
+    if not isinstance(module, FSDPModule):
+        yield
+        return
+    handle = module.unshard(async_op=False)
+    if handle is not None:
+        handle.wait()
+    try:
+        yield
+    finally:
+        module.reshard()
 
 
 # ── State ─────────────────────────────────────────────────────────────────────
@@ -434,7 +453,7 @@ class GenerationGraph:
             # Optional per-module scope (e.g. make this module's ParallelState
             # current so Extra Parallel groups resolve correctly).
             module_context = scope_fn(node.module) if scope_fn is not None else nullcontext()
-            with module_context:
+            with module_context, _maybe_unshard_fsdp_module(module):
                 out = method_fn(**ctx, generation_kwargs=generation_kwargs)
             if not isinstance(out, dict):
                 raise TypeError(f"FSM node '{node_name}'.{method_name} must return a dict; got {type(out).__name__}.")

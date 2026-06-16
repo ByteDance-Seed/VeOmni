@@ -32,6 +32,7 @@ from tests.seed_omni.parity_suite.core import (
     tolerance_from_policy,
     zero_module_grads,
 )
+from tests.seed_omni.parity_suite.v2.model import load_graph_active_omni_config
 from veomni.distributed import parallel_state as parallel_state_module
 from veomni.distributed.clip_grad_norm import veomni_clip_grad_norm
 from veomni.models.seed_omni.modeling_omni import OmniModel
@@ -111,8 +112,16 @@ def run_v2_infer_framework(
     device: torch.device,
     dtype: torch.dtype,
 ) -> dict[str, Any] | ParityReport:
-    del reference_output, whitelist, device, dtype
-    raise NotImplementedError(f"{type(driver).__name__} does not implement inference framework-tier execution.")
+    """Run inference framework tier through distributed policy reports."""
+
+    run = driver.case.run
+    _release_cuda_memory()
+    try:
+        if run.kind == "distributed_infer":
+            return _run_distributed_infer_policy(driver, reference_output, device=device, dtype=dtype)
+        raise NotImplementedError(f"Unsupported inference framework kind {run.kind!r}.")
+    finally:
+        _release_cuda_memory()
 
 
 def run_v2_train_framework_batch(
@@ -486,6 +495,278 @@ def _run_distributed_train_policy(
             )
         )
     return ParityReport(case_id=driver.case.node_id, probes=tuple(reports))
+
+
+def _run_distributed_infer_policy(
+    driver: Any,
+    reference_output: Any,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> ParityReport:
+    options = driver.case.run.options
+    strategy = str(options.get("strategy", ""))
+    if strategy != "fsdp2":
+        raise NotImplementedError(f"Unsupported distributed_infer strategy {strategy!r}.")
+
+    nproc = int(options.get("nproc_per_node", 2))
+    compare_eager = bool(options.get("compare_eager", False))
+    output_dir = _policy_output_dir(driver, "distributed_infer_fsdp2")
+    if output_dir.exists():
+        shutil.rmtree(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    request_kwargs = driver.v2_request_kwargs(reference_output, device=torch.device("cpu"))
+    config = load_graph_active_omni_config(driver.case, driver.v2_module_names())
+    generation_kwargs = driver.generation_kwargs(config, reference_output)
+    probe_names = tuple(str(name) for name in options.get("compare_probes", ()) or driver.case.run.probes)
+    baseline_report: Mapping[str, Any] | None = None
+    if compare_eager:
+        baseline_report = _run_v2_infer_fsdp2(
+            driver,
+            request_kwargs,
+            generation_kwargs=generation_kwargs,
+            config_path=Path(str(options.get("config_path", driver.case.model.v2_model.config_dir / "base.yaml"))),
+            modules_config=Path(
+                str(
+                    options.get(
+                        "baseline_modules_config",
+                        driver.case.model.v2_model.config_dir / "modules_infer_eager.yaml",
+                    )
+                )
+            ),
+            infer_type=str(options.get("infer_type", driver.case.graph.name)),
+            output_dir=output_dir / "baseline_rank1",
+            dtype=dtype,
+            nproc_per_node=1,
+            timeout=int(options.get("timeout", 1800)),
+            probe_names=probe_names,
+            require_fsdp_modules=False,
+        )
+    report = _run_v2_infer_fsdp2(
+        driver,
+        request_kwargs,
+        generation_kwargs=generation_kwargs,
+        config_path=Path(str(options.get("config_path", driver.case.model.v2_model.config_dir / "base.yaml"))),
+        modules_config=Path(
+            str(
+                options.get(
+                    "modules_config",
+                    driver.case.model.v2_model.config_dir / "modules_infer_fsdp.yaml",
+                )
+            )
+        ),
+        infer_type=str(options.get("infer_type", driver.case.graph.name)),
+        output_dir=output_dir / "target",
+        dtype=dtype,
+        nproc_per_node=nproc,
+        timeout=int(options.get("timeout", 1800)),
+        probe_names=probe_names,
+        require_fsdp_modules=True,
+    )
+    reports = [
+        _framework_report(driver, "framework.infer_fsdp2_exit_code", report["exit_code"], 0, "exact"),
+        _framework_report(
+            driver, "framework.infer_fsdp2_all_pass", bool(report.get("all_pass", False)), True, "exact"
+        ),
+        _framework_report(driver, "framework.infer_fsdp2_rank_count", len(report.get("ranks", [])), nproc, "exact"),
+        _framework_report(
+            driver,
+            "framework.infer_fsdp2_has_fsdp_modules",
+            int(report.get("fsdp_module_count", 0)) > 0,
+            True,
+            "exact",
+        ),
+        _framework_report(
+            driver,
+            "framework.infer_fsdp2_trace_has_image_flow",
+            bool(report.get("trace_has_image_flow", False)),
+            True,
+            "exact",
+        ),
+        _framework_report(
+            driver,
+            "framework.infer_fsdp2_trace_has_prompt_encode",
+            bool(report.get("trace_has_prompt_encode", False)),
+            True,
+            "exact",
+        ),
+        _framework_report(
+            driver,
+            "framework.infer_fsdp2_rank0_finalized",
+            bool(report.get("rank0_finalized", False)),
+            True,
+            "exact",
+        ),
+        _framework_report(
+            driver,
+            "framework.infer_fsdp2_finite_observations",
+            bool(report.get("finite_observations", False)),
+            True,
+            "exact",
+        ),
+    ]
+    if compare_eager:
+        if baseline_report is None:
+            raise RuntimeError("Inference FSDP2 numeric policy did not build a baseline report.")
+        reports.extend(
+            _infer_fsdp2_numeric_reports(
+                driver,
+                report=report,
+                baseline_report=baseline_report,
+                probe_names=probe_names,
+            )
+        )
+    return ParityReport(case_id=driver.case.node_id, probes=tuple(reports))
+
+
+def _infer_fsdp2_numeric_reports(
+    driver: Any,
+    *,
+    report: Mapping[str, Any],
+    baseline_report: Mapping[str, Any],
+    probe_names: tuple[str, ...],
+) -> list[ProbeReport]:
+    reports = [
+        _framework_report(
+            driver,
+            "framework.infer_fsdp2_baseline_exit_code",
+            baseline_report["exit_code"],
+            0,
+            "exact",
+        ),
+        _framework_report(
+            driver,
+            "framework.infer_fsdp2_baseline_all_pass",
+            bool(baseline_report.get("all_pass", False)),
+            True,
+            "exact",
+        ),
+    ]
+    baseline_observations = baseline_report.get("observations", {})
+    target_observations = report.get("observations", {})
+    for probe_name in probe_names:
+        mapping = driver.case.model.probes.for_probe_names((probe_name,))
+        if not mapping:
+            continue
+        probe_mapping = mapping[0]
+        tol = probe_mapping.tol
+        actual = target_observations.get(probe_name)
+        expected = baseline_observations.get(probe_name)
+        reports.append(
+            _framework_report(
+                driver,
+                f"framework.infer_fsdp2_{probe_name.replace('.', '_')}",
+                actual,
+                expected,
+                tol,
+            )
+        )
+    return reports
+
+
+def _run_v2_infer_fsdp2(
+    driver: Any,
+    request_kwargs: Mapping[str, Any],
+    *,
+    generation_kwargs: Mapping[str, Any],
+    config_path: Path,
+    modules_config: Path,
+    infer_type: str,
+    output_dir: Path,
+    dtype: torch.dtype,
+    nproc_per_node: int,
+    timeout: int,
+    probe_names: tuple[str, ...],
+    require_fsdp_modules: bool,
+) -> Mapping[str, Any]:
+    """Run the inference FSDP2 worker and load its rank-0 ``results.json`` report."""
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    payload_path = output_dir / "infer_fsdp2_payload.pt"
+    torch.save(
+        {
+            "request_kwargs": dict(request_kwargs),
+            "generation_kwargs": dict(generation_kwargs),
+            "probe_names": probe_names,
+            "seed": driver.case.model.seed,
+            "dtype": "bf16" if dtype == torch.bfloat16 else "fp32",
+            "require_fsdp_modules": require_fsdp_modules,
+        },
+        payload_path,
+    )
+    port = _find_free_port()
+    worker_path = Path("tests/seed_omni/parity_suite/v2/workers/infer_fsdp2_worker.py")
+    cmd = [
+        sys.executable,
+        "-m",
+        "torch.distributed.run",
+        "--nnodes=1",
+        f"--nproc_per_node={nproc_per_node}",
+        f"--master_port={port}",
+        str(worker_path),
+        str(config_path),
+        "--model.model_path",
+        str(driver.case.model.v2_model.model_root),
+        "--infer.model_path",
+        str(driver.case.model.v2_model.model_root),
+        "--infer.infer_type",
+        infer_type,
+        "--infer.modules",
+        str(modules_config),
+        "--infer.prompt",
+        "parity-suite-infer",
+        "--infer.output_dir",
+        str(output_dir),
+        "--infer.seed",
+        str(driver.case.model.seed),
+    ]
+    env = {
+        **os.environ,
+        "VEOMNI_PARITY_INFER_FSDP2_PAYLOAD": str(payload_path),
+        "VEOMNI_PARITY_INFER_FSDP2_OUTPUT_DIR": str(output_dir),
+    }
+    log_path = output_dir / "run.log"
+    with log_path.open("w", encoding="utf-8") as log_file:
+        log_file.write("command: " + " ".join(cmd) + "\n")
+        log_file.flush()
+        process = subprocess.Popen(
+            cmd,
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+        stdout_chunks: list[str] = []
+        deadline = time.monotonic() + timeout
+        try:
+            assert process.stdout is not None
+            for line in process.stdout:
+                stdout_chunks.append(line)
+                log_file.write(line)
+                log_file.flush()
+                sys.__stdout__.write(line)
+                sys.__stdout__.flush()
+                if time.monotonic() > deadline:
+                    raise subprocess.TimeoutExpired(cmd, timeout)
+            returncode = process.wait(timeout=max(0.0, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            os.killpg(process.pid, signal.SIGTERM)
+            try:
+                process.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.wait()
+            raise
+    report_path = output_dir / "results.json"
+    report = json.loads(report_path.read_text(encoding="utf-8")) if report_path.exists() else {}
+    stdout = "".join(stdout_chunks)
+    report["exit_code"] = returncode
+    report["log_path"] = str(log_path)
+    report["stdout_tail"] = stdout[-4000:]
+    report["stderr_tail"] = ""
+    return report
 
 
 def _run_data_loss_smoke_policy(
