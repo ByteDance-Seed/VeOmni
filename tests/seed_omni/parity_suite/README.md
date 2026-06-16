@@ -35,7 +35,7 @@ Model-owned parity inputs live beside the model tests, not under this package. F
 ```text
 tests/seed_omni/bagel/
 ├── base.yaml                 Reference and V2 model paths, enabled tiers, tolerances, launcher config
-├── probes.yaml              Probe names mapped to V2 observation fields and reference taps
+├── probes.yaml              Public probe names mapped to V2 node/field and reference taps
 ├── recipes/*.yaml            Stimuli, tier runs, selected probes, run options, per-run gates
 └── driver.py                 BAGEL-specific reference and V2 adaptation
 ```
@@ -53,7 +53,7 @@ Normal reference handlers must return the suite contract defined in ``reference/
 ```
 
 - ``canonical`` is the model-owned payload passed to V2 request handlers through ``canonical_from_reference_output()``.
-- ``reference`` holds values addressed by ``probes.yaml`` paths such as ``ref_tap: {output: reference.hidden_state}``.
+- ``reference`` holds values addressed by ``probes.yaml`` reference fields such as ``ref.field: hidden_state`` (resolved to ``reference.hidden_state``).
 - ``None`` remains valid only when reference capture is skipped and request handlers build from recipe stimulus.
 - ``ParityReport`` remains valid for reference-only recipe execution and is not routed through this contract.
 
@@ -81,7 +81,7 @@ python -m pytest -q \
   'tests/seed_omni/parity_suite/test_parity_cases.py::test_seed_omni_v2_parity_case[bagel.text_und.graph.one_step]'
 ```
 
-The default gate skips full parity execution unless `VEOMNI_V2_TEST_ENABLE_PARITY_CHECK=1` is set. Case gates can also require CUDA, a reference checkpoint, or a V2 model path.
+The default gate skips full parity execution unless `VEOMNI_V2_TEST_ENABLE_PARITY_CHECK=1` is set. Case gates can also require CUDA, a minimum CUDA device count (`gate.min_cuda_devices`, used by multi-rank FSDP2/HSDP cases), a reference checkpoint, or a V2 model path.
 
 ## GPU Launcher
 
@@ -97,8 +97,27 @@ Directly selecting a single parametrized case bypasses the grouped launcher so t
 
 1. Add or update the model test contract under `tests/seed_omni/<model>/`.
 2. Configure `base.yaml` with the reference loader, V2 model config, enabled graph names, enabled tiers, tolerances, gates, and launcher settings.
-3. Add recipe variants in `recipes/*.yaml`. Each variant declares exactly one of `stimulus` or `data`, then lists `runs` by tier. The `probes` list names entries from `probes.yaml`.
-4. Add probes in `probes.yaml`. Each probe selects the graph node, V2 observation field, reference tap, tolerance policy, and optional state or step policy.
+3. Add recipe variants in `recipes/*.yaml`. Each variant declares exactly one of `stimulus` or `data`, then lists `runs` by tier. The `probes` list names public probe keys from `probes.yaml`. `stimulus` is driver-owned and opaque to the shared suite.
+4. Add probes in `probes.yaml`. Each top-level key is a public probe name. The probe maps a V2 graph node and observation field to a reference tap and tolerance policy:
+
+```yaml
+text.hidden:
+  v2:
+    node: bagel_qwen2_mot.generate   # required V2 graph node / call-site
+    state: prompt_encode             # optional FSM-state disambiguation
+    field: bagel_last_hidden_state   # required V2 observation field (`loss` aliases to the shared loss field)
+    grad:                            # required for gradient probes
+      parameter: lm_head.weight      # required gradient parameter path
+      module: bagel_text_encoder     # optional; defaults to the node prefix before the first dot
+  ref:
+    field: hidden_state              # reference output path `reference.<field>`
+    hook: model.norm                 # or a module hook path
+    extractor: pkg.mod:fn            # or a callable entrypoint
+  tol: hidden                        # required tolerance policy key from base.yaml
+  step: last                         # optional; `last` (default) or `all`
+```
+
+Declare exactly one of `ref.field`, `ref.hook`, or `ref.extractor`.
 5. Implement or extend `driver.py` by returning a `ParityDriver` from `create_driver(case)`. The driver owns reference loading, reference execution, V2 model loading, and any model-specific input/output adaptation.
 6. Run the harness unit tests and at least one targeted parity case before broadening to the full suite.
 

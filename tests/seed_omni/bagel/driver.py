@@ -15,7 +15,10 @@ from tests.seed_omni.parity_suite.driver import ParityDriver
 from tests.seed_omni.parity_suite.reference.contract import canonical_from_reference_output
 from tests.seed_omni.parity_suite.v2.tier_runners.module import InferModulePolicy
 from veomni.models.seed_omni.modeling_omni import OmniModel
-from veomni.models.seed_omni.modules.bagel.training_pack import packed_label_rows
+from veomni.models.seed_omni.modules.bagel.packer import packed_label_rows
+
+
+_LM_HEAD_SAMPLE_ROWS_KEY = "_bagel_lm_head_sample_rows"
 
 
 def create_driver(case: ParityCase) -> BagelParityDriver:
@@ -117,7 +120,7 @@ class BagelParityDriver(ParityDriver):
         model: OmniModel,
         batch: Mapping[str, Any],
     ) -> Mapping[str, torch.Tensor]:
-        label_rows = _maybe_packed_label_rows(batch)
+        label_rows = _framework_lm_head_rows(batch)
         return {
             "qwen_early_q_proj": sample_named_param(
                 model.get_module("bagel_qwen2_mot"),
@@ -134,12 +137,25 @@ class BagelParityDriver(ParityDriver):
             ),
         }
 
+    def framework_parameter_sample_context(self, batch: Mapping[str, Any]) -> Mapping[str, torch.Tensor]:
+        label_rows = _maybe_packed_label_rows(batch)
+        if label_rows is None:
+            return {}
+        return {_LM_HEAD_SAMPLE_ROWS_KEY: label_rows.detach().cpu().to(dtype=torch.long)}
+
 
 def _maybe_packed_label_rows(batch: Mapping[str, Any]) -> torch.Tensor | None:
     try:
         return packed_label_rows(batch.get("conversation_list"))
     except (KeyError, ValueError):
         return None
+
+
+def _framework_lm_head_rows(batch: Mapping[str, Any]) -> torch.Tensor | None:
+    rows = batch.get(_LM_HEAD_SAMPLE_ROWS_KEY)
+    if torch.is_tensor(rows):
+        return rows.detach().cpu().to(dtype=torch.long)
+    return _maybe_packed_label_rows(batch)
 
 
 __all__ = [

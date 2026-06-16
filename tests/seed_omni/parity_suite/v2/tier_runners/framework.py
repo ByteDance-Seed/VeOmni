@@ -253,6 +253,9 @@ def _run_checkpoint_resume_policy(
         )
         _run_checkpoint_train_step(save_trainer, save_batch, seed=driver.case.model.seed)
         saved_parameters = driver.sample_v2_framework_parameters(save_model, save_batch)
+        # Reuse the post-step sampling context so resume compares the same rows
+        # without keeping graph-bearing batch tensors alive across model reload.
+        sample_context = getattr(driver, "framework_parameter_sample_context", lambda batch: batch)(save_batch)
         saved_lrs = save_trainer.base.lr_scheduler.get_last_lr()
         checkpoint_root = output_dir / "checkpoints" / "global_step_1"
         saved_layout = _checkpoint_layout(save_model, checkpoint_root)
@@ -272,7 +275,7 @@ def _run_checkpoint_resume_policy(
             max_grad_norm=options.max_grad_norm,
         )
         _checkpoint_on_train_begin(resume_trainer)
-        resumed_parameters = driver.sample_v2_framework_parameters(resume_model, resume_batch)
+        resumed_parameters = driver.sample_v2_framework_parameters(resume_model, sample_context)
         resume_lrs = resume_trainer.base.lr_scheduler.get_last_lr()
         resume_global_step = int(resume_trainer.base.state.global_step)
         _run_checkpoint_train_step(resume_trainer, resume_batch, seed=driver.case.model.seed)
@@ -293,7 +296,7 @@ def _run_checkpoint_resume_policy(
             driver, "framework.parameters_after_resume", resumed_parameters, saved_parameters, "gradient"
         ),
     ]
-    del resume_trainer, resume_model, resume_batch
+    del resume_trainer, resume_model, resume_batch, sample_context
     _release_cuda_memory()
     return ParityReport(case_id=driver.case.node_id, probes=tuple(reports))
 

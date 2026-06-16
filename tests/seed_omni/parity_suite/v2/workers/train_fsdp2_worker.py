@@ -20,7 +20,7 @@ sys.path.insert(0, str(_REPO_ROOT))
 
 from tests.seed_omni.parity_suite.core import configure_torch_determinism, to_device  # noqa: E402
 from veomni.arguments import OmniArguments, parse_omni_args  # noqa: E402
-from veomni.models.seed_omni.modules.bagel.training_pack import packed_label_rows  # noqa: E402
+from veomni.models.seed_omni.modules.bagel.packer import packed_label_rows  # noqa: E402
 from veomni.trainer.omni_trainer import MultiLRScheduler, MultiOptimizer, OmniTrainer  # noqa: E402
 
 

@@ -15,16 +15,20 @@ def test_probes_yaml_parses_hook_and_extractor_taps(tmp_path: Path) -> None:
     probes_path = tmp_path / "probes.yaml"
     probes_path.write_text(
         """
-nodes:
-  toy.generate:
-    text.hidden:
-      v2_field: hidden
-      ref_tap: model.norm
-      tol: hidden
-    text.greedy_token:
-      v2_field: greedy
-      ref_tap: {extractor: tests.seed_omni.parity_suite.suite_tests.test_probe_resolver:fake_extractor}
-      tol: exact
+text.hidden:
+  v2:
+    node: toy.generate
+    field: hidden
+  ref:
+    hook: model.norm
+  tol: hidden
+text.greedy_token:
+  v2:
+    node: toy.generate
+    field: greedy
+  ref:
+    extractor: tests.seed_omni.parity_suite.suite_tests.test_probe_resolver:fake_extractor
+  tol: exact
 """,
         encoding="utf-8",
     )
@@ -40,12 +44,13 @@ def test_probes_yaml_parses_output_tap(tmp_path: Path) -> None:
     probes_path = tmp_path / "probes.yaml"
     probes_path.write_text(
         """
-nodes:
-  toy.generate:
-    text.hidden:
-      v2_field: hidden
-      ref: hidden
-      tol: hidden
+text.hidden:
+  v2:
+    node: toy.generate
+    field: hidden
+  ref:
+    field: hidden
+  tol: hidden
 """,
         encoding="utf-8",
     )
@@ -85,13 +90,14 @@ def test_resolver_honors_optional_state_scope(tmp_path: Path) -> None:
     probes_path = tmp_path / "probes.yaml"
     probes_path.write_text(
         """
-nodes:
-  toy.generate:
-    image.hidden:
-      state: image_flow
-      v2_field: hidden
-      ref_tap: {extractor: tests.seed_omni.parity_suite.suite_tests.test_probe_resolver:fake_extractor}
-      tol: hidden
+image.hidden:
+  v2:
+    node: toy.generate
+    state: image_flow
+    field: hidden
+  ref:
+    extractor: tests.seed_omni.parity_suite.suite_tests.test_probe_resolver:fake_extractor
+  tol: hidden
 """,
         encoding="utf-8",
     )
@@ -109,15 +115,16 @@ def test_probes_yaml_parses_v2_gradient_spec(tmp_path: Path) -> None:
     probes_path = tmp_path / "probes.yaml"
     probes_path.write_text(
         """
-nodes:
-  toy.forward:
-    train.grad_weight:
-      v2_field: grad_weight
-      v2_grad:
-        module: toy_module
-        parameter: linear.weight
-      ref: grad_weight
-      tol: gradient
+train.grad_weight:
+  v2:
+    node: toy.forward
+    field: grad_weight
+    grad:
+      module: toy_module
+      parameter: linear.weight
+  ref:
+    field: grad_weight
+  tol: gradient
 """,
         encoding="utf-8",
     )
@@ -131,20 +138,45 @@ nodes:
     assert probe.ref_tap.target == "reference.grad_weight"
 
 
+def test_probes_yaml_infers_grad_module_from_v2_node(tmp_path: Path) -> None:
+    probes_path = tmp_path / "probes.yaml"
+    probes_path.write_text(
+        """
+train.grad_weight:
+  v2:
+    node: toy_module.forward
+    field: grad_weight
+    grad:
+      parameter: linear.weight
+  ref:
+    field: grad_weight
+  tol: gradient
+""",
+        encoding="utf-8",
+    )
+
+    [probe] = load_probe_catalog(probes_path).probes
+
+    assert probe.v2_grad is not None
+    assert probe.v2_grad.module == "toy_module"
+    assert probe.v2_grad.parameter == "linear.weight"
+
+
 def test_probes_yaml_ignores_rows_from_in_v2_grad(tmp_path: Path) -> None:
     probes_path = tmp_path / "probes.yaml"
     probes_path.write_text(
         """
-nodes:
-  toy.forward:
-    train.grad_weight:
-      v2_field: grad_weight
-      v2_grad:
-        module: toy_module
-        parameter: linear.weight
-        rows_from: packed.labels
-      ref: grad_weight
-      tol: gradient
+train.grad_weight:
+  v2:
+    node: toy_module.forward
+    field: grad_weight
+    grad:
+      module: toy_module
+      parameter: linear.weight
+      rows_from: packed.labels
+  ref:
+    field: grad_weight
+  tol: gradient
 """,
         encoding="utf-8",
     )
@@ -165,12 +197,13 @@ def test_probes_yaml_resolves_loss_field_alias(tmp_path: Path) -> None:
     probes_path = tmp_path / "probes.yaml"
     probes_path.write_text(
         """
-nodes:
-  toy.decode:
-    train.ce_loss:
-      v2_field: loss
-      ref: train_ce_loss
-      tol: loss
+train.ce_loss:
+  v2:
+    node: toy.decode
+    field: loss
+  ref:
+    field: train_ce_loss
+  tol: loss
 """,
         encoding="utf-8",
     )
@@ -184,12 +217,13 @@ def test_resolver_requires_state_for_multi_state_nodes(tmp_path: Path) -> None:
     probes_path = tmp_path / "probes.yaml"
     probes_path.write_text(
         """
-nodes:
-  toy.generate:
-    text.hidden:
-      v2_field: hidden
-      ref: hidden
-      tol: hidden
+text.hidden:
+  v2:
+    node: toy.generate
+    field: hidden
+  ref:
+    field: hidden
+  tol: hidden
 """,
         encoding="utf-8",
     )
@@ -203,7 +237,7 @@ nodes:
         resolve_probes(probes=(probe,), nodes=nodes)
 
 
-def _write_probes(tmp_path: Path) -> Path:
+def test_load_probe_catalog_rejects_node_keyed_schema(tmp_path: Path) -> None:
     probes_path = tmp_path / "probes.yaml"
     probes_path.write_text(
         """
@@ -211,12 +245,34 @@ nodes:
   toy.generate:
     text.hidden:
       v2_field: hidden
-      ref_tap: model.norm
+      ref: hidden
       tol: hidden
-    text.greedy_token:
-      v2_field: greedy
-      ref_tap: {extractor: tests.seed_omni.parity_suite.suite_tests.test_probe_resolver:fake_extractor}
-      tol: exact
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="deprecated node-keyed probes schema"):
+        load_probe_catalog(probes_path)
+
+
+def _write_probes(tmp_path: Path) -> Path:
+    probes_path = tmp_path / "probes.yaml"
+    probes_path.write_text(
+        """
+text.hidden:
+  v2:
+    node: toy.generate
+    field: hidden
+  ref:
+    hook: model.norm
+  tol: hidden
+text.greedy_token:
+  v2:
+    node: toy.generate
+    field: greedy
+  ref:
+    extractor: tests.seed_omni.parity_suite.suite_tests.test_probe_resolver:fake_extractor
+  tol: exact
 """,
         encoding="utf-8",
     )

@@ -7,7 +7,7 @@ import torch
 from ....conversation import ConversationItem
 from ....generation_graph import FSM_SIGNAL_KEY
 from ....module import ModuleMixin, post_forward, pre_forward
-from ..training_pack import add_dummy_anchor_to_batch, get_packed_batch, zero_hidden_from_batch
+from ..packer import add_dummy_anchor_to_batch, get_packed_batch, zero_hidden_from_batch
 
 
 SIGNAL_IMAGE_COMPLETE = "image_complete"

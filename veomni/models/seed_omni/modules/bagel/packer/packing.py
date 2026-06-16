@@ -12,8 +12,9 @@ from typing import Any
 
 import torch
 
-from ...conversation import ConversationItem
-from .training_pack import BAGEL_DUMMY_ANCHORS_META_KEY, conversation_samples, dummy_anchors_from_conversation
+from ....conversation import ConversationItem
+from .anchors import BAGEL_DUMMY_ANCHORS_META_KEY, dummy_anchors_from_conversation
+from .carrier import conversation_samples
 
 
 def pack_training_conversation(
@@ -523,6 +524,9 @@ def _prepare_attention_mask_per_sample(split_lens: Iterable[int], attn_modes: It
         attention_mask[cursor : cursor + length, :cursor] = True
         cursor += length
 
+    # Noise (image-generation target) tokens must stay invisible to every other token:
+    # no later token may attend to them, and they only attend within their own span.
+    # This second pass overrides the cross-attention granted by the first pass.
     cursor = 0
     for length, mode in zip(split_lens, attn_modes, strict=True):
         if mode == "noise":
@@ -535,6 +539,3 @@ def _prepare_attention_mask_per_sample(split_lens: Iterable[int], attn_modes: It
 def _shifted_timesteps(timesteps: torch.Tensor, timestep_shift: float) -> torch.Tensor:
     values = torch.sigmoid(timesteps)
     return timestep_shift * values / (1 + (timestep_shift - 1) * values)
-
-
-__all__ = ["BagelTrainingPacker", "pack_training_conversation"]

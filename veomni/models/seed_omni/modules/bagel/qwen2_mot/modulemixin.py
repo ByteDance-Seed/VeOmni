@@ -8,7 +8,7 @@ from veomni.utils.tensor_utils import naflatten
 
 from ....conversation import ConversationItem, is_dummy
 from ....module import ModuleMixin, post_forward, pre_forward
-from ..training_pack import BAGEL_DUMMY_ANCHORS_META_KEY, fold_dummy_anchors, get_packed_batch
+from ..packer import BAGEL_DUMMY_ANCHORS_META_KEY, fold_dummy_anchors, get_packed_batch
 
 
 class BagelQwen2MoTModuleMixin(ModuleMixin):

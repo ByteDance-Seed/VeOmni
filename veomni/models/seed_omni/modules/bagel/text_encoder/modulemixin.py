@@ -9,8 +9,7 @@ from ....conversation import ConversationItem, maybe_merge_outputs, seal_outputs
 from ....generation_graph import FSM_SIGNAL_KEY
 from ....module import post_forward, pre_forward
 from ...base.text_encoder.modulemixin import TextEncoderModuleMixin
-from ..packer import pack_training_conversation
-from ..training_pack import get_packed_batch, set_packed_batch, zero_hidden_from_batch
+from ..packer import get_packed_batch, pack_training_conversation, set_packed_batch, zero_hidden_from_batch
 
 
 SIGNAL_TEXT_DONE = "text_done"

@@ -61,6 +61,11 @@ def _apply_rotary_pos_emb(
 
 
 def _fold_zero_anchors(target: torch.Tensor, *anchors: torch.Tensor) -> torch.Tensor:
+    # When a packed batch has no generation tokens, the MoT "gen" expert weights still
+    # run on an empty slice and produce zero-sized outputs. Folding ``sum() * 0.0`` of
+    # those outputs into ``target`` keeps the gen-expert parameters in the autograd graph
+    # (with zero gradient) so FSDP/DP gradient reduction sees the same parameter set on
+    # every rank regardless of which modalities a micro-batch contains.
     anchor = target.new_zeros(())
     has_anchor = False
     for value in anchors:
@@ -185,6 +190,8 @@ class BagelQwen2MoTAttention(nn.Module):
             packed_value_states[packed_und_token_indexes] = self.v_proj(packed_sequence_und)
             packed_value_states[packed_gen_token_indexes] = self.v_proj_moe_gen(packed_sequence_gen)
         else:
+            # No gen tokens: run the gen experts on the empty slice anyway and keep handles
+            # to their outputs so _fold_zero_anchors can anchor those weights below.
             query_states_gen = self.q_proj_moe_gen(packed_sequence_gen)
             key_states_gen = self.k_proj_moe_gen(packed_sequence_gen)
             value_states_gen = self.v_proj_moe_gen(packed_sequence_gen)

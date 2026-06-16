@@ -1,149 +1,240 @@
-nodes:
-  bagel_text_encoder.decode:
-    train.ce_loss:
-      v2_field: loss
-      ref: train_ce_loss
-      tol: loss
-    train.grad_lm_head_rows:
-      v2_field: train_grad_lm_head_rows
-      v2_grad:
-        module: bagel_text_encoder
-        parameter: lm_head.weight
-      ref: train_grad_lm_head_rows
-      tol: gradient
-  bagel_qwen2_mot.forward:
-    train.grad_early_q_proj:
-      v2_field: train_grad_early_q_proj
-      v2_grad:
-        module: bagel_qwen2_mot
-        parameter: model.layers.0.self_attn.q_proj.weight
-      ref: train_grad_early_q_proj
-      tol: gradient
-    train.grad_gen_q_proj:
-      v2_field: train_grad_gen_q_proj
-      v2_grad:
-        module: bagel_qwen2_mot
-        parameter: model.layers.0.self_attn.q_proj_moe_gen.weight
-      ref: train_grad_gen_q_proj
-      tol: gradient
-  bagel_qwen2_mot.generate:
-    text.hidden:
-      state: prompt_encode
-      v2_field: bagel_last_hidden_state
-      ref: hidden_state
-      tol: hidden
-    image.hidden_sample:
-      state: image_flow
-      v2_field: bagel_last_hidden_state_sample
-      ref: image_hidden_state_sample
-      tol: hidden
-  bagel_text_encoder.token_generate:
-    text.logits:
-      state: prompt_encode
-      v2_field: bagel_last_logits
-      ref_tap: model.language_model.lm_head
-      tol: logits
-    text.greedy_token:
-      state: prompt_encode
-      v2_field: bagel_last_greedy_token
-      ref: greedy_token
-      tol: exact
-  bagel_siglip_navit.forward:
-    train.grad_siglip_q_proj:
-      v2_field: train_grad_siglip_q_proj
-      v2_grad:
-        module: bagel_siglip_navit
-        parameter: vision_model.encoder.layers.0.self_attn.q_proj.weight
-      ref: train_grad_siglip_q_proj
-      tol: gradient
-  bagel_siglip_navit.generate:
-    image.image_embeds_sample:
-      state: prompt_encode
-      v2_field: bagel_last_image_embeds_sample
-      ref: image_embeds_sample
-      tol: hidden
-    image.preprocessed_image_size:
-      state: prompt_encode
-      v2_field: bagel_preprocessed_image_size
-      ref: preprocessed_image_size
-      tol: exact
-  bagel_vae.encode:
-    image.vae_context_latents:
-      state: prompt_encode
-      v2_field: bagel_last_vae_context_latents
-      ref: vae_context_latents
-      tol: latent
-  bagel_vae.decode:
-    image.generated_image_count:
-      state: image_decode
-      v2_field: bagel_generated_image_count
-      ref: generated_image_count
-      tol: exact
-    image.generated_image_size:
-      state: image_decode
-      v2_field: bagel_generated_image_size
-      ref: generated_image_size
-      tol: exact
-  bagel_flow_connector.embed_latent:
-    image.vae_context_latent_embeds_sample:
-      state: prompt_encode
-      v2_field: bagel_last_vae_context_latent_embeds_sample
-      ref: vae_context_latent_embeds_sample
-      tol: hidden
-    image.vae_context_packed_sequence_sample:
-      state: prompt_encode
-      v2_field: bagel_last_vae_context_packed_sequence_sample
-      ref: vae_context_packed_sequence_sample
-      tol: hidden
-    image.latent_embeds_sample:
-      state: image_flow
-      v2_field: bagel_last_latent_embeds_sample
-      ref: latent_embeds_sample
-      tol: hidden
-    image.packed_sequence_sample:
-      state: image_flow
-      v2_field: bagel_last_packed_sequence_sample
-      ref: packed_sequence_sample
-      tol: hidden
-  bagel_flow_connector.decode_velocity:
-    train.mse_loss:
-      v2_field: loss
-      ref: train_mse_loss
-      tol: loss
-    train.grad_llm2vae:
-      v2_field: train_grad_llm2vae
-      v2_grad:
-        module: bagel_flow_connector
-        parameter: llm2vae.weight
-      ref: train_grad_llm2vae
-      tol: gradient
-    image.velocity:
-      v2_field: bagel_last_velocity
-      ref: velocity
-      tol: velocity
-      step: all
-    image.base_velocity:
-      v2_field: bagel_last_base_velocity
-      ref: base_velocity
-      tol: velocity
-    image.cfg_text_hidden_sample:
-      v2_field: bagel_last_cfg_text_hidden_state_sample
-      ref: cfg_text_hidden_state_sample
-      tol: hidden
-    image.cfg_img_hidden_sample:
-      v2_field: bagel_last_cfg_img_hidden_state_sample
-      ref: cfg_img_hidden_state_sample
-      tol: hidden
-    image.cfg_text_velocity:
-      v2_field: bagel_last_cfg_text_velocity
-      ref: cfg_text_velocity
-      tol: velocity
-    image.cfg_img_velocity:
-      v2_field: bagel_last_cfg_img_velocity
-      ref: cfg_img_velocity
-      tol: velocity
-    image.x_t:
-      v2_field: bagel_last_x_t
-      ref: x_t
-      tol: latent
-      step: all
+train.ce_loss:
+  v2:
+    node: bagel_text_encoder.decode
+    field: loss
+  ref:
+    field: train_ce_loss
+  tol: loss
+
+train.grad_lm_head_rows:
+  v2:
+    node: bagel_text_encoder.decode
+    field: train_grad_lm_head_rows
+    grad:
+      parameter: lm_head.weight
+  ref:
+    field: train_grad_lm_head_rows
+  tol: gradient
+
+train.grad_early_q_proj:
+  v2:
+    node: bagel_qwen2_mot.forward
+    field: train_grad_early_q_proj
+    grad:
+      parameter: model.layers.0.self_attn.q_proj.weight
+  ref:
+    field: train_grad_early_q_proj
+  tol: gradient
+
+train.grad_gen_q_proj:
+  v2:
+    node: bagel_qwen2_mot.forward
+    field: train_grad_gen_q_proj
+    grad:
+      parameter: model.layers.0.self_attn.q_proj_moe_gen.weight
+  ref:
+    field: train_grad_gen_q_proj
+  tol: gradient
+
+text.hidden:
+  v2:
+    node: bagel_qwen2_mot.generate
+    state: prompt_encode
+    field: bagel_last_hidden_state
+  ref:
+    field: hidden_state
+  tol: hidden
+
+image.hidden_sample:
+  v2:
+    node: bagel_qwen2_mot.generate
+    state: image_flow
+    field: bagel_last_hidden_state_sample
+  ref:
+    field: image_hidden_state_sample
+  tol: hidden
+
+text.logits:
+  v2:
+    node: bagel_text_encoder.token_generate
+    state: prompt_encode
+    field: bagel_last_logits
+  ref:
+    hook: model.language_model.lm_head
+  tol: logits
+
+text.greedy_token:
+  v2:
+    node: bagel_text_encoder.token_generate
+    state: prompt_encode
+    field: bagel_last_greedy_token
+  ref:
+    field: greedy_token
+  tol: exact
+
+train.grad_siglip_q_proj:
+  v2:
+    node: bagel_siglip_navit.forward
+    field: train_grad_siglip_q_proj
+    grad:
+      parameter: vision_model.encoder.layers.0.self_attn.q_proj.weight
+  ref:
+    field: train_grad_siglip_q_proj
+  tol: gradient
+
+image.image_embeds_sample:
+  v2:
+    node: bagel_siglip_navit.generate
+    state: prompt_encode
+    field: bagel_last_image_embeds_sample
+  ref:
+    field: image_embeds_sample
+  tol: hidden
+
+image.preprocessed_image_size:
+  v2:
+    node: bagel_siglip_navit.generate
+    state: prompt_encode
+    field: bagel_preprocessed_image_size
+  ref:
+    field: preprocessed_image_size
+  tol: exact
+
+image.vae_context_latents:
+  v2:
+    node: bagel_vae.encode
+    state: prompt_encode
+    field: bagel_last_vae_context_latents
+  ref:
+    field: vae_context_latents
+  tol: latent
+
+image.generated_image_count:
+  v2:
+    node: bagel_vae.decode
+    state: image_decode
+    field: bagel_generated_image_count
+  ref:
+    field: generated_image_count
+  tol: exact
+
+image.generated_image_size:
+  v2:
+    node: bagel_vae.decode
+    state: image_decode
+    field: bagel_generated_image_size
+  ref:
+    field: generated_image_size
+  tol: exact
+
+image.vae_context_latent_embeds_sample:
+  v2:
+    node: bagel_flow_connector.embed_latent
+    state: prompt_encode
+    field: bagel_last_vae_context_latent_embeds_sample
+  ref:
+    field: vae_context_latent_embeds_sample
+  tol: hidden
+
+image.vae_context_packed_sequence_sample:
+  v2:
+    node: bagel_flow_connector.embed_latent
+    state: prompt_encode
+    field: bagel_last_vae_context_packed_sequence_sample
+  ref:
+    field: vae_context_packed_sequence_sample
+  tol: hidden
+
+image.latent_embeds_sample:
+  v2:
+    node: bagel_flow_connector.embed_latent
+    state: image_flow
+    field: bagel_last_latent_embeds_sample
+  ref:
+    field: latent_embeds_sample
+  tol: hidden
+
+image.packed_sequence_sample:
+  v2:
+    node: bagel_flow_connector.embed_latent
+    state: image_flow
+    field: bagel_last_packed_sequence_sample
+  ref:
+    field: packed_sequence_sample
+  tol: hidden
+
+train.mse_loss:
+  v2:
+    node: bagel_flow_connector.decode_velocity
+    field: loss
+  ref:
+    field: train_mse_loss
+  tol: loss
+
+train.grad_llm2vae:
+  v2:
+    node: bagel_flow_connector.decode_velocity
+    field: train_grad_llm2vae
+    grad:
+      parameter: llm2vae.weight
+  ref:
+    field: train_grad_llm2vae
+  tol: gradient
+
+image.velocity:
+  v2:
+    node: bagel_flow_connector.decode_velocity
+    field: bagel_last_velocity
+  ref:
+    field: velocity
+  tol: velocity
+  step: all
+
+image.base_velocity:
+  v2:
+    node: bagel_flow_connector.decode_velocity
+    field: bagel_last_base_velocity
+  ref:
+    field: base_velocity
+  tol: velocity
+
+image.cfg_text_hidden_sample:
+  v2:
+    node: bagel_flow_connector.decode_velocity
+    field: bagel_last_cfg_text_hidden_state_sample
+  ref:
+    field: cfg_text_hidden_state_sample
+  tol: hidden
+
+image.cfg_img_hidden_sample:
+  v2:
+    node: bagel_flow_connector.decode_velocity
+    field: bagel_last_cfg_img_hidden_state_sample
+  ref:
+    field: cfg_img_hidden_state_sample
+  tol: hidden
+
+image.cfg_text_velocity:
+  v2:
+    node: bagel_flow_connector.decode_velocity
+    field: bagel_last_cfg_text_velocity
+  ref:
+    field: cfg_text_velocity
+  tol: velocity
+
+image.cfg_img_velocity:
+  v2:
+    node: bagel_flow_connector.decode_velocity
+    field: bagel_last_cfg_img_velocity
+  ref:
+    field: cfg_img_velocity
+  tol: velocity
+
+image.x_t:
+  v2:
+    node: bagel_flow_connector.decode_velocity
+    field: bagel_last_x_t
+  ref:
+    field: x_t
+  tol: latent
+  step: all

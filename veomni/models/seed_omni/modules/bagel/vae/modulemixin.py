@@ -9,7 +9,7 @@ from PIL import Image
 
 from ....conversation import ConversationItem
 from ....module import ModuleMixin, post_forward, pre_forward
-from ..training_pack import conversation_samples, get_packed_batch
+from ..packer import conversation_samples, get_packed_batch
 
 
 class BagelVAEModuleMixin(ModuleMixin):

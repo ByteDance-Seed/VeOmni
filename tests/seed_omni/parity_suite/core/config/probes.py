@@ -20,17 +20,20 @@ class RefTapSpec:
     target: str
 
     @classmethod
-    def from_raw(cls, raw: Any, *, probe: str) -> RefTapSpec:
-        if isinstance(raw, str):
-            return cls(kind="hook", target=raw)
-        if isinstance(raw, dict) and "extractor" in raw:
-            return cls(kind="extractor", target=str(raw["extractor"]))
-        if isinstance(raw, dict) and "output" in raw:
-            return cls(kind="output", target=str(raw["output"]))
-        raise TypeError(
-            f"Probe {probe} ref_tap must be a hook path string, "
-            "{extractor: entrypoint}, or {output: context.output.path} mapping."
-        )
+    def from_ref_raw(cls, raw: Any, *, probe: str) -> RefTapSpec:
+        if not isinstance(raw, dict):
+            raise TypeError(f"Probe {probe!r} ref must be a mapping.")
+        has_field = "field" in raw
+        has_hook = "hook" in raw
+        has_extractor = "extractor" in raw
+        declared = int(has_field) + int(has_hook) + int(has_extractor)
+        if declared != 1:
+            raise ValueError(f"Probe {probe!r} ref must declare exactly one of field, hook, or extractor.")
+        if has_field:
+            return cls(kind="output", target=f"reference.{raw['field']}")
+        if has_hook:
+            return cls(kind="hook", target=str(raw["hook"]))
+        return cls(kind="extractor", target=str(raw["extractor"]))
 
 
 @dataclass(frozen=True)
@@ -39,15 +42,16 @@ class V2GradSpec:
     parameter: str
 
     @classmethod
-    def from_raw(cls, raw: Any, *, probe: str) -> V2GradSpec | None:
+    def from_raw(cls, raw: Any, *, probe: str, node: str) -> V2GradSpec | None:
         if raw is None:
             return None
         if not isinstance(raw, dict):
-            raise TypeError(f"Probe {probe} v2_grad must be a mapping.")
-        if "module" not in raw or "parameter" not in raw:
-            raise ValueError(f"Probe {probe} v2_grad must declare module and parameter.")
+            raise TypeError(f"Probe {probe!r} v2.grad must be a mapping.")
+        if "parameter" not in raw:
+            raise ValueError(f"Probe {probe!r} v2.grad must declare parameter.")
+        module = str(raw["module"]) if "module" in raw else node.split(".", 1)[0]
         return cls(
-            module=str(raw["module"]),
+            module=module,
             parameter=str(raw["parameter"]),
         )
 
@@ -67,38 +71,39 @@ class ProbeMapping:
     step: str = "last"
 
     @classmethod
-    def from_raw(cls, node: str, probe: str, raw: Mapping[str, Any]) -> ProbeMapping:
-        if "v2_field" not in raw:
-            raise ValueError(f"Probe {node}.{probe} must declare v2_field.")
-        has_ref = "ref" in raw
-        has_ref_tap = "ref_tap" in raw
-        if has_ref == has_ref_tap:
-            raise ValueError(f"Probe {node}.{probe} must declare exactly one of ref or ref_tap.")
+    def from_raw(cls, probe: str, raw: Mapping[str, Any]) -> ProbeMapping:
+        if "v2" not in raw:
+            raise ValueError(f"Probe {probe!r} must declare v2.")
+        v2_raw = raw["v2"]
+        if not isinstance(v2_raw, dict):
+            raise TypeError(f"Probe {probe!r} v2 must be a mapping.")
+        if "node" not in v2_raw:
+            raise ValueError(f"Probe {probe!r} v2 must declare node.")
+        if "field" not in v2_raw:
+            raise ValueError(f"Probe {probe!r} v2 must declare field.")
+        if "ref" not in raw:
+            raise ValueError(f"Probe {probe!r} must declare ref.")
         if "tol" not in raw:
-            raise ValueError(f"Probe {node}.{probe} must declare tol.")
+            raise ValueError(f"Probe {probe!r} must declare tol.")
         step = str(raw.get("step", "last"))
         if step not in _STEP_POLICIES:
             raise ValueError(
-                f"Probe {node}.{probe} has unsupported step policy {step!r}; expected one of {sorted(_STEP_POLICIES)}."
+                f"Probe {probe!r} has unsupported step policy {step!r}; expected one of {sorted(_STEP_POLICIES)}."
             )
-        v2_field = str(raw["v2_field"])
+        node = str(v2_raw["node"])
+        v2_field = str(v2_raw["field"])
         if v2_field == "loss":
             from tests.seed_omni.parity_suite.v2.observation import LOSS_FIELD
 
             v2_field = LOSS_FIELD
-        ref_tap_raw: Any
-        if has_ref:
-            ref_tap_raw = {"output": f"reference.{raw['ref']}"}
-        else:
-            ref_tap_raw = raw["ref_tap"]
         return cls(
             node=node,
             probe=probe,
             v2_field=v2_field,
-            ref_tap=RefTapSpec.from_raw(ref_tap_raw, probe=f"{node}.{probe}"),
+            ref_tap=RefTapSpec.from_ref_raw(raw["ref"], probe=probe),
             tol=str(raw["tol"]),
-            state=None if raw.get("state") is None else str(raw["state"]),
-            v2_grad=V2GradSpec.from_raw(raw.get("v2_grad"), probe=f"{node}.{probe}"),
+            state=None if v2_raw.get("state") is None else str(v2_raw["state"]),
+            v2_grad=V2GradSpec.from_raw(v2_raw.get("grad"), probe=probe, node=node),
             step=step,
         )
 
@@ -137,7 +142,7 @@ class ResolvedProbes:
 
 
 def load_probe_catalog(path: Path) -> ProbeCatalog:
-    """Load a node-keyed probes.yaml file."""
+    """Load a probe-keyed probes.yaml file."""
 
     if not path.exists():
         return ProbeCatalog()
@@ -146,18 +151,16 @@ def load_probe_catalog(path: Path) -> ProbeCatalog:
         raise TypeError(f"{path} must contain a YAML mapping.")
     if "input_boundary" in data:
         raise ValueError(f"{path} must not declare input_boundary; input shape is driver-owned.")
-    nodes = data.get("nodes", {}) or {}
-    if not isinstance(nodes, dict):
-        raise TypeError("probes.yaml nodes must be a mapping.")
+    if "nodes" in data:
+        raise ValueError(
+            f"{path} uses deprecated node-keyed probes schema; declare each public probe name at the top level."
+        )
 
     probes: list[ProbeMapping] = []
-    for node, raw_node in nodes.items():
-        if not isinstance(raw_node, dict):
-            raise TypeError(f"probes.yaml node {node!r} must map probes to specs.")
-        for probe, raw_probe in raw_node.items():
-            if not isinstance(raw_probe, dict):
-                raise TypeError(f"probes.yaml probe {node}.{probe} must be a mapping.")
-            probes.append(ProbeMapping.from_raw(str(node), str(probe), raw_probe))
+    for probe_name, raw_probe in data.items():
+        if not isinstance(raw_probe, dict):
+            raise TypeError(f"probes.yaml probe {probe_name!r} must be a mapping.")
+        probes.append(ProbeMapping.from_raw(str(probe_name), raw_probe))
     return ProbeCatalog(probes=tuple(probes))
 
 
@@ -185,8 +188,8 @@ def resolve_probes(
         node_states = {node.state for node in node_by_name[probe.node] if node.state is not None}
         if probe.state is None and len(node_states) > 1:
             raise ValueError(
-                f"Probe {probe.node}.{probe.probe} maps node {probe.node!r} which appears in multiple "
-                f"states {sorted(node_states)}; declare an explicit state."
+                f"Probe {probe.probe!r} maps node {probe.node!r} which appears in multiple "
+                f"states {sorted(node_states)}; declare an explicit v2.state."
             )
         _collect_ref_tap(probe, ref_taps=ref_taps, seen=seen_ref_taps)
         for node in node_by_name[probe.node]:

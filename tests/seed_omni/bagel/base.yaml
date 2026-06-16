@@ -2,10 +2,10 @@ name: bagel
 
 reference:
   module: tests.seed_omni.bagel.reference_model:BagelModel
-  checkpoint: ${MODEL_HUB}/transformers/BAGEL-7B-MoT
+  checkpoint: /mnt/hdfs/user_dir/veomni_omni/models/transformers/BAGEL-7B-MoT
 
 v2_model:
-  model_root: ${MODEL_HUB}/seed_omni/BAGEL-7B-MoT
+  model_root: /mnt/hdfs/user_dir/veomni_omni/models/seed_omni/BAGEL-7B-MoT
   config_dir: configs/seed_omni/Bagel/bagel_7b_mot
   module_dirs: auto
 

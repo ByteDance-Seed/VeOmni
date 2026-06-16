@@ -8,7 +8,7 @@ from PIL import Image
 
 from ....conversation import ConversationItem
 from ....module import ModuleMixin, post_forward, pre_forward
-from ..training_pack import add_dummy_anchor_to_batch, append_dummy_anchor, conversation_samples, get_packed_batch
+from ..packer import add_dummy_anchor_to_batch, append_dummy_anchor, conversation_samples, get_packed_batch
 
 
 class BagelSiglipNavitModuleMixin(ModuleMixin):
