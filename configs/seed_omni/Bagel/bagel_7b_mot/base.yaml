@@ -1,7 +1,7 @@
 # VeOmni training / inference config for OmniModel V2 - BAGEL-7B-MoT.
 
 model:
-  model_path: /mnt/hdfs/shizhelun/veomni_omni/models/seed_omni/BAGEL-7B-MoT
+  model_path: /mnt/hdfs/user_dir/veomni_omni/models/seed_omni/BAGEL-7B-MoT
   modules: configs/seed_omni/Bagel/bagel_7b_mot/modules_train.yaml
   train_graph: configs/seed_omni/Bagel/bagel_7b_mot/graph_train.yaml
   ops_implementation:
@@ -27,7 +27,7 @@ accelerator:
 data:
   data_type: seedomni
   max_seq_len: 4096
-  train_path: /mnt/hdfs/shizhelun/veomni_omni/data
+  train_path: /mnt/hdfs/user_dir/veomni_omni/data
   datasets_type: mapping
   chat_template: default
   dataloader:
@@ -76,7 +76,7 @@ train:
     name: bagel_7b_mot_omni_sft
 
 infer:
-  model_path: /mnt/hdfs/shizhelun/veomni_omni/models/seed_omni/BAGEL-7B-MoT
+  model_path: /mnt/hdfs/user_dir/veomni_omni/models/seed_omni/BAGEL-7B-MoT
   modules: configs/seed_omni/Bagel/bagel_7b_mot/modules_infer.yaml
   infer_graph:
     infer_edit: configs/seed_omni/Bagel/bagel_7b_mot/graph_infer_edit.yaml

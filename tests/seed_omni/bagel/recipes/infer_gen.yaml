@@ -1,6 +1,7 @@
 image_gen:
   - stimulus:
       prompt: "A small ceramic teapot on a wooden table, soft morning light."
+      infer_mode: gen
       max_new_tokens: 2
       max_flow_steps: 1
       image_height: 1024
@@ -33,12 +34,10 @@ image_gen:
             - image.hidden_sample
             - image.velocity
             - image.x_t
-          options:
-            required_nodes:
-              - [image_flow, bagel_flow_connector.decode_velocity]
 
   - stimulus:
       prompt: "A panoramic watercolor view of a quiet beach at dusk."
+      infer_mode: gen
       max_new_tokens: 2
       max_flow_steps: 1
       image_height: 768
@@ -71,12 +70,10 @@ image_gen:
             - image.hidden_sample
             - image.velocity
             - image.x_t
-          options:
-            required_nodes:
-              - [image_flow, bagel_flow_connector.decode_velocity]
 
   - stimulus:
       prompt: "A tiny red robot painting flowers in a quiet studio."
+      infer_mode: gen
       max_new_tokens: 2
       max_flow_steps: 1
       image_height: 512
@@ -109,12 +106,10 @@ image_gen:
             - image.cfg_text_velocity
             - image.velocity
             - image.x_t
-          options:
-            required_nodes:
-              - [image_flow, bagel_flow_connector.decode_velocity]
 
   - stimulus:
       prompt: "A blue glass owl sitting beside a candle."
+      infer_mode: gen
       max_new_tokens: 2
       max_flow_steps: 1
       image_height: 512
@@ -151,12 +146,10 @@ image_gen:
             - image.cfg_img_velocity
             - image.velocity
             - image.x_t
-          options:
-            required_nodes:
-              - [image_flow, bagel_flow_connector.decode_velocity]
 
   - stimulus:
       prompt: "A paper boat floating through a neon canal."
+      infer_mode: gen
       max_new_tokens: 2
       max_flow_steps: 1
       image_height: 512
@@ -187,12 +180,10 @@ image_gen:
             - image.cfg_text_velocity
             - image.velocity
             - image.x_t
-          options:
-            required_nodes:
-              - [image_flow, bagel_flow_connector.decode_velocity]
 
   - stimulus:
       prompt: "A silver toy train crossing a small wooden bridge."
+      infer_mode: gen
       max_new_tokens: 6
       max_flow_steps: 3
       image_height: 512
@@ -224,6 +215,7 @@ image_gen:
 
   - stimulus:
       prompt: "A small clay house under a clear sky."
+      infer_mode: gen
       max_new_tokens: 6
       max_flow_steps: 2
       image_height: 512
@@ -256,6 +248,7 @@ image_gen:
 
   - stimulus:
       prompt: "A tiny red robot painting flowers in a quiet studio."
+      infer_mode: gen
       max_new_tokens: 6
       max_flow_steps: 2
       image_height: 512
@@ -288,6 +281,7 @@ image_gen:
 
   - stimulus:
       prompt: "A blue glass owl sitting beside a candle."
+      infer_mode: gen
       max_new_tokens: 6
       max_flow_steps: 2
       image_height: 512

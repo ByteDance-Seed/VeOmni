@@ -42,7 +42,7 @@ def run_v2_infer_module(
 
     model = driver.load_v2_model(device=device, dtype=dtype)
     request = driver.v2_request_kwargs(reference_output, device=device)
-    generation_kwargs = driver.generation_kwargs(model)
+    generation_kwargs = driver.generation_kwargs(model, reference_output)
     return run_infer_module_fsm(
         model,
         request,

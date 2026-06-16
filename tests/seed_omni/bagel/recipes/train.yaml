@@ -148,7 +148,7 @@ train_ce_mse:
       data_type: seedomni
       train_path:
         sources:
-          - /mnt/hdfs/shizhelun/dataset/imagenet1k_train
+          - /mnt/hdfs/user_dir/dataset/imagenet1k_train
           - /mnt/hdfs/veomni/datasets/tulu-3-sft-mixture/data
           - /mnt/hdfs/veomni/datasets/sharegpt4v_cap_100k
         names:

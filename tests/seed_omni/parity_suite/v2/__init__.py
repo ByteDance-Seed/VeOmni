@@ -9,6 +9,7 @@ from .model import (
     load_omni_module_from_pretrained,
 )
 from .observation import (
+    LOSS_FIELD,
     ModuleObservationSink,
     ObserverSink,
     arm_generation_observer,
@@ -33,6 +34,7 @@ from .tier_runners import (
 
 
 __all__ = [
+    "LOSS_FIELD",
     "ObserverSink",
     "InferModulePolicy",
     "ModuleObservationSink",

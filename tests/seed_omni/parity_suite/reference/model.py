@@ -33,6 +33,13 @@ class ParityReferenceModel(nn.Module):
         if not model_type:
             raise ValueError(f"{cls.__name__} must define model_type or config_class.model_type.")
 
+        # transformers >= 5.9.0 requires AutoConfig.register's model_type to match
+        # config_class.model_type. Vendored reference configs may leave model_type
+        # empty; set it online here so we register consistently without editing the
+        # vendored config definition on disk.
+        if not getattr(config_class, "model_type", ""):
+            config_class.model_type = model_type
+
         from transformers import AutoConfig, AutoModel
 
         AutoConfig.register(model_type, config_class, exist_ok=exist_ok)

@@ -23,7 +23,7 @@ def run_v2_infer_graph(
 
     model = driver.load_v2_model(device=device, dtype=dtype)
     request = driver.v2_request_kwargs(reference_output, device=device)
-    generation_kwargs = driver.generation_kwargs(model)
+    generation_kwargs = driver.generation_kwargs(model, reference_output)
     trace: list[str] = []
     with torch.no_grad(), arm_generation_observer(whitelist) as observations:
         ctx = model.generate(request, trace=trace, generation_kwargs=dict(generation_kwargs))

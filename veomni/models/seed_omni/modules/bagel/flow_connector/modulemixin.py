@@ -313,12 +313,16 @@ class BagelFlowConnectorModuleMixin(ModuleMixin):
             latent_h = height // latent_downsample
             latent_w = width // latent_downsample
             num_latent_tokens = latent_h * latent_w
-            item.value = torch.randn(
-                num_latent_tokens,
-                self.config.patch_latent_dim,
-                device=self.device,
-                dtype=torch.float32,
-            )
+            fixed_noise = kwargs.get("fixed_init_noise")
+            if torch.is_tensor(fixed_noise):
+                item.value = fixed_noise.detach().to(device=self.device, dtype=torch.float32)
+            else:
+                item.value = torch.randn(
+                    num_latent_tokens,
+                    self.config.patch_latent_dim,
+                    device=self.device,
+                    dtype=torch.float32,
+                )
 
         if not torch.is_tensor(item.meta.get("vae_position_ids")):
             height, width = self._raw_image_size(item)

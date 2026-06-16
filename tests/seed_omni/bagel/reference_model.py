@@ -34,6 +34,7 @@ from tests.seed_omni.parity_suite.core import (
     patched_randn_like,
     resolve_torch_dtype,
     sample_named_grad,
+    sample_tensor,
     to_cpu,
     to_device,
 )
@@ -583,7 +584,7 @@ def _run_text_image_reference(
             "hidden_state": text_step["hidden_state"].detach().cpu(),
             "logits": text_step["logits"].detach().cpu(),
             "greedy_token": text_step["greedy_token"].detach().cpu(),
-            "image_embeds_sample": _sample_tensor(image_embeds).detach().cpu(),
+            "image_embeds_sample": sample_tensor(image_embeds).detach().cpu(),
             "preprocessed_image_size": torch.tensor(
                 [int(preprocessed_image.shape[-1]), int(preprocessed_image.shape[-2])],
                 dtype=torch.long,
@@ -792,7 +793,7 @@ def _run_image_edit_reference(
             else flow_step["cfg_img_velocity"].detach().cpu(),
             "velocity": [tensor.detach().cpu() for tensor in flow_step["velocity_steps"]],
             "x_t": [tensor.detach().cpu() for tensor in flow_step["x_t_steps"]],
-            "image_embeds_sample": _sample_tensor(image_embeds).detach().cpu(),
+            "image_embeds_sample": sample_tensor(image_embeds).detach().cpu(),
             "vae_context_latents": vae_context["packed_latents"].detach().cpu(),
             "vae_context_latent_embeds_sample": vae_context["latent_embeds_sample"].detach().cpu(),
             "vae_context_packed_sequence_sample": vae_context["packed_sequence_sample"].detach().cpu(),
@@ -1225,15 +1226,15 @@ def _run_reference_image_flow_step(
         "x_t": last_capture["x_t"],
         "velocity_steps": [capture["velocity"] for capture in captures],
         "x_t_steps": [capture["x_t"] for capture in captures],
-        "latent_embeds_sample": _sample_tensor(first_capture["latent_embeds"]),
-        "packed_sequence_sample": _sample_tensor(first_capture["packed_sequence"]),
-        "hidden_state_sample": _sample_tensor(first_capture["hidden_state"]),
+        "latent_embeds_sample": sample_tensor(first_capture["latent_embeds"]),
+        "packed_sequence_sample": sample_tensor(first_capture["packed_sequence"]),
+        "hidden_state_sample": sample_tensor(first_capture["hidden_state"]),
         "cfg_text_hidden_state_sample": None
         if first_capture["cfg_text_hidden_state"] is None
-        else _sample_tensor(first_capture["cfg_text_hidden_state"]),
+        else sample_tensor(first_capture["cfg_text_hidden_state"]),
         "cfg_img_hidden_state_sample": None
         if first_capture["cfg_img_hidden_state"] is None
-        else _sample_tensor(first_capture["cfg_img_hidden_state"]),
+        else sample_tensor(first_capture["cfg_img_hidden_state"]),
     }
 
 
@@ -1410,9 +1411,9 @@ def _capture_official_cache_update_vae(
         "past_key_values": past_key_values,
         "packed_latents": capture["packed_latents"],
         "latent_embeds": capture["latent_embeds"],
-        "latent_embeds_sample": _sample_tensor(capture["latent_embeds"]),
+        "latent_embeds_sample": sample_tensor(capture["latent_embeds"]),
         "packed_sequence": capture["packed_sequence"],
-        "packed_sequence_sample": _sample_tensor(capture["packed_sequence"]),
+        "packed_sequence_sample": sample_tensor(capture["packed_sequence"]),
     }
 
 
@@ -1440,12 +1441,6 @@ def _capture_official_cache_update_vit(
     if "image_embeds" not in capture:
         raise RuntimeError("Official BAGEL ViT context update produced no captured image embeddings.")
     return {"past_key_values": past_key_values, "image_embeds": capture["image_embeds"]}
-
-
-def _sample_tensor(value: torch.Tensor) -> torch.Tensor:
-    if value.dim() >= 2:
-        return value.detach()[:4, :4]
-    return value.detach()[:16]
 
 
 __all__ = [

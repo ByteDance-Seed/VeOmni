@@ -32,7 +32,6 @@ def build_text_image_und_request(ctx: V2RequestContext) -> dict[str, Any]:
 def build_image_gen_request(ctx: V2RequestContext) -> dict[str, Any]:
     builder = ConversationRequestBuilder(ctx.canonical, device=ctx.device)
     return builder.request(
-        _build_image_latent_item(builder, ctx.canonical),
         _build_image_prompt_item(builder, ctx.canonical),
     )
 
@@ -41,7 +40,6 @@ def build_image_edit_request(ctx: V2RequestContext) -> dict[str, Any]:
     builder = ConversationRequestBuilder(ctx.canonical, device=ctx.device)
     return builder.request(
         _build_image_vae_input_item(builder, ctx.canonical),
-        _build_image_latent_item(builder, ctx.canonical),
         _build_image_prompt_item(builder, ctx.canonical, image_generation_prompt=True),
     )
 
@@ -205,21 +203,6 @@ def _build_text_und_item(builder: ConversationRequestBuilder, canonical: Mapping
         meta={
             "bagel_role": "text",
             "raw_text": canonical["prompt"],
-            "position_ids": builder.path("prompt_input.packed_text_position_ids", dtype=torch.long),
-            "sequence_indexes": builder.path("prompt_input.packed_text_indexes", dtype=torch.long),
-            "context_indexes": builder.path("prompt_input.packed_key_value_indexes", dtype=torch.long),
-            "token_lens": builder.path("prompt_input.text_token_lens", dtype=torch.int32),
-            "key_value_lens_before": builder.path("prompt_input.key_values_lens", dtype=torch.int32),
-            "key_value_lens_after": builder.path("kv_lens_after_prompt", device=False),
-            "rope_after": builder.path("ropes_after_prompt", device=False),
-            "next_token": {
-                "input_ids": builder.path("start_input.packed_start_tokens", dtype=torch.long),
-                "query_lens": builder.path("query_lens", dtype=torch.int32),
-                "position_ids": builder.path("start_input.packed_query_position_ids", dtype=torch.long),
-                "query_indexes": builder.path("packed_query_indexes", dtype=torch.long),
-                "key_value_lens": builder.path("start_input.key_values_lens", dtype=torch.int32),
-                "context_indexes": builder.path("packed_key_value_indexes_for_step", dtype=torch.long),
-            },
         },
     )
 
@@ -253,19 +236,8 @@ def _build_prepared_image_und_item(
         meta={
             "bagel_role": "image_und",
             "raw_image_size": [canonical["image_width"], canonical["image_height"]],
-            "image_token_ids": builder.path("image_input.packed_text_ids", dtype=torch.long),
-            "image_text_indexes": builder.path("image_input.packed_text_indexes", dtype=torch.long),
             "vit_position_ids": builder.path("image_input.packed_vit_position_ids", dtype=torch.long),
-            "vit_token_indexes": builder.path("image_input.packed_vit_token_indexes", dtype=torch.long),
             "vit_token_lens": builder.path("image_input.vit_token_seqlens", dtype=torch.int32),
-            "position_ids": builder.path("image_input.packed_position_ids", dtype=torch.long),
-            "sequence_indexes": builder.path("image_input.packed_indexes", dtype=torch.long),
-            "context_indexes": builder.path("image_input.packed_key_value_indexes", dtype=torch.long),
-            "query_lens": builder.path("image_input.packed_seqlens", dtype=torch.int32),
-            "key_value_lens_before": builder.path("image_input.key_values_lens", dtype=torch.int32),
-            "key_value_lens_after": builder.path("kv_lens_after_image", device=False),
-            "rope_after": builder.path("ropes_after_image", device=False),
-            "is_causal": False,
         },
     )
 
@@ -314,13 +286,6 @@ def _build_image_prompt_item(
             "bagel_role": "text",
             "raw_text": canonical["prompt"],
             "image_generation_prompt": image_generation_prompt,
-            "position_ids": builder.path("prompt_input.packed_text_position_ids", dtype=torch.long),
-            "sequence_indexes": builder.path("prompt_input.packed_text_indexes", dtype=torch.long),
-            "context_indexes": builder.path("prompt_input.packed_key_value_indexes", dtype=torch.long),
-            "token_lens": builder.path("prompt_input.text_token_lens", dtype=torch.int32),
-            "key_value_lens_before": builder.path("prompt_input.key_values_lens", dtype=torch.int32),
-            "key_value_lens_after": builder.path("kv_lens_after_prompt", device=False),
-            "rope_after": builder.path("ropes_after_prompt", device=False),
         },
     )
 

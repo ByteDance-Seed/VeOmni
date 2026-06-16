@@ -37,7 +37,6 @@ class RefTapSpec:
 class V2GradSpec:
     module: str
     parameter: str
-    rows_from: str | None = None
 
     @classmethod
     def from_raw(cls, raw: Any, *, probe: str) -> V2GradSpec | None:
@@ -47,11 +46,9 @@ class V2GradSpec:
             raise TypeError(f"Probe {probe} v2_grad must be a mapping.")
         if "module" not in raw or "parameter" not in raw:
             raise ValueError(f"Probe {probe} v2_grad must declare module and parameter.")
-        rows_from = raw.get("rows_from")
         return cls(
             module=str(raw["module"]),
             parameter=str(raw["parameter"]),
-            rows_from=None if rows_from is None else str(rows_from),
         )
 
 
@@ -73,8 +70,10 @@ class ProbeMapping:
     def from_raw(cls, node: str, probe: str, raw: Mapping[str, Any]) -> ProbeMapping:
         if "v2_field" not in raw:
             raise ValueError(f"Probe {node}.{probe} must declare v2_field.")
-        if "ref_tap" not in raw:
-            raise ValueError(f"Probe {node}.{probe} must declare ref_tap.")
+        has_ref = "ref" in raw
+        has_ref_tap = "ref_tap" in raw
+        if has_ref == has_ref_tap:
+            raise ValueError(f"Probe {node}.{probe} must declare exactly one of ref or ref_tap.")
         if "tol" not in raw:
             raise ValueError(f"Probe {node}.{probe} must declare tol.")
         step = str(raw.get("step", "last"))
@@ -82,11 +81,21 @@ class ProbeMapping:
             raise ValueError(
                 f"Probe {node}.{probe} has unsupported step policy {step!r}; expected one of {sorted(_STEP_POLICIES)}."
             )
+        v2_field = str(raw["v2_field"])
+        if v2_field == "loss":
+            from tests.seed_omni.parity_suite.v2.observation import LOSS_FIELD
+
+            v2_field = LOSS_FIELD
+        ref_tap_raw: Any
+        if has_ref:
+            ref_tap_raw = {"output": f"reference.{raw['ref']}"}
+        else:
+            ref_tap_raw = raw["ref_tap"]
         return cls(
             node=node,
             probe=probe,
-            v2_field=str(raw["v2_field"]),
-            ref_tap=RefTapSpec.from_raw(raw["ref_tap"], probe=f"{node}.{probe}"),
+            v2_field=v2_field,
+            ref_tap=RefTapSpec.from_raw(ref_tap_raw, probe=f"{node}.{probe}"),
             tol=str(raw["tol"]),
             state=None if raw.get("state") is None else str(raw["state"]),
             v2_grad=V2GradSpec.from_raw(raw.get("v2_grad"), probe=f"{node}.{probe}"),
@@ -173,6 +182,12 @@ def resolve_probes(
     whitelist: dict[tuple[str, str], set[str]] = {}
 
     for probe in selected:
+        node_states = {node.state for node in node_by_name[probe.node] if node.state is not None}
+        if probe.state is None and len(node_states) > 1:
+            raise ValueError(
+                f"Probe {probe.node}.{probe.probe} maps node {probe.node!r} which appears in multiple "
+                f"states {sorted(node_states)}; declare an explicit state."
+            )
         _collect_ref_tap(probe, ref_taps=ref_taps, seen=seen_ref_taps)
         for node in node_by_name[probe.node]:
             if node.state is None:

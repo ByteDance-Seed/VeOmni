@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 import torch
 
 from tests.seed_omni.parity_suite.core import NodeSpec, ProbeCatalog, load_probe_catalog, resolve_probes
@@ -43,8 +44,7 @@ nodes:
   toy.generate:
     text.hidden:
       v2_field: hidden
-      ref_tap:
-        output: reference.hidden
+      ref: hidden
       tol: hidden
 """,
         encoding="utf-8",
@@ -58,6 +58,7 @@ nodes:
     reference_plan = build_reference_capture_plan(resolved.ref_taps)
 
     assert probe.ref_tap.kind == "output"
+    assert probe.ref_tap.target == "reference.hidden"
     context = ReferenceCaptureContext(ref_model=None, inputs={}, hook_taps={})
     context.output = {"reference": {"hidden": torch.tensor([5])}}
     assert reference_plan.extractor_taps[0].extractor(context).item() == 5
@@ -67,10 +68,7 @@ def test_resolver_builds_reference_plan_and_v2_whitelist(tmp_path: Path) -> None
     catalog = ProbeCatalog(
         probes=load_probe_catalog(_write_probes(tmp_path)).for_probe_names(["text.hidden", "text.greedy_token"])
     )
-    nodes = (
-        NodeSpec(name="toy.generate", module="toy", method="generate", graph="infer", state="prompt"),
-        NodeSpec(name="toy.generate", module="toy", method="generate", graph="infer", state="text_ar"),
-    )
+    nodes = (NodeSpec(name="toy.generate", module="toy", method="generate", graph="infer", state="prompt"),)
 
     resolved = resolve_probes(probes=catalog.probes, nodes=nodes)
     reference_plan = build_reference_capture_plan(resolved.ref_taps)
@@ -80,7 +78,6 @@ def test_resolver_builds_reference_plan_and_v2_whitelist(tmp_path: Path) -> None
     assert reference_plan.extractor_taps[0].extractor(_fake_context()).item() == 3
     assert resolved.v2_whitelist == {
         ("prompt", "toy.generate"): frozenset({"hidden", "greedy"}),
-        ("text_ar", "toy.generate"): frozenset({"hidden", "greedy"}),
     }
 
 
@@ -119,8 +116,7 @@ nodes:
       v2_grad:
         module: toy_module
         parameter: linear.weight
-        rows_from: packed.labels
-      ref_tap: {extractor: tests.seed_omni.parity_suite.suite_tests.test_probe_resolver:fake_extractor}
+      ref: grad_weight
       tol: gradient
 """,
         encoding="utf-8",
@@ -131,7 +127,80 @@ nodes:
     assert probe.v2_grad is not None
     assert probe.v2_grad.module == "toy_module"
     assert probe.v2_grad.parameter == "linear.weight"
-    assert probe.v2_grad.rows_from == "packed.labels"
+    assert probe.ref_tap.kind == "output"
+    assert probe.ref_tap.target == "reference.grad_weight"
+
+
+def test_probes_yaml_ignores_rows_from_in_v2_grad(tmp_path: Path) -> None:
+    probes_path = tmp_path / "probes.yaml"
+    probes_path.write_text(
+        """
+nodes:
+  toy.forward:
+    train.grad_weight:
+      v2_field: grad_weight
+      v2_grad:
+        module: toy_module
+        parameter: linear.weight
+        rows_from: packed.labels
+      ref: grad_weight
+      tol: gradient
+""",
+        encoding="utf-8",
+    )
+
+    # Gradient row selection moved to ParityDriver.gradient_rows. A stale
+    # rows_from is ignored rather than rejected.
+    catalog = load_probe_catalog(probes_path)
+    (probe,) = catalog.probes
+    assert probe.v2_grad is not None
+    assert probe.v2_grad.module == "toy_module"
+    assert probe.v2_grad.parameter == "linear.weight"
+    assert not hasattr(probe.v2_grad, "rows_from")
+
+
+def test_probes_yaml_resolves_loss_field_alias(tmp_path: Path) -> None:
+    from tests.seed_omni.parity_suite.v2.observation import LOSS_FIELD
+
+    probes_path = tmp_path / "probes.yaml"
+    probes_path.write_text(
+        """
+nodes:
+  toy.decode:
+    train.ce_loss:
+      v2_field: loss
+      ref: train_ce_loss
+      tol: loss
+""",
+        encoding="utf-8",
+    )
+
+    [probe] = load_probe_catalog(probes_path).probes
+
+    assert probe.v2_field == LOSS_FIELD
+
+
+def test_resolver_requires_state_for_multi_state_nodes(tmp_path: Path) -> None:
+    probes_path = tmp_path / "probes.yaml"
+    probes_path.write_text(
+        """
+nodes:
+  toy.generate:
+    text.hidden:
+      v2_field: hidden
+      ref: hidden
+      tol: hidden
+""",
+        encoding="utf-8",
+    )
+    probe = load_probe_catalog(probes_path).probes[0]
+    nodes = (
+        NodeSpec(name="toy.generate", module="toy", method="generate", graph="infer", state="prompt"),
+        NodeSpec(name="toy.generate", module="toy", method="generate", graph="infer", state="text_ar"),
+    )
+
+    with pytest.raises(ValueError, match="appears in multiple states"):
+        resolve_probes(probes=(probe,), nodes=nodes)
 
 
 def _write_probes(tmp_path: Path) -> Path:

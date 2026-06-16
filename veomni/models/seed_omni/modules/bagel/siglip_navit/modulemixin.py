@@ -163,6 +163,7 @@ class BagelSiglipNavitModuleMixin(ModuleMixin):
             vit_token_lens = image_item.meta.get("vit_token_lens")
             if not torch.is_tensor(position_ids) or not torch.is_tensor(vit_token_lens):
                 raise ValueError("Image ConversationItem requires vit_position_ids and vit_token_lens metadata.")
+            self._ensure_llm_image_layout_metadata(image_item, vit_token_lens=vit_token_lens)
             return value, position_ids, vit_token_lens
 
         image_tensor = self._preprocess_raw_image(value)
@@ -183,13 +184,10 @@ class BagelSiglipNavitModuleMixin(ModuleMixin):
         )
         return packed_pixel_values, position_ids, vit_token_lens
 
-    def _ensure_raw_image_metadata(
+    def _ensure_llm_image_layout_metadata(
         self,
         image_item: ConversationItem,
         *,
-        image_tensor: torch.Tensor,
-        packed_pixel_values: torch.Tensor,
-        position_ids: torch.Tensor,
         vit_token_lens: torch.Tensor,
     ) -> None:
         num_img_tokens = int(vit_token_lens.reshape(-1)[0].item())
@@ -204,12 +202,6 @@ class BagelSiglipNavitModuleMixin(ModuleMixin):
         query_len = num_img_tokens + 2
         local_text_indexes = torch.tensor([0, num_img_tokens + 1], dtype=torch.long)
         local_vit_indexes = torch.arange(1, num_img_tokens + 1, dtype=torch.long)
-        image_item.meta.setdefault("bagel_role", "image_und")
-        image_item.meta.setdefault("raw_image_size", self._raw_image_size(image_item.value))
-        image_item.meta["preprocessed_image_size"] = [int(image_tensor.shape[-1]), int(image_tensor.shape[-2])]
-        image_item.meta["packed_vit_tokens"] = packed_pixel_values.detach()
-        image_item.meta["vit_position_ids"] = position_ids.detach().to(dtype=torch.long)
-        image_item.meta["vit_token_lens"] = vit_token_lens.detach().to(dtype=torch.int32)
         image_item.meta.setdefault("image_text_indexes", local_text_indexes)
         image_item.meta.setdefault("vit_token_indexes", local_vit_indexes)
         image_item.meta.setdefault("query_lens", torch.tensor([query_len], dtype=torch.int32))
@@ -226,6 +218,23 @@ class BagelSiglipNavitModuleMixin(ModuleMixin):
         image_item.meta.setdefault("key_value_lens_after", torch.tensor([curr_kvlen + query_len], dtype=torch.int32))
         image_item.meta.setdefault("rope_after", torch.tensor([curr_rope + 1], dtype=torch.long))
         image_item.meta.setdefault("is_causal", False)
+
+    def _ensure_raw_image_metadata(
+        self,
+        image_item: ConversationItem,
+        *,
+        image_tensor: torch.Tensor,
+        packed_pixel_values: torch.Tensor,
+        position_ids: torch.Tensor,
+        vit_token_lens: torch.Tensor,
+    ) -> None:
+        image_item.meta.setdefault("bagel_role", "image_und")
+        image_item.meta.setdefault("raw_image_size", self._raw_image_size(image_item.value))
+        image_item.meta["preprocessed_image_size"] = [int(image_tensor.shape[-1]), int(image_tensor.shape[-2])]
+        image_item.meta["packed_vit_tokens"] = packed_pixel_values.detach()
+        image_item.meta["vit_position_ids"] = position_ids.detach().to(dtype=torch.long)
+        image_item.meta["vit_token_lens"] = vit_token_lens.detach().to(dtype=torch.int32)
+        self._ensure_llm_image_layout_metadata(image_item, vit_token_lens=vit_token_lens)
 
     def _preprocess_raw_image(self, image: Any) -> torch.Tensor:
         pil_image = self._to_rgb_pil(image)

@@ -16,6 +16,8 @@ from veomni.models.seed_omni.module import ModuleMixin
 ObserverSink = MutableMapping[tuple[str, str], list[dict[str, Any]]]
 ModuleObservationSink = MutableMapping[tuple[str, str], list[dict[str, Any]]]
 
+LOSS_FIELD = "_loss"
+
 
 @contextmanager
 def arm_generation_observer(

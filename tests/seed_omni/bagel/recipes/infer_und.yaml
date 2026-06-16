@@ -18,10 +18,6 @@ text_und:
             - text.hidden
             - text.logits
             - text.greedy_token
-          options:
-            required_nodes:
-              - [prompt_encode, bagel_qwen2_mot.generate]
-              - [prompt_encode, bagel_text_encoder.token_generate]
 
 text_image_und:
   - stimulus:
@@ -45,10 +41,6 @@ text_image_und:
             - text.hidden
             - text.logits
             - text.greedy_token
-          options:
-            required_nodes:
-              - [prompt_encode, bagel_qwen2_mot.generate]
-              - [prompt_encode, bagel_text_encoder.token_generate]
   - stimulus:
       prompt: "Describe the colors and layout of this synthetic image in one sentence."
       image_width: 448
@@ -75,8 +67,3 @@ text_image_und:
             - text.hidden
             - text.logits
             - text.greedy_token
-          options:
-            required_nodes:
-              - [prompt_encode, bagel_siglip_navit.generate]
-              - [prompt_encode, bagel_qwen2_mot.generate]
-              - [prompt_encode, bagel_text_encoder.token_generate]

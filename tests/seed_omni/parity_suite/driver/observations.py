@@ -25,15 +25,24 @@ class TrainObservationMixin:
     ) -> InferModulePolicy:
         """Return the module-tier FSM policy for inference parity."""
 
-        del reference_output, whitelist
+        del reference_output
         options = self.case.run.options
-        required_nodes = tuple(tuple(item) for item in options.get("required_nodes", ()) or ())
         max_steps = options.get("max_steps")
         return InferModulePolicy(
             max_steps=None if max_steps is None else int(max_steps),
-            required_nodes=frozenset((str(state), str(node)) for state, node in required_nodes),
+            required_nodes=frozenset(whitelist.keys()),
             allow_finalize=bool(options.get("allow_finalize", False)),
         )
+
+    def gradient_rows(
+        self,
+        batch: Mapping[str, Any],
+        mapping: ProbeMapping,
+    ) -> torch.Tensor | None:
+        """Return optional row indices for gradient sampling."""
+
+        del batch, mapping
+        return None
 
     def collect_v2_train_observations(
         self,
@@ -77,7 +86,7 @@ class TrainObservationMixin:
             fields = whitelist.get(("train", mapping.node), frozenset())
             if mapping.v2_field not in fields or mapping.v2_grad is None:
                 continue
-            rows = _rows_from_batch(batch, mapping.v2_grad.rows_from)
+            rows = self.gradient_rows(batch, mapping)
             out = {
                 mapping.v2_field: sample_named_grad(
                     model.get_module(mapping.v2_grad.module),
@@ -100,16 +109,3 @@ class TrainObservationMixin:
         batch: Mapping[str, Any],
     ) -> None:
         del model, observations, whitelist, batch
-
-
-def _rows_from_batch(batch: Mapping[str, Any], path: str | None) -> torch.Tensor | None:
-    if path is None:
-        return None
-    value: Any = batch
-    for part in path.split("."):
-        if not isinstance(value, Mapping) or part not in value:
-            raise KeyError(f"Unable to resolve v2_grad rows_from path {path!r}.")
-        value = value[part]
-    if not torch.is_tensor(value):
-        raise TypeError(f"v2_grad rows_from path {path!r} must resolve to a tensor.")
-    return torch.unique(value.detach().cpu()).to(dtype=torch.long)

@@ -21,11 +21,13 @@ class ReferenceMixin:
     def reference_inputs(self) -> Mapping[str, Any]:
         return self.case.recipe.stimulus
 
-    def generation_kwargs(self, model_or_config: Any) -> dict[str, Any]:
+    def generation_kwargs(self, model_or_config: Any, reference_output: Any) -> dict[str, Any]:
+        del reference_output
         config = getattr(model_or_config, "config", model_or_config)
         kwargs = dict(getattr(config, "generation_kwargs", None) or {})
         for key, default in self.generation_defaults.items():
-            kwargs[key] = self.case.recipe.stimulus.get(key, default)
+            kwargs[key] = default
+        kwargs.update(self.case.recipe.stimulus)
         return kwargs
 
     def reference_model_load_kwargs(self, *, device: torch.device, dtype: torch.dtype) -> dict[str, Any]:

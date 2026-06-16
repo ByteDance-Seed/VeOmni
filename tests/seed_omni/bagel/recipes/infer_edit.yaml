@@ -1,6 +1,7 @@
 image_edit:
   - stimulus:
       prompt: "Turn the scene into a clean watercolor illustration."
+      infer_mode: gen
       input_width: 384
       input_height: 256
       max_new_tokens: 3
@@ -36,9 +37,6 @@ image_edit:
             - image.hidden_sample
             - image.velocity
             - image.x_t
-          options:
-            required_nodes:
-              - [image_flow, bagel_flow_connector.decode_velocity]
 
 image_edit_text_und:
   - stimulus:
@@ -61,7 +59,3 @@ image_edit_text_und:
             - text.hidden
             - text.logits
             - text.greedy_token
-          options:
-            required_nodes:
-              - [prompt_encode, bagel_qwen2_mot.generate]
-              - [prompt_encode, bagel_text_encoder.token_generate]

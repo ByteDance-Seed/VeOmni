@@ -84,19 +84,27 @@ def sum_losses(losses: Mapping[str, torch.Tensor]) -> torch.Tensor | None:
     return total
 
 
+def sample_tensor(tensor: torch.Tensor, rows: torch.Tensor | None = None) -> torch.Tensor:
+    if rows is not None:
+        return tensor.detach().cpu()[rows.detach().cpu().to(dtype=torch.long)]
+    if tensor.dim() >= 2:
+        return tensor.detach().cpu()[:4, :4]
+    return tensor.detach().cpu()[:16]
+
+
 def sample_grad(param: torch.nn.Parameter, rows: torch.Tensor | None = None) -> torch.Tensor:
     grad = param.grad
     if grad is None:
         raise RuntimeError(f"Expected gradient for {tuple(param.shape)}, got None.")
-    if rows is not None:
-        return grad.detach().cpu()[rows.detach().cpu().to(dtype=torch.long)]
-    if grad.dim() >= 2:
-        return grad.detach().cpu()[:4, :4]
-    return grad.detach().cpu()[:16]
+    return sample_tensor(grad, rows=rows)
 
 
 def sample_named_grad(module: nn.Module, name: str, rows: torch.Tensor | None = None) -> torch.Tensor:
     return sample_grad(dict(module.named_parameters())[name], rows=rows)
+
+
+def sample_named_param(module: nn.Module, name: str, rows: torch.Tensor | None = None) -> torch.Tensor:
+    return sample_tensor(dict(module.named_parameters())[name], rows=rows)
 
 
 def zero_module_grads(modules: Iterable[nn.Module]) -> None:
@@ -126,6 +134,8 @@ __all__ = [
     "resolve_torch_dtype",
     "sample_grad",
     "sample_named_grad",
+    "sample_named_param",
+    "sample_tensor",
     "sum_losses",
     "to_cpu",
     "to_device",
