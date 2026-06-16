@@ -57,9 +57,11 @@ Division of labour
   step, and cascades the callback lifecycle into each module-trainer.
 """
 
+import math
 import os
 import random
 from collections import defaultdict
+from contextlib import nullcontext
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import numpy as np
@@ -69,9 +71,13 @@ import torch.distributed as dist
 from ..arguments import OmniArguments, VeOmniArguments
 from ..data import SeedOmniCollator
 from ..data.data_transform import build_data_transform
-from ..distributed.clip_grad_norm import veomni_clip_grad_norm
+from ..distributed.clip_grad_norm import veomni_omni_module_clip_grad_norm
+from ..distributed.parallel_state import (
+    init_parallel_state,
+    use_parallel_state,
+)
 from ..models import build_processor, build_tokenizer
-from ..models.seed_omni.modeling_omni import OmniModel
+from ..models.seed_omni.modeling_omni import OmniModel, _unwrap_module
 from ..models.seed_omni.tracemixin import TraceMixin, TraceResult
 from ..ops.batch_invariant_ops import set_batch_invariant_mode
 from ..utils import helper, logging
@@ -89,6 +95,7 @@ from .callbacks import (
 
 
 if TYPE_CHECKING:
+    from ..distributed.parallel_state import ParallelState
     from ..models.seed_omni.configuration_omni import OmniConfig
 
 
@@ -123,8 +130,10 @@ class MultiOptimizer:
             opt.step()
 
     def zero_grad(self, set_to_none: bool = True) -> None:
+        # veomni.optim.MultiOptimizer (FSDP2 +ExtraParallel) has ``zero_grad()`` with no args
+        # plain torch optimizers default to ``set_to_none=True``.
         for opt in self.optimizers.values():
-            opt.zero_grad(set_to_none=set_to_none)
+            opt.zero_grad()
 
 
 class MultiLRScheduler:
@@ -352,6 +361,7 @@ class OmniModuleTrainer:
     """
 
     base: BaseTrainer
+    parallel_state: "ParallelState"
 
     def __init__(
         self,
@@ -364,18 +374,37 @@ class OmniModuleTrainer:
         self.base = BaseTrainer.__new__(BaseTrainer)
         self.base.args = args
 
-        self.base._build_model()  # meta-init the sub-model from its config.json
-        # Load this module's own processor / tokenizer and assemble
-        # ``base.model_assets`` (mirrors ``BaseTrainer._build_model_assets``).
-        self._build_model_assets()
-        self._freeze_model_module()  # module self-freezes + lora + pretty-print + mem
+        # Build this module's own ParallelState (does not mutate the global
+        # current state — that stays the orchestrator's).
+        self._setup()
 
-        # FSDP2 (and the meta-init weight load) preserve ``requires_grad``: the
-        # shard carries it (torch ``_fsdp_param.py``: ``sharded_param.requires_grad_(
-        # param.requires_grad)``) and the loader writes weights in-place
-        # (``param.data.copy_``), so the freeze applied in ``_freeze_model_module``
-        # above survives the wrap — no need to re-assert it here.
-        self.base._build_parallelized_model()  # FSDP2 wrap + per-module weight load
+        # The meta-init + FSDP2/DDP wrap read the *current* global ParallelState
+        # via ``get_parallel_state()`` (``build_parallelize_model`` /
+        # ``parallelize_model_fsdp2`` / ``torch_parallelize``), so scope them to
+        # this module's state.
+        with use_parallel_state(self.parallel_state):
+            self.base._build_model()  # meta-init the sub-model from its config.json
+
+            # Load this module's own processor / tokenizer and assemble
+            # ``base.model_assets`` (mirrors ``BaseTrainer._build_model_assets``).
+            self._build_model_assets()
+            self._freeze_model_module()  # module self-freezes + lora + pretty-print + mem
+
+            # FSDP2 (and the meta-init weight load) preserve ``requires_grad``: the
+            # shard carries it (torch ``_fsdp_param.py``: ``sharded_param.requires_grad_(
+            # param.requires_grad)``) and the loader writes weights in-place
+            # (``param.data.copy_``), so the freeze applied in ``_freeze_model_module``
+            # above survives the wrap — no need to re-assert it here.
+            self.base._build_parallelized_model()  # FSDP2 wrap + per-module weight load
+
+            # Gradient-checkpoint recompute runs during backward — OUTSIDE the
+            # per-module ``use_parallel_state`` scope that wraps the forward — so it
+            # would recompute under the orchestrator's (restored) global state and
+            # read the wrong groups (e.g. an EP MoE backbone falls back to the non-EP
+            # kernel path on its EP-sharded experts → shape mismatch). Re-enter this
+            # module's state during recompute.
+            if self.base.args.train.gradient_checkpointing.enable:
+                self._scope_recompute_to_parallel_state()
 
         # Make ``base`` look enough like a single-model trainer for the reused
         # checkpoint callbacks: the dataloader is global (owned by the
@@ -396,6 +425,65 @@ class OmniModuleTrainer:
         # :meth:`_build_lr_scheduler` (the orchestrator calls them once
         # ``args.train_steps`` is known).
         self._init_callbacks(subfolder_name)
+
+    # ── Parallel state (per-module device mesh) ────────────────────────────────
+
+    def _setup(self):
+        """Build this module's own :class:`ParallelState` and set it current.
+
+        Mirrors the parallel-state half of :meth:`BaseTrainer._setup`.  The
+        distributed process group / device / seed are already initialised once
+        by the orchestrator (``OmniTrainer.base._setup``), so here we only build
+        **this** module's own device mesh from its (merged) ``train.accelerator``
+        and make it the current global state — so the immediately-following
+        meta-init + _build_parallelized_model (FSDP wrap) read this module's mesh
+        rather than the orchestrator's.  The accelerator is already merged +
+        validated by ``OmniConfig.module_config``; the orchestrator restores its
+        default state after the build loop.
+        """
+        acc = self.base.args.train.accelerator
+        self.parallel_state = init_parallel_state(
+            dp_size=acc.dp_size,
+            dp_replicate_size=acc.dp_replicate_size,
+            dp_shard_size=acc.dp_shard_size,
+            tp_size=acc.tp_size,
+            pp_size=acc.pp_size,
+            cp_size=acc.cp_size,
+            ulysses_size=acc.ulysses_size,
+            extra_parallel_sizes=acc.extra_parallel_sizes,
+            extra_parallel_placement_innermost=acc.extra_parallel_placement_innermost,
+            extra_parallel_names=acc.extra_parallel_names,
+            dp_mode=acc.fsdp_config.fsdp_mode,
+            async_enabled=acc.enable_async,
+        )
+
+    def _scope_recompute_to_parallel_state(self) -> None:
+        """Make gradient-checkpoint recompute re-enter this module's ParallelState.
+
+        torch ``checkpoint``'s ``context_fn`` returns ``(forward_ctx, recompute_ctx)``;
+        the forward is already wrapped in :meth:`OmniModel._module_scope`, but the
+        recompute (in backward) escapes it. Setting ``recompute_ctx`` to
+        :func:`use_parallel_state` keeps reads of the free ``get_parallel_state()``
+        (EP groups, vocab-parallel ``emb`` group, …) resolving to this module's mesh
+        during recompute. ``use_reentrant=True`` does not honour ``context_fn`` — but
+        the omni path runs non-reentrant (``train.gradient_checkpointing.enable_reentrant``
+        defaults to ``False``).
+        """
+        ps = self.parallel_state
+        gc = self.base.args.train.gradient_checkpointing
+
+        def _recompute_context_fn():
+            return nullcontext(), use_parallel_state(ps)
+
+        # DDP wraps the model (``.module``) and does not expose
+        # ``gradient_checkpointing_enable``; FSDP2 wraps in place. Unwrap so the
+        # call reaches the raw HF model regardless of dp_mode.
+        _unwrap_module(self.base.model).gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={
+                "use_reentrant": gc.enable_reentrant,
+                "context_fn": _recompute_context_fn,
+            }
+        )
 
     # ── Optimizer / lr-scheduler (built here; the orchestrator only calls) ─────
 
@@ -427,30 +515,39 @@ class OmniModuleTrainer:
         same FSDP2 lifecycle (all-gather pre-hook + reduce-scatter backward hook)
         as a plain ``forward`` node.  Calling the method directly would run
         against still-sharded DTensor params and skip gradient sync.
-        """
-        model = self.base.model
 
-        kwargs = model.pre_forward(method=method, **kwargs)
+        ``wrapped_model`` is the callable that fires the parallel hooks (the DDP wrapped_model
+        / FSDP2-in-place module); ``raw_model`` is the unwrapped OmniModule that owns
+        the ``pre_forward`` / ``post_forward`` / method hooks.  FSDP2 mutates in
+        place so ``raw_model is wrapped_model``; DDP wraps, so ``raw_model = wrapped_model.module`` (a
+        ``DistributedDataParallel`` does not proxy attribute access).
+        """
+        wrapped_model = self.base.model
+        raw_model = _unwrap_module(wrapped_model)
+
+        kwargs = raw_model.pre_forward(method=method, **kwargs)
 
         # Tracing is opt-in via multi-inheriting a TraceMixin on the concrete
         # model; only those modules accumulate token lengths.
-        if isinstance(model, TraceMixin):
-            model.trace_add(method, kwargs)
+        if isinstance(raw_model, TraceMixin):
+            raw_model.trace_add(method, kwargs)
 
         if method == "forward":
-            out = model(**kwargs)
+            out = wrapped_model(**kwargs)
         else:
-            fn = getattr(model, method, None)
+            fn = getattr(raw_model, method, None)
             if fn is None:
-                raise AttributeError(f"Node method {type(model).__name__}.{method}() is not implemented.")
-            orig_forward = model.forward
+                raise AttributeError(f"Node method {type(raw_model).__name__}.{method}() is not implemented.")
+            # Point the raw module's ``forward`` at the target method, then call
+            # the wrapped_model so the DDP / FSDP2 lifecycle still fires.
+            orig_forward = raw_model.forward
             try:
-                model.forward = fn
-                out = model(**kwargs)
+                raw_model.forward = fn
+                out = wrapped_model(**kwargs)
             finally:
-                model.forward = orig_forward
+                raw_model.forward = orig_forward
 
-        return model.post_forward(method=method, **out)
+        return raw_model.post_forward(method=method, **out)
 
     def collect_trace(self) -> Optional[TraceResult]:
         """The per-module trace computed at the last :meth:`on_step_end`.
@@ -477,21 +574,34 @@ class OmniModuleTrainer:
         else:
             self.hf_ckpt_callback = OmniModuleHfCallback(base, subfolder_name)
 
+    # Each checkpoint callback (DCP save/load + HF/LoRA export) runs under this
+    # module's ParallelState so the DCP extra-parallel dim
+    # preprocessing reads the right meshes via get_parallel_state().
+
     def on_train_begin(self, state):
-        self.checkpointer_callback.on_train_begin(state)
-        self.hf_ckpt_callback.on_train_begin(state)
+        with use_parallel_state(self.parallel_state):
+            self.checkpointer_callback.on_train_begin(state)
+            self.hf_ckpt_callback.on_train_begin(state)
 
     def on_train_end(self, state):
-        self.checkpointer_callback.on_train_end(state)
-        self.hf_ckpt_callback.on_train_end(state)
+        with use_parallel_state(self.parallel_state):
+            self.checkpointer_callback.on_train_end(state)
+            self.hf_ckpt_callback.on_train_end(state)
 
     def on_epoch_begin(self, state):
-        self.checkpointer_callback.on_epoch_begin(state)
-        self.hf_ckpt_callback.on_epoch_begin(state)
+        with use_parallel_state(self.parallel_state):
+            self.checkpointer_callback.on_epoch_begin(state)
+            self.hf_ckpt_callback.on_epoch_begin(state)
 
     def on_epoch_end(self, state):
-        self.checkpointer_callback.on_epoch_end(state)
-        self.hf_ckpt_callback.on_epoch_end(state)
+        with use_parallel_state(self.parallel_state):
+            self.checkpointer_callback.on_epoch_end(state)
+            self.hf_ckpt_callback.on_epoch_end(state)
+
+    def on_step_begin(self, state, **kwargs):
+        with use_parallel_state(self.parallel_state):
+            self.checkpointer_callback.on_step_begin(state, **kwargs)
+            self.hf_ckpt_callback.on_step_begin(state, **kwargs)
 
     def on_step_end(self, state, **kwargs):
         # Stash this module's time-independent trace contribution
@@ -500,10 +610,13 @@ class OmniModuleTrainer:
         # (this fires only after the whole graph's fwd+bwd, so a module-local
         # wall-clock would be the whole-step time, not its own).
         # Tracing is opt-in: only modules that multi-inherit a TraceMixin report.
-        model = self.base.model
+        # Unwrap the DDP wrapper (FSDP2 is in-place) so a DDP-wrapped module's
+        # TraceMixin is still seen.
+        model = _unwrap_module(self.base.model)
         self._trace_result = model.trace_collect() if isinstance(model, TraceMixin) else None
-        self.checkpointer_callback.on_step_end(state, **kwargs)
-        self.hf_ckpt_callback.on_step_end(state, **kwargs)
+        with use_parallel_state(self.parallel_state):
+            self.checkpointer_callback.on_step_end(state, **kwargs)
+            self.hf_ckpt_callback.on_step_end(state, **kwargs)
 
     def _freeze_model_module(self):
         """Let the module freeze itself (its policy), then run the base report (+ lora)."""
@@ -640,15 +753,13 @@ class OmniTrainer:
         modules: Dict[str, torch.nn.Module] = {}
         for name in self.module_names:
             module_config = self.omni_config.module_config(name)
-            module_trainer = OmniModuleTrainer(
-                module_config,
-                subfolder_name=name,
-            )
+            module_trainer = OmniModuleTrainer(module_config, subfolder_name=name)
             self.module_trainers[name] = module_trainer
             modules[name] = module_trainer.base.model
             logger.info_rank0(f"OmniTrainer: built module-trainer '{name}' from {module_config.model.model_path}")
 
         model = OmniModel(self.omni_config, modules)
+        model.set_module_parallel_states({name: mt.parallel_state for name, mt in self.module_trainers.items()})
         base.model_config = self.omni_config
 
         # Route the training graph's per-node execution through each module's
@@ -708,7 +819,8 @@ class OmniTrainer:
         base = self.base
         self.optimizers: Dict[str, torch.optim.Optimizer] = {}
         for name, module_trainer in self.module_trainers.items():
-            module_trainer._build_optimizer()
+            with use_parallel_state(module_trainer.parallel_state):
+                module_trainer._build_optimizer()
             self.optimizers[name] = module_trainer.base.optimizer
         base.optimizer = MultiOptimizer(self.optimizers)
         logger.info_rank0(f"OmniTrainer: built {len(self.optimizers)} optimizer(s): {list(self.optimizers)}.")
@@ -840,9 +952,12 @@ class OmniTrainer:
             for k, v in loss_dict.items():
                 total_loss_dict[k] += v.item() / num_micro_steps
 
-        # Global gradient clip across every module's DTensor parameters, then
-        # step every per-module optimizer + scheduler.
-        grad_norm = veomni_clip_grad_norm(base.model, args.train.optimizer.max_grad_norm)
+        max_grad_norm = args.train.optimizer.max_grad_norm
+        module_grad_norms = [
+            veomni_omni_module_clip_grad_norm(module_trainer.base.model, module_trainer.parallel_state, max_grad_norm)
+            for module_trainer in self.module_trainers.values()
+        ]
+        grad_norm = math.sqrt(sum(g * g for g in module_grad_norms)) if module_grad_norms else 0.0
         base.optimizer.step()
         base.lr_scheduler.step()
         base.optimizer.zero_grad()

@@ -93,7 +93,7 @@ bash train.sh tasks/train_vlm.py configs/multimodal/qwen3_vl/qwen3_vl_dense.yaml
     --data.train_path ./sharegpt4v_instruct_gpt4-vision_cap100k_coco.json \
     --data.dataloader.type native \
     --data.datasets_type iterable \
-    --data.source_name sharegpt4v_sft \
+    --data.source_name sharegpt4v_sft
 ```
 
 ## Step 6: Checkpoint Configuration

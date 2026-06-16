@@ -1,0 +1,19 @@
+# Per-module INFERENCE overrides for Qwen3-30B-A3B (MoE) — all eager.
+#
+# Single-process load (`python tasks/omni/infer_omni.py ...`): every module
+# loads via `from_pretrained(device_map='auto')`, spread across visible GPUs.
+# The MoE runs the eager experts loop over the full (unsharded) 128-expert
+# weights — no Expert Parallel, no torchrun.
+qwen3_text_encoder:
+  model:
+    model_path: qwen3_text_encoder
+  accelerator:
+    fsdp_config:
+      fsdp_mode: eager
+
+qwen3_moe_llm:
+  model:
+    model_path: qwen3_moe_llm
+  accelerator:
+    fsdp_config:
+      fsdp_mode: eager

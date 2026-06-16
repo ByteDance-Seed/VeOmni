@@ -28,7 +28,7 @@
 |------|------|
 | 完全模块化 | 所有组件以 `*ModuleMixin` + HF 模型多继承形态平等存在；只改 YAML（path / nodes / edges）即可替换任意模块 |
 | 支持 AR + DiT | 同一训练框架内同时支持自回归和扩散两种生成范式 |
-| 并行可组合 | 全局单一 `ParallelState`；OmniModel 顶层一次 `build_parallelize_model`；ParallelPlan 由各子模块的 `get_parallel_plan()` 递归聚合（**不**做异构 mesh / per-module FSDP wrap） |
+| 并行可组合 | 每个子模块可在完整 world 上跑**自己的**并行拓扑（异构 FSDP2 / FSDP2+ExtraParallel(`emb`/`ep`) / DDP）：拓扑与全局一致则复用全局 `ParallelState`，不同则自建独立 mesh；ParallelPlan 由各子模块 `get_parallel_plan()` 贡献 ExtraParallel 切分 |
 | 训推一致（RL） | training `forward()` 和 inference `generate_step()` 共用同一底层实现 |
 | 多模态对话驱动 | 同模态数据根据 conversation role 路由到不同模块（understanding vs. generation） |
 | 推理循环生成 | 推理时可以反复循环（text→image→text→image），不是 DAG |
@@ -775,56 +775,86 @@ training_graph:
 
 ---
 
-## 并行配置（单一 ParallelState + 递归 ParallelPlan）
+## 并行配置（按模块 ParallelState + 递归 ParallelPlan）
 
-本版本采用与 `BaseTrainer` 完全一致的并行入口：**全局一份 `ParallelState`**（FSDP / SP / EP / CP / TP 维度共享），**OmniModel 顶层单次** `build_parallelize_model` 包装。子模块**不**单独 wrap FSDP、**不**单独定义 mesh / dp_mode；它们只通过 `get_parallel_plan()` 贡献自己那部分的 ExtraParallel（EP / embed 等）切分声明，由 OmniModel 收集后递归合并成整模 plan。
+每个子模块可在**完整 world** 上跑自己的并行拓扑——同一个 OmniModel 内可同时存在异构的
+**FSDP2 / FSDP2 + ExtraParallel（`emb`/`ep`）/ DDP**。机制如下：
+
+- trainer 先建**一份全局 `ParallelState`**（`OmniTrainer.base._setup()`，来自顶层 `accelerator`）。
+- 每个子模块比较自己的 accelerator 拓扑与全局拓扑（`OmniTrainer._build_model` 用
+  `_accelerator_topology(module_acc) != _accelerator_topology(global_acc)`）：**一致则复用**全局
+  `ParallelState`（不重复建进程组）；**不同则**由 `OmniModuleTrainer._setup` 调
+  `init_parallel_state(...)` **自建独立 mesh**。
+- 每个子模块**各自 wrap**（FSDP2 原地分片 / DDP 包装），权重也按各自路径加载（`build_parallelize_model`
+  的 `weights_path={name: path}` dispatch）。
+- ExtraParallel（`emb`/`ep`）切分仍由各子模块 `get_parallel_plan()` 贡献，但应用在该模块自己的 mesh 上。
+
+per-module 拓扑通过 `modules_{train,infer}.yaml` 里每个模块的 `accelerator:` 块声明（被 `OmniConfig`
+lift 到 `train.accelerator`）。
 
 | 层级 | 职责 |
 |------|------|
-| 全局 `ParallelState` | trainer 层一次 `init_parallel_state(...)`；所有子模块共享 fsdp_mesh / sp_group / ep_group |
-| 每个 `ModuleMixin` 子类的 `forward()` | 内部自管 SP `gather/scatter`（数据进出 SP 区域），对外完全透明 |
-| `OmniModel.forward()` | 不含任何 SP / FSDP / EP 操作，仅做图遍历 + loss 聚合 |
-| `ModuleMixin.get_parallel_plan()` | 返回**模块本地** fqn 的 `ParallelPlan`（如 `layers.*.mlp.experts.gate_up_proj`），不带任何前缀 |
-| `OmniModel.get_parallel_plan()` | 调 `plan.update_prefix(name)` 加 `<name>.` 前缀，把所有子模块 plan 合并成一份整模 plan |
-| trainer | 一次 `build_parallelize_model(omni_model, ...)`：内部读 `omni_model.get_parallel_plan()` 应用 EP，再 `fully_shard()` 顶层 |
+| 全局 `ParallelState` | trainer 层一次 `init_parallel_state(...)`（顶层 `accelerator`）；拓扑相同的子模块复用它 |
+| 每个 `OmniModuleTrainer._setup` | 拓扑不同的子模块自建独立 `ParallelState`（先 `_dedup_extra_parallel` 折叠重复的 `ep`）|
+| `ModuleMixin.forward()` | 内部自管 SP `gather/scatter`；运行时被包在 `use_parallel_state(该模块 state)` 中 |
+| `OmniModel` | `set_module_parallel_states({name: ps})` + `_module_scope(name)`：每个 node 的 forward/generate 在该模块 state 下执行，使 `get_parallel_state()` 解析到该模块 mesh |
+| `ModuleMixin.get_parallel_plan()` | 返回**模块本地** fqn 的 `ParallelPlan`（如 `embed_tokens.weight` / `layers.*.mlp.experts.gate_up_proj`）|
+| 梯度裁剪 | `_omni_clip_grad_norm`：按各模块拓扑分别 reduce pᵗʰ-power → 合成全局范数 → 共享系数裁剪（见下）|
 
-```python
-class OmniModel(nn.Module):
-    def get_parallel_plan(self) -> ParallelPlan | None:
-        merged: dict[str, dict[str, Shard]] = {}
-        for name in self._module_names:
-            mod = getattr(self, name)
-            plan = mod.get_parallel_plan() if hasattr(mod, "get_parallel_plan") else None
-            if plan is None:
-                continue
-            plan.update_prefix(name)                     # 加 <name>. 前缀
-            for para, sub_plan in plan.extra_parallel_plan.items():
-                merged.setdefault(para, {}).update(sub_plan)
-        return ParallelPlan(merged) if merged else None
-```
+### 拓扑判定与 `ep` 去重
+
+`AcceleratorConfig.__post_init__` 总会追加一个 `ep` 维；而 `OmniConfig.module_config` 会
+`_instantiate_recursive` 重新实例化 accelerator，于是 per-module accelerator 末尾会出现**两个 `ep`**。
+建 mesh / 比拓扑前必须 `_dedup_extra_parallel(acc)` 折叠这个重复（真实的 `emb`+`ep` 布局会保留）：
+
+| 模块 override | 重新实例化后 names | dedup 后 | vs 全局 |
+|---------------|--------------------|----------|---------|
+| 无 | `["ep","ep"]` | `["ep"]` | 相同 → 复用 |
+| `emb` size 4 | `["emb","ep"]` | `["emb","ep"]` | 不同 → 自建 |
+| `fsdp_mode: ddp` | `["ep","ep"]` | `["ep"]`（mode 不同）| 不同 → 自建 |
+
+### 异构梯度裁剪
+
+对 `OmniModel.parameters()` 直接 `clip_grad_norm_` 会失败（不能混 DTensor 与普通 Tensor）。
+`_omni_clip_grad_norm` 对每个模块在其拓扑对应进程组上算 world-complete 的 pᵗʰ-power 和
+（FSDP2 → `fsdp_group`；FSDP2+ExtraParallel → `{p}_fsdp` 再 `{p}`；DDP → 不再 reduce，backward 已 all-reduce），
+合成一个全局范数后用共享系数裁剪所有模块。
+
+### DDP 细节
+
+- **构建**：`parallelize_model_ddp`（`torch_parallelize.py`）在 meta-init 下先 materialize + 加载全量权重，
+  **再** `DDP(...)`（DDP 只复制 + 注册梯度同步 hook，不会 materialize meta 参数、不加载权重）。
+- **分发**：`DistributedDataParallel` 不代理属性访问，所以 `OmniModuleTrainer.forward` / `on_step_end` 要
+  `_unwrap_module(self.base.model)` 取 `pre_forward`/`post_forward`/`trace_collect`，但实际前向仍调 **wrapper**
+  以触发 hook（FSDP2 原地 `raw is wrapper`；DDP 包装 `raw = wrapper.module`）。
 
 ### FQN 视角对齐（重要细节）
 
-`OmniModel` 把每个 sub-module 直接 attach 为顶层 attribute（**不**通过 `nn.ModuleDict` 中介，D2.2 已落地），所以 `model.named_parameters()` 看到的 fqn 形如 `<module_name>.<rest>`，无中间 prefix；`model.named_children()` 直接枚举 `[(<module_name>, sub_module), ...]`。`ParallelPlan.apply` 按这一视角做 fqn 匹配，与 `update_prefix(name)` 加的 `<name>.` 前缀**对齐一致**；`build_parallelize_model(weights_path={name: path, ...})` 也按这同一组 `named_children` 名做 dispatch（见 § "Build & 权重加载"）。`modules_dict` 字段保留为 property dict view（`{name: getattr(self, name) for name in self._module_names}`），方便老 callsite（如旧测试 fixture）继续用 `model.modules_dict[name]` 取子模块；它**不**是 `nn.ModuleDict`，写入它不影响真实 children。
+`OmniModel` 把每个 sub-module 直接 attach 为顶层 attribute（**不**通过 `nn.ModuleDict` 中介），所以
+`model.named_parameters()` 看到的 fqn 形如 `<module_name>.<rest>`；`model.named_children()` 直接枚举
+`[(<module_name>, sub_module), ...]`。`build_parallelize_model(weights_path={name: path, ...})` 按这组
+`named_children` 名做 dispatch（见 § "Build & 权重加载"）。`modules_dict` 是 property dict view，**不**是
+`nn.ModuleDict`。
 
 ### 举例
 
-- `janus_llama`（MoE）：模块自身 `get_parallel_plan()` 返回 `{"ep": {"layers.*.mlp.experts.gate_up_proj": Shard(0), ...}}`；OmniModel 加前缀后变成 `{"ep": {"janus_llama.layers.*.mlp.experts.gate_up_proj": Shard(0), ...}}`
-- `janus_siglip`（VLM ViT）：`get_parallel_plan()` 返回 `None`（无 ExtraParallel）；SP 在自己的 `forward()` 里通过 `gather_seq_scatter_heads` 处理
-- `bagel_dit`：当前版本不做 per-module 不同 mesh / TP；后续如有需要再扩展
+- `janus_text_encoder`：`accelerator` 声明 `emb` ExtraParallel（`extra_parallel_names: ["emb"]`），
+  `get_parallel_plan()` 返回 `{"emb": {"embed_tokens.weight": Shard(0)}}`，自建 FSDP2+emb 的独立 state；
+  查表用 `AllToAllEmbedding`（`veomni/ops/kernels/embed/`）。
+- `janus_llama`：`accelerator.fsdp_config.fsdp_mode: ddp` → 自建 ddp `ParallelState`，复制式 backbone。
+- `janus_siglip` / `janus_vqvae`：无 `accelerator` override → 复用全局 FSDP2 mesh；SP 在自己 `forward()` 里处理。
 
-### micro_batch_size / DP / SP 一致（暂时全局对齐）
+### micro_batch_size 仍全局；dp / fsdp / ExtraParallel 可 per-module
 
-V2 当前版本**不接受 per-module 的 `micro_batch_size` / `dp_size` / `sp_size` / `tp_size` / `cp_size` 字段**——`OmniConfig.modules.<name>.*` 里只有模块自身的 ckpt 路径与少量模块行为开关（`freeze` / `gradient_checkpointing` 等）。所有并行配置和 micro batch size **全部走顶层 launcher YAML**（`configs/seed_omni/Janus/janus_1.3b/base.yaml` 的 `train.micro_batch_size` / 顶层 `accelerator.*`），每个 module 的 dp / sp 都保持一致。
+`micro_batch_size` 与数据管线是全局共享的（数据集 / collator / dataloader 只有一份），**不**接受 per-module
+`micro_batch_size`。但 **dp / fsdp_mode / ExtraParallel 现在可以 per-module**——通过模块的 `accelerator:` 块声明，
+拓扑不同即自建独立 mesh。`OmniConfig.modules.<name>.accelerator.*` 即承载这些覆盖。
 
-这条约束等 OmniTrainer 整体 build flow 跑通（含 dataset / collator / optimizer / save / resume）后再放开——届时再回头讨论"哪些 module 真的需要异构 mb / dp / sp"，避免过早实现复杂的多-mesh / 多-mb 路径。
+### 推理侧
 
-### 本版本明确**不做**的
-
-- ❌ 子模块各自 wrap FSDP（异构 dp_mode）
-- ❌ 子模块持有自己的 `ParallelState` / mesh
-- ❌ 子模块声明独立 SP / EP group（SP / EP group 全局唯一）
-- ❌ DDP 路径（暂只支持 FSDP2）
+推理同样支持 per-module 拓扑：`OmniInferencer` 用 `_module_needs_distributed`（fsdp_mode 非 `eager` 即为分布式，
+含 `fsdp2` / `ddp`）判断是否需要 torchrun + 进程组，并为每个非 eager 模块建独立 `ParallelState`；eager 模块走
+`from_pretrained(device_map=...)` 单卡副本。两套 `modules_infer_*.yaml`（分布式 / 全 eager）+ 对应启动脚本。
 - ❌ per-module micro_batch_size / dp_size / sp_size / tp_size / cp_size（OmniTrainer 整体可工作后再支持）
 
 ### 与现有基础设施
