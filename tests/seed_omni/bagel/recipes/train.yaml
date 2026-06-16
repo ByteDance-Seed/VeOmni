@@ -183,6 +183,16 @@ train_ce_mse:
             expect_loss_decrease: true
             loss_window: 10
             timeout: 7200
+        - id: script_data_smoke
+          kind: script_data_smoke
+          options:
+            strategy: fsdp2
+            nproc_per_node: 8
+            steps: 1
+            gradient_checkpointing: true
+            config_path: configs/seed_omni/Bagel/bagel_7b_mot/base.yaml
+            launcher_path: tasks/omni/train_omni.py
+            timeout: 3600
 
 train_ce:
   - stimulus:

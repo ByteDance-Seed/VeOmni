@@ -99,6 +99,8 @@ def run_v2_train_framework(
             return _run_distributed_train_policy(driver, reference_output, device=device, dtype=dtype)
         if run.kind == "data_loss_smoke":
             return _run_data_loss_smoke_policy(driver, device=device, dtype=dtype)
+        if run.kind == "script_data_smoke":
+            return _run_script_data_smoke_policy(driver, device=device, dtype=dtype)
         raise NotImplementedError(f"Unsupported training framework kind {run.kind!r}.")
     finally:
         _release_cuda_memory()
@@ -826,6 +828,62 @@ def _run_data_loss_smoke_policy(
             "framework.data_loss_decreased",
             bool(report.get("loss_decreased", False)),
             True,
+            "exact",
+        ),
+    ]
+    return ParityReport(case_id=driver.case.node_id, probes=tuple(reports))
+
+
+def _run_script_data_smoke_policy(
+    driver: Any,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> ParityReport:
+    del device, dtype
+    options = driver.case.run.options
+    strategy = str(options.get("strategy", "fsdp2"))
+    if strategy != "fsdp2":
+        raise NotImplementedError(f"Unsupported script_data_smoke strategy {strategy!r}.")
+
+    nproc = int(options.get("nproc_per_node", 8))
+    steps = int(options.get("steps", 1))
+    output_dir = _policy_output_dir(driver, "script_data_smoke_fsdp2")
+    if output_dir.exists():
+        shutil.rmtree(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    report = _run_v2_train_script_data_smoke(
+        driver,
+        config_path=Path(str(options.get("config_path", driver.case.model.v2_model.config_dir / "base.yaml"))),
+        launcher_path=Path(str(options.get("launcher_path", "tasks/omni/train_omni.py"))),
+        output_dir=output_dir,
+        nproc_per_node=nproc,
+        steps=steps,
+        timeout=int(options.get("timeout", 3600)),
+        gradient_checkpointing=bool(options.get("gradient_checkpointing", True)),
+    )
+    reports = [
+        _framework_report(driver, "framework.script_data_exit_code", report["exit_code"], 0, "exact"),
+        _framework_report(
+            driver,
+            "framework.script_data_training_started",
+            bool(report.get("training_started", False)),
+            True,
+            "exact",
+        ),
+        _framework_report(
+            driver,
+            "framework.script_data_steps",
+            int(report.get("steps", 0)),
+            steps,
+            "exact",
+        ),
+        _framework_report(
+            driver,
+            "framework.script_data_gradient_checkpointing",
+            bool(report.get("gradient_checkpointing", False)),
+            bool(options.get("gradient_checkpointing", True)),
             "exact",
         ),
     ]
@@ -1643,6 +1701,124 @@ def _run_v2_train_data_loss_smoke(
     report["stdout_tail"] = stdout[-4000:]
     report["stderr_tail"] = ""
     return report
+
+
+def _run_v2_train_script_data_smoke(
+    driver: Any,
+    *,
+    config_path: Path,
+    launcher_path: Path,
+    output_dir: Path,
+    nproc_per_node: int,
+    steps: int,
+    timeout: int,
+    gradient_checkpointing: bool,
+) -> Mapping[str, Any]:
+    """Run the production training launcher and verify a lightweight data-backed step."""
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    port = _find_free_port()
+    cmd = [
+        sys.executable,
+        "-m",
+        "torch.distributed.run",
+        "--nnodes=1",
+        f"--nproc_per_node={nproc_per_node}",
+        f"--master_port={port}",
+        str(launcher_path),
+        str(config_path),
+        "--model.model_path",
+        str(driver.case.model.v2_model.model_root),
+        "--train.global_batch_size",
+        str(nproc_per_node),
+        "--train.micro_batch_size",
+        "1",
+        "--train.max_steps",
+        str(steps),
+        "--train.seed",
+        str(driver.case.model.seed),
+        "--train.wandb.enable",
+        "false",
+        "--train.checkpoint.output_dir",
+        str(output_dir),
+        "--train.checkpoint.save_steps",
+        "0",
+        "--train.checkpoint.save_hf_weights",
+        "false",
+        "--train.checkpoint.hf_save_steps",
+        "0",
+        "--accelerator.fsdp_config.fsdp_mode",
+        "fsdp2",
+        "--train.gradient_checkpointing.enable",
+        str(gradient_checkpointing).lower(),
+        "--data.dataloader.num_workers",
+        "0",
+        "--data.dataloader.drop_last",
+        "false",
+    ]
+    log_path = output_dir / "run.log"
+    with log_path.open("w", encoding="utf-8") as log_file:
+        log_file.write("command: " + " ".join(cmd) + "\n")
+        log_file.flush()
+        process = subprocess.Popen(
+            cmd,
+            env=dict(os.environ),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+        stdout_chunks: list[str] = []
+        deadline = time.monotonic() + timeout
+        timed_out = False
+        try:
+            assert process.stdout is not None
+            while True:
+                if process.poll() is not None:
+                    for line in process.stdout:
+                        stdout_chunks.append(line)
+                        log_file.write(line)
+                        sys.__stdout__.write(line)
+                    log_file.flush()
+                    sys.__stdout__.flush()
+                    returncode = int(process.returncode)
+                    break
+                if time.monotonic() > deadline:
+                    timed_out = True
+                    returncode = 124
+                    raise subprocess.TimeoutExpired(cmd, timeout)
+                ready, _, _ = select.select([process.stdout], [], [], 1.0)
+                if not ready:
+                    continue
+                line = process.stdout.readline()
+                if not line:
+                    continue
+                stdout_chunks.append(line)
+                log_file.write(line)
+                log_file.flush()
+                sys.__stdout__.write(line)
+                sys.__stdout__.flush()
+        except subprocess.TimeoutExpired:
+            os.killpg(process.pid, signal.SIGTERM)
+            try:
+                process.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.wait()
+            timed_out = True
+            returncode = 124
+    stdout = "".join(stdout_chunks)
+    training_started = "Start training" in stdout and f"Train steps: {steps}" in stdout
+    return {
+        "exit_code": returncode,
+        "timed_out": timed_out,
+        "training_started": training_started,
+        "steps": steps,
+        "gradient_checkpointing": gradient_checkpointing,
+        "log_path": str(log_path),
+        "stdout_tail": stdout[-4000:],
+        "stderr_tail": "",
+    }
 
 
 def _filter_data_sources(data_config: Mapping[str, Any], source_names: tuple[str, ...]) -> dict[str, Any]:
