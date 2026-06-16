@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from typing import Any
 
@@ -14,18 +13,24 @@ from tests.seed_omni.parity_suite.core import (
     ParityReport,
     ProbeMapping,
     configure_torch_determinism,
-    to_device,
 )
 from tests.seed_omni.parity_suite.core.utilities import sample_named_grad
 from tests.seed_omni.parity_suite.reference.capture import (
     ReferenceCaptureContext,
 )
-from tests.seed_omni.parity_suite.v2.module import InferModulePolicy
+from tests.seed_omni.parity_suite.reference.loader import load_transformers_reference_model
+from tests.seed_omni.parity_suite.reference.model import reference_options
+from tests.seed_omni.parity_suite.v2.model import (
+    graph_active_module_names,
+    load_graph_active_omni_config,
+    load_graph_active_omni_modules,
+)
 from tests.seed_omni.parity_suite.v2.observation import record_module_output
+from tests.seed_omni.parity_suite.v2.tier_runners.module import InferModulePolicy
 from veomni.models.seed_omni.modeling_omni import OmniModel
 
 
-class ParityDriver(ABC):
+class ParityDriver:
     """Model-specific execution contract used by the shared parity runner."""
 
     generation_defaults: Mapping[str, Any] = {
@@ -54,15 +59,48 @@ class ParityDriver(ABC):
             kwargs[key] = self.case.recipe.stimulus.get(key, default)
         return kwargs
 
-    @abstractmethod
-    def load_reference(self, *, device: torch.device, dtype: torch.dtype) -> nn.Module:
+    def reference_model_load_kwargs(self, *, device: torch.device, dtype: torch.dtype) -> dict[str, Any]:
+        """Return model-specific kwargs for ``AutoModel.from_pretrained``."""
+
+        del device, dtype
+        return {}
+
+    def load_reference_model(self, *, device: torch.device, dtype: torch.dtype) -> nn.Module:
         """Load the independent reference oracle."""
 
-    @abstractmethod
+        return load_transformers_reference_model(
+            self.case.model.reference,
+            **self.reference_model_load_kwargs(device=device, dtype=dtype),
+        )
+
     def load_v2_model(self, *, device: torch.device, dtype: torch.dtype) -> OmniModel:
         """Load the V2 model under test."""
 
-    @abstractmethod
+        module_names = self.v2_module_names()
+        config = load_graph_active_omni_config(self.case, module_names)
+        modules = self.load_v2_modules(config.module_names, device=device, dtype=dtype)
+        return OmniModel(config, modules).eval()
+
+    def v2_module_names(self) -> frozenset[str]:
+        """Return the complete module set referenced by the selected V2 graph."""
+
+        return graph_active_module_names(self.case)
+
+    def load_v2_modules(
+        self,
+        module_names: tuple[str, ...] | list[str],
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Mapping[str, nn.Module]:
+        """Load graph-active V2 modules.
+
+        Drivers with non-standard checkpoint layouts can override this hook
+        while keeping the shared graph-driven config behavior.
+        """
+
+        return load_graph_active_omni_modules(self.case, module_names, device=device, dtype=dtype)
+
     def run_reference_recipe(
         self,
         ref_model: nn.Module,
@@ -70,6 +108,19 @@ class ParityDriver(ABC):
         context: ReferenceCaptureContext,
     ) -> Any:
         """Run the reference recipe and return driver-owned canonical output."""
+
+        reference = self.case.recipe.reference
+        kind = reference.get("kind")
+        if kind is not None:
+            kind = str(kind)
+        options = reference.get("options", {}) or {}
+        with reference_options(ref_model, options):
+            run_reference_kind = getattr(ref_model, "run_reference_kind", None)
+            if run_reference_kind is not None:
+                return run_reference_kind(kind, inputs, context)
+            if kind is None:
+                return ref_model(**inputs)
+        raise NotImplementedError(f"{type(ref_model).__name__} does not implement reference kind {kind!r}.")
 
     def run_reference_only_recipe(self) -> ParityReport:
         """Run a reference-only recipe."""
@@ -86,7 +137,7 @@ class ParityDriver(ABC):
     ) -> dict[str, Any]:
         """Run a V2 inference graph through the shared graph dispatcher."""
 
-        from tests.seed_omni.parity_suite.v2.graph import run_v2_infer_graph
+        from tests.seed_omni.parity_suite.v2.tier_runners.graph import run_v2_infer_graph
 
         return run_v2_infer_graph(self, reference_output, whitelist, device=device, dtype=dtype)
 
@@ -100,7 +151,7 @@ class ParityDriver(ABC):
     ) -> dict[str, Any]:
         """Run a V2 training graph through the shared graph dispatcher."""
 
-        from tests.seed_omni.parity_suite.v2.graph import run_v2_train_graph
+        from tests.seed_omni.parity_suite.v2.tier_runners.graph import run_v2_train_graph
 
         return run_v2_train_graph(self, reference_output, whitelist, device=device, dtype=dtype)
 
@@ -114,7 +165,7 @@ class ParityDriver(ABC):
     ) -> dict[str, Any]:
         """Run a V2 inference graph through the shared module dispatcher."""
 
-        from tests.seed_omni.parity_suite.v2.module import run_v2_infer_module
+        from tests.seed_omni.parity_suite.v2.tier_runners.module import run_v2_infer_module
 
         return run_v2_infer_module(self, reference_output, whitelist, device=device, dtype=dtype)
 
@@ -128,7 +179,7 @@ class ParityDriver(ABC):
     ) -> dict[str, Any]:
         """Run a V2 training graph through the shared module dispatcher."""
 
-        from tests.seed_omni.parity_suite.v2.module import run_v2_train_module
+        from tests.seed_omni.parity_suite.v2.tier_runners.module import run_v2_train_module
 
         return run_v2_train_module(self, reference_output, whitelist, device=device, dtype=dtype)
 
@@ -142,7 +193,7 @@ class ParityDriver(ABC):
     ) -> dict[str, Any] | ParityReport:
         """Run an inference framework-tier case through the shared framework dispatcher."""
 
-        from tests.seed_omni.parity_suite.v2.framework import run_v2_infer_framework
+        from tests.seed_omni.parity_suite.v2.tier_runners.framework import run_v2_infer_framework
 
         return run_v2_infer_framework(self, reference_output, whitelist, device=device, dtype=dtype)
 
@@ -156,7 +207,7 @@ class ParityDriver(ABC):
     ) -> dict[str, Any] | ParityReport:
         """Run a training framework-tier case through the shared framework dispatcher."""
 
-        from tests.seed_omni.parity_suite.v2.framework import run_v2_train_framework
+        from tests.seed_omni.parity_suite.v2.tier_runners.framework import run_v2_train_framework
 
         return run_v2_train_framework(self, reference_output, whitelist, device=device, dtype=dtype)
 
@@ -169,19 +220,26 @@ class ParityDriver(ABC):
         return {}
 
     def v2_infer_request(self, reference_output: Any, *, device: torch.device) -> dict[str, Any]:
-        """Adapt driver-owned canonical output into an ``OmniModel.generate`` request."""
+        """Adapt driver-owned canonical output into an ``OmniModel.generate`` request.
+
+        Shared suite code treats the returned mapping as opaque apart from common
+        V2 request keys such as ``conversation_list``. Concrete conversion from
+        reference canonical data or model-owned fixtures belongs to model drivers.
+        """
 
         del reference_output, device
         raise NotImplementedError(f"{type(self).__name__} does not implement inference request adaptation.")
 
     def v2_train_batch_kwargs(self, reference_output: Any, *, device: torch.device) -> dict[str, Any]:
-        """Adapt driver-owned canonical output into kwargs for ``OmniModel.forward``."""
+        """Adapt driver-owned canonical output into kwargs for ``OmniModel.forward``.
 
-        if not isinstance(reference_output, Mapping):
-            raise TypeError(f"{type(self).__name__} expected a mapping reference output.")
-        canonical = reference_output.get("canonical")
-        if isinstance(canonical, Mapping) and isinstance(canonical.get("train_batch"), Mapping):
-            return dict(to_device(canonical["train_batch"], device))
+        The base suite defines only the adapter shape. It must not know a
+        model's internal tensor layout. Model-specific drivers should return a
+        V2 request, typically ``{"conversation_list": ...}``, and let runtime
+        hooks convert that request into model internals.
+        """
+
+        del reference_output, device
         raise NotImplementedError(f"{type(self).__name__} does not implement training batch adaptation.")
 
     def v2_infer_module_policy(

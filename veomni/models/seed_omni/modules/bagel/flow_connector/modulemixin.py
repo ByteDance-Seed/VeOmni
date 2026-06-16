@@ -6,68 +6,93 @@ import torch
 
 from ....conversation import ConversationItem
 from ....generation_graph import FSM_SIGNAL_KEY
-from ....module import ModuleMixin
+from ....module import ModuleMixin, post_forward, pre_forward
+from ..training_pack import add_dummy_anchor_to_batch, get_packed_batch, zero_hidden_from_batch
 
 
 SIGNAL_IMAGE_COMPLETE = "image_complete"
 
 
 class BagelFlowConnectorModuleMixin(ModuleMixin):
-    def pre_forward(self, method: str, **kwargs: Any) -> Dict[str, Any]:
-        assert method in ("embed_latent", "decode_velocity", "forward")
+    @pre_forward("embed_latent")
+    def embed_latent_pre(self, **kwargs: Any) -> Dict[str, Any]:
         bagel_packed_batch = kwargs.get("bagel_packed_batch")
+        if bagel_packed_batch is None:
+            bagel_packed_batch = get_packed_batch(kwargs.get("conversation_list"))
         if bagel_packed_batch is None:
             return kwargs
         self._bagel_packed_batch = bagel_packed_batch
-        if method in ("embed_latent", "forward"):
-            patched_latents = self._patched_latents(bagel_packed_batch)
-            if patched_latents is None:
-                return {
-                    "latents": torch.zeros(
-                        1,
-                        int(self.config.patch_latent_dim),
-                        device=self.device,
-                        dtype=self.dtype,
-                    ),
-                    "position_ids": torch.zeros(1, device=self.device, dtype=torch.long),
-                    "timesteps": torch.zeros(1, device=self.device, dtype=torch.float32),
-                }
-            noised_latents, mse_target = patched_latents
-            bagel_packed_batch["mse_target"] = mse_target
-            return {
-                "latents": noised_latents,
-                "position_ids": bagel_packed_batch["packed_latent_position_ids"],
-                "timesteps": bagel_packed_batch["shifted_timesteps"],
-            }
+        patched_latents = self._patched_latents(bagel_packed_batch)
+        if patched_latents is None:
+            return self._dummy_latent_inputs()
+        noised_latents, mse_target = patched_latents
+        bagel_packed_batch["mse_target"] = mse_target
+        return {
+            "latents": noised_latents,
+            "position_ids": bagel_packed_batch["packed_latent_position_ids"],
+            "timesteps": bagel_packed_batch["shifted_timesteps"],
+        }
+
+    @pre_forward("decode_velocity")
+    def decode_velocity_pre(self, **kwargs: Any) -> Dict[str, Any]:
+        bagel_packed_batch = kwargs.get("bagel_packed_batch")
+        if bagel_packed_batch is None:
+            bagel_packed_batch = get_packed_batch(kwargs.get("conversation_list"))
+        if bagel_packed_batch is None:
+            return kwargs
+        self._bagel_packed_batch = bagel_packed_batch
         if "mse_loss_indexes" not in bagel_packed_batch or "packed_hidden_states" not in bagel_packed_batch:
             return {
-                "hidden_states": torch.zeros(
-                    1,
-                    int(self.config.hidden_size),
+                "hidden_states": zero_hidden_from_batch(
+                    bagel_packed_batch,
+                    hidden_size=int(self.config.hidden_size),
                     device=self.device,
                     dtype=self.dtype,
                 )
             }
         return {"hidden_states": bagel_packed_batch["packed_hidden_states"][bagel_packed_batch["mse_loss_indexes"]]}
 
-    def post_forward(self, method: str, **outputs: Any) -> Dict[str, Any]:
-        assert method in ("embed_latent", "decode_velocity", "forward")
+    @post_forward("embed_latent")
+    def embed_latent_post(self, **outputs: Any) -> Dict[str, Any]:
         batch = getattr(self, "_bagel_packed_batch", None)
         self._bagel_packed_batch = None
-        if batch is not None:
-            result: Dict[str, Any] = {"bagel_packed_batch": batch}
-            if method in ("embed_latent", "forward"):
-                if "fixed_noise" in batch:
-                    batch["packed_latent_embeds"] = outputs["latent_embeds"]
-                return result
-            if "mse_target" in batch and "mse_loss_indexes" in batch:
-                velocity = outputs["velocity"]
-                mse_target = batch["mse_target"].to(device=velocity.device, dtype=velocity.dtype)
-                mse = (velocity - mse_target).square()
-                batch["mse_tensor"] = mse
-                result["_loss"] = mse.mean()
-            return result
-        return outputs
+        if batch is None:
+            return outputs
+        result: Dict[str, Any] = {"bagel_packed_batch": batch}
+        if "fixed_noise" in batch:
+            batch["packed_latent_embeds"] = outputs["latent_embeds"]
+        else:
+            add_dummy_anchor_to_batch(batch, outputs["latent_embeds"].sum() * 0.0)
+        return result
+
+    @post_forward("decode_velocity")
+    def decode_velocity_post(self, **outputs: Any) -> Dict[str, Any]:
+        batch = getattr(self, "_bagel_packed_batch", None)
+        self._bagel_packed_batch = None
+        if batch is None:
+            return outputs
+        result: Dict[str, Any] = {"bagel_packed_batch": batch}
+        if "mse_target" in batch and "mse_loss_indexes" in batch:
+            velocity = outputs["velocity"]
+            mse_target = batch["mse_target"].to(device=velocity.device, dtype=velocity.dtype)
+            mse = (velocity - mse_target).square()
+            batch["mse_tensor"] = mse
+            result["_loss"] = mse.mean()
+        else:
+            result["_loss"] = outputs["velocity"].sum() * 0.0
+        return result
+
+    def _dummy_latent_inputs(self) -> Dict[str, torch.Tensor]:
+        return {
+            "latents": torch.zeros(
+                1,
+                int(self.config.patch_latent_dim),
+                device=self.device,
+                dtype=self.dtype,
+            ),
+            "position_ids": torch.zeros(1, device=self.device, dtype=torch.long),
+            "timesteps": torch.zeros(1, device=self.device, dtype=torch.float32),
+        }
 
     def _patched_latents(self, batch: dict[str, Any]) -> tuple[torch.Tensor, torch.Tensor] | None:
         if "fixed_noise" not in batch:

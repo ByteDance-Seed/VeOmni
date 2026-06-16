@@ -19,7 +19,11 @@ ModuleNode = tuple[str, str]
 
 @dataclass(frozen=True)
 class InferModulePolicy:
-    """Controls the shared inference module-tier FSM loop."""
+    """Controls the shared inference module-tier FSM loop.
+
+    ``required_nodes`` lets short recipes stop after the evidence they compare.
+    ``allow_finalize`` permits policies that need final generated artifacts.
+    """
 
     max_steps: int | None = None
     required_nodes: frozenset[tuple[str, str]] = frozenset()
@@ -98,6 +102,8 @@ def run_v2_train_nodes(driver: Any, model: OmniModel, batch: dict[str, Any]) -> 
         module_name = model.training_graph.module_of(node_name)
         method = model.training_graph.method_of(node_name)
         module = model.get_module(module_name)
+        # Mirror OmniModel's graph wiring one node at a time so module-tier
+        # tests can localize parity failures below the full graph boundary.
         kwargs = model.training_graph.collect_inputs(node_name, node_outputs, batch)
         call_kwargs = module.pre_forward(method, **kwargs)
         fn = module if method == "forward" else getattr(module, method)
@@ -157,6 +163,8 @@ def run_infer_module_fsm(
 
     with arm_generation_observer(whitelist) as observations:
         for _ in range(max_steps):
+            # Recipes usually need only a few observed nodes, not a complete
+            # generation. Stop as soon as the requested evidence is present.
             if _observed_all_required(observations, required):
                 break
             if model.generation_graph.is_done():

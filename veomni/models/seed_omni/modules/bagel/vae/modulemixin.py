@@ -8,16 +8,24 @@ import torch
 from PIL import Image
 
 from ....conversation import ConversationItem
-from ....module import ModuleMixin
+from ....module import ModuleMixin, post_forward, pre_forward
+from ..training_pack import conversation_samples, get_packed_batch
 
 
 class BagelVAEModuleMixin(ModuleMixin):
     def init_omni_state(self) -> None:
         self._bagel_packed_batch: Optional[dict[str, Any]] = None
+        self._conversation_carrier: Optional[list[list[ConversationItem]]] = None
+        self._raw_training_image_items: list[ConversationItem] = []
+        self._raw_training_image_tensors: list[torch.Tensor] = []
+        self._raw_training_skip: bool = False
 
-    def pre_forward(self, method: str, **kwargs: Any) -> Dict[str, Any]:
-        assert method in ("encode", "decode", "forward")
+    @pre_forward("encode")
+    def encode_pre(self, **kwargs: Any) -> Dict[str, Any]:
         bagel_packed_batch = kwargs.get("bagel_packed_batch")
+        conversation_list = kwargs.get("conversation_list")
+        if bagel_packed_batch is None:
+            bagel_packed_batch = get_packed_batch(conversation_list)
         if bagel_packed_batch is not None:
             self._bagel_packed_batch = bagel_packed_batch
             height = width = max(16, int(self.config.downsample) * 2)
@@ -31,15 +39,94 @@ class BagelVAEModuleMixin(ModuleMixin):
                     dtype=torch.float32,
                 )
             }
+        if conversation_list is not None:
+            self._conversation_carrier = conversation_list
+            self._raw_training_skip = False
+            self._freeze_target_encoder()
+            self._raw_training_image_items = [
+                item
+                for sample in conversation_samples(conversation_list)
+                for item in sample
+                if item.type == "image" and item.role == "assistant" and not item.meta.get("bagel_vae_latents_ready")
+            ]
+            if self._raw_training_image_items:
+                self._raw_training_image_tensors = [
+                    self._preprocess_raw_image(item.value, generation_kwargs=None)
+                    for item in self._raw_training_image_items
+                ]
+                return {
+                    "pixel_values": torch.stack(self._raw_training_image_tensors, dim=0).to(
+                        device=self.device, dtype=torch.float32
+                    )
+                }
+            self._raw_training_skip = True
+            height = width = max(16, int(self.config.downsample) * 2)
+            return {
+                "pixel_values": torch.zeros(
+                    1,
+                    int(self.config.in_channels),
+                    height,
+                    width,
+                    device=self.device,
+                    dtype=torch.float32,
+                )
+            }
         return kwargs
 
-    def post_forward(self, method: str, **outputs: Any) -> Dict[str, Any]:
-        assert method in ("encode", "decode", "forward")
+    @post_forward("encode")
+    def encode_post(self, **outputs: Any) -> Dict[str, Any]:
         batch = self._bagel_packed_batch
         self._bagel_packed_batch = None
         if batch is not None:
             return {"bagel_packed_batch": batch}
+        conversation = self._conversation_carrier
+        raw_items = self._raw_training_image_items
+        raw_tensors = self._raw_training_image_tensors
+        raw_skip = self._raw_training_skip
+        self._conversation_carrier = None
+        self._raw_training_image_items = []
+        self._raw_training_image_tensors = []
+        self._raw_training_skip = False
+        if conversation is not None and raw_skip and not raw_items:
+            return {"conversation_list": conversation}
+        if raw_items:
+            self._write_training_target_metadata(raw_items, raw_tensors, outputs["latents"].detach())
+            return {"conversation_list": conversation}
         return outputs
+
+    def _freeze_target_encoder(self) -> None:
+        # Target-image VAE encoding is data preparation. Official BAGEL keeps
+        # VAE frozen/eval here, so avoid building a useless backward graph while
+        # still letting FSDP2/DTensor wrappers run the actual forward.
+        self.eval()
+        for parameter in self.parameters():
+            parameter.requires_grad_(False)
+
+    def _write_training_target_metadata(
+        self,
+        raw_items: list[ConversationItem],
+        raw_tensors: list[torch.Tensor],
+        latents: torch.Tensor,
+    ) -> None:
+        latent_patch_size = 2
+        for index, item in enumerate(raw_items):
+            image_tensor = raw_tensors[index]
+            image_height = int(image_tensor.shape[-2])
+            image_width = int(image_tensor.shape[-1])
+            h = image_height // (int(self.config.downsample) * latent_patch_size)
+            w = image_width // (int(self.config.downsample) * latent_patch_size)
+            item.meta["bagel_role"] = "image_gen_target"
+            item.meta["raw_image_size"] = [image_width, image_height]
+            item.meta["preprocessed_image_size"] = [image_width, image_height]
+            item.meta["padded_latent"] = latents[index : index + 1]
+            item.meta["patchified_vae_latent_shape"] = (h, w)
+            item.meta["packed_latent_position_ids"] = self._flattened_position_ids(
+                image_height,
+                image_width,
+                int(self.config.downsample) * latent_patch_size,
+                64,
+            ).detach()
+            item.meta["bagel_vae_latents_ready"] = True
 
     def _decode_image_graph(
         self,

@@ -3,58 +3,23 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
 from typing import Any
 
 import torch
 from torch import nn
 
-from tests.seed_omni.bagel import reference_execution
-from tests.seed_omni.bagel.v2_execution import build_conversation_from_canonical
-from tests.seed_omni.parity_suite.core import ParityCase, ParityReport, to_device
+from tests.seed_omni.bagel.reference_model import run_reference_only_recipe
+from tests.seed_omni.bagel.transformers import BagelConfig
+from tests.seed_omni.bagel.v2_execution import (
+    build_infer_request_from_canonical,
+    build_train_graph_request_from_raw_fixture,
+    build_train_graph_request_from_stimulus,
+)
+from tests.seed_omni.parity_suite.core import ParityCase, ParityReport, sample_named_grad
 from tests.seed_omni.parity_suite.driver import ParityDriver
-from tests.seed_omni.parity_suite.reference.capture import ReferenceCaptureContext
-from tests.seed_omni.parity_suite.reference.loader import load_reference_model
-from tests.seed_omni.parity_suite.v2.model import load_omni_config_from_dir, load_omni_module_from_pretrained
-from tests.seed_omni.parity_suite.v2.module import InferModulePolicy
+from tests.seed_omni.parity_suite.v2.observation import record_module_output
 from veomni.models.seed_omni.modeling_omni import OmniModel
-
-
-@dataclass(frozen=True)
-class BagelRecipe:
-    reference_case: str
-    loss_mode: str | None = None
-    training: bool = False
-    visual_gen: bool = False
-    visual_und: bool = False
-    needs_siglip: bool = False
-    needs_flow: bool = False
-    needs_vae: bool = False
-
-
-RECIPES: dict[str, BagelRecipe] = {
-    "train_ce_mse": BagelRecipe("train_ce_mse", loss_mode="ce_mse", training=True, visual_gen=True),
-    "train_ce": BagelRecipe("train_ce_mse", loss_mode="ce_only", training=True),
-    "train_text_image_ce": BagelRecipe("train_ce_mse", loss_mode="text_image_ce", training=True, visual_und=True),
-    "train_mse": BagelRecipe("train_ce_mse", loss_mode="mse_only", training=True, visual_gen=True),
-    "text_und": BagelRecipe("text_und"),
-    "text_image_und": BagelRecipe("text_image_und", visual_und=True, needs_siglip=True),
-    "image_gen": BagelRecipe("image_gen", visual_gen=True, needs_flow=True),
-    "image_edit": BagelRecipe(
-        "image_edit",
-        visual_gen=True,
-        visual_und=True,
-        needs_siglip=True,
-        needs_flow=True,
-        needs_vae=True,
-    ),
-    "image_edit_text_und": BagelRecipe("text_und"),
-    "interleave_text_und": BagelRecipe("text_und"),
-    "interleave_text_image_und": BagelRecipe("text_image_und", visual_und=True, needs_siglip=True),
-    "interleave_image_gen": BagelRecipe("image_gen", visual_gen=True, needs_flow=True),
-    "transformers_reference_smoke": BagelRecipe("transformers_reference_smoke"),
-}
-SUPPORTED_RECIPES = frozenset(RECIPES)
+from veomni.models.seed_omni.modules.bagel.training_pack import packed_label_rows
 
 
 def create_driver(case: ParityCase) -> BagelParityDriver:
@@ -64,70 +29,25 @@ def create_driver(case: ParityCase) -> BagelParityDriver:
 class BagelParityDriver(ParityDriver):
     """Own BAGEL-specific reference/V2 execution wiring."""
 
-    def __init__(self, case: ParityCase) -> None:
-        super().__init__(case)
-        if case.recipe.id not in SUPPORTED_RECIPES:
-            raise NotImplementedError(f"Unsupported BAGEL recipe: {case.recipe.id!r}")
-
     def reference_inputs(self) -> Mapping[str, Any]:
         inputs = dict(super().reference_inputs())
-        recipe = self._recipe()
-        if recipe.loss_mode is not None:
-            inputs["loss_mode"] = recipe.loss_mode
+        loss_mode = self._loss_mode()
+        if loss_mode is not None:
+            inputs["loss_mode"] = loss_mode
         return inputs
 
-    def load_reference(self, *, device: torch.device, dtype: torch.dtype) -> nn.Module:
-        recipe = self._recipe()
-        return load_reference_model(
-            self.case.model.reference,
-            visual_gen=recipe.visual_gen,
-            visual_und=recipe.visual_und,
-            init_on_meta=True,
-            torch_dtype=dtype,
-            device=device,
-            latent_patch_size=2,
-            max_latent_size=64,
-            timestep_shift=float(self.case.recipe.stimulus.get("timestep_shift", 3.0)),
-            vit_max_num_patch_per_side=70,
-            connector_act="gelu_pytorch_tanh",
-        )
-
-    def load_v2_model(self, *, device: torch.device, dtype: torch.dtype) -> OmniModel:
-        model_root = self.case.model.v2_model.model_root
-        if model_root is None:
-            raise ValueError("BAGEL V2 model_root is required.")
-        recipe = self._recipe()
-        graph = None if recipe.training else self.case.graph.name
-        config = load_omni_config_from_dir(self.case.model.v2_model.config_dir, graph=graph)
-        text_encoder = load_omni_module_from_pretrained(model_root / "bagel_text_encoder", device=device, dtype=dtype)
-        qwen2_mot = load_omni_module_from_pretrained(model_root / "bagel_qwen2_mot", device=device, dtype=dtype)
-        if recipe.training or recipe.needs_flow:
-            flow_connector: nn.Module = load_omni_module_from_pretrained(
-                model_root / "bagel_flow_connector", device=device, dtype=dtype
-            )
-        else:
-            flow_connector = _UnusedModule()
-        if recipe.training or recipe.needs_siglip:
-            siglip: nn.Module = load_omni_module_from_pretrained(
-                model_root / "bagel_siglip_navit", device=device, dtype=dtype
-            )
-        else:
-            siglip = _NoopGenerateModule()
-        if recipe.training or recipe.needs_vae or bool(self.case.recipe.stimulus.get("enable_decode_smoke", False)):
-            vae: nn.Module = load_omni_module_from_pretrained(model_root / "bagel_vae", device=device, dtype=dtype)
-        else:
-            vae = _UnusedModule()
-        modules: dict[str, nn.Module] = {
-            "bagel_text_encoder": text_encoder.eval(),
-            "bagel_siglip_navit": siglip.eval(),
-            "bagel_vae": vae.eval(),
-            "bagel_flow_connector": flow_connector.eval(),
-            "bagel_qwen2_mot": qwen2_mot.eval(),
+    def reference_model_load_kwargs(self, *, device: torch.device, dtype: torch.dtype) -> dict[str, Any]:
+        return {
+            "config": BagelConfig(),
+            "init_on_meta": True,
+            "torch_dtype": dtype,
+            "device": device,
+            "latent_patch_size": 2,
+            "max_latent_size": 64,
+            "timestep_shift": float(self.case.recipe.stimulus.get("timestep_shift", 3.0)),
+            "vit_max_num_patch_per_side": 70,
+            "connector_act": "gelu_pytorch_tanh",
         }
-        return OmniModel(config, modules).eval()
-
-    def _recipe(self) -> BagelRecipe:
-        return RECIPES[self.case.recipe.id]
 
     def generation_kwargs(self, model_or_config: Any) -> dict[str, Any]:
         kwargs = super().generation_kwargs(model_or_config)
@@ -148,42 +68,40 @@ class BagelParityDriver(ParityDriver):
                 kwargs[key] = self.case.recipe.stimulus[key]
         return kwargs
 
-    @torch.no_grad()
-    def run_reference_recipe(
-        self,
-        ref_model: nn.Module,
-        inputs: Mapping[str, Any],
-        context: ReferenceCaptureContext,
-    ) -> dict[str, Any]:
-        return reference_execution.run_reference_recipe(self._recipe().reference_case, ref_model, inputs, context)
-
     def run_reference_only_recipe(self) -> ParityReport:
-        return reference_execution.run_reference_only_recipe(
+        return run_reference_only_recipe(
             recipe_id=self.case.recipe.id,
             run_kind=self.case.run.kind,
             case_id=self.case.node_id,
         )
 
     def v2_infer_request(self, reference_output: Mapping[str, Any], *, device: torch.device) -> dict[str, Any]:
-        return {"conversation_list": build_conversation_from_canonical(reference_output["canonical"], device=device)}
+        return build_infer_request_from_canonical(reference_output["canonical"], device=device)
 
-    def v2_train_batch_kwargs(self, reference_output: Mapping[str, Any], *, device: torch.device) -> dict[str, Any]:
-        return {"bagel_packed_batch": to_device(reference_output["canonical"]["train_batch"], device)}
+    def v2_train_batch_kwargs(
+        self, reference_output: Mapping[str, Any] | None, *, device: torch.device
+    ) -> dict[str, Any]:
+        if reference_output is None:
+            loss_mode = self._loss_mode()
+            if loss_mode is None:
+                raise ValueError(f"BAGEL training recipe {self.case.recipe.id!r} must declare a loss_mode.")
+            return build_train_graph_request_from_stimulus(
+                self.case.recipe.stimulus,
+                loss_mode=loss_mode,
+                device=device,
+            )
+        return build_train_graph_request_from_raw_fixture(reference_output["canonical"], device=device)
 
-    def v2_infer_module_policy(
-        self,
-        reference_output: Mapping[str, Any],
-        whitelist: Mapping[tuple[str, str], frozenset[str]],
-    ) -> InferModulePolicy:
-        return super().v2_infer_module_policy(reference_output, whitelist)
+    def _loss_mode(self) -> str | None:
+        loss_mode = self.case.recipe.reference.get("loss_mode")
+        return None if loss_mode is None else str(loss_mode)
 
     def sample_v2_framework_parameters(
         self,
         model: OmniModel,
         batch: Mapping[str, Any],
     ) -> Mapping[str, torch.Tensor]:
-        packed_batch = _packed_batch(batch)
-        label_rows = torch.unique(packed_batch["packed_label_ids"].detach().cpu()).to(dtype=torch.long)
+        label_rows = _maybe_packed_label_rows(batch)
         return {
             "qwen_early_q_proj": _sample_param(
                 model.get_module("bagel_qwen2_mot"),
@@ -200,6 +118,32 @@ class BagelParityDriver(ParityDriver):
             ),
         }
 
+    def record_v2_train_gradient_observations(
+        self,
+        model: OmniModel,
+        observations: dict[tuple[str, str], list[dict[str, Any]]],
+        whitelist: Mapping[tuple[str, str], frozenset[str]],
+        *,
+        batch: Mapping[str, Any],
+    ) -> None:
+        label_rows: torch.Tensor | None = None
+        for mapping in self.v2_train_gradient_mappings():
+            fields = whitelist.get(("train", mapping.node), frozenset())
+            if mapping.v2_field not in fields or mapping.v2_grad is None:
+                continue
+            rows = None
+            if mapping.v2_grad.module == "bagel_text_encoder" and mapping.v2_grad.parameter == "lm_head.weight":
+                label_rows = _maybe_packed_label_rows(batch) if label_rows is None else label_rows
+                rows = label_rows
+            out = {
+                mapping.v2_field: sample_named_grad(
+                    model.get_module(mapping.v2_grad.module),
+                    mapping.v2_grad.parameter,
+                    rows=rows,
+                )
+            }
+            record_module_output(observations, whitelist, state="train", node=mapping.node, out=out)
+
 
 def _sample_param(module: nn.Module, name: str, rows: torch.Tensor | None = None) -> torch.Tensor:
     value = dict(module.named_parameters())[name].detach().cpu()
@@ -210,37 +154,14 @@ def _sample_param(module: nn.Module, name: str, rows: torch.Tensor | None = None
     return value[:16]
 
 
-def _packed_batch(batch: Mapping[str, Any]) -> Mapping[str, Any]:
-    packed = batch.get("bagel_packed_batch")
-    if isinstance(packed, Mapping):
-        return packed
-    return batch
-
-
-class _NoopGenerateModule(nn.Module):
-    def generate(self, conversation_list: list[Any] | None = None, **kwargs: Any) -> dict[str, Any]:
-        del kwargs
-        return {"conversation_list": conversation_list}
-
-
-class _UnusedModule(nn.Module):
-    def encode(self, conversation_list: list[Any] | None = None, **kwargs: Any) -> dict[str, Any]:
-        del kwargs
-        return {"conversation_list": conversation_list}
-
-    def decode(self, conversation_list: list[Any] | None = None, **kwargs: Any) -> dict[str, Any]:
-        del kwargs
-        return {"conversation_list": conversation_list}
-
-    def embed_latent(self, conversation_list: list[Any] | None = None, **kwargs: Any) -> dict[str, Any]:
-        del kwargs
-        return {"conversation_list": conversation_list}
+def _maybe_packed_label_rows(batch: Mapping[str, Any]) -> torch.Tensor | None:
+    try:
+        return packed_label_rows(batch.get("conversation_list"))
+    except (KeyError, ValueError):
+        return None
 
 
 __all__ = [
-    "BagelRecipe",
     "BagelParityDriver",
-    "RECIPES",
-    "SUPPORTED_RECIPES",
     "create_driver",
 ]

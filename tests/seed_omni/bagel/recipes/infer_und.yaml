@@ -3,6 +3,8 @@ text_und:
       prompt: "Write a short description of a calm lake at sunrise."
       max_new_tokens: 1
       do_sample: false
+    reference:
+      kind: text_und
     runs:
       graph:
         - id: one_step
@@ -28,6 +30,8 @@ text_image_und:
       image_height: 336
       max_new_tokens: 1
       do_sample: false
+    reference:
+      kind: text_image_und
     runs:
       graph:
         - id: prepared_one_step
@@ -52,6 +56,8 @@ text_image_und:
       use_raw_image: true
       max_new_tokens: 1
       do_sample: false
+    reference:
+      kind: text_image_und
     runs:
       graph:
         - id: raw_one_step

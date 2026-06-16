@@ -2,6 +2,12 @@ train_ce_mse:
   - stimulus:
       prompt: "Describe BAGEL in one short sentence."
       timestep_shift: 3.0
+    reference:
+      kind: train
+      loss_mode: ce_mse
+      options:
+        visual_gen: true
+        visual_und: false
     runs:
       graph:
         - id: one_step
@@ -21,16 +27,21 @@ train_ce_mse:
             - train.grad_gen_q_proj
             - train.grad_lm_head_rows
             - train.grad_llm2vae
+
+  - stimulus:
+      prompt: "Describe BAGEL in one short sentence."
+      timestep_shift: 3.0
+    reference:
+      kind: train
+      loss_mode: ce_mse
+      options:
+        visual_gen: true
+        visual_und: false
+    gate:
+      requires_reference_capture: false
+      requires_reference_checkpoint: false
+    runs:
       framework:
-        - id: forward_backward
-          kind: forward_backward
-          probes:
-            - train.ce_loss
-            - train.mse_loss
-            - train.grad_early_q_proj
-            - train.grad_gen_q_proj
-            - train.grad_lm_head_rows
-            - train.grad_llm2vae
         - id: train_step_optimizer_scheduler
           kind: train_step
           options:
@@ -133,10 +144,60 @@ train_ce_mse:
             max_grad_norm: 1.0e9
             timeout: 900
 
+  - data:
+      data_type: seedomni
+      train_path:
+        sources:
+          - /mnt/hdfs/shizhelun/dataset/imagenet1k_train
+          - /mnt/hdfs/veomni/datasets/tulu-3-sft-mixture/data
+          - /mnt/hdfs/veomni/datasets/sharegpt4v_cap_100k
+        names:
+          - imagenet1k
+          - tulu-3-sft-mixture
+          - sharegpt4v_cap_100k
+        schedule:
+          - schedule_type: const
+            weights: [0.5, 0.2, 0.3]
+        level: token
+        stopping_strategy: all_exhausted
+        upstream_sharded: true
+      datasets_type: iterable
+      multisource_datasets_type: veomni_weighted_multisource
+      max_seq_len: 1024
+    reference:
+      kind: train
+      loss_mode: ce_mse
+      options:
+        visual_gen: true
+        visual_und: false
+    gate:
+      requires_reference_capture: false
+      requires_reference_checkpoint: false
+      requires_cuda: true
+      min_cuda_devices: 8
+    runs:
+      framework:
+        - id: fsdp2_8rank_100step_data_loss_mixed_gc
+          kind: data_loss_smoke
+          options:
+            strategy: fsdp2
+            nproc_per_node: 8
+            steps: 100
+            gradient_checkpointing: true
+            expect_loss_decrease: true
+            loss_window: 10
+            timeout: 7200
+
 train_ce:
   - stimulus:
       prompt: "Describe BAGEL in one short sentence."
       timestep_shift: 3.0
+    reference:
+      kind: train
+      loss_mode: ce_only
+      options:
+        visual_gen: false
+        visual_und: false
     runs:
       graph:
         - id: one_step
@@ -150,13 +211,28 @@ train_ce:
             - train.ce_loss
             - train.grad_early_q_proj
             - train.grad_lm_head_rows
+
+  - stimulus:
+      prompt: "Describe BAGEL in one short sentence."
+      timestep_shift: 3.0
+    reference:
+      kind: train
+      loss_mode: ce_only
+      options:
+        visual_gen: false
+        visual_und: false
+    gate:
+      requires_reference_capture: false
+      requires_reference_checkpoint: false
+    runs:
       framework:
-        - id: forward_backward
-          kind: forward_backward
-          probes:
-            - train.ce_loss
-            - train.grad_early_q_proj
-            - train.grad_lm_head_rows
+        - id: train_step_v2_policy
+          kind: train_step
+          options:
+            lr: 1.0e-4
+            max_grad_norm: 1.0e9
+            checks:
+              - optimizer_scheduler
         - id: fsdp2_ce_only_dummy_safety
           kind: distributed_train
           gate:
@@ -172,6 +248,12 @@ train_text_image_ce:
   - stimulus:
       prompt: "Describe BAGEL in one short sentence."
       timestep_shift: 3.0
+    reference:
+      kind: train
+      loss_mode: text_image_ce
+      options:
+        visual_gen: false
+        visual_und: true
     runs:
       graph:
         - id: one_step
@@ -182,24 +264,44 @@ train_text_image_ce:
             - train.grad_siglip_q_proj
       module:
         - id: one_step
-          probes:
-            - train.ce_loss
-            - train.grad_early_q_proj
-            - train.grad_lm_head_rows
-            - train.grad_siglip_q_proj
-      framework:
-        - id: forward_backward
-          kind: forward_backward
           probes:
             - train.ce_loss
             - train.grad_early_q_proj
             - train.grad_lm_head_rows
             - train.grad_siglip_q_proj
 
+  - stimulus:
+      prompt: "Describe BAGEL in one short sentence."
+      timestep_shift: 3.0
+    reference:
+      kind: train
+      loss_mode: text_image_ce
+      options:
+        visual_gen: false
+        visual_und: true
+    gate:
+      requires_reference_capture: false
+      requires_reference_checkpoint: false
+    runs:
+      framework:
+        - id: train_step_v2_policy
+          kind: train_step
+          options:
+            lr: 1.0e-4
+            max_grad_norm: 1.0e9
+            checks:
+              - optimizer_scheduler
+
 train_mse:
   - stimulus:
       prompt: "Describe BAGEL in one short sentence."
       timestep_shift: 3.0
+    reference:
+      kind: train
+      loss_mode: mse_only
+      options:
+        visual_gen: true
+        visual_und: false
     runs:
       graph:
         - id: one_step
@@ -213,13 +315,28 @@ train_mse:
             - train.mse_loss
             - train.grad_gen_q_proj
             - train.grad_llm2vae
+
+  - stimulus:
+      prompt: "Describe BAGEL in one short sentence."
+      timestep_shift: 3.0
+    reference:
+      kind: train
+      loss_mode: mse_only
+      options:
+        visual_gen: true
+        visual_und: false
+    gate:
+      requires_reference_capture: false
+      requires_reference_checkpoint: false
+    runs:
       framework:
-        - id: forward_backward
-          kind: forward_backward
-          probes:
-            - train.mse_loss
-            - train.grad_gen_q_proj
-            - train.grad_llm2vae
+        - id: train_step_v2_policy
+          kind: train_step
+          options:
+            lr: 1.0e-4
+            max_grad_norm: 1.0e9
+            checks:
+              - optimizer_scheduler
         - id: fsdp2_mse_only_dummy_safety
           kind: distributed_train
           gate:

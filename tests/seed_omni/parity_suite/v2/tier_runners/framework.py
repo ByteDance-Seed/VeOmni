@@ -6,9 +6,12 @@ import gc
 import json
 import os
 import runpy
+import select
 import shutil
+import signal
 import subprocess
 import sys
+import time
 from collections.abc import Mapping
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
@@ -18,6 +21,7 @@ from typing import Any
 
 import torch
 import torch.distributed as dist
+import yaml
 from torch import nn
 
 from tests.seed_omni.parity_suite.core import (
@@ -92,6 +96,8 @@ def run_v2_train_framework(
             return _run_optimizer_trajectory_policy(driver, reference_output, device=device, dtype=dtype)
         if run.kind == "distributed_train":
             return _run_distributed_train_policy(driver, reference_output, device=device, dtype=dtype)
+        if run.kind == "data_loss_smoke":
+            return _run_data_loss_smoke_policy(driver, device=device, dtype=dtype)
         raise NotImplementedError(f"Unsupported training framework kind {run.kind!r}.")
     finally:
         _release_cuda_memory()
@@ -130,6 +136,8 @@ def run_v2_train_framework_batch(
 
 
 def build_minimal_omni_trainer(model: OmniModel, *, device: torch.device, dtype: torch.dtype) -> OmniTrainer:
+    """Create only the trainer state needed by ``forward_backward_step``."""
+
     trainer = OmniTrainer.__new__(OmniTrainer)
     base = BaseTrainer.__new__(BaseTrainer)
     base.model = model
@@ -150,6 +158,8 @@ def build_minimal_omni_trainer(model: OmniModel, *, device: torch.device, dtype:
 
 
 def build_trainer_node_executors(model: OmniModel) -> dict[str, Any]:
+    """Bind graph nodes to ``OmniModuleTrainer.forward`` without full trainer setup."""
+
     executors: dict[str, Any] = {}
     for name, module in model.modules_dict.items():
         module_trainer = OmniModuleTrainer.__new__(OmniModuleTrainer)
@@ -170,6 +180,8 @@ def _run_train_step_policy(
     direct_batch = driver.v2_train_batch_kwargs(reference_output, device=device)
     trainer_batch = driver.v2_train_batch_kwargs(reference_output, device=device)
 
+    # Compare the production trainer step against a direct optimizer step using
+    # fresh models with identical seeds, batches, optimizer, and scheduler.
     driver.configure_determinism(driver.case.model.seed)
     direct_model = driver.load_v2_model(device=device, dtype=dtype).train()
     direct_result = _run_direct_train_step(
@@ -373,31 +385,33 @@ def _run_distributed_train_policy(
         shutil.rmtree(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    direct_result: Mapping[str, Any] | None = None
-    direct_parameters: Mapping[str, torch.Tensor] | None = None
+    batch_kwargs = driver.v2_train_batch_kwargs(reference_output, device=torch.device("cpu"))
+    baseline_report: Mapping[str, Any] | None = None
     if compare_direct:
-        direct_batch = driver.v2_train_batch_kwargs(reference_output, device=device)
-        driver.configure_determinism(driver.case.model.seed)
-        direct_model = driver.load_v2_model(device=device, dtype=dtype).train()
-        direct_result = _run_direct_train_step(
-            direct_model,
-            direct_batch,
-            seed=driver.case.model.seed,
+        baseline_report = _run_v2_train_fsdp2(
+            driver,
+            batch_kwargs,
+            config_path=Path(str(options.get("config_path", driver.case.model.v2_model.config_dir / "base.yaml"))),
+            output_dir=output_dir / "baseline_rank1",
             dtype=dtype,
+            nproc_per_node=1,
+            timeout=int(options.get("timeout", 900)),
             lr=lr,
             max_grad_norm=max_grad_norm,
             num_micro_steps=num_micro_steps,
+            collect_parameter_samples=True,
+            dp_replicate_size=None,
+            dp_shard_size=None,
+            fsdp_mode="ddp",
+            init_device="cuda",
+            mixed_precision=False,
+            require_fsdp_modules=False,
         )
-        direct_parameters = driver.sample_v2_framework_parameters(direct_model, direct_batch)
-        del direct_model, direct_batch
-        _release_cuda_memory()
-
-    batch_kwargs = driver.v2_train_batch_kwargs(reference_output, device=torch.device("cpu"))
     report = _run_v2_train_fsdp2(
         driver,
         batch_kwargs,
         config_path=Path(str(options.get("config_path", driver.case.model.v2_model.config_dir / "base.yaml"))),
-        output_dir=output_dir,
+        output_dir=output_dir / "target",
         dtype=dtype,
         nproc_per_node=nproc,
         timeout=int(options.get("timeout", 900)),
@@ -407,6 +421,10 @@ def _run_distributed_train_policy(
         collect_parameter_samples=compare_direct,
         dp_replicate_size=dp_replicate_size,
         dp_shard_size=dp_shard_size,
+        fsdp_mode="fsdp2",
+        init_device="meta",
+        mixed_precision=False,
+        require_fsdp_modules=True,
     )
     reports = [
         _framework_report(driver, "framework.fsdp2_exit_code", report["exit_code"], 0, "exact"),
@@ -442,16 +460,78 @@ def _run_distributed_train_policy(
             )
         )
     if compare_direct:
-        if direct_result is None or direct_parameters is None:
-            raise RuntimeError("FSDP2 numeric policy did not build a direct reference.")
+        if baseline_report is None:
+            raise RuntimeError("FSDP2 numeric policy did not build a baseline report.")
         reports.extend(
             _fsdp2_numeric_reports(
                 driver,
                 report=report,
-                direct_result=direct_result,
-                direct_parameters=direct_parameters,
+                baseline_report=baseline_report,
             )
         )
+    return ParityReport(case_id=driver.case.node_id, probes=tuple(reports))
+
+
+def _run_data_loss_smoke_policy(
+    driver: Any,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> ParityReport:
+    del device, dtype
+    options = driver.case.run.options
+    strategy = str(options.get("strategy", "fsdp2"))
+    if strategy != "fsdp2":
+        raise NotImplementedError(f"Unsupported data_loss_smoke strategy {strategy!r}.")
+
+    nproc = int(options.get("nproc_per_node", 8))
+    steps = int(options.get("steps", 100))
+    loss_window = int(options.get("loss_window", 10))
+    output_dir = _policy_output_dir(driver, "data_loss_smoke_fsdp2")
+    if output_dir.exists():
+        shutil.rmtree(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    report = _run_v2_train_data_loss_smoke(
+        driver,
+        config_path=Path(str(options.get("config_path", driver.case.model.v2_model.config_dir / "base.yaml"))),
+        output_dir=output_dir,
+        nproc_per_node=nproc,
+        steps=steps,
+        timeout=int(options.get("timeout", 7200)),
+        gradient_checkpointing=bool(options.get("gradient_checkpointing", True)),
+        loss_window=loss_window,
+        expect_loss_decrease=bool(options.get("expect_loss_decrease", True)),
+        data_source_names=tuple(str(name) for name in options.get("data_source_names", ()) or ()),
+    )
+    _write_data_loss_manifest(driver, report=report, output_dir=output_dir)
+    reports = [
+        _framework_report(driver, "framework.data_loss_exit_code", report["exit_code"], 0, "exact"),
+        _framework_report(driver, "framework.data_loss_all_pass", bool(report.get("all_pass", False)), True, "exact"),
+        _framework_report(driver, "framework.data_loss_dp_mode", report.get("dp_mode"), "fsdp2", "exact"),
+        _framework_report(driver, "framework.data_loss_rank_count", len(report.get("ranks", [])), nproc, "exact"),
+        _framework_report(
+            driver,
+            "framework.data_loss_steps",
+            int(report.get("steps", 0)),
+            steps,
+            "exact",
+        ),
+        _framework_report(
+            driver,
+            "framework.data_loss_gradient_checkpointing",
+            bool(report.get("gradient_checkpointing", False)),
+            True,
+            "exact",
+        ),
+        _framework_report(
+            driver,
+            "framework.data_loss_decreased",
+            bool(report.get("loss_decreased", False)),
+            True,
+            "exact",
+        ),
+    ]
     return ParityReport(case_id=driver.case.node_id, probes=tuple(reports))
 
 
@@ -598,49 +678,63 @@ def _fsdp2_numeric_reports(
     driver: Any,
     *,
     report: Mapping[str, Any],
-    direct_result: Mapping[str, Any],
-    direct_parameters: Mapping[str, torch.Tensor],
+    baseline_report: Mapping[str, Any],
 ) -> list[ProbeReport]:
     reports = [
         _framework_report(
             driver,
+            "framework.fsdp2_baseline_exit_code",
+            baseline_report["exit_code"],
+            0,
+            "exact",
+        ),
+        _framework_report(
+            driver,
+            "framework.fsdp2_baseline_all_pass",
+            bool(baseline_report.get("all_pass", False)),
+            True,
+            "exact",
+        ),
+        _framework_report(
+            driver,
             "framework.fsdp2_loss",
             torch.tensor([float(report.get("loss", float("nan")))]),
-            direct_result["loss"].reshape(1),
+            torch.tensor([float(baseline_report.get("loss", float("nan")))]),
             "distributed_loss",
         ),
         _framework_report(
             driver,
             "framework.fsdp2_grad_norm",
             torch.tensor([float(report.get("grad_norm", float("nan")))]),
-            torch.tensor([float(direct_result["grad_norm"])]),
+            torch.tensor([float(baseline_report.get("grad_norm", float("nan")))]),
             "gradient",
         ),
         _framework_report(
             driver,
             "framework.fsdp2_scheduler_lrs",
             torch.tensor(report.get("scheduler_lrs", [])),
-            torch.tensor(direct_result["scheduler_lrs"]),
+            torch.tensor(baseline_report.get("scheduler_lrs", [])),
             "exact",
         ),
         _framework_report(
             driver,
             "framework.fsdp2_scheduler_epochs",
             report.get("scheduler_epochs", {}),
-            direct_result["scheduler_epochs"],
+            baseline_report.get("scheduler_epochs", {}),
             "exact",
         ),
         _framework_report(
             driver, "framework.fsdp2_zero_grad", bool(report.get("zero_grad_passes", False)), True, "exact"
         ),
     ]
-    if direct_parameters:
+    baseline_parameters = baseline_report.get("parameters_after_step", {})
+    if baseline_parameters:
         reports.append(
             _framework_report(
                 driver,
                 "framework.fsdp2_parameters_after_step",
                 report.get("parameters_after_step", {}),
-                _floating_tensors_to_float32(direct_parameters),
+                _floating_tensors_to_float32(baseline_parameters),
                 "gradient",
             )
         )
@@ -888,9 +982,13 @@ def _run_launcher_smoke(
     device: torch.device,
     dtype: torch.dtype,
 ) -> dict[str, Any]:
+    """Exercise the training launcher path with a recipe-backed trainer stub."""
+
     import veomni.trainer.omni_trainer as omni_trainer_module
 
     report: dict[str, Any] = {"train_called": False}
+    lr = 1.0e-4
+    max_grad_norm = 1.0e9
 
     class RecipeBackedLauncherTrainer:
         def __init__(self, args: Any) -> None:
@@ -898,9 +996,9 @@ def _run_launcher_smoke(
             model = driver.load_v2_model(device=device, dtype=dtype).train()
             model.set_node_executors(build_trainer_node_executors(model))
             self.trainer = build_minimal_omni_trainer(model, device=device, dtype=dtype)
-            self.trainer.base.args.train.optimizer = SimpleNamespace(max_grad_norm=1.0e9)
+            self.trainer.base.args.train.optimizer = SimpleNamespace(max_grad_norm=max_grad_norm)
             self.trainer.base.state = SimpleNamespace(global_step=0)
-            self.trainer.base.optimizer = _build_multi_optimizer(model, lr=1.0e-4)
+            self.trainer.base.optimizer = _build_multi_optimizer(model, lr=lr)
             self.trainer.base.lr_scheduler = _build_multi_scheduler(self.trainer.base.optimizer)
             self.batch = batch
             report.update(
@@ -948,6 +1046,12 @@ def _run_launcher_smoke(
         "1",
         "--train.max_steps",
         "1",
+        "--train.seed",
+        str(driver.case.model.seed),
+        "--train.optimizer.lr",
+        str(lr),
+        "--train.optimizer.max_grad_norm",
+        str(max_grad_norm),
         "--train.wandb.enable",
         "false",
         "--train.checkpoint.output_dir",
@@ -967,6 +1071,8 @@ def _run_launcher_smoke(
         "--data.dataloader.drop_last",
         "false",
     ]
+    # Patch argv and OmniTrainer only inside the smoke so the production launcher
+    # parses config normally while the training body stays deterministic.
     omni_trainer_module.OmniTrainer = RecipeBackedLauncherTrainer
     try:
         runpy.run_path(str(launcher_path), run_name="__main__")
@@ -991,7 +1097,14 @@ def _run_v2_train_fsdp2(
     collect_parameter_samples: bool,
     dp_replicate_size: int | None,
     dp_shard_size: int | None,
+    fsdp_mode: str,
+    init_device: str,
+    mixed_precision: bool,
+    require_fsdp_modules: bool,
 ) -> Mapping[str, Any]:
+    """Run the FSDP2 worker and load its rank-0 ``results.json`` report."""
+
+    output_dir.mkdir(parents=True, exist_ok=True)
     payload_path = output_dir / "fsdp2_payload.pt"
     torch.save(
         {
@@ -1002,11 +1115,14 @@ def _run_v2_train_fsdp2(
             "max_grad_norm": max_grad_norm,
             "num_micro_steps": num_micro_steps,
             "collect_parameter_samples": collect_parameter_samples,
+            "require_fsdp_modules": require_fsdp_modules,
         },
         payload_path,
     )
     port = _find_free_port()
-    worker_path = Path("tests/seed_omni/parity_suite/v2/train_fsdp2_worker.py")
+    worker_path = Path("tests/seed_omni/parity_suite/v2/workers/train_fsdp2_worker.py")
+    # Distributed policies run in a child process so FSDP process groups and
+    # device state are isolated from the parent pytest process.
     cmd = [
         sys.executable,
         "-m",
@@ -1035,7 +1151,11 @@ def _run_v2_train_fsdp2(
         "--train.checkpoint.hf_save_steps",
         "0",
         "--accelerator.fsdp_config.fsdp_mode",
-        "fsdp2",
+        fsdp_mode,
+        "--train.init_device",
+        init_device,
+        "--accelerator.fsdp_config.mixed_precision.enable",
+        str(mixed_precision).lower(),
         "--train.gradient_checkpointing.enable",
         "false",
         "--data.dataloader.num_workers",
@@ -1052,13 +1172,258 @@ def _run_v2_train_fsdp2(
         "VEOMNI_PARITY_FSDP2_PAYLOAD": str(payload_path),
         "VEOMNI_PARITY_FSDP2_OUTPUT_DIR": str(output_dir),
     }
-    result = subprocess.run(cmd, env=env, text=True, capture_output=True, timeout=timeout)
+    log_path = output_dir / "run.log"
+    with log_path.open("w", encoding="utf-8") as log_file:
+        log_file.write("command: " + " ".join(cmd) + "\n")
+        log_file.flush()
+        process = subprocess.Popen(
+            cmd,
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+        stdout_chunks: list[str] = []
+        deadline = time.monotonic() + timeout
+        try:
+            assert process.stdout is not None
+            for line in process.stdout:
+                stdout_chunks.append(line)
+                log_file.write(line)
+                log_file.flush()
+                sys.__stdout__.write(line)
+                sys.__stdout__.flush()
+                if time.monotonic() > deadline:
+                    raise subprocess.TimeoutExpired(cmd, timeout)
+            returncode = process.wait(timeout=max(0.0, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            os.killpg(process.pid, signal.SIGTERM)
+            try:
+                process.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.wait()
+            raise
     report_path = output_dir / "results.json"
     report = json.loads(report_path.read_text(encoding="utf-8")) if report_path.exists() else {}
-    report["exit_code"] = result.returncode
-    report["stdout_tail"] = result.stdout[-4000:]
-    report["stderr_tail"] = result.stderr[-4000:]
+    stdout = "".join(stdout_chunks)
+    report["exit_code"] = returncode
+    report["log_path"] = str(log_path)
+    report["stdout_tail"] = stdout[-4000:]
+    report["stderr_tail"] = ""
     return report
+
+
+def _run_v2_train_data_loss_smoke(
+    driver: Any,
+    *,
+    config_path: Path,
+    output_dir: Path,
+    nproc_per_node: int,
+    steps: int,
+    timeout: int,
+    gradient_checkpointing: bool,
+    loss_window: int,
+    expect_loss_decrease: bool,
+    data_source_names: tuple[str, ...],
+) -> Mapping[str, Any]:
+    """Run the data/loss worker and load its rank-0 ``results.json`` report."""
+
+    data_config = dict(driver.case.recipe.data or {})
+    data_config = _filter_data_sources(data_config, data_source_names)
+    data_path = _materialize_recipe_data_config(data_config, output_dir)
+    port = _find_free_port()
+    worker_path = Path("tests/seed_omni/parity_suite/v2/workers/train_data_loss_worker.py")
+    cmd = [
+        sys.executable,
+        "-m",
+        "torch.distributed.run",
+        "--nnodes=1",
+        f"--nproc_per_node={nproc_per_node}",
+        f"--master_port={port}",
+        str(worker_path),
+        str(config_path),
+        "--model.model_path",
+        str(driver.case.model.v2_model.model_root),
+        "--train.global_batch_size",
+        str(nproc_per_node),
+        "--train.micro_batch_size",
+        "1",
+        "--train.max_steps",
+        str(steps),
+        "--train.wandb.enable",
+        "false",
+        "--train.checkpoint.output_dir",
+        str(output_dir),
+        "--train.checkpoint.save_steps",
+        "0",
+        "--train.checkpoint.save_hf_weights",
+        "false",
+        "--train.checkpoint.hf_save_steps",
+        "0",
+        "--accelerator.fsdp_config.fsdp_mode",
+        "fsdp2",
+        "--train.gradient_checkpointing.enable",
+        str(gradient_checkpointing).lower(),
+        "--data.train_path",
+        str(data_path),
+        "--data.dataloader.num_workers",
+        "0",
+        "--data.dataloader.drop_last",
+        "false",
+    ]
+    for key in ("data_type", "datasets_type", "multisource_datasets_type", "max_seq_len", "train_sample"):
+        if key in data_config:
+            cmd.extend([f"--data.{key}", str(data_config[key])])
+    env = {
+        **os.environ,
+        "VEOMNI_PARITY_DATA_LOSS_OUTPUT_DIR": str(output_dir),
+        "VEOMNI_PARITY_DATA_LOSS_WINDOW": str(loss_window),
+        "VEOMNI_PARITY_DATA_LOSS_EXPECT_DECREASE": str(expect_loss_decrease).lower(),
+    }
+    log_path = output_dir / "run.log"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    with log_path.open("w", encoding="utf-8") as log_file:
+        log_file.write("command: " + " ".join(cmd) + "\n")
+        log_file.flush()
+        process = subprocess.Popen(
+            cmd,
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+        stdout_chunks: list[str] = []
+        deadline = time.monotonic() + timeout
+        timed_out = False
+        try:
+            assert process.stdout is not None
+            while True:
+                if process.poll() is not None:
+                    for line in process.stdout:
+                        stdout_chunks.append(line)
+                        log_file.write(line)
+                        sys.__stdout__.write(line)
+                    log_file.flush()
+                    sys.__stdout__.flush()
+                    returncode = int(process.returncode)
+                    break
+                if time.monotonic() > deadline:
+                    timed_out = True
+                    returncode = 124
+                    raise subprocess.TimeoutExpired(cmd, timeout)
+                ready, _, _ = select.select([process.stdout], [], [], 1.0)
+                if not ready:
+                    continue
+                line = process.stdout.readline()
+                if not line:
+                    continue
+                stdout_chunks.append(line)
+                log_file.write(line)
+                log_file.flush()
+                sys.__stdout__.write(line)
+                sys.__stdout__.flush()
+        except subprocess.TimeoutExpired:
+            os.killpg(process.pid, signal.SIGTERM)
+            try:
+                process.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.wait()
+            timed_out = True
+            returncode = 124
+    report_path = output_dir / "results.json"
+    report = json.loads(report_path.read_text(encoding="utf-8")) if report_path.exists() else {}
+    stdout = "".join(stdout_chunks)
+    report.setdefault("all_pass", False)
+    report["exit_code"] = returncode
+    report["timed_out"] = timed_out
+    report["data_sources"] = _data_source_names(data_config)
+    report["log_path"] = str(log_path)
+    report["stdout_tail"] = stdout[-4000:]
+    report["stderr_tail"] = ""
+    return report
+
+
+def _filter_data_sources(data_config: Mapping[str, Any], source_names: tuple[str, ...]) -> dict[str, Any]:
+    filtered = dict(data_config)
+    if not source_names:
+        return filtered
+    train_path = filtered.get("train_path")
+    if not isinstance(train_path, Mapping):
+        raise ValueError("data_source_names can only filter mapping-style data.train_path.")
+    names = list(train_path.get("names") or ())
+    sources = list(train_path.get("sources") or ())
+    if len(names) != len(sources):
+        raise ValueError("data.train_path names and sources must have the same length.")
+    wanted = set(source_names)
+    indexes = [index for index, name in enumerate(names) if str(name) in wanted]
+    missing = sorted(wanted - {str(names[index]) for index in indexes})
+    if missing:
+        raise ValueError(f"Requested unknown data source name(s): {missing}.")
+    next_train_path = dict(train_path)
+    next_train_path["names"] = [names[index] for index in indexes]
+    next_train_path["sources"] = [sources[index] for index in indexes]
+    next_schedule = []
+    for schedule in train_path.get("schedule", []) or []:
+        next_item = dict(schedule)
+        weights = list(next_item.get("weights") or [])
+        if len(weights) == len(names):
+            selected_weights = [float(weights[index]) for index in indexes]
+            total = sum(selected_weights)
+            next_item["weights"] = (
+                [weight / total for weight in selected_weights] if total > 0 else [1.0 / len(indexes)] * len(indexes)
+            )
+        else:
+            next_item["weights"] = [1.0 / len(indexes)] * len(indexes)
+        next_schedule.append(next_item)
+    next_train_path["schedule"] = next_schedule
+    filtered["train_path"] = next_train_path
+    return filtered
+
+
+def _data_source_names(data_config: Mapping[str, Any]) -> list[str]:
+    train_path = data_config.get("train_path")
+    if isinstance(train_path, Mapping):
+        return [str(name) for name in train_path.get("names", []) or []]
+    return [str(train_path)] if train_path is not None else []
+
+
+def _write_data_loss_manifest(driver: Any, *, report: Mapping[str, Any], output_dir: Path) -> None:
+    manifest_path = Path("outputs") / "parity_suite" / "data_loss_smoke_manifest.json"
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    if manifest_path.exists():
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    else:
+        manifest = {"runs": {}}
+    losses = report.get("losses")
+    manifest["runs"][driver.case.node_id] = {
+        "case_id": driver.case.node_id,
+        "data_sources": list(report.get("data_sources", [])),
+        "all_pass": bool(report.get("all_pass", False)),
+        "exit_code": int(report.get("exit_code", -1)),
+        "timed_out": bool(report.get("timed_out", False)),
+        "steps": int(report.get("steps", 0) or 0),
+        "loss_decreased": bool(report.get("loss_decreased", False)),
+        "first_loss": float(losses[0]) if isinstance(losses, list) and losses else None,
+        "last_loss": float(losses[-1]) if isinstance(losses, list) and losses else None,
+        "output_dir": str(output_dir),
+        "log_path": str(report.get("log_path", output_dir / "run.log")),
+    }
+    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def _materialize_recipe_data_config(data_config: Mapping[str, Any], output_dir: Path) -> Path | str:
+    train_path = data_config.get("train_path")
+    if isinstance(train_path, Mapping):
+        path = output_dir / "data.yaml"
+        path.write_text(yaml.safe_dump(dict(train_path), sort_keys=False), encoding="utf-8")
+        return path
+    if train_path is None:
+        raise ValueError(f"{data_config!r} must include data.train_path for data_loss_smoke.")
+    return str(train_path)
 
 
 def _policy_output_dir(driver: Any, name: str) -> Path:
@@ -1077,6 +1442,8 @@ def _find_free_port() -> int:
 
 @contextmanager
 def _single_rank_ddp_clip_state():
+    """Temporarily fake DDP state for shared grad clipping in local policies."""
+
     previous = parallel_state_module._PARALLEL_STATE
     parallel_state_module._PARALLEL_STATE = parallel_state_module.ParallelState(dp_mode="ddp")
     try:

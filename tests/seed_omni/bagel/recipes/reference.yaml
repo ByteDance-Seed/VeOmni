@@ -3,6 +3,8 @@ transformers_reference_smoke:
       requires_cuda: false
       requires_reference_checkpoint: false
       requires_v2_model: false
+    reference:
+      kind: reference_smoke
     runs:
       reference:
         - id: basic

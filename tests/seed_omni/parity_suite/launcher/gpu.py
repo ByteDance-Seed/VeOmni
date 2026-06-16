@@ -71,6 +71,8 @@ def build_case_env(
     base_env: dict[str, str] | None = None,
 ) -> dict[str, str]:
     env = dict(os.environ if base_env is None else base_env)
+    # Children run the real case directly. Force-enable parity and mark the
+    # process so pytest integration does not start another launcher.
     env[PARITY_ENABLE_ENV] = "1"
     env[LAUNCHER_CHILD_ENV] = "1"
     env["CUDA_VISIBLE_DEVICES"] = ",".join(cuda_devices)
@@ -132,6 +134,8 @@ def _run_parallel(
             needed = _case_slots(case, total_cuda_devices=len(cuda_devices))
             if needed > len(available):
                 continue
+            # Lease visible CUDA slots to child pytest processes. The child
+            # sees only its lease through CUDA_VISIBLE_DEVICES.
             devices = tuple(available[:needed])
             del available[:needed]
             pending.remove(case)
@@ -195,6 +199,8 @@ def _case_cuda_devices(case: ParityCase, cuda_devices: tuple[str, ...]) -> tuple
 
 def _case_slots(case: ParityCase, *, total_cuda_devices: int) -> int:
     if not case.model.launcher.enable_parallel:
+        # Serial-only cases reserve the full visible pool to avoid sharing GPUs
+        # with cases that were not authored for concurrent execution.
         return total_cuda_devices
     needed = required_cuda_devices(case)
     if needed == 0:

@@ -3,6 +3,8 @@ interleave_text_und:
       prompt: "Write one concise sentence about a mountain path after rain."
       max_new_tokens: 1
       do_sample: false
+    reference:
+      kind: text_und
     runs:
       graph:
         - id: one_step
@@ -28,6 +30,8 @@ interleave_text_image_und:
       image_height: 336
       max_new_tokens: 1
       do_sample: false
+    reference:
+      kind: text_image_und
     runs:
       graph:
         - id: one_step
@@ -63,6 +67,8 @@ interleave_image_gen:
       cfg_renorm_min: 0.0
       cfg_renorm_type: global
       enable_taylorseer: false
+    reference:
+      kind: image_gen
     runs:
       graph:
         - id: image_span_one_step

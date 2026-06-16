@@ -38,23 +38,31 @@ def run_parity_case(case: ParityCase) -> ParityReport:
         return driver.run_reference_only_recipe()
     if case.tier not in {"graph", "module", "framework"}:
         raise NotImplementedError(f"Unsupported parity tier for execution: {case.tier!r}")
+    # Non-forward framework policies produce their own reports instead of
+    # comparing node-level reference taps.
     selected = () if _is_framework_policy_run(case) else case.model.mapping.for_probe_names(case.run.probes)
     resolved = resolve_mapping(mappings=selected, nodes=case.nodes)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dtype = driver.dtype()
 
-    driver.configure_determinism(case.model.seed)
-    reference = capture_reference_taps(
-        reference_factory=lambda: driver.load_reference(device=device, dtype=dtype),
-        driver=driver,
-        inputs=driver.reference_inputs(),
-        plan=resolved.reference_plan,
-    )
+    reference = None
+    reference_output = None
+    if case.effective_gate.requires_reference_capture:
+        driver.configure_determinism(case.model.seed)
+        reference = capture_reference_taps(
+            reference_factory=lambda: driver.load_reference_model(device=device, dtype=dtype),
+            driver=driver,
+            inputs=driver.reference_inputs(),
+            plan=resolved.reference_plan,
+        )
+        reference_output = reference.run_output
 
     driver.configure_determinism(case.model.seed)
-    v2_result = _run_v2(driver, case, reference.run_output, resolved.v2_whitelist, device=device, dtype=dtype)
+    v2_result = _run_v2(driver, case, reference_output, resolved.v2_whitelist, device=device, dtype=dtype)
     if isinstance(v2_result, ParityReport):
         return v2_result
+    if reference is None:
+        raise RuntimeError(f"{case.node_id} disabled reference capture but did not return a policy report.")
 
     reports: list[ProbeReport] = []
     for mapping in resolved.probes:

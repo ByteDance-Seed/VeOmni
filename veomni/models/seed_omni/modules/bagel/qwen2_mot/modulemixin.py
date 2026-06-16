@@ -7,7 +7,8 @@ import torch
 from veomni.utils.tensor_utils import naflatten
 
 from ....conversation import ConversationItem, is_dummy
-from ....module import ModuleMixin
+from ....module import ModuleMixin, post_forward, pre_forward
+from ..training_pack import BAGEL_DUMMY_ANCHORS_META_KEY, fold_dummy_anchors, get_packed_batch
 
 
 class BagelQwen2MoTModuleMixin(ModuleMixin):
@@ -18,15 +19,16 @@ class BagelQwen2MoTModuleMixin(ModuleMixin):
         self._key_values_lens: Optional[torch.Tensor] = None
         self._bagel_packed_batch: Optional[dict[str, Any]] = None
 
-    def pre_forward(
+    @pre_forward("forward")
+    def forward_pre(
         self,
-        method: str,
         conversation_list: Optional[list[list[ConversationItem]]] = None,
         bagel_packed_batch: Optional[dict[str, Any]] = None,
         **kwargs: Any,
     ) -> Dict[str, Any]:
-        del conversation_list, kwargs
-        assert method in ("forward",)
+        del kwargs
+        if bagel_packed_batch is None:
+            bagel_packed_batch = get_packed_batch(conversation_list)
         if bagel_packed_batch is None:
             raise NotImplementedError("BagelQwen2MoT graph hooks currently require bagel_packed_batch.")
         self._conversation_carrier = None
@@ -49,6 +51,8 @@ class BagelQwen2MoTModuleMixin(ModuleMixin):
             packed_sequence[gen_indexes] = bagel_packed_batch["packed_latent_embeds"].to(
                 device=self.device, dtype=self.dtype
             )
+        else:
+            gen_indexes = torch.empty(0, device=self.device, dtype=torch.long)
 
         return {
             "packed_sequence": packed_sequence,
@@ -59,14 +63,18 @@ class BagelQwen2MoTModuleMixin(ModuleMixin):
             "packed_gen_token_indexes": gen_indexes,
         }
 
-    def post_forward(self, method: str, **outputs: Any) -> Dict[str, Any]:
-        assert method in ("forward",)
+    @post_forward("forward")
+    def forward_post(self, **outputs: Any) -> Dict[str, Any]:
         batch = getattr(self, "_bagel_packed_batch", None)
         self._bagel_packed_batch = None
         if batch is None:
             return outputs
-        batch["packed_hidden_states"] = outputs["hidden_states"]
-        return {"bagel_packed_batch": batch}
+        hidden_states = outputs["hidden_states"]
+        anchors = list(batch.get(BAGEL_DUMMY_ANCHORS_META_KEY, []) or [])
+        hidden_states = fold_dummy_anchors(hidden_states, anchors)
+        batch["packed_hidden_states"] = hidden_states
+        result: Dict[str, Any] = {"bagel_packed_batch": batch}
+        return result
 
     def reset_local_inference_state(self) -> None:
         self._past_key_values = None

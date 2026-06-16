@@ -14,6 +14,8 @@ image_gen:
       cfg_renorm_min: 0.0
       cfg_renorm_type: global
       enable_taylorseer: false
+    reference:
+      kind: image_gen
     runs:
       graph:
         - id: base_one_step
@@ -50,6 +52,8 @@ image_gen:
       cfg_renorm_min: 0.0
       cfg_renorm_type: global
       enable_taylorseer: false
+    reference:
+      kind: image_gen
     runs:
       graph:
         - id: wide_one_step
@@ -86,6 +90,8 @@ image_gen:
       cfg_renorm_min: 0.0
       cfg_renorm_type: global
       enable_taylorseer: false
+    reference:
+      kind: image_gen
     runs:
       graph:
         - id: cfg_text_one_step
@@ -122,6 +128,8 @@ image_gen:
       cfg_renorm_min: 0.0
       cfg_renorm_type: global
       enable_taylorseer: false
+    reference:
+      kind: image_gen
     runs:
       graph:
         - id: cfg_image_one_step
@@ -162,6 +170,8 @@ image_gen:
       cfg_renorm_min: 0.8
       cfg_renorm_type: channel
       enable_taylorseer: false
+    reference:
+      kind: image_gen
     runs:
       graph:
         - id: cfg_renorm_one_step
@@ -196,6 +206,8 @@ image_gen:
       cfg_renorm_min: 0.0
       cfg_renorm_type: global
       enable_taylorseer: false
+    reference:
+      kind: image_gen
     runs:
       graph:
         - id: multi_step_three_steps
@@ -226,6 +238,8 @@ image_gen:
       cfg_renorm_type: global
       enable_taylorseer: false
       enable_decode_smoke: true
+    reference:
+      kind: image_gen
     runs:
       graph:
         - id: base_decode_smoke
@@ -256,6 +270,8 @@ image_gen:
       cfg_renorm_type: global
       enable_taylorseer: false
       enable_decode_smoke: true
+    reference:
+      kind: image_gen
     runs:
       graph:
         - id: cfg_text_decode_smoke
@@ -286,6 +302,8 @@ image_gen:
       cfg_renorm_type: global
       enable_taylorseer: false
       enable_decode_smoke: true
+    reference:
+      kind: image_gen
     runs:
       graph:
         - id: cfg_image_decode_smoke

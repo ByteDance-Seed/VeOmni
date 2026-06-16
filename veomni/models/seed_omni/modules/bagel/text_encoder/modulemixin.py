@@ -9,6 +9,8 @@ from ....conversation import ConversationItem, maybe_merge_outputs, seal_outputs
 from ....generation_graph import FSM_SIGNAL_KEY
 from ....module import post_forward, pre_forward
 from ...base.text_encoder.modulemixin import TextEncoderModuleMixin
+from ..packer import pack_training_conversation
+from ..training_pack import get_packed_batch, set_packed_batch, zero_hidden_from_batch
 
 
 SIGNAL_TEXT_DONE = "text_done"
@@ -31,8 +33,14 @@ class BagelTextEncoderModuleMixin(TextEncoderModuleMixin):
     def encode_pre(
         self,
         bagel_packed_batch: Optional[dict[str, Any]] = None,
+        conversation_list: Optional[list[list[ConversationItem]] | list[ConversationItem]] = None,
         **kwargs: Any,
     ) -> Dict[str, Any]:
+        if bagel_packed_batch is None:
+            bagel_packed_batch = get_packed_batch(conversation_list)
+        if bagel_packed_batch is None and conversation_list is not None:
+            bagel_packed_batch = pack_training_conversation(self, conversation_list, kwargs)
+            set_packed_batch(conversation_list, bagel_packed_batch)
         if bagel_packed_batch is None:
             return kwargs
         self._bagel_packed_batch = bagel_packed_batch
@@ -51,14 +59,23 @@ class BagelTextEncoderModuleMixin(TextEncoderModuleMixin):
     def decode_pre(
         self,
         bagel_packed_batch: Optional[dict[str, Any]] = None,
+        conversation_list: Optional[list[list[ConversationItem]] | list[ConversationItem]] = None,
         **kwargs: Any,
     ) -> Dict[str, Any]:
+        if bagel_packed_batch is None:
+            bagel_packed_batch = get_packed_batch(conversation_list)
         if bagel_packed_batch is None:
             return kwargs
         self._bagel_packed_batch = bagel_packed_batch
         if "ce_loss_indexes" not in bagel_packed_batch:
-            hidden_size = int(self.config.hidden_size)
-            return {"hidden_states": torch.zeros(1, hidden_size, device=self.device, dtype=self.dtype)}
+            return {
+                "hidden_states": zero_hidden_from_batch(
+                    bagel_packed_batch,
+                    hidden_size=int(self.config.hidden_size),
+                    device=self.device,
+                    dtype=self.dtype,
+                )
+            }
         return {"hidden_states": bagel_packed_batch["packed_hidden_states"][bagel_packed_batch["ce_loss_indexes"]]}
 
     @post_forward("decode")
@@ -68,9 +85,10 @@ class BagelTextEncoderModuleMixin(TextEncoderModuleMixin):
         if batch is None:
             return super().decode_post(**outputs)
         result: Dict[str, Any] = {"bagel_packed_batch": batch}
-        if "ce_loss_indexes" not in batch:
-            return result
         logits = outputs["logits"]
+        if "ce_loss_indexes" not in batch:
+            result["_loss"] = logits.sum() * 0.0
+            return result
         ce = F.cross_entropy(logits, batch["packed_label_ids"], reduction="none")
         batch["ce_vector"] = ce
         result["_loss"] = ce.mean()

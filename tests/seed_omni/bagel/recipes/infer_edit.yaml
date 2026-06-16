@@ -9,6 +9,8 @@ image_edit:
       timestep_shift: 3.0
       enable_vae_context: true
       enable_taylorseer: false
+    reference:
+      kind: image_edit
     runs:
       graph:
         - id: one_step
@@ -44,6 +46,8 @@ image_edit_text_und:
       infer_mode: und
       max_new_tokens: 1
       do_sample: false
+    reference:
+      kind: text_und
     runs:
       graph:
         - id: text_branch_one_step

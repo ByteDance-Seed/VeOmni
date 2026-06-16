@@ -1,4 +1,16 @@
-"""SeedOmni V2 parity suite test harness."""
+"""SeedOmni V2 parity suite test harness.
+
+The package exposes the shared building blocks used by
+``test_parity_cases.py`` and model-specific parity drivers:
+
+- ``core`` discovers YAML contracts, resolves graph nodes, applies gates, and
+  compares mapped probes.
+- ``reference`` loads reference oracles and captures configured tap values.
+- ``v2`` runs the SeedOmni V2 graph/module/framework tiers and records
+  observations for comparison.
+- ``launcher`` optionally schedules pytest subprocesses across visible CUDA
+  devices for large suites.
+"""
 
 from .core import PARITY_ENABLE_ENV, LauncherSpec, ModelSpec, ParityCase, RecipeSpec, discover_cases, load_model_spec
 from .driver import ParityDriver

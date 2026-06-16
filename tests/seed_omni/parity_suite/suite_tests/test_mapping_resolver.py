@@ -10,8 +10,8 @@ from tests.seed_omni.parity_suite.core import MappingSpec, NodeSpec, load_mappin
 from tests.seed_omni.parity_suite.reference import ReferenceCaptureContext
 
 
-def test_mapping_yaml_parses_hook_and_extractor_taps(tmp_path: Path) -> None:
-    mapping_path = tmp_path / "mapping.yaml"
+def test_probes_yaml_parses_hook_and_extractor_taps(tmp_path: Path) -> None:
+    mapping_path = tmp_path / "probes.yaml"
     mapping_path.write_text(
         """
 nodes:
@@ -35,8 +35,8 @@ nodes:
     assert spec.probes[1].ref_tap.kind == "extractor"
 
 
-def test_mapping_yaml_parses_output_tap(tmp_path: Path) -> None:
-    mapping_path = tmp_path / "mapping.yaml"
+def test_probes_yaml_parses_output_tap(tmp_path: Path) -> None:
+    mapping_path = tmp_path / "probes.yaml"
     mapping_path.write_text(
         """
 nodes:
@@ -64,7 +64,7 @@ nodes:
 
 def test_resolver_builds_reference_plan_and_v2_whitelist(tmp_path: Path) -> None:
     mapping = MappingSpec(
-        probes=load_mapping_spec(_write_mapping(tmp_path)).for_probe_names(["text.hidden", "text.greedy_token"])
+        probes=load_mapping_spec(_write_probes(tmp_path)).for_probe_names(["text.hidden", "text.greedy_token"])
     )
     nodes = (
         NodeSpec(name="toy.generate", module="toy", method="generate", graph="infer", state="prompt"),
@@ -83,7 +83,7 @@ def test_resolver_builds_reference_plan_and_v2_whitelist(tmp_path: Path) -> None
 
 
 def test_resolver_honors_optional_state_scope(tmp_path: Path) -> None:
-    mapping_path = tmp_path / "mapping.yaml"
+    mapping_path = tmp_path / "probes.yaml"
     mapping_path.write_text(
         """
 nodes:
@@ -106,8 +106,8 @@ nodes:
     assert resolved.v2_whitelist == {("image_flow", "toy.generate"): frozenset({"hidden"})}
 
 
-def test_mapping_yaml_parses_v2_gradient_spec(tmp_path: Path) -> None:
-    mapping_path = tmp_path / "mapping.yaml"
+def test_probes_yaml_parses_v2_gradient_spec(tmp_path: Path) -> None:
+    mapping_path = tmp_path / "probes.yaml"
     mapping_path.write_text(
         """
 nodes:
@@ -132,8 +132,8 @@ nodes:
     assert probe.v2_grad.rows_from == "packed.labels"
 
 
-def _write_mapping(tmp_path: Path) -> Path:
-    mapping_path = tmp_path / "mapping.yaml"
+def _write_probes(tmp_path: Path) -> Path:
+    mapping_path = tmp_path / "probes.yaml"
     mapping_path.write_text(
         """
 nodes:

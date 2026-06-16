@@ -79,7 +79,7 @@ class ParityCase:
 
 def default_model_dirs() -> tuple[Path, ...]:
     seed_omni_tests = repository_root() / "tests" / "seed_omni"
-    required_files = ("base.yaml", "mapping.yaml")
+    required_files = ("base.yaml", "probes.yaml")
     return tuple(
         path
         for path in sorted(seed_omni_tests.iterdir())

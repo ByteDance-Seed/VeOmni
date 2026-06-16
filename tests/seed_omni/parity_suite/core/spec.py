@@ -56,7 +56,6 @@ def _string_tuple(value: Any, *, field_name: str) -> tuple[str, ...]:
 
 @dataclass(frozen=True)
 class ReferenceSpec:
-    loader: str
     module: str | None = None
     checkpoint: Path | None = None
     extra: dict[str, Any] = field(default_factory=dict)
@@ -65,7 +64,6 @@ class ReferenceSpec:
     def from_dict(cls, data: dict[str, Any] | None, *, repo_root: Path) -> ReferenceSpec:
         values = dict(data or {})
         known = {
-            "loader": str(values.pop("loader", "transformers")),
             "module": values.pop("module", None),
             "checkpoint": _resolve_repo_path(values.pop("checkpoint", None), repo_root=repo_root),
         }
@@ -137,6 +135,7 @@ class TierSelection:
 class GateSpec:
     requires_parity_env: bool | None = None
     requires_cuda: bool | None = None
+    requires_reference_capture: bool | None = None
     requires_reference_checkpoint: bool | None = None
     requires_v2_model: bool | None = None
     min_cuda_devices: int = 0
@@ -147,15 +146,26 @@ class GateSpec:
         return cls(
             requires_parity_env=_optional_bool(values.get("requires_parity_env")),
             requires_cuda=_optional_bool(values.get("requires_cuda")),
+            requires_reference_capture=_optional_bool(values.get("requires_reference_capture")),
             requires_reference_checkpoint=_optional_bool(values.get("requires_reference_checkpoint")),
             requires_v2_model=_optional_bool(values.get("requires_v2_model")),
             min_cuda_devices=int(values.get("min_cuda_devices", 0) or 0),
         )
 
     def merge(self, other: GateSpec) -> GateSpec:
+        """Merge a narrower gate over this one.
+
+        Boolean fields use ``other`` when explicitly set. Device count is a
+        floor, so nested gates can only raise the CUDA requirement.
+        """
+
         return GateSpec(
             requires_parity_env=_coalesce(other.requires_parity_env, self.requires_parity_env),
             requires_cuda=_coalesce(other.requires_cuda, self.requires_cuda),
+            requires_reference_capture=_coalesce(
+                other.requires_reference_capture,
+                self.requires_reference_capture,
+            ),
             requires_reference_checkpoint=_coalesce(
                 other.requires_reference_checkpoint,
                 self.requires_reference_checkpoint,
@@ -168,6 +178,7 @@ class GateSpec:
 DEFAULT_GATE = GateSpec(
     requires_parity_env=True,
     requires_cuda=False,
+    requires_reference_capture=True,
     requires_reference_checkpoint=True,
     requires_v2_model=True,
 )
@@ -242,6 +253,8 @@ class RecipeSpec:
     id: str
     graph: str
     stimulus: dict[str, Any] = field(default_factory=dict)
+    data: dict[str, Any] | None = None
+    reference: dict[str, Any] = field(default_factory=dict)
     gate: GateSpec = field(default_factory=GateSpec)
     runs: tuple[RunSpec, ...] = ()
 
@@ -264,13 +277,27 @@ class RecipeSpec:
             raise ValueError(f"{recipe_label} must declare graph.")
         if default_graph is not None and "graph" in data and str(data["graph"]) != default_graph:
             raise ValueError(f"{recipe_label} declares graph {data['graph']!r}, expected {default_graph!r}.")
+        has_stimulus = "stimulus" in data
+        has_data = "data" in data
+        # Normal parity recipes are either driver-owned synthetic stimuli or
+        # data-backed framework smokes. Reference recipes may be pure policies.
+        if str(graph) != "reference" and has_stimulus == has_data:
+            raise ValueError(f"{recipe_label} must declare exactly one of stimulus or data.")
         stimulus = data.get("stimulus", {}) or {}
         if not isinstance(stimulus, dict):
             raise TypeError(f"{recipe_label} stimulus must be a mapping.")
+        recipe_data = data.get("data")
+        if recipe_data is not None and not isinstance(recipe_data, dict):
+            raise TypeError(f"{recipe_label} data must be a mapping.")
+        reference = data.get("reference", {}) or {}
+        if not isinstance(reference, dict):
+            raise TypeError(f"{recipe_label} reference must be a mapping.")
         return cls(
             id=recipe_id,
             graph=str(graph),
             stimulus=stimulus,
+            data=recipe_data,
+            reference=dict(reference),
             gate=GateSpec.from_dict(data.get("gate")),
             runs=_run_specs(recipe_label, data.get("runs")),
         )
@@ -336,7 +363,7 @@ def load_model_spec(model_dir: str | Path) -> ModelSpec:
         gate=GateSpec.from_dict(base.get("gate")),
         launcher=LauncherSpec.from_dict(base.get("launcher")),
         recipes=recipes,
-        mapping=load_mapping_spec(root / "mapping.yaml"),
+        mapping=load_mapping_spec(root / "probes.yaml"),
     )
 
 

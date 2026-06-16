@@ -103,6 +103,8 @@ class MappingSpec:
     probes: tuple[ProbeMapping, ...] = ()
 
     def for_probe_names(self, probe_names: Iterable[str]) -> tuple[ProbeMapping, ...]:
+        """Select mappings by public probe name, preserving multi-node probes."""
+
         requested = tuple(probe_names)
         if not requested:
             return self.probes
@@ -111,7 +113,7 @@ class MappingSpec:
         for probe_name in requested:
             matches = [probe for (node, name), probe in by_name.items() if name == probe_name]
             if not matches:
-                raise KeyError(f"Probe {probe_name!r} is not declared in mapping.yaml.")
+                raise KeyError(f"Probe {probe_name!r} is not declared in probes.yaml.")
             selected.extend(matches)
         return tuple(selected)
 
@@ -130,7 +132,7 @@ class ResolvedMapping:
 
 
 def load_mapping_spec(path: Path) -> MappingSpec:
-    """Load a node-keyed mapping.yaml file."""
+    """Load a node-keyed probes.yaml file."""
 
     if not path.exists():
         return MappingSpec()
@@ -141,15 +143,15 @@ def load_mapping_spec(path: Path) -> MappingSpec:
         raise ValueError(f"{path} must not declare input_boundary; input shape is driver-owned.")
     nodes = data.get("nodes", {}) or {}
     if not isinstance(nodes, dict):
-        raise TypeError("mapping.yaml nodes must be a mapping.")
+        raise TypeError("probes.yaml nodes must be a mapping.")
 
     probes: list[ProbeMapping] = []
     for node, raw_node in nodes.items():
         if not isinstance(raw_node, dict):
-            raise TypeError(f"mapping.yaml node {node!r} must map probes to specs.")
+            raise TypeError(f"probes.yaml node {node!r} must map probes to specs.")
         for probe, raw_probe in raw_node.items():
             if not isinstance(raw_probe, dict):
-                raise TypeError(f"mapping.yaml probe {node}.{probe} must be a mapping.")
+                raise TypeError(f"probes.yaml probe {node}.{probe} must be a mapping.")
             probes.append(ProbeMapping.from_raw(str(node), str(probe), raw_probe))
     return MappingSpec(probes=tuple(probes))
 
@@ -182,6 +184,8 @@ def resolve_mapping(
                 continue
             if mapping.state is not None and node.state != mapping.state:
                 continue
+            # The V2 observer is armed only for fields named by selected probes,
+            # so unrelated large tensors never leave the model-side execution.
             whitelist.setdefault((node.state, node.name), set()).add(mapping.v2_field)
 
     return ResolvedMapping(
@@ -198,6 +202,8 @@ def _append_ref_tap(
     extractor_taps: list[ExtractorTap],
     seen: set[tuple[str, str, str]],
 ) -> None:
+    # Deduplicate identical registrations while preserving distinct probe names
+    # that intentionally read the same module or output target.
     key = (mapping.ref_tap.kind, mapping.probe, mapping.ref_tap.target)
     if key in seen:
         return

@@ -10,7 +10,6 @@ nodes:
       v2_grad:
         module: bagel_text_encoder
         parameter: lm_head.weight
-        rows_from: bagel_packed_batch.packed_label_ids
       ref_tap:
         output: reference.train_grad_lm_head_rows
       tol: gradient

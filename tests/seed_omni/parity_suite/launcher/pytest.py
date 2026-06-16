@@ -15,6 +15,8 @@ _LAUNCHER_SESSIONS: dict[tuple[str, ...], _PytestLauncherSession] = {}
 
 
 class _PytestLauncherSession:
+    """Fan out one GPU-pool launcher run to individual parametrized pytest items."""
+
     def __init__(self, cases: tuple[ParityCase, ...]) -> None:
         self.cases = cases
         self._condition = threading.Condition()
@@ -79,6 +81,8 @@ def run_case_with_pytest_launcher(case: ParityCase, request: Any) -> LauncherRes
 
 
 def _is_direct_case_selection(case: ParityCase, request: Any) -> bool:
+    # Keep explicitly selected cases in the foreground for ordinary pytest
+    # debugging, logs, breakpoints, and failure reporting.
     selected_id = f"[{case.node_id}]"
     return any(selected_id in arg for arg in request.config.args)
 
@@ -86,6 +90,8 @@ def _is_direct_case_selection(case: ParityCase, request: Any) -> bool:
 def _launcher_session(request: Any) -> _PytestLauncherSession:
     cases = _selected_runnable_launcher_cases(request)
     key = tuple(case.node_id for case in cases)
+    # Every parametrized pytest item reaches this helper. Cache one session for
+    # the selected case set so the GPU pool is started once per pytest run.
     session = _LAUNCHER_SESSIONS.get(key)
     if session is None:
         session = _PytestLauncherSession(cases)

@@ -79,9 +79,11 @@ class BagelFlowConnector(BagelFlowConnectorModuleMixin, PreTrainedModel):
     base_model_prefix = "bagel_flow_connector"
     main_input_name = "hidden_states"
     _no_split_modules: list[str] = []
+    supports_gradient_checkpointing = True
 
     def __init__(self, config: BagelFlowConnectorConfig):
         super().__init__(config)
+        self.gradient_checkpointing = False
         self.time_embedder = TimestepEmbedder(config.hidden_size, config.timestep_frequency_embedding_size)
         self.vae2llm = nn.Linear(config.patch_latent_dim, config.hidden_size)
         self.llm2vae = nn.Linear(config.hidden_size, config.patch_latent_dim)

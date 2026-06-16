@@ -90,6 +90,8 @@ def capture_reference_taps(
         with capture_hook_taps(ref_model, plan.hook_taps, sink=taps, max_tensor_numel=max_tensor_numel):
             run_output = driver.run_reference_recipe(ref_model, inputs, context)
             context.output = run_output
+        # Extractors run after hooks are removed so driver-owned canonical output
+        # can be captured without extending hook lifetimes.
         _capture_extractors(context, plan.extractor_taps, taps=taps, max_tensor_numel=max_tensor_numel)
         memory_before_release = _memory_allocated(memory_probe)
     finally:
@@ -102,6 +104,8 @@ def capture_reference_taps(
         _empty_cache(empty_cache_fn)
         memory_after_release = _memory_allocated(memory_probe)
 
+    # Large reference oracles and V2 models usually cannot coexist on one GPU.
+    # Treat a failed release as a parity-suite failure before V2 loading starts.
     should_assert_drop = memory_before_release > 0 if require_memory_drop is None else require_memory_drop
     if should_assert_drop and memory_after_release >= memory_before_release:
         raise AssertionError(

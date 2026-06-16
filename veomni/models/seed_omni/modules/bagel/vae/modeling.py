@@ -110,6 +110,7 @@ class Encoder(nn.Module):
         z_channels: int,
     ):
         super().__init__()
+        self.gradient_checkpointing = False
         self.ch = ch
         self.num_resolutions = len(ch_mult)
         self.num_res_blocks = num_res_blocks
@@ -148,17 +149,37 @@ class Encoder(nn.Module):
         hs = [self.conv_in(x)]
         for i_level in range(self.num_resolutions):
             for i_block in range(self.num_res_blocks):
-                h = self.down[i_level].block[i_block](hs[-1])
+                block = self.down[i_level].block[i_block]
+                h = (
+                    self._gradient_checkpointing_func(block.__call__, hs[-1])
+                    if self.gradient_checkpointing and self.training
+                    else block(hs[-1])
+                )
                 if len(self.down[i_level].attn) > 0:
-                    h = self.down[i_level].attn[i_block](h)
+                    attn = self.down[i_level].attn[i_block]
+                    h = (
+                        self._gradient_checkpointing_func(attn.__call__, h)
+                        if self.gradient_checkpointing and self.training
+                        else attn(h)
+                    )
                 hs.append(h)
             if i_level != self.num_resolutions - 1:
-                hs.append(self.down[i_level].downsample(hs[-1]))
+                downsample = self.down[i_level].downsample
+                hs.append(
+                    self._gradient_checkpointing_func(downsample.__call__, hs[-1])
+                    if self.gradient_checkpointing and self.training
+                    else downsample(hs[-1])
+                )
 
         h = hs[-1]
-        h = self.mid.block_1(h)
-        h = self.mid.attn_1(h)
-        h = self.mid.block_2(h)
+        if self.gradient_checkpointing and self.training:
+            h = self._gradient_checkpointing_func(self.mid.block_1.__call__, h)
+            h = self._gradient_checkpointing_func(self.mid.attn_1.__call__, h)
+            h = self._gradient_checkpointing_func(self.mid.block_2.__call__, h)
+        else:
+            h = self.mid.block_1(h)
+            h = self.mid.attn_1(h)
+            h = self.mid.block_2(h)
         h = self.norm_out(h)
         h = swish(h)
         return self.conv_out(h)
@@ -176,6 +197,7 @@ class Decoder(nn.Module):
         z_channels: int,
     ):
         super().__init__()
+        self.gradient_checkpointing = False
         self.ch = ch
         self.num_resolutions = len(ch_mult)
         self.num_res_blocks = num_res_blocks
@@ -214,17 +236,37 @@ class Decoder(nn.Module):
     def forward(self, z: Tensor) -> Tensor:
         h = self.conv_in(z)
 
-        h = self.mid.block_1(h)
-        h = self.mid.attn_1(h)
-        h = self.mid.block_2(h)
+        if self.gradient_checkpointing and self.training:
+            h = self._gradient_checkpointing_func(self.mid.block_1.__call__, h)
+            h = self._gradient_checkpointing_func(self.mid.attn_1.__call__, h)
+            h = self._gradient_checkpointing_func(self.mid.block_2.__call__, h)
+        else:
+            h = self.mid.block_1(h)
+            h = self.mid.attn_1(h)
+            h = self.mid.block_2(h)
 
         for i_level in reversed(range(self.num_resolutions)):
             for i_block in range(self.num_res_blocks + 1):
-                h = self.up[i_level].block[i_block](h)
+                block = self.up[i_level].block[i_block]
+                h = (
+                    self._gradient_checkpointing_func(block.__call__, h)
+                    if self.gradient_checkpointing and self.training
+                    else block(h)
+                )
                 if len(self.up[i_level].attn) > 0:
-                    h = self.up[i_level].attn[i_block](h)
+                    attn = self.up[i_level].attn[i_block]
+                    h = (
+                        self._gradient_checkpointing_func(attn.__call__, h)
+                        if self.gradient_checkpointing and self.training
+                        else attn(h)
+                    )
             if i_level != 0:
-                h = self.up[i_level].upsample(h)
+                upsample = self.up[i_level].upsample
+                h = (
+                    self._gradient_checkpointing_func(upsample.__call__, h)
+                    if self.gradient_checkpointing and self.training
+                    else upsample(h)
+                )
 
         h = self.norm_out(h)
         h = swish(h)
@@ -250,6 +292,7 @@ class BagelVAE(BagelVAEModuleMixin, PreTrainedModel):
     base_model_prefix = "bagel_vae"
     main_input_name = "pixel_values"
     _no_split_modules: list[str] = []
+    supports_gradient_checkpointing = True
 
     def __init__(self, config: BagelVAEConfig):
         super().__init__(config)

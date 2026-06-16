@@ -7,39 +7,75 @@ import types
 from pathlib import Path
 from typing import Any
 
-import pytest
-
 from tests.seed_omni.parity_suite.core import ReferenceSpec
-from tests.seed_omni.parity_suite.reference.loader import load_reference_model
+from tests.seed_omni.parity_suite.reference import loader as reference_loader
+from tests.seed_omni.parity_suite.reference.loader import load_transformers_reference_model
+from tests.seed_omni.parity_suite.reference.model import ParityReferenceModel
 
 
-def test_vendored_loader_uses_functional_contract(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    calls: list[tuple[Path | None, dict[str, Any]]] = []
+def test_reference_model_registers_auto_classes(monkeypatch: Any) -> None:
+    calls: list[tuple[str, Any]] = []
 
-    def load_vendored_model(checkpoint: Path | None, **kwargs: Any) -> dict[str, Any]:
-        calls.append((checkpoint, kwargs))
-        return {"loaded": checkpoint}
+    class Config:
+        model_type = "fake"
 
-    module = types.SimpleNamespace(load_vendored_model=load_vendored_model)
-    monkeypatch.setitem(sys.modules, "tests.fake_vendored_reference", module)
-    checkpoint = tmp_path / "checkpoint"
-    spec = ReferenceSpec(loader="vendored", module="tests.fake_vendored_reference", checkpoint=checkpoint)
+    class Reference(ParityReferenceModel):
+        config_class = Config
 
-    result = load_reference_model(spec, device="cpu")
+    class AutoConfig:
+        @staticmethod
+        def register(model_type: str, config_class: type[Any], *, exist_ok: bool) -> None:
+            calls.append(("config", model_type, config_class, exist_ok))
 
-    assert result == {"loaded": checkpoint}
-    assert calls == [(checkpoint, {"device": "cpu"})]
+    class AutoModel:
+        @staticmethod
+        def register(config_class: type[Any], model_class: type[Any], *, exist_ok: bool) -> None:
+            calls.append(("model", config_class, model_class, exist_ok))
+
+    monkeypatch.setitem(sys.modules, "transformers", types.SimpleNamespace(AutoConfig=AutoConfig, AutoModel=AutoModel))
+
+    Reference.register_auto_model(exist_ok=False)
+
+    assert calls == [
+        ("config", "fake", Config, False),
+        ("model", Config, Reference, False),
+    ]
 
 
-def test_vendored_loader_requires_functional_contract(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setitem(sys.modules, "tests.fake_invalid_reference", types.SimpleNamespace())
-    spec = ReferenceSpec(loader="vendored", module="tests.fake_invalid_reference")
+def test_transformers_loader_registers_reference_class_before_load(monkeypatch: Any) -> None:
+    events: list[tuple[str, Any]] = []
 
-    with pytest.raises(ValueError, match="load_vendored_model"):
-        load_reference_model(spec)
+    def import_module(name: str) -> types.ModuleType:
+        events.append(("import", name))
+        module = types.ModuleType(name)
+
+        class Reference:
+            @staticmethod
+            def register_auto_model() -> None:
+                events.append(("register", Reference))
+
+        module.Reference = Reference
+        return module
+
+    class AutoModel:
+        @staticmethod
+        def from_pretrained(model_id: Any, **kwargs: Any) -> dict[str, Any]:
+            events.append(("from_pretrained", model_id))
+            return {"model_id": model_id}
+
+    monkeypatch.setattr(reference_loader.importlib, "import_module", import_module)
+    monkeypatch.setitem(sys.modules, "transformers", types.SimpleNamespace(AutoModel=AutoModel))
+    spec = ReferenceSpec(module="tests.fake_reference_registration:Reference")
+
+    result = load_transformers_reference_model(spec)
+
+    assert result == {"model_id": "tests.fake_reference_registration:Reference"}
+    assert events[0] == ("import", "tests.fake_reference_registration")
+    assert events[1][0] == "register"
+    assert events[2] == ("from_pretrained", "tests.fake_reference_registration:Reference")
 
 
-def test_transformers_loader_prefers_checkpoint(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_transformers_loader_prefers_checkpoint(monkeypatch: Any, tmp_path: Path) -> None:
     calls: list[tuple[Any, dict[str, Any]]] = []
 
     class AutoModel:
@@ -48,17 +84,20 @@ def test_transformers_loader_prefers_checkpoint(monkeypatch: pytest.MonkeyPatch,
             calls.append((model_id, kwargs))
             return {"model_id": model_id}
 
+    module = types.ModuleType("tests.fake_reference_registration")
+    module.Reference = types.SimpleNamespace(register_auto_model=lambda: calls.append(("register", {})))
+    monkeypatch.setitem(sys.modules, "tests.fake_reference_registration", module)
     monkeypatch.setitem(sys.modules, "transformers", types.SimpleNamespace(AutoModel=AutoModel))
     checkpoint = tmp_path / "checkpoint"
-    spec = ReferenceSpec(loader="transformers", module="owner/model", checkpoint=checkpoint)
+    spec = ReferenceSpec(module="tests.fake_reference_registration:Reference", checkpoint=checkpoint)
 
-    result = load_reference_model(spec, local_files_only=True)
+    result = load_transformers_reference_model(spec, local_files_only=True)
 
     assert result == {"model_id": checkpoint}
-    assert calls == [(checkpoint, {"local_files_only": True})]
+    assert calls == [("register", {}), (checkpoint, {"local_files_only": True})]
 
 
-def test_transformers_loader_falls_back_to_module(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_transformers_loader_falls_back_to_module(monkeypatch: Any) -> None:
     calls: list[tuple[Any, dict[str, Any]]] = []
 
     class AutoModel:
@@ -67,10 +106,24 @@ def test_transformers_loader_falls_back_to_module(monkeypatch: pytest.MonkeyPatc
             calls.append((model_id, kwargs))
             return {"model_id": model_id}
 
+    module = types.ModuleType("tests.fake_reference_registration")
+    module.Reference = types.SimpleNamespace(register_auto_model=lambda: None)
+    monkeypatch.setitem(sys.modules, "tests.fake_reference_registration", module)
     monkeypatch.setitem(sys.modules, "transformers", types.SimpleNamespace(AutoModel=AutoModel))
-    spec = ReferenceSpec(loader="transformers", module="owner/model")
+    spec = ReferenceSpec(module="tests.fake_reference_registration:Reference")
 
-    result = load_reference_model(spec)
+    result = load_transformers_reference_model(spec)
 
-    assert result == {"model_id": "owner/model"}
-    assert calls == [("owner/model", {})]
+    assert result == {"model_id": "tests.fake_reference_registration:Reference"}
+    assert calls == [("tests.fake_reference_registration:Reference", {})]
+
+
+def test_transformers_loader_requires_explicit_reference_class() -> None:
+    spec = ReferenceSpec(module="tests.fake_reference_registration")
+
+    try:
+        load_transformers_reference_model(spec)
+    except ValueError as exc:
+        assert "module.path:ClassName" in str(exc)
+    else:
+        raise AssertionError("load_transformers_reference_model should require an explicit reference class.")

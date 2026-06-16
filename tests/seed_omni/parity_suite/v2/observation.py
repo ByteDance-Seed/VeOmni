@@ -86,6 +86,8 @@ def record_module_output(
     fields = whitelist.get((state, node))
     if not fields:
         return
+    # Module-tier calls return raw node outputs. Keep the same small,
+    # whitelisted tensor contract as the durable graph observer.
     record = {
         field: to_cpu(value)
         for field, value in out.items()

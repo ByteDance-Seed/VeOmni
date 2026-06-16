@@ -1,38 +1,318 @@
-"""BAGEL reference-side execution helpers for parity cases."""
+"""BAGEL parity reference model and official oracle execution helpers."""
 
 from __future__ import annotations
 
 from collections.abc import Mapping
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from copy import deepcopy
+from pathlib import Path
 from typing import Any
 
+import numpy as np
 import torch
+from PIL import Image
+from safetensors import safe_open
 from torch import nn
+from transformers.initialization import no_init_weights
+from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
 
-from tests.seed_omni.bagel.transformers.bagel import ReferenceImageTransform, make_reference_image
+from tests.seed_omni.bagel.transformers.vendor.data.data_utils import add_special_tokens
+from tests.seed_omni.bagel.transformers.vendor.data.transforms import ImageTransform
 from tests.seed_omni.bagel.transformers.vendor.inference import InterleaveInferencer
+from tests.seed_omni.bagel.transformers.vendor.modeling.autoencoder import AutoEncoderParams, load_ae
+from tests.seed_omni.bagel.transformers.vendor.modeling.bagel import (
+    Bagel,
+    BagelConfig,
+    Qwen2Config,
+    Qwen2ForCausalLM,
+    SiglipVisionConfig,
+    SiglipVisionModel,
+)
 from tests.seed_omni.bagel.transformers.vendor.modeling.bagel.qwen2_navit import NaiveCache
+from tests.seed_omni.bagel.transformers.vendor.modeling.qwen2.tokenization_qwen2 import Qwen2Tokenizer
 from tests.seed_omni.parity_suite.core import ParityReport, to_cpu, to_device
 from tests.seed_omni.parity_suite.core.utilities import autocast_for_dtype, patched_randn_like, sample_named_grad
 from tests.seed_omni.parity_suite.reference.capture import ReferenceCaptureContext
+from tests.seed_omni.parity_suite.reference.model import ParityReferenceModel
+from veomni.models.module_utils import init_empty_weights
 
 
-def run_reference_recipe(
-    reference_case: str,
-    ref_model: nn.Module,
-    inputs: Mapping[str, Any],
-    context: ReferenceCaptureContext,
+class BagelModel(ParityReferenceModel):
+    """Own the official BAGEL assembly so captures do not import vendor internals."""
+
+    config_class = BagelConfig
+    model_type = "bagel"
+
+    def __init__(
+        self,
+        model: Bagel,
+        *,
+        tokenizer: Qwen2Tokenizer | None = None,
+        new_token_ids: dict[str, int] | None = None,
+        vae_model: nn.Module | None = None,
+    ) -> None:
+        super().__init__()
+        self.model = model
+        self.vae_model = vae_model
+        self.tokenizer = tokenizer
+        self.new_token_ids = new_token_ids or {}
+        self.config = model.config
+
+    def forward(self, *args: Any, **kwargs: Any) -> Any:
+        return self.model(*args, **kwargs)
+
+    @classmethod
+    def from_configs(
+        cls,
+        *,
+        llm_config: Qwen2Config,
+        vit_config: SiglipVisionConfig | None = None,
+        vae_config: Any | None = None,
+        visual_gen: bool,
+        visual_und: bool,
+        tokenizer: Qwen2Tokenizer | None = None,
+        new_token_ids: dict[str, int] | None = None,
+        init_on_meta: bool = True,
+        latent_patch_size: int | None = None,
+        max_latent_size: int | None = None,
+        timestep_shift: float | None = None,
+        vit_max_num_patch_per_side: int | None = None,
+        connector_act: str | None = None,
+    ) -> BagelModel:
+        _ensure_default_rope_init()
+        _normalize_llm_config(llm_config)
+        config = BagelConfig(
+            visual_gen=visual_gen,
+            visual_und=visual_und,
+            llm_config=llm_config,
+            vit_config=vit_config,
+            vae_config=vae_config,
+            **_optional_bagel_config_kwargs(
+                latent_patch_size=latent_patch_size,
+                max_latent_size=max_latent_size,
+                timestep_shift=timestep_shift,
+                vit_max_num_patch_per_side=vit_max_num_patch_per_side,
+                connector_act=connector_act,
+            ),
+        )
+        context = _empty_init_context() if init_on_meta else nullcontext()
+        with context:
+            language_model = Qwen2ForCausalLM(llm_config)
+            vit_model = SiglipVisionModel(vit_config) if visual_und and vit_config is not None else None
+            model = Bagel(language_model, vit_model, config)
+            if visual_und and vit_model is not None:
+                model.vit_model.vision_model.embeddings.convert_conv2d_to_linear(vit_config, meta=init_on_meta)
+        return cls(model, tokenizer=tokenizer, new_token_ids=new_token_ids)
+
+    @classmethod
+    def from_pretrained(
+        cls,
+        pretrained_model_name_or_path: str | Path,
+        *model_args: Any,
+        config: BagelConfig | None = None,
+        visual_gen: bool = True,
+        visual_und: bool = True,
+        init_on_meta: bool = True,
+        torch_dtype: torch.dtype | str | None = None,
+        device: torch.device | str | None = None,
+        load_weights: bool = True,
+        latent_patch_size: int = 2,
+        max_latent_size: int = 64,
+        timestep_shift: float = 3.0,
+        vit_max_num_patch_per_side: int = 70,
+        connector_act: str = "gelu_pytorch_tanh",
+        **kwargs: Any,
+    ) -> BagelModel:
+        del model_args, config, kwargs
+        root = Path(pretrained_model_name_or_path)
+        dtype = _resolve_dtype(torch_dtype)
+        target_device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
+        llm_config = Qwen2Config.from_json_file(str(root / "llm_config.json"))
+        _normalize_llm_config(llm_config)
+
+        tokenizer = Qwen2Tokenizer.from_pretrained(str(root), local_files_only=True)
+        tokenizer, new_token_ids, num_new_tokens = add_special_tokens(tokenizer)
+        if num_new_tokens > 0:
+            llm_config.vocab_size = len(tokenizer)
+
+        vit_config = SiglipVisionConfig.from_json_file(str(root / "vit_config.json")) if visual_und else None
+        if vit_config is not None:
+            vit_config.rope = False
+            vit_config.num_hidden_layers -= 1
+        reference = cls.from_configs(
+            llm_config=llm_config,
+            vit_config=vit_config,
+            vae_config=_default_vae_config() if visual_gen else None,
+            visual_gen=visual_gen,
+            visual_und=visual_und,
+            tokenizer=tokenizer,
+            new_token_ids=new_token_ids,
+            init_on_meta=init_on_meta,
+            latent_patch_size=latent_patch_size,
+            max_latent_size=max_latent_size,
+            timestep_shift=timestep_shift,
+            vit_max_num_patch_per_side=vit_max_num_patch_per_side,
+            connector_act=connector_act,
+        )
+        if load_weights:
+            _load_weights(
+                reference.model,
+                root / "ema.safetensors",
+                device=target_device,
+                dtype=dtype,
+                visual_gen=visual_gen,
+                visual_und=visual_und,
+            )
+        reference.model.to(device=target_device)
+        if visual_und:
+            vae_model, _ = load_ae(str(root / "ae.safetensors"))
+            reference.vae_model = vae_model.to(device=target_device, dtype=dtype).eval()
+        reference.eval()
+        return reference
+
+    def run_reference_train(self, inputs: Mapping[str, Any], context: ReferenceCaptureContext) -> dict[str, Any]:
+        return _run_train_reference(self, inputs, context)
+
+    def run_reference_text_und(self, inputs: Mapping[str, Any], context: ReferenceCaptureContext) -> dict[str, Any]:
+        return _run_text_reference(self, inputs, context)
+
+    def run_reference_text_image_und(
+        self, inputs: Mapping[str, Any], context: ReferenceCaptureContext
+    ) -> dict[str, Any]:
+        return _run_text_image_reference(self, inputs, context)
+
+    def run_reference_image_gen(self, inputs: Mapping[str, Any], context: ReferenceCaptureContext) -> dict[str, Any]:
+        return _run_image_gen_reference(self, inputs, context)
+
+    def run_reference_image_edit(self, inputs: Mapping[str, Any], context: ReferenceCaptureContext) -> dict[str, Any]:
+        return _run_image_edit_reference(self, inputs, context)
+
+
+def make_reference_image(width: int, height: int) -> Image.Image:
+    """Create the deterministic reference-side input image used by edit parity."""
+
+    x = np.linspace(0, 255, width, dtype=np.uint8)
+    y = np.linspace(0, 255, height, dtype=np.uint8)
+    xx, yy = np.meshgrid(x, y)
+    rgb = np.stack([xx, yy, ((xx.astype(np.uint16) + yy.astype(np.uint16)) // 2).astype(np.uint8)], axis=-1)
+    return Image.fromarray(rgb)
+
+
+@contextmanager
+def _empty_init_context():
+    with no_init_weights(), init_empty_weights():
+        yield
+
+
+def _normalize_llm_config(llm_config: Qwen2Config) -> None:
+    llm_config.layer_module = "Qwen2MoTDecoderLayer"
+    llm_config.qk_norm = True
+    llm_config.tie_word_embeddings = False
+    llm_config.freeze_und = False
+    if not hasattr(llm_config, "pad_token_id"):
+        llm_config.pad_token_id = getattr(llm_config, "bos_token_id", 0)
+
+
+def _ensure_default_rope_init() -> None:
+    if "default" in ROPE_INIT_FUNCTIONS:
+        return
+    ROPE_INIT_FUNCTIONS["default"] = _compute_default_rope_parameters
+
+
+def _resolve_dtype(dtype: torch.dtype | str | None) -> torch.dtype:
+    if dtype is None:
+        return torch.float32
+    if isinstance(dtype, torch.dtype):
+        return dtype
+    if dtype in {"fp32", "float32"}:
+        return torch.float32
+    if dtype in {"fp16", "float16"}:
+        return torch.float16
+    if dtype in {"bf16", "bfloat16"}:
+        return torch.bfloat16
+    raise ValueError(f"Unsupported BAGEL reference dtype: {dtype!r}")
+
+
+def _default_vae_config() -> AutoEncoderParams:
+    return AutoEncoderParams(
+        resolution=256,
+        in_channels=3,
+        downsample=8,
+        ch=128,
+        out_ch=3,
+        ch_mult=[1, 2, 4, 4],
+        num_res_blocks=2,
+        z_channels=16,
+        scale_factor=0.3611,
+        shift_factor=0.1159,
+    )
+
+
+def _optional_bagel_config_kwargs(
+    *,
+    latent_patch_size: int | None,
+    max_latent_size: int | None,
+    timestep_shift: float | None,
+    vit_max_num_patch_per_side: int | None,
+    connector_act: str | None,
 ) -> dict[str, Any]:
-    if reference_case == "train_ce_mse":
-        return _run_train_reference(ref_model, inputs, context)
-    if reference_case == "text_image_und":
-        return _run_text_image_reference(ref_model, inputs, context)
-    if reference_case == "image_edit":
-        return _run_image_edit_reference(ref_model, inputs, context)
-    if reference_case == "image_gen":
-        return _run_image_gen_reference(ref_model, inputs, context)
-    return _run_text_reference(ref_model, inputs, context)
+    values: dict[str, Any] = {}
+    if latent_patch_size is not None:
+        values["latent_patch_size"] = latent_patch_size
+    if max_latent_size is not None:
+        values["max_latent_size"] = max_latent_size
+    if timestep_shift is not None:
+        values["timestep_shift"] = timestep_shift
+    if vit_max_num_patch_per_side is not None:
+        values["vit_max_num_patch_per_side"] = vit_max_num_patch_per_side
+    if connector_act is not None:
+        values["connector_act"] = connector_act
+    return values
+
+
+def _load_weights(
+    model: Bagel,
+    weights_path: Path,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+    visual_gen: bool,
+    visual_und: bool,
+) -> None:
+    if not weights_path.exists():
+        raise FileNotFoundError(f"BAGEL official reference weights not found: {weights_path}")
+    prefixes = ("language_model",)
+    if visual_gen:
+        prefixes = ("language_model.", "vae2llm.", "llm2vae.", "time_embedder.", "latent_pos_embed.")
+    if visual_und:
+        prefixes = (
+            *prefixes,
+            "vit_model.",
+            "connector.",
+            "vit_pos_embed.",
+        )
+    state_dict: dict[str, torch.Tensor] = {}
+    with safe_open(weights_path, framework="pt", device="cpu") as handle:
+        for key in handle.keys():
+            if key.startswith(prefixes):
+                state_dict[key] = handle.get_tensor(key).to(device=device, dtype=dtype)
+    missing, unexpected = model.load_state_dict(state_dict, strict=False, assign=True)
+    relevant_missing = [key for key in missing if key.startswith(prefixes)]
+    relevant_unexpected = [key for key in unexpected if key.startswith(prefixes)]
+    if relevant_missing:
+        raise RuntimeError(f"Missing BAGEL reference weight keys: {relevant_missing[:20]}")
+    if relevant_unexpected:
+        raise RuntimeError(f"Unexpected BAGEL reference weight keys: {relevant_unexpected[:20]}")
+
+
+def _compute_default_rope_parameters(config: Any, device: torch.device | None = None, **kwargs: Any):
+    del kwargs
+    head_dim = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads
+    partial_rotary_factor = getattr(config, "partial_rotary_factor", 1.0)
+    dim = int(head_dim * partial_rotary_factor)
+    base = getattr(config, "rope_theta", 10000.0)
+    inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.int64).to(device=device, dtype=torch.float) / dim))
+    return inv_freq, 1.0
 
 
 def run_reference_only_recipe(*, recipe_id: str, run_kind: str, case_id: str) -> ParityReport:
@@ -45,21 +325,27 @@ def run_reference_only_recipe(*, recipe_id: str, run_kind: str, case_id: str) ->
 
 
 def _run_transformers_reference_smoke() -> None:
+    from transformers import AutoConfig, AutoModel
+
     from tests.seed_omni.bagel.transformers import (
         AutoEncoderParams,
         Bagel,
         BagelConfig,
-        BagelOfficialReference,
         Qwen2Config,
         Qwen2ForCausalLM,
         Qwen2Model,
         SiglipVisionConfig,
         SiglipVisionModel,
-        load_vendored_model,
     )
+
+    BagelModel.register_auto_model()
 
     if Bagel.config_class is not BagelConfig:
         raise AssertionError("BAGEL official reference did not expose BagelConfig.")
+    if not isinstance(AutoConfig.for_model("bagel"), BagelConfig):
+        raise AssertionError("BAGEL config is not registered with AutoConfig.")
+    if AutoModel._model_mapping[BagelConfig] is not BagelModel:
+        raise AssertionError("BAGEL model is not registered with AutoModel.")
     if not issubclass(Qwen2Config, Qwen2Model.config_class):
         raise AssertionError("BAGEL Qwen2Config is not compatible with Qwen2Model.")
     if not issubclass(Qwen2Config, Qwen2ForCausalLM.config_class):
@@ -68,8 +354,6 @@ def _run_transformers_reference_smoke() -> None:
         raise AssertionError("BAGEL SigLIP reference did not expose SiglipVisionConfig.")
     if AutoEncoderParams.__name__ != "AutoEncoderParams":
         raise AssertionError("BAGEL autoencoder parameters are not exposed.")
-    if not callable(load_vendored_model):
-        raise AssertionError("BAGEL vendored reference loader is not callable.")
 
     llm_config = Qwen2Config(
         vocab_size=32,
@@ -85,7 +369,7 @@ def _run_transformers_reference_smoke() -> None:
         eos_token_id=2,
         pad_token_id=0,
     )
-    reference = BagelOfficialReference.from_configs(
+    reference = BagelModel.from_configs(
         llm_config=llm_config,
         visual_gen=False,
         visual_und=False,
@@ -272,7 +556,7 @@ def _run_text_image_reference(
     dtype = next(model.parameters()).dtype
 
     raw_image = make_reference_image(int(inputs.get("image_width", 448)), int(inputs.get("image_height", 336)))
-    vit_transform = ReferenceImageTransform(
+    vit_transform = ImageTransform(
         max_image_size=int(inputs.get("vit_max_image_size", 980)),
         min_image_size=int(inputs.get("vit_min_image_size", 378)),
         image_stride=int(inputs.get("vit_image_stride", 14)),
@@ -460,13 +744,13 @@ def _run_image_edit_reference(
     dtype = next(model.parameters()).dtype
 
     raw_image = make_reference_image(int(inputs.get("input_width", 384)), int(inputs.get("input_height", 256)))
-    vae_transform = ReferenceImageTransform(
+    vae_transform = ImageTransform(
         max_image_size=int(inputs.get("vae_max_image_size", 1024)),
         min_image_size=int(inputs.get("vae_min_image_size", 512)),
         image_stride=int(inputs.get("vae_image_stride", 16)),
         max_pixels=int(inputs.get("vae_max_pixels", 14 * 14 * 9 * 1024)),
     )
-    vit_transform = ReferenceImageTransform(
+    vit_transform = ImageTransform(
         max_image_size=int(inputs.get("vit_max_image_size", 980)),
         min_image_size=int(inputs.get("vit_min_image_size", 378)),
         image_stride=int(inputs.get("vit_image_stride", 14)),
@@ -581,7 +865,7 @@ def _run_train_reference(
     dtype = next(model.parameters()).dtype
 
     loss_mode = str(inputs.get("loss_mode", "ce_mse"))
-    batch = _build_train_batch(
+    fixture = _build_train_fixture(
         tokenizer,
         str(inputs["prompt"]),
         device=device,
@@ -589,6 +873,7 @@ def _run_train_reference(
         timestep_shift=float(inputs.get("timestep_shift", 3.0)),
         loss_mode=loss_mode,
     )
+    batch = _build_train_batch_from_fixture(fixture, device=device, dtype=dtype)
     model.train()
     model.zero_grad(set_to_none=True)
     official_batch = {key: value for key, value in batch.items() if key not in {"fixed_noise", "shifted_timesteps"}}
@@ -609,7 +894,7 @@ def _run_train_reference(
         loss = sum(loss_terms)
     loss.backward()
 
-    canonical = {"kind": f"train_{loss_mode}", "train_batch": to_cpu(batch)}
+    canonical = {"kind": str(fixture["kind"]), "train_fixture": to_cpu(fixture)}
     result = {
         "canonical": canonical,
         "reference": {
@@ -643,7 +928,7 @@ def _run_train_reference(
     return result
 
 
-def _build_train_batch(
+def _build_train_fixture(
     tokenizer: Any,
     text: str,
     *,
@@ -654,9 +939,32 @@ def _build_train_batch(
 ) -> dict[str, Any]:
     token_ids = torch.tensor(tokenizer.encode(text), device=device, dtype=torch.long)
     if loss_mode == "text_image_ce":
-        return _prepare_text_image_ce_batch(token_ids, device=device, dtype=dtype)
-    batch, fixed_noise = _prepare_ce_mse_batch(token_ids, device=device, dtype=dtype)
-    _add_flow_noise_controls(batch, fixed_noise=fixed_noise, timestep_shift=timestep_shift)
+        fixture = _prepare_text_image_ce_fixture(token_ids, device=device, dtype=dtype)
+    else:
+        fixture = _prepare_ce_mse_fixture(token_ids, device=device, dtype=dtype)
+    if loss_mode == "mse_only":
+        fixture["compute_ce"] = False
+    elif loss_mode not in {"ce_mse", "ce_only", "text_image_ce"}:
+        raise ValueError(f"Unsupported BAGEL train loss_mode: {loss_mode!r}")
+    fixture["kind"] = f"train_{loss_mode}"
+    fixture["loss_mode"] = loss_mode
+    fixture["prompt"] = text
+    fixture["timestep_shift"] = float(timestep_shift)
+    return fixture
+
+
+def _build_train_batch_from_fixture(
+    fixture: Mapping[str, Any],
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> dict[str, Any]:
+    loss_mode = str(fixture["loss_mode"])
+    token_ids = fixture["text_token_ids"].to(device=device, dtype=torch.long)
+    if loss_mode == "text_image_ce":
+        return _prepare_text_image_ce_batch_from_fixture(fixture, token_ids, device=device, dtype=dtype)
+    batch, fixed_noise = _prepare_ce_mse_batch_from_fixture(fixture, token_ids, device=device, dtype=dtype)
+    _add_flow_noise_controls(batch, fixed_noise=fixed_noise, timestep_shift=float(fixture.get("timestep_shift", 3.0)))
     if loss_mode == "ce_only":
         _remove_mse_fields(batch)
     elif loss_mode == "mse_only":
@@ -697,24 +1005,72 @@ def _remove_fields(batch: dict[str, Any], keys: tuple[str, ...]) -> None:
         batch.pop(key, None)
 
 
-def _prepare_ce_mse_batch(
+def _prepare_ce_mse_fixture(
     token_ids: torch.Tensor,
     *,
     device: torch.device,
     dtype: torch.dtype,
-) -> tuple[dict[str, Any], torch.Tensor]:
+) -> dict[str, Any]:
     latent_grid = (2, 2)
     latent_channels = 16
     latent_patch_size = 2
-    max_latent_size = 64
     h, w = latent_grid
-    latent = torch.linspace(
+    target_latent = torch.linspace(
         -0.75,
         0.75,
         steps=latent_channels * h * latent_patch_size * w * latent_patch_size,
         device=device,
         dtype=dtype,
     ).reshape(1, latent_channels, h * latent_patch_size, w * latent_patch_size)
+    num_vae_tokens = h * w
+    patch_dim = latent_channels * latent_patch_size * latent_patch_size
+    return {
+        "text_token_ids": token_ids,
+        "compute_ce": True,
+        "target_latent": target_latent,
+        "latent_grid": latent_grid,
+        "latent_patch_size": latent_patch_size,
+        "max_latent_size": 64,
+        "flow_timesteps": torch.linspace(-0.5, 0.5, steps=num_vae_tokens, device=device),
+        "flow_noise": torch.linspace(
+            -0.25, 0.25, steps=num_vae_tokens * patch_dim, device=device, dtype=dtype
+        ).reshape(num_vae_tokens, patch_dim),
+    }
+
+
+def _prepare_text_image_ce_fixture(
+    token_ids: torch.Tensor,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> dict[str, Any]:
+    vit_tokens = 2
+    vit_patch_dim = 3 * 14 * 14
+    return {
+        "text_token_ids": token_ids,
+        "compute_ce": True,
+        "vit_tokens": torch.linspace(
+            -1.0,
+            1.0,
+            steps=vit_tokens * vit_patch_dim,
+            device=device,
+            dtype=dtype,
+        ).reshape(vit_tokens, vit_patch_dim),
+        "vit_position_ids": torch.arange(vit_tokens, device=device, dtype=torch.long),
+        "vit_token_lens": torch.tensor([vit_tokens], device=device, dtype=torch.int32),
+    }
+
+
+def _prepare_ce_mse_batch_from_fixture(
+    fixture: Mapping[str, Any],
+    token_ids: torch.Tensor,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> tuple[dict[str, Any], torch.Tensor]:
+    latent = fixture["target_latent"].to(device=device, dtype=dtype)
+    h, w = tuple(int(value) for value in fixture["latent_grid"])
+    max_latent_size = int(fixture.get("max_latent_size", 64))
     num_vae_tokens = h * w
     text_fields = _base_text_fields(token_ids)
     vae_indexes = torch.arange(int(token_ids.numel()), int(token_ids.numel()) + num_vae_tokens, device=device)
@@ -734,33 +1090,24 @@ def _prepare_ce_mse_batch(
         "patchified_vae_latent_shapes": [(h, w)],
         "packed_latent_position_ids": _latent_position_ids(h, w, max_latent_size=max_latent_size, device=device),
         "packed_vae_token_indexes": vae_indexes.to(dtype=torch.long),
-        "packed_timesteps": torch.linspace(-0.5, 0.5, steps=num_vae_tokens, device=device),
+        "packed_timesteps": fixture["flow_timesteps"].to(device=device, dtype=torch.float32),
         "mse_loss_indexes": torch.zeros(sequence_length, device=device, dtype=torch.bool),
     }
     batch["mse_loss_indexes"][batch["packed_vae_token_indexes"]] = True
-    _apply_ce(batch, batch["packed_text_indexes"], token_ids)
-    patch_dim = latent_channels * latent_patch_size * latent_patch_size
-    fixed_noise = torch.linspace(-0.25, 0.25, steps=num_vae_tokens * patch_dim, device=device, dtype=dtype).reshape(
-        num_vae_tokens, patch_dim
-    )
-    return batch, fixed_noise
+    if bool(fixture.get("compute_ce", True)):
+        _apply_ce(batch, batch["packed_text_indexes"], token_ids)
+    return batch, fixture["flow_noise"].to(device=device, dtype=dtype)
 
 
-def _prepare_text_image_ce_batch(
+def _prepare_text_image_ce_batch_from_fixture(
+    fixture: Mapping[str, Any],
     token_ids: torch.Tensor,
     *,
     device: torch.device,
     dtype: torch.dtype,
 ) -> dict[str, Any]:
-    vit_tokens = 2
-    vit_patch_dim = 3 * 14 * 14
-    packed_vit_tokens = torch.linspace(
-        -1.0,
-        1.0,
-        steps=vit_tokens * vit_patch_dim,
-        device=device,
-        dtype=dtype,
-    ).reshape(vit_tokens, vit_patch_dim)
+    packed_vit_tokens = fixture["vit_tokens"].to(device=device, dtype=dtype)
+    vit_tokens = int(packed_vit_tokens.shape[0])
     text_fields = _base_text_fields(token_ids, start_index=vit_tokens)
     sequence_length = vit_tokens + int(token_ids.numel())
     batch: dict[str, Any] = {
@@ -776,8 +1123,8 @@ def _prepare_text_image_ce_batch(
         "nested_attention_masks": [_causal_attention_mask(sequence_length, device)],
         "packed_vit_tokens": packed_vit_tokens,
         "packed_vit_token_indexes": torch.arange(vit_tokens, device=device, dtype=torch.long),
-        "packed_vit_position_ids": torch.arange(vit_tokens, device=device, dtype=torch.long),
-        "vit_token_seqlens": torch.tensor([vit_tokens], device=device, dtype=torch.int32),
+        "packed_vit_position_ids": fixture["vit_position_ids"].to(device=device, dtype=torch.long),
+        "vit_token_seqlens": fixture["vit_token_lens"].to(device=device, dtype=torch.int32),
     }
     _apply_ce(batch, text_fields["packed_text_indexes"], token_ids)
     return batch
@@ -1183,6 +1530,8 @@ def _sample_tensor(value: torch.Tensor) -> torch.Tensor:
 
 
 __all__ = [
+    "BagelModel",
+    "ImageTransform",
+    "make_reference_image",
     "run_reference_only_recipe",
-    "run_reference_recipe",
 ]

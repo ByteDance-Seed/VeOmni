@@ -234,6 +234,7 @@ class BagelSiglipEncoderLayer(nn.Module):
 class BagelSiglipEncoder(nn.Module):
     def __init__(self, config: BagelSiglipNavitConfig):
         super().__init__()
+        self.gradient_checkpointing = False
         self.layers = nn.ModuleList([BagelSiglipEncoderLayer(config) for _ in range(config.num_hidden_layers)])
 
     def forward(
@@ -248,15 +249,27 @@ class BagelSiglipEncoder(nn.Module):
     ) -> torch.Tensor:
         hidden_states = inputs_embeds
         for encoder_layer in self.layers:
-            hidden_states = encoder_layer(
-                hidden_states,
-                cu_seqlens,
-                max_seqlen,
-                cos_h=cos_h,
-                sin_h=sin_h,
-                cos_w=cos_w,
-                sin_w=sin_w,
-            )
+            if self.gradient_checkpointing and self.training:
+                hidden_states = self._gradient_checkpointing_func(
+                    encoder_layer.__call__,
+                    hidden_states,
+                    cu_seqlens,
+                    max_seqlen,
+                    cos_h,
+                    sin_h,
+                    cos_w,
+                    sin_w,
+                )
+            else:
+                hidden_states = encoder_layer(
+                    hidden_states,
+                    cu_seqlens,
+                    max_seqlen,
+                    cos_h=cos_h,
+                    sin_h=sin_h,
+                    cos_w=cos_w,
+                    sin_w=sin_w,
+                )
         return hidden_states
 
 

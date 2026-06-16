@@ -1,8 +1,7 @@
 name: bagel
 
 reference:
-  loader: vendored
-  module: tests.seed_omni.bagel.transformers.bagel
+  module: tests.seed_omni.bagel.reference_model:BagelModel
   checkpoint: ${MODEL_HUB}/transformers/BAGEL-7B-MoT
 
 v2_model:

@@ -7,25 +7,57 @@ import torch
 from PIL import Image
 
 from ....conversation import ConversationItem
-from ....module import ModuleMixin
+from ....module import ModuleMixin, post_forward, pre_forward
+from ..training_pack import add_dummy_anchor_to_batch, append_dummy_anchor, conversation_samples, get_packed_batch
 
 
 class BagelSiglipNavitModuleMixin(ModuleMixin):
     def init_omni_state(self) -> None:
         self._conversation_carrier: Optional[list[list[ConversationItem]]] = None
+        self._raw_training_image_items: list[ConversationItem] = []
         self._bagel_packed_batch: Optional[dict[str, Any]] = None
         self._bagel_packed_skip: bool = False
 
-    def pre_forward(
+    @pre_forward("forward")
+    def forward_pre(
         self,
-        method: str,
         conversation_list: Optional[list[list[ConversationItem]]] = None,
         bagel_packed_batch: Optional[dict[str, Any]] = None,
         **kwargs: Any,
     ) -> Dict[str, Any]:
-        del conversation_list, kwargs
-        assert method in ("forward",)
+        del kwargs
+        if bagel_packed_batch is None:
+            bagel_packed_batch = get_packed_batch(conversation_list)
         self._bagel_packed_batch = bagel_packed_batch
+        self._conversation_carrier = conversation_list
+        self._raw_training_image_items = []
+        if bagel_packed_batch is None and conversation_list is not None:
+            self._raw_training_image_items = [
+                item
+                for sample in conversation_samples(conversation_list)
+                for item in sample
+                if item.type == "image" and item.role == "user" and item.meta.get("bagel_role") != "image_vae_context"
+            ]
+            if not self._raw_training_image_items:
+                self._bagel_packed_skip = True
+                return self.dummy_inputs()
+            pixel_values: list[torch.Tensor] = []
+            position_ids: list[torch.Tensor] = []
+            token_lens: list[torch.Tensor] = []
+            for item in self._raw_training_image_items:
+                item_pixel_values, item_position_ids, item_token_lens = self._prepare_image_item(item)
+                pixel_values.append(item_pixel_values)
+                position_ids.append(item_position_ids.reshape(-1))
+                token_lens.append(item_token_lens.reshape(-1))
+            vit_token_lens = torch.cat(token_lens).to(device=self.device, dtype=torch.int32)
+            return {
+                "packed_pixel_values": torch.cat(pixel_values, dim=0).to(device=self.device, dtype=self.dtype),
+                "packed_flattened_position_ids": torch.cat(position_ids, dim=0).to(
+                    device=self.device, dtype=torch.long
+                ),
+                "cu_seqlens": torch.nn.functional.pad(torch.cumsum(vit_token_lens, dim=0), (1, 0)).to(torch.int32),
+                "max_seqlen": int(vit_token_lens.max().item()),
+            }
         self._bagel_packed_skip = bagel_packed_batch is None or "packed_vit_tokens" not in bagel_packed_batch
         if self._bagel_packed_skip:
             return self.dummy_inputs()
@@ -39,14 +71,35 @@ class BagelSiglipNavitModuleMixin(ModuleMixin):
             "max_seqlen": int(vit_token_lens.max().item()),
         }
 
-    def post_forward(self, method: str, **outputs: Any) -> Dict[str, Any]:
-        assert method in ("forward",)
+    @post_forward("forward")
+    def forward_post(self, **outputs: Any) -> Dict[str, Any]:
         batch = self._bagel_packed_batch
         skip = self._bagel_packed_skip
+        conversation = self._conversation_carrier
+        raw_items = self._raw_training_image_items
         self._bagel_packed_batch = None
+        self._conversation_carrier = None
+        self._raw_training_image_items = []
         self._bagel_packed_skip = False
+        dummy_anchor = outputs["image_embeds"].sum() * 0.0 if skip else None
+        if batch is None and raw_items:
+            image_embeds = outputs["image_embeds"]
+            offset = 0
+            for item in raw_items:
+                vit_token_lens = item.meta["vit_token_lens"].detach().reshape(-1).to(dtype=torch.int32)
+                length = int(vit_token_lens.sum().item())
+                item.meta["packed_vit_embeds"] = image_embeds[offset : offset + length]
+                item.meta["image_embeds_ready"] = True
+                offset += length
+            return {"conversation_list": conversation}
+        if batch is None and conversation is not None:
+            if dummy_anchor is not None:
+                append_dummy_anchor(conversation, dummy_anchor)
+            return {"conversation_list": conversation}
         if batch is not None and not skip:
             batch["packed_vit_embeds"] = outputs["image_embeds"]
+        if batch is not None and dummy_anchor is not None:
+            add_dummy_anchor_to_batch(batch, dummy_anchor)
         return {"bagel_packed_batch": batch}
 
     def dummy_inputs(self) -> Dict[str, Any]:
