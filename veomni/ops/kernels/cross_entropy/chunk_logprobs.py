@@ -90,6 +90,7 @@ try:
 except ImportError:
     _NPU_CE_AVAILABLE = False
 
+
 def _per_token_log_probs_from_logits_npu(
     logits: torch.Tensor,
     labels: torch.Tensor,
@@ -112,6 +113,7 @@ def _per_token_log_probs_from_logits_npu(
         ignore_index=ignore_index,
     )
     return -loss.view(*batch_shape)
+
 
 def _per_token_log_probs_from_logits(
     logits: torch.Tensor,
