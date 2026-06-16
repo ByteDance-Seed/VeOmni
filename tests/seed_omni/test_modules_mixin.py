@@ -439,7 +439,7 @@ def test_janus_train_plus_infer_merges_generation_graph(infer_graph: str):
     cfg = _load_omni_config(
         modules_path=_janus_cfg_dir() / "modules_train.yaml",
         train_graph_path=_janus_cfg_dir() / "graph_train.yaml",
-        infer_modules=_janus_cfg_dir() / "modules_infer.yaml",
+        infer_modules=_janus_cfg_dir() / "modules_infer_fsdp.yaml",
         infer_graph_path=_janus_cfg_dir() / infer_graph,
     )
     # Training vocabulary still present.
@@ -503,7 +503,7 @@ def test_init_resolves_relative_module_paths():
         model_path=root,
         modules_path=_janus_cfg_dir() / "modules_train.yaml",
         train_graph_path=_janus_cfg_dir() / "graph_train.yaml",
-        infer_modules=_janus_cfg_dir() / "modules_infer.yaml",
+        infer_modules=_janus_cfg_dir() / "modules_infer_fsdp.yaml",
         infer_graph_path=_janus_cfg_dir() / "graph_infer_gen.yaml",
     )
 

@@ -91,7 +91,8 @@ train:
 
 infer:
   model_path: /mnt/hdfs/user_dir/veomni_omni/models/seed_omni/Janus-1.3B
-  modules: configs/seed_omni/Janus/janus_1.3b/modules_infer.yaml
+  modules: configs/seed_omni/Janus/janus_1.3b/modules_infer_eager.yaml
+  # modules: configs/seed_omni/Janus/janus_1.3b/modules_infer_fsdp.yaml
   infer_graph:
     infer_gen: configs/seed_omni/Janus/janus_1.3b/graph_infer_gen.yaml
     infer_und: configs/seed_omni/Janus/janus_1.3b/graph_infer_und.yaml

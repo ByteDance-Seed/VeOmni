@@ -18,10 +18,11 @@ drives the inferencer.
 | File | Role |
 |------|------|
 | `base.yaml` | Top-level omni launcher: model paths, top-level `accelerator`, data, train, and the `infer` block. References the module/graph files below. |
-| `modules_train.yaml` | Per-module **training** overrides (`model` / `train` / `accelerator` per module). |
+| `modules_train.yaml` | Per-module **training** overrides (`model` / `train` / `accelerator` per module). `janus_text_encoder` carries a embed-parallel `emb` extra-parallel block (see below). |
 | `graph_train.yaml` | Training DAG (`training_graph:` flat edge list). |
 | `data.yaml` | Weighted multisource data list (ImageNet + ShareGPT4V). |
-| `modules_infer.yaml` | Per-module **inference** overrides (deep-merged onto the training modules; modules default to eager load). |
+| `modules_infer_fsdp.yaml` | Per-module **inference** overrides — distributed: `janus_text_encoder` vocab-parallel `emb` + `janus_llama` `ddp`, vision modules eager (base.yaml's default `infer.modules`). |
+| `modules_infer_eager.yaml` | Per-module **inference** overrides — every module `eager` (single-process replica). |
 | `graph_infer_und.yaml` / `graph_infer_gen.yaml` / `graph_infer_interleave.yaml` | Per-scenario generation graphs (mapped under `infer.infer_graph`). |
 
 ---
@@ -92,6 +93,22 @@ Key knobs (override on the CLI, e.g. `--train.global_batch_size 32`):
 - `--accelerator.fsdp_config.fsdp_mode` — top-level FSDP mode (the omni schema lifts `accelerator` out of `train`).
 - `--model.modules.janus_llama.accelerator.fsdp_config.fsdp_mode eager` — per-module override (arbitrary nested keys deep-merge into the referenced module file).
 
+### Per-module parallelism
+
+Each module can carry its own `accelerator` block in `modules_train.yaml`; when a
+module's topology differs from the top-level one, the trainer builds it its **own**
+`ParallelState` (device mesh + process groups) on the full world, while modules that
+match the global topology reuse it. `janus_text_encoder` ships with a embed-parallel
+**embedding** (`emb`) extra-parallel group:
+
+```yaml
+# modules_train.yaml — janus_text_encoder
+accelerator:
+  extra_parallel_sizes: [4]            # shard embed_tokens.weight dim-0 (vocab) across 4 ranks
+  extra_parallel_names: ["emb"]
+  extra_parallel_placement_innermost: [false]
+```
+
 Quick 1-node smoke run (no wandb, tiny step budget):
 
 ```bash
@@ -129,8 +146,25 @@ defaults to `infer_interleave`). Point `--infer.model_path` at a
 `janus_vqvae/`, `janus_text_encoder/`, `janus_llama/`), each with its own
 `config.json` + weights — or omit it to fall back to `model.model_path`. The
 step-1 converter output already has this layout, so you can infer directly with
-the converted base model. Each module loads eager (`fsdp_mode: eager`) by
-default; opt a module into FSDP via `modules_infer.yaml`.
+the converted base model.
+
+Each module opts into FSDP / extra-parallel via its inference module YAML's
+`accelerator` block; `OmniInferencer` auto-detects whether any module needs a
+distributed run. Two ready-made inference module files ship with the config:
+
+| `infer.modules` file | Layout | Launch |
+|----------------------|--------|--------|
+| `modules_infer_fsdp.yaml` (base.yaml default) | `janus_text_encoder` → distributed **vocab-parallel `emb`** (`fsdp2` + `emb`), `janus_llama` → `ddp`, vision modules eager | **torchrun** (`bash train.sh …`) |
+| `modules_infer_eager.yaml` | every module `eager` — plain per-rank replica | single-process (`python …`) |
+
+Four launcher scripts at the repo root wrap the two paths for both scenarios:
+
+| Script | Modules | Launcher |
+|--------|---------|----------|
+| `infer_fsdp_i2t.sh` / `infer_fsdp_t2i.sh` | base default (`modules_infer_fsdp.yaml`) | `bash train.sh` (torchrun) |
+| `infer_eager_i2t.sh` / `infer_eager_t2i.sh` | `--infer.modules …/modules_infer_eager.yaml` | `python` (single process) |
+
+The commands below mirror those scripts.
 
 ### 5.1 Inferring from a trained checkpoint
 
@@ -151,12 +185,15 @@ Then pass `--infer.model_path "$ASM"` to any of the commands below. (Verified:
 the `global_step_20` checkpoint loads all four modules and runs both the I2T and
 T2I graphs end-to-end.)
 
-**Image understanding (I2T / VQA)** — `graph_infer_und.yaml`:
+**Image understanding (I2T / VQA)** — `graph_infer_und.yaml`.
+
+Distributed (`infer_fsdp_i2t.sh`) — base default `modules_infer_fsdp.yaml`, torchrun:
 
 ```bash
-python tasks/omni/infer_omni.py \
+bash train.sh tasks/omni/infer_omni.py \
   configs/seed_omni/Janus/janus_1.3b/base.yaml \
   --infer.infer_type infer_und \
+  --infer.modules configs/seed_omni/Janus/janus_1.3b/modules_infer_fsdp.yaml \
   --infer.model_path /mnt/hdfs/user_dir/veomni_omni/models/seed_omni/Janus-1.3B \
   --infer.prompt "What do you see in this image?" \
   --infer.image /path/to/image.png \
@@ -164,12 +201,45 @@ python tasks/omni/infer_omni.py \
   --infer.generation_kwargs.max_new_tokens 1024
 ```
 
-**Text-to-image (T2I)** — `graph_infer_gen.yaml` (`guidance_scale` enables CFG):
+Single-process (`infer_eager_i2t.sh`) — swap `infer.modules` to the all-eager
+file so every module loads as a plain replica (no torchrun):
+
+```bash
+python tasks/omni/infer_omni.py \
+  configs/seed_omni/Janus/janus_1.3b/base.yaml \
+  --infer.infer_type infer_und \
+  --infer.modules configs/seed_omni/Janus/janus_1.3b/modules_infer_eager.yaml \
+  --infer.model_path /mnt/hdfs/user_dir/veomni_omni/models/seed_omni/Janus-1.3B \
+  --infer.prompt "What do you see in this image?" \
+  --infer.image /path/to/image.png \
+  --infer.output_dir janus_out \
+  --infer.generation_kwargs.max_new_tokens 1024
+```
+
+**Text-to-image (T2I)** — `graph_infer_gen.yaml` (`guidance_scale` enables CFG).
+
+Distributed (`infer_fsdp_t2i.sh`) — base default `modules_infer_fsdp.yaml`, torchrun:
+
+```bash
+bash train.sh tasks/omni/infer_omni.py \
+  configs/seed_omni/Janus/janus_1.3b/base.yaml \
+  --infer.infer_type infer_gen \
+  --infer.modules configs/seed_omni/Janus/janus_1.3b/modules_infer_fsdp.yaml \
+  --infer.model_path /mnt/hdfs/user_dir/veomni_omni/models/seed_omni/Janus-1.3B \
+  --infer.prompt "A photo of the Sydney Opera House under a starry night sky." \
+  --infer.output_dir janus_out \
+  --infer.generation_kwargs.max_new_tokens 2048 \
+  --infer.generation_kwargs.guidance_scale 5.0
+```
+
+Single-process (`infer_eager_t2i.sh`) — swap `infer.modules` to the all-eager
+file so every module loads as a plain replica (no torchrun):
 
 ```bash
 python tasks/omni/infer_omni.py \
   configs/seed_omni/Janus/janus_1.3b/base.yaml \
   --infer.infer_type infer_gen \
+  --infer.modules configs/seed_omni/Janus/janus_1.3b/modules_infer_eager.yaml \
   --infer.model_path /mnt/hdfs/user_dir/veomni_omni/models/seed_omni/Janus-1.3B \
   --infer.prompt "A photo of the Sydney Opera House under a starry night sky." \
   --infer.output_dir janus_out \

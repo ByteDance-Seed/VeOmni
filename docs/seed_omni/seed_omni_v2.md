@@ -351,7 +351,10 @@ Use the `/seedomni-v2` skill for the full checklist. The shape of the work:
    - `base.yaml` — top-level launcher: `model.*` (incl. `modules` / `train_graph`
      paths), top-level `accelerator`, `data.*`, `train.*`, and the `infer` block.
    - `modules_train.yaml` — per-module training overrides (`model` / `train` /
-     `accelerator` per module).
+     `accelerator` per module). A module's `accelerator` block drives its own
+     parallel topology on the full world (heterogeneous FSDP2 / FSDP2+`emb`/`ep`
+     / DDP); modules matching the global topology reuse it, others build their
+     own `ParallelState`.
    - `graph_train.yaml` — the `training_graph` (a flat list of edges whose
      endpoints are `module[.method]` strings). Remember: edges only declare
      order; modules move data via the conversation list.
@@ -371,8 +374,11 @@ Use the `/seedomni-v2` skill for the full checklist. The shape of the work:
      `finalize()`.
 
 6. **Validate:** render the graph with `TrainingGraph.to_mermaid()`, run the
-   unit tests in `tests/seed_omni/`, then the end-to-end train/infer pipeline
-   (see `docs/seed_omni/example_models/janus.md`).
+   unit tests in `tests/seed_omni/`, then the end-to-end train/infer pipeline.
+   Worked examples under `docs/seed_omni/example_models/`:
+   - [`janus.md`](example_models/janus.md) — multimodal understanding + generation (SigLIP / VQVAE / LLaMA).
+   - [`qwen3.md`](example_models/qwen3.md) — minimal text-only split.
+   - [`qwen3moe.md`](example_models/qwen3moe.md) — MoE backbone with Expert Parallel (fsdp2 + ep).
 
 ---
 

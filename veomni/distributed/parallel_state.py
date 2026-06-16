@@ -17,6 +17,7 @@
 
 import math
 import os
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from functools import cached_property, wraps
 from typing import TYPE_CHECKING, Callable, Dict, Literal, Optional, Tuple
@@ -37,6 +38,9 @@ if TYPE_CHECKING:
 logger = logging.get_logger(__name__)
 
 _PARALLEL_STATE: "ParallelState" = None
+
+# Cache of built parallel states keyed by full topology.
+_PARALLEL_STATE_CACHE: Dict[tuple, "ParallelState"] = {}
 
 
 def requires_mesh(fn: Callable) -> Callable:
@@ -497,14 +501,13 @@ def init_parallel_state(
     extra_parallel_placement_innermost: Tuple[bool] = (False,),
     extra_parallel_names: Tuple[str] = ("ep",),
     async_enabled: Optional[bool] = False,
-) -> None:
+) -> "ParallelState":
     """
-    Initializes global parallel state.
+    Initialize a parallel state, set it as the global state.
     """
     global _PARALLEL_STATE
     if _PARALLEL_STATE is not None:
         logger.warning("Parallel state has already been initialized.")
-        return
 
     if device_type is None:
         device_type = get_device_type()
@@ -513,10 +516,43 @@ def init_parallel_state(
     if dp_size > 1 and dp_shard_size == 1 and dp_replicate_size == 1:
         dp_shard_size = dp_size
 
+    extra_parallel_sizes = tuple(extra_parallel_sizes)
+    extra_parallel_placement_innermost = tuple(extra_parallel_placement_innermost)
+    extra_parallel_names = tuple(extra_parallel_names)
+
     # Note that Expert Parallel is included into Extra Parallel
     assert len(extra_parallel_sizes) == len(extra_parallel_placement_innermost) == len(extra_parallel_names), (
         "each extra parallel should correspond to a size, a placement and a name"
     )
+
+    # Reuse an already-built state for an identical topology (e.g. the omni
+    # orchestrator builds one ParallelState per module, many of which share the
+    # global topology). Building the device mesh / extra-parallel meshes creates
+    # process groups via collectives — all ranks run the same call sequence in
+    # the same order, so cache hits/misses are rank-consistent and no duplicate
+    # groups are created. The key spans every field that shapes the mesh or the
+    # state's behaviour (e.g. ``dp_mode`` is read by grad-clip).
+    cache_key = (
+        dp_size,
+        dp_replicate_size,
+        dp_shard_size,
+        tp_size,
+        pp_size,
+        cp_size,
+        ulysses_size,
+        dp_mode,
+        device_type,
+        include_sp_in_fsdp,
+        extra_parallel_sizes,
+        extra_parallel_placement_innermost,
+        extra_parallel_names,
+        async_enabled,
+    )
+    cached_state = _PARALLEL_STATE_CACHE.get(cache_key)
+    if cached_state is not None:
+        logger.info_rank0("Reusing cached parallel state for identical topology.")
+        assert _PARALLEL_STATE is not None
+        return cached_state
 
     logger.info_rank0(
         f"Initializing parallel state: dp_size {dp_size}, dp_replicate_size {dp_replicate_size}, "
@@ -604,7 +640,7 @@ def init_parallel_state(
     for para_name in extra_parallel_names:
         logger.info_rank0(f"{para_name} FSDP device mesh: {extra_parallel_fsdp_device_mesh[para_name]}")
 
-    _PARALLEL_STATE = ParallelState(
+    parallel_state = ParallelState(
         dp_size=dp_size,
         dp_replicate_size=dp_replicate_size,
         dp_shard_size=dp_shard_size,
@@ -621,6 +657,34 @@ def init_parallel_state(
         extra_parallel_fsdp_device_mesh=extra_parallel_fsdp_device_mesh,
         async_enabled=async_enabled,
     )
+
+    if _PARALLEL_STATE is None:
+        _PARALLEL_STATE = parallel_state
+
+    _PARALLEL_STATE_CACHE[cache_key] = parallel_state
+    return parallel_state
+
+
+def set_parallel_state(parallel_state: "ParallelState") -> Optional["ParallelState"]:
+    """
+    Set the global parallel state to ``parallel_state``.
+    """
+    global _PARALLEL_STATE
+    old = _PARALLEL_STATE
+    _PARALLEL_STATE = parallel_state
+    return old
+
+
+@contextmanager
+def use_parallel_state(parallel_state: "ParallelState"):
+    """
+    Temporarily make ``parallel_state`` the global parallel state, restoring on exit.
+    """
+    old = set_parallel_state(parallel_state)
+    try:
+        yield
+    finally:
+        set_parallel_state(old)
 
 
 def get_parallel_state() -> "ParallelState":

@@ -93,17 +93,32 @@ def test_module_exports_inferencer_and_request():
     assert "InferenceRequest" in module.__all__
 
 
-def test_module_uses_fsdp_only_when_declared_in_module_yaml():
-    from veomni.trainer.omni_inferencer import _module_uses_fsdp
+def test_module_needs_distributed_only_when_declared_non_eager():
+    from veomni.trainer.omni_inferencer import _module_needs_distributed
 
-    assert not _module_uses_fsdp({"model": {"weights_path": "janus_siglip"}})
-    assert _module_uses_fsdp(
+    # No accelerator block → eager default → single-process.
+    assert not _module_needs_distributed({"model": {"weights_path": "janus_siglip"}})
+    # fsdp2 / ddp need a distributed (torchrun) launch + own ParallelState.
+    assert _module_needs_distributed(
         {
             "model": {"weights_path": "janus_siglip"},
             "train": {"accelerator": {"fsdp_config": {"fsdp_mode": "fsdp2"}}},
         }
     )
-    assert not _module_uses_fsdp(
+    assert _module_needs_distributed(
+        {
+            "model": {"weights_path": "janus_llama"},
+            "train": {"accelerator": {"fsdp_config": {"fsdp_mode": "ddp"}}},
+        }
+    )
+    # eager / none are single-process loads.
+    assert not _module_needs_distributed(
+        {
+            "model": {"weights_path": "janus_siglip"},
+            "train": {"accelerator": {"fsdp_config": {"fsdp_mode": "eager"}}},
+        }
+    )
+    assert not _module_needs_distributed(
         {
             "model": {"weights_path": "janus_siglip"},
             "train": {"accelerator": {"fsdp_config": {"fsdp_mode": "none"}}},

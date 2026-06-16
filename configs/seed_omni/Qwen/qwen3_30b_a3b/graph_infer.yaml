@@ -1,0 +1,15 @@
+# Qwen3-30B-A3B (MoE) inference — text-only chat generation.
+generation_graph:
+  initial: text_ar
+
+  states:
+    # Single AR loop: ``qwen3_text_encoder.generate`` embeds the prompt on the
+    # first pass and the sampled-token tail on every subsequent pass (dispatch
+    # is driven by ``ctx``), so there is no separate ``prompt_encode`` state.
+    text_ar:
+      body:
+        - { from: qwen3_text_encoder, to: qwen3_moe_llm }
+        - { from: qwen3_moe_llm,      to: qwen3_text_encoder }
+        - { from: qwen3_text_encoder, to: end }
+      transitions:
+        - { condition: { type: module_signal, key: text_done }, next_state: done }

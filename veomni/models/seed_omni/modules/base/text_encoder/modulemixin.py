@@ -24,6 +24,11 @@ class TextEncoderModuleMixin(ModuleMixin):
         self._text_token_cache: list[int] = []
         self._bos_injected: bool = False
 
+    def get_parallel_plan(self):
+        from .parallel_plan import get_parallel_plan as _get_parallel_plan
+
+        return _get_parallel_plan()
+
     @property
     def tokenizer(self) -> Any:
         return self._tokenizer

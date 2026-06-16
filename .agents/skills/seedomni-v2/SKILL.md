@@ -1,6 +1,6 @@
 ---
 name: seedomni-v2
-description: "Use this skill when adding or modifying anything inside `veomni/models/seed_omni/` (the SeedOmni V2 graph-based multi-modal model). Covers: writing a new `XxxModuleMixin` (subclass `ModuleMixin` + HF/diffusers model multi-inheritance), wiring it into the YAML graph (`modules` / `training_graph` / `generation_graph`, flat edge lists), writing `configuration.py` + `modulemixin.py` + `modeling.py` (+ optional `processing.py`), updating the split-checkpoint script, registering with `OMNI_*_REGISTRY`, and validating with the visualization script + tests. Trigger: 'add seedomni module', 'new omnimodule', 'extend seed_omni', 'add encode/decode module', 'wire into omni graph', 'split <model> checkpoint into omni modules', 'modify training_graph / generation_graph', 'add SeedOmni V2 backbone'."
+description: "Use this skill when adding or modifying anything inside `veomni/models/seed_omni/` (the SeedOmni V2 graph-based multi-modal model). Covers: writing a new `XxxModuleMixin` (subclass `ModuleMixin` + HF/diffusers model multi-inheritance), wiring it into the YAML graph (`modules` / `training_graph` / `generation_graph`, flat edge lists), writing `configuration.py` + `modulemixin.py` + `modeling.py` (+ optional `processing.py`), updating the split-checkpoint script, registering with `OMNI_*_REGISTRY`, configuring per-module parallelism (per-OmniModule `accelerator`: heterogeneous FSDP2 / vocab-parallel `emb` / `ep` / DDP, per-module `ParallelState`, distributed vs eager inference), and validating with the visualization script + tests. Trigger: 'add seedomni module', 'new omnimodule', 'extend seed_omni', 'add encode/decode module', 'wire into omni graph', 'split <model> checkpoint into omni modules', 'modify training_graph / generation_graph', 'add SeedOmni V2 backbone', 'per-module parallel / emb / ddp for an omni module', 'distributed omni inference'."
 ---
 
 ## Required Reading (before any code change)
@@ -400,11 +400,17 @@ configs/seed_omni/Janus/janus_1.3b/
 ├── base.yaml                  # launcher: model / accelerator / data / train + infer block
 ├── modules_train.yaml         # per-module training overrides (model / train / accelerator)
 ├── graph_train.yaml           # training_graph (flat edge list)
-├── modules_infer.yaml         # per-module inference overrides (optional; default eager load)
+├── modules_infer_fsdp.yaml    # per-module inference overrides — distributed (FSDP2 / emb / ddp)
+├── modules_infer_eager.yaml   # per-module inference overrides — all eager (single-process)
 ├── graph_infer_interleave.yaml  # generation_graph — T2T+T2I mid-stream image generation
 ├── graph_infer_gen.yaml         # generation_graph — T2I-only (no preceding text)
 └── graph_infer_und.yaml         # generation_graph — I2T / VQA (uni-directional)
 ```
+
+A model may ship **several inference module files** (e.g. a distributed
+`modules_infer_fsdp.yaml` and a single-process `modules_infer_eager.yaml`);
+`base.yaml`'s `infer.modules` points at the default and callers override with
+`--infer.modules <other>.yaml`. See **Per-module parallelism** below.
 
 Loading rules (driven by `OmniArguments`, parsed via `parse_omni_args`):
 
@@ -511,6 +517,86 @@ Editing `graph_infer_<scenario>.yaml`:
     - **Naming**: pick a signal key that is unique across the FSM lifetime (`image_complete`, `start_image_gen`, `text_done`, …).
     - Only two condition types exist: `module_signal` and `default`. Build-time validation rejects unknown types, a missing `key` on `module_signal`, and a `default` that isn't listed last.
 
+### Per-module parallelism (per-OmniModule `accelerator`)
+
+Each OmniModule can run under its **own parallel topology on the full world** —
+heterogeneous FSDP2 / FSDP2+ExtraParallel (`emb`/`ep`) / DDP within one
+OmniModel. This is driven entirely by a per-module `accelerator:` block in
+`modules_{train,infer}.yaml` (lifted under `train.accelerator` by `OmniConfig`).
+
+```yaml
+# modules_train.yaml
+janus_text_encoder:            # vocab-parallel embedding: shard embed_tokens.weight
+  accelerator:                 #   dim-0 (vocab) across the `emb` group, FSDP dim-1 (hidden)
+    extra_parallel_sizes: [4]
+    extra_parallel_names: ["emb"]
+    extra_parallel_placement_innermost: [false]
+janus_llama:                   # replicated backbone (mixed with the sharded modules)
+  accelerator:
+    fsdp_config: {fsdp_mode: ddp}
+# janus_siglip / janus_vqvae: no accelerator block → reuse the global FSDP2 mesh
+```
+
+How it works (trainer side):
+
+- **One global `ParallelState`** is built once by `OmniTrainer.base._setup()`
+  from the top-level `accelerator`. Each module either **reuses** it or **builds
+  its own**, decided by comparing accelerator topology: `OmniTrainer._build_model`
+  uses `_accelerator_topology(module_acc) != _accelerator_topology(global_acc)`
+  (`omni_trainer.py`). Same topology → reuse (no redundant process-group build);
+  different → `OmniModuleTrainer._setup` calls `init_parallel_state(...)`.
+- **Runtime scoping**: `OmniModel.set_module_parallel_states({name: ps})` +
+  `_module_scope(name)` wrap each node's forward/generate in
+  `use_parallel_state(ps)`, so the free function `get_parallel_state()` read
+  inside the module (vocab-parallel `emb` all-reduce, MoE `ep` groups, DCP
+  checkpoint preprocessing) resolves to **that module's** mesh.
+- **ExtraParallel plan**: a module that shards a weight provides
+  `get_parallel_plan()` returning a `ParallelPlan(extra_parallel_plan={...})`
+  keyed by the dim name (e.g. `{"emb": {"embed_tokens.weight": Shard(0)}}` in
+  `modules/janus/text_encoder/parallel_plan.py`). The vocab-parallel embedding
+  lookup is `AllToAllEmbedding` (`veomni/ops/kernels/embed/`).
+- **`ep` double-append gotcha**: `AcceleratorConfig.__post_init__` always appends
+  an `ep` dim; because `OmniConfig.module_config` re-instantiates the accelerator,
+  a per-module config ends up with **two trailing `ep`** entries. `_setup` /
+  topology comparison run `_dedup_extra_parallel(acc)` first to collapse the
+  duplicate (a genuine `emb`+`ep` layout is preserved). If you add a new extra
+  dim, never assume the raw `extra_parallel_*` lists are dedup'd.
+- **Heterogeneous grad clip**: a single `clip_grad_norm_` over
+  `OmniModel.parameters()` fails (mixed DTensor + plain Tensor). `OmniTrainer`
+  uses `_omni_clip_grad_norm`, which reduces each module's pᵗʰ-power over the
+  right group for its topology (FSDP2 → `fsdp_group`; FSDP2+ExtraParallel →
+  `{p}_fsdp` then `{p}`; DDP → no reduce, already all-reduced), combines into one
+  global norm, then clips with the shared coefficient.
+
+DDP specifics:
+
+- **Build**: `parallelize_model_ddp` (`torch_parallelize.py`) materialises +
+  loads full weights **before** `DDP(...)` wrapping under meta-init (DDP neither
+  materialises meta params nor loads weights — it only replicates + hooks grad
+  sync). FSDP2 does this internally (sharded load); DDP needs the explicit step.
+- **Dispatch**: `DistributedDataParallel` does **not** proxy attribute access, so
+  `OmniModuleTrainer.forward` / `on_step_end` must `_unwrap_module(self.base.model)`
+  to reach `pre_forward` / `post_forward` / `trace_collect`, while still calling
+  the **wrapper** for the actual forward so DDP/FSDP hooks fire. FSDP2 is
+  in-place (`raw is wrapper`); DDP wraps (`raw = wrapper.module`).
+
+Inference side (`OmniInferencer`):
+
+- A module needs a distributed (torchrun) launch when its inference `fsdp_mode`
+  is **non-eager** — `_module_needs_distributed` (`omni_inferencer.py`) returns
+  True for `fsdp2` / `ddp`, False for `eager` (the default from
+  `OmniConfig._resolve_default_accelerator`). `OmniInferencer` auto-`_setup()`s
+  the process group when any module needs it, and builds a per-module
+  `ParallelState` for each non-eager module (same `_module_scope` runtime
+  scoping as training).
+- Eager modules load via `from_pretrained(device_map=...)`. Single-process →
+  `device_map="auto"`; under a distributed launch each rank pins a **full
+  replica to its own device** (`{"": "<device>:<local_rank>"}`) — `"auto"` would
+  make every rank fan a copy across all GPUs and clash.
+- Ship two `modules_infer_*.yaml` (distributed vs all-eager) and pick via
+  `--infer.modules`. Launcher scripts: `infer_fsdp_{i2t,t2i}.sh` (torchrun),
+  `infer_eager_{i2t,t2i}.sh` (`python`).
+
 ## Phase 6 — Validate
 
 Run all four checks in order. Failing any one means stop and fix before continuing.
@@ -567,6 +653,11 @@ Visual sanity:
 - **Looking up `raw_batch["input_ids"]` at OmniModel entry**: V2 entry-time raw_batch contains only `conversation_list`. `input_ids` is produced by `text_encoder.forward` later in the pipeline — modules consuming `input_ids` (e.g. backbone splice) must depend on edges that route `text_encoder`'s output, not raw_batch directly.
 - **Backbone scanning `input_ids` for placeholder positions**: V2 backbone splice is segment-order driven — iterate the split conversation_list (output of text_encoder) and replace each modality segment's placeholder embedding with N patch tokens. Don't add `image_pos` / `und_image_pos` index fields (V1 leftover).
 - **Putting chat templating / tokenization into `multimodal_transform.py`**: in V2, that file does basic IO + resize only. Chat template + tokenize live in `text_encoder.forward` (per family). Image processing lives in vision encoder modules. Putting them in the data layer breaks model-agnostic data.
+- **Building a per-module mesh from the raw accelerator without dedup**: `OmniConfig.module_config` re-instantiates the accelerator, so `AcceleratorConfig.__post_init__` appends a **second** `ep` dim. Always `_dedup_extra_parallel(acc)` before `init_parallel_state` / topology comparison (see Per-module parallelism). Double-`ep` will build a broken mesh.
+- **Accessing OmniModule hooks through a DDP wrapper**: `DistributedDataParallel` doesn't proxy attribute access — `self.base.model.pre_forward` raises `AttributeError`. Use `_unwrap_module(...)` for hooks/methods and call the wrapper only for the actual forward (FSDP2 is in-place; DDP needs unwrap).
+- **Per-module clip with `clip_grad_norm_` over `OmniModel.parameters()`**: fails on mixed DTensor (FSDP2) + plain Tensor (DDP). Use `_omni_clip_grad_norm` (per-topology reduce → global norm → shared coefficient).
+- **`device_map="auto"` for eager inference under torchrun**: every rank fans its own copy across all GPUs → clashes / OOM. Pin a full replica to the rank's device (`{"": "<device>:<local_rank>"}`) when `dist.is_initialized()`.
+- **Forgetting `infer.modules` defaults to eager**: a module only goes distributed (FSDP2/`emb`/`ddp`) for inference if its `modules_infer_*.yaml` `accelerator` block opts in; otherwise `OmniConfig._resolve_default_accelerator` forces `fsdp_mode: eager` (single-process replica).
 
 ## When to use this skill vs. siblings
 

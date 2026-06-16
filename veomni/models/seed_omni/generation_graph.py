@@ -101,8 +101,9 @@ See also
 ``training_graph.py``  — DAG view driven by ``OmniConfig.training_graph``.
 """
 
+from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, ContextManager, Dict, List, Optional
 
 from .graph import (
     EdgeDef,
@@ -328,6 +329,7 @@ class GenerationGraph:
         ctx: Dict[str, Any],
         trace: Optional[List[str]] = None,
         generation_kwargs: Optional[Dict[str, Any]] = None,
+        scope_fn: Optional[Callable[[str], ContextManager]] = None,
     ) -> Dict[str, Any]:
         """Execute one iteration of the current state.
 
@@ -429,7 +431,11 @@ class GenerationGraph:
                 raise AttributeError(f"FSM node '{node_name}': {type(module).__name__} has no method '{method_name}'.")
             if trace is not None:
                 trace.append(f"[State|{state.name}] {node_name}: {node.module}.{method_name}")
-            out = method_fn(**ctx, generation_kwargs=generation_kwargs)
+            # Optional per-module scope (e.g. make this module's ParallelState
+            # current so Extra Parallel groups resolve correctly).
+            module_context = scope_fn(node.module) if scope_fn is not None else nullcontext()
+            with module_context:
+                out = method_fn(**ctx, generation_kwargs=generation_kwargs)
             if not isinstance(out, dict):
                 raise TypeError(f"FSM node '{node_name}'.{method_name} must return a dict; got {type(out).__name__}.")
             if isinstance(module, ModuleMixin):

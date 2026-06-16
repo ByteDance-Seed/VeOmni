@@ -40,4 +40,4 @@ torchrun \
   --nnodes=$NNODES \
   --nproc-per-node=$NPROC_PER_NODE \
   --node-rank=$NODE_RANK \
-  $additional_args $@ 2>&1 | tee log.txt
+  $additional_args "$@" 2>&1 | tee log.txt

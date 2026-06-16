@@ -80,11 +80,13 @@ spans (e.g. Janus T2I's 576-step ``image_vq`` loop).  Rank-0 gating is
 handled by the logger.
 """
 
+from contextlib import nullcontext
 from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Tuple
 
 import torch
 import torch.nn as nn
 
+from ...distributed.parallel_state import use_parallel_state
 from ...utils import helper
 from .configuration_omni import OmniConfig
 from .generation_graph import GenerationGraph
@@ -195,6 +197,12 @@ class OmniModel(nn.Module):
         # list and never persisted back onto ``ctx``.
         self._generated: List[Dict[str, Any]] = []
 
+        # ``{module_name: ParallelState}`` — set by the trainer so each node's
+        # forward runs under its module's own device mesh / extra-parallel
+        # groups (see :meth:`set_module_parallel_states`).  Empty by default so
+        # the runtime stays importable without a trainer (the print-flow tests).
+        self._module_parallel_states: Dict[str, Any] = {}
+
         # Prime per-request inference runtime state (FSM at its initial
         # state).  :meth:`generate` deliberately does NOT reset, so a future
         # multi-turn conversation can keep cache across turns and only wipe
@@ -220,6 +228,28 @@ class OmniModel(nn.Module):
         ``{"type": "image", "value": PIL.Image}``.  Not mirrored on ``ctx``.
         """
         return list(self._generated)
+
+    def set_module_parallel_states(self, module_parallel_states: Mapping[str, Any]) -> None:
+        """Register ``{module_name: ParallelState}`` for per-node forward scoping.
+
+        Called by :class:`~veomni.trainer.omni_trainer.OmniTrainer` after the
+        modules are built so each node's pre/forward/post runs under its own
+        module's device mesh / extra-parallel groups — needed when modules use
+        different parallelism (e.g. a vocab-parallel ``emb`` embedding whose
+        forward all-reduces over the ``emb`` group, or an EP MoE module whose
+        kernels read ``get_parallel_state().ep_group``).
+        """
+        self._module_parallel_states = dict(module_parallel_states)
+
+    def _module_scope(self, module_name: str):
+        """Context manager scoping ``module_name``'s ParallelState as current.
+
+        Used by both training ``forward`` and the inference ``generate`` FSM
+        (passed as ``scope_fn`` to :meth:`GenerationGraph.step`).  No-op when no
+        per-module states are registered (e.g. eager single-process inference).
+        """
+        ps = self._module_parallel_states.get(module_name)
+        return use_parallel_state(ps) if ps is not None else nullcontext()
 
     # ── Training ──────────────────────────────────────────────────────────────
 
@@ -277,19 +307,27 @@ class OmniModel(nn.Module):
 
             kwargs = self.training_graph.collect_inputs(node_name, node_outputs, batch)
 
-            # The training-graph path always runs through the trainer-injected
-            # per-module executor (``OmniModuleTrainer.forward``: pre_forward →
-            # method → post_forward + per-module trace meter). Inference never
-            # reaches here — it goes through ``generate`` / the generation graph.
+            # The training-graph path runs through the trainer-injected per-module
+            # executor (``OmniModuleTrainer.forward``: pre_forward → method →
+            # post_forward + per-module trace meter) when available.  When no
+            # executors are registered (print-flow tests, trainer-free contexts),
+            # fall back to inline pre/forward/post.  Inference never reaches here
+            # — it goes through ``generate`` / the generation graph.
+            #
+            # Scope each node to its module's ParallelState so the free function
+            # ``get_parallel_state()`` (read inside pre/forward/post — e.g. the
+            # vocab-parallel ``emb`` embedding all-reduce, MoE EP groups) resolves
+            # to this module's mesh. No-op when no per-module states are registered.
             executor = None if self._node_executors is None else self._node_executors.get(module_name)
-            if executor is None:
-                module = getattr(self, module_name)
-                call_kwargs = module.pre_forward(method, **kwargs)
-                fn = module if method == "forward" else getattr(module, method)
-                outputs = fn(**call_kwargs)
-                out = module.post_forward(method, **outputs)
-            else:
-                out = executor(method, **kwargs)
+            with self._module_scope(module_name):
+                if executor is None:
+                    module = getattr(self, module_name)
+                    call_kwargs = module.pre_forward(method, **kwargs)
+                    fn = module if method == "forward" else getattr(module, method)
+                    outputs = fn(**call_kwargs)
+                    out = module.post_forward(method, **outputs)
+                else:
+                    out = executor(method, **kwargs)
 
             node_outputs[node_name] = out
 
@@ -452,7 +490,9 @@ class OmniModel(nn.Module):
 
         while not self.generation_graph.is_done() and total_steps < max_new_tokens:
             self._emit_progress(total_steps)
-            ctx = self.generation_graph.step(modules, ctx, trace=trace, generation_kwargs=generation_kwargs)
+            ctx = self.generation_graph.step(
+                modules, ctx, trace=trace, generation_kwargs=generation_kwargs, scope_fn=self._module_scope
+            )
             total_steps += 1
             self._collect_generated(ctx, trace)
             self.generation_graph.maybe_transition(ctx, trace=trace)

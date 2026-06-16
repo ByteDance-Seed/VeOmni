@@ -1,0 +1,25 @@
+# Per-module INFERENCE overrides for Qwen3-30B-A3B (MoE) — distributed FSDP2 + EP.
+#
+# Mirrors the training topology: the backbone shards experts over the `ep` group
+# (fsdp2 + Expert Parallel) and the text encoder runs plain FSDP2. Requires a
+# torchrun launch (>= 8 GPUs; ep must divide world size and num_experts=128).
+# `OmniInferencer` auto-detects the non-eager modules and initialises the process
+# group; the per-module forward runs under its own ParallelState so the fused
+# MoE kernel takes the EP all-to-all path.
+qwen3_text_encoder:
+  model:
+    model_path: qwen3_text_encoder
+  accelerator:
+    fsdp_config:
+      fsdp_mode: fsdp2
+
+qwen3_moe_llm:
+  model:
+    model_path: qwen3_moe_llm
+  accelerator:
+    fsdp_config:
+      fsdp_mode: fsdp2
+    # Mirror the training EP degree (modules_train.yaml). Must divide the world
+    # size and num_experts (128).
+    ep_size: 4
+    ep_outside: false
