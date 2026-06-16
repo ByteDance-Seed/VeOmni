@@ -577,7 +577,7 @@ def test_bagel_train_plus_infer_merges_generation_graph(infer_graph: str):
     cfg = _load_omni_config(
         modules_path=_bagel_cfg_dir() / "modules_train.yaml",
         train_graph_path=_bagel_cfg_dir() / "graph_train.yaml",
-        infer_modules=_bagel_cfg_dir() / "modules_infer.yaml",
+        infer_modules=_bagel_cfg_dir() / "modules_infer_eager.yaml",
         infer_graph_path=_bagel_cfg_dir() / infer_graph,
     )
     assert set(cfg.modules) == {
@@ -762,7 +762,7 @@ def test_bagel_interleave_image_branch_signal_smoke():
     cfg = _load_omni_config(
         modules_path=_bagel_cfg_dir() / "modules_train.yaml",
         train_graph_path=_bagel_cfg_dir() / "graph_train.yaml",
-        infer_modules=_bagel_cfg_dir() / "modules_infer.yaml",
+        infer_modules=_bagel_cfg_dir() / "modules_infer_eager.yaml",
         infer_graph_path=_bagel_cfg_dir() / "graph_infer_interleave.yaml",
     )
     model = OmniModel(

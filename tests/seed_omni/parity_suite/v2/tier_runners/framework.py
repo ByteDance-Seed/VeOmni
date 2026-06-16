@@ -135,8 +135,26 @@ def run_v2_train_framework_batch(
     return {"observations": observations, "ctx": {"loss": loss, "losses": loss_dict}, "trace": ["train:framework"]}
 
 
+def _single_rank_ddp_parallel_state() -> parallel_state_module.ParallelState:
+    return parallel_state_module.ParallelState(dp_mode="ddp")
+
+
+def build_stub_module_trainer(module: nn.Module) -> OmniModuleTrainer:
+    """Minimal module-trainer stub for local framework policies."""
+
+    module_trainer = OmniModuleTrainer.__new__(OmniModuleTrainer)
+    module_trainer.base = BaseTrainer.__new__(BaseTrainer)
+    module_trainer.base.model = module
+    module_trainer.parallel_state = _single_rank_ddp_parallel_state()
+    return module_trainer
+
+
+def build_module_trainers(model: OmniModel) -> dict[str, OmniModuleTrainer]:
+    return {name: build_stub_module_trainer(module) for name, module in model.modules_dict.items()}
+
+
 def build_minimal_omni_trainer(model: OmniModel, *, device: torch.device, dtype: torch.dtype) -> OmniTrainer:
-    """Create only the trainer state needed by ``forward_backward_step``."""
+    """Create only the trainer state needed by ``forward_backward_step`` / ``train_step``."""
 
     trainer = OmniTrainer.__new__(OmniTrainer)
     base = BaseTrainer.__new__(BaseTrainer)
@@ -154,19 +172,14 @@ def build_minimal_omni_trainer(model: OmniModel, *, device: torch.device, dtype:
     base.model_fwd_context = autocast_for_dtype(device, dtype)
     base.model_bwd_context = nullcontext()
     trainer.base = base
+    trainer.module_trainers = build_module_trainers(model)
     return trainer
 
 
 def build_trainer_node_executors(model: OmniModel) -> dict[str, Any]:
     """Bind graph nodes to ``OmniModuleTrainer.forward`` without full trainer setup."""
 
-    executors: dict[str, Any] = {}
-    for name, module in model.modules_dict.items():
-        module_trainer = OmniModuleTrainer.__new__(OmniModuleTrainer)
-        module_trainer.base = BaseTrainer.__new__(BaseTrainer)
-        module_trainer.base.model = module
-        executors[name] = module_trainer.forward
-    return executors
+    return {name: build_stub_module_trainer(module).forward for name, module in model.modules_dict.items()}
 
 
 def _run_train_step_policy(
@@ -830,6 +843,7 @@ class _CheckpointModuleTrainer:
         self.base.optimizer = optimizer
         self.base.lr_scheduler = lr_scheduler
         self.base.args = args
+        self.parallel_state = _single_rank_ddp_parallel_state()
         self.callback = OmniModuleDcpCallback(self.base, name)
 
     def on_train_begin(self, state: TrainerState) -> None:

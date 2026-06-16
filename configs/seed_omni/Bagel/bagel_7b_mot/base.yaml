@@ -77,7 +77,7 @@ train:
 
 infer:
   model_path: /mnt/hdfs/user_dir/veomni_omni/models/seed_omni/BAGEL-7B-MoT
-  modules: configs/seed_omni/Bagel/bagel_7b_mot/modules_infer.yaml
+  modules: configs/seed_omni/Bagel/bagel_7b_mot/modules_infer_eager.yaml
   infer_graph:
     infer_edit: configs/seed_omni/Bagel/bagel_7b_mot/graph_infer_edit.yaml
     infer_gen: configs/seed_omni/Bagel/bagel_7b_mot/graph_infer_gen.yaml

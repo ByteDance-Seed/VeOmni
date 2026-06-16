@@ -59,9 +59,15 @@ Normal reference handlers must return the suite contract defined in ``reference/
 
 Future models such as Janus should implement reference loading plus reference handlers that return this shape, then define ``build_{kind}_request`` hook methods keyed by ``reference.kind``.
 
-For training parity, graph and current module-tier runs execute through SeedOmni graph nodes and invoke `pre_forward` / `post_forward` hooks. The current module tier is node-level parity, not a bare packed-tensor module API test. Bare model-internal packer checks should live in model-specific unit tests outside shared suite flow.
+## Tier Boundaries
 
-Framework-tier training checks are V2 runtime policy checks by default. They validate trainer behavior, optimizer and scheduler updates, checkpointing, distributed/FSDP execution, and data health. They should not compare to an official oracle unless a case explicitly keeps reference capture enabled and declares probes for that purpose.
+Module tier is the local module-behavior tier. It may use lazy module loading and CPU offload so only the active module is resident on the target device while the carrier stays materialized between nodes. Inference module-tier runs validate per-node FSM behavior. Training module-tier runs validate forward/loss behavior through module `pre_forward` / call / `post_forward` hooks, but they do not own training gradient parity.
+
+Graph tier is the eager graph-oracle tier. For training, a graph-tier parity case is meaningful when both the independent reference and the V2 `OmniModel.forward()` graph can run as an eager reference path and compare the selected loss and gradient probes. Graph tier validates graph dispatch, carrier mutation, loss aggregation, and graph-level backward semantics against the reference. It is not a scalability guarantee for models whose reference or V2 graph cannot fit in eager form.
+
+Framework tier is the trainer and distributed-training tier. It validates `OmniTrainer`, optimizer and scheduler updates, clipping, checkpointing, data health, and FSDP/HSDP behavior. When an eager graph oracle is runnable, framework policies may compare trainer/FSDP results to that direct graph baseline. For models that are too large for eager graph/reference execution, training parity should be defined directly at the framework/distributed level against a sharded or otherwise low-memory reference path rather than forcing graph tier to become an FSDP test.
+
+Bare model-internal packer checks should live in model-specific unit tests outside shared suite flow.
 
 ## Running Cases
 

@@ -1,0 +1,39 @@
+# Per-module INFERENCE overrides for BAGEL-7B-MoT — distributed FSDP2.
+#
+# Requires a torchrun launch. Every module runs under FSDP2; no heterogeneous
+# EP/MoE inference topology for Bagel at this stage.
+
+bagel_text_encoder:
+  model:
+    model_path: bagel_text_encoder
+  accelerator:
+    fsdp_config:
+      fsdp_mode: fsdp2
+
+bagel_siglip_navit:
+  model:
+    model_path: bagel_siglip_navit
+  accelerator:
+    fsdp_config:
+      fsdp_mode: fsdp2
+
+bagel_vae:
+  model:
+    model_path: bagel_vae
+  accelerator:
+    fsdp_config:
+      fsdp_mode: fsdp2
+
+bagel_flow_connector:
+  model:
+    model_path: bagel_flow_connector
+  accelerator:
+    fsdp_config:
+      fsdp_mode: fsdp2
+
+bagel_qwen2_mot:
+  model:
+    model_path: bagel_qwen2_mot
+  accelerator:
+    fsdp_config:
+      fsdp_mode: fsdp2
