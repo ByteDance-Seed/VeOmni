@@ -144,4 +144,65 @@ class AllToAllEmbedding(torch.autograd.Function):
         return None, None, grad_embedding_table
 
 
-__all__ = ["AllToAllEmbedding"]
+class VocabParallelLinear(torch.autograd.Function):
+    """Tied-embedding output projection when the vocab is sharded over the ``emb`` group.
+
+    Symmetric to :class:`AllToAllEmbedding`: each ``emb`` rank owns a contiguous
+    vocabulary shard ``weight`` of shape ``[vocab // emb_size, hidden]`` (the
+    hidden dim is already reconstructed by the caller's ``full_tensor()``). To
+    produce full-vocab logits for this rank's tokens, the shards are all-gathered
+    over the ``emb`` group (concatenated in rank order to match the ``Shard(0)``
+    vocab layout) into the full ``[vocab, hidden]`` weight and projected locally.
+
+    Backward computes the full-vocab weight grad from this rank's tokens, then
+    reduce-scatters it over the ``emb`` group so each rank keeps only its own
+    chunk's (cross-rank summed) grad — mirroring the embedding's grad routing, so
+    the local shard's gradient is complete without a separate all-reduce.
+    """
+
+    @staticmethod
+    def forward(ctx, group: "dist.ProcessGroup", hidden: torch.Tensor, weight: torch.Tensor):
+        emb_size = dist.get_world_size(group) if group else 1
+        if group and emb_size > 1:
+            gathered = [torch.empty_like(weight) for _ in range(emb_size)]
+            dist.all_gather(gathered, weight.contiguous(), group=group)
+            weight_full = torch.cat(gathered, dim=0)
+        else:
+            weight_full = weight
+
+        logits = torch.nn.functional.linear(hidden, weight_full)
+
+        ctx.save_for_backward(hidden, weight_full)
+        ctx.group = group
+        ctx.emb_size = emb_size
+        ctx.vocab_local = weight.shape[0]
+        return logits
+
+    @staticmethod
+    def backward(ctx, grad_logits: torch.Tensor):
+        hidden, weight_full = ctx.saved_tensors
+        group = ctx.group
+        emb_size = ctx.emb_size
+
+        gl = grad_logits.reshape(-1, grad_logits.shape[-1])
+        h = hidden.reshape(-1, hidden.shape[-1])
+
+        grad_hidden = (gl @ weight_full).view_as(hidden)
+        grad_weight_full = gl.transpose(0, 1) @ h  # [vocab, hidden]
+
+        if group and emb_size > 1:
+            grad_weight_local = torch.empty(
+                ctx.vocab_local,
+                grad_weight_full.shape[1],
+                dtype=grad_weight_full.dtype,
+                device=grad_weight_full.device,
+            )
+            dist.reduce_scatter_tensor(grad_weight_local, grad_weight_full.contiguous(), group=group)
+        else:
+            grad_weight_local = grad_weight_full
+
+        # Gradients for (group, hidden, weight)
+        return None, grad_hidden, grad_weight_local
+
+
+__all__ = ["AllToAllEmbedding", "VocabParallelLinear"]
