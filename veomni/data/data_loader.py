@@ -13,6 +13,7 @@
 # limitations under the License.
 
 
+import math
 from typing import Any, Callable, Dict, Literal, Optional
 
 import torch
@@ -73,6 +74,7 @@ def build_native_dataloader(
     dyn_bsz: bool = True,
     dyn_bsz_runtime: Literal["main", "worker"] = "main",
     dyn_bsz_count_mode: Literal["total", "effective"] = "total",
+    dyn_bsz_physical_overflow_ratio: float = 1.5,
     dyn_bsz_dataset_save_by_idx: bool = False,  # Whether to save dynamic-batching buffers by index for worker-side checkpoint/resume.
     dyn_bsz_buffer_size: int = 200,
     num_workers: int = 8,
@@ -167,8 +169,16 @@ def build_native_dataloader(
         )
         dyn_bsz_collate_fn = collate_fn
         dyn_bsz_length_fn = get_length_fn_by_count_mode(dyn_bsz_count_mode)
-        physical_token_cap = batching_token_len if dyn_bsz_count_mode == "effective" else None
-        dyn_bsz_physical_length_fn = get_length_by_attention_mask_fn if dyn_bsz_count_mode == "effective" else None
+        if dyn_bsz_count_mode == "effective":
+            if dyn_bsz_physical_overflow_ratio < 1.0:
+                raise ValueError(
+                    f"dyn_bsz_physical_overflow_ratio must be >= 1.0, got {dyn_bsz_physical_overflow_ratio}."
+                )
+            physical_token_cap = math.ceil(batching_token_len * dyn_bsz_physical_overflow_ratio)
+            dyn_bsz_physical_length_fn = get_length_by_attention_mask_fn
+        else:
+            physical_token_cap = None
+            dyn_bsz_physical_length_fn = None
         if dyn_bsz_runtime == "main":
             batching_strategy = TextBatchingStrategy(
                 token_micro_bsz=batching_token_len,

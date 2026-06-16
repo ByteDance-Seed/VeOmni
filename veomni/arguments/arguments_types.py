@@ -475,8 +475,19 @@ class TrainingArguments:
                 "How dynamic batching counts tokens when packing a micro batch. "
                 "'total' (default, legacy) sums attention_mask; 'effective' sums "
                 "only loss-contributing tokens (labels != IGNORE_INDEX), which "
-                "balances effective tokens across DP ranks at the cost of slightly "
-                "more padding."
+                "balances effective tokens across DP ranks at the cost of allowing "
+                "controlled physical-token overflow."
+            )
+        },
+    )
+    dyn_bsz_physical_overflow_ratio: float = field(
+        default=1.5,
+        metadata={
+            "help": (
+                "Physical-token cap multiplier used when dyn_bsz_count_mode='effective'. "
+                "The cap is ceil(micro_batch_size * max_seq_len * ratio), so values "
+                "> 1.0 let effective-token batching differ from total-token batching "
+                "while still bounding prompt-heavy micro batches."
             )
         },
     )
@@ -548,6 +559,11 @@ class TrainingArguments:
     checkpoint: CheckpointConfig = field(default_factory=CheckpointConfig)
 
     def __post_init__(self):
+        if self.dyn_bsz_physical_overflow_ratio < 1.0:
+            raise ValueError(
+                f"dyn_bsz_physical_overflow_ratio must be >= 1.0, got {self.dyn_bsz_physical_overflow_ratio}."
+            )
+
         self._train_steps = -1
         self.local_rank = int(os.getenv("LOCAL_RANK", 0))
         self.global_rank = int(os.getenv("RANK", 0))

@@ -208,6 +208,7 @@ def main():
         train_steps=args.train_steps,
         dyn_bsz=args.train.dyn_bsz,
         dyn_bsz_count_mode=args.train.dyn_bsz_count_mode,
+        dyn_bsz_physical_overflow_ratio=args.train.dyn_bsz_physical_overflow_ratio,
         bsz_warmup_ratio=args.train.bsz_warmup_ratio,
         dyn_bsz_buffer_size=args.data.dyn_bsz_buffer_size,
         bsz_warmup_init_mbtoken=args.train.bsz_warmup_init_mbtoken,

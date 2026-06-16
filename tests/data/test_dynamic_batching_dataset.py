@@ -371,6 +371,30 @@ def test_text_batching_strategy_effective_count_mode():
     assert sum(batch_sample["attention_mask"].sum().item() for batch_sample in effective_batch) == 8
 
 
+def test_text_batching_strategy_effective_mode_can_overflow_total_budget_with_larger_physical_cap():
+    strategy = TextBatchingStrategy(
+        token_micro_bsz=4,
+        buffer_size=1,
+        get_length_fn=get_length_by_labels_fn,
+        physical_token_cap=6,
+        get_physical_length_fn=get_length_by_attention_mask_fn,
+    )
+    samples = [
+        _make_sample(token_id=1, total_tokens=3, effective_tokens=2),
+        _make_sample(token_id=2, total_tokens=3, effective_tokens=2),
+        _make_sample(token_id=3, total_tokens=3, effective_tokens=2),
+    ]
+
+    for sample in samples:
+        strategy.put_item(sample)
+
+    micro_batch = strategy.get_micro_batch(step=0)
+
+    assert [sample["input_ids"][0].item() for sample in micro_batch] == [1, 2]
+    assert sum(sample["labels"].ne(IGNORE_INDEX).sum().item() for sample in micro_batch) == 4
+    assert sum(sample["attention_mask"].sum().item() for sample in micro_batch) == 6
+
+
 def test_text_batching_strategy_effective_mode_honors_physical_cap():
     strategy = TextBatchingStrategy(
         token_micro_bsz=4,
@@ -394,6 +418,33 @@ def test_text_batching_strategy_effective_mode_honors_physical_cap():
     assert sum(sample["attention_mask"].sum().item() for sample in micro_batch) == 8
     assert strategy.buffer.all_token_cnt == 2
     assert strategy.buffer.all_physical_token_cnt == 6
+
+
+def test_dynamic_batching_size_dataset_effective_mode_can_overflow_total_budget_with_larger_physical_cap():
+    class PromptHeavyDataset(IterableDataset):
+        def __iter__(self):
+            for sample in [
+                _make_sample(token_id=1, total_tokens=3, effective_tokens=2),
+                _make_sample(token_id=2, total_tokens=3, effective_tokens=2),
+                _make_sample(token_id=3, total_tokens=3, effective_tokens=2),
+            ]:
+                yield sample
+
+    dynamic_ds = DynamicBatchingSizeDataset(
+        dataset=PromptHeavyDataset(),
+        micro_batch_seq_length=4,
+        ready_for_micro_batch_threshold=1,
+        dynamic_batching_collate_fn=lambda samples: samples,
+        get_length_fn=get_length_by_labels_fn,
+        physical_token_cap=6,
+        get_physical_length_fn=get_length_by_attention_mask_fn,
+        save_by_idx=False,
+    )
+
+    micro_batches = list(dynamic_ds)
+
+    assert [[sample["input_ids"][0].item() for sample in batch] for batch in micro_batches] == [[1, 2], [3]]
+    assert [sum(sample["attention_mask"].sum().item() for sample in batch) for batch in micro_batches] == [6, 3]
 
 
 def test_dynamic_batching_size_dataset_effective_mode_honors_physical_cap():
@@ -631,6 +682,7 @@ class TrainerTest(BaseTrainer):
             dyn_bsz=args.train.dyn_bsz,
             dyn_bsz_runtime=args.train.dyn_bsz_runtime,
             dyn_bsz_count_mode=args.train.dyn_bsz_count_mode,
+            dyn_bsz_physical_overflow_ratio=args.train.dyn_bsz_physical_overflow_ratio,
             dyn_bsz_buffer_size=args.data.dyn_bsz_buffer_size,
             dyn_bsz_dataset_save_by_idx=self.save_by_idx,
             seed=args.train.seed,

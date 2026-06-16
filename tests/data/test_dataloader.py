@@ -141,10 +141,81 @@ def test_build_dataloader_dyn_bsz_count_mode(
         assert isinstance(dl, DynamicBatchSizeDataLoader)
         assert isinstance(dl.batching_strategy, TextBatchingStrategy)
         assert dl.batching_strategy.buffer._get_length_fn is m_ds.get_length_by_labels_fn
-        assert dl.batching_strategy.physical_token_cap == 32
+        assert dl.batching_strategy.physical_token_cap == 48
         assert dl.batching_strategy.buffer._get_physical_length_fn is m_ds.get_length_by_attention_mask_fn
     else:
         assert isinstance(dl.dataset, m_ds.DynamicBatchingSizeDataset)
         assert dl.dataset.get_length_fn is m_ds.get_length_by_labels_fn
-        assert dl.dataset.physical_token_cap == 32
+        assert dl.dataset.physical_token_cap == 48
         assert dl.dataset.get_physical_length_fn is m_ds.get_length_by_attention_mask_fn
+
+
+def test_build_dataloader_dyn_bsz_physical_overflow_ratio(monkeypatch, dummy_dataset_ci):
+    import veomni.data.data_loader as m_dl
+    import veomni.data.dataset as m_ds
+
+    ps = _fake_ps(sp_size=1)
+    monkeypatch.setattr(m_dl, "get_parallel_state", lambda: ps)
+    monkeypatch.setattr(m_ds, "get_parallel_state", lambda: ps)
+
+    dataset = build_dataset(
+        dataset_name="iterable",
+        train_path=dummy_dataset_ci.save_path,
+        transform=partial(process_dummy_example, max_seq_len=16),
+        seed=0,
+    )
+    dl = build_dataloader(
+        "native",
+        dataset=dataset,
+        micro_batch_size=2,
+        global_batch_size=4,
+        dataloader_batch_size=1,
+        max_seq_len=16,
+        train_steps=1,
+        num_workers=0,
+        dyn_bsz=True,
+        dyn_bsz_runtime="main",
+        dyn_bsz_count_mode="effective",
+        dyn_bsz_physical_overflow_ratio=1.25,
+        dyn_bsz_buffer_size=1,
+        drop_last=True,
+        prefetch_factor=None,
+        seed=0,
+    )
+
+    assert dl.batching_strategy.physical_token_cap == 40
+
+
+def test_build_dataloader_rejects_invalid_physical_overflow_ratio(monkeypatch, dummy_dataset_ci):
+    import veomni.data.data_loader as m_dl
+    import veomni.data.dataset as m_ds
+
+    ps = _fake_ps(sp_size=1)
+    monkeypatch.setattr(m_dl, "get_parallel_state", lambda: ps)
+    monkeypatch.setattr(m_ds, "get_parallel_state", lambda: ps)
+
+    dataset = build_dataset(
+        dataset_name="iterable",
+        train_path=dummy_dataset_ci.save_path,
+        transform=partial(process_dummy_example, max_seq_len=16),
+        seed=0,
+    )
+    with pytest.raises(ValueError, match="dyn_bsz_physical_overflow_ratio must be >= 1.0"):
+        build_dataloader(
+            "native",
+            dataset=dataset,
+            micro_batch_size=2,
+            global_batch_size=4,
+            dataloader_batch_size=1,
+            max_seq_len=16,
+            train_steps=1,
+            num_workers=0,
+            dyn_bsz=True,
+            dyn_bsz_runtime="main",
+            dyn_bsz_count_mode="effective",
+            dyn_bsz_physical_overflow_ratio=0.5,
+            dyn_bsz_buffer_size=1,
+            drop_last=True,
+            prefetch_factor=None,
+            seed=0,
+        )
