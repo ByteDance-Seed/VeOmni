@@ -599,6 +599,63 @@ def parallelize_model_fsdp2(
     return model
 
 
+def parallelize_model_ddp(
+    model: "nn.Module",
+    weights_path: Optional[Union[str, Mapping[str, str]]] = None,
+    **kwargs,
+) -> "nn.Module":
+    """Apply DDP (replicated) data parallelism to the model.
+
+    DDP keeps a **full replica of plain
+    tensors** per rank: :class:`~torch.nn.parallel.DistributedDataParallel` only
+    registers gradient-sync hooks and broadcasts rank-0's params at construction.
+    It does **not** materialise meta-init params nor load weights — so under the
+    meta-init flow we must materialise + load the full weights *before* wrapping;
+    DDP then broadcasts the loaded rank-0 weights to every rank.
+
+    Args:
+        weights_path: One of three forms:
+            * ``None`` — random init (``to_empty + init_weights``).
+            * ``str`` — single HF snapshot path; loads the entire ``model``.
+              All existing single-model trainers (BaseTrainer / VLMTrainer /
+              TextTrainer / DiTTrainer) hit this branch.
+            * ``Mapping[str, str]`` — ``{sub_module_name: snapshot_path}``,
+              keyed by the model's direct ``named_children()`` names.
+              **Strict bijection** — every direct child must appear as a
+              key, every key must name a direct child; mismatches raise
+              ``KeyError``.  Each named child is loaded from its own
+              snapshot via the same loader the ``str`` branch uses.
+              Used by V2 OmniModel (D2.3), where each declared sub-module
+              owns its own HF folder.  Incompatible with
+              ``is_peft_model=True`` — raises ``NotImplementedError``.
+            loaded as full tensors (no DTensor sharding).
+    """
+    parallel_state = get_parallel_state()
+
+    # Under meta-init the params are still on `meta` here; DDP wrapping neither
+    # materialises them nor loads weights, so do it now (full-tensor load).
+    if kwargs.get("init_device") == "meta":
+        from torch.distributed.tensor import distribute_tensor
+
+        _apply_weights_load_step(
+            model=model,
+            weights_path=weights_path,
+            materialize_device=get_device_type(),
+            broadcast_from_rank0=bool(kwargs.get("broadcast_model_weights_from_rank0")),
+            is_peft_model=kwargs.get("is_peft_model", False),
+            adapter_path=kwargs.get("adapter_path", None),
+            cpu_load_param_name=kwargs.get("cpu_load_param_name", None),
+            max_load_broadcast_size=kwargs.get("max_load_broadcast_size", 20.0),
+            # DDP params are plain tensors (not DTensors), so this factory is
+            # never invoked by _dispatch_parameter; passed for signature parity
+            # with the FSDP2 path.
+            distribute_tensor_fn=distribute_tensor,
+            fqn_to_index_mapping=kwargs.get("fqn_to_index_mapping"),
+        )
+
+    return DDP(model, device_ids=[parallel_state.local_rank], process_group=parallel_state.dp_group)
+
+
 def build_parallelize_model(
     model: "nn.Module",
     weights_path: Optional[Union[str, Mapping[str, str]]] = None,
@@ -668,6 +725,6 @@ def build_parallelize_model(
                 **kwargs,
             )
         else:
-            model = DDP(model, device_ids=[parallel_state.local_rank], process_group=parallel_state.dp_group)
+            model = parallelize_model_ddp(model=model, weights_path=weights_path, **kwargs)
 
     return model

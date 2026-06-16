@@ -1,0 +1,32 @@
+---
+title: qwen3_30b_a3b_base — training
+---
+%%{init: {'flowchart': {'defaultRenderer': 'elk'}}}%%
+flowchart LR
+    data[(data)]:::io
+    subgraph col0 [ ]
+        direction TB
+        qwen3_text_encoder_encode["<i>qwen3_text_encoder.encode</i>"]:::source
+    end
+    subgraph col1 [ ]
+        direction TB
+        qwen3_moe_llm_forward["<i>qwen3_moe_llm.forward</i>"]:::middle
+    end
+    subgraph col2 [ ]
+        direction TB
+        qwen3_text_encoder_decode["<i>qwen3_text_encoder.decode</i>"]:::sink
+    end
+    end_sink(("end")):::end_sink
+    data -.-> qwen3_text_encoder_encode
+    qwen3_text_encoder_encode --> qwen3_moe_llm_forward
+    qwen3_moe_llm_forward --> qwen3_text_encoder_decode
+    qwen3_text_encoder_decode --> end_sink
+    style col0 fill:transparent,stroke:none
+    style col1 fill:transparent,stroke:none
+    style col2 fill:transparent,stroke:none
+    classDef source fill:#dff,stroke:#06c,stroke-width:2px
+    classDef sink fill:#fdd,stroke:#c06,stroke-width:2px
+    classDef both fill:#efe,stroke:#693,stroke-width:2px
+    classDef middle fill:#fff,stroke:#666
+    classDef io fill:#eef,stroke:#669,stroke-dasharray:3 3
+    classDef end_sink fill:#eee,stroke:#333,stroke-width:1px,stroke-dasharray:3 3

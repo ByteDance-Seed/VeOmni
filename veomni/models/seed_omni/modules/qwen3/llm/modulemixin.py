@@ -135,7 +135,11 @@ class Qwen3LlmModuleMixin(ModuleMixin):
                 position_ids
             )
 
-            outputs = self.forward(
+            # Call via ``__call__`` for FSDP2 pre-forward hook
+            # fires (lazy_init + unshard). Calling ``.forward``
+            # directly under FSDP inference skips lazy_init and the nested
+            # unshard crashes ('FSDPCommContext' has no all_gather_copy_in_stream).
+            outputs = self(
                 inputs_embeds=inputs_embeds,
                 attention_mask=attention_mask,
                 past_key_values=self._past_key_values,
@@ -163,7 +167,7 @@ class Qwen3LlmModuleMixin(ModuleMixin):
         inputs_embeds: torch.Tensor = tail_part.value[-1:].to(self.device)
         inputs_embeds = inputs_embeds.unsqueeze(0)
 
-        outputs = self.forward(
+        outputs = self(
             inputs_embeds=inputs_embeds,
             attention_mask=None,
             past_key_values=self._past_key_values,

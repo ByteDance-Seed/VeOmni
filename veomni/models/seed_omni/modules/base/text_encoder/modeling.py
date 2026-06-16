@@ -11,8 +11,11 @@ from typing import Any, Dict, Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.distributed.tensor import DTensor
 from transformers import PreTrainedModel
 
+from ......distributed.parallel_state import get_parallel_state
+from ......ops.kernels.embed import AllToAllEmbedding
 from .configuration import TextEncoderConfig
 from .modulemixin import TextEncoderModuleMixin, TextEncoderTraceMixin
 
@@ -22,7 +25,7 @@ class TextEncoder(TextEncoderModuleMixin, TextEncoderTraceMixin, PreTrainedModel
 
     config_class = TextEncoderConfig
     base_model_prefix = ""
-    _no_split_modules: list = []
+    _no_split_modules: list = ["Embedding", "Linear"]
     main_input_name = "input_ids"
     supports_gradient_checkpointing = True
 
@@ -82,10 +85,31 @@ class TextEncoder(TextEncoderModuleMixin, TextEncoderTraceMixin, PreTrainedModel
     ) -> Dict[str, Any]:
         del kwargs
         input_ids = input_ids.unsqueeze(0) if input_ids.dim() == 1 else input_ids
-        embeds = self.embed_tokens(input_ids)
+        embeds = self._embed_tokens(input_ids)
         return {
             "inputs_embeds": embeds.squeeze(0) if embeds.size(0) == 1 else embeds,
         }
+
+    def _embed_tokens(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """Embedding lookup, vocab-parallel-aware when ``emb`` extra-parallel is on.
+        Use AllToAllEmbedding to handle the vocab-parallel embedding.
+        """
+        ps = get_parallel_state()
+        if "emb" not in ps.extra_parallel_sizes or not ps.extra_parallel_enabled("emb"):
+            return self.embed_tokens(input_ids)
+
+        # Under ``emb`` extra-parallel the weight is sharded on dim-0 (vocab) by
+        # the parallel plan AND on dim-1 (hidden) by FSDP over the ``emb_fsdp``
+        # mesh. AllToAllEmbedding needs this emb-rank's FULL [vocab/emb_size,
+        # hidden] slice, so ``full_tensor()`` all-gathers the hidden shards over
+        # emb_fsdp (reconstructing the same emb-chunk — not mixing emb ranks).
+        weight = self.embed_tokens.weight
+        if isinstance(weight, DTensor):
+            # Inference (no grad): ``detach()`` first — full_tensor()'s redistribute
+            # hits an unsupported in-place ``detach_`` on a grad-requiring DTensor.
+            # Training: keep grad so AllToAllEmbedding's backward reaches the param.
+            weight = weight.full_tensor() if torch.is_grad_enabled() else weight.detach().full_tensor()
+        return AllToAllEmbedding.apply(ps.extra_parallel_group("emb"), input_ids, weight)
 
     def decode(
         self,

@@ -1,0 +1,20 @@
+---
+title: qwen3_30b_a3b_base — infer_text
+---
+%%{init: {'flowchart': {'defaultRenderer': 'elk'}}}%%
+flowchart LR
+    fsm_start(("▶")):::fsm_start
+    fsm_done(("⏹")):::fsm_terminal
+    subgraph state_text_ar [text_ar]
+        direction LR
+        text_ar__qwen3_text_encoder_generate["<i>qwen3_text_encoder.generate</i>"]:::body_node
+        text_ar__qwen3_moe_llm_generate["<i>qwen3_moe_llm.generate</i>"]:::body_node
+        text_ar__qwen3_text_encoder_generate --> text_ar__qwen3_moe_llm_generate
+        text_ar__qwen3_moe_llm_generate --> text_ar__qwen3_text_encoder_generate
+    end
+    fsm_start ==> state_text_ar
+    state_text_ar ==>|"module_signal(text_done)"| fsm_done
+    classDef body_node fill:#fff,stroke:#666
+    classDef fsm_start fill:#dff,stroke:#06c,stroke-width:2px
+    classDef fsm_terminal fill:#eee,stroke:#333,stroke-width:1px,stroke-dasharray:3 3
+    style state_text_ar fill:#eef,stroke:#06c,stroke-width:2px

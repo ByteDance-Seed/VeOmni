@@ -1,0 +1,25 @@
+# Per-module training overrides for Qwen3-30B-A3B (MoE, OmniModel V2).
+#
+# Module names match the registered HF model_type strings. Relative
+# ``model.model_path`` joins ``model.model_path`` (split-checkpoint root) from
+# base.yaml. Modules without an ``accelerator`` block inherit the global
+# (fsdp2) accelerator from base.yaml.
+#
+# The LLM tokenizer lives in ``qwen3_text_encoder/`` (split checkpoint asset).
+qwen3_text_encoder:
+  model:
+    model_path: qwen3_text_encoder
+
+qwen3_moe_llm:
+  model:
+    model_path: qwen3_moe_llm
+
+  # Expert Parallel for the fused experts (Shard(0) over the `ep` group, see
+  # modules/qwen3_moe/llm/modulemixin.py get_parallel_plan). `ep_size` is appended
+  # as the single `ep` extra-parallel dim by AcceleratorConfig.__post_init__.
+  #
+  # `ep_size` must divide both the world size and `num_experts` (128). Tune per
+  # cluster; 8 fits an 8-GPU node (16 experts / rank).
+  accelerator:
+    ep_size: 4
+    ep_outside: false
