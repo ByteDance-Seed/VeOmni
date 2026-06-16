@@ -83,7 +83,9 @@ class ParallelMode:
 _SP_SIZE = [1, 2]
 _EP_SIZE = [1, 2]
 _WAN_BFLOAT16_TRAINING_ARGS = [
-    "--train.accelerator.fsdp_config.mixed_precision.enable=False",
+    "--train.accelerator.fsdp_config.mixed_precision.enable=True",
+    "--train.accelerator.fsdp_config.mixed_precision.param_dtype=bfloat16",
+    "--train.accelerator.fsdp_config.mixed_precision.cast_forward_inputs=True",
 ]
 
 

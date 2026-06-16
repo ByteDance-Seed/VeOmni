@@ -430,7 +430,9 @@ def test_wan_dit_uses_bfloat16_and_flash_attention():
     for _, cmd_kwargs in command_list:
         cmd = build_torchrun_cmd(**cmd_kwargs)
         assert cmd_kwargs["extra_args"] == [
-            "--train.accelerator.fsdp_config.mixed_precision.enable=False",
+            "--train.accelerator.fsdp_config.mixed_precision.enable=True",
+            "--train.accelerator.fsdp_config.mixed_precision.param_dtype=bfloat16",
+            "--train.accelerator.fsdp_config.mixed_precision.cast_forward_inputs=True",
         ]
         assert "--model.ops_implementation.attn_implementation=flash_attention_2" in cmd
 

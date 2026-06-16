@@ -20,9 +20,7 @@ from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
 from .....distributed.parallel_state import get_parallel_state
 from .....distributed.sequence_parallel import (
-    gather_heads_scatter_seq,
     gather_outputs,
-    gather_seq_scatter_heads,
     slice_input_tensor,
 )
 from .....utils import logging
@@ -75,6 +73,7 @@ def _get_wan_full_sequence_varlen_kwargs(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
+    seq_len_multiplier: int = 1,
 ) -> dict[str, torch.Tensor | int]:
     if query.ndim != 4 or key.ndim != 4 or value.ndim != 4:
         raise ValueError("Wan flash-attention expects Q/K/V tensors with shape (batch, seq, heads, head_dim).")
@@ -85,25 +84,27 @@ def _get_wan_full_sequence_varlen_kwargs(
         )
 
     batch_size = query.shape[0]
+    query_length = query.shape[1] * seq_len_multiplier
+    key_length = key.shape[1] * seq_len_multiplier
     cu_seq_lens_q = torch.arange(
         0,
-        (batch_size + 1) * query.shape[1],
-        query.shape[1],
+        (batch_size + 1) * query_length,
+        query_length,
         device=query.device,
         dtype=torch.int32,
     )
     cu_seq_lens_k = torch.arange(
         0,
-        (batch_size + 1) * key.shape[1],
-        key.shape[1],
+        (batch_size + 1) * key_length,
+        key_length,
         device=key.device,
         dtype=torch.int32,
     )
     return {
         "cu_seq_lens_q": cu_seq_lens_q,
         "cu_seq_lens_k": cu_seq_lens_k,
-        "max_length_q": query.shape[1],
-        "max_length_k": key.shape[1],
+        "max_length_q": query_length,
+        "max_length_k": key_length,
     }
 
 
@@ -169,22 +170,12 @@ class WanSPAttnProcessor(WanAttnProcessor):
             self.attn_implementation in {"flash_attention_2", "veomni_flash_attention_2_with_sp"}
             and not use_fp32_attention
         )
-        if self.attn_implementation == "flash_attention_2" and not use_fp32_attention:
-            attention_interface = ALL_ATTENTION_FUNCTIONS["veomni_flash_attention_2_with_sp"]
-        elif self.attn_implementation != "eager" and not use_fp32_attention:
+        if self.attn_implementation != "eager" and not use_fp32_attention:
             attention_interface = ALL_ATTENTION_FUNCTIONS[self.attn_implementation]
         elif self.attn_implementation != "eager":
             logger.warning_once("Wan attention is running in fp32, so using eager SDPA instead of flash-attention.")
 
-        kernel_config = self.config
-        if self.attn_implementation == "flash_attention_2":
-            kernel_config = SimpleNamespace(_attn_implementation="veomni_flash_attention_2_with_sp")
-        kernel_module = WanAttentionKernelModule(kernel_config, attn)
-
-        if use_sp:
-            query = gather_seq_scatter_heads(query, seq_dim=1, head_dim=2, group=get_parallel_state().ulysses_group)
-            key = gather_seq_scatter_heads(key, seq_dim=1, head_dim=2, group=get_parallel_state().ulysses_group)
-            value = gather_seq_scatter_heads(value, seq_dim=1, head_dim=2, group=get_parallel_state().ulysses_group)
+        kernel_module = WanAttentionKernelModule(self.config, attn)
 
         # I2V: additional cross-attention over image tokens (no Ulysses SP needed).
         hidden_states_img = None
@@ -210,7 +201,12 @@ class WanSPAttnProcessor(WanAttnProcessor):
             )[0]
             hidden_states_img = hidden_states_img.flatten(2, 3).type_as(query)
 
-        attention_kwargs = _get_wan_full_sequence_varlen_kwargs(query, key, value) if use_flash_attention else {}
+        seq_len_multiplier = get_parallel_state().ulysses_size if use_sp else 1
+        attention_kwargs = (
+            _get_wan_full_sequence_varlen_kwargs(query, key, value, seq_len_multiplier=seq_len_multiplier)
+            if use_flash_attention
+            else {}
+        )
         hidden_states_out = attention_interface(
             kernel_module,
             query.transpose(1, 2),
@@ -219,13 +215,9 @@ class WanSPAttnProcessor(WanAttnProcessor):
             attention_mask=attention_mask,
             dropout=0.0,
             is_causal=False,
-            skip_ulysses=True,
+            skip_ulysses=is_cross_attention,
             **attention_kwargs,
         )[0]
-        if use_sp:
-            hidden_states_out = gather_heads_scatter_seq(
-                hidden_states_out, seq_dim=1, head_dim=2, group=get_parallel_state().ulysses_group
-            )
 
         hidden_states_out = hidden_states_out.flatten(2, 3)
         hidden_states = hidden_states.type_as(query)
@@ -358,16 +350,11 @@ class WanTransformer3DModel(PreTrainedModel, _WanTransformerInitShim):
     _supports_flash_attn = True
 
     def __init__(self, config: WanTransformer3DModelConfig, **kwargs):
-        attn_implementation = kwargs.get("attn_implementation")
-        if attn_implementation is not None:
-            config._attn_implementation = attn_implementation
         PreTrainedModel.__init__(self, config, **kwargs)
         del self._internal_dict
         # Remove VeOmni-specific kwargs before passing to the diffusers init.
         kwargs.pop("attn_implementation", None)
         kwargs.pop("torch_dtype", None)
-        if attn_implementation is not None:
-            config._attn_implementation = attn_implementation
         _WanTransformer3DModel.__init__(self, **config.to_diffuser_dict())
         self.config: WanTransformer3DModelConfig = config
         self.config.tie_word_embeddings = False
@@ -393,25 +380,6 @@ class WanTransformer3DModel(PreTrainedModel, _WanTransformerInitShim):
         encoder_hidden_states: torch.Tensor,
         training_target: torch.Tensor,
     ):
-        param_dtype = self.dtype
-
-        def _cast_floating_inputs(value):
-            if isinstance(value, torch.Tensor) and torch.is_floating_point(value):
-                return value.to(dtype=param_dtype)
-            if isinstance(value, list):
-                return [_cast_floating_inputs(item) for item in value]
-            if isinstance(value, tuple):
-                return tuple(_cast_floating_inputs(item) for item in value)
-            if isinstance(value, dict):
-                return {key: _cast_floating_inputs(item) for key, item in value.items()}
-            return value
-
-        latents = _cast_floating_inputs(latents)
-        hidden_states = _cast_floating_inputs(hidden_states)
-        timestep = _cast_floating_inputs(timestep)
-        encoder_hidden_states = _cast_floating_inputs(encoder_hidden_states)
-        training_target = _cast_floating_inputs(training_target)
-
         per_sample_losses = []
         predictions = []
         for hidden_state, ts, enc_hs, target in zip(hidden_states, timestep, encoder_hidden_states, training_target):
