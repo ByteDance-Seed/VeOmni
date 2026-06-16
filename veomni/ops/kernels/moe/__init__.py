@@ -36,6 +36,7 @@ def fused_moe_forward(
     fc1_2_weight: torch.Tensor | None,
     fc2_weight: torch.Tensor,
     fc1_1_2_weight: torch.Tensor | None = None,
+    swiglu_limit: float | None = None,
 ):
     if _fused_moe_forward is None:
         raise NotImplementedError("No fused MoE kernel is available. Please check your environment.")
@@ -56,6 +57,7 @@ def fused_moe_forward(
         fc1_2_weight,
         fc2_weight,
         fc1_1_2_weight,
+        swiglu_limit=swiglu_limit,
     )
 
 
@@ -125,9 +127,14 @@ def _make_moe_experts_adapter(raw_forward):
     ``quack_gemm_fused_moe_forward``) instead take the flat tensor-level
     signature ``(num_experts, routing_weights, selected_experts,
     hidden_states, fc1_1_weight, fc1_2_weight, fc2_weight,
-    fc1_1_2_weight)``. This adapter pulls ``num_experts``/``gate_up_proj``/
-    ``down_proj`` off ``self`` and forwards everything else positionally so
-    the OpSlot stays a drop-in replacement for the HF ``forward``.
+    fc1_1_2_weight, swiglu_limit)``. This adapter pulls
+    ``num_experts``/``gate_up_proj``/``down_proj`` off ``self`` and forwards
+    everything else positionally so the OpSlot stays a drop-in replacement
+    for the HF ``forward``.
+
+    ``swiglu_limit`` is read from ``self.limit`` when present (DeepSeek-V4
+    style clamped SwiGLU); legacy MoE experts modules without that attribute
+    fall through to ``None`` and pay zero overhead.
     """
 
     def adapter(self, hidden_states, top_k_index, top_k_weights):
@@ -140,6 +147,7 @@ def _make_moe_experts_adapter(raw_forward):
             fc1_2_weight=None,
             fc2_weight=self.down_proj,
             fc1_1_2_weight=self.gate_up_proj,
+            swiglu_limit=getattr(self, "limit", None),
         )
 
     return adapter

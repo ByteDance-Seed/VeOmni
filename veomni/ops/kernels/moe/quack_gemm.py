@@ -30,6 +30,7 @@ from quack.gemm_interface import gemm
 from ....distributed.moe import preprocess, token_pre_all2all, tokens_post_all2all
 from ....distributed.parallel_state import get_parallel_state
 from ._kernels.kernel.moe import expert_histogram, moe_gather, moe_scatter
+from .group_gemm import _apply_swiglu_clamp
 
 
 def _build_moe_indices(expert_index: torch.Tensor, num_experts: int):
@@ -72,6 +73,7 @@ class QuackFusedMoeExpertFunction(torch.autograd.Function):
         fc1_1_weight,
         fc1_2_weight,
         fc2_weight,
+        swiglu_limit=None,
     ):
         cu_seqlens_m, A_idx, scatter_index = _build_moe_indices(expert_index, num_experts)
 
@@ -87,6 +89,11 @@ class QuackFusedMoeExpertFunction(torch.autograd.Function):
 
         # fc1_2: [T*topk, I]
         fc1_2_output = gemm(hidden_states, fc1_2_w_t, cu_seqlens_m=cu_seqlens_m, A_idx=A_idx)
+
+        # gpt-oss / DeepSeek-V4 style clamped SwiGLU pre-activation.
+        fc1_1_output, fc1_2_output, mask_fc1_1, mask_fc1_2 = _apply_swiglu_clamp(
+            fc1_1_output, fc1_2_output, swiglu_limit
+        )
 
         # SiLU activation + gate multiply
         fc1_1_activation = torch.ops.aten.silu(fc1_1_output)
@@ -111,6 +118,7 @@ class QuackFusedMoeExpertFunction(torch.autograd.Function):
         output = expert_output.reshape(hidden_states.shape)
 
         ctx.num_experts = num_experts
+        ctx.swiglu_limit = swiglu_limit
         ctx.save_for_backward(
             gate_weights,
             fc1_1_weight,
@@ -124,6 +132,8 @@ class QuackFusedMoeExpertFunction(torch.autograd.Function):
             fc1_activation,
             scattered_gate_weight,
             fc1_weighted_output,
+            mask_fc1_1 if mask_fc1_1 is not None else torch.empty(0, device=hidden_states.device),
+            mask_fc1_2 if mask_fc1_2 is not None else torch.empty(0, device=hidden_states.device),
         )
 
         return output
@@ -143,7 +153,10 @@ class QuackFusedMoeExpertFunction(torch.autograd.Function):
             fc1_activation,
             scattered_gate_weight,
             fc1_weighted_output,
+            mask_fc1_1,
+            mask_fc1_2,
         ) = ctx.saved_tensors
+        swiglu_limit = ctx.swiglu_limit
         hidden_dim = grad_output.shape[-1]
         grad_output = grad_output.view(-1, hidden_dim)
 
@@ -181,12 +194,17 @@ class QuackFusedMoeExpertFunction(torch.autograd.Function):
         grad_fc1_2_output = fc1_1_activation * grad_fc1_activation
         del grad_fc1_activation, fc1_1_activation
 
+        if swiglu_limit is not None:
+            grad_fc1_2_output = grad_fc1_2_output * mask_fc1_2
+
         # Step 6 dgrad: fc1_2_weight [E, I, H] is already [K, N] for quack
         grad_scatter_output_2 = gemm(grad_fc1_2_output, fc1_2_weight, cu_seqlens_m=cu_seqlens_m)
 
         # Step 5: SiLU backward
         grad_fc1_1_output = torch.ops.aten.silu_backward(grad_fc1_1_activation, fc1_1_output)
         del fc1_1_output
+        if swiglu_limit is not None:
+            grad_fc1_1_output = grad_fc1_1_output * mask_fc1_1
 
         # Step 4 dgrad: fc1_1_weight [E, I, H] is already [K, N] for quack
         grad_scatter_output_1 = gemm(grad_fc1_1_output, fc1_1_weight, cu_seqlens_m=cu_seqlens_m)
@@ -220,6 +238,7 @@ class QuackFusedMoeExpertFunction(torch.autograd.Function):
             grad_fc1_1_weight,  # fc1_1_weight
             grad_fc1_2_weight,  # fc1_2_weight
             grad_fc2_weight,  # fc2_weight
+            None,  # swiglu_limit
         )
 
 
@@ -235,6 +254,7 @@ class MergedFc1QuackFusedMoeExpertFunction(torch.autograd.Function):
         hidden_states,
         fc1_1_2_weight,
         fc2_weight,
+        swiglu_limit=None,
     ):
         cu_seqlens_m, A_idx, scatter_index = _build_moe_indices(expert_index, num_experts)
 
@@ -248,6 +268,13 @@ class MergedFc1QuackFusedMoeExpertFunction(torch.autograd.Function):
         fc1_output = gemm(hidden_states, fc1_1_2_w_t, cu_seqlens_m=cu_seqlens_m, A_idx=A_idx)
 
         fc1_1_output, fc1_2_output = fc1_output.chunk(2, dim=-1)
+
+        # gpt-oss / DeepSeek-V4 style clamped SwiGLU pre-activation. ``_apply_swiglu_clamp``
+        # creates new tensors when ``swiglu_limit is not None`` so the saved halves are
+        # independent of ``fc1_output`` storage; otherwise it is a no-op.
+        fc1_1_output, fc1_2_output, mask_fc1_1, mask_fc1_2 = _apply_swiglu_clamp(
+            fc1_1_output, fc1_2_output, swiglu_limit
+        )
 
         fc1_1_activation = torch.ops.aten.silu(fc1_1_output)
         fc1_activation = fc1_1_activation * fc1_2_output
@@ -265,6 +292,7 @@ class MergedFc1QuackFusedMoeExpertFunction(torch.autograd.Function):
         output = expert_output.reshape(hidden_states.shape)
 
         ctx.num_experts = num_experts
+        ctx.swiglu_limit = swiglu_limit
         ctx.save_for_backward(
             gate_weights,
             fc1_1_2_weight,
@@ -277,6 +305,8 @@ class MergedFc1QuackFusedMoeExpertFunction(torch.autograd.Function):
             fc1_activation,
             scattered_gate_weight,
             fc1_weighted_output,
+            mask_fc1_1 if mask_fc1_1 is not None else torch.empty(0, device=hidden_states.device),
+            mask_fc1_2 if mask_fc1_2 is not None else torch.empty(0, device=hidden_states.device),
         )
 
         return output
@@ -295,7 +325,10 @@ class MergedFc1QuackFusedMoeExpertFunction(torch.autograd.Function):
             fc1_activation,
             scattered_gate_weight,
             fc1_weighted_output,
+            mask_fc1_1,
+            mask_fc1_2,
         ) = ctx.saved_tensors
+        swiglu_limit = ctx.swiglu_limit
         hidden_dim = grad_output.shape[-1]
         grad_output = grad_output.view(-1, hidden_dim)
 
@@ -337,6 +370,10 @@ class MergedFc1QuackFusedMoeExpertFunction(torch.autograd.Function):
         grad_fc1_1_output = torch.ops.aten.silu_backward(grad_fc1_1_activation, fc1_1_output)
         del fc1_1_output
 
+        if swiglu_limit is not None:
+            grad_fc1_1_output = grad_fc1_1_output * mask_fc1_1
+            grad_fc1_2_output = grad_fc1_2_output * mask_fc1_2
+
         # Merge grads back to [T, 2I]
         grad_fc1_output = torch.cat([grad_fc1_1_output, grad_fc1_2_output], dim=-1)
         del grad_fc1_1_output, grad_fc1_2_output
@@ -364,6 +401,7 @@ class MergedFc1QuackFusedMoeExpertFunction(torch.autograd.Function):
             grad_hidden_states,  # hidden_states
             grad_fc1_1_2_weight,  # fc1_1_2_weight
             grad_fc2_weight,  # fc2_weight
+            None,  # swiglu_limit
         )
 
 
@@ -384,6 +422,7 @@ class EPQuackGroupGemm(torch.autograd.Function):
         fc1_1_weight,
         fc1_2_weight,
         fc2_weight,
+        swiglu_limit=None,
     ):
         cu_seqlens_m = _cumsum_to_cu_seqlens(cumsum)
 
@@ -394,11 +433,16 @@ class EPQuackGroupGemm(torch.autograd.Function):
         fc1_1_output = gemm(permute_tokens, fc1_1_w_t, cu_seqlens_m=cu_seqlens_m)
         fc1_2_output = gemm(permute_tokens, fc1_2_w_t, cu_seqlens_m=cu_seqlens_m)
 
+        fc1_1_output, fc1_2_output, mask_fc1_1, mask_fc1_2 = _apply_swiglu_clamp(
+            fc1_1_output, fc1_2_output, swiglu_limit
+        )
+
         fc1_1_activation = torch.ops.aten.silu(fc1_1_output)
         fc1_result = fc1_1_activation * fc1_2_output
 
         fc2_output = gemm(fc1_result, fc2_w_t, cu_seqlens_m=cu_seqlens_m)
 
+        ctx.swiglu_limit = swiglu_limit
         ctx.save_for_backward(
             permute_tokens,
             cumsum,
@@ -407,6 +451,8 @@ class EPQuackGroupGemm(torch.autograd.Function):
             fc2_weight,
             fc1_1_output,
             fc1_2_output,
+            mask_fc1_1 if mask_fc1_1 is not None else torch.empty(0, device=permute_tokens.device),
+            mask_fc1_2 if mask_fc1_2 is not None else torch.empty(0, device=permute_tokens.device),
         )
 
         return fc2_output
@@ -421,7 +467,10 @@ class EPQuackGroupGemm(torch.autograd.Function):
             fc2_weight,
             fc1_1_output,
             fc1_2_output,
+            mask_fc1_1,
+            mask_fc1_2,
         ) = ctx.saved_tensors
+        swiglu_limit = ctx.swiglu_limit
 
         cu_seqlens_m = _cumsum_to_cu_seqlens(cumsum)
 
@@ -443,6 +492,9 @@ class EPQuackGroupGemm(torch.autograd.Function):
         grad_fc1_1_activation = grad_fc1_result * fc1_2_output
         del fc1_1_activation
 
+        if swiglu_limit is not None:
+            grad_fc1_2_output = grad_fc1_2_output * mask_fc1_2
+
         # dgrad fc1_2
         grad_scatter_output_2 = gemm(grad_fc1_2_output, fc1_2_weight, cu_seqlens_m=cu_seqlens_m)
 
@@ -454,6 +506,8 @@ class EPQuackGroupGemm(torch.autograd.Function):
 
         # silu backward
         grad_fc1_1_output = torch.ops.aten.silu_backward(grad_fc1_1_activation, fc1_1_output)
+        if swiglu_limit is not None:
+            grad_fc1_1_output = grad_fc1_1_output * mask_fc1_1
 
         # dgrad fc1_1
         grad_scatter_output_1 = gemm(grad_fc1_1_output, fc1_1_weight, cu_seqlens_m=cu_seqlens_m)
@@ -473,6 +527,7 @@ class EPQuackGroupGemm(torch.autograd.Function):
             grad_fc1_1_weight,  # fc1_1_weight
             grad_fc1_2_weight,  # fc1_2_weight
             grad_fc2_weight,  # fc2_weight
+            None,  # swiglu_limit
         )
 
 
@@ -486,6 +541,7 @@ class EPMergedFc1QuackGroupGemm(torch.autograd.Function):
         cumsum,
         fc1_1_2_weight,
         fc2_weight,
+        swiglu_limit=None,
     ):
         assert fc1_1_2_weight.shape[1] % 2 == 0, (
             f"Merged fc1_1_2_weight dim 1 must be even, got {fc1_1_2_weight.shape[1]}"
@@ -501,12 +557,17 @@ class EPMergedFc1QuackGroupGemm(torch.autograd.Function):
         # chunk is a view, no copy
         fc1_1_output, fc1_2_output = fc1_output.chunk(2, dim=-1)
 
+        fc1_1_output, fc1_2_output, mask_fc1_1, mask_fc1_2 = _apply_swiglu_clamp(
+            fc1_1_output, fc1_2_output, swiglu_limit
+        )
+
         fc1_1_activation = torch.ops.aten.silu(fc1_1_output)
         fc1_result = fc1_1_activation * fc1_2_output
 
         # fc2
         fc2_output = gemm(fc1_result, fc2_w_t, cu_seqlens_m=cu_seqlens_m)
 
+        ctx.swiglu_limit = swiglu_limit
         ctx.save_for_backward(
             permute_tokens,
             cumsum,
@@ -514,6 +575,8 @@ class EPMergedFc1QuackGroupGemm(torch.autograd.Function):
             fc2_weight,
             fc1_1_output,
             fc1_2_output,
+            mask_fc1_1 if mask_fc1_1 is not None else torch.empty(0, device=permute_tokens.device),
+            mask_fc1_2 if mask_fc1_2 is not None else torch.empty(0, device=permute_tokens.device),
         )
 
         return fc2_output
@@ -527,7 +590,10 @@ class EPMergedFc1QuackGroupGemm(torch.autograd.Function):
             fc2_weight,
             fc1_1_output,
             fc1_2_output,
+            mask_fc1_1,
+            mask_fc1_2,
         ) = ctx.saved_tensors
+        swiglu_limit = ctx.swiglu_limit
 
         cu_seqlens_m = _cumsum_to_cu_seqlens(cumsum)
 
@@ -552,6 +618,10 @@ class EPMergedFc1QuackGroupGemm(torch.autograd.Function):
         grad_fc1_1_output = torch.ops.aten.silu_backward(grad_fc1_1_activation, fc1_1_output)
         del fc1_1_output
 
+        if swiglu_limit is not None:
+            grad_fc1_1_output = grad_fc1_1_output * mask_fc1_1
+            grad_fc1_2_output = grad_fc1_2_output * mask_fc1_2
+
         # Merge grads back to [T, 2I]
         grad_fc1_output = torch.cat([grad_fc1_1_output, grad_fc1_2_output], dim=-1)
         del grad_fc1_1_output, grad_fc1_2_output
@@ -570,6 +640,7 @@ class EPMergedFc1QuackGroupGemm(torch.autograd.Function):
             None,  # cumsum
             grad_fc1_1_2_weight,  # fc1_1_2_weight
             grad_fc2_weight,  # fc2_weight
+            None,  # swiglu_limit
         )
 
 
@@ -582,11 +653,15 @@ def quack_gemm_fused_moe_forward(
     fc1_2_weight: torch.Tensor | None,
     fc2_weight: torch.Tensor,
     fc1_1_2_weight: torch.Tensor | None = None,
+    swiglu_limit: float | None = None,
 ):
     """Quack GEMM fused MoE forward pass.
 
     Same interface as ``group_gemm_fused_moe_forward``. Supports both split
     and merged fc1 weight layouts, including EP (Expert Parallelism).
+
+    ``swiglu_limit``: gpt-oss / DeepSeek-V4 style clamp on SwiGLU
+    pre-activations. ``None`` disables the clamp (default, zero overhead).
     """
     if get_parallel_state().ep_enabled:
         if fc1_1_2_weight is not None:
@@ -622,6 +697,7 @@ def quack_gemm_fused_moe_forward(
                 cumsum,
                 fc1_1_2_weight,
                 fc2_weight,
+                swiglu_limit,
             )
         else:
             final_permute_tokens = EPQuackGroupGemm.apply(
@@ -630,6 +706,7 @@ def quack_gemm_fused_moe_forward(
                 fc1_1_weight,
                 fc1_2_weight,
                 fc2_weight,
+                swiglu_limit,
             )
 
         final_hidden_states = tokens_post_all2all(
@@ -657,6 +734,7 @@ def quack_gemm_fused_moe_forward(
             hidden_states,
             fc1_1_2_weight,
             fc2_weight,
+            swiglu_limit,
         )
     else:
         if fc1_1_weight is None or fc1_2_weight is None:
@@ -669,4 +747,5 @@ def quack_gemm_fused_moe_forward(
             fc1_1_weight,
             fc1_2_weight,
             fc2_weight,
+            swiglu_limit,
         )
