@@ -674,7 +674,7 @@
 
 
  class Qwen3_5DecoderLayer(GradientCheckpointingLayer):
-@@ -774,19 +1081,29 @@
+@@ -774,19 +1081,30 @@
          attention_mask: torch.Tensor | None = None,
          position_ids: torch.LongTensor | None = None,
          past_key_values: Cache | None = None,
@@ -691,21 +691,22 @@
 +            "cu_seq_lens_q must be provided to support varlen Flash Linear Attention, varlen Conv1D,"
 +            "and to remove the full Flash Attention CPU-GPU sync."
 +        )
++        linear_attn_cu_seq_lens_q = kwargs.pop("linear_attn_cu_seq_lens_q", cu_seq_lens_q)
 +
          # Token Mixer
          if self.layer_type == "linear_attention":
-+            # Modification: pass cu_seq_lens_q through to Qwen3_5GatedDeltaNet.forward.
++            # Modification: pass linear-attention cu_seqlens through to Qwen3_5GatedDeltaNet.forward.
              hidden_states = self.linear_attn(
                  hidden_states=hidden_states,
                  cache_params=past_key_values,
 +                cache_position=cache_position,
                  attention_mask=attention_mask,
 -                **kwargs,
-+                cu_seq_lens_q=cu_seq_lens_q,
++                cu_seq_lens_q=linear_attn_cu_seq_lens_q,
              )
          elif self.layer_type == "full_attention":
              # Self Attention
-@@ -795,6 +1112,7 @@
+@@ -795,6 +1113,7 @@
                  attention_mask=attention_mask,
                  position_ids=position_ids,
                  past_key_values=past_key_values,
@@ -713,7 +714,7 @@
                  position_embeddings=position_embeddings,
                  **kwargs,
              )
-@@ -806,7 +1124,6 @@
+@@ -806,7 +1125,6 @@
          hidden_states = self.post_attention_layernorm(hidden_states)
          hidden_states = self.mlp(hidden_states)
          hidden_states = residual + hidden_states
@@ -721,7 +722,7 @@
          return hidden_states
 
 
-@@ -902,6 +1219,12 @@
+@@ -902,6 +1220,12 @@
      return q_embed, k_embed
 
 
@@ -734,7 +735,7 @@
  class Qwen3_5VisionAttention(nn.Module):
      def __init__(self, config: Qwen3_5VisionConfig) -> None:
          super().__init__()
-@@ -935,13 +1258,18 @@
+@@ -935,13 +1259,18 @@
          key_states = key_states.transpose(0, 1).unsqueeze(0)
          value_states = value_states.transpose(0, 1).unsqueeze(0)
 
@@ -756,7 +757,7 @@
              attn_output, _ = attention_interface(
                  self,
                  query_states,
-@@ -958,6 +1286,9 @@
+@@ -958,6 +1287,9 @@
                  **kwargs,
              )
          else:
@@ -766,7 +767,7 @@
              # Other implementations: Process each chunk separately
              lengths = cu_seqlens[1:] - cu_seqlens[:-1]
              splits = [
-@@ -1019,6 +1350,12 @@
+@@ -1019,6 +1351,12 @@
          return hidden_states
 
 
@@ -779,7 +780,7 @@
  class Qwen3_5VisionModel(Qwen3_5PreTrainedModel):
      config: Qwen3_5VisionConfig
      input_modalities = ("image", "video")
-@@ -1054,28 +1391,127 @@
+@@ -1054,28 +1392,127 @@
 
          self.post_init()
 
@@ -927,7 +928,7 @@
 
      @merge_with_config_defaults
      @capture_outputs
-@@ -1090,25 +1526,147 @@
+@@ -1090,25 +1527,147 @@
          Returns:
              `torch.Tensor`: hidden_states.
          """
@@ -1087,7 +1088,7 @@
 
          for blk in self.blocks:
              hidden_states = blk(
-@@ -1124,6 +1682,36 @@
+@@ -1124,6 +1683,36 @@
              last_hidden_state=hidden_states,
              pooler_output=merged_hidden_states,
          )
@@ -1124,7 +1125,7 @@
 
 
  @auto_docstring(
-@@ -1148,6 +1736,12 @@
+@@ -1148,6 +1737,12 @@
      hidden_states: tuple[torch.FloatTensor] | None = None
      attentions: tuple[torch.FloatTensor] | None = None
      rope_deltas: torch.LongTensor | None = None
@@ -1137,7 +1138,7 @@
 
 
  class Qwen3_5TextModel(Qwen3_5PreTrainedModel):
-@@ -1233,19 +1827,42 @@
+@@ -1233,19 +1828,42 @@
              past_key_values=past_key_values,
          )
 
@@ -1191,7 +1192,7 @@
 
 
  @auto_docstring
-@@ -1441,64 +2058,43 @@
+@@ -1441,64 +2059,43 @@
          self,
          pixel_values: torch.FloatTensor,
          image_grid_thw: torch.LongTensor | None = None,
@@ -1281,7 +1282,7 @@
          return special_image_mask, special_video_mask
 
      def compute_3d_position_ids(
-@@ -1564,13 +2160,18 @@
+@@ -1564,13 +2161,18 @@
          image_grid_thw: torch.LongTensor | None = None,
          video_grid_thw: torch.LongTensor | None = None,
          mm_token_type_ids: torch.IntTensor | None = None,
@@ -1300,7 +1301,7 @@
          """
          if (input_ids is None) ^ (inputs_embeds is not None):
              raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
-@@ -1578,29 +2179,169 @@
+@@ -1578,29 +2180,169 @@
          if inputs_embeds is None:
              inputs_embeds = self.get_input_embeddings()(input_ids)
 
@@ -1480,7 +1481,7 @@
              position_ids = self.compute_3d_position_ids(
                  input_ids=input_ids,
                  image_grid_thw=image_grid_thw,
-@@ -1610,6 +2351,18 @@
+@@ -1610,6 +2352,18 @@
                  past_key_values=past_key_values,
                  mm_token_type_ids=mm_token_type_ids,
              )
@@ -1499,7 +1500,7 @@
 
          outputs = self.language_model(
              input_ids=None,
-@@ -1617,6 +2370,7 @@
+@@ -1617,6 +2371,7 @@
              attention_mask=attention_mask,
              past_key_values=past_key_values,
              inputs_embeds=inputs_embeds,
@@ -1507,7 +1508,7 @@
              **kwargs,
          )
 
-@@ -1624,6 +2378,12 @@
+@@ -1624,6 +2379,12 @@
              **outputs,
              rope_deltas=self.rope_deltas,
          )
@@ -1520,7 +1521,7 @@
 
 
  @auto_docstring
-@@ -1654,10 +2414,13 @@
+@@ -1654,10 +2415,13 @@
          inputs_embeds: torch.FloatTensor | None = None,
          labels: torch.LongTensor | None = None,
          use_cache: bool | None = None,
@@ -1534,7 +1535,7 @@
          labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
              Labels for computing the masked language modeling loss. Indices should either be in `[0, ...,
              config.vocab_size]` or -100 (see `input_ids` docstring). Tokens with indices set to `-100` are ignored
-@@ -1686,21 +2449,50 @@
+@@ -1686,21 +2450,50 @@
              past_key_values=past_key_values,
              inputs_embeds=inputs_embeds,
              use_cache=use_cache,
@@ -1589,7 +1590,7 @@
              past_key_values=outputs.past_key_values,
              hidden_states=outputs.hidden_states,
              attentions=outputs.attentions,
-@@ -1740,6 +2532,41 @@
+@@ -1740,6 +2533,41 @@
      rope_deltas: torch.LongTensor | None = None
 
 
@@ -1631,7 +1632,7 @@
  class Qwen3_5ForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
      _tied_weights_keys = {"lm_head.weight": "model.language_model.embed_tokens.weight"}
      # Reference: fix gemma3 grad acc #37208
-@@ -1796,57 +2623,10 @@
+@@ -1796,57 +2624,10 @@
          pixel_values_videos: torch.FloatTensor | None = None,
          image_grid_thw: torch.LongTensor | None = None,
          video_grid_thw: torch.LongTensor | None = None,
@@ -1691,7 +1692,7 @@
          outputs = self.model(
              input_ids=input_ids,
              pixel_values=pixel_values,
-@@ -1857,27 +2637,54 @@
+@@ -1857,27 +2638,54 @@
              attention_mask=attention_mask,
              past_key_values=past_key_values,
              inputs_embeds=inputs_embeds,
@@ -1752,7 +1753,7 @@
          )
 
      def prepare_inputs_for_generation(
-@@ -2103,6 +2910,24 @@
+@@ -2103,6 +2911,24 @@
 
          return input_ids, model_kwargs
 

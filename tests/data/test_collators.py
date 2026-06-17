@@ -170,4 +170,27 @@ def test_seqcls_collator_pad_to_length_sp_enabled(monkeypatch, features_two_samp
     assert out["max_length_k"] == exp_max_length
 
 
+def test_packing_collator_clamps_linear_attn_tail_padding_length(monkeypatch, features_two_samples):
+    import veomni.data.data_collator as m
+
+    monkeypatch.setattr(m, "get_parallel_state", lambda: _fake_ps(sp_enabled=True))
+    monkeypatch.setattr(m.PackingCollator, "pad_batch_to_length", lambda _, batch: batch)
+
+    token_labels = [
+        {
+            **features_two_samples[0],
+            "labels": torch.tensor([2, 3, 4], dtype=torch.long),
+        },
+        {
+            **features_two_samples[1],
+            "labels": torch.tensor([1, 2], dtype=torch.long),
+        },
+    ]
+    collator = m.PackingCollator(pad_to_length=4)
+
+    out = collator(token_labels)
+
+    assert m._LINEAR_ATTN_TAIL_PADDING_LENGTH not in out
+
+
 # TODO: add omni data ci test

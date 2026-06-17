@@ -99,6 +99,27 @@ def prepare_fa_kwargs_from_position_ids(position_ids):
     return (cu_seq_lens_q, cu_seq_lens_k), (max_length_q, max_length_k)
 
 
+def coalesce_tail_padding_cu_seqlens(cu_seqlens: torch.Tensor, tail_padding_length: int = 0) -> torch.Tensor:
+    """
+    Coalesce per-token tail padding segments into one sequence segment.
+
+    ``position_ids == 0`` marks packed sequence boundaries. When a collator pads
+    the tail with zero position ids, the FlashAttention cu-seqlens intentionally
+    contains one synthetic 1-token segment per padding token. Some linear
+    attention kernels compile or allocate per segment, so forwarding those
+    padding-only boundaries can create many unnecessary kernel shapes. This
+    helper preserves the padded tensor length while presenting the tail padding
+    as one independent segment for linear-attention style kernels.
+    """
+    if tail_padding_length <= 0:
+        return cu_seqlens
+
+    total_length = cu_seqlens[-1:]
+    real_end = torch.clamp(total_length - tail_padding_length, min=0)
+    valid_cu_seqlens = cu_seqlens[cu_seqlens <= real_end]
+    return torch.unique_consecutive(torch.cat((valid_cu_seqlens, real_end, total_length)))
+
+
 def valid_seqlens_from_cu_seqlens(cu_seqlens: torch.Tensor) -> torch.Tensor:
     """
     cu_seqlens: shape (B+1,), monotonic non-decreasing.
