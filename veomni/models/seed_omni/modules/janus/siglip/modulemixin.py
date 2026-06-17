@@ -55,7 +55,7 @@ class JanusSiglipModuleMixin(ModuleMixin):
     def _pixels_from_raw_images(self, raw_images: list[Any]) -> Optional[torch.Tensor]:
         if not raw_images:
             return None
-        return self._processor(images=raw_images, return_tensors="pt")["pixel_values"].to(
+        return self._image_processor(images=raw_images, return_tensors="pt")["pixel_values"].to(
             device=self.device, dtype=self.dtype
         )
 

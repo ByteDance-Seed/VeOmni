@@ -92,7 +92,12 @@ class ModuleMixin:
     :class:`~veomni.models.seed_omni.tracemixin.TraceMixin`.
     """
 
+    # Generic / combined processor (e.g. an HF ``XxxProcessor`` wrapping several
+    # modalities). Single-modality modules instead declare the specific slots
+    # below (``image_processor_class`` / ``video_processor_class`` / ...).
     processor_class: Optional[Type[Any]] = None
+    image_processor_class: Optional[Type[Any]] = None
+    video_processor_class: Optional[Type[Any]] = None
     tokenizer_class: Optional[Type[Any]] = None
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
@@ -251,21 +256,37 @@ class ModuleMixin:
         # Lazy import to avoid an import cycle (``veomni.models.auto`` pulls in
         # the loader / ops stack at import time, while this module is imported
         # while that stack is still initialising).
-        from ..auto import build_processor, build_tokenizer
+        from ..auto import build_tokenizer
 
         model = super().from_pretrained(pretrained_model_name_or_path, *args, **kwargs)
-        if cls.processor_class is not None:
+        # Each per-module asset is loaded only when its class slot is declared,
+        # via the declared class (e.g. the image processor reads
+        # ``preprocessor_config.json`` rather than auto-detecting — a module dir
+        # may also hold a ``video_preprocessor_config.json`` which would confuse
+        # auto-resolution). The tokenizer is built by ``build_tokenizer``.
+        # On failure the attr is set to ``None`` (best-effort; surfaced lazily by
+        # the module when the modality is actually used).
+        # ``set attr`` is the public name so the tokenizer goes through its
+        # property setter (which may build chat markers / token ids); ``none attr``
+        # is the private storage zeroed on failure. For processors the two match.
+        #   (set attr, none attr, class attr, build_via_tokenizer)
+        asset_specs = [
+            ("_processor", "_processor", "processor_class", False),
+            ("_image_processor", "_image_processor", "image_processor_class", False),
+            ("_video_processor", "_video_processor", "video_processor_class", False),
+            ("tokenizer", "_tokenizer", "tokenizer_class", True),
+        ]
+        for set_attr, none_attr, class_attr, build_via_tokenizer in asset_specs:
+            if getattr(cls, class_attr, None) is None:
+                continue
             try:
-                model._processor = build_processor(pretrained_model_name_or_path)
+                if build_via_tokenizer:
+                    asset = build_tokenizer(pretrained_model_name_or_path)
+                else:
+                    asset = getattr(cls, class_attr).from_pretrained(pretrained_model_name_or_path)
+                setattr(model, set_attr, asset)
             except Exception:
-                # Best-effort: defer the "missing processor" error to ``generate``
-                # where the message can reference the actual call site.
-                model._processor = None
-        if cls.tokenizer_class is not None:
-            try:
-                model._tokenizer = build_tokenizer(pretrained_model_name_or_path)
-            except Exception:
-                model._tokenizer = None
+                setattr(model, none_attr, None)
         return model
 
     def finalize(self, *, ctx: Dict[str, Any]) -> Dict[str, Any]:

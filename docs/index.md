@@ -86,6 +86,7 @@ seed_omni/data_format.md
 seed_omni/design.md
 seed_omni/example_models/janus.md
 seed_omni/example_models/qwen3.md
+seed_omni/example_models/qwen3vl.md
 ```
 
 ```{toctree}

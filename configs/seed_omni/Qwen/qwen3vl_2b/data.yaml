@@ -1,0 +1,14 @@
+sources:
+  - /mnt/hdfs/veomni/datasets/sharegpt4v_cap_100k
+  - /mnt/hdfs/veomni/datasets/llava_video
+  - /mnt/hdfs/veomni/datasets/tulu-3-sft-mixture/data
+names:
+  - sharegpt4v_cap_100k
+  - llava_video
+  - tulu-3-sft-mixture
+schedule:
+  - schedule_type: const
+    weights: [0.4, 0.4, 0.2]
+level: token
+stopping_strategy: all_exhausted
+upstream_sharded: true

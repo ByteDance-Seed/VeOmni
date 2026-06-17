@@ -41,7 +41,7 @@ accelerator:
 data:
   data_type: seedomni
   max_seq_len: 4096
-  train_path: configs/seed_omni/Qwen/data.yaml
+  train_path: configs/seed_omni/Qwen/qwen3_0.6b/data.yaml
   datasets_type: iterable
   multisource_datasets_type: veomni_weighted_multisource
   train_sample: 1000000

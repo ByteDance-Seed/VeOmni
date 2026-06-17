@@ -2,12 +2,9 @@ from typing import Any, Dict, List, Optional
 
 import torch
 import torch.nn.functional as F
-from torch.distributed.tensor import DTensor
 
 from veomni.utils.tensor_utils import unflatten
 
-from ......distributed.parallel_state import get_parallel_state
-from ......ops.kernels.embed import VocabParallelLinear
 from ....conversation import ConversationItem, seal_outputs
 from ....module import ModuleMixin, post_forward
 from ....tracemixin import TraceMixin
@@ -89,28 +86,6 @@ class TextEncoderModuleMixin(ModuleMixin):
 
     def generate(self, conversation_list: list[list[ConversationItem]], **generation_kwargs: Any) -> Dict[str, Any]:
         raise NotImplementedError("TextEncoderModuleMixin.generate is not implemented")
-
-    def _project(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if not self.config.tie_word_embeddings:
-            return self.lm_head(hidden_states)
-
-        weight = self.embed_tokens.weight
-        ps = get_parallel_state()
-        if "emb" in ps.extra_parallel_sizes and ps.extra_parallel_enabled("emb"):
-            # Vocab-parallel tied head: ``embed_tokens.weight`` is sharded on dim-0
-            # (vocab) over the ``emb`` group and dim-1 (hidden) over ``emb_fsdp``.
-            # Reconstruct the hidden shards (full_tensor over emb_fsdp — same as
-            # ``_embed_tokens``), then all-gather the vocab shards over ``emb`` to
-            # project to full-vocab logits.
-            if isinstance(weight, DTensor):
-                weight = weight.full_tensor() if torch.is_grad_enabled() else weight.detach().full_tensor()
-            # ``full_tensor()`` bypasses FSDP's mixed-precision cast, so the gathered
-            # master weight may be fp32 while ``hidden_states`` is bf16. Match the
-            # activation dtype (also makes the emb all-gather bf16, halving comm).
-            weight = weight.to(hidden_states.dtype)
-            return VocabParallelLinear.apply(ps.extra_parallel_group("emb"), hidden_states, weight)
-
-        return F.linear(hidden_states, weight)
 
     @staticmethod
     def _top_p_filter(logits: torch.Tensor, top_p: float) -> torch.Tensor:

@@ -1,0 +1,31 @@
+---
+title: qwen3_0.6b_base_visual_instruction_tuning — understanding
+---
+%%{init: {'flowchart': {'defaultRenderer': 'elk'}}}%%
+flowchart LR
+    fsm_start(("▶")):::fsm_start
+    fsm_done(("⏹")):::fsm_terminal
+    subgraph state_prompt_encode [prompt_encode]
+        direction LR
+        prompt_encode__qwen3vl_vision_generate["<i>qwen3vl_vision.generate</i>"]:::body_node
+        prompt_encode__qwen3_llm_generate["<i>qwen3_llm.generate</i>"]:::body_node
+        prompt_encode__qwen3_text_encoder_generate["<i>qwen3_text_encoder.generate</i>"]:::body_node
+        prompt_encode__qwen3vl_vision_generate --> prompt_encode__qwen3_llm_generate
+        prompt_encode__qwen3_text_encoder_generate --> prompt_encode__qwen3_llm_generate
+        prompt_encode__qwen3_llm_generate --> prompt_encode__qwen3_text_encoder_generate
+    end
+    subgraph state_text_ar [text_ar]
+        direction LR
+        text_ar__qwen3_text_encoder_generate["<i>qwen3_text_encoder.generate</i>"]:::body_node
+        text_ar__qwen3_llm_generate["<i>qwen3_llm.generate</i>"]:::body_node
+        text_ar__qwen3_text_encoder_generate --> text_ar__qwen3_llm_generate
+        text_ar__qwen3_llm_generate --> text_ar__qwen3_text_encoder_generate
+    end
+    fsm_start ==> state_prompt_encode
+    state_prompt_encode ==>|"module_signal(text_done)"| fsm_done
+    state_prompt_encode ==>|"default"| state_text_ar
+    state_text_ar ==>|"module_signal(text_done)"| fsm_done
+    classDef body_node fill:#fff,stroke:#666
+    classDef fsm_start fill:#dff,stroke:#06c,stroke-width:2px
+    classDef fsm_terminal fill:#eee,stroke:#333,stroke-width:1px,stroke-dasharray:3 3
+    style state_prompt_encode fill:#eef,stroke:#06c,stroke-width:2px

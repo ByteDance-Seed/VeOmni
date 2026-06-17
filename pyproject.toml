@@ -53,6 +53,9 @@ audio = [
   "av>=14.3.0,<15.0; python_version == '3.11'",
   "av>=14.0.0,<14.3; python_version == '3.12'",
   "librosa>=0.11.0,<0.12",
+  # librosa pulls numba loosely (>=0.51); pin >=0.64 so the resolved numba
+  # supports numpy 2.4 (numba <0.64 caps numpy<2.4 and fails at import).
+  "numba>=0.64,<0.66",
   "soundfile>=0.13.1,<0.14"
 ]
 # Alias for audio extra - includes both video and audio processing dependencies
@@ -61,6 +64,8 @@ video = [
   "av>=14.3.0,<15.0; python_version == '3.11'",
   "av>=14.0.0,<14.3; python_version == '3.12'",
   "librosa>=0.11.0,<0.12",
+  # See note in the ``audio`` extra: keep numba>=0.64 for numpy 2.4 support.
+  "numba>=0.64,<0.66",
   "soundfile>=0.13.1,<0.14"
 ]
 dit = [
@@ -69,6 +74,8 @@ dit = [
   "av>=14.3.0,<15.0; python_version == '3.11'",
   "av>=14.0.0,<14.3; python_version == '3.12'",
   "librosa>=0.11.0,<0.12",
+  # See note in the ``audio`` extra: keep numba>=0.64 for numpy 2.4 support.
+  "numba>=0.64,<0.66",
   "soundfile>=0.13.1,<0.14",
   "ftfy",
 ]

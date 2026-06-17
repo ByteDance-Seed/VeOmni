@@ -1,0 +1,14 @@
+# Qwen3-0.6B visual instruction tuning training DAG — image understanding SFT.
+#
+# Flat edge list (bare module -> .forward). The Qwen3-VL ViT (merger retargeted)
+# encodes images; the qwen3 text encoder (in image mode, enable_image=True)
+# tokenises text with a Qwen3-VL-style image chat template; the frozen qwen3
+# backbone consumes the packed embeds and the text head computes the loss.
+#
+#   {qwen3vl_vision, qwen3_text_encoder.encode}
+#       -> qwen3_llm -> qwen3_text_encoder.decode -> end
+training_graph:
+  - { from: qwen3vl_vision,             to: qwen3_llm }
+  - { from: qwen3_text_encoder.encode,  to: qwen3_llm }
+  - { from: qwen3_llm,                  to: qwen3_text_encoder.decode }
+  - { from: qwen3_text_encoder.decode,  to: end }
