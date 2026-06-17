@@ -185,6 +185,21 @@ class OmniInferArguments:
 
 
 @dataclass
+class OmniDataArguments(DataArguments):
+    """``data.*`` for OmniModel — adds the multimodal-IO config block.
+
+    ``mm_configs`` is forwarded to the ``seedomni`` data transform (and thence to
+    ``fetch_images`` / ``fetch_videos``), e.g.
+    ``mm_configs: {use_audio_in_video: false, fps: 2.0, max_frames: 16}``.
+    """
+
+    mm_configs: Optional[Dict] = field(
+        default_factory=dict,
+        metadata={"help": "Config for multimodal input (forwarded to the seedomni data transform)."},
+    )
+
+
+@dataclass
 class OmniArguments(VeOmniArguments):
     """Root config for OmniModel V2 — assembles model / data / train /
     accelerator / infer.  Consumed by :func:`veomni.arguments.parse_omni_args`.
@@ -195,7 +210,7 @@ class OmniArguments(VeOmniArguments):
     """
 
     model: OmniModelArguments = field(default_factory=OmniModelArguments)
-    data: DataArguments = field(default_factory=DataArguments)
+    data: OmniDataArguments = field(default_factory=OmniDataArguments)
     train: OmniTrainingArguments = field(default_factory=OmniTrainingArguments)
     accelerator: AcceleratorConfig = field(default_factory=AcceleratorConfig)
     infer: OmniInferArguments = field(default_factory=OmniInferArguments)

@@ -1,0 +1,14 @@
+# Qwen3-VL-2B training DAG — image/video understanding SFT (I2T).
+#
+# Flat list of edges; each endpoint is a self-describing `module[.method]`
+# string (bare module -> `.forward`). Active nodes derived from endpoints:
+#
+#   {qwen3vl_vision, qwen3vl_text_encoder.encode}
+#       -> qwen3vl_llm -> qwen3vl_text_encoder.decode -> end
+#
+# qwen3vl_vision encodes both image and video user items through one ViT call.
+training_graph:
+  - { from: qwen3vl_vision,              to: qwen3vl_llm }            # image/video embeds -> carrier
+  - { from: qwen3vl_text_encoder.encode, to: qwen3vl_llm }           # chat-template tokenise + wte
+  - { from: qwen3vl_llm,                 to: qwen3vl_text_encoder.decode }  # text CE head
+  - { from: qwen3vl_text_encoder.decode, to: end }

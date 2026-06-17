@@ -1,0 +1,21 @@
+# Qwen3-0.6B visual instruction tuning inference — image understanding (I2T).
+initial: prompt_encode
+
+states:
+  prompt_encode:
+    body:
+      - { from: qwen3vl_vision,      to: qwen3_llm }
+      - { from: qwen3_text_encoder,  to: qwen3_llm }
+      - { from: qwen3_llm,           to: qwen3_text_encoder }
+      - { from: qwen3_text_encoder,  to: end }
+    transitions:
+      - { condition: { type: module_signal, key: text_done }, next_state: done }
+      - { condition: { type: default }, next_state: text_ar }
+
+  text_ar:
+    body:
+      - { from: qwen3_text_encoder,  to: qwen3_llm }
+      - { from: qwen3_llm,           to: qwen3_text_encoder }
+      - { from: qwen3_text_encoder,  to: end }
+    transitions:
+      - { condition: { type: module_signal, key: text_done }, next_state: done }

@@ -25,7 +25,7 @@ class JanusSiglip(JanusSiglipModuleMixin, JanusSiglipTraceMixin, PreTrainedModel
     """
 
     config_class = JanusSiglipConfig
-    processor_class = JanusSiglipProcessor
+    image_processor_class = JanusSiglipProcessor
     base_model_prefix = "janus_siglip"
     main_input_name = "pixel_values"
     _no_split_modules = ["JanusVisionEncoderLayer"]
@@ -37,7 +37,7 @@ class JanusSiglip(JanusSiglipModuleMixin, JanusSiglipTraceMixin, PreTrainedModel
         self.vision_model = JanusVisionModel(self.config.vision_config)
         self.aligner = JanusVisionAlignerMLP(self.config.vision_config)
 
-        self._processor: Optional[Any] = None
+        self._image_processor: Optional[Any] = None
         self.post_init()
 
     def _encode_pixel_values(self, pixel_values: torch.Tensor) -> torch.Tensor:

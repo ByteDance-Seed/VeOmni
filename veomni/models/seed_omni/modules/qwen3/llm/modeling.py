@@ -33,6 +33,11 @@ class Qwen3Llm(Qwen3LlmModuleMixin, Qwen3LlmTraceMixin, PreTrainedModel):
         self.language_model.set_input_embeddings(nn.Identity())
         self.post_init()
 
+    def freeze_model(self) -> None:
+        """Freeze the whole backbone when ``config.freeze`` (bootstrap setups)."""
+        if getattr(self.config, "freeze", False):
+            self.language_model.requires_grad_(False)
+
     def forward(  # type: ignore[override]
         self,
         inputs_embeds: Optional[torch.FloatTensor] = None,

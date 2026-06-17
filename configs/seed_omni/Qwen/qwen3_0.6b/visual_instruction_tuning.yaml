@@ -1,0 +1,107 @@
+# VeOmni config — visual instruction tuning of text-only Qwen3-0.6B into image
+# understanding using the Qwen3-VL ViT, training ONLY the ViT patch merger + the
+# vision special-token embedding rows (ViT blocks + LLM frozen).
+#
+# No bespoke modeling/script: assemble the split checkpoint from the two standard
+# per-model converts, then combine. The merger retarget + freeze + image behaviour
+# are switched on via ``model_config:`` overrides in the modules YAML.
+#
+#   # 1) text LLM -> qwen3_llm/ + qwen3_text_encoder/
+#   python scripts/convert_model.py --model_type qwen3 \
+#     --model_path /mnt/hdfs/veomni/models/transformers/Qwen/Qwen3-0.6B \
+#     --output_dir /mnt/hdfs/veomni/models/seed_omni/Qwen3-0.6B-visual-instruction-tuning
+#   # 2) Qwen3-VL -> qwen3vl_vision/ (+ others); keep only the vision tower
+#   python scripts/convert_model.py --model_type qwen3_vl \
+#     --model_path /mnt/hdfs/veomni/models/transformers/Qwen/Qwen3-VL-2B-Instruct \
+#     --output_dir /tmp/qwen3vl_split
+#   cp -r /tmp/qwen3vl_split/qwen3vl_vision \
+#     /mnt/hdfs/veomni/models/seed_omni/Qwen3-0.6B-visual-instruction-tuning/
+#
+# Train:
+#   bash train.sh tasks/omni/train_omni.py \
+#     configs/seed_omni/Qwen/qwen3_0.6b/visual_instruction_tuning.yaml
+
+model:
+  model_path: /mnt/hdfs/veomni/models/seed_omni/Qwen3-0.6B
+  modules: configs/seed_omni/Qwen/qwen3_0.6b/modules_train_visual_instruction_tuning.yaml
+  train_graph: configs/seed_omni/Qwen/qwen3_0.6b/graph_train_visual_instruction_tuning.yaml
+  ops_implementation:
+    attn_implementation: flash_attention_2
+
+accelerator:
+  fsdp_config:
+    fsdp_mode: fsdp2
+    full_shard: true
+    reshard_after_forward: true
+    reshard_after_backward: true
+    forward_prefetch: true
+    offload: false
+    max_load_broadcast_size: 20.0
+    mixed_precision:
+      enable: true
+      param_dtype: bfloat16
+      reduce_dtype: float32
+  offload_config:
+    enable_activation: false
+    activation_gpu_limit: 0.0
+
+data:
+  data_type: seedomni
+  max_seq_len: 4096
+  train_path: configs/seed_omni/Qwen/qwen3_0.6b/data_visual_instruction_tuning.yaml
+  datasets_type: iterable
+  multisource_datasets_type: veomni_weighted_multisource
+  train_sample: 1000000
+  dataloader:
+    type: native
+    num_workers: 4
+    drop_last: true
+    pin_memory: true
+    prefetch_factor: 2
+
+train:
+  seed: 42
+  num_train_epochs: 1
+  global_batch_size: 32
+  micro_batch_size: 1
+  init_device: meta
+  dyn_bsz: false
+
+  gradient_checkpointing:
+    enable: true
+    enable_reentrant: false
+
+  optimizer:
+    type: adamw
+    lr: 1.0e-4
+    lr_min: 1.0e-6
+    lr_start: 0.0
+    lr_warmup_ratio: 0.03
+    lr_decay_style: cosine
+    lr_decay_ratio: 1.0
+    weight_decay: 0.01
+    max_grad_norm: 1.0
+    no_decay_params: []
+    no_decay_modules: []
+
+  checkpoint:
+    output_dir: outputs/qwen3_0.6b_visual_instruction_tuning
+    save_steps: 500
+    save_epochs: 0
+    save_hf_weights: true
+    hf_save_steps: 500
+    hf_save_epochs: 0
+  wandb:
+    enable: true
+    project: VeOmni_omni
+    name: qwen3_0.6b_visual_instruction_tuning
+
+infer:
+  infer_graph:
+    understanding: configs/seed_omni/Qwen/qwen3_0.6b/graph_infer_visual_instruction_tuning.yaml
+  infer_type: understanding
+  generation_kwargs:
+    max_new_tokens: 512
+    temperature: 0.0
+    top_p: 1.0
+    do_sample: false

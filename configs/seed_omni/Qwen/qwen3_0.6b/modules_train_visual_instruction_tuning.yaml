@@ -1,0 +1,44 @@
+# Per-module training overrides — Qwen3-0.6B visual instruction tuning.
+#
+# No bespoke "image text encoder" / dedicated checkpoint: the standard
+# qwen3_text_encoder, qwen3_llm and qwen3vl_vision modules are reused, and the
+# image-understanding behaviour is switched on here via per-module
+# ``model_config:`` overrides (merged into the module's HF config at build time).
+#
+# Trainable: qwen3vl_vision's patch merger + the vision special-token rows of
+# qwen3_text_encoder's tied embedding. Frozen: ViT blocks, the LLM backbone, and
+# all other embedding rows.
+#
+#   * qwen3vl_vision      — out_hidden_size retargets the patch merger to the LLM
+#                           hidden size (its linear_fc2 is the trainable
+#                           projection, dropped + re-init at load); disable_deepstack
+#                           drops the unused DeepStack features; freeze=True freezes
+#                           the ViT blocks but keeps the merger trainable.
+#   * qwen3_text_encoder  — enable_image switches on the Qwen3-VL image chat
+#                           template + image decode, and keeps only the vision
+#                           special-token rows trainable (their ids resolved from
+#                           the module's own tokenizer). Loaded DDP (replicated,
+#                           not sharded) so the per-row grad mask uses valid global
+#                           indices; weight_decay=0 so the frozen rows don't decay
+#                           under AdamW.
+#   * qwen3_llm           — freeze=True fully freezes the backbone (empty optimizer).
+qwen3vl_vision:
+  model:
+    model_path: /mnt/hdfs/veomni/models/seed_omni/Qwen3-VL-2B-Instruct/qwen3vl_vision
+    model_config:
+      out_hidden_size: 1024  # Qwen3-0.6B hidden size (ViT default out_hidden_size is 2048)
+      disable_deepstack: true
+      freeze: true
+
+qwen3_text_encoder:
+  model:
+    model_path: qwen3_text_encoder
+    model_config:
+      # Switches on the Qwen3-VL image template + image decode, and trains only
+      # the vision special-token embedding rows (<|vision_start|>, <|vision_end|>,
+      # <|image_pad|>) — their ids are resolved from the module's own tokenizer.
+      enable_image: true
+
+qwen3_llm:
+  model:
+    model_path: qwen3_llm

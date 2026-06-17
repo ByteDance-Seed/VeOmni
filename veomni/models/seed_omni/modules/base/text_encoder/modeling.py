@@ -15,7 +15,7 @@ from torch.distributed.tensor import DTensor
 from transformers import PreTrainedModel
 
 from ......distributed.parallel_state import get_parallel_state
-from ......ops.kernels.embed import AllToAllEmbedding
+from ......ops.kernels.embed import AllToAllEmbedding, VocabParallelLinear
 from .configuration import TextEncoderConfig
 from .modulemixin import TextEncoderModuleMixin, TextEncoderTraceMixin
 
@@ -146,3 +146,33 @@ class TextEncoder(TextEncoderModuleMixin, TextEncoderTraceMixin, PreTrainedModel
             "loss": loss,
             "logits": logits,
         }
+
+    def _project(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if not self.config.tie_word_embeddings:
+            return self.lm_head(hidden_states)
+
+        # Tied head reuses ``embed_tokens.weight`` directly, bypassing
+        # ``embed_tokens.__call__`` — and ``embed_tokens`` is its own FSDP2 unit
+        # (``_no_split_modules``), so the pre-forward all-gather that would
+        # materialize + cast the weight never fires here. Reconstruct it
+        # ourselves, mirroring ``_embed_tokens``.
+        weight = self.embed_tokens.weight
+        if isinstance(weight, DTensor):
+            # ``full_tensor()`` all-gathers the FSDP (``emb_fsdp``) hidden shards
+            # back to this rank's slice — under ``emb`` that is the vocab-sharded
+            # ``[vocab/emb_size, hidden]`` chunk; without ``emb`` it is the full
+            # ``[vocab, hidden]`` weight. Keep grad in training so the tied param
+            # still receives gradient; detach under inference (full_tensor()'s
+            # redistribute trips on an in-place ``detach_`` of a grad DTensor).
+            weight = weight.full_tensor() if torch.is_grad_enabled() else weight.detach().full_tensor()
+        # ``full_tensor()`` returns the fp32 master param (no mixed-precision
+        # cast), so align with the activation dtype before the matmul.
+        weight = weight.to(hidden_states.dtype)
+
+        ps = get_parallel_state()
+        if "emb" in ps.extra_parallel_sizes and ps.extra_parallel_enabled("emb"):
+            # Vocab-parallel tied head: ``weight`` above is only this rank's vocab
+            # chunk, so all-gather the vocab shards over ``emb`` and project to
+            # full-vocab logits (dual of ``AllToAllEmbedding``).
+            return VocabParallelLinear.apply(ps.extra_parallel_group("emb"), hidden_states, weight)
+        return F.linear(hidden_states, weight)

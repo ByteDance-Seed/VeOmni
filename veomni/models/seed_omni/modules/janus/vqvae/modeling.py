@@ -48,7 +48,7 @@ class JanusVqvae(JanusVqvaeModuleMixin, JanusVqvaeTraceMixin, PreTrainedModel):
     """
 
     config_class = JanusVqvaeConfig
-    processor_class = JanusVqvaeProcessor
+    image_processor_class = JanusVqvaeProcessor
     base_model_prefix = "janus_vqvae"
     main_input_name = "pixel_values"
     _no_split_modules: list = []
@@ -67,7 +67,7 @@ class JanusVqvae(JanusVqvaeModuleMixin, JanusVqvaeTraceMixin, PreTrainedModel):
         self.generation_embeddings = nn.Embedding(config.vq_config.num_embeddings, config.vq_config.embed_dim)
         self.generation_aligner = JanusVQVAEAlignerMLP(config.vq_config)
         self.generation_head = JanusVQVAEHead(config.vq_config)
-        self._processor: JanusVqvaeProcessor = None
+        self._image_processor: JanusVqvaeProcessor = None
         self.post_init()
 
     def freeze_model(self) -> None:

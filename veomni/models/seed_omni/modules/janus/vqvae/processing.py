@@ -13,7 +13,7 @@ We therefore inherit the upstream preprocess pipeline as-is and override
 Exposed as :class:`JanusVqvaeProcessor` so the per-module checkpoint
 ships a ``preprocessor_config.json`` saved by HF's standard
 ``save_pretrained``; loading back goes through
-:meth:`OmniModule.from_pretrained` via the ``processor_class`` class
+:meth:`OmniModule.from_pretrained` via the ``image_processor_class`` class
 attribute on :class:`JanusVqvae`.
 """
 

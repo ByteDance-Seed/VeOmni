@@ -76,7 +76,7 @@ from ..distributed.parallel_state import (
     init_parallel_state,
     use_parallel_state,
 )
-from ..models import build_processor, build_tokenizer
+from ..models import build_tokenizer
 from ..models.seed_omni.modeling_omni import OmniModel, _unwrap_module
 from ..models.seed_omni.tracemixin import TraceMixin, TraceResult
 from ..ops.batch_invariant_ops import set_batch_invariant_mode
@@ -648,31 +648,51 @@ class OmniModuleTrainer:
         label = type(model).__name__
         weights_path = self.base.args.model.model_path
 
-        if getattr(type(model), "processor_class", None) is not None and getattr(model, "_processor", None) is None:
+        # Per-module assets, tried in order. Each is loaded from the module's own
+        # checkpoint dir via the class declared on the model (``<kind>_class``,
+        # e.g. reads ``preprocessor_config.json`` so a sibling config can't shadow
+        # it) into ``_<kind>``. The tokenizer is the exception — it has no class
+        # slot (``class_attr is None``) and is built by ``build_tokenizer``.
+        # A module that doesn't declare a kind is skipped; a load failure is only
+        # a warning (the module raises lazily if that modality is actually used).
+        model_type = type(model)
+        asset_specs = [
+            # (human label, set attr, check attr, class attr | None)
+            # ``set attr`` is the public name so the tokenizer goes through its
+            # property setter (which may build chat markers / token ids); ``check
+            # attr`` is the private storage used for the already-loaded / asset
+            # collection. ``class attr`` None => load via ``build_tokenizer``.
+            ("processor", "_processor", "_processor", "processor_class"),
+            ("image processor", "_image_processor", "_image_processor", "image_processor_class"),
+            ("video processor", "_video_processor", "_video_processor", "video_processor_class"),
+            ("tokenizer", "tokenizer", "_tokenizer", None),
+        ]
+        for kind, set_attr, check_attr, class_attr in asset_specs:
+            if getattr(model, check_attr, None) is not None:
+                continue
             try:
-                model._processor = build_processor(weights_path)
-                logger.info_rank0(f"OmniModuleTrainer '{label}': loaded processor.")
-            except Exception as e:  # noqa: BLE001 — surfaced lazily by the module if truly needed
-                logger.warning_once(
-                    f"OmniModuleTrainer '{label}': could not load processor from {weights_path}: {e}. "
-                    "Training will fail if this modality's images are actually present."
-                )
+                if class_attr is None:
+                    asset = build_tokenizer(weights_path)
+                else:
+                    asset_class = getattr(model_type, class_attr, None)
+                    if asset_class is None:
+                        continue
+                    asset = asset_class.from_pretrained(weights_path)
+                setattr(model, set_attr, asset)
+            except Exception as e:  # noqa: BLE001 — surfaced lazily by the module if the modality is used
+                logger.warning_once(f"OmniModuleTrainer '{label}': could not load {kind} from {weights_path}: {e}.")
+                continue
+            logger.info_rank0(f"OmniModuleTrainer '{label}': loaded {kind}.")
 
-        try:
-            model.tokenizer = build_tokenizer(weights_path)
-            logger.info_rank0(f"OmniModuleTrainer '{label}': loaded tokenizer.")
-        except Exception as e:  # noqa: BLE001 — no tokenizer asset in this module dir
-            logger.warning_once(f"OmniModuleTrainer '{label}': could not load tokenizer from {weights_path}: {e}.")
-
-        # Assemble the savable assets (config + own processor + own tokenizer).
+        # Assemble the savable assets (config + own processors + tokenizer).
         assets: List[Any] = []
         cfg = getattr(model, "config", None)
         if cfg is not None:
             assets.append(cfg)
-        if getattr(model, "_processor", None) is not None:
-            assets.append(model._processor)
-        if getattr(model, "_tokenizer", None) is not None:
-            assets.append(model._tokenizer)
+        for attr in ("_processor", "_image_processor", "_video_processor", "_tokenizer"):
+            asset = getattr(model, attr, None)
+            if asset is not None:
+                assets.append(asset)
         self.base.model_assets = assets
 
 
@@ -730,7 +750,7 @@ class OmniTrainer:
         self._build_model()
         self._freeze_model_module()
         self._build_model_assets()
-        self.base._build_data_transform()
+        self._build_data_transform()
         self.base._build_dataset()
         self._build_collate_fn()
         self.base._build_dataloader()
@@ -794,7 +814,8 @@ class OmniTrainer:
 
     # —— Build: data_transform ───────────────────────────────────────────────────────────
     def _build_data_transform(self):
-        self.base.data_transform = build_data_transform("seedomni")
+        mm_configs = getattr(self.base.args.data, "mm_configs", None) or {}
+        self.base.data_transform = build_data_transform("seedomni", **mm_configs)
 
     # ── Build: collator ─────────────────────────────────────────────────────────
 
