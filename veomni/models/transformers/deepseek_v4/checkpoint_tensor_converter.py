@@ -32,15 +32,16 @@ tensors as they stream in from safetensors.
         model.layers.{i}.mlp.experts.gate_up_proj  [E, 2*I, H]
         model.layers.{i}.mlp.experts.down_proj     [E, H, I]
 
-The HF -> v5 weight rename ``w1 -> gate_proj`` / ``w2 -> down_proj`` /
-``w3 -> up_proj`` lives in ``transformers/conversion_mapping.py`` and is
-applied *before* this converter sees the keys. The regex below therefore
-matches the post-rename names.
+VeOmni's runtime loader reads safetensor keys directly and does not run HF's
+``WeightConverter`` objects, so this converter accepts both the raw on-disk
+``w1`` / ``w2`` / ``w3`` keys and the already-renamed
+``gate_proj`` / ``down_proj`` / ``up_proj`` form.
 """
 
 from __future__ import annotations
 
 import re
+from collections import defaultdict
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -51,9 +52,16 @@ from ...checkpoint_tensor_loading import ConvertedCheckpointTensor
 
 logger = logging.get_logger(__name__)
 
-# Matches per-expert split keys after HF's structural rename:
-# model.layers.0.mlp.experts.3.gate_proj.weight (and up_proj / down_proj).
-_EXPERT_PATTERN = re.compile(r"^(.+\.mlp)\.experts\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight$")
+# Matches raw DeepSeek-V4 checkpoint keys (w1/w2/w3) and post-rename
+# keys (gate_proj/up_proj/down_proj), e.g.:
+#   model.layers.0.mlp.experts.3.w1.weight
+#   model.layers.0.mlp.experts.3.gate_proj.weight
+_EXPERT_PATTERN = re.compile(r"^(.+\.mlp)\.experts\.(\d+)\.(w1|w2|w3|gate_proj|up_proj|down_proj)\.weight$")
+_PROJ_NAME_ALIASES = {
+    "w1": "gate_proj",
+    "w2": "down_proj",
+    "w3": "up_proj",
+}
 
 
 class DeepseekV4CheckpointTensorConverter:
@@ -84,6 +92,7 @@ class DeepseekV4CheckpointTensorConverter:
             return None
 
         prefix, expert_id_str, proj_name = match.groups()
+        proj_name = _PROJ_NAME_ALIASES.get(proj_name, proj_name)
         expert_id = int(expert_id_str)
         buf_key = (prefix, proj_name)
 
@@ -146,6 +155,27 @@ def create_deepseek_v4_checkpoint_tensor_converter(model):
 
 def convert_deepseek_v4_fqn_to_index_mapping(fqn_to_index_mapping: Dict[str, int]) -> Dict[str, int]:
     """Align HF safetensors index keys with fused expert parameter names."""
-    from ..._moe_fused_weight_map import convert_per_expert_fqn_mapping_to_fused
+    gate_up_shard_indices: Dict[str, List[int]] = defaultdict(list)
+    down_shard_indices: Dict[str, List[int]] = defaultdict(list)
+    converted: Dict[str, int] = {}
 
-    return convert_per_expert_fqn_mapping_to_fused(fqn_to_index_mapping, _EXPERT_PATTERN)
+    for fqn, shard_idx in fqn_to_index_mapping.items():
+        match = _EXPERT_PATTERN.match(fqn)
+        if not match:
+            converted[fqn] = shard_idx
+            continue
+
+        prefix, _expert_id, proj_name = match.groups()
+        proj_name = _PROJ_NAME_ALIASES.get(proj_name, proj_name)
+        if proj_name == "down_proj":
+            down_shard_indices[prefix].append(shard_idx)
+        else:
+            gate_up_shard_indices[prefix].append(shard_idx)
+
+    for prefix, indices in down_shard_indices.items():
+        converted[f"{prefix}.experts.down_proj"] = min(indices)
+
+    for prefix, indices in gate_up_shard_indices.items():
+        converted[f"{prefix}.experts.gate_up_proj"] = min(indices)
+
+    return converted
