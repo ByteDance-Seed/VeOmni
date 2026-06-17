@@ -8,7 +8,14 @@ from veomni.utils.tensor_utils import naflatten
 
 from ....conversation import ConversationItem, is_dummy
 from ....module import ModuleMixin, post_forward, pre_forward
-from ..packer import BAGEL_DUMMY_ANCHORS_META_KEY, fold_dummy_anchors, get_packed_batch
+from ..packer import (
+    BAGEL_DUMMY_ANCHORS_META_KEY,
+    assemble_training_forward,
+    ensure_training_layout_planned,
+    fold_dummy_anchors,
+    get_packed_batch,
+    scatter_training_hidden_states,
+)
 
 
 class BagelQwen2MoTModuleMixin(ModuleMixin):
@@ -26,55 +33,88 @@ class BagelQwen2MoTModuleMixin(ModuleMixin):
         bagel_packed_batch: Optional[dict[str, Any]] = None,
         **kwargs: Any,
     ) -> Dict[str, Any]:
-        del kwargs
         if bagel_packed_batch is None:
             bagel_packed_batch = get_packed_batch(conversation_list)
-        if bagel_packed_batch is None:
-            raise NotImplementedError("BagelQwen2MoT graph hooks currently require bagel_packed_batch.")
-        self._conversation_carrier = None
-        self._bagel_packed_batch = bagel_packed_batch
+        if bagel_packed_batch is not None:
+            self._conversation_carrier = None
+            self._bagel_packed_batch = bagel_packed_batch
 
-        text_embeds = bagel_packed_batch["packed_text_embeds"].to(device=self.device, dtype=self.dtype)
-        packed_sequence = text_embeds.new_zeros((int(bagel_packed_batch["sequence_length"]), text_embeds.shape[-1]))
-        packed_sequence[bagel_packed_batch["packed_text_indexes"]] = text_embeds
-
-        und_indexes = [bagel_packed_batch["packed_text_indexes"].to(device=self.device, dtype=torch.long)]
-        if "packed_vit_embeds" in bagel_packed_batch:
-            packed_sequence[bagel_packed_batch["packed_vit_token_indexes"]] = bagel_packed_batch[
-                "packed_vit_embeds"
-            ].to(device=self.device, dtype=self.dtype)
-            und_indexes.append(bagel_packed_batch["packed_vit_token_indexes"].to(device=self.device, dtype=torch.long))
-
-        gen_indexes = None
-        if "packed_latent_embeds" in bagel_packed_batch:
-            gen_indexes = bagel_packed_batch["packed_vae_token_indexes"].to(device=self.device, dtype=torch.long)
-            packed_sequence[gen_indexes] = bagel_packed_batch["packed_latent_embeds"].to(
-                device=self.device, dtype=self.dtype
+            text_embeds = bagel_packed_batch["packed_text_embeds"].to(device=self.device, dtype=self.dtype)
+            packed_sequence = text_embeds.new_zeros(
+                (int(bagel_packed_batch["sequence_length"]), text_embeds.shape[-1])
             )
-        else:
-            gen_indexes = torch.empty(0, device=self.device, dtype=torch.long)
+            packed_sequence[bagel_packed_batch["packed_text_indexes"]] = text_embeds
 
+            und_indexes = [bagel_packed_batch["packed_text_indexes"].to(device=self.device, dtype=torch.long)]
+            if "packed_vit_embeds" in bagel_packed_batch:
+                packed_sequence[bagel_packed_batch["packed_vit_token_indexes"]] = bagel_packed_batch[
+                    "packed_vit_embeds"
+                ].to(device=self.device, dtype=self.dtype)
+                und_indexes.append(
+                    bagel_packed_batch["packed_vit_token_indexes"].to(device=self.device, dtype=torch.long)
+                )
+
+            gen_indexes = None
+            if "packed_latent_embeds" in bagel_packed_batch:
+                gen_indexes = bagel_packed_batch["packed_vae_token_indexes"].to(device=self.device, dtype=torch.long)
+                packed_sequence[gen_indexes] = bagel_packed_batch["packed_latent_embeds"].to(
+                    device=self.device, dtype=self.dtype
+                )
+            else:
+                gen_indexes = torch.empty(0, device=self.device, dtype=torch.long)
+
+            return {
+                "packed_sequence": packed_sequence,
+                "sample_lens": bagel_packed_batch["sample_lens"],
+                "attention_mask": bagel_packed_batch["nested_attention_masks"],
+                "packed_position_ids": bagel_packed_batch["packed_position_ids"].to(
+                    device=self.device, dtype=torch.long
+                ),
+                "packed_und_token_indexes": torch.cat(und_indexes),
+                "packed_gen_token_indexes": gen_indexes,
+            }
+
+        if conversation_list is None:
+            raise NotImplementedError("BagelQwen2MoT graph hooks require conversation_list or bagel_packed_batch.")
+
+        ensure_training_layout_planned(conversation_list, kwargs, device=self.device)
+        assembled = assemble_training_forward(
+            conversation_list,
+            device=self.device,
+            dtype=self.dtype,
+            hidden_size=int(self.config.hidden_size),
+        )
+        self._conversation_carrier = conversation_list
+        self._assembled_training = assembled
         return {
-            "packed_sequence": packed_sequence,
-            "sample_lens": bagel_packed_batch["sample_lens"],
-            "attention_mask": bagel_packed_batch["nested_attention_masks"],
-            "packed_position_ids": bagel_packed_batch["packed_position_ids"].to(device=self.device, dtype=torch.long),
-            "packed_und_token_indexes": torch.cat(und_indexes),
-            "packed_gen_token_indexes": gen_indexes,
+            "packed_sequence": assembled["packed_sequence"],
+            "sample_lens": assembled["sample_lens"],
+            "attention_mask": assembled["nested_attention_masks"],
+            "packed_position_ids": assembled["packed_position_ids"],
+            "packed_und_token_indexes": assembled["packed_und_token_indexes"],
+            "packed_gen_token_indexes": assembled["packed_gen_token_indexes"],
         }
 
     @post_forward("forward")
     def forward_post(self, **outputs: Any) -> Dict[str, Any]:
         batch = getattr(self, "_bagel_packed_batch", None)
+        conversation = getattr(self, "_conversation_carrier", None)
+        assembled = getattr(self, "_assembled_training", None)
         self._bagel_packed_batch = None
-        if batch is None:
-            return outputs
+        self._conversation_carrier = None
+        self._assembled_training = None
         hidden_states = outputs["hidden_states"]
-        anchors = list(batch.get(BAGEL_DUMMY_ANCHORS_META_KEY, []) or [])
-        hidden_states = fold_dummy_anchors(hidden_states, anchors)
-        batch["packed_hidden_states"] = hidden_states
-        result: Dict[str, Any] = {"bagel_packed_batch": batch}
-        return result
+        if batch is not None:
+            anchors = list(batch.get(BAGEL_DUMMY_ANCHORS_META_KEY, []) or [])
+            hidden_states = fold_dummy_anchors(hidden_states, anchors)
+            batch["packed_hidden_states"] = hidden_states
+            return {"bagel_packed_batch": batch}
+        if conversation is not None and assembled is not None:
+            anchors = list(assembled.get("dummy_anchors", []) or [])
+            hidden_states = fold_dummy_anchors(hidden_states, anchors)
+            scatter_training_hidden_states(conversation, hidden_states)
+            return {"conversation_list": conversation}
+        return outputs
 
     def reset_local_inference_state(self) -> None:
         self._past_key_values = None

@@ -9,7 +9,13 @@ from ....conversation import ConversationItem, maybe_merge_outputs, seal_outputs
 from ....generation_graph import FSM_SIGNAL_KEY
 from ....module import post_forward, pre_forward
 from ...base.text_encoder.modulemixin import TextEncoderModuleMixin
-from ..packer import get_packed_batch, pack_training_conversation, set_packed_batch, zero_hidden_from_batch
+from ..packer import (
+    collect_ce_loss_inputs,
+    get_packed_batch,
+    materialize_training_text_ids,
+    scatter_training_text_embeds,
+    zero_hidden_from_batch,
+)
 
 
 SIGNAL_TEXT_DONE = "text_done"
@@ -37,22 +43,33 @@ class BagelTextEncoderModuleMixin(TextEncoderModuleMixin):
     ) -> Dict[str, Any]:
         if bagel_packed_batch is None:
             bagel_packed_batch = get_packed_batch(conversation_list)
-        if bagel_packed_batch is None and conversation_list is not None:
-            bagel_packed_batch = pack_training_conversation(self, conversation_list, kwargs)
-            set_packed_batch(conversation_list, bagel_packed_batch)
-        if bagel_packed_batch is None:
+        if bagel_packed_batch is not None:
+            self._bagel_packed_batch = bagel_packed_batch
+            return {"input_ids": bagel_packed_batch["packed_text_ids"]}
+        if conversation_list is None:
             return kwargs
-        self._bagel_packed_batch = bagel_packed_batch
-        return {"input_ids": bagel_packed_batch["packed_text_ids"]}
+        packed_text_ids = materialize_training_text_ids(self, conversation_list)
+        if packed_text_ids is None:
+            return kwargs
+        self._conversation_carrier = conversation_list
+        self._training_encode = True
+        return {"input_ids": packed_text_ids}
 
     @post_forward("encode")
     def encode_post(self, **outputs: Any) -> Dict[str, Any]:
         batch = self._bagel_packed_batch
+        conversation = getattr(self, "_conversation_carrier", None)
+        training_encode = getattr(self, "_training_encode", False)
         self._bagel_packed_batch = None
-        if batch is None:
-            return super().encode_post(**outputs)
-        batch["packed_text_embeds"] = outputs["inputs_embeds"]
-        return {"bagel_packed_batch": batch}
+        self._conversation_carrier = None
+        self._training_encode = False
+        if batch is not None:
+            batch["packed_text_embeds"] = outputs["inputs_embeds"]
+            return {"bagel_packed_batch": batch}
+        if training_encode and conversation is not None:
+            scatter_training_text_embeds(conversation, outputs["inputs_embeds"])
+            return {"conversation_list": conversation}
+        return super().encode_post(**outputs)
 
     @pre_forward("decode")
     def decode_pre(
@@ -63,35 +80,57 @@ class BagelTextEncoderModuleMixin(TextEncoderModuleMixin):
     ) -> Dict[str, Any]:
         if bagel_packed_batch is None:
             bagel_packed_batch = get_packed_batch(conversation_list)
-        if bagel_packed_batch is None:
-            return kwargs
-        self._bagel_packed_batch = bagel_packed_batch
-        if "ce_loss_indexes" not in bagel_packed_batch:
+        if bagel_packed_batch is not None:
+            self._bagel_packed_batch = bagel_packed_batch
+            if "ce_loss_indexes" not in bagel_packed_batch:
+                return {
+                    "hidden_states": zero_hidden_from_batch(
+                        bagel_packed_batch,
+                        hidden_size=int(self.config.hidden_size),
+                        device=self.device,
+                        dtype=self.dtype,
+                    )
+                }
+            return {"hidden_states": bagel_packed_batch["packed_hidden_states"][bagel_packed_batch["ce_loss_indexes"]]}
+        self._conversation_carrier = conversation_list
+        ce_inputs = collect_ce_loss_inputs(conversation_list)
+        if ce_inputs is None:
             return {
-                "hidden_states": zero_hidden_from_batch(
-                    bagel_packed_batch,
-                    hidden_size=int(self.config.hidden_size),
+                "hidden_states": torch.zeros(
+                    1,
+                    int(self.config.hidden_size),
                     device=self.device,
                     dtype=self.dtype,
                 )
             }
-        return {"hidden_states": bagel_packed_batch["packed_hidden_states"][bagel_packed_batch["ce_loss_indexes"]]}
+        hidden_states, _ = ce_inputs
+        return {"hidden_states": hidden_states.to(device=self.device, dtype=self.dtype)}
 
     @post_forward("decode")
     def decode_post(self, **outputs: Any) -> Dict[str, Any]:
         batch = self._bagel_packed_batch
+        conversation = getattr(self, "_conversation_carrier", None)
         self._bagel_packed_batch = None
-        if batch is None:
-            return super().decode_post(**outputs)
-        result: Dict[str, Any] = {"bagel_packed_batch": batch}
-        logits = outputs["logits"]
-        if "ce_loss_indexes" not in batch:
-            result["_loss"] = logits.sum() * 0.0
+        self._conversation_carrier = None
+        if batch is not None:
+            result: Dict[str, Any] = {"bagel_packed_batch": batch}
+            logits = outputs["logits"]
+            if "ce_loss_indexes" not in batch:
+                result["_loss"] = logits.sum() * 0.0
+                return result
+            ce = F.cross_entropy(logits, batch["packed_label_ids"], reduction="none")
+            batch["ce_vector"] = ce
+            result["_loss"] = ce.mean()
             return result
-        ce = F.cross_entropy(logits, batch["packed_label_ids"], reduction="none")
-        batch["ce_vector"] = ce
-        result["_loss"] = ce.mean()
-        return result
+        if conversation is not None:
+            ce_inputs = collect_ce_loss_inputs(conversation)
+            logits = outputs["logits"]
+            if ce_inputs is None:
+                return {"conversation_list": conversation, "_loss": logits.sum() * 0.0}
+            _, labels = ce_inputs
+            ce = F.cross_entropy(logits, labels.to(device=logits.device, dtype=torch.long), reduction="none")
+            return {"conversation_list": conversation, "_loss": ce.mean()}
+        return super().decode_post(**outputs)
 
     @property
     def tokenizer(self) -> Any:

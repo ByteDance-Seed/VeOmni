@@ -570,6 +570,93 @@ def test_bagel_train_yaml_loads_with_v2_module_names():
     assert "end" in endpoints
 
 
+def test_bagel_train_graph_fan_in_execution_order():
+    from veomni.models.seed_omni.training_graph import TrainingGraph
+
+    graph = TrainingGraph(_bagel_train_edges())
+    order = graph.execution_order
+    assert order.index("bagel_qwen2_mot.forward") > order.index("bagel_text_encoder.encode")
+    assert order.index("bagel_qwen2_mot.forward") > order.index("bagel_siglip_navit.forward")
+    assert order.index("bagel_qwen2_mot.forward") > order.index("bagel_flow_connector.embed_latent")
+    assert order.index("bagel_flow_connector.embed_latent") > order.index("bagel_vae.encode")
+    assert set(graph.sources) == {
+        "bagel_text_encoder.encode",
+        "bagel_siglip_navit.forward",
+        "bagel_vae.encode",
+    }
+
+
+def test_bagel_training_text_embed_meta_preserves_grad():
+    from veomni.models.seed_omni.modules.bagel.packer.item_layout import (
+        BAGEL_TRAIN_TEXT_EMBEDS,
+        BAGEL_TRAIN_TEXT_IDS,
+        scatter_training_text_embeds,
+    )
+
+    item = ConversationItem(
+        type="text",
+        value=torch.tensor([11, 12]),
+        role="assistant",
+        meta={BAGEL_TRAIN_TEXT_IDS: torch.tensor([11, 12])},
+    )
+    packed_text_embeds = torch.randn(2, 4, requires_grad=True)
+
+    scatter_training_text_embeds([[item]], packed_text_embeds)
+    assert item.meta[BAGEL_TRAIN_TEXT_EMBEDS].requires_grad
+
+    item.meta[BAGEL_TRAIN_TEXT_EMBEDS].sum().backward()
+    assert packed_text_embeds.grad is not None
+    assert packed_text_embeds.grad.abs().sum() > 0
+
+
+def test_bagel_training_flow_metadata_matches_packed_noising_dtype():
+    from veomni.models.seed_omni.modules.bagel.packer.item_layout import (
+        patchified_clean_latents,
+        prepare_flow_training_metadata,
+    )
+    from veomni.models.seed_omni.modules.bagel.packer.packing import _shifted_timesteps
+
+    latent = torch.arange(4, dtype=torch.float32).reshape(1, 1, 2, 2)
+    noise = torch.linspace(-1.0, 1.0, steps=4, dtype=torch.float32).reshape(1, 4)
+    raw_timesteps = torch.tensor([0.25], dtype=torch.float32)
+    item = ConversationItem(
+        type="image",
+        value=latent,
+        role="assistant",
+        meta={
+            "padded_latent": latent,
+            "patchified_vae_latent_shape": (1, 1),
+            "flow_timesteps": raw_timesteps,
+            "flow_noise": noise,
+        },
+    )
+
+    noised, target, shifted = prepare_flow_training_metadata(
+        item,
+        device=torch.device("cpu"),
+        dtype=torch.bfloat16,
+        timestep_shift=3.0,
+    )
+
+    clean = patchified_clean_latents(latent, 1, 1).to(dtype=torch.bfloat16)
+    expected_noise = noise.to(dtype=clean.dtype)
+    expected_shifted = _shifted_timesteps(raw_timesteps, 3.0)
+    expected_noised = (1.0 - expected_shifted.reshape(-1, 1)) * clean + expected_shifted.reshape(
+        -1, 1
+    ) * expected_noise
+
+    assert shifted.dtype == torch.float32
+    assert torch.equal(target, expected_noise - clean)
+    assert torch.equal(noised, expected_noised)
+
+
+def _bagel_train_edges() -> list[dict]:
+    import yaml
+
+    data = yaml.safe_load((_bagel_cfg_dir() / "graph_train.yaml").read_text())
+    return data["training_graph"]
+
+
 @pytest.mark.parametrize(
     "infer_graph", ["graph_infer_und.yaml", "graph_infer_gen.yaml", "graph_infer_interleave.yaml"]
 )

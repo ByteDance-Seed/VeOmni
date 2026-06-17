@@ -147,7 +147,13 @@ def _write_report(output_dir: Path, report: dict[str, Any]) -> None:
 def _fresh_micro_batch(batch_kwargs: Mapping[str, Any], device: torch.device) -> dict[str, Any]:
     # SeedOmni graph nodes mutate ConversationItem values in place. Gradient
     # accumulation therefore needs independent batch objects for each micro-step.
-    return to_device(deepcopy(dict(batch_kwargs)), device)
+    batch = deepcopy(dict(batch_kwargs))
+    # Synthetic parity batches bypass the dataloader, so add ds_idx for multisource meter accounting.
+    if "ds_idx" not in batch:
+        conversation_list = batch.get("conversation_list")
+        batch_size = len(conversation_list) if conversation_list else 1
+        batch["ds_idx"] = [0] * batch_size
+    return to_device(batch, device)
 
 
 def main() -> None:

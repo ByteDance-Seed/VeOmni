@@ -8,7 +8,7 @@ from PIL import Image
 
 from ....conversation import ConversationItem
 from ....module import ModuleMixin, post_forward, pre_forward
-from ..packer import add_dummy_anchor_to_batch, append_dummy_anchor, conversation_samples, get_packed_batch
+from ..packer import append_dummy_anchor, conversation_samples, get_packed_batch
 
 
 class BagelSiglipNavitModuleMixin(ModuleMixin):
@@ -89,6 +89,7 @@ class BagelSiglipNavitModuleMixin(ModuleMixin):
                 vit_token_lens = item.meta["vit_token_lens"].detach().reshape(-1).to(dtype=torch.int32)
                 length = int(vit_token_lens.sum().item())
                 item.meta["packed_vit_embeds"] = image_embeds[offset : offset + length]
+                item.meta["image_embeds"] = image_embeds[offset : offset + length].detach()
                 item.meta["image_embeds_ready"] = True
                 offset += length
             return {"conversation_list": conversation}
@@ -98,8 +99,6 @@ class BagelSiglipNavitModuleMixin(ModuleMixin):
             return {"conversation_list": conversation}
         if batch is not None and not skip:
             batch["packed_vit_embeds"] = outputs["image_embeds"]
-        if batch is not None and dummy_anchor is not None:
-            add_dummy_anchor_to_batch(batch, dummy_anchor)
         return {"bagel_packed_batch": batch}
 
     def dummy_inputs(self) -> Dict[str, Any]:

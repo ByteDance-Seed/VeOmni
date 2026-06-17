@@ -7,80 +7,193 @@ import torch
 from ....conversation import ConversationItem
 from ....generation_graph import FSM_SIGNAL_KEY
 from ....module import ModuleMixin, post_forward, pre_forward
-from ..packer import add_dummy_anchor_to_batch, get_packed_batch, zero_hidden_from_batch
+from ..packer import (
+    append_dummy_anchor,
+    collect_mse_loss_inputs,
+    conversation_samples,
+    get_packed_batch,
+    patchified_clean_latents,
+    prepare_flow_training_metadata,
+    zero_hidden_from_batch,
+)
 
 
 SIGNAL_IMAGE_COMPLETE = "image_complete"
 
 
 class BagelFlowConnectorModuleMixin(ModuleMixin):
+    def init_omni_state(self) -> None:
+        self._bagel_packed_batch: Optional[dict[str, Any]] = None
+        self._conversation_carrier: Optional[list[list[ConversationItem]]] = None
+        self._raw_training_items: list[ConversationItem] = []
+        self._raw_training_skip: bool = False
+
     @pre_forward("embed_latent")
     def embed_latent_pre(self, **kwargs: Any) -> Dict[str, Any]:
         bagel_packed_batch = kwargs.get("bagel_packed_batch")
+        conversation_list = kwargs.get("conversation_list")
         if bagel_packed_batch is None:
-            bagel_packed_batch = get_packed_batch(kwargs.get("conversation_list"))
-        if bagel_packed_batch is None:
+            bagel_packed_batch = get_packed_batch(conversation_list)
+        if bagel_packed_batch is not None:
+            self._bagel_packed_batch = bagel_packed_batch
+            patched_latents = self._patched_latents(bagel_packed_batch)
+            if patched_latents is None:
+                return self._dummy_latent_inputs()
+            noised_latents, mse_target = patched_latents
+            bagel_packed_batch["mse_target"] = mse_target
+            return {
+                "latents": noised_latents,
+                "position_ids": bagel_packed_batch["packed_latent_position_ids"],
+                "timesteps": bagel_packed_batch["shifted_timesteps"],
+            }
+
+        self._conversation_carrier = conversation_list
+        self._raw_training_items = []
+        self._raw_training_skip = False
+        if conversation_list is None:
             return kwargs
-        self._bagel_packed_batch = bagel_packed_batch
-        patched_latents = self._patched_latents(bagel_packed_batch)
-        if patched_latents is None:
+
+        timestep_shift = float(kwargs.get("timestep_shift", 3.0))
+        self._raw_training_items = [
+            item
+            for sample in conversation_samples(conversation_list)
+            for item in sample
+            if item.type == "image"
+            and item.role == "assistant"
+            and torch.is_tensor(item.meta.get("padded_latent"))
+            and not torch.is_tensor(item.meta.get("packed_latent_embeds"))
+        ]
+        if not self._raw_training_items:
+            self._raw_training_skip = True
             return self._dummy_latent_inputs()
-        noised_latents, mse_target = patched_latents
-        bagel_packed_batch["mse_target"] = mse_target
+
+        latents_parts: list[torch.Tensor] = []
+        position_parts: list[torch.Tensor] = []
+        timestep_parts: list[torch.Tensor] = []
+        for item in self._raw_training_items:
+            flow_meta = prepare_flow_training_metadata(
+                item,
+                device=self.device,
+                dtype=self.dtype,
+                timestep_shift=timestep_shift,
+            )
+            if flow_meta is None:
+                continue
+            noised, target, shifted = flow_meta
+            item.meta["bagel_train_mse_target"] = target.detach()
+            latents_parts.append(noised)
+            latent_pos = item.meta.get("packed_latent_position_ids")
+            if torch.is_tensor(latent_pos):
+                position_parts.append(latent_pos.detach().reshape(-1))
+            timestep_parts.append(shifted.reshape(-1))
+
+        if not latents_parts:
+            self._raw_training_skip = True
+            return self._dummy_latent_inputs()
+
+        self._raw_training_latents = torch.cat(latents_parts, dim=0)
+        self._raw_training_positions = torch.cat(position_parts, dim=0).to(device=self.device, dtype=torch.long)
+        self._raw_training_timesteps = torch.cat(timestep_parts, dim=0).to(device=self.device, dtype=torch.float32)
         return {
-            "latents": noised_latents,
-            "position_ids": bagel_packed_batch["packed_latent_position_ids"],
-            "timesteps": bagel_packed_batch["shifted_timesteps"],
+            "latents": self._raw_training_latents,
+            "position_ids": self._raw_training_positions,
+            "timesteps": self._raw_training_timesteps,
         }
 
     @pre_forward("decode_velocity")
     def decode_velocity_pre(self, **kwargs: Any) -> Dict[str, Any]:
         bagel_packed_batch = kwargs.get("bagel_packed_batch")
+        conversation_list = kwargs.get("conversation_list")
         if bagel_packed_batch is None:
-            bagel_packed_batch = get_packed_batch(kwargs.get("conversation_list"))
-        if bagel_packed_batch is None:
-            return kwargs
-        self._bagel_packed_batch = bagel_packed_batch
-        if "mse_loss_indexes" not in bagel_packed_batch or "packed_hidden_states" not in bagel_packed_batch:
+            bagel_packed_batch = get_packed_batch(conversation_list)
+        if bagel_packed_batch is not None:
+            self._bagel_packed_batch = bagel_packed_batch
+            if "mse_loss_indexes" not in bagel_packed_batch or "packed_hidden_states" not in bagel_packed_batch:
+                return {
+                    "hidden_states": zero_hidden_from_batch(
+                        bagel_packed_batch,
+                        hidden_size=int(self.config.hidden_size),
+                        device=self.device,
+                        dtype=self.dtype,
+                    )
+                }
             return {
-                "hidden_states": zero_hidden_from_batch(
-                    bagel_packed_batch,
-                    hidden_size=int(self.config.hidden_size),
+                "hidden_states": bagel_packed_batch["packed_hidden_states"][bagel_packed_batch["mse_loss_indexes"]]
+            }
+        self._conversation_carrier = conversation_list
+        mse_inputs = collect_mse_loss_inputs(conversation_list)
+        if mse_inputs is None:
+            return {
+                "hidden_states": torch.zeros(
+                    1,
+                    int(self.config.hidden_size),
                     device=self.device,
                     dtype=self.dtype,
                 )
             }
-        return {"hidden_states": bagel_packed_batch["packed_hidden_states"][bagel_packed_batch["mse_loss_indexes"]]}
+        hidden_states, _ = mse_inputs
+        return {"hidden_states": hidden_states.to(device=self.device, dtype=self.dtype)}
 
     @post_forward("embed_latent")
     def embed_latent_post(self, **outputs: Any) -> Dict[str, Any]:
         batch = getattr(self, "_bagel_packed_batch", None)
+        conversation = getattr(self, "_conversation_carrier", None)
+        raw_items = getattr(self, "_raw_training_items", [])
+        raw_skip = getattr(self, "_raw_training_skip", False)
         self._bagel_packed_batch = None
-        if batch is None:
-            return outputs
-        result: Dict[str, Any] = {"bagel_packed_batch": batch}
-        if "fixed_noise" in batch:
-            batch["packed_latent_embeds"] = outputs["latent_embeds"]
-        else:
-            add_dummy_anchor_to_batch(batch, outputs["latent_embeds"].sum() * 0.0)
-        return result
+        self._conversation_carrier = None
+        self._raw_training_items = []
+        self._raw_training_skip = False
+        if batch is not None:
+            result: Dict[str, Any] = {"bagel_packed_batch": batch}
+            if "fixed_noise" in batch:
+                batch["packed_latent_embeds"] = outputs["latent_embeds"]
+            return result
+        if conversation is not None and raw_skip and not raw_items:
+            dummy_anchor = outputs["latent_embeds"].sum() * 0.0
+            append_dummy_anchor(conversation, dummy_anchor)
+            return {"conversation_list": conversation}
+        if raw_items:
+            latent_embeds = outputs["latent_embeds"]
+            offset = 0
+            for item in raw_items:
+                latent_shape = item.meta.get("patchified_vae_latent_shape")
+                latent = item.meta.get("padded_latent")
+                if isinstance(latent_shape, tuple) and torch.is_tensor(latent):
+                    length = int(patchified_clean_latents(latent, int(latent_shape[0]), int(latent_shape[1])).shape[0])
+                else:
+                    length = int(latent_embeds.shape[0])
+                item.meta["packed_latent_embeds"] = latent_embeds[offset : offset + length]
+                offset += length
+            return {"conversation_list": conversation}
+        return outputs
 
     @post_forward("decode_velocity")
     def decode_velocity_post(self, **outputs: Any) -> Dict[str, Any]:
         batch = getattr(self, "_bagel_packed_batch", None)
+        conversation = getattr(self, "_conversation_carrier", None)
         self._bagel_packed_batch = None
-        if batch is None:
-            return outputs
-        result: Dict[str, Any] = {"bagel_packed_batch": batch}
-        if "mse_target" in batch and "mse_loss_indexes" in batch:
+        self._conversation_carrier = None
+        if batch is not None:
+            result: Dict[str, Any] = {"bagel_packed_batch": batch}
+            if "mse_target" in batch and "mse_loss_indexes" in batch:
+                velocity = outputs["velocity"]
+                mse_target = batch["mse_target"].to(device=velocity.device, dtype=velocity.dtype)
+                mse = (velocity - mse_target).square()
+                batch["mse_tensor"] = mse
+                result["_loss"] = mse.mean()
+            else:
+                result["_loss"] = outputs["velocity"].sum() * 0.0
+            return result
+        if conversation is not None:
+            mse_inputs = collect_mse_loss_inputs(conversation)
             velocity = outputs["velocity"]
-            mse_target = batch["mse_target"].to(device=velocity.device, dtype=velocity.dtype)
-            mse = (velocity - mse_target).square()
-            batch["mse_tensor"] = mse
-            result["_loss"] = mse.mean()
-        else:
-            result["_loss"] = outputs["velocity"].sum() * 0.0
-        return result
+            if mse_inputs is None:
+                return {"conversation_list": conversation, "_loss": velocity.sum() * 0.0}
+            _, mse_target = mse_inputs
+            mse = (velocity - mse_target.to(device=velocity.device, dtype=velocity.dtype)).square()
+            return {"conversation_list": conversation, "_loss": mse.mean()}
+        return outputs
 
     def _dummy_latent_inputs(self) -> Dict[str, torch.Tensor]:
         return {

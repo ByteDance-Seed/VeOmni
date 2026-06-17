@@ -1,9 +1,8 @@
 # BAGEL-7B-MoT training DAG.
 training_graph:
-  - { from: bagel_siglip_navit,                   to: bagel_text_encoder.encode }
-  - { from: bagel_vae.encode,                     to: bagel_text_encoder.encode }
-  - { from: bagel_text_encoder.encode,            to: bagel_flow_connector.embed_latent }
   - { from: bagel_text_encoder.encode,            to: bagel_qwen2_mot }
+  - { from: bagel_siglip_navit,                   to: bagel_qwen2_mot }
+  - { from: bagel_vae.encode,                     to: bagel_flow_connector.embed_latent }
   - { from: bagel_flow_connector.embed_latent,    to: bagel_qwen2_mot }
   - { from: bagel_qwen2_mot,                      to: bagel_text_encoder.decode }
   - { from: bagel_qwen2_mot,                      to: bagel_flow_connector.decode_velocity }
