@@ -574,16 +574,17 @@ def qwen3_5_decoder_layer_forward_patched(
         "cu_seq_lens_q must be provided to support varlen Flash Linear Attention, varlen Conv1D,"
         "and to remove the full Flash Attention CPU-GPU sync."
     )
+    linear_attn_cu_seq_lens_q = kwargs.pop("linear_attn_cu_seq_lens_q", cu_seq_lens_q)
 
     # Token Mixer
     if self.layer_type == "linear_attention":
-        # Modification: pass cu_seq_lens_q through to Qwen3_5GatedDeltaNet.forward.
+        # Modification: pass linear-attention cu_seqlens through to Qwen3_5GatedDeltaNet.forward.
         hidden_states = self.linear_attn(
             hidden_states=hidden_states,
             cache_params=past_key_values,
             cache_position=cache_position,
             attention_mask=attention_mask,
-            cu_seq_lens_q=cu_seq_lens_q,
+            cu_seq_lens_q=linear_attn_cu_seq_lens_q,
         )
     elif self.layer_type == "full_attention":
         # Self Attention
