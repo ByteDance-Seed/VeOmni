@@ -265,8 +265,11 @@ class BagelFlowConnectorModuleMixin(ModuleMixin):
         query_lens = self._meta_tensor(item, "query_lens", dtype=torch.int32)
 
         packed_sequence = text_embeds.new_zeros((int(query_lens.sum().item()), self.config.hidden_size))
-        packed_sequence[text_indexes] = text_embeds
-        packed_sequence[vae_token_indexes] = latent_embeds.to(dtype=packed_sequence.dtype)
+        seq_device = packed_sequence.device
+        text_indexes = text_indexes.to(device=seq_device)
+        vae_token_indexes = vae_token_indexes.to(device=seq_device)
+        packed_sequence[text_indexes] = text_embeds.to(device=seq_device, dtype=packed_sequence.dtype)
+        packed_sequence[vae_token_indexes] = latent_embeds.to(device=seq_device, dtype=packed_sequence.dtype)
 
         item.value = packed_sequence
         item.meta["current_latents"] = latents.detach()
@@ -292,9 +295,7 @@ class BagelFlowConnectorModuleMixin(ModuleMixin):
         latents = latents.detach().to(device=self.device, dtype=self.dtype)
         position_ids = self._meta_tensor(item, "vae_position_ids", dtype=torch.long)
         timestep = self._current_timestep(item)
-        latent_embeds = self.vae2llm(latents)
-        latent_embeds = latent_embeds + self.time_embedder(timestep.reshape(-1)[:1])
-        latent_embeds = latent_embeds + self.latent_pos_embed(position_ids)
+        latent_embeds = self._combine_latent_embeds(latents, position_ids, timestep.reshape(-1)[:1])
         latent_embeds = latent_embeds.to(dtype=self.dtype)
         text_embeds = item.meta.get("text_embeds")
         if not torch.is_tensor(text_embeds):
@@ -305,8 +306,11 @@ class BagelFlowConnectorModuleMixin(ModuleMixin):
         query_lens = self._meta_tensor(item, "query_lens", dtype=torch.int32)
 
         packed_sequence = text_embeds.new_zeros((int(query_lens.sum().item()), self.config.hidden_size))
-        packed_sequence[text_indexes] = text_embeds
-        packed_sequence[vae_token_indexes] = latent_embeds.to(dtype=packed_sequence.dtype)
+        seq_device = packed_sequence.device
+        text_indexes = text_indexes.to(device=seq_device)
+        vae_token_indexes = vae_token_indexes.to(device=seq_device)
+        packed_sequence[text_indexes] = text_embeds.to(device=seq_device, dtype=packed_sequence.dtype)
+        packed_sequence[vae_token_indexes] = latent_embeds.to(device=seq_device, dtype=packed_sequence.dtype)
 
         item.value = packed_sequence
         item.meta["vae_context_latents"] = latents.detach()
@@ -336,7 +340,9 @@ class BagelFlowConnectorModuleMixin(ModuleMixin):
             raise ValueError("BAGEL flow decode requires hidden states from qwen2_mot.")
 
         velocity_all = self.decode_velocity(hidden_states=hidden_states)["velocity"]
-        vae_token_indexes = self._meta_tensor(item, "vae_token_indexes", dtype=torch.long)
+        vae_token_indexes = self._meta_tensor(item, "vae_token_indexes", dtype=torch.long).to(
+            device=velocity_all.device
+        )
         base_velocity = velocity_all[vae_token_indexes]
         velocity = base_velocity
         cfg_text_hidden_states = None

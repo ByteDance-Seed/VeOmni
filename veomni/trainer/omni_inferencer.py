@@ -36,7 +36,6 @@ from ..distributed.parallel_state import use_parallel_state
 from ..models.seed_omni import build_conversation
 from ..models.seed_omni.modeling_omni import OmniModel
 from ..utils import helper
-from ..utils.device import get_device_type
 from .base import BaseTrainer
 from .omni_trainer import OmniModuleTrainer, OmniTrainer
 
@@ -111,14 +110,10 @@ class OmniModuleInferencer(OmniModuleTrainer):
         return self.base.model
 
     def _build_model_eager(self) -> None:
-        """Eager ``from_pretrained`` load with a launch-aware ``device_map``.
+        """Eager ``from_pretrained`` load with ``device_map='auto'``.
 
-        * **Single-process** (no torchrun) — ``device_map='auto'`` lets accelerate
-          spread the one model across all visible GPUs (and offload if needed).
-        * **Distributed** (torchrun, mixed with FSDP/emb modules) — every rank
-          sees all GPUs. Pin a **full replica to this rank's own device**
-          (``{"": "<device>:<local_rank>"}``; the ``""`` key targets the whole
-          model), co-located with this rank's sharded modules.
+        Full eager inference runs single-process and lets accelerate spread the
+        model across visible GPUs (and offload if needed).
         """
         args: VeOmniArguments = self.base.args
         assert args.train.accelerator.fsdp_config.fsdp_mode == "eager"
@@ -128,11 +123,7 @@ class OmniModuleInferencer(OmniModuleTrainer):
         overrides = dict(args.model.model_config or {})
         model_type = read_model_type(model_path)
         cls = OMNI_MODEL_REGISTRY[model_type]()
-        if dist.is_initialized() or "LOCAL_RANK" in os.environ:
-            # Distributed launch: one full replica pinned to this rank's device.
-            device_map = {"": f"{get_device_type()}:{int(os.getenv('LOCAL_RANK', 0))}"}
-        else:
-            device_map = "auto"
+        device_map = "auto"
         logger.info_rank0(
             f"OmniModuleInferencer '{self.subfolder_name}': eager load "
             f"(model_type={model_type}, cls={cls.__name__}, device_map={device_map}) from {model_path}"

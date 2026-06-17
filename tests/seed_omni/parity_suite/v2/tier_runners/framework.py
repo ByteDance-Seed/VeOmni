@@ -524,7 +524,7 @@ def _run_distributed_infer_policy(
     probe_names = tuple(str(name) for name in options.get("compare_probes", ()) or driver.case.run.probes)
     baseline_report: Mapping[str, Any] | None = None
     if compare_eager:
-        baseline_report = _run_v2_infer_fsdp2(
+        baseline_report = _run_v2_infer_eager(
             driver,
             request_kwargs,
             generation_kwargs=generation_kwargs,
@@ -538,12 +538,10 @@ def _run_distributed_infer_policy(
                 )
             ),
             infer_type=str(options.get("infer_type", driver.case.graph.name)),
-            output_dir=output_dir / "baseline_rank1",
+            output_dir=output_dir / "baseline_eager",
             dtype=dtype,
-            nproc_per_node=1,
             timeout=int(options.get("timeout", 1800)),
             probe_names=probe_names,
-            require_fsdp_modules=False,
         )
     report = _run_v2_infer_fsdp2(
         driver,
@@ -667,6 +665,150 @@ def _infer_fsdp2_numeric_reports(
     return reports
 
 
+_DISTRIBUTED_LAUNCH_ENV_VARS = (
+    "RANK",
+    "WORLD_SIZE",
+    "LOCAL_RANK",
+    "LOCAL_WORLD_SIZE",
+    "MASTER_ADDR",
+    "MASTER_PORT",
+)
+
+
+def _subprocess_env_without_distributed_launch() -> dict[str, str]:
+    env = dict(os.environ)
+    for key in _DISTRIBUTED_LAUNCH_ENV_VARS:
+        env.pop(key, None)
+    return env
+
+
+def _infer_worker_argv(
+    driver: Any,
+    *,
+    config_path: Path,
+    modules_config: Path,
+    infer_type: str,
+    output_dir: Path,
+    worker_path: Path,
+) -> list[str]:
+    return [
+        str(worker_path),
+        str(config_path),
+        "--model.model_path",
+        str(driver.case.model.v2_model.model_root),
+        "--infer.model_path",
+        str(driver.case.model.v2_model.model_root),
+        "--infer.infer_type",
+        infer_type,
+        "--infer.modules",
+        str(modules_config),
+        "--infer.prompt",
+        "parity-suite-infer",
+        "--infer.output_dir",
+        str(output_dir),
+        "--infer.seed",
+        str(driver.case.model.seed),
+    ]
+
+
+def _run_infer_worker_subprocess(
+    cmd: list[str],
+    *,
+    env: Mapping[str, str],
+    output_dir: Path,
+    timeout: int,
+) -> Mapping[str, Any]:
+    log_path = output_dir / "run.log"
+    with log_path.open("w", encoding="utf-8") as log_file:
+        log_file.write("command: " + " ".join(cmd) + "\n")
+        log_file.flush()
+        process = subprocess.Popen(
+            cmd,
+            env=dict(env),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+        stdout_chunks: list[str] = []
+        deadline = time.monotonic() + timeout
+        try:
+            assert process.stdout is not None
+            for line in process.stdout:
+                stdout_chunks.append(line)
+                log_file.write(line)
+                log_file.flush()
+                sys.__stdout__.write(line)
+                sys.__stdout__.flush()
+                if time.monotonic() > deadline:
+                    raise subprocess.TimeoutExpired(cmd, timeout)
+            returncode = process.wait(timeout=max(0.0, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            os.killpg(process.pid, signal.SIGTERM)
+            try:
+                process.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.wait()
+            raise
+    report_path = output_dir / "results.json"
+    report = json.loads(report_path.read_text(encoding="utf-8")) if report_path.exists() else {}
+    stdout = "".join(stdout_chunks)
+    report["exit_code"] = returncode
+    report["log_path"] = str(log_path)
+    report["stdout_tail"] = stdout[-4000:]
+    report["stderr_tail"] = ""
+    return report
+
+
+def _run_v2_infer_eager(
+    driver: Any,
+    request_kwargs: Mapping[str, Any],
+    *,
+    generation_kwargs: Mapping[str, Any],
+    config_path: Path,
+    modules_config: Path,
+    infer_type: str,
+    output_dir: Path,
+    dtype: torch.dtype,
+    timeout: int,
+    probe_names: tuple[str, ...],
+) -> Mapping[str, Any]:
+    """Run the inference worker as a single-process eager baseline."""
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    payload_path = output_dir / "infer_eager_payload.pt"
+    torch.save(
+        {
+            "request_kwargs": dict(request_kwargs),
+            "generation_kwargs": dict(generation_kwargs),
+            "probe_names": probe_names,
+            "seed": driver.case.model.seed,
+            "dtype": "bf16" if dtype == torch.bfloat16 else "fp32",
+            "require_fsdp_modules": False,
+        },
+        payload_path,
+    )
+    worker_path = Path("tests/seed_omni/parity_suite/v2/workers/infer_fsdp2_worker.py")
+    cmd = [
+        sys.executable,
+        *_infer_worker_argv(
+            driver,
+            config_path=config_path,
+            modules_config=modules_config,
+            infer_type=infer_type,
+            output_dir=output_dir,
+            worker_path=worker_path,
+        ),
+    ]
+    env = {
+        **_subprocess_env_without_distributed_launch(),
+        "VEOMNI_PARITY_INFER_FSDP2_PAYLOAD": str(payload_path),
+        "VEOMNI_PARITY_INFER_FSDP2_OUTPUT_DIR": str(output_dir),
+    }
+    return _run_infer_worker_subprocess(cmd, env=env, output_dir=output_dir, timeout=timeout)
+
+
 def _run_v2_infer_fsdp2(
     driver: Any,
     request_kwargs: Mapping[str, Any],
@@ -706,69 +848,21 @@ def _run_v2_infer_fsdp2(
         "--nnodes=1",
         f"--nproc_per_node={nproc_per_node}",
         f"--master_port={port}",
-        str(worker_path),
-        str(config_path),
-        "--model.model_path",
-        str(driver.case.model.v2_model.model_root),
-        "--infer.model_path",
-        str(driver.case.model.v2_model.model_root),
-        "--infer.infer_type",
-        infer_type,
-        "--infer.modules",
-        str(modules_config),
-        "--infer.prompt",
-        "parity-suite-infer",
-        "--infer.output_dir",
-        str(output_dir),
-        "--infer.seed",
-        str(driver.case.model.seed),
+        *_infer_worker_argv(
+            driver,
+            config_path=config_path,
+            modules_config=modules_config,
+            infer_type=infer_type,
+            output_dir=output_dir,
+            worker_path=worker_path,
+        ),
     ]
     env = {
         **os.environ,
         "VEOMNI_PARITY_INFER_FSDP2_PAYLOAD": str(payload_path),
         "VEOMNI_PARITY_INFER_FSDP2_OUTPUT_DIR": str(output_dir),
     }
-    log_path = output_dir / "run.log"
-    with log_path.open("w", encoding="utf-8") as log_file:
-        log_file.write("command: " + " ".join(cmd) + "\n")
-        log_file.flush()
-        process = subprocess.Popen(
-            cmd,
-            env=env,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-        )
-        stdout_chunks: list[str] = []
-        deadline = time.monotonic() + timeout
-        try:
-            assert process.stdout is not None
-            for line in process.stdout:
-                stdout_chunks.append(line)
-                log_file.write(line)
-                log_file.flush()
-                sys.__stdout__.write(line)
-                sys.__stdout__.flush()
-                if time.monotonic() > deadline:
-                    raise subprocess.TimeoutExpired(cmd, timeout)
-            returncode = process.wait(timeout=max(0.0, deadline - time.monotonic()))
-        except subprocess.TimeoutExpired:
-            os.killpg(process.pid, signal.SIGTERM)
-            try:
-                process.wait(timeout=30)
-            except subprocess.TimeoutExpired:
-                os.killpg(process.pid, signal.SIGKILL)
-                process.wait()
-            raise
-    report_path = output_dir / "results.json"
-    report = json.loads(report_path.read_text(encoding="utf-8")) if report_path.exists() else {}
-    stdout = "".join(stdout_chunks)
-    report["exit_code"] = returncode
-    report["log_path"] = str(log_path)
-    report["stdout_tail"] = stdout[-4000:]
-    report["stderr_tail"] = ""
-    return report
+    return _run_infer_worker_subprocess(cmd, env=env, output_dir=output_dir, timeout=timeout)
 
 
 def _run_data_loss_smoke_policy(

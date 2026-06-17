@@ -648,6 +648,15 @@ class BagelQwen2MoTBackbone(nn.Module):
             packed_vae_token_indexes=packed_vae_token_indexes,
             packed_text_indexes=packed_text_indexes,
         )
+        query_device = packed_query_sequence.device
+        packed_query_indexes = packed_query_indexes.to(device=query_device)
+        packed_query_position_ids = packed_query_position_ids.to(device=query_device)
+        if packed_key_value_indexes is not None:
+            packed_key_value_indexes = packed_key_value_indexes.to(device=query_device)
+        if packed_vae_token_indexes is not None:
+            packed_vae_token_indexes = packed_vae_token_indexes.to(device=query_device)
+        if packed_text_indexes is not None:
+            packed_text_indexes = packed_text_indexes.to(device=query_device)
         if past_key_values is None:
             past_key_values = NaiveCache(len(self.layers))
 
@@ -673,6 +682,9 @@ class BagelQwen2MoTBackbone(nn.Module):
         if not is_gen:
             packed_query_sequence = self.norm(packed_query_sequence)
         else:
+            query_device = packed_query_sequence.device
+            packed_text_indexes = packed_text_indexes.to(device=query_device)
+            packed_vae_token_indexes = packed_vae_token_indexes.to(device=query_device)
             packed_query_sequence_ = torch.zeros_like(packed_query_sequence)
             packed_query_sequence_[packed_text_indexes] = self.norm(packed_query_sequence[packed_text_indexes])
             packed_query_sequence_[packed_vae_token_indexes] = self.norm_moe_gen(

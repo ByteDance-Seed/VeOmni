@@ -96,6 +96,29 @@ class BagelFlowConnector(BagelFlowConnectorModuleMixin, PreTrainedModel):
             return
         super()._init_weights(module)
 
+    def _combine_latent_embeds(
+        self,
+        latents: torch.Tensor,
+        position_ids: torch.LongTensor,
+        timesteps: torch.Tensor,
+    ) -> torch.Tensor:
+        position_ids = position_ids.reshape(-1)
+        timesteps = timesteps.reshape(-1)
+        if timesteps.numel() == 1:
+            timesteps = timesteps.expand(latents.shape[0])
+        if timesteps.numel() != latents.shape[0]:
+            raise ValueError("timesteps must be a scalar or have one value per latent token.")
+
+        latent_embeds = self.vae2llm(latents)
+        ref_device = latent_embeds.device
+        time_emb = self.time_embedder(timesteps.to(device=self.time_embedder.mlp[0].weight.device))
+        pos_emb = self.latent_pos_embed(position_ids.to(device=self.latent_pos_embed.pos_embed.device))
+        return (
+            latent_embeds
+            + time_emb.to(device=ref_device, dtype=latent_embeds.dtype)
+            + pos_emb.to(device=ref_device, dtype=latent_embeds.dtype)
+        )
+
     def embed_latent(
         self,
         latents: Optional[torch.Tensor] = None,
@@ -110,14 +133,8 @@ class BagelFlowConnector(BagelFlowConnectorModuleMixin, PreTrainedModel):
         latents = latents.to(device=self.device)
         if not torch.is_autocast_enabled(latents.device.type):
             latents = latents.to(dtype=self.dtype)
-        position_ids = position_ids.to(device=self.device, dtype=torch.long).reshape(-1)
-        timesteps = timesteps.to(device=self.device).reshape(-1)
-        if timesteps.numel() == 1:
-            timesteps = timesteps.expand(latents.shape[0])
-        if timesteps.numel() != latents.shape[0]:
-            raise ValueError("timesteps must be a scalar or have one value per latent token.")
-
-        latent_embeds = self.vae2llm(latents) + self.time_embedder(timesteps) + self.latent_pos_embed(position_ids)
+        position_ids = position_ids.to(dtype=torch.long)
+        latent_embeds = self._combine_latent_embeds(latents, position_ids, timesteps)
         return {"latent_embeds": latent_embeds.to(dtype=self.dtype)}
 
     def decode_velocity(self, hidden_states: Optional[torch.Tensor] = None, **kwargs: Any) -> Dict[str, Any]:

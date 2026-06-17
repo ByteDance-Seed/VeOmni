@@ -291,7 +291,7 @@ class BagelVAE(BagelVAEModuleMixin, PreTrainedModel):
     config_class = BagelVAEConfig
     base_model_prefix = "bagel_vae"
     main_input_name = "pixel_values"
-    _no_split_modules: list[str] = []
+    _no_split_modules: list[str] = ["ResnetBlock", "AttnBlock"]
     supports_gradient_checkpointing = True
 
     def __init__(self, config: BagelVAEConfig):

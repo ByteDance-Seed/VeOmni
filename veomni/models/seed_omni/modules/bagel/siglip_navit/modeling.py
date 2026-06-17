@@ -355,6 +355,8 @@ class BagelSiglipNavit(BagelSiglipNavitModuleMixin, PreTrainedModel):
             max_seqlen=max_seqlen,
         )
         packed_vit_token_embed = self.connector(packed_vit_token_embed)
-        vit_token_pos_emb = self.vit_pos_embed(packed_flattened_position_ids)
-        packed_vit_token_embed = packed_vit_token_embed + vit_token_pos_emb
+        vit_token_pos_emb = self.vit_pos_embed(
+            packed_flattened_position_ids.to(device=self.vit_pos_embed.pos_embed.device)
+        )
+        packed_vit_token_embed = packed_vit_token_embed + vit_token_pos_emb.to(device=packed_vit_token_embed.device)
         return {"image_embeds": packed_vit_token_embed}
