@@ -12,6 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from .byted_loader import (
+    BYTED_LOADER_TYPE,
+    BytedLoaderAdapter,
+    BytedLoaderDatasetSpec,
+    build_byted_loader_dataset_spec,
+    is_byted_loader_type,
+)
 from .chat_template import build_chat_template
 from .data_collator import (
     MainCollator,
@@ -37,4 +44,9 @@ __all__ = [
     "UnpackDataCollator",
     "build_dataset",
     "DistributedDataloader",
+    "BYTED_LOADER_TYPE",
+    "BytedLoaderAdapter",
+    "BytedLoaderDatasetSpec",
+    "build_byted_loader_dataset_spec",
+    "is_byted_loader_type",
 ]

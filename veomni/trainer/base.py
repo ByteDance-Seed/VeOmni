@@ -49,8 +49,10 @@ from ..arguments import VeOmniArguments, save_args
 from ..checkpoint import CheckpointerBase
 from ..data import (
     DistributedDataloader,
+    build_byted_loader_dataset_spec,
     build_dataloader,
     build_dataset,
+    is_byted_loader_type,
 )
 from ..data.chat_template import ChatTemplate
 from ..data.data_collator import DataCollator, MainCollator
@@ -433,6 +435,19 @@ class BaseTrainer(Stateful, ABC):
 
     def _build_dataset(self):
         args: VeOmniArguments = self.args
+        if is_byted_loader_type(args.data.dataloader):
+            self.train_dataset = build_byted_loader_dataset_spec(args, self.data_transform)
+            args.compute_train_steps(None)
+            self.train_steps = args.train_steps
+            logger.info_rank0(
+                "[byted_loader] dataset bypass enabled "
+                f"raw_train_path={args.data.train_path} "
+                f"source_config_path={self.train_dataset.source_config_path or 'n/a'} "
+                f"original_dataset_name={self.train_dataset.dataset_name_before_bypass} "
+                "disable_veomni_multisource_meter=true"
+            )
+            return
+
         # Build dataset
         self.train_dataset = build_dataset(
             dataset_name=args.data.dataset_name,

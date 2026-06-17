@@ -1086,6 +1086,50 @@ class DataloaderConfig:
         default=False,
         metadata={"help": "Whether to use BackgroundPrefetcher for dataloader."},
     )
+    # bytedance.dataloader backend. These fields are inert unless
+    # data.dataloader.type is set to "byted_loader".
+    mode: str = field(default="local", metadata={"help": "Byted loader mode. Currently only local is supported."})
+    file_type: str = field(default="lance", metadata={"help": "Byted loader source type: lance/jsonl/parquet."})
+    shuffle: Optional[bool] = field(default=None, metadata={"help": "Override byted loader shuffle setting."})
+    shuffle_seed: Optional[int] = field(default=None, metadata={"help": "Override byted loader shuffle seed."})
+    shuffle_algo: str = field(default="file", metadata={"help": "Byted loader shuffle algorithm."})
+    shuffle_shard_nums: int = field(default=10, metadata={"help": "Byted loader shuffle shard count."})
+    worker_num: int = field(default=-1, metadata={"help": "Byted loader workers. -1 follows local role topology."})
+    worker_subprocess_num: int = field(default=4, metadata={"help": "Byted loader worker subprocess count."})
+    worker_parallel_read_num: int = field(default=4, metadata={"help": "Byted loader per-worker parallel read count."})
+    worker_prefetch_num: int = field(default=1_000_000, metadata={"help": "Byted loader worker prefetch count."})
+    client_prefetch_num: int = field(default=2, metadata={"help": "Byted loader client prefetch count."})
+    server_prefetch_num: int = field(default=8, metadata={"help": "Byted loader server prefetch count."})
+    ckpt_dir: str = field(default="", metadata={"help": "Byted loader checkpoint directory."})
+    save_ckpt_interval: int = field(default=-1, metadata={"help": "Byted loader save interval; -1 follows trainer."})
+    enable_ckpt: bool = field(default=True, metadata={"help": "Enable byted loader progress checkpoint."})
+    enable_batch_db_save: bool = field(
+        default=False,
+        metadata={"help": "Write microbatch/global-batch DBs. Keep false unless replay/debug is needed."},
+    )
+    resume_ckpt_path: str = field(default="", metadata={"help": "Byted loader snapshot resume path."})
+    resume_use_latest_snapshot: bool = field(default=False, metadata={"help": "Resume latest byted loader snapshot."})
+    allow_transform_failure: bool = field(
+        default=False, metadata={"help": "Allow transform failures in byted workers."}
+    )
+    do_sp_split_in_loader: bool = field(
+        default=False, metadata={"help": "Let byted loader split sequence parallel data."}
+    )
+    gpu_prefetch: bool = field(default=False, metadata={"help": "Use byted loader GPU prefetch."})
+    identity: str = field(default="veomni", metadata={"help": "Byted loader RPC/checkpoint identity."})
+    start_role_after_iter: bool = field(
+        default=False, metadata={"help": "Start byted local roles lazily at iteration."}
+    )
+    peek_num: int = field(default=300, metadata={"help": "Byted PrePeekStrategy lookahead size."})
+    enable_balance: bool = field(default=False, metadata={"help": "Enable byted loader sample-level balance."})
+    microbatch_balance: bool = field(default=False, metadata={"help": "Enable byted loader microbatch-level balance."})
+    biwise_balance: bool = field(default=True, metadata={"help": "Byted loader balance fallback knob."})
+    seq_len_warmup: bool = field(default=False, metadata={"help": "Enable byted PrePeek seq-len warmup."})
+    num_warmup_steps: int = field(default=0, metadata={"help": "Byted PrePeek warmup steps."})
+    dsp_rotate_interval: int = field(default=-1, metadata={"help": "Byted loader DSP rotate interval."})
+    dp_constructor_per_dp: int = field(default=1, metadata={"help": "Byted loader DP constructors per DP rank."})
+    min_version: str = field(default="0.1.42", metadata={"help": "Minimum bytedance.dataloader version."})
+    strict_api_check: bool = field(default=True, metadata={"help": "Check byted loader API contract at build time."})
 
 
 @dataclass

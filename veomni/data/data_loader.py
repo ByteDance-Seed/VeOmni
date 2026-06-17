@@ -13,6 +13,7 @@
 # limitations under the License.
 
 
+import inspect
 import math
 from typing import Any, Callable, Dict, Literal, Optional
 
@@ -40,7 +41,11 @@ logger = logging.get_logger(__name__)
 
 
 def build_dataloader(dataloader_type: str, **kwargs):
-    return DATALOADER_REGISTRY[dataloader_type](**kwargs)
+    builder = DATALOADER_REGISTRY[dataloader_type]
+    signature = inspect.signature(builder)
+    if not any(param.kind == inspect.Parameter.VAR_KEYWORD for param in signature.parameters.values()):
+        kwargs = {key: value for key, value in kwargs.items() if key in signature.parameters}
+    return builder(**kwargs)
 
 
 class DistributedDataloader(StatefulDataLoader):
