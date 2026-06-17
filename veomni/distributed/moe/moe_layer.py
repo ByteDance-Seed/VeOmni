@@ -276,7 +276,7 @@ class EPGroupGemm(torch.autograd.Function):
         grad_fc1_1_activation = grad_fc1_output * fc1_2_output
 
         if swiglu_limit is not None:
-            grad_fc1_2_output = grad_fc1_2_output * mask_fc1_2
+            grad_fc1_2_output.masked_fill_(~mask_fc1_2, 0)
 
         # dgrad output 2
         grad_scatter_output_2 = group_gemm_same_nk(
@@ -303,7 +303,7 @@ class EPGroupGemm(torch.autograd.Function):
 
         grad_fc1_1_output = torch.ops.aten.silu_backward(grad_fc1_1_activation, fc1_1_output)
         if swiglu_limit is not None:
-            grad_fc1_1_output = grad_fc1_1_output * mask_fc1_1
+            grad_fc1_1_output.masked_fill_(~mask_fc1_1, 0)
 
         # dgrad output 1
         grad_scatter_output_1 = group_gemm_same_nk(
@@ -459,8 +459,8 @@ class EPMergedFc1GroupGemm(torch.autograd.Function):
         grad_fc1_1_output = torch.ops.aten.silu_backward(grad_fc1_1_activation, fc1_1_output)
 
         if swiglu_limit is not None:
-            grad_fc1_1_output = grad_fc1_1_output * mask_fc1_1
-            grad_fc1_2_output = grad_fc1_2_output * mask_fc1_2
+            grad_fc1_1_output.masked_fill_(~mask_fc1_1, 0)
+            grad_fc1_2_output.masked_fill_(~mask_fc1_2, 0)
 
         # Merge grads back to [T, 2I]
         grad_fc1_output = torch.cat([grad_fc1_1_output, grad_fc1_2_output], dim=-1)

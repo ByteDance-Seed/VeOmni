@@ -228,7 +228,7 @@ class TritonFusedMoeExpertFunction(torch.autograd.Function):
         # clamp regions; mirrors ``torch.clamp`` autograd. No-op when
         # ``swiglu_limit`` is None (mask tensors are placeholders).
         if swiglu_limit is not None:
-            grad_fc1_2_output = grad_fc1_2_output * mask_fc1_2
+            grad_fc1_2_output.masked_fill_(~mask_fc1_2, 0)
 
         # MOE Step 6
         # grad_scatter_output_2 = torch.empty_like(scatter_output)
@@ -259,7 +259,7 @@ class TritonFusedMoeExpertFunction(torch.autograd.Function):
         # MOE Step 5
         grad_fc1_1_output = torch.ops.aten.silu_backward(grad_fc1_1_activation, fc1_1_output)
         if swiglu_limit is not None:
-            grad_fc1_1_output = grad_fc1_1_output * mask_fc1_1
+            grad_fc1_1_output.masked_fill_(~mask_fc1_1, 0)
 
         # MOE Step 4
         # grad_scatter_output_1 = torch.empty_like(scatter_output)
@@ -465,8 +465,8 @@ class MergedFc1TritonFusedMoeExpertFunction(torch.autograd.Function):
 
         # Step 5a (backward): zero out gradients in saturated SwiGLU clamp regions.
         if swiglu_limit is not None:
-            grad_fc1_1_output = grad_fc1_1_output * mask_fc1_1
-            grad_fc1_2_output = grad_fc1_2_output * mask_fc1_2
+            grad_fc1_1_output.masked_fill_(~mask_fc1_1, 0)
+            grad_fc1_2_output.masked_fill_(~mask_fc1_2, 0)
 
         # Merge grad_fc1_1_output and grad_fc1_2_output back to [T, 2I]
         grad_fc1_output = torch.cat([grad_fc1_1_output, grad_fc1_2_output], dim=-1)

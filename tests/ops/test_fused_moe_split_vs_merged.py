@@ -26,6 +26,7 @@ def _eager_moe_forward(
     fc1_1_weight: torch.Tensor,
     fc1_2_weight: torch.Tensor,
     fc2_weight: torch.Tensor,
+    swiglu_limit: float | None = None,
 ) -> torch.Tensor:
     output = torch.zeros_like(hidden_states)
     expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=num_experts).permute(2, 1, 0)
@@ -37,6 +38,9 @@ def _eager_moe_forward(
         x = hidden_states[token_idx]
         gate = F.linear(x, fc1_1_weight[idx])
         up = F.linear(x, fc1_2_weight[idx])
+        if swiglu_limit is not None:
+            gate = gate.clamp(max=swiglu_limit)
+            up = up.clamp(min=-swiglu_limit, max=swiglu_limit)
         y = F.linear(F.silu(gate) * up, fc2_weight[idx])
         y = y * routing_weights[token_idx, top_k_pos, None]
         output.index_add_(0, token_idx, y.to(output.dtype))
@@ -170,6 +174,88 @@ def test_fused_moe_split_vs_merged(
     )
 
 
+@pytest.mark.parametrize("swiglu_limit", [0.10, 0.20])
+def test_fused_moe_swiglu_limit_split_vs_merged_and_eager(swiglu_limit: float, monkeypatch: pytest.MonkeyPatch):
+    """Verify the fused MoE SwiGLU clamp matches eager for split and merged fc1 layouts."""
+    _skip_if_unsupported()
+
+    torch.manual_seed(42)
+    device = torch.device(get_device_type())
+    dtype = torch.bfloat16
+    num_tokens, num_experts, hidden_dim, ffn_dim, topk = 128, 8, 512, 256, 2
+
+    hidden_states = 0.1 * torch.randn(num_tokens, hidden_dim, device=device, dtype=dtype)
+    router_logits = torch.randn(num_tokens, num_experts, device=device, dtype=torch.float32)
+    routing_weights, selected_experts = torch.topk(torch.softmax(router_logits, dim=-1), topk, dim=-1)
+    routing_weights = routing_weights.to(dtype)
+    fc1_1_weight = 0.1 * torch.randn(num_experts, ffn_dim, hidden_dim, device=device, dtype=dtype)
+    fc1_2_weight = 0.1 * torch.randn(num_experts, ffn_dim, hidden_dim, device=device, dtype=dtype)
+    fc1_1_2_weight = torch.cat([fc1_1_weight, fc1_2_weight], dim=1).contiguous()
+    fc2_weight = 0.1 * torch.randn(num_experts, hidden_dim, ffn_dim, device=device, dtype=dtype)
+
+    monkeypatch.setattr(fused_moe, "_fused_moe_forward", group_gemm_fused_moe_forward)
+
+    hs_split = hidden_states.clone().detach().requires_grad_(True)
+    fc1_1_split = fc1_1_weight.clone().detach().requires_grad_(True)
+    fc1_2_split = fc1_2_weight.clone().detach().requires_grad_(True)
+    fc2_split = fc2_weight.clone().detach().requires_grad_(True)
+    out_split = fused_moe_forward(
+        num_experts=num_experts,
+        routing_weights=routing_weights,
+        selected_experts=selected_experts,
+        hidden_states=hs_split,
+        fc1_1_weight=fc1_1_split,
+        fc1_2_weight=fc1_2_split,
+        fc2_weight=fc2_split,
+        swiglu_limit=swiglu_limit,
+    )
+    out_split.sum().backward()
+
+    hs_merged = hidden_states.clone().detach().requires_grad_(True)
+    fc1_merged = fc1_1_2_weight.clone().detach().requires_grad_(True)
+    fc2_merged = fc2_weight.clone().detach().requires_grad_(True)
+    out_merged = fused_moe_forward(
+        num_experts=num_experts,
+        routing_weights=routing_weights,
+        selected_experts=selected_experts,
+        hidden_states=hs_merged,
+        fc1_1_weight=None,
+        fc1_2_weight=None,
+        fc2_weight=fc2_merged,
+        fc1_1_2_weight=fc1_merged,
+        swiglu_limit=swiglu_limit,
+    )
+    out_merged.sum().backward()
+
+    hs_eager = hidden_states.clone().detach().requires_grad_(True)
+    fc1_1_eager = fc1_1_weight.clone().detach().requires_grad_(True)
+    fc1_2_eager = fc1_2_weight.clone().detach().requires_grad_(True)
+    fc2_eager = fc2_weight.clone().detach().requires_grad_(True)
+    out_eager = _eager_moe_forward(
+        num_experts=num_experts,
+        routing_weights=routing_weights,
+        selected_experts=selected_experts,
+        hidden_states=hs_eager,
+        fc1_1_weight=fc1_1_eager,
+        fc1_2_weight=fc1_2_eager,
+        fc2_weight=fc2_eager,
+        swiglu_limit=swiglu_limit,
+    )
+    out_eager.sum().backward()
+
+    torch.testing.assert_close(out_split, out_merged, rtol=0, atol=0)
+    torch.testing.assert_close(hs_split.grad, hs_merged.grad, rtol=3e-2, atol=3e-2)
+    torch.testing.assert_close(fc2_split.grad, fc2_merged.grad, rtol=0, atol=0)
+    fc1_split_grad = torch.cat([fc1_1_split.grad, fc1_2_split.grad], dim=1)
+    torch.testing.assert_close(fc1_split_grad, fc1_merged.grad, rtol=0, atol=0)
+
+    torch.testing.assert_close(out_merged, out_eager, rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(hs_merged.grad, hs_eager.grad, rtol=6e-2, atol=6e-2)
+    torch.testing.assert_close(fc2_merged.grad, fc2_eager.grad, rtol=2e-2, atol=2e-2)
+    fc1_eager_grad = torch.cat([fc1_1_eager.grad, fc1_2_eager.grad], dim=1)
+    torch.testing.assert_close(fc1_merged.grad, fc1_eager_grad, rtol=5e-2, atol=5e-2)
+
+
 def _make_ep_inputs(num_tokens, num_experts, hidden_dim, ffn_dim, seed):
     """Create synthetic EP test inputs: permute_tokens, cumsum, and weights."""
     torch.manual_seed(seed)
@@ -192,6 +278,7 @@ def _make_ep_inputs(num_tokens, num_experts, hidden_dim, ffn_dim, seed):
     return cumsum, permute_tokens, fc1_1_weight, fc1_2_weight, fc1_1_2_weight, fc2_weight
 
 
+@pytest.mark.parametrize("swiglu_limit", [None, 0.20])
 @pytest.mark.parametrize(
     "num_tokens,num_experts,hidden_dim,ffn_dim,seed",
     [
@@ -205,6 +292,7 @@ def test_ep_split_vs_merged(
     hidden_dim: int,
     ffn_dim: int,
     seed: int,
+    swiglu_limit: float | None,
 ):
     """Verify EPGroupGemm (split) and EPMergedFc1GroupGemm (merged) produce identical results."""
     _skip_if_unsupported()
@@ -219,7 +307,7 @@ def test_ep_split_vs_merged(
     fc1_2_split = fc1_2_weight.clone().detach().requires_grad_(True)
     fc2_split = fc2_weight.clone().detach().requires_grad_(True)
 
-    out_split = EPGroupGemm.apply(pt_split, cumsum, fc1_1_split, fc1_2_split, fc2_split)
+    out_split = EPGroupGemm.apply(pt_split, cumsum, fc1_1_split, fc1_2_split, fc2_split, swiglu_limit)
     # Use a contiguous grad tensor; .sum().backward() produces non-contiguous expand grads
     grad_output = torch.randn_like(out_split)
     out_split.backward(grad_output)
@@ -229,7 +317,7 @@ def test_ep_split_vs_merged(
     fc1_merged = fc1_1_2_weight.clone().detach().requires_grad_(True)
     fc2_merged = fc2_weight.clone().detach().requires_grad_(True)
 
-    out_merged = EPMergedFc1GroupGemm.apply(pt_merged, cumsum, fc1_merged, fc2_merged)
+    out_merged = EPMergedFc1GroupGemm.apply(pt_merged, cumsum, fc1_merged, fc2_merged, swiglu_limit)
     out_merged.backward(grad_output)
 
     # Forward: bitwise identical
@@ -246,6 +334,7 @@ def test_ep_split_vs_merged(
     torch.testing.assert_close(pt_split.grad, pt_merged.grad, rtol=3e-2, atol=3e-2)
 
 
+@pytest.mark.parametrize("swiglu_limit", [None, 0.20])
 @pytest.mark.parametrize(
     "num_tokens,num_experts,hidden_dim,ffn_dim,seed",
     [
@@ -259,6 +348,7 @@ def test_ep_quack_split_vs_merged(
     hidden_dim: int,
     ffn_dim: int,
     seed: int,
+    swiglu_limit: float | None,
 ):
     """Verify EPMergedFc1QuackGroupGemm matches EPGroupGemm (triton split) in forward/backward."""
     _skip_if_unsupported()
@@ -277,7 +367,7 @@ def test_ep_quack_split_vs_merged(
     fc1_2_split = fc1_2_weight.clone().detach().requires_grad_(True)
     fc2_split = fc2_weight.clone().detach().requires_grad_(True)
 
-    out_split = EPGroupGemm.apply(pt_split, cumsum, fc1_1_split, fc1_2_split, fc2_split)
+    out_split = EPGroupGemm.apply(pt_split, cumsum, fc1_1_split, fc1_2_split, fc2_split, swiglu_limit)
     grad_output = torch.randn_like(out_split)
     out_split.backward(grad_output)
 
@@ -286,7 +376,7 @@ def test_ep_quack_split_vs_merged(
     fc1_quack = fc1_1_2_weight.clone().detach().requires_grad_(True)
     fc2_quack = fc2_weight.clone().detach().requires_grad_(True)
 
-    out_quack = EPMergedFc1QuackGroupGemm.apply(pt_quack, cumsum, fc1_quack, fc2_quack)
+    out_quack = EPMergedFc1QuackGroupGemm.apply(pt_quack, cumsum, fc1_quack, fc2_quack, swiglu_limit)
     out_quack.backward(grad_output)
 
     # Forward: approximate match (different GEMM backends)
@@ -303,6 +393,7 @@ def test_ep_quack_split_vs_merged(
     torch.testing.assert_close(pt_split.grad, pt_quack.grad, rtol=3e-2, atol=3e-2)
 
 
+@pytest.mark.parametrize("swiglu_limit", [None, 0.20])
 @pytest.mark.parametrize(
     "num_tokens,num_experts,hidden_dim,ffn_dim,seed",
     [
@@ -316,6 +407,7 @@ def test_ep_quack_split(
     hidden_dim: int,
     ffn_dim: int,
     seed: int,
+    swiglu_limit: float | None,
 ):
     """Verify EPQuackGroupGemm (quack split) matches EPGroupGemm (triton split) in forward/backward."""
     _skip_if_unsupported()
@@ -334,7 +426,7 @@ def test_ep_quack_split(
     fc1_2_triton = fc1_2_weight.clone().detach().requires_grad_(True)
     fc2_triton = fc2_weight.clone().detach().requires_grad_(True)
 
-    out_triton = EPGroupGemm.apply(pt_triton, cumsum, fc1_1_triton, fc1_2_triton, fc2_triton)
+    out_triton = EPGroupGemm.apply(pt_triton, cumsum, fc1_1_triton, fc1_2_triton, fc2_triton, swiglu_limit)
     grad_output = torch.randn_like(out_triton)
     out_triton.backward(grad_output)
 
@@ -344,7 +436,7 @@ def test_ep_quack_split(
     fc1_2_quack = fc1_2_weight.clone().detach().requires_grad_(True)
     fc2_quack = fc2_weight.clone().detach().requires_grad_(True)
 
-    out_quack = EPQuackGroupGemm.apply(pt_quack, cumsum, fc1_1_quack, fc1_2_quack, fc2_quack)
+    out_quack = EPQuackGroupGemm.apply(pt_quack, cumsum, fc1_1_quack, fc1_2_quack, fc2_quack, swiglu_limit)
     out_quack.backward(grad_output)
 
     # Forward: approximate match (different GEMM backends)
@@ -380,6 +472,7 @@ def _scatter_routing_weights(routing_weights, scatter_index):
     return scattered
 
 
+@pytest.mark.parametrize("swiglu_limit", [None, 0.20])
 @pytest.mark.parametrize(
     "num_tokens,num_experts,hidden_dim,ffn_dim,topk,seed",
     [
@@ -395,6 +488,7 @@ def test_ep_vs_non_ep(
     ffn_dim: int,
     topk: int,
     seed: int,
+    swiglu_limit: float | None,
 ):
     """Verify EP autograd functions produce the same output as the non-EP eager path.
 
@@ -434,6 +528,7 @@ def test_ep_vs_non_ep(
         fc1_1_weight=fc1_1_weight,
         fc1_2_weight=fc1_2_weight,
         fc2_weight=fc2_weight,
+        swiglu_limit=swiglu_limit,
     )
 
     ep_raw = EPGroupGemm.apply(
@@ -442,6 +537,7 @@ def test_ep_vs_non_ep(
         fc1_1_weight.clone().detach(),
         fc1_2_weight.clone().detach(),
         fc2_weight.clone().detach(),
+        swiglu_limit,
     )
     out_ep = moe_gather(ep_raw * scattered_gw, scatter_index).reshape(hidden_states.shape)
 
@@ -465,6 +561,7 @@ def test_ep_vs_non_ep(
         fc1_1_weight=fc1_1_eager,
         fc1_2_weight=fc1_2_eager,
         fc2_weight=fc2_eager,
+        swiglu_limit=swiglu_limit,
     )
     out_e.sum().backward()
 
@@ -472,7 +569,7 @@ def test_ep_vs_non_ep(
     fc1_1_ep = fc1_1_weight.clone().detach().requires_grad_(True)
     fc1_2_ep = fc1_2_weight.clone().detach().requires_grad_(True)
     fc2_ep = fc2_weight.clone().detach().requires_grad_(True)
-    ep_raw2 = EPGroupGemm.apply(pt_ep, cumsum, fc1_1_ep, fc1_2_ep, fc2_ep)
+    ep_raw2 = EPGroupGemm.apply(pt_ep, cumsum, fc1_1_ep, fc1_2_ep, fc2_ep, swiglu_limit)
     ep_raw2.backward(scattered_gw.expand_as(ep_raw2).contiguous())
 
     # SM90+: bitwise; pre-SM90 (L20 CI): atol<=1.56e-2 observed.
@@ -484,6 +581,7 @@ def test_ep_vs_non_ep(
     torch.testing.assert_close(fc1_2_eager.grad, fc1_2_ep.grad, rtol=0, atol=fc1_atol)
 
 
+@pytest.mark.parametrize("swiglu_limit", [None, 0.20])
 @pytest.mark.parametrize(
     "num_tokens,num_experts,hidden_dim,ffn_dim,topk,seed",
     [
@@ -498,6 +596,7 @@ def test_ep_merged_vs_non_ep(
     ffn_dim: int,
     topk: int,
     seed: int,
+    swiglu_limit: float | None,
 ):
     """Verify EPMergedFc1GroupGemm produces the same output as the non-EP eager path."""
     _skip_if_unsupported()
@@ -528,6 +627,7 @@ def test_ep_merged_vs_non_ep(
         fc1_1_weight=fc1_1_weight,
         fc1_2_weight=fc1_2_weight,
         fc2_weight=fc2_weight,
+        swiglu_limit=swiglu_limit,
     )
 
     ep_raw = EPMergedFc1GroupGemm.apply(
@@ -535,6 +635,7 @@ def test_ep_merged_vs_non_ep(
         cumsum,
         fc1_1_2_weight.clone().detach(),
         fc2_weight.clone().detach(),
+        swiglu_limit,
     )
     out_ep = moe_gather(ep_raw * scattered_gw, scatter_index).reshape(hidden_states.shape)
 
@@ -555,13 +656,14 @@ def test_ep_merged_vs_non_ep(
         fc1_1_weight=fc1_1_eager,
         fc1_2_weight=fc1_2_eager,
         fc2_weight=fc2_eager,
+        swiglu_limit=swiglu_limit,
     )
     out_e.sum().backward()
 
     pt_ep = scatter_output.clone().detach().requires_grad_(True)
     fc1_merged_ep = fc1_1_2_weight.clone().detach().requires_grad_(True)
     fc2_ep = fc2_weight.clone().detach().requires_grad_(True)
-    ep_raw2 = EPMergedFc1GroupGemm.apply(pt_ep, cumsum, fc1_merged_ep, fc2_ep)
+    ep_raw2 = EPMergedFc1GroupGemm.apply(pt_ep, cumsum, fc1_merged_ep, fc2_ep, swiglu_limit)
     ep_raw2.backward(scattered_gw.expand_as(ep_raw2).contiguous())
 
     fc2_atol = 0 if is_sm90_or_above() else 3.2e-2

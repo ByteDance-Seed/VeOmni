@@ -195,7 +195,7 @@ class QuackFusedMoeExpertFunction(torch.autograd.Function):
         del grad_fc1_activation, fc1_1_activation
 
         if swiglu_limit is not None:
-            grad_fc1_2_output = grad_fc1_2_output * mask_fc1_2
+            grad_fc1_2_output.masked_fill_(~mask_fc1_2, 0)
 
         # Step 6 dgrad: fc1_2_weight [E, I, H] is already [K, N] for quack
         grad_scatter_output_2 = gemm(grad_fc1_2_output, fc1_2_weight, cu_seqlens_m=cu_seqlens_m)
@@ -204,7 +204,7 @@ class QuackFusedMoeExpertFunction(torch.autograd.Function):
         grad_fc1_1_output = torch.ops.aten.silu_backward(grad_fc1_1_activation, fc1_1_output)
         del fc1_1_output
         if swiglu_limit is not None:
-            grad_fc1_1_output = grad_fc1_1_output * mask_fc1_1
+            grad_fc1_1_output.masked_fill_(~mask_fc1_1, 0)
 
         # Step 4 dgrad: fc1_1_weight [E, I, H] is already [K, N] for quack
         grad_scatter_output_1 = gemm(grad_fc1_1_output, fc1_1_weight, cu_seqlens_m=cu_seqlens_m)
@@ -371,8 +371,8 @@ class MergedFc1QuackFusedMoeExpertFunction(torch.autograd.Function):
         del fc1_1_output
 
         if swiglu_limit is not None:
-            grad_fc1_1_output = grad_fc1_1_output * mask_fc1_1
-            grad_fc1_2_output = grad_fc1_2_output * mask_fc1_2
+            grad_fc1_1_output.masked_fill_(~mask_fc1_1, 0)
+            grad_fc1_2_output.masked_fill_(~mask_fc1_2, 0)
 
         # Merge grads back to [T, 2I]
         grad_fc1_output = torch.cat([grad_fc1_1_output, grad_fc1_2_output], dim=-1)
@@ -493,7 +493,7 @@ class EPQuackGroupGemm(torch.autograd.Function):
         del fc1_1_activation
 
         if swiglu_limit is not None:
-            grad_fc1_2_output = grad_fc1_2_output * mask_fc1_2
+            grad_fc1_2_output.masked_fill_(~mask_fc1_2, 0)
 
         # dgrad fc1_2
         grad_scatter_output_2 = gemm(grad_fc1_2_output, fc1_2_weight, cu_seqlens_m=cu_seqlens_m)
@@ -507,7 +507,7 @@ class EPQuackGroupGemm(torch.autograd.Function):
         # silu backward
         grad_fc1_1_output = torch.ops.aten.silu_backward(grad_fc1_1_activation, fc1_1_output)
         if swiglu_limit is not None:
-            grad_fc1_1_output = grad_fc1_1_output * mask_fc1_1
+            grad_fc1_1_output.masked_fill_(~mask_fc1_1, 0)
 
         # dgrad fc1_1
         grad_scatter_output_1 = gemm(grad_fc1_1_output, fc1_1_weight, cu_seqlens_m=cu_seqlens_m)
@@ -619,8 +619,8 @@ class EPMergedFc1QuackGroupGemm(torch.autograd.Function):
         del fc1_1_output
 
         if swiglu_limit is not None:
-            grad_fc1_1_output = grad_fc1_1_output * mask_fc1_1
-            grad_fc1_2_output = grad_fc1_2_output * mask_fc1_2
+            grad_fc1_1_output.masked_fill_(~mask_fc1_1, 0)
+            grad_fc1_2_output.masked_fill_(~mask_fc1_2, 0)
 
         # Merge grads back to [T, 2I]
         grad_fc1_output = torch.cat([grad_fc1_1_output, grad_fc1_2_output], dim=-1)
