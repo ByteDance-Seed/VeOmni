@@ -108,6 +108,7 @@ def prepare_exec_cmd(
     output_dir: str,
     is_moe: bool,
     max_sp_size: int | None = None,
+    max_ep_size: int | None = None,
 ) -> list[tuple[str, dict]]:
     """Prepare torchrun command kwargs for every (task, parallel-mode) combination.
 
@@ -125,6 +126,8 @@ def prepare_exec_cmd(
         is_moe: If True, also iterates over ep_size values (expert parallelism).
         max_sp_size: If set, filters out modes with sp_size > this value.
             Use 1 to skip sp=2 when the model does not support sequence parallelism yet.
+        max_ep_size: If set, filters out modes with ep_size > this value.
+            Use 1 to skip ep=2 when the model does not support expert parallelism yet.
 
     Returns:
         List of (task_name, cmd_kwargs) tuples, where cmd_kwargs is a dict of
@@ -133,6 +136,8 @@ def prepare_exec_cmd(
     model_modes: list[ParallelMode] = _base_model_modes() if not is_moe else _moe_model_modes()
     if max_sp_size is not None:
         model_modes = [m for m in model_modes if m.sp_size <= max_sp_size]
+    if max_ep_size is not None:
+        model_modes = [m for m in model_modes if m.ep_size <= max_ep_size]
 
     command_list = []
     for task in test_tasks:
