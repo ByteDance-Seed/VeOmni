@@ -27,6 +27,7 @@ Features:
 """
 
 import json
+import os
 import queue
 import threading
 import warnings
@@ -67,6 +68,7 @@ from ..utils.device import (
     get_device_type,
     get_dist_comm_backend,
     get_torch_device,
+    is_nccl_backend,
     synchronize,
 )
 from ..utils.loss_utils import count_loss_token, mean_global_loss
@@ -747,8 +749,21 @@ class BaseTrainer(Stateful, ABC):
         self.on_step_end(loss=total_loss, loss_dict=total_loss_dict, grad_norm=grad_norm)
 
     def destroy_distributed(self):
+        if not dist.is_available() or not dist.is_initialized():
+            return
+
+        backend = dist.get_backend()
         helper.empty_cache()
         dist.barrier()
+
+        if is_nccl_backend(backend) and os.getenv("VEOMNI_DESTROY_NCCL_ON_EXIT", "0") != "1":
+            logger.info_rank0(
+                "Skipping explicit NCCL process-group destroy on normal trainer exit. "
+                "Set VEOMNI_DESTROY_NCCL_ON_EXIT=1 to restore the previous teardown behavior."
+            )
+            return
+
+        synchronize()
         dist.destroy_process_group()
 
     def train(self):
