@@ -64,4 +64,31 @@ def sharegpt4v_cap_preprocess(conversations, **kwargs):
     return _sharegpt4v_sft_layout(conversations)
 
 
+@SEED_OMNI_PREPROCESSOR_REGISTRY.register("llava_video")
+def llava_video_preprocess(conversations, **kwargs):
+    """LLaVA-Video-178K layout — like ShareGPT4V but the media turn is a video.
+
+    The upstream marks the video position with a ``<image>`` (occasionally
+    ``<video>``) token in the first human turn; we strip it and emit a
+    ``("video", None)`` turn whose value is paired with the per-sample ``videos``
+    list in source order by the transform.
+    """
+    del kwargs
+    role_mapping = {"human": "user", "gpt": "assistant"}
+    if conversations[0]["from"] != "human":
+        conversations = conversations[1:]
+    assert conversations[0]["from"] == "human"
+
+    constructed_conversation = []
+    for message in conversations:
+        value = message["value"]
+        role = role_mapping[message["from"]]
+        if "<image>" in value or "<video>" in value:
+            value = value.replace("<image>", "").replace("<video>", "").strip()
+            constructed_conversation.append([role, ("video", None), ("text", value)])
+        else:
+            constructed_conversation.append([role, ("text", value)])
+    return constructed_conversation
+
+
 __all__ = ["SEED_OMNI_PREPROCESSOR_REGISTRY", "conv_preprocess"]

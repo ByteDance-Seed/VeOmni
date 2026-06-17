@@ -14,8 +14,7 @@ All paths below assume the upstream HuggingFace checkpoint (the post-trained
 chat model) lives at `/mnt/hdfs/veomni/models/transformers/Qwen/Qwen3-0.6B`. Adjust to your own
 storage.
 
-Config dir: `configs/seed_omni/Qwen/qwen3_0.6b/` (the `data.yaml` lives one level
-up at `configs/seed_omni/Qwen/data.yaml`, shared across Qwen launchers).
+Config dir: `configs/seed_omni/Qwen/qwen3_0.6b/`.
 
 The omni config layout splits the old monolithic launcher into a `base.yaml` plus
 per-purpose module/graph files. Both training and inference take the **same**
@@ -26,7 +25,7 @@ per-purpose module/graph files. Both training and inference take the **same**
 | `qwen3_0.6b/base.yaml` | Top-level omni launcher: model paths, top-level `accelerator`, data, train, and the `infer` block. |
 | `qwen3_0.6b/modules_train.yaml` | Per-module training overrides. |
 | `qwen3_0.6b/graph_train.yaml` | Training DAG (`qwen3_text_encoder → qwen3_llm → qwen3_text_encoder.decode`). |
-| `data.yaml` | Weighted multisource data list (Tulu-3 SFT mixture). |
+| `qwen3_0.6b/data.yaml` | Weighted multisource data list (Tulu-3 SFT mixture). |
 | `qwen3_0.6b/graph_infer.yaml` | Text chat generation graph (mapped under `infer.infer_graph.infer_text`). |
 
 ---
@@ -57,7 +56,7 @@ preprocessor key in `veomni/data/seed_omni/preprocess.py`
 `messages` list to a `[role, ("text", content)]` conversation.
 
 ```yaml
-# configs/seed_omni/Qwen/data.yaml
+# configs/seed_omni/Qwen/qwen3_0.6b/data.yaml
 sources:
   - /mnt/hdfs/veomni/datasets/tulu-3-sft-mixture/mini_data
 names:
@@ -183,3 +182,160 @@ bash train.sh tasks/train_text.py configs/text/qwen3.yaml \
 The classic `chatml` template labels the whole assistant block (role prefix +
 `<|im_end|>`); the omni `qwen3_text_encoder` template masks the
 `<|im_start|>assistant\n` prefix, which accounts for the small residual gap.
+
+---
+
+## 7. Visual instruction tuning: Qwen3-0.6B into image understanding
+
+This recipe turns the **text-only** Qwen3-0.6B into an image-understanding model
+by bolting on the **Qwen3-VL ViT** and training as little as possible: only the
+ViT's **patch merger** and the vision **special-token** embedding rows — the ViT
+blocks and the whole LLM stay frozen.
+
+**No bespoke modeling or build script** — it reuses the standard `qwen3_text_encoder`,
+`qwen3_llm` and `qwen3vl_vision` modules; the image-understanding behaviour is
+switched on entirely through per-module `model_config:` overrides in the modules YAML.
+
+| Module | Source | `model_config` override | Trainable? |
+|--------|--------|--------|-----------|
+| `qwen3vl_vision` (ViT + **patch merger**) | Qwen3-VL-2B ViT | `out_hidden_size: 1024`, `disable_deepstack: true`, `freeze: true` | **patch merger only** (ViT blocks frozen) |
+| `qwen3_text_encoder` (tied wte/lm_head + tokenizer) | Qwen3-0.6B embed | `enable_image: true` | **only the vision special-token rows** |
+| `qwen3_llm` (decoder backbone) | Qwen3-0.6B | `freeze: true` | frozen |
+
+### 7.1 Retarget the patch merger (no separate projector)
+
+Qwen3-VL's ViT outputs **2048-d** tokens (it was pretrained for the 2B LLM), but
+Qwen3-0.6B's hidden size is **1024**. Rather than bolt a separate `Linear` on top,
+we **retarget the ViT's own patch merger** to the LLM hidden size: the merger
+already ends in `linear_fc2: Linear(merger_hidden → out_hidden_size)`, so setting
+`out_hidden_size: 1024` via `model_config:` makes that the bridge into the LLM
+embedding space. `freeze: true` then freezes the ViT **blocks** but keeps the
+**merger** trainable (`freeze_model` re-enables `visual.merger`).
+
+Because a stock Qwen3-VL checkpoint's `merger.linear_fc2` is `→ 2048`, its shape
+no longer matches after retargeting. `Qwen3VLVisionEncoder`'s checkpoint converter
+(`_MergerProjectionConverter`) **drops the mismatched `linear_fc2`** at load so the
+weight loader re-initialises it (via the ViT's `_init_weights`); `merger.norm` and
+`merger.linear_fc1` still load from the checkpoint. No build-time surgery needed.
+
+The plain `qwen3_llm` backbone (flat `arange` positions) uses **neither M-RoPE nor
+DeepStack**, so `disable_deepstack: true` zeroes `deepstack_visual_indexes` — the
+ViT produces only the merged image tokens, which are packed into the sequence like
+any other embedding segment.
+
+### 7.2 Special tokens already exist — train only their rows
+
+Qwen3's tokenizer **already reserves** the vision special tokens
+(`<|vision_start|>`=151652, `<|vision_end|>`=151653, `<|image_pad|>`=151655, all
+below the 151936 embedding rows). So there is **no vocab/embedding expansion** to
+do (adding duplicates would be wrong — the tokenizer still maps to the reserved
+ids). The standard `qwen3_text_encoder` gains a single config knob (off by
+default → plain text-only Qwen3):
+
+- `enable_image: true` — use the **Qwen3-VL image ChatML template** (image →
+  `<|vision_start|>` · the vision-embed segment · `<|vision_end|>`) and handle
+  image/video parts in decode. With it off, the original text-only template runs
+  verbatim (`if self._enable_image:` branches in `modulemixin.py`). It also makes
+  `freeze_model()` keep the tied embedding's `requires_grad=True` but register a
+  **per-row gradient mask** that zeroes every row except the vision special tokens
+  (`<|vision_start|>`, `<|vision_end|>`, `<|image_pad|>`), so only those rows
+  update. **You don't pass the token ids** — the module resolves them from its own
+  tokenizer (`convert_tokens_to_ids`), since the user can't know them but the
+  module can. (With `enable_image: false` the embedding is fully trainable.)
+
+The grad mask uses **global** row indices, so the module is loaded **`ddp`**
+(replicated, not FSDP-sharded) and with **`weight_decay: 0`** (otherwise AdamW's
+decoupled decay would erode the frozen rows). Both are set in `modules_train.yaml`.
+
+> The special-token rows load verbatim from Qwen3-0.6B (an untrained reserved
+> stub). They start training from there; if you want a better starting point,
+> mean-init them before training (HF `mean_resizing` trick).
+
+### 7.3 Assemble the split checkpoint (two standard converts + combine)
+
+No dual-source script: run the two per-model converters, then copy the vision
+tower in:
+
+```bash
+# text LLM -> qwen3_llm/ + qwen3_text_encoder/
+python scripts/convert_model.py --model_type qwen3 \
+  --model_path /mnt/hdfs/veomni/models/transformers/Qwen/Qwen3-0.6B \
+  --output_dir /mnt/hdfs/veomni/models/seed_omni/Qwen3-0.6B-visual-instruction-tuning
+
+# Qwen3-VL -> qwen3vl_vision/ (+ others); keep only the vision tower
+python scripts/convert_model.py --model_type qwen3_vl \
+  --model_path /mnt/hdfs/veomni/models/transformers/Qwen/Qwen3-VL-2B-Instruct \
+  --output_dir /tmp/qwen3vl_split
+cp -r /tmp/qwen3vl_split/qwen3vl_vision \
+  /mnt/hdfs/veomni/models/seed_omni/Qwen3-0.6B-visual-instruction-tuning/
+```
+
+The combined dir holds `qwen3_llm/`, `qwen3_text_encoder/` (+ tokenizer) and
+`qwen3vl_vision/` (ViT + image/video processors). At train time the
+`out_hidden_size` override retargets the merger and its mismatched `linear_fc2` is
+re-initialised; `disable_deepstack` drops the unused DeepStack mergers.
+
+### 7.4 Config
+
+The configs live alongside the text-only Qwen3-0.6B ones in
+`configs/seed_omni/Qwen/qwen3_0.6b/`, distinguished by a `visual_instruction_tuning`
+suffix:
+
+| File | Role |
+|------|------|
+| `visual_instruction_tuning.yaml` | Launcher (model paths, accelerator, data, train, infer). |
+| `modules_train_visual_instruction_tuning.yaml` | All overrides: `qwen3vl_vision` merger retarget (`out_hidden_size`) + `disable_deepstack` + `freeze`; `qwen3_text_encoder` image mode + special-token freeze (`ddp` + `weight_decay: 0`); `qwen3_llm` freeze. |
+| `graph_train_visual_instruction_tuning.yaml` | `{qwen3vl_vision, qwen3_text_encoder.encode} → qwen3_llm → qwen3_text_encoder.decode → end`. |
+| `data_visual_instruction_tuning.yaml` | ShareGPT4V captions (image + text). |
+| `graph_infer_visual_instruction_tuning.yaml` | I2T generation FSM. |
+
+### 7.5 Train on ShareGPT4V
+
+```bash
+bash train.sh tasks/omni/train_omni.py \
+  configs/seed_omni/Qwen/qwen3_0.6b/visual_instruction_tuning.yaml
+```
+
+Trainable params are exactly `qwen3vl_vision.visual.merger.*` plus the masked
+text-encoder embedding (only the vision special-token rows receive gradient; the
+ViT and LLM are frozen).
+
+### 7.6 Inference
+
+```bash
+python tasks/omni/infer_omni.py \
+  configs/seed_omni/Qwen/qwen3_0.6b/visual_instruction_tuning.yaml \
+  --infer.infer_type understanding \
+  --infer.model_path /mnt/hdfs/veomni/models/seed_omni/Qwen3-0.6B-visual-instruction-tuning \
+  --infer.image /path/to/image.jpg \
+  --infer.prompt "What is in this image?" \
+  --infer.output_dir qwen3_vit_out
+```
+
+To infer from a **trained** checkpoint (per-module weights live under
+`<step>/<module>/hf_ckpt/`), point `--infer.model_path` at the checkpoint step
+dir and override each module's `model_path` **relative to that root** — do NOT
+repeat the `--infer.model_path` prefix. Per-module override paths are joined
+under `--infer.model_path` unless they are absolute (start with `/`); passing a
+cwd-relative full path double-joins it and fails with a cryptic
+`HFValidationError: Repo id must be in the form ...`.
+
+```bash
+STEP=outputs/qwen3_0.6b_visual_instruction_tuning/checkpoints/global_step_2000
+python tasks/omni/infer_omni.py \
+  configs/seed_omni/Qwen/qwen3_0.6b/visual_instruction_tuning.yaml \
+  --infer.infer_type understanding \
+  --infer.model_path "$STEP" \
+  --infer.image /path/to/image.jpg \
+  --infer.prompt "What is in this image?" \
+  --infer.output_dir qwen3_vit_out \
+  --infer.modules.qwen3vl_vision.model.model_path qwen3vl_vision/hf_ckpt \
+  --infer.modules.qwen3_text_encoder.model.model_path qwen3_text_encoder/hf_ckpt \
+  --infer.modules.qwen3_llm.model.model_path qwen3_llm/hf_ckpt
+```
+
+> **Scope**: this is a deliberately minimal setup (frozen ViT blocks + frozen LLM
+> + a retargeted patch merger + the vision special-token rows). It exercises the
+> full image pipeline and trains, but real image-understanding quality needs more
+> capacity (unfreeze the ViT blocks / LLM, or use an aligned ViT). DeepStack is
+> disabled because the plain `qwen3_llm` backbone can't consume those features.

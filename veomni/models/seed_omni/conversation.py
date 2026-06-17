@@ -62,6 +62,18 @@ class ConversationItem:
             return f"[torch.Tensor]{tuple(self.value.shape)}"
         elif isinstance(self.value, Image.Image):
             return f"[PIL.Image]{self.value.size}"
+        elif hasattr(self.value, "video") and hasattr(self.value, "video_fps"):
+            # VideoInputs bundle — duck-typed so core conversation.py doesn't
+            # import the optional video/audio (ffmpeg/torchcodec/librosa) stack.
+            v = self.value
+            shape = tuple(v.video.shape) if isinstance(v.video, torch.Tensor) else type(v.video).__name__
+            parts = [f"video.shape={shape}", f"fps={v.video_fps}"]
+            audio = getattr(v, "audio", None)
+            if audio is not None:
+                audio_shape = tuple(audio.shape) if isinstance(audio, torch.Tensor) else type(audio).__name__
+                parts.append(f"audio.shape={audio_shape}")
+                parts.append(f"audio_fps={getattr(v, 'audio_fps', None)}")
+            return f"[VideoInputs | {', '.join(parts)}]"
         else:
             return f"[UnknownType]{type(self.value).__name__}"
 

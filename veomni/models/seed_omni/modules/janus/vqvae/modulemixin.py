@@ -24,7 +24,7 @@ logger = helper.create_logger(__name__)
 
 class JanusVqvaeModuleMixin(ModuleMixin):
     config: JanusVqvaeConfig
-    _processor: JanusVqvaeProcessor
+    _image_processor: JanusVqvaeProcessor
 
     def init_omni_state(self) -> None:
         # Training state
@@ -142,16 +142,16 @@ class JanusVqvaeModuleMixin(ModuleMixin):
     def _pixels_from_raw_images(self, raw_images: list[Any]) -> Optional[torch.Tensor]:
         if not raw_images:
             return None
-        if self._processor is None:
+        if self._image_processor is None:
             raise RuntimeError(
                 "JanusVqvae: samples carry images but no image processor is loaded. "
-                "Assign `module._processor` before training."
+                "Assign `module._image_processor` before training."
             )
-        processed = self._processor(images=raw_images, return_tensors="pt")["pixel_values"]
+        processed = self._image_processor(images=raw_images, return_tensors="pt")["pixel_values"]
         return processed.to(device=self.device, dtype=self.dtype)
 
     def dummy_inputs(self) -> Dict[str, Any]:
-        size = self._processor.size
+        size = self._image_processor.size
         height = size.get("height")
         width = size.get("width")
         c = self.config.vq_config.in_channels
@@ -191,7 +191,7 @@ class JanusVqvaeModuleMixin(ModuleMixin):
         self._vq_buffer.append(token_id_int)
 
         outputs: Dict[str, Any] = {}
-        target = self._processor.num_image_tokens
+        target = self._image_processor.num_image_tokens
         if len(self._vq_buffer) == target:
             generated = self._emit_buffered_image()
 
@@ -214,12 +214,12 @@ class JanusVqvaeModuleMixin(ModuleMixin):
         self._vq_buffer.clear()
         with torch.inference_mode():
             decoded = self.vqmodel.decode(token_ids).permute(0, 2, 3, 1)
-        if self._processor is None:
+        if self._image_processor is None:
             raise RuntimeError(
                 "JanusVqvae: cannot postprocess VQVAE output — no processor was "
                 "loaded. Ensure `preprocessor_config.json` ships next to the weights."
             )
-        image_pil = self._processor.postprocess(decoded)[0]
+        image_pil = self._image_processor.postprocess(decoded)[0]
         return {"type": "image", "value": image_pil}
 
     def reset_local_inference_state(self) -> None:
@@ -227,7 +227,7 @@ class JanusVqvaeModuleMixin(ModuleMixin):
 
     def finalize(self, *, ctx: Dict[str, Any]) -> Dict[str, Any]:
         del ctx
-        target = self._processor.num_image_tokens
+        target = self._image_processor.num_image_tokens
         n = len(self._vq_buffer)
         if n == 0:
             return {}
@@ -286,7 +286,7 @@ class JanusVqvaeTraceMixin(TraceMixin):
     """Per-module training-trace for the Janus VQVAE codec + generation head."""
 
     config: JanusVqvaeConfig
-    _processor: JanusVqvaeProcessor
+    _image_processor: JanusVqvaeProcessor
 
     def trace_token_lengths(self, method: str, data: Dict[str, Any]) -> List[int]:
         # Count VQ image tokens on encode only; decode is the generation-head /
@@ -296,7 +296,7 @@ class JanusVqvaeTraceMixin(TraceMixin):
         pixel_values = data.get("pixel_values")
         if pixel_values is None:
             return []
-        return [int(self._processor.num_image_tokens)] * int(pixel_values.shape[0])
+        return [int(self._image_processor.num_image_tokens)] * int(pixel_values.shape[0])
 
     def estimate_flops(self, seqlens: List[int]) -> float:
         # The inner VQ codec (``vqmodel``) is a frozen conv stack (``config.freeze``

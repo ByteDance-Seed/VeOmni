@@ -1,0 +1,20 @@
+# Per-module training overrides for Qwen3-VL-2B (OmniModel V2).
+#
+# Module names match the registered HF model_type strings. Relative
+# ``model.model_path`` joins ``model.model_path`` (split-checkpoint root) from
+# base.yaml. Modules without an ``accelerator`` block inherit the global
+# (fsdp2) accelerator from base.yaml.
+#
+# The LLM tokenizer lives in ``qwen3vl_text_encoder/``; the image + video
+# processors live in ``qwen3vl_vision/`` (split checkpoint assets).
+qwen3vl_vision:
+  model:
+    model_path: qwen3vl_vision
+
+qwen3vl_text_encoder:
+  model:
+    model_path: qwen3vl_text_encoder
+
+qwen3vl_llm:
+  model:
+    model_path: qwen3vl_llm

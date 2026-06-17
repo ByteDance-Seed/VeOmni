@@ -43,11 +43,11 @@ deliberately **not** done here — it belongs in model modules per the V2
 design contract (see ``docs/seed_omni/design.md`` § "数据路由" and the per-module
 responsibility table).
 
-Video / audio modalities are not yet handled — Feature D1 covers the
-text + image minimum needed by the Janus / Bagel SeedOmni stacks.  When
-those modalities are added back in (alongside their respective encoder
-modules), they should follow the same "IO + resize → tensor in
-``item['value']``" pattern.
+Video turns (``("video", _)``) are paired with the per-sample ``videos`` list
+and decoded via ``fetch_videos`` into a :class:`VideoInputs` bundle — the
+sampled-frame tensor plus the optional in-video audio waveform.  Both streams
+ride on one media item; the downstream video / audio modules each read their
+own stream (see ``design.md`` § av-video).
 
 Registered as ``data_type: seedomni`` in
 ``veomni/data/data_transform.py``::
@@ -59,16 +59,25 @@ Registered as ``data_type: seedomni`` in
 
 from __future__ import annotations
 
+import json
 from typing import Any, List
 
-import numpy as np
 import torch
-from PIL import Image
 
 from ...models.seed_omni.conversation import ConversationItem
+from ...utils.import_utils import is_video_audio_available
 from ..data_transform import DATA_TRANSFORM_REGISTRY
-from ..multimodal.image_utils import fetch_images
+from .image_utils import fetch_images
 from .preprocess import conv_preprocess
+
+
+if is_video_audio_available():
+    from .video_utils import VideoInputs, fetch_videos
+else:
+    VideoInputs = None
+
+    def fetch_videos(*args, **kwargs):
+        return []
 
 
 # Tuple-form turn entry used by ``conv_preprocess``: ``(type, value)``.
@@ -77,101 +86,58 @@ from .preprocess import conv_preprocess
 _TupleTurn = List  # ``[role: str, (type, value), ...]``
 
 
-def _pil_to_uint8_tensor(image: Image.Image) -> torch.Tensor:
-    """Convert an RGB PIL image to a ``(C, H, W) uint8`` torch tensor.
-
-    No normalization, no float conversion, no channel-mean subtraction —
-    those are vision-encoder-specific decisions and live in the encoder
-    module's ``pre_forward``/forward.  Keeping pixels as uint8 makes the
-    dataloader-worker → main-process IPC roughly 4x cheaper than float32
-    and preserves all original pixel information.
-    """
-    if image.mode != "RGB":
-        image = image.convert("RGB")
-    # ``np.array`` (vs ``np.asarray``) forces a writable copy so torch
-    # doesn't warn about non-writable tensors when we later .permute().
-    arr = np.array(image, dtype=np.uint8)  # (H, W, C)
-    tensor = torch.from_numpy(arr).permute(2, 0, 1).contiguous()  # (C, H, W)
-    return tensor
-
-
 def _build_conversation_list(
     constructed: list[_TupleTurn],
     image_tensors: list[torch.Tensor],
+    video_inputs: list[VideoInputs],
 ) -> list[ConversationItem]:
     """Flatten ``[[role, (type, value), ...], ...]`` into
-    :class:`ConversationItem` rows and pair image turns with
-    ``image_tensors`` in source order.
+    :class:`ConversationItem` rows and pair image / video turns with
+    ``image_tensors`` / ``video_inputs`` in source order.
+
+    A video turn's value is a :class:`VideoInputs` bundling the decoded frame
+    tensor and the optional in-video audio waveform — the single carrier the
+    downstream video / audio modules each read their own stream from.
 
     Raises:
-        ValueError: if the number of ``("image", _)`` turns doesn't match
-            the number of supplied image tensors — that means upstream
+        ValueError: if the number of ``("image"|"video", _)`` turns doesn't
+            match the number of supplied media — that means upstream
             preprocessor / dataset disagree on count and we refuse to
             silently misalign.
     """
     image_iter = iter(image_tensors)
+    video_iter = iter(video_inputs)
     image_consumed = 0
+    video_consumed = 0
     out: list[ConversationItem] = []
     for turn in constructed:
         if not turn:
             continue
         role = turn[0]
-        if not isinstance(role, str):
-            raise TypeError(f"first element of a turn must be a role string, got {type(role).__name__}: {turn!r}")
+        assert role in ["user", "assistant"], f"role must be user or assistant, got {role}"
         for entry in turn[1:]:
-            if not (isinstance(entry, (tuple, list)) and len(entry) == 2):
-                raise TypeError(f"turn entry must be a (type, value) pair, got {entry!r}")
+            assert len(entry) == 2, f"turn entry must be a (type, value) pair, got {entry}"
             type_, value = entry
             if type_ == "image":
-                try:
-                    value = next(image_iter)
-                except StopIteration as e:
-                    raise ValueError(
-                        f"conversation has more image turns than supplied images "
-                        f"({image_consumed} consumed before this one)"
-                    ) from e
+                value: torch.Tensor = next(image_iter)
                 image_consumed += 1
+            elif type_ == "video":
+                value: VideoInputs = next(video_iter)
+                video_consumed += 1
             elif type_ == "text":
-                if value is None:
-                    value = ""
+                assert value is not None, "text value must not be None"
             else:
-                # Other modalities (video / audio / ...) are not handled in
-                # D1; raise so the caller knows to extend this transform
-                # alongside the matching encoder module.
-                raise NotImplementedError(
-                    f"modality type {type_!r} is not yet handled by the SeedOmni V2 "
-                    f"transform; extend ``seedomni_transform.py`` and ensure a matching "
-                    f"encoder module exists."
-                )
+                raise ValueError(f"modality type {type_!r} is not yet handled")
             out.append(ConversationItem(type=type_, value=value, role=role))
-    # Validate that we consumed exactly the supplied images — leftover
-    # images mean the dataset has unreferenced media which is almost
-    # always a bug in upstream data prep.
-    leftover = list(image_iter)
-    if leftover:
-        raise ValueError(
-            f"sample has {len(leftover)} unused image(s) after consuming "
-            f"{image_consumed} — preprocessor / dataset mismatch."
-        )
+    leftover_images = list(image_iter)
+    assert len(leftover_images) == 0, (
+        f"sample has {len(leftover_images)} unused image(s) after consuming {image_consumed}"
+    )
+    leftover_videos = list(video_iter)
+    assert len(leftover_videos) == 0, (
+        f"sample has {len(leftover_videos)} unused video(s) after consuming {video_consumed}"
+    )
     return out
-
-
-def _modalities_in(constructed: list[_TupleTurn]) -> tuple[bool, bool]:
-    """Quick scan: does this sample reference any image turns?
-
-    Returns ``(has_image, has_video)`` — kept simple, used only to skip
-    media IO when the modality is absent.  ``has_video`` is a stub for
-    when video support lands; today the function never returns True for it.
-    """
-    has_image = False
-    for turn in constructed:
-        for entry in turn[1:]:
-            if not (isinstance(entry, (tuple, list)) and len(entry) == 2):
-                continue
-            if entry[0] == "image":
-                has_image = True
-                break
-    return has_image, False
 
 
 @DATA_TRANSFORM_REGISTRY.register("seedomni")
@@ -206,8 +172,6 @@ def process_seedomni_example(
         training samples).  We do not split by length here — packing is a
         downstream collator concern (Feature D2).
     """
-    import json
-
     # Non-destructive read — datasets often share dict references and a
     # subsequent ``__getitem__`` would otherwise see the key gone.
     source = example.get("source_name", kwargs.get("source_name"))
@@ -224,14 +188,8 @@ def process_seedomni_example(
 
     constructed = conv_preprocess(source, conversations, **kwargs)
 
-    has_image, _ = _modalities_in(constructed)
-    if has_image:
-        raw_images = example.get("images", []) or []
-        pil_images = fetch_images(raw_images, **kwargs)
-        image_tensors = [_pil_to_uint8_tensor(img) for img in pil_images]
-    else:
-        image_tensors = []
+    image_tensors = fetch_images(example.get("images", []) or [], **kwargs)
+    video_inputs = fetch_videos(example.get("videos", []) or [], **kwargs)
 
-    conversation_list = _build_conversation_list(constructed, image_tensors)
-
+    conversation_list = _build_conversation_list(constructed, image_tensors, video_inputs)
     return [{"conversation_list": conversation_list}]
