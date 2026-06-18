@@ -124,13 +124,17 @@ class MiniMaxM3TinyBlock(nn.Module):
         key = key.transpose(1, 2)
         value = value.transpose(1, 2)
         attn_scores = torch.matmul(query, key.transpose(-2, -1)) / math.sqrt(self.head_dim)
-        causal_mask = torch.triu(torch.ones(seq_len, seq_len, device=hidden_states.device, dtype=torch.bool), diagonal=1)
+        causal_mask = torch.triu(
+            torch.ones(seq_len, seq_len, device=hidden_states.device, dtype=torch.bool), diagonal=1
+        )
         attn_scores = attn_scores.masked_fill(causal_mask, torch.finfo(attn_scores.dtype).min)
         if attention_mask is not None:
             padding_mask = attention_mask[:, None, None, :].to(torch.bool)
             attn_scores = attn_scores.masked_fill(~padding_mask, torch.finfo(attn_scores.dtype).min)
         attn_weights = torch.softmax(attn_scores, dim=-1)
-        attn_output = torch.matmul(attn_weights, value).transpose(1, 2).contiguous().view(batch_size, seq_len, hidden_size)
+        attn_output = (
+            torch.matmul(attn_weights, value).transpose(1, 2).contiguous().view(batch_size, seq_len, hidden_size)
+        )
         hidden_states = residual + self.o_proj(attn_output)
         hidden_states = hidden_states + self.mlp(self.post_attention_layernorm(hidden_states))
         return hidden_states
@@ -202,7 +206,9 @@ def plot_loss(losses, output_path):
 def parse_args():
     parser = argparse.ArgumentParser(description="Run MiniMax M3 VL tiny SFT smoke without real weights.")
     parser.add_argument("--config-path", default="./tests/toy_config/minimax_m3_vl_toy")
-    parser.add_argument("--weights-manifest", default="./tests/fixtures/minimax_m3_vl_sft/random_init_weights_manifest.json")
+    parser.add_argument(
+        "--weights-manifest", default="./tests/fixtures/minimax_m3_vl_sft/random_init_weights_manifest.json"
+    )
     parser.add_argument("--dataset-path", default="./tests/fixtures/minimax_m3_vl_sft/tiny_sft.jsonl")
     parser.add_argument("--output-dir", default="/tmp/veomni_minimax_m3_vl_sft_smoke")
     parser.add_argument("--steps", type=int, default=80)

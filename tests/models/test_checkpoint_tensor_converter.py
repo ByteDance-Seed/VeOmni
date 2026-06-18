@@ -169,13 +169,18 @@ class TestMiniMaxM3VLCheckpointTensorConverter:
         down = torch.full((4, 3), 3.0)
         router = torch.full((2, 4), 4.0)
 
-        assert converter.convert("language_model.model.layers.1.block_sparse_moe.shared_experts.gate_proj.weight", gate) is None
+        assert (
+            converter.convert("language_model.model.layers.1.block_sparse_moe.shared_experts.gate_proj.weight", gate)
+            is None
+        )
         result = converter.convert("language_model.model.layers.1.block_sparse_moe.shared_experts.up_proj.weight", up)
         assert result is not None
         assert result.name == "model.language_model.layers.1.mlp.shared_experts.gate_up_proj.weight"
         assert torch.equal(result.tensor, torch.cat([gate, up], dim=0))
 
-        result = converter.convert("language_model.model.layers.1.block_sparse_moe.shared_experts.down_proj.weight", down)
+        result = converter.convert(
+            "language_model.model.layers.1.block_sparse_moe.shared_experts.down_proj.weight", down
+        )
         assert result is not None
         assert result.name == "model.language_model.layers.1.mlp.shared_experts.down_proj.weight"
         assert torch.equal(result.tensor, down)
@@ -207,17 +212,37 @@ class TestMiniMaxM3VLCheckpointTensorConverter:
 
     def test_sparse_expert_merge(self):
         converter = MiniMaxM3VLCheckpointTensorConverter(num_experts=2)
-        assert converter.convert("language_model.model.layers.3.block_sparse_moe.experts.0.w1.weight", torch.ones(3, 4)) is None
-        assert converter.convert("language_model.model.layers.3.block_sparse_moe.experts.1.w1.weight", torch.ones(3, 4) * 2) is None
-        assert converter.convert("language_model.model.layers.3.block_sparse_moe.experts.0.w3.weight", torch.ones(3, 4) * 3) is None
-        result = converter.convert("language_model.model.layers.3.block_sparse_moe.experts.1.w3.weight", torch.ones(3, 4) * 4)
+        assert (
+            converter.convert("language_model.model.layers.3.block_sparse_moe.experts.0.w1.weight", torch.ones(3, 4))
+            is None
+        )
+        assert (
+            converter.convert(
+                "language_model.model.layers.3.block_sparse_moe.experts.1.w1.weight", torch.ones(3, 4) * 2
+            )
+            is None
+        )
+        assert (
+            converter.convert(
+                "language_model.model.layers.3.block_sparse_moe.experts.0.w3.weight", torch.ones(3, 4) * 3
+            )
+            is None
+        )
+        result = converter.convert(
+            "language_model.model.layers.3.block_sparse_moe.experts.1.w3.weight", torch.ones(3, 4) * 4
+        )
 
         assert result is not None
         assert result.name == "model.language_model.layers.3.mlp.experts.gate_up_proj"
         assert result.tensor.shape == (2, 6, 4)
 
-        assert converter.convert("language_model.model.layers.3.block_sparse_moe.experts.0.w2.weight", torch.ones(4, 3)) is None
-        result = converter.convert("language_model.model.layers.3.block_sparse_moe.experts.1.w2.weight", torch.ones(4, 3) * 2)
+        assert (
+            converter.convert("language_model.model.layers.3.block_sparse_moe.experts.0.w2.weight", torch.ones(4, 3))
+            is None
+        )
+        result = converter.convert(
+            "language_model.model.layers.3.block_sparse_moe.experts.1.w2.weight", torch.ones(4, 3) * 2
+        )
         assert result is not None
         assert result.name == "model.language_model.layers.3.mlp.experts.down_proj"
         assert result.tensor.shape == (2, 4, 3)
@@ -225,7 +250,10 @@ class TestMiniMaxM3VLCheckpointTensorConverter:
     def test_finalize_raises_on_incomplete_public_checkpoint(self):
         converter = MiniMaxM3VLCheckpointTensorConverter(num_experts=2)
         assert converter.convert("language_model.model.layers.0.mlp.gate_proj.weight", torch.ones(3, 4)) is None
-        assert converter.convert("language_model.model.layers.0.block_sparse_moe.experts.0.w1.weight", torch.ones(3, 4)) is None
+        assert (
+            converter.convert("language_model.model.layers.0.block_sparse_moe.experts.0.w1.weight", torch.ones(3, 4))
+            is None
+        )
 
         with pytest.raises(RuntimeError, match="incomplete checkpoint"):
             converter.finalize()

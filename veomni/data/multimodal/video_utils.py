@@ -580,7 +580,9 @@ def _load_and_process_video_with_codec(video_input: VideoInput, use_audio_in_vid
                     decoder = VideoDecoder(video_bytes, device="cpu", num_ffmpeg_threads=0)
                 except Exception as codec_error:
                     logger.warning(f"torchcodec URL-bytes decode failed: {codec_error}. Falling back to PyAV.")
-                    return _load_and_process_video_with_pyav(video_bytes, use_audio_in_video=use_audio_in_video, **kwargs)
+                    return _load_and_process_video_with_pyav(
+                        video_bytes, use_audio_in_video=use_audio_in_video, **kwargs
+                    )
             except Exception as download_error:
                 raise RuntimeError(
                     f"Failed to decode video from URL {video_input}: {download_error}"

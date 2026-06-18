@@ -113,8 +113,7 @@ class _MiniMaxTrainerProcessor:
         grid_t = int(grid_thw[0])
         frame_seqlen = int(grid_thw[1:].prod() // merge_length)
         return "".join(
-            self.VISION_START_TOKEN + self.VIDEO_TOKEN * frame_seqlen + self.VISION_END_TOKEN
-            for _ in range(grid_t)
+            self.VISION_START_TOKEN + self.VIDEO_TOKEN * frame_seqlen + self.VISION_END_TOKEN for _ in range(grid_t)
         )
 
 
@@ -231,6 +230,7 @@ def test_minimax_m3_vl_vlm_trainer_transform_collate_forward_backward(monkeypatc
         initialized_dist = True
 
     try:
+
         def fake_conv_preprocess(source, conversations, **kwargs):
             assert source == "minimax_trainer_test"
             return [
@@ -309,12 +309,12 @@ def test_minimax_m3_vl_vlm_trainer_transform_collate_forward_backward(monkeypatc
 
         image_token_count = int(micro_batch["image_grid_thw"][0].prod() // processor.image_processor.merge_size**2)
         video_token_count = int(micro_batch["video_grid_thw"][0].prod() // processor.video_processor.merge_size**2)
-        assert micro_batch["input_ids"][micro_batch["image_mask"]].tolist() == [
-            config.image_token_id
-        ] * image_token_count
-        assert micro_batch["input_ids"][micro_batch["video_mask"]].tolist() == [
-            config.video_token_id
-        ] * video_token_count
+        assert (
+            micro_batch["input_ids"][micro_batch["image_mask"]].tolist() == [config.image_token_id] * image_token_count
+        )
+        assert (
+            micro_batch["input_ids"][micro_batch["video_mask"]].tolist() == [config.video_token_id] * video_token_count
+        )
         assert micro_batch["multimodal_metadata"] == {
             "image_grid_thw_list": micro_batch["image_grid_thw"].tolist(),
             "video_grid_thw_list": micro_batch["video_grid_thw"].tolist(),

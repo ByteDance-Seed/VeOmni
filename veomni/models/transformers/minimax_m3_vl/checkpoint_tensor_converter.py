@@ -58,9 +58,7 @@ _DENSE_MLP_PATTERN = re.compile(
 _SHARED_EXPERT_PATTERN = re.compile(
     r"^language_model\.model\.layers\.(?P<layer>\d+)\.block_sparse_moe\.shared_experts\.(?P<proj>gate_proj|up_proj|down_proj)\.weight$"
 )
-_SPARSE_GATE_PATTERN = re.compile(
-    r"^language_model\.model\.layers\.(?P<layer>\d+)\.block_sparse_moe\.gate\.weight$"
-)
+_SPARSE_GATE_PATTERN = re.compile(r"^language_model\.model\.layers\.(?P<layer>\d+)\.block_sparse_moe\.gate\.weight$")
 _INDEXER_PATTERN = re.compile(
     r"^language_model\.model\.layers\.(?P<layer>\d+)\.self_attn\.index_(?P<kind>q|k)_(?P<part>proj|norm)\.weight$"
 )
@@ -194,11 +192,17 @@ class MiniMaxM3VLCheckpointTensorConverter:
     def finalize(self) -> List[ConvertedCheckpointTensor]:
         errors: List[str] = []
         if self._expert_buffer:
-            errors.append(f"unflushed expert tensors: { {key: len(value) for key, value in self._expert_buffer.items()} }")
+            errors.append(
+                f"unflushed expert tensors: { {key: len(value) for key, value in self._expert_buffer.items()} }"
+            )
         if self._gate_up_buffer:
-            errors.append(f"unflushed gate/up tensors: { {key: list(value) for key, value in self._gate_up_buffer.items()} }")
+            errors.append(
+                f"unflushed gate/up tensors: { {key: list(value) for key, value in self._gate_up_buffer.items()} }"
+            )
         if errors:
-            raise RuntimeError("MiniMaxM3VL checkpoint converter: incomplete checkpoint detected. " + "; ".join(errors))
+            raise RuntimeError(
+                "MiniMaxM3VL checkpoint converter: incomplete checkpoint detected. " + "; ".join(errors)
+            )
         return []
 
 
