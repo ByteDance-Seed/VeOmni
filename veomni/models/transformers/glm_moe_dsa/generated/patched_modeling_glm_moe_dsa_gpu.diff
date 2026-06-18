@@ -285,7 +285,7 @@
          k_pe = k_pe.expand(-1, k_nope.shape[1], -1, -1)  # [B, H, S, rope_D]
 
          # Assemble full Q and K
-@@ -411,6 +451,54 @@
+@@ -411,6 +451,56 @@
              )  # [B, S, topk]
          else:
              topk_indices = prev_topk_indices  # [B, S, topk]
@@ -308,7 +308,9 @@
 +            if self.training and self.attention_dropout != 0:
 +                raise ValueError("dsa_attention_backend='flashmla_cudnn' requires attention_dropout=0")
 +
-+            kv_b_weight = self.kv_b_proj.weight.reshape(
++            if not self.kv_b_proj.weight.is_contiguous():
++                raise ValueError("dsa_attention_backend='flashmla_cudnn' requires contiguous kv_b_proj.weight")
++            kv_b_weight = self.kv_b_proj.weight.view(
 +                self.num_heads,
 +                self.qk_nope_head_dim + self.v_head_dim,
 +                self.kv_lora_rank,
@@ -340,7 +342,7 @@
 
          # Build combined DSA + causal mask: -inf everywhere except selected top-k positions
          total_len = key_states.shape[2]
-@@ -818,6 +906,12 @@
+@@ -818,6 +908,12 @@
          )
 
 
@@ -353,7 +355,7 @@
  @auto_docstring
  class GlmMoeDsaForCausalLM(GlmMoeDsaPreTrainedModel, GenerationMixin):
      _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
-@@ -844,48 +938,59 @@
+@@ -844,48 +940,59 @@
          inputs_embeds: torch.FloatTensor | None = None,
          labels: torch.LongTensor | None = None,
          use_cache: bool | None = None,

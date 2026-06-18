@@ -470,7 +470,9 @@ class GlmMoeDsaAttention(nn.Module):
             if self.training and self.attention_dropout != 0:
                 raise ValueError("dsa_attention_backend='flashmla_cudnn' requires attention_dropout=0")
 
-            kv_b_weight = self.kv_b_proj.weight.reshape(
+            if not self.kv_b_proj.weight.is_contiguous():
+                raise ValueError("dsa_attention_backend='flashmla_cudnn' requires contiguous kv_b_proj.weight")
+            kv_b_weight = self.kv_b_proj.weight.view(
                 self.num_heads,
                 self.qk_nope_head_dim + self.v_head_dim,
                 self.kv_lora_rank,
