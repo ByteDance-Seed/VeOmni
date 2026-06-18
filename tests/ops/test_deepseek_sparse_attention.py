@@ -1,8 +1,19 @@
+import importlib
+import sys
+
 import pytest
 import torch
 
 from veomni.ops.kernels import deepseek_sparse_attention as dsa
 from veomni.utils.import_utils import is_cudnn_frontend_available
+
+
+def test_deepseek_sparse_attention_is_not_eagerly_imported_by_kernels():
+    sys.modules.pop("veomni.ops.kernels.deepseek_sparse_attention", None)
+
+    importlib.import_module("veomni.ops.kernels")
+
+    assert "veomni.ops.kernels.deepseek_sparse_attention" not in sys.modules
 
 
 def test_deepseek_sparse_attention_reports_cudnn_frontend_availability():
