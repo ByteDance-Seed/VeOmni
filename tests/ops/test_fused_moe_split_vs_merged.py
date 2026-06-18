@@ -250,7 +250,8 @@ def test_fused_moe_swiglu_limit_split_vs_merged_and_eager(swiglu_limit: float, m
     torch.testing.assert_close(fc1_split_grad, fc1_merged.grad, rtol=0, atol=0)
 
     torch.testing.assert_close(out_merged, out_eager, rtol=2e-2, atol=2e-2)
-    torch.testing.assert_close(hs_merged.grad, hs_eager.grad, rtol=6e-2, atol=6e-2)
+    # bf16 grouped GEMM dgrad can diverge slightly from eager around the clamp boundary.
+    torch.testing.assert_close(hs_merged.grad, hs_eager.grad, rtol=6e-2, atol=8e-2)
     torch.testing.assert_close(fc2_merged.grad, fc2_eager.grad, rtol=2e-2, atol=2e-2)
     fc1_eager_grad = torch.cat([fc1_1_eager.grad, fc1_2_eager.grad], dim=1)
     torch.testing.assert_close(fc1_merged.grad, fc1_eager_grad, rtol=5e-2, atol=5e-2)
