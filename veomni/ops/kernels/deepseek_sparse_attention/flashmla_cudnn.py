@@ -27,10 +27,6 @@ from cudnn import DSA
 from flash_mla import flash_mla_sparse_fwd
 
 
-def is_flash_mla_sparse_attention_available() -> bool:
-    return True
-
-
 def _local_topk_to_global(topk_indices: torch.Tensor, seqlen_k: int) -> torch.Tensor:
     if topk_indices.dim() != 3:
         raise ValueError(f"topk_indices must be [B, S_q, topk], got {tuple(topk_indices.shape)}")
@@ -373,7 +369,6 @@ def indexer_select_topk(
 
 
 __all__ = [
-    "is_flash_mla_sparse_attention_available",
     "indexer_select_topk",
     "check_flash_mla_sparse_forward_compatible",
     "flash_mla_sparse_forward",

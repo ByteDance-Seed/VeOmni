@@ -157,7 +157,6 @@ def test_flash_mla_sparse_forward_uses_imported_flash_mla_symbol(monkeypatch):
 
     monkeypatch.setattr(dsa, "flash_mla_sparse_fwd", fake_flash_mla_sparse_fwd)
 
-    assert dsa.is_flash_mla_sparse_attention_available()
     result = dsa.flash_mla_sparse_forward(q_pe, k_pe, kv_cache, q_nope, gather)
     assert set(result) == {"out", "lse"}
 
