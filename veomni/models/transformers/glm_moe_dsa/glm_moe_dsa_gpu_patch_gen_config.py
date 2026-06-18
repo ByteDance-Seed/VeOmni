@@ -28,8 +28,10 @@ config.add_post_import_block(
     """
     # ── OpSlot declarations ──────────────────────────────────────────────────
     # Bound at model-build time by _bind_veomni_ops() in auto.py.
-    from veomni.ops.dispatch import OpSlot
+    from veomni.ops.dispatch import OpSlot, OpsConfigSlot
     veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
+    veomni_dsa_indexer_backend = OpsConfigSlot("dsa_indexer_backend")
+    veomni_dsa_attention_backend = OpsConfigSlot("dsa_attention_backend")
     """
 )
 
@@ -96,7 +98,7 @@ def glm_moe_dsa_indexer_forward_patched(
     else:
         has_standard_causal_mask = False
 
-    indexer_backend = getattr(self.config, "dsa_indexer_backend", "eager")
+    indexer_backend = veomni_dsa_indexer_backend.value
     if indexer_backend not in ("eager", "cudnn"):
         raise ValueError(f"Unknown dsa_indexer_backend={indexer_backend!r}; expected 'eager' or 'cudnn'")
     if indexer_backend == "cudnn":
@@ -219,7 +221,7 @@ def glm_moe_dsa_attention_forward_patched(
     else:
         topk_indices = prev_topk_indices  # [B, S, topk]
 
-    attention_backend = getattr(self.config, "dsa_attention_backend", "eager")
+    attention_backend = veomni_dsa_attention_backend.value
     if attention_backend not in ("eager", "flashmla_cudnn"):
         raise ValueError(f"Unknown dsa_attention_backend={attention_backend!r}; expected 'eager' or 'flashmla_cudnn'")
     if attention_backend == "flashmla_cudnn":

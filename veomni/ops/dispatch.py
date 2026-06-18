@@ -35,6 +35,24 @@ from .kernel_registry import KERNEL_REGISTRY
 logger = logging.get_logger(__name__)
 
 
+class OpsConfigSlot:
+    """A module-level config value bound from ``OpsImplementationConfig``."""
+
+    def __init__(self, field_name: str, default: str = "eager"):
+        self.field_name = field_name
+        self._value = default
+
+    def bind(self, ops_config: Any) -> None:
+        self._value = getattr(ops_config, self.field_name, self._value)
+
+    @property
+    def value(self) -> str:
+        return self._value
+
+    def __repr__(self) -> str:
+        return f"OpsConfigSlot(field_name={self.field_name!r}, value={self._value!r})"
+
+
 class OpSlot:
     """A named dispatch slot that can be bound to a kernel implementation."""
 

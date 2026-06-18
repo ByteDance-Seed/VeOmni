@@ -26,7 +26,7 @@ from transformers import (
 
 from ..arguments.arguments_types import OpsImplementationConfig
 from ..distributed.parallel_state import get_parallel_state
-from ..ops.dispatch import OpSlot
+from ..ops.dispatch import OpsConfigSlot, OpSlot
 from ..utils import logging
 from ..utils.device import is_torch_npu_available
 from .loader import BaseModelLoader, get_loader, get_model_config, get_model_processor
@@ -69,6 +69,10 @@ def _bind_veomni_ops(modeling_module, ops_config: OpsImplementationConfig) -> bo
     moe_experts_kernel: Optional[str] = None
     for name in dir(modeling_module):
         obj = getattr(modeling_module, name, None)
+        if isinstance(obj, OpsConfigSlot):
+            obj.bind(ops_config)
+            bound.append(f"{obj.field_name} ({obj.value})")
+            continue
         if not isinstance(obj, OpSlot):
             continue
         # ``moe_experts`` reads ``moe_implementation`` (not the

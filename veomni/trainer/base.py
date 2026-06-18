@@ -368,7 +368,6 @@ class BaseTrainer(Stateful, ABC):
             config_kwargs=self.args.model.model_config,
         )
         self.model_config = self.model.config
-        self.args.model.apply_dsa_backend_config(self.model_config)
 
     def _setup_lora(self):
         """Wrap ``self.model`` with PEFT LoRA if ``lora_config`` is configured.
