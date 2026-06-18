@@ -150,11 +150,19 @@ def check_flash_mla_sparse_forward_compatible(
         )
     if kv_cache.shape[-1] != 512:
         return False, f"FlashMLA sparse prefill currently requires value dim 512, got {kv_cache.shape[-1]}"
+    packed_dim = q_nope.shape[-1] + q_pe.shape[-1]
+    if packed_dim != 576:
+        return False, f"FlashMLA sparse prefill currently requires packed q/k dim 576, got {packed_dim}"
     if k_pe.shape[2] != 1:
         return False, f"FlashMLA sparse prefill wrapper requires MQA K/V with H_kv=1, got {k_pe.shape[2]}"
     if gather_kv_indices is not None:
         if gather_kv_indices.shape != (*q_pe.shape[:2], gather_kv_indices.shape[-1]):
             return False, f"gather_kv_indices must be [B, S_q, topk], got {tuple(gather_kv_indices.shape)}"
+        if gather_kv_indices.shape[-1] % 128 != 0:
+            return (
+                False,
+                f"FlashMLA sparse prefill requires topk to be a multiple of 128, got {gather_kv_indices.shape[-1]}",
+            )
     if learnable_sink is not None:
         return False, "this FlashMLA/cuDNN composite path does not support learnable_sink"
     return True, ""

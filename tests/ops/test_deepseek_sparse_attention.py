@@ -146,7 +146,7 @@ def test_flash_mla_sparse_forward_imports_flash_mla(monkeypatch):
     assert set(result) == {"out", "lse"}
 
 
-def test_flash_mla_sparse_forward_compatibility_allows_unaligned_topk():
+def test_flash_mla_sparse_forward_compatibility_rejects_unaligned_topk():
     q_pe = torch.empty(1, 2, 128, 64, dtype=torch.bfloat16)
     k_pe = torch.empty(1, 4, 1, 64, dtype=torch.bfloat16)
     kv_cache = torch.empty(1, 4, 1, 512, dtype=torch.bfloat16)
@@ -155,8 +155,21 @@ def test_flash_mla_sparse_forward_compatibility_allows_unaligned_topk():
 
     compatible, reason = dsa.check_flash_mla_sparse_forward_compatible(q_pe, k_pe, kv_cache, q_nope, gather)
 
-    assert compatible
-    assert reason == ""
+    assert not compatible
+    assert "multiple of 128" in reason
+
+
+def test_flash_mla_sparse_forward_compatibility_rejects_unsupported_packed_dim():
+    q_pe = torch.empty(1, 2, 128, 32, dtype=torch.bfloat16)
+    k_pe = torch.empty(1, 4, 1, 32, dtype=torch.bfloat16)
+    kv_cache = torch.empty(1, 4, 1, 512, dtype=torch.bfloat16)
+    q_nope = torch.empty(1, 2, 128, 512, dtype=torch.bfloat16)
+    gather = torch.zeros(1, 2, 128, dtype=torch.int32)
+
+    compatible, reason = dsa.check_flash_mla_sparse_forward_compatible(q_pe, k_pe, kv_cache, q_nope, gather)
+
+    assert not compatible
+    assert "packed q/k dim 576" in reason
 
 
 def test_flash_mla_sparse_forward_compatibility_rejects_sink():

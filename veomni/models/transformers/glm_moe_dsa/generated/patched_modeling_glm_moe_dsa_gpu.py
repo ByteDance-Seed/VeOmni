@@ -476,6 +476,8 @@ class GlmMoeDsaAttention(nn.Module):
                 )
             if self.num_heads != 128:
                 unsupported_reasons.append(f"num_heads must be 128, got {self.num_heads}")
+            if topk_indices.shape[-1] % 128 != 0:
+                unsupported_reasons.append(f"topk must be a multiple of 128, got {topk_indices.shape[-1]}")
             if self.qk_rope_head_dim != 64:
                 unsupported_reasons.append(f"qk_rope_head_dim must be 64, got {self.qk_rope_head_dim}")
             if self.kv_lora_rank != 512:
