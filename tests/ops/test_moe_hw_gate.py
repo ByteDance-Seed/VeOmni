@@ -218,9 +218,21 @@ def test_bind_veomni_ops_rejects_unknown_config_slot():
     from veomni.models.auto import _bind_veomni_ops
 
     fake_module = SimpleNamespace(veomni_unknown_backend=OpsConfigSlot("missing_backend"))
+    ops_config = OpsImplementationConfig(
+        attn_implementation="eager",
+        moe_implementation="eager",
+        cross_entropy_loss_implementation="eager",
+        rms_norm_implementation="eager",
+        swiglu_mlp_implementation="eager",
+        rotary_pos_emb_implementation="eager",
+        load_balancing_loss_implementation="eager",
+        rms_norm_gated_implementation="eager",
+        causal_conv1d_implementation="eager",
+        chunk_gated_delta_rule_implementation="eager",
+    )
 
     with pytest.raises(AttributeError, match="missing_backend"):
-        _bind_veomni_ops(fake_module, OpsImplementationConfig())
+        _bind_veomni_ops(fake_module, ops_config)
 
 
 # KERNEL_REGISTRY is a module-level singleton. Assert the registrations the

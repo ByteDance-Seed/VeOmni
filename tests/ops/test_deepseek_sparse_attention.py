@@ -1,5 +1,6 @@
 import importlib
 import sys
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -39,7 +40,7 @@ def test_indexer_select_topk_uses_cudnn_score_wrapper(monkeypatch):
         assert sm_scale == 0.5
         return {"scores": scores}
 
-    monkeypatch.setattr(dsa.DSA, "indexer_forward_wrapper", fake_indexer_forward)
+    monkeypatch.setattr(dsa, "DSA", SimpleNamespace(indexer_forward_wrapper=fake_indexer_forward))
 
     indices = dsa.indexer_select_topk(
         torch.empty(1, 2, 32, 128, dtype=torch.bfloat16),
@@ -89,7 +90,7 @@ def test_sparse_attention_backward_flattens_batched_inputs(monkeypatch):
             "d_sink": torch.ones_like(sink),
         }
 
-    monkeypatch.setattr(dsa.DSA, "sparse_attention_backward_wrapper", fake_sparse_attention_backward)
+    monkeypatch.setattr(dsa, "DSA", SimpleNamespace(sparse_attention_backward_wrapper=fake_sparse_attention_backward))
 
     result = dsa.sparse_attention_backward(
         q,
