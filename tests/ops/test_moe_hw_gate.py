@@ -211,6 +211,18 @@ def test_bind_veomni_ops_binds_model_registered_config_slots():
     assert attention_slot.value == "flashmla_cudnn"
 
 
+def test_bind_veomni_ops_rejects_unknown_config_slot():
+    from types import SimpleNamespace
+
+    from veomni.arguments.arguments_types import OpsImplementationConfig
+    from veomni.models.auto import _bind_veomni_ops
+
+    fake_module = SimpleNamespace(veomni_unknown_backend=OpsConfigSlot("missing_backend"))
+
+    with pytest.raises(AttributeError, match="missing_backend"):
+        _bind_veomni_ops(fake_module, OpsImplementationConfig())
+
+
 # KERNEL_REGISTRY is a module-level singleton. Assert the registrations the
 # tests rely on are present so a future registry reshuffle trips this early.
 @pytest.mark.parametrize("impl_name", ["triton", "quack", "npu"])

@@ -43,7 +43,7 @@ class OpsConfigSlot:
         self._value = default
 
     def bind(self, ops_config: Any) -> None:
-        self._value = getattr(ops_config, self.field_name, self._value)
+        self._value = getattr(ops_config, self.field_name)
 
     @property
     def value(self) -> str:
