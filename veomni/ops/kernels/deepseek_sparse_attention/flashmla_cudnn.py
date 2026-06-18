@@ -27,20 +27,8 @@ from cudnn import DSA
 from flash_mla import flash_mla_sparse_fwd
 
 
-def is_deepseek_sparse_attention_available() -> bool:
-    return hasattr(DSA, "indexer_forward_wrapper")
-
-
 def is_flash_mla_sparse_attention_available() -> bool:
     return True
-
-
-def _indexer_forward(*args: Any, **kwargs: Any) -> Any:
-    return DSA.indexer_forward_wrapper(*args, **kwargs)
-
-
-def _sparse_attention_backward(*args: Any, **kwargs: Any) -> Any:
-    return DSA.sparse_attention_backward_wrapper(*args, **kwargs)
 
 
 def _local_topk_to_global(topk_indices: torch.Tensor, seqlen_k: int) -> torch.Tensor:
@@ -339,7 +327,7 @@ def sparse_attention_backward(
     ).reshape(batch_size * seqlen_q, topk_indices.shape[-1])
     topk_length_flat = None if topk_length is None else topk_length.reshape(batch_size * seqlen_q).to(torch.int32)
 
-    result = _sparse_attention_backward(
+    result = DSA.sparse_attention_backward_wrapper(
         q_flat,
         kv_flat,
         out_flat,
@@ -372,7 +360,7 @@ def indexer_select_topk(
     if k.dim() == 3:
         k = k.unsqueeze(2)
 
-    scores = _indexer_forward(
+    scores = DSA.indexer_forward_wrapper(
         q,
         k,
         w,
@@ -385,7 +373,6 @@ def indexer_select_topk(
 
 
 __all__ = [
-    "is_deepseek_sparse_attention_available",
     "is_flash_mla_sparse_attention_available",
     "indexer_select_topk",
     "check_flash_mla_sparse_forward_compatible",

@@ -105,7 +105,7 @@
  class GlmMoeDsaIndexer(nn.Module):
      """
      DeepSeek Sparse Attention (DSA) indexer for selecting top-k tokens.
-@@ -144,80 +162,101 @@
+@@ -144,80 +162,96 @@
      @torch.no_grad()
      def forward(
          self,
@@ -220,17 +220,12 @@
 +        if indexer_backend not in ("eager", "cudnn"):
 +            raise ValueError(f"Unknown dsa_indexer_backend={indexer_backend!r}; expected 'eager' or 'cudnn'")
 +        if indexer_backend == "cudnn":
-+            from veomni.ops.kernels.deepseek_sparse_attention.flashmla_cudnn import (
-+                indexer_select_topk,
-+                is_deepseek_sparse_attention_available,
-+            )
++            from veomni.ops.kernels.deepseek_sparse_attention.flashmla_cudnn import indexer_select_topk
 +
 +            qhead_per_kv_head = self.n_heads
 +            unsupported_reasons = []
 +            if not hidden_states.is_cuda:
 +                unsupported_reasons.append("hidden_states must be CUDA")
-+            if not is_deepseek_sparse_attention_available():
-+                unsupported_reasons.append("cuDNN FE DSA indexer wrappers are unavailable")
 +            if q.dtype not in (torch.bfloat16, torch.float16):
 +                unsupported_reasons.append(f"q dtype must be bf16/fp16, got {q.dtype}")
 +            if k_cached.dtype not in (torch.bfloat16, torch.float16):
@@ -259,7 +254,7 @@
          index_scores = torch.einsum("bsht,bsh->bst", scores, weights)
 
          if attention_mask is not None:
-@@ -225,8 +264,7 @@
+@@ -225,8 +259,7 @@
 
          total_len = index_scores.shape[-1]
          topk = min(self.index_topk, total_len)
@@ -269,7 +264,7 @@
 
 
  def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
-@@ -266,6 +304,12 @@
+@@ -266,6 +299,12 @@
      return attn_output, attn_weights
 
 
@@ -282,7 +277,7 @@
  class GlmMoeDsaAttention(nn.Module):
      """
      Multi-head Latent Attention (MLA) with DeepSeek Sparse Attention (DSA) indexer.
-@@ -382,6 +426,7 @@
+@@ -382,6 +421,7 @@
          # RoPE on k_pe (single-head rope stream)
          k_pe = k_pe.view(batch_size, 1, seq_length, self.qk_rope_head_dim)  # [B, 1, S, rope_D]
          k_pe = apply_rotary_pos_emb(k_pe, cos, sin, unsqueeze_dim=1)  # BHSD format
@@ -290,7 +285,7 @@
          k_pe = k_pe.expand(-1, k_nope.shape[1], -1, -1)  # [B, H, S, rope_D]
 
          # Assemble full Q and K
-@@ -411,6 +456,54 @@
+@@ -411,6 +451,54 @@
              )  # [B, S, topk]
          else:
              topk_indices = prev_topk_indices  # [B, S, topk]
@@ -345,7 +340,7 @@
 
          # Build combined DSA + causal mask: -inf everywhere except selected top-k positions
          total_len = key_states.shape[2]
-@@ -818,6 +911,12 @@
+@@ -818,6 +906,12 @@
          )
 
 
@@ -358,7 +353,7 @@
  @auto_docstring
  class GlmMoeDsaForCausalLM(GlmMoeDsaPreTrainedModel, GenerationMixin):
      _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
-@@ -844,48 +943,59 @@
+@@ -844,48 +938,59 @@
          inputs_embeds: torch.FloatTensor | None = None,
          labels: torch.LongTensor | None = None,
          use_cache: bool | None = None,

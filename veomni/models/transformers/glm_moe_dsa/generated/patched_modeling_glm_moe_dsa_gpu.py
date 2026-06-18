@@ -222,17 +222,12 @@ class GlmMoeDsaIndexer(nn.Module):
         if indexer_backend not in ("eager", "cudnn"):
             raise ValueError(f"Unknown dsa_indexer_backend={indexer_backend!r}; expected 'eager' or 'cudnn'")
         if indexer_backend == "cudnn":
-            from veomni.ops.kernels.deepseek_sparse_attention.flashmla_cudnn import (
-                indexer_select_topk,
-                is_deepseek_sparse_attention_available,
-            )
+            from veomni.ops.kernels.deepseek_sparse_attention.flashmla_cudnn import indexer_select_topk
 
             qhead_per_kv_head = self.n_heads
             unsupported_reasons = []
             if not hidden_states.is_cuda:
                 unsupported_reasons.append("hidden_states must be CUDA")
-            if not is_deepseek_sparse_attention_available():
-                unsupported_reasons.append("cuDNN FE DSA indexer wrappers are unavailable")
             if q.dtype not in (torch.bfloat16, torch.float16):
                 unsupported_reasons.append(f"q dtype must be bf16/fp16, got {q.dtype}")
             if k_cached.dtype not in (torch.bfloat16, torch.float16):

@@ -4,8 +4,6 @@ import sys
 import pytest
 import torch
 
-from veomni.utils.import_utils import is_cudnn_frontend_available
-
 
 dsa = pytest.importorskip("veomni.ops.kernels.deepseek_sparse_attention.flashmla_cudnn")
 
@@ -29,10 +27,6 @@ def test_deepseek_sparse_attention_package_does_not_import_flashmla_cudnn_backen
     assert "veomni.ops.kernels.deepseek_sparse_attention.flashmla_cudnn" not in sys.modules
 
 
-def test_deepseek_sparse_attention_reports_cudnn_frontend_availability():
-    assert dsa.is_deepseek_sparse_attention_available() == is_cudnn_frontend_available()
-
-
 def test_indexer_select_topk_uses_cudnn_score_wrapper(monkeypatch):
     scores = torch.tensor([[[0.1, 0.7, 0.2], [0.9, 0.0, 0.3]]], dtype=torch.float32)
 
@@ -45,7 +39,7 @@ def test_indexer_select_topk_uses_cudnn_score_wrapper(monkeypatch):
         assert sm_scale == 0.5
         return {"scores": scores}
 
-    monkeypatch.setattr(dsa, "_indexer_forward", fake_indexer_forward)
+    monkeypatch.setattr(dsa.DSA, "indexer_forward_wrapper", fake_indexer_forward)
 
     indices = dsa.indexer_select_topk(
         torch.empty(1, 2, 32, 128, dtype=torch.bfloat16),
@@ -95,7 +89,7 @@ def test_sparse_attention_backward_flattens_batched_inputs(monkeypatch):
             "d_sink": torch.ones_like(sink),
         }
 
-    monkeypatch.setattr(dsa, "_sparse_attention_backward", fake_sparse_attention_backward)
+    monkeypatch.setattr(dsa.DSA, "sparse_attention_backward_wrapper", fake_sparse_attention_backward)
 
     result = dsa.sparse_attention_backward(
         q,
