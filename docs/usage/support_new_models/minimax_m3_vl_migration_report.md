@@ -14,8 +14,8 @@ Upstream PR:
 
 - PR: `https://github.com/ByteDance-Seed/VeOmni/pull/846`
 - Branch: `codex/minimax-m3-vl-slice`
-- Latest audited head: `0164940fe2a7ca1bfe5a9be6901f3d18d5865da8`
-- GitHub status at this head: CLA is `success`; upstream GitHub Actions are still `action_required`, so maintainers must approve fork-workflow execution before CI jobs/logs exist.
+- Latest audited code head: `f15248f40d9f8498ae6749dc2410096f56a8d9e0`; subsequent commits in this report update validation evidence only.
+- GitHub status after the validation-evidence pushes: CLA is `success`; upstream GitHub Actions are still `action_required`, so maintainers must approve fork-workflow execution before CI jobs/logs exist.
 
 ## Delivered Files
 
@@ -132,7 +132,7 @@ Source recheck: HF sha and `lastModified` are unchanged, the public safetensors 
 
 ## Validation
 
-Latest PR-head preflight after the ruff-format commit and docs-evidence update (`0164940`):
+Latest PR-head preflight after the ruff-format code commit (`f15248f`), repeated after the docs-evidence update:
 
 ```text
 git diff --check
