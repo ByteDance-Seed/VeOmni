@@ -14,6 +14,8 @@ Upstream PR:
 
 - PR: `https://github.com/ByteDance-Seed/VeOmni/pull/846`
 - Branch: `codex/minimax-m3-vl-slice`
+- Latest audited head: `f15248f40d9f8498ae6749dc2410096f56a8d9e0`
+- GitHub status at this head: CLA is `success`; upstream GitHub Actions are still `action_required`, so maintainers must approve fork-workflow execution before CI jobs/logs exist.
 
 ## Delivered Files
 
@@ -129,6 +131,55 @@ Source recheck: HF sha and `lastModified` are unchanged, the public safetensors 
   - `tests/e2e/test_e2e_parallel.py` (MiniMax-specific dataset; xfail follow-up gate)
 
 ## Validation
+
+Latest PR-head preflight after ruff-format commit `f15248f`:
+
+```text
+git diff --check
+
+uv run --no-project --with ruff==0.13.2 ruff check tasks tests veomni docs
+All checks passed!
+
+uv run --no-project --with ruff==0.13.2 ruff format --check tasks tests veomni docs
+468 files already formatted
+
+uv run --no-project --with torch==2.7.1 --with transformers==5.12.0 --with psutil \
+  --with pytest --with safetensors pytest tests/models/test_checkpoint_tensor_converter.py -k MiniMax -q
+10 passed, 51 deselected in 5.22s
+
+python3 scripts/ci/check_doc_task_paths.py
+All task script paths in docs shell blocks exist.
+
+python3 tests/special_sanity/check_device_api_usage.py -d tasks
+python3 tests/special_sanity/check_device_api_usage.py -d veomni
+python3 tests/special_sanity/check_device_api_usage.py -d tests
+all checked files reported success or intentional whitelist skips
+```
+
+MiniMax targeted patchgen drift preflight at the same head:
+
+```text
+PYTHONPATH=$PWD uv run --no-project --with-editable ./patchgen-pkg \
+  --with transformers==5.12.0 --with torch==2.7.1 \
+  patchgen veomni.models.transformers.minimax_m3_vl.minimax_m3_vl_gpu_patch_gen_config \
+  -o /tmp/veomni_minimax_patchgen_check/gpu --diff
+
+PYTHONPATH=$PWD uv run --no-project --with-editable ./patchgen-pkg \
+  --with transformers==5.12.0 --with torch==2.7.1 --with psutil \
+  patchgen veomni.models.transformers.minimax_m3_vl.minimax_m3_vl_npu_patch_gen_config \
+  -o /tmp/veomni_minimax_patchgen_check/npu --diff
+
+diff -u veomni/models/transformers/minimax_m3_vl/generated/patched_modeling_minimax_m3_vl_gpu.py \
+  /tmp/veomni_minimax_patchgen_check/gpu/patched_modeling_minimax_m3_vl_gpu.py
+diff -u veomni/models/transformers/minimax_m3_vl/generated/patched_modeling_minimax_m3_vl_gpu.diff \
+  /tmp/veomni_minimax_patchgen_check/gpu/patched_modeling_minimax_m3_vl_gpu.diff
+diff -u veomni/models/transformers/minimax_m3_vl/generated/patched_modeling_minimax_m3_vl_npu.py \
+  /tmp/veomni_minimax_patchgen_check/npu/patched_modeling_minimax_m3_vl_npu.py
+diff -u veomni/models/transformers/minimax_m3_vl/generated/patched_modeling_minimax_m3_vl_npu.diff \
+  /tmp/veomni_minimax_patchgen_check/npu/patched_modeling_minimax_m3_vl_npu.diff
+```
+
+Both MiniMax patchgen commands succeeded and all four `diff -u` comparisons returned no differences, so the checked-in GPU/NPU generated `.py` and `.diff` files match the MiniMax patchgen configs byte-for-byte. The full CI command `uv run --extra gpu --dev patchgen --check` was also attempted locally, but this machine stalled during project dependency sync before patchgen execution; the targeted MiniMax regeneration above is the actionable local drift evidence for this PR head.
 
 Static checks for this update:
 
