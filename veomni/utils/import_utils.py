@@ -49,7 +49,6 @@ _PACKAGE_FLAGS: Dict[str, bool] = {
     "soundfile": _is_package_available("soundfile"),
     "triton": _is_package_available("triton"),
     "quack": _is_package_available("quack"),
-    "cudnn": _is_package_available("cudnn"),
     "veomni_patch": _is_package_available("veomni_patch"),
 }
 
@@ -90,10 +89,6 @@ def is_quack_gemm_available() -> bool:
     from .device import is_sm90_or_above
 
     return is_quack_package_available() and not _PACKAGE_FLAGS["torch_npu"] and is_sm90_or_above()
-
-
-def is_cudnn_frontend_available() -> bool:
-    return _PACKAGE_FLAGS["cudnn"]
 
 
 def is_video_audio_available() -> bool:

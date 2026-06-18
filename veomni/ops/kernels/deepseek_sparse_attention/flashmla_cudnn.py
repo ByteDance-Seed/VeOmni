@@ -197,10 +197,6 @@ def pack_flash_mla_tensors_for_sparse_backward(
     )
     if not compatible:
         raise ValueError(reason)
-    if k_pe.shape[2] != 1 or kv_cache.shape[2] != 1:
-        raise ValueError(
-            f"cuDNN FE DSA backward requires MQA K/V with H_kv=1, got {k_pe.shape[2]} and {kv_cache.shape[2]}"
-        )
     return {
         "q": torch.cat((q_nope, q_pe), dim=-1),
         "kv": torch.cat((kv_cache.squeeze(2), k_pe.squeeze(2)), dim=-1),
@@ -294,7 +290,6 @@ def sparse_attention_backward(
     *,
     softmax_scale: float | None = None,
     topk_length: torch.Tensor | None = None,
-    topk_indices_global: bool = False,
     **kwargs: Any,
 ) -> dict[str, torch.Tensor]:
     """Run cuDNN FE DSA backward from batched VeOmni-style tensors.
@@ -318,9 +313,7 @@ def sparse_attention_backward(
     out_flat = out.reshape(batch_size * seqlen_q, num_heads, out.shape[-1])
     dout_flat = dout.reshape(batch_size * seqlen_q, num_heads, dout.shape[-1])
     lse_flat = lse.reshape(batch_size * seqlen_q, num_heads)
-    topk_flat = (
-        topk_indices.to(torch.int32) if topk_indices_global else _local_topk_to_global(topk_indices, seqlen_k)
-    ).reshape(batch_size * seqlen_q, topk_indices.shape[-1])
+    topk_flat = _local_topk_to_global(topk_indices, seqlen_k).reshape(batch_size * seqlen_q, topk_indices.shape[-1])
     topk_length_flat = None if topk_length is None else topk_length.reshape(batch_size * seqlen_q).to(torch.int32)
 
     result = DSA.sparse_attention_backward_wrapper(
