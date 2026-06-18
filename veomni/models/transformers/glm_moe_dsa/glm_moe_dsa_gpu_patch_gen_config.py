@@ -23,6 +23,7 @@ config.add_import(
 config.add_import(
     "veomni.ops.kernels.deepseek_sparse_attention",
     names=[
+        "check_flash_mla_sparse_forward_compatible",
         "flash_mla_sparse_attention_with_cudnn_backward",
         "indexer_select_topk",
         "is_deepseek_sparse_attention_available",
@@ -226,33 +227,12 @@ def glm_moe_dsa_attention_forward_patched(
     if attention_backend not in ("eager", "flashmla_cudnn"):
         raise ValueError(f"Unknown dsa_attention_backend={attention_backend!r}; expected 'eager' or 'flashmla_cudnn'")
     if attention_backend == "flashmla_cudnn":
-        unsupported_reasons = []
         if not hidden_states.is_cuda:
-            unsupported_reasons.append("hidden_states must be CUDA")
+            raise ValueError("dsa_attention_backend='flashmla_cudnn' requires CUDA hidden_states")
         if past_key_values is not None:
-            unsupported_reasons.append("KV cache is not supported")
+            raise ValueError("dsa_attention_backend='flashmla_cudnn' does not support KV cache")
         if self.training and self.attention_dropout != 0:
-            unsupported_reasons.append("attention dropout must be 0")
-        if q_pe.dtype not in (torch.bfloat16, torch.float16):
-            unsupported_reasons.append(f"q_pe dtype must be bf16/fp16, got {q_pe.dtype}")
-        if k_pe_mqa.dtype != q_pe.dtype:
-            unsupported_reasons.append(f"k_pe dtype must match q_pe dtype, got {k_pe_mqa.dtype} and {q_pe.dtype}")
-        if k_compressed.dtype != q_pe.dtype:
-            unsupported_reasons.append(
-                f"compressed KV dtype must match q_pe dtype, got {k_compressed.dtype} and {q_pe.dtype}"
-            )
-        if self.num_heads != 128:
-            unsupported_reasons.append(f"num_heads must be 128, got {self.num_heads}")
-        if topk_indices.shape[-1] % 128 != 0:
-            unsupported_reasons.append(f"topk must be a multiple of 128, got {topk_indices.shape[-1]}")
-        if self.qk_rope_head_dim != 64:
-            unsupported_reasons.append(f"qk_rope_head_dim must be 64, got {self.qk_rope_head_dim}")
-        if self.kv_lora_rank != 512:
-            unsupported_reasons.append(f"kv_lora_rank must be 512, got {self.kv_lora_rank}")
-        if unsupported_reasons:
-            raise ValueError(
-                "dsa_attention_backend='flashmla_cudnn' is not supported: " + "; ".join(unsupported_reasons)
-            )
+            raise ValueError("dsa_attention_backend='flashmla_cudnn' requires attention_dropout=0")
 
         kv_b_weight = self.kv_b_proj.weight.view(
             self.num_heads,
@@ -262,6 +242,15 @@ def glm_moe_dsa_attention_forward_patched(
         k_nope_weight = kv_b_weight[:, : self.qk_nope_head_dim, :]
         value_weight = kv_b_weight[:, self.qk_nope_head_dim :, :]
         q_nope_absorbed = torch.einsum("bhsd,hdr->bshr", q_nope, k_nope_weight)
+        compatible, reason = check_flash_mla_sparse_forward_compatible(
+            q_pe.transpose(1, 2),
+            k_pe_mqa.transpose(1, 2),
+            k_compressed.unsqueeze(2),
+            q_nope_absorbed,
+            topk_indices,
+        )
+        if not compatible:
+            raise ValueError("dsa_attention_backend='flashmla_cudnn' is not supported: " + reason)
         compressed_attn_output = flash_mla_sparse_attention_with_cudnn_backward(
             q_pe.transpose(1, 2).contiguous(),
             k_pe_mqa.transpose(1, 2).contiguous(),
