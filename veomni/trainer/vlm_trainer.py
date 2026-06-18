@@ -144,6 +144,7 @@ class VLMTrainer:
             config_kwargs=args.model.model_config,
         )
         self.base.model_config = self.base.model.config
+        args.model.apply_dsa_backend_config(self.base.model_config)
 
     def _freeze_model_module(self):
         args: VeOmniVLMArguments = self.base.args

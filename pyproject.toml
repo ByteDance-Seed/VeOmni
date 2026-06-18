@@ -53,11 +53,16 @@ gpu = [
   "nvidia-cusparselt-cu13",
   "nvidia-nccl-cu13",
   "nvidia-cutlass-dsl>=4.4.2",
+  # cuDNN Frontend DSA kernels for DeepSeek sparse attention training. Avoid the
+  # `cutedsl` extra because it pins nvidia-cutlass-dsl==4.5.0, which conflicts with FA4.
+  "nvidia-cudnn-frontend>=1.24.0",
   "cuda-python==13.0.3",
-  # See `[tool.uv.sources]` — FA2 (cp311/cp312) and FA3 (sm90 abi3) install
-  # from prebuilt wheels; flash-qla source-builds from git.
+  # See `[tool.uv.sources]` — FA2 (cp311/cp312), FA3 (sm90 abi3), and
+  # FlashMLA (cp311/cp312 sm90a/sm100f) install from prebuilt wheels;
+  # flash-qla source-builds from git.
   "flash-attn",
   "flash-attn-3",
+  "flash-mla",
   # 4.0.0b16 is available from PyPI; newer fa4-v4.0.0.beta17 is tag-only
   # and not yet published as a package release.
   "flash-attn-4==4.0.0b16",
@@ -66,6 +71,7 @@ gpu = [
   "flash-linear-attention",
   "quack-kernels[cu13]==0.5.0",
   "torch-c-dlpack-ext",
+  "apache-tvm-ffi==0.1.9",
   "av>=14.3.0,<15.0; python_version == '3.11'",
   "av>=14.0.0,<14.3; python_version == '3.12'",
   "librosa>=0.11.0,<0.12",
@@ -197,6 +203,10 @@ flash-attn = [
 ]
 flash-attn-3 = [
     { url = "https://github.com/Luosuu/flash-attention3-wheels/releases/download/v0.0.5/flash_attn_3-3.0.0+20260610.cu130torch2110cxx11abitrue.fb02fc.sm90-cp310-abi3-linux_x86_64.whl", marker = "extra == 'gpu'" },
+]
+flash-mla = [
+    { url = "https://github.com/Luosuu/flash-mla-wheels/releases/download/v1.0.0-9241ae3-torch211cu130/flash_mla-1.0.0%2B9241ae3-1torch211cu130cuda131sm90asm100f-cp311-cp311-linux_x86_64.whl", marker = "extra == 'gpu' and python_version == '3.11'" },
+    { url = "https://github.com/Luosuu/flash-mla-wheels/releases/download/v1.0.0-9241ae3-torch211cu130/flash_mla-1.0.0%2B9241ae3-1torch211cu130cuda131sm90asm100f-cp312-cp312-linux_x86_64.whl", marker = "extra == 'gpu' and python_version == '3.12'" },
 ]
 # Strictly newer than v0.1.0 — picks up fixes for backward gradient count (#10),
 # auto_cp UnboundLocalError (#8), and l2norm dtype preservation (#13).

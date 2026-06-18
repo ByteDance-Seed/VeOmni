@@ -779,6 +779,30 @@ wheels = [
 ]
 
 [[package]]
+name = "flash-mla"
+version = "1.0.0+9241ae3"
+source = { url = "https://github.com/Luosuu/flash-mla-wheels/releases/download/v1.0.0-9241ae3-torch211cu130/flash_mla-1.0.0%2B9241ae3-1torch211cu130cuda131sm90asm100f-cp311-cp311-linux_x86_64.whl" }
+resolution-markers = [
+    "python_full_version < '3.12' and sys_platform == 'linux'",
+    "python_full_version < '3.12' and sys_platform != 'linux'",
+]
+wheels = [
+    { url = "https://github.com/Luosuu/flash-mla-wheels/releases/download/v1.0.0-9241ae3-torch211cu130/flash_mla-1.0.0%2B9241ae3-1torch211cu130cuda131sm90asm100f-cp311-cp311-linux_x86_64.whl", hash = "sha256:e09cdd9dde993011a5d5bb3820885d92d62b2776cef65fbab13ccf2acb9060e6" },
+]
+
+[[package]]
+name = "flash-mla"
+version = "1.0.0+9241ae3"
+source = { url = "https://github.com/Luosuu/flash-mla-wheels/releases/download/v1.0.0-9241ae3-torch211cu130/flash_mla-1.0.0%2B9241ae3-1torch211cu130cuda131sm90asm100f-cp312-cp312-linux_x86_64.whl" }
+resolution-markers = [
+    "python_full_version >= '3.12' and sys_platform == 'linux'",
+    "python_full_version >= '3.12' and sys_platform != 'linux'",
+]
+wheels = [
+    { url = "https://github.com/Luosuu/flash-mla-wheels/releases/download/v1.0.0-9241ae3-torch211cu130/flash_mla-1.0.0%2B9241ae3-1torch211cu130cuda131sm90asm100f-cp312-cp312-linux_x86_64.whl", hash = "sha256:4888e25a4f72c72514ddcceb06401a7bcb2beb9aacd0fc90622c7bfd892ebcbe" },
+]
+
+[[package]]
 name = "flash-qla"
 version = "0.1.0"
 source = { git = "https://github.com/QwenLM/FlashQLA?rev=6ef4858b5446e05bd461d9658d877e548182dbcb#6ef4858b5446e05bd461d9658d877e548182dbcb" }
@@ -1726,6 +1750,19 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/f1/84/26025437c1e6b61a707442184fa0c03d083b661adf3a3eecfd6d21677740/nvidia_cudnn_cu13-9.19.0.56-py3-none-manylinux_2_27_aarch64.whl", hash = "sha256:6ed29ffaee1176c612daf442e4dd6cfeb6a0caa43ddcbeb59da94953030b1be4", size = 433781201, upload-time = "2026-02-03T20:40:53.805Z" },
     { url = "https://files.pythonhosted.org/packages/a3/22/0b4b932655d17a6da1b92fa92ab12844b053bb2ac2475e179ba6f043da1e/nvidia_cudnn_cu13-9.19.0.56-py3-none-manylinux_2_27_x86_64.whl", hash = "sha256:d20e1734305e9d68889a96e3f35094d733ff1f83932ebe462753973e53a572bf", size = 366066321, upload-time = "2026-02-03T20:44:52.837Z" },
     { url = "https://files.pythonhosted.org/packages/91/a2/f020386683ee9ab2c9a9f7f79290d9b0d07f7241de54dc746af2abd188d2/nvidia_cudnn_cu13-9.19.0.56-py3-none-win_amd64.whl", hash = "sha256:40d8c375005bcb01495f8edf375230b203a411a0c05fb6dc92a3781edcb23eac", size = 350547366, upload-time = "2026-02-03T20:50:49.563Z" },
+]
+
+[[package]]
+name = "nvidia-cudnn-frontend"
+version = "1.25.0"
+source = { registry = "https://pypi.org/simple" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/7c/57/5f2a32a40f7beeaec4020b7124ea854ba38ecb89663ba3449b42bb88ad54/nvidia_cudnn_frontend-1.25.0-cp311-cp311-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:3ae5c281bcb23536c12b7fd2b28e2f599dd1e45e96d37b598175195eb75e8f1a", size = 3262531, upload-time = "2026-06-10T21:06:43.49Z" },
+    { url = "https://files.pythonhosted.org/packages/a8/50/224ff36c5d9e02624f8d3c582982bfac74bec481cd331e704fb9a5ecd128/nvidia_cudnn_frontend-1.25.0-cp311-cp311-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:676d56062d3ade4ffb34315abe52ea766fa4488db1161b702d9ddd872fab4ddf", size = 3413687, upload-time = "2026-06-10T21:07:04.26Z" },
+    { url = "https://files.pythonhosted.org/packages/fa/87/4716b610e0f5b695f76984cb7591944f2d72b10139ca952f3d0cd1cd9ea3/nvidia_cudnn_frontend-1.25.0-cp311-cp311-win_amd64.whl", hash = "sha256:05279eac512e923fc61154f5d463d9917f14d46aa7a507e2610458e1d2367f3b", size = 2797009, upload-time = "2026-06-10T21:07:27.112Z" },
+    { url = "https://files.pythonhosted.org/packages/28/0f/df39a194f2529093db737d43cc4cbf594c6a79712a09aa104b999e4d95d4/nvidia_cudnn_frontend-1.25.0-cp312-cp312-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:09e6e1bc48ce1235743f89d8ea699c52b3008fd6dae7f2ecadb744bebf272a2b", size = 3263306, upload-time = "2026-06-10T21:07:48.093Z" },
+    { url = "https://files.pythonhosted.org/packages/03/65/3b45941d8a22128b971e910f2e9af6bf5ef453e92cc329c56b6eb53c53de/nvidia_cudnn_frontend-1.25.0-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:9a94a72d736bd79eb35f451aaf26d9493778e02ecabccc92c05425508c9e7a83", size = 3414884, upload-time = "2026-06-10T21:08:08.603Z" },
+    { url = "https://files.pythonhosted.org/packages/2e/45/69517e8f028573a150e82b71205c920e78ebbe83ff0d073eaeee2ada18dc/nvidia_cudnn_frontend-1.25.0-cp312-cp312-win_amd64.whl", hash = "sha256:d1bfdc795a8bda570ca80ef2287e83f00974857a9a086c1653d2a28099496fee", size = 2798190, upload-time = "2026-06-10T21:08:30.506Z" },
 ]
 
 [[package]]
@@ -2933,8 +2970,6 @@ source = { registry = "https://download.pytorch.org/whl/" }
 resolution-markers = [
     "python_full_version >= '3.12' and sys_platform == 'darwin'",
     "python_full_version < '3.12' and sys_platform == 'darwin'",
-    "python_full_version >= '3.12' and platform_machine == 'aarch64' and sys_platform == 'linux'",
-    "python_full_version < '3.12' and platform_machine == 'aarch64' and sys_platform == 'linux'",
 ]
 dependencies = [
     { name = "filelock", marker = "sys_platform == 'darwin'" },
@@ -2948,8 +2983,6 @@ dependencies = [
 wheels = [
     { url = "https://download-r2.pytorch.org/whl/cpu/torch-2.7.1-cp311-none-macosx_11_0_arm64.whl", hash = "sha256:68a352c7f435abb5cb47e2c032dcd1012772ae2bacb6fc8b83b0c1b11874ab3a", upload-time = "2025-06-03T18:28:05Z" },
     { url = "https://download-r2.pytorch.org/whl/cpu/torch-2.7.1-cp312-none-macosx_11_0_arm64.whl", hash = "sha256:7b4f8b2b83bd08f7d399025a9a7b323bdbb53d20566f1e0d584689bb92d82f9a", upload-time = "2025-06-03T18:28:06Z" },
-    { url = "https://files.pythonhosted.org/packages/11/56/2eae3494e3d375533034a8e8cf0ba163363e996d85f0629441fa9d9843fe/torch-2.7.1-cp311-cp311-manylinux_2_28_aarch64.whl", hash = "sha256:236f501f2e383f1cb861337bdf057712182f910f10aeaf509065d54d339e49b2", size = 99093039, upload-time = "2025-06-04T17:39:06.963424Z" },
-    { url = "https://files.pythonhosted.org/packages/87/93/fb505a5022a2e908d81fe9a5e0aa84c86c0d5f408173be71c6018836f34e/torch-2.7.1-cp312-cp312-manylinux_2_28_aarch64.whl", hash = "sha256:27ea1e518df4c9de73af7e8a720770f3628e7f667280bce2be7a16292697e3fa", size = 98948276, upload-time = "2025-06-04T17:39:12.852763Z" },
 ]
 
 [[package]]
@@ -3162,8 +3195,6 @@ resolution-markers = [
     "python_full_version < '3.12' and sys_platform == 'darwin'",
 ]
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/df/e6/0f3835895f9d0b8900ca4a7196932b13b74156ad9ffb76e7aacfc5bb4157/torchaudio-2.7.1-cp311-cp311-manylinux_2_28_aarch64.whl", hash = "sha256:53bc4ba12e7468be34a7ca2ee837ee5c8bd5755b25c12f665af9339cae37e265", size = 1686156, upload-time = "2025-06-04T17:44:09.390428Z" },
-    { url = "https://files.pythonhosted.org/packages/62/7d/6c15f15d3edc5271abc808f70713644b50f0f7bfb85a09dba8b5735fbad3/torchaudio-2.7.1-cp312-cp312-manylinux_2_28_aarch64.whl", hash = "sha256:d66bd76b226fdd4135c97650e1b7eb63fb7659b4ed0e3a778898e41dbba21b61", size = 1686680, upload-time = "2025-06-04T17:43:58.986189Z" },
     { url = "https://download-r2.pytorch.org/whl/cpu/torchaudio-2.7.1-cp311-cp311-macosx_11_0_arm64.whl", hash = "sha256:d5a62f88c629035913f506df03f710c48fc8bb9637191933f27c67088d5ca136", upload-time = "2025-06-03T18:37:35Z" },
     { url = "https://download-r2.pytorch.org/whl/cu128/torchaudio-2.7.1-cp311-cp311-manylinux_2_28_aarch64.whl", hash = "sha256:aa130165f67ef873c53c8580559e5baca08ea189835419279efbf35a58587bf8", upload-time = "2025-06-03T18:37:40Z" },
     { url = "https://download-r2.pytorch.org/whl/cpu/torchaudio-2.7.1-cp311-cp311-manylinux_2_28_aarch64.whl", hash = "sha256:53bc4ba12e7468be34a7ca2ee837ee5c8bd5755b25c12f665af9339cae37e265", upload-time = "2025-06-03T18:37:35Z" },
@@ -3290,11 +3321,9 @@ dependencies = [
     { name = "pillow", marker = "(platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux') or sys_platform == 'darwin'" },
 ]
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/ac/d0/18f951b2be3cfe48c0027b349dcc6fde950e3dc95dd83e037e86f284f6fd/torchvision-0.22.1-cp311-cp311-manylinux_2_28_aarch64.whl", hash = "sha256:8b4a53a6067d63adba0c52f2b8dd2290db649d642021674ee43c0c922f0c6a69", size = 2514021, upload-time = "2025-06-04T17:43:07.608391Z" },
-    { url = "https://files.pythonhosted.org/packages/25/f6/53e65384cdbbe732cc2106bb04f7fb908487e4fb02ae4a1613ce6904a122/torchvision-0.22.1-cp312-cp312-manylinux_2_28_aarch64.whl", hash = "sha256:964414eef19459d55a10e886e2fca50677550e243586d1678f65e3f6f6bac47a", size = 2514576, upload-time = "2025-06-04T17:43:02.707736Z" },
     { url = "https://download-r2.pytorch.org/whl/cpu/torchvision-0.22.1-cp311-cp311-macosx_11_0_arm64.whl", hash = "sha256:4addf626e2b57fc22fd6d329cf1346d474497672e6af8383b7b5b636fba94a53", upload-time = "2025-06-03T18:37:22Z" },
-    { url = "https://download-r2.pytorch.org/whl/cu128/torchvision-0.22.1-cp311-cp311-manylinux_2_28_aarch64.whl", hash = "sha256:299fbd935f02b424e9166b7689de57067e24a228edc00abd5faf84f86c0643a0", upload-time = "2025-06-03T18:37:29Z" },
     { url = "https://download-r2.pytorch.org/whl/cpu/torchvision-0.22.1-cp311-cp311-manylinux_2_28_aarch64.whl", hash = "sha256:8b4a53a6067d63adba0c52f2b8dd2290db649d642021674ee43c0c922f0c6a69", upload-time = "2025-06-03T18:37:22Z" },
+    { url = "https://download-r2.pytorch.org/whl/cu128/torchvision-0.22.1-cp311-cp311-manylinux_2_28_aarch64.whl", hash = "sha256:299fbd935f02b424e9166b7689de57067e24a228edc00abd5faf84f86c0643a0", upload-time = "2025-06-03T18:37:29Z" },
     { url = "https://download-r2.pytorch.org/whl/cpu/torchvision-0.22.1-cp312-cp312-macosx_11_0_arm64.whl", hash = "sha256:153f1790e505bd6da123e21eee6e83e2e155df05c0fe7d56347303067d8543c5", upload-time = "2025-06-03T18:37:22Z" },
     { url = "https://download-r2.pytorch.org/whl/cu128/torchvision-0.22.1-cp312-cp312-manylinux_2_28_aarch64.whl", hash = "sha256:2ad7fe412b821333fc05b4046263d77c14ba86f3965366adbada8dc397ea45b4", upload-time = "2025-06-03T18:37:29Z" },
     { url = "https://download-r2.pytorch.org/whl/cpu/torchvision-0.22.1-cp312-cp312-manylinux_2_28_aarch64.whl", hash = "sha256:964414eef19459d55a10e886e2fca50677550e243586d1678f65e3f6f6bac47a", upload-time = "2025-06-03T18:37:23Z" },
@@ -3507,6 +3536,7 @@ dev = [
     { name = "ruff" },
 ]
 gpu = [
+    { name = "apache-tvm-ffi" },
     { name = "av", version = "14.2.0", source = { url = "https://files.pythonhosted.org/packages/ed/e8/cf60f3fcde3d0eedee3e9ff66b674a9b85bffc907dccebbc56fb5ac4a954/av-14.2.0-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl" }, marker = "(python_full_version >= '3.12' and extra == 'extra-6-veomni-gpu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64')" },
     { name = "av", version = "14.4.0", source = { url = "https://files.pythonhosted.org/packages/f8/9a/8ffabfcafb42154b4b3a67d63f9b69e68fa8c34cb39ddd5cb813dd049ed4/av-14.4.0-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl" }, marker = "(python_full_version < '3.12' and extra == 'extra-6-veomni-gpu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64')" },
     { name = "cuda-python" },
@@ -3516,12 +3546,15 @@ gpu = [
     { name = "flash-attn-3" },
     { name = "flash-attn-4" },
     { name = "flash-linear-attention" },
+    { name = "flash-mla", version = "1.0.0+9241ae3", source = { url = "https://github.com/Luosuu/flash-mla-wheels/releases/download/v1.0.0-9241ae3-torch211cu130/flash_mla-1.0.0%2B9241ae3-1torch211cu130cuda131sm90asm100f-cp311-cp311-linux_x86_64.whl" }, marker = "(python_full_version < '3.12' and extra == 'extra-6-veomni-gpu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64')" },
+    { name = "flash-mla", version = "1.0.0+9241ae3", source = { url = "https://github.com/Luosuu/flash-mla-wheels/releases/download/v1.0.0-9241ae3-torch211cu130/flash_mla-1.0.0%2B9241ae3-1torch211cu130cuda131sm90asm100f-cp312-cp312-linux_x86_64.whl" }, marker = "(python_full_version >= '3.12' and extra == 'extra-6-veomni-gpu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64')" },
     { name = "flash-qla" },
     { name = "ftfy" },
     { name = "hf-transfer" },
     { name = "librosa" },
     { name = "liger-kernel" },
     { name = "megatron-energon" },
+    { name = "nvidia-cudnn-frontend" },
     { name = "nvidia-cusparselt-cu13" },
     { name = "nvidia-cutlass-dsl" },
     { name = "nvidia-nccl-cu13" },
@@ -3556,10 +3589,13 @@ npu = [
 npu-aarch64 = [
     { name = "decorator" },
     { name = "scipy" },
-    { name = "torch", version = "2.7.1", source = { registry = "https://download.pytorch.org/whl/" } },
+    { name = "torch", version = "2.7.1", source = { registry = "https://download.pytorch.org/whl/" }, marker = "(sys_platform == 'darwin' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64')" },
+    { name = "torch", version = "2.7.1+cu128", source = { registry = "https://download.pytorch.org/whl/" }, marker = "(sys_platform != 'darwin' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64')" },
     { name = "torch-npu" },
-    { name = "torchaudio", version = "2.7.1", source = { registry = "https://download.pytorch.org/whl/" } },
-    { name = "torchvision", version = "0.22.1", source = { registry = "https://download.pytorch.org/whl/" } },
+    { name = "torchaudio", version = "2.7.1", source = { registry = "https://download.pytorch.org/whl/" }, marker = "(platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux' and extra == 'extra-6-veomni-npu-aarch64') or (platform_machine != 'aarch64' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (platform_python_implementation != 'CPython' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform != 'linux' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform == 'darwin' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform == 'darwin' and extra != 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64')" },
+    { name = "torchaudio", version = "2.7.1+xpu", source = { registry = "https://download.pytorch.org/whl/" }, marker = "(platform_machine != 'aarch64' and sys_platform == 'linux' and extra == 'extra-6-veomni-npu-aarch64') or (platform_python_implementation != 'CPython' and sys_platform == 'linux' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform != 'darwin' and sys_platform != 'linux' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform == 'darwin' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform == 'linux' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64')" },
+    { name = "torchvision", version = "0.22.1", source = { registry = "https://download.pytorch.org/whl/" }, marker = "(platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux' and extra == 'extra-6-veomni-npu-aarch64') or (platform_machine != 'aarch64' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (platform_python_implementation != 'CPython' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform != 'linux' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform == 'darwin' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform == 'darwin' and extra != 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64')" },
+    { name = "torchvision", version = "0.22.1+cpu", source = { registry = "https://download.pytorch.org/whl/" }, marker = "(platform_machine != 'aarch64' and sys_platform == 'linux' and extra == 'extra-6-veomni-npu-aarch64') or (platform_python_implementation != 'CPython' and sys_platform == 'linux' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform != 'darwin' and sys_platform != 'linux' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform == 'darwin' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform == 'linux' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64')" },
 ]
 
 [package.dev-dependencies]
@@ -3589,6 +3625,7 @@ transformers-stable = [
 
 [package.metadata]
 requires-dist = [
+    { name = "apache-tvm-ffi", marker = "extra == 'gpu'", specifier = "==0.1.9" },
     { name = "av", marker = "python_full_version == '3.11.*' and extra == 'gpu'", url = "https://files.pythonhosted.org/packages/f8/9a/8ffabfcafb42154b4b3a67d63f9b69e68fa8c34cb39ddd5cb813dd049ed4/av-14.4.0-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl" },
     { name = "av", marker = "python_full_version == '3.11.*' and extra == 'npu'", url = "https://files.pythonhosted.org/packages/f8/9a/8ffabfcafb42154b4b3a67d63f9b69e68fa8c34cb39ddd5cb813dd049ed4/av-14.4.0-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl" },
     { name = "av", marker = "python_full_version == '3.12.*' and extra == 'gpu'", url = "https://files.pythonhosted.org/packages/ed/e8/cf60f3fcde3d0eedee3e9ff66b674a9b85bffc907dccebbc56fb5ac4a954/av-14.2.0-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl" },
@@ -3608,6 +3645,9 @@ requires-dist = [
     { name = "flash-attn-3", marker = "extra == 'gpu'", url = "https://github.com/Luosuu/flash-attention3-wheels/releases/download/v0.0.5/flash_attn_3-3.0.0+20260610.cu130torch2110cxx11abitrue.fb02fc.sm90-cp310-abi3-linux_x86_64.whl" },
     { name = "flash-attn-4", marker = "extra == 'gpu'", specifier = "==4.0.0b16" },
     { name = "flash-linear-attention", marker = "extra == 'gpu'" },
+    { name = "flash-mla", marker = "python_full_version == '3.11.*' and extra == 'gpu'", url = "https://github.com/Luosuu/flash-mla-wheels/releases/download/v1.0.0-9241ae3-torch211cu130/flash_mla-1.0.0%2B9241ae3-1torch211cu130cuda131sm90asm100f-cp311-cp311-linux_x86_64.whl" },
+    { name = "flash-mla", marker = "(python_full_version < '3.11' and extra == 'gpu') or (python_full_version >= '3.13' and extra == 'gpu')" },
+    { name = "flash-mla", marker = "python_full_version == '3.12.*' and extra == 'gpu'", url = "https://github.com/Luosuu/flash-mla-wheels/releases/download/v1.0.0-9241ae3-torch211cu130/flash_mla-1.0.0%2B9241ae3-1torch211cu130cuda131sm90asm100f-cp312-cp312-linux_x86_64.whl" },
     { name = "flash-qla", marker = "extra == 'gpu'", git = "https://github.com/QwenLM/FlashQLA?rev=6ef4858b5446e05bd461d9658d877e548182dbcb" },
     { name = "ftfy", marker = "extra == 'gpu'" },
     { name = "ftfy", marker = "extra == 'npu'" },
@@ -3619,6 +3659,7 @@ requires-dist = [
     { name = "matplotlib", specifier = ">=3.7" },
     { name = "megatron-energon", marker = "extra == 'gpu'", specifier = ">=7.2.1" },
     { name = "megatron-energon", marker = "extra == 'npu'", specifier = ">=7.2.1" },
+    { name = "nvidia-cudnn-frontend", marker = "extra == 'gpu'", specifier = ">=1.24.0" },
     { name = "nvidia-cusparselt-cu13", marker = "extra == 'gpu'" },
     { name = "nvidia-cutlass-dsl", marker = "extra == 'gpu'", specifier = ">=4.4.2" },
     { name = "nvidia-nccl-cu13", marker = "extra == 'gpu'" },

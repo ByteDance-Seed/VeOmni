@@ -990,7 +990,21 @@ class ModelArguments:
         default_factory=dict,
         metadata={"help": "Config for lora."},
     )
+    dsa_indexer_backend: Literal["eager", "cudnn"] = field(
+        default="eager",
+        metadata={"help": "DeepSeek sparse attention top-k indexer backend."},
+    )
+    dsa_attention_backend: Literal["eager", "fa4_cudnn"] = field(
+        default="eager",
+        metadata={"help": "DeepSeek sparse attention backend."},
+    )
     ops_implementation: OpsImplementationConfig = field(default_factory=OpsImplementationConfig)
+
+    def apply_dsa_backend_config(self, config):
+        if self.dsa_indexer_backend != "eager":
+            config.dsa_indexer_backend = self.dsa_indexer_backend
+        if self.dsa_attention_backend != "eager":
+            config.dsa_attention_backend = self.dsa_attention_backend
 
     def __post_init__(self):
         if self.config_path is None and self.model_path is None:
