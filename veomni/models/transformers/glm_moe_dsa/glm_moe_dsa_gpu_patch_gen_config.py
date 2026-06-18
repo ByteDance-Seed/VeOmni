@@ -223,9 +223,9 @@ def glm_moe_dsa_attention_forward_patched(
         topk_indices = prev_topk_indices  # [B, S, topk]
 
     attention_backend = getattr(self.config, "dsa_attention_backend", "eager")
-    if attention_backend not in ("eager", "fa4_cudnn"):
-        raise ValueError(f"Unknown dsa_attention_backend={attention_backend!r}; expected 'eager' or 'fa4_cudnn'")
-    if attention_backend == "fa4_cudnn":
+    if attention_backend not in ("eager", "flashmla_cudnn"):
+        raise ValueError(f"Unknown dsa_attention_backend={attention_backend!r}; expected 'eager' or 'flashmla_cudnn'")
+    if attention_backend == "flashmla_cudnn":
         unsupported_reasons = []
         if not hidden_states.is_cuda:
             unsupported_reasons.append("hidden_states must be CUDA")
@@ -248,7 +248,9 @@ def glm_moe_dsa_attention_forward_patched(
         if self.kv_lora_rank != 512:
             unsupported_reasons.append(f"kv_lora_rank must be 512, got {self.kv_lora_rank}")
         if unsupported_reasons:
-            raise ValueError("dsa_attention_backend='fa4_cudnn' is not supported: " + "; ".join(unsupported_reasons))
+            raise ValueError(
+                "dsa_attention_backend='flashmla_cudnn' is not supported: " + "; ".join(unsupported_reasons)
+            )
 
         kv_b_weight = self.kv_b_proj.weight.view(
             self.num_heads,

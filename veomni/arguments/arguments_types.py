@@ -994,7 +994,7 @@ class ModelArguments:
         default="eager",
         metadata={"help": "DeepSeek sparse attention top-k indexer backend."},
     )
-    dsa_attention_backend: Literal["eager", "fa4_cudnn"] = field(
+    dsa_attention_backend: Literal["eager", "flashmla_cudnn"] = field(
         default="eager",
         metadata={"help": "DeepSeek sparse attention backend."},
     )
