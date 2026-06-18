@@ -15,8 +15,7 @@
 """Thin VeOmni entrypoints for cuDNN Frontend DeepSeek Sparse Attention.
 
 The implementation lives in NVIDIA's ``nvidia-cudnn-frontend`` package under
-``cudnn.DSA``. This module keeps model patches from importing that package
-directly and gives VeOmni one place to guard optional availability.
+``cudnn.DSA`` and uses FlashMLA sparse prefill for the forward path.
 """
 
 from __future__ import annotations
@@ -24,49 +23,23 @@ from __future__ import annotations
 from typing import Any
 
 import torch
-
-from ....utils.import_utils import is_cudnn_frontend_available
-
-
-_MISSING_DSA_ERROR = (
-    "DeepSeek sparse attention kernels require `nvidia-cudnn-frontend` and its CuTe DSL "
-    "runtime dependencies. Install VeOmni with the `gpu` extra or install those packages explicitly."
-)
+from cudnn import DSA
+from flash_mla import flash_mla_sparse_fwd
 
 
 def is_deepseek_sparse_attention_available() -> bool:
-    if not is_cudnn_frontend_available():
-        return False
-    try:
-        from cudnn import DSA
-    except ImportError:
-        return False
     return hasattr(DSA, "indexer_forward_wrapper")
 
 
 def is_flash_mla_sparse_attention_available() -> bool:
-    try:
-        from flash_mla import flash_mla_sparse_fwd  # noqa: F401
-    except ImportError:
-        return False
     return True
 
 
-def _import_dsa() -> Any:
-    try:
-        from cudnn import DSA
-    except ImportError as e:
-        raise ImportError(_MISSING_DSA_ERROR) from e
-    return DSA
-
-
 def _indexer_forward(*args: Any, **kwargs: Any) -> Any:
-    DSA = _import_dsa()
     return DSA.indexer_forward_wrapper(*args, **kwargs)
 
 
 def _sparse_attention_backward(*args: Any, **kwargs: Any) -> Any:
-    DSA = _import_dsa()
     return DSA.sparse_attention_backward_wrapper(*args, **kwargs)
 
 
@@ -199,14 +172,6 @@ def flash_mla_sparse_forward(
         raise ValueError(reason)
     if gather_kv_indices is None:
         raise ValueError("FlashMLA sparse prefill requires gather_kv_indices")
-
-    try:
-        from flash_mla import flash_mla_sparse_fwd
-    except ImportError as e:
-        raise ImportError(
-            "FlashMLA sparse attention forward requires the `flash-mla` package. "
-            "Install VeOmni with the `gpu` extra or install that package explicitly."
-        ) from e
 
     if causal:
         raise ValueError("FlashMLA sparse prefill requires causal=False")

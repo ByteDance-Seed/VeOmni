@@ -4,8 +4,10 @@ import sys
 import pytest
 import torch
 
-from veomni.ops.kernels.deepseek_sparse_attention import flashmla_cudnn as dsa
 from veomni.utils.import_utils import is_cudnn_frontend_available
+
+
+dsa = pytest.importorskip("veomni.ops.kernels.deepseek_sparse_attention.flashmla_cudnn")
 
 
 def test_deepseek_sparse_attention_is_not_eagerly_imported_by_kernels():
@@ -113,7 +115,6 @@ def test_sparse_attention_backward_flattens_batched_inputs(monkeypatch):
 
 
 def test_flash_mla_sparse_forward_returns_lse(monkeypatch):
-    flash_mla = pytest.importorskip("flash_mla")
     q_pe = torch.empty(1, 2, 128, 64, dtype=torch.bfloat16)
     k_pe = torch.empty(1, 4, 1, 64, dtype=torch.bfloat16)
     kv_cache = torch.empty(1, 4, 1, 512, dtype=torch.bfloat16)
@@ -135,7 +136,7 @@ def test_flash_mla_sparse_forward_returns_lse(monkeypatch):
             expected_lse.reshape(2, 128),
         )
 
-    monkeypatch.setattr(flash_mla, "flash_mla_sparse_fwd", fake_flash_mla_sparse_fwd)
+    monkeypatch.setattr(dsa, "flash_mla_sparse_fwd", fake_flash_mla_sparse_fwd)
 
     result = dsa.flash_mla_sparse_forward(
         q_pe,
@@ -150,8 +151,7 @@ def test_flash_mla_sparse_forward_returns_lse(monkeypatch):
     assert torch.equal(result["lse"], expected_lse)
 
 
-def test_flash_mla_sparse_forward_imports_flash_mla(monkeypatch):
-    flash_mla = pytest.importorskip("flash_mla")
+def test_flash_mla_sparse_forward_uses_imported_flash_mla_symbol(monkeypatch):
     q_pe = torch.empty(1, 2, 128, 64, dtype=torch.bfloat16)
     k_pe = torch.empty(1, 4, 1, 64, dtype=torch.bfloat16)
     kv_cache = torch.empty(1, 4, 1, 512, dtype=torch.bfloat16)
@@ -161,7 +161,7 @@ def test_flash_mla_sparse_forward_imports_flash_mla(monkeypatch):
     def fake_flash_mla_sparse_fwd(q, kv, indices, sm_scale, d_v):
         return torch.empty(2, 128, 512, dtype=q.dtype), torch.empty(2, 128), torch.empty(2, 128)
 
-    monkeypatch.setattr(flash_mla, "flash_mla_sparse_fwd", fake_flash_mla_sparse_fwd)
+    monkeypatch.setattr(dsa, "flash_mla_sparse_fwd", fake_flash_mla_sparse_fwd)
 
     assert dsa.is_flash_mla_sparse_attention_available()
     result = dsa.flash_mla_sparse_forward(q_pe, k_pe, kv_cache, q_nope, gather)

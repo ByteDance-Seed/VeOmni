@@ -20,15 +20,6 @@ config.add_import(
     "veomni.utils.model_outputs",
     names=["FusedLinearAuxOutput", "FusedLinearAuxOutputMixin", "CausalLMOutputWithLogProbs"],
 )
-config.add_import(
-    "veomni.ops.kernels.deepseek_sparse_attention.flashmla_cudnn",
-    names=[
-        "check_flash_mla_sparse_forward_compatible",
-        "flash_mla_sparse_attention_with_cudnn_backward",
-        "indexer_select_topk",
-        "is_deepseek_sparse_attention_available",
-    ],
-)
 
 # TODO: glm_moe_dsa GPU and NPU configs are currently full copies of each
 # other. Consider consolidating (NPU config imports shared patch functions
@@ -109,6 +100,11 @@ def glm_moe_dsa_indexer_forward_patched(
     if indexer_backend not in ("eager", "cudnn"):
         raise ValueError(f"Unknown dsa_indexer_backend={indexer_backend!r}; expected 'eager' or 'cudnn'")
     if indexer_backend == "cudnn":
+        from veomni.ops.kernels.deepseek_sparse_attention.flashmla_cudnn import (
+            indexer_select_topk,
+            is_deepseek_sparse_attention_available,
+        )
+
         qhead_per_kv_head = self.n_heads
         unsupported_reasons = []
         if not hidden_states.is_cuda:
@@ -227,6 +223,11 @@ def glm_moe_dsa_attention_forward_patched(
     if attention_backend not in ("eager", "flashmla_cudnn"):
         raise ValueError(f"Unknown dsa_attention_backend={attention_backend!r}; expected 'eager' or 'flashmla_cudnn'")
     if attention_backend == "flashmla_cudnn":
+        from veomni.ops.kernels.deepseek_sparse_attention.flashmla_cudnn import (
+            check_flash_mla_sparse_forward_compatible,
+            flash_mla_sparse_attention_with_cudnn_backward,
+        )
+
         if not hidden_states.is_cuda:
             raise ValueError("dsa_attention_backend='flashmla_cudnn' requires CUDA hidden_states")
         if past_key_values is not None:
