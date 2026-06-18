@@ -288,14 +288,16 @@
          k_pe = k_pe.expand(-1, k_nope.shape[1], -1, -1)  # [B, H, S, rope_D]
 
          # Assemble full Q and K
-@@ -411,6 +454,59 @@
+@@ -411,6 +454,61 @@
              )  # [B, S, topk]
          else:
              topk_indices = prev_topk_indices  # [B, S, topk]
 +
 +        attention_backend = getattr(self.config, "dsa_attention_backend", "eager")
 +        if attention_backend not in ("eager", "flashmla_cudnn"):
-+            raise ValueError(f"Unknown dsa_attention_backend={attention_backend!r}; expected 'eager' or 'flashmla_cudnn'")
++            raise ValueError(
++                f"Unknown dsa_attention_backend={attention_backend!r}; expected 'eager' or 'flashmla_cudnn'"
++            )
 +        if attention_backend == "flashmla_cudnn":
 +            unsupported_reasons = []
 +            if not hidden_states.is_cuda:
@@ -314,6 +316,8 @@
 +                )
 +            if self.num_heads != 128:
 +                unsupported_reasons.append(f"num_heads must be 128, got {self.num_heads}")
++            if topk_indices.shape[-1] % 128 != 0:
++                unsupported_reasons.append(f"topk must be a multiple of 128, got {topk_indices.shape[-1]}")
 +            if self.qk_rope_head_dim != 64:
 +                unsupported_reasons.append(f"qk_rope_head_dim must be 64, got {self.qk_rope_head_dim}")
 +            if self.kv_lora_rank != 512:
@@ -346,7 +350,7 @@
 
          # Build combined DSA + causal mask: -inf everywhere except selected top-k positions
          total_len = key_states.shape[2]
-@@ -818,6 +914,12 @@
+@@ -818,6 +916,12 @@
          )
 
 
@@ -359,7 +363,7 @@
  @auto_docstring
  class GlmMoeDsaForCausalLM(GlmMoeDsaPreTrainedModel, GenerationMixin):
      _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
-@@ -844,48 +946,59 @@
+@@ -844,48 +948,59 @@
          inputs_embeds: torch.FloatTensor | None = None,
          labels: torch.LongTensor | None = None,
          use_cache: bool | None = None,

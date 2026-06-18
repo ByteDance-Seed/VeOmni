@@ -1,5 +1,5 @@
-import torch
 import pytest
+import torch
 
 from veomni.ops.kernels import deepseek_sparse_attention as dsa
 from veomni.utils.import_utils import is_cudnn_frontend_available
