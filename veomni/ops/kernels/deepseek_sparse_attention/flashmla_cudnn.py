@@ -167,9 +167,9 @@ def flash_mla_sparse_forward(
     packed = pack_flash_mla_tensors_for_sparse_backward(q_pe, k_pe, kv_cache, q_nope)
     batch_size, seqlen_q, num_heads = q_pe.shape[:3]
     seqlen_k = k_pe.shape[1]
-    q_flat = packed["q"].reshape(batch_size * seqlen_q, num_heads, packed["q"].shape[-1])
-    kv_flat = packed["kv"].reshape(batch_size * seqlen_k, 1, packed["kv"].shape[-1])
-    indices = _local_topk_to_global(gather_kv_indices, seqlen_k).reshape(batch_size * seqlen_q, 1, -1)
+    q_flat = packed["q"].reshape(batch_size * seqlen_q, num_heads, packed["q"].shape[-1]).contiguous()
+    kv_flat = packed["kv"].reshape(batch_size * seqlen_k, 1, packed["kv"].shape[-1]).contiguous()
+    indices = _local_topk_to_global(gather_kv_indices, seqlen_k).reshape(batch_size * seqlen_q, 1, -1).contiguous()
     sm_scale = q_flat.shape[-1] ** (-0.5) if softmax_scale is None else softmax_scale
 
     out, _, lse = flash_mla_sparse_fwd(
@@ -308,13 +308,19 @@ def sparse_attention_backward(
 
     batch_size, seqlen_q, num_heads, head_dim = q.shape
     seqlen_k = kv.shape[1]
-    q_flat = q.reshape(batch_size * seqlen_q, num_heads, head_dim)
-    kv_flat = kv.reshape(batch_size * seqlen_k, kv.shape[-1])
-    out_flat = out.reshape(batch_size * seqlen_q, num_heads, out.shape[-1])
-    dout_flat = dout.reshape(batch_size * seqlen_q, num_heads, dout.shape[-1])
-    lse_flat = lse.reshape(batch_size * seqlen_q, num_heads)
-    topk_flat = _local_topk_to_global(topk_indices, seqlen_k).reshape(batch_size * seqlen_q, topk_indices.shape[-1])
-    topk_length_flat = None if topk_length is None else topk_length.reshape(batch_size * seqlen_q).to(torch.int32)
+    q_flat = q.reshape(batch_size * seqlen_q, num_heads, head_dim).contiguous()
+    kv_flat = kv.reshape(batch_size * seqlen_k, kv.shape[-1]).contiguous()
+    out_flat = out.reshape(batch_size * seqlen_q, num_heads, out.shape[-1]).contiguous()
+    dout_flat = dout.reshape(batch_size * seqlen_q, num_heads, dout.shape[-1]).contiguous()
+    lse_flat = lse.reshape(batch_size * seqlen_q, num_heads).contiguous()
+    topk_flat = (
+        _local_topk_to_global(topk_indices, seqlen_k)
+        .reshape(batch_size * seqlen_q, topk_indices.shape[-1])
+        .contiguous()
+    )
+    topk_length_flat = (
+        None if topk_length is None else topk_length.reshape(batch_size * seqlen_q).to(torch.int32).contiguous()
+    )
 
     result = DSA.sparse_attention_backward_wrapper(
         q_flat,
