@@ -4,16 +4,27 @@ import sys
 import pytest
 import torch
 
-from veomni.ops.kernels import deepseek_sparse_attention as dsa
+from veomni.ops.kernels.deepseek_sparse_attention import flashmla_cudnn as dsa
 from veomni.utils.import_utils import is_cudnn_frontend_available
 
 
 def test_deepseek_sparse_attention_is_not_eagerly_imported_by_kernels():
     sys.modules.pop("veomni.ops.kernels.deepseek_sparse_attention", None)
+    sys.modules.pop("veomni.ops.kernels.deepseek_sparse_attention.flashmla_cudnn", None)
 
     importlib.import_module("veomni.ops.kernels")
 
     assert "veomni.ops.kernels.deepseek_sparse_attention" not in sys.modules
+    assert "veomni.ops.kernels.deepseek_sparse_attention.flashmla_cudnn" not in sys.modules
+
+
+def test_deepseek_sparse_attention_package_does_not_import_flashmla_cudnn_backend():
+    sys.modules.pop("veomni.ops.kernels.deepseek_sparse_attention", None)
+    sys.modules.pop("veomni.ops.kernels.deepseek_sparse_attention.flashmla_cudnn", None)
+
+    importlib.import_module("veomni.ops.kernels.deepseek_sparse_attention")
+
+    assert "veomni.ops.kernels.deepseek_sparse_attention.flashmla_cudnn" not in sys.modules
 
 
 def test_deepseek_sparse_attention_reports_cudnn_frontend_availability():
@@ -108,8 +119,8 @@ def test_flash_mla_sparse_forward_returns_lse(monkeypatch):
     kv_cache = torch.empty(1, 4, 1, 512, dtype=torch.bfloat16)
     q_nope = torch.empty(1, 2, 128, 512, dtype=torch.bfloat16)
     gather = torch.zeros(1, 2, 128, dtype=torch.int32)
-    expected_out = torch.empty(1, 2, 128, 512, dtype=torch.bfloat16)
-    expected_lse = torch.empty(1, 2, 128, dtype=torch.float32)
+    expected_out = torch.zeros(1, 2, 128, 512, dtype=torch.bfloat16)
+    expected_lse = torch.arange(256, dtype=torch.float32).reshape(1, 2, 128)
 
     def fake_flash_mla_sparse_fwd(q, kv, indices, sm_scale, d_v):
         assert q.shape == (2, 128, 576)

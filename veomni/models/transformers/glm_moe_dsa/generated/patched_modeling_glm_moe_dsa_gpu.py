@@ -45,7 +45,7 @@ from transformers.utils.output_capturing import capture_outputs
 # ── OpSlot declarations ──────────────────────────────────────────────────
 # Bound at model-build time by _bind_veomni_ops() in auto.py.
 from veomni.ops.dispatch import OpSlot
-from veomni.ops.kernels.deepseek_sparse_attention import (
+from veomni.ops.kernels.deepseek_sparse_attention.flashmla_cudnn import (
     check_flash_mla_sparse_forward_compatible,
     flash_mla_sparse_attention_with_cudnn_backward,
     indexer_select_topk,

@@ -21,7 +21,7 @@ config.add_import(
     names=["FusedLinearAuxOutput", "FusedLinearAuxOutputMixin", "CausalLMOutputWithLogProbs"],
 )
 config.add_import(
-    "veomni.ops.kernels.deepseek_sparse_attention",
+    "veomni.ops.kernels.deepseek_sparse_attention.flashmla_cudnn",
     names=[
         "check_flash_mla_sparse_forward_compatible",
         "flash_mla_sparse_attention_with_cudnn_backward",
