@@ -97,6 +97,7 @@ import pytest
 import torch
 
 from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type, get_torch_device, synchronize
+from veomni.utils.import_utils import is_transformers_version_greater_or_equal_to
 
 from .test_models_logits_equal_v5 import (
     _DTYPE_MAP,
@@ -209,6 +210,16 @@ CASES = [
     # qwen2_5_omni — forward on ``model.thinker``; shares the window-attention
     # ViT layout with qwen2_5_vl.
     _logits_case("qwen2_5_omni-fa2"),
+    # minimax_m3_vl — generated from transformers>=5.12.0 and exercised with
+    # the MiniMax VLM metadata hook so the 3D RoPE grid list is collator-built.
+    Case(
+        "minimax_m3_vl-fa2",
+        _toy("minimax_m3_vl_toy"),
+        "MiniMaxM3SparseForConditionalGeneration",
+        "vlm_full",
+        attn_implementation="flash_attention_2",
+        dtype="bfloat16",
+    ),
 ]
 
 # Acknowledged sync sites in generated/. Keyed by ``Case.case_id``;
@@ -369,6 +380,10 @@ _ALLOWED_SYNCS: dict[str, dict[tuple[str, str], str]] = {
     # on-device (no sync) and the omni `get_rope_index` is VeOmni-patched and
     # host-side, so no syncs remain on the production path.
     "qwen2_5_omni-fa2": {},
+    # minimax_m3_vl-fa2: MiniMax's collator hook precomputes image/video
+    # grid_thw lists on CPU and Model.forward passes them to the vision tower,
+    # so the 3D RoPE fallback `grid_thw.tolist()` is not on the production path.
+    "minimax_m3_vl-fa2": {},
 }
 
 # Cases that are *declared* in CASES but skipped at runtime because they
@@ -395,7 +410,13 @@ _MM_METADATA_WIRED_CASES: set[str] = {
     "qwen2_vl-fa2",
     "qwen2_5_vl-fa2",
     "qwen2_5_omni-fa2",
+    "minimax_m3_vl-fa2",
 }
+
+
+def _skip_if_case_transformers_unavailable(case: Case) -> None:
+    if case.case_id.startswith("minimax_m3_vl") and not is_transformers_version_greater_or_equal_to("5.12.0"):
+        pytest.skip("MiniMax M3 VL generated modeling requires transformers>=5.12.0.")
 
 
 def _attach_multimodal_metadata(model, case: Case, fwd_kwargs: dict) -> None:
@@ -591,10 +612,9 @@ def _build_veomni_model(case, config):
 @pytest.mark.parametrize("case", CASES, ids=[c.case_id for c in CASES])
 def test_no_implicit_sync_in_generated_forward(case):
     """No implicit CUDA sync should originate from generated/ during forward."""
-    from veomni.utils.import_utils import is_transformers_version_greater_or_equal_to
-
     if not is_transformers_version_greater_or_equal_to("5.2.0"):
         pytest.skip("Scope is transformers v5 model definition only (v5 stack pins >= 5.2.0).")
+    _skip_if_case_transformers_unavailable(case)
     if not IS_CUDA_AVAILABLE:
         pytest.skip("CUDA required.")
     if not os.path.isdir(case.toy_config_dir):
@@ -739,10 +759,9 @@ def test_multimodal_metadata_path_matches_fallback(case):
     *that* the fast path is sync-free, not that it is *correct*; this test
     closes that gap.
     """
-    from veomni.utils.import_utils import is_transformers_version_greater_or_equal_to
-
     if not is_transformers_version_greater_or_equal_to("5.2.0"):
         pytest.skip("Scope is transformers v5 model definition only (v5 stack pins >= 5.2.0).")
+    _skip_if_case_transformers_unavailable(case)
     if not IS_CUDA_AVAILABLE:
         pytest.skip("CUDA required.")
     if not os.path.isdir(case.toy_config_dir):
@@ -797,3 +816,30 @@ def test_multimodal_metadata_path_matches_fallback(case):
             f"derivation.\n{m}"
         ),
     )
+
+
+def test_minimax_m3_vl_no_implicit_sync_gate_readiness():
+    from veomni.utils.import_utils import is_transformers_version_greater_or_equal_to
+
+    if not is_transformers_version_greater_or_equal_to("5.12.0"):
+        pytest.skip("MiniMax M3 VL generated modeling requires transformers>=5.12.0.")
+
+    repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    generated_path = os.path.join(
+        repo_root,
+        "veomni",
+        "models",
+        "transformers",
+        "minimax_m3_vl",
+        "generated",
+        "patched_modeling_minimax_m3_vl_gpu.py",
+    )
+    with open(generated_path) as f:
+        generated_source = f.read()
+
+    assert "MiniMaxM3SparseForConditionalGeneration.get_position_id_func" in generated_source
+    assert "MiniMaxM3SparseForConditionalGeneration.get_parallel_plan" in generated_source
+    assert "MiniMaxM3SparseForConditionalGeneration.get_metadata_collate_func" in generated_source
+    assert "MiniMaxM3VLVisionModel.dummy_forward" in generated_source
+    assert "MiniMaxM3VLModel.forward" in generated_source
+    assert "grid_thw_list" in generated_source

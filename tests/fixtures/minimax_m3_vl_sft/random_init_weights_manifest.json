@@ -1,0 +1,7 @@
+{
+  "format": "random_init_manifest",
+  "model_type": "minimax_m3_vl",
+  "actual_weight_files": [],
+  "actual_weights_loaded": false,
+  "description": "Tiny SFT smoke initializes MiniMax M3 VL toy parameters from config only. No real checkpoint shards are required or loaded."
+}

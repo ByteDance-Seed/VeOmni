@@ -9,7 +9,7 @@ import torch
 
 from veomni.models.auto import build_foundation_model
 from veomni.utils.device import IS_NPU_AVAILABLE
-from veomni.utils.import_utils import is_diffusers_available
+from veomni.utils.import_utils import is_diffusers_available, is_transformers_version_greater_or_equal_to
 
 from ..tools import DummyDataset, build_torchrun_cmd, compare_metrics, print_comparison_table
 from ..tools.training_utils import make_eager_ops_config
@@ -26,6 +26,10 @@ _qwen3_5_npu_skip = pytest.mark.skipif(
     IS_NPU_AVAILABLE, reason="Qwen3.5 GatedDeltaNet has no NPU backend (varlen path)"
 )
 _qwen_image_npu_skip = pytest.mark.skipif(IS_NPU_AVAILABLE, reason="Qwen-Image training is GPU-only for now")
+_minimax_m3_vl_transformers_skip = pytest.mark.skipif(
+    not is_transformers_version_greater_or_equal_to("5.12.0"),
+    reason="MiniMax M3 VL generated modeling requires transformers>=5.12.0",
+)
 
 
 def _materialize_weights_dir(config_path: str, output_path: str, save_original_format: bool = True) -> Path:
@@ -204,6 +208,24 @@ qwen3vl_test_cases = [
     ),
 ]
 
+minimax_m3_vl_test_cases = [
+    pytest.param(
+        "minimax_m3_vl",
+        "./tests/toy_config/minimax_m3_vl_toy/config.json",
+        True,  # is_moe
+        _DEFAULT_RTOL,
+        _DEFAULT_ATOL,
+        None,  # max_sp_size
+        marks=[
+            _minimax_m3_vl_transformers_skip,
+            pytest.mark.xfail(
+                reason="MiniMax M3 VL e2e SP/EP alignment awaits hardware validation of multimodal SP/EP metadata",
+                strict=False,
+            ),
+        ],
+    ),
+]
+
 qwen2omni_test_cases = [
     pytest.param(
         "qwen2_5_omni",
@@ -280,6 +302,14 @@ def dummy_qwen2vl_dataset():
 @pytest.fixture(scope="session")
 def dummy_qwen3vl_dataset():
     dummy_dataset = DummyDataset(seq_len=2048, dataset_type="qwen3vl")
+    train_path = dummy_dataset.save_path
+    yield train_path
+    del dummy_dataset
+
+
+@pytest.fixture(scope="session")
+def dummy_minimax_m3_vl_dataset():
+    dummy_dataset = DummyDataset(seq_len=512, dataset_type="minimax_m3_vl")
     train_path = dummy_dataset.save_path
     yield train_path
     del dummy_dataset
@@ -381,6 +411,28 @@ def test_qwen3vl_parallel_align(
         atol=atol,
         max_sp_size=max_sp_size,
         train_path=dummy_qwen3vl_dataset,
+    )
+
+
+@pytest.mark.parametrize("model_name, config_path, is_moe, rtol, atol, max_sp_size", minimax_m3_vl_test_cases)
+def test_minimax_m3_vl_parallel_align(
+    model_name: str,
+    config_path: str,
+    is_moe: bool,
+    rtol: float,
+    atol: float,
+    max_sp_size: int | None,
+    dummy_minimax_m3_vl_dataset,
+):
+    main(
+        task_name="train_vlm_test",
+        model_name=model_name,
+        config_path=config_path,
+        is_moe=is_moe,
+        rtol=rtol,
+        atol=atol,
+        max_sp_size=max_sp_size,
+        train_path=dummy_minimax_m3_vl_dataset,
     )
 
 

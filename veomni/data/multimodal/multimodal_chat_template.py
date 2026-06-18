@@ -969,6 +969,77 @@ class SeedOssPretrainTemplate(LlamaPretrainTemplate):
         self.cfg_ratio = kwargs.get("cfg_ratio", None)
 
 
+class MiniMaxM3VLChatTemplate(MultimodalChatTemplate):
+    IMAGE_TOKEN = "]<]image[>["
+    VIDEO_TOKEN = "]<]video[>["
+    VISION_START_TOKEN = "]<]start of image[>["
+    VISION_END_TOKEN = "]<]end of image[>["
+
+    def __init__(self, tokenizer: PreTrainedTokenizer, **kwargs) -> None:
+        super().__init__(tokenizer)
+        self.image_token_id = tokenizer.convert_tokens_to_ids(self.IMAGE_TOKEN)
+        self.video_token_id = tokenizer.convert_tokens_to_ids(self.VIDEO_TOKEN)
+        self.eos = tokenizer.encode(tokenizer.eos_token, add_special_tokens=False) if tokenizer.eos_token else []
+
+    def image_pattern(self, token_num: int) -> str:
+        return self.VISION_START_TOKEN + self.IMAGE_TOKEN * token_num + self.VISION_END_TOKEN
+
+    def video_pattern(self, token_num: int) -> str:
+        return self.VISION_START_TOKEN + self.VIDEO_TOKEN * token_num + self.VISION_END_TOKEN
+
+    def encode_messages(
+        self, conversations: Sequence[Dict[str, str]], num_tokens: Dict[str, List[int]] = None, **kwargs
+    ) -> Dict[str, List[int]]:
+        if num_tokens is None:
+            num_tokens = defaultdict(list)
+
+        processor = kwargs.get("processor")
+        image_inputs = kwargs.get("image_inputs") or {}
+        video_inputs = kwargs.get("video_inputs") or {}
+        image_token_num_list = iter(num_tokens.get("image", []))
+        video_token_num_list = iter(num_tokens.get("video", []))
+
+        input_ids, attention_mask, labels = [], [], []
+        image_idx = 0
+        video_idx = 0
+        for message in conversations:
+            role = message[0]
+            content = ""
+            for value in message[1:]:
+                if value[0] == "text":
+                    content += value[1]
+                elif value[0] == "image":
+                    if processor is not None and image_inputs:
+                        content += processor.replace_image_token(image_inputs, image_idx)
+                    else:
+                        content += self.image_pattern(next(image_token_num_list))
+                    image_idx += 1
+                elif value[0] == "video":
+                    if processor is not None and video_inputs:
+                        content += processor.replace_video_token(video_inputs, video_idx)
+                    else:
+                        content += self.video_pattern(next(video_token_num_list))
+                    video_idx += 1
+                else:
+                    raise ValueError(f"Unknown value type: {value[0]}")
+
+            message_ids = self.tokenizer.encode(f"{role}\n{content}", add_special_tokens=False) + self.eos
+            input_ids += message_ids
+            attention_mask += [1] * len(message_ids)
+            if role == "assistant":
+                labels += message_ids
+            else:
+                labels += [IGNORE_INDEX] * len(message_ids)
+
+        tokenized_example = {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}
+        tokenized_example = {key: torch.tensor(value) for key, value in tokenized_example.items()}
+
+        image_mask = tokenized_example["input_ids"] == self.image_token_id
+        video_mask = tokenized_example["input_ids"] == self.video_token_id
+        tokenized_example["labels"][image_mask | video_mask] = IGNORE_INDEX
+        return tokenized_example
+
+
 TEMPLATES = {
     "qwen2vl": Qwen2VLChatTemplate,
     "qwen3vl": Qwen3VLChatTemplate,
@@ -978,6 +1049,7 @@ TEMPLATES = {
     "janus": JanusChatTemplate,
     "llama": LlamaPretrainTemplate,
     "qwen3moe": Qwen3MoeChatTemplate,
+    "minimax_m3_vl": MiniMaxM3VLChatTemplate,
     "seed_oss": SeedOssPretrainTemplate,
 }
 

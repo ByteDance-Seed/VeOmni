@@ -443,6 +443,72 @@ def _apply_dynamic_video_max_pixels(nframes: int, kwargs: dict) -> dict:
     return {**kwargs, "video_max_pixels": int(dynamic_max)}
 
 
+def _decode_video_container_with_pyav(video_input: Union[ByteString, str], **kwargs):
+    """Decode a str/bytes video container with PyAV.
+
+    This is a fallback for environments where ffmpeg is available but
+    torchcodec's compiled extension cannot be loaded. It decodes the container
+    to RGB frames on CPU, then applies the same frame sampling and resize
+    contract used by the torchcodec path.
+    """
+    from io import BytesIO
+
+    import av
+
+    container_input = BytesIO(video_input) if isinstance(video_input, (bytes, bytearray)) else video_input
+    container = av.open(container_input)
+    try:
+        if not container.streams.video:
+            raise ValueError("video container has no video stream")
+
+        stream = container.streams.video[0]
+        if stream.average_rate:
+            video_fps = float(stream.average_rate)
+        elif stream.frames and stream.duration and stream.time_base:
+            video_fps = float(stream.frames / (stream.duration * stream.time_base))
+        else:
+            video_fps = float(kwargs.get("fps", 2.0))
+
+        frames = []
+        for frame in container.decode(stream):
+            array = frame.to_ndarray(format="rgb24")
+            frames.append(torch.from_numpy(array).permute(2, 0, 1))
+    finally:
+        container.close()
+
+    if not frames:
+        raise ValueError("video container decoded zero frames")
+
+    video = torch.stack(frames)
+    indices, pad_count = calculate_frame_indices(total_frames=video.shape[0], video_fps=video_fps, **kwargs)
+    sampled_frames = video[indices]
+    nframes = len(indices) + pad_count
+    resize_kwargs = _apply_dynamic_video_max_pixels(nframes, kwargs)
+    resized_frames = smart_resize(sampled_frames, **resize_kwargs)
+
+    if pad_count > 0:
+        last_frame = resized_frames[-1:].expand(pad_count, -1, -1, -1)
+        final_frames = torch.cat([resized_frames, last_frame], dim=0)
+        padded_indices = indices + [indices[-1]] * pad_count
+    else:
+        final_frames = resized_frames
+        padded_indices = indices
+
+    frames_indices = torch.tensor(padded_indices, dtype=torch.long)
+    return final_frames, video_fps, frames_indices
+
+
+def _load_and_process_video_with_pyav(video_input: Union[ByteString, str], use_audio_in_video: bool = True, **kwargs):
+    final_frames, video_fps, frames_indices = _decode_video_container_with_pyav(video_input, **kwargs)
+
+    audio, audio_fps = None, None
+    if use_audio_in_video:
+        max_audio_duration = final_frames.shape[0] / max(video_fps, 1e-6) + 1.0
+        audio, audio_fps = extract_audio_from_video(video_input, max_duration_seconds=max_audio_duration)
+
+    return final_frames, audio, audio_fps, frames_indices
+
+
 def _load_and_process_video_with_codec(video_input: VideoInput, use_audio_in_video: bool = True, **kwargs):
     """Load and process video using torchcodec (video) and PyAV (audio).
 
@@ -487,32 +553,44 @@ def _load_and_process_video_with_codec(video_input: VideoInput, use_audio_in_vid
         frames_indices = torch.arange(video.shape[0])
         return video, audio, audio_fps, frames_indices
 
-    # video_input is str (path/URL) or bytes — the only branch that needs the
-    # ffmpeg / torchcodec stack. dict / List[bytes] / List[PIL.Image] inputs above
-    # never reach this point, so they work in ffmpeg-less environments.
-    if not is_ffmpeg_available():
-        raise RuntimeError(
-            "ffmpeg is not available; required for decoding str/bytes video containers. "
-            "Install with `apt-get install ffmpeg` / `brew install ffmpeg`, or feed the "
-            "video as pre-decoded frames (dict / List[bytes] / List[PIL.Image] — see "
-            "docs/examples/qwen3_omni_offline_av.md)."
-        )
-    from torchcodec.decoders import VideoDecoder
-
+    # video_input is str (path/URL) or bytes. Prefer torchcodec when its
+    # extension is loadable; otherwise fall back to PyAV. A system ffmpeg
+    # binary is only needed for the URL download fallback below, not for local
+    # path/bytes containers when PyAV can open them directly.
     try:
+        from torchcodec.decoders import VideoDecoder
+
         decoder = VideoDecoder(video_input, device="cpu", num_ffmpeg_threads=0)
     except Exception as e:
         if isinstance(video_input, str) and ("http://" in video_input or "https://" in video_input):
             logger.warning(f"Direct URL decoding failed: {e}. Downloading with ffmpeg...")
+            if not is_ffmpeg_available():
+                logger.warning("ffmpeg binary is unavailable for URL download fallback. Trying PyAV URL decode.")
+                try:
+                    return _load_and_process_video_with_pyav(
+                        video_input, use_audio_in_video=use_audio_in_video, **kwargs
+                    )
+                except Exception as pyav_error:
+                    raise RuntimeError(
+                        f"Failed to decode video URL without ffmpeg download fallback: {pyav_error}"
+                    ) from e
             try:
                 video_bytes = _download_url_to_bytes(video_input)
-                decoder = VideoDecoder(video_bytes, device="cpu", num_ffmpeg_threads=0)
+                try:
+                    decoder = VideoDecoder(video_bytes, device="cpu", num_ffmpeg_threads=0)
+                except Exception as codec_error:
+                    logger.warning(f"torchcodec URL-bytes decode failed: {codec_error}. Falling back to PyAV.")
+                    return _load_and_process_video_with_pyav(video_bytes, use_audio_in_video=use_audio_in_video, **kwargs)
             except Exception as download_error:
                 raise RuntimeError(
                     f"Failed to decode video from URL {video_input}: {download_error}"
                 ) from download_error
         else:
-            raise RuntimeError(f"Failed to create VideoDecoder: {e}") from e
+            logger.warning(f"torchcodec decode failed: {e}. Falling back to PyAV.")
+            try:
+                return _load_and_process_video_with_pyav(video_input, use_audio_in_video=use_audio_in_video, **kwargs)
+            except Exception as pyav_error:
+                raise RuntimeError(f"Failed to create VideoDecoder and PyAV fallback failed: {pyav_error}") from e
 
     metadata = decoder.metadata
     video_fps = metadata.average_fps
@@ -566,10 +644,10 @@ def fetch_videos(videos: List[VideoInput], **kwargs):
     Note: Does NOT return frames_indices. Use fetch_videos_metadata() for temporal modeling
     (e.g., Qwen3-VL timestamp calculation).
 
-    ffmpeg / torchcodec is only required for ``str`` / ``bytes`` (raw container)
-    inputs — ``dict`` / ``List[bytes]`` / ``List[PIL.Image]`` inputs are handled
-    by the PIL + soundfile path inside ``_load_and_process_video_with_codec`` and
-    work in ffmpeg-less environments.
+    ``str`` / ``bytes`` raw containers use torchcodec when available and fall
+    back to PyAV when torchcodec's extension cannot be loaded. ``dict`` /
+    ``List[bytes]`` / ``List[PIL.Image]`` inputs are handled by the PIL +
+    soundfile path inside ``_load_and_process_video_with_codec``.
     """
     logger.info_once("Loading videos via _load_and_process_video_with_codec.")
 
@@ -597,8 +675,8 @@ def fetch_videos_metadata(videos: List[VideoInput], **kwargs):
 
     IMPORTANT: For Qwen3-VL, this returns frames_indices needed for timestamp calculation.
 
-    ffmpeg / torchcodec is only required for ``str`` / ``bytes`` (raw container)
-    inputs — see ``fetch_videos`` for the same note.
+    ``str`` / ``bytes`` raw containers use torchcodec with a PyAV fallback —
+    see ``fetch_videos`` for the same note.
 
     Args:
         videos: List of video inputs (paths, bytes, PIL images, or dicts)

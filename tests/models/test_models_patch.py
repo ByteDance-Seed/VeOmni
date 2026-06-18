@@ -24,6 +24,7 @@ from veomni.distributed.clip_grad_norm import veomni_clip_grad_norm
 from veomni.trainer.base import BaseTrainer, VeOmniArguments
 from veomni.utils.device import IS_NPU_AVAILABLE, empty_cache, get_device_type, synchronize
 from veomni.utils.env import get_env
+from veomni.utils.import_utils import is_transformers_version_greater_or_equal_to
 from veomni.utils.loss_utils import count_loss_token
 
 from ..tools.common_utils import print_device_mem_info
@@ -519,3 +520,95 @@ def test_models_patch_fwd_bwd(
 
     _release_device_memory()
     print_device_mem_info("[Memory Info] after running train_compare_models:")
+
+
+@pytest.mark.skipif(
+    not is_transformers_version_greater_or_equal_to("5.12.0"),
+    reason="MiniMax M3 VL generated modeling requires transformers>=5.12.0",
+)
+def test_minimax_m3_vl_patchgen_generated_modeling_hooks():
+    from veomni.models.loader import get_model_class, get_model_config
+
+    config = get_model_config("./tests/toy_config/minimax_m3_vl_toy/config.json")
+    model_cls = get_model_class(config)
+
+    assert model_cls.__name__ == "MiniMaxM3SparseForConditionalGeneration"
+    assert model_cls.__module__.endswith("patched_modeling_minimax_m3_vl_gpu")
+    assert hasattr(model_cls, "get_parallel_plan")
+    assert hasattr(model_cls, "get_position_id_func")
+    assert hasattr(model_cls, "get_metadata_collate_func")
+
+    modeling = importlib.import_module(model_cls.__module__)
+    assert hasattr(modeling.MiniMaxM3VLVisionModel, "dummy_forward")
+
+
+@pytest.mark.skipif(
+    not is_transformers_version_greater_or_equal_to("5.12.0"),
+    reason="MiniMax M3 VL generated modeling requires transformers>=5.12.0",
+)
+def test_minimax_m3_vl_mixed_image_video_forward_backward():
+    """Run the generated MiniMax model through a mixed image+video loss step.
+
+    The toy config keeps a tiny vocab, while the real MiniMax placeholder token
+    ids live at 200025/200026. Use `inputs_embeds` plus explicit masks so the
+    test can exercise image/video feature scatter, language loss, and gradients
+    without requiring a huge toy embedding table.
+    """
+    from veomni.models.loader import get_model_class, get_model_config
+
+    torch.manual_seed(20260618)
+    config = get_model_config("./tests/toy_config/minimax_m3_vl_toy/config.json")
+    model_cls = get_model_class(config)
+    model = model_cls(config)
+    model.train()
+
+    seq_len = 10
+    safe_ids = torch.arange(seq_len, dtype=torch.long).unsqueeze(0) % config.text_config.vocab_size
+    inputs_embeds = model.get_input_embeddings()(safe_ids).detach().clone().requires_grad_(True)
+    attention_mask = torch.ones_like(safe_ids)
+    position_ids = torch.arange(seq_len, dtype=torch.long).unsqueeze(0)
+
+    image_mask = torch.zeros((1, seq_len), dtype=torch.bool)
+    video_mask = torch.zeros((1, seq_len), dtype=torch.bool)
+    image_mask[0, 1] = True
+    video_mask[0, 3] = True
+
+    patch_size = config.vision_config.patch_size
+    temporal_patch_size = config.vision_config.temporal_patch_size
+    num_channels = config.vision_config.num_channels
+    merge = config.vision_config.spatial_merge_size
+    pixel_row_size = num_channels * temporal_patch_size * patch_size * patch_size
+    num_patches = merge * merge
+
+    image_grid_thw = torch.tensor([[1, merge, merge]], dtype=torch.long)
+    video_grid_thw = torch.tensor([[1, merge, merge]], dtype=torch.long)
+    pixel_values = torch.randn((num_patches, pixel_row_size), dtype=torch.float32)
+    pixel_values_videos = torch.randn((num_patches, pixel_row_size), dtype=torch.float32)
+
+    metadata_batch = {"image_grid_thw": image_grid_thw.clone(), "video_grid_thw": video_grid_thw.clone()}
+    model.get_metadata_collate_func()(metadata_batch, {"pixel_values": 0, "pixel_values_videos": 0})
+
+    labels = safe_ids.clone()
+    labels[image_mask | video_mask] = -100
+    outputs = model(
+        inputs_embeds=inputs_embeds,
+        pixel_values=pixel_values,
+        pixel_values_videos=pixel_values_videos,
+        image_grid_thw=image_grid_thw,
+        video_grid_thw=video_grid_thw,
+        image_mask=image_mask,
+        video_mask=video_mask,
+        attention_mask=attention_mask,
+        position_ids=position_ids,
+        labels=labels,
+        multimodal_metadata=metadata_batch["multimodal_metadata"],
+    )
+
+    assert torch.isfinite(outputs.loss)
+    assert outputs.image_hidden_states.shape == (1, config.text_config.hidden_size)
+    assert outputs.video_hidden_states.shape == (1, config.text_config.hidden_size)
+
+    outputs.loss.backward()
+    assert model.model.vision_tower.embeddings.proj.weight.grad.abs().sum() > 0
+    assert model.model.multi_modal_projector.merge_linear_2.weight.grad.abs().sum() > 0
+    assert model.lm_head.weight.grad.abs().sum() > 0

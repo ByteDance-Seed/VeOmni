@@ -3,6 +3,11 @@
 **TLDR:** VeOmni layers FSDP, Sequence Parallelism (SP), Expert Parallelism (EP), and fused kernels on top of HuggingFace models. This guide walks you through the integration steps with checklists per model type. For worked examples, see:
 - [qwen3_vl_example.md](./qwen3_vl_example.md) — VLM + MoE (image/video, deepstack, EP)
 - [qwen3_omni_moe_example.md](./qwen3_omni_moe_example.md) — Omni-modal MoE (image/video/audio, talker)
+- [minimax_m3_vl_migration_report.md](./minimax_m3_vl_migration_report.md) — MiniMax M3 VL patchgen slice, RFC, Bagel-style deliverable check, and checkpoint blocker evidence
+- [minimax_m3_vl_data_module_design.md](./minimax_m3_vl_data_module_design.md) — MiniMax M3 VL current smoke dataset boundary and future multimodal data module design
+- [minimax_m3_vl_hyperparams_loading_report.md](./minimax_m3_vl_hyperparams_loading_report.md) — MiniMax M3 VL official config/source verification and VeOmni config parsing boundary
+- [minimax_m3_vl_model_migration_design.md](./minimax_m3_vl_model_migration_design.md) — MiniMax M3 VL config, module structure, forward-source boundary, and migration plan
+- [minimax_m3_vl_reduced_layer_sft_report.md](./minimax_m3_vl_reduced_layer_sft_report.md) — MiniMax M3 VL reduced-layer SFT loss evidence
 
 > **Scope note:** VeOmni now pins `transformers==5.9.0` and ships
 > patchgen-generated modeling files under

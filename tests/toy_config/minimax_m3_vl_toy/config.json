@@ -1,0 +1,68 @@
+{
+  "architectures": [
+    "MiniMaxM3SparseForConditionalGeneration"
+  ],
+  "image_token_index": 200025,
+  "model_type": "minimax_m3_vl",
+  "projector_hidden_size": 32,
+  "text_config": {
+    "attention_dropout": 0.0,
+    "bos_token_id": 200034,
+    "dense_intermediate_size": 64,
+    "eos_token_id": 200020,
+    "head_dim": 8,
+    "hidden_act": "swigluoai",
+    "hidden_size": 32,
+    "initializer_range": 0.02,
+    "intermediate_size": 16,
+    "max_position_embeddings": 1024,
+    "model_type": "minimax_m2",
+    "moe_layer_freq": [
+      true,
+      false
+    ],
+    "num_attention_heads": 4,
+    "num_hidden_layers": 2,
+    "num_key_value_heads": 1,
+    "num_local_experts": 4,
+    "num_experts_per_tok": 1,
+    "rms_norm_eps": 1e-06,
+    "rotary_dim": 8,
+    "router_aux_loss_coef": 0.001,
+    "router_jitter_noise": 0.0,
+    "shared_intermediate_size": 16,
+    "sparse_attention_config": {
+      "sparse_attention_freq": [
+        true,
+        false
+      ],
+      "sparse_block_size": 16,
+      "sparse_index_dim": 8,
+      "sparse_local_block": 1,
+      "sparse_num_index_heads": 1,
+      "sparse_topk_blocks": 2
+    },
+    "tie_word_embeddings": false,
+    "use_cache": true,
+    "vocab_size": 256
+  },
+  "tie_word_embeddings": false,
+  "transformers_version": "5.12.0",
+  "video_token_index": 200026,
+  "vision_config": {
+    "attention_dropout": 0.0,
+    "hidden_act": "gelu",
+    "hidden_size": 16,
+    "image_size": 28,
+    "initializer_range": 0.02,
+    "intermediate_size": 32,
+    "layer_norm_eps": 1e-05,
+    "model_type": "minimax_m3_vl_vision",
+    "num_attention_heads": 2,
+    "num_channels": 3,
+    "num_hidden_layers": 1,
+    "patch_size": 14,
+    "spatial_merge_size": 2,
+    "temporal_patch_size": 2
+  }
+}

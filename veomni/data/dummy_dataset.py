@@ -110,6 +110,73 @@ class DummyQwenVLDataset(Dataset):
         ]
 
 
+class DummyMiniMaxM3VLDataset(Dataset):
+    def __init__(
+        self, size: int, seq_length: int, patch_size: int = 14, temporal_patch_size: int = 2, merge_size: int = 2
+    ):
+        """
+        Args:
+            size: Nums of datasets.
+            seq_length: Packed text+vision sequence length.
+
+        MiniMax uses the default 1-D packed ``position_ids`` path rather than
+        Qwen-style 3-D mRoPE ids, so it needs its own dummy VLM dataset for e2e
+        SP/EP alignment.
+        """
+        self.size = size
+        self.seq_length = seq_length
+        self.vocab_size = 256
+
+        t, h, w = 1, 2, 2
+        channel_size = 3
+
+        self.image_size = [t * h * w, patch_size * patch_size * temporal_patch_size * channel_size]
+        self.video_size = [t * h * w, patch_size * patch_size * temporal_patch_size * channel_size]
+        self.image_grid_thw = torch.tensor([[t, h, w]], dtype=torch.long)
+        self.video_grid_thw = torch.tensor([[t, h, w]], dtype=torch.long)
+        self.image_seqlen = t * h * w // (merge_size**2)
+        self.video_seqlen = t * h * w // (merge_size**2)
+
+        self.text_seqlen = self.seq_length - self.image_seqlen - self.video_seqlen
+        if self.text_seqlen <= 0:
+            raise ValueError("MiniMax M3 VL dummy seq_length must leave room for text tokens.")
+
+        self.seq_length = self.text_seqlen + self.image_seqlen + self.video_seqlen
+        mask = torch.zeros((self.seq_length,), dtype=torch.bool)
+        self.image_mask = mask.clone()
+        self.image_mask[: self.image_seqlen] = 1
+        self.video_mask = mask.clone()
+        self.video_mask[-self.video_seqlen :] = 1
+
+    def __len__(self) -> int:
+        return self.size
+
+    def __getitem__(self, index: int) -> List[Dict[str, "torch.Tensor"]]:
+        gen = torch.Generator().manual_seed(index)
+        input_ids = torch.randint(low=0, high=self.vocab_size, size=(self.seq_length,), generator=gen)
+        attention_mask = torch.ones((self.seq_length,), dtype=torch.long)
+        labels = input_ids.clone()
+        labels[0] = IGNORE_INDEX
+        labels[self.image_mask | self.video_mask] = IGNORE_INDEX
+        position_ids = torch.arange(0, self.seq_length)
+        pixel_values = torch.rand(self.image_size, dtype=torch.float32, generator=gen)
+        pixel_values_videos = torch.rand(self.video_size, dtype=torch.float32, generator=gen)
+        return [
+            {
+                "input_ids": input_ids,
+                "attention_mask": attention_mask,
+                "labels": labels,
+                "position_ids": position_ids,
+                "pixel_values": pixel_values,
+                "pixel_values_videos": pixel_values_videos,
+                "image_mask": self.image_mask,
+                "video_mask": self.video_mask,
+                "image_grid_thw": self.image_grid_thw,
+                "video_grid_thw": self.video_grid_thw,
+            }
+        ]
+
+
 class DummyQwenOmniDataset(Dataset):
     def __init__(
         self, size: int, seq_length: int, patch_size: int = 14, temporal_patch_size: int = 2, merge_size: int = 2
@@ -431,6 +498,8 @@ def build_dummy_dataset(task_type: str, size: int, max_seq_len: int) -> "Dataset
         return DummyQwenVLDataset(size=size, seq_length=max_seq_len, patch_size=14)
     elif task_type == "qwen3vl":
         return DummyQwenVLDataset(size=size, seq_length=max_seq_len, patch_size=16)
+    elif task_type == "minimax_m3_vl":
+        return DummyMiniMaxM3VLDataset(size=size, seq_length=max_seq_len)
     elif task_type == "qwen2omni":
         return DummyQwenOmniDataset(size=size, seq_length=max_seq_len, patch_size=14)
     elif task_type == "qwen3omni":

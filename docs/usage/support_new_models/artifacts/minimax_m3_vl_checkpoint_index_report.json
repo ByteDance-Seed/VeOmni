@@ -1,0 +1,16 @@
+{
+  "config_path": "MiniMaxAI/MiniMax-M3",
+  "converted_index_keys": 1582,
+  "full_checkpoint_load_executed": false,
+  "index_json": "/tmp/minimax_m3_model.safetensors.index.json",
+  "missing_projector_keys": [],
+  "missing_state_key_count": 0,
+  "missing_state_keys_sample": [],
+  "model_parameter_keys": 1525,
+  "model_persistent_buffer_keys": 57,
+  "model_state_keys": 1582,
+  "public_weight_map_keys": 23416,
+  "shard_metadata_verified": false,
+  "unexpected_index_key_count": 0,
+  "unexpected_index_keys_sample": []
+}
