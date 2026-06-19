@@ -29,7 +29,7 @@ _qwen_image_npu_skip = pytest.mark.skipif(IS_NPU_AVAILABLE, reason="Qwen-Image t
 
 
 def _is_fa4_available() -> bool:
-    if get_gpu_compute_capability() < 100:
+    if get_gpu_compute_capability() < 90:
         return False
     try:
         from flash_attn.cute import flash_attn_func, flash_attn_varlen_func  # noqa: F401
@@ -40,7 +40,7 @@ def _is_fa4_available() -> bool:
 
 _gpt_oss_fa4_quack_skip = pytest.mark.skipif(
     IS_NPU_AVAILABLE or not is_quack_gemm_available() or not _is_fa4_available(),
-    reason="GPT-OSS fused parallel test requires FA4 plus Quack GEMM on Blackwell CUDA GPUs",
+    reason="GPT-OSS fused parallel test requires FA4 plus Quack GEMM on SM90+ CUDA GPUs",
 )
 
 
