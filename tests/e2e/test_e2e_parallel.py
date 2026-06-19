@@ -8,8 +8,8 @@ import pytest
 import torch
 
 from veomni.models.auto import build_foundation_model
-from veomni.utils.device import IS_NPU_AVAILABLE
-from veomni.utils.import_utils import is_diffusers_available
+from veomni.utils.device import IS_NPU_AVAILABLE, get_gpu_compute_capability
+from veomni.utils.import_utils import is_diffusers_available, is_quack_gemm_available
 
 from ..tools import DummyDataset, build_torchrun_cmd, compare_metrics, print_comparison_table
 from ..tools.training_utils import make_eager_ops_config
@@ -26,6 +26,22 @@ _qwen3_5_npu_skip = pytest.mark.skipif(
     IS_NPU_AVAILABLE, reason="Qwen3.5 GatedDeltaNet has no NPU backend (varlen path)"
 )
 _qwen_image_npu_skip = pytest.mark.skipif(IS_NPU_AVAILABLE, reason="Qwen-Image training is GPU-only for now")
+
+
+def _is_fa4_available() -> bool:
+    if get_gpu_compute_capability() < 100:
+        return False
+    try:
+        from flash_attn.cute import flash_attn_func, flash_attn_varlen_func  # noqa: F401
+    except Exception:
+        return False
+    return True
+
+
+_gpt_oss_fa4_quack_skip = pytest.mark.skipif(
+    IS_NPU_AVAILABLE or not is_quack_gemm_available() or not _is_fa4_available(),
+    reason="GPT-OSS fused parallel test requires FA4 plus Quack GEMM on Blackwell CUDA GPUs",
+)
 
 
 def _materialize_weights_dir(config_path: str, output_path: str, save_original_format: bool = True) -> Path:
@@ -147,6 +163,15 @@ text_test_cases = [
         _DEFAULT_RTOL,
         _DEFAULT_ATOL,
         None,  # max_sp_size
+    ),
+    pytest.param(
+        "gpt_oss",
+        "./tests/toy_config/gpt_oss_toy",
+        True,  # is_moe
+        _DEFAULT_RTOL,
+        _DEFAULT_ATOL,
+        None,  # max_sp_size
+        marks=_gpt_oss_fa4_quack_skip,
     ),
 ]
 
@@ -435,6 +460,27 @@ def test_wan_dit_uses_bfloat16_and_flash_attention():
             "--train.accelerator.fsdp_config.mixed_precision.cast_forward_inputs=True",
         ]
         assert "--model.ops_implementation.attn_implementation=flash_attention_2" in cmd
+
+
+@_gpt_oss_fa4_quack_skip
+def test_gpt_oss_parallel_uses_fa4_and_quack():
+    command_list = prepare_exec_cmd(
+        ["train_text_test"],
+        "gpt_oss",
+        "./tests/toy_config/gpt_oss_toy",
+        model_path="./gpt_oss",
+        train_path="./dummy_text",
+        output_dir="./gpt_oss",
+        is_moe=True,
+    )
+
+    assert command_list
+    assert {cmd_kwargs["parallel_config"].ep_size for _, cmd_kwargs in command_list} == {1, 2}
+    assert {cmd_kwargs["parallel_config"].sp_size for _, cmd_kwargs in command_list} == {1, 2}
+    for _, cmd_kwargs in command_list:
+        cmd = build_torchrun_cmd(**cmd_kwargs)
+        assert "--model.ops_implementation.attn_implementation=flash_attention_4" in cmd
+        assert "--model.ops_implementation.moe_implementation=fused_quack" in cmd
 
 
 @pytest.mark.parametrize("model_name, config_path, is_moe, rtol, atol", wan_dit_test_cases)

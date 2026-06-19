@@ -43,6 +43,20 @@ _DEFAULT_RTOL = 1e-1
 _DEFAULT_ATOL = 1e-1
 
 _TEXT_TRAIN_SCRIPT = "tests/train_scripts/train_text_test.py"
+_GPT_OSS_EAGER_OPS_ARGS = [
+    "--model.ops_implementation.attn_implementation=eager",
+    "--model.ops_implementation.moe_implementation=eager",
+    "--model.ops_implementation.cross_entropy_loss_implementation=eager",
+    "--model.ops_implementation.load_balancing_loss_implementation=eager",
+    "--model.ops_implementation.rms_norm_implementation=eager",
+    "--model.ops_implementation.rotary_pos_emb_implementation=eager",
+]
+
+
+def _fsdp_equivalence_extra_args(model_name: str) -> list[str]:
+    if model_name == "gpt_oss":
+        return list(_GPT_OSS_EAGER_OPS_ARGS)
+    return []
 
 
 def _setup_model_and_data(model_name, config_path, dataset_type="text"):
@@ -81,6 +95,7 @@ def _run_single_gpu_training(model_name, config_path, model_path, train_path, ou
         nproc=1,
         init_device=get_device_type(),
         extra_args=[
+            *_fsdp_equivalence_extra_args(model_name),
             "--train.accelerator.fsdp_config.fsdp_mode=ddp",
             "--train.accelerator.fsdp_config.mixed_precision.enable=False",
         ],
@@ -117,6 +132,7 @@ def _run_fsdp2_training(model_name, config_path, model_path, train_path, output_
         task_name="fsdp2",
         nproc=nproc,
         extra_args=[
+            *_fsdp_equivalence_extra_args(model_name),
             "--train.accelerator.ulysses_size=1",
             "--train.accelerator.ep_size=1",
             "--train.accelerator.fsdp_config.mixed_precision.enable=False",

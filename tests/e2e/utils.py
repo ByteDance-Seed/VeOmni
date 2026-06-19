@@ -87,6 +87,10 @@ _WAN_BFLOAT16_TRAINING_ARGS = [
     "--train.accelerator.fsdp_config.mixed_precision.param_dtype=bfloat16",
     "--train.accelerator.fsdp_config.mixed_precision.cast_forward_inputs=True",
 ]
+_GPT_OSS_FA4_QUACK_TRAINING_ARGS = [
+    "--model.ops_implementation.attn_implementation=flash_attention_4",
+    "--model.ops_implementation.moe_implementation=fused_quack",
+]
 
 
 def _base_model_modes():
@@ -159,6 +163,8 @@ def prepare_exec_cmd(
             )
             if model_name == "wan_t2v":
                 cmd_kwargs["extra_args"] = list(_WAN_BFLOAT16_TRAINING_ARGS)
+            elif model_name == "gpt_oss":
+                cmd_kwargs["extra_args"] = list(_GPT_OSS_FA4_QUACK_TRAINING_ARGS)
             command_list.append((task_name, cmd_kwargs))
 
     return command_list
