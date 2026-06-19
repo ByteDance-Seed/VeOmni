@@ -73,6 +73,16 @@ class OpSlot:
         """
         return self._kernel is not None
 
+    @property
+    def use_eager_impl(self) -> bool:
+        """``True`` only when the slot was explicitly bound to eager."""
+        return self._impl_name == "eager"
+
+    @property
+    def is_bound(self) -> bool:
+        """``True`` once ``bind()`` has been called."""
+        return self._impl_name is not None
+
     def bound_kernel(self) -> Callable | None:
         """Return the resolved kernel callable, or ``None`` if eager / unbound.
 

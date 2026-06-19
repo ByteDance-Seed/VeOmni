@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import json
+from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -51,6 +52,16 @@ def qwen3_5_counter():
 def qwen3_5_moe_counter():
     config = _load_toy_config("tests/toy_config/qwen3_5_moe_toy")
     return VeomniFlopsCounter(config)
+
+
+@pytest.fixture
+def gpt_oss_config():
+    return _load_toy_config("tests/toy_config/gpt_oss_toy")
+
+
+@pytest.fixture
+def gpt_oss_counter(gpt_oss_config):
+    return VeomniFlopsCounter(gpt_oss_config)
 
 
 class TestQwen35Flops:
@@ -101,3 +112,23 @@ class TestQwen35MoeFlops:
         flops, _ = qwen3_5_moe_counter.estimate_flops(batch_seqlens, delta_time=1.0, images_seqlens=[256, 512])
         # Embedding lookup is not a matmul; only lm_head contributes vocab_size * hidden_size.
         assert flops == pytest.approx(18.847925010432, rel=1e-9)
+
+
+class TestGptOssFlops:
+    def test_numerical(self, gpt_oss_counter):
+        batch_seqlens = [12, 5]
+        flops, promised_flops = gpt_oss_counter.estimate_flops(batch_seqlens, delta_time=1.0)
+        assert flops == pytest.approx(0.000326931456, rel=1e-9)
+        assert promised_flops == 1000.0
+
+    def test_sliding_attention_reduces_quadratic_flops(self, gpt_oss_config):
+        batch_seqlens = [12, 5]
+        mixed_counter = VeomniFlopsCounter(gpt_oss_config)
+        mixed_flops, _ = mixed_counter.estimate_flops(batch_seqlens, delta_time=1.0)
+
+        full_config = deepcopy(gpt_oss_config)
+        full_config.layer_types = ["full_attention"] * full_config.num_hidden_layers
+        full_counter = VeomniFlopsCounter(full_config)
+        full_flops, _ = full_counter.estimate_flops(batch_seqlens, delta_time=1.0)
+
+        assert full_flops > mixed_flops

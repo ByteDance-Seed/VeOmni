@@ -16,6 +16,7 @@ from types import SimpleNamespace
 from typing import Callable, Optional
 
 import torch
+import torch.distributed as dist
 from transformers.modeling_flash_attention_utils import _flash_attention_forward as hf_flash_attention_forward
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
@@ -279,6 +280,11 @@ def flash_attention_forward(
 
         # Only after all_to_all we got the full seq_len
         seq_len = query.shape[1]
+        s_aux = kwargs.get("s_aux")
+        if s_aux is not None and s_aux.ndim == 1 and s_aux.numel() == q_head_num:
+            local_q_head_num = query.shape[2]
+            head_start = dist.get_rank(ulysses_group) * local_q_head_num
+            kwargs["s_aux"] = s_aux.narrow(0, head_start, local_q_head_num).contiguous()
 
     # Resolve the token that will be passed to Transformers' lazy_import_flash_attention.
     #

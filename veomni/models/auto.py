@@ -82,7 +82,7 @@ def _bind_veomni_ops(modeling_module, ops_config: OpsImplementationConfig) -> bo
                 if ops_config.moe_implementation == "eager"
                 else ops_config.moe_implementation.removeprefix("fused_")
             )
-            if impl_name != "eager":
+            if impl_name != "eager" and obj.variant == "standard":
                 moe_experts_kernel = impl_name
         else:
             impl_name = getattr(ops_config, f"{obj.op_name}_implementation", "eager")
