@@ -1,3 +1,5 @@
+import sys
+
 import pytest
 import torch
 
@@ -19,6 +21,21 @@ def _ops_config(moe_implementation: str = "eager") -> OpsImplementationConfig:
         causal_conv1d_implementation="eager",
         chunk_gated_delta_rule_implementation="eager",
     )
+
+
+def _bind_gpt_oss_moe(impl: str) -> None:
+    """Rebind GPT-OSS' module-level MoE OpSlot before each comparison forward."""
+    from veomni.models.transformers.gpt_oss.generated import patched_modeling_gpt_oss_gpu as gpt_oss_gen
+
+    gpt_oss_gen.veomni_moe_experts_forward.bind("eager" if impl == "eager" else impl.removeprefix("fused_"))
+
+
+@pytest.fixture(autouse=True)
+def _reset_gpt_oss_moe_binding():
+    yield
+    module = sys.modules.get("veomni.models.transformers.gpt_oss.generated.patched_modeling_gpt_oss_gpu")
+    if module is not None:
+        module.veomni_moe_experts_forward.bind("eager")
 
 
 def test_gpt_oss_veomni_forward_loss_contract(monkeypatch):
@@ -121,7 +138,9 @@ def test_gpt_oss_fused_moe_matches_eager_cuda(monkeypatch):
 
     input_ids = torch.randint(3, 64, (1, 8), device="cuda")
     with torch.no_grad():
+        _bind_gpt_oss_moe("eager")
         eager_logits = eager_model(input_ids=input_ids, use_cache=False).logits
+        _bind_gpt_oss_moe("fused_quack")
         fused_logits = fused_model(input_ids=input_ids, use_cache=False).logits
 
     torch.testing.assert_close(fused_logits, eager_logits, atol=8e-3, rtol=8e-3)
@@ -146,6 +165,7 @@ def test_gpt_oss_quack_fused_moe_matches_eager_cuda(monkeypatch):
 
     input_ids = torch.randint(3, 64, (1, 8), device="cuda")
     labels = input_ids.clone()
+    _bind_gpt_oss_moe("eager")
     eager_loss = eager_model(input_ids=input_ids, labels=labels, use_cache=False).loss
 
     fused_model = build_foundation_model(
@@ -156,6 +176,7 @@ def test_gpt_oss_quack_fused_moe_matches_eager_cuda(monkeypatch):
     )
     fused_model.load_state_dict(eager_model.state_dict())
 
+    _bind_gpt_oss_moe("fused_quack")
     fused_loss = fused_model(input_ids=input_ids, labels=labels, use_cache=False).loss
     torch.testing.assert_close(fused_loss, eager_loss, atol=8e-3, rtol=8e-3)
 
