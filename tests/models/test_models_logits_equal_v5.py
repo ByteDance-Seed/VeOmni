@@ -162,7 +162,13 @@ CASES = [
     # eager+fp32 only for this HF bitwise baseline: fused_quack is covered by
     # ``test_gpt_oss_integration.py`` against VeOmni eager, while this test
     # proves the patchgen-generated modeling preserves pristine HF semantics.
-    Case("gpt_oss-eager", _toy("gpt_oss_toy"), "GptOssForCausalLM", "causal_lm"),
+    Case(
+        "gpt_oss-eager",
+        _toy("gpt_oss_toy"),
+        "GptOssForCausalLM",
+        "causal_lm",
+        config_overrides={"_experts_implementation": "eager"},
+    ),
     # ── GLM-MoE-DSA (MLA + Dynamic Sparse Attention) ─────────────────────
     # Upstream sets ``_supports_flash_attn = False``, so FA2 is not an
     # option here — we use eager+fp32 as the RNG-init baseline and
@@ -653,7 +659,13 @@ _LOADER_CASES = [
     Case("deepseek_v3-eager-loader", _toy("deepseek_v3_toy"), "DeepseekV3ForCausalLM", "causal_lm"),
     # GPT-OSS uses native interleaved gate/up expert weights plus biases; the
     # loader path should preserve that HF-format layout exactly.
-    Case("gpt_oss-eager-loader", _toy("gpt_oss_toy"), "GptOssForCausalLM", "causal_lm"),
+    Case(
+        "gpt_oss-eager-loader",
+        _toy("gpt_oss_toy"),
+        "GptOssForCausalLM",
+        "causal_lm",
+        config_overrides={"_experts_implementation": "eager"},
+    ),
     Case(
         "glm_moe_dsa-eager-loader",
         _toy("glm_moe_dsa_toy"),
