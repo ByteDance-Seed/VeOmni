@@ -115,7 +115,7 @@
  class GptOssExperts(nn.Module):
      def __init__(self, config):
          super().__init__()
-@@ -94,18 +115,16 @@
+@@ -94,18 +115,22 @@
 
      def forward(self, hidden_states: torch.Tensor, router_indices=None, routing_weights=None) -> torch.Tensor:
          next_states = torch.zeros_like(hidden_states, dtype=hidden_states.dtype, device=hidden_states.device)
@@ -145,7 +145,7 @@
              if expert_idx == self.num_experts:
                  continue
              top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
-@@ -135,7 +154,12 @@
+@@ -135,7 +160,12 @@
          return router_logits, router_scores, router_indices
 
 
@@ -159,7 +159,7 @@
  class GptOssMLP(nn.Module):
      def __init__(self, config):
          super().__init__()
-@@ -392,6 +416,12 @@
+@@ -392,6 +422,12 @@
          return hidden_states
 
 
@@ -172,7 +172,7 @@
  @auto_docstring
  class GptOssPreTrainedModel(PreTrainedModel):
      config: GptOssConfig
-@@ -411,7 +441,11 @@
+@@ -411,7 +447,11 @@
          "attentions": GptOssAttention,
      }
      _keep_in_fp32_modules = ["post_attention_layernorm", "input_layernorm", "norm"]
@@ -185,7 +185,7 @@
 
      @torch.no_grad()
      def _init_weights(self, module):
-@@ -589,6 +623,12 @@
+@@ -589,6 +629,12 @@
      return overall_loss * num_experts
 
 
@@ -198,7 +198,7 @@
  @auto_docstring
  class GptOssForCausalLM(GptOssPreTrainedModel, GenerationMixin):
      _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
-@@ -621,35 +661,11 @@
+@@ -621,35 +667,11 @@
          output_router_logits: bool | None = None,
          logits_to_keep: int | torch.Tensor = 0,
          **kwargs: Unpack[TransformersKwargs],
@@ -235,7 +235,7 @@
          outputs: MoeModelOutputWithPast = self.model(
              input_ids=input_ids,
              attention_mask=attention_mask,
-@@ -662,34 +678,68 @@
+@@ -662,34 +684,68 @@
          )
 
          hidden_states = outputs.last_hidden_state

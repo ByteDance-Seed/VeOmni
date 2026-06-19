@@ -19,16 +19,17 @@ def register_gpt_oss_modeling(architecture: str):
     architecture = architecture or "GptOssForCausalLM"
 
     try:
-        from transformers import (
-            GptOssForSequenceClassification,
-            GptOssForTokenClassification,
-            GptOssModel,
-        )
+        import transformers.models.gpt_oss
     except ImportError as e:
         raise RuntimeError(
             "GPT-OSS support requires a Transformers build that provides `transformers.models.gpt_oss`."
         ) from e
-    from .generated.patched_modeling_gpt_oss_gpu import GptOssForCausalLM
+    from .generated.patched_modeling_gpt_oss_gpu import (
+        GptOssForCausalLM,
+        GptOssForSequenceClassification,
+        GptOssForTokenClassification,
+        GptOssModel,
+    )
 
     if "ForSequenceClassification" in architecture:
         return GptOssForSequenceClassification

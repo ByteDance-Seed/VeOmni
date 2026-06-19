@@ -5,6 +5,7 @@ import torch
 
 from veomni.arguments.arguments_types import OpsImplementationConfig
 from veomni.models.auto import build_foundation_model
+from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type
 from veomni.utils.import_utils import is_quack_gemm_available
 
 
@@ -112,16 +113,36 @@ def test_gpt_oss_rejects_triton_moe_backend(monkeypatch):
         )
 
 
+def test_gpt_oss_fused_quack_without_sm90_raises(monkeypatch):
+    from veomni.ops import kernel_registry
+
+    monkeypatch.setenv("MODELING_BACKEND", "veomni")
+    monkeypatch.setattr(kernel_registry, "IS_CUDA_AVAILABLE", True)
+    monkeypatch.setattr(kernel_registry, "IS_NPU_AVAILABLE", False)
+    monkeypatch.setattr(kernel_registry, "get_gpu_compute_capability", lambda: 80)
+
+    with pytest.raises(RuntimeError, match="compute_capability>=90"):
+        build_foundation_model(
+            "tests/toy_config/gpt_oss_toy",
+            torch_dtype="float32",
+            init_device="cpu",
+            ops_implementation=_ops_config(moe_implementation="fused_quack"),
+        )
+
+
 def test_gpt_oss_fused_moe_matches_eager_cuda(monkeypatch):
+    if not IS_CUDA_AVAILABLE:
+        pytest.skip("CUDA is required for GPT-OSS fused_quack MoE.")
     if not is_quack_gemm_available():
         pytest.skip("Quack SM90+ GEMM kernels are required for GPT-OSS fused_quack MoE.")
 
     monkeypatch.setenv("MODELING_BACKEND", "veomni")
     torch.manual_seed(0)
+    device = get_device_type()
     eager_model = build_foundation_model(
         "tests/toy_config/gpt_oss_toy",
         torch_dtype="bfloat16",
-        init_device="cuda",
+        init_device=device,
         ops_implementation=_ops_config(moe_implementation="eager"),
     ).eval()
     with torch.no_grad():
@@ -131,12 +152,12 @@ def test_gpt_oss_fused_moe_matches_eager_cuda(monkeypatch):
     fused_model = build_foundation_model(
         "tests/toy_config/gpt_oss_toy",
         torch_dtype="bfloat16",
-        init_device="cuda",
+        init_device=device,
         ops_implementation=_ops_config(moe_implementation="fused_quack"),
     ).eval()
     fused_model.load_state_dict(eager_model.state_dict())
 
-    input_ids = torch.randint(3, 64, (1, 8), device="cuda")
+    input_ids = torch.randint(3, 64, (1, 8), device=device)
     with torch.no_grad():
         _bind_gpt_oss_moe("eager")
         eager_logits = eager_model(input_ids=input_ids, use_cache=False).logits
@@ -147,15 +168,18 @@ def test_gpt_oss_fused_moe_matches_eager_cuda(monkeypatch):
 
 
 def test_gpt_oss_quack_fused_moe_matches_eager_cuda(monkeypatch):
+    if not IS_CUDA_AVAILABLE:
+        pytest.skip("CUDA is required for GPT-OSS fused_quack MoE.")
     if not is_quack_gemm_available():
         pytest.skip("Quack SM90+ GEMM kernels are required for GPT-OSS fused_quack MoE.")
 
     monkeypatch.setenv("MODELING_BACKEND", "veomni")
     torch.manual_seed(0)
+    device = get_device_type()
     eager_model = build_foundation_model(
         "tests/toy_config/gpt_oss_toy",
         torch_dtype="bfloat16",
-        init_device="cuda",
+        init_device=device,
         ops_implementation=_ops_config(moe_implementation="eager"),
     )
     with torch.no_grad():
@@ -163,7 +187,7 @@ def test_gpt_oss_quack_fused_moe_matches_eager_cuda(monkeypatch):
             layer.mlp.experts.gate_up_proj_bias.normal_(mean=0.0, std=0.02)
             layer.mlp.experts.down_proj_bias.normal_(mean=0.0, std=0.02)
 
-    input_ids = torch.randint(3, 64, (1, 8), device="cuda")
+    input_ids = torch.randint(3, 64, (1, 8), device=device)
     labels = input_ids.clone()
     _bind_gpt_oss_moe("eager")
     eager_loss = eager_model(input_ids=input_ids, labels=labels, use_cache=False).loss
@@ -171,7 +195,7 @@ def test_gpt_oss_quack_fused_moe_matches_eager_cuda(monkeypatch):
     fused_model = build_foundation_model(
         "tests/toy_config/gpt_oss_toy",
         torch_dtype="bfloat16",
-        init_device="cuda",
+        init_device=device,
         ops_implementation=_ops_config(moe_implementation="fused_quack"),
     )
     fused_model.load_state_dict(eager_model.state_dict())
