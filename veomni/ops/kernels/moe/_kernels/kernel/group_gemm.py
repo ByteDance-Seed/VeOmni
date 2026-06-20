@@ -19,7 +19,7 @@ import triton
 import triton.language as tl
 
 from ......utils.device import get_torch_device
-from ..utils.pretuned import algo_key_scaled, pretuned
+from ..utils.pretuned import USE_FALLBACK_KWARG, algo_key_scaled, pretuned
 from .triton_utils.activation import (
     ActivationType,
     activation_fwd,
@@ -362,6 +362,7 @@ def group_gemm_same_mn(
     max_K: int,
     transpose_a: bool = False,
     transpose_b: bool = False,
+    tuned: bool = True,
 ):
     G, M, N = c.shape
 
@@ -394,4 +395,5 @@ def group_gemm_same_mn(
             TRANSPOSE_A=transpose_a,
             TRANSPOSE_B=transpose_b,
             ACCUMULATE_TO_C=False,
+            **{USE_FALLBACK_KWARG: not tuned},
         )
