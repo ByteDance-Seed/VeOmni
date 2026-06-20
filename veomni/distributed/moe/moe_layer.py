@@ -239,7 +239,6 @@ class EPGroupGemm(torch.autograd.Function):
                 max_K=grad_output.shape[0],
                 transpose_a=True,
                 transpose_b=False,
-                tuned=False,
             )
 
         grad_fc1_2_output = fc1_1_activation * grad_fc1_output
@@ -266,7 +265,6 @@ class EPGroupGemm(torch.autograd.Function):
                 max_K=grad_output.shape[0],
                 transpose_a=True,
                 transpose_b=False,
-                tuned=False,
             )
 
         grad_fc1_1_output = torch.ops.aten.silu_backward(grad_fc1_1_activation, fc1_1_output)
@@ -292,7 +290,6 @@ class EPGroupGemm(torch.autograd.Function):
                 max_K=grad_output.shape[0],
                 transpose_a=True,
                 transpose_b=False,
-                tuned=False,
             )
 
         # grad input
@@ -403,7 +400,6 @@ class EPMergedFc1GroupGemm(torch.autograd.Function):
                 max_K=grad_output.shape[0],
                 transpose_a=True,
                 transpose_b=False,
-                tuned=False,
             )
 
         # gate gradients
@@ -435,7 +431,6 @@ class EPMergedFc1GroupGemm(torch.autograd.Function):
                 max_K=grad_output.shape[0],
                 transpose_a=True,
                 transpose_b=False,
-                tuned=False,
             )
 
         return (

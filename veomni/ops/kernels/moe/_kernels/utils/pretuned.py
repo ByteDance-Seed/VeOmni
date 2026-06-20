@@ -24,7 +24,6 @@ from .kernel import innermost_fn, qualified_name
 logger = logging.get_logger(__name__)
 
 CATCH_ALL_ALGO_KEY = "__CATCH_ALL__"
-USE_FALLBACK_KWARG = "_pretuned_use_fallback"
 
 
 def algo_key_scaled(names, scales, rest_key=None):
@@ -56,11 +55,8 @@ class Pretuned(triton.KernelInterface):
         assert CATCH_ALL_ALGO_KEY in self.configs
 
     def run(self, *args, **kwargs):
-        use_fallback = kwargs.pop(USE_FALLBACK_KWARG, False)
         algo_key = self.algo_key_maker(**kwargs)
-        if use_fallback:
-            extra_kwargs = self.configs[CATCH_ALL_ALGO_KEY]
-        elif algo_key not in self.configs:
+        if algo_key not in self.configs:
             if not envvars.is_untuned_warning_suppressed():
                 logger.debug(
                     f"Untuned case (using algo-key [{algo_key}]) is seen when invoking "

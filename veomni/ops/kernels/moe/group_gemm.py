@@ -171,7 +171,6 @@ class TritonFusedMoeExpertFunction(torch.autograd.Function):
                 max_K=grad_output.shape[0],
                 transpose_a=True,
                 transpose_b=False,
-                tuned=False,
             )
 
         # MOE Step 8
@@ -214,7 +213,6 @@ class TritonFusedMoeExpertFunction(torch.autograd.Function):
                 max_K=grad_output.shape[0],
                 transpose_a=True,
                 transpose_b=False,
-                tuned=False,
             )
 
         # MOE Step 5
@@ -244,7 +242,6 @@ class TritonFusedMoeExpertFunction(torch.autograd.Function):
                 max_K=grad_output.shape[0],
                 transpose_a=True,
                 transpose_b=False,
-                tuned=False,
             )
 
         # MOE Step 3
@@ -387,7 +384,6 @@ class MergedFc1TritonFusedMoeExpertFunction(torch.autograd.Function):
                 max_K=grad_output.shape[0],
                 transpose_a=True,
                 transpose_b=False,
-                tuned=False,
             )
 
         # MOE Step 8-2
@@ -432,7 +428,6 @@ class MergedFc1TritonFusedMoeExpertFunction(torch.autograd.Function):
                 max_K=grad_output.shape[0],
                 transpose_a=True,
                 transpose_b=False,
-                tuned=False,
             )
 
         # MOE Step 3
