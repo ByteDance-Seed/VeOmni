@@ -11,11 +11,8 @@ from PIL import Image
 from torch import nn
 
 from tests.seed_omni.parity_suite.core import to_cpu
-from tests.seed_omni.parity_suite.reference.capture import (
-    NullReferenceObservationCapture,
-    ReferenceCaptureContext,
-    ReferenceObservationCapture,
-)
+from tests.seed_omni.parity_suite.reference.capture.observation_adapter import ReferenceObservationAdapter
+from tests.seed_omni.parity_suite.reference.capture.spec import ReferenceCaptureContext
 from tests.seed_omni.parity_suite.reference.contract import ReferenceRunResult
 from tests.seed_omni.parity_suite.reference.oracles.hf_model import HfModelSubject
 from tests.seed_omni.parity_suite.v2.request import conversation_list_from_specs
@@ -26,11 +23,14 @@ from .data import (
     encode_reference_vae_latents,
     first_output_of_type,
     inferencer_generation_kwargs,
+    official_train_forward_batch,
     reduce_reference_train_losses,
     reference_train_batch_from_inputs,
+    reference_train_forward_context,
+    train_loss_options,
     train_options_from_inputs,
 )
-from .observation import BagelInferencerObservationCapture, BagelTrainObservationCapture
+from .observation_adapter import bagel_reference_observation_adapter
 from .vendor.data.transforms import ImageTransform
 from .vendor.inference import InterleaveInferencer
 from .vendor.modeling.bagel import (
@@ -124,24 +124,17 @@ class BagelHfModelReference(HfModelSubject):
             reference_device=bundle.device,
         )
 
-    # Observation capture -------------------------------------------------------
+    # Observation adapter -------------------------------------------------------
 
-    def reference_observation_capture(
+    def reference_observation_adapter(
         self,
         kind: str | None,
         inputs: Mapping[str, Any],
         context: ReferenceCaptureContext,
         options: Mapping[str, Any],
-    ) -> ReferenceObservationCapture:
+    ) -> ReferenceObservationAdapter:
         del inputs, context, options
-        observation_capture = {
-            "infer_und": BagelInferencerObservationCapture(mode="und"),
-            "infer_gen": BagelInferencerObservationCapture(mode="gen"),
-            "infer_edit": BagelInferencerObservationCapture(mode="gen"),
-            "infer_interleave": BagelInferencerObservationCapture(mode="gen"),
-            "train_forward_backward": BagelTrainObservationCapture(),
-        }
-        return observation_capture.get(kind, NullReferenceObservationCapture())
+        return bagel_reference_observation_adapter(kind)
 
     # Reference inference -------------------------------------------------------
 
@@ -150,9 +143,9 @@ class BagelHfModelReference(HfModelSubject):
         inputs: Mapping[str, Any],
         context: ReferenceCaptureContext,
         *,
-        capture: ReferenceObservationCapture | None = None,
+        observation_adapter: ReferenceObservationAdapter | None = None,
     ) -> ReferenceRunResult:
-        del capture
+        del observation_adapter
         return self._run_reference_infer(inputs, context, understanding_output=True)
 
     def run_reference_infer_gen(
@@ -160,9 +153,9 @@ class BagelHfModelReference(HfModelSubject):
         inputs: Mapping[str, Any],
         context: ReferenceCaptureContext,
         *,
-        capture: ReferenceObservationCapture | None = None,
+        observation_adapter: ReferenceObservationAdapter | None = None,
     ) -> ReferenceRunResult:
-        del capture
+        del observation_adapter
         return self._run_reference_infer(inputs, context, understanding_output=False)
 
     def run_reference_infer_edit(
@@ -170,9 +163,9 @@ class BagelHfModelReference(HfModelSubject):
         inputs: Mapping[str, Any],
         context: ReferenceCaptureContext,
         *,
-        capture: ReferenceObservationCapture | None = None,
+        observation_adapter: ReferenceObservationAdapter | None = None,
     ) -> ReferenceRunResult:
-        del capture
+        del observation_adapter
         return self._run_reference_infer(inputs, context, understanding_output=False)
 
     def run_reference_infer_interleave(
@@ -180,9 +173,9 @@ class BagelHfModelReference(HfModelSubject):
         inputs: Mapping[str, Any],
         context: ReferenceCaptureContext,
         *,
-        capture: ReferenceObservationCapture | None = None,
+        observation_adapter: ReferenceObservationAdapter | None = None,
     ) -> ReferenceRunResult:
-        del capture
+        del observation_adapter
         return self._run_reference_infer(inputs, context, understanding_output=False)
 
     def run_reference_train_forward_backward(
@@ -190,27 +183,45 @@ class BagelHfModelReference(HfModelSubject):
         inputs: Mapping[str, Any],
         context: ReferenceCaptureContext,
         *,
-        capture: ReferenceObservationCapture,
+        observation_adapter: ReferenceObservationAdapter,
     ) -> ReferenceRunResult:
-        del context
+        del context, observation_adapter
         device = self._reference_device()
-        batch = reference_train_batch_from_inputs(inputs, device=device)
-        batch = encode_reference_vae_latents(vae_model=self.vae_model, batch=batch)
-        train_options = train_options_from_inputs(inputs)
+        dtype = next(self.model.parameters()).dtype
+        loss_mode = str(inputs.get("loss_mode", self.case.recipe.reference.get("loss_mode", "ce_mse")))
+        batch = reference_train_batch_from_inputs(
+            inputs,
+            device=device,
+            tokenizer=self.tokenizer,
+            new_token_ids=self.new_token_ids,
+            loss_mode=loss_mode,
+        )
+        batch = encode_reference_vae_latents(
+            vae_model=self.vae_model,
+            batch=batch,
+            target_device=device,
+            target_dtype=dtype,
+        )
+        train_options = train_options_from_inputs(inputs, batch=batch)
 
         self.model.train()
         self.model.zero_grad(set_to_none=True)
-        loss_dict = self.model(**batch)
-        reduced = reduce_reference_train_losses(loss_dict, batch, **train_options)
+        with reference_train_forward_context(
+            self.model,
+            batch,
+            train_options,
+            device=device,
+            dtype=dtype,
+        ):
+            loss_dict = self.model(**official_train_forward_batch(batch))
+        reduced = reduce_reference_train_losses(loss_dict, batch, **train_loss_options(train_options))
         reduced.loss.backward()
 
-        capture.record("train_loss", reduced.loss.detach().cpu())
-        capture.record("train_ce", reduced.losses["ce"].detach().cpu())
-        capture.record("train_mse", reduced.losses["mse"].detach().cpu())
         return ReferenceRunResult(
             canonical={
                 "train_batch": to_cpu(batch),
                 "train_kwargs": dict(train_options),
+                "loss_mode": loss_mode,
             },
             observations={},
             raw_output={

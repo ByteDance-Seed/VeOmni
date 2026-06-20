@@ -10,7 +10,6 @@ reference:
     - siglip_navit
     - vae
     - flow_connector_embed
-    - flow_connector_decode
     - qwen2_mot
 
 v2_model:
@@ -26,8 +25,6 @@ v2_model:
       config_dir: tests/seed_omni/bagel/configs/vae
     flow_connector_embed:
       config_dir: tests/seed_omni/bagel/configs/flow_connector
-    flow_connector_decode:
-      config_dir: tests/seed_omni/bagel/configs/flow_connector_decode
     qwen2_mot:
       config_dir: tests/seed_omni/bagel/configs/qwen2_mot
 

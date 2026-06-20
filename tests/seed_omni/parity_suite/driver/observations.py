@@ -7,10 +7,34 @@ from typing import Any
 
 import torch
 
-from tests.seed_omni.parity_suite.core import ParityCase, ProbeMapping, sample_named_grad
+from tests.seed_omni.parity_suite.core import ParityCase, ProbeMapping, RunCaptureOptions, sample_named_grad
+from tests.seed_omni.parity_suite.v2.generation_runtime import InferModulePolicy
 from tests.seed_omni.parity_suite.v2.observation import record_conversation_output, record_module_output
-from tests.seed_omni.parity_suite.v2.tier_runners.module import InferModulePolicy
 from veomni.models.seed_omni.modeling_omni import OmniModel
+
+
+def shifted_label_rows_from_conversation(
+    conversation_list: Any,
+    *,
+    label_key: str = "labels",
+    ignore_index: int = -100,
+) -> torch.Tensor | None:
+    """Return unique next-token label rows from a conversation carrier."""
+
+    labels: list[torch.Tensor] = []
+    for sample in conversation_list or []:
+        for item in sample:
+            meta = getattr(item, "meta", {})
+            item_labels = meta.get(label_key) if isinstance(meta, dict) else None
+            if not torch.is_tensor(item_labels):
+                continue
+            shifted = item_labels.reshape(-1)[1:]
+            shifted = shifted[shifted != ignore_index]
+            if int(shifted.numel()) > 0:
+                labels.append(shifted.detach().cpu())
+    if not labels:
+        return None
+    return torch.unique(torch.cat(labels)).to(dtype=torch.long)
 
 
 class TrainObservationMixin:
@@ -24,13 +48,14 @@ class TrainObservationMixin:
         self,
         reference_output: Any,
         whitelist: Mapping[tuple[str, str], frozenset[str]],
+        *,
+        capture_options: RunCaptureOptions,
     ) -> InferModulePolicy:
         """Return the module-tier FSM policy for inference parity."""
 
         del reference_output
         options = self.case.run.options
         max_steps = options.get("max_steps")
-        max_tensor_numel = options.get("max_tensor_numel", 1_000_000)
         selected = self.case.model.probes.for_probe_names(self.case.run.probes)
         needs_all_steps = any(mapping.step == "all" for mapping in selected)
         required_observations = frozenset(
@@ -43,7 +68,7 @@ class TrainObservationMixin:
             required_nodes=frozenset() if needs_all_steps else frozenset(whitelist.keys()),
             required_observations=frozenset() if needs_all_steps else required_observations,
             allow_finalize=bool(options.get("allow_finalize", False)),
-            max_tensor_numel=int(max_tensor_numel),
+            max_tensor_numel=capture_options.max_tensor_numel,
         )
 
     # Public train-tier collectors -------------------------------------------------

@@ -9,6 +9,8 @@ from typing import TYPE_CHECKING, Any
 
 from torch import nn
 
+from tests.seed_omni.parity_suite.core.runtime import RunCaptureOptions
+
 
 if TYPE_CHECKING:
     from tests.seed_omni.parity_suite.core import RefTapSpec
@@ -47,6 +49,7 @@ class ReferenceCaptureContext:
     ref_model: nn.Module | None
     inputs: Mapping[str, Any]
     hook_taps: MutableMapping[str, list[Any]]
+    capture_options: RunCaptureOptions = field(default_factory=RunCaptureOptions)
     extras: dict[str, Any] = field(default_factory=dict)
     output: Any = None
 

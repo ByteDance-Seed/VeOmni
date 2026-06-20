@@ -1,0 +1,63 @@
+train_ce:
+  - graph: train
+    stimulus:
+      loss_mode: ce
+      conversation_list:
+        - type: text
+          role: assistant
+          value:
+            kind: text
+            text: "Describe BAGEL in one short sentence."
+    reference:
+      oracle: hf_model
+    gate:
+      requires_reference_checkpoint: true
+      requires_v2_model: true
+    v2_model:
+      module_overrides:
+        bagel_vae:
+          device: cpu
+          dtype: float32
+    runs:
+      graph:
+        - id: forward_backward
+          options:
+            deterministic_sdpa: true
+          probes:
+            - train.ce_loss
+            - train.grad_lm_head_rows
+
+train_ce_mse:
+  - graph: train
+    stimulus:
+      loss_mode: ce_mse
+      image_size: 32
+      conversation_list:
+        - type: text
+          role: assistant
+          value:
+            kind: text
+            text: "Describe BAGEL in one short sentence."
+    reference:
+      oracle: hf_model
+    gate:
+      requires_reference_checkpoint: true
+      requires_v2_model: true
+    v2_model:
+      module_overrides:
+        bagel_vae:
+          device: cpu
+          dtype: float32
+    runs:
+      graph:
+        - id: forward_backward
+          enable: false
+          options:
+            deterministic_sdpa: true
+          probes:
+            - train.ce_loss
+            - train.mse_loss
+            - train.grad_lm_head_rows
+            - train.grad_early_q_proj
+            - train.grad_gen_q_proj
+            - train.grad_llm2vae

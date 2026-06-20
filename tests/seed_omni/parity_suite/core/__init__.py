@@ -42,10 +42,13 @@ from .config import (
 )
 from .fixtures import make_reference_image
 from .runtime import (
+    RunCaptureOptions,
     autocast_for_dtype,
     configure_torch_determinism,
     patched_randn_like,
     resolve_torch_dtype,
+    run_capture_context,
+    run_runtime_context,
     sample_grad,
     sample_named_grad,
     sample_named_param,
@@ -115,10 +118,13 @@ __all__ = [
     "conversation_stimulus_to_batched_specs",
     "validate_stimulus",
     # Runtime helpers
+    "RunCaptureOptions",
     "autocast_for_dtype",
     "configure_torch_determinism",
     "patched_randn_like",
     "resolve_torch_dtype",
+    "run_capture_context",
+    "run_runtime_context",
     "sample_grad",
     "sample_named_grad",
     "sample_named_param",

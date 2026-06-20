@@ -14,19 +14,28 @@ from safetensors import safe_open
 from torch import nn
 from transformers.initialization import no_init_weights
 
-from tests.seed_omni.parity_suite.core import ParityCase, configure_torch_determinism, effective_reference_kind
-from tests.seed_omni.parity_suite.reference.capture import (
-    NullReferenceObservationCapture,
-    ReferenceCaptureContext,
-    ReferenceCapturePlan,
-    ReferenceObservationCapture,
-    capture_hook_taps,
-    materialize_reference_value,
+from tests.seed_omni.parity_suite.core import (
+    ParityCase,
+    RunCaptureOptions,
+    configure_torch_determinism,
+    effective_reference_kind,
+)
+from tests.seed_omni.parity_suite.reference.capture.observation_adapter import (
+    NullReferenceObservationAdapter,
+    ReferenceObservationAdapter,
 )
 from tests.seed_omni.parity_suite.reference.capture.runtime import (
     _empty_cache,
     _memory_allocated,
     _release_module_storage,
+    capture_extractor_taps,
+    capture_hook_taps,
+    materialize_reference_observations,
+    selected_reference_field_observations,
+)
+from tests.seed_omni.parity_suite.reference.capture.spec import (
+    ReferenceCaptureContext,
+    ReferenceCapturePlan,
 )
 from tests.seed_omni.parity_suite.reference.contract import (
     ReferenceCaptureResult,
@@ -78,23 +87,27 @@ class HfModelSubject(ReferenceSubject):
     ) -> ReferenceRunResult:
         if kind is None:
             raise NotImplementedError(f"{type(self).__name__} requires reference.kind.")
-        method = getattr(self, f"run_reference_{kind}", None)
-        if method is None:
-            raise NotImplementedError(f"{type(self).__name__} does not implement reference kind {kind!r}.")
-        capture = self.reference_observation_capture(kind, inputs, context, options)
-        with capture.install(self):
-            result = normalize_reference_run_result(_call_reference_method(method, inputs, context, capture))
-        return merge_reference_observations(result, capture.observations())
 
-    def reference_observation_capture(
+        observation_adapter = self.reference_observation_adapter(kind, inputs, context, options)
+        with observation_adapter.install(self):
+            method = getattr(self, f"run_reference_{kind}", None)
+            if method is None:
+                raise NotImplementedError(f"{type(self).__name__} does not implement reference kind {kind!r}.")
+            result = normalize_reference_run_result(
+                _call_reference_method(method, inputs, context, observation_adapter)
+            )
+
+        return merge_reference_observations(result, observation_adapter.observations())
+
+    def reference_observation_adapter(
         self,
         kind: str | None,
         inputs: Mapping[str, Any],
         context: ReferenceCaptureContext,
         options: Mapping[str, Any],
-    ) -> ReferenceObservationCapture:
+    ) -> ReferenceObservationAdapter:
         del kind, inputs, context, options
-        return NullReferenceObservationCapture()
+        return NullReferenceObservationAdapter()
 
     @classmethod
     def create_hf_module_subject(cls, request: Any):
@@ -127,71 +140,116 @@ class HfModelReferenceOracle(ReferenceOracle):
         plan: ReferenceCapturePlan,
         device: torch.device,
         dtype: torch.dtype,
+        capture_options: RunCaptureOptions,
     ) -> ReferenceCaptureResult:
         memory_before_load = _memory_allocated(None)
-        subject = self._load(device=device, dtype=dtype)
-        hook_root = _reference_hook_root(subject)
-        hook_observations: dict[str, list[Any]] = {}
-        run_output: ReferenceRunResult | None = None
-        memory_before_release = 0
+
+        subject = load_hf_model_subject(
+            case=self.case,
+            device=device,
+            dtype=dtype,
+            load_kwargs=self.load_kwargs,
+        )
+
         memory_after_release = 0
-        max_tensor_numel = _max_tensor_numel(_run_options(self.case))
         try:
-            context = ReferenceCaptureContext(ref_model=hook_root, inputs=inputs, hook_taps=hook_observations)
-            with capture_hook_taps(
-                hook_root,
-                plan.hook_taps,
-                sink=hook_observations,
-                max_tensor_numel=max_tensor_numel,
-            ):
-                configure_torch_determinism(int(getattr(self.case.model, "seed", 1234)))
-                raw_output = self._run(subject, inputs, context)
-                run_output = normalize_reference_run_result(raw_output)
-                context.output = run_output
-            observations = {
-                **_materialize_observations(
-                    _selected_field_observations(run_output.observations, plan),
-                    max_tensor_numel=max_tensor_numel,
-                ),
-                **hook_observations,
-            }
-            _capture_extractors(context, plan, observations=observations, max_tensor_numel=max_tensor_numel)
-            run_output = ReferenceRunResult(
-                canonical=run_output.canonical,
-                observations=observations,
-                raw_output=run_output.raw_output,
+            # Execute the official reference path while collecting field, hook,
+            # extractor, and subject-owned observation-adapter values.
+            payload = self._capture_subject(
+                subject,
+                inputs=inputs,
+                plan=plan,
+                capture_options=capture_options,
             )
-            memory_before_release = _memory_allocated(None)
         finally:
-            if "context" in locals():
-                context.ref_model = None
-                context.output = None
+            # Only CPU-materialized observations should survive this point.
             _release_reference_subject(subject)
             del subject
             _empty_cache(None)
             memory_after_release = _memory_allocated(None)
 
-        if run_output is None:
-            raise RuntimeError("HF model reference oracle did not produce a run output.")
-        if memory_before_release > memory_before_load and memory_after_release >= memory_before_release:
-            raise AssertionError(
-                "Reference model memory was not released before V2 load: "
-                f"before_load={memory_before_load}, before_release={memory_before_release}, "
-                f"after_release={memory_after_release}."
-            )
-        return ReferenceCaptureResult(
-            observations=dict(run_output.observations),
-            run_output=run_output,
-            memory_before_release=memory_before_release,
+        # Large HF subjects must be released before the V2 side is loaded.
+        self._assert_reference_released(
+            memory_before_load=memory_before_load,
+            memory_before_release=payload.memory_before_release,
             memory_after_release=memory_after_release,
         )
 
-    def _load(self, *, device: torch.device, dtype: torch.dtype) -> HfModelSubject:
-        return load_hf_model_subject(
-            case=self.case,
-            device=device,
-            dtype=dtype,
-            load_kwargs=self.load_kwargs,
+        return ReferenceCaptureResult(
+            observations=dict(payload.run_output.observations),
+            run_output=payload.run_output,
+            memory_before_release=payload.memory_before_release,
+            memory_after_release=memory_after_release,
+        )
+
+    def _capture_subject(
+        self,
+        subject: HfModelSubject,
+        *,
+        inputs: Mapping[str, Any],
+        plan: ReferenceCapturePlan,
+        capture_options: RunCaptureOptions,
+    ) -> _HfModelCapturePayload:
+        hook_root = _reference_hook_root(subject)
+        hook_observations: dict[str, list[Any]] = {}
+        context = ReferenceCaptureContext(
+            ref_model=hook_root,
+            inputs=inputs,
+            hook_taps=hook_observations,
+            capture_options=capture_options,
+        )
+        try:
+            run_output = self._run_with_hook_capture(subject, inputs, context, plan=plan)
+            run_output = self._with_materialized_observations(
+                run_output,
+                context=context,
+                plan=plan,
+                hook_observations=hook_observations,
+            )
+            return _HfModelCapturePayload(
+                run_output=run_output,
+                memory_before_release=_memory_allocated(None),
+            )
+        finally:
+            context.ref_model = None
+            context.output = None
+
+    def _run_with_hook_capture(
+        self,
+        subject: HfModelSubject,
+        inputs: Mapping[str, Any],
+        context: ReferenceCaptureContext,
+        *,
+        plan: ReferenceCapturePlan,
+    ) -> ReferenceRunResult:
+        hook_root = _reference_hook_root(subject)
+        with capture_hook_taps(hook_root, plan.hook_taps, context=context):
+            configure_torch_determinism(int(getattr(self.case.model, "seed", 1234)))
+            raw_output = self._run(subject, inputs, context)
+            run_output = normalize_reference_run_result(raw_output)
+            context.output = run_output
+            return run_output
+
+    def _with_materialized_observations(
+        self,
+        run_output: ReferenceRunResult,
+        *,
+        context: ReferenceCaptureContext,
+        plan: ReferenceCapturePlan,
+        hook_observations: Mapping[str, list[Any]],
+    ) -> ReferenceRunResult:
+        observations = {
+            **materialize_reference_observations(
+                selected_reference_field_observations(run_output.observations, plan),
+                context=context,
+            ),
+            **hook_observations,
+        }
+        capture_extractor_taps(context, plan, observations=observations)
+        return ReferenceRunResult(
+            canonical=run_output.canonical,
+            observations=observations,
+            raw_output=run_output.raw_output,
         )
 
     def _run(
@@ -206,73 +264,35 @@ class HfModelReferenceOracle(ReferenceOracle):
         with subject.reference_options(options):
             return subject.run_reference(kind, inputs, context, options)
 
-
-# Capture materialization helpers ---------------------------------------------
-
-
-def _capture_extractors(
-    context: ReferenceCaptureContext,
-    plan: ReferenceCapturePlan,
-    *,
-    observations: dict[str, list[Any]],
-    max_tensor_numel: int,
-) -> None:
-    for tap in plan.extractor_taps:
-        value = materialize_reference_value(
-            tap.extractor(context),
-            max_tensor_numel=max_tensor_numel,
-            field_path=tap.name,
+    def _assert_reference_released(
+        self,
+        *,
+        memory_before_load: int,
+        memory_before_release: int,
+        memory_after_release: int,
+    ) -> None:
+        if memory_before_release <= memory_before_load or memory_after_release < memory_before_release:
+            return
+        raise AssertionError(
+            "Reference model memory was not released before V2 load: "
+            f"before_load={memory_before_load}, before_release={memory_before_release}, "
+            f"after_release={memory_after_release}."
         )
-        values = value if isinstance(value, list) else [value]
-        observations.setdefault(tap.name, []).extend(values)
+
+
+@dataclass(frozen=True)
+class _HfModelCapturePayload:
+    run_output: ReferenceRunResult
+    memory_before_release: int
 
 
 def _call_reference_method(
     method: Any,
     inputs: Mapping[str, Any],
     context: ReferenceCaptureContext,
-    capture: ReferenceObservationCapture,
+    observation_adapter: ReferenceObservationAdapter,
 ) -> Any:
-    return method(inputs, context, capture=capture)
-
-
-def _materialize_observations(
-    observations: Mapping[str, list[Any]],
-    *,
-    max_tensor_numel: int,
-) -> dict[str, list[Any]]:
-    materialized: dict[str, list[Any]] = {}
-    for name, values in observations.items():
-        value_list = values if isinstance(values, list) else [values]
-        materialized[str(name)] = [
-            materialize_reference_value(
-                value,
-                max_tensor_numel=max_tensor_numel,
-                field_path=str(name),
-            )
-            for value in value_list
-        ]
-    return materialized
-
-
-def _selected_field_observations(
-    observations: Mapping[str, list[Any]],
-    plan: ReferenceCapturePlan,
-) -> Mapping[str, list[Any]]:
-    if not plan.field_taps:
-        return observations
-    selected = {tap.name for tap in plan.field_taps}
-    return {name: values for name, values in observations.items() if name in selected}
-
-
-def _max_tensor_numel(options: Mapping[str, Any] | None) -> int:
-    if not options:
-        return 1_000_000
-    return int(options.get("max_tensor_numel", 1_000_000))
-
-
-def _run_options(case: Any) -> Mapping[str, Any] | None:
-    return getattr(getattr(case, "run", None), "options", None)
+    return method(inputs, context, observation_adapter=observation_adapter)
 
 
 # Reference option patching ----------------------------------------------------
@@ -378,7 +398,7 @@ def load_hf_model_subject(
     spec = case.model.reference.hf_model
     if spec is None:
         raise ValueError(f"{case.node_id} requires reference.hf_model, but it is not configured.")
-    subject_cls = _load_reference_class(spec.module)
+    subject_cls = load_hf_model_subject_class(spec.module)
     load_subject = getattr(subject_cls, "load_reference_subject", None)
     if load_subject is None:
         raise TypeError(f"{subject_cls.__name__} must implement load_reference_subject().")
@@ -400,7 +420,16 @@ def load_hf_model_subject(
 def load_hf_model_subject_class(reference_module: str | None) -> type[Any]:
     """Load the configured full-model reference subject class."""
 
-    return _load_reference_class(reference_module)
+    if reference_module is None:
+        raise ValueError("reference.hf_model.module must declare 'module.path:ClassName'.")
+    if ":" not in reference_module:
+        raise ValueError("reference.hf_model.module must use 'module.path:ClassName'.")
+    module_name, class_name = reference_module.rsplit(":", 1)
+    if not module_name or not class_name:
+        raise ValueError("reference.hf_model.module must use 'module.path:ClassName'.")
+
+    module = importlib.import_module(module_name)
+    return getattr(module, class_name)
 
 
 # Reference cleanup helpers ----------------------------------------------------
@@ -425,19 +454,6 @@ def _release_reference_subject(subject: Any) -> None:
     for module in modules:
         if isinstance(module, nn.Module):
             _release_module_storage(module)
-
-
-def _load_reference_class(reference_module: str | None) -> type[Any]:
-    if reference_module is None:
-        raise ValueError("reference.hf_model.module must declare 'module.path:ClassName'.")
-    if ":" not in reference_module:
-        raise ValueError("reference.hf_model.module must use 'module.path:ClassName'.")
-    module_name, class_name = reference_module.rsplit(":", 1)
-    if not module_name or not class_name:
-        raise ValueError("reference.hf_model.module must use 'module.path:ClassName'.")
-
-    module = importlib.import_module(module_name)
-    return getattr(module, class_name)
 
 
 __all__ = [

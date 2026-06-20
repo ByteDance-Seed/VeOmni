@@ -121,16 +121,6 @@ infer_gen.velocity_all:
   tol: tensor
   step: all
 
-infer_gen.flow_decode_velocity:
-  v2:
-    node: bagel_flow_connector.decode_velocity
-    state: velocity_collect
-    field: velocity
-  ref:
-    field: velocity
-  tol: tensor
-  step: last
-
 infer_gen.merged_velocity:
   v2:
     node: bagel_qwen2_mot.generate
@@ -152,3 +142,65 @@ infer_gen.merged_velocity_all:
     field: velocity
   tol: tensor
   step: all
+
+train.ce_loss:
+  v2:
+    node: bagel_text_encoder.decode
+    state: train
+    field: loss
+  ref:
+    field: train_ce
+  tol: loss
+
+train.mse_loss:
+  v2:
+    node: bagel_flow_connector.decode_velocity
+    state: train
+    field: loss
+  ref:
+    field: train_mse
+  tol: loss
+
+train.grad_lm_head_rows:
+  v2:
+    node: bagel_text_encoder.decode
+    state: train
+    field: train_grad_lm_head_rows
+    grad:
+      parameter: lm_head.weight
+  ref:
+    field: train_grad_lm_head_rows
+  tol: exact
+
+train.grad_early_q_proj:
+  v2:
+    node: bagel_qwen2_mot.forward
+    state: train
+    field: train_grad_early_q_proj
+    grad:
+      parameter: model.layers.0.self_attn.q_proj.weight
+  ref:
+    field: train_grad_early_q_proj
+  tol: gradient
+
+train.grad_gen_q_proj:
+  v2:
+    node: bagel_qwen2_mot.forward
+    state: train
+    field: train_grad_gen_q_proj
+    grad:
+      parameter: model.layers.0.self_attn.q_proj_moe_gen.weight
+  ref:
+    field: train_grad_gen_q_proj
+  tol: gradient
+
+train.grad_llm2vae:
+  v2:
+    node: bagel_flow_connector.decode_velocity
+    state: train
+    field: train_grad_llm2vae
+    grad:
+      parameter: llm2vae.weight
+  ref:
+    field: train_grad_llm2vae
+  tol: gradient

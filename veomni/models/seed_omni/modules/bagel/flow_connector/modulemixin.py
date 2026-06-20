@@ -317,7 +317,8 @@ class BagelFlowConnectorModuleMixin(ModuleMixin):
         if target is None:
             return {"conversation_list": conversation, "_loss": velocity.sum() * 0.0}
         mse = (velocity - target.to(device=velocity.device, dtype=velocity.dtype)).square()
-        return {"conversation_list": conversation, "_loss": mse.mean()}
+        token_count = torch.tensor(float(mse.shape[0]), device=mse.device, dtype=mse.dtype)
+        return {"conversation_list": conversation, "_loss": mse.mean(dim=-1).sum() / token_count}
 
     def dummy_inputs(self, kind: str = "embed_latent") -> dict[str, torch.Tensor]:
         if kind == "decode_velocity":

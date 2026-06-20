@@ -11,7 +11,7 @@ from tests.seed_omni.parity_suite.core import ParityCase, configure_torch_determ
 from tests.seed_omni.parity_suite.driver.observations import TrainObservationMixin
 from tests.seed_omni.parity_suite.driver.reference import ReferenceMixin
 from tests.seed_omni.parity_suite.driver.requests import RequestDispatchMixin
-from tests.seed_omni.parity_suite.driver.runners import TierRunnerMixin
+from tests.seed_omni.parity_suite.driver.runtime import DriverRuntimeMixin
 from tests.seed_omni.parity_suite.driver.v2_loading import V2LoadingMixin
 
 
@@ -22,7 +22,7 @@ class ParityDriver(
     ReferenceMixin,
     V2LoadingMixin,
     RequestDispatchMixin,
-    TierRunnerMixin,
+    DriverRuntimeMixin,
     TrainObservationMixin,
 ):
     """Model-specific execution contract used by the shared parity runner.

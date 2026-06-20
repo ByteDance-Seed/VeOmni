@@ -15,17 +15,19 @@ from typing import Any
 import torch
 from torch import nn
 
-from tests.seed_omni.parity_suite.core import ParityCase, effective_reference_kind
-from tests.seed_omni.parity_suite.reference.capture import (
-    ReferenceCaptureContext,
-    ReferenceCapturePlan,
-    capture_hook_taps,
-    materialize_reference_value,
-)
+from tests.seed_omni.parity_suite.core import ParityCase, RunCaptureOptions, effective_reference_kind
 from tests.seed_omni.parity_suite.reference.capture.runtime import (
     _empty_cache,
     _memory_allocated,
     _release_module_storage,
+    capture_extractor_taps,
+    capture_hook_taps,
+    materialize_reference_observations,
+    selected_reference_field_observations,
+)
+from tests.seed_omni.parity_suite.reference.capture.spec import (
+    ReferenceCaptureContext,
+    ReferenceCapturePlan,
 )
 from tests.seed_omni.parity_suite.reference.contract import (
     ReferenceCaptureResult,
@@ -173,74 +175,50 @@ class HfModuleReferenceOracle(ReferenceOracle):
         plan: ReferenceCapturePlan,
         device: torch.device,
         dtype: torch.dtype,
+        capture_options: RunCaptureOptions,
     ) -> ReferenceCaptureResult:
         self._validate_module_name()
+
         reference = self.case.recipe.reference
         kind = effective_reference_kind(self.case)
         options = _merged_options(self.case.model.reference.hf_model.options, reference.get("options", {}))
+
         memory_before_load = _memory_allocated(None)
         subject = self._load(device=device, dtype=dtype, plan=plan, kind=kind, options=options)
-        hook_root = subject.hook_root
-        hook_observations: dict[str, list[Any]] = {}
-        run_output: ReferenceRunResult | None = None
-        memory_before_release = 0
+
         memory_after_release = 0
-        max_tensor_numel = _max_tensor_numel(_run_options(self.case))
         try:
-            context = ReferenceCaptureContext(ref_model=hook_root, inputs=inputs, hook_taps=hook_observations)
-            with capture_hook_taps(
-                hook_root,
-                plan.hook_taps,
-                sink=hook_observations,
-                max_tensor_numel=max_tensor_numel,
-            ):
-                raw_output = self._run(subject, inputs, context, kind=kind, options=options)
-            normalized = normalize_reference_run_result(raw_output)
-            context.output = normalized
-            observations = {
-                **_materialize_observations(
-                    _selected_field_observations(normalized.observations, plan),
-                    max_tensor_numel=max_tensor_numel,
-                ),
-                **hook_observations,
-            }
-            _capture_extractors(context, plan, observations=observations, max_tensor_numel=max_tensor_numel)
-            canonical_fields = subject.canonical_observation_fields(kind)
-            canonical_observations = _materialize_observations(
-                {field: normalized.observations.get(field, []) for field in canonical_fields},
-                max_tensor_numel=max_tensor_numel,
+            # Run the full-model reference facade for this module and collect
+            # both generic taps and module-owned observation-adapter values.
+            payload = self._capture_subject(
+                subject,
+                inputs=inputs,
+                plan=plan,
+                kind=kind,
+                options=options,
+                capture_options=capture_options,
             )
-            run_output = ReferenceRunResult(
-                canonical=_canonical_with_observations(
-                    normalized.canonical,
-                    {**canonical_observations, **observations},
-                    fields=canonical_fields,
-                ),
-                observations=observations,
-                raw_output=normalized.raw_output,
-            )
-            memory_before_release = _memory_allocated(None)
         finally:
-            if "context" in locals():
-                context.ref_model = None
-                context.output = None
+            # The facade may own a full HF model, so release it before V2-side
+            # execution starts.
             _release_subject_storage(subject)
             del subject
             gc.collect()
             _empty_cache(None)
             memory_after_release = _memory_allocated(None)
-        if run_output is None:
-            raise RuntimeError(f"HF module reference oracle {self.name!r} did not produce a run output.")
-        if memory_before_release > memory_before_load and memory_after_release >= memory_before_release:
-            raise AssertionError(
-                "Reference module memory was not released before V2 load: "
-                f"before_load={memory_before_load}, before_release={memory_before_release}, "
-                f"after_release={memory_after_release}."
-            )
+
+        # Module tier exists partly to avoid co-resident reference/V2 graphs;
+        # make that memory boundary explicit.
+        self._assert_reference_released(
+            memory_before_load=memory_before_load,
+            memory_before_release=payload.memory_before_release,
+            memory_after_release=memory_after_release,
+        )
+
         return ReferenceCaptureResult(
-            observations=dict(run_output.observations),
-            run_output=run_output,
-            memory_before_release=memory_before_release,
+            observations=dict(payload.run_output.observations),
+            run_output=payload.run_output,
+            memory_before_release=payload.memory_before_release,
             memory_after_release=memory_after_release,
         )
 
@@ -278,6 +256,97 @@ class HfModuleReferenceOracle(ReferenceOracle):
             )
         return subject
 
+    def _capture_subject(
+        self,
+        subject: HfModuleSubject,
+        *,
+        inputs: Mapping[str, Any],
+        plan: ReferenceCapturePlan,
+        kind: str | None,
+        options: Mapping[str, Any],
+        capture_options: RunCaptureOptions,
+    ) -> _HfModuleCapturePayload:
+        hook_observations: dict[str, list[Any]] = {}
+        context = ReferenceCaptureContext(
+            ref_model=subject.hook_root,
+            inputs=inputs,
+            hook_taps=hook_observations,
+            capture_options=capture_options,
+        )
+        try:
+            run_output = self._run_with_hook_capture(
+                subject,
+                inputs,
+                context,
+                plan=plan,
+                kind=kind,
+                options=options,
+            )
+            run_output = self._with_materialized_observations(
+                subject,
+                run_output,
+                context=context,
+                plan=plan,
+                kind=kind,
+                hook_observations=hook_observations,
+            )
+            return _HfModuleCapturePayload(
+                run_output=run_output,
+                memory_before_release=_memory_allocated(None),
+            )
+        finally:
+            context.ref_model = None
+            context.output = None
+
+    def _run_with_hook_capture(
+        self,
+        subject: HfModuleSubject,
+        inputs: Mapping[str, Any],
+        context: ReferenceCaptureContext,
+        *,
+        plan: ReferenceCapturePlan,
+        kind: str | None,
+        options: Mapping[str, Any],
+    ) -> ReferenceRunResult:
+        with capture_hook_taps(subject.hook_root, plan.hook_taps, context=context):
+            raw_output = self._run(subject, inputs, context, kind=kind, options=options)
+            run_output = normalize_reference_run_result(raw_output)
+            context.output = run_output
+            return run_output
+
+    def _with_materialized_observations(
+        self,
+        subject: HfModuleSubject,
+        run_output: ReferenceRunResult,
+        *,
+        context: ReferenceCaptureContext,
+        plan: ReferenceCapturePlan,
+        kind: str | None,
+        hook_observations: Mapping[str, list[Any]],
+    ) -> ReferenceRunResult:
+        observations = {
+            **materialize_reference_observations(
+                selected_reference_field_observations(run_output.observations, plan),
+                context=context,
+            ),
+            **hook_observations,
+        }
+        capture_extractor_taps(context, plan, observations=observations)
+        canonical_fields = subject.canonical_observation_fields(kind)
+        canonical_observations = materialize_reference_observations(
+            {field: run_output.observations.get(field, []) for field in canonical_fields},
+            context=context,
+        )
+        return ReferenceRunResult(
+            canonical=_canonical_with_observations(
+                run_output.canonical,
+                {**canonical_observations, **observations},
+                fields=canonical_fields,
+            ),
+            observations=observations,
+            raw_output=run_output.raw_output,
+        )
+
     def _run(
         self,
         subject: HfModuleSubject,
@@ -289,6 +358,27 @@ class HfModuleReferenceOracle(ReferenceOracle):
     ) -> ReferenceRunResult:
         with subject.model_subject.reference_options(options):
             return subject.run_reference(kind, inputs, context, options)
+
+    def _assert_reference_released(
+        self,
+        *,
+        memory_before_load: int,
+        memory_before_release: int,
+        memory_after_release: int,
+    ) -> None:
+        if memory_before_release <= memory_before_load or memory_after_release < memory_before_release:
+            return
+        raise AssertionError(
+            "Reference module memory was not released before V2 load: "
+            f"before_load={memory_before_load}, before_release={memory_before_release}, "
+            f"after_release={memory_after_release}."
+        )
+
+
+@dataclass(frozen=True)
+class _HfModuleCapturePayload:
+    run_output: ReferenceRunResult
+    memory_before_release: int
 
 
 # Reference cleanup helpers ----------------------------------------------------
@@ -319,68 +409,6 @@ def _canonical_with_observations(
         if observed:
             values[field] = observed
     return values
-
-
-# Capture materialization helpers ---------------------------------------------
-
-
-def _capture_extractors(
-    context: ReferenceCaptureContext,
-    plan: ReferenceCapturePlan,
-    *,
-    observations: dict[str, list[Any]],
-    max_tensor_numel: int,
-) -> None:
-    for tap in plan.extractor_taps:
-        value = materialize_reference_value(
-            tap.extractor(context),
-            max_tensor_numel=max_tensor_numel,
-            field_path=tap.name,
-        )
-        values = value if isinstance(value, list) else [value]
-        observations.setdefault(tap.name, []).extend(values)
-
-
-def _materialize_observations(
-    observations: Mapping[str, list[Any]],
-    *,
-    max_tensor_numel: int,
-) -> dict[str, list[Any]]:
-    materialized: dict[str, list[Any]] = {}
-    for name, values in observations.items():
-        value_list = values if isinstance(values, list) else [values]
-        materialized[str(name)] = [
-            materialize_reference_value(
-                value,
-                max_tensor_numel=max_tensor_numel,
-                field_path=str(name),
-            )
-            for value in value_list
-        ]
-    return materialized
-
-
-def _selected_field_observations(
-    observations: Mapping[str, list[Any]],
-    plan: ReferenceCapturePlan,
-) -> Mapping[str, list[Any]]:
-    if not plan.field_taps:
-        return observations
-    selected = {tap.name for tap in plan.field_taps}
-    return {name: values for name, values in observations.items() if name in selected}
-
-
-# Runtime option helpers -------------------------------------------------------
-
-
-def _max_tensor_numel(options: Mapping[str, Any] | None) -> int:
-    if not options:
-        return 1_000_000
-    return int(options.get("max_tensor_numel", 1_000_000))
-
-
-def _run_options(case: Any) -> Mapping[str, Any] | None:
-    return getattr(getattr(case, "run", None), "options", None)
 
 
 def _requested_fields(plan: ReferenceCapturePlan) -> frozenset[str]:

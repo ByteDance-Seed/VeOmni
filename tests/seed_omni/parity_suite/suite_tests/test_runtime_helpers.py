@@ -8,6 +8,7 @@ from torch import nn
 
 from tests.seed_omni.parity_suite.core.runtime import (
     resolve_torch_dtype,
+    run_capture_context,
     sample_grad,
     sample_named_param,
     sample_tensor,
@@ -33,6 +34,16 @@ def test_resolve_torch_dtype_accepts_known_aliases() -> None:
 def test_resolve_torch_dtype_rejects_unknown_string() -> None:
     with pytest.raises(ValueError, match="Unsupported reference dtype"):
         resolve_torch_dtype("fp8")
+
+
+def test_run_capture_context_defaults_capture_budget() -> None:
+    with run_capture_context({}) as options:
+        assert options.max_tensor_numel == 1_000_000
+
+
+def test_run_capture_context_reads_capture_budget_from_run_options() -> None:
+    with run_capture_context({"max_tensor_numel": 12}) as options:
+        assert options.max_tensor_numel == 12
 
 
 def test_sample_tensor_slices_without_rows() -> None:

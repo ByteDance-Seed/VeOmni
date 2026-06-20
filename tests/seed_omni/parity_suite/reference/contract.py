@@ -9,7 +9,8 @@ from typing import Any, Protocol
 import torch
 from torch import nn
 
-from tests.seed_omni.parity_suite.reference.capture import ReferenceCapturePlan
+from tests.seed_omni.parity_suite.core.runtime import RunCaptureOptions
+from tests.seed_omni.parity_suite.reference.capture.spec import ReferenceCapturePlan
 
 
 # Runtime value contract -------------------------------------------------------
@@ -47,6 +48,7 @@ class ReferenceOracle(Protocol):
         plan: ReferenceCapturePlan,
         device: torch.device,
         dtype: torch.dtype,
+        capture_options: RunCaptureOptions,
     ) -> ReferenceCaptureResult:
         """Run reference execution and return canonical observations."""
 

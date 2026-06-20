@@ -1,3 +1,0 @@
-# DAG: MoT hidden states -> flow connector velocity projection/loss.
-training_graph:
-  - { from: bagel_flow_connector.decode_velocity, to: end }

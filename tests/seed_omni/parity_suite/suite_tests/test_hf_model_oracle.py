@@ -10,17 +10,23 @@ import pytest
 import torch
 from torch import nn
 
-from tests.seed_omni.parity_suite.reference.capture import (
+from tests.seed_omni.parity_suite.core import RunCaptureOptions
+from tests.seed_omni.parity_suite.reference.capture.observation_adapter import (
+    MethodPatchObservationAdapter,
+    ReferenceObservationAdapter,
+)
+from tests.seed_omni.parity_suite.reference.capture.spec import (
     ExtractorTap,
     HookTap,
-    MethodPatchObservationCapture,
     ReferenceCaptureContext,
     ReferenceCapturePlan,
-    ReferenceObservationCapture,
 )
 from tests.seed_omni.parity_suite.reference.contract import ReferenceRunResult
-from tests.seed_omni.parity_suite.reference.oracles import HfModelReferenceOracle
-from tests.seed_omni.parity_suite.reference.oracles.hf_model import HfModelSubject, reference_options
+from tests.seed_omni.parity_suite.reference.oracles.hf_model import (
+    HfModelReferenceOracle,
+    HfModelSubject,
+    reference_options,
+)
 
 
 class _TinyReferenceRoot(nn.Module):
@@ -45,9 +51,9 @@ class _TinyFullSubject(HfModelSubject):
         inputs: Mapping[str, Any],
         context: ReferenceCaptureContext,
         *,
-        capture: ReferenceObservationCapture,
+        observation_adapter: ReferenceObservationAdapter,
     ) -> ReferenceRunResult:
-        del capture
+        del observation_adapter
         hidden = self.root.encoder(inputs["x"])
         context.record_extra("extra", hidden + 1)
         return ReferenceRunResult(
@@ -88,40 +94,40 @@ class _ComposedReferenceSubject(HfModelSubject):
         )
 
 
-class _MethodPatchCapture(MethodPatchObservationCapture):
+class _MethodPatchAdapter(MethodPatchObservationAdapter):
     def configure(self, subject: Any) -> None:
-        def scale_capture(original: Any):
+        def scale_adapter(original: Any):
             def wrapper(value: torch.Tensor) -> torch.Tensor:
                 self.record("captured_input", value)
                 return original(value) + 1
 
             return wrapper
 
-        self.patch_method(subject, "scale", scale_capture)
+        self.patch_method(subject, "scale", scale_adapter)
 
 
-class _CaptureSubject(_TinyFullSubject):
+class _AdapterSubject(_TinyFullSubject):
     def scale(self, value: torch.Tensor) -> torch.Tensor:
         return value * 2
 
-    def reference_observation_capture(
+    def reference_observation_adapter(
         self,
         kind: str | None,
         inputs: Mapping[str, Any],
         context: ReferenceCaptureContext,
         options: Mapping[str, Any],
-    ) -> _MethodPatchCapture:
+    ) -> _MethodPatchAdapter:
         del kind, inputs, context, options
-        return _MethodPatchCapture()
+        return _MethodPatchAdapter()
 
     def run_reference_train_forward(
         self,
         inputs: Mapping[str, Any],
         context: ReferenceCaptureContext,
         *,
-        capture: ReferenceObservationCapture,
+        observation_adapter: ReferenceObservationAdapter,
     ) -> ReferenceRunResult:
-        del capture
+        del observation_adapter
         hidden = self.scale(inputs["x"])
         return ReferenceRunResult(
             canonical={"x": inputs["x"]},
@@ -144,6 +150,7 @@ def test_hf_model_oracle_combines_fields_hooks_and_extractors(monkeypatch: Any) 
         ),
         device=torch.device("cpu"),
         dtype=torch.float32,
+        capture_options=RunCaptureOptions(),
     )
 
     assert torch.equal(result.observations["field_hidden"][0], torch.tensor([[8.0]]))
@@ -163,6 +170,7 @@ def test_hf_model_oracle_runs_composed_subject_on_hook_root(monkeypatch: Any) ->
         plan=ReferenceCapturePlan(hook_taps=(HookTap(name="hook_hidden", module_path="encoder"),)),
         device=torch.device("cpu"),
         dtype=torch.float32,
+        capture_options=RunCaptureOptions(),
     )
 
     assert torch.equal(result.observations["field_hidden"][0], torch.tensor([[8.0]]))
@@ -170,7 +178,7 @@ def test_hf_model_oracle_runs_composed_subject_on_hook_root(monkeypatch: Any) ->
 
 
 def test_hf_model_subject_merges_capture_observations_and_restores_patch() -> None:
-    subject = _CaptureSubject(_case())
+    subject = _AdapterSubject(_case())
     context = ReferenceCaptureContext(ref_model=subject.hook_root, inputs={}, hook_taps={})
 
     result = subject.run_reference("train_forward", {"x": torch.tensor([[3.0]])}, context, {})

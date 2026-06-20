@@ -7,7 +7,8 @@ from typing import Any
 
 from tests.seed_omni.parity_suite.core import ParityCase, ParityReport
 from tests.seed_omni.parity_suite.core.stimulus import conversation_stimulus_to_batched_specs
-from tests.seed_omni.parity_suite.reference import ReferenceOracle, build_reference_oracle
+from tests.seed_omni.parity_suite.reference.contract import ReferenceOracle
+from tests.seed_omni.parity_suite.reference.oracles.factory import build_reference_oracle
 
 
 class ReferenceMixin:

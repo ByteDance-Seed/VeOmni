@@ -8,7 +8,7 @@ from typing import Any
 import torch
 from torch import nn
 
-from tests.seed_omni.parity_suite.reference.capture import ReferenceCaptureContext
+from tests.seed_omni.parity_suite.reference.capture.spec import ReferenceCaptureContext
 from tests.seed_omni.parity_suite.reference.contract import ReferenceRunResult
 
 

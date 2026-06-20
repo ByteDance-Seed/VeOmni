@@ -1,4 +1,10 @@
-"""Subject-owned reference observation capture helpers."""
+"""Subject-owned reference observation adapters.
+
+These classes are not the outer oracle capture pass. They are optional adapters
+that a reference subject can install around its own methods to record values
+that are easier to observe inside the official implementation than through a
+generic field, hook, or extractor tap.
+"""
 
 from __future__ import annotations
 
@@ -8,11 +14,11 @@ from dataclasses import dataclass
 from typing import Any
 
 
-# Base capture -----------------------------------------------------------------
+# Base adapter -----------------------------------------------------------------
 
 
 @dataclass(frozen=True)
-class ReferenceStopPolicy:
+class ReferenceObservationAdapterStopPolicy:
     """Stop reference execution once selected observation fields are captured."""
 
     fields: frozenset[str] = frozenset()
@@ -20,26 +26,26 @@ class ReferenceStopPolicy:
 
     def __post_init__(self) -> None:
         if self.mode not in {"all", "any"}:
-            raise ValueError(f"ReferenceStopPolicy.mode must be 'all' or 'any', got {self.mode!r}.")
+            raise ValueError(f"ReferenceObservationAdapterStopPolicy.mode must be 'all' or 'any', got {self.mode!r}.")
 
 
-class ReferenceObservationSatisfied(Exception):
-    """Raised when a reference capture has observed enough fields."""
+class ReferenceObservationAdapterSatisfied(Exception):
+    """Raised when a reference observation adapter has observed enough fields."""
 
     def __init__(self, observations: Mapping[str, list[Any]]) -> None:
         super().__init__("Reference observation stop policy was satisfied.")
         self.observations = {name: list(values) for name, values in observations.items()}
 
 
-class ReferenceObservationCapture:
-    """Base class for reference subjects that need capture around their run path."""
+class ReferenceObservationAdapter:
+    """Subject-owned adapter that records observations while the reference runs."""
 
-    def __init__(self, stop_policy: ReferenceStopPolicy | None = None) -> None:
+    def __init__(self, stop_policy: ReferenceObservationAdapterStopPolicy | None = None) -> None:
         self._observations: dict[str, list[Any]] = {}
-        self._stop_policy = stop_policy or ReferenceStopPolicy()
+        self._stop_policy = stop_policy or ReferenceObservationAdapterStopPolicy()
 
     @contextmanager
-    def install(self, subject: Any) -> Iterator[ReferenceObservationCapture]:
+    def install(self, subject: Any) -> Iterator[ReferenceObservationAdapter]:
         del subject
         yield self
 
@@ -49,13 +55,13 @@ class ReferenceObservationCapture:
     def record(self, name: str, value: Any) -> None:
         self._observations.setdefault(name, []).append(value)
         if self._stop_policy_satisfied():
-            raise ReferenceObservationSatisfied(self._observations)
+            raise ReferenceObservationAdapterSatisfied(self._observations)
 
     def observations(self) -> Mapping[str, list[Any]]:
         return self._observations
 
     @property
-    def stop_policy(self) -> ReferenceStopPolicy:
+    def stop_policy(self) -> ReferenceObservationAdapterStopPolicy:
         return self._stop_policy
 
     def _stop_policy_satisfied(self) -> bool:
@@ -69,36 +75,36 @@ class ReferenceObservationCapture:
 
 
 @contextmanager
-def reference_observation_stop_policy(
-    capture: ReferenceObservationCapture,
-    stop_policy: ReferenceStopPolicy,
-) -> Iterator[ReferenceObservationCapture]:
-    """Temporarily apply an early-stop policy to an existing capture object."""
+def reference_observation_adapter_stop_policy(
+    adapter: ReferenceObservationAdapter,
+    stop_policy: ReferenceObservationAdapterStopPolicy,
+) -> Iterator[ReferenceObservationAdapter]:
+    """Temporarily apply an early-stop policy to an existing adapter."""
 
-    original = capture._stop_policy
-    capture._stop_policy = stop_policy
+    original = adapter._stop_policy
+    adapter._stop_policy = stop_policy
     try:
-        yield capture
+        yield adapter
     finally:
-        capture._stop_policy = original
+        adapter._stop_policy = original
 
 
-class NullReferenceObservationCapture(ReferenceObservationCapture):
-    """No-op capture used by subjects that only return explicit observations."""
+class NullReferenceObservationAdapter(ReferenceObservationAdapter):
+    """No-op adapter used by subjects that only return explicit observations."""
 
 
 # Method wrapping --------------------------------------------------------------
 
 
-class MethodPatchObservationCapture(ReferenceObservationCapture):
-    """Reference capture helper that temporarily wraps subject methods."""
+class MethodPatchObservationAdapter(ReferenceObservationAdapter):
+    """Observation adapter that temporarily wraps subject methods."""
 
-    def __init__(self, stop_policy: ReferenceStopPolicy | None = None) -> None:
+    def __init__(self, stop_policy: ReferenceObservationAdapterStopPolicy | None = None) -> None:
         super().__init__(stop_policy=stop_policy)
         self._patches: list[tuple[Any, str, Any]] = []
 
     @contextmanager
-    def install(self, subject: Any) -> Iterator[MethodPatchObservationCapture]:
+    def install(self, subject: Any) -> Iterator[MethodPatchObservationAdapter]:
         self._patches = []
         try:
             self.configure(subject)
@@ -118,10 +124,10 @@ class MethodPatchObservationCapture(ReferenceObservationCapture):
 
 
 __all__ = [
-    "MethodPatchObservationCapture",
-    "NullReferenceObservationCapture",
-    "ReferenceObservationSatisfied",
-    "ReferenceObservationCapture",
-    "ReferenceStopPolicy",
-    "reference_observation_stop_policy",
+    "MethodPatchObservationAdapter",
+    "NullReferenceObservationAdapter",
+    "ReferenceObservationAdapterSatisfied",
+    "ReferenceObservationAdapter",
+    "ReferenceObservationAdapterStopPolicy",
+    "reference_observation_adapter_stop_policy",
 ]

@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 from collections.abc import Iterable, Mapping
 from contextlib import contextmanager, nullcontext
+from dataclasses import dataclass
 from typing import Any, Iterator
 
 import torch
@@ -27,6 +28,85 @@ def configure_torch_determinism(seed: int, *, strict: bool = False) -> None:
     torch.backends.cudnn.deterministic = True
     torch.use_deterministic_algorithms(True, warn_only=not strict)
     torch.set_float32_matmul_precision("highest")
+
+
+@dataclass(frozen=True)
+class RunCaptureOptions:
+    max_tensor_numel: int = 1_000_000
+
+
+@contextmanager
+def run_runtime_context(
+    run_options: Mapping[str, Any] | None,
+    *,
+    sdpa_kernel_modules: Iterable[Any] = (),
+) -> Iterator[None]:
+    """Apply opt-in runtime settings for one parity run."""
+
+    options = _runtime_options(run_options)
+    if not options["deterministic_sdpa"]:
+        yield
+        return
+    with _deterministic_sdpa_context(sdpa_kernel_modules=sdpa_kernel_modules):
+        yield
+
+
+@contextmanager
+def run_capture_context(run_options: Mapping[str, Any] | None) -> Iterator[RunCaptureOptions]:
+    """Resolve observation/capture settings for one parity run."""
+
+    yield _capture_options(run_options)
+
+
+def _runtime_options(run_options: Mapping[str, Any] | None) -> dict[str, Any]:
+    raw = run_options or {}
+    if not isinstance(raw, Mapping):
+        raise TypeError("run.options must be a mapping.")
+    return {
+        "deterministic_sdpa": bool(raw.get("deterministic_sdpa", False)),
+    }
+
+
+def _capture_options(run_options: Mapping[str, Any] | None) -> RunCaptureOptions:
+    raw = run_options or {}
+    if not isinstance(raw, Mapping):
+        raise TypeError("run.options must be a mapping.")
+    return RunCaptureOptions(max_tensor_numel=int(raw.get("max_tensor_numel", 1_000_000)))
+
+
+@contextmanager
+def _deterministic_sdpa_context(*, sdpa_kernel_modules: Iterable[Any]) -> Iterator[None]:
+    from torch.nn.attention import SDPBackend, sdpa_kernel
+
+    def math_sdpa_kernel(*args: Any, **kwargs: Any):
+        del args, kwargs
+        return sdpa_kernel(backends=[SDPBackend.MATH])
+
+    modules = tuple(sdpa_kernel_modules)
+    originals = tuple((module, module.sdpa_kernel) for module in modules if hasattr(module, "sdpa_kernel"))
+    cuda_state: tuple[bool, bool, bool] | None = None
+    if torch.cuda.is_available():
+        cuda_state = (
+            torch.backends.cuda.flash_sdp_enabled(),
+            torch.backends.cuda.mem_efficient_sdp_enabled(),
+            torch.backends.cuda.math_sdp_enabled(),
+        )
+    try:
+        if torch.cuda.is_available():
+            torch.backends.cuda.enable_flash_sdp(False)
+            torch.backends.cuda.enable_mem_efficient_sdp(False)
+            torch.backends.cuda.enable_math_sdp(True)
+        for module, _original in originals:
+            module.sdpa_kernel = math_sdpa_kernel
+        yield
+    finally:
+        for module, original in originals:
+            module.sdpa_kernel = original
+        if cuda_state is not None:
+            flash, mem_efficient, math = cuda_state
+            torch.backends.cuda.enable_flash_sdp(flash)
+            torch.backends.cuda.enable_mem_efficient_sdp(mem_efficient)
+            torch.backends.cuda.enable_math_sdp(math)
 
 
 # Device and dtype helpers -----------------------------------------------------
@@ -143,10 +223,13 @@ def patched_randn_like(fixed_noise: torch.Tensor) -> Iterator[None]:
 
 
 __all__ = [
+    "RunCaptureOptions",
     "autocast_for_dtype",
     "configure_torch_determinism",
     "patched_randn_like",
     "resolve_torch_dtype",
+    "run_capture_context",
+    "run_runtime_context",
     "sample_grad",
     "sample_named_grad",
     "sample_named_param",

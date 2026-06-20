@@ -9,18 +9,20 @@ from typing import Any
 import torch
 from torch import nn
 
-from tests.seed_omni.parity_suite.reference.capture import (
+from tests.seed_omni.parity_suite.core import RunCaptureOptions
+from tests.seed_omni.parity_suite.reference.capture.spec import (
     ExtractorTap,
     HookTap,
     ReferenceCaptureContext,
     ReferenceCapturePlan,
 )
 from tests.seed_omni.parity_suite.reference.contract import ReferenceRunResult
-from tests.seed_omni.parity_suite.reference.oracles import (
-    HfModuleReferenceOracle,
-)
 from tests.seed_omni.parity_suite.reference.oracles.hf_model import HfModelSubject
-from tests.seed_omni.parity_suite.reference.oracles.hf_module import HfModuleLoadRequest, HfModuleSubject
+from tests.seed_omni.parity_suite.reference.oracles.hf_module import (
+    HfModuleLoadRequest,
+    HfModuleReferenceOracle,
+    HfModuleSubject,
+)
 
 
 EVENTS: list[tuple[str, Any]] = []
@@ -96,6 +98,7 @@ def test_hf_module_oracle_reuses_hf_model_subject(monkeypatch: Any) -> None:
         plan=ReferenceCapturePlan(),
         device=torch.device("cpu"),
         dtype=torch.float32,
+        capture_options=RunCaptureOptions(),
     )
 
     assert result.run_output.canonical["x"].shape == (1, 1)
@@ -121,6 +124,7 @@ def test_hf_module_oracle_captures_hook_and_extractor_taps(monkeypatch: Any) -> 
         ),
         device=torch.device("cpu"),
         dtype=torch.float32,
+        capture_options=RunCaptureOptions(),
     )
 
     assert torch.equal(result.observations["hook_hidden"][0], torch.tensor([[14.0]]))

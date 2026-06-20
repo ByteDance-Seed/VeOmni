@@ -7,7 +7,7 @@ import torch
 from torch import nn
 
 from tests.seed_omni.parity_suite.core import PARITY_ENABLE_ENV, ProbeMapping, RefTapSpec, v2_probe_values
-from tests.seed_omni.parity_suite.v2 import (
+from tests.seed_omni.parity_suite.v2.observation import (
     arm_generation_observer,
     capture_forward_outputs,
     record_conversation_output,

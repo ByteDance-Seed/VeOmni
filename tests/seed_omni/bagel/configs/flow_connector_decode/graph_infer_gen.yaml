@@ -1,9 +1,0 @@
-generation_graph:
-  initial: velocity_collect
-
-  states:
-    velocity_collect:
-      body:
-        - { from: bagel_flow_connector.decode_velocity, to: end }
-      transitions:
-        - { condition: { type: default }, next_state: done }

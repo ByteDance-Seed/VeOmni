@@ -5,12 +5,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from tests.seed_omni.parity_suite.reference.capture import (
-    ReferenceCaptureContext,
-    ReferenceObservationSatisfied,
-    ReferenceStopPolicy,
-    reference_observation_stop_policy,
+from tests.seed_omni.parity_suite.reference.capture.observation_adapter import (
+    ReferenceObservationAdapterSatisfied,
+    ReferenceObservationAdapterStopPolicy,
+    reference_observation_adapter_stop_policy,
 )
+from tests.seed_omni.parity_suite.reference.capture.spec import ReferenceCaptureContext
 from tests.seed_omni.parity_suite.reference.contract import (
     ReferenceRunResult,
     merge_reference_observations,
@@ -28,7 +28,7 @@ class BagelModuleProfile:
 
     assembly_plan: BagelAssemblyPlan
     observation_fields: tuple[str, ...]
-    stop_policy: ReferenceStopPolicy
+    stop_policy: ReferenceObservationAdapterStopPolicy
 
 
 class BagelModuleSubject(HfModuleSubject):
@@ -89,7 +89,7 @@ class BagelModuleSubject(HfModuleSubject):
         return BagelModuleProfile(
             assembly_plan=_module_assembly_plan(request.module_name, observation_fields),
             observation_fields=observation_fields,
-            stop_policy=ReferenceStopPolicy(fields=frozenset(observation_fields)),
+            stop_policy=ReferenceObservationAdapterStopPolicy(fields=frozenset(observation_fields)),
         )
 
     def run_reference(self, kind, inputs, context, options):
@@ -97,7 +97,7 @@ class BagelModuleSubject(HfModuleSubject):
             return super().run_reference(kind, inputs, context, options)
         try:
             result = self._run_model_subject_with_stop_policy(kind, inputs, context, options)
-        except ReferenceObservationSatisfied as exc:
+        except ReferenceObservationAdapterSatisfied as exc:
             result = ReferenceRunResult(
                 canonical={"conversation_list": inputs["conversation_list"]},
                 observations=exc.observations,
@@ -120,11 +120,14 @@ class BagelModuleSubject(HfModuleSubject):
                 f"{type(self.model_subject).__name__} does not implement reference kind {kind!r}."
             )
 
-        capture = self.model_subject.reference_observation_capture(kind, inputs, context, options)
-        with reference_observation_stop_policy(capture, self.profile.stop_policy):
-            with capture.install(self.model_subject):
-                result = normalize_reference_run_result(_call_reference_method(method, inputs, context, capture))
-        return merge_reference_observations(result, capture.observations())
+        observation_adapter = self.model_subject.reference_observation_adapter(kind, inputs, context, options)
+        with reference_observation_adapter_stop_policy(observation_adapter, self.profile.stop_policy):
+            with observation_adapter.install(self.model_subject):
+                result = normalize_reference_run_result(
+                    _call_reference_method(method, inputs, context, observation_adapter)
+                )
+
+        return merge_reference_observations(result, observation_adapter.observations())
 
     def reference_observation_fields(self, kind: str | None) -> tuple[str, ...] | None:
         if self.profile is not None:
@@ -134,9 +137,6 @@ class BagelModuleSubject(HfModuleSubject):
 
     def canonical_observation_fields(self, kind: str | None) -> tuple[str, ...]:
         del kind
-        if self.profile is not None and self.module_name == "flow_connector_decode":
-            if "denoise_hidden" in self.profile.observation_fields:
-                return ("denoise_hidden",)
         return ()
 
 
@@ -164,8 +164,6 @@ def _module_observation_fields(request: HfModuleLoadRequest) -> tuple[str, ...]:
     if not supported:
         return ()
     fields = request.requested_fields & supported
-    if request.module_name == "flow_connector_decode" and "velocity" in fields:
-        fields = fields | frozenset({"denoise_hidden"})
     return tuple(field for field in _BAGEL_OBSERVATION_ORDER if field in fields)
 
 
@@ -176,7 +174,7 @@ def _supported_fields_for_module(module_name: str) -> frozenset[str]:
         return _VISUAL_UND_FIELDS
     if module_name == "qwen2_mot":
         return _LANGUAGE_MODEL_FIELDS
-    if module_name in {"flow_connector", "flow_connector_decode"}:
+    if module_name == "flow_connector":
         return _FLOW_FIELDS | frozenset({"latent_query", "denoise_hidden", "timestep"})
     if module_name == "vae":
         return _VAE_FIELDS
@@ -188,7 +186,7 @@ def _module_assembly_plan(module_name: str, observation_fields: tuple[str, ...])
     return BagelAssemblyPlan.lazy(
         visual_und=bool(fields & _VISUAL_UND_FIELDS),
         language_model=bool(fields & _LANGUAGE_MODEL_FIELDS),
-        flow=module_name in {"flow_connector", "flow_connector_decode"} or bool(fields & _FLOW_PATH_FIELDS),
+        flow=module_name == "flow_connector" or bool(fields & _FLOW_PATH_FIELDS),
         ae=module_name == "vae" or bool(fields & _VAE_FIELDS),
         visual_gen=bool(fields & _GEN_FIELDS),
     )

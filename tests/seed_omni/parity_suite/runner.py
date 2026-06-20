@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import importlib
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from typing import Any
 
@@ -16,19 +16,37 @@ from tests.seed_omni.parity_suite.core import (
     compare_values,
     reference_probe_values,
     resolve_probes,
+    run_capture_context,
+    run_runtime_context,
     tolerance_from_policy,
     v2_probe_values,
 )
 from tests.seed_omni.parity_suite.driver import ParityDriver
-from tests.seed_omni.parity_suite.reference.capture import build_reference_capture_plan
+from tests.seed_omni.parity_suite.reference.capture.spec import build_reference_capture_plan
+from tests.seed_omni.parity_suite.v2.tier_runners.framework import (
+    run_v2_infer_framework,
+    run_v2_train_framework,
+)
+from tests.seed_omni.parity_suite.v2.tier_runners.graph import run_v2_infer_graph, run_v2_train_graph
+from tests.seed_omni.parity_suite.v2.tier_runners.module import run_v2_infer_module
 
 
-_V2_DISPATCH: dict[tuple[str, str], str] = {
-    ("training", "graph"): "run_v2_train_graph_recipe",
-    ("training", "framework"): "run_v2_train_framework_recipe",
-    ("inference", "graph"): "run_v2_infer_graph_recipe",
-    ("inference", "module"): "run_v2_infer_module_recipe",
-    ("inference", "framework"): "run_v2_infer_framework_recipe",
+V2TierRunner = Callable[
+    [
+        ParityDriver,
+        Any,
+        dict[tuple[str, str], frozenset[str]],
+    ],
+    dict[str, Any] | ParityReport,
+]
+
+
+_V2_DISPATCH: dict[tuple[str, str], V2TierRunner] = {
+    ("training", "graph"): run_v2_train_graph,
+    ("training", "framework"): run_v2_train_framework,
+    ("inference", "graph"): run_v2_infer_graph,
+    ("inference", "module"): run_v2_infer_module,
+    ("inference", "framework"): run_v2_infer_framework,
 }
 
 
@@ -55,12 +73,20 @@ def run_parity_case(case: ParityCase) -> ParityReport:
     reference_output = None
     if case.effective_gate.requires_reference_capture:
         driver.configure_determinism(case.model.seed)
-        with _reference_grad_context(case):
+        with (
+            _reference_grad_context(case),
+            run_runtime_context(
+                case.run.options,
+                sdpa_kernel_modules=driver.runtime_sdpa_kernel_modules(),
+            ),
+            run_capture_context(case.run.options) as capture_options,
+        ):
             reference = driver.reference_oracle().capture(
                 inputs=driver.reference_inputs(),
                 plan=reference_plan,
                 device=device,
                 dtype=dtype,
+                capture_options=capture_options,
             )
         reference_output = reference.run_output
 
@@ -120,10 +146,24 @@ def _run_v2(
     device: torch.device,
     dtype: torch.dtype,
 ) -> dict[str, Any] | ParityReport:
-    method_name = _V2_DISPATCH.get((case.graph.domain, case.tier))
-    if method_name is None:
+    runner = _V2_DISPATCH.get((case.graph.domain, case.tier))
+    if runner is None:
         raise NotImplementedError(f"Unsupported V2 dispatch for domain={case.graph.domain!r}, tier={case.tier!r}.")
-    return getattr(driver, method_name)(reference_output, v2_whitelist, device=device, dtype=dtype)
+    with (
+        run_runtime_context(
+            case.run.options,
+            sdpa_kernel_modules=driver.runtime_sdpa_kernel_modules(),
+        ),
+        run_capture_context(case.run.options) as capture_options,
+    ):
+        return runner(
+            driver,
+            reference_output,
+            v2_whitelist,
+            device=device,
+            dtype=dtype,
+            capture_options=capture_options,
+        )
 
 
 __all__ = ["run_parity_case"]

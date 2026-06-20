@@ -2,11 +2,10 @@
 
 from .framework import run_v2_infer_framework, run_v2_train_framework
 from .graph import run_v2_infer_graph, run_v2_train_graph
-from .module import InferModulePolicy, run_v2_infer_module
+from .module import run_v2_infer_module
 
 
 __all__ = [
-    "InferModulePolicy",
     "run_v2_infer_framework",
     "run_v2_infer_graph",
     "run_v2_infer_module",

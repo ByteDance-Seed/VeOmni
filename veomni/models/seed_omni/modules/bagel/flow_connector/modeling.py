@@ -43,7 +43,7 @@ class TimestepEmbedder(nn.Module):
 
     def forward(self, t: torch.Tensor) -> torch.Tensor:
         t_freq = self.timestep_embedding(t, self.frequency_embedding_size)
-        return self.mlp(t_freq.to(device=self.mlp[0].weight.device, dtype=self.mlp[0].weight.dtype))
+        return self.mlp(t_freq.to(device=self.mlp[0].weight.device))
 
 
 class PositionEmbedding(nn.Module):
@@ -157,7 +157,7 @@ class BagelFlowConnector(BagelFlowConnectorModuleMixin, PreTrainedModel):
             outputs["is_dummy"] = True
             return outputs
         weight = self.llm2vae.weight
-        hidden_states = hidden_states.to(device=weight.device, dtype=weight.dtype)
+        hidden_states = hidden_states.to(device=weight.device)
         return {"velocity": self.llm2vae(hidden_states)}
 
 

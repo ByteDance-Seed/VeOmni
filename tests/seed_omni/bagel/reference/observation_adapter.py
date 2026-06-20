@@ -1,21 +1,27 @@
-"""BAGEL-specific reference observation capture for parity tests."""
+"""BAGEL-specific reference observation adapters for parity tests."""
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
 
 import torch
 
-from tests.seed_omni.parity_suite.core import to_device
-from tests.seed_omni.parity_suite.reference.capture import MethodPatchObservationCapture
+from tests.seed_omni.parity_suite.core import sample_named_grad, to_device
+from tests.seed_omni.parity_suite.reference.capture.observation_adapter import (
+    MethodPatchObservationAdapter,
+    NullReferenceObservationAdapter,
+    ReferenceObservationAdapter,
+)
+from tests.seed_omni.parity_suite.reference.contract import normalize_reference_run_result
 
 
 if TYPE_CHECKING:
     from .hf_model import BagelHfModelReference
 
 
-class BagelInferencerObservationCapture(MethodPatchObservationCapture):
-    """Capture-only hooks for tensors produced by the vendored inferencer.
+class BagelInferencerObservationAdapter(MethodPatchObservationAdapter):
+    """Adapter hooks for tensors produced by the vendored inferencer.
 
     For ``infer_gen``, ``timestep``, ``latent_query``, and ``velocity`` are
     round-level observations captured once per official ``_forward_flow`` call.
@@ -153,8 +159,8 @@ class BagelInferencerObservationCapture(MethodPatchObservationCapture):
             self.patch_method(model, "_forward_flow", forward_flow_capture)
 
 
-class BagelTrainObservationCapture(MethodPatchObservationCapture):
-    """Capture-only hooks for official BAGEL training ``Bagel.forward``.
+class BagelTrainObservationAdapter(MethodPatchObservationAdapter):
+    """Adapter hooks for official BAGEL training ``Bagel.forward``.
 
     Training parity runs the official VAE encode followed by one packed
     ``Bagel.forward`` and ``loss.backward``. Keep this separate from inference
@@ -163,7 +169,17 @@ class BagelTrainObservationCapture(MethodPatchObservationCapture):
 
     def __init__(self) -> None:
         super().__init__()
-        for name in ("train_loss", "train_ce", "train_mse", "train_last_hidden_state", "train_velocity_pred"):
+        for name in (
+            "train_loss",
+            "train_ce",
+            "train_mse",
+            "train_last_hidden_state",
+            "train_velocity_pred",
+            "train_grad_lm_head_rows",
+            "train_grad_early_q_proj",
+            "train_grad_gen_q_proj",
+            "train_grad_llm2vae",
+        ):
             self.ensure_field(name)
 
     def configure(self, subject: BagelHfModelReference) -> None:
@@ -190,6 +206,72 @@ class BagelTrainObservationCapture(MethodPatchObservationCapture):
         self.patch_method(model.language_model, "forward", language_model_forward_capture)
         if hasattr(model, "llm2vae"):
             self.patch_method(model.llm2vae, "forward", llm2vae_forward_capture)
+        self.patch_method(subject, "run_reference_train_forward_backward", self._train_run_capture(model))
+
+    def _train_run_capture(self, model: Any):
+        def wrapper_factory(original: Any):
+            def wrapper(*args: Any, **kwargs: Any) -> Any:
+                result = normalize_reference_run_result(original(*args, **kwargs))
+                self._record_forward_backward(model=model, result=result)
+                return result
+
+            return wrapper
+
+        return wrapper_factory
+
+    def _record_forward_backward(self, *, model: Any, result: Any) -> None:
+        """Record scalar losses and selected gradients after the train backward pass."""
+
+        raw_output = result.raw_output if isinstance(result.raw_output, Mapping) else {}
+        losses = raw_output.get("losses", {})
+        if not isinstance(losses, Mapping):
+            losses = {}
+        loss = raw_output.get("loss", losses.get("loss"))
+        if torch.is_tensor(loss):
+            self.record("train_loss", loss.detach().cpu())
+        ce = losses.get("ce")
+        if torch.is_tensor(ce):
+            self.record("train_ce", ce.detach().cpu())
+        mse = losses.get("mse")
+        if torch.is_tensor(mse):
+            self.record("train_mse", mse.detach().cpu())
+
+        canonical = result.canonical if isinstance(result.canonical, Mapping) else {}
+        batch = canonical.get("train_batch", {})
+        if not isinstance(batch, Mapping):
+            batch = {}
+        labels = batch.get("packed_label_ids")
+        label_rows = torch.unique(labels.detach().cpu()).to(dtype=torch.long) if torch.is_tensor(labels) else None
+        self.record(
+            "train_grad_lm_head_rows",
+            sample_named_grad(model, "language_model.lm_head.weight", rows=label_rows),
+        )
+        self.record(
+            "train_grad_early_q_proj",
+            sample_named_grad(model, "language_model.model.layers.0.self_attn.q_proj.weight"),
+        )
+        self.record(
+            "train_grad_gen_q_proj",
+            sample_named_grad(model, "language_model.model.layers.0.self_attn.q_proj_moe_gen.weight"),
+        )
+        llm2vae = getattr(model, "llm2vae", None)
+        if llm2vae is not None and llm2vae.weight.grad is not None:
+            self.record("train_grad_llm2vae", sample_named_grad(model, "llm2vae.weight"))
 
 
-__all__ = ["BagelInferencerObservationCapture", "BagelTrainObservationCapture"]
+def bagel_reference_observation_adapter(kind: str | None) -> ReferenceObservationAdapter:
+    observation_adapter = {
+        "infer_und": BagelInferencerObservationAdapter(mode="und"),
+        "infer_gen": BagelInferencerObservationAdapter(mode="gen"),
+        "infer_edit": BagelInferencerObservationAdapter(mode="gen"),
+        "infer_interleave": BagelInferencerObservationAdapter(mode="gen"),
+        "train_forward_backward": BagelTrainObservationAdapter(),
+    }
+    return observation_adapter.get(kind, NullReferenceObservationAdapter())
+
+
+__all__ = [
+    "BagelInferencerObservationAdapter",
+    "BagelTrainObservationAdapter",
+    "bagel_reference_observation_adapter",
+]

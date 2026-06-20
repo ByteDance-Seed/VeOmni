@@ -336,7 +336,7 @@ def prepare_decode_velocity_inputs(
             raise ValueError(
                 f"BAGEL flow velocity hidden-size mismatch: got {hidden.shape[-1]}, expected {hidden_size}."
             )
-        hidden = hidden.to(device=device, dtype=dtype)
+        hidden = hidden.to(device=device)
         hidden_parts.append(hidden)
         decode_lengths.append(int(hidden.shape[0]))
         target = item.meta.get("flow_velocity_target")

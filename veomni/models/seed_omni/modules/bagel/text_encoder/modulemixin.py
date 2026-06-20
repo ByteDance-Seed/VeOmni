@@ -51,7 +51,11 @@ class BagelTextEncoderModuleMixin(TextEncoderModuleMixin):
     def tokenizer(self, tokenizer: Any) -> None:
         self._tokenizer = tokenizer
         eos_token_id = getattr(tokenizer, "eos_token_id", None)
-        self._eos_token_id = int(eos_token_id) if eos_token_id is not None else None
+        self._eos_token_id = resolve_token_id(
+            tokenizer,
+            "<|im_end|>",
+            fallback=int(eos_token_id) if eos_token_id is not None else None,
+        )
         self._start_token_id = resolve_token_id(tokenizer, "<|im_start|>", fallback=self._eos_token_id)
         self._image_start_token_id = resolve_token_id(tokenizer, "<|vision_start|>", fallback=None)
         self._image_end_token_id = resolve_token_id(tokenizer, "<|vision_end|>", fallback=None)
@@ -278,9 +282,14 @@ class BagelTextEncoderModuleMixin(TextEncoderModuleMixin):
         if self._eos_token_id is not None:
             return int(self._eos_token_id)
         eos_token_id = getattr(self._tokenizer, "eos_token_id", None)
-        if eos_token_id is None:
+        resolved = resolve_token_id(
+            self._tokenizer,
+            "<|im_end|>",
+            fallback=int(eos_token_id) if eos_token_id is not None else None,
+        )
+        if resolved is None:
             raise ValueError("Unable to resolve BAGEL EOS token id.")
-        self._eos_token_id = int(eos_token_id)
+        self._eos_token_id = int(resolved)
         return int(self._eos_token_id)
 
     def _resolve_image_start_token_id(self) -> int:

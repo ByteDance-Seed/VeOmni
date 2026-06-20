@@ -12,7 +12,7 @@ import torch
 from torch import nn
 
 from tests.seed_omni.parity_suite.reference.oracles import hf_model
-from tests.seed_omni.parity_suite.reference.oracles.hf_model import HfModelReferenceOracle, HfModelSubject
+from tests.seed_omni.parity_suite.reference.oracles.hf_model import HfModelSubject, load_hf_model_subject
 
 
 class _ReferenceSubject(HfModelSubject):
@@ -51,8 +51,8 @@ def test_hf_model_oracle_loads_subject_class(monkeypatch: Any, tmp_path: Path) -
 
     monkeypatch.setattr(hf_model.importlib, "import_module", import_module)
 
-    oracle = HfModelReferenceOracle(case=_case(checkpoint=checkpoint, load_kwargs={"local_files_only": True}))
-    subject = oracle._load(device=torch.device("cpu"), dtype=torch.float32)
+    case = _case(checkpoint=checkpoint, load_kwargs={"local_files_only": True})
+    subject = load_hf_model_subject(case=case, device=torch.device("cpu"), dtype=torch.float32)
 
     assert isinstance(subject, Reference)
     assert events == [
@@ -73,10 +73,8 @@ def test_hf_model_oracle_requires_subject_loader(monkeypatch: Any) -> None:
     module.Reference = object
     monkeypatch.setattr(hf_model.importlib, "import_module", lambda _: module)
 
-    oracle = HfModelReferenceOracle(case=_case())
-
     with pytest.raises(TypeError, match="load_reference_subject"):
-        oracle._load(device=torch.device("cpu"), dtype=torch.float32)
+        load_hf_model_subject(case=_case(), device=torch.device("cpu"), dtype=torch.float32)
 
 
 def test_hf_model_oracle_requires_subject_return(monkeypatch: Any) -> None:
@@ -90,17 +88,17 @@ def test_hf_model_oracle_requires_subject_return(monkeypatch: Any) -> None:
     module.Reference = Reference
     monkeypatch.setattr(hf_model.importlib, "import_module", lambda _: module)
 
-    oracle = HfModelReferenceOracle(case=_case())
-
     with pytest.raises(TypeError, match="HfModelSubject"):
-        oracle._load(device=torch.device("cpu"), dtype=torch.float32)
+        load_hf_model_subject(case=_case(), device=torch.device("cpu"), dtype=torch.float32)
 
 
 def test_hf_model_oracle_requires_explicit_reference_class() -> None:
-    oracle = HfModelReferenceOracle(case=_case(module="tests.fake_reference_subject"))
-
     with pytest.raises(ValueError, match="module.path:ClassName"):
-        oracle._load(device=torch.device("cpu"), dtype=torch.float32)
+        load_hf_model_subject(
+            case=_case(module="tests.fake_reference_subject"),
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+        )
 
 
 def _case(

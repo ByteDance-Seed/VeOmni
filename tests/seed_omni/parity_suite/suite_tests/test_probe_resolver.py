@@ -8,7 +8,7 @@ import pytest
 import torch
 
 from tests.seed_omni.parity_suite.core import NodeSpec, ProbeCatalog, load_probe_catalog, resolve_probes
-from tests.seed_omni.parity_suite.reference.capture import ReferenceCaptureContext, build_reference_capture_plan
+from tests.seed_omni.parity_suite.reference.capture.spec import ReferenceCaptureContext, build_reference_capture_plan
 
 
 def test_probes_yaml_parses_hook_and_extractor_taps(tmp_path: Path) -> None:
