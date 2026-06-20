@@ -10,7 +10,7 @@ from ....conversation import ConversationItem
 from ....module import ModuleMixin, post_forward, pre_forward
 from ....tracemixin import TraceMixin
 from .configuration import BagelSiglipNavitConfig
-from .processing import image_items, prepare_image_batch, scatter_image_embeds, user_raw_image_items
+from .processing import prepare_image_batch, scatter_image_embeds, user_raw_image_items
 
 
 class BagelSiglipNavitModuleMixin(ModuleMixin):
@@ -29,7 +29,10 @@ class BagelSiglipNavitModuleMixin(ModuleMixin):
     ) -> dict[str, Any]:
         del kwargs
         self._conversation_carrier = conversation_list
-        self._image_items = image_items(conversation_list)
+        self._image_items = user_raw_image_items(
+            conversation_list or [],
+            output_size=int(self.config.output_size),
+        )
         self._image_token_lens = None
         if not self._image_items:
             return {"patchified_pixel_values": None}

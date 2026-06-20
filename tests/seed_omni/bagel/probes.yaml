@@ -204,3 +204,14 @@ train.grad_llm2vae:
   ref:
     field: train_grad_llm2vae
   tol: gradient
+
+train.grad_siglip_q_proj:
+  v2:
+    node: bagel_siglip_navit.forward
+    state: train
+    field: train_grad_siglip_q_proj
+    grad:
+      parameter: vision_model.encoder.layers.0.self_attn.q_proj.weight
+  ref:
+    field: train_grad_siglip_q_proj
+  tol: gradient

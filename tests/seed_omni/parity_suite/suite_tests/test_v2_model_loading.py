@@ -11,6 +11,7 @@ import torch
 from tests.seed_omni.parity_suite.core import NodeSpec
 from tests.seed_omni.parity_suite.core.config.discovery import discover_cases
 from tests.seed_omni.parity_suite.v2.model import (
+    apply_v2_module_override,
     graph_active_module_names,
     load_graph_active_omni_config,
     load_graph_active_omni_modules,
@@ -190,6 +191,16 @@ def test_v2_module_override_target_can_change_device_and_dtype() -> None:
 
     assert device == torch.device("cpu")
     assert dtype == torch.float32
+
+
+def test_v2_module_override_can_patch_module_config() -> None:
+    module = torch.nn.Identity()
+    module.config = SimpleNamespace(min_image_size=512, max_image_size=1024)
+
+    apply_v2_module_override(module, {"config": {"min_image_size": 32, "max_image_size": 32}})
+
+    assert module.config.min_image_size == 32
+    assert module.config.max_image_size == 32
 
 
 def test_v2_module_override_map_rejects_invalid_shape() -> None:

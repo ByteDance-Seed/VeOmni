@@ -222,8 +222,8 @@ def prepare_embed_latent_inputs(
             device=device,
             timestep_shift=timestep_shift,
         )
-        noised = (1.0 - timestep.reshape(-1, 1).to(device=clean.device, dtype=clean.dtype)) * clean
-        noised = noised + timestep.reshape(-1, 1).to(device=clean.device, dtype=clean.dtype) * noise
+        timestep_values = timestep.reshape(-1, 1).to(device=clean.device, dtype=torch.float32)
+        noised = (1.0 - timestep_values) * clean + timestep_values * noise
         item.meta["timestep"] = timestep.detach()
         item.meta["noise"] = noise.detach()
         item.meta["flow_velocity_target"] = (noise - clean).detach()

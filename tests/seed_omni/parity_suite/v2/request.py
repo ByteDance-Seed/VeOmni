@@ -147,12 +147,15 @@ def _materialize_value_spec(
         return _materialize_random_value(
             value, case=case, device=device, sample_index=sample_index, item_index=item_index
         )
+    if kind == "linspace":
+        return _materialize_linspace_value(value, device=device)
     if kind == "text":
         return str(value.get("text", ""))
     if kind == "image":
         return _materialize_image_value(value)
     raise ValueError(
-        f"Unsupported conversation item value kind {kind!r}; expected 'tensor', 'random', 'text', or 'image'."
+        "Unsupported conversation item value kind "
+        f"{kind!r}; expected 'tensor', 'random', 'linspace', 'text', or 'image'."
     )
 
 
@@ -204,6 +207,31 @@ def _materialize_random_value(
     return tensor.to(device=device if bool(spec.get("device", True)) else torch.device("cpu"))
 
 
+def _materialize_linspace_value(spec: Mapping[str, Any], *, device: torch.device) -> torch.Tensor:
+    if "start" not in spec or "end" not in spec:
+        raise KeyError("kind: linspace value spec must declare start and end.")
+    shape = _shape_tuple(spec["shape"]) if "shape" in spec else None
+    steps = int(spec.get("steps", _numel(shape) if shape is not None else 0))
+    if steps <= 0:
+        raise ValueError("kind: linspace value spec must declare positive steps or shape.")
+    dtype = _resolve_dtype(spec.get("dtype", "float"))
+    if dtype is not None and not dtype.is_floating_point:
+        raise TypeError(f"linspace requires a floating point dtype; got {dtype}.")
+    tensor = torch.linspace(float(spec["start"]), float(spec["end"]), steps=steps, dtype=dtype)
+    transform = spec.get("transform")
+    if transform is not None:
+        transform_name = str(transform)
+        if transform_name == "sigmoid":
+            tensor = torch.sigmoid(tensor)
+        else:
+            raise ValueError(f"Unsupported linspace transform {transform_name!r}; expected 'sigmoid'.")
+    if shape is not None:
+        if _numel(shape) != steps:
+            raise ValueError(f"kind: linspace shape {shape} contains {_numel(shape)} values, but steps={steps}.")
+        tensor = tensor.reshape(shape)
+    return tensor.to(device=device if bool(spec.get("device", True)) else torch.device("cpu"))
+
+
 def _materialize_image_value(spec: Mapping[str, Any]) -> Any:
     width = int(spec.get("width", 64))
     height = int(spec.get("height", width))
@@ -228,7 +256,9 @@ def _materialize_meta_value(value: Mapping[str, Any], *, device: torch.device) -
     kind = str(value["kind"])
     if kind == "tensor":
         return _materialize_tensor_value(value, device=device)
-    raise ValueError(f"Unsupported meta value kind {kind!r}; expected 'tensor'.")
+    if kind == "linspace":
+        return _materialize_linspace_value(value, device=device)
+    raise ValueError(f"Unsupported meta value kind {kind!r}; expected 'tensor' or 'linspace'.")
 
 
 # Internal helpers -------------------------------------------------------------
@@ -241,6 +271,15 @@ def _shape_tuple(value: Any) -> tuple[int, ...]:
     if not shape or any(dim <= 0 for dim in shape):
         raise ValueError(f"kind: random shape must contain positive dimensions; got {shape}.")
     return shape
+
+
+def _numel(shape: Sequence[int] | None) -> int:
+    if shape is None:
+        return 0
+    size = 1
+    for dim in shape:
+        size *= int(dim)
+    return size
 
 
 def _validate_sequence(value: Any, name: str) -> None:

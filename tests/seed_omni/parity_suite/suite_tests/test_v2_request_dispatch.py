@@ -321,6 +321,45 @@ def test_random_conversation_value_rejects_invalid_distribution() -> None:
         driver.v2_request_kwargs(ReferenceRunResult(canonical={}, observations={}), device=torch.device("cpu"))
 
 
+def test_linspace_conversation_meta_materializes_tensor_shape_and_transform() -> None:
+    driver = _ToyDriver(
+        _case(
+            reference={"kind": "missing_kind"},
+            stimulus={
+                "conversation_list": [
+                    {
+                        "type": "image",
+                        "value": {"kind": "image", "width": 2, "height": 2},
+                        "meta": {
+                            "noise": {
+                                "kind": "linspace",
+                                "start": -0.25,
+                                "end": 0.25,
+                                "steps": 6,
+                                "shape": [2, 3],
+                            },
+                            "timestep": {
+                                "kind": "linspace",
+                                "start": -0.5,
+                                "end": 0.5,
+                                "steps": 2,
+                                "transform": "sigmoid",
+                            },
+                        },
+                    }
+                ]
+            },
+        )
+    )
+
+    request = driver.v2_request_kwargs(ReferenceRunResult(canonical={}, observations={}), device=torch.device("cpu"))
+    item = request["conversation_list"][0][0]
+
+    assert item.meta["noise"].shape == (2, 3)
+    assert torch.equal(item.meta["noise"], torch.linspace(-0.25, 0.25, steps=6).reshape(2, 3))
+    assert torch.allclose(item.meta["timestep"], torch.sigmoid(torch.tensor([-0.5, 0.5])))
+
+
 def test_v2_request_kwargs_rejects_invalid_reference_output() -> None:
     driver = _ToyDriver(_case())
     with pytest.raises(TypeError, match="expects ReferenceRunResult"):

@@ -73,32 +73,38 @@ def load_graph_active_omni_modules(
         config = load_graph_active_omni_config(case, module_names)
         modules: dict[str, nn.Module] = {}
         for name in module_names:
+            override = overrides.get(name)
             module_device, module_dtype = v2_module_target(
-                overrides.get(name),
+                override,
                 default_device=device,
                 default_dtype=dtype,
             )
-            modules[name] = load_omni_module_from_parity_config(
+            module = load_omni_module_from_parity_config(
                 name,
                 config.modules[name],
                 seed=int(case.model.seed),
                 device=module_device,
                 dtype=module_dtype,
-            ).eval()
+            )
+            apply_v2_module_override(module, override)
+            modules[name] = module.eval()
         return modules
 
     modules = {}
     for name in module_names:
+        override = overrides.get(name)
         module_device, module_dtype = v2_module_target(
-            overrides.get(name),
+            override,
             default_device=device,
             default_dtype=dtype,
         )
-        modules[name] = load_omni_module_from_pretrained(
+        module = load_omni_module_from_pretrained(
             model_root / name,
             device=module_device,
             dtype=module_dtype,
-        ).eval()
+        )
+        apply_v2_module_override(module, override)
+        modules[name] = module.eval()
     return modules
 
 
@@ -124,6 +130,23 @@ def v2_module_target(
     raw_dtype = override.get("dtype", default_dtype)
     target_device = raw_device if isinstance(raw_device, torch.device) else torch.device(str(raw_device))
     return target_device, resolve_torch_dtype(raw_dtype)
+
+
+def apply_v2_module_override(module: nn.Module, override: Any) -> None:
+    if override is None:
+        return
+    if not isinstance(override, Mapping):
+        raise TypeError("v2_model.module_overrides.<module> must be a mapping.")
+    config_overrides = override.get("config")
+    if config_overrides is None:
+        return
+    if not isinstance(config_overrides, Mapping):
+        raise TypeError("v2_model.module_overrides.<module>.config must be a mapping.")
+    config = getattr(module, "config", None)
+    if config is None:
+        raise ValueError("v2_model.module_overrides.<module>.config requires the module to expose .config.")
+    for key, value in config_overrides.items():
+        setattr(config, str(key), value)
 
 
 def load_omni_config_from_dir(
@@ -257,6 +280,7 @@ __all__ = [
     "load_omni_config_from_dir",
     "load_omni_module_from_parity_config",
     "load_omni_module_from_pretrained",
+    "apply_v2_module_override",
     "v2_module_override_map",
     "v2_module_target",
 ]

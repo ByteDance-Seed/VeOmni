@@ -14,6 +14,9 @@ from torch import nn
 from tests.seed_omni.parity_suite.core import autocast_for_dtype, make_reference_image, patched_randn_like, to_device
 from veomni.models.seed_omni.modules.bagel.qwen2_mot.processing import prepare_attention_mask_per_sample
 
+from ..vendor.data.data_utils import get_flattened_position_ids_extrapolate, patchify
+from ..vendor.data.transforms import ImageTransform
+
 
 _TRAIN_BATCH_KEYS = {
     "sequence_length",
@@ -79,8 +82,10 @@ def build_reference_train_batch_from_stimulus(
     if tokenizer is None:
         raise ValueError("BAGEL train stimulus conversion requires the reference tokenizer.")
     mode = str(loss_mode or inputs.get("loss_mode", "ce_mse"))
-    if mode not in {"ce", "ce_mse"}:
-        raise ValueError(f"Initial BAGEL train graph parity supports loss_mode='ce' or 'ce_mse', got {mode!r}.")
+    if mode not in {"ce", "ce_mse", "text_image_ce"}:
+        raise ValueError(
+            f"Initial BAGEL train graph parity supports loss_mode='ce', 'ce_mse', or 'text_image_ce', got {mode!r}."
+        )
 
     prompt = _train_prompt_from_stimulus(inputs)
     token_ids = torch.tensor(_train_prompt_token_ids(prompt, tokenizer, new_token_ids), dtype=torch.long)
@@ -94,42 +99,45 @@ def build_reference_train_batch_from_stimulus(
     num_latent_tokens = latent_grid[0] * latent_grid[1]
     text_len = int(token_ids.numel())
     include_mse = mode == "ce_mse"
-    sequence_length = text_len + (num_latent_tokens if include_mse else 0)
+    include_vit = mode == "text_image_ce"
+    vit_tokens = _reference_vit_tokens(inputs) if include_vit else None
+    vit_len = int(vit_tokens["packed_vit_tokens"].shape[0]) if vit_tokens is not None else 0
+    sequence_length = vit_len + text_len + (num_latent_tokens if include_mse else 0)
 
-    packed_text_indexes = torch.arange(text_len, dtype=torch.long)
-    packed_vae_token_indexes = torch.arange(text_len, sequence_length, dtype=torch.long)
+    packed_text_indexes = torch.arange(vit_len, vit_len + text_len, dtype=torch.long)
+    packed_vae_token_indexes = torch.arange(vit_len + text_len, sequence_length, dtype=torch.long)
     ce_loss_indexes = torch.zeros(sequence_length, dtype=torch.bool)
     ce_loss_indexes[packed_text_indexes[:-1]] = True
+
+    split_lens = [text_len, num_latent_tokens] if include_mse else [text_len]
+    attn_modes = ["causal", "noise"] if include_mse else ["causal"]
+    position_parts = [torch.arange(text_len, dtype=torch.long)]
+    if include_vit:
+        split_lens = [vit_len, text_len]
+        attn_modes = ["full", "causal"]
+        position_parts = [
+            torch.zeros(vit_len, dtype=torch.long),
+            torch.arange(1, text_len + 1, dtype=torch.long),
+        ]
+    elif include_mse:
+        position_parts.append(torch.full((num_latent_tokens,), text_len, dtype=torch.long))
 
     batch: dict[str, Any] = {
         "sequence_length": sequence_length,
         "sample_lens": [sequence_length],
-        "split_lens": [text_len, num_latent_tokens] if include_mse else [text_len],
-        "attn_modes": ["causal", "noise"] if include_mse else ["causal"],
-        "nested_attention_masks": [
-            prepare_attention_mask_per_sample(
-                [text_len, num_latent_tokens] if include_mse else [text_len],
-                ["causal", "noise"] if include_mse else ["causal"],
-            )
-        ],
+        "split_lens": split_lens,
+        "attn_modes": attn_modes,
+        "nested_attention_masks": [prepare_attention_mask_per_sample(split_lens, attn_modes)],
         "packed_text_ids": token_ids,
         "packed_text_indexes": packed_text_indexes,
-        "packed_position_ids": (
-            torch.cat(
-                [
-                    torch.arange(text_len, dtype=torch.long),
-                    torch.full((num_latent_tokens,), text_len, dtype=torch.long),
-                ],
-                dim=0,
-            )
-            if include_mse
-            else torch.arange(text_len, dtype=torch.long)
-        ),
+        "packed_position_ids": torch.cat(position_parts, dim=0),
         "ce_loss_indexes": ce_loss_indexes,
         "packed_label_ids": token_ids[1:].clone(),
         "loss_mode": mode,
         "timestep_shift": 1.0,
     }
+    if vit_tokens is not None:
+        batch.update(vit_tokens)
     if include_mse:
         mse_loss_indexes = torch.zeros(sequence_length, dtype=torch.bool)
         mse_loss_indexes[packed_vae_token_indexes] = True
@@ -153,6 +161,46 @@ def build_reference_train_batch_from_stimulus(
             batch["packed_timesteps"], timestep_shift=batch["timestep_shift"]
         )
     return batch
+
+
+def _reference_vit_tokens(inputs: Mapping[str, Any]) -> dict[str, torch.Tensor]:
+    image_size = int(inputs.get("image_size", 224))
+    transform = ImageTransform(
+        image_size,
+        int(inputs.get("min_image_size", image_size)),
+        14,
+        max_pixels=int(inputs.get("max_pixels", image_size * image_size)),
+    )
+    image = _train_image_from_stimulus(inputs, image_size=image_size)
+    image_tensor = transform(image)
+    vit_tokens = patchify(image_tensor, 14)
+    vit_position_ids = get_flattened_position_ids_extrapolate(
+        image_tensor.size(1),
+        image_tensor.size(2),
+        14,
+        70,
+    )
+    return {
+        "packed_vit_tokens": vit_tokens,
+        "packed_vit_token_indexes": torch.arange(int(vit_tokens.shape[0]), dtype=torch.long),
+        "packed_vit_position_ids": vit_position_ids,
+        "vit_token_seqlens": torch.tensor([int(vit_tokens.shape[0])], dtype=torch.int32),
+    }
+
+
+def _train_image_from_stimulus(inputs: Mapping[str, Any], *, image_size: int):
+    conversation_list = inputs.get("conversation_list")
+    if conversation_list is not None:
+        for sample in _iter_conversation_samples(conversation_list):
+            for item in sample:
+                if not isinstance(item, Mapping) or str(item.get("type")) != "image":
+                    continue
+                value = item.get("value")
+                if isinstance(value, Mapping) and str(value.get("kind")) == "image":
+                    return make_reference_image(
+                        int(value.get("width", image_size)), int(value.get("height", image_size))
+                    )
+    return make_reference_image(image_size, image_size)
 
 
 def _train_prompt_token_ids(

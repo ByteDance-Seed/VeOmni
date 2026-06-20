@@ -179,6 +179,7 @@ class BagelTrainObservationAdapter(MethodPatchObservationAdapter):
             "train_grad_early_q_proj",
             "train_grad_gen_q_proj",
             "train_grad_llm2vae",
+            "train_grad_siglip_q_proj",
         ):
             self.ensure_field(name)
 
@@ -257,6 +258,16 @@ class BagelTrainObservationAdapter(MethodPatchObservationAdapter):
         llm2vae = getattr(model, "llm2vae", None)
         if llm2vae is not None and llm2vae.weight.grad is not None:
             self.record("train_grad_llm2vae", sample_named_grad(model, "llm2vae.weight"))
+        vit_model = getattr(model, "vit_model", None)
+        if vit_model is not None:
+            siglip_q_proj = dict(model.named_parameters()).get(
+                "vit_model.vision_model.encoder.layers.0.self_attn.q_proj.weight"
+            )
+            if siglip_q_proj is not None and siglip_q_proj.grad is not None:
+                self.record(
+                    "train_grad_siglip_q_proj",
+                    sample_named_grad(model, "vit_model.vision_model.encoder.layers.0.self_attn.q_proj.weight"),
+                )
 
 
 def bagel_reference_observation_adapter(kind: str | None) -> ReferenceObservationAdapter:
