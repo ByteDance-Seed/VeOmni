@@ -179,6 +179,17 @@ class _Transition:
 
 @contextmanager
 def _maybe_unshard_fsdp_module(module: Any):
+    """Unshard a FSDP2 module for inference-only non-``forward`` node calls.
+
+    Training uses ``OmniModuleTrainer.forward`` to temporarily route the target
+    method through ``module.__call__`` so backward gradient sync hooks fire.
+    Inference stays on explicit unshard/reshard because generation methods can
+    call other methods on the same module, and replacing ``forward`` for the
+    full generation method would make nested calls dispatch incorrectly.
+    Keep this path symmetric with ``OmniModuleTrainer.forward`` when changing
+    how graph node methods cross FSDP2/DDP lifecycles.
+    """
+
     try:
         from torch.distributed.fsdp import FSDPModule
     except ImportError:

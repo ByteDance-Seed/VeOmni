@@ -539,7 +539,9 @@ class OmniModuleTrainer:
             if fn is None:
                 raise AttributeError(f"Node method {type(raw_model).__name__}.{method}() is not implemented.")
             # Point the raw module's ``forward`` at the target method, then call
-            # the wrapped_model so the DDP / FSDP2 lifecycle still fires.
+            # the wrapped_model so the DDP / FSDP2 lifecycle still fires. The
+            # inference graph intentionally uses explicit unshard/reshard
+            # instead; see ``generation_graph._maybe_unshard_fsdp_module``.
             orig_forward = raw_model.forward
             try:
                 raw_model.forward = fn
