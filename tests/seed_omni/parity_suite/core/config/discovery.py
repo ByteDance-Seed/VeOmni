@@ -15,10 +15,15 @@ from .spec import (
     ModelSpec,
     RecipeSpec,
     RunSpec,
+    V2ModelTargetSpec,
     load_model_spec,
     load_yaml_file,
     repository_root,
+    select_v2_model_target,
 )
+
+
+# Discovered case contract -----------------------------------------------------
 
 
 @dataclass(frozen=True)
@@ -60,6 +65,10 @@ class ParityCase:
         return self.run.tier
 
     @property
+    def v2_model(self) -> V2ModelTargetSpec:
+        return _recipe_v2_model_target(self.model, self.recipe)
+
+    @property
     def effective_gate(self) -> GateSpec:
         return DEFAULT_GATE.merge(self.model.gate).merge(self.recipe.gate).merge(self.run.gate)
 
@@ -77,6 +86,9 @@ class ParityCase:
         return case_skip_reason(self)
 
 
+# Public discovery entrypoints -------------------------------------------------
+
+
 def default_model_dirs() -> tuple[Path, ...]:
     seed_omni_tests = repository_root() / "tests" / "seed_omni"
     required_files = ("base.yaml", "probes.yaml")
@@ -86,6 +98,7 @@ def default_model_dirs() -> tuple[Path, ...]:
         if path.is_dir()
         and all((path / file_name).exists() for file_name in required_files)
         and ((path / "recipes.yaml").exists() or (path / "recipes").is_dir())
+        and _model_dir_discoverable(path)
     )
 
 
@@ -96,8 +109,10 @@ def discover_cases(model_dirs: Iterable[str | Path] | None = None) -> tuple[Pari
     seen: set[tuple[str, str, str, str]] = set()
     for model_dir in model_dirs or default_model_dirs():
         model = load_model_spec(model_dir)
-        graph_by_name = {graph.name: graph for graph in discover_graph_specs(model)}
+        if not model.discover:
+            continue
         for recipe in model.recipes:
+            graph_by_name = {graph.name: graph for graph in discover_graph_specs(model, recipes=(recipe,))}
             graph = graph_by_name.get(recipe.graph)
             if graph is None:
                 raise KeyError(
@@ -106,6 +121,11 @@ def discover_cases(model_dirs: Iterable[str | Path] | None = None) -> tuple[Pari
                 )
             nodes = discover_nodes(graph)
             for run in _enabled_runs(model.tiers.enabled(), recipe):
+                if run.tier == "module" and graph.domain != "inference":
+                    raise ValueError(
+                        f"{model.name}.{recipe.id}.{run.tier}.{run.id} selects graph {graph.name!r} "
+                        f"with domain {graph.domain!r}; module tier is inference-only."
+                    )
                 key = (model.name, recipe.id, run.tier, run.id)
                 if key in seen:
                     raise ValueError(
@@ -118,26 +138,50 @@ def discover_cases(model_dirs: Iterable[str | Path] | None = None) -> tuple[Pari
     return tuple(cases)
 
 
-def discover_graph_specs(model: ModelSpec) -> tuple[GraphSpec, ...]:
+# Reference dispatch helpers ---------------------------------------------------
+
+
+def effective_reference_kind(case: ParityCase) -> str:
+    """Return the reference runner kind after applying graph-domain defaults."""
+
+    kind = case.recipe.reference.get("kind")
+    if kind is not None:
+        return str(kind)
+    if case.graph.domain == "training":
+        return "train_forward_backward"
+    return case.graph.name
+
+
+# Graph and node discovery -----------------------------------------------------
+
+
+def discover_graph_specs(
+    model: ModelSpec,
+    *,
+    recipes: tuple[RecipeSpec, ...] | None = None,
+) -> tuple[GraphSpec, ...]:
     """Discover graph files from the configured SeedOmni V2 config directory."""
 
-    config_dir = model.v2_model.config_dir
-    if not config_dir.exists():
-        raise FileNotFoundError(f"V2 config_dir does not exist: {config_dir}")
-
+    active_recipes = model.recipes if recipes is None else recipes
     graphs: list[GraphSpec] = []
-    train_path = config_dir / "graph_train.yaml"
-    if train_path.exists():
-        graphs.append(GraphSpec(name="train", path=train_path, domain="training"))
-    for path in sorted(config_dir.glob("graph_infer_*.yaml")):
-        graphs.append(GraphSpec(name=path.stem.removeprefix("graph_"), path=path, domain="inference"))
-    if any(recipe.graph == "reference" for recipe in model.recipes):
+    seen_graphs: set[tuple[str, Path]] = set()
+    for recipe in active_recipes:
+        if recipe.graph == "reference":
+            continue
+        target = _recipe_v2_model_target(model, recipe)
+        for graph in _discover_v2_graphs(target.config_dir):
+            key = (graph.name, graph.path)
+            if key in seen_graphs:
+                continue
+            seen_graphs.add(key)
+            graphs.append(graph)
+    if any(recipe.graph == "reference" for recipe in active_recipes):
         graphs.append(GraphSpec(name="reference", path=model.root / "recipes" / "reference.yaml", domain="reference"))
 
     include = set(model.graphs.include)
     if include:
         graph_names = {graph.name for graph in graphs}
-        referenced = {recipe.graph for recipe in model.recipes}
+        referenced = {recipe.graph for recipe in active_recipes}
         missing = include.difference(graph_names)
         if missing:
             raise KeyError(f"Configured graph include list has unknown graphs: {sorted(missing)}")
@@ -186,5 +230,39 @@ def discover_nodes(graph: GraphSpec) -> tuple[NodeSpec, ...]:
     return tuple(nodes)
 
 
+# Internal filters -------------------------------------------------------------
+
+
 def _enabled_runs(enabled_tiers: tuple[str, ...], recipe: RecipeSpec) -> tuple[RunSpec, ...]:
     return tuple(run for run in recipe.runs if run.enable and run.tier in enabled_tiers)
+
+
+def _recipe_v2_model_target(model: ModelSpec, recipe: RecipeSpec) -> V2ModelTargetSpec:
+    oracle = str(recipe.reference.get("oracle", ""))
+    return select_v2_model_target(
+        model.v2_model,
+        oracle,
+        model_name=model.name,
+        recipe_id=recipe.id,
+    )
+
+
+def _discover_v2_graphs(config_dir: Path) -> tuple[GraphSpec, ...]:
+    if not config_dir.exists():
+        raise FileNotFoundError(f"V2 config_dir does not exist: {config_dir}")
+
+    graphs: list[GraphSpec] = []
+    train_path = config_dir / "graph_train.yaml"
+    if train_path.exists():
+        graphs.append(GraphSpec(name="train", path=train_path, domain="training"))
+    for path in sorted(config_dir.glob("graph_infer_*.yaml")):
+        graphs.append(GraphSpec(name=path.stem.removeprefix("graph_"), path=path, domain="inference"))
+    return tuple(graphs)
+
+
+def _model_dir_discoverable(path: Path) -> bool:
+    data = load_yaml_file(path / "base.yaml")
+    gate = data.get("gate") or {}
+    if isinstance(gate, dict) and "discover" in gate:
+        return bool(gate["discover"])
+    return bool(data.get("discover", True))

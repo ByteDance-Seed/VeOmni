@@ -1,69 +1,135 @@
-text_und:
+text_only_prefill:
   - stimulus:
-      prompt: "Write a short description of a calm lake at sunrise."
-      max_new_tokens: 1
-      do_sample: false
+      conversation_list:
+        - type: text
+          role: user
+          value:
+            kind: text
+            text: "Describe yourself in one short sentence."
+      generation_kwargs:
+        max_new_tokens: 1
+        do_sample: false
+        temperature: 0.0
+        top_p: 1.0
     reference:
-      kind: text_und
+      oracle: hf_model
+      kind: infer_und
+    gate:
+      requires_reference_checkpoint: true
+      requires_v2_model: true
     runs:
       graph:
-        - id: one_step
+        - id: prompt_prefill
           probes:
-            - text.hidden
-            - text.logits
-            - text.greedy_token
-      module:
-        - id: one_step
-          probes:
-            - text.hidden
-            - text.logits
-            - text.greedy_token
+            - infer_und.prompt_input_ids
+            - infer_und.mot_prefill_hidden
 
-text_image_und:
+text_image_prefill:
   - stimulus:
-      prompt: "Describe the colors and layout of this synthetic image in one sentence."
-      image_width: 448
-      image_height: 336
-      max_new_tokens: 1
-      do_sample: false
+      conversation_list:
+        - type: image
+          role: user
+          value:
+            kind: image
+            width: 560
+            height: 560
+        - type: text
+          role: user
+          value:
+            kind: text
+            text: "What is the dominant visual pattern in this image?"
+      generation_kwargs:
+        max_new_tokens: 1
+        do_sample: false
+        temperature: 0.0
+        top_p: 1.0
     reference:
-      kind: text_image_und
+      oracle: hf_model
+      kind: infer_und
+    gate:
+      requires_reference_checkpoint: true
+      requires_v2_model: true
     runs:
       graph:
-        - id: prepared_one_step
+        - id: prompt_prefill
           probes:
-            - text.hidden
-            - text.logits
-            - text.greedy_token
-      module:
-        - id: prepared_one_step
-          probes:
-            - text.hidden
-            - text.logits
-            - text.greedy_token
+            - infer_und.prompt_input_ids
+            - infer_und.mot_prefill_hidden
+
+module_text_encoder_prompt:
   - stimulus:
-      prompt: "Describe the colors and layout of this synthetic image in one sentence."
-      image_width: 448
-      image_height: 336
-      use_raw_image: true
-      max_new_tokens: 1
-      do_sample: false
+      conversation_list:
+        - type: text
+          role: user
+          value:
+            kind: text
+            text: "Describe yourself in one short sentence."
+      generation_kwargs:
+        max_new_tokens: 1
+        do_sample: false
+        temperature: 0.0
+        top_p: 1.0
     reference:
-      kind: text_image_und
+      oracle: hf_module.text_encoder
+      kind: infer_und
+    gate:
+      requires_reference_checkpoint: true
+      requires_v2_model: true
     runs:
-      graph:
-        - id: raw_one_step
-          probes:
-            - image.image_embeds_sample
-            - image.preprocessed_image_size
-            - text.hidden
-            - text.logits
-            - text.greedy_token
       module:
-        - id: raw_one_step
+        - id: prompt_encode
           probes:
-            - image.image_embeds_sample
-            - image.preprocessed_image_size
-            - text.hidden
-            - text.logits
-            - text.greedy_token
+            - infer_und.prompt_input_ids
+
+module_siglip_image_prompt:
+  - stimulus:
+      conversation_list:
+        - type: image
+          role: user
+          value:
+            kind: image
+            width: 560
+            height: 560
+      generation_kwargs:
+        max_new_tokens: 1
+        do_sample: false
+        temperature: 0.0
+        top_p: 1.0
+    reference:
+      oracle: hf_module.siglip_navit
+      kind: infer_und
+    gate:
+      requires_reference_checkpoint: true
+      requires_v2_model: true
+    runs:
+      module:
+        - id: image_encode
+          options:
+            max_tensor_numel: 6000000
+          probes:
+            - infer_und.vision_embeds
+
+module_qwen2_mot_text_prefill:
+  - stimulus:
+      conversation_list:
+        - type: text
+          role: user
+          value:
+            kind: text
+            text: "Answer in one word."
+      generation_kwargs:
+        max_new_tokens: 1
+        do_sample: false
+        temperature: 0.0
+        top_p: 1.0
+    reference:
+      oracle: hf_module.qwen2_mot
+      kind: infer_und
+    gate:
+      requires_reference_checkpoint: true
+      requires_v2_model: true
+    runs:
+      module:
+        - id: text_prefill
+          probes:
+            - infer_und.mot_prefill_hidden

@@ -9,6 +9,9 @@ from typing import Any
 import torch
 
 
+# Comparison contract ----------------------------------------------------------
+
+
 @dataclass(frozen=True)
 class Tolerance:
     name: str
@@ -28,6 +31,9 @@ class MetricResult:
     message: str = ""
     max_abs_diff: float | None = None
     max_rel_diff: float | None = None
+
+
+# Public comparison helpers ----------------------------------------------------
 
 
 def tolerance_from_policy(name: str, policies: dict[str, Any]) -> Tolerance:
@@ -52,7 +58,12 @@ def compare_tensors(actual: torch.Tensor, expected: torch.Tensor, *, tolerance: 
     if tolerance.exact:
         passed = torch.equal(actual_cpu, expected_cpu)
     else:
-        passed = torch.allclose(actual_cpu, expected_cpu, rtol=tolerance.rtol, atol=tolerance.atol)
+        passed = torch.allclose(
+            actual_cpu.to(torch.float64),
+            expected_cpu.to(torch.float64),
+            rtol=tolerance.rtol,
+            atol=tolerance.atol,
+        )
 
     diff = (actual_cpu.to(torch.float64) - expected_cpu.to(torch.float64)).abs()
     max_abs = float(diff.max().item()) if diff.numel() else 0.0
@@ -72,12 +83,41 @@ def compare_values(
 ) -> MetricResult:
     """Compare nested values and return the first mismatch."""
 
-    if _is_step_list(actual) and _is_step_list(expected):
+    return _compare_values(
+        actual,
+        expected,
+        tolerance=tolerance,
+        path=path,
+        compare_steps=compare_steps,
+        allow_step_list=True,
+    )
+
+
+# Internal recursive comparison ------------------------------------------------
+
+
+def _compare_values(
+    actual: Any,
+    expected: Any,
+    *,
+    tolerance: Tolerance,
+    path: str,
+    compare_steps: str,
+    allow_step_list: bool,
+) -> MetricResult:
+    """Compare nested values and return the first mismatch."""
+
+    if allow_step_list and _is_step_list(actual) and _is_step_list(expected):
         if not actual or not expected:
             return MetricResult(False, path, message="empty per-step list")
         if compare_steps == "last":
-            return compare_values(
-                actual[-1], expected[-1], tolerance=tolerance, path=f"{path}[-1]", compare_steps=compare_steps
+            return _compare_values(
+                actual[-1],
+                expected[-1],
+                tolerance=tolerance,
+                path=f"{path}[-1]",
+                compare_steps=compare_steps,
+                allow_step_list=False,
             )
         if compare_steps != "all":
             return MetricResult(False, path, message=f"unsupported step policy: {compare_steps!r}")
@@ -108,12 +148,13 @@ def _compare_mappings(
             False, path, message=f"mapping keys differ: actual={sorted(actual)} expected={sorted(expected)}"
         )
     for key in sorted(actual):
-        result = compare_values(
+        result = _compare_values(
             actual[key],
             expected[key],
             tolerance=tolerance,
             path=f"{path}.{key}",
             compare_steps=compare_steps,
+            allow_step_list=False,
         )
         if not result.passed:
             return result
@@ -133,12 +174,13 @@ def _compare_sequences(
             False, path, message=f"sequence length differs: actual={len(actual)} expected={len(expected)}"
         )
     for idx, (actual_item, expected_item) in enumerate(zip(actual, expected, strict=True)):
-        result = compare_values(
+        result = _compare_values(
             actual_item,
             expected_item,
             tolerance=tolerance,
             path=f"{path}[{idx}]",
             compare_steps=compare_steps,
+            allow_step_list=False,
         )
         if not result.passed:
             return result
@@ -169,6 +211,9 @@ def _is_sequence(value: Any) -> bool:
 
 def _is_step_list(value: Any) -> bool:
     return isinstance(value, list)
+
+
+# Report contract --------------------------------------------------------------
 
 
 @dataclass(frozen=True)

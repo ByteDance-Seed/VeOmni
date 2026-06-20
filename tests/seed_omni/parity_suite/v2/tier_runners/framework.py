@@ -77,7 +77,7 @@ def run_v2_train_framework(
 
     run = driver.case.run
     if run.kind == "forward_backward":
-        return run_v2_train_framework_batch(
+        return _run_v2_train_framework_batch(
             driver,
             driver.v2_request_kwargs(reference_output, device=device),
             whitelist,
@@ -126,7 +126,7 @@ def run_v2_infer_framework(
         _release_cuda_memory()
 
 
-def run_v2_train_framework_batch(
+def _run_v2_train_framework_batch(
     driver: Any,
     batch_kwargs: Mapping[str, Any],
     whitelist: Mapping[tuple[str, str], frozenset[str]],
@@ -334,7 +334,7 @@ def _run_launcher_policy(
 ) -> ParityReport:
     options = driver.case.run.options
     launcher_path = Path(str(options.get("launcher_path", "tasks/omni/train_omni.py")))
-    config_path = Path(str(options.get("config_path", driver.case.model.v2_model.config_dir / "base.yaml")))
+    config_path = Path(str(options.get("config_path", driver.case.v2_model.config_dir / "base.yaml")))
     output_dir = _policy_output_dir(driver, "launcher")
     output_dir.mkdir(parents=True, exist_ok=True)
     batch = driver.v2_request_kwargs(reference_output, device=device)
@@ -418,7 +418,7 @@ def _run_distributed_train_policy(
         baseline_report = _run_v2_train_fsdp2(
             driver,
             batch_kwargs,
-            config_path=Path(str(options.get("config_path", driver.case.model.v2_model.config_dir / "base.yaml"))),
+            config_path=Path(str(options.get("config_path", driver.case.v2_model.config_dir / "base.yaml"))),
             output_dir=output_dir / "baseline_rank1",
             dtype=dtype,
             nproc_per_node=1,
@@ -437,7 +437,7 @@ def _run_distributed_train_policy(
     report = _run_v2_train_fsdp2(
         driver,
         batch_kwargs,
-        config_path=Path(str(options.get("config_path", driver.case.model.v2_model.config_dir / "base.yaml"))),
+        config_path=Path(str(options.get("config_path", driver.case.v2_model.config_dir / "base.yaml"))),
         output_dir=output_dir / "target",
         dtype=dtype,
         nproc_per_node=nproc,
@@ -528,12 +528,12 @@ def _run_distributed_infer_policy(
             driver,
             request_kwargs,
             generation_kwargs=generation_kwargs,
-            config_path=Path(str(options.get("config_path", driver.case.model.v2_model.config_dir / "base.yaml"))),
+            config_path=Path(str(options.get("config_path", driver.case.v2_model.config_dir / "base.yaml"))),
             modules_config=Path(
                 str(
                     options.get(
                         "baseline_modules_config",
-                        driver.case.model.v2_model.config_dir / "modules_infer_eager.yaml",
+                        driver.case.v2_model.config_dir / "modules_infer_eager.yaml",
                     )
                 )
             ),
@@ -547,12 +547,12 @@ def _run_distributed_infer_policy(
         driver,
         request_kwargs,
         generation_kwargs=generation_kwargs,
-        config_path=Path(str(options.get("config_path", driver.case.model.v2_model.config_dir / "base.yaml"))),
+        config_path=Path(str(options.get("config_path", driver.case.v2_model.config_dir / "base.yaml"))),
         modules_config=Path(
             str(
                 options.get(
                     "modules_config",
-                    driver.case.model.v2_model.config_dir / "modules_infer_fsdp.yaml",
+                    driver.case.v2_model.config_dir / "modules_infer_fsdp.yaml",
                 )
             )
         ),
@@ -695,9 +695,9 @@ def _infer_worker_argv(
         str(worker_path),
         str(config_path),
         "--model.model_path",
-        str(driver.case.model.v2_model.model_root),
+        str(driver.case.v2_model.model_root),
         "--infer.model_path",
-        str(driver.case.model.v2_model.model_root),
+        str(driver.case.v2_model.model_root),
         "--infer.infer_type",
         infer_type,
         "--infer.modules",
@@ -887,7 +887,7 @@ def _run_data_loss_smoke_policy(
 
     report = _run_v2_train_data_loss_smoke(
         driver,
-        config_path=Path(str(options.get("config_path", driver.case.model.v2_model.config_dir / "base.yaml"))),
+        config_path=Path(str(options.get("config_path", driver.case.v2_model.config_dir / "base.yaml"))),
         output_dir=output_dir,
         nproc_per_node=nproc,
         steps=steps,
@@ -949,7 +949,7 @@ def _run_script_data_smoke_policy(
 
     report = _run_v2_train_script_data_smoke(
         driver,
-        config_path=Path(str(options.get("config_path", driver.case.model.v2_model.config_dir / "base.yaml"))),
+        config_path=Path(str(options.get("config_path", driver.case.v2_model.config_dir / "base.yaml"))),
         launcher_path=Path(str(options.get("launcher_path", "tasks/omni/train_omni.py"))),
         output_dir=output_dir,
         nproc_per_node=nproc,
@@ -1489,7 +1489,7 @@ def _run_launcher_smoke(
         str(launcher_path),
         str(config_path),
         "--model.model_path",
-        str(driver.case.model.v2_model.model_root),
+        str(driver.case.v2_model.model_root),
         "--train.global_batch_size",
         "1",
         "--train.micro_batch_size",
@@ -1583,7 +1583,7 @@ def _run_v2_train_fsdp2(
         str(worker_path),
         str(config_path),
         "--model.model_path",
-        str(driver.case.model.v2_model.model_root),
+        str(driver.case.v2_model.model_root),
         "--train.global_batch_size",
         str(nproc_per_node),
         "--train.micro_batch_size",
@@ -1695,7 +1695,7 @@ def _run_v2_train_data_loss_smoke(
         str(worker_path),
         str(config_path),
         "--model.model_path",
-        str(driver.case.model.v2_model.model_root),
+        str(driver.case.v2_model.model_root),
         "--train.global_batch_size",
         str(nproc_per_node),
         "--train.micro_batch_size",
@@ -1822,7 +1822,7 @@ def _run_v2_train_script_data_smoke(
         str(launcher_path),
         str(config_path),
         "--model.model_path",
-        str(driver.case.model.v2_model.model_root),
+        str(driver.case.v2_model.model_root),
         "--train.global_batch_size",
         str(nproc_per_node),
         "--train.micro_batch_size",

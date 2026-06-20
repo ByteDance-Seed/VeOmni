@@ -1,4 +1,4 @@
-"""BAGEL SigLIP NaViT visual-understanding module."""
+"""BAGEL SigLIP NaViT vision encoder module."""
 
 from ... import OMNI_CONFIG_REGISTRY, OMNI_MODEL_REGISTRY
 

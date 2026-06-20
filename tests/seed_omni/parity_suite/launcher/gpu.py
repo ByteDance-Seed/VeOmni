@@ -14,8 +14,14 @@ from typing import Any
 from tests.seed_omni.parity_suite.core import PARITY_ENABLE_ENV, ParityCase
 
 
+# Launcher constants -----------------------------------------------------------
+
+
 LAUNCHER_CHILD_ENV = "VEOMNI_PARITY_GPU_LAUNCHER_CHILD"
 TEST_ENTRYPOINT = "tests/seed_omni/parity_suite/test_parity_cases.py::test_seed_omni_v2_parity_case"
+
+
+# Result and process contracts -------------------------------------------------
 
 
 @dataclass(frozen=True)
@@ -32,6 +38,9 @@ class _RunningCase:
     log_file: Any
     log_path: Path
     cuda_devices: tuple[str, ...]
+
+
+# Public planning helpers ------------------------------------------------------
 
 
 def required_cuda_devices(case: ParityCase) -> int:
@@ -53,6 +62,9 @@ def configured_cuda_devices(cases: Sequence[ParityCase]) -> tuple[str, ...]:
     if configured_max:
         devices = devices[:configured_max]
     return devices
+
+
+# Public command and environment helpers --------------------------------------
 
 
 def build_pytest_command(case_id: str) -> list[str]:
@@ -79,6 +91,9 @@ def build_case_env(
     return env
 
 
+# Public launcher entrypoint ---------------------------------------------------
+
+
 def run_cases(
     cases: Sequence[ParityCase],
     *,
@@ -96,6 +111,9 @@ def run_cases(
     if not enable_parallel or not selected_devices:
         return _run_serial(cases, cuda_devices=selected_devices, output_dir=output_root, on_result=on_result)
     return _run_parallel(cases, cuda_devices=selected_devices, output_dir=output_root, on_result=on_result)
+
+
+# Scheduling backends ----------------------------------------------------------
 
 
 def _run_serial(
@@ -157,6 +175,9 @@ def _run_parallel(
     return results
 
 
+# Process lifecycle ------------------------------------------------------------
+
+
 def _start_case(case: ParityCase, *, cuda_devices: tuple[str, ...], output_dir: Path) -> _RunningCase:
     log_path = output_dir / f"{_safe_case_id(case.node_id)}.log"
     log_file = log_path.open("wb")
@@ -192,6 +213,9 @@ def _collect_completed(running: list[_RunningCase]) -> list[_RunningCase]:
     return completed
 
 
+# GPU slot helpers -------------------------------------------------------------
+
+
 def _case_cuda_devices(case: ParityCase, cuda_devices: tuple[str, ...]) -> tuple[str, ...]:
     needed = _case_slots(case, total_cuda_devices=len(cuda_devices))
     return cuda_devices[:needed]
@@ -214,6 +238,9 @@ def _enable_parallel(cases: Sequence[ParityCase]) -> bool:
     return any(case.model.launcher.enable_parallel for case in cases)
 
 
+# CUDA device discovery --------------------------------------------------------
+
+
 def _visible_cuda_devices() -> tuple[str, ...]:
     raw_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
     if raw_visible is not None:
@@ -230,3 +257,15 @@ def _visible_cuda_devices() -> tuple[str, ...]:
 
 def _safe_case_id(case_id: str) -> str:
     return "".join(char if char.isalnum() or char in {"-", "_"} else "_" for char in case_id)
+
+
+__all__ = [
+    "LAUNCHER_CHILD_ENV",
+    "TEST_ENTRYPOINT",
+    "LauncherResult",
+    "build_case_env",
+    "build_pytest_command",
+    "configured_cuda_devices",
+    "required_cuda_devices",
+    "run_cases",
+]

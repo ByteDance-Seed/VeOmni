@@ -1,0 +1,3 @@
+# DAG: output-carried latent grid -> flow connector embed.
+training_graph:
+  - { from: bagel_flow_connector.embed_latent, to: end }

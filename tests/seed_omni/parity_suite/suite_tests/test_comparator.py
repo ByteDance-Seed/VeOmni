@@ -29,17 +29,17 @@ def test_numeric_tolerance_allows_small_tensor_drift() -> None:
     assert result.max_abs_diff is not None and result.max_abs_diff > 0
 
 
-def test_nested_comparison_reports_first_mismatch_path() -> None:
+def test_nested_comparison_treats_inner_lists_as_structure() -> None:
     tolerance = Tolerance("hidden", rtol=0.0, atol=0.0)
 
     result = compare_values(
-        {"a": torch.tensor([1.0]), "b": [torch.tensor([2.0])]},
-        {"a": torch.tensor([1.0]), "b": [torch.tensor([3.0])]},
+        [{"a": torch.tensor([1.0]), "b": [torch.tensor([2.0]), torch.tensor([4.0])]}],
+        [{"a": torch.tensor([1.0]), "b": [torch.tensor([3.0]), torch.tensor([4.0])]}],
         tolerance=tolerance,
     )
 
     assert not result.passed
-    assert result.path == "$.b[-1]"
+    assert result.path == "$[-1].b[0]"
 
 
 def test_per_step_lists_compare_last_step_by_default() -> None:

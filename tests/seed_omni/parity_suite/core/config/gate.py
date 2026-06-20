@@ -12,6 +12,9 @@ if TYPE_CHECKING:
     from .discovery import ParityCase
 
 
+# Public gate evaluation -------------------------------------------------------
+
+
 def case_skip_reason(case: ParityCase) -> str | None:
     """Return the reason a parity case should be skipped, if any."""
 
@@ -21,22 +24,22 @@ def case_skip_reason(case: ParityCase) -> str | None:
     return _cuda_skip_reason(case)
 
 
+# Internal gate checks ---------------------------------------------------------
+
+
 def _static_skip_reason(case: ParityCase) -> str | None:
     gate = case.effective_gate
     if gate.requires_parity_env and os.environ.get(PARITY_ENABLE_ENV) != "1":
         return f"Set {PARITY_ENABLE_ENV}=1 to run {case.node_id}."
     if (
         gate.requires_reference_checkpoint
-        and case.model.reference.checkpoint is not None
-        and not case.model.reference.checkpoint.exists()
+        and case.model.reference.hf_model is not None
+        and case.model.reference.hf_model.checkpoint is not None
+        and not case.model.reference.hf_model.checkpoint.exists()
     ):
-        return f"Reference checkpoint does not exist: {case.model.reference.checkpoint}"
-    if (
-        gate.requires_v2_model
-        and case.model.v2_model.model_root is not None
-        and not case.model.v2_model.model_root.exists()
-    ):
-        return f"V2 model root does not exist: {case.model.v2_model.model_root}"
+        return f"Reference checkpoint does not exist: {case.model.reference.hf_model.checkpoint}"
+    if gate.requires_v2_model and case.v2_model.model_root is not None and not case.v2_model.model_root.exists():
+        return f"V2 model root does not exist: {case.v2_model.model_root}"
     return None
 
 

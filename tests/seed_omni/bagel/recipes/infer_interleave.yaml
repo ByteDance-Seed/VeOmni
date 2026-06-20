@@ -1,173 +1,51 @@
-interleave_text_und:
+infer_interleave_text_image_then_gen:
   - stimulus:
-      prompt: "Write one concise sentence about a mountain path after rain."
-      max_new_tokens: 1
-      do_sample: false
+      conversation_list:
+        - type: image
+          role: user
+          value:
+            kind: image
+            width: 512
+            height: 512
+        - type: text
+          role: user
+          value:
+            kind: text
+            text: "Describe the image briefly, then make it brighter."
+      generation_kwargs:
+        infer_mode: gen
+        image_height: 512
+        image_width: 512
+        image_shapes: [512, 512]
+        num_timesteps: 4
+        timestep_shift: 3.0
+        max_new_tokens: 23
+        max_think_token_n: 1
+        think: false
+        do_sample: false
+        cfg_text_scale: 4.0
+        cfg_img_scale: 1.5
+        cfg_interval: [0.0, 1.0]
+        cfg_renorm_min: 0.0
+        cfg_renorm_type: text_channel
     reference:
-      kind: text_und
+      oracle: hf_model
+      kind: infer_interleave
+    gate:
+      requires_reference_checkpoint: true
+      requires_v2_model: true
+    v2_model:
+      module_overrides:
+        bagel_vae:
+          device: cpu
+          dtype: float32
     runs:
       graph:
-        - id: one_step
-          probes:
-            - text.hidden
-            - text.logits
-            - text.greedy_token
-      module:
-        - id: one_step
-          probes:
-            - text.hidden
-            - text.logits
-            - text.greedy_token
-
-interleave_text_image_und:
-  - stimulus:
-      prompt: "Describe this synthetic image as part of an interleaved response."
-      image_width: 448
-      image_height: 336
-      max_new_tokens: 1
-      do_sample: false
-    reference:
-      kind: text_image_und
-    runs:
-      graph:
-        - id: one_step
-          probes:
-            - text.hidden
-            - text.logits
-            - text.greedy_token
-      module:
-        - id: one_step
-          probes:
-            - text.hidden
-            - text.logits
-            - text.greedy_token
-
-interleave_image_gen:
-  - stimulus:
-      prompt: "A glass greenhouse filled with tiny orange trees."
-      infer_mode: gen
-      max_new_tokens: 2
-      max_flow_steps: 1
-      image_height: 1024
-      image_width: 1024
-      latent_downsample: 16
-      num_timesteps: 50
-      timestep_shift: 3.0
-      cfg_text_scale: 1.0
-      cfg_img_scale: 1.0
-      cfg_interval: [0.0, 1.0]
-      cfg_renorm_min: 0.0
-      cfg_renorm_type: global
-      enable_taylorseer: false
-    reference:
-      kind: image_gen
-    runs:
-      graph:
-        - id: image_span_one_step
-          probes:
-            - image.latent_embeds_sample
-            - image.packed_sequence_sample
-            - image.hidden_sample
-            - image.velocity
-            - image.x_t
-      module:
-        - id: image_span_one_step
-          probes:
-            - image.latent_embeds_sample
-            - image.packed_sequence_sample
-            - image.hidden_sample
-            - image.velocity
-            - image.x_t
-
-text_image_und_then_edit_gen:
-  - stimulus:
-      und_prompt: "Describe this scene in one concise sentence."
-      prompt: "Turn the scene into a clean watercolor illustration."
-      infer_mode: gen
-      image_width: 448
-      image_height: 336
-      input_width: 384
-      input_height: 256
-      max_new_tokens: 2
-      max_flow_steps: 1
-      num_timesteps: 50
-      timestep_shift: 3.0
-      cfg_text_scale: 1.0
-      cfg_img_scale: 1.0
-      cfg_interval: [0.0, 1.0]
-      cfg_renorm_min: 0.0
-      cfg_renorm_type: global
-      enable_vae_context: true
-      enable_taylorseer: false
-      do_sample: false
-    reference:
-      kind: text_image_und_then_edit_gen
-    runs:
-      graph:
-        - id: und_then_gen_one_step
-          probes:
-            - image.image_embeds_sample
-            - image.vae_context_latents
-            - image.vae_context_latent_embeds_sample
-            - image.vae_context_packed_sequence_sample
-            - image.latent_embeds_sample
-            - image.packed_sequence_sample
-            - image.hidden_sample
-            - image.velocity
-            - image.x_t
-      module:
-        - id: und_then_gen_one_step
-          probes:
-            - image.image_embeds_sample
-            - image.vae_context_latents
-            - image.vae_context_latent_embeds_sample
-            - image.vae_context_packed_sequence_sample
-            - image.latent_embeds_sample
-            - image.packed_sequence_sample
-            - image.hidden_sample
-            - image.velocity
-            - image.x_t
-      framework:
-        - id: infer_fsdp2_2rank_smoke
-          kind: distributed_infer
-          gate:
-            min_cuda_devices: 2
+        - id: denoise_multistep_cfg_text_img
           options:
-            strategy: fsdp2
-            nproc_per_node: 2
-            timeout: 1800
-            config_path: configs/seed_omni/Bagel/bagel_7b_mot/base.yaml
-            infer_type: infer_interleave
-            modules_config: configs/seed_omni/Bagel/bagel_7b_mot/modules_infer_fsdp.yaml
-        - id: infer_fsdp2_2rank_numeric
-          kind: distributed_infer
-          gate:
-            min_cuda_devices: 2
-          options:
-            strategy: fsdp2
-            compare_eager: true
-            nproc_per_node: 2
-            timeout: 1800
-            config_path: configs/seed_omni/Bagel/bagel_7b_mot/base.yaml
-            infer_type: infer_interleave
-            modules_config: configs/seed_omni/Bagel/bagel_7b_mot/modules_infer_fsdp.yaml
-            compare_probes:
-              - image.velocity
-              - image.hidden_sample
-              - image.latent_embeds_sample
-        - id: infer_fsdp2_8rank_numeric
-          kind: distributed_infer
-          gate:
-            min_cuda_devices: 8
-          options:
-            strategy: fsdp2
-            compare_eager: true
-            nproc_per_node: 8
-            timeout: 3600
-            config_path: configs/seed_omni/Bagel/bagel_7b_mot/base.yaml
-            infer_type: infer_interleave
-            modules_config: configs/seed_omni/Bagel/bagel_7b_mot/modules_infer_fsdp.yaml
-            compare_probes:
-              - image.velocity
-              - image.hidden_sample
-              - image.latent_embeds_sample
+            max_tensor_numel: 4000000
+          probes:
+            - infer_gen.timestep_all
+            - infer_gen.latent_query_all
+            - infer_gen.denoise_hidden_all
+            - infer_gen.merged_velocity_all

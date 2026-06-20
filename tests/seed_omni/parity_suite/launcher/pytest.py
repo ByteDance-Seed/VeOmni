@@ -11,6 +11,9 @@ from tests.seed_omni.parity_suite.core import ParityCase, case_skip_reason
 from .gpu import LAUNCHER_CHILD_ENV, LauncherResult, run_cases
 
 
+# Pytest launcher session ------------------------------------------------------
+
+
 _LAUNCHER_SESSIONS: dict[tuple[str, ...], _PytestLauncherSession] = {}
 
 
@@ -64,6 +67,9 @@ class _PytestLauncherSession:
             self._condition.notify_all()
 
 
+# Public pytest integration hooks ---------------------------------------------
+
+
 def is_launcher_child() -> bool:
     return os.environ.get(LAUNCHER_CHILD_ENV) == "1"
 
@@ -78,6 +84,9 @@ def should_use_pytest_launcher(case: ParityCase, request: Any) -> bool:
 
 def run_case_with_pytest_launcher(case: ParityCase, request: Any) -> LauncherResult:
     return _launcher_session(request).wait_for(case)
+
+
+# Internal pytest selection helpers -------------------------------------------
 
 
 def _is_direct_case_selection(case: ParityCase, request: Any) -> bool:
@@ -108,3 +117,10 @@ def _selected_runnable_launcher_cases(request: Any) -> tuple[ParityCase, ...]:
         if isinstance(case, ParityCase) and case.model.launcher.enable_parallel and case_skip_reason(case) is None:
             cases.append(case)
     return tuple(cases)
+
+
+__all__ = [
+    "is_launcher_child",
+    "run_case_with_pytest_launcher",
+    "should_use_pytest_launcher",
+]

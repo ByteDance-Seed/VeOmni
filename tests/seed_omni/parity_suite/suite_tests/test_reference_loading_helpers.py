@@ -9,7 +9,7 @@ import torch
 from safetensors.torch import save_file
 from torch import nn
 
-from tests.seed_omni.parity_suite.reference.model import empty_init_context, load_safetensors_weights
+from tests.seed_omni.parity_suite.reference.oracles.hf_model import empty_init_context, load_safetensors_weights
 
 
 class _TinyModel(nn.Module):

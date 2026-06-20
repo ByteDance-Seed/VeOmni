@@ -1,4 +1,4 @@
-"""BAGEL flow-generation connector module."""
+"""BAGEL VAE/LLM flow connector module."""
 
 from ... import OMNI_CONFIG_REGISTRY, OMNI_MODEL_REGISTRY
 

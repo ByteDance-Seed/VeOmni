@@ -5,21 +5,27 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
-import torch
-from torch import nn
-
 from tests.seed_omni.parity_suite.core import ParityCase, ParityReport
-from tests.seed_omni.parity_suite.reference.capture import ReferenceCaptureContext
-from tests.seed_omni.parity_suite.reference.model import load_transformers_reference_model, reference_options
+from tests.seed_omni.parity_suite.core.stimulus import conversation_stimulus_to_batched_specs
+from tests.seed_omni.parity_suite.reference import ReferenceOracle, build_reference_oracle
 
 
 class ReferenceMixin:
-    """Reference oracle inputs, loading, and recipe execution."""
+    """Reference oracle inputs and selection."""
 
     case: ParityCase
 
+    # Reference inputs and generation --------------------------------------------
+
     def reference_inputs(self) -> Mapping[str, Any]:
-        return self.case.recipe.stimulus
+        stimulus = self.case.recipe.stimulus
+        batched_conversation = conversation_stimulus_to_batched_specs(stimulus)
+        if batched_conversation is None:
+            return stimulus
+        inputs = dict(stimulus)
+        inputs.pop("batched_conversation_list", None)
+        inputs["conversation_list"] = batched_conversation
+        return inputs
 
     def generation_kwargs(self, model_or_config: Any, reference_output: Any) -> dict[str, Any]:
         del reference_output
@@ -27,44 +33,19 @@ class ReferenceMixin:
         kwargs = dict(getattr(config, "generation_kwargs", None) or {})
         for key, default in self.generation_defaults.items():
             kwargs[key] = default
-        kwargs.update(self.case.recipe.stimulus)
+        stimulus_kwargs = self.case.recipe.stimulus.get("generation_kwargs", {})
+        if stimulus_kwargs:
+            if not isinstance(stimulus_kwargs, Mapping):
+                raise TypeError("stimulus.generation_kwargs must be a mapping.")
+            kwargs.update(stimulus_kwargs)
         return kwargs
 
-    def reference_model_load_kwargs(self, *, device: torch.device, dtype: torch.dtype) -> dict[str, Any]:
-        """Return model-specific kwargs for ``AutoModel.from_pretrained``."""
+    # Reference oracle ------------------------------------------------------------
 
-        del device, dtype
-        return {}
+    def reference_oracle(self) -> ReferenceOracle:
+        """Return the configured independent reference oracle."""
 
-    def load_reference_model(self, *, device: torch.device, dtype: torch.dtype) -> nn.Module:
-        """Load the independent reference oracle."""
-
-        return load_transformers_reference_model(
-            module=self.case.model.reference.module,
-            checkpoint=self.case.model.reference.checkpoint,
-            **self.reference_model_load_kwargs(device=device, dtype=dtype),
-        )
-
-    def run_reference_recipe(
-        self,
-        ref_model: nn.Module,
-        inputs: Mapping[str, Any],
-        context: ReferenceCaptureContext,
-    ) -> Any:
-        """Run the reference recipe and return driver-owned canonical output."""
-
-        reference = self.case.recipe.reference
-        kind = reference.get("kind")
-        if kind is not None:
-            kind = str(kind)
-        options = reference.get("options", {}) or {}
-        with reference_options(ref_model, options):
-            run_reference_kind = getattr(ref_model, "run_reference_kind", None)
-            if run_reference_kind is not None:
-                return run_reference_kind(kind, inputs, context)
-            if kind is None:
-                return ref_model(**inputs)
-        raise NotImplementedError(f"{type(ref_model).__name__} does not implement reference kind {kind!r}.")
+        return build_reference_oracle(self.case, self)
 
     def run_reference_only_recipe(self) -> ParityReport:
         """Run a reference-only recipe."""

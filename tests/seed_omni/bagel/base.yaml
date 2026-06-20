@@ -1,56 +1,61 @@
 name: bagel
+seed: 7
 
 reference:
-  module: tests.seed_omni.bagel.reference_model:BagelModel
-  checkpoint: /mnt/hdfs/user_dir/veomni_omni/models/transformers/BAGEL-7B-MoT
+  hf_model:
+    module: tests.seed_omni.bagel.reference.hf_model:BagelHfModelReference
+    checkpoint: /mnt/hdfs/user_dir/veomni_omni/models/transformers/BAGEL-7B-MoT
+  hf_module:
+    - text_encoder
+    - siglip_navit
+    - vae
+    - flow_connector_embed
+    - flow_connector_decode
+    - qwen2_mot
 
 v2_model:
   model_root: /mnt/hdfs/user_dir/veomni_omni/models/seed_omni/BAGEL-7B-MoT
-  config_dir: configs/seed_omni/Bagel/bagel_7b_mot
-  module_dirs: auto
-
-graphs:
-  include:
-    - train
-    - infer_und
-    - infer_gen
-    - infer_edit
-    - infer_interleave
+  hf_model:
+    config_dir: configs/seed_omni/Bagel/bagel_7b_mot
+  hf_module:
+    text_encoder:
+      config_dir: tests/seed_omni/bagel/configs/text_encoder
+    siglip_navit:
+      config_dir: tests/seed_omni/bagel/configs/siglip_navit
+    vae:
+      config_dir: tests/seed_omni/bagel/configs/vae
+    flow_connector_embed:
+      config_dir: tests/seed_omni/bagel/configs/flow_connector
+    flow_connector_decode:
+      config_dir: tests/seed_omni/bagel/configs/flow_connector_decode
+    qwen2_mot:
+      config_dir: tests/seed_omni/bagel/configs/qwen2_mot
 
 tiers:
+  reference: false
   graph: true
   module: true
-  framework: true
+  framework: false
 
-seed: 1234
+gate:
+  requires_parity_env: false
+  requires_cuda: true
+  requires_reference_capture: true
+  requires_reference_checkpoint: false
+  requires_v2_model: false
 
 tolerance:
   exact:
     kind: exact
-  hidden:
-    rtol: 1.0e-2
-    atol: 1.0e-2
-  logits:
-    rtol: 1.0e-2
-    atol: 1.0e-2
-  velocity:
-    rtol: 1.0e-2
-    atol: 1.0e-2
-  latent:
-    rtol: 1.0e-2
-    atol: 1.0e-2
+  tensor:
+    rtol: 0.0
+    atol: 0.0
+  vision:
+    rtol: 1.0e-6
+    atol: 1.0e-5
   loss:
-    rtol: 1.0e-4
-    atol: 1.0e-4
-  distributed_loss:
-    rtol: 2.0e-4
-    atol: 2.0e-3
-  gradient:
-    rtol: 1.0e-2
-    atol: 1.0e-2
-
-gate:
-  requires_cuda: true
+    rtol: 1.0e-6
+    atol: 1.0e-6
 
 launcher:
   enable_parallel: true

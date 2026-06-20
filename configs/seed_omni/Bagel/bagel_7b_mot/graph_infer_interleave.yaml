@@ -5,15 +5,15 @@ generation_graph:
   states:
     prompt_encode:
       body:
-        - { from: bagel_vae.encode,                    to: bagel_siglip_navit }
-        - { from: bagel_siglip_navit,                   to: bagel_text_encoder.prompt_encode }
-        - { from: bagel_text_encoder.prompt_encode,     to: bagel_flow_connector.embed_latent }
-        - { from: bagel_flow_connector.embed_latent,    to: bagel_qwen2_mot }
-        - { from: bagel_text_encoder.prompt_encode,     to: bagel_qwen2_mot }
-        - { from: bagel_qwen2_mot,                      to: bagel_text_encoder.token_generate }
-        - { from: bagel_text_encoder.token_generate,    to: end }
+        - { from: bagel_vae.encode,                              to: bagel_flow_connector.embed_latent }
+        - { from: bagel_siglip_navit,                             to: bagel_text_encoder.prompt_encode }
+        - { from: bagel_text_encoder.prompt_encode,               to: bagel_flow_connector.embed_latent }
+        - { from: bagel_flow_connector.embed_latent,              to: bagel_text_encoder.encode_image_query_markers }
+        - { from: bagel_text_encoder.encode_image_query_markers,  to: bagel_qwen2_mot }
+        - { from: bagel_qwen2_mot,                                to: bagel_text_encoder.token_generate }
+        - { from: bagel_text_encoder.token_generate,              to: end }
       transitions:
-        - { condition: { type: module_signal, key: start_image_gen }, next_state: image_flow }
+        - { condition: { type: module_signal, key: start_image_gen }, next_state: denoise_query }
         - { condition: { type: module_signal, key: text_done }, next_state: done }
         - { condition: { type: default }, next_state: text_ar }
 
@@ -22,16 +22,31 @@ generation_graph:
         - { from: bagel_qwen2_mot,                   to: bagel_text_encoder.token_generate }
         - { from: bagel_text_encoder.token_generate, to: end }
       transitions:
-        - { condition: { type: module_signal, key: start_image_gen }, next_state: image_flow }
+        - { condition: { type: module_signal, key: start_image_gen }, next_state: denoise_query }
         - { condition: { type: module_signal, key: text_done }, next_state: done }
 
-    image_flow:
+    denoise_query:
       body:
-        - { from: bagel_flow_connector.embed_latent,    to: bagel_qwen2_mot }
-        - { from: bagel_qwen2_mot,                      to: bagel_flow_connector.decode_velocity }
-        - { from: bagel_flow_connector.decode_velocity, to: end }
+        - { from: bagel_flow_connector,                         to: bagel_text_encoder.encode_image_query_markers }
+        - { from: bagel_text_encoder.encode_image_query_markers, to: bagel_qwen2_mot }
+        - { from: bagel_qwen2_mot,                              to: end }
+      transitions:
+        - { condition: { type: default }, next_state: velocity_collect }
+
+    velocity_collect:
+      body:
+        - { from: bagel_flow_connector, to: bagel_qwen2_mot }
+        - { from: bagel_qwen2_mot,      to: end }
+      transitions:
+        - { condition: { type: module_signal, key: need_denoise_branch }, next_state: denoise_query }
+        - { condition: { type: module_signal, key: velocity_ready },      next_state: denoise_advance }
+
+    denoise_advance:
+      body:
+        - { from: bagel_flow_connector, to: end }
       transitions:
         - { condition: { type: module_signal, key: image_complete }, next_state: image_decode }
+        - { condition: { type: default }, next_state: denoise_query }
 
     image_decode:
       body:

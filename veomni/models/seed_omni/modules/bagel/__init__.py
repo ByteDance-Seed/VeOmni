@@ -1,12 +1,10 @@
-"""BAGEL SeedOmni V2 modules.
+"""BAGEL SeedOmni V2 modules."""
 
-The BAGEL checkpoint is split into five module-owned state dicts:
-
-* ``bagel_text_encoder``: token embeddings and LM head
-* ``bagel_siglip_navit``: SigLIP NaViT visual-understanding tower and connector
-* ``bagel_qwen2_mot``: Qwen2 MoT backbone blocks
-* ``bagel_vae``: latent image autoencoder
-* ``bagel_flow_connector``: VAE/LLM flow connector and latent positional/timestep layers
-"""
-
-from . import convert_model, flow_connector, qwen2_mot, siglip_navit, text_encoder, vae  # noqa: F401
+from . import (
+    convert_model,  # noqa: F401
+    flow_connector,  # noqa: F401
+    qwen2_mot,  # noqa: F401
+    siglip_navit,  # noqa: F401
+    text_encoder,  # noqa: F401
+    vae,  # noqa: F401
+)

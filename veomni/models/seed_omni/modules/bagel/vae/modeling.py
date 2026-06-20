@@ -1,15 +1,19 @@
 """BAGEL latent VAE module.
 
-The released BAGEL checkpoint stores the autoencoder in ``ae.safetensors``.
-This module mirrors the official FLUX/BAGEL autoencoder key layout exactly so
-the module-aware splitter can load/save it as ``bagel_vae``.
+Training graph call-sites:
+* ``bagel_vae.encode`` reads assistant image items and writes scaled latent
+  grids back to ``item.value``.
+* ``bagel_vae.decode`` reads output tensor items and writes decoded
+  image tensors back to ``item.value``.
 
-TODO(bagel-v2): official training keeps the VAE frozen/eval and encodes under
-``torch.no_grad()``. Wire that runtime policy when Bagel graph parity is ported.
+The VAE module is a codec boundary only. Flow timestep/noise sampling, latent
+patchification, and packed MoT indexes belong to downstream Bagel nodes.
 """
 
+from __future__ import annotations
+
 from contextlib import nullcontext
-from typing import Any, Dict, Optional
+from typing import Any
 
 import torch
 import torch.nn as nn
@@ -26,7 +30,7 @@ def swish(x: Tensor) -> Tensor:
 
 
 class AttnBlock(nn.Module):
-    def __init__(self, in_channels: int):
+    def __init__(self, in_channels: int) -> None:
         super().__init__()
         self.in_channels = in_channels
         self.norm = nn.GroupNorm(num_groups=32, num_channels=in_channels, eps=1e-6, affine=True)
@@ -35,26 +39,25 @@ class AttnBlock(nn.Module):
         self.v = nn.Conv2d(in_channels, in_channels, kernel_size=1)
         self.proj_out = nn.Conv2d(in_channels, in_channels, kernel_size=1)
 
-    def attention(self, h_: Tensor) -> Tensor:
-        h_ = self.norm(h_)
-        q = self.q(h_)
-        k = self.k(h_)
-        v = self.v(h_)
+    def attention(self, hidden_states: Tensor) -> Tensor:
+        hidden_states = self.norm(hidden_states)
+        query = self.q(hidden_states)
+        key = self.k(hidden_states)
+        value = self.v(hidden_states)
 
-        b, c, h, w = q.shape
-        q = rearrange(q, "b c h w -> b 1 (h w) c").contiguous()
-        k = rearrange(k, "b c h w -> b 1 (h w) c").contiguous()
-        v = rearrange(v, "b c h w -> b 1 (h w) c").contiguous()
-        h_ = nn.functional.scaled_dot_product_attention(q, k, v)
-
-        return rearrange(h_, "b 1 (h w) c -> b c h w", h=h, w=w, c=c, b=b)
+        batch, channels, height, width = query.shape
+        query = rearrange(query, "b c h w -> b 1 (h w) c").contiguous()
+        key = rearrange(key, "b c h w -> b 1 (h w) c").contiguous()
+        value = rearrange(value, "b c h w -> b 1 (h w) c").contiguous()
+        hidden_states = nn.functional.scaled_dot_product_attention(query, key, value)
+        return rearrange(hidden_states, "b 1 (h w) c -> b c h w", h=height, w=width, c=channels, b=batch)
 
     def forward(self, x: Tensor) -> Tensor:
         return x + self.proj_out(self.attention(x))
 
 
 class ResnetBlock(nn.Module):
-    def __init__(self, in_channels: int, out_channels: int):
+    def __init__(self, in_channels: int, out_channels: int) -> None:
         super().__init__()
         self.in_channels = in_channels
         self.out_channels = out_channels
@@ -66,21 +69,20 @@ class ResnetBlock(nn.Module):
             self.nin_shortcut = nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=1, padding=0)
 
     def forward(self, x: Tensor) -> Tensor:
-        h = self.norm1(x)
-        h = swish(h)
-        h = self.conv1(h)
-        h = self.norm2(h)
-        h = swish(h)
-        h = self.conv2(h)
+        hidden_states = self.norm1(x)
+        hidden_states = swish(hidden_states)
+        hidden_states = self.conv1(hidden_states)
+        hidden_states = self.norm2(hidden_states)
+        hidden_states = swish(hidden_states)
+        hidden_states = self.conv2(hidden_states)
 
         if self.in_channels != self.out_channels:
             x = self.nin_shortcut(x)
-
-        return x + h
+        return x + hidden_states
 
 
 class Downsample(nn.Module):
-    def __init__(self, in_channels: int):
+    def __init__(self, in_channels: int) -> None:
         super().__init__()
         self.conv = nn.Conv2d(in_channels, in_channels, kernel_size=3, stride=2, padding=0)
 
@@ -90,7 +92,7 @@ class Downsample(nn.Module):
 
 
 class Upsample(nn.Module):
-    def __init__(self, in_channels: int):
+    def __init__(self, in_channels: int) -> None:
         super().__init__()
         self.conv = nn.Conv2d(in_channels, in_channels, kernel_size=3, stride=1, padding=1)
 
@@ -108,7 +110,7 @@ class Encoder(nn.Module):
         ch_mult: list[int],
         num_res_blocks: int,
         z_channels: int,
-    ):
+    ) -> None:
         super().__init__()
         self.gradient_checkpointing = False
         self.ch = ch
@@ -146,43 +148,43 @@ class Encoder(nn.Module):
         self.conv_out = nn.Conv2d(block_in, 2 * z_channels, kernel_size=3, stride=1, padding=1)
 
     def forward(self, x: Tensor) -> Tensor:
-        hs = [self.conv_in(x)]
+        hidden_stack = [self.conv_in(x)]
         for i_level in range(self.num_resolutions):
             for i_block in range(self.num_res_blocks):
                 block = self.down[i_level].block[i_block]
-                h = (
-                    self._gradient_checkpointing_func(block.__call__, hs[-1])
+                hidden_states = (
+                    self._gradient_checkpointing_func(block.__call__, hidden_stack[-1])
                     if self.gradient_checkpointing and self.training
-                    else block(hs[-1])
+                    else block(hidden_stack[-1])
                 )
                 if len(self.down[i_level].attn) > 0:
                     attn = self.down[i_level].attn[i_block]
-                    h = (
-                        self._gradient_checkpointing_func(attn.__call__, h)
+                    hidden_states = (
+                        self._gradient_checkpointing_func(attn.__call__, hidden_states)
                         if self.gradient_checkpointing and self.training
-                        else attn(h)
+                        else attn(hidden_states)
                     )
-                hs.append(h)
+                hidden_stack.append(hidden_states)
             if i_level != self.num_resolutions - 1:
                 downsample = self.down[i_level].downsample
-                hs.append(
-                    self._gradient_checkpointing_func(downsample.__call__, hs[-1])
+                hidden_stack.append(
+                    self._gradient_checkpointing_func(downsample.__call__, hidden_stack[-1])
                     if self.gradient_checkpointing and self.training
-                    else downsample(hs[-1])
+                    else downsample(hidden_stack[-1])
                 )
 
-        h = hs[-1]
+        hidden_states = hidden_stack[-1]
         if self.gradient_checkpointing and self.training:
-            h = self._gradient_checkpointing_func(self.mid.block_1.__call__, h)
-            h = self._gradient_checkpointing_func(self.mid.attn_1.__call__, h)
-            h = self._gradient_checkpointing_func(self.mid.block_2.__call__, h)
+            hidden_states = self._gradient_checkpointing_func(self.mid.block_1.__call__, hidden_states)
+            hidden_states = self._gradient_checkpointing_func(self.mid.attn_1.__call__, hidden_states)
+            hidden_states = self._gradient_checkpointing_func(self.mid.block_2.__call__, hidden_states)
         else:
-            h = self.mid.block_1(h)
-            h = self.mid.attn_1(h)
-            h = self.mid.block_2(h)
-        h = self.norm_out(h)
-        h = swish(h)
-        return self.conv_out(h)
+            hidden_states = self.mid.block_1(hidden_states)
+            hidden_states = self.mid.attn_1(hidden_states)
+            hidden_states = self.mid.block_2(hidden_states)
+        hidden_states = self.norm_out(hidden_states)
+        hidden_states = swish(hidden_states)
+        return self.conv_out(hidden_states)
 
 
 class Decoder(nn.Module):
@@ -195,7 +197,7 @@ class Decoder(nn.Module):
         in_channels: int,
         resolution: int,
         z_channels: int,
-    ):
+    ) -> None:
         super().__init__()
         self.gradient_checkpointing = False
         self.ch = ch
@@ -234,47 +236,47 @@ class Decoder(nn.Module):
         self.conv_out = nn.Conv2d(block_in, out_ch, kernel_size=3, stride=1, padding=1)
 
     def forward(self, z: Tensor) -> Tensor:
-        h = self.conv_in(z)
+        hidden_states = self.conv_in(z)
 
         if self.gradient_checkpointing and self.training:
-            h = self._gradient_checkpointing_func(self.mid.block_1.__call__, h)
-            h = self._gradient_checkpointing_func(self.mid.attn_1.__call__, h)
-            h = self._gradient_checkpointing_func(self.mid.block_2.__call__, h)
+            hidden_states = self._gradient_checkpointing_func(self.mid.block_1.__call__, hidden_states)
+            hidden_states = self._gradient_checkpointing_func(self.mid.attn_1.__call__, hidden_states)
+            hidden_states = self._gradient_checkpointing_func(self.mid.block_2.__call__, hidden_states)
         else:
-            h = self.mid.block_1(h)
-            h = self.mid.attn_1(h)
-            h = self.mid.block_2(h)
+            hidden_states = self.mid.block_1(hidden_states)
+            hidden_states = self.mid.attn_1(hidden_states)
+            hidden_states = self.mid.block_2(hidden_states)
 
         for i_level in reversed(range(self.num_resolutions)):
             for i_block in range(self.num_res_blocks + 1):
                 block = self.up[i_level].block[i_block]
-                h = (
-                    self._gradient_checkpointing_func(block.__call__, h)
+                hidden_states = (
+                    self._gradient_checkpointing_func(block.__call__, hidden_states)
                     if self.gradient_checkpointing and self.training
-                    else block(h)
+                    else block(hidden_states)
                 )
                 if len(self.up[i_level].attn) > 0:
                     attn = self.up[i_level].attn[i_block]
-                    h = (
-                        self._gradient_checkpointing_func(attn.__call__, h)
+                    hidden_states = (
+                        self._gradient_checkpointing_func(attn.__call__, hidden_states)
                         if self.gradient_checkpointing and self.training
-                        else attn(h)
+                        else attn(hidden_states)
                     )
             if i_level != 0:
                 upsample = self.up[i_level].upsample
-                h = (
-                    self._gradient_checkpointing_func(upsample.__call__, h)
+                hidden_states = (
+                    self._gradient_checkpointing_func(upsample.__call__, hidden_states)
                     if self.gradient_checkpointing and self.training
-                    else upsample(h)
+                    else upsample(hidden_states)
                 )
 
-        h = self.norm_out(h)
-        h = swish(h)
-        return self.conv_out(h)
+        hidden_states = self.norm_out(hidden_states)
+        hidden_states = swish(hidden_states)
+        return self.conv_out(hidden_states)
 
 
 class DiagonalGaussian(nn.Module):
-    def __init__(self, sample: bool = True, chunk_dim: int = 1):
+    def __init__(self, sample: bool = True, chunk_dim: int = 1) -> None:
         super().__init__()
         self.sample = sample
         self.chunk_dim = chunk_dim
@@ -294,7 +296,7 @@ class BagelVAE(BagelVAEModuleMixin, PreTrainedModel):
     _no_split_modules: list[str] = ["ResnetBlock", "AttnBlock"]
     supports_gradient_checkpointing = True
 
-    def __init__(self, config: BagelVAEConfig):
+    def __init__(self, config: BagelVAEConfig) -> None:
         super().__init__(config)
         self.encoder = Encoder(
             resolution=config.resolution,
@@ -316,26 +318,61 @@ class BagelVAE(BagelVAEModuleMixin, PreTrainedModel):
         self.reg = DiagonalGaussian()
         self.post_init()
 
-    def encode(self, pixel_values: Optional[torch.Tensor] = None, **kwargs: Any) -> Dict[str, torch.Tensor]:
+    def freeze_model(self) -> None:
+        if self.config.freeze:
+            self.eval()
+            self.requires_grad_(False)
+
+    def encode(
+        self,
+        pixel_values: torch.Tensor | None = None,
+        conversation_list: Any | None = None,
+        generation_kwargs: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        del generation_kwargs, kwargs
+        if pixel_values is not None:
+            return self._encode_pixel_values(pixel_values)
+        if conversation_list is not None:
+            return self._encode_context_conversation(conversation_list)
         if pixel_values is None:
-            return self._encode_image_graph(**kwargs)
-        with self._autocast_context(pixel_values):
+            dummy = self.dummy_inputs(kind="encode")
+            outputs = self.encode(**dummy)
+            outputs["is_dummy"] = True
+            return outputs
+
+    def _encode_pixel_values(self, pixel_values: torch.Tensor) -> dict[str, Any]:
+        encoder_device = self.encoder.conv_in.weight.device
+        pixel_values = pixel_values.to(device=encoder_device, dtype=self.dtype)
+        grad_context = torch.no_grad() if self.config.freeze else torch.enable_grad()
+        with grad_context, self._autocast_context(pixel_values):
             latents = self.reg(self.encoder(pixel_values))
             latents = self.config.scale_factor * (latents - self.config.shift_factor)
         return {"latents": latents.to(dtype=self.dtype)}
 
-    def decode(self, latents: Optional[torch.Tensor] = None, **kwargs: Any) -> Dict[str, Any]:
-        if latents is None:
-            return self._decode_image_graph(**kwargs)
+    def _decode_latents(self, latents: torch.Tensor) -> dict[str, Any]:
+        decoder_device = self.decoder.conv_in.weight.device
+        latents = latents.to(device=decoder_device, dtype=self.dtype)
         latents = latents / self.config.scale_factor + self.config.shift_factor
-        with self._autocast_context(latents):
+        grad_context = torch.no_grad() if self.config.freeze else torch.enable_grad()
+        with grad_context, self._autocast_context(latents):
             pixel_values = self.decoder(latents)
-        return {"pixel_values": pixel_values}
+        return {"pixel_values": pixel_values.to(dtype=self.dtype)}
 
     def _autocast_context(self, tensor: torch.Tensor):
         if tensor.device.type == "cuda" and self.dtype != torch.float32:
             return torch.amp.autocast("cuda", enabled=True, dtype=self.dtype)
         return nullcontext()
 
-    def forward(self, **kwargs: Any) -> Dict[str, torch.Tensor]:  # type: ignore[override]
-        return self.encode(**kwargs)
+
+__all__ = [
+    "AttnBlock",
+    "BagelVAE",
+    "BagelVAEConfig",
+    "Decoder",
+    "DiagonalGaussian",
+    "Downsample",
+    "Encoder",
+    "ResnetBlock",
+    "Upsample",
+]

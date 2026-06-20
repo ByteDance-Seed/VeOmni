@@ -10,20 +10,26 @@ from typing import Any, Iterator
 import torch
 from torch import nn
 
+from veomni.utils.helper import enable_full_determinism
+
+
+# Determinism ------------------------------------------------------------------
+
 
 def configure_torch_determinism(seed: int, *, strict: bool = False) -> None:
-    """Configure PyTorch RNG and deterministic knobs for parity execution."""
+    """Configure RNG and deterministic knobs for parity execution."""
 
+    enable_full_determinism(seed)
     os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
     torch.backends.cudnn.benchmark = False
     torch.backends.cudnn.deterministic = True
     torch.use_deterministic_algorithms(True, warn_only=not strict)
     torch.set_float32_matmul_precision("highest")
+
+
+# Device and dtype helpers -----------------------------------------------------
 
 
 def to_device(value: Any, device: torch.device) -> Any:
@@ -74,6 +80,9 @@ def autocast_for_dtype(device: torch.device, dtype: torch.dtype):
     return torch.amp.autocast("cuda", enabled=True, dtype=dtype)
 
 
+# Loss helpers -----------------------------------------------------------------
+
+
 def sum_losses(losses: Mapping[str, torch.Tensor]) -> torch.Tensor | None:
     if not losses:
         return None
@@ -82,6 +91,9 @@ def sum_losses(losses: Mapping[str, torch.Tensor]) -> torch.Tensor | None:
     for value in values:
         total = total + value
     return total
+
+
+# Tensor and gradient sampling -------------------------------------------------
 
 
 def sample_tensor(tensor: torch.Tensor, rows: torch.Tensor | None = None) -> torch.Tensor:
@@ -110,6 +122,9 @@ def sample_named_param(module: nn.Module, name: str, rows: torch.Tensor | None =
 def zero_module_grads(modules: Iterable[nn.Module]) -> None:
     for module in modules:
         module.zero_grad(set_to_none=True)
+
+
+# Test-side patches ------------------------------------------------------------
 
 
 @contextmanager

@@ -1,9 +1,11 @@
-"""Configuration for BAGEL's SigLIP NaViT module."""
+"""Configuration for :class:`BagelSiglipNavit`."""
 
 from transformers import PretrainedConfig
 
 
 class BagelSiglipNavitConfig(PretrainedConfig):
+    """BAGEL SigLIP NaViT vision encoder config."""
+
     model_type = "bagel_siglip_navit"
 
     def __init__(
@@ -27,7 +29,7 @@ class BagelSiglipNavitConfig(PretrainedConfig):
         attention_dropout: float = 0.0,
         rope: bool = False,
         **kwargs,
-    ):
+    ) -> None:
         self.hidden_size = hidden_size
         self.output_size = output_size
         self.image_size = image_size
@@ -47,3 +49,6 @@ class BagelSiglipNavitConfig(PretrainedConfig):
         self.attention_dropout = attention_dropout
         self.rope = rope
         super().__init__(**kwargs)
+
+
+__all__ = ["BagelSiglipNavitConfig"]

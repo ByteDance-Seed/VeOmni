@@ -1,7 +1,15 @@
-"""BAGEL flow-generation connector layers between VAE tokens and Qwen2 hidden states."""
+"""BAGEL flow connector.
+
+``embed_latent`` patchifies VAE latent grids, applies rectified-flow timestep
+conditioning, projects latent tokens to MoT hidden width, and writes embeddings
+back to the carrier. ``decode_velocity`` projects MoT hidden states back to
+patch-latent velocity tokens and optionally computes flow MSE.
+"""
+
+from __future__ import annotations
 
 import math
-from typing import Any, Dict, Optional
+from typing import Any
 
 import numpy as np
 import torch
@@ -10,28 +18,11 @@ from transformers import PreTrainedModel
 
 from .configuration import BagelFlowConnectorConfig
 from .modulemixin import BagelFlowConnectorModuleMixin
-
-
-def get_1d_sincos_pos_embed_from_grid(embed_dim: int, pos: np.ndarray) -> np.ndarray:
-    omega = np.arange(embed_dim // 2, dtype=np.float64)
-    omega /= embed_dim / 2.0
-    omega = 1.0 / 10000**omega
-    out = np.einsum("m,d->md", pos.reshape(-1), omega)
-    return np.concatenate([np.sin(out), np.cos(out)], axis=1)
-
-
-def get_2d_sincos_pos_embed(embed_dim: int, grid_size: int) -> np.ndarray:
-    grid_h = np.arange(grid_size, dtype=np.float32)
-    grid_w = np.arange(grid_size, dtype=np.float32)
-    grid = np.meshgrid(grid_w, grid_h)
-    grid = np.stack(grid, axis=0).reshape([2, 1, grid_size, grid_size])
-    emb_h = get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[0])
-    emb_w = get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[1])
-    return np.concatenate([emb_h, emb_w], axis=1)
+from .processing import autocast_enabled_for_device
 
 
 class TimestepEmbedder(nn.Module):
-    def __init__(self, hidden_size: int, frequency_embedding_size: int = 256):
+    def __init__(self, hidden_size: int, frequency_embedding_size: int = 256) -> None:
         super().__init__()
         self.mlp = nn.Sequential(
             nn.Linear(frequency_embedding_size, hidden_size, bias=True),
@@ -52,11 +43,11 @@ class TimestepEmbedder(nn.Module):
 
     def forward(self, t: torch.Tensor) -> torch.Tensor:
         t_freq = self.timestep_embedding(t, self.frequency_embedding_size)
-        return self.mlp(t_freq.to(self.mlp[0].weight.dtype))
+        return self.mlp(t_freq.to(device=self.mlp[0].weight.device, dtype=self.mlp[0].weight.dtype))
 
 
 class PositionEmbedding(nn.Module):
-    def __init__(self, max_num_patch_per_side: int, hidden_size: int):
+    def __init__(self, max_num_patch_per_side: int, hidden_size: int) -> None:
         super().__init__()
         self.max_num_patch_per_side = max_num_patch_per_side
         self.hidden_size = hidden_size
@@ -64,14 +55,35 @@ class PositionEmbedding(nn.Module):
             torch.zeros(max_num_patch_per_side**2, hidden_size),
             requires_grad=False,
         )
-        self._init_weights()
+        self.reset_parameters()
 
-    def _init_weights(self) -> None:
-        pos_embed = get_2d_sincos_pos_embed(self.hidden_size, self.max_num_patch_per_side)
-        self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float())
+    def reset_parameters(self) -> None:
+        self.pos_embed.data.copy_(_get_2d_sincos_pos_embed(self.hidden_size, self.max_num_patch_per_side))
 
     def forward(self, position_ids: torch.LongTensor) -> torch.Tensor:
-        return self.pos_embed[position_ids]
+        return self.pos_embed[position_ids.to(device=self.pos_embed.device)]
+
+
+def _get_2d_sincos_pos_embed(embed_dim: int, grid_size: int) -> torch.Tensor:
+    grid_h = np.arange(grid_size, dtype=np.float32)
+    grid_w = np.arange(grid_size, dtype=np.float32)
+    grid = np.meshgrid(grid_w, grid_h)
+    grid = np.stack(grid, axis=0).reshape(2, 1, grid_size, grid_size)
+    return torch.from_numpy(_get_2d_sincos_pos_embed_from_grid(embed_dim, grid)).float()
+
+
+def _get_2d_sincos_pos_embed_from_grid(embed_dim: int, grid: np.ndarray) -> np.ndarray:
+    emb_h = _get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[0])
+    emb_w = _get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[1])
+    return np.concatenate([emb_h, emb_w], axis=1)
+
+
+def _get_1d_sincos_pos_embed_from_grid(embed_dim: int, pos: np.ndarray) -> np.ndarray:
+    omega = np.arange(embed_dim // 2, dtype=np.float64)
+    omega /= embed_dim / 2.0
+    omega = 1.0 / 10000**omega
+    out = np.einsum("m,d->md", pos.reshape(-1), omega)
+    return np.concatenate([np.sin(out), np.cos(out)], axis=1)
 
 
 class BagelFlowConnector(BagelFlowConnectorModuleMixin, PreTrainedModel):
@@ -81,7 +93,7 @@ class BagelFlowConnector(BagelFlowConnectorModuleMixin, PreTrainedModel):
     _no_split_modules: list[str] = []
     supports_gradient_checkpointing = True
 
-    def __init__(self, config: BagelFlowConnectorConfig):
+    def __init__(self, config: BagelFlowConnectorConfig) -> None:
         super().__init__(config)
         self.gradient_checkpointing = False
         self.time_embedder = TimestepEmbedder(config.hidden_size, config.timestep_frequency_embedding_size)
@@ -89,58 +101,69 @@ class BagelFlowConnector(BagelFlowConnectorModuleMixin, PreTrainedModel):
         self.llm2vae = nn.Linear(config.hidden_size, config.patch_latent_dim)
         self.latent_pos_embed = PositionEmbedding(config.max_latent_size, config.hidden_size)
         self.post_init()
+        nn.init.constant_(self.llm2vae.weight, 0)
+        nn.init.constant_(self.llm2vae.bias, 0)
 
     def _init_weights(self, module: nn.Module) -> None:
         if isinstance(module, PositionEmbedding):
-            module._init_weights()
+            module.reset_parameters()
             return
         super()._init_weights(module)
 
-    def _combine_latent_embeds(
-        self,
-        latents: torch.Tensor,
-        position_ids: torch.LongTensor,
-        timesteps: torch.Tensor,
-    ) -> torch.Tensor:
-        position_ids = position_ids.reshape(-1)
-        timesteps = timesteps.reshape(-1)
-        if timesteps.numel() == 1:
-            timesteps = timesteps.expand(latents.shape[0])
-        if timesteps.numel() != latents.shape[0]:
-            raise ValueError("timesteps must be a scalar or have one value per latent token.")
-
-        latent_embeds = self.vae2llm(latents)
-        ref_device = latent_embeds.device
-        time_emb = self.time_embedder(timesteps.to(device=self.time_embedder.mlp[0].weight.device))
-        pos_emb = self.latent_pos_embed(position_ids.to(device=self.latent_pos_embed.pos_embed.device))
-        return (
-            latent_embeds
-            + time_emb.to(device=ref_device, dtype=latent_embeds.dtype)
-            + pos_emb.to(device=ref_device, dtype=latent_embeds.dtype)
-        )
-
     def embed_latent(
         self,
-        latents: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        timesteps: Optional[torch.Tensor] = None,
+        latents: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        timesteps: torch.Tensor | None = None,
+        conversation_list: Any | None = None,
+        generation_kwargs: dict[str, Any] | None = None,
         **kwargs: Any,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
+        del generation_kwargs, kwargs
+        if latents is None and conversation_list is not None:
+            return self._embed_context_latents(conversation_list)
         if latents is None:
-            return self._embed_latent_graph(**kwargs)
+            dummy = self.dummy_inputs(kind="embed_latent")
+            outputs = self.embed_latent(**dummy)
+            outputs["is_dummy"] = True
+            return outputs
         if position_ids is None or timesteps is None:
             raise ValueError("BagelFlowConnector.embed_latent requires position_ids and timesteps.")
-        latents = latents.to(device=self.device)
-        if not torch.is_autocast_enabled(latents.device.type):
-            latents = latents.to(dtype=self.dtype)
-        position_ids = position_ids.to(dtype=torch.long)
-        latent_embeds = self._combine_latent_embeds(latents, position_ids, timesteps)
-        return {"latent_embeds": latent_embeds.to(dtype=self.dtype)}
 
-    def decode_velocity(self, hidden_states: Optional[torch.Tensor] = None, **kwargs: Any) -> Dict[str, Any]:
+        weight = self.vae2llm.weight
+        latent_dtype = latents.dtype if autocast_enabled_for_device(weight.device) else weight.dtype
+        latents = latents.to(device=weight.device, dtype=latent_dtype)
+        position_ids = position_ids.to(device=self.latent_pos_embed.pos_embed.device, dtype=torch.long).reshape(-1)
+        timesteps = timesteps.to(device=self.time_embedder.mlp[0].weight.device, dtype=torch.float32).reshape(-1)
+        if timesteps.numel() not in {1, latents.shape[0]}:
+            raise ValueError("timesteps must be a scalar or have one value per latent token.")
+        if position_ids.numel() != latents.shape[0]:
+            raise ValueError("position_ids must have one value per latent token.")
+
+        latent_embeds = self.vae2llm(latents)
+        time_embeds = self.time_embedder(timesteps)
+        pos_embeds = self.latent_pos_embed(position_ids)
+        return {
+            "latent_embeds": latent_embeds
+            + time_embeds.to(device=latent_embeds.device, dtype=latent_embeds.dtype)
+            + pos_embeds.to(device=latent_embeds.device, dtype=latent_embeds.dtype)
+        }
+
+    def decode_velocity(self, hidden_states: torch.Tensor | None = None, **kwargs: Any) -> dict[str, Any]:
+        del kwargs
         if hidden_states is None:
-            return self._decode_velocity_graph(**kwargs)
-        return {"velocity": self.llm2vae(hidden_states.to(device=self.device, dtype=self.dtype))}
+            dummy = self.dummy_inputs(kind="decode_velocity")
+            outputs = self.decode_velocity(**dummy)
+            outputs["is_dummy"] = True
+            return outputs
+        weight = self.llm2vae.weight
+        hidden_states = hidden_states.to(device=weight.device, dtype=weight.dtype)
+        return {"velocity": self.llm2vae(hidden_states)}
 
-    def forward(self, **kwargs: Any) -> Dict[str, Any]:  # type: ignore[override]
-        return self.embed_latent(**kwargs)
+
+__all__ = [
+    "BagelFlowConnector",
+    "BagelFlowConnectorConfig",
+    "PositionEmbedding",
+    "TimestepEmbedder",
+]

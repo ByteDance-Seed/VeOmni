@@ -1,0 +1,4 @@
+# DAG: image carrier -> bagel_vae.encode -> output carrier; output carrier -> bagel_vae.decode -> image tensor.
+training_graph:
+  - { from: bagel_vae.encode, to: bagel_vae.decode }
+  - { from: bagel_vae.decode, to: end }

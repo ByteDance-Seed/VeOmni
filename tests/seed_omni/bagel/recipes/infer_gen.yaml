@@ -1,313 +1,172 @@
-image_gen:
+text_only_t2i_cfg_disabled:
   - stimulus:
-      prompt: "A small ceramic teapot on a wooden table, soft morning light."
-      infer_mode: gen
-      max_new_tokens: 2
-      max_flow_steps: 1
-      image_height: 1024
-      image_width: 1024
-      latent_downsample: 16
-      num_timesteps: 50
-      timestep_shift: 3.0
-      cfg_text_scale: 1.0
-      cfg_img_scale: 1.0
-      cfg_interval: [0.0, 1.0]
-      cfg_renorm_min: 0.0
-      cfg_renorm_type: global
-      enable_taylorseer: false
+      conversation_list:
+        - type: text
+          role: user
+          value:
+            kind: text
+            text: "a red square"
+      generation_kwargs:
+        image_height: 64
+        image_width: 64
+        image_shapes: [64, 64]
+        num_timesteps: 2
+        timestep_shift: 3.0
+        max_new_tokens: 8
+        max_think_token_n: 1
+        think: false
+        do_sample: false
+        cfg_text_scale: 1.0
+        cfg_img_scale: 1.0
     reference:
-      kind: image_gen
+      oracle: hf_model
+      kind: infer_gen
+    gate:
+      requires_reference_checkpoint: true
+      requires_v2_model: true
     runs:
       graph:
-        - id: base_one_step
+        - id: denoise_one_step
           probes:
-            - image.latent_embeds_sample
-            - image.packed_sequence_sample
-            - image.hidden_sample
-            - image.velocity
-            - image.x_t
-      module:
-        - id: base_one_step
-          probes:
-            - image.latent_embeds_sample
-            - image.packed_sequence_sample
-            - image.hidden_sample
-            - image.velocity
-            - image.x_t
+            - infer_gen.timestep
+            - infer_gen.latent_query
+            - infer_gen.denoise_hidden
+            - infer_gen.velocity
 
+text_only_t2i_multistep_cfg_disabled:
   - stimulus:
-      prompt: "A panoramic watercolor view of a quiet beach at dusk."
-      infer_mode: gen
-      max_new_tokens: 2
-      max_flow_steps: 1
-      image_height: 768
-      image_width: 1344
-      latent_downsample: 16
-      num_timesteps: 50
-      timestep_shift: 3.0
-      cfg_text_scale: 1.0
-      cfg_img_scale: 1.0
-      cfg_interval: [0.0, 1.0]
-      cfg_renorm_min: 0.0
-      cfg_renorm_type: global
-      enable_taylorseer: false
+      conversation_list:
+        - type: text
+          role: user
+          value:
+            kind: text
+            text: "a red square"
+      generation_kwargs:
+        image_height: 64
+        image_width: 64
+        image_shapes: [64, 64]
+        num_timesteps: 3
+        timestep_shift: 3.0
+        max_new_tokens: 16
+        max_think_token_n: 1
+        think: false
+        do_sample: false
+        cfg_text_scale: 1.0
+        cfg_img_scale: 1.0
     reference:
-      kind: image_gen
+      oracle: hf_model
+      kind: infer_gen
+    gate:
+      requires_reference_checkpoint: true
+      requires_v2_model: true
     runs:
       graph:
-        - id: wide_one_step
+        - id: denoise_two_steps
           probes:
-            - image.latent_embeds_sample
-            - image.packed_sequence_sample
-            - image.hidden_sample
-            - image.velocity
-            - image.x_t
-      module:
-        - id: wide_one_step
-          probes:
-            - image.latent_embeds_sample
-            - image.packed_sequence_sample
-            - image.hidden_sample
-            - image.velocity
-            - image.x_t
+            - infer_gen.timestep_all
+            - infer_gen.latent_query_all
+            - infer_gen.denoise_hidden_all
+            - infer_gen.velocity_all
 
+text_only_t2i_cfg_text:
   - stimulus:
-      prompt: "A tiny red robot painting flowers in a quiet studio."
-      infer_mode: gen
-      max_new_tokens: 2
-      max_flow_steps: 1
-      image_height: 512
-      image_width: 512
-      latent_downsample: 16
-      num_timesteps: 50
-      timestep_shift: 3.0
-      cfg_text_scale: 4.0
-      cfg_img_scale: 1.0
-      cfg_interval: [0.0, 1.0]
-      cfg_renorm_min: 0.0
-      cfg_renorm_type: global
-      enable_taylorseer: false
+      conversation_list:
+        - type: text
+          role: user
+          value:
+            kind: text
+            text: "a red square"
+      generation_kwargs:
+        image_height: 64
+        image_width: 64
+        image_shapes: [64, 64]
+        num_timesteps: 2
+        timestep_shift: 3.0
+        max_new_tokens: 8
+        max_think_token_n: 1
+        think: false
+        do_sample: false
+        cfg_text_scale: 4.0
+        cfg_img_scale: 1.0
     reference:
-      kind: image_gen
+      oracle: hf_model
+      kind: infer_gen
+    gate:
+      requires_reference_checkpoint: true
+      requires_v2_model: true
     runs:
       graph:
-        - id: cfg_text_one_step
+        - id: denoise_one_step
           probes:
-            - image.base_velocity
-            - image.cfg_text_hidden_sample
-            - image.cfg_text_velocity
-            - image.velocity
-            - image.x_t
-      module:
-        - id: cfg_text_one_step
-          probes:
-            - image.base_velocity
-            - image.cfg_text_hidden_sample
-            - image.cfg_text_velocity
-            - image.velocity
-            - image.x_t
+            - infer_gen.timestep
+            - infer_gen.latent_query
+            - infer_gen.denoise_hidden
+            - infer_gen.merged_velocity
 
+text_only_t2i_multistep_cfg_text:
   - stimulus:
-      prompt: "A blue glass owl sitting beside a candle."
-      infer_mode: gen
-      max_new_tokens: 2
-      max_flow_steps: 1
-      image_height: 512
-      image_width: 512
-      latent_downsample: 16
-      num_timesteps: 50
-      timestep_shift: 3.0
-      cfg_text_scale: 4.0
-      cfg_img_scale: 2.0
-      cfg_interval: [0.0, 1.0]
-      cfg_renorm_min: 0.0
-      cfg_renorm_type: global
-      enable_taylorseer: false
+      conversation_list:
+        - type: text
+          role: user
+          value:
+            kind: text
+            text: "a red square"
+      generation_kwargs:
+        image_height: 64
+        image_width: 64
+        image_shapes: [64, 64]
+        num_timesteps: 3
+        timestep_shift: 3.0
+        max_new_tokens: 24
+        max_think_token_n: 1
+        think: false
+        do_sample: false
+        cfg_text_scale: 4.0
+        cfg_img_scale: 1.0
+        cfg_interval: [0.4, 1.0]
     reference:
-      kind: image_gen
+      oracle: hf_model
+      kind: infer_gen
+    gate:
+      requires_reference_checkpoint: true
+      requires_v2_model: true
     runs:
       graph:
-        - id: cfg_image_one_step
+        - id: denoise_two_steps
           probes:
-            - image.base_velocity
-            - image.cfg_text_hidden_sample
-            - image.cfg_img_hidden_sample
-            - image.cfg_text_velocity
-            - image.cfg_img_velocity
-            - image.velocity
-            - image.x_t
-      module:
-        - id: cfg_image_one_step
-          probes:
-            - image.base_velocity
-            - image.cfg_text_hidden_sample
-            - image.cfg_img_hidden_sample
-            - image.cfg_text_velocity
-            - image.cfg_img_velocity
-            - image.velocity
-            - image.x_t
+            - infer_gen.timestep_all
+            - infer_gen.latent_query_all
+            - infer_gen.denoise_hidden_all
+            - infer_gen.merged_velocity_all
 
+module_flow_connector_decode_t2i_velocity_cfg_disabled:
   - stimulus:
-      prompt: "A paper boat floating through a neon canal."
-      infer_mode: gen
-      max_new_tokens: 2
-      max_flow_steps: 1
-      image_height: 512
-      image_width: 512
-      latent_downsample: 16
-      num_timesteps: 50
-      timestep_shift: 3.0
-      cfg_text_scale: 4.0
-      cfg_img_scale: 1.0
-      cfg_interval: [0.0, 1.0]
-      cfg_renorm_min: 0.8
-      cfg_renorm_type: channel
-      enable_taylorseer: false
+      conversation_list:
+        - type: text
+          role: user
+          value:
+            kind: text
+            text: "a red square"
+      generation_kwargs:
+        image_height: 64
+        image_width: 64
+        image_shapes: [64, 64]
+        num_timesteps: 2
+        timestep_shift: 3.0
+        max_new_tokens: 8
+        max_think_token_n: 1
+        think: false
+        do_sample: false
+        cfg_text_scale: 1.0
+        cfg_img_scale: 1.0
     reference:
-      kind: image_gen
+      oracle: hf_module.flow_connector_decode
+      kind: infer_gen
+    gate:
+      requires_reference_checkpoint: true
+      requires_v2_model: true
     runs:
-      graph:
-        - id: cfg_renorm_one_step
-          probes:
-            - image.base_velocity
-            - image.cfg_text_velocity
-            - image.velocity
-            - image.x_t
       module:
-        - id: cfg_renorm_one_step
+        - id: velocity_direct
           probes:
-            - image.base_velocity
-            - image.cfg_text_velocity
-            - image.velocity
-            - image.x_t
-
-  - stimulus:
-      prompt: "A silver toy train crossing a small wooden bridge."
-      infer_mode: gen
-      max_new_tokens: 6
-      max_flow_steps: 3
-      image_height: 512
-      image_width: 512
-      latent_downsample: 16
-      num_timesteps: 50
-      timestep_shift: 3.0
-      cfg_text_scale: 1.0
-      cfg_img_scale: 1.0
-      cfg_interval: [0.0, 1.0]
-      cfg_renorm_min: 0.0
-      cfg_renorm_type: global
-      enable_taylorseer: false
-    reference:
-      kind: image_gen
-    runs:
-      graph:
-        - id: multi_step_three_steps
-          probes:
-            - image.velocity
-            - image.x_t
-      module:
-        - id: multi_step_three_steps
-          probes:
-            - image.velocity
-            - image.x_t
-          options:
-            max_steps: 8
-
-  - stimulus:
-      prompt: "A small clay house under a clear sky."
-      infer_mode: gen
-      max_new_tokens: 6
-      max_flow_steps: 2
-      image_height: 512
-      image_width: 512
-      latent_downsample: 16
-      num_timesteps: 50
-      timestep_shift: 3.0
-      cfg_text_scale: 1.0
-      cfg_img_scale: 1.0
-      cfg_interval: [0.0, 1.0]
-      cfg_renorm_min: 0.0
-      cfg_renorm_type: global
-      enable_taylorseer: false
-      enable_decode_smoke: true
-    reference:
-      kind: image_gen
-    runs:
-      graph:
-        - id: base_decode_smoke
-          probes:
-            - image.generated_image_count
-            - image.generated_image_size
-      module:
-        - id: base_decode_smoke
-          probes:
-            - image.generated_image_count
-            - image.generated_image_size
-          options:
-            max_steps: 8
-
-  - stimulus:
-      prompt: "A tiny red robot painting flowers in a quiet studio."
-      infer_mode: gen
-      max_new_tokens: 6
-      max_flow_steps: 2
-      image_height: 512
-      image_width: 512
-      latent_downsample: 16
-      num_timesteps: 50
-      timestep_shift: 3.0
-      cfg_text_scale: 4.0
-      cfg_img_scale: 1.0
-      cfg_interval: [0.0, 1.0]
-      cfg_renorm_min: 0.0
-      cfg_renorm_type: global
-      enable_taylorseer: false
-      enable_decode_smoke: true
-    reference:
-      kind: image_gen
-    runs:
-      graph:
-        - id: cfg_text_decode_smoke
-          probes:
-            - image.generated_image_count
-            - image.generated_image_size
-      module:
-        - id: cfg_text_decode_smoke
-          probes:
-            - image.generated_image_count
-            - image.generated_image_size
-          options:
-            max_steps: 8
-
-  - stimulus:
-      prompt: "A blue glass owl sitting beside a candle."
-      infer_mode: gen
-      max_new_tokens: 6
-      max_flow_steps: 2
-      image_height: 512
-      image_width: 512
-      latent_downsample: 16
-      num_timesteps: 50
-      timestep_shift: 3.0
-      cfg_text_scale: 4.0
-      cfg_img_scale: 2.0
-      cfg_interval: [0.0, 1.0]
-      cfg_renorm_min: 0.0
-      cfg_renorm_type: global
-      enable_taylorseer: false
-      enable_decode_smoke: true
-    reference:
-      kind: image_gen
-    runs:
-      graph:
-        - id: cfg_image_decode_smoke
-          probes:
-            - image.generated_image_count
-            - image.generated_image_size
-      module:
-        - id: cfg_image_decode_smoke
-          probes:
-            - image.generated_image_count
-            - image.generated_image_size
-          options:
-            max_steps: 8
+            - infer_gen.flow_decode_velocity

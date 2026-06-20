@@ -1,0 +1,4 @@
+# Module-only BAGEL flow connector decode parity config.
+bagel_flow_connector:
+  model:
+    model_path: bagel_flow_connector

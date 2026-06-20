@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Iterable, Mapping, MutableMapping
 from contextlib import contextmanager
 from typing import Any, Iterator
@@ -9,8 +10,10 @@ from typing import Any, Iterator
 import torch
 from torch import nn
 
-from tests.seed_omni.parity_suite.core import to_cpu
+from tests.seed_omni.parity_suite.core import PARITY_ENABLE_ENV, to_cpu
+from veomni.models.seed_omni.conversation import ConversationItem, is_dummy
 from veomni.models.seed_omni.module import ModuleMixin
+from veomni.models.seed_omni.observer import _materialize_observed_value
 
 
 ObserverSink = MutableMapping[tuple[str, str], list[dict[str, Any]]]
@@ -26,10 +29,49 @@ def arm_generation_observer(
     sink: ObserverSink | None = None,
     max_tensor_numel: int = 1_000_000,
 ) -> Iterator[ObserverSink]:
-    """Arm the durable V2 generation observer through ``ModuleMixin``."""
+    """Arm V2 generation observation for parity-suite probes."""
 
-    with ModuleMixin.arm_observer(whitelist, sink=sink, max_tensor_numel=max_tensor_numel) as records:
+    normalized = _normalize_observation_whitelist(whitelist)
+    records: ObserverSink = sink if sink is not None else {}
+    if os.environ.get(PARITY_ENABLE_ENV) != "1":
         yield records
+        return
+
+    original_observe = ModuleMixin.observe
+
+    def observe_with_parity_capture(
+        self: ModuleMixin,
+        state: str,
+        node: str,
+        out: Mapping[str, Any],
+    ) -> None:
+        del self
+        if not isinstance(out, Mapping):
+            return
+        record_node_output(
+            records,
+            normalized,
+            state=state,
+            node=node,
+            out=out,
+            max_tensor_numel=max_tensor_numel,
+        )
+        conversation_list = out.get("conversation_list")
+        if conversation_list is not None:
+            record_conversation_output(
+                records,
+                normalized,
+                state=state,
+                node=node,
+                conversation_list=conversation_list,
+                max_tensor_numel=max_tensor_numel,
+            )
+
+    ModuleMixin.observe = observe_with_parity_capture
+    try:
+        yield records
+    finally:
+        ModuleMixin.observe = original_observe
 
 
 @contextmanager
@@ -97,3 +139,90 @@ def record_module_output(
     }
     if record:
         observations.setdefault((state, node), []).append(record)
+
+
+def record_node_output(
+    observations: ModuleObservationSink,
+    whitelist: Mapping[tuple[str, str], frozenset[str]],
+    *,
+    state: str,
+    node: str,
+    out: Mapping[str, Any],
+    max_tensor_numel: int = 1_000_000,
+) -> None:
+    """Record whitelisted top-level node fields for parity observations."""
+
+    fields = whitelist.get((state, node))
+    if not fields:
+        return
+    record: dict[str, Any] = {}
+    for field in fields:
+        if field not in out or field == "conversation_list":
+            continue
+        record[field] = _materialize_observed_value(
+            out[field],
+            max_tensor_numel=max_tensor_numel,
+            field_path=f"{state}:{node}.{field}",
+        )
+    if record:
+        observations.setdefault((state, node), []).append(record)
+
+
+def record_conversation_output(
+    observations: ModuleObservationSink,
+    whitelist: Mapping[tuple[str, str], frozenset[str]],
+    *,
+    state: str,
+    node: str,
+    conversation_list: Any,
+    max_tensor_numel: int = 1_000_000,
+) -> None:
+    """Record whitelisted tensor fields from a conversation-list carrier.
+
+    This is the default observation path for conversation-contract nodes:
+    ``field: value`` maps to ``item.value`` and other fields map to
+    ``item.meta[field]``. Extend this helper before adding per-model driver
+    hooks for ordinary carrier fields.
+    """
+
+    fields = whitelist.get((state, node))
+    if not fields:
+        return
+    for item in _iter_conversation_items(conversation_list):
+        if is_dummy(item):
+            continue
+        record: dict[str, Any] = {}
+        if "value" in fields and torch.is_tensor(item.value) and item.value.numel() <= max_tensor_numel:
+            record["value"] = to_cpu(item.value)
+        for field in fields:
+            if field == "value":
+                continue
+            value = item.meta.get(field)
+            if torch.is_tensor(value) and value.numel() <= max_tensor_numel:
+                record[field] = to_cpu(value)
+        if record:
+            record["_item_type"] = item.type
+            observations.setdefault((state, node), []).append(record)
+
+
+def _normalize_observation_whitelist(
+    whitelist: Mapping[tuple[str, str], Iterable[str]],
+) -> dict[tuple[str, str], frozenset[str]]:
+    return {
+        (str(state), str(node)): frozenset(str(field) for field in fields)
+        for (state, node), fields in whitelist.items()
+    }
+
+
+def _iter_conversation_items(conversation_list: Any) -> Iterator[ConversationItem]:
+    if isinstance(conversation_list, ConversationItem):
+        yield conversation_list
+        return
+    if isinstance(conversation_list, list):
+        for entry in conversation_list:
+            if isinstance(entry, ConversationItem):
+                yield entry
+            elif isinstance(entry, list):
+                for item in entry:
+                    if isinstance(item, ConversationItem):
+                        yield item

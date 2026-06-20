@@ -14,9 +14,8 @@ from tests.seed_omni.parity_suite.core.runtime import (
 )
 
 
-@pytest.mark.parametrize(
-    ("raw", "expected"),
-    [
+def test_resolve_torch_dtype_accepts_known_aliases() -> None:
+    cases = [
         (None, torch.float32),
         (torch.float16, torch.float16),
         ("fp32", torch.float32),
@@ -25,10 +24,10 @@ from tests.seed_omni.parity_suite.core.runtime import (
         ("float16", torch.float16),
         ("bf16", torch.bfloat16),
         ("bfloat16", torch.bfloat16),
-    ],
-)
-def test_resolve_torch_dtype_accepts_known_aliases(raw: object, expected: torch.dtype) -> None:
-    assert resolve_torch_dtype(raw) is expected
+    ]
+
+    for raw, expected in cases:
+        assert resolve_torch_dtype(raw) is expected
 
 
 def test_resolve_torch_dtype_rejects_unknown_string() -> None:

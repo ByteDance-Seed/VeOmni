@@ -1,0 +1,8 @@
+# Module-only BAGEL Qwen2-MoT parity config.
+bagel_text_encoder:
+  model:
+    model_path: bagel_text_encoder
+
+bagel_qwen2_mot:
+  model:
+    model_path: bagel_qwen2_mot

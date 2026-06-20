@@ -1,0 +1,15 @@
+generation_graph:
+  initial: prompt_encode
+
+  states:
+    prompt_encode:
+      body:
+        - { from: bagel_text_encoder.prompt_encode, to: end }
+      transitions:
+        - { condition: { type: default }, next_state: done }
+
+generation_kwargs:
+  max_new_tokens: 1
+  temperature: 0.0
+  top_p: 1.0
+  do_sample: false

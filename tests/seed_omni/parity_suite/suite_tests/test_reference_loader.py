@@ -1,129 +1,122 @@
-"""Tests for generic reference oracle loading contracts."""
+"""Tests for generic hf_model subject loading contracts."""
 
 from __future__ import annotations
 
-import sys
 import types
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
-from tests.seed_omni.parity_suite.reference import model as reference_model
-from tests.seed_omni.parity_suite.reference.model import ParityReferenceModel, load_transformers_reference_model
+import pytest
+import torch
+from torch import nn
+
+from tests.seed_omni.parity_suite.reference.oracles import hf_model
+from tests.seed_omni.parity_suite.reference.oracles.hf_model import HfModelReferenceOracle, HfModelSubject
 
 
-def test_reference_model_registers_auto_classes(monkeypatch: Any) -> None:
-    calls: list[tuple[str, Any]] = []
+class _ReferenceSubject(HfModelSubject):
+    def __init__(self, case: Any) -> None:
+        super().__init__(case)
+        self.root = nn.Linear(1, 1)
 
-    class Config:
-        model_type = "fake"
-
-    class Reference(ParityReferenceModel):
-        config_class = Config
-
-    class AutoConfig:
-        @staticmethod
-        def register(model_type: str, config_class: type[Any], *, exist_ok: bool) -> None:
-            calls.append(("config", model_type, config_class, exist_ok))
-
-    class AutoModel:
-        @staticmethod
-        def register(config_class: type[Any], model_class: type[Any], *, exist_ok: bool) -> None:
-            calls.append(("model", config_class, model_class, exist_ok))
-
-    monkeypatch.setitem(sys.modules, "transformers", types.SimpleNamespace(AutoConfig=AutoConfig, AutoModel=AutoModel))
-
-    Reference.register_auto_model(exist_ok=False)
-
-    assert calls == [
-        ("config", "fake", Config, False),
-        ("model", Config, Reference, False),
-    ]
+    @property
+    def hook_root(self) -> nn.Module:
+        return self.root
 
 
-def test_transformers_loader_registers_reference_class_before_load(monkeypatch: Any) -> None:
+def test_hf_model_oracle_loads_subject_class(monkeypatch: Any, tmp_path: Path) -> None:
     events: list[tuple[str, Any]] = []
+    checkpoint = tmp_path / "checkpoint"
+
+    class Reference(_ReferenceSubject):
+        @classmethod
+        def load_reference_subject(
+            cls,
+            *,
+            case: Any,
+            checkpoint: Path | None,
+            device: torch.device,
+            dtype: torch.dtype,
+            **kwargs: Any,
+        ) -> HfModelSubject:
+            events.append(("load_subject", case.node_id, checkpoint, device, dtype, kwargs))
+            return cls(case)
 
     def import_module(name: str) -> types.ModuleType:
         events.append(("import", name))
         module = types.ModuleType(name)
-
-        class Reference:
-            @staticmethod
-            def register_auto_model() -> None:
-                events.append(("register", Reference))
-
         module.Reference = Reference
         return module
 
-    class AutoModel:
-        @staticmethod
-        def from_pretrained(model_id: Any, **kwargs: Any) -> dict[str, Any]:
-            events.append(("from_pretrained", model_id))
-            return {"model_id": model_id}
+    monkeypatch.setattr(hf_model.importlib, "import_module", import_module)
 
-    monkeypatch.setattr(reference_model.importlib, "import_module", import_module)
-    monkeypatch.setitem(sys.modules, "transformers", types.SimpleNamespace(AutoModel=AutoModel))
+    oracle = HfModelReferenceOracle(case=_case(checkpoint=checkpoint, load_kwargs={"local_files_only": True}))
+    subject = oracle._load(device=torch.device("cpu"), dtype=torch.float32)
 
-    result = load_transformers_reference_model(module="tests.fake_reference_registration:Reference", checkpoint=None)
+    assert isinstance(subject, Reference)
+    assert events == [
+        ("import", "tests.fake_reference_subject"),
+        (
+            "load_subject",
+            "toy.full.graph.forward",
+            checkpoint,
+            torch.device("cpu"),
+            torch.float32,
+            {"local_files_only": True},
+        ),
+    ]
 
-    assert result == {"model_id": "tests.fake_reference_registration:Reference"}
-    assert events[0] == ("import", "tests.fake_reference_registration")
-    assert events[1][0] == "register"
-    assert events[2] == ("from_pretrained", "tests.fake_reference_registration:Reference")
+
+def test_hf_model_oracle_requires_subject_loader(monkeypatch: Any) -> None:
+    module = types.ModuleType("tests.fake_reference_subject")
+    module.Reference = object
+    monkeypatch.setattr(hf_model.importlib, "import_module", lambda _: module)
+
+    oracle = HfModelReferenceOracle(case=_case())
+
+    with pytest.raises(TypeError, match="load_reference_subject"):
+        oracle._load(device=torch.device("cpu"), dtype=torch.float32)
 
 
-def test_transformers_loader_prefers_checkpoint(monkeypatch: Any, tmp_path: Path) -> None:
-    calls: list[tuple[Any, dict[str, Any]]] = []
+def test_hf_model_oracle_requires_subject_return(monkeypatch: Any) -> None:
+    class Reference:
+        @classmethod
+        def load_reference_subject(cls, **kwargs: Any) -> object:
+            del kwargs
+            return object()
 
-    class AutoModel:
-        @staticmethod
-        def from_pretrained(model_id: Any, **kwargs: Any) -> dict[str, Any]:
-            calls.append((model_id, kwargs))
-            return {"model_id": model_id}
+    module = types.ModuleType("tests.fake_reference_subject")
+    module.Reference = Reference
+    monkeypatch.setattr(hf_model.importlib, "import_module", lambda _: module)
 
-    module = types.ModuleType("tests.fake_reference_registration")
-    module.Reference = types.SimpleNamespace(register_auto_model=lambda: calls.append(("register", {})))
-    monkeypatch.setitem(sys.modules, "tests.fake_reference_registration", module)
-    monkeypatch.setitem(sys.modules, "transformers", types.SimpleNamespace(AutoModel=AutoModel))
-    checkpoint = tmp_path / "checkpoint"
+    oracle = HfModelReferenceOracle(case=_case())
 
-    result = load_transformers_reference_model(
-        module="tests.fake_reference_registration:Reference",
+    with pytest.raises(TypeError, match="HfModelSubject"):
+        oracle._load(device=torch.device("cpu"), dtype=torch.float32)
+
+
+def test_hf_model_oracle_requires_explicit_reference_class() -> None:
+    oracle = HfModelReferenceOracle(case=_case(module="tests.fake_reference_subject"))
+
+    with pytest.raises(ValueError, match="module.path:ClassName"):
+        oracle._load(device=torch.device("cpu"), dtype=torch.float32)
+
+
+def _case(
+    *,
+    module: str = "tests.fake_reference_subject:Reference",
+    checkpoint: Path | None = None,
+    load_kwargs: dict[str, Any] | None = None,
+) -> SimpleNamespace:
+    hf_model_spec = SimpleNamespace(
+        module=module,
         checkpoint=checkpoint,
-        local_files_only=True,
+        load_kwargs=load_kwargs or {},
+        options={},
     )
-
-    assert result == {"model_id": checkpoint}
-    assert calls == [("register", {}), (checkpoint, {"local_files_only": True})]
-
-
-def test_transformers_loader_falls_back_to_module(monkeypatch: Any) -> None:
-    calls: list[tuple[Any, dict[str, Any]]] = []
-
-    class AutoModel:
-        @staticmethod
-        def from_pretrained(model_id: Any, **kwargs: Any) -> dict[str, Any]:
-            calls.append((model_id, kwargs))
-            return {"model_id": model_id}
-
-    module = types.ModuleType("tests.fake_reference_registration")
-    module.Reference = types.SimpleNamespace(register_auto_model=lambda: None)
-    monkeypatch.setitem(sys.modules, "tests.fake_reference_registration", module)
-    monkeypatch.setitem(sys.modules, "transformers", types.SimpleNamespace(AutoModel=AutoModel))
-
-    result = load_transformers_reference_model(
-        module="tests.fake_reference_registration:Reference",
-        checkpoint=None,
+    return SimpleNamespace(
+        node_id="toy.full.graph.forward",
+        model=SimpleNamespace(reference=SimpleNamespace(hf_model=hf_model_spec)),
+        recipe=SimpleNamespace(reference={"oracle": "hf_model", "kind": "train_forward"}),
     )
-
-    assert result == {"model_id": "tests.fake_reference_registration:Reference"}
-    assert calls == [("tests.fake_reference_registration:Reference", {})]
-
-
-def test_transformers_loader_requires_explicit_reference_class() -> None:
-    try:
-        load_transformers_reference_model(module="tests.fake_reference_registration", checkpoint=None)
-    except ValueError as exc:
-        assert "module.path:ClassName" in str(exc)
-    else:
-        raise AssertionError("load_transformers_reference_model should require an explicit reference class.")

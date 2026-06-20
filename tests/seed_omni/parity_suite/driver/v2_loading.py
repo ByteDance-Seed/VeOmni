@@ -21,6 +21,8 @@ class V2LoadingMixin:
 
     case: ParityCase
 
+    # Public V2 loading entry -----------------------------------------------------
+
     def load_v2_model(self, *, device: torch.device, dtype: torch.dtype) -> OmniModel:
         """Load the V2 model under test."""
 
@@ -28,6 +30,8 @@ class V2LoadingMixin:
         config = load_graph_active_omni_config(self.case, module_names)
         modules = self.load_v2_modules(config.module_names, device=device, dtype=dtype)
         return OmniModel(config, modules).eval()
+
+    # Driver loading hooks --------------------------------------------------------
 
     def v2_module_names(self) -> frozenset[str]:
         """Return the complete module set referenced by the selected V2 graph."""
@@ -47,4 +51,9 @@ class V2LoadingMixin:
         while keeping the shared graph-driven config behavior.
         """
 
-        return load_graph_active_omni_modules(self.case, module_names, device=device, dtype=dtype)
+        return load_graph_active_omni_modules(
+            self.case,
+            module_names,
+            device=device,
+            dtype=dtype,
+        )

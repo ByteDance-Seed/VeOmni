@@ -1,357 +1,152 @@
-"""SeedOmni graph hooks for BAGEL's SigLIP NaViT module."""
+"""SeedOmni V2 hooks for BAGEL's SigLIP NaViT vision encoder."""
 
-from typing import Any, Dict, Optional
+from __future__ import annotations
 
-import numpy as np
+from typing import Any
+
 import torch
-from PIL import Image
 
 from ....conversation import ConversationItem
 from ....module import ModuleMixin, post_forward, pre_forward
-from ..packer import append_dummy_anchor, conversation_samples, get_packed_batch
+from ....tracemixin import TraceMixin
+from .configuration import BagelSiglipNavitConfig
+from .processing import image_items, prepare_image_batch, scatter_image_embeds, user_raw_image_items
 
 
 class BagelSiglipNavitModuleMixin(ModuleMixin):
+    """Carrier hooks for BAGEL visual-understanding image features."""
+
     def init_omni_state(self) -> None:
-        self._conversation_carrier: Optional[list[list[ConversationItem]]] = None
-        self._raw_training_image_items: list[ConversationItem] = []
-        self._bagel_packed_batch: Optional[dict[str, Any]] = None
-        self._bagel_packed_skip: bool = False
+        self._conversation_carrier: list[list[ConversationItem]] | None = None
+        self._image_items: list[ConversationItem] = []
+        self._image_token_lens: torch.Tensor | None = None
 
     @pre_forward("forward")
     def forward_pre(
         self,
-        conversation_list: Optional[list[list[ConversationItem]]] = None,
-        bagel_packed_batch: Optional[dict[str, Any]] = None,
+        conversation_list: list[list[ConversationItem]] | None = None,
         **kwargs: Any,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         del kwargs
-        if bagel_packed_batch is None:
-            bagel_packed_batch = get_packed_batch(conversation_list)
-        self._bagel_packed_batch = bagel_packed_batch
         self._conversation_carrier = conversation_list
-        self._raw_training_image_items = []
-        if bagel_packed_batch is None and conversation_list is not None:
-            self._raw_training_image_items = [
-                item
-                for sample in conversation_samples(conversation_list)
-                for item in sample
-                if item.type == "image" and item.role == "user" and item.meta.get("bagel_role") != "image_vae_context"
-            ]
-            if not self._raw_training_image_items:
-                self._bagel_packed_skip = True
-                return self.dummy_inputs()
-            pixel_values: list[torch.Tensor] = []
-            position_ids: list[torch.Tensor] = []
-            token_lens: list[torch.Tensor] = []
-            for item in self._raw_training_image_items:
-                item_pixel_values, item_position_ids, item_token_lens = self._prepare_image_item(item)
-                pixel_values.append(item_pixel_values)
-                position_ids.append(item_position_ids.reshape(-1))
-                token_lens.append(item_token_lens.reshape(-1))
-            vit_token_lens = torch.cat(token_lens).to(device=self.device, dtype=torch.int32)
-            return {
-                "packed_pixel_values": torch.cat(pixel_values, dim=0).to(device=self.device, dtype=self.dtype),
-                "packed_flattened_position_ids": torch.cat(position_ids, dim=0).to(
-                    device=self.device, dtype=torch.long
-                ),
-                "cu_seqlens": torch.nn.functional.pad(torch.cumsum(vit_token_lens, dim=0), (1, 0)).to(torch.int32),
-                "max_seqlen": int(vit_token_lens.max().item()),
-            }
-        self._bagel_packed_skip = bagel_packed_batch is None or "packed_vit_tokens" not in bagel_packed_batch
-        if self._bagel_packed_skip:
-            return self.dummy_inputs()
-        vit_token_lens = bagel_packed_batch["vit_token_seqlens"].to(device=self.device, dtype=torch.int32).reshape(-1)
-        return {
-            "packed_pixel_values": bagel_packed_batch["packed_vit_tokens"].to(device=self.device, dtype=self.dtype),
-            "packed_flattened_position_ids": bagel_packed_batch["packed_vit_position_ids"]
-            .to(device=self.device, dtype=torch.long)
-            .reshape(-1),
-            "cu_seqlens": torch.nn.functional.pad(torch.cumsum(vit_token_lens, dim=0), (1, 0)).to(torch.int32),
-            "max_seqlen": int(vit_token_lens.max().item()),
-        }
+        self._image_items = image_items(conversation_list)
+        self._image_token_lens = None
+        if not self._image_items:
+            return {"patchified_pixel_values": None}
+
+        inputs = prepare_image_batch(
+            self._image_items,
+            config=self.config,
+            device=self.device,
+            dtype=self.dtype,
+        )
+        self._image_token_lens = inputs["token_lens"]
+        return inputs
 
     @post_forward("forward")
-    def forward_post(self, **outputs: Any) -> Dict[str, Any]:
-        batch = self._bagel_packed_batch
-        skip = self._bagel_packed_skip
+    def forward_post(
+        self,
+        image_embeds: torch.Tensor,
+        token_lens: torch.Tensor | None = None,
+        is_dummy: bool = False,
+    ) -> dict[str, Any]:
         conversation = self._conversation_carrier
-        raw_items = self._raw_training_image_items
-        self._bagel_packed_batch = None
+        image_items = self._image_items
         self._conversation_carrier = None
-        self._raw_training_image_items = []
-        self._bagel_packed_skip = False
-        dummy_anchor = outputs["image_embeds"].sum() * 0.0 if skip else None
-        if batch is None and raw_items:
-            image_embeds = outputs["image_embeds"]
-            offset = 0
-            for item in raw_items:
-                vit_token_lens = item.meta["vit_token_lens"].detach().reshape(-1).to(dtype=torch.int32)
-                length = int(vit_token_lens.sum().item())
-                item.meta["packed_vit_embeds"] = image_embeds[offset : offset + length]
-                item.meta["image_embeds"] = image_embeds[offset : offset + length].detach()
-                item.meta["image_embeds_ready"] = True
-                offset += length
-            return {"conversation_list": conversation}
-        if batch is None and conversation is not None:
-            if dummy_anchor is not None:
-                append_dummy_anchor(conversation, dummy_anchor)
-            return {"conversation_list": conversation}
-        if batch is not None and not skip:
-            batch["packed_vit_embeds"] = outputs["image_embeds"]
-        return {"bagel_packed_batch": batch}
+        self._image_items = []
+        self._image_token_lens = None
 
-    def dummy_inputs(self) -> Dict[str, Any]:
+        if is_dummy:
+            if conversation is not None:
+                value = (
+                    image_embeds.squeeze(0) if image_embeds.dim() == 3 and image_embeds.shape[0] == 1 else image_embeds
+                )
+                for sample in conversation:
+                    sample.append(
+                        ConversationItem(
+                            type="image",
+                            value=value,
+                            role="dummy",
+                            meta={"source": "bagel_siglip_navit"},
+                        )
+                    )
+            return {"conversation_list": conversation}
+
+        if token_lens is None:
+            token_lens = self._image_token_lens
+        if token_lens is None:
+            raise ValueError("BagelSiglipNavit.forward_post requires token_lens for non-dummy outputs.")
+
+        scatter_image_embeds(image_items, image_embeds, token_lens, device=self.device, dtype=self.dtype)
+        return {"conversation_list": conversation}
+
+    def dummy_inputs(self) -> dict[str, Any]:
         patch_dim = self.config.num_channels * self.config.patch_size * self.config.patch_size
+        token_lens = torch.tensor([1], dtype=torch.int32, device=self.device)
         return {
-            "packed_pixel_values": torch.zeros(1, patch_dim, device=self.device, dtype=self.dtype),
-            "packed_flattened_position_ids": torch.zeros(1, dtype=torch.long, device=self.device),
+            "patchified_pixel_values": torch.zeros(1, patch_dim, device=self.device, dtype=self.dtype),
+            "patchified_position_ids": torch.zeros(1, dtype=torch.long, device=self.device),
             "cu_seqlens": torch.tensor([0, 1], dtype=torch.int32, device=self.device),
             "max_seqlen": 1,
+            "token_lens": token_lens,
         }
 
     def generate(
         self,
-        conversation_list: Optional[list[ConversationItem]] = None,
+        conversation_list: list[ConversationItem] | list[list[ConversationItem]] | None = None,
         **kwargs: Any,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         del kwargs
         if conversation_list is None:
-            raise ValueError("BagelSiglipNavit.generate requires conversation_list.")
-        pending = [
-            item
-            for item in conversation_list
-            if item.type == "image" and item.role == "user" and item.meta.get("bagel_role") != "image_vae_context"
-        ]
-        if not pending:
             return {"conversation_list": conversation_list}
-        if len(pending) != 1:
-            raise NotImplementedError(
-                "BAGEL graph-level image understanding currently supports one image per request."
-            )
 
-        image_item = pending[0]
-        packed_pixel_values, position_ids, vit_token_lens = self._prepare_image_item(image_item)
+        image_items = user_raw_image_items(conversation_list, output_size=self.config.output_size)
+        if not image_items:
+            return {"conversation_list": conversation_list}
 
-        vit_token_lens = vit_token_lens.detach().to(device=self.device, dtype=torch.int32).reshape(-1)
-        cu_seqlens = torch.nn.functional.pad(torch.cumsum(vit_token_lens, dim=0), (1, 0)).to(torch.int32)
-        outputs = self.forward(
-            packed_pixel_values=packed_pixel_values.detach().to(device=self.device, dtype=self.dtype),
-            packed_flattened_position_ids=position_ids.detach().to(device=self.device, dtype=torch.long).reshape(-1),
-            cu_seqlens=cu_seqlens,
-            max_seqlen=int(vit_token_lens.max().item()),
+        inputs = prepare_image_batch(
+            image_items,
+            config=self.config,
+            device=self.device,
+            dtype=self.dtype,
         )
-        image_embeds = outputs["image_embeds"]
-        image_item.value = image_embeds
-        image_item.meta["image_embeds"] = image_embeds.detach()
-        image_item.meta["image_embeds_ready"] = True
-        output: Dict[str, Any] = {
-            "conversation_list": conversation_list,
-            "bagel_last_image_embeds": image_embeds.detach(),
-            "bagel_last_image_embeds_sample": _sample_tensor(image_embeds),
-        }
-        preprocessed_image_size = image_item.meta.get("preprocessed_image_size")
-        if preprocessed_image_size is not None:
-            output["bagel_preprocessed_image_size"] = torch.tensor(preprocessed_image_size, dtype=torch.long)
-        return output
-
-    def _prepare_image_item(self, image_item: ConversationItem) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        value = image_item.value
-        if torch.is_tensor(value) and value.dim() == 2:
-            position_ids = image_item.meta.get("vit_position_ids")
-            vit_token_lens = image_item.meta.get("vit_token_lens")
-            if not torch.is_tensor(position_ids) or not torch.is_tensor(vit_token_lens):
-                raise ValueError("Image ConversationItem requires vit_position_ids and vit_token_lens metadata.")
-            self._ensure_llm_image_layout_metadata(image_item, vit_token_lens=vit_token_lens)
-            return value, position_ids, vit_token_lens
-
-        image_tensor = self._preprocess_raw_image(value)
-        packed_pixel_values = self._patchify(image_tensor, self.config.patch_size)
-        position_ids = self._flattened_position_ids(
-            image_tensor.shape[-2],
-            image_tensor.shape[-1],
-            patch_size=self.config.patch_size,
-            max_num_patches_per_side=self.config.vit_max_num_patch_per_side,
-        )
-        vit_token_lens = torch.tensor([packed_pixel_values.shape[0]], dtype=torch.int32)
-        self._ensure_raw_image_metadata(
-            image_item,
-            image_tensor=image_tensor,
-            packed_pixel_values=packed_pixel_values,
-            position_ids=position_ids,
-            vit_token_lens=vit_token_lens,
-        )
-        return packed_pixel_values, position_ids, vit_token_lens
-
-    def _ensure_llm_image_layout_metadata(
-        self,
-        image_item: ConversationItem,
-        *,
-        vit_token_lens: torch.Tensor,
-    ) -> None:
-        num_img_tokens = int(vit_token_lens.reshape(-1)[0].item())
-        curr_kvlen = self._scalar_meta_int(
-            image_item.meta.get("key_value_lens_before", image_item.meta.get("key_value_lens")),
-            default=0,
-        )
-        curr_rope = self._scalar_meta_int(
-            image_item.meta.get("rope_before", image_item.meta.get("rope_position")),
-            default=0,
-        )
-        query_len = num_img_tokens + 2
-        local_text_indexes = torch.tensor([0, num_img_tokens + 1], dtype=torch.long)
-        local_vit_indexes = torch.arange(1, num_img_tokens + 1, dtype=torch.long)
-        image_item.meta.setdefault("image_text_indexes", local_text_indexes)
-        image_item.meta.setdefault("vit_token_indexes", local_vit_indexes)
-        image_item.meta.setdefault("query_lens", torch.tensor([query_len], dtype=torch.int32))
-        image_item.meta.setdefault(
-            "position_ids",
-            torch.full((query_len,), curr_rope, dtype=torch.long),
-        )
-        image_item.meta.setdefault(
-            "sequence_indexes",
-            torch.arange(curr_kvlen, curr_kvlen + query_len, dtype=torch.long),
-        )
-        image_item.meta.setdefault("context_indexes", torch.arange(curr_kvlen, dtype=torch.long))
-        image_item.meta.setdefault("key_value_lens_before", torch.tensor([curr_kvlen], dtype=torch.int32))
-        image_item.meta.setdefault("key_value_lens_after", torch.tensor([curr_kvlen + query_len], dtype=torch.int32))
-        image_item.meta.setdefault("rope_after", torch.tensor([curr_rope + 1], dtype=torch.long))
-        image_item.meta.setdefault("is_causal", False)
-
-    def _ensure_raw_image_metadata(
-        self,
-        image_item: ConversationItem,
-        *,
-        image_tensor: torch.Tensor,
-        packed_pixel_values: torch.Tensor,
-        position_ids: torch.Tensor,
-        vit_token_lens: torch.Tensor,
-    ) -> None:
-        image_item.meta.setdefault("bagel_role", "image_und")
-        image_item.meta.setdefault("raw_image_size", self._raw_image_size(image_item.value))
-        image_item.meta["preprocessed_image_size"] = [int(image_tensor.shape[-1]), int(image_tensor.shape[-2])]
-        image_item.meta["packed_vit_tokens"] = packed_pixel_values.detach()
-        image_item.meta["vit_position_ids"] = position_ids.detach().to(dtype=torch.long)
-        image_item.meta["vit_token_lens"] = vit_token_lens.detach().to(dtype=torch.int32)
-        self._ensure_llm_image_layout_metadata(image_item, vit_token_lens=vit_token_lens)
-
-    def _preprocess_raw_image(self, image: Any) -> torch.Tensor:
-        pil_image = self._to_rgb_pil(image)
-        pil_image = self._resize_image(pil_image)
-        array = np.array(pil_image, copy=True)
-        if array.ndim != 3 or array.shape[2] != 3:
-            raise ValueError("BAGEL raw image preprocessing expects an RGB image.")
-        tensor = torch.from_numpy(array).permute(2, 0, 1).contiguous().to(dtype=torch.float32).div_(255.0)
-        mean = torch.tensor(self.config.image_mean, dtype=torch.float32).view(-1, 1, 1)
-        std = torch.tensor(self.config.image_std, dtype=torch.float32).view(-1, 1, 1)
-        return tensor.sub_(mean).div_(std)
-
-    def _resize_image(self, image: Image.Image) -> Image.Image:
-        width, height = image.size
-        stride = int(self.config.patch_size)
-        max_size = int(self.config.image_size)
-        min_size = int(self.config.min_image_size)
-        max_pixels = int(self.config.max_pixels)
-
-        scale = min(max_size / max(width, height), 1.0)
-        scale = max(scale, min_size / min(width, height))
-        new_width, new_height = self._apply_scale(width, height, scale, stride)
-        if new_width * new_height > max_pixels:
-            scale = max_pixels / (new_width * new_height)
-            new_width, new_height = self._apply_scale(new_width, new_height, scale, stride)
-        if max(new_width, new_height) > max_size:
-            scale = max_size / max(new_width, new_height)
-            new_width, new_height = self._apply_scale(new_width, new_height, scale, stride)
-        return image.resize((new_width, new_height), resample=Image.Resampling.BICUBIC)
-
-    @staticmethod
-    def _apply_scale(width: int, height: int, scale: float, stride: int) -> tuple[int, int]:
-        new_width = round(width * scale)
-        new_height = round(height * scale)
-        return (
-            max(stride, int(round(new_width / stride) * stride)),
-            max(stride, int(round(new_height / stride) * stride)),
-        )
-
-    @staticmethod
-    def _to_rgb_pil(image: Any) -> Image.Image:
-        if isinstance(image, Image.Image):
-            pil_image = image
-        elif isinstance(image, np.ndarray):
-            pil_image = Image.fromarray(image)
-        elif torch.is_tensor(image):
-            tensor = image.detach().cpu()
-            if tensor.dim() != 3:
-                raise TypeError(f"BAGEL raw tensor image must be 3-D, got shape {tuple(tensor.shape)}.")
-            if tensor.shape[0] in (1, 3, 4):
-                tensor = tensor.permute(1, 2, 0)
-            if tensor.dtype.is_floating_point:
-                tensor = tensor.clamp(0, 1).mul(255).round().to(torch.uint8)
-            else:
-                tensor = tensor.to(torch.uint8)
-            pil_image = Image.fromarray(tensor.numpy())
-        else:
-            raise TypeError(
-                f"BAGEL image understanding expects PIL, numpy, raw tensor, or packed tokens, got {type(image).__name__}."
-            )
-
-        if pil_image.mode == "RGBA" or pil_image.info.get("transparency", None) is not None:
-            rgba = pil_image.convert("RGBA")
-            white = Image.new(mode="RGB", size=rgba.size, color=(255, 255, 255))
-            white.paste(rgba, mask=rgba.split()[3])
-            return white
-        return pil_image.convert("RGB")
-
-    @staticmethod
-    def _patchify(image: torch.Tensor, patch_size: int) -> torch.Tensor:
-        channels, height, width = image.shape
-        if height % patch_size != 0 or width % patch_size != 0:
-            raise ValueError("BAGEL preprocessed image height and width must be divisible by patch_size.")
-        image = image.reshape(channels, height // patch_size, patch_size, width // patch_size, patch_size)
-        image = torch.einsum("chpwq->hwpqc", image)
-        return image.reshape(-1, patch_size**2 * channels)
-
-    @staticmethod
-    def _flattened_position_ids(
-        height: int,
-        width: int,
-        *,
-        patch_size: int,
-        max_num_patches_per_side: int,
-    ) -> torch.Tensor:
-        num_patches_h = height // patch_size
-        num_patches_w = width // patch_size
-        coords_h = torch.arange(0, num_patches_h, dtype=torch.long)
-        coords_w = torch.arange(0, num_patches_w, dtype=torch.long)
-        return (coords_h[:, None] * max_num_patches_per_side + coords_w).flatten()
-
-    @staticmethod
-    def _raw_image_size(image: Any) -> list[int]:
-        if isinstance(image, Image.Image):
-            return [int(image.size[0]), int(image.size[1])]
-        if isinstance(image, np.ndarray):
-            return [int(image.shape[1]), int(image.shape[0])]
-        if torch.is_tensor(image) and image.dim() == 3:
-            if image.shape[0] in (1, 3, 4):
-                return [int(image.shape[2]), int(image.shape[1])]
-            return [int(image.shape[1]), int(image.shape[0])]
-        return []
-
-    @staticmethod
-    def _scalar_meta_int(value: Any, default: int) -> int:
-        if torch.is_tensor(value) and value.numel() > 0:
-            return int(value.detach().reshape(-1)[0].item())
-        if isinstance(value, (list, tuple)) and value:
-            return int(value[0])
-        if isinstance(value, int):
-            return value
-        return default
+        with torch.inference_mode():
+            outputs = self.forward(**inputs)
+        token_lens = outputs.get("token_lens")
+        if token_lens is None:
+            token_lens = inputs["token_lens"]
+        scatter_image_embeds(image_items, outputs["image_embeds"], token_lens, device=self.device, dtype=self.dtype)
+        return {"conversation_list": conversation_list}
 
 
-def _sample_tensor(value: torch.Tensor) -> torch.Tensor:
-    if value.dim() >= 2:
-        return value.detach()[:4, :4]
-    return value.detach()[:16]
+class BagelSiglipNavitTraceMixin(TraceMixin):
+    """Per-module training trace for BAGEL SigLIP NaViT."""
+
+    config: BagelSiglipNavitConfig
+
+    def trace_token_lengths(self, method: str, data: dict[str, Any]) -> list[int]:
+        if method != "forward":
+            return []
+        token_lens = data.get("token_lens")
+        if token_lens is None:
+            return []
+        return [int(value) for value in token_lens.detach().cpu().reshape(-1).tolist()]
+
+    def estimate_flops(self, seqlens: list[int]) -> float:
+        cfg = self.config
+        dim = cfg.hidden_size
+        heads = cfg.num_attention_heads
+        head_dim = dim // heads
+        patch_embed_n = dim * cfg.num_channels * cfg.patch_size * cfg.patch_size
+        attn_linear_n = dim * 4 * dim
+        mlp_n = dim * cfg.intermediate_size * 2
+        connector_n = dim * cfg.output_size + cfg.output_size * cfg.output_size
+        dense_n = patch_embed_n + (attn_linear_n + mlp_n) * cfg.num_hidden_layers + connector_n
+        tokens = sum(seqlens)
+        seqlen_sq = sum(length * length for length in seqlens)
+        dense_flops = 6 * dense_n * tokens
+        attn_flops = 12 * seqlen_sq * head_dim * heads * cfg.num_hidden_layers
+        return (dense_flops + attn_flops) / 1e12
 
 
-__all__ = ["BagelSiglipNavitModuleMixin"]
+__all__ = ["BagelSiglipNavitModuleMixin", "BagelSiglipNavitTraceMixin"]

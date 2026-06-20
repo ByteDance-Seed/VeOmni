@@ -15,6 +15,9 @@ from tests.seed_omni.parity_suite.driver.runners import TierRunnerMixin
 from tests.seed_omni.parity_suite.driver.v2_loading import V2LoadingMixin
 
 
+# Driver composition -----------------------------------------------------------
+
+
 class ParityDriver(
     ReferenceMixin,
     V2LoadingMixin,
@@ -29,12 +32,16 @@ class ParityDriver(
     canonical payload to ``v2_request_kwargs()`` for both inference and training.
     """
 
+    # Shared generation defaults -------------------------------------------------
+
     generation_defaults: Mapping[str, Any] = {
         "max_new_tokens": 1,
         "do_sample": False,
         "temperature": 1.0,
         "top_p": 1.0,
     }
+
+    # Lifecycle and runtime policy ----------------------------------------------
 
     def __init__(self, case: ParityCase) -> None:
         self.case = case

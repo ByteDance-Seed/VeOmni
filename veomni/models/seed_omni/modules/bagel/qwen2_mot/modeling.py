@@ -104,7 +104,13 @@ class BagelQwen2RotaryEmbedding(nn.Module):
         self.attention_scaling = 1.0
         inv_freq, _ = self.compute_default_rope_parameters(config, device)
         self.register_buffer("inv_freq", inv_freq, persistent=False)
-        self.original_inv_freq = self.inv_freq
+        self.register_buffer("original_inv_freq", inv_freq.clone(), persistent=False)
+
+    def _apply(self, fn: Any, recurse: bool = True) -> nn.Module:
+        module = super()._apply(fn, recurse=recurse)
+        self.inv_freq = self.inv_freq.float()
+        self.original_inv_freq = self.original_inv_freq.float()
+        return module
 
     @staticmethod
     def compute_default_rope_parameters(
@@ -126,7 +132,8 @@ class BagelQwen2RotaryEmbedding(nn.Module):
 
     @torch.no_grad()
     def forward(self, x: torch.Tensor, position_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1)
+        inv_freq = self.inv_freq.to(device=x.device, dtype=torch.float32)
+        inv_freq_expanded = inv_freq[None, :, None].expand(position_ids.shape[0], -1, 1)
         position_ids_expanded = position_ids[:, None, :].float()
         device_type = x.device.type
         device_type = device_type if isinstance(device_type, str) and device_type != "mps" else "cpu"

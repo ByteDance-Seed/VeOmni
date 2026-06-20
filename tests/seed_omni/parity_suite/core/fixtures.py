@@ -6,6 +6,9 @@ import numpy as np
 from PIL import Image
 
 
+# Image fixtures ---------------------------------------------------------------
+
+
 def make_reference_image(width: int, height: int) -> Image.Image:
     """Create the deterministic reference-side input image used by parity tests."""
 

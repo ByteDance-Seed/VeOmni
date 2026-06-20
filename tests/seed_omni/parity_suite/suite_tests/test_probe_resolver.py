@@ -8,7 +8,7 @@ import pytest
 import torch
 
 from tests.seed_omni.parity_suite.core import NodeSpec, ProbeCatalog, load_probe_catalog, resolve_probes
-from tests.seed_omni.parity_suite.reference import ReferenceCaptureContext, build_reference_capture_plan
+from tests.seed_omni.parity_suite.reference.capture import ReferenceCaptureContext, build_reference_capture_plan
 
 
 def test_probes_yaml_parses_hook_and_extractor_taps(tmp_path: Path) -> None:
@@ -60,13 +60,11 @@ text.hidden:
         probes=(probe,),
         nodes=(NodeSpec(name="toy.generate", module="toy", method="generate", graph="infer", state="prompt"),),
     )
-    reference_plan = build_reference_capture_plan(resolved.ref_taps)
 
-    assert probe.ref_tap.kind == "output"
-    assert probe.ref_tap.target == "reference.hidden"
-    context = ReferenceCaptureContext(ref_model=None, inputs={}, hook_taps={})
-    context.output = {"reference": {"hidden": torch.tensor([5])}}
-    assert reference_plan.extractor_taps[0].extractor(context).item() == 5
+    assert probe.ref_tap.kind == "field"
+    assert probe.ref_tap.target == "hidden"
+    assert probe.ref_tap.field == "hidden"
+    assert build_reference_capture_plan(resolved.ref_taps).extractor_taps == ()
 
 
 def test_resolver_builds_reference_plan_and_v2_whitelist(tmp_path: Path) -> None:
@@ -134,8 +132,50 @@ train.grad_weight:
     assert probe.v2_grad is not None
     assert probe.v2_grad.module == "toy_module"
     assert probe.v2_grad.parameter == "linear.weight"
-    assert probe.ref_tap.kind == "output"
-    assert probe.ref_tap.target == "reference.grad_weight"
+    assert probe.ref_tap.kind == "field"
+    assert probe.ref_tap.target == "grad_weight"
+    assert probe.ref_tap.field == "grad_weight"
+
+
+def test_probes_yaml_parses_v2_selector(tmp_path: Path) -> None:
+    probes_path = tmp_path / "probes.yaml"
+    probes_path.write_text(
+        """
+infer.step:
+  v2:
+    node: toy.generate
+    field: hidden
+    selector: unique_consecutive
+  ref:
+    field: hidden
+  tol: hidden
+""",
+        encoding="utf-8",
+    )
+
+    [probe] = load_probe_catalog(probes_path).probes
+
+    assert probe.v2_selector == "unique_consecutive"
+
+
+def test_probes_yaml_rejects_unknown_v2_selector(tmp_path: Path) -> None:
+    probes_path = tmp_path / "probes.yaml"
+    probes_path.write_text(
+        """
+infer.step:
+  v2:
+    node: toy.generate
+    field: hidden
+    selector: middle
+  ref:
+    field: hidden
+  tol: hidden
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="unsupported v2.selector"):
+        load_probe_catalog(probes_path)
 
 
 def test_probes_yaml_infers_grad_module_from_v2_node(tmp_path: Path) -> None:
@@ -237,7 +277,7 @@ text.hidden:
         resolve_probes(probes=(probe,), nodes=nodes)
 
 
-def test_load_probe_catalog_rejects_node_keyed_schema(tmp_path: Path) -> None:
+def test_load_probe_catalog_requires_probe_keyed_schema(tmp_path: Path) -> None:
     probes_path = tmp_path / "probes.yaml"
     probes_path.write_text(
         """
@@ -251,7 +291,7 @@ nodes:
         encoding="utf-8",
     )
 
-    with pytest.raises(ValueError, match="deprecated node-keyed probes schema"):
+    with pytest.raises(ValueError, match="must be probe-keyed"):
         load_probe_catalog(probes_path)
 
 

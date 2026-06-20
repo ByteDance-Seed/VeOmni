@@ -35,39 +35,41 @@ Model-owned parity inputs live beside the model tests, not under this package. F
 ```text
 tests/seed_omni/bagel/
 ├── base.yaml                 Reference and V2 model paths, enabled tiers, tolerances, launcher config
-├── probes.yaml              Public probe names mapped to V2 node/field and reference taps
-├── recipes/*.yaml            Stimuli, tier runs, selected probes, run options, per-run gates
+├── probes.yaml              Public probe names mapped to V2 node/field and reference observations
+├── recipes/*.yaml            Stimuli, tier runs, selected probes, run options, gates, V2 load overrides
 └── driver.py                 BAGEL-specific reference and V2 adaptation
 ```
 
 ## Data Contract Boundaries
 
-Shared `parity_suite` code is model-agnostic. It owns discovery, gating, reference capture, tier dispatch, probe resolution, tolerance comparison, reports, and abstract adapter method names. It must not require model-internal tensor layouts in recipes, probe paths, runner logic, or base driver defaults.
+Shared `parity_suite` code is model-agnostic. It owns discovery, gating, reference oracle execution, tier dispatch, probe resolution, tolerance comparison, reports, and abstract adapter method names. It must not require model-internal tensor layouts in recipes, probe paths, runner logic, or base driver defaults.
 
-Model drivers own concrete input adaptation. A driver may start from raw fixtures, model-owned canonical data, or reference outputs, but shared suite code treats those values as opaque. Implement ``build_{reference.kind}_request`` hook methods on ``ParityDriver`` subclasses and resolve them through ``v2_request_kwargs()``. Hook methods should return common V2 request keys, usually ``{"conversation_list": ...}``, and leave model-internal conversion to model runtime hooks or model-specific helpers.
+Model drivers own concrete input adaptation. A driver may start from raw fixtures, model-owned canonical data, or reference outputs, but shared suite code treats those values as opaque. Standard conversation-carrier recipes can declare ``stimulus.conversation_list`` for a single sample or ``stimulus.batched_conversation_list`` for an explicit batch and use the default request builder, which returns the production ``{"conversation_list": list[list[ConversationItem]]}`` shape. Implement ``build_{reference.kind}_request`` hook methods on ``ParityDriver`` subclasses only when a case needs non-standard request adaptation. Hook methods should return common V2 request keys, usually ``{"conversation_list": ...}``, and leave model-internal conversion to model runtime hooks or model-specific helpers.
 
-Normal reference handlers must return the suite contract defined in ``reference/contract.py``:
+Reference oracles return the suite contract defined in ``reference/oracles/contract.py``:
 
 ```python
-{"canonical": {...}, "reference": {...}}
+ReferenceRunResult(canonical={...}, observations={...})
 ```
 
-- ``canonical`` is the model-owned payload passed to V2 request handlers through ``canonical_from_reference_output()``.
-- ``reference`` holds values addressed by ``probes.yaml`` reference fields such as ``ref.field: hidden_state`` (resolved to ``reference.hidden_state``).
-- ``None`` remains valid only when reference capture is skipped and request handlers build from recipe stimulus.
+- ``canonical`` is the model-owned payload passed to V2 request handlers.
+- ``observations`` holds values addressed by ``probes.yaml`` reference fields such as ``ref.field: hidden_state``.
+- ``None`` remains valid only when reference oracle execution is skipped and request handlers build from recipe stimulus.
 - ``ParityReport`` remains valid for reference-only recipe execution and is not routed through this contract.
 
-Future models such as Janus should implement reference loading plus reference handlers that return this shape, then define ``build_{kind}_request`` hook methods keyed by ``reference.kind``.
+Future models such as Janus should configure ``reference.hf_model`` or ``reference.hf_module`` backends, then define ``build_{kind}_request`` hook methods keyed by ``reference.kind`` only when default conversation-list dispatch is insufficient.
 
 ## Tier Boundaries
 
-Module tier is the local module-behavior tier. It may use lazy module loading and CPU offload so only the active module is resident on the target device while the carrier stays materialized between nodes. Inference module-tier runs validate per-node FSM behavior. Training module-tier runs validate forward/loss behavior through module `pre_forward` / call / `post_forward` hooks, but they do not own training gradient parity.
+Module tier is the inference-forward module-boundary tier. It validates one module, or a very small module-local call chain, by comparing forward observations produced by the independent reference inference path against V2 module outputs and carrier mutation. Module-tier recipes should use only minimal model-owned micro graphs under the model's test config directory; they must not point at full-model production graph configs as the meaning of the tier. The V2 side loads only modules referenced by the selected graph. This keeps module-tier runs lazy and scoped: a text-encoder micro graph should not force SigLIP, VAE, MoT, or flow modules to be constructed unless the micro graph actually references them. Module tier does not own training loss parity, backward parity, optimizer behavior, or distributed safety.
+
+Reference execution for module tier should call the model's highest-level official inference entrypoint that naturally reaches the boundary under test. For example, BAGEL module references should call `InterleaveInferencer.interleave_inference(...)` and install non-mutating hooks around official calls, rather than manually replaying `init_gen_context`/`update_context_*`/`gen_*` loops or reimplementing packed layout, attention, VAE, flow, or loss semantics in the oracle. The shared `hf_module.<name>` reference backend is a facade over `reference.hf_model`: by default it loads the full HF subject for compatibility, but model subjects can override `create_hf_module_subject()` or `HfModuleSubject.load_reference_subject()` to lazily assemble only the backing pieces needed for the requested module boundary. The module facade is released before V2 loading so reference memory does not remain live across the comparison.
 
 Graph tier is the eager graph-oracle tier. For training, a graph-tier parity case is meaningful when both the independent reference and the V2 `OmniModel.forward()` graph can run as an eager reference path and compare the selected loss and gradient probes. Graph tier validates graph dispatch, carrier mutation, loss aggregation, and graph-level backward semantics against the reference. It is not a scalability guarantee for models whose reference or V2 graph cannot fit in eager form.
 
 Framework tier is the trainer and distributed-training tier. It validates `OmniTrainer`, optimizer and scheduler updates, clipping, checkpointing, data health, and FSDP/HSDP behavior. When an eager graph oracle is runnable, framework policies may compare trainer/FSDP results to that direct graph baseline. For models that are too large for eager graph/reference execution, training parity should be defined directly at the framework/distributed level against a sharded or otherwise low-memory reference path rather than forcing graph tier to become an FSDP test.
 
-Bare model-internal packer checks should live in model-specific unit tests outside shared suite flow.
+Bare model-internal packer checks and train-only module loss checks should live in model-specific unit tests, graph-tier cases, or framework-tier cases outside module-tier reference flow.
 
 ## Running Cases
 
@@ -102,8 +104,70 @@ Directly selecting a single parametrized case bypasses the grouped launcher so t
 ## Adding Or Updating A Case
 
 1. Add or update the model test contract under `tests/seed_omni/<model>/`.
-2. Configure `base.yaml` with the reference loader, V2 model config, enabled graph names, enabled tiers, tolerances, gates, and launcher settings.
+2. Configure `base.yaml` with reference oracle backends, V2 model targets, enabled graph names, enabled tiers, tolerances, gates, and launcher settings.
+   Set `gate.discover: false` in a legacy or archive `base.yaml` when the directory should not be collected by parity discovery.
+   Reference backends and V2 configs are target registries. Recipe variants select one target with `reference.oracle`; the suite uses the same target key to pick the V2 config:
+
+   ```yaml
+   reference:
+     hf_model:
+       module: tests.seed_omni.foo.reference.hf_model:FooReferenceSubject
+       checkpoint: /path/to/foo/reference
+     hf_module:
+       - text_encoder
+
+   v2_model:
+     model_root: /path/to/foo/seed_omni
+     hf_model:
+       config_dir: configs/seed_omni/Foo/full_model
+     hf_module:
+       text_encoder:
+         config_dir: tests/seed_omni/foo/configs/text_encoder
+   ```
+
+   `reference.hf_module` entries are named facades backed by `reference.hf_model`; they do not declare separate checkpoints. Use them when a recipe should compare a module-boundary view while still executing the official reference path.
+
 3. Add recipe variants in `recipes/*.yaml`. Each variant declares exactly one of `stimulus` or `data`, then lists `runs` by tier. The `probes` list names public probe keys from `probes.yaml`. `stimulus` is driver-owned and opaque to the shared suite.
+   Recipe variants may declare only the narrow `v2_model.module_overrides` block. Use it for parity-only module loading differences, such as keeping a VAE on CPU/fp32 to match an official app path, while the rest of the V2 modules use the runner device and dtype. Overrides may name only modules referenced by the selected graph. Put target-specific model roots and config directories under `base.yaml`, then select them with `reference.oracle: hf_module.<name>` or `reference.oracle: hf_model`.
+
+   ```yaml
+   v2_model:
+     module_overrides:
+       bagel_vae:
+         device: cpu
+         dtype: float32
+   ```
+
+   Module-level cases should use the shared module runner only with a module-local inference micro graph that reaches the requested observation boundary. Do not use module tier as a shorthand for a full production inference graph or for a train/loss graph.
+   The shared observation path records whitelisted tensor fields from node outputs and from returned `conversation_list` carriers: `value` reads `item.value`, while meta fields such as `input_ids`, `labels`, and `attention_mask` read `item.meta[...]`.
+   Drivers should add extra observations only for model-specific derived values.
+   Reference-side module observations should be collected by calling official high-level inference APIs and installing capture-only hooks. A reference adapter may translate suite stimuli into official inputs and rename captured tensors into probe fields, but it must not manually implement the model's inference loop, packing rules, forward math, loss formulas, or sampling semantics.
+   If a future graph/framework path needs carrier observations, extend the shared observation helpers first instead of adding per-node carrier readers in a model driver.
+   The shared V2 loader builds a graph-active config and loads only the modules used by that config. With a `model_root`, each active module is loaded from `<model_root>/<module_name>`. If the selected V2 target has no `model_root`, the loader can instantiate active modules from node-specific `modules_train.yaml` `parity` blocks containing `model_type`, `config`, and an optional `setup` callable.
+   Standard conversation-list module cases should declare `stimulus.conversation_list` as a single sample:
+
+   ```yaml
+   stimulus:
+     conversation_list:
+       - type: image
+         role: user
+         value:
+           kind: random
+           shape: [3, 4, 4]
+           distribution: uniform
+           seed: 11
+           dtype: float
+       - type: text
+         role: user
+         value:
+           kind: tensor
+           tensor: [1, 10, 2]
+           dtype: long
+   ```
+
+   Use `stimulus.batched_conversation_list` only when the case intentionally validates `bs > 1`; it is authored as `list[list[item spec]]`. The suite normalizes both forms to the production `conversation_list: list[list[ConversationItem]]` shape before reference oracle execution and V2 request dispatch.
+
+   Each item spec may include `type`, `role`, `value`, `source`, and `meta`. Supported item `type` values are `image`, `text`, and `output`. Item `value` is a strict tagged union: `kind: tensor` requires `tensor` and optional `dtype`/`device`; `kind: random` requires `shape` and supports `distribution: uniform|normal|zeros|ones`, `seed`, `dtype`, and distribution parameters. Legacy untagged values such as `{tensor: [...]}` are rejected. Prefer deterministic `kind: random` image specs over large inline image tensors; keep explicit tensors for semantic token ids or small training targets where readability matters.
 
 Each run can be toggled independently with `enable`. The field is optional and defaults to `true`; when set to `false`, discovery filters the run before pytest parametrization, so it will not appear in `--collect-only` output. Use a YAML bool, not a quoted string:
 
@@ -112,6 +176,7 @@ interleave_image_gen:
   - stimulus:
       prompt: "A glass greenhouse filled with tiny orange trees."
     reference:
+      oracle: hf_model
       kind: image_gen
     runs:
       graph:
@@ -126,7 +191,7 @@ interleave_image_gen:
             - image.velocity
 ```
 
-4. Add probes in `probes.yaml`. Each top-level key is a public probe name. The probe maps a V2 graph node and observation field to a reference tap and tolerance policy:
+4. Add probes in `probes.yaml`. Each top-level key is a public probe name. The probe maps a V2 graph node and observation field to a reference observation field and tolerance policy:
 
 ```yaml
 text.hidden:
@@ -138,15 +203,15 @@ text.hidden:
       parameter: lm_head.weight      # required gradient parameter path
       module: bagel_text_encoder     # optional; defaults to the node prefix before the first dot
   ref:
-    field: hidden_state              # reference output path `reference.<field>`
-    hook: model.norm                 # or a module hook path
-    extractor: pkg.mod:fn            # or a callable entrypoint
+    field: hidden_state              # reference oracle observations["hidden_state"]
+    hook: model.norm                 # hf_model-only module hook path
+    extractor: pkg.mod:fn            # hf_model-only callable entrypoint
   tol: hidden                        # required tolerance policy key from base.yaml
   step: last                         # optional; `last` (default) or `all`
 ```
 
 Declare exactly one of `ref.field`, `ref.hook`, or `ref.extractor`.
-5. Implement or extend `driver.py` by returning a `ParityDriver` from `create_driver(case)`. The driver owns reference loading, reference execution, V2 model loading, and any model-specific input/output adaptation.
+5. Implement or extend `driver.py` by returning a `ParityDriver` from `create_driver(case)`. Reference execution is selected by `recipe.reference.oracle` and routed through the configured `reference.hf_model` or `reference.hf_module.<name>` backend; drivers only override `reference_oracle()` for genuinely model-specific runtimes.
 6. Run the harness unit tests and at least one targeted parity case before broadening to the full suite.
 
 Useful checks while editing the harness:
@@ -158,6 +223,6 @@ python -m pytest -q tests/seed_omni/parity_suite/test_parity_cases.py --collect-
 
 ## Execution Model
 
-Each discovered `ParityCase` combines one model spec, one recipe variant, one run, one graph, and the graph node catalog. `runner.run_parity_case()` loads the model-specific driver, captures reference taps when the effective gate requires them, dispatches the V2 tier, then compares each selected probe with the tolerance policy from `probes.yaml` and `base.yaml`.
+Each discovered `ParityCase` combines one model spec, one recipe variant, one run, one graph, and the graph node catalog. `runner.run_parity_case()` loads the model-specific driver, captures reference oracle observations when the effective gate requires them, dispatches the V2 tier, then compares each selected probe with the tolerance policy from `probes.yaml` and `base.yaml`.
 
-Reference-only recipes can return their own `ParityReport`. Graph, module, and framework tiers usually return V2 observations keyed by `(state, node)` so the shared runner can compare them against captured reference taps.
+Reference-only recipes can return their own `ParityReport`. Graph, module, and framework tiers usually return V2 observations keyed by `(state, node)` so the shared runner can compare them against captured reference observations.

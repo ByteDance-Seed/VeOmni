@@ -1,0 +1,4 @@
+# Module-only BAGEL SigLIP NaViT parity config.
+bagel_siglip_navit:
+  model:
+    model_path: bagel_siglip_navit

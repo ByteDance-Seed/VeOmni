@@ -14,10 +14,14 @@ if TYPE_CHECKING:
     from .discovery import NodeSpec
 
 
+# Probe schema -----------------------------------------------------------------
+
+
 @dataclass(frozen=True)
 class RefTapSpec:
     kind: str
     target: str
+    field: str
 
     @classmethod
     def from_ref_raw(cls, raw: Any, *, probe: str) -> RefTapSpec:
@@ -30,10 +34,11 @@ class RefTapSpec:
         if declared != 1:
             raise ValueError(f"Probe {probe!r} ref must declare exactly one of field, hook, or extractor.")
         if has_field:
-            return cls(kind="output", target=f"reference.{raw['field']}")
+            field = str(raw["field"])
+            return cls(kind="field", target=field, field=field)
         if has_hook:
-            return cls(kind="hook", target=str(raw["hook"]))
-        return cls(kind="extractor", target=str(raw["extractor"]))
+            return cls(kind="hook", target=str(raw["hook"]), field=probe)
+        return cls(kind="extractor", target=str(raw["extractor"]), field=probe)
 
 
 @dataclass(frozen=True)
@@ -57,6 +62,7 @@ class V2GradSpec:
 
 
 _STEP_POLICIES = frozenset({"last", "all"})
+_V2_SELECTORS = frozenset({"all", "unique_consecutive"})
 
 
 @dataclass(frozen=True)
@@ -67,7 +73,9 @@ class ProbeMapping:
     ref_tap: RefTapSpec
     tol: str
     state: str | None = None
+    v2_item_type: str | None = None
     v2_grad: V2GradSpec | None = None
+    v2_selector: str = "all"
     step: str = "last"
 
     @classmethod
@@ -90,6 +98,12 @@ class ProbeMapping:
             raise ValueError(
                 f"Probe {probe!r} has unsupported step policy {step!r}; expected one of {sorted(_STEP_POLICIES)}."
             )
+        v2_selector = str(v2_raw.get("selector", "all"))
+        if v2_selector not in _V2_SELECTORS:
+            raise ValueError(
+                f"Probe {probe!r} has unsupported v2.selector {v2_selector!r}; "
+                f"expected one of {sorted(_V2_SELECTORS)}."
+            )
         node = str(v2_raw["node"])
         v2_field = str(v2_raw["field"])
         if v2_field == "loss":
@@ -103,9 +117,14 @@ class ProbeMapping:
             ref_tap=RefTapSpec.from_ref_raw(raw["ref"], probe=probe),
             tol=str(raw["tol"]),
             state=None if v2_raw.get("state") is None else str(v2_raw["state"]),
+            v2_item_type=None if v2_raw.get("item_type") is None else str(v2_raw["item_type"]),
             v2_grad=V2GradSpec.from_raw(v2_raw.get("grad"), probe=probe, node=node),
+            v2_selector=v2_selector,
             step=step,
         )
+
+
+# Probe catalog ----------------------------------------------------------------
 
 
 @dataclass(frozen=True)
@@ -134,11 +153,17 @@ class ProbeCatalog:
         return {node: tuple(items) for node, items in grouped.items()}
 
 
+# Resolved runtime plan --------------------------------------------------------
+
+
 @dataclass(frozen=True)
 class ResolvedProbes:
     probes: tuple[ProbeMapping, ...]
     ref_taps: tuple[tuple[str, RefTapSpec], ...]
     v2_whitelist: dict[tuple[str, str], frozenset[str]]
+
+
+# Public loading and resolution ------------------------------------------------
 
 
 def load_probe_catalog(path: Path) -> ProbeCatalog:
@@ -152,9 +177,7 @@ def load_probe_catalog(path: Path) -> ProbeCatalog:
     if "input_boundary" in data:
         raise ValueError(f"{path} must not declare input_boundary; input shape is driver-owned.")
     if "nodes" in data:
-        raise ValueError(
-            f"{path} uses deprecated node-keyed probes schema; declare each public probe name at the top level."
-        )
+        raise ValueError(f"{path} must be probe-keyed; declare each public probe name at the top level.")
 
     probes: list[ProbeMapping] = []
     for probe_name, raw_probe in data.items():
@@ -208,6 +231,9 @@ def resolve_probes(
     )
 
 
+# Internal helpers -------------------------------------------------------------
+
+
 def _collect_ref_tap(
     probe: ProbeMapping,
     *,
@@ -216,11 +242,11 @@ def _collect_ref_tap(
 ) -> None:
     # Deduplicate identical registrations while preserving distinct probe names
     # that intentionally read the same module or output target.
-    key = (probe.ref_tap.kind, probe.probe, probe.ref_tap.target)
+    key = (probe.ref_tap.kind, probe.ref_tap.field, probe.ref_tap.target)
     if key in seen:
         return
     seen.add(key)
-    ref_taps.append((probe.probe, probe.ref_tap))
+    ref_taps.append((probe.ref_tap.field, probe.ref_tap))
 
 
 __all__ = [
