@@ -187,27 +187,29 @@ class BagelQwen2MoTAttention(nn.Module):
 
         packed_sequence_und = packed_sequence[packed_und_token_indexes]
         packed_sequence_gen = packed_sequence[packed_gen_token_indexes]
+        has_und_tokens = int(packed_und_token_indexes.numel()) > 0
         has_gen_tokens = int(packed_gen_token_indexes.numel()) > 0
 
-        if has_gen_tokens:
-            packed_query_states[packed_und_token_indexes] = self.q_proj(packed_sequence_und)
-            packed_query_states[packed_gen_token_indexes] = self.q_proj_moe_gen(packed_sequence_gen)
-            packed_key_states[packed_und_token_indexes] = self.k_proj(packed_sequence_und)
-            packed_key_states[packed_gen_token_indexes] = self.k_proj_moe_gen(packed_sequence_gen)
-            packed_value_states[packed_und_token_indexes] = self.v_proj(packed_sequence_und)
-            packed_value_states[packed_gen_token_indexes] = self.v_proj_moe_gen(packed_sequence_gen)
-        else:
-            # No gen tokens: run the gen experts on the empty slice anyway and keep handles
-            # to their outputs so _fold_zero_anchors can anchor those weights below.
-            query_states_gen = self.q_proj_moe_gen(packed_sequence_gen)
-            key_states_gen = self.k_proj_moe_gen(packed_sequence_gen)
-            value_states_gen = self.v_proj_moe_gen(packed_sequence_gen)
-            packed_query_states[packed_und_token_indexes] = self.q_proj(packed_sequence_und)
-            packed_query_states[packed_gen_token_indexes] = query_states_gen
-            packed_key_states[packed_und_token_indexes] = self.k_proj(packed_sequence_und)
-            packed_key_states[packed_gen_token_indexes] = key_states_gen
-            packed_value_states[packed_und_token_indexes] = self.v_proj(packed_sequence_und)
-            packed_value_states[packed_gen_token_indexes] = value_states_gen
+        query_states_und = self.q_proj(packed_sequence_und)
+        query_states_gen = self.q_proj_moe_gen(packed_sequence_gen)
+        key_states_und = self.k_proj(packed_sequence_und)
+        key_states_gen = self.k_proj_moe_gen(packed_sequence_gen)
+        value_states_und = self.v_proj(packed_sequence_und)
+        value_states_gen = self.v_proj_moe_gen(packed_sequence_gen)
+        packed_query_states[packed_und_token_indexes] = query_states_und
+        packed_query_states[packed_gen_token_indexes] = query_states_gen
+        packed_key_states[packed_und_token_indexes] = key_states_und
+        packed_key_states[packed_gen_token_indexes] = key_states_gen
+        packed_value_states[packed_und_token_indexes] = value_states_und
+        packed_value_states[packed_gen_token_indexes] = value_states_gen
+        if not has_und_tokens:
+            packed_query_states = _fold_zero_anchors(packed_query_states, query_states_und)
+            packed_key_states = _fold_zero_anchors(packed_key_states, key_states_und)
+            packed_value_states = _fold_zero_anchors(packed_value_states, value_states_und)
+        if not has_gen_tokens:
+            packed_query_states = _fold_zero_anchors(packed_query_states, query_states_gen)
+            packed_key_states = _fold_zero_anchors(packed_key_states, key_states_gen)
+            packed_value_states = _fold_zero_anchors(packed_value_states, value_states_gen)
 
         packed_query_states = packed_query_states.view(-1, self.num_heads, self.head_dim)
         packed_key_states = packed_key_states.view(-1, self.num_key_value_heads, self.head_dim)
@@ -215,22 +217,20 @@ class BagelQwen2MoTAttention(nn.Module):
 
         packed_query_states_ = packed_query_states.new_zeros(packed_query_states.shape)
         packed_key_states_ = packed_key_states.new_zeros(packed_key_states.shape)
-        if has_gen_tokens:
-            packed_query_states_[packed_und_token_indexes] = self.q_norm(packed_query_states[packed_und_token_indexes])
-            packed_query_states_[packed_gen_token_indexes] = self.q_norm_moe_gen(
-                packed_query_states[packed_gen_token_indexes]
-            )
-            packed_key_states_[packed_und_token_indexes] = self.k_norm(packed_key_states[packed_und_token_indexes])
-            packed_key_states_[packed_gen_token_indexes] = self.k_norm_moe_gen(
-                packed_key_states[packed_gen_token_indexes]
-            )
-        else:
-            query_states_norm_gen = self.q_norm_moe_gen(packed_query_states[packed_gen_token_indexes])
-            key_states_norm_gen = self.k_norm_moe_gen(packed_key_states[packed_gen_token_indexes])
-            packed_query_states_[packed_und_token_indexes] = self.q_norm(packed_query_states[packed_und_token_indexes])
-            packed_query_states_[packed_gen_token_indexes] = query_states_norm_gen
-            packed_key_states_[packed_und_token_indexes] = self.k_norm(packed_key_states[packed_und_token_indexes])
-            packed_key_states_[packed_gen_token_indexes] = key_states_norm_gen
+        query_states_norm_und = self.q_norm(packed_query_states[packed_und_token_indexes])
+        query_states_norm_gen = self.q_norm_moe_gen(packed_query_states[packed_gen_token_indexes])
+        key_states_norm_und = self.k_norm(packed_key_states[packed_und_token_indexes])
+        key_states_norm_gen = self.k_norm_moe_gen(packed_key_states[packed_gen_token_indexes])
+        packed_query_states_[packed_und_token_indexes] = query_states_norm_und
+        packed_query_states_[packed_gen_token_indexes] = query_states_norm_gen
+        packed_key_states_[packed_und_token_indexes] = key_states_norm_und
+        packed_key_states_[packed_gen_token_indexes] = key_states_norm_gen
+        if not has_und_tokens:
+            packed_query_states_ = _fold_zero_anchors(packed_query_states_, query_states_norm_und)
+            packed_key_states_ = _fold_zero_anchors(packed_key_states_, key_states_norm_und)
+        if not has_gen_tokens:
+            packed_query_states_ = _fold_zero_anchors(packed_query_states_, query_states_norm_gen)
+            packed_key_states_ = _fold_zero_anchors(packed_key_states_, key_states_norm_gen)
 
         packed_cos, packed_sin = packed_position_embeddings
         packed_query_states_, packed_key_states_ = _apply_rotary_pos_emb(
@@ -279,24 +279,14 @@ class BagelQwen2MoTAttention(nn.Module):
 
         packed_attn_output = packed_attn_output.transpose(0, 1).reshape(-1, self.num_heads * self.head_dim)
         packed_attn_output_ = packed_attn_output.new_zeros(packed_attn_output.shape)
-        if has_gen_tokens:
-            packed_attn_output_[packed_und_token_indexes] = self.o_proj(packed_attn_output[packed_und_token_indexes])
-            packed_attn_output_[packed_gen_token_indexes] = self.o_proj_moe_gen(
-                packed_attn_output[packed_gen_token_indexes]
-            )
-        else:
-            attn_output_gen = self.o_proj_moe_gen(packed_attn_output[packed_gen_token_indexes])
-            packed_attn_output_[packed_und_token_indexes] = self.o_proj(packed_attn_output[packed_und_token_indexes])
-            packed_attn_output_[packed_gen_token_indexes] = attn_output_gen
-            packed_attn_output_ = _fold_zero_anchors(
-                packed_attn_output_,
-                query_states_gen,
-                key_states_gen,
-                value_states_gen,
-                query_states_norm_gen,
-                key_states_norm_gen,
-                attn_output_gen,
-            )
+        attn_output_und = self.o_proj(packed_attn_output[packed_und_token_indexes])
+        attn_output_gen = self.o_proj_moe_gen(packed_attn_output[packed_gen_token_indexes])
+        packed_attn_output_[packed_und_token_indexes] = attn_output_und
+        packed_attn_output_[packed_gen_token_indexes] = attn_output_gen
+        if not has_und_tokens:
+            packed_attn_output_ = _fold_zero_anchors(packed_attn_output_, attn_output_und)
+        if not has_gen_tokens:
+            packed_attn_output_ = _fold_zero_anchors(packed_attn_output_, attn_output_gen)
         return packed_attn_output_
 
     def _forward_packed_inference(
@@ -447,20 +437,16 @@ class BagelQwen2MoTDecoderLayer(nn.Module):
     ) -> torch.Tensor:
         residual = packed_sequence
         packed_sequence_ = packed_sequence.new_zeros(packed_sequence.shape)
+        has_und_tokens = int(packed_und_token_indexes.numel()) > 0
         has_gen_tokens = int(packed_gen_token_indexes.numel()) > 0
-        if has_gen_tokens:
-            packed_sequence_[packed_und_token_indexes] = self.input_layernorm(
-                packed_sequence[packed_und_token_indexes]
-            )
-            packed_sequence_[packed_gen_token_indexes] = self.input_layernorm_moe_gen(
-                packed_sequence[packed_gen_token_indexes]
-            )
-        else:
-            normed_sequence_gen = self.input_layernorm_moe_gen(packed_sequence[packed_gen_token_indexes])
-            packed_sequence_[packed_und_token_indexes] = self.input_layernorm(
-                packed_sequence[packed_und_token_indexes]
-            )
-            packed_sequence_[packed_gen_token_indexes] = normed_sequence_gen
+        normed_sequence_und = self.input_layernorm(packed_sequence[packed_und_token_indexes])
+        normed_sequence_gen = self.input_layernorm_moe_gen(packed_sequence[packed_gen_token_indexes])
+        packed_sequence_[packed_und_token_indexes] = normed_sequence_und
+        packed_sequence_[packed_gen_token_indexes] = normed_sequence_gen
+        if not has_und_tokens:
+            packed_sequence_ = _fold_zero_anchors(packed_sequence_, normed_sequence_und)
+        if not has_gen_tokens:
+            packed_sequence_ = _fold_zero_anchors(packed_sequence_, normed_sequence_gen)
 
         packed_sequence_, _ = self.self_attn(
             packed_sequence=packed_sequence_,
@@ -474,23 +460,17 @@ class BagelQwen2MoTDecoderLayer(nn.Module):
 
         residual = packed_sequence
         packed_sequence_ = packed_sequence.new_zeros(packed_sequence.shape)
-        if has_gen_tokens:
-            packed_sequence_[packed_und_token_indexes] = self.mlp(
-                self.post_attention_layernorm(packed_sequence[packed_und_token_indexes])
-            )
-            packed_sequence_[packed_gen_token_indexes] = self.mlp_moe_gen(
-                self.post_attention_layernorm_moe_gen(packed_sequence[packed_gen_token_indexes])
-            )
-        else:
-            post_attn_gen = self.post_attention_layernorm_moe_gen(packed_sequence[packed_gen_token_indexes])
-            mlp_gen = self.mlp_moe_gen(post_attn_gen)
-            packed_sequence_[packed_und_token_indexes] = self.mlp(
-                self.post_attention_layernorm(packed_sequence[packed_und_token_indexes])
-            )
-            packed_sequence_[packed_gen_token_indexes] = mlp_gen
-        output = residual + packed_sequence_
+        post_attn_und = self.post_attention_layernorm(packed_sequence[packed_und_token_indexes])
+        post_attn_gen = self.post_attention_layernorm_moe_gen(packed_sequence[packed_gen_token_indexes])
+        mlp_und = self.mlp(post_attn_und)
+        mlp_gen = self.mlp_moe_gen(post_attn_gen)
+        packed_sequence_[packed_und_token_indexes] = mlp_und
+        packed_sequence_[packed_gen_token_indexes] = mlp_gen
+        if not has_und_tokens:
+            packed_sequence_ = _fold_zero_anchors(packed_sequence_, post_attn_und, mlp_und)
         if not has_gen_tokens:
-            output = _fold_zero_anchors(output, normed_sequence_gen, post_attn_gen, mlp_gen)
+            packed_sequence_ = _fold_zero_anchors(packed_sequence_, post_attn_gen, mlp_gen)
+        output = residual + packed_sequence_
         return output
 
     def _forward_packed_inference(
@@ -622,15 +602,13 @@ class BagelQwen2MoTBackbone(nn.Module):
 
         if self.use_moe:
             packed_sequence_ = torch.zeros_like(packed_sequence)
-            if int(packed_gen_token_indexes.numel()) > 0:
-                packed_sequence_[packed_und_token_indexes] = self.norm(packed_sequence[packed_und_token_indexes])
-                packed_sequence_[packed_gen_token_indexes] = self.norm_moe_gen(
-                    packed_sequence[packed_gen_token_indexes]
-                )
-            else:
-                normed_sequence_gen = self.norm_moe_gen(packed_sequence[packed_gen_token_indexes])
-                packed_sequence_[packed_und_token_indexes] = self.norm(packed_sequence[packed_und_token_indexes])
-                packed_sequence_[packed_gen_token_indexes] = normed_sequence_gen
+            normed_sequence_und = self.norm(packed_sequence[packed_und_token_indexes])
+            normed_sequence_gen = self.norm_moe_gen(packed_sequence[packed_gen_token_indexes])
+            packed_sequence_[packed_und_token_indexes] = normed_sequence_und
+            packed_sequence_[packed_gen_token_indexes] = normed_sequence_gen
+            if int(packed_und_token_indexes.numel()) == 0:
+                packed_sequence_ = _fold_zero_anchors(packed_sequence_, normed_sequence_und)
+            if int(packed_gen_token_indexes.numel()) == 0:
                 packed_sequence_ = _fold_zero_anchors(packed_sequence_, normed_sequence_gen)
             return packed_sequence_
         return self.norm(packed_sequence)

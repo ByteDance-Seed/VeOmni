@@ -5,8 +5,9 @@ from __future__ import annotations
 from typing import Any
 
 import torch
+import torch.distributed as dist
 
-from ....conversation import ConversationItem
+from ....conversation import ConversationItem, is_dummy
 from ....generation_graph import FSM_SIGNAL_KEY
 from ....module import ModuleMixin, post_forward, pre_forward
 from .generation_state import MotGenerationState
@@ -56,8 +57,9 @@ class BagelQwen2MoTModuleMixin(ModuleMixin):
         self._packed_training = packed
         if packed is None:
             return self.dummy_inputs()
+        packed_sequence = self._fold_dummy_anchors(packed.packed_sequence, conversation_list)
         return {
-            "packed_sequence": packed.packed_sequence,
+            "packed_sequence": packed_sequence,
             "sample_lens": packed.sample_lens,
             "attention_mask": packed.nested_attention_masks,
             "packed_position_ids": packed.packed_position_ids,
@@ -85,6 +87,7 @@ class BagelQwen2MoTModuleMixin(ModuleMixin):
                     )
             return {"conversation_list": conversation}
         scatter_hidden_states(packed.spans, hidden_states, device=self.device)
+        self._append_missing_flow_hidden_anchors(conversation)
         return {"conversation_list": conversation}
 
     def dummy_inputs(self) -> dict[str, Any]:
@@ -96,6 +99,80 @@ class BagelQwen2MoTModuleMixin(ModuleMixin):
             "packed_und_token_indexes": torch.zeros(1, device=self.device, dtype=torch.long),
             "packed_gen_token_indexes": torch.empty(0, device=self.device, dtype=torch.long),
         }
+
+    def _fold_dummy_anchors(
+        self,
+        packed_sequence: torch.Tensor,
+        conversation_list: list[list[ConversationItem]] | None,
+    ) -> torch.Tensor:
+        # Dummy encoder outputs must still touch MoT on ranks where another rank
+        # has the real branch, otherwise FSDP sees different gradient buckets.
+        anchor = packed_sequence.new_zeros(())
+        has_anchor = False
+        include_siglip_dummy = self._global_has_real_siglip_image(conversation_list)
+        for sample in conversation_list or []:
+            for item in sample:
+                if not is_dummy(item) or not torch.is_tensor(item.value):
+                    continue
+                meta = item.meta if isinstance(item.meta, dict) else {}
+                source = meta.get("source")
+                if source != "bagel_flow_connector" and not (source == "bagel_siglip_navit" and include_siglip_dummy):
+                    continue
+                anchor = anchor + item.value.to(device=packed_sequence.device).sum() * 0.0
+                has_anchor = True
+        if not has_anchor:
+            return packed_sequence
+        return packed_sequence + anchor
+
+    def _global_has_real_siglip_image(self, conversation_list: list[list[ConversationItem]] | None) -> bool:
+        local = 0
+        for sample in conversation_list or []:
+            for item in sample:
+                if is_dummy(item) or item.type != "image" or not torch.is_tensor(item.value):
+                    continue
+                value = item.value
+                if value.dim() == 3 and value.shape[0] == 1:
+                    value = value.squeeze(0)
+                if value.dim() == 2 and int(value.shape[-1]) == int(self.config.hidden_size):
+                    local = 1
+                    break
+            if local:
+                break
+        if not dist.is_available() or not dist.is_initialized():
+            return bool(local)
+        flag = torch.tensor(local, device=self.device, dtype=torch.int32)
+        dist.all_reduce(flag, op=dist.ReduceOp.MAX)
+        return bool(flag.item())
+
+    def _append_missing_flow_hidden_anchors(self, conversation_list: list[list[ConversationItem]] | None) -> None:
+        # Text-only samples can share a batch with image-generation samples.
+        # Give flow decode a zero MoT output anchor so the MSE path still flows
+        # through MoT before reaching llm2vae on those ranks.
+        for sample in conversation_list or []:
+            has_flow_hidden = False
+            anchor: torch.Tensor | None = None
+            for item in sample:
+                if is_dummy(item) or not torch.is_tensor(item.value):
+                    continue
+                value = item.value
+                if value.dim() == 3 and value.shape[0] == 1:
+                    value = value.squeeze(0)
+                if value.dim() != 2 or int(value.shape[-1]) != int(self.config.hidden_size):
+                    continue
+                if anchor is None:
+                    anchor = value[:1].to(device=self.device, dtype=self.dtype) * 0.0
+                if item.type == "output":
+                    has_flow_hidden = True
+            if has_flow_hidden or anchor is None:
+                continue
+            sample.append(
+                ConversationItem(
+                    type="output",
+                    value=anchor,
+                    role="assistant",
+                    meta={"source": "bagel_qwen2_mot_dummy"},
+                )
+            )
 
     def reset_local_inference_state(self) -> None:
         self._generation_state.reset()

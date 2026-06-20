@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import gc
+import math
 from collections.abc import Mapping
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
@@ -21,7 +22,7 @@ from tests.seed_omni.parity_suite.core import (
     zero_module_grads,
 )
 from veomni.distributed import parallel_state as parallel_state_module
-from veomni.distributed.clip_grad_norm import veomni_clip_grad_norm
+from veomni.distributed.clip_grad_norm import veomni_omni_module_clip_grad_norm
 from veomni.models.seed_omni.modeling_omni import OmniModel
 from veomni.trainer.base import BaseTrainer
 from veomni.trainer.omni_trainer import MultiLRScheduler, MultiOptimizer, OmniModuleTrainer, OmniTrainer
@@ -123,7 +124,11 @@ def run_direct_train_step(
         loss.backward()
         total_loss += float(loss.detach().cpu().item()) / num_micro_steps
     with single_rank_ddp_clip_state():
-        grad_norm = veomni_clip_grad_norm(model, max_grad_norm)
+        module_grad_norms = [
+            veomni_omni_module_clip_grad_norm(module, single_rank_ddp_parallel_state(), max_grad_norm)
+            for module in model.modules_dict.values()
+        ]
+        grad_norm = math.sqrt(sum(norm * norm for norm in module_grad_norms)) if module_grad_norms else 0.0
     optimizer.step()
     scheduler.step()
     optimizer.zero_grad()
@@ -179,7 +184,7 @@ def trainer_step_reports(
 ) -> list[ProbeReport]:
     reports = [
         framework_report(
-            driver, "framework.loss", torch.tensor([trainer_result["loss"]]), direct_result["loss"].reshape(1), "loss"
+            driver, "framework.loss", torch.tensor([trainer_result["loss"]]), direct_result["loss"].reshape(1), "exact"
         ),
         framework_report(
             driver,
@@ -255,14 +260,7 @@ def fsdp2_numeric_reports(
             "framework.fsdp2_loss",
             torch.tensor([float(report.get("loss", float("nan")))]),
             torch.tensor([float(baseline_report.get("loss", float("nan")))]),
-            "distributed_loss",
-        ),
-        framework_report(
-            driver,
-            "framework.fsdp2_grad_norm",
-            torch.tensor([float(report.get("grad_norm", float("nan")))]),
-            torch.tensor([float(baseline_report.get("grad_norm", float("nan")))]),
-            "gradient",
+            "exact",
         ),
         framework_report(
             driver,

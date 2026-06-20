@@ -333,6 +333,7 @@ def _run_distributed_train_policy(
     max_grad_norm = float(options.get("max_grad_norm", 1.0))
     num_micro_steps = int(options.get("num_micro_steps", 1))
     compare_direct = bool(options.get("compare_direct", False))
+    collect_parameter_samples = bool(options.get("collect_parameter_samples", compare_direct))
     dp_replicate_size = optional_int(options.get("dp_replicate_size"))
     dp_shard_size = optional_int(options.get("dp_shard_size"))
     output_dir = policy_output_dir(driver, "distributed_train_fsdp2")
@@ -373,7 +374,7 @@ def _run_distributed_train_policy(
         lr=lr,
         max_grad_norm=max_grad_norm,
         num_micro_steps=num_micro_steps,
-        collect_parameter_samples=compare_direct,
+        collect_parameter_samples=collect_parameter_samples,
         dp_replicate_size=dp_replicate_size,
         dp_shard_size=dp_shard_size,
         fsdp_mode="fsdp2",
@@ -411,6 +412,16 @@ def _run_distributed_train_policy(
                 "framework.fsdp2_dp_shard_size",
                 int(report.get("dp_shard_size", 0)),
                 dp_shard_size,
+                "exact",
+            )
+        )
+    if collect_parameter_samples:
+        reports.append(
+            framework_report(
+                driver,
+                "framework.fsdp2_parameter_samples_collected",
+                bool(report.get("parameters_after_step", {})),
+                True,
                 "exact",
             )
         )

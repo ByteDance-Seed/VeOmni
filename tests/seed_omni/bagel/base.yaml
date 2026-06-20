@@ -32,7 +32,7 @@ tiers:
   reference: false
   graph: true
   module: true
-  framework: false
+  framework: true
 
 gate:
   requires_parity_env: false

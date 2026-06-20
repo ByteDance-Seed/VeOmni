@@ -43,7 +43,8 @@ class TimestepEmbedder(nn.Module):
 
     def forward(self, t: torch.Tensor) -> torch.Tensor:
         t_freq = self.timestep_embedding(t, self.frequency_embedding_size)
-        return self.mlp(t_freq.to(device=self.mlp[0].weight.device))
+        first_weight = self.mlp[0].weight
+        return self.mlp(t_freq.to(device=first_weight.device, dtype=first_weight.dtype))
 
 
 class PositionEmbedding(nn.Module):

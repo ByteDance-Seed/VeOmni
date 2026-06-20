@@ -6,9 +6,12 @@ import json
 import math
 import os
 import sys
+from collections.abc import Callable, Mapping
 from pathlib import Path
+from types import MethodType
 from typing import Any
 
+import torch
 import torch.distributed as dist
 
 
@@ -16,6 +19,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[5]
 sys.path.insert(0, str(_REPO_ROOT))
 
 from veomni.arguments import OmniArguments, parse_omni_args  # noqa: E402
+from veomni.ops.batch_invariant_ops import set_batch_invariant_mode  # noqa: E402
 from veomni.trainer.omni_trainer import OmniTrainer  # noqa: E402
 from veomni.utils.device import get_torch_device  # noqa: E402
 
@@ -62,6 +66,107 @@ def _write_report(output_dir: Path, report: dict[str, Any]) -> None:
     print(json.dumps(report, indent=2))
 
 
+def _debug_enabled() -> bool:
+    return os.environ.get("VEOMNI_PARITY_DATA_LOSS_DEBUG", "false").lower() == "true"
+
+
+def _conversation_summary(batch: Mapping[str, Any] | None) -> str:
+    if not isinstance(batch, Mapping):
+        return "batch=unknown"
+    conversation_list = batch.get("conversation_list")
+    if not isinstance(conversation_list, list):
+        return "conversation=missing"
+    counts: dict[str, int] = {}
+    for sample in conversation_list:
+        if not isinstance(sample, list):
+            continue
+        for item in sample:
+            item_type = str(getattr(item, "type", type(item).__name__))
+            role = str(getattr(item, "role", "unknown"))
+            meta = getattr(item, "meta", {}) or {}
+            source = meta.get("source", "raw") if isinstance(meta, Mapping) else "raw"
+            key = f"{item_type}:{role}:{source}"
+            counts[key] = counts.get(key, 0) + 1
+    if not counts:
+        return "conversation=empty"
+    return ",".join(f"{key}={value}" for key, value in sorted(counts.items()))
+
+
+def _loss_keys(result: Mapping[str, Any]) -> str:
+    losses = result.get("losses")
+    if not isinstance(losses, Mapping):
+        return "losses=missing"
+    return "losses=" + ",".join(str(key) for key in sorted(losses))
+
+
+def _debug_log(message: str, *, trainer: OmniTrainer | None = None, batch: Mapping[str, Any] | None = None) -> None:
+    if not _debug_enabled():
+        return
+    global_step = "NA"
+    if trainer is not None:
+        global_step = str(getattr(trainer.base.state, "global_step", "NA"))
+    suffix = f" {_conversation_summary(batch)}" if batch is not None else ""
+    print(f"[data_loss_debug][rank={_rank()}][step={global_step}] {message}{suffix}", flush=True)
+
+
+def _install_debug_hooks(trainer: OmniTrainer) -> None:
+    if not _debug_enabled():
+        return
+
+    base = trainer.base
+    model = base.model
+    executors = getattr(model, "_node_executors", None)
+    if isinstance(executors, Mapping):
+        wrapped_executors: dict[str, Callable[..., dict[str, Any]]] = {}
+
+        for module_name, executor in executors.items():
+
+            def _wrap_executor(
+                name: str,
+                fn: Callable[..., dict[str, Any]],
+            ) -> Callable[..., dict[str, Any]]:
+                def _wrapped(method: str, **kwargs: Any) -> dict[str, Any]:
+                    _debug_log(f"node_enter {name}.{method}", trainer=trainer, batch=kwargs)
+                    out = fn(method, **kwargs)
+                    _debug_log(f"node_exit {name}.{method} keys={','.join(sorted(out))}", trainer=trainer)
+                    return out
+
+                return _wrapped
+
+            wrapped_executors[str(module_name)] = _wrap_executor(str(module_name), executor)
+
+        model.set_node_executors(wrapped_executors)
+
+    def _debug_forward_backward_step(self: OmniTrainer, micro_batch: dict[str, Any]):
+        del self
+        _debug_log("preforward_enter", trainer=trainer, batch=micro_batch)
+        prepared_batch = base.preforward(micro_batch)
+        _debug_log("preforward_exit", trainer=trainer, batch=prepared_batch)
+
+        with base.model_fwd_context, set_batch_invariant_mode(base.args.train.enable_batch_invariant_mode):
+            _debug_log("model_forward_enter", trainer=trainer, batch=prepared_batch)
+            result: dict[str, Any] = base.model(**prepared_batch)
+            _debug_log(f"model_forward_exit {_loss_keys(result)}", trainer=trainer)
+
+        total_loss: torch.Tensor = result["loss"]
+        if total_loss is None:
+            raise RuntimeError(
+                "OmniModel.forward produced no loss — no training node emitted a `_loss`. "
+                "Check that the training data + per-module training forwards are wired (D4/D5)."
+            )
+        loss_dict: dict[str, torch.Tensor] = result.get("losses", {})
+
+        with base.model_bwd_context, set_batch_invariant_mode(base.args.train.enable_batch_invariant_mode):
+            _debug_log("backward_enter", trainer=trainer)
+            total_loss.backward()
+            _debug_log("backward_exit", trainer=trainer)
+
+        del prepared_batch
+        return total_loss, loss_dict
+
+    trainer.forward_backward_step = MethodType(_debug_forward_backward_step, trainer)  # type: ignore[method-assign]
+
+
 def main() -> None:
     os.environ.setdefault("NCCL_DEBUG", "WARN")
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
@@ -77,6 +182,7 @@ def main() -> None:
 
     trainer = OmniTrainer(args)
     trainer.base.LOG_SAMPLE = False
+    _install_debug_hooks(trainer)
     losses: list[float] = []
     grad_norms: list[float] = []
     original_on_step_end = trainer.on_step_end
@@ -117,9 +223,11 @@ def main() -> None:
             base.state.epoch = epoch
             trainer.on_epoch_begin()
             data_iterator = iter(base.train_dataloader)
-            for _ in range(base.start_step, args.train_steps):
+            for step_index in range(base.start_step, args.train_steps):
                 try:
+                    _debug_log(f"train_step_enter loop_step={step_index + 1}", trainer=trainer)
                     trainer.train_step(data_iterator)
+                    _debug_log(f"train_step_exit loop_step={step_index + 1}", trainer=trainer)
                 except StopIteration:
                     break
             trainer.on_epoch_end()

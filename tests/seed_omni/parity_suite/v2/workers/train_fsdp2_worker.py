@@ -19,8 +19,8 @@ _REPO_ROOT = Path(__file__).resolve().parents[5]
 sys.path.insert(0, str(_REPO_ROOT))
 
 from tests.seed_omni.parity_suite.core import configure_torch_determinism, to_device  # noqa: E402
+from tests.seed_omni.parity_suite.driver.observations import shifted_label_rows_from_conversation  # noqa: E402
 from veomni.arguments import OmniArguments, parse_omni_args  # noqa: E402
-from veomni.models.seed_omni.modules.bagel.packer import packed_label_rows  # noqa: E402
 from veomni.trainer.omni_trainer import MultiLRScheduler, MultiOptimizer, OmniTrainer  # noqa: E402
 
 
@@ -89,6 +89,21 @@ def _install_lightweight_optimizer(trainer: OmniTrainer, *, lr: float) -> None:
     trainer.base.lr_scheduler = MultiLRScheduler(schedulers)
 
 
+def _apply_module_config_overrides(model: Any, module_overrides: Mapping[str, Any]) -> None:
+    for module_name, override in module_overrides.items():
+        if not isinstance(override, Mapping):
+            continue
+        config_values = override.get("config")
+        if not isinstance(config_values, Mapping):
+            continue
+        module = model.get_module(str(module_name))
+        config = getattr(module, "config", None)
+        if config is None:
+            raise ValueError(f"Cannot apply config override to {module_name!r}: module has no config.")
+        for key, value in config_values.items():
+            setattr(config, str(key), value)
+
+
 def _tensor_to_full_cpu(value: torch.Tensor) -> torch.Tensor:
     if DTensor is not None and isinstance(value, DTensor):
         value = value.full_tensor()
@@ -109,7 +124,12 @@ def _sample_param(module: torch.nn.Module, name: str, rows: torch.Tensor | None 
 def _sample_bagel_parameters(model: Any, batch: Mapping[str, Any]) -> dict[str, torch.Tensor]:
     """Sample BAGEL parameters used by the parent FSDP2 numeric comparison."""
 
-    label_rows = packed_label_rows(batch.get("conversation_list"))
+    labels = batch.get("_bagel_train_label_ids")
+    label_rows = (
+        torch.unique(labels.detach().cpu()).to(dtype=torch.long)
+        if torch.is_tensor(labels)
+        else shifted_label_rows_from_conversation(batch.get("conversation_list"))
+    )
     return {
         "qwen_early_q_proj": _sample_param(
             model.get_module("bagel_qwen2_mot"),
@@ -137,11 +157,19 @@ def _jsonable(value: Any) -> Any:
     return value
 
 
+def _stdout_report(report: Mapping[str, Any]) -> dict[str, Any]:
+    summary = dict(report)
+    parameters = summary.get("parameters_after_step")
+    if isinstance(parameters, Mapping):
+        summary["parameters_after_step"] = sorted(parameters)
+    return summary
+
+
 def _write_report(output_dir: Path, report: dict[str, Any]) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     with (output_dir / "results.json").open("w", encoding="utf-8") as f:
         json.dump(report, f, indent=2)
-    print(json.dumps(report, indent=2))
+    print(json.dumps(_stdout_report(report), indent=2))
 
 
 def _fresh_micro_batch(batch_kwargs: Mapping[str, Any], device: torch.device) -> dict[str, Any]:
@@ -171,6 +199,7 @@ def main() -> None:
 
     trainer = OmniTrainer(args)
     trainer.base.LOG_SAMPLE = False
+    _apply_module_config_overrides(trainer.base.model, payload.get("module_overrides", {}) or {})
     _install_lightweight_optimizer(trainer, lr=float(payload.get("lr", args.train.optimizer.lr)))
 
     events: dict[str, Any] = {}
@@ -228,6 +257,7 @@ def main() -> None:
             "scheduler_lrs": scheduler_lrs,
             "scheduler_epochs": scheduler_epochs,
             "zero_grad_passes": zero_grad_passes,
+            "parameters_after_step": _jsonable(parameters_after_step),
         }
         gathered: list[dict[str, Any] | None] = [None for _ in range(_world_size())]
         if dist.is_initialized():
@@ -236,16 +266,32 @@ def main() -> None:
             gathered[0] = rank_metrics
 
         if _rank() == 0:
+            reference_rank = gathered[0]
             all_pass = all(
                 item is not None
+                and reference_rank is not None
                 and math.isfinite(item["loss"])
                 and math.isfinite(item["grad_norm"])
                 and item["grad_norm"] > 0
                 and (item["fsdp_module_count"] > 0 or not require_fsdp_modules)
                 and item["optimizer_count"] > 0
                 and item["zero_grad_passes"]
+                and item["loss"] == reference_rank["loss"]
+                and item["loss_dict"] == reference_rank["loss_dict"]
+                and item["grad_norm"] == reference_rank["grad_norm"]
+                and item["scheduler_lrs"] == reference_rank["scheduler_lrs"]
+                and item["scheduler_epochs"] == reference_rank["scheduler_epochs"]
+                and item["fsdp_module_count"] == reference_rank["fsdp_module_count"]
+                and item["optimizer_count"] == reference_rank["optimizer_count"]
+                and item["parameters_after_step"] == reference_rank["parameters_after_step"]
                 for item in gathered
             )
+            report_ranks = [
+                {key: value for key, value in item.items() if key != "parameters_after_step"}
+                if item is not None
+                else None
+                for item in gathered
+            ]
             report = {
                 "all_pass": all_pass,
                 "dp_mode": args.train.accelerator.fsdp_config.fsdp_mode,
@@ -262,8 +308,8 @@ def main() -> None:
                 "scheduler_epochs": rank_metrics["scheduler_epochs"],
                 "zero_grad_passes": rank_metrics["zero_grad_passes"],
                 "require_fsdp_modules": require_fsdp_modules,
-                "parameters_after_step": _jsonable(parameters_after_step),
-                "ranks": gathered,
+                "parameters_after_step": rank_metrics["parameters_after_step"],
+                "ranks": report_ranks,
             }
             _write_report(output_dir, report)
             if not all_pass:

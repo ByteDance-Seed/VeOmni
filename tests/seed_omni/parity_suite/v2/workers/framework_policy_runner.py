@@ -60,6 +60,23 @@ def _subprocess_env_without_distributed_launch() -> dict[str, str]:
     return env
 
 
+def _terminate_process_group(process: subprocess.Popen[str]) -> None:
+    if process.poll() is not None:
+        return
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    try:
+        process.wait(timeout=30)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            return
+        process.wait()
+
+
 def _infer_worker_argv(
     driver: Any,
     *,
@@ -122,12 +139,10 @@ def _run_infer_worker_subprocess(
                     raise subprocess.TimeoutExpired(cmd, timeout)
             returncode = process.wait(timeout=max(0.0, deadline - time.monotonic()))
         except subprocess.TimeoutExpired:
-            os.killpg(process.pid, signal.SIGTERM)
-            try:
-                process.wait(timeout=30)
-            except subprocess.TimeoutExpired:
-                os.killpg(process.pid, signal.SIGKILL)
-                process.wait()
+            _terminate_process_group(process)
+            raise
+        except BaseException:
+            _terminate_process_group(process)
             raise
     report_path = output_dir / "results.json"
     report = json.loads(report_path.read_text(encoding="utf-8")) if report_path.exists() else {}
@@ -245,11 +260,12 @@ def run_v2_infer_fsdp2(
 
 def run_data_loss_smoke_policy(
     driver: Any,
+    reference_output: Any = None,
     *,
     device: torch.device,
     dtype: torch.dtype,
 ) -> ParityReport:
-    del device, dtype
+    del reference_output, device, dtype
     options = driver.case.run.options
     strategy = str(options.get("strategy", "fsdp2"))
     if strategy != "fsdp2":
@@ -273,6 +289,7 @@ def run_data_loss_smoke_policy(
         gradient_checkpointing=bool(options.get("gradient_checkpointing", True)),
         loss_window=loss_window,
         expect_loss_decrease=bool(options.get("expect_loss_decrease", True)),
+        debug_log=bool(options.get("debug_log", False)),
         data_source_names=tuple(str(name) for name in options.get("data_source_names", ()) or ()),
     )
     _write_data_loss_manifest(driver, report=report, output_dir=output_dir)
@@ -308,11 +325,12 @@ def run_data_loss_smoke_policy(
 
 def run_script_data_smoke_policy(
     driver: Any,
+    reference_output: Any = None,
     *,
     device: torch.device,
     dtype: torch.dtype,
 ) -> ParityReport:
-    del device, dtype
+    del reference_output, device, dtype
     options = driver.case.run.options
     strategy = str(options.get("strategy", "fsdp2"))
     if strategy != "fsdp2":
@@ -677,6 +695,7 @@ def run_v2_train_fsdp2(
             "num_micro_steps": num_micro_steps,
             "collect_parameter_samples": collect_parameter_samples,
             "require_fsdp_modules": require_fsdp_modules,
+            "module_overrides": driver.case.recipe.v2_model.module_overrides,
         },
         payload_path,
     )
@@ -759,12 +778,10 @@ def run_v2_train_fsdp2(
                     raise subprocess.TimeoutExpired(cmd, timeout)
             returncode = process.wait(timeout=max(0.0, deadline - time.monotonic()))
         except subprocess.TimeoutExpired:
-            os.killpg(process.pid, signal.SIGTERM)
-            try:
-                process.wait(timeout=30)
-            except subprocess.TimeoutExpired:
-                os.killpg(process.pid, signal.SIGKILL)
-                process.wait()
+            _terminate_process_group(process)
+            raise
+        except BaseException:
+            _terminate_process_group(process)
             raise
     report_path = output_dir / "results.json"
     report = json.loads(report_path.read_text(encoding="utf-8")) if report_path.exists() else {}
@@ -787,6 +804,7 @@ def _run_v2_train_data_loss_smoke(
     gradient_checkpointing: bool,
     loss_window: int,
     expect_loss_decrease: bool,
+    debug_log: bool,
     data_source_names: tuple[str, ...],
 ) -> Mapping[str, Any]:
     """Run the data/loss worker and load its rank-0 ``results.json`` report."""
@@ -842,6 +860,7 @@ def _run_v2_train_data_loss_smoke(
         "VEOMNI_PARITY_DATA_LOSS_OUTPUT_DIR": str(output_dir),
         "VEOMNI_PARITY_DATA_LOSS_WINDOW": str(loss_window),
         "VEOMNI_PARITY_DATA_LOSS_EXPECT_DECREASE": str(expect_loss_decrease).lower(),
+        "VEOMNI_PARITY_DATA_LOSS_DEBUG": str(debug_log).lower(),
     }
     log_path = output_dir / "run.log"
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -887,14 +906,12 @@ def _run_v2_train_data_loss_smoke(
                 sys.__stdout__.write(line)
                 sys.__stdout__.flush()
         except subprocess.TimeoutExpired:
-            os.killpg(process.pid, signal.SIGTERM)
-            try:
-                process.wait(timeout=30)
-            except subprocess.TimeoutExpired:
-                os.killpg(process.pid, signal.SIGKILL)
-                process.wait()
+            _terminate_process_group(process)
             timed_out = True
             returncode = 124
+        except BaseException:
+            _terminate_process_group(process)
+            raise
     report_path = output_dir / "results.json"
     report = json.loads(report_path.read_text(encoding="utf-8")) if report_path.exists() else {}
     stdout = "".join(stdout_chunks)
@@ -902,6 +919,7 @@ def _run_v2_train_data_loss_smoke(
     report["exit_code"] = returncode
     report["timed_out"] = timed_out
     report["data_sources"] = _data_source_names(data_config)
+    report["debug_log"] = debug_log
     report["log_path"] = str(log_path)
     report["stdout_tail"] = stdout[-4000:]
     report["stderr_tail"] = ""
@@ -1004,14 +1022,12 @@ def _run_v2_train_script_data_smoke(
                 sys.__stdout__.write(line)
                 sys.__stdout__.flush()
         except subprocess.TimeoutExpired:
-            os.killpg(process.pid, signal.SIGTERM)
-            try:
-                process.wait(timeout=30)
-            except subprocess.TimeoutExpired:
-                os.killpg(process.pid, signal.SIGKILL)
-                process.wait()
+            _terminate_process_group(process)
             timed_out = True
             returncode = 124
+        except BaseException:
+            _terminate_process_group(process)
+            raise
     stdout = "".join(stdout_chunks)
     training_started = "Start training" in stdout and f"Train steps: {steps}" in stdout
     return {
