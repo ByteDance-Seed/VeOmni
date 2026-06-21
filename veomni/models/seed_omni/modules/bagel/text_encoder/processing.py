@@ -9,6 +9,7 @@ import torch
 from veomni.utils.tensor_utils import naflatten
 
 from ....conversation import ConversationItem, is_dummy, maybe_merge_outputs, seal_outputs
+from ..carrier_updates import materialize_carrier_updates, meta_patch, replace_value
 
 
 def resolve_token_id(tokenizer: Any, token: str, fallback: int | None) -> int | None:
@@ -98,10 +99,20 @@ def prepare_text_encode_inputs(
                 eos_token_id=eos_token_id,
                 device=device,
             )
-            item.value = token_ids
-            item.meta["input_ids"] = token_ids.detach()
-            item.meta["labels"] = labels_for_text_item(item, token_ids)
-            item.meta["attention_mask"] = torch.ones_like(token_ids, dtype=torch.long)
+            materialize_carrier_updates(
+                None,
+                [
+                    replace_value(item, token_ids),
+                    meta_patch(
+                        item,
+                        {
+                            "input_ids": token_ids.detach(),
+                            "labels": labels_for_text_item(item, token_ids),
+                            "attention_mask": torch.ones_like(token_ids, dtype=torch.long),
+                        },
+                    ),
+                ],
+            )
             input_ids.append(token_ids)
             segment_count += 1
 
@@ -149,16 +160,18 @@ def scatter_text_embeds(
         return
 
     consumed = 0
+    updates = []
     for sample in conversation_list:
         for item in sample:
             if is_dummy(item) or item.type != "text":
                 continue
             if consumed >= len(segment_embeds):
                 raise RuntimeError("BAGEL text segment count mismatch during embed scatter.")
-            item.value = segment_embeds[consumed].to(device=device, dtype=dtype)
+            updates.append(replace_value(item, segment_embeds[consumed].to(device=device, dtype=dtype)))
             consumed += 1
     if consumed != expected or consumed != len(segment_embeds):
         raise RuntimeError("BAGEL text segment count mismatch during embed scatter.")
+    materialize_carrier_updates(None, updates)
 
 
 def image_embed_marker_items(
@@ -205,7 +218,10 @@ def apply_image_embed_markers(
             and torch.equal(image_embeds[-1:], embeds[1:])
         ):
             continue
-        item.value = torch.cat([embeds[:1], image_embeds, embeds[1:]], dim=0)
+        materialize_carrier_updates(
+            None,
+            [replace_value(item, torch.cat([embeds[:1], image_embeds, embeds[1:]], dim=0))],
+        )
 
 
 def output_hidden_tail(sample: list[ConversationItem]) -> tuple[ConversationItem, torch.Tensor]:
@@ -237,8 +253,13 @@ def update_tail_with_generated_token(
     device: torch.device,
     dtype: torch.dtype,
 ) -> None:
-    tail.value = inputs_embeds.to(device=device, dtype=dtype)
-    tail.meta["input_ids"] = input_ids.reshape(-1).detach()
+    materialize_carrier_updates(
+        sample,
+        [
+            replace_value(tail, inputs_embeds.to(device=device, dtype=dtype)),
+            meta_patch(tail, {"input_ids": input_ids.reshape(-1).detach()}),
+        ],
+    )
     maybe_merge_outputs(sample)
 
 

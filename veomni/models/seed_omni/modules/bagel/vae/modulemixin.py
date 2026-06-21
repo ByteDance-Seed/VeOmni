@@ -8,6 +8,8 @@ import torch
 
 from ....conversation import ConversationItem
 from ....module import ModuleMixin, post_forward, pre_forward
+from ..carrier_updates import append as carrier_append
+from ..carrier_updates import materialize_carrier_updates
 from .configuration import BagelVAEConfig
 from .processing import (
     as_batched_decode_conversation,
@@ -60,8 +62,7 @@ class BagelVAEModuleMixin(ModuleMixin):
         outputs = self._decode_latents(inputs["latents"])
         pixel_values = outputs["pixel_values"]
         scatter_decoded_images(decode_items, pixel_values, device=self.device, dtype=self.dtype)
-        generated = {"type": "image", "value": decoded_tensor_to_pil(decode_items[0].value)}
-        return {"conversation_list": conversation_list, "generated": generated}
+        return {"conversation_list": conversation_list}
 
     def _encode_context_conversation(self, conversation_list: Any) -> dict[str, Any]:
         batched = as_batched_decode_conversation(conversation_list)
@@ -109,15 +110,21 @@ class BagelVAEModuleMixin(ModuleMixin):
         if is_dummy:
             if conversation is not None:
                 value = latents.squeeze(0) if latents.dim() == 4 and latents.shape[0] == 1 else latents
-                for sample in conversation:
-                    sample.append(
-                        ConversationItem(
-                            type="output",
-                            value=value,
-                            role="dummy",
-                            meta={"source": "bagel_vae"},
+                materialize_carrier_updates(
+                    conversation,
+                    [
+                        carrier_append(
+                            sample,
+                            ConversationItem(
+                                type="output",
+                                value=value,
+                                role="dummy",
+                                meta={"source": "bagel_vae"},
+                            ),
                         )
-                    )
+                        for sample in conversation
+                    ],
+                )
             return {"conversation_list": conversation}
 
         scatter_encoded_latents(encode_items, latents, device=self.device, dtype=self.dtype)
@@ -173,6 +180,14 @@ class BagelVAEModuleMixin(ModuleMixin):
                 dtype=self.dtype,
             )
         }
+
+    def finalize(self, *, ctx: dict[str, Any]) -> dict[str, Any]:
+        for sample in reversed(as_batched_decode_conversation(ctx.get("conversation_list", []))):
+            for item in reversed(sample):
+                if item.type != "image" or item.role != "assistant" or not torch.is_tensor(item.value):
+                    continue
+                return {"generated": {"type": "image", "value": decoded_tensor_to_pil(item.value)}}
+        return {}
 
 
 __all__ = ["BagelVAEModuleMixin"]

@@ -12,6 +12,7 @@ from torchvision.transforms import InterpolationMode
 from torchvision.transforms import functional as TVF
 
 from ....conversation import ConversationItem, is_dummy
+from ..carrier_updates import materialize_carrier_updates, replace_value
 
 
 def preprocess_image(
@@ -299,11 +300,13 @@ def scatter_image_embeds(
     lengths = token_lens.detach().cpu().reshape(-1).tolist()
     if len(lengths) != len(image_items):
         raise RuntimeError("BAGEL SigLIP image count mismatch during feature scatter.")
+    updates = []
     for item, length in zip(image_items, lengths, strict=True):
-        item.value = image_embeds[offset : offset + int(length)].to(device=device, dtype=dtype)
+        updates.append(replace_value(item, image_embeds[offset : offset + int(length)].to(device=device, dtype=dtype)))
         offset += int(length)
     if offset != int(image_embeds.shape[0]):
         raise RuntimeError("BAGEL SigLIP token count mismatch during feature scatter.")
+    materialize_carrier_updates(None, updates)
 
 
 __all__ = [

@@ -7,6 +7,7 @@ from typing import Any
 import torch
 
 from ....conversation import ConversationItem, is_dummy
+from ..carrier_updates import materialize_carrier_updates, meta_patch, replace_value
 
 
 def autocast_enabled_for_device(device: torch.device) -> bool:
@@ -224,9 +225,19 @@ def prepare_embed_latent_inputs(
         )
         timestep_values = timestep.reshape(-1, 1).to(device=clean.device, dtype=torch.float32)
         noised = (1.0 - timestep_values) * clean + timestep_values * noise
-        item.meta["timestep"] = timestep.detach()
-        item.meta["noise"] = noise.detach()
-        item.meta["flow_velocity_target"] = (noise - clean).detach()
+        materialize_carrier_updates(
+            None,
+            [
+                meta_patch(
+                    item,
+                    {
+                        "timestep": timestep.detach(),
+                        "noise": noise.detach(),
+                        "flow_velocity_target": (noise - clean).detach(),
+                    },
+                )
+            ],
+        )
         latent_parts.append(noised)
         position_parts.append(
             flattened_position_ids(
@@ -295,11 +306,13 @@ def scatter_latent_embeds(
     dtype: torch.dtype,
 ) -> None:
     offset = 0
+    updates = []
     for item, length in zip(embed_items, embed_lengths, strict=True):
-        item.value = latent_embeds[offset : offset + length].to(device=device, dtype=dtype)
+        updates.append(replace_value(item, latent_embeds[offset : offset + length].to(device=device, dtype=dtype)))
         offset += length
     if offset != int(latent_embeds.shape[0]):
         raise RuntimeError("BAGEL flow connector latent count mismatch during embed scatter.")
+    materialize_carrier_updates(None, updates)
 
 
 def flow_hidden_items(
@@ -364,11 +377,13 @@ def scatter_velocity(
     dtype: torch.dtype,
 ) -> None:
     offset = 0
+    updates = []
     for item, length in zip(decode_items, decode_lengths, strict=True):
-        item.value = velocity[offset : offset + length].to(device=device, dtype=dtype)
+        updates.append(replace_value(item, velocity[offset : offset + length].to(device=device, dtype=dtype)))
         offset += length
     if offset != int(velocity.shape[0]):
         raise RuntimeError("BAGEL flow connector token count mismatch during velocity scatter.")
+    materialize_carrier_updates(None, updates)
 
 
 __all__ = [

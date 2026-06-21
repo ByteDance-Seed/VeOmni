@@ -9,6 +9,8 @@ import torch
 from ....conversation import ConversationItem
 from ....module import ModuleMixin, post_forward, pre_forward
 from ....tracemixin import TraceMixin
+from ..carrier_updates import append as carrier_append
+from ..carrier_updates import materialize_carrier_updates
 from .configuration import BagelSiglipNavitConfig
 from .processing import prepare_image_batch, scatter_image_embeds, user_raw_image_items
 
@@ -64,15 +66,21 @@ class BagelSiglipNavitModuleMixin(ModuleMixin):
                 value = (
                     image_embeds.squeeze(0) if image_embeds.dim() == 3 and image_embeds.shape[0] == 1 else image_embeds
                 )
-                for sample in conversation:
-                    sample.append(
-                        ConversationItem(
-                            type="image",
-                            value=value,
-                            role="dummy",
-                            meta={"source": "bagel_siglip_navit"},
+                materialize_carrier_updates(
+                    conversation,
+                    [
+                        carrier_append(
+                            sample,
+                            ConversationItem(
+                                type="image",
+                                value=value,
+                                role="dummy",
+                                meta={"source": "bagel_siglip_navit"},
+                            ),
                         )
-                    )
+                        for sample in conversation
+                    ],
+                )
             return {"conversation_list": conversation}
 
         if token_lens is None:

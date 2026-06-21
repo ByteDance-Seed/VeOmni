@@ -9,6 +9,8 @@ import torch
 from ....conversation import ConversationItem
 from ....generation_graph import FSM_SIGNAL_KEY
 from ....module import ModuleMixin, post_forward, pre_forward
+from ..carrier_updates import append as carrier_append
+from ..carrier_updates import materialize_carrier_updates, meta_patch, replace_fields, replace_value
 from .configuration import BagelFlowConnectorConfig
 from .generation_state import FlowGenerationState
 from .processing import (
@@ -103,15 +105,24 @@ class BagelFlowConnectorModuleMixin(ModuleMixin):
         )
         query = outputs["latent_embeds"].to(device=self.device, dtype=self.dtype)
         item = active_output_item(conversation)
+        timestep_meta = timestep.detach().to(device=query.device, dtype=torch.float32)
         if item is None:
-            conversation.append(ConversationItem(type="output", value=query, role="assistant", meta={}))
-            item = conversation[-1]
+            materialize_carrier_updates(
+                conversation,
+                [
+                    carrier_append(
+                        conversation,
+                        ConversationItem(
+                            type="output", value=query, role="assistant", meta={"timestep": timestep_meta}
+                        ),
+                    )
+                ],
+            )
         else:
-            item.type = "output"
-            item.role = "assistant"
-            item.value = query
-        item.meta.clear()
-        item.meta["timestep"] = timestep.detach().to(device=query.device, dtype=torch.float32)
+            materialize_carrier_updates(
+                conversation,
+                [replace_fields(item, type="output", role="assistant", value=query, meta={"timestep": timestep_meta})],
+            )
         state.phase = "decode_velocity"
         return {"conversation_list": conversation_list}
 
@@ -131,7 +142,7 @@ class BagelFlowConnectorModuleMixin(ModuleMixin):
         state = self._generation_state
         outputs = self.decode_velocity(hidden_states=hidden)
         velocity = state.strip_query_markers(outputs["velocity"])
-        item.value = velocity.to(device=self.device, dtype=self.dtype)
+        materialize_carrier_updates(None, [replace_value(item, velocity.to(device=self.device, dtype=self.dtype))])
         state.phase = "advance"
         return {"conversation_list": conversation_list}
 
@@ -150,7 +161,7 @@ class BagelFlowConnectorModuleMixin(ModuleMixin):
         complete = state.advance(velocity)
         if complete:
             return self._emit_final_latent(conversation_list, conversation)
-        item.meta.pop("timestep", None)
+        materialize_carrier_updates(None, [meta_patch(item, {}, remove=("timestep",))])
         state.phase = "prepare_query"
         return {"conversation_list": conversation_list}
 
@@ -177,15 +188,27 @@ class BagelFlowConnectorModuleMixin(ModuleMixin):
             latent_patch_size=int(self.config.latent_patch_size),
         )
         if item is None:
-            conversation.append(ConversationItem(type="output", value=latent, role="assistant", meta={}))
-            item = conversation[-1]
+            materialize_carrier_updates(
+                conversation,
+                [
+                    carrier_append(
+                        conversation, ConversationItem(type="output", value=latent, role="assistant", meta={})
+                    )
+                ],
+            )
         else:
-            item.type = "output"
-            item.role = "assistant"
-            item.value = latent.to(device=self.device, dtype=self.dtype)
-        item.meta.pop("timestep", None)
-        item.meta.pop("noise", None)
-        item.meta.pop("flow_velocity_target", None)
+            materialize_carrier_updates(
+                conversation,
+                [
+                    replace_fields(
+                        item,
+                        type="output",
+                        role="assistant",
+                        value=latent.to(device=self.device, dtype=self.dtype),
+                        meta={},
+                    )
+                ],
+            )
         self.reset_local_inference_state()
         return {"conversation_list": conversation_list, FSM_SIGNAL_KEY: SIGNAL_IMAGE_COMPLETE}
 
@@ -261,15 +284,21 @@ class BagelFlowConnectorModuleMixin(ModuleMixin):
 
         if is_dummy:
             if conversation is not None:
-                for sample in conversation:
-                    sample.append(
-                        ConversationItem(
-                            type="output",
-                            value=latent_embeds.squeeze(0),
-                            role="dummy",
-                            meta={"source": "bagel_flow_connector"},
+                materialize_carrier_updates(
+                    conversation,
+                    [
+                        carrier_append(
+                            sample,
+                            ConversationItem(
+                                type="output",
+                                value=latent_embeds.squeeze(0),
+                                role="dummy",
+                                meta={"source": "bagel_flow_connector"},
+                            ),
                         )
-                    )
+                        for sample in conversation
+                    ],
+                )
             return {"conversation_list": conversation}
 
         scatter_latent_embeds(embed_items, embed_lengths, latent_embeds, device=self.device, dtype=self.dtype)

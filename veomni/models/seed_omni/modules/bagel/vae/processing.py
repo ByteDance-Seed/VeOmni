@@ -12,6 +12,11 @@ from torchvision.transforms import InterpolationMode
 from torchvision.transforms import functional as TVF
 
 from ....conversation import ConversationItem, is_dummy
+from ..carrier_updates import (
+    insert_before,
+    materialize_carrier_updates,
+    replace_fields,
+)
 
 
 def preprocess_image(
@@ -261,9 +266,13 @@ def scatter_encoded_latents(
 ) -> None:
     if len(encode_items) != int(latents.shape[0]):
         raise RuntimeError("BAGEL VAE image count mismatch during latent scatter.")
-    for item, latent in zip(encode_items, latents, strict=True):
-        item.type = "output"
-        item.value = latent.to(device=device, dtype=dtype)
+    materialize_carrier_updates(
+        None,
+        [
+            replace_fields(item, type="output", value=latent.to(device=device, dtype=dtype))
+            for item, latent in zip(encode_items, latents, strict=True)
+        ],
+    )
 
 
 def context_encode_image_items(
@@ -281,19 +290,22 @@ def insert_context_encoded_latents(
 ) -> None:
     if len(context_items) != int(latents.shape[0]):
         raise RuntimeError("BAGEL VAE context image count mismatch during latent scatter.")
-    for (sample, image_item), latent in zip(context_items, latents, strict=True):
-        insert_at = next((idx for idx, candidate in enumerate(sample) if candidate is image_item), None)
-        if insert_at is None:
-            raise RuntimeError("BAGEL VAE context image disappeared before latent insertion.")
-        sample.insert(
-            insert_at,
-            ConversationItem(
-                type="output",
-                value=latent.to(device=device, dtype=dtype),
-                role="assistant",
-                meta={},
-            ),
-        )
+    samples = [sample for sample, _ in context_items]
+    materialize_carrier_updates(
+        samples,
+        [
+            insert_before(
+                image_item,
+                ConversationItem(
+                    type="output",
+                    value=latent.to(device=device, dtype=dtype),
+                    role="assistant",
+                    meta={},
+                ),
+            )
+            for (_, image_item), latent in zip(context_items, latents, strict=True)
+        ],
+    )
 
 
 def latent_decode_items(conversation_list: list[list[ConversationItem]] | None) -> list[ConversationItem]:
@@ -324,9 +336,13 @@ def scatter_decoded_images(
 ) -> None:
     if len(decode_items) != int(pixel_values.shape[0]):
         raise RuntimeError("BAGEL VAE latent count mismatch during decoded image scatter.")
-    for item, image in zip(decode_items, pixel_values, strict=True):
-        item.type = "image"
-        item.value = image.to(device=device, dtype=dtype)
+    materialize_carrier_updates(
+        None,
+        [
+            replace_fields(item, type="image", value=image.to(device=device, dtype=dtype))
+            for item, image in zip(decode_items, pixel_values, strict=True)
+        ],
+    )
 
 
 def as_batched_decode_conversation(conversation_list: Any) -> list[list[Any]]:
