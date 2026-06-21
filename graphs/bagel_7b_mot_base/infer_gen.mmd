@@ -11,21 +11,35 @@ flowchart LR
         prompt_encode__bagel_qwen2_mot_generate["<i>bagel_qwen2_mot.generate</i>"]:::body_node
         prompt_encode__bagel_text_encoder_prompt_encode --> prompt_encode__bagel_qwen2_mot_generate
     end
-    subgraph state_image_flow [image_flow]
+    subgraph state_denoise_query [denoise_query]
         direction TB
-        image_flow__bagel_flow_connector_embed_latent["<i>bagel_flow_connector.embed_latent</i>"]:::body_node
-        image_flow__bagel_qwen2_mot_generate["<i>bagel_qwen2_mot.generate</i>"]:::body_node
-        image_flow__bagel_flow_connector_decode_velocity["<i>bagel_flow_connector.decode_velocity</i>"]:::body_node
-        image_flow__bagel_flow_connector_embed_latent --> image_flow__bagel_qwen2_mot_generate
-        image_flow__bagel_qwen2_mot_generate --> image_flow__bagel_flow_connector_decode_velocity
+        denoise_query__bagel_flow_connector_generate["<i>bagel_flow_connector.generate</i>"]:::body_node
+        denoise_query__bagel_text_encoder_encode_image_query_markers["<i>bagel_text_encoder.encode_image_query_markers</i>"]:::body_node
+        denoise_query__bagel_qwen2_mot_generate["<i>bagel_qwen2_mot.generate</i>"]:::body_node
+        denoise_query__bagel_flow_connector_generate --> denoise_query__bagel_text_encoder_encode_image_query_markers
+        denoise_query__bagel_text_encoder_encode_image_query_markers --> denoise_query__bagel_qwen2_mot_generate
+    end
+    subgraph state_velocity_collect [velocity_collect]
+        direction TB
+        velocity_collect__bagel_flow_connector_generate["<i>bagel_flow_connector.generate</i>"]:::body_node
+        velocity_collect__bagel_qwen2_mot_generate["<i>bagel_qwen2_mot.generate</i>"]:::body_node
+        velocity_collect__bagel_flow_connector_generate --> velocity_collect__bagel_qwen2_mot_generate
+    end
+    subgraph state_denoise_advance [denoise_advance]
+        direction TB
+        denoise_advance__bagel_flow_connector_generate["<i>bagel_flow_connector.generate</i>"]:::body_node
     end
     subgraph state_image_decode [image_decode]
         direction TB
         image_decode__bagel_vae_decode["<i>bagel_vae.decode</i>"]:::body_node
     end
     fsm_start ==> state_prompt_encode
-    state_prompt_encode ==>|"default"| state_image_flow
-    state_image_flow ==>|"module_signal(image_complete)"| state_image_decode
+    state_prompt_encode ==>|"default"| state_denoise_query
+    state_denoise_query ==>|"default"| state_velocity_collect
+    state_velocity_collect ==>|"module_signal(need_denoise_branch)"| state_denoise_query
+    state_velocity_collect ==>|"module_signal(velocity_ready)"| state_denoise_advance
+    state_denoise_advance ==>|"module_signal(image_complete)"| state_image_decode
+    state_denoise_advance ==>|"default"| state_denoise_query
     state_image_decode ==>|"default"| fsm_done
     classDef body_node fill:#fff,stroke:#666
     classDef fsm_start fill:#dff,stroke:#06c,stroke-width:2px
