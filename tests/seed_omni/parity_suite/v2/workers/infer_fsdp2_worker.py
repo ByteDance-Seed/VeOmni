@@ -83,12 +83,12 @@ def _inferencer_device(inferencer: OmniInferencer) -> torch.device:
     )
 
 
-def _load_probe_catalog() -> ProbeCatalog:
-    return load_probe_catalog(_REPO_ROOT / "tests/seed_omni/bagel/probes.yaml")
+def _load_probe_catalog(probes_path: Path) -> ProbeCatalog:
+    return load_probe_catalog(probes_path)
 
 
-def _build_whitelist(probe_names: tuple[str, ...]) -> dict[tuple[str, str], frozenset[str]]:
-    catalog = _load_probe_catalog()
+def _build_whitelist(probe_names: tuple[str, ...], *, probes_path: Path) -> dict[tuple[str, str], frozenset[str]]:
+    catalog = _load_probe_catalog(probes_path)
     selected = catalog.for_probe_names(probe_names)
     whitelist: dict[tuple[str, str], set[str]] = {}
     for mapping in selected:
@@ -101,8 +101,10 @@ def _build_whitelist(probe_names: tuple[str, ...]) -> dict[tuple[str, str], froz
 def _extract_probe_values(
     observations: Mapping[tuple[str, str], list[dict[str, Any]]],
     probe_names: tuple[str, ...],
+    *,
+    probes_path: Path,
 ) -> dict[str, Any]:
-    catalog = _load_probe_catalog()
+    catalog = _load_probe_catalog(probes_path)
     extracted: dict[str, Any] = {}
     for probe_name in probe_names:
         mappings = catalog.for_probe_names((probe_name,))
@@ -148,6 +150,7 @@ def main() -> None:
     args.infer.seed = seed
     require_fsdp_modules = bool(payload.get("require_fsdp_modules", True))
     probe_names = tuple(str(name) for name in payload.get("probe_names", ()) or ())
+    probes_path = Path(str(payload["probes_path"]))
     request_kwargs = payload["request_kwargs"]
     generation_kwargs = dict(payload.get("generation_kwargs", {}) or {})
 
@@ -156,7 +159,7 @@ def main() -> None:
     device = _inferencer_device(inferencer)
     configure_torch_determinism(seed)
     request = _fresh_request(request_kwargs, device)
-    whitelist = _build_whitelist(probe_names) if probe_names else {}
+    whitelist = _build_whitelist(probe_names, probes_path=probes_path) if probe_names else {}
 
     try:
         trace_buf: list[str] = []
@@ -175,7 +178,7 @@ def main() -> None:
                 )
         inferencer.finalize(ctx, output_dir=str(output_dir))
         rank0_finalized = _rank() == 0 and (output_dir / "trace.txt").exists()
-        extracted = _extract_probe_values(observations, probe_names)
+        extracted = _extract_probe_values(observations, probe_names, probes_path=probes_path)
         fsdp_module_count = _count_fsdp_modules(inferencer.model)
         finite_observations = _observations_are_finite(extracted) if extracted else True
 

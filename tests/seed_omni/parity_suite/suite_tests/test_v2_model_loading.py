@@ -70,14 +70,14 @@ def test_training_config_filters_modules_and_keeps_training_graph(tmp_path: Path
 def test_bagel_module_recipe_selects_module_level_config_from_oracle_target() -> None:
     [case] = [
         case
-        for case in discover_cases([Path("tests/seed_omni/bagel")])
+        for case in discover_cases([Path("tests/seed_omni/bagel/parity")])
         if case.recipe.id == "module_text_encoder_prompt" and case.tier == "module" and case.run.id == "prompt_encode"
     ]
 
     module_names = graph_active_module_names(case)
     config = load_graph_active_omni_config(case)
 
-    assert case.v2_model.config_dir.match("*/tests/seed_omni/bagel/configs/text_encoder")
+    assert case.v2_model.config_dir.match("*/tests/seed_omni/bagel/parity/configs/text_encoder")
     assert case.v2_model.model_root.match("*/models/seed_omni/BAGEL-7B-MoT")
     assert module_names == frozenset({"bagel_text_encoder"})
     assert config.module_names == ["bagel_text_encoder"]
@@ -92,7 +92,7 @@ def test_bagel_module_recipe_selects_module_level_config_from_oracle_target() ->
 def test_bagel_infer_edit_case_declares_recipe_level_v2_module_override() -> None:
     [case] = [
         case
-        for case in discover_cases([Path("tests/seed_omni/bagel")])
+        for case in discover_cases([Path("tests/seed_omni/bagel/parity")])
         if case.recipe.id == "image_text_edit_cfg_disabled"
         and case.tier == "graph"
         and case.run.id == "denoise_one_step"

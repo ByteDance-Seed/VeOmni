@@ -3,7 +3,7 @@ seed: 7
 
 reference:
   hf_model:
-    module: tests.seed_omni.bagel.reference.hf_model:BagelHfModelReference
+    module: tests.seed_omni.bagel.parity.reference.hf_model:BagelHfModelReference
     checkpoint: /mnt/hdfs/user_dir/veomni_omni/models/transformers/BAGEL-7B-MoT
   hf_module:
     - text_encoder
@@ -18,15 +18,15 @@ v2_model:
     config_dir: configs/seed_omni/Bagel/bagel_7b_mot
   hf_module:
     text_encoder:
-      config_dir: tests/seed_omni/bagel/configs/text_encoder
+      config_dir: tests/seed_omni/bagel/parity/configs/text_encoder
     siglip_navit:
-      config_dir: tests/seed_omni/bagel/configs/siglip_navit
+      config_dir: tests/seed_omni/bagel/parity/configs/siglip_navit
     vae:
-      config_dir: tests/seed_omni/bagel/configs/vae
+      config_dir: tests/seed_omni/bagel/parity/configs/vae
     flow_connector_embed:
-      config_dir: tests/seed_omni/bagel/configs/flow_connector
+      config_dir: tests/seed_omni/bagel/parity/configs/flow_connector
     qwen2_mot:
-      config_dir: tests/seed_omni/bagel/configs/qwen2_mot
+      config_dir: tests/seed_omni/bagel/parity/configs/qwen2_mot
 
 tiers:
   reference: false

@@ -18,7 +18,6 @@ from tests.seed_omni.parity_suite.core import PARITY_ENABLE_ENV, ParityCase
 
 
 LAUNCHER_CHILD_ENV = "VEOMNI_PARITY_GPU_LAUNCHER_CHILD"
-TEST_ENTRYPOINT = "tests/seed_omni/parity_suite/test_parity_cases.py::test_seed_omni_v2_parity_case"
 
 
 # Result and process contracts -------------------------------------------------
@@ -67,13 +66,13 @@ def configured_cuda_devices(cases: Sequence[ParityCase]) -> tuple[str, ...]:
 # Public command and environment helpers --------------------------------------
 
 
-def build_pytest_command(case_id: str) -> list[str]:
+def build_pytest_command(case_id: str, *, test_entrypoint: str) -> list[str]:
     return [
         sys.executable,
         "-m",
         "pytest",
         "-q",
-        f"{TEST_ENTRYPOINT}[{case_id}]",
+        f"{test_entrypoint}[{case_id}]",
     ]
 
 
@@ -97,6 +96,7 @@ def build_case_env(
 def run_cases(
     cases: Sequence[ParityCase],
     *,
+    test_entrypoint: str,
     cuda_devices: Sequence[str] | None = None,
     output_dir: Path | None = None,
     parallel: bool | None = None,
@@ -109,8 +109,20 @@ def run_cases(
     output_root.mkdir(parents=True, exist_ok=True)
     enable_parallel = _enable_parallel(cases) if parallel is None else parallel
     if not enable_parallel or not selected_devices:
-        return _run_serial(cases, cuda_devices=selected_devices, output_dir=output_root, on_result=on_result)
-    return _run_parallel(cases, cuda_devices=selected_devices, output_dir=output_root, on_result=on_result)
+        return _run_serial(
+            cases,
+            test_entrypoint=test_entrypoint,
+            cuda_devices=selected_devices,
+            output_dir=output_root,
+            on_result=on_result,
+        )
+    return _run_parallel(
+        cases,
+        test_entrypoint=test_entrypoint,
+        cuda_devices=selected_devices,
+        output_dir=output_root,
+        on_result=on_result,
+    )
 
 
 # Scheduling backends ----------------------------------------------------------
@@ -119,6 +131,7 @@ def run_cases(
 def _run_serial(
     cases: Sequence[ParityCase],
     *,
+    test_entrypoint: str,
     cuda_devices: tuple[str, ...],
     output_dir: Path,
     on_result: Callable[[LauncherResult], None] | None,
@@ -126,7 +139,7 @@ def _run_serial(
     results: list[LauncherResult] = []
     for case in cases:
         devices = _case_cuda_devices(case, cuda_devices)
-        running = _start_case(case, cuda_devices=devices, output_dir=output_dir)
+        running = _start_case(case, test_entrypoint=test_entrypoint, cuda_devices=devices, output_dir=output_dir)
         result = _wait_case(running)
         results.append(result)
         if on_result is not None:
@@ -137,6 +150,7 @@ def _run_serial(
 def _run_parallel(
     cases: Sequence[ParityCase],
     *,
+    test_entrypoint: str,
     cuda_devices: tuple[str, ...],
     output_dir: Path,
     on_result: Callable[[LauncherResult], None] | None,
@@ -157,7 +171,9 @@ def _run_parallel(
             devices = tuple(available[:needed])
             del available[:needed]
             pending.remove(case)
-            running.append(_start_case(case, cuda_devices=devices, output_dir=output_dir))
+            running.append(
+                _start_case(case, test_entrypoint=test_entrypoint, cuda_devices=devices, output_dir=output_dir)
+            )
             launched = True
 
         completed = _collect_completed(running)
@@ -178,10 +194,16 @@ def _run_parallel(
 # Process lifecycle ------------------------------------------------------------
 
 
-def _start_case(case: ParityCase, *, cuda_devices: tuple[str, ...], output_dir: Path) -> _RunningCase:
+def _start_case(
+    case: ParityCase,
+    *,
+    test_entrypoint: str,
+    cuda_devices: tuple[str, ...],
+    output_dir: Path,
+) -> _RunningCase:
     log_path = output_dir / f"{_safe_case_id(case.node_id)}.log"
     log_file = log_path.open("wb")
-    command = build_pytest_command(case.node_id)
+    command = build_pytest_command(case.node_id, test_entrypoint=test_entrypoint)
     print(f"START {case.node_id} cuda={','.join(cuda_devices) or '<none>'} log={log_path}")
     process = subprocess.Popen(
         command, env=build_case_env(cuda_devices=cuda_devices), stdout=log_file, stderr=subprocess.STDOUT
@@ -261,7 +283,6 @@ def _safe_case_id(case_id: str) -> str:
 
 __all__ = [
     "LAUNCHER_CHILD_ENV",
-    "TEST_ENTRYPOINT",
     "LauncherResult",
     "build_case_env",
     "build_pytest_command",

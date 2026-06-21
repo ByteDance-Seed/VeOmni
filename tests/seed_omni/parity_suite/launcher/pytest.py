@@ -20,8 +20,9 @@ _LAUNCHER_SESSIONS: dict[tuple[str, ...], _PytestLauncherSession] = {}
 class _PytestLauncherSession:
     """Fan out one GPU-pool launcher run to individual parametrized pytest items."""
 
-    def __init__(self, cases: tuple[ParityCase, ...]) -> None:
+    def __init__(self, cases: tuple[ParityCase, ...], *, test_entrypoint: str) -> None:
         self.cases = cases
+        self.test_entrypoint = test_entrypoint
         self._condition = threading.Condition()
         self._results: dict[str, LauncherResult] = {}
         self._error: BaseException | None = None
@@ -50,7 +51,7 @@ class _PytestLauncherSession:
 
     def _run(self) -> None:
         try:
-            run_cases(self.cases, on_result=self._record_result)
+            run_cases(self.cases, test_entrypoint=self.test_entrypoint, on_result=self._record_result)
         except BaseException as exc:  # noqa: BLE001 - propagate worker failures to pytest items.
             with self._condition:
                 self._error = exc
@@ -97,15 +98,20 @@ def _is_direct_case_selection(case: ParityCase, request: Any) -> bool:
 
 
 def _launcher_session(request: Any) -> _PytestLauncherSession:
+    test_entrypoint = _current_test_entrypoint(request)
     cases = _selected_runnable_launcher_cases(request)
-    key = tuple(case.node_id for case in cases)
+    key = (test_entrypoint, *(case.node_id for case in cases))
     # Every parametrized pytest item reaches this helper. Cache one session for
     # the selected case set so the GPU pool is started once per pytest run.
     session = _LAUNCHER_SESSIONS.get(key)
     if session is None:
-        session = _PytestLauncherSession(cases)
+        session = _PytestLauncherSession(cases, test_entrypoint=test_entrypoint)
         _LAUNCHER_SESSIONS[key] = session
     return session
+
+
+def _current_test_entrypoint(request: Any) -> str:
+    return str(request.node.nodeid).split("[", 1)[0]
 
 
 def _selected_runnable_launcher_cases(request: Any) -> tuple[ParityCase, ...]:

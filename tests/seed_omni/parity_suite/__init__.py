@@ -1,7 +1,7 @@
 """SeedOmni V2 parity suite test harness.
 
 The package exposes the shared building blocks used by
-``test_parity_cases.py`` and model-specific parity drivers:
+model-owned pytest entrypoints and parity drivers:
 
 - ``core`` discovers YAML contracts, resolves graph nodes, applies gates, and
   compares mapped probes.

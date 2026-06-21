@@ -21,6 +21,7 @@ from tests.seed_omni.parity_suite.core import (
     tolerance_from_policy,
     v2_probe_values,
 )
+from tests.seed_omni.parity_suite.core.config.spec import repository_root
 from tests.seed_omni.parity_suite.driver import ParityDriver
 from tests.seed_omni.parity_suite.reference.capture.spec import build_reference_capture_plan
 from tests.seed_omni.parity_suite.v2.tier_runners.framework import (
@@ -130,11 +131,22 @@ def _reference_grad_context(case: ParityCase) -> Iterator[None]:
 
 
 def _load_driver(case: ParityCase) -> ParityDriver:
-    module = importlib.import_module(f"tests.seed_omni.{case.model.name}.driver")
+    module = importlib.import_module(_driver_module_name(case))
     driver = module.create_driver(case)
     if not isinstance(driver, ParityDriver):
         raise TypeError(f"{module.__name__}.create_driver must return a ParityDriver, got {type(driver).__name__}.")
     return driver
+
+
+def _driver_module_name(case: ParityCase) -> str:
+    driver_path = (case.model.root / "driver.py").resolve()
+    if not driver_path.exists():
+        raise FileNotFoundError(f"Parity model {case.model.name!r} has no driver.py under {case.model.root}.")
+    try:
+        relative = driver_path.relative_to(repository_root().resolve())
+    except ValueError as exc:
+        raise ValueError(f"Parity driver must live under the repository root: {driver_path}") from exc
+    return ".".join(relative.with_suffix("").parts)
 
 
 def _run_v2(

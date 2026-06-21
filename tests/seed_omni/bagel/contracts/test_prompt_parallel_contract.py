@@ -21,7 +21,7 @@ from veomni.models.seed_omni.modules.bagel.text_encoder.processing import (
 )
 
 
-_BAGEL_CONFIG_DIR = Path(__file__).resolve().parents[3] / "configs/seed_omni/Bagel/bagel_7b_mot"
+_BAGEL_CONFIG_DIR = Path(__file__).resolve().parents[4] / "configs/seed_omni/Bagel/bagel_7b_mot"
 _HIDDEN_SIZE = 4
 _Z_CHANNELS = 2
 

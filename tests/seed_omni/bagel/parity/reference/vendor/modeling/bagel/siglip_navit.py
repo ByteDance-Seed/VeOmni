@@ -15,10 +15,10 @@ import torch
 from torch import nn
 
 from transformers.activations import ACT2FN
-from tests.seed_omni.bagel.reference.vendor.modeling.siglip.configuration_siglip import (
+from tests.seed_omni.bagel.parity.reference.vendor.modeling.siglip.configuration_siglip import (
     SiglipVisionConfig as _SiglipVisionConfig,
 )
-from tests.seed_omni.bagel.reference.vendor.modeling.siglip.modeling_siglip import (
+from tests.seed_omni.bagel.parity.reference.vendor.modeling.siglip.modeling_siglip import (
     SiglipAttention,
     SiglipPreTrainedModel,
 )

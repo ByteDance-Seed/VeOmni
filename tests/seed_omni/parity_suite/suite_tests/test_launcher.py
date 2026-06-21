@@ -49,8 +49,9 @@ def test_build_case_env_sets_parity_gate_and_cuda_visibility() -> None:
 
 
 def test_build_pytest_command_targets_single_parametrized_case() -> None:
-    command = build_pytest_command("bagel.image_gen.graph.base_one_step")
-
-    assert command[-1].endswith(
-        "test_parity_cases.py::test_seed_omni_v2_parity_case[bagel.image_gen.graph.base_one_step]"
+    command = build_pytest_command(
+        "bagel.image_gen.graph.base_one_step",
+        test_entrypoint="tests/seed_omni/bagel/parity/test_parity_cases.py::test_bagel_parity_case",
     )
+
+    assert command[-1].endswith("test_parity_cases.py::test_bagel_parity_case[bagel.image_gen.graph.base_one_step]")

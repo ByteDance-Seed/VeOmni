@@ -85,7 +85,7 @@ class BagelHfModelReference(HfModelSubject):
 
     @classmethod
     def create_hf_module_subject(cls, request: Any):
-        from tests.seed_omni.bagel.reference.hf_module import BagelModuleSubject
+        from tests.seed_omni.bagel.parity.reference.hf_module import BagelModuleSubject
 
         return BagelModuleSubject.load_reference_subject(model_subject_cls=cls, request=request)
 

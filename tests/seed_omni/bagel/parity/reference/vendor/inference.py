@@ -9,8 +9,8 @@ from typing import List, Dict, Optional, Union, Any
 from PIL import Image
 import torch
 
-from tests.seed_omni.bagel.reference.vendor.data.data_utils import pil_img2rgb
-from tests.seed_omni.bagel.reference.vendor.modeling.bagel.qwen2_navit import NaiveCache
+from tests.seed_omni.bagel.parity.reference.vendor.data.data_utils import pil_img2rgb
+from tests.seed_omni.bagel.parity.reference.vendor.modeling.bagel.qwen2_navit import NaiveCache
 
 
 VLM_THINK_SYSTEM_PROMPT = """You should first think about the reasoning process in the mind and then provide the user with the answer.

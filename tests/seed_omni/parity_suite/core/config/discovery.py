@@ -18,7 +18,6 @@ from .spec import (
     V2ModelTargetSpec,
     load_model_spec,
     load_yaml_file,
-    repository_root,
     select_v2_model_target,
 )
 
@@ -89,25 +88,12 @@ class ParityCase:
 # Public discovery entrypoints -------------------------------------------------
 
 
-def default_model_dirs() -> tuple[Path, ...]:
-    seed_omni_tests = repository_root() / "tests" / "seed_omni"
-    required_files = ("base.yaml", "probes.yaml")
-    return tuple(
-        path
-        for path in sorted(seed_omni_tests.iterdir())
-        if path.is_dir()
-        and all((path / file_name).exists() for file_name in required_files)
-        and ((path / "recipes.yaml").exists() or (path / "recipes").is_dir())
-        and _model_dir_discoverable(path)
-    )
-
-
-def discover_cases(model_dirs: Iterable[str | Path] | None = None) -> tuple[ParityCase, ...]:
+def discover_cases(model_dirs: Iterable[str | Path]) -> tuple[ParityCase, ...]:
     """Discover all configured parity cases without executing reference or V2 models."""
 
     cases: list[ParityCase] = []
     seen: set[tuple[str, str, str, str]] = set()
-    for model_dir in model_dirs or default_model_dirs():
+    for model_dir in model_dirs:
         model = load_model_spec(model_dir)
         if not model.discover:
             continue
@@ -258,11 +244,3 @@ def _discover_v2_graphs(config_dir: Path) -> tuple[GraphSpec, ...]:
     for path in sorted(config_dir.glob("graph_infer_*.yaml")):
         graphs.append(GraphSpec(name=path.stem.removeprefix("graph_"), path=path, domain="inference"))
     return tuple(graphs)
-
-
-def _model_dir_discoverable(path: Path) -> bool:
-    data = load_yaml_file(path / "base.yaml")
-    gate = data.get("gate") or {}
-    if isinstance(gate, dict) and "discover" in gate:
-        return bool(gate["discover"])
-    return bool(data.get("discover", True))

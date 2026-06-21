@@ -1,12 +1,12 @@
 # SeedOmni V2 Parity Suite
 
-`parity_suite` is the shared pytest harness for checking SeedOmni V2 behavior against an independent reference implementation. Model-specific tests provide YAML contracts and a small `ParityDriver`. This package discovers those contracts, captures reference probes, runs the selected V2 graph/module/framework tier, and compares the observed values.
+`parity_suite` is the shared pytest harness for checking SeedOmni V2 behavior against an independent reference implementation. Model-specific tests own their pytest entrypoints, YAML contracts, and small `ParityDriver` implementations. This package provides reusable discovery, reference capture, V2 tier runners, launcher integration, and comparison helpers; it is not itself a model parity entrypoint.
 
 ## Directory Layout
 
 ```text
 tests/seed_omni/parity_suite/
-├── test_parity_cases.py      Pytest collection entrypoint for discovered cases
+├── pytest_entrypoint.py      Factory for model-owned pytest parity entrypoints
 ├── runner.py                 End-to-end execution for one parity case
 ├── driver/                   Base class package for model-specific parity drivers
 │   ├── base.py               ParityDriver composition and dtype/determinism
@@ -36,11 +36,14 @@ Model-owned parity inputs live beside the model tests, not under this package. F
 
 ```text
 tests/seed_omni/bagel/
-├── base.yaml                 Reference and V2 model paths, enabled tiers, tolerances, launcher config
-├── probes.yaml              Public probe names mapped to V2 node/field and reference observations
-├── recipes/*.yaml            Stimuli, tier runs, selected probes, run options, gates, V2 load overrides
-├── reference/data/           BAGEL reference input, generation-option, and train-batch adapters
-└── driver.py                 BAGEL-specific reference and V2 adaptation
+├── contracts/                BAGEL-local contract and helper tests
+└── parity/
+    ├── test_parity_cases.py  BAGEL-owned pytest entrypoint
+    ├── base.yaml             Reference and V2 model paths, enabled tiers, tolerances, launcher config
+    ├── probes.yaml           Public probe names mapped to V2 node/field and reference observations
+    ├── recipes/*.yaml        Stimuli, tier runs, selected probes, run options, gates, V2 load overrides
+    ├── reference/data/       BAGEL reference input, generation-option, and train-batch adapters
+    └── driver.py             BAGEL-specific reference and V2 adaptation
 ```
 
 ## Data Contract Boundaries
@@ -86,22 +89,33 @@ Framework tier is the trainer and distributed-training tier. It validates `OmniT
 
 Bare model-internal packer checks and train-only module loss checks should live in model-specific unit tests, graph-tier cases, or framework-tier cases outside module-tier reference flow.
 
-## Running Cases
+## Running Suite Tests
 
-Run from the Open-VeOmni repository root:
+`parity_suite` does not own model parity entrypoints. Its own pytest surface is the harness unit test
+suite:
+
+```bash
+source .venv/bin/activate
+python -m pytest -q tests/seed_omni/parity_suite
+```
+
+## Running Model Cases
+
+Run model parity through the model-owned entrypoint. For example, BAGEL runs from the Open-VeOmni
+repository root with:
 
 ```bash
 source .venv/bin/activate
 export VEOMNI_V2_TEST_ENABLE_PARITY_CHECK=1
 
-python -m pytest -q tests/seed_omni/parity_suite/test_parity_cases.py
+python -m pytest -q tests/seed_omni/bagel/parity/test_parity_cases.py
 ```
 
 To run one discovered case, pass the parametrized pytest id:
 
 ```bash
 python -m pytest -q \
-  'tests/seed_omni/parity_suite/test_parity_cases.py::test_seed_omni_v2_parity_case[bagel.text_und.graph.one_step]'
+  'tests/seed_omni/bagel/parity/test_parity_cases.py::test_bagel_parity_case[bagel.text_und.graph.one_step]'
 ```
 
 The default gate skips full parity execution unless `VEOMNI_V2_TEST_ENABLE_PARITY_CHECK=1` is set. Case gates can also require CUDA, a minimum CUDA device count (`gate.min_cuda_devices`, used by multi-rank FSDP2/HSDP cases), a reference checkpoint, or a V2 model path.
@@ -118,15 +132,25 @@ Directly selecting a single parametrized case bypasses the grouped launcher so t
 
 ## Adding Or Updating A Case
 
-1. Add or update the model test contract under `tests/seed_omni/<model>/`.
+1. Add or update the model test contract under `tests/seed_omni/<model>/parity/`.
+   The model parity package should define its own pytest entrypoint with the shared factory:
+
+   ```python
+   from pathlib import Path
+
+   from tests.seed_omni.parity_suite.pytest_entrypoint import make_parity_test
+
+
+   test_<model>_parity_case = make_parity_test(Path(__file__).parent)
+   ```
+
 2. Configure `base.yaml` with reference oracle backends, V2 model targets, enabled graph names, enabled tiers, tolerances, gates, and launcher settings.
-   Set `gate.discover: false` in a legacy or archive `base.yaml` when the directory should not be collected by parity discovery.
    Reference backends and V2 configs are target registries. Recipe variants select one target with `reference.oracle`; the suite uses the same target key to pick the V2 config:
 
    ```yaml
    reference:
      hf_model:
-       module: tests.seed_omni.foo.reference.hf_model:FooReferenceSubject
+       module: tests.seed_omni.foo.parity.reference.hf_model:FooReferenceSubject
        checkpoint: /path/to/foo/reference
      hf_module:
        - text_encoder
@@ -137,7 +161,7 @@ Directly selecting a single parametrized case bypasses the grouped launcher so t
        config_dir: configs/seed_omni/Foo/full_model
      hf_module:
        text_encoder:
-         config_dir: tests/seed_omni/foo/configs/text_encoder
+         config_dir: tests/seed_omni/foo/parity/configs/text_encoder
    ```
 
    `reference.hf_module` entries are named facades backed by `reference.hf_model`; they do not declare separate checkpoints. Use them when a recipe should compare a module-boundary view while still executing the official reference path.
@@ -234,7 +258,7 @@ Useful checks while editing the harness:
 
 ```bash
 python -m pytest -q tests/seed_omni/parity_suite/suite_tests
-python -m pytest -q tests/seed_omni/parity_suite/test_parity_cases.py --collect-only
+python -m pytest -q tests/seed_omni/<model>/parity/test_parity_cases.py --collect-only
 ```
 
 ## Execution Model

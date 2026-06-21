@@ -19,7 +19,7 @@ class BagelParityDriver(ParityDriver):
         # Official BAGEL and V2 BAGEL each bind sdpa_kernel in their own module.
         # The deterministic-SDPA runtime option patches both globals with the
         # same semantic policy during reference and V2 phases.
-        import tests.seed_omni.bagel.reference.vendor.modeling.bagel.qwen2_navit as ref_qwen2_navit
+        import tests.seed_omni.bagel.parity.reference.vendor.modeling.bagel.qwen2_navit as ref_qwen2_navit
         import veomni.models.seed_omni.modules.bagel.qwen2_mot.modeling as v2_qwen2_mot
 
         return (ref_qwen2_navit, v2_qwen2_mot)
