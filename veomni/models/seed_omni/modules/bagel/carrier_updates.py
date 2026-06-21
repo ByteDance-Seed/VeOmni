@@ -110,6 +110,10 @@ def materialize_carrier_updates(
             sample_index = sample_locations.get(id(update.sample))
             if sample_index is None:
                 raise RuntimeError("BAGEL carrier append sample is not present in the materialization snapshot.")
+            if _structural_update_already_materialized(
+                samples[sample_index], len(samples[sample_index]), update.new_item
+            ):
+                continue
             structural_updates.append((sample_index, len(samples[sample_index]), order, update.new_item))
             continue
 
@@ -120,6 +124,8 @@ def materialize_carrier_updates(
             raise RuntimeError("BAGEL carrier update anchor is not present in the materialization snapshot.")
         sample_index, item_index = location
         insert_index = item_index if update.op == "insert_before" else item_index + 1
+        if _structural_update_already_materialized(samples[sample_index], insert_index, update.new_item):
+            continue
         structural_updates.append((sample_index, insert_index, order, update.new_item))
 
     for sample_index, insert_index, _, new_item in sorted(
@@ -128,6 +134,15 @@ def materialize_carrier_updates(
         reverse=True,
     ):
         samples[sample_index].insert(insert_index, new_item)
+
+
+def _structural_update_already_materialized(
+    sample: list[ConversationItem],
+    insert_index: int,
+    new_item: ConversationItem,
+) -> bool:
+    del insert_index
+    return any(existing is new_item for existing in sample)
 
 
 def _validate_update_conflicts(updates: list[_CarrierUpdate]) -> None:
