@@ -22,7 +22,7 @@ import torch.distributed as dist
 import yaml
 from torch import nn
 
-from tests.seed_omni.parity_suite.core import ParityReport, autocast_for_dtype
+from tests.seed_omni.parity_suite.core import ParityReport, RunWorkerOptions, autocast_for_dtype, run_worker_context
 from tests.seed_omni.parity_suite.v2.tier_runners.framework_support import (
     all_grads_are_cleared,
     build_minimal_omni_trainer,
@@ -58,6 +58,24 @@ def _subprocess_env_without_distributed_launch() -> dict[str, str]:
     for key in _DISTRIBUTED_LAUNCH_ENV_VARS:
         env.pop(key, None)
     return env
+
+
+def _worker_subprocess_env(
+    driver: Any,
+    extra_env: Mapping[str, str] | None = None,
+    *,
+    inherit_distributed_launch: bool = True,
+    worker_options: RunWorkerOptions | None = None,
+) -> dict[str, str]:
+    base_env = dict(os.environ) if inherit_distributed_launch else _subprocess_env_without_distributed_launch()
+    if worker_options is None:
+        with run_worker_context(driver.case.run.options) as resolved_options:
+            worker_options = resolved_options
+    return {
+        **base_env,
+        **worker_options.env(),
+        **dict(extra_env or {}),
+    }
 
 
 def _terminate_process_group(process: subprocess.Popen[str]) -> None:
@@ -194,11 +212,14 @@ def run_v2_infer_eager(
             worker_path=worker_path,
         ),
     ]
-    env = {
-        **_subprocess_env_without_distributed_launch(),
-        "VEOMNI_PARITY_INFER_FSDP2_PAYLOAD": str(payload_path),
-        "VEOMNI_PARITY_INFER_FSDP2_OUTPUT_DIR": str(output_dir),
-    }
+    env = _worker_subprocess_env(
+        driver,
+        {
+            "VEOMNI_PARITY_INFER_FSDP2_PAYLOAD": str(payload_path),
+            "VEOMNI_PARITY_INFER_FSDP2_OUTPUT_DIR": str(output_dir),
+        },
+        inherit_distributed_launch=False,
+    )
     return _run_infer_worker_subprocess(cmd, env=env, output_dir=output_dir, timeout=timeout)
 
 
@@ -250,11 +271,13 @@ def run_v2_infer_fsdp2(
             worker_path=worker_path,
         ),
     ]
-    env = {
-        **os.environ,
-        "VEOMNI_PARITY_INFER_FSDP2_PAYLOAD": str(payload_path),
-        "VEOMNI_PARITY_INFER_FSDP2_OUTPUT_DIR": str(output_dir),
-    }
+    env = _worker_subprocess_env(
+        driver,
+        {
+            "VEOMNI_PARITY_INFER_FSDP2_PAYLOAD": str(payload_path),
+            "VEOMNI_PARITY_INFER_FSDP2_OUTPUT_DIR": str(output_dir),
+        },
+    )
     return _run_infer_worker_subprocess(cmd, env=env, output_dir=output_dir, timeout=timeout)
 
 
@@ -279,19 +302,20 @@ def run_data_loss_smoke_policy(
         shutil.rmtree(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    report = _run_v2_train_data_loss_smoke(
-        driver,
-        config_path=Path(str(options.get("config_path", driver.case.v2_model.config_dir / "base.yaml"))),
-        output_dir=output_dir,
-        nproc_per_node=nproc,
-        steps=steps,
-        timeout=int(options.get("timeout", 7200)),
-        gradient_checkpointing=bool(options.get("gradient_checkpointing", True)),
-        loss_window=loss_window,
-        expect_loss_decrease=bool(options.get("expect_loss_decrease", True)),
-        debug_log=bool(options.get("debug_log", False)),
-        data_source_names=tuple(str(name) for name in options.get("data_source_names", ()) or ()),
-    )
+    with run_worker_context(options) as worker_options:
+        report = _run_v2_train_data_loss_smoke(
+            driver,
+            config_path=Path(str(options.get("config_path", driver.case.v2_model.config_dir / "base.yaml"))),
+            output_dir=output_dir,
+            nproc_per_node=nproc,
+            steps=steps,
+            timeout=int(options.get("timeout", 7200)),
+            gradient_checkpointing=bool(options.get("gradient_checkpointing", True)),
+            loss_window=loss_window,
+            expect_loss_decrease=bool(options.get("expect_loss_decrease", True)),
+            worker_options=worker_options,
+            data_source_names=tuple(str(name) for name in options.get("data_source_names", ()) or ()),
+        )
     _write_data_loss_manifest(driver, report=report, output_dir=output_dir)
     reports = [
         framework_report(driver, "framework.data_loss_exit_code", report["exit_code"], 0, "exact"),
@@ -747,11 +771,13 @@ def run_v2_train_fsdp2(
         cmd.extend(["--accelerator.dp_replicate_size", str(dp_replicate_size)])
     if dp_shard_size is not None:
         cmd.extend(["--accelerator.dp_shard_size", str(dp_shard_size)])
-    env = {
-        **os.environ,
-        "VEOMNI_PARITY_FSDP2_PAYLOAD": str(payload_path),
-        "VEOMNI_PARITY_FSDP2_OUTPUT_DIR": str(output_dir),
-    }
+    env = _worker_subprocess_env(
+        driver,
+        {
+            "VEOMNI_PARITY_FSDP2_PAYLOAD": str(payload_path),
+            "VEOMNI_PARITY_FSDP2_OUTPUT_DIR": str(output_dir),
+        },
+    )
     log_path = output_dir / "run.log"
     with log_path.open("w", encoding="utf-8") as log_file:
         log_file.write("command: " + " ".join(cmd) + "\n")
@@ -804,7 +830,7 @@ def _run_v2_train_data_loss_smoke(
     gradient_checkpointing: bool,
     loss_window: int,
     expect_loss_decrease: bool,
-    debug_log: bool,
+    worker_options: RunWorkerOptions,
     data_source_names: tuple[str, ...],
 ) -> Mapping[str, Any]:
     """Run the data/loss worker and load its rank-0 ``results.json`` report."""
@@ -855,13 +881,15 @@ def _run_v2_train_data_loss_smoke(
     for key in ("data_type", "datasets_type", "multisource_datasets_type", "max_seq_len", "train_sample"):
         if key in data_config:
             cmd.extend([f"--data.{key}", str(data_config[key])])
-    env = {
-        **os.environ,
-        "VEOMNI_PARITY_DATA_LOSS_OUTPUT_DIR": str(output_dir),
-        "VEOMNI_PARITY_DATA_LOSS_WINDOW": str(loss_window),
-        "VEOMNI_PARITY_DATA_LOSS_EXPECT_DECREASE": str(expect_loss_decrease).lower(),
-        "VEOMNI_PARITY_DATA_LOSS_DEBUG": str(debug_log).lower(),
-    }
+    env = _worker_subprocess_env(
+        driver,
+        {
+            "VEOMNI_PARITY_DATA_LOSS_OUTPUT_DIR": str(output_dir),
+            "VEOMNI_PARITY_DATA_LOSS_WINDOW": str(loss_window),
+            "VEOMNI_PARITY_DATA_LOSS_EXPECT_DECREASE": str(expect_loss_decrease).lower(),
+        },
+        worker_options=worker_options,
+    )
     log_path = output_dir / "run.log"
     output_dir.mkdir(parents=True, exist_ok=True)
     with log_path.open("w", encoding="utf-8") as log_file:
@@ -919,7 +947,7 @@ def _run_v2_train_data_loss_smoke(
     report["exit_code"] = returncode
     report["timed_out"] = timed_out
     report["data_sources"] = _data_source_names(data_config)
-    report["debug_log"] = debug_log
+    report["debug_log"] = worker_options.debug_log
     report["log_path"] = str(log_path)
     report["stdout_tail"] = stdout[-4000:]
     report["stderr_tail"] = ""
@@ -985,7 +1013,7 @@ def _run_v2_train_script_data_smoke(
         log_file.flush()
         process = subprocess.Popen(
             cmd,
-            env=dict(os.environ),
+            env=_worker_subprocess_env(driver),
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,

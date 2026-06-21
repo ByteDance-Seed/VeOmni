@@ -67,7 +67,8 @@ def _write_report(output_dir: Path, report: dict[str, Any]) -> None:
 
 
 def _debug_enabled() -> bool:
-    return os.environ.get("VEOMNI_PARITY_DATA_LOSS_DEBUG", "false").lower() == "true"
+    raw = os.environ.get("VEOMNI_PARITY_WORKER_DEBUG_LOG", os.environ.get("VEOMNI_PARITY_DATA_LOSS_DEBUG", "false"))
+    return raw.lower() == "true"
 
 
 def _conversation_summary(batch: Mapping[str, Any] | None) -> str:

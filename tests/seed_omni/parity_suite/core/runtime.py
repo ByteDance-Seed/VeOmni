@@ -35,6 +35,16 @@ class RunCaptureOptions:
     max_tensor_numel: int = 1_000_000
 
 
+@dataclass(frozen=True)
+class RunWorkerOptions:
+    debug_log: bool = False
+
+    def env(self) -> dict[str, str]:
+        return {
+            "VEOMNI_PARITY_WORKER_DEBUG_LOG": str(self.debug_log).lower(),
+        }
+
+
 @contextmanager
 def run_runtime_context(
     run_options: Mapping[str, Any] | None,
@@ -58,6 +68,13 @@ def run_capture_context(run_options: Mapping[str, Any] | None) -> Iterator[RunCa
     yield _capture_options(run_options)
 
 
+@contextmanager
+def run_worker_context(run_options: Mapping[str, Any] | None) -> Iterator[RunWorkerOptions]:
+    """Resolve subprocess-worker settings for one parity run."""
+
+    yield _worker_options(run_options)
+
+
 def _runtime_options(run_options: Mapping[str, Any] | None) -> dict[str, Any]:
     raw = run_options or {}
     if not isinstance(raw, Mapping):
@@ -72,6 +89,13 @@ def _capture_options(run_options: Mapping[str, Any] | None) -> RunCaptureOptions
     if not isinstance(raw, Mapping):
         raise TypeError("run.options must be a mapping.")
     return RunCaptureOptions(max_tensor_numel=int(raw.get("max_tensor_numel", 1_000_000)))
+
+
+def _worker_options(run_options: Mapping[str, Any] | None) -> RunWorkerOptions:
+    raw = run_options or {}
+    if not isinstance(raw, Mapping):
+        raise TypeError("run.options must be a mapping.")
+    return RunWorkerOptions(debug_log=bool(raw.get("debug_log", False)))
 
 
 @contextmanager
@@ -224,12 +248,14 @@ def patched_randn_like(fixed_noise: torch.Tensor) -> Iterator[None]:
 
 __all__ = [
     "RunCaptureOptions",
+    "RunWorkerOptions",
     "autocast_for_dtype",
     "configure_torch_determinism",
     "patched_randn_like",
     "resolve_torch_dtype",
     "run_capture_context",
     "run_runtime_context",
+    "run_worker_context",
     "sample_grad",
     "sample_named_grad",
     "sample_named_param",

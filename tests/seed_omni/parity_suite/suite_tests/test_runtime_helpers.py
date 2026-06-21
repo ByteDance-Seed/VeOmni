@@ -9,6 +9,7 @@ from torch import nn
 from tests.seed_omni.parity_suite.core.runtime import (
     resolve_torch_dtype,
     run_capture_context,
+    run_worker_context,
     sample_grad,
     sample_named_param,
     sample_tensor,
@@ -44,6 +45,18 @@ def test_run_capture_context_defaults_capture_budget() -> None:
 def test_run_capture_context_reads_capture_budget_from_run_options() -> None:
     with run_capture_context({"max_tensor_numel": 12}) as options:
         assert options.max_tensor_numel == 12
+
+
+def test_run_worker_context_defaults_debug_log_off() -> None:
+    with run_worker_context({}) as options:
+        assert options.debug_log is False
+        assert options.env()["VEOMNI_PARITY_WORKER_DEBUG_LOG"] == "false"
+
+
+def test_run_worker_context_reads_debug_log_from_run_options() -> None:
+    with run_worker_context({"debug_log": True}) as options:
+        assert options.debug_log is True
+        assert options.env()["VEOMNI_PARITY_WORKER_DEBUG_LOG"] == "true"
 
 
 def test_sample_tensor_slices_without_rows() -> None:
