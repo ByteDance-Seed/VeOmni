@@ -225,6 +225,7 @@ def prepare_embed_latent_inputs(
         )
         timestep_values = timestep.reshape(-1, 1).to(device=clean.device, dtype=torch.float32)
         noised = (1.0 - timestep_values) * clean + timestep_values * noise
+        noised = noised.to(dtype=dtype)
         materialize_carrier_updates(
             None,
             [
