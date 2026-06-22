@@ -20,8 +20,20 @@ Common options:
   --max-new-tokens N          Greedy decode tokens to compare. Default: 8.
   --atol VALUE                Forward absolute tolerance. Default: 5e-4 for NPU candidate, else 2e-4.
   --rtol VALUE                Forward relative tolerance. Default: 5e-4 for NPU candidate, else 2e-4.
+  --preflight-json PATH       Preflight artifact path.
   --output-json PATH          Forward artifact path.
   --audit-json PATH           Strict audit artifact path.
+  --require-free-disk-gb N    Require N GiB free on checkpoint/output filesystems. Default: 0.
+  --require-free-hbm-mb N     Require at least N free HBM MB on one NPU. Default: 0.
+  --npu-smi-cmd CMD           Command that prints npu-smi info for preflight evidence.
+                              Default: auto-detect npu-smi info.
+  --python-cmd CMD            Python executable. Default: python3.
+  --expected-shards N         Preflight shard-count gate. Default: 59.
+  --expected-min-weight-map-keys N
+                              Preflight weight-map key-count gate. Default: 20000.
+  --expected-min-payload-bytes N
+                              Preflight payload byte gate. Default: 800000000000.
+  --preflight-only            Run preflight only and exit.
   --dry-run                   Print commands without executing them.
 
 Example:
@@ -49,6 +61,15 @@ ATOL=""
 RTOL=""
 OUTPUT_JSON=""
 AUDIT_JSON=""
+PREFLIGHT_JSON=""
+REQUIRE_FREE_DISK_GB="0"
+REQUIRE_FREE_HBM_MB="0"
+NPU_SMI_CMD="${MINIMAX_NPU_SMI_CMD:-}"
+PYTHON_CMD="python3"
+EXPECTED_SHARDS="59"
+EXPECTED_MIN_WEIGHT_MAP_KEYS="20000"
+EXPECTED_MIN_PAYLOAD_BYTES="800000000000"
+PREFLIGHT_ONLY=0
 DRY_RUN=0
 
 while [[ $# -gt 0 ]]; do
@@ -109,6 +130,42 @@ while [[ $# -gt 0 ]]; do
       AUDIT_JSON="$2"
       shift 2
       ;;
+    --preflight-json)
+      PREFLIGHT_JSON="$2"
+      shift 2
+      ;;
+    --require-free-disk-gb)
+      REQUIRE_FREE_DISK_GB="$2"
+      shift 2
+      ;;
+    --require-free-hbm-mb)
+      REQUIRE_FREE_HBM_MB="$2"
+      shift 2
+      ;;
+    --npu-smi-cmd)
+      NPU_SMI_CMD="$2"
+      shift 2
+      ;;
+    --python-cmd)
+      PYTHON_CMD="$2"
+      shift 2
+      ;;
+    --expected-shards)
+      EXPECTED_SHARDS="$2"
+      shift 2
+      ;;
+    --expected-min-weight-map-keys)
+      EXPECTED_MIN_WEIGHT_MAP_KEYS="$2"
+      shift 2
+      ;;
+    --expected-min-payload-bytes)
+      EXPECTED_MIN_PAYLOAD_BYTES="$2"
+      shift 2
+      ;;
+    --preflight-only)
+      PREFLIGHT_ONLY=1
+      shift
+      ;;
     --dry-run)
       DRY_RUN=1
       shift
@@ -131,7 +188,7 @@ if [[ -z "$CHECKPOINT_DIR" ]]; then
   exit 2
 fi
 
-if [[ ! -d "$CHECKPOINT_DIR" ]]; then
+if [[ ! -d "$CHECKPOINT_DIR" && "$DRY_RUN" -ne 1 ]]; then
   echo "checkpoint dir does not exist: $CHECKPOINT_DIR" >&2
   exit 2
 fi
@@ -154,6 +211,9 @@ if [[ -z "$OUTPUT_JSON" ]]; then
   CAND_TAG="$(sanitize_device "$CANDIDATE_DEVICE")"
   OUTPUT_JSON="docs/usage/support_new_models/artifacts/minimax_m3_vl_precision_parity/real_checkpoint_forward_${REF_TAG}_${CAND_TAG}.json"
 fi
+if [[ -z "$PREFLIGHT_JSON" ]]; then
+  PREFLIGHT_JSON="${OUTPUT_JSON%.json}_preflight.json"
+fi
 AUDIT_JSON="${AUDIT_JSON:-docs/usage/support_new_models/artifacts/minimax_m3_vl_precision_parity/parity_artifact_audit_full.json}"
 
 if [[ "$REFERENCE_DEVICE" == "npu" || "$CANDIDATE_DEVICE" == "npu" ]]; then
@@ -169,8 +229,25 @@ fi
 export MODELING_BACKEND="${MODELING_BACKEND:-veomni}"
 export PYTHONPATH="$REPO_ROOT:${PYTHONPATH:-}"
 
+preflight_cmd=(
+  "$PYTHON_CMD" scripts/multimodal/preflight_minimax_m3_vl_full_checkpoint_parity.py
+  --checkpoint-dir "$CHECKPOINT_DIR"
+  --config-path "$CONFIG_PATH"
+  --reference-device "$REFERENCE_DEVICE"
+  --candidate-device "$CANDIDATE_DEVICE"
+  --output-json "$PREFLIGHT_JSON"
+  --require-free-disk-gb "$REQUIRE_FREE_DISK_GB"
+  --require-free-hbm-mb "$REQUIRE_FREE_HBM_MB"
+  --expected-shards "$EXPECTED_SHARDS"
+  --expected-min-weight-map-keys "$EXPECTED_MIN_WEIGHT_MAP_KEYS"
+  --expected-min-payload-bytes "$EXPECTED_MIN_PAYLOAD_BYTES"
+)
+if [[ -n "$NPU_SMI_CMD" ]]; then
+  preflight_cmd+=(--npu-smi-cmd "$NPU_SMI_CMD")
+fi
+
 forward_cmd=(
-  python scripts/multimodal/verify_minimax_m3_vl_checkpoint_payload_parity.py
+  "$PYTHON_CMD" scripts/multimodal/verify_minimax_m3_vl_checkpoint_payload_parity.py
   --checkpoint-dir "$CHECKPOINT_DIR"
   --config-path "$CONFIG_PATH"
   --mode forward
@@ -189,7 +266,7 @@ forward_cmd=(
 )
 
 audit_cmd=(
-  python scripts/multimodal/audit_minimax_m3_vl_parity_artifacts.py
+  "$PYTHON_CMD" scripts/multimodal/audit_minimax_m3_vl_parity_artifacts.py
   --require-full-checkpoint-forward
   --full-forward-json "$OUTPUT_JSON"
   --output-json "$AUDIT_JSON"
@@ -203,10 +280,16 @@ print_command() {
   printf '\n'
 }
 
+print_command "Preflight command" "${preflight_cmd[@]}"
 print_command "Forward parity command" "${forward_cmd[@]}"
 print_command "Audit command" "${audit_cmd[@]}"
 
 if [[ "$DRY_RUN" -eq 1 ]]; then
+  exit 0
+fi
+
+"${preflight_cmd[@]}"
+if [[ "$PREFLIGHT_ONLY" -eq 1 ]]; then
   exit 0
 fi
 

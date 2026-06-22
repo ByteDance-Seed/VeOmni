@@ -35,6 +35,7 @@ Upstream PR:
 - `scripts/multimodal/run_minimax_m3_vl_npu_loss_root.sh`
 - `scripts/multimodal/verify_minimax_m3_vl_precision_parity.py`
 - `scripts/multimodal/verify_minimax_m3_vl_checkpoint_payload_parity.py`
+- `scripts/multimodal/preflight_minimax_m3_vl_full_checkpoint_parity.py`
 - `scripts/multimodal/run_minimax_m3_vl_full_checkpoint_parity.sh`
 - `scripts/multimodal/audit_minimax_m3_vl_parity_artifacts.py`
 - `scripts/multimodal/run_minimax_m3_vl_multicard_parity.sh`
@@ -262,6 +263,45 @@ expected failure: the audit rejected the host preflight summary and preserved th
 
 python3 scripts/ci/check_doc_task_paths.py
 All task script paths in docs shell blocks exist.
+```
+
+Additional local checks for the full-checkpoint target-machine preflight gate:
+
+```text
+python3 -m py_compile \
+  scripts/multimodal/preflight_minimax_m3_vl_full_checkpoint_parity.py \
+  scripts/multimodal/audit_minimax_m3_vl_parity_artifacts.py
+
+bash -n scripts/multimodal/run_minimax_m3_vl_full_checkpoint_parity.sh
+
+uv run --no-project --offline --with ruff \
+  ruff check \
+  scripts/multimodal/preflight_minimax_m3_vl_full_checkpoint_parity.py \
+  scripts/multimodal/audit_minimax_m3_vl_parity_artifacts.py
+All checks passed!
+
+scripts/multimodal/run_minimax_m3_vl_full_checkpoint_parity.sh \
+  --checkpoint-dir /tmp/minimax_full_preflight_fake_checkpoint \
+  --config-path /tmp/minimax_full_preflight_fake_checkpoint \
+  --reference-device cpu \
+  --candidate-device cpu \
+  --preflight-json /tmp/minimax_full_preflight_fake_checkpoint/preflight.json \
+  --expected-shards 2 \
+  --expected-min-weight-map-keys 2 \
+  --expected-min-payload-bytes 1 \
+  --preflight-only
+expected failure on this host because the system Python lacks torch/transformers; the preflight artifact still proves local checkpoint index/shard/config detection.
+
+scripts/multimodal/run_minimax_m3_vl_full_checkpoint_parity.sh \
+  --checkpoint-dir /data/checkpoints/MiniMax-M3 \
+  --reference-device cpu \
+  --candidate-device npu \
+  --require-free-disk-gb 50 \
+  --require-free-hbm-mb 4096 \
+  --npu-smi-cmd 'sudo -n /usr/local/sbin/npu-smi info' \
+  --preflight-only \
+  --dry-run
+printed the preflight, forward, and strict audit commands without executing the 869 GB load.
 ```
 
 Additional local checks for the latest patchgen/docstring commit:

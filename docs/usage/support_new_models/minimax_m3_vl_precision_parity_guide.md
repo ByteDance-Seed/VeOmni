@@ -264,6 +264,7 @@ NPU 通过标准：
 脚本：
 
 - `scripts/multimodal/verify_minimax_m3_vl_checkpoint_payload_parity.py`
+- `scripts/multimodal/preflight_minimax_m3_vl_full_checkpoint_parity.py`
 
 已落地的远程抽样 payload 证据：
 
@@ -337,7 +338,37 @@ python scripts/multimodal/verify_minimax_m3_vl_checkpoint_payload_parity.py \
 
 `--mode forward` 会按顺序执行 HF baseline 和 VeOmni candidate：HF 结果写入 CPU baseline 后释放 HF 模型，再读取/转换 checkpoint payload，并以 streaming assign 方式写入 VeOmni model。这样避免同时保留两个模型和完整 converted tensor dict，更适合大 checkpoint 目标机，但完整 869 GB payload 仍需要足够磁盘、CPU 内存和设备内存。
 
-推荐在目标机器使用 launcher，它会先运行完整 forward parity，再用 artifact auditor 的强制模式确认 full checkpoint evidence 真的满足门禁：
+推荐在目标机器使用 launcher。第一步先只跑 preflight，不加载权重，确认本地 checkpoint、Python/NPU runtime 和资源条件足够：
+
+```bash
+cd /path/to/VeOmni
+
+scripts/multimodal/run_minimax_m3_vl_full_checkpoint_parity.sh \
+  --checkpoint-dir /data/checkpoints/MiniMax-M3 \
+  --reference-device cpu \
+  --candidate-device npu \
+  --require-free-disk-gb 50 \
+  --require-free-hbm-mb 4096 \
+  --npu-smi-cmd 'sudo -n /usr/local/sbin/npu-smi info' \
+  --preflight-json docs/usage/support_new_models/artifacts/minimax_m3_vl_precision_parity/real_checkpoint_forward_cpu_npu_preflight.json \
+  --preflight-only
+```
+
+Preflight 通过标准：
+
+- `passed=true`，`issues=[]`；
+- `checkpoint.index_exists=true`；
+- `checkpoint.weight_map_keys>=20000`；
+- `checkpoint.selected_shard_count>=59`；
+- `checkpoint.missing_shards=[]`；
+- `checkpoint.payload_bytes_present>=800000000000`；
+- `config.config_json_exists=true`；
+- `runtime.transformers_version>=5.12.0`；
+- 如果 reference 或 candidate 是 NPU，`runtime.torch_npu_version` 不能为空，`runtime.npu_available=true`，并记录可见 Ascend 设备环境变量；
+- 如果设置 `--require-free-hbm-mb`，`runtime.npu_smi.returncode=0`，且至少一张 NPU 满足 free HBM 门槛；
+- 如果设置 `--require-free-disk-gb`，checkpoint 和 output filesystem 都满足对应 free disk 门槛。
+
+第二步再运行完整 forward parity；launcher 会先重复 preflight，再运行完整 forward parity，最后用 artifact auditor 的强制模式确认 full checkpoint evidence 真的满足门禁：
 
 ```bash
 cd /path/to/VeOmni
@@ -350,11 +381,15 @@ scripts/multimodal/run_minimax_m3_vl_full_checkpoint_parity.sh \
   --prompt-kind multimodal \
   --top-k 8 \
   --max-new-tokens 8 \
+  --require-free-disk-gb 50 \
+  --require-free-hbm-mb 4096 \
+  --npu-smi-cmd 'sudo -n /usr/local/sbin/npu-smi info' \
+  --preflight-json docs/usage/support_new_models/artifacts/minimax_m3_vl_precision_parity/real_checkpoint_forward_cpu_npu_preflight.json \
   --output-json docs/usage/support_new_models/artifacts/minimax_m3_vl_precision_parity/real_checkpoint_forward_cpu_npu.json \
   --audit-json docs/usage/support_new_models/artifacts/minimax_m3_vl_precision_parity/parity_artifact_audit_full.json
 ```
 
-如需在目标机器先确认命令而不加载权重，可加 `--dry-run`。
+如需在目标机器只确认命令而不做 preflight 或加载权重，可加 `--dry-run`。
 
 完整 text-prompt forward 示例：
 
