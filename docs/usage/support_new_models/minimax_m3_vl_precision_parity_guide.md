@@ -21,6 +21,7 @@ MiniMax 官方 GitHub `MiniMax-AI/MiniMax-M3` 当前是发布说明仓，模型�
 - `scripts/multimodal/run_minimax_m3_vl_full_checkpoint_parity.sh`
 - `scripts/multimodal/audit_minimax_m3_vl_parity_artifacts.py`
 - `scripts/multimodal/run_minimax_m3_vl_precision_suite.sh`
+- `scripts/multimodal/audit_minimax_m3_vl_target_artifact_bundle.py`
 
 本地 CPU/NPU 证据：
 

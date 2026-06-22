@@ -144,6 +144,9 @@ NPU 目标机通过预期：
 在跑 854G checkpoint 之前，先确认代码路径和 NPU tolerance 可用：
 
 ```bash
+export OUTPUT_ROOT=docs/usage/support_new_models/artifacts/minimax_m3_vl_target_precision_suite
+mkdir -p "$OUTPUT_ROOT/toy"
+
 python3 scripts/multimodal/verify_minimax_m3_vl_precision_parity.py \
   --reference-device cpu \
   --candidate-device npu \
@@ -151,7 +154,7 @@ python3 scripts/multimodal/verify_minimax_m3_vl_precision_parity.py \
   --atol 5e-4 --rtol 5e-4 \
   --grad-atol 1e-3 --grad-rtol 1e-3 \
   --param-atol 1e-4 --param-rtol 1e-4 \
-  --output-json docs/usage/support_new_models/artifacts/minimax_m3_vl_precision_parity/toy_hf_cpu_veomni_npu_parity_target.json
+  --output-json "$OUTPUT_ROOT/toy/toy_hf_cpu_veomni_npu_parity_target.json"
 ```
 
 继续条件：
@@ -311,9 +314,6 @@ PY
 ```bash
 export OUTPUT_ROOT=docs/usage/support_new_models/artifacts/minimax_m3_vl_target_precision_suite
 
-find "$OUTPUT_ROOT" -type f -print0 | sort -z | xargs -0 sha256sum \
-  > "$OUTPUT_ROOT/artifact_manifest.sha256"
-
 {
   echo "veomni_commit $(git rev-parse HEAD)"
   echo "minimax_revision ${MINIMAX_M3_REVISION:-unset}"
@@ -321,13 +321,30 @@ find "$OUTPUT_ROOT" -type f -print0 | sort -z | xargs -0 sha256sum \
   date -u +"generated_at %Y-%m-%dT%H:%M:%SZ"
 } > "$OUTPUT_ROOT/run_metadata.txt"
 
+tmp_manifest="$(mktemp)"
+find "$OUTPUT_ROOT" -type f ! -name artifact_manifest.sha256 -print0 | sort -z | xargs -0 sha256sum \
+  > "$tmp_manifest"
+mv "$tmp_manifest" "$OUTPUT_ROOT/artifact_manifest.sha256"
+
 tar -czf /tmp/minimax_m3_vl_target_precision_suite_artifacts.tgz \
   "$OUTPUT_ROOT"
+```
+
+回传前可以在目标机自审一次包内容：
+
+```bash
+python3 scripts/multimodal/audit_minimax_m3_vl_target_artifact_bundle.py \
+  --artifact-tar /tmp/minimax_m3_vl_target_precision_suite_artifacts.tgz \
+  --expected-revision "$MINIMAX_M3_REVISION" \
+  --expected-veomni-commit "$(git rev-parse HEAD)" \
+  --require-target-toy \
+  --output-json /tmp/minimax_m3_vl_target_precision_suite_artifacts_audit.json
 ```
 
 回传文件：
 
 - `/tmp/minimax_m3_vl_target_precision_suite_artifacts.tgz`
+- `/tmp/minimax_m3_vl_target_precision_suite_artifacts_audit.json`
 - 如果 full forward 或 multi-card 失败，也回传同一个 tar 包；失败日志本身是定位依据。
 
 ## 9. 失败时停止点
