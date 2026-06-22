@@ -638,6 +638,75 @@ def compare_payload_to_model_metadata(
     }
 
 
+def verify_sampled_state_load(
+    converted_tensors: dict[str, Any],
+    model_metadata: dict[str, dict[str, Any]],
+    *,
+    hash_values: bool,
+    max_report_tensors: int,
+) -> dict[str, Any]:
+    import torch
+
+    missing_model_keys = []
+    shape_mismatches = []
+    dtype_casts: dict[str, int] = defaultdict(int)
+    value_mismatches = []
+    loaded_reports = []
+    loaded_count = 0
+    loaded_bytes = 0
+
+    for name, tensor in sorted(converted_tensors.items()):
+        expected = model_metadata.get(name)
+        if expected is None:
+            missing_model_keys.append(name)
+            continue
+
+        checkpoint_shape = list(tensor.shape)
+        model_shape = expected["shape"]
+        if checkpoint_shape != model_shape:
+            shape_mismatches.append({"name": name, "checkpoint": checkpoint_shape, "model": model_shape})
+            continue
+
+        target_dtype = torch_dtype_from_safetensors(expected["dtype"])
+        loaded = torch.empty(tuple(model_shape), dtype=target_dtype)
+        expected_loaded = tensor.to(dtype=target_dtype)
+        loaded.copy_(expected_loaded)
+        loaded_count += 1
+        loaded_bytes += loaded.numel() * loaded.element_size()
+
+        checkpoint_dtype = safetensors_dtype_from_torch(tensor)
+        loaded_dtype = safetensors_dtype_from_torch(loaded)
+        dtype_casts[f"{checkpoint_dtype}->{loaded_dtype}"] += 1
+        if not torch.equal(loaded, expected_loaded):
+            value_mismatches.append(name)
+
+        if len(loaded_reports) < max_report_tensors:
+            loaded_reports.append(
+                {
+                    "converted_name": name,
+                    "checkpoint_dtype": checkpoint_dtype,
+                    "loaded_dtype": loaded_dtype,
+                    "shape": model_shape,
+                    "loaded_fingerprint": tensor_fingerprint(loaded, hash_values=hash_values),
+                }
+            )
+
+    return {
+        "passed": not missing_model_keys and not shape_mismatches and not value_mismatches,
+        "loaded_tensor_count": loaded_count,
+        "loaded_bytes": loaded_bytes,
+        "dtype_cast_groups": dict(sorted(dtype_casts.items())),
+        "missing_model_key_count": len(missing_model_keys),
+        "missing_model_keys_sample": missing_model_keys[:20],
+        "shape_mismatch_count": len(shape_mismatches),
+        "shape_mismatches_sample": shape_mismatches[:20],
+        "value_mismatch_count": len(value_mismatches),
+        "value_mismatches_sample": value_mismatches[:20],
+        "loaded_reports": loaded_reports,
+        "loaded_report_truncated": loaded_count > max_report_tensors,
+    }
+
+
 def tensor_stats(lhs: Any, rhs: Any, *, atol: float, rtol: float) -> dict[str, Any]:
     import torch
 
@@ -1056,7 +1125,15 @@ def main() -> None:
             metadata_cache_dir=args.metadata_cache_dir,
         )
         metadata_comparison = compare_payload_to_model_metadata(converted_tensors, model_metadata)
+        sampled_state_load_report = verify_sampled_state_load(
+            converted_tensors,
+            model_metadata,
+            hash_values=not args.no_hash,
+            max_report_tensors=args.max_report_tensors,
+        )
         forward_report = None
+    if args.mode == "forward":
+        sampled_state_load_report = None
 
     payload_passed = (
         payload_summary["converted_tensor_keys"] > 0
@@ -1066,6 +1143,7 @@ def main() -> None:
         and not metadata_comparison["shape_mismatch_count"]
         and (args.allow_incomplete_groups or payload_summary["converter_finalize_error"] is None)
         and (not args.fail_on_dtype_mismatch or not metadata_comparison["dtype_mismatch_count"])
+        and (sampled_state_load_report is None or sampled_state_load_report["passed"])
     )
 
     report = {
@@ -1096,6 +1174,7 @@ def main() -> None:
             if key != "tensor_reports"
         },
         "metadata_comparison": metadata_comparison,
+        "sampled_state_load": sampled_state_load_report,
         "tensor_reports": payload_summary["tensor_reports"][: args.max_report_tensors],
         "tensor_report_truncated": payload_summary.get("tensor_report_total", len(payload_summary["tensor_reports"]))
         > args.max_report_tensors,

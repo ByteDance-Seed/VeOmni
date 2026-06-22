@@ -169,7 +169,7 @@ NPU 通过标准：
 - [real_checkpoint_payload_remote_sample.json](./artifacts/minimax_m3_vl_precision_parity/real_checkpoint_payload_remote_sample.json)
 - [toy_checkpoint_forward_parity.json](./artifacts/minimax_m3_vl_precision_parity/toy_checkpoint_forward_parity.json)
 
-该证据没有下载完整 shard，而是通过 HTTP Range 从 Hugging Face `model-00001/00003/00026/00059-of-00059.safetensors` 读取 11 个真实 tensor payload，共 `55808` bytes，经 converter 映射到 VeOmni generated state keys 后检查 shape/dtype/value fingerprint。样本覆盖 language dense/sparse attention norm、MoE router correction bias、vision tower、multi-modal projector 和 patch-merge projector；它证明真实 checkpoint payload 字节和 converter 路径已被执行，但仍不是 full-checkpoint logits parity。
+该证据没有下载完整 shard，而是通过 HTTP Range 从 Hugging Face `model-00001/00003/00026/00059-of-00059.safetensors` 读取 11 个真实 tensor payload，共 `55808` bytes，经 converter 映射到 VeOmni generated state keys 后检查 shape/dtype/value fingerprint。样本覆盖 language dense/sparse attention norm、MoE router correction bias、vision tower、multi-modal projector 和 patch-merge projector；随后按 generated model state metadata 执行 sampled state-load cast/copy 校验，`sampled_state_load.passed=true`、`loaded_tensor_count=11`、`value_mismatch_count=0`。它证明真实 checkpoint payload 字节、converter 路径和目标 runtime state dtype cast/copy 路径已被执行，但仍不是 full-checkpoint logits parity。
 
 `toy_checkpoint_forward_parity.json` 使用完整 toy safetensors checkpoint 验证了 `--mode forward --prompt-kind multimodal` 的执行路径：先加载 HF reference 生成 logits/top-k/greedy 和 image/video hidden-state baseline，释放 HF 模型，再把 public checkpoint tensors 边读、边转换、边写入 VeOmni generated model。该 smoke 中 `streaming_model_load=true`，strict missing/unexpected key count 都为 `0`，`forward.logits`、`forward.image_hidden_states`、`forward.video_hidden_states` max diff 都为 `0.0`，top-k 和 greedy ids 完全一致；它只证明 runner 逻辑，不替代真实 869 GB checkpoint parity。
 
@@ -220,6 +220,7 @@ python scripts/multimodal/verify_minimax_m3_vl_checkpoint_payload_parity.py \
 - `payload.converter_finalize_error=null`；
 - `metadata_comparison.shape_mismatch_count=0`；
 - `metadata_comparison.missing_model_key_count=0`；
+- `sampled_state_load.passed=true`，且 `sampled_state_load.value_mismatch_count=0`；
 - dtype mismatch 仅允许为已解释的 checkpoint-to-runtime cast，例如 router/gate `F32 -> BF16`。
 
 2. **全量 payload load parity**
