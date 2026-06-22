@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
 import os
 import re
@@ -14,6 +15,7 @@ from typing import Any
 
 
 DEFAULT_MIN_PAYLOAD_BYTES = 800_000_000_000
+DEFAULT_OFFICIAL_REFERENCE_MODEL_ID = "MiniMaxAI/MiniMax-M3"
 
 
 def parse_args() -> argparse.Namespace:
@@ -29,6 +31,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--expected-shards", type=int, default=59)
     parser.add_argument("--expected-min-weight-map-keys", type=int, default=20_000)
     parser.add_argument("--expected-min-payload-bytes", type=int, default=DEFAULT_MIN_PAYLOAD_BYTES)
+    parser.add_argument("--official-reference-model-id", default=DEFAULT_OFFICIAL_REFERENCE_MODEL_ID)
+    parser.add_argument(
+        "--official-reference-revision",
+        default=os.environ.get("MINIMAX_M3_REFERENCE_REVISION", ""),
+        help="Optional pinned MiniMaxAI/MiniMax-M3 HF commit revision to record in the preflight artifact.",
+    )
     return parser.parse_args()
 
 
@@ -226,6 +234,118 @@ def runtime_report(reference_device: str, candidate_device: str, npu_smi_cmd: st
     return report
 
 
+def import_symbol(module_name: str, symbol_name: str) -> dict[str, Any]:
+    report: dict[str, Any] = {
+        "module": module_name,
+        "symbol": symbol_name,
+        "import_ok": False,
+        "resolved": None,
+        "error": None,
+    }
+    try:
+        module = importlib.import_module(module_name)
+        symbol = getattr(module, symbol_name)
+    except Exception as exc:
+        report["error"] = repr(exc)
+    else:
+        report["import_ok"] = True
+        report["resolved"] = f"{symbol.__module__}.{symbol.__name__}"
+    return report
+
+
+def load_config_json(config_path: Path) -> tuple[dict[str, Any], str | None]:
+    config_json = config_path / "config.json" if config_path.is_dir() else config_path
+    try:
+        return json.loads(config_json.read_text()), None
+    except Exception as exc:
+        return {}, repr(exc)
+
+
+def official_reference_report(config_path: Path, model_id: str, revision: str) -> dict[str, Any]:
+    config_data, error = load_config_json(config_path)
+    auto_map = config_data.get("auto_map") or {}
+    architectures = config_data.get("architectures") or []
+    auto_config = str(auto_map.get("AutoConfig") or "")
+    return {
+        "policy": "official_minimax_hf_config_processor_checkpoint_parity",
+        "model_id": model_id,
+        "revision": revision or None,
+        "config_load_error": error,
+        "config_model_type": config_data.get("model_type"),
+        "config_architectures": architectures,
+        "config_auto_map": auto_map,
+        "config_transformers_version": config_data.get("transformers_version"),
+        "official_config_ok": config_data.get("model_type") == "minimax_m3_vl",
+        "official_architecture_ok": "MiniMaxM3SparseForConditionalGeneration" in architectures,
+        "official_remote_config_ok": auto_config.startswith("configuration_minimax_m3_vl."),
+        "reference_loader": (
+            "transformers>=5.12 MiniMax model class is the execution loader; "
+            "the precision source is the pinned MiniMax official HF config/processor/checkpoint."
+        ),
+    }
+
+
+def model_entrypoint_report(config_path: Path) -> dict[str, Any]:
+    report: dict[str, Any] = {
+        "transformers_reference_loader_class": import_symbol(
+            "transformers.models.minimax_m3_vl.modeling_minimax_m3_vl",
+            "MiniMaxM3SparseForConditionalGeneration",
+        ),
+        "checkpoint_converter_class": import_symbol(
+            "veomni.models.transformers.minimax_m3_vl.checkpoint_tensor_converter",
+            "MiniMaxM3VLCheckpointTensorConverter",
+        ),
+        "veomni_loader": {
+            "import_ok": False,
+            "error": None,
+        },
+        "veomni_config": {
+            "load_ok": False,
+            "model_type": None,
+            "class": None,
+            "error": None,
+        },
+        "veomni_model_class": {
+            "load_ok": False,
+            "resolved": None,
+            "error": None,
+        },
+    }
+    try:
+        from veomni.models.loader import get_model_class, get_model_config
+    except Exception as exc:
+        report["veomni_loader"]["error"] = repr(exc)
+        return report
+
+    report["veomni_loader"]["import_ok"] = True
+    try:
+        config = get_model_config(str(config_path))
+    except Exception as exc:
+        report["veomni_config"]["error"] = repr(exc)
+        return report
+
+    report["veomni_config"].update(
+        {
+            "load_ok": True,
+            "model_type": getattr(config, "model_type", None),
+            "class": f"{config.__class__.__module__}.{config.__class__.__name__}",
+        }
+    )
+    try:
+        model_class = get_model_class(config)
+    except Exception as exc:
+        report["veomni_model_class"]["error"] = repr(exc)
+        return report
+
+    report["veomni_model_class"].update(
+        {
+            "load_ok": True,
+            "resolved": f"{model_class.__module__}.{model_class.__name__}",
+        }
+    )
+    return report
+
+
 def validate_device(runtime: dict[str, Any], device: str, issues: list[str]) -> None:
     kind = device_kind(device)
     if kind == "cpu":
@@ -281,11 +401,59 @@ def main() -> None:
     add_issue(issues, config_report["config_json_exists"], "config.json is missing or config path is not local")
 
     runtime = runtime_report(args.reference_device, args.candidate_device, args.npu_smi_cmd, args.require_free_hbm_mb)
+    official_reference = official_reference_report(
+        config_path,
+        args.official_reference_model_id,
+        args.official_reference_revision,
+    )
+    model_entrypoints = model_entrypoint_report(config_path)
     add_issue(issues, runtime["import_errors"] == [], f"runtime import/probe errors: {runtime['import_errors']}")
     add_issue(
         issues,
         version_at_least(runtime.get("transformers_version"), (5, 12, 0)),
         "transformers>=5.12.0 is required",
+    )
+    add_issue(
+        issues,
+        official_reference["official_config_ok"] is True,
+        "MiniMax official config model_type is not minimax_m3_vl",
+    )
+    add_issue(
+        issues,
+        official_reference["official_architecture_ok"] is True,
+        "MiniMax official config architecture is not MiniMaxM3SparseForConditionalGeneration",
+    )
+    add_issue(
+        issues,
+        official_reference["official_remote_config_ok"] is True,
+        "MiniMax official config auto_map does not point to configuration_minimax_m3_vl",
+    )
+    add_issue(
+        issues,
+        model_entrypoints["transformers_reference_loader_class"].get("import_ok") is True,
+        "MiniMax M3 VL transformers reference loader class is not importable",
+    )
+    add_issue(
+        issues,
+        model_entrypoints["checkpoint_converter_class"].get("import_ok") is True,
+        "MiniMax checkpoint converter class is not importable",
+    )
+    add_issue(issues, model_entrypoints["veomni_loader"].get("import_ok") is True, "VeOmni model loader is not importable")
+    add_issue(issues, model_entrypoints["veomni_config"].get("load_ok") is True, "VeOmni MiniMax config is not loadable")
+    add_issue(
+        issues,
+        model_entrypoints["veomni_config"].get("model_type") == "minimax_m3_vl",
+        "VeOmni config model_type is not minimax_m3_vl",
+    )
+    add_issue(
+        issues,
+        model_entrypoints["veomni_model_class"].get("load_ok") is True,
+        "VeOmni MiniMax candidate model class is not loadable",
+    )
+    add_issue(
+        issues,
+        "MiniMaxM3SparseForConditionalGeneration" in str(model_entrypoints["veomni_model_class"].get("resolved")),
+        "VeOmni candidate class is not MiniMaxM3SparseForConditionalGeneration",
     )
     validate_device(runtime, args.reference_device, issues)
     validate_device(runtime, args.candidate_device, issues)
@@ -320,6 +488,8 @@ def main() -> None:
         "issues": issues,
         "checkpoint": checkpoint,
         "config": config_report,
+        "official_reference": official_reference,
+        "model_entrypoints": model_entrypoints,
         "runtime": runtime,
         "disk": {
             "checkpoint": checkpoint_disk,

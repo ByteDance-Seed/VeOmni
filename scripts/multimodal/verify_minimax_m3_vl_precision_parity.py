@@ -49,7 +49,7 @@ def parse_args() -> argparse.Namespace:
         "--reference-device",
         default=None,
         choices=("cpu", "cuda", "npu"),
-        help="Device for upstream HF reference. Defaults to --device.",
+        help="Device for the official MiniMax reference loader. Defaults to --device.",
     )
     parser.add_argument(
         "--candidate-device",

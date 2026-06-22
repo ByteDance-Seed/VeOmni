@@ -7,9 +7,10 @@ This script complements the toy HF-vs-VeOmni parity gate. It has two modes:
   run the VeOmni MiniMax checkpoint tensor converter on real tensors, and
   compare converted tensor names/shapes/dtypes against the generated model
   state metadata.
-* forward: after payload conversion, load the full public checkpoint into both
-  the upstream transformers MiniMax model and the VeOmni generated model, then
-  compare fixed-prompt logits, top-k ids, and greedy decode ids.
+* forward: after payload conversion, load the full official MiniMax public
+  checkpoint through the Transformers MiniMax reference loader and the VeOmni
+  generated model, then compare fixed-prompt logits, top-k ids, and greedy
+  decode ids.
 
 The forward mode is intentionally guarded by --confirm-full-load because the
 public MiniMax M3 checkpoint payload is large.
@@ -99,7 +100,7 @@ def parse_args() -> argparse.Namespace:
         "--reference-device",
         default=None,
         choices=("cpu", "cuda", "npu"),
-        help="Device for upstream HF reference forward. Defaults to --device.",
+        help="Device for the official MiniMax reference-loader forward. Defaults to --device.",
     )
     parser.add_argument(
         "--candidate-device",

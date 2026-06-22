@@ -4,11 +4,11 @@
 
 ## 目标
 
-MiniMax M3 VL 迁移的精度结论必须来自 reference parity，而不是只看 SFT loss 是否下降。本手册把 `transformers==5.12.0` 原始 MiniMax M3 VL modeling 作为 reference，把 VeOmni patchgen generated modeling 作为 candidate，要求在同 config、同权重、同输入下逐层验证 forward、backward 和 optimizer update。
+MiniMax M3 VL 迁移的精度结论必须来自 reference parity，而不是只看 SFT loss 是否下降。本手册把 MiniMax 官方 Hugging Face `MiniMaxAI/MiniMax-M3` 的 config、processor、checkpoint 作为精度来源，把可加载该官方源的 `transformers>=5.12.0` MiniMax model class 作为 reference loader，把 VeOmni patchgen generated modeling 作为 candidate，要求在同 config、同权重、同输入下逐层验证 forward、backward 和 optimizer update。
 
-Transformers 原仓提供 MiniMax M3 VL reference modeling 和通用训练组件，但没有 MiniMax M3 专用 SFT recipe。因此：
+MiniMax 官方 GitHub `MiniMax-AI/MiniMax-M3` 当前是发布说明仓，模型可执行源和权重入口在官方 HF repo。Transformers 原仓提供通用 `Trainer` 和 MiniMax loader；SFT 专用 trainer 属于 TRL 的 `SFTTrainer`，不是 Transformers core，也不是 MiniMax 官方精度真值。因此：
 
-- `Trainer` / `TRL SFTTrainer` 能作为训练工具参考；
+- `transformers.Trainer` / `trl.SFTTrainer` 能作为训练工具参考；
 - 精度保证必须由本手册的 parity gates 给出；
 - toy SFT loss 下降只能证明训练链路可用，不能替代 reference parity。
 
@@ -43,7 +43,8 @@ Transformers 原仓提供 MiniMax M3 VL reference modeling 和通用训练组件
 
 该 gate 覆盖：
 
-- HF reference class: `transformers.models.minimax_m3_vl.modeling_minimax_m3_vl.MiniMaxM3SparseForConditionalGeneration`
+- Official MiniMax source: `MiniMaxAI/MiniMax-M3` config/processor/checkpoint；
+- Reference loader class: `transformers.models.minimax_m3_vl.modeling_minimax_m3_vl.MiniMaxM3SparseForConditionalGeneration`
 - VeOmni candidate class: `veomni.models.transformers.minimax_m3_vl.generated.patched_modeling_minimax_m3_vl_gpu.MiniMaxM3SparseForConditionalGeneration`
 - 同一份随机初始化 `state_dict`，`strict=True` 加载到 candidate；
 - 同一份 mixed image+video toy batch；
@@ -188,7 +189,7 @@ python scripts/multimodal/verify_minimax_m3_vl_precision_parity.py \
 
 NPU parity 分两层：
 
-1. HF reference 原始 modeling 与 VeOmni NPU generated modeling 的 toy parity；
+1. Official MiniMax config + Transformers reference loader 与 VeOmni NPU generated modeling 的 toy parity；
 2. VeOmni GPU/CPU reference 与 NPU candidate 的 backend tolerance parity。
 
 本 PR 已在单卡 Ascend 910B3 容器环境中完成第 1 层 toy parity：
@@ -319,7 +320,7 @@ NPU 通过标准：
 
 该证据没有下载完整 shard，而是通过 HTTP Range 从 Hugging Face `model-00001/00003/00026/00059-of-00059.safetensors` 读取 11 个真实 tensor payload，共 `55808` bytes，经 converter 映射到 VeOmni generated state keys 后检查 shape/dtype/value fingerprint。样本覆盖 language dense/sparse attention norm、MoE router correction bias、vision tower、multi-modal projector 和 patch-merge projector；随后按 generated model state metadata 执行 sampled state-load cast/copy 校验，`sampled_state_load.passed=true`、`loaded_tensor_count=11`、`value_mismatch_count=0`。它证明真实 checkpoint payload 字节、converter 路径和目标 runtime state dtype cast/copy 路径已被执行，但仍不是 full-checkpoint logits parity。
 
-`toy_checkpoint_forward_parity.json` 使用完整 toy safetensors checkpoint 和 `torch_dtype=float32` 验证了 `--mode forward --prompt-kind multimodal` 的执行路径：先加载 HF reference 生成 logits/top-k/greedy 和 image/video hidden-state baseline，释放 HF 模型，再把 public checkpoint tensors 边读、边转换、边写入 VeOmni generated model。该 smoke 中顶层 `full_checkpoint_load_executed=true`、`num_checks=12`、`failed=[]`，`streaming_model_load=true`，strict missing/unexpected key count 都为 `0`，input ids/mask/position/grid/pixels、`forward.logits`、`forward.image_hidden_states`、`forward.video_hidden_states`、top-k 和 greedy ids 全部一致；它只证明 runner 逻辑，不替代真实 869 GB checkpoint parity。`toy_checkpoint_cpu_npu_forward_parity.json` 使用同一 toy checkpoint 验证了 `--reference-device cpu --candidate-device npu` 路径，在单卡 Ascend 910B3 上同样 `num_checks=12`、`failed=[]`，并记录 `runtime.torch_npu_version=2.10.0`、`runtime.torch_npu_available=true`、`runtime.torch_npu_device_count=1`、`runtime.ascend_env.ASCEND_RT_VISIBLE_DEVICES=0` 和 forward tolerance。真实 CUDA/NPU 目标机可使用 `torch_dtype=bfloat16`，但必须在 artifact 中保留对应 tolerance、runtime 和 `failed=[]` 证据。
+`toy_checkpoint_forward_parity.json` 使用完整 toy safetensors checkpoint 和 `torch_dtype=float32` 验证了 `--mode forward --prompt-kind multimodal` 的执行路径：先用 reference loader 生成 logits/top-k/greedy 和 image/video hidden-state baseline，释放 reference 模型，再把 public checkpoint tensors 边读、边转换、边写入 VeOmni generated model。该 smoke 中顶层 `full_checkpoint_load_executed=true`、`num_checks=12`、`failed=[]`，`streaming_model_load=true`，strict missing/unexpected key count 都为 `0`，input ids/mask/position/grid/pixels、`forward.logits`、`forward.image_hidden_states`、`forward.video_hidden_states`、top-k 和 greedy ids 全部一致；它只证明 runner 逻辑，不替代真实 869 GB checkpoint parity。`toy_checkpoint_cpu_npu_forward_parity.json` 使用同一 toy checkpoint 验证了 `--reference-device cpu --candidate-device npu` 路径，在单卡 Ascend 910B3 上同样 `num_checks=12`、`failed=[]`，并记录 `runtime.torch_npu_version=2.10.0`、`runtime.torch_npu_available=true`、`runtime.torch_npu_device_count=1`、`runtime.ascend_env.ASCEND_RT_VISIBLE_DEVICES=0` 和 forward tolerance。真实 CUDA/NPU 目标机可使用 `torch_dtype=bfloat16`，但必须在 artifact 中保留对应 tolerance、runtime 和 `failed=[]` 证据。
 
 推荐分阶段执行。
 
@@ -373,7 +374,7 @@ python scripts/multimodal/verify_minimax_m3_vl_checkpoint_payload_parity.py \
 
 2. **全量 payload load parity**
    - 下载完整 `59` 个 public safetensors shard；
-   - HF reference 通过原始 `from_pretrained` 或等价 loader 加载；
+   - reference loader 通过官方 MiniMax config + 原始 `from_pretrained` 或等价 loader 加载；
    - VeOmni candidate 通过 checkpoint converter 加载；
    - 固定 prompt 集比较：
      - logits max abs / max rel；
@@ -408,7 +409,16 @@ Preflight 通过标准：
 - `checkpoint.missing_shards=[]`；
 - `checkpoint.payload_bytes_present>=800000000000`；
 - `config.config_json_exists=true`；
+- `official_reference.policy=official_minimax_hf_config_processor_checkpoint_parity`；
+- `official_reference.model_id=MiniMaxAI/MiniMax-M3`；
+- `official_reference.official_config_ok=true`；
+- `official_reference.official_architecture_ok=true`；
+- `official_reference.official_remote_config_ok=true`；
 - `runtime.transformers_version>=5.12.0`；
+- `model_entrypoints.transformers_reference_loader_class.import_ok=true`；
+- `model_entrypoints.checkpoint_converter_class.import_ok=true`；
+- `model_entrypoints.veomni_config.model_type=minimax_m3_vl`；
+- `model_entrypoints.veomni_model_class.resolved` 指向 `MiniMaxM3SparseForConditionalGeneration`；
 - 如果 reference 或 candidate 是 NPU，`runtime.torch_npu_version` 不能为空，`runtime.npu_available=true`，并记录可见 Ascend 设备环境变量；
 - 如果设置 `--require-free-hbm-mb`，`runtime.npu_smi.returncode=0`，且至少一张 NPU 满足 free HBM 门槛；
 - 如果设置 `--require-free-disk-gb`，checkpoint 和 output filesystem 都满足对应 free disk 门槛。

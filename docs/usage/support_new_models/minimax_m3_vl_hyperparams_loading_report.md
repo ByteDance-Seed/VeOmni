@@ -22,6 +22,8 @@ MiniMax M3 VL 的模型超参数以 Hugging Face `MiniMaxAI/MiniMax-M3` 的 `con
 curl -fsSL https://huggingface.co/api/models/MiniMaxAI/MiniMax-M3
 curl -fsSL https://huggingface.co/MiniMaxAI/MiniMax-M3/raw/main/config.json
 curl -fsSL https://huggingface.co/MiniMaxAI/MiniMax-M3/raw/main/preprocessor_config.json
+curl -fsSL https://api.github.com/repos/MiniMax-AI/MiniMax-M3/contents/
+curl -fsSL https://api.github.com/repos/MiniMax-AI/MiniMax-M3/commits/main
 curl -sS -o /tmp/minimax_m3_vl_v590.py -w "%{http_code}" \
   https://raw.githubusercontent.com/huggingface/transformers/v5.9.0/src/transformers/models/minimax_m3_vl/modeling_minimax_m3_vl.py
 curl -sS -o /tmp/minimax_m3_vl_v512.py -w "%{http_code}" \
@@ -41,8 +43,10 @@ curl -fsSL -o /tmp/minimax_m3_model_index.json -w "%{http_code}" \
 | 项目 | 值 |
 |---|---|
 | Hugging Face repo | `MiniMaxAI/MiniMax-M3` |
-| Hugging Face sha | `051e8f961274fb4e18ac3b57991f13bffedde212` |
-| Last modified | `2026-06-16T05:18:24.000Z` |
+| Hugging Face sha | `b1c79b9c07578aeebf33c2aeff0f6de8a96b02b1` |
+| Last modified | `2026-06-22T06:35:16.000Z` |
+| MiniMax GitHub repo | `MiniMax-AI/MiniMax-M3`, main `a4ee8150dd58920c6f87c6aba26e3b6cdea56d75` |
+| MiniMax GitHub files | README/figures only for model release notes; executable config/processor/checkpoint source is the official HF repo |
 | ModelScope page | `https://modelscope.cn/models/MiniMax/MiniMax-M3`, HTTP `200` |
 | ModelScope API/files | HTTP `200`; `config.json`、`preprocessor_config.json`、`model.safetensors.index.json` present |
 | ModelScope `config.json` | HTTP `200`, SHA256 `c9c97ce1e4eece60012d5a10ea87717458bfb1f19c2c7a615a3dbff83d090c6b`, byte-identical to HF |
@@ -55,9 +59,9 @@ curl -fsSL -o /tmp/minimax_m3_model_index.json -w "%{http_code}" \
 | AutoVideoProcessor | `video_processor.MiniMaxM3VLVideoProcessor` |
 | AutoProcessor | `processing_minimax.MiniMaxVLProcessor` |
 | transformers v5.9.0 MiniMax modeling | HTTP `404` |
-| transformers v5.12.0 MiniMax modeling | HTTP `200` |
+| transformers v5.12.0 MiniMax modeling | HTTP `200`; used as loader for the official MiniMax HF config/checkpoint |
 
-本轮再次复查官方源：HF sha 仍为 `051e8f961274fb4e18ac3b57991f13bffedde212`，`lastModified=2026-06-16T05:18:24.000Z`，`model.safetensors.index.json` 仍为 HTTP `200` 且 `weight_map` 为 `23416` 个 key。projector 相关 key 分为两组：`multi_modal_projector.linear_{1,2}.{weight,bias}` 对应 transformers generated `linear_{1,2}`，`patch_merge_mlp.linear_{1,2}.{weight,bias}` 对应 transformers generated `merge_linear_{1,2}`。
+本轮再次复查官方源：HF sha 已更新为 `b1c79b9c07578aeebf33c2aeff0f6de8a96b02b1`，`lastModified=2026-06-22T06:35:16.000Z`，`model.safetensors.index.json` 仍为 HTTP `200` 且 `weight_map` 为 `23416` 个 key。MiniMax GitHub main 当前只更新 README 发布说明，不提供 SFT 或训练 recipe；精度 reference 必须固定到官方 HF config/processor/checkpoint。projector 相关 key 分为两组：`multi_modal_projector.linear_{1,2}.{weight,bias}` 对应 transformers generated `linear_{1,2}`，`patch_merge_mlp.linear_{1,2}.{weight,bias}` 对应 transformers generated `merge_linear_{1,2}`。
 
 Public processor load evidence:
 

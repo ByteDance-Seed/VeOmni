@@ -20,6 +20,8 @@
 - generated header：`Based on: transformers==5.12.0`
 - 旧版本状态：transformers v5.9.0/v5.10.0/v5.11.0 不包含 `modeling_minimax_m3_vl.py`
 
+精度来源是 MiniMax 官方 Hugging Face `MiniMaxAI/MiniMax-M3` 的 config、processor 和 public checkpoint。Transformers v5.12.0 在本 PR 中是加载该官方源的 reference loader；不能把 Transformers 仓本身当作 MiniMax 原始精度真值。
+
 VeOmni 全局 `transformers-stable` pin 不改；MiniMax example 文档要求局部 `transformers>=5.12.0`。
 
 ## 超参数加载报告
@@ -31,8 +33,9 @@ VeOmni 全局 `transformers-stable` pin 不改；MiniMax example 文档要求局
 | 字段 | 值 |
 |---|---|
 | repo | `MiniMaxAI/MiniMax-M3` |
-| HF sha | `051e8f961274fb4e18ac3b57991f13bffedde212` |
-| last modified | `2026-06-16T05:18:24.000Z` |
+| HF sha | `b1c79b9c07578aeebf33c2aeff0f6de8a96b02b1` |
+| last modified | `2026-06-22T06:35:16.000Z` |
+| MiniMax GitHub release repo | `MiniMax-AI/MiniMax-M3`, main `a4ee8150dd58920c6f87c6aba26e3b6cdea56d75`; README/figures only |
 | `model_type` | `minimax_m3_vl` |
 | `architectures` | `["MiniMaxM3SparseForConditionalGeneration"]` |
 | processor class | `MiniMaxVLProcessor` |

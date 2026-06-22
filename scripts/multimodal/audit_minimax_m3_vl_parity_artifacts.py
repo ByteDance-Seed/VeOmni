@@ -202,8 +202,13 @@ def check_full_checkpoint_preflight(path: Path) -> dict[str, Any]:
     prefix = path.name
     checkpoint = data.get("checkpoint") or {}
     config = data.get("config") or {}
+    official_reference = data.get("official_reference") or {}
+    model_entrypoints = data.get("model_entrypoints") or {}
     runtime = data.get("runtime") or {}
     requirements = data.get("requirements") or {}
+    reference_loader = model_entrypoints.get("transformers_reference_loader_class") or model_entrypoints.get(
+        "hf_reference_class"
+    ) or {}
 
     add_issue(issues, data.get("passed") is True, f"{prefix}: passed is not true")
     add_issue(issues, data.get("issues") == [], f"{prefix}: issues is not empty")
@@ -215,6 +220,67 @@ def check_full_checkpoint_preflight(path: Path) -> dict[str, Any]:
     checkpoint_dir = str(checkpoint.get("checkpoint_dir") or "")
     add_issue(issues, "toy" not in checkpoint_dir.lower(), f"{prefix}: checkpoint_dir looks like a toy checkpoint")
     add_issue(issues, config.get("config_json_exists") is True, f"{prefix}: config.json is missing")
+    add_issue(
+        issues,
+        official_reference.get("policy") == "official_minimax_hf_config_processor_checkpoint_parity",
+        f"{prefix}: MiniMax official reference policy is missing",
+    )
+    add_issue(
+        issues,
+        official_reference.get("model_id") == "MiniMaxAI/MiniMax-M3",
+        f"{prefix}: MiniMax official reference model id is not MiniMaxAI/MiniMax-M3",
+    )
+    add_issue(
+        issues,
+        official_reference.get("official_config_ok") is True,
+        f"{prefix}: MiniMax official config model_type is not minimax_m3_vl",
+    )
+    add_issue(
+        issues,
+        official_reference.get("official_architecture_ok") is True,
+        f"{prefix}: MiniMax official architecture is not MiniMaxM3SparseForConditionalGeneration",
+    )
+    add_issue(
+        issues,
+        official_reference.get("official_remote_config_ok") is True,
+        f"{prefix}: MiniMax official AutoConfig remote-code mapping is missing",
+    )
+    add_issue(
+        issues,
+        reference_loader.get("import_ok") is True,
+        f"{prefix}: MiniMax transformers reference loader class is not importable",
+    )
+    add_issue(
+        issues,
+        (model_entrypoints.get("checkpoint_converter_class") or {}).get("import_ok") is True,
+        f"{prefix}: MiniMax checkpoint converter class is not importable",
+    )
+    add_issue(
+        issues,
+        (model_entrypoints.get("veomni_loader") or {}).get("import_ok") is True,
+        f"{prefix}: VeOmni model loader is not importable",
+    )
+    add_issue(
+        issues,
+        (model_entrypoints.get("veomni_config") or {}).get("load_ok") is True,
+        f"{prefix}: VeOmni MiniMax config is not loadable",
+    )
+    add_issue(
+        issues,
+        (model_entrypoints.get("veomni_config") or {}).get("model_type") == "minimax_m3_vl",
+        f"{prefix}: VeOmni config model_type is not minimax_m3_vl",
+    )
+    veomni_model_class = model_entrypoints.get("veomni_model_class") or {}
+    add_issue(
+        issues,
+        veomni_model_class.get("load_ok") is True,
+        f"{prefix}: VeOmni candidate class is not loadable",
+    )
+    add_issue(
+        issues,
+        "MiniMaxM3SparseForConditionalGeneration" in str(veomni_model_class.get("resolved")),
+        f"{prefix}: VeOmni candidate class is not MiniMaxM3SparseForConditionalGeneration",
+    )
     add_issue(issues, runtime.get("import_errors") == [], f"{prefix}: runtime import/probe errors present")
     add_issue(
         issues,
