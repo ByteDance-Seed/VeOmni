@@ -228,7 +228,7 @@ NPU 通过标准：
 
 该证据没有下载完整 shard，而是通过 HTTP Range 从 Hugging Face `model-00001/00003/00026/00059-of-00059.safetensors` 读取 11 个真实 tensor payload，共 `55808` bytes，经 converter 映射到 VeOmni generated state keys 后检查 shape/dtype/value fingerprint。样本覆盖 language dense/sparse attention norm、MoE router correction bias、vision tower、multi-modal projector 和 patch-merge projector；随后按 generated model state metadata 执行 sampled state-load cast/copy 校验，`sampled_state_load.passed=true`、`loaded_tensor_count=11`、`value_mismatch_count=0`。它证明真实 checkpoint payload 字节、converter 路径和目标 runtime state dtype cast/copy 路径已被执行，但仍不是 full-checkpoint logits parity。
 
-`toy_checkpoint_forward_parity.json` 使用完整 toy safetensors checkpoint 验证了 `--mode forward --prompt-kind multimodal` 的执行路径：先加载 HF reference 生成 logits/top-k/greedy 和 image/video hidden-state baseline，释放 HF 模型，再把 public checkpoint tensors 边读、边转换、边写入 VeOmni generated model。该 smoke 中 `streaming_model_load=true`，strict missing/unexpected key count 都为 `0`，`forward.logits`、`forward.image_hidden_states`、`forward.video_hidden_states` max diff 都为 `0.0`，top-k 和 greedy ids 完全一致；它只证明 runner 逻辑，不替代真实 869 GB checkpoint parity。
+`toy_checkpoint_forward_parity.json` 使用完整 toy safetensors checkpoint 和 `torch_dtype=float32` 验证了 `--mode forward --prompt-kind multimodal` 的执行路径：先加载 HF reference 生成 logits/top-k/greedy 和 image/video hidden-state baseline，释放 HF 模型，再把 public checkpoint tensors 边读、边转换、边写入 VeOmni generated model。该 smoke 中顶层 `full_checkpoint_load_executed=true`、`num_checks=5`、`failed=[]`，`streaming_model_load=true`，strict missing/unexpected key count 都为 `0`，`forward.logits`、`forward.image_hidden_states`、`forward.video_hidden_states` max diff 都为 `0.0`，top-k 和 greedy ids 完全一致；它只证明 runner 逻辑，不替代真实 869 GB checkpoint parity。真实 CUDA/NPU 目标机可使用 `torch_dtype=bfloat16`，但必须在 artifact 中保留对应 tolerance 和 `failed=[]` 证据。
 
 推荐分阶段执行。
 
@@ -338,6 +338,9 @@ python scripts/multimodal/verify_minimax_m3_vl_checkpoint_payload_parity.py \
 完整 forward 通过标准：
 
 - payload 部分同样 `passed=true`；
+- JSON 顶层 `full_checkpoint_load_executed=true`；
+- JSON 顶层 `device` 等于本次目标设备，例如 `cuda:0` 或 `npu:0`；
+- JSON 顶层 `num_checks` 等于 `forward.checks` 数量，且 `failed=[]`；
 - `forward.state_dict_load.missing_keys=[]`；
 - `forward.state_dict_load.unexpected_keys=[]`；
 - `forward.checks[name=forward.logits].allclose=true`；

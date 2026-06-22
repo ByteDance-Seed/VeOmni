@@ -2,9 +2,12 @@
   "allow_incomplete_groups": false,
   "checkpoint_dir": null,
   "config_path": "MiniMaxAI/MiniMax-M3",
-  "date": "2026-06-22T13:38:08Z",
+  "date": "2026-06-22T14:05:23Z",
+  "device": "cpu",
   "fail_on_dtype_mismatch": false,
+  "failed": null,
   "forward": null,
+  "full_checkpoint_load_executed": false,
   "include_key_regex": [
     "^language_model\\.model\\.layers\\.0\\.self_attn\\.[qk]_norm\\.weight$|^language_model\\.model\\.layers\\.3\\.self_attn\\.index_[qk]_norm\\.weight$|^language_model\\.model\\.layers\\.3\\.block_sparse_moe\\.e_score_correction_bias$|^vision_tower\\.vision_model\\.encoder\\.layers\\.0\\.(layer_norm1\\.weight|self_attn\\.q_proj\\.bias)$|^multi_modal_projector\\.linear_[12]\\.bias$|^patch_merge_mlp\\.linear_[12]\\.bias$"
   ],
@@ -27,6 +30,7 @@
     "shape_mismatches_sample": []
   },
   "mode": "payload",
+  "num_checks": null,
   "passed": true,
   "payload": {
     "converted_tensor_keys": 11,
@@ -46,7 +50,7 @@
     "machine": "aarch64",
     "platform": "Linux-5.15.0-94-generic-aarch64-with-glibc2.35",
     "python": "3.11.15 (main, Jun 11 2026, 04:04:24) [Clang 22.1.3 ]",
-    "python_executable": "/home/t00906153/super/.cache/uv/builds-v0/.tmp9LEdDg/bin/python",
+    "python_executable": "/home/t00906153/super/.cache/uv/builds-v0/.tmpuArPfx/bin/python",
     "torch_version": "2.7.1+cpu",
     "transformers_version": "5.12.0"
   },

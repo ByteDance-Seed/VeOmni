@@ -1039,6 +1039,7 @@ def run_forward_parity(
         }
     )
 
+    failed_checks = [item["name"] for item in checks if not item.get("allclose", item.get("equal", False))]
     forward_report = {
         "device": str(device),
         "prompt_kind": args.prompt_kind,
@@ -1058,7 +1059,9 @@ def run_forward_parity(
             "streaming": True,
         },
         "checks": checks,
-        "passed": all(item.get("allclose", item.get("equal", False)) for item in checks),
+        "num_checks": len(checks),
+        "failed": failed_checks,
+        "passed": not failed_checks,
     }
     del veomni_outputs
     del veomni_model
@@ -1150,6 +1153,10 @@ def main() -> None:
         "passed": bool(payload_passed and (forward_report is None or forward_report["passed"])),
         "date": started_at,
         "mode": args.mode,
+        "device": forward_report["device"] if forward_report is not None else args.device,
+        "full_checkpoint_load_executed": bool(args.mode == "forward"),
+        "num_checks": forward_report["num_checks"] if forward_report is not None else None,
+        "failed": forward_report["failed"] if forward_report is not None else None,
         "checkpoint_dir": str(checkpoint_dir) if checkpoint_dir else None,
         "config_path": config_path,
         "index_json": index_json,
