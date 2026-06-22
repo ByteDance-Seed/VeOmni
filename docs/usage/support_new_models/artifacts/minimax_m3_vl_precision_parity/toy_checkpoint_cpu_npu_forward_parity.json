@@ -3,7 +3,7 @@
   "candidate_device": "npu:0",
   "checkpoint_dir": "/tmp/minimax_m3_vl_toy_full_checkpoint",
   "config_path": "/tmp/minimax_m3_vl_toy_full_checkpoint",
-  "date": "2026-06-22T14:11:39Z",
+  "date": "2026-06-22T14:18:16Z",
   "device": "npu:0",
   "fail_on_dtype_mismatch": false,
   "failed": [],
@@ -411,6 +411,16 @@
       "unexpected_key_count": 0,
       "unexpected_keys": []
     },
+    "tolerances": {
+      "forward": {
+        "atol": 0.0005,
+        "rtol": 0.0005
+      },
+      "input": {
+        "atol": 0.0,
+        "rtol": 0.0
+      }
+    },
     "top_k": 4,
     "veomni_model_class": "veomni.models.transformers.minimax_m3_vl.generated.patched_modeling_minimax_m3_vl_npu.MiniMaxM3SparseForConditionalGeneration"
   },
@@ -446,10 +456,21 @@
   },
   "reference_device": "cpu",
   "runtime": {
+    "ascend_env": {
+      "ASCEND_HOME_PATH": "/usr/local/Ascend/cann-9.0.0",
+      "ASCEND_RT_VISIBLE_DEVICES": "0",
+      "ASCEND_TOOLKIT_HOME": "/usr/local/Ascend/cann-9.0.0",
+      "ASCEND_VISIBLE_DEVICES": null,
+      "MODELING_BACKEND": "veomni"
+    },
     "machine": "aarch64",
     "platform": "Linux-5.15.0-94-generic-aarch64-with-glibc2.35",
     "python": "3.11.15 (main, May 13 2026, 07:56:17) [GCC 11.4.0]",
     "python_executable": "/usr/local/python3.11.15/bin/python3",
+    "torch_npu_available": true,
+    "torch_npu_device_count": 1,
+    "torch_npu_error": null,
+    "torch_npu_version": "2.10.0",
     "torch_version": "2.10.0+cpu",
     "transformers_version": "5.12.0"
   },
@@ -1425,5 +1446,15 @@
       "source_shard": "model.safetensors"
     }
   ],
+  "tolerances": {
+    "forward": {
+      "atol": 0.0005,
+      "rtol": 0.0005
+    },
+    "input": {
+      "atol": 0.0,
+      "rtol": 0.0
+    }
+  },
   "torch_dtype": "float32"
 }

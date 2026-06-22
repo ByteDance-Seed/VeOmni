@@ -229,7 +229,7 @@ NPU 通过标准：
 
 该证据没有下载完整 shard，而是通过 HTTP Range 从 Hugging Face `model-00001/00003/00026/00059-of-00059.safetensors` 读取 11 个真实 tensor payload，共 `55808` bytes，经 converter 映射到 VeOmni generated state keys 后检查 shape/dtype/value fingerprint。样本覆盖 language dense/sparse attention norm、MoE router correction bias、vision tower、multi-modal projector 和 patch-merge projector；随后按 generated model state metadata 执行 sampled state-load cast/copy 校验，`sampled_state_load.passed=true`、`loaded_tensor_count=11`、`value_mismatch_count=0`。它证明真实 checkpoint payload 字节、converter 路径和目标 runtime state dtype cast/copy 路径已被执行，但仍不是 full-checkpoint logits parity。
 
-`toy_checkpoint_forward_parity.json` 使用完整 toy safetensors checkpoint 和 `torch_dtype=float32` 验证了 `--mode forward --prompt-kind multimodal` 的执行路径：先加载 HF reference 生成 logits/top-k/greedy 和 image/video hidden-state baseline，释放 HF 模型，再把 public checkpoint tensors 边读、边转换、边写入 VeOmni generated model。该 smoke 中顶层 `full_checkpoint_load_executed=true`、`num_checks=12`、`failed=[]`，`streaming_model_load=true`，strict missing/unexpected key count 都为 `0`，input ids/mask/position/grid/pixels、`forward.logits`、`forward.image_hidden_states`、`forward.video_hidden_states`、top-k 和 greedy ids 全部一致；它只证明 runner 逻辑，不替代真实 869 GB checkpoint parity。`toy_checkpoint_cpu_npu_forward_parity.json` 使用同一 toy checkpoint 验证了 `--reference-device cpu --candidate-device npu` 路径，在单卡 Ascend 910B3 上同样 `num_checks=12`、`failed=[]`。真实 CUDA/NPU 目标机可使用 `torch_dtype=bfloat16`，但必须在 artifact 中保留对应 tolerance 和 `failed=[]` 证据。
+`toy_checkpoint_forward_parity.json` 使用完整 toy safetensors checkpoint 和 `torch_dtype=float32` 验证了 `--mode forward --prompt-kind multimodal` 的执行路径：先加载 HF reference 生成 logits/top-k/greedy 和 image/video hidden-state baseline，释放 HF 模型，再把 public checkpoint tensors 边读、边转换、边写入 VeOmni generated model。该 smoke 中顶层 `full_checkpoint_load_executed=true`、`num_checks=12`、`failed=[]`，`streaming_model_load=true`，strict missing/unexpected key count 都为 `0`，input ids/mask/position/grid/pixels、`forward.logits`、`forward.image_hidden_states`、`forward.video_hidden_states`、top-k 和 greedy ids 全部一致；它只证明 runner 逻辑，不替代真实 869 GB checkpoint parity。`toy_checkpoint_cpu_npu_forward_parity.json` 使用同一 toy checkpoint 验证了 `--reference-device cpu --candidate-device npu` 路径，在单卡 Ascend 910B3 上同样 `num_checks=12`、`failed=[]`，并记录 `runtime.torch_npu_version=2.10.0`、`runtime.torch_npu_available=true`、`runtime.torch_npu_device_count=1`、`runtime.ascend_env.ASCEND_RT_VISIBLE_DEVICES=0` 和 forward tolerance。真实 CUDA/NPU 目标机可使用 `torch_dtype=bfloat16`，但必须在 artifact 中保留对应 tolerance、runtime 和 `failed=[]` 证据。
 
 推荐分阶段执行。
 
@@ -344,6 +344,7 @@ python scripts/multimodal/verify_minimax_m3_vl_checkpoint_payload_parity.py \
 - JSON 顶层 `full_checkpoint_load_executed=true`；
 - JSON 顶层 `reference_device` 和 `candidate_device` 等于本次目标设备组合，例如 `cuda:0`/`cuda:0` 或 `cpu`/`npu:0`；
 - JSON 顶层 `device` 等于 candidate 设备，例如 `cuda:0` 或 `npu:0`；
+- JSON 顶层 `tolerances.forward` 记录本次 `atol`/`rtol`，`tolerances.input` 为 exact input contract；
 - JSON 顶层 `num_checks` 等于 `forward.checks` 数量，且 `failed=[]`；
 - `forward.state_dict_load.missing_keys=[]`；
 - `forward.state_dict_load.unexpected_keys=[]`；
@@ -355,7 +356,7 @@ python scripts/multimodal/verify_minimax_m3_vl_checkpoint_payload_parity.py \
 - `forward.checks[name=forward.last_token_topk_ids].equal=true`；
 - `forward.checks[name=generate.greedy_ids].equal=true`。
 
-NPU 上复跑完整 forward 时优先使用 `--reference-device cpu` 或 `--reference-device cuda` 搭配 `--candidate-device npu`，先完成本手册 NPU runtime gates，并根据 backend 数值误差使用 NPU tolerance。NPU JSON 必须保留 `reference_device`、`candidate_device`、tolerance、prompt ids、top-k、greedy ids 和 runtime 证据路径。
+NPU 上复跑完整 forward 时优先使用 `--reference-device cpu` 或 `--reference-device cuda` 搭配 `--candidate-device npu`，先完成本手册 NPU runtime gates，并根据 backend 数值误差使用 NPU tolerance。NPU JSON 必须保留 `reference_device`、`candidate_device`、`tolerances`、prompt ids、top-k、greedy ids 和 runtime 证据；其中 `runtime.torch_npu_version` 不能为空，`runtime.torch_npu_available=true`，`runtime.torch_npu_device_count>=1`，并记录 `runtime.ascend_env.ASCEND_RT_VISIBLE_DEVICES`。
 
 完整 checkpoint CPU reference vs NPU candidate 示例：
 

@@ -875,6 +875,47 @@ def release_accelerator_memory(device: Any) -> None:
         torch.npu.empty_cache()
 
 
+def runtime_report(torch_module: Any, transformers_module: Any) -> dict[str, Any]:
+    torch_npu_module = sys.modules.get("torch_npu")
+    npu_available = None
+    npu_device_count = None
+    if hasattr(torch_module, "npu"):
+        try:
+            npu_available = bool(torch_module.npu.is_available())
+            npu_device_count = int(torch_module.npu.device_count())
+        except RuntimeError as exc:
+            npu_available = False
+            npu_device_count = None
+            npu_error = str(exc)
+        else:
+            npu_error = None
+    else:
+        npu_error = None
+
+    return {
+        "python": sys.version,
+        "python_executable": sys.executable,
+        "platform": platform.platform(),
+        "machine": platform.machine(),
+        "torch_version": torch_module.__version__,
+        "transformers_version": transformers_module.__version__,
+        "torch_npu_version": getattr(torch_npu_module, "__version__", None),
+        "torch_npu_available": npu_available,
+        "torch_npu_device_count": npu_device_count,
+        "torch_npu_error": npu_error,
+        "ascend_env": {
+            name: os.environ.get(name)
+            for name in (
+                "ASCEND_RT_VISIBLE_DEVICES",
+                "ASCEND_VISIBLE_DEVICES",
+                "ASCEND_HOME_PATH",
+                "ASCEND_TOOLKIT_HOME",
+                "MODELING_BACKEND",
+            )
+        },
+    }
+
+
 def patch_eager_config(config: Any, args: argparse.Namespace | None = None) -> Any:
     if args is not None:
         for value, attrs in (
@@ -1123,6 +1164,10 @@ def run_forward_parity(
         "device": str(candidate_device),
         "reference_device": str(reference_device),
         "candidate_device": str(candidate_device),
+        "tolerances": {
+            "input": {"atol": 0.0, "rtol": 0.0},
+            "forward": {"atol": args.atol, "rtol": args.rtol},
+        },
         "prompt_kind": args.prompt_kind,
         "prompt_ids": prompt_ids,
         "seed": args.seed if args.prompt_kind == "multimodal" else None,
@@ -1248,19 +1293,16 @@ def main() -> None:
         "index_json": index_json,
         "shard_base_url": shard_base_url,
         "torch_dtype": args.torch_dtype,
+        "tolerances": {
+            "input": {"atol": 0.0, "rtol": 0.0},
+            "forward": {"atol": args.atol, "rtol": args.rtol},
+        },
         "selected_shards": sorted(set(selected_weight_map.values())),
         "selected_shard_count": len(set(selected_weight_map.values())),
         "include_key_regex": args.include_key_regex,
         "allow_incomplete_groups": args.allow_incomplete_groups,
         "fail_on_dtype_mismatch": args.fail_on_dtype_mismatch,
-        "runtime": {
-            "python": sys.version,
-            "python_executable": sys.executable,
-            "platform": platform.platform(),
-            "machine": platform.machine(),
-            "torch_version": torch.__version__,
-            "transformers_version": transformers.__version__,
-        },
+        "runtime": runtime_report(torch, transformers),
         "payload": {
             key: value
             for key, value in payload_summary.items()
