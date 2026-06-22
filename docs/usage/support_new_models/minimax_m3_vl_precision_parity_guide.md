@@ -461,7 +461,25 @@ python scripts/multimodal/verify_minimax_m3_vl_checkpoint_payload_parity.py \
   - grad norm；
   - rank 间 dummy visual path 是否无 hang。
 
-多卡通过后，再把对应命令、硬件拓扑、torchrun world size、JSON/日志路径补进 `minimax_m3_vl_migration_report.md`。
+目标机器推荐使用 launcher，它会先做 runtime/device-count preflight，再跑 FSDP2 asymmetric dummy-forward gate 和带 `--runxfail` 的 SP/EP/FSDP2 e2e alignment gate：
+
+```bash
+cd /path/to/VeOmni
+
+scripts/multimodal/run_minimax_m3_vl_multicard_parity.sh \
+  --min-devices 8 \
+  --output-dir docs/usage/support_new_models/artifacts/minimax_m3_vl_multicard_parity
+```
+
+通过标准：
+
+- `multicard_parity_summary.json` 中 `passed=true`；
+- `preflight.returncode=0`，且 log 中 `device_count>=8`、`transformers_version>=5.12.0`；
+- `dummy_forward.returncode=0`；
+- `e2e_align.returncode=0`，并且该命令必须使用 `--runxfail`，不能让 xfail marker 吞掉真实失败；
+- 保存 `preflight.log`、`dummy_forward.log`、`e2e_align.log`，并把硬件拓扑、torchrun world size、JSON/日志路径补进 `minimax_m3_vl_migration_report.md`。
+
+多卡通过前，不应声明 SP/EP/FSDP2 完成。
 
 ## 故障定位顺序
 
