@@ -130,19 +130,24 @@ class Qwen3VLVisionEncoder(Qwen3VLVisionEncoderModuleMixin, PreTrainedModel):
         pixel_values: Optional[torch.Tensor] = None,
         image_grid_thw: Optional[torch.Tensor] = None,
         vit_metadata: Optional[Dict[str, Any]] = None,
+        is_dummy: Optional[bool] = None,
     ) -> Dict[str, Any]:
-        if pixel_values is None and get_parallel_state().fsdp_enabled:
+        # ``is_dummy`` comes from the (worker-aware) pre_forward: True with
+        # worker-built dummy zeros, False with real patches. ``None`` = eager /
+        # no-worker path → derive from the absence of pixels (FSDP only).
+        if is_dummy is None:
+            is_dummy = pixel_values is None and get_parallel_state().fsdp_enabled
+        if is_dummy and pixel_values is None:
             dummy = self.dummy_inputs()
-            image_embeds, deepstack_features = self._encode(**dummy)
-            return {
-                "image_embeds": image_embeds,
-                "deepstack_features": deepstack_features,
-                "image_grid_thw": dummy["image_grid_thw"],
-                "is_dummy": True,
-            }
+            pixel_values, image_grid_thw, vit_metadata = (
+                dummy["pixel_values"],
+                dummy["image_grid_thw"],
+                dummy["vit_metadata"],
+            )
         image_embeds, deepstack_features = self._encode(pixel_values, image_grid_thw, vit_metadata)
         return {
             "image_embeds": image_embeds,
             "deepstack_features": deepstack_features,
             "image_grid_thw": image_grid_thw,
+            "is_dummy": is_dummy,
         }

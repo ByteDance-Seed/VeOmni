@@ -47,7 +47,13 @@ class JanusSiglip(JanusSiglipModuleMixin, JanusSiglipTraceMixin, PreTrainedModel
     def forward(
         self,
         pixel_values: Optional[torch.Tensor] = None,
+        is_dummy: Optional[bool] = None,
     ) -> Dict[str, Any]:
-        if pixel_values is None and get_parallel_state().fsdp_enabled:
-            return {"image_embeds": self._encode_pixel_values(**self.dummy_inputs()), "is_dummy": True}
-        return {"image_embeds": self._encode_pixel_values(pixel_values)}
+        # ``is_dummy`` comes from the (worker-aware) pre_forward: True with
+        # worker-built dummy zeros, False with real pixels. ``None`` = eager /
+        # no-worker path → derive from the absence of pixels (FSDP only).
+        if is_dummy is None:
+            is_dummy = pixel_values is None and get_parallel_state().fsdp_enabled
+        if is_dummy and pixel_values is None:
+            pixel_values = self.dummy_inputs()["pixel_values"]
+        return {"image_embeds": self._encode_pixel_values(pixel_values), "is_dummy": is_dummy}

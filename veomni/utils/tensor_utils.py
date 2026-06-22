@@ -22,17 +22,24 @@ import torch
 def naflatten(
     hid: list[torch.Tensor],
 ) -> tuple[torch.Tensor, torch.LongTensor]:
-    """Concatenate variable-shape tensors; return flat tensor and per-element prefix shapes ``(b, n)``."""
+    """Concatenate variable-shape tensors; return flat tensor and per-element prefix shapes ``(b, n)``.
+
+    The returned shape metadata is kept on **CPU** (it is pure host-side
+    bookkeeping derived from ``.shape`` / ``.numel()``). This lets
+    :func:`unflatten` split with ``.tolist()`` without forcing a device→host
+    sync per segment — those syncs otherwise dominate the post-forward of the
+    text encoder / backbone (they block on the still-running forward kernels).
+    The flat data tensor stays on the input device.
+    """
     assert len(hid) > 0
-    device = hid[0].device
     prefix_rows: list[torch.Tensor] = []
     pieces: list[torch.Tensor] = []
     for x in hid:
         if x.dim() == 1:
-            prefix_rows.append(torch.tensor([x.numel()], device=device, dtype=torch.long))
+            prefix_rows.append(torch.tensor([x.numel()], dtype=torch.long))
             pieces.append(x.reshape(-1))
         else:
-            prefix_rows.append(torch.tensor(x.shape[:-1], device=device, dtype=torch.long))
+            prefix_rows.append(torch.tensor(tuple(x.shape[:-1]), dtype=torch.long))
             pieces.append(x.flatten(0, -2))
     shape = torch.stack(prefix_rows)
     return torch.cat(pieces), shape
@@ -42,7 +49,14 @@ def unflatten(
     hid: torch.Tensor,
     hid_shape: torch.LongTensor,
 ) -> list[torch.Tensor]:
-    """Split a flat tensor using prefix shapes from :func:`naflatten`."""
+    """Split a flat tensor using prefix shapes from :func:`naflatten`.
+
+    ``hid_shape`` is moved to CPU once (a single sync at most) so the per-segment
+    ``.tolist()`` calls below never trigger a device→host sync; with the CPU
+    shape produced by :func:`naflatten` this is already a no-op.
+    """
+    if hid_shape.device.type != "cpu":
+        hid_shape = hid_shape.cpu()
     hid_len = hid_shape.prod(-1)
     chunks = hid.split(hid_len.tolist())
     return [x.unflatten(0, s.tolist()) for x, s in zip(chunks, hid_shape, strict=True)]
