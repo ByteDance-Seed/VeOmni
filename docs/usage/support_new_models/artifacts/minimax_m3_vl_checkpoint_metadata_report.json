@@ -1,0 +1,135 @@
+{
+  "checkpoint_values_downloaded": false,
+  "config_path": "MiniMaxAI/MiniMax-M3",
+  "converted_index_keys": 1582,
+  "converted_metadata_keys": 1582,
+  "dtype_mismatch_count": 115,
+  "dtype_mismatch_failure_enabled": false,
+  "dtype_mismatch_groups": {
+    "F32->BF16": 115
+  },
+  "dtype_mismatch_note": "Dtype metadata differences are reported but do not fail by default; VeOmni checkpoint dispatch casts tensors to the target parameter or buffer dtype during load.",
+  "dtype_mismatches_sample": [
+    {
+      "checkpoint": "F32",
+      "model": "BF16",
+      "name": "model.language_model.layers.10.mlp.gate.e_score_correction_bias"
+    },
+    {
+      "checkpoint": "F32",
+      "model": "BF16",
+      "name": "model.language_model.layers.10.mlp.gate.weight"
+    },
+    {
+      "checkpoint": "F32",
+      "model": "BF16",
+      "name": "model.language_model.layers.11.mlp.gate.e_score_correction_bias"
+    },
+    {
+      "checkpoint": "F32",
+      "model": "BF16",
+      "name": "model.language_model.layers.11.mlp.gate.weight"
+    },
+    {
+      "checkpoint": "F32",
+      "model": "BF16",
+      "name": "model.language_model.layers.12.mlp.gate.e_score_correction_bias"
+    },
+    {
+      "checkpoint": "F32",
+      "model": "BF16",
+      "name": "model.language_model.layers.12.mlp.gate.weight"
+    },
+    {
+      "checkpoint": "F32",
+      "model": "BF16",
+      "name": "model.language_model.layers.13.mlp.gate.e_score_correction_bias"
+    },
+    {
+      "checkpoint": "F32",
+      "model": "BF16",
+      "name": "model.language_model.layers.13.mlp.gate.weight"
+    },
+    {
+      "checkpoint": "F32",
+      "model": "BF16",
+      "name": "model.language_model.layers.14.mlp.gate.e_score_correction_bias"
+    },
+    {
+      "checkpoint": "F32",
+      "model": "BF16",
+      "name": "model.language_model.layers.14.mlp.gate.weight"
+    },
+    {
+      "checkpoint": "F32",
+      "model": "BF16",
+      "name": "model.language_model.layers.15.mlp.gate.e_score_correction_bias"
+    },
+    {
+      "checkpoint": "F32",
+      "model": "BF16",
+      "name": "model.language_model.layers.15.mlp.gate.weight"
+    },
+    {
+      "checkpoint": "F32",
+      "model": "BF16",
+      "name": "model.language_model.layers.16.mlp.gate.e_score_correction_bias"
+    },
+    {
+      "checkpoint": "F32",
+      "model": "BF16",
+      "name": "model.language_model.layers.16.mlp.gate.weight"
+    },
+    {
+      "checkpoint": "F32",
+      "model": "BF16",
+      "name": "model.language_model.layers.17.mlp.gate.e_score_correction_bias"
+    },
+    {
+      "checkpoint": "F32",
+      "model": "BF16",
+      "name": "model.language_model.layers.17.mlp.gate.weight"
+    },
+    {
+      "checkpoint": "F32",
+      "model": "BF16",
+      "name": "model.language_model.layers.18.mlp.gate.e_score_correction_bias"
+    },
+    {
+      "checkpoint": "F32",
+      "model": "BF16",
+      "name": "model.language_model.layers.18.mlp.gate.weight"
+    },
+    {
+      "checkpoint": "F32",
+      "model": "BF16",
+      "name": "model.language_model.layers.19.mlp.gate.e_score_correction_bias"
+    },
+    {
+      "checkpoint": "F32",
+      "model": "BF16",
+      "name": "model.language_model.layers.19.mlp.gate.weight"
+    }
+  ],
+  "full_checkpoint_load_executed": false,
+  "index_json": "/tmp/minimax_m3_model.safetensors.index.json",
+  "missing_metadata_key_count": 0,
+  "missing_metadata_keys_sample": [],
+  "missing_projector_keys": [],
+  "missing_state_key_count": 0,
+  "missing_state_keys_sample": [],
+  "model_parameter_keys": 1525,
+  "model_persistent_buffer_keys": 57,
+  "model_state_keys": 1582,
+  "public_safetensors_metadata_keys": 23416,
+  "public_weight_map_keys": 23416,
+  "safetensors_header_bytes_read": 3440088,
+  "safetensors_shards_read": 59,
+  "shape_mismatch_count": 0,
+  "shape_mismatches_sample": [],
+  "shard_metadata_verified": true,
+  "unexpected_index_key_count": 0,
+  "unexpected_index_keys_sample": [],
+  "unexpected_metadata_key_count": 0,
+  "unexpected_metadata_keys_sample": []
+}

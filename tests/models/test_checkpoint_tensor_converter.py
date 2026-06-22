@@ -30,6 +30,11 @@ from veomni.models.checkpoint_tensor_loading import (
     get_checkpoint_tensor_converter,
     maybe_convert_checkpoint_tensor,
 )
+from veomni.models.transformers.minimax_m3_vl.checkpoint_tensor_converter import (
+    MiniMaxM3VLCheckpointTensorConverter,
+    convert_minimax_m3_vl_fqn_to_index_mapping,
+    create_minimax_m3_vl_checkpoint_tensor_converter,
+)
 from veomni.models.transformers.qwen3_moe.checkpoint_tensor_converter import (
     Qwen3MoeCheckpointTensorConverter,
     create_qwen3_moe_checkpoint_tensor_converter,
@@ -111,6 +116,236 @@ class TestMaybeConvertCheckpointTensor:
         result = maybe_convert_checkpoint_tensor("handle_me.weight", t, converter)
         assert result is not None
         assert result.name == "HANDLE_ME.WEIGHT"
+
+
+class TestMiniMaxM3VLCheckpointTensorConverter:
+    def test_can_handle_public_checkpoint_prefixes(self):
+        converter = MiniMaxM3VLCheckpointTensorConverter(num_experts=2)
+
+        assert converter.can_handle("language_model.model.embed_tokens.weight")
+        assert converter.can_handle("vision_tower.vision_model.embeddings.patch_embedding.weight")
+        assert converter.can_handle("multi_modal_projector.linear_1.weight")
+        assert converter.can_handle("patch_merge_mlp.linear_1.weight")
+        assert not converter.can_handle("model.language_model.layers.0.mlp.gate_up_proj.weight")
+        assert not converter.can_handle("random.weight")
+
+    def test_plain_name_mapping(self):
+        converter = MiniMaxM3VLCheckpointTensorConverter(num_experts=2)
+        tensor = torch.randn(3, 4)
+
+        result = converter.convert("language_model.model.embed_tokens.weight", tensor)
+        assert result is not None
+        assert result.name == "model.language_model.embed_tokens.weight"
+        assert torch.equal(result.tensor, tensor)
+
+        result = converter.convert("vision_tower.vision_model.embeddings.patch_embedding.weight", tensor)
+        assert result is not None
+        assert result.name == "model.vision_tower.embeddings.proj.weight"
+
+        result = converter.convert("language_model.lm_head.weight", tensor)
+        assert result is not None
+        assert result.name == "lm_head.weight"
+
+        result = converter.convert("patch_merge_mlp.linear_1.weight", tensor)
+        assert result is not None
+        assert result.name == "model.multi_modal_projector.merge_linear_1.weight"
+
+    def test_dense_gate_up_merge(self):
+        converter = MiniMaxM3VLCheckpointTensorConverter(num_experts=2)
+        gate = torch.ones(3, 4)
+        up = torch.full((3, 4), 2.0)
+
+        assert converter.convert("language_model.model.layers.0.mlp.gate_proj.weight", gate) is None
+        result = converter.convert("language_model.model.layers.0.mlp.up_proj.weight", up)
+
+        assert result is not None
+        assert result.name == "model.language_model.layers.0.mlp.gate_up_proj.weight"
+        assert torch.equal(result.tensor, torch.cat([gate, up], dim=0))
+
+    def test_shared_expert_gate_up_merge_and_sparse_gate_mapping(self):
+        converter = MiniMaxM3VLCheckpointTensorConverter(num_experts=2)
+        gate = torch.ones(3, 4)
+        up = torch.full((3, 4), 2.0)
+        down = torch.full((4, 3), 3.0)
+        router = torch.full((2, 4), 4.0)
+
+        assert (
+            converter.convert("language_model.model.layers.1.block_sparse_moe.shared_experts.gate_proj.weight", gate)
+            is None
+        )
+        result = converter.convert("language_model.model.layers.1.block_sparse_moe.shared_experts.up_proj.weight", up)
+        assert result is not None
+        assert result.name == "model.language_model.layers.1.mlp.shared_experts.gate_up_proj.weight"
+        assert torch.equal(result.tensor, torch.cat([gate, up], dim=0))
+
+        result = converter.convert(
+            "language_model.model.layers.1.block_sparse_moe.shared_experts.down_proj.weight", down
+        )
+        assert result is not None
+        assert result.name == "model.language_model.layers.1.mlp.shared_experts.down_proj.weight"
+        assert torch.equal(result.tensor, down)
+
+        result = converter.convert("language_model.model.layers.1.block_sparse_moe.gate.weight", router)
+        assert result is not None
+        assert result.name == "model.language_model.layers.1.mlp.gate.weight"
+        assert torch.equal(result.tensor, router)
+
+    def test_sparse_attention_indexer_and_e_score_bias_mapping(self):
+        converter = MiniMaxM3VLCheckpointTensorConverter(num_experts=2)
+        tensor = torch.randn(3, 4)
+        bias = torch.randn(2)
+
+        result = converter.convert("language_model.model.layers.5.self_attn.index_q_proj.weight", tensor)
+        assert result is not None
+        assert result.name == "model.language_model.layers.5.self_attn.indexer.q_proj.weight"
+        assert torch.equal(result.tensor, tensor)
+
+        result = converter.convert("language_model.model.layers.5.self_attn.index_k_norm.weight", tensor)
+        assert result is not None
+        assert result.name == "model.language_model.layers.5.self_attn.indexer.k_norm.weight"
+        assert torch.equal(result.tensor, tensor)
+
+        result = converter.convert("language_model.model.layers.5.block_sparse_moe.e_score_correction_bias", bias)
+        assert result is not None
+        assert result.name == "model.language_model.layers.5.mlp.gate.e_score_correction_bias"
+        assert torch.equal(result.tensor, bias)
+
+    def test_sparse_expert_merge(self):
+        converter = MiniMaxM3VLCheckpointTensorConverter(num_experts=2)
+        assert (
+            converter.convert("language_model.model.layers.3.block_sparse_moe.experts.0.w1.weight", torch.ones(3, 4))
+            is None
+        )
+        assert (
+            converter.convert(
+                "language_model.model.layers.3.block_sparse_moe.experts.1.w1.weight", torch.ones(3, 4) * 2
+            )
+            is None
+        )
+        assert (
+            converter.convert(
+                "language_model.model.layers.3.block_sparse_moe.experts.0.w3.weight", torch.ones(3, 4) * 3
+            )
+            is None
+        )
+        result = converter.convert(
+            "language_model.model.layers.3.block_sparse_moe.experts.1.w3.weight", torch.ones(3, 4) * 4
+        )
+
+        assert result is not None
+        assert result.name == "model.language_model.layers.3.mlp.experts.gate_up_proj"
+        assert result.tensor.shape == (2, 6, 4)
+
+        assert (
+            converter.convert("language_model.model.layers.3.block_sparse_moe.experts.0.w2.weight", torch.ones(4, 3))
+            is None
+        )
+        result = converter.convert(
+            "language_model.model.layers.3.block_sparse_moe.experts.1.w2.weight", torch.ones(4, 3) * 2
+        )
+        assert result is not None
+        assert result.name == "model.language_model.layers.3.mlp.experts.down_proj"
+        assert result.tensor.shape == (2, 4, 3)
+
+    def test_finalize_raises_on_incomplete_public_checkpoint(self):
+        converter = MiniMaxM3VLCheckpointTensorConverter(num_experts=2)
+        assert converter.convert("language_model.model.layers.0.mlp.gate_proj.weight", torch.ones(3, 4)) is None
+        assert (
+            converter.convert("language_model.model.layers.0.block_sparse_moe.experts.0.w1.weight", torch.ones(3, 4))
+            is None
+        )
+
+        with pytest.raises(RuntimeError, match="incomplete checkpoint"):
+            converter.finalize()
+
+    def test_factory_accepts_nested_and_flat_text_config(self):
+        nested_model = SimpleNamespace(
+            config=SimpleNamespace(text_config=SimpleNamespace(num_local_experts=3)),
+        )
+        flat_model = SimpleNamespace(config=SimpleNamespace(num_local_experts=4))
+
+        nested = create_minimax_m3_vl_checkpoint_tensor_converter(nested_model)
+        flat = create_minimax_m3_vl_checkpoint_tensor_converter(flat_model)
+
+        assert nested.num_experts == 3
+        assert flat.num_experts == 4
+
+    def test_fqn_mapping(self):
+        mapping = {
+            "language_model.lm_head.weight": 1,
+            "language_model.model.layers.0.mlp.gate_proj.weight": 2,
+            "language_model.model.layers.0.mlp.up_proj.weight": 3,
+            "language_model.model.layers.0.mlp.down_proj.weight": 4,
+            "language_model.model.layers.0.block_sparse_moe.shared_experts.gate_proj.weight": 8,
+            "language_model.model.layers.0.block_sparse_moe.shared_experts.up_proj.weight": 9,
+            "language_model.model.layers.0.block_sparse_moe.shared_experts.down_proj.weight": 10,
+            "language_model.model.layers.0.block_sparse_moe.gate.weight": 11,
+            "language_model.model.layers.0.block_sparse_moe.e_score_correction_bias": 12,
+            "language_model.model.layers.0.self_attn.index_q_proj.weight": 13,
+            "language_model.model.layers.0.self_attn.index_k_proj.weight": 14,
+            "language_model.model.layers.0.self_attn.index_q_norm.weight": 15,
+            "language_model.model.layers.0.self_attn.index_k_norm.weight": 16,
+            "language_model.model.layers.3.block_sparse_moe.experts.0.w1.weight": 5,
+            "language_model.model.layers.3.block_sparse_moe.experts.0.w2.weight": 6,
+            "language_model.model.layers.3.block_sparse_moe.experts.0.w3.weight": 7,
+        }
+
+        converted = convert_minimax_m3_vl_fqn_to_index_mapping(mapping)
+
+        assert converted["lm_head.weight"] == 1
+        assert converted["model.language_model.layers.0.mlp.gate_up_proj.weight"] == 2
+        assert converted["model.language_model.layers.0.mlp.down_proj.weight"] == 4
+        assert converted["model.language_model.layers.0.mlp.shared_experts.gate_up_proj.weight"] == 8
+        assert converted["model.language_model.layers.0.mlp.shared_experts.down_proj.weight"] == 10
+        assert converted["model.language_model.layers.0.mlp.gate.weight"] == 11
+        assert converted["model.language_model.layers.0.mlp.gate.e_score_correction_bias"] == 12
+        assert converted["model.language_model.layers.0.self_attn.indexer.q_proj.weight"] == 13
+        assert converted["model.language_model.layers.0.self_attn.indexer.k_proj.weight"] == 14
+        assert converted["model.language_model.layers.0.self_attn.indexer.q_norm.weight"] == 15
+        assert converted["model.language_model.layers.0.self_attn.indexer.k_norm.weight"] == 16
+        assert converted["model.language_model.layers.3.mlp.experts.gate_up_proj"] == 5
+        assert converted["model.language_model.layers.3.mlp.experts.down_proj"] == 6
+
+    def test_public_projector_index_mapping_covers_merge_weights_from_patch_merge_mlp(self):
+        public_projector_mapping = {
+            "multi_modal_projector.linear_1.bias": 1,
+            "multi_modal_projector.linear_1.weight": 2,
+            "multi_modal_projector.linear_2.bias": 3,
+            "multi_modal_projector.linear_2.weight": 4,
+            "patch_merge_mlp.linear_1.bias": 5,
+            "patch_merge_mlp.linear_1.weight": 6,
+            "patch_merge_mlp.linear_2.bias": 7,
+            "patch_merge_mlp.linear_2.weight": 8,
+        }
+        generated_projector_keys = {
+            "model.multi_modal_projector.linear_1.bias",
+            "model.multi_modal_projector.linear_1.weight",
+            "model.multi_modal_projector.linear_2.bias",
+            "model.multi_modal_projector.linear_2.weight",
+            "model.multi_modal_projector.merge_linear_1.bias",
+            "model.multi_modal_projector.merge_linear_1.weight",
+            "model.multi_modal_projector.merge_linear_2.bias",
+            "model.multi_modal_projector.merge_linear_2.weight",
+        }
+
+        converted = convert_minimax_m3_vl_fqn_to_index_mapping(public_projector_mapping)
+        missing_projector_keys = sorted(generated_projector_keys - set(converted))
+
+        assert sorted(converted) == [
+            "model.multi_modal_projector.linear_1.bias",
+            "model.multi_modal_projector.linear_1.weight",
+            "model.multi_modal_projector.linear_2.bias",
+            "model.multi_modal_projector.linear_2.weight",
+            "model.multi_modal_projector.merge_linear_1.bias",
+            "model.multi_modal_projector.merge_linear_1.weight",
+            "model.multi_modal_projector.merge_linear_2.bias",
+            "model.multi_modal_projector.merge_linear_2.weight",
+        ]
+        assert missing_projector_keys == []
+        assert converted["model.multi_modal_projector.merge_linear_1.bias"] == 5
+        assert converted["model.multi_modal_projector.merge_linear_1.weight"] == 6
+        assert converted["model.multi_modal_projector.merge_linear_2.bias"] == 7
+        assert converted["model.multi_modal_projector.merge_linear_2.weight"] == 8
 
 
 # ---------------------------------------------------------------------------

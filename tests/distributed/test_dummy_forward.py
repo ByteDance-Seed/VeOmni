@@ -18,6 +18,7 @@ import torch.distributed as dist
 
 from veomni.arguments import MixedPrecisionConfig
 from veomni.utils.device import empty_cache
+from veomni.utils.import_utils import is_transformers_version_greater_or_equal_to
 
 
 _TEXT_SEQ_LEN = 64
@@ -216,6 +217,18 @@ _vlm_cases = [
         "./tests/toy_config/qwen3vlmoe_toy",
         partial(_vlm_batch, patch_size=16),
         id="qwen3_vl_moe",
+    ),
+    pytest.param(
+        "minimax_m3_vl",
+        "./tests/toy_config/minimax_m3_vl_toy",
+        partial(_vlm_batch, patch_size=14),
+        marks=[
+            pytest.mark.skipif(
+                not is_transformers_version_greater_or_equal_to("5.12.0"),
+                reason="MiniMax M3 VL modeling is generated from transformers>=5.12.0",
+            ),
+        ],
+        id="minimax_m3_vl",
     ),
 ]
 

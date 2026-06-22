@@ -1,0 +1,25 @@
+{
+  "date": "2026-06-18",
+  "transformers_version": "5.12.0",
+  "model_class": "veomni.models.transformers.minimax_m3_vl.generated.patched_modeling_minimax_m3_vl_gpu.MiniMaxM3SparseForConditionalGeneration",
+  "config_path": "./tests/toy_config/minimax_m3_vl_toy/config.json",
+  "dataset_path": "./tests/fixtures/minimax_m3_vl_sft/tiny_sft.jsonl",
+  "steps": 8,
+  "batch_size": 2,
+  "lr": 0.005,
+  "seed": 20260618,
+  "actual_weights_loaded": false,
+  "losses": [
+    5.57344913482666,
+    5.1658034324646,
+    4.941288948059082,
+    4.761152744293213,
+    4.579178810119629,
+    4.394667625427246,
+    4.216017246246338,
+    4.035123348236084
+  ],
+  "first_loss": 5.57344913482666,
+  "last_loss": 4.035123348236084,
+  "min_loss": 4.035123348236084
+}

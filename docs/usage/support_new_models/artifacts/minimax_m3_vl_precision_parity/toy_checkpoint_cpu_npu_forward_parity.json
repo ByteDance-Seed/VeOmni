@@ -1,0 +1,1460 @@
+{
+  "allow_incomplete_groups": false,
+  "candidate_device": "npu:0",
+  "checkpoint_dir": "/tmp/minimax_m3_vl_toy_full_checkpoint",
+  "config_path": "/tmp/minimax_m3_vl_toy_full_checkpoint",
+  "date": "2026-06-22T14:18:16Z",
+  "device": "npu:0",
+  "fail_on_dtype_mismatch": false,
+  "failed": [],
+  "forward": {
+    "candidate_device": "npu:0",
+    "checks": [
+      {
+        "equal": true,
+        "hf": [
+          [
+            11,
+            250,
+            23,
+            251,
+            37,
+            41,
+            43,
+            47,
+            53,
+            59
+          ]
+        ],
+        "kind": "exact",
+        "name": "input.input_ids",
+        "veomni": [
+          [
+            11,
+            250,
+            23,
+            251,
+            37,
+            41,
+            43,
+            47,
+            53,
+            59
+          ]
+        ]
+      },
+      {
+        "equal": true,
+        "hf": [
+          [
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1
+          ]
+        ],
+        "kind": "exact",
+        "name": "input.attention_mask",
+        "veomni": [
+          [
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1
+          ]
+        ]
+      },
+      {
+        "equal": true,
+        "hf": [
+          [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9
+          ]
+        ],
+        "kind": "exact",
+        "name": "input.position_ids",
+        "veomni": [
+          [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9
+          ]
+        ]
+      },
+      {
+        "equal": true,
+        "hf": [
+          [
+            1,
+            2,
+            2
+          ]
+        ],
+        "kind": "exact",
+        "name": "input.image_grid_thw",
+        "veomni": [
+          [
+            1,
+            2,
+            2
+          ]
+        ]
+      },
+      {
+        "equal": true,
+        "hf": [
+          [
+            1,
+            2,
+            2
+          ]
+        ],
+        "kind": "exact",
+        "name": "input.video_grid_thw",
+        "veomni": [
+          [
+            1,
+            2,
+            2
+          ]
+        ]
+      },
+      {
+        "allclose": true,
+        "atol": 0.0,
+        "kind": "tensor",
+        "max_abs": 0.0,
+        "max_rel": 0.0,
+        "name": "input.pixel_values",
+        "rtol": 0.0,
+        "shape": [
+          4,
+          1176
+        ]
+      },
+      {
+        "allclose": true,
+        "atol": 0.0,
+        "kind": "tensor",
+        "max_abs": 0.0,
+        "max_rel": 0.0,
+        "name": "input.pixel_values_videos",
+        "rtol": 0.0,
+        "shape": [
+          4,
+          1176
+        ]
+      },
+      {
+        "allclose": true,
+        "atol": 0.0005,
+        "kind": "tensor",
+        "max_abs": 2.4899840354919434e-05,
+        "max_rel": 0.034908466041088104,
+        "name": "forward.logits",
+        "rtol": 0.0005,
+        "shape": [
+          1,
+          10,
+          256
+        ]
+      },
+      {
+        "allclose": true,
+        "atol": 0.0005,
+        "kind": "tensor",
+        "max_abs": 2.3790562408976257e-08,
+        "max_rel": 0.0067812115885317326,
+        "name": "forward.image_hidden_states",
+        "rtol": 0.0005,
+        "shape": [
+          1,
+          32
+        ]
+      },
+      {
+        "allclose": true,
+        "atol": 0.0005,
+        "kind": "tensor",
+        "max_abs": 2.0860170479863882e-08,
+        "max_rel": 0.009615296497941017,
+        "name": "forward.video_hidden_states",
+        "rtol": 0.0005,
+        "shape": [
+          1,
+          32
+        ]
+      },
+      {
+        "equal": true,
+        "hf": [
+          [
+            129,
+            198,
+            244,
+            70
+          ]
+        ],
+        "kind": "exact",
+        "name": "forward.last_token_topk_ids",
+        "veomni": [
+          [
+            129,
+            198,
+            244,
+            70
+          ]
+        ]
+      },
+      {
+        "equal": true,
+        "hf": [
+          129,
+          119
+        ],
+        "kind": "exact",
+        "name": "generate.greedy_ids",
+        "veomni": [
+          129,
+          119
+        ]
+      }
+    ],
+    "device": "npu:0",
+    "failed": [],
+    "hf_model_class": "transformers.models.minimax_m3_vl.modeling_minimax_m3_vl.MiniMaxM3SparseForConditionalGeneration",
+    "input_contract": {
+      "candidate": {
+        "attention_mask": [
+          [
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1
+          ]
+        ],
+        "image_grid_thw": [
+          [
+            1,
+            2,
+            2
+          ]
+        ],
+        "input_ids": [
+          [
+            11,
+            250,
+            23,
+            251,
+            37,
+            41,
+            43,
+            47,
+            53,
+            59
+          ]
+        ],
+        "pixel_values_shape": [
+          4,
+          1176
+        ],
+        "pixel_values_videos_shape": [
+          4,
+          1176
+        ],
+        "position_ids": [
+          [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9
+          ]
+        ],
+        "video_grid_thw": [
+          [
+            1,
+            2,
+            2
+          ]
+        ]
+      },
+      "reference": {
+        "attention_mask": [
+          [
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1
+          ]
+        ],
+        "image_grid_thw": [
+          [
+            1,
+            2,
+            2
+          ]
+        ],
+        "input_ids": [
+          [
+            11,
+            250,
+            23,
+            251,
+            37,
+            41,
+            43,
+            47,
+            53,
+            59
+          ]
+        ],
+        "pixel_values_shape": [
+          4,
+          1176
+        ],
+        "pixel_values_videos_shape": [
+          4,
+          1176
+        ],
+        "position_ids": [
+          [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9
+          ]
+        ],
+        "video_grid_thw": [
+          [
+            1,
+            2,
+            2
+          ]
+        ]
+      }
+    },
+    "max_new_tokens": 2,
+    "num_checks": 12,
+    "passed": true,
+    "prompt_ids": [
+      11,
+      250,
+      23,
+      251,
+      37,
+      41,
+      43,
+      47,
+      53,
+      59
+    ],
+    "prompt_kind": "multimodal",
+    "reference_device": "cpu",
+    "seed": 20260622,
+    "state_dict_load": {
+      "missing_key_count": 0,
+      "missing_keys": [],
+      "streaming": true,
+      "strict": true,
+      "unexpected_key_count": 0,
+      "unexpected_keys": []
+    },
+    "tolerances": {
+      "forward": {
+        "atol": 0.0005,
+        "rtol": 0.0005
+      },
+      "input": {
+        "atol": 0.0,
+        "rtol": 0.0
+      }
+    },
+    "top_k": 4,
+    "veomni_model_class": "veomni.models.transformers.minimax_m3_vl.generated.patched_modeling_minimax_m3_vl_npu.MiniMaxM3SparseForConditionalGeneration"
+  },
+  "full_checkpoint_load_executed": true,
+  "include_key_regex": [],
+  "index_json": "/tmp/minimax_m3_vl_toy_full_checkpoint/model.safetensors.index.json",
+  "metadata_comparison": {
+    "dtype_mismatch_count": 0,
+    "dtype_mismatch_groups": {},
+    "dtype_mismatches_sample": [],
+    "missing_model_key_count": 0,
+    "missing_model_keys_sample": [],
+    "missing_state_key_count": 0,
+    "missing_state_keys_sample": [],
+    "shape_mismatch_count": 0,
+    "shape_mismatches_sample": []
+  },
+  "mode": "forward",
+  "num_checks": 12,
+  "passed": true,
+  "payload": {
+    "converted_tensor_keys": 58,
+    "converter_finalize_error": null,
+    "duplicate_converted_keys": [],
+    "payload_bytes_read": 256144,
+    "public_keys_read": 58,
+    "selected_public_keys": 58,
+    "shard_sources": {
+      "model.safetensors": "/tmp/minimax_m3_vl_toy_full_checkpoint/model.safetensors"
+    },
+    "streaming_model_load": true,
+    "tensor_report_total": 58
+  },
+  "reference_device": "cpu",
+  "runtime": {
+    "ascend_env": {
+      "ASCEND_HOME_PATH": "/usr/local/Ascend/cann-9.0.0",
+      "ASCEND_RT_VISIBLE_DEVICES": "0",
+      "ASCEND_TOOLKIT_HOME": "/usr/local/Ascend/cann-9.0.0",
+      "ASCEND_VISIBLE_DEVICES": null,
+      "MODELING_BACKEND": "veomni"
+    },
+    "machine": "aarch64",
+    "platform": "Linux-5.15.0-94-generic-aarch64-with-glibc2.35",
+    "python": "3.11.15 (main, May 13 2026, 07:56:17) [GCC 11.4.0]",
+    "python_executable": "/usr/local/python3.11.15/bin/python3",
+    "torch_npu_available": true,
+    "torch_npu_device_count": 1,
+    "torch_npu_error": null,
+    "torch_npu_version": "2.10.0",
+    "torch_version": "2.10.0+cpu",
+    "transformers_version": "5.12.0"
+  },
+  "sampled_state_load": null,
+  "selected_shard_count": 1,
+  "selected_shards": [
+    "model.safetensors"
+  ],
+  "shard_base_url": null,
+  "tensor_report_truncated": false,
+  "tensor_reports": [
+    {
+      "converted_name": "lm_head.weight",
+      "fingerprint": {
+        "dtype": "float32",
+        "max_abs": 0.08704764395952225,
+        "mean": 0.00010009111429098994,
+        "numel": 8192,
+        "shape": [
+          256,
+          32
+        ],
+        "std": 0.020056061446666718
+      },
+      "public_name": "lm_head.weight",
+      "source": "/tmp/minimax_m3_vl_toy_full_checkpoint/model.safetensors",
+      "source_shard": "model.safetensors"
+    },
+    {
+      "converted_name": "model.language_model.embed_tokens.weight",
+      "fingerprint": {
+        "dtype": "float32",
+        "max_abs": 0.072722427546978,
+        "mean": -0.00015473467647098005,
+        "numel": 8192,
+        "shape": [
+          256,
+          32
+        ],
+        "std": 0.02011755481362343
+      },
+      "public_name": "model.language_model.embed_tokens.weight",
+      "source": "/tmp/minimax_m3_vl_toy_full_checkpoint/model.safetensors",
+      "source_shard": "model.safetensors"
+    },
+    {
+      "converted_name": "model.language_model.layers.0.input_layernorm.weight",
+      "fingerprint": {
+        "dtype": "float32",
+        "max_abs": 0.0,
+        "mean": 0.0,
+        "numel": 32,
+        "shape": [
+          32
+        ],
+        "std": 0.0
+      },
+      "public_name": "model.language_model.layers.0.input_layernorm.weight",
+      "source": "/tmp/minimax_m3_vl_toy_full_checkpoint/model.safetensors",
+      "source_shard": "model.safetensors"
+    },
+    {
+      "converted_name": "model.language_model.layers.0.mlp.experts.down_proj",
+      "fingerprint": {
+        "dtype": "float32",
+        "max_abs": 0.06252893060445786,
+        "mean": -9.256228804588318e-05,
+        "numel": 2048,
+        "shape": [
+          4,
+          32,
+          16
+        ],
+        "std": 0.02032751962542534
+      },
+      "public_name": "model.language_model.layers.0.mlp.experts.down_proj",
+      "source": "/tmp/minimax_m3_vl_toy_full_checkpoint/model.safetensors",
+      "source_shard": "model.safetensors"
+    },
+    {
+      "converted_name": "model.language_model.layers.0.mlp.experts.gate_up_proj",
+      "fingerprint": {
+        "dtype": "float32",
+        "max_abs": 0.07091536372900009,
+        "mean": 0.00022473304125014693,
+        "numel": 4096,
+        "shape": [
+          4,
+          32,
+          32
+        ],
+        "std": 0.020232638344168663
+      },
+      "public_name": "model.language_model.layers.0.mlp.experts.gate_up_proj",
+      "source": "/tmp/minimax_m3_vl_toy_full_checkpoint/model.safetensors",
+      "source_shard": "model.safetensors"
+    },
+    {
+      "converted_name": "model.language_model.layers.0.mlp.gate.e_score_correction_bias",
+      "fingerprint": {
+        "dtype": "float32",
+        "max_abs": 0.0,
+        "mean": 0.0,
+        "numel": 4,
+        "shape": [
+          4
+        ],
+        "std": 0.0
+      },
+      "public_name": "model.language_model.layers.0.mlp.gate.e_score_correction_bias",
+      "source": "/tmp/minimax_m3_vl_toy_full_checkpoint/model.safetensors",
+      "source_shard": "model.safetensors"
+    },
+    {
+      "converted_name": "model.language_model.layers.0.mlp.gate.weight",
+      "fingerprint": {
+        "dtype": "float32",
+        "max_abs": 0.049592554569244385,
+        "mean": 0.002403219696134329,
+        "numel": 128,
+        "shape": [
+          4,
+          32
+        ],
+        "std": 0.02044656313955784
+      },
+      "public_name": "model.language_model.layers.0.mlp.gate.weight",
+      "source": "/tmp/minimax_m3_vl_toy_full_checkpoint/model.safetensors",
+      "source_shard": "model.safetensors"
+    },
+    {
+      "converted_name": "model.language_model.layers.0.mlp.shared_experts.down_proj.weight",
+      "fingerprint": {
+        "dtype": "float32",
+        "max_abs": 0.05879344418644905,
+        "mean": -0.000261136912740767,
+        "numel": 512,
+        "shape": [
+          32,
+          16
+        ],
+        "std": 0.019468793645501137
+      },
+      "public_name": "model.language_model.layers.0.mlp.shared_experts.down_proj.weight",
+      "source": "/tmp/minimax_m3_vl_toy_full_checkpoint/model.safetensors",
+      "source_shard": "model.safetensors"
+    },
+    {
+      "converted_name": "model.language_model.layers.0.mlp.shared_experts.gate_up_proj.weight",
+      "fingerprint": {
+        "dtype": "float32",
+        "max_abs": 0.06012187525629997,
+        "mean": 0.0001566717546666041,
+        "numel": 1024,
+        "shape": [
+          32,
+          32
+        ],
+        "std": 0.019805653020739555
+      },
+      "public_name": "model.language_model.layers.0.mlp.shared_experts.gate_up_proj.weight",
+      "source": "/tmp/minimax_m3_vl_toy_full_checkpoint/model.safetensors",
+      "source_shard": "model.safetensors"
+    },
+    {
+      "converted_name": "model.language_model.layers.0.post_attention_layernorm.weight",
+      "fingerprint": {
+        "dtype": "float32",
+        "max_abs": 0.0,
+        "mean": 0.0,
+        "numel": 32,
+        "shape": [
+          32
+        ],
+        "std": 0.0
+      },
+      "public_name": "model.language_model.layers.0.post_attention_layernorm.weight",
+      "source": "/tmp/minimax_m3_vl_toy_full_checkpoint/model.safetensors",
+      "source_shard": "model.safetensors"
+    },
+    {
+      "converted_name": "model.language_model.layers.0.self_attn.indexer.k_norm.weight",
+      "fingerprint": {
+        "dtype": "float32",
+        "max_abs": 0.0,
+        "mean": 0.0,
+        "numel": 8,
+        "shape": [
+          8
+        ],
+        "std": 0.0
+      },
+      "public_name": "model.language_model.layers.0.self_attn.indexer.k_norm.weight",
+      "source": "/tmp/minimax_m3_vl_toy_full_checkpoint/model.safetensors",
+      "source_shard": "model.safetensors"
+    },
+    {
+      "converted_name": "model.language_model.layers.0.self_attn.indexer.k_proj.weight",
+      "fingerprint": {
+        "dtype": "float32",
+        "max_abs": 0.059951841831207275,
+        "mean": -0.000477433466585353,
+        "numel": 256,
+        "shape": [
+          8,
+          32
+        ],
+        "std": 0.019694965332746506
+      },
+      "public_name": "model.language_model.layers.0.self_attn.indexer.k_proj.weight",
+      "source": "/tmp/minimax_m3_vl_toy_full_checkpoint/model.safetensors",
+      "source_shard": "model.safetensors"
+    },
+    {
+      "converted_name": "model.language_model.layers.0.self_attn.indexer.q_norm.weight",
+      "fingerprint": {
+        "dtype": "float32",
+        "max_abs": 0.0,
+        "mean": 0.0,
+        "numel": 8,
+        "shape": [
+          8
+        ],
+        "std": 0.0
+      },
+      "public_name": "model.language_model.layers.0.self_attn.indexer.q_norm.weight",
+      "source": "/tmp/minimax_m3_vl_toy_full_checkpoint/model.safetensors",
+      "source_shard": "model.safetensors"
+    },
+    {
+      "converted_name": "model.language_model.layers.0.self_attn.indexer.q_proj.weight",
+      "fingerprint": {
+        "dtype": "float32",
+        "max_abs": 0.05280669033527374,
+        "mean": 0.0005174565012566745,
+        "numel": 256,
+        "shape": [
+          8,
+          32
+        ],
+        "std": 0.01897459849715233
+      },
+      "public_name": "model.language_model.layers.0.self_attn.indexer.q_proj.weight",
+      "source": "/tmp/minimax_m3_vl_toy_full_checkpoint/model.safetensors",
+      "source_shard": "model.safetensors"
+    },
+    {
+      "converted_name": "model.language_model.layers.0.self_attn.k_norm.weight",
+      "fingerprint": {
+        "dtype": "float32",
+        "max_abs": 0.0,
+        "mean": 0.0,
+        "numel": 8,
+        "shape": [
+          8
+        ],
+        "std": 0.0
+      },
+      "public_name": "model.language_model.layers.0.self_attn.k_norm.weight",
+      "source": "/tmp/minimax_m3_vl_toy_full_checkpoint/model.safetensors",
+      "source_shard": "model.safetensors"
+    },
+    {
+      "converted_name": "model.language_model.layers.0.self_attn.k_proj.weight",
+      "fingerprint": {
+        "dtype": "float32",
+        "max_abs": 0.05323415622115135,
+        "mean": -0.00016809292719699442,
+        "numel": 256,
+        "shape": [
+          8,
+          32
+        ],
+        "std": 0.01965491473674774
+      },
+      "public_name": "model.language_model.layers.0.self_attn.k_proj.weight",
+      "source": "/tmp/minimax_m3_vl_toy_full_checkpoint/model.safetensors",
+      "source_shard": "model.safetensors"
+    },
+    {
+      "converted_name": "model.language_model.layers.0.self_attn.o_proj.weight",
+      "fingerprint": {
+        "dtype": "float32",
+        "max_abs": 0.06850307434797287,
+        "mean": 9.212105942424387e-05,
+        "numel": 1024,
+        "shape": [
+          32,
+          32
+        ],
+        "std": 0.019423384219408035
+      },
+      "public_name": "model.language_model.layers.0.self_attn.o_proj.weight",
+      "source": "/tmp/minimax_m3_vl_toy_full_checkpoint/model.safetensors",
+      "source_shard": "model.safetensors"
+    },
+    {
+      "converted_name": "model.language_model.layers.0.self_attn.q_norm.weight",
+      "fingerprint": {
+        "dtype": "float32",
+        "max_abs": 0.0,
+        "mean": 0.0,
+        "numel": 8,
+        "shape": [
+          8
+        ],
+        "std": 0.0
+      },
+      "public_name": "model.language_model.layers.0.self_attn.q_norm.weight",
+      "source": "/tmp/minimax_m3_vl_toy_full_checkpoint/model.safetensors",
+      "source_shard": "model.safetensors"
+    },
+    {
+      "converted_name": "model.language_model.layers.0.self_attn.q_proj.weight",
+      "fingerprint": {
+        "dtype": "float32",
+        "max_abs": 0.07135143131017685,
+        "mean": -0.0008459468372166157,
+        "numel": 1024,
+        "shape": [
+          32,
+          32
+        ],
+        "std": 0.02002904936671257
+      },
+      "public_name": "model.language_model.layers.0.self_attn.q_proj.weight",
+      "source": "/tmp/minimax_m3_vl_toy_full_checkpoint/model.safetensors",
+      "source_shard": "model.safetensors"
+    },
+    {
+      "converted_name": "model.language_model.layers.0.self_attn.v_proj.weight",
+      "fingerprint": {
+        "dtype": "float32",
+        "max_abs": 0.055730003863573074,
+        "mean": 0.0008118939003907144,
+        "numel": 256,
+        "shape": [
+          8,
+          32
+        ],
+        "std": 0.02011159248650074
+      },
+      "public_name": "model.language_model.layers.0.self_attn.v_proj.weight",
+      "source": "/tmp/minimax_m3_vl_toy_full_checkpoint/model.safetensors",
+      "source_shard": "model.safetensors"
+    },
+    {
+      "converted_name": "model.language_model.layers.1.input_layernorm.weight",
+      "fingerprint": {
+        "dtype": "float32",
+        "max_abs": 0.0,
+        "mean": 0.0,
+        "numel": 32,
+        "shape": [
+          32
+        ],
+        "std": 0.0
+      },
+      "public_name": "model.language_model.layers.1.input_layernorm.weight",
+      "source": "/tmp/minimax_m3_vl_toy_full_checkpoint/model.safetensors",
+      "source_shard": "model.safetensors"
+    },
+    {
+      "converted_name": "model.language_model.layers.1.mlp.down_proj.weight",
+      "fingerprint": {
+        "dtype": "float32",
+        "max_abs": 0.0744703933596611,
+        "mean": 0.00039668698445893824,
+        "numel": 2048,
+        "shape": [
+          32,
+          64
+        ],
+        "std": 0.0202261321246624
+      },
+      "public_name": "model.language_model.layers.1.mlp.down_proj.weight",
+      "source": "/tmp/minimax_m3_vl_toy_full_checkpoint/model.safetensors",
+      "source_shard": "model.safetensors"
+    },
+    {
+      "converted_name": "model.language_model.layers.1.mlp.gate_up_proj.weight",
+      "fingerprint": {
+        "dtype": "float32",
+        "max_abs": 0.06973396241664886,
+        "mean": 0.0005473223282024264,
+        "numel": 4096,
+        "shape": [
+          128,
+          32
+        ],
+        "std": 0.020160727202892303
+      },
+      "public_name": "model.language_model.layers.1.mlp.gate_up_proj.weight",
+      "source": "/tmp/minimax_m3_vl_toy_full_checkpoint/model.safetensors",
+      "source_shard": "model.safetensors"
+    },
+    {
+      "converted_name": "model.language_model.layers.1.post_attention_layernorm.weight",
+      "fingerprint": {
+        "dtype": "float32",
+        "max_abs": 0.0,
+        "mean": 0.0,
+        "numel": 32,
+        "shape": [
+          32
+        ],
+        "std": 0.0
+      },
+      "public_name": "model.language_model.layers.1.post_attention_layernorm.weight",
+      "source": "/tmp/minimax_m3_vl_toy_full_checkpoint/model.safetensors",
+      "source_shard": "model.safetensors"
+    },
+    {
+      "converted_name": "model.language_model.layers.1.self_attn.k_norm.weight",
+      "fingerprint": {
+        "dtype": "float32",
+        "max_abs": 0.0,
+        "mean": 0.0,
+        "numel": 8,
+        "shape": [
+          8
+        ],
+        "std": 0.0
+      },
+      "public_name": "model.language_model.layers.1.self_attn.k_norm.weight",
+      "source": "/tmp/minimax_m3_vl_toy_full_checkpoint/model.safetensors",
+      "source_shard": "model.safetensors"
+    },
+    {
+      "converted_name": "model.language_model.layers.1.self_attn.k_proj.weight",
+      "fingerprint": {
+        "dtype": "float32",
+        "max_abs": 0.06511133164167404,
+        "mean": -0.0005683390772901475,
+        "numel": 256,
+        "shape": [
+          8,
+          32
+        ],
+        "std": 0.02074679732322693
+      },
+      "public_name": "model.language_model.layers.1.self_attn.k_proj.weight",
+      "source": "/tmp/minimax_m3_vl_toy_full_checkpoint/model.safetensors",
+      "source_shard": "model.safetensors"
+    },
+    {
+      "converted_name": "model.language_model.layers.1.self_attn.o_proj.weight",
+      "fingerprint": {
+        "dtype": "float32",
+        "max_abs": 0.07556119561195374,
+        "mean": -0.0005982632283121347,
+        "numel": 1024,
+        "shape": [
+          32,
+          32
+        ],
+        "std": 0.019574854522943497
+      },
+      "public_name": "model.language_model.layers.1.self_attn.o_proj.weight",
+      "source": "/tmp/minimax_m3_vl_toy_full_checkpoint/model.safetensors",
+      "source_shard": "model.safetensors"
+    },
+    {
+      "converted_name": "model.language_model.layers.1.self_attn.q_norm.weight",
+      "fingerprint": {
+        "dtype": "float32",
+        "max_abs": 0.0,
+        "mean": 0.0,
+        "numel": 8,
+        "shape": [
+          8
+        ],
+        "std": 0.0
+      },
+      "public_name": "model.language_model.layers.1.self_attn.q_norm.weight",
+      "source": "/tmp/minimax_m3_vl_toy_full_checkpoint/model.safetensors",
+      "source_shard": "model.safetensors"
+    },
+    {
+      "converted_name": "model.language_model.layers.1.self_attn.q_proj.weight",
+      "fingerprint": {
+        "dtype": "float32",
+        "max_abs": 0.07174250483512878,
+        "mean": 0.0005434402264654636,
+        "numel": 1024,
+        "shape": [
+          32,
+          32
+        ],
+        "std": 0.019582632929086685
+      },
+      "public_name": "model.language_model.layers.1.self_attn.q_proj.weight",
+      "source": "/tmp/minimax_m3_vl_toy_full_checkpoint/model.safetensors",
+      "source_shard": "model.safetensors"
+    },
+    {
+      "converted_name": "model.language_model.layers.1.self_attn.v_proj.weight",
+      "fingerprint": {
+        "dtype": "float32",
+        "max_abs": 0.08606968075037003,
+        "mean": 0.0005824582185596228,
+        "numel": 256,
+        "shape": [
+          8,
+          32
+        ],
+        "std": 0.01970270462334156
+      },
+      "public_name": "model.language_model.layers.1.self_attn.v_proj.weight",
+      "source": "/tmp/minimax_m3_vl_toy_full_checkpoint/model.safetensors",
+      "source_shard": "model.safetensors"
+    },
+    {
+      "converted_name": "model.language_model.norm.weight",
+      "fingerprint": {
+        "dtype": "float32",
+        "max_abs": 0.0,
+        "mean": 0.0,
+        "numel": 32,
+        "shape": [
+          32
+        ],
+        "std": 0.0
+      },
+      "public_name": "model.language_model.norm.weight",
+      "source": "/tmp/minimax_m3_vl_toy_full_checkpoint/model.safetensors",
+      "source_shard": "model.safetensors"
+    },
+    {
+      "converted_name": "model.multi_modal_projector.linear_1.bias",
+      "fingerprint": {
+        "dtype": "float32",
+        "max_abs": 0.0,
+        "mean": 0.0,
+        "numel": 32,
+        "shape": [
+          32
+        ],
+        "std": 0.0
+      },
+      "public_name": "model.multi_modal_projector.linear_1.bias",
+      "source": "/tmp/minimax_m3_vl_toy_full_checkpoint/model.safetensors",
+      "source_shard": "model.safetensors"
+    },
+    {
+      "converted_name": "model.multi_modal_projector.linear_1.weight",
+      "fingerprint": {
+        "dtype": "float32",
+        "max_abs": 0.06091693788766861,
+        "mean": -0.0011714320862665772,
+        "numel": 512,
+        "shape": [
+          32,
+          16
+        ],
+        "std": 0.01936146430671215
+      },
+      "public_name": "model.multi_modal_projector.linear_1.weight",
+      "source": "/tmp/minimax_m3_vl_toy_full_checkpoint/model.safetensors",
+      "source_shard": "model.safetensors"
+    },
+    {
+      "converted_name": "model.multi_modal_projector.linear_2.bias",
+      "fingerprint": {
+        "dtype": "float32",
+        "max_abs": 0.0,
+        "mean": 0.0,
+        "numel": 32,
+        "shape": [
+          32
+        ],
+        "std": 0.0
+      },
+      "public_name": "model.multi_modal_projector.linear_2.bias",
+      "source": "/tmp/minimax_m3_vl_toy_full_checkpoint/model.safetensors",
+      "source_shard": "model.safetensors"
+    },
+    {
+      "converted_name": "model.multi_modal_projector.linear_2.weight",
+      "fingerprint": {
+        "dtype": "float32",
+        "max_abs": 0.06333119422197342,
+        "mean": 0.0008023648406378925,
+        "numel": 1024,
+        "shape": [
+          32,
+          32
+        ],
+        "std": 0.01892264001071453
+      },
+      "public_name": "model.multi_modal_projector.linear_2.weight",
+      "source": "/tmp/minimax_m3_vl_toy_full_checkpoint/model.safetensors",
+      "source_shard": "model.safetensors"
+    },
+    {
+      "converted_name": "model.multi_modal_projector.merge_linear_1.bias",
+      "fingerprint": {
+        "dtype": "float32",
+        "max_abs": 0.0,
+        "mean": 0.0,
+        "numel": 32,
+        "shape": [
+          32
+        ],
+        "std": 0.0
+      },
+      "public_name": "model.multi_modal_projector.merge_linear_1.bias",
+      "source": "/tmp/minimax_m3_vl_toy_full_checkpoint/model.safetensors",
+      "source_shard": "model.safetensors"
+    },
+    {
+      "converted_name": "model.multi_modal_projector.merge_linear_1.weight",
+      "fingerprint": {
+        "dtype": "float32",
+        "max_abs": 0.07667655497789383,
+        "mean": -0.00017070883768610656,
+        "numel": 4096,
+        "shape": [
+          32,
+          128
+        ],
+        "std": 0.020116856321692467
+      },
+      "public_name": "model.multi_modal_projector.merge_linear_1.weight",
+      "source": "/tmp/minimax_m3_vl_toy_full_checkpoint/model.safetensors",
+      "source_shard": "model.safetensors"
+    },
+    {
+      "converted_name": "model.multi_modal_projector.merge_linear_2.bias",
+      "fingerprint": {
+        "dtype": "float32",
+        "max_abs": 0.0,
+        "mean": 0.0,
+        "numel": 32,
+        "shape": [
+          32
+        ],
+        "std": 0.0
+      },
+      "public_name": "model.multi_modal_projector.merge_linear_2.bias",
+      "source": "/tmp/minimax_m3_vl_toy_full_checkpoint/model.safetensors",
+      "source_shard": "model.safetensors"
+    },
+    {
+      "converted_name": "model.multi_modal_projector.merge_linear_2.weight",
+      "fingerprint": {
+        "dtype": "float32",
+        "max_abs": 0.07092572003602982,
+        "mean": 6.859040877316147e-05,
+        "numel": 1024,
+        "shape": [
+          32,
+          32
+        ],
+        "std": 0.020508699119091034
+      },
+      "public_name": "model.multi_modal_projector.merge_linear_2.weight",
+      "source": "/tmp/minimax_m3_vl_toy_full_checkpoint/model.safetensors",
+      "source_shard": "model.safetensors"
+    },
+    {
+      "converted_name": "model.vision_tower.embeddings.proj.weight",
+      "fingerprint": {
+        "dtype": "float32",
+        "max_abs": 0.07899020612239838,
+        "mean": 0.00013647688319906592,
+        "numel": 18816,
+        "shape": [
+          16,
+          3,
+          2,
+          14,
+          14
+        ],
+        "std": 0.020034823566675186
+      },
+      "public_name": "model.vision_tower.embeddings.proj.weight",
+      "source": "/tmp/minimax_m3_vl_toy_full_checkpoint/model.safetensors",
+      "source_shard": "model.safetensors"
+    },
+    {
+      "converted_name": "model.vision_tower.layers.0.layer_norm1.bias",
+      "fingerprint": {
+        "dtype": "float32",
+        "max_abs": 0.0,
+        "mean": 0.0,
+        "numel": 16,
+        "shape": [
+          16
+        ],
+        "std": 0.0
+      },
+      "public_name": "model.vision_tower.layers.0.layer_norm1.bias",
+      "source": "/tmp/minimax_m3_vl_toy_full_checkpoint/model.safetensors",
+      "source_shard": "model.safetensors"
+    },
+    {
+      "converted_name": "model.vision_tower.layers.0.layer_norm1.weight",
+      "fingerprint": {
+        "dtype": "float32",
+        "max_abs": 1.0,
+        "mean": 1.0,
+        "numel": 16,
+        "shape": [
+          16
+        ],
+        "std": 0.0
+      },
+      "public_name": "model.vision_tower.layers.0.layer_norm1.weight",
+      "source": "/tmp/minimax_m3_vl_toy_full_checkpoint/model.safetensors",
+      "source_shard": "model.safetensors"
+    },
+    {
+      "converted_name": "model.vision_tower.layers.0.layer_norm2.bias",
+      "fingerprint": {
+        "dtype": "float32",
+        "max_abs": 0.0,
+        "mean": 0.0,
+        "numel": 16,
+        "shape": [
+          16
+        ],
+        "std": 0.0
+      },
+      "public_name": "model.vision_tower.layers.0.layer_norm2.bias",
+      "source": "/tmp/minimax_m3_vl_toy_full_checkpoint/model.safetensors",
+      "source_shard": "model.safetensors"
+    },
+    {
+      "converted_name": "model.vision_tower.layers.0.layer_norm2.weight",
+      "fingerprint": {
+        "dtype": "float32",
+        "max_abs": 1.0,
+        "mean": 1.0,
+        "numel": 16,
+        "shape": [
+          16
+        ],
+        "std": 0.0
+      },
+      "public_name": "model.vision_tower.layers.0.layer_norm2.weight",
+      "source": "/tmp/minimax_m3_vl_toy_full_checkpoint/model.safetensors",
+      "source_shard": "model.safetensors"
+    },
+    {
+      "converted_name": "model.vision_tower.layers.0.mlp.fc1.bias",
+      "fingerprint": {
+        "dtype": "float32",
+        "max_abs": 0.0,
+        "mean": 0.0,
+        "numel": 32,
+        "shape": [
+          32
+        ],
+        "std": 0.0
+      },
+      "public_name": "model.vision_tower.layers.0.mlp.fc1.bias",
+      "source": "/tmp/minimax_m3_vl_toy_full_checkpoint/model.safetensors",
+      "source_shard": "model.safetensors"
+    },
+    {
+      "converted_name": "model.vision_tower.layers.0.mlp.fc1.weight",
+      "fingerprint": {
+        "dtype": "float32",
+        "max_abs": 0.06284594535827637,
+        "mean": -4.816160071641207e-06,
+        "numel": 512,
+        "shape": [
+          32,
+          16
+        ],
+        "std": 0.01877768523991108
+      },
+      "public_name": "model.vision_tower.layers.0.mlp.fc1.weight",
+      "source": "/tmp/minimax_m3_vl_toy_full_checkpoint/model.safetensors",
+      "source_shard": "model.safetensors"
+    },
+    {
+      "converted_name": "model.vision_tower.layers.0.mlp.fc2.bias",
+      "fingerprint": {
+        "dtype": "float32",
+        "max_abs": 0.0,
+        "mean": 0.0,
+        "numel": 16,
+        "shape": [
+          16
+        ],
+        "std": 0.0
+      },
+      "public_name": "model.vision_tower.layers.0.mlp.fc2.bias",
+      "source": "/tmp/minimax_m3_vl_toy_full_checkpoint/model.safetensors",
+      "source_shard": "model.safetensors"
+    },
+    {
+      "converted_name": "model.vision_tower.layers.0.mlp.fc2.weight",
+      "fingerprint": {
+        "dtype": "float32",
+        "max_abs": 0.07515484094619751,
+        "mean": -0.000573767232708633,
+        "numel": 512,
+        "shape": [
+          16,
+          32
+        ],
+        "std": 0.019696898758411407
+      },
+      "public_name": "model.vision_tower.layers.0.mlp.fc2.weight",
+      "source": "/tmp/minimax_m3_vl_toy_full_checkpoint/model.safetensors",
+      "source_shard": "model.safetensors"
+    },
+    {
+      "converted_name": "model.vision_tower.layers.0.self_attn.k_proj.bias",
+      "fingerprint": {
+        "dtype": "float32",
+        "max_abs": 0.0,
+        "mean": 0.0,
+        "numel": 16,
+        "shape": [
+          16
+        ],
+        "std": 0.0
+      },
+      "public_name": "model.vision_tower.layers.0.self_attn.k_proj.bias",
+      "source": "/tmp/minimax_m3_vl_toy_full_checkpoint/model.safetensors",
+      "source_shard": "model.safetensors"
+    },
+    {
+      "converted_name": "model.vision_tower.layers.0.self_attn.k_proj.weight",
+      "fingerprint": {
+        "dtype": "float32",
+        "max_abs": 0.06688830256462097,
+        "mean": -0.000900032464414835,
+        "numel": 256,
+        "shape": [
+          16,
+          16
+        ],
+        "std": 0.020439201965928078
+      },
+      "public_name": "model.vision_tower.layers.0.self_attn.k_proj.weight",
+      "source": "/tmp/minimax_m3_vl_toy_full_checkpoint/model.safetensors",
+      "source_shard": "model.safetensors"
+    },
+    {
+      "converted_name": "model.vision_tower.layers.0.self_attn.out_proj.bias",
+      "fingerprint": {
+        "dtype": "float32",
+        "max_abs": 0.0,
+        "mean": 0.0,
+        "numel": 16,
+        "shape": [
+          16
+        ],
+        "std": 0.0
+      },
+      "public_name": "model.vision_tower.layers.0.self_attn.out_proj.bias",
+      "source": "/tmp/minimax_m3_vl_toy_full_checkpoint/model.safetensors",
+      "source_shard": "model.safetensors"
+    },
+    {
+      "converted_name": "model.vision_tower.layers.0.self_attn.out_proj.weight",
+      "fingerprint": {
+        "dtype": "float32",
+        "max_abs": 0.06510615348815918,
+        "mean": 0.0011045460123568773,
+        "numel": 256,
+        "shape": [
+          16,
+          16
+        ],
+        "std": 0.020250122994184494
+      },
+      "public_name": "model.vision_tower.layers.0.self_attn.out_proj.weight",
+      "source": "/tmp/minimax_m3_vl_toy_full_checkpoint/model.safetensors",
+      "source_shard": "model.safetensors"
+    },
+    {
+      "converted_name": "model.vision_tower.layers.0.self_attn.q_proj.bias",
+      "fingerprint": {
+        "dtype": "float32",
+        "max_abs": 0.0,
+        "mean": 0.0,
+        "numel": 16,
+        "shape": [
+          16
+        ],
+        "std": 0.0
+      },
+      "public_name": "model.vision_tower.layers.0.self_attn.q_proj.bias",
+      "source": "/tmp/minimax_m3_vl_toy_full_checkpoint/model.safetensors",
+      "source_shard": "model.safetensors"
+    },
+    {
+      "converted_name": "model.vision_tower.layers.0.self_attn.q_proj.weight",
+      "fingerprint": {
+        "dtype": "float32",
+        "max_abs": 0.061271362006664276,
+        "mean": -0.0010168824810534716,
+        "numel": 256,
+        "shape": [
+          16,
+          16
+        ],
+        "std": 0.02107091434299946
+      },
+      "public_name": "model.vision_tower.layers.0.self_attn.q_proj.weight",
+      "source": "/tmp/minimax_m3_vl_toy_full_checkpoint/model.safetensors",
+      "source_shard": "model.safetensors"
+    },
+    {
+      "converted_name": "model.vision_tower.layers.0.self_attn.v_proj.bias",
+      "fingerprint": {
+        "dtype": "float32",
+        "max_abs": 0.0,
+        "mean": 0.0,
+        "numel": 16,
+        "shape": [
+          16
+        ],
+        "std": 0.0
+      },
+      "public_name": "model.vision_tower.layers.0.self_attn.v_proj.bias",
+      "source": "/tmp/minimax_m3_vl_toy_full_checkpoint/model.safetensors",
+      "source_shard": "model.safetensors"
+    },
+    {
+      "converted_name": "model.vision_tower.layers.0.self_attn.v_proj.weight",
+      "fingerprint": {
+        "dtype": "float32",
+        "max_abs": 0.057802680879831314,
+        "mean": 0.001295516500249505,
+        "numel": 256,
+        "shape": [
+          16,
+          16
+        ],
+        "std": 0.019585315138101578
+      },
+      "public_name": "model.vision_tower.layers.0.self_attn.v_proj.weight",
+      "source": "/tmp/minimax_m3_vl_toy_full_checkpoint/model.safetensors",
+      "source_shard": "model.safetensors"
+    },
+    {
+      "converted_name": "model.vision_tower.pre_layrnorm.bias",
+      "fingerprint": {
+        "dtype": "float32",
+        "max_abs": 0.0,
+        "mean": 0.0,
+        "numel": 16,
+        "shape": [
+          16
+        ],
+        "std": 0.0
+      },
+      "public_name": "model.vision_tower.pre_layrnorm.bias",
+      "source": "/tmp/minimax_m3_vl_toy_full_checkpoint/model.safetensors",
+      "source_shard": "model.safetensors"
+    },
+    {
+      "converted_name": "model.vision_tower.pre_layrnorm.weight",
+      "fingerprint": {
+        "dtype": "float32",
+        "max_abs": 1.0,
+        "mean": 1.0,
+        "numel": 16,
+        "shape": [
+          16
+        ],
+        "std": 0.0
+      },
+      "public_name": "model.vision_tower.pre_layrnorm.weight",
+      "source": "/tmp/minimax_m3_vl_toy_full_checkpoint/model.safetensors",
+      "source_shard": "model.safetensors"
+    }
+  ],
+  "tolerances": {
+    "forward": {
+      "atol": 0.0005,
+      "rtol": 0.0005
+    },
+    "input": {
+      "atol": 0.0,
+      "rtol": 0.0
+    }
+  },
+  "torch_dtype": "float32"
+}

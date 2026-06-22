@@ -1,0 +1,206 @@
+{
+  "gates": [
+    {
+      "description": "Toy parity uses transformers MiniMax M3 VL modeling as reference and VeOmni generated modeling as candidate.",
+      "evidence": [
+        {
+          "issues": [],
+          "passed": true,
+          "path": "docs/usage/support_new_models/artifacts/minimax_m3_vl_precision_parity/toy_hf_veomni_parity.json"
+        },
+        {
+          "issues": [],
+          "passed": true,
+          "path": "docs/usage/support_new_models/artifacts/minimax_m3_vl_precision_parity/toy_hf_cpu_veomni_npu_parity.json"
+        }
+      ],
+      "issues": [],
+      "name": "hf_transformers_reference_vs_veomni_candidate",
+      "passed": true,
+      "required_for_completion": true,
+      "status": "passed"
+    },
+    {
+      "description": "Toy/reduced config uses fixed seed, strict state_dict load, and identical input contract.",
+      "evidence": [
+        {
+          "issues": [],
+          "passed": true,
+          "path": "docs/usage/support_new_models/artifacts/minimax_m3_vl_precision_parity/toy_hf_veomni_parity.json"
+        },
+        {
+          "issues": [],
+          "passed": true,
+          "path": "docs/usage/support_new_models/artifacts/minimax_m3_vl_precision_parity/toy_hf_cpu_veomni_npu_parity.json"
+        },
+        {
+          "issues": [],
+          "passed": true,
+          "path": "docs/usage/support_new_models/artifacts/minimax_m3_vl_precision_parity/toy_hf_veomni_parity.json"
+        }
+      ],
+      "issues": [],
+      "name": "same_config_same_weights_same_input",
+      "passed": true,
+      "required_for_completion": true,
+      "status": "passed"
+    },
+    {
+      "description": "Forward loss/logits/vision states and MoE router logits/selected experts are aligned.",
+      "evidence": [
+        {
+          "issues": [],
+          "passed": true,
+          "path": "docs/usage/support_new_models/artifacts/minimax_m3_vl_precision_parity/toy_hf_veomni_parity.json"
+        },
+        {
+          "issues": [],
+          "passed": true,
+          "path": "docs/usage/support_new_models/artifacts/minimax_m3_vl_precision_parity/toy_hf_cpu_veomni_npu_parity.json"
+        }
+      ],
+      "issues": [],
+      "name": "toy_forward_and_router_parity",
+      "passed": true,
+      "required_for_completion": true,
+      "status": "passed"
+    },
+    {
+      "description": "Embedding, attention q/k/v/o, MoE gate/experts, projector, and lm_head gradients are aligned.",
+      "evidence": [
+        {
+          "issues": [],
+          "passed": true,
+          "path": "docs/usage/support_new_models/artifacts/minimax_m3_vl_precision_parity/toy_hf_veomni_parity.json"
+        },
+        {
+          "issues": [],
+          "passed": true,
+          "path": "docs/usage/support_new_models/artifacts/minimax_m3_vl_precision_parity/toy_hf_cpu_veomni_npu_parity.json"
+        }
+      ],
+      "issues": [],
+      "name": "toy_backward_gradient_parity",
+      "passed": true,
+      "required_for_completion": true,
+      "status": "passed"
+    },
+    {
+      "description": "The same AdamW configuration produces matching one-step parameter deltas.",
+      "evidence": [
+        {
+          "issues": [],
+          "passed": true,
+          "path": "docs/usage/support_new_models/artifacts/minimax_m3_vl_precision_parity/toy_hf_veomni_parity.json"
+        },
+        {
+          "issues": [],
+          "passed": true,
+          "path": "docs/usage/support_new_models/artifacts/minimax_m3_vl_precision_parity/toy_hf_cpu_veomni_npu_parity.json"
+        }
+      ],
+      "issues": [],
+      "name": "toy_adamw_one_step_delta_parity",
+      "passed": true,
+      "required_for_completion": true,
+      "status": "passed"
+    },
+    {
+      "description": "A real public-checkpoint tensor payload sample is read, converted, and value-checked.",
+      "evidence": [
+        {
+          "issues": [],
+          "passed": true,
+          "path": "docs/usage/support_new_models/artifacts/minimax_m3_vl_precision_parity/real_checkpoint_payload_remote_sample.json"
+        }
+      ],
+      "issues": [],
+      "name": "real_checkpoint_payload_sample",
+      "passed": true,
+      "required_for_completion": true,
+      "status": "passed"
+    },
+    {
+      "description": "The streaming checkpoint forward runner path is proven on a complete toy checkpoint.",
+      "evidence": [
+        {
+          "issues": [],
+          "passed": true,
+          "path": "docs/usage/support_new_models/artifacts/minimax_m3_vl_precision_parity/toy_checkpoint_forward_parity.json"
+        },
+        {
+          "issues": [],
+          "passed": true,
+          "path": "docs/usage/support_new_models/artifacts/minimax_m3_vl_precision_parity/toy_checkpoint_cpu_npu_forward_parity.json"
+        }
+      ],
+      "issues": [],
+      "name": "checkpoint_forward_runner_smoke",
+      "passed": true,
+      "required_for_completion": true,
+      "status": "passed"
+    },
+    {
+      "description": "Target machine proves official MiniMax source, 59 shards, >800GB payload, entrypoints, and runtime readiness.",
+      "evidence": [],
+      "issues": [
+        "no full public-checkpoint preflight artifact was provided"
+      ],
+      "name": "full_public_checkpoint_preflight",
+      "passed": false,
+      "required_for_completion": true,
+      "status": "missing"
+    },
+    {
+      "description": "The full MiniMax public checkpoint is loaded through both paths and logits/top-k/greedy outputs align.",
+      "evidence": [],
+      "issues": [
+        "no full public-checkpoint forward parity artifact was provided"
+      ],
+      "name": "full_public_checkpoint_forward_parity",
+      "passed": false,
+      "required_for_completion": true,
+      "status": "missing"
+    },
+    {
+      "description": "Single-card NPU parity passes with explicit tolerance and Ascend runtime evidence.",
+      "evidence": [
+        {
+          "issues": [],
+          "passed": true,
+          "path": "docs/usage/support_new_models/artifacts/minimax_m3_vl_precision_parity/toy_hf_veomni_parity_npu.json"
+        },
+        {
+          "issues": [],
+          "passed": true,
+          "path": "docs/usage/support_new_models/artifacts/minimax_m3_vl_precision_parity/toy_hf_cpu_veomni_npu_parity.json"
+        }
+      ],
+      "issues": [],
+      "name": "single_card_npu_tolerance_parity",
+      "passed": true,
+      "required_for_completion": true,
+      "status": "passed"
+    },
+    {
+      "description": "Multi-card SP/EP/FSDP2 target-machine parity summary and logs pass.",
+      "evidence": [],
+      "issues": [
+        "no multi-card SP/EP/FSDP2 parity artifact was provided"
+      ],
+      "name": "multicard_sp_ep_fsdp2_parity",
+      "passed": false,
+      "required_for_completion": true,
+      "status": "missing"
+    }
+  ],
+  "objective_complete": false,
+  "passed": false,
+  "summary": {
+    "failed": 0,
+    "missing": 3,
+    "partial": 0,
+    "passed": 8,
+    "required_total": 11
+  }
+}

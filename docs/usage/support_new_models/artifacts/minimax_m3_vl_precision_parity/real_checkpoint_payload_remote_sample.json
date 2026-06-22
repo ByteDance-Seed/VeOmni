@@ -1,0 +1,506 @@
+{
+  "allow_incomplete_groups": false,
+  "candidate_device": null,
+  "checkpoint_dir": null,
+  "config_path": "MiniMaxAI/MiniMax-M3",
+  "date": "2026-06-22T14:18:40Z",
+  "device": "cpu",
+  "fail_on_dtype_mismatch": false,
+  "failed": null,
+  "forward": null,
+  "full_checkpoint_load_executed": false,
+  "include_key_regex": [
+    "^language_model\\.model\\.layers\\.0\\.self_attn\\.[qk]_norm\\.weight$|^language_model\\.model\\.layers\\.3\\.self_attn\\.index_[qk]_norm\\.weight$|^language_model\\.model\\.layers\\.3\\.block_sparse_moe\\.e_score_correction_bias$|^vision_tower\\.vision_model\\.encoder\\.layers\\.0\\.(layer_norm1\\.weight|self_attn\\.q_proj\\.bias)$|^multi_modal_projector\\.linear_[12]\\.bias$|^patch_merge_mlp\\.linear_[12]\\.bias$"
+  ],
+  "index_json": "/tmp/minimax_m3_model.safetensors.index.json",
+  "metadata_comparison": {
+    "dtype_mismatch_count": 1,
+    "dtype_mismatch_groups": {
+      "F32->BF16": 1
+    },
+    "dtype_mismatches_sample": [
+      {
+        "checkpoint": "F32",
+        "model": "BF16",
+        "name": "model.language_model.layers.3.mlp.gate.e_score_correction_bias"
+      }
+    ],
+    "missing_model_key_count": 0,
+    "missing_model_keys_sample": [],
+    "shape_mismatch_count": 0,
+    "shape_mismatches_sample": []
+  },
+  "mode": "payload",
+  "num_checks": null,
+  "passed": true,
+  "payload": {
+    "converted_tensor_keys": 11,
+    "converter_finalize_error": null,
+    "duplicate_converted_keys": [],
+    "payload_bytes_read": 55808,
+    "public_keys_read": 11,
+    "selected_public_keys": 11,
+    "shard_sources": {
+      "model-00001-of-00059.safetensors": "https://huggingface.co/MiniMaxAI/MiniMax-M3/resolve/main/model-00001-of-00059.safetensors",
+      "model-00003-of-00059.safetensors": "https://huggingface.co/MiniMaxAI/MiniMax-M3/resolve/main/model-00003-of-00059.safetensors",
+      "model-00026-of-00059.safetensors": "https://huggingface.co/MiniMaxAI/MiniMax-M3/resolve/main/model-00026-of-00059.safetensors",
+      "model-00059-of-00059.safetensors": "https://huggingface.co/MiniMaxAI/MiniMax-M3/resolve/main/model-00059-of-00059.safetensors"
+    }
+  },
+  "reference_device": null,
+  "runtime": {
+    "ascend_env": {
+      "ASCEND_HOME_PATH": null,
+      "ASCEND_RT_VISIBLE_DEVICES": null,
+      "ASCEND_TOOLKIT_HOME": null,
+      "ASCEND_VISIBLE_DEVICES": null,
+      "MODELING_BACKEND": "veomni"
+    },
+    "machine": "aarch64",
+    "platform": "Linux-5.15.0-94-generic-aarch64-with-glibc2.35",
+    "python": "3.11.15 (main, Jun 11 2026, 04:04:24) [Clang 22.1.3 ]",
+    "python_executable": "/home/t00906153/super/.cache/uv/builds-v0/.tmpDkp2Xo/bin/python",
+    "torch_npu_available": null,
+    "torch_npu_device_count": null,
+    "torch_npu_error": null,
+    "torch_npu_version": null,
+    "torch_version": "2.7.1+cpu",
+    "transformers_version": "5.12.0"
+  },
+  "sampled_state_load": {
+    "dtype_cast_groups": {
+      "BF16->BF16": 10,
+      "F32->BF16": 1
+    },
+    "loaded_bytes": 55552,
+    "loaded_report_truncated": false,
+    "loaded_reports": [
+      {
+        "checkpoint_dtype": "BF16",
+        "converted_name": "model.language_model.layers.0.self_attn.k_norm.weight",
+        "loaded_dtype": "BF16",
+        "loaded_fingerprint": {
+          "dtype": "bfloat16",
+          "max_abs": 0.435546875,
+          "mean": 0.10995100438594818,
+          "numel": 128,
+          "sha256": "c00a79d2ddf9f0f6694cb475dc828cedc003e0c8c803d2761955da8e5be4b316",
+          "shape": [
+            128
+          ],
+          "std": 0.09312020987272263
+        },
+        "shape": [
+          128
+        ]
+      },
+      {
+        "checkpoint_dtype": "BF16",
+        "converted_name": "model.language_model.layers.0.self_attn.q_norm.weight",
+        "loaded_dtype": "BF16",
+        "loaded_fingerprint": {
+          "dtype": "bfloat16",
+          "max_abs": 0.3671875,
+          "mean": 0.10128962993621826,
+          "numel": 128,
+          "sha256": "ef99a458918e712403127bed754d586d64176b7a8afee7a2064a61f13f250842",
+          "shape": [
+            128
+          ],
+          "std": 0.10049757361412048
+        },
+        "shape": [
+          128
+        ]
+      },
+      {
+        "checkpoint_dtype": "F32",
+        "converted_name": "model.language_model.layers.3.mlp.gate.e_score_correction_bias",
+        "loaded_dtype": "BF16",
+        "loaded_fingerprint": {
+          "dtype": "bfloat16",
+          "max_abs": 11.625,
+          "mean": 11.58349609375,
+          "numel": 128,
+          "sha256": "da829ae40247eb5384aa2ff8bd739d42d0050a48aaf90597ced1f2e65f268f92",
+          "shape": [
+            128
+          ],
+          "std": 0.06687670946121216
+        },
+        "shape": [
+          128
+        ]
+      },
+      {
+        "checkpoint_dtype": "BF16",
+        "converted_name": "model.language_model.layers.3.self_attn.indexer.k_norm.weight",
+        "loaded_dtype": "BF16",
+        "loaded_fingerprint": {
+          "dtype": "bfloat16",
+          "max_abs": 0.60546875,
+          "mean": 0.22738409042358398,
+          "numel": 128,
+          "sha256": "2cc06cd088eebbfaaa56aeb84f7e7b7016e6559172c559240055f09b1fca08f0",
+          "shape": [
+            128
+          ],
+          "std": 0.08064107596874237
+        },
+        "shape": [
+          128
+        ]
+      },
+      {
+        "checkpoint_dtype": "BF16",
+        "converted_name": "model.language_model.layers.3.self_attn.indexer.q_norm.weight",
+        "loaded_dtype": "BF16",
+        "loaded_fingerprint": {
+          "dtype": "bfloat16",
+          "max_abs": 0.51171875,
+          "mean": 0.1913900375366211,
+          "numel": 128,
+          "sha256": "2df3e40352fcc7f65fe573fa7ac4b337bd8ee660a920b60e902753094c3ec901",
+          "shape": [
+            128
+          ],
+          "std": 0.12433004379272461
+        },
+        "shape": [
+          128
+        ]
+      },
+      {
+        "checkpoint_dtype": "BF16",
+        "converted_name": "model.multi_modal_projector.linear_1.bias",
+        "loaded_dtype": "BF16",
+        "loaded_fingerprint": {
+          "dtype": "bfloat16",
+          "max_abs": 0.3984375,
+          "mean": 0.010179826058447361,
+          "numel": 6144,
+          "sha256": "05a8bf3bfe7d2cdbb0f662499d7ce5f07f906719c9b5477d575f6e810309c2df",
+          "shape": [
+            6144
+          ],
+          "std": 0.054082248359918594
+        },
+        "shape": [
+          6144
+        ]
+      },
+      {
+        "checkpoint_dtype": "BF16",
+        "converted_name": "model.multi_modal_projector.linear_2.bias",
+        "loaded_dtype": "BF16",
+        "loaded_fingerprint": {
+          "dtype": "bfloat16",
+          "max_abs": 0.578125,
+          "mean": -0.0018237722106277943,
+          "numel": 6144,
+          "sha256": "7abc993700cd6767196295a97481996bf4460df86785410aac94d160afcb6577",
+          "shape": [
+            6144
+          ],
+          "std": 0.13001017272472382
+        },
+        "shape": [
+          6144
+        ]
+      },
+      {
+        "checkpoint_dtype": "BF16",
+        "converted_name": "model.multi_modal_projector.merge_linear_1.bias",
+        "loaded_dtype": "BF16",
+        "loaded_fingerprint": {
+          "dtype": "bfloat16",
+          "max_abs": 0.3515625,
+          "mean": 0.023292729631066322,
+          "numel": 6144,
+          "sha256": "2660bfb056c3cb24cad4790aaf9205dd87c66b8577ea1bd7dded5c389d337829",
+          "shape": [
+            6144
+          ],
+          "std": 0.0601925291121006
+        },
+        "shape": [
+          6144
+        ]
+      },
+      {
+        "checkpoint_dtype": "BF16",
+        "converted_name": "model.multi_modal_projector.merge_linear_2.bias",
+        "loaded_dtype": "BF16",
+        "loaded_fingerprint": {
+          "dtype": "bfloat16",
+          "max_abs": 2.078125,
+          "mean": 0.002515783766284585,
+          "numel": 6144,
+          "sha256": "da87f1be0bdd36317210879fcc9f85ea04b0df2c1994c4e267f3357bde384194",
+          "shape": [
+            6144
+          ],
+          "std": 0.1408134400844574
+        },
+        "shape": [
+          6144
+        ]
+      },
+      {
+        "checkpoint_dtype": "BF16",
+        "converted_name": "model.vision_tower.layers.0.layer_norm1.weight",
+        "loaded_dtype": "BF16",
+        "loaded_fingerprint": {
+          "dtype": "bfloat16",
+          "max_abs": 1.5390625,
+          "mean": 0.243489071726799,
+          "numel": 1280,
+          "sha256": "054373589e1c4cca2aadb9d37c1ea32595a311b987096d7e741d4353a4960193",
+          "shape": [
+            1280
+          ],
+          "std": 0.4786248207092285
+        },
+        "shape": [
+          1280
+        ]
+      },
+      {
+        "checkpoint_dtype": "BF16",
+        "converted_name": "model.vision_tower.layers.0.self_attn.q_proj.bias",
+        "loaded_dtype": "BF16",
+        "loaded_fingerprint": {
+          "dtype": "bfloat16",
+          "max_abs": 3.546875,
+          "mean": 0.005659913178533316,
+          "numel": 1280,
+          "sha256": "6a6158d934e4a0b4dd4f3a5ada3c3eb43a962cc2331a34393b8de5b2ae2f31d3",
+          "shape": [
+            1280
+          ],
+          "std": 1.194533109664917
+        },
+        "shape": [
+          1280
+        ]
+      }
+    ],
+    "loaded_tensor_count": 11,
+    "missing_model_key_count": 0,
+    "missing_model_keys_sample": [],
+    "passed": true,
+    "shape_mismatch_count": 0,
+    "shape_mismatches_sample": [],
+    "value_mismatch_count": 0,
+    "value_mismatches_sample": []
+  },
+  "selected_shard_count": 4,
+  "selected_shards": [
+    "model-00001-of-00059.safetensors",
+    "model-00003-of-00059.safetensors",
+    "model-00026-of-00059.safetensors",
+    "model-00059-of-00059.safetensors"
+  ],
+  "shard_base_url": "https://huggingface.co/MiniMaxAI/MiniMax-M3/resolve/main/",
+  "tensor_report_truncated": false,
+  "tensor_reports": [
+    {
+      "converted_name": "model.language_model.layers.0.self_attn.k_norm.weight",
+      "fingerprint": {
+        "dtype": "bfloat16",
+        "max_abs": 0.435546875,
+        "mean": 0.10995100438594818,
+        "numel": 128,
+        "sha256": "c00a79d2ddf9f0f6694cb475dc828cedc003e0c8c803d2761955da8e5be4b316",
+        "shape": [
+          128
+        ],
+        "std": 0.09312020987272263
+      },
+      "public_name": "language_model.model.layers.0.self_attn.k_norm.weight",
+      "source": "https://huggingface.co/MiniMaxAI/MiniMax-M3/resolve/main/model-00001-of-00059.safetensors",
+      "source_shard": "model-00001-of-00059.safetensors"
+    },
+    {
+      "converted_name": "model.language_model.layers.0.self_attn.q_norm.weight",
+      "fingerprint": {
+        "dtype": "bfloat16",
+        "max_abs": 0.3671875,
+        "mean": 0.10128962993621826,
+        "numel": 128,
+        "sha256": "ef99a458918e712403127bed754d586d64176b7a8afee7a2064a61f13f250842",
+        "shape": [
+          128
+        ],
+        "std": 0.10049757361412048
+      },
+      "public_name": "language_model.model.layers.0.self_attn.q_norm.weight",
+      "source": "https://huggingface.co/MiniMaxAI/MiniMax-M3/resolve/main/model-00001-of-00059.safetensors",
+      "source_shard": "model-00001-of-00059.safetensors"
+    },
+    {
+      "converted_name": "model.language_model.layers.3.mlp.gate.e_score_correction_bias",
+      "fingerprint": {
+        "dtype": "float32",
+        "max_abs": 11.64959716796875,
+        "mean": 11.583320617675781,
+        "numel": 128,
+        "sha256": "04f90ff03babde111654d3074549c181b48a3fcf3cf5e0251f18f6c1bad2c443",
+        "shape": [
+          128
+        ],
+        "std": 0.06001435965299606
+      },
+      "public_name": "language_model.model.layers.3.block_sparse_moe.e_score_correction_bias",
+      "source": "https://huggingface.co/MiniMaxAI/MiniMax-M3/resolve/main/model-00003-of-00059.safetensors",
+      "source_shard": "model-00003-of-00059.safetensors"
+    },
+    {
+      "converted_name": "model.language_model.layers.3.self_attn.indexer.k_norm.weight",
+      "fingerprint": {
+        "dtype": "bfloat16",
+        "max_abs": 0.60546875,
+        "mean": 0.22738409042358398,
+        "numel": 128,
+        "sha256": "2cc06cd088eebbfaaa56aeb84f7e7b7016e6559172c559240055f09b1fca08f0",
+        "shape": [
+          128
+        ],
+        "std": 0.08064107596874237
+      },
+      "public_name": "language_model.model.layers.3.self_attn.index_k_norm.weight",
+      "source": "https://huggingface.co/MiniMaxAI/MiniMax-M3/resolve/main/model-00003-of-00059.safetensors",
+      "source_shard": "model-00003-of-00059.safetensors"
+    },
+    {
+      "converted_name": "model.language_model.layers.3.self_attn.indexer.q_norm.weight",
+      "fingerprint": {
+        "dtype": "bfloat16",
+        "max_abs": 0.51171875,
+        "mean": 0.1913900375366211,
+        "numel": 128,
+        "sha256": "2df3e40352fcc7f65fe573fa7ac4b337bd8ee660a920b60e902753094c3ec901",
+        "shape": [
+          128
+        ],
+        "std": 0.12433004379272461
+      },
+      "public_name": "language_model.model.layers.3.self_attn.index_q_norm.weight",
+      "source": "https://huggingface.co/MiniMaxAI/MiniMax-M3/resolve/main/model-00003-of-00059.safetensors",
+      "source_shard": "model-00003-of-00059.safetensors"
+    },
+    {
+      "converted_name": "model.multi_modal_projector.linear_2.bias",
+      "fingerprint": {
+        "dtype": "bfloat16",
+        "max_abs": 0.578125,
+        "mean": -0.0018237722106277943,
+        "numel": 6144,
+        "sha256": "7abc993700cd6767196295a97481996bf4460df86785410aac94d160afcb6577",
+        "shape": [
+          6144
+        ],
+        "std": 0.13001017272472382
+      },
+      "public_name": "multi_modal_projector.linear_2.bias",
+      "source": "https://huggingface.co/MiniMaxAI/MiniMax-M3/resolve/main/model-00026-of-00059.safetensors",
+      "source_shard": "model-00026-of-00059.safetensors"
+    },
+    {
+      "converted_name": "model.multi_modal_projector.merge_linear_1.bias",
+      "fingerprint": {
+        "dtype": "bfloat16",
+        "max_abs": 0.3515625,
+        "mean": 0.023292729631066322,
+        "numel": 6144,
+        "sha256": "2660bfb056c3cb24cad4790aaf9205dd87c66b8577ea1bd7dded5c389d337829",
+        "shape": [
+          6144
+        ],
+        "std": 0.0601925291121006
+      },
+      "public_name": "patch_merge_mlp.linear_1.bias",
+      "source": "https://huggingface.co/MiniMaxAI/MiniMax-M3/resolve/main/model-00026-of-00059.safetensors",
+      "source_shard": "model-00026-of-00059.safetensors"
+    },
+    {
+      "converted_name": "model.multi_modal_projector.merge_linear_2.bias",
+      "fingerprint": {
+        "dtype": "bfloat16",
+        "max_abs": 2.078125,
+        "mean": 0.002515783766284585,
+        "numel": 6144,
+        "sha256": "da87f1be0bdd36317210879fcc9f85ea04b0df2c1994c4e267f3357bde384194",
+        "shape": [
+          6144
+        ],
+        "std": 0.1408134400844574
+      },
+      "public_name": "patch_merge_mlp.linear_2.bias",
+      "source": "https://huggingface.co/MiniMaxAI/MiniMax-M3/resolve/main/model-00026-of-00059.safetensors",
+      "source_shard": "model-00026-of-00059.safetensors"
+    },
+    {
+      "converted_name": "model.multi_modal_projector.linear_1.bias",
+      "fingerprint": {
+        "dtype": "bfloat16",
+        "max_abs": 0.3984375,
+        "mean": 0.010179826058447361,
+        "numel": 6144,
+        "sha256": "05a8bf3bfe7d2cdbb0f662499d7ce5f07f906719c9b5477d575f6e810309c2df",
+        "shape": [
+          6144
+        ],
+        "std": 0.054082248359918594
+      },
+      "public_name": "multi_modal_projector.linear_1.bias",
+      "source": "https://huggingface.co/MiniMaxAI/MiniMax-M3/resolve/main/model-00059-of-00059.safetensors",
+      "source_shard": "model-00059-of-00059.safetensors"
+    },
+    {
+      "converted_name": "model.vision_tower.layers.0.layer_norm1.weight",
+      "fingerprint": {
+        "dtype": "bfloat16",
+        "max_abs": 1.5390625,
+        "mean": 0.243489071726799,
+        "numel": 1280,
+        "sha256": "054373589e1c4cca2aadb9d37c1ea32595a311b987096d7e741d4353a4960193",
+        "shape": [
+          1280
+        ],
+        "std": 0.4786248207092285
+      },
+      "public_name": "vision_tower.vision_model.encoder.layers.0.layer_norm1.weight",
+      "source": "https://huggingface.co/MiniMaxAI/MiniMax-M3/resolve/main/model-00059-of-00059.safetensors",
+      "source_shard": "model-00059-of-00059.safetensors"
+    },
+    {
+      "converted_name": "model.vision_tower.layers.0.self_attn.q_proj.bias",
+      "fingerprint": {
+        "dtype": "bfloat16",
+        "max_abs": 3.546875,
+        "mean": 0.005659913178533316,
+        "numel": 1280,
+        "sha256": "6a6158d934e4a0b4dd4f3a5ada3c3eb43a962cc2331a34393b8de5b2ae2f31d3",
+        "shape": [
+          1280
+        ],
+        "std": 1.194533109664917
+      },
+      "public_name": "vision_tower.vision_model.encoder.layers.0.self_attn.q_proj.bias",
+      "source": "https://huggingface.co/MiniMaxAI/MiniMax-M3/resolve/main/model-00059-of-00059.safetensors",
+      "source_shard": "model-00059-of-00059.safetensors"
+    }
+  ],
+  "tolerances": {
+    "forward": {
+      "atol": 0.0001,
+      "rtol": 0.0001
+    },
+    "input": {
+      "atol": 0.0,
+      "rtol": 0.0
+    }
+  },
+  "torch_dtype": "bfloat16"
+}

@@ -32,7 +32,10 @@ and lives in the patchgen-generated helpers — its sync behaviour is gated by
 
 import os
 
+import pytest
 import torch
+
+from veomni.utils.import_utils import is_transformers_version_greater_or_equal_to
 
 
 # Bootstrap a single-rank "process group" env so collator import doesn't crash
@@ -176,3 +179,48 @@ def test_qwen3_vl_metadata_hook_is_picklable_and_correct():
     batch = {"input_ids": torch.zeros(8)}
     hook(batch, {"pixel_values": 0, "pixel_values_videos": 0})
     assert "multimodal_metadata" not in batch
+
+
+def _minimax_mm_sample(seq_len, *, image_grid_thw, video_grid_thw):
+    return {
+        "input_ids": torch.randint(0, 1000, (seq_len,), dtype=torch.long),
+        "labels": torch.randint(0, 1000, (seq_len,), dtype=torch.long),
+        "attention_mask": torch.ones(seq_len, dtype=torch.long),
+        "position_ids": torch.arange(seq_len, dtype=torch.long),
+        "image_grid_thw": torch.tensor(image_grid_thw, dtype=torch.long),
+        "video_grid_thw": torch.tensor(video_grid_thw, dtype=torch.long),
+    }
+
+
+def test_minimax_m3_vl_metadata_hook_is_picklable_and_main_collator_wired():
+    """MiniMax's hook carries packed HF processor grids into `multimodal_metadata`.
+
+    MiniMax M3 VL needs only the CPU-built image/video grid lists for its 3D
+    RoPE fast path. This verifies the real generated hook is picklable for
+    DataLoader workers and that `MainCollator` invokes it after packing both
+    `image_grid_thw` and `video_grid_thw`.
+    """
+    if not is_transformers_version_greater_or_equal_to("5.12.0"):
+        pytest.skip("MiniMax M3 VL generated modeling requires transformers>=5.12.0.")
+
+    import pickle
+
+    from veomni.data.data_collator import MainCollator
+    from veomni.models.transformers.minimax_m3_vl.generated.patched_modeling_minimax_m3_vl_gpu import (
+        collate_multimodal_metadata,
+    )
+
+    hook = pickle.loads(pickle.dumps(collate_multimodal_metadata))
+    batch = MainCollator(metadata_collate_func=hook)(
+        [
+            _minimax_mm_sample(8, image_grid_thw=[[1, 2, 2]], video_grid_thw=[[2, 2, 2]]),
+            _minimax_mm_sample(4, image_grid_thw=[[1, 4, 4]], video_grid_thw=[[1, 2, 2], [2, 4, 4]]),
+        ]
+    )
+
+    assert batch["image_grid_thw"].tolist() == [[1, 2, 2], [1, 4, 4]]
+    assert batch["video_grid_thw"].tolist() == [[2, 2, 2], [1, 2, 2], [2, 4, 4]]
+    assert batch["multimodal_metadata"] == {
+        "image_grid_thw_list": [[1, 2, 2], [1, 4, 4]],
+        "video_grid_thw_list": [[2, 2, 2], [1, 2, 2], [2, 4, 4]],
+    }

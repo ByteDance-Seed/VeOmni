@@ -1,0 +1,48 @@
+model:
+  model_path: MiniMaxAI/MiniMax-M3
+  ops_implementation:
+    moe_implementation: eager
+    attn_implementation: eager
+
+data:
+  train_path: configs/multimodal/data/tulu_sharegpt4v_llavavideo.yaml
+  data_type: conversation
+  chat_template: minimax_m3_vl
+  max_seq_len: 4096
+  train_size: 80000000
+  mm_configs:
+    image_max_pixels: 602112
+    video_max_pixels: 602112
+    video_total_pixels: 2889523
+    max_frames: 16
+    fps: 2.0
+    use_audio_in_video: false
+
+train:
+  accelerator:
+    ep_size: 1
+    fsdp_config:
+      fsdp_mode: fsdp2
+  gradient_checkpointing:
+    enable_reentrant: false
+  wandb:
+    enable: false
+    project: minimax_m3_vl
+    name: minimax_m3_vl
+  freeze_vit: false
+  optimizer:
+    lr: 1.0e-5
+    lr_decay_style: cosine
+  num_train_epochs: 2
+  micro_batch_size: 1
+  global_batch_size: 32
+  max_steps: 500
+  init_device: meta
+  profile:
+    enable: true
+    start_step: 20
+    end_step: 21
+    record_shapes: true
+  checkpoint:
+    output_dir: minimax_m3_vl_sft
+    manager: dcp

@@ -394,6 +394,69 @@ def process_sample_qwen_vl(
     )
 
 
+@DATA_TRANSFORM_REGISTRY.register("minimax_m3_vl")
+def process_sample_minimax_m3_vl(
+    sample: Dict[str, Any],
+    processor: "ProcessorMixin",
+    chat_template: "ChatTemplate",
+    **kwargs,
+):
+    from .multimodal import conv_preprocess
+    from .multimodal.image_utils import fetch_images
+    from .multimodal.video_utils import fetch_videos_metadata
+
+    source = kwargs.get("source_name") or sample.get("source") or sample.get("source_name")
+    if "conversations" in sample and sample["conversations"] is not None and len(sample["conversations"]) > 0:
+        conversations = sample["conversations"]
+    else:
+        conversations = sample
+    conversations = conv_preprocess(source, conversations, **kwargs)
+
+    image_inputs, video_inputs = {}, {}
+    video_metadata = None
+    if "images" in sample and sample["images"]:
+        images = fetch_images(sample["images"], **kwargs)
+        image_inputs = processor.image_processor(images=images, return_tensors="pt")
+
+    if "videos" in sample and sample["videos"]:
+        videos, metadata, _, _ = fetch_videos_metadata(sample["videos"], **kwargs)
+        video_inputs = processor.video_processor(
+            videos=videos, video_metadata=metadata, return_tensors="pt", return_metadata=True
+        )
+        video_metadata = video_inputs.pop("video_metadata", None)
+
+    video_inputs_for_template = video_inputs
+    if video_metadata is not None:
+        video_inputs_for_template = dict(video_inputs)
+        video_inputs_for_template["video_metadata"] = video_metadata
+
+    encode_kwargs = {
+        "processor": processor,
+        "image_inputs": image_inputs,
+        "video_inputs": video_inputs_for_template,
+    }
+
+    tokenized_example = chat_template.encode_messages(conversations, **encode_kwargs)
+    tokenized_example = {
+        key: (value if isinstance(value, torch.Tensor) else torch.tensor(value))
+        for key, value in tokenized_example.items()
+    }
+
+    input_ids = tokenized_example["input_ids"]
+    image_token_id = getattr(processor, "image_token_id", chat_template.image_token_id)
+    video_token_id = getattr(processor, "video_token_id", chat_template.video_token_id)
+    image_mask = input_ids == image_token_id
+    video_mask = input_ids == video_token_id
+    tokenized_example["image_mask"] = image_mask
+    tokenized_example["video_mask"] = video_mask
+    tokenized_example["labels"][image_mask | video_mask] = IGNORE_INDEX
+    tokenized_example["position_ids"] = torch.arange(input_ids.numel(), dtype=torch.long)
+
+    tokenized_example.update(image_inputs)
+    tokenized_example.update(video_inputs)
+    return [tokenized_example]
+
+
 @DATA_TRANSFORM_REGISTRY.register("qwen2_5_omni")
 @DATA_TRANSFORM_REGISTRY.register("qwen3_omni_moe")
 def process_sample_qwen_omni(

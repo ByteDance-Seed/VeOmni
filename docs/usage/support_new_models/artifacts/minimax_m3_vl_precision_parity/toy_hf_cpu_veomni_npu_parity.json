@@ -1,0 +1,710 @@
+{
+  "batch_contract": {
+    "candidate": {
+      "attention_mask": [
+        [
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1
+        ]
+      ],
+      "image_grid_thw": [
+        [
+          1,
+          2,
+          2
+        ]
+      ],
+      "input_ids": [
+        [
+          11,
+          250,
+          23,
+          251,
+          37,
+          41,
+          43,
+          47,
+          53,
+          59
+        ]
+      ],
+      "labels": [
+        [
+          11,
+          -100,
+          23,
+          -100,
+          37,
+          41,
+          43,
+          47,
+          53,
+          59
+        ]
+      ],
+      "position_ids": [
+        [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9
+        ]
+      ],
+      "video_grid_thw": [
+        [
+          1,
+          2,
+          2
+        ]
+      ]
+    },
+    "reference": {
+      "attention_mask": [
+        [
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1
+        ]
+      ],
+      "image_grid_thw": [
+        [
+          1,
+          2,
+          2
+        ]
+      ],
+      "input_ids": [
+        [
+          11,
+          250,
+          23,
+          251,
+          37,
+          41,
+          43,
+          47,
+          53,
+          59
+        ]
+      ],
+      "labels": [
+        [
+          11,
+          -100,
+          23,
+          -100,
+          37,
+          41,
+          43,
+          47,
+          53,
+          59
+        ]
+      ],
+      "position_ids": [
+        [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9
+        ]
+      ],
+      "video_grid_thw": [
+        [
+          1,
+          2,
+          2
+        ]
+      ]
+    }
+  },
+  "candidate_device": "npu:0",
+  "checks": [
+    {
+      "equal": true,
+      "kind": "exact",
+      "name": "input.input_ids",
+      "shape": [
+        1,
+        10
+      ]
+    },
+    {
+      "equal": true,
+      "kind": "exact",
+      "name": "input.attention_mask",
+      "shape": [
+        1,
+        10
+      ]
+    },
+    {
+      "equal": true,
+      "kind": "exact",
+      "name": "input.position_ids",
+      "shape": [
+        1,
+        10
+      ]
+    },
+    {
+      "actual": {
+        "image_grid_thw_list": [
+          [
+            1,
+            2,
+            2
+          ]
+        ],
+        "video_grid_thw_list": [
+          [
+            1,
+            2,
+            2
+          ]
+        ]
+      },
+      "equal": true,
+      "expected": {
+        "image_grid_thw_list": [
+          [
+            1,
+            2,
+            2
+          ]
+        ],
+        "video_grid_thw_list": [
+          [
+            1,
+            2,
+            2
+          ]
+        ]
+      },
+      "kind": "metadata",
+      "name": "input.multimodal_metadata_contract"
+    },
+    {
+      "allclose": true,
+      "atol": 0.0005,
+      "kind": "tensor",
+      "max_abs": 3.337860107421875e-06,
+      "max_rel": 6.05112632001692e-07,
+      "name": "forward.loss",
+      "rtol": 0.0005,
+      "shape": []
+    },
+    {
+      "allclose": true,
+      "atol": 0.0005,
+      "kind": "tensor",
+      "max_abs": 1.9215047359466553e-05,
+      "max_rel": 0.0375836007297039,
+      "name": "forward.logits",
+      "rtol": 0.0005,
+      "shape": [
+        1,
+        10,
+        256
+      ]
+    },
+    {
+      "allclose": true,
+      "atol": 0.0005,
+      "kind": "tensor",
+      "max_abs": 2.7809619496110827e-08,
+      "max_rel": 0.0034439112059772015,
+      "name": "forward.image_hidden_states",
+      "rtol": 0.0005,
+      "shape": [
+        1,
+        32
+      ]
+    },
+    {
+      "allclose": true,
+      "atol": 0.0005,
+      "kind": "tensor",
+      "max_abs": 1.9063008949160576e-08,
+      "max_rel": 0.015590478666126728,
+      "name": "forward.video_hidden_states",
+      "rtol": 0.0005,
+      "shape": [
+        1,
+        32
+      ]
+    },
+    {
+      "equal": true,
+      "hf": 1,
+      "kind": "exact",
+      "name": "router.record_count",
+      "veomni": 1
+    },
+    {
+      "allclose": true,
+      "atol": 0.0005,
+      "kind": "tensor",
+      "max_abs": 1.6629695892333984e-05,
+      "max_rel": 0.0008622725144959986,
+      "name": "router.0.logits",
+      "rtol": 0.0005,
+      "shape": [
+        10,
+        4
+      ]
+    },
+    {
+      "allclose": true,
+      "atol": 0.0005,
+      "kind": "tensor",
+      "max_abs": 0.0,
+      "max_rel": 0.0,
+      "name": "router.0.weights",
+      "rtol": 0.0005,
+      "shape": [
+        10,
+        1
+      ]
+    },
+    {
+      "equal": true,
+      "kind": "exact",
+      "name": "router.0.selected_experts",
+      "shape": [
+        10,
+        1
+      ]
+    },
+    {
+      "allclose": true,
+      "atol": 0.001,
+      "kind": "tensor",
+      "max_abs": 7.602572441101074e-05,
+      "max_rel": 0.01754237711429596,
+      "name": "grad.model.language_model.embed_tokens.weight",
+      "rtol": 0.001,
+      "shape": [
+        256,
+        32
+      ]
+    },
+    {
+      "allclose": true,
+      "atol": 0.001,
+      "kind": "tensor",
+      "max_abs": 3.2104551792144775e-05,
+      "max_rel": 9.474023818969727,
+      "name": "grad.model.language_model.layers.0.self_attn.q_proj.weight",
+      "rtol": 0.001,
+      "shape": [
+        32,
+        32
+      ]
+    },
+    {
+      "allclose": true,
+      "atol": 0.001,
+      "kind": "tensor",
+      "max_abs": 5.13959676027298e-05,
+      "max_rel": 0.026762431487441063,
+      "name": "grad.model.language_model.layers.0.self_attn.k_proj.weight",
+      "rtol": 0.001,
+      "shape": [
+        8,
+        32
+      ]
+    },
+    {
+      "allclose": true,
+      "atol": 0.001,
+      "kind": "tensor",
+      "max_abs": 4.7832727432250977e-05,
+      "max_rel": 0.00319843040779233,
+      "name": "grad.model.language_model.layers.0.self_attn.v_proj.weight",
+      "rtol": 0.001,
+      "shape": [
+        8,
+        32
+      ]
+    },
+    {
+      "allclose": true,
+      "atol": 0.001,
+      "kind": "tensor",
+      "max_abs": 3.1441450119018555e-05,
+      "max_rel": 0.023510176688432693,
+      "name": "grad.model.language_model.layers.0.self_attn.o_proj.weight",
+      "rtol": 0.001,
+      "shape": [
+        32,
+        32
+      ]
+    },
+    {
+      "allclose": true,
+      "atol": 0.001,
+      "kind": "tensor",
+      "max_abs": 2.201509252675038e-10,
+      "max_rel": 220.1509246826172,
+      "name": "grad.model.language_model.layers.0.mlp.gate.weight",
+      "rtol": 0.001,
+      "shape": [
+        4,
+        32
+      ]
+    },
+    {
+      "allclose": true,
+      "atol": 0.001,
+      "kind": "tensor",
+      "max_abs": 1.6003847122192383e-05,
+      "max_rel": 0.05802958086133003,
+      "name": "grad.model.language_model.layers.0.mlp.experts.gate_up_proj",
+      "rtol": 0.001,
+      "shape": [
+        4,
+        32,
+        32
+      ]
+    },
+    {
+      "allclose": true,
+      "atol": 0.001,
+      "kind": "tensor",
+      "max_abs": 1.3833865523338318e-05,
+      "max_rel": 0.032921869307756424,
+      "name": "grad.model.language_model.layers.0.mlp.experts.down_proj",
+      "rtol": 0.001,
+      "shape": [
+        4,
+        32,
+        16
+      ]
+    },
+    {
+      "allclose": true,
+      "atol": 0.001,
+      "kind": "tensor",
+      "max_abs": 3.8154423236846924e-05,
+      "max_rel": 0.5463822484016418,
+      "name": "grad.model.multi_modal_projector.linear_1.weight",
+      "rtol": 0.001,
+      "shape": [
+        32,
+        16
+      ]
+    },
+    {
+      "allclose": true,
+      "atol": 0.001,
+      "kind": "tensor",
+      "max_abs": 2.6009976863861084e-05,
+      "max_rel": 0.06982605904340744,
+      "name": "grad.model.multi_modal_projector.linear_2.weight",
+      "rtol": 0.001,
+      "shape": [
+        32,
+        32
+      ]
+    },
+    {
+      "allclose": true,
+      "atol": 0.001,
+      "kind": "tensor",
+      "max_abs": 1.7136335372924805e-05,
+      "max_rel": 2.436556339263916,
+      "name": "grad.model.multi_modal_projector.merge_linear_1.weight",
+      "rtol": 0.001,
+      "shape": [
+        32,
+        128
+      ]
+    },
+    {
+      "allclose": true,
+      "atol": 0.001,
+      "kind": "tensor",
+      "max_abs": 2.664327621459961e-05,
+      "max_rel": 0.20448127388954163,
+      "name": "grad.model.multi_modal_projector.merge_linear_2.weight",
+      "rtol": 0.001,
+      "shape": [
+        32,
+        32
+      ]
+    },
+    {
+      "allclose": true,
+      "atol": 0.001,
+      "kind": "tensor",
+      "max_abs": 2.09808349609375e-05,
+      "max_rel": 0.4448508024215698,
+      "name": "grad.lm_head.weight",
+      "rtol": 0.001,
+      "shape": [
+        256,
+        32
+      ]
+    },
+    {
+      "allclose": true,
+      "atol": 0.0001,
+      "kind": "tensor",
+      "max_abs": 0.0,
+      "max_rel": 0.0,
+      "name": "optimizer_delta.model.language_model.embed_tokens.weight",
+      "rtol": 0.0001,
+      "shape": [
+        256,
+        32
+      ]
+    },
+    {
+      "allclose": true,
+      "atol": 0.0001,
+      "kind": "tensor",
+      "max_abs": 1.990277087315917e-05,
+      "max_rel": 2.0016684532165527,
+      "name": "optimizer_delta.model.language_model.layers.0.self_attn.q_proj.weight",
+      "rtol": 0.0001,
+      "shape": [
+        32,
+        32
+      ]
+    },
+    {
+      "allclose": true,
+      "atol": 0.0001,
+      "kind": "tensor",
+      "max_abs": 0.0,
+      "max_rel": 0.0,
+      "name": "optimizer_delta.model.language_model.layers.0.self_attn.k_proj.weight",
+      "rtol": 0.0001,
+      "shape": [
+        8,
+        32
+      ]
+    },
+    {
+      "allclose": true,
+      "atol": 0.0001,
+      "kind": "tensor",
+      "max_abs": 0.0,
+      "max_rel": 0.0,
+      "name": "optimizer_delta.model.language_model.layers.0.self_attn.v_proj.weight",
+      "rtol": 0.0001,
+      "shape": [
+        8,
+        32
+      ]
+    },
+    {
+      "allclose": true,
+      "atol": 0.0001,
+      "kind": "tensor",
+      "max_abs": 5.820766091346741e-11,
+      "max_rel": 5.820823389512952e-06,
+      "name": "optimizer_delta.model.language_model.layers.0.self_attn.o_proj.weight",
+      "rtol": 0.0001,
+      "shape": [
+        32,
+        32
+      ]
+    },
+    {
+      "allclose": true,
+      "atol": 0.0001,
+      "kind": "tensor",
+      "max_abs": 2.1513551473617554e-07,
+      "max_rel": 2498.0,
+      "name": "optimizer_delta.model.language_model.layers.0.mlp.gate.weight",
+      "rtol": 0.0001,
+      "shape": [
+        4,
+        32
+      ]
+    },
+    {
+      "allclose": true,
+      "atol": 0.0001,
+      "kind": "tensor",
+      "max_abs": 1.1175870895385742e-08,
+      "max_rel": 0.0011393846943974495,
+      "name": "optimizer_delta.model.language_model.layers.0.mlp.experts.gate_up_proj",
+      "rtol": 0.0001,
+      "shape": [
+        4,
+        32,
+        32
+      ]
+    },
+    {
+      "allclose": true,
+      "atol": 0.0001,
+      "kind": "tensor",
+      "max_abs": 9.313225746154785e-10,
+      "max_rel": 9.314456110587344e-05,
+      "name": "optimizer_delta.model.language_model.layers.0.mlp.experts.down_proj",
+      "rtol": 0.0001,
+      "shape": [
+        4,
+        32,
+        16
+      ]
+    },
+    {
+      "allclose": true,
+      "atol": 0.0001,
+      "kind": "tensor",
+      "max_abs": 5.587935447692871e-09,
+      "max_rel": 0.0005589714855886996,
+      "name": "optimizer_delta.model.multi_modal_projector.linear_1.weight",
+      "rtol": 0.0001,
+      "shape": [
+        32,
+        16
+      ]
+    },
+    {
+      "allclose": true,
+      "atol": 0.0001,
+      "kind": "tensor",
+      "max_abs": 0.0,
+      "max_rel": 0.0,
+      "name": "optimizer_delta.model.multi_modal_projector.linear_2.weight",
+      "rtol": 0.0001,
+      "shape": [
+        32,
+        32
+      ]
+    },
+    {
+      "allclose": true,
+      "atol": 0.0001,
+      "kind": "tensor",
+      "max_abs": 1.994054764509201e-05,
+      "max_rel": 2.002263307571411,
+      "name": "optimizer_delta.model.multi_modal_projector.merge_linear_1.weight",
+      "rtol": 0.0001,
+      "shape": [
+        32,
+        128
+      ]
+    },
+    {
+      "allclose": true,
+      "atol": 0.0001,
+      "kind": "tensor",
+      "max_abs": 9.313225746154785e-10,
+      "max_rel": 9.318796219304204e-05,
+      "name": "optimizer_delta.model.multi_modal_projector.merge_linear_2.weight",
+      "rtol": 0.0001,
+      "shape": [
+        32,
+        32
+      ]
+    },
+    {
+      "allclose": true,
+      "atol": 0.0001,
+      "kind": "tensor",
+      "max_abs": 5.513429641723633e-07,
+      "max_rel": 0.07000946253538132,
+      "name": "optimizer_delta.lm_head.weight",
+      "rtol": 0.0001,
+      "shape": [
+        256,
+        32
+      ]
+    }
+  ],
+  "config_path": "./tests/toy_config/minimax_m3_vl_toy/config.json",
+  "date": "2026-06-22T14:27:59Z",
+  "device": "npu:0",
+  "failed": [],
+  "hf_model_class": "transformers.models.minimax_m3_vl.modeling_minimax_m3_vl.MiniMaxM3SparseForConditionalGeneration",
+  "image_token_id": 250,
+  "num_checks": 38,
+  "optimizer": {
+    "betas": [
+      0.9,
+      0.999
+    ],
+    "eps": 1e-08,
+    "foreach": false,
+    "lr": 1e-05,
+    "name": "AdamW",
+    "weight_decay": 0.01
+  },
+  "passed": true,
+  "reference_device": "cpu",
+  "runtime": {
+    "ascend_env": {
+      "ASCEND_HOME_PATH": "/usr/local/Ascend/cann-9.0.0",
+      "ASCEND_RT_VISIBLE_DEVICES": "0",
+      "ASCEND_TOOLKIT_HOME": "/usr/local/Ascend/cann-9.0.0",
+      "ASCEND_VISIBLE_DEVICES": null,
+      "MODELING_BACKEND": "veomni"
+    },
+    "machine": "aarch64",
+    "platform": "Linux-5.15.0-94-generic-aarch64-with-glibc2.35",
+    "python": "3.11.15 (main, May 13 2026, 07:56:17) [GCC 11.4.0]",
+    "python_executable": "/usr/local/python3.11.15/bin/python3",
+    "torch_npu_available": true,
+    "torch_npu_device_count": 1,
+    "torch_npu_error": null,
+    "torch_npu_version": "2.10.0",
+    "torch_version": "2.10.0+cpu",
+    "transformers_version": "5.12.0"
+  },
+  "seed": 20260622,
+  "state_dict_load": {
+    "missing_keys": [],
+    "strict": true,
+    "unexpected_keys": []
+  },
+  "tolerances": {
+    "forward": {
+      "atol": 0.0005,
+      "rtol": 0.0005
+    },
+    "grad": {
+      "atol": 0.001,
+      "rtol": 0.001
+    },
+    "param": {
+      "atol": 0.0001,
+      "rtol": 0.0001
+    }
+  },
+  "veomni_model_class": "veomni.models.transformers.minimax_m3_vl.generated.patched_modeling_minimax_m3_vl_npu.MiniMaxM3SparseForConditionalGeneration",
+  "video_token_id": 251
+}

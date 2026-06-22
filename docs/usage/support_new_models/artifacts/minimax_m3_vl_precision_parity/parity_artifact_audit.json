@@ -1,0 +1,50 @@
+{
+  "full_checkpoint_forward_passed": false,
+  "full_checkpoint_preflight_passed": false,
+  "multicard_passed": false,
+  "passed": true,
+  "require_full_checkpoint_forward": false,
+  "require_full_checkpoint_preflight": false,
+  "require_multicard": false,
+  "results": {
+    "checkpoint_forward_smoke": [
+      {
+        "issues": [],
+        "passed": true,
+        "path": "docs/usage/support_new_models/artifacts/minimax_m3_vl_precision_parity/toy_checkpoint_forward_parity.json"
+      },
+      {
+        "issues": [],
+        "passed": true,
+        "path": "docs/usage/support_new_models/artifacts/minimax_m3_vl_precision_parity/toy_checkpoint_cpu_npu_forward_parity.json"
+      }
+    ],
+    "checkpoint_payload_sample": [
+      {
+        "issues": [],
+        "passed": true,
+        "path": "docs/usage/support_new_models/artifacts/minimax_m3_vl_precision_parity/real_checkpoint_payload_remote_sample.json"
+      }
+    ],
+    "full_checkpoint_forward": [],
+    "full_checkpoint_preflight": [],
+    "multicard_parity": [],
+    "toy_precision": [
+      {
+        "issues": [],
+        "passed": true,
+        "path": "docs/usage/support_new_models/artifacts/minimax_m3_vl_precision_parity/toy_hf_veomni_parity.json"
+      },
+      {
+        "issues": [],
+        "passed": true,
+        "path": "docs/usage/support_new_models/artifacts/minimax_m3_vl_precision_parity/toy_hf_veomni_parity_npu.json"
+      },
+      {
+        "issues": [],
+        "passed": true,
+        "path": "docs/usage/support_new_models/artifacts/minimax_m3_vl_precision_parity/toy_hf_cpu_veomni_npu_parity.json"
+      }
+    ]
+  }
+}
