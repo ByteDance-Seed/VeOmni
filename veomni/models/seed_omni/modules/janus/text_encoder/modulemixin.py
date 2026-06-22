@@ -2,6 +2,7 @@ from typing import Any, Dict, List, Optional
 
 import torch
 import torch.nn.functional as F
+from transformers import PreTrainedTokenizerBase
 
 from veomni.utils.tensor_utils import naflatten, unflatten
 
@@ -38,7 +39,7 @@ class JanusTextEncoderCPUPreprocessor(CPUPreprocessor):
     ``encode_pre`` skips the redundant work.
     """
 
-    def __init__(self, tokenizer: Any, chat_markers: JanusChatMarkers) -> None:
+    def __init__(self, tokenizer: PreTrainedTokenizerBase, chat_markers: JanusChatMarkers) -> None:
         self._tokenizer = tokenizer
         self._chat_markers = chat_markers
 
@@ -142,13 +143,12 @@ class JanusTextEncoderModuleMixin(TextEncoderModuleMixin):
         conversation_list: list[list[ConversationItem]],
         segment_embeds: list[torch.Tensor],
     ) -> None:
-        dtype = self.dtype
         segment_embeds_iterator = iter(segment_embeds)
         for sample in conversation_list:
             for part in sample:
                 if part.type != "text":
                     continue
-                part.value = next(segment_embeds_iterator).to(device=self.device, dtype=dtype)
+                part.value = next(segment_embeds_iterator).to(device=self.device, dtype=self.dtype)
         if next(segment_embeds_iterator, None) is not None:
             raise RuntimeError(
                 f"text segment count mismatch: scattered {len(segment_embeds)}, expected {len(conversation_list)}"
@@ -193,17 +193,17 @@ class JanusTextEncoderModuleMixin(TextEncoderModuleMixin):
     # inference hooks
 
     @property
-    def tokenizer(self) -> Any:
+    def tokenizer(self) -> PreTrainedTokenizerBase:
         return self._tokenizer
 
     @tokenizer.setter
-    def tokenizer(self, tokenizer: Any) -> None:
+    def tokenizer(self, tokenizer: PreTrainedTokenizerBase) -> None:
         self._tokenizer = tokenizer
-        self._bos_token_id = int(tokenizer.bos_token_id)
-        self._eos_token_id = int(tokenizer.eos_token_id)
-        self._pad_token_id = int(tokenizer.pad_token_id)
-        self._boi_token_id = int(tokenizer.boi_token_id)
-        self._eoi_token_id = int(tokenizer.eoi_token_id)
+        self._bos_token_id = self._resolve_token_id(tokenizer, token_id=tokenizer.bos_token_id)
+        self._eos_token_id = self._resolve_token_id(tokenizer, token_id=tokenizer.eos_token_id)
+        self._pad_token_id = self._resolve_token_id(tokenizer, token_id=tokenizer.pad_token_id)
+        self._boi_token_id = self._resolve_token_id(tokenizer, token_id=tokenizer.boi_token_id)
+        self._eoi_token_id = self._resolve_token_id(tokenizer, token_id=tokenizer.eoi_token_id)
         self._chat_markers = JanusChatMarkers(
             bos_token=str(tokenizer.bos_token),
             eos_token=str(tokenizer.eos_token),

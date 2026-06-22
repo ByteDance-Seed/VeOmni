@@ -157,7 +157,12 @@ def test_mixin_registry_contains_all_v2_modules():
 
 def test_processor_registry_only_for_vision_modules():
     """janus_llama / text_encoder have no per-module asset."""
-    assert set(OMNI_PROCESSOR_REGISTRY.valid_keys()) == {"janus_siglip", "janus_vqvae", "qwen3vl_vision"}
+    assert set(OMNI_PROCESSOR_REGISTRY.valid_keys()) == {
+        "bagel_siglip_navit",
+        "janus_siglip",
+        "janus_vqvae",
+        "qwen3vl_vision",
+    }
 
 
 def test_all_registered_classes_are_module_mixins():

@@ -6,20 +6,20 @@ generation_graph:
   states:
     prompt_encode:
       body:
-        - { from: bagel_vae.encode,                               to: bagel_flow_connector.embed_latent }
-        - { from: bagel_siglip_navit,                             to: bagel_text_encoder.prompt_encode }
-        - { from: bagel_text_encoder.prompt_encode,               to: bagel_flow_connector.embed_latent }
-        - { from: bagel_flow_connector.embed_latent,              to: bagel_text_encoder.encode_image_query_markers }
-        - { from: bagel_text_encoder.encode_image_query_markers,  to: bagel_qwen2_mot }
-        - { from: bagel_qwen2_mot,                                to: end }
+        - { from: bagel_text_encoder,                     to: bagel_qwen2_mot }
+        - { from: bagel_vae.encode,                       to: bagel_siglip_navit }
+        - { from: bagel_siglip_navit,                     to: bagel_flow_connector.embed_latent }
+        - { from: bagel_flow_connector.embed_latent,      to: bagel_text_encoder.encode_image_markers }
+        - { from: bagel_text_encoder.encode_image_markers, to: bagel_qwen2_mot }
+        - { from: bagel_qwen2_mot,                        to: end }
       transitions:
         - { condition: { type: default }, next_state: denoise_query }
 
     denoise_query:
       body:
-        - { from: bagel_flow_connector,                         to: bagel_text_encoder.encode_image_query_markers }
-        - { from: bagel_text_encoder.encode_image_query_markers, to: bagel_qwen2_mot }
-        - { from: bagel_qwen2_mot,                              to: end }
+        - { from: bagel_flow_connector,                    to: bagel_text_encoder.encode_image_markers }
+        - { from: bagel_text_encoder.encode_image_markers, to: bagel_qwen2_mot }
+        - { from: bagel_qwen2_mot,                         to: end }
       transitions:
         - { condition: { type: default }, next_state: velocity_collect }
 

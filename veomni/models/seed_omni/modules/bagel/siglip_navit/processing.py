@@ -1,4 +1,4 @@
-"""Stateless image preprocessing helpers for BAGEL SigLIP NaViT."""
+"""Image processor and carrier helpers for BAGEL SigLIP NaViT."""
 
 from __future__ import annotations
 
@@ -10,9 +10,121 @@ import torch.nn.functional as F
 from PIL import Image
 from torchvision.transforms import InterpolationMode
 from torchvision.transforms import functional as TVF
+from transformers.image_processing_utils import BaseImageProcessor, BatchFeature
 
 from ....conversation import ConversationItem, is_dummy
-from ..carrier_updates import materialize_carrier_updates, replace_value
+from ..carrier_updates import materialize_carrier_updates, replace_fields
+from ..sources import BAGEL_SIGLIP_CONTEXT
+
+
+class BagelSiglipNavitProcessor(BaseImageProcessor):
+    """BAGEL SigLIP NaViT image processor.
+
+    Converts raw images into flattened patch rows plus the varlen metadata that
+    the NaViT tower consumes. Carrier selection and embed scatter stay in the
+    module mixin because they are SeedOmni conversation semantics.
+    """
+
+    model_input_names = [
+        "patchified_pixel_values",
+        "patchified_position_ids",
+        "cu_seqlens",
+        "max_seqlen",
+        "token_lens",
+    ]
+
+    def __init__(
+        self,
+        patch_size: int = 14,
+        image_size: int = 980,
+        min_image_size: int = 378,
+        max_pixels: int = 14 * 14 * 9 * 1024,
+        image_mean: list[float] | None = None,
+        image_std: list[float] | None = None,
+        vit_max_num_patch_per_side: int = 70,
+        num_channels: int = 3,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(**kwargs)
+        self.patch_size = patch_size
+        self.image_size = image_size
+        self.min_image_size = min_image_size
+        self.max_pixels = max_pixels
+        self.image_mean = [0.5, 0.5, 0.5] if image_mean is None else image_mean
+        self.image_std = [0.5, 0.5, 0.5] if image_std is None else image_std
+        self.vit_max_num_patch_per_side = vit_max_num_patch_per_side
+        self.num_channels = num_channels
+
+    @classmethod
+    def from_config(cls, config: Any) -> BagelSiglipNavitProcessor:
+        return cls(
+            patch_size=int(config.patch_size),
+            image_size=int(config.image_size),
+            min_image_size=int(config.min_image_size),
+            max_pixels=int(config.max_pixels),
+            image_mean=list(config.image_mean),
+            image_std=list(config.image_std),
+            vit_max_num_patch_per_side=int(config.vit_max_num_patch_per_side),
+            num_channels=int(config.num_channels),
+        )
+
+    def preprocess(
+        self,
+        images: Any,
+        *,
+        return_tensors: str | None = None,
+        device: torch.device | None = None,
+        dtype: torch.dtype | None = None,
+        **kwargs: Any,
+    ) -> BatchFeature:
+        del return_tensors, kwargs
+        image_list = images if isinstance(images, list) else [images]
+        data = self.prepare_image_batch(image_list, device=device, dtype=dtype)
+        return BatchFeature(data=data)
+
+    def prepare_image_batch(
+        self,
+        images: list[Any],
+        *,
+        device: torch.device | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> dict[str, Any]:
+        pixel_values: list[torch.Tensor] = []
+        position_ids: list[torch.Tensor] = []
+        token_lens: list[int] = []
+        for image in images:
+            image_tensor = preprocess_image(
+                image,
+                patch_size=self.patch_size,
+                image_size=self.image_size,
+                min_image_size=self.min_image_size,
+                max_pixels=self.max_pixels,
+                image_mean=self.image_mean,
+                image_std=self.image_std,
+            )
+            patches = patchify_image(image_tensor, self.patch_size)
+            positions = flattened_position_ids(
+                image_tensor.shape[-2],
+                image_tensor.shape[-1],
+                patch_size=self.patch_size,
+                max_num_patches_per_side=self.vit_max_num_patch_per_side,
+            )
+            pixel_values.append(patches)
+            position_ids.append(positions)
+            token_lens.append(int(patches.shape[0]))
+
+        tensor_device = torch.device("cpu") if device is None else device
+        token_lens_tensor = torch.tensor(token_lens, dtype=torch.int32, device=tensor_device)
+        pixel_tensor = torch.cat(pixel_values, dim=0)
+        if dtype is not None:
+            pixel_tensor = pixel_tensor.to(dtype=dtype)
+        return {
+            "patchified_pixel_values": pixel_tensor.to(device=tensor_device),
+            "patchified_position_ids": torch.cat(position_ids, dim=0).to(device=tensor_device, dtype=torch.long),
+            "cu_seqlens": F.pad(torch.cumsum(token_lens_tensor, dim=0), (1, 0)).to(torch.int32),
+            "max_seqlen": int(token_lens_tensor.max().item()),
+            "token_lens": token_lens_tensor,
+        }
 
 
 def preprocess_image(
@@ -235,6 +347,7 @@ def user_raw_image_items(
         if item.type == "image"
         and item.role == "user"
         and not is_dummy(item)
+        and item.source in (None, BAGEL_SIGLIP_CONTEXT)
         and not is_encoded_image_value(item.value, output_size=output_size)
     ]
 
@@ -254,38 +367,11 @@ def prepare_image_batch(
     device: torch.device,
     dtype: torch.dtype,
 ) -> dict[str, Any]:
-    pixel_values: list[torch.Tensor] = []
-    position_ids: list[torch.Tensor] = []
-    token_lens: list[int] = []
-    for item in image_items:
-        image_tensor = preprocess_image(
-            item.value,
-            patch_size=config.patch_size,
-            image_size=config.image_size,
-            min_image_size=config.min_image_size,
-            max_pixels=config.max_pixels,
-            image_mean=config.image_mean,
-            image_std=config.image_std,
-        )
-        patches = patchify_image(image_tensor, config.patch_size)
-        positions = flattened_position_ids(
-            image_tensor.shape[-2],
-            image_tensor.shape[-1],
-            patch_size=config.patch_size,
-            max_num_patches_per_side=config.vit_max_num_patch_per_side,
-        )
-        pixel_values.append(patches)
-        position_ids.append(positions)
-        token_lens.append(int(patches.shape[0]))
-
-    token_lens_tensor = torch.tensor(token_lens, dtype=torch.int32, device=device)
-    return {
-        "patchified_pixel_values": torch.cat(pixel_values, dim=0).to(device=device, dtype=dtype),
-        "patchified_position_ids": torch.cat(position_ids, dim=0).to(device=device, dtype=torch.long),
-        "cu_seqlens": F.pad(torch.cumsum(token_lens_tensor, dim=0), (1, 0)).to(torch.int32),
-        "max_seqlen": int(token_lens_tensor.max().item()),
-        "token_lens": token_lens_tensor,
-    }
+    return BagelSiglipNavitProcessor.from_config(config).prepare_image_batch(
+        [item.value for item in image_items],
+        device=device,
+        dtype=dtype,
+    )
 
 
 def scatter_image_embeds(
@@ -302,7 +388,13 @@ def scatter_image_embeds(
         raise RuntimeError("BAGEL SigLIP image count mismatch during feature scatter.")
     updates = []
     for item, length in zip(image_items, lengths, strict=True):
-        updates.append(replace_value(item, image_embeds[offset : offset + int(length)].to(device=device, dtype=dtype)))
+        updates.append(
+            replace_fields(
+                item,
+                value=image_embeds[offset : offset + int(length)].to(device=device, dtype=dtype),
+                source=BAGEL_SIGLIP_CONTEXT,
+            )
+        )
         offset += int(length)
     if offset != int(image_embeds.shape[0]):
         raise RuntimeError("BAGEL SigLIP token count mismatch during feature scatter.")
@@ -311,6 +403,7 @@ def scatter_image_embeds(
 
 __all__ = [
     "apply_scale",
+    "BagelSiglipNavitProcessor",
     "flattened_position_ids",
     "image_items",
     "is_encoded_image_value",

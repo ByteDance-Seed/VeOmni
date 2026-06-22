@@ -11,13 +11,15 @@ from veomni.models.seed_omni.generation_graph import GenerationGraph
 from veomni.models.seed_omni.modules.bagel.carrier_updates import (
     insert_before,
     materialize_carrier_updates,
+    replace_fields,
     replace_value,
 )
 from veomni.models.seed_omni.modules.bagel.flow_connector.processing import flow_latent_items
 from veomni.models.seed_omni.modules.bagel.qwen2_mot.processing import pack_training_conversation
+from veomni.models.seed_omni.modules.bagel.sources import BAGEL_SIGLIP_CONTEXT, BAGEL_VAE_CONTEXT
 from veomni.models.seed_omni.modules.bagel.text_encoder.processing import (
-    apply_image_embed_markers,
-    image_embed_marker_items,
+    apply_image_marker,
+    is_image_item,
 )
 
 
@@ -26,8 +28,15 @@ _HIDDEN_SIZE = 4
 _Z_CHANNELS = 2
 
 
-def _item(value: object, *, type_: str, role: str = "user", meta: dict[str, Any] | None = None) -> ConversationItem:
-    return ConversationItem(type=type_, value=value, role=role, meta={} if meta is None else dict(meta))
+def _item(
+    value: object,
+    *,
+    type_: str,
+    role: str = "user",
+    source: str | None = None,
+    meta: dict[str, Any] | None = None,
+) -> ConversationItem:
+    return ConversationItem(type=type_, value=value, role=role, source=source, meta={} if meta is None else dict(meta))
 
 
 def _raw_prompt_sample() -> tuple[list[ConversationItem], ConversationItem, ConversationItem]:
@@ -66,10 +75,15 @@ def _prompt_updates(
         _vae_context_latent() if latent_value is None else latent_value,
         type_="output",
         role="assistant",
+        source=BAGEL_VAE_CONTEXT,
     )
     return latent_item, [
         insert_before(image_item, latent_item),
-        replace_value(image_item, _siglip_image_embeds() if image_embeds is None else image_embeds),
+        replace_fields(
+            image_item,
+            value=_siglip_image_embeds() if image_embeds is None else image_embeds,
+            source=BAGEL_SIGLIP_CONTEXT,
+        ),
     ]
 
 
@@ -77,7 +91,10 @@ def _materialized_prompt_sequential() -> tuple[list[ConversationItem], Conversat
     sample, image_item, text_item = _raw_prompt_sample()
     latent_item, _ = _prompt_updates(image_item)
     materialize_carrier_updates([sample], [insert_before(image_item, latent_item)])
-    materialize_carrier_updates([sample], [replace_value(image_item, _siglip_image_embeds())])
+    materialize_carrier_updates(
+        [sample],
+        [replace_fields(image_item, value=_siglip_image_embeds(), source=BAGEL_SIGLIP_CONTEXT)],
+    )
     return sample, latent_item, text_item
 
 
@@ -107,16 +124,19 @@ def test_bagel_prompt_graphs_expose_independent_vae_and_siglip_producers() -> No
         graph_config = yaml.safe_load((_BAGEL_CONFIG_DIR / graph_name).read_text())["generation_graph"]
         prompt_body = graph_config["states"]["prompt_encode"]["body"]
 
-        assert {"from": "bagel_vae.encode", "to": "bagel_flow_connector.embed_latent"} in prompt_body
-        assert {"from": "bagel_siglip_navit", "to": "bagel_text_encoder.prompt_encode"} in prompt_body
-        assert {"from": "bagel_text_encoder.prompt_encode", "to": "bagel_flow_connector.embed_latent"} in prompt_body
+        assert {"from": "bagel_text_encoder", "to": "bagel_qwen2_mot"} in prompt_body
+        assert {"from": "bagel_vae.encode", "to": "bagel_siglip_navit"} in prompt_body
+        assert {"from": "bagel_siglip_navit", "to": "bagel_flow_connector.embed_latent"} in prompt_body
         assert {
             "from": "bagel_flow_connector.embed_latent",
-            "to": "bagel_text_encoder.encode_image_query_markers",
+            "to": "bagel_text_encoder.encode_image_markers",
+        } in (prompt_body)
+        assert {
+            "from": "bagel_text_encoder.encode_image_markers",
+            "to": "bagel_qwen2_mot",
         } in (prompt_body)
 
         forbidden_edges = {
-            ("bagel_vae.encode", "bagel_siglip_navit"),
             ("bagel_siglip_navit", "bagel_vae.encode"),
         }
         assert not forbidden_edges.intersection({(edge["from"], edge["to"]) for edge in prompt_body})
@@ -163,17 +183,17 @@ def test_repeated_prompt_update_materialization_does_not_duplicate_context_laten
 
 
 def test_image_marker_wrapping_is_idempotent() -> None:
-    image_item = _item(_siglip_image_embeds(), type_="image")
-    marker_embeds = _marker_embeds()
+    image_item = _item(_siglip_image_embeds(), type_="image", source=BAGEL_SIGLIP_CONTEXT)
+    marker_embeds = _marker_embeds().squeeze(0)
 
-    apply_image_embed_markers([image_item], marker_embeds, device=torch.device("cpu"), dtype=torch.float32)
+    apply_image_marker(image_item, marker_embeds, device=torch.device("cpu"), dtype=torch.float32)
     wrapped_once = image_item.value.clone()
-    apply_image_embed_markers([image_item], marker_embeds, device=torch.device("cpu"), dtype=torch.float32)
+    apply_image_marker(image_item, marker_embeds, device=torch.device("cpu"), dtype=torch.float32)
 
     assert torch.equal(image_item.value, wrapped_once)
     assert image_item.value.shape == (5, _HIDDEN_SIZE)
-    assert torch.equal(image_item.value[:1], marker_embeds[0, :1])
-    assert torch.equal(image_item.value[-1:], marker_embeds[0, 1:])
+    assert torch.equal(image_item.value[:1], marker_embeds[:1])
+    assert torch.equal(image_item.value[-1:], marker_embeds[1:])
 
 
 def test_downstream_prompt_consumers_see_sequentially_equivalent_carrier() -> None:
@@ -183,9 +203,10 @@ def test_downstream_prompt_consumers_see_sequentially_equivalent_carrier() -> No
     assert flow_items == [latent_item]
     materialize_carrier_updates([sample], [replace_value(latent_item, _flow_context_embeds())])
 
-    image_items = image_embed_marker_items([sample], item_types={"image"})
-    assert image_items == [sample[1]]
-    apply_image_embed_markers(image_items, _marker_embeds(), device=torch.device("cpu"), dtype=torch.float32)
+    image_items = [item for item in sample if is_image_item(item)]
+    assert image_items == [latent_item, sample[1]]
+    for image_item in image_items:
+        apply_image_marker(image_item, _marker_embeds().squeeze(0), device=torch.device("cpu"), dtype=torch.float32)
     text_item.value = _text_embeds()
 
     packed = pack_training_conversation(
@@ -197,6 +218,6 @@ def test_downstream_prompt_consumers_see_sequentially_equivalent_carrier() -> No
 
     assert packed is not None
     assert [span.item for span in packed.spans] == [latent_item, sample[1], text_item]
-    assert packed.sample_lens == [9]
-    assert torch.equal(packed.packed_gen_token_indexes, torch.arange(0, 2))
-    assert torch.equal(packed.packed_und_token_indexes, torch.arange(2, 9))
+    assert packed.sample_lens == [11]
+    assert torch.equal(packed.packed_gen_token_indexes, torch.arange(0, 4))
+    assert torch.equal(packed.packed_und_token_indexes, torch.arange(4, 11))

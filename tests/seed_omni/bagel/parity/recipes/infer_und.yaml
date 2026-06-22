@@ -3,9 +3,7 @@ text_only_prefill:
       conversation_list:
         - type: text
           role: user
-          value:
-            kind: text
-            text: "Describe yourself in one short sentence."
+          value: "Describe yourself in one short sentence."
       generation_kwargs:
         max_new_tokens: 1
         do_sample: false
@@ -35,9 +33,7 @@ text_image_prefill:
             height: 560
         - type: text
           role: user
-          value:
-            kind: text
-            text: "What is the dominant visual pattern in this image?"
+          value: "What is the dominant visual pattern in this image?"
       generation_kwargs:
         max_new_tokens: 1
         do_sample: false
@@ -61,9 +57,7 @@ module_text_encoder_prompt:
       conversation_list:
         - type: text
           role: user
-          value:
-            kind: text
-            text: "Describe yourself in one short sentence."
+          value: "Describe yourself in one short sentence."
       generation_kwargs:
         max_new_tokens: 1
         do_sample: false
@@ -114,9 +108,7 @@ module_qwen2_mot_text_prefill:
       conversation_list:
         - type: text
           role: user
-          value:
-            kind: text
-            text: "Answer in one word."
+          value: "Answer in one word."
       generation_kwargs:
         max_new_tokens: 1
         do_sample: false

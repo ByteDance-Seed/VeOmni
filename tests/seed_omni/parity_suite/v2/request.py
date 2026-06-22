@@ -36,20 +36,26 @@ class V2RequestContext:
 def conversation_request_from_conversation_list(ctx: V2RequestContext) -> dict[str, Any]:
     """Build the default V2 request from authored conversation stimulus only."""
 
-    conversation_list = conversation_stimulus_to_batched_specs(ctx.stimulus)
+    batched_conversation_list = conversation_stimulus_to_batched_specs(ctx.stimulus)
+    if "conversation_list" in ctx.stimulus:
+        conversation_list = [ctx.stimulus["conversation_list"]]
+    else:
+        conversation_list = batched_conversation_list
     if conversation_list is None:
         raise KeyError(
             "Default V2 conversation request requires stimulus.conversation_list "
             "or stimulus.batched_conversation_list."
         )
-    return {
-        "conversation_list": conversation_list_from_specs(
-            conversation_list,
-            case=ctx.case,
-            canonical=ctx.canonical,
-            device=ctx.device,
-        )
-    }
+
+    materialized = conversation_list_from_specs(
+        conversation_list,
+        case=ctx.case,
+        canonical=ctx.canonical,
+        device=ctx.device,
+    )
+    if "conversation_list" in ctx.stimulus and getattr(ctx.case.graph, "domain", None) != "training":
+        return {"conversation_list": materialized[0]}
+    return {"conversation_list": materialized}
 
 
 # Conversation materialization ------------------------------------------------
@@ -107,15 +113,22 @@ def _conversation_item_from_spec(
             f"Unsupported conversation item type {item_type!r}; expected one of {sorted(_ALLOWED_ITEM_TYPES)}."
         )
     meta = _materialize_meta(spec.get("meta", {}) or {}, device=device)
-    return ConversationItem(
-        type=item_type,
-        value=_materialize_value_spec(
-            spec["value"],
+    value_spec = spec["value"]
+    if item_type == "text":
+        if not isinstance(value_spec, str):
+            raise TypeError(f"Text conversation item value must be str; got {type(value_spec).__name__}.")
+        value = value_spec
+    else:
+        value = _materialize_value_spec(
+            value_spec,
             device=device,
             case=case,
             sample_index=sample_index,
             item_index=item_index,
-        ),
+        )
+    return ConversationItem(
+        type=item_type,
+        value=value,
         role=str(spec.get("role", "user")),
         source=spec.get("source"),
         meta=meta,
@@ -149,13 +162,10 @@ def _materialize_value_spec(
         )
     if kind == "linspace":
         return _materialize_linspace_value(value, device=device)
-    if kind == "text":
-        return str(value.get("text", ""))
     if kind == "image":
         return _materialize_image_value(value)
     raise ValueError(
-        "Unsupported conversation item value kind "
-        f"{kind!r}; expected 'tensor', 'random', 'linspace', 'text', or 'image'."
+        f"Unsupported conversation item value kind {kind!r}; expected 'tensor', 'random', 'linspace', or 'image'."
     )
 
 

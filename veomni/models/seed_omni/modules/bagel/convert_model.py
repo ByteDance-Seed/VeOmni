@@ -226,6 +226,9 @@ def convert_bagel_checkpoint(
         target_root,
         allowed_missing={"vit_pos_embed.pos_embed"},
     )
+    from veomni.models.seed_omni.modules.bagel.siglip_navit.processing import BagelSiglipNavitProcessor
+
+    BagelSiglipNavitProcessor.from_config(siglip_cfg).save_pretrained(target_root / "bagel_siglip_navit")
 
     flow_cfg_cls = OMNI_CONFIG_REGISTRY["bagel_flow_connector"]()
     patch_latent_dim = 2 * 2 * 16

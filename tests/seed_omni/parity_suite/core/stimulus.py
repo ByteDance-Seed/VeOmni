@@ -10,7 +10,7 @@ from typing import Any
 
 
 CONVERSATION_ITEM_TYPES = frozenset({"image", "text", "output"})
-CONVERSATION_VALUE_KINDS = frozenset({"tensor", "random", "text", "image"})
+CONVERSATION_VALUE_KINDS = frozenset({"tensor", "random", "linspace", "image"})
 
 
 # Public stimulus helpers ------------------------------------------------------
@@ -87,10 +87,14 @@ def _validate_conversation_items(recipe_label: str, items: Any, *, path: str) ->
             )
         if "value" not in item:
             raise ValueError(f"{recipe_label} {item_path} must declare value.")
-        _validate_conversation_value(recipe_label, item["value"], path=f"{item_path}.value")
+        _validate_conversation_value(recipe_label, item["value"], item_type=item_type, path=f"{item_path}.value")
 
 
-def _validate_conversation_value(recipe_label: str, value: Any, *, path: str) -> None:
+def _validate_conversation_value(recipe_label: str, value: Any, *, item_type: str, path: str) -> None:
+    if item_type == "text":
+        if not isinstance(value, str):
+            raise TypeError(f"{recipe_label} {path} for text items must be a string.")
+        return
     if not isinstance(value, dict):
         raise TypeError(f"{recipe_label} {path} must be a mapping with a kind field.")
     kind = value.get("kind")
@@ -107,8 +111,8 @@ def _validate_conversation_value(recipe_label: str, value: Any, *, path: str) ->
         raise ValueError(f"{recipe_label} {path} with kind: tensor must declare tensor.")
     if kind == "random" and "shape" not in value:
         raise ValueError(f"{recipe_label} {path} with kind: random must declare shape.")
-    if kind == "text" and "text" not in value:
-        raise ValueError(f"{recipe_label} {path} with kind: text must declare text.")
+    if kind == "linspace" and ("start" not in value or "end" not in value):
+        raise ValueError(f"{recipe_label} {path} with kind: linspace must declare start and end.")
     if kind == "image":
         for dim in ("width", "height"):
             if dim in value and not isinstance(value[dim], int):

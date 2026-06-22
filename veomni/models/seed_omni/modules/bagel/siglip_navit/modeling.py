@@ -20,6 +20,69 @@ from transformers.activations import ACT2FN
 
 from .configuration import BagelSiglipNavitConfig
 from .modulemixin import BagelSiglipNavitModuleMixin, BagelSiglipNavitTraceMixin
+from .processing import BagelSiglipNavitProcessor
+
+
+class BagelSiglipNavit(BagelSiglipNavitModuleMixin, BagelSiglipNavitTraceMixin, PreTrainedModel):
+    config_class = BagelSiglipNavitConfig
+    image_processor_class = BagelSiglipNavitProcessor
+    base_model_prefix = "bagel_siglip_navit"
+    main_input_name = "patchified_pixel_values"
+    _no_split_modules = ["BagelSiglipEncoderLayer"]
+    supports_gradient_checkpointing = True
+
+    def __init__(self, config: BagelSiglipNavitConfig) -> None:
+        super().__init__(config)
+        self.vision_model = BagelSiglipVisionTransformer(config)
+        self.connector = MLPConnector(config.hidden_size, config.output_size, config.connector_act)
+        self.vit_pos_embed = PositionEmbedding(config.vit_max_num_patch_per_side, config.output_size)
+        self.post_init()
+
+    def _init_weights(self, module: nn.Module) -> None:
+        if isinstance(module, PositionEmbedding):
+            module.reset_parameters()
+            return
+        super()._init_weights(module)
+
+    def forward(  # type: ignore[override]
+        self,
+        patchified_pixel_values: torch.Tensor | None = None,
+        patchified_position_ids: torch.LongTensor | None = None,
+        cu_seqlens: torch.IntTensor | None = None,
+        max_seqlen: int | None = None,
+        token_lens: torch.IntTensor | None = None,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        del kwargs
+
+        if patchified_pixel_values is None:
+            dummy = self.dummy_inputs()
+            outputs = self.forward(**dummy)
+            outputs["is_dummy"] = True
+            return outputs
+
+        if patchified_position_ids is None or cu_seqlens is None or max_seqlen is None:
+            raise ValueError("BagelSiglipNavit.forward requires position ids, cu_seqlens, and max_seqlen.")
+
+        vit_device = self.vision_model.embeddings.patch_embedding.weight.device
+        patchified_pixel_values = patchified_pixel_values.to(device=vit_device, dtype=self.dtype)
+        patchified_position_ids = patchified_position_ids.to(device=vit_device, dtype=torch.long)
+        cu_seqlens = cu_seqlens.to(device=vit_device, dtype=torch.int32)
+        vit_hidden = self.vision_model(
+            patchified_pixel_values=patchified_pixel_values,
+            patchified_position_ids=patchified_position_ids,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
+        )
+        connector_device = self.connector.fc1.weight.device
+        vit_hidden = vit_hidden.to(device=connector_device, dtype=self.connector.fc1.weight.dtype)
+        patchified_position_ids = patchified_position_ids.to(device=self.vit_pos_embed.pos_embed.device)
+        image_embeds = self.connector(vit_hidden)
+        image_embeds = image_embeds + self.vit_pos_embed(patchified_position_ids).to(
+            device=image_embeds.device,
+            dtype=image_embeds.dtype,
+        )
+        return {"image_embeds": image_embeds, "token_lens": token_lens}
 
 
 class RotaryEmbedding2D(nn.Module):
@@ -321,67 +384,6 @@ class BagelSiglipVisionTransformer(nn.Module):
             **extra_inputs,
         )
         return self.post_layernorm(last_hidden_state)
-
-
-class BagelSiglipNavit(BagelSiglipNavitModuleMixin, BagelSiglipNavitTraceMixin, PreTrainedModel):
-    config_class = BagelSiglipNavitConfig
-    base_model_prefix = "bagel_siglip_navit"
-    main_input_name = "patchified_pixel_values"
-    _no_split_modules = ["BagelSiglipEncoderLayer"]
-    supports_gradient_checkpointing = True
-
-    def __init__(self, config: BagelSiglipNavitConfig) -> None:
-        super().__init__(config)
-        self.vision_model = BagelSiglipVisionTransformer(config)
-        self.connector = MLPConnector(config.hidden_size, config.output_size, config.connector_act)
-        self.vit_pos_embed = PositionEmbedding(config.vit_max_num_patch_per_side, config.output_size)
-        self.post_init()
-
-    def _init_weights(self, module: nn.Module) -> None:
-        if isinstance(module, PositionEmbedding):
-            module.reset_parameters()
-            return
-        super()._init_weights(module)
-
-    def forward(  # type: ignore[override]
-        self,
-        patchified_pixel_values: torch.Tensor | None = None,
-        patchified_position_ids: torch.LongTensor | None = None,
-        cu_seqlens: torch.IntTensor | None = None,
-        max_seqlen: int | None = None,
-        token_lens: torch.IntTensor | None = None,
-        **kwargs: Any,
-    ) -> dict[str, Any]:
-        del kwargs
-
-        if patchified_pixel_values is None:
-            dummy = self.dummy_inputs()
-            outputs = self.forward(**dummy)
-            outputs["is_dummy"] = True
-            return outputs
-
-        if patchified_position_ids is None or cu_seqlens is None or max_seqlen is None:
-            raise ValueError("BagelSiglipNavit.forward requires position ids, cu_seqlens, and max_seqlen.")
-
-        vit_device = self.vision_model.embeddings.patch_embedding.weight.device
-        patchified_pixel_values = patchified_pixel_values.to(device=vit_device, dtype=self.dtype)
-        patchified_position_ids = patchified_position_ids.to(device=vit_device, dtype=torch.long)
-        cu_seqlens = cu_seqlens.to(device=vit_device, dtype=torch.int32)
-        vit_hidden = self.vision_model(
-            patchified_pixel_values=patchified_pixel_values,
-            patchified_position_ids=patchified_position_ids,
-            cu_seqlens=cu_seqlens,
-            max_seqlen=max_seqlen,
-        )
-        connector_device = self.connector.fc1.weight.device
-        vit_hidden = vit_hidden.to(device=connector_device, dtype=self.connector.fc1.weight.dtype)
-        patchified_position_ids = patchified_position_ids.to(device=self.vit_pos_embed.pos_embed.device)
-        image_embeds = self.connector(vit_hidden)
-        image_embeds = image_embeds + self.vit_pos_embed(patchified_position_ids).to(
-            device=image_embeds.device,
-            dtype=image_embeds.dtype,
-        )
-        return {"image_embeds": image_embeds, "token_lens": token_lens}
 
 
 __all__ = [

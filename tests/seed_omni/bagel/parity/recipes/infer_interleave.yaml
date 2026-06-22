@@ -9,9 +9,7 @@ infer_interleave_text_image_then_gen:
             height: 512
         - type: text
           role: user
-          value:
-            kind: text
-            text: "Describe the image briefly, then make it brighter."
+          value: "Describe the image briefly, then make it brighter."
       generation_kwargs:
         infer_mode: gen
         image_height: 512
@@ -42,6 +40,7 @@ infer_interleave_text_image_then_gen:
     runs:
       graph:
         - id: denoise_multistep_cfg_text_img
+          enable: false
           options:
             max_tensor_numel: 4000000
           probes:

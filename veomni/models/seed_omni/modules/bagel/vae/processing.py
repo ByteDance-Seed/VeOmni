@@ -17,7 +17,7 @@ from ..carrier_updates import (
     materialize_carrier_updates,
     replace_fields,
 )
-from ..sources import BAGEL_GENERATED_LATENT
+from ..sources import BAGEL_GENERATED_LATENT, BAGEL_VAE_CONTEXT
 
 
 def preprocess_image(
@@ -232,7 +232,11 @@ def raw_context_image_items(
         (sample, item)
         for sample in conversation_list or []
         for item in sample
-        if item.type == "image" and item.role == "user" and not is_dummy(item) and looks_raw_image_value(item.value)
+        if item.type == "image"
+        and item.role == "user"
+        and not is_dummy(item)
+        and looks_raw_image_value(item.value)
+        and item.source in (None, BAGEL_VAE_CONTEXT)
     ]
 
 
@@ -301,6 +305,7 @@ def insert_context_encoded_latents(
                     type="output",
                     value=latent.to(device=device, dtype=dtype),
                     role="assistant",
+                    source=BAGEL_VAE_CONTEXT,
                     meta={},
                 ),
             )

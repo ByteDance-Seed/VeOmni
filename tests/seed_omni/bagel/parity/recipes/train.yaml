@@ -5,9 +5,7 @@ train_ce:
       conversation_list:
         - type: text
           role: assistant
-          value:
-            kind: text
-            text: "Describe BAGEL in one short sentence."
+          value: "Describe BAGEL in one short sentence."
     reference:
       oracle: hf_model
     gate:
@@ -35,9 +33,7 @@ train_ce_mse:
       conversation_list:
         - type: text
           role: assistant
-          value:
-            kind: text
-            text: "Describe BAGEL in one short sentence."
+          value: "Describe BAGEL in one short sentence."
         - type: image
           role: assistant
           value:
@@ -185,9 +181,7 @@ train_text_image_ce:
             height: 224
         - type: text
           role: assistant
-          value:
-            kind: text
-            text: "Describe BAGEL in one short sentence."
+          value: "Describe BAGEL in one short sentence."
     reference:
       oracle: hf_model
     gate:

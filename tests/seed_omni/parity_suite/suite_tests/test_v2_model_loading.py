@@ -84,9 +84,7 @@ def test_bagel_module_recipe_selects_module_level_config_from_oracle_target() ->
     assert config.modules["bagel_text_encoder"]["model"]["model_path"] == "bagel_text_encoder"
     assert config.training_graph == []
     assert config.generation_graph["initial"] == "prompt_encode"
-    assert config.generation_graph["states"]["prompt_encode"]["body"] == [
-        {"from": "bagel_text_encoder.prompt_encode", "to": "end"}
-    ]
+    assert config.generation_graph["states"]["prompt_encode"]["body"] == [{"from": "bagel_text_encoder", "to": "end"}]
 
 
 def test_bagel_infer_edit_case_declares_recipe_level_v2_module_override() -> None:

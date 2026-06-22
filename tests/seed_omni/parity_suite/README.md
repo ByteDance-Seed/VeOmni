@@ -52,7 +52,7 @@ Shared `parity_suite` code is model-agnostic. It owns discovery, gating, referen
 
 Prefer importing helpers from their owning module (`v2.observation`, `v2.model`, `reference.oracles.hf_model`, and so on) instead of high-level package re-exports. Top-level packages are intentionally thin namespaces so internal test-runtime helpers do not become accidental public APIs.
 
-Model drivers own concrete input adaptation. A driver may start from raw fixtures, model-owned canonical data, or reference outputs, but shared suite code treats those values as opaque. Standard conversation-carrier recipes can declare ``stimulus.conversation_list`` for a single sample or ``stimulus.batched_conversation_list`` for an explicit batch and use the default request builder, which returns the production ``{"conversation_list": list[list[ConversationItem]]}`` shape. Implement ``build_{reference.kind}_request`` hook methods on ``ParityDriver`` subclasses only when a case needs non-standard request adaptation. Hook methods should return common V2 request keys, usually ``{"conversation_list": ...}``, and leave model-internal conversion to model runtime hooks or model-specific helpers.
+Model drivers own concrete input adaptation. A driver may start from raw fixtures, model-owned canonical data, or reference outputs, but shared suite code treats those values as opaque. Standard conversation-carrier recipes can declare ``stimulus.conversation_list`` for a single sample or ``stimulus.batched_conversation_list`` for an explicit batch and use the default request builder. For V2 inference requests, ``stimulus.conversation_list`` materializes to the production ``{"conversation_list": list[ConversationItem]}`` shape; for V2 training requests, it materializes to ``{"conversation_list": list[list[ConversationItem]]}``. Implement ``build_{reference.kind}_request`` hook methods on ``ParityDriver`` subclasses only when a case needs non-standard request adaptation. Hook methods should return common V2 request keys, usually ``{"conversation_list": ...}``, and leave model-internal conversion to model runtime hooks or model-specific helpers.
 
 Reference oracles return the suite contract defined in ``reference/oracles/contract.py``:
 
@@ -198,15 +198,18 @@ Directly selecting a single parametrized case bypasses the grouped launcher so t
            dtype: float
        - type: text
          role: user
+         value: "Describe this image."
+       - type: output
+         role: assistant
          value:
            kind: tensor
            tensor: [1, 10, 2]
            dtype: long
    ```
 
-   Use `stimulus.batched_conversation_list` only when the case intentionally validates `bs > 1`; it is authored as `list[list[item spec]]`. The suite normalizes both forms to the production `conversation_list: list[list[ConversationItem]]` shape before reference oracle execution and V2 request dispatch.
+   Use `stimulus.batched_conversation_list` only when the case intentionally validates `bs > 1`; it is authored as `list[list[item spec]]`. The suite normalizes single-sample `stimulus.conversation_list` to a batched shape for reference oracle execution, to `list[ConversationItem]` for V2 inference, and to `list[list[ConversationItem]]` for V2 training.
 
-   Each item spec may include `type`, `role`, `value`, `source`, and `meta`. Supported item `type` values are `image`, `text`, and `output`. Item `value` is a strict tagged union: `kind: tensor` requires `tensor` and optional `dtype`/`device`; `kind: random` requires `shape` and supports `distribution: uniform|normal|zeros|ones`, `seed`, `dtype`, and distribution parameters. Legacy untagged values such as `{tensor: [...]}` are rejected. Prefer deterministic `kind: random` image specs over large inline image tensors; keep explicit tensors for semantic token ids or small training targets where readability matters.
+   Each item spec may include `type`, `role`, `value`, `source`, and `meta`. Supported item `type` values are `image`, `text`, and `output`. Text items use the production carrier shape directly: `value` is a plain string. Non-text values that YAML cannot express directly still use the suite materializer tagged union: `kind: tensor` requires `tensor` and optional `dtype`/`device`; `kind: random` requires `shape` and supports `distribution: uniform|normal|zeros|ones`, `seed`, `dtype`, and distribution parameters; `kind: linspace` requires `start` and `end`; `kind: image` creates a deterministic PIL image. Legacy untagged values such as `{tensor: [...]}` are rejected. Prefer deterministic `kind: random` image specs over large inline image tensors; keep explicit tensors for semantic token ids or small training targets where readability matters.
 
 Each run can be toggled independently with `enable`. The field is optional and defaults to `true`; when set to `false`, discovery filters the run before pytest parametrization, so it will not appear in `--collect-only` output. Use a YAML bool, not a quoted string:
 

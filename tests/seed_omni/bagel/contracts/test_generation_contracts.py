@@ -325,11 +325,11 @@ class _NoopBagelSiglip(nn.Module):
 
 
 class _InferGenTextEncoder(nn.Module):
-    def prompt_encode(self, conversation_list: list[ConversationItem] | None = None, **kwargs):
+    def generate(self, conversation_list: list[ConversationItem] | None = None, **kwargs):
         del kwargs
         return {"conversation_list": conversation_list}
 
-    def encode_image_query_markers(self, conversation_list: list[ConversationItem] | None = None, **kwargs):
+    def encode_image_markers(self, conversation_list: list[ConversationItem] | None = None, **kwargs):
         del kwargs
         assert conversation_list is not None
         for item in conversation_list:

@@ -2,6 +2,7 @@ from typing import Any, Dict, List, Optional
 
 import torch
 import torch.nn.functional as F
+from transformers import PreTrainedTokenizerBase
 
 from veomni.utils.tensor_utils import unflatten
 
@@ -30,11 +31,11 @@ class TextEncoderModuleMixin(ModuleMixin):
         return _get_parallel_plan()
 
     @property
-    def tokenizer(self) -> Any:
+    def tokenizer(self) -> PreTrainedTokenizerBase:
         return self._tokenizer
 
     @tokenizer.setter
-    def tokenizer(self, tokenizer: Any) -> None:
+    def tokenizer(self, tokenizer: PreTrainedTokenizerBase) -> None:
         self._tokenizer = tokenizer
 
     # training hooks
@@ -66,13 +67,12 @@ class TextEncoderModuleMixin(ModuleMixin):
         conversation_list: list[list[ConversationItem]],
         segment_embeds: list[torch.Tensor],
     ) -> None:
-        dtype = self.dtype
         segment_embeds_iterator = iter(segment_embeds)
         for sample in conversation_list:
             for part in sample:
                 if part.type != "text":
                     continue
-                part.value = next(segment_embeds_iterator).to(device=self.device, dtype=dtype)
+                part.value = next(segment_embeds_iterator).to(device=self.device, dtype=self.dtype)
         if next(segment_embeds_iterator, None) is not None:
             raise RuntimeError("TextEncoder text segment count mismatch during embed scatter.")
 
@@ -86,6 +86,24 @@ class TextEncoderModuleMixin(ModuleMixin):
 
     def generate(self, conversation_list: list[list[ConversationItem]], **generation_kwargs: Any) -> Dict[str, Any]:
         raise NotImplementedError("TextEncoderModuleMixin.generate is not implemented")
+
+    @staticmethod
+    def _resolve_token_id(
+        tokenizer: PreTrainedTokenizerBase,
+        token: str | None = None,
+        token_id: int | None = None,
+        fallback: int | None = None,
+    ) -> int | None:
+        resolved = None
+        if token is not None and (resolved := tokenizer.convert_tokens_to_ids(token)) is not None:
+            unk_token_id = getattr(tokenizer, "unk_token_id", None)
+            if unk_token_id is not None and int(resolved) == int(unk_token_id):
+                resolved = None
+        if resolved is not None:
+            return int(resolved)
+        if token_id is not None:
+            return int(token_id)
+        return fallback
 
     @staticmethod
     def _top_p_filter(logits: torch.Tensor, top_p: float) -> torch.Tensor:
@@ -116,7 +134,7 @@ class TextEncoderModuleMixin(ModuleMixin):
             logits = self._top_p_filter(logits, top_p)
         probs = F.softmax(logits, dim=-1)
         token = torch.multinomial(probs, num_samples=1)
-        return token
+        return int(token.reshape(-1)[0].item())
 
     def _token_id_tensor(self, token_id: int) -> torch.Tensor:
         device = self.device

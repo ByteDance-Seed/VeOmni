@@ -3,9 +3,7 @@ text_only_t2i_cfg_disabled:
       conversation_list:
         - type: text
           role: user
-          value:
-            kind: text
-            text: "a red square"
+          value: "a red square"
       generation_kwargs:
         image_height: 64
         image_width: 64
@@ -38,9 +36,7 @@ text_only_t2i_multistep_cfg_disabled:
       conversation_list:
         - type: text
           role: user
-          value:
-            kind: text
-            text: "a red square"
+          value: "a red square"
       generation_kwargs:
         image_height: 64
         image_width: 64
@@ -73,9 +69,7 @@ text_only_t2i_cfg_text:
       conversation_list:
         - type: text
           role: user
-          value:
-            kind: text
-            text: "a red square"
+          value: "a red square"
       generation_kwargs:
         image_height: 64
         image_width: 64
@@ -108,9 +102,7 @@ text_only_t2i_multistep_cfg_text:
       conversation_list:
         - type: text
           role: user
-          value:
-            kind: text
-            text: "a red square"
+          value: "a red square"
       generation_kwargs:
         image_height: 64
         image_width: 64

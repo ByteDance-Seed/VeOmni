@@ -128,14 +128,15 @@ def test_conversation_values_materialize_from_single_sample_stimulus() -> None:
             stimulus={
                 "conversation_list": [
                     {
-                        "type": "text",
+                        "type": "output",
                         "role": "user",
                         "value": {"kind": "tensor", "tensor": [1, 2, 3], "dtype": "long"},
                     },
                     {
                         "type": "text",
                         "role": "user",
-                        "value": {"kind": "text", "text": "hello"},
+                        "source": "recipe",
+                        "value": "hello",
                     },
                     {
                         "type": "image",
@@ -149,14 +150,41 @@ def test_conversation_values_materialize_from_single_sample_stimulus() -> None:
 
     request = driver.v2_request_kwargs(ReferenceRunResult(canonical={}, observations={}), device=torch.device("cpu"))
 
-    assert len(request["conversation_list"]) == 1
-    tensor_item, text_item, image_item = request["conversation_list"][0]
-    assert tensor_item.type == "text"
+    assert len(request["conversation_list"]) == 3
+    tensor_item, text_item, image_item = request["conversation_list"]
+    assert tensor_item.type == "output"
     assert tensor_item.value.tolist() == [1, 2, 3]
+    assert text_item.type == "text"
+    assert text_item.role == "user"
+    assert text_item.source == "recipe"
     assert text_item.value == "hello"
     assert isinstance(image_item.value, Image.Image)
     assert image_item.value.mode == "RGB"
     assert image_item.value.size == (8, 6)
+
+
+def test_training_conversation_values_materialize_to_batch() -> None:
+    driver = _ToyDriver(
+        _case(
+            reference={"kind": "missing_kind"},
+            graph_name="train",
+            graph_domain="training",
+            stimulus={
+                "conversation_list": [
+                    {
+                        "type": "text",
+                        "role": "assistant",
+                        "value": "hello",
+                    }
+                ]
+            },
+        )
+    )
+
+    request = driver.v2_request_kwargs(ReferenceRunResult(canonical={}, observations={}), device=torch.device("cpu"))
+
+    assert len(request["conversation_list"]) == 1
+    assert request["conversation_list"][0][0].value == "hello"
 
 
 def test_reference_inputs_normalizes_single_conversation_list_to_batch() -> None:
@@ -165,7 +193,7 @@ def test_reference_inputs_normalizes_single_conversation_list_to_batch() -> None
             {
                 "type": "text",
                 "role": "user",
-                "value": {"kind": "tensor", "tensor": [1], "dtype": "long"},
+                "value": "hello",
             }
         ]
     }
@@ -184,13 +212,13 @@ def test_stimulus_batched_conversation_list_keeps_explicit_batch() -> None:
                 "batched_conversation_list": [
                     [
                         {
-                            "type": "text",
+                            "type": "output",
                             "value": {"kind": "tensor", "tensor": [1], "dtype": "long"},
                         }
                     ],
                     [
                         {
-                            "type": "text",
+                            "type": "output",
                             "value": {"kind": "tensor", "tensor": [2], "dtype": "long"},
                         }
                     ],
@@ -216,7 +244,7 @@ def test_conversation_value_requires_tagged_kind() -> None:
             stimulus={
                 "conversation_list": [
                     {
-                        "type": "text",
+                        "type": "image",
                         "value": {"tensor": [1, 2], "dtype": "long"},
                     }
                 ]
@@ -271,8 +299,8 @@ def test_random_conversation_values_are_deterministic() -> None:
     first = driver.v2_request_kwargs(ReferenceRunResult(canonical={}, observations={}), device=torch.device("cpu"))
     second = driver.v2_request_kwargs(ReferenceRunResult(canonical={}, observations={}), device=torch.device("cpu"))
 
-    first_value = first["conversation_list"][0][0].value
-    second_value = second["conversation_list"][0][0].value
+    first_value = first["conversation_list"][0].value
+    second_value = second["conversation_list"][0].value
     assert first_value.shape == (3, 4, 4)
     assert first_value.dtype == torch.float32
     assert torch.equal(first_value, second_value)
@@ -300,7 +328,7 @@ def test_random_conversation_values_are_deterministic() -> None:
         ReferenceRunResult(canonical={}, observations={}), device=torch.device("cpu")
     )
 
-    assert torch.equal(first["conversation_list"][0][0].value, second["conversation_list"][0][0].value)
+    assert torch.equal(first["conversation_list"][0].value, second["conversation_list"][0].value)
 
 
 def test_random_conversation_value_rejects_invalid_distribution() -> None:
@@ -353,7 +381,7 @@ def test_linspace_conversation_meta_materializes_tensor_shape_and_transform() ->
     )
 
     request = driver.v2_request_kwargs(ReferenceRunResult(canonical={}, observations={}), device=torch.device("cpu"))
-    item = request["conversation_list"][0][0]
+    item = request["conversation_list"][0]
 
     assert item.meta["noise"].shape == (2, 3)
     assert torch.equal(item.meta["noise"], torch.linspace(-0.25, 0.25, steps=6).reshape(2, 3))
@@ -402,7 +430,7 @@ def test_conversation_request_materializes_nested_meta_tensors() -> None:
             stimulus={
                 "conversation_list": [
                     {
-                        "type": "text",
+                        "type": "output",
                         "role": "user",
                         "source": "recipe",
                         "value": {"kind": "tensor", "tensor": [1, 2, 3], "dtype": "long"},
@@ -418,8 +446,8 @@ def test_conversation_request_materializes_nested_meta_tensors() -> None:
 
     request = driver.v2_request_kwargs(ReferenceRunResult(canonical={}, observations={}), device=torch.device("cpu"))
 
-    [item] = request["conversation_list"][0]
-    assert item.type == "text"
+    [item] = request["conversation_list"]
+    assert item.type == "output"
     assert item.source == "recipe"
     assert item.value.tolist() == [1, 2, 3]
     assert item.meta["position_ids"].tolist() == [0, 1, 2]

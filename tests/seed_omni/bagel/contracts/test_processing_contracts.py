@@ -10,12 +10,13 @@ from veomni.models.seed_omni.conversation import ConversationItem
 from veomni.models.seed_omni.modules.bagel.sources import (
     BAGEL_FLOW_VELOCITY,
     BAGEL_GENERATED_LATENT,
+    BAGEL_SIGLIP_CONTEXT,
     BAGEL_VAE_CONTEXT,
 )
 
 
 def test_bagel_training_text_embed_meta_preserves_grad():
-    from veomni.models.seed_omni.modules.bagel.text_encoder.processing import scatter_text_embeds
+    from veomni.models.seed_omni.modules.bagel.text_encoder.modulemixin import BagelTextEncoderModuleMixin
 
     item = ConversationItem(
         type="text",
@@ -24,13 +25,13 @@ def test_bagel_training_text_embed_meta_preserves_grad():
         meta={"input_ids": torch.tensor([11, 12])},
     )
     packed_text_embeds = torch.randn(2, 4, requires_grad=True)
+    mixin = BagelTextEncoderModuleMixin()
+    mixin.device = torch.device("cpu")
+    mixin.dtype = torch.float32
 
-    scatter_text_embeds(
+    mixin._scatter_text_embeds(
         [[item]],
         [packed_text_embeds],
-        expected=1,
-        device=torch.device("cpu"),
-        dtype=torch.float32,
     )
     assert item.value.requires_grad
 
@@ -191,47 +192,26 @@ def test_bagel_vae_decode_skips_context_hidden_outputs():
 
 def test_bagel_text_encoder_marker_and_token_helpers():
     from veomni.models.seed_omni.modules.bagel.text_encoder.processing import (
-        apply_image_embed_markers,
-        build_generated_text,
-        image_embed_marker_items,
-        output_hidden_tail,
-        sampled_token_id,
-        update_tail_with_generated_token,
+        apply_image_marker,
+        is_image_item,
     )
 
-    image_item = ConversationItem(type="image", value=torch.ones(1, 2, 3), role="user")
+    image_item = ConversationItem(
+        type="image",
+        value=torch.ones(1, 2, 3),
+        role="user",
+        source=BAGEL_SIGLIP_CONTEXT,
+    )
     text_item = ConversationItem(type="text", value="prompt", role="user")
-    conversation = [[image_item, text_item]]
-    marker_items = image_embed_marker_items(conversation, item_types={"image"})
-    assert marker_items == [image_item]
+    assert is_image_item(image_item)
+    assert not is_image_item(text_item)
 
-    marker_embeds = torch.tensor([[[0.0, 0.0, 0.0], [2.0, 2.0, 2.0]]])
-    apply_image_embed_markers(marker_items, marker_embeds, device=torch.device("cpu"), dtype=torch.float32)
+    marker_embeds = torch.tensor([[0.0, 0.0, 0.0], [2.0, 2.0, 2.0]])
+    apply_image_marker(image_item, marker_embeds, device=torch.device("cpu"), dtype=torch.float32)
     assert image_item.value.shape == (4, 3)
     wrapped_once = image_item.value.clone()
-    apply_image_embed_markers(marker_items, marker_embeds, device=torch.device("cpu"), dtype=torch.float32)
+    apply_image_marker(image_item, marker_embeds, device=torch.device("cpu"), dtype=torch.float32)
     assert torch.equal(image_item.value, wrapped_once)
-
-    output_item = ConversationItem(type="output", value=torch.ones(2, 4), role="assistant", meta={})
-    tail, hidden_states = output_hidden_tail([output_item])
-    assert tail is output_item
-    assert hidden_states.shape == (1, 2, 4)
-    assert sampled_token_id(torch.tensor([7])) == 7
-
-    update_tail_with_generated_token(
-        [output_item],
-        output_item,
-        input_ids=torch.tensor([[7]]),
-        inputs_embeds=torch.ones(1, 1, 4),
-        device=torch.device("cpu"),
-        dtype=torch.float32,
-    )
-    assert output_item.meta["input_ids"].tolist() == [7]
-
-    tokenizer = _BagelInterleaveTokenizer()
-    generated = build_generated_text([output_item], tokenizer=tokenizer, token_ids=[7])
-    assert generated["type"] == "text"
-    assert generated["meta"]["token_ids"] == [7]
 
 
 def test_bagel_flow_generation_state_tracks_denoise_round():
@@ -262,8 +242,11 @@ def test_bagel_flow_generation_state_tracks_denoise_round():
     assert state.phase == "prepare_query"
 
 
-def test_bagel_raw_image_preprocessing_builds_official_metadata():
-    from veomni.models.seed_omni.modules.bagel.siglip_navit.processing import prepare_image_batch
+def test_bagel_raw_image_preprocessing_builds_official_metadata(tmp_path):
+    from veomni.models.seed_omni.modules.bagel.siglip_navit.processing import (
+        BagelSiglipNavitProcessor,
+        prepare_image_batch,
+    )
 
     BagelSiglip = model_cls("bagel_siglip_navit")
     BagelSiglipConfig = config_cls("bagel_siglip_navit")
@@ -281,6 +264,11 @@ def test_bagel_raw_image_preprocessing_builds_official_metadata():
             vit_max_num_patch_per_side=2,
         )
     )
+    assert siglip.image_processor_class is BagelSiglipNavitProcessor
+
+    processor = BagelSiglipNavitProcessor.from_config(siglip.config)
+    processor.save_pretrained(tmp_path)
+    loaded_processor = BagelSiglipNavitProcessor.from_pretrained(tmp_path)
     image_item = ConversationItem(
         type="image",
         value=Image.new("RGB", (20, 10), color=(255, 0, 0)),
@@ -292,10 +280,23 @@ def test_bagel_raw_image_preprocessing_builds_official_metadata():
         device=torch.device("cpu"),
         dtype=torch.float32,
     )
+    processor_inputs = loaded_processor.prepare_image_batch(
+        [image_item.value],
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+    call_inputs = loaded_processor(images=[image_item.value], return_tensors="pt")
 
     assert inputs["patchified_pixel_values"].shape == (2, 14 * 14 * 3)
     assert inputs["patchified_position_ids"].tolist() == [0, 1]
     assert inputs["token_lens"].tolist() == [2]
+    assert torch.equal(inputs["patchified_pixel_values"], processor_inputs["patchified_pixel_values"])
+    assert torch.equal(inputs["patchified_position_ids"], processor_inputs["patchified_position_ids"])
+    assert torch.equal(inputs["cu_seqlens"], processor_inputs["cu_seqlens"])
+    assert inputs["max_seqlen"] == processor_inputs["max_seqlen"]
+    assert torch.equal(inputs["token_lens"], processor_inputs["token_lens"])
+    assert isinstance(call_inputs["max_seqlen"], int)
+    assert torch.equal(inputs["patchified_pixel_values"], call_inputs["patchified_pixel_values"])
     assert image_item.meta == {}
 
     BagelTextEncoder = model_cls("bagel_text_encoder")
@@ -303,10 +304,10 @@ def test_bagel_raw_image_preprocessing_builds_official_metadata():
     text_encoder = BagelTextEncoder(BagelTextEncoderConfig(vocab_size=16, hidden_size=8))
     text_encoder.tokenizer = _BagelInterleaveTokenizer()
     image_item.value = torch.zeros(2, 8)
-    image_item.meta["image_embeds"] = image_item.value
-    image_item.meta["image_embeds_ready"] = True
+    image_item.source = BAGEL_SIGLIP_CONTEXT
     text_item = ConversationItem(type="text", value="prompt", role="user")
-    text_encoder.prompt_encode(conversation_list=[image_item, text_item])
+    text_encoder.generate(conversation_list=[image_item, text_item])
+    text_encoder.encode_image_markers(conversation_list=[image_item, text_item])
 
     assert image_item.value.shape == (4, 8)
     assert text_item.value.shape == (3, 8)

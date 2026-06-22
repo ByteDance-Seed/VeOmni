@@ -11,8 +11,9 @@ from ....module import ModuleMixin, post_forward, pre_forward
 from ....tracemixin import TraceMixin
 from ..carrier_updates import append as carrier_append
 from ..carrier_updates import materialize_carrier_updates
+from ..sources import BAGEL_SIGLIP_CONTEXT
 from .configuration import BagelSiglipNavitConfig
-from .processing import prepare_image_batch, scatter_image_embeds, user_raw_image_items
+from .processing import BagelSiglipNavitProcessor, scatter_image_embeds, user_raw_image_items
 
 
 class BagelSiglipNavitModuleMixin(ModuleMixin):
@@ -39,12 +40,7 @@ class BagelSiglipNavitModuleMixin(ModuleMixin):
         if not self._image_items:
             return {"patchified_pixel_values": None}
 
-        inputs = prepare_image_batch(
-            self._image_items,
-            config=self.config,
-            device=self.device,
-            dtype=self.dtype,
-        )
+        inputs = self._prepare_image_batch(self._image_items)
         self._image_token_lens = inputs["token_lens"]
         return inputs
 
@@ -75,6 +71,7 @@ class BagelSiglipNavitModuleMixin(ModuleMixin):
                                 type="image",
                                 value=value,
                                 role="dummy",
+                                source=BAGEL_SIGLIP_CONTEXT,
                                 meta={"source": "bagel_siglip_navit"},
                             ),
                         )
@@ -115,12 +112,7 @@ class BagelSiglipNavitModuleMixin(ModuleMixin):
         if not image_items:
             return {"conversation_list": conversation_list}
 
-        inputs = prepare_image_batch(
-            image_items,
-            config=self.config,
-            device=self.device,
-            dtype=self.dtype,
-        )
+        inputs = self._prepare_image_batch(image_items)
         with torch.inference_mode():
             outputs = self.forward(**inputs)
         token_lens = outputs.get("token_lens")
@@ -128,6 +120,14 @@ class BagelSiglipNavitModuleMixin(ModuleMixin):
             token_lens = inputs["token_lens"]
         scatter_image_embeds(image_items, outputs["image_embeds"], token_lens, device=self.device, dtype=self.dtype)
         return {"conversation_list": conversation_list}
+
+    def _prepare_image_batch(self, image_items: list[ConversationItem]) -> dict[str, Any]:
+        processor = BagelSiglipNavitProcessor.from_config(self.config)
+        return processor.prepare_image_batch(
+            [item.value for item in image_items],
+            device=self.device,
+            dtype=self.dtype,
+        )
 
 
 class BagelSiglipNavitTraceMixin(TraceMixin):

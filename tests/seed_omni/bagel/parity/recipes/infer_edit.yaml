@@ -9,9 +9,7 @@ image_text_edit_cfg_disabled:
             height: 512
         - type: text
           role: user
-          value:
-            kind: text
-            text: "make the image brighter"
+          value: "make the image brighter"
       generation_kwargs:
         image_height: 512
         image_width: 512
@@ -57,9 +55,7 @@ image_text_edit_cfg_text:
             height: 512
         - type: text
           role: user
-          value:
-            kind: text
-            text: "make the image brighter"
+          value: "make the image brighter"
       generation_kwargs:
         image_height: 512
         image_width: 512
@@ -105,9 +101,7 @@ image_text_edit_cfg_text_img:
             height: 512
         - type: text
           role: user
-          value:
-            kind: text
-            text: "make the image brighter"
+          value: "make the image brighter"
       generation_kwargs:
         image_height: 512
         image_width: 512
@@ -156,9 +150,7 @@ image_text_edit_multistep_cfg_text_img:
             height: 512
         - type: text
           role: user
-          value:
-            kind: text
-            text: "make the image brighter"
+          value: "make the image brighter"
       generation_kwargs:
         image_height: 512
         image_width: 512

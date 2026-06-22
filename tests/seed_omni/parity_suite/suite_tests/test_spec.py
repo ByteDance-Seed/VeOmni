@@ -230,6 +230,10 @@ def test_recipe_spec_accepts_conversation_stimulus_shapes() -> None:
                 "conversation_list": [
                     {
                         "type": "text",
+                        "value": "hello",
+                    },
+                    {
+                        "type": "output",
                         "value": {"kind": "tensor", "tensor": [1, 2], "dtype": "long"},
                     },
                     {
@@ -251,7 +255,7 @@ def test_recipe_spec_accepts_conversation_stimulus_shapes() -> None:
                     [
                         {
                             "type": "text",
-                            "value": {"kind": "tensor", "tensor": [1], "dtype": "long"},
+                            "value": "hello",
                         }
                     ],
                     [
@@ -268,8 +272,9 @@ def test_recipe_spec_accepts_conversation_stimulus_shapes() -> None:
         default_graph="train",
     )
 
-    assert single.stimulus["conversation_list"][0]["value"]["kind"] == "tensor"
-    assert single.stimulus["conversation_list"][1]["value"]["kind"] == "image"
+    assert single.stimulus["conversation_list"][0]["value"] == "hello"
+    assert single.stimulus["conversation_list"][1]["value"]["kind"] == "tensor"
+    assert single.stimulus["conversation_list"][2]["value"]["kind"] == "image"
     assert len(batched.stimulus["batched_conversation_list"]) == 2
 
 

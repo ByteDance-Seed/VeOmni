@@ -2,6 +2,7 @@ from typing import Any, Dict, List, Optional
 
 import torch
 import torch.nn.functional as F
+from transformers import PreTrainedTokenizerBase
 
 from veomni.utils.tensor_utils import naflatten, unflatten
 
@@ -34,7 +35,7 @@ class Qwen3VLTextEncoderCPUPreprocessor(CPUPreprocessor):
     CPU tensors so it can run in DataLoader workers and overlap with GPU compute.
     """
 
-    def __init__(self, tokenizer: Any, chat_markers: Qwen3VLChatMarkers) -> None:
+    def __init__(self, tokenizer: PreTrainedTokenizerBase, chat_markers: Qwen3VLChatMarkers) -> None:
         self._tokenizer = tokenizer
         self._chat_markers = chat_markers
 
@@ -69,14 +70,14 @@ class Qwen3VLTextEncoderModuleMixin(TextEncoderModuleMixin):
         self._im_end_token_id: Optional[int] = None
 
     @property
-    def tokenizer(self) -> Any:
+    def tokenizer(self) -> PreTrainedTokenizerBase:
         return self._tokenizer
 
     @tokenizer.setter
-    def tokenizer(self, tokenizer: Any) -> None:
+    def tokenizer(self, tokenizer: PreTrainedTokenizerBase) -> None:
         self._tokenizer = tokenizer
-        self._eos_token_id = int(tokenizer.eos_token_id)
-        self._im_end_token_id = int(tokenizer.convert_tokens_to_ids("<|im_end|>"))
+        self._eos_token_id = self._resolve_token_id(tokenizer, token_id=tokenizer.eos_token_id)
+        self._im_end_token_id = self._resolve_token_id(tokenizer, token="<|im_end|>")
         self._chat_markers = Qwen3VLChatMarkers(
             im_start_token="<|im_start|>",
             im_end_token="<|im_end|>",

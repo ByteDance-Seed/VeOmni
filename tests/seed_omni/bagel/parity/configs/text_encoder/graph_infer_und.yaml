@@ -4,7 +4,7 @@ generation_graph:
   states:
     prompt_encode:
       body:
-        - { from: bagel_text_encoder.prompt_encode, to: end }
+        - { from: bagel_text_encoder, to: end }
       transitions:
         - { condition: { type: default }, next_state: done }
 

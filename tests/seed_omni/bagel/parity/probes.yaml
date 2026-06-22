@@ -11,7 +11,7 @@ infer_und.mot_prefill_hidden:
 
 infer_und.prompt_input_ids:
   v2:
-    node: bagel_text_encoder.prompt_encode
+    node: bagel_text_encoder.generate
     state: prompt_encode
     field: input_ids
     item_type: text

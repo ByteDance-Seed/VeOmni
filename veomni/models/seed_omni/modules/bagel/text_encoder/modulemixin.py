@@ -1,28 +1,17 @@
 """SeedOmni V2 graph hooks for BAGEL text token embeddings and CE loss."""
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import torch
+from transformers import PreTrainedTokenizerBase
 
-from veomni.utils.tensor_utils import unflatten
+from veomni.utils.tensor_utils import naflatten, unflatten
 
-from ....conversation import ConversationItem
+from ....conversation import ConversationItem, is_dummy, maybe_merge_outputs
 from ....generation_graph import FSM_SIGNAL_KEY
 from ....module import post_forward, pre_forward
 from ...base.text_encoder.modulemixin import TextEncoderModuleMixin
-from .processing import (
-    apply_image_embed_markers,
-    as_batched_inference_conversation,
-    build_generated_text,
-    image_embed_marker_items,
-    output_hidden_tail,
-    prepare_text_decode_inputs,
-    prepare_text_encode_inputs,
-    resolve_token_id,
-    sampled_token_id,
-    scatter_text_embeds,
-    update_tail_with_generated_token,
-)
+from .processing import apply_image_marker, is_image_item
 
 
 SIGNAL_START_IMAGE_GEN = "start_image_gen"
@@ -41,142 +30,123 @@ class BagelTextEncoderModuleMixin(TextEncoderModuleMixin):
         self._image_start_token_id: Optional[int] = None
         self._image_end_token_id: Optional[int] = None
         self._decode_has_valid_labels: bool = False
-        self._encode_text_segment_count: int = 0
 
     @property
-    def tokenizer(self) -> Any:
+    def tokenizer(self) -> PreTrainedTokenizerBase:
         return self._tokenizer
 
     @tokenizer.setter
-    def tokenizer(self, tokenizer: Any) -> None:
+    def tokenizer(self, tokenizer: PreTrainedTokenizerBase) -> None:
         self._tokenizer = tokenizer
-        eos_token_id = getattr(tokenizer, "eos_token_id", None)
-        self._eos_token_id = resolve_token_id(
-            tokenizer,
-            "<|im_end|>",
-            fallback=int(eos_token_id) if eos_token_id is not None else None,
-        )
-        self._start_token_id = resolve_token_id(tokenizer, "<|im_start|>", fallback=self._eos_token_id)
-        self._image_start_token_id = resolve_token_id(tokenizer, "<|vision_start|>", fallback=None)
-        self._image_end_token_id = resolve_token_id(tokenizer, "<|vision_end|>", fallback=None)
+        self._eos_token_id = self._resolve_token_id(tokenizer, token_id=tokenizer.eos_token_id, token="<|im_end|>")
+        self._start_token_id = self._resolve_token_id(tokenizer, token="<|im_start|>", fallback=self._eos_token_id)
+        self._image_start_token_id = self._resolve_token_id(tokenizer, token="<|vision_start|>")
+        self._image_end_token_id = self._resolve_token_id(tokenizer, token="<|vision_end|>")
 
-    def prompt_encode(
+    # ── Graph Entrypoints ──────────────────────────────────
+
+    def generate(
         self,
-        conversation_list: Optional[list[ConversationItem] | list[list[ConversationItem]]] = None,
+        conversation_list: Optional[List[ConversationItem]] = None,
         generation_kwargs: Optional[Dict[str, Any]] = None,
         **kwargs: Any,
     ) -> Dict[str, Any]:
-        del generation_kwargs, kwargs
-        batched = as_batched_inference_conversation(conversation_list)
-        dummy = self.dummy_inputs(kind="encode")
-        input_ids, batch_shape, self._encode_text_segment_count = prepare_text_encode_inputs(
-            batched,
-            tokenizer=self._tokenizer,
-            start_token_id=self._resolve_start_token_id(),
-            eos_token_id=self._resolve_eos_token_id(),
-            device=self.device,
-            dummy_input_ids=dummy["input_ids"],
-        )
-        if self._encode_text_segment_count == 0:
+        tail = conversation_list[-1]
+        batched = [conversation_list]
+
+        if tail.role == "user" and not torch.is_tensor(tail.value):
+            input_ids = self._prepare_encode_inputs(batched)
+            inputs_embeds = self.encode(input_ids)["inputs_embeds"]
+            self._scatter_text_embeds(batched, unflatten(inputs_embeds, self._encode_batch_shape))
             self._encode_batch_shape = None
-            self._wrap_image_embeds_with_markers(batched)
-            return {"conversation_list": conversation_list}
+            return {"conversation_list": batched[0]}
 
-        self._encode_batch_shape = batch_shape
-        inputs_embeds = self.encode(input_ids)["inputs_embeds"]
-        self._scatter_text_embeds(batched, unflatten(inputs_embeds, batch_shape))
-        self._wrap_image_embeds_with_markers(batched)
-        self._encode_batch_shape = None
-        return {"conversation_list": conversation_list}
+        if tail.type == "output":
+            outputs: Dict[str, Any] = {"conversation_list": batched[0]}
+            hidden_states = tail.value
+            if not torch.is_tensor(hidden_states):
+                raise TypeError("BAGEL text generate expects the tail output value to be a hidden-state tensor.")
+            if hidden_states.dim() == 2:
+                hidden_states = hidden_states.unsqueeze(0)
+            sampling = self._extract_sampling_kwargs(generation_kwargs, 1.0, 1.0, kwargs)
 
-    def encode_image_query_markers(
+            output_token_id = self._sample_token(hidden_states, **sampling)
+            if output_token_id == self._eos_token_id:
+                outputs[FSM_SIGNAL_KEY] = SIGNAL_TEXT_DONE
+                return outputs
+            self._text_token_cache.append(output_token_id)
+
+            input_ids = self._token_id_tensor(output_token_id)
+            inputs_embeds = self.encode(input_ids)["inputs_embeds"]
+            tail.value = inputs_embeds.to(device=self.device, dtype=self.dtype)
+            tail.meta["input_ids"] = input_ids.reshape(-1).detach()
+            maybe_merge_outputs(batched[0])
+            return outputs
+
+        outputs: Dict[str, Any] = {"conversation_list": batched[0]}
+        if str((generation_kwargs or {}).get("infer_mode", "")) == "gen":
+            outputs[FSM_SIGNAL_KEY] = SIGNAL_START_IMAGE_GEN
+            return outputs
+
+        raise ValueError(f"Invalid type: {tail.type}")
+
+    def encode_image_markers(
         self,
-        conversation_list: Optional[list[ConversationItem] | list[list[ConversationItem]]] = None,
+        conversation_list: Optional[List[ConversationItem]] = None,
         generation_kwargs: Optional[Dict[str, Any]] = None,
         **kwargs: Any,
     ) -> Dict[str, Any]:
         del generation_kwargs, kwargs
-        batched = as_batched_inference_conversation(conversation_list)
-        self._wrap_image_embeds_with_markers(batched, item_types={"image", "output"})
+        marker_embeds: Optional[torch.Tensor] = None
+        for item in conversation_list:
+            if not is_image_item(item):
+                continue
+
+            if marker_embeds is None:
+                marker_ids = torch.tensor(
+                    [[self._image_start_token_id, self._image_end_token_id]],
+                    dtype=torch.long,
+                    device=self.device,
+                )
+                marker_embeds = self.encode(marker_ids)["inputs_embeds"].to(device=self.device, dtype=self.dtype)
+                marker_embeds = marker_embeds.squeeze(0)
+            apply_image_marker(item, marker_embeds, device=self.device, dtype=self.dtype)
+
         return {"conversation_list": conversation_list}
 
-    def token_generate(
-        self,
-        conversation_list: Optional[list[ConversationItem] | list[list[ConversationItem]]] = None,
-        generation_kwargs: Optional[Dict[str, Any]] = None,
-        **kwargs: Any,
-    ) -> Dict[str, Any]:
-        batched = as_batched_inference_conversation(conversation_list)
-        if len(batched) != 1:
-            raise ValueError("BAGEL text token_generate currently expects one inference conversation.")
-
-        sample = batched[0]
-        outputs: Dict[str, Any] = {"conversation_list": conversation_list}
-        if self._should_start_image_generation(sample, generation_kwargs):
-            outputs[FSM_SIGNAL_KEY] = SIGNAL_START_IMAGE_GEN
-            return outputs
-
-        tail, hidden_states = output_hidden_tail(sample)
-        sampling = self._extract_sampling_kwargs(generation_kwargs, 1.0, 1.0, kwargs)
-        output_token_id = self._sample_text_token_id(hidden_states, sampling)
-
-        if output_token_id == self._resolve_eos_token_id():
-            outputs[FSM_SIGNAL_KEY] = SIGNAL_TEXT_DONE
-            return outputs
-        if output_token_id == self._resolve_image_start_token_id():
-            outputs[FSM_SIGNAL_KEY] = SIGNAL_START_IMAGE_GEN
-            return outputs
-
-        self._text_token_cache.append(output_token_id)
-        input_ids = self._token_id_tensor(output_token_id)
-        inputs_embeds = self.encode(input_ids)["inputs_embeds"].to(device=self.device, dtype=self.dtype)
-        update_tail_with_generated_token(
-            sample,
-            tail,
-            input_ids=input_ids,
-            inputs_embeds=inputs_embeds,
-            device=self.device,
-            dtype=self.dtype,
-        )
-        return outputs
+    # ── Training hooks ──────────────────────────────────
 
     @pre_forward("encode")
     def encode_pre(
         self,
-        conversation_list: Optional[list[list[ConversationItem]]] = None,
+        conversation_list: Optional[List[List[ConversationItem]]] = None,
         **kwargs: Any,
     ) -> Dict[str, Any]:
         del kwargs
         self._conversation_carrier = conversation_list
-        dummy = self.dummy_inputs(kind="encode")
-        input_ids, self._encode_batch_shape, self._encode_text_segment_count = prepare_text_encode_inputs(
-            conversation_list,
-            tokenizer=self._tokenizer,
-            start_token_id=self._resolve_start_token_id(),
-            eos_token_id=self._resolve_eos_token_id(),
-            device=self.device,
-            dummy_input_ids=dummy["input_ids"],
-        )
+        input_ids = self._prepare_encode_inputs(self._conversation_carrier)
         return {"input_ids": input_ids}
 
     @pre_forward("decode")
     def decode_pre(
         self,
-        conversation_list: Optional[list[list[ConversationItem]]] = None,
+        conversation_list: Optional[List[List[ConversationItem]]] = None,
         **kwargs: Any,
     ) -> Dict[str, Any]:
         del kwargs
         self._conversation_carrier = conversation_list
+
+        inputs = self._prepare_decode_inputs(conversation_list)
+        if inputs is not None:
+            hidden_states, shift_labels = inputs
+            has_valid_labels = bool(torch.any(shift_labels != -100).item())
+            if has_valid_labels:
+                self._decode_has_valid_labels = True
+                return {"hidden_states": hidden_states, "shift_labels": shift_labels}
+
         dummy = self.dummy_inputs(kind="decode")
-        hidden_states, labels = prepare_text_decode_inputs(
-            conversation_list,
-            device=self.device,
-            dtype=self.dtype,
-            dummy_hidden_states=dummy["hidden_states"],
-            dummy_labels=dummy["labels"],
-        )
-        self._decode_has_valid_labels = bool(torch.any(labels != -100).item())
-        return {"hidden_states": hidden_states, "labels": labels}
+        self._decode_has_valid_labels = False
+        return {"hidden_states": dummy["hidden_states"], "shift_labels": dummy["labels"]}
 
     @post_forward("decode")
     def decode_post(self, **outputs: Any) -> Dict[str, Any]:
@@ -184,131 +154,105 @@ class BagelTextEncoderModuleMixin(TextEncoderModuleMixin):
             self._decode_has_valid_labels = False
             return super().decode_post(**outputs)
 
-        self._decode_has_valid_labels = False
         conversation = self._conversation_carrier
         self._conversation_carrier = None
-        logits = outputs.get("logits")
-        if logits is None:
-            raise ValueError("BagelTextEncoder.decode_post requires logits.")
-        outputs = {"conversation_list": conversation, "_loss": logits.sum() * 0.0}
-        return outputs
+        return {"conversation_list": conversation, "_loss": outputs["logits"].sum() * 0.0}
+
+    # ── Dummy helpers ──────────────────────────────────
+
+    def dummy_inputs(self, kind: str = "encode") -> Dict[str, torch.Tensor]:
+        if kind == "encode":
+            return {"input_ids": torch.zeros(1, device=self.device, dtype=torch.long)}
+        return {
+            "hidden_states": torch.zeros(1, int(self.config.hidden_size), device=self.device, dtype=self.dtype),
+            "labels": torch.full((1,), -100, device=self.device, dtype=torch.long),
+        }
+
+    # ── Internal helpers ──────────────────────────────────
+
+    def _prepare_encode_inputs(
+        self,
+        conversation_list: Optional[List[List[ConversationItem]]],
+    ) -> torch.Tensor:
+        input_ids: List[torch.Tensor] = []
+        self._encode_batch_shape = None
+
+        for sample in conversation_list or []:
+            for item in sample:
+                if is_dummy(item) or item.type != "text":
+                    continue
+
+                token_ids = self._tokenizer(item.value, add_special_tokens=False)["input_ids"]
+                token_ids = torch.tensor(
+                    [self._start_token_id, *token_ids, self._eos_token_id],
+                    device=self.device,
+                    dtype=torch.long,
+                )
+                item.value = token_ids
+                item.meta["input_ids"] = token_ids.detach()
+                item.meta["attention_mask"] = torch.ones_like(token_ids, dtype=torch.long)
+                item.meta["labels"] = (
+                    token_ids.detach().clone()
+                    if item.role == "assistant"
+                    else torch.full_like(token_ids, -100, dtype=torch.long)
+                )
+
+                input_ids.append(token_ids)
+
+        if not input_ids:
+            return self.dummy_inputs(kind="encode")["input_ids"]
+
+        input_ids, self._encode_batch_shape = naflatten(input_ids)
+        return input_ids
 
     def _scatter_text_embeds(
         self,
-        conversation_list: list[list[ConversationItem]],
-        segment_embeds: list[torch.Tensor],
+        conversation_list: List[List[ConversationItem]],
+        segment_embeds: List[torch.Tensor],
     ) -> None:
-        expected = self._encode_text_segment_count
-        self._encode_text_segment_count = 0
-        scatter_text_embeds(
-            conversation_list,
-            segment_embeds,
-            expected=expected,
-            device=self.device,
-            dtype=self.dtype,
-        )
+        segment_embeds_iterator = iter(segment_embeds)
+        for sample in conversation_list:
+            for item in sample:
+                if is_dummy(item) or item.type != "text":
+                    continue
+                item.value = next(segment_embeds_iterator).to(device=self.device, dtype=self.dtype)
+        if next(segment_embeds_iterator, None) is not None:
+            raise RuntimeError("BAGEL text segment count mismatch during embed scatter.")
 
-    def _sample_text_token_id(self, hidden_states: torch.Tensor, sampling: Dict[str, Any]) -> int:
-        return sampled_token_id(self._sample_token(hidden_states, **sampling))
-
-    def _should_start_image_generation(
+    def _prepare_decode_inputs(
         self,
-        sample: list[ConversationItem],
-        generation_kwargs: Optional[Dict[str, Any]],
-    ) -> bool:
-        if str((generation_kwargs or {}).get("infer_mode", "")) != "gen":
-            return False
-        if not sample:
-            return True
-        tail = sample[-1]
-        return tail.type != "output" or not torch.is_tensor(tail.value)
+        conversation_list: Optional[List[List[ConversationItem]]],
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        hidden_parts: List[torch.Tensor] = []
+        shift_label_parts: List[torch.Tensor] = []
 
-    def _wrap_image_embeds_with_markers(
-        self,
-        conversation_list: list[list[ConversationItem]],
-        *,
-        item_types: set[str] | None = None,
-    ) -> None:
-        if item_types is None:
-            item_types = {"image"}
-        image_items = image_embed_marker_items(conversation_list, item_types=item_types)
-        if not image_items:
-            return
+        for sample in conversation_list or []:
+            for item in sample:
+                if is_dummy(item) or item.type != "text":
+                    continue
 
-        start_token_id = self._resolve_image_start_token_id()
-        end_token_id = self._resolve_image_end_token_id()
-        marker_ids = torch.tensor(
-            [[start_token_id, end_token_id] for _ in image_items],
-            dtype=torch.long,
-            device=self.device,
-        )
-        marker_embeds = self.encode(marker_ids)["inputs_embeds"].to(device=self.device, dtype=self.dtype)
-        apply_image_embed_markers(image_items, marker_embeds, device=self.device, dtype=self.dtype)
+                hidden_states = item.value
+                labels = item.meta["labels"]
+                if hidden_states.dim() == 3 and hidden_states.size(0) == 1:
+                    hidden_states = hidden_states.squeeze(0)
+                labels = labels.reshape(-1)
+                if hidden_states.shape[0] != labels.shape[0]:
+                    raise ValueError(
+                        "BAGEL text decode requires hidden-state and label lengths to match: "
+                        f"got {hidden_states.shape[0]} and {labels.shape[0]}."
+                    )
 
-    def finalize(self, *, ctx: Dict[str, Any]) -> Dict[str, Any]:
-        if not self._text_token_cache:
-            return {}
-        flushed = self._flush_text_generated(ctx["conversation_list"])
-        if not flushed:
-            return {}
-        return {"generated": flushed}
+                shift_labels = torch.full_like(labels, -100, dtype=torch.long)
+                shift_labels[:-1] = labels[1:]
+                hidden_parts.append(hidden_states.to(device=self.device, dtype=self.dtype))
+                shift_label_parts.append(shift_labels)
 
-    def _flush_text_generated(
-        self,
-        conversation_list: list[ConversationItem] | list[list[ConversationItem]],
-    ) -> Dict[str, Any]:
-        token_ids = list(self._text_token_cache)
-        self._text_token_cache.clear()
-        return build_generated_text(conversation_list, tokenizer=self._tokenizer, token_ids=token_ids)
+        if not hidden_parts:
+            return None
 
-    def dummy_inputs(self, kind: str = "encode") -> Dict[str, torch.Tensor]:
-        if kind == "decode":
-            return {
-                "hidden_states": torch.zeros(1, int(self.config.hidden_size), device=self.device, dtype=self.dtype),
-                "labels": torch.full((1,), -100, device=self.device, dtype=torch.long),
-            }
-        return {"input_ids": torch.zeros(1, device=self.device, dtype=torch.long)}
-
-    def _resolve_start_token_id(self) -> int:
-        if self._start_token_id is not None:
-            return int(self._start_token_id)
-        resolved = resolve_token_id(self._tokenizer, "<|im_start|>", fallback=self._eos_token_id)
-        if resolved is None:
-            raise ValueError("Unable to resolve BAGEL start token id.")
-        self._start_token_id = int(resolved)
-        return int(resolved)
-
-    def _resolve_eos_token_id(self) -> int:
-        if self._eos_token_id is not None:
-            return int(self._eos_token_id)
-        eos_token_id = getattr(self._tokenizer, "eos_token_id", None)
-        resolved = resolve_token_id(
-            self._tokenizer,
-            "<|im_end|>",
-            fallback=int(eos_token_id) if eos_token_id is not None else None,
-        )
-        if resolved is None:
-            raise ValueError("Unable to resolve BAGEL EOS token id.")
-        self._eos_token_id = int(resolved)
-        return int(self._eos_token_id)
-
-    def _resolve_image_start_token_id(self) -> int:
-        if self._image_start_token_id is not None:
-            return int(self._image_start_token_id)
-        resolved = resolve_token_id(self._tokenizer, "<|vision_start|>", fallback=None)
-        if resolved is None:
-            raise ValueError("Unable to resolve BAGEL vision start token id.")
-        self._image_start_token_id = int(resolved)
-        return int(resolved)
-
-    def _resolve_image_end_token_id(self) -> int:
-        if self._image_end_token_id is not None:
-            return int(self._image_end_token_id)
-        resolved = resolve_token_id(self._tokenizer, "<|vision_end|>", fallback=None)
-        if resolved is None:
-            raise ValueError("Unable to resolve BAGEL vision end token id.")
-        self._image_end_token_id = int(resolved)
-        return int(resolved)
+        hidden_states = torch.cat(hidden_parts, dim=0)
+        shift_labels = torch.cat(shift_label_parts, dim=0).to(device=hidden_states.device, non_blocking=True)
+        return hidden_states, shift_labels
 
 
 __all__ = ["BagelTextEncoderModuleMixin", "SIGNAL_START_IMAGE_GEN", "SIGNAL_TEXT_DONE"]

@@ -156,7 +156,7 @@ def test_bagel_qwen2_mot_velocity_collect_requires_flow_velocity_source() -> Non
 
 
 def test_bagel_marker_wrapping_skips_velocity_and_generated_latent_sources() -> None:
-    from veomni.models.seed_omni.modules.bagel.text_encoder.processing import image_embed_marker_items
+    from veomni.models.seed_omni.modules.bagel.text_encoder.processing import is_image_item
 
     context = ConversationItem(
         type="output",
@@ -187,10 +187,7 @@ def test_bagel_marker_wrapping_skips_velocity_and_generated_latent_sources() -> 
         meta={},
     )
 
-    assert image_embed_marker_items([[context, query, velocity, generated]], item_types={"output"}) == [
-        context,
-        query,
-    ]
+    assert [item for item in (context, query, velocity, generated) if is_image_item(item)] == [context, query]
 
 
 def _tiny_flow_connector():

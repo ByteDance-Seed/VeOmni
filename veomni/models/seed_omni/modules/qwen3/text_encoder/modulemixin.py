@@ -2,6 +2,7 @@ from typing import Any, Dict, List, Optional
 
 import torch
 import torch.nn.functional as F
+from transformers import PreTrainedTokenizerBase
 
 from veomni.utils.tensor_utils import naflatten, unflatten
 
@@ -41,7 +42,12 @@ class Qwen3TextEncoderCPUPreprocessor(CPUPreprocessor):
     tensors so it can run in DataLoader workers and overlap with GPU compute.
     """
 
-    def __init__(self, tokenizer: Any, chat_markers: Any, apply_template_fn: Any) -> None:
+    def __init__(
+        self,
+        tokenizer: PreTrainedTokenizerBase,
+        chat_markers: Any,
+        apply_template_fn: Any,
+    ) -> None:
         self._tokenizer = tokenizer
         self._chat_markers = chat_markers
         self._apply_template_fn = apply_template_fn
@@ -91,14 +97,14 @@ class Qwen3TextEncoderModuleMixin(TextEncoderModuleMixin):
         return self.config.enable_image
 
     @property
-    def tokenizer(self) -> Any:
+    def tokenizer(self) -> PreTrainedTokenizerBase:
         return self._tokenizer
 
     @tokenizer.setter
-    def tokenizer(self, tokenizer: Any) -> None:
+    def tokenizer(self, tokenizer: PreTrainedTokenizerBase) -> None:
         self._tokenizer = tokenizer
-        self._eos_token_id = int(tokenizer.eos_token_id)
-        self._im_end_token_id = int(tokenizer.convert_tokens_to_ids("<|im_end|>"))
+        self._eos_token_id = self._resolve_token_id(tokenizer, token_id=tokenizer.eos_token_id)
+        self._im_end_token_id = self._resolve_token_id(tokenizer, token="<|im_end|>")
         # Only the markers differ: image mode adds the vision wrap tokens.
         if self._enable_image:
             self._chat_markers = Qwen3VLChatMarkers(
@@ -133,7 +139,7 @@ class Qwen3TextEncoderModuleMixin(TextEncoderModuleMixin):
             return  # fully trainable (default text-only behaviour)
         # The user can't know the vision special-token ids, but the module can:
         # resolve them from its own tokenizer so only those rows stay trainable.
-        ids = [int(self._tokenizer.convert_tokens_to_ids(tok)) for tok in self._VISION_SPECIAL_TOKENS]
+        ids = [int(self._resolve_token_id(self._tokenizer, token=tok)) for tok in self._VISION_SPECIAL_TOKENS]
         weight = self.embed_tokens.weight
         weight.requires_grad_(True)
         keep = torch.zeros(weight.shape[0], dtype=torch.bool)
