@@ -25,20 +25,42 @@ def permute(tokens: torch.Tensor, routing_map: torch.Tensor):
         routing_map (torch.Tensor): The sparse token to expert mapping, [num_experts, tokens].
 
     """
-    num_tokens, _ = tokens.shape
-    num_experts = routing_map.shape[0]
-
-    # mask [num_tokens, num_experts] -> [num_experts, num_tokens]
-    routing_map = routing_map.bool()
-
-    # Create a dense expert-to-token mapping from the sparse token-to-expert mapping
-    token_indices = torch.arange(num_tokens, device=routing_map.device).unsqueeze(0).expand(num_experts, -1)
-    sorted_indices = token_indices.masked_select(routing_map)
+    sorted_indices = get_permutation_mapping(tokens.size(0), routing_map)
 
     # use the mapping to permute the tokens
     permuted_input = tokens.index_select(0, sorted_indices)
 
     return permuted_input, sorted_indices
+
+
+def get_permutation_mapping(num_tokens: int, routing_map: torch.Tensor):
+    num_experts = routing_map.shape[0]
+    routing_map = routing_map.bool()
+    token_indices = torch.arange(num_tokens, device=routing_map.device).unsqueeze(0).expand(num_experts, -1)
+    return token_indices.masked_select(routing_map)
+
+
+def build_routing_map(selected_experts: torch.Tensor, num_experts: int) -> torch.Tensor:
+    num_tokens, top_k = selected_experts.shape
+    routing_map = torch.zeros(
+        (num_experts, num_tokens),
+        dtype=torch.bool,
+        device=selected_experts.device,
+    )
+    token_indices = torch.arange(num_tokens, device=selected_experts.device).unsqueeze(0).expand(top_k, -1)
+    routing_map[selected_experts.T.reshape(-1), token_indices.reshape(-1)] = True
+    return routing_map
+
+
+def get_permuted_tokens_weight(
+    routing_weights: torch.Tensor,
+    selected_experts: torch.Tensor,
+    routing_map: torch.Tensor,
+) -> torch.Tensor:
+    expert_indices, token_indices = routing_map.nonzero(as_tuple=True)
+    topk_match = selected_experts[token_indices] == expert_indices.unsqueeze(1)
+    topk_indices = topk_match.to(torch.int64).argmax(dim=1)
+    return routing_weights[token_indices, topk_indices]
 
 
 def unpermute(
@@ -92,8 +114,48 @@ def generate_weights_idx(routing_weights: torch.Tensor, selected_experts: torch.
     return weights_idx
 
 
-def sort_chunks_by_idxs(input: torch.Tensor, split_sizes: torch.Tensor, sorted_idxs: torch.Tensor):
+def sort_chunks_by_idxs(input: torch.Tensor, split_sizes: torch.Tensor, sorted_idxs: torch.Tensor, output=None):
     """Split and sort the input tensor based on the split_sizes and sorted indices."""
-    input = torch.split(input, split_sizes.tolist(), dim=0)
-    output = torch.cat([input[i] for i in sorted_idxs], dim=0)
+    split_sizes = split_sizes.tolist()
+    if output is None:
+        output = torch.empty_like(input)
+
+    input_offsets = [0]
+    for split_size in split_sizes:
+        input_offsets.append(input_offsets[-1] + split_size)
+
+    output_offset = 0
+    for idx in sorted_idxs:
+        split_size = split_sizes[idx]
+        if split_size > 0:
+            input_start = input_offsets[idx]
+            input_end = input_start + split_size
+            output_end = output_offset + split_size
+            output[output_offset:output_end].copy_(input[input_start:input_end])
+            output_offset = output_end
+    return output
+
+
+def inverse_sort_chunks_by_idxs(
+    input: torch.Tensor, split_sizes: torch.Tensor, sorted_idxs: torch.Tensor, output=None
+):
+    """Undo sort_chunks_by_idxs for the same split sizes and sorted indices."""
+    split_sizes = split_sizes.tolist()
+    if output is None:
+        output = torch.empty_like(input)
+
+    input_offsets = [0]
+    for split_size in split_sizes:
+        input_offsets.append(input_offsets[-1] + split_size)
+
+    sorted_input_offset = 0
+    for idx in sorted_idxs:
+        split_size = split_sizes[idx]
+        if split_size > 0:
+            input_start = sorted_input_offset
+            input_end = input_start + split_size
+            output_start = input_offsets[idx]
+            output_end = output_start + split_size
+            output[output_start:output_end].copy_(input[input_start:input_end])
+            sorted_input_offset = input_end
     return output

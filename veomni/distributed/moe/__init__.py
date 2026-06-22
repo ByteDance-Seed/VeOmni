@@ -13,7 +13,15 @@
 # limitations under the License.
 
 
-from .moe_layer import EPGroupGemm, EPMergedFc1GroupGemm, preprocess, token_pre_all2all, tokens_post_all2all
+from .moe_layer import (
+    EPGroupGemm,
+    EPMergedFc1GroupGemm,
+    EPMergedFc1PostAllToAllGroupGemm,
+    preprocess,
+    token_pre_all2all,
+    tokens_post_all2all,
+)
+from .moe_utils import build_routing_map
 
 
 __all__ = [
@@ -22,4 +30,6 @@ __all__ = [
     "tokens_post_all2all",
     "EPGroupGemm",
     "EPMergedFc1GroupGemm",
+    "EPMergedFc1PostAllToAllGroupGemm",
+    "build_routing_map",
 ]
