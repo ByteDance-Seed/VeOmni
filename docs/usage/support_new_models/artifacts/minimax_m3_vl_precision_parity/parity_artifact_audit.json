@@ -1,8 +1,10 @@
 {
   "full_checkpoint_forward_passed": false,
+  "full_checkpoint_preflight_passed": false,
   "multicard_passed": false,
   "passed": true,
   "require_full_checkpoint_forward": false,
+  "require_full_checkpoint_preflight": false,
   "require_multicard": false,
   "results": {
     "checkpoint_forward_smoke": [
@@ -25,6 +27,7 @@
       }
     ],
     "full_checkpoint_forward": [],
+    "full_checkpoint_preflight": [],
     "multicard_parity": [],
     "toy_precision": [
       {

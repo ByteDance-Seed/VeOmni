@@ -60,6 +60,18 @@ def parse_args() -> argparse.Namespace:
         help="Fail unless at least one --full-forward-json proves full public-checkpoint forward parity.",
     )
     parser.add_argument(
+        "--full-preflight-json",
+        type=Path,
+        action="append",
+        default=[],
+        help="Full public-checkpoint preflight artifact. May be repeated.",
+    )
+    parser.add_argument(
+        "--require-full-checkpoint-preflight",
+        action="store_true",
+        help="Fail unless at least one --full-preflight-json proves target-machine readiness.",
+    )
+    parser.add_argument(
         "--multicard-json",
         type=Path,
         action="append",
@@ -180,6 +192,58 @@ def check_payload_sample(path: Path) -> dict[str, Any]:
     add_issue(issues, sampled.get("passed") is True, f"{prefix}: sampled state load failed")
     add_issue(issues, sampled.get("loaded_tensor_count", 0) > 0, f"{prefix}: no sampled tensors loaded")
     add_issue(issues, sampled.get("value_mismatch_count") == 0, f"{prefix}: sampled value mismatches")
+
+    return {"path": str(path), "passed": not issues, "issues": issues}
+
+
+def check_full_checkpoint_preflight(path: Path) -> dict[str, Any]:
+    data = load_json(path)
+    issues: list[str] = []
+    prefix = path.name
+    checkpoint = data.get("checkpoint") or {}
+    config = data.get("config") or {}
+    runtime = data.get("runtime") or {}
+    requirements = data.get("requirements") or {}
+
+    add_issue(issues, data.get("passed") is True, f"{prefix}: passed is not true")
+    add_issue(issues, data.get("issues") == [], f"{prefix}: issues is not empty")
+    add_issue(issues, checkpoint.get("index_exists") is True, f"{prefix}: checkpoint index is missing")
+    add_issue(issues, checkpoint.get("weight_map_keys", 0) >= 20_000, f"{prefix}: weight_map key count is too low")
+    add_issue(issues, checkpoint.get("selected_shard_count", 0) >= 59, f"{prefix}: did not find all public shards")
+    add_issue(issues, checkpoint.get("missing_shards") == [], f"{prefix}: missing public shards")
+    add_issue(issues, checkpoint.get("payload_bytes_present", 0) > 800_000_000_000, f"{prefix}: payload bytes below full checkpoint")
+    checkpoint_dir = str(checkpoint.get("checkpoint_dir") or "")
+    add_issue(issues, "toy" not in checkpoint_dir.lower(), f"{prefix}: checkpoint_dir looks like a toy checkpoint")
+    add_issue(issues, config.get("config_json_exists") is True, f"{prefix}: config.json is missing")
+    add_issue(issues, runtime.get("import_errors") == [], f"{prefix}: runtime import/probe errors present")
+    add_issue(
+        issues,
+        version_at_least(runtime.get("transformers_version"), (5, 12, 0)),
+        f"{prefix}: transformers_version is below 5.12.0",
+    )
+
+    for role in ("reference_device", "candidate_device"):
+        device = str(runtime.get(role) or "")
+        if device.startswith("cuda"):
+            add_issue(issues, runtime.get("cuda_available") is True, f"{prefix}: {role} requested CUDA but unavailable")
+            add_issue(issues, runtime.get("cuda_device_count", 0) >= 1, f"{prefix}: {role} requested CUDA but no devices are visible")
+        elif device.startswith("npu"):
+            add_issue(issues, runtime.get("npu_available") is True, f"{prefix}: {role} requested NPU but unavailable")
+            add_issue(issues, runtime.get("npu_device_count", 0) >= 1, f"{prefix}: {role} requested NPU but no devices are visible")
+            add_issue(issues, runtime.get("torch_npu_version") is not None, f"{prefix}: missing torch_npu_version")
+            ascend_env = runtime.get("ascend_env") or {}
+            add_issue(
+                issues,
+                ascend_env.get("ASCEND_RT_VISIBLE_DEVICES") is not None
+                or ascend_env.get("ASCEND_VISIBLE_DEVICES") is not None,
+                f"{prefix}: missing visible Ascend device env",
+            )
+
+    required_free_hbm_mb = requirements.get("require_free_hbm_mb", 0)
+    if isinstance(required_free_hbm_mb, int) and required_free_hbm_mb > 0:
+        npu_smi = runtime.get("npu_smi") or {}
+        add_issue(issues, npu_smi.get("returncode") == 0, f"{prefix}: npu-smi preflight did not pass")
+        add_issue(issues, npu_smi.get("devices_with_required_free_hbm", 0) >= 1, f"{prefix}: no NPU has required free HBM")
 
     return {"path": str(path), "passed": not issues, "issues": issues}
 
@@ -311,6 +375,7 @@ def main() -> None:
         "checkpoint_payload_sample": [
             check_payload_sample(artifacts_dir / "real_checkpoint_payload_remote_sample.json"),
         ],
+        "full_checkpoint_preflight": [check_full_checkpoint_preflight(path) for path in args.full_preflight_json],
         "checkpoint_forward_smoke": [
             check_checkpoint_forward(artifacts_dir / "toy_checkpoint_forward_parity.json", require_public_full=False),
             check_checkpoint_forward(artifacts_dir / "toy_checkpoint_cpu_npu_forward_parity.json", require_public_full=False),
@@ -320,8 +385,17 @@ def main() -> None:
         ],
         "multicard_parity": [check_multicard_summary(path) for path in args.multicard_json],
     }
+    full_preflight_passed = any(item["passed"] for item in results["full_checkpoint_preflight"])
     full_forward_passed = any(item["passed"] for item in results["full_checkpoint_forward"])
     multicard_passed = any(item["passed"] for item in results["multicard_parity"])
+    if args.require_full_checkpoint_preflight and not full_preflight_passed:
+        results["full_checkpoint_preflight"].append(
+            {
+                "path": None,
+                "passed": False,
+                "issues": ["no full public-checkpoint preflight artifact passed"],
+            }
+        )
     if args.require_full_checkpoint_forward and not full_forward_passed:
         results["full_checkpoint_forward"].append(
             {
@@ -342,8 +416,10 @@ def main() -> None:
     all_items = [item for group in results.values() for item in group]
     report = {
         "passed": all(item["passed"] for item in all_items),
+        "require_full_checkpoint_preflight": args.require_full_checkpoint_preflight,
         "require_full_checkpoint_forward": args.require_full_checkpoint_forward,
         "require_multicard": args.require_multicard,
+        "full_checkpoint_preflight_passed": full_preflight_passed,
         "full_checkpoint_forward_passed": full_forward_passed,
         "multicard_passed": multicard_passed,
         "results": results,

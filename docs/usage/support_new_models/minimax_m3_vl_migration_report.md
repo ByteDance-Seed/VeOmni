@@ -302,6 +302,22 @@ scripts/multimodal/run_minimax_m3_vl_full_checkpoint_parity.sh \
   --preflight-only \
   --dry-run
 printed the preflight, forward, and strict audit commands without executing the 869 GB load.
+
+python3 scripts/multimodal/audit_minimax_m3_vl_parity_artifacts.py \
+  --output-json docs/usage/support_new_models/artifacts/minimax_m3_vl_precision_parity/parity_artifact_audit.json
+passed=true, full_checkpoint_preflight_passed=false, full_checkpoint_forward_passed=false, multicard_passed=false
+
+python3 scripts/multimodal/audit_minimax_m3_vl_parity_artifacts.py \
+  --full-preflight-json /tmp/minimax_full_preflight_audit_pass.json \
+  --require-full-checkpoint-preflight \
+  --output-json /tmp/minimax_full_preflight_audit_pass_audit.json
+passed=true, full_checkpoint_preflight_passed=true
+
+python3 scripts/multimodal/audit_minimax_m3_vl_parity_artifacts.py \
+  --full-preflight-json /tmp/minimax_full_preflight_fake_checkpoint/preflight.json \
+  --require-full-checkpoint-preflight \
+  --output-json /tmp/minimax_full_preflight_fake_checkpoint/preflight_audit.json
+expected failure: runtime import/probe errors and missing full-checkpoint readiness were rejected.
 ```
 
 Additional local checks for the latest patchgen/docstring commit:

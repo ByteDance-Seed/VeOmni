@@ -68,22 +68,39 @@ python scripts/multimodal/audit_minimax_m3_vl_parity_artifacts.py \
 ```json
 {
   "passed": true,
+  "full_checkpoint_preflight_passed": false,
   "full_checkpoint_forward_passed": false,
   "multicard_passed": false,
+  "require_full_checkpoint_preflight": false,
   "require_full_checkpoint_forward": false,
   "require_multicard": false
 }
 ```
 
-这表示 toy precision、真实 tensor payload sample、toy checkpoint forward smoke 和 CPU reference vs NPU candidate checkpoint-forward smoke 都已通过，但完整 869 GB checkpoint forward parity 尚未完成。
+这表示 toy precision、真实 tensor payload sample、toy checkpoint forward smoke 和 CPU reference vs NPU candidate checkpoint-forward smoke 都已通过，但完整 869 GB checkpoint preflight 和 forward parity 尚未作为审计输入提供。
 多卡 SP/EP/FSDP2 summary 也尚未作为审计输入提供，所以 `multicard_passed=false`。
 
-在目标机器跑完完整 public checkpoint 和多卡 SP/EP/FSDP2 alignment 后，必须改用强制模式，把 full-checkpoint artifact 与 multicard artifact 都作为输入：
+在目标机器只完成 full-checkpoint preflight 后，可以先用强制 preflight 模式确认目标机具备开始真实 forward 的条件：
 
 ```bash
 cd /path/to/VeOmni
 
 python scripts/multimodal/audit_minimax_m3_vl_parity_artifacts.py \
+  --require-full-checkpoint-preflight \
+  --full-preflight-json docs/usage/support_new_models/artifacts/minimax_m3_vl_precision_parity/real_checkpoint_forward_cpu_npu_preflight.json \
+  --output-json docs/usage/support_new_models/artifacts/minimax_m3_vl_precision_parity/parity_artifact_audit_preflight.json
+```
+
+注意：`full_checkpoint_preflight_passed=true` 只能证明本地 59 shard、payload bytes、runtime 和资源门槛满足要求，不能替代 logits/top-k/greedy forward parity。
+
+在目标机器跑完完整 public checkpoint forward 和多卡 SP/EP/FSDP2 alignment 后，必须改用最终强制模式，把 full-checkpoint preflight、full-checkpoint forward artifact 与 multicard artifact 都作为输入：
+
+```bash
+cd /path/to/VeOmni
+
+python scripts/multimodal/audit_minimax_m3_vl_parity_artifacts.py \
+  --require-full-checkpoint-preflight \
+  --full-preflight-json docs/usage/support_new_models/artifacts/minimax_m3_vl_precision_parity/real_checkpoint_forward_cpu_npu_preflight.json \
   --require-full-checkpoint-forward \
   --full-forward-json docs/usage/support_new_models/artifacts/minimax_m3_vl_precision_parity/real_checkpoint_forward_cpu_npu.json \
   --require-multicard \
