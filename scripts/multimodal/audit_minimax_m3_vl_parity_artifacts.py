@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -58,6 +59,18 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Fail unless at least one --full-forward-json proves full public-checkpoint forward parity.",
     )
+    parser.add_argument(
+        "--multicard-json",
+        type=Path,
+        action="append",
+        default=[],
+        help="Multi-card SP/EP/FSDP2 parity summary produced by run_minimax_m3_vl_multicard_parity.sh. May be repeated.",
+    )
+    parser.add_argument(
+        "--require-multicard",
+        action="store_true",
+        help="Fail unless at least one --multicard-json proves multi-card SP/EP/FSDP2 parity.",
+    )
     parser.add_argument("--output-json", type=Path, default=None)
     return parser.parse_args()
 
@@ -70,6 +83,42 @@ def load_json(path: Path) -> dict[str, Any]:
 def add_issue(issues: list[str], condition: bool, message: str) -> None:
     if not condition:
         issues.append(message)
+
+
+def version_at_least(version: str | None, minimum: tuple[int, int, int]) -> bool:
+    if not version:
+        return False
+    parts = tuple(int(part) for part in re.findall(r"\d+", version)[:3])
+    return parts >= minimum if len(parts) == 3 else False
+
+
+def resolve_log_path(log_value: Any, summary_path: Path) -> Path | None:
+    if not isinstance(log_value, str) or not log_value:
+        return None
+    path = Path(log_value)
+    if path.is_absolute() or path.exists():
+        return path
+    return summary_path.parent / path.name
+
+
+def load_json_from_log(path: Path, issues: list[str], prefix: str) -> dict[str, Any]:
+    if not path.exists():
+        issues.append(f"{prefix}: missing log {path}")
+        return {}
+    text = path.read_text(errors="replace")
+    if not text.strip():
+        issues.append(f"{prefix}: empty log {path}")
+        return {}
+    start = text.find("{")
+    end = text.rfind("}")
+    if start < 0 or end <= start:
+        issues.append(f"{prefix}: log {path} does not contain a JSON runtime report")
+        return {}
+    try:
+        return json.loads(text[start : end + 1])
+    except json.JSONDecodeError as exc:
+        issues.append(f"{prefix}: could not parse JSON runtime report from {path}: {exc}")
+        return {}
 
 
 def check_runtime_for_npu(data: dict[str, Any], issues: list[str], prefix: str) -> None:
@@ -131,6 +180,62 @@ def check_payload_sample(path: Path) -> dict[str, Any]:
     add_issue(issues, sampled.get("passed") is True, f"{prefix}: sampled state load failed")
     add_issue(issues, sampled.get("loaded_tensor_count", 0) > 0, f"{prefix}: no sampled tensors loaded")
     add_issue(issues, sampled.get("value_mismatch_count") == 0, f"{prefix}: sampled value mismatches")
+
+    return {"path": str(path), "passed": not issues, "issues": issues}
+
+
+def check_multicard_summary(path: Path) -> dict[str, Any]:
+    data = load_json(path)
+    issues: list[str] = []
+    prefix = path.name
+    preflight = data.get("preflight") or {}
+    dummy_forward = data.get("dummy_forward") or {}
+    e2e_align = data.get("e2e_align") or {}
+
+    add_issue(issues, data.get("passed") is True, f"{prefix}: passed is not true")
+    add_issue(issues, preflight.get("returncode") == 0, f"{prefix}: preflight did not pass")
+    add_issue(issues, dummy_forward.get("enabled") is True, f"{prefix}: dummy-forward gate was skipped")
+    add_issue(issues, dummy_forward.get("returncode") == 0, f"{prefix}: dummy-forward gate did not pass")
+    add_issue(issues, e2e_align.get("enabled") is True, f"{prefix}: e2e alignment gate was skipped")
+    add_issue(issues, e2e_align.get("returncode") == 0, f"{prefix}: e2e alignment gate did not pass")
+    add_issue(issues, e2e_align.get("runxfail_required") is True, f"{prefix}: e2e gate did not record --runxfail")
+
+    preflight_log = resolve_log_path(preflight.get("log"), path)
+    dummy_log = resolve_log_path(dummy_forward.get("log"), path)
+    e2e_log = resolve_log_path(e2e_align.get("log"), path)
+    add_issue(issues, preflight_log is not None, f"{prefix}: missing preflight log path")
+    add_issue(issues, dummy_log is not None, f"{prefix}: missing dummy-forward log path")
+    add_issue(issues, e2e_log is not None, f"{prefix}: missing e2e alignment log path")
+    if preflight_log is not None:
+        runtime = load_json_from_log(preflight_log, issues, prefix)
+        device_type = runtime.get("device_type")
+        device_count = runtime.get("device_count")
+        min_devices = runtime.get("min_devices")
+        add_issue(issues, device_type in {"cuda", "npu"}, f"{prefix}: invalid preflight device_type")
+        add_issue(issues, isinstance(device_count, int) and device_count > 1, f"{prefix}: invalid preflight device_count")
+        add_issue(issues, isinstance(min_devices, int) and min_devices > 1, f"{prefix}: invalid preflight min_devices")
+        if isinstance(device_count, int) and isinstance(min_devices, int):
+            add_issue(issues, device_count >= min_devices, f"{prefix}: device_count below min_devices")
+        add_issue(
+            issues,
+            version_at_least(runtime.get("transformers_version"), (5, 12, 0)),
+            f"{prefix}: transformers_version is below 5.12.0",
+        )
+        if device_type == "npu":
+            add_issue(issues, runtime.get("torch_npu_version") is not None, f"{prefix}: missing torch_npu_version")
+            ascend_env = runtime.get("ascend_env") or {}
+            add_issue(
+                issues,
+                ascend_env.get("ASCEND_RT_VISIBLE_DEVICES") is not None
+                or ascend_env.get("ASCEND_VISIBLE_DEVICES") is not None,
+                f"{prefix}: missing visible Ascend device env",
+            )
+    for label, log_path in (("dummy-forward", dummy_log), ("e2e alignment", e2e_log)):
+        if log_path is None:
+            continue
+        add_issue(issues, log_path.exists(), f"{prefix}: missing {label} log {log_path}")
+        if log_path.exists():
+            add_issue(issues, log_path.read_text(errors="replace").strip() != "", f"{prefix}: empty {label} log {log_path}")
 
     return {"path": str(path), "passed": not issues, "issues": issues}
 
@@ -200,8 +305,10 @@ def main() -> None:
         "full_checkpoint_forward": [
             check_checkpoint_forward(path, require_public_full=True) for path in args.full_forward_json
         ],
+        "multicard_parity": [check_multicard_summary(path) for path in args.multicard_json],
     }
     full_forward_passed = any(item["passed"] for item in results["full_checkpoint_forward"])
+    multicard_passed = any(item["passed"] for item in results["multicard_parity"])
     if args.require_full_checkpoint_forward and not full_forward_passed:
         results["full_checkpoint_forward"].append(
             {
@@ -210,12 +317,22 @@ def main() -> None:
                 "issues": ["no full public-checkpoint forward artifact passed"],
             }
         )
+    if args.require_multicard and not multicard_passed:
+        results["multicard_parity"].append(
+            {
+                "path": None,
+                "passed": False,
+                "issues": ["no multi-card SP/EP/FSDP2 parity artifact passed"],
+            }
+        )
 
     all_items = [item for group in results.values() for item in group]
     report = {
         "passed": all(item["passed"] for item in all_items),
         "require_full_checkpoint_forward": args.require_full_checkpoint_forward,
+        "require_multicard": args.require_multicard,
         "full_checkpoint_forward_passed": full_forward_passed,
+        "multicard_passed": multicard_passed,
         "results": results,
     }
 

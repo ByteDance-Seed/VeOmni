@@ -69,13 +69,16 @@ python scripts/multimodal/audit_minimax_m3_vl_parity_artifacts.py \
 {
   "passed": true,
   "full_checkpoint_forward_passed": false,
-  "require_full_checkpoint_forward": false
+  "multicard_passed": false,
+  "require_full_checkpoint_forward": false,
+  "require_multicard": false
 }
 ```
 
 这表示 toy precision、真实 tensor payload sample、toy checkpoint forward smoke 和 CPU reference vs NPU candidate checkpoint-forward smoke 都已通过，但完整 869 GB checkpoint forward parity 尚未完成。
+多卡 SP/EP/FSDP2 summary 也尚未作为审计输入提供，所以 `multicard_passed=false`。
 
-在目标机器跑完完整 public checkpoint 后，必须改用强制模式，把 full-checkpoint artifact 作为输入：
+在目标机器跑完完整 public checkpoint 和多卡 SP/EP/FSDP2 alignment 后，必须改用强制模式，把 full-checkpoint artifact 与 multicard artifact 都作为输入：
 
 ```bash
 cd /path/to/VeOmni
@@ -83,10 +86,12 @@ cd /path/to/VeOmni
 python scripts/multimodal/audit_minimax_m3_vl_parity_artifacts.py \
   --require-full-checkpoint-forward \
   --full-forward-json docs/usage/support_new_models/artifacts/minimax_m3_vl_precision_parity/real_checkpoint_forward_cpu_npu.json \
+  --require-multicard \
+  --multicard-json docs/usage/support_new_models/artifacts/minimax_m3_vl_multicard_parity/multicard_parity_summary.json \
   --output-json docs/usage/support_new_models/artifacts/minimax_m3_vl_precision_parity/parity_artifact_audit_full.json
 ```
 
-只有强制模式也 `passed=true`，才可以把真实 checkpoint forward parity 视为完成。
+只有强制模式也 `passed=true`，才可以把真实 checkpoint forward parity 和多卡 SP/EP/FSDP2 parity 视为完成。
 
 ## CPU 复跑
 
@@ -478,6 +483,19 @@ scripts/multimodal/run_minimax_m3_vl_multicard_parity.sh \
 - `dummy_forward.returncode=0`；
 - `e2e_align.returncode=0`，并且该命令必须使用 `--runxfail`，不能让 xfail marker 吞掉真实失败；
 - 保存 `preflight.log`、`dummy_forward.log`、`e2e_align.log`，并把硬件拓扑、torchrun world size、JSON/日志路径补进 `minimax_m3_vl_migration_report.md`。
+
+多卡 summary 必须进入 artifact 审计：
+
+```bash
+cd /path/to/VeOmni
+
+python scripts/multimodal/audit_minimax_m3_vl_parity_artifacts.py \
+  --multicard-json docs/usage/support_new_models/artifacts/minimax_m3_vl_multicard_parity/multicard_parity_summary.json \
+  --require-multicard \
+  --output-json docs/usage/support_new_models/artifacts/minimax_m3_vl_precision_parity/parity_artifact_audit_multicard.json
+```
+
+审计器会检查 summary 中的 `passed=true`、preflight/dummy/e2e return code、`--runxfail` 记录、log 路径、preflight log 中的 `device_count>=min_devices` 和 `transformers_version>=5.12.0`。如果 preflight 设备类型是 NPU，还会要求 `torch_npu_version` 和可见 Ascend 设备环境变量。
 
 多卡通过前，不应声明 SP/EP/FSDP2 完成。
 
