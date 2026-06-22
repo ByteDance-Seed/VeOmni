@@ -4,7 +4,7 @@ Date: 2026-06-18
 
 ## Status
 
-This PR now contains a MiniMax M3 VL patchgen-generated intake for VeOmni. It does not claim full production completion yet, because the 59-shard public checkpoint payload load, multi-card SP/EP alignment, and accelerator-specific execution evidence are still outstanding. Public checkpoint index coverage is verified against the generated model `state_dict()` keys, and safetensors shard-header metadata verifies converted key/shape coverage across all 59 public shards without downloading tensor payloads.
+This PR now contains a MiniMax M3 VL patchgen-generated intake for VeOmni. It does not claim full production completion yet, because the 59-shard public checkpoint payload load and multi-card SP/EP alignment are still outstanding. Public checkpoint index coverage is verified against the generated model `state_dict()` keys, safetensors shard-header metadata verifies converted key/shape coverage across all 59 public shards without downloading tensor payloads, and single-card Ascend NPU generated-model toy SFT loss now passes.
 
 Community RFC:
 
@@ -31,6 +31,8 @@ Upstream PR:
 - `configs/multimodal/minimax_m3_vl/minimax_m3_vl.yaml`
 - `scripts/multimodal/verify_minimax_m3_vl_checkpoint_index.py`
 - `scripts/multimodal/train_minimax_m3_vl.sh`
+- `scripts/multimodal/run_minimax_m3_vl_npu_loss.py`
+- `scripts/multimodal/run_minimax_m3_vl_npu_loss_root.sh`
 - `docs/examples/minimax_m3_vl.md`
 - `docs/usage/support_new_models/minimax_m3_vl_data_module_design.md`
 - `docs/usage/support_new_models/minimax_m3_vl_hyperparams_loading_report.md`
@@ -79,12 +81,12 @@ Reading `.agents/skills/veomni-new-model/SKILL.md` and the Bagel reference commi
 | Model Python | `veomni/models/transformers/<model>/__init__.py`, config, patchgen configs, generated GPU/NPU files, `parallel_plan.py`, converter if checkpoint layout needs it | Present for patchgen slice |
 | Data Python | `veomni/data/data_transform.py` and/or `veomni/data/multimodal/<model>*.py`; trainer glue if visual module lookup differs | Present: transform/template and VLM trainer visual-module lookup |
 | Config | `configs/multimodal/<model>/<model>.yaml` for VLM models | Present: `configs/multimodal/minimax_m3_vl/minimax_m3_vl.yaml` |
-| Script | `scripts/multimodal/<model>.sh` or a conversion/training helper | Present: `scripts/multimodal/train_minimax_m3_vl.sh` |
+| Script | `scripts/multimodal/<model>.sh` or a conversion/training helper | Present: `scripts/multimodal/train_minimax_m3_vl.sh` plus NPU loss evidence runners |
 | Docs | `docs/examples/<model>.md` plus support-new-model evidence reports | Present, with the MiniMax-only `transformers>=5.12.0` environment documented |
 | Tests | registry, patchgen hook, data/trainer, converter, dummy-forward, e2e where applicable | Partial: light tests pass; no-sync metadata and FSDP2 dummy-forward gates are wired; SP/EP e2e remains an explicit follow-up gate |
-| Validation evidence | source facts, generated import, real or toy forward/backward, checkpoint load, trainer smoke, accelerator status | Partial: source facts, import, converter unit tests, public checkpoint index/state coverage, public shard-header shape coverage, and toy/generated SFT smoke pass; full public checkpoint payload load and NPU execution are not complete |
+| Validation evidence | source facts, generated import, real or toy forward/backward, checkpoint load, trainer smoke, accelerator status | Partial: source facts, import, converter unit tests, public checkpoint index/state coverage, public shard-header shape coverage, toy/generated SFT smoke, and single-card Ascend NPU generated-model SFT smoke pass; full public checkpoint payload load and multi-card accelerator validation are not complete |
 
-Assessment: the current MiniMax M3 VL PR is a useful patchgen-generated migration slice and has the right file families for a VeOmni new-model PR. It is not a completed production model migration yet, because completion still requires full public checkpoint payload loading, public-checkpoint trainer smoke, SP/EP e2e alignment, and accelerator evidence. Synthetic image/video `VLMTrainer` forward/backward evidence, data-transform-level path/bytes video-container evidence, public checkpoint index/state coverage, and public shard-header shape coverage are present and documented below.
+Assessment: the current MiniMax M3 VL PR is a useful patchgen-generated migration slice and has the right file families for a VeOmni new-model PR. It is not a completed production model migration yet, because completion still requires full public checkpoint payload loading, public-checkpoint trainer smoke, and SP/EP e2e alignment on multi-card hardware. Synthetic image/video `VLMTrainer` forward/backward evidence, data-transform-level path/bytes video-container evidence, public checkpoint index/state coverage, public shard-header shape coverage, and single-card Ascend NPU generated-model SFT loss evidence are present and documented below.
 
 ## Source Facts
 
@@ -452,9 +454,30 @@ Artifact:
 
 - [generated_model_loss_log.json](./artifacts/minimax_m3_vl_sft_smoke/generated_model_loss_log.json)
 
+Ascend NPU generated-model reduced SFT smoke:
+
+```json
+{
+  "passed": true,
+  "first_loss": 5.531774044036865,
+  "last_loss": 4.8606367111206055,
+  "steps": 8,
+  "device": "npu:0",
+  "model_class": "veomni.models.transformers.minimax_m3_vl.generated.patched_modeling_minimax_m3_vl_npu.MiniMaxM3SparseForConditionalGeneration",
+  "torch_npu_version": "2.10.0",
+  "transformers_version": "5.12.0"
+}
+```
+
+Artifacts:
+
+- [npu_generated_model_loss_log.json](./artifacts/minimax_m3_vl_npu_loss_smoke/npu_generated_model_loss_log.json)
+- [npu_runtime_probe.json](./artifacts/minimax_m3_vl_npu_loss_smoke/npu_runtime_probe.json)
+- [loss_curve.svg](./artifacts/minimax_m3_vl_npu_loss_smoke/loss_curve.svg)
+
 ## Known Blockers
 
 1. **Full public checkpoint payload load.** Public config/preprocessor metadata loads from HF, ModelScope raw config/preprocessor files are byte-identical to HF, and the HF `model.safetensors.index.json` has `23416` weight-map keys. Index-level conversion now covers all generated model `state_dict()` keys: `1525` parameters plus `57` persistent buffers, with `missing_state_key_count=0`, `unexpected_index_key_count=0`, and no missing projector keys. Safetensors header metadata has also been read for all `59` public shards, with `shape_mismatch_count=0` after conversion. Real full checkpoint loading still cannot be claimed complete until the 869 GB tensor payloads are downloaded and loaded through the converter.
 2. **Full real multimodal trainer fixture.** The data path, trainer hooks, VeOmni pre-decoded-frame video fetch, local path/bytes MP4 decode through PyAV fallback, a single-process real-image/video-processor trainer-glue forward/backward fixture, and CPU `VLMTrainer.__init__()` image-only/video-only/mixed dataloader+optimizer smoke over local JPEG/MP4 path/bytes inputs are present. Remaining trainer evidence still needs public-checkpoint full trainer smoke and multi-card torchrun coverage.
 3. **SP/EP e2e alignment.** `tests/e2e/test_e2e_parallel.py` now uses a MiniMax-specific dummy VLM dataset with 1-D position ids and MiniMax image/video masks, but the alignment case remains xfail until multimodal SP/EP behavior is validated on hardware.
-4. **NPU kernels.** NPU generated modeling is checked in for runtime selection, but no Ascend-specific RMSNorm/RoPE/attention/MSA kernel replacement is claimed in this PR.
+4. **NPU kernels and distributed NPU.** Single-card Ascend 910B3 generated-model toy SFT loss passes in the `quay.io/ascend/vllm-ascend:v0.20.2rc1` container with `torch_npu==2.10.0`, but no Ascend-specific RMSNorm/RoPE/attention/MSA kernel replacement or multi-card NPU SP/EP/FSDP2 result is claimed in this PR.
