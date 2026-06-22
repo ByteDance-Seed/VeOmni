@@ -164,6 +164,12 @@ NPU 通过标准：
 
 - `scripts/multimodal/verify_minimax_m3_vl_checkpoint_payload_parity.py`
 
+已落地的远程抽样 payload 证据：
+
+- [real_checkpoint_payload_remote_sample.json](./artifacts/minimax_m3_vl_precision_parity/real_checkpoint_payload_remote_sample.json)
+
+该证据没有下载完整 shard，而是通过 HTTP Range 从 Hugging Face `model-00003-of-00059.safetensors` 读取 3 个真实 tensor payload，共 `1024` bytes，经 converter 映射到 VeOmni generated state keys 后检查 shape/dtype/value fingerprint。它证明真实 checkpoint payload 字节和 converter 路径已被执行，但仍不是 full-checkpoint logits parity。
+
 推荐分阶段执行。
 
 1. **抽样 shard payload parity**
@@ -173,7 +179,23 @@ NPU 通过标准：
    - 检查 converted tensor key、shape、dtype group、SHA256/value stats，并输出 JSON 证据；
    - 若抽样只覆盖部分 expert/gate-up group，可先加 `--allow-incomplete-groups` 产出诊断 JSON；正式通过证据必须覆盖完整 group，不应依赖该开关。
 
-示例命令：
+远程 range 抽样示例命令：
+
+```bash
+cd /path/to/VeOmni
+export PYTHONPATH=$PWD
+
+python scripts/multimodal/verify_minimax_m3_vl_checkpoint_payload_parity.py \
+  --config-path MiniMaxAI/MiniMax-M3 \
+  --index-json /path/to/model.safetensors.index.json \
+  --shard-base-url https://huggingface.co/MiniMaxAI/MiniMax-M3/resolve/main/ \
+  --include-key-regex '^language_model\.model\.layers\.3\.self_attn\.index_[qk]_norm\.weight$|^language_model\.model\.layers\.3\.block_sparse_moe\.e_score_correction_bias$' \
+  --torch-dtype bfloat16 \
+  --metadata-cache-dir /tmp/minimax_m3_safetensors_headers \
+  --output-json docs/usage/support_new_models/artifacts/minimax_m3_vl_precision_parity/real_checkpoint_payload_remote_sample.json
+```
+
+本地 shard 抽样示例命令：
 
 ```bash
 cd /path/to/VeOmni

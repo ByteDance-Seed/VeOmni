@@ -3,9 +3,10 @@
 
 This script complements the toy HF-vs-VeOmni parity gate. It has two modes:
 
-* payload: read local public safetensors payloads, run the VeOmni MiniMax
-  checkpoint tensor converter on real tensors, and compare converted tensor
-  names/shapes/dtypes against the generated model state metadata.
+* payload: read local public safetensors payloads or remote tensor byte ranges,
+  run the VeOmni MiniMax checkpoint tensor converter on real tensors, and
+  compare converted tensor names/shapes/dtypes against the generated model
+  state metadata.
 * forward: after payload conversion, load the full public checkpoint into both
   the upstream transformers MiniMax model and the VeOmni generated model, then
   compare fixed-prompt logits, top-k ids, and greedy decode ids.
@@ -20,11 +21,16 @@ import argparse
 import hashlib
 import json
 import os
+import platform
 import re
+import struct
+import sys
 import time
+import urllib.request
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
+from urllib.parse import urljoin
 
 
 DEFAULT_OUTPUT_JSON = (
@@ -32,20 +38,46 @@ DEFAULT_OUTPUT_JSON = (
     "minimax_m3_vl_precision_parity/real_checkpoint_payload_parity.json"
 )
 DEFAULT_PROMPT_IDS = "1,1209,318,257,1332"
+DEFAULT_INDEX_JSON = "https://huggingface.co/MiniMaxAI/MiniMax-M3/raw/main/model.safetensors.index.json"
+DEFAULT_SHARD_BASE_URL = "https://huggingface.co/MiniMaxAI/MiniMax-M3/resolve/main/"
+SAFETENSORS_TO_TORCH_DTYPE = {
+    "BF16": "bfloat16",
+    "F16": "float16",
+    "F32": "float32",
+    "F64": "float64",
+    "I8": "int8",
+    "I16": "int16",
+    "I32": "int32",
+    "I64": "int64",
+    "U8": "uint8",
+    "BOOL": "bool",
+}
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--checkpoint-dir", required=True, help="Local MiniMaxAI/MiniMax-M3 snapshot directory.")
+    parser.add_argument(
+        "--checkpoint-dir",
+        default=None,
+        help="Local MiniMaxAI/MiniMax-M3 snapshot directory. Required for --mode forward.",
+    )
     parser.add_argument(
         "--config-path",
         default=None,
-        help="Config path for model construction. Defaults to --checkpoint-dir.",
+        help="Config path for model construction. Defaults to --checkpoint-dir or MiniMaxAI/MiniMax-M3.",
     )
     parser.add_argument(
         "--index-json",
         default=None,
-        help="Path to model.safetensors.index.json. Defaults to <checkpoint-dir>/model.safetensors.index.json.",
+        help=(
+            "Path or URL to model.safetensors.index.json. Defaults to <checkpoint-dir>/model.safetensors.index.json "
+            "or the Hugging Face MiniMaxAI/MiniMax-M3 index URL when --checkpoint-dir is omitted."
+        ),
+    )
+    parser.add_argument(
+        "--shard-base-url",
+        default=None,
+        help="HTTP(S) base URL or local directory for shard files. Enables remote range payload reads.",
     )
     parser.add_argument("--mode", choices=("payload", "forward"), default="payload")
     parser.add_argument(
@@ -73,6 +105,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-new-tokens", type=int, default=8)
     parser.add_argument("--atol", type=float, default=1e-4)
     parser.add_argument("--rtol", type=float, default=1e-4)
+    parser.add_argument("--range-timeout", type=float, default=30.0)
+    parser.add_argument("--range-retries", type=int, default=5)
+    parser.add_argument("--metadata-cache-dir", default=None)
     return parser.parse_args()
 
 
@@ -102,10 +137,107 @@ def safetensors_dtype_from_torch(tensor: Any) -> str:
     }.get(dtype, dtype)
 
 
-def load_weight_map(index_json: Path) -> dict[str, str]:
-    with index_json.open() as f:
-        payload = json.load(f)
+def load_weight_map(index_json: str) -> dict[str, str]:
+    if index_json.startswith(("http://", "https://")):
+        request = urllib.request.Request(index_json, headers={"User-Agent": "VeOmni-MiniMaxM3VL-payload-parity"})
+        with urllib.request.urlopen(request, timeout=60) as response:
+            payload = json.loads(response.read().decode())
+    else:
+        with Path(index_json).open() as f:
+            payload = json.load(f)
     return payload["weight_map"]
+
+
+def read_http_range(url: str, start: int, end: int, *, timeout: float, retries: int) -> bytes:
+    headers = {
+        "Range": f"bytes={start}-{end}",
+        "User-Agent": "VeOmni-MiniMaxM3VL-payload-parity",
+    }
+    for attempt in range(retries):
+        request = urllib.request.Request(url, headers=headers)
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                return response.read(end - start + 1)
+        except OSError:
+            if attempt == retries - 1:
+                raise
+            time.sleep(2**attempt)
+    raise RuntimeError(f"failed to read HTTP range from {url}")
+
+
+def resolve_shard_source(filename: str, *, checkpoint_dir: Path | None, shard_base_url: str | None, index_json: str) -> str:
+    if shard_base_url:
+        if shard_base_url.startswith(("http://", "https://")):
+            return urljoin(shard_base_url.rstrip("/") + "/", filename)
+        return str(Path(shard_base_url) / filename)
+    if checkpoint_dir:
+        return str(checkpoint_dir / filename)
+    if index_json.startswith(("http://", "https://")):
+        return urljoin(index_json.rsplit("/", 1)[0] + "/", filename)
+    return str(Path(index_json).parent / filename)
+
+
+def read_safetensors_header(
+    source: str,
+    *,
+    timeout: float,
+    retries: int,
+    cache_dir: Path | None,
+) -> tuple[dict[str, Any], int]:
+    cache_path = cache_dir / f"{Path(source).name}.header.json" if cache_dir else None
+    if cache_path and cache_path.exists():
+        cached = json.loads(cache_path.read_text())
+        return cached["tensors"], int(cached["header_bytes"])
+
+    if source.startswith(("http://", "https://")):
+        header_length = struct.unpack("<Q", read_http_range(source, 0, 7, timeout=timeout, retries=retries))[0]
+        header = read_http_range(source, 8, 8 + header_length - 1, timeout=timeout, retries=retries)
+    else:
+        with Path(source).open("rb") as handle:
+            header_length = struct.unpack("<Q", handle.read(8))[0]
+            header = handle.read(header_length)
+    tensors = json.loads(header.decode())
+    tensors.pop("__metadata__", None)
+    header_bytes = header_length + 8
+    if cache_path:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_text(json.dumps({"header_bytes": header_bytes, "tensors": tensors}, sort_keys=True) + "\n")
+    return tensors, header_bytes
+
+
+def torch_dtype_from_safetensors(dtype: str):
+    import torch
+
+    return getattr(torch, SAFETENSORS_TO_TORCH_DTYPE[dtype])
+
+
+def tensor_from_safetensors_payload(payload: bytes, *, dtype: str, shape: list[int]) -> Any:
+    import torch
+
+    tensor = torch.frombuffer(bytearray(payload), dtype=torch_dtype_from_safetensors(dtype)).clone()
+    return tensor.reshape(tuple(shape))
+
+
+def read_tensor_from_source(
+    source: str,
+    public_name: str,
+    *,
+    metadata: dict[str, Any],
+    header_bytes: int,
+    timeout: float,
+    retries: int,
+) -> Any:
+    tensor_metadata = metadata[public_name]
+    start, end = tensor_metadata["data_offsets"]
+    absolute_start = header_bytes + start
+    absolute_end = header_bytes + end - 1
+    if source.startswith(("http://", "https://")):
+        payload = read_http_range(source, absolute_start, absolute_end, timeout=timeout, retries=retries)
+    else:
+        with Path(source).open("rb") as handle:
+            handle.seek(absolute_start)
+            payload = handle.read(end - start)
+    return tensor_from_safetensors_payload(payload, dtype=tensor_metadata["dtype"], shape=tensor_metadata["shape"])
 
 
 def select_weight_map(args: argparse.Namespace, weight_map: dict[str, str]) -> dict[str, str]:
@@ -171,10 +303,15 @@ def build_model_metadata(config_path: str, torch_dtype: str) -> tuple[dict[str, 
 
 def load_converted_payload(
     *,
-    checkpoint_dir: Path,
+    checkpoint_dir: Path | None,
+    index_json: str,
+    shard_base_url: str | None,
     selected_weight_map: dict[str, str],
     num_experts: int,
     hash_values: bool,
+    range_timeout: float,
+    range_retries: int,
+    metadata_cache_dir: str | None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     from safetensors import safe_open
 
@@ -191,18 +328,35 @@ def load_converted_payload(
     tensor_reports = []
     duplicate_converted_keys = []
     public_keys_read = 0
+    payload_bytes_read = 0
+    shard_sources: dict[str, str] = {}
+    metadata_cache_path = Path(metadata_cache_dir) if metadata_cache_dir else None
 
     for filename in sorted(by_shard):
-        shard_path = checkpoint_dir / filename
-        if not shard_path.exists():
-            raise FileNotFoundError(f"missing safetensors shard: {shard_path}")
-        with safe_open(shard_path, framework="pt", device="cpu") as handle:
-            available = set(handle.keys())
+        source = resolve_shard_source(filename, checkpoint_dir=checkpoint_dir, shard_base_url=shard_base_url, index_json=index_json)
+        shard_sources[filename] = source
+        if source.startswith(("http://", "https://")):
+            metadata, header_bytes = read_safetensors_header(
+                source,
+                timeout=range_timeout,
+                retries=range_retries,
+                cache_dir=metadata_cache_path,
+            )
+            available = set(metadata)
             for public_name in sorted(by_shard[filename]):
                 if public_name not in available:
-                    raise KeyError(f"{public_name} not found in {shard_path}")
+                    raise KeyError(f"{public_name} not found in {source}")
                 public_keys_read += 1
-                tensor = handle.get_tensor(public_name)
+                tensor = read_tensor_from_source(
+                    source,
+                    public_name,
+                    metadata=metadata,
+                    header_bytes=header_bytes,
+                    timeout=range_timeout,
+                    retries=range_retries,
+                )
+                start, end = metadata[public_name]["data_offsets"]
+                payload_bytes_read += end - start
                 result = converter.convert(public_name, tensor)
                 if result is None:
                     continue
@@ -214,9 +368,37 @@ def load_converted_payload(
                         "public_name": public_name,
                         "converted_name": result.name,
                         "source_shard": filename,
+                        "source": source,
                         "fingerprint": tensor_fingerprint(result.tensor, hash_values=hash_values),
                     }
                 )
+        else:
+            shard_path = Path(source)
+            if not shard_path.exists():
+                raise FileNotFoundError(f"missing safetensors shard: {shard_path}")
+            with safe_open(shard_path, framework="pt", device="cpu") as handle:
+                available = set(handle.keys())
+                for public_name in sorted(by_shard[filename]):
+                    if public_name not in available:
+                        raise KeyError(f"{public_name} not found in {shard_path}")
+                    public_keys_read += 1
+                    tensor = handle.get_tensor(public_name)
+                    payload_bytes_read += tensor.numel() * tensor.element_size()
+                    result = converter.convert(public_name, tensor)
+                    if result is None:
+                        continue
+                    if result.name in converted_tensors:
+                        duplicate_converted_keys.append(result.name)
+                    converted_tensors[result.name] = result.tensor
+                    tensor_reports.append(
+                        {
+                            "public_name": public_name,
+                            "converted_name": result.name,
+                            "source_shard": filename,
+                            "source": str(shard_path),
+                            "fingerprint": tensor_fingerprint(result.tensor, hash_values=hash_values),
+                        }
+                    )
 
     finalize_error = None
     try:
@@ -238,7 +420,9 @@ def load_converted_payload(
     summary = {
         "selected_public_keys": len(selected_weight_map),
         "public_keys_read": public_keys_read,
+        "payload_bytes_read": payload_bytes_read,
         "converted_tensor_keys": len(converted_tensors),
+        "shard_sources": shard_sources,
         "duplicate_converted_keys": sorted(set(duplicate_converted_keys)),
         "converter_finalize_error": finalize_error,
         "tensor_reports": tensor_reports,
@@ -436,14 +620,27 @@ def main() -> None:
     args = parse_args()
     os.environ.setdefault("MODELING_BACKEND", "veomni")
 
+    import torch
+    import transformers
+
     from veomni.utils.import_utils import is_transformers_version_greater_or_equal_to
 
     if not is_transformers_version_greater_or_equal_to("5.12.0"):
         raise RuntimeError("MiniMax M3 VL payload parity requires transformers>=5.12.0.")
 
-    checkpoint_dir = Path(args.checkpoint_dir)
-    config_path = args.config_path or str(checkpoint_dir)
-    index_json = Path(args.index_json) if args.index_json else checkpoint_dir / "model.safetensors.index.json"
+    checkpoint_dir = Path(args.checkpoint_dir) if args.checkpoint_dir else None
+    if args.mode == "forward" and checkpoint_dir is None:
+        raise RuntimeError("--mode forward requires --checkpoint-dir with a complete local checkpoint snapshot")
+    config_path = args.config_path or (str(checkpoint_dir) if checkpoint_dir else "MiniMaxAI/MiniMax-M3")
+    if args.index_json:
+        index_json = args.index_json
+    elif checkpoint_dir:
+        index_json = str(checkpoint_dir / "model.safetensors.index.json")
+    else:
+        index_json = DEFAULT_INDEX_JSON
+    shard_base_url = args.shard_base_url
+    if checkpoint_dir is None and shard_base_url is None:
+        shard_base_url = DEFAULT_SHARD_BASE_URL
     started_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
     weight_map = load_weight_map(index_json)
@@ -454,9 +651,14 @@ def main() -> None:
     model_metadata, num_experts = build_model_metadata(config_path, args.torch_dtype)
     converted_tensors, payload_summary = load_converted_payload(
         checkpoint_dir=checkpoint_dir,
+        index_json=index_json,
+        shard_base_url=shard_base_url,
         selected_weight_map=selected_weight_map,
         num_experts=num_experts,
         hash_values=not args.no_hash,
+        range_timeout=args.range_timeout,
+        range_retries=args.range_retries,
+        metadata_cache_dir=args.metadata_cache_dir,
     )
     metadata_comparison = compare_payload_to_model_metadata(converted_tensors, model_metadata)
 
@@ -482,15 +684,24 @@ def main() -> None:
         "passed": bool(payload_passed and (forward_report is None or forward_report["passed"])),
         "date": started_at,
         "mode": args.mode,
-        "checkpoint_dir": str(checkpoint_dir),
+        "checkpoint_dir": str(checkpoint_dir) if checkpoint_dir else None,
         "config_path": config_path,
-        "index_json": str(index_json),
+        "index_json": index_json,
+        "shard_base_url": shard_base_url,
         "torch_dtype": args.torch_dtype,
         "selected_shards": sorted(set(selected_weight_map.values())),
         "selected_shard_count": len(set(selected_weight_map.values())),
         "include_key_regex": args.include_key_regex,
         "allow_incomplete_groups": args.allow_incomplete_groups,
         "fail_on_dtype_mismatch": args.fail_on_dtype_mismatch,
+        "runtime": {
+            "python": sys.version,
+            "python_executable": sys.executable,
+            "platform": platform.platform(),
+            "machine": platform.machine(),
+            "torch_version": torch.__version__,
+            "transformers_version": transformers.__version__,
+        },
         "payload": {
             key: value
             for key, value in payload_summary.items()
