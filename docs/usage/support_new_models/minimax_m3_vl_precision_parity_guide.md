@@ -171,7 +171,7 @@ NPU 通过标准：
 
 该证据没有下载完整 shard，而是通过 HTTP Range 从 Hugging Face `model-00003-of-00059.safetensors` 读取 3 个真实 tensor payload，共 `1024` bytes，经 converter 映射到 VeOmni generated state keys 后检查 shape/dtype/value fingerprint。它证明真实 checkpoint payload 字节和 converter 路径已被执行，但仍不是 full-checkpoint logits parity。
 
-`toy_checkpoint_forward_parity.json` 使用完整 toy safetensors checkpoint 验证了 `--mode forward` 的执行路径：先加载 HF reference 生成 logits/top-k/greedy baseline，释放 HF 模型，再加载 VeOmni generated model 和 converted tensors 做对比。该 smoke 中 `forward.logits` max diff 为 `0.0`，top-k 和 greedy ids 完全一致；它只证明 runner 逻辑，不替代真实 869 GB checkpoint parity。
+`toy_checkpoint_forward_parity.json` 使用完整 toy safetensors checkpoint 验证了 `--mode forward` 的执行路径：先加载 HF reference 生成 logits/top-k/greedy baseline，释放 HF 模型，再把 public checkpoint tensors 边读、边转换、边写入 VeOmni generated model。该 smoke 中 `streaming_model_load=true`，strict missing/unexpected key count 都为 `0`，`forward.logits` max diff 为 `0.0`，top-k 和 greedy ids 完全一致；它只证明 runner 逻辑，不替代真实 869 GB checkpoint parity。
 
 推荐分阶段执行。
 
@@ -232,7 +232,7 @@ python scripts/multimodal/verify_minimax_m3_vl_checkpoint_payload_parity.py \
      - greedy decode 首 N token；
      - image/video prompt 的 projector output 和 final logits。
 
-`--mode forward` 会按顺序执行 HF baseline 和 VeOmni candidate：HF 结果写入 CPU baseline 后释放 HF 模型，再读取/转换 checkpoint payload 并加载 VeOmni model。这样比同时保留两个模型更适合大 checkpoint 目标机，但完整 869 GB payload 仍需要足够磁盘、CPU 内存和设备内存。
+`--mode forward` 会按顺序执行 HF baseline 和 VeOmni candidate：HF 结果写入 CPU baseline 后释放 HF 模型，再读取/转换 checkpoint payload，并以 streaming assign 方式写入 VeOmni model。这样避免同时保留两个模型和完整 converted tensor dict，更适合大 checkpoint 目标机，但完整 869 GB payload 仍需要足够磁盘、CPU 内存和设备内存。
 
 完整 text-prompt forward 示例：
 

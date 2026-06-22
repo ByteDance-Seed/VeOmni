@@ -431,6 +431,167 @@ def load_converted_payload(
     return converted_tensors, summary
 
 
+def stream_load_converted_payload_into_model(
+    *,
+    model: Any,
+    checkpoint_dir: Path | None,
+    index_json: str,
+    shard_base_url: str | None,
+    selected_weight_map: dict[str, str],
+    num_experts: int,
+    hash_values: bool,
+    range_timeout: float,
+    range_retries: int,
+    metadata_cache_dir: str | None,
+    max_report_tensors: int,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    from safetensors import safe_open
+
+    from veomni.models.transformers.minimax_m3_vl.checkpoint_tensor_converter import (
+        MiniMaxM3VLCheckpointTensorConverter,
+    )
+
+    by_shard: dict[str, list[str]] = defaultdict(list)
+    for name, filename in selected_weight_map.items():
+        by_shard[filename].append(name)
+
+    converter = MiniMaxM3VLCheckpointTensorConverter(num_experts=num_experts)
+    model_state = model.state_dict()
+    loaded_names: set[str] = set()
+    unexpected_model_keys = []
+    duplicate_converted_keys = []
+    shape_mismatches = []
+    dtype_mismatches = []
+    tensor_reports = []
+    tensor_report_total = 0
+    public_keys_read = 0
+    payload_bytes_read = 0
+    converted_tensor_keys = 0
+    shard_sources: dict[str, str] = {}
+    metadata_cache_path = Path(metadata_cache_dir) if metadata_cache_dir else None
+
+    def record_and_assign(public_name: str, filename: str | None, source: str | None, result: Any) -> None:
+        nonlocal converted_tensor_keys, tensor_report_total
+        converted_tensor_keys += 1
+        name = result.name
+        tensor = result.tensor
+        if name in loaded_names:
+            duplicate_converted_keys.append(name)
+            return
+        target = model_state.get(name)
+        if target is None:
+            unexpected_model_keys.append(name)
+            return
+        checkpoint_shape = list(tensor.shape)
+        model_shape = list(target.shape)
+        checkpoint_dtype = safetensors_dtype_from_torch(tensor)
+        model_dtype = safetensors_dtype_from_torch(target)
+        if checkpoint_shape != model_shape:
+            shape_mismatches.append({"name": name, "checkpoint": checkpoint_shape, "model": model_shape})
+            return
+        if checkpoint_dtype != model_dtype:
+            dtype_mismatches.append({"name": name, "checkpoint": checkpoint_dtype, "model": model_dtype})
+        target.copy_(tensor.to(dtype=target.dtype))
+        loaded_names.add(name)
+        tensor_report_total += 1
+        if len(tensor_reports) < max_report_tensors:
+            tensor_reports.append(
+                {
+                    "public_name": public_name,
+                    "converted_name": name,
+                    "source_shard": filename,
+                    "source": source,
+                    "fingerprint": tensor_fingerprint(tensor, hash_values=hash_values),
+                }
+            )
+
+    for filename in sorted(by_shard):
+        source = resolve_shard_source(
+            filename,
+            checkpoint_dir=checkpoint_dir,
+            shard_base_url=shard_base_url,
+            index_json=index_json,
+        )
+        shard_sources[filename] = source
+        if source.startswith(("http://", "https://")):
+            metadata, header_bytes = read_safetensors_header(
+                source,
+                timeout=range_timeout,
+                retries=range_retries,
+                cache_dir=metadata_cache_path,
+            )
+            available = set(metadata)
+            for public_name in sorted(by_shard[filename]):
+                if public_name not in available:
+                    raise KeyError(f"{public_name} not found in {source}")
+                public_keys_read += 1
+                tensor = read_tensor_from_source(
+                    source,
+                    public_name,
+                    metadata=metadata,
+                    header_bytes=header_bytes,
+                    timeout=range_timeout,
+                    retries=range_retries,
+                )
+                start, end = metadata[public_name]["data_offsets"]
+                payload_bytes_read += end - start
+                result = converter.convert(public_name, tensor)
+                if result is not None:
+                    record_and_assign(public_name, filename, source, result)
+        else:
+            shard_path = Path(source)
+            if not shard_path.exists():
+                raise FileNotFoundError(f"missing safetensors shard: {shard_path}")
+            with safe_open(shard_path, framework="pt", device="cpu") as handle:
+                available = set(handle.keys())
+                for public_name in sorted(by_shard[filename]):
+                    if public_name not in available:
+                        raise KeyError(f"{public_name} not found in {shard_path}")
+                    public_keys_read += 1
+                    tensor = handle.get_tensor(public_name)
+                    payload_bytes_read += tensor.numel() * tensor.element_size()
+                    result = converter.convert(public_name, tensor)
+                    if result is not None:
+                        record_and_assign(public_name, filename, str(shard_path), result)
+
+    finalize_error = None
+    try:
+        for result in converter.finalize():
+            record_and_assign("<converter.finalize>", None, None, result)
+    except RuntimeError as exc:
+        finalize_error = str(exc)
+
+    missing_state_keys = sorted(set(model_state) - loaded_names)
+    dtype_mismatch_groups: dict[str, int] = defaultdict(int)
+    for item in dtype_mismatches:
+        dtype_mismatch_groups[f"{item['checkpoint']}->{item['model']}"] += 1
+
+    payload_summary = {
+        "selected_public_keys": len(selected_weight_map),
+        "public_keys_read": public_keys_read,
+        "payload_bytes_read": payload_bytes_read,
+        "converted_tensor_keys": converted_tensor_keys,
+        "shard_sources": shard_sources,
+        "duplicate_converted_keys": sorted(set(duplicate_converted_keys)),
+        "converter_finalize_error": finalize_error,
+        "tensor_reports": tensor_reports,
+        "tensor_report_total": tensor_report_total,
+        "streaming_model_load": True,
+    }
+    metadata_comparison = {
+        "missing_model_key_count": len(unexpected_model_keys),
+        "shape_mismatch_count": len(shape_mismatches),
+        "dtype_mismatch_count": len(dtype_mismatches),
+        "dtype_mismatch_groups": dict(sorted(dtype_mismatch_groups.items())),
+        "missing_model_keys_sample": sorted(unexpected_model_keys)[:20],
+        "shape_mismatches_sample": shape_mismatches[:20],
+        "dtype_mismatches_sample": dtype_mismatches[:20],
+        "missing_state_key_count": len(missing_state_keys),
+        "missing_state_keys_sample": missing_state_keys[:20],
+    }
+    return payload_summary, metadata_comparison
+
+
 def compare_payload_to_model_metadata(
     converted_tensors: dict[str, Any],
     model_metadata: dict[str, dict[str, Any]],
@@ -582,24 +743,22 @@ def run_forward_parity(
     del hf_model
     release_accelerator_memory(device)
 
-    converted_tensors, payload_summary = load_converted_payload(
+    veomni_config = patch_eager_config(get_model_config(config_path))
+    veomni_cls = get_model_class(veomni_config)
+    veomni_model = veomni_cls(veomni_config)
+    payload_summary, metadata_comparison = stream_load_converted_payload_into_model(
+        model=veomni_model,
         checkpoint_dir=checkpoint_dir,
         index_json=index_json,
         shard_base_url=shard_base_url,
         selected_weight_map=selected_weight_map,
         num_experts=num_experts,
-        hash_values=not args.no_hash,
+        hash_values=False,
         range_timeout=args.range_timeout,
         range_retries=args.range_retries,
         metadata_cache_dir=args.metadata_cache_dir,
+        max_report_tensors=args.max_report_tensors,
     )
-    metadata_comparison = compare_payload_to_model_metadata(converted_tensors, model_metadata)
-
-    veomni_config = patch_eager_config(get_model_config(config_path))
-    veomni_cls = get_model_class(veomni_config)
-    veomni_model = veomni_cls(veomni_config)
-    load_result = veomni_model.load_state_dict(converted_tensors, strict=True)
-    del converted_tensors
     release_accelerator_memory(device)
 
     veomni_model.to(device)
@@ -643,9 +802,12 @@ def run_forward_parity(
         "hf_model_class": f"{HFMiniMaxM3SparseForConditionalGeneration.__module__}.MiniMaxM3SparseForConditionalGeneration",
         "veomni_model_class": f"{veomni_cls.__module__}.{veomni_cls.__name__}",
         "state_dict_load": {
-            "missing_keys": list(load_result.missing_keys),
-            "unexpected_keys": list(load_result.unexpected_keys),
+            "missing_keys": metadata_comparison.get("missing_state_keys_sample", []),
+            "missing_key_count": metadata_comparison.get("missing_state_key_count", 0),
+            "unexpected_keys": metadata_comparison.get("missing_model_keys_sample", []),
+            "unexpected_key_count": metadata_comparison.get("missing_model_key_count", 0),
             "strict": True,
+            "streaming": True,
         },
         "checks": checks,
         "passed": all(item.get("allclose", item.get("equal", False)) for item in checks),
@@ -721,6 +883,7 @@ def main() -> None:
         payload_summary["converted_tensor_keys"] > 0
         and not payload_summary["duplicate_converted_keys"]
         and not metadata_comparison["missing_model_key_count"]
+        and not metadata_comparison.get("missing_state_key_count", 0)
         and not metadata_comparison["shape_mismatch_count"]
         and (args.allow_incomplete_groups or payload_summary["converter_finalize_error"] is None)
         and (not args.fail_on_dtype_mismatch or not metadata_comparison["dtype_mismatch_count"])
@@ -755,7 +918,8 @@ def main() -> None:
         },
         "metadata_comparison": metadata_comparison,
         "tensor_reports": payload_summary["tensor_reports"][: args.max_report_tensors],
-        "tensor_report_truncated": len(payload_summary["tensor_reports"]) > args.max_report_tensors,
+        "tensor_report_truncated": payload_summary.get("tensor_report_total", len(payload_summary["tensor_reports"]))
+        > args.max_report_tensors,
         "forward": forward_report,
     }
 

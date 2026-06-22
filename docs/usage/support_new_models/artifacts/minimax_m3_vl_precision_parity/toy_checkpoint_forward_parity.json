@@ -2,7 +2,7 @@
   "allow_incomplete_groups": false,
   "checkpoint_dir": "/tmp/minimax_m3_vl_toy_full_checkpoint",
   "config_path": "/tmp/minimax_m3_vl_toy_full_checkpoint",
-  "date": "2026-06-22T13:05:00Z",
+  "date": "2026-06-22T13:10:37Z",
   "fail_on_dtype_mismatch": false,
   "forward": {
     "checks": [
@@ -67,8 +67,11 @@
       5
     ],
     "state_dict_load": {
+      "missing_key_count": 0,
       "missing_keys": [],
+      "streaming": true,
       "strict": true,
+      "unexpected_key_count": 0,
       "unexpected_keys": []
     },
     "top_k": 4,
@@ -82,6 +85,8 @@
     "dtype_mismatches_sample": [],
     "missing_model_key_count": 0,
     "missing_model_keys_sample": [],
+    "missing_state_key_count": 0,
+    "missing_state_keys_sample": [],
     "shape_mismatch_count": 0,
     "shape_mismatches_sample": []
   },
@@ -96,13 +101,15 @@
     "selected_public_keys": 58,
     "shard_sources": {
       "model.safetensors": "/tmp/minimax_m3_vl_toy_full_checkpoint/model.safetensors"
-    }
+    },
+    "streaming_model_load": true,
+    "tensor_report_total": 58
   },
   "runtime": {
     "machine": "aarch64",
     "platform": "Linux-5.15.0-94-generic-aarch64-with-glibc2.35",
     "python": "3.11.15 (main, Jun 11 2026, 04:04:24) [Clang 22.1.3 ]",
-    "python_executable": "/home/t00906153/super/.cache/uv/builds-v0/.tmpLM6IRr/bin/python",
+    "python_executable": "/home/t00906153/super/.cache/uv/builds-v0/.tmpG988WN/bin/python",
     "torch_version": "2.7.1+cpu",
     "transformers_version": "5.12.0"
   },
@@ -120,7 +127,6 @@
         "max_abs": 0.08704764395952225,
         "mean": 0.00010009111429098994,
         "numel": 8192,
-        "sha256": "135fff60db4efade7d8b468456ca849ea3589bd59e9366e5cc2c71c2df44ef36",
         "shape": [
           256,
           32
@@ -138,7 +144,6 @@
         "max_abs": 0.072722427546978,
         "mean": -0.00015473467647098005,
         "numel": 8192,
-        "sha256": "2db8da8d5e4779745733689c405b9dedad8b6de77858c4e9e9b91215f6b67f34",
         "shape": [
           256,
           32
@@ -156,7 +161,6 @@
         "max_abs": 0.0,
         "mean": 0.0,
         "numel": 32,
-        "sha256": "38723a2e5e8a17aa7950dc008209944e898f69a7bd10a23c839d341e935fd5ca",
         "shape": [
           32
         ],
@@ -173,7 +177,6 @@
         "max_abs": 0.06252893060445786,
         "mean": -9.256228804588318e-05,
         "numel": 2048,
-        "sha256": "41efa3843e11794ce5d5dfea8a4c182e4d5767a6f7417e5dfeeed4bf77cf3a75",
         "shape": [
           4,
           32,
@@ -192,7 +195,6 @@
         "max_abs": 0.07091536372900009,
         "mean": 0.00022473304125014693,
         "numel": 4096,
-        "sha256": "efbbfe034a57d1ffc34be7a32387994c7d5e0ea7ff967302330bd5da323b9143",
         "shape": [
           4,
           32,
@@ -211,7 +213,6 @@
         "max_abs": 0.0,
         "mean": 0.0,
         "numel": 4,
-        "sha256": "374708fff7719dd5979ec875d56cd2286f6d3cf7ec317a3b25632aab28ec37bb",
         "shape": [
           4
         ],
@@ -228,7 +229,6 @@
         "max_abs": 0.049592554569244385,
         "mean": 0.002403219696134329,
         "numel": 128,
-        "sha256": "674cfd21725ce4b48b46b357aa46984f4a6862b93a3f6601e39bbf72e909eac1",
         "shape": [
           4,
           32
@@ -246,7 +246,6 @@
         "max_abs": 0.05879344418644905,
         "mean": -0.000261136912740767,
         "numel": 512,
-        "sha256": "cad84565f2028b97c89ee3f8f1fddfbba16a572ec0e7fbb07a686023f03938c2",
         "shape": [
           32,
           16
@@ -264,7 +263,6 @@
         "max_abs": 0.06012187525629997,
         "mean": 0.0001566717546666041,
         "numel": 1024,
-        "sha256": "452f3e2d803be2976053cdfcd4817947c00e10be1718a61b52802f0382f6d55d",
         "shape": [
           32,
           32
@@ -282,7 +280,6 @@
         "max_abs": 0.0,
         "mean": 0.0,
         "numel": 32,
-        "sha256": "38723a2e5e8a17aa7950dc008209944e898f69a7bd10a23c839d341e935fd5ca",
         "shape": [
           32
         ],
@@ -299,7 +296,6 @@
         "max_abs": 0.0,
         "mean": 0.0,
         "numel": 8,
-        "sha256": "66687aadf862bd776c8fc18b8e9f8e20089714856ee233b3902a591d0d5f2925",
         "shape": [
           8
         ],
@@ -316,7 +312,6 @@
         "max_abs": 0.059951841831207275,
         "mean": -0.000477433466585353,
         "numel": 256,
-        "sha256": "1f9e6e7e7a4d45be5d49d1c1e2cf8a77c416043d205c489dfd899146080a9d9f",
         "shape": [
           8,
           32
@@ -334,7 +329,6 @@
         "max_abs": 0.0,
         "mean": 0.0,
         "numel": 8,
-        "sha256": "66687aadf862bd776c8fc18b8e9f8e20089714856ee233b3902a591d0d5f2925",
         "shape": [
           8
         ],
@@ -351,7 +345,6 @@
         "max_abs": 0.05280669033527374,
         "mean": 0.0005174565012566745,
         "numel": 256,
-        "sha256": "698b7a8d2f288d9d8665ab2fd71bd1b3c8b412cbfce7f92b8ac1c88db564d07b",
         "shape": [
           8,
           32
@@ -369,7 +362,6 @@
         "max_abs": 0.0,
         "mean": 0.0,
         "numel": 8,
-        "sha256": "66687aadf862bd776c8fc18b8e9f8e20089714856ee233b3902a591d0d5f2925",
         "shape": [
           8
         ],
@@ -386,7 +378,6 @@
         "max_abs": 0.05323415622115135,
         "mean": -0.00016809292719699442,
         "numel": 256,
-        "sha256": "805921a8831b8ca93cc7df1d2cf8db848b901b8307f5fc0a754aea2385bb510c",
         "shape": [
           8,
           32
@@ -404,7 +395,6 @@
         "max_abs": 0.06850307434797287,
         "mean": 9.212105942424387e-05,
         "numel": 1024,
-        "sha256": "045079594ac352b695704bcc8a5c1838919b012fb35a2f16584a652421ba7fea",
         "shape": [
           32,
           32
@@ -422,7 +412,6 @@
         "max_abs": 0.0,
         "mean": 0.0,
         "numel": 8,
-        "sha256": "66687aadf862bd776c8fc18b8e9f8e20089714856ee233b3902a591d0d5f2925",
         "shape": [
           8
         ],
@@ -439,7 +428,6 @@
         "max_abs": 0.07135143131017685,
         "mean": -0.0008459468372166157,
         "numel": 1024,
-        "sha256": "159fae315ef6637204ea799291826146fbf9d33231d637a5f70c70cc0d66d1ab",
         "shape": [
           32,
           32
@@ -457,7 +445,6 @@
         "max_abs": 0.055730003863573074,
         "mean": 0.0008118939003907144,
         "numel": 256,
-        "sha256": "cec0aa29805d9a58726119b9421f59d8e1a4849e55bfe86ac99980b08bef62e5",
         "shape": [
           8,
           32
@@ -475,7 +462,6 @@
         "max_abs": 0.0,
         "mean": 0.0,
         "numel": 32,
-        "sha256": "38723a2e5e8a17aa7950dc008209944e898f69a7bd10a23c839d341e935fd5ca",
         "shape": [
           32
         ],
@@ -492,7 +478,6 @@
         "max_abs": 0.0744703933596611,
         "mean": 0.00039668698445893824,
         "numel": 2048,
-        "sha256": "126c8648555b5dd6acfba6e6069e918ed158ecafbd4261517d7761993e8d6a0e",
         "shape": [
           32,
           64
@@ -510,7 +495,6 @@
         "max_abs": 0.06973396241664886,
         "mean": 0.0005473223282024264,
         "numel": 4096,
-        "sha256": "94ae001925d18c3075010be773c6e1695fd76fe8ccae137566ba03b588718761",
         "shape": [
           128,
           32
@@ -528,7 +512,6 @@
         "max_abs": 0.0,
         "mean": 0.0,
         "numel": 32,
-        "sha256": "38723a2e5e8a17aa7950dc008209944e898f69a7bd10a23c839d341e935fd5ca",
         "shape": [
           32
         ],
@@ -545,7 +528,6 @@
         "max_abs": 0.0,
         "mean": 0.0,
         "numel": 8,
-        "sha256": "66687aadf862bd776c8fc18b8e9f8e20089714856ee233b3902a591d0d5f2925",
         "shape": [
           8
         ],
@@ -562,7 +544,6 @@
         "max_abs": 0.06511133164167404,
         "mean": -0.0005683390772901475,
         "numel": 256,
-        "sha256": "080269b708f4bfaa5719d06d209b83c75702a2b9f71a1b082ebd0ca05701424b",
         "shape": [
           8,
           32
@@ -580,7 +561,6 @@
         "max_abs": 0.07556119561195374,
         "mean": -0.0005982632283121347,
         "numel": 1024,
-        "sha256": "a9e5fa5a3bf502e7b1e5acdd87102c7253b1fc2daedb9a4d2ed84adfee1f1bc9",
         "shape": [
           32,
           32
@@ -598,7 +578,6 @@
         "max_abs": 0.0,
         "mean": 0.0,
         "numel": 8,
-        "sha256": "66687aadf862bd776c8fc18b8e9f8e20089714856ee233b3902a591d0d5f2925",
         "shape": [
           8
         ],
@@ -615,7 +594,6 @@
         "max_abs": 0.07174250483512878,
         "mean": 0.0005434402264654636,
         "numel": 1024,
-        "sha256": "1d452372bf4f35b8bbc776e70b8be48bed1aca87df47b8ee936b3d20c5321c8a",
         "shape": [
           32,
           32
@@ -633,7 +611,6 @@
         "max_abs": 0.08606968075037003,
         "mean": 0.0005824582185596228,
         "numel": 256,
-        "sha256": "55ad485073b5bbca759801b65a4480c4b04bae5baf7bf12dc65503eb3ecad8e9",
         "shape": [
           8,
           32
@@ -651,7 +628,6 @@
         "max_abs": 0.0,
         "mean": 0.0,
         "numel": 32,
-        "sha256": "38723a2e5e8a17aa7950dc008209944e898f69a7bd10a23c839d341e935fd5ca",
         "shape": [
           32
         ],
@@ -668,7 +644,6 @@
         "max_abs": 0.0,
         "mean": 0.0,
         "numel": 32,
-        "sha256": "38723a2e5e8a17aa7950dc008209944e898f69a7bd10a23c839d341e935fd5ca",
         "shape": [
           32
         ],
@@ -685,7 +660,6 @@
         "max_abs": 0.06091693788766861,
         "mean": -0.0011714320862665772,
         "numel": 512,
-        "sha256": "5eb6883488307402a813a6ffaf00a62ad596e294f22c6febdf281d65ba23a38b",
         "shape": [
           32,
           16
@@ -703,7 +677,6 @@
         "max_abs": 0.0,
         "mean": 0.0,
         "numel": 32,
-        "sha256": "38723a2e5e8a17aa7950dc008209944e898f69a7bd10a23c839d341e935fd5ca",
         "shape": [
           32
         ],
@@ -720,7 +693,6 @@
         "max_abs": 0.06333119422197342,
         "mean": 0.0008023648406378925,
         "numel": 1024,
-        "sha256": "73462367ee643bafa5d65f741f3680f181c801c7a05ca7c4e7b7922a915d9a65",
         "shape": [
           32,
           32
@@ -738,7 +710,6 @@
         "max_abs": 0.0,
         "mean": 0.0,
         "numel": 32,
-        "sha256": "38723a2e5e8a17aa7950dc008209944e898f69a7bd10a23c839d341e935fd5ca",
         "shape": [
           32
         ],
@@ -755,7 +726,6 @@
         "max_abs": 0.07667655497789383,
         "mean": -0.00017070883768610656,
         "numel": 4096,
-        "sha256": "79a3b60b40d585f7ff7944a07c05acddd5629835d546664427f36ecc9ced3c75",
         "shape": [
           32,
           128
@@ -773,7 +743,6 @@
         "max_abs": 0.0,
         "mean": 0.0,
         "numel": 32,
-        "sha256": "38723a2e5e8a17aa7950dc008209944e898f69a7bd10a23c839d341e935fd5ca",
         "shape": [
           32
         ],
@@ -790,7 +759,6 @@
         "max_abs": 0.07092572003602982,
         "mean": 6.859040877316147e-05,
         "numel": 1024,
-        "sha256": "06fde847e311f9c70d18701f40ec4e91b63026710200fdfd36f2f6132608e1d0",
         "shape": [
           32,
           32
@@ -808,7 +776,6 @@
         "max_abs": 0.07899020612239838,
         "mean": 0.00013647688319906592,
         "numel": 18816,
-        "sha256": "f1e0958053d28ad22c3bfd4702adc24de86050cb3358e64cf8faf8ac951cdc02",
         "shape": [
           16,
           3,
@@ -829,7 +796,6 @@
         "max_abs": 0.0,
         "mean": 0.0,
         "numel": 16,
-        "sha256": "f5a5fd42d16a20302798ef6ed309979b43003d2320d9f0e8ea9831a92759fb4b",
         "shape": [
           16
         ],
@@ -846,7 +812,6 @@
         "max_abs": 1.0,
         "mean": 1.0,
         "numel": 16,
-        "sha256": "9628e545ed3ac074e5a6cbf542a642b62482fbfca9b4cb3ea4743a1874256e37",
         "shape": [
           16
         ],
@@ -863,7 +828,6 @@
         "max_abs": 0.0,
         "mean": 0.0,
         "numel": 16,
-        "sha256": "f5a5fd42d16a20302798ef6ed309979b43003d2320d9f0e8ea9831a92759fb4b",
         "shape": [
           16
         ],
@@ -880,7 +844,6 @@
         "max_abs": 1.0,
         "mean": 1.0,
         "numel": 16,
-        "sha256": "9628e545ed3ac074e5a6cbf542a642b62482fbfca9b4cb3ea4743a1874256e37",
         "shape": [
           16
         ],
@@ -897,7 +860,6 @@
         "max_abs": 0.0,
         "mean": 0.0,
         "numel": 32,
-        "sha256": "38723a2e5e8a17aa7950dc008209944e898f69a7bd10a23c839d341e935fd5ca",
         "shape": [
           32
         ],
@@ -914,7 +876,6 @@
         "max_abs": 0.06284594535827637,
         "mean": -4.816160071641207e-06,
         "numel": 512,
-        "sha256": "5c214ce9eb5bc706b4177c37c59dba1a49301d915614d3ab2e884c47beafee6e",
         "shape": [
           32,
           16
@@ -932,7 +893,6 @@
         "max_abs": 0.0,
         "mean": 0.0,
         "numel": 16,
-        "sha256": "f5a5fd42d16a20302798ef6ed309979b43003d2320d9f0e8ea9831a92759fb4b",
         "shape": [
           16
         ],
@@ -949,7 +909,6 @@
         "max_abs": 0.07515484094619751,
         "mean": -0.000573767232708633,
         "numel": 512,
-        "sha256": "acd5d6cb2fbeee9c6e7423c794e9cd16907817906b7fa0fc3d4e632cba421143",
         "shape": [
           16,
           32
@@ -967,7 +926,6 @@
         "max_abs": 0.0,
         "mean": 0.0,
         "numel": 16,
-        "sha256": "f5a5fd42d16a20302798ef6ed309979b43003d2320d9f0e8ea9831a92759fb4b",
         "shape": [
           16
         ],
@@ -984,7 +942,6 @@
         "max_abs": 0.06688830256462097,
         "mean": -0.000900032464414835,
         "numel": 256,
-        "sha256": "735c96f4d7272732cfc630b8f10424e18a07839719fba303e36c0388a1599fe5",
         "shape": [
           16,
           16
@@ -1002,7 +959,6 @@
         "max_abs": 0.0,
         "mean": 0.0,
         "numel": 16,
-        "sha256": "f5a5fd42d16a20302798ef6ed309979b43003d2320d9f0e8ea9831a92759fb4b",
         "shape": [
           16
         ],
@@ -1019,7 +975,6 @@
         "max_abs": 0.06510615348815918,
         "mean": 0.0011045460123568773,
         "numel": 256,
-        "sha256": "0d4d4ccf2c5e2e0dbd7eb70f55af280de97518a5b73d7674afc37cf76410ab48",
         "shape": [
           16,
           16
@@ -1037,7 +992,6 @@
         "max_abs": 0.0,
         "mean": 0.0,
         "numel": 16,
-        "sha256": "f5a5fd42d16a20302798ef6ed309979b43003d2320d9f0e8ea9831a92759fb4b",
         "shape": [
           16
         ],
@@ -1054,7 +1008,6 @@
         "max_abs": 0.061271362006664276,
         "mean": -0.0010168824810534716,
         "numel": 256,
-        "sha256": "52ffe966ed03f25eb0d48c77a11be6dac68855b23cf46fc14148130c95ab8dde",
         "shape": [
           16,
           16
@@ -1072,7 +1025,6 @@
         "max_abs": 0.0,
         "mean": 0.0,
         "numel": 16,
-        "sha256": "f5a5fd42d16a20302798ef6ed309979b43003d2320d9f0e8ea9831a92759fb4b",
         "shape": [
           16
         ],
@@ -1089,7 +1041,6 @@
         "max_abs": 0.057802680879831314,
         "mean": 0.001295516500249505,
         "numel": 256,
-        "sha256": "40fdb377d6f5c26e06a4749ce723b677b7a525569ab42954eeda7eb9ff4cb507",
         "shape": [
           16,
           16
@@ -1107,7 +1058,6 @@
         "max_abs": 0.0,
         "mean": 0.0,
         "numel": 16,
-        "sha256": "f5a5fd42d16a20302798ef6ed309979b43003d2320d9f0e8ea9831a92759fb4b",
         "shape": [
           16
         ],
@@ -1124,7 +1074,6 @@
         "max_abs": 1.0,
         "mean": 1.0,
         "numel": 16,
-        "sha256": "9628e545ed3ac074e5a6cbf542a642b62482fbfca9b4cb3ea4743a1874256e37",
         "shape": [
           16
         ],
