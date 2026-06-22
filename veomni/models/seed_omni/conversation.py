@@ -44,6 +44,10 @@ ItemType = str  # "text" | "image" | "output"
 ItemRole = str  # "user" | "assistant" | "dummy"
 ItemValue = Union[str, torch.Tensor, Image.Image]
 
+# Sentinel so ``__value_repr__`` can distinguish "repr self.value" (no arg) from
+# "repr this explicit meta value" (which may legitimately be ``None``).
+_UNSET = object()
+
 
 @dataclass
 class ConversationItem:
@@ -55,17 +59,20 @@ class ConversationItem:
     source: str | None = None
     meta: dict = field(default_factory=dict)
 
-    def __value_repr__(self) -> str:
-        if isinstance(self.value, str):
-            return f"[str]{repr(self.value)}"
-        elif isinstance(self.value, torch.Tensor):
-            return f"[torch.Tensor]{tuple(self.value.shape)}"
-        elif isinstance(self.value, Image.Image):
-            return f"[PIL.Image]{self.value.size}"
-        elif hasattr(self.value, "video") and hasattr(self.value, "video_fps"):
+    def __value_repr__(self, value: Any = _UNSET) -> str:
+        # Repr ``self.value`` by default; ``__meta_repr__`` passes meta values.
+        if value is _UNSET:
+            value = self.value
+        if isinstance(value, str):
+            return f"[str]{repr(value)}"
+        elif isinstance(value, torch.Tensor):
+            return f"[torch.Tensor]{tuple(value.shape)}"
+        elif isinstance(value, Image.Image):
+            return f"[PIL.Image]{value.size}"
+        elif hasattr(value, "video") and hasattr(value, "video_fps"):
             # VideoInputs bundle — duck-typed so core conversation.py doesn't
             # import the optional video/audio (ffmpeg/torchcodec/librosa) stack.
-            v = self.value
+            v = value
             shape = tuple(v.video.shape) if isinstance(v.video, torch.Tensor) else type(v.video).__name__
             parts = [f"video.shape={shape}", f"fps={v.video_fps}"]
             audio = getattr(v, "audio", None)
@@ -75,7 +82,7 @@ class ConversationItem:
                 parts.append(f"audio_fps={getattr(v, 'audio_fps', None)}")
             return f"[VideoInputs | {', '.join(parts)}]"
         else:
-            return f"[UnknownType]{type(self.value).__name__}"
+            return f"[UnknownType]{type(value).__name__}"
 
     def __meta_repr__(self) -> str:
         meta_items = [f"{key}={self.__value_repr__(value)}" for key, value in self.meta.items()]
@@ -153,6 +160,20 @@ def collect_desired_values(
     return [item.value for item in iter_desired_items(conversation_list, types, roles, sources)]
 
 
+def worker_dummy_items(conversation_list: list[list[ConversationItem]], source: str) -> list[ConversationItem]:
+    """Worker-appended ``role="dummy"`` placeholders for module ``source``.
+
+    A module's CPU preprocessor appends one on a micro-batch with no real input for
+    it; ``meta["source"]`` + ``role="dummy"`` is enough to find it back (a given
+    source has at most one class of dummy item live at any call site).
+    """
+    return [it for it in iter_desired_items(conversation_list, roles=["dummy"]) if it.meta.get("source") == source]
+
+
+def has_worker_dummy(conversation_list: list[list[ConversationItem]], source: str) -> bool:
+    return bool(worker_dummy_items(conversation_list, source))
+
+
 __all__ = [
     "ConversationItem",
     "build_conversation",
@@ -161,4 +182,6 @@ __all__ = [
     "seal_outputs",
     "iter_desired_items",
     "collect_desired_values",
+    "worker_dummy_items",
+    "has_worker_dummy",
 ]

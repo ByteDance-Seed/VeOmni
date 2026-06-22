@@ -822,9 +822,32 @@ class OmniTrainer:
     # ── Build: collator ─────────────────────────────────────────────────────────
 
     def _build_collate_fn(self):
-        """list-only ``SeedOmniCollator`` for data_type='seedomni'."""
-        self.base.collate_fn = SeedOmniCollator()
-        logger.info_rank0("OmniTrainer: using SeedOmniCollator (list-only) for data_type='seedomni'")
+        """list-only ``SeedOmniCollator`` for data_type='seedomni'.
+
+        Collects each active module's optional worker-side CPU preprocessor
+        (tokenize / image normalize) and hands them to the collator, so that
+        heavy CPU input-prep runs inside the DataLoader worker (overlapping with
+        GPU compute via prefetch) instead of blocking the main process inside
+        each module's ``pre_forward``. Modules without one contribute nothing.
+        Assets (tokenizer / processor) are already loaded by
+        ``_build_model_assets`` which runs before this in ``__init__``.
+        """
+        cpu_preprocessors = []
+        for name, module_trainer in self.module_trainers.items():
+            model = _unwrap_module(module_trainer.base.model)
+            builder = getattr(model, "build_cpu_preprocessor", None)
+            preprocessor = builder() if builder is not None else None
+            if preprocessor is not None:
+                cpu_preprocessors.append(preprocessor)
+                logger.info_rank0(
+                    f"OmniTrainer: module '{name}' contributes worker-side "
+                    f"CPU preprocessor {type(preprocessor).__name__}."
+                )
+        self.base.collate_fn = SeedOmniCollator(cpu_preprocessors=tuple(cpu_preprocessors))
+        logger.info_rank0(
+            f"OmniTrainer: SeedOmniCollator with {len(cpu_preprocessors)} worker-side CPU preprocessor(s) "
+            "for data_type='seedomni'."
+        )
 
     # ── Build: per-module optimizers + schedulers (drive the module-trainers) ──
 

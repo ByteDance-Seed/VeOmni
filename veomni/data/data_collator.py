@@ -552,7 +552,18 @@ class SeedOmniCollator(DataCollator):
             {"conversation_list": [{"type": "image", "value": <Tensor>, ...}]},
         ])
         # batch == {"conversation_list": [[ConversationItem(...)], ...]}
+
+    ``cpu_preprocessors`` is an ordered list of picklable, weight-free callables
+    (see :class:`veomni.models.seed_omni.module.CPUPreprocessor`) collected by
+    :class:`~veomni.trainer.omni_trainer.OmniTrainer` from the active graph-node
+    modules. Each is run, in order, over the grouped ``conversation_list`` so the
+    heavy per-module CPU input-prep (tokenize / image normalize) executes inside
+    the DataLoader worker and overlaps with GPU compute via prefetch, instead of
+    blocking the main process inside each module's ``pre_forward``. Default empty
+    => pure grouping (all other behaviour unchanged).
     """
+
+    cpu_preprocessors: Sequence[Callable[[List[List[Any]]], None]] = ()
 
     def __call__(self, features: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
         if not features:
@@ -576,4 +587,11 @@ class SeedOmniCollator(DataCollator):
             )
 
         batch = {key: [f[key] for f in features] for key in first_keys}
+
+        # Run each active module's worker-side CPU input-prep (tokenize / image
+        # normalize) over the grouped conversation_list, in graph order. Mutates
+        # items in place; the modules' thin pre_forward then only moves to device.
+        for preprocess in self.cpu_preprocessors:
+            preprocess(batch["conversation_list"])
+
         return batch

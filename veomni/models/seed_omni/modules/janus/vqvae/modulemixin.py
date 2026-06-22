@@ -6,20 +6,73 @@ import torch.nn.functional as F
 from ......utils import helper
 from ....conversation import (
     ConversationItem,
-    collect_desired_values,
     is_dummy,
     iter_desired_items,
     maybe_merge_outputs,
     seal_outputs,
+    worker_dummy_items,
 )
 from ....generation_graph import FSM_SIGNAL_KEY
-from ....module import ModuleMixin, post_forward, pre_forward
+from ....module import (
+    CPUPreprocessor,
+    ModuleMixin,
+    post_forward,
+    pre_forward,
+)
 from ....tracemixin import TraceMixin
 from .configuration import JanusVqvaeConfig
 from .processing import JanusVqvaeProcessor
 
 
 logger = helper.create_logger(__name__)
+
+_SOURCE = "janus_vqvae"
+# Module-specific sentinel on a real assistant-image item's meta marking that the
+# worker already normalized its pixels (kept distinct per module per MR review).
+_OMNI_PIXELS = "janus_vqvae_pixels"
+
+
+class JanusVqvaeCPUPreprocessor(CPUPreprocessor):
+    """Worker-side image normalize for the VQVAE (generation) codec.
+
+    Holds only the (picklable) VQVAE image processor + a CPU zero-pixel template
+    — never the model. Mirrors ``_pixels_from_raw_images`` on **CPU** (bf16, to
+    halve IPC); writes the pixel tensor back into each ``assistant``-image item.
+    When a micro-batch has **no** assistant image, appends a ``role="dummy"``
+    placeholder per sample carrying the zero pixels (the codec + generation heads
+    still run on it in the GPU forward for the FSDP gradient anchor).
+    """
+
+    def __init__(self, image_processor: JanusVqvaeProcessor, dtype: Any, dummy_pixel_values: torch.Tensor) -> None:
+        self._image_processor = image_processor
+        self._dtype = dtype
+        self._dummy_pixel_values = dummy_pixel_values  # CPU (C, H, W), model dtype
+
+    def __call__(self, conversation_list: list[list[ConversationItem]]) -> None:
+        todo = [
+            it
+            for it in iter_desired_items(conversation_list, types=["image"], roles=["assistant"])
+            if not it.meta.get(_OMNI_PIXELS)
+        ]
+        if todo:
+            pixel_values = self._image_processor(images=[it.value for it in todo], return_tensors="pt")["pixel_values"]
+            for it, px in zip(todo, pixel_values, strict=True):
+                it.value = px.to(dtype=self._dtype)
+                it.meta[_OMNI_PIXELS] = True
+        # Real assistant images present → no dummy needed.
+        if any(iter_desired_items(conversation_list, types=["image"], roles=["assistant"])):
+            return
+        if worker_dummy_items(conversation_list, _SOURCE):
+            return
+        for sample in conversation_list:
+            sample.append(
+                ConversationItem(
+                    type="image",
+                    value=self._dummy_pixel_values,
+                    role="dummy",
+                    meta={"source": _SOURCE, _OMNI_PIXELS: True},
+                )
+            )
 
 
 class JanusVqvaeModuleMixin(ModuleMixin):
@@ -33,6 +86,15 @@ class JanusVqvaeModuleMixin(ModuleMixin):
         # Inference state
         self._vq_buffer: List[int] = []
 
+    def build_cpu_preprocessor(self) -> Optional[CPUPreprocessor]:
+        """Worker-side image normalize (see :class:`JanusVqvaeCPUPreprocessor`)."""
+        if getattr(self, "_image_processor", None) is None:
+            return None
+        size = self._image_processor.size
+        c = self.config.vq_config.in_channels
+        dummy = torch.zeros(c, size.get("height"), size.get("width"), dtype=self.dtype)
+        return JanusVqvaeCPUPreprocessor(self._image_processor, self.dtype, dummy)
+
     # Training hooks — one pre/post pair per call-site (tagged with its method),
     # routed by the ModuleMixin.pre_forward / post_forward dispatchers.
     @pre_forward("encode")
@@ -41,10 +103,24 @@ class JanusVqvaeModuleMixin(ModuleMixin):
         conversation_list: Optional[list[list[ConversationItem]]] = None,
     ) -> Dict[str, Any]:
         self._conversation_carrier = conversation_list
-        pixel_values = self._pixels_from_raw_images(
-            collect_desired_values(conversation_list, types=["image"], roles=["assistant"])
-        )
-        return {"pixel_values": pixel_values}
+        items = list(iter_desired_items(conversation_list, types=["image"], roles=["assistant"]))
+        if items and all(it.meta.get(_OMNI_PIXELS) for it in items):
+            # Worker already normalized: just stack + move to device.
+            pixel_values = torch.stack([it.value for it in items], dim=0).to(
+                device=self.device, dtype=self.dtype, non_blocking=True
+            )
+            return {"pixel_values": pixel_values, "is_dummy": False}
+        if items:
+            return {"pixel_values": self._pixels_from_raw_images([it.value for it in items]), "is_dummy": False}
+        # No real assistant images: consume the worker-built dummy placeholder
+        # (one dummy forward, batch 1) if present; else fall back to modeling dummy.
+        dummy_items = worker_dummy_items(conversation_list, _SOURCE)
+        if dummy_items:
+            pixel_values = (
+                dummy_items[0].value.unsqueeze(0).to(device=self.device, dtype=self.dtype, non_blocking=True)
+            )
+            return {"pixel_values": pixel_values, "is_dummy": True}
+        return {"pixel_values": None, "is_dummy": None}
 
     @pre_forward("decode")
     def decode_pre(
@@ -110,18 +186,26 @@ class JanusVqvaeModuleMixin(ModuleMixin):
             assert image_embeds.shape[0] == 1
             image_embeds = image_embeds.squeeze(0)
             vq_token_ids = vq_token_ids.squeeze(0)
-            for sample in conversation:
-                sample.append(
-                    ConversationItem(
-                        type="image",
-                        value=image_embeds,
-                        role="dummy",
-                        meta={
-                            "source": "janus_vqvae",
-                            "janus_vqvae_labels": vq_token_ids.to(dtype=torch.long),
-                        },
+            dummy_items = worker_dummy_items(conversation, _SOURCE)
+            if dummy_items:
+                # Worker pre-created the placeholders: zero pixels → embed + VQ labels.
+                for item in dummy_items:
+                    item.value = image_embeds
+                    item.meta["janus_vqvae_labels"] = vq_token_ids.to(dtype=torch.long)
+            else:
+                # Eager / no-worker fallback: append the dummy placeholder per sample.
+                for sample in conversation:
+                    sample.append(
+                        ConversationItem(
+                            type="image",
+                            value=image_embeds,
+                            role="dummy",
+                            meta={
+                                "source": _SOURCE,
+                                "janus_vqvae_labels": vq_token_ids.to(dtype=torch.long),
+                            },
+                        )
                     )
-                )
         else:
             items = list(iter_desired_items(conversation, types=["image"], roles=["assistant"]))
             for item, emb, ids in zip(items, image_embeds, vq_token_ids, strict=True):

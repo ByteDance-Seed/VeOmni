@@ -7,18 +7,53 @@ from veomni.utils.tensor_utils import naflatten, unflatten
 
 from ....conversation import ConversationItem, is_dummy, maybe_merge_outputs
 from ....generation_graph import FSM_SIGNAL_KEY
-from ....module import pre_forward
+from ....module import CPUPreprocessor, pre_forward
 from ...base.text_encoder.modulemixin import TextEncoderModuleMixin
 from .chat_template import (
     JanusChatMarkers,
     _template_item,
     apply_janus_chat_template,
+    merge_consecutive_text_parts,
     pack_text_input_ids,
+    tokenize_template_parts,
 )
 
 
 SIGNAL_START_IMAGE_GEN = "start_image_gen"
 SIGNAL_TEXT_DONE = "text_done"
+
+# Sentinel written by JanusTextEncoderCPUPreprocessor onto every text part's meta
+# so the thin ``encode_pre`` knows chat-template + tokenize already ran in the
+# DataLoader worker (and otherwise falls back to the in-module path).
+_OMNI_TOKENIZED = "_omni_tokenized"
+
+
+class JanusTextEncoderCPUPreprocessor(CPUPreprocessor):
+    """Worker-side chat-template + tokenize for the Janus text encoder.
+
+    Holds only the (picklable) tokenizer + chat markers — never the model. Runs
+    the same ``apply_janus_chat_template`` → tokenize → merge as the in-module
+    path, but builds **CPU** tensors so it can execute in DataLoader workers and
+    overlap with GPU compute. Mutates each sample in place and tags ``meta`` so
+    ``encode_pre`` skips the redundant work.
+    """
+
+    def __init__(self, tokenizer: Any, chat_markers: JanusChatMarkers) -> None:
+        self._tokenizer = tokenizer
+        self._chat_markers = chat_markers
+
+    def __call__(self, conversation_list: list[list[ConversationItem]]) -> None:
+        for sample in conversation_list or []:
+            if sample and sample[0].meta.get(_OMNI_TOKENIZED):
+                continue  # idempotent: already processed
+            parts = apply_janus_chat_template(sample, self._chat_markers)
+            tokenize_template_parts(parts, self._tokenizer, device=None)
+            parts = merge_consecutive_text_parts(parts)
+            for part in parts:
+                if part.type == "text":
+                    part.meta[_OMNI_TOKENIZED] = True
+            sample.clear()
+            sample.extend(parts)
 
 
 _JANUS_SYSTEM_PROMPT = (
@@ -64,48 +99,43 @@ class JanusTextEncoderModuleMixin(TextEncoderModuleMixin):
         hidden_states, shift_labels = self._prepare_decode_inputs(self._conversation_carrier)
         return {"hidden_states": hidden_states, "shift_labels": shift_labels}
 
+    def build_cpu_preprocessor(self) -> Optional[CPUPreprocessor]:
+        """Worker-side chat-template + tokenize (see :class:`JanusTextEncoderCPUPreprocessor`).
+
+        Returns ``None`` until the tokenizer (and thus chat markers) is loaded.
+        """
+        if self._chat_markers is None or getattr(self, "_tokenizer", None) is None:
+            return None
+        return JanusTextEncoderCPUPreprocessor(self._tokenizer, self._chat_markers)
+
     def _prepare_encode_inputs(
         self,
         conversation_list: Optional[list[list[ConversationItem]]],
-    ) -> tuple[torch.Tensor, bool]:
+    ) -> torch.Tensor:
         input_ids: list[torch.Tensor] = []
         self._encode_batch_shape = None
         for sample in conversation_list or []:
-            self._prepare_sample_training(sample)
+            # Fast path: the worker-side CPU preprocessor already ran chat-template
+            # + tokenize (tagged on meta). Otherwise fall back to the in-module
+            # device path (eager inference / no worker collator).
+            if not (sample and sample[0].meta.get(_OMNI_TOKENIZED)):
+                self._prepare_sample_training(sample)
             input_ids.extend(pack_text_input_ids(sample))
+        # ``naflatten`` keeps the shape on CPU (avoids the post-forward D2H sync);
+        # the flat ids may be CPU (worker path) or device (fallback) — move once.
         input_ids, self._encode_batch_shape = naflatten(input_ids)
+        input_ids = input_ids.to(self.device, non_blocking=True)
         return input_ids
 
     def _prepare_sample_training(self, sample: list[ConversationItem]) -> None:
+        # Build CPU tensors (mirrors the worker preprocessor); ``_prepare_encode_inputs``
+        # moves the flat input_ids to device, and labels/attention_mask are moved at
+        # their consumers. Keeping them on CPU here avoids per-segment device mixing.
         parts = apply_janus_chat_template(sample, self._chat_markers)
-        self._tokenize_template_parts(parts)
-        parts = self._merge_consecutive_text_parts(parts)
+        tokenize_template_parts(parts, self._tokenizer, device=None)
+        parts = merge_consecutive_text_parts(parts)
         sample.clear()
         sample.extend(parts)
-
-    def _merge_consecutive_text_parts(self, parts: list[ConversationItem]) -> list[ConversationItem]:
-        merged: list[ConversationItem] = []
-        for part in parts:
-            if merged and merged[-1].type == "text" and part.type == "text" and merged[-1].role == part.role:
-                prev = merged[-1]
-                prev.value = torch.cat([prev.value, part.value])
-                prev.meta["labels"] = torch.cat([prev.meta["labels"], part.meta["labels"]])
-                prev.meta["attention_mask"] = torch.cat([prev.meta["attention_mask"], part.meta["attention_mask"]])
-                continue
-            merged.append(part)
-        return merged
-
-    def _tokenize_template_parts(self, parts: list[ConversationItem]) -> None:
-        device = self.device
-        for part in parts:
-            if part.type == "text":
-                text = part.value
-                loss_mask = int(part.meta.pop("loss_mask"))
-                input_ids = self._tokenizer(text, add_special_tokens=False)["input_ids"]
-                labels = input_ids if loss_mask else [-100] * len(input_ids)
-                part.value = torch.tensor(input_ids, device=device, dtype=torch.long)
-                part.meta["labels"] = torch.tensor(labels, device=device, dtype=torch.long)
-                part.meta["attention_mask"] = torch.ones(len(input_ids), dtype=torch.long, device=device)
 
     def _scatter_text_embeds(
         self,
@@ -139,19 +169,25 @@ class JanusTextEncoderModuleMixin(TextEncoderModuleMixin):
                 if hidden_states.dim() == 3:
                     hidden_states = hidden_states.squeeze(0)
                 if part.type == "text":
+                    # ``labels`` rides in meta from tokenize (CPU). Keep all label
+                    # chunks on CPU and move the concatenated result to device once
+                    # below — avoids per-segment blocking H2D syncs.
                     labels = part.meta["labels"]
                     assert labels.shape[0] == hidden_states.shape[0]
                     hidden_states_chunks.append(hidden_states)
                     label_chunks.append(labels)
                 elif part.type == "image":
                     hidden_states_chunks.append(hidden_states[-1:])
-                    label_chunks.append(torch.full((1,), -100, dtype=torch.long, device=hidden_states.device))
+                    label_chunks.append(torch.full((1,), -100, dtype=torch.long))
 
         hidden_states = torch.cat(hidden_states_chunks, dim=0)
-        labels = torch.cat(label_chunks, dim=0)
+        labels = torch.cat(label_chunks, dim=0)  # CPU
 
         labels = labels[..., 1:].contiguous()
         shift_labels = F.pad(labels, (0, 1), "constant", -100)
+        # Single H2D move (labels are tiny host-side bookkeeping); the loss forward
+        # orders after the backbone kernels on the GPU stream without a CPU stall.
+        shift_labels = shift_labels.to(device=hidden_states.device, non_blocking=True)
         return hidden_states, shift_labels
 
     # inference hooks
@@ -191,8 +227,8 @@ class JanusTextEncoderModuleMixin(TextEncoderModuleMixin):
                 self._bos_injected = True
 
             conversation_list.append(_template_item("text", self._chat_markers.assistant_prefix, "assistant"))
-            self._tokenize_template_parts(conversation_list)
-            conversation_list = self._merge_consecutive_text_parts(conversation_list)
+            tokenize_template_parts(conversation_list, self._tokenizer, device=self.device)
+            conversation_list = merge_consecutive_text_parts(conversation_list)
             for part in conversation_list:
                 part.meta.pop("labels", None)
             input_ids = pack_text_input_ids(conversation_list)

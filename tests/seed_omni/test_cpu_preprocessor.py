@@ -1,0 +1,542 @@
+"""Worker-side CPU preprocessor hooks + naflatten/unflatten CPU-shape fix.
+
+Covers the SeedOmni V2 optimization that moves each module's heavy CPU input-prep
+(chat-template + tokenize, image normalize) into the DataLoader worker via a
+picklable ``CPUPreprocessor`` run inside ``SeedOmniCollator``:
+
+* ``naflatten``/``unflatten`` keep shape metadata on CPU (no per-segment D2H sync)
+  and round-trip correctly.
+* The Janus text / siglip / vqvae preprocessors produce the same tokens / pixels
+  that the in-module ``pre_forward`` fallback would, tag a sentinel, are
+  idempotent, target the right role, and are picklable (worker-safe).
+* ``SeedOmniCollator`` runs the preprocessors in order over the grouped batch and
+  is a pure grouper when none are supplied.
+"""
+
+import copy
+import pickle
+
+import torch
+
+from veomni.data.data_collator import SeedOmniCollator
+from veomni.models.seed_omni.conversation import ConversationItem, worker_dummy_items
+from veomni.models.seed_omni.modules.janus.siglip.modulemixin import (
+    _OMNI_PIXELS,
+    JanusSiglipCPUPreprocessor,
+)
+from veomni.models.seed_omni.modules.janus.text_encoder.chat_template import (
+    JanusChatMarkers,
+    apply_janus_chat_template,
+    merge_consecutive_text_parts,
+    pack_text_input_ids,
+    tokenize_template_parts,
+)
+from veomni.models.seed_omni.modules.janus.text_encoder.modulemixin import (
+    _OMNI_TOKENIZED,
+    JanusTextEncoderCPUPreprocessor,
+)
+from veomni.models.seed_omni.modules.janus.vqvae.modulemixin import (
+    _OMNI_PIXELS as VQVAE_PIX,
+)
+from veomni.models.seed_omni.modules.janus.vqvae.modulemixin import (
+    JanusVqvaeCPUPreprocessor,
+)
+from veomni.models.seed_omni.modules.qwen3.text_encoder.chat_template import (
+    Qwen3ChatMarkers,
+    apply_qwen3_chat_template,
+)
+from veomni.models.seed_omni.modules.qwen3.text_encoder.chat_template import (
+    merge_consecutive_text_parts as qwen3_merge,
+)
+from veomni.models.seed_omni.modules.qwen3.text_encoder.chat_template import (
+    pack_text_input_ids as qwen3_pack,
+)
+from veomni.models.seed_omni.modules.qwen3.text_encoder.chat_template import (
+    tokenize_template_parts as qwen3_tokenize,
+)
+from veomni.models.seed_omni.modules.qwen3.text_encoder.modulemixin import (
+    _OMNI_TOKENIZED as Q3_TOK,
+)
+from veomni.models.seed_omni.modules.qwen3.text_encoder.modulemixin import (
+    Qwen3TextEncoderCPUPreprocessor,
+)
+from veomni.models.seed_omni.modules.qwen3vl.text_encoder.chat_template import (
+    Qwen3VLChatMarkers,
+)
+from veomni.models.seed_omni.modules.qwen3vl.text_encoder.modulemixin import (
+    _OMNI_TOKENIZED as Q3VL_TOK,
+)
+from veomni.models.seed_omni.modules.qwen3vl.text_encoder.modulemixin import (
+    Qwen3VLTextEncoderCPUPreprocessor,
+)
+from veomni.models.seed_omni.modules.qwen3vl.vision.modulemixin import (
+    _OMNI_GRID,
+    Qwen3VLVisionCPUPreprocessor,
+)
+from veomni.models.seed_omni.modules.qwen3vl.vision.modulemixin import (
+    _OMNI_PIXELS as Q3VL_PIX,
+)
+from veomni.utils.tensor_utils import naflatten, unflatten
+
+
+# Module-level fakes so the preprocessors stay picklable (workers fork/spawn them).
+class FakeTokenizer:
+    """Char-ordinal tokenizer: deterministic, no external assets."""
+
+    def __call__(self, text, add_special_tokens=False):
+        return {"input_ids": [ord(c) for c in text]}
+
+
+class FakeImageProcessor:
+    """Returns a fixed-shape normalized pixel batch (fp32) for the given images."""
+
+    def __init__(self, channels=3, size=4):
+        self.channels = channels
+        self.size = size
+
+    def __call__(self, images, return_tensors="pt"):
+        # Deterministic content keyed on the (uint8) input so equivalence is checkable.
+        px = torch.stack([img.float().mean() + torch.zeros(self.channels, self.size, self.size) for img in images])
+        return {"pixel_values": px}
+
+
+class FakeQwen3VLImageProcessor:
+    """Returns (pixel_values, image_grid_thw) with a fixed grid per image."""
+
+    def __init__(self, patch_dim=8, grid=(1, 2, 2)):
+        self.patch_dim = patch_dim
+        self.grid = list(grid)
+
+    def __call__(self, images, return_tensors="pt"):
+        grids = [self.grid for _ in images]
+        total = sum(g[0] * g[1] * g[2] for g in grids)
+        pv = torch.arange(total * self.patch_dim, dtype=torch.float32).reshape(total, self.patch_dim)
+        return {"pixel_values": pv, "image_grid_thw": torch.tensor(grids, dtype=torch.long)}
+
+
+def _qwen3_markers():
+    return Qwen3ChatMarkers(
+        im_start_token="<|im_start|>",
+        im_end_token="<|im_end|>",
+        eos_token="</s>",
+        assistant_prefix="<|im_start|>assistant\n",
+    )
+
+
+def _qwen3vl_markers():
+    return Qwen3VLChatMarkers(
+        im_start_token="<|im_start|>",
+        im_end_token="<|im_end|>",
+        eos_token="</s>",
+        assistant_prefix="<|im_start|>assistant\n",
+        vision_start_token="<|vision_start|>",
+        vision_end_token="<|vision_end|>",
+    )
+
+
+def _markers():
+    return JanusChatMarkers(
+        bos_token="<s>",
+        eos_token="</s>",
+        boi_token="<boi>",
+        eoi_token="<eoi>",
+        system_prompt="SYS\n\n",
+        user_prefix="<|User|>: ",
+        assistant_prefix="\n\n<|Assistant|>:",
+    )
+
+
+# ── naflatten / unflatten: shape stays on CPU, round-trips ──────────────────────
+
+
+def test_naflatten_shape_on_cpu_and_roundtrip_1d():
+    parts = [torch.arange(3), torch.arange(5), torch.arange(2)]
+    flat, shape = naflatten(parts)
+    assert shape.device.type == "cpu"
+    out = unflatten(flat, shape)
+    assert all(torch.equal(a, b) for a, b in zip(out, parts))
+
+
+def test_naflatten_shape_on_cpu_and_roundtrip_2d():
+    parts = [torch.randn(3, 4), torch.randn(5, 4), torch.randn(1, 4)]
+    flat, shape = naflatten(parts)
+    assert shape.device.type == "cpu"
+    assert tuple(flat.shape) == (9, 4)
+    out = unflatten(flat, shape)
+    assert all(torch.equal(a, b) for a, b in zip(out, parts))
+
+
+def test_unflatten_accepts_non_cpu_shape_without_error():
+    # Robustness: a caller passing a shape on another device must still work.
+    parts = [torch.randn(2, 4), torch.randn(3, 4)]
+    flat, shape = naflatten(parts)
+    out = unflatten(flat, shape.to("cpu"))  # explicit cpu path is a no-op move
+    assert all(torch.equal(a, b) for a, b in zip(out, parts))
+
+
+# ── Text encoder preprocessor ───────────────────────────────────────────────────
+
+
+def _raw_text_sample():
+    return [
+        ConversationItem(type="text", value="describe", role="user"),
+        ConversationItem(type="image", value=torch.zeros(3, 4, 4, dtype=torch.uint8), role="user"),
+        ConversationItem(type="text", value="more", role="user"),
+        ConversationItem(type="text", value="hi", role="assistant"),
+    ]
+
+
+def test_text_preprocessor_matches_inmodule_pipeline():
+    tok = FakeTokenizer()
+    markers = _markers()
+    batch = [_raw_text_sample(), _raw_text_sample()]
+
+    # Worker path.
+    JanusTextEncoderCPUPreprocessor(tok, markers)(batch)
+    worker_ids = []
+    for sample in batch:
+        assert sample[0].meta.get(_OMNI_TOKENIZED) is True
+        worker_ids.extend(pack_text_input_ids(sample))
+    worker_flat, worker_shape = naflatten(worker_ids)
+
+    # Independent reconstruction of the in-module fallback (device=cpu) path.
+    ref = [_raw_text_sample(), _raw_text_sample()]
+    ref_ids = []
+    for sample in ref:
+        parts = apply_janus_chat_template(sample, markers)
+        tokenize_template_parts(parts, tok, device=None)
+        parts = merge_consecutive_text_parts(parts)
+        ref_ids.extend(pack_text_input_ids(parts))
+    ref_flat, ref_shape = naflatten(ref_ids)
+
+    assert torch.equal(worker_flat, ref_flat)
+    assert torch.equal(worker_shape, ref_shape)
+
+
+def test_text_preprocessor_sets_labels_mask_and_is_idempotent():
+    tok = FakeTokenizer()
+    pre = JanusTextEncoderCPUPreprocessor(tok, _markers())
+    batch = [_raw_text_sample()]
+    pre(batch)
+    sample = batch[0]
+    for part in sample:
+        if part.type == "text":
+            assert isinstance(part.value, torch.Tensor) and part.value.dtype == torch.long
+            assert part.value.device.type == "cpu"
+            assert part.meta["labels"].shape == part.value.shape
+            assert part.meta["attention_mask"].shape == part.value.shape
+
+    snapshot = copy.deepcopy(batch)
+    pre(batch)  # second run must be a no-op (sentinel guard)
+    assert len(batch[0]) == len(snapshot[0])
+    for a, b in zip(batch[0], snapshot[0]):
+        if isinstance(a.value, torch.Tensor):
+            assert torch.equal(a.value, b.value)
+
+
+# ── Qwen3 / Qwen3-VL text preprocessors ─────────────────────────────────────────
+
+
+def _qwen3_text_sample():
+    return [
+        ConversationItem(type="text", value="hello", role="user"),
+        ConversationItem(type="text", value="hi there", role="assistant"),
+    ]
+
+
+def test_qwen3_text_preprocessor_matches_inmodule_pipeline_and_idempotent():
+    tok = FakeTokenizer()
+    markers = _qwen3_markers()
+    batch = [_qwen3_text_sample(), _qwen3_text_sample()]
+
+    Qwen3TextEncoderCPUPreprocessor(tok, markers, apply_qwen3_chat_template)(batch)
+    worker_ids = []
+    for sample in batch:
+        assert sample[0].meta.get(Q3_TOK) is True
+        for part in sample:
+            if part.type == "text":
+                assert part.value.dtype == torch.long and part.value.device.type == "cpu"
+        worker_ids.extend(qwen3_pack(sample))
+    worker_flat, worker_shape = naflatten(worker_ids)
+
+    ref = [_qwen3_text_sample(), _qwen3_text_sample()]
+    ref_ids = []
+    for sample in ref:
+        parts = apply_qwen3_chat_template(sample, markers)
+        qwen3_tokenize(parts, tok, device=None)
+        parts = qwen3_merge(parts)
+        ref_ids.extend(qwen3_pack(parts))
+    ref_flat, ref_shape = naflatten(ref_ids)
+
+    assert torch.equal(worker_flat, ref_flat)
+    assert torch.equal(worker_shape, ref_shape)
+
+    snapshot = copy.deepcopy(batch)
+    Qwen3TextEncoderCPUPreprocessor(tok, markers, apply_qwen3_chat_template)(batch)  # idempotent
+    assert all(len(a) == len(b) for a, b in zip(batch, snapshot))
+
+
+def test_qwen3vl_text_preprocessor_tokenizes_and_tags():
+    tok = FakeTokenizer()
+    batch = [_qwen3_text_sample()]
+    Qwen3VLTextEncoderCPUPreprocessor(tok, _qwen3vl_markers())(batch)
+    sample = batch[0]
+    assert sample[0].meta.get(Q3VL_TOK) is True
+    for part in sample:
+        if part.type == "text":
+            assert part.value.dtype == torch.long and part.value.device.type == "cpu"
+            assert part.meta["labels"].shape == part.value.shape
+
+
+# ── Qwen3-VL vision preprocessor (patchify/normalize split + recombine) ──────────
+
+
+def test_qwen3vl_vision_preprocessor_splits_and_recombines():
+    proc = FakeQwen3VLImageProcessor(patch_dim=8, grid=(1, 2, 2))  # 4 patches/image
+    items = [
+        ConversationItem(type="image", value=torch.zeros(3, 4, 4, dtype=torch.uint8), role="user") for _ in range(3)
+    ]
+    batch = [items]
+    ref = proc(images=[it.value for it in items])["pixel_values"]
+
+    Qwen3VLVisionCPUPreprocessor(
+        proc,
+        None,
+        dtype=torch.bfloat16,
+        dummy_pixel_values=torch.zeros(4, 8, dtype=torch.bfloat16),
+        dummy_grid=[1, 2, 2],
+    )(batch)
+
+    recombined = torch.cat([it.value for it in items], dim=0)
+    assert recombined.dtype == torch.bfloat16
+    # Worker casts to bf16 per-item; recombine must equal the bf16 of the raw output.
+    assert torch.equal(recombined, ref.to(torch.bfloat16))
+    for it in items:
+        assert it.meta.get(Q3VL_PIX) is True
+        assert it.meta[_OMNI_GRID] == [1, 2, 2]
+        assert it.value.shape == (4, 8)
+
+
+def test_qwen3vl_vision_preprocessor_idempotent_and_assistant_untouched():
+    proc = FakeQwen3VLImageProcessor()
+    user_img = ConversationItem(type="image", value=torch.zeros(3, 4, 4, dtype=torch.uint8), role="user")
+    asst_img = ConversationItem(type="image", value=torch.ones(3, 4, 4, dtype=torch.uint8), role="assistant")
+    batch = [[user_img, asst_img]]
+    pre = Qwen3VLVisionCPUPreprocessor(
+        proc,
+        None,
+        dtype=torch.bfloat16,
+        dummy_pixel_values=torch.zeros(4, 8, dtype=torch.bfloat16),
+        dummy_grid=[1, 2, 2],
+    )
+    pre(batch)
+    assert user_img.meta.get(Q3VL_PIX) is True
+    assert not asst_img.meta.get(Q3VL_PIX)  # vision tower only consumes user images
+    stored = user_img.value.clone()
+    pre(batch)  # idempotent
+    assert torch.equal(user_img.value, stored)
+
+
+# ── Image preprocessors (siglip = user, vqvae = assistant) ──────────────────────
+
+
+def _raw_image_sample():
+    return [
+        ConversationItem(type="image", value=torch.full((3, 4, 4), 7, dtype=torch.uint8), role="user"),
+        ConversationItem(type="text", value="caption", role="user"),
+        ConversationItem(type="image", value=torch.full((3, 4, 4), 9, dtype=torch.uint8), role="assistant"),
+    ]
+
+
+def test_siglip_preprocessor_normalizes_only_user_images():
+    pre = JanusSiglipCPUPreprocessor(
+        FakeImageProcessor(), dtype=torch.bfloat16, dummy_pixel_values=torch.zeros(3, 4, 4, dtype=torch.bfloat16)
+    )
+    batch = [_raw_image_sample()]
+    pre(batch)
+    user_img, _, assistant_img = batch[0]
+    assert user_img.meta.get(_OMNI_PIXELS) is True
+    assert user_img.value.shape == (3, 4, 4) and user_img.value.dtype == torch.bfloat16
+    # Assistant image untouched by the siglip (user-only) preprocessor.
+    assert not assistant_img.meta.get(_OMNI_PIXELS)
+    assert assistant_img.value.dtype == torch.uint8
+
+
+def test_vqvae_preprocessor_normalizes_only_assistant_images_and_idempotent():
+    pre = JanusVqvaeCPUPreprocessor(
+        FakeImageProcessor(), dtype=torch.bfloat16, dummy_pixel_values=torch.zeros(3, 4, 4, dtype=torch.bfloat16)
+    )
+    batch = [_raw_image_sample()]
+    pre(batch)
+    user_img, _, assistant_img = batch[0]
+    assert assistant_img.meta.get(VQVAE_PIX) is True
+    assert assistant_img.value.shape == (3, 4, 4) and assistant_img.value.dtype == torch.bfloat16
+    assert user_img.value.dtype == torch.uint8  # user image left to siglip
+
+    val = assistant_img.value.clone()
+    pre(batch)  # idempotent
+    assert torch.equal(batch[0][2].value, val)
+
+
+# ── Collator wiring ─────────────────────────────────────────────────────────────
+
+
+def test_collator_runs_preprocessors_in_order():
+    tok = FakeTokenizer()
+    preprocessors = [
+        JanusTextEncoderCPUPreprocessor(tok, _markers()),
+        JanusSiglipCPUPreprocessor(
+            FakeImageProcessor(), dtype=torch.bfloat16, dummy_pixel_values=torch.zeros(3, 4, 4, dtype=torch.bfloat16)
+        ),
+        JanusVqvaeCPUPreprocessor(
+            FakeImageProcessor(), dtype=torch.bfloat16, dummy_pixel_values=torch.zeros(3, 4, 4, dtype=torch.bfloat16)
+        ),
+    ]
+    collator = SeedOmniCollator(cpu_preprocessors=tuple(preprocessors))
+    features = [{"conversation_list": _raw_image_sample()}, {"conversation_list": _raw_text_sample()}]
+    batch = collator(features)
+    assert set(batch.keys()) == {"conversation_list"}
+    assert len(batch["conversation_list"]) == 2
+    # Text rows tokenized, user/assistant images normalized (per-module sentinel:
+    # siglip on user images, vqvae on assistant images).
+    for sample in batch["conversation_list"]:
+        assert sample[0].meta.get(_OMNI_TOKENIZED) is True
+        for part in sample:
+            if part.type == "image":
+                key = _OMNI_PIXELS if part.role == "user" else VQVAE_PIX
+                assert part.meta.get(key) is True
+                assert part.value.dtype == torch.bfloat16
+
+
+def test_repr_after_preprocessing_does_not_raise():
+    # The preprocessors populate item.meta (labels / attention_mask / sentinels)
+    # before BaseTrainer.preforward -> print_example reprs the micro-batch.
+    # ConversationItem.__repr__ must handle non-empty meta (regression: it used
+    # to crash because __value_repr__ took no value argument).
+    tok = FakeTokenizer()
+    batch = [_raw_image_sample()]
+    JanusTextEncoderCPUPreprocessor(tok, _markers())(batch)
+    JanusSiglipCPUPreprocessor(
+        FakeImageProcessor(), dtype=torch.bfloat16, dummy_pixel_values=torch.zeros(3, 4, 4, dtype=torch.bfloat16)
+    )(batch)
+    JanusVqvaeCPUPreprocessor(
+        FakeImageProcessor(), dtype=torch.bfloat16, dummy_pixel_values=torch.zeros(3, 4, 4, dtype=torch.bfloat16)
+    )(batch)
+    for sample in batch:
+        for part in sample:
+            assert isinstance(repr(part), str)  # must not raise
+
+
+def test_collator_default_is_pure_grouper():
+    collator = SeedOmniCollator()
+    features = [{"conversation_list": _raw_text_sample()}]
+    batch = collator(features)
+    # No preprocessing: text stays a raw string, no sentinel.
+    assert batch["conversation_list"][0][0].value == "describe"
+    assert not batch["conversation_list"][0][0].meta.get(_OMNI_TOKENIZED)
+
+
+# ── Worker-built dummy placeholders (text-only / no-image micro-batches) ─────────
+
+
+def _text_only_batch():
+    return [
+        [ConversationItem(type="text", value="hi", role="user")],
+        [ConversationItem(type="text", value="yo", role="user")],
+    ]
+
+
+def test_siglip_appends_one_dummy_per_sample_when_no_user_image():
+    pre = JanusSiglipCPUPreprocessor(
+        FakeImageProcessor(), dtype=torch.bfloat16, dummy_pixel_values=torch.zeros(3, 4, 4, dtype=torch.bfloat16)
+    )
+    batch = _text_only_batch()
+    pre(batch)
+    dummies = worker_dummy_items(batch, "janus_siglip")
+    assert len(dummies) == len(batch)
+    for d in dummies:
+        assert d.type == "image" and d.role == "dummy"
+        assert d.value.shape == (3, 4, 4) and d.value.dtype == torch.bfloat16
+        assert d.meta["source"] == "janus_siglip"
+    pre(batch)  # idempotent: no duplicate dummies
+    assert len(worker_dummy_items(batch, "janus_siglip")) == len(batch)
+
+
+def test_siglip_no_dummy_when_user_image_present():
+    pre = JanusSiglipCPUPreprocessor(
+        FakeImageProcessor(), dtype=torch.bfloat16, dummy_pixel_values=torch.zeros(3, 4, 4, dtype=torch.bfloat16)
+    )
+    batch = [[ConversationItem(type="image", value=torch.zeros(3, 4, 4, dtype=torch.uint8), role="user")]]
+    pre(batch)
+    assert worker_dummy_items(batch, "janus_siglip") == []
+    assert batch[0][0].meta.get(_OMNI_PIXELS) is True  # real image normalized instead
+
+
+def test_vqvae_appends_dummy_only_when_no_assistant_image():
+    pre = JanusVqvaeCPUPreprocessor(
+        FakeImageProcessor(), dtype=torch.bfloat16, dummy_pixel_values=torch.zeros(3, 4, 4, dtype=torch.bfloat16)
+    )
+    batch = _text_only_batch()
+    pre(batch)
+    dummies = worker_dummy_items(batch, "janus_vqvae")
+    assert len(dummies) == len(batch)
+    assert all(d.meta["source"] == "janus_vqvae" and d.value.shape == (3, 4, 4) for d in dummies)
+
+
+def test_qwen3vl_vision_appends_dummy_with_grid_when_no_visual():
+    proc = FakeQwen3VLImageProcessor()
+    pre = Qwen3VLVisionCPUPreprocessor(
+        proc,
+        None,
+        dtype=torch.bfloat16,
+        dummy_pixel_values=torch.zeros(4, 8, dtype=torch.bfloat16),
+        dummy_grid=[1, 2, 2],
+    )
+    batch = _text_only_batch()
+    pre(batch)
+    dummies = worker_dummy_items(batch, "qwen3vl_vision")
+    assert len(dummies) == len(batch)
+    for d in dummies:
+        assert d.value.shape == (4, 8) and d.value.dtype == torch.bfloat16
+        assert d.meta[_OMNI_GRID] == [1, 2, 2] and d.meta["source"] == "qwen3vl_vision"
+
+
+def test_worker_dummy_routes_to_dummy_parts_in_text_template():
+    # A worker-appended role="dummy" image item must survive Janus chat-template
+    # (routed to dummy_parts at the end, no markers, value untouched).
+    batch = _text_only_batch()
+    JanusSiglipCPUPreprocessor(
+        FakeImageProcessor(), dtype=torch.bfloat16, dummy_pixel_values=torch.zeros(3, 4, 4, dtype=torch.bfloat16)
+    )(batch)
+    sample = batch[0]
+    templated = apply_janus_chat_template(sample, _markers())
+    dummies = [p for p in templated if p.role == "dummy"]
+    assert len(dummies) == 1
+    assert dummies[-1] is templated[-1]  # dummy parts kept at the very end
+    assert dummies[0].meta.get("source") == "janus_siglip"
+
+
+# ── Picklability (worker-safe: no nn.Module captured) ───────────────────────────
+
+
+def test_preprocessors_are_picklable():
+    for pre in (
+        JanusTextEncoderCPUPreprocessor(FakeTokenizer(), _markers()),
+        JanusSiglipCPUPreprocessor(
+            FakeImageProcessor(), dtype=torch.bfloat16, dummy_pixel_values=torch.zeros(3, 4, 4, dtype=torch.bfloat16)
+        ),
+        JanusVqvaeCPUPreprocessor(
+            FakeImageProcessor(), dtype=torch.bfloat16, dummy_pixel_values=torch.zeros(3, 4, 4, dtype=torch.bfloat16)
+        ),
+        Qwen3TextEncoderCPUPreprocessor(FakeTokenizer(), _qwen3_markers(), apply_qwen3_chat_template),
+        Qwen3VLTextEncoderCPUPreprocessor(FakeTokenizer(), _qwen3vl_markers()),
+        Qwen3VLVisionCPUPreprocessor(
+            FakeQwen3VLImageProcessor(),
+            None,
+            dtype=torch.bfloat16,
+            dummy_pixel_values=torch.zeros(4, 8, dtype=torch.bfloat16),
+            dummy_grid=[1, 2, 2],
+        ),
+    ):
+        restored = pickle.loads(pickle.dumps(pre))
+        assert type(restored) is type(pre)
