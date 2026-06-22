@@ -18,6 +18,7 @@ Transformers 原仓提供 MiniMax M3 VL reference modeling 和通用训练组件
 
 - `scripts/multimodal/verify_minimax_m3_vl_precision_parity.py`
 - `scripts/multimodal/verify_minimax_m3_vl_checkpoint_payload_parity.py`
+- `scripts/multimodal/run_minimax_m3_vl_full_checkpoint_parity.sh`
 - `scripts/multimodal/audit_minimax_m3_vl_parity_artifacts.py`
 
 本地 CPU/NPU 证据：
@@ -330,6 +331,25 @@ python scripts/multimodal/verify_minimax_m3_vl_checkpoint_payload_parity.py \
      - image/video prompt 的 projector output 和 final logits。
 
 `--mode forward` 会按顺序执行 HF baseline 和 VeOmni candidate：HF 结果写入 CPU baseline 后释放 HF 模型，再读取/转换 checkpoint payload，并以 streaming assign 方式写入 VeOmni model。这样避免同时保留两个模型和完整 converted tensor dict，更适合大 checkpoint 目标机，但完整 869 GB payload 仍需要足够磁盘、CPU 内存和设备内存。
+
+推荐在目标机器使用 launcher，它会先运行完整 forward parity，再用 artifact auditor 的强制模式确认 full checkpoint evidence 真的满足门禁：
+
+```bash
+cd /path/to/VeOmni
+
+scripts/multimodal/run_minimax_m3_vl_full_checkpoint_parity.sh \
+  --checkpoint-dir /data/checkpoints/MiniMax-M3 \
+  --reference-device cpu \
+  --candidate-device npu \
+  --torch-dtype bfloat16 \
+  --prompt-kind multimodal \
+  --top-k 8 \
+  --max-new-tokens 8 \
+  --output-json docs/usage/support_new_models/artifacts/minimax_m3_vl_precision_parity/real_checkpoint_forward_cpu_npu.json \
+  --audit-json docs/usage/support_new_models/artifacts/minimax_m3_vl_precision_parity/parity_artifact_audit_full.json
+```
+
+如需在目标机器先确认命令而不加载权重，可加 `--dry-run`。
 
 完整 text-prompt forward 示例：
 
