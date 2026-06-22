@@ -647,7 +647,7 @@
     }
   ],
   "config_path": "./tests/toy_config/minimax_m3_vl_toy/config.json",
-  "date": "2026-06-22T13:56:56Z",
+  "date": "2026-06-22T14:27:59Z",
   "device": "npu:0",
   "failed": [],
   "hf_model_class": "transformers.models.minimax_m3_vl.modeling_minimax_m3_vl.MiniMaxM3SparseForConditionalGeneration",
@@ -667,12 +667,20 @@
   "passed": true,
   "reference_device": "cpu",
   "runtime": {
+    "ascend_env": {
+      "ASCEND_HOME_PATH": "/usr/local/Ascend/cann-9.0.0",
+      "ASCEND_RT_VISIBLE_DEVICES": "0",
+      "ASCEND_TOOLKIT_HOME": "/usr/local/Ascend/cann-9.0.0",
+      "ASCEND_VISIBLE_DEVICES": null,
+      "MODELING_BACKEND": "veomni"
+    },
     "machine": "aarch64",
     "platform": "Linux-5.15.0-94-generic-aarch64-with-glibc2.35",
     "python": "3.11.15 (main, May 13 2026, 07:56:17) [GCC 11.4.0]",
     "python_executable": "/usr/local/python3.11.15/bin/python3",
     "torch_npu_available": true,
     "torch_npu_device_count": 1,
+    "torch_npu_error": null,
     "torch_npu_version": "2.10.0",
     "torch_version": "2.10.0+cpu",
     "transformers_version": "5.12.0"

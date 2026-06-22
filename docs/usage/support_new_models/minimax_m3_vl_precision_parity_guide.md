@@ -18,12 +18,14 @@ Transformers 原仓提供 MiniMax M3 VL reference modeling 和通用训练组件
 
 - `scripts/multimodal/verify_minimax_m3_vl_precision_parity.py`
 - `scripts/multimodal/verify_minimax_m3_vl_checkpoint_payload_parity.py`
+- `scripts/multimodal/audit_minimax_m3_vl_parity_artifacts.py`
 
 本地 CPU/NPU 证据：
 
 - [toy_hf_veomni_parity.json](./artifacts/minimax_m3_vl_precision_parity/toy_hf_veomni_parity.json)
 - [toy_hf_veomni_parity_npu.json](./artifacts/minimax_m3_vl_precision_parity/toy_hf_veomni_parity_npu.json)
 - [toy_hf_cpu_veomni_npu_parity.json](./artifacts/minimax_m3_vl_precision_parity/toy_hf_cpu_veomni_npu_parity.json)
+- [parity_artifact_audit.json](./artifacts/minimax_m3_vl_precision_parity/parity_artifact_audit.json)
 
 结果摘要：
 
@@ -48,6 +50,42 @@ Transformers 原仓提供 MiniMax M3 VL reference modeling 和通用训练组件
 - routing: `MiniMaxM3VLTopKRouter` 的 `router_logits`、`top_k_weights`、`selected_experts`；
 - backward: embedding、attention q/k/v/o、MoE gate/experts、projector、`lm_head` 梯度；
 - optimizer: 同一 AdamW one-step 后关键参数 delta。
+
+## Artifact 审计
+
+每次更新 parity evidence 后，先跑默认 artifact 审计，确认当前 PR 中已声明的证据包自洽：
+
+```bash
+cd /path/to/VeOmni
+
+python scripts/multimodal/audit_minimax_m3_vl_parity_artifacts.py \
+  --output-json docs/usage/support_new_models/artifacts/minimax_m3_vl_precision_parity/parity_artifact_audit.json
+```
+
+当前 PR 的审计结果应为：
+
+```json
+{
+  "passed": true,
+  "full_checkpoint_forward_passed": false,
+  "require_full_checkpoint_forward": false
+}
+```
+
+这表示 toy precision、真实 tensor payload sample、toy checkpoint forward smoke 和 CPU reference vs NPU candidate checkpoint-forward smoke 都已通过，但完整 869 GB checkpoint forward parity 尚未完成。
+
+在目标机器跑完完整 public checkpoint 后，必须改用强制模式，把 full-checkpoint artifact 作为输入：
+
+```bash
+cd /path/to/VeOmni
+
+python scripts/multimodal/audit_minimax_m3_vl_parity_artifacts.py \
+  --require-full-checkpoint-forward \
+  --full-forward-json docs/usage/support_new_models/artifacts/minimax_m3_vl_precision_parity/real_checkpoint_forward_cpu_npu.json \
+  --output-json docs/usage/support_new_models/artifacts/minimax_m3_vl_precision_parity/parity_artifact_audit_full.json
+```
+
+只有强制模式也 `passed=true`，才可以把真实 checkpoint forward parity 视为完成。
 
 ## CPU 复跑
 

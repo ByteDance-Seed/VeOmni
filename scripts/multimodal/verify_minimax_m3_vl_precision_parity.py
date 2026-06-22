@@ -96,6 +96,43 @@ def get_device(name: str):
     return torch.device("cpu")
 
 
+def runtime_report(torch_module: Any, transformers_module: Any) -> dict[str, Any]:
+    torch_npu_module = sys.modules.get("torch_npu")
+    npu_available = None
+    npu_device_count = None
+    npu_error = None
+    if hasattr(torch_module, "npu"):
+        try:
+            npu_available = bool(torch_module.npu.is_available())
+            npu_device_count = int(torch_module.npu.device_count())
+        except RuntimeError as exc:
+            npu_available = False
+            npu_error = str(exc)
+
+    return {
+        "python": sys.version,
+        "python_executable": sys.executable,
+        "platform": platform.platform(),
+        "machine": platform.machine(),
+        "torch_version": torch_module.__version__,
+        "transformers_version": transformers_module.__version__,
+        "torch_npu_version": getattr(torch_npu_module, "__version__", None),
+        "torch_npu_available": npu_available,
+        "torch_npu_device_count": npu_device_count,
+        "torch_npu_error": npu_error,
+        "ascend_env": {
+            name: os.environ.get(name)
+            for name in (
+                "ASCEND_RT_VISIBLE_DEVICES",
+                "ASCEND_VISIBLE_DEVICES",
+                "ASCEND_HOME_PATH",
+                "ASCEND_TOOLKIT_HOME",
+                "MODELING_BACKEND",
+            )
+        },
+    }
+
+
 def patch_config(config: Any, image_token_id: int, video_token_id: int) -> Any:
     for name, value in (
         ("image_token_id", image_token_id),
@@ -426,17 +463,7 @@ def main() -> None:
             "weight_decay": 0.01,
             "foreach": False,
         },
-        "runtime": {
-            "python": sys.version,
-            "python_executable": sys.executable,
-            "platform": platform.platform(),
-            "machine": platform.machine(),
-            "torch_version": torch.__version__,
-            "transformers_version": transformers.__version__,
-            "torch_npu_version": getattr(sys.modules.get("torch_npu"), "__version__", None),
-            "torch_npu_available": bool(torch.npu.is_available()) if hasattr(torch, "npu") else None,
-            "torch_npu_device_count": int(torch.npu.device_count()) if hasattr(torch, "npu") else None,
-        },
+        "runtime": runtime_report(torch, transformers),
         "batch_contract": {
             "reference": {
                 "input_ids": hf_batch["input_ids"].detach().cpu().tolist(),
