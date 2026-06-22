@@ -41,6 +41,7 @@ Upstream PR:
 - `scripts/multimodal/run_minimax_m3_vl_multicard_parity.sh`
 - `scripts/multimodal/run_minimax_m3_vl_precision_suite.sh`
 - `scripts/multimodal/audit_minimax_m3_vl_target_artifact_bundle.py`
+- `scripts/multimodal/audit_minimax_m3_vl_precision_objective.py`
 - `docs/examples/minimax_m3_vl.md`
 - `docs/usage/support_new_models/minimax_m3_vl_data_module_design.md`
 - `docs/usage/support_new_models/minimax_m3_vl_hyperparams_loading_report.md`

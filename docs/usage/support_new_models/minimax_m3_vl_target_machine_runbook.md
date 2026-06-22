@@ -339,12 +339,18 @@ python3 scripts/multimodal/audit_minimax_m3_vl_target_artifact_bundle.py \
   --expected-veomni-commit "$(git rev-parse HEAD)" \
   --require-target-toy \
   --output-json /tmp/minimax_m3_vl_target_precision_suite_artifacts_audit.json
+
+python3 scripts/multimodal/audit_minimax_m3_vl_precision_objective.py \
+  --target-bundle-audit-json /tmp/minimax_m3_vl_target_precision_suite_artifacts_audit.json \
+  --require-complete \
+  --output-json /tmp/minimax_m3_vl_target_precision_objective_audit.json
 ```
 
 回传文件：
 
 - `/tmp/minimax_m3_vl_target_precision_suite_artifacts.tgz`
 - `/tmp/minimax_m3_vl_target_precision_suite_artifacts_audit.json`
+- `/tmp/minimax_m3_vl_target_precision_objective_audit.json`
 - 如果 full forward 或 multi-card 失败，也回传同一个 tar 包；失败日志本身是定位依据。
 
 ## 9. 失败时停止点
