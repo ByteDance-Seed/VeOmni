@@ -2,11 +2,11 @@
   "allow_incomplete_groups": false,
   "checkpoint_dir": null,
   "config_path": "MiniMaxAI/MiniMax-M3",
-  "date": "2026-06-22T12:54:59Z",
+  "date": "2026-06-22T13:31:32Z",
   "fail_on_dtype_mismatch": false,
   "forward": null,
   "include_key_regex": [
-    "^language_model\\.model\\.layers\\.3\\.self_attn\\.index_[qk]_norm\\.weight$|^language_model\\.model\\.layers\\.3\\.block_sparse_moe\\.e_score_correction_bias$"
+    "^language_model\\.model\\.layers\\.0\\.self_attn\\.[qk]_norm\\.weight$|^language_model\\.model\\.layers\\.3\\.self_attn\\.index_[qk]_norm\\.weight$|^language_model\\.model\\.layers\\.3\\.block_sparse_moe\\.e_score_correction_bias$|^vision_tower\\.vision_model\\.encoder\\.layers\\.0\\.(layer_norm1\\.weight|self_attn\\.q_proj\\.bias)$|^multi_modal_projector\\.linear_[12]\\.bias$|^patch_merge_mlp\\.linear_[12]\\.bias$"
   ],
   "index_json": "/tmp/minimax_m3_model.safetensors.index.json",
   "metadata_comparison": {
@@ -29,31 +29,71 @@
   "mode": "payload",
   "passed": true,
   "payload": {
-    "converted_tensor_keys": 3,
+    "converted_tensor_keys": 11,
     "converter_finalize_error": null,
     "duplicate_converted_keys": [],
-    "payload_bytes_read": 1024,
-    "public_keys_read": 3,
-    "selected_public_keys": 3,
+    "payload_bytes_read": 55808,
+    "public_keys_read": 11,
+    "selected_public_keys": 11,
     "shard_sources": {
-      "model-00003-of-00059.safetensors": "https://huggingface.co/MiniMaxAI/MiniMax-M3/resolve/main/model-00003-of-00059.safetensors"
+      "model-00001-of-00059.safetensors": "https://huggingface.co/MiniMaxAI/MiniMax-M3/resolve/main/model-00001-of-00059.safetensors",
+      "model-00003-of-00059.safetensors": "https://huggingface.co/MiniMaxAI/MiniMax-M3/resolve/main/model-00003-of-00059.safetensors",
+      "model-00026-of-00059.safetensors": "https://huggingface.co/MiniMaxAI/MiniMax-M3/resolve/main/model-00026-of-00059.safetensors",
+      "model-00059-of-00059.safetensors": "https://huggingface.co/MiniMaxAI/MiniMax-M3/resolve/main/model-00059-of-00059.safetensors"
     }
   },
   "runtime": {
     "machine": "aarch64",
     "platform": "Linux-5.15.0-94-generic-aarch64-with-glibc2.35",
     "python": "3.11.15 (main, Jun 11 2026, 04:04:24) [Clang 22.1.3 ]",
-    "python_executable": "/home/t00906153/super/.cache/uv/builds-v0/.tmp4hEkwU/bin/python",
+    "python_executable": "/home/t00906153/super/.cache/uv/builds-v0/.tmpHKDgft/bin/python",
     "torch_version": "2.7.1+cpu",
     "transformers_version": "5.12.0"
   },
-  "selected_shard_count": 1,
+  "selected_shard_count": 4,
   "selected_shards": [
-    "model-00003-of-00059.safetensors"
+    "model-00001-of-00059.safetensors",
+    "model-00003-of-00059.safetensors",
+    "model-00026-of-00059.safetensors",
+    "model-00059-of-00059.safetensors"
   ],
   "shard_base_url": "https://huggingface.co/MiniMaxAI/MiniMax-M3/resolve/main/",
   "tensor_report_truncated": false,
   "tensor_reports": [
+    {
+      "converted_name": "model.language_model.layers.0.self_attn.k_norm.weight",
+      "fingerprint": {
+        "dtype": "bfloat16",
+        "max_abs": 0.435546875,
+        "mean": 0.10995100438594818,
+        "numel": 128,
+        "sha256": "c00a79d2ddf9f0f6694cb475dc828cedc003e0c8c803d2761955da8e5be4b316",
+        "shape": [
+          128
+        ],
+        "std": 0.09312020987272263
+      },
+      "public_name": "language_model.model.layers.0.self_attn.k_norm.weight",
+      "source": "https://huggingface.co/MiniMaxAI/MiniMax-M3/resolve/main/model-00001-of-00059.safetensors",
+      "source_shard": "model-00001-of-00059.safetensors"
+    },
+    {
+      "converted_name": "model.language_model.layers.0.self_attn.q_norm.weight",
+      "fingerprint": {
+        "dtype": "bfloat16",
+        "max_abs": 0.3671875,
+        "mean": 0.10128962993621826,
+        "numel": 128,
+        "sha256": "ef99a458918e712403127bed754d586d64176b7a8afee7a2064a61f13f250842",
+        "shape": [
+          128
+        ],
+        "std": 0.10049757361412048
+      },
+      "public_name": "language_model.model.layers.0.self_attn.q_norm.weight",
+      "source": "https://huggingface.co/MiniMaxAI/MiniMax-M3/resolve/main/model-00001-of-00059.safetensors",
+      "source_shard": "model-00001-of-00059.safetensors"
+    },
     {
       "converted_name": "model.language_model.layers.3.mlp.gate.e_score_correction_bias",
       "fingerprint": {
@@ -104,6 +144,108 @@
       "public_name": "language_model.model.layers.3.self_attn.index_q_norm.weight",
       "source": "https://huggingface.co/MiniMaxAI/MiniMax-M3/resolve/main/model-00003-of-00059.safetensors",
       "source_shard": "model-00003-of-00059.safetensors"
+    },
+    {
+      "converted_name": "model.multi_modal_projector.linear_2.bias",
+      "fingerprint": {
+        "dtype": "bfloat16",
+        "max_abs": 0.578125,
+        "mean": -0.0018237722106277943,
+        "numel": 6144,
+        "sha256": "7abc993700cd6767196295a97481996bf4460df86785410aac94d160afcb6577",
+        "shape": [
+          6144
+        ],
+        "std": 0.13001017272472382
+      },
+      "public_name": "multi_modal_projector.linear_2.bias",
+      "source": "https://huggingface.co/MiniMaxAI/MiniMax-M3/resolve/main/model-00026-of-00059.safetensors",
+      "source_shard": "model-00026-of-00059.safetensors"
+    },
+    {
+      "converted_name": "model.multi_modal_projector.merge_linear_1.bias",
+      "fingerprint": {
+        "dtype": "bfloat16",
+        "max_abs": 0.3515625,
+        "mean": 0.023292729631066322,
+        "numel": 6144,
+        "sha256": "2660bfb056c3cb24cad4790aaf9205dd87c66b8577ea1bd7dded5c389d337829",
+        "shape": [
+          6144
+        ],
+        "std": 0.0601925291121006
+      },
+      "public_name": "patch_merge_mlp.linear_1.bias",
+      "source": "https://huggingface.co/MiniMaxAI/MiniMax-M3/resolve/main/model-00026-of-00059.safetensors",
+      "source_shard": "model-00026-of-00059.safetensors"
+    },
+    {
+      "converted_name": "model.multi_modal_projector.merge_linear_2.bias",
+      "fingerprint": {
+        "dtype": "bfloat16",
+        "max_abs": 2.078125,
+        "mean": 0.002515783766284585,
+        "numel": 6144,
+        "sha256": "da87f1be0bdd36317210879fcc9f85ea04b0df2c1994c4e267f3357bde384194",
+        "shape": [
+          6144
+        ],
+        "std": 0.1408134400844574
+      },
+      "public_name": "patch_merge_mlp.linear_2.bias",
+      "source": "https://huggingface.co/MiniMaxAI/MiniMax-M3/resolve/main/model-00026-of-00059.safetensors",
+      "source_shard": "model-00026-of-00059.safetensors"
+    },
+    {
+      "converted_name": "model.multi_modal_projector.linear_1.bias",
+      "fingerprint": {
+        "dtype": "bfloat16",
+        "max_abs": 0.3984375,
+        "mean": 0.010179826058447361,
+        "numel": 6144,
+        "sha256": "05a8bf3bfe7d2cdbb0f662499d7ce5f07f906719c9b5477d575f6e810309c2df",
+        "shape": [
+          6144
+        ],
+        "std": 0.054082248359918594
+      },
+      "public_name": "multi_modal_projector.linear_1.bias",
+      "source": "https://huggingface.co/MiniMaxAI/MiniMax-M3/resolve/main/model-00059-of-00059.safetensors",
+      "source_shard": "model-00059-of-00059.safetensors"
+    },
+    {
+      "converted_name": "model.vision_tower.layers.0.layer_norm1.weight",
+      "fingerprint": {
+        "dtype": "bfloat16",
+        "max_abs": 1.5390625,
+        "mean": 0.243489071726799,
+        "numel": 1280,
+        "sha256": "054373589e1c4cca2aadb9d37c1ea32595a311b987096d7e741d4353a4960193",
+        "shape": [
+          1280
+        ],
+        "std": 0.4786248207092285
+      },
+      "public_name": "vision_tower.vision_model.encoder.layers.0.layer_norm1.weight",
+      "source": "https://huggingface.co/MiniMaxAI/MiniMax-M3/resolve/main/model-00059-of-00059.safetensors",
+      "source_shard": "model-00059-of-00059.safetensors"
+    },
+    {
+      "converted_name": "model.vision_tower.layers.0.self_attn.q_proj.bias",
+      "fingerprint": {
+        "dtype": "bfloat16",
+        "max_abs": 3.546875,
+        "mean": 0.005659913178533316,
+        "numel": 1280,
+        "sha256": "6a6158d934e4a0b4dd4f3a5ada3c3eb43a962cc2331a34393b8de5b2ae2f31d3",
+        "shape": [
+          1280
+        ],
+        "std": 1.194533109664917
+      },
+      "public_name": "vision_tower.vision_model.encoder.layers.0.self_attn.q_proj.bias",
+      "source": "https://huggingface.co/MiniMaxAI/MiniMax-M3/resolve/main/model-00059-of-00059.safetensors",
+      "source_shard": "model-00059-of-00059.safetensors"
     }
   ],
   "torch_dtype": "bfloat16"

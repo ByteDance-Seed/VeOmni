@@ -169,9 +169,9 @@ NPU 通过标准：
 - [real_checkpoint_payload_remote_sample.json](./artifacts/minimax_m3_vl_precision_parity/real_checkpoint_payload_remote_sample.json)
 - [toy_checkpoint_forward_parity.json](./artifacts/minimax_m3_vl_precision_parity/toy_checkpoint_forward_parity.json)
 
-该证据没有下载完整 shard，而是通过 HTTP Range 从 Hugging Face `model-00003-of-00059.safetensors` 读取 3 个真实 tensor payload，共 `1024` bytes，经 converter 映射到 VeOmni generated state keys 后检查 shape/dtype/value fingerprint。它证明真实 checkpoint payload 字节和 converter 路径已被执行，但仍不是 full-checkpoint logits parity。
+该证据没有下载完整 shard，而是通过 HTTP Range 从 Hugging Face `model-00001/00003/00026/00059-of-00059.safetensors` 读取 11 个真实 tensor payload，共 `55808` bytes，经 converter 映射到 VeOmni generated state keys 后检查 shape/dtype/value fingerprint。样本覆盖 language dense/sparse attention norm、MoE router correction bias、vision tower、multi-modal projector 和 patch-merge projector；它证明真实 checkpoint payload 字节和 converter 路径已被执行，但仍不是 full-checkpoint logits parity。
 
-`toy_checkpoint_forward_parity.json` 使用完整 toy safetensors checkpoint 验证了 `--mode forward` 的执行路径：先加载 HF reference 生成 logits/top-k/greedy baseline，释放 HF 模型，再把 public checkpoint tensors 边读、边转换、边写入 VeOmni generated model。该 smoke 中 `streaming_model_load=true`，strict missing/unexpected key count 都为 `0`，`forward.logits` max diff 为 `0.0`，top-k 和 greedy ids 完全一致；它只证明 runner 逻辑，不替代真实 869 GB checkpoint parity。
+`toy_checkpoint_forward_parity.json` 使用完整 toy safetensors checkpoint 验证了 `--mode forward --prompt-kind multimodal` 的执行路径：先加载 HF reference 生成 logits/top-k/greedy 和 image/video hidden-state baseline，释放 HF 模型，再把 public checkpoint tensors 边读、边转换、边写入 VeOmni generated model。该 smoke 中 `streaming_model_load=true`，strict missing/unexpected key count 都为 `0`，`forward.logits`、`forward.image_hidden_states`、`forward.video_hidden_states` max diff 都为 `0.0`，top-k 和 greedy ids 完全一致；它只证明 runner 逻辑，不替代真实 869 GB checkpoint parity。
 
 推荐分阶段执行。
 
@@ -192,7 +192,7 @@ python scripts/multimodal/verify_minimax_m3_vl_checkpoint_payload_parity.py \
   --config-path MiniMaxAI/MiniMax-M3 \
   --index-json /path/to/model.safetensors.index.json \
   --shard-base-url https://huggingface.co/MiniMaxAI/MiniMax-M3/resolve/main/ \
-  --include-key-regex '^language_model\.model\.layers\.3\.self_attn\.index_[qk]_norm\.weight$|^language_model\.model\.layers\.3\.block_sparse_moe\.e_score_correction_bias$' \
+  --include-key-regex '^language_model\.model\.layers\.0\.self_attn\.[qk]_norm\.weight$|^language_model\.model\.layers\.3\.self_attn\.index_[qk]_norm\.weight$|^language_model\.model\.layers\.3\.block_sparse_moe\.e_score_correction_bias$|^vision_tower\.vision_model\.encoder\.layers\.0\.(layer_norm1\.weight|self_attn\.q_proj\.bias)$|^multi_modal_projector\.linear_[12]\.bias$|^patch_merge_mlp\.linear_[12]\.bias$' \
   --torch-dtype bfloat16 \
   --metadata-cache-dir /tmp/minimax_m3_safetensors_headers \
   --output-json docs/usage/support_new_models/artifacts/minimax_m3_vl_precision_parity/real_checkpoint_payload_remote_sample.json
