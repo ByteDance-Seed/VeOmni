@@ -254,12 +254,36 @@ python scripts/multimodal/verify_minimax_m3_vl_checkpoint_payload_parity.py \
   --output-json docs/usage/support_new_models/artifacts/minimax_m3_vl_precision_parity/real_checkpoint_forward_cuda.json
 ```
 
+完整 image+video-prompt forward 示例：
+
+```bash
+cd /path/to/VeOmni
+export PYTHONPATH=$PWD
+
+python scripts/multimodal/verify_minimax_m3_vl_checkpoint_payload_parity.py \
+  --checkpoint-dir /data/checkpoints/MiniMax-M3 \
+  --config-path /data/checkpoints/MiniMax-M3 \
+  --mode forward \
+  --device cuda \
+  --torch-dtype bfloat16 \
+  --prompt-kind multimodal \
+  --seq-len 10 \
+  --top-k 8 \
+  --max-new-tokens 8 \
+  --atol 2e-4 --rtol 2e-4 \
+  --confirm-full-load \
+  --output-json docs/usage/support_new_models/artifacts/minimax_m3_vl_precision_parity/real_checkpoint_forward_multimodal_cuda.json
+```
+
+如果在 toy checkpoint 上复跑该路径，使用 `--image-token-id 250 --video-token-id 251` 覆盖 toy vocab 内的占位符；真实 MiniMax checkpoint 默认使用 config 中的 `200025/200026`，不需要覆盖。
+
 完整 forward 通过标准：
 
 - payload 部分同样 `passed=true`；
 - `forward.state_dict_load.missing_keys=[]`；
 - `forward.state_dict_load.unexpected_keys=[]`；
 - `forward.checks[name=forward.logits].allclose=true`；
+- image/video prompt 还要求 `forward.checks[name=forward.image_hidden_states].allclose=true` 和 `forward.checks[name=forward.video_hidden_states].allclose=true`；
 - `forward.checks[name=forward.last_token_topk_ids].equal=true`；
 - `forward.checks[name=generate.greedy_ids].equal=true`。
 

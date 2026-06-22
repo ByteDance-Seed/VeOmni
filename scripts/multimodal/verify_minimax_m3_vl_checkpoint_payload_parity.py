@@ -101,7 +101,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-hash", action="store_true", help="Skip SHA256 tensor fingerprints.")
     parser.add_argument("--max-report-tensors", type=int, default=80)
     parser.add_argument("--confirm-full-load", action="store_true", help="Required for --mode forward.")
-    parser.add_argument("--prompt-ids", default=DEFAULT_PROMPT_IDS, help="Comma-separated token ids for forward mode.")
+    parser.add_argument(
+        "--prompt-kind",
+        choices=("text", "multimodal"),
+        default="text",
+        help="Forward prompt family. Text uses --prompt-ids; multimodal builds a fixed image+video prompt.",
+    )
+    parser.add_argument("--prompt-ids", default=DEFAULT_PROMPT_IDS, help="Comma-separated token ids for text forward mode.")
+    parser.add_argument("--seq-len", type=int, default=10, help="Sequence length for --prompt-kind multimodal.")
+    parser.add_argument("--seed", type=int, default=20260622, help="Seed for deterministic multimodal pixel tensors.")
+    parser.add_argument("--image-token-id", type=int, default=None, help="Override config image placeholder token id.")
+    parser.add_argument("--video-token-id", type=int, default=None, help="Override config video placeholder token id.")
     parser.add_argument("--top-k", type=int, default=8)
     parser.add_argument("--max-new-tokens", type=int, default=8)
     parser.add_argument("--atol", type=float, default=1e-4)
@@ -653,6 +663,54 @@ def parse_prompt_ids(text: str) -> list[int]:
     return values
 
 
+def config_token_id(config: Any, *, token_attr: str, index_attr: str, override: int | None) -> int:
+    if override is not None:
+        return override
+    for candidate in (config, getattr(config, "text_config", None)):
+        if candidate is None:
+            continue
+        for attr in (token_attr, index_attr):
+            if hasattr(candidate, attr):
+                value = getattr(candidate, attr)
+                if value is not None:
+                    return int(value)
+    raise ValueError(f"config is missing {token_attr}/{index_attr}; pass --{token_attr.replace('_', '-')}")
+
+
+def build_prompt_ids(config: Any, args: argparse.Namespace) -> list[int]:
+    if args.prompt_kind == "text":
+        return parse_prompt_ids(args.prompt_ids)
+
+    text_config = getattr(config, "text_config", config)
+    vocab_size = getattr(text_config, "vocab_size", None)
+    if vocab_size is None:
+        raise ValueError("config text_config must expose vocab_size for multimodal prompt construction")
+    image_token_id = config_token_id(
+        config,
+        token_attr="image_token_id",
+        index_attr="image_token_index",
+        override=args.image_token_id,
+    )
+    video_token_id = config_token_id(
+        config,
+        token_attr="video_token_id",
+        index_attr="video_token_index",
+        override=args.video_token_id,
+    )
+    if max(image_token_id, video_token_id) >= vocab_size:
+        raise ValueError(f"image/video token ids must be below vocab_size={vocab_size}")
+    if args.seq_len < 6:
+        raise ValueError("--seq-len must be at least 6 for the mixed image/video parity prompt")
+
+    token_values = [11, image_token_id, 23, video_token_id, 37, 41, 43, 47, 53, 59]
+    while len(token_values) < args.seq_len:
+        next_id = (token_values[-1] + 7) % vocab_size
+        if next_id in (image_token_id, video_token_id):
+            next_id = (next_id + 1) % vocab_size
+        token_values.append(next_id)
+    return token_values[: args.seq_len]
+
+
 def build_text_batch(prompt_ids: list[int], device: Any) -> dict[str, Any]:
     import torch
 
@@ -662,12 +720,63 @@ def build_text_batch(prompt_ids: list[int], device: Any) -> dict[str, Any]:
     return {"input_ids": input_ids, "attention_mask": attention_mask, "position_ids": position_ids}
 
 
-def greedy_decode_ids(model: Any, prompt_ids: list[int], *, device: Any, max_new_tokens: int) -> list[int]:
+def build_multimodal_batch(config: Any, args: argparse.Namespace, prompt_ids: list[int], device: Any) -> dict[str, Any]:
+    import torch
+
+    batch = build_text_batch(prompt_ids, device)
+    vision_config = config.vision_config
+    merge = vision_config.spatial_merge_size
+    num_patches = merge * merge
+    pixel_row_size = (
+        vision_config.num_channels
+        * vision_config.temporal_patch_size
+        * vision_config.patch_size
+        * vision_config.patch_size
+    )
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(args.seed + 17)
+    batch["pixel_values"] = torch.randn((num_patches, pixel_row_size), generator=generator, dtype=torch.float32).to(device)
+    batch["pixel_values_videos"] = torch.randn((num_patches, pixel_row_size), generator=generator, dtype=torch.float32).to(device)
+    batch["image_grid_thw"] = torch.tensor([[1, merge, merge]], dtype=torch.long, device=device)
+    batch["video_grid_thw"] = torch.tensor([[1, merge, merge]], dtype=torch.long, device=device)
+    return batch
+
+
+def build_forward_batch(config: Any, args: argparse.Namespace, prompt_ids: list[int], device: Any) -> dict[str, Any]:
+    if args.prompt_kind == "text":
+        return build_text_batch(prompt_ids, device)
+    return build_multimodal_batch(config, args, prompt_ids, device)
+
+
+def batch_contract(batch: dict[str, Any]) -> dict[str, Any]:
+    result = {
+        "input_ids": batch["input_ids"].detach().cpu().tolist(),
+        "attention_mask": batch["attention_mask"].detach().cpu().tolist(),
+        "position_ids": batch["position_ids"].detach().cpu().tolist(),
+    }
+    for name in ("image_grid_thw", "video_grid_thw"):
+        if name in batch:
+            result[name] = batch[name].detach().cpu().tolist()
+    for name in ("pixel_values", "pixel_values_videos"):
+        if name in batch:
+            result[f"{name}_shape"] = list(batch[name].shape)
+    return result
+
+
+def greedy_decode_ids(
+    model: Any,
+    config: Any,
+    args: argparse.Namespace,
+    prompt_ids: list[int],
+    *,
+    device: Any,
+    max_new_tokens: int,
+) -> list[int]:
     import torch
 
     generated = torch.tensor([prompt_ids], dtype=torch.long, device=device)
     for _ in range(max_new_tokens):
-        batch = build_text_batch(generated[0].detach().cpu().tolist(), device)
+        batch = build_forward_batch(config, args, generated[0].detach().cpu().tolist(), device)
         with torch.no_grad():
             outputs = model(**batch)
         next_id = outputs.logits[:, -1, :].argmax(dim=-1, keepdim=True)
@@ -685,7 +794,17 @@ def release_accelerator_memory(device: Any) -> None:
         torch.npu.empty_cache()
 
 
-def patch_eager_config(config: Any) -> Any:
+def patch_eager_config(config: Any, args: argparse.Namespace | None = None) -> Any:
+    if args is not None:
+        for value, attrs in (
+            (args.image_token_id, ("image_token_id", "image_token_index")),
+            (args.video_token_id, ("video_token_id", "video_token_index")),
+        ):
+            if value is None:
+                continue
+            for attr in attrs:
+                if hasattr(config, attr):
+                    setattr(config, attr, value)
     if hasattr(config, "_attn_implementation"):
         config._attn_implementation = "eager"
     if hasattr(config, "use_cache"):
@@ -696,6 +815,33 @@ def patch_eager_config(config: Any) -> Any:
         if hasattr(config.text_config, "use_cache"):
             config.text_config.use_cache = False
     return config
+
+
+def add_optional_hidden_check(
+    checks: list[dict[str, Any]],
+    name: str,
+    hf_value: Any | None,
+    veomni_value: Any | None,
+    *,
+    atol: float,
+    rtol: float,
+) -> None:
+    if hf_value is None and veomni_value is None:
+        return
+    if hf_value is None or veomni_value is None:
+        checks.append(
+            {
+                "name": name,
+                "kind": "missing",
+                "equal": False,
+                "hf_present": hf_value is not None,
+                "veomni_present": veomni_value is not None,
+            }
+        )
+        return
+    check = {"name": name, "kind": "tensor"}
+    check.update(tensor_stats(hf_value, veomni_value, atol=atol, rtol=rtol))
+    checks.append(check)
 
 
 def run_forward_parity(
@@ -722,9 +868,9 @@ def run_forward_parity(
 
     dtype = torch_dtype_from_name(args.torch_dtype)
     device = get_device(args.device)
-    prompt_ids = parse_prompt_ids(args.prompt_ids)
 
-    hf_config = patch_eager_config(AutoConfig.from_pretrained(config_path))
+    hf_config = patch_eager_config(AutoConfig.from_pretrained(config_path), args)
+    prompt_ids = build_prompt_ids(hf_config, args)
     hf_model = HFMiniMaxM3SparseForConditionalGeneration.from_pretrained(
         str(checkpoint_dir),
         config=hf_config,
@@ -733,17 +879,24 @@ def run_forward_parity(
     hf_model.to(device)
     hf_model.eval()
 
-    batch = build_text_batch(prompt_ids, device)
+    batch = build_forward_batch(hf_config, args, prompt_ids, device)
     with torch.no_grad():
         hf_outputs = hf_model(**batch)
     hf_logits = hf_outputs.logits.detach().cpu()
     hf_topk = torch.topk(hf_outputs.logits[:, -1, :], k=args.top_k, dim=-1).indices.detach().cpu()
-    hf_greedy = greedy_decode_ids(hf_model, prompt_ids, device=device, max_new_tokens=args.max_new_tokens)
+    hf_image_hidden_states = getattr(hf_outputs, "image_hidden_states", None)
+    hf_video_hidden_states = getattr(hf_outputs, "video_hidden_states", None)
+    if hf_image_hidden_states is not None:
+        hf_image_hidden_states = hf_image_hidden_states.detach().cpu()
+    if hf_video_hidden_states is not None:
+        hf_video_hidden_states = hf_video_hidden_states.detach().cpu()
+    input_contract = batch_contract(batch)
+    hf_greedy = greedy_decode_ids(hf_model, hf_config, args, prompt_ids, device=device, max_new_tokens=args.max_new_tokens)
     del hf_outputs
     del hf_model
     release_accelerator_memory(device)
 
-    veomni_config = patch_eager_config(get_model_config(config_path))
+    veomni_config = patch_eager_config(get_model_config(config_path), args)
     veomni_cls = get_model_class(veomni_config)
     veomni_model = veomni_cls(veomni_config)
     payload_summary, metadata_comparison = stream_load_converted_payload_into_model(
@@ -763,7 +916,7 @@ def run_forward_parity(
 
     veomni_model.to(device)
     veomni_model.eval()
-    batch = build_text_batch(prompt_ids, device)
+    batch = build_forward_batch(veomni_config, args, prompt_ids, device)
     with torch.no_grad():
         veomni_outputs = veomni_model(**batch)
 
@@ -771,6 +924,22 @@ def run_forward_parity(
     logits_check = {"name": "forward.logits", "kind": "tensor"}
     logits_check.update(tensor_stats(hf_logits, veomni_outputs.logits, atol=args.atol, rtol=args.rtol))
     checks.append(logits_check)
+    add_optional_hidden_check(
+        checks,
+        "forward.image_hidden_states",
+        hf_image_hidden_states,
+        getattr(veomni_outputs, "image_hidden_states", None),
+        atol=args.atol,
+        rtol=args.rtol,
+    )
+    add_optional_hidden_check(
+        checks,
+        "forward.video_hidden_states",
+        hf_video_hidden_states,
+        getattr(veomni_outputs, "video_hidden_states", None),
+        atol=args.atol,
+        rtol=args.rtol,
+    )
 
     veomni_topk = torch.topk(veomni_outputs.logits[:, -1, :], k=args.top_k, dim=-1).indices.detach().cpu()
     checks.append(
@@ -783,7 +952,14 @@ def run_forward_parity(
         }
     )
 
-    veomni_greedy = greedy_decode_ids(veomni_model, prompt_ids, device=device, max_new_tokens=args.max_new_tokens)
+    veomni_greedy = greedy_decode_ids(
+        veomni_model,
+        veomni_config,
+        args,
+        prompt_ids,
+        device=device,
+        max_new_tokens=args.max_new_tokens,
+    )
     checks.append(
         {
             "name": "generate.greedy_ids",
@@ -796,11 +972,14 @@ def run_forward_parity(
 
     forward_report = {
         "device": str(device),
+        "prompt_kind": args.prompt_kind,
         "prompt_ids": prompt_ids,
+        "seed": args.seed if args.prompt_kind == "multimodal" else None,
         "top_k": args.top_k,
         "max_new_tokens": args.max_new_tokens,
         "hf_model_class": f"{HFMiniMaxM3SparseForConditionalGeneration.__module__}.MiniMaxM3SparseForConditionalGeneration",
         "veomni_model_class": f"{veomni_cls.__module__}.{veomni_cls.__name__}",
+        "input_contract": input_contract,
         "state_dict_load": {
             "missing_keys": metadata_comparison.get("missing_state_keys_sample", []),
             "missing_key_count": metadata_comparison.get("missing_state_key_count", 0),
