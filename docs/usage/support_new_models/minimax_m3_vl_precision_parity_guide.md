@@ -23,14 +23,16 @@ Transformers 原仓提供 MiniMax M3 VL reference modeling 和通用训练组件
 
 - [toy_hf_veomni_parity.json](./artifacts/minimax_m3_vl_precision_parity/toy_hf_veomni_parity.json)
 - [toy_hf_veomni_parity_npu.json](./artifacts/minimax_m3_vl_precision_parity/toy_hf_veomni_parity_npu.json)
+- [toy_hf_cpu_veomni_npu_parity.json](./artifacts/minimax_m3_vl_precision_parity/toy_hf_cpu_veomni_npu_parity.json)
 
 结果摘要：
 
 ```json
 {
   "passed": true,
-  "device": "cpu / npu:0",
-  "num_checks": 37,
+  "reference_device": "cpu / npu:0",
+  "candidate_device": "cpu / npu:0",
+  "num_checks": 38,
   "failed": []
 }
 ```
@@ -41,9 +43,9 @@ Transformers 原仓提供 MiniMax M3 VL reference modeling 和通用训练组件
 - VeOmni candidate class: `veomni.models.transformers.minimax_m3_vl.generated.patched_modeling_minimax_m3_vl_gpu.MiniMaxM3SparseForConditionalGeneration`
 - 同一份随机初始化 `state_dict`，`strict=True` 加载到 candidate；
 - 同一份 mixed image+video toy batch；
+- input contract: `input_ids`、`attention_mask`、`position_ids`、VeOmni `multimodal_metadata` collate contract；
 - forward: `loss`、`logits`、`image_hidden_states`、`video_hidden_states`；
 - routing: `MiniMaxM3VLTopKRouter` 的 `router_logits`、`top_k_weights`、`selected_experts`；
-- input contract: `attention_mask`、`position_ids`、VeOmni `multimodal_metadata` collate contract；
 - backward: embedding、attention q/k/v/o、MoE gate/experts、projector、`lm_head` 梯度；
 - optimizer: 同一 AdamW one-step 后关键参数 delta。
 
@@ -105,11 +107,29 @@ NPU parity 分两层：
 ```json
 {
   "passed": true,
-  "device": "npu:0",
-  "num_checks": 37,
+  "reference_device": "npu:0",
+  "candidate_device": "npu:0",
+  "num_checks": 38,
   "torch_version": "2.10.0+cpu",
   "torch_npu_version": "2.10.0",
   "transformers_version": "5.12.0"
+}
+```
+
+同一台容器环境也完成了第 2 层 CPU reference vs NPU candidate toy parity：
+
+```json
+{
+  "passed": true,
+  "reference_device": "cpu",
+  "candidate_device": "npu:0",
+  "num_checks": 38,
+  "optimizer": {"name": "AdamW", "lr": 1e-5},
+  "tolerances": {
+    "forward": {"atol": 5e-4, "rtol": 5e-4},
+    "grad": {"atol": 1e-3, "rtol": 1e-3},
+    "param": {"atol": 1e-4, "rtol": 1e-4}
+  }
 }
 ```
 
@@ -145,6 +165,43 @@ docker run --rm --shm-size=8g \
       --output-json docs/usage/support_new_models/artifacts/minimax_m3_vl_precision_parity/toy_hf_veomni_parity_npu.json
   '
 ```
+
+单卡 CPU reference vs NPU candidate parity 示例：
+
+```bash
+cd /path/to/VeOmni
+
+docker run --rm --shm-size=8g \
+  --device=/dev/davinci0 \
+  --device=/dev/davinci_manager \
+  --device=/dev/devmm_svm \
+  --device=/dev/hisi_hdc \
+  -v /usr/local/dcmi:/usr/local/dcmi \
+  -v /usr/local/bin/npu-smi:/usr/local/bin/npu-smi \
+  -v /usr/local/Ascend/driver/lib64:/usr/local/Ascend/driver/lib64 \
+  -v /usr/local/Ascend/driver/version.info:/usr/local/Ascend/driver/version.info \
+  -v /etc/ascend_install.info:/etc/ascend_install.info \
+  -v "$PWD":/workspace/VeOmni \
+  -w /workspace/VeOmni \
+  -e ASCEND_RT_VISIBLE_DEVICES=0 \
+  -e MODELING_BACKEND=veomni \
+  quay.io/ascend/vllm-ascend:v0.20.2rc1 \
+  bash -lc '
+    export PYTHONPATH=/workspace/VeOmni
+    python3 -m pip install --quiet --target /tmp/transformers512 --no-deps transformers==5.12.0
+    export PYTHONPATH=/tmp/transformers512:/workspace/VeOmni:$PYTHONPATH
+    python3 scripts/multimodal/verify_minimax_m3_vl_precision_parity.py \
+      --reference-device cpu \
+      --candidate-device npu \
+      --lr 1e-5 \
+      --atol 5e-4 --rtol 5e-4 \
+      --grad-atol 1e-3 --grad-rtol 1e-3 \
+      --param-atol 1e-4 --param-rtol 1e-4 \
+      --output-json docs/usage/support_new_models/artifacts/minimax_m3_vl_precision_parity/toy_hf_cpu_veomni_npu_parity.json
+  '
+```
+
+跨 backend AdamW 首步对极小梯度符号差很敏感，`lr=1e-5` 用于避免把 backend 浮点噪声放大成近 `2 * lr` 的假失败；它仍然比较同一 AdamW 配置下的一步参数 delta。
 
 如果使用已缓存的 transformers 5.12.0 目录，也可以像 NPU loss smoke 那样把缓存目录挂载到容器，只要 `transformers.__version__ == "5.12.0"` 且包含 `transformers.models.minimax_m3_vl`。
 

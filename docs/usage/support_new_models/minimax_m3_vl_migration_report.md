@@ -14,7 +14,7 @@ Upstream PR:
 
 - PR: `https://github.com/ByteDance-Seed/VeOmni/pull/846`
 - Branch: `codex/minimax-m3-vl-slice`
-- Latest audited code head: `f15248f40d9f8498ae6749dc2410096f56a8d9e0`; subsequent commits in this report update validation evidence only.
+- Validation scope: this report covers the current `codex/minimax-m3-vl-slice` PR branch, including the CPU/NPU parity tooling and artifacts described below.
 - GitHub status after the validation-evidence pushes: CLA is `success`; upstream GitHub Actions are still `action_required`, so maintainers must approve fork-workflow execution before CI jobs/logs exist.
 
 ## Delivered Files
@@ -483,19 +483,20 @@ HF reference vs VeOmni generated toy precision parity:
 ```json
 {
   "passed": true,
-  "num_checks": 37,
+  "num_checks": 38,
   "device": "cpu / npu:0",
   "reference": "transformers.models.minimax_m3_vl.modeling_minimax_m3_vl.MiniMaxM3SparseForConditionalGeneration",
   "candidate": "veomni.models.transformers.minimax_m3_vl.generated.patched_modeling_minimax_m3_vl_gpu.MiniMaxM3SparseForConditionalGeneration"
 }
 ```
 
-This parity gate uses one deterministic mixed image+video toy batch and the same randomly initialized state dict for both models. It checks forward loss/logits/projected image/video hidden states, MoE router logits/top-k weights/selected experts, attention mask and position-id inputs, VeOmni multimodal metadata contract, key gradients, and one AdamW parameter-update delta. CPU parity passes with `torch==2.7.1` and `transformers==5.12.0`; single-card Ascend NPU parity passes in `quay.io/ascend/vllm-ascend:v0.20.2rc1` with `torch_npu==2.10.0`, `transformers==5.12.0`, and NPU tolerances `forward=5e-4`, `grad=1e-3`, `param=1e-3`. GPU, real-checkpoint, and multi-card reruns are documented in the guide.
+This parity gate uses one deterministic mixed image+video toy batch and the same randomly initialized state dict for both models. It checks input ids, attention mask and position-id inputs, VeOmni multimodal metadata contract, forward loss/logits/projected image/video hidden states, MoE router logits/top-k weights/selected experts, key gradients, and one AdamW parameter-update delta. CPU parity passes with `torch==2.7.1` and `transformers==5.12.0`; single-card Ascend NPU same-device parity passes in `quay.io/ascend/vllm-ascend:v0.20.2rc1` with `torch_npu==2.10.0`, `transformers==5.12.0`, and NPU tolerances `forward=5e-4`, `grad=1e-3`, `param=1e-3`. CPU HF reference vs NPU VeOmni candidate cross-backend parity also passes with `reference_device=cpu`, `candidate_device=npu:0`, `lr=1e-5`, and tolerances `forward=5e-4`, `grad=1e-3`, `param=1e-4`. GPU, real-checkpoint, and multi-card reruns are documented in the guide.
 
 Artifacts:
 
 - [toy_hf_veomni_parity.json](./artifacts/minimax_m3_vl_precision_parity/toy_hf_veomni_parity.json)
 - [toy_hf_veomni_parity_npu.json](./artifacts/minimax_m3_vl_precision_parity/toy_hf_veomni_parity_npu.json)
+- [toy_hf_cpu_veomni_npu_parity.json](./artifacts/minimax_m3_vl_precision_parity/toy_hf_cpu_veomni_npu_parity.json)
 - [minimax_m3_vl_precision_parity_guide.md](./minimax_m3_vl_precision_parity_guide.md)
 
 Real checkpoint payload parity tooling:

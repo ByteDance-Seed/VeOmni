@@ -45,6 +45,18 @@ def parse_args() -> argparse.Namespace:
         default="./docs/usage/support_new_models/artifacts/minimax_m3_vl_precision_parity/toy_hf_veomni_parity.json",
     )
     parser.add_argument("--device", default="cpu", choices=("cpu", "cuda", "npu"))
+    parser.add_argument(
+        "--reference-device",
+        default=None,
+        choices=("cpu", "cuda", "npu"),
+        help="Device for upstream HF reference. Defaults to --device.",
+    )
+    parser.add_argument(
+        "--candidate-device",
+        default=None,
+        choices=("cpu", "cuda", "npu"),
+        help="Device for VeOmni candidate. Defaults to --device.",
+    )
     parser.add_argument("--seed", type=int, default=20260622)
     parser.add_argument("--seq-len", type=int, default=10)
     parser.add_argument("--image-token-id", type=int, default=250)
@@ -66,6 +78,22 @@ def set_seed(seed: int, torch_module: Any) -> None:
     torch_module.manual_seed(seed)
     if hasattr(torch_module, "cuda"):
         torch_module.cuda.manual_seed_all(seed)
+
+
+def get_device(name: str):
+    import torch
+
+    if name == "npu":
+        import torch_npu  # noqa: F401
+
+        device = torch.device("npu:0")
+        torch.npu.set_device(device)
+        return device
+    if name == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA requested but torch.cuda.is_available() is false")
+        return torch.device("cuda:0")
+    return torch.device("cpu")
 
 
 def patch_config(config: Any, image_token_id: int, video_token_id: int) -> Any:
@@ -220,17 +248,10 @@ def main() -> None:
         MiniMaxM3SparseForConditionalGeneration as HFMiniMaxM3SparseForConditionalGeneration,
     )
 
-    if args.device == "npu":
-        import torch_npu  # noqa: F401
-
-        device = torch.device("npu:0")
-        torch.npu.set_device(device)
-    elif args.device == "cuda":
-        if not torch.cuda.is_available():
-            raise RuntimeError("CUDA requested but torch.cuda.is_available() is false")
-        device = torch.device("cuda:0")
-    else:
-        device = torch.device("cpu")
+    reference_device_name = args.reference_device or args.device
+    candidate_device_name = args.candidate_device or args.device
+    reference_device = get_device(reference_device_name)
+    candidate_device = get_device(candidate_device_name)
 
     from veomni.models.loader import get_model_class, get_model_config
 
@@ -248,24 +269,26 @@ def main() -> None:
     veomni_model = veomni_cls(veomni_config)
     load_result = veomni_model.load_state_dict(source_state, strict=True)
 
-    hf_model.to(device)
-    veomni_model.to(device)
+    hf_model.to(reference_device)
+    veomni_model.to(candidate_device)
     hf_model.train()
     veomni_model.train()
 
-    batch = build_batch(hf_config, torch, device, args)
+    hf_batch = build_batch(hf_config, torch, reference_device, args)
+    veomni_batch = build_batch(veomni_config, torch, candidate_device, args)
     checks: list[dict[str, Any]] = []
-    add_exact_check(checks, "input.attention_mask", batch["attention_mask"], batch["attention_mask"].clone())
-    add_exact_check(checks, "input.position_ids", batch["position_ids"], batch["position_ids"].clone())
+    add_exact_check(checks, "input.input_ids", hf_batch["input_ids"], veomni_batch["input_ids"])
+    add_exact_check(checks, "input.attention_mask", hf_batch["attention_mask"], veomni_batch["attention_mask"])
+    add_exact_check(checks, "input.position_ids", hf_batch["position_ids"], veomni_batch["position_ids"])
     metadata_expected = {
-        "image_grid_thw_list": batch["image_grid_thw"].detach().cpu().tolist(),
-        "video_grid_thw_list": batch["video_grid_thw"].detach().cpu().tolist(),
+        "image_grid_thw_list": veomni_batch["image_grid_thw"].detach().cpu().tolist(),
+        "video_grid_thw_list": veomni_batch["video_grid_thw"].detach().cpu().tolist(),
     }
     metadata_actual = {"image_grid_thw": 0, "video_grid_thw": 0}
     if hasattr(veomni_model, "get_metadata_collate_func"):
         metadata_batch = {
-            "image_grid_thw": batch["image_grid_thw"].detach().cpu().clone(),
-            "video_grid_thw": batch["video_grid_thw"].detach().cpu().clone(),
+            "image_grid_thw": veomni_batch["image_grid_thw"].detach().cpu().clone(),
+            "video_grid_thw": veomni_batch["video_grid_thw"].detach().cpu().clone(),
         }
         veomni_model.get_metadata_collate_func()(metadata_batch, metadata_actual)
         metadata_actual = metadata_batch["multimodal_metadata"]
@@ -282,8 +305,8 @@ def main() -> None:
     hf_router_records, hf_handles = install_router_hooks(hf_model)
     veomni_router_records, veomni_handles = install_router_hooks(veomni_model)
     try:
-        hf_outputs = hf_model(**batch)
-        veomni_outputs = veomni_model(**batch)
+        hf_outputs = hf_model(**hf_batch)
+        veomni_outputs = veomni_model(**veomni_batch)
     finally:
         remove_hooks(hf_handles)
         remove_hooks(veomni_handles)
@@ -369,12 +392,17 @@ def main() -> None:
         veomni_delta = named_param(veomni_model, name).detach() - before_veomni[name]
         add_tensor_check(checks, f"optimizer_delta.{name}", hf_delta, veomni_delta, atol=args.param_atol, rtol=args.param_rtol)
 
-    passed = all(item.get("allclose", item.get("equal", False)) for item in checks)
+    failed_checks = [item["name"] for item in checks if not item.get("allclose", item.get("equal", False))]
+    passed = not failed_checks
     report = {
         "passed": passed,
+        "num_checks": len(checks),
+        "failed": failed_checks,
         "date": started_at,
         "config_path": args.config_path,
-        "device": str(device),
+        "device": str(candidate_device),
+        "reference_device": str(reference_device),
+        "candidate_device": str(candidate_device),
         "seed": args.seed,
         "image_token_id": args.image_token_id,
         "video_token_id": args.video_token_id,
@@ -390,6 +418,14 @@ def main() -> None:
             "grad": {"atol": args.grad_atol, "rtol": args.grad_rtol},
             "param": {"atol": args.param_atol, "rtol": args.param_rtol},
         },
+        "optimizer": {
+            "name": "AdamW",
+            "lr": args.lr,
+            "betas": [0.9, 0.999],
+            "eps": 1e-8,
+            "weight_decay": 0.01,
+            "foreach": False,
+        },
         "runtime": {
             "python": sys.version,
             "python_executable": sys.executable,
@@ -402,12 +438,22 @@ def main() -> None:
             "torch_npu_device_count": int(torch.npu.device_count()) if hasattr(torch, "npu") else None,
         },
         "batch_contract": {
-            "input_ids": batch["input_ids"].detach().cpu().tolist(),
-            "labels": batch["labels"].detach().cpu().tolist(),
-            "attention_mask": batch["attention_mask"].detach().cpu().tolist(),
-            "position_ids": batch["position_ids"].detach().cpu().tolist(),
-            "image_grid_thw": batch["image_grid_thw"].detach().cpu().tolist(),
-            "video_grid_thw": batch["video_grid_thw"].detach().cpu().tolist(),
+            "reference": {
+                "input_ids": hf_batch["input_ids"].detach().cpu().tolist(),
+                "labels": hf_batch["labels"].detach().cpu().tolist(),
+                "attention_mask": hf_batch["attention_mask"].detach().cpu().tolist(),
+                "position_ids": hf_batch["position_ids"].detach().cpu().tolist(),
+                "image_grid_thw": hf_batch["image_grid_thw"].detach().cpu().tolist(),
+                "video_grid_thw": hf_batch["video_grid_thw"].detach().cpu().tolist(),
+            },
+            "candidate": {
+                "input_ids": veomni_batch["input_ids"].detach().cpu().tolist(),
+                "labels": veomni_batch["labels"].detach().cpu().tolist(),
+                "attention_mask": veomni_batch["attention_mask"].detach().cpu().tolist(),
+                "position_ids": veomni_batch["position_ids"].detach().cpu().tolist(),
+                "image_grid_thw": veomni_batch["image_grid_thw"].detach().cpu().tolist(),
+                "video_grid_thw": veomni_batch["video_grid_thw"].detach().cpu().tolist(),
+            },
         },
         "checks": jsonable_checks(checks),
     }
