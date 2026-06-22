@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Collection
 from dataclasses import dataclass
 from typing import Iterable
 
@@ -10,10 +11,17 @@ import torch
 from ....conversation import ConversationItem, is_dummy
 
 
-def active_output_item(conversation: list[ConversationItem]) -> ConversationItem | None:
+def active_output_item(
+    conversation: list[ConversationItem],
+    *,
+    sources: Collection[str] | None = None,
+) -> ConversationItem | None:
     for item in reversed(conversation):
-        if item.type == "output":
-            return item
+        if item.type != "output":
+            continue
+        if sources is not None and item.source not in sources:
+            continue
+        return item
     return None
 
 

@@ -15,6 +15,12 @@ from tests.seed_omni.bagel.contracts.helpers import (
 from veomni.models.seed_omni.conversation import ConversationItem
 from veomni.models.seed_omni.generation_graph import FSM_SIGNAL_KEY
 from veomni.models.seed_omni.modeling_omni import OmniModel
+from veomni.models.seed_omni.modules.bagel.sources import (
+    BAGEL_FLOW_HIDDEN,
+    BAGEL_FLOW_QUERY,
+    BAGEL_FLOW_VELOCITY,
+    BAGEL_GENERATED_LATENT,
+)
 
 
 def test_bagel_qwen2_mot_gen_mode_requires_token_indexes():
@@ -263,6 +269,7 @@ def test_bagel_qwen2_mot_cfg_text_image_velocity_collection_and_merge():
             type="output",
             value=torch.tensor([[1.0, 2.0], [3.0, 4.0]]),
             role="assistant",
+            source=BAGEL_FLOW_VELOCITY,
             meta={"timestep": torch.tensor(0.5)},
         )
     ]
@@ -348,7 +355,10 @@ class _InferGenBagelQwen(nn.Module):
         if not conversation_list or conversation_list[-1].type != "output":
             return {"conversation_list": conversation_list}
         tail = conversation_list[-1]
-        if torch.is_tensor(tail.value) and tail.value.dim() == 2 and tail.value.shape[-1] == 4:
+        if tail.source == BAGEL_FLOW_QUERY:
+            tail.source = BAGEL_FLOW_HIDDEN
+            return {"conversation_list": conversation_list}
+        if tail.source == BAGEL_FLOW_VELOCITY:
             branch_count = 0
             if float((generation_kwargs or {}).get("cfg_text_scale", 1.0)) > 1.0:
                 branch_count += 1
@@ -380,22 +390,27 @@ class _InferGenBagelFlow(nn.Module):
                         type="output",
                         value=torch.zeros(16, 8),
                         role="assistant",
+                        source=BAGEL_FLOW_QUERY,
                         meta={"timestep": torch.tensor(0.5)},
                     )
                 )
             else:
                 item.value = torch.zeros(16, 8)
+                item.source = BAGEL_FLOW_QUERY
                 item.meta = {"timestep": torch.tensor(0.5)}
             self.phase = "decode"
             return {"conversation_list": conversation_list}
         if self.phase == "decode":
             item = conversation_list[-1]
+            assert item.source == BAGEL_FLOW_HIDDEN
             assert item.value.shape == (18, 8)
             item.value = torch.zeros(16, 4)
+            item.source = BAGEL_FLOW_VELOCITY
             self.phase = "advance"
             return {"conversation_list": conversation_list}
         item = conversation_list[-1]
         item.value = torch.zeros(1, 4, 4)
+        item.source = BAGEL_GENERATED_LATENT
         item.meta.pop("timestep", None)
         self.phase = "done"
         return {"conversation_list": conversation_list, FSM_SIGNAL_KEY: "image_complete"}

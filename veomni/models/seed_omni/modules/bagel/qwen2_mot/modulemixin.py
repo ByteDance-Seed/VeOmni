@@ -10,6 +10,8 @@ import torch.distributed as dist
 from ....conversation import ConversationItem, is_dummy
 from ....generation_graph import FSM_SIGNAL_KEY
 from ....module import ModuleMixin, post_forward, pre_forward
+from ..carrier_updates import materialize_carrier_updates, replace_fields
+from ..sources import BAGEL_FLOW_HIDDEN, BAGEL_FLOW_QUERY, BAGEL_FLOW_VELOCITY
 from .generation_state import MotGenerationState
 from .processing import (
     PackedConversation,
@@ -223,9 +225,22 @@ class BagelQwen2MoTModuleMixin(ModuleMixin):
             value = tail.value
             if value.dim() == 3 and value.shape[0] == 1:
                 value = value.squeeze(0)
-            if value.dim() == 2 and ("timestep" in tail.meta or state.infer_mode == "gen"):
-                if int(value.shape[-1]) == int(self.config.hidden_size):
-                    return "denoise_branch"
+            if tail.source == BAGEL_FLOW_QUERY:
+                if value.dim() != 2:
+                    raise ValueError(
+                        f"BAGEL Qwen2-MoT denoise query expects rank-2 output tensors, got {tuple(value.shape)}."
+                    )
+                if int(value.shape[-1]) != int(self.config.hidden_size):
+                    raise ValueError(
+                        "BAGEL Qwen2-MoT denoise query hidden-size mismatch: "
+                        f"got {value.shape[-1]}, expected {self.config.hidden_size}."
+                    )
+                return "denoise_branch"
+            if tail.source == BAGEL_FLOW_VELOCITY:
+                if value.dim() != 2:
+                    raise ValueError(
+                        f"BAGEL Qwen2-MoT velocity collection expects rank-2 output tensors, got {tuple(value.shape)}."
+                    )
                 return "velocity_collect"
             if state.infer_mode == "gen" and value.dim() != 2:
                 raise ValueError(f"BAGEL Qwen2-MoT infer_gen expects rank-2 output tensors, got {tuple(value.shape)}.")
@@ -388,9 +403,9 @@ class BagelQwen2MoTModuleMixin(ModuleMixin):
     ) -> dict[str, Any]:
         validate_cfg_request(generation_kwargs)
         self._generation_state.main.require_ready()
-        tail = active_output_item(conversation)
+        tail = active_output_item(conversation, sources={BAGEL_FLOW_QUERY})
         if tail is None or not torch.is_tensor(tail.value):
-            raise ValueError("BAGEL Qwen2-MoT denoise branch requires an output query item.")
+            raise ValueError("BAGEL Qwen2-MoT denoise branch requires source='bagel_flow_query'.")
         query = tail.value
         if query.dim() == 3 and query.shape[0] == 1:
             query = query.squeeze(0)
@@ -429,7 +444,16 @@ class BagelQwen2MoTModuleMixin(ModuleMixin):
             packed_vae_token_indexes=packed_vae_token_indexes,
             packed_text_indexes=packed_text_indexes,
         )
-        tail.value = outputs["hidden_states"].to(device=self.device, dtype=self.dtype)
+        materialize_carrier_updates(
+            None,
+            [
+                replace_fields(
+                    tail,
+                    source=BAGEL_FLOW_HIDDEN,
+                    value=outputs["hidden_states"].to(device=self.device, dtype=self.dtype),
+                )
+            ],
+        )
         return {"conversation_list": conversation_list}
 
     def _collect_or_merge_velocity(
@@ -440,9 +464,9 @@ class BagelQwen2MoTModuleMixin(ModuleMixin):
         generation_kwargs: dict[str, Any],
     ) -> dict[str, Any]:
         validate_cfg_request(generation_kwargs)
-        tail = active_output_item(conversation)
+        tail = active_output_item(conversation, sources={BAGEL_FLOW_VELOCITY})
         if tail is None or not torch.is_tensor(tail.value):
-            raise ValueError("BAGEL Qwen2-MoT velocity collection requires an output velocity item.")
+            raise ValueError("BAGEL Qwen2-MoT velocity collection requires source='bagel_flow_velocity'.")
         velocity = tail.value
         if velocity.dim() == 3 and velocity.shape[0] == 1:
             velocity = velocity.squeeze(0)

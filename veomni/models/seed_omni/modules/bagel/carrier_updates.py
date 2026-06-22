@@ -22,7 +22,7 @@ ALLOWED_META_KEYS = frozenset(
         "source",
     }
 )
-_FIELD_KEYS = frozenset({"type", "value", "role", "meta"})
+_FIELD_KEYS = frozenset({"type", "value", "role", "source", "meta"})
 
 
 @dataclass(frozen=True)

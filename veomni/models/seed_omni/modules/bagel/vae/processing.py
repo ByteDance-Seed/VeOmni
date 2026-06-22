@@ -17,6 +17,7 @@ from ..carrier_updates import (
     materialize_carrier_updates,
     replace_fields,
 )
+from ..sources import BAGEL_GENERATED_LATENT
 
 
 def preprocess_image(
@@ -313,7 +314,10 @@ def latent_decode_items(conversation_list: list[list[ConversationItem]] | None) 
         item
         for sample in conversation_list or []
         for item in sample
-        if item.type == "output" and not is_dummy(item) and is_latent_grid_value(item.value)
+        if item.type == "output"
+        and item.source == BAGEL_GENERATED_LATENT
+        and not is_dummy(item)
+        and is_latent_grid_value(item.value)
     ]
 
 

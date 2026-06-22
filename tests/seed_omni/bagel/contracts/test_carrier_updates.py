@@ -14,8 +14,14 @@ from veomni.models.seed_omni.modules.bagel.carrier_updates import (
 )
 
 
-def item(value: object, *, type_: str = "text", role: str = "user") -> ConversationItem:
-    return ConversationItem(type=type_, value=value, role=role, meta={})
+def item(
+    value: object,
+    *,
+    type_: str = "text",
+    role: str = "user",
+    source: str | None = None,
+) -> ConversationItem:
+    return ConversationItem(type=type_, value=value, role=role, source=source, meta={})
 
 
 def test_replace_value_updates_item_value() -> None:
@@ -31,12 +37,12 @@ def test_replace_fields_updates_basic_item_fields() -> None:
 
     materialize_carrier_updates(
         [[target]],
-        [replace_fields(target, type="output", role="dummy", meta={"source": "bagel_test"})],
+        [replace_fields(target, type="output", role="dummy", source="bagel_source", meta={"source": "bagel_test"})],
     )
 
     assert target.type == "output"
     assert target.role == "dummy"
-    assert target.source is None
+    assert target.source == "bagel_source"
     assert target.meta == {"source": "bagel_test"}
 
 

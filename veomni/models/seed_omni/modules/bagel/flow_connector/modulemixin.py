@@ -10,7 +10,14 @@ from ....conversation import ConversationItem
 from ....generation_graph import FSM_SIGNAL_KEY
 from ....module import ModuleMixin, post_forward, pre_forward
 from ..carrier_updates import append as carrier_append
-from ..carrier_updates import materialize_carrier_updates, meta_patch, replace_fields, replace_value
+from ..carrier_updates import materialize_carrier_updates, meta_patch, replace_fields
+from ..sources import (
+    BAGEL_FLOW_HIDDEN,
+    BAGEL_FLOW_QUERY,
+    BAGEL_FLOW_VELOCITY,
+    BAGEL_GENERATED_LATENT,
+    BAGEL_VAE_CONTEXT,
+)
 from .configuration import BagelFlowConnectorConfig
 from .generation_state import FlowGenerationState
 from .processing import (
@@ -73,7 +80,7 @@ class BagelFlowConnectorModuleMixin(ModuleMixin):
         state = self._generation_state
         if state.phase == "advance":
             conversation = single_inference_conversation(conversation_list)
-            item = active_output_item(conversation)
+            item = active_output_item(conversation, sources={BAGEL_FLOW_VELOCITY})
             if item is not None and not torch.is_tensor(item.value):
                 return "prepare_query"
         return state.phase
@@ -104,7 +111,7 @@ class BagelFlowConnectorModuleMixin(ModuleMixin):
             timesteps=timestep_tokens,
         )
         query = outputs["latent_embeds"].to(device=self.device, dtype=self.dtype)
-        item = active_output_item(conversation)
+        item = active_output_item(conversation, sources={BAGEL_FLOW_VELOCITY})
         timestep_meta = timestep.detach().to(device=query.device, dtype=torch.float32)
         if item is None:
             materialize_carrier_updates(
@@ -113,7 +120,11 @@ class BagelFlowConnectorModuleMixin(ModuleMixin):
                     carrier_append(
                         conversation,
                         ConversationItem(
-                            type="output", value=query, role="assistant", meta={"timestep": timestep_meta}
+                            type="output",
+                            value=query,
+                            role="assistant",
+                            source=BAGEL_FLOW_QUERY,
+                            meta={"timestep": timestep_meta},
                         ),
                     )
                 ],
@@ -121,7 +132,16 @@ class BagelFlowConnectorModuleMixin(ModuleMixin):
         else:
             materialize_carrier_updates(
                 conversation,
-                [replace_fields(item, type="output", role="assistant", value=query, meta={"timestep": timestep_meta})],
+                [
+                    replace_fields(
+                        item,
+                        type="output",
+                        role="assistant",
+                        source=BAGEL_FLOW_QUERY,
+                        value=query,
+                        meta={"timestep": timestep_meta},
+                    )
+                ],
             )
         state.phase = "decode_velocity"
         return {"conversation_list": conversation_list}
@@ -131,18 +151,34 @@ class BagelFlowConnectorModuleMixin(ModuleMixin):
         conversation_list: list[ConversationItem] | list[list[ConversationItem]] | None,
     ) -> dict[str, Any]:
         conversation = single_inference_conversation(conversation_list)
-        item = active_output_item(conversation)
+        item = active_output_item(conversation, sources={BAGEL_FLOW_HIDDEN})
         if item is None or not torch.is_tensor(item.value):
-            raise ValueError("BAGEL flow decode_velocity requires a current output hidden-state item.")
+            raise ValueError("BAGEL flow decode_velocity requires source='bagel_flow_hidden'.")
         hidden = item.value
         if hidden.dim() == 3 and hidden.shape[0] == 1:
             hidden = hidden.squeeze(0)
         if hidden.dim() != 2:
             raise ValueError(f"BAGEL flow decode_velocity expected rank-2 hidden states, got {tuple(hidden.shape)}.")
+        if int(hidden.shape[-1]) != int(self.config.hidden_size):
+            raise ValueError(
+                "BAGEL flow decode_velocity hidden-size mismatch: "
+                f"got {hidden.shape[-1]}, expected {self.config.hidden_size}."
+            )
         state = self._generation_state
         outputs = self.decode_velocity(hidden_states=hidden)
         velocity = state.strip_query_markers(outputs["velocity"])
-        materialize_carrier_updates(None, [replace_value(item, velocity.to(device=self.device, dtype=self.dtype))])
+        materialize_carrier_updates(
+            None,
+            [
+                replace_fields(
+                    item,
+                    type="output",
+                    role="assistant",
+                    source=BAGEL_FLOW_VELOCITY,
+                    value=velocity.to(device=self.device, dtype=self.dtype),
+                )
+            ],
+        )
         state.phase = "advance"
         return {"conversation_list": conversation_list}
 
@@ -151,9 +187,9 @@ class BagelFlowConnectorModuleMixin(ModuleMixin):
         conversation_list: list[ConversationItem] | list[list[ConversationItem]] | None,
     ) -> dict[str, Any]:
         conversation = single_inference_conversation(conversation_list)
-        item = active_output_item(conversation)
+        item = active_output_item(conversation, sources={BAGEL_FLOW_VELOCITY})
         if item is None or not torch.is_tensor(item.value):
-            raise ValueError("BAGEL flow advance requires a current output velocity item.")
+            raise ValueError("BAGEL flow advance requires source='bagel_flow_velocity'.")
         state = self._generation_state
         velocity = item.value
         if velocity.dim() == 3 and velocity.shape[0] == 1:
@@ -180,7 +216,7 @@ class BagelFlowConnectorModuleMixin(ModuleMixin):
     ) -> dict[str, Any]:
         state = self._generation_state
         x_t = state.require_latents()
-        item = active_output_item(conversation)
+        item = active_output_item(conversation, sources={BAGEL_FLOW_VELOCITY})
         latent = unpatchify_latent_tokens(
             x_t,
             state.require_latent_grid_shape(),
@@ -192,7 +228,14 @@ class BagelFlowConnectorModuleMixin(ModuleMixin):
                 conversation,
                 [
                     carrier_append(
-                        conversation, ConversationItem(type="output", value=latent, role="assistant", meta={})
+                        conversation,
+                        ConversationItem(
+                            type="output",
+                            value=latent,
+                            role="assistant",
+                            source=BAGEL_GENERATED_LATENT,
+                            meta={},
+                        ),
                     )
                 ],
             )
@@ -204,6 +247,7 @@ class BagelFlowConnectorModuleMixin(ModuleMixin):
                         item,
                         type="output",
                         role="assistant",
+                        source=BAGEL_GENERATED_LATENT,
                         value=latent.to(device=self.device, dtype=self.dtype),
                         meta={},
                     )
@@ -217,7 +261,13 @@ class BagelFlowConnectorModuleMixin(ModuleMixin):
         conversation_list: list[ConversationItem] | list[list[ConversationItem]] | None,
     ) -> dict[str, Any]:
         batched = self._as_batched_conversation(conversation_list)
-        embed_items = flow_latent_items(batched, z_channels=int(self.config.z_channels))
+        embed_items = flow_latent_items(
+            batched,
+            z_channels=int(self.config.z_channels),
+            sources={BAGEL_VAE_CONTEXT},
+        )
+        if not embed_items:
+            embed_items = flow_latent_items(batched, z_channels=int(self.config.z_channels))
         if not embed_items:
             return {"conversation_list": conversation_list}
         inputs, embed_lengths = prepare_context_embed_latent_inputs(
@@ -312,7 +362,13 @@ class BagelFlowConnectorModuleMixin(ModuleMixin):
     ) -> dict[str, Any]:
         del kwargs
         self._conversation_carrier = conversation_list
-        self._decode_items = flow_hidden_items(conversation_list, hidden_size=int(self.config.hidden_size))
+        self._decode_items = flow_hidden_items(
+            conversation_list,
+            hidden_size=int(self.config.hidden_size),
+            sources={BAGEL_FLOW_HIDDEN},
+        )
+        if not self._decode_items:
+            self._decode_items = flow_hidden_items(conversation_list, hidden_size=int(self.config.hidden_size))
         self._decode_lengths = []
         self._decode_target = None
         if not self._decode_items:

@@ -38,6 +38,10 @@ def v2_probe_values(
         for record in observations.get((node.state, node.name), []):
             if mapping.v2_item_type is not None and record.get("_item_type") != mapping.v2_item_type:
                 continue
+            if mapping.v2_item_source is not None and record.get("_item_source") != mapping.v2_item_source:
+                continue
+            if mapping.v2_signal is not None and record.get("_fsm_signal") != mapping.v2_signal:
+                continue
             if mapping.v2_field in record:
                 values.append(record[mapping.v2_field])
     if not values:

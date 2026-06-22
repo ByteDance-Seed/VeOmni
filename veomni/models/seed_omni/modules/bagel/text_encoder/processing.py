@@ -10,6 +10,10 @@ from veomni.utils.tensor_utils import naflatten
 
 from ....conversation import ConversationItem, is_dummy, maybe_merge_outputs, seal_outputs
 from ..carrier_updates import materialize_carrier_updates, meta_patch, replace_value
+from ..sources import BAGEL_FLOW_HIDDEN, BAGEL_FLOW_VELOCITY, BAGEL_GENERATED_LATENT
+
+
+_MARKER_EXCLUDED_SOURCES = frozenset({BAGEL_FLOW_HIDDEN, BAGEL_FLOW_VELOCITY, BAGEL_GENERATED_LATENT})
 
 
 def resolve_token_id(tokenizer: Any, token: str, fallback: int | None) -> int | None:
@@ -183,6 +187,8 @@ def image_embed_marker_items(
     for sample in conversation_list:
         for item in sample:
             if is_dummy(item) or item.type not in item_types:
+                continue
+            if item.source in _MARKER_EXCLUDED_SOURCES:
                 continue
             value = squeeze_single_batch(item.value)
             if not torch.is_tensor(value) or value.dim() != 2:

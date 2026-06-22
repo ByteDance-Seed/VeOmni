@@ -37,6 +37,7 @@ infer_gen.timestep:
     state: denoise_query
     field: timestep
     item_type: output
+    source: bagel_flow_query
   ref:
     field: timestep
   tol: exact
@@ -48,6 +49,7 @@ infer_gen.timestep_all:
     state: denoise_query
     field: timestep
     item_type: output
+    source: bagel_flow_query
     selector: unique_consecutive
   ref:
     field: timestep
@@ -60,6 +62,7 @@ infer_gen.latent_query:
     state: denoise_query
     field: value
     item_type: output
+    source: bagel_flow_query
   ref:
     field: latent_query
   tol: tensor
@@ -71,6 +74,7 @@ infer_gen.latent_query_all:
     state: denoise_query
     field: value
     item_type: output
+    source: bagel_flow_query
     selector: unique_consecutive
   ref:
     field: latent_query
@@ -83,6 +87,7 @@ infer_gen.denoise_hidden:
     state: denoise_query
     field: value
     item_type: output
+    source: bagel_flow_hidden
   ref:
     field: denoise_hidden
   tol: tensor
@@ -94,6 +99,7 @@ infer_gen.denoise_hidden_all:
     state: denoise_query
     field: value
     item_type: output
+    source: bagel_flow_hidden
   ref:
     field: denoise_hidden
   tol: tensor
@@ -105,6 +111,7 @@ infer_gen.velocity:
     state: velocity_collect
     field: value
     item_type: output
+    source: bagel_flow_velocity
   ref:
     field: velocity
   tol: tensor
@@ -116,6 +123,7 @@ infer_gen.velocity_all:
     state: velocity_collect
     field: value
     item_type: output
+    source: bagel_flow_velocity
   ref:
     field: velocity
   tol: tensor
@@ -127,6 +135,8 @@ infer_gen.merged_velocity:
     state: velocity_collect
     field: value
     item_type: output
+    source: bagel_flow_velocity
+    signal: velocity_ready
   ref:
     field: velocity
   tol: tensor
@@ -138,6 +148,8 @@ infer_gen.merged_velocity_all:
     state: velocity_collect
     field: value
     item_type: output
+    source: bagel_flow_velocity
+    signal: velocity_ready
   ref:
     field: velocity
   tol: tensor

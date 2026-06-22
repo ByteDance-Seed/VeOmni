@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+from collections.abc import Collection
 from typing import Any
 
 import torch
 
 from ....conversation import ConversationItem, is_dummy
-from ..carrier_updates import materialize_carrier_updates, meta_patch, replace_value
+from ..carrier_updates import materialize_carrier_updates, meta_patch, replace_fields, replace_value
+from ..sources import BAGEL_FLOW_HIDDEN, BAGEL_FLOW_VELOCITY, BAGEL_GENERATED_LATENT
 
 
 def autocast_enabled_for_device(device: torch.device) -> bool:
@@ -35,10 +37,17 @@ def single_inference_conversation(
     raise TypeError("BAGEL flow inference conversation_list must contain ConversationItem objects.")
 
 
-def active_output_item(conversation: list[ConversationItem]) -> ConversationItem | None:
+def active_output_item(
+    conversation: list[ConversationItem],
+    *,
+    sources: Collection[str] | None = None,
+) -> ConversationItem | None:
     for item in reversed(conversation):
-        if item.type == "output":
-            return item
+        if item.type != "output":
+            continue
+        if sources is not None and item.source not in sources:
+            continue
+        return item
     return None
 
 
@@ -63,14 +72,30 @@ def is_latent_grid(value: object, *, z_channels: int) -> bool:
     return value.dim() == 3 and value.shape[0] == z_channels
 
 
-def is_flow_latent_item(item: ConversationItem, *, z_channels: int) -> bool:
+def is_flow_latent_item(
+    item: ConversationItem,
+    *,
+    z_channels: int,
+    sources: Collection[str] | None = None,
+) -> bool:
     if is_dummy(item) or item.type != "output":
+        return False
+    if sources is not None and item.source not in sources:
+        return False
+    if sources is None and item.source == BAGEL_GENERATED_LATENT:
         return False
     return is_latent_grid(item.value, z_channels=z_channels)
 
 
-def is_flow_hidden_item(item: ConversationItem, *, hidden_size: int) -> bool:
+def is_flow_hidden_item(
+    item: ConversationItem,
+    *,
+    hidden_size: int,
+    sources: Collection[str] | None = None,
+) -> bool:
     if is_dummy(item) or item.type != "output" or not torch.is_tensor(item.value):
+        return False
+    if sources is not None and item.source not in sources:
         return False
     value = item.value
     if value.dim() == 3 and value.shape[0] == 1:
@@ -187,12 +212,13 @@ def flow_latent_items(
     conversation_list: list[list[ConversationItem]] | None,
     *,
     z_channels: int,
+    sources: Collection[str] | None = None,
 ) -> list[ConversationItem]:
     return [
         item
         for sample in conversation_list or []
         for item in sample
-        if is_flow_latent_item(item, z_channels=z_channels)
+        if is_flow_latent_item(item, z_channels=z_channels, sources=sources)
     ]
 
 
@@ -320,12 +346,13 @@ def flow_hidden_items(
     conversation_list: list[list[ConversationItem]] | None,
     *,
     hidden_size: int,
+    sources: Collection[str] | None = None,
 ) -> list[ConversationItem]:
     return [
         item
         for sample in conversation_list or []
         for item in sample
-        if is_flow_hidden_item(item, hidden_size=hidden_size)
+        if is_flow_hidden_item(item, hidden_size=hidden_size, sources=sources)
     ]
 
 
@@ -380,7 +407,11 @@ def scatter_velocity(
     offset = 0
     updates = []
     for item, length in zip(decode_items, decode_lengths, strict=True):
-        updates.append(replace_value(item, velocity[offset : offset + length].to(device=device, dtype=dtype)))
+        value = velocity[offset : offset + length].to(device=device, dtype=dtype)
+        if item.source == BAGEL_FLOW_HIDDEN:
+            updates.append(replace_fields(item, source=BAGEL_FLOW_VELOCITY, value=value))
+        else:
+            updates.append(replace_value(item, value))
         offset += length
     if offset != int(velocity.shape[0]):
         raise RuntimeError("BAGEL flow connector token count mismatch during velocity scatter.")

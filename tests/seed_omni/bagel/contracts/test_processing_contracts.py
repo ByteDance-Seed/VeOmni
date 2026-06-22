@@ -7,6 +7,11 @@ from PIL import Image
 
 from tests.seed_omni.bagel.contracts.helpers import config_cls, model_cls
 from veomni.models.seed_omni.conversation import ConversationItem
+from veomni.models.seed_omni.modules.bagel.sources import (
+    BAGEL_FLOW_VELOCITY,
+    BAGEL_GENERATED_LATENT,
+    BAGEL_VAE_CONTEXT,
+)
 
 
 def test_bagel_training_text_embed_meta_preserves_grad():
@@ -124,7 +129,13 @@ def test_bagel_flow_embed_latent_infer_context_keeps_numeric_state_out_of_meta()
             timestep_frequency_embedding_size=4,
         )
     )
-    item = ConversationItem(type="output", value=torch.ones(1, 2, 2), role="assistant", meta={})
+    item = ConversationItem(
+        type="output",
+        value=torch.ones(1, 2, 2),
+        role="assistant",
+        source=BAGEL_VAE_CONTEXT,
+        meta={},
+    )
     conversation = [item, ConversationItem(type="text", value="prompt", role="user")]
     captured_timesteps = []
     original_time_embedder_forward = model.time_embedder.forward
@@ -150,9 +161,32 @@ def test_bagel_vae_decode_skips_context_hidden_outputs():
     from veomni.models.seed_omni.modules.bagel.vae.processing import latent_decode_items
 
     context_hidden = ConversationItem(type="output", value=torch.zeros(6, 8), role="assistant", meta={})
-    final_latent = ConversationItem(type="output", value=torch.zeros(4, 2, 2), role="assistant", meta={})
+    vae_context = ConversationItem(
+        type="output",
+        value=torch.zeros(4, 2, 2),
+        role="assistant",
+        source=BAGEL_VAE_CONTEXT,
+        meta={},
+    )
+    training_latent = ConversationItem(type="output", value=torch.zeros(4, 2, 2), role="assistant", meta={})
+    velocity = ConversationItem(
+        type="output",
+        value=torch.zeros(4, 2),
+        role="assistant",
+        source=BAGEL_FLOW_VELOCITY,
+        meta={},
+    )
+    final_latent = ConversationItem(
+        type="output",
+        value=torch.zeros(4, 2, 2),
+        role="assistant",
+        source=BAGEL_GENERATED_LATENT,
+        meta={},
+    )
 
-    assert latent_decode_items([[context_hidden, final_latent]]) == [final_latent]
+    assert latent_decode_items([[context_hidden, vae_context, training_latent, velocity, final_latent]]) == [
+        final_latent
+    ]
 
 
 def test_bagel_text_encoder_marker_and_token_helpers():

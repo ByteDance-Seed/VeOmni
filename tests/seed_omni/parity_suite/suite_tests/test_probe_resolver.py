@@ -158,6 +158,31 @@ infer.step:
     assert probe.v2_selector == "unique_consecutive"
 
 
+def test_probes_yaml_parses_v2_source_and_signal(tmp_path: Path) -> None:
+    probes_path = tmp_path / "probes.yaml"
+    probes_path.write_text(
+        """
+infer.step:
+  v2:
+    node: toy.generate
+    field: hidden
+    item_type: output
+    source: toy_hidden
+    signal: ready
+  ref:
+    field: hidden
+  tol: hidden
+""",
+        encoding="utf-8",
+    )
+
+    [probe] = load_probe_catalog(probes_path).probes
+
+    assert probe.v2_item_type == "output"
+    assert probe.v2_item_source == "toy_hidden"
+    assert probe.v2_signal == "ready"
+
+
 def test_probes_yaml_rejects_unknown_v2_selector(tmp_path: Path) -> None:
     probes_path = tmp_path / "probes.yaml"
     probes_path.write_text(

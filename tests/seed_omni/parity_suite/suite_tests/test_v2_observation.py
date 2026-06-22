@@ -150,6 +150,7 @@ def test_conversation_output_records_value_and_meta_fields() -> None:
                 type="text",
                 role="assistant",
                 value=torch.tensor([[1.0, 2.0]]),
+                source="text_hidden",
                 meta={
                     "input_ids": torch.tensor([3, 4]),
                     "labels": torch.tensor([5, 6]),
@@ -171,6 +172,7 @@ def test_conversation_output_records_value_and_meta_fields() -> None:
         state="train",
         node="toy.encode",
         conversation_list=conversation,
+        fsm_signal="ready",
     )
 
     records = observations[("train", "toy.encode")]
@@ -178,6 +180,9 @@ def test_conversation_output_records_value_and_meta_fields() -> None:
     assert torch.equal(records[0]["value"], torch.tensor([[1.0, 2.0]]))
     assert torch.equal(records[0]["input_ids"], torch.tensor([3, 4]))
     assert torch.equal(records[0]["labels"], torch.tensor([5, 6]))
+    assert records[0]["_item_type"] == "text"
+    assert records[0]["_item_source"] == "text_hidden"
+    assert records[0]["_fsm_signal"] == "ready"
     assert "ignored" not in records[0]
 
 
@@ -207,3 +212,49 @@ def test_probe_values_can_filter_conversation_item_type() -> None:
 
     assert len(values) == 1
     assert torch.equal(values[0], torch.tensor([2]))
+
+
+def test_probe_values_can_filter_conversation_item_source_and_signal() -> None:
+    mapping = ProbeMapping(
+        node="flow",
+        probe="flow.velocity",
+        v2_field="value",
+        ref_tap=RefTapSpec(kind="field", target="velocity", field="velocity"),
+        tol="tensor",
+        state="denoise",
+        v2_item_type="output",
+        v2_item_source="bagel_flow_velocity",
+        v2_signal="velocity_ready",
+    )
+    case = type(
+        "Case",
+        (),
+        {"nodes": (type("Node", (), {"name": "flow", "state": "denoise"})(),)},
+    )()
+    observations = {
+        ("denoise", "flow"): [
+            {
+                "value": torch.tensor([1]),
+                "_item_type": "output",
+                "_item_source": "bagel_vae_context",
+                "_fsm_signal": "velocity_ready",
+            },
+            {
+                "value": torch.tensor([2]),
+                "_item_type": "output",
+                "_item_source": "bagel_flow_velocity",
+                "_fsm_signal": "need_denoise_branch",
+            },
+            {
+                "value": torch.tensor([3]),
+                "_item_type": "output",
+                "_item_source": "bagel_flow_velocity",
+                "_fsm_signal": "velocity_ready",
+            },
+        ]
+    }
+
+    values = v2_probe_values(observations, mapping, case=case)
+
+    assert len(values) == 1
+    assert torch.equal(values[0], torch.tensor([3]))

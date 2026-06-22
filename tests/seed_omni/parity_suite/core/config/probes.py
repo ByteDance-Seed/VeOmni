@@ -74,6 +74,8 @@ class ProbeMapping:
     tol: str
     state: str | None = None
     v2_item_type: str | None = None
+    v2_item_source: str | None = None
+    v2_signal: str | None = None
     v2_grad: V2GradSpec | None = None
     v2_selector: str = "all"
     step: str = "last"
@@ -118,6 +120,8 @@ class ProbeMapping:
             tol=str(raw["tol"]),
             state=None if v2_raw.get("state") is None else str(v2_raw["state"]),
             v2_item_type=None if v2_raw.get("item_type") is None else str(v2_raw["item_type"]),
+            v2_item_source=None if v2_raw.get("source") is None else str(v2_raw["source"]),
+            v2_signal=None if v2_raw.get("signal") is None else str(v2_raw["signal"]),
             v2_grad=V2GradSpec.from_raw(v2_raw.get("grad"), probe=probe, node=node),
             v2_selector=v2_selector,
             step=step,

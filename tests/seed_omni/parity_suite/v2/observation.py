@@ -12,6 +12,7 @@ from torch import nn
 
 from tests.seed_omni.parity_suite.core import PARITY_ENABLE_ENV, to_cpu
 from veomni.models.seed_omni.conversation import ConversationItem, is_dummy
+from veomni.models.seed_omni.generation_graph import FSM_SIGNAL_KEY
 from veomni.models.seed_omni.module import ModuleMixin
 from veomni.models.seed_omni.observer import _materialize_observed_value
 
@@ -64,6 +65,7 @@ def arm_generation_observer(
                 state=state,
                 node=node,
                 conversation_list=conversation_list,
+                fsm_signal=out.get(FSM_SIGNAL_KEY),
                 max_tensor_numel=max_tensor_numel,
             )
 
@@ -175,6 +177,7 @@ def record_conversation_output(
     state: str,
     node: str,
     conversation_list: Any,
+    fsm_signal: str | None = None,
     max_tensor_numel: int = 1_000_000,
 ) -> None:
     """Record whitelisted tensor fields from a conversation-list carrier.
@@ -202,6 +205,9 @@ def record_conversation_output(
                 record[field] = to_cpu(value)
         if record:
             record["_item_type"] = item.type
+            record["_item_source"] = item.source
+            if fsm_signal is not None:
+                record["_fsm_signal"] = fsm_signal
             observations.setdefault((state, node), []).append(record)
 
 
