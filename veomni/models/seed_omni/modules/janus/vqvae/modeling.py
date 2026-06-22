@@ -93,11 +93,19 @@ class JanusVqvae(JanusVqvaeModuleMixin, JanusVqvaeTraceMixin, PreTrainedModel):
             image_embeds = image_embeds.reshape(b, vq_token_ids.size(1), image_embeds.size(-1))
         return {"image_embeds": image_embeds, "vq_token_ids": vq_token_ids}
 
-    def encode(self, pixel_values: Optional[torch.Tensor] = None) -> Dict[str, Any]:
-        if pixel_values is None and get_parallel_state().fsdp_enabled:
-            dummy = self.dummy_inputs()
-            return {**self._encode_pixels(dummy["pixel_values"]), "is_dummy": True}
-        return self._encode_pixels(pixel_values)
+    def encode(
+        self,
+        pixel_values: Optional[torch.Tensor] = None,
+        is_dummy: Optional[bool] = None,
+    ) -> Dict[str, Any]:
+        # ``is_dummy`` comes from the (worker-aware) pre_forward: True with
+        # worker-built dummy zeros, False with real pixels. ``None`` = eager /
+        # no-worker path → derive from the absence of pixels (FSDP only).
+        if is_dummy is None:
+            is_dummy = pixel_values is None and get_parallel_state().fsdp_enabled
+        if is_dummy and pixel_values is None:
+            pixel_values = self.dummy_inputs()["pixel_values"]
+        return {**self._encode_pixels(pixel_values), "is_dummy": is_dummy}
 
     def decode(
         self,

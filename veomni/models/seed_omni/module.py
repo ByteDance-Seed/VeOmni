@@ -79,6 +79,40 @@ def post_forward(context: str) -> Callable[[Callable], Callable]:
     return decorator
 
 
+class CPUPreprocessor:
+    """Picklable, weight-free CPU input-prep run inside DataLoader workers.
+
+    A module whose ``pre_forward`` does heavy **CPU** input preparation (e.g. a
+    text encoder's chat-template + tokenize, a vision tower's image normalize)
+    can move that work off the main/GPU process by returning one of these from
+    :meth:`ModuleMixin.build_cpu_preprocessor`.  The :class:`OmniModuleTrainer`
+    orchestrator collects the active graph-node modules' preprocessors and runs
+    them inside :class:`~veomni.data.data_collator.SeedOmniCollator` — which
+    executes in the DataLoader worker — so the work overlaps with GPU compute via
+    prefetch instead of blocking the main process inside ``pre_forward``.
+
+    Contract:
+
+    * **No model weights.** It is pickled / fork-inherited into worker processes,
+      so it must hold only CPU-safe, picklable assets (tokenizer / image
+      processor / special-token ids / config ints) — never the ``nn.Module``.
+    * **CPU only.** Workers must not touch the training CUDA device; build CPU
+      tensors (no ``device=``).  The main process's thin ``pre_forward`` does the
+      single ``.to(device)``.
+    * **In-place mutation.** ``__call__`` receives the batched
+      ``conversation_list`` (``list[list[ConversationItem]]``) and mutates items'
+      ``value`` / ``meta`` in place, tagging a sentinel in ``meta`` so the thin
+      ``pre_forward`` knows the heavy work is already done (and falls back to the
+      full self-contained path when the sentinel is absent, e.g. eager inference
+      with no worker collator).
+    """
+
+    def __call__(self, conversation_list: List[List[Any]]) -> None:
+        raise NotImplementedError(
+            f"{type(self).__name__} must implement __call__(conversation_list) and mutate it in place."
+        )
+
+
 class ModuleMixin:
     """Unified SeedOmni V2 mixin for both training and inference hooks.
 
@@ -179,6 +213,20 @@ class ModuleMixin:
             return outputs
         return getattr(self, name)(**outputs)
 
+    def build_cpu_preprocessor(self) -> Optional["CPUPreprocessor"]:
+        """Optional: return a picklable, weight-free :class:`CPUPreprocessor`.
+
+        Default ``None`` = this module does no worker-side input-prep.  Override
+        on a module whose ``pre_forward`` has heavy **CPU** work (tokenize /
+        image normalize): build a :class:`CPUPreprocessor` from this module's
+        already-loaded assets (``self._tokenizer`` / ``self._image_processor`` /
+        config ints — never ``self`` / weights) and return it.  The orchestrator
+        collects these from the active graph-node modules and runs them inside
+        the worker-side collator, so the work overlaps with GPU compute and the
+        module's ``pre_forward`` becomes a thin consumer.
+        """
+        return None
+
     def get_parallel_plan(self) -> Optional[Any]:
         """Return a per-module VeOmni parallel plan, or ``None`` for default."""
         return None
@@ -264,4 +312,9 @@ class ModuleMixin:
         return {}
 
 
-__all__ = ["ModuleMixin", "pre_forward", "post_forward"]
+__all__ = [
+    "ModuleMixin",
+    "CPUPreprocessor",
+    "pre_forward",
+    "post_forward",
+]

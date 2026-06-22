@@ -87,3 +87,41 @@ def apply_qwen3_generation_prompt(
 def pack_text_input_ids(parts: list[ConversationItem]) -> list[torch.Tensor]:
     """Collect ``type='text'`` token-id tensors (``value``); one tensor per text row."""
     return [part.value for part in parts if part.type == "text"]
+
+
+def tokenize_template_parts(
+    parts: list[ConversationItem],
+    tokenizer: Any,
+    device: Any = None,
+) -> None:
+    """Tokenize each ``text`` part in place: ``str`` value → token-id tensor.
+
+    ``device=None`` (default) builds CPU tensors — used by the worker-side
+    preprocessor so no CUDA is touched; the in-module fallback passes the module
+    device. Sets ``meta['labels']`` (``-100`` where ``loss_mask`` is 0) and
+    ``meta['attention_mask']``.
+    """
+    for part in parts:
+        if part.type != "text":
+            continue
+        text = part.value
+        loss_mask = int(part.meta.pop("loss_mask"))
+        input_ids = tokenizer(text, add_special_tokens=False)["input_ids"]
+        labels = input_ids if loss_mask else [-100] * len(input_ids)
+        part.value = torch.tensor(input_ids, device=device, dtype=torch.long)
+        part.meta["labels"] = torch.tensor(labels, device=device, dtype=torch.long)
+        part.meta["attention_mask"] = torch.ones(len(input_ids), dtype=torch.long, device=device)
+
+
+def merge_consecutive_text_parts(parts: list[ConversationItem]) -> list[ConversationItem]:
+    """Merge adjacent same-role ``text`` parts (concat ids / labels / mask)."""
+    merged: list[ConversationItem] = []
+    for part in parts:
+        if merged and merged[-1].type == "text" and part.type == "text" and merged[-1].role == part.role:
+            prev = merged[-1]
+            prev.value = torch.cat([prev.value, part.value])
+            prev.meta["labels"] = torch.cat([prev.meta["labels"], part.meta["labels"]])
+            prev.meta["attention_mask"] = torch.cat([prev.meta["attention_mask"], part.meta["attention_mask"]])
+            continue
+        merged.append(part)
+    return merged

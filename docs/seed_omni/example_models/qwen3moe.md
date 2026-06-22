@@ -15,8 +15,9 @@ Graph: `qwen3_text_encoder.encode → qwen3_moe_llm → qwen3_text_encoder.decod
 All paths below assume the upstream HuggingFace checkpoint lives at
 `/mnt/hdfs/veomni/models/Qwen3-30B-A3B`. Adjust to your own storage.
 
-Config dir: `configs/seed_omni/Qwen/qwen3_30b_a3b/` (the `data.yaml` lives one
-level up at `configs/seed_omni/Qwen/data.yaml`, shared across Qwen launchers).
+Config dir: `configs/seed_omni/Qwen/qwen3_30b_a3b/`. As with dense Qwen3, both
+training and inference take the **same** `base.yaml`; the data list is shared
+from `configs/seed_omni/Qwen/qwen3_0.6b/data.yaml`.
 
 | File | Role |
 |------|------|
@@ -26,7 +27,7 @@ level up at `configs/seed_omni/Qwen/data.yaml`, shared across Qwen launchers).
 | `modules_infer_eager.yaml` | Inference overrides — all eager (single-process). |
 | `modules_infer_fsdp.yaml` | Inference overrides — distributed FSDP2 + EP (mirrors train). |
 | `graph_infer.yaml` | Text chat generation graph (`infer.infer_graph.infer_text`). |
-| `data.yaml` | Weighted multisource data list (shared). |
+| `../qwen3_0.6b/data.yaml` | Weighted multisource data list (shared with dense Qwen3). |
 
 ---
 
@@ -54,8 +55,26 @@ Notes:
 
 ## 2. Prepare data
 
-Same as dense Qwen3 — `configs/seed_omni/Qwen/data.yaml` (weighted multisource).
-See [`docs/seed_omni/example_models/qwen3.md`](qwen3.md) §2 and
+Same weighted multisource mix as dense Qwen3 — the shared
+`configs/seed_omni/Qwen/qwen3_0.6b/data.yaml`. Each `names` entry must match a
+preprocessor key in `veomni/data/seed_omni/preprocess.py`
+(`SEED_OMNI_PREPROCESSOR_REGISTRY`); `tulu-3-sft-mixture` maps each row's
+`messages` list to a `[role, ("text", content)]` conversation.
+
+```yaml
+# configs/seed_omni/Qwen/qwen3_0.6b/data.yaml (shared)
+sources:
+  - /mnt/hdfs/veomni/datasets/tulu-3-sft-mixture/mini_data
+names:
+  - tulu-3-sft-mixture
+schedule:
+  - { schedule_type: const, weights: [1.0] }
+level: token
+stopping_strategy: all_exhausted
+upstream_sharded: true
+```
+
+The on-disk row schema is documented in
 [`docs/seed_omni/data_format.md`](../data_format.md).
 
 ---
@@ -82,7 +101,15 @@ bash train.sh tasks/omni/train_omni.py \
   --model.model_path /mnt/hdfs/user_dir/omni_v2/ckpt/Qwen3-30B-A3B
 ```
 
-Quick smoke run (`train_omni_qwen3moe.sh`):
+Key knobs:
+
+- `--model.model_path` — split-checkpoint root from step 1.
+- `accelerator.ep_size` (in `modules_train.yaml`, `qwen3_moe_llm`) — Expert Parallel degree; must divide both the world size and `num_experts` (128).
+- `--train.global_batch_size` / `--train.micro_batch_size` — global vs. per-step micro batch.
+- `--data.max_seq_len` — packed sequence length.
+- `--train.checkpoint.output_dir` — run root; DCP checkpoints land in `<output_dir>/checkpoints/`.
+- `--train.wandb.enable false` — disable wandb for quick smoke runs.
+
 
 ```bash
 bash train.sh tasks/omni/train_omni.py \
@@ -96,9 +123,16 @@ bash train.sh tasks/omni/train_omni.py \
 
 ## 4. Resume
 
-Same as the other omni models — point `--train.checkpoint.load_path` at a
-`<output_dir>/checkpoints/global_step_N/` directory (per-module DCP shards +
-`trainer_state.pt`).
+Each save writes per-module DCP shards plus a `trainer_state.pt` (global step,
+dataloader position, RNG state) under `<output_dir>/checkpoints/global_step_N/`.
+Resume by pointing `load_path` at that directory:
+
+```bash
+bash train.sh tasks/omni/train_omni.py \
+  configs/seed_omni/Qwen/qwen3_30b_a3b/base.yaml \
+  --model.model_path /mnt/hdfs/user_dir/omni_v2/ckpt/Qwen3-30B-A3B \
+  --train.checkpoint.load_path outputs/qwen3_30b_a3b_omni_sft/checkpoints/global_step_500
+```
 
 ---
 
@@ -106,7 +140,7 @@ Same as the other omni models — point `--train.checkpoint.load_path` at a
 
 Two paths, selected by `infer.modules` (default = eager in `base.yaml`):
 
-**Eager — single process** (`infer_eager_qwen3moe.sh`): every module loads via
+**Eager — single process**: every module loads via
 `from_pretrained(device_map='auto')` and the MoE runs the eager experts loop over
 the full 128-expert weights. No torchrun / EP.
 
@@ -120,7 +154,7 @@ python tasks/omni/infer_omni.py \
   --infer.generation_kwargs.max_new_tokens 40
 ```
 
-**Distributed FSDP2 + EP** (`infer_fsdp_qwen3moe.sh`, mirrors train): override
+**Distributed FSDP2 + EP** (mirrors train): override
 `infer.modules` to the fsdp file; `OmniInferencer` auto-detects the non-eager
 modules, inits the process group, and runs each module's forward under its own
 `ParallelState` (fused MoE takes the EP all-to-all path). Needs ≥ ep GPUs.

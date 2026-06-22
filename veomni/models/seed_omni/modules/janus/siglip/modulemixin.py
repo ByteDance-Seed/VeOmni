@@ -2,10 +2,65 @@ from typing import Any, Dict, List, Optional
 
 import torch
 
-from ....conversation import ConversationItem, collect_desired_values, iter_desired_items
-from ....module import ModuleMixin, post_forward, pre_forward
+from ....conversation import ConversationItem, iter_desired_items, worker_dummy_items
+from ....module import (
+    CPUPreprocessor,
+    ModuleMixin,
+    post_forward,
+    pre_forward,
+)
 from ....tracemixin import TraceMixin
 from .configuration import JanusSiglipConfig
+
+
+_SOURCE = "janus_siglip"
+# Module-specific sentinel on a real user-image item's meta marking that the
+# worker already normalized its pixels (kept distinct per module per MR review).
+_OMNI_PIXELS = "janus_siglip_pixels"
+
+
+class JanusSiglipCPUPreprocessor(CPUPreprocessor):
+    """Worker-side image normalize for the SigLIP (understanding) tower.
+
+    Holds only the (picklable) HF image processor + a CPU zero-pixel template —
+    never the model. Runs the same normalize as ``_pixels_from_raw_images`` but on
+    **CPU** (bf16, to halve worker→main IPC); writes the pixel tensor back into
+    each ``user``-image item. When a micro-batch has **no** user image, appends a
+    ``role="dummy"`` placeholder per sample carrying the zero pixels, so the GPU
+    forward never builds dummy inputs (the FSDP gradient anchor still runs there).
+    """
+
+    def __init__(self, image_processor: Any, dtype: Any, dummy_pixel_values: torch.Tensor) -> None:
+        self._image_processor = image_processor
+        self._dtype = dtype
+        self._dummy_pixel_values = dummy_pixel_values  # CPU (C, H, W), model dtype
+
+    def __call__(self, conversation_list: list[list[ConversationItem]]) -> None:
+        todo = [
+            it
+            for it in iter_desired_items(conversation_list, types=["image"], roles=["user"])
+            if not it.meta.get(_OMNI_PIXELS)
+        ]
+        if todo:
+            pixel_values = self._image_processor(images=[it.value for it in todo], return_tensors="pt")["pixel_values"]
+            for it, px in zip(todo, pixel_values, strict=True):
+                it.value = px.to(dtype=self._dtype)
+                it.meta[_OMNI_PIXELS] = True
+        # Real user images present → no dummy needed.
+        if any(iter_desired_items(conversation_list, types=["image"], roles=["user"])):
+            return
+        # No real user images anywhere → append one dummy placeholder per sample.
+        if worker_dummy_items(conversation_list, _SOURCE):
+            return
+        for sample in conversation_list:
+            sample.append(
+                ConversationItem(
+                    type="image",
+                    value=self._dummy_pixel_values,
+                    role="dummy",
+                    meta={"source": _SOURCE, _OMNI_PIXELS: True},
+                )
+            )
 
 
 class JanusSiglipModuleMixin(ModuleMixin):
@@ -15,16 +70,39 @@ class JanusSiglipModuleMixin(ModuleMixin):
 
     # Training hooks
 
+    def build_cpu_preprocessor(self) -> Optional[CPUPreprocessor]:
+        """Worker-side image normalize (see :class:`JanusSiglipCPUPreprocessor`)."""
+        if getattr(self, "_image_processor", None) is None:
+            return None
+        cfg = self.config.vision_config
+        dummy = torch.zeros(cfg.num_channels, cfg.image_size, cfg.image_size, dtype=self.dtype)
+        return JanusSiglipCPUPreprocessor(self._image_processor, self.dtype, dummy)
+
     @pre_forward("forward")
     def forward_pre(
         self,
         conversation_list: Optional[list[list[ConversationItem]]] = None,
     ) -> Dict[str, Any]:
         self._conversation_carrier = conversation_list
-        pixel_values = self._pixels_from_raw_images(
-            collect_desired_values(conversation_list, types=["image"], roles=["user"])
-        )
-        return {"pixel_values": pixel_values}
+        items = list(iter_desired_items(conversation_list, types=["image"], roles=["user"]))
+        if items and all(it.meta.get(_OMNI_PIXELS) for it in items):
+            # Worker already normalized: just stack + move to device.
+            pixel_values = torch.stack([it.value for it in items], dim=0).to(
+                device=self.device, dtype=self.dtype, non_blocking=True
+            )
+            return {"pixel_values": pixel_values, "is_dummy": False}
+        if items:
+            # Eager / no-worker path with real images: normalize here.
+            return {"pixel_values": self._pixels_from_raw_images([it.value for it in items]), "is_dummy": False}
+        # No real user images: consume the worker-built dummy placeholder if present
+        # (one dummy forward, batch 1); else fall back to the modeling device dummy.
+        dummy_items = worker_dummy_items(conversation_list, _SOURCE)
+        if dummy_items:
+            pixel_values = (
+                dummy_items[0].value.unsqueeze(0).to(device=self.device, dtype=self.dtype, non_blocking=True)
+            )
+            return {"pixel_values": pixel_values, "is_dummy": True}
+        return {"pixel_values": None, "is_dummy": None}
 
     @post_forward("forward")
     def forward_post(
@@ -37,15 +115,22 @@ class JanusSiglipModuleMixin(ModuleMixin):
         if is_dummy:
             assert image_embeds.shape[0] == 1
             image_embeds = image_embeds.squeeze(0)
-            for sample in conversation:
-                sample.append(
-                    ConversationItem(
-                        type="image",
-                        value=image_embeds,
-                        role="dummy",
-                        meta={"source": "janus_siglip"},
+            dummy_items = worker_dummy_items(conversation, _SOURCE)
+            if dummy_items:
+                # Worker pre-created the placeholders: overwrite zero pixels → embed.
+                for item in dummy_items:
+                    item.value = image_embeds
+            else:
+                # Eager / no-worker fallback: append the dummy placeholder per sample.
+                for sample in conversation:
+                    sample.append(
+                        ConversationItem(
+                            type="image",
+                            value=image_embeds,
+                            role="dummy",
+                            meta={"source": _SOURCE},
+                        )
                     )
-                )
         else:
             items = list(iter_desired_items(conversation, types=["image"], roles=["user"]))
             for item, emb in zip(items, image_embeds, strict=True):
