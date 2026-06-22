@@ -17,6 +17,7 @@ Transformers 原仓提供 MiniMax M3 VL reference modeling 和通用训练组件
 脚本：
 
 - `scripts/multimodal/verify_minimax_m3_vl_precision_parity.py`
+- `scripts/multimodal/verify_minimax_m3_vl_checkpoint_payload_parity.py`
 
 本地 CPU 证据：
 
@@ -144,14 +145,42 @@ NPU 通过标准：
 
 现有 PR 已完成 public checkpoint index 和 safetensors header 级验证，但还没有下载并加载 869 GB tensor payload。因此真实 checkpoint parity 仍是生产完成前的必需门禁。
 
-推荐分阶段执行：
+脚本：
+
+- `scripts/multimodal/verify_minimax_m3_vl_checkpoint_payload_parity.py`
+
+推荐分阶段执行。
 
 1. **抽样 shard payload parity**
    - 下载覆盖 language embedding、至少一层 attention、至少一个 sparse MoE 层、projector、`lm_head` 的 safetensors shard；
    - 用 `scripts/multimodal/verify_minimax_m3_vl_checkpoint_index.py --verify-shard-metadata` 先确认 metadata；
-   - 通过 `MiniMaxM3VLCheckpointTensorConverter` 把 public key 转为 VeOmni generated key；
-   - 将相同抽样 tensor 分别加载到 HF reference 和 VeOmni candidate；
-   - 固定 toy/micro prompt 比较 logits/top-k。
+   - 通过 payload parity 脚本读取真实 tensor payload，经 `MiniMaxM3VLCheckpointTensorConverter` 转成 VeOmni generated key；
+   - 检查 converted tensor key、shape、dtype group、SHA256/value stats，并输出 JSON 证据；
+   - 若抽样只覆盖部分 expert/gate-up group，可先加 `--allow-incomplete-groups` 产出诊断 JSON；正式通过证据必须覆盖完整 group，不应依赖该开关。
+
+示例命令：
+
+```bash
+cd /path/to/VeOmni
+export PYTHONPATH=$PWD
+
+python scripts/multimodal/verify_minimax_m3_vl_checkpoint_payload_parity.py \
+  --checkpoint-dir /data/checkpoints/MiniMax-M3 \
+  --config-path /data/checkpoints/MiniMax-M3 \
+  --include-key-regex 'language_model\.model\.embed_tokens\.weight|language_model\.lm_head\.weight|multi_modal_projector\.|patch_merge_mlp\.' \
+  --include-key-regex 'language_model\.model\.layers\.0\.(self_attn|mlp|block_sparse_moe)\.' \
+  --torch-dtype bfloat16 \
+  --output-json docs/usage/support_new_models/artifacts/minimax_m3_vl_precision_parity/real_checkpoint_payload_sample.json
+```
+
+抽样 payload 通过标准：
+
+- 命令 exit code 为 `0`；
+- JSON 中 `passed=true`；
+- `payload.converter_finalize_error=null`；
+- `metadata_comparison.shape_mismatch_count=0`；
+- `metadata_comparison.missing_model_key_count=0`；
+- dtype mismatch 仅允许为已解释的 checkpoint-to-runtime cast，例如 router/gate `F32 -> BF16`。
 
 2. **全量 payload load parity**
    - 下载完整 `59` 个 public safetensors shard；
@@ -162,6 +191,37 @@ NPU 通过标准：
      - top-k token ids；
      - greedy decode 首 N token；
      - image/video prompt 的 projector output 和 final logits。
+
+完整 text-prompt forward 示例：
+
+```bash
+cd /path/to/VeOmni
+export PYTHONPATH=$PWD
+
+python scripts/multimodal/verify_minimax_m3_vl_checkpoint_payload_parity.py \
+  --checkpoint-dir /data/checkpoints/MiniMax-M3 \
+  --config-path /data/checkpoints/MiniMax-M3 \
+  --mode forward \
+  --device cuda \
+  --torch-dtype bfloat16 \
+  --prompt-ids 1,1209,318,257,1332 \
+  --top-k 8 \
+  --max-new-tokens 8 \
+  --atol 2e-4 --rtol 2e-4 \
+  --confirm-full-load \
+  --output-json docs/usage/support_new_models/artifacts/minimax_m3_vl_precision_parity/real_checkpoint_forward_cuda.json
+```
+
+完整 forward 通过标准：
+
+- payload 部分同样 `passed=true`；
+- `forward.state_dict_load.missing_keys=[]`；
+- `forward.state_dict_load.unexpected_keys=[]`；
+- `forward.checks[name=forward.logits].allclose=true`；
+- `forward.checks[name=forward.last_token_topk_ids].equal=true`；
+- `forward.checks[name=generate.greedy_ids].equal=true`。
+
+NPU 上复跑完整 forward 时把 `--device cuda` 改为 `--device npu`，先完成本手册 NPU runtime gates，并根据 backend 数值误差使用 NPU tolerance。NPU JSON 必须保留 `device`、tolerance、prompt ids、top-k、greedy ids 和 runtime 证据路径。
 
 3. **训练步 parity**
    - 选择小 batch SFT fixture；
