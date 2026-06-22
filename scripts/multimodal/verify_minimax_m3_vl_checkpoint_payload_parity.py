@@ -95,6 +95,18 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--torch-dtype", default="bfloat16", choices=("float32", "float16", "bfloat16"))
     parser.add_argument("--device", default="cpu", choices=("cpu", "cuda", "npu"))
+    parser.add_argument(
+        "--reference-device",
+        default=None,
+        choices=("cpu", "cuda", "npu"),
+        help="Device for upstream HF reference forward. Defaults to --device.",
+    )
+    parser.add_argument(
+        "--candidate-device",
+        default=None,
+        choices=("cpu", "cuda", "npu"),
+        help="Device for VeOmni converted-checkpoint candidate forward. Defaults to --device.",
+    )
     parser.add_argument("--output-json", default=DEFAULT_OUTPUT_JSON)
     parser.add_argument("--allow-incomplete-groups", action="store_true")
     parser.add_argument("--fail-on-dtype-mismatch", action="store_true")
@@ -913,6 +925,62 @@ def add_optional_hidden_check(
     checks.append(check)
 
 
+def add_exact_tensor_check(checks: list[dict[str, Any]], name: str, hf_value: Any, veomni_value: Any) -> None:
+    import torch
+
+    hf_cpu = hf_value.detach().cpu()
+    veomni_cpu = veomni_value.detach().cpu()
+    checks.append(
+        {
+            "name": name,
+            "kind": "exact",
+            "hf": hf_cpu.tolist(),
+            "veomni": veomni_cpu.tolist(),
+            "equal": bool(torch.equal(hf_cpu, veomni_cpu)),
+        }
+    )
+
+
+def add_input_contract_checks(
+    checks: list[dict[str, Any]],
+    hf_batch: dict[str, Any],
+    veomni_batch: dict[str, Any],
+    *,
+    atol: float,
+    rtol: float,
+) -> None:
+    for name in ("input_ids", "attention_mask", "position_ids", "image_grid_thw", "video_grid_thw"):
+        if name in hf_batch or name in veomni_batch:
+            if name not in hf_batch or name not in veomni_batch:
+                checks.append(
+                    {
+                        "name": f"input.{name}",
+                        "kind": "missing",
+                        "equal": False,
+                        "hf_present": name in hf_batch,
+                        "veomni_present": name in veomni_batch,
+                    }
+                )
+                continue
+            add_exact_tensor_check(checks, f"input.{name}", hf_batch[name], veomni_batch[name])
+    for name in ("pixel_values", "pixel_values_videos"):
+        if name in hf_batch or name in veomni_batch:
+            if name not in hf_batch or name not in veomni_batch:
+                checks.append(
+                    {
+                        "name": f"input.{name}",
+                        "kind": "missing",
+                        "allclose": False,
+                        "hf_present": name in hf_batch,
+                        "veomni_present": name in veomni_batch,
+                    }
+                )
+                continue
+            check = {"name": f"input.{name}", "kind": "tensor"}
+            check.update(tensor_stats(hf_batch[name], veomni_batch[name], atol=atol, rtol=rtol))
+            checks.append(check)
+
+
 def run_forward_parity(
     *,
     args: argparse.Namespace,
@@ -936,7 +1004,9 @@ def run_forward_parity(
         raise RuntimeError("--mode forward requires --confirm-full-load because the public payload is large")
 
     dtype = torch_dtype_from_name(args.torch_dtype)
-    device = get_device(args.device)
+    reference_device_name = args.reference_device or args.device
+    candidate_device_name = args.candidate_device or args.device
+    reference_device = get_device(reference_device_name)
 
     hf_config = patch_eager_config(AutoConfig.from_pretrained(config_path), args)
     prompt_ids = build_prompt_ids(hf_config, args)
@@ -945,12 +1015,12 @@ def run_forward_parity(
         config=hf_config,
         torch_dtype=dtype,
     )
-    hf_model.to(device)
+    hf_model.to(reference_device)
     hf_model.eval()
 
-    batch = build_forward_batch(hf_config, args, prompt_ids, device)
+    hf_batch = build_forward_batch(hf_config, args, prompt_ids, reference_device)
     with torch.no_grad():
-        hf_outputs = hf_model(**batch)
+        hf_outputs = hf_model(**hf_batch)
     hf_logits = hf_outputs.logits.detach().cpu()
     hf_topk = torch.topk(hf_outputs.logits[:, -1, :], k=args.top_k, dim=-1).indices.detach().cpu()
     hf_image_hidden_states = getattr(hf_outputs, "image_hidden_states", None)
@@ -959,12 +1029,20 @@ def run_forward_parity(
         hf_image_hidden_states = hf_image_hidden_states.detach().cpu()
     if hf_video_hidden_states is not None:
         hf_video_hidden_states = hf_video_hidden_states.detach().cpu()
-    input_contract = batch_contract(batch)
-    hf_greedy = greedy_decode_ids(hf_model, hf_config, args, prompt_ids, device=device, max_new_tokens=args.max_new_tokens)
+    hf_input_contract = batch_contract(hf_batch)
+    hf_greedy = greedy_decode_ids(
+        hf_model,
+        hf_config,
+        args,
+        prompt_ids,
+        device=reference_device,
+        max_new_tokens=args.max_new_tokens,
+    )
     del hf_outputs
     del hf_model
-    release_accelerator_memory(device)
+    release_accelerator_memory(reference_device)
 
+    candidate_device = get_device(candidate_device_name)
     veomni_config = patch_eager_config(get_model_config(config_path), args)
     veomni_cls = get_model_class(veomni_config)
     veomni_model = veomni_cls(veomni_config)
@@ -981,15 +1059,16 @@ def run_forward_parity(
         metadata_cache_dir=args.metadata_cache_dir,
         max_report_tensors=args.max_report_tensors,
     )
-    release_accelerator_memory(device)
+    release_accelerator_memory(candidate_device)
 
-    veomni_model.to(device)
+    veomni_model.to(candidate_device)
     veomni_model.eval()
-    batch = build_forward_batch(veomni_config, args, prompt_ids, device)
+    veomni_batch = build_forward_batch(veomni_config, args, prompt_ids, candidate_device)
     with torch.no_grad():
-        veomni_outputs = veomni_model(**batch)
+        veomni_outputs = veomni_model(**veomni_batch)
 
     checks: list[dict[str, Any]] = []
+    add_input_contract_checks(checks, hf_batch, veomni_batch, atol=0.0, rtol=0.0)
     logits_check = {"name": "forward.logits", "kind": "tensor"}
     logits_check.update(tensor_stats(hf_logits, veomni_outputs.logits, atol=args.atol, rtol=args.rtol))
     checks.append(logits_check)
@@ -1026,7 +1105,7 @@ def run_forward_parity(
         veomni_config,
         args,
         prompt_ids,
-        device=device,
+        device=candidate_device,
         max_new_tokens=args.max_new_tokens,
     )
     checks.append(
@@ -1041,7 +1120,9 @@ def run_forward_parity(
 
     failed_checks = [item["name"] for item in checks if not item.get("allclose", item.get("equal", False))]
     forward_report = {
-        "device": str(device),
+        "device": str(candidate_device),
+        "reference_device": str(reference_device),
+        "candidate_device": str(candidate_device),
         "prompt_kind": args.prompt_kind,
         "prompt_ids": prompt_ids,
         "seed": args.seed if args.prompt_kind == "multimodal" else None,
@@ -1049,7 +1130,10 @@ def run_forward_parity(
         "max_new_tokens": args.max_new_tokens,
         "hf_model_class": f"{HFMiniMaxM3SparseForConditionalGeneration.__module__}.MiniMaxM3SparseForConditionalGeneration",
         "veomni_model_class": f"{veomni_cls.__module__}.{veomni_cls.__name__}",
-        "input_contract": input_contract,
+        "input_contract": {
+            "reference": hf_input_contract,
+            "candidate": batch_contract(veomni_batch),
+        },
         "state_dict_load": {
             "missing_keys": metadata_comparison.get("missing_state_keys_sample", []),
             "missing_key_count": metadata_comparison.get("missing_state_key_count", 0),
@@ -1065,7 +1149,7 @@ def run_forward_parity(
     }
     del veomni_outputs
     del veomni_model
-    release_accelerator_memory(device)
+    release_accelerator_memory(candidate_device)
     return forward_report, payload_summary, metadata_comparison
 
 
@@ -1154,6 +1238,8 @@ def main() -> None:
         "date": started_at,
         "mode": args.mode,
         "device": forward_report["device"] if forward_report is not None else args.device,
+        "reference_device": forward_report["reference_device"] if forward_report is not None else None,
+        "candidate_device": forward_report["candidate_device"] if forward_report is not None else None,
         "full_checkpoint_load_executed": bool(args.mode == "forward"),
         "num_checks": forward_report["num_checks"] if forward_report is not None else None,
         "failed": forward_report["failed"] if forward_report is not None else None,
