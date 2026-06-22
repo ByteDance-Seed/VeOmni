@@ -27,6 +27,8 @@ Common options:
   --require-free-hbm-mb N     Require at least N free HBM MB on one NPU. Default: 0.
   --npu-smi-cmd CMD           Command that prints npu-smi info for preflight evidence.
                               Default: auto-detect npu-smi info.
+  --official-reference-revision REV
+                              Optional MiniMaxAI/MiniMax-M3 HF commit revision to record in preflight.
   --python-cmd CMD            Python executable. Default: python3.
   --expected-shards N         Preflight shard-count gate. Default: 59.
   --expected-min-weight-map-keys N
@@ -65,6 +67,7 @@ PREFLIGHT_JSON=""
 REQUIRE_FREE_DISK_GB="0"
 REQUIRE_FREE_HBM_MB="0"
 NPU_SMI_CMD="${MINIMAX_NPU_SMI_CMD:-}"
+OFFICIAL_REFERENCE_REVISION="${MINIMAX_M3_REFERENCE_REVISION:-}"
 PYTHON_CMD="python3"
 EXPECTED_SHARDS="59"
 EXPECTED_MIN_WEIGHT_MAP_KEYS="20000"
@@ -144,6 +147,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --npu-smi-cmd)
       NPU_SMI_CMD="$2"
+      shift 2
+      ;;
+    --official-reference-revision)
+      OFFICIAL_REFERENCE_REVISION="$2"
       shift 2
       ;;
     --python-cmd)
@@ -244,6 +251,9 @@ preflight_cmd=(
 )
 if [[ -n "$NPU_SMI_CMD" ]]; then
   preflight_cmd+=(--npu-smi-cmd "$NPU_SMI_CMD")
+fi
+if [[ -n "$OFFICIAL_REFERENCE_REVISION" ]]; then
+  preflight_cmd+=(--official-reference-revision "$OFFICIAL_REFERENCE_REVISION")
 fi
 
 forward_cmd=(

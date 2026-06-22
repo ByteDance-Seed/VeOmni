@@ -30,6 +30,8 @@ Common options:
   --require-free-disk-gb N    Require N GiB free before full checkpoint work. Default: 0.
   --require-free-hbm-mb N     Require free HBM MB for NPU preflight gates. Default: 0.
   --npu-smi-cmd CMD           Command that prints npu-smi info for preflight evidence.
+  --official-reference-revision REV
+                              Optional MiniMaxAI/MiniMax-M3 HF commit revision to record in preflight.
   --min-devices N             Minimum devices for multi-card parity. Default: 8.
   --python-cmd CMD            Python executable. Default: python3.
   --dry-run                   Print commands without executing them.
@@ -65,6 +67,7 @@ RTOL=""
 REQUIRE_FREE_DISK_GB="0"
 REQUIRE_FREE_HBM_MB="0"
 NPU_SMI_CMD="${MINIMAX_NPU_SMI_CMD:-}"
+OFFICIAL_REFERENCE_REVISION="${MINIMAX_M3_REFERENCE_REVISION:-}"
 MIN_DEVICES="8"
 PYTHON_CMD="python3"
 DRY_RUN=0
@@ -133,6 +136,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --npu-smi-cmd)
       NPU_SMI_CMD="$2"
+      shift 2
+      ;;
+    --official-reference-revision)
+      OFFICIAL_REFERENCE_REVISION="$2"
       shift 2
       ;;
     --min-devices)
@@ -215,6 +222,9 @@ final_audit_cmd=(
 if [[ -n "$NPU_SMI_CMD" ]]; then
   full_cmd+=(--npu-smi-cmd "$NPU_SMI_CMD")
   multicard_cmd+=(--npu-smi-cmd "$NPU_SMI_CMD")
+fi
+if [[ -n "$OFFICIAL_REFERENCE_REVISION" ]]; then
+  full_cmd+=(--official-reference-revision "$OFFICIAL_REFERENCE_REVISION")
 fi
 if [[ -n "$ATOL" ]]; then
   full_cmd+=(--atol "$ATOL")

@@ -46,6 +46,7 @@ Upstream PR:
 - `docs/usage/support_new_models/minimax_m3_vl_model_migration_design.md`
 - `docs/usage/support_new_models/minimax_m3_vl_reduced_layer_sft_report.md`
 - `docs/usage/support_new_models/minimax_m3_vl_precision_parity_guide.md`
+- `docs/usage/support_new_models/minimax_m3_vl_target_machine_runbook.md`
 - `tests/data/multimodal/test_minimax_m3_vl_data_transform.py`
 - `tests/data/test_mm_metadata.py`
 - `tests/models/test_models_patch.py`
@@ -616,6 +617,7 @@ Artifacts:
 - [toy_hf_veomni_parity_npu.json](./artifacts/minimax_m3_vl_precision_parity/toy_hf_veomni_parity_npu.json)
 - [toy_hf_cpu_veomni_npu_parity.json](./artifacts/minimax_m3_vl_precision_parity/toy_hf_cpu_veomni_npu_parity.json)
 - [minimax_m3_vl_precision_parity_guide.md](./minimax_m3_vl_precision_parity_guide.md)
+- [minimax_m3_vl_target_machine_runbook.md](./minimax_m3_vl_target_machine_runbook.md)
 
 Real checkpoint payload parity tooling:
 
