@@ -43,6 +43,11 @@ FORWARD_CHECKS = {
     "forward.image_hidden_states",
     "forward.video_hidden_states",
 }
+PROJECTOR_CHECKS = {
+    "projector.record_count",
+    "projector.0.output",
+    "projector.1.output",
+}
 INPUT_CHECKS = {
     "input.input_ids",
     "input.attention_mask",
@@ -227,7 +232,14 @@ def main() -> None:
     toy_npu_path = args.artifacts_dir / TOY_NPU_ARTIFACT
     toy_cpu_npu_path = args.artifacts_dir / TOY_CPU_NPU_ARTIFACT
 
-    toy_cpu = safe_check(TOY_CPU_ARTIFACT, check_toy_precision, toy_cpu_path, expect_reference="cpu", expect_candidate="cpu")
+    toy_cpu = safe_check(
+        TOY_CPU_ARTIFACT,
+        check_toy_precision,
+        toy_cpu_path,
+        expect_reference="cpu",
+        expect_candidate="cpu",
+        require_projector=True,
+    )
     toy_npu = safe_check(TOY_NPU_ARTIFACT, check_toy_precision, toy_npu_path, expect_reference="npu:0", expect_candidate="npu:0")
     toy_cpu_npu = safe_check(
         TOY_CPU_NPU_ARTIFACT,
@@ -242,7 +254,7 @@ def main() -> None:
     ]
     input_checks = [safe_check(TOY_CPU_ARTIFACT, check_toy_named_checks, toy_cpu_path, INPUT_CHECKS)]
     forward_checks = [
-        safe_check(TOY_CPU_ARTIFACT, check_toy_named_checks, toy_cpu_path, FORWARD_CHECKS | ROUTER_CHECKS),
+        safe_check(TOY_CPU_ARTIFACT, check_toy_named_checks, toy_cpu_path, FORWARD_CHECKS | PROJECTOR_CHECKS | ROUTER_CHECKS),
         safe_check(TOY_CPU_NPU_ARTIFACT, check_toy_named_checks, toy_cpu_npu_path, FORWARD_CHECKS | ROUTER_CHECKS),
     ]
     backward_checks = [

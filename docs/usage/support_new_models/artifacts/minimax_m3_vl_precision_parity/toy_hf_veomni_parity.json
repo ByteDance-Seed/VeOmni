@@ -263,6 +263,39 @@
     },
     {
       "equal": true,
+      "hf": 2,
+      "kind": "exact",
+      "name": "projector.record_count",
+      "veomni": 2
+    },
+    {
+      "allclose": true,
+      "atol": 1e-05,
+      "kind": "tensor",
+      "max_abs": 0.0,
+      "max_rel": 0.0,
+      "name": "projector.0.output",
+      "rtol": 1e-05,
+      "shape": [
+        1,
+        32
+      ]
+    },
+    {
+      "allclose": true,
+      "atol": 1e-05,
+      "kind": "tensor",
+      "max_abs": 0.0,
+      "max_rel": 0.0,
+      "name": "projector.1.output",
+      "rtol": 1e-05,
+      "shape": [
+        1,
+        32
+      ]
+    },
+    {
+      "equal": true,
       "hf": 1,
       "kind": "exact",
       "name": "router.record_count",
@@ -647,12 +680,12 @@
     }
   ],
   "config_path": "./tests/toy_config/minimax_m3_vl_toy/config.json",
-  "date": "2026-06-22T14:25:57Z",
+  "date": "2026-06-22T16:02:32Z",
   "device": "cpu",
   "failed": [],
   "hf_model_class": "transformers.models.minimax_m3_vl.modeling_minimax_m3_vl.MiniMaxM3SparseForConditionalGeneration",
   "image_token_id": 250,
-  "num_checks": 38,
+  "num_checks": 41,
   "optimizer": {
     "betas": [
       0.9,
@@ -677,7 +710,7 @@
     "machine": "aarch64",
     "platform": "Linux-5.15.0-94-generic-aarch64-with-glibc2.35",
     "python": "3.11.15 (main, Jun 11 2026, 04:04:24) [Clang 22.1.3 ]",
-    "python_executable": "/home/t00906153/super/.cache/uv/builds-v0/.tmpBeGZzI/bin/python",
+    "python_executable": "/home/t00906153/super/.cache/uv/builds-v0/.tmpHTXfiq/bin/python",
     "torch_npu_available": null,
     "torch_npu_device_count": null,
     "torch_npu_error": null,

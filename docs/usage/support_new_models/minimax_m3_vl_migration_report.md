@@ -604,14 +604,14 @@ Official MiniMax loader vs VeOmni generated toy precision parity:
 ```json
 {
   "passed": true,
-  "num_checks": 38,
+  "num_checks": "41 for refreshed CPU artifact; 38 for existing NPU tolerance artifacts",
   "device": "cpu / npu:0",
   "reference": "transformers.models.minimax_m3_vl.modeling_minimax_m3_vl.MiniMaxM3SparseForConditionalGeneration",
   "candidate": "veomni.models.transformers.minimax_m3_vl.generated.patched_modeling_minimax_m3_vl_gpu.MiniMaxM3SparseForConditionalGeneration"
 }
 ```
 
-This parity gate uses one deterministic mixed image+video toy batch and the same randomly initialized state dict for both models. It checks input ids, attention mask and position-id inputs, VeOmni multimodal metadata contract, forward loss/logits/projected image/video hidden states, MoE router logits/top-k weights/selected experts, key gradients, and one AdamW parameter-update delta. CPU parity passes with `torch==2.7.1` and `transformers==5.12.0`; single-card Ascend NPU same-device parity passes in `quay.io/ascend/vllm-ascend:v0.20.2rc1` with `torch_npu==2.10.0`, `transformers==5.12.0`, and NPU tolerances `forward=5e-4`, `grad=1e-3`, `param=1e-3`. CPU reference loader vs NPU VeOmni candidate cross-backend parity also passes with `reference_device=cpu`, `candidate_device=npu:0`, `lr=1e-5`, and tolerances `forward=5e-4`, `grad=1e-3`, `param=1e-4`. GPU, real-checkpoint, and multi-card reruns are documented in the guide.
+This parity gate uses one deterministic mixed image+video toy batch and the same randomly initialized state dict for both models. It checks input ids, attention mask and position-id inputs, VeOmni multimodal metadata contract, forward loss/logits/projected image/video hidden states, direct `MiniMaxM3VLMultiModalProjector` hook outputs, MoE router logits/top-k weights/selected experts, key gradients, and one AdamW parameter-update delta. CPU parity passes with `torch==2.7.1` and `transformers==5.12.0`; single-card Ascend NPU same-device parity passes in `quay.io/ascend/vllm-ascend:v0.20.2rc1` with `torch_npu==2.10.0`, `transformers==5.12.0`, and NPU tolerances `forward=5e-4`, `grad=1e-3`, `param=1e-3`. CPU reference loader vs NPU VeOmni candidate cross-backend parity also passes with `reference_device=cpu`, `candidate_device=npu:0`, `lr=1e-5`, and tolerances `forward=5e-4`, `grad=1e-3`, `param=1e-4`; those existing NPU artifacts predate the direct projector hook, and target-machine reruns with the latest scripts require projector checks in the target toy bundle audit. GPU, real-checkpoint, and multi-card reruns are documented in the guide.
 
 Artifacts:
 

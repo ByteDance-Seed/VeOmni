@@ -14,6 +14,18 @@ from typing import Any
 
 
 DEFAULT_ROOT_NAME = "minimax_m3_vl_target_precision_suite"
+REQUIRED_TARGET_TOY_CHECKS = {
+    "forward.loss",
+    "forward.logits",
+    "forward.image_hidden_states",
+    "forward.video_hidden_states",
+    "projector.record_count",
+    "projector.0.output",
+    "projector.1.output",
+    "router.record_count",
+    "router.0.logits",
+    "router.0.selected_experts",
+}
 
 
 def parse_args() -> argparse.Namespace:
@@ -246,6 +258,9 @@ def audit_target_toy(suite_root: Path, issues: list[str], required: bool) -> dic
     add_issue(issues, data.get("failed") == [], "target toy parity has failed checks")
     add_issue(issues, data.get("reference_device") == "cpu", "target toy parity reference_device is not cpu")
     add_issue(issues, str(data.get("candidate_device", "")).startswith("npu"), "target toy parity candidate is not npu")
+    check_names = {item.get("name") for item in data.get("checks", [])}
+    missing_checks = sorted(REQUIRED_TARGET_TOY_CHECKS - check_names)
+    add_issue(issues, not missing_checks, f"target toy parity missing checks: {missing_checks}")
     return {"path": str(path), "present": True}
 
 

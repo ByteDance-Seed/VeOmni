@@ -225,6 +225,24 @@ def install_router_hooks(model: Any) -> tuple[list[dict[str, Any]], list[Any]]:
     return records, handles
 
 
+def install_projector_hooks(model: Any) -> tuple[list[dict[str, Any]], list[Any]]:
+    records: list[dict[str, Any]] = []
+    handles = []
+
+    def hook(module: Any, _inputs: Any, output: Any) -> None:
+        records.append(
+            {
+                "module": module.__class__.__name__,
+                "output": output.detach().clone(),
+            }
+        )
+
+    for module in model.modules():
+        if module.__class__.__name__ == "MiniMaxM3VLMultiModalProjector":
+            handles.append(module.register_forward_hook(hook))
+    return records, handles
+
+
 def remove_hooks(handles: Iterable[Any]) -> None:
     for handle in handles:
         handle.remove()
@@ -339,14 +357,18 @@ def main() -> None:
         }
     )
 
-    hf_router_records, hf_handles = install_router_hooks(hf_model)
-    veomni_router_records, veomni_handles = install_router_hooks(veomni_model)
+    hf_router_records, hf_router_handles = install_router_hooks(hf_model)
+    veomni_router_records, veomni_router_handles = install_router_hooks(veomni_model)
+    hf_projector_records, hf_projector_handles = install_projector_hooks(hf_model)
+    veomni_projector_records, veomni_projector_handles = install_projector_hooks(veomni_model)
     try:
         hf_outputs = hf_model(**hf_batch)
         veomni_outputs = veomni_model(**veomni_batch)
     finally:
-        remove_hooks(hf_handles)
-        remove_hooks(veomni_handles)
+        remove_hooks(hf_router_handles)
+        remove_hooks(veomni_router_handles)
+        remove_hooks(hf_projector_handles)
+        remove_hooks(veomni_projector_handles)
 
     add_tensor_check(checks, "forward.loss", hf_outputs.loss, veomni_outputs.loss, atol=args.atol, rtol=args.rtol)
     add_tensor_check(checks, "forward.logits", hf_outputs.logits, veomni_outputs.logits, atol=args.atol, rtol=args.rtol)
@@ -366,6 +388,25 @@ def main() -> None:
         atol=args.atol,
         rtol=args.rtol,
     )
+
+    checks.append(
+        {
+            "name": "projector.record_count",
+            "kind": "exact",
+            "equal": len(hf_projector_records) == len(veomni_projector_records),
+            "hf": len(hf_projector_records),
+            "veomni": len(veomni_projector_records),
+        }
+    )
+    for index, (hf_record, veomni_record) in enumerate(zip(hf_projector_records, veomni_projector_records, strict=False)):
+        add_tensor_check(
+            checks,
+            f"projector.{index}.output",
+            hf_record["output"],
+            veomni_record["output"],
+            atol=args.atol,
+            rtol=args.rtol,
+        )
 
     checks.append(
         {

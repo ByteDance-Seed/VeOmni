@@ -18,7 +18,7 @@ from typing import Any
 
 
 DEFAULT_ARTIFACTS_DIR = Path("docs/usage/support_new_models/artifacts/minimax_m3_vl_precision_parity")
-REQUIRED_TOY_CHECKS = {
+REQUIRED_TOY_BASE_CHECKS = {
     "input.input_ids",
     "input.attention_mask",
     "input.position_ids",
@@ -57,6 +57,11 @@ REQUIRED_TOY_CHECKS = {
     "optimizer_delta.model.multi_modal_projector.merge_linear_1.weight",
     "optimizer_delta.model.multi_modal_projector.merge_linear_2.weight",
     "optimizer_delta.lm_head.weight",
+}
+REQUIRED_TOY_PROJECTOR_CHECKS = {
+    "projector.record_count",
+    "projector.0.output",
+    "projector.1.output",
 }
 REQUIRED_CHECKPOINT_FORWARD_CHECKS = {
     "input.input_ids",
@@ -177,7 +182,13 @@ def check_runtime_for_npu(data: dict[str, Any], issues: list[str], prefix: str) 
     )
 
 
-def check_toy_precision(path: Path, *, expect_reference: str, expect_candidate: str | None) -> dict[str, Any]:
+def check_toy_precision(
+    path: Path,
+    *,
+    expect_reference: str,
+    expect_candidate: str | None,
+    require_projector: bool = False,
+) -> dict[str, Any]:
     data = load_json(path)
     issues: list[str] = []
     prefix = path.name
@@ -194,7 +205,8 @@ def check_toy_precision(path: Path, *, expect_reference: str, expect_candidate: 
     add_issue(issues, state_load.get("unexpected_keys") == [], f"{prefix}: unexpected state_dict keys")
 
     check_names = {item.get("name") for item in data.get("checks", [])}
-    missing_checks = sorted(REQUIRED_TOY_CHECKS - check_names)
+    required_checks = REQUIRED_TOY_BASE_CHECKS | (REQUIRED_TOY_PROJECTOR_CHECKS if require_projector else set())
+    missing_checks = sorted(required_checks - check_names)
     add_issue(issues, not missing_checks, f"{prefix}: missing checks {missing_checks}")
     add_issue(issues, (data.get("optimizer") or {}).get("name") == "AdamW", f"{prefix}: missing AdamW optimizer evidence")
     if "npu" in str(data.get("candidate_device")):
@@ -460,7 +472,12 @@ def main() -> None:
     artifacts_dir = args.artifacts_dir
     results = {
         "toy_precision": [
-            check_toy_precision(artifacts_dir / "toy_hf_veomni_parity.json", expect_reference="cpu", expect_candidate="cpu"),
+            check_toy_precision(
+                artifacts_dir / "toy_hf_veomni_parity.json",
+                expect_reference="cpu",
+                expect_candidate="cpu",
+                require_projector=True,
+            ),
             check_toy_precision(artifacts_dir / "toy_hf_veomni_parity_npu.json", expect_reference="npu:0", expect_candidate="npu:0"),
             check_toy_precision(
                 artifacts_dir / "toy_hf_cpu_veomni_npu_parity.json",
