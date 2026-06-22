@@ -473,13 +473,27 @@ cd /path/to/VeOmni
 
 scripts/multimodal/run_minimax_m3_vl_multicard_parity.sh \
   --min-devices 8 \
+  --require-free-hbm-mb 4096 \
+  --output-dir docs/usage/support_new_models/artifacts/minimax_m3_vl_multicard_parity
+```
+
+如果目标机的 `npu-smi info` 只能通过 root 运行，可以显式传入 root-only preflight 命令：
+
+```bash
+cd /path/to/VeOmni
+
+scripts/multimodal/run_minimax_m3_vl_multicard_parity.sh \
+  --min-devices 8 \
+  --require-free-hbm-mb 4096 \
+  --npu-smi-cmd 'sudo -n /usr/local/sbin/npu-smi info' \
   --output-dir docs/usage/support_new_models/artifacts/minimax_m3_vl_multicard_parity
 ```
 
 通过标准：
 
 - `multicard_parity_summary.json` 中 `passed=true`；
-- `preflight.returncode=0`，且 log 中 `device_count>=8`、`transformers_version>=5.12.0`；
+- `preflight.returncode=0`，且 log 中 `device_count>=8`、`transformers_version>=5.12.0`、`errors=[]`；
+- 如设置 `--require-free-hbm-mb`，preflight log 中 `npu_smi.returncode=0`，且 `npu_smi.devices_with_required_free_hbm>=8`；
 - `dummy_forward.returncode=0`；
 - `e2e_align.returncode=0`，并且该命令必须使用 `--runxfail`，不能让 xfail marker 吞掉真实失败；
 - 保存 `preflight.log`、`dummy_forward.log`、`e2e_align.log`，并把硬件拓扑、torchrun world size、JSON/日志路径补进 `minimax_m3_vl_migration_report.md`。
@@ -495,7 +509,7 @@ python scripts/multimodal/audit_minimax_m3_vl_parity_artifacts.py \
   --output-json docs/usage/support_new_models/artifacts/minimax_m3_vl_precision_parity/parity_artifact_audit_multicard.json
 ```
 
-审计器会检查 summary 中的 `passed=true`、preflight/dummy/e2e return code、`--runxfail` 记录、log 路径、preflight log 中的 `device_count>=min_devices` 和 `transformers_version>=5.12.0`。如果 preflight 设备类型是 NPU，还会要求 `torch_npu_version` 和可见 Ascend 设备环境变量。
+审计器会检查 summary 中的 `passed=true`、preflight/dummy/e2e return code、`--runxfail` 记录、log 路径、preflight log 中的 `device_count>=min_devices`、`transformers_version>=5.12.0` 和 `errors=[]`。如果 preflight 设备类型是 NPU，还会要求 `torch_npu_version` 和可见 Ascend 设备环境变量；如果开启了 free-HBM 门禁，还会要求 `npu_smi.devices_with_required_free_hbm>=min_devices`。
 
 多卡通过前，不应声明 SP/EP/FSDP2 完成。
 

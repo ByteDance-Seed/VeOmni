@@ -221,6 +221,9 @@ def check_multicard_summary(path: Path) -> dict[str, Any]:
             version_at_least(runtime.get("transformers_version"), (5, 12, 0)),
             f"{prefix}: transformers_version is below 5.12.0",
         )
+        errors = runtime.get("errors") or []
+        add_issue(issues, errors == [], f"{prefix}: preflight reported errors {errors}")
+        required_free_hbm_mb = runtime.get("required_free_hbm_mb", 0)
         if device_type == "npu":
             add_issue(issues, runtime.get("torch_npu_version") is not None, f"{prefix}: missing torch_npu_version")
             ascend_env = runtime.get("ascend_env") or {}
@@ -230,6 +233,16 @@ def check_multicard_summary(path: Path) -> dict[str, Any]:
                 or ascend_env.get("ASCEND_VISIBLE_DEVICES") is not None,
                 f"{prefix}: missing visible Ascend device env",
             )
+            if isinstance(required_free_hbm_mb, int) and required_free_hbm_mb > 0:
+                npu_smi = runtime.get("npu_smi") or {}
+                add_issue(issues, npu_smi.get("returncode") == 0, f"{prefix}: npu-smi preflight did not pass")
+                devices_with_free_hbm = npu_smi.get("devices_with_required_free_hbm")
+                if isinstance(min_devices, int):
+                    add_issue(
+                        issues,
+                        isinstance(devices_with_free_hbm, int) and devices_with_free_hbm >= min_devices,
+                        f"{prefix}: not enough NPU devices with required free HBM",
+                    )
     for label, log_path in (("dummy-forward", dummy_log), ("e2e alignment", e2e_log)):
         if log_path is None:
             continue

@@ -14,6 +14,10 @@ Options:
   --output-dir PATH       Directory for logs and multicard_parity_summary.json.
                           Default: docs/usage/support_new_models/artifacts/minimax_m3_vl_multicard_parity
   --min-devices N         Minimum accelerator device count. Default: 8.
+  --require-free-hbm-mb N Require at least N free HBM MB on each counted NPU.
+                          Default: 0, disabled.
+  --npu-smi-cmd CMD       Command that prints npu-smi info for preflight evidence.
+                          Default: auto-detect npu-smi info.
   --python-cmd CMD        Python executable. Default: python3.
   --skip-dummy-forward    Skip asymmetric dummy-forward gate.
   --skip-e2e-align        Skip SP/EP/FSDP2 e2e alignment gate.
@@ -32,6 +36,8 @@ cd "$REPO_ROOT"
 
 OUTPUT_DIR="docs/usage/support_new_models/artifacts/minimax_m3_vl_multicard_parity"
 MIN_DEVICES="8"
+REQUIRE_FREE_HBM_MB="0"
+NPU_SMI_CMD="${MINIMAX_NPU_SMI_CMD:-}"
 PYTHON_CMD="python3"
 RUN_DUMMY=1
 RUN_E2E=1
@@ -45,6 +51,14 @@ while [[ $# -gt 0 ]]; do
       ;;
     --min-devices)
       MIN_DEVICES="$2"
+      shift 2
+      ;;
+    --require-free-hbm-mb)
+      REQUIRE_FREE_HBM_MB="$2"
+      shift 2
+      ;;
+    --npu-smi-cmd)
+      NPU_SMI_CMD="$2"
       shift 2
       ;;
     --python-cmd)
@@ -82,6 +96,8 @@ export PYTHONPATH="$REPO_ROOT:${PYTHONPATH:-}"
 preflight_cmd=(
   "$PYTHON_CMD" -
   "$MIN_DEVICES"
+  "$REQUIRE_FREE_HBM_MB"
+  "$NPU_SMI_CMD"
 )
 dummy_cmd=(
   "$PYTHON_CMD" -m pytest
@@ -126,43 +142,130 @@ set +e
 import json
 import os
 import re
+import shutil
+import subprocess
 import sys
 
 min_devices = int(sys.argv[1])
+required_free_hbm_mb = int(sys.argv[2])
+npu_smi_cmd = sys.argv[3] or ""
 
-import torch
-import transformers
+def run_command(command):
+    if not command:
+        return None
+    try:
+        completed = subprocess.run(command, shell=True, check=False, capture_output=True, text=True, timeout=60)
+    except Exception as exc:
+        return {"command": command, "returncode": None, "error": repr(exc), "output_excerpt": ""}
+    output = (completed.stdout or "") + (completed.stderr or "")
+    return {
+        "command": command,
+        "returncode": completed.returncode,
+        "output_excerpt": output[:12000],
+        "truncated": len(output) > 12000,
+    }
 
-version_parts = tuple(int(part) for part in re.findall(r"\d+", transformers.__version__)[:3])
-if version_parts < (5, 12, 0):
-    raise SystemExit(f"transformers>=5.12.0 required, got {transformers.__version__}")
+def default_npu_smi_command():
+    for candidate in ("npu-smi", "/usr/local/sbin/npu-smi", "/usr/local/bin/npu-smi"):
+        if shutil.which(candidate) or os.path.exists(candidate):
+            return f"{candidate} info"
+    return ""
+
+def parse_npu_hbm(output):
+    devices = []
+    current_device = None
+    for line in output.splitlines():
+        if "Process id" in line:
+            break
+        device_match = re.match(r"\|\s*(\d+)\s+\S+\s+\|", line)
+        if device_match and "OK" in line:
+            current_device = int(device_match.group(1))
+            continue
+        if current_device is None:
+            continue
+        pairs = [(int(used), int(total)) for used, total in re.findall(r"(\d+)\s*/\s*(\d+)", line)]
+        hbm_pairs = [(used, total) for used, total in pairs if total >= 1024]
+        if hbm_pairs:
+            used, total = hbm_pairs[-1]
+            devices.append({"device": current_device, "used_mb": used, "total_mb": total, "free_mb": total - used})
+            current_device = None
+    return devices
+
+npu_smi_report = run_command(npu_smi_cmd or default_npu_smi_command())
+if npu_smi_report is not None:
+    npu_smi_report["hbm"] = parse_npu_hbm(npu_smi_report.get("output_excerpt", ""))
+    npu_smi_report["required_free_hbm_mb"] = required_free_hbm_mb
+    npu_smi_report["devices_with_required_free_hbm"] = sum(
+        1 for device in npu_smi_report["hbm"] if device["free_mb"] >= required_free_hbm_mb
+    )
+
+errors = []
+
+try:
+    import torch
+except Exception as exc:
+    torch = None
+    torch_version = None
+    errors.append(f"torch import failed: {exc!r}")
+else:
+    torch_version = torch.__version__
+
+try:
+    import transformers
+except Exception as exc:
+    transformers = None
+    transformers_version = None
+    errors.append(f"transformers import failed: {exc!r}")
+else:
+    transformers_version = transformers.__version__
+    version_parts = tuple(int(part) for part in re.findall(r"\d+", transformers_version)[:3])
+    if version_parts < (5, 12, 0):
+        errors.append(f"transformers>=5.12.0 required, got {transformers_version}")
 
 torch_npu_version = None
-if hasattr(torch, "npu"):
+if torch is not None and hasattr(torch, "npu"):
     try:
         import torch_npu  # noqa: F401
 
         torch_npu_version = getattr(torch_npu, "__version__", None)
-    except Exception:
+    except Exception as exc:
         torch_npu_version = None
+        errors.append(f"torch_npu import failed: {exc!r}")
 
-if hasattr(torch, "cuda") and torch.cuda.is_available():
+if torch is not None and hasattr(torch, "cuda") and torch.cuda.is_available():
     device_type = "cuda"
     device_count = torch.cuda.device_count()
-elif hasattr(torch, "npu") and torch.npu.is_available():
+elif torch is not None and hasattr(torch, "npu") and torch.npu.is_available():
     device_type = "npu"
     device_count = torch.npu.device_count()
 else:
     device_type = None
     device_count = 0
 
+if device_count < min_devices:
+    errors.append(f"requires at least {min_devices} accelerator devices, got {device_count}")
+if required_free_hbm_mb > 0:
+    if npu_smi_report is None:
+        errors.append("npu-smi command is required when --require-free-hbm-mb is set")
+    elif npu_smi_report.get("returncode") != 0:
+        errors.append(f"npu-smi command failed with return code {npu_smi_report.get('returncode')}")
+    elif not npu_smi_report.get("hbm"):
+        errors.append("npu-smi output did not include parseable HBM usage")
+    elif npu_smi_report.get("devices_with_required_free_hbm", 0) < min_devices:
+        errors.append(
+            f"requires at least {min_devices} NPU devices with >= {required_free_hbm_mb} free HBM MB, "
+            f"got {npu_smi_report.get('devices_with_required_free_hbm', 0)}"
+        )
+
 report = {
     "device_type": device_type,
     "device_count": device_count,
     "min_devices": min_devices,
-    "torch_version": torch.__version__,
+    "required_free_hbm_mb": required_free_hbm_mb,
+    "torch_version": torch_version,
     "torch_npu_version": torch_npu_version,
-    "transformers_version": transformers.__version__,
+    "transformers_version": transformers_version,
+    "npu_smi": npu_smi_report,
     "ascend_env": {
         name: os.environ.get(name)
         for name in (
@@ -173,10 +276,11 @@ report = {
             "MODELING_BACKEND",
         )
     },
+    "errors": errors,
 }
 print(json.dumps(report, indent=2, sort_keys=True))
-if device_count < min_devices:
-    raise SystemExit(f"requires at least {min_devices} accelerator devices, got {device_count}")
+if errors:
+    raise SystemExit("; ".join(errors))
 PY
 preflight_status=${PIPESTATUS[0]}
 set -e

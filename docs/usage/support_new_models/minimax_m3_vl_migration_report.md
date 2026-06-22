@@ -223,6 +223,7 @@ Additional local checks for the multi-card artifact audit gate:
 
 ```text
 python3 -m py_compile scripts/multimodal/audit_minimax_m3_vl_parity_artifacts.py
+bash -n scripts/multimodal/run_minimax_m3_vl_multicard_parity.sh
 
 uv run --no-project --offline --with ruff \
   ruff check scripts/multimodal/audit_minimax_m3_vl_parity_artifacts.py
@@ -236,13 +237,28 @@ python3 scripts/multimodal/audit_minimax_m3_vl_parity_artifacts.py \
   --multicard-json /tmp/minimax_multicard_audit_pass/multicard_parity_summary.json \
   --require-multicard \
   --output-json /tmp/minimax_multicard_audit_pass/audit.json
-passed=true, multicard_passed=true
+passed=true, multicard_passed=true, including the free-HBM preflight fields
 
 python3 scripts/multimodal/audit_minimax_m3_vl_parity_artifacts.py \
   --multicard-json /tmp/minimax_multicard_audit_fail/multicard_parity_summary.json \
   --require-multicard \
   --output-json /tmp/minimax_multicard_audit_fail/audit.json
 expected failure: bad return codes, device_count<min_devices, transformers<5.12.0, and missing NPU runtime env were rejected.
+
+scripts/multimodal/run_minimax_m3_vl_multicard_parity.sh \
+  --min-devices 8 \
+  --require-free-hbm-mb 4096 \
+  --npu-smi-cmd 'sudo -n /usr/local/sbin/npu-smi info' \
+  --skip-dummy-forward \
+  --skip-e2e-align \
+  --output-dir /tmp/minimax_multicard_host_preflight
+expected failure on the current host: root `npu-smi` sees 8 Ascend 910B3 cards, but host Python lacks torch/transformers and zero devices have >=4096 MB free HBM because the cards are occupied by vLLM workers.
+
+python3 scripts/multimodal/audit_minimax_m3_vl_parity_artifacts.py \
+  --multicard-json /tmp/minimax_multicard_host_preflight/multicard_parity_summary.json \
+  --require-multicard \
+  --output-json /tmp/minimax_multicard_host_preflight/audit.json
+expected failure: the audit rejected the host preflight summary and preserved the preflight errors.
 
 python3 scripts/ci/check_doc_task_paths.py
 All task script paths in docs shell blocks exist.
