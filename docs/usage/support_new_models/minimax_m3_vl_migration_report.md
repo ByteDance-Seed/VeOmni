@@ -87,9 +87,9 @@ Reading `.agents/skills/veomni-new-model/SKILL.md` and the Bagel reference commi
 | Script | `scripts/multimodal/<model>.sh` or a conversion/training helper | Present: `scripts/multimodal/train_minimax_m3_vl.sh`, NPU loss evidence runners, toy precision parity, and real checkpoint payload parity tooling |
 | Docs | `docs/examples/<model>.md` plus support-new-model evidence reports | Present, with the MiniMax-only `transformers>=5.12.0` environment documented |
 | Tests | registry, patchgen hook, data/trainer, converter, dummy-forward, e2e where applicable | Partial: light tests pass; no-sync metadata and FSDP2 dummy-forward gates are wired; SP/EP e2e remains an explicit follow-up gate |
-| Validation evidence | source facts, generated import, real or toy forward/backward, checkpoint load, trainer smoke, accelerator status | Partial: source facts, import, converter unit tests, public checkpoint index/state coverage, public shard-header shape coverage, CPU HF-vs-VeOmni toy precision parity, toy/generated SFT smoke, and single-card Ascend NPU generated-model SFT smoke pass; real checkpoint payload/full-forward tooling is present, but real payload results and multi-card accelerator validation are not complete |
+| Validation evidence | source facts, generated import, real or toy forward/backward, checkpoint load, trainer smoke, accelerator status | Partial: source facts, import, converter unit tests, public checkpoint index/state coverage, public shard-header shape coverage, CPU and single-card Ascend NPU HF-vs-VeOmni toy precision parity, toy/generated SFT smoke, and single-card Ascend NPU generated-model SFT smoke pass; real checkpoint payload/full-forward tooling is present, but real payload results and multi-card accelerator validation are not complete |
 
-Assessment: the current MiniMax M3 VL PR is a useful patchgen-generated migration slice and has the right file families for a VeOmni new-model PR. It is not a completed production model migration yet, because completion still requires real public checkpoint payload loading, public-checkpoint trainer smoke, GPU/NPU parity reruns on target machines, and SP/EP e2e alignment on multi-card hardware. Synthetic image/video `VLMTrainer` forward/backward evidence, data-transform-level path/bytes video-container evidence, public checkpoint index/state coverage, public shard-header shape coverage, CPU HF-vs-VeOmni toy precision parity, real checkpoint payload/full-forward tooling, and single-card Ascend NPU generated-model SFT loss evidence are present and documented below.
+Assessment: the current MiniMax M3 VL PR is a useful patchgen-generated migration slice and has the right file families for a VeOmni new-model PR. It is not a completed production model migration yet, because completion still requires real public checkpoint payload loading, public-checkpoint trainer smoke, GPU parity reruns on target machines, and SP/EP e2e alignment on multi-card hardware. Synthetic image/video `VLMTrainer` forward/backward evidence, data-transform-level path/bytes video-container evidence, public checkpoint index/state coverage, public shard-header shape coverage, CPU and single-card Ascend NPU HF-vs-VeOmni toy precision parity, real checkpoint payload/full-forward tooling, and single-card Ascend NPU generated-model SFT loss evidence are present and documented below.
 
 ## Source Facts
 
@@ -484,17 +484,18 @@ HF reference vs VeOmni generated toy precision parity:
 {
   "passed": true,
   "num_checks": 37,
-  "device": "cpu",
+  "device": "cpu / npu:0",
   "reference": "transformers.models.minimax_m3_vl.modeling_minimax_m3_vl.MiniMaxM3SparseForConditionalGeneration",
   "candidate": "veomni.models.transformers.minimax_m3_vl.generated.patched_modeling_minimax_m3_vl_gpu.MiniMaxM3SparseForConditionalGeneration"
 }
 ```
 
-This parity gate uses one deterministic mixed image+video toy batch and the same randomly initialized state dict for both models. It checks forward loss/logits/projected image/video hidden states, MoE router logits/top-k weights/selected experts, attention mask and position-id inputs, VeOmni multimodal metadata contract, key gradients, and one AdamW parameter-update delta. GPU, NPU, real-checkpoint, and multi-card reruns are documented in the guide.
+This parity gate uses one deterministic mixed image+video toy batch and the same randomly initialized state dict for both models. It checks forward loss/logits/projected image/video hidden states, MoE router logits/top-k weights/selected experts, attention mask and position-id inputs, VeOmni multimodal metadata contract, key gradients, and one AdamW parameter-update delta. CPU parity passes with `torch==2.7.1` and `transformers==5.12.0`; single-card Ascend NPU parity passes in `quay.io/ascend/vllm-ascend:v0.20.2rc1` with `torch_npu==2.10.0`, `transformers==5.12.0`, and NPU tolerances `forward=5e-4`, `grad=1e-3`, `param=1e-3`. GPU, real-checkpoint, and multi-card reruns are documented in the guide.
 
 Artifacts:
 
 - [toy_hf_veomni_parity.json](./artifacts/minimax_m3_vl_precision_parity/toy_hf_veomni_parity.json)
+- [toy_hf_veomni_parity_npu.json](./artifacts/minimax_m3_vl_precision_parity/toy_hf_veomni_parity_npu.json)
 - [minimax_m3_vl_precision_parity_guide.md](./minimax_m3_vl_precision_parity_guide.md)
 
 Real checkpoint payload parity tooling:
@@ -508,4 +509,4 @@ The script reads local public safetensors payloads, applies `MiniMaxM3VLCheckpoi
 1. **Full public checkpoint payload load.** Public config/preprocessor metadata loads from HF, ModelScope raw config/preprocessor files are byte-identical to HF, and the HF `model.safetensors.index.json` has `23416` weight-map keys. Index-level conversion now covers all generated model `state_dict()` keys: `1525` parameters plus `57` persistent buffers, with `missing_state_key_count=0`, `unexpected_index_key_count=0`, and no missing projector keys. Safetensors header metadata has also been read for all `59` public shards, with `shape_mismatch_count=0` after conversion. CPU toy HF-vs-VeOmni precision parity passes and a real-payload parity runner is present, but real full checkpoint loading still cannot be claimed complete until the 869 GB tensor payloads are downloaded and loaded through the converter, followed by logits/top-k/greedy parity.
 2. **Full real multimodal trainer fixture.** The data path, trainer hooks, VeOmni pre-decoded-frame video fetch, local path/bytes MP4 decode through PyAV fallback, a single-process real-image/video-processor trainer-glue forward/backward fixture, and CPU `VLMTrainer.__init__()` image-only/video-only/mixed dataloader+optimizer smoke over local JPEG/MP4 path/bytes inputs are present. Remaining trainer evidence still needs public-checkpoint full trainer smoke and multi-card torchrun coverage.
 3. **SP/EP e2e alignment.** `tests/e2e/test_e2e_parallel.py` now uses a MiniMax-specific dummy VLM dataset with 1-D position ids and MiniMax image/video masks, but the alignment case remains xfail until multimodal SP/EP behavior is validated on hardware.
-4. **NPU kernels and distributed NPU.** Single-card Ascend 910B3 generated-model toy SFT loss passes in the `quay.io/ascend/vllm-ascend:v0.20.2rc1` container with `torch_npu==2.10.0`, but no Ascend-specific RMSNorm/RoPE/attention/MSA kernel replacement or multi-card NPU SP/EP/FSDP2 result is claimed in this PR.
+4. **NPU kernels and distributed NPU.** Single-card Ascend 910B3 HF-vs-VeOmni toy precision parity and generated-model toy SFT loss both pass in the `quay.io/ascend/vllm-ascend:v0.20.2rc1` container with `torch_npu==2.10.0`, but no Ascend-specific RMSNorm/RoPE/attention/MSA kernel replacement or multi-card NPU SP/EP/FSDP2 result is claimed in this PR.

@@ -19,15 +19,17 @@ Transformers 原仓提供 MiniMax M3 VL reference modeling 和通用训练组件
 - `scripts/multimodal/verify_minimax_m3_vl_precision_parity.py`
 - `scripts/multimodal/verify_minimax_m3_vl_checkpoint_payload_parity.py`
 
-本地 CPU 证据：
+本地 CPU/NPU 证据：
 
 - [toy_hf_veomni_parity.json](./artifacts/minimax_m3_vl_precision_parity/toy_hf_veomni_parity.json)
+- [toy_hf_veomni_parity_npu.json](./artifacts/minimax_m3_vl_precision_parity/toy_hf_veomni_parity_npu.json)
 
 结果摘要：
 
 ```json
 {
   "passed": true,
+  "device": "cpu / npu:0",
   "num_checks": 37,
   "failed": []
 }
@@ -97,6 +99,19 @@ NPU parity 分两层：
 
 1. HF reference 原始 modeling 与 VeOmni NPU generated modeling 的 toy parity；
 2. VeOmni GPU/CPU reference 与 NPU candidate 的 backend tolerance parity。
+
+本 PR 已在单卡 Ascend 910B3 容器环境中完成第 1 层 toy parity：
+
+```json
+{
+  "passed": true,
+  "device": "npu:0",
+  "num_checks": 37,
+  "torch_version": "2.10.0+cpu",
+  "torch_npu_version": "2.10.0",
+  "transformers_version": "5.12.0"
+}
+```
 
 单卡 NPU toy parity 示例：
 

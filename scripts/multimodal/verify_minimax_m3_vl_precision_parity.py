@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import platform
 import random
 import sys
 import time
@@ -213,6 +214,7 @@ def main() -> None:
     os.environ.setdefault("MODELING_BACKEND", "veomni")
 
     import torch
+    import transformers
     from transformers import AutoConfig
     from transformers.models.minimax_m3_vl.modeling_minimax_m3_vl import (
         MiniMaxM3SparseForConditionalGeneration as HFMiniMaxM3SparseForConditionalGeneration,
@@ -387,6 +389,17 @@ def main() -> None:
             "forward": {"atol": args.atol, "rtol": args.rtol},
             "grad": {"atol": args.grad_atol, "rtol": args.grad_rtol},
             "param": {"atol": args.param_atol, "rtol": args.param_rtol},
+        },
+        "runtime": {
+            "python": sys.version,
+            "python_executable": sys.executable,
+            "platform": platform.platform(),
+            "machine": platform.machine(),
+            "torch_version": torch.__version__,
+            "transformers_version": transformers.__version__,
+            "torch_npu_version": getattr(sys.modules.get("torch_npu"), "__version__", None),
+            "torch_npu_available": bool(torch.npu.is_available()) if hasattr(torch, "npu") else None,
+            "torch_npu_device_count": int(torch.npu.device_count()) if hasattr(torch, "npu") else None,
         },
         "batch_contract": {
             "input_ids": batch["input_ids"].detach().cpu().tolist(),
