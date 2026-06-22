@@ -20,6 +20,7 @@ Transformers 原仓提供 MiniMax M3 VL reference modeling 和通用训练组件
 - `scripts/multimodal/verify_minimax_m3_vl_checkpoint_payload_parity.py`
 - `scripts/multimodal/run_minimax_m3_vl_full_checkpoint_parity.sh`
 - `scripts/multimodal/audit_minimax_m3_vl_parity_artifacts.py`
+- `scripts/multimodal/run_minimax_m3_vl_precision_suite.sh`
 
 本地 CPU/NPU 证据：
 
@@ -109,6 +110,33 @@ python scripts/multimodal/audit_minimax_m3_vl_parity_artifacts.py \
 ```
 
 只有强制模式也 `passed=true`，才可以把真实 checkpoint forward parity 和多卡 SP/EP/FSDP2 parity 视为完成。
+
+目标机器也可以使用最终套件入口一次性串联 full-checkpoint forward、多卡 SP/EP/FSDP2 和最终 strict audit：
+
+```bash
+cd /path/to/VeOmni
+
+scripts/multimodal/run_minimax_m3_vl_precision_suite.sh \
+  --checkpoint-dir /data/checkpoints/MiniMax-M3 \
+  --reference-device cpu \
+  --candidate-device npu \
+  --torch-dtype bfloat16 \
+  --require-free-disk-gb 50 \
+  --require-free-hbm-mb 4096 \
+  --npu-smi-cmd 'sudo -n /usr/local/sbin/npu-smi info' \
+  --min-devices 8 \
+  --output-root docs/usage/support_new_models/artifacts/minimax_m3_vl_target_precision_suite
+```
+
+套件会产出：
+
+- `full_checkpoint/full_checkpoint_preflight.json`
+- `full_checkpoint/full_checkpoint_forward.json`
+- `full_checkpoint/full_checkpoint_audit.json`
+- `multicard/multicard_parity_summary.json`
+- `final_precision_audit.json`
+
+只有 `final_precision_audit.json` 中 `passed=true`、`full_checkpoint_preflight_passed=true`、`full_checkpoint_forward_passed=true`、`multicard_passed=true` 同时成立，才可以声明 MiniMax M3 VL 的真实 checkpoint 和多卡精度闭环完成。
 
 ## CPU 复跑
 

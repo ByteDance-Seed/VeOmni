@@ -39,6 +39,7 @@ Upstream PR:
 - `scripts/multimodal/run_minimax_m3_vl_full_checkpoint_parity.sh`
 - `scripts/multimodal/audit_minimax_m3_vl_parity_artifacts.py`
 - `scripts/multimodal/run_minimax_m3_vl_multicard_parity.sh`
+- `scripts/multimodal/run_minimax_m3_vl_precision_suite.sh`
 - `docs/examples/minimax_m3_vl.md`
 - `docs/usage/support_new_models/minimax_m3_vl_data_module_design.md`
 - `docs/usage/support_new_models/minimax_m3_vl_hyperparams_loading_report.md`
@@ -273,6 +274,7 @@ python3 -m py_compile \
   scripts/multimodal/audit_minimax_m3_vl_parity_artifacts.py
 
 bash -n scripts/multimodal/run_minimax_m3_vl_full_checkpoint_parity.sh
+bash -n scripts/multimodal/run_minimax_m3_vl_precision_suite.sh
 
 uv run --no-project --offline --with ruff \
   ruff check \
@@ -302,6 +304,16 @@ scripts/multimodal/run_minimax_m3_vl_full_checkpoint_parity.sh \
   --preflight-only \
   --dry-run
 printed the preflight, forward, and strict audit commands without executing the 869 GB load.
+
+scripts/multimodal/run_minimax_m3_vl_precision_suite.sh \
+  --checkpoint-dir /data/checkpoints/MiniMax-M3 \
+  --reference-device cpu \
+  --candidate-device npu \
+  --require-free-disk-gb 50 \
+  --require-free-hbm-mb 4096 \
+  --npu-smi-cmd 'sudo -n /usr/local/sbin/npu-smi info' \
+  --dry-run
+printed the full-checkpoint command, multi-card command, and final strict audit command without executing target-machine work.
 
 python3 scripts/multimodal/audit_minimax_m3_vl_parity_artifacts.py \
   --output-json docs/usage/support_new_models/artifacts/minimax_m3_vl_precision_parity/parity_artifact_audit.json
