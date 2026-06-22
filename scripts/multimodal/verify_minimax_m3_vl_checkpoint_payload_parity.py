@@ -18,6 +18,7 @@ public MiniMax M3 checkpoint payload is large.
 from __future__ import annotations
 
 import argparse
+import gc
 import hashlib
 import json
 import os
@@ -513,6 +514,16 @@ def greedy_decode_ids(model: Any, prompt_ids: list[int], *, device: Any, max_new
     return generated[0, len(prompt_ids) :].detach().cpu().tolist()
 
 
+def release_accelerator_memory(device: Any) -> None:
+    import torch
+
+    gc.collect()
+    if getattr(device, "type", None) == "cuda":
+        torch.cuda.empty_cache()
+    elif getattr(device, "type", None) == "npu" and hasattr(torch, "npu"):
+        torch.npu.empty_cache()
+
+
 def patch_eager_config(config: Any) -> Any:
     if hasattr(config, "_attn_implementation"):
         config._attn_implementation = "eager"
@@ -531,8 +542,12 @@ def run_forward_parity(
     args: argparse.Namespace,
     checkpoint_dir: Path,
     config_path: str,
-    converted_tensors: dict[str, Any],
-) -> dict[str, Any]:
+    index_json: str,
+    shard_base_url: str | None,
+    selected_weight_map: dict[str, str],
+    model_metadata: dict[str, dict[str, Any]],
+    num_experts: int,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
     import torch
     from transformers import AutoConfig
     from transformers.models.minimax_m3_vl.modeling_minimax_m3_vl import (
@@ -549,33 +564,55 @@ def run_forward_parity(
     prompt_ids = parse_prompt_ids(args.prompt_ids)
 
     hf_config = patch_eager_config(AutoConfig.from_pretrained(config_path))
-    veomni_config = patch_eager_config(get_model_config(config_path))
-    veomni_cls = get_model_class(veomni_config)
-
     hf_model = HFMiniMaxM3SparseForConditionalGeneration.from_pretrained(
         str(checkpoint_dir),
         config=hf_config,
         torch_dtype=dtype,
     )
-    veomni_model = veomni_cls(veomni_config)
-    load_result = veomni_model.load_state_dict(converted_tensors, strict=True)
-
     hf_model.to(device)
-    veomni_model.to(device)
     hf_model.eval()
-    veomni_model.eval()
 
     batch = build_text_batch(prompt_ids, device)
     with torch.no_grad():
         hf_outputs = hf_model(**batch)
+    hf_logits = hf_outputs.logits.detach().cpu()
+    hf_topk = torch.topk(hf_outputs.logits[:, -1, :], k=args.top_k, dim=-1).indices.detach().cpu()
+    hf_greedy = greedy_decode_ids(hf_model, prompt_ids, device=device, max_new_tokens=args.max_new_tokens)
+    del hf_outputs
+    del hf_model
+    release_accelerator_memory(device)
+
+    converted_tensors, payload_summary = load_converted_payload(
+        checkpoint_dir=checkpoint_dir,
+        index_json=index_json,
+        shard_base_url=shard_base_url,
+        selected_weight_map=selected_weight_map,
+        num_experts=num_experts,
+        hash_values=not args.no_hash,
+        range_timeout=args.range_timeout,
+        range_retries=args.range_retries,
+        metadata_cache_dir=args.metadata_cache_dir,
+    )
+    metadata_comparison = compare_payload_to_model_metadata(converted_tensors, model_metadata)
+
+    veomni_config = patch_eager_config(get_model_config(config_path))
+    veomni_cls = get_model_class(veomni_config)
+    veomni_model = veomni_cls(veomni_config)
+    load_result = veomni_model.load_state_dict(converted_tensors, strict=True)
+    del converted_tensors
+    release_accelerator_memory(device)
+
+    veomni_model.to(device)
+    veomni_model.eval()
+    batch = build_text_batch(prompt_ids, device)
+    with torch.no_grad():
         veomni_outputs = veomni_model(**batch)
 
     checks: list[dict[str, Any]] = []
     logits_check = {"name": "forward.logits", "kind": "tensor"}
-    logits_check.update(tensor_stats(hf_outputs.logits, veomni_outputs.logits, atol=args.atol, rtol=args.rtol))
+    logits_check.update(tensor_stats(hf_logits, veomni_outputs.logits, atol=args.atol, rtol=args.rtol))
     checks.append(logits_check)
 
-    hf_topk = torch.topk(hf_outputs.logits[:, -1, :], k=args.top_k, dim=-1).indices.detach().cpu()
     veomni_topk = torch.topk(veomni_outputs.logits[:, -1, :], k=args.top_k, dim=-1).indices.detach().cpu()
     checks.append(
         {
@@ -587,7 +624,6 @@ def run_forward_parity(
         }
     )
 
-    hf_greedy = greedy_decode_ids(hf_model, prompt_ids, device=device, max_new_tokens=args.max_new_tokens)
     veomni_greedy = greedy_decode_ids(veomni_model, prompt_ids, device=device, max_new_tokens=args.max_new_tokens)
     checks.append(
         {
@@ -599,7 +635,7 @@ def run_forward_parity(
         }
     )
 
-    return {
+    forward_report = {
         "device": str(device),
         "prompt_ids": prompt_ids,
         "top_k": args.top_k,
@@ -614,6 +650,10 @@ def run_forward_parity(
         "checks": checks,
         "passed": all(item.get("allclose", item.get("equal", False)) for item in checks),
     }
+    del veomni_outputs
+    del veomni_model
+    release_accelerator_memory(device)
+    return forward_report, payload_summary, metadata_comparison
 
 
 def main() -> None:
@@ -649,18 +689,33 @@ def main() -> None:
         raise RuntimeError("no checkpoint tensors selected; check --shard and --include-key-regex")
 
     model_metadata, num_experts = build_model_metadata(config_path, args.torch_dtype)
-    converted_tensors, payload_summary = load_converted_payload(
-        checkpoint_dir=checkpoint_dir,
-        index_json=index_json,
-        shard_base_url=shard_base_url,
-        selected_weight_map=selected_weight_map,
-        num_experts=num_experts,
-        hash_values=not args.no_hash,
-        range_timeout=args.range_timeout,
-        range_retries=args.range_retries,
-        metadata_cache_dir=args.metadata_cache_dir,
-    )
-    metadata_comparison = compare_payload_to_model_metadata(converted_tensors, model_metadata)
+    if args.mode == "forward":
+        if args.include_key_regex or args.shard:
+            raise RuntimeError("--mode forward requires the complete local checkpoint; do not use --include-key-regex or --shard")
+        forward_report, payload_summary, metadata_comparison = run_forward_parity(
+            args=args,
+            checkpoint_dir=checkpoint_dir,
+            config_path=config_path,
+            index_json=index_json,
+            shard_base_url=shard_base_url,
+            selected_weight_map=selected_weight_map,
+            model_metadata=model_metadata,
+            num_experts=num_experts,
+        )
+    else:
+        converted_tensors, payload_summary = load_converted_payload(
+            checkpoint_dir=checkpoint_dir,
+            index_json=index_json,
+            shard_base_url=shard_base_url,
+            selected_weight_map=selected_weight_map,
+            num_experts=num_experts,
+            hash_values=not args.no_hash,
+            range_timeout=args.range_timeout,
+            range_retries=args.range_retries,
+            metadata_cache_dir=args.metadata_cache_dir,
+        )
+        metadata_comparison = compare_payload_to_model_metadata(converted_tensors, model_metadata)
+        forward_report = None
 
     payload_passed = (
         payload_summary["converted_tensor_keys"] > 0
@@ -670,15 +725,6 @@ def main() -> None:
         and (args.allow_incomplete_groups or payload_summary["converter_finalize_error"] is None)
         and (not args.fail_on_dtype_mismatch or not metadata_comparison["dtype_mismatch_count"])
     )
-
-    forward_report = None
-    if args.mode == "forward":
-        forward_report = run_forward_parity(
-            args=args,
-            checkpoint_dir=checkpoint_dir,
-            config_path=config_path,
-            converted_tensors=converted_tensors,
-        )
 
     report = {
         "passed": bool(payload_passed and (forward_report is None or forward_report["passed"])),
