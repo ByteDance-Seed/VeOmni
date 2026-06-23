@@ -11,7 +11,8 @@ from ....conversation import ConversationItem, is_dummy, iter_desired_items, may
 from ....generation_graph import FSM_SIGNAL_KEY
 from ....module import CPUPreprocessor, post_forward, pre_forward
 from ...base.text_encoder.modulemixin import TextEncoderModuleMixin
-from .processing import apply_image_marker, is_image_item, materialize_text_item_input_ids
+from ..sources import BAGEL_FLOW_QUERY, BAGEL_SIGLIP_CONTEXT, BAGEL_VAE_CONTEXT
+from .processing import apply_image_marker, materialize_text_item_input_ids
 
 
 SIGNAL_START_IMAGE_GEN = "start_image_gen"
@@ -137,12 +138,12 @@ class BagelTextEncoderModuleMixin(TextEncoderModuleMixin):
     ) -> Dict[str, Any]:
         del generation_kwargs, kwargs
         marker_embeds: Optional[torch.Tensor] = None
-        for item in iter_desired_items([conversation_list], types=["image", "output"]):
-            # Broad type scan keeps the graph tolerant while VAE inference still
-            # accepts raw source=None inputs. The actual marker contract is
-            # source-based in is_image_item(); once VAE train/inference both
-            # materialize source tags, this path should stay source-routed.
-            if not is_image_item(item):
+        for item in iter_desired_items(
+            [conversation_list],
+            types=["image", "output"],
+            sources=[BAGEL_SIGLIP_CONTEXT, BAGEL_VAE_CONTEXT, BAGEL_FLOW_QUERY],
+        ):
+            if is_dummy(item):
                 continue
 
             if marker_embeds is None:

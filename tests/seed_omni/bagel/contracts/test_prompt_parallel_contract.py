@@ -16,16 +16,18 @@ from veomni.models.seed_omni.modules.bagel.carrier_updates import (
 )
 from veomni.models.seed_omni.modules.bagel.flow_connector.processing import flow_latent_items
 from veomni.models.seed_omni.modules.bagel.qwen2_mot.processing import pack_training_conversation
-from veomni.models.seed_omni.modules.bagel.sources import BAGEL_SIGLIP_CONTEXT, BAGEL_VAE_CONTEXT
-from veomni.models.seed_omni.modules.bagel.text_encoder.processing import (
-    apply_image_marker,
-    is_image_item,
+from veomni.models.seed_omni.modules.bagel.sources import (
+    BAGEL_FLOW_QUERY,
+    BAGEL_SIGLIP_CONTEXT,
+    BAGEL_VAE_CONTEXT,
 )
+from veomni.models.seed_omni.modules.bagel.text_encoder.processing import apply_image_marker
 
 
 _BAGEL_CONFIG_DIR = Path(__file__).resolve().parents[4] / "configs/seed_omni/Bagel/bagel_7b_mot"
 _HIDDEN_SIZE = 4
 _Z_CHANNELS = 2
+_IMAGE_MARKER_SOURCES = {BAGEL_SIGLIP_CONTEXT, BAGEL_VAE_CONTEXT, BAGEL_FLOW_QUERY}
 
 
 def _item(
@@ -124,7 +126,7 @@ def test_bagel_edit_prompt_graph_exposes_vae_then_siglip_prompt_producers() -> N
     prompt_body = graph_config["states"]["prompt_encode"]["body"]
 
     assert {"from": "bagel_text_encoder", "to": "bagel_qwen2_mot"} in prompt_body
-    assert {"from": "bagel_vae.encode", "to": "bagel_siglip_navit"} in prompt_body
+    assert {"from": "bagel_vae.encode_context", "to": "bagel_siglip_navit"} in prompt_body
     assert {"from": "bagel_siglip_navit", "to": "bagel_flow_connector.embed_latent"} in prompt_body
     assert {
         "from": "bagel_flow_connector.embed_latent",
@@ -136,13 +138,13 @@ def test_bagel_edit_prompt_graph_exposes_vae_then_siglip_prompt_producers() -> N
     } in (prompt_body)
 
     forbidden_edges = {
-        ("bagel_siglip_navit", "bagel_vae.encode"),
+        ("bagel_siglip_navit", "bagel_vae.encode_context"),
     }
     assert not forbidden_edges.intersection({(edge["from"], edge["to"]) for edge in prompt_body})
 
     graph = GenerationGraph(graph_config)
     sequence = graph.state_node_sequence("prompt_encode")
-    assert "bagel_vae.encode" in sequence
+    assert "bagel_vae.encode_context" in sequence
     assert "bagel_siglip_navit.generate" in sequence
 
 
@@ -202,7 +204,9 @@ def test_downstream_prompt_consumers_see_sequentially_equivalent_carrier() -> No
     assert flow_items == [latent_item]
     materialize_carrier_updates([sample], [replace_value(latent_item, _flow_context_embeds())])
 
-    image_items = [item for item in sample if is_image_item(item)]
+    image_items = [
+        item for item in sample if item.type in {"image", "output"} and item.source in _IMAGE_MARKER_SOURCES
+    ]
     assert image_items == [latent_item, sample[1]]
     for image_item in image_items:
         apply_image_marker(image_item, _marker_embeds().squeeze(0), device=torch.device("cpu"), dtype=torch.float32)

@@ -1,4 +1,4 @@
-"""Stateless image and latent helpers for BAGEL VAE."""
+"""Image processor helpers for BAGEL VAE."""
 
 from __future__ import annotations
 
@@ -10,17 +10,90 @@ import torch.nn.functional as F
 from PIL import Image
 from torchvision.transforms import InterpolationMode
 from torchvision.transforms import functional as TVF
-
-from ....conversation import ConversationItem, is_dummy
-from ..carrier_updates import (
-    insert_before,
-    materialize_carrier_updates,
-    replace_fields,
-)
-from ..sources import BAGEL_GENERATED_LATENT, BAGEL_VAE_CONTEXT
+from transformers.image_processing_utils import BaseImageProcessor, BatchFeature
 
 
-def preprocess_image(
+class BagelVAEProcessor(BaseImageProcessor):
+    """BAGEL VAE image processor.
+
+    Owns raw-image resize and normalization for VAE encode. Carrier selection,
+    source tagging, and latent scatter stay in the module mixin.
+    """
+
+    model_input_names = ["pixel_values"]
+
+    def __init__(
+        self,
+        image_stride: int = 16,
+        max_image_size: int = 1024,
+        min_image_size: int = 512,
+        max_pixels: int = 14 * 14 * 9 * 1024,
+        image_mean: list[float] | None = None,
+        image_std: list[float] | None = None,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(**kwargs)
+        self.image_stride = image_stride
+        self.max_image_size = max_image_size
+        self.min_image_size = min_image_size
+        self.max_pixels = max_pixels
+        self.image_mean = [0.5, 0.5, 0.5] if image_mean is None else image_mean
+        self.image_std = [0.5, 0.5, 0.5] if image_std is None else image_std
+
+    @classmethod
+    def from_config(cls, config: Any) -> BagelVAEProcessor:
+        return cls(
+            image_stride=int(config.image_stride),
+            max_image_size=int(config.max_image_size),
+            min_image_size=int(config.min_image_size),
+            max_pixels=int(config.max_pixels),
+            image_mean=list(config.image_mean),
+            image_std=list(config.image_std),
+        )
+
+    def preprocess(
+        self,
+        images: Any,
+        *,
+        return_tensors: str | None = None,
+        device: torch.device | None = None,
+        dtype: torch.dtype | None = None,
+        **kwargs: Any,
+    ) -> BatchFeature:
+        del return_tensors, kwargs
+        image_list = images if isinstance(images, list) else [images]
+        pixel_values = [
+            _preprocess_image(
+                image,
+                image_stride=self.image_stride,
+                max_image_size=self.max_image_size,
+                min_image_size=self.min_image_size,
+                max_pixels=self.max_pixels,
+                image_mean=self.image_mean,
+                image_std=self.image_std,
+            )
+            for image in image_list
+        ]
+        tensor = torch.stack(pixel_values, dim=0)
+        if dtype is not None:
+            tensor = tensor.to(dtype=dtype)
+        if device is not None:
+            tensor = tensor.to(device=device)
+        return BatchFeature(data={"pixel_values": tensor})
+
+    def postprocess(self, images: torch.Tensor | list[torch.Tensor], **kwargs: Any) -> list[Image.Image]:
+        del kwargs
+        image_list = images if isinstance(images, list) else [images]
+        out: list[Image.Image] = []
+        for image in image_list:
+            if image.dim() == 4:
+                out.extend(_decoded_tensor_to_pil(item) for item in image)
+            else:
+                out.append(_decoded_tensor_to_pil(image))
+        return out
+
+
+def _preprocess_image(
     image: Any,
     *,
     image_stride: int,
@@ -31,18 +104,18 @@ def preprocess_image(
     image_std: list[float],
 ) -> torch.Tensor:
     if isinstance(image, (Image.Image, np.ndarray)):
-        pil_image = to_rgb_pil(image if isinstance(image, Image.Image) else Image.fromarray(image))
-        pil_image = resize_pil(
+        pil_image = _to_rgb_pil(image if isinstance(image, Image.Image) else Image.fromarray(image))
+        pil_image = _resize_pil(
             pil_image,
             image_stride=image_stride,
             max_image_size=max_image_size,
             min_image_size=min_image_size,
             max_pixels=max_pixels,
         )
-        tensor = pil_to_rgb_tensor(pil_image)
+        tensor = _pil_to_rgb_tensor(pil_image)
     else:
-        tensor = to_rgb_tensor(image)
-        tensor = resize_tensor(
+        tensor = _to_rgb_tensor(image)
+        tensor = _resize_tensor(
             tensor,
             image_stride=image_stride,
             max_image_size=max_image_size,
@@ -54,13 +127,13 @@ def preprocess_image(
     return tensor.sub(mean).div(std)
 
 
-def to_rgb_tensor(image: Any) -> torch.Tensor:
+def _to_rgb_tensor(image: Any) -> torch.Tensor:
     if isinstance(image, Image.Image):
-        pil_image = to_rgb_pil(image)
+        pil_image = _to_rgb_pil(image)
         array = np.array(pil_image, copy=True)
         return torch.from_numpy(array).permute(2, 0, 1).contiguous().to(dtype=torch.float32).div_(255.0)
     if isinstance(image, np.ndarray):
-        return to_rgb_tensor(Image.fromarray(image))
+        return _to_rgb_tensor(Image.fromarray(image))
     if torch.is_tensor(image):
         tensor = image.detach().to(dtype=torch.float32)
         if tensor.dim() != 3:
@@ -87,7 +160,7 @@ def to_rgb_tensor(image: Any) -> torch.Tensor:
     raise TypeError(f"BAGEL VAE image item value must be PIL, numpy, or tensor, got {type(image).__name__}.")
 
 
-def resize_tensor(
+def _resize_tensor(
     tensor: torch.Tensor,
     *,
     image_stride: int,
@@ -96,7 +169,7 @@ def resize_tensor(
     max_pixels: int,
 ) -> torch.Tensor:
     height, width = tensor.shape[-2:]
-    new_width, new_height = target_size(
+    new_width, new_height = _target_size(
         width,
         height,
         image_stride=image_stride,
@@ -116,7 +189,7 @@ def resize_tensor(
     return resized.squeeze(0).clamp(0.0, 1.0)
 
 
-def resize_pil(
+def _resize_pil(
     image: Image.Image,
     *,
     image_stride: int,
@@ -126,7 +199,7 @@ def resize_pil(
     img_num: int = 1,
 ) -> Image.Image:
     width, height = image.size
-    new_width, new_height = target_size(
+    new_width, new_height = _target_size(
         width,
         height,
         image_stride=image_stride,
@@ -144,7 +217,7 @@ def resize_pil(
     )
 
 
-def target_size(
+def _target_size(
     width: int,
     height: int,
     *,
@@ -155,17 +228,17 @@ def target_size(
 ) -> tuple[int, int]:
     scale = min(max_image_size / max(width, height), 1.0)
     scale = max(scale, min_image_size / min(width, height))
-    new_width, new_height = apply_scale(width, height, scale, image_stride)
+    new_width, new_height = _apply_scale(width, height, scale, image_stride)
     if new_width * new_height > max_pixels:
         scale = max_pixels / (new_width * new_height)
-        new_width, new_height = apply_scale(new_width, new_height, scale, image_stride)
+        new_width, new_height = _apply_scale(new_width, new_height, scale, image_stride)
     if max(new_width, new_height) > max_image_size:
         scale = max_image_size / max(new_width, new_height)
-        new_width, new_height = apply_scale(new_width, new_height, scale, image_stride)
+        new_width, new_height = _apply_scale(new_width, new_height, scale, image_stride)
     return new_width, new_height
 
 
-def to_rgb_pil(image: Image.Image) -> Image.Image:
+def _to_rgb_pil(image: Image.Image) -> Image.Image:
     if image.mode == "RGBA" or image.info.get("transparency", None) is not None:
         rgba = image.convert("RGBA")
         white = Image.new(mode="RGB", size=rgba.size, color=(255, 255, 255))
@@ -174,12 +247,12 @@ def to_rgb_pil(image: Image.Image) -> Image.Image:
     return image.convert("RGB")
 
 
-def pil_to_rgb_tensor(image: Image.Image) -> torch.Tensor:
+def _pil_to_rgb_tensor(image: Image.Image) -> torch.Tensor:
     array = np.array(image, copy=True)
     return torch.from_numpy(array).permute(2, 0, 1).contiguous().to(dtype=torch.float32).div_(255.0)
 
 
-def apply_scale(width: int, height: int, scale: float, stride: int) -> tuple[int, int]:
+def _apply_scale(width: int, height: int, scale: float, stride: int) -> tuple[int, int]:
     new_width = round(width * scale)
     new_height = round(height * scale)
     return (
@@ -188,182 +261,7 @@ def apply_scale(width: int, height: int, scale: float, stride: int) -> tuple[int
     )
 
 
-def looks_raw_image_value(value: Any) -> bool:
-    if not torch.is_tensor(value):
-        return True
-    if value.dim() != 3:
-        return False
-    return int(value.shape[0]) in (1, 3, 4) or int(value.shape[-1]) in (1, 3, 4)
-
-
-def latent_grid(value: torch.Tensor) -> torch.Tensor:
-    latent = value.detach()
-    if latent.dim() == 4 and latent.shape[0] == 1:
-        latent = latent.squeeze(0)
-    if latent.dim() != 3:
-        raise ValueError(f"BAGEL VAE decode expects latent grid tensors, got shape {tuple(value.shape)}.")
-    return latent
-
-
-def is_latent_grid_value(value: object) -> bool:
-    if not torch.is_tensor(value):
-        return False
-    if value.dim() == 4:
-        return int(value.shape[0]) == 1
-    return value.dim() == 3
-
-
-def raw_image_encode_items(conversation_list: list[list[ConversationItem]] | None) -> list[ConversationItem]:
-    return [
-        item
-        for sample in conversation_list or []
-        for item in sample
-        if item.type == "image"
-        and item.role == "assistant"
-        and not is_dummy(item)
-        and looks_raw_image_value(item.value)
-    ]
-
-
-def raw_context_image_items(
-    conversation_list: list[list[ConversationItem]] | None,
-) -> list[tuple[list[ConversationItem], ConversationItem]]:
-    return [
-        (sample, item)
-        for sample in conversation_list or []
-        for item in sample
-        if item.type == "image"
-        and item.role == "user"
-        and not is_dummy(item)
-        and looks_raw_image_value(item.value)
-        and item.source in (None, BAGEL_VAE_CONTEXT)
-    ]
-
-
-def prepare_encode_inputs(
-    encode_items: list[ConversationItem],
-    *,
-    config: Any,
-    device: torch.device,
-    dtype: torch.dtype,
-) -> dict[str, torch.Tensor]:
-    pixel_values = [
-        preprocess_image(
-            item.value,
-            image_stride=config.image_stride,
-            max_image_size=config.max_image_size,
-            min_image_size=config.min_image_size,
-            max_pixels=config.max_pixels,
-            image_mean=config.image_mean,
-            image_std=config.image_std,
-        )
-        for item in encode_items
-    ]
-    return {"pixel_values": torch.stack(pixel_values, dim=0).to(device=device, dtype=dtype)}
-
-
-def scatter_encoded_latents(
-    encode_items: list[ConversationItem],
-    latents: torch.Tensor,
-    *,
-    device: torch.device,
-    dtype: torch.dtype,
-) -> None:
-    if len(encode_items) != int(latents.shape[0]):
-        raise RuntimeError("BAGEL VAE image count mismatch during latent scatter.")
-    materialize_carrier_updates(
-        None,
-        [
-            replace_fields(item, type="output", value=latent.to(device=device, dtype=dtype))
-            for item, latent in zip(encode_items, latents, strict=True)
-        ],
-    )
-
-
-def context_encode_image_items(
-    context_items: list[tuple[list[ConversationItem], ConversationItem]],
-) -> list[ConversationItem]:
-    return [item for _, item in context_items]
-
-
-def insert_context_encoded_latents(
-    context_items: list[tuple[list[ConversationItem], ConversationItem]],
-    latents: torch.Tensor,
-    *,
-    device: torch.device,
-    dtype: torch.dtype,
-) -> None:
-    if len(context_items) != int(latents.shape[0]):
-        raise RuntimeError("BAGEL VAE context image count mismatch during latent scatter.")
-    samples = [sample for sample, _ in context_items]
-    materialize_carrier_updates(
-        samples,
-        [
-            insert_before(
-                image_item,
-                ConversationItem(
-                    type="output",
-                    value=latent.to(device=device, dtype=dtype),
-                    role="assistant",
-                    source=BAGEL_VAE_CONTEXT,
-                    meta={},
-                ),
-            )
-            for (_, image_item), latent in zip(context_items, latents, strict=True)
-        ],
-    )
-
-
-def latent_decode_items(conversation_list: list[list[ConversationItem]] | None) -> list[ConversationItem]:
-    return [
-        item
-        for sample in conversation_list or []
-        for item in sample
-        if item.type == "output"
-        and item.source == BAGEL_GENERATED_LATENT
-        and not is_dummy(item)
-        and is_latent_grid_value(item.value)
-    ]
-
-
-def prepare_decode_inputs(
-    decode_items: list[ConversationItem],
-    *,
-    device: torch.device,
-    dtype: torch.dtype,
-) -> dict[str, torch.Tensor]:
-    latents = [latent_grid(item.value) for item in decode_items]
-    return {"latents": torch.stack(latents, dim=0).to(device=device, dtype=dtype)}
-
-
-def scatter_decoded_images(
-    decode_items: list[ConversationItem],
-    pixel_values: torch.Tensor,
-    *,
-    device: torch.device,
-    dtype: torch.dtype,
-) -> None:
-    if len(decode_items) != int(pixel_values.shape[0]):
-        raise RuntimeError("BAGEL VAE latent count mismatch during decoded image scatter.")
-    materialize_carrier_updates(
-        None,
-        [
-            replace_fields(item, type="image", value=image.to(device=device, dtype=dtype))
-            for item, image in zip(decode_items, pixel_values, strict=True)
-        ],
-    )
-
-
-def as_batched_decode_conversation(conversation_list: Any) -> list[list[Any]]:
-    if not conversation_list:
-        return []
-    first = conversation_list[0]
-    if isinstance(first, list):
-        return conversation_list
-    return [conversation_list]
-
-
-def decoded_tensor_to_pil(image: torch.Tensor) -> Image.Image:
+def _decoded_tensor_to_pil(image: torch.Tensor) -> Image.Image:
     if image.dim() == 4 and image.shape[0] == 1:
         image = image.squeeze(0)
     if image.dim() != 3:
@@ -378,26 +276,5 @@ def decoded_tensor_to_pil(image: torch.Tensor) -> Image.Image:
 
 
 __all__ = [
-    "apply_scale",
-    "as_batched_decode_conversation",
-    "decoded_tensor_to_pil",
-    "context_encode_image_items",
-    "insert_context_encoded_latents",
-    "latent_grid",
-    "latent_decode_items",
-    "is_latent_grid_value",
-    "looks_raw_image_value",
-    "prepare_decode_inputs",
-    "prepare_encode_inputs",
-    "preprocess_image",
-    "pil_to_rgb_tensor",
-    "raw_context_image_items",
-    "raw_image_encode_items",
-    "resize_pil",
-    "resize_tensor",
-    "scatter_decoded_images",
-    "scatter_encoded_latents",
-    "target_size",
-    "to_rgb_pil",
-    "to_rgb_tensor",
+    "BagelVAEProcessor",
 ]

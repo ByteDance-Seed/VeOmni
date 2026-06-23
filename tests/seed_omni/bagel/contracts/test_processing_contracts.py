@@ -82,6 +82,8 @@ def test_bagel_training_flow_metadata_matches_packed_noising_dtype():
 
 
 def test_bagel_vae_infer_encode_inserts_context_latent_before_user_image():
+    from veomni.models.seed_omni.modules.bagel.vae.processing import BagelVAEProcessor
+
     BagelVAE = model_cls("bagel_vae")
     BagelVAEConfig = config_cls("bagel_vae")
     model = BagelVAE(
@@ -97,6 +99,7 @@ def test_bagel_vae_infer_encode_inserts_context_latent_before_user_image():
             max_pixels=64,
         )
     )
+    model._image_processor = BagelVAEProcessor.from_config(model.config)
     model._encode_pixel_values = lambda pixel_values: {  # type: ignore[method-assign]
         "latents": torch.ones(int(pixel_values.shape[0]), 2, 2, 2, device=model.device, dtype=model.dtype)
     }
@@ -106,14 +109,68 @@ def test_bagel_vae_infer_encode_inserts_context_latent_before_user_image():
         ConversationItem(type="text", value="edit", role="user"),
     ]
 
-    out = model.encode(conversation_list=conversation)
+    out = model.encode_context(conversation_list=conversation)
 
     assert out["conversation_list"] is conversation
     assert [item.type for item in conversation] == ["output", "image", "text"]
     assert conversation[0].role == "assistant"
+    assert conversation[0].source == BAGEL_VAE_CONTEXT
     assert conversation[0].meta == {}
     assert conversation[0].value.shape == (2, 2, 2)
     assert conversation[1].value is image
+
+
+def test_bagel_vae_training_encode_marks_context_latent_source():
+    BagelVAE = model_cls("bagel_vae")
+    BagelVAEConfig = config_cls("bagel_vae")
+    model = BagelVAE(
+        BagelVAEConfig(
+            resolution=8,
+            ch=32,
+            ch_mult=[1],
+            num_res_blocks=1,
+            z_channels=2,
+        )
+    )
+    item = ConversationItem(type="image", value=torch.zeros(3, 8, 8), role="assistant")
+    conversation = [[item]]
+
+    model._conversation_carrier = conversation
+    model._encode_items = [item]
+    out = model.encode_post(torch.ones(1, 2, 2, 2))
+
+    assert out["conversation_list"] is conversation
+    assert item.type == "output"
+    assert item.source == BAGEL_VAE_CONTEXT
+    assert item.value.shape == (2, 2, 2)
+
+
+def test_bagel_vae_training_encode_falls_back_for_raw_assistant_image():
+    from veomni.models.seed_omni.modules.bagel.vae.processing import BagelVAEProcessor
+
+    BagelVAE = model_cls("bagel_vae")
+    BagelVAEConfig = config_cls("bagel_vae")
+    model = BagelVAE(
+        BagelVAEConfig(
+            resolution=8,
+            ch=32,
+            ch_mult=[1],
+            num_res_blocks=1,
+            z_channels=2,
+            max_image_size=8,
+            min_image_size=8,
+            image_stride=4,
+            max_pixels=64,
+        )
+    )
+    model._image_processor = BagelVAEProcessor.from_config(model.config)
+    item = ConversationItem(type="image", value=torch.zeros(3, 8, 8), role="assistant")
+    conversation = [[item]]
+
+    out = model.encode_pre(conversation_list=conversation)
+
+    assert model._encode_items == [item]
+    assert out["pixel_values"].shape == (1, 3, 8, 8)
 
 
 def test_bagel_flow_embed_latent_infer_context_keeps_numeric_state_out_of_meta():
@@ -158,8 +215,17 @@ def test_bagel_flow_embed_latent_infer_context_keeps_numeric_state_out_of_meta()
 
 
 def test_bagel_vae_decode_skips_context_hidden_outputs():
-    from veomni.models.seed_omni.modules.bagel.vae.processing import latent_decode_items
-
+    BagelVAE = model_cls("bagel_vae")
+    BagelVAEConfig = config_cls("bagel_vae")
+    model = BagelVAE(
+        BagelVAEConfig(
+            resolution=8,
+            ch=32,
+            ch_mult=[1],
+            num_res_blocks=1,
+            z_channels=2,
+        )
+    )
     context_hidden = ConversationItem(type="output", value=torch.zeros(6, 8), role="assistant", meta={})
     vae_context = ConversationItem(
         type="output",
@@ -183,10 +249,48 @@ def test_bagel_vae_decode_skips_context_hidden_outputs():
         source=BAGEL_GENERATED_LATENT,
         meta={},
     )
+    conversation = [[context_hidden, vae_context, training_latent, velocity, final_latent]]
 
-    assert latent_decode_items([[context_hidden, vae_context, training_latent, velocity, final_latent]]) == [
-        final_latent
-    ]
+    out = model.decode_pre(conversation_list=conversation)
+
+    assert model._decode_items == [final_latent]
+    assert out["latents"].shape == (1, 4, 2, 2)
+
+
+def test_bagel_vae_decode_generated_returns_generated_image():
+    from veomni.models.seed_omni.modules.bagel.vae.processing import BagelVAEProcessor
+
+    BagelVAE = model_cls("bagel_vae")
+    BagelVAEConfig = config_cls("bagel_vae")
+    model = BagelVAE(
+        BagelVAEConfig(
+            resolution=8,
+            ch=32,
+            ch_mult=[1],
+            num_res_blocks=1,
+            z_channels=2,
+        )
+    )
+    model._image_processor = BagelVAEProcessor.from_config(model.config)
+    model._decode_latents = lambda latents: {  # type: ignore[method-assign]
+        "pixel_values": torch.ones(int(latents.shape[0]), 3, 2, 2, device=model.device, dtype=model.dtype)
+    }
+    item = ConversationItem(
+        type="output",
+        value=torch.zeros(2, 2, 2),
+        role="assistant",
+        source=BAGEL_GENERATED_LATENT,
+        meta={},
+    )
+    conversation = [item]
+
+    out = model.decode_generated(conversation_list=conversation)
+
+    assert out["conversation_list"] is conversation
+    assert out["generated"]["type"] == "image"
+    assert isinstance(out["generated"]["value"], Image.Image)
+    assert item.type == "image"
+    assert item.value.shape == (3, 2, 2)
 
 
 def test_bagel_flow_generation_state_tracks_denoise_round():
@@ -275,7 +379,11 @@ def test_bagel_siglip_processor_call_matches_saved_config(tmp_path):
     assert image_item.meta == {}
 
 
-def test_bagel_siglip_module_uses_initialized_processor_config():
+def test_bagel_siglip_from_pretrained_loads_processor_config(tmp_path):
+    from veomni.models.seed_omni.modules.bagel.siglip_navit.processing import (
+        BagelSiglipNavitProcessor,
+    )
+
     BagelSiglip = model_cls("bagel_siglip_navit")
     BagelSiglipConfig = config_cls("bagel_siglip_navit")
     model = BagelSiglip(
@@ -292,23 +400,80 @@ def test_bagel_siglip_module_uses_initialized_processor_config():
             vit_max_num_patch_per_side=2,
         )
     )
-    assert model._image_processor.image_size == 28
+    assert model._image_processor is None
 
-    model.config.image_size = 56
-    model.config.min_image_size = 56
-    model.config.max_pixels = 56 * 56
+    model.save_pretrained(tmp_path)
+    BagelSiglipNavitProcessor.from_config(model.config).save_pretrained(tmp_path)
+    loaded = BagelSiglip.from_pretrained(tmp_path)
+    assert loaded._image_processor.image_size == 28
+
+    loaded.config.image_size = 56
+    loaded.config.min_image_size = 56
+    loaded.config.max_pixels = 56 * 56
     image_item = ConversationItem(
         type="image",
         value=Image.new("RGB", (20, 10), color=(255, 0, 0)),
         role="user",
     )
 
-    inputs = model._image_processor(
+    inputs = loaded._image_processor(
         images=[image_item.value],
         return_tensors="pt",
-        device=model.device,
-        dtype=model.dtype,
+        device=loaded.device,
+        dtype=loaded.dtype,
     )
 
     assert inputs["token_lens"].tolist() == [2]
     assert inputs["patchified_pixel_values"].shape == (2, 14 * 14 * 3)
+
+
+def test_bagel_vae_processor_call_matches_saved_config(tmp_path):
+    from veomni.models.seed_omni.modules.bagel.vae.processing import BagelVAEProcessor
+
+    BagelVAEConfig = config_cls("bagel_vae")
+    config = BagelVAEConfig(
+        max_image_size=8,
+        min_image_size=8,
+        image_stride=4,
+        max_pixels=64,
+    )
+    processor = BagelVAEProcessor.from_config(config)
+    processor.save_pretrained(tmp_path)
+    loaded_processor = BagelVAEProcessor.from_pretrained(tmp_path)
+    image = Image.new("RGB", (20, 10), color=(255, 0, 0))
+
+    inputs = processor(images=[image], return_tensors="pt", device=torch.device("cpu"), dtype=torch.float32)
+    loaded_inputs = loaded_processor(
+        images=[image], return_tensors="pt", device=torch.device("cpu"), dtype=torch.float32
+    )
+
+    assert inputs["pixel_values"].shape == (1, 3, 4, 8)
+    assert torch.equal(inputs["pixel_values"], loaded_inputs["pixel_values"])
+
+
+def test_bagel_vae_from_pretrained_loads_processor_config(tmp_path):
+    from veomni.models.seed_omni.modules.bagel.vae.processing import BagelVAEProcessor
+
+    BagelVAE = model_cls("bagel_vae")
+    BagelVAEConfig = config_cls("bagel_vae")
+    model = BagelVAE(
+        BagelVAEConfig(
+            resolution=8,
+            ch=32,
+            ch_mult=[1],
+            num_res_blocks=1,
+            z_channels=2,
+            max_image_size=8,
+            min_image_size=8,
+            image_stride=4,
+            max_pixels=64,
+        )
+    )
+    assert model._image_processor is None
+
+    model.save_pretrained(tmp_path)
+    BagelVAEProcessor.from_config(model.config).save_pretrained(tmp_path)
+    loaded = BagelVAE.from_pretrained(tmp_path)
+
+    assert loaded._image_processor.max_image_size == 8
+    assert loaded._image_processor.image_stride == 4

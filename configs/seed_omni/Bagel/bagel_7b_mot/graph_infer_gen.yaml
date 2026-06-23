@@ -35,7 +35,7 @@ generation_graph:
 
     image_decode:
       body:
-        - { from: bagel_vae.decode, to: end }
+        - { from: bagel_vae.decode_generated, to: end }
       transitions:
         - { condition: { type: default }, next_state: done }
 

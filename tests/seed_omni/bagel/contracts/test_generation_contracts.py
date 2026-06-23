@@ -20,6 +20,7 @@ from veomni.models.seed_omni.modules.bagel.sources import (
     BAGEL_FLOW_QUERY,
     BAGEL_FLOW_VELOCITY,
     BAGEL_GENERATED_LATENT,
+    BAGEL_VAE_CONTEXT,
 )
 
 
@@ -417,7 +418,7 @@ class _InferGenBagelFlow(nn.Module):
 
 
 class _InferGenBagelVAE(nn.Module):
-    def decode(self, conversation_list: list[ConversationItem] | None = None, **kwargs):
+    def decode_generated(self, conversation_list: list[ConversationItem] | None = None, **kwargs):
         del kwargs
         assert conversation_list is not None
         assert "timestep" not in conversation_list[-1].meta
@@ -428,14 +429,20 @@ class _InferGenBagelVAE(nn.Module):
 
 
 class _InferEditBagelVAE(_InferGenBagelVAE):
-    def encode(self, conversation_list: list[ConversationItem] | None = None, **kwargs):
+    def encode_context(self, conversation_list: list[ConversationItem] | None = None, **kwargs):
         del kwargs
         assert conversation_list is not None
         for index, item in enumerate(conversation_list):
             if item.type == "image" and item.role == "user":
                 conversation_list.insert(
                     index,
-                    ConversationItem(type="output", value=torch.zeros(4, 4, 4), role="assistant", meta={}),
+                    ConversationItem(
+                        type="output",
+                        value=torch.zeros(4, 4, 4),
+                        role="assistant",
+                        source=BAGEL_VAE_CONTEXT,
+                        meta={},
+                    ),
                 )
                 break
         return {"conversation_list": conversation_list}

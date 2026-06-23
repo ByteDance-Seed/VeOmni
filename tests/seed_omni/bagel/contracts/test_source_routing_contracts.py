@@ -157,8 +157,6 @@ def test_bagel_qwen2_mot_velocity_collect_requires_flow_velocity_source() -> Non
 
 
 def test_bagel_marker_wrapping_skips_velocity_and_generated_latent_sources() -> None:
-    from veomni.models.seed_omni.modules.bagel.text_encoder.processing import is_image_item
-
     siglip = ConversationItem(
         type="image",
         value=torch.zeros(2, 4),
@@ -201,7 +199,12 @@ def test_bagel_marker_wrapping_skips_velocity_and_generated_latent_sources() -> 
         meta={},
     )
 
-    assert [item for item in (siglip, raw_image, context, query, velocity, generated) if is_image_item(item)] == [
+    marker_sources = {BAGEL_SIGLIP_CONTEXT, BAGEL_VAE_CONTEXT, BAGEL_FLOW_QUERY}
+    assert [
+        item
+        for item in (siglip, raw_image, context, query, velocity, generated)
+        if item.type in {"image", "output"} and item.source in marker_sources
+    ] == [
         siglip,
         context,
         query,

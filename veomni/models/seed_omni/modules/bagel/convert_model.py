@@ -255,6 +255,9 @@ def convert_bagel_checkpoint(
     vae_cfg = vae_cfg_cls()
     vae_state = _load_prefixed_safetensors(ae_path, lambda key: key, consumed_ae_keys)
     _save_module("bagel_vae", vae_cfg, vae_state, target_root)
+    from veomni.models.seed_omni.modules.bagel.vae.processing import BagelVAEProcessor
+
+    BagelVAEProcessor.from_config(vae_cfg).save_pretrained(target_root / "bagel_vae")
 
     # Position embeddings are deterministic sin-cos buffers regenerated from config.
     ignored_ema_keys = {"latent_pos_embed.pos_embed", "vit_pos_embed.pos_embed"}

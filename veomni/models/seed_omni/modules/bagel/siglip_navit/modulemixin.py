@@ -27,12 +27,9 @@ class BagelSiglipNavitCPUPreprocessor(CPUPreprocessor):
 
     def __call__(self, conversation_list: list[list[ConversationItem]]) -> None:
         image_items: list[ConversationItem] = []
-        for item in iter_desired_items(
-            conversation_list,
-            types=["image"],
-            roles=["user"],
-            sources=[None, BAGEL_SIGLIP_CONTEXT],
-        ):
+        # Training data routes image branches by role: user images feed SigLIP,
+        # assistant images feed VAE.
+        for item in iter_desired_items(conversation_list, types=["image"], roles=["user"]):
             if item.meta.get(_OMNI_PATCHES):
                 continue
             image_items.append(item)
@@ -167,7 +164,7 @@ class BagelSiglipNavitModuleMixin(ModuleMixin):
 
     def _select_siglip_image_items(
         self,
-        conversation_list: list[list[ConversationItem]] | None,
+        conversation_list: list[list[ConversationItem]] | None = None,
     ) -> list[ConversationItem]:
         if conversation_list is None:
             raise ValueError("BagelSiglipNavit requires conversation_list to select image items.")
@@ -176,9 +173,9 @@ class BagelSiglipNavitModuleMixin(ModuleMixin):
         # BagelSiglipNavitCPUPreprocessor, which patchifies raw images and tags
         # them as BAGEL_SIGLIP_CONTEXT. Inference does not have that prompt
         # preprocessor yet: edit/interleave graphs currently serialize
-        # bagel_vae.encode -> bagel_siglip_navit with explicit edges instead of
-        # materializing branch sources up front, so raw prompt images may still
-        # arrive with source=None.
+        # bagel_vae.encode_context -> bagel_siglip_navit with explicit edges
+        # instead of materializing branch sources up front, so raw prompt images
+        # may still arrive with source=None.
         image_items: list[ConversationItem] = []
         for item in iter_desired_items(
             conversation_list,

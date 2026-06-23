@@ -6,16 +6,6 @@ import torch
 from transformers import PreTrainedTokenizerBase
 
 from ....conversation import ConversationItem, is_dummy
-from ..sources import BAGEL_FLOW_QUERY, BAGEL_SIGLIP_CONTEXT, BAGEL_VAE_CONTEXT
-
-
-IMAGE_MARKER_TARGETS = frozenset(
-    {
-        ("image", BAGEL_SIGLIP_CONTEXT),
-        ("output", BAGEL_VAE_CONTEXT),
-        ("output", BAGEL_FLOW_QUERY),
-    }
-)
 
 
 def materialize_text_item_input_ids(
@@ -42,10 +32,6 @@ def materialize_text_item_input_ids(
     if tokenized_key is not None:
         item.meta[tokenized_key] = True
     return token_ids
-
-
-def is_image_item(item: ConversationItem) -> bool:
-    return not is_dummy(item) and (item.type, item.source) in IMAGE_MARKER_TARGETS
 
 
 def apply_image_marker(
@@ -75,6 +61,5 @@ def apply_image_marker(
 
 __all__ = [
     "apply_image_marker",
-    "is_image_item",
     "materialize_text_item_input_ids",
 ]

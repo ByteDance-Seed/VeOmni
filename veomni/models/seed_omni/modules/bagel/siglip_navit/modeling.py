@@ -36,7 +36,7 @@ class BagelSiglipNavit(BagelSiglipNavitModuleMixin, BagelSiglipNavitTraceMixin, 
         self.vision_model = BagelSiglipVisionTransformer(config)
         self.connector = MLPConnector(config.hidden_size, config.output_size, config.connector_act)
         self.vit_pos_embed = PositionEmbedding(config.vit_max_num_patch_per_side, config.output_size)
-        self._image_processor = BagelSiglipNavitProcessor.from_config(config)
+        self._image_processor: BagelSiglipNavitProcessor = None
         self.post_init()
 
     def _init_weights(self, module: nn.Module) -> None:

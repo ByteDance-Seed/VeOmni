@@ -1,18 +1,17 @@
 """BAGEL latent VAE module.
 
-Training graph call-sites:
-* ``bagel_vae.encode`` reads assistant image items and writes scaled latent
-  grids back to ``item.value``.
-* ``bagel_vae.decode`` reads output tensor items and writes decoded
-  image tensors back to ``item.value``.
+Tensor call-sites:
+* ``bagel_vae.encode`` maps normalized image tensors to scaled latent grids.
+* ``bagel_vae.decode`` maps generated latent grids to decoded image tensors.
 
 The VAE module is a codec boundary only. Flow timestep/noise sampling, latent
-patchification, and packed MoT indexes belong to downstream Bagel nodes.
+patchification, packed MoT indexes, and conversation-carrier mutation belong to
+the Bagel VAE module mixin and downstream Bagel nodes.
 """
 
 from __future__ import annotations
 
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from typing import Any
 
 import torch
@@ -23,6 +22,107 @@ from transformers import PreTrainedModel
 
 from .configuration import BagelVAEConfig
 from .modulemixin import BagelVAEModuleMixin
+from .processing import BagelVAEProcessor
+
+
+class BagelVAE(BagelVAEModuleMixin, PreTrainedModel):
+    config_class = BagelVAEConfig
+    image_processor_class = BagelVAEProcessor
+    base_model_prefix = "bagel_vae"
+    main_input_name = "pixel_values"
+    _no_split_modules: list[str] = ["ResnetBlock", "AttnBlock"]
+    supports_gradient_checkpointing = True
+
+    def __init__(self, config: BagelVAEConfig) -> None:
+        super().__init__(config)
+        self.encoder = Encoder(
+            resolution=config.resolution,
+            in_channels=config.in_channels,
+            ch=config.ch,
+            ch_mult=config.ch_mult,
+            num_res_blocks=config.num_res_blocks,
+            z_channels=config.z_channels,
+        )
+        self.decoder = Decoder(
+            resolution=config.resolution,
+            in_channels=config.in_channels,
+            ch=config.ch,
+            out_ch=config.out_ch,
+            ch_mult=config.ch_mult,
+            num_res_blocks=config.num_res_blocks,
+            z_channels=config.z_channels,
+        )
+        self.reg = DiagonalGaussian()
+        self._image_processor: BagelVAEProcessor | None = None
+        self.post_init()
+
+    def freeze_model(self) -> None:
+        if self.config.freeze:
+            self.eval()
+            self.requires_grad_(False)
+
+    @property
+    def _encoder_device(self) -> torch.device:
+        return self.encoder.conv_in.weight.device
+
+    @property
+    def _decoder_device(self) -> torch.device:
+        return self.decoder.conv_in.weight.device
+
+    @contextmanager
+    def _runtime_context(self, tensor: torch.Tensor):
+        grad_context = torch.enable_grad()
+        if self.config.freeze:
+            grad_context = torch.no_grad()
+
+        autocast_context = nullcontext()
+        if tensor.device.type == "cuda" and self.dtype != torch.float32:
+            autocast_context = torch.amp.autocast("cuda", enabled=True, dtype=self.dtype)
+
+        with grad_context, autocast_context:
+            yield
+
+    def encode(
+        self,
+        pixel_values: torch.Tensor | None = None,
+        **kwargs: object,
+    ) -> dict[str, Any]:
+        del kwargs
+        if pixel_values is not None:
+            return self._encode_pixel_values(pixel_values)
+
+        dummy = self.dummy_inputs(kind="encode")
+        outputs = self.encode(**dummy)
+        outputs["is_dummy"] = True
+        return outputs
+
+    def decode(
+        self,
+        latents: torch.Tensor | None = None,
+        **kwargs: object,
+    ) -> dict[str, Any]:
+        del kwargs
+        if latents is not None:
+            return self._decode_latents(latents)
+
+        dummy = self.dummy_inputs(kind="decode")
+        outputs = self._decode_latents(dummy["latents"])
+        outputs["is_dummy"] = True
+        return outputs
+
+    def _encode_pixel_values(self, pixel_values: torch.Tensor) -> dict[str, Any]:
+        pixel_values = pixel_values.to(device=self._encoder_device, dtype=self.dtype)
+        with self._runtime_context(pixel_values):
+            latents = self.reg(self.encoder(pixel_values))
+            latents = self.config.scale_factor * (latents - self.config.shift_factor)
+        return {"latents": latents.to(dtype=self.dtype)}
+
+    def _decode_latents(self, latents: torch.Tensor) -> dict[str, Any]:
+        latents = latents.to(device=self._decoder_device, dtype=self.dtype)
+        latents = latents / self.config.scale_factor + self.config.shift_factor
+        with self._runtime_context(latents):
+            pixel_values = self.decoder(latents)
+        return {"pixel_values": pixel_values.to(dtype=self.dtype)}
 
 
 def swish(x: Tensor) -> Tensor:
@@ -287,82 +387,6 @@ class DiagonalGaussian(nn.Module):
             std = torch.exp(0.5 * logvar)
             return mean + std * torch.randn_like(mean)
         return mean
-
-
-class BagelVAE(BagelVAEModuleMixin, PreTrainedModel):
-    config_class = BagelVAEConfig
-    base_model_prefix = "bagel_vae"
-    main_input_name = "pixel_values"
-    _no_split_modules: list[str] = ["ResnetBlock", "AttnBlock"]
-    supports_gradient_checkpointing = True
-
-    def __init__(self, config: BagelVAEConfig) -> None:
-        super().__init__(config)
-        self.encoder = Encoder(
-            resolution=config.resolution,
-            in_channels=config.in_channels,
-            ch=config.ch,
-            ch_mult=config.ch_mult,
-            num_res_blocks=config.num_res_blocks,
-            z_channels=config.z_channels,
-        )
-        self.decoder = Decoder(
-            resolution=config.resolution,
-            in_channels=config.in_channels,
-            ch=config.ch,
-            out_ch=config.out_ch,
-            ch_mult=config.ch_mult,
-            num_res_blocks=config.num_res_blocks,
-            z_channels=config.z_channels,
-        )
-        self.reg = DiagonalGaussian()
-        self.post_init()
-
-    def freeze_model(self) -> None:
-        if self.config.freeze:
-            self.eval()
-            self.requires_grad_(False)
-
-    def encode(
-        self,
-        pixel_values: torch.Tensor | None = None,
-        conversation_list: Any | None = None,
-        generation_kwargs: dict[str, Any] | None = None,
-        **kwargs: Any,
-    ) -> dict[str, Any]:
-        del generation_kwargs, kwargs
-        if pixel_values is not None:
-            return self._encode_pixel_values(pixel_values)
-        if conversation_list is not None:
-            return self._encode_context_conversation(conversation_list)
-        if pixel_values is None:
-            dummy = self.dummy_inputs(kind="encode")
-            outputs = self.encode(**dummy)
-            outputs["is_dummy"] = True
-            return outputs
-
-    def _encode_pixel_values(self, pixel_values: torch.Tensor) -> dict[str, Any]:
-        encoder_device = self.encoder.conv_in.weight.device
-        pixel_values = pixel_values.to(device=encoder_device, dtype=self.dtype)
-        grad_context = torch.no_grad() if self.config.freeze else torch.enable_grad()
-        with grad_context, self._autocast_context(pixel_values):
-            latents = self.reg(self.encoder(pixel_values))
-            latents = self.config.scale_factor * (latents - self.config.shift_factor)
-        return {"latents": latents.to(dtype=self.dtype)}
-
-    def _decode_latents(self, latents: torch.Tensor) -> dict[str, Any]:
-        decoder_device = self.decoder.conv_in.weight.device
-        latents = latents.to(device=decoder_device, dtype=self.dtype)
-        latents = latents / self.config.scale_factor + self.config.shift_factor
-        grad_context = torch.no_grad() if self.config.freeze else torch.enable_grad()
-        with grad_context, self._autocast_context(latents):
-            pixel_values = self.decoder(latents)
-        return {"pixel_values": pixel_values.to(dtype=self.dtype)}
-
-    def _autocast_context(self, tensor: torch.Tensor):
-        if tensor.device.type == "cuda" and self.dtype != torch.float32:
-            return torch.amp.autocast("cuda", enabled=True, dtype=self.dtype)
-        return nullcontext()
 
 
 __all__ = [
