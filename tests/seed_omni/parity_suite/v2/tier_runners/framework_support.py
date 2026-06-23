@@ -18,6 +18,7 @@ from tests.seed_omni.parity_suite.core import (
     ProbeReport,
     autocast_for_dtype,
     compare_values,
+    configure_torch_determinism,
     tolerance_from_policy,
     zero_module_grads,
 )
@@ -110,7 +111,7 @@ def run_direct_train_step(
     zero_module_grads(model.modules_dict.values())
     optimizer = build_multi_optimizer(model, lr=lr)
     scheduler = build_multi_scheduler(optimizer)
-    torch.manual_seed(seed)
+    configure_torch_determinism(seed)
     total_loss = 0.0
     pristine_batch = _clone_batch(batch)
     for _micro_step in range(num_micro_steps):
@@ -161,7 +162,7 @@ def run_trainer_train_step(
     trainer.on_step_end = lambda loss=None, loss_dict=None, grad_norm=None: events.update(
         {"loss": loss, "loss_dict": loss_dict, "grad_norm": grad_norm}
     )
-    torch.manual_seed(seed)
+    configure_torch_determinism(seed)
     with single_rank_ddp_clip_state():
         trainer.train_step(iter([[dict(batch)]]))
     events["global_step"] = int(trainer.base.state.global_step)

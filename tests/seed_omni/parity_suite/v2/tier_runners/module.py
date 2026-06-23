@@ -33,6 +33,7 @@ def run_v2_infer_module(
     modules = driver.load_v2_modules(config.module_names, device=device, dtype=dtype)
     for module in modules.values():
         module.eval()
+    driver.configure_determinism(driver.case.model.seed)
     model = ModuleRuntime(
         config=config,
         modules=modules,

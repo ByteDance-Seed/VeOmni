@@ -13,32 +13,26 @@ class FlowGenerationState:
     """Flow-side latent denoise state.
 
     The flow connector owns the numerical denoise state: noisy latent tokens,
-    timesteps, dt values, and the current FSM phase. Branch/cache/controller
-    state belongs to the MoT module and is intentionally not represented here.
+    timesteps, dt values, and step progress. Branch/cache/controller state
+    belongs to the MoT module and is intentionally not represented here.
     """
 
-    phase: str = "prepare_query"
-    x_t: torch.Tensor | None = None
-    timesteps: torch.Tensor | None = None
-    dts: torch.Tensor | None = None
-    step_index: int = 0
-    image_shape: tuple[int, int] | None = None
-    latent_grid_shape: tuple[int, int] | None = None
-    token_count: int = 0
-
-    @property
-    def initialized(self) -> bool:
-        return self.x_t is not None
+    _latents: torch.Tensor | None = None
+    _timestep_values: torch.Tensor | None = None
+    _dt_values: torch.Tensor | None = None
+    _step_index: int = 0
+    _image_shape: tuple[int, int] | None = None
+    _grid_shape: tuple[int, int] | None = None
+    _token_count: int = 0
 
     def reset(self) -> None:
-        self.phase = "prepare_query"
-        self.x_t = None
-        self.timesteps = None
-        self.dts = None
-        self.step_index = 0
-        self.image_shape = None
-        self.latent_grid_shape = None
-        self.token_count = 0
+        self._latents = None
+        self._timestep_values = None
+        self._dt_values = None
+        self._step_index = 0
+        self._image_shape = None
+        self._grid_shape = None
+        self._token_count = 0
 
     def initialize(
         self,
@@ -67,74 +61,94 @@ class FlowGenerationState:
         timesteps = torch.linspace(1.0, 0.0, num_timesteps, device=device, dtype=torch.float32)
         timesteps = timestep_shift * timesteps / (1.0 + (timestep_shift - 1.0) * timesteps)
 
-        self.timesteps = timesteps[:-1]
-        self.dts = timesteps[:-1] - timesteps[1:]
-        self.x_t = torch.randn(
+        self._timestep_values = timesteps[:-1]
+        self._dt_values = timesteps[:-1] - timesteps[1:]
+        self._latents = torch.randn(
             token_count,
             int(patch_latent_dim),
             device=device,
             dtype=torch.float32,
         )
-        self.step_index = 0
-        self.image_shape = (image_height, image_width)
-        self.latent_grid_shape = grid_shape
-        self.token_count = token_count
-        self.phase = "prepare_query"
+        self._step_index = 0
+        self._image_shape = (image_height, image_width)
+        self._grid_shape = grid_shape
+        self._token_count = token_count
 
-    def require_latents(self) -> torch.Tensor:
-        if self.x_t is None:
+    @property
+    def initialized(self) -> bool:
+        return self._latents is not None
+
+    @property
+    def step_index(self) -> int:
+        return self._step_index
+
+    @property
+    def image_shape(self) -> tuple[int, int] | None:
+        return self._image_shape
+
+    @property
+    def token_count(self) -> int:
+        return self._token_count
+
+    @property
+    def latents(self) -> torch.Tensor:
+        if self._latents is None:
             raise RuntimeError("BAGEL flow denoise latent state is not initialized.")
-        return self.x_t
+        return self._latents
 
-    def require_timesteps(self) -> torch.Tensor:
-        if self.timesteps is None:
+    @property
+    def timestep_values(self) -> torch.Tensor:
+        if self._timestep_values is None:
             raise RuntimeError("BAGEL flow denoise timesteps are not initialized.")
-        return self.timesteps
+        return self._timestep_values
 
-    def require_dts(self) -> torch.Tensor:
-        if self.dts is None:
+    @property
+    def dt_values(self) -> torch.Tensor:
+        if self._dt_values is None:
             raise RuntimeError("BAGEL flow denoise dt values are not initialized.")
-        return self.dts
+        return self._dt_values
 
-    def require_latent_grid_shape(self) -> tuple[int, int]:
-        if self.latent_grid_shape is None:
+    @property
+    def grid_shape(self) -> tuple[int, int]:
+        if self._grid_shape is None:
             raise RuntimeError("BAGEL flow denoise latent grid shape is not initialized.")
-        return self.latent_grid_shape
+        return self._grid_shape
 
     def current_timestep(self) -> torch.Tensor:
-        timesteps = self.require_timesteps()
-        if self.step_index >= int(timesteps.numel()):
+        timesteps = self.timestep_values
+        if self._step_index >= int(timesteps.numel()):
             raise RuntimeError("BAGEL flow denoise timestep index is past the final step.")
-        return timesteps[self.step_index]
+        return timesteps[self._step_index]
 
     def current_timestep_tokens(self) -> torch.Tensor:
-        x_t = self.require_latents()
+        x_t = self.latents
         return self.current_timestep().reshape(1).expand(int(x_t.shape[0]))
 
     def is_complete(self) -> bool:
-        timesteps = self.require_timesteps()
-        return self.step_index >= int(timesteps.numel())
+        timesteps = self.timestep_values
+        return self._step_index >= int(timesteps.numel())
 
     def strip_query_markers(self, hidden: torch.Tensor) -> torch.Tensor:
-        if self.token_count and int(hidden.shape[0]) == self.token_count + 2:
+        if self._token_count and int(hidden.shape[0]) == self._token_count + 2:
             hidden = hidden[1:-1]
-        if self.token_count and int(hidden.shape[0]) != self.token_count:
+        if self._token_count and int(hidden.shape[0]) != self._token_count:
             raise ValueError(
-                f"BAGEL flow decode_velocity token count mismatch: got {hidden.shape[0]}, expected {self.token_count}."
+                f"BAGEL flow decode_velocity token count mismatch: got {hidden.shape[0]}, expected {self._token_count}."
             )
         return hidden
 
     def advance(self, velocity: torch.Tensor) -> bool:
-        x_t = self.require_latents()
-        dts = self.require_dts()
+        x_t = self.latents
+        dts = self.dt_values
         velocity = velocity.to(device=x_t.device, dtype=x_t.dtype)
         if velocity.shape != x_t.shape:
             raise ValueError(
                 f"BAGEL flow velocity shape mismatch: got {tuple(velocity.shape)}, expected {tuple(x_t.shape)}."
             )
-        dt = dts[self.step_index].to(device=x_t.device, dtype=x_t.dtype)
-        self.x_t = x_t - velocity * dt
-        self.step_index += 1
+
+        dt = dts[self._step_index].to(device=x_t.device, dtype=x_t.dtype)
+        self._latents = x_t - velocity * dt
+        self._step_index += 1
         return self.step_index >= int(dts.numel())
 
 

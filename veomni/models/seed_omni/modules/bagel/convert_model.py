@@ -236,6 +236,7 @@ def convert_bagel_checkpoint(
         hidden_size=hidden_size,
         patch_latent_dim=patch_latent_dim,
         max_latent_size=max_latent_size,
+        timestep_shift=1.0,
     )
     flow_prefixes = ("vae2llm.", "llm2vae.", "time_embedder.")
     flow_state = _load_prefixed_safetensors(

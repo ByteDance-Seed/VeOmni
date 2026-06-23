@@ -71,6 +71,7 @@ def _run_v2_train_graph_batch(
 ) -> dict[str, Any]:
     del capture_options
     model = driver.load_v2_model(device=device, dtype=dtype).train()
+    driver.configure_determinism(driver.case.model.seed)
     zero_module_grads(model.modules_dict.values())
     batch = dict(batch_kwargs)
     apply_training_cpu_preprocessors(model, batch)

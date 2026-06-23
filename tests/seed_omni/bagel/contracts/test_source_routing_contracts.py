@@ -27,9 +27,9 @@ def test_bagel_denoise_item_source_lifecycle() -> None:
     }
     conversation = [ConversationItem(type="text", value="prompt", role="user")]
 
-    model._prepare_latent_query(
-        conversation,
-        {"image_height": 16, "image_width": 16, "latent_downsample": 16, "num_timesteps": 2},
+    model.prepare_denoise_query(
+        conversation_list=conversation,
+        generation_kwargs={"image_height": 16, "image_width": 16, "latent_downsample": 16, "num_timesteps": 2},
     )
     item = conversation[-1]
     assert item.source == BAGEL_FLOW_QUERY
@@ -37,12 +37,12 @@ def test_bagel_denoise_item_source_lifecycle() -> None:
 
     item.source = BAGEL_FLOW_HIDDEN
     item.value = torch.ones(3, 4)
-    model._decode_velocity_from_hidden(conversation)
+    model.decode_velocity_from_hidden(conversation_list=conversation)
     assert item.source == BAGEL_FLOW_VELOCITY
     assert item.value.shape == (1, 1)
     assert item.meta.keys() == {"timestep"}
 
-    out = model._advance_denoise(conversation)
+    out = model.advance_denoise(conversation_list=conversation)
     assert out[FSM_SIGNAL_KEY] == SIGNAL_IMAGE_COMPLETE
     assert item.source == BAGEL_GENERATED_LATENT
     assert item.value.shape == (1, 1, 1)
@@ -110,7 +110,7 @@ def test_bagel_flow_decode_and_advance_require_source_routed_products() -> None:
         meta={"timestep": torch.tensor(0.5)},
     )
     with pytest.raises(ValueError, match="bagel_flow_hidden"):
-        model._decode_velocity_from_hidden([wrong_source_hidden])
+        model.decode_velocity_from_hidden(conversation_list=[wrong_source_hidden])
 
     wrong_size_hidden = ConversationItem(
         type="output",
@@ -120,7 +120,7 @@ def test_bagel_flow_decode_and_advance_require_source_routed_products() -> None:
         meta={"timestep": torch.tensor(0.5)},
     )
     with pytest.raises(ValueError, match="hidden-size mismatch"):
-        model._decode_velocity_from_hidden([wrong_size_hidden])
+        model.decode_velocity_from_hidden(conversation_list=[wrong_size_hidden])
 
     model._generation_state.initialize(
         {"image_height": 16, "image_width": 16, "latent_downsample": 16, "num_timesteps": 2},
@@ -130,7 +130,7 @@ def test_bagel_flow_decode_and_advance_require_source_routed_products() -> None:
     )
     wrong_source_velocity = ConversationItem(type="output", value=torch.zeros(1, 1), role="assistant", meta={})
     with pytest.raises(ValueError, match="bagel_flow_velocity"):
-        model._advance_denoise([wrong_source_velocity])
+        model.advance_denoise(conversation_list=[wrong_source_velocity])
 
     wrong_shape_velocity = ConversationItem(
         type="output",
@@ -140,7 +140,79 @@ def test_bagel_flow_decode_and_advance_require_source_routed_products() -> None:
         meta={},
     )
     with pytest.raises(ValueError, match="velocity shape mismatch"):
-        model._advance_denoise([wrong_shape_velocity])
+        model.advance_denoise(conversation_list=[wrong_shape_velocity])
+
+
+def test_bagel_flow_reset_clears_denoise_state() -> None:
+    model = _tiny_flow_connector()
+    model.embed_latent = lambda **kwargs: {  # type: ignore[method-assign]
+        "latent_embeds": torch.ones(kwargs["latents"].shape[0], 4, device=model.device, dtype=model.dtype)
+    }
+    conversation = [ConversationItem(type="text", value="prompt", role="user")]
+
+    model.prepare_denoise_query(conversation_list=conversation)
+    assert model._generation_state.initialized
+
+    model.reset_local_inference_state()
+    assert not model._generation_state.initialized
+
+
+def test_bagel_flow_context_embed_consumes_only_vae_context_latents() -> None:
+    model = _tiny_flow_connector()
+    raw_latent = ConversationItem(type="output", value=torch.zeros(1, 2, 2), role="assistant", meta={})
+    vae_context = ConversationItem(
+        type="output",
+        value=torch.ones(1, 2, 2),
+        role="assistant",
+        source=BAGEL_VAE_CONTEXT,
+        meta={},
+    )
+    conversation = [raw_latent, vae_context]
+    model.embed_latent = lambda **kwargs: {  # type: ignore[method-assign]
+        "latent_embeds": torch.full((kwargs["latents"].shape[0], 4), 7.0, device=model.device, dtype=model.dtype)
+    }
+
+    model.embed_context_latents(conversation_list=conversation)
+
+    assert raw_latent.value.shape == (1, 2, 2)
+    assert vae_context.value.shape == (4, 4)
+
+
+def test_bagel_flow_training_embed_consumes_only_vae_context_latents() -> None:
+    model = _tiny_flow_connector()
+    raw_latent = ConversationItem(type="output", value=torch.zeros(1, 2, 2), role="assistant", meta={})
+    vae_context = ConversationItem(
+        type="output",
+        value=torch.ones(1, 2, 2),
+        role="assistant",
+        source=BAGEL_VAE_CONTEXT,
+        meta={},
+    )
+
+    out = model.embed_latent_pre(conversation_list=[[raw_latent, vae_context]], timestep_shift=1.0)
+
+    assert model._embed_items == [vae_context]
+    assert out["latents"].shape == (4, 1)
+    assert "flow_velocity_target" not in raw_latent.meta
+    assert "flow_velocity_target" in vae_context.meta
+
+
+def test_bagel_flow_training_decode_consumes_velocity_target_items() -> None:
+    model = _tiny_flow_connector()
+    hidden = torch.zeros(2, int(model.config.hidden_size))
+    unrelated = ConversationItem(type="output", value=hidden.clone(), role="assistant", meta={})
+    target = ConversationItem(
+        type="output",
+        value=hidden.clone(),
+        role="assistant",
+        source=BAGEL_VAE_CONTEXT,
+        meta={"flow_velocity_target": torch.ones(2, int(model.config.patch_latent_dim))},
+    )
+
+    out = model.decode_velocity_pre(conversation_list=[[unrelated, target]])
+
+    assert model._decode_items == [target]
+    assert out["hidden_states"].shape == (2, int(model.config.hidden_size))
 
 
 def test_bagel_qwen2_mot_velocity_collect_requires_flow_velocity_source() -> None:

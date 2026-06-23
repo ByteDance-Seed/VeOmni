@@ -8,35 +8,30 @@ generation_graph:
       body:
         - { from: bagel_text_encoder,                     to: bagel_qwen2_mot }
         - { from: bagel_vae.encode_context,               to: bagel_siglip_navit }
-        - { from: bagel_siglip_navit,                     to: bagel_flow_connector.embed_latent }
-        - { from: bagel_flow_connector.embed_latent,      to: bagel_text_encoder.encode_image_markers }
+        - { from: bagel_siglip_navit,                     to: bagel_flow_connector.embed_context_latents }
+        - { from: bagel_flow_connector.embed_context_latents, to: bagel_text_encoder.encode_image_markers }
         - { from: bagel_text_encoder.encode_image_markers, to: bagel_qwen2_mot }
         - { from: bagel_qwen2_mot,                        to: end }
       transitions:
-        - { condition: { type: default }, next_state: denoise_query }
+        - { condition: { type: default }, next_state: query_denoise }
 
-    denoise_query:
+    query_denoise:
       body:
-        - { from: bagel_flow_connector,                    to: bagel_text_encoder.encode_image_markers }
-        - { from: bagel_text_encoder.encode_image_markers, to: bagel_qwen2_mot }
-        - { from: bagel_qwen2_mot,                         to: end }
+        - { from: bagel_flow_connector.prepare_denoise_query, to: bagel_text_encoder.encode_image_markers }
+        - { from: bagel_text_encoder.encode_image_markers, to: bagel_qwen2_mot.run_denoise_branch }
+        - { from: bagel_qwen2_mot.run_denoise_branch,      to: end }
       transitions:
         - { condition: { type: default }, next_state: velocity_collect }
 
     velocity_collect:
       body:
-        - { from: bagel_flow_connector, to: bagel_qwen2_mot }
-        - { from: bagel_qwen2_mot,      to: end }
+        - { from: bagel_flow_connector.decode_velocity_from_hidden, to: bagel_qwen2_mot.collect_velocity }
+        - { from: bagel_qwen2_mot.collect_velocity,                 to: bagel_flow_connector.advance_denoise }
+        - { from: bagel_flow_connector.advance_denoise,             to: end }
       transitions:
-        - { condition: { type: module_signal, key: need_denoise_branch }, next_state: denoise_query }
-        - { condition: { type: module_signal, key: velocity_ready },      next_state: denoise_advance }
-
-    denoise_advance:
-      body:
-        - { from: bagel_flow_connector, to: end }
-      transitions:
+        - { condition: { type: module_signal, key: need_denoise_branch }, next_state: query_denoise }
         - { condition: { type: module_signal, key: image_complete }, next_state: image_decode }
-        - { condition: { type: default }, next_state: denoise_query }
+        - { condition: { type: default }, next_state: query_denoise }
 
     image_decode:
       body:

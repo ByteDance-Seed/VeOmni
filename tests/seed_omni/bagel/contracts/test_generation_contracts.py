@@ -68,10 +68,9 @@ def test_bagel_infer_gen_denoise_signal_smoke():
         },
     )
 
-    assert any("transition: prompt_encode -> denoise_query" in entry for entry in trace)
-    assert any("transition: denoise_query -> velocity_collect" in entry for entry in trace)
-    assert any("transition: velocity_collect -> denoise_advance" in entry for entry in trace)
-    assert any("transition: denoise_advance -> image_decode" in entry for entry in trace)
+    assert any("transition: prompt_encode -> query_denoise" in entry for entry in trace)
+    assert any("transition: query_denoise -> velocity_collect" in entry for entry in trace)
+    assert any("transition: velocity_collect -> image_decode" in entry for entry in trace)
     assert any("transition: image_decode -> done" in entry for entry in trace)
     assert any(item["type"] == "image" for item in model.generated)
     assert "timestep" not in ctx["conversation_list"][-1].meta
@@ -111,7 +110,7 @@ def test_bagel_infer_edit_defaults_to_denoise_signal_smoke():
         },
     )
 
-    assert any("transition: prompt_encode -> denoise_query" in entry for entry in trace)
+    assert any("transition: prompt_encode -> query_denoise" in entry for entry in trace)
     assert not any("transition: prompt_encode -> text_ar" in entry for entry in trace)
     assert any("transition: image_decode -> done" in entry for entry in trace)
     assert any(item["type"] == "image" for item in model.generated)
@@ -150,11 +149,11 @@ def test_bagel_infer_gen_cfg_text_branch_signal_smoke():
     )
 
     assert any(
-        "transition: velocity_collect -> denoise_query [module_signal(need_denoise_branch)]" in entry
+        "transition: velocity_collect -> query_denoise [module_signal(need_denoise_branch)]" in entry
         for entry in trace
     )
     assert any(
-        "transition: velocity_collect -> denoise_advance [module_signal(velocity_ready)]" in entry for entry in trace
+        "transition: velocity_collect -> image_decode [module_signal(image_complete)]" in entry for entry in trace
     )
     assert any(item["type"] == "image" for item in model.generated)
     assert "timestep" not in ctx["conversation_list"][-1].meta
@@ -194,11 +193,11 @@ def test_bagel_infer_gen_cfg_text_and_image_branch_signal_smoke():
     branch_transitions = [
         entry
         for entry in trace
-        if "transition: velocity_collect -> denoise_query [module_signal(need_denoise_branch)]" in entry
+        if "transition: velocity_collect -> query_denoise [module_signal(need_denoise_branch)]" in entry
     ]
     assert len(branch_transitions) == 2
     assert any(
-        "transition: velocity_collect -> denoise_advance [module_signal(velocity_ready)]" in entry for entry in trace
+        "transition: velocity_collect -> image_decode [module_signal(image_complete)]" in entry for entry in trace
     )
     assert any(item["type"] == "image" for item in model.generated)
     assert "timestep" not in ctx["conversation_list"][-1].meta
@@ -313,7 +312,7 @@ def test_bagel_qwen2_mot_cfg_text_image_velocity_collection_and_merge():
     guided = cfg_img + 1.5 * (text_guided - cfg_img)
     expected = guided * (torch.norm(main) / (torch.norm(guided) + 1e-8)).clamp(min=0.0, max=1.0)
 
-    assert out[FSM_SIGNAL_KEY] == "velocity_ready"
+    assert FSM_SIGNAL_KEY not in out
     assert model._generation_state.denoise_branch == "main"
     assert model._generation_state.velocity_buffer == {}
     torch.testing.assert_close(conversation[-1].value, expected)
@@ -369,51 +368,84 @@ class _InferGenBagelQwen(nn.Module):
                 self.velocity_collect_count += 1
                 tail.value = None
                 return {"conversation_list": conversation_list, FSM_SIGNAL_KEY: "need_denoise_branch"}
-            return {"conversation_list": conversation_list, FSM_SIGNAL_KEY: "velocity_ready"}
+            return {"conversation_list": conversation_list}
+        return {"conversation_list": conversation_list}
+
+    def run_denoise_branch(self, conversation_list: list[ConversationItem] | None = None, **kwargs):
+        del kwargs
+        assert conversation_list is not None
+        tail = conversation_list[-1]
+        assert tail.source == BAGEL_FLOW_QUERY
+        tail.source = BAGEL_FLOW_HIDDEN
+        return {"conversation_list": conversation_list}
+
+    def collect_velocity(
+        self,
+        conversation_list: list[ConversationItem] | None = None,
+        generation_kwargs: dict | None = None,
+        **kwargs,
+    ):
+        del kwargs
+        assert conversation_list is not None
+        tail = conversation_list[-1]
+        assert tail.source == BAGEL_FLOW_VELOCITY
+        branch_count = 0
+        if float((generation_kwargs or {}).get("cfg_text_scale", 1.0)) > 1.0:
+            branch_count += 1
+        if float((generation_kwargs or {}).get("cfg_img_scale", 1.0)) > 1.0:
+            branch_count += 1
+        if self.velocity_collect_count < branch_count:
+            self.velocity_collect_count += 1
+            tail.value = None
+            return {"conversation_list": conversation_list, FSM_SIGNAL_KEY: "need_denoise_branch"}
         return {"conversation_list": conversation_list}
 
 
 class _InferGenBagelFlow(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.phase = "prepare"
-
-    def generate(self, conversation_list: list[ConversationItem] | None = None, **kwargs):
+    def prepare_denoise_query(self, conversation_list: list[ConversationItem] | None = None, **kwargs):
         del kwargs
         assert conversation_list is not None
-        if self.phase == "advance" and not torch.is_tensor(conversation_list[-1].value):
-            self.phase = "prepare"
-        if self.phase == "prepare":
-            item = conversation_list[-1] if conversation_list and conversation_list[-1].type == "output" else None
-            if item is None:
-                conversation_list.append(
-                    ConversationItem(
-                        type="output",
-                        value=torch.zeros(16, 8),
-                        role="assistant",
-                        source=BAGEL_FLOW_QUERY,
-                        meta={"timestep": torch.tensor(0.5)},
-                    )
-                )
-            else:
-                item.value = torch.zeros(16, 8)
-                item.source = BAGEL_FLOW_QUERY
-                item.meta = {"timestep": torch.tensor(0.5)}
-            self.phase = "decode"
-            return {"conversation_list": conversation_list}
-        if self.phase == "decode":
+        if (
+            conversation_list
+            and conversation_list[-1].type == "output"
+            and not torch.is_tensor(conversation_list[-1].value)
+        ):
             item = conversation_list[-1]
-            assert item.source == BAGEL_FLOW_HIDDEN
-            assert item.value.shape == (18, 8)
-            item.value = torch.zeros(16, 4)
-            item.source = BAGEL_FLOW_VELOCITY
-            self.phase = "advance"
-            return {"conversation_list": conversation_list}
+        else:
+            item = conversation_list[-1] if conversation_list and conversation_list[-1].type == "output" else None
+        if item is None:
+            conversation_list.append(
+                ConversationItem(
+                    type="output",
+                    value=torch.zeros(16, 8),
+                    role="assistant",
+                    source=BAGEL_FLOW_QUERY,
+                    meta={"timestep": torch.tensor(0.5)},
+                )
+            )
+        else:
+            item.value = torch.zeros(16, 8)
+            item.source = BAGEL_FLOW_QUERY
+            item.meta = {"timestep": torch.tensor(0.5)}
+        return {"conversation_list": conversation_list}
+
+    def decode_velocity_from_hidden(self, conversation_list: list[ConversationItem] | None = None, **kwargs):
+        del kwargs
+        assert conversation_list is not None
+        item = conversation_list[-1]
+        assert item.source == BAGEL_FLOW_HIDDEN
+        assert item.value.shape == (18, 8)
+        item.value = torch.zeros(16, 4)
+        item.source = BAGEL_FLOW_VELOCITY
+        return {"conversation_list": conversation_list}
+
+    def advance_denoise(self, conversation_list: list[ConversationItem] | None = None, **kwargs):
+        del kwargs
+        assert conversation_list is not None
         item = conversation_list[-1]
         item.value = torch.zeros(1, 4, 4)
         item.source = BAGEL_GENERATED_LATENT
         item.meta.pop("timestep", None)
-        self.phase = "done"
         return {"conversation_list": conversation_list, FSM_SIGNAL_KEY: "image_complete"}
 
 
@@ -449,7 +481,7 @@ class _InferEditBagelVAE(_InferGenBagelVAE):
 
 
 class _InferEditBagelFlow(_InferGenBagelFlow):
-    def embed_latent(self, conversation_list: list[ConversationItem] | None = None, **kwargs):
+    def embed_context_latents(self, conversation_list: list[ConversationItem] | None = None, **kwargs):
         del kwargs
         assert conversation_list is not None
         for item in conversation_list:

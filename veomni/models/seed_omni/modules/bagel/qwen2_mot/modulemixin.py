@@ -30,7 +30,6 @@ from .processing import (
 )
 
 
-SIGNAL_VELOCITY_READY = "velocity_ready"
 SIGNAL_NEED_DENOISE_BRANCH = "need_denoise_branch"
 
 
@@ -210,6 +209,36 @@ class BagelQwen2MoTModuleMixin(ModuleMixin):
                 generation_kwargs=generation_kwargs or {},
             )
         raise RuntimeError(f"Unsupported BAGEL Qwen2-MoT inference phase: {phase!r}")
+
+    def run_denoise_branch(
+        self,
+        conversation_list: list[ConversationItem] | list[list[ConversationItem]] | None = None,
+        generation_kwargs: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        del kwargs
+        validate_cfg_request(generation_kwargs or {})
+        conversation = single_inference_conversation(conversation_list)
+        return self._run_denoise_branch(
+            conversation_list=conversation_list,
+            conversation=conversation,
+            generation_kwargs=generation_kwargs or {},
+        )
+
+    def collect_velocity(
+        self,
+        conversation_list: list[ConversationItem] | list[list[ConversationItem]] | None = None,
+        generation_kwargs: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        del kwargs
+        validate_cfg_request(generation_kwargs or {})
+        conversation = single_inference_conversation(conversation_list)
+        return self._collect_or_merge_velocity(
+            conversation_list=conversation_list,
+            conversation=conversation,
+            generation_kwargs=generation_kwargs or {},
+        )
 
     def _resolve_inference_phase(
         self,
@@ -483,7 +512,7 @@ class BagelQwen2MoTModuleMixin(ModuleMixin):
             dtype=self.dtype,
         )
         if collect_state == "ready":
-            return {"conversation_list": conversation_list, FSM_SIGNAL_KEY: SIGNAL_VELOCITY_READY}
+            return {"conversation_list": conversation_list}
         if collect_state == "need_branch":
             tail.value = None
             return {"conversation_list": conversation_list, FSM_SIGNAL_KEY: SIGNAL_NEED_DENOISE_BRANCH}
@@ -500,7 +529,7 @@ class BagelQwen2MoTModuleMixin(ModuleMixin):
             generation_kwargs=generation_kwargs,
         ).to(device=self.device)
         state.finish_velocity_round()
-        return {"conversation_list": conversation_list, FSM_SIGNAL_KEY: SIGNAL_VELOCITY_READY}
+        return {"conversation_list": conversation_list}
 
     def _snapshot_cfg_text_context(
         self,

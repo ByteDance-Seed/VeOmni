@@ -59,6 +59,7 @@ class BagelSiglipNavitModuleMixin(ModuleMixin):
     def init_omni_state(self) -> None:
         self._conversation_carrier: list[list[ConversationItem]] | None = None
         self._image_items: list[ConversationItem] = []
+        self._forward_is_dummy = False
 
     def build_cpu_preprocessor(self) -> CPUPreprocessor | None:
         """Worker-side image patchify for training batches."""
@@ -100,9 +101,12 @@ class BagelSiglipNavitModuleMixin(ModuleMixin):
     ) -> dict[str, Any]:
         del kwargs
         self._conversation_carrier = conversation_list
+        self._forward_is_dummy = False
+
         self._image_items = self._select_siglip_image_items(conversation_list)
         if not self._image_items:
-            return {"patchified_pixel_values": None}
+            self._forward_is_dummy = True
+            return self.dummy_inputs()
 
         if all(item.meta.get(_OMNI_PATCHES) for item in self._image_items):
             return self._inputs_from_preprocessed_items(self._image_items)
@@ -120,12 +124,13 @@ class BagelSiglipNavitModuleMixin(ModuleMixin):
         self,
         image_embeds: torch.Tensor,
         token_lens: torch.Tensor | None = None,
-        is_dummy: bool = False,
     ) -> dict[str, Any]:
         conversation = self._conversation_carrier
         image_items = self._image_items
+        is_dummy = self._forward_is_dummy
         self._conversation_carrier = None
         self._image_items = []
+        self._forward_is_dummy = False
 
         if is_dummy:
             value = image_embeds.squeeze(0) if image_embeds.dim() == 3 and image_embeds.shape[0] == 1 else image_embeds

@@ -7,3 +7,6 @@ from .modulemixin import BagelTextEncoderModuleMixin
 
 class BagelTextEncoder(BagelTextEncoderModuleMixin, TextEncoder):
     config_class = BagelTextEncoderConfig
+
+
+__all__ = ["BagelTextEncoder", "BagelTextEncoderConfig"]

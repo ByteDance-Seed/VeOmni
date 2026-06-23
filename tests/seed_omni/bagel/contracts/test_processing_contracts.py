@@ -41,24 +41,18 @@ def test_bagel_training_text_embed_meta_preserves_grad():
 
 def test_bagel_training_flow_metadata_matches_packed_noising_dtype():
     from veomni.models.seed_omni.modules.bagel.flow_connector.processing import (
-        patchify_latent_grid,
-        prepare_embed_latent_inputs,
+        preprocess_latent_embed,
     )
 
     latent = torch.arange(4, dtype=torch.float32).reshape(1, 1, 2, 2)
-    noise = torch.linspace(-1.0, 1.0, steps=4, dtype=torch.float32).reshape(1, 4)
-    raw_timestep_logits = torch.tensor([0.25], dtype=torch.float32)
     item = ConversationItem(
         type="output",
         value=latent,
         role="assistant",
-        meta={
-            "timestep": raw_timestep_logits,
-            "noise": noise,
-        },
+        meta={},
     )
 
-    inputs, lengths = prepare_embed_latent_inputs(
+    inputs, lengths = preprocess_latent_embed(
         [item],
         config=SimpleNamespace(z_channels=1, latent_patch_size=2, max_latent_size=2),
         device=torch.device("cpu"),
@@ -66,10 +60,9 @@ def test_bagel_training_flow_metadata_matches_packed_noising_dtype():
         timestep_shift=3.0,
     )
 
-    clean, _ = patchify_latent_grid(latent, z_channels=1, latent_patch_size=2)
-    clean = clean.to(dtype=torch.bfloat16)
-    expected_noise = noise.to(dtype=clean.dtype)
-    expected_shifted = raw_timestep_logits
+    clean = torch.tensor([[0.0, 1.0, 2.0, 3.0]], dtype=torch.bfloat16)
+    expected_noise = item.meta["noise"]
+    expected_shifted = item.meta["timestep"]
     expected_noised = (1.0 - expected_shifted.reshape(-1, 1)) * clean + expected_shifted.reshape(
         -1, 1
     ) * expected_noise
@@ -77,6 +70,7 @@ def test_bagel_training_flow_metadata_matches_packed_noising_dtype():
 
     assert lengths == [1]
     assert item.meta["timestep"].dtype == torch.float32
+    assert expected_noise.shape == clean.shape
     assert torch.equal(item.meta["flow_velocity_target"], expected_noise - clean)
     assert torch.equal(inputs["latents"], expected_noised)
 
@@ -100,7 +94,7 @@ def test_bagel_vae_infer_encode_inserts_context_latent_before_user_image():
         )
     )
     model._image_processor = BagelVAEProcessor.from_config(model.config)
-    model._encode_pixel_values = lambda pixel_values: {  # type: ignore[method-assign]
+    model.encode = lambda pixel_values, **kwargs: {  # type: ignore[method-assign]
         "latents": torch.ones(int(pixel_values.shape[0]), 2, 2, 2, device=model.device, dtype=model.dtype)
     }
     image = torch.zeros(3, 8, 8)
@@ -203,7 +197,7 @@ def test_bagel_flow_embed_latent_infer_context_keeps_numeric_state_out_of_meta()
 
     model.time_embedder.forward = capture_time_embedder  # type: ignore[method-assign]
 
-    out = model.embed_latent(conversation_list=conversation)
+    out = model.embed_context_latents(conversation_list=conversation)
 
     assert out["conversation_list"] is conversation
     assert item.value.shape == (4, 4)
@@ -272,7 +266,7 @@ def test_bagel_vae_decode_generated_returns_generated_image():
         )
     )
     model._image_processor = BagelVAEProcessor.from_config(model.config)
-    model._decode_latents = lambda latents: {  # type: ignore[method-assign]
+    model.decode = lambda latents, **kwargs: {  # type: ignore[method-assign]
         "pixel_values": torch.ones(int(latents.shape[0]), 3, 2, 2, device=model.device, dtype=model.dtype)
     }
     item = ConversationItem(
@@ -304,21 +298,24 @@ def test_bagel_flow_generation_state_tracks_denoise_round():
         device=torch.device("cpu"),
     )
 
-    assert state.phase == "prepare_query"
+    assert state.initialized
+    assert state.step_index == 0
     assert state.token_count == 4
-    assert state.require_latent_grid_shape() == (2, 2)
+    assert state.grid_shape == (2, 2)
     assert state.current_timestep_tokens().shape == (4,)
 
     hidden = torch.arange(24, dtype=torch.float32).reshape(6, 4)
     assert torch.equal(state.strip_query_markers(hidden), hidden[1:-1])
 
-    complete = state.advance(torch.zeros_like(state.require_latents()))
+    complete = state.advance(torch.zeros_like(state.latents))
     assert complete
     assert state.is_complete()
 
     state.reset()
     assert not state.initialized
-    assert state.phase == "prepare_query"
+    assert state.step_index == 0
+    assert state.token_count == 0
+    assert state.image_shape is None
 
 
 def test_bagel_siglip_processor_call_matches_saved_config(tmp_path):

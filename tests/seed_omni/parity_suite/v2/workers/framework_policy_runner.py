@@ -22,7 +22,13 @@ import torch.distributed as dist
 import yaml
 from torch import nn
 
-from tests.seed_omni.parity_suite.core import ParityReport, RunWorkerOptions, autocast_for_dtype, run_worker_context
+from tests.seed_omni.parity_suite.core import (
+    ParityReport,
+    RunWorkerOptions,
+    autocast_for_dtype,
+    configure_torch_determinism,
+    run_worker_context,
+)
 from tests.seed_omni.parity_suite.v2.tier_runners.framework_support import (
     all_grads_are_cleared,
     build_minimal_omni_trainer,
@@ -516,7 +522,7 @@ def run_checkpoint_train_step(trainer: OmniTrainer, batch: Mapping[str, Any], *,
         )
 
     trainer.on_step_end = _on_step_end
-    torch.manual_seed(seed)
+    configure_torch_determinism(seed)
     with single_rank_ddp_clip_state():
         trainer.train_step(iter([[dict(batch)]]))
     return events
@@ -559,6 +565,7 @@ def run_optimizer_trajectory(
 ) -> dict[str, Any]:
     driver.configure_determinism(driver.case.model.seed)
     model = driver.load_v2_model(device=device, dtype=dtype).train()
+    driver.configure_determinism(driver.case.model.seed)
     optimizer = torch.optim.SGD(model.parameters(), lr=lr)
     losses: list[torch.Tensor] = []
     parameters_after_step: list[Mapping[str, torch.Tensor]] = []
@@ -599,6 +606,7 @@ def run_launcher_smoke(
         def __init__(self, args: Any) -> None:
             self.args = args
             model = driver.load_v2_model(device=device, dtype=dtype).train()
+            driver.configure_determinism(driver.case.model.seed)
             model.set_node_executors(build_trainer_node_executors(model))
             self.trainer = build_minimal_omni_trainer(model, device=device, dtype=dtype)
             self.trainer.base.args.train.optimizer = SimpleNamespace(max_grad_norm=max_grad_norm)

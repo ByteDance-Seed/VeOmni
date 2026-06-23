@@ -16,6 +16,7 @@ class BagelFlowConnectorConfig(PretrainedConfig):
         patch_latent_dim: int | None = None,
         max_latent_size: int = 64,
         timestep_frequency_embedding_size: int = 256,
+        timestep_shift: float = 1.0,
         **kwargs,
     ) -> None:
         self.hidden_size = hidden_size
@@ -26,6 +27,7 @@ class BagelFlowConnectorConfig(PretrainedConfig):
         )
         self.max_latent_size = max_latent_size
         self.timestep_frequency_embedding_size = timestep_frequency_embedding_size
+        self.timestep_shift = timestep_shift
         super().__init__(**kwargs)
 
 

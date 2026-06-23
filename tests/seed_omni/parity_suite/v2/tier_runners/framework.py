@@ -111,6 +111,7 @@ def _run_v2_train_framework_batch(
     dtype: torch.dtype,
 ) -> dict[str, Any]:
     model = driver.load_v2_model(device=device, dtype=dtype).train()
+    driver.configure_determinism(driver.case.model.seed)
     model.set_node_executors(build_trainer_node_executors(model))
     zero_module_grads(model.modules_dict.values())
     batch = dict(batch_kwargs)
@@ -138,6 +139,7 @@ def _run_train_step_policy(
     # fresh models with identical seeds, batches, optimizer, and scheduler.
     driver.configure_determinism(driver.case.model.seed)
     direct_model = driver.load_v2_model(device=device, dtype=dtype).train()
+    driver.configure_determinism(driver.case.model.seed)
     direct_result = run_direct_train_step(
         direct_model,
         direct_batch,
@@ -152,6 +154,7 @@ def _run_train_step_policy(
 
     driver.configure_determinism(driver.case.model.seed)
     trainer_model = driver.load_v2_model(device=device, dtype=dtype).train()
+    driver.configure_determinism(driver.case.model.seed)
     trainer_model.set_node_executors(build_trainer_node_executors(trainer_model))
     trainer_result = run_trainer_train_step(
         driver,
@@ -195,6 +198,7 @@ def _run_checkpoint_resume_policy(
     with single_rank_process_group():
         driver.configure_determinism(driver.case.model.seed)
         save_model = driver.load_v2_model(device=device, dtype=dtype).train()
+        driver.configure_determinism(driver.case.model.seed)
         save_model.set_node_executors(build_trainer_node_executors(save_model))
         save_batch = driver.v2_request_kwargs(reference_output, device=device)
         save_trainer = build_minimal_omni_trainer(save_model, device=device, dtype=dtype)
@@ -218,6 +222,7 @@ def _run_checkpoint_resume_policy(
 
         driver.configure_determinism(driver.case.model.seed)
         resume_model = driver.load_v2_model(device=device, dtype=dtype).train()
+        driver.configure_determinism(driver.case.model.seed)
         resume_model.set_node_executors(build_trainer_node_executors(resume_model))
         resume_batch = driver.v2_request_kwargs(reference_output, device=device)
         resume_trainer = build_minimal_omni_trainer(resume_model, device=device, dtype=dtype)

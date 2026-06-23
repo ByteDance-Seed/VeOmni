@@ -50,6 +50,8 @@ class BagelVAEModuleMixin(ModuleMixin):
         self._conversation_carrier: list[list[ConversationItem]] | None = None
         self._encode_items: list[ConversationItem] = []
         self._decode_items: list[ConversationItem] = []
+        self._encode_is_dummy = False
+        self._decode_is_dummy = False
 
     def build_cpu_preprocessor(self) -> CPUPreprocessor | None:
         if getattr(self, "_image_processor", None) is None:
@@ -79,7 +81,7 @@ class BagelVAEModuleMixin(ModuleMixin):
             device=self.device,
             dtype=self.dtype,
         )
-        outputs = self._encode_pixel_values(inputs["pixel_values"])
+        outputs = self.encode(pixel_values=inputs["pixel_values"])
         for image_item, latent in zip(image_items, outputs["latents"], strict=True):
             # Edit keeps the raw user image in place for SigLIP and inserts the
             # VAE context latent immediately before that image for flow context.
@@ -119,7 +121,7 @@ class BagelVAEModuleMixin(ModuleMixin):
             )
         latents = torch.stack(latents, dim=0).to(device=self.device, dtype=self.dtype)
 
-        outputs = self._decode_latents(latents)
+        outputs = self.decode(latents=latents)
         pixel_values = outputs["pixel_values"]
         for item, image in zip(decode_items, pixel_values, strict=True):
             item.type = "image"
@@ -139,10 +141,12 @@ class BagelVAEModuleMixin(ModuleMixin):
     ) -> dict[str, Any]:
         del kwargs
         self._conversation_carrier = conversation_list
+        self._encode_is_dummy = False
 
         self._encode_items = self._select_vae_encode_items(conversation_list)
         if not self._encode_items:
-            return {"pixel_values": None}
+            self._encode_is_dummy = True
+            return self.dummy_inputs(kind="encode")
 
         if all(item.meta.get(_OMNI_PIXELS) for item in self._encode_items):
             pixel_values = torch.stack([item.value for item in self._encode_items], dim=0).to(
@@ -158,13 +162,15 @@ class BagelVAEModuleMixin(ModuleMixin):
         )
 
     @post_forward("encode")
-    def encode_post(self, latents: torch.Tensor, is_dummy: bool = False) -> dict[str, Any]:
+    def encode_post(self, latents: torch.Tensor) -> dict[str, Any]:
         conversation = self._conversation_carrier
         encode_items = self._encode_items
+        encode_is_dummy = self._encode_is_dummy
         self._conversation_carrier = None
         self._encode_items = []
+        self._encode_is_dummy = False
 
-        if is_dummy:
+        if encode_is_dummy:
             if conversation is not None:
                 value = latents.squeeze(0) if latents.dim() == 4 and latents.shape[0] == 1 else latents
                 for sample in conversation:
@@ -193,10 +199,12 @@ class BagelVAEModuleMixin(ModuleMixin):
         del kwargs
         self._conversation_carrier = conversation_list
         self._decode_items = []
+        self._decode_is_dummy = False
 
         self._decode_items = self._select_vae_decode_items(conversation_list)
         if not self._decode_items:
-            return {"latents": None}
+            self._decode_is_dummy = True
+            return self.dummy_inputs(kind="decode")
 
         latents = []
         for item in self._decode_items:
@@ -208,13 +216,15 @@ class BagelVAEModuleMixin(ModuleMixin):
         return {"latents": torch.stack(latents, dim=0).to(device=self.device, dtype=self.dtype)}
 
     @post_forward("decode")
-    def decode_post(self, pixel_values: torch.Tensor, is_dummy: bool = False) -> dict[str, Any]:
+    def decode_post(self, pixel_values: torch.Tensor) -> dict[str, Any]:
         conversation = self._conversation_carrier
         decode_items = self._decode_items
+        decode_is_dummy = self._decode_is_dummy
         self._conversation_carrier = None
         self._decode_items = []
+        self._decode_is_dummy = False
 
-        if is_dummy:
+        if decode_is_dummy:
             return {"conversation_list": conversation}
 
         for item, image in zip(decode_items, pixel_values, strict=True):

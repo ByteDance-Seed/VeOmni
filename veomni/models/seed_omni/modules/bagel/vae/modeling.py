@@ -84,40 +84,22 @@ class BagelVAE(BagelVAEModuleMixin, PreTrainedModel):
 
     def encode(
         self,
-        pixel_values: torch.Tensor | None = None,
+        pixel_values: torch.Tensor,
         **kwargs: object,
     ) -> dict[str, Any]:
         del kwargs
-        if pixel_values is not None:
-            return self._encode_pixel_values(pixel_values)
-
-        dummy = self.dummy_inputs(kind="encode")
-        outputs = self.encode(**dummy)
-        outputs["is_dummy"] = True
-        return outputs
-
-    def decode(
-        self,
-        latents: torch.Tensor | None = None,
-        **kwargs: object,
-    ) -> dict[str, Any]:
-        del kwargs
-        if latents is not None:
-            return self._decode_latents(latents)
-
-        dummy = self.dummy_inputs(kind="decode")
-        outputs = self._decode_latents(dummy["latents"])
-        outputs["is_dummy"] = True
-        return outputs
-
-    def _encode_pixel_values(self, pixel_values: torch.Tensor) -> dict[str, Any]:
         pixel_values = pixel_values.to(device=self._encoder_device, dtype=self.dtype)
         with self._runtime_context(pixel_values):
             latents = self.reg(self.encoder(pixel_values))
             latents = self.config.scale_factor * (latents - self.config.shift_factor)
         return {"latents": latents.to(dtype=self.dtype)}
 
-    def _decode_latents(self, latents: torch.Tensor) -> dict[str, Any]:
+    def decode(
+        self,
+        latents: torch.Tensor,
+        **kwargs: object,
+    ) -> dict[str, Any]:
+        del kwargs
         latents = latents.to(device=self._decoder_device, dtype=self.dtype)
         latents = latents / self.config.scale_factor + self.config.shift_factor
         with self._runtime_context(latents):
@@ -390,13 +372,6 @@ class DiagonalGaussian(nn.Module):
 
 
 __all__ = [
-    "AttnBlock",
     "BagelVAE",
     "BagelVAEConfig",
-    "Decoder",
-    "DiagonalGaussian",
-    "Downsample",
-    "Encoder",
-    "ResnetBlock",
-    "Upsample",
 ]

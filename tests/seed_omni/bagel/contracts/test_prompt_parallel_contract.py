@@ -6,7 +6,7 @@ from typing import Any
 import torch
 import yaml
 
-from veomni.models.seed_omni.conversation import ConversationItem
+from veomni.models.seed_omni.conversation import ConversationItem, iter_desired_items
 from veomni.models.seed_omni.generation_graph import GenerationGraph
 from veomni.models.seed_omni.modules.bagel.carrier_updates import (
     insert_before,
@@ -14,7 +14,6 @@ from veomni.models.seed_omni.modules.bagel.carrier_updates import (
     replace_fields,
     replace_value,
 )
-from veomni.models.seed_omni.modules.bagel.flow_connector.processing import flow_latent_items
 from veomni.models.seed_omni.modules.bagel.qwen2_mot.processing import pack_training_conversation
 from veomni.models.seed_omni.modules.bagel.sources import (
     BAGEL_FLOW_QUERY,
@@ -127,9 +126,9 @@ def test_bagel_edit_prompt_graph_exposes_vae_then_siglip_prompt_producers() -> N
 
     assert {"from": "bagel_text_encoder", "to": "bagel_qwen2_mot"} in prompt_body
     assert {"from": "bagel_vae.encode_context", "to": "bagel_siglip_navit"} in prompt_body
-    assert {"from": "bagel_siglip_navit", "to": "bagel_flow_connector.embed_latent"} in prompt_body
+    assert {"from": "bagel_siglip_navit", "to": "bagel_flow_connector.embed_context_latents"} in prompt_body
     assert {
-        "from": "bagel_flow_connector.embed_latent",
+        "from": "bagel_flow_connector.embed_context_latents",
         "to": "bagel_text_encoder.encode_image_markers",
     } in (prompt_body)
     assert {
@@ -200,7 +199,7 @@ def test_image_marker_wrapping_is_idempotent() -> None:
 def test_downstream_prompt_consumers_see_sequentially_equivalent_carrier() -> None:
     sample, latent_item, text_item = _materialized_prompt_from_same_snapshot()
 
-    flow_items = flow_latent_items([sample], z_channels=_Z_CHANNELS)
+    flow_items = list(iter_desired_items([sample], types=["output"], sources=[BAGEL_VAE_CONTEXT]))
     assert flow_items == [latent_item]
     materialize_carrier_updates([sample], [replace_value(latent_item, _flow_context_embeds())])
 

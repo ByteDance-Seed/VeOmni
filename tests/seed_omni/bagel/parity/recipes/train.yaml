@@ -29,7 +29,7 @@ train_ce_mse:
   - graph: train
     stimulus:
       loss_mode: ce_mse
-      image_size: 32
+      image_size: 512
       conversation_list:
         - type: text
           role: assistant
@@ -38,21 +38,21 @@ train_ce_mse:
           role: assistant
           value:
             kind: image
-            width: 32
-            height: 32
+            width: 512
+            height: 512
           meta:
             timestep:
               kind: linspace
               start: -0.5
               end: 0.5
-              steps: 4
+              steps: 1024
               transform: sigmoid
             noise:
               kind: linspace
               start: -0.25
               end: 0.25
-              steps: 256
-              shape: [4, 64]
+              steps: 65536
+              shape: [1024, 64]
     reference:
       oracle: hf_model
     gate:
@@ -63,9 +63,6 @@ train_ce_mse:
         bagel_vae:
           device: cpu
           dtype: float32
-          config:
-            min_image_size: 32
-            max_image_size: 32
     runs:
       graph:
         - id: forward_backward

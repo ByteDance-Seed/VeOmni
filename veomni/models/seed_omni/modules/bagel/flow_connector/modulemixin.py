@@ -6,11 +6,9 @@ from typing import Any
 
 import torch
 
-from ....conversation import ConversationItem
+from ....conversation import ConversationItem, is_dummy, iter_desired_items
 from ....generation_graph import FSM_SIGNAL_KEY
 from ....module import ModuleMixin, post_forward, pre_forward
-from ..carrier_updates import append as carrier_append
-from ..carrier_updates import materialize_carrier_updates, meta_patch, replace_fields
 from ..sources import (
     BAGEL_FLOW_HIDDEN,
     BAGEL_FLOW_QUERY,
@@ -21,16 +19,10 @@ from ..sources import (
 from .configuration import BagelFlowConnectorConfig
 from .generation_state import FlowGenerationState
 from .processing import (
-    active_output_item,
     flattened_position_ids,
-    flow_hidden_items,
-    flow_latent_items,
-    prepare_context_embed_latent_inputs,
-    prepare_decode_velocity_inputs,
-    prepare_embed_latent_inputs,
-    scatter_latent_embeds,
-    scatter_velocity,
-    single_inference_conversation,
+    preprocess_context_latent_embed,
+    preprocess_decode_velocity,
+    preprocess_latent_embed,
     unpatchify_latent_tokens,
 )
 
@@ -50,58 +42,68 @@ class BagelFlowConnectorModuleMixin(ModuleMixin):
         self._decode_items: list[ConversationItem] = []
         self._decode_lengths: list[int] = []
         self._decode_target: torch.Tensor | None = None
+        self._embed_is_dummy = False
+        self._decode_is_dummy = False
         self._generation_state = FlowGenerationState()
 
     def reset_local_inference_state(self) -> None:
         self._generation_state.reset()
 
-    def generate(
+    # ── Graph Entrypoints ──────────────────────────────────
+
+    def embed_context_latents(
         self,
-        conversation_list: list[ConversationItem] | list[list[ConversationItem]] | None = None,
+        conversation_list: list[ConversationItem] | None = None,
         generation_kwargs: dict[str, Any] | None = None,
         **kwargs: Any,
     ) -> dict[str, Any]:
-        phase = self._resolve_denoise_phase(conversation_list, generation_kwargs or {}, kwargs)
-        if phase == "prepare_query":
-            return self._prepare_latent_query(conversation_list, generation_kwargs or {})
-        if phase == "decode_velocity":
-            return self._decode_velocity_from_hidden(conversation_list)
-        if phase == "advance":
-            return self._advance_denoise(conversation_list)
-        raise RuntimeError(f"Unsupported BAGEL flow connector inference phase: {phase!r}")
-
-    def _resolve_denoise_phase(
-        self,
-        conversation_list: list[ConversationItem] | list[list[ConversationItem]] | None,
-        generation_kwargs: dict[str, Any],
-        kwargs: dict[str, Any],
-    ) -> str:
         del generation_kwargs, kwargs
-        state = self._generation_state
-        if state.phase == "advance":
-            conversation = single_inference_conversation(conversation_list)
-            item = active_output_item(conversation, sources={BAGEL_FLOW_VELOCITY})
-            if item is not None and not torch.is_tensor(item.value):
-                return "prepare_query"
-        return state.phase
+        if conversation_list is None:
+            return {"conversation_list": conversation_list}
 
-    def _prepare_latent_query(
+        batched = [conversation_list]
+        embed_items = self._select_vae_context_latent_items(batched)
+        if not embed_items:
+            return {"conversation_list": conversation_list}
+
+        inputs, embed_lengths = preprocess_context_latent_embed(
+            embed_items,
+            config=self.config,
+            device=self.device,
+            dtype=self.dtype,
+        )
+        outputs = self.embed_latent(**inputs)
+        self._scatter_latent_embeds(
+            embed_items,
+            embed_lengths,
+            outputs["latent_embeds"],
+        )
+        return {"conversation_list": conversation_list}
+
+    def prepare_denoise_query(
         self,
-        conversation_list: list[ConversationItem] | list[list[ConversationItem]] | None,
-        generation_kwargs: dict[str, Any],
+        conversation_list: list[ConversationItem] | None = None,
+        generation_kwargs: dict[str, Any] | None = None,
+        **kwargs: Any,
     ) -> dict[str, Any]:
-        conversation = single_inference_conversation(conversation_list)
+        del kwargs
+        if conversation_list is None:
+            raise ValueError("BAGEL flow inference requires conversation_list.")
+
         state = self._generation_state
         if not state.initialized:
-            self._init_denoise_state(generation_kwargs)
-        if state.is_complete():
-            return self._emit_final_latent(conversation_list, conversation)
+            self._generation_state.initialize(
+                generation_kwargs or {},
+                resolution=int(getattr(self.config, "resolution", 1024)),
+                patch_latent_dim=int(self.config.patch_latent_dim),
+                device=self._vae2llm_device,
+            )
 
-        x_t = state.require_latents()
+        x_t = state.latents
         timestep = state.current_timestep()
         timestep_tokens = state.current_timestep_tokens()
         position_ids = flattened_position_ids(
-            state.require_latent_grid_shape(),
+            state.grid_shape,
             max_latent_size=int(self.config.max_latent_size),
             device=x_t.device,
         )
@@ -111,49 +113,57 @@ class BagelFlowConnectorModuleMixin(ModuleMixin):
             timesteps=timestep_tokens,
         )
         query = outputs["latent_embeds"].to(device=self.device, dtype=self.dtype)
-        item = active_output_item(conversation, sources={BAGEL_FLOW_VELOCITY})
         timestep_meta = timestep.detach().to(device=query.device, dtype=torch.float32)
+
+        item = next(
+            iter_desired_items(
+                [conversation_list],
+                types=["output"],
+                sources=[BAGEL_FLOW_VELOCITY],
+                reverse_item=True,
+            ),
+            None,
+        )
         if item is None:
-            materialize_carrier_updates(
-                conversation,
-                [
-                    carrier_append(
-                        conversation,
-                        ConversationItem(
-                            type="output",
-                            value=query,
-                            role="assistant",
-                            source=BAGEL_FLOW_QUERY,
-                            meta={"timestep": timestep_meta},
-                        ),
-                    )
-                ],
+            conversation_list.append(
+                ConversationItem(
+                    type="output",
+                    value=query,
+                    role="assistant",
+                    source=BAGEL_FLOW_QUERY,
+                    meta={"timestep": timestep_meta},
+                )
             )
         else:
-            materialize_carrier_updates(
-                conversation,
-                [
-                    replace_fields(
-                        item,
-                        type="output",
-                        role="assistant",
-                        source=BAGEL_FLOW_QUERY,
-                        value=query,
-                        meta={"timestep": timestep_meta},
-                    )
-                ],
-            )
-        state.phase = "decode_velocity"
+            item.type = "output"
+            item.role = "assistant"
+            item.source = BAGEL_FLOW_QUERY
+            item.value = query
+            item.meta = {"timestep": timestep_meta}
         return {"conversation_list": conversation_list}
 
-    def _decode_velocity_from_hidden(
+    def decode_velocity_from_hidden(
         self,
-        conversation_list: list[ConversationItem] | list[list[ConversationItem]] | None,
+        conversation_list: list[ConversationItem] | None = None,
+        generation_kwargs: dict[str, Any] | None = None,
+        **kwargs: Any,
     ) -> dict[str, Any]:
-        conversation = single_inference_conversation(conversation_list)
-        item = active_output_item(conversation, sources={BAGEL_FLOW_HIDDEN})
+        del generation_kwargs, kwargs
+        if conversation_list is None:
+            raise ValueError("BAGEL flow inference requires conversation_list.")
+
+        item = next(
+            iter_desired_items(
+                [conversation_list],
+                types=["output"],
+                sources=[BAGEL_FLOW_HIDDEN],
+                reverse_item=True,
+            ),
+            None,
+        )
         if item is None or not torch.is_tensor(item.value):
             raise ValueError("BAGEL flow decode_velocity requires source='bagel_flow_hidden'.")
+
         hidden = item.value
         if hidden.dim() == 3 and hidden.shape[0] == 1:
             hidden = hidden.squeeze(0)
@@ -164,140 +174,48 @@ class BagelFlowConnectorModuleMixin(ModuleMixin):
                 "BAGEL flow decode_velocity hidden-size mismatch: "
                 f"got {hidden.shape[-1]}, expected {self.config.hidden_size}."
             )
-        state = self._generation_state
+
         outputs = self.decode_velocity(hidden_states=hidden)
-        velocity = state.strip_query_markers(outputs["velocity"])
-        materialize_carrier_updates(
-            None,
-            [
-                replace_fields(
-                    item,
-                    type="output",
-                    role="assistant",
-                    source=BAGEL_FLOW_VELOCITY,
-                    value=velocity.to(device=self.device, dtype=self.dtype),
-                )
-            ],
-        )
-        state.phase = "advance"
+        velocity = self._generation_state.strip_query_markers(outputs["velocity"])
+        item.type = "output"
+        item.role = "assistant"
+        item.source = BAGEL_FLOW_VELOCITY
+        item.value = velocity.to(device=self.device, dtype=self.dtype)
         return {"conversation_list": conversation_list}
 
-    def _advance_denoise(
+    def advance_denoise(
         self,
-        conversation_list: list[ConversationItem] | list[list[ConversationItem]] | None,
+        conversation_list: list[ConversationItem] | None = None,
+        generation_kwargs: dict[str, Any] | None = None,
+        **kwargs: Any,
     ) -> dict[str, Any]:
-        conversation = single_inference_conversation(conversation_list)
-        item = active_output_item(conversation, sources={BAGEL_FLOW_VELOCITY})
+        del generation_kwargs, kwargs
+        if conversation_list is None:
+            raise ValueError("BAGEL flow inference requires conversation_list.")
+
+        item = next(
+            iter_desired_items(
+                [conversation_list],
+                types=["output"],
+                sources=[BAGEL_FLOW_VELOCITY],
+                reverse_item=True,
+            ),
+            None,
+        )
         if item is None or not torch.is_tensor(item.value):
             raise ValueError("BAGEL flow advance requires source='bagel_flow_velocity'.")
-        state = self._generation_state
+
         velocity = item.value
         if velocity.dim() == 3 and velocity.shape[0] == 1:
             velocity = velocity.squeeze(0)
-        complete = state.advance(velocity)
+        complete = self._generation_state.advance(velocity)
+
         if complete:
-            return self._emit_final_latent(conversation_list, conversation)
-        materialize_carrier_updates(None, [meta_patch(item, {}, remove=("timestep",))])
-        state.phase = "prepare_query"
+            return self._emit_final_latent(conversation_list)
+        item.meta.pop("timestep", None)
         return {"conversation_list": conversation_list}
 
-    def _init_denoise_state(self, generation_kwargs: dict[str, Any]) -> None:
-        self._generation_state.initialize(
-            generation_kwargs,
-            resolution=int(getattr(self.config, "resolution", 1024)),
-            patch_latent_dim=int(self.config.patch_latent_dim),
-            device=self.vae2llm.weight.device,
-        )
-
-    def _emit_final_latent(
-        self,
-        conversation_list: list[ConversationItem] | list[list[ConversationItem]] | None,
-        conversation: list[ConversationItem],
-    ) -> dict[str, Any]:
-        state = self._generation_state
-        x_t = state.require_latents()
-        item = active_output_item(conversation, sources={BAGEL_FLOW_VELOCITY})
-        latent = unpatchify_latent_tokens(
-            x_t,
-            state.require_latent_grid_shape(),
-            z_channels=int(self.config.z_channels),
-            latent_patch_size=int(self.config.latent_patch_size),
-        )
-        if item is None:
-            materialize_carrier_updates(
-                conversation,
-                [
-                    carrier_append(
-                        conversation,
-                        ConversationItem(
-                            type="output",
-                            value=latent,
-                            role="assistant",
-                            source=BAGEL_GENERATED_LATENT,
-                            meta={},
-                        ),
-                    )
-                ],
-            )
-        else:
-            materialize_carrier_updates(
-                conversation,
-                [
-                    replace_fields(
-                        item,
-                        type="output",
-                        role="assistant",
-                        source=BAGEL_GENERATED_LATENT,
-                        value=latent.to(device=self.device, dtype=self.dtype),
-                        meta={},
-                    )
-                ],
-            )
-        self.reset_local_inference_state()
-        return {"conversation_list": conversation_list, FSM_SIGNAL_KEY: SIGNAL_IMAGE_COMPLETE}
-
-    def _embed_context_latents(
-        self,
-        conversation_list: list[ConversationItem] | list[list[ConversationItem]] | None,
-    ) -> dict[str, Any]:
-        batched = self._as_batched_conversation(conversation_list)
-        embed_items = flow_latent_items(
-            batched,
-            z_channels=int(self.config.z_channels),
-            sources={BAGEL_VAE_CONTEXT},
-        )
-        if not embed_items:
-            embed_items = flow_latent_items(batched, z_channels=int(self.config.z_channels))
-        if not embed_items:
-            return {"conversation_list": conversation_list}
-        inputs, embed_lengths = prepare_context_embed_latent_inputs(
-            embed_items,
-            config=self.config,
-            device=self.device,
-            dtype=self.dtype,
-        )
-        outputs = self.embed_latent(**inputs)
-        scatter_latent_embeds(
-            embed_items,
-            embed_lengths,
-            outputs["latent_embeds"],
-            device=self.device,
-            dtype=self.dtype,
-        )
-        return {"conversation_list": conversation_list}
-
-    def _as_batched_conversation(
-        self,
-        conversation_list: list[ConversationItem] | list[list[ConversationItem]] | None,
-    ) -> list[list[ConversationItem]]:
-        if conversation_list is None:
-            return []
-        if not conversation_list:
-            return []
-        first = conversation_list[0]
-        if isinstance(first, ConversationItem):
-            return [conversation_list]  # type: ignore[list-item]
-        return conversation_list  # type: ignore[return-value]
+    # ── Training hooks ──────────────────────────────────
 
     @pre_forward("embed_latent")
     def embed_latent_pre(
@@ -305,53 +223,52 @@ class BagelFlowConnectorModuleMixin(ModuleMixin):
         conversation_list: list[list[ConversationItem]] | None = None,
         **kwargs: Any,
     ) -> dict[str, Any]:
-        timestep_shift = float(kwargs.get("timestep_shift", 1.0))
+        del kwargs
         self._conversation_carrier = conversation_list
-        self._embed_items = flow_latent_items(conversation_list, z_channels=int(self.config.z_channels))
+        self._embed_is_dummy = False
         self._embed_lengths = []
+
+        self._embed_items = self._select_vae_context_latent_items(conversation_list)
         if not self._embed_items:
-            return {"latents": None}
+            self._embed_is_dummy = True
+            return self.dummy_inputs(kind="embed_latent")
 
         # Training/module-tier embedding adds flow noising; generation context
         # calls BagelFlowConnector.embed_latent and uses the clean timestep=0 path.
-        inputs, self._embed_lengths = prepare_embed_latent_inputs(
+        inputs, self._embed_lengths = preprocess_latent_embed(
             self._embed_items,
             config=self.config,
             device=self.device,
             dtype=self.dtype,
-            timestep_shift=timestep_shift,
+            timestep_shift=float(self.config.timestep_shift),
         )
         return inputs
 
     @post_forward("embed_latent")
-    def embed_latent_post(self, latent_embeds: torch.Tensor, is_dummy: bool = False) -> dict[str, Any]:
+    def embed_latent_post(self, latent_embeds: torch.Tensor) -> dict[str, Any]:
         conversation = self._conversation_carrier
         embed_items = self._embed_items
         embed_lengths = self._embed_lengths
+        embed_is_dummy = self._embed_is_dummy
         self._conversation_carrier = None
         self._embed_items = []
         self._embed_lengths = []
+        self._embed_is_dummy = False
 
-        if is_dummy:
+        if embed_is_dummy:
             if conversation is not None:
-                materialize_carrier_updates(
-                    conversation,
-                    [
-                        carrier_append(
-                            sample,
-                            ConversationItem(
-                                type="output",
-                                value=latent_embeds.squeeze(0),
-                                role="dummy",
-                                meta={"source": "bagel_flow_connector"},
-                            ),
+                for sample in conversation:
+                    sample.append(
+                        ConversationItem(
+                            type="output",
+                            value=latent_embeds.squeeze(0),
+                            role="dummy",
+                            meta={"source": "bagel_flow_connector"},
                         )
-                        for sample in conversation
-                    ],
-                )
+                    )
             return {"conversation_list": conversation}
 
-        scatter_latent_embeds(embed_items, embed_lengths, latent_embeds, device=self.device, dtype=self.dtype)
+        self._scatter_latent_embeds(embed_items, embed_lengths, latent_embeds)
         return {"conversation_list": conversation}
 
     @pre_forward("decode_velocity")
@@ -362,48 +279,45 @@ class BagelFlowConnectorModuleMixin(ModuleMixin):
     ) -> dict[str, Any]:
         del kwargs
         self._conversation_carrier = conversation_list
-        self._decode_items = flow_hidden_items(
-            conversation_list,
-            hidden_size=int(self.config.hidden_size),
-            sources={BAGEL_FLOW_HIDDEN},
-        )
-        if not self._decode_items:
-            self._decode_items = flow_hidden_items(conversation_list, hidden_size=int(self.config.hidden_size))
+        self._decode_is_dummy = False
         self._decode_lengths = []
         self._decode_target = None
-        if not self._decode_items:
-            return {"hidden_states": None}
 
-        inputs, self._decode_lengths, self._decode_target = prepare_decode_velocity_inputs(
+        self._decode_items = self._select_velocity_target_items(conversation_list)
+        if not self._decode_items:
+            self._decode_is_dummy = True
+            return self.dummy_inputs(kind="decode_velocity")
+
+        inputs, self._decode_lengths, self._decode_target = preprocess_decode_velocity(
             self._decode_items,
-            hidden_size=int(self.config.hidden_size),
-            patch_latent_dim=int(self.config.patch_latent_dim),
+            config=self.config,
             device=self.device,
             dtype=self.dtype,
         )
         return inputs
 
     @post_forward("decode_velocity")
-    def decode_velocity_post(self, velocity: torch.Tensor, is_dummy: bool = False) -> dict[str, Any]:
+    def decode_velocity_post(self, velocity: torch.Tensor) -> dict[str, Any]:
         conversation = self._conversation_carrier
         decode_items = self._decode_items
         decode_lengths = self._decode_lengths
         target = self._decode_target
+        decode_is_dummy = self._decode_is_dummy
         self._conversation_carrier = None
         self._decode_items = []
         self._decode_lengths = []
         self._decode_target = None
+        self._decode_is_dummy = False
 
-        if is_dummy:
+        if decode_is_dummy:
             return {"conversation_list": conversation, "_loss": velocity.sum() * 0.0}
 
-        scatter_velocity(decode_items, decode_lengths, velocity, device=self.device, dtype=self.dtype)
-
-        if target is None:
-            return {"conversation_list": conversation, "_loss": velocity.sum() * 0.0}
+        self._scatter_velocity(decode_items, decode_lengths, velocity)
         mse = (velocity - target.to(device=velocity.device, dtype=velocity.dtype)).square()
         token_count = torch.tensor(float(mse.shape[0]), device=mse.device, dtype=mse.dtype)
         return {"conversation_list": conversation, "_loss": mse.mean(dim=-1).sum() / token_count}
+
+    # ── Dummy helpers ──────────────────────────────────
 
     def dummy_inputs(self, kind: str = "embed_latent") -> dict[str, torch.Tensor]:
         if kind == "decode_velocity":
@@ -415,6 +329,7 @@ class BagelFlowConnectorModuleMixin(ModuleMixin):
                     dtype=self.dtype,
                 )
             }
+
         return {
             "latents": torch.zeros(
                 1,
@@ -427,6 +342,105 @@ class BagelFlowConnectorModuleMixin(ModuleMixin):
             ),
             "timesteps": torch.zeros(1, device=self.device, dtype=torch.float32),
         }
+
+    # ── Inference helpers ──────────────────────────────────
+
+    def _select_vae_context_latent_items(
+        self,
+        conversation_list: list[list[ConversationItem]] | None,
+    ) -> list[ConversationItem]:
+        if conversation_list is None:
+            raise ValueError("BAGEL flow connector requires conversation_list to select VAE context latents.")
+
+        latent_items: list[ConversationItem] = []
+        for item in iter_desired_items(
+            conversation_list,
+            types=["output"],
+            sources=[BAGEL_VAE_CONTEXT],
+        ):
+            if not is_dummy(item):
+                latent_items.append(item)
+        return latent_items
+
+    def _select_velocity_target_items(
+        self,
+        conversation_list: list[list[ConversationItem]] | None,
+    ) -> list[ConversationItem]:
+        decode_items: list[ConversationItem] = []
+        for item in iter_desired_items(conversation_list, types=["output"]):
+            target = item.meta.get("flow_velocity_target")
+            if is_dummy(item) or not torch.is_tensor(target):
+                continue
+            decode_items.append(item)
+        return decode_items
+
+    def _scatter_latent_embeds(
+        self,
+        embed_items: list[ConversationItem],
+        embed_lengths: list[int],
+        latent_embeds: torch.Tensor,
+    ) -> None:
+        offset = 0
+        for item, length in zip(embed_items, embed_lengths, strict=True):
+            item.value = latent_embeds[offset : offset + length].to(device=self.device, dtype=self.dtype)
+            offset += length
+        if offset != int(latent_embeds.shape[0]):
+            raise RuntimeError("BAGEL flow connector latent count mismatch during embed scatter.")
+
+    def _scatter_velocity(
+        self,
+        decode_items: list[ConversationItem],
+        decode_lengths: list[int],
+        velocity: torch.Tensor,
+    ) -> None:
+        offset = 0
+        for item, length in zip(decode_items, decode_lengths, strict=True):
+            item.value = velocity[offset : offset + length].to(device=self.device, dtype=self.dtype)
+            if item.source == BAGEL_FLOW_HIDDEN:
+                item.source = BAGEL_FLOW_VELOCITY
+            offset += length
+        if offset != int(velocity.shape[0]):
+            raise RuntimeError("BAGEL flow connector token count mismatch during velocity scatter.")
+
+    def _emit_final_latent(
+        self,
+        conversation_list: list[ConversationItem],
+    ) -> dict[str, Any]:
+        x_t = self._generation_state.latents
+        item = next(
+            iter_desired_items(
+                [conversation_list],
+                types=["output"],
+                sources=[BAGEL_FLOW_VELOCITY],
+                reverse_item=True,
+            ),
+            None,
+        )
+        latent = unpatchify_latent_tokens(
+            x_t,
+            self._generation_state.grid_shape,
+            z_channels=int(self.config.z_channels),
+            latent_patch_size=int(self.config.latent_patch_size),
+        )
+        if item is None:
+            conversation_list.append(
+                ConversationItem(
+                    type="output",
+                    value=latent,
+                    role="assistant",
+                    source=BAGEL_GENERATED_LATENT,
+                    meta={},
+                )
+            )
+        else:
+            item.type = "output"
+            item.role = "assistant"
+            item.source = BAGEL_GENERATED_LATENT
+            item.value = latent.to(device=self.device, dtype=self.dtype)
+            item.meta = {}
+
+        self._generation_state.reset()
+        return {"conversation_list": conversation_list, FSM_SIGNAL_KEY: SIGNAL_IMAGE_COMPLETE}
 
 
 __all__ = ["BagelFlowConnectorModuleMixin"]

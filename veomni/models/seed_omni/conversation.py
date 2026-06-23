@@ -137,10 +137,12 @@ def iter_desired_items(
     types: list[str] | None = None,
     roles: list[str] | None = None,
     sources: list[str] | None = None,
+    reverse_item: bool = False,
 ) -> Iterator[ConversationItem]:
     """Yield matching items in micro-batch order (sample 0, then sample 1, …)."""
     for sample in conversation_list:
-        for item in sample:
+        items = reversed(sample) if reverse_item else sample
+        for item in items:
             if types is not None and item.type not in types:
                 continue
             if roles is not None and item.role not in roles:
