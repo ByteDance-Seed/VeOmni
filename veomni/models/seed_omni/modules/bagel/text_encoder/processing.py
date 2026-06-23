@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import torch
+from transformers import PreTrainedTokenizerBase
 
 from ....conversation import ConversationItem, is_dummy
 from ..sources import BAGEL_FLOW_QUERY, BAGEL_SIGLIP_CONTEXT, BAGEL_VAE_CONTEXT
@@ -15,6 +16,32 @@ IMAGE_MARKER_TARGETS = frozenset(
         ("output", BAGEL_FLOW_QUERY),
     }
 )
+
+
+def materialize_text_item_input_ids(
+    item: ConversationItem,
+    tokenizer: PreTrainedTokenizerBase,
+    *,
+    start_token_id: int,
+    eos_token_id: int,
+    tokenized_key: str | None = None,
+) -> torch.Tensor | None:
+    if is_dummy(item) or item.type != "text":
+        return None
+    if tokenized_key is not None and item.meta.get(tokenized_key):
+        return item.meta["input_ids"]
+
+    token_ids = tokenizer(item.value, add_special_tokens=False)["input_ids"]
+    token_ids = torch.tensor([start_token_id, *token_ids, eos_token_id], dtype=torch.long)
+    item.value = token_ids
+    item.meta["input_ids"] = token_ids.detach()
+    item.meta["attention_mask"] = torch.ones_like(token_ids, dtype=torch.long)
+    item.meta["labels"] = (
+        token_ids.detach().clone() if item.role == "assistant" else torch.full_like(token_ids, -100, dtype=torch.long)
+    )
+    if tokenized_key is not None:
+        item.meta[tokenized_key] = True
+    return token_ids
 
 
 def is_image_item(item: ConversationItem) -> bool:
@@ -49,4 +76,5 @@ def apply_image_marker(
 __all__ = [
     "apply_image_marker",
     "is_image_item",
+    "materialize_text_item_input_ids",
 ]

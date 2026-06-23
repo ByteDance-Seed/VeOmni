@@ -15,6 +15,7 @@ from tests.seed_omni.parity_suite.core import (
     RunCaptureOptions,
     zero_module_grads,
 )
+from tests.seed_omni.parity_suite.v2.cpu_preprocess import apply_training_cpu_preprocessors
 from tests.seed_omni.parity_suite.v2.model import load_graph_active_omni_config
 from tests.seed_omni.parity_suite.v2.tier_runners.framework_support import (
     TrainerStepOptions,
@@ -113,6 +114,7 @@ def _run_v2_train_framework_batch(
     model.set_node_executors(build_trainer_node_executors(model))
     zero_module_grads(model.modules_dict.values())
     batch = dict(batch_kwargs)
+    apply_training_cpu_preprocessors(model, batch)
     trainer = build_minimal_omni_trainer(model, device=device, dtype=dtype)
     loss, loss_dict = trainer.forward_backward_step(batch)
     if loss is None:

@@ -1,21 +1,50 @@
 """SeedOmni V2 graph hooks for BAGEL text token embeddings and CE loss."""
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 from transformers import PreTrainedTokenizerBase
 
 from veomni.utils.tensor_utils import naflatten, unflatten
 
-from ....conversation import ConversationItem, is_dummy, maybe_merge_outputs
+from ....conversation import ConversationItem, is_dummy, iter_desired_items, maybe_merge_outputs
 from ....generation_graph import FSM_SIGNAL_KEY
-from ....module import post_forward, pre_forward
+from ....module import CPUPreprocessor, post_forward, pre_forward
 from ...base.text_encoder.modulemixin import TextEncoderModuleMixin
-from .processing import apply_image_marker, is_image_item
+from .processing import apply_image_marker, is_image_item, materialize_text_item_input_ids
 
 
 SIGNAL_START_IMAGE_GEN = "start_image_gen"
 SIGNAL_TEXT_DONE = "text_done"
+
+# Sentinel written by BagelTextEncoderCPUPreprocessor onto every text item so
+# encode_pre can skip tokenizer work already completed by a DataLoader worker.
+_OMNI_TOKENIZED = "_omni_tokenized"
+
+
+class BagelTextEncoderCPUPreprocessor(CPUPreprocessor):
+    """Worker-side tokenize for BAGEL text encoder training inputs."""
+
+    def __init__(
+        self,
+        tokenizer: PreTrainedTokenizerBase,
+        *,
+        start_token_id: int,
+        eos_token_id: int,
+    ) -> None:
+        self._tokenizer = tokenizer
+        self._start_token_id = int(start_token_id)
+        self._eos_token_id = int(eos_token_id)
+
+    def __call__(self, conversation_list: List[List[ConversationItem]]) -> None:
+        for item in iter_desired_items(conversation_list, types=["text"]):
+            materialize_text_item_input_ids(
+                item,
+                self._tokenizer,
+                start_token_id=self._start_token_id,
+                eos_token_id=self._eos_token_id,
+                tokenized_key=_OMNI_TOKENIZED,
+            )
 
 
 class BagelTextEncoderModuleMixin(TextEncoderModuleMixin):
@@ -42,6 +71,16 @@ class BagelTextEncoderModuleMixin(TextEncoderModuleMixin):
         self._start_token_id = self._resolve_token_id(tokenizer, token="<|im_start|>", fallback=self._eos_token_id)
         self._image_start_token_id = self._resolve_token_id(tokenizer, token="<|vision_start|>")
         self._image_end_token_id = self._resolve_token_id(tokenizer, token="<|vision_end|>")
+
+    def build_cpu_preprocessor(self) -> Optional[CPUPreprocessor]:
+        """Worker-side tokenize for training batches."""
+        if getattr(self, "_tokenizer", None) is None or self._start_token_id is None or self._eos_token_id is None:
+            return None
+        return BagelTextEncoderCPUPreprocessor(
+            self._tokenizer,
+            start_token_id=self._start_token_id,
+            eos_token_id=self._eos_token_id,
+        )
 
     # ── Graph Entrypoints ──────────────────────────────────
 
@@ -98,7 +137,11 @@ class BagelTextEncoderModuleMixin(TextEncoderModuleMixin):
     ) -> Dict[str, Any]:
         del generation_kwargs, kwargs
         marker_embeds: Optional[torch.Tensor] = None
-        for item in conversation_list:
+        for item in iter_desired_items([conversation_list], types=["image", "output"]):
+            # Broad type scan keeps the graph tolerant while VAE inference still
+            # accepts raw source=None inputs. The actual marker contract is
+            # source-based in is_image_item(); once VAE train/inference both
+            # materialize source tags, this path should stay source-routed.
             if not is_image_item(item):
                 continue
 
@@ -174,36 +217,27 @@ class BagelTextEncoderModuleMixin(TextEncoderModuleMixin):
         self,
         conversation_list: Optional[List[List[ConversationItem]]],
     ) -> torch.Tensor:
+        if conversation_list is None:
+            raise ValueError("BagelTextEncoder._prepare_encode_inputs requires conversation_list.")
+
         input_ids: List[torch.Tensor] = []
         self._encode_batch_shape = None
-
-        for sample in conversation_list or []:
-            for item in sample:
-                if is_dummy(item) or item.type != "text":
-                    continue
-
-                token_ids = self._tokenizer(item.value, add_special_tokens=False)["input_ids"]
-                token_ids = torch.tensor(
-                    [self._start_token_id, *token_ids, self._eos_token_id],
-                    device=self.device,
-                    dtype=torch.long,
-                )
-                item.value = token_ids
-                item.meta["input_ids"] = token_ids.detach()
-                item.meta["attention_mask"] = torch.ones_like(token_ids, dtype=torch.long)
-                item.meta["labels"] = (
-                    token_ids.detach().clone()
-                    if item.role == "assistant"
-                    else torch.full_like(token_ids, -100, dtype=torch.long)
-                )
-
+        for item in iter_desired_items(conversation_list, types=["text"]):
+            token_ids = materialize_text_item_input_ids(
+                item,
+                self._tokenizer,
+                start_token_id=self._start_token_id,
+                eos_token_id=self._eos_token_id,
+                tokenized_key=_OMNI_TOKENIZED,
+            )
+            if token_ids is not None:
                 input_ids.append(token_ids)
 
         if not input_ids:
             return self.dummy_inputs(kind="encode")["input_ids"]
 
         input_ids, self._encode_batch_shape = naflatten(input_ids)
-        return input_ids
+        return input_ids.to(self.device, non_blocking=True)
 
     def _scatter_text_embeds(
         self,
@@ -211,41 +245,41 @@ class BagelTextEncoderModuleMixin(TextEncoderModuleMixin):
         segment_embeds: List[torch.Tensor],
     ) -> None:
         segment_embeds_iterator = iter(segment_embeds)
-        for sample in conversation_list:
-            for item in sample:
-                if is_dummy(item) or item.type != "text":
-                    continue
-                item.value = next(segment_embeds_iterator).to(device=self.device, dtype=self.dtype)
+        for item in iter_desired_items(conversation_list, types=["text"]):
+            if is_dummy(item):
+                continue
+            item.value = next(segment_embeds_iterator).to(device=self.device, dtype=self.dtype)
         if next(segment_embeds_iterator, None) is not None:
             raise RuntimeError("BAGEL text segment count mismatch during embed scatter.")
 
     def _prepare_decode_inputs(
         self,
         conversation_list: Optional[List[List[ConversationItem]]],
-    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        if conversation_list is None:
+            raise ValueError("BagelTextEncoder._prepare_decode_inputs requires conversation_list.")
+
         hidden_parts: List[torch.Tensor] = []
         shift_label_parts: List[torch.Tensor] = []
+        for item in iter_desired_items(conversation_list, types=["text"]):
+            if is_dummy(item):
+                continue
 
-        for sample in conversation_list or []:
-            for item in sample:
-                if is_dummy(item) or item.type != "text":
-                    continue
+            hidden_states = item.value
+            labels = item.meta["labels"]
+            if hidden_states.dim() == 3 and hidden_states.size(0) == 1:
+                hidden_states = hidden_states.squeeze(0)
+            labels = labels.reshape(-1)
+            if hidden_states.shape[0] != labels.shape[0]:
+                raise ValueError(
+                    "BAGEL text decode requires hidden-state and label lengths to match: "
+                    f"got {hidden_states.shape[0]} and {labels.shape[0]}."
+                )
 
-                hidden_states = item.value
-                labels = item.meta["labels"]
-                if hidden_states.dim() == 3 and hidden_states.size(0) == 1:
-                    hidden_states = hidden_states.squeeze(0)
-                labels = labels.reshape(-1)
-                if hidden_states.shape[0] != labels.shape[0]:
-                    raise ValueError(
-                        "BAGEL text decode requires hidden-state and label lengths to match: "
-                        f"got {hidden_states.shape[0]} and {labels.shape[0]}."
-                    )
-
-                shift_labels = torch.full_like(labels, -100, dtype=torch.long)
-                shift_labels[:-1] = labels[1:]
-                hidden_parts.append(hidden_states.to(device=self.device, dtype=self.dtype))
-                shift_label_parts.append(shift_labels)
+            shift_labels = torch.full_like(labels, -100, dtype=torch.long)
+            shift_labels[:-1] = labels[1:]
+            hidden_parts.append(hidden_states.to(device=self.device, dtype=self.dtype))
+            shift_label_parts.append(shift_labels)
 
         if not hidden_parts:
             return None
@@ -255,4 +289,9 @@ class BagelTextEncoderModuleMixin(TextEncoderModuleMixin):
         return hidden_states, shift_labels
 
 
-__all__ = ["BagelTextEncoderModuleMixin", "SIGNAL_START_IMAGE_GEN", "SIGNAL_TEXT_DONE"]
+__all__ = [
+    "BagelTextEncoderCPUPreprocessor",
+    "BagelTextEncoderModuleMixin",
+    "SIGNAL_START_IMAGE_GEN",
+    "SIGNAL_TEXT_DONE",
+]

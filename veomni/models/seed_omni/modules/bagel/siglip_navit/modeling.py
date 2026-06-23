@@ -36,6 +36,7 @@ class BagelSiglipNavit(BagelSiglipNavitModuleMixin, BagelSiglipNavitTraceMixin, 
         self.vision_model = BagelSiglipVisionTransformer(config)
         self.connector = MLPConnector(config.hidden_size, config.output_size, config.connector_act)
         self.vit_pos_embed = PositionEmbedding(config.vit_max_num_patch_per_side, config.output_size)
+        self._image_processor = BagelSiglipNavitProcessor.from_config(config)
         self.post_init()
 
     def _init_weights(self, module: nn.Module) -> None:
@@ -64,25 +65,51 @@ class BagelSiglipNavit(BagelSiglipNavitModuleMixin, BagelSiglipNavitTraceMixin, 
         if patchified_position_ids is None or cu_seqlens is None or max_seqlen is None:
             raise ValueError("BagelSiglipNavit.forward requires position ids, cu_seqlens, and max_seqlen.")
 
-        vit_device = self.vision_model.embeddings.patch_embedding.weight.device
-        patchified_pixel_values = patchified_pixel_values.to(device=vit_device, dtype=self.dtype)
-        patchified_position_ids = patchified_position_ids.to(device=vit_device, dtype=torch.long)
-        cu_seqlens = cu_seqlens.to(device=vit_device, dtype=torch.int32)
-        vit_hidden = self.vision_model(
+        vit_hidden = self._encode_patches(
             patchified_pixel_values=patchified_pixel_values,
             patchified_position_ids=patchified_position_ids,
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen,
         )
+        image_embeds = self._project_with_position(
+            vit_hidden=vit_hidden,
+            patchified_position_ids=patchified_position_ids,
+        )
+        return {"image_embeds": image_embeds, "token_lens": token_lens}
+
+    def _encode_patches(
+        self,
+        *,
+        patchified_pixel_values: torch.Tensor,
+        patchified_position_ids: torch.LongTensor,
+        cu_seqlens: torch.IntTensor,
+        max_seqlen: int,
+    ) -> torch.Tensor:
+        vit_device = self.vision_model.embeddings.patch_embedding.weight.device
+        patchified_pixel_values = patchified_pixel_values.to(device=vit_device, dtype=self.dtype)
+        patchified_position_ids = patchified_position_ids.to(device=vit_device, dtype=torch.long)
+        cu_seqlens = cu_seqlens.to(device=vit_device, dtype=torch.int32)
+        return self.vision_model(
+            patchified_pixel_values=patchified_pixel_values,
+            patchified_position_ids=patchified_position_ids,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
+        )
+
+    def _project_with_position(
+        self,
+        *,
+        vit_hidden: torch.Tensor,
+        patchified_position_ids: torch.LongTensor,
+    ) -> torch.Tensor:
         connector_device = self.connector.fc1.weight.device
         vit_hidden = vit_hidden.to(device=connector_device, dtype=self.connector.fc1.weight.dtype)
         patchified_position_ids = patchified_position_ids.to(device=self.vit_pos_embed.pos_embed.device)
         image_embeds = self.connector(vit_hidden)
-        image_embeds = image_embeds + self.vit_pos_embed(patchified_position_ids).to(
+        return image_embeds + self.vit_pos_embed(patchified_position_ids).to(
             device=image_embeds.device,
             dtype=image_embeds.dtype,
         )
-        return {"image_embeds": image_embeds, "token_lens": token_lens}
 
 
 class RotaryEmbedding2D(nn.Module):

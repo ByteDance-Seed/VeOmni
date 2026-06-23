@@ -29,6 +29,11 @@ _TRAIN_BATCH_KEYS = {
 _LATENT_PATCH_SIZE = 2
 _LATENT_CHANNELS = 16
 _MAX_LATENT_SIZE = 64
+_SIGLIP_IMAGE_SIZE = 980
+_SIGLIP_MIN_IMAGE_SIZE = 378
+_SIGLIP_MAX_PIXELS = 14 * 14 * 9 * 1024
+_SIGLIP_PATCH_SIZE = 14
+_SIGLIP_MAX_PATCHES_PER_SIDE = 70
 
 
 @dataclass(frozen=True)
@@ -164,21 +169,21 @@ def build_reference_train_batch_from_stimulus(
 
 
 def _reference_vit_tokens(inputs: Mapping[str, Any]) -> dict[str, torch.Tensor]:
-    image_size = int(inputs.get("image_size", 224))
+    image_size = int(inputs.get("image_size", _SIGLIP_IMAGE_SIZE))
     transform = ImageTransform(
         image_size,
-        int(inputs.get("min_image_size", image_size)),
-        14,
-        max_pixels=int(inputs.get("max_pixels", image_size * image_size)),
+        int(inputs.get("min_image_size", _SIGLIP_MIN_IMAGE_SIZE)),
+        _SIGLIP_PATCH_SIZE,
+        max_pixels=int(inputs.get("max_pixels", _SIGLIP_MAX_PIXELS)),
     )
     image = _train_image_from_stimulus(inputs, image_size=image_size)
     image_tensor = transform(image)
-    vit_tokens = patchify(image_tensor, 14)
+    vit_tokens = patchify(image_tensor, _SIGLIP_PATCH_SIZE)
     vit_position_ids = get_flattened_position_ids_extrapolate(
         image_tensor.size(1),
         image_tensor.size(2),
-        14,
-        70,
+        _SIGLIP_PATCH_SIZE,
+        _SIGLIP_MAX_PATCHES_PER_SIDE,
     )
     return {
         "packed_vit_tokens": vit_tokens,

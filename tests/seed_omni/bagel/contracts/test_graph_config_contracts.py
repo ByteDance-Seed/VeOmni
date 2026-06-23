@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 import yaml
 
@@ -77,6 +79,15 @@ def test_bagel_train_plus_infer_merges_generation_graph(infer_graph: str):
             assert isinstance(e, dict) and "from" in e and "to" in e, (
                 f"state '{state_name}' body item must be a `{{from, to}}` dict: {e!r}"
             )
+
+
+def test_bagel_interleave_parity_run_stays_disabled_until_official_support() -> None:
+    recipe_path = Path(__file__).resolve().parents[1] / "parity" / "recipes" / "infer_interleave.yaml"
+    recipe = yaml.safe_load(recipe_path.read_text())
+    [run] = recipe["infer_interleave_text_image_then_gen"][0]["runs"]["graph"]
+
+    assert run["id"] == "denoise_multistep_cfg_text_img"
+    assert run["enable"] is False
 
 
 def _bagel_train_edges() -> list[dict]:

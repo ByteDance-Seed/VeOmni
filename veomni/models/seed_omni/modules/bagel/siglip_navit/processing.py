@@ -1,4 +1,4 @@
-"""Image processor and carrier helpers for BAGEL SigLIP NaViT."""
+"""Image processor helpers for BAGEL SigLIP NaViT."""
 
 from __future__ import annotations
 
@@ -11,10 +11,6 @@ from PIL import Image
 from torchvision.transforms import InterpolationMode
 from torchvision.transforms import functional as TVF
 from transformers.image_processing_utils import BaseImageProcessor, BatchFeature
-
-from ....conversation import ConversationItem, is_dummy
-from ..carrier_updates import materialize_carrier_updates, replace_fields
-from ..sources import BAGEL_SIGLIP_CONTEXT
 
 
 class BagelSiglipNavitProcessor(BaseImageProcessor):
@@ -79,21 +75,12 @@ class BagelSiglipNavitProcessor(BaseImageProcessor):
     ) -> BatchFeature:
         del return_tensors, kwargs
         image_list = images if isinstance(images, list) else [images]
-        data = self.prepare_image_batch(image_list, device=device, dtype=dtype)
-        return BatchFeature(data=data)
 
-    def prepare_image_batch(
-        self,
-        images: list[Any],
-        *,
-        device: torch.device | None = None,
-        dtype: torch.dtype | None = None,
-    ) -> dict[str, Any]:
         pixel_values: list[torch.Tensor] = []
         position_ids: list[torch.Tensor] = []
         token_lens: list[int] = []
-        for image in images:
-            image_tensor = preprocess_image(
+        for image in image_list:
+            image_tensor = _preprocess_image(
                 image,
                 patch_size=self.patch_size,
                 image_size=self.image_size,
@@ -102,8 +89,8 @@ class BagelSiglipNavitProcessor(BaseImageProcessor):
                 image_mean=self.image_mean,
                 image_std=self.image_std,
             )
-            patches = patchify_image(image_tensor, self.patch_size)
-            positions = flattened_position_ids(
+            patches = _patchify_image(image_tensor, self.patch_size)
+            positions = _flattened_position_ids(
                 image_tensor.shape[-2],
                 image_tensor.shape[-1],
                 patch_size=self.patch_size,
@@ -118,16 +105,18 @@ class BagelSiglipNavitProcessor(BaseImageProcessor):
         pixel_tensor = torch.cat(pixel_values, dim=0)
         if dtype is not None:
             pixel_tensor = pixel_tensor.to(dtype=dtype)
-        return {
-            "patchified_pixel_values": pixel_tensor.to(device=tensor_device),
-            "patchified_position_ids": torch.cat(position_ids, dim=0).to(device=tensor_device, dtype=torch.long),
-            "cu_seqlens": F.pad(torch.cumsum(token_lens_tensor, dim=0), (1, 0)).to(torch.int32),
-            "max_seqlen": int(token_lens_tensor.max().item()),
-            "token_lens": token_lens_tensor,
-        }
+        return BatchFeature(
+            data={
+                "patchified_pixel_values": pixel_tensor.to(device=tensor_device),
+                "patchified_position_ids": torch.cat(position_ids, dim=0).to(device=tensor_device, dtype=torch.long),
+                "cu_seqlens": F.pad(torch.cumsum(token_lens_tensor, dim=0), (1, 0)).to(torch.int32),
+                "max_seqlen": int(token_lens_tensor.max().item()),
+                "token_lens": token_lens_tensor,
+            }
+        )
 
 
-def preprocess_image(
+def _preprocess_image(
     image: Any,
     *,
     patch_size: int,
@@ -138,18 +127,18 @@ def preprocess_image(
     image_std: list[float],
 ) -> torch.Tensor:
     if isinstance(image, (Image.Image, np.ndarray)):
-        pil_image = to_rgb_pil(image if isinstance(image, Image.Image) else Image.fromarray(image))
-        pil_image = resize_pil(
+        pil_image = _to_rgb_pil(image if isinstance(image, Image.Image) else Image.fromarray(image))
+        pil_image = _resize_pil(
             pil_image,
             patch_size=patch_size,
             image_size=image_size,
             min_image_size=min_image_size,
             max_pixels=max_pixels,
         )
-        tensor = pil_to_rgb_tensor(pil_image)
+        tensor = _pil_to_rgb_tensor(pil_image)
     else:
-        tensor = to_rgb_tensor(image)
-        tensor = resize_tensor(
+        tensor = _to_rgb_tensor(image)
+        tensor = _resize_tensor(
             tensor,
             patch_size=patch_size,
             image_size=image_size,
@@ -161,13 +150,13 @@ def preprocess_image(
     return tensor.sub(mean).div(std)
 
 
-def to_rgb_tensor(image: Any) -> torch.Tensor:
+def _to_rgb_tensor(image: Any) -> torch.Tensor:
     if isinstance(image, Image.Image):
-        pil_image = to_rgb_pil(image)
+        pil_image = _to_rgb_pil(image)
         array = np.array(pil_image, copy=True)
         return torch.from_numpy(array).permute(2, 0, 1).contiguous().to(dtype=torch.float32).div_(255.0)
     if isinstance(image, np.ndarray):
-        return to_rgb_tensor(Image.fromarray(image))
+        return _to_rgb_tensor(Image.fromarray(image))
     if torch.is_tensor(image):
         tensor = image.detach().to(dtype=torch.float32)
         if tensor.dim() != 3:
@@ -194,7 +183,7 @@ def to_rgb_tensor(image: Any) -> torch.Tensor:
     raise TypeError(f"BAGEL image item value must be PIL, numpy, or tensor, got {type(image).__name__}.")
 
 
-def resize_tensor(
+def _resize_tensor(
     tensor: torch.Tensor,
     *,
     patch_size: int,
@@ -204,7 +193,7 @@ def resize_tensor(
     img_num: int = 1,
 ) -> torch.Tensor:
     height, width = tensor.shape[-2:]
-    new_width, new_height = target_size(
+    new_width, new_height = _target_size(
         width,
         height,
         patch_size=patch_size,
@@ -225,7 +214,7 @@ def resize_tensor(
     return resized.squeeze(0).clamp(0.0, 1.0)
 
 
-def resize_pil(
+def _resize_pil(
     image: Image.Image,
     *,
     patch_size: int,
@@ -235,7 +224,7 @@ def resize_pil(
     img_num: int = 1,
 ) -> Image.Image:
     width, height = image.size
-    new_width, new_height = target_size(
+    new_width, new_height = _target_size(
         width,
         height,
         patch_size=patch_size,
@@ -254,7 +243,7 @@ def resize_pil(
     )
 
 
-def target_size(
+def _target_size(
     width: int,
     height: int,
     *,
@@ -266,17 +255,17 @@ def target_size(
 ) -> tuple[int, int]:
     scale = min(image_size / max(width, height), 1.0)
     scale = max(scale, min_image_size / min(width, height))
-    new_width, new_height = apply_scale(width, height, scale, patch_size)
+    new_width, new_height = _apply_scale(width, height, scale, patch_size)
     if new_width * new_height > max_pixels / img_num:
         scale = max_pixels / img_num / (new_width * new_height)
-        new_width, new_height = apply_scale(new_width, new_height, scale, patch_size)
+        new_width, new_height = _apply_scale(new_width, new_height, scale, patch_size)
     if max(new_width, new_height) > image_size:
         scale = image_size / max(new_width, new_height)
-        new_width, new_height = apply_scale(new_width, new_height, scale, patch_size)
+        new_width, new_height = _apply_scale(new_width, new_height, scale, patch_size)
     return new_width, new_height
 
 
-def to_rgb_pil(image: Image.Image) -> Image.Image:
+def _to_rgb_pil(image: Image.Image) -> Image.Image:
     if image.mode == "RGBA" or image.info.get("transparency", None) is not None:
         rgba = image.convert("RGBA")
         white = Image.new(mode="RGB", size=rgba.size, color=(255, 255, 255))
@@ -285,12 +274,12 @@ def to_rgb_pil(image: Image.Image) -> Image.Image:
     return image.convert("RGB")
 
 
-def pil_to_rgb_tensor(image: Image.Image) -> torch.Tensor:
+def _pil_to_rgb_tensor(image: Image.Image) -> torch.Tensor:
     array = np.array(image, copy=True)
     return torch.from_numpy(array).permute(2, 0, 1).contiguous().to(dtype=torch.float32).div_(255.0)
 
 
-def apply_scale(width: int, height: int, scale: float, stride: int) -> tuple[int, int]:
+def _apply_scale(width: int, height: int, scale: float, stride: int) -> tuple[int, int]:
     new_width = round(width * scale)
     new_height = round(height * scale)
     return (
@@ -299,7 +288,7 @@ def apply_scale(width: int, height: int, scale: float, stride: int) -> tuple[int
     )
 
 
-def patchify_image(image: torch.Tensor, patch_size: int) -> torch.Tensor:
+def _patchify_image(image: torch.Tensor, patch_size: int) -> torch.Tensor:
     channels, height, width = image.shape
     if height % patch_size != 0 or width % patch_size != 0:
         raise ValueError("BAGEL preprocessed image height and width must be divisible by patch_size.")
@@ -308,7 +297,7 @@ def patchify_image(image: torch.Tensor, patch_size: int) -> torch.Tensor:
     return image.reshape(-1, patch_size**2 * channels)
 
 
-def flattened_position_ids(
+def _flattened_position_ids(
     height: int,
     width: int,
     *,
@@ -322,101 +311,6 @@ def flattened_position_ids(
     return (coords_h[:, None] * max_num_patches_per_side + coords_w).flatten()
 
 
-def iter_conversation_items(
-    conversation_list: list[ConversationItem] | list[list[ConversationItem]],
-) -> list[ConversationItem]:
-    if not conversation_list:
-        return []
-    if isinstance(conversation_list[0], ConversationItem):
-        return conversation_list  # type: ignore[return-value]
-    return [item for sample in conversation_list for item in sample]  # type: ignore[union-attr]
-
-
-def is_encoded_image_value(value: Any, *, output_size: int) -> bool:
-    return torch.is_tensor(value) and value.dim() == 2 and value.shape[-1] == output_size
-
-
-def user_raw_image_items(
-    conversation_list: list[ConversationItem] | list[list[ConversationItem]],
-    *,
-    output_size: int,
-) -> list[ConversationItem]:
-    return [
-        item
-        for item in iter_conversation_items(conversation_list)
-        if item.type == "image"
-        and item.role == "user"
-        and not is_dummy(item)
-        and item.source in (None, BAGEL_SIGLIP_CONTEXT)
-        and not is_encoded_image_value(item.value, output_size=output_size)
-    ]
-
-
-def image_items(
-    conversation_list: list[list[ConversationItem]] | None,
-) -> list[ConversationItem]:
-    return [
-        item for sample in conversation_list or [] for item in sample if item.type == "image" and not is_dummy(item)
-    ]
-
-
-def prepare_image_batch(
-    image_items: list[ConversationItem],
-    *,
-    config: Any,
-    device: torch.device,
-    dtype: torch.dtype,
-) -> dict[str, Any]:
-    return BagelSiglipNavitProcessor.from_config(config).prepare_image_batch(
-        [item.value for item in image_items],
-        device=device,
-        dtype=dtype,
-    )
-
-
-def scatter_image_embeds(
-    image_items: list[ConversationItem],
-    image_embeds: torch.Tensor,
-    token_lens: torch.Tensor,
-    *,
-    device: torch.device,
-    dtype: torch.dtype,
-) -> None:
-    offset = 0
-    lengths = token_lens.detach().cpu().reshape(-1).tolist()
-    if len(lengths) != len(image_items):
-        raise RuntimeError("BAGEL SigLIP image count mismatch during feature scatter.")
-    updates = []
-    for item, length in zip(image_items, lengths, strict=True):
-        updates.append(
-            replace_fields(
-                item,
-                value=image_embeds[offset : offset + int(length)].to(device=device, dtype=dtype),
-                source=BAGEL_SIGLIP_CONTEXT,
-            )
-        )
-        offset += int(length)
-    if offset != int(image_embeds.shape[0]):
-        raise RuntimeError("BAGEL SigLIP token count mismatch during feature scatter.")
-    materialize_carrier_updates(None, updates)
-
-
 __all__ = [
-    "apply_scale",
     "BagelSiglipNavitProcessor",
-    "flattened_position_ids",
-    "image_items",
-    "is_encoded_image_value",
-    "iter_conversation_items",
-    "patchify_image",
-    "pil_to_rgb_tensor",
-    "prepare_image_batch",
-    "preprocess_image",
-    "resize_pil",
-    "resize_tensor",
-    "scatter_image_embeds",
-    "target_size",
-    "to_rgb_pil",
-    "to_rgb_tensor",
-    "user_raw_image_items",
 ]

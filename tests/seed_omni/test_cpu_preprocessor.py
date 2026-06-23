@@ -20,6 +20,26 @@ import torch
 
 from veomni.data.data_collator import SeedOmniCollator
 from veomni.models.seed_omni.conversation import ConversationItem, worker_dummy_items
+from veomni.models.seed_omni.modules.bagel.siglip_navit.modulemixin import (
+    _OMNI_PATCHES as BAGEL_SIGLIP_PATCHES,
+)
+from veomni.models.seed_omni.modules.bagel.siglip_navit.modulemixin import (
+    _OMNI_POSITION_IDS as BAGEL_SIGLIP_POSITION_IDS,
+)
+from veomni.models.seed_omni.modules.bagel.siglip_navit.modulemixin import (
+    _OMNI_TOKEN_LEN as BAGEL_SIGLIP_TOKEN_LEN,
+)
+from veomni.models.seed_omni.modules.bagel.siglip_navit.modulemixin import (
+    BagelSiglipNavitCPUPreprocessor,
+)
+from veomni.models.seed_omni.modules.bagel.siglip_navit.processing import BagelSiglipNavitProcessor
+from veomni.models.seed_omni.modules.bagel.sources import BAGEL_SIGLIP_CONTEXT
+from veomni.models.seed_omni.modules.bagel.text_encoder.modulemixin import (
+    _OMNI_TOKENIZED as BAGEL_TOK,
+)
+from veomni.models.seed_omni.modules.bagel.text_encoder.modulemixin import (
+    BagelTextEncoderCPUPreprocessor,
+)
 from veomni.models.seed_omni.modules.janus.siglip.modulemixin import (
     _OMNI_PIXELS,
     JanusSiglipCPUPreprocessor,
@@ -232,6 +252,64 @@ def test_text_preprocessor_sets_labels_mask_and_is_idempotent():
     for a, b in zip(batch[0], snapshot[0]):
         if isinstance(a.value, torch.Tensor):
             assert torch.equal(a.value, b.value)
+
+
+def test_bagel_text_preprocessor_tokenizes_plain_items_and_is_idempotent():
+    pre = BagelTextEncoderCPUPreprocessor(FakeTokenizer(), start_token_id=1, eos_token_id=2)
+    batch = [
+        [
+            ConversationItem(type="text", value="hi", role="user"),
+            ConversationItem(type="image", value=torch.zeros(3, 4, 4), role="user"),
+            ConversationItem(type="text", value="ok", role="assistant"),
+        ]
+    ]
+
+    pre(batch)
+    user_text, image, assistant_text = batch[0]
+
+    assert image.type == "image"
+    assert torch.equal(user_text.value, torch.tensor([1, ord("h"), ord("i"), 2]))
+    assert user_text.value.device.type == "cpu"
+    assert user_text.meta[BAGEL_TOK] is True
+    assert torch.equal(user_text.meta["labels"], torch.full_like(user_text.value, -100))
+    assert torch.equal(user_text.meta["attention_mask"], torch.ones_like(user_text.value))
+
+    assert torch.equal(assistant_text.value, torch.tensor([1, ord("o"), ord("k"), 2]))
+    assert assistant_text.meta[BAGEL_TOK] is True
+    assert torch.equal(assistant_text.meta["labels"], assistant_text.value)
+
+    snapshot = copy.deepcopy(batch)
+    pre(batch)
+    for actual, expected in zip(batch[0], snapshot[0]):
+        if isinstance(actual.value, torch.Tensor):
+            assert torch.equal(actual.value, expected.value)
+
+
+def test_bagel_siglip_preprocessor_patchifies_and_tags_context():
+    pre = BagelSiglipNavitCPUPreprocessor(
+        BagelSiglipNavitProcessor(
+            patch_size=2,
+            image_size=4,
+            min_image_size=2,
+            max_pixels=16,
+            vit_max_num_patch_per_side=2,
+        ),
+        dtype=torch.bfloat16,
+    )
+    batch = [[ConversationItem(type="image", value=torch.full((3, 4, 4), 7, dtype=torch.uint8), role="user")]]
+
+    pre(batch)
+    item = batch[0][0]
+    assert item.source == BAGEL_SIGLIP_CONTEXT
+    assert item.meta[BAGEL_SIGLIP_PATCHES] is True
+    assert item.meta[BAGEL_SIGLIP_TOKEN_LEN] == 4
+    assert item.meta[BAGEL_SIGLIP_POSITION_IDS].tolist() == [0, 1, 2, 3]
+    assert item.value.shape == (4, 2 * 2 * 3)
+    assert item.value.dtype == torch.bfloat16
+
+    value = item.value.clone()
+    pre(batch)
+    assert torch.equal(item.value, value)
 
 
 # ── Qwen3 / Qwen3-VL text preprocessors ─────────────────────────────────────────
@@ -527,6 +605,11 @@ def test_preprocessors_are_picklable():
         ),
         JanusVqvaeCPUPreprocessor(
             FakeImageProcessor(), dtype=torch.bfloat16, dummy_pixel_values=torch.zeros(3, 4, 4, dtype=torch.bfloat16)
+        ),
+        BagelTextEncoderCPUPreprocessor(FakeTokenizer(), start_token_id=1, eos_token_id=2),
+        BagelSiglipNavitCPUPreprocessor(
+            BagelSiglipNavitProcessor(patch_size=2, image_size=4, min_image_size=2, max_pixels=16),
+            dtype=torch.bfloat16,
         ),
         Qwen3TextEncoderCPUPreprocessor(FakeTokenizer(), _qwen3_markers(), apply_qwen3_chat_template),
         Qwen3VLTextEncoderCPUPreprocessor(FakeTokenizer(), _qwen3vl_markers()),

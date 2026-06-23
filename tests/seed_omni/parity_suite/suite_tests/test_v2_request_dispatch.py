@@ -121,7 +121,7 @@ def test_missing_request_hook_raises_clear_error_without_canonical_fallback() ->
         driver.v2_request_kwargs(reference_output, device=torch.device("cpu"))
 
 
-def test_conversation_values_materialize_from_single_sample_stimulus() -> None:
+def test_inference_conversation_stimulus_materializes_flat_request() -> None:
     driver = _ToyDriver(
         _case(
             reference={"kind": "missing_kind"},
@@ -163,7 +163,7 @@ def test_conversation_values_materialize_from_single_sample_stimulus() -> None:
     assert image_item.value.size == (8, 6)
 
 
-def test_training_conversation_values_materialize_to_batch() -> None:
+def test_training_conversation_stimulus_materializes_batched_request() -> None:
     driver = _ToyDriver(
         _case(
             reference={"kind": "missing_kind"},
@@ -187,7 +187,7 @@ def test_training_conversation_values_materialize_to_batch() -> None:
     assert request["conversation_list"][0][0].value == "hello"
 
 
-def test_reference_inputs_normalizes_single_conversation_list_to_batch() -> None:
+def test_reference_inputs_keep_batched_oracle_shape() -> None:
     stimulus = {
         "conversation_list": [
             {
@@ -204,7 +204,7 @@ def test_reference_inputs_normalizes_single_conversation_list_to_batch() -> None
     assert inputs["conversation_list"] == [stimulus["conversation_list"]]
 
 
-def test_stimulus_batched_conversation_list_keeps_explicit_batch() -> None:
+def test_v2_request_explicit_batched_stimulus_keeps_batch_shape() -> None:
     driver = _ToyDriver(
         _case(
             reference={"kind": "missing_kind"},
@@ -416,11 +416,13 @@ def test_tier_runners_call_v2_request_kwargs() -> None:
     assert "v2_request_kwargs" in inspect.getsource(graph.run_v2_train_graph)
     assert "v2_infer_request" not in inspect.getsource(graph.run_v2_infer_graph)
     assert "v2_train_batch_kwargs" not in inspect.getsource(graph.run_v2_train_graph)
+    assert "apply_training_cpu_preprocessors" in inspect.getsource(graph._run_v2_train_graph_batch)
     assert "v2_request_kwargs" in inspect.getsource(module.run_v2_infer_module)
     assert "v2_infer_request" not in inspect.getsource(module.run_v2_infer_module)
     source = inspect.getsource(framework.run_v2_train_framework)
     assert "v2_request_kwargs" in source
     assert "v2_train_batch_kwargs" not in source
+    assert "apply_training_cpu_preprocessors" in inspect.getsource(framework._run_v2_train_framework_batch)
 
 
 def test_conversation_request_materializes_nested_meta_tensors() -> None:

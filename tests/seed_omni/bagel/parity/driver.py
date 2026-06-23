@@ -16,13 +16,15 @@ _LM_HEAD_SAMPLE_ROWS_KEY = "lm_head_sample_rows"
 
 class BagelParityDriver(ParityDriver):
     def runtime_sdpa_kernel_modules(self) -> tuple[Any, ...]:
-        # Official BAGEL and V2 BAGEL each bind sdpa_kernel in their own module.
-        # The deterministic-SDPA runtime option patches both globals with the
+        # Official BAGEL and V2 BAGEL bind attention helpers in module globals.
+        # The deterministic-SDPA runtime option patches these globals with the
         # same semantic policy during reference and V2 phases.
         import tests.seed_omni.bagel.parity.reference.vendor.modeling.bagel.qwen2_navit as ref_qwen2_navit
+        import tests.seed_omni.bagel.parity.reference.vendor.modeling.bagel.siglip_navit as ref_siglip_navit
         import veomni.models.seed_omni.modules.bagel.qwen2_mot.modeling as v2_qwen2_mot
+        import veomni.models.seed_omni.modules.bagel.siglip_navit.modeling as v2_siglip_navit
 
-        return (ref_qwen2_navit, v2_qwen2_mot)
+        return (ref_siglip_navit, ref_qwen2_navit, v2_siglip_navit, v2_qwen2_mot)
 
     def gradient_rows(self, batch: dict[str, Any], mapping: ProbeMapping) -> torch.Tensor | None:
         if mapping.v2_field == "train_grad_lm_head_rows":

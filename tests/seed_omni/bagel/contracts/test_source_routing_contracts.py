@@ -12,6 +12,7 @@ from veomni.models.seed_omni.modules.bagel.sources import (
     BAGEL_FLOW_QUERY,
     BAGEL_FLOW_VELOCITY,
     BAGEL_GENERATED_LATENT,
+    BAGEL_SIGLIP_CONTEXT,
     BAGEL_VAE_CONTEXT,
 )
 
@@ -158,6 +159,19 @@ def test_bagel_qwen2_mot_velocity_collect_requires_flow_velocity_source() -> Non
 def test_bagel_marker_wrapping_skips_velocity_and_generated_latent_sources() -> None:
     from veomni.models.seed_omni.modules.bagel.text_encoder.processing import is_image_item
 
+    siglip = ConversationItem(
+        type="image",
+        value=torch.zeros(2, 4),
+        role="user",
+        source=BAGEL_SIGLIP_CONTEXT,
+        meta={},
+    )
+    raw_image = ConversationItem(
+        type="image",
+        value=torch.zeros(2, 4),
+        role="user",
+        meta={},
+    )
     context = ConversationItem(
         type="output",
         value=torch.zeros(2, 4),
@@ -187,7 +201,44 @@ def test_bagel_marker_wrapping_skips_velocity_and_generated_latent_sources() -> 
         meta={},
     )
 
-    assert [item for item in (context, query, velocity, generated) if is_image_item(item)] == [context, query]
+    assert [item for item in (siglip, raw_image, context, query, velocity, generated) if is_image_item(item)] == [
+        siglip,
+        context,
+        query,
+    ]
+
+
+def test_bagel_siglip_selector_accepts_raw_and_context_sources() -> None:
+    model = _tiny_siglip()
+    raw_image = ConversationItem(type="image", value=torch.zeros(3, 4, 4), role="user")
+    context_image = ConversationItem(
+        type="image",
+        value=torch.zeros(3, 4, 4),
+        role="user",
+        source=BAGEL_SIGLIP_CONTEXT,
+    )
+
+    assert model._select_siglip_image_items([[raw_image]]) == [raw_image]
+    assert model._select_siglip_image_items([[context_image]]) == [context_image]
+
+
+def _tiny_siglip():
+    BagelSiglip = model_cls("bagel_siglip_navit")
+    BagelSiglipConfig = config_cls("bagel_siglip_navit")
+    return BagelSiglip(
+        BagelSiglipConfig(
+            hidden_size=8,
+            output_size=8,
+            image_size=28,
+            min_image_size=14,
+            max_pixels=28 * 14,
+            intermediate_size=16,
+            num_attention_heads=2,
+            num_hidden_layers=1,
+            patch_size=14,
+            vit_max_num_patch_per_side=2,
+        )
+    )
 
 
 def _tiny_flow_connector():

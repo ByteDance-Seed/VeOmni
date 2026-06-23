@@ -106,8 +106,18 @@ def _deterministic_sdpa_context(*, sdpa_kernel_modules: Iterable[Any]) -> Iterat
         del args, kwargs
         return sdpa_kernel(backends=[SDPBackend.MATH])
 
+    def deterministic_flash_attn_varlen_func(original: Any):
+        def wrapped(*args: Any, **kwargs: Any):
+            kwargs.setdefault("deterministic", True)
+            return original(*args, **kwargs)
+
+        return wrapped
+
     modules = tuple(sdpa_kernel_modules)
-    originals = tuple((module, module.sdpa_kernel) for module in modules if hasattr(module, "sdpa_kernel"))
+    sdpa_originals = tuple((module, module.sdpa_kernel) for module in modules if hasattr(module, "sdpa_kernel"))
+    flash_originals = tuple(
+        (module, module.flash_attn_varlen_func) for module in modules if hasattr(module, "flash_attn_varlen_func")
+    )
     cuda_state: tuple[bool, bool, bool] | None = None
     if torch.cuda.is_available():
         cuda_state = (
@@ -120,12 +130,16 @@ def _deterministic_sdpa_context(*, sdpa_kernel_modules: Iterable[Any]) -> Iterat
             torch.backends.cuda.enable_flash_sdp(False)
             torch.backends.cuda.enable_mem_efficient_sdp(False)
             torch.backends.cuda.enable_math_sdp(True)
-        for module, _original in originals:
+        for module, _original in sdpa_originals:
             module.sdpa_kernel = math_sdpa_kernel
+        for module, original in flash_originals:
+            module.flash_attn_varlen_func = deterministic_flash_attn_varlen_func(original)
         yield
     finally:
-        for module, original in originals:
+        for module, original in sdpa_originals:
             module.sdpa_kernel = original
+        for module, original in flash_originals:
+            module.flash_attn_varlen_func = original
         if cuda_state is not None:
             flash, mem_efficient, math = cuda_state
             torch.backends.cuda.enable_flash_sdp(flash)

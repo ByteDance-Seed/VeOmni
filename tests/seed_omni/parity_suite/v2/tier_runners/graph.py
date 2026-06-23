@@ -8,6 +8,7 @@ from typing import Any
 import torch
 
 from tests.seed_omni.parity_suite.core import RunCaptureOptions, autocast_for_dtype, zero_module_grads
+from tests.seed_omni.parity_suite.v2.cpu_preprocess import apply_training_cpu_preprocessors
 from tests.seed_omni.parity_suite.v2.generation_runtime import cpu_origin_randn_for_reference_parity
 from tests.seed_omni.parity_suite.v2.observation import arm_generation_observer
 
@@ -72,6 +73,7 @@ def _run_v2_train_graph_batch(
     model = driver.load_v2_model(device=device, dtype=dtype).train()
     zero_module_grads(model.modules_dict.values())
     batch = dict(batch_kwargs)
+    apply_training_cpu_preprocessors(model, batch)
     with torch.enable_grad(), autocast_for_dtype(device, dtype):
         forward_result = model(**batch)
         loss = forward_result["loss"]

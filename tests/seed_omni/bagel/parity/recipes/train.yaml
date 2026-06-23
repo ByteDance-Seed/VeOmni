@@ -171,7 +171,6 @@ train_text_image_ce:
   - graph: train
     stimulus:
       loss_mode: text_image_ce
-      image_size: 224
       conversation_list:
         - type: image
           role: user
@@ -187,13 +186,6 @@ train_text_image_ce:
     gate:
       requires_reference_checkpoint: true
       requires_v2_model: true
-    v2_model:
-      module_overrides:
-        bagel_siglip_navit:
-          config:
-            image_size: 224
-            min_image_size: 224
-            max_pixels: 50176
     runs:
       graph:
         - id: forward_backward

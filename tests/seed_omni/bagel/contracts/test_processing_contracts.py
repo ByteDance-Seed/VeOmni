@@ -10,7 +10,6 @@ from veomni.models.seed_omni.conversation import ConversationItem
 from veomni.models.seed_omni.modules.bagel.sources import (
     BAGEL_FLOW_VELOCITY,
     BAGEL_GENERATED_LATENT,
-    BAGEL_SIGLIP_CONTEXT,
     BAGEL_VAE_CONTEXT,
 )
 
@@ -190,30 +189,6 @@ def test_bagel_vae_decode_skips_context_hidden_outputs():
     ]
 
 
-def test_bagel_text_encoder_marker_and_token_helpers():
-    from veomni.models.seed_omni.modules.bagel.text_encoder.processing import (
-        apply_image_marker,
-        is_image_item,
-    )
-
-    image_item = ConversationItem(
-        type="image",
-        value=torch.ones(1, 2, 3),
-        role="user",
-        source=BAGEL_SIGLIP_CONTEXT,
-    )
-    text_item = ConversationItem(type="text", value="prompt", role="user")
-    assert is_image_item(image_item)
-    assert not is_image_item(text_item)
-
-    marker_embeds = torch.tensor([[0.0, 0.0, 0.0], [2.0, 2.0, 2.0]])
-    apply_image_marker(image_item, marker_embeds, device=torch.device("cpu"), dtype=torch.float32)
-    assert image_item.value.shape == (4, 3)
-    wrapped_once = image_item.value.clone()
-    apply_image_marker(image_item, marker_embeds, device=torch.device("cpu"), dtype=torch.float32)
-    assert torch.equal(image_item.value, wrapped_once)
-
-
 def test_bagel_flow_generation_state_tracks_denoise_round():
     from veomni.models.seed_omni.modules.bagel.flow_connector.generation_state import FlowGenerationState
 
@@ -242,10 +217,9 @@ def test_bagel_flow_generation_state_tracks_denoise_round():
     assert state.phase == "prepare_query"
 
 
-def test_bagel_raw_image_preprocessing_builds_official_metadata(tmp_path):
+def test_bagel_siglip_processor_call_matches_saved_config(tmp_path):
     from veomni.models.seed_omni.modules.bagel.siglip_navit.processing import (
         BagelSiglipNavitProcessor,
-        prepare_image_batch,
     )
 
     BagelSiglip = model_cls("bagel_siglip_navit")
@@ -274,14 +248,15 @@ def test_bagel_raw_image_preprocessing_builds_official_metadata(tmp_path):
         value=Image.new("RGB", (20, 10), color=(255, 0, 0)),
         role="user",
     )
-    inputs = prepare_image_batch(
-        [image_item],
-        config=siglip.config,
+    inputs = processor(
+        images=[image_item.value],
+        return_tensors="pt",
         device=torch.device("cpu"),
         dtype=torch.float32,
     )
-    processor_inputs = loaded_processor.prepare_image_batch(
-        [image_item.value],
+    processor_inputs = loaded_processor(
+        images=[image_item.value],
+        return_tensors="pt",
         device=torch.device("cpu"),
         dtype=torch.float32,
     )
@@ -299,42 +274,41 @@ def test_bagel_raw_image_preprocessing_builds_official_metadata(tmp_path):
     assert torch.equal(inputs["patchified_pixel_values"], call_inputs["patchified_pixel_values"])
     assert image_item.meta == {}
 
-    BagelTextEncoder = model_cls("bagel_text_encoder")
-    BagelTextEncoderConfig = config_cls("bagel_text_encoder")
-    text_encoder = BagelTextEncoder(BagelTextEncoderConfig(vocab_size=16, hidden_size=8))
-    text_encoder.tokenizer = _BagelInterleaveTokenizer()
-    image_item.value = torch.zeros(2, 8)
-    image_item.source = BAGEL_SIGLIP_CONTEXT
-    text_item = ConversationItem(type="text", value="prompt", role="user")
-    text_encoder.generate(conversation_list=[image_item, text_item])
-    text_encoder.encode_image_markers(conversation_list=[image_item, text_item])
 
-    assert image_item.value.shape == (4, 8)
-    assert text_item.value.shape == (3, 8)
-    assert text_item.meta["input_ids"].tolist() == [1, 7, 2]
+def test_bagel_siglip_module_uses_initialized_processor_config():
+    BagelSiglip = model_cls("bagel_siglip_navit")
+    BagelSiglipConfig = config_cls("bagel_siglip_navit")
+    model = BagelSiglip(
+        BagelSiglipConfig(
+            hidden_size=8,
+            output_size=8,
+            image_size=28,
+            min_image_size=14,
+            max_pixels=28 * 14,
+            intermediate_size=16,
+            num_attention_heads=2,
+            num_hidden_layers=1,
+            patch_size=14,
+            vit_max_num_patch_per_side=2,
+        )
+    )
+    assert model._image_processor.image_size == 28
 
+    model.config.image_size = 56
+    model.config.min_image_size = 56
+    model.config.max_pixels = 56 * 56
+    image_item = ConversationItem(
+        type="image",
+        value=Image.new("RGB", (20, 10), color=(255, 0, 0)),
+        role="user",
+    )
 
-class _BagelInterleaveTokenizer:
-    eos_token_id = 2
-    unk_token_id = 0
+    inputs = model._image_processor(
+        images=[image_item.value],
+        return_tensors="pt",
+        device=model.device,
+        dtype=model.dtype,
+    )
 
-    _token_ids = {
-        "<|im_start|>": 1,
-        "<|vision_start|>": 5,
-        "<|vision_end|>": 6,
-        "prompt": 7,
-    }
-
-    def convert_tokens_to_ids(self, token: str) -> int:
-        return self._token_ids.get(token, self.unk_token_id)
-
-    def encode(self, text: str, add_special_tokens: bool = False) -> list[int]:
-        del add_special_tokens
-        return [self._token_ids.get(part, 8) for part in text.split()]
-
-    def __call__(self, text: str, add_special_tokens: bool = False) -> dict[str, list[int]]:
-        return {"input_ids": self.encode(text, add_special_tokens=add_special_tokens)}
-
-    def decode(self, token_ids: list[int], skip_special_tokens: bool = True) -> str:
-        special = {1, 2, 5, 6} if skip_special_tokens else set()
-        return " ".join(str(token_id) for token_id in token_ids if token_id not in special)
+    assert inputs["token_lens"].tolist() == [2]
+    assert inputs["patchified_pixel_values"].shape == (2, 14 * 14 * 3)

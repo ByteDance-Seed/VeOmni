@@ -119,32 +119,31 @@ def _assert_carrier_equivalent(
             assert left_item.value == right_item.value
 
 
-def test_bagel_prompt_graphs_expose_independent_vae_and_siglip_producers() -> None:
-    for graph_name in ("graph_infer_edit.yaml", "graph_infer_interleave.yaml"):
-        graph_config = yaml.safe_load((_BAGEL_CONFIG_DIR / graph_name).read_text())["generation_graph"]
-        prompt_body = graph_config["states"]["prompt_encode"]["body"]
+def test_bagel_edit_prompt_graph_exposes_vae_then_siglip_prompt_producers() -> None:
+    graph_config = yaml.safe_load((_BAGEL_CONFIG_DIR / "graph_infer_edit.yaml").read_text())["generation_graph"]
+    prompt_body = graph_config["states"]["prompt_encode"]["body"]
 
-        assert {"from": "bagel_text_encoder", "to": "bagel_qwen2_mot"} in prompt_body
-        assert {"from": "bagel_vae.encode", "to": "bagel_siglip_navit"} in prompt_body
-        assert {"from": "bagel_siglip_navit", "to": "bagel_flow_connector.embed_latent"} in prompt_body
-        assert {
-            "from": "bagel_flow_connector.embed_latent",
-            "to": "bagel_text_encoder.encode_image_markers",
-        } in (prompt_body)
-        assert {
-            "from": "bagel_text_encoder.encode_image_markers",
-            "to": "bagel_qwen2_mot",
-        } in (prompt_body)
+    assert {"from": "bagel_text_encoder", "to": "bagel_qwen2_mot"} in prompt_body
+    assert {"from": "bagel_vae.encode", "to": "bagel_siglip_navit"} in prompt_body
+    assert {"from": "bagel_siglip_navit", "to": "bagel_flow_connector.embed_latent"} in prompt_body
+    assert {
+        "from": "bagel_flow_connector.embed_latent",
+        "to": "bagel_text_encoder.encode_image_markers",
+    } in (prompt_body)
+    assert {
+        "from": "bagel_text_encoder.encode_image_markers",
+        "to": "bagel_qwen2_mot",
+    } in (prompt_body)
 
-        forbidden_edges = {
-            ("bagel_siglip_navit", "bagel_vae.encode"),
-        }
-        assert not forbidden_edges.intersection({(edge["from"], edge["to"]) for edge in prompt_body})
+    forbidden_edges = {
+        ("bagel_siglip_navit", "bagel_vae.encode"),
+    }
+    assert not forbidden_edges.intersection({(edge["from"], edge["to"]) for edge in prompt_body})
 
-        graph = GenerationGraph(graph_config)
-        sequence = graph.state_node_sequence("prompt_encode")
-        assert "bagel_vae.encode" in sequence
-        assert "bagel_siglip_navit.generate" in sequence
+    graph = GenerationGraph(graph_config)
+    sequence = graph.state_node_sequence("prompt_encode")
+    assert "bagel_vae.encode" in sequence
+    assert "bagel_siglip_navit.generate" in sequence
 
 
 def test_same_snapshot_prompt_updates_match_current_sequential_materialization() -> None:

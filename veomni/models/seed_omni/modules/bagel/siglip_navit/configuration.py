@@ -1,5 +1,7 @@
 """Configuration for :class:`BagelSiglipNavit`."""
 
+from typing import List, Optional
+
 from transformers import PretrainedConfig
 
 
@@ -15,8 +17,8 @@ class BagelSiglipNavitConfig(PretrainedConfig):
         image_size: int = 980,
         min_image_size: int = 378,
         max_pixels: int = 14 * 14 * 9 * 1024,
-        image_mean: list[float] | None = None,
-        image_std: list[float] | None = None,
+        image_mean: Optional[List[float]] = None,
+        image_std: Optional[List[float]] = None,
         intermediate_size: int = 4304,
         num_attention_heads: int = 16,
         num_hidden_layers: int = 26,
