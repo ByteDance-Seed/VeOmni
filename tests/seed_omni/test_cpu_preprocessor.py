@@ -41,6 +41,8 @@ from veomni.models.seed_omni.modules.bagel.text_encoder.modulemixin import (
 from veomni.models.seed_omni.modules.bagel.text_encoder.modulemixin import (
     BagelTextEncoderCPUPreprocessor,
 )
+from veomni.models.seed_omni.modules.bagel.vae.modulemixin import BagelVAECPUPreprocessor
+from veomni.models.seed_omni.modules.bagel.vae.processing import BagelVAEProcessor
 from veomni.models.seed_omni.modules.janus.siglip.modulemixin import (
     JanusSiglipCPUPreprocessor,
 )
@@ -256,6 +258,39 @@ def test_bagel_siglip_preprocessor_patchifies_and_tags_context():
     value = item.value.clone()
     pre(batch)
     assert torch.equal(item.value, value)
+
+
+def test_bagel_preprocessors_leave_inference_request_raw():
+    text_pre = BagelTextEncoderCPUPreprocessor(FakeTokenizer(), start_token_id=1, eos_token_id=2)
+    siglip_pre = BagelSiglipNavitCPUPreprocessor(
+        BagelSiglipNavitProcessor(patch_size=2, image_size=4, min_image_size=2, max_pixels=16),
+        dtype=torch.bfloat16,
+    )
+    vae_pre = BagelVAECPUPreprocessor(
+        BagelVAEProcessor(image_stride=2, min_image_size=4, max_image_size=4, max_pixels=16),
+        dtype=torch.bfloat16,
+    )
+    user_image = torch.full((3, 4, 4), 7, dtype=torch.uint8)
+    assistant_image = torch.full((3, 4, 4), 9, dtype=torch.uint8)
+    batch = [
+        [
+            ConversationItem(type="text", value="hi", role="user"),
+            ConversationItem(type="image", value=user_image.clone(), role="user"),
+            ConversationItem(type="image", value=assistant_image.clone(), role="assistant"),
+        ]
+    ]
+
+    for preprocessor in (text_pre, siglip_pre, vae_pre):
+        preprocessor(batch, inference=True, generation_kwargs={"max_new_tokens": 1})
+
+    text_item, user_image_item, assistant_image_item = batch[0]
+    assert text_item.value == "hi"
+    assert BAGEL_TOK not in text_item.meta
+    assert user_image_item.source is None
+    assert BAGEL_SIGLIP_PATCHES not in user_image_item.meta
+    assert torch.equal(user_image_item.value, user_image)
+    assert assistant_image_item.source is None
+    assert torch.equal(assistant_image_item.value, assistant_image)
 
 
 # ── Qwen3 / Qwen3-VL text preprocessors ─────────────────────────────────────────
@@ -587,6 +622,10 @@ def test_preprocessors_are_picklable():
         BagelTextEncoderCPUPreprocessor(FakeTokenizer(), start_token_id=1, eos_token_id=2),
         BagelSiglipNavitCPUPreprocessor(
             BagelSiglipNavitProcessor(patch_size=2, image_size=4, min_image_size=2, max_pixels=16),
+            dtype=torch.bfloat16,
+        ),
+        BagelVAECPUPreprocessor(
+            BagelVAEProcessor(image_stride=2, min_image_size=4, max_image_size=4, max_pixels=16),
             dtype=torch.bfloat16,
         ),
         Qwen3VLVisionCPUPreprocessor(

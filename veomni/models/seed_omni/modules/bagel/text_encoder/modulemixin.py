@@ -37,7 +37,16 @@ class BagelTextEncoderCPUPreprocessor(CPUPreprocessor):
         self._start_token_id = int(start_token_id)
         self._eos_token_id = int(eos_token_id)
 
-    def __call__(self, conversation_list: List[List[ConversationItem]]) -> None:
+    def __call__(
+        self,
+        conversation_list: List[List[ConversationItem]],
+        *,
+        inference: bool = False,
+        generation_kwargs: Dict[str, Any] | None = None,
+    ) -> None:
+        del generation_kwargs
+        if inference:
+            return
         for item in iter_desired_items(conversation_list, types=["text"]):
             materialize_text_item_input_ids(
                 item,

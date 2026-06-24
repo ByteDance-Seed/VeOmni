@@ -22,7 +22,16 @@ class BagelVAECPUPreprocessor(CPUPreprocessor):
         self._image_processor = image_processor
         self._dtype = dtype
 
-    def __call__(self, conversation_list: list[list[ConversationItem]]) -> None:
+    def __call__(
+        self,
+        conversation_list: list[list[ConversationItem]],
+        *,
+        inference: bool = False,
+        generation_kwargs: dict[str, Any] | None = None,
+    ) -> None:
+        del generation_kwargs
+        if inference:
+            return
         image_items = []
         # Training data routes image branches by role: user images feed SigLIP,
         # assistant images feed VAE.
