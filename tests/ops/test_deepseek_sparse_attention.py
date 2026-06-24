@@ -228,6 +228,20 @@ def test_flash_mla_sparse_forward_compatibility_rejects_bad_sink_shape():
     assert "learnable_sink" in reason
 
 
+def test_flash_mla_sparse_forward_compatibility_rejects_bad_sink_dtype():
+    q_pe = torch.empty(1, 2, 128, 64, dtype=torch.bfloat16)
+    k_pe = torch.empty(1, 4, 1, 64, dtype=torch.bfloat16)
+    kv_cache = torch.empty(1, 4, 1, 512, dtype=torch.bfloat16)
+    q_nope = torch.empty(1, 2, 128, 512, dtype=torch.bfloat16)
+    gather = torch.zeros(1, 2, 128, dtype=torch.int32)
+    sink = torch.zeros(128, dtype=torch.bfloat16)
+
+    compatible, reason = dsa.check_flash_mla_sparse_forward_compatible(q_pe, k_pe, kv_cache, q_nope, gather, sink)
+
+    assert not compatible
+    assert "fp32" in reason
+
+
 def test_flash_mla_sparse_forward_compatibility_rejects_bad_topk_length_shape():
     q_pe = torch.empty(1, 2, 128, 64, dtype=torch.bfloat16)
     k_pe = torch.empty(1, 4, 1, 64, dtype=torch.bfloat16)

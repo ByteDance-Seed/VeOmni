@@ -124,6 +124,8 @@ def check_flash_mla_sparse_forward_compatible(
     if learnable_sink is not None:
         if learnable_sink.shape != (q_pe.shape[2],):
             return False, f"learnable_sink must be [H], got {tuple(learnable_sink.shape)}"
+        if learnable_sink.dtype != torch.float32:
+            return False, f"learnable_sink must be fp32, got {learnable_sink.dtype}"
     if topk_length is not None:
         if gather_kv_indices is None:
             return False, "topk_length requires gather_kv_indices"

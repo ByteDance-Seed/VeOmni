@@ -552,13 +552,14 @@ def deepseek_v4_attention_forward_patched(
             base_kv_len=base_kv_len,
             sliding_window=self.sliding_window,
         )
+        attn_sink = self.sinks.float()
         compatible, reason = check_flash_mla_sparse_forward_compatible(
             q_pe,
             k_pe,
             kv_bshd,
             q_nope,
             sparse_indices,
-            self.sinks,
+            attn_sink,
             topk_length,
         )
         if not compatible:
@@ -569,7 +570,7 @@ def deepseek_v4_attention_forward_patched(
             kv_bshd.contiguous(),
             q_nope.contiguous(),
             sparse_indices,
-            attn_sink=self.sinks,
+            attn_sink=attn_sink,
             topk_length=topk_length,
             softmax_scale=self.scaling,
         )
