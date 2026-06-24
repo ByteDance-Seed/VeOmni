@@ -1,5 +1,5 @@
 from veomni.arguments import OmniArguments, parse_omni_args
-from veomni.trainer.omni_inferencer import OmniInferencer
+from veomni.trainer.omni import OmniInferencer
 
 
 def main() -> None:

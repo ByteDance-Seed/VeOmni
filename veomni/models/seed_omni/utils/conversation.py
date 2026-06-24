@@ -137,8 +137,16 @@ def iter_desired_items(
     types: list[str] | None = None,
     roles: list[str] | None = None,
     sources: list[str] | None = None,
+    meta: dict | None = None,
 ) -> Iterator[ConversationItem]:
     """Yield matching items in micro-batch order (sample 0, then sample 1, …)."""
+
+    def meta_matches(item_meta: ConversationItem) -> bool:
+        for key, value in meta.items():
+            if item_meta.get(key) != value:
+                return False
+        return True
+
     for sample in conversation_list:
         for item in sample:
             if types is not None and item.type not in types:
@@ -146,6 +154,8 @@ def iter_desired_items(
             if roles is not None and item.role not in roles:
                 continue
             if sources is not None and item.source not in sources:
+                continue
+            if meta is not None and not meta_matches(item.meta):
                 continue
             yield item
 
@@ -160,20 +170,6 @@ def collect_desired_values(
     return [item.value for item in iter_desired_items(conversation_list, types, roles, sources)]
 
 
-def worker_dummy_items(conversation_list: list[list[ConversationItem]], source: str) -> list[ConversationItem]:
-    """Worker-appended ``role="dummy"`` placeholders for module ``source``.
-
-    A module's CPU preprocessor appends one on a micro-batch with no real input for
-    it; ``meta["source"]`` + ``role="dummy"`` is enough to find it back (a given
-    source has at most one class of dummy item live at any call site).
-    """
-    return [it for it in iter_desired_items(conversation_list, roles=["dummy"]) if it.meta.get("source") == source]
-
-
-def has_worker_dummy(conversation_list: list[list[ConversationItem]], source: str) -> bool:
-    return bool(worker_dummy_items(conversation_list, source))
-
-
 __all__ = [
     "ConversationItem",
     "build_conversation",
@@ -182,6 +178,4 @@ __all__ = [
     "seal_outputs",
     "iter_desired_items",
     "collect_desired_values",
-    "worker_dummy_items",
-    "has_worker_dummy",
 ]

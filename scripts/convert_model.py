@@ -16,7 +16,8 @@ from __future__ import annotations
 
 import argparse
 
-from veomni.models.seed_omni.convert_registry import convert_checkpoint, read_hf_model_type
+from veomni.models.seed_omni import read_hf_model_type
+from veomni.models.seed_omni.utils.convert_registry import convert_checkpoint
 
 
 def main() -> None:

@@ -5,8 +5,8 @@ import torch
 from veomni.distributed.parallel_state import get_parallel_state
 from veomni.utils.tensor_utils import naflatten, unflatten
 
-from ....conversation import ConversationItem, is_dummy
-from ....module import ModuleMixin, post_forward, pre_forward
+from ....mixins.modulemixin import ModuleMixin, post_forward, pre_forward
+from ....utils.conversation import ConversationItem, is_dummy
 
 
 class Qwen3VLLlmModuleMixin(ModuleMixin):

@@ -25,10 +25,10 @@ Every node (real, non-``end``) MUST appear on at least one edge — either as a
 ``to: end``.  This guarantees no orphans and a single, well-formed forward
 queue.
 
-Each active node executes **exactly once** per forward pass.  Multiple edges
-into the same node fan in (their routed values merge into one kwargs dict).
-Multiple edges out of the same node fan out (downstream nodes share the same
-single output dict).
+Each active node executes **exactly once** per forward pass.  Edges declare
+**topology only** (execution order) — there is no per-node input routing: every
+node receives the same shared ``batch`` and all cross-node state flows through
+the single ``conversation_list`` carrier, mutated/replaced in place as it goes.
 
 Single-loss protocol
 --------------------
@@ -44,7 +44,11 @@ Exposed surface
 * ``sources`` / ``sinks``               — nodes with no incoming / no
                                             non-``end`` outgoing active edge.
 * ``module_of(node)`` / ``method_of(node)`` — accessors.
-* ``collect_inputs(node, outputs, raw_batch)`` — assemble forward kwargs.
+* ``reset()`` / ``is_done()`` / ``current_node_name`` — cursor lifecycle
+                                            (mirror of the generation FSM).
+* ``step(modules, batch, ...)``         — run the node at the cursor (one
+                                            forward); ``maybe_transition()``
+                                            advances to the next node.
 * ``to_mermaid(...)``                    — render the active DAG (``end`` is
                                             drawn as a dashed terminal node).
 
@@ -55,7 +59,8 @@ See also
 """
 
 from collections import defaultdict, deque
-from typing import Any, Dict, List, Optional
+from contextlib import nullcontext
+from typing import Any, Callable, ContextManager, Dict, List, Optional
 
 from .graph import EdgeDef, NodeDef, is_end
 
@@ -122,6 +127,11 @@ class TrainingGraph:
 
         self._execution_order: List[str] = self._topological_sort()
 
+        # Runtime cursor into :attr:`_execution_order` — the training analogue of
+        # the FSM's ``_current`` state. ``step`` runs the node at the cursor;
+        # ``maybe_transition`` advances it. Reset before each forward pass.
+        self._cursor: int = 0
+
     # ── public API ────────────────────────────────────────────────────────────
 
     @property
@@ -161,19 +171,124 @@ class TrainingGraph:
             raise KeyError(f"'{node}' is not an active node. Active: {sorted(self._node_by_name)}.")
         return n.method
 
-    def collect_inputs(
-        self,
-        node: str,
-        outputs: Dict[str, Dict[str, Any]],
-        raw_batch: Dict[str, Any],
-    ) -> Dict[str, Any]:
-        """Build the kwargs dict for ``node``'s forward call.
+    # ── Lifecycle (mirror of GenerationGraph) ───────────────────────────────────
 
-        Returns a shallow copy of ``raw_batch``.  Modules mutate
-        ``conversation_list`` in place; edges declare execution order only.
+    def reset(self) -> None:
+        """Re-point the cursor at the first node for a fresh forward pass.
+
+        Training analogue of :meth:`GenerationGraph.reset` (FSM → initial state).
         """
-        del node, outputs
-        return dict(raw_batch)
+        self._cursor = 0
+
+    def is_done(self) -> bool:
+        """True once every node in :attr:`execution_order` has been stepped.
+
+        Training analogue of :meth:`GenerationGraph.is_done` (FSM at ``done``).
+        """
+        return self._cursor >= len(self._execution_order)
+
+    @property
+    def current_node_name(self) -> str:
+        """The node the next :meth:`step` will run (the cursor position).
+
+        Analogue of :attr:`GenerationGraph.current_state_name`.
+        """
+        if self.is_done():
+            raise RuntimeError("TrainingGraph.current_node_name: cursor past the last node (graph is done).")
+        return self._execution_order[self._cursor]
+
+    # ── Step & Transition (mirror of GenerationGraph) ───────────────────────────
+
+    def step(
+        self,
+        modules: Dict[str, Any],
+        batch: Dict[str, Any],
+        *,
+        trace: Optional[List[str]] = None,
+        scope_fn: Optional[Callable[[str], ContextManager]] = None,
+    ) -> Dict[str, Any]:
+        """Run the node at the cursor — one forward (mirror of ``GenerationGraph.step``).
+
+        Like the FSM step, this is self-contained: it resolves the module, scopes
+        its :class:`ParallelState` (via ``scope_fn`` — vocab-parallel ``emb`` /
+        MoE EP groups), runs ``pre_forward`` → method → ``post_forward``, and
+        feeds the optional per-module trace meter. The one training-specific bit
+        the FSM lacks is the **wrapper call**: inference invokes raw module
+        methods directly (modules self-unshard via internal ``self(...)`` and
+        there is no backward), whereas training must call the **wrapped** module
+        (``modules[name]`` is the DDP / FSDP2 unit) so the all-gather pre-hook and
+        the reduce-scatter backward hook fire. Non-``forward`` node methods are
+        dispatched by temporarily pointing ``raw.forward`` at the target method so
+        they still run through ``__call__``. ``raw`` (the unwrapped
+        :class:`ModuleMixin`) owns the hooks; FSDP2 is in-place (``raw is
+        wrapped``) while DDP wraps (``raw = wrapped.module``).
+
+        Edges are pure topology — no per-node input routing. Every node receives
+        the same shared ``batch``; cross-node state flows through the single
+        ``conversation_list`` carrier, so the node's return dict (only ever
+        ``conversation_list`` and/or ``_loss``) is merged back into ``batch`` for
+        downstream nodes. Loss collection lives in :meth:`OmniModel.forward`
+        (``_collect_training_loss``), mirroring ``_collect_generated``.
+
+        Returns the (mutated) ``batch``.
+        """
+        node_name = self.current_node_name
+        node = self._node_by_name[node_name]
+        method = node.method
+
+        wrapped = modules.get(node.module)
+        if wrapped is None:
+            raise KeyError(
+                f"TrainingGraph.step: module '{node.module}' (node '{node_name}') missing "
+                f"from modules dict. Provided: {sorted(modules)}."
+            )
+        # Duck-typed unwrap (keeps this module import-light, like the FSM): the
+        # raw OmniModule exposes ``pre_forward``; a DDP wrapper does not proxy it.
+        raw = wrapped if hasattr(wrapped, "pre_forward") else wrapped.module
+
+        module_context = scope_fn(node.module) if scope_fn is not None else nullcontext()
+        with module_context:
+            kwargs = raw.pre_forward(method=method, **batch)
+
+            # Opt-in trace meter (only modules multi-inheriting a TraceMixin have
+            # ``trace_add``); token lengths read straight from the real inputs.
+            if hasattr(raw, "trace_add"):
+                raw.trace_add(method, kwargs)
+
+            if method == "forward":
+                out = wrapped(**kwargs)
+            else:
+                fn = getattr(raw, method, None)
+                if fn is None:
+                    raise AttributeError(f"Node method {type(raw).__name__}.{method}() is not implemented.")
+                orig_forward = raw.forward
+                try:
+                    raw.forward = fn
+                    out = wrapped(**kwargs)
+                finally:
+                    raw.forward = orig_forward
+
+            out = raw.post_forward(method=method, **out)
+
+        batch.update(out)
+
+        if trace is not None:
+            trace.append(f"forward:{node_name}")
+
+        return batch
+
+    def maybe_transition(self, *, trace: Optional[List[str]] = None) -> bool:
+        """Advance the cursor to the next node (mirror of ``GenerationGraph.maybe_transition``).
+
+        Training's "transition" is unconditional: a static topological pass just
+        moves to the next node. Returns ``True`` while nodes remain, ``False``
+        once the cursor steps past the last one (``is_done()``).
+        """
+        self._cursor += 1
+        moved = not self.is_done()
+        if trace is not None and moved:
+            trace.append(f"transition: -> {self.current_node_name}")
+        return moved
 
     # ── visualization ────────────────────────────────────────────────────────
 

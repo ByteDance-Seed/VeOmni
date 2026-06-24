@@ -1,20 +1,23 @@
-"""Unit tests for Qwen3 ChatML template helpers."""
+"""Unit tests for the Qwen3 ChatML template (class-based)."""
 
-from veomni.models.seed_omni.conversation import ConversationItem
-from veomni.models.seed_omni.modules.qwen3.text_encoder.chat_template import (
-    Qwen3ChatMarkers,
-    apply_qwen3_chat_template,
-    apply_qwen3_generation_prompt,
-)
+from veomni.models.seed_omni.modules.qwen3.text_encoder.chat_template import Qwen3ChatTemplate
+from veomni.models.seed_omni.utils.conversation import ConversationItem
 
 
-def _markers() -> Qwen3ChatMarkers:
-    return Qwen3ChatMarkers(
-        im_start_token="<|im_start|>",
-        im_end_token="</turn>",
-        eos_token="<|endoftext|>",
-        assistant_prefix="<|im_start|>assistant\n",
-    )
+class FakeTokenizer:
+    """Minimal tokenizer for chat-template construction (markers are fixed literals)."""
+
+    eos_token_id = 0
+
+    def convert_tokens_to_ids(self, token):
+        return 1
+
+    def __call__(self, text, add_special_tokens=False):
+        return {"input_ids": [ord(c) for c in text]}
+
+
+def _template() -> Qwen3ChatTemplate:
+    return Qwen3ChatTemplate(FakeTokenizer())
 
 
 def test_apply_qwen3_chat_template_wraps_roles():
@@ -22,20 +25,23 @@ def test_apply_qwen3_chat_template_wraps_roles():
         ConversationItem(type="text", value="hi", role="user"),
         ConversationItem(type="text", value="hello", role="assistant"),
     ]
-    parts = apply_qwen3_chat_template(sample, _markers())
+    parts = _template().apply_chat_template(sample)
+    # Standard Qwen ChatML: every turn closed with <|im_end|>\n.
     assert parts[0].value == "<|im_start|>user\n"
     assert parts[1].value == "hi"
-    assert parts[2].value == "<|im_start|>assistant\n"
-    assert parts[3].value == "hello"
-    assert parts[4].value == "</turn>\n"
-    assert parts[3].meta["loss_mask"] == 1
+    assert parts[2].value == "<|im_end|>\n"  # user turn closed (unsupervised)
+    assert parts[2].meta["loss_mask"] == 0
+    assert parts[3].value == "<|im_start|>assistant\n"
+    assert parts[4].value == "hello"
+    assert parts[4].meta["loss_mask"] == 1
+    assert parts[5].value == "<|im_end|>\n"  # assistant turn closed (supervised)
+    assert parts[5].meta["loss_mask"] == 1
 
 
 def test_apply_qwen3_generation_prompt_appends_assistant_prefix():
-    sample = [
-        ConversationItem(type="text", value="<|im_start|>user\n", role="user", meta={"loss_mask": 0}),
-        ConversationItem(type="text", value="hi", role="user", meta={"loss_mask": 0}),
-    ]
-    parts = apply_qwen3_generation_prompt(sample, _markers())
+    # Input is an already-templated (turn-closed) prompt; generation prompt only
+    # appends the assistant prefix.
+    sample = _template().apply_chat_template([ConversationItem(type="text", value="hi", role="user")])
+    parts = _template().apply_generation_prompt(sample)
     assert parts[-1].value == "<|im_start|>assistant\n"
-    assert parts[-2].value == "</turn>\n"
+    assert parts[-2].value == "<|im_end|>\n"  # closing of the user turn from apply_chat_template

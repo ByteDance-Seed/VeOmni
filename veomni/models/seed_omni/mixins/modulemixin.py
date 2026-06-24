@@ -3,7 +3,7 @@ ModuleMixin — base hooks for every SeedOmni V2 sub-model.
 
 Layout
 ------
-* ``module.py`` — :class:`ModuleMixin` (shared defaults).
+* ``modulemixin.py`` — :class:`ModuleMixin` (shared defaults).
 * ``modules/<family>/<sub>/modulemixin.py`` — ``XxxModuleMixin(ModuleMixin)``
   with train/infer hooks and :meth:`init_omni_state`.
 * ``modules/<family>/<sub>/modeling.py`` — HF ``PreTrainedModel`` body
@@ -101,15 +101,24 @@ class CPUPreprocessor:
       single ``.to(device)``.
     * **In-place mutation.** ``__call__`` receives the batched
       ``conversation_list`` (``list[list[ConversationItem]]``) and mutates items'
-      ``value`` / ``meta`` in place, tagging a sentinel in ``meta`` so the thin
-      ``pre_forward`` knows the heavy work is already done (and falls back to the
-      full self-contained path when the sentinel is absent, e.g. eager inference
-      with no worker collator).
+      ``value`` / ``meta`` in place, tagging the module ``source`` so the thin
+      ``pre_forward`` / ``generate`` reads the heavy work back uniformly.
+    * **Shared by training + inference.** Training runs it inside
+      :class:`~veomni.data.data_collator.SeedOmniCollator` (DataLoader worker);
+      inference runs it once over the request in
+      :meth:`~veomni.trainer.omni.omni_inferencer.OmniInferencer._preprocess_request`,
+      before the FSM. The ``inference`` flag flips the train/infer-only behaviour:
+      image modules **skip dummy injection** (no FSDP anchor at inference) and
+      text encoders **append the assistant generation prompt**. Extra request
+      options (e.g. ``generation_kwargs``) arrive via ``**kwargs`` so a module
+      *could* vary its input-prep by them (classifier-free guidance duplicating the
+      prompt, …); no current module needs them, but the hook is plumbed through.
     """
 
-    def __call__(self, conversation_list: List[List[Any]]) -> None:
+    def __call__(self, conversation_list: List[List[Any]], inference: bool = False, **kwargs: Any) -> None:
         raise NotImplementedError(
-            f"{type(self).__name__} must implement __call__(conversation_list) and mutate it in place."
+            f"{type(self).__name__} must implement "
+            "__call__(conversation_list, inference=False, **kwargs) and mutate it in place."
         )
 
 
@@ -119,7 +128,7 @@ class ModuleMixin:
     A module opts into the optional per-module training trace separately, by
     multi-inheriting its own ``XxxTraceMixin(TraceMixin)`` on the concrete model
     (``ModuleMixin`` itself does **not** inherit ``TraceMixin``).  See
-    :class:`~veomni.models.seed_omni.tracemixin.TraceMixin`.
+    :class:`~veomni.models.seed_omni.mixins.tracemixin.TraceMixin`.
     """
 
     # Generic / combined processor (e.g. an HF ``XxxProcessor`` wrapping several
@@ -273,7 +282,7 @@ class ModuleMixin:
         # Lazy import to avoid an import cycle (``veomni.models.auto`` pulls in
         # the loader / ops stack at import time, while this module is imported
         # while that stack is still initialising).
-        from ..auto import build_tokenizer
+        from ...auto import build_tokenizer
 
         model = super().from_pretrained(pretrained_model_name_or_path, *args, **kwargs)
         # Each per-module asset is loaded only when its class slot is declared,

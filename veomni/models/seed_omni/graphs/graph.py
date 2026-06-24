@@ -49,15 +49,13 @@ Two execution views consume these edge lists (see ``training_graph.py`` and
   inline edge dicts; the unique nodes appearing as endpoints (excluding
   ``end``) execute once per FSM step in declaration order.
 
-See the :class:`~veomni.models.seed_omni.training_graph.TrainingGraph` and
-:class:`~veomni.models.seed_omni.generation_graph.GenerationGraph` module
+See the :class:`~veomni.models.seed_omni.graphs.training_graph.TrainingGraph` and
+:class:`~veomni.models.seed_omni.graphs.generation_graph.GenerationGraph` module
 docstrings for the full schema.
 """
 
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
-
-import torch
+from typing import Dict, Optional
 
 
 END: str = "end"
@@ -160,69 +158,3 @@ class EdgeDef:
     def is_sink(self) -> bool:
         """True iff this edge terminates at the virtual ``end`` sink."""
         return self.to == END
-
-
-def scalar_token_id(value: Any) -> Optional[int]:
-    """Extract one token id from ``input_ids`` (scalar, tensor, or nested list).
-
-    Used by modules that inspect the sampled token after ``decode`` (e.g.
-    ``JanusTextEncoder.decode`` reads the last id to decide which one-shot
-    ``module_signal`` to emit).
-    """
-    if isinstance(value, torch.Tensor):
-        if value.numel() == 0:
-            return None
-        flat = value.reshape(-1)
-        return int(flat[-1].item())
-    if isinstance(value, (list, tuple)) and value:
-        return scalar_token_id(value[-1])
-    if value is None:
-        return None
-    return int(value)
-
-
-def is_step_input_ids(value: Any) -> bool:
-    """True when ``value`` is a single next-token step (HF ``generate`` shape).
-
-    Step tokens are scalars, ``(B, 1)`` tensors, or length-1 vectors.
-    A ``(B, T)`` tensor with ``T > 1`` is treated as a full prompt / sequence
-    replacement, not a step token.
-    """
-    if isinstance(value, int):
-        return True
-    if isinstance(value, torch.Tensor):
-        if value.numel() == 1:
-            return True
-        return value.ndim == 2 and value.size(-1) == 1
-    return False
-
-
-def normalize_step_input_ids(value: Any) -> Any:
-    """Coerce a step token to ``(B, 1)`` when possible (tensors / ints)."""
-    if isinstance(value, int):
-        return torch.tensor([[value]], dtype=torch.long)
-    if isinstance(value, torch.Tensor):
-        if value.ndim == 0:
-            return value.view(1, 1)
-        if value.ndim == 1:
-            return value.unsqueeze(-1)
-        return value
-    return value
-
-
-def append_input_ids(sequence: Any, new_tokens: Any) -> Any:
-    """Append a sampled step token onto a growing ``input_ids`` sequence.
-
-    Mirrors HuggingFace ``generate`` — ``ctx["input_ids"]`` accumulates the
-    full sequence while modules still emit ``(B, 1)`` next-token steps.
-    Non-tensor histories (print tests) fall back to the latest tensor step.
-    """
-    new = normalize_step_input_ids(new_tokens)
-    if sequence is None:
-        return new
-    if not isinstance(sequence, torch.Tensor):
-        return new if isinstance(new, torch.Tensor) else new_tokens
-    if not isinstance(new, torch.Tensor):
-        return sequence
-    seq = sequence.unsqueeze(0) if sequence.ndim == 1 else sequence
-    return torch.cat([seq, new.to(dtype=seq.dtype, device=seq.device)], dim=-1)

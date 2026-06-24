@@ -56,8 +56,11 @@ class VideoInputs:
     A single clip is one media item whose ``value`` bundles both streams:
 
     * ``video`` — sampled-frame tensor ``(T, C, H, W)`` uint8.
-    * ``video_fps`` — the (target) frame sampling rate, kept for the temporal
-      grid timeline (``video_second_per_grid = temporal_patch_size / video_fps``).
+    * ``video_fps`` — the fps these sampled frames represent (the data layer's
+      memory-bound pre-trim rate). Forwarded as the HF processor's
+      ``video_metadata`` fps so it can sub-sample to the model's authoritative
+      ``self.fps``; also the basis for the temporal grid timeline
+      (``video_second_per_grid = temporal_patch_size / video_fps``).
     * ``audio`` — optional in-video waveform (``None`` when there is no audio
       track or extraction was disabled). When present, downstream modules wrap it
       with ``<|vision_bos|><|audio_bos|> … <|audio_eos|><|vision_eos|>`` and

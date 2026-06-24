@@ -21,19 +21,20 @@
 #      :data:`OMNI_MODEL_REGISTRY`, :data:`OMNI_PROCESSOR_REGISTRY` — resolve
 #      ``model_type → class`` lazily at runtime.
 from .configuration_omni import OmniConfig
-from .conversation import build_conversation
-from .generation_graph import GenerationGraph
-from .graph import END, EdgeDef, NodeDef
+from .graphs.generation_graph import GenerationGraph
+from .graphs.graph import END, EdgeDef, NodeDef
+from .graphs.training_graph import TrainingGraph
+from .mixins.modulemixin import ModuleMixin
+from .mixins.tracemixin import TraceMixin
 from .modeling_omni import OmniModel
-from .module import ModuleMixin
 from .modules import (
     OMNI_CONFIG_REGISTRY,
     OMNI_MODEL_REGISTRY,
     OMNI_PROCESSOR_REGISTRY,
+    read_hf_model_type,
     read_model_type,
 )
-from .tracemixin import TraceMixin
-from .training_graph import TrainingGraph
+from .utils.conversation import build_conversation
 
 
 __all__ = [
@@ -52,5 +53,6 @@ __all__ = [
     "OMNI_CONFIG_REGISTRY",
     "OMNI_MODEL_REGISTRY",
     "OMNI_PROCESSOR_REGISTRY",
+    "read_hf_model_type",
     "read_model_type",
 ]

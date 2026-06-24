@@ -16,7 +16,7 @@
 
 Reads a raw jsonl-style sample (already source-tagged conversations + media
 paths/bytes) and returns ``[{"conversation_list": [...]}]`` where each
-item is a :class:`~veomni.models.seed_omni.conversation.ConversationItem`
+item is a :class:`~veomni.models.seed_omni.utils.conversation.ConversationItem`
 with ``type`` / ``value`` / ``role`` (empty ``meta`` at the data boundary).
 
 Understanding vs generation images both use ``type="image"``; ``role`` distinguishes
@@ -64,7 +64,7 @@ from typing import Any, List
 
 import torch
 
-from ...models.seed_omni.conversation import ConversationItem
+from ...models.seed_omni.utils.conversation import ConversationItem
 from ...utils.import_utils import is_video_audio_available
 from ..data_transform import DATA_TRANSFORM_REGISTRY
 from .image_utils import fetch_images
