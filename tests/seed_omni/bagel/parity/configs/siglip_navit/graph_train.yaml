@@ -1,3 +1,0 @@
-# DAG: image carrier -> bagel_siglip_navit.forward -> carrier image features.
-training_graph:
-  - { from: bagel_siglip_navit, to: end }

@@ -1,3 +1,0 @@
-# DAG: embedded carrier spans -> Qwen2-MoT packed hidden states.
-training_graph:
-  - { from: bagel_qwen2_mot, to: end }

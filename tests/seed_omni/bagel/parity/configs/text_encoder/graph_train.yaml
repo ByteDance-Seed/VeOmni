@@ -1,3 +1,0 @@
-training_graph:
-  - { from: bagel_text_encoder.encode, to: bagel_text_encoder.decode }
-  - { from: bagel_text_encoder.decode, to: end }

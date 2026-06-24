@@ -1,4 +1,0 @@
-# Module-only BAGEL VAE parity config.
-bagel_vae:
-  model:
-    model_path: bagel_vae

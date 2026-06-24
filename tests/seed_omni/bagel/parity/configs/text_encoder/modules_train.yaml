@@ -1,3 +1,0 @@
-bagel_text_encoder:
-  model:
-    model_path: bagel_text_encoder

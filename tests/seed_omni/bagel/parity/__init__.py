@@ -1,1 +1,0 @@
-"""BAGEL parity contracts."""
