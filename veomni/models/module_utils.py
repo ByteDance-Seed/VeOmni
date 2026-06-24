@@ -88,8 +88,19 @@ def _copy_safetensors_shard(filepath: str, staged_filepath: str) -> None:
         shutil.copyfile(filepath, staged_filepath)
         return
 
-    logger.info_rank0(f"Copying safetensors shard with hdfs dfs -copyToLocal: {hdfs_uri} -> {staged_filepath}")
-    subprocess.run(["hdfs", "dfs", "-copyToLocal", "-f", hdfs_uri, staged_filepath], check=True)
+    copy_method = os.getenv("VEOMNI_STAGE_HDFS_SAFETENSORS_COPY_METHOD", "copy_to_local")
+    if copy_method == "copy_to_local":
+        logger.info_rank0(f"Copying safetensors shard with hdfs dfs -copyToLocal: {hdfs_uri} -> {staged_filepath}")
+        subprocess.run(["hdfs", "dfs", "-copyToLocal", "-f", hdfs_uri, staged_filepath], check=True)
+    elif copy_method == "cat":
+        logger.info_rank0(f"Copying safetensors shard with hdfs dfs -cat: {hdfs_uri} -> {staged_filepath}")
+        with open(staged_filepath, "wb") as staged_file:
+            subprocess.run(["hdfs", "dfs", "-cat", hdfs_uri], stdout=staged_file, check=True)
+    else:
+        raise ValueError(
+            "VEOMNI_STAGE_HDFS_SAFETENSORS_COPY_METHOD must be one of: "
+            f"copy_to_local, cat. Got {copy_method!r}."
+        )
 
 
 @contextmanager
