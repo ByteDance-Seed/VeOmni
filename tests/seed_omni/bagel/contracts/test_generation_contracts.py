@@ -15,6 +15,7 @@ from tests.seed_omni.bagel.contracts.helpers import (
 from veomni.models.seed_omni.conversation import ConversationItem
 from veomni.models.seed_omni.generation_graph import FSM_SIGNAL_KEY
 from veomni.models.seed_omni.modeling_omni import OmniModel
+from veomni.models.seed_omni.modules.bagel.qwen2_mot.generation_state import MotGenerationState
 from veomni.models.seed_omni.modules.bagel.sources import (
     BAGEL_FLOW_HIDDEN,
     BAGEL_FLOW_QUERY,
@@ -22,21 +23,6 @@ from veomni.models.seed_omni.modules.bagel.sources import (
     BAGEL_GENERATED_LATENT,
     BAGEL_VAE_CONTEXT,
 )
-
-
-def test_bagel_qwen2_mot_gen_mode_requires_token_indexes():
-    BagelQwen2MoT = model_cls("bagel_qwen2_mot")
-    BagelQwen2MoTConfig = config_cls("bagel_qwen2_mot")
-    model = BagelQwen2MoT(BagelQwen2MoTConfig(**tiny_bagel_qwen2_cfg()))
-
-    with pytest.raises(ValueError, match="mode='gen' requires"):
-        model._forward_packed_inference(
-            packed_query_sequence=torch.randn(1, 64),
-            query_lens=torch.tensor([1], dtype=torch.int32),
-            packed_query_position_ids=torch.tensor([0], dtype=torch.long),
-            packed_query_indexes=torch.tensor([0], dtype=torch.long),
-            mode="gen",
-        )
 
 
 def test_bagel_infer_gen_denoise_signal_smoke():
@@ -208,32 +194,34 @@ def test_bagel_qwen2_mot_cfg_text_context_snapshot_is_internal():
     BagelQwen2MoTConfig = config_cls("bagel_qwen2_mot")
     model = BagelQwen2MoT(BagelQwen2MoTConfig(**tiny_bagel_qwen2_cfg()))
 
-    model._snapshot_cfg_text_context(
-        past_key_values=None,
+    model._generation_state.cfg_text.snapshot(
+        cache=None,
         key_values_lens=None,
         packed_key_value_indexes=None,
         next_position_id=torch.tensor(7),
+        empty_cache_factory=model._new_empty_cache,
+        device=model.device,
     )
-    model._generation_state.denoise_branch = "cfg_text"
-
     cfg_text_context = model._generation_state.cfg_text
     assert cfg_text_context.cache is not None
     assert cfg_text_context.cache_len() == 0
-    assert cfg_text_context.position_ids(3, device=model.device).tolist() == [7, 7, 7]
+    assert cfg_text_context.repeated_position_ids(3, device=model.device).tolist() == [7, 7, 7]
     assert cfg_text_context.key_values_lens.tolist() == [0]
     assert cfg_text_context.packed_key_value_indexes.numel() == 0
 
     cache = model._new_empty_cache()
-    model._snapshot_cfg_text_context(
-        past_key_values=cache,
+    model._generation_state.cfg_text.snapshot(
+        cache=cache,
         key_values_lens=torch.tensor([5], dtype=torch.int32),
         packed_key_value_indexes=torch.arange(5),
         next_position_id=torch.tensor(11),
+        empty_cache_factory=model._new_empty_cache,
+        device=model.device,
     )
 
     assert cfg_text_context.cache is not cache
     assert cfg_text_context.cache_len() == 5
-    assert cfg_text_context.position_ids(2, device=model.device).tolist() == [11, 11]
+    assert cfg_text_context.repeated_position_ids(2, device=model.device).tolist() == [11, 11]
     assert cfg_text_context.packed_key_value_indexes.tolist() == [0, 1, 2, 3, 4]
 
 
@@ -242,22 +230,18 @@ def test_bagel_qwen2_mot_cfg_img_context_accessors_are_internal():
     BagelQwen2MoTConfig = config_cls("bagel_qwen2_mot")
     model = BagelQwen2MoT(BagelQwen2MoTConfig(**tiny_bagel_qwen2_cfg()))
 
-    model._ensure_cfg_img_context()
-    model._generation_state.denoise_branch = "cfg_img"
-
+    model._generation_state.cfg_img.ensure_empty(empty_cache_factory=model._new_empty_cache, device=model.device)
     cfg_img_context = model._generation_state.cfg_img
     assert cfg_img_context.cache is not None
     assert cfg_img_context.cache_len() == 0
-    assert cfg_img_context.position_ids(3, device=model.device).tolist() == [0, 0, 0]
+    assert cfg_img_context.repeated_position_ids(3, device=model.device).tolist() == [0, 0, 0]
     assert cfg_img_context.key_values_lens.tolist() == [0]
     assert cfg_img_context.packed_key_value_indexes.numel() == 0
 
 
 def test_bagel_qwen2_mot_cfg_img_requires_text_cfg():
-    from veomni.models.seed_omni.modules.bagel.qwen2_mot.processing import validate_cfg_request
-
     with pytest.raises(ValueError, match="cfg_img_scale > 1.0 requires cfg_text_scale > 1.0"):
-        validate_cfg_request({"cfg_text_scale": 1.0, "cfg_img_scale": 1.5})
+        MotGenerationState().validate_cfg_request({"cfg_text_scale": 1.0, "cfg_img_scale": 1.5})
 
 
 def test_bagel_qwen2_mot_cfg_text_image_velocity_collection_and_merge():
@@ -281,27 +265,24 @@ def test_bagel_qwen2_mot_cfg_text_image_velocity_collection_and_merge():
         "cfg_renorm_min": 0.0,
     }
 
-    out = model._collect_or_merge_velocity(
+    out = model.collect_velocity(
         conversation_list=conversation,
-        conversation=conversation,
         generation_kwargs=generation_kwargs,
     )
     assert out[FSM_SIGNAL_KEY] == "need_denoise_branch"
-    assert model._generation_state.denoise_branch == "cfg_text"
+    assert model._generation_state.active_denoise_branch == "cfg_text"
 
     conversation[-1].value = torch.tensor([[0.5, 1.0], [1.5, 2.0]])
-    out = model._collect_or_merge_velocity(
+    out = model.collect_velocity(
         conversation_list=conversation,
-        conversation=conversation,
         generation_kwargs=generation_kwargs,
     )
     assert out[FSM_SIGNAL_KEY] == "need_denoise_branch"
-    assert model._generation_state.denoise_branch == "cfg_img"
+    assert model._generation_state.active_denoise_branch == "cfg_img"
 
     conversation[-1].value = torch.tensor([[0.25, 0.5], [0.75, 1.0]])
-    out = model._collect_or_merge_velocity(
+    out = model.collect_velocity(
         conversation_list=conversation,
-        conversation=conversation,
         generation_kwargs=generation_kwargs,
     )
 
@@ -313,8 +294,51 @@ def test_bagel_qwen2_mot_cfg_text_image_velocity_collection_and_merge():
     expected = guided * (torch.norm(main) / (torch.norm(guided) + 1e-8)).clamp(min=0.0, max=1.0)
 
     assert FSM_SIGNAL_KEY not in out
-    assert model._generation_state.denoise_branch == "main"
-    assert model._generation_state.velocity_buffer == {}
+    assert model._generation_state.active_denoise_branch == "main"
+    torch.testing.assert_close(conversation[-1].value, expected)
+
+
+def test_bagel_qwen2_mot_cfg_text_only_velocity_collection_and_merge():
+    BagelQwen2MoT = model_cls("bagel_qwen2_mot")
+    BagelQwen2MoTConfig = config_cls("bagel_qwen2_mot")
+    model = BagelQwen2MoT(BagelQwen2MoTConfig(**tiny_bagel_qwen2_cfg()))
+    conversation = [
+        ConversationItem(
+            type="output",
+            value=torch.tensor([[1.0, 2.0], [3.0, 4.0]]),
+            role="assistant",
+            source=BAGEL_FLOW_VELOCITY,
+            meta={"timestep": torch.tensor(0.5)},
+        )
+    ]
+    generation_kwargs = {
+        "cfg_text_scale": 2.0,
+        "cfg_img_scale": 1.0,
+        "cfg_interval": [0.0, 1.0],
+        "cfg_renorm_type": "global",
+        "cfg_renorm_min": 0.0,
+    }
+
+    out = model.collect_velocity(
+        conversation_list=conversation,
+        generation_kwargs=generation_kwargs,
+    )
+    assert out[FSM_SIGNAL_KEY] == "need_denoise_branch"
+    assert model._generation_state.active_denoise_branch == "cfg_text"
+
+    conversation[-1].value = torch.tensor([[0.5, 1.0], [1.5, 2.0]])
+    out = model.collect_velocity(
+        conversation_list=conversation,
+        generation_kwargs=generation_kwargs,
+    )
+
+    main = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+    cfg_text = torch.tensor([[0.5, 1.0], [1.5, 2.0]])
+    guided = cfg_text + 2.0 * (main - cfg_text)
+    expected = guided * (torch.norm(main) / (torch.norm(guided) + 1e-8)).clamp(min=0.0, max=1.0)
+
+    assert FSM_SIGNAL_KEY not in out
+    assert model._generation_state.active_denoise_branch == "main"
     torch.testing.assert_close(conversation[-1].value, expected)
 
 
@@ -371,7 +395,7 @@ class _InferGenBagelQwen(nn.Module):
             return {"conversation_list": conversation_list}
         return {"conversation_list": conversation_list}
 
-    def run_denoise_branch(self, conversation_list: list[ConversationItem] | None = None, **kwargs):
+    def denoise_branch(self, conversation_list: list[ConversationItem] | None = None, **kwargs):
         del kwargs
         assert conversation_list is not None
         tail = conversation_list[-1]

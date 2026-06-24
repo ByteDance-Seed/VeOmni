@@ -13,10 +13,12 @@ from PIL import Image
 from tests.seed_omni.parity_suite.core import (
     ParityCase,
     RecipeSpec,
+    RunCaptureOptions,
     RunSpec,
     conversation_stimulus_to_batched_specs,
 )
 from tests.seed_omni.parity_suite.driver import ParityDriver
+from tests.seed_omni.parity_suite.driver.v2_run import V2RunContext, canonical_from_reference_output
 from tests.seed_omni.parity_suite.reference.contract import ReferenceRunResult
 from tests.seed_omni.parity_suite.v2.request import V2RequestContext
 from tests.seed_omni.parity_suite.v2.tier_runners import framework, graph, module
@@ -68,6 +70,30 @@ def _handler(ctx: V2RequestContext) -> dict[str, Any]:
     return {"conversation_list": [[{"kind": ctx.kind, "prompt": ctx.stimulus["prompt"]}]]}
 
 
+def _v2_ctx(
+    driver: ParityDriver,
+    reference_output: ReferenceRunResult | None = None,
+    *,
+    device: torch.device | None = None,
+) -> V2RunContext:
+    device = torch.device("cpu") if device is None else device
+    return V2RunContext(
+        case=driver.case,
+        tier=driver.case.tier,
+        domain=driver.case.graph.domain,
+        reference_output=reference_output,
+        canonical=canonical_from_reference_output(reference_output),
+        whitelist={},
+        device=device,
+        dtype=torch.float32,
+        capture_options=RunCaptureOptions(),
+    )
+
+
+def _build_request(driver: ParityDriver, reference_output: ReferenceRunResult | None = None) -> dict[str, Any]:
+    return driver.build_v2_request(_v2_ctx(driver, reference_output))
+
+
 class _ToyDriver(ParityDriver):
     def build_text_und_request(self, ctx: V2RequestContext) -> dict[str, Any]:
         return _handler(ctx)
@@ -83,19 +109,19 @@ def test_reference_kind_infers_default_handler_name() -> None:
     driver = _ToyDriver(_case())
     assert driver._v2_request_method_name("text_und") == "build_text_und_request"
     reference_output = ReferenceRunResult(canonical={"prompt": "x"}, observations={})
-    request = driver.v2_request_kwargs(reference_output, device=torch.device("cpu"))
+    request = _build_request(driver, reference_output)
     assert request["conversation_list"][0][0]["kind"] == "text_und"
 
 
 def test_missing_reference_kind_defaults_to_graph_name() -> None:
     driver = _ToyDriver(_case(missing_kind=True))
-    request = driver.v2_request_kwargs(ReferenceRunResult(canonical={}, observations={}), device=torch.device("cpu"))
+    request = _build_request(driver)
     assert request["conversation_list"][0][0]["kind"] == "infer_toy"
 
 
 def test_training_reference_kind_defaults_to_forward_backward() -> None:
     driver = _ToyDriver(_case(missing_kind=True, graph_name="train", graph_domain="training"))
-    request = driver.v2_request_kwargs(ReferenceRunResult(canonical={}, observations={}), device=torch.device("cpu"))
+    request = _build_request(driver)
     assert request["conversation_list"][0][0]["kind"] == "train_forward_backward"
 
 
@@ -118,7 +144,7 @@ def test_missing_request_hook_raises_clear_error_without_canonical_fallback() ->
     )
 
     with pytest.raises(NotImplementedError, match="no method 'build_missing_kind_request'"):
-        driver.v2_request_kwargs(reference_output, device=torch.device("cpu"))
+        driver.build_v2_request(_v2_ctx(driver, reference_output))
 
 
 def test_inference_conversation_stimulus_materializes_flat_request() -> None:
@@ -148,7 +174,7 @@ def test_inference_conversation_stimulus_materializes_flat_request() -> None:
         )
     )
 
-    request = driver.v2_request_kwargs(ReferenceRunResult(canonical={}, observations={}), device=torch.device("cpu"))
+    request = _build_request(driver)
 
     assert len(request["conversation_list"]) == 3
     tensor_item, text_item, image_item = request["conversation_list"]
@@ -181,7 +207,7 @@ def test_training_conversation_stimulus_materializes_batched_request() -> None:
         )
     )
 
-    request = driver.v2_request_kwargs(ReferenceRunResult(canonical={}, observations={}), device=torch.device("cpu"))
+    request = _build_request(driver)
 
     assert len(request["conversation_list"]) == 1
     assert request["conversation_list"][0][0].value == "hello"
@@ -227,7 +253,7 @@ def test_v2_request_explicit_batched_stimulus_keeps_batch_shape() -> None:
         )
     )
 
-    request = driver.v2_request_kwargs(ReferenceRunResult(canonical={}, observations={}), device=torch.device("cpu"))
+    request = _build_request(driver)
 
     assert [sample[0].value.item() for sample in request["conversation_list"]] == [1, 2]
 
@@ -252,7 +278,7 @@ def test_conversation_value_requires_tagged_kind() -> None:
         )
     )
     with pytest.raises(ValueError, match="must declare kind"):
-        driver.v2_request_kwargs(ReferenceRunResult(canonical={}, observations={}), device=torch.device("cpu"))
+        _build_request(driver)
 
 
 def test_conversation_item_type_is_allowlisted() -> None:
@@ -270,7 +296,7 @@ def test_conversation_item_type_is_allowlisted() -> None:
         )
     )
     with pytest.raises(ValueError, match="Unsupported conversation item type"):
-        driver.v2_request_kwargs(ReferenceRunResult(canonical={}, observations={}), device=torch.device("cpu"))
+        _build_request(driver)
 
 
 def test_random_conversation_values_are_deterministic() -> None:
@@ -296,8 +322,8 @@ def test_random_conversation_values_are_deterministic() -> None:
         )
     )
 
-    first = driver.v2_request_kwargs(ReferenceRunResult(canonical={}, observations={}), device=torch.device("cpu"))
-    second = driver.v2_request_kwargs(ReferenceRunResult(canonical={}, observations={}), device=torch.device("cpu"))
+    first = _build_request(driver)
+    second = _build_request(driver)
 
     first_value = first["conversation_list"][0].value
     second_value = second["conversation_list"][0].value
@@ -321,12 +347,8 @@ def test_random_conversation_values_are_deterministic() -> None:
         )
     )
 
-    first = default_seed_driver.v2_request_kwargs(
-        ReferenceRunResult(canonical={}, observations={}), device=torch.device("cpu")
-    )
-    second = default_seed_driver.v2_request_kwargs(
-        ReferenceRunResult(canonical={}, observations={}), device=torch.device("cpu")
-    )
+    first = _build_request(default_seed_driver)
+    second = _build_request(default_seed_driver)
 
     assert torch.equal(first["conversation_list"][0].value, second["conversation_list"][0].value)
 
@@ -346,7 +368,7 @@ def test_random_conversation_value_rejects_invalid_distribution() -> None:
         )
     )
     with pytest.raises(ValueError, match="Unsupported random distribution"):
-        driver.v2_request_kwargs(ReferenceRunResult(canonical={}, observations={}), device=torch.device("cpu"))
+        _build_request(driver)
 
 
 def test_linspace_conversation_meta_materializes_tensor_shape_and_transform() -> None:
@@ -380,7 +402,7 @@ def test_linspace_conversation_meta_materializes_tensor_shape_and_transform() ->
         )
     )
 
-    request = driver.v2_request_kwargs(ReferenceRunResult(canonical={}, observations={}), device=torch.device("cpu"))
+    request = _build_request(driver)
     item = request["conversation_list"][0]
 
     assert item.meta["noise"].shape == (2, 3)
@@ -388,15 +410,14 @@ def test_linspace_conversation_meta_materializes_tensor_shape_and_transform() ->
     assert torch.allclose(item.meta["timestep"], torch.sigmoid(torch.tensor([-0.5, 0.5])))
 
 
-def test_v2_request_kwargs_rejects_invalid_reference_output() -> None:
-    driver = _ToyDriver(_case())
+def test_canonical_from_reference_output_rejects_invalid_reference_output() -> None:
     with pytest.raises(TypeError, match="expects ReferenceRunResult"):
-        driver.v2_request_kwargs({"canonical": {"prompt": "x"}}, device=torch.device("cpu"))
+        canonical_from_reference_output({"canonical": {"prompt": "x"}})
     with pytest.raises(TypeError, match="expects ReferenceRunResult"):
-        driver.v2_request_kwargs("invalid", device=torch.device("cpu"))
+        canonical_from_reference_output("invalid")
 
 
-def test_v2_request_kwargs_uses_empty_canonical_without_reference_output() -> None:
+def test_build_v2_request_uses_empty_canonical_without_reference_output() -> None:
     captured: dict[str, Any] = {}
 
     class _Driver(_ToyDriver):
@@ -406,21 +427,21 @@ def test_v2_request_kwargs_uses_empty_canonical_without_reference_output() -> No
             return {"conversation_list": [[]]}
 
     driver = _Driver(_case())
-    driver.v2_request_kwargs(None, device=torch.device("cpu"))
+    driver.build_v2_request(_v2_ctx(driver, None))
     assert captured["canonical"] == {}
     assert captured["reference_output"] is None
 
 
-def test_tier_runners_call_v2_request_kwargs() -> None:
-    assert "v2_request_kwargs" in inspect.getsource(graph.run_v2_infer_graph)
-    assert "v2_request_kwargs" in inspect.getsource(graph.run_v2_train_graph)
+def test_tier_runners_call_build_v2_request() -> None:
+    assert "build_v2_request" in inspect.getsource(graph.run_v2_infer_graph)
+    assert "build_v2_request" in inspect.getsource(graph.run_v2_train_graph)
     assert "v2_infer_request" not in inspect.getsource(graph.run_v2_infer_graph)
     assert "v2_train_batch_kwargs" not in inspect.getsource(graph.run_v2_train_graph)
     assert "apply_training_cpu_preprocessors" in inspect.getsource(graph._run_v2_train_graph_batch)
-    assert "v2_request_kwargs" in inspect.getsource(module.run_v2_infer_module)
+    assert "build_v2_request" in inspect.getsource(module.run_v2_infer_module)
     assert "v2_infer_request" not in inspect.getsource(module.run_v2_infer_module)
     source = inspect.getsource(framework.run_v2_train_framework)
-    assert "v2_request_kwargs" in source
+    assert "build_v2_request" in source
     assert "v2_train_batch_kwargs" not in source
     assert "apply_training_cpu_preprocessors" in inspect.getsource(framework._run_v2_train_framework_batch)
 
@@ -446,7 +467,7 @@ def test_conversation_request_materializes_nested_meta_tensors() -> None:
         )
     )
 
-    request = driver.v2_request_kwargs(ReferenceRunResult(canonical={}, observations={}), device=torch.device("cpu"))
+    request = _build_request(driver)
 
     [item] = request["conversation_list"]
     assert item.type == "output"

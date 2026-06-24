@@ -15,6 +15,7 @@ from tests.seed_omni.parity_suite.core import (
     RunCaptureOptions,
     zero_module_grads,
 )
+from tests.seed_omni.parity_suite.driver.v2_run import V2RunContext, canonical_from_reference_output
 from tests.seed_omni.parity_suite.v2.cpu_preprocess import apply_training_cpu_preprocessors
 from tests.seed_omni.parity_suite.v2.model import load_graph_active_omni_config
 from tests.seed_omni.parity_suite.v2.tier_runners.framework_support import (
@@ -58,13 +59,21 @@ def run_v2_train_framework(
 ) -> dict[str, Any] | ParityReport:
     """Run training framework tier through mapping comparison or policy reports."""
 
-    del capture_options
     run = driver.case.run
     if run.kind == "forward_backward":
+        run_ctx = _v2_run_context(
+            driver,
+            reference_output,
+            whitelist,
+            device=device,
+            dtype=dtype,
+            capture_options=capture_options,
+        )
         return _run_v2_train_framework_batch(
             driver,
-            driver.v2_request_kwargs(reference_output, device=device),
+            driver.build_v2_request(run_ctx),
             whitelist,
+            run_ctx=run_ctx,
             device=device,
             dtype=dtype,
         )
@@ -107,9 +116,11 @@ def _run_v2_train_framework_batch(
     batch_kwargs: Mapping[str, Any],
     whitelist: Mapping[tuple[str, str], frozenset[str]],
     *,
+    run_ctx: V2RunContext,
     device: torch.device,
     dtype: torch.dtype,
 ) -> dict[str, Any]:
+    del whitelist
     model = driver.load_v2_model(device=device, dtype=dtype).train()
     driver.configure_determinism(driver.case.model.seed)
     model.set_node_executors(build_trainer_node_executors(model))
@@ -117,10 +128,11 @@ def _run_v2_train_framework_batch(
     batch = dict(batch_kwargs)
     apply_training_cpu_preprocessors(model, batch)
     trainer = build_minimal_omni_trainer(model, device=device, dtype=dtype)
-    loss, loss_dict = trainer.forward_backward_step(batch)
+    with driver.v2_execution_context(run_ctx, model=model, batch=batch):
+        loss, loss_dict = trainer.forward_backward_step(batch)
     if loss is None:
         raise RuntimeError(f"{type(driver).__name__} V2 train framework tier produced no loss.")
-    observations = driver.collect_v2_train_framework_observations(model, loss_dict, whitelist, batch=batch)
+    observations = driver.collect_v2_observations(run_ctx, model=model, result={"losses": loss_dict}, batch=batch)
     return {"observations": observations, "ctx": {"loss": loss, "losses": loss_dict}, "trace": ["train:framework"]}
 
 
@@ -132,8 +144,10 @@ def _run_train_step_policy(
     dtype: torch.dtype,
 ) -> ParityReport:
     options = TrainerStepOptions.from_options(driver.case.run.options)
-    direct_batch = driver.v2_request_kwargs(reference_output, device=device)
-    trainer_batch = driver.v2_request_kwargs(reference_output, device=device)
+    direct_ctx = _v2_run_context(driver, reference_output, device=device, dtype=dtype, purpose="direct")
+    trainer_ctx = _v2_run_context(driver, reference_output, device=device, dtype=dtype, purpose="trainer")
+    direct_batch = driver.build_v2_request(direct_ctx)
+    trainer_batch = driver.build_v2_request(trainer_ctx)
 
     # Compare the production trainer step against a direct optimizer step using
     # fresh models with identical seeds, batches, optimizer, and scheduler.
@@ -148,7 +162,7 @@ def _run_train_step_policy(
         lr=options.lr,
         max_grad_norm=options.max_grad_norm,
     )
-    direct_parameters = driver.sample_v2_framework_parameters(direct_model, direct_batch)
+    direct_parameters = driver.v2_parameter_samples(direct_ctx, direct_model, direct_batch)
     del direct_model, direct_batch
     release_cuda_memory()
 
@@ -166,7 +180,7 @@ def _run_train_step_policy(
         lr=options.lr,
         max_grad_norm=options.max_grad_norm,
     )
-    trainer_parameters = driver.sample_v2_framework_parameters(trainer_model, trainer_batch)
+    trainer_parameters = driver.v2_parameter_samples(trainer_ctx, trainer_model, trainer_batch)
     zero_grad_passes = all_grads_are_cleared(trainer_model)
     reports = trainer_step_reports(
         driver,
@@ -196,11 +210,13 @@ def _run_checkpoint_resume_policy(
     output_dir.mkdir(parents=True, exist_ok=True)
 
     with single_rank_process_group():
+        save_ctx = _v2_run_context(driver, reference_output, device=device, dtype=dtype, purpose="checkpoint_save")
+        resume_ctx = _v2_run_context(driver, reference_output, device=device, dtype=dtype, purpose="checkpoint_resume")
         driver.configure_determinism(driver.case.model.seed)
         save_model = driver.load_v2_model(device=device, dtype=dtype).train()
         driver.configure_determinism(driver.case.model.seed)
         save_model.set_node_executors(build_trainer_node_executors(save_model))
-        save_batch = driver.v2_request_kwargs(reference_output, device=device)
+        save_batch = driver.build_v2_request(save_ctx)
         save_trainer = build_minimal_omni_trainer(save_model, device=device, dtype=dtype)
         attach_checkpoint_state(
             save_trainer,
@@ -210,10 +226,10 @@ def _run_checkpoint_resume_policy(
             max_grad_norm=options.max_grad_norm,
         )
         run_checkpoint_train_step(save_trainer, save_batch, seed=driver.case.model.seed)
-        saved_parameters = driver.sample_v2_framework_parameters(save_model, save_batch)
+        saved_parameters = driver.v2_parameter_samples(save_ctx, save_model, save_batch)
         # Reuse the post-step sampling context so resume compares the same rows
         # without keeping graph-bearing batch tensors alive across model reload.
-        sample_context = getattr(driver, "framework_parameter_sample_context", lambda batch: batch)(save_batch)
+        sample_context = driver.v2_parameter_sample_context(save_ctx, save_batch)
         saved_lrs = save_trainer.base.lr_scheduler.get_last_lr()
         checkpoint_root = output_dir / "checkpoints" / "global_step_1"
         saved_layout = checkpoint_layout(save_model, checkpoint_root)
@@ -224,7 +240,7 @@ def _run_checkpoint_resume_policy(
         resume_model = driver.load_v2_model(device=device, dtype=dtype).train()
         driver.configure_determinism(driver.case.model.seed)
         resume_model.set_node_executors(build_trainer_node_executors(resume_model))
-        resume_batch = driver.v2_request_kwargs(reference_output, device=device)
+        resume_batch = driver.build_v2_request(resume_ctx)
         resume_trainer = build_minimal_omni_trainer(resume_model, device=device, dtype=dtype)
         attach_checkpoint_state(
             resume_trainer,
@@ -234,7 +250,7 @@ def _run_checkpoint_resume_policy(
             max_grad_norm=options.max_grad_norm,
         )
         checkpoint_on_train_begin(resume_trainer)
-        resumed_parameters = driver.sample_v2_framework_parameters(resume_model, sample_context)
+        resumed_parameters = driver.v2_parameter_samples(resume_ctx, resume_model, sample_context)
         resume_lrs = resume_trainer.base.lr_scheduler.get_last_lr()
         resume_global_step = int(resume_trainer.base.state.global_step)
         run_checkpoint_train_step(resume_trainer, resume_batch, seed=driver.case.model.seed)
@@ -272,7 +288,7 @@ def _run_launcher_policy(
     config_path = Path(str(options.get("config_path", driver.case.v2_model.config_dir / "base.yaml")))
     output_dir = policy_output_dir(driver, "launcher")
     output_dir.mkdir(parents=True, exist_ok=True)
-    batch = driver.v2_request_kwargs(reference_output, device=device)
+    batch = _build_v2_request(driver, reference_output, device=device, dtype=dtype, purpose="launcher")
     report = run_launcher_smoke(
         driver,
         batch,
@@ -348,7 +364,13 @@ def _run_distributed_train_policy(
         shutil.rmtree(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    batch_kwargs = driver.v2_request_kwargs(reference_output, device=torch.device("cpu"))
+    batch_kwargs = _build_v2_request(
+        driver,
+        reference_output,
+        device=torch.device("cpu"),
+        dtype=dtype,
+        purpose="distributed_train",
+    )
     baseline_report: Mapping[str, Any] | None = None
     if compare_direct:
         baseline_report = run_v2_train_fsdp2(
@@ -464,9 +486,22 @@ def _run_distributed_infer_policy(
         shutil.rmtree(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    request_kwargs = driver.v2_request_kwargs(reference_output, device=torch.device("cpu"))
+    request_kwargs = _build_v2_request(
+        driver,
+        reference_output,
+        device=torch.device("cpu"),
+        dtype=dtype,
+        purpose="distributed_infer",
+    )
     config = load_graph_active_omni_config(driver.case, driver.v2_module_names())
-    generation_kwargs = driver.generation_kwargs(config, reference_output)
+    generation_kwargs = _v2_generation_kwargs(
+        driver,
+        reference_output,
+        config,
+        device=torch.device("cpu"),
+        dtype=dtype,
+        purpose="distributed_infer",
+    )
     probe_names = tuple(str(name) for name in options.get("compare_probes", ()) or driver.case.run.probes)
     baseline_report: Mapping[str, Any] | None = None
     if compare_eager:
@@ -607,6 +642,58 @@ def _infer_fsdp2_numeric_reports(
             )
         )
     return reports
+
+
+def _v2_run_context(
+    driver: Any,
+    reference_output: Any,
+    whitelist: Mapping[tuple[str, str], frozenset[str]] | None = None,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+    capture_options: RunCaptureOptions | None = None,
+    purpose: str = "default",
+) -> V2RunContext:
+    return V2RunContext(
+        case=driver.case,
+        tier=driver.case.tier,
+        domain=driver.case.graph.domain,
+        reference_output=reference_output,
+        canonical=canonical_from_reference_output(reference_output),
+        whitelist={} if whitelist is None else whitelist,
+        device=device,
+        dtype=dtype,
+        capture_options=RunCaptureOptions() if capture_options is None else capture_options,
+        purpose=purpose,
+    )
+
+
+def _build_v2_request(
+    driver: Any,
+    reference_output: Any,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+    purpose: str,
+) -> dict[str, Any]:
+    return driver.build_v2_request(
+        _v2_run_context(driver, reference_output, device=device, dtype=dtype, purpose=purpose)
+    )
+
+
+def _v2_generation_kwargs(
+    driver: Any,
+    reference_output: Any,
+    model_or_config: Any,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+    purpose: str,
+) -> dict[str, Any]:
+    return driver.v2_generation_kwargs(
+        _v2_run_context(driver, reference_output, device=device, dtype=dtype, purpose=purpose),
+        model_or_config,
+    )
 
 
 _TRAIN_FRAMEWORK_POLICIES = {

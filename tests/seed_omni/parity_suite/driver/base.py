@@ -29,7 +29,7 @@ class ParityDriver(
 
     Reference handlers used with ``ref_tap: {output: ...}`` should return
     ``{"canonical": ..., "reference": ...}``. Shared tier runners pass that
-    canonical payload to ``v2_request_kwargs()`` for both inference and training.
+    canonical payload through ``V2RunContext`` to V2 driver hooks.
     """
 
     # Shared generation defaults -------------------------------------------------

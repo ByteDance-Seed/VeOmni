@@ -12,9 +12,12 @@ import torch
 from torch import nn
 
 from tests.seed_omni.parity_suite.core import autocast_for_dtype, make_reference_image, patched_randn_like, to_device
-from veomni.models.seed_omni.modules.bagel.qwen2_mot.processing import prepare_attention_mask_per_sample
 
-from ..vendor.data.data_utils import get_flattened_position_ids_extrapolate, patchify
+from ..vendor.data.data_utils import (
+    get_flattened_position_ids_extrapolate,
+    patchify,
+    prepare_attention_mask_per_sample,
+)
 from ..vendor.data.transforms import ImageTransform
 
 

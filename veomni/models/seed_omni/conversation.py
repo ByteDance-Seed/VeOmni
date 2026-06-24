@@ -138,6 +138,8 @@ def iter_desired_items(
     roles: list[str] | None = None,
     sources: list[str] | None = None,
     reverse_item: bool = False,
+    *,
+    meta_keys: list[str] | None = None,
 ) -> Iterator[ConversationItem]:
     """Yield matching items in micro-batch order (sample 0, then sample 1, …)."""
     for sample in conversation_list:
@@ -149,6 +151,8 @@ def iter_desired_items(
                 continue
             if sources is not None and item.source not in sources:
                 continue
+            if meta_keys is not None and any(key not in item.meta for key in meta_keys):
+                continue
             yield item
 
 
@@ -157,9 +161,11 @@ def collect_desired_values(
     types: list[str] | None = None,
     roles: list[str] | None = None,
     sources: list[str] | None = None,
+    *,
+    meta_keys: list[str] | None = None,
 ) -> list[Any]:
     """Flat ``item.value`` list for matching items in micro-batch order."""
-    return [item.value for item in iter_desired_items(conversation_list, types, roles, sources)]
+    return [item.value for item in iter_desired_items(conversation_list, types, roles, sources, meta_keys=meta_keys)]
 
 
 def worker_dummy_items(conversation_list: list[list[ConversationItem]], source: str) -> list[ConversationItem]:

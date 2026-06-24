@@ -280,11 +280,13 @@ pytest case
      -> reference capture materializes field, hook, and extractor taps
   -> runner._run_v2(...)
   -> v2.tier_runners.graph.run_v2_*_graph(...)
-  -> driver.v2_request_kwargs(...)
+  -> build V2RunContext
+  -> driver.build_v2_request(ctx)
      -> default conversation request when stimulus.conversation_list is present
      -> build_{reference.kind}_request only for non-standard requests
+  -> driver.v2_execution_context(ctx, model=..., batch=...)
   -> OmniModel.generate(...) or OmniModel.forward(...)
-  -> V2 observation capture records whitelisted node outputs/carrier fields
+  -> V2 observation capture or driver.collect_v2_observations(ctx, ...)
   -> runner compares mapped probes
 ```
 
@@ -298,7 +300,9 @@ pytest case
      -> executes the official high-level reference path and filters module fields
   -> v2.tier_runners.module.run_v2_infer_module(...)
   -> load the graph-active V2 modules for the selected module micro graph
-  -> driver.v2_request_kwargs(...)
+  -> build V2RunContext
+  -> driver.build_v2_request(ctx)
+  -> driver.v2_module_fsm_policy(ctx)
   -> run_generation_fsm(...) steps the production SeedOmni generation graph
   -> ModuleRuntime records only required node/state observations
   -> runner compares mapped probes

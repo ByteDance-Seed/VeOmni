@@ -85,7 +85,6 @@ infer:
   infer_graph:
     infer_edit: configs/seed_omni/Bagel/bagel_7b_mot/graph_infer_edit.yaml
     infer_gen: configs/seed_omni/Bagel/bagel_7b_mot/graph_infer_gen.yaml
-    infer_interleave: configs/seed_omni/Bagel/bagel_7b_mot/graph_infer_interleave.yaml
     infer_und: configs/seed_omni/Bagel/bagel_7b_mot/graph_infer_und.yaml
   infer_type: infer_und
   generation_kwargs:

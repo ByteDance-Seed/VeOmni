@@ -16,6 +16,79 @@ from .configuration import BagelQwen2MoTConfig
 from .modulemixin import BagelQwen2MoTModuleMixin
 
 
+class BagelQwen2MoT(BagelQwen2MoTModuleMixin, PreTrainedModel):
+    config_class = BagelQwen2MoTConfig
+    base_model_prefix = "bagel_qwen2_mot"
+    main_input_name = "inputs_embeds"
+    _no_split_modules = ["BagelQwen2MoTDecoderLayer"]
+    supports_gradient_checkpointing = True
+
+    def __init__(self, config: BagelQwen2MoTConfig):
+        super().__init__(config)
+        self.model = BagelQwen2MoTBackbone(config)
+        self.post_init()
+
+    def forward(  # type: ignore[override]
+        self,
+        packed_sequence: torch.Tensor,
+        sample_lens: list[int],
+        attention_mask: Any,
+        packed_position_ids: torch.Tensor,
+        packed_und_token_indexes: Optional[torch.Tensor] = None,
+        packed_gen_token_indexes: Optional[torch.Tensor] = None,
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
+        del kwargs
+        output = self.model(
+            packed_sequence=packed_sequence,
+            sample_lens=sample_lens,
+            attention_mask=attention_mask,
+            packed_position_ids=packed_position_ids,
+            packed_und_token_indexes=packed_und_token_indexes,
+            packed_gen_token_indexes=packed_gen_token_indexes,
+        )
+        return {"hidden_states": output.packed_query_sequence}
+
+    def forward_inference(
+        self,
+        packed_query_sequence: torch.Tensor,
+        query_lens: torch.Tensor,
+        packed_query_position_ids: torch.Tensor,
+        packed_query_indexes: torch.Tensor,
+        past_key_values: Optional["NaiveCache"] = None,
+        key_values_lens: Optional[torch.Tensor] = None,
+        packed_key_value_indexes: Optional[torch.Tensor] = None,
+        update_past_key_values: bool = True,
+        is_causal: bool = True,
+        mode: str = "und",
+        packed_vae_token_indexes: Optional[torch.Tensor] = None,
+        packed_text_indexes: Optional[torch.Tensor] = None,
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
+        del kwargs
+        is_gen = _check_packed_inference_mode(mode)
+        call_kwargs: Dict[str, Any] = {
+            "packed_query_sequence": packed_query_sequence,
+            "query_lens": query_lens,
+            "packed_query_position_ids": packed_query_position_ids,
+            "packed_query_indexes": packed_query_indexes,
+            "past_key_values": past_key_values,
+            "key_values_lens": key_values_lens,
+            "packed_key_value_indexes": packed_key_value_indexes,
+            "update_past_key_values": update_past_key_values,
+            "is_causal": is_causal,
+            "mode": mode,
+        }
+        if is_gen:
+            call_kwargs["packed_vae_token_indexes"] = packed_vae_token_indexes
+            call_kwargs["packed_text_indexes"] = packed_text_indexes
+        output = self.model._forward_packed_inference(**call_kwargs)
+        return {
+            "hidden_states": output.packed_query_sequence,
+            "past_key_values": output.past_key_values,
+        }
+
+
 class NaiveCache:
     """Official BAGEL packed KV cache."""
 
@@ -79,15 +152,10 @@ def _fold_zero_anchors(target: torch.Tensor, *anchors: torch.Tensor) -> torch.Te
 
 def _check_packed_inference_mode(
     mode: str,
-    *,
-    packed_vae_token_indexes: Optional[torch.Tensor],
-    packed_text_indexes: Optional[torch.Tensor],
 ) -> bool:
     if mode == "und":
         return False
     if mode == "gen":
-        if packed_text_indexes is None or packed_vae_token_indexes is None:
-            raise ValueError("mode='gen' requires packed_text_indexes and packed_vae_token_indexes.")
         return True
     raise ValueError(f"Unsupported BAGEL Qwen2 MoT inference mode: {mode!r}")
 
@@ -304,11 +372,7 @@ class BagelQwen2MoTAttention(nn.Module):
         packed_vae_token_indexes: Optional[torch.Tensor] = None,
         packed_text_indexes: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, Optional[NaiveCache]]:
-        is_gen = _check_packed_inference_mode(
-            mode,
-            packed_vae_token_indexes=packed_vae_token_indexes,
-            packed_text_indexes=packed_text_indexes,
-        )
+        is_gen = _check_packed_inference_mode(mode)
         if not is_gen:
             packed_query_states = self.q_proj(packed_query_sequence).view(-1, self.num_heads, self.head_dim)
             packed_key_states = self.k_proj(packed_query_sequence).view(-1, self.num_key_value_heads, self.head_dim)
@@ -488,11 +552,7 @@ class BagelQwen2MoTDecoderLayer(nn.Module):
         packed_vae_token_indexes: Optional[torch.Tensor] = None,
         packed_text_indexes: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, Optional[NaiveCache]]:
-        is_gen = _check_packed_inference_mode(
-            mode,
-            packed_vae_token_indexes=packed_vae_token_indexes,
-            packed_text_indexes=packed_text_indexes,
-        )
+        is_gen = _check_packed_inference_mode(mode)
         residual = packed_query_sequence
         if not is_gen:
             packed_query_sequence = self.input_layernorm(packed_query_sequence)
@@ -628,11 +688,7 @@ class BagelQwen2MoTBackbone(nn.Module):
         packed_vae_token_indexes: Optional[torch.Tensor] = None,
         packed_text_indexes: Optional[torch.Tensor] = None,
     ) -> BaseNavitOutputWithPast:
-        is_gen = _check_packed_inference_mode(
-            mode,
-            packed_vae_token_indexes=packed_vae_token_indexes,
-            packed_text_indexes=packed_text_indexes,
-        )
+        is_gen = _check_packed_inference_mode(mode)
         query_device = packed_query_sequence.device
         packed_query_indexes = packed_query_indexes.to(device=query_device)
         packed_query_position_ids = packed_query_position_ids.to(device=query_device)
@@ -685,126 +741,6 @@ class BagelQwen2MoTBackbone(nn.Module):
         if self.training:
             return BaseNavitOutputWithPast(packed_query_sequence=self._forward_packed_train(*args, **kwargs))
         return self._forward_packed_inference(*args, **kwargs)
-
-
-class BagelQwen2MoT(BagelQwen2MoTModuleMixin, PreTrainedModel):
-    config_class = BagelQwen2MoTConfig
-    base_model_prefix = "bagel_qwen2_mot"
-    main_input_name = "inputs_embeds"
-    _no_split_modules = ["BagelQwen2MoTDecoderLayer"]
-    supports_gradient_checkpointing = True
-
-    def __init__(self, config: BagelQwen2MoTConfig):
-        super().__init__(config)
-        self.model = BagelQwen2MoTBackbone(config)
-        self.post_init()
-
-    def forward(  # type: ignore[override]
-        self,
-        inputs_embeds: Optional[torch.Tensor] = None,
-        packed_query_sequence: Optional[torch.Tensor] = None,
-        packed_sequence: Optional[torch.Tensor] = None,
-        query_lens: Optional[torch.Tensor] = None,
-        packed_query_position_ids: Optional[torch.Tensor] = None,
-        packed_query_indexes: Optional[torch.Tensor] = None,
-        sample_lens: Optional[list[int]] = None,
-        attention_mask: Any = None,
-        packed_position_ids: Optional[torch.Tensor] = None,
-        packed_und_token_indexes: Optional[torch.Tensor] = None,
-        packed_gen_token_indexes: Optional[torch.Tensor] = None,
-        past_key_values: Optional[NaiveCache] = None,
-        key_values_lens: Optional[torch.Tensor] = None,
-        packed_key_value_indexes: Optional[torch.Tensor] = None,
-        update_past_key_values: bool = True,
-        is_causal: bool = True,
-        mode: str = "und",
-        packed_vae_token_indexes: Optional[torch.Tensor] = None,
-        packed_text_indexes: Optional[torch.Tensor] = None,
-        **kwargs: Any,
-    ) -> Dict[str, Any]:
-        del kwargs
-        if sample_lens is not None or attention_mask is not None or packed_position_ids is not None:
-            if packed_sequence is None:
-                packed_sequence = packed_query_sequence if packed_query_sequence is not None else inputs_embeds
-            if packed_sequence is None:
-                raise ValueError("BagelQwen2MoT training forward requires packed_sequence or inputs_embeds.")
-            if sample_lens is None or attention_mask is None or packed_position_ids is None:
-                raise ValueError("sample_lens, attention_mask, and packed_position_ids are required for training.")
-            output = self.model(
-                packed_sequence=packed_sequence,
-                sample_lens=sample_lens,
-                attention_mask=attention_mask,
-                packed_position_ids=packed_position_ids,
-                packed_und_token_indexes=packed_und_token_indexes,
-                packed_gen_token_indexes=packed_gen_token_indexes,
-            )
-            hidden_states = output.packed_query_sequence
-            return {"hidden_states": hidden_states}
-
-        if packed_query_sequence is None:
-            packed_query_sequence = inputs_embeds
-        if packed_query_sequence is None:
-            raise ValueError("BagelQwen2MoT.forward requires inputs_embeds or packed_query_sequence.")
-        if query_lens is None or packed_query_position_ids is None or packed_query_indexes is None:
-            raise ValueError("query_lens, packed_query_position_ids, and packed_query_indexes are required.")
-
-        output = self._forward_packed_inference(
-            packed_query_sequence=packed_query_sequence,
-            query_lens=query_lens,
-            packed_query_position_ids=packed_query_position_ids,
-            packed_query_indexes=packed_query_indexes,
-            past_key_values=past_key_values,
-            key_values_lens=key_values_lens,
-            packed_key_value_indexes=packed_key_value_indexes,
-            update_past_key_values=update_past_key_values,
-            is_causal=is_causal,
-            mode=mode,
-            packed_vae_token_indexes=packed_vae_token_indexes,
-            packed_text_indexes=packed_text_indexes,
-        )
-        return {
-            "hidden_states": output.packed_query_sequence,
-            "past_key_values": output.past_key_values,
-        }
-
-    def _forward_packed_inference(
-        self,
-        packed_query_sequence: torch.Tensor,
-        query_lens: torch.Tensor,
-        packed_query_position_ids: torch.Tensor,
-        packed_query_indexes: torch.Tensor,
-        past_key_values: Optional[NaiveCache] = None,
-        key_values_lens: Optional[torch.Tensor] = None,
-        packed_key_value_indexes: Optional[torch.Tensor] = None,
-        update_past_key_values: bool = True,
-        is_causal: bool = True,
-        mode: str = "und",
-        packed_vae_token_indexes: Optional[torch.Tensor] = None,
-        packed_text_indexes: Optional[torch.Tensor] = None,
-        **kwargs: Any,
-    ) -> BaseNavitOutputWithPast:
-        del kwargs
-        is_gen = _check_packed_inference_mode(
-            mode,
-            packed_vae_token_indexes=packed_vae_token_indexes,
-            packed_text_indexes=packed_text_indexes,
-        )
-        call_kwargs: Dict[str, Any] = {
-            "packed_query_sequence": packed_query_sequence,
-            "query_lens": query_lens,
-            "packed_query_position_ids": packed_query_position_ids,
-            "packed_query_indexes": packed_query_indexes,
-            "past_key_values": past_key_values,
-            "key_values_lens": key_values_lens,
-            "packed_key_value_indexes": packed_key_value_indexes,
-            "update_past_key_values": update_past_key_values,
-            "is_causal": is_causal,
-            "mode": mode,
-        }
-        if is_gen:
-            call_kwargs["packed_vae_token_indexes"] = packed_vae_token_indexes
-            call_kwargs["packed_text_indexes"] = packed_text_indexes
-        return self.model._forward_packed_inference(**call_kwargs)
 
 
 __all__ = ["BaseNavitOutputWithPast", "BagelQwen2MoT", "NaiveCache"]

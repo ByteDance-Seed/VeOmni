@@ -246,7 +246,7 @@ train.grad_weight:
         encoding="utf-8",
     )
 
-    # Gradient row selection moved to ParityDriver.gradient_rows. A stale
+    # Gradient row selection moved to ParityDriver.v2_gradient_rows. A stale
     # rows_from is ignored rather than rejected.
     catalog = load_probe_catalog(probes_path)
     (probe,) = catalog.probes

@@ -7,7 +7,8 @@ from typing import Any
 
 import torch
 
-from tests.seed_omni.parity_suite.core import ParityCase, ProbeMapping, RunCaptureOptions, sample_named_grad
+from tests.seed_omni.parity_suite.core import ParityCase, ProbeMapping, sample_named_grad
+from tests.seed_omni.parity_suite.driver.v2_run import V2RunContext
 from tests.seed_omni.parity_suite.v2.generation_runtime import InferModulePolicy
 from tests.seed_omni.parity_suite.v2.observation import record_conversation_output, record_module_output
 from veomni.models.seed_omni.modeling_omni import OmniModel
@@ -42,18 +43,9 @@ class TrainObservationMixin:
 
     case: ParityCase
 
-    # Inference module-tier policy -------------------------------------------------
-
-    def v2_infer_module_policy(
-        self,
-        reference_output: Any,
-        whitelist: Mapping[tuple[str, str], frozenset[str]],
-        *,
-        capture_options: RunCaptureOptions,
-    ) -> InferModulePolicy:
+    def v2_module_fsm_policy(self, ctx: V2RunContext) -> InferModulePolicy:
         """Return the module-tier FSM policy for inference parity."""
 
-        del reference_output
         options = self.case.run.options
         max_steps = options.get("max_steps")
         selected = self.case.model.probes.for_probe_names(self.case.run.probes)
@@ -65,51 +57,48 @@ class TrainObservationMixin:
         )
         return InferModulePolicy(
             max_steps=None if max_steps is None else int(max_steps),
-            required_nodes=frozenset() if needs_all_steps else frozenset(whitelist.keys()),
+            required_nodes=frozenset() if needs_all_steps else frozenset(ctx.whitelist.keys()),
             required_observations=frozenset() if needs_all_steps else required_observations,
             allow_finalize=bool(options.get("allow_finalize", False)),
-            max_tensor_numel=capture_options.max_tensor_numel,
+            max_tensor_numel=ctx.capture_options.max_tensor_numel,
         )
 
-    # Public train-tier collectors -------------------------------------------------
-
-    def collect_v2_train_graph_observations(
+    def collect_v2_observations(
         self,
-        model: OmniModel,
-        forward_result: Mapping[str, Any],
-        whitelist: Mapping[tuple[str, str], frozenset[str]],
+        ctx: V2RunContext,
         *,
-        batch: Mapping[str, Any],
-    ) -> dict[tuple[str, str], list[dict[str, Any]]]:
-        observations = self._collect_v2_train_forward_observations(forward_result, whitelist)
-        self._record_v2_train_gradient_observations(model, observations, whitelist, batch=batch)
-        self._record_v2_train_graph_extra_observations(model, observations, whitelist, batch=batch)
-        return observations
-
-    def collect_v2_train_framework_observations(
-        self,
         model: OmniModel,
-        loss_dict: Mapping[str, torch.Tensor],
-        whitelist: Mapping[tuple[str, str], frozenset[str]],
-        *,
-        batch: Mapping[str, Any],
+        result: Mapping[str, Any],
+        batch: Mapping[str, Any] | None = None,
     ) -> dict[tuple[str, str], list[dict[str, Any]]]:
-        observations: dict[tuple[str, str], list[dict[str, Any]]] = {}
-        self._record_v2_train_loss_observations(loss_dict, observations, whitelist)
-        self._record_v2_train_gradient_observations(model, observations, whitelist, batch=batch)
-        self._record_v2_train_framework_extra_observations(model, observations, whitelist, batch=batch)
-        return observations
+        batch = {} if batch is None else batch
+        if ctx.domain == "training" and ctx.tier == "graph":
+            observations = self._collect_v2_train_forward_observations(result, ctx.whitelist)
+            self._record_v2_train_gradient_observations(ctx, model, observations, batch=batch)
+            self._record_v2_train_graph_extra_observations(model, observations, ctx.whitelist, batch=batch)
+            return observations
+        if ctx.domain == "training" and ctx.tier == "framework":
+            losses = result.get("losses", result)
+            if not isinstance(losses, Mapping):
+                raise TypeError("V2 training framework observation result must contain a mapping of losses.")
+            observations: dict[tuple[str, str], list[dict[str, Any]]] = {}
+            self._record_v2_train_loss_observations(losses, observations, ctx.whitelist)
+            self._record_v2_train_gradient_observations(ctx, model, observations, batch=batch)
+            self._record_v2_train_framework_extra_observations(model, observations, ctx.whitelist, batch=batch)
+            return observations
+        raise NotImplementedError(f"Unsupported V2 observation context: domain={ctx.domain!r}, tier={ctx.tier!r}.")
 
     # Driver extension hooks -------------------------------------------------------
 
-    def gradient_rows(
+    def v2_gradient_rows(
         self,
+        ctx: V2RunContext,
         batch: Mapping[str, Any],
         mapping: ProbeMapping,
     ) -> torch.Tensor | None:
         """Return optional row indices for gradient sampling."""
 
-        del batch, mapping
+        del ctx, batch, mapping
         return None
 
     def _record_v2_train_graph_extra_observations(
@@ -167,17 +156,17 @@ class TrainObservationMixin:
 
     def _record_v2_train_gradient_observations(
         self,
+        ctx: V2RunContext,
         model: OmniModel,
         observations: dict[tuple[str, str], list[dict[str, Any]]],
-        whitelist: Mapping[tuple[str, str], frozenset[str]],
         *,
         batch: Mapping[str, Any],
     ) -> None:
         for mapping in self._v2_train_gradient_mappings():
-            fields = whitelist.get(("train", mapping.node), frozenset())
+            fields = ctx.whitelist.get(("train", mapping.node), frozenset())
             if mapping.v2_field not in fields or mapping.v2_grad is None:
                 continue
-            rows = self.gradient_rows(batch, mapping)
+            rows = self.v2_gradient_rows(ctx, batch, mapping)
             out = {
                 mapping.v2_field: sample_named_grad(
                     model.get_module(mapping.v2_grad.module),
@@ -185,7 +174,7 @@ class TrainObservationMixin:
                     rows=rows,
                 )
             }
-            record_module_output(observations, whitelist, state="train", node=mapping.node, out=out)
+            record_module_output(observations, ctx.whitelist, state="train", node=mapping.node, out=out)
 
     def _v2_train_gradient_mappings(self) -> tuple[ProbeMapping, ...]:
         selected = self.case.model.probes.for_probe_names(self.case.run.probes)

@@ -61,3 +61,22 @@ def test_iter_desired_items_allows_multiple_images_per_sample():
     items = list(iter_desired_items(batch, types=["image"], roles=["user"]))
     assert [item.value for item in items] == [img_a, img_b, img_c]
     assert collect_desired_values(batch, types=["image"], roles=["user"]) == [img_a, img_b, img_c]
+
+
+def test_iter_desired_items_filters_meta_keys():
+    batch = [
+        [
+            ConversationItem(type="output", value=torch.zeros(1), role="assistant", meta={}),
+            ConversationItem(
+                type="output",
+                value=torch.ones(1),
+                role="assistant",
+                meta={"flow_velocity_target": torch.zeros(1)},
+            ),
+        ]
+    ]
+
+    items = list(iter_desired_items(batch, types=["output"], meta_keys=["flow_velocity_target"]))
+
+    assert len(items) == 1
+    assert torch.equal(items[0].value, torch.ones(1))

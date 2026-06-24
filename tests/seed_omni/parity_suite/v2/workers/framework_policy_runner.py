@@ -24,11 +24,13 @@ from torch import nn
 
 from tests.seed_omni.parity_suite.core import (
     ParityReport,
+    RunCaptureOptions,
     RunWorkerOptions,
     autocast_for_dtype,
     configure_torch_determinism,
     run_worker_context,
 )
+from tests.seed_omni.parity_suite.driver.v2_run import V2RunContext, canonical_from_reference_output
 from tests.seed_omni.parity_suite.v2.tier_runners.framework_support import (
     all_grads_are_cleared,
     build_minimal_omni_trainer,
@@ -571,7 +573,19 @@ def run_optimizer_trajectory(
     parameters_after_step: list[Mapping[str, torch.Tensor]] = []
     for _step in range(steps):
         optimizer.zero_grad(set_to_none=True)
-        batch = driver.v2_request_kwargs(reference_output, device=device)
+        run_ctx = V2RunContext(
+            case=driver.case,
+            tier=driver.case.tier,
+            domain=driver.case.graph.domain,
+            reference_output=reference_output,
+            canonical=canonical_from_reference_output(reference_output),
+            whitelist={},
+            device=device,
+            dtype=dtype,
+            capture_options=RunCaptureOptions(),
+            purpose="optimizer_trajectory",
+        )
+        batch = driver.build_v2_request(run_ctx)
         with torch.enable_grad(), autocast_for_dtype(device, dtype):
             outputs = model(**dict(batch))
             loss = outputs["loss"]
@@ -580,7 +594,7 @@ def run_optimizer_trajectory(
         loss.backward()
         optimizer.step()
         losses.append(loss.detach().cpu().reshape(1))
-        parameters_after_step.append(driver.sample_v2_framework_parameters(model, batch))
+        parameters_after_step.append(driver.v2_parameter_samples(run_ctx, model, batch))
     return {"losses": losses, "parameters_after_step": parameters_after_step}
 
 

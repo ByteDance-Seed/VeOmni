@@ -18,8 +18,8 @@ generation_graph:
     query_denoise:
       body:
         - { from: bagel_flow_connector.prepare_denoise_query, to: bagel_text_encoder.encode_image_markers }
-        - { from: bagel_text_encoder.encode_image_markers, to: bagel_qwen2_mot.run_denoise_branch }
-        - { from: bagel_qwen2_mot.run_denoise_branch,      to: end }
+        - { from: bagel_text_encoder.encode_image_markers, to: bagel_qwen2_mot.denoise_branch }
+        - { from: bagel_qwen2_mot.denoise_branch,      to: end }
       transitions:
         - { condition: { type: default }, next_state: velocity_collect }
 

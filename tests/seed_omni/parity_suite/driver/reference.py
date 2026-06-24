@@ -7,6 +7,7 @@ from typing import Any
 
 from tests.seed_omni.parity_suite.core import ParityCase, ParityReport
 from tests.seed_omni.parity_suite.core.stimulus import conversation_stimulus_to_batched_specs
+from tests.seed_omni.parity_suite.driver.v2_run import V2RunContext
 from tests.seed_omni.parity_suite.reference.contract import ReferenceOracle
 from tests.seed_omni.parity_suite.reference.oracles.factory import build_reference_oracle
 
@@ -28,8 +29,8 @@ class ReferenceMixin:
         inputs["conversation_list"] = batched_conversation
         return inputs
 
-    def generation_kwargs(self, model_or_config: Any, reference_output: Any) -> dict[str, Any]:
-        del reference_output
+    def v2_generation_kwargs(self, ctx: V2RunContext, model_or_config: Any) -> dict[str, Any]:
+        del ctx
         config = getattr(model_or_config, "config", model_or_config)
         kwargs = dict(getattr(config, "generation_kwargs", None) or {})
         for key, default in self.generation_defaults.items():
