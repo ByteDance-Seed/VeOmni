@@ -30,7 +30,7 @@ logger = get_logger(__name__)
 
 if TYPE_CHECKING:
     from ..base import BaseTrainer, VeOmniArguments
-    from ..omni_trainer import OmniTrainer
+    from ..omni.omni_trainer import OmniTrainer
 
 
 class MoERouterMonitorCallback(Callback):
@@ -242,13 +242,13 @@ class OmniEnvironMeterCallback(Callback):
     FLOPs on, and the entry batch carries only ``conversation_list`` (no
     ``input_ids`` / ``attention_mask`` to count tokens from).  So **FLOPs / MFU**
     are computed per-module by each module's
-    :class:`~veomni.models.seed_omni.tracemixin.TraceMixin`.  This callback drives the
+    :class:`~veomni.models.seed_omni.mixins.tracemixin.TraceMixin`.  This callback drives the
     timing, collects every module's ``(metrics, seqlens)`` via the orchestrator,
     and hands them to :class:`~veomni.utils.omni_helper.OmniEnvironMeter`, which owns the **global**
     roll-up — merged batch-token statistics, multi-source accounting, and
     device/host memory.
 
-    ``self.trainer`` here is the :class:`~veomni.trainer.omni_trainer.OmniTrainer`
+    ``self.trainer`` here is the :class:`~veomni.trainer.omni.omni_trainer.OmniTrainer`
     orchestrator; the canonical :class:`BaseTrainer` state it writes
     (``environ_meter`` / ``step_env_metrics`` / ``step_train_metrics``) lives on
     ``self.trainer.base`` where the wandb / tqdm callbacks read it.
@@ -282,7 +282,7 @@ class OmniEnvironMeterCallback(Callback):
         # ``(theoretical_flops, seqlens)`` in its module-trainer's on_step_end;
         # the meter sums the FLOPs + merges the tokens and applies this single
         # whole-graph delta to get the overall achieved FLOPs / MFU.
-        module_traces = self.trainer.collect_module_trace()
+        module_traces = self.trainer.collect_trace()
         step_env_metrics = base.environ_meter.step(delta_time, state.global_step, module_traces)
 
         step_train_metrics = {

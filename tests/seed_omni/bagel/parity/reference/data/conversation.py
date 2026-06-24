@@ -8,7 +8,7 @@ from typing import Any
 import torch
 from PIL import Image
 
-from veomni.models.seed_omni.conversation import ConversationItem, is_dummy
+from veomni.models.seed_omni.utils.conversation import ConversationItem, is_dummy
 
 
 def conversation_item_text(

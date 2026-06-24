@@ -6,7 +6,7 @@ from typing import Any
 
 import torch
 
-from ....conversation import ConversationItem
+from ....utils.conversation import ConversationItem
 
 
 def preprocess_latent_embed(

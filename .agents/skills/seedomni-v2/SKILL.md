@@ -15,8 +15,8 @@ description: "Use this skill when adding or modifying anything inside `veomni/mo
    - **Module forward → mutates raw_batch**: every module's `forward(**kwargs) -> Dict` return dict is **immediately written back into raw_batch** by OmniModel (keyed by `edge.output`). Data does **not** flow through edge channels to downstream modules — downstream reads the same `raw_batch` by its own input keys. Edges are dependency / topology contracts, not data conduits.
    - **No global collator final-step, no global SP slice node**: each module calls collator helpers and applies SP slicing **inside its own `pre_forward`** for the fields it owns. ViT slices the image batch dimension; text encoder slices the sequence dimension; nothing gets sliced twice.
    - **Status**: this is the target contract; the current code still runs the V1-compatible path (`multimodal_chat_template.py` does chat templating + N pre-expanded placeholders; `JanusLlama.pre_forward` uses `masked_scatter`). Migration happens feature-by-feature (D1: lighter `multimodal_transform`; D2: lighter collator; D3: vision modules take over image processing + boundary markers; D4: `text_encoder` takes over chat template + tokenize; D5: backbone splice). Don't try to land it all in one PR.
-2. `veomni/models/seed_omni/module.py` — the `ModuleMixin` base contract.
-3. `veomni/models/seed_omni/graph.py` + `training_graph.py` + `generation_graph.py` — `NodeDef` / `EdgeDef` schema and the DAG / FSM views.
+2. `veomni/models/seed_omni/mixins/modulemixin.py` — the `ModuleMixin` base contract.
+3. `veomni/models/seed_omni/graphs/graph.py` + `graphs/training_graph.py` + `graphs/generation_graph.py` — `NodeDef` / `EdgeDef` schema and the DAG / FSM views.
 4. An existing module that matches your shape:
    - **Generic / cross-family** → `modules/base/text_encoder/modeling.py` (and the planned `modules/base/mlp_adapter/modeling.py`).
    - **Vision encoder** → `modules/janus/siglip/modeling.py`.
@@ -575,10 +575,13 @@ DDP specifics:
   materialises meta params nor loads weights — it only replicates + hooks grad
   sync). FSDP2 does this internally (sharded load); DDP needs the explicit step.
 - **Dispatch**: `DistributedDataParallel` does **not** proxy attribute access, so
-  `OmniModuleTrainer.forward` / `on_step_end` must `_unwrap_module(self.base.model)`
-  to reach `pre_forward` / `post_forward` / `trace_collect`, while still calling
-  the **wrapper** for the actual forward so DDP/FSDP hooks fire. FSDP2 is
-  in-place (`raw is wrapper`); DDP wraps (`raw = wrapper.module`).
+  `TrainingGraph.step` (per-node training driver) / `OmniModuleTrainer.on_step_end`
+  must `_unwrap_module(...)` to reach `pre_forward` / `post_forward` /
+  `trace_collect`, while still calling the **wrapper** for the actual forward so
+  DDP/FSDP hooks fire. FSDP2 is in-place (`raw is wrapper`); DDP wraps
+  (`raw = wrapper.module`). The composed `OmniModel` holds each module's wrapped
+  model as a sub-module and passes the wrapped-modules dict into `TrainingGraph.step`
+  (symmetric with `GenerationGraph.step`).
 
 Inference side (`OmniInferencer`):
 
@@ -596,6 +599,15 @@ Inference side (`OmniInferencer`):
 - Ship two `modules_infer_*.yaml` (distributed vs all-eager) and pick via
   `--infer.modules`. Launcher scripts: `infer_fsdp_{i2t,t2i}.sh` (torchrun),
   `infer_eager_{i2t,t2i}.sh` (`python`).
+- **Input preprocessing mirrors training.** Before the FSM loop,
+  `OmniInferencer._preprocess_request` runs every module's `build_cpu_preprocessor()`
+  over the request `conversation_list` (batch-of-one) in `module_names` order — the
+  same `CPUPreprocessor`s the training collator uses — with `inference=True` (image
+  modules skip the FSDP-anchor dummy; text encoders append the generation prompt).
+  So a module's `generate` only packs → encodes → scatters preprocessed items; it
+  must **not** re-run chat-template / patchify on the request. The one exception is
+  items produced *mid-FSM* (e.g. a generated image re-encoded by siglip), which the
+  pre-loop pass can't see and are still processed inside `generate`.
 
 ## Phase 6 — Validate
 

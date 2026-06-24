@@ -6,9 +6,9 @@ from veomni.distributed.parallel_state import get_parallel_state
 from veomni.utils.seqlen_pos_transform_utils import prepare_fa_kwargs_from_position_ids, valid_seqlens_from_cu_seqlens
 from veomni.utils.tensor_utils import naflatten, unflatten
 
-from ....conversation import ConversationItem, is_dummy
-from ....module import ModuleMixin, post_forward, pre_forward
-from ....tracemixin import TraceMixin
+from ....mixins.modulemixin import ModuleMixin, post_forward, pre_forward
+from ....mixins.tracemixin import TraceMixin
+from ....utils.conversation import ConversationItem, is_dummy
 from .configuration import JanusLlamaConfig
 
 

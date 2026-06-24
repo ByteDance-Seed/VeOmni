@@ -6,8 +6,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
-from veomni.models.seed_omni.generation_graph import GenerationGraph
-from veomni.models.seed_omni.training_graph import TrainingGraph
+from veomni.models.seed_omni.graphs.generation_graph import GenerationGraph
+from veomni.models.seed_omni.graphs.training_graph import TrainingGraph
 
 from .spec import (
     DEFAULT_GATE,

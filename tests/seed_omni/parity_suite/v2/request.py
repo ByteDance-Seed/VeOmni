@@ -11,7 +11,7 @@ import torch
 
 from tests.seed_omni.parity_suite.core import ParityCase, make_reference_image
 from tests.seed_omni.parity_suite.core.stimulus import conversation_stimulus_to_batched_specs
-from veomni.models.seed_omni.conversation import ConversationItem
+from veomni.models.seed_omni.utils.conversation import ConversationItem
 
 
 _ALLOWED_ITEM_TYPES = frozenset({"image", "text", "output"})

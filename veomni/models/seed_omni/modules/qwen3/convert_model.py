@@ -20,7 +20,7 @@ from transformers.initialization import no_init_weights
 from veomni.models.module_utils import init_empty_weights
 from veomni.utils.device import IS_NPU_AVAILABLE
 
-from ...convert_registry import OMNI_CONVERT_REGISTRY
+from ...utils.convert_registry import OMNI_CONVERT_REGISTRY
 
 
 if IS_NPU_AVAILABLE:

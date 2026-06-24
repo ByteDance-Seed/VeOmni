@@ -1,5 +1,5 @@
 from veomni.arguments import OmniArguments, parse_omni_args
-from veomni.trainer.omni_trainer import OmniTrainer
+from veomni.trainer.omni import OmniTrainer
 
 
 if __name__ == "__main__":

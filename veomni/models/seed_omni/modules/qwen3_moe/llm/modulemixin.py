@@ -12,7 +12,7 @@ from typing import Any, Dict, List
 from torch.distributed._tensor import Shard
 
 from ......distributed.parallel_plan import ParallelPlan
-from ....tracemixin import TraceMixin
+from ....mixins.tracemixin import TraceMixin
 from ...qwen3.llm.modulemixin import Qwen3LlmModuleMixin
 from .configuration import Qwen3MoeLlmConfig
 

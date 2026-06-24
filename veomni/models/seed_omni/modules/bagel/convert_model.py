@@ -12,7 +12,7 @@ from safetensors import safe_open
 from transformers.initialization import no_init_weights
 
 from veomni.models.module_utils import init_empty_weights
-from veomni.models.seed_omni.convert_registry import OMNI_CONVERT_REGISTRY
+from veomni.models.seed_omni.utils.convert_registry import OMNI_CONVERT_REGISTRY
 
 
 def _read_json(path: Path) -> dict[str, Any]:

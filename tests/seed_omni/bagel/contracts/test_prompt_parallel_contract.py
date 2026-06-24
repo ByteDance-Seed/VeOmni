@@ -6,8 +6,7 @@ from typing import Any
 import torch
 import yaml
 
-from veomni.models.seed_omni.conversation import ConversationItem, iter_desired_items
-from veomni.models.seed_omni.generation_graph import GenerationGraph
+from veomni.models.seed_omni.graphs.generation_graph import GenerationGraph
 from veomni.models.seed_omni.modules.bagel.qwen2_mot.processing import preprocess_mot_inputs
 from veomni.models.seed_omni.modules.bagel.sources import (
     BAGEL_FLOW_QUERY,
@@ -15,6 +14,7 @@ from veomni.models.seed_omni.modules.bagel.sources import (
     BAGEL_VAE_CONTEXT,
 )
 from veomni.models.seed_omni.modules.bagel.text_encoder.processing import apply_image_marker
+from veomni.models.seed_omni.utils.conversation import ConversationItem, iter_desired_items
 
 
 _BAGEL_CONFIG_DIR = Path(__file__).resolve().parents[4] / "configs/seed_omni/Bagel/bagel_7b_mot"

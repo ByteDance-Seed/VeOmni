@@ -15,10 +15,10 @@
 """OmniInferencer — SeedOmni V2 inference driver.
 
 Standalone from :class:`OmniTrainer`.  Each sub-module is built by its own
-:class:`OmniModuleInferencer` (default: eager ``from_pretrained`` +
-``device_map='auto'``).  Per-module FSDP2 is opt-in via the module's YAML
-``train.accelerator.fsdp_config`` block — see ``infer_*.yaml`` ``modules:``
-overrides deep-merged into ``train.yaml``.
+:class:`~veomni.trainer.omni.omni_module_inferencer.OmniModuleInferencer`
+(default: eager ``from_pretrained`` + ``device_map='auto'``).  Per-module FSDP2
+is opt-in via the module's YAML ``train.accelerator.fsdp_config`` block — see
+``infer_*.yaml`` ``modules:`` overrides deep-merged into ``train.yaml``.
 """
 
 from __future__ import annotations
@@ -30,14 +30,15 @@ from typing import Any
 import torch
 import torch.distributed as dist
 
-from ..arguments import OmniArguments, VeOmniArguments
-from ..data.multimodal.image_utils import load_image
-from ..distributed.parallel_state import use_parallel_state
-from ..models.seed_omni import build_conversation
-from ..models.seed_omni.modeling_omni import OmniModel
-from ..utils import helper
-from .base import BaseTrainer
-from .omni_trainer import OmniModuleTrainer, OmniTrainer
+from ...arguments import OmniArguments
+from ...data.multimodal.image_utils import load_image
+from ...models.seed_omni import build_conversation
+from ...models.seed_omni.modeling_omni import OmniModel, _unwrap_module
+from ...models.seed_omni.utils.conversation import ConversationItem
+from ...utils import helper
+from ..base import BaseTrainer
+from .omni_module_inferencer import OmniModuleInferencer
+from .omni_trainer import OmniTrainer
 
 
 logger = helper.create_logger(__name__)
@@ -58,82 +59,6 @@ def _module_needs_distributed(mod_cfg: dict[str, Any]) -> bool:
         return False
     fsdp_mode = fsdp_config.get("fsdp_mode")
     return bool(fsdp_mode and str(fsdp_mode).lower() not in ("eager"))
-
-
-class OmniModuleInferencer(OmniModuleTrainer):
-    """Per-module inference builder — extends :class:`OmniModuleTrainer`.
-
-    * **Default (eager)** — ``from_pretrained(..., device_map='auto')`` on one
-      device; no distributed init required.
-    * **Optional FSDP** — when the module's YAML carries
-      ``train.accelerator.fsdp_config.fsdp_mode: fsdp2``, reuses the training
-      meta-init → FSDP2 → weight-load path from :class:`OmniModuleTrainer`
-      (without checkpoint callbacks).
-    """
-
-    def __init__(
-        self,
-        args: VeOmniArguments,
-        subfolder_name: str,
-    ):
-        self.subfolder_name = subfolder_name
-        self.base = BaseTrainer.__new__(BaseTrainer)
-        self.base.args = args
-
-        if args.train.accelerator.fsdp_config.fsdp_mode == "eager":
-            self._build_model_eager()
-            self._build_model_assets()
-        else:
-            # FSDP / extra-parallel (e.g. ep / emb) inference: reuse the training build
-            # (per-module ParallelState -> meta-init -> FSDP2 wrap + weight load),
-            # in eval mode and without optimizer / checkpoint callbacks.
-
-            # TODO(WJC)
-            # Disable mixed precision so FSDP params stay bf16 (no float32 master)
-            # — matching the eager (bf16) modules; otherwise the float32 embeds
-            # collide with the eager backbone's bf16 weights (dtype mismatch).
-            args.train.accelerator.fsdp_config.mixed_precision.enable = False
-
-            # ``_setup`` builds this module's ParallelState without mutating the
-            # global current state, so scope the meta-init + FSDP/DDP wrap (which
-            # read ``get_parallel_state()``) to it.
-            self._setup()
-            with use_parallel_state(self.parallel_state):
-                self.base._build_model()
-                self._build_model_assets()
-                self._freeze_model_module()
-                self.base._build_parallelized_model()
-                self.base.model.eval()
-
-    @property
-    def model(self) -> torch.nn.Module:
-        return self.base.model
-
-    def _build_model_eager(self) -> None:
-        """Eager ``from_pretrained`` load with ``device_map='auto'``.
-
-        Full eager inference runs single-process and lets accelerate spread the
-        model across visible GPUs (and offload if needed).
-        """
-        args: VeOmniArguments = self.base.args
-        assert args.train.accelerator.fsdp_config.fsdp_mode == "eager"
-        from ..models.seed_omni import OMNI_MODEL_REGISTRY, read_model_type
-
-        model_path = args.model.model_path
-        overrides = dict(args.model.model_config or {})
-        model_type = read_model_type(model_path)
-        cls = OMNI_MODEL_REGISTRY[model_type]()
-        device_map = "auto"
-        logger.info_rank0(
-            f"OmniModuleInferencer '{self.subfolder_name}': eager load "
-            f"(model_type={model_type}, cls={cls.__name__}, device_map={device_map}) from {model_path}"
-        )
-        self.base.model = cls.from_pretrained(
-            model_path,
-            torch_dtype=torch.bfloat16,
-            device_map=device_map,
-            **overrides,
-        ).eval()
 
 
 @dataclass
@@ -282,6 +207,36 @@ class OmniInferencer(OmniTrainer):
         if not reply and not images_out:
             logger.warning_rank0("finalize: FSM produced no reply and no images.")
 
+    def _preprocess_request(
+        self,
+        conversation: list[ConversationItem],
+        generation_kwargs: dict[str, Any] | None = None,
+    ) -> None:
+        """Run every module's CPU preprocessor over the request once, before the FSM.
+
+        The inference twin of training's :class:`SeedOmniCollator` pass: each module
+        contributes the same :meth:`build_cpu_preprocessor` (chat-template + tokenize
+        for text, image/video patchify for vision). ``inference=True`` flips the
+        train/infer-only bits — image modules skip the FSDP-anchor dummy and text
+        encoders append the assistant generation prompt; ``generation_kwargs`` is
+        forwarded so a module can vary its prep by the request's decoding options (no
+        current module needs it). After this each module's ``generate`` only packs →
+        encodes → scatters the preprocessed items, exactly like the training forward.
+
+        Order is FIXED and SERIAL: preprocessors run one-by-one over the single-sample
+        request (wrapped as a batch of one) in ``module_names`` order — i.e. the
+        config ``modules:`` declaration order, identical to the training collator — so
+        a module whose prep depends on an earlier one's output (e.g. text chat-template
+        after a vision tower patchifies its image items) stays correct.
+        """
+        batched = [conversation]
+        for name in self.module_names:
+            module = _unwrap_module(self.modules[name])
+            builder = getattr(module, "build_cpu_preprocessor", None)
+            preprocessor = builder() if builder is not None else None
+            if preprocessor is not None:
+                preprocessor(batched, inference=True, generation_kwargs=generation_kwargs)
+
     @torch.no_grad()
     def _run(self, req: InferenceRequest) -> dict[str, Any]:
         for module in self.modules.values():
@@ -291,6 +246,7 @@ class OmniInferencer(OmniTrainer):
                 module.reset_local_inference_state()
 
         conversation = build_conversation(prompt=req.prompt, images=req.images)
+        self._preprocess_request(conversation, req.generation_kwargs)
         request_dict: dict[str, Any] = {
             "conversation_list": conversation,
         }

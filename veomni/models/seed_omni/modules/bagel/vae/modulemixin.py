@@ -6,8 +6,8 @@ from typing import Any
 
 import torch
 
-from ....conversation import ConversationItem, is_dummy, iter_desired_items
-from ....module import CPUPreprocessor, ModuleMixin, post_forward, pre_forward
+from ....mixins.modulemixin import CPUPreprocessor, ModuleMixin, post_forward, pre_forward
+from ....utils.conversation import ConversationItem, is_dummy, iter_desired_items
 from ..sources import BAGEL_GENERATED_LATENT, BAGEL_VAE_CONTEXT
 from .configuration import BagelVAEConfig
 

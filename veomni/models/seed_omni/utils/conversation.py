@@ -142,6 +142,7 @@ def iter_desired_items(
     meta_keys: list[str] | None = None,
 ) -> Iterator[ConversationItem]:
     """Yield matching items in micro-batch order (sample 0, then sample 1, …)."""
+
     for sample in conversation_list:
         items = reversed(sample) if reverse_item else sample
         for item in items:
@@ -165,21 +166,16 @@ def collect_desired_values(
     meta_keys: list[str] | None = None,
 ) -> list[Any]:
     """Flat ``item.value`` list for matching items in micro-batch order."""
-    return [item.value for item in iter_desired_items(conversation_list, types, roles, sources, meta_keys=meta_keys)]
-
-
-def worker_dummy_items(conversation_list: list[list[ConversationItem]], source: str) -> list[ConversationItem]:
-    """Worker-appended ``role="dummy"`` placeholders for module ``source``.
-
-    A module's CPU preprocessor appends one on a micro-batch with no real input for
-    it; ``meta["source"]`` + ``role="dummy"`` is enough to find it back (a given
-    source has at most one class of dummy item live at any call site).
-    """
-    return [it for it in iter_desired_items(conversation_list, roles=["dummy"]) if it.meta.get("source") == source]
-
-
-def has_worker_dummy(conversation_list: list[list[ConversationItem]], source: str) -> bool:
-    return bool(worker_dummy_items(conversation_list, source))
+    return [
+        item.value
+        for item in iter_desired_items(
+            conversation_list,
+            types,
+            roles,
+            sources,
+            meta_keys=meta_keys,
+        )
+    ]
 
 
 __all__ = [
@@ -190,6 +186,4 @@ __all__ = [
     "seal_outputs",
     "iter_desired_items",
     "collect_desired_values",
-    "worker_dummy_items",
-    "has_worker_dummy",
 ]

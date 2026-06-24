@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import torch
 
-from veomni.models.seed_omni.conversation import (
+from veomni.models.seed_omni.utils.conversation import (
     ConversationItem,
     build_conversation,
     collect_desired_values,

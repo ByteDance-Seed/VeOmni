@@ -93,19 +93,34 @@ class JanusVqvae(JanusVqvaeModuleMixin, JanusVqvaeTraceMixin, PreTrainedModel):
             image_embeds = image_embeds.reshape(b, vq_token_ids.size(1), image_embeds.size(-1))
         return {"image_embeds": image_embeds, "vq_token_ids": vq_token_ids}
 
+    def _dummy_encode_outputs(self, pixel_values: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """Zero stand-ins shaped exactly like :meth:`_encode_pixels`' output (same
+        batch + per-image token count) for the non-FSDP dummy, whose codec forward
+        is skipped (no gradient anchor needed without FSDP). Emitting real-shaped
+        zeros instead of ``None`` lets the pre/post hooks treat every batch
+        identically — no ``None`` / dummy special-casing downstream."""
+        vq = self.config.vq_config
+        downsample = 2 ** (len(vq.channel_multiplier) - 1)
+        b, _, h, w = pixel_values.shape
+        num_tokens = (h // downsample) * (w // downsample)
+        return {
+            "image_embeds": pixel_values.new_zeros(b, num_tokens, vq.projection_dim),
+            "vq_token_ids": pixel_values.new_zeros(b, num_tokens, dtype=torch.long),
+        }
+
     def encode(
         self,
         pixel_values: Optional[torch.Tensor] = None,
-        is_dummy: Optional[bool] = None,
+        is_dummy: bool = False,
     ) -> Dict[str, Any]:
-        # ``is_dummy`` comes from the (worker-aware) pre_forward: True with
-        # worker-built dummy zeros, False with real pixels. ``None`` = eager /
-        # no-worker path → derive from the absence of pixels (FSDP only).
-        if is_dummy is None:
-            is_dummy = pixel_values is None and get_parallel_state().fsdp_enabled
-        if is_dummy and pixel_values is None:
-            pixel_values = self.dummy_inputs()["pixel_values"]
-        return {**self._encode_pixels(pixel_values), "is_dummy": is_dummy}
+        # Real pixels → always encode. A worker-built dummy is only the training
+        # FSDP gradient anchor, so it runs the codec solely under training + FSDP;
+        # otherwise (inference, or no FSDP) there is nothing to anchor, so skip the
+        # forward but still emit real-shaped zeros so the output is uniform with a
+        # real encode (pre/post never branch on dummy).
+        if is_dummy and not (self.training and get_parallel_state().fsdp_enabled):
+            return self._dummy_encode_outputs(pixel_values)
+        return self._encode_pixels(pixel_values)
 
     def decode(
         self,
@@ -118,25 +133,21 @@ class JanusVqvae(JanusVqvaeModuleMixin, JanusVqvaeTraceMixin, PreTrainedModel):
         if hidden_states is None or labels is None:
             return {}
         if is_dummy:
-            return {"loss": self.generation_head(hidden_states).sum() * 0.0}
+            # Under training + FSDP, route the dummy span through the generation
+            # head so its reduce-scatter fires on every rank (the gradient anchor).
+            # Otherwise (inference, or no FSDP) no collective sync is needed, so
+            # return a 0.0 loss directly.
+            if self.training and get_parallel_state().fsdp_enabled:
+                return {"loss": self.generation_head(hidden_states).sum() * 0.0}
+            return {"loss": hidden_states.sum() * 0.0}
         return {"loss": self._vq_loss(hidden_states, labels)}
 
     def _vq_loss(self, hidden_states: torch.Tensor, gt_token_ids: torch.Tensor) -> torch.Tensor:
+        # ``hidden_states`` is already teacher-forcing aligned in
+        # ``_prepare_decode_inputs`` (row i = hidden after the previous token,
+        # predicting VQ id i), so no further shift here — shifting again would
+        # mis-align by one and bleed across concatenated image spans. Labels are
+        # pure VQ codebook ids (every decoded row is an image token, no -100).
         labels = gt_token_ids.to(hidden_states.device)
-        hidden_states = hidden_states[:, : labels.size(1)]
         logits = self.generation_head(hidden_states)
-        v = logits.size(-1)
-
-        if not labels.ne(-100).any():
-            return logits[:, -1:, :].mean() * 0.0
-
-        shift_logits = logits[:, :-1, :].contiguous()
-        shift_labels = labels[:, 1:].contiguous()
-        ce_sum = F.cross_entropy(
-            shift_logits.reshape(-1, v),
-            shift_labels.reshape(-1),
-            ignore_index=-100,
-            reduction="sum",
-        )
-        n_valid = (shift_labels != -100).sum().clamp(min=1)
-        return ce_sum / n_valid
+        return F.cross_entropy(logits.reshape(-1, logits.size(-1)), labels.reshape(-1))

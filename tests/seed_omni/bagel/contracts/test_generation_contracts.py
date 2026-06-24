@@ -12,8 +12,7 @@ from tests.seed_omni.bagel.contracts.helpers import (
     model_cls,
     tiny_bagel_qwen2_cfg,
 )
-from veomni.models.seed_omni.conversation import ConversationItem
-from veomni.models.seed_omni.generation_graph import FSM_SIGNAL_KEY
+from veomni.models.seed_omni.graphs.generation_graph import FSM_SIGNAL_KEY
 from veomni.models.seed_omni.modeling_omni import OmniModel
 from veomni.models.seed_omni.modules.bagel.qwen2_mot.generation_state import MotGenerationState
 from veomni.models.seed_omni.modules.bagel.sources import (
@@ -23,6 +22,7 @@ from veomni.models.seed_omni.modules.bagel.sources import (
     BAGEL_GENERATED_LATENT,
     BAGEL_VAE_CONTEXT,
 )
+from veomni.models.seed_omni.utils.conversation import ConversationItem
 
 
 def test_bagel_infer_gen_denoise_signal_smoke():

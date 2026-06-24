@@ -11,10 +11,10 @@ import torch
 from torch import nn
 
 from tests.seed_omni.parity_suite.core import PARITY_ENABLE_ENV, to_cpu
-from veomni.models.seed_omni.conversation import ConversationItem, is_dummy
-from veomni.models.seed_omni.generation_graph import FSM_SIGNAL_KEY
-from veomni.models.seed_omni.module import ModuleMixin
+from veomni.models.seed_omni.graphs.generation_graph import FSM_SIGNAL_KEY
+from veomni.models.seed_omni.mixins.modulemixin import ModuleMixin
 from veomni.models.seed_omni.observer import _materialize_observed_value
+from veomni.models.seed_omni.utils.conversation import ConversationItem, is_dummy
 
 
 ObserverSink = MutableMapping[tuple[str, str], list[dict[str, Any]]]

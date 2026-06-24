@@ -16,7 +16,7 @@ from tests.seed_omni.parity_suite.v2.generation_runtime import (
     run_generation_fsm,
 )
 from tests.seed_omni.parity_suite.v2.model import load_graph_active_omni_config
-from veomni.models.seed_omni.generation_graph import GenerationGraph
+from veomni.models.seed_omni.graphs.generation_graph import GenerationGraph
 
 
 def run_v2_infer_module(
