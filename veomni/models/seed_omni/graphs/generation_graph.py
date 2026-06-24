@@ -101,11 +101,10 @@ See also
 ``training_graph.py``  — DAG view driven by ``OmniConfig.training_graph``.
 """
 
-from contextlib import contextmanager, nullcontext
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any, Callable, ContextManager, Dict, List, Optional
 
-from ..mixins.modulemixin import ModuleMixin
 from .graph import (
     EdgeDef,
     NodeDef,
@@ -175,36 +174,6 @@ class _Condition:
 class _Transition:
     condition: _Condition
     next_state: str
-
-
-@contextmanager
-def _maybe_unshard_fsdp_module(module: Any):
-    """Unshard a FSDP2 module for inference-only non-``forward`` node calls.
-
-    Training uses ``OmniModuleTrainer.forward`` to temporarily route the target
-    method through ``module.__call__`` so backward gradient sync hooks fire.
-    Inference stays on explicit unshard/reshard because generation methods can
-    call other methods on the same module, and replacing ``forward`` for the
-    full generation method would make nested calls dispatch incorrectly.
-    Keep this path symmetric with ``OmniModuleTrainer.forward`` when changing
-    how graph node methods cross FSDP2/DDP lifecycles.
-    """
-
-    try:
-        from torch.distributed.fsdp import FSDPModule
-    except ImportError:
-        yield
-        return
-    if not isinstance(module, FSDPModule):
-        yield
-        return
-    handle = module.unshard(async_op=False)
-    if handle is not None:
-        handle.wait()
-    try:
-        yield
-    finally:
-        module.reshard()
 
 
 # ── State ─────────────────────────────────────────────────────────────────────
@@ -464,12 +433,10 @@ class GenerationGraph:
             # Optional per-module scope (e.g. make this module's ParallelState
             # current so Extra Parallel groups resolve correctly).
             module_context = scope_fn(node.module) if scope_fn is not None else nullcontext()
-            with module_context, _maybe_unshard_fsdp_module(module):
+            with module_context:
                 out = method_fn(**ctx, generation_kwargs=generation_kwargs)
             if not isinstance(out, dict):
                 raise TypeError(f"FSM node '{node_name}'.{method_name} must return a dict; got {type(out).__name__}.")
-            if isinstance(module, ModuleMixin):
-                module.observe(state.name, node_name, out)
             ctx.update(out)
             executed.add(node_name)
 
