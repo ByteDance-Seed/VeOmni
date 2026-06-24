@@ -4,6 +4,11 @@ from typing import List
 import torch
 import torch.distributed as dist
 from torch.distributed._tensor import DTensor
+from torch.utils._foreach_utils import (
+    _device_has_foreach_support,
+    _group_tensors_by_device_and_dtype,
+    _has_foreach_support,
+)
 
 from ...utils.device import get_device_type
 from ...utils.logging import get_logger
@@ -167,18 +172,24 @@ def _raise_if_nonfinite(total_norm: torch.Tensor, norm_type: float, error_if_non
 
 # compute local sum of param gard norm
 def _local_pth_sum(params: List[torch.nn.Parameter], p: float) -> torch.Tensor:
+    grads = [p.grad for p in params if p.grad is not None]
+    grads_local = [
+        g.to_local().detach().to(torch.float32) if isinstance(g, DTensor) else g.detach().to(torch.float32)
+        for g in grads
+    ]
+
     reduce_device = torch.device(get_device_type())
     res = torch.tensor(0.0, device=reduce_device, dtype=torch.float32)
     with torch.no_grad():
-        for param in params:
-            g = param.grad
-            if g is None:
-                continue
-            if isinstance(g, DTensor):
-                g = g.to_local()
-            g = g.detach().to(torch.float32)
-            gn = torch.norm(g, p=p)
-            res = res + (gn**p).to(reduce_device)
+        grouped_grads_local = _group_tensors_by_device_and_dtype([grads_local])
+        for (device, _), ([device_grads_local], _) in grouped_grads_local.items():
+            if _has_foreach_support(device_grads_local, device) or _device_has_foreach_support(device):
+                out = torch._foreach_pow_(torch._foreach_norm(device_grads_local, p), p)
+                res += torch.sum(torch.stack(out)).to(reduce_device)
+            else:
+                for grad_local in device_grads_local:
+                    gn = torch.norm(grad_local, p=p)
+                    res = res + (gn**p).to(reduce_device)
     return res
 
 
