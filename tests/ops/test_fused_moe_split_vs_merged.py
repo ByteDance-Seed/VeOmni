@@ -28,6 +28,14 @@ def _eager_moe_forward(
     fc2_weight: torch.Tensor,
     swiglu_limit: float | None = None,
 ) -> torch.Tensor:
+    """Reference eager MoE implementation matching fused-kernel operator ordering.
+
+    The fused kernels multiply routing weights *before* the fc2 projection. That
+    is mathematically equivalent to applying the weights after fc2 because fc2 is
+    linear, but it is not numerically identical in bf16, especially around
+    ``swiglu_limit`` clamp boundaries. Keep this helper aligned with the fused
+    implementation so parity tests compare like-for-like.
+    """
     output = torch.zeros_like(hidden_states)
     expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=num_experts).permute(2, 1, 0)
     expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
@@ -41,8 +49,9 @@ def _eager_moe_forward(
         if swiglu_limit is not None:
             gate = gate.clamp(max=swiglu_limit)
             up = up.clamp(min=-swiglu_limit, max=swiglu_limit)
-        y = F.linear(F.silu(gate) * up, fc2_weight[idx])
+        y = F.silu(gate) * up
         y = y * routing_weights[token_idx, top_k_pos, None]
+        y = F.linear(y, fc2_weight[idx])
         output.index_add_(0, token_idx, y.to(output.dtype))
 
     return output
