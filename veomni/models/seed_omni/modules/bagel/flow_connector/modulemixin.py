@@ -286,7 +286,8 @@ class BagelFlowConnectorModuleMixin(ModuleMixin):
         self._decode_items = self._select_velocity_target_items(conversation_list)
         if not self._decode_items:
             self._decode_is_dummy = True
-            return self.dummy_inputs(kind="decode_velocity")
+            dummy = self.dummy_inputs(kind="decode_velocity")
+            return self._anchor_dummy_decode_velocity_inputs(conversation_list, dummy)
 
         inputs, self._decode_lengths, self._decode_target = preprocess_decode_velocity(
             self._decode_items,
@@ -342,6 +343,34 @@ class BagelFlowConnectorModuleMixin(ModuleMixin):
             ),
             "timesteps": torch.zeros(1, device=self.device, dtype=torch.float32),
         }
+
+    def _anchor_dummy_decode_velocity_inputs(
+        self,
+        conversation_list: list[list[ConversationItem]] | None,
+        dummy: dict[str, torch.Tensor],
+    ) -> dict[str, torch.Tensor]:
+        """Tie dummy flow loss to MoT hidden states without changing its value."""
+        if conversation_list is None:
+            return dummy
+
+        anchor = None
+        for item in iter_desired_items(
+            conversation_list,
+            types=["text", "image", "output"],
+            roles=["user", "assistant"],
+        ):
+            value = item.value
+            if not torch.is_tensor(value):
+                continue
+            if value.dim() == 3 and value.shape[0] == 1:
+                value = value.squeeze(0)
+            if value.dim() == 2 and int(value.shape[-1]) == int(self.config.hidden_size):
+                anchor = value.to(device=self.device, dtype=self.dtype).sum() * 0.0
+                break
+        if anchor is None:
+            return dummy
+
+        return {"hidden_states": dummy["hidden_states"] + anchor}
 
     # ── Inference helpers ──────────────────────────────────
 

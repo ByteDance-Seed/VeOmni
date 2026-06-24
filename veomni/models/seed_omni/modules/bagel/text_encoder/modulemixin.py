@@ -189,6 +189,7 @@ class BagelTextEncoderModuleMixin(TextEncoderModuleMixin):
                 return {"hidden_states": hidden_states, "shift_labels": shift_labels}
 
         dummy = self.dummy_inputs(kind="decode")
+        dummy = self._anchor_dummy_decode_inputs(conversation_list, dummy)
         self._decode_has_valid_labels = False
         return {"hidden_states": dummy["hidden_states"], "shift_labels": dummy["labels"]}
 
@@ -210,6 +211,35 @@ class BagelTextEncoderModuleMixin(TextEncoderModuleMixin):
         return {
             "hidden_states": torch.zeros(1, int(self.config.hidden_size), device=self.device, dtype=self.dtype),
             "labels": torch.full((1,), -100, device=self.device, dtype=torch.long),
+        }
+
+    def _anchor_dummy_decode_inputs(
+        self,
+        conversation_list: Optional[List[List[ConversationItem]]],
+        dummy: Dict[str, torch.Tensor],
+    ) -> Dict[str, torch.Tensor]:
+        """Tie dummy CE loss to MoT hidden states without changing its value."""
+        if conversation_list is None:
+            return dummy
+
+        anchor = None
+        for item in iter_desired_items(
+            conversation_list, types=["text", "image", "output"], roles=["user", "assistant"]
+        ):
+            value = item.value
+            if not torch.is_tensor(value):
+                continue
+            if value.dim() == 3 and value.shape[0] == 1:
+                value = value.squeeze(0)
+            if value.dim() == 2 and int(value.shape[-1]) == int(self.config.hidden_size):
+                anchor = value.to(device=self.device, dtype=self.dtype).sum() * 0.0
+                break
+        if anchor is None:
+            return dummy
+
+        return {
+            "hidden_states": dummy["hidden_states"] + anchor,
+            "labels": dummy["labels"],
         }
 
     # ── Internal helpers ──────────────────────────────────
