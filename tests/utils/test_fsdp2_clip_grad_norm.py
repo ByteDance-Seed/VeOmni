@@ -1,8 +1,12 @@
+import importlib
 from types import SimpleNamespace
 
 import torch
 
 from veomni.distributed.fsdp2.clip_grad_norm import _fsdp_grad_norm_reduce_groups, _local_pth_sum
+
+
+clip_grad_norm_module = importlib.import_module("veomni.distributed.fsdp2.clip_grad_norm")
 
 
 def _parallel_state(*, dp_mode: str = "fsdp2", dp_replicate_enabled: bool = False, dp_shard_size: int = 1):
@@ -27,13 +31,20 @@ def test_fsdp_grad_norm_reduce_groups_use_shard_group_for_hsdp():
     assert _fsdp_grad_norm_reduce_groups(ps) == [("fsdp_shard", ps.dp_shard_group)]
 
 
+def test_fsdp_grad_norm_reduce_groups_skip_replicated_unsharded_fsdp2():
+    ps = _parallel_state(dp_replicate_enabled=True, dp_shard_size=1)
+
+    assert _fsdp_grad_norm_reduce_groups(ps) == []
+
+
 def test_fsdp_grad_norm_reduce_groups_skip_non_fsdp2_modes():
     ps = _parallel_state(dp_mode="ddp")
 
     assert _fsdp_grad_norm_reduce_groups(ps) == []
 
 
-def test_local_pth_sum_skips_missing_grads_and_accumulates_in_fp32():
+def test_local_pth_sum_skips_missing_grads_and_accumulates_in_fp32(monkeypatch):
+    monkeypatch.setattr(clip_grad_norm_module, "_LOCAL_NORM_CHUNK_SIZE", 2)
     p1 = torch.nn.Parameter(torch.tensor([1.0, -2.0]))
     p2 = torch.nn.Parameter(torch.tensor([3.0]))
     p3 = torch.nn.Parameter(torch.tensor([5.0]))

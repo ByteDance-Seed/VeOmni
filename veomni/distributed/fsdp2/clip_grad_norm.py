@@ -11,6 +11,7 @@ from ..parallel_state import get_parallel_state
 
 
 logger = get_logger(__name__)
+_LOCAL_NORM_CHUNK_SIZE = 128
 
 
 def clip_grad_norm(
@@ -54,8 +55,8 @@ def _fsdp_grad_norm_reduce_groups(ps) -> List[tuple[str, dist.ProcessGroup | Non
     """
     if ps.dp_mode != "fsdp2":
         return []
-    if ps.dp_replicate_enabled and ps.dp_shard_size > 1:
-        return [("fsdp_shard", ps.dp_shard_group)]
+    if ps.dp_replicate_enabled:
+        return [("fsdp_shard", ps.dp_shard_group)] if ps.dp_shard_size > 1 else []
     return [("fsdp", ps.fsdp_group)]
 
 
@@ -181,6 +182,19 @@ def _raise_if_nonfinite(total_norm: torch.Tensor, norm_type: float, error_if_non
 def _local_pth_sum(params: List[torch.nn.Parameter], p: float) -> torch.Tensor:
     reduce_device = torch.device(get_device_type())
     res = torch.tensor(0.0, device=reduce_device, dtype=torch.float32)
+
+    chunks: dict[torch.device, list[torch.Tensor]] = {}
+
+    def flush_chunk(device: torch.device) -> None:
+        nonlocal res
+        chunk = chunks.get(device)
+        if not chunk:
+            return
+        chunk_fp32 = [g.to(torch.float32) for g in chunk]
+        norms = torch._foreach_norm(chunk_fp32, p)
+        res = res + torch.sum(torch.stack(norms).pow(p)).to(reduce_device)
+        chunk.clear()
+
     with torch.no_grad():
         for param in params:
             g = param.grad
@@ -188,9 +202,14 @@ def _local_pth_sum(params: List[torch.nn.Parameter], p: float) -> torch.Tensor:
                 continue
             if isinstance(g, DTensor):
                 g = g.to_local()
-            g = g.detach().to(torch.float32)
-            gn = torch.norm(g, p=p)
-            res = res + (gn**p).to(reduce_device)
+            g = g.detach()
+            chunk = chunks.setdefault(g.device, [])
+            chunk.append(g)
+            if len(chunk) >= _LOCAL_NORM_CHUNK_SIZE:
+                flush_chunk(g.device)
+
+        for device in list(chunks):
+            flush_chunk(device)
     return res
 
 
