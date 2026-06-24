@@ -105,12 +105,12 @@ from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import Any, Callable, ContextManager, Dict, List, Optional
 
+from ..mixins.modulemixin import ModuleMixin
 from .graph import (
     EdgeDef,
     NodeDef,
     is_end,
 )
-from .module import ModuleMixin
 
 
 # Default method for a bare endpoint in the inference FSM (training uses

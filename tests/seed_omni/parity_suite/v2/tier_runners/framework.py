@@ -22,7 +22,6 @@ from tests.seed_omni.parity_suite.v2.tier_runners.framework_support import (
     TrainerStepOptions,
     all_grads_are_cleared,
     build_minimal_omni_trainer,
-    build_trainer_node_executors,
     framework_report,
     fsdp2_numeric_reports,
     optional_int,
@@ -123,7 +122,6 @@ def _run_v2_train_framework_batch(
     del whitelist
     model = driver.load_v2_model(device=device, dtype=dtype).train()
     driver.configure_determinism(driver.case.model.seed)
-    model.set_node_executors(build_trainer_node_executors(model))
     zero_module_grads(model.modules_dict.values())
     batch = dict(batch_kwargs)
     apply_training_cpu_preprocessors(model, batch)
@@ -169,7 +167,6 @@ def _run_train_step_policy(
     driver.configure_determinism(driver.case.model.seed)
     trainer_model = driver.load_v2_model(device=device, dtype=dtype).train()
     driver.configure_determinism(driver.case.model.seed)
-    trainer_model.set_node_executors(build_trainer_node_executors(trainer_model))
     trainer_result = run_trainer_train_step(
         driver,
         trainer_model,
@@ -215,7 +212,6 @@ def _run_checkpoint_resume_policy(
         driver.configure_determinism(driver.case.model.seed)
         save_model = driver.load_v2_model(device=device, dtype=dtype).train()
         driver.configure_determinism(driver.case.model.seed)
-        save_model.set_node_executors(build_trainer_node_executors(save_model))
         save_batch = driver.build_v2_request(save_ctx)
         save_trainer = build_minimal_omni_trainer(save_model, device=device, dtype=dtype)
         attach_checkpoint_state(
@@ -239,7 +235,6 @@ def _run_checkpoint_resume_policy(
         driver.configure_determinism(driver.case.model.seed)
         resume_model = driver.load_v2_model(device=device, dtype=dtype).train()
         driver.configure_determinism(driver.case.model.seed)
-        resume_model.set_node_executors(build_trainer_node_executors(resume_model))
         resume_batch = driver.build_v2_request(resume_ctx)
         resume_trainer = build_minimal_omni_trainer(resume_model, device=device, dtype=dtype)
         attach_checkpoint_state(

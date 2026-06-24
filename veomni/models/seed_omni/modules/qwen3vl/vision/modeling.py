@@ -125,29 +125,42 @@ class Qwen3VLVisionEncoder(Qwen3VLVisionEncoderModuleMixin, PreTrainedModel):
         out = self.visual(pixel_values.type(self.visual.dtype), grid_thw=image_grid_thw, vit_metadata=vit_metadata)
         return out.pooler_output, list(out.deepstack_features)
 
+    def _dummy_outputs(
+        self,
+        pixel_values: torch.Tensor,
+        image_grid_thw: torch.Tensor,
+    ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
+        """Zero stand-ins shaped exactly like :meth:`_encode`' output (merged-token
+        count + per-deepstack-layer features) for the non-FSDP dummy, whose ViT
+        forward is skipped (no gradient anchor needed without FSDP). Emitting
+        real-shaped zeros instead of ``None`` keeps the pre/post hooks branch-free."""
+        cfg = self.config.vision_config
+        merge_area = cfg.spatial_merge_size**2
+        num_merged = int(image_grid_thw.prod(dim=1).sum().item()) // merge_area
+        image_embeds = pixel_values.new_zeros(num_merged, cfg.out_hidden_size)
+        deepstack_features = [
+            pixel_values.new_zeros(num_merged, cfg.out_hidden_size) for _ in cfg.deepstack_visual_indexes
+        ]
+        return image_embeds, deepstack_features
+
     def forward(
         self,
         pixel_values: Optional[torch.Tensor] = None,
         image_grid_thw: Optional[torch.Tensor] = None,
         vit_metadata: Optional[Dict[str, Any]] = None,
-        is_dummy: Optional[bool] = None,
+        is_dummy: bool = False,
     ) -> Dict[str, Any]:
-        # ``is_dummy`` comes from the (worker-aware) pre_forward: True with
-        # worker-built dummy zeros, False with real patches. ``None`` = eager /
-        # no-worker path → derive from the absence of pixels (FSDP only).
-        if is_dummy is None:
-            is_dummy = pixel_values is None and get_parallel_state().fsdp_enabled
-        if is_dummy and pixel_values is None:
-            dummy = self.dummy_inputs()
-            pixel_values, image_grid_thw, vit_metadata = (
-                dummy["pixel_values"],
-                dummy["image_grid_thw"],
-                dummy["vit_metadata"],
-            )
-        image_embeds, deepstack_features = self._encode(pixel_values, image_grid_thw, vit_metadata)
+        # Real input → always encode. A worker-built dummy is only the training
+        # FSDP gradient anchor, so it runs the ViT solely under training + FSDP;
+        # otherwise (inference, or no FSDP) there is nothing to anchor, so skip the
+        # forward but still emit real-shaped zeros so the output is uniform with a
+        # real encode (pre/post never branch on dummy).
+        if is_dummy and not (self.training and get_parallel_state().fsdp_enabled):
+            image_embeds, deepstack_features = self._dummy_outputs(pixel_values, image_grid_thw)
+        else:
+            image_embeds, deepstack_features = self._encode(pixel_values, image_grid_thw, vit_metadata)
         return {
             "image_embeds": image_embeds,
             "deepstack_features": deepstack_features,
             "image_grid_thw": image_grid_thw,
-            "is_dummy": is_dummy,
         }

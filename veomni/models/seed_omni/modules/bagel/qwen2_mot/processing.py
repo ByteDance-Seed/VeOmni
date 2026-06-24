@@ -7,7 +7,7 @@ from typing import Iterable
 
 import torch
 
-from ....conversation import ConversationItem, iter_desired_items
+from ....utils.conversation import ConversationItem, iter_desired_items
 
 
 @dataclass(frozen=True)

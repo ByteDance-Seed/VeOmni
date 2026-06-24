@@ -31,7 +31,7 @@ def test_bagel_train_yaml_loads_with_v2_module_names():
 
 
 def test_bagel_train_graph_fan_in_execution_order():
-    from veomni.models.seed_omni.training_graph import TrainingGraph
+    from veomni.models.seed_omni.graphs.training_graph import TrainingGraph
 
     graph = TrainingGraph(_bagel_train_edges())
     order = graph.execution_order

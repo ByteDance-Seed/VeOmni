@@ -6,9 +6,9 @@ from typing import Any
 
 import torch
 
-from ....conversation import ConversationItem, iter_desired_items
-from ....module import CPUPreprocessor, ModuleMixin, post_forward, pre_forward
-from ....tracemixin import TraceMixin
+from ....mixins.modulemixin import CPUPreprocessor, ModuleMixin, post_forward, pre_forward
+from ....mixins.tracemixin import TraceMixin
+from ....utils.conversation import ConversationItem, iter_desired_items
 from ..sources import BAGEL_SIGLIP_CONTEXT
 from .configuration import BagelSiglipNavitConfig
 

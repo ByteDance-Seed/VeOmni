@@ -26,7 +26,8 @@ from veomni.distributed import parallel_state as parallel_state_module
 from veomni.distributed.clip_grad_norm import veomni_omni_module_clip_grad_norm
 from veomni.models.seed_omni.modeling_omni import OmniModel
 from veomni.trainer.base import BaseTrainer
-from veomni.trainer.omni_trainer import MultiLRScheduler, MultiOptimizer, OmniModuleTrainer, OmniTrainer
+from veomni.trainer.omni.omni_module_trainer import OmniModuleTrainer
+from veomni.trainer.omni.omni_trainer import MultiLRScheduler, MultiOptimizer, OmniTrainer
 
 
 @dataclass(frozen=True)
@@ -84,12 +85,6 @@ def build_minimal_omni_trainer(model: OmniModel, *, device: torch.device, dtype:
     trainer.base = base
     trainer.module_trainers = build_module_trainers(model)
     return trainer
-
-
-def build_trainer_node_executors(model: OmniModel) -> dict[str, Any]:
-    """Bind graph nodes to ``OmniModuleTrainer.forward`` without full trainer setup."""
-
-    return {name: build_stub_module_trainer(module).forward for name, module in model.modules_dict.items()}
 
 
 def optional_int(value: Any) -> int | None:
@@ -399,5 +394,4 @@ __all__ = [
     "single_rank_ddp_parallel_state",
     "trainer_step_reports",
     "build_minimal_omni_trainer",
-    "build_trainer_node_executors",
 ]

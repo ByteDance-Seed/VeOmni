@@ -4,8 +4,7 @@ import pytest
 import torch
 
 from tests.seed_omni.bagel.contracts.helpers import config_cls, model_cls, tiny_bagel_qwen2_cfg
-from veomni.models.seed_omni.conversation import ConversationItem
-from veomni.models.seed_omni.generation_graph import FSM_SIGNAL_KEY
+from veomni.models.seed_omni.graphs.generation_graph import FSM_SIGNAL_KEY
 from veomni.models.seed_omni.modules.bagel.flow_connector.modulemixin import SIGNAL_IMAGE_COMPLETE
 from veomni.models.seed_omni.modules.bagel.sources import (
     BAGEL_FLOW_HIDDEN,
@@ -15,6 +14,7 @@ from veomni.models.seed_omni.modules.bagel.sources import (
     BAGEL_SIGLIP_CONTEXT,
     BAGEL_VAE_CONTEXT,
 )
+from veomni.models.seed_omni.utils.conversation import ConversationItem
 
 
 def test_bagel_denoise_item_source_lifecycle() -> None:

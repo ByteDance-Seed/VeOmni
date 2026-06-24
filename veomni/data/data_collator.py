@@ -554,8 +554,8 @@ class SeedOmniCollator(DataCollator):
         # batch == {"conversation_list": [[ConversationItem(...)], ...]}
 
     ``cpu_preprocessors`` is an ordered list of picklable, weight-free callables
-    (see :class:`veomni.models.seed_omni.module.CPUPreprocessor`) collected by
-    :class:`~veomni.trainer.omni_trainer.OmniTrainer` from the active graph-node
+    (see :class:`veomni.models.seed_omni.mixins.modulemixin.CPUPreprocessor`) collected by
+    :class:`~veomni.trainer.omni.omni_trainer.OmniTrainer` from the active graph-node
     modules. Each is run, in order, over the grouped ``conversation_list`` so the
     heavy per-module CPU input-prep (tokenize / image normalize) executes inside
     the DataLoader worker and overlaps with GPU compute via prefetch, instead of
@@ -589,8 +589,15 @@ class SeedOmniCollator(DataCollator):
         batch = {key: [f[key] for f in features] for key in first_keys}
 
         # Run each active module's worker-side CPU input-prep (tokenize / image
-        # normalize) over the grouped conversation_list, in graph order. Mutates
-        # items in place; the modules' thin pre_forward then only moves to device.
+        # normalize) over the grouped conversation_list. Mutates items in place;
+        # the modules' thin pre_forward then only moves to device.
+        #
+        # Order is FIXED and SERIAL: the preprocessors are applied one-by-one in the
+        # exact order they were supplied (``OmniTrainer._build_collate_fn`` collects
+        # them in the config ``modules:`` declaration order). This is a contract, not
+        # an accident — a later preprocessor may depend on an earlier one's output
+        # (e.g. the text encoder's chat-template runs after a vision tower has
+        # patchified its image items). Keep ``cpu_preprocessors`` ordered accordingly.
         for preprocess in self.cpu_preprocessors:
             preprocess(batch["conversation_list"])
 

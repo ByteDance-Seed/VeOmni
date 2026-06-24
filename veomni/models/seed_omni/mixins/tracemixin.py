@@ -29,7 +29,7 @@ A module only ever produces **time-independent** quantities:
 
 * :meth:`trace_add` accumulates this module's token lengths — the per-module
   analogue of ``EnvironMeter.add``.  The
-  :class:`~veomni.trainer.omni_trainer.OmniModuleTrainer` calls it right after
+  :class:`~veomni.trainer.omni.omni_module_trainer.OmniModuleTrainer` calls it right after
   ``pre_forward`` (when the real input tensors are in hand), passing the node's
   ``method`` + the forward ``data``.  **Each module implements its own**
   :meth:`trace_token_lengths` — there is no generic default, because token

@@ -6,12 +6,12 @@ import torch
 from PIL import Image
 
 from tests.seed_omni.bagel.contracts.helpers import config_cls, model_cls
-from veomni.models.seed_omni.conversation import ConversationItem
 from veomni.models.seed_omni.modules.bagel.sources import (
     BAGEL_FLOW_VELOCITY,
     BAGEL_GENERATED_LATENT,
     BAGEL_VAE_CONTEXT,
 )
+from veomni.models.seed_omni.utils.conversation import ConversationItem
 
 
 def test_bagel_training_text_embed_meta_preserves_grad():

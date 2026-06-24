@@ -20,7 +20,7 @@ sys.path.insert(0, str(_REPO_ROOT))
 
 from veomni.arguments import OmniArguments, parse_omni_args  # noqa: E402
 from veomni.ops.batch_invariant_ops import set_batch_invariant_mode  # noqa: E402
-from veomni.trainer.omni_trainer import OmniTrainer  # noqa: E402
+from veomni.trainer.omni.omni_trainer import OmniTrainer  # noqa: E402
 from veomni.utils.device import get_torch_device  # noqa: E402
 
 

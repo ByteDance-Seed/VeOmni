@@ -7,9 +7,9 @@ from transformers import PreTrainedTokenizerBase
 
 from veomni.utils.tensor_utils import naflatten, unflatten
 
-from ....conversation import ConversationItem, is_dummy, iter_desired_items, maybe_merge_outputs
-from ....generation_graph import FSM_SIGNAL_KEY
-from ....module import CPUPreprocessor, post_forward, pre_forward
+from ....graphs.generation_graph import FSM_SIGNAL_KEY
+from ....mixins.modulemixin import CPUPreprocessor, post_forward, pre_forward
+from ....utils.conversation import ConversationItem, is_dummy, iter_desired_items, maybe_merge_outputs
 from ...base.text_encoder.modulemixin import TextEncoderModuleMixin
 from ..sources import BAGEL_FLOW_QUERY, BAGEL_SIGLIP_CONTEXT, BAGEL_VAE_CONTEXT
 from .processing import apply_image_marker, materialize_text_item_input_ids
@@ -72,6 +72,24 @@ class BagelTextEncoderModuleMixin(TextEncoderModuleMixin):
         self._start_token_id = self._resolve_token_id(tokenizer, token="<|im_start|>", fallback=self._eos_token_id)
         self._image_start_token_id = self._resolve_token_id(tokenizer, token="<|vision_start|>")
         self._image_end_token_id = self._resolve_token_id(tokenizer, token="<|vision_end|>")
+
+    @staticmethod
+    def _resolve_token_id(
+        tokenizer: PreTrainedTokenizerBase,
+        *,
+        token_id: int | None = None,
+        token: str | None = None,
+        fallback: int | None = None,
+    ) -> int:
+        if token_id is not None:
+            return int(token_id)
+        if token is not None:
+            resolved = tokenizer.convert_tokens_to_ids(token)
+            if resolved is not None and resolved != tokenizer.unk_token_id:
+                return int(resolved)
+        if fallback is not None:
+            return int(fallback)
+        raise ValueError(f"BAGEL tokenizer is missing required token: {token!r}.")
 
     def build_cpu_preprocessor(self) -> Optional[CPUPreprocessor]:
         """Worker-side tokenize for training batches."""

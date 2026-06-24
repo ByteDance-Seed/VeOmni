@@ -129,15 +129,23 @@ class TrainObservationMixin:
         whitelist: Mapping[tuple[str, str], frozenset[str]],
     ) -> dict[tuple[str, str], list[dict[str, Any]]]:
         observations: dict[tuple[str, str], list[dict[str, Any]]] = {}
-        for node, out in forward_result["outputs"].items():
-            record_module_output(observations, whitelist, state="train", node=node, out=out)
-            record_conversation_output(
-                observations,
-                whitelist,
-                state="train",
-                node=node,
-                conversation_list=out.get("conversation_list"),
-            )
+        outputs = forward_result.get("outputs")
+        if isinstance(outputs, Mapping):
+            for node, out in outputs.items():
+                record_module_output(observations, whitelist, state="train", node=node, out=out)
+                record_conversation_output(
+                    observations,
+                    whitelist,
+                    state="train",
+                    node=node,
+                    conversation_list=out.get("conversation_list"),
+                )
+            return observations
+
+        losses = forward_result.get("losses")
+        if not isinstance(losses, Mapping):
+            raise TypeError("V2 training graph observation result must contain either outputs or losses.")
+        self._record_v2_train_loss_observations(losses, observations, whitelist)
         return observations
 
     @staticmethod

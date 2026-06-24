@@ -5,7 +5,7 @@ from __future__ import annotations
 import torch
 from transformers import PreTrainedTokenizerBase
 
-from ....conversation import ConversationItem, is_dummy
+from ....utils.conversation import ConversationItem, is_dummy
 
 
 def materialize_text_item_input_ids(

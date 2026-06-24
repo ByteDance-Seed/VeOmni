@@ -7,9 +7,9 @@ import re
 import pytest
 
 from veomni.models.seed_omni import EdgeDef, NodeDef
-from veomni.models.seed_omni.generation_graph import GenerationGraph
-from veomni.models.seed_omni.graph import END
-from veomni.models.seed_omni.training_graph import TrainingGraph
+from veomni.models.seed_omni.graphs.generation_graph import GenerationGraph
+from veomni.models.seed_omni.graphs.graph import END
+from veomni.models.seed_omni.graphs.training_graph import TrainingGraph
 
 
 # ── NodeDef parsing ───────────────────────────────────────────────────────────
@@ -187,30 +187,133 @@ def test_module_lookup_raises_for_unknown():
         g.module_of("not_a_node")
 
 
-# ── collect_inputs ────────────────────────────────────────────────────────────
+# ── Execution lifecycle (cursor + step + maybe_transition) ────────────────────
 
 
-def test_collect_inputs_returns_raw_batch_copy():
-    """Topology-only edges: every node sees the same shared batch dict."""
-    g = TrainingGraph(edges=_janus_joint_edges())
-    raw_batch = {"conversation_list": {"hidden_states": "HID"}, "input_ids": "X"}
-    upstream = {"run_ar.forward": {"hidden_states": "SHOULD_NOT_ROUTE"}}
-    kwargs = g.collect_inputs("vq_decoder.gen_loss", upstream, raw_batch)
-    assert kwargs is not raw_batch
-    assert kwargs == raw_batch
-    assert kwargs["conversation_list"]["hidden_states"] == "HID"
+class _FakeOmniModule:
+    """Minimal stand-in for an OmniModule: callable (→ forward) + pre/post hooks.
+
+    ``__call__`` delegates to ``self.forward`` so the non-``forward`` alias trick
+    (``raw.forward = encode``) works exactly as on a real ``nn.Module``.
+    """
+
+    def __init__(self, name: str):
+        self.name = name
+
+    def pre_forward(self, method, **kwargs):
+        return kwargs
+
+    def post_forward(self, method, **outputs):
+        return outputs
+
+    def __call__(self, **kwargs):
+        return self.forward(**kwargs)
+
+    def forward(self, **kwargs):
+        cl = list(kwargs.get("conversation_list", []))
+        cl.append(f"{self.name}.forward")
+        return {"conversation_list": cl}
+
+    def encode(self, **kwargs):
+        cl = list(kwargs.get("conversation_list", []))
+        cl.append(f"{self.name}.encode")
+        return {"conversation_list": cl}
 
 
-def test_collect_inputs_ignores_upstream_outputs():
-    """Upstream node output dicts are not merged into kwargs — carrier holds cross-node state."""
+def _fake_modules(g: TrainingGraph) -> dict:
+    return {name: _FakeOmniModule(name) for name in {g.module_of(n) for n in g.execution_order}}
+
+
+def test_cursor_lifecycle():
     g = TrainingGraph(edges=_understanding_only_edges())
-    upstream = {
-        "vision_encoder.forward": {"image_embeds": "VIS"},
-        "vq_decoder.forward": {"gen_embeds": "GEN"},
-    }
-    kwargs = g.collect_inputs("run_ar.forward", upstream, {"input_ids": "X"})
-    assert kwargs == {"input_ids": "X"}
-    assert "und_image_embeds" not in kwargs
+    assert not g.is_done()
+    assert g.current_node_name == g.execution_order[0]
+    # Walk the cursor manually.
+    seen = []
+    while not g.is_done():
+        seen.append(g.current_node_name)
+        g.maybe_transition()
+    assert seen == g.execution_order
+    assert g.is_done()
+    with pytest.raises(RuntimeError, match="cursor past the last node"):
+        _ = g.current_node_name
+    g.reset()
+    assert not g.is_done() and g.current_node_name == g.execution_order[0]
+
+
+def test_step_loop_flows_carrier_in_topological_order():
+    """Driving step + maybe_transition mirrors OmniModel.forward; carrier accretes per node."""
+    g = TrainingGraph(edges=_understanding_only_edges())
+    modules = _fake_modules(g)
+    batch = {"conversation_list": []}
+    trace: list[str] = []
+    g.reset()
+    while not g.is_done():
+        batch = g.step(modules, batch, trace=trace)
+        g.maybe_transition(trace=trace)
+    # run_ar runs last; both encoders precede it.
+    assert batch["conversation_list"][-1] == "run_ar.forward"
+    assert set(batch["conversation_list"]) == {"vision_encoder.forward", "vq_decoder.forward", "run_ar.forward"}
+    assert [t for t in trace if t.startswith("forward:")] == [f"forward:{n}" for n in g.execution_order]
+
+
+def test_step_dispatches_non_forward_method_via_wrapper():
+    """A dotted ``module.encode`` node must run the module's ``encode`` (alias trick)."""
+    g = TrainingGraph(edges=[{"from": "vq_decoder.encode", "to": "end"}])
+    modules = _fake_modules(g)
+    batch = g.step(modules, {"conversation_list": []})
+    assert batch["conversation_list"] == ["vq_decoder.encode"]
+    # forward restored after the aliased call.
+    assert modules["vq_decoder"].forward.__name__ == "forward"
+
+
+def test_step_unwraps_ddp_style_wrapper():
+    """A wrapper without ``pre_forward`` is unwrapped via ``.module`` (DDP)."""
+
+    class _DDPWrap:
+        def __init__(self, inner):
+            self.module = inner
+
+        def __call__(self, **kwargs):
+            return self.module.forward(**kwargs)
+
+    g = TrainingGraph(edges=[{"from": "run_ar", "to": "end"}])
+    inner = _FakeOmniModule("run_ar")
+    batch = g.step({"run_ar": _DDPWrap(inner)}, {"conversation_list": []})
+    assert batch["conversation_list"] == ["run_ar.forward"]
+
+
+def test_step_applies_module_scope():
+    from contextlib import contextmanager
+
+    scoped: list[str] = []
+
+    @contextmanager
+    def scope_fn(name: str):
+        scoped.append(name)
+        yield
+
+    g = TrainingGraph(edges=[{"from": "run_ar", "to": "end"}])
+    g.step(_fake_modules(g), {"conversation_list": []}, scope_fn=scope_fn)
+    assert scoped == ["run_ar"]
+
+
+def test_step_merges_loss_into_batch():
+    class _LossModule(_FakeOmniModule):
+        def forward(self, **kwargs):
+            out = super().forward(**kwargs)
+            out["_loss"] = 1.5
+            return out
+
+    g = TrainingGraph(edges=[{"from": "run_ar", "to": "end"}])
+    batch = g.step({"run_ar": _LossModule("run_ar")}, {"conversation_list": []})
+    assert batch["_loss"] == 1.5
+
+
+def test_step_raises_for_missing_module():
+    g = TrainingGraph(edges=[{"from": "run_ar", "to": "end"}])
+    with pytest.raises(KeyError, match="missing from modules dict"):
+        g.step({}, {"conversation_list": []})
 
 
 # ── Mermaid visualisation ────────────────────────────────────────────────────
@@ -278,20 +381,3 @@ def test_generation_graph_mermaid_stacks_state_body_nodes():
     assert "flowchart LR" in out
     assert "subgraph state_prompt [prompt]\n        direction TB" in out
     assert "prompt__encoder_encode --> prompt__decoder_decode" in out
-
-
-# ── input_ids sequence helpers (HF generate alignment) ───────────────────────
-
-
-def test_append_input_ids_grows_sequence():
-    import torch
-
-    from veomni.models.seed_omni.graph import append_input_ids, is_step_input_ids, scalar_token_id
-
-    prompt = torch.tensor([[100, 101]], dtype=torch.long)
-    step = torch.tensor([[42]], dtype=torch.long)
-    full = append_input_ids(prompt, step)
-    assert full.tolist() == [[100, 101, 42]]
-    assert is_step_input_ids(step)
-    assert not is_step_input_ids(prompt)
-    assert scalar_token_id(full) == 42

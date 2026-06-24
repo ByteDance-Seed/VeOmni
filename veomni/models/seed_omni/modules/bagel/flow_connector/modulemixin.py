@@ -6,9 +6,9 @@ from typing import Any
 
 import torch
 
-from ....conversation import ConversationItem, is_dummy, iter_desired_items
-from ....generation_graph import FSM_SIGNAL_KEY
-from ....module import ModuleMixin, post_forward, pre_forward
+from ....graphs.generation_graph import FSM_SIGNAL_KEY
+from ....mixins.modulemixin import ModuleMixin, post_forward, pre_forward
+from ....utils.conversation import ConversationItem, is_dummy, iter_desired_items
 from ..sources import (
     BAGEL_FLOW_HIDDEN,
     BAGEL_FLOW_QUERY,

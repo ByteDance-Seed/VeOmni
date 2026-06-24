@@ -12,9 +12,9 @@ from tests.seed_omni.parity_suite.v2.observation import (
     capture_forward_outputs,
     record_conversation_output,
 )
-from veomni.models.seed_omni.conversation import ConversationItem
-from veomni.models.seed_omni.generation_graph import GenerationGraph
-from veomni.models.seed_omni.module import ModuleMixin
+from veomni.models.seed_omni.graphs.generation_graph import GenerationGraph
+from veomni.models.seed_omni.mixins.modulemixin import ModuleMixin
+from veomni.models.seed_omni.utils.conversation import ConversationItem
 
 
 class _ToyMixinModule(ModuleMixin):

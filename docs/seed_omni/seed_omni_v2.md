@@ -45,7 +45,7 @@ flowchart LR
 
 Every sub-model multi-inherits a family-specific ``*ModuleMixin`` and a real
 HuggingFace / diffusers model.  Shared defaults live in
-:class:`~veomni.models.seed_omni.module.ModuleMixin`; per-module train/infer
+:class:`~veomni.models.seed_omni.mixins.modulemixin.ModuleMixin`; per-module train/infer
 logic lives in ``modules/<family>/<sub>/modulemixin.py``:
 
 ```python
@@ -54,7 +54,7 @@ class JanusLlama(JanusLlamaModuleMixin, PreTrainedModel): ...
 ```
 
 Construction chain: ``super().__init__(config)`` → ``PreTrainedModel`` +
-:meth:`~veomni.models.seed_omni.module.ModuleMixin.init_omni_state`, then
+:meth:`~veomni.models.seed_omni.mixins.modulemixin.ModuleMixin.init_omni_state`, then
 build submodules in ``modeling.py`` and call ``self.post_init()`` for HF
 weight init.  Core ``forward`` stays in ``modeling.py``; graph hooks
 (``pre_forward``, ``generate``, …) stay in ``modulemixin.py``.
@@ -74,7 +74,7 @@ The mixins expose **optional hooks** with safe defaults:
 | `dummy_inputs(...)` | training | zero placeholders to keep FSDP aligned |
 | `trace_add(...)` / `trace_collect(...)` | training | **optional** per-module token + theoretical-FLOPs meter (`TraceMixin`; driven by the module-trainer, not `pre_forward`) |
 
-#### Optional per-module trace (`tracemixin.py`, `TraceMixin`)
+#### Optional per-module trace (`mixins/tracemixin.py`, `TraceMixin`)
 
 `OmniModel` has no single `model_type` to estimate FLOPs on, so **FLOPs / MFU
 accounting is per-module and opt-in**. The per-module meter is the optional
@@ -93,10 +93,9 @@ token, an image patch, or a VQ token — the mixin does not distinguish modaliti
 A module only ever produces **time-independent** quantities (tokens + theoretical
 FLOPs); all timing / MFU lives at the orchestrator.
 
-Execution is driven by the module-trainer (not the module's `pre_forward`). The
-training graph dispatches every node through
-`OmniModuleTrainer.forward(method, **kwargs)`
-(`OmniModel.set_node_executors(...)`), which:
+Execution is driven by the model itself (not the module's `pre_forward`).
+`OmniModel.forward` loops the FSM (`TrainingGraph.step` → `_collect_training_loss`
+→ `maybe_transition`), and `TrainingGraph.step` runs one node end-to-end, which:
 
 1. runs the module's `pre_forward` → real input tensors;
 2. feeds the meter `trace_add(method, data)` — the analogue of `EnvironMeter.add`.
@@ -143,7 +142,7 @@ micro-batch; it does **not** cascade to module-trainers. There is **no
 image-seqlens concept** anywhere. Modules that don't implement the trace hooks
 contribute nothing.
 
-### 2.2 `ConversationItem` — the data carrier (`conversation.py`)
+### 2.2 `ConversationItem` — the data carrier (`utils/conversation.py`)
 
 There are **no per-field data channels** between modules. Instead, a single
 mutable list is threaded through every call. One element:
@@ -174,7 +173,7 @@ micro-batch that lacks its modality (e.g. a text-only sample has no image). The
 backbone skips dummy rows when packing but folds a `+ value.mean()*0.0` anchor
 so FSDP gradient-sync stays aligned across ranks.
 
-### 2.3 Two graph views (`graph.py`, `training_graph.py`, `generation_graph.py`)
+### 2.3 Two graph views (`graphs/graph.py`, `graphs/training_graph.py`, `graphs/generation_graph.py`)
 
 There is **no shared `nodes` / `edges` pool**. Both views are written as plain
 lists of **edges** (`{from, to}`), and each endpoint is a self-describing
@@ -236,18 +235,20 @@ What each node does to the shared carrier:
 5. **`janus_text_encoder.decode`** / **`janus_vqvae.decode`** — read hidden
    states + labels off the carrier and each return one `_loss`.
 
-The runtime loop (simplified from `OmniModel.forward`):
+The runtime loop (simplified from `OmniModel.forward` + `TrainingGraph.step`,
+which mirrors `OmniModel.generate` + `GenerationGraph.step`):
 
 ```python
-for node in training_graph.execution_order:
-    module = getattr(self, training_graph.module_of(node))
-    kwargs = training_graph.collect_inputs(node, ...)   # shallow copy of batch
-    kwargs = module.pre_forward(method, **kwargs)       # read conversation_list
-    out    = module(**kwargs)                            # through FSDP wrapper
-    out    = module.post_forward(method, **out)          # write conversation_list back
-    batch["conversation_list"] = out["conversation_list"]  # carrier flows on
-    if "_loss" in out: losses[node] = out["_loss"]
-total_loss = sum(losses.values())
+training_graph.reset()
+while not training_graph.is_done():
+    # TrainingGraph.step runs the current node end-to-end: unwrap the wrapped
+    # sub-module (held by OmniModel), scope its ParallelState, pre_forward →
+    # call (through the FSDP/DDP wrapper) → post_forward, merge conversation_list
+    # + _loss back into the shared batch (edges are topology only, no input routing).
+    batch = training_graph.step(modules, batch, trace, scope_fn)
+    self._collect_training_loss(batch, trace)   # pop _loss → self._losses[node]
+    training_graph.maybe_transition()
+total_loss = sum(self._losses.values())
 ```
 
 **Dummy forward (training only):** every active node must run on every
@@ -386,15 +387,17 @@ Use the `/seedomni-v2` skill for the full checklist. The shape of the work:
 
 | Path | Responsibility |
 |------|----------------|
-| `module.py` | base `ModuleMixin` (shared hook defaults + `init_omni_state`) |
-| `conversation.py` | `ConversationItem` + carrier helpers |
-| `graph.py` | shared `NodeDef` / `EdgeDef` / `END` |
-| `training_graph.py` | DAG view (topological forward order) |
-| `generation_graph.py` | FSM view (states / transitions / signals) |
+| `mixins/modulemixin.py` | base `ModuleMixin` (shared hook defaults + `init_omni_state`) |
+| `mixins/tracemixin.py` | `TraceMixin` / `TraceResult` (optional per-module FLOPs meter) |
+| `utils/conversation.py` | `ConversationItem` + carrier helpers |
+| `utils/convert_registry.py` | HF → split-checkpoint conversion registry |
+| `graphs/graph.py` | shared `NodeDef` / `EdgeDef` / `END` |
+| `graphs/training_graph.py` | DAG view (topological forward order) |
+| `graphs/generation_graph.py` | FSM view (states / transitions / signals) |
 | `configuration_omni.py` | parse + merge the YAML into `OmniConfig` |
 | `modeling_omni.py` | `OmniModel` runtime (train DAG + infer FSM + loss sum) |
 | `modules/<family>/<sub>/` | per-module `configuration.py`, `modulemixin.py`, `modeling.py` [, `processing.py`] |
-| `veomni/trainer/omni_trainer.py` | build + FSDP-wrap modules, drive the loop |
-| `veomni/trainer/omni_inferencer.py` | request loop, `reset` + `finalize` |
+| `veomni/trainer/omni/omni_trainer.py` | build + FSDP-wrap modules, drive the loop |
+| `veomni/trainer/omni/omni_inferencer.py` | request loop, `reset` + `finalize` |
 | `configs/seed_omni/<model>/` | `base.yaml` + `modules_train.yaml` + `graph_train.yaml` (+ `modules_infer.yaml` / `graph_infer_*.yaml`) |
 ```

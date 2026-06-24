@@ -1,27 +1,43 @@
 """Janus chat template as readable Python (mirrors ``chat_template.jinja``).
 
-Training flow
--------------
-1. :func:`apply_janus_chat_template` — insert bos / (optional) system / role
-   markers / boi–image–eoi spans; set ``meta["loss_mask"]`` on template rows
-   that differ from the default ``int(role == "assistant")``.
-2. :func:`render_template_string` — concatenate the human-readable wire string.
-3. Text encoder tokenizes (token ids in ``value``), merges adjacent text, then packs text rows.
-4. :func:`pack_text_input_ids` — ``list[Tensor]`` of per-text-row token ids (for ``naflatten``).
+:class:`JanusChatTemplate` subclasses
+:class:`~veomni.models.seed_omni.modules.base.text_encoder.chat_template.TextEncoderChatTemplate`
+and overrides only the Janus-specific templating:
+
+1. :meth:`JanusChatTemplate.apply_chat_template` — insert bos / (optional) system
+   / role markers / boi–image–eoi spans; set ``meta["loss_mask"]`` on template
+   rows that differ from the default ``int(role == "assistant")``.
+2. :meth:`JanusChatTemplate.render_template_string` — concatenate the
+   human-readable wire string (debug / demo only).
+
+Tokenize / merge / pack are inherited from the base template; the text encoder
+runs ``apply_chat_template`` → ``tokenize`` → ``merge_text_embeds`` → ``pack_input_ids``.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING
 
-import torch
+from ....utils.conversation import ConversationItem
+from ...base.text_encoder.chat_template import TextEncoderChatTemplate
 
-from ....conversation import ConversationItem
 
+if TYPE_CHECKING:
+    from transformers import PreTrainedTokenizer
 
 # Upstream Jinja emits this literal for ``content['type'] == 'image'``.
 IMAGE_PLACEHOLDER = "<image_placeholder>"
+
+# Janus chat-template defaults (mirror the upstream Jinja system preamble + role markers).
+_JANUS_SYSTEM_PROMPT = (
+    "You are a helpful language and vision assistant. "
+    "You are able to understand the visual content that the user provides, "
+    "and assist the user with a variety of tasks using natural language."
+    "\n\n"
+)
+_JANUS_USER_PREFIX = "<|User|>: "
+_JANUS_ASSISTANT_PREFIX = "\n\n<|Assistant|>:"
 
 
 @dataclass(frozen=True)
@@ -32,137 +48,113 @@ class JanusChatMarkers:
     eos_token: str
     boi_token: str
     eoi_token: str
-    system_prompt: str
-    user_prefix: str
-    assistant_prefix: str
+    system_prompt: str = _JANUS_SYSTEM_PROMPT
+    user_prefix: str = _JANUS_USER_PREFIX
+    assistant_prefix: str = _JANUS_ASSISTANT_PREFIX
 
 
-def _template_item(
-    item_type: str,
-    value: Any,
-    role: str,
-    *,
-    loss_mask: int | None = None,
-    meta: dict | None = None,
-) -> ConversationItem:
-    """Build one conversation row; ``text`` rows always get ``meta["loss_mask"]``."""
-    part_meta = dict(meta or {})
-    if item_type == "text":
-        part_meta["loss_mask"] = int(role == "assistant") if loss_mask is None else int(loss_mask)
-    return ConversationItem(type=item_type, value=value, role=role, meta=part_meta)
+class JanusChatTemplate(TextEncoderChatTemplate):
+    chat_markers: JanusChatMarkers
 
+    def __init__(self, tokenizer: PreTrainedTokenizer):
+        chat_markers = JanusChatMarkers(
+            bos_token=tokenizer.bos_token,
+            eos_token=tokenizer.eos_token,
+            boi_token=tokenizer.boi_token,
+            eoi_token=tokenizer.eoi_token,
+            system_prompt=_JANUS_SYSTEM_PROMPT,
+            user_prefix=_JANUS_USER_PREFIX,
+            assistant_prefix=_JANUS_ASSISTANT_PREFIX,
+        )
+        self.tokenizer = tokenizer
+        self.chat_markers = chat_markers
+        self.bos_token_id = int(tokenizer.bos_token_id)
+        self.eos_token_id = int(tokenizer.eos_token_id)
+        self.boi_token_id = int(tokenizer.boi_token_id)
+        self.eoi_token_id = int(tokenizer.eoi_token_id)
+        self.pad_token_id = int(tokenizer.pad_token_id)
 
-def sample_has_user_image(sample: list[ConversationItem]) -> bool:
-    """Return True when the raw conversation includes a user ``image`` row."""
-    return any(item.type == "image" and item.role == "user" for item in sample)
+    def apply_chat_template(self, sample: list[ConversationItem]) -> list[ConversationItem]:
+        """Apply Janus chat template to a raw conversation (text + image parts).
 
+        User and assistant images both use explicit ``<boi>`` … ``<eoi>`` text
+        rows bracketing a sibling ``image`` row (SigLIP patch embeds).  No
+        ``<image_placeholder>`` text row — nothing in the inference graph
+        tokenises or embeds that literal.
+        """
+        out: list[ConversationItem] = []
+        dummy_parts: list[ConversationItem] = []  # dummy from other modules
+        out.append(self._build_conversation_item("text", self.chat_markers.bos_token, "user"))
+        # HF Janus ``task != "gen"`` prepends the default system prompt for I2T.
+        # TODO: shared by training + inference.  Official Janus I2T prepends the VL
+        # system preamble; T2I does not.  Current micro-batches are either pure I2T
+        # (user image present) or pure T2I (text-only user turn) — use that as a
+        # proxy.  Ideally every sample would carry an explicit system row upstream.
+        if self._sample_has_user_image(sample):
+            out.append(self._build_conversation_item("text", self.chat_markers.system_prompt, "user"))
+        prev_role: str | None = None
+        prev_was_user_image = (
+            False  # True after a user image; prepend \n to the next user text (HF Jinja same-turn layout).
+        )
+        for item in sample:
+            role = item.role
+            if role != prev_role:
+                if role == "user":
+                    out.append(self._build_conversation_item("text", self.chat_markers.user_prefix, "user"))
+                elif role == "assistant":
+                    out.append(
+                        self._build_conversation_item(
+                            type="text",
+                            value=self.chat_markers.assistant_prefix,
+                            role="assistant",
+                            loss_mask=0,
+                        )
+                    )
+                prev_role = role
+                prev_was_user_image = False
 
-def apply_janus_chat_template(
-    sample: list[ConversationItem],
-    markers: JanusChatMarkers,
-) -> list[ConversationItem]:
-    """Apply Janus chat template to a raw conversation (text + image parts).
+            if item.type == "text":
+                text = str(item.value)
+                if prev_was_user_image and role == "user" and not text.startswith("\n"):
+                    text = "\n" + text
+                out.append(self._build_conversation_item("text", text, role))
+                prev_was_user_image = False
+            elif item.type == "image" and role != "dummy":
+                out.append(self._build_conversation_item("text", self.chat_markers.boi_token, role))
+                out.append(item)  # media row passed through verbatim (keeps value/source/meta)
+                out.append(self._build_conversation_item("text", self.chat_markers.eoi_token, role))
+                prev_was_user_image = role == "user"
+            elif role == "dummy":
+                dummy_parts.append(item)
+            else:
+                raise ValueError(f"Unsupported part type: {item.type}")
+        if prev_role == "assistant":
+            out.append(self._build_conversation_item("text", self.chat_markers.eos_token, "assistant"))
+        out.extend(dummy_parts)
+        return out
 
-    User and assistant images both use explicit ``<boi>`` … ``<eoi>`` text
-    rows bracketing a sibling ``image`` row (SigLIP patch embeds).  No
-    ``<image_placeholder>`` text row — nothing in the inference graph
-    tokenises or embeds that literal.
-    """
-    out: list[ConversationItem] = []
-    dummy_parts: list[ConversationItem] = []  # dummy from other modules
-    out.append(_template_item("text", markers.bos_token, "user"))
-    # HF Janus ``task != "gen"`` prepends the default system prompt for I2T.
-    # TODO: shared by training + inference.  Official Janus I2T prepends the VL
-    # system preamble; T2I does not.  Current micro-batches are either pure I2T
-    # (user image present) or pure T2I (text-only user turn) — use that as a
-    # proxy.  Ideally every sample would carry an explicit system row upstream.
-    if sample_has_user_image(sample):
-        out.append(_template_item("text", markers.system_prompt, "user"))
-    prev_role: str | None = None
-    prev_was_user_image = (
-        False  # True after a user image; prepend \n to the next user text (HF Jinja same-turn layout).
-    )
-    for item in sample:
-        role = item.role
-        if role != prev_role:
-            if role == "user":
-                out.append(_template_item("text", markers.user_prefix, "user"))
-            elif role == "assistant":
-                out.append(_template_item("text", markers.assistant_prefix, "assistant", loss_mask=0))
-            prev_role = role
-            prev_was_user_image = False
+    def apply_generation_prompt(self, sample: list[ConversationItem]) -> list[ConversationItem]:
+        """Append the assistant generation prefix to a templated prompt (inference)."""
+        out = list(sample)
+        out.append(self._build_conversation_item("text", self.chat_markers.assistant_prefix, "assistant", loss_mask=0))
+        return out
 
-        if item.type == "text":
-            text = str(item.value)
-            if prev_was_user_image and role == "user" and not text.startswith("\n"):
-                text = "\n" + text
-            out.append(_template_item("text", text, role))
-            prev_was_user_image = False
-        elif item.type == "image" and role != "dummy":
-            out.append(_template_item("text", markers.boi_token, role))
-            out.append(_template_item("image", item.value, role, meta=dict(item.meta)))
-            out.append(_template_item("text", markers.eoi_token, role))
-            prev_was_user_image = role == "user"
-        elif role == "dummy":
-            dummy_parts.append(item)
-        else:
-            raise ValueError(f"Unsupported part type: {item.type}")
-    if prev_role == "assistant":
-        out.append(_template_item("text", markers.eos_token, "assistant"))
-    out.extend(dummy_parts)
-    return out
+    def render_template_string(self, parts: list[ConversationItem]) -> str:
+        """
+        For debug or demo.
+            Build the on-the-wire prompt string (Jinja-visible layout).
+        """
+        chunks: list[str] = []
+        for part in parts:
+            if part.type == "text":
+                chunks.append(str(part.value or ""))
+            elif part.type == "image":
+                chunks.append(IMAGE_PLACEHOLDER)
+            else:
+                raise ValueError(f"Unsupported part type: {part.type}")
+        return "".join(chunks)
 
-
-def render_template_string(parts: list[ConversationItem]) -> str:  # for debug or demo
-    """Build the on-the-wire prompt string (Jinja-visible layout)."""
-    chunks: list[str] = []
-    for part in parts:
-        if part.type == "text":
-            chunks.append(str(part.value or ""))
-        elif part.type == "image":
-            chunks.append(IMAGE_PLACEHOLDER)
-        else:
-            raise ValueError(f"Unsupported part type: {part.type}")
-    return "".join(chunks)
-
-
-def pack_text_input_ids(parts: list[ConversationItem]) -> list[torch.Tensor]:
-    """Collect ``type='text'`` token-id tensors (``value``); one tensor per text row."""
-    return [part.value for part in parts if part.type == "text"]
-
-
-def tokenize_template_parts(
-    parts: list[ConversationItem],
-    tokenizer: Any,
-    device: Any = None,
-) -> None:
-    """Tokenize each ``text`` part in place: ``str`` value → token-id tensor.
-
-    Builds tensors on ``device`` (default ``None`` = CPU, used by the worker-side
-    preprocessor so no CUDA is touched; the in-module fallback passes the module
-    device). Sets ``meta['labels']`` (``-100`` where ``loss_mask`` is 0) and
-    ``meta['attention_mask']``.
-    """
-    for part in parts:
-        if part.type == "text":
-            text = part.value
-            loss_mask = int(part.meta.pop("loss_mask"))
-            input_ids = tokenizer(text, add_special_tokens=False)["input_ids"]
-            labels = input_ids if loss_mask else [-100] * len(input_ids)
-            part.value = torch.tensor(input_ids, device=device, dtype=torch.long)
-            part.meta["labels"] = torch.tensor(labels, device=device, dtype=torch.long)
-            part.meta["attention_mask"] = torch.ones(len(input_ids), dtype=torch.long, device=device)
-
-
-def merge_consecutive_text_parts(parts: list[ConversationItem]) -> list[ConversationItem]:
-    """Merge adjacent same-role ``text`` parts (concat ids / labels / mask)."""
-    merged: list[ConversationItem] = []
-    for part in parts:
-        if merged and merged[-1].type == "text" and part.type == "text" and merged[-1].role == part.role:
-            prev = merged[-1]
-            prev.value = torch.cat([prev.value, part.value])
-            prev.meta["labels"] = torch.cat([prev.meta["labels"], part.meta["labels"]])
-            prev.meta["attention_mask"] = torch.cat([prev.meta["attention_mask"], part.meta["attention_mask"]])
-            continue
-        merged.append(part)
-    return merged
+    @staticmethod
+    def _sample_has_user_image(sample: list[ConversationItem]) -> bool:
+        """Return True when the raw conversation includes a user ``image`` row."""
+        return any(item.type == "image" and item.role == "user" for item in sample)

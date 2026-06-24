@@ -36,7 +36,6 @@ from tests.seed_omni.parity_suite.v2.tier_runners.framework_support import (
     build_minimal_omni_trainer,
     build_multi_optimizer,
     build_multi_scheduler,
-    build_trainer_node_executors,
     find_free_port,
     framework_report,
     policy_output_dir,
@@ -47,7 +46,8 @@ from tests.seed_omni.parity_suite.v2.tier_runners.framework_support import (
 from veomni.models.seed_omni.modeling_omni import OmniModel
 from veomni.trainer.base import BaseTrainer
 from veomni.trainer.callbacks import TrainerState
-from veomni.trainer.omni_trainer import OmniGlobalStateCallback, OmniModuleDcpCallback, OmniTrainer
+from veomni.trainer.omni.omni_module_trainer import OmniModuleDcpCallback
+from veomni.trainer.omni.omni_trainer import OmniGlobalStateCallback, OmniTrainer
 from veomni.utils.device import get_dist_comm_backend, get_torch_device
 
 
@@ -610,7 +610,7 @@ def run_launcher_smoke(
 ) -> dict[str, Any]:
     """Exercise the training launcher path with a recipe-backed trainer stub."""
 
-    import veomni.trainer.omni_trainer as omni_trainer_module
+    import veomni.trainer.omni.omni_trainer as omni_trainer_module
 
     report: dict[str, Any] = {"train_called": False}
     lr = 1.0e-4
@@ -621,7 +621,6 @@ def run_launcher_smoke(
             self.args = args
             model = driver.load_v2_model(device=device, dtype=dtype).train()
             driver.configure_determinism(driver.case.model.seed)
-            model.set_node_executors(build_trainer_node_executors(model))
             self.trainer = build_minimal_omni_trainer(model, device=device, dtype=dtype)
             self.trainer.base.args.train.optimizer = SimpleNamespace(max_grad_norm=max_grad_norm)
             self.trainer.base.state = SimpleNamespace(global_step=0)

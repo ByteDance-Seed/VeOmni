@@ -22,7 +22,7 @@ from tests.seed_omni.parity_suite.core import configure_torch_determinism, to_de
 from tests.seed_omni.parity_suite.core.config.probes import ProbeCatalog, load_probe_catalog  # noqa: E402
 from tests.seed_omni.parity_suite.v2.observation import arm_generation_observer  # noqa: E402
 from veomni.arguments import OmniArguments, parse_omni_args  # noqa: E402
-from veomni.trainer.omni_inferencer import OmniInferencer  # noqa: E402
+from veomni.trainer.omni.omni_inferencer import OmniInferencer  # noqa: E402
 
 
 def _env_path(name: str) -> Path:

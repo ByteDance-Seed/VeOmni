@@ -4,7 +4,7 @@ OmniModel V2 — composable multi-modal model driven by config-specified graphs.
 This file holds the *minimal* runtime — graph traversal for training, FSM
 walk for inference, and a single ``_loss`` aggregation step.  It deliberately
 contains **no** build / weight-loading / FSDP wiring; that lives in
-:class:`~veomni.trainer.omni_trainer.OmniTrainer`, which builds and
+:class:`~veomni.trainer.omni.omni_trainer.OmniTrainer`, which builds and
 FSDP-wraps each module independently and attaches them to :class:`OmniModel`.
 
 Architecture
@@ -36,23 +36,19 @@ micro-batch sizes differ across modules).
 
 Training
 --------
-For each node in ``training_graph.execution_order``:
+``forward(**batch)`` walks the DAG one node at a time, fully symmetric with
+:meth:`generate` (it resets the graph cursor at entry — each forward is
+independent):
 
-  1. Look up the ModuleMixin via ``training_graph.module_of(node)``.
-  2. ``training_graph.collect_inputs(node, outputs, batch)`` returns a shallow
-     copy of the shared ``batch`` (which carries the mutable
-     ``conversation_list``).  Edges declare execution order only — they do
-     **not** route per-field values; modules read and mutate
-     ``conversation_list`` in place.
-  3. Dispatch on ``training_graph.method_of(node)``:
-       * ``forward`` → call the (possibly FSDP-wrapped) module so backward
-         hooks fire correctly.
-       * any other  → call ``getattr(module, method)`` directly (FSDP2 with
-         DTensor params handles partial-param-use transparently).
-  4. Store the output dict under the node name.  If it carries ``_loss``,
-     accumulate.
+  * ``batch = training_graph.step(modules, batch)`` — run the node at the cursor
+    (``pre_forward`` → method → ``post_forward``, every method routed through the
+    module's ``__call__`` so FSDP2/DDP hooks fire). Edges declare execution order
+    only — no per-field routing; every node receives the same shared ``batch``
+    and reads / mutates the ``conversation_list`` carrier in place.
+  * ``_collect_training_loss(batch)`` — drain the node's optional ``_loss``.
+  * ``training_graph.maybe_transition()`` — advance the cursor.
 
-Returns ``{"loss": scalar_or_None, "losses": {node: scalar}, "outputs": {node: dict}}``.
+Returns ``{"loss": scalar_or_None, "losses": {node: scalar}}``.
 
 Inference
 ---------
@@ -81,22 +77,21 @@ handled by the logger.
 """
 
 from contextlib import nullcontext
-from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Mapping, Optional, Tuple
 
-import torch
 import torch.nn as nn
 
 from ...distributed.parallel_state import use_parallel_state
 from ...utils import helper
 from .configuration_omni import OmniConfig
-from .generation_graph import GenerationGraph
-from .module import ModuleMixin
-from .training_graph import TrainingGraph
+from .graphs.generation_graph import GenerationGraph
+from .graphs.training_graph import TrainingGraph
+from .mixins.modulemixin import ModuleMixin
 
 
 logger = helper.create_logger(__name__)
 
-
+# Must match the ``_loss`` key every OmniModule's ``post_forward`` emits.
 _LOSS_KEY = "_loss"
 
 
@@ -180,15 +175,6 @@ class OmniModel(nn.Module):
             GenerationGraph(fsm_config=config.generation_graph) if config.has_generation_graph() else None
         )
 
-        # Optional per-node executors injected by the trainer.  When set, the
-        # training graph dispatches each node's pre_forward → method → post_forward
-        # through ``self._node_executors[module_name](method, **kwargs)`` (the
-        # OmniModuleTrainer's ``forward``, which also drives the per-module trace
-        # meter) instead of running it inline.  ``None`` ⇒ inline default — keeps
-        # the runtime importable / runnable in torch-free, trainer-free contexts
-        # (the print-flow tests, inference).
-        self._node_executors: Optional[Dict[str, Callable[..., Dict[str, Any]]]] = None
-
         # Last FSM state printed by :meth:`_emit_progress` — its private
         # dedup cursor (reset on each fresh ``generate`` run).
         self._last_printed_state: Optional[str] = None
@@ -196,6 +182,11 @@ class OmniModel(nn.Module):
         # ``ctx["generated"] = {type, value}`` payloads — drained into this
         # list and never persisted back onto ``ctx``.
         self._generated: List[Dict[str, Any]] = []
+
+        # Per-``forward`` training losses, ``{node_name: scalar}`` — drained from
+        # each node's ``batch["_loss"]`` by ``_collect_training_loss`` (the
+        # training analogue of ``_generated`` / ``_collect_generated``).
+        self._losses: Dict[str, Any] = {}
 
         # ``{module_name: ParallelState}`` — set by the trainer so each node's
         # forward runs under its module's own device mesh / extra-parallel
@@ -232,7 +223,7 @@ class OmniModel(nn.Module):
     def set_module_parallel_states(self, module_parallel_states: Mapping[str, Any]) -> None:
         """Register ``{module_name: ParallelState}`` for per-node forward scoping.
 
-        Called by :class:`~veomni.trainer.omni_trainer.OmniTrainer` after the
+        Called by :class:`~veomni.trainer.omni.omni_trainer.OmniTrainer` after the
         modules are built so each node's pre/forward/post runs under its own
         module's device mesh / extra-parallel groups — needed when modules use
         different parallelism (e.g. a vocab-parallel ``emb`` embedding whose
@@ -253,16 +244,20 @@ class OmniModel(nn.Module):
 
     # ── Training ──────────────────────────────────────────────────────────────
 
-    def set_node_executors(self, executors: Optional[Mapping[str, Callable[..., Dict[str, Any]]]]) -> None:
-        """Install per-module node executors (called by :class:`OmniTrainer`).
+    def _collect_training_loss(self, batch: Dict[str, Any], trace: Optional[List[str]] = None) -> None:
+        """Drain ``batch["_loss"]`` for the just-stepped node into :attr:`_losses`.
 
-        ``executors`` maps ``module_name → callable(method, **kwargs) -> dict``.
-        The training graph then routes each node through its module's executor
-        (the ``OmniModuleTrainer.forward``, which wraps pre_forward / method /
-        post_forward and drives the per-module trace meter).  Pass ``None`` to
-        restore the inline default.
+        The training analogue of :meth:`_collect_generated`: the node's
+        ``post_forward`` merges an optional scalar ``_loss`` into the carrier;
+        we pop it (so it never leaks to the next node) and key it by the node
+        that produced it for per-node logging.
         """
-        self._node_executors = dict(executors) if executors is not None else None
+        loss = batch.pop(_LOSS_KEY, None)
+        if loss is not None:
+            node = self.training_graph.current_node_name
+            self._losses[node] = loss
+            if trace is not None:
+                trace.append(f"loss:{node}")
 
     def forward(
         self,
@@ -272,8 +267,12 @@ class OmniModel(nn.Module):
     ) -> Dict[str, Any]:
         """Execute the training DAG once over the full ``batch``.
 
-        Each module is invoked exactly once and is responsible for any
-        internal micro-batch chunking (token-mean reduction included).
+        Fully symmetric with :meth:`generate`: walk the graph one node at a time
+        — ``step`` runs the node at the cursor, ``_collect_training_loss`` drains
+        its ``_loss``, ``maybe_transition`` advances the cursor — until
+        ``is_done()``. Each module is invoked exactly once and owns its internal
+        micro-batch chunking (token-mean reduction included). The wrapped
+        sub-modules are passed to ``step`` so it can fire the FSDP2/DDP hooks.
 
         Parameters
         ----------
@@ -289,8 +288,6 @@ class OmniModel(nn.Module):
         * ``"loss"``    : scalar tensor (sum of all node ``_loss`` values),
                           or ``None`` if no node emitted a loss.
         * ``"losses"``  : ``{node_name: scalar tensor}``.
-        * ``"outputs"`` : ``{node_name: full output dict}`` as returned by
-                          each node's ``post_forward``.
         """
         if self.training_graph is None:
             raise RuntimeError(
@@ -298,56 +295,16 @@ class OmniModel(nn.Module):
                 "(inference-only). Use `generate` instead, or load a training YAML."
             )
 
-        node_outputs: Dict[str, Dict[str, Any]] = {}
-        losses: Dict[str, torch.Tensor] = {}
+        self.training_graph.reset()
+        self._losses.clear()
+        modules = {name: getattr(self, name) for name in self._module_names}
 
-        for node_name in self.training_graph.execution_order:
-            module_name = self.training_graph.module_of(node_name)
-            method = self.training_graph.method_of(node_name)
+        while not self.training_graph.is_done():
+            batch = self.training_graph.step(modules, batch, trace=trace, scope_fn=self._module_scope)
+            self._collect_training_loss(batch, trace)
+            self.training_graph.maybe_transition(trace=trace)
 
-            kwargs = self.training_graph.collect_inputs(node_name, node_outputs, batch)
-
-            # The training-graph path runs through the trainer-injected per-module
-            # executor (``OmniModuleTrainer.forward``: pre_forward → method →
-            # post_forward + per-module trace meter) when available.  When no
-            # executors are registered (print-flow tests, trainer-free contexts),
-            # fall back to inline pre/forward/post.  Inference never reaches here
-            # — it goes through ``generate`` / the generation graph.
-            #
-            # Scope each node to its module's ParallelState so the free function
-            # ``get_parallel_state()`` (read inside pre/forward/post — e.g. the
-            # vocab-parallel ``emb`` embedding all-reduce, MoE EP groups) resolves
-            # to this module's mesh. No-op when no per-module states are registered.
-            executor = None if self._node_executors is None else self._node_executors.get(module_name)
-            with self._module_scope(module_name):
-                if executor is None:
-                    module = getattr(self, module_name)
-                    call_kwargs = module.pre_forward(method, **kwargs)
-                    fn = module if method == "forward" else getattr(module, method)
-                    outputs = fn(**call_kwargs)
-                    out = module.post_forward(method, **outputs)
-                else:
-                    out = executor(method, **kwargs)
-
-            node_outputs[node_name] = out
-
-            # V2 segment-driven carrier: the single ``conversation_list`` object
-            # is mutated/replaced in place as it flows
-            # through the training graph. Write it
-            # back into the shared batch so downstream nodes read the evolving
-            # carrier directly — edges are pure ``{from, to}`` topology.
-            convo = out.get("conversation_list")
-            if convo is not None:
-                batch["conversation_list"] = convo
-
-            if _LOSS_KEY in out:
-                losses[node_name] = out[_LOSS_KEY]
-
-            if trace is not None:
-                trace.append(f"forward:{node_name}")
-
-        total = _sum_losses(losses)
-        return {"loss": total, "losses": losses, "outputs": node_outputs}
+        return {"loss": _sum_losses(self._losses), "losses": dict(self._losses)}
 
     # ── Inference ─────────────────────────────────────────────────────────────
 
@@ -527,7 +484,7 @@ class OmniModel(nn.Module):
         """Collect per-module assets (vision/audio processors, codebooks).
 
         Tokenizers (e.g. ``janus_text_encoder``) are module-owned assets assigned
-        on ``_tokenizer`` by :class:`~veomni.trainer.omni_trainer.OmniModuleTrainer`.
+        on ``_tokenizer`` by :class:`~veomni.trainer.omni.omni_module_trainer.OmniModuleTrainer`.
         """
         assets: List[Any] = []
         for _, raw in self.named_omni_modules():
@@ -555,8 +512,11 @@ def _is_omni_module(mod: nn.Module) -> bool:
     return isinstance(mod, ModuleMixin)
 
 
-def _sum_losses(losses: Mapping[str, torch.Tensor]) -> Optional[torch.Tensor]:
-    """Sum a per-node ``{name: scalar}`` dict into one scalar (or ``None``)."""
+def _sum_losses(losses: Dict[str, Any]) -> Optional[Any]:
+    """Sum a per-node ``{name: scalar}`` dict into one scalar (or ``None``).
+
+    Plain ``+`` builds the autograd graph across the per-node loss tensors.
+    """
     if not losses:
         return None
     it = iter(losses.values())

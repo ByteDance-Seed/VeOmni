@@ -21,7 +21,7 @@ sys.path.insert(0, str(_REPO_ROOT))
 from tests.seed_omni.parity_suite.core import configure_torch_determinism, to_device  # noqa: E402
 from tests.seed_omni.parity_suite.driver.observations import shifted_label_rows_from_conversation  # noqa: E402
 from veomni.arguments import OmniArguments, parse_omni_args  # noqa: E402
-from veomni.trainer.omni_trainer import MultiLRScheduler, MultiOptimizer, OmniTrainer  # noqa: E402
+from veomni.trainer.omni.omni_trainer import MultiLRScheduler, MultiOptimizer, OmniTrainer  # noqa: E402
 
 
 try:

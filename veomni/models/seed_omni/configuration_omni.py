@@ -124,6 +124,11 @@ class OmniConfig(PretrainedConfig):
 
     @property
     def module_names(self) -> List[str]:
+        # Config ``modules:`` declaration order (dict insertion order). This is the
+        # canonical, FIXED order that drives serial CPU-preprocessor execution in
+        # both training (SeedOmniCollator) and inference (OmniInferencer); declare
+        # modules so any order-dependent prep (e.g. vision patchify before the text
+        # chat-template) runs in the right sequence.
         return list(self.modules.keys())
 
     def has_training_graph(self) -> bool:

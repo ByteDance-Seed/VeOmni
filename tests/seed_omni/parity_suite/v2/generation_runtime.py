@@ -11,8 +11,8 @@ import torch
 from torch import nn
 
 from tests.seed_omni.parity_suite.v2.observation import arm_generation_observer
-from veomni.models.seed_omni.conversation import ConversationItem
-from veomni.models.seed_omni.generation_graph import GenerationGraph
+from veomni.models.seed_omni.graphs.generation_graph import GenerationGraph
+from veomni.models.seed_omni.utils.conversation import ConversationItem
 
 
 @dataclass
