@@ -1,6 +1,8 @@
 from types import SimpleNamespace
 
-from veomni.distributed.fsdp2.clip_grad_norm import _fsdp_grad_norm_reduce_groups
+import torch
+
+from veomni.distributed.fsdp2.clip_grad_norm import _fsdp_grad_norm_reduce_groups, _local_pth_sum
 
 
 def _parallel_state(*, dp_mode: str = "fsdp2", dp_replicate_enabled: bool = False, dp_shard_size: int = 1):
@@ -29,3 +31,17 @@ def test_fsdp_grad_norm_reduce_groups_skip_non_fsdp2_modes():
     ps = _parallel_state(dp_mode="ddp")
 
     assert _fsdp_grad_norm_reduce_groups(ps) == []
+
+
+def test_local_pth_sum_skips_missing_grads_and_accumulates_in_fp32():
+    p1 = torch.nn.Parameter(torch.tensor([1.0, -2.0]))
+    p2 = torch.nn.Parameter(torch.tensor([3.0]))
+    p3 = torch.nn.Parameter(torch.tensor([5.0]))
+    p1.grad = torch.tensor([3.0, 4.0])
+    p2.grad = None
+    p3.grad = torch.tensor([12.0])
+
+    actual = _local_pth_sum([p1, p2, p3], p=2.0)
+
+    assert actual.dtype == torch.float32
+    assert torch.equal(actual.cpu(), torch.tensor(169.0))
