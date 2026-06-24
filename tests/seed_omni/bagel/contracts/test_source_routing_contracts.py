@@ -216,6 +216,31 @@ def test_bagel_qwen2_mot_flow_alignment_requires_real_flow_item() -> None:
     assert out.requires_grad
 
 
+def test_bagel_flow_dummy_embed_anchors_to_vae_dummy_output() -> None:
+    model = _tiny_flow_connector()
+    vae_dummy = ConversationItem(
+        type="output",
+        value=torch.ones(1, 1, 1, requires_grad=True),
+        role="dummy",
+        meta={"source": "bagel_vae"},
+    )
+    conversation = [[vae_dummy]]
+
+    inputs = model.embed_latent_pre(conversation_list=conversation)
+    latent_embeds = torch.ones(1, int(model.config.hidden_size), device=model.device, dtype=model.dtype)
+    latent_embeds = latent_embeds + inputs["latents"].sum() * 0.0
+    out = model.embed_latent_post(latent_embeds)
+
+    assert inputs["latents"].requires_grad
+    assert out["conversation_list"] is conversation
+    flow_dummy = conversation[0][-1]
+    assert flow_dummy.type == "output"
+    assert flow_dummy.role == "dummy"
+    assert flow_dummy.meta == {"source": "bagel_flow_connector"}
+    assert torch.is_tensor(flow_dummy.value)
+    assert flow_dummy.value.requires_grad
+
+
 def test_bagel_flow_decode_and_advance_require_source_routed_products() -> None:
     model = _tiny_flow_connector()
     model.decode_velocity = lambda hidden_states, **kwargs: {  # type: ignore[method-assign]

@@ -231,7 +231,8 @@ class BagelFlowConnectorModuleMixin(ModuleMixin):
         self._embed_items = self._select_vae_context_latent_items(conversation_list)
         if not self._embed_items:
             self._embed_is_dummy = True
-            return self.dummy_inputs(kind="embed_latent")
+            dummy = self.dummy_inputs(kind="embed_latent")
+            return self._anchor_dummy_embed_latent_inputs(conversation_list, dummy)
 
         # Training/module-tier embedding adds flow noising; generation context
         # calls BagelFlowConnector.embed_latent and uses the clean timestep=0 path.
@@ -371,6 +372,32 @@ class BagelFlowConnectorModuleMixin(ModuleMixin):
             return dummy
 
         return {"hidden_states": dummy["hidden_states"] + anchor}
+
+    def _anchor_dummy_embed_latent_inputs(
+        self,
+        conversation_list: list[list[ConversationItem]] | None,
+        dummy: dict[str, torch.Tensor],
+    ) -> dict[str, torch.Tensor]:
+        """Tie flow dummy embed to upstream VAE dummy output when present."""
+        if conversation_list is None:
+            return dummy
+
+        anchor = None
+        for item in iter_desired_items(conversation_list, roles=["dummy"]):
+            if item.meta.get("source") != "bagel_vae":
+                continue
+            if not torch.is_tensor(item.value):
+                continue
+            anchor = item.value.to(device=self.device, dtype=self.dtype).sum() * 0.0
+            break
+        if anchor is None:
+            return dummy
+
+        return {
+            "latents": dummy["latents"] + anchor,
+            "position_ids": dummy["position_ids"],
+            "timesteps": dummy["timesteps"],
+        }
 
     # ── Inference helpers ──────────────────────────────────
 
