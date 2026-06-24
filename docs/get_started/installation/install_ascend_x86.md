@@ -23,21 +23,17 @@ git clone https://github.com/ByteDance-Seed/VeOmni.git
 cd VeOmni
 
 # use the locked uv env
-uv sync --locked  --extra npu
+uv sync --locked --extra npu
 source .venv/bin/activate
 ```
 
-You can use `--extra` to install other optional dependencies. Refer to [pyproject.toml](https://github.com/ByteDance-Seed/VeOmni/blob/main/pyproject.toml) for more details.
+`npu` is a single full superset for x86 Ascend: torch 2.7.1+cpu / torch-npu,
+diffusion / audio / video / LoRA deps, and `megatron-energon`. CUDA-only
+kernels (FA3 / FA4 / FlashQLA) are intentionally absent. See
+[pyproject.toml](https://github.com/ByteDance-Seed/VeOmni/blob/main/pyproject.toml)
+for the full list.
 
-```bash
-# eg. install with video/audio processing dependencies (torchcodec, PyAV, librosa, soundfile)
-# Note: `video` and `audio` extras are equivalent - both include video and audio processing
-uv sync --locked  --extra npu --extra video
-# or equivalently:
-uv sync --locked  --extra npu --extra audio
-```
-
-> **Note**: For video/audio processing with the `video` or `audio` extra, you also need to install ffmpeg separately:
+> **Note**: video/audio processing also needs ffmpeg installed at the OS level:
 > ```bash
 > # Ubuntu/Debian/openEuler
 > sudo apt-get install ffmpeg

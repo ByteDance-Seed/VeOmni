@@ -26,7 +26,11 @@ from ..distributed.parallel_state import get_parallel_state
 from ..distributed.sequence_parallel import gather_outputs
 from ..utils import logging
 from ..utils.constants import IGNORE_INDEX, MODALITY
-from ..utils.seqlen_pos_transform_utils import prepare_fa_kwargs_from_position_ids, valid_seqlens_from_cu_seqlens
+from ..utils.seqlen_pos_transform_utils import (
+    coalesce_tail_padding_cu_seqlens,
+    prepare_fa_kwargs_from_position_ids,
+    valid_seqlens_from_cu_seqlens,
+)
 
 
 # A model-provided hook that derives ``multimodal_metadata`` from a packed +
@@ -40,9 +44,12 @@ MetadataCollateFunc = Callable[[Dict[str, Any], Dict[str, int]], None]
 
 logger = logging.get_logger(__name__)
 
+_LINEAR_ATTN_TAIL_PADDING_LENGTH = "_linear_attn_tail_padding_length"
+
 
 def add_flash_attention_kwargs_from_position_ids(
     batch: Dict[str, "torch.Tensor"],
+    linear_attn_tail_padding_length: int = 0,
 ) -> Tuple["torch.Tensor", "torch.Tensor", "torch.Tensor", "torch.Tensor"]:
     """
     Calculate and add Flash Attention kwargs (cu_seq_lens and max_length) from position_ids.
@@ -55,7 +62,11 @@ def add_flash_attention_kwargs_from_position_ids(
 
     Args:
         batch: The batch dictionary containing position_ids. Will be modified in-place to add
-               cu_seq_lens_q, cu_seq_lens_k, max_length_q, and max_length_k.
+               cu_seq_lens_q, cu_seq_lens_k, max_length_q, max_length_k, and
+               linear_attn_cu_seq_lens_q.
+        linear_attn_tail_padding_length: Number of known padding tokens appended at the tail by
+               collators. These are kept in FlashAttention cu-seqlens but coalesced into one segment
+               for linear-attention kernels that compile or allocate per segment.
 
     Returns:
         Tuple of (cu_seq_lens_q, cu_seq_lens_k, max_length_q, max_length_k) for additional use.
@@ -69,6 +80,10 @@ def add_flash_attention_kwargs_from_position_ids(
     batch["cu_seq_lens_k"] = cu_seq_lens_k
     batch["max_length_q"] = max_length_q
     batch["max_length_k"] = max_length_k
+    batch["linear_attn_cu_seq_lens_q"] = coalesce_tail_padding_cu_seqlens(
+        cu_seq_lens_q,
+        linear_attn_tail_padding_length,
+    )
 
     return cu_seq_lens_q, cu_seq_lens_k, max_length_q, max_length_k
 
@@ -263,11 +278,14 @@ class PackingCollator(DataCollator):
                 if pack_dim == -1:
                     batch[key] = batch[key].unsqueeze(0)
 
+        linear_attn_tail_padding_length = 0
         if self.pad_to_length:
+            input_ids_len_before = batch["input_ids"].shape[-1]
             batch = self.pad_batch_to_length(batch)
+            linear_attn_tail_padding_length = max(0, batch["input_ids"].shape[-1] - input_ids_len_before)
 
         if not self.sp_enabled:
-            add_flash_attention_kwargs_from_position_ids(batch)
+            add_flash_attention_kwargs_from_position_ids(batch, linear_attn_tail_padding_length)
             # No SP downstream → no sp-pad. Hand the packed batch to the
             # model-provided hook (if any), which derives ``multimodal_metadata``
             # from the packed ``*_grid_thw`` tensors using its own config. When
@@ -275,6 +293,8 @@ class PackingCollator(DataCollator):
             # the hook sees the SP-padded batch + per-modality pad counts.
             if self.metadata_collate_func is not None:
                 self.metadata_collate_func(batch, {"pixel_values": 0, "pixel_values_videos": 0})
+        elif linear_attn_tail_padding_length:
+            batch[_LINEAR_ATTN_TAIL_PADDING_LENGTH] = linear_attn_tail_padding_length
         return batch
 
 
@@ -340,6 +360,8 @@ class SequenceParallelCollator(DataCollator):
             labels = F.pad(labels, (0, 1), "constant", IGNORE_INDEX)
             batch["labels"] = labels
 
+        linear_attn_tail_padding_length = int(batch.pop(_LINEAR_ATTN_TAIL_PADDING_LENGTH, 0))
+
         # Track sp_pad sizes for pixel_values{,_videos} so the ViT metadata
         # ``cu_seqlens`` can be extended with the sp-pad tail entry (mirrors
         # how the text-side cu_seq_lens picks up sp-pad via the position_ids==0
@@ -367,12 +389,14 @@ class SequenceParallelCollator(DataCollator):
                 post_pad_len = len(batch[key]) if isinstance(batch[key], list) else batch[key].size(pack_dim)
                 if key in vit_sp_pad:
                     vit_sp_pad[key] = post_pad_len - pre_pad_len
+                if key == "position_ids":
+                    linear_attn_tail_padding_length += post_pad_len - pre_pad_len
 
             if sp_slice and key != "position_ids":  # position_ids should be sp sliced after precompute fa kwargs
                 # sp slice
                 batch[key] = self.sp_slice(key, batch[key], dim=pack_dim)
 
-        add_flash_attention_kwargs_from_position_ids(batch)
+        add_flash_attention_kwargs_from_position_ids(batch, linear_attn_tail_padding_length)
 
         batch["position_ids"] = self.sp_slice(
             "position_ids", batch["position_ids"], dim=self.collate_infos["position_ids"].pack_dim

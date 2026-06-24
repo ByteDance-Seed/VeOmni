@@ -11,7 +11,8 @@ Models under ``veomni/models/transformers/`` that register a patchgen-generated
 class (``transformers-stable`` default group in ``pyproject.toml`` pins
 ``transformers==5.9.0``):
 
-- Causal-LM (text-only):           qwen2, qwen3, qwen3_moe, deepseek_v3
+- Causal-LM (text-only):           qwen2, qwen3, qwen3_moe, deepseek_v3,
+                                   gpt_oss
 - VLM via text-only sub-config
   (``*ForCausalLM`` registered):   qwen3_5, qwen3_5_moe
 - VLM full forward (image + text): qwen2_vl, qwen2_5_vl, qwen3_vl, qwen3_vl_moe,
@@ -157,6 +158,17 @@ CASES = [
     # the OpSlot-guarded cross-entropy, and the v5 ``gate_up_proj`` layout
     # end-to-end.
     Case("deepseek_v3-eager", _toy("deepseek_v3_toy"), "DeepseekV3ForCausalLM", "causal_lm"),
+    # ── GPT-OSS (SWA + learnable sinks + interleaved gate/up MoE) ────────
+    # eager+fp32 only for this HF bitwise baseline: fused_quack is covered by
+    # ``test_gpt_oss_integration.py`` against VeOmni eager, while this test
+    # proves the patchgen-generated modeling preserves pristine HF semantics.
+    Case(
+        "gpt_oss-eager",
+        _toy("gpt_oss_toy"),
+        "GptOssForCausalLM",
+        "causal_lm",
+        config_overrides={"_experts_implementation": "eager"},
+    ),
     # ── GLM-MoE-DSA (MLA + Dynamic Sparse Attention) ─────────────────────
     # Upstream sets ``_supports_flash_attn = False``, so FA2 is not an
     # option here — we use eager+fp32 as the RNG-init baseline and
@@ -645,6 +657,15 @@ _LOADER_CASES = [
     # Eager+fp32 only — see the ``deepseek_v3-eager`` entry in CASES for
     # why fa2/sdpa diverge on MLA today.
     Case("deepseek_v3-eager-loader", _toy("deepseek_v3_toy"), "DeepseekV3ForCausalLM", "causal_lm"),
+    # GPT-OSS uses native interleaved gate/up expert weights plus biases; the
+    # loader path should preserve that HF-format layout exactly.
+    Case(
+        "gpt_oss-eager-loader",
+        _toy("gpt_oss_toy"),
+        "GptOssForCausalLM",
+        "causal_lm",
+        config_overrides={"_experts_implementation": "eager"},
+    ),
     Case(
         "glm_moe_dsa-eager-loader",
         _toy("glm_moe_dsa_toy"),

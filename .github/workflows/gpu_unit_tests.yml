@@ -35,10 +35,10 @@ permissions:
   contents: read
 
 env:
-  IMAGE: "verl-ci-cn-beijing.cr.volces.com/veomni/open_veomni-gpu:pytorch_25_06_py3_cuda12_9.post2"
+  IMAGE: "verl-ci-cn-beijing.cr.volces.com/veomni/open_veomni-gpu:v0.1.11_cu130"
   NCCL_DEBUG: "WARN"
-  # uv's default 30s timeout is too short for the ~617 MiB
-  # nvidia-cudnn-cu12 wheel on the CN runners; bump to 5 min so a
+  # uv's default 30s timeout is too short for the large ~600 MiB
+  # nvidia-cudnn-cu13 wheel on the CN runners; bump to 5 min so a
   # transient slow link doesn't fail the whole sync.
   UV_HTTP_TIMEOUT: "300"
   # qwen3_5's full 248K vocab embedding fragments the PyTorch allocator
@@ -69,7 +69,7 @@ jobs:
     # fsdp utils, checkpoint callback, etc.).
     timeout-minutes: 120
     container:
-      image: verl-ci-cn-beijing.cr.volces.com/veomni/open_veomni-gpu:pytorch_25_06_py3_cuda12_9.post2
+      image: verl-ci-cn-beijing.cr.volces.com/veomni/open_veomni-gpu:v0.1.11_cu130
       volumes:
         - /mnt/veomni_ci:/mnt/veomni_ci:ro
       options: >-
@@ -118,7 +118,7 @@ jobs:
           fi
       - name: Sync dependencies
         run: |
-          uv sync --frozen --extra gpu --extra audio --group dev
+          uv sync --frozen --extra gpu --group dev
       - name: Run parallel tests
         # TODO: run all tests under tests/parallel/ulysses after we verify
         #       tests/parallel/ulysses/test_ulysses_async.py still works
@@ -172,9 +172,9 @@ jobs:
           uv run --frozen pytest -s -x tests/optim/test_muon_unit.py
           uv run --frozen pytest -s -x tests/optim/test_muon_fsdp2_parity.py
           uv run --frozen pytest -s -x tests/optim/test_muon_fsdp2_smoke.py
-      - name: Install LoRA extra
-        run: |
-          uv sync --frozen --extra gpu --extra audio --extra lora --group dev
       - name: Run LoRA e2e test
+        # peft ships under the `gpu` extra (rolled in from the dropped `lora`
+        # extra), so the earlier `uv sync --extra gpu --group dev` step is
+        # sufficient — no extra sync needed here.
         run: |
           uv run --frozen pytest -s -x tests/lora/test_lora_trainer_saveload.py

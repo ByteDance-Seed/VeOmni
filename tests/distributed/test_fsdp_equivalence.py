@@ -37,11 +37,26 @@ from ..tools import ParallelConfig
 _qwen3_5_npu_skip = pytest.mark.skipif(
     IS_NPU_AVAILABLE, reason="Qwen3.5 GatedDeltaNet has no NPU backend (varlen path)"
 )
+_gpt_oss_npu_skip = pytest.mark.skipif(IS_NPU_AVAILABLE, reason="GPT-OSS FSDP equivalence is GPU-only today")
 
 _DEFAULT_RTOL = 1e-1
 _DEFAULT_ATOL = 1e-1
 
 _TEXT_TRAIN_SCRIPT = "tests/train_scripts/train_text_test.py"
+_GPT_OSS_EAGER_OPS_ARGS = [
+    "--model.ops_implementation.attn_implementation=eager",
+    "--model.ops_implementation.moe_implementation=eager",
+    "--model.ops_implementation.cross_entropy_loss_implementation=eager",
+    "--model.ops_implementation.load_balancing_loss_implementation=eager",
+    "--model.ops_implementation.rms_norm_implementation=eager",
+    "--model.ops_implementation.rotary_pos_emb_implementation=eager",
+]
+
+
+def _fsdp_equivalence_extra_args(model_name: str) -> list[str]:
+    if model_name == "gpt_oss":
+        return list(_GPT_OSS_EAGER_OPS_ARGS)
+    return []
 
 
 def _setup_model_and_data(model_name, config_path, dataset_type="text"):
@@ -80,6 +95,7 @@ def _run_single_gpu_training(model_name, config_path, model_path, train_path, ou
         nproc=1,
         init_device=get_device_type(),
         extra_args=[
+            *_fsdp_equivalence_extra_args(model_name),
             "--train.accelerator.fsdp_config.fsdp_mode=ddp",
             "--train.accelerator.fsdp_config.mixed_precision.enable=False",
         ],
@@ -88,14 +104,14 @@ def _run_single_gpu_training(model_name, config_path, model_path, train_path, ou
 
 
 def _get_nproc():
-    """Return the number of available GPUs/NPUs, requiring at least 2."""
+    """Return the fixed 2-device world size required by this equivalence test."""
     from veomni.utils.device import get_torch_device
 
     torch_device = get_torch_device()
     count = torch_device.device_count() if torch_device.is_available() else 0
     if count < 2:
         pytest.skip(f"Requires at least 2 devices, found {count}")
-    return count
+    return 2
 
 
 def _run_fsdp2_training(model_name, config_path, model_path, train_path, output_dir, nproc=None):
@@ -116,6 +132,7 @@ def _run_fsdp2_training(model_name, config_path, model_path, train_path, output_
         task_name="fsdp2",
         nproc=nproc,
         extra_args=[
+            *_fsdp_equivalence_extra_args(model_name),
             "--train.accelerator.ulysses_size=1",
             "--train.accelerator.ep_size=1",
             "--train.accelerator.fsdp_config.mixed_precision.enable=False",
@@ -141,6 +158,7 @@ def _run_fsdp_equivalence(
     """
     from ..tools import compare_metrics, print_comparison_table
 
+    nproc = _get_nproc()
     test_dir, train_path, dummy_dataset = _setup_model_and_data(model_name, config_path, dataset_type)
 
     try:
@@ -153,13 +171,14 @@ def _run_fsdp_equivalence(
             output_dir=test_dir,
         )
 
-        # 2. Run FSDP2 with all available GPUs
+        # 2. Run FSDP2 with the fixed 2-device world size
         fsdp2_results = _run_fsdp2_training(
             model_name=model_name,
             config_path=config_path,
             model_path=test_dir,
             train_path=train_path,
             output_dir=test_dir,
+            nproc=nproc,
         )
 
         # 3. Compare grad_norm (primary correctness signal)
@@ -228,6 +247,15 @@ _text_test_cases = [
         _DEFAULT_RTOL,
         _DEFAULT_ATOL,
         id="deepseek_v3",
+    ),
+    pytest.param(
+        "gpt_oss",
+        "./tests/toy_config/gpt_oss_toy",
+        True,
+        _DEFAULT_RTOL,
+        _DEFAULT_ATOL,
+        id="gpt_oss",
+        marks=_gpt_oss_npu_skip,
     ),
 ]
 

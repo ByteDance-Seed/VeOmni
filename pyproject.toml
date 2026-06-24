@@ -23,24 +23,21 @@ dependencies = [
   "packaging>=23.0,<26.0",
   "torchdata>=0.8.0,<1.0",
   "tiktoken>=0.9.0",
-  # Comment out transformers version so pip users do not accidentally pull in a
-  # version that conflicts with the uv-managed setup.
-  # For uv user: the actual version is pinned by the "transformers-stable"
-  # default dependency-group (==5.9.0).
-  # For pip user: please install 5.9.0 manually via `pip install transformers==5.9.0`.
-  # "transformers==5.9.0",
+  # transformers is pinned by the `transformers-stable` dependency group for
+  # uv users; pip users should `pip install transformers==5.9.0` themselves.
   "psutil",
   "timm",
   "wandb",
   "setuptools",
   "einops>=0.8.1",
-  # matplotlib is used by veomni.utils.moe_monitor to render the per-step
-  # MoE expert-load heatmap that gets logged to wandb. Falls back to scalar
-  # metrics only if matplotlib is missing.
-  "matplotlib>=3.7",
+  "matplotlib>=3.7",  # veomni.utils.moe_monitor expert-load heatmap
 ]
 
 [project.optional-dependencies]
+# Three mutually-exclusive hardware extras (see `[tool.uv].conflicts`): a
+# typical install is `uv sync --extra <gpu|npu|npu_aarch64>`. trl is NOT
+# included — VeOmni's DPO trainer (veomni/trainer/text_dpo_trainer.py) is
+# from-scratch and the trl<=0.9.6 pin is transformers v4-era anyway.
 dev = [
   "pre-commit>=4.0.0,<5.0",
   "ruff>=0.7.0,<1.0",
@@ -76,70 +73,85 @@ dit = [
   # See note in the ``audio`` extra: keep numba>=0.64 for numpy 2.4 support.
   "numba>=0.64,<0.66",
   "soundfile>=0.13.1,<0.14",
+  "diffusers==0.37.0",
   "ftfy",
+  "peft==0.18.1",
+  "megatron-energon>=7.2.1",
+  "hf_transfer",
 ]
+
+gpu = [
+  "torch==2.11.0+cu130",
+  "torchvision==0.26.0+cu130",
+  "torchaudio==2.11.0+cu130",
+  "torchcodec==0.12.0",
+  "nvidia-cusparselt-cu13",
+  "nvidia-nccl-cu13",
+  "nvidia-cutlass-dsl>=4.4.2",
+  # cuDNN Frontend DSA kernels for DeepSeek sparse attention training. Avoid the
+  # `cutedsl` extra because it pins nvidia-cutlass-dsl==4.5.0, which conflicts with FA4.
+  "nvidia-cudnn-frontend>=1.24.0",
+  "cuda-python==13.0.3",
+  # See `[tool.uv.sources]` — FA2 (cp311/cp312), FA3 (sm90 abi3), and
+  # FlashMLA (cp311/cp312 sm90a/sm100f) install from prebuilt wheels;
+  # flash-qla source-builds from git.
+  "flash-attn",
+  "flash-attn-3",
+  "flash-mla",
+  # 4.0.0b16 is available from PyPI; newer fa4-v4.0.0.beta17 is tag-only
+  # and not yet published as a package release.
+  "flash-attn-4==4.0.0b16",
+  "flash-qla",
+  "liger-kernel",
+  "flash-linear-attention",
+  "quack-kernels[cu13]==0.5.0",
+  "torch-c-dlpack-ext",
+  "apache-tvm-ffi==0.1.9",
+  "av>=14.3.0,<15.0; python_version == '3.11'",
+  "av>=14.0.0,<14.3; python_version == '3.12'",
+  "librosa>=0.11.0,<0.12",
+  # See note in the ``audio`` extra: keep numba>=0.64 for numpy 2.4 support.
+  "numba>=0.64,<0.66",
+  "soundfile>=0.13.1,<0.14",
+  "diffusers==0.37.0",
+  "ftfy",
+  "peft==0.18.1",
+  "megatron-energon>=7.2.1",
+  "hf_transfer",
+]
+
+# Ascend NPU x86_64 — superset minus CUDA-only kernels (FA2/3/4, FlashQLA).
+npu = [
+  "torch==2.7.1+cpu",
+  "torch-npu==2.7.1",
+  "torchvision==0.22.1+cpu",
+  "torchaudio==2.7.1+cpu",
+  "torchcodec>=0.4.0,<0.6.0",
+  "decorator>=5.2.1",
+  "scipy>=1.16.2",
+  "av>=14.3.0,<15.0; python_version == '3.11'",
+  "av>=14.0.0,<14.3; python_version == '3.12'",
+  "librosa>=0.11.0,<0.12",
+  "soundfile>=0.13.1,<0.14",
+  "diffusers==0.37.0",
+  "ftfy",
+  "peft==0.18.1",
+  "megatron-energon>=7.2.1",
+  "hf_transfer",
+]
+
+# aarch64 NPU — torch + torch-npu only; av/torchcodec/librosa/soundfile lack
+# aarch64 wheels (see `[tool.uv.sources].av`, x86_64-only).
 npu_aarch64 = [
   "torch==2.7.1",
   "torch-npu==2.7.1",
   "torchvision==0.22.1",
   "torchaudio==2.7.1",
   "decorator>=5.2.1",
-  "scipy>=1.16.2"
-]
-npu = [
-  "torch==2.7.1+cpu",
-  "torch-npu==2.7.1",
-  "torchvision==0.22.1+cpu",
-  "torchaudio==2.7.1+cpu",
-  "decorator>=5.2.1",
   "scipy>=1.16.2",
-  "torchcodec>=0.4.0,<0.6.0"
-]
-gpu = [
-  "torch==2.9.1+cu129",
-  "torchvision==0.24.1+cu129",
-  "torchaudio==2.9.1+cu129",
-  "nvidia-cusparselt-cu12",
-  "nvidia-nccl-cu12",
-  "liger-kernel",
-  "flash-attn",
-  "flash-attn-3",
-  "hf_transfer",
-  "torchcodec==0.8.1", # 0.8.1 is compatible with torch 2.9
-  "cuda-python==12.9.1",
-  "torch-c-dlpack-ext",
-  # For models with linear attention like Qwen 3.5
-  "flash-linear-attention",
-  "quack-kernels==0.3.4",
-]
-megatron = [
-  "megatron-energon>=7.2.1"
-]
-trl = [
-  "trl<=0.9.6"
-]
-lora = [
-  "peft==0.18.1"
-]
-
-fa4 = [
-  "flash-attn-4",
-  "nvidia-cutlass-dsl>=4.4.2"
-]
-
-# Optional alternative chunk_gated_delta_rule kernel for Qwen3.5 linear attention.
-# Opt in by selecting `chunk_gated_delta_rule_implementation: flash_qla` in
-# OpsImplementationConfig — the default `eager` and the `fla` backend
-# (shipped under the `gpu` extra via `flash-linear-attention`) work without
-# this extra. Source: https://github.com/QwenLM/FlashQLA
-flash-qla = [
-  "flash-qla"
 ]
 
 [dependency-groups]
-# Follow the best practice in https://docs.astral.sh/uv/concepts/projects/dependencies/#development-dependencies
-# to manage dev dependencies (i.e., dependencies that are only used in development) like
-# test, lint and doc tools.
 dev = [
   {include-group = "lint"},
   {include-group = "test"},
@@ -154,77 +166,44 @@ test = [
   "pytest",
   "expecttest",
 ]
-# AST-based patchgen library. Build-time tool for regenerating modeling
-# patches under veomni/models/transformers/*/generated/; not imported on
-# the runtime path. Lives as a sibling project under ./patchgen-pkg/ for
-# monorepo dev; `[tool.uv.sources].patchgen` points uv at the path.
-# (Outer dir is ``patchgen-pkg`` rather than ``patchgen`` because Python's
-# namespace-package finder would otherwise treat the sibling dir as
-# ``import patchgen`` and shadow the editable install when cwd is the
-# VeOmni repo root.) When patchgen lands on PyPI / a byted SCM mirror,
-# move this entry to [project.optional-dependencies].dev so pip users can
-# install it via `pip install veomni[dev]`.
+# Sibling project under ./patchgen-pkg/ (build-time tool — regenerates
+# veomni/models/transformers/*/generated/; not imported at runtime).
+# Outer dir is `patchgen-pkg` because a flat `patchgen/` would shadow the
+# editable install via namespace-package discovery.
 patchgen = [
   "patchgen>=0.1.0",
 ]
-# Pin the default transformers version via a dependency group. This is a
-# default group (see default-groups below), so `uv sync` always installs
-# transformers==5.9.0.
-#
-# Why a dependency group instead of `[project.dependencies]`? It keeps the
-# transformers version out of the wheel metadata so pip users are not forced
-# into a specific 5.x patch release.
+# In default-groups so `uv sync` always installs transformers==5.9.0.
+# Kept out of [project.dependencies] so pip users are not forced into a
+# specific 5.x patch release.
 transformers-stable = [
   "transformers==5.9.0"
 ]
 
 [tool.uv]
-# Accept a range of uv versions rather than an exact pin. Supported range:
-# 0.9.8 through 0.11.x; developers are encouraged to stay reasonably current
-# within it. An exact pin goes stale almost immediately (uv ships weekly —
-# 0.11.17 landed days after we pinned 0.11.16) and needlessly blocks local
-# devs whose uv differs by a patch release. This window will be tightened
-# again later.
-#
-# Reproducibility is preserved because CI and the docker/ images install a
-# concrete, in-range uv (currently 0.11.16) and never re-resolve the lockfile
-# (docker: `uv sync --locked`; CI: `uv run --frozen`). Those concrete uv pins
-# — the docker/ Dockerfiles and .github/workflows/check_patchgen.yml — must
-# stay inside this range.
+# Range so local devs are not forced onto one weekly uv build. Reproducibility
+# is preserved because docker/CI install a concrete pin and use --locked /
+# --frozen. Concrete pins (docker/, .github/workflows/check_patchgen.yml)
+# must stay inside this range.
 required-version = ">=0.9.8,<0.12"
-no-build-isolation-package = [
-    "flash-attn",
-    "flash-attn-3",
-]
 
-# The "transformers-stable" dependency group is synced by default, ensuring
-# that `uv sync` (with no extra flags) installs transformers==5.9.0.
 default-groups = ["transformers-stable"]
 
+# The `(extra == '...')` markers are load-bearing — without them uv resolves
+# torch from PyPI ignoring the +cu130/+cpu variants. Ref astral-sh/uv#11153.
 override-dependencies = [
-    # Adding the (extra == 'gpu') mark to declare this override is only for gpu extra.
-    # Without this mark, uv would download torch/torchaudio/torchvision unexpectedly from
-    # PyPI without using the cu128 versions.
-    # Ref: https://github.com/astral-sh/uv/issues/11153
-    "torch==2.9.1+cu129; (extra == 'gpu')",
-    "torchaudio==2.9.1+cu129; (extra == 'gpu')",
-    "torchvision==0.24.1+cu129; (extra == 'gpu')",
-    "torchcodec==0.8.1; (extra == 'gpu')",
-    # Adding explicit override for NPU backends - aarch64 variant
+    "torch==2.11.0+cu130; (extra == 'gpu')",
+    "torchaudio==2.11.0+cu130; (extra == 'gpu')",
+    "torchvision==0.26.0+cu130; (extra == 'gpu')",
+    "torchcodec==0.12.0; (extra == 'gpu')",
     "torch==2.7.1; (extra == 'npu_aarch64')",
     "torchaudio==2.7.1; (extra == 'npu_aarch64')",
     "torchvision==0.22.1; (extra == 'npu_aarch64')",
-    "torchcodec>=0.4.0,<0.6.0; (extra == 'npu_aarch64')",
     # Adding explicit override for NPU backends - x86 variant (default npu)
     "torch==2.7.1+cpu; (extra == 'npu')",
     "torchaudio==2.7.1+cpu; (extra == 'npu')",
     "torchvision==0.22.1+cpu; (extra == 'npu')",
     "torchcodec>=0.4.0,<0.6.0; (extra == 'npu')",
-
-    # Force to use 9.15+ cudnn to avoid torch 2.9 conv3d performance regression issue:
-    # https://github.com/pytorch/pytorch/releases/tag/v2.9.1
-    # TODO: remove this override after we upgrade to torch 2.10.
-    "nvidia-cudnn-cu12==9.15.1.9",
 ]
 
 conflicts = [
@@ -236,54 +215,46 @@ conflicts = [
 ]
 
 [tool.uv.sources]
-# Sibling patchgen project under ./patchgen-pkg — once published, drop
-# this entry and uv resolves the version pin from the registry instead.
 patchgen = { path = "patchgen-pkg", editable = true }
-# To support override-dependencies for multiple extras, one package can only have one index.
-# Using pytorch index for all variants since it has both regular and +cpu versions
+# Direct wheel URL for gpu — pytorch index sometimes resolves cu128_full wheels
+# that drop nvidia-* deps and confuse uv into uninstalling them. Update both
+# 3.11 and 3.12 URLs when bumping torch.
 torch = [
   { index = "pytorch", marker = "(extra == 'npu' or extra == 'npu_aarch64')" },
-  # Due to some unknown bugs, uv might resolve to a wheel from https://download.pytorch.org/whl/cu128_full which does
-  # not include the proper dependencies on nvidia packages like nvidia-cublas and nvidia-nccl. This confuses uv to uninstall
-  # those nvidia packages.
-  #
-  # By forcing it to the proper package here, we avoid the problem that uv could randomly resolve to other packages.
-  #
-  # NOTE: WHEN UPDATE TORCH VERSIONS, PLEASE UPDATE THIS TO THE CORRESPONDING WHEEL URL.
-  { url = "https://download.pytorch.org/whl/cu129/torch-2.9.1%2Bcu129-cp311-cp311-manylinux_2_28_x86_64.whl", extra = 'gpu', marker = "python_version == '3.11'" },
-  { url = "https://download.pytorch.org/whl/cu129/torch-2.9.1%2Bcu129-cp312-cp312-manylinux_2_28_x86_64.whl", extra = 'gpu', marker = "python_version == '3.12'" },
+  { url = "https://download.pytorch.org/whl/cu130/torch-2.11.0%2Bcu130-cp311-cp311-manylinux_2_28_x86_64.whl", extra = 'gpu', marker = "python_version == '3.11'" },
+  { url = "https://download.pytorch.org/whl/cu130/torch-2.11.0%2Bcu130-cp312-cp312-manylinux_2_28_x86_64.whl", extra = 'gpu', marker = "python_version == '3.12'" },
 ]
 torchvision = { index = "pytorch" }
 torchaudio = { index = "pytorch" }
-# Download fa2 and fa3 wheels directly to avoid build issues.
-# Both wheels are built against torch 2.9+cu129. From
-# https://github.com/Luosuu/flash-attention-prebuild-wheels since there is no official
-# FA2 prebuilt wheel for torch 2.9+.
+# FA2 + FA3 use prebuilt wheels hosted by @Luosuu, ABI-aligned with our
+# torch 2.11.0+cu130 cxx11abi=true stack:
+#   - FA2 cp311 (v0.0.3) and cp312 (v0.0.5), both sm80/89/90/100 — covers
+#     Ampere/Ada/Hopper/Blackwell on NGC25.11 (cp312) and cp311 local dev.
+#   - FA3 cp310-abi3 sm90 (v0.0.5) — abi3 loads on cp310+. Non-Hopper users
+#     never import flash_attn_interface (lazy in
+#     veomni/ops/kernels/attention/__init__.py), so sm90-only is no-loss.
+# FA4 4.0.0b16 is resolved from PyPI.
 flash-attn = [
-  { url = "https://github.com/Luosuu/flash-attention3-wheels/releases/download/v0.0.1/flash_attn-2.8.4-cp311-cp311-linux_x86_64.whl", marker = "extra == 'gpu' and python_version == '3.11'"},
-  { url = "https://github.com/Luosuu/flash-attention-prebuild-wheels/releases/download/fa2cu129/flash_attn-2.8.3+cu129torch2.9-cp312-cp312-linux_x86_64.whl", marker = "extra == 'gpu' and python_version == '3.12'"},
+    { url = "https://github.com/Luosuu/flash-attention3-wheels/releases/download/v0.0.3/flash_attn-2.8.4+20260608.cu130torch2110cxx11abitrue.bc58ab.sm80sm89sm90sm100-cp311-cp311-linux_x86_64.whl", marker = "extra == 'gpu' and python_version == '3.11'" },
+    { url = "https://github.com/Luosuu/flash-attention3-wheels/releases/download/v0.0.5/flash_attn-2.8.4+20260610.cu130torch2110cxx11abitrue.fb02fc.sm80sm89sm90sm100-cp312-cp312-linux_x86_64.whl", marker = "extra == 'gpu' and python_version == '3.12'" },
 ]
 flash-attn-3 = [
-  # torch 2.9+cu129 — cp39-abi3 (stable ABI) works on both 3.11 and 3.12.
-  { url = "https://github.com/Luosuu/flash-attention3-wheels/releases/download/v0.0.1/flash_attn_3-3.0.0+20260313.cu129torch291cxx11abitrue.3a0d6b-cp39-abi3-linux_x86_64.whl", marker = "extra == 'gpu'"},
+    { url = "https://github.com/Luosuu/flash-attention3-wheels/releases/download/v0.0.5/flash_attn_3-3.0.0+20260610.cu130torch2110cxx11abitrue.fb02fc.sm90-cp310-abi3-linux_x86_64.whl", marker = "extra == 'gpu'" },
 ]
-# FlashAttention 4 is developed under flash-attention/flash-attn/cute folder as a standalone python project.
-# Pinned to 03/18/2026 latest main commit.
-flash-attn-4 = { git = "https://github.com/Dao-AILab/flash-attention", subdirectory = "flash_attn/cute", rev = "9397816f6094f5ba0de52c221093637054590d0d" }
-# FlashQLA — alternative chunk_gated_delta_rule implementation for Qwen3.5 linear attention.
-# Pinned to 05/08/2026 main HEAD (PR #13 "preserve input dtype in l2norm helper"). Includes
-# fixes accumulated since the prior pin: backward returning wrong number of gradients (#10),
-# auto_cp UnboundLocalError (#8), and l2norm dtype preservation (#13). Strictly newer than
-# v0.1.0 which shipped a chunk_gated_delta_rule wrapper that broke Qwen3.5 GatedDeltaNet
-# training.
+flash-mla = [
+    { url = "https://github.com/Luosuu/flash-mla-wheels/releases/download/v1.0.0-9241ae3-torch211cu130/flash_mla-1.0.0%2B9241ae3-1torch211cu130cuda131sm90asm100f-cp311-cp311-linux_x86_64.whl", marker = "extra == 'gpu' and python_version == '3.11'" },
+    { url = "https://github.com/Luosuu/flash-mla-wheels/releases/download/v1.0.0-9241ae3-torch211cu130/flash_mla-1.0.0%2B9241ae3-1torch211cu130cuda131sm90asm100f-cp312-cp312-linux_x86_64.whl", marker = "extra == 'gpu' and python_version == '3.12'" },
+]
+# Strictly newer than v0.1.0 — picks up fixes for backward gradient count (#10),
+# auto_cp UnboundLocalError (#8), and l2norm dtype preservation (#13).
 flash-qla = { git = "https://github.com/QwenLM/FlashQLA", rev = "6ef4858b5446e05bd461d9658d877e548182dbcb" }
 
-# Download av wheels directly to avoid FFmpeg build dependency issues in CI.
-# 3.11 uses av 14.4.0 (latest 14.x with cp311 wheel). 3.12 falls back to av 14.2.0 — the
-# newest 14.x release with a cp312 wheel on pypi (14.3.0 and 14.4.0 are 3.11-only).
+# Pinned wheels avoid FFmpeg build dep in CI. 3.11 → 14.4.0; 3.12 falls back
+# to 14.2.0 (no cp312 wheel for 14.3.0/14.4.0). x86_64 only — npu_aarch64
+# does not match these markers.
 av = [
-  { url = "https://files.pythonhosted.org/packages/f8/9a/8ffabfcafb42154b4b3a67d63f9b69e68fa8c34cb39ddd5cb813dd049ed4/av-14.4.0-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", marker = "(extra == 'audio' or extra == 'video' or extra == 'dit') and python_version == '3.11'" },
-  { url = "https://files.pythonhosted.org/packages/ed/e8/cf60f3fcde3d0eedee3e9ff66b674a9b85bffc907dccebbc56fb5ac4a954/av-14.2.0-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", marker = "(extra == 'audio' or extra == 'video' or extra == 'dit') and python_version == '3.12'" },
+  { url = "https://files.pythonhosted.org/packages/f8/9a/8ffabfcafb42154b4b3a67d63f9b69e68fa8c34cb39ddd5cb813dd049ed4/av-14.4.0-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", marker = "(extra == 'gpu' or extra == 'npu') and python_version == '3.11'" },
+  { url = "https://files.pythonhosted.org/packages/ed/e8/cf60f3fcde3d0eedee3e9ff66b674a9b85bffc907dccebbc56fb5ac4a954/av-14.2.0-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", marker = "(extra == 'gpu' or extra == 'npu') and python_version == '3.12'" },
 ]
 
 [[tool.uv.index]]
@@ -296,28 +267,34 @@ name = "pytorch-cpu"
 url = "https://download.pytorch.org/whl/cpu/"
 explicit = true
 
+# Static metadata bypasses the build hook during resolution. flash-qla has no
+# pyproject.toml, so without explicit `version` uv runs its setup.py on a
+# fresh (unseeded) venv and crashes with `ModuleNotFoundError: No module
+# named 'setuptools'`. The `requires-dist` mirrors flash-qla's own
+# install_requires — flash_qla/__init__.py top-level imports tilelang
+# (which itself transitively requires apache-tvm-ffi), so any code that
+# imports flash_qla (including VeOmni's lazy factory in
+# veomni/ops/kernels/gated_delta_rule) needs them present, not just users
+# who opt into the kernel at runtime.
+# Version: flash_qla setup.py = "0.1.0".
 [[tool.uv.dependency-metadata]]
-name = "flash-attn"
-requires-dist = ["torch"]
+name = "flash-qla"
+version = "0.1.0"
+requires-dist = ["torch", "tilelang==0.1.8", "apache-tvm-ffi==0.1.9"]
 
-[[tool.uv.dependency-metadata]]
-name = "flash-attn-3"
-requires-dist = ["torch"]
+# Seeds the build env (uv-created venvs are not seeded by default).
+[tool.uv.extra-build-dependencies]
+flash-attn-4 = ["setuptools", "wheel", "packaging", "ninja", "torch"]
+flash-qla = ["setuptools", "wheel", "packaging", "ninja", "torch"]
 
 [tool.setuptools.dynamic]
 version = {attr = "veomni._version.__version__"}
 
 [tool.setuptools.packages.find]
 where = ["."]
-# ``patchgen-pkg*`` keeps the sibling patchgen project from being bundled into
-# the veomni wheel — it ships separately. (The outer dir name carries the
-# ``-pkg`` suffix so setuptools' namespace-package finder doesn't see it as a
-# top-level ``patchgen`` package and shadow the editable install at dev time.)
+# patchgen-pkg* — sibling project, not bundled into the veomni wheel.
 exclude = ["tests*", "ci*", "configs*", "veomni_patch", "tasks", "scripts", "patchgen-pkg*"]
 
-# VeOmni's own discovery config — used when running ``patchgen --check`` /
-# ``patchgen --all`` from this repo. Downstream projects override it in
-# their own pyproject.toml.
 [tool.patchgen]
 search_root = "veomni/models/transformers"
 package_prefix = "veomni.models.transformers"

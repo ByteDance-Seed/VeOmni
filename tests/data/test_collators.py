@@ -100,6 +100,7 @@ def test_data_collator_pad_to_length_sp_disabled(monkeypatch, features_two_sampl
     exp_pos = torch.tensor([[0, 1, 2, 0, 1, 0, 0, 0]], dtype=torch.long)
     exp_labels = torch.tensor([[2, 3, 4, IGNORE_INDEX, 2, IGNORE_INDEX, IGNORE_INDEX, IGNORE_INDEX]], dtype=torch.long)
     exp_cu_seq_lens = torch.tensor([0, 3, 5, 6, 7, 8], dtype=torch.int32)
+    exp_linear_attn_cu_seq_lens = torch.tensor([0, 3, 5, 8], dtype=torch.int32)
     exp_max_length = 3
 
     assert torch.equal(out["input_ids"], exp_input_ids)
@@ -108,6 +109,7 @@ def test_data_collator_pad_to_length_sp_disabled(monkeypatch, features_two_sampl
     assert torch.equal(out["labels"], exp_labels)
     assert torch.equal(out["cu_seq_lens_q"], exp_cu_seq_lens)
     assert torch.equal(out["cu_seq_lens_k"], exp_cu_seq_lens)
+    assert torch.equal(out["linear_attn_cu_seq_lens_q"], exp_linear_attn_cu_seq_lens)
     assert out["max_length_q"] == exp_max_length
     assert out["max_length_k"] == exp_max_length
 
@@ -137,6 +139,7 @@ def test_seqcls_collator_pad_to_length_sp_enabled(monkeypatch, features_two_samp
     exp_pos = torch.tensor([[0, 1, 2, 0]], dtype=torch.long)
     exp_labels = torch.tensor([[3, 4, IGNORE_INDEX, 2]], dtype=torch.long)
     exp_cu_seq_lens = torch.tensor([0, 3, 5, 6, 7, 8], dtype=torch.int32)
+    exp_linear_attn_cu_seq_lens = torch.tensor([0, 3, 5, 8], dtype=torch.int32)
     exp_max_length = 3
 
     assert torch.equal(out["input_ids"], exp_input_ids)
@@ -145,6 +148,7 @@ def test_seqcls_collator_pad_to_length_sp_enabled(monkeypatch, features_two_samp
     assert torch.equal(out["labels"], exp_labels)
     assert torch.equal(out["cu_seq_lens_q"], exp_cu_seq_lens)
     assert torch.equal(out["cu_seq_lens_k"], exp_cu_seq_lens)
+    assert torch.equal(out["linear_attn_cu_seq_lens_q"], exp_linear_attn_cu_seq_lens)
     assert out["max_length_q"] == exp_max_length
     assert out["max_length_k"] == exp_max_length
 
@@ -158,6 +162,7 @@ def test_seqcls_collator_pad_to_length_sp_enabled(monkeypatch, features_two_samp
     exp_pos = torch.tensor([[1, 0, 0, 0]], dtype=torch.long)
     exp_labels = torch.tensor([[IGNORE_INDEX, IGNORE_INDEX, IGNORE_INDEX, IGNORE_INDEX]], dtype=torch.long)
     exp_cu_seq_lens = torch.tensor([0, 3, 5, 6, 7, 8], dtype=torch.int32)
+    exp_linear_attn_cu_seq_lens = torch.tensor([0, 3, 5, 8], dtype=torch.int32)
     exp_max_length = 3
 
     assert torch.equal(out["input_ids"], exp_input_ids)
@@ -166,8 +171,32 @@ def test_seqcls_collator_pad_to_length_sp_enabled(monkeypatch, features_two_samp
     assert torch.equal(out["labels"], exp_labels)
     assert torch.equal(out["cu_seq_lens_q"], exp_cu_seq_lens)
     assert torch.equal(out["cu_seq_lens_k"], exp_cu_seq_lens)
+    assert torch.equal(out["linear_attn_cu_seq_lens_q"], exp_linear_attn_cu_seq_lens)
     assert out["max_length_q"] == exp_max_length
     assert out["max_length_k"] == exp_max_length
+
+
+def test_packing_collator_clamps_linear_attn_tail_padding_length(monkeypatch, features_two_samples):
+    import veomni.data.data_collator as m
+
+    monkeypatch.setattr(m, "get_parallel_state", lambda: _fake_ps(sp_enabled=True))
+    monkeypatch.setattr(m.PackingCollator, "pad_batch_to_length", lambda _, batch: batch)
+
+    token_labels = [
+        {
+            **features_two_samples[0],
+            "labels": torch.tensor([2, 3, 4], dtype=torch.long),
+        },
+        {
+            **features_two_samples[1],
+            "labels": torch.tensor([1, 2], dtype=torch.long),
+        },
+    ]
+    collator = m.PackingCollator(pad_to_length=4)
+
+    out = collator(token_labels)
+
+    assert m._LINEAR_ATTN_TAIL_PADDING_LENGTH not in out
 
 
 # TODO: add omni data ci test

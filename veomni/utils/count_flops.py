@@ -86,6 +86,7 @@ class VeomniFlopsCounter:
             "qwen3_5": self._estimate_qwen3_5_family_flops,
             "qwen3_5_moe": self._estimate_qwen3_5_family_flops,
             "qwen3_5_moe_text": self._estimate_qwen3_5_family_flops,
+            "gpt_oss": self._estimate_gpt_oss_flops,
         }
 
         self.config = config
@@ -214,6 +215,82 @@ class VeomniFlopsCounter:
         attn_qkv_flops = 12 * seqlen_square_sum * head_dim * num_attention_heads * num_hidden_layers
 
         # all_layer & all_token fwd & bwk flops
+        flops_all_token = dense_N_flops + attn_qkv_flops
+        flops_achieved = flops_all_token * (1.0 / delta_time) / 1e12
+        return flops_achieved
+
+    @staticmethod
+    def _compute_sliding_attention_score_sum(batch_seqlens, sliding_window):
+        attention_score_sum = 0
+        for seqlen in batch_seqlens:
+            if seqlen <= sliding_window:
+                attention_score_sum += seqlen * (seqlen + 1) // 2
+            else:
+                attention_score_sum += sliding_window * (sliding_window + 1) // 2
+                attention_score_sum += (seqlen - sliding_window) * sliding_window
+        return attention_score_sum
+
+    def _estimate_gpt_oss_flops(self, tokens_sum, batch_seqlens, delta_time):
+        """
+        Estimate GPT-OSS training FLOPs.
+
+        GPT-OSS uses all-MoE layers with top-k routed experts and a mixed schedule of
+        full attention and sliding-window attention. Learnable attention sinks are
+        negligible relative to matmul FLOPs and are intentionally ignored.
+        """
+        hidden_size = self.config.hidden_size
+        vocab_size = self.config.vocab_size
+        intermediate_size = self.config.intermediate_size
+        num_hidden_layers = self.config.num_hidden_layers
+        num_key_value_heads = self.config.num_key_value_heads
+        num_attention_heads = self.config.num_attention_heads
+        num_local_experts = self.config.num_local_experts
+        num_experts_per_tok = self.config.num_experts_per_tok
+        head_dim = getattr(self.config, "head_dim", hidden_size // num_attention_heads)
+
+        q_size = num_attention_heads * head_dim
+        k_size = num_key_value_heads * head_dim
+        v_size = num_key_value_heads * head_dim
+
+        # Router + active routed experts. GPT-OSS stores gate/up in one interleaved
+        # projection, but its arithmetic is equivalent to gate_proj + up_proj + down_proj.
+        moe_gate_N = hidden_size * num_local_experts
+        moe_expertmlp_N = hidden_size * intermediate_size * num_experts_per_tok * 3
+        attn_linear_N = hidden_size * (q_size + k_size + v_size + q_size)
+        lm_head_N = self._compute_lm_head_params(hidden_size, vocab_size)
+        dense_N = (moe_gate_N + moe_expertmlp_N + attn_linear_N) * num_hidden_layers + lm_head_N
+        dense_N_flops = 6 * dense_N * tokens_sum
+
+        layer_types = getattr(self.config, "layer_types", None)
+        if layer_types is None:
+            num_full_attn_layers = num_hidden_layers
+            num_sliding_attn_layers = 0
+        else:
+            num_full_attn_layers = sum(t == "full_attention" for t in layer_types)
+            num_sliding_attn_layers = sum(t == "sliding_attention" for t in layer_types)
+            if num_full_attn_layers + num_sliding_attn_layers != num_hidden_layers:
+                raise ValueError(
+                    f"GPT-OSS attention layer count mismatch: {num_full_attn_layers} full + "
+                    f"{num_sliding_attn_layers} sliding != {num_hidden_layers} total layers. "
+                    "The config may use an unsupported entry in `config.layer_types`."
+                )
+
+        full_attn_score_sum = 0
+        for seqlen in batch_seqlens:
+            full_attn_score_sum += seqlen * seqlen
+
+        sliding_window = getattr(self.config, "sliding_window", None)
+        if num_sliding_attn_layers > 0 and sliding_window is None:
+            raise ValueError("GPT-OSS config has sliding attention layers but no `sliding_window`.")
+        sliding_attn_score_sum = (
+            self._compute_sliding_attention_score_sum(batch_seqlens, sliding_window)
+            if num_sliding_attn_layers > 0
+            else 0
+        )
+        attn_score_sum = full_attn_score_sum * num_full_attn_layers
+        attn_score_sum += sliding_attn_score_sum * num_sliding_attn_layers
+        attn_qkv_flops = 12 * attn_score_sum * head_dim * num_attention_heads
+
         flops_all_token = dense_N_flops + attn_qkv_flops
         flops_achieved = flops_all_token * (1.0 / delta_time) / 1e12
         return flops_achieved

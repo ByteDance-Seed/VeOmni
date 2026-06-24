@@ -24,13 +24,24 @@ file systems (e.g., HDFS via FUSE) that do not support r+b (read-write binary)
 file mode for random write access.
 """
 
+import hashlib
+import inspect
 import types
 
 
 _dcp_consolidation_patch_applied = False
 
-# Fixed torch version for this patch - update when upgrading torch
-_REQUIRED_TORCH_VERSION = "2.9"
+# Fixed torch versions for this patch - update when upgrading torch
+_SUPPORTED_TORCH_VERSION_PREFIXES = ("2.9", "2.11")
+_EXPECTED_PROCESS_OUTPUT_FILE_ARGS = ("output_file", "output_data", "input_files_data")
+_SUPPORTED_PROCESS_OUTPUT_FILE_SHA256 = {
+    # torch 2.9.1
+    "0837813477b4ca319890ef671b954f83bbe966f21a751875606b74e4e8e30ea8",
+    # torch 2.11.0 upstream source
+    "ff25a85cc52018707334f1206760fe186146771e5357388f0b4d6bc19bdf61c1",
+    # torch 2.11.0+cu130 CI wheel
+    "433c9d026092f48f5ba02631975294de1a8ae98e020d5cb6ffd0f5db760476fe",
+}
 
 
 def apply_dcp_consolidation_patch():
@@ -59,12 +70,12 @@ def apply_dcp_consolidation_patch():
     if _dcp_consolidation_patch_applied:
         return
 
-    # Verify torch version matches exactly
+    # Verify torch version matches a known-compatible implementation.
     import torch
 
-    if not torch.__version__.startswith(_REQUIRED_TORCH_VERSION):
+    if not torch.__version__.startswith(_SUPPORTED_TORCH_VERSION_PREFIXES):
         raise RuntimeError(
-            f"DCP consolidation patch requires torch {_REQUIRED_TORCH_VERSION}.x, "
+            f"DCP consolidation patch requires torch {_SUPPORTED_TORCH_VERSION_PREFIXES}, "
             f"but got {torch.__version__}. Please update the patch or verify compatibility."
         )
 
@@ -73,7 +84,25 @@ def apply_dcp_consolidation_patch():
     if not hasattr(hf_module, "_process_output_file"):
         raise RuntimeError(
             f"torch.distributed.checkpoint._consolidate_hf_safetensors does not have "
-            f"_process_output_file attribute. Please verify torch {_REQUIRED_TORCH_VERSION}.x compatibility."
+            f"_process_output_file attribute. Please verify torch {_SUPPORTED_TORCH_VERSION_PREFIXES} compatibility."
+        )
+
+    process_output_file = hf_module._process_output_file
+    process_output_file_args = tuple(inspect.signature(process_output_file).parameters)
+    if process_output_file_args != _EXPECTED_PROCESS_OUTPUT_FILE_ARGS:
+        raise RuntimeError(
+            "torch.distributed.checkpoint._consolidate_hf_safetensors._process_output_file "
+            f"signature changed from {_EXPECTED_PROCESS_OUTPUT_FILE_ARGS} to {process_output_file_args}. "
+            "Please update the DCP consolidation patch."
+        )
+
+    process_output_file_source = inspect.getsource(process_output_file)
+    process_output_file_hash = hashlib.sha256(process_output_file_source.encode()).hexdigest()
+    if process_output_file_hash not in _SUPPORTED_PROCESS_OUTPUT_FILE_SHA256:
+        raise RuntimeError(
+            "torch.distributed.checkpoint._consolidate_hf_safetensors._process_output_file "
+            f"source hash {process_output_file_hash} is not in the verified set. "
+            "Please update the DCP consolidation patch."
         )
 
     # Define the replacement function logic

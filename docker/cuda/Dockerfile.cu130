@@ -1,5 +1,5 @@
-# https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-25-03.html
-from nvcr.io/nvidia/pytorch:25.03-py3
+# https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-25-11.html
+from nvcr.io/nvidia/pytorch:25.11-py3
 
 # Define environments
 ENV MAX_JOBS=16
@@ -88,13 +88,6 @@ RUN uv sync \
     --locked \
     --all-packages \
     --extra gpu \
-    --extra audio \
-    --extra video \
-    --extra dit \
-    --extra trl \
-    --extra lora \
-    --extra fa4 \
-    --extra flash-qla \
     --dev
 
 USER root

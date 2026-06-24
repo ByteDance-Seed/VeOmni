@@ -20,9 +20,7 @@ from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
 from .....distributed.parallel_state import get_parallel_state
 from .....distributed.sequence_parallel import (
-    gather_heads_scatter_seq,
     gather_outputs,
-    gather_seq_scatter_heads,
     slice_input_tensor,
 )
 from .....utils import logging
@@ -52,6 +50,92 @@ def wan_eager_attention_forward(
         query, key, value, attn_mask=attention_mask, dropout_p=dropout, scale=scaling, is_causal=False
     )
     return attn_output.transpose(1, 2), None
+
+
+class WanAttentionKernelModule:
+    def __init__(self, config: SimpleNamespace, attn: WanAttention):
+        target_dtype = attn.to_q.weight.dtype
+        if target_dtype == torch.float32:
+            target_dtype = torch.bfloat16
+        self.config = SimpleNamespace(
+            _attn_implementation=config._attn_implementation,
+            _pre_quantization_dtype=target_dtype,
+        )
+        self.is_causal = False
+        self.layer_idx = getattr(attn, "layer_idx", None)
+        self._attn = attn
+
+    def modules(self):
+        return self._attn.modules()
+
+
+def _get_wan_full_sequence_varlen_kwargs(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    query_length: int | None = None,
+    key_length: int | None = None,
+) -> dict[str, torch.Tensor | int]:
+    # Wan DiT batches are already full per-sample sequences, not packed
+    # text-style ragged inputs. Still pass explicit varlen metadata so FA2 uses
+    # the same unpadded kernel path without inventing a padding mask.
+    if query.ndim != 4 or key.ndim != 4 or value.ndim != 4:
+        raise ValueError("Wan flash-attention expects Q/K/V tensors with shape (batch, seq, heads, head_dim).")
+    if query.shape[0] != key.shape[0] or query.shape[0] != value.shape[0]:
+        raise ValueError(
+            "Wan flash-attention expects matching Q/K/V batch sizes; "
+            f"got {query.shape[0]}/{key.shape[0]}/{value.shape[0]}."
+        )
+
+    batch_size = query.shape[0]
+    query_length = query.shape[1] if query_length is None else query_length
+    key_length = key.shape[1] if key_length is None else key_length
+    cu_seq_lens_q = torch.arange(
+        0,
+        (batch_size + 1) * query_length,
+        query_length,
+        device=query.device,
+        dtype=torch.int32,
+    )
+    cu_seq_lens_k = torch.arange(
+        0,
+        (batch_size + 1) * key_length,
+        key_length,
+        device=key.device,
+        dtype=torch.int32,
+    )
+    return {
+        "cu_seq_lens_q": cu_seq_lens_q,
+        "cu_seq_lens_k": cu_seq_lens_k,
+        "max_length_q": query_length,
+        "max_length_k": key_length,
+    }
+
+
+def _assert_wan_flash_attention_bf16(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attn: WanAttention,
+) -> None:
+    # Wan's production FA2 coverage is bf16 mixed precision. Falling back to
+    # eager for fp32 would hide the path this PR is meant to validate.
+    tensor_dtypes = {
+        "query": query.dtype,
+        "key": key.dtype,
+        "value": value.dtype,
+    }
+    weight_dtypes = {
+        "to_q.weight": attn.to_q.weight.dtype,
+        "to_k.weight": attn.to_k.weight.dtype,
+        "to_v.weight": attn.to_v.weight.dtype,
+    }
+    assert all(dtype == torch.bfloat16 for dtype in tensor_dtypes.values()), (
+        f"Wan flash-attention expects bf16 Q/K/V tensors, got {tensor_dtypes}."
+    )
+    assert all(dtype == torch.bfloat16 for dtype in weight_dtypes.values()), (
+        f"Wan flash-attention expects bf16 projection weights, got {weight_dtypes}."
+    )
 
 
 class WanSPAttnProcessor(WanAttnProcessor):
@@ -87,6 +171,8 @@ class WanSPAttnProcessor(WanAttnProcessor):
         key = key.unflatten(2, (attn.heads, -1))
         value = value.unflatten(2, (attn.heads, -1))
 
+        use_sp = get_parallel_state().sp_enabled and not is_cross_attention
+
         if rotary_emb is not None:
 
             def apply_rotary_emb(
@@ -105,16 +191,17 @@ class WanSPAttnProcessor(WanAttnProcessor):
             query = apply_rotary_emb(query, *rotary_emb)
             key = apply_rotary_emb(key, *rotary_emb)
 
-        if get_parallel_state().sp_enabled and not is_cross_attention:
-            query = gather_seq_scatter_heads(query, seq_dim=1, head_dim=2, group=get_parallel_state().ulysses_group)
-            key = gather_seq_scatter_heads(key, seq_dim=1, head_dim=2, group=get_parallel_state().ulysses_group)
-            value = gather_seq_scatter_heads(value, seq_dim=1, head_dim=2, group=get_parallel_state().ulysses_group)
-
-        # Route to the right attention kernel via ALL_ATTENTION_FUNCTIONS.
-        # SP has already been handled above, so skip it inside the kernel.
+        # DiT trainer feeds full per-sample sequences. Passing explicit sequence
+        # boundaries selects HF's varlen FA2 path without changing attention
+        # semantics or relying on a synthetic padding mask.
         attention_interface: Callable = wan_eager_attention_forward
+        use_flash_attention = self.attn_implementation in {"flash_attention_2", "veomni_flash_attention_2_with_sp"}
+        if use_flash_attention:
+            _assert_wan_flash_attention_bf16(query, key, value, attn)
         if self.attn_implementation != "eager":
             attention_interface = ALL_ATTENTION_FUNCTIONS[self.attn_implementation]
+
+        kernel_module = WanAttentionKernelModule(self.config, attn)
 
         # I2V: additional cross-attention over image tokens (no Ulysses SP needed).
         hidden_states_img = None
@@ -124,8 +211,16 @@ class WanSPAttnProcessor(WanAttnProcessor):
 
             key_img = key_img.unflatten(2, (attn.heads, -1))
             value_img = value_img.unflatten(2, (attn.heads, -1))
+            if use_flash_attention:
+                assert key_img.dtype == torch.bfloat16 and value_img.dtype == torch.bfloat16, (
+                    "Wan image flash-attention expects bf16 added K/V tensors, "
+                    f"got key={key_img.dtype}, value={value_img.dtype}."
+                )
+            image_attention_kwargs = (
+                _get_wan_full_sequence_varlen_kwargs(query, key_img, value_img) if use_flash_attention else {}
+            )
             hidden_states_img = attention_interface(
-                self,
+                kernel_module,
                 query.transpose(1, 2),
                 key_img.transpose(1, 2),
                 value_img.transpose(1, 2),
@@ -133,25 +228,35 @@ class WanSPAttnProcessor(WanAttnProcessor):
                 dropout=0.0,
                 is_causal=False,
                 skip_ulysses=True,
+                **image_attention_kwargs,
             )[0]
             hidden_states_img = hidden_states_img.flatten(2, 3).type_as(query)
 
+        query_length = query.shape[1]
+        key_length = key.shape[1]
+        if use_sp:
+            # Wan forward slices hidden_states/rotary_emb before the blocks.
+            # The shared VeOmni FA wrapper gathers those local slices back to
+            # the full sequence before calling FA2, so cu_seqlens must describe
+            # the post-gather length rather than this rank's local length.
+            query_length *= get_parallel_state().ulysses_size
+            key_length *= get_parallel_state().ulysses_size
+        attention_kwargs = (
+            _get_wan_full_sequence_varlen_kwargs(query, key, value, query_length=query_length, key_length=key_length)
+            if use_flash_attention
+            else {}
+        )
         hidden_states_out = attention_interface(
-            self,
+            kernel_module,
             query.transpose(1, 2),
             key.transpose(1, 2),
             value.transpose(1, 2),
-            attention_mask=None,
+            attention_mask=attention_mask,
             dropout=0.0,
             is_causal=False,
-            skip_ulysses=True,
+            skip_ulysses=is_cross_attention,
+            **attention_kwargs,
         )[0]
-
-        # Inverse AllToAll: scatter sequence, gather heads back.
-        if get_parallel_state().sp_enabled and not is_cross_attention:
-            hidden_states_out = gather_heads_scatter_seq(
-                hidden_states_out, seq_dim=1, head_dim=2, group=get_parallel_state().ulysses_group
-            )
 
         hidden_states_out = hidden_states_out.flatten(2, 3)
         hidden_states = hidden_states.type_as(query)
@@ -159,6 +264,7 @@ class WanSPAttnProcessor(WanAttnProcessor):
         if hidden_states_img is not None:
             hidden_states_out = hidden_states_out + hidden_states_img
 
+        hidden_states_out = hidden_states_out.type_as(attn.to_out[0].weight)
         hidden_states_out = attn.to_out[0](hidden_states_out)
         hidden_states_out = attn.to_out[1](hidden_states_out)
         return hidden_states_out
@@ -280,6 +386,7 @@ class _WanTransformerInitShim(_WanTransformer3DModel):
 class WanTransformer3DModel(PreTrainedModel, _WanTransformerInitShim):
     config_class = WanTransformer3DModelConfig
     supports_gradient_checkpointing = True
+    _supports_flash_attn = True
 
     def __init__(self, config: WanTransformer3DModelConfig, **kwargs):
         PreTrainedModel.__init__(self, config, **kwargs)
@@ -360,6 +467,7 @@ def apply_veomni_wan_transformer_patch() -> None:
     # already exercises FA2 (via our SP-aware attention processor) and goes
     # through the WanAttention forward we control — opt in to FA2 here so the
     # diffusers gate doesn't refuse on our behalf.
+    _WanTransformer3DModel._supports_flash_attn = True
     _WanTransformer3DModel._supports_flash_attn_2 = True
     logger.info_rank0("Applied VeOmni SP patch to WanTransformer3DModel.forward.")
 

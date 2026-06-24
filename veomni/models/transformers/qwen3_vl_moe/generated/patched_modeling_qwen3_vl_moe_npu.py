@@ -937,6 +937,18 @@ class Qwen3VLMoeVisionBlock(GradientCheckpointingLayer):
         position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
         **kwargs,
     ) -> torch.Tensor:
+        r"""
+        hidden_states (`torch.Tensor`):
+            The input hidden states.
+        cu_seqlens (`torch.Tensor`):
+            Cumulative sequence lengths for variable-length vision attention.
+        max_seqlen (`int`):
+            Maximum per-image or per-video sequence length in the packed vision batch.
+        rotary_pos_emb (`torch.Tensor`, *optional*):
+            Precomputed rotary position embeddings for vision attention.
+        position_embeddings (`tuple[torch.Tensor, torch.Tensor]`, *optional*):
+            Precomputed rotary positional embeddings (cos, sin) for vision attention.
+        """
         hidden_states = hidden_states + self.attn(
             self.norm1(hidden_states),
             cu_seqlens=cu_seqlens,
@@ -1998,6 +2010,8 @@ class Qwen3VLMoeModel(Qwen3VLMoePreTrainedModel):
         **kwargs: Unpack[TransformersKwargs],
     ) -> tuple | Qwen3VLMoeModelOutputWithPast:
         r"""
+        cache_position (`torch.LongTensor`, *optional*):
+            Indices describing the positions of the input sequence tokens in the cache.
         image_grid_thw (`torch.LongTensor` of shape `(num_images, 3)`, *optional*):
             The temporal, height and width of feature shape of each image in LLM.
         video_grid_thw (`torch.LongTensor` of shape `(num_videos, 3)`, *optional*):

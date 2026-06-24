@@ -69,7 +69,7 @@ python -c "import transformers; print(transformers.__version__)"
 If not `5.9.0`, re-sync the default env:
 
 ```bash
-uv sync --frozen --extra gpu --extra audio --group dev
+uv sync --frozen --extra gpu --group dev
 source .venv/bin/activate
 ```
 
@@ -703,7 +703,7 @@ Activate the project venv:
 ```bash
 source .venv/bin/activate
 # If not already synced:
-# uv sync --extra gpu --extra audio --dev
+# uv sync --extra gpu --dev
 ```
 
 Run:

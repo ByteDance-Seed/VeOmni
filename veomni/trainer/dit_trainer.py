@@ -374,6 +374,8 @@ class DiTTrainer:
                 bsz_warmup_init_mbtoken=args.train.bsz_warmup_init_mbtoken,
                 dyn_bsz=args.train.dyn_bsz,
                 dyn_bsz_runtime=args.train.dyn_bsz_runtime,
+                dyn_bsz_count_mode=args.train.dyn_bsz_count_mode,
+                dyn_bsz_physical_overflow_ratio=args.train.dyn_bsz_physical_overflow_ratio,
                 dyn_bsz_buffer_size=args.data.dyn_bsz_buffer_size,
                 num_workers=args.data.dataloader.num_workers,
                 drop_last=args.data.dataloader.drop_last,
