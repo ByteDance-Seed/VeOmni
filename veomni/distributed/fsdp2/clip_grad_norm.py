@@ -46,19 +46,6 @@ def clip_grad_norm(
     return grad_norm
 
 
-def _fsdp_grad_norm_reduce_groups(ps) -> List[tuple[str, dist.ProcessGroup | None]]:
-    """Process groups for FSDP2 grad-norm reduction.
-
-    Under HSDP each shard group is replicated across ``dp_replicate``; only sum
-    shard-local p-th powers across ``dp_shard``, not across replicas.
-    """
-    if ps.dp_mode != "fsdp2":
-        return []
-    if ps.dp_replicate_enabled and ps.dp_shard_size > 1:
-        return [("fsdp_shard", ps.dp_shard_group)]
-    return [("fsdp", ps.fsdp_group)]
-
-
 @torch.no_grad()
 def _cpu_offload_fsdp2_clip_grad_norm(
     model, max_norm: float, norm_type: float = 2.0, error_if_nonfinite: bool = False, foreach: bool | None = None
@@ -68,7 +55,7 @@ def _cpu_offload_fsdp2_clip_grad_norm(
     total_norm_or_pth_sum = _fsdp2_reduce_group(
         params=params,
         norm_type=norm_type,
-        reduce_groups=_fsdp_grad_norm_reduce_groups(ps),
+        reduce_groups=[("fsdp", ps.fsdp_group)],
     )
     total_norm = _finalize_total_norm(total_norm_or_pth_sum, norm_type)
     _raise_if_nonfinite(total_norm, norm_type, error_if_nonfinite)
@@ -93,6 +80,7 @@ def extra_parallel_fsdp2_clip_grad_norm(
     - Use a single global clip coefficient for both groups.
     """
     ps = get_parallel_state()
+    fsdp_group = ps.fsdp_group
     extra_parallel_group = {
         para: ps.extra_parallel_group(para) if ps.extra_parallel_enabled(para) else None
         for para in ps.extra_parallel_names
@@ -118,7 +106,7 @@ def extra_parallel_fsdp2_clip_grad_norm(
     non_extra_parallel_total = _fsdp2_reduce_group(
         params=non_extra_parallel_params,
         norm_type=norm_type,
-        reduce_groups=_fsdp_grad_norm_reduce_groups(ps),
+        reduce_groups=[("fsdp", fsdp_group)],
     )
     logger.debug_rank0(f"non_extra_parallel total grad norm: {non_extra_parallel_total}")
 

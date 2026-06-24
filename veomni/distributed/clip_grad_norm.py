@@ -3,7 +3,7 @@ import math
 import torch
 
 from .fsdp2 import clip_grad_norm as fsdp2_clip_grad_norm
-from .fsdp2.clip_grad_norm import _finalize_total_norm, _fsdp2_reduce_group, _fsdp_grad_norm_reduce_groups
+from .fsdp2.clip_grad_norm import _finalize_total_norm, _fsdp2_reduce_group
 from .parallel_state import get_parallel_state
 
 
@@ -36,8 +36,7 @@ def veomni_omni_module_clip_grad_norm(
     for this module's topology, finalized into the module norm, then used to clip
     this module's params:
 
-    * FSDP2: local shard pᵗʰ-sum, all-reduce SUM over the FSDP grad-norm group
-      (``dp_shard`` under HSDP, otherwise ``fsdp_group``).
+    * FSDP2: local shard pᵗʰ-sum, all-reduce SUM over ``fsdp_group``.
     * FSDP2 + ExtraParallel: non-ExtraParallel params over ``fsdp_group``;
       ExtraParallel params over ``{ep}_fsdp`` then ``{ep}`` (mirrors
       ``extra_parallel_fsdp2_clip_grad_norm``).
@@ -57,7 +56,7 @@ def veomni_omni_module_clip_grad_norm(
     if ep_param_groups is not None and ps.any_extra_parallel_enabled:
         non_ep = [p for p in ep_param_groups.get("non_extra_parallel", []) if p.grad is not None]
         if non_ep:
-            pth_sums.append(_fsdp2_reduce_group(non_ep, norm_type, _fsdp_grad_norm_reduce_groups(ps)))
+            pth_sums.append(_fsdp2_reduce_group(non_ep, norm_type, [("fsdp", ps.fsdp_group)]))
             groups_to_clip.append(non_ep)
         for para in ps.extra_parallel_names:
             if not ps.extra_parallel_enabled(para):
@@ -77,9 +76,9 @@ def veomni_omni_module_clip_grad_norm(
     else:
         params = [p for p in model.parameters() if p.grad is not None]
         if params:
-            # FSDP2 grads are sharded -> reduce local shard sums over the grad-norm group.
+            # FSDP2 grads are sharded -> reduce local shard sums over the fsdp group.
             # DDP grads are replicated and already all-reduced -> no further reduce.
-            reduce_groups = _fsdp_grad_norm_reduce_groups(ps)
+            reduce_groups = [("fsdp", ps.fsdp_group)] if ps.dp_mode == "fsdp2" else []
             pth_sums.append(_fsdp2_reduce_group(params, norm_type, reduce_groups))
             groups_to_clip.append(params)
 
