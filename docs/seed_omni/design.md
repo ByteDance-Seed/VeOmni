@@ -268,7 +268,7 @@ class OmniModel(PreTrainedModel, GenerationMixin):
             module_name = self.graph.module_of(n)
             method      = self.graph.method_of(n)       # 默认 forward
             module      = self.modules_dict[module_name]
-            inputs      = self.graph.collect_inputs(n, node_outputs, batch)
+            inputs      = batch   # edges 仅声明拓扑顺序，无 per-node 路由；共享 conversation_list 载体
             # 一次调用内部把本 step 的所有 micro-batch 跑完：模块 forward
             # 自己迭代 micro-batches → 累加 token-sum loss / 累加 token_count →
             # post_forward 里做一次 token-level mean，吐出标量 `*_loss`
@@ -824,9 +824,11 @@ lift 到 `train.accelerator`）。
 
 - **构建**：`parallelize_model_ddp`（`torch_parallelize.py`）在 meta-init 下先 materialize + 加载全量权重，
   **再** `DDP(...)`（DDP 只复制 + 注册梯度同步 hook，不会 materialize meta 参数、不加载权重）。
-- **分发**：`DistributedDataParallel` 不代理属性访问，所以 `OmniModuleTrainer.forward` / `on_step_end` 要
-  `_unwrap_module(self.base.model)` 取 `pre_forward`/`post_forward`/`trace_collect`，但实际前向仍调 **wrapper**
-  以触发 hook（FSDP2 原地 `raw is wrapper`；DDP 包装 `raw = wrapper.module`）。
+- **分发**：`DistributedDataParallel` 不代理属性访问，所以 `TrainingGraph.step`（训练单节点驱动）/
+  `OmniModuleTrainer.on_step_end` 要 `_unwrap_module(...)` 取 `pre_forward`/`post_forward`/`trace_collect`，
+  但实际前向仍调 **wrapper** 以触发 hook（FSDP2 原地 `raw is wrapper`；DDP 包装 `raw = wrapper.module`）。
+  composed 后的 `OmniModel` 把每个 module 的 wrapped model 作为子模块持有，`TrainingGraph.step` 通过 `OmniModel`
+  传入的 wrapped modules 字典取用（与 `GenerationGraph.step` 完全对称）。
 
 ### FQN 视角对齐（重要细节）
 
@@ -898,7 +900,7 @@ lift 到 `train.accelerator`）。
 
 ### Save：每个 module 自己的 callback
 
-每个 module-trainer 在初始化时挂一个自己的 `OmniModuleHfCallback` / `OmniModuleLoraCallback` 实例（定义于 [`veomni/trainer/omni_trainer.py`](veomni/trainer/omni_trainer.py)，分别继承 `HuggingfaceCkptCallback` / `HFLoraCkptCallback`）。orchestrator 的 `on_*` cascade 触发 save 时，各 module-trainer 各自写自己的 subfolder：
+每个 module-trainer 在初始化时挂一个自己的 `OmniModuleHfCallback` / `OmniModuleLoraCallback` 实例（定义于 [`veomni/trainer/omni/omni_module_trainer.py`](veomni/trainer/omni/omni_module_trainer.py)，分别继承 `HuggingfaceCkptCallback` / `HFLoraCkptCallback`）。orchestrator 的 `on_*` cascade 触发 save 时，各 module-trainer 各自写自己的 subfolder：
 
 ```
 output_ckpt_dir/
@@ -1117,8 +1119,14 @@ raw_batch["conversation_list"][0] = [   # 第 0 个 sample
 - **collator 在 module pre_forward 中按需调用，不再是 dataloader final-step**：每个 module 自己知道关心哪些字段、怎么 batch、SP 怎么切（ViT 切 image batch 维；text encoder 切 sequence 维）。
 - **可选：module 自管的 CPU 预处理可下放到 DataLoader worker（不破坏上面的契约）**：module 的 chat-template+tokenize、image normalize 等**纯 CPU、无权重、无梯度**的 input-prep，默认在 `pre_forward`（主进程）跑，会阻塞 GPU 且无法 prefetch。module 可 override `ModuleMixin.build_cpu_preprocessor()` 返回一个**可 pickle、不含 nn.Module** 的 `CPUPreprocessor`（仅持有 tokenizer / image_processor / config 整数，建 CPU 张量）；`OmniTrainer._build_collate_fn` 收集 active 模块的预处理器交给 `SeedOmniCollator`，于是这段逻辑在 **worker** 内执行、借 prefetch 与 GPU 计算重叠，`pre_forward` 退化为「检测 sentinel → 已就绪则只 `.to(device)`，否则回退完整路径」。处理逻辑仍归 module 所有、数据集仍 model-agnostic；只有执行位置从主进程移到 worker。需要权重/梯度的真正 encode 计算（ViT/VAE/wte、VQ 量化）必须留在 forward，不可进 worker。已接入：Janus（text_encoder / siglip / vqvae）、Qwen3 text_encoder（同时覆盖 qwen3_moe，二者共用该 text_encoder）、Qwen3-VL（text_encoder + vision）。各 backbone（`janus_llama` / `qwen3_*_llm`）只读 embeds/hidden_states、无 CPU 预处理，不 override（返回 `None`、零开销）。
   - 配套：`naflatten`/`unflatten`（`veomni/utils/tensor_utils.py`）的形状元数据保持在 **CPU**，避免 `unflatten().tolist()` 在 backbone / text_encoder 的 post_forward 触发逐段 device→host 同步（这些同步会阻塞在尚未跑完的 forward kernel 上）。
-  - **dummy 输入也由 worker 构造**：vision/codec 模块（siglip / vqvae / qwen3vl_vision）在某 micro-batch 没有真实 image/video 时，预处理器按模块几何 append 一个 `role="dummy"` 占位 item（value=零 pixels，`meta["source"]` 标识模块，qwen3vl 另带 grid）。这样 forward 不再构造 dummy 输入：`forward_pre` 识别该占位 → 给 forward 喂零输入 + `is_dummy=True`，`forward_post` 把占位 value 覆写成 embed（与真实 item「worker 设 pixels → post 设 embed」同构）。FSDP/DDP 需要的「零输入 GPU forward 跑过可训练权重拿梯度」仍在 forward 发生（不可省、不进 worker）；`worker_dummy_items` 用 `role="dummy"` + `meta["source"]` 找回该占位（同一 source 在任一调用点至多一类 dummy，无需额外 sentinel）。eager 推理无 worker 时，`forward` 仍按 `pixel_values is None and fsdp_enabled` 回退自建 dummy。
-  - **「真实图已 normalize」哨兵是每模块专属**（`janus_siglip_pixels` / `janus_vqvae_pixels` / `qwen3vl_vision_pixels`，各模块 mixin 内定义），不共用——三者虽按 role 不相交，但专属 key 让标记显式、按构造防冲突。
+  - **推理复用同一套 preprocessor（训练/推理对齐）**：`OmniInferencer._preprocess_request` 在进入 FSM 之前，对 request 的 `conversation_list`（单样本，包成 batch-of-1）按 graph 顺序跑一遍各 module 的 `build_cpu_preprocessor()`，与训练 `SeedOmniCollator` 完全同一套逻辑。`CPUPreprocessor.__call__(conversation_list, *, inference=False)` 用 `inference` flag 区分训练/推理专属行为：image/codec 模块**跳过 dummy 注入**（推理无 FSDP anchor 需求），text encoder **追加 generation prompt**（`tokenize_conversation(..., add_generation_prompt=True)`）。于是 module 的 `generate` 不再现场 process，只负责 pack → encode → scatter，和训练 forward 同构：vision 直接读回 patches 跑 ViT；text encoder 首个 FSM step 由 `TextEncoderModuleMixin._encode_prompt` 直接 embed 已 tokenize 的 prompt（`_prompt_encoded` flag 区分首步 vs 后续 AR）。唯一例外是推理 FSM **中途**生成的 item（如 janus siglip 对生成图的 `image_output` 回编码），preprocessor 见不到，仍在 `generate` 内现场处理。
+  - **dummy 输入也由 worker 构造**：vision/codec 模块（siglip / vqvae / qwen3vl_vision）在某 micro-batch 没有真实 image/video 时，预处理器按模块几何 append 一个 `role="dummy"` 占位 item（value=零 pixels，`item.source` 标识模块，qwen3vl 另带 grid）。真实 item 也在 CPU 预处理时打上 `item.source`，于是**真实数据与 dummy 同构**：`forward_pre` 用单个 `iter_desired_items(sources=[_SOURCE])` 一把取出（一个 batch 要么全真要么全 dummy），stack→喂 forward + `is_dummy` 标记；`forward_post` 同样按 source 取回、逐 item 回写 embed，**不判断 None / dummy / role**。
+  - **dummy 仅在 training + FSDP 下需要**（「零输入 GPU forward 跑过可训练权重拿梯度」的 reduce_scatter anchor），所有 fsdp/training 判断统一收敛到 `modeling`，且**永远产出真实形状的零张量而非 `None`**，让 pre/post 保持 branch-free：
+    - `modeling.forward/encode`：`if is_dummy and not (self.training and fsdp_enabled): 造零张量 else: 真跑 encode`。即只有「训练 + 开 FSDP」才真跑 codec/ViT 当 anchor；推理（eval）或不开 FSDP 时跳过 forward，用 `_dummy_*` helper 造一份与真实 encode 同 batch/同 token 数的零张量（vqvae: `image_embeds`+`vq_token_ids`；siglip: `image_embeds`；qwen3vl: `image_embeds`+每层 deepstack feature）。
+    - vqvae 还有 encode→decode 两段依赖（decode 需要 encode 产出的 label），因 dummy 现在恒有真实形状的 label/embed，`decode_pre` 拼 dummy span 与真实 gen image 完全同构；`modeling.decode` 同样按 `self.training and fsdp_enabled` 决定 dummy 走 `generation_head` anchor 还是直接返回 `0.0` loss。
+
+    CPU 预处理一定会跑（worker 或主进程 collator），故 `pre_forward` 无需 eager 回退。
+  - **「worker 已 normalize」无需独立哨兵**：siglip / vqvae 真实 item 经 role 即可区分（`forward_pre` 直接 stack 已是 model-dtype 的 `value`）；qwen3vl_vision 用 per-item `_OMNI_GRID`（grid 元数据）的存在与否区分「训练已处理 patches」与「eager 推理 raw 图」，复用同一个 grid key，不再额外维护 `*_pixels` 哨兵。
 - **forward 阶段两次"形态变换"**：(1) Layer 4 ViT/VAE 在 conversation_list 中**插入新 item**（boi/eoi marker）、原 image item 的 value 不变（仍是 resized tensor）；(2) Layer 5 text_encoder 把 conversation_list **按模态 split** 输出新 list，每个 item 的 value 升级为 inputs_embeds（text segment 多 token；image/audio/marker segment 单 token placeholder）；(3) Layer 6 backbone splice 把每个 modality segment 的 1-token placeholder embedding 替换成 N 个 patch tokens，concat 输出 flat inputs_embeds。labels / attention_mask / position_ids 在 Layer 5 和 Layer 6 各重新计算一次。
 - **module forward = kwargs + Dict 返回**（W2 风格）：API 不变，但语义改成"返回 dict 立刻被框架按 edge.as 写回 raw_batch"，data 不通过 edge 通道传递。下游 module 从同一 raw_batch 按 input keys 取。
 - **graph topology 自动从 edge dependency 推**：因为 ViT/VAE 修改 conversation_list、text_encoder 读 conversation_list，topo 序自动 ViT/VAE → text_encoder → backbone，**不需要显式顺序约束 edge**。

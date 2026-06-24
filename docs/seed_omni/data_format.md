@@ -153,7 +153,7 @@ assistant-side placeholder.
 ## After transform: `conversation_list`
 
 `seedomni_transform` emits a per-sample list of
-:class:`~veomni.models.seed_omni.conversation.ConversationItem`:
+:class:`~veomni.models.seed_omni.utils.conversation.ConversationItem`:
 
 ```python
 ConversationItem(

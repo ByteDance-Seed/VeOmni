@@ -44,16 +44,28 @@ class JanusSiglip(JanusSiglipModuleMixin, JanusSiglipTraceMixin, PreTrainedModel
         vision_out = self.vision_model(pixel_values, return_dict=True)
         return self.aligner(vision_out.last_hidden_state)
 
+    def _dummy_image_embeds(self, pixel_values: torch.Tensor) -> torch.Tensor:
+        """Zero stand-in shaped exactly like :meth:`_encode_pixel_values`' output
+        (same batch + patch count) for the non-FSDP dummy, whose ViT forward is
+        skipped (no gradient anchor needed without FSDP). Emitting real-shaped
+        zeros instead of ``None`` keeps the pre/post hooks branch-free."""
+        cfg = self.config.vision_config
+        b, _, h, w = pixel_values.shape
+        num_patches = (h // cfg.patch_size) * (w // cfg.patch_size)
+        return pixel_values.new_zeros(b, num_patches, cfg.projection_dim)
+
     def forward(
         self,
-        pixel_values: Optional[torch.Tensor] = None,
-        is_dummy: Optional[bool] = None,
+        pixel_values: Optional[torch.Tensor],
+        is_dummy: bool = False,
     ) -> Dict[str, Any]:
-        # ``is_dummy`` comes from the (worker-aware) pre_forward: True with
-        # worker-built dummy zeros, False with real pixels. ``None`` = eager /
-        # no-worker path → derive from the absence of pixels (FSDP only).
-        if is_dummy is None:
-            is_dummy = pixel_values is None and get_parallel_state().fsdp_enabled
-        if is_dummy and pixel_values is None:
-            pixel_values = self.dummy_inputs()["pixel_values"]
-        return {"image_embeds": self._encode_pixel_values(pixel_values), "is_dummy": is_dummy}
+        # Real pixels → always encode. A worker-built dummy is only the training
+        # FSDP gradient anchor, so it runs the ViT solely under training + FSDP;
+        # otherwise (inference, or no FSDP) there is nothing to anchor, so skip the
+        # forward but still emit real-shaped zeros so the output is uniform with a
+        # real encode (pre/post never branch on dummy).
+        if is_dummy and not (self.training and get_parallel_state().fsdp_enabled):
+            image_embeds = self._dummy_image_embeds(pixel_values)
+        else:
+            image_embeds = self._encode_pixel_values(pixel_values)
+        return {"image_embeds": image_embeds}

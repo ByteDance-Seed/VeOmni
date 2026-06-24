@@ -8,7 +8,7 @@ from transformers import AutoTokenizer, JanusForConditionalGeneration, JanusProc
 from transformers.initialization import no_init_weights
 
 from veomni.models.module_utils import init_empty_weights
-from veomni.models.seed_omni.convert_registry import OMNI_CONVERT_REGISTRY
+from veomni.models.seed_omni.utils.convert_registry import OMNI_CONVERT_REGISTRY
 
 from .convert_janus_weight_to_hf import convert_model as convert_janus_to_hf
 

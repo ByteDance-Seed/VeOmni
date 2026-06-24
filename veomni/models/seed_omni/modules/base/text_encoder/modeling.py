@@ -83,7 +83,6 @@ class TextEncoder(TextEncoderModuleMixin, TextEncoderTraceMixin, PreTrainedModel
         input_ids: Optional[torch.LongTensor] = None,
         **kwargs: Any,
     ) -> Dict[str, Any]:
-        del kwargs
         input_ids = input_ids.unsqueeze(0) if input_ids.dim() == 1 else input_ids
         embeds = self._embed_tokens(input_ids)
         return {
@@ -116,7 +115,7 @@ class TextEncoder(TextEncoderModuleMixin, TextEncoderTraceMixin, PreTrainedModel
         hidden_states: Optional[torch.Tensor] = None,
         labels: Optional[torch.LongTensor] = None,
         shift_labels: Optional[torch.LongTensor] = None,
-        **_,
+        **kwargs,
     ) -> dict:
         logits = self._project(hidden_states)
         loss: torch.Tensor | None = None

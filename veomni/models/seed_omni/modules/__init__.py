@@ -2,7 +2,7 @@
 
 Each entry maps a HuggingFace ``model_type`` string (the ``model_type``
 field of each module's :class:`PretrainedConfig` subclass) to the
-:class:`~veomni.models.seed_omni.module.ModuleMixin` subclass that backs it.  At trainer-build time the
+:class:`~veomni.models.seed_omni.mixins.modulemixin.ModuleMixin` subclass that backs it.  At trainer-build time the
 flow is::
 
     model_type = read_model_type(<weights_path>)        # reads config.json
@@ -38,7 +38,38 @@ OMNI_CONFIG_REGISTRY = Registry("OmniConfig")
 OMNI_MODEL_REGISTRY = Registry("OmniModel")
 OMNI_PROCESSOR_REGISTRY = Registry("OmniProcessor")
 
+
+def read_hf_model_type(model_path: str) -> str:
+    """Read the upstream ``model_type`` from a HuggingFace ``config.json``.
+
+    Generic reader (no registry validation): returns the raw ``model_type``
+    string. Shared by any caller that needs to dispatch on a checkpoint's
+    declared family — the SeedOmni convert pipeline
+    (:func:`~veomni.models.seed_omni.utils.convert_registry.convert_checkpoint`,
+    which dispatches on the *upstream* HF type) and as the primitive behind
+    :func:`read_model_type`.
+
+    Uses :meth:`PretrainedConfig.get_config_dict` rather than
+    :class:`AutoConfig.from_pretrained` because Janus / future split
+    checkpoints declare custom ``model_type`` values
+    (``janus_siglip`` / ``janus_text_encoder`` / ``janus_llama`` /
+    ``janus_vqvae``) that are NOT in HF's :data:`CONFIG_MAPPING`.
+    ``AutoConfig`` would raise on those families before we even get a chance
+    to consult the registries; reading the raw dict sidesteps that.  See
+    :mod:`veomni.models.loader` for the same pattern in the foundation-model
+    loader.
+    """
+    config_dict, _ = PretrainedConfig.get_config_dict(model_path)
+    model_type = config_dict.get("model_type")
+    if not model_type:
+        raise ValueError(f"Checkpoint at {model_path} has no `model_type` in config.json.")
+    return model_type
+
+
 # Side-effect only: attach @register factories under base/, janus/, qwen3/, qwen3_moe/, qwen3vl/.
+# Imported after ``read_hf_model_type`` so the convert_registry ↔ modules cycle
+# resolves: each family's ``convert_model`` imports ``convert_registry``, whose
+# ``convert_checkpoint`` reads ``read_hf_model_type`` back from this module.
 from . import base, janus, qwen3, qwen3_moe, qwen3vl  # noqa: F401  E402
 
 
@@ -52,20 +83,10 @@ def read_model_type(model_path: str) -> str:
     :func:`build_foundation_model`).  Centralised here so both paths use
     the same registration gate and emit identical error messages.
 
-    Uses :meth:`PretrainedConfig.get_config_dict` rather than
-    :class:`AutoConfig.from_pretrained` because Janus / future split
-    checkpoints declare custom ``model_type`` values
-    (``janus_siglip`` / ``janus_text_encoder`` / ``janus_llama`` /
-    ``janus_vqvae``) that are NOT in HF's :data:`CONFIG_MAPPING`.
-    ``AutoConfig`` would raise on those families before we even get a
-    chance to consult :data:`OMNI_MODEL_REGISTRY`; reading the raw dict
-    sidesteps that.  See :mod:`veomni.models.loader` for the same
-    pattern in the foundation-model loader.
+    Builds on :func:`read_hf_model_type` (the raw ``config.json`` read) and
+    then gates the result on the SeedOmni registries.
     """
-    config_dict, _ = PretrainedConfig.get_config_dict(model_path)
-    model_type = config_dict.get("model_type")
-    if not model_type:
-        raise ValueError(f"Module config at {model_path} has no `model_type` — cannot resolve module class.")
+    model_type = read_hf_model_type(model_path)
     # Note: :class:`Registry.__getitem__` raises ``ValueError`` (not
     # ``KeyError``) on miss, so the default ``in`` test on a MutableMapping
     # subclass would mis-route the exception.  Use ``valid_keys()`` to
@@ -89,5 +110,6 @@ __all__ = [
     "OMNI_CONFIG_REGISTRY",
     "OMNI_MODEL_REGISTRY",
     "OMNI_PROCESSOR_REGISTRY",
+    "read_hf_model_type",
     "read_model_type",
 ]

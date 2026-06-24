@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -15,8 +16,8 @@ from veomni.models.seed_omni import (
     ModuleMixin,
 )
 from veomni.models.seed_omni.configuration_omni import OmniConfig
-from veomni.models.seed_omni.conversation import ConversationItem
 from veomni.models.seed_omni.modules import OMNI_CONFIG_REGISTRY
+from veomni.models.seed_omni.utils.conversation import ConversationItem
 
 
 def _config_cls(model_type: str):
@@ -223,8 +224,8 @@ def test_janus_text_encoder_emit_image_start_replaces_output_tail():
 
     cfg = JanusTextEncoderConfig(vocab_size=128, hidden_size=16, tie_word_embeddings=True)
     jte = JanusTextEncoder(cfg)
-    jte._boi_token_id = 42
-    jte._eoi_token_id = 43
+    # emit_image_start reads the boi/eoi ids off the chat template; stub it (no tokenizer).
+    jte._chat_template = SimpleNamespace(boi_token_id=42, eoi_token_id=43)
 
     conv = [ConversationItem(type="output", value=torch.randn(1, 1, 16), role="assistant")]
     out = jte.emit_image_start(conversation_list=conv, generation_kwargs={})
@@ -272,10 +273,14 @@ def test_janus_vqvae_decode_training_loss():
     assert out["loss"].dim() == 0
 
 
-def test_janus_vqvae_dummy_decode_keeps_generation_head_in_graph():
-    """FSDP2 regression: the dummy decode path must route through
+def test_janus_vqvae_dummy_decode_keeps_generation_head_in_graph(monkeypatch):
+    """FSDP2 regression: under FSDP the dummy decode path must route through
     ``generation_head`` so its grad/reduce_scatter fires on every rank (ranks
     with no assistant image would otherwise skip it and dead-lock NCCL)."""
+    import veomni.models.seed_omni.modules.janus.vqvae.modeling as vqvae_modeling
+
+    monkeypatch.setattr(vqvae_modeling, "get_parallel_state", lambda: SimpleNamespace(fsdp_enabled=True))
+
     JanusVqvae = _model_cls("janus_vqvae")
     JanusVqvaeConfig = _config_cls("janus_vqvae")
     jv = JanusVqvae(JanusVqvaeConfig(vq_config=_tiny_vq_cfg()))
@@ -297,6 +302,69 @@ def test_janus_vqvae_dummy_decode_keeps_generation_head_in_graph():
     assert head_grads, "dummy decode must produce a gradient path through generation_head"
 
 
+def test_janus_vqvae_dummy_encode_emits_real_shaped_zeros_without_fsdp(monkeypatch):
+    """Off-FSDP the dummy encode skips the codec forward but must still emit
+    zeros shaped exactly like a real encode (same batch + token count, no
+    ``None``), so the pre/post hooks never special-case the dummy."""
+    import veomni.models.seed_omni.modules.janus.vqvae.modeling as vqvae_modeling
+
+    monkeypatch.setattr(vqvae_modeling, "get_parallel_state", lambda: SimpleNamespace(fsdp_enabled=False))
+
+    JanusVqvae = _model_cls("janus_vqvae")
+    JanusVqvaeConfig = _config_cls("janus_vqvae")
+    jv = JanusVqvae(JanusVqvaeConfig(vq_config=_tiny_vq_cfg()))
+
+    pixel_values = torch.zeros(3, 3, 32, 32)  # batch of 3 dummy placeholders
+    real = jv._encode_pixels(pixel_values)
+    out = jv.encode(pixel_values=pixel_values, is_dummy=True)
+
+    assert out["image_embeds"] is not None and out["vq_token_ids"] is not None
+    assert out["image_embeds"].shape == real["image_embeds"].shape
+    assert out["vq_token_ids"].shape == real["vq_token_ids"].shape
+    assert out["vq_token_ids"].dtype == real["vq_token_ids"].dtype
+    assert out["image_embeds"].abs().sum().item() == 0.0
+
+
+def test_janus_vqvae_dummy_encode_skips_codec_in_eval_even_under_fsdp(monkeypatch):
+    """Inference (eval) needs no gradient anchor, so the dummy encode fabricates
+    zeros even with FSDP enabled — the real codec must not run."""
+    import veomni.models.seed_omni.modules.janus.vqvae.modeling as vqvae_modeling
+
+    monkeypatch.setattr(vqvae_modeling, "get_parallel_state", lambda: SimpleNamespace(fsdp_enabled=True))
+
+    JanusVqvae = _model_cls("janus_vqvae")
+    JanusVqvaeConfig = _config_cls("janus_vqvae")
+    jv = JanusVqvae(JanusVqvaeConfig(vq_config=_tiny_vq_cfg())).eval()
+
+    def _boom(*_a, **_k):
+        raise AssertionError("codec must not run for a dummy in eval mode")
+
+    monkeypatch.setattr(jv, "_encode_pixels", _boom)
+    out = jv.encode(pixel_values=torch.zeros(2, 3, 32, 32), is_dummy=True)
+    assert out["image_embeds"].abs().sum().item() == 0.0
+
+
+def test_janus_vqvae_dummy_decode_skips_generation_head_without_fsdp(monkeypatch):
+    """Without FSDP there is no collective to anchor, so the dummy decode returns
+    a 0.0 loss directly (no generation_head pass)."""
+    import veomni.models.seed_omni.modules.janus.vqvae.modeling as vqvae_modeling
+
+    monkeypatch.setattr(vqvae_modeling, "get_parallel_state", lambda: SimpleNamespace(fsdp_enabled=False))
+
+    JanusVqvae = _model_cls("janus_vqvae")
+    JanusVqvaeConfig = _config_cls("janus_vqvae")
+    jv = JanusVqvae(JanusVqvaeConfig(vq_config=_tiny_vq_cfg()))
+    jv.freeze_model()
+
+    h = torch.randn(1, 4, 64, requires_grad=True)
+    labels = torch.randint(0, 64, (1, 4))
+    out = jv.decode(hidden_states=h, labels=labels, is_dummy=True)
+
+    assert out["loss"].detach().item() == 0.0
+    out["loss"].backward()
+    assert all(p.grad is None for p in jv.generation_head.parameters())
+
+
 def test_janus_siglip_forward_returns_image_embeds():
     JanusSiglip = _model_cls("janus_siglip")
     JanusSiglipConfig = _config_cls("janus_siglip")
@@ -304,6 +372,44 @@ def test_janus_siglip_forward_returns_image_embeds():
     pixels = torch.randn(1, 3, 64, 64)
     out = js(pixel_values=pixels)
     assert "image_embeds" in out and out["image_embeds"].dim() >= 2
+
+
+def test_janus_siglip_dummy_forward_emits_real_shaped_zeros_without_fsdp(monkeypatch):
+    """Off-FSDP the dummy forward skips the ViT but must still emit zeros shaped
+    exactly like a real encode (no ``None``), so forward_post never branches."""
+    import veomni.models.seed_omni.modules.janus.siglip.modeling as siglip_modeling
+
+    monkeypatch.setattr(siglip_modeling, "get_parallel_state", lambda: SimpleNamespace(fsdp_enabled=False))
+
+    JanusSiglip = _model_cls("janus_siglip")
+    JanusSiglipConfig = _config_cls("janus_siglip")
+    js = JanusSiglip(JanusSiglipConfig(vision_config=_tiny_vision_cfg()))
+    pixels = torch.zeros(3, 3, 64, 64)
+    real = js._encode_pixel_values(pixels)
+    out = js.forward(pixel_values=pixels, is_dummy=True)
+
+    assert out["image_embeds"] is not None
+    assert out["image_embeds"].shape == real.shape
+    assert out["image_embeds"].abs().sum().item() == 0.0
+
+
+def test_janus_siglip_dummy_forward_skips_vit_in_eval_even_under_fsdp(monkeypatch):
+    """Inference (eval) needs no gradient anchor, so the dummy forward fabricates
+    zeros even with FSDP enabled — the real ViT must not run."""
+    import veomni.models.seed_omni.modules.janus.siglip.modeling as siglip_modeling
+
+    monkeypatch.setattr(siglip_modeling, "get_parallel_state", lambda: SimpleNamespace(fsdp_enabled=True))
+
+    JanusSiglip = _model_cls("janus_siglip")
+    JanusSiglipConfig = _config_cls("janus_siglip")
+    js = JanusSiglip(JanusSiglipConfig(vision_config=_tiny_vision_cfg())).eval()
+
+    def _boom(*_a, **_k):
+        raise AssertionError("ViT must not run for a dummy in eval mode")
+
+    monkeypatch.setattr(js, "_encode_pixel_values", _boom)
+    out = js.forward(pixel_values=torch.zeros(3, 3, 64, 64), is_dummy=True)
+    assert out["image_embeds"].abs().sum().item() == 0.0
 
 
 def test_janus_llama_forward_returns_hidden_states():

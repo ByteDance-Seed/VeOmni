@@ -17,7 +17,7 @@
 Split out from :mod:`veomni.utils.helper` because the OmniModel trace is a
 different shape from the single-model :class:`~veomni.utils.helper.EnvironMeter`:
 FLOPs and token lengths are produced **per module** (each module's
-:class:`~veomni.models.seed_omni.tracemixin.TraceMixin`), so this meter does not
+:class:`~veomni.models.seed_omni.mixins.tracemixin.TraceMixin`), so this meter does not
 inspect the batch for token lengths at all.  It only owns the global,
 module-agnostic concerns.
 """
@@ -52,7 +52,7 @@ class OmniEnvironMeter:
     estimates FLOPs itself from a single ``model_type`` — ``OmniModel`` is a
     *composition* of independent sub-modules with no single config to dispatch a
     FLOPs formula on.  So **FLOPs and token lengths are produced per module** by
-    each module's :class:`~veomni.models.seed_omni.tracemixin.TraceMixin` and
+    each module's :class:`~veomni.models.seed_omni.mixins.tracemixin.TraceMixin` and
     handed to :meth:`step` as ``module_traces``.
 
     This meter therefore does **not** inspect the batch for token lengths.  Its

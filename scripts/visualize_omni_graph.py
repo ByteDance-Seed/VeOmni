@@ -37,8 +37,8 @@ from typing import Literal
 
 from veomni.arguments import OmniArguments, parse_omni_args
 from veomni.models.seed_omni.configuration_omni import OmniConfig
-from veomni.models.seed_omni.generation_graph import GenerationGraph
-from veomni.models.seed_omni.training_graph import TrainingGraph
+from veomni.models.seed_omni.graphs.generation_graph import GenerationGraph
+from veomni.models.seed_omni.graphs.training_graph import TrainingGraph
 
 
 OutputFormat = Literal["html", "mmd"]

@@ -1,4 +1,4 @@
-"""Smoke tests for :mod:`veomni.trainer.omni_inferencer` and the
+"""Smoke tests for :mod:`veomni.trainer.omni.omni_inferencer` and the
 :func:`veomni.models.seed_omni.read_model_type` registry-dispatch helper.
 
 Scope
@@ -23,7 +23,7 @@ from pathlib import Path
 import pytest
 
 from veomni.models.seed_omni import read_model_type
-from veomni.trainer.omni_inferencer import InferenceRequest
+from veomni.trainer.omni.omni_inferencer import InferenceRequest
 
 
 # ── InferenceRequest ─────────────────────────────────────────────────────────
@@ -86,7 +86,7 @@ def test_read_model_type_rejects_completely_unknown_family(tmp_path: Path):
 
 
 def test_module_exports_inferencer_and_request():
-    import veomni.trainer.omni_inferencer as module
+    import veomni.trainer.omni.omni_inferencer as module
 
     assert "OmniInferencer" in module.__all__
     assert "OmniModuleInferencer" in module.__all__
@@ -94,7 +94,7 @@ def test_module_exports_inferencer_and_request():
 
 
 def test_module_needs_distributed_only_when_declared_non_eager():
-    from veomni.trainer.omni_inferencer import _module_needs_distributed
+    from veomni.trainer.omni.omni_inferencer import _module_needs_distributed
 
     # No accelerator block → eager default → single-process.
     assert not _module_needs_distributed({"model": {"weights_path": "janus_siglip"}})
@@ -111,17 +111,12 @@ def test_module_needs_distributed_only_when_declared_non_eager():
             "train": {"accelerator": {"fsdp_config": {"fsdp_mode": "ddp"}}},
         }
     )
-    # eager / none are single-process loads.
+    # eager is the only single-process load (the inference default). fsdp_mode is
+    # now Literal["ddp", "fsdp2", "eager"] — FSDP1 / "none" were removed.
     assert not _module_needs_distributed(
         {
             "model": {"weights_path": "janus_siglip"},
             "train": {"accelerator": {"fsdp_config": {"fsdp_mode": "eager"}}},
-        }
-    )
-    assert not _module_needs_distributed(
-        {
-            "model": {"weights_path": "janus_siglip"},
-            "train": {"accelerator": {"fsdp_config": {"fsdp_mode": "none"}}},
         }
     )
 
