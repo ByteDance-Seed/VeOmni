@@ -18,6 +18,8 @@ import json
 import math
 import os
 import re
+import shutil
+import tempfile
 import time
 from collections import OrderedDict
 from contextlib import contextmanager
@@ -60,6 +62,37 @@ logger = logging.get_logger(__name__)
 
 
 @contextmanager
+def _stage_safetensors_if_requested(filepath: str):
+    stage_dir = os.getenv("VEOMNI_STAGE_HDFS_SAFETENSORS_DIR")
+    if not stage_dir:
+        yield filepath
+        return
+
+    stage_dir = os.path.abspath(stage_dir)
+    if stage_dir.startswith("/mnt/hdfs/"):
+        raise ValueError("VEOMNI_STAGE_HDFS_SAFETENSORS_DIR must be a local filesystem path, not an HDFS mount.")
+
+    os.makedirs(stage_dir, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        dir=stage_dir,
+        prefix=f"{os.path.basename(filepath)}.",
+        suffix=".tmp",
+        delete=False,
+    ) as tmp_file:
+        staged_filepath = tmp_file.name
+
+    try:
+        logger.info_rank0(f"Staging safetensors shard to local path: {filepath} -> {staged_filepath}")
+        shutil.copyfile(filepath, staged_filepath)
+        yield staged_filepath
+    finally:
+        try:
+            os.remove(staged_filepath)
+        except FileNotFoundError:
+            pass
+
+
+@contextmanager
 def init_empty_weights():
     """
     A context manager under which models are initialized with all parameters on the meta device.
@@ -99,9 +132,10 @@ class StateDictIterator:
 
     def __iter__(self) -> Generator[Tuple[str, "torch.Tensor"], None, None]:
         if self.filepath.endswith(".safetensors"):
-            with safe_open(self.filepath, framework="pt", device="cpu") as f:
-                for key in f.keys():
-                    yield key, f.get_tensor(key)
+            with _stage_safetensors_if_requested(self.filepath) as filepath:
+                with safe_open(filepath, framework="pt", device="cpu") as f:
+                    for key in f.keys():
+                        yield key, f.get_tensor(key)
 
         else:
             state_dict = torch.load(self.filepath, map_location="cpu", weights_only=True, mmap=True)
