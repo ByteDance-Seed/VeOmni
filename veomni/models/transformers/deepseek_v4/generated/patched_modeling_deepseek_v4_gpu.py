@@ -92,11 +92,16 @@ def _deepseek_v4_build_flashmla_indices(
     dense_indices = torch.where(dense_valid, dense_indices, torch.full_like(dense_indices, -1))
     compressed_indices = torch.where(top_k_indices >= 0, top_k_indices + base_kv_len, top_k_indices)
     sparse_indices = torch.cat((dense_indices, compressed_indices), dim=-1)
-    if sparse_indices.shape[-1] % 128 != 0:
-        raise ValueError(
-            "dsa_attention_backend='flashmla_cudnn' requires sliding_window + index_topk "
-            f"to be a multiple of 128, got {sparse_indices.shape[-1]}"
+    curr_len = sparse_indices.shape[-1]
+    if curr_len % 128 != 0:
+        pad_len = 128 - (curr_len % 128)
+        pad = torch.full(
+            (*sparse_indices.shape[:-1], pad_len),
+            -1,
+            dtype=sparse_indices.dtype,
+            device=sparse_indices.device,
         )
+        sparse_indices = torch.cat((sparse_indices, pad), dim=-1)
     return _deepseek_v4_compact_sparse_indices(sparse_indices)
 
 

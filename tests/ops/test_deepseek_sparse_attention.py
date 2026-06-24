@@ -249,6 +249,29 @@ def test_flash_mla_sparse_forward_compatibility_rejects_bad_topk_length_shape():
     assert "topk_length" in reason
 
 
+def test_deepseek_v4_flashmla_indices_pad_to_128_multiple():
+    from veomni.models.transformers.deepseek_v4.generated.patched_modeling_deepseek_v4_gpu import (
+        _deepseek_v4_build_flashmla_indices,
+    )
+
+    top_k_indices = torch.full((1, 3, 3), -1, dtype=torch.long)
+    top_k_indices[0, 2] = torch.tensor([0, 1, -1])
+
+    sparse_indices, topk_length = _deepseek_v4_build_flashmla_indices(
+        None,
+        top_k_indices,
+        batch_size=1,
+        seq_len=3,
+        base_kv_len=4,
+        sliding_window=127,
+    )
+
+    assert sparse_indices.shape == (1, 3, 128)
+    assert topk_length.tolist() == [[1, 2, 5]]
+    assert sparse_indices[0, 2, :5].tolist() == [0, 1, 2, 4, 5]
+    assert torch.equal(sparse_indices[0, 2, 5:], torch.zeros(123, dtype=sparse_indices.dtype))
+
+
 def test_pack_flash_mla_tensors_for_sparse_backward():
     q_pe = torch.full((1, 2, 128, 64), 2.0, dtype=torch.bfloat16)
     k_pe = torch.full((1, 4, 1, 64), 4.0, dtype=torch.bfloat16)
