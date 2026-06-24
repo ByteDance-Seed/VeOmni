@@ -24,10 +24,14 @@ Patches:
    ``down_proj [E, H, I]`` layout and the gpt-oss-style ``swiglu_limit``
    clamp. Dispatch is OpSlot-guarded (``veomni_moe_experts_forward``):
    non-eager -> ``fused_moe_forward``; eager -> per-expert loop.
-2. ``DeepseekV4ForCausalLM.forward`` — OpSlot guard for fused
+2. ``DeepseekV4Indexer.forward`` / ``DeepseekV4CSACompressor.forward`` /
+   ``DeepseekV4Attention.forward`` — opt-in DeepSeek sparse attention path:
+   cuDNN Frontend DSA indexer plus FlashMLA sparse prefill forward paired with
+   cuDNN Frontend DSA backward for CSA layers.
+3. ``DeepseekV4ForCausalLM.forward`` — OpSlot guard for fused
    cross-entropy (``veomni_causal_lm_loss``) + ``MoeCausalLMOutputWithLogProbs``
    so callers can read per-token log-probs / entropy alongside the loss.
-3. Register ``get_parallel_plan`` on ``DeepseekV4ForCausalLM``.
+4. Register ``get_parallel_plan`` on ``DeepseekV4ForCausalLM``.
 
 Intentionally NOT patched:
 
@@ -47,13 +51,6 @@ Intentionally NOT patched:
   untouched) plus an interleaved ``repeat_interleave(2)`` cos/sin layout
   that ``liger_rotary_pos_emb`` does not implement. SKILL.md flags this
   exact case (partial_rotary -> liger NaN).
-- ``DeepseekV4Attention.forward`` — V4 ships eager-only
-  (``_supports_flash_attn = False`` / ``_supports_sdpa = False`` /
-  ``_supports_flex_attn = False``: ``head_dim=512`` exceeds FlashAttention's
-  256 cap, SDPA lacks the per-head learnable sink, and FlexAttention can't
-  resize BlockMask after the in-block compressor concatenation). Sequence
-  parallel for V4 attention is out of scope for this patchgen pass and
-  needs a dedicated eager-SP path before the model can train under SP.
 - ``DeepseekV4Model.forward`` — top-level ``hidden_states`` is *4D*
   (``[B, S, hc_mult, D]`` for the manifold-constrained Hyper-Connection
   residual stack); existing VeOmni SP collators assume 3D
@@ -69,13 +66,14 @@ import torch.nn.functional as F
 from torch import nn
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache
+from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 from transformers.modeling_outputs import MoeModelOutputWithPast
 from transformers.models.deepseek_v4.modeling_deepseek_v4 import load_balancing_loss_func
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs
 
 from veomni.ops import fused_moe_forward
-from veomni.ops.dispatch import OpSlot
+from veomni.ops.dispatch import OpsConfigSlot, OpSlot
 from veomni.patchgen.patch_spec import PatchConfig
 from veomni.utils.model_outputs import MoeCausalLMOutputWithLogProbs
 
@@ -88,6 +86,8 @@ from veomni.utils.model_outputs import MoeCausalLMOutputWithLogProbs
 veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
 veomni_moe_experts_forward = OpSlot("moe_experts", "standard")
 veomni_load_balancing_loss = OpSlot("load_balancing_loss", "standard")
+veomni_dsa_indexer_backend = OpsConfigSlot("dsa_indexer_backend")
+veomni_dsa_attention_backend = OpsConfigSlot("dsa_attention_backend")
 
 
 config = PatchConfig(
@@ -112,12 +112,90 @@ config.drop_import_names("MoeCausalLMOutputWithPast")
 
 config.add_post_import_block(
     """
-    from veomni.ops.dispatch import OpSlot
+    from veomni.ops.dispatch import OpSlot, OpsConfigSlot
     veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
     veomni_moe_experts_forward = OpSlot("moe_experts", "standard")
     veomni_load_balancing_loss = OpSlot("load_balancing_loss", "standard")
+    veomni_dsa_indexer_backend = OpsConfigSlot("dsa_indexer_backend")
+    veomni_dsa_attention_backend = OpsConfigSlot("dsa_attention_backend")
+
+
+    def _deepseek_v4_compact_sparse_indices(indices: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        valid = indices >= 0
+        order = torch.argsort((~valid).to(torch.int64), dim=-1, stable=True)
+        compacted = indices.gather(-1, order)
+        compacted = torch.where(compacted >= 0, compacted, torch.zeros_like(compacted))
+        return compacted, valid.sum(dim=-1).to(torch.int32)
+
+
+    def _deepseek_v4_build_flashmla_indices(
+        attention_mask: torch.Tensor | None,
+        top_k_indices: torch.Tensor,
+        *,
+        batch_size: int,
+        seq_len: int,
+        base_kv_len: int,
+        sliding_window: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        window = min(sliding_window, base_kv_len)
+        query_positions = torch.arange(seq_len, device=top_k_indices.device).view(1, seq_len, 1)
+        offsets = torch.arange(window - 1, -1, -1, device=top_k_indices.device).view(1, 1, window)
+        dense_indices = (query_positions - offsets).expand(batch_size, -1, -1)
+        dense_valid = dense_indices >= 0
+        if attention_mask is not None:
+            if attention_mask.dim() != 4:
+                raise ValueError("dsa_attention_backend='flashmla_cudnn' requires a 4D attention mask")
+            dense_mask = attention_mask[:, 0, :, :base_kv_len].gather(-1, dense_indices.clamp(0, base_kv_len - 1))
+            dense_valid = dense_valid & torch.isfinite(dense_mask) & (dense_mask >= 0)
+        dense_indices = torch.where(dense_valid, dense_indices, torch.full_like(dense_indices, -1))
+        compressed_indices = torch.where(top_k_indices >= 0, top_k_indices + base_kv_len, top_k_indices)
+        sparse_indices = torch.cat((dense_indices, compressed_indices), dim=-1)
+        if sparse_indices.shape[-1] % 128 != 0:
+            raise ValueError(
+                "dsa_attention_backend='flashmla_cudnn' requires sliding_window + index_topk "
+                f"to be a multiple of 128, got {sparse_indices.shape[-1]}"
+            )
+        return _deepseek_v4_compact_sparse_indices(sparse_indices)
     """
 )
+
+
+def _deepseek_v4_compact_sparse_indices(indices: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    valid = indices >= 0
+    order = torch.argsort((~valid).to(torch.int64), dim=-1, stable=True)
+    compacted = indices.gather(-1, order)
+    compacted = torch.where(compacted >= 0, compacted, torch.zeros_like(compacted))
+    return compacted, valid.sum(dim=-1).to(torch.int32)
+
+
+def _deepseek_v4_build_flashmla_indices(
+    attention_mask: torch.Tensor | None,
+    top_k_indices: torch.Tensor,
+    *,
+    batch_size: int,
+    seq_len: int,
+    base_kv_len: int,
+    sliding_window: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    window = min(sliding_window, base_kv_len)
+    query_positions = torch.arange(seq_len, device=top_k_indices.device).view(1, seq_len, 1)
+    offsets = torch.arange(window - 1, -1, -1, device=top_k_indices.device).view(1, 1, window)
+    dense_indices = (query_positions - offsets).expand(batch_size, -1, -1)
+    dense_valid = dense_indices >= 0
+    if attention_mask is not None:
+        if attention_mask.dim() != 4:
+            raise ValueError("dsa_attention_backend='flashmla_cudnn' requires a 4D attention mask")
+        dense_mask = attention_mask[:, 0, :, :base_kv_len].gather(-1, dense_indices.clamp(0, base_kv_len - 1))
+        dense_valid = dense_valid & torch.isfinite(dense_mask) & (dense_mask >= 0)
+    dense_indices = torch.where(dense_valid, dense_indices, torch.full_like(dense_indices, -1))
+    compressed_indices = torch.where(top_k_indices >= 0, top_k_indices + base_kv_len, top_k_indices)
+    sparse_indices = torch.cat((dense_indices, compressed_indices), dim=-1)
+    if sparse_indices.shape[-1] % 128 != 0:
+        raise ValueError(
+            "dsa_attention_backend='flashmla_cudnn' requires sliding_window + index_topk "
+            f"to be a multiple of 128, got {sparse_indices.shape[-1]}"
+        )
+    return _deepseek_v4_compact_sparse_indices(sparse_indices)
 
 
 # ================================================================
@@ -201,6 +279,318 @@ class PatchedDeepseekV4Experts(nn.Module):
         up = up.clamp(min=-self.limit, max=self.limit)
         return self.act_fn(gate) * up
         # --- Patch.3 ---
+
+
+@config.override_method(
+    "DeepseekV4Indexer.forward",
+    description="Use cuDNN Frontend DSA indexer kernels when supported",
+)
+def deepseek_v4_indexer_forward_patched(
+    self,
+    hidden_states: torch.Tensor,
+    q_residual: torch.Tensor,
+    position_ids: torch.Tensor,
+    past_key_values: Cache | None,
+    layer_idx: int,
+) -> torch.LongTensor:
+    batch, seq_len, _ = hidden_states.shape
+    cache_layer: DeepseekV4CSACache = past_key_values.layers[layer_idx] if past_key_values is not None else None
+    kv = self.kv_proj(hidden_states)
+    gate = self.gate_proj(hidden_states)
+
+    if cache_layer is None:
+        usable = (kv.shape[1] // self.compress_rate) * self.compress_rate
+        chunk_kv, chunk_gate, first_window_position = kv[:, :usable], gate[:, :usable], 0
+    else:
+        chunk_kv, chunk_gate, first_window_position = cache_layer.store_compression_weights("indexer", kv, gate)
+
+    if chunk_kv.shape[1] > 0:
+        n_windows = chunk_kv.shape[1] // self.compress_rate
+        ratio = self.compress_rate
+        chunk_kv = chunk_kv.view(batch, n_windows, ratio, -1)
+        chunk_gate = chunk_gate.view(batch, n_windows, ratio, -1) + self.position_bias.to(chunk_gate.dtype)
+
+        new_kv = chunk_kv.new_zeros((batch, n_windows, 2 * ratio, self.head_dim))
+        new_gate = chunk_gate.new_full((batch, n_windows, 2 * ratio, self.head_dim), float("-inf"))
+        new_kv[:, :, ratio:] = chunk_kv[..., self.head_dim :]
+        new_gate[:, :, ratio:] = chunk_gate[..., self.head_dim :]
+        if n_windows > 1:
+            new_kv[:, 1:, :ratio] = chunk_kv[:, :-1, :, : self.head_dim]
+            new_gate[:, 1:, :ratio] = chunk_gate[:, :-1, :, : self.head_dim]
+        if cache_layer is not None:
+            prior_kv, prior_gate = cache_layer.update_overlap_state("indexer", chunk_kv, chunk_gate, self.head_dim)
+            if prior_kv is not None:
+                new_kv[:, 0, :ratio] = prior_kv.to(new_kv.dtype)
+                new_gate[:, 0, :ratio] = prior_gate.to(new_gate.dtype)
+
+        compressed = self.kv_norm((new_kv * new_gate.softmax(dim=2, dtype=torch.float32).to(new_kv.dtype)).sum(dim=2))
+        positions = torch.arange(n_windows, device=compressed.device)
+        positions = positions * self.compress_rate + first_window_position
+        positions = positions.unsqueeze(0).expand(batch, -1)
+        cos, sin = self.rotary_emb(compressed, position_ids=positions, layer_type=self.rope_layer_type)
+        compressed = apply_rotary_pos_emb(compressed.unsqueeze(1), cos, sin).squeeze(1)
+    else:
+        compressed = chunk_kv.new_zeros((batch, 0, self.head_dim))
+
+    compressed_kv = compressed if cache_layer is None else cache_layer.update_compressor_states("indexer", compressed)
+
+    cos_q, sin_q = self.rotary_emb(hidden_states, position_ids=position_ids, layer_type=self.rope_layer_type)
+    q = self.q_b_proj(q_residual).view(batch, seq_len, -1, self.head_dim).transpose(1, 2)
+    q = apply_rotary_pos_emb(q, cos_q, sin_q).transpose(1, 2)
+
+    compressed_len = compressed_kv.shape[1]
+    top_k = min(self.index_topk, compressed_len)
+    if compressed_len == 0:
+        return compressed_kv.new_empty((batch, seq_len, 0), dtype=torch.long)
+
+    weights = self.weights_proj(hidden_states).float() * self.weights_scaling
+    indexer_backend = veomni_dsa_indexer_backend.value
+    if indexer_backend not in ("eager", "cudnn"):
+        raise ValueError(f"Unknown dsa_indexer_backend={indexer_backend!r}; expected 'eager' or 'cudnn'")
+    if indexer_backend == "cudnn":
+        from veomni.ops.kernels.deepseek_sparse_attention.flashmla_cudnn import indexer_select_topk
+
+        unsupported_reasons = []
+        if not hidden_states.is_cuda:
+            unsupported_reasons.append("hidden_states must be CUDA")
+        if past_key_values is not None:
+            unsupported_reasons.append("KV cache is not supported")
+        if q.dtype not in (torch.bfloat16, torch.float16):
+            unsupported_reasons.append(f"q dtype must be bf16/fp16, got {q.dtype}")
+        if compressed_kv.dtype not in (torch.bfloat16, torch.float16):
+            unsupported_reasons.append(f"k dtype must be bf16/fp16, got {compressed_kv.dtype}")
+        if weights.dtype not in (torch.bfloat16, torch.float16, torch.float32):
+            unsupported_reasons.append(f"weights dtype must be bf16/fp16/fp32, got {weights.dtype}")
+        if self.num_heads not in (32, 64):
+            unsupported_reasons.append(f"qhead_per_kv_head must be 32 or 64, got {self.num_heads}")
+        if unsupported_reasons:
+            raise ValueError("dsa_indexer_backend='cudnn' is not supported: " + "; ".join(unsupported_reasons))
+        return indexer_select_topk(
+            q,
+            compressed_kv,
+            weights.to(q.dtype),
+            top_k,
+            ratio=self.compress_rate,
+            qhead_per_kv_head=self.num_heads,
+            sm_scale=self.softmax_scale,
+        )
+
+    scores = torch.matmul(q.float(), compressed_kv.transpose(-1, -2).float().unsqueeze(1))
+    scores = F.relu(scores) * self.softmax_scale
+    index_scores = (scores * weights.unsqueeze(-1)).sum(dim=2)
+
+    causal_threshold = (position_ids + 1) // self.compress_rate
+    entry_indices = torch.arange(compressed_len, device=index_scores.device)
+    future_mask = entry_indices.view(1, 1, -1) >= causal_threshold.unsqueeze(-1)
+    index_scores = index_scores.masked_fill(future_mask, float("-inf"))
+    top_k_indices = index_scores.topk(top_k, dim=-1).indices
+    invalid = top_k_indices >= causal_threshold.unsqueeze(-1)
+    return torch.where(invalid, torch.full_like(top_k_indices, -1), top_k_indices)
+
+
+@config.override_method(
+    "DeepseekV4CSACompressor.forward",
+    description="Return top-k indices needed by the opt-in DSA attention backend",
+)
+def deepseek_v4_csa_compressor_forward_patched(
+    self,
+    hidden_states: torch.Tensor,
+    q_residual: torch.Tensor,
+    position_ids: torch.Tensor,
+    past_key_values: Cache | None,
+    layer_idx: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    batch, seq_len, _ = hidden_states.shape
+    cache_layer: DeepseekV4CSACache = past_key_values.layers[layer_idx] if past_key_values is not None else None
+    kv = self.kv_proj(hidden_states)
+    gate = self.gate_proj(hidden_states)
+
+    if cache_layer is None:
+        usable = (kv.shape[1] // self.compress_rate) * self.compress_rate
+        chunk_kv, chunk_gate, first_window_position = kv[:, :usable], gate[:, :usable], 0
+    else:
+        chunk_kv, chunk_gate, first_window_position = cache_layer.store_compression_weights("compressor", kv, gate)
+
+    if chunk_kv.shape[1] > 0:
+        n_windows = chunk_kv.shape[1] // self.compress_rate
+        ratio = self.compress_rate
+        chunk_kv = chunk_kv.view(batch, n_windows, ratio, -1)
+        chunk_gate = chunk_gate.view(batch, n_windows, ratio, -1) + self.position_bias.to(chunk_gate.dtype)
+
+        new_kv = chunk_kv.new_zeros((batch, n_windows, 2 * ratio, self.head_dim))
+        new_gate = chunk_gate.new_full((batch, n_windows, 2 * ratio, self.head_dim), float("-inf"))
+        new_kv[:, :, ratio:] = chunk_kv[..., self.head_dim :]
+        new_gate[:, :, ratio:] = chunk_gate[..., self.head_dim :]
+        if n_windows > 1:
+            new_kv[:, 1:, :ratio] = chunk_kv[:, :-1, :, : self.head_dim]
+            new_gate[:, 1:, :ratio] = chunk_gate[:, :-1, :, : self.head_dim]
+        if cache_layer is not None:
+            prior_kv, prior_gate = cache_layer.update_overlap_state("compressor", chunk_kv, chunk_gate, self.head_dim)
+            if prior_kv is not None:
+                new_kv[:, 0, :ratio] = prior_kv.to(new_kv.dtype)
+                new_gate[:, 0, :ratio] = prior_gate.to(new_gate.dtype)
+
+        compressed = self.kv_norm((new_kv * new_gate.softmax(dim=2, dtype=torch.float32).to(new_kv.dtype)).sum(dim=2))
+        positions = torch.arange(n_windows, device=compressed.device)
+        positions = positions * self.compress_rate + first_window_position
+        positions = positions.unsqueeze(0).expand(batch, -1)
+        cos, sin = self.rotary_emb(compressed, position_ids=positions, layer_type=self.rope_layer_type)
+        compressed = apply_rotary_pos_emb(compressed.unsqueeze(1), cos, sin).squeeze(1)
+    else:
+        compressed = chunk_kv.new_zeros((batch, 0, self.head_dim))
+
+    if cache_layer is not None:
+        compressed = cache_layer.update_compressor_states("compressor", compressed)
+    compressed_kv = compressed.unsqueeze(1)
+
+    top_k_indices = self.indexer(hidden_states, q_residual, position_ids, past_key_values, layer_idx)
+    if top_k_indices.shape[-1] < self.indexer.index_topk:
+        pad = top_k_indices.new_full((*top_k_indices.shape[:2], self.indexer.index_topk - top_k_indices.shape[-1]), -1)
+        top_k_indices = torch.cat((top_k_indices, pad), dim=-1)
+    compressed_len = compressed_kv.shape[2]
+    valid = top_k_indices >= 0
+    safe_indices = torch.where(valid, top_k_indices, torch.full_like(top_k_indices, compressed_len))
+    block_bias = compressed_kv.new_full((batch, 1, seq_len, compressed_len + 1), float("-inf"))
+    block_bias.scatter_(-1, safe_indices.unsqueeze(1), 0.0)
+    return compressed_kv, block_bias[..., :compressed_len], top_k_indices
+
+
+@config.override_method(
+    "DeepseekV4Attention.forward",
+    description="Use FlashMLA sparse prefill forward with cuDNN FE DSA backward for CSA layers",
+)
+def deepseek_v4_attention_forward_patched(
+    self,
+    hidden_states: torch.Tensor,
+    position_embeddings: dict[str, tuple[torch.Tensor, torch.Tensor]] | tuple[torch.Tensor, torch.Tensor],
+    position_ids: torch.Tensor,
+    attention_mask: torch.Tensor | None,
+    past_key_values: Cache | None = None,
+    **kwargs: Unpack[FlashAttentionKwargs],
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    input_shape = hidden_states.shape[:-1]
+    hidden_shape = (*input_shape, -1, self.head_dim)
+    cos, sin = position_embeddings[self.rope_layer_type]
+
+    q_residual = self.q_a_norm(self.q_a_proj(hidden_states))
+    q = self.q_b_proj(q_residual).view(*hidden_shape).transpose(1, 2)
+    q = self.q_b_norm(q)
+    q = apply_rotary_pos_emb(q, cos, sin)
+
+    kv = self.kv_norm(self.kv_proj(hidden_states)).view(*hidden_shape).transpose(1, 2)
+    kv = apply_rotary_pos_emb(kv, cos, sin)
+
+    if past_key_values is not None:
+        kv = past_key_values.update(kv, kv, self.layer_idx)[0]
+
+    block_bias = None
+    top_k_indices = None
+    base_kv_len = kv.shape[2]
+    if self.compressor is not None:
+        compressor_result = self.compressor(hidden_states, q_residual, position_ids, past_key_values, self.layer_idx)
+        if self.layer_type == "compressed_sparse_attention":
+            compressed_kv, block_bias, top_k_indices = compressor_result
+        else:
+            compressed_kv, block_bias = compressor_result
+        kv = torch.cat([kv, compressed_kv], dim=2)
+
+    if isinstance(attention_mask, torch.Tensor) and kv.shape[2] > attention_mask.shape[-1]:
+        if block_bias is not None:
+            attention_mask = torch.cat([attention_mask, block_bias.to(attention_mask.dtype)], dim=-1)
+        else:
+            attention_mask = F.pad(attention_mask, (0, kv.shape[2] - attention_mask.shape[-1]), value=0.0)
+
+    attention_backend = veomni_dsa_attention_backend.value
+    if attention_backend not in ("eager", "flashmla_cudnn"):
+        raise ValueError(f"Unknown dsa_attention_backend={attention_backend!r}; expected 'eager' or 'flashmla_cudnn'")
+    if attention_backend == "flashmla_cudnn" and self.layer_type == "compressed_sparse_attention":
+        from veomni.ops.kernels.deepseek_sparse_attention.flashmla_cudnn import (
+            check_flash_mla_sparse_forward_compatible,
+            flash_mla_sparse_attention_with_cudnn_backward,
+        )
+
+        unsupported_reasons = []
+        if not hidden_states.is_cuda:
+            unsupported_reasons.append("hidden_states must be CUDA")
+        if past_key_values is not None:
+            unsupported_reasons.append("KV cache is not supported")
+        if self.training and self.attention_dropout != 0:
+            unsupported_reasons.append("attention_dropout must be 0")
+        if top_k_indices is None:
+            unsupported_reasons.append("CSA top-k indices are missing")
+        rope_dim = cos.shape[-1] * 2
+        if rope_dim != 64:
+            unsupported_reasons.append(f"qk_rope_head_dim must be 64, got {rope_dim}")
+        if self.head_dim != 512:
+            unsupported_reasons.append(f"head_dim must be 512, got {self.head_dim}")
+        if unsupported_reasons:
+            raise ValueError(
+                "dsa_attention_backend='flashmla_cudnn' is not supported: " + "; ".join(unsupported_reasons)
+            )
+
+        q_bshd = q.transpose(1, 2)
+        kv_bshd = kv.transpose(1, 2)
+        q_pe = q_bshd[..., -rope_dim:]
+        k_pe = kv_bshd[..., -rope_dim:]
+        q_nope = q_bshd.clone()
+        q_nope[..., -rope_dim:] = 0
+        sparse_indices, topk_length = _deepseek_v4_build_flashmla_indices(
+            attention_mask,
+            top_k_indices,
+            batch_size=hidden_states.shape[0],
+            seq_len=hidden_states.shape[1],
+            base_kv_len=base_kv_len,
+            sliding_window=self.sliding_window,
+        )
+        compatible, reason = check_flash_mla_sparse_forward_compatible(
+            q_pe,
+            k_pe,
+            kv_bshd,
+            q_nope,
+            sparse_indices,
+            self.sinks,
+            topk_length,
+        )
+        if not compatible:
+            raise ValueError("dsa_attention_backend='flashmla_cudnn' is not supported: " + reason)
+        attn_output = flash_mla_sparse_attention_with_cudnn_backward(
+            q_pe.contiguous(),
+            k_pe.contiguous(),
+            kv_bshd.contiguous(),
+            q_nope.contiguous(),
+            sparse_indices,
+            attn_sink=self.sinks,
+            topk_length=topk_length,
+            softmax_scale=self.scaling,
+        )
+        attn_output = apply_rotary_pos_emb(attn_output.transpose(1, 2), cos, -sin).transpose(1, 2)
+        grouped = attn_output.reshape(*input_shape, self.config.o_groups, -1)
+        grouped = self.o_a_proj(grouped).flatten(2)
+        output = self.o_b_proj(grouped)
+        return output, None
+
+    attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
+        self.config._attn_implementation, eager_attention_forward
+    )
+    attn_output, attn_weights = attention_interface(
+        self,
+        q,
+        kv,
+        kv,
+        attention_mask,
+        dropout=0.0 if not self.training else self.attention_dropout,
+        scaling=self.scaling,
+        sliding_window=self.sliding_window,
+        s_aux=self.sinks,
+        **kwargs,
+    )
+
+    attn_output = apply_rotary_pos_emb(attn_output.transpose(1, 2), cos, -sin).transpose(1, 2)
+
+    grouped = attn_output.reshape(*input_shape, self.config.o_groups, -1)
+    grouped = self.o_a_proj(grouped).flatten(2)
+    output = self.o_b_proj(grouped)
+    return output, attn_weights
 
 
 # ================================================================

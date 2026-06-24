@@ -83,6 +83,7 @@ def check_flash_mla_sparse_forward_compatible(
     q_nope: torch.Tensor,
     gather_kv_indices: torch.Tensor | None,
     learnable_sink: torch.Tensor | None = None,
+    topk_length: torch.Tensor | None = None,
 ) -> tuple[bool, str]:
     """Validate the FlashMLA sparse prefill contract used by DeepSeek DSA."""
     if q_pe.dim() != 4:
@@ -121,7 +122,13 @@ def check_flash_mla_sparse_forward_compatible(
                 f"FlashMLA sparse prefill requires topk to be a multiple of 128, got {gather_kv_indices.shape[-1]}",
             )
     if learnable_sink is not None:
-        return False, "this FlashMLA/cuDNN composite path does not support learnable_sink"
+        if learnable_sink.shape != (q_pe.shape[2],):
+            return False, f"learnable_sink must be [H], got {tuple(learnable_sink.shape)}"
+    if topk_length is not None:
+        if gather_kv_indices is None:
+            return False, "topk_length requires gather_kv_indices"
+        if topk_length.shape != gather_kv_indices.shape[:2]:
+            return False, f"topk_length must be [B, S_q], got {tuple(topk_length.shape)}"
     return True, ""
 
 
@@ -135,14 +142,14 @@ def flash_mla_sparse_forward(
     softmax_scale: float | None = None,
     causal: bool = False,
     min_seqlen_k: int | None = None,
+    learnable_sink: torch.Tensor | None = None,
+    topk_length: torch.Tensor | None = None,
     **kwargs: Any,
 ) -> dict[str, torch.Tensor]:
     """Run FlashMLA sparse prefill and return both output and LSE.
 
     The returned LSE uses FlashMLA's sparse-prefill layout ``[B, S_q, H]``, which can be
-    flattened to cuDNN FE DSA backward's ``[total_S_q, H]`` contract. FlashMLA's
-    learnable sink support is intentionally not wired through this composite
-    path because the backward side would also need matching sink gradients.
+    flattened to cuDNN FE DSA backward's ``[total_S_q, H]`` contract.
     """
     compatible, reason = check_flash_mla_sparse_forward_compatible(
         q_pe,
@@ -150,7 +157,8 @@ def flash_mla_sparse_forward(
         kv_cache,
         q_nope,
         gather_kv_indices,
-        kwargs.get("learnable_sink"),
+        learnable_sink,
+        topk_length,
     )
     if not compatible:
         raise ValueError(reason)
@@ -170,6 +178,7 @@ def flash_mla_sparse_forward(
     q_flat = packed["q"].reshape(batch_size * seqlen_q, num_heads, packed["q"].shape[-1]).contiguous()
     kv_flat = packed["kv"].reshape(batch_size * seqlen_k, 1, packed["kv"].shape[-1]).contiguous()
     indices = _local_topk_to_global(gather_kv_indices, seqlen_k).reshape(batch_size * seqlen_q, 1, -1).contiguous()
+    topk_length_flat = None if topk_length is None else topk_length.reshape(batch_size * seqlen_q).to(torch.int32)
     sm_scale = q_flat.shape[-1] ** (-0.5) if softmax_scale is None else softmax_scale
 
     out, _, lse = flash_mla_sparse_fwd(
@@ -178,6 +187,8 @@ def flash_mla_sparse_forward(
         indices,
         sm_scale,
         d_v=kv_cache.shape[-1],
+        attn_sink=learnable_sink,
+        topk_length=topk_length_flat,
     )
     return {
         "out": out.reshape(batch_size, seqlen_q, num_heads, kv_cache.shape[-1]),
@@ -212,6 +223,8 @@ class _FlashMLASparseAttentionWithCuDNNBackward(torch.autograd.Function):
         kv_cache: torch.Tensor,
         q_nope_absorbed: torch.Tensor,
         topk_indices: torch.Tensor,
+        attn_sink: torch.Tensor | None,
+        topk_length: torch.Tensor | None,
         softmax_scale: float | None,
     ) -> torch.Tensor:
         forward_result = flash_mla_sparse_forward(
@@ -221,18 +234,40 @@ class _FlashMLASparseAttentionWithCuDNNBackward(torch.autograd.Function):
             q_nope_absorbed,
             topk_indices.to(torch.int32),
             softmax_scale=softmax_scale,
+            learnable_sink=attn_sink,
+            topk_length=topk_length,
         )
-        ctx.save_for_backward(
-            q_pe, k_pe, kv_cache, q_nope_absorbed, topk_indices, forward_result["out"], forward_result["lse"]
-        )
+        saved_tensors = [
+            q_pe,
+            k_pe,
+            kv_cache,
+            q_nope_absorbed,
+            topk_indices,
+            forward_result["out"],
+            forward_result["lse"],
+        ]
+        if attn_sink is not None:
+            saved_tensors.append(attn_sink)
+        if topk_length is not None:
+            saved_tensors.append(topk_length)
+        ctx.save_for_backward(*saved_tensors)
+        ctx.has_attn_sink = attn_sink is not None
+        ctx.has_topk_length = topk_length is not None
         ctx.softmax_scale = softmax_scale
         return forward_result["out"]
 
     @staticmethod
     def backward(ctx: Any, dout: torch.Tensor) -> tuple[torch.Tensor | None, ...]:
-        q_pe, k_pe, kv_cache, q_nope_absorbed, topk_indices, out, lse = ctx.saved_tensors
+        saved = ctx.saved_tensors
+        q_pe, k_pe, kv_cache, q_nope_absorbed, topk_indices, out, lse = saved[:7]
+        offset = 7
+        if ctx.has_attn_sink:
+            attn_sink = saved[offset]
+            offset += 1
+        else:
+            attn_sink = torch.full((q_pe.shape[2],), float("-inf"), device=q_pe.device, dtype=torch.float32)
+        topk_length = saved[offset] if ctx.has_topk_length else None
         packed = pack_flash_mla_tensors_for_sparse_backward(q_pe, k_pe, kv_cache, q_nope_absorbed)
-        attn_sink = torch.full((q_pe.shape[2],), float("-inf"), device=q_pe.device, dtype=torch.float32)
 
         backward_result = sparse_attention_backward(
             packed["q"],
@@ -243,6 +278,7 @@ class _FlashMLASparseAttentionWithCuDNNBackward(torch.autograd.Function):
             attn_sink,
             topk_indices,
             softmax_scale=ctx.softmax_scale,
+            topk_length=topk_length,
         )
         dq_nope_absorbed, dq_pe = torch.split(
             backward_result["dq"], [q_nope_absorbed.shape[-1], q_pe.shape[-1]], dim=-1
@@ -255,6 +291,8 @@ class _FlashMLASparseAttentionWithCuDNNBackward(torch.autograd.Function):
             dkv_cache.unsqueeze(2),
             dq_nope_absorbed,
             None,
+            backward_result["d_sink"] if ctx.has_attn_sink else None,
+            None,
             None,
         )
 
@@ -266,6 +304,8 @@ def flash_mla_sparse_attention_with_cudnn_backward(
     q_nope_absorbed: torch.Tensor,
     topk_indices: torch.Tensor,
     *,
+    attn_sink: torch.Tensor | None = None,
+    topk_length: torch.Tensor | None = None,
     softmax_scale: float | None = None,
 ) -> torch.Tensor:
     """FlashMLA sparse prefill forward paired with cuDNN FE DSA backward."""
@@ -275,6 +315,8 @@ def flash_mla_sparse_attention_with_cudnn_backward(
         kv_cache,
         q_nope_absorbed,
         topk_indices,
+        attn_sink,
+        topk_length,
         softmax_scale,
     )
 

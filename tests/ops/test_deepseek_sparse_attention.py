@@ -118,13 +118,15 @@ def test_flash_mla_sparse_forward_returns_lse(monkeypatch):
     expected_out = torch.zeros(1, 2, 128, 512, dtype=torch.bfloat16)
     expected_lse = torch.arange(256, dtype=torch.float32).reshape(1, 2, 128)
 
-    def fake_flash_mla_sparse_fwd(q, kv, indices, sm_scale, d_v):
+    def fake_flash_mla_sparse_fwd(q, kv, indices, sm_scale, d_v, *, attn_sink=None, topk_length=None):
         assert q.shape == (2, 128, 576)
         assert kv.shape == (4, 1, 576)
         assert indices.shape == (2, 1, 128)
         assert indices.dtype == torch.int32
         assert sm_scale == 0.25
         assert d_v == 512
+        assert attn_sink is None
+        assert topk_length is None
         return (
             expected_out.reshape(2, 128, 512),
             torch.empty(2, 128, dtype=torch.float32),
@@ -153,7 +155,9 @@ def test_flash_mla_sparse_forward_uses_imported_flash_mla_symbol(monkeypatch):
     q_nope = torch.empty(1, 2, 128, 512, dtype=torch.bfloat16)
     gather = torch.zeros(1, 2, 128, dtype=torch.int32)
 
-    def fake_flash_mla_sparse_fwd(q, kv, indices, sm_scale, d_v):
+    def fake_flash_mla_sparse_fwd(q, kv, indices, sm_scale, d_v, *, attn_sink=None, topk_length=None):
+        assert attn_sink is None
+        assert topk_length is None
         return torch.empty(2, 128, 512, dtype=q.dtype), torch.empty(2, 128), torch.empty(2, 128)
 
     monkeypatch.setattr(dsa, "flash_mla_sparse_fwd", fake_flash_mla_sparse_fwd)
@@ -188,18 +192,61 @@ def test_flash_mla_sparse_forward_compatibility_rejects_unsupported_packed_dim()
     assert "packed q/k dim 576" in reason
 
 
-def test_flash_mla_sparse_forward_compatibility_rejects_sink():
+def test_flash_mla_sparse_forward_compatibility_accepts_sink_and_topk_length():
     q_pe = torch.empty(1, 2, 128, 64, dtype=torch.bfloat16)
     k_pe = torch.empty(1, 4, 1, 64, dtype=torch.bfloat16)
     kv_cache = torch.empty(1, 4, 1, 512, dtype=torch.bfloat16)
     q_nope = torch.empty(1, 2, 128, 512, dtype=torch.bfloat16)
     gather = torch.zeros(1, 2, 128, dtype=torch.int32)
-    sink = torch.zeros(128, dtype=torch.bfloat16)
+    sink = torch.zeros(128, dtype=torch.float32)
+    topk_length = torch.full((1, 2), 128, dtype=torch.int32)
+
+    compatible, reason = dsa.check_flash_mla_sparse_forward_compatible(
+        q_pe,
+        k_pe,
+        kv_cache,
+        q_nope,
+        gather,
+        sink,
+        topk_length,
+    )
+
+    assert compatible, reason
+
+
+def test_flash_mla_sparse_forward_compatibility_rejects_bad_sink_shape():
+    q_pe = torch.empty(1, 2, 128, 64, dtype=torch.bfloat16)
+    k_pe = torch.empty(1, 4, 1, 64, dtype=torch.bfloat16)
+    kv_cache = torch.empty(1, 4, 1, 512, dtype=torch.bfloat16)
+    q_nope = torch.empty(1, 2, 128, 512, dtype=torch.bfloat16)
+    gather = torch.zeros(1, 2, 128, dtype=torch.int32)
+    sink = torch.zeros(127, dtype=torch.float32)
 
     compatible, reason = dsa.check_flash_mla_sparse_forward_compatible(q_pe, k_pe, kv_cache, q_nope, gather, sink)
 
     assert not compatible
     assert "learnable_sink" in reason
+
+
+def test_flash_mla_sparse_forward_compatibility_rejects_bad_topk_length_shape():
+    q_pe = torch.empty(1, 2, 128, 64, dtype=torch.bfloat16)
+    k_pe = torch.empty(1, 4, 1, 64, dtype=torch.bfloat16)
+    kv_cache = torch.empty(1, 4, 1, 512, dtype=torch.bfloat16)
+    q_nope = torch.empty(1, 2, 128, 512, dtype=torch.bfloat16)
+    gather = torch.zeros(1, 2, 128, dtype=torch.int32)
+    topk_length = torch.full((1, 2, 1), 128, dtype=torch.int32)
+
+    compatible, reason = dsa.check_flash_mla_sparse_forward_compatible(
+        q_pe,
+        k_pe,
+        kv_cache,
+        q_nope,
+        gather,
+        topk_length=topk_length,
+    )
+
+    assert not compatible
+    assert "topk_length" in reason
 
 
 def test_pack_flash_mla_tensors_for_sparse_backward():
@@ -227,16 +274,30 @@ def test_flash_mla_sparse_attention_with_cudnn_backward_splits_gradients(monkeyp
     out = torch.ones(1, 2, 128, 512, dtype=torch.bfloat16)
     lse = torch.ones(1, 2, 128, dtype=torch.float32)
 
-    def fake_flash_mla_sparse_forward(q_pe_arg, k_pe_arg, kv_cache_arg, q_nope_arg, topk_arg, *, softmax_scale):
+    def fake_flash_mla_sparse_forward(
+        q_pe_arg,
+        k_pe_arg,
+        kv_cache_arg,
+        q_nope_arg,
+        topk_arg,
+        *,
+        softmax_scale,
+        learnable_sink=None,
+        topk_length=None,
+    ):
         assert q_pe_arg is q_pe
         assert k_pe_arg is k_pe
         assert kv_cache_arg is kv_cache
         assert q_nope_arg is q_nope_absorbed
         assert topk_arg.dtype == torch.int32
+        assert learnable_sink is None
+        assert topk_length is None
         assert softmax_scale == 0.25
         return {"out": out, "lse": lse}
 
-    def fake_sparse_attention_backward(q, kv, out_arg, dout, lse_arg, attn_sink, topk_arg, *, softmax_scale):
+    def fake_sparse_attention_backward(
+        q, kv, out_arg, dout, lse_arg, attn_sink, topk_arg, *, softmax_scale, topk_length=None
+    ):
         assert q.shape == (1, 2, 128, 576)
         assert kv.shape == (1, 4, 576)
         assert out_arg.shape == out.shape
@@ -246,6 +307,7 @@ def test_flash_mla_sparse_attention_with_cudnn_backward_splits_gradients(monkeyp
         assert torch.equal(lse_arg, lse)
         assert torch.isneginf(attn_sink).all()
         assert topk_arg is topk_indices
+        assert topk_length is None
         assert softmax_scale == 0.25
         dq_nope = torch.full((1, 2, 128, 512), 1.0, dtype=torch.bfloat16)
         dq_pe = torch.full((1, 2, 128, 64), 2.0, dtype=torch.bfloat16)
