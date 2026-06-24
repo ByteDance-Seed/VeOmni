@@ -210,6 +210,7 @@ deepseek_v4_text_smoke_test_cases = [
         _DEFAULT_RTOL,
         _DEFAULT_ATOL,
         None,  # max_sp_size
+        None,  # max_ep_size
         marks=_gpt_oss_fa4_quack_skip,
     ),
 ]
