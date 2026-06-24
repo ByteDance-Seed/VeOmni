@@ -73,7 +73,7 @@ Use MindStudio Insight's visualization tools for performance analysis, viewing o
 - Use MindStudio Insight to view the multi-card communication overview, analyzing computation, communication, and idle time for each card
 - Find cards with long communication times, analyze their communication matrices to identify slow cards and links
 - Check the time consumption of collective communications such as all-reduce and all-gather
-- Analyze if GPU idle waiting is caused by communication
+- Analyze if NPU idle waiting is caused by communication
 
 ### 4. Data Loading Bottleneck Analysis
 

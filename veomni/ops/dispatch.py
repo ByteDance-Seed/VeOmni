@@ -35,6 +35,24 @@ from .kernel_registry import KERNEL_REGISTRY
 logger = logging.get_logger(__name__)
 
 
+class OpsConfigSlot:
+    """A module-level config value bound from ``OpsImplementationConfig``."""
+
+    def __init__(self, field_name: str, default: str = "eager"):
+        self.field_name = field_name
+        self._value = default
+
+    def bind(self, ops_config: Any) -> None:
+        self._value = getattr(ops_config, self.field_name)
+
+    @property
+    def value(self) -> str:
+        return self._value
+
+    def __repr__(self) -> str:
+        return f"OpsConfigSlot(field_name={self.field_name!r}, value={self._value!r})"
+
+
 class OpSlot:
     """A named dispatch slot that can be bound to a kernel implementation."""
 
@@ -72,6 +90,16 @@ class OpSlot:
         and "never bound".
         """
         return self._kernel is not None
+
+    @property
+    def use_eager_impl(self) -> bool:
+        """``True`` only when the slot was explicitly bound to eager."""
+        return self._impl_name == "eager"
+
+    @property
+    def is_bound(self) -> bool:
+        """``True`` once ``bind()`` has been called."""
+        return self._impl_name is not None
 
     def bound_kernel(self) -> Callable | None:
         """Return the resolved kernel callable, or ``None`` if eager / unbound.

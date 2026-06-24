@@ -59,6 +59,9 @@ seed_all(mode=True)
 Or use this custom implementation:
 
 ```python
+# def main():
+#     pass
+
 def seed_all(seed=42, mode=True, is_gpu=False):
     print("======================seed_all=============================")
     import random

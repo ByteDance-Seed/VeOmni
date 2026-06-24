@@ -422,6 +422,19 @@ TEST_CASES = [
         _DEFAULT_ATOL,
         id="deepseek_v3",
     ),
+    pytest.param(
+        "./tests/toy_config/deepseek_v4_toy/config.json",
+        True,
+        # DeepSeek-V4 ships eager-only attention (head_dim=512 > FA cap,
+        # no SDPA sink-aware kernel, FlexAttention can't resize BlockMask
+        # mid-block). Until a v4-specific eager-SP / fused-attention path
+        # lands, the per-block parity gap inherits the eager baseline; the
+        # default rtol/atol remain a strict gate on the fused-MoE +
+        # cross-entropy patch.
+        _DEFAULT_RTOL,
+        _DEFAULT_ATOL,
+        id="deepseek_v4",
+    ),
 ]
 
 
@@ -443,6 +456,22 @@ def test_models_patch_fwd_bwd(
         if IS_NPU_AVAILABLE:
             # npu not support torch.kaiser_window init in Token2WavBigVGANModel
             return
+
+    # DeepSeek-V4 ships eager-only attention: ``_supports_flash_attn = False``
+    # / ``_supports_sdpa = False`` / ``_supports_flex_attn = False`` —
+    # ``head_dim=512`` exceeds FA's 256 cap, SDPA lacks the per-head learnable
+    # sink, and FlexAttention can't resize BlockMask after the in-block
+    # compressor concatenation. The default FA-based mode grid would fail at
+    # ``TrainerTest(hf_model_modes[0])`` with
+    # ``ValueError: DeepseekV4ForCausalLM does not support Flash Attention 2``.
+    # Replace with a single eager-only HF/VeOmni pair — V4's fused-MoE
+    # ``fused_triton`` path also bypasses the gpt-oss-style ``swiglu_limit``
+    # clamp that the eager loop applies via ``_apply_gate``, which can drive
+    # gate/up activations into NaN territory at the toy scale, so keep
+    # ``moe_implementation=eager`` until a v4-aware fused-MoE path lands.
+    if case_id == "deepseek_v4":
+        hf_model_modes = [ModelMode("hf", "eager")]
+        veomni_model_modes = [ModelMode("veomni", "eager")]
 
     # Qwen3.5 compatibility:
     # - HF backend doesn't support the test's position_ids test cases.

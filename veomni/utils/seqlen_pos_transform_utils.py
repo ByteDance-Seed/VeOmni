@@ -13,6 +13,8 @@
 # limitations under the License.
 
 
+from typing import Optional
+
 import torch
 import torch.nn.functional as F
 
@@ -99,13 +101,43 @@ def prepare_fa_kwargs_from_position_ids(position_ids):
     return (cu_seq_lens_q, cu_seq_lens_k), (max_length_q, max_length_k)
 
 
-def valid_seqlens_from_cu_seqlens(cu_seqlens: torch.Tensor) -> torch.Tensor:
+def coalesce_tail_padding_cu_seqlens(cu_seqlens: torch.Tensor, tail_padding_length: int = 0) -> torch.Tensor:
+    """
+    Coalesce per-token tail padding segments into one sequence segment.
+
+    ``position_ids == 0`` marks packed sequence boundaries. When a collator pads
+    the tail with zero position ids, the FlashAttention cu-seqlens intentionally
+    contains one synthetic 1-token segment per padding token. Some linear
+    attention kernels compile or allocate per segment, so forwarding those
+    padding-only boundaries can create many unnecessary kernel shapes. This
+    helper preserves the padded tensor length while presenting the tail padding
+    as one independent segment for linear-attention style kernels.
+    """
+    if tail_padding_length <= 0:
+        return cu_seqlens
+
+    valid_seqlens = valid_seqlens_from_cu_seqlens(cu_seqlens, tail_padding_length=tail_padding_length)
+    valid_cu_seqlens = len2culen(valid_seqlens)
+    total_length = cu_seqlens[-1:].type(valid_cu_seqlens.dtype)
+    return torch.unique_consecutive(torch.cat((valid_cu_seqlens, total_length)))
+
+
+def valid_seqlens_from_cu_seqlens(cu_seqlens: torch.Tensor, tail_padding_length: Optional[int] = None) -> torch.Tensor:
     """
     cu_seqlens: shape (B+1,), monotonic non-decreasing.
     padding at the tail is represented by consecutive +1 increments:
       ..., n, n+1, n+2, ... , n+padlen (sp padding / pad_to_length padding)
     Return: 1D tensor of valid seqlens (exclude tail padding segments).
+
+    When ``tail_padding_length`` is supplied, only that exact tail range is
+    treated as padding. This preserves valid final sequences whose length is 1.
     """
     diff = cu_seqlens[1:] - cu_seqlens[:-1]
+    if tail_padding_length is not None:
+        if tail_padding_length <= 0:
+            return diff
+        valid_end = torch.clamp(cu_seqlens[-1:] - tail_padding_length, min=0)
+        return diff[cu_seqlens[1:] <= valid_end]
+
     pad = int((torch.flip(diff == 1, (0,)).cumprod(0)).sum().item())
     return diff[:-pad] if pad else diff

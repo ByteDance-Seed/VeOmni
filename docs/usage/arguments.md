@@ -167,7 +167,7 @@ NPU validation runs at two times:
 | load_balancing_loss_implementation | `str` | `"triton"` | MoE load-balancing loss. `triton` (default) requires the `triton` Python package (or `triton-ascend` on NPU); raises at config validation time if the package is missing. `eager` is the pure-PyTorch reference. |
 | rms_norm_gated_implementation | `str` | `"fla"` | Gated RMSNorm (Qwen3.5 GatedDeltaNet `self.norm`). Known values: `eager`, `fla` (FLA `FusedRMSNormGated`, requires `flash-linear-attention`, GPU). No NPU backend — selecting any non-eager value on NPU raises at OpSlot bind time. |
 | causal_conv1d_implementation | `str` | `"fla"` | Varlen depthwise causal conv1d (Qwen3.5 GatedDeltaNet pre-mixer). Known values: `eager`, `fla` (FLA `causal_conv1d`, requires `flash-linear-attention`, GPU). `eager` raises at forward time for varlen training (no torch fallback handles `cu_seqlens`). No NPU backend. |
-| chunk_gated_delta_rule_implementation | `str` | `"fla"` | Chunk gated delta-rule kernel for Qwen3.5 linear attention. Known values: `eager`, `fla` (FLA `chunk_gated_delta_rule`, GPU), `flash_qla` (QwenLM FlashQLA, requires the optional `flash-qla` extra, GPU). `eager` falls back to transformers' `torch_chunk_gated_delta_rule`, which raises at forward time for varlen training. No NPU backend. |
+| chunk_gated_delta_rule_implementation | `str` | `"fla"` | Chunk gated delta-rule kernel for Qwen3.5 linear attention. Known values: `eager`, `fla` (FLA `chunk_gated_delta_rule`, GPU), `flash_qla` (QwenLM FlashQLA, ships under the `gpu` extra, Hopper sm90 only). `eager` falls back to transformers' `torch_chunk_gated_delta_rule`, which raises at forward time for varlen training. No NPU backend. |
 
 ### DataArguments
 
@@ -210,6 +210,9 @@ NPU validation runs at two times:
 | --- | --- | --- | --- |
 
 | dyn_bsz | `bool` | `True` | Enable dynamic batch size for padding-free training. |
+| dyn_bsz_runtime | `Literal["main", "worker"]` | `"main"` | Where dynamic batching runs. `"main"` keeps the legacy main-process batching path; `"worker"` batches inside DataLoader workers to support exact `StatefulDataLoader` resume. |
+| dyn_bsz_count_mode | `Literal["total", "effective"]` | `"total"` | How dynamic batching counts tokens. `"total"` uses `attention_mask.sum()` (legacy behavior); `"effective"` counts only `labels != IGNORE_INDEX` for balancing while still applying a physical-token cap. |
+| dyn_bsz_physical_overflow_ratio | `float` | `1.5` | Physical-token cap multiplier used with `dyn_bsz_count_mode="effective"`: `ceil(micro_batch_size * max_seq_len * ratio)`. Values above `1.0` allow controlled physical overflow so effective-token batching does not degenerate into total-token batching. |
 | micro_batch_size | `int` | `1` | Number of samples per iteration on each device. |
 | global_batch_size | `Optional[int]` | `None` | Global batch size. If `None`, uses `micro_batch_size × dp_size`. |
 | num_train_epochs | `int` | `1` | Number of training epochs. |

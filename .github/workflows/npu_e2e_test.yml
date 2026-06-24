@@ -113,13 +113,6 @@ jobs:
           fi
           echo "ASCEND_VISIBLE_DEVICES=$cards" | tee -a "$GITHUB_ENV"
           echo "ASCEND_RT_VISIBLE_DEVICES=$cards" | tee -a "$GITHUB_ENV"
-      # - name: Set up proxy
-      #   run: |
-      #     CURRENT_PROXY=$(cat /tmp/latest_proxy)
-      #     echo "HTTP_PROXY=$CURRENT_PROXY" >> $GITHUB_ENV
-      #     echo "HTTPS_PROXY=$CURRENT_PROXY" >> $GITHUB_ENV
-      #     echo "http_proxy=$CURRENT_PROXY" >> $GITHUB_ENV
-      #     echo "https_proxy=$CURRENT_PROXY" >> $GITHUB_ENV
       - name: Check npu and CANN info
         run: |
           cat /usr/local/Ascend/ascend-toolkit/latest/"$(uname -i)"-linux/ascend_toolkit_install.info
@@ -134,7 +127,7 @@ jobs:
           clean: true
       - name: Sync dependencies
         run: |
-          uv sync --frozen --python 3.11 --extra npu --extra audio --group dev
+          uv sync --frozen --python 3.11 --extra npu --group dev
       - name: Check final pip list
         run: |
           uv pip list
@@ -171,7 +164,9 @@ jobs:
           fi
       - name: Sync dependencies [diffusers]
         run: |
-          uv sync --frozen --python 3.11 --extra npu --extra dit --group dev
+          # diffusers ships under the `npu` extra (rolled in from the dropped
+          # `dit` extra), so no additional extra is needed here.
+          uv sync --frozen --python 3.11 --extra npu --group dev
       - name: Run diffusers tests
         run: |
           uv run --frozen pytest -v -s -x tests/e2e/test_e2e_parallel.py::test_wan_dit_parallel_align

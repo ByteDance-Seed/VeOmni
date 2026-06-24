@@ -376,8 +376,8 @@ def qwen3_5_gated_deltanet_forward_patched(
             raise RuntimeError(
                 "Varlen Qwen3.5 GatedDeltaNet training is GPU-only — NPU has no fla/flash_qla "
                 "backend registered today. On GPU, set chunk_gated_delta_rule_implementation='fla' "
-                "(and install flash-linear-attention) or 'flash_qla' (with the optional flash-qla "
-                "extra) in OpsImplementationConfig."
+                "(and install flash-linear-attention) or 'flash_qla' (ships under the gpu extra, "
+                "Hopper sm90 only) in OpsImplementationConfig."
             )
         else:
             # Modification: use direct args and pass cu_seqlens for varlen FLA attention.

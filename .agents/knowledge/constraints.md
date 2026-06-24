@@ -96,10 +96,12 @@ Core files:
     - These must be in the batch dict **before** the model forward pass. Recomputing per-layer causes host-device sync.
     - Multimodal models may have 3D position_ids `(B, dim, L)` — FA uses the first row `[:, 0, :]`.
 
-11. **`attention_mask` sum = token count for dynamic batching**
-    - Dynamic batching (`DynamicBatchingSizeDataset`, `DynBszBuffer`) uses `attention_mask.sum()` as the length function.
-    - With FA varlen, `attention_mask` is expected to be all-ones over packed length; boundaries come from `position_ids` and `cu_seq_lens`.
+11. **Dynamic batching token counting must match `dyn_bsz_count_mode`**
+    - Default / legacy behavior (`train.dyn_bsz_count_mode="total"`) uses `attention_mask.sum()` as the length function in `DynamicBatchingSizeDataset` and `DynBszBuffer`.
+    - Optional effective-token mode (`"effective"`) uses `(labels != IGNORE_INDEX).sum()` when `labels` are present, and falls back to `attention_mask.sum()` otherwise.
+    - With FA varlen, `attention_mask` is still expected to be all-ones over packed length; boundaries come from `position_ids` and `cu_seq_lens`.
     - When SP is enabled, `attention_mask` must use `sp_pad_value=1` (asserted in `MainCollator.__post_init__`).
+    - In effective-token mode, dynamic batching still applies a hard physical-token cap of `micro_batch_size * max_seq_len` during micro-batch selection to avoid unbounded prompt-heavy batches; a single sample may still exceed the cap by itself and should be controlled by preprocessing.
 
 12. **`IGNORE_INDEX` (-100) for loss masking**
     - Labels set to `IGNORE_INDEX` are excluded from loss computation.

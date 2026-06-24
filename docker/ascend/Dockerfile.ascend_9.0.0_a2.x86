@@ -62,6 +62,8 @@ ENV PATH="/bin/:$PATH"
 # uv sync
 WORKDIR /app
 COPY . ./
-RUN uv sync --locked --all-packages --extra npu --extra audio --dev --allow-insecure-host github.com --allow-insecure-host pythonhosted.org
+# audio/video dependencies ship under the `npu` extra (rolled in from the
+# dropped `audio` extra), so no additional extra is needed here.
+RUN uv sync --locked --all-packages --extra npu --dev --allow-insecure-host github.com --allow-insecure-host pythonhosted.org
 
 USER root

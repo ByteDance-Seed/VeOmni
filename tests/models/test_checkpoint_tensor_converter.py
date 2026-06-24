@@ -30,6 +30,11 @@ from veomni.models.checkpoint_tensor_loading import (
     get_checkpoint_tensor_converter,
     maybe_convert_checkpoint_tensor,
 )
+from veomni.models.transformers.deepseek_v4.checkpoint_tensor_converter import (
+    DeepseekV4CheckpointTensorConverter,
+    convert_deepseek_v4_fqn_to_index_mapping,
+    create_deepseek_v4_checkpoint_tensor_converter,
+)
 from veomni.models.transformers.qwen3_moe.checkpoint_tensor_converter import (
     Qwen3MoeCheckpointTensorConverter,
     create_qwen3_moe_checkpoint_tensor_converter,
@@ -369,6 +374,126 @@ class TestQwen3MoeConverterIntegration:
             HIDDEN_DIM,
             INTERMEDIATE_DIM,
         )
+
+
+# ---------------------------------------------------------------------------
+# Tests for DeepseekV4CheckpointTensorConverter
+# ---------------------------------------------------------------------------
+
+
+def _make_deepseek_v4_expert_key(layer: int, expert: int, proj: str) -> str:
+    return f"model.layers.{layer}.mlp.experts.{expert}.{proj}.weight"
+
+
+def _make_deepseek_v4_expert_tensor(proj: str, expert_id: int) -> torch.Tensor:
+    if proj in ("w2", "down_proj"):
+        shape = (HIDDEN_DIM, INTERMEDIATE_DIM)
+        offset = 0.2
+    elif proj in ("w1", "gate_proj"):
+        shape = (INTERMEDIATE_DIM, HIDDEN_DIM)
+        offset = 0.0
+    else:
+        shape = (INTERMEDIATE_DIM, HIDDEN_DIM)
+        offset = 0.1
+    return torch.full(shape, expert_id + offset)
+
+
+class TestDeepseekV4ConverterCanHandle:
+    def setup_method(self):
+        self.converter = DeepseekV4CheckpointTensorConverter(num_experts=NUM_EXPERTS)
+
+    @pytest.mark.parametrize(
+        "proj",
+        ["w1", "w2", "w3", "gate_proj", "up_proj", "down_proj"],
+    )
+    def test_matches_raw_and_renamed_expert_keys(self, proj: str):
+        assert self.converter.can_handle(_make_deepseek_v4_expert_key(0, 1, proj))
+
+    def test_rejects_non_expert_keys(self):
+        assert not self.converter.can_handle("model.layers.0.self_attn.q_proj.weight")
+        assert not self.converter.can_handle("model.layers.0.mlp.experts.gate_up_proj")
+
+
+class TestDeepseekV4ConverterConvert:
+    def test_raw_w_keys_convert_to_fused_expert_layout(self):
+        converter = DeepseekV4CheckpointTensorConverter(num_experts=NUM_EXPERTS)
+        dispatched = {}
+
+        # CI materializes DeepSeek-V4 toy checkpoints with save_original_format=True,
+        # which writes raw w1/w2/w3 expert keys. The runtime loader must consume
+        # those keys directly instead of letting them pass through as unexpected.
+        for proj in ("w1", "w3", "w2"):
+            for expert_id in range(NUM_EXPERTS):
+                result = maybe_convert_checkpoint_tensor(
+                    _make_deepseek_v4_expert_key(0, expert_id, proj),
+                    _make_deepseek_v4_expert_tensor(proj, expert_id),
+                    converter,
+                )
+                if result is not None:
+                    dispatched[result.name] = result.tensor
+
+        assert converter.finalize() == []
+        assert set(dispatched) == {
+            "model.layers.0.mlp.experts.gate_up_proj",
+            "model.layers.0.mlp.experts.down_proj",
+        }
+        assert dispatched["model.layers.0.mlp.experts.gate_up_proj"].shape == (
+            NUM_EXPERTS,
+            2 * INTERMEDIATE_DIM,
+            HIDDEN_DIM,
+        )
+        assert dispatched["model.layers.0.mlp.experts.down_proj"].shape == (
+            NUM_EXPERTS,
+            HIDDEN_DIM,
+            INTERMEDIATE_DIM,
+        )
+        for expert_id in range(NUM_EXPERTS):
+            gate_expected = _make_deepseek_v4_expert_tensor("w1", expert_id)
+            up_expected = _make_deepseek_v4_expert_tensor("w3", expert_id)
+            down_expected = _make_deepseek_v4_expert_tensor("w2", expert_id)
+            gate_up = dispatched["model.layers.0.mlp.experts.gate_up_proj"]
+            down = dispatched["model.layers.0.mlp.experts.down_proj"]
+            assert torch.equal(gate_up[expert_id, :INTERMEDIATE_DIM, :], gate_expected)
+            assert torch.equal(gate_up[expert_id, INTERMEDIATE_DIM:, :], up_expected)
+            assert torch.equal(down[expert_id], down_expected)
+
+    def test_renamed_keys_still_convert(self):
+        converter = DeepseekV4CheckpointTensorConverter(num_experts=NUM_EXPERTS)
+        emitted = []
+        for proj in ("gate_proj", "up_proj", "down_proj"):
+            for expert_id in range(NUM_EXPERTS):
+                result = converter.convert(
+                    _make_deepseek_v4_expert_key(1, expert_id, proj),
+                    _make_deepseek_v4_expert_tensor(proj, expert_id),
+                )
+                if result is not None:
+                    emitted.append(result.name)
+        assert sorted(emitted) == [
+            "model.layers.1.mlp.experts.down_proj",
+            "model.layers.1.mlp.experts.gate_up_proj",
+        ]
+
+
+class TestDeepseekV4ConverterFactoryAndMapping:
+    def test_factory_creates_converter(self):
+        model = SimpleNamespace(config=SimpleNamespace(n_routed_experts=8))
+        converter = create_deepseek_v4_checkpoint_tensor_converter(model)
+        assert isinstance(converter, DeepseekV4CheckpointTensorConverter)
+        assert converter.num_experts == 8
+
+    def test_fqn_mapping_accepts_raw_w_keys(self):
+        mapping = {
+            "model.layers.0.mlp.experts.0.w1.weight": 3,
+            "model.layers.0.mlp.experts.0.w2.weight": 4,
+            "model.layers.0.mlp.experts.0.w3.weight": 5,
+            "model.layers.0.self_attn.q_proj.weight": 7,
+        }
+        converted = convert_deepseek_v4_fqn_to_index_mapping(mapping)
+        assert converted == {
+            "model.layers.0.mlp.experts.gate_up_proj": 3,
+            "model.layers.0.mlp.experts.down_proj": 4,
+            "model.layers.0.self_attn.q_proj.weight": 7,
+        }
 
 
 # ---------------------------------------------------------------------------

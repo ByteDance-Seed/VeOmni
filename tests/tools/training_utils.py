@@ -71,13 +71,14 @@ _NPU_PER_MODEL_OVERRIDES: Dict[str, Dict[str, str]] = {
 }
 
 # GPU per-model overrides for models whose patched ops disable a default
-# backend. Wan's ``rope_apply(x, **kwargs)`` signature is incompatible with
-# the registry-default Liger RoPE — ``device_patch.py`` marks ``liger_kernel``
-# as explicitly disabled, so any non-eager value would raise. Wan training
-# YAMLs pin ``rotary_pos_emb_implementation: eager``, but e2e tests build CLI
-# args directly (no training YAML), so we pin here as well.
+# backend. Wan uses FA2 in real DiT configs, while RoPE stays eager because
+# its ``rope_apply(x, **kwargs)`` signature is incompatible with the
+# registry-default Liger RoPE.
 _GPU_PER_MODEL_OVERRIDES: Dict[str, Dict[str, str]] = {
-    "wan_t2v": {"rotary_pos_emb_implementation": "eager"},
+    "wan_t2v": {
+        "attn_implementation": "flash_attention_2",
+        "rotary_pos_emb_implementation": "eager",
+    },
     # Qwen-Image runs its dual-stream joint attention through diffusers' own
     # attention dispatch (Ulysses SP is handled by QwenImageSPAttnProcessor, not
     # the VeOmni FA2 op), so keep the VeOmni attn/rope ops on eager.
@@ -90,6 +91,18 @@ _GPU_PER_MODEL_OVERRIDES: Dict[str, Dict[str, str]] = {
     # L20 runners where another job is still holding part of the card.
     "qwen3_5": {"cross_entropy_loss_implementation": "chunk_loss"},
     "qwen3_5_moe": {"cross_entropy_loss_implementation": "chunk_loss"},
+    # GPT-OSS intentionally does not register a Triton MoE backend because its
+    # native interleaved gate/up training layout needs either eager reference
+    # math or the dedicated SM90-only Quack path. Keep the shared helper on the
+    # portable eager baseline; capability-gated tests append FA4/Quack flags.
+    "gpt_oss": {
+        "attn_implementation": "eager",
+        "moe_implementation": "eager",
+        "cross_entropy_loss_implementation": "eager",
+        "load_balancing_loss_implementation": "eager",
+        "rms_norm_implementation": "eager",
+        "rotary_pos_emb_implementation": "eager",
+    },
 }
 
 

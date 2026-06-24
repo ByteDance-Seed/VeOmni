@@ -351,15 +351,21 @@
  @auto_docstring
  class Qwen3MoeModel(Qwen3MoePreTrainedModel):
      def __init__(self, config: Qwen3MoeConfig):
-@@ -477,6 +578,7 @@
+@@ -477,8 +578,13 @@
          past_key_values: Cache | None = None,
          inputs_embeds: torch.FloatTensor | None = None,
          use_cache: bool | None = None,
 +        cache_position: torch.LongTensor | None = None,
          **kwargs: Unpack[TransformersKwargs],
      ) -> MoeModelOutputWithPast:
++        r"""
++        cache_position (`torch.LongTensor`, *optional*):
++            Indices depicting the position of the input sequence tokens in the sequence.
++        """
          if (input_ids is None) ^ (inputs_embeds is not None):
-@@ -488,12 +590,18 @@
+             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
+
+@@ -488,12 +594,18 @@
          if inputs_embeds is None:
              inputs_embeds = self.embed_tokens(input_ids)
 
@@ -381,7 +387,7 @@
          causal_mask = mask_function(
              config=self.config,
              inputs_embeds=inputs_embeds,
-@@ -512,6 +620,7 @@
+@@ -512,6 +624,7 @@
                  position_ids=position_ids,
                  past_key_values=past_key_values,
                  use_cache=use_cache,
@@ -389,7 +395,7 @@
                  position_embeddings=position_embeddings,
                  **kwargs,
              )
-@@ -606,6 +715,12 @@
+@@ -606,6 +719,12 @@
      return overall_loss * num_experts
 
 
@@ -402,7 +408,7 @@
  @auto_docstring
  class Qwen3MoeForCausalLM(Qwen3MoePreTrainedModel, GenerationMixin):
      _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
-@@ -636,37 +751,14 @@
+@@ -636,37 +755,23 @@
          labels: torch.LongTensor | None = None,
          use_cache: bool | None = None,
          output_router_logits: bool | None = None,
@@ -410,12 +416,13 @@
          logits_to_keep: int | torch.Tensor = 0,
          **kwargs: Unpack[TransformersKwargs],
 -    ) -> MoeCausalLMOutputWithPast:
--        r"""
--        labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
--            Labels for computing the masked language modeling loss. Indices should either be in `[0, ...,
--            config.vocab_size]` or -100 (see `input_ids` docstring). Tokens with indices set to `-100` are ignored
--            (masked), the loss is only computed for the tokens with labels in `[0, ..., config.vocab_size]`.
--
++    ) -> MoeCausalLMOutputWithLogProbs:
+         r"""
+         labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
+             Labels for computing the masked language modeling loss. Indices should either be in `[0, ...,
+             config.vocab_size]` or -100 (see `input_ids` docstring). Tokens with indices set to `-100` are ignored
+             (masked), the loss is only computed for the tokens with labels in `[0, ..., config.vocab_size]`.
+
 -        Example:
 -
 -        ```python
@@ -433,7 +440,9 @@
 -        "Hey, are you conscious? Can you talk to me?\nI'm not conscious, but I can talk to you."
 -        ```"""
 -
-+    ) -> MoeCausalLMOutputWithLogProbs:
++        cache_position (`torch.LongTensor`, *optional*):
++            Indices depicting the position of the input sequence tokens in the sequence.
++        """
          output_router_logits = (
              output_router_logits if output_router_logits is not None else self.config.output_router_logits
          )
@@ -442,7 +451,7 @@
          outputs: MoeModelOutputWithPast = self.model(
              input_ids=input_ids,
              attention_mask=attention_mask,
-@@ -675,30 +767,69 @@
+@@ -675,30 +780,69 @@
              inputs_embeds=inputs_embeds,
              use_cache=use_cache,
              output_router_logits=output_router_logits,
@@ -524,7 +533,7 @@
              loss=loss,
              aux_loss=aux_loss,
              logits=logits,
-@@ -706,7 +837,13 @@
+@@ -706,7 +850,13 @@
              hidden_states=outputs.hidden_states,
              attentions=outputs.attentions,
              router_logits=outputs.router_logits,

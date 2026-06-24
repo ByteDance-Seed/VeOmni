@@ -145,6 +145,26 @@ def _make_moe_experts_adapter(raw_forward):
     return adapter
 
 
+def _make_gpt_oss_moe_experts_adapter(raw_forward):
+    """Adapt GPT-OSS experts to the OpSlot call signature."""
+
+    def adapter(self, hidden_states, top_k_index, top_k_weights):
+        return raw_forward(
+            num_experts=self.num_experts,
+            routing_weights=top_k_weights,
+            selected_experts=top_k_index,
+            hidden_states=hidden_states,
+            gate_up_proj=self.gate_up_proj,
+            gate_up_proj_bias=self.gate_up_proj_bias,
+            down_proj=self.down_proj,
+            down_proj_bias=self.down_proj_bias,
+            alpha=self.alpha,
+            limit=self.limit,
+        )
+
+    return adapter
+
+
 def _triton_kernel_factory():
     from .group_gemm import group_gemm_fused_moe_forward
 
@@ -177,6 +197,24 @@ KERNEL_REGISTRY.register(
         factory=_quack_kernel_factory,
         hardware=HardwareRequirement(device_type="gpu", min_compute_capability=90),
         description="Quack CUTLASS/CuTe fused MoE forward (SM90+)",
+    )
+)
+
+
+def _gpt_oss_quack_kernel_factory():
+    from .quack_gemm_interleave_gate_up import quack_gemm_gpt_oss_fused_moe_forward
+
+    return _make_gpt_oss_moe_experts_adapter(quack_gemm_gpt_oss_fused_moe_forward)
+
+
+KERNEL_REGISTRY.register(
+    KernelSpec(
+        name="quack",
+        op_name="moe_experts",
+        variant="gpt_oss",
+        factory=_gpt_oss_quack_kernel_factory,
+        hardware=HardwareRequirement(device_type="gpu", min_compute_capability=90),
+        description="GPT-OSS Quack CUTLASS/CuTe fused MoE forward with interleaved gate/up layout (SM90+)",
     )
 )
 

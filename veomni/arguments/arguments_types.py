@@ -469,6 +469,29 @@ class TrainingArguments:
         default="main",
         metadata={"help": "Which process dynamic batching runs in: main process or DataLoader worker."},
     )
+    dyn_bsz_count_mode: Literal["total", "effective"] = field(
+        default="total",
+        metadata={
+            "help": (
+                "How dynamic batching counts tokens when packing a micro batch. "
+                "'total' (default, legacy) sums attention_mask; 'effective' sums "
+                "only loss-contributing tokens (labels != IGNORE_INDEX), which "
+                "balances effective tokens across DP ranks at the cost of allowing "
+                "controlled physical-token overflow."
+            )
+        },
+    )
+    dyn_bsz_physical_overflow_ratio: float = field(
+        default=1.5,
+        metadata={
+            "help": (
+                "Physical-token cap multiplier used when dyn_bsz_count_mode='effective'. "
+                "The cap is ceil(micro_batch_size * max_seq_len * ratio), so values "
+                "> 1.0 let effective-token batching differ from total-token batching "
+                "while still bounding prompt-heavy micro batches."
+            )
+        },
+    )
     init_device: Literal["cpu", "cuda", "meta", "npu"] = field(
         default="meta",
         metadata={
@@ -537,6 +560,11 @@ class TrainingArguments:
     checkpoint: CheckpointConfig = field(default_factory=CheckpointConfig)
 
     def __post_init__(self):
+        if self.dyn_bsz_physical_overflow_ratio < 1.0:
+            raise ValueError(
+                f"dyn_bsz_physical_overflow_ratio must be >= 1.0, got {self.dyn_bsz_physical_overflow_ratio}."
+            )
+
         self._train_steps = -1
         self.local_rank = int(os.getenv("LOCAL_RANK", 0))
         self.global_rank = int(os.getenv("RANK", 0))
@@ -821,12 +849,20 @@ class OpsImplementationConfig:
         metadata={
             "help": "Chunk gated delta-rule kernel for Qwen3.5 linear attention. "
             "'fla' (default) uses fla.ops.gated_delta_rule.chunk_gated_delta_rule (requires flash-linear-attention, GPU). "
-            "'flash_qla' uses QwenLM FlashQLA (requires the optional flash-qla extra, Hopper SM90 only — "
+            "'flash_qla' uses QwenLM FlashQLA (ships under the gpu extra, Hopper SM90 only — "
             "no Ampere/Ada below or Blackwell above; SM10x wheels are WIP upstream). "
             "'eager' uses transformers' torch_chunk_gated_delta_rule, which does NOT support "
             "cu_seqlens; varlen training therefore raises at runtime. "
             "Qwen3.5 has no NPU backend today — selecting any non-eager value on NPU raises at OpSlot bind time."
         },
+    )
+    dsa_indexer_backend: Literal["eager", "cudnn"] = field(
+        default="eager",
+        metadata={"help": "DeepSeek sparse attention top-k indexer backend."},
+    )
+    dsa_attention_backend: Literal["eager", "flashmla_cudnn"] = field(
+        default="eager",
+        metadata={"help": "DeepSeek sparse attention backend."},
     )
 
     def __post_init__(self):
