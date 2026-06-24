@@ -19,6 +19,7 @@ import math
 import os
 import re
 import shutil
+import subprocess
 import tempfile
 import time
 from collections import OrderedDict
@@ -61,6 +62,36 @@ if TYPE_CHECKING:
 logger = logging.get_logger(__name__)
 
 
+def _resolve_hdfs_uri(filepath: str) -> Optional[str]:
+    mount_prefix = os.getenv("VEOMNI_STAGE_HDFS_SAFETENSORS_MOUNT_PREFIX")
+    uri_prefix = os.getenv("VEOMNI_STAGE_HDFS_SAFETENSORS_URI_PREFIX")
+    if not mount_prefix and not uri_prefix:
+        return None
+    if not mount_prefix or not uri_prefix:
+        raise ValueError(
+            "VEOMNI_STAGE_HDFS_SAFETENSORS_MOUNT_PREFIX and "
+            "VEOMNI_STAGE_HDFS_SAFETENSORS_URI_PREFIX must be set together."
+        )
+
+    mount_prefix = os.path.abspath(mount_prefix)
+    filepath = os.path.abspath(filepath)
+    if filepath != mount_prefix and not filepath.startswith(f"{mount_prefix}{os.sep}"):
+        return None
+
+    relative_path = os.path.relpath(filepath, mount_prefix)
+    return f"{uri_prefix.rstrip('/')}/{relative_path}"
+
+
+def _copy_safetensors_shard(filepath: str, staged_filepath: str) -> None:
+    hdfs_uri = _resolve_hdfs_uri(filepath)
+    if hdfs_uri is None:
+        shutil.copyfile(filepath, staged_filepath)
+        return
+
+    logger.info_rank0(f"Copying safetensors shard with hdfs dfs -copyToLocal: {hdfs_uri} -> {staged_filepath}")
+    subprocess.run(["hdfs", "dfs", "-copyToLocal", "-f", hdfs_uri, staged_filepath], check=True)
+
+
 @contextmanager
 def _stage_safetensors_if_requested(filepath: str):
     stage_dir = os.getenv("VEOMNI_STAGE_HDFS_SAFETENSORS_DIR")
@@ -83,7 +114,7 @@ def _stage_safetensors_if_requested(filepath: str):
 
     try:
         logger.info_rank0(f"Staging safetensors shard to local path: {filepath} -> {staged_filepath}")
-        shutil.copyfile(filepath, staged_filepath)
+        _copy_safetensors_shard(filepath, staged_filepath)
         yield staged_filepath
     finally:
         try:
