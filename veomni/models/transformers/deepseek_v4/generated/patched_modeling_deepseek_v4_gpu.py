@@ -70,6 +70,16 @@ def _deepseek_v4_compact_sparse_indices(indices: torch.Tensor) -> tuple[torch.Te
     return compacted, valid.sum(dim=-1).to(torch.int32)
 
 
+def _deepseek_v4_mask_future_sparse_indices(
+    top_k_indices: torch.Tensor,
+    position_ids: torch.Tensor,
+    compress_rate: int,
+) -> torch.Tensor:
+    causal_threshold = (position_ids + 1) // compress_rate
+    invalid = top_k_indices >= causal_threshold.unsqueeze(-1)
+    return torch.where(invalid, torch.full_like(top_k_indices, -1), top_k_indices)
+
+
 def _deepseek_v4_build_flashmla_indices(
     attention_mask: torch.Tensor | None,
     top_k_indices: torch.Tensor,
@@ -628,7 +638,7 @@ class DeepseekV4Indexer(nn.Module):
         if indexer_backend not in ("eager", "cudnn"):
             raise ValueError(f"Unknown dsa_indexer_backend={indexer_backend!r}; expected 'eager' or 'cudnn'")
         if indexer_backend == "cudnn":
-            from veomni.ops.kernels.deepseek_sparse_attention.flashmla_cudnn import indexer_select_topk
+            from veomni.ops.kernels.deepseek_sparse_attention.flashmla_cudnn import indexer_scores
 
             unsupported_reasons = []
             if not hidden_states.is_cuda:
@@ -643,29 +653,32 @@ class DeepseekV4Indexer(nn.Module):
                 unsupported_reasons.append(f"weights dtype must be bf16/fp16/fp32, got {weights.dtype}")
             if self.num_heads not in (32, 64):
                 unsupported_reasons.append(f"qhead_per_kv_head must be 32 or 64, got {self.num_heads}")
+            expected_position_ids = torch.arange(seq_len, device=position_ids.device).unsqueeze(0)
+            position_ids_for_check = position_ids.expand(batch, -1) if position_ids.shape[0] == 1 else position_ids
+            if not torch.equal(position_ids_for_check, expected_position_ids.expand(batch, -1)):
+                unsupported_reasons.append("position_ids must be contiguous [0, seq_len) for each batch row")
             if unsupported_reasons:
                 raise ValueError("dsa_indexer_backend='cudnn' is not supported: " + "; ".join(unsupported_reasons))
-            return indexer_select_topk(
+            index_scores = indexer_scores(
                 q,
                 compressed_kv,
                 weights.to(q.dtype),
-                top_k,
                 ratio=self.compress_rate,
                 qhead_per_kv_head=self.num_heads,
                 sm_scale=self.softmax_scale,
             )
 
-        scores = torch.matmul(q.float(), compressed_kv.transpose(-1, -2).float().unsqueeze(1))
-        scores = F.relu(scores) * self.softmax_scale
-        index_scores = (scores * weights.unsqueeze(-1)).sum(dim=2)
+        else:
+            scores = torch.matmul(q.float(), compressed_kv.transpose(-1, -2).float().unsqueeze(1))
+            scores = F.relu(scores) * self.softmax_scale
+            index_scores = (scores * weights.unsqueeze(-1)).sum(dim=2)
 
         causal_threshold = (position_ids + 1) // self.compress_rate
         entry_indices = torch.arange(compressed_len, device=index_scores.device)
         future_mask = entry_indices.view(1, 1, -1) >= causal_threshold.unsqueeze(-1)
         index_scores = index_scores.masked_fill(future_mask, float("-inf"))
         top_k_indices = index_scores.topk(top_k, dim=-1).indices
-        invalid = top_k_indices >= causal_threshold.unsqueeze(-1)
-        return torch.where(invalid, torch.full_like(top_k_indices, -1), top_k_indices)
+        return _deepseek_v4_mask_future_sparse_indices(top_k_indices, position_ids, self.compress_rate)
 
 
 # ======================================================================

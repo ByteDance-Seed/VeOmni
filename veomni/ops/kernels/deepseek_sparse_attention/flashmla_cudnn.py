@@ -385,6 +385,29 @@ def sparse_attention_backward(
     }
 
 
+def indexer_scores(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    w: torch.Tensor,
+    *,
+    ratio: int = 1,
+    qhead_per_kv_head: int | None = None,
+    sm_scale: float = 1.0,
+) -> torch.Tensor:
+    """Compute DSA indexer scores with cuDNN FE."""
+    if k.dim() == 3:
+        k = k.unsqueeze(2)
+
+    return DSA.indexer_forward_wrapper(
+        q,
+        k,
+        w,
+        ratio=ratio,
+        qhead_per_kv_head=qhead_per_kv_head,
+        sm_scale=sm_scale,
+    )["scores"]
+
+
 def indexer_select_topk(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -396,22 +419,13 @@ def indexer_select_topk(
     sm_scale: float = 1.0,
 ) -> torch.Tensor:
     """Compute DSA indexer scores with cuDNN FE and select local top-k indices."""
-    if k.dim() == 3:
-        k = k.unsqueeze(2)
-
-    scores = DSA.indexer_forward_wrapper(
-        q,
-        k,
-        w,
-        ratio=ratio,
-        qhead_per_kv_head=qhead_per_kv_head,
-        sm_scale=sm_scale,
-    )["scores"]
+    scores = indexer_scores(q, k, w, ratio=ratio, qhead_per_kv_head=qhead_per_kv_head, sm_scale=sm_scale)
     top_k = min(int(top_k), int(scores.shape[-1]))
     return scores.topk(top_k, dim=-1).indices.to(torch.long)
 
 
 __all__ = [
+    "indexer_scores",
     "indexer_select_topk",
     "check_flash_mla_sparse_forward_compatible",
     "flash_mla_sparse_forward",

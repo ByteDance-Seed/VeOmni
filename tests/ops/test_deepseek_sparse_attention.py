@@ -286,6 +286,19 @@ def test_deepseek_v4_flashmla_indices_pad_to_128_multiple():
     assert torch.equal(sparse_indices[0, 2, 5:], torch.zeros(123, dtype=sparse_indices.dtype))
 
 
+def test_deepseek_v4_masks_future_sparse_indices():
+    from veomni.models.transformers.deepseek_v4.generated.patched_modeling_deepseek_v4_gpu import (
+        _deepseek_v4_mask_future_sparse_indices,
+    )
+
+    top_k_indices = torch.tensor([[[0, 1, 2], [0, 1, 2], [0, 1, 2], [0, 1, 2]]], dtype=torch.long)
+    position_ids = torch.arange(4).unsqueeze(0)
+
+    masked = _deepseek_v4_mask_future_sparse_indices(top_k_indices, position_ids, compress_rate=2)
+
+    assert masked.tolist() == [[[-1, -1, -1], [0, -1, -1], [0, -1, -1], [0, 1, -1]]]
+
+
 def test_pack_flash_mla_tensors_for_sparse_backward():
     q_pe = torch.full((1, 2, 128, 64), 2.0, dtype=torch.bfloat16)
     k_pe = torch.full((1, 4, 1, 64), 4.0, dtype=torch.bfloat16)
