@@ -21,12 +21,7 @@ def _eager_moe_forward(
     fc1_2_weight: torch.Tensor,
     fc2_weight: torch.Tensor,
 ) -> torch.Tensor:
-    """Reference eager MoE implementation for correctness comparison.
-
-    Keep the routing-weight multiply before fc2 to match the fused kernels'
-    operator ordering exactly. Moving the multiply after fc2 is only
-    mathematically equivalent; in bf16 it introduces extra rounding drift.
-    """
+    """Reference eager MoE implementation for correctness comparison."""
     output = torch.zeros_like(hidden_states)
     expert_mask = F.one_hot(selected_experts, num_classes=num_experts).permute(2, 1, 0)
     expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
@@ -37,9 +32,8 @@ def _eager_moe_forward(
         x = hidden_states[token_idx]
         gate = F.linear(x, fc1_1_weight[idx])
         up = F.linear(x, fc1_2_weight[idx])
-        y = F.silu(gate) * up
+        y = F.linear(F.silu(gate) * up, fc2_weight[idx])
         y = y * routing_weights[token_idx, top_k_pos, None]
-        y = F.linear(y, fc2_weight[idx])
         output.index_add_(0, token_idx, y.to(output.dtype))
 
     return output

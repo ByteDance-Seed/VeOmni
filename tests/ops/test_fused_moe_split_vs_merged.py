@@ -28,14 +28,7 @@ def _eager_moe_forward(
     fc2_weight: torch.Tensor,
     swiglu_limit: float | None = None,
 ) -> torch.Tensor:
-    """Reference eager MoE implementation matching fused-kernel operator ordering.
-
-    The fused kernels multiply routing weights *before* the fc2 projection. That
-    is mathematically equivalent to applying the weights after fc2 because fc2 is
-    linear, but it is not numerically identical in bf16, especially around
-    ``swiglu_limit`` clamp boundaries. Keep this helper aligned with the fused
-    implementation so parity tests compare like-for-like.
-    """
+    """Reference eager MoE implementation matching HuggingFace expert order."""
     output = torch.zeros_like(hidden_states)
     expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=num_experts).permute(2, 1, 0)
     expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
@@ -49,9 +42,8 @@ def _eager_moe_forward(
         if swiglu_limit is not None:
             gate = gate.clamp(max=swiglu_limit)
             up = up.clamp(min=-swiglu_limit, max=swiglu_limit)
-        y = F.silu(gate) * up
+        y = F.linear(F.silu(gate) * up, fc2_weight[idx])
         y = y * routing_weights[token_idx, top_k_pos, None]
-        y = F.linear(y, fc2_weight[idx])
         output.index_add_(0, token_idx, y.to(output.dtype))
 
     return output
@@ -502,10 +494,9 @@ def test_ep_vs_non_ep(
 ):
     """Verify EP autograd functions produce the same output as the non-EP eager path.
 
-    The EP path (EPGroupGemm) computes fc2(silu(fc1_1(x)) * fc1_2(x)) per expert,
-    then applies routing weights externally.  The non-EP path applies routing weights
-    before fc2.  Since fc2 is linear, w * fc2(x) == fc2(w * x), so both should match
-    up to bf16 rounding differences.
+    Both paths compute fc2(silu(fc1_1(x)) * fc1_2(x)) per expert, then apply
+    routing weights before the final top-k gather. This keeps the optimized kernels
+    aligned with the HuggingFace eager expert order.
 
     Forward comparison uses the full scatter → EP gemm → routing weight → gather pipeline.
     Backward comparison uses scattered routing weights as grad_output to EPGroupGemm,
