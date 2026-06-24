@@ -177,7 +177,7 @@ class BagelSiglipNavitModuleMixin(ModuleMixin):
         # Training batches normally reach this module after
         # BagelSiglipNavitCPUPreprocessor, which patchifies raw images and tags
         # them as BAGEL_SIGLIP_CONTEXT. Inference does not have that prompt
-        # preprocessor yet: edit/interleave graphs currently serialize
+        # preprocessor yet: edit graphs currently serialize
         # bagel_vae.encode_context -> bagel_siglip_navit with explicit edges
         # instead of materializing branch sources up front, so raw prompt images
         # may still arrive with source=None.

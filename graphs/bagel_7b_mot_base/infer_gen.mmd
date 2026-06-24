@@ -7,39 +7,36 @@ flowchart LR
     fsm_done(("⏹")):::fsm_terminal
     subgraph state_prompt_encode [prompt_encode]
         direction TB
-        prompt_encode__bagel_text_encoder_prompt_encode["<i>bagel_text_encoder.prompt_encode</i>"]:::body_node
+        prompt_encode__bagel_text_encoder_generate["<i>bagel_text_encoder.generate</i>"]:::body_node
         prompt_encode__bagel_qwen2_mot_generate["<i>bagel_qwen2_mot.generate</i>"]:::body_node
-        prompt_encode__bagel_text_encoder_prompt_encode --> prompt_encode__bagel_qwen2_mot_generate
+        prompt_encode__bagel_text_encoder_generate --> prompt_encode__bagel_qwen2_mot_generate
     end
-    subgraph state_denoise_query [denoise_query]
+    subgraph state_query_denoise [query_denoise]
         direction TB
-        denoise_query__bagel_flow_connector_generate["<i>bagel_flow_connector.generate</i>"]:::body_node
-        denoise_query__bagel_text_encoder_encode_image_query_markers["<i>bagel_text_encoder.encode_image_query_markers</i>"]:::body_node
-        denoise_query__bagel_qwen2_mot_generate["<i>bagel_qwen2_mot.generate</i>"]:::body_node
-        denoise_query__bagel_flow_connector_generate --> denoise_query__bagel_text_encoder_encode_image_query_markers
-        denoise_query__bagel_text_encoder_encode_image_query_markers --> denoise_query__bagel_qwen2_mot_generate
+        query_denoise__bagel_flow_connector_prepare_denoise_query["<i>bagel_flow_connector.prepare_denoise_query</i>"]:::body_node
+        query_denoise__bagel_text_encoder_encode_image_markers["<i>bagel_text_encoder.encode_image_markers</i>"]:::body_node
+        query_denoise__bagel_qwen2_mot_denoise_branch["<i>bagel_qwen2_mot.denoise_branch</i>"]:::body_node
+        query_denoise__bagel_flow_connector_prepare_denoise_query --> query_denoise__bagel_text_encoder_encode_image_markers
+        query_denoise__bagel_text_encoder_encode_image_markers --> query_denoise__bagel_qwen2_mot_denoise_branch
     end
     subgraph state_velocity_collect [velocity_collect]
         direction TB
-        velocity_collect__bagel_flow_connector_generate["<i>bagel_flow_connector.generate</i>"]:::body_node
-        velocity_collect__bagel_qwen2_mot_generate["<i>bagel_qwen2_mot.generate</i>"]:::body_node
-        velocity_collect__bagel_flow_connector_generate --> velocity_collect__bagel_qwen2_mot_generate
-    end
-    subgraph state_denoise_advance [denoise_advance]
-        direction TB
-        denoise_advance__bagel_flow_connector_generate["<i>bagel_flow_connector.generate</i>"]:::body_node
+        velocity_collect__bagel_flow_connector_decode_velocity_from_hidden["<i>bagel_flow_connector.decode_velocity_from_hidden</i>"]:::body_node
+        velocity_collect__bagel_qwen2_mot_collect_velocity["<i>bagel_qwen2_mot.collect_velocity</i>"]:::body_node
+        velocity_collect__bagel_flow_connector_advance_denoise["<i>bagel_flow_connector.advance_denoise</i>"]:::body_node
+        velocity_collect__bagel_flow_connector_decode_velocity_from_hidden --> velocity_collect__bagel_qwen2_mot_collect_velocity
+        velocity_collect__bagel_qwen2_mot_collect_velocity --> velocity_collect__bagel_flow_connector_advance_denoise
     end
     subgraph state_image_decode [image_decode]
         direction TB
-        image_decode__bagel_vae_decode["<i>bagel_vae.decode</i>"]:::body_node
+        image_decode__bagel_vae_decode_generated["<i>bagel_vae.decode_generated</i>"]:::body_node
     end
     fsm_start ==> state_prompt_encode
-    state_prompt_encode ==>|"default"| state_denoise_query
-    state_denoise_query ==>|"default"| state_velocity_collect
-    state_velocity_collect ==>|"module_signal(need_denoise_branch)"| state_denoise_query
-    state_velocity_collect ==>|"module_signal(velocity_ready)"| state_denoise_advance
-    state_denoise_advance ==>|"module_signal(image_complete)"| state_image_decode
-    state_denoise_advance ==>|"default"| state_denoise_query
+    state_prompt_encode ==>|"default"| state_query_denoise
+    state_query_denoise ==>|"default"| state_velocity_collect
+    state_velocity_collect ==>|"module_signal(need_denoise_branch)"| state_query_denoise
+    state_velocity_collect ==>|"module_signal(image_complete)"| state_image_decode
+    state_velocity_collect ==>|"default"| state_query_denoise
     state_image_decode ==>|"default"| fsm_done
     classDef body_node fill:#fff,stroke:#666
     classDef fsm_start fill:#dff,stroke:#06c,stroke-width:2px
