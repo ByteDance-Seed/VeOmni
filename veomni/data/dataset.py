@@ -853,6 +853,8 @@ class DynamicBatchingSizeDataset(IterableDataset):
         physical_token_cap: Optional[int] = None,
         get_physical_length_fn: Optional[Callable] = get_length_by_attention_mask_fn,
         force_generate_long_sequence: bool = False,
+        infinity: bool = False,
+        infinity_padding: bool = False,
     ) -> None:
         """Initialize the DynamicBatchingSizeDataset.
 
@@ -868,6 +870,13 @@ class DynamicBatchingSizeDataset(IterableDataset):
             force_generate_long_sequence: If True, a sample whose length alone exceeds
                 ``micro_batch_seq_length`` is emitted as a single-sample batch instead of
                 being silently discarded. This is not supported yet.
+            infinity: If True, restart the upstream dataset whenever it is exhausted so
+                iteration never stops because of source exhaustion. Takes precedence over
+                ``infinity_padding``.
+            infinity_padding: If True, after the upstream dataset is exhausted and the
+                buffer drained, keep yielding padding micro batches (deep-copied from the
+                last real micro batch, marked with ``padding_flag=True`` so downstream loss
+                accounting skips them) forever instead of stopping.
 
         Resume flow when ``save_by_idx=True``::
 
@@ -925,6 +934,9 @@ class DynamicBatchingSizeDataset(IterableDataset):
             raise ValueError("force_generate_long_sequence is not supported yet.")
         self.force_generate_long_sequence = force_generate_long_sequence
 
+        self._infinity = infinity
+        self._infinity_padding = infinity_padding
+
         self._buffer = []
         self._buffer_of_output_index = []
         self._buffer_token_count = 0
@@ -972,6 +984,10 @@ class DynamicBatchingSizeDataset(IterableDataset):
         else:
             self._just_resumed = False
 
+        # Keep the most recent real micro batch around so infinity_padding has a template
+        # to deep-copy padding batches from after the source is exhausted.
+        last_micro_batch = None
+
         while True:
             try:
                 effective_ready = (
@@ -987,6 +1003,7 @@ class DynamicBatchingSizeDataset(IterableDataset):
                     micro_batch = self._get_micro_batch()
                     micro_batch = self.dynamic_batching_collate_fn(micro_batch)
                     if micro_batch is not None:
+                        last_micro_batch = micro_batch
                         yield micro_batch
                     else:
                         logger.warning("dynamic_batching_collate_fn returned None, skip this micro_batch")
@@ -1021,13 +1038,37 @@ class DynamicBatchingSizeDataset(IterableDataset):
 
             except Exception as e:
                 if isinstance(e, StopIteration):
+                    if self._infinity:
+                        # Restart the upstream dataset and keep going forever; the buffer is
+                        # preserved so batching continues to accumulate across epochs.
+                        self._data_iter = iter(self.dataset)
+                        continue
+
+                    # Drain the remaining buffered samples into micro batches.
                     while len(self._buffer) > 0:
                         micro_batch = self._get_micro_batch()
                         micro_batch = self.dynamic_batching_collate_fn(micro_batch)
                         if micro_batch is not None:
+                            last_micro_batch = micro_batch
                             yield micro_batch
                         else:
                             logger.warning("dynamic_batching_collate_fn returned None, skip this micro_batch")
+
+                    if self._infinity_padding:
+                        if last_micro_batch is None:
+                            logger.warning(
+                                "infinity_padding is enabled but no micro batch was ever produced, "
+                                "there is nothing to pad from; stopping iteration."
+                            )
+                            return
+                        # Keep yielding padding micro batches forever; downstream groups them
+                        # into num_micro_batch-sized steps and loss accounting skips them via
+                        # the padding_flag marker.
+                        while True:
+                            padding_batch = copy.deepcopy(last_micro_batch)
+                            padding_batch["padding_flag"] = True
+                            yield padding_batch
+
                     return
                 else:
                     logger.error(f"DynamicBatchDataset iter data exception: {e} \n{traceback.format_exc()}")
