@@ -21,7 +21,7 @@ from typing import Any, Dict, Optional, Union
 import torch
 import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
-from torch.distributed._tensor import DeviceMesh, DTensor, Shard
+from torch.distributed._tensor import DeviceMesh, DTensor, Replicate, Shard
 from torch.distributed.checkpoint import (
     FileSystemReader,
     FileSystemWriter,
@@ -55,7 +55,9 @@ def _validate_extra_parallel_meshes(parallel_state) -> None:
     """Fail-fast precondition for ExtraParallel state dict preprocessing.
 
     At least one ExtraParallel mesh must be non-None, and at least one
-    of those meshes must be 2D (the ExtraParallel + FSDP composition).
+    of those meshes must carry the ExtraParallel + FSDP composition:
+    2D ``(ep_fsdp, ep)`` for plain FSDP or 3D
+    ``(ep_replicate, ep_fsdp, ep)`` for HSDP.
     """
     extra_parallel_mesh = {
         para: parallel_state.extra_parallel_fsdp_device_mesh[para][para]
@@ -68,7 +70,7 @@ def _validate_extra_parallel_meshes(parallel_state) -> None:
     )
     assert any(
         parallel_state.extra_parallel_fsdp_device_mesh[para] is not None
-        and parallel_state.extra_parallel_fsdp_device_mesh[para].ndim == 2
+        and parallel_state.extra_parallel_fsdp_device_mesh[para].ndim in (2, 3)
         for para in parallel_state.extra_parallel_names
     ), "At least one extra_parallel fsdp_device_mesh should be not None"
 
@@ -129,7 +131,11 @@ def _apply_extra_parallel_dim(
 
         assert spec_info.para_fsdp_mesh is not None, f"ExtraParallel spec {name} must have an ExtraParallel FSDP mesh"
 
-        fsdp_submesh = spec_info.para_fsdp_mesh[f"{spec_info.para_name}_fsdp"]
+        # Drop the innermost ExtraParallel (e.g. ``ep``) dim and keep the FSDP
+        # sub-mesh: 1D ``(ep_fsdp,)`` for plain FSDP, or 2D
+        # ``(ep_replicate, ep_fsdp)`` for HSDP. Mirrors the mesh slicing used
+        # when sharding the module in ``torch_parallelize``.
+        fsdp_submesh = spec_info.para_fsdp_mesh[spec_info.para_fsdp_mesh.mesh_dim_names[:-1]]
         if action == "drop":
             tensor = drop_extra_parallel_dim(tensor, fsdp_submesh)
         else:
@@ -277,16 +283,31 @@ class OptimizerState(Stateful):
 
 def drop_extra_parallel_dim(loaded_tensor: torch.Tensor, device_mesh: DeviceMesh):
     """
-    Drop ExtraParallel dims after loading from DCP so that ExtraParallel-FSDP would not be confused
+    Drop ExtraParallel dims after loading from DCP so that ExtraParallel-FSDP would not be confused.
+
+    ``device_mesh`` is the FSDP sub-mesh (ExtraParallel dim already excluded):
+    1D ``(ep_fsdp,)`` for plain FSDP, or 2D ``(ep_replicate, ep_fsdp)`` for HSDP.
+    The number of placements on the loaded DTensor reflects the full saved mesh:
+
+    * 1 placement: pure ExtraParallel, no FSDP -> return the plain local tensor.
+    * 2 placements: ``(ep_fsdp, ep)`` -> keep FSDP ``Shard(1)`` on the 1D sub-mesh.
+    * 3 placements: ``(ep_replicate, ep_fsdp, ep)`` (HSDP) -> keep
+      ``[Replicate(), Shard(1)]`` on the 2D sub-mesh.
     """
 
-    if len(loaded_tensor.placements) == 2:
-        tensor_to_put = DTensor.from_local(loaded_tensor._local_tensor, device_mesh=device_mesh, placements=[Shard(1)])
-    elif len(loaded_tensor.placements) == 1:
+    num_placements = len(loaded_tensor.placements)
+    if num_placements == 1:
         tensor_to_put = loaded_tensor.to_local()
+    elif num_placements == 2:
+        tensor_to_put = DTensor.from_local(loaded_tensor._local_tensor, device_mesh=device_mesh, placements=[Shard(1)])
+    elif num_placements == 3:
+        tensor_to_put = DTensor.from_local(
+            loaded_tensor._local_tensor, device_mesh=device_mesh, placements=[Replicate(), Shard(1)]
+        )
     else:
         raise RuntimeError(
-            f"Expect ExtraParallel paramters from checkpoints to be DTensor with 1-dim (no FSDP) or 2-dim (ExtraParallel+FSDP), got {loaded_tensor}"
+            "Expect ExtraParallel parameters from checkpoints to be DTensor with 1-dim (no FSDP), "
+            f"2-dim (ExtraParallel+FSDP) or 3-dim (ExtraParallel+HSDP), got {loaded_tensor}"
         )
 
     return tensor_to_put
@@ -300,20 +321,32 @@ def restore_extra_parallel_dim(
 
     args:
         orgin_tensor (torch.Tensor): The orgin tensor.
-        fsdp_mesh (DeviceMesh): The extra_parallel fsdp device mesh.
-        shard (Shard): The shard info, default Shard(0).
+        fsdp_mesh (DeviceMesh): The full ExtraParallel mesh, i.e. 2D
+            ``(ep_fsdp, ep)`` for plain FSDP or 3D
+            ``(ep_replicate, ep_fsdp, ep)`` for HSDP.
+        extra_parallel_fsdp_mesh (DeviceMesh): The FSDP sub-mesh (ExtraParallel
+            dim excluded), used for the pure-ExtraParallel (no FSDP) path.
 
     """
-    assert fsdp_mesh.ndim == 2, f"global_mesh.ndim must be 2, got {fsdp_mesh.ndim}"
+    assert fsdp_mesh.ndim in (2, 3), f"global_mesh.ndim must be 2 or 3, got {fsdp_mesh.ndim}"
 
     if isinstance(orgin_tensor, DTensor):
-        # ExtraParallel+FSDP2
-        dtensor = DTensor.from_local(
-            orgin_tensor._local_tensor, device_mesh=fsdp_mesh, placements=[Shard(0), Shard(1)]
-        )
+        # ExtraParallel+FSDP2. For HSDP the leading ``ep_replicate`` dim is a
+        # replicated copy, so it maps to ``Replicate()`` while the trailing
+        # ``(ep_fsdp, ep)`` keep the same ``[Shard(0), Shard(1)]`` layout as the
+        # plain-FSDP case.
+        if fsdp_mesh.ndim == 3:
+            placements = [Replicate(), Shard(0), Shard(1)]
+        else:
+            placements = [Shard(0), Shard(1)]
+        dtensor = DTensor.from_local(orgin_tensor._local_tensor, device_mesh=fsdp_mesh, placements=placements)
     elif torch.is_tensor(orgin_tensor):
         # If there is no FSDP but only ExtraParallel
-        dtensor = DTensor.from_local(orgin_tensor, device_mesh=extra_parallel_fsdp_mesh, placements=[Shard(0)])
+        if extra_parallel_fsdp_mesh.ndim == 2:
+            placements = [Replicate(), Shard(0)]
+        else:
+            placements = [Shard(0)]
+        dtensor = DTensor.from_local(orgin_tensor, device_mesh=extra_parallel_fsdp_mesh, placements=placements)
     else:
         raise RuntimeError(f"origin_tensor - {orgin_tensor} is not a tensor!")
 
