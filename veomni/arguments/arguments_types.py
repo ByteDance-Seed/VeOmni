@@ -587,6 +587,7 @@ class TrainingArguments:
             )
         assert acc.tp_size == 1, "Tensor parallel size not supported yet."
         assert acc.pp_size == 1, "Pipeline parallel size not supported yet."
+        assert acc.cp_size == 1, "Context parallel size not supported yet."
 
         acc.dp_size = self.world_size // (acc.pp_size * acc.ulysses_size * acc.cp_size * acc.tp_size)
 
