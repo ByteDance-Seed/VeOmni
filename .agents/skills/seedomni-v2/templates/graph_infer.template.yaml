@@ -1,0 +1,26 @@
+# <Model> generation FSM.
+#
+# State bodies are ordered inline edge lists over `module[.method]` endpoints.
+# Do not declare a `done` state; it is framework-injected.
+
+generation_graph:
+  initial: prompt_encode
+  states:
+    prompt_encode:
+      body:
+        - { from: vision_encoder,      to: backbone }
+        - { from: text_encoder.encode, to: backbone }
+        - { from: backbone,            to: text_encoder.decode }
+        - { from: text_encoder.decode, to: end }
+      transitions:
+        - { condition: { type: module_signal, key: text_done }, next_state: done }
+        - { condition: { type: default }, next_state: autoregressive }
+
+    autoregressive:
+      body:
+        - { from: text_encoder.encode, to: backbone }
+        - { from: backbone,            to: text_encoder.decode }
+        - { from: text_encoder.decode, to: end }
+      transitions:
+        - { condition: { type: module_signal, key: text_done }, next_state: done }
+        - { condition: { type: default }, next_state: autoregressive }
