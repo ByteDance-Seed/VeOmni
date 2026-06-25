@@ -1,0 +1,10 @@
+# <Model> training DAG.
+#
+# Flat edge list over `module[.method]` endpoints. Bare module names use the
+# training default method. Every sink should point to `end`.
+
+training_graph:
+  - { from: vision_encoder,      to: backbone }
+  - { from: text_encoder.encode, to: backbone }
+  - { from: backbone,            to: text_encoder.decode }
+  - { from: text_encoder.decode, to: end }
