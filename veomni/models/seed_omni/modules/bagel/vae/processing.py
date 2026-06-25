@@ -74,7 +74,7 @@ class BagelVAEProcessor(BaseImageProcessor):
             )
             for image in image_list
         ]
-        tensor = torch.stack(pixel_values, dim=0)
+        tensor = torch.stack(_pad_to_batch_size(pixel_values), dim=0)
         if dtype is not None:
             tensor = tensor.to(dtype=dtype)
         if device is not None:
@@ -215,6 +215,21 @@ def _resize_pil(
         interpolation=InterpolationMode.BICUBIC,
         antialias=True,
     )
+
+
+def _pad_to_batch_size(images: list[torch.Tensor]) -> list[torch.Tensor]:
+    if not images:
+        return images
+    max_height = max(int(image.shape[-2]) for image in images)
+    max_width = max(int(image.shape[-1]) for image in images)
+    padded = []
+    for image in images:
+        pad_height = max_height - int(image.shape[-2])
+        pad_width = max_width - int(image.shape[-1])
+        if pad_height or pad_width:
+            image = F.pad(image, (0, pad_width, 0, pad_height), value=0.0)
+        padded.append(image)
+    return padded
 
 
 def _target_size(

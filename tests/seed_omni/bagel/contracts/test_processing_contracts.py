@@ -448,6 +448,25 @@ def test_bagel_vae_processor_call_matches_saved_config(tmp_path):
     assert torch.equal(inputs["pixel_values"], loaded_inputs["pixel_values"])
 
 
+def test_bagel_vae_processor_pads_mixed_image_sizes_for_batch_stack():
+    from veomni.models.seed_omni.modules.bagel.vae.processing import BagelVAEProcessor
+
+    processor = BagelVAEProcessor(
+        max_image_size=8,
+        min_image_size=4,
+        image_stride=4,
+        max_pixels=64,
+    )
+    tall = Image.new("RGB", (4, 8), color=(255, 0, 0))
+    wide = Image.new("RGB", (8, 4), color=(0, 255, 0))
+
+    inputs = processor(images=[tall, wide], return_tensors="pt", device=torch.device("cpu"), dtype=torch.float32)
+
+    assert inputs["pixel_values"].shape == (2, 3, 8, 8)
+    assert torch.equal(inputs["pixel_values"][0, :, :, 4:], torch.zeros(3, 8, 4))
+    assert torch.equal(inputs["pixel_values"][1, :, 4:, :], torch.zeros(3, 4, 8))
+
+
 def test_bagel_vae_from_pretrained_loads_processor_config(tmp_path):
     from veomni.models.seed_omni.modules.bagel.vae.processing import BagelVAEProcessor
 
