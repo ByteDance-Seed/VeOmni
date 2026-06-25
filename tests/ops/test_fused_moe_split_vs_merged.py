@@ -175,7 +175,7 @@ def test_fused_moe_split_vs_merged(
     )
 
 
-@pytest.mark.parametrize("swiglu_limit", [0.10, 0.20])
+@pytest.mark.parametrize("swiglu_limit", [7.0, 10.0])
 def test_fused_moe_swiglu_limit_split_vs_merged_and_eager(swiglu_limit: float, monkeypatch: pytest.MonkeyPatch):
     """Verify the fused MoE SwiGLU clamp matches eager for split and merged fc1 layouts."""
     _skip_if_unsupported()
@@ -251,14 +251,139 @@ def test_fused_moe_swiglu_limit_split_vs_merged_and_eager(swiglu_limit: float, m
     torch.testing.assert_close(fc1_split_grad, fc1_merged.grad, rtol=0, atol=0)
 
     torch.testing.assert_close(out_merged, out_eager, rtol=2e-2, atol=2e-2)
-    # bf16 grouped GEMM dgrad can diverge slightly from eager around the clamp boundary.
-    torch.testing.assert_close(hs_merged.grad, hs_eager.grad, rtol=6e-2, atol=8e-2)
+    torch.testing.assert_close(hs_merged.grad, hs_eager.grad, rtol=6e-2, atol=6e-2)
     torch.testing.assert_close(fc2_merged.grad, fc2_eager.grad, rtol=2e-2, atol=2e-2)
     fc1_eager_grad = torch.cat([fc1_1_eager.grad, fc1_2_eager.grad], dim=1)
     torch.testing.assert_close(fc1_merged.grad, fc1_eager_grad, rtol=5e-2, atol=5e-2)
 
 
-def _make_ep_inputs(num_tokens, num_experts, hidden_dim, ffn_dim, seed):
+def _count_non_ep_saturated_activations(
+    hidden_states: torch.Tensor,
+    selected_experts: torch.Tensor,
+    fc1_1_weight: torch.Tensor,
+    fc1_2_weight: torch.Tensor,
+    swiglu_limit: float,
+) -> int:
+    saturated = 0
+    for expert_idx in selected_experts.unique(sorted=True).tolist():
+        token_idx = torch.where(selected_experts == expert_idx)[0]
+        x = hidden_states[token_idx]
+        gate = F.linear(x, fc1_1_weight[expert_idx])
+        up = F.linear(x, fc1_2_weight[expert_idx])
+        saturated += (gate > swiglu_limit).sum().item()
+        saturated += (up.abs() > swiglu_limit).sum().item()
+    return saturated
+
+
+@pytest.mark.parametrize("swiglu_limit", [7.0, 10.0])
+def test_fused_moe_swiglu_limit_scaled_inputs_exercise_clamp(swiglu_limit: float, monkeypatch: pytest.MonkeyPatch):
+    """Exercise saturated non-EP fused clamp paths with realistic LLM limits."""
+    _skip_if_unsupported()
+
+    torch.manual_seed(7)
+    device = torch.device(get_device_type())
+    dtype = torch.bfloat16
+    num_tokens, num_experts, hidden_dim, ffn_dim, topk = 64, 4, 128, 64, 2
+
+    hidden_states = 3.0 * torch.randn(num_tokens, hidden_dim, device=device, dtype=dtype)
+    router_logits = torch.randn(num_tokens, num_experts, device=device, dtype=torch.float32)
+    routing_weights, selected_experts = torch.topk(torch.softmax(router_logits, dim=-1), topk, dim=-1)
+    routing_weights = routing_weights.to(dtype)
+    fc1_1_weight = 0.1 * torch.randn(num_experts, ffn_dim, hidden_dim, device=device, dtype=dtype)
+    fc1_2_weight = 0.1 * torch.randn(num_experts, ffn_dim, hidden_dim, device=device, dtype=dtype)
+    fc1_1_2_weight = torch.cat([fc1_1_weight, fc1_2_weight], dim=1).contiguous()
+    fc2_weight = 0.1 * torch.randn(num_experts, hidden_dim, ffn_dim, device=device, dtype=dtype)
+
+    assert (
+        _count_non_ep_saturated_activations(hidden_states, selected_experts, fc1_1_weight, fc1_2_weight, swiglu_limit)
+        > 0
+    )
+
+    monkeypatch.setattr(fused_moe, "_fused_moe_forward", group_gemm_fused_moe_forward)
+
+    hs_split = hidden_states.clone().detach().requires_grad_(True)
+    fc1_1_split = fc1_1_weight.clone().detach().requires_grad_(True)
+    fc1_2_split = fc1_2_weight.clone().detach().requires_grad_(True)
+    fc2_split = fc2_weight.clone().detach().requires_grad_(True)
+    out_split = fused_moe_forward(
+        num_experts=num_experts,
+        routing_weights=routing_weights,
+        selected_experts=selected_experts,
+        hidden_states=hs_split,
+        fc1_1_weight=fc1_1_split,
+        fc1_2_weight=fc1_2_split,
+        fc2_weight=fc2_split,
+        swiglu_limit=swiglu_limit,
+    )
+
+    hs_merged = hidden_states.clone().detach().requires_grad_(True)
+    fc1_merged = fc1_1_2_weight.clone().detach().requires_grad_(True)
+    fc2_merged = fc2_weight.clone().detach().requires_grad_(True)
+    out_merged = fused_moe_forward(
+        num_experts=num_experts,
+        routing_weights=routing_weights,
+        selected_experts=selected_experts,
+        hidden_states=hs_merged,
+        fc1_1_weight=None,
+        fc1_2_weight=None,
+        fc2_weight=fc2_merged,
+        fc1_1_2_weight=fc1_merged,
+        swiglu_limit=swiglu_limit,
+    )
+
+    hs_eager = hidden_states.clone().detach().requires_grad_(True)
+    fc1_1_eager = fc1_1_weight.clone().detach().requires_grad_(True)
+    fc1_2_eager = fc1_2_weight.clone().detach().requires_grad_(True)
+    fc2_eager = fc2_weight.clone().detach().requires_grad_(True)
+    out_eager = _eager_moe_forward(
+        num_experts=num_experts,
+        routing_weights=routing_weights,
+        selected_experts=selected_experts,
+        hidden_states=hs_eager,
+        fc1_1_weight=fc1_1_eager,
+        fc1_2_weight=fc1_2_eager,
+        fc2_weight=fc2_eager,
+        swiglu_limit=swiglu_limit,
+    )
+
+    torch.testing.assert_close(out_split, out_merged, rtol=0, atol=0)
+    torch.testing.assert_close(out_merged, out_eager, rtol=2e-2, atol=2e-2)
+
+    grad_output = torch.randn_like(out_split)
+    out_split.backward(grad_output)
+    out_merged.backward(grad_output)
+    out_eager.backward(grad_output)
+
+    torch.testing.assert_close(hs_split.grad, hs_merged.grad, rtol=3e-2, atol=3e-2)
+    torch.testing.assert_close(fc2_split.grad, fc2_merged.grad, rtol=0, atol=0)
+    fc1_split_grad = torch.cat([fc1_1_split.grad, fc1_2_split.grad], dim=1)
+    torch.testing.assert_close(fc1_split_grad, fc1_merged.grad, rtol=0, atol=0)
+    torch.testing.assert_close(hs_merged.grad, hs_eager.grad, rtol=6e-2, atol=6e-2)
+    torch.testing.assert_close(fc2_merged.grad, fc2_eager.grad, rtol=2e-2, atol=2e-2)
+    fc1_eager_grad = torch.cat([fc1_1_eager.grad, fc1_2_eager.grad], dim=1)
+    torch.testing.assert_close(fc1_merged.grad, fc1_eager_grad, rtol=5e-2, atol=5e-2)
+
+
+def _count_ep_saturated_activations(
+    permute_tokens: torch.Tensor,
+    cumsum: torch.Tensor,
+    fc1_1_weight: torch.Tensor,
+    fc1_2_weight: torch.Tensor,
+    swiglu_limit: float,
+) -> int:
+    start = 0
+    saturated = 0
+    for expert_idx, end in enumerate(cumsum.tolist()):
+        tokens = permute_tokens[start:end]
+        gate = F.linear(tokens, fc1_1_weight[expert_idx])
+        up = F.linear(tokens, fc1_2_weight[expert_idx])
+        saturated += (gate > swiglu_limit).sum().item()
+        saturated += (up.abs() > swiglu_limit).sum().item()
+        start = end
+    return saturated
+
+
+def _make_ep_inputs(num_tokens, num_experts, hidden_dim, ffn_dim, seed, activation_scale: float = 0.1):
     """Create synthetic EP test inputs: permute_tokens, cumsum, and weights."""
     torch.manual_seed(seed)
     device = torch.device(get_device_type())
@@ -271,7 +396,7 @@ def _make_ep_inputs(num_tokens, num_experts, hidden_dim, ffn_dim, seed):
     total_tokens = tokens_per_expert.sum().item()
     cumsum = torch.cumsum(tokens_per_expert, dim=0).to(device)
 
-    permute_tokens = 0.1 * torch.randn(total_tokens, hidden_dim, device=device, dtype=dtype)
+    permute_tokens = activation_scale * torch.randn(total_tokens, hidden_dim, device=device, dtype=dtype)
     fc1_1_weight = 0.1 * torch.randn(num_experts, ffn_dim, hidden_dim, device=device, dtype=dtype)
     fc1_2_weight = 0.1 * torch.randn(num_experts, ffn_dim, hidden_dim, device=device, dtype=dtype)
     fc1_1_2_weight = torch.cat([fc1_1_weight, fc1_2_weight], dim=1).contiguous()
@@ -280,7 +405,175 @@ def _make_ep_inputs(num_tokens, num_experts, hidden_dim, ffn_dim, seed):
     return cumsum, permute_tokens, fc1_1_weight, fc1_2_weight, fc1_1_2_weight, fc2_weight
 
 
-@pytest.mark.parametrize("swiglu_limit", [None, 0.20])
+def _ep_eager_forward(
+    permute_tokens: torch.Tensor,
+    cumsum: torch.Tensor,
+    fc1_1_weight: torch.Tensor,
+    fc1_2_weight: torch.Tensor,
+    fc2_weight: torch.Tensor,
+    swiglu_limit: float | None,
+) -> torch.Tensor:
+    output = torch.empty(
+        permute_tokens.shape[0], fc2_weight.shape[1], device=permute_tokens.device, dtype=permute_tokens.dtype
+    )
+    start = 0
+    for expert_idx, end in enumerate(cumsum.tolist()):
+        tokens = permute_tokens[start:end]
+        gate = F.linear(tokens, fc1_1_weight[expert_idx])
+        up = F.linear(tokens, fc1_2_weight[expert_idx])
+        if swiglu_limit is not None:
+            gate = gate.clamp(max=swiglu_limit)
+            up = up.clamp(min=-swiglu_limit, max=swiglu_limit)
+        output[start:end] = F.linear(F.silu(gate) * up, fc2_weight[expert_idx])
+        start = end
+    return output
+
+
+def _assert_ep_matches_eager(
+    out_ep: torch.Tensor,
+    pt_ep: torch.Tensor,
+    fc1_1_ep: torch.Tensor,
+    fc1_2_ep: torch.Tensor,
+    fc2_ep: torch.Tensor,
+    permute_tokens: torch.Tensor,
+    cumsum: torch.Tensor,
+    fc1_1_weight: torch.Tensor,
+    fc1_2_weight: torch.Tensor,
+    fc2_weight: torch.Tensor,
+    swiglu_limit: float,
+    grad_output: torch.Tensor,
+) -> None:
+    pt_eager = permute_tokens.clone().detach().requires_grad_(True)
+    fc1_1_eager = fc1_1_weight.clone().detach().requires_grad_(True)
+    fc1_2_eager = fc1_2_weight.clone().detach().requires_grad_(True)
+    fc2_eager = fc2_weight.clone().detach().requires_grad_(True)
+    out_eager = _ep_eager_forward(pt_eager, cumsum, fc1_1_eager, fc1_2_eager, fc2_eager, swiglu_limit)
+
+    torch.testing.assert_close(out_ep, out_eager, rtol=2e-2, atol=2e-2)
+
+    out_ep.backward(grad_output, retain_graph=True)
+    out_eager.backward(grad_output)
+    torch.testing.assert_close(pt_ep.grad, pt_eager.grad, rtol=6e-2, atol=6e-2)
+    torch.testing.assert_close(fc2_ep.grad, fc2_eager.grad, rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(fc1_1_ep.grad, fc1_1_eager.grad, rtol=5e-2, atol=5e-2)
+    torch.testing.assert_close(fc1_2_ep.grad, fc1_2_eager.grad, rtol=5e-2, atol=5e-2)
+
+
+@pytest.mark.parametrize("swiglu_limit", [7.0, 10.0])
+def test_ep_swiglu_limit_scaled_inputs_exercise_clamp(swiglu_limit: float):
+    """Keep one focused saturation case while parity tests use realistic LLM limits."""
+    _skip_if_unsupported()
+
+    cumsum, permute_tokens, fc1_1_weight, fc1_2_weight, fc1_1_2_weight, fc2_weight = _make_ep_inputs(
+        num_tokens=64,
+        num_experts=4,
+        hidden_dim=128,
+        ffn_dim=64,
+        seed=7,
+        activation_scale=8.0,
+    )
+    assert _count_ep_saturated_activations(permute_tokens, cumsum, fc1_1_weight, fc1_2_weight, swiglu_limit) > 0
+
+    pt_split = permute_tokens.clone().detach().requires_grad_(True)
+    fc1_1_split = fc1_1_weight.clone().detach().requires_grad_(True)
+    fc1_2_split = fc1_2_weight.clone().detach().requires_grad_(True)
+    fc2_split = fc2_weight.clone().detach().requires_grad_(True)
+    out_split = EPGroupGemm.apply(pt_split, cumsum, fc1_1_split, fc1_2_split, fc2_split, swiglu_limit)
+
+    pt_merged = permute_tokens.clone().detach().requires_grad_(True)
+    fc1_merged = fc1_1_2_weight.clone().detach().requires_grad_(True)
+    fc2_merged = fc2_weight.clone().detach().requires_grad_(True)
+    out_merged = EPMergedFc1GroupGemm.apply(pt_merged, cumsum, fc1_merged, fc2_merged, swiglu_limit)
+
+    out_unclamped = EPGroupGemm.apply(
+        permute_tokens.clone().detach(),
+        cumsum,
+        fc1_1_weight.clone().detach(),
+        fc1_2_weight.clone().detach(),
+        fc2_weight.clone().detach(),
+        None,
+    )
+
+    torch.testing.assert_close(out_split, out_merged, rtol=0, atol=0)
+    assert not torch.equal(out_split, out_unclamped)
+
+    grad_output = torch.randn_like(out_split)
+    _assert_ep_matches_eager(
+        out_split,
+        pt_split,
+        fc1_1_split,
+        fc1_2_split,
+        fc2_split,
+        permute_tokens,
+        cumsum,
+        fc1_1_weight,
+        fc1_2_weight,
+        fc2_weight,
+        swiglu_limit,
+        grad_output,
+    )
+    out_merged.backward(grad_output)
+    torch.testing.assert_close(pt_split.grad, pt_merged.grad, rtol=3e-2, atol=3e-2)
+    torch.testing.assert_close(fc2_split.grad, fc2_merged.grad, rtol=0, atol=0)
+    fc1_split_grad = torch.cat([fc1_1_split.grad, fc1_2_split.grad], dim=1)
+    torch.testing.assert_close(fc1_split_grad, fc1_merged.grad, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("swiglu_limit", [7.0, 10.0])
+def test_ep_quack_swiglu_limit_scaled_inputs_exercise_clamp(swiglu_limit: float):
+    """Exercise saturated Quack EP clamp paths when the backend is available."""
+    _skip_if_unsupported()
+    if not is_quack_gemm_available():
+        pytest.skip("quack not available or GPU < SM90")
+
+    from veomni.ops.kernels.moe.quack_gemm import EPMergedFc1QuackGroupGemm, EPQuackGroupGemm
+
+    cumsum, permute_tokens, fc1_1_weight, fc1_2_weight, fc1_1_2_weight, fc2_weight = _make_ep_inputs(
+        num_tokens=64,
+        num_experts=4,
+        hidden_dim=128,
+        ffn_dim=64,
+        seed=11,
+        activation_scale=8.0,
+    )
+    assert _count_ep_saturated_activations(permute_tokens, cumsum, fc1_1_weight, fc1_2_weight, swiglu_limit) > 0
+
+    pt_split = permute_tokens.clone().detach().requires_grad_(True)
+    fc1_1_split = fc1_1_weight.clone().detach().requires_grad_(True)
+    fc1_2_split = fc1_2_weight.clone().detach().requires_grad_(True)
+    fc2_split = fc2_weight.clone().detach().requires_grad_(True)
+    out_split = EPQuackGroupGemm.apply(pt_split, cumsum, fc1_1_split, fc1_2_split, fc2_split, swiglu_limit)
+
+    pt_merged = permute_tokens.clone().detach().requires_grad_(True)
+    fc1_merged = fc1_1_2_weight.clone().detach().requires_grad_(True)
+    fc2_merged = fc2_weight.clone().detach().requires_grad_(True)
+    out_merged = EPMergedFc1QuackGroupGemm.apply(pt_merged, cumsum, fc1_merged, fc2_merged, swiglu_limit)
+
+    torch.testing.assert_close(out_split, out_merged, rtol=1e-2, atol=1e-2)
+
+    grad_output = torch.randn_like(out_split)
+    _assert_ep_matches_eager(
+        out_split,
+        pt_split,
+        fc1_1_split,
+        fc1_2_split,
+        fc2_split,
+        permute_tokens,
+        cumsum,
+        fc1_1_weight,
+        fc1_2_weight,
+        fc2_weight,
+        swiglu_limit,
+        grad_output,
+    )
+    out_merged.backward(grad_output)
+    torch.testing.assert_close(pt_split.grad, pt_merged.grad, rtol=3e-2, atol=3e-2)
+    torch.testing.assert_close(fc2_split.grad, fc2_merged.grad, rtol=1e-2, atol=1e-2)
+    fc1_split_grad = torch.cat([fc1_1_split.grad, fc1_2_split.grad], dim=1)
+    torch.testing.assert_close(fc1_split_grad, fc1_merged.grad, rtol=3e-2, atol=3e-2)
+
+
+@pytest.mark.parametrize("swiglu_limit", [None, 7.0, 10.0])
 @pytest.mark.parametrize(
     "num_tokens,num_experts,hidden_dim,ffn_dim,seed",
     [
@@ -336,7 +629,7 @@ def test_ep_split_vs_merged(
     torch.testing.assert_close(pt_split.grad, pt_merged.grad, rtol=3e-2, atol=3e-2)
 
 
-@pytest.mark.parametrize("swiglu_limit", [None, 0.20])
+@pytest.mark.parametrize("swiglu_limit", [None, 7.0, 10.0])
 @pytest.mark.parametrize(
     "num_tokens,num_experts,hidden_dim,ffn_dim,seed",
     [
@@ -395,7 +688,7 @@ def test_ep_quack_split_vs_merged(
     torch.testing.assert_close(pt_split.grad, pt_quack.grad, rtol=3e-2, atol=3e-2)
 
 
-@pytest.mark.parametrize("swiglu_limit", [None, 0.20])
+@pytest.mark.parametrize("swiglu_limit", [None, 7.0, 10.0])
 @pytest.mark.parametrize(
     "num_tokens,num_experts,hidden_dim,ffn_dim,seed",
     [
@@ -474,7 +767,7 @@ def _scatter_routing_weights(routing_weights, scatter_index):
     return scattered
 
 
-@pytest.mark.parametrize("swiglu_limit", [None, 0.20])
+@pytest.mark.parametrize("swiglu_limit", [None, 7.0, 10.0])
 @pytest.mark.parametrize(
     "num_tokens,num_experts,hidden_dim,ffn_dim,topk,seed",
     [
@@ -582,7 +875,7 @@ def test_ep_vs_non_ep(
     torch.testing.assert_close(fc1_2_eager.grad, fc1_2_ep.grad, rtol=0, atol=fc1_atol)
 
 
-@pytest.mark.parametrize("swiglu_limit", [None, 0.20])
+@pytest.mark.parametrize("swiglu_limit", [None, 7.0, 10.0])
 @pytest.mark.parametrize(
     "num_tokens,num_experts,hidden_dim,ffn_dim,topk,seed",
     [
