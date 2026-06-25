@@ -91,16 +91,42 @@ def _copy_safetensors_shard(filepath: str, staged_filepath: str) -> None:
     copy_method = os.getenv("VEOMNI_STAGE_HDFS_SAFETENSORS_COPY_METHOD", "copy_to_local")
     if copy_method == "copy_to_local":
         logger.info_rank0(f"Copying safetensors shard with hdfs dfs -copyToLocal: {hdfs_uri} -> {staged_filepath}")
-        subprocess.run(["hdfs", "dfs", "-copyToLocal", "-f", hdfs_uri, staged_filepath], check=True)
+        subprocess.run(
+            ["hdfs", "dfs", "-copyToLocal", "-f", hdfs_uri, staged_filepath],
+            check=True,
+            env=_get_hdfs_subprocess_env(),
+        )
+    elif copy_method == "get":
+        logger.info_rank0(f"Copying safetensors shard with hdfs dfs -get: {hdfs_uri} -> {staged_filepath}")
+        subprocess.run(
+            ["hdfs", "dfs", "-get", "-f", hdfs_uri, staged_filepath],
+            check=True,
+            env=_get_hdfs_subprocess_env(),
+        )
     elif copy_method == "cat":
         logger.info_rank0(f"Copying safetensors shard with hdfs dfs -cat: {hdfs_uri} -> {staged_filepath}")
         with open(staged_filepath, "wb") as staged_file:
-            subprocess.run(["hdfs", "dfs", "-cat", hdfs_uri], stdout=staged_file, check=True)
+            subprocess.run(
+                ["hdfs", "dfs", "-cat", hdfs_uri],
+                stdout=staged_file,
+                check=True,
+                env=_get_hdfs_subprocess_env(),
+            )
     else:
         raise ValueError(
             "VEOMNI_STAGE_HDFS_SAFETENSORS_COPY_METHOD must be one of: "
-            f"copy_to_local, cat. Got {copy_method!r}."
+            f"copy_to_local, get, cat. Got {copy_method!r}."
         )
+
+
+def _get_hdfs_subprocess_env() -> Dict[str, str]:
+    env = os.environ.copy()
+    env["CPP_HDFS_LOG_TYPE"] = "file,stderr"
+    env["CPP_HDFS_LOG_LEVEL"] = "error"
+    libhdfs_opts = env.get("LIBHDFS_OPTS", "")
+    if "hadoop.root.logger" not in libhdfs_opts:
+        env["LIBHDFS_OPTS"] = f"{libhdfs_opts} -Dhadoop.root.logger=ERROR,console".strip()
+    return env
 
 
 @contextmanager
