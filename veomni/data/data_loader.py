@@ -84,6 +84,8 @@ def build_native_dataloader(
     prefetch_factor: int = 2,
     shuffle: bool = True,
     seed: int = 0,
+    infinity: bool = False,
+    infinity_padding: bool = False,
     collate_fn: Optional[Callable] = None,
     build_collate_fn: bool = True,
     collate_fn_kwargs: Optional[Dict[str, Any]] = None,
@@ -201,6 +203,8 @@ def build_native_dataloader(
                 get_physical_length_fn=dyn_bsz_physical_length_fn,
                 dynamic_batching_collate_fn=dyn_bsz_collate_fn,
                 save_by_idx=dyn_bsz_dataset_save_by_idx,
+                infinity=infinity,
+                infinity_padding=infinity_padding,
             )
             collate_fn = NoopDataCollator()
     else:
