@@ -53,25 +53,34 @@ class DataSimArguments:
 
 
 def _hash_batch(micro_batch: Any) -> str:
-    """Order-stable SHA256 over one step's data (a ``list[dict[str, Tensor]]``).
+    """Order-stable SHA256 over one step's data.
 
-    Tensor bytes + dtype + shape go into the hash; non-tensor values (e.g. ``padding_flag``)
-    by their repr. Stable enough to compare a step across runs / before-vs-after resume.
+    Recurses through dicts / lists / tuples. Tensors are hashed by their device-independent
+    cpu bytes + dtype + shape (never by repr, which would embed ``device=`` and truncate);
+    leaf scalars (e.g. ``padding_flag``) by their repr. Stable across runs / devices, so a
+    step can be compared cross-run or before-vs-after resume.
     """
-    micro_batches = micro_batch if isinstance(micro_batch, (list, tuple)) else [micro_batch]
     hasher = hashlib.sha256()
-    for mb in micro_batches:
-        for key in sorted(mb, key=repr):
-            value = mb[key]
-            hasher.update(repr(key).encode())
-            if isinstance(value, torch.Tensor):
-                t = value.detach().cpu().contiguous()
-                if t.dtype == torch.bfloat16:  # numpy has no bfloat16; widen deterministically
-                    t = t.to(torch.float32)
-                hasher.update(f"{t.dtype}{tuple(t.shape)}".encode())
-                hasher.update(t.numpy().tobytes())
-            else:
-                hasher.update(repr(value).encode())
+
+    def feed(value: Any) -> None:
+        if isinstance(value, torch.Tensor):
+            t = value.detach().cpu().contiguous()
+            if t.dtype == torch.bfloat16:  # numpy has no bfloat16; widen deterministically
+                t = t.to(torch.float32)
+            hasher.update(f"{t.dtype}{tuple(t.shape)}".encode())
+            hasher.update(t.numpy().tobytes())
+        elif isinstance(value, dict):
+            for key in sorted(value, key=repr):
+                hasher.update(repr(key).encode())
+                feed(value[key])
+        elif isinstance(value, (list, tuple)):
+            hasher.update(f"{type(value).__name__}{len(value)}".encode())
+            for item in value:
+                feed(item)
+        else:
+            hasher.update(repr(value).encode())
+
+    feed(micro_batch)
     return hasher.hexdigest()
 
 
