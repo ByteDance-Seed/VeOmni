@@ -80,6 +80,7 @@ def test_local_pth_sum_skips_missing_grads_and_accumulates_in_fp32(monkeypatch):
 
 def test_local_pth_sum_falls_back_without_foreach_support(monkeypatch):
     monkeypatch.setattr(clip_grad_norm_module, "_has_foreach_support", lambda tensors, device: False)
+    monkeypatch.setattr(clip_grad_norm_module, "_device_has_foreach_support", lambda device: False)
 
     def fail_foreach_norm(*args, **kwargs):
         raise AssertionError("foreach path should not be used")

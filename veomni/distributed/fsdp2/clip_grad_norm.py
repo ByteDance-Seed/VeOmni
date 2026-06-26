@@ -4,7 +4,7 @@ from typing import List
 import torch
 import torch.distributed as dist
 from torch.distributed._tensor import DTensor
-from torch.utils._foreach_utils import _has_foreach_support
+from torch.utils._foreach_utils import _device_has_foreach_support, _has_foreach_support
 
 from ...utils.device import get_device_type
 from ...utils.logging import get_logger
@@ -197,11 +197,11 @@ def _local_pth_sum(params: List[torch.nn.Parameter], p: float) -> torch.Tensor:
         if not chunk:
             return
         chunk_fp32 = [g.to(torch.float32) for g in chunk]
-        if _has_foreach_support(chunk_fp32, device):
-            norms = torch._foreach_norm(chunk_fp32, p)
+        if _has_foreach_support(chunk_fp32, device) or _device_has_foreach_support(device):
+            norm_pows = torch._foreach_pow_(torch._foreach_norm(chunk_fp32, p), p)
         else:
-            norms = [torch.linalg.vector_norm(g, p) for g in chunk_fp32]
-        res = res + torch.sum(torch.stack(norms).pow(p)).to(reduce_device)
+            norm_pows = [torch.linalg.vector_norm(g, p).pow(p) for g in chunk_fp32]
+        res = res + torch.sum(torch.stack(norm_pows)).to(reduce_device)
         chunk.clear()
 
     with torch.no_grad():
