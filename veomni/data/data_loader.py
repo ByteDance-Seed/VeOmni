@@ -31,7 +31,12 @@ from .data_collator import (
     NoopDataCollator,
     UnpackDataCollator,
 )
-from .dataset import DynamicBatchingSizeDataset, get_length_by_attention_mask_fn, get_length_fn_by_count_mode
+from .dataset import (
+    DynamicBatchingSizeDataset,
+    _MapStyleSamplerWrapper,
+    get_length_by_attention_mask_fn,
+    get_length_fn_by_count_mode
+)
 from .dynamic_batching import DynamicBatchSizeDataLoader, TextBatchingStrategy
 
 
@@ -192,6 +197,17 @@ def build_native_dataloader(
 
             collate_fn = UnpackDataCollator()
         else:
+            if not isinstance(dataset, IterableDataset):
+                # Map-style datasets lose their DistributedSampler once wrapped into the
+                # (iterable) DynamicBatchingSizeDataset. Adapt them to a per-rank,
+                # per-worker iterable with sampler-equivalent index assignment.
+                dataset = _MapStyleSamplerWrapper(
+                    dataset,
+                    num_replicas=parallel_state.dp_size,
+                    rank=parallel_state.dp_rank,
+                    shuffle=shuffle,
+                    seed=seed,
+                )
             dataset = DynamicBatchingSizeDataset(
                 dataset=dataset,
                 micro_batch_seq_length=batching_token_len,
