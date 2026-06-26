@@ -4,6 +4,7 @@ from typing import List
 import torch
 import torch.distributed as dist
 from torch.distributed._tensor import DTensor
+from torch.utils._foreach_utils import _has_foreach_support
 
 from ...utils.device import get_device_type
 from ...utils.logging import get_logger
@@ -48,16 +49,19 @@ def clip_grad_norm(
 
 
 def _fsdp_grad_norm_reduce_groups(ps) -> List[tuple[str, dist.ProcessGroup | None]]:
-    """Process groups for FSDP2 grad-norm reduction.
-
-    Under HSDP each shard group is replicated across ``dp_replicate``; only sum
-    shard-local p-th powers across ``dp_shard``, not across replicas.
-    """
+    """Return process groups that own distinct FSDP gradient shards."""
     if ps.dp_mode != "fsdp2":
         return []
-    if ps.dp_replicate_enabled:
-        return [("fsdp_shard", ps.dp_shard_group)] if ps.dp_shard_size > 1 else []
-    return [("fsdp", ps.fsdp_group)]
+    if not ps.dp_replicate_enabled:
+        return [("fsdp", ps.fsdp_group)]
+    # In HSDP, replicas already hold equivalent gradients after backward; reduce
+    # only across the shard side of the FSDP mesh.
+    if ps.dp_shard_sp_enabled:
+        # When SP participates in FSDP sharding, the shard group is dp_shard_sp.
+        return [("fsdp_shard_sp", ps.dp_shard_sp_group)]
+    if ps.dp_shard_size > 1:
+        return [("fsdp_shard", ps.dp_shard_group)]
+    return []
 
 
 @torch.no_grad()
@@ -178,11 +182,13 @@ def _raise_if_nonfinite(total_norm: torch.Tensor, norm_type: float, error_if_non
         )
 
 
-# compute local sum of param gard norm
 def _local_pth_sum(params: List[torch.nn.Parameter], p: float) -> torch.Tensor:
+    """Compute the local p-th norm sum with bounded fp32 grad materialization."""
     reduce_device = torch.device(get_device_type())
     res = torch.tensor(0.0, device=reduce_device, dtype=torch.float32)
 
+    # Materializing every grad as fp32 at once can OOM on large models, so keep
+    # foreach acceleration local to bounded same-device chunks.
     chunks: dict[torch.device, list[torch.Tensor]] = {}
 
     def flush_chunk(device: torch.device) -> None:
@@ -191,7 +197,10 @@ def _local_pth_sum(params: List[torch.nn.Parameter], p: float) -> torch.Tensor:
         if not chunk:
             return
         chunk_fp32 = [g.to(torch.float32) for g in chunk]
-        norms = torch._foreach_norm(chunk_fp32, p)
+        if _has_foreach_support(chunk_fp32, device):
+            norms = torch._foreach_norm(chunk_fp32, p)
+        else:
+            norms = [torch.linalg.vector_norm(g, p) for g in chunk_fp32]
         res = res + torch.sum(torch.stack(norms).pow(p)).to(reduce_device)
         chunk.clear()
 

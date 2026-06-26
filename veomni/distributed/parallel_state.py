@@ -216,6 +216,11 @@ class ParallelState:
             return self.device_mesh.get_group("dp_shard")
 
     @property
+    def dp_shard_sp_group(self) -> Optional["ProcessGroup"]:
+        if self.device_mesh is not None:
+            return self.device_mesh.get_group("dp_shard_sp")
+
+    @property
     def dp_shard_rank(self) -> int:
         if self.device_mesh is not None:
             return self.device_mesh.get_local_rank("dp_shard")
