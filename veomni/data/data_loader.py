@@ -35,7 +35,7 @@ from .dataset import (
     DynamicBatchingSizeDataset,
     _MapStyleSamplerWrapper,
     get_length_by_attention_mask_fn,
-    get_length_fn_by_count_mode
+    get_length_fn_by_count_mode,
 )
 from .dynamic_batching import DynamicBatchSizeDataLoader, TextBatchingStrategy
 

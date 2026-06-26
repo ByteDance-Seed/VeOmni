@@ -446,3 +446,34 @@ def test_map_style_sampler_wrapper_resume(num_workers, save_by_idx):
         for key in got:
             if torch.is_tensor(got[key]):
                 assert torch.equal(got[key], want[key]), f"mismatch in {key}"
+
+
+def test_map_style_sampler_wrapper_state_dict_after_resume_before_iter():
+    """state_dict() right after load_state_dict() but before __iter__ must report the
+    restored progress, not 0.
+    """
+    dataset = ShardedMappingDataset(size=_WRAPPER_DATASET_SIZE)
+    kwargs = dict(num_replicas=2, rank=0, shuffle=True, seed=5)
+
+    src = _MapStyleSamplerWrapper(dataset, **kwargs)
+    src.set_epoch(2)
+    it = iter(src)
+    consumed = 3
+    for _ in range(consumed):
+        next(it)
+    state = src.state_dict()
+    assert state == {"epoch": 2, "yielded": consumed}
+
+    # Resume, then query state BEFORE iterating: must still reflect the restored progress.
+    resumed = _MapStyleSamplerWrapper(dataset, **kwargs)
+    resumed.load_state_dict(state)
+    assert resumed.state_dict() == state  # used to return yielded == 0
+
+    # And the resumed iteration actually skips the already-consumed prefix.
+    full = _MapStyleSamplerWrapper(dataset, **kwargs)
+    full.set_epoch(2)
+    full.output_index_for_resume = True
+    resumed.output_index_for_resume = True
+    full_indices = [idx for _, idx in full]
+    resumed_indices = [idx for _, idx in resumed]
+    assert resumed_indices == full_indices[consumed:]

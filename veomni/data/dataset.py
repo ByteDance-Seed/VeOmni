@@ -888,7 +888,9 @@ class _MapStyleSamplerWrapper(IterableDataset):
         self.total_size = self.num_samples * self.num_replicas
 
         self._yielded = 0
-        self._next_yielded = None
+        # When resumed from a checkpoint, __iter__ keeps the restored _yielded instead of
+        # resetting it to 0, mirroring DynamicBatchingSizeDataset's resume handling.
+        self._just_resumed = False
 
     def __len__(self) -> int:
         """Number of samples assigned to this rank (across all of its workers)."""
@@ -923,10 +925,12 @@ class _MapStyleSamplerWrapper(IterableDataset):
         # Strided worker split keeps per-worker counts balanced (difference <= 1).
         indices = self._rank_indices()[worker_id::num_workers]
 
-        self._yielded = 0
-        if self._next_yielded is not None:
-            self._yielded = min(self._next_yielded, len(indices))
-            self._next_yielded = None
+        if not self._just_resumed:
+            self._yielded = 0
+        else:
+            # Resuming: keep the restored progress (clamped to this worker's index count).
+            self._yielded = min(self._yielded, len(indices))
+            self._just_resumed = False
 
         for idx in indices[self._yielded :]:
             self._yielded += 1
@@ -945,7 +949,8 @@ class _MapStyleSamplerWrapper(IterableDataset):
 
     def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
         self.epoch = state_dict["epoch"]
-        self._next_yielded = state_dict["yielded"]
+        self._yielded = state_dict["yielded"]
+        self._just_resumed = True
 
     def set_epoch(self, epoch: int) -> None:
         self.epoch = epoch
