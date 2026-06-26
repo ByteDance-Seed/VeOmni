@@ -15,13 +15,11 @@
 
 # Adapted from https://github.com/pytorch/torchtitan/blob/main/torchtitan/distributed/parallel_dims.py
 
-import math
 import os
 from dataclasses import dataclass, field
 from functools import cached_property, wraps
 from typing import TYPE_CHECKING, Callable, Dict, Literal, Optional, Tuple
 
-import torch
 from torch import distributed as dist
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 
@@ -48,29 +46,6 @@ def requires_mesh(fn: Callable) -> Callable:
         return fn(self, *args, **kwargs)
 
     return _inner
-
-
-def init_para_mesh_matrix(para_size: int, para_fsdp_size: int, para_outside: bool = False) -> "DeviceMesh":
-    """
-    Initialize the device mesh matrix for the ExtraParallel.
-    Args:
-        para_size (int): The size of the ExtraParallel.
-        para_fsdp_size (int): The size of the ExtraParallel-FSDP.
-        para_outside (bool): Whether the ExtraParallel is outside in para-fsdp group.
-    """
-    if para_outside:
-        with torch.device("cpu"):
-            mesh = torch.arange(math.prod((para_size, para_fsdp_size)), dtype=torch.int).view(
-                para_size, para_fsdp_size
-            )
-    else:
-        with torch.device("cpu"):
-            mesh = (
-                torch.arange(math.prod((para_size, para_fsdp_size)), dtype=torch.int)
-                .view(para_fsdp_size, para_size)
-                .transpose(0, 1)
-            )
-    return mesh
 
 
 @dataclass(frozen=True)

@@ -273,7 +273,9 @@ def main():
     dist.destroy_process_group()
 
 
-def _run_clip_grad_norm_fsdp2_test(ep_size: int, emb_size: int, cpu_offload: bool) -> None:
+def _run_clip_grad_norm_fsdp2_test(
+    ep_size: int, emb_size: int, cpu_offload: bool, dp_replicate_size: int | None = None
+) -> None:
     command = [
         "torchrun",
         "--nnodes=1",
@@ -289,6 +291,12 @@ def _run_clip_grad_norm_fsdp2_test(ep_size: int, emb_size: int, cpu_offload: boo
         "--train.init_device=meta",
         "--train.checkpoint.output_dir='debug'",
     ]
+    # HSDP: split the dp dim into (dp_replicate, dp_shard). dp_shard is inferred
+    # as dp_size // dp_replicate_size by the argument resolver. The expected
+    # total grad norm is identical to the pure-FSDP case: the clip reduces over
+    # the shard group only, so replicating over dp_replicate must NOT inflate it.
+    if dp_replicate_size is not None:
+        command.append(f"--train.accelerator.dp_replicate_size={dp_replicate_size}")
     if cpu_offload:
         command.append("--train.accelerator.fsdp_config.offload=True")
     result = subprocess.run(command, check=True)
@@ -318,6 +326,37 @@ def test_clip_grad_norm_fsdp2_emb8(cpu_offload: bool):
 @pytest.mark.parametrize("cpu_offload", [False, True], ids=["no_offload", "cpu_offload"])
 def test_clip_grad_norm_fsdp2_ep2_emb4(cpu_offload: bool):
     _run_clip_grad_norm_fsdp2_test(ep_size=2, emb_size=4, cpu_offload=cpu_offload)
+
+
+# ---------------------------------------------------------------------------
+# HSDP regression: dp = (dp_replicate=2, dp_shard=4) on 8 GPUs.
+#
+# The grad-norm reduction must skip the replicate dim for BOTH non-ExtraParallel
+# params (reduce over `dp_shard_sp`, not `dp_sp`) and ExtraParallel params
+# (reduce over `ep_fsdp`/`emb_fsdp`, not the full `*_replicate` mesh). If the
+# replicate dim leaks into the sum, the norm is inflated by sqrt(dp_replicate),
+# so these reuse the SAME expected total norm as the pure-FSDP cases above.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("cpu_offload", [False, True], ids=["no_offload", "cpu_offload"])
+def test_clip_grad_norm_hsdp_no_extra_parallel(cpu_offload: bool):
+    _run_clip_grad_norm_fsdp2_test(ep_size=1, emb_size=1, cpu_offload=cpu_offload, dp_replicate_size=2)
+
+
+@pytest.mark.parametrize("cpu_offload", [False, True], ids=["no_offload", "cpu_offload"])
+def test_clip_grad_norm_hsdp_ep4(cpu_offload: bool):
+    _run_clip_grad_norm_fsdp2_test(ep_size=4, emb_size=1, cpu_offload=cpu_offload, dp_replicate_size=2)
+
+
+@pytest.mark.parametrize("cpu_offload", [False, True], ids=["no_offload", "cpu_offload"])
+def test_clip_grad_norm_hsdp_emb4(cpu_offload: bool):
+    _run_clip_grad_norm_fsdp2_test(ep_size=1, emb_size=4, cpu_offload=cpu_offload, dp_replicate_size=2)
+
+
+@pytest.mark.parametrize("cpu_offload", [False, True], ids=["no_offload", "cpu_offload"])
+def test_clip_grad_norm_hsdp_ep2_emb4(cpu_offload: bool):
+    _run_clip_grad_norm_fsdp2_test(ep_size=2, emb_size=4, cpu_offload=cpu_offload, dp_replicate_size=2)
 
 
 if __name__ == "__main__":

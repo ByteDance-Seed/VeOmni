@@ -72,7 +72,10 @@ def _validate_extra_parallel_meshes(parallel_state) -> None:
         parallel_state.extra_parallel_fsdp_device_mesh[para] is not None
         and parallel_state.extra_parallel_fsdp_device_mesh[para].ndim in (2, 3)
         for para in parallel_state.extra_parallel_names
-    ), "At least one extra_parallel fsdp_device_mesh should be not None"
+    ), (
+        "At least one extra_parallel fsdp_device_mesh must carry the ExtraParallel+FSDP "
+        "composition: 2D (ep_fsdp, ep) for plain FSDP or 3D (ep_replicate, ep_fsdp, ep) for HSDP"
+    )
 
 
 def _apply_extra_parallel_dim(
