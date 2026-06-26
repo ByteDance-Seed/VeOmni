@@ -99,20 +99,22 @@ class QuackFusedMoeExpertFunction(torch.autograd.Function):
         fc1_1_activation = torch.ops.aten.silu(fc1_1_output)
         fc1_activation = fc1_1_activation * fc1_2_output
 
-        # fc2: input is already expert-sorted, no A_idx needed
-        fc2_output = gemm(fc1_activation, fc2_w_t, cu_seqlens_m=cu_seqlens_m)
-
-        # Apply routing weights after fc2, matching HuggingFace eager experts and
-        # common fused-MoE implementations. A_idx alone cannot replace
-        # scatter_index here because it lacks the topk-slot index needed to
-        # address gate_weights[T, topk].
+        # Apply routing weights.
+        # Note: A_idx alone cannot replace scatter_index here because A_idx only
+        # carries token indices (sorted_order // topk) but not the topk-slot index,
+        # so it cannot address into gate_weights[T, topk] without extra bookkeeping.
         reshaped_gate_weight = gate_weights.reshape(-1, 1)
         scattered_gate_weight = torch.empty_like(reshaped_gate_weight)
         scattered_gate_weight[scatter_index.flatten()] = reshaped_gate_weight
-        fc2_weighted_output = fc2_output * scattered_gate_weight
+
+        fc1_weighted_output = fc1_activation * scattered_gate_weight
+
+        # fc2: input is already expert-sorted, no A_idx needed
+        fc2_output = gemm(fc1_weighted_output, fc2_w_t, cu_seqlens_m=cu_seqlens_m)
 
         # Gather output tokens back to original order
-        expert_output = moe_gather(fc2_weighted_output, scatter_index)
+        expert_output = moe_gather(fc2_output, scatter_index)
+        del fc2_output
         output = expert_output.reshape(hidden_states.shape)
 
         ctx.num_experts = num_experts
@@ -129,7 +131,7 @@ class QuackFusedMoeExpertFunction(torch.autograd.Function):
             fc1_2_output,
             fc1_activation,
             scattered_gate_weight,
-            fc2_output,
+            fc1_weighted_output,
             mask_fc1_1 if mask_fc1_1 is not None else torch.empty(0, device=hidden_states.device),
             mask_fc1_2 if mask_fc1_2 is not None else torch.empty(0, device=hidden_states.device),
         )
@@ -150,7 +152,7 @@ class QuackFusedMoeExpertFunction(torch.autograd.Function):
             fc1_2_output,
             fc1_activation,
             scattered_gate_weight,
-            fc2_output,
+            fc1_weighted_output,
             mask_fc1_1,
             mask_fc1_2,
         ) = ctx.saved_tensors
@@ -161,25 +163,27 @@ class QuackFusedMoeExpertFunction(torch.autograd.Function):
         # Step 10: scatter grad to expert-sorted order
         grad_fc2_output = moe_scatter(grad_output, scatter_index)
 
-        # Step 9: routing weights are applied after fc2.
-        grad_weighted_fc2_output = grad_fc2_output
-        grad_fc2_output = grad_weighted_fc2_output * scattered_gate_weight
-        grad_scattered_gate_weight = torch.sum(fc2_output * grad_weighted_fc2_output, dim=-1)
-        del fc2_output, grad_weighted_fc2_output, scattered_gate_weight
-        grad_gate_weight = grad_scattered_gate_weight[scatter_index.flatten()]
-        del grad_scattered_gate_weight
-        grad_gate_weight = grad_gate_weight.reshape(gate_weights.shape)
+        # Step 9 dgrad: grad @ fc2_weight (original layout [E, H, I] is already [K, N] for quack)
+        grad_fc1_weighted_output = gemm(grad_fc2_output, fc2_weight, cu_seqlens_m=cu_seqlens_m)
 
-        # Step 8 dgrad: grad @ fc2_weight (original layout [E, H, I] is already [K, N] for quack)
-        grad_fc1_activation = gemm(grad_fc2_output, fc2_weight, cu_seqlens_m=cu_seqlens_m)
-
-        # Step 8 wgrad: grad_fc2_output.T @ fc1_activation → [E, H, I]
+        # Step 9 wgrad: grad_fc2_output.T @ fc1_weighted_output → [E, H, I]
         # cu_seqlens_k mode: A=[M, total_K] @ B=[total_K, N] → [L, M, N] per expert group.
         # Pass .T view (not .T.contiguous()) — quack varlen_k requires A to be m-major.
         grad_fc2_weight = None
         if fc2_weight.requires_grad:
-            grad_fc2_weight = gemm(grad_fc2_output.T, fc1_activation, cu_seqlens_k=cu_seqlens_m)
+            grad_fc2_weight = gemm(grad_fc2_output.T, fc1_weighted_output, cu_seqlens_k=cu_seqlens_m)
+        del fc1_weighted_output
+
+        # Step 8-2: routing weight backward
+        grad_fc1_activation = grad_fc1_weighted_output * scattered_gate_weight
+        del scattered_gate_weight
+
+        # Step 8-1: gate weight backward
+        grad_scattered_gate_weight = torch.sum(fc1_activation * grad_fc1_weighted_output, dim=-1)
         del fc1_activation
+        grad_gate_weight = grad_scattered_gate_weight[scatter_index.flatten()]
+        del grad_scattered_gate_weight
+        grad_gate_weight = grad_gate_weight.reshape(gate_weights.shape)
 
         # Recompute SiLU activation
         fc1_1_activation = torch.ops.aten.silu(fc1_1_output)
@@ -275,14 +279,16 @@ class MergedFc1QuackFusedMoeExpertFunction(torch.autograd.Function):
         fc1_1_activation = torch.ops.aten.silu(fc1_1_output)
         fc1_activation = fc1_1_activation * fc1_2_output
 
-        fc2_output = gemm(fc1_activation, fc2_w_t, cu_seqlens_m=cu_seqlens_m)
-
         reshaped_gate_weight = gate_weights.reshape(-1, 1)
         scattered_gate_weight = torch.empty_like(reshaped_gate_weight)
         scattered_gate_weight[scatter_index.flatten()] = reshaped_gate_weight
-        fc2_weighted_output = fc2_output * scattered_gate_weight
 
-        expert_output = moe_gather(fc2_weighted_output, scatter_index)
+        fc1_weighted_output = fc1_activation * scattered_gate_weight
+
+        fc2_output = gemm(fc1_weighted_output, fc2_w_t, cu_seqlens_m=cu_seqlens_m)
+
+        expert_output = moe_gather(fc2_output, scatter_index)
+        del fc2_output
         output = expert_output.reshape(hidden_states.shape)
 
         ctx.num_experts = num_experts
@@ -298,7 +304,7 @@ class MergedFc1QuackFusedMoeExpertFunction(torch.autograd.Function):
             fc1_2_output,
             fc1_activation,
             scattered_gate_weight,
-            fc2_output,
+            fc1_weighted_output,
             mask_fc1_1 if mask_fc1_1 is not None else torch.empty(0, device=hidden_states.device),
             mask_fc1_2 if mask_fc1_2 is not None else torch.empty(0, device=hidden_states.device),
         )
@@ -318,7 +324,7 @@ class MergedFc1QuackFusedMoeExpertFunction(torch.autograd.Function):
             fc1_2_output,
             fc1_activation,
             scattered_gate_weight,
-            fc2_output,
+            fc1_weighted_output,
             mask_fc1_1,
             mask_fc1_2,
         ) = ctx.saved_tensors
@@ -329,25 +335,27 @@ class MergedFc1QuackFusedMoeExpertFunction(torch.autograd.Function):
         # Step 10
         grad_fc2_output = moe_scatter(grad_output, scatter_index)
 
-        # Step 9: routing weights are applied after fc2.
-        grad_weighted_fc2_output = grad_fc2_output
-        grad_fc2_output = grad_weighted_fc2_output * scattered_gate_weight
-        grad_scattered_gate_weight = torch.sum(fc2_output * grad_weighted_fc2_output, dim=-1)
-        del fc2_output, grad_weighted_fc2_output, scattered_gate_weight
-        grad_gate_weight = grad_scattered_gate_weight[scatter_index.flatten()]
-        del grad_scattered_gate_weight
-        grad_gate_weight = grad_gate_weight.reshape(gate_weights.shape)
+        # Step 9 dgrad
+        grad_fc1_weighted_output = gemm(grad_fc2_output, fc2_weight, cu_seqlens_m=cu_seqlens_m)
 
-        # Step 8 dgrad
-        grad_fc1_activation = gemm(grad_fc2_output, fc2_weight, cu_seqlens_m=cu_seqlens_m)
-
-        # Step 8 wgrad: grad_fc2_output.T @ fc1_activation → [E, H, I]
+        # Step 9 wgrad: grad_fc2_output.T @ fc1_weighted_output → [E, H, I]
         # cu_seqlens_k mode: A=[M, total_K] @ B=[total_K, N] → [L, M, N] per expert group.
         # Pass .T view (not .T.contiguous()) — quack varlen_k requires A to be m-major.
         grad_fc2_weight = None
         if fc2_weight.requires_grad:
-            grad_fc2_weight = gemm(grad_fc2_output.T, fc1_activation, cu_seqlens_k=cu_seqlens_m)
+            grad_fc2_weight = gemm(grad_fc2_output.T, fc1_weighted_output, cu_seqlens_k=cu_seqlens_m)
+        del fc1_weighted_output
+
+        # Step 8-2
+        grad_fc1_activation = grad_fc1_weighted_output * scattered_gate_weight
+        del scattered_gate_weight
+
+        # Step 8-1
+        grad_scattered_gate_weight = torch.sum(fc1_activation * grad_fc1_weighted_output, dim=-1)
         del fc1_activation
+        grad_gate_weight = grad_scattered_gate_weight[scatter_index.flatten()]
+        del grad_scattered_gate_weight
+        grad_gate_weight = grad_gate_weight.reshape(gate_weights.shape)
 
         # Recompute
         fc1_1_activation = torch.ops.aten.silu(fc1_1_output)

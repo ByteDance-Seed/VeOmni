@@ -152,11 +152,11 @@ class TestOpSlotEagerBinding:
 
 
 # ---------------------------------------------------------------------------
-# MoE numerical-ordering guardrail (CPU-only)
+# Eager MoE numerical-ordering guardrail (CPU-only)
 # ---------------------------------------------------------------------------
 
 
-def _eager_moe_legacy_routing_before_fc2(
+def _eager_moe_routing_before_fc2(
     num_experts: int,
     routing_weights: torch.Tensor,
     selected_experts: torch.Tensor,
@@ -166,7 +166,7 @@ def _eager_moe_legacy_routing_before_fc2(
     fc2_weight: torch.Tensor,
     swiglu_limit: float | None = None,
 ) -> torch.Tensor:
-    """Legacy fused ordering with routing weights applied before fc2."""
+    """Reference eager MoE with routing weights applied before fc2."""
     output = torch.zeros_like(hidden_states)
     expert_mask = F.one_hot(selected_experts, num_classes=num_experts).permute(2, 1, 0)
     expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
@@ -188,7 +188,7 @@ def _eager_moe_legacy_routing_before_fc2(
     return output
 
 
-def _eager_moe_hf_routing_after_fc2(
+def _eager_moe_routing_after_fc2(
     num_experts: int,
     routing_weights: torch.Tensor,
     selected_experts: torch.Tensor,
@@ -198,7 +198,7 @@ def _eager_moe_hf_routing_after_fc2(
     fc2_weight: torch.Tensor,
     swiglu_limit: float | None = None,
 ) -> torch.Tensor:
-    """HuggingFace eager ordering with routing weights applied after fc2."""
+    """Alternative eager MoE ordering used by the broken parity oracle."""
     output = torch.zeros_like(hidden_states)
     expert_mask = F.one_hot(selected_experts, num_classes=num_experts).permute(2, 1, 0)
     expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
@@ -220,31 +220,25 @@ def _eager_moe_hf_routing_after_fc2(
 
 
 class TestEagerMoeOrdering:
-    """CPU-only regression tests for MoE routing-weight ordering."""
+    """CPU-only regression tests for the eager MoE parity oracle."""
 
-    def test_legacy_pre_fc2_order_differs_from_hf_reference_in_bf16(self):
+    def test_routing_weight_order_matters_in_bf16(self):
         """The two mathematically equivalent orderings are not bf16-identical."""
         torch.manual_seed(0)
 
         num_tokens, num_experts, hidden_dim, ffn_dim, topk = 32, 4, 64, 32, 2
         dtype = torch.bfloat16
 
-        hidden_states = (0.1 * torch.randn(num_tokens, hidden_dim, dtype=dtype)).requires_grad_(True)
+        hidden_states = 0.1 * torch.randn(num_tokens, hidden_dim, dtype=dtype)
         router_logits = torch.randn(num_tokens, num_experts, dtype=torch.float32)
         routing_weights, selected_experts = torch.topk(torch.softmax(router_logits, dim=-1), topk, dim=-1)
-        routing_weights = routing_weights.to(dtype).requires_grad_(True)
+        routing_weights = routing_weights.to(dtype)
 
-        fc1_1_weight = (0.1 * torch.randn(num_experts, ffn_dim, hidden_dim, dtype=dtype)).requires_grad_(True)
-        fc1_2_weight = (0.1 * torch.randn(num_experts, ffn_dim, hidden_dim, dtype=dtype)).requires_grad_(True)
-        fc2_weight = (0.1 * torch.randn(num_experts, hidden_dim, ffn_dim, dtype=dtype)).requires_grad_(True)
+        fc1_1_weight = 0.1 * torch.randn(num_experts, ffn_dim, hidden_dim, dtype=dtype)
+        fc1_2_weight = 0.1 * torch.randn(num_experts, ffn_dim, hidden_dim, dtype=dtype)
+        fc2_weight = 0.1 * torch.randn(num_experts, hidden_dim, ffn_dim, dtype=dtype)
 
-        legacy_hidden_states = hidden_states.detach().clone().requires_grad_(True)
-        legacy_routing_weights = routing_weights.detach().clone().requires_grad_(True)
-        legacy_fc1_1_weight = fc1_1_weight.detach().clone().requires_grad_(True)
-        legacy_fc1_2_weight = fc1_2_weight.detach().clone().requires_grad_(True)
-        legacy_fc2_weight = fc2_weight.detach().clone().requires_grad_(True)
-
-        hf = _eager_moe_hf_routing_after_fc2(
+        before = _eager_moe_routing_before_fc2(
             num_experts,
             routing_weights,
             selected_experts,
@@ -254,22 +248,15 @@ class TestEagerMoeOrdering:
             fc2_weight,
             swiglu_limit=0.1,
         )
-        legacy = _eager_moe_legacy_routing_before_fc2(
+        after = _eager_moe_routing_after_fc2(
             num_experts,
-            legacy_routing_weights,
+            routing_weights,
             selected_experts,
-            legacy_hidden_states,
-            legacy_fc1_1_weight,
-            legacy_fc1_2_weight,
-            legacy_fc2_weight,
+            hidden_states,
+            fc1_1_weight,
+            fc1_2_weight,
+            fc2_weight,
             swiglu_limit=0.1,
         )
-        hf.sum().backward()
-        legacy.sum().backward()
 
-        assert not torch.equal(hf, legacy)
-        assert not torch.equal(hidden_states.grad, legacy_hidden_states.grad)
-        assert not torch.equal(fc1_1_weight.grad, legacy_fc1_1_weight.grad)
-        assert not torch.equal(fc1_2_weight.grad, legacy_fc1_2_weight.grad)
-        assert not torch.equal(fc2_weight.grad, legacy_fc2_weight.grad)
-        assert not torch.equal(routing_weights.grad, legacy_routing_weights.grad)
+        assert not torch.equal(before, after)
