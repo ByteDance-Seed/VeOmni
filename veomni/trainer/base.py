@@ -110,15 +110,19 @@ def _expand_parameter_patterns(model: torch.nn.Module, patterns: list[str]) -> l
 
 def _build_peft_lora_targets(model: torch.nn.Module, lora_config: dict[str, Any]) -> tuple[list[str], list[str]]:
     lora_modules = list(lora_config["lora_modules"])
+    parameter_names = [name for name, _param in model.named_parameters()]
+    has_fused_gate_up = any(name.endswith(".mlp.experts.gate_up_proj") for name in parameter_names)
+    has_fused_down = any(name.endswith(".mlp.experts.down_proj") for name in parameter_names)
 
     target_parameter_patterns = list(lora_config.get("target_parameters") or [])
     if target_parameter_patterns:
-        target_modules = [name for name in lora_modules if name not in _FUSED_MOE_TARGET_MODULES]
+        target_modules = list(lora_modules)
+        if has_fused_gate_up:
+            target_modules = [name for name in target_modules if name not in {"gate_proj", "up_proj"}]
+        if has_fused_down:
+            target_modules = [name for name in target_modules if name != "down_proj"]
         target_parameters = _expand_parameter_patterns(model, target_parameter_patterns)
     else:
-        parameter_names = [name for name, _param in model.named_parameters()]
-        has_fused_gate_up = any(name.endswith(".mlp.experts.gate_up_proj") for name in parameter_names)
-        has_fused_down = any(name.endswith(".mlp.experts.down_proj") for name in parameter_names)
         target_modules = list(lora_modules)
         if has_fused_gate_up and {"gate_proj", "up_proj"} & set(lora_modules):
             target_parameter_patterns.append("*.mlp.experts.gate_up_proj")
