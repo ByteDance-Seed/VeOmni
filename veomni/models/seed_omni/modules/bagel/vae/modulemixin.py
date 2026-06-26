@@ -12,9 +12,6 @@ from ..sources import BAGEL_GENERATED_LATENT, BAGEL_VAE_CONTEXT
 from .configuration import BagelVAEConfig
 
 
-_OMNI_PIXELS = "bagel_vae_pixels"
-
-
 class BagelVAECPUPreprocessor(CPUPreprocessor):
     """Worker-side image normalize for BAGEL training VAE targets."""
 
@@ -36,7 +33,7 @@ class BagelVAECPUPreprocessor(CPUPreprocessor):
         # Training data routes image branches by role: user images feed SigLIP,
         # assistant images feed VAE.
         for item in iter_desired_items(conversation_list, types=["image"], roles=["assistant"]):
-            if not is_dummy(item) and not item.meta.get(_OMNI_PIXELS):
+            if not is_dummy(item):
                 image_items.append(item)
         if not image_items:
             return
@@ -47,7 +44,6 @@ class BagelVAECPUPreprocessor(CPUPreprocessor):
         for item, pixels in zip(image_items, inputs["pixel_values"], strict=True):
             item.value = pixels.to(dtype=self._dtype)
             item.source = BAGEL_VAE_CONTEXT
-            item.meta[_OMNI_PIXELS] = True
 
 
 class BagelVAEModuleMixin(ModuleMixin):
@@ -157,18 +153,10 @@ class BagelVAEModuleMixin(ModuleMixin):
             self._encode_is_dummy = True
             return self.dummy_inputs(kind="encode")
 
-        if all(item.meta.get(_OMNI_PIXELS) for item in self._encode_items):
-            pixel_values = torch.stack([item.value for item in self._encode_items], dim=0).to(
-                device=self.device, dtype=self.dtype, non_blocking=True
-            )
-            return {"pixel_values": pixel_values}
-
-        return self._image_processor(
-            images=[item.value for item in self._encode_items],
-            return_tensors="pt",
-            device=self.device,
-            dtype=self.dtype,
+        pixel_values = torch.stack([item.value for item in self._encode_items], dim=0).to(
+            device=self.device, dtype=self.dtype, non_blocking=True
         )
+        return {"pixel_values": pixel_values}
 
     @post_forward("encode")
     def encode_post(self, latents: torch.Tensor) -> dict[str, Any]:

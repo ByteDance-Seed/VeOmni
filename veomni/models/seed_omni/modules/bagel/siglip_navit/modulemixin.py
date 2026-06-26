@@ -13,7 +13,6 @@ from ..sources import BAGEL_SIGLIP_CONTEXT
 from .configuration import BagelSiglipNavitConfig
 
 
-_OMNI_PATCHES = "bagel_siglip_navit_patches"
 _OMNI_POSITION_IDS = "bagel_siglip_navit_position_ids"
 _OMNI_TOKEN_LEN = "bagel_siglip_navit_token_len"
 
@@ -39,8 +38,6 @@ class BagelSiglipNavitCPUPreprocessor(CPUPreprocessor):
         # Training data routes image branches by role: user images feed SigLIP,
         # assistant images feed VAE.
         for item in iter_desired_items(conversation_list, types=["image"], roles=["user"]):
-            if item.meta.get(_OMNI_PATCHES):
-                continue
             image_items.append(item)
 
         if not image_items:
@@ -57,7 +54,6 @@ class BagelSiglipNavitCPUPreprocessor(CPUPreprocessor):
         ):
             item.value = pixels.to(dtype=self._dtype)
             item.source = BAGEL_SIGLIP_CONTEXT
-            item.meta[_OMNI_PATCHES] = True
             item.meta[_OMNI_POSITION_IDS] = position_ids.to(dtype=torch.long)
             item.meta[_OMNI_TOKEN_LEN] = int(length)
 
@@ -117,16 +113,7 @@ class BagelSiglipNavitModuleMixin(ModuleMixin):
             self._forward_is_dummy = True
             return self.dummy_inputs()
 
-        if all(item.meta.get(_OMNI_PATCHES) for item in self._image_items):
-            return self._inputs_from_preprocessed_items(self._image_items)
-
-        inputs = self._image_processor(
-            images=[item.value for item in self._image_items],
-            return_tensors="pt",
-            device=self.device,
-            dtype=self.dtype,
-        )
-        return inputs
+        return self._inputs_from_preprocessed_items(self._image_items)
 
     @post_forward("forward")
     def forward_post(

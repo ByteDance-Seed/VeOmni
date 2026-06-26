@@ -22,9 +22,6 @@ import torch
 
 from veomni.data.data_collator import SeedOmniCollator
 from veomni.models.seed_omni.modules.bagel.siglip_navit.modulemixin import (
-    _OMNI_PATCHES as BAGEL_SIGLIP_PATCHES,
-)
-from veomni.models.seed_omni.modules.bagel.siglip_navit.modulemixin import (
     _OMNI_POSITION_IDS as BAGEL_SIGLIP_POSITION_IDS,
 )
 from veomni.models.seed_omni.modules.bagel.siglip_navit.modulemixin import (
@@ -249,15 +246,10 @@ def test_bagel_siglip_preprocessor_patchifies_and_tags_context():
     pre(batch)
     item = batch[0][0]
     assert item.source == BAGEL_SIGLIP_CONTEXT
-    assert item.meta[BAGEL_SIGLIP_PATCHES] is True
     assert item.meta[BAGEL_SIGLIP_TOKEN_LEN] == 4
     assert item.meta[BAGEL_SIGLIP_POSITION_IDS].tolist() == [0, 1, 2, 3]
     assert item.value.shape == (4, 2 * 2 * 3)
     assert item.value.dtype == torch.bfloat16
-
-    value = item.value.clone()
-    pre(batch)
-    assert torch.equal(item.value, value)
 
 
 def test_bagel_preprocessors_leave_inference_request_raw():
@@ -287,7 +279,6 @@ def test_bagel_preprocessors_leave_inference_request_raw():
     assert text_item.value == "hi"
     assert BAGEL_TOK not in text_item.meta
     assert user_image_item.source is None
-    assert BAGEL_SIGLIP_PATCHES not in user_image_item.meta
     assert torch.equal(user_image_item.value, user_image)
     assert assistant_image_item.source is None
     assert torch.equal(assistant_image_item.value, assistant_image)
