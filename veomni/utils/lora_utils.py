@@ -49,19 +49,24 @@ def build_lora_key_overrides(model: "nn.Module") -> "Dict[str, str]":
         A ``{checkpoint_key: model_fqn}`` dict for every LoRA layer's
         parameters and buffers.  Empty dict if the model has no LoRA layers.
     """
-    from typing import Dict
-
     overrides: Dict[str, str] = {}
-    for fqn, module in model.named_modules():
-        if not hasattr(module, "base_layer"):
-            continue
-        inner = fqn[len("base_model.model.") :] if fqn.startswith("base_model.model.") else fqn
-        inner_dot = inner + ("." if inner else "")
-        wrap_dot = fqn + ("." if fqn else "") + "base_layer."
-        for pname, _ in module.base_layer.named_parameters():
-            overrides[inner_dot + pname] = wrap_dot + pname
-        for bname, _ in module.base_layer.named_buffers():
-            overrides[inner_dot + bname] = wrap_dot + bname
+    adapter_parts = {"lora_A", "lora_B", "lora_embedding_A", "lora_embedding_B"}
+
+    def add_override(fqn: str) -> None:
+        if not fqn.startswith("base_model.model."):
+            return
+        inner = fqn[len("base_model.model.") :]
+        parts = inner.split(".")
+        if "base_layer" not in parts or any(part in adapter_parts for part in parts):
+            return
+
+        checkpoint_key = ".".join(part for part in parts if part != "base_layer")
+        overrides[checkpoint_key] = fqn
+
+    for fqn, _param in model.named_parameters():
+        add_override(fqn)
+    for fqn, _buffer in model.named_buffers():
+        add_override(fqn)
     return overrides
 
 
@@ -116,8 +121,8 @@ def load_lora_model_weights(
 
     adapter_name = _read_adapter_name(adapter_path)
     raw_sd = load_peft_weights(adapter_path, device=init_device)
-    for name, tensor in raw_sd.items():
-        name = _remap_adapter_key(name, adapter_name)
+    adapter_sd = {_remap_adapter_key(name, adapter_name): tensor for name, tensor in raw_sd.items()}
+    for name, tensor in adapter_sd.items():
         _dispatch_parameter(model, name, tensor, dtensor_factory)
         if parameter_names_to_load is not None:
             parameter_names_to_load.discard(name)

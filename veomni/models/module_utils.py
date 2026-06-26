@@ -332,7 +332,14 @@ def load_model_weights(
 
         lora_key_overrides = build_lora_key_overrides(model)
 
+    def _map_peft_key(name: str) -> str:
+        if not is_peft_model:
+            return name
+        return lora_key_overrides.get(name, "base_model.model." + name)
+
     converter = get_checkpoint_tensor_converter(model)
+    if converter is None and is_peft_model and hasattr(model, "get_base_model"):
+        converter = get_checkpoint_tensor_converter(model.get_base_model())
     state_dict_iterators = _load_state_dict(weights_path)
 
     def _dispatch_kv(name: str, tensor: "torch.Tensor") -> None:
@@ -349,19 +356,17 @@ def load_model_weights(
     ):
         for name, tensor in state_dict_iterator:
             name = _convert_weight_key(name, model)
-            if is_peft_model:
-                name = lora_key_overrides.get(name, "base_model.model." + name)
             converted = maybe_convert_checkpoint_tensor(name, tensor, converter)
             if converted is None:
                 continue
-            _dispatch_kv(converted.name, converted.tensor)
+            _dispatch_kv(_map_peft_key(converted.name), converted.tensor)
 
         del state_dict_iterator
         empty_cache()
 
     if converter is not None:
         for result in converter.finalize():
-            _dispatch_kv(result.name, result.tensor)
+            _dispatch_kv(_map_peft_key(result.name), result.tensor)
 
     if is_peft_model and adapter_path:
         # load peft lora weights if adapter_path is provided, else, init lora model weights in post_process_after_weight_loading
@@ -425,7 +430,14 @@ def rank0_load_and_broadcast_weights(
 
         lora_key_overrides = build_lora_key_overrides(model)
 
+    def _map_peft_key(name: str) -> str:
+        if not is_peft_model:
+            return name
+        return lora_key_overrides.get(name, "base_model.model." + name)
+
     converter = get_checkpoint_tensor_converter(model)
+    if converter is None and is_peft_model and hasattr(model, "get_base_model"):
+        converter = get_checkpoint_tensor_converter(model.get_base_model())
     global_rank = get_parallel_state().global_rank
     torch_device = _get_communication_device(init_device)
 
@@ -669,12 +681,10 @@ def rank0_load_and_broadcast_weights(
                     try:
                         key, tensor = next(iterator)  # type: ignore[arg-type]
                         key = _convert_weight_key(key, model)
-                        if is_peft_model:
-                            key = lora_key_overrides.get(key, "base_model.model." + key)
                         converted = maybe_convert_checkpoint_tensor(key, tensor, converter)
                         if converted is None:
                             continue
-                        key, tensor = converted.name, converted.tensor
+                        key, tensor = _map_peft_key(converted.name), converted.tensor
                         logger.info_rank0(f"loading {key=}")
                         if torch.count_nonzero(tensor) == 0:
                             logger.warning_rank0(
@@ -732,7 +742,8 @@ def rank0_load_and_broadcast_weights(
         for i in range(fin_count):
             if global_rank == 0:
                 result = finalized[i]
-                metadata = BroadcastMetadata(False, result.name, result.tensor.shape, result.tensor.dtype)
+                name = _map_peft_key(result.name)
+                metadata = BroadcastMetadata(False, name, result.tensor.shape, result.tensor.dtype)
                 tensor = result.tensor
             else:
                 metadata = BroadcastMetadata(False, None, None, None)

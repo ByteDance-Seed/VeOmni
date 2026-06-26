@@ -34,6 +34,7 @@ import warnings
 from abc import ABC
 from collections import defaultdict
 from dataclasses import asdict
+from fnmatch import fnmatch
 from typing import Any, Callable, Dict, List
 
 import torch
@@ -88,6 +89,48 @@ from .callbacks import (
 
 
 logger = logging.get_logger(__name__)
+
+
+_FUSED_MOE_TARGET_MODULES = {"gate_proj", "up_proj", "down_proj"}
+
+
+def _expand_parameter_patterns(model: torch.nn.Module, patterns: list[str]) -> list[str]:
+    parameter_names = [name for name, _param in model.named_parameters()]
+    expanded: list[str] = []
+    for pattern in patterns:
+        if any(ch in pattern for ch in "*?["):
+            matches = [name for name in parameter_names if fnmatch(name, pattern)]
+        else:
+            matches = [name for name in parameter_names if name == pattern or name.endswith(f".{pattern}")]
+        if not matches:
+            raise ValueError(f"LoRA target parameter pattern did not match any parameter: {pattern}")
+        expanded.extend(matches)
+    return sorted(set(expanded))
+
+
+def _build_peft_lora_targets(model: torch.nn.Module, lora_config: dict[str, Any]) -> tuple[list[str], list[str]]:
+    lora_modules = list(lora_config["lora_modules"])
+
+    target_parameter_patterns = list(lora_config.get("target_parameters") or [])
+    if target_parameter_patterns:
+        target_modules = [name for name in lora_modules if name not in _FUSED_MOE_TARGET_MODULES]
+        target_parameters = _expand_parameter_patterns(model, target_parameter_patterns)
+    else:
+        parameter_names = [name for name, _param in model.named_parameters()]
+        has_fused_gate_up = any(name.endswith(".mlp.experts.gate_up_proj") for name in parameter_names)
+        has_fused_down = any(name.endswith(".mlp.experts.down_proj") for name in parameter_names)
+        target_modules = list(lora_modules)
+        if has_fused_gate_up and {"gate_proj", "up_proj"} & set(lora_modules):
+            target_parameter_patterns.append("*.mlp.experts.gate_up_proj")
+            target_modules = [name for name in target_modules if name not in {"gate_proj", "up_proj"}]
+        if has_fused_down and "down_proj" in lora_modules:
+            target_parameter_patterns.append("*.mlp.experts.down_proj")
+            target_modules = [name for name in target_modules if name != "down_proj"]
+        target_parameters = (
+            _expand_parameter_patterns(model, target_parameter_patterns) if target_parameter_patterns else []
+        )
+
+    return target_modules, target_parameters
 
 
 class BackgroundPrefetcher:
@@ -405,11 +448,19 @@ class BaseTrainer(Stateful, ABC):
             logger.info_rank0("Initialising LoRA adapter from scratch.")
             from peft import LoraConfig, get_peft_model
 
-            peft_cfg = LoraConfig(
-                r=lora_config["rank"],
-                lora_alpha=lora_config["alpha"],
-                target_modules=lora_config["lora_modules"],
+            target_modules, target_parameters = _build_peft_lora_targets(self.model, lora_config)
+            logger.info_rank0(
+                f"Using PEFT target_parameters for fused MoE LoRA: {len(target_parameters)} parameter(s), "
+                f"first={target_parameters[0] if target_parameters else '<none>'}."
             )
+            peft_kwargs = {
+                "r": lora_config["rank"],
+                "lora_alpha": lora_config["alpha"],
+                "target_modules": target_modules,
+            }
+            if target_parameters:
+                peft_kwargs["target_parameters"] = target_parameters
+            peft_cfg = LoraConfig(**peft_kwargs)
             logger.info_rank0(f"LoraConfig: {peft_cfg.to_dict()}.")
             self.model = get_peft_model(self.model, peft_cfg)
 
