@@ -262,6 +262,11 @@ def parallelize_model_fsdp2(
                     )
             para_fsdp_kwargs["shard_placement_fn"] = lambda param, _d=shard_dim_for_para: Shard(_d)
             extra_parallel_fsdp_kwargs[para] = para_fsdp_kwargs
+            # Record the FSDP shard dim on the spec_info so the checkpointer can
+            # build correct DTensor placements (EP dim vs FSDP dim) on save/load.
+            for spec_info in getattr(model, "_fqn2spec_info", {}).values():
+                if spec_info.para_name == para:
+                    spec_info.fsdp_shard_dim = shard_dim_for_para
         else:
             extra_parallel_fsdp_kwargs[para] = None
 
