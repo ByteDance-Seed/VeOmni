@@ -181,7 +181,14 @@ class MotGenerationState:
         self._cfg_img.reset()
 
     def update_infer_mode(self, generation_kwargs: dict[str, Any]) -> str:
-        self._infer_mode = str(generation_kwargs.get("infer_mode", self._infer_mode or "und"))
+        if "infer_type" in generation_kwargs:
+            infer_type = str(generation_kwargs["infer_type"])
+            if infer_type not in {"infer_und", "infer_gen", "infer_edit"}:
+                raise ValueError(f"Unsupported BAGEL infer_type: {infer_type!r}.")
+            infer_mode = "und" if infer_type == "infer_und" else "gen"
+        else:
+            infer_mode = self._infer_mode or "und"
+        self._infer_mode = infer_mode
         return self._infer_mode
 
     @property

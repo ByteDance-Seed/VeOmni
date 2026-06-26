@@ -151,7 +151,8 @@ class BagelTextEncoderModuleMixin(TextEncoderModuleMixin):
             return outputs
 
         outputs: Dict[str, Any] = {"conversation_list": batched[0]}
-        if str((generation_kwargs or {}).get("infer_mode", "")) == "gen":
+        infer_type = str((generation_kwargs or {}).get("infer_type", ""))
+        if infer_type in {"infer_gen", "infer_edit"}:
             outputs[FSM_SIGNAL_KEY] = SIGNAL_START_IMAGE_GEN
             return outputs
 

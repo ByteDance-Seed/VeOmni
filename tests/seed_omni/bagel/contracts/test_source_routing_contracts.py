@@ -17,6 +17,21 @@ from veomni.models.seed_omni.modules.bagel.sources import (
 from veomni.models.seed_omni.utils.conversation import ConversationItem
 
 
+def test_bagel_qwen2_mot_infer_mode_uses_v2_infer_type() -> None:
+    state = _tiny_qwen2_mot()._generation_state
+
+    assert state.update_infer_mode({"infer_type": "infer_und"}) == "und"
+    assert state.update_infer_mode({"infer_type": "infer_gen"}) == "gen"
+    assert state.update_infer_mode({"infer_type": "infer_edit"}) == "gen"
+
+
+def test_bagel_qwen2_mot_infer_mode_preserves_current_mode_without_infer_type() -> None:
+    state = _tiny_qwen2_mot()._generation_state
+
+    assert state.update_infer_mode({"infer_type": "infer_gen"}) == "gen"
+    assert state.update_infer_mode({}) == "gen"
+
+
 def test_bagel_denoise_item_source_lifecycle() -> None:
     model = _tiny_flow_connector()
     model.embed_latent = lambda **kwargs: {  # type: ignore[method-assign]
@@ -71,7 +86,7 @@ def test_bagel_qwen2_mot_generate_does_not_validate_denoise_cfg() -> None:
 
     out = model.generate(
         conversation_list=conversation,
-        generation_kwargs={"infer_mode": "gen", "cfg_img_scale": 2.0, "cfg_text_scale": 1.0},
+        generation_kwargs={"infer_type": "infer_gen", "cfg_img_scale": 2.0, "cfg_text_scale": 1.0},
     )
 
     assert out["conversation_list"] is conversation
@@ -94,7 +109,7 @@ def test_bagel_qwen2_mot_prefill_builds_cfg_img_context_only_when_requested() ->
         conversation_list=[
             ConversationItem(type="text", value=torch.zeros(1, hidden_size), role="user"),
         ],
-        generation_kwargs={"infer_mode": "gen"},
+        generation_kwargs={"infer_type": "infer_gen"},
     )
 
     assert len(calls) == 1
@@ -107,7 +122,7 @@ def test_bagel_qwen2_mot_prefill_builds_cfg_img_context_only_when_requested() ->
         conversation_list=[
             ConversationItem(type="text", value=torch.zeros(1, hidden_size), role="user"),
         ],
-        generation_kwargs={"infer_mode": "gen", "cfg_text_scale": 4.0, "cfg_img_scale": 1.5},
+        generation_kwargs={"infer_type": "infer_gen", "cfg_text_scale": 4.0, "cfg_img_scale": 1.5},
     )
 
     assert len(calls) == 2
@@ -133,7 +148,7 @@ def test_bagel_qwen2_mot_keeps_denoise_shape_validation_after_source_selection()
     )
 
     with pytest.raises(ValueError, match="hidden-size mismatch"):
-        model.denoise_branch(conversation_list=[wrong_hidden], generation_kwargs={"infer_mode": "gen"})
+        model.denoise_branch(conversation_list=[wrong_hidden], generation_kwargs={})
 
 
 def test_bagel_qwen2_mot_siglip_alignment_uses_source_before_shape() -> None:

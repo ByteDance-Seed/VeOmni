@@ -103,4 +103,3 @@ infer:
     cfg_renorm_min: 0.0
     cfg_renorm_type: global
     enable_taylorseer: false
-    enable_vae_context: false

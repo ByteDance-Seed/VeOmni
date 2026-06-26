@@ -79,6 +79,17 @@ def test_bagel_train_plus_infer_merges_generation_graph(infer_graph: str):
             )
 
 
+@pytest.mark.parametrize(
+    "infer_graph",
+    ["graph_infer_und.yaml", "graph_infer_gen.yaml", "graph_infer_edit.yaml"],
+)
+def test_bagel_infer_graph_yaml_is_graph_only(infer_graph: str):
+    data = yaml.safe_load((bagel_cfg_dir() / infer_graph).read_text())
+
+    assert "generation_graph" in data
+    assert "generation_kwargs" not in data
+
+
 def _bagel_train_edges() -> list[dict]:
     data = yaml.safe_load((bagel_cfg_dir() / "graph_train.yaml").read_text())
     return data["training_graph"]
