@@ -283,15 +283,16 @@ def _weighted_unpermute_forward(
     output: torch.Tensor,
 ):
     hidden_dim = output.size(-1)
-    output.zero_()
+    fp32_output = torch.zeros(output.shape, device=output.device, dtype=torch.float32)
     for start in range(0, tokens.size(0), _UNPERMUTE_CHUNK_SIZE):
         end = min(start + _UNPERMUTE_CHUNK_SIZE, tokens.size(0))
         chunk_mapping = permutation_mapping[start:end]
-        output.scatter_add_(
+        fp32_output.scatter_add_(
             0,
             chunk_mapping.unsqueeze(1).expand(-1, hidden_dim),
-            (tokens[start:end] * tokens_weight[start:end].unsqueeze(-1)).to(output.dtype),
+            (tokens[start:end] * tokens_weight[start:end].unsqueeze(-1)).float(),
         )
+    output.copy_(fp32_output.to(output.dtype))
     return output
 
 
@@ -404,6 +405,8 @@ class EPMergedFc1PostAllToAllGroupGemm(torch.autograd.Function):
         hidden_chunk_size = ctx.hidden_chunk_size
         intermediate_dim = fc1_1_2_weight.shape[1] // 2
         fc2_weight_grad_arg_start = 17
+        if grad_output.dtype != permute_tokens.dtype:
+            grad_output = grad_output.to(permute_tokens.dtype)
 
         grad_routing_weights = torch.zeros_like(routing_weights) if ctx.needs_input_grad[1] else None
         grad_tokens_weight = torch.zeros_like(tokens_weight) if grad_routing_weights is not None else None
@@ -462,6 +465,8 @@ class EPMergedFc1PostAllToAllGroupGemm(torch.autograd.Function):
                 ctx.expert_output_splits,
                 ctx.unpermute_order,
             )
+            if grad_expert_full.dtype != permute_tokens.dtype:
+                grad_expert_full = grad_expert_full.to(permute_tokens.dtype)
 
             grad_fc2_weight_chunk = fc2_weight_grads[chunk_idx]
             for token_start, token_end in _iter_token_chunks(permute_tokens.shape[0]):
@@ -539,7 +544,7 @@ class EPMergedFc1PostAllToAllGroupGemm(torch.autograd.Function):
                 )
                 grad_tokens_weight.add_((grad_local * local_output).sum(dim=-1).to(tokens_weight.dtype))
 
-        grad_permute_tokens = permute_tokens
+        grad_permute_tokens = torch.empty_like(permute_tokens)
         for token_start, token_end in _iter_token_chunks(permute_tokens.shape[0]):
             chunk_cumsum = _chunk_cumsum(cumsum, token_start, token_end)
             permute_tokens_chunk = permute_tokens[token_start:token_end].clone()
