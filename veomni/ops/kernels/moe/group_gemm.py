@@ -14,10 +14,20 @@
 
 import torch
 
-from ....distributed.moe import EPGroupGemm, EPMergedFc1GroupGemm, preprocess, token_pre_all2all, tokens_post_all2all
+from ....distributed.moe import (
+    EPGroupGemm,
+    EPMergedFc1PostAllToAllGroupGemm,
+    build_routing_map,
+    preprocess,
+    token_pre_all2all,
+    tokens_post_all2all,
+)
 from ....distributed.parallel_state import get_parallel_state
 from ._kernels.kernel.group_gemm import group_gemm_same_mn, group_gemm_same_nk
 from ._kernels.kernel.moe import expert_histogram, moe_gather, moe_scatter
+
+
+_EP_MERGED_POST_ALL2ALL_HIDDEN_CHUNK_SIZE = 128
 
 
 class TritonFusedMoeExpertFunction(torch.autograd.Function):
@@ -471,18 +481,18 @@ def group_gemm_fused_moe_forward(
         else:
             if fc1_1_weight is None or fc1_2_weight is None:
                 raise ValueError("EP requires split fc1 weights (fc1_1_weight and fc1_2_weight).")
-        expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=num_experts).permute(2, 1, 0)
+        routing_map = build_routing_map(selected_experts, num_experts)
         # preprocess, permute token for ep
         input_splits, output_splits, num_global_tokens_per_local_expert, num_global_sum_tokens_per_local_expert = (
             preprocess(
-                expert_mask=expert_mask,
+                selected_experts=selected_experts,
                 num_experts=num_experts,
                 ep_group=get_parallel_state().ep_group,
             )
         )
         permute_tokens, routing_map, local_input_permutation_mapping, org_hidden_states_shape = token_pre_all2all(
             hidden_states=hidden_states,
-            expert_mask=expert_mask,
+            routing_map=routing_map,
             num_experts=num_experts,
             input_splits=input_splits,
             output_splits=output_splits,
@@ -493,11 +503,33 @@ def group_gemm_fused_moe_forward(
         cumsum = torch.cumsum(num_global_sum_tokens_per_local_expert, dim=0).to(permute_tokens.device)
 
         if fc1_1_2_weight is not None:
-            final_permute_tokens = EPMergedFc1GroupGemm.apply(
+            hidden_dim = fc2_weight.shape[1]
+            intermediate_dim = fc1_1_2_weight.shape[1] // 2
+            fc1_1_weight = fc1_1_2_weight[:, :intermediate_dim, :]
+            fc1_2_weight = fc1_1_2_weight[:, intermediate_dim:, :]
+            fc2_weight_chunks = [
+                fc2_weight[:, start : start + _EP_MERGED_POST_ALL2ALL_HIDDEN_CHUNK_SIZE, :]
+                for start in range(0, hidden_dim, _EP_MERGED_POST_ALL2ALL_HIDDEN_CHUNK_SIZE)
+            ]
+            final_hidden_states = EPMergedFc1PostAllToAllGroupGemm.apply(
                 permute_tokens,
+                routing_weights,
+                selected_experts,
+                routing_map,
+                local_input_permutation_mapping,
                 cumsum,
                 fc1_1_2_weight,
+                fc1_1_weight,
+                fc1_2_weight,
                 fc2_weight,
+                _EP_MERGED_POST_ALL2ALL_HIDDEN_CHUNK_SIZE,
+                num_experts,
+                input_splits,
+                output_splits,
+                num_global_tokens_per_local_expert,
+                org_hidden_states_shape,
+                get_parallel_state().ep_group,
+                *fc2_weight_chunks,
             )
         else:
             final_permute_tokens = EPGroupGemm.apply(
@@ -508,20 +540,20 @@ def group_gemm_fused_moe_forward(
                 fc2_weight,
             )
 
-        # unpermute with routing_weight
-        final_hidden_states = tokens_post_all2all(
-            expert_outputs=final_permute_tokens,
-            routing_weights=routing_weights,
-            selected_experts=selected_experts,
-            num_experts=num_experts,
-            input_splits=input_splits,
-            output_splits=output_splits,
-            num_global_tokens_per_local_expert=num_global_tokens_per_local_expert,
-            routing_map=routing_map,
-            local_input_permutation_mapping=local_input_permutation_mapping,
-            org_hidden_states_shape=org_hidden_states_shape,
-            ep_group=get_parallel_state().ep_group,
-        )
+            # unpermute with routing_weight
+            final_hidden_states = tokens_post_all2all(
+                expert_outputs=final_permute_tokens,
+                routing_weights=routing_weights,
+                selected_experts=selected_experts,
+                num_experts=num_experts,
+                input_splits=input_splits,
+                output_splits=output_splits,
+                num_global_tokens_per_local_expert=num_global_tokens_per_local_expert,
+                routing_map=routing_map,
+                local_input_permutation_mapping=local_input_permutation_mapping,
+                org_hidden_states_shape=org_hidden_states_shape,
+                ep_group=get_parallel_state().ep_group,
+            )
     else:
         if fc1_1_2_weight is not None:
             if fc1_1_weight is not None or fc1_2_weight is not None:

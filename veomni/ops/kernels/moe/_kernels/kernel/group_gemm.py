@@ -23,6 +23,7 @@ from ..utils.pretuned import algo_key_scaled, pretuned
 from .triton_utils.activation import (
     ActivationType,
     activation_fwd,
+    silu,
 )
 from .triton_utils.memory import (
     load_block_with_pred_2d,
@@ -234,6 +235,128 @@ def group_gemm_same_nk(
     return c
 
 
+@triton.heuristics(
+    values={
+        "N_ALIGNED": lambda args: args["N"] % args["BLOCK_N"] == 0,
+        "K_ALIGNED": lambda args: args["K"] % args["BLOCK_K"] == 0,
+    }
+)
+@triton.jit
+def group_gemm_same_nk_silu_gate_up_kernel(
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    cumsum_M,
+    max_M,
+    total_M,  # Used for generating algo. key only.
+    G: tl.constexpr,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    GROUP: tl.constexpr,
+    N_ALIGNED: tl.constexpr,
+    K_ALIGNED: tl.constexpr,
+):
+    m, n = get_pid_mn(tl.program_id(axis=0), max_M, N, BLOCK_M, BLOCK_N, GROUP)
+    gid = tl.program_id(1).to(tl.uint64)
+    gtid_start = tl.load(cumsum_M + gid - 1, mask=gid > 0, other=0)
+    gtid_end = tl.load(cumsum_M + gid)
+    m_size = (gtid_end - gtid_start).to(tl.uint64)
+
+    if m * BLOCK_M >= m_size:
+        return
+
+    # b is a merged [G, 2N, K] tensor used as transposed B.  The first N columns
+    # are gate, and the second N columns are up.
+    a_ptr += gtid_start * K
+    b_gate_ptr = b_ptr + gid * K * (2 * N)
+    b_up_ptr = b_gate_ptr + N * K
+    c_ptr += gtid_start * N
+
+    offs_m = m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = n * BLOCK_N + tl.arange(0, BLOCK_N)
+
+    offs_am = offs_m % m_size.to(tl.int64)
+    offs_bn = offs_n % N
+
+    blk_k = tl.arange(0, BLOCK_K)
+
+    a_ptrs = a_ptr + (offs_am[:, None] * K + blk_k[None, :])
+    b_gate_ptrs = b_gate_ptr + (blk_k[:, None] + offs_bn[None, :] * K)
+    b_up_ptrs = b_up_ptr + (blk_k[:, None] + offs_bn[None, :] * K)
+    c_ptrs = c_ptr + N * offs_m[:, None] + offs_n[None, :]
+
+    gate = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    up = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for k in range(0, tl.cdiv(K, BLOCK_K)):
+        a = load_with_pred_1d(a_ptrs, K_ALIGNED, blk_k[None, :] < K - k * BLOCK_K, other=0)
+        b_gate = load_with_pred_1d(b_gate_ptrs, K_ALIGNED, blk_k[:, None] < K - k * BLOCK_K, other=0)
+        b_up = load_with_pred_1d(b_up_ptrs, K_ALIGNED, blk_k[:, None] < K - k * BLOCK_K, other=0)
+
+        gate = tl.dot(a, b_gate, gate)
+        up = tl.dot(a, b_up, up)
+
+        a_ptrs += BLOCK_K
+        b_gate_ptrs += BLOCK_K
+        b_up_ptrs += BLOCK_K
+
+    gate = make_blocked(gate, c_ptr.dtype.element_ty)
+    up = make_blocked(up, c_ptr.dtype.element_ty)
+    c = silu(gate).to(c_ptr.dtype.element_ty) * up
+    store_with_pred_2d(c_ptrs, c, False, N_ALIGNED, offs_m[:, None] < m_size, offs_n[None, :] < N)
+
+
+def group_gemm_same_nk_silu_gate_up(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    cumsum_M: torch.Tensor,
+    max_M: int,
+):
+    """Grouped GEMM for merged gate/up weights.
+
+    Computes ``silu(a @ gate.T) * (a @ up.T)`` from merged ``b`` with shape
+    ``[G, 2N, K]`` without materializing the intermediate ``[T, 2N]`` tensor.
+    """
+    G, two_n, K = b.shape
+    assert two_n % 2 == 0, two_n
+    N = two_n // 2
+
+    assert a.dtype in [torch.bfloat16, torch.float16], a.dtype
+    assert b.dtype in [torch.bfloat16, torch.float16], b.dtype
+    assert a.device == b.device, f"a.device = {a.device}, b.device = {b.device}"
+    assert len(cumsum_M) == G
+    assert a.is_contiguous() and b.is_contiguous(), "Not implemented: Noncontiguous input."
+
+    c = torch.empty((a.shape[0], N), dtype=a.dtype, device=a.device)
+    with get_torch_device().device(a.device):
+        group_gemm_same_nk_silu_gate_up_kernel[
+            lambda x: (
+                triton.cdiv(max_M, x["BLOCK_M"]) * triton.cdiv(N, x["BLOCK_N"]),
+                x["G"],
+            )
+        ](
+            a_ptr=a,
+            b_ptr=b,
+            c_ptr=c,
+            cumsum_M=cumsum_M,
+            max_M=max_M,
+            total_M=a.shape[0],
+            G=G,
+            K=K,
+            N=N,
+            BLOCK_M=128,
+            BLOCK_N=128,
+            BLOCK_K=32,
+            GROUP=8,
+            num_warps=8,
+            num_stages=3,
+        )
+
+    return c
+
+
 # @triton.autotune(
 #     configs=_get_cuda_autotune_config(),
 #     key=["total_K", "M", "N"],
@@ -362,6 +485,7 @@ def group_gemm_same_mn(
     max_K: int,
     transpose_a: bool = False,
     transpose_b: bool = False,
+    accumulate: bool = False,
 ):
     G, M, N = c.shape
 
@@ -393,5 +517,5 @@ def group_gemm_same_mn(
             N=N,
             TRANSPOSE_A=transpose_a,
             TRANSPOSE_B=transpose_b,
-            ACCUMULATE_TO_C=False,
+            ACCUMULATE_TO_C=accumulate,
         )
