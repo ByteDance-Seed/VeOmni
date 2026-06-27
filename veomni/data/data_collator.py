@@ -180,9 +180,8 @@ class MakeMicroBatchCollator(DataCollator):
 
     def __call__(self, features: Sequence[Tuple[Dict[str, "torch.Tensor"]]]) -> List[Dict[str, "torch.Tensor"]]:
         micro_batch_size = len(features) // self.num_micro_batch
-        if features and isinstance(features[0], (list, tuple)):
-            for i in range(len(features)):
-                features[i] = features[i][0]  # 1-to-N inverse transform
+        for i in range(len(features)):
+            features[i] = features[i][0]  # 1-to-N inverse transform
 
         micro_batches = []
         for i in range(0, len(features), micro_batch_size):

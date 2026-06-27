@@ -321,12 +321,6 @@ class DiTTrainer:
         if get_parallel_state().sp_enabled and get_parallel_state().sp_rank != 0:
             self.base.train_dataset = None
 
-        if (
-            not get_parallel_state().sp_enabled or get_parallel_state().sp_rank == 0
-        ) and self.base.train_dataset is not None:
-            if hasattr(self.condition_model, "on_dataset_ready"):
-                self.condition_model.on_dataset_ready(self)
-
         if self.training_task == "offline_embedding":
             if not get_parallel_state().sp_enabled or get_parallel_state().sp_rank == 0:
                 dp_rank = get_parallel_state().dp_rank
@@ -393,9 +387,6 @@ class DiTTrainer:
             )
         else:
             self.base.train_dataloader = None
-
-        if hasattr(self.condition_model, "on_dataloader_ready"):
-            self.condition_model.on_dataloader_ready(self)
 
     def on_train_begin(self):
         self.base.on_train_begin()

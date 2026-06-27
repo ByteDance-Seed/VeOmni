@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 from pathlib import Path
 from typing import Any
 
@@ -11,6 +12,7 @@ from transformers import PreTrainedModel
 
 from .....utils import logging
 from .....utils.device import get_device_type
+from ..ltx_core.model.transformer.rope import LTXRopeType
 from ..ltx_core.model.video_vae import load_video_encoder
 from ..ltx_core.text_encoders.gemma.embeddings_processor import (
     EmbeddingsProcessor,
@@ -20,7 +22,6 @@ from ..ltx_core.text_encoders.gemma.encoders.encoder_configurator import (
     EMBEDDINGS_PROCESSOR_KEY_REMAP,
     build_embeddings_processor,
 )
-from ..ltx_core.model.transformer.rope import LTXRopeType
 from .configuration_ltx2_3_condition import LTXVideoConditionModelConfig
 
 
@@ -319,8 +320,34 @@ def _create_input_projections(
 
 
 def _load_transformer_config(checkpoint_path: str) -> dict:
-    """Load transformer config JSON from checkpoint directory for connector config."""
+    """Load transformer config from checkpoint.
+
+    Priority:
+    1. Safetensors metadata (contains full config including connector fields)
+    2. Fallback to config.json files in checkpoint directory
+    """
+    from safetensors import safe_open
+
     ckpt_path = Path(checkpoint_path)
+
+    if ckpt_path.is_dir():
+        safetensor_files = sorted(ckpt_path.glob("*.safetensors"))
+    elif ckpt_path.suffix == ".safetensors":
+        safetensor_files = [ckpt_path]
+    else:
+        safetensor_files = []
+
+    logger.info_rank0(f"Searching safetensors in {ckpt_path}, found: {[str(p) for p in safetensor_files]}")
+
+    for sf_path in safetensor_files:
+        with safe_open(str(sf_path), framework="pt", device="cpu") as f:
+            meta = f.metadata()
+            logger.info_rank0(f"Safetensors {sf_path.name} metadata keys: {list(meta.keys()) if meta else 'None'}")
+            if meta and "config" in meta:
+                config = json.loads(meta["config"])
+                logger.info_rank0(f"Loaded config from safetensors metadata, keys: {sorted(config.keys())}")
+                return config
+
     config_candidates = [
         ckpt_path / "transformer" / "config.json",
         ckpt_path / "config.json",
@@ -334,7 +361,7 @@ def _load_transformer_config(checkpoint_path: str) -> dict:
             with open(candidate) as f:
                 return json.load(f)
 
-    raise FileNotFoundError(f"No config.json found near {checkpoint_path}")
+    raise FileNotFoundError(f"No config found near {checkpoint_path}")
 
 
 class LTXVideoConditionModel(PreTrainedModel):
@@ -359,21 +386,35 @@ class LTXVideoConditionModel(PreTrainedModel):
 
         transformer_config = _load_transformer_config(base)
 
+        _tc = transformer_config.get("transformer", transformer_config)
+        logger.info_rank0(f"VeOmni transformer sub-dict keys: {sorted(_tc.keys())}")
+        logger.info_rank0(
+            f"VeOmni connector_apply_gated_attention: {_tc.get('connector_apply_gated_attention', 'NOT_SET')}"
+        )
+        logger.info_rank0(
+            f"VeOmni connector_num_attention_heads: {_tc.get('connector_num_attention_heads', 'NOT_SET')}"
+        )
+        logger.info_rank0(
+            f"VeOmni audio_connector_num_attention_heads: {_tc.get('audio_connector_num_attention_heads', 'NOT_SET')}"
+        )
+
         connector_dims = _infer_connector_dims_from_checkpoint(base)
         if connector_dims:
-            logger.info_rank0(
-                f"Inferred connector dimensions from checkpoint: {connector_dims}"
-            )
+            logger.info_rank0(f"Inferred connector dimensions from checkpoint: {connector_dims}")
 
-        self.embeddings_processor = _build_embeddings_processor_with_dims(
-            transformer_config, connector_dims
-        )
+        self.embeddings_processor = _build_embeddings_processor_with_dims(transformer_config, connector_dims)
 
         fe_dims = _load_embeddings_processor_weights(
             self.embeddings_processor, base, device=device, dtype=torch.bfloat16
         )
 
         _create_input_projections(self.embeddings_processor, device=device, dtype=torch.bfloat16, fe_dims=fe_dims)
+
+        logger.info_rank0(
+            f"VeOmni connector inner_dim={self.embeddings_processor.video_connector.inner_dim}, "
+            f"heads={self.embeddings_processor.video_connector.num_attention_heads}, "
+            f"video_input_proj={self.embeddings_processor.video_input_proj is not None}"
+        )
 
         self.embeddings_processor = self.embeddings_processor.to(device=device, dtype=torch.bfloat16)
 
@@ -392,79 +433,6 @@ class LTXVideoConditionModel(PreTrainedModel):
 
         if self.meta_init:
             self.embeddings_processor.feature_extractor = None
-
-    def on_dataset_ready(self, trainer):
-        """Hook called by trainer after dataset is built. Adjusts training params for LTX-2."""
-        import torch.distributed as dist
-
-        from .....distributed.parallel_state import get_parallel_state
-
-        args = trainer.base.args
-        ps = get_parallel_state()
-        train_dataset = trainer.base.train_dataset
-
-        if train_dataset is None:
-            return
-
-        inner = train_dataset._data if hasattr(train_dataset, "_data") else train_dataset
-        if not hasattr(inner, "__len__"):
-            return
-
-        dataset_len = len(inner)
-        global_batch_size = args.train.global_batch_size
-        max_steps = args.train.max_steps
-
-        corrected_steps = max(1, dataset_len // global_batch_size)
-        if max_steps is not None:
-            corrected_steps = min(corrected_steps, max_steps)
-        args._train_steps = corrected_steps
-        trainer.base.train_steps = args.train_steps
-        logger.info_rank0(
-            f"Corrected train_steps based on actual dataset size: "
-            f"dataset_len={dataset_len}, global_batch_size={global_batch_size}, "
-            f"train_steps={corrected_steps}."
-        )
-
-        dp_size = ps.dp_size
-        per_rank_count = max(1, math.ceil(dataset_len / dp_size))
-        if args.train.dataloader_batch_size > per_rank_count:
-            old_bs = args.train.dataloader_batch_size
-            args.train.dataloader_batch_size = per_rank_count
-            logger.info_rank0(
-                f"Capped dataloader_batch_size from {old_bs} to {per_rank_count} "
-                f"(dataset_len={dataset_len}, dp_size={dp_size}, per_rank_count={per_rank_count}) "
-                f"to ensure DataLoader can form batches with drop_last=True."
-            )
-
-        if ps.dp_enabled and hasattr(args, "_train_steps"):
-            steps_t = torch.tensor([args._train_steps], dtype=torch.long, device=torch.device(get_device_type()))
-            dist.all_reduce(steps_t, op=dist.ReduceOp.MIN, group=ps.dp_group)
-            args._train_steps = int(steps_t.item())
-            trainer.base.train_steps = args.train_steps
-
-    def on_dataloader_ready(self, trainer):
-        """Hook called by trainer after dataloader is built. Adjusts micro-batch count for LTX-2."""
-        from .....data.data_collator import MakeMicroBatchCollator
-        from .....distributed.parallel_state import get_parallel_state
-
-        args = trainer.base.args
-        ps = get_parallel_state()
-        dataloader = trainer.base.train_dataloader
-
-        if args.train.dyn_bsz or dataloader is None:
-            return
-
-        num_micro_batch = args.train.global_batch_size // (args.train.micro_batch_size * ps.dp_size)
-        if num_micro_batch > args.train.dataloader_batch_size:
-            capped_nmb = max(1, args.train.dataloader_batch_size)
-            logger.info_rank0(
-                f"Capping num_micro_batch from {num_micro_batch} to {capped_nmb} "
-                f"(dataloader_batch_size={args.train.dataloader_batch_size}) "
-                f"to avoid empty micro-batches."
-            )
-            collate_fn = dataloader.collate_fn
-            if isinstance(collate_fn, MakeMicroBatchCollator):
-                collate_fn.num_micro_batch = capped_nmb
 
     def _encode_video_to_latents(self, video: torch.Tensor) -> torch.Tensor:
         height, width = video.shape[-2:]
@@ -574,7 +542,7 @@ class LTXVideoConditionModel(PreTrainedModel):
             self._timesteps_ready = True
 
         device = latents[0].device
-        compute_dtype = torch.float32
+        compute_dtype = latents[0].dtype
 
         packed_conditions: dict[str, list] = {
             "hidden_states": [],
@@ -629,20 +597,6 @@ class LTXVideoConditionModel(PreTrainedModel):
                 dtype=compute_dtype,
                 device=device,
             )
-
-            if timestep_sampling_mode == "shifted_logit_normal":
-                seq_length = F * H * W
-                timestep = self._sample_shifted_logit_normal(B, seq_length, device).to(
-                    device=device, dtype=compute_dtype
-                )
-            else:
-                timestep_ids = torch.randint(
-                    0,
-                    len(self.scheduler.timesteps),
-                    (B,),
-                    device=device,
-                )
-                timestep = self.scheduler.timesteps[timestep_ids].to(device=device, dtype=compute_dtype)
 
             noisy_latents = self.scheduler.scale_noise(latents_on_device, timestep, noise)
             noisy_latents = noisy_latents.to(device=device)
@@ -715,19 +669,18 @@ class LTXVideoConditionModel(PreTrainedModel):
             video_features = kwargs.pop("video_prompt_embeds")
             audio_features = kwargs.pop("audio_prompt_embeds", None)
             prompt_mask = kwargs.pop("prompt_attention_mask", None)
-            latents_raw = kwargs.pop("latents", None)
+            kwargs.pop("latents", None)
+            if fps is None and "fps" in kwargs:
+                fps = kwargs.pop("fps")
 
-            if latents_raw is not None:
-                if isinstance(latents_raw, list) and len(latents_raw) > 0 and isinstance(latents_raw[0], dict):
-                    fps = [float(d.get("fps", 24)) for d in latents_raw]
+            if latents is not None:
+                if isinstance(latents, list):
                     latents = [
-                        (d["latents"].unsqueeze(0) if d["latents"].dim() == 4 else d["latents"]).to(device)
-                        for d in latents_raw
+                        (t.unsqueeze(0) if isinstance(t, torch.Tensor) and t.dim() == 4 else t).to(device)
+                        for t in latents
                     ]
-                elif isinstance(latents_raw, list):
-                    latents = [t.to(device) if isinstance(t, torch.Tensor) else t for t in latents_raw]
                 else:
-                    latents = latents_raw.to(device) if isinstance(latents_raw, torch.Tensor) else latents_raw
+                    latents = latents.to(device) if isinstance(latents, torch.Tensor) else latents
 
             if isinstance(video_features, list):
                 context = [(f.unsqueeze(0) if f.dim() == 2 else f).to(device) for f in video_features]
@@ -746,19 +699,28 @@ class LTXVideoConditionModel(PreTrainedModel):
                 else:
                     context_mask = [prompt_mask.to(device)]
 
+            kwargs.pop("audio_latents", None)
+            if audio_latents is not None:
+                if isinstance(audio_latents, list):
+                    audio_latents = [
+                        (t.unsqueeze(0) if isinstance(t, torch.Tensor) and t.dim() == 3 else t).to(device)
+                        for t in audio_latents
+                    ]
+                else:
+                    audio_latents = (
+                        audio_latents.to(device) if isinstance(audio_latents, torch.Tensor) else audio_latents
+                    )
+
         elif "conditions" in kwargs:
             conditions_raw = kwargs.pop("conditions")
             audio_latents_raw = kwargs.pop("audio_latents", None)
+            if fps is None and "fps" in kwargs:
+                fps = kwargs.pop("fps")
 
             if latents is not None and isinstance(latents, list) and len(latents) > 0:
-                if isinstance(latents[0], dict):
-                    fps = [float(d.get("fps", 24)) for d in latents]
-                    latents = [
-                        (d["latents"].unsqueeze(0) if d["latents"].dim() == 4 else d["latents"]).to(device)
-                        for d in latents
-                    ]
-                else:
-                    latents = [t.to(device) if isinstance(t, torch.Tensor) else t for t in latents]
+                latents = [
+                    (t.unsqueeze(0) if isinstance(t, torch.Tensor) and t.dim() == 4 else t).to(device) for t in latents
+                ]
 
             first_cond = conditions_raw[0]
             if isinstance(first_cond, dict) and "video_prompt_embeds" in first_cond:
@@ -785,15 +747,10 @@ class LTXVideoConditionModel(PreTrainedModel):
 
             if audio_latents_raw is not None:
                 if isinstance(audio_latents_raw, list) and len(audio_latents_raw) > 0:
-                    if isinstance(audio_latents_raw[0], dict):
-                        audio_latents = [
-                            (d["latents"].unsqueeze(0) if d["latents"].dim() == 3 else d["latents"]).to(device)
-                            for d in audio_latents_raw
-                        ]
-                    else:
-                        audio_latents = [
-                            (t.to(device) if isinstance(t, torch.Tensor) else t) for t in audio_latents_raw
-                        ]
+                    audio_latents = [
+                        (t.unsqueeze(0) if isinstance(t, torch.Tensor) and t.dim() == 3 else t).to(device)
+                        for t in audio_latents_raw
+                    ]
 
         return latents, context, context_mask, audio_context, audio_latents, fps
 
