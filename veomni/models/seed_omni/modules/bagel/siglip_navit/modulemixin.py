@@ -35,9 +35,7 @@ class BagelSiglipNavitCPUPreprocessor(CPUPreprocessor):
         if inference:
             return
         image_items: list[ConversationItem] = []
-        # Training data routes image branches by role: user images feed SigLIP,
-        # assistant images feed VAE.
-        for item in iter_desired_items(conversation_list, types=["image"], roles=["user"]):
+        for item in iter_desired_items(conversation_list, types=["image"], sources=[BAGEL_SIGLIP_CONTEXT]):
             image_items.append(item)
 
         if not image_items:
@@ -170,19 +168,11 @@ class BagelSiglipNavitModuleMixin(ModuleMixin):
         if conversation_list is None:
             raise ValueError("BagelSiglipNavit requires conversation_list to select image items.")
 
-        # Training batches normally reach this module after
-        # BagelSiglipNavitCPUPreprocessor, which patchifies raw images and tags
-        # them as BAGEL_SIGLIP_CONTEXT. Inference does not have that prompt
-        # preprocessor yet: edit graphs currently serialize
-        # bagel_vae.encode_context -> bagel_siglip_navit with explicit edges
-        # instead of materializing branch sources up front, so raw prompt images
-        # may still arrive with source=None.
         image_items: list[ConversationItem] = []
         for item in iter_desired_items(
             conversation_list,
             types=["image"],
-            roles=["user"],
-            sources=[None, BAGEL_SIGLIP_CONTEXT],
+            sources=[BAGEL_SIGLIP_CONTEXT],
         ):
             image_items.append(item)
         return image_items

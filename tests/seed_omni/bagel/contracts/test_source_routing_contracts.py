@@ -220,7 +220,7 @@ def test_bagel_qwen2_mot_flow_alignment_requires_real_flow_item() -> None:
     assert out is packed_sequence
 
     flow_output = ConversationItem(
-        type="output",
+        type="image",
         value=torch.zeros(2, hidden_size),
         role="assistant",
         source=BAGEL_VAE_CONTEXT,
@@ -234,9 +234,10 @@ def test_bagel_qwen2_mot_flow_alignment_requires_real_flow_item() -> None:
 def test_bagel_flow_dummy_embed_anchors_to_vae_dummy_output() -> None:
     model = _tiny_flow_connector()
     vae_dummy = ConversationItem(
-        type="output",
+        type="image",
         value=torch.ones(1, 1, 1, requires_grad=True),
         role="dummy",
+        source=BAGEL_VAE_CONTEXT,
         meta={"source": "bagel_vae"},
     )
     conversation = [[vae_dummy]]
@@ -319,9 +320,9 @@ def test_bagel_flow_reset_clears_denoise_state() -> None:
 
 def test_bagel_flow_context_embed_consumes_only_vae_context_latents() -> None:
     model = _tiny_flow_connector()
-    raw_latent = ConversationItem(type="output", value=torch.zeros(1, 2, 2), role="assistant", meta={})
+    raw_latent = ConversationItem(type="image", value=torch.zeros(1, 2, 2), role="assistant", meta={})
     vae_context = ConversationItem(
-        type="output",
+        type="image",
         value=torch.ones(1, 2, 2),
         role="assistant",
         source=BAGEL_VAE_CONTEXT,
@@ -340,9 +341,9 @@ def test_bagel_flow_context_embed_consumes_only_vae_context_latents() -> None:
 
 def test_bagel_flow_training_embed_consumes_only_vae_context_latents() -> None:
     model = _tiny_flow_connector()
-    raw_latent = ConversationItem(type="output", value=torch.zeros(1, 2, 2), role="assistant", meta={})
+    raw_latent = ConversationItem(type="image", value=torch.zeros(1, 2, 2), role="assistant", meta={})
     vae_context = ConversationItem(
-        type="output",
+        type="image",
         value=torch.ones(1, 2, 2),
         role="assistant",
         source=BAGEL_VAE_CONTEXT,
@@ -362,7 +363,7 @@ def test_bagel_flow_training_decode_consumes_velocity_target_items() -> None:
     hidden = torch.zeros(2, int(model.config.hidden_size))
     unrelated = ConversationItem(type="output", value=hidden.clone(), role="assistant", meta={})
     target = ConversationItem(
-        type="output",
+        type="image",
         value=hidden.clone(),
         role="assistant",
         source=BAGEL_VAE_CONTEXT,
@@ -388,7 +389,7 @@ def test_bagel_qwen2_mot_velocity_collect_requires_flow_velocity_source() -> Non
         model.collect_velocity(conversation_list=[item], generation_kwargs={})
 
 
-def test_bagel_marker_wrapping_skips_velocity_and_generated_latent_sources() -> None:
+def test_bagel_runtime_marker_wrapping_selects_only_flow_query() -> None:
     siglip = ConversationItem(
         type="image",
         value=torch.zeros(2, 4),
@@ -403,7 +404,7 @@ def test_bagel_marker_wrapping_skips_velocity_and_generated_latent_sources() -> 
         meta={},
     )
     context = ConversationItem(
-        type="output",
+        type="image",
         value=torch.zeros(2, 4),
         role="assistant",
         source=BAGEL_VAE_CONTEXT,
@@ -431,19 +432,17 @@ def test_bagel_marker_wrapping_skips_velocity_and_generated_latent_sources() -> 
         meta={},
     )
 
-    marker_sources = {BAGEL_SIGLIP_CONTEXT, BAGEL_VAE_CONTEXT, BAGEL_FLOW_QUERY}
+    marker_sources = {BAGEL_FLOW_QUERY}
     assert [
         item
         for item in (siglip, raw_image, context, query, velocity, generated)
-        if item.type in {"image", "output"} and item.source in marker_sources
+        if item.type == "output" and item.source in marker_sources
     ] == [
-        siglip,
-        context,
         query,
     ]
 
 
-def test_bagel_siglip_selector_accepts_raw_and_context_sources() -> None:
+def test_bagel_siglip_selector_requires_context_source() -> None:
     model = _tiny_siglip()
     raw_image = ConversationItem(type="image", value=torch.zeros(3, 4, 4), role="user")
     context_image = ConversationItem(
@@ -453,7 +452,7 @@ def test_bagel_siglip_selector_accepts_raw_and_context_sources() -> None:
         source=BAGEL_SIGLIP_CONTEXT,
     )
 
-    assert model._select_siglip_image_items([[raw_image]]) == [raw_image]
+    assert model._select_siglip_image_items([[raw_image]]) == []
     assert model._select_siglip_image_items([[context_image]]) == [context_image]
 
 

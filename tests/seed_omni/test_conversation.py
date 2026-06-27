@@ -8,6 +8,7 @@ from veomni.models.seed_omni.utils.conversation import (
     ConversationItem,
     build_conversation,
     collect_desired_values,
+    get_tail_output_item,
     iter_desired_items,
     maybe_merge_outputs,
     seal_outputs,
@@ -80,3 +81,16 @@ def test_iter_desired_items_filters_meta_keys():
 
     assert len(items) == 1
     assert torch.equal(items[0].value, torch.ones(1))
+
+
+def test_get_tail_output_item_returns_latest_matching_output():
+    first = ConversationItem(type="output", value=torch.zeros(1), role="assistant", source="a")
+    middle = ConversationItem(type="text", value="done", role="assistant")
+    second = ConversationItem(type="output", value=torch.ones(1), role="assistant", source="b")
+    third = ConversationItem(type="output", value=torch.full((1,), 2.0), role="assistant", source="a")
+    conversation = [first, middle, second, third]
+
+    assert get_tail_output_item(conversation) is third
+    assert get_tail_output_item(conversation, sources=["a"]) is third
+    assert get_tail_output_item(conversation, sources=["b"]) is second
+    assert get_tail_output_item(conversation, sources=["missing"]) is None

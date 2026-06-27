@@ -9,8 +9,7 @@ generation_graph:
         - { from: bagel_text_encoder,                     to: bagel_qwen2_mot }
         - { from: bagel_vae.encode_context,               to: bagel_siglip_navit }
         - { from: bagel_siglip_navit,                     to: bagel_flow_connector.embed_context_latents }
-        - { from: bagel_flow_connector.embed_context_latents, to: bagel_text_encoder.encode_image_markers }
-        - { from: bagel_text_encoder.encode_image_markers, to: bagel_qwen2_mot }
+        - { from: bagel_flow_connector.embed_context_latents, to: bagel_qwen2_mot }
         - { from: bagel_qwen2_mot,                        to: end }
       transitions:
         - { condition: { type: default }, next_state: query_denoise }

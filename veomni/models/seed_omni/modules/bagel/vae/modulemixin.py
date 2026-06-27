@@ -30,9 +30,7 @@ class BagelVAECPUPreprocessor(CPUPreprocessor):
         if inference:
             return
         image_items = []
-        # Training data routes image branches by role: user images feed SigLIP,
-        # assistant images feed VAE.
-        for item in iter_desired_items(conversation_list, types=["image"], roles=["assistant"]):
+        for item in iter_desired_items(conversation_list, types=["image"], sources=[BAGEL_VAE_CONTEXT]):
             if not is_dummy(item):
                 image_items.append(item)
         if not image_items:
@@ -88,18 +86,8 @@ class BagelVAEModuleMixin(ModuleMixin):
         )
         outputs = self.encode(pixel_values=inputs["pixel_values"])
         for image_item, latent in zip(image_items, outputs["latents"], strict=True):
-            # Edit keeps the raw user image in place for SigLIP and inserts the
-            # VAE context latent immediately before that image for flow context.
-            conversation_list.insert(
-                conversation_list.index(image_item),
-                ConversationItem(
-                    type="output",
-                    value=latent.to(device=self.device, dtype=self.dtype),
-                    role="assistant",
-                    source=BAGEL_VAE_CONTEXT,
-                    meta={},
-                ),
-            )
+            image_item.value = latent.to(device=self.device, dtype=self.dtype)
+            image_item.source = BAGEL_VAE_CONTEXT
         return {"conversation_list": conversation_list}
 
     def decode_generated(
@@ -173,16 +161,17 @@ class BagelVAEModuleMixin(ModuleMixin):
                 for sample in conversation:
                     sample.append(
                         ConversationItem(
-                            type="output",
+                            type="image",
                             value=value,
                             role="dummy",
+                            source=BAGEL_VAE_CONTEXT,
                             meta={"source": "bagel_vae"},
                         )
                     )
             return {"conversation_list": conversation}
 
         for item, latent in zip(encode_items, latents, strict=True):
-            item.type = "output"
+            item.type = "image"
             item.value = latent.to(device=self.device, dtype=self.dtype)
             item.source = BAGEL_VAE_CONTEXT
         return {"conversation_list": conversation}
@@ -255,10 +244,8 @@ class BagelVAEModuleMixin(ModuleMixin):
         if conversation_list is None:
             raise ValueError("BagelVAE encode requires conversation_list to select image items.")
 
-        # Training VAE encode consumes generation target images. Data-level role
-        # routing keeps these separate from SigLIP's user-image branch.
         encode_items: list[ConversationItem] = []
-        for item in iter_desired_items(conversation_list, types=["image"], roles=["assistant"]):
+        for item in iter_desired_items(conversation_list, types=["image"], sources=[BAGEL_VAE_CONTEXT]):
             if not is_dummy(item):
                 encode_items.append(item)
         return encode_items
@@ -282,16 +269,11 @@ class BagelVAEModuleMixin(ModuleMixin):
         if conversation_list is None:
             raise ValueError("BagelVAE encode_context requires conversation_list to select context images.")
 
-        # Same staged source contract as SigLIP: once inference prompt
-        # preprocessing materializes branch sources, raw edit images can arrive
-        # tagged as BAGEL_VAE_CONTEXT. Today build_conversation() still creates
-        # prompt images with source=None, so keep that fallback.
         image_items: list[ConversationItem] = []
         for item in iter_desired_items(
             conversation_list,
             types=["image"],
-            roles=["user"],
-            sources=[None, BAGEL_VAE_CONTEXT],
+            sources=[BAGEL_VAE_CONTEXT],
         ):
             if not is_dummy(item):
                 image_items.append(item)

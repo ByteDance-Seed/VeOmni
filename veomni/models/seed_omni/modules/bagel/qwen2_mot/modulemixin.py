@@ -9,7 +9,7 @@ import torch.distributed as dist
 
 from ....graphs.generation_graph import FSM_SIGNAL_KEY
 from ....mixins.modulemixin import ModuleMixin, post_forward, pre_forward
-from ....utils.conversation import ConversationItem, iter_desired_items
+from ....utils.conversation import ConversationItem, get_tail_output_item, iter_desired_items
 from ..sources import (
     BAGEL_FLOW_HIDDEN,
     BAGEL_FLOW_QUERY,
@@ -84,15 +84,7 @@ class BagelQwen2MoTModuleMixin(ModuleMixin):
 
         self._generation_state.validate_cfg_request(generation_kwargs or {})
         self._generation_state.main.require_ready()
-        tail = next(
-            iter_desired_items(
-                [conversation_list],
-                types=["output"],
-                sources=[BAGEL_FLOW_QUERY],
-                reverse_item=True,
-            ),
-            None,
-        )
+        tail = get_tail_output_item(conversation_list, sources=[BAGEL_FLOW_QUERY])
         if tail is None or not torch.is_tensor(tail.value):
             raise ValueError("BAGEL Qwen2-MoT denoise branch requires source='bagel_flow_query'.")
 
@@ -149,15 +141,7 @@ class BagelQwen2MoTModuleMixin(ModuleMixin):
             raise ValueError("BAGEL Qwen2-MoT collect_velocity requires conversation_list.")
 
         self._generation_state.validate_cfg_request(generation_kwargs or {})
-        tail = next(
-            iter_desired_items(
-                [conversation_list],
-                types=["output"],
-                sources=[BAGEL_FLOW_VELOCITY],
-                reverse_item=True,
-            ),
-            None,
-        )
+        tail = get_tail_output_item(conversation_list, sources=[BAGEL_FLOW_VELOCITY])
         if tail is None or not torch.is_tensor(tail.value):
             raise ValueError("BAGEL Qwen2-MoT velocity collection requires source='bagel_flow_velocity'.")
 
@@ -236,7 +220,11 @@ class BagelQwen2MoTModuleMixin(ModuleMixin):
             return {"conversation_list": conversation}
 
         for span in packed.spans:
-            span.item.value = hidden_states[span.start : span.start + span.length].to(device=self.device)
+            span_hidden = hidden_states[span.start : span.start + span.length].to(device=self.device)
+            offset = 0
+            for item, length in zip(span.items, span.lengths, strict=True):
+                item.value = span_hidden[offset : offset + length]
+                offset += length
         return {"conversation_list": conversation}
 
     # ── Dummy helpers ──────────────────────────────────
@@ -297,7 +285,7 @@ class BagelQwen2MoTModuleMixin(ModuleMixin):
             self._has_valid_upstream_embedding(
                 conversation_list,
                 label="flow",
-                types=["output"],
+                types=["image"],
                 sources=[BAGEL_VAE_CONTEXT],
                 meta_keys=["flow_velocity_target"],
             )
@@ -467,15 +455,38 @@ class BagelQwen2MoTModuleMixin(ModuleMixin):
         }
         if span.item.type == "output":
             if span.length < 3:
-                raise ValueError("BAGEL Qwen2-MoT VAE context output must include start/end marker embeddings.")
-            # Output spans are marker-wrapped latent spans: marker tokens stay
-            # on the text path, while interior latent tokens use the gen expert.
+                raise ValueError("BAGEL Qwen2-MoT output query must include start/end marker embeddings.")
+            # Runtime flow query output remains marker-wrapped: marker tokens
+            # stay on the text path, while interior latent tokens use the gen expert.
             call_kwargs["is_causal"] = False
             call_kwargs["mode"] = "gen"
             call_kwargs["packed_text_indexes"] = torch.tensor([0, span.length - 1], device=self.device)
             call_kwargs["packed_vae_token_indexes"] = torch.arange(
                 1,
                 span.length - 1,
+                device=self.device,
+                dtype=torch.long,
+            )
+        elif span.item.type == "image" and span.item.source == BAGEL_VAE_CONTEXT:
+            # Prompt/edit VAE context is now source-routed as an image carrier.
+            # Surrounding vision marker rows stay on the text path while the
+            # image span itself uses the generation expert.
+            call_kwargs["is_causal"] = False
+            call_kwargs["mode"] = "gen"
+            if span.is_image_triplet:
+                call_kwargs["packed_text_indexes"] = torch.tensor(
+                    [0, span.length - 1],
+                    device=self.device,
+                    dtype=torch.long,
+                )
+                start = span.primary_start
+                end = start + span.primary_length
+            else:
+                start = 0
+                end = span.length
+            call_kwargs["packed_vae_token_indexes"] = torch.arange(
+                start,
+                end,
                 device=self.device,
                 dtype=torch.long,
             )

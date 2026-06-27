@@ -11,8 +11,9 @@ from ....graphs.generation_graph import FSM_SIGNAL_KEY
 from ....mixins.modulemixin import CPUPreprocessor, post_forward, pre_forward
 from ....utils.conversation import ConversationItem, is_dummy, iter_desired_items, maybe_merge_outputs
 from ...base.text_encoder.modulemixin import TextEncoderModuleMixin
-from ..sources import BAGEL_FLOW_QUERY, BAGEL_SIGLIP_CONTEXT, BAGEL_VAE_CONTEXT
-from .processing import apply_image_marker, materialize_text_item_input_ids
+from ..sources import BAGEL_FLOW_QUERY
+from .chat_template import BagelChatTemplate
+from .processing import apply_image_marker
 
 
 SIGNAL_START_IMAGE_GEN = "start_image_gen"
@@ -24,18 +25,10 @@ _OMNI_TOKENIZED = "_omni_tokenized"
 
 
 class BagelTextEncoderCPUPreprocessor(CPUPreprocessor):
-    """Worker-side tokenize for BAGEL text encoder training inputs."""
+    """Worker-side chat-template + tokenize for BAGEL text encoder inputs."""
 
-    def __init__(
-        self,
-        tokenizer: PreTrainedTokenizerBase,
-        *,
-        start_token_id: int,
-        eos_token_id: int,
-    ) -> None:
-        self._tokenizer = tokenizer
-        self._start_token_id = int(start_token_id)
-        self._eos_token_id = int(eos_token_id)
+    def __init__(self, chat_template: BagelChatTemplate) -> None:
+        self._chat_template = chat_template
 
     def __call__(
         self,
@@ -44,17 +37,14 @@ class BagelTextEncoderCPUPreprocessor(CPUPreprocessor):
         inference: bool = False,
         generation_kwargs: Dict[str, Any] | None = None,
     ) -> None:
-        del generation_kwargs
-        if inference:
-            return
-        for item in iter_desired_items(conversation_list, types=["text"]):
-            materialize_text_item_input_ids(
-                item,
-                self._tokenizer,
-                start_token_id=self._start_token_id,
-                eos_token_id=self._eos_token_id,
-                tokenized_key=_OMNI_TOKENIZED,
+        for sample in conversation_list:
+            parts = self._chat_template.tokenize_conversation(
+                sample,
+                add_generation_prompt=inference,
+                generation_kwargs=generation_kwargs,
             )
+            sample.clear()
+            sample.extend(parts)
 
 
 class BagelTextEncoderModuleMixin(TextEncoderModuleMixin):
@@ -64,11 +54,8 @@ class BagelTextEncoderModuleMixin(TextEncoderModuleMixin):
 
     def init_omni_state(self) -> None:
         super().init_omni_state()
-        self._eos_token_id: Optional[int] = None
-        self._start_token_id: Optional[int] = None
-        self._image_start_token_id: Optional[int] = None
-        self._image_end_token_id: Optional[int] = None
         self._decode_has_valid_labels: bool = False
+        self._chat_template: Optional[BagelChatTemplate] = None
 
     @property
     def tokenizer(self) -> PreTrainedTokenizerBase:
@@ -77,38 +64,11 @@ class BagelTextEncoderModuleMixin(TextEncoderModuleMixin):
     @tokenizer.setter
     def tokenizer(self, tokenizer: PreTrainedTokenizerBase) -> None:
         self._tokenizer = tokenizer
-        self._eos_token_id = self._resolve_token_id(tokenizer, token_id=tokenizer.eos_token_id, token="<|im_end|>")
-        self._start_token_id = self._resolve_token_id(tokenizer, token="<|im_start|>", fallback=self._eos_token_id)
-        self._image_start_token_id = self._resolve_token_id(tokenizer, token="<|vision_start|>")
-        self._image_end_token_id = self._resolve_token_id(tokenizer, token="<|vision_end|>")
-
-    @staticmethod
-    def _resolve_token_id(
-        tokenizer: PreTrainedTokenizerBase,
-        *,
-        token_id: int | None = None,
-        token: str | None = None,
-        fallback: int | None = None,
-    ) -> int:
-        if token_id is not None:
-            return int(token_id)
-        if token is not None:
-            resolved = tokenizer.convert_tokens_to_ids(token)
-            if resolved is not None and resolved != tokenizer.unk_token_id:
-                return int(resolved)
-        if fallback is not None:
-            return int(fallback)
-        raise ValueError(f"BAGEL tokenizer is missing required token: {token!r}.")
+        self._chat_template = BagelChatTemplate(tokenizer)
 
     def build_cpu_preprocessor(self) -> Optional[CPUPreprocessor]:
         """Worker-side tokenize for training batches."""
-        if getattr(self, "_tokenizer", None) is None or self._start_token_id is None or self._eos_token_id is None:
-            return None
-        return BagelTextEncoderCPUPreprocessor(
-            self._tokenizer,
-            start_token_id=self._start_token_id,
-            eos_token_id=self._eos_token_id,
-        )
+        return BagelTextEncoderCPUPreprocessor(self._chat_template)
 
     # ── Graph Entrypoints ──────────────────────────────────
 
@@ -121,7 +81,7 @@ class BagelTextEncoderModuleMixin(TextEncoderModuleMixin):
         tail = conversation_list[-1]
         batched = [conversation_list]
 
-        if tail.role == "user" and not torch.is_tensor(tail.value):
+        if tail.type == "text" and tail.role == "user":
             input_ids = self._prepare_encode_inputs(batched)
             inputs_embeds = self.encode(input_ids)["inputs_embeds"]
             self._scatter_text_embeds(batched, unflatten(inputs_embeds, self._encode_batch_shape))
@@ -138,7 +98,7 @@ class BagelTextEncoderModuleMixin(TextEncoderModuleMixin):
             sampling = self._extract_sampling_kwargs(generation_kwargs, 1.0, 1.0, kwargs)
 
             output_token_id = self._sample_token(hidden_states, **sampling)
-            if output_token_id == self._eos_token_id:
+            if output_token_id == self._chat_template.eos_token_id:
                 outputs[FSM_SIGNAL_KEY] = SIGNAL_TEXT_DONE
                 return outputs
             self._text_token_cache.append(output_token_id)
@@ -168,15 +128,15 @@ class BagelTextEncoderModuleMixin(TextEncoderModuleMixin):
         marker_embeds: Optional[torch.Tensor] = None
         for item in iter_desired_items(
             [conversation_list],
-            types=["image", "output"],
-            sources=[BAGEL_SIGLIP_CONTEXT, BAGEL_VAE_CONTEXT, BAGEL_FLOW_QUERY],
+            types=["output"],
+            sources=[BAGEL_FLOW_QUERY],
         ):
             if is_dummy(item):
                 continue
 
             if marker_embeds is None:
                 marker_ids = torch.tensor(
-                    [[self._image_start_token_id, self._image_end_token_id]],
+                    [[self._chat_template.vision_start_token_id, self._chat_template.vision_end_token_id]],
                     dtype=torch.long,
                     device=self.device,
                 )
@@ -282,15 +242,12 @@ class BagelTextEncoderModuleMixin(TextEncoderModuleMixin):
         input_ids: List[torch.Tensor] = []
         self._encode_batch_shape = None
         for item in iter_desired_items(conversation_list, types=["text"]):
-            token_ids = materialize_text_item_input_ids(
-                item,
-                self._tokenizer,
-                start_token_id=self._start_token_id,
-                eos_token_id=self._eos_token_id,
-                tokenized_key=_OMNI_TOKENIZED,
-            )
-            if token_ids is not None:
-                input_ids.append(token_ids)
+            if is_dummy(item):
+                continue
+            if not item.meta.get(_OMNI_TOKENIZED):
+                raise ValueError("BAGEL text encoder expects CPU-preprocessed text items.")
+            token_ids = item.meta.get("input_ids")
+            input_ids.append(token_ids.reshape(-1))
 
         if not input_ids:
             return self.dummy_inputs(kind="encode")["input_ids"]

@@ -157,6 +157,27 @@ def iter_desired_items(
             yield item
 
 
+def get_tail_output_item(
+    conversation_list: list[ConversationItem],
+    *,
+    sources: list[str] | None = None,
+    roles: list[str] | None = None,
+    meta_keys: list[str] | None = None,
+) -> ConversationItem | None:
+    """Return the latest matching output item in a single conversation."""
+    return next(
+        iter_desired_items(
+            [conversation_list],
+            types=["output"],
+            roles=roles,
+            sources=sources,
+            reverse_item=True,
+            meta_keys=meta_keys,
+        ),
+        None,
+    )
+
+
 def collect_desired_values(
     conversation_list: list[list[ConversationItem]],
     types: list[str] | None = None,
@@ -184,6 +205,7 @@ __all__ = [
     "is_dummy",
     "maybe_merge_outputs",
     "seal_outputs",
+    "get_tail_output_item",
     "iter_desired_items",
     "collect_desired_values",
 ]

@@ -2,36 +2,58 @@
 
 from __future__ import annotations
 
+import copy
+
 import torch
-from transformers import PreTrainedTokenizerBase
+from PIL import Image
 
-from ....utils.conversation import ConversationItem, is_dummy
+from ....utils.conversation import ConversationItem
+from ..sources import BAGEL_SIGLIP_CONTEXT, BAGEL_VAE_CONTEXT
 
 
-def materialize_text_item_input_ids(
-    item: ConversationItem,
-    tokenizer: PreTrainedTokenizerBase,
-    *,
-    start_token_id: int,
-    eos_token_id: int,
-    tokenized_key: str | None = None,
-) -> torch.Tensor | None:
-    if is_dummy(item) or item.type != "text":
+def is_bagel_vision_marker(item: ConversationItem, *, source: str | None = None) -> bool:
+    if item.type != "text":
+        return False
+    if source is not None and item.source != source:
+        return False
+    if item.source not in {BAGEL_SIGLIP_CONTEXT, BAGEL_VAE_CONTEXT}:
+        return False
+    return _text_item_length(item) == 1
+
+
+def _text_item_length(item: ConversationItem) -> int | None:
+    value = item.value
+    if torch.is_tensor(value):
+        if value.dim() == 0:
+            return 1
+        if value.dim() == 1:
+            return int(value.shape[0])
+        if value.dim() == 2:
+            return int(value.shape[0])
+        if value.dim() == 3 and int(value.shape[0]) == 1:
+            return int(value.shape[1])
         return None
-    if tokenized_key is not None and item.meta.get(tokenized_key):
-        return item.meta["input_ids"]
+    input_ids = item.meta.get("input_ids")
+    if torch.is_tensor(input_ids):
+        return int(input_ids.reshape(-1).shape[0])
+    return None
 
-    token_ids = tokenizer(item.value, add_special_tokens=False)["input_ids"]
-    token_ids = torch.tensor([start_token_id, *token_ids, eos_token_id], dtype=torch.long)
-    item.value = token_ids
-    item.meta["input_ids"] = token_ids.detach()
-    item.meta["attention_mask"] = torch.ones_like(token_ids, dtype=torch.long)
-    item.meta["labels"] = (
-        token_ids.detach().clone() if item.role == "assistant" else torch.full_like(token_ids, -100, dtype=torch.long)
+
+def copy_image_item(item: ConversationItem) -> ConversationItem:
+    value = item.value
+    if torch.is_tensor(value):
+        value = value.clone()
+    elif isinstance(value, Image.Image):
+        value = value.copy()
+    else:
+        value = copy.deepcopy(value)
+    return ConversationItem(
+        type=item.type,
+        value=value,
+        role=item.role,
+        source=item.source,
+        meta=copy.deepcopy(item.meta),
     )
-    if tokenized_key is not None:
-        item.meta[tokenized_key] = True
-    return token_ids
 
 
 def apply_image_marker(
@@ -61,5 +83,6 @@ def apply_image_marker(
 
 __all__ = [
     "apply_image_marker",
-    "materialize_text_item_input_ids",
+    "copy_image_item",
+    "is_bagel_vision_marker",
 ]

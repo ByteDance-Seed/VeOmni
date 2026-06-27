@@ -8,13 +8,41 @@ from typing import Iterable
 import torch
 
 from ....utils.conversation import ConversationItem, iter_desired_items
+from ..sources import BAGEL_SIGLIP_CONTEXT, BAGEL_VAE_CONTEXT
 
 
 @dataclass(frozen=True)
 class PackedSpan:
-    item: ConversationItem
     start: int
-    length: int
+    items: tuple[ConversationItem, ...]
+    lengths: tuple[int, ...]
+    primary_index: int = 0
+
+    @property
+    def item(self) -> ConversationItem:
+        return self.items[self.primary_index]
+
+    @property
+    def length(self) -> int:
+        return sum(self.lengths)
+
+    @property
+    def primary_start(self) -> int:
+        return sum(self.lengths[: self.primary_index])
+
+    @property
+    def primary_length(self) -> int:
+        return self.lengths[self.primary_index]
+
+    @property
+    def is_image_triplet(self) -> bool:
+        return (
+            len(self.items) == 3
+            and self.primary_index == 1
+            and self.items[0].type == "text"
+            and self.items[1].type == "image"
+            and self.items[2].type == "text"
+        )
 
 
 @dataclass
@@ -59,18 +87,41 @@ def preprocess_mot_inputs(
         sample_attn_modes: list[str] = []
         sample_position_cursor = 0
 
-        for item in iter_desired_items(
-            [sample],
-            types=["text", "image", "output"],
-            roles=["user", "assistant"],
-        ):
-            value = _mot_value_for_item(item, device=device, dtype=dtype, hidden_size=hidden_size)
-            length = int(value.shape[0])
+        items = list(
+            iter_desired_items(
+                [sample],
+                types=["text", "image", "output"],
+                roles=["user", "assistant"],
+            )
+        )
+        item_index = 0
+        while item_index < len(items):
+            if _is_vision_marker_triplet_at(items, item_index):
+                span_items = (items[item_index], items[item_index + 1], items[item_index + 2])
+                span_values = [
+                    _mot_value_for_item(item, device=device, dtype=dtype, hidden_size=hidden_size)
+                    for item in span_items
+                ]
+                span_lengths = tuple(int(value.shape[0]) for value in span_values)
+                item = span_items[1]
+                value = torch.cat(span_values, dim=0)
+                length = int(value.shape[0])
+                primary_index = 1
+                item_index += 3
+            else:
+                item = items[item_index]
+                value = _mot_value_for_item(item, device=device, dtype=dtype, hidden_size=hidden_size)
+                length = int(value.shape[0])
+                span_items = (item,)
+                span_lengths = (length,)
+                primary_index = 0
+                item_index += 1
+
             if length == 0:
                 continue
 
             indexes = torch.arange(sequence_cursor, sequence_cursor + length, device=device, dtype=torch.long)
-            position_ids, sample_position_cursor = _mot_position_ids_for_item(
+            position_ids, sample_position_cursor = _mot_position_ids_for_span(
                 item,
                 start=sample_position_cursor,
                 length=length,
@@ -82,12 +133,20 @@ def preprocess_mot_inputs(
             position_parts.append(position_ids)
             sample_splits.append(length)
             sample_attn_modes.append(mode)
-            spans.append(PackedSpan(item=item, start=sequence_cursor, length=length))
+            span = PackedSpan(
+                start=sequence_cursor,
+                items=span_items,
+                lengths=span_lengths,
+                primary_index=primary_index,
+            )
+            spans.append(span)
             sequence_cursor += length
-            if item.type == "output":
-                gen_indexes.append(indexes)
-            else:
-                und_indexes.append(indexes)
+
+            gen_token_indexes = _mot_gen_token_indexes_for_span(span, indexes)
+            if gen_token_indexes.numel() > 0:
+                gen_indexes.append(gen_token_indexes)
+            if int(gen_token_indexes.numel()) < int(indexes.numel()):
+                und_indexes.append(_index_difference(indexes, gen_token_indexes))
 
         sample_len = sequence_cursor - sample_start
         if sample_len > 0:
@@ -137,7 +196,7 @@ def _mot_value_for_item(
     return value.to(device=device, dtype=dtype)
 
 
-def _mot_position_ids_for_item(
+def _mot_position_ids_for_span(
     item: ConversationItem,
     *,
     start: int,
@@ -158,11 +217,69 @@ def _mot_position_ids_for_item(
 
 
 def _mot_attn_mode_for_item(item: ConversationItem) -> str:
-    if item.type == "image":
-        return "full"
     if item.type == "output":
         return "noise"
+    if item.type == "image":
+        return "noise" if item.source == BAGEL_VAE_CONTEXT else "full"
     return "causal"
+
+
+def _mot_gen_token_indexes_for_span(span: PackedSpan, indexes: torch.Tensor) -> torch.Tensor:
+    item = span.item
+    if item.type == "output":
+        return indexes
+    if item.type != "image" or item.source != BAGEL_VAE_CONTEXT:
+        return indexes.new_empty(0)
+    if span.is_image_triplet:
+        primary_start = span.primary_start
+        primary_end = primary_start + span.primary_length
+        return indexes[primary_start:primary_end]
+    return indexes
+
+
+def _index_difference(indexes: torch.Tensor, remove: torch.Tensor) -> torch.Tensor:
+    if remove.numel() == 0:
+        return indexes
+    keep = torch.ones(indexes.shape, device=indexes.device, dtype=torch.bool)
+    start = int(indexes[0].item())
+    keep[(remove - start).to(device=indexes.device, dtype=torch.long)] = False
+    return indexes[keep]
+
+
+def _is_vision_marker_triplet_at(items: list[ConversationItem], index: int) -> bool:
+    if index + 2 >= len(items):
+        return False
+    start, image, end = items[index], items[index + 1], items[index + 2]
+    if image.type != "image" or image.source not in {BAGEL_SIGLIP_CONTEXT, BAGEL_VAE_CONTEXT}:
+        return False
+    return (
+        start.source == image.source
+        and end.source == image.source
+        and _is_bagel_vision_marker(start, source=image.source)
+        and _is_bagel_vision_marker(end, source=image.source)
+    )
+
+
+def _is_bagel_vision_marker(item: ConversationItem, *, source: str) -> bool:
+    return item.type == "text" and item.source == source and _text_item_length(item) == 1
+
+
+def _text_item_length(item: ConversationItem) -> int | None:
+    value = item.value
+    if torch.is_tensor(value):
+        if value.dim() == 0:
+            return 1
+        if value.dim() == 1:
+            return int(value.shape[0])
+        if value.dim() == 2:
+            return int(value.shape[0])
+        if value.dim() == 3 and int(value.shape[0]) == 1:
+            return int(value.shape[1])
+        return None
+    input_ids = item.meta.get("input_ids")
+    if torch.is_tensor(input_ids):
+        return int(input_ids.reshape(-1).shape[0])
+    return None
 
 
 def _mot_attn_mask_for_sample(split_lens: Iterable[int], attn_modes: Iterable[str]) -> torch.Tensor:

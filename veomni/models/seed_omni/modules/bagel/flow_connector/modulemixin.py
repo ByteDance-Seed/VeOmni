@@ -8,7 +8,7 @@ import torch
 
 from ....graphs.generation_graph import FSM_SIGNAL_KEY
 from ....mixins.modulemixin import ModuleMixin, post_forward, pre_forward
-from ....utils.conversation import ConversationItem, is_dummy, iter_desired_items
+from ....utils.conversation import ConversationItem, get_tail_output_item, is_dummy, iter_desired_items
 from ..sources import (
     BAGEL_FLOW_HIDDEN,
     BAGEL_FLOW_QUERY,
@@ -115,15 +115,7 @@ class BagelFlowConnectorModuleMixin(ModuleMixin):
         query = outputs["latent_embeds"].to(device=self.device, dtype=self.dtype)
         timestep_meta = timestep.detach().to(device=query.device, dtype=torch.float32)
 
-        item = next(
-            iter_desired_items(
-                [conversation_list],
-                types=["output"],
-                sources=[BAGEL_FLOW_VELOCITY],
-                reverse_item=True,
-            ),
-            None,
-        )
+        item = get_tail_output_item(conversation_list, sources=[BAGEL_FLOW_VELOCITY])
         if item is None:
             conversation_list.append(
                 ConversationItem(
@@ -152,15 +144,7 @@ class BagelFlowConnectorModuleMixin(ModuleMixin):
         if conversation_list is None:
             raise ValueError("BAGEL flow inference requires conversation_list.")
 
-        item = next(
-            iter_desired_items(
-                [conversation_list],
-                types=["output"],
-                sources=[BAGEL_FLOW_HIDDEN],
-                reverse_item=True,
-            ),
-            None,
-        )
+        item = get_tail_output_item(conversation_list, sources=[BAGEL_FLOW_HIDDEN])
         if item is None or not torch.is_tensor(item.value):
             raise ValueError("BAGEL flow decode_velocity requires source='bagel_flow_hidden'.")
 
@@ -193,15 +177,7 @@ class BagelFlowConnectorModuleMixin(ModuleMixin):
         if conversation_list is None:
             raise ValueError("BAGEL flow inference requires conversation_list.")
 
-        item = next(
-            iter_desired_items(
-                [conversation_list],
-                types=["output"],
-                sources=[BAGEL_FLOW_VELOCITY],
-                reverse_item=True,
-            ),
-            None,
-        )
+        item = get_tail_output_item(conversation_list, sources=[BAGEL_FLOW_VELOCITY])
         if item is None or not torch.is_tensor(item.value):
             raise ValueError("BAGEL flow advance requires source='bagel_flow_velocity'.")
 
@@ -411,7 +387,7 @@ class BagelFlowConnectorModuleMixin(ModuleMixin):
         latent_items: list[ConversationItem] = []
         for item in iter_desired_items(
             conversation_list,
-            types=["output"],
+            types=["image"],
             sources=[BAGEL_VAE_CONTEXT],
         ):
             if not is_dummy(item):
@@ -423,7 +399,8 @@ class BagelFlowConnectorModuleMixin(ModuleMixin):
         conversation_list: list[list[ConversationItem]] | None,
     ) -> list[ConversationItem]:
         decode_items: list[ConversationItem] = []
-        for item in iter_desired_items(conversation_list, types=["output"]):
+        # Training uses the VAE-processed image item directly as the generation target.
+        for item in iter_desired_items(conversation_list, types=["image"]):
             target = item.meta.get("flow_velocity_target")
             if is_dummy(item) or not torch.is_tensor(target):
                 continue
@@ -463,15 +440,7 @@ class BagelFlowConnectorModuleMixin(ModuleMixin):
         conversation_list: list[ConversationItem],
     ) -> dict[str, Any]:
         x_t = self._generation_state.latents
-        item = next(
-            iter_desired_items(
-                [conversation_list],
-                types=["output"],
-                sources=[BAGEL_FLOW_VELOCITY],
-                reverse_item=True,
-            ),
-            None,
-        )
+        item = get_tail_output_item(conversation_list, sources=[BAGEL_FLOW_VELOCITY])
         latent = unpatchify_latent_tokens(
             x_t,
             self._generation_state.grid_shape,

@@ -20,6 +20,7 @@ from veomni.models.seed_omni.modules.bagel.sources import (
     BAGEL_FLOW_QUERY,
     BAGEL_FLOW_VELOCITY,
     BAGEL_GENERATED_LATENT,
+    BAGEL_SIGLIP_CONTEXT,
     BAGEL_VAE_CONTEXT,
 )
 from veomni.models.seed_omni.utils.conversation import ConversationItem
@@ -83,7 +84,18 @@ def test_bagel_infer_edit_defaults_to_denoise_signal_smoke():
     ctx = model.generate(
         {
             "conversation_list": [
-                ConversationItem(type="image", value=Image.new("RGB", (1, 1)), role="user"),
+                ConversationItem(
+                    type="image",
+                    value=Image.new("RGB", (1, 1)),
+                    role="user",
+                    source=BAGEL_VAE_CONTEXT,
+                ),
+                ConversationItem(
+                    type="image",
+                    value=Image.new("RGB", (1, 1)),
+                    role="user",
+                    source=BAGEL_SIGLIP_CONTEXT,
+                ),
                 ConversationItem(type="text", value="prompt", role="user"),
             ]
         },
@@ -488,19 +500,9 @@ class _InferEditBagelVAE(_InferGenBagelVAE):
     def encode_context(self, conversation_list: list[ConversationItem] | None = None, **kwargs):
         del kwargs
         assert conversation_list is not None
-        for index, item in enumerate(conversation_list):
-            if item.type == "image" and item.role == "user":
-                conversation_list.insert(
-                    index,
-                    ConversationItem(
-                        type="output",
-                        value=torch.zeros(4, 4, 4),
-                        role="assistant",
-                        source=BAGEL_VAE_CONTEXT,
-                        meta={},
-                    ),
-                )
-                break
+        for item in conversation_list:
+            if item.type == "image" and item.source == BAGEL_VAE_CONTEXT:
+                item.value = torch.zeros(4, 4, 4)
         return {"conversation_list": conversation_list}
 
 
@@ -509,7 +511,7 @@ class _InferEditBagelFlow(_InferGenBagelFlow):
         del kwargs
         assert conversation_list is not None
         for item in conversation_list:
-            if item.type == "output" and torch.is_tensor(item.value) and item.value.dim() == 3:
+            if item.type == "image" and item.source == BAGEL_VAE_CONTEXT and torch.is_tensor(item.value):
                 item.value = torch.zeros(16, 8)
                 item.meta.clear()
         return {"conversation_list": conversation_list}
