@@ -73,6 +73,17 @@ def _check_extra_parallel_dim0_divisibility(model: "nn.Module", para_name: str, 
     return True
 
 
+def _collect_param_fqns_from_modules(
+    submods: List[Tuple[str, "nn.Module"]],
+) -> set:
+    """Return the set of parameter FQN strings covered by *submods* (relative to their parent)."""
+    covered: set = set()
+    for sub_name, sub_mod in submods:
+        for param_name, _ in sub_mod.named_parameters():
+            covered.add(f"{sub_name}.{param_name}")
+    return covered
+
+
 def parallelize_model_fsdp2(
     model: "nn.Module",
     weights_path: Optional[str] = None,
@@ -107,6 +118,21 @@ def parallelize_model_fsdp2(
     """
 
     parallel_state = get_parallel_state()
+
+    # ── DT-FSDP2: apply monkey-patches before any fully_shard call ──────
+    enable_dt_fsdp2 = kwargs.pop("enable_dt_fsdp2", False)
+    if enable_dt_fsdp2:
+        from veomni.distributed.dt_fsdp2 import (
+            apply_dt_fsdp2_patch,
+            discover_dtfsdp2_submodules,
+            fully_shard as _dt_fully_shard,
+        )
+
+        apply_dt_fsdp2_patch()
+        _fully_shard = _dt_fully_shard  # patched (hook_module-capable)
+        logger.info_rank0("DT-FSDP2 patch applied (per-sub-module fully_shard mode).")
+    else:
+        _fully_shard = fully_shard  # original (module-level import)
 
     model_no_split_modules = getattr(model, "_no_split_modules", None) or []
     target_classes = set(model_no_split_modules) | set(basic_modules or [])
@@ -269,7 +295,7 @@ def parallelize_model_fsdp2(
     #     | -- no more target module or extra parallel module
     #   | -- other module (e.g. attention, if provided)
     # e.g. Decoder Layer
-    # | -- layers that are sharded by fully_shard(decode_layer) (e.g., Attention)
+    # | -- layers that are sharded by _fully_shard(decode_layer) (e.g., Attention)
     # | -- experts layer (apply fully_shard separately in order to shard across EP groups on the same EP rank instead of sharding globally)
     # | -- layers (declared in model.modules_to_ignore_in_mixed_precision) that need to apply fully_shard separately due to different mp policy as the decoder layer
     #      (e.g., some models requires MoE TopK gate layer to have parameters in higher FP32 precision in forward).
@@ -298,7 +324,7 @@ def parallelize_model_fsdp2(
                 and not isinstance(extra_parallel_mod[para], FSDPModule)
             ):
                 # shard para module (e.g. expert/decoder.moe, embed_tokens/decoder.embed_tokens)
-                fully_shard(extra_parallel_mod[para], **extra_parallel_fsdp_kwargs[para])
+                _fully_shard(extra_parallel_mod[para], **extra_parallel_fsdp_kwargs[para])
                 # average para (e.g. ep) grads across para (e.g. ep) ranks
                 # NOTE: in torch 2.8 and later we should use
                 # experts_mod.set_gradient_divide_factor(parallel_state.ep_size)
@@ -317,7 +343,7 @@ def parallelize_model_fsdp2(
         if mp_ignored_classes:
             for sub_mod in layer_mod.modules():
                 if isinstance(sub_mod, mp_ignored_classes) and sub_mod is not layer_mod:
-                    fully_shard(sub_mod, **fsdp_kwargs_without_mp)
+                    _fully_shard(sub_mod, **fsdp_kwargs_without_mp)
                     layer_mod._fsdp_modules.append(sub_mod)
 
         # Shard everything else in the module:
@@ -327,8 +353,33 @@ def parallelize_model_fsdp2(
         #      is the parent of or equal to extra_parallel_mod[para] (e.g. ToyEmbed),
         #      no need to shard layer_mod again.
         if not isinstance(layer_mod, FSDPModule):
-            fully_shard(layer_mod, **fsdp_kwargs)
-            layer_mod._fsdp_modules.append(layer_mod)
+            if enable_dt_fsdp2:
+                # ── DT-FSDP2 path: split into per-sub-module fully_shard ──
+                submods = discover_dtfsdp2_submodules(layer_mod)
+                for sub_name, sub_mod in submods:
+                    if not isinstance(sub_mod, FSDPModule):
+                        _fully_shard(
+                            sub_mod,
+                            hook_module=layer_mod,
+                            **fsdp_kwargs,
+                        )
+                        layer_mod._fsdp_modules.append(sub_mod)
+
+                # Defensive: warn about any params not covered by named sub-modules
+                covered = _collect_param_fqns_from_modules(submods)
+                all_params = set(dict(layer_mod.named_parameters()).keys())
+                if uncovered := all_params - covered:
+                    logger.warning_rank0(
+                        f"DT-FSDP2: layer {layer_fqn} has parameters outside known "
+                        f"sub-modules: {sorted(uncovered)}. Wrapping the whole layer "
+                        f"as a fallback."
+                    )
+                    _fully_shard(layer_mod, **fsdp_kwargs)
+                    layer_mod._fsdp_modules.append(layer_mod)
+            else:
+                # ── Default path: single fully_shard for the whole layer ──
+                _fully_shard(layer_mod, **fsdp_kwargs)
+                layer_mod._fsdp_modules.append(layer_mod)
         logger.info_rank0(f"{layer_fqn=}, {layer_mod._fsdp_modules=}")
 
     # Shard root WITHOUT explicit `reshard_after_forward` so FSDP2's
@@ -341,11 +392,13 @@ def parallelize_model_fsdp2(
     # to a freed buffer. Decoder layers reshard normally (their calls
     # above pass `reshard_after_forward` explicitly).
     root_fsdp_kwargs = {k: v for k, v in fsdp_kwargs.items() if k != "reshard_after_forward"}
-    fully_shard(model, **root_fsdp_kwargs)
+    _fully_shard(model, **root_fsdp_kwargs)
 
     # configure manual prefetching when needed
     need_manual_prefetch = (
-        parallel_state.any_extra_parallel_enabled or mp_ignored_classes is not None
+        enable_dt_fsdp2  # DT-FSDP2 always needs manual prefetch for cross-layer control
+        or parallel_state.any_extra_parallel_enabled
+        or mp_ignored_classes is not None
     ) and kwargs.pop("enable_forward_prefetch", True)
     if need_manual_prefetch:
         blocks = [pair[1][0] for pair in layer_pairs_list]  # all target modules
@@ -353,8 +406,13 @@ def parallelize_model_fsdp2(
         for current_block, next_block in zip(blocks, next_blocks):
             if next_block is not None:
                 prefetch_modules = next_block._fsdp_modules
-                # prefetch in order of attn, gate, experts
-                current_block.set_modules_to_forward_prefetch(list(reversed(prefetch_modules)))
+                if enable_dt_fsdp2:
+                    # DT-FSDP2: _fsdp_modules is already in forward-execution order
+                    # (attn → mlp → norms), so forward prefetch keeps the natural order.
+                    current_block.set_modules_to_forward_prefetch(prefetch_modules)
+                else:
+                    # prefetch in order of attn, gate, experts (reversed order)
+                    current_block.set_modules_to_forward_prefetch(list(reversed(prefetch_modules)))
 
         # configure backward prefetch
         rev_blocks = list(reversed(blocks))
@@ -362,7 +420,11 @@ def parallelize_model_fsdp2(
         for current_block, prev_block in zip(rev_blocks, prev_blocks):
             if prev_block is not None:
                 prefetch_modules = prev_block._fsdp_modules
-                current_block.set_modules_to_backward_prefetch(list(reversed(prefetch_modules)))
+                if enable_dt_fsdp2:
+                    # DT-FSDP2: backward runs in reverse order, prefetch in reverse order
+                    current_block.set_modules_to_backward_prefetch(list(reversed(prefetch_modules)))
+                else:
+                    current_block.set_modules_to_backward_prefetch(list(reversed(prefetch_modules)))
 
     # Handle meta initialization for FSDP2 (fallback if pre-load not done)
     assert kwargs.get("init_device") == "meta", "Please use init_device: meta for FSDP2"
@@ -427,6 +489,7 @@ def build_parallelize_model(
     enable_gradient_checkpointing: bool = True,
     basic_modules: Optional[List[str]] = None,
     muon_expert_zero_comm: bool = False,
+    enable_dt_fsdp2: bool = False,
     **kwargs,
 ) -> "nn.Module":
     """Apply parallel strategies to the model.
@@ -434,6 +497,9 @@ def build_parallelize_model(
     Args:
         muon_expert_zero_comm: Shard ExtraParallel weights on dim-0 when the
             EP-local dim is divisible by ``ep_fsdp_size``.
+        enable_dt_fsdp2: If True, split each transformer layer's
+            ``fully_shard`` into per-sub-module (attn, mlp, …) calls to
+            reduce peak memory fragmentation.
     """
 
     parallel_state = get_parallel_state()
@@ -475,6 +541,7 @@ def build_parallelize_model(
                 mixed_precision=mixed_precision,
                 basic_modules=basic_modules,
                 muon_expert_zero_comm=muon_expert_zero_comm,
+                enable_dt_fsdp2=enable_dt_fsdp2,
                 **kwargs,
             )
         else:

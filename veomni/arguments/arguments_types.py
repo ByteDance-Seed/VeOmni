@@ -291,6 +291,18 @@ class FSDPConfig:
         default=True,
         metadata={"help": "Enable forward prefetch."},
     )
+    enable_dt_fsdp2: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Enable DT-FSDP2: splits each transformer layer's fully_shard "
+                "into per-sub-module (attn, mlp) fully_shard calls. Reduces peak "
+                "memory fragmentation for large MoE models by all-gathering only "
+                "the currently-needed sub-module's weights instead of the entire "
+                "layer. Requires fsdp_mode='fsdp2'."
+            )
+        },
+    )
     offload: bool = field(
         default=False,
         metadata={"help": "Enable CPU offload for FSDP2."},
