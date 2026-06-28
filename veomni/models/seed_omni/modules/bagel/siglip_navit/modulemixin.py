@@ -18,7 +18,7 @@ _OMNI_TOKEN_LEN = "bagel_siglip_navit_token_len"
 
 
 class BagelSiglipNavitCPUPreprocessor(CPUPreprocessor):
-    """Worker-side image patchify for BAGEL SigLIP NaViT training inputs."""
+    """Worker-side image patchify for BAGEL SigLIP NaViT context images."""
 
     def __init__(self, image_processor: Any, dtype: torch.dtype) -> None:
         self._image_processor = image_processor
@@ -31,9 +31,7 @@ class BagelSiglipNavitCPUPreprocessor(CPUPreprocessor):
         inference: bool = False,
         generation_kwargs: dict[str, Any] | None = None,
     ) -> None:
-        del generation_kwargs
-        if inference:
-            return
+        del inference, generation_kwargs
         image_items: list[ConversationItem] = []
         for item in iter_desired_items(conversation_list, types=["image"], sources=[BAGEL_SIGLIP_CONTEXT]):
             image_items.append(item)
@@ -83,12 +81,7 @@ class BagelSiglipNavitModuleMixin(ModuleMixin):
         if not image_items:
             return {"conversation_list": conversation_list}
 
-        inputs = self._image_processor(
-            images=[item.value for item in image_items],
-            return_tensors="pt",
-            device=self.device,
-            dtype=self.dtype,
-        )
+        inputs = self._inputs_from_preprocessed_items(image_items)
         outputs = self.forward(**inputs)
         token_lens = outputs.get("token_lens", inputs["token_lens"])
         self._scatter_image_embeds(image_items, outputs["image_embeds"], token_lens)

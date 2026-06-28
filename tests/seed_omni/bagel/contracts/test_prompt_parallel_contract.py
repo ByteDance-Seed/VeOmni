@@ -89,18 +89,20 @@ def _materialized_prompt() -> tuple[list[ConversationItem], ConversationItem, Co
     return sample, latent_item, text_item
 
 
-def test_bagel_edit_prompt_graph_exposes_vae_then_siglip_prompt_producers() -> None:
+def test_bagel_edit_prompt_graph_exposes_independent_prompt_producers() -> None:
     graph_config = yaml.safe_load((_BAGEL_CONFIG_DIR / "graph_infer_edit.yaml").read_text())["generation_graph"]
     prompt_body = graph_config["states"]["prompt_encode"]["body"]
 
     assert {"from": "bagel_text_encoder", "to": "bagel_qwen2_mot"} in prompt_body
-    assert {"from": "bagel_vae.encode_context", "to": "bagel_siglip_navit"} in prompt_body
-    assert {"from": "bagel_siglip_navit", "to": "bagel_flow_connector.embed_context_latents"} in prompt_body
+    assert {"from": "bagel_siglip_navit", "to": "bagel_qwen2_mot"} in prompt_body
+    assert {"from": "bagel_vae.encode_context", "to": "bagel_flow_connector.embed_context_latents"} in prompt_body
     assert {"from": "bagel_flow_connector.embed_context_latents", "to": "bagel_qwen2_mot"} in prompt_body
     assert all(edge["to"] != "bagel_text_encoder.encode_image_markers" for edge in prompt_body)
 
     forbidden_edges = {
+        ("bagel_vae.encode_context", "bagel_siglip_navit"),
         ("bagel_siglip_navit", "bagel_vae.encode_context"),
+        ("bagel_siglip_navit", "bagel_flow_connector.embed_context_latents"),
     }
     assert not forbidden_edges.intersection({(edge["from"], edge["to"]) for edge in prompt_body})
 

@@ -13,7 +13,7 @@ from .configuration import BagelVAEConfig
 
 
 class BagelVAECPUPreprocessor(CPUPreprocessor):
-    """Worker-side image normalize for BAGEL training VAE targets."""
+    """Worker-side image normalize for BAGEL VAE context/target images."""
 
     def __init__(self, image_processor: Any, dtype: torch.dtype) -> None:
         self._image_processor = image_processor
@@ -26,9 +26,7 @@ class BagelVAECPUPreprocessor(CPUPreprocessor):
         inference: bool = False,
         generation_kwargs: dict[str, Any] | None = None,
     ) -> None:
-        del generation_kwargs
-        if inference:
-            return
+        del inference, generation_kwargs
         image_items = []
         for item in iter_desired_items(conversation_list, types=["image"], sources=[BAGEL_VAE_CONTEXT]):
             if not is_dummy(item):
@@ -78,13 +76,10 @@ class BagelVAEModuleMixin(ModuleMixin):
         if not image_items:
             return {"conversation_list": conversation_list}
 
-        inputs = self._image_processor(
-            images=[item.value for item in image_items],
-            return_tensors="pt",
-            device=self.device,
-            dtype=self.dtype,
+        pixel_values = torch.stack([item.value for item in image_items], dim=0).to(
+            device=self.device, dtype=self.dtype, non_blocking=True
         )
-        outputs = self.encode(pixel_values=inputs["pixel_values"])
+        outputs = self.encode(pixel_values=pixel_values)
         for image_item, latent in zip(image_items, outputs["latents"], strict=True):
             image_item.value = latent.to(device=self.device, dtype=self.dtype)
             image_item.source = BAGEL_VAE_CONTEXT

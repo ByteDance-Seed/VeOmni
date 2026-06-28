@@ -340,9 +340,13 @@ def test_bagel_text_preprocessor_routes_inference_edit_prompt_context():
     assert sample[2].source == BAGEL_VAE_CONTEXT
     assert sample[5].source == BAGEL_SIGLIP_CONTEXT
     assert sample[8].source == BAGEL_VAE_CONTEXT
-    assert torch.equal(sample[2].value, user_image)
-    assert torch.equal(sample[5].value, user_image)
-    assert torch.equal(sample[8].value, assistant_image)
+    assert sample[2].value.shape == (3, 4, 4)
+    assert sample[2].value.dtype == torch.bfloat16
+    assert sample[5].value.shape == (4, 2 * 2 * 3)
+    assert sample[5].value.dtype == torch.bfloat16
+    assert sample[5].meta[BAGEL_SIGLIP_TOKEN_LEN] == 4
+    assert sample[8].value.shape == (3, 4, 4)
+    assert sample[8].value.dtype == torch.bfloat16
     assert [sample[i].source for i in [1, 3, 4, 6, 7, 9]] == [
         BAGEL_VAE_CONTEXT,
         BAGEL_VAE_CONTEXT,
