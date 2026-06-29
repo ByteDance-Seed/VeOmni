@@ -576,6 +576,7 @@ def init_parallel_state(
             # NOTE: Support HSDP for extra parallel. For example, world_size=1024
             # - dense param device_mesh: (dp_replicate, dp_shard_sp)=(4, 256)
             # - ep_size=8, expert parallel device_mesh: (ep_replicate, ep_fsdp, ep)=(4, 32, 8)
+            # Note that ep_size should be a factor of dp_shard_sp_size.
             param_mesh_shape, para_mesh_dim_names = [], []
             if dp_replicate_size > 1:
                 param_mesh_shape.append(dp_replicate_size)

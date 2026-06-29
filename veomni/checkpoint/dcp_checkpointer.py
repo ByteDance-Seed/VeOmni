@@ -379,11 +379,7 @@ def restore_extra_parallel_dim(
         dtensor = DTensor.from_local(orgin_tensor._local_tensor, device_mesh=fsdp_mesh, placements=placements)
     elif torch.is_tensor(orgin_tensor):
         # If there is no FSDP but only ExtraParallel
-        if extra_parallel_fsdp_mesh.ndim == 2:
-            placements = [Replicate(), Shard(fsdp_shard_dim)]
-        else:
-            placements = [Shard(fsdp_shard_dim)]
-        dtensor = DTensor.from_local(orgin_tensor, device_mesh=extra_parallel_fsdp_mesh, placements=placements)
+        dtensor = DTensor.from_local(orgin_tensor, device_mesh=extra_parallel_fsdp_mesh, placements=[Shard(0)])
     else:
         raise RuntimeError(f"origin_tensor - {orgin_tensor} is not a tensor!")
 
