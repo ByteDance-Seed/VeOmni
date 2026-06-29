@@ -434,7 +434,7 @@ class OmniModel(nn.Module):
         ctx: Dict[str, Any] = request
         self._generated.clear()
 
-        modules = {name: _unwrap_module(getattr(self, name)) for name in self._module_names}
+        modules = {name: getattr(self, name) for name in self._module_names}
 
         # Progress trail.  ``maybe_transition`` flips the FSM's current state
         # at the END of each iteration body, so emitting at the START of the
