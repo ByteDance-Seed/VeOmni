@@ -34,6 +34,17 @@ def _deepseek_v4_experts_reference(
     return output
 
 
+def test_deepseek_v4_test_overrides_keep_eager_attention_and_expected_moe():
+    from tests.tools.training_utils import resolve_ops_overrides
+    from veomni.utils.import_utils import is_torch_npu_available
+
+    overrides = resolve_ops_overrides("deepseek_v4")
+
+    expected_moe = "eager" if is_torch_npu_available() else "fused_triton"
+    assert "--model.ops_implementation.attn_implementation=eager" in overrides
+    assert f"--model.ops_implementation.moe_implementation={expected_moe}" in overrides
+
+
 def test_deepseek_v4_fused_moe_receives_merged_weights_and_swiglu_limit(monkeypatch):
     config = SimpleNamespace(
         num_local_experts=3,
