@@ -12,7 +12,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributed.tensor import DTensor
-from transformers import PreTrainedModel
+from transformers import PreTrainedModel, PreTrainedTokenizerBase
 
 from ......distributed.parallel_state import get_parallel_state
 from ......ops.kernels.embed import AllToAllEmbedding, VocabParallelLinear
@@ -37,7 +37,7 @@ class TextEncoder(TextEncoderModuleMixin, TextEncoderTraceMixin, PreTrainedModel
             self.lm_head = None
         else:
             self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=config.lm_head_bias)
-        self._tokenizer: Optional[Any] = None
+        self._tokenizer: Optional[PreTrainedTokenizerBase] = None
         self.post_init()
 
     # ── Embedding accessors ────────────────────────────────────────────────────

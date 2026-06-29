@@ -1,0 +1,20 @@
+# BAGEL-7B-MoT inference - understanding to text (text/image -> text).
+generation_graph:
+  initial: prompt_encode
+
+  states:
+    prompt_encode:
+      body:
+        - { from: bagel_text_encoder, to: bagel_qwen2_mot }
+        - { from: bagel_siglip_navit, to: bagel_qwen2_mot }
+        - { from: bagel_qwen2_mot,    to: end }
+      transitions:
+        - { condition: { type: module_signal, key: text_done }, next_state: done }
+        - { condition: { type: default }, next_state: text_ar }
+
+    text_ar:
+      body:
+        - { from: bagel_qwen2_mot,    to: bagel_text_encoder }
+        - { from: bagel_text_encoder, to: end }
+      transitions:
+        - { condition: { type: module_signal, key: text_done }, next_state: done }

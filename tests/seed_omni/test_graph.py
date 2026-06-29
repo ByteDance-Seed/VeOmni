@@ -432,3 +432,23 @@ def test_to_mermaid_always_draws_data_pseudo_node():
     assert "data -.-> vision_encoder_forward" in out
     assert "losses" not in out
     assert "end_sink" in out
+
+
+def test_generation_graph_mermaid_stacks_state_body_nodes():
+    g = GenerationGraph(
+        {
+            "initial": "prompt",
+            "states": {
+                "prompt": {
+                    "body": [{"from": "encoder.encode", "to": "decoder.decode"}],
+                    "transitions": [{"condition": {"type": "default"}, "next_state": "done"}],
+                }
+            },
+        }
+    )
+
+    out = g.to_mermaid(title="Compact FSM")
+
+    assert "flowchart LR" in out
+    assert "subgraph state_prompt [prompt]\n        direction TB" in out
+    assert "prompt__encoder_encode --> prompt__decoder_decode" in out

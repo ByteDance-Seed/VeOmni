@@ -135,6 +135,11 @@ def test_mixin_registry_contains_all_v2_modules():
         "janus_text_encoder",
         "qwen3_llm",
         "qwen3_text_encoder",
+        "bagel_text_encoder",
+        "bagel_siglip_navit",
+        "bagel_qwen2_mot",
+        "bagel_flow_connector",
+        "bagel_vae",
     }
     assert expected.issubset(set(OMNI_MODEL_REGISTRY.valid_keys()))
     assert _model_cls("text_encoder").__name__ == "TextEncoder"
@@ -144,11 +149,21 @@ def test_mixin_registry_contains_all_v2_modules():
     assert _model_cls("janus_text_encoder").__name__ == "JanusTextEncoder"
     assert _model_cls("qwen3_llm").__name__ == "Qwen3Llm"
     assert _model_cls("qwen3_text_encoder").__name__ == "Qwen3TextEncoder"
+    assert _model_cls("bagel_text_encoder").__name__ == "BagelTextEncoder"
+    assert _model_cls("bagel_siglip_navit").__name__ == "BagelSiglipNavit"
+    assert _model_cls("bagel_qwen2_mot").__name__ == "BagelQwen2MoT"
+    assert _model_cls("bagel_flow_connector").__name__ == "BagelFlowConnector"
+    assert _model_cls("bagel_vae").__name__ == "BagelVAE"
 
 
 def test_processor_registry_only_for_vision_modules():
     """janus_llama / text_encoder have no per-module asset."""
-    assert set(OMNI_PROCESSOR_REGISTRY.valid_keys()) == {"janus_siglip", "janus_vqvae", "qwen3vl_vision"}
+    assert set(OMNI_PROCESSOR_REGISTRY.valid_keys()) == {
+        "bagel_siglip_navit",
+        "janus_siglip",
+        "janus_vqvae",
+        "qwen3vl_vision",
+    }
 
 
 def test_all_registered_classes_are_module_mixins():

@@ -151,6 +151,19 @@ class OmniInferencer(OmniTrainer):
 
     # ── Inference entry point ─────────────────────────────────────────────────
 
+    def _runtime_generation_kwargs(self) -> dict[str, Any]:
+        """Return per-request generation kwargs with the resolved V2 scenario attached."""
+        infer_args = self.args.infer
+        generation_kwargs = dict(infer_args.generation_kwargs)
+        requested_infer_type = generation_kwargs.get("infer_type")
+        if requested_infer_type is not None and requested_infer_type != infer_args.infer_type:
+            raise ValueError(
+                "`infer.generation_kwargs.infer_type` conflicts with `infer.infer_type`: "
+                f"{requested_infer_type!r} != {infer_args.infer_type!r}."
+            )
+        generation_kwargs["infer_type"] = infer_args.infer_type
+        return generation_kwargs
+
     def generate(self) -> dict[str, Any]:
         """Run one inference request end-to-end (FSM + save outputs)."""
         infer_args = self.args.infer
@@ -158,7 +171,7 @@ class OmniInferencer(OmniTrainer):
         request = InferenceRequest(
             prompt=infer_args.prompt,
             images=[load_image(infer_args.image)] if infer_args.image else [],
-            generation_kwargs=infer_args.generation_kwargs,
+            generation_kwargs=self._runtime_generation_kwargs(),
         )
         ctx = self._run(request)
         self.finalize(ctx, output_dir=infer_args.output_dir)
