@@ -193,16 +193,13 @@ class Qwen3VLLlmModuleMixin(ModuleMixin):
         **kwargs: Any,
     ) -> Dict[str, Any]:
         del kwargs
-        # NOTE: every forward below is invoked via ``self(...)`` (``__call__``),
-        # not ``self.forward(...)``. Under FSDP2 inference the root pre-forward
-        # hook must fire (lazy_init + unshard of root-owned params); calling
-        # ``.forward`` directly skips it and the sharded DTensor params crash
-        # with "FSDPCommContext has no all_gather_copy_in_stream" / mixed
-        # Tensor and DTensor.
+        # GenerationGraph invokes this endpoint through ``self.__call__`` so
+        # FSDP/DDP hooks have already fired; its dispatch trampoline restores
+        # the real ``forward`` while this endpoint runs.
         if self._past_key_values is None:
             packed = self._pack_conversations_for_forward([conversation_list])
             position_ids = packed["position_ids"]
-            outputs = self(
+            outputs = self.forward(
                 inputs_embeds=packed["inputs_embeds"],
                 attention_mask=None,
                 position_ids=position_ids,
@@ -230,7 +227,7 @@ class Qwen3VLLlmModuleMixin(ModuleMixin):
         assert tail_part.type == "output"
         inputs_embeds = tail_part.value[-1:].to(self.device).unsqueeze(0)
         position_ids = torch.full((3, 1, 1), self._next_position, dtype=torch.long, device=self.device)
-        outputs = self(
+        outputs = self.forward(
             inputs_embeds=inputs_embeds,
             attention_mask=None,
             position_ids=position_ids,

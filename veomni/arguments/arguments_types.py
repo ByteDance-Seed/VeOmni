@@ -14,7 +14,7 @@
 
 import math
 import os
-from dataclasses import dataclass, field
+from dataclasses import MISSING, dataclass, field, fields
 from pathlib import Path
 from typing import Dict, List, Literal, Optional
 
@@ -732,6 +732,16 @@ _NPU_REQUIRED: Dict[str, frozenset] = {
     "moe_implementation": frozenset({"fused_npu"}),
 }
 
+_NPU_DEFAULT_FALLBACK: Dict[str, str] = {
+    "rms_norm_implementation": "npu",
+    "rotary_pos_emb_implementation": "npu",
+    "rotary_pos_emb_vision_implementation": "npu",
+    "swiglu_mlp_implementation": "eager",
+    "load_balancing_loss_implementation": "eager",
+    "cross_entropy_loss_implementation": "npu",
+    "moe_implementation": "fused_npu",
+}
+
 
 @dataclass
 class OpsImplementationConfig:
@@ -891,7 +901,32 @@ class OpsImplementationConfig:
             )
             self.moe_implementation = resolved
 
+        self._apply_npu_default_fallback()
         self._validate_implementations()
+
+    def _apply_npu_default_fallback(self):
+        """Auto-resolve GPU-only defaults to NPU-compatible alternatives.
+
+        When running on NPU, fields still at their GPU default are silently
+        swapped to the NPU fallback from ``_NPU_DEFAULT_FALLBACK``. Explicit
+        user overrides (non-default values) are left untouched and will be
+        caught by ``_validate_implementations`` if unsupported.
+        """
+        from ..utils.import_utils import is_torch_npu_available
+
+        if not is_torch_npu_available():
+            return
+
+        gpu_defaults = {f.name: f.default for f in fields(self) if f.default is not MISSING}
+        for field_name, npu_value in _NPU_DEFAULT_FALLBACK.items():
+            if field_name not in gpu_defaults:
+                continue
+            current = getattr(self, field_name)
+            if current == gpu_defaults[field_name]:
+                setattr(self, field_name, npu_value)
+                logger.info_rank0(
+                    f"{field_name}: auto-resolved GPU default {current!r} -> {npu_value!r} on Ascend NPU."
+                )
 
     def _validate_implementations(self):
         """Fail fast on hardware/op mismatch at config-parse time.

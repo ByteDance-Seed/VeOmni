@@ -10,6 +10,7 @@ from veomni.models.seed_omni import EdgeDef, NodeDef
 from veomni.models.seed_omni.graphs.generation_graph import GenerationGraph
 from veomni.models.seed_omni.graphs.graph import END
 from veomni.models.seed_omni.graphs.training_graph import TrainingGraph
+from veomni.models.seed_omni.mixins.modulemixin import ModuleMixin
 
 
 # ── NodeDef parsing ───────────────────────────────────────────────────────────
@@ -190,7 +191,7 @@ def test_module_lookup_raises_for_unknown():
 # ── Execution lifecycle (cursor + step + maybe_transition) ────────────────────
 
 
-class _FakeOmniModule:
+class _FakeOmniModule(ModuleMixin):
     """Minimal stand-in for an OmniModule: callable (→ forward) + pre/post hooks.
 
     ``__call__`` delegates to ``self.forward`` so the non-``forward`` alias trick
@@ -218,6 +219,16 @@ class _FakeOmniModule:
         cl = list(kwargs.get("conversation_list", []))
         cl.append(f"{self.name}.encode")
         return {"conversation_list": cl}
+
+    def generate(self, **kwargs):
+        cl = list(kwargs.get("conversation_list", []))
+        cl.append(f"{self.name}.generate")
+        return {"conversation_list": cl}
+
+    def generate_via_forward(self, **kwargs):
+        out = self.forward(**kwargs)
+        out["conversation_list"].append(f"{self.name}.generate_via_forward")
+        return out
 
 
 def _fake_modules(g: TrainingGraph) -> dict:
@@ -281,6 +292,66 @@ def test_step_unwraps_ddp_style_wrapper():
     inner = _FakeOmniModule("run_ar")
     batch = g.step({"run_ar": _DDPWrap(inner)}, {"conversation_list": []})
     assert batch["conversation_list"] == ["run_ar.forward"]
+
+
+class _TrackingWrapper:
+    def __init__(self, inner):
+        self.module = inner
+        self.calls = 0
+
+    def __call__(self, **kwargs):
+        self.calls += 1
+        return self.module.forward(**kwargs)
+
+
+def _one_step_generation_graph(endpoint: str) -> GenerationGraph:
+    return GenerationGraph(
+        {
+            "initial": "run",
+            "states": {
+                "run": {
+                    "body": [{"from": endpoint, "to": "end"}],
+                    "transitions": [{"condition": {"type": "default"}, "next_state": "done"}],
+                }
+            },
+        }
+    )
+
+
+def test_generation_step_dispatches_bare_generate_via_wrapper_call():
+    g = _one_step_generation_graph("run_ar")
+    inner = _FakeOmniModule("run_ar")
+    wrapped = _TrackingWrapper(inner)
+
+    ctx = g.step({"run_ar": wrapped}, {"conversation_list": []})
+
+    assert wrapped.calls == 1
+    assert ctx["conversation_list"] == ["run_ar.generate"]
+    assert inner.forward.__name__ == "forward"
+
+
+def test_generation_step_dispatches_dotted_method_via_wrapper_call():
+    g = _one_step_generation_graph("run_ar.encode")
+    inner = _FakeOmniModule("run_ar")
+    wrapped = _TrackingWrapper(inner)
+
+    ctx = g.step({"run_ar": wrapped}, {"conversation_list": []})
+
+    assert wrapped.calls == 1
+    assert ctx["conversation_list"] == ["run_ar.encode"]
+    assert inner.forward.__name__ == "forward"
+
+
+def test_generation_endpoint_can_call_original_forward_without_recursing():
+    g = _one_step_generation_graph("run_ar.generate_via_forward")
+    inner = _FakeOmniModule("run_ar")
+    wrapped = _TrackingWrapper(inner)
+
+    ctx = g.step({"run_ar": wrapped}, {"conversation_list": []})
+
+    assert wrapped.calls == 1
+    assert ctx["conversation_list"] == ["run_ar.forward", "run_ar.generate_via_forward"]
+    assert inner.forward.__name__ == "forward"
 
 
 def test_step_applies_module_scope():

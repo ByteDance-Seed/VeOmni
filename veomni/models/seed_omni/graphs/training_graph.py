@@ -62,6 +62,7 @@ from collections import defaultdict, deque
 from contextlib import nullcontext
 from typing import Any, Callable, ContextManager, Dict, List, Optional
 
+from .dispatch import call_graph_endpoint, unwrap_graph_module
 from .graph import EdgeDef, NodeDef, is_end
 
 
@@ -212,16 +213,13 @@ class TrainingGraph:
         Like the FSM step, this is self-contained: it resolves the module, scopes
         its :class:`ParallelState` (via ``scope_fn`` — vocab-parallel ``emb`` /
         MoE EP groups), runs ``pre_forward`` → method → ``post_forward``, and
-        feeds the optional per-module trace meter. The one training-specific bit
-        the FSM lacks is the **wrapper call**: inference invokes raw module
-        methods directly (modules self-unshard via internal ``self(...)`` and
-        there is no backward), whereas training must call the **wrapped** module
-        (``modules[name]`` is the DDP / FSDP2 unit) so the all-gather pre-hook and
-        the reduce-scatter backward hook fire. Non-``forward`` node methods are
-        dispatched by temporarily pointing ``raw.forward`` at the target method so
-        they still run through ``__call__``. ``raw`` (the unwrapped
-        :class:`ModuleMixin`) owns the hooks; FSDP2 is in-place (``raw is
-        wrapped``) while DDP wraps (``raw = wrapped.module``).
+        feeds the optional per-module trace meter. Training and inference both
+        call the graph endpoint through the **wrapped** module so DDP/FSDP hooks
+        fire. Non-``forward`` node methods are dispatched by temporarily
+        pointing ``raw.forward`` at the target method so they still run through
+        ``__call__``. ``raw`` (the unwrapped :class:`ModuleMixin`) owns the
+        hooks; FSDP2 is in-place (``raw is wrapped``) while DDP wraps
+        (``raw = wrapped.module``).
 
         Edges are pure topology — no per-node input routing. Every node receives
         the same shared ``batch``; cross-node state flows through the single
@@ -242,9 +240,7 @@ class TrainingGraph:
                 f"TrainingGraph.step: module '{node.module}' (node '{node_name}') missing "
                 f"from modules dict. Provided: {sorted(modules)}."
             )
-        # Duck-typed unwrap (keeps this module import-light, like the FSM): the
-        # raw OmniModule exposes ``pre_forward``; a DDP wrapper does not proxy it.
-        raw = wrapped if hasattr(wrapped, "pre_forward") else wrapped.module
+        raw = unwrap_graph_module(wrapped, module_name=node.module)
 
         module_context = scope_fn(node.module) if scope_fn is not None else nullcontext()
         with module_context:
@@ -255,19 +251,7 @@ class TrainingGraph:
             if hasattr(raw, "trace_add"):
                 raw.trace_add(method, kwargs)
 
-            if method == "forward":
-                out = wrapped(**kwargs)
-            else:
-                fn = getattr(raw, method, None)
-                if fn is None:
-                    raise AttributeError(f"Node method {type(raw).__name__}.{method}() is not implemented.")
-                orig_forward = raw.forward
-                try:
-                    raw.forward = fn
-                    out = wrapped(**kwargs)
-                finally:
-                    raw.forward = orig_forward
-
+            out = call_graph_endpoint(wrapped, raw, method=method, kwargs=kwargs)
             out = raw.post_forward(method=method, **out)
 
         batch.update(out)

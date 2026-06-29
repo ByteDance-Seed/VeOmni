@@ -42,7 +42,6 @@ from __future__ import annotations
 
 import re
 from collections import defaultdict
-from typing import Dict, List, Optional, Tuple
 
 import torch
 
@@ -79,14 +78,14 @@ class DeepseekV4CheckpointTensorConverter:
     def __init__(self, num_experts: int):
         self.num_experts = num_experts
         # {(prefix, proj_name): {expert_id: tensor}}
-        self._expert_buffer: Dict[Tuple[str, str], Dict[int, torch.Tensor]] = {}
+        self._expert_buffer: dict[tuple[str, str], dict[int, torch.Tensor]] = {}
         # {prefix: {proj_name: stacked_tensor}} for gate/up merge waiting
-        self._stacked_buffer: Dict[str, Dict[str, torch.Tensor]] = {}
+        self._stacked_buffer: dict[str, dict[str, torch.Tensor]] = {}
 
     def can_handle(self, name: str) -> bool:
         return bool(_EXPERT_PATTERN.match(name))
 
-    def convert(self, name: str, tensor: "torch.Tensor") -> Optional[ConvertedCheckpointTensor]:
+    def convert(self, name: str, tensor: torch.Tensor) -> ConvertedCheckpointTensor | None:
         match = _EXPERT_PATTERN.match(name)
         if not match:
             return None
@@ -125,14 +124,14 @@ class DeepseekV4CheckpointTensorConverter:
 
         return None
 
-    def finalize(self) -> List[ConvertedCheckpointTensor]:
+    def finalize(self) -> list[ConvertedCheckpointTensor]:
         """Validate that all buffers were flushed.
 
         Raises RuntimeError if any buffers remain unflushed, since incomplete
         expert tensors cannot be merged into valid fused format and indicate
         a corrupted or incomplete checkpoint.
         """
-        errors: List[str] = []
+        errors: list[str] = []
         if self._expert_buffer:
             unflushed = {k: len(v) for k, v in self._expert_buffer.items()}
             errors.append(
@@ -153,11 +152,11 @@ def create_deepseek_v4_checkpoint_tensor_converter(model):
     )
 
 
-def convert_deepseek_v4_fqn_to_index_mapping(fqn_to_index_mapping: Dict[str, int]) -> Dict[str, int]:
+def convert_deepseek_v4_fqn_to_index_mapping(fqn_to_index_mapping: dict[str, int]) -> dict[str, int]:
     """Align HF safetensors index keys with fused expert parameter names."""
-    gate_up_shard_indices: Dict[str, List[int]] = defaultdict(list)
-    down_shard_indices: Dict[str, List[int]] = defaultdict(list)
-    converted: Dict[str, int] = {}
+    gate_up_shard_indices: dict[str, list[int]] = defaultdict(list)
+    down_shard_indices: dict[str, list[int]] = defaultdict(list)
+    converted: dict[str, int] = {}
 
     for fqn, shard_idx in fqn_to_index_mapping.items():
         match = _EXPERT_PATTERN.match(fqn)

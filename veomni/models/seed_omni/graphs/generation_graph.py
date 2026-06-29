@@ -47,7 +47,9 @@ Method dispatch
 ---------------
 A bare endpoint (``module`` with no ``.method``) defaults to ``generate`` in the
 FSM view.  A dotted endpoint (``module.method`` — e.g. ``encode``, ``decode``,
-``emit_image_start``) is taken verbatim.
+``emit_image_start``) is taken verbatim.  Every endpoint method is executed via
+the module's ``__call__`` path: non-``forward`` methods are temporarily installed
+as ``forward`` so DDP/FSDP pre/post-forward hooks still run.
 
   transitions
       Ordered list of ``{condition: ..., next_state: S}`` items checked after
@@ -105,6 +107,7 @@ from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any, Callable, ContextManager, Dict, List, Optional
 
+from .dispatch import call_graph_endpoint, unwrap_graph_module
 from .graph import (
     EdgeDef,
     NodeDef,
@@ -418,23 +421,26 @@ class GenerationGraph:
                     f"appearance as a source."
                 )
             node = self._node_pool[node_name]
-            module = modules.get(node.module)
-            if module is None:
+            wrapped = modules.get(node.module)
+            if wrapped is None:
                 raise KeyError(
                     f"FSM step: module '{node.module}' (node '{node_name}') missing "
                     f"from modules dict. Provided: {sorted(modules)}."
                 )
             method_name = node.method
-            method_fn: Optional[Callable] = getattr(module, method_name, None)
-            if method_fn is None:
-                raise AttributeError(f"FSM node '{node_name}': {type(module).__name__} has no method '{method_name}'.")
+            raw = unwrap_graph_module(wrapped, module_name=node.module)
             if trace is not None:
                 trace.append(f"[State|{state.name}] {node_name}: {node.module}.{method_name}")
             # Optional per-module scope (e.g. make this module's ParallelState
             # current so Extra Parallel groups resolve correctly).
             module_context = scope_fn(node.module) if scope_fn is not None else nullcontext()
             with module_context:
-                out = method_fn(**ctx, generation_kwargs=generation_kwargs)
+                out = call_graph_endpoint(
+                    wrapped,
+                    raw,
+                    method=method_name,
+                    kwargs={**ctx, "generation_kwargs": generation_kwargs},
+                )
             if not isinstance(out, dict):
                 raise TypeError(f"FSM node '{node_name}'.{method_name} must return a dict; got {type(out).__name__}.")
             ctx.update(out)
