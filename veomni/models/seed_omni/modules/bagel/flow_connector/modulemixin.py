@@ -160,7 +160,7 @@ class BagelFlowConnectorModuleMixin(ModuleMixin):
             )
 
         outputs = self.decode_velocity(hidden_states=hidden)
-        velocity = self._generation_state.strip_query_markers(outputs["velocity"])
+        velocity = outputs["velocity"]
         item.type = "output"
         item.role = "assistant"
         item.source = BAGEL_FLOW_VELOCITY

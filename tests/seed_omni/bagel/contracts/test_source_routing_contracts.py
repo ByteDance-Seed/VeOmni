@@ -54,14 +54,35 @@ def test_bagel_denoise_item_source_lifecycle() -> None:
     item.value = torch.ones(3, 4)
     model.decode_velocity_from_hidden(conversation_list=conversation)
     assert item.source == BAGEL_FLOW_VELOCITY
-    assert item.value.shape == (1, 1)
+    assert item.value.shape == (3, 1)
     assert item.meta.keys() == {"timestep"}
 
+    item.value = item.value[1:-1]
     out = model.advance_denoise(conversation_list=conversation)
     assert out[FSM_SIGNAL_KEY] == SIGNAL_IMAGE_COMPLETE
     assert item.source == BAGEL_GENERATED_LATENT
     assert item.value.shape == (1, 1, 1)
     assert item.meta == {}
+
+
+def test_bagel_flow_decode_velocity_preserves_marker_wrapped_branch_rows() -> None:
+    model = _tiny_flow_connector()
+    model.decode_velocity = lambda hidden_states, **kwargs: {  # type: ignore[method-assign]
+        "velocity": torch.arange(hidden_states.shape[0], device=model.device, dtype=model.dtype).reshape(-1, 1)
+    }
+    item = ConversationItem(
+        type="output",
+        value=torch.ones(12, int(model.config.hidden_size)),
+        role="assistant",
+        source=BAGEL_FLOW_HIDDEN,
+        meta={"timestep": torch.tensor(0.5)},
+    )
+
+    model.decode_velocity_from_hidden(conversation_list=[item])
+
+    assert item.source == BAGEL_FLOW_VELOCITY
+    assert item.value.shape == (12, 1)
+    assert item.value[:, 0].tolist() == list(range(12))
 
 
 def test_bagel_qwen2_mot_generate_does_not_validate_denoise_cfg() -> None:

@@ -28,7 +28,6 @@ generation_graph:
         - { from: bagel_qwen2_mot.collect_velocity,                 to: bagel_flow_connector.advance_denoise }
         - { from: bagel_flow_connector.advance_denoise,             to: end }
       transitions:
-        - { condition: { type: module_signal, key: need_denoise_branch }, next_state: query_denoise }
         - { condition: { type: module_signal, key: image_complete }, next_state: image_decode }
         - { condition: { type: default }, next_state: query_denoise }
 

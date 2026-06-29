@@ -128,15 +128,6 @@ class FlowGenerationState:
         timesteps = self.timestep_values
         return self._step_index >= int(timesteps.numel())
 
-    def strip_query_markers(self, hidden: torch.Tensor) -> torch.Tensor:
-        if self._token_count and int(hidden.shape[0]) == self._token_count + 2:
-            hidden = hidden[1:-1]
-        if self._token_count and int(hidden.shape[0]) != self._token_count:
-            raise ValueError(
-                f"BAGEL flow decode_velocity token count mismatch: got {hidden.shape[0]}, expected {self._token_count}."
-            )
-        return hidden
-
     def advance(self, velocity: torch.Tensor) -> bool:
         x_t = self.latents
         dts = self.dt_values

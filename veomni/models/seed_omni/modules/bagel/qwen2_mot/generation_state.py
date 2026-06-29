@@ -166,16 +166,18 @@ class MotCacheContext:
 @dataclass
 class MotGenerationState:
     _infer_mode: str = "und"
-    _active_denoise_branch: str = "main"
     _velocity_buffer: dict[str, torch.Tensor] = field(default_factory=dict)
+    _pending_denoise_branches: tuple[str, ...] | None = None
+    _pending_denoise_query_len: int | None = None
     _main: MotCacheContext = field(default_factory=lambda: MotCacheContext("main"))
     _cfg_text: MotCacheContext = field(default_factory=lambda: MotCacheContext("text CFG"))
     _cfg_img: MotCacheContext = field(default_factory=lambda: MotCacheContext("image CFG"))
 
     def reset(self) -> None:
         self._infer_mode = "und"
-        self._active_denoise_branch = "main"
         self._velocity_buffer.clear()
+        self._pending_denoise_branches = None
+        self._pending_denoise_query_len = None
         self._main.reset()
         self._cfg_text.reset()
         self._cfg_img.reset()
@@ -209,10 +211,6 @@ class MotGenerationState:
     def cfg_img(self) -> MotCacheContext:
         return self._cfg_img
 
-    @property
-    def active_denoise_cache(self) -> MotCacheContext:
-        return self._cache_for_branch(self._active_denoise_branch)
-
     def _cache_for_branch(self, branch: str) -> MotCacheContext:
         if branch == "main":
             return self._main
@@ -238,11 +236,116 @@ class MotGenerationState:
 
     # ── Denoise velocity round ──────────────────────────────────
 
-    @property
-    def active_denoise_branch(self) -> str:
-        return self._active_denoise_branch
+    def preprocess_parallel_denoise_inputs(
+        self,
+        query: torch.Tensor,
+        generation_kwargs: dict[str, object],
+        *,
+        timestep: object,
+        empty_cache_factory: Callable[[], Any],
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> dict[str, Any]:
+        query = query.to(device=device, dtype=dtype)
+        query_len = int(query.shape[0])
+        if query_len < 3:
+            raise ValueError("BAGEL Qwen2-MoT denoise query must include start/end marker embeddings.")
 
-    def denoise_branches_for_timestep(self, generation_kwargs: dict[str, object], timestep: object) -> tuple[str, ...]:
+        branches = self._denoise_branches_for_timestep(generation_kwargs, timestep)
+        contexts = [self._cache_for_branch(branch) for branch in branches]
+        for context in contexts:
+            context.require_ready()
+
+        query_lens = torch.full((len(branches),), query_len, device=device, dtype=torch.int32)
+        key_values_lens = torch.tensor([context.cache_len() for context in contexts], device=device, dtype=torch.int32)
+        packed_query_sequence = torch.cat([query] * len(branches), dim=0)
+        packed_query_position_ids = torch.cat(
+            [context.repeated_position_ids(query_len, device=device) for context in contexts],
+            dim=0,
+        )
+
+        query_indexes: list[torch.Tensor] = []
+        key_value_indexes: list[torch.Tensor] = []
+        text_indexes: list[torch.Tensor] = []
+        vae_token_indexes: list[torch.Tensor] = []
+        attention_offset = 0
+        query_offset = 0
+        for key_values_len in key_values_lens.tolist():
+            key_values_len = int(key_values_len)
+            key_value_indexes.append(
+                torch.arange(attention_offset, attention_offset + key_values_len, device=device, dtype=torch.long)
+            )
+            query_indexes.append(
+                torch.arange(
+                    attention_offset + key_values_len,
+                    attention_offset + key_values_len + query_len,
+                    device=device,
+                    dtype=torch.long,
+                )
+            )
+            text_indexes.append(torch.tensor([query_offset, query_offset + query_len - 1], device=device))
+            vae_token_indexes.append(
+                torch.arange(query_offset + 1, query_offset + query_len - 1, device=device, dtype=torch.long)
+            )
+            attention_offset += key_values_len + query_len
+            query_offset += query_len
+
+        self._pending_denoise_branches = branches
+        self._pending_denoise_query_len = query_len
+        return {
+            "packed_query_sequence": packed_query_sequence,
+            "query_lens": query_lens,
+            "key_values_lens": key_values_lens,
+            "packed_query_position_ids": packed_query_position_ids,
+            "packed_query_indexes": torch.cat(query_indexes, dim=0),
+            "packed_key_value_indexes": (
+                torch.cat(key_value_indexes, dim=0)
+                if key_value_indexes
+                else torch.empty(0, device=device, dtype=torch.long)
+            ),
+            "packed_text_indexes": torch.cat(text_indexes, dim=0),
+            "packed_vae_token_indexes": torch.cat(vae_token_indexes, dim=0),
+            "past_key_values": self._merged_branch_cache(contexts, key_values_lens, empty_cache_factory),
+        }
+
+    def collect_velocity(
+        self,
+        velocity: torch.Tensor,
+        generation_kwargs: dict[str, object],
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        branches = self._pending_denoise_branches
+        query_len = self._pending_denoise_query_len
+        if branches is None or query_len is None:
+            raise RuntimeError("BAGEL MoT velocity collection requires a pending denoise branch layout.")
+        expected_rows = len(branches) * query_len
+        if int(velocity.shape[0]) != expected_rows:
+            raise ValueError(
+                f"BAGEL MoT velocity collection expected {expected_rows} stacked rows, got {velocity.shape[0]}."
+            )
+
+        self._velocity_buffer.clear()
+        offset = 0
+        for branch in branches:
+            branch_velocity = velocity[offset : offset + query_len].to(device=device, dtype=dtype)
+            self._velocity_buffer[branch] = self._strip_denoise_query_markers(branch_velocity)
+            offset += query_len
+
+        merged_velocity = (
+            self._merged_velocity_without_cfg(device=device)
+            if "cfg_text" not in self._velocity_buffer
+            else self._merged_velocity_with_cfg(generation_kwargs, device=device)
+        )
+        self._velocity_buffer.clear()
+        self._pending_denoise_branches = None
+        self._pending_denoise_query_len = None
+        return merged_velocity
+
+    def _denoise_branches_for_timestep(
+        self, generation_kwargs: dict[str, object], timestep: object
+    ) -> tuple[str, ...]:
         branches = ["main"]
         if self._cfg_text_active(generation_kwargs, timestep):
             branches.append("cfg_text")
@@ -250,42 +353,37 @@ class MotGenerationState:
             branches.append("cfg_img")
         return tuple(branches)
 
-    def collect_velocity(
-        self,
-        velocity: torch.Tensor,
-        branches: tuple[str, ...],
-        *,
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> str:
-        if len(branches) == 1:
-            self._velocity_buffer.clear()
-            self._active_denoise_branch = "main"
-            return "ready"
-        if self._active_denoise_branch not in branches:
-            raise RuntimeError(f"Unsupported BAGEL denoise branch {self._active_denoise_branch!r}.")
+    def _cfg_text_active(self, generation_kwargs: dict[str, object], timestep: object) -> bool:
+        cfg_text_scale = float(generation_kwargs.get("cfg_text_scale", 1.0))
+        if cfg_text_scale <= 1.0:
+            return False
 
-        self._velocity_buffer[self._active_denoise_branch] = velocity.to(device=device, dtype=dtype)
-        branch_index = branches.index(self._active_denoise_branch)
-        if branch_index + 1 < len(branches):
-            self._active_denoise_branch = branches[branch_index + 1]
-            return "need_branch"
-        return "merge"
+        interval = generation_kwargs.get("cfg_interval", (0.0, 1.0))
+        if interval is None:
+            lower, upper = 0.0, 1.0
+        elif isinstance(interval, (list, tuple)) and len(interval) == 2:
+            lower, upper = float(interval[0]), float(interval[1])
+        else:
+            lower, upper = float(interval), 1.0
 
-    def merge_collected_velocity(
-        self,
-        generation_kwargs: dict[str, object],
-        *,
-        device: torch.device,
-    ) -> torch.Tensor:
-        merged_velocity = (
-            self._merged_velocity_without_cfg(device=device)
-            if not self.cfg_text_requested(generation_kwargs)
-            else self._merged_velocity_with_cfg(generation_kwargs, device=device)
-        )
-        self._velocity_buffer.clear()
-        self._active_denoise_branch = "main"
-        return merged_velocity
+        if torch.is_tensor(timestep):
+            if timestep.numel() == 0:
+                raise ValueError("BAGEL CFG timestep tensor must not be empty.")
+            t = float(timestep.detach().reshape(-1)[0].item())
+        elif timestep is None:
+            raise ValueError("BAGEL CFG requires current-round meta['timestep'].")
+        else:
+            t = float(timestep)
+        return t > lower and t <= upper
+
+    def _cfg_img_active(self, generation_kwargs: dict[str, object], timestep: object) -> bool:
+        self.validate_cfg_request(generation_kwargs)
+        return self.cfg_img_requested(generation_kwargs) and self._cfg_text_active(generation_kwargs, timestep)
+
+    def _strip_denoise_query_markers(self, velocity: torch.Tensor) -> torch.Tensor:
+        if int(velocity.shape[0]) < 3:
+            raise ValueError("BAGEL MoT denoise velocity must include start/end marker rows.")
+        return velocity[1:-1]
 
     def _merged_velocity_without_cfg(self, *, device: torch.device) -> torch.Tensor:
         main_velocity = self._velocity_buffer.get("main")
@@ -339,32 +437,29 @@ class MotGenerationState:
 
         return (guided * scale).to(device=device)
 
-    def _cfg_text_active(self, generation_kwargs: dict[str, object], timestep: object) -> bool:
-        cfg_text_scale = float(generation_kwargs.get("cfg_text_scale", 1.0))
-        if cfg_text_scale <= 1.0:
-            return False
-
-        interval = generation_kwargs.get("cfg_interval", (0.0, 1.0))
-        if interval is None:
-            lower, upper = 0.0, 1.0
-        elif isinstance(interval, (list, tuple)) and len(interval) == 2:
-            lower, upper = float(interval[0]), float(interval[1])
-        else:
-            lower, upper = float(interval), 1.0
-
-        if torch.is_tensor(timestep):
-            if timestep.numel() == 0:
-                raise ValueError("BAGEL CFG timestep tensor must not be empty.")
-            t = float(timestep.detach().reshape(-1)[0].item())
-        elif timestep is None:
-            raise ValueError("BAGEL CFG requires current-round meta['timestep'].")
-        else:
-            t = float(timestep)
-        return t > lower and t <= upper
-
-    def _cfg_img_active(self, generation_kwargs: dict[str, object], timestep: object) -> bool:
-        self.validate_cfg_request(generation_kwargs)
-        return self.cfg_img_requested(generation_kwargs) and self._cfg_text_active(generation_kwargs, timestep)
+    def _merged_branch_cache(
+        self,
+        contexts: list[MotCacheContext],
+        key_values_lens: torch.Tensor,
+        empty_cache_factory: Callable[[], Any],
+    ) -> Any:
+        merged_cache = empty_cache_factory()
+        for layer_idx in merged_cache.key_cache:
+            key_parts = []
+            value_parts = []
+            for context, key_values_len in zip(contexts, key_values_lens.tolist(), strict=True):
+                key_values_len = int(key_values_len)
+                if key_values_len == 0:
+                    continue
+                cache = context.cache
+                if cache is None or cache.key_cache[layer_idx] is None or cache.value_cache[layer_idx] is None:
+                    raise RuntimeError(f"BAGEL {context.name} branch cache is missing layer {layer_idx}.")
+                key_parts.append(cache.key_cache[layer_idx])
+                value_parts.append(cache.value_cache[layer_idx])
+            if key_parts:
+                merged_cache.key_cache[layer_idx] = torch.cat(key_parts, dim=0)
+                merged_cache.value_cache[layer_idx] = torch.cat(value_parts, dim=0)
+        return merged_cache
 
 
 __all__ = ["MotCacheContext", "MotGenerationState"]

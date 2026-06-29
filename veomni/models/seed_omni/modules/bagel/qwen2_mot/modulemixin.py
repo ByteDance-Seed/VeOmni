@@ -7,7 +7,6 @@ from typing import Any
 import torch
 import torch.distributed as dist
 
-from ....graphs.generation_graph import FSM_SIGNAL_KEY
 from ....mixins.modulemixin import ModuleMixin, post_forward, pre_forward
 from ....utils.conversation import ConversationItem, get_tail_output_item, iter_desired_items
 from ..sources import (
@@ -23,9 +22,6 @@ from .processing import (
     PackedSpan,
     preprocess_mot_inputs,
 )
-
-
-SIGNAL_NEED_DENOISE_BRANCH = "need_denoise_branch"
 
 
 class BagelQwen2MoTModuleMixin(ModuleMixin):
@@ -100,30 +96,20 @@ class BagelQwen2MoTModuleMixin(ModuleMixin):
             )
         if int(query.shape[0]) < 3:
             raise ValueError("BAGEL Qwen2-MoT denoise query must include start/end marker embeddings.")
-        query = query.to(device=self.device, dtype=self.dtype)
 
-        query_len = int(query.shape[0])
-        branch_context = self._generation_state.active_denoise_cache
-        query_lens, packed_query_indexes, packed_position_ids = branch_context.packed_query_args(
-            query_len,
+        inputs = self._generation_state.preprocess_parallel_denoise_inputs(
+            query,
+            generation_kwargs or {},
+            timestep=tail.meta.get("timestep"),
+            empty_cache_factory=self._new_empty_cache,
             device=self.device,
-            position_ids=branch_context.repeated_position_ids(query_len, device=self.device),
+            dtype=self.dtype,
         )
-        packed_text_indexes = torch.tensor([0, query_len - 1], device=self.device, dtype=torch.long)
-        packed_vae_token_indexes = torch.arange(1, query_len - 1, device=self.device, dtype=torch.long)
         outputs = self.forward_inference(
-            packed_query_sequence=query,
-            query_lens=query_lens,
-            packed_query_position_ids=packed_position_ids,
-            packed_query_indexes=packed_query_indexes,
-            past_key_values=branch_context.cache,
-            key_values_lens=branch_context.key_values_lens,
-            packed_key_value_indexes=branch_context.packed_key_value_indexes,
+            **inputs,
             update_past_key_values=False,
             is_causal=False,
             mode="gen",
-            packed_vae_token_indexes=packed_vae_token_indexes,
-            packed_text_indexes=packed_text_indexes,
         )
 
         tail.source = BAGEL_FLOW_HIDDEN
@@ -153,20 +139,12 @@ class BagelQwen2MoTModuleMixin(ModuleMixin):
                 f"BAGEL Qwen2-MoT velocity collection expects rank-2 velocity, got {tuple(velocity.shape)}."
             )
 
-        branches = self._generation_state.denoise_branches_for_timestep(generation_kwargs, tail.meta.get("timestep"))
-        collect_state = self._generation_state.collect_velocity(
+        tail.value = self._generation_state.collect_velocity(
             velocity,
-            branches,
+            generation_kwargs or {},
             device=self.device,
             dtype=self.dtype,
         )
-        if collect_state == "ready":
-            return {"conversation_list": conversation_list}
-        if collect_state == "need_branch":
-            tail.value = None
-            return {"conversation_list": conversation_list, FSM_SIGNAL_KEY: SIGNAL_NEED_DENOISE_BRANCH}
-
-        tail.value = self._generation_state.merge_collected_velocity(generation_kwargs, device=self.device)
         return {"conversation_list": conversation_list}
 
     # ── Training hooks ──────────────────────────────────

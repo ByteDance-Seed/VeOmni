@@ -320,9 +320,6 @@ def test_bagel_flow_generation_state_tracks_denoise_round():
     assert state.grid_shape == (2, 2)
     assert state.current_timestep_tokens().shape == (4,)
 
-    hidden = torch.arange(24, dtype=torch.float32).reshape(6, 4)
-    assert torch.equal(state.strip_query_markers(hidden), hidden[1:-1])
-
     complete = state.advance(torch.zeros_like(state.latents))
     assert complete
     assert state.is_complete()

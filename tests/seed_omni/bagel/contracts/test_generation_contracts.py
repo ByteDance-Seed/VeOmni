@@ -13,6 +13,7 @@ from tests.seed_omni.bagel.contracts.helpers import (
     tiny_bagel_qwen2_cfg,
 )
 from veomni.models.seed_omni.graphs.generation_graph import FSM_SIGNAL_KEY
+from veomni.models.seed_omni.mixins.modulemixin import ModuleMixin
 from veomni.models.seed_omni.modeling_omni import OmniModel
 from veomni.models.seed_omni.modules.bagel.qwen2_mot.generation_state import MotGenerationState
 from veomni.models.seed_omni.modules.bagel.sources import (
@@ -146,10 +147,7 @@ def test_bagel_infer_gen_cfg_text_branch_signal_smoke():
         },
     )
 
-    assert any(
-        "transition: velocity_collect -> query_denoise [module_signal(need_denoise_branch)]" in entry
-        for entry in trace
-    )
+    assert not any("module_signal(need_denoise_branch)" in entry for entry in trace)
     assert any(
         "transition: velocity_collect -> image_decode [module_signal(image_complete)]" in entry for entry in trace
     )
@@ -188,12 +186,7 @@ def test_bagel_infer_gen_cfg_text_and_image_branch_signal_smoke():
         },
     )
 
-    branch_transitions = [
-        entry
-        for entry in trace
-        if "transition: velocity_collect -> query_denoise [module_signal(need_denoise_branch)]" in entry
-    ]
-    assert len(branch_transitions) == 2
+    assert not any("module_signal(need_denoise_branch)" in entry for entry in trace)
     assert any(
         "transition: velocity_collect -> image_decode [module_signal(image_complete)]" in entry for entry in trace
     )
@@ -256,111 +249,197 @@ def test_bagel_qwen2_mot_cfg_img_requires_text_cfg():
         MotGenerationState().validate_cfg_request({"cfg_text_scale": 1.0, "cfg_img_scale": 1.5})
 
 
-def test_bagel_qwen2_mot_cfg_text_image_velocity_collection_and_merge():
+def test_bagel_qwen2_mot_branch_batch_indexes_use_per_branch_attention_offsets():
     BagelQwen2MoT = model_cls("bagel_qwen2_mot")
     BagelQwen2MoTConfig = config_cls("bagel_qwen2_mot")
     model = BagelQwen2MoT(BagelQwen2MoTConfig(**tiny_bagel_qwen2_cfg()))
-    conversation = [
-        ConversationItem(
-            type="output",
-            value=torch.tensor([[1.0, 2.0], [3.0, 4.0]]),
-            role="assistant",
-            source=BAGEL_FLOW_VELOCITY,
-            meta={"timestep": torch.tensor(0.5)},
-        )
-    ]
-    generation_kwargs = {
-        "cfg_text_scale": 2.0,
-        "cfg_img_scale": 1.5,
-        "cfg_interval": [0.0, 1.0],
-        "cfg_renorm_type": "global",
-        "cfg_renorm_min": 0.0,
-    }
-
-    out = model.collect_velocity(
-        conversation_list=conversation,
-        generation_kwargs=generation_kwargs,
+    state = model._generation_state
+    state.main.snapshot(
+        cache=_fake_cache(model, torch.tensor([10.0, 11.0])),
+        key_values_lens=torch.tensor([2], dtype=torch.int32),
+        packed_key_value_indexes=torch.arange(2),
+        next_position_id=torch.tensor(3),
+        empty_cache_factory=model._new_empty_cache,
+        device=model.device,
     )
-    assert out[FSM_SIGNAL_KEY] == "need_denoise_branch"
-    assert model._generation_state.active_denoise_branch == "cfg_text"
-
-    conversation[-1].value = torch.tensor([[0.5, 1.0], [1.5, 2.0]])
-    out = model.collect_velocity(
-        conversation_list=conversation,
-        generation_kwargs=generation_kwargs,
+    state.cfg_text.snapshot(
+        cache=None,
+        key_values_lens=None,
+        packed_key_value_indexes=None,
+        next_position_id=torch.tensor(7),
+        empty_cache_factory=model._new_empty_cache,
+        device=model.device,
     )
-    assert out[FSM_SIGNAL_KEY] == "need_denoise_branch"
-    assert model._generation_state.active_denoise_branch == "cfg_img"
-
-    conversation[-1].value = torch.tensor([[0.25, 0.5], [0.75, 1.0]])
-    out = model.collect_velocity(
-        conversation_list=conversation,
-        generation_kwargs=generation_kwargs,
+    state.cfg_img.snapshot(
+        cache=_fake_cache(model, torch.tensor([20.0, 21.0, 22.0])),
+        key_values_lens=torch.tensor([3], dtype=torch.int32),
+        packed_key_value_indexes=torch.arange(3),
+        next_position_id=torch.tensor(11),
+        empty_cache_factory=model._new_empty_cache,
+        device=model.device,
     )
 
+    inputs = state.preprocess_parallel_denoise_inputs(
+        torch.zeros(5, int(model.config.hidden_size)),
+        {"cfg_text_scale": 2.0, "cfg_img_scale": 1.5},
+        timestep=0.5,
+        empty_cache_factory=model._new_empty_cache,
+        device=model.device,
+        dtype=model.dtype,
+    )
+
+    assert inputs["query_lens"].tolist() == [5, 5, 5]
+    assert inputs["key_values_lens"].tolist() == [2, 0, 3]
+    assert inputs["packed_query_indexes"].tolist() == [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 15, 16, 17, 18, 19]
+    assert inputs["packed_key_value_indexes"].tolist() == [0, 1, 12, 13, 14]
+    assert inputs["packed_text_indexes"].tolist() == [0, 4, 5, 9, 10, 14]
+    assert inputs["packed_vae_token_indexes"].tolist() == [1, 2, 3, 6, 7, 8, 11, 12, 13]
+    assert inputs["packed_query_position_ids"].tolist() == [3, 3, 3, 3, 3, 7, 7, 7, 7, 7, 11, 11, 11, 11, 11]
+    assert inputs["past_key_values"].key_cache[0].reshape(-1).tolist() == [10.0, 11.0, 20.0, 21.0, 22.0]
+
+
+@pytest.mark.parametrize(
+    ("branches", "generation_kwargs", "timestep", "renorm_type"),
+    [
+        (("main",), {"cfg_text_scale": 1.0, "cfg_img_scale": 1.0}, 0.5, "global"),
+        (("main", "cfg_text"), {"cfg_text_scale": 2.0, "cfg_img_scale": 1.0}, 0.5, "global"),
+        (("main", "cfg_text", "cfg_img"), {"cfg_text_scale": 2.0, "cfg_img_scale": 1.5}, 0.5, "global"),
+        (
+            ("main",),
+            {"cfg_text_scale": 2.0, "cfg_img_scale": 1.5, "cfg_interval": [0.2, 0.8]},
+            0.1,
+            "global",
+        ),
+        (("main", "cfg_text"), {"cfg_text_scale": 2.0, "cfg_img_scale": 1.0}, 0.5, "channel"),
+        (("main", "cfg_text", "cfg_img"), {"cfg_text_scale": 2.0, "cfg_img_scale": 1.5}, 0.5, "text_channel"),
+    ],
+)
+def test_bagel_qwen2_mot_collects_stacked_cfg_velocity_like_serial_oracle(
+    branches: tuple[str, ...],
+    generation_kwargs: dict[str, float],
+    timestep: float,
+    renorm_type: str,
+):
+    BagelQwen2MoT = model_cls("bagel_qwen2_mot")
+    BagelQwen2MoTConfig = config_cls("bagel_qwen2_mot")
+    model = BagelQwen2MoT(BagelQwen2MoTConfig(**tiny_bagel_qwen2_cfg()))
     main = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
     cfg_text = torch.tensor([[0.5, 1.0], [1.5, 2.0]])
     cfg_img = torch.tensor([[0.25, 0.5], [0.75, 1.0]])
-    text_guided = cfg_text + 2.0 * (main - cfg_text)
-    guided = cfg_img + 1.5 * (text_guided - cfg_img)
-    expected = guided * (torch.norm(main) / (torch.norm(guided) + 1e-8)).clamp(min=0.0, max=1.0)
-
-    assert FSM_SIGNAL_KEY not in out
-    assert model._generation_state.active_denoise_branch == "main"
-    torch.testing.assert_close(conversation[-1].value, expected)
-
-
-def test_bagel_qwen2_mot_cfg_text_only_velocity_collection_and_merge():
-    BagelQwen2MoT = model_cls("bagel_qwen2_mot")
-    BagelQwen2MoTConfig = config_cls("bagel_qwen2_mot")
-    model = BagelQwen2MoT(BagelQwen2MoTConfig(**tiny_bagel_qwen2_cfg()))
+    velocity_by_branch = {"main": main, "cfg_text": cfg_text, "cfg_img": cfg_img}
+    generation_kwargs = {
+        **generation_kwargs,
+        "cfg_interval": generation_kwargs.get("cfg_interval", [0.0, 1.0]),
+        "cfg_renorm_type": renorm_type,
+        "cfg_renorm_min": 0.0,
+    }
     conversation = [
         ConversationItem(
             type="output",
-            value=torch.tensor([[1.0, 2.0], [3.0, 4.0]]),
+            value=torch.cat([_marker_wrap(velocity_by_branch[branch]) for branch in branches], dim=0),
             role="assistant",
             source=BAGEL_FLOW_VELOCITY,
-            meta={"timestep": torch.tensor(0.5)},
+            meta={"timestep": torch.tensor(timestep)},
         )
     ]
-    generation_kwargs = {
-        "cfg_text_scale": 2.0,
-        "cfg_img_scale": 1.0,
-        "cfg_interval": [0.0, 1.0],
-        "cfg_renorm_type": "global",
-        "cfg_renorm_min": 0.0,
-    }
-
+    state = model._generation_state
+    state.main.ensure_empty(empty_cache_factory=model._new_empty_cache, device=model.device)
+    if "cfg_text" in branches:
+        state.cfg_text.ensure_empty(empty_cache_factory=model._new_empty_cache, device=model.device)
+    if "cfg_img" in branches:
+        state.cfg_img.ensure_empty(empty_cache_factory=model._new_empty_cache, device=model.device)
+    state.preprocess_parallel_denoise_inputs(
+        torch.zeros(4, int(model.config.hidden_size)),
+        generation_kwargs,
+        timestep=torch.tensor(timestep),
+        empty_cache_factory=model._new_empty_cache,
+        device=model.device,
+        dtype=model.dtype,
+    )
     out = model.collect_velocity(
         conversation_list=conversation,
         generation_kwargs=generation_kwargs,
     )
-    assert out[FSM_SIGNAL_KEY] == "need_denoise_branch"
-    assert model._generation_state.active_denoise_branch == "cfg_text"
 
-    conversation[-1].value = torch.tensor([[0.5, 1.0], [1.5, 2.0]])
-    out = model.collect_velocity(
-        conversation_list=conversation,
-        generation_kwargs=generation_kwargs,
+    expected = _serial_cfg_velocity_oracle(
+        main,
+        cfg_text if "cfg_text" in branches else None,
+        cfg_img if "cfg_img" in branches else None,
+        generation_kwargs,
     )
-
-    main = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
-    cfg_text = torch.tensor([[0.5, 1.0], [1.5, 2.0]])
-    guided = cfg_text + 2.0 * (main - cfg_text)
-    expected = guided * (torch.norm(main) / (torch.norm(guided) + 1e-8)).clamp(min=0.0, max=1.0)
 
     assert FSM_SIGNAL_KEY not in out
-    assert model._generation_state.active_denoise_branch == "main"
     torch.testing.assert_close(conversation[-1].value, expected)
 
 
-class _NoopBagelSiglip(nn.Module):
+def _fake_cache(model: nn.Module, values: torch.Tensor):
+    cache = model._new_empty_cache()
+    cache.key_cache[0] = values.reshape(-1, 1, 1)
+    cache.value_cache[0] = (values + 100.0).reshape(-1, 1, 1)
+    return cache
+
+
+def _marker_wrap(velocity: torch.Tensor) -> torch.Tensor:
+    return torch.cat([torch.zeros_like(velocity[:1]), velocity, torch.zeros_like(velocity[:1])], dim=0)
+
+
+def _serial_cfg_velocity_oracle(
+    main: torch.Tensor,
+    cfg_text: torch.Tensor | None,
+    cfg_img: torch.Tensor | None,
+    generation_kwargs: dict[str, object],
+) -> torch.Tensor:
+    if cfg_text is None:
+        return main
+
+    cfg_text_scale = float(generation_kwargs.get("cfg_text_scale", 1.0))
+    cfg_img_scale = float(generation_kwargs.get("cfg_img_scale", 1.0))
+    cfg_renorm_min = float(generation_kwargs.get("cfg_renorm_min", 0.0))
+    cfg_renorm_type = str(generation_kwargs.get("cfg_renorm_type", "global"))
+
+    guided = cfg_text + cfg_text_scale * (main - cfg_text)
+    if cfg_renorm_type == "text_channel":
+        scale = (torch.norm(main, dim=-1, keepdim=True) / (torch.norm(guided, dim=-1, keepdim=True) + 1e-8)).clamp(
+            min=cfg_renorm_min,
+            max=1.0,
+        )
+        merged = guided * scale
+        if cfg_img_scale > 1.0:
+            assert cfg_img is not None
+            merged = cfg_img + cfg_img_scale * (merged - cfg_img)
+        return merged
+
+    if cfg_img_scale > 1.0:
+        assert cfg_img is not None
+        guided = cfg_img + cfg_img_scale * (guided - cfg_img)
+
+    if cfg_renorm_type == "global":
+        norm_main = torch.norm(main)
+        norm_guided = torch.norm(guided)
+    elif cfg_renorm_type == "channel":
+        norm_main = torch.norm(main, dim=-1, keepdim=True)
+        norm_guided = torch.norm(guided, dim=-1, keepdim=True)
+    else:
+        raise NotImplementedError(cfg_renorm_type)
+    return guided * (norm_main / (norm_guided + 1e-8)).clamp(min=cfg_renorm_min, max=1.0)
+
+
+def _fake_cfg_branch_count(generation_kwargs: dict | None) -> int:
+    branch_count = 1
+    if float((generation_kwargs or {}).get("cfg_text_scale", 1.0)) > 1.0:
+        branch_count += 1
+    if float((generation_kwargs or {}).get("cfg_img_scale", 1.0)) > 1.0:
+        branch_count += 1
+    return branch_count
+
+
+class _NoopBagelSiglip(ModuleMixin, nn.Module):
     def generate(self, conversation_list: list[ConversationItem] | None = None, **kwargs):
         del kwargs
         return {"conversation_list": conversation_list}
 
 
-class _InferGenTextEncoder(nn.Module):
+class _InferGenTextEncoder(ModuleMixin, nn.Module):
     def generate(self, conversation_list: list[ConversationItem] | None = None, **kwargs):
         del kwargs
         return {"conversation_list": conversation_list}
@@ -375,11 +454,7 @@ class _InferGenTextEncoder(nn.Module):
         return {"conversation_list": conversation_list}
 
 
-class _InferGenBagelQwen(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.velocity_collect_count = 0
-
+class _InferGenBagelQwen(ModuleMixin, nn.Module):
     def generate(
         self,
         conversation_list: list[ConversationItem] | None = None,
@@ -393,26 +468,25 @@ class _InferGenBagelQwen(nn.Module):
         tail = conversation_list[-1]
         if tail.source == BAGEL_FLOW_QUERY:
             tail.source = BAGEL_FLOW_HIDDEN
+            tail.value = tail.value.repeat(_fake_cfg_branch_count(generation_kwargs), 1)
             return {"conversation_list": conversation_list}
         if tail.source == BAGEL_FLOW_VELOCITY:
-            branch_count = 0
-            if float((generation_kwargs or {}).get("cfg_text_scale", 1.0)) > 1.0:
-                branch_count += 1
-            if float((generation_kwargs or {}).get("cfg_img_scale", 1.0)) > 1.0:
-                branch_count += 1
-            if self.velocity_collect_count < branch_count:
-                self.velocity_collect_count += 1
-                tail.value = None
-                return {"conversation_list": conversation_list, FSM_SIGNAL_KEY: "need_denoise_branch"}
+            tail.value = torch.zeros(16, 4)
             return {"conversation_list": conversation_list}
         return {"conversation_list": conversation_list}
 
-    def denoise_branch(self, conversation_list: list[ConversationItem] | None = None, **kwargs):
+    def denoise_branch(
+        self,
+        conversation_list: list[ConversationItem] | None = None,
+        generation_kwargs: dict | None = None,
+        **kwargs,
+    ):
         del kwargs
         assert conversation_list is not None
         tail = conversation_list[-1]
         assert tail.source == BAGEL_FLOW_QUERY
         tail.source = BAGEL_FLOW_HIDDEN
+        tail.value = tail.value.repeat(_fake_cfg_branch_count(generation_kwargs), 1)
         return {"conversation_list": conversation_list}
 
     def collect_velocity(
@@ -425,19 +499,12 @@ class _InferGenBagelQwen(nn.Module):
         assert conversation_list is not None
         tail = conversation_list[-1]
         assert tail.source == BAGEL_FLOW_VELOCITY
-        branch_count = 0
-        if float((generation_kwargs or {}).get("cfg_text_scale", 1.0)) > 1.0:
-            branch_count += 1
-        if float((generation_kwargs or {}).get("cfg_img_scale", 1.0)) > 1.0:
-            branch_count += 1
-        if self.velocity_collect_count < branch_count:
-            self.velocity_collect_count += 1
-            tail.value = None
-            return {"conversation_list": conversation_list, FSM_SIGNAL_KEY: "need_denoise_branch"}
+        assert tail.value.shape[0] == 18 * _fake_cfg_branch_count(generation_kwargs)
+        tail.value = torch.zeros(16, 4)
         return {"conversation_list": conversation_list}
 
 
-class _InferGenBagelFlow(nn.Module):
+class _InferGenBagelFlow(ModuleMixin, nn.Module):
     def prepare_denoise_query(self, conversation_list: list[ConversationItem] | None = None, **kwargs):
         del kwargs
         assert conversation_list is not None
@@ -470,8 +537,8 @@ class _InferGenBagelFlow(nn.Module):
         assert conversation_list is not None
         item = conversation_list[-1]
         assert item.source == BAGEL_FLOW_HIDDEN
-        assert item.value.shape == (18, 8)
-        item.value = torch.zeros(16, 4)
+        assert item.value.shape[0] % 18 == 0
+        item.value = torch.zeros(item.value.shape[0], 4)
         item.source = BAGEL_FLOW_VELOCITY
         return {"conversation_list": conversation_list}
 
@@ -485,7 +552,7 @@ class _InferGenBagelFlow(nn.Module):
         return {"conversation_list": conversation_list, FSM_SIGNAL_KEY: "image_complete"}
 
 
-class _InferGenBagelVAE(nn.Module):
+class _InferGenBagelVAE(ModuleMixin, nn.Module):
     def decode_generated(self, conversation_list: list[ConversationItem] | None = None, **kwargs):
         del kwargs
         assert conversation_list is not None

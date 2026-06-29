@@ -40,7 +40,6 @@ flowchart LR
     fsm_start ==> state_prompt_encode
     state_prompt_encode ==>|"default"| state_query_denoise
     state_query_denoise ==>|"default"| state_velocity_collect
-    state_velocity_collect ==>|"module_signal(need_denoise_branch)"| state_query_denoise
     state_velocity_collect ==>|"module_signal(image_complete)"| state_image_decode
     state_velocity_collect ==>|"default"| state_query_denoise
     state_image_decode ==>|"default"| fsm_done

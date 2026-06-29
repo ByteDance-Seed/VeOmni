@@ -10,7 +10,7 @@ The V2 graph keeps BAGEL modules split by producer/consumer boundaries:
 - image denoise: ``flow_connector.prepare_denoise_query`` writes
   ``bagel_flow_query``; text marker wrapping feeds ``qwen2_mot.denoise_branch``;
   ``flow_connector.decode_velocity_from_hidden`` writes ``bagel_flow_velocity``;
-  ``qwen2_mot.collect_velocity`` handles CFG branch collection; finally
+  ``qwen2_mot.collect_velocity`` strips branch markers and handles CFG merge; finally
   ``flow_connector.advance_denoise`` either loops or emits generated latents
   for VAE decode.
 """
