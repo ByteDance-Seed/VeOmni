@@ -138,11 +138,9 @@ class JanusLlamaModuleMixin(ModuleMixin):
         conversation_list: Optional[List[ConversationItem]] = None,
         **kwargs: Any,
     ) -> Dict[str, Any]:
-        # NOTE: every forward below is invoked via ``self(...)`` (``__call__``),
-        # not ``self.forward(...)``. Under FSDP2 inference the root pre-forward
-        # hook must fire (lazy_init + unshard of root-owned params like
-        # ``language_model.norm.weight``); calling ``.forward`` directly skips it
-        # and the sharded DTensor params trigger "mixed Tensor and DTensor".
+        # GenerationGraph invokes this endpoint through ``self.__call__`` so
+        # FSDP/DDP hooks have already fired; its dispatch trampoline restores
+        # the real ``forward`` while this endpoint runs.
         del kwargs
         if self._past_key_values is None:
             inputs_embeds, attention_mask, position_ids, _ = self._pack_conversations_for_forward([conversation_list])
@@ -150,7 +148,7 @@ class JanusLlamaModuleMixin(ModuleMixin):
                 position_ids
             )
 
-            outputs = self(
+            outputs = self.forward(
                 inputs_embeds=inputs_embeds,
                 attention_mask=attention_mask,
                 past_key_values=self._past_key_values,
@@ -179,7 +177,7 @@ class JanusLlamaModuleMixin(ModuleMixin):
             uncond = cfg_uncond_inputs_embeds.to(self.device)
             if uncond.dim() == 2:
                 uncond = uncond.unsqueeze(0)
-            uncond_out = self(
+            uncond_out = self.forward(
                 inputs_embeds=uncond,
                 attention_mask=None,
                 past_key_values=None,
@@ -195,13 +193,13 @@ class JanusLlamaModuleMixin(ModuleMixin):
         inputs_embeds = inputs_embeds.unsqueeze(0)
 
         if self._cfg_active:
-            cond_out = self(
+            cond_out = self.forward(
                 inputs_embeds=inputs_embeds,
                 attention_mask=None,
                 past_key_values=self._past_key_values,
                 use_cache=True,
             )
-            uncond_out = self(
+            uncond_out = self.forward(
                 inputs_embeds=inputs_embeds,
                 attention_mask=None,
                 past_key_values=self._uncond_past_key_values,
@@ -211,7 +209,7 @@ class JanusLlamaModuleMixin(ModuleMixin):
             self._uncond_past_key_values = uncond_out["past_key_values"]
             hidden_states = torch.cat([cond_out["hidden_states"], uncond_out["hidden_states"]], dim=0)
         else:
-            outputs = self(
+            outputs = self.forward(
                 inputs_embeds=inputs_embeds,
                 attention_mask=None,
                 past_key_values=self._past_key_values,
