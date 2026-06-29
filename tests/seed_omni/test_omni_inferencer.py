@@ -19,11 +19,12 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from veomni.models.seed_omni import read_model_type
-from veomni.trainer.omni.omni_inferencer import InferenceRequest
+from veomni.trainer.omni.omni_inferencer import InferenceRequest, OmniInferencer
 
 
 # ── InferenceRequest ─────────────────────────────────────────────────────────
@@ -54,6 +55,38 @@ def test_inference_request_is_a_plain_dataclass():
         "images",
         "generation_kwargs",
     }
+
+
+def test_inferencer_injects_resolved_infer_type_into_runtime_kwargs():
+    inferencer = OmniInferencer.__new__(OmniInferencer)
+    inferencer.base = SimpleNamespace(
+        args=SimpleNamespace(
+            infer=SimpleNamespace(
+                infer_type="infer_gen",
+                generation_kwargs={"temperature": 0.5},
+            )
+        )
+    )
+
+    kwargs = inferencer._runtime_generation_kwargs()
+
+    assert kwargs == {"temperature": 0.5, "infer_type": "infer_gen"}
+    assert inferencer.args.infer.generation_kwargs == {"temperature": 0.5}
+
+
+def test_inferencer_rejects_conflicting_runtime_infer_type():
+    inferencer = OmniInferencer.__new__(OmniInferencer)
+    inferencer.base = SimpleNamespace(
+        args=SimpleNamespace(
+            infer=SimpleNamespace(
+                infer_type="infer_gen",
+                generation_kwargs={"infer_type": "infer_und"},
+            )
+        )
+    )
+
+    with pytest.raises(ValueError, match="conflicts"):
+        inferencer._runtime_generation_kwargs()
 
 
 # ── read_model_type ─────────────────────────────────────────────────────────

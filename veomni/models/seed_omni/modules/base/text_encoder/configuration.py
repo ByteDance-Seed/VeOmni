@@ -38,8 +38,8 @@ class TextEncoderConfig(PretrainedConfig):
         lm_head_bias: bool = False,
         **kwargs,
     ):
+        super().__init__(**kwargs)
         self.vocab_size = vocab_size
         self.hidden_size = hidden_size
         self.tie_word_embeddings = tie_word_embeddings
         self.lm_head_bias = lm_head_bias
-        super().__init__(**kwargs)

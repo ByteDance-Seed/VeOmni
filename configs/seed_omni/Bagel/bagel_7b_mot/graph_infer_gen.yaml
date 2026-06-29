@@ -1,0 +1,34 @@
+# BAGEL-7B-MoT inference - text to image.
+generation_graph:
+  initial: prompt_encode
+
+  states:
+    prompt_encode:
+      body:
+        - { from: bagel_text_encoder, to: bagel_qwen2_mot }
+        - { from: bagel_qwen2_mot,    to: end }
+      transitions:
+        - { condition: { type: default }, next_state: query_denoise }
+
+    query_denoise:
+      body:
+        - { from: bagel_flow_connector.prepare_denoise_query, to: bagel_text_encoder.encode_image_markers }
+        - { from: bagel_text_encoder.encode_image_markers, to: bagel_qwen2_mot.denoise_branch }
+        - { from: bagel_qwen2_mot.denoise_branch,      to: end }
+      transitions:
+        - { condition: { type: default }, next_state: velocity_collect }
+
+    velocity_collect:
+      body:
+        - { from: bagel_flow_connector.decode_velocity_from_hidden, to: bagel_qwen2_mot.collect_velocity }
+        - { from: bagel_qwen2_mot.collect_velocity,                 to: bagel_flow_connector.advance_denoise }
+        - { from: bagel_flow_connector.advance_denoise,             to: end }
+      transitions:
+        - { condition: { type: module_signal, key: image_complete }, next_state: image_decode }
+        - { condition: { type: default }, next_state: query_denoise }
+
+    image_decode:
+      body:
+        - { from: bagel_vae.decode_generated, to: end }
+      transitions:
+        - { condition: { type: default }, next_state: done }

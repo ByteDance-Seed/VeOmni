@@ -6,7 +6,7 @@ flowchart LR
     fsm_start(("▶")):::fsm_start
     fsm_done(("⏹")):::fsm_terminal
     subgraph state_prompt_encode [prompt_encode]
-        direction LR
+        direction TB
         prompt_encode__janus_siglip_generate["<i>janus_siglip.generate</i>"]:::body_node
         prompt_encode__janus_llama_generate["<i>janus_llama.generate</i>"]:::body_node
         prompt_encode__janus_text_encoder_generate["<i>janus_text_encoder.generate</i>"]:::body_node
@@ -14,18 +14,18 @@ flowchart LR
         prompt_encode__janus_text_encoder_generate --> prompt_encode__janus_llama_generate
     end
     subgraph state_image_vq_start [image_vq_start]
-        direction LR
+        direction TB
         image_vq_start__janus_text_encoder_emit_image_start["<i>janus_text_encoder.emit_image_start</i>"]:::body_node
     end
     subgraph state_image_vq [image_vq]
-        direction LR
+        direction TB
         image_vq__janus_llama_generate["<i>janus_llama.generate</i>"]:::body_node
         image_vq__janus_vqvae_generate["<i>janus_vqvae.generate</i>"]:::body_node
         image_vq__janus_llama_generate --> image_vq__janus_vqvae_generate
         image_vq__janus_vqvae_generate --> image_vq__janus_llama_generate
     end
     subgraph state_image_vq_end [image_vq_end]
-        direction LR
+        direction TB
         image_vq_end__janus_text_encoder_emit_image_end["<i>janus_text_encoder.emit_image_end</i>"]:::body_node
     end
     fsm_start ==> state_prompt_encode

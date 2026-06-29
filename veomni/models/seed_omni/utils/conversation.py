@@ -137,27 +137,45 @@ def iter_desired_items(
     types: list[str] | None = None,
     roles: list[str] | None = None,
     sources: list[str] | None = None,
-    meta: dict | None = None,
+    reverse_item: bool = False,
+    *,
+    meta_keys: list[str] | None = None,
 ) -> Iterator[ConversationItem]:
     """Yield matching items in micro-batch order (sample 0, then sample 1, …)."""
 
-    def meta_matches(item_meta: ConversationItem) -> bool:
-        for key, value in meta.items():
-            if item_meta.get(key) != value:
-                return False
-        return True
-
     for sample in conversation_list:
-        for item in sample:
+        items = reversed(sample) if reverse_item else sample
+        for item in items:
             if types is not None and item.type not in types:
                 continue
             if roles is not None and item.role not in roles:
                 continue
             if sources is not None and item.source not in sources:
                 continue
-            if meta is not None and not meta_matches(item.meta):
+            if meta_keys is not None and any(key not in item.meta for key in meta_keys):
                 continue
             yield item
+
+
+def get_tail_output_item(
+    conversation_list: list[ConversationItem],
+    *,
+    sources: list[str] | None = None,
+    roles: list[str] | None = None,
+    meta_keys: list[str] | None = None,
+) -> ConversationItem | None:
+    """Return the latest matching output item in a single conversation."""
+    return next(
+        iter_desired_items(
+            [conversation_list],
+            types=["output"],
+            roles=roles,
+            sources=sources,
+            reverse_item=True,
+            meta_keys=meta_keys,
+        ),
+        None,
+    )
 
 
 def collect_desired_values(
@@ -165,9 +183,20 @@ def collect_desired_values(
     types: list[str] | None = None,
     roles: list[str] | None = None,
     sources: list[str] | None = None,
+    *,
+    meta_keys: list[str] | None = None,
 ) -> list[Any]:
     """Flat ``item.value`` list for matching items in micro-batch order."""
-    return [item.value for item in iter_desired_items(conversation_list, types, roles, sources)]
+    return [
+        item.value
+        for item in iter_desired_items(
+            conversation_list,
+            types,
+            roles,
+            sources,
+            meta_keys=meta_keys,
+        )
+    ]
 
 
 __all__ = [
@@ -176,6 +205,7 @@ __all__ = [
     "is_dummy",
     "maybe_merge_outputs",
     "seal_outputs",
+    "get_tail_output_item",
     "iter_desired_items",
     "collect_desired_values",
 ]

@@ -6,7 +6,7 @@ flowchart LR
     fsm_start(("▶")):::fsm_start
     fsm_done(("⏹")):::fsm_terminal
     subgraph state_text_ar [text_ar]
-        direction LR
+        direction TB
         text_ar__qwen3_text_encoder_generate["<i>qwen3_text_encoder.generate</i>"]:::body_node
         text_ar__qwen3_llm_generate["<i>qwen3_llm.generate</i>"]:::body_node
         text_ar__qwen3_text_encoder_generate --> text_ar__qwen3_llm_generate

@@ -528,8 +528,9 @@ class GenerationGraph:
         construction (framework-injected, not user-declared), and
         rendering it would just add a redundant box.
 
-        Layout uses ``flowchart LR`` + the ELK renderer to match the
-        training graph's left-to-right column-banded look.
+        Layout uses ``flowchart LR`` + the ELK renderer so major FSM states
+        read left-to-right. State bodies use ``direction TB`` so multi-step
+        states stay readable instead of stretching into a single wide strip.
         """
         lines: List[str] = []
         if title:
@@ -554,7 +555,7 @@ class GenerationGraph:
                 continue
             drawn.append(name)
             lines.append(f"    subgraph state_{name} [{name}]")
-            lines.append("        direction LR")
+            lines.append("        direction TB")
             for n_name in state.node_sequence:
                 n = self._node_pool[n_name]
                 node_label = f"<i>{n.module}.{n.method}</i>"
