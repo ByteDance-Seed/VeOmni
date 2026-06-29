@@ -1,3 +1,5 @@
+import importlib.metadata
+import importlib.util
 import math
 import subprocess
 from dataclasses import dataclass, field
@@ -5,6 +7,7 @@ from dataclasses import dataclass, field
 import pytest
 import torch
 import torch.distributed as dist
+from packaging.version import Version
 from torch.distributed._tensor import DTensor, Shard
 
 from veomni.arguments import TrainingArguments, parse_args
@@ -25,6 +28,13 @@ from veomni.utils.device import (
 # from veomni.optim.optimizer import build_optimizer
 
 logger = helper.create_logger(__name__)
+
+
+def _torch_npu_version() -> str:
+    """Return the version of torch_npu if installed, otherwise return "0.0.0"."""
+    if importlib.util.find_spec("torch_npu") is None:
+        return None
+    return str(importlib.metadata.version("torch_npu"))
 
 
 @dataclass
@@ -344,16 +354,28 @@ def test_clip_grad_norm_hsdp_no_extra_parallel(cpu_offload: bool):
     _run_clip_grad_norm_fsdp2_test(ep_size=1, emb_size=1, cpu_offload=cpu_offload, dp_replicate_size=2)
 
 
+@pytest.mark.skipif(
+    _torch_npu_version() and Version(_torch_npu_version()) < Version("2.9.0"),
+    reason="torch_npu < 2.9.0 grad_norm with HSDP is buggy",
+)
 @pytest.mark.parametrize("cpu_offload", [False, True], ids=["no_offload", "cpu_offload"])
 def test_clip_grad_norm_hsdp_ep4(cpu_offload: bool):
     _run_clip_grad_norm_fsdp2_test(ep_size=4, emb_size=1, cpu_offload=cpu_offload, dp_replicate_size=2)
 
 
+@pytest.mark.skipif(
+    _torch_npu_version() and Version(_torch_npu_version()) < Version("2.9.0"),
+    reason="torch_npu < 2.9.0 grad_norm with HSDP is buggy",
+)
 @pytest.mark.parametrize("cpu_offload", [False, True], ids=["no_offload", "cpu_offload"])
 def test_clip_grad_norm_hsdp_emb4(cpu_offload: bool):
     _run_clip_grad_norm_fsdp2_test(ep_size=1, emb_size=4, cpu_offload=cpu_offload, dp_replicate_size=2)
 
 
+@pytest.mark.skipif(
+    _torch_npu_version() and Version(_torch_npu_version()) < Version("2.9.0"),
+    reason="torch_npu < 2.9.0 grad_norm with HSDP is buggy",
+)
 @pytest.mark.parametrize("cpu_offload", [False, True], ids=["no_offload", "cpu_offload"])
 def test_clip_grad_norm_hsdp_ep2_emb4(cpu_offload: bool):
     _run_clip_grad_norm_fsdp2_test(ep_size=2, emb_size=4, cpu_offload=cpu_offload, dp_replicate_size=2)
