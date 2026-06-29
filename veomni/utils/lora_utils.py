@@ -14,6 +14,7 @@
 
 import os
 import time
+from fnmatch import fnmatch
 from typing import TYPE_CHECKING, Any, Callable, Dict, Literal, Optional, Union
 
 import torch
@@ -29,6 +30,71 @@ if TYPE_CHECKING:
     from transformers import PreTrainedModel
 
 logger = logging.get_logger(__name__)
+
+
+def _unwrap_model_for_lora_targets(model: "nn.Module") -> "nn.Module":
+    if hasattr(model, "get_base_model"):
+        return model.get_base_model()
+    return model
+
+
+def _expand_parameter_patterns(model: "nn.Module", patterns: list[str]) -> list[str]:
+    parameter_names = [name for name, _param in model.named_parameters()]
+    expanded: list[str] = []
+    for pattern in patterns:
+        if any(ch in pattern for ch in "*?["):
+            matches = [name for name in parameter_names if fnmatch(name, pattern)]
+        else:
+            matches = [name for name in parameter_names if name == pattern or name.endswith(f".{pattern}")]
+        if not matches:
+            raise ValueError(f"LoRA target parameter pattern did not match any parameter: {pattern}")
+        expanded.extend(matches)
+    return sorted(set(expanded))
+
+
+def convert_fused_moe_lora_targets(
+    lora_modules: list[str],
+    target_parameter_patterns: list[str],
+    gate_up_proj_pattern: str,
+    down_proj_pattern: str,
+) -> tuple[list[str], list[str]]:
+    """Map semantic MLP LoRA module names to fused MoE expert parameters."""
+    target_modules = list(lora_modules)
+    target_parameter_patterns = list(target_parameter_patterns)
+    if {"gate_proj", "up_proj"} & set(target_modules):
+        target_parameter_patterns.append(gate_up_proj_pattern)
+        target_modules = [name for name in target_modules if name not in {"gate_proj", "up_proj"}]
+    if "down_proj" in target_modules:
+        target_parameter_patterns.append(down_proj_pattern)
+        target_modules = [name for name in target_modules if name != "down_proj"]
+    return target_modules, target_parameter_patterns
+
+
+def build_peft_lora_targets(model: "nn.Module", lora_config: dict[str, Any]) -> tuple[list[str], list[str]]:
+    """Build PEFT LoRA module and parameter targets.
+
+    Models with fused parameters can provide ``_convert_lora_targets_to_parameters``
+    to translate semantic module names (for example ``gate_proj``) to physical
+    parameter patterns owned by that model.
+    """
+    model = _unwrap_model_for_lora_targets(model)
+    lora_modules = list(lora_config["lora_modules"])
+    target_parameter_patterns = list(lora_config.get("target_parameters") or [])
+
+    converter = getattr(model, "_convert_lora_targets_to_parameters", None)
+    if converter is not None:
+        if not callable(converter):
+            logger.warning_rank0("Ignore invalid `_convert_lora_targets_to_parameters`: not callable.")
+            target_modules = lora_modules
+        else:
+            target_modules, target_parameter_patterns = converter(model, lora_modules, target_parameter_patterns)
+    else:
+        target_modules = lora_modules
+
+    target_parameters = (
+        _expand_parameter_patterns(model, target_parameter_patterns) if target_parameter_patterns else []
+    )
+    return target_modules, target_parameters
 
 
 def build_lora_key_overrides(model: "nn.Module") -> "Dict[str, str]":
