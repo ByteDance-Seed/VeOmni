@@ -93,6 +93,26 @@ token, an image patch, or a VQ token — the mixin does not distinguish modaliti
 A module only ever produces **time-independent** quantities (tokens + theoretical
 FLOPs); all timing / MFU lives at the orchestrator.
 
+#### Optional graph profiler (`graph_profile.*`, `GraphProfiler`)
+
+SeedOmni also has a lightweight graph profiler for execution-path records and
+optional graph-node timing. This is separate from `train.profile.*`, which owns
+PyTorch profiler traces. The graph profiler is configured at the Omni root:
+
+```yaml
+graph_profile:
+  enable_wall_time: true    # append wall_ms=...
+  enable_cuda_events: true  # append cuda_ms=...
+  enable_memory: true       # append peak_allocated_gb / peak_reserved_gb
+  train_profiling_steps: 10 # training only: save global steps 1-10
+```
+
+Inference always writes the graph path to `<output_dir>/<infer_type>/trace.txt`;
+the `graph_profile.enable_*` switches only add suffix fields to those node lines.
+Training writes rank-0 graph traces only when any detail switch is enabled,
+under `train.checkpoint.output_dir/graph_trace`. `train_profiling_steps=0`
+disables training graph trace files.
+
 Execution is driven by the model itself (not the module's `pre_forward`).
 `OmniModel.forward` loops the FSM (`TrainingGraph.step` → `_collect_training_loss`
 → `maybe_transition`), and `TrainingGraph.step` runs one node end-to-end, which:

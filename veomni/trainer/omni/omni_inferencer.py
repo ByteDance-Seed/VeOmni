@@ -266,10 +266,11 @@ class OmniInferencer(OmniTrainer):
             "conversation_list": conversation,
         }
         self.model.reset()
+        profile_args = self.args.graph_profile
         profiler = GraphProfiler(
-            enable_wall_time=self.args.infer.profile.enable_wall_time,
-            enable_cuda_events=self.args.infer.profile.enable_cuda_events,
-            enable_memory=self.args.infer.profile.enable_memory,
+            enable_wall_time=profile_args.enable_wall_time,
+            enable_cuda_events=profile_args.enable_cuda_events,
+            enable_memory=profile_args.enable_memory,
         )
         ctx = self.model.generate(
             request=request_dict,

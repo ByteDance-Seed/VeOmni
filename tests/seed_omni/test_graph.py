@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import re
+from types import SimpleNamespace
 
 import pytest
 
+from veomni.arguments.arguments_types_omni import OmniGraphProfileArguments
 from veomni.models.seed_omni import EdgeDef, NodeDef
 from veomni.models.seed_omni.graphs import profiling
 from veomni.models.seed_omni.graphs.generation_graph import GenerationGraph
@@ -13,6 +15,7 @@ from veomni.models.seed_omni.graphs.graph import END
 from veomni.models.seed_omni.graphs.profiling import GraphProfiler
 from veomni.models.seed_omni.graphs.training_graph import TrainingGraph
 from veomni.models.seed_omni.mixins.modulemixin import ModuleMixin
+from veomni.trainer.omni.omni_trainer import OmniTrainer
 
 
 # ── NodeDef parsing ───────────────────────────────────────────────────────────
@@ -294,6 +297,32 @@ def test_graph_profiler_can_append_request_peak_memory(monkeypatch):
 
     assert device.reset_calls == 1
     assert profiler.save_records() == ["forward:run_ar.forward | peak_allocated_gb=2.000 | peak_reserved_gb=3.000"]
+
+
+def test_omni_trainer_saves_training_graph_profile_from_top_level_profile(tmp_path):
+    profile = OmniGraphProfileArguments(enable_wall_time=True, train_profiling_steps=3)
+    output_dir = tmp_path / "output"
+    trainer = OmniTrainer.__new__(OmniTrainer)
+    trainer.base = SimpleNamespace(
+        args=SimpleNamespace(
+            graph_profile=profile,
+            train=SimpleNamespace(
+                global_rank=0,
+                checkpoint=SimpleNamespace(output_dir=str(output_dir)),
+            ),
+        ),
+        state=SimpleNamespace(global_step=3),
+    )
+
+    profiler = trainer._build_graph_profiler()
+    assert profiler is not None
+    with profiler.node("forward:run_ar.forward"):
+        pass
+    trainer._save_graph_profile(profiler, micro_step=1)
+
+    trace_path = output_dir / "graph_trace" / "step_000003_micro_01_rank_0.txt"
+    assert trace_path.exists()
+    assert "forward:run_ar.forward | wall_ms=" in trace_path.read_text()
 
 
 def test_step_dispatches_non_forward_method_via_wrapper():

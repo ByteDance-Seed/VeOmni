@@ -119,25 +119,38 @@ class OmniModelArguments(ModelArguments):
 
 
 @dataclass
-class OmniInferProfileArguments:
-    """``infer.profile.*`` — graph profiler timing switches.
+class OmniGraphProfileArguments:
+    """``graph_profile.*`` — SeedOmni graph profiler settings.
 
-    The inferencer always writes the graph execution path to ``trace.txt``.
-    These flags only add profiling suffixes to those path lines.
+    This is separate from ``train.profile.*``. The latter owns PyTorch profiler
+    traces; this block controls graph-node execution records and optional
+    wall/CUDA/memory suffixes.
     """
 
+    train_profiling_steps: int = field(
+        default=0,
+        metadata={
+            "help": (
+                "Number of initial training steps to save graph profiler records for. "
+                "0 disables training graph trace files; 1 records global step 1."
+            )
+        },
+    )
     enable_wall_time: bool = field(
         default=False,
-        metadata={"help": "Append per graph-node wall-clock timing to trace.txt."},
+        metadata={"help": "Append per graph-node wall-clock timing to graph profiler records."},
     )
     enable_cuda_events: bool = field(
         default=False,
-        metadata={"help": "Append per graph-node CUDA event timing to trace.txt."},
+        metadata={"help": "Append per graph-node CUDA event timing to graph profiler records."},
     )
     enable_memory: bool = field(
         default=False,
-        metadata={"help": "Append request-local peak device memory to trace.txt."},
+        metadata={"help": "Append request-local peak device memory to graph profiler records."},
     )
+
+    def enable_graph_profiling(self) -> bool:
+        return self.enable_wall_time or self.enable_cuda_events or self.enable_memory
 
 
 @dataclass
@@ -187,7 +200,6 @@ class OmniInferArguments:
             )
         },
     )
-    profile: OmniInferProfileArguments = field(default_factory=OmniInferProfileArguments)
     # ---- per-invocation runtime knobs ------------------------------------
     prompt: str = field(
         default="",
@@ -236,6 +248,7 @@ class OmniArguments(VeOmniArguments):
     data: OmniDataArguments = field(default_factory=OmniDataArguments)
     train: OmniTrainingArguments = field(default_factory=OmniTrainingArguments)
     accelerator: AcceleratorConfig = field(default_factory=AcceleratorConfig)
+    graph_profile: OmniGraphProfileArguments = field(default_factory=OmniGraphProfileArguments)
     infer: OmniInferArguments = field(default_factory=OmniInferArguments)
 
     def __post_init__(self):
@@ -318,5 +331,6 @@ __all__ = [
     "OmniTrainingArguments",
     "OmniModelArguments",
     "OmniInferArguments",
+    "OmniGraphProfileArguments",
     "OmniArguments",
 ]
