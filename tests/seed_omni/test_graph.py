@@ -3,14 +3,19 @@
 from __future__ import annotations
 
 import re
+from types import SimpleNamespace
 
 import pytest
 
+from veomni.arguments.arguments_types_omni import OmniGraphProfileArguments
 from veomni.models.seed_omni import EdgeDef, NodeDef
+from veomni.models.seed_omni.graphs import profiling
 from veomni.models.seed_omni.graphs.generation_graph import GenerationGraph
 from veomni.models.seed_omni.graphs.graph import END
+from veomni.models.seed_omni.graphs.profiling import GraphProfiler
 from veomni.models.seed_omni.graphs.training_graph import TrainingGraph
 from veomni.models.seed_omni.mixins.modulemixin import ModuleMixin
+from veomni.trainer.omni.omni_trainer import OmniTrainer
 
 
 # ── NodeDef parsing ───────────────────────────────────────────────────────────
@@ -257,15 +262,67 @@ def test_step_loop_flows_carrier_in_topological_order():
     g = TrainingGraph(edges=_understanding_only_edges())
     modules = _fake_modules(g)
     batch = {"conversation_list": []}
-    trace: list[str] = []
+    profiler = GraphProfiler()
     g.reset()
     while not g.is_done():
-        batch = g.step(modules, batch, trace=trace)
-        g.maybe_transition(trace=trace)
+        batch = g.step(modules, batch, profiler=profiler)
+        g.maybe_transition(profiler=profiler)
     # run_ar runs last; both encoders precede it.
+    trace = profiler.save_records()
     assert batch["conversation_list"][-1] == "run_ar.forward"
     assert set(batch["conversation_list"]) == {"vision_encoder.forward", "vq_decoder.forward", "run_ar.forward"}
     assert [t for t in trace if t.startswith("forward:")] == [f"forward:{n}" for n in g.execution_order]
+
+
+def test_graph_profiler_can_append_request_peak_memory(monkeypatch):
+    class _FakeDevice:
+        def __init__(self):
+            self.reset_calls = 0
+
+        def reset_peak_memory_stats(self):
+            self.reset_calls += 1
+
+        def max_memory_allocated(self):
+            return 2 * 1024**3
+
+        def max_memory_reserved(self):
+            return 3 * 1024**3
+
+    device = _FakeDevice()
+    monkeypatch.setattr(profiling, "get_torch_device", lambda: device)
+
+    profiler = GraphProfiler(enable_memory=True)
+    with profiler.node("forward:run_ar.forward"):
+        pass
+
+    assert device.reset_calls == 1
+    assert profiler.save_records() == ["forward:run_ar.forward | peak_allocated_gb=2.000 | peak_reserved_gb=3.000"]
+
+
+def test_omni_trainer_saves_training_graph_profile_from_top_level_profile(tmp_path):
+    profile = OmniGraphProfileArguments(enable_wall_time=True, train_start_step=2, train_end_step=3)
+    output_dir = tmp_path / "output"
+    trainer = OmniTrainer.__new__(OmniTrainer)
+    trainer.base = SimpleNamespace(
+        args=SimpleNamespace(
+            graph_profile=profile,
+            train=SimpleNamespace(
+                global_rank=0,
+                checkpoint=SimpleNamespace(output_dir=str(output_dir)),
+            ),
+        ),
+        state=SimpleNamespace(global_step=3),
+    )
+
+    profiler = trainer._build_graph_profiler()
+    assert profiler is not None
+    with profiler.node("forward:run_ar.forward"):
+        pass
+    trainer._save_graph_profile(profiler, micro_step=1)
+
+    trace_path = output_dir / "graph_trace" / "step_000003_micro_01_rank_0.txt"
+    assert trace_path.exists()
+    assert "forward:run_ar.forward | wall_ms=" in trace_path.read_text()
 
 
 def test_step_dispatches_non_forward_method_via_wrapper():

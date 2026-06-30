@@ -33,6 +33,7 @@ from .arguments_types import (
 )
 from .arguments_types_omni import (
     OmniArguments,
+    OmniGraphProfileArguments,
     OmniInferArguments,
     OmniModelArguments,
     OmniTrainingArguments,

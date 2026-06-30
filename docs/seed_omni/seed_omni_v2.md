@@ -93,6 +93,26 @@ token, an image patch, or a VQ token — the mixin does not distinguish modaliti
 A module only ever produces **time-independent** quantities (tokens + theoretical
 FLOPs); all timing / MFU lives at the orchestrator.
 
+#### Optional graph profiler (`graph_profile.*`, `GraphProfiler`)
+
+SeedOmni also has a lightweight graph profiler for execution-path records and
+optional graph-node timing. This is separate from `train.profile.*`, which owns
+PyTorch profiler traces. The graph profiler is configured at the Omni root:
+
+```yaml
+graph_profile:
+  enable_wall_time: true    # append wall_ms=...
+  enable_cuda_events: true  # append cuda_ms=...
+  enable_memory: true       # append peak_allocated_gb / peak_reserved_gb
+  train_start_step: 1       # training only: save global steps 1-10
+  train_end_step: 10
+```
+
+Inference always writes the graph path to `<output_dir>/<infer_type>/trace.txt`;
+the `graph_profile.enable_*` switches only add suffix fields to those node lines.
+Training writes rank-0 graph traces only when any detail switch is enabled,
+under `train.checkpoint.output_dir/graph_trace`.
+
 Execution is driven by the model itself (not the module's `pre_forward`).
 `OmniModel.forward` loops the FSM (`TrainingGraph.step` → `_collect_training_loss`
 → `maybe_transition`), and `TrainingGraph.step` runs one node end-to-end, which:
@@ -240,14 +260,15 @@ which mirrors `OmniModel.generate` + `GenerationGraph.step`):
 
 ```python
 training_graph.reset()
+profiler = GraphProfiler()
 while not training_graph.is_done():
     # TrainingGraph.step runs the current node end-to-end: unwrap the wrapped
     # sub-module (held by OmniModel), scope its ParallelState, pre_forward →
     # call (through the FSDP/DDP wrapper) → post_forward, merge conversation_list
     # + _loss back into the shared batch (edges are topology only, no input routing).
-    batch = training_graph.step(modules, batch, trace, scope_fn)
-    self._collect_training_loss(batch, trace)   # pop _loss → self._losses[node]
-    training_graph.maybe_transition()
+    batch = training_graph.step(modules, batch, profiler=profiler, scope_fn=scope_fn)
+    self._collect_training_loss(batch, profiler)   # pop _loss → self._losses[node]
+    training_graph.maybe_transition(profiler=profiler)
 total_loss = sum(self._losses.values())
 ```
 

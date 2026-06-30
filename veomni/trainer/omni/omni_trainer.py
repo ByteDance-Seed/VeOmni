@@ -51,7 +51,7 @@ import math
 import os
 import random
 from collections import defaultdict
-from typing import TYPE_CHECKING, Any, Dict, List
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import numpy as np
 import torch
@@ -62,6 +62,7 @@ from ...data import SeedOmniCollator
 from ...data.data_transform import build_data_transform
 from ...distributed.clip_grad_norm import veomni_omni_module_clip_grad_norm
 from ...distributed.parallel_state import use_parallel_state
+from ...models.seed_omni.graphs import GraphProfiler
 from ...models.seed_omni.mixins.tracemixin import TraceResult
 from ...models.seed_omni.modeling_omni import OmniModel, _unwrap_module
 from ...ops.batch_invariant_ops import set_batch_invariant_mode
@@ -462,7 +463,41 @@ class OmniTrainer:
 
     # ── Forward / backward (override single-model path) ────────────────────────
 
-    def forward_backward_step(self, micro_batch: Dict[str, Any]):
+    def _should_save_graph_profile(self) -> bool:
+        profile = self.base.args.graph_profile
+        if self.base.args.train.global_rank != 0:
+            return False
+        if not profile.enable_graph_profiling():
+            return False
+        return profile.train_start_step <= self.base.state.global_step <= profile.train_end_step
+
+    def _build_graph_profiler(self) -> Optional[GraphProfiler]:
+        profile = self.base.args.graph_profile
+        if not self._should_save_graph_profile():
+            return None
+
+        return GraphProfiler(
+            enable_wall_time=profile.enable_wall_time,
+            enable_cuda_events=profile.enable_cuda_events,
+            enable_memory=profile.enable_memory,
+        )
+
+    def _save_graph_profile(self, profiler: Optional[GraphProfiler], *, micro_step: int) -> None:
+        if profiler is None:
+            return
+
+        args: OmniArguments = self.base.args
+        trace_dir = os.path.join(args.train.checkpoint.output_dir, "graph_trace")
+        os.makedirs(trace_dir, exist_ok=True)
+        trace_path = os.path.join(
+            trace_dir,
+            f"step_{self.base.state.global_step:06d}_micro_{micro_step:02d}_rank_{args.train.global_rank}.txt",
+        )
+        with open(trace_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(profiler.save_records()) + "\n")
+        logger.info_rank0(f"OmniTrainer: graph profile trace → {trace_path}")
+
+    def forward_backward_step(self, micro_batch: Dict[str, Any], *, micro_step: int = 0):
         """One gradient-accumulation micro-batch over the training DAG.
 
         ``OmniModel.forward`` returns ``{"loss", "losses"}`` where ``loss`` is
@@ -471,9 +506,11 @@ class OmniTrainer:
         """
         base = self.base
         micro_batch = base.preforward(micro_batch)
+        profiler = self._build_graph_profiler()
 
         with base.model_fwd_context, set_batch_invariant_mode(base.args.train.enable_batch_invariant_mode):
-            result: Dict[str, Any] = base.model(**micro_batch)
+            result: Dict[str, Any] = base.model(profiler=profiler, **micro_batch)
+        self._save_graph_profile(profiler, micro_step=micro_step)
 
         total_loss: torch.Tensor = result["loss"]
         if total_loss is None:
@@ -525,7 +562,7 @@ class OmniTrainer:
 
         for micro_step, micro_batch in enumerate(micro_batches):
             self.model_reshard(micro_step, num_micro_steps)
-            loss, loss_dict = self.forward_backward_step(micro_batch)
+            loss, loss_dict = self.forward_backward_step(micro_batch, micro_step=micro_step)
             total_loss += loss.item() / num_micro_steps
             for k, v in loss_dict.items():
                 total_loss_dict[k] += v.item() / num_micro_steps

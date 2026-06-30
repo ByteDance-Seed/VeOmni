@@ -119,6 +119,45 @@ class OmniModelArguments(ModelArguments):
 
 
 @dataclass
+class OmniGraphProfileArguments:
+    """``graph_profile.*`` — SeedOmni graph profiler settings.
+
+    This is separate from ``train.profile.*``. The latter owns PyTorch profiler
+    traces; this block controls graph-node execution records and optional
+    wall/CUDA/memory suffixes.
+    """
+
+    train_start_step: int = field(
+        default=1,
+        metadata={
+            "help": (
+                "First training global step to save graph profiler records for. "
+                "Only used when at least one graph profiler detail switch is enabled."
+            )
+        },
+    )
+    train_end_step: int = field(
+        default=2,
+        metadata={"help": "Last training global step to save graph profiler records for."},
+    )
+    enable_wall_time: bool = field(
+        default=False,
+        metadata={"help": "Append per graph-node wall-clock timing to graph profiler records."},
+    )
+    enable_cuda_events: bool = field(
+        default=False,
+        metadata={"help": "Append per graph-node CUDA event timing to graph profiler records."},
+    )
+    enable_memory: bool = field(
+        default=False,
+        metadata={"help": "Append request-local peak device memory to graph profiler records."},
+    )
+
+    def enable_graph_profiling(self) -> bool:
+        return self.enable_wall_time or self.enable_cuda_events or self.enable_memory
+
+
+@dataclass
 class OmniInferArguments:
     """``infer.*`` — OmniModel V2 inference configuration + per-call knobs.
 
@@ -213,6 +252,7 @@ class OmniArguments(VeOmniArguments):
     data: OmniDataArguments = field(default_factory=OmniDataArguments)
     train: OmniTrainingArguments = field(default_factory=OmniTrainingArguments)
     accelerator: AcceleratorConfig = field(default_factory=AcceleratorConfig)
+    graph_profile: OmniGraphProfileArguments = field(default_factory=OmniGraphProfileArguments)
     infer: OmniInferArguments = field(default_factory=OmniInferArguments)
 
     def __post_init__(self):
@@ -295,5 +335,6 @@ __all__ = [
     "OmniTrainingArguments",
     "OmniModelArguments",
     "OmniInferArguments",
+    "OmniGraphProfileArguments",
     "OmniArguments",
 ]
