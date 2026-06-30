@@ -20,8 +20,10 @@ train:
       fsdp_mode: fsdp2
       mixed_precision:
         enable: true
-    offload:
+    offload_config:
       enable_activation: false
+      enable_async_activation: false
+      activation_offload_modules:
   gradient_checkpointing:
     enable: true
   global_batch_size: 8

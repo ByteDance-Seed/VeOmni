@@ -15,6 +15,8 @@ veomni/
 │   ├── parallel_state.py   init_parallel_state(), ParallelState, device mesh setup
 │   ├── torch_parallelize.py  build_parallelize_model(), parallelize_model_fsdp2()
 │   ├── parallel_plan.py    ParallelPlan for ExtraParallel (EP, embedding shard)
+│   ├── async_offload.py    Async activation offload (SwapTensor, OffloadManager, async_save_on_cpu)
+│   ├── training_context.py TrainingContext singleton (stage, layer_index, model_depth)
 │   ├── fsdp2/          FSDP2 (composable fully_shard), gradient clipping
 │   ├── moe/            MoE expert parallelism: token routing, all-to-all, EPGroupGemm
 │   └── sequence_parallel/  Ulysses SP: all-to-all head/seq exchange, async variants
@@ -70,6 +72,8 @@ veomni/
 │   ├── base_rl_trainer.py   Base RL trainer for RLHF
 │   └── callbacks/      Training callbacks (checkpoint, evaluate, trace, etc.)
 └── utils/              Shared utilities (logging, device, constants, helpers)
+    ├── singleton.py    Singleton metaclass for global state objects
+    ├── module_match.py module_name_match() for glob-style module name matching
 ```
 
 ## Trainer Hierarchy
