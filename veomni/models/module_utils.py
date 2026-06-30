@@ -18,9 +18,6 @@ import json
 import math
 import os
 import re
-import shutil
-import subprocess
-import tempfile
 import time
 from collections import OrderedDict
 from contextlib import contextmanager
@@ -60,103 +57,6 @@ if TYPE_CHECKING:
 
 
 logger = logging.get_logger(__name__)
-
-
-def _resolve_hdfs_uri(filepath: str) -> Optional[str]:
-    mount_prefix = os.getenv("VEOMNI_STAGE_HDFS_SAFETENSORS_MOUNT_PREFIX")
-    uri_prefix = os.getenv("VEOMNI_STAGE_HDFS_SAFETENSORS_URI_PREFIX")
-    if not mount_prefix and not uri_prefix:
-        return None
-    if not mount_prefix or not uri_prefix:
-        raise ValueError(
-            "VEOMNI_STAGE_HDFS_SAFETENSORS_MOUNT_PREFIX and "
-            "VEOMNI_STAGE_HDFS_SAFETENSORS_URI_PREFIX must be set together."
-        )
-
-    mount_prefix = os.path.abspath(mount_prefix)
-    filepath = os.path.abspath(filepath)
-    if filepath != mount_prefix and not filepath.startswith(f"{mount_prefix}{os.sep}"):
-        return None
-
-    relative_path = os.path.relpath(filepath, mount_prefix)
-    return f"{uri_prefix.rstrip('/')}/{relative_path}"
-
-
-def _copy_safetensors_shard(filepath: str, staged_filepath: str) -> None:
-    hdfs_uri = _resolve_hdfs_uri(filepath)
-    if hdfs_uri is None:
-        shutil.copyfile(filepath, staged_filepath)
-        return
-
-    copy_method = os.getenv("VEOMNI_STAGE_HDFS_SAFETENSORS_COPY_METHOD", "copy_to_local")
-    if copy_method == "copy_to_local":
-        logger.info_rank0(f"Copying safetensors shard with hdfs dfs -copyToLocal: {hdfs_uri} -> {staged_filepath}")
-        subprocess.run(
-            ["hdfs", "dfs", "-copyToLocal", "-f", hdfs_uri, staged_filepath],
-            check=True,
-            env=_get_hdfs_subprocess_env(),
-        )
-    elif copy_method == "get":
-        logger.info_rank0(f"Copying safetensors shard with hdfs dfs -get: {hdfs_uri} -> {staged_filepath}")
-        subprocess.run(
-            ["hdfs", "dfs", "-get", "-f", hdfs_uri, staged_filepath],
-            check=True,
-            env=_get_hdfs_subprocess_env(),
-        )
-    elif copy_method == "cat":
-        logger.info_rank0(f"Copying safetensors shard with hdfs dfs -cat: {hdfs_uri} -> {staged_filepath}")
-        with open(staged_filepath, "wb") as staged_file:
-            subprocess.run(
-                ["hdfs", "dfs", "-cat", hdfs_uri],
-                stdout=staged_file,
-                check=True,
-                env=_get_hdfs_subprocess_env(),
-            )
-    else:
-        raise ValueError(
-            f"VEOMNI_STAGE_HDFS_SAFETENSORS_COPY_METHOD must be one of: copy_to_local, get, cat. Got {copy_method!r}."
-        )
-
-
-def _get_hdfs_subprocess_env() -> Dict[str, str]:
-    env = os.environ.copy()
-    env["CPP_HDFS_LOG_TYPE"] = "file,stderr"
-    env["CPP_HDFS_LOG_LEVEL"] = "error"
-    libhdfs_opts = env.get("LIBHDFS_OPTS", "")
-    if "hadoop.root.logger" not in libhdfs_opts:
-        env["LIBHDFS_OPTS"] = f"{libhdfs_opts} -Dhadoop.root.logger=ERROR,console".strip()
-    return env
-
-
-@contextmanager
-def _stage_safetensors_if_requested(filepath: str):
-    stage_dir = os.getenv("VEOMNI_STAGE_HDFS_SAFETENSORS_DIR")
-    if not stage_dir:
-        yield filepath
-        return
-
-    stage_dir = os.path.abspath(stage_dir)
-    if stage_dir.startswith("/mnt/hdfs/"):
-        raise ValueError("VEOMNI_STAGE_HDFS_SAFETENSORS_DIR must be a local filesystem path, not an HDFS mount.")
-
-    os.makedirs(stage_dir, exist_ok=True)
-    with tempfile.NamedTemporaryFile(
-        dir=stage_dir,
-        prefix=f"{os.path.basename(filepath)}.",
-        suffix=".tmp",
-        delete=False,
-    ) as tmp_file:
-        staged_filepath = tmp_file.name
-
-    try:
-        logger.info_rank0(f"Staging safetensors shard to local path: {filepath} -> {staged_filepath}")
-        _copy_safetensors_shard(filepath, staged_filepath)
-        yield staged_filepath
-    finally:
-        try:
-            os.remove(staged_filepath)
-        except FileNotFoundError:
-            pass
 
 
 @contextmanager
@@ -199,10 +99,9 @@ class StateDictIterator:
 
     def __iter__(self) -> Generator[Tuple[str, "torch.Tensor"], None, None]:
         if self.filepath.endswith(".safetensors"):
-            with _stage_safetensors_if_requested(self.filepath) as filepath:
-                with safe_open(filepath, framework="pt", device="cpu") as f:
-                    for key in f.keys():
-                        yield key, f.get_tensor(key)
+            with safe_open(self.filepath, framework="pt", device="cpu") as f:
+                for key in f.keys():
+                    yield key, f.get_tensor(key)
 
         else:
             state_dict = torch.load(self.filepath, map_location="cpu", weights_only=True, mmap=True)
