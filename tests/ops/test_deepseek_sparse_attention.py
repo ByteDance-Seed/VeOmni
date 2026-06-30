@@ -5,8 +5,28 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from veomni.utils.device import get_gpu_compute_capability
+
 
 dsa = pytest.importorskip("veomni.ops.kernels.deepseek_sparse_attention.flashmla_cudnn")
+
+
+def _eager_sparse_mla_forward(q_pe, k_pe, kv_cache, q_nope, topk_indices, *, softmax_scale):
+    packed_q = torch.cat((q_nope, q_pe), dim=-1).float()
+    packed_k = torch.cat((kv_cache.squeeze(2), k_pe.squeeze(2)), dim=-1).float()
+    values = kv_cache.squeeze(2).float()
+    output = torch.empty((*q_pe.shape[:3], kv_cache.shape[-1]), device=q_pe.device, dtype=torch.float32)
+
+    for batch_idx in range(q_pe.shape[0]):
+        for seq_idx in range(q_pe.shape[1]):
+            indices = topk_indices[batch_idx, seq_idx].long()
+            q_row = packed_q[batch_idx, seq_idx]
+            k_row = packed_k[batch_idx, indices]
+            v_row = values[batch_idx, indices]
+            scores = torch.einsum("hd,td->ht", q_row, k_row) * softmax_scale
+            output[batch_idx, seq_idx] = torch.softmax(scores, dim=-1) @ v_row
+
+    return output.to(q_pe.dtype)
 
 
 def test_deepseek_sparse_attention_is_not_eagerly_imported_by_kernels():
@@ -332,6 +352,63 @@ def test_flash_mla_sparse_attention_with_cudnn_backward_splits_gradients(monkeyp
     assert torch.equal(q_pe.grad, torch.full_like(q_pe, 2.0))
     assert torch.equal(kv_cache.grad, torch.full_like(kv_cache, 3.0))
     assert torch.equal(k_pe.grad, torch.full_like(k_pe, 4.0))
+
+
+@pytest.mark.skipif(
+    get_gpu_compute_capability() != 100,
+    reason="FlashMLA/cuDNN DSA numerical parity test requires SM100, e.g. B200.",
+)
+def test_flash_mla_sparse_attention_with_cudnn_backward_sm100_matches_eager():
+    device = "cuda"
+    dtype = torch.bfloat16
+    batch_size, seqlen_q, seqlen_k, topk, num_heads = 1, 2, 192, 128, 128
+    d_pe, d_nope = 64, 512
+    softmax_scale = (d_pe + d_nope) ** -0.5
+    torch.manual_seed(0)
+
+    q_pe = (0.2 * torch.randn(batch_size, seqlen_q, num_heads, d_pe, device=device)).to(dtype).requires_grad_(True)
+    k_pe = (0.2 * torch.randn(batch_size, seqlen_k, 1, d_pe, device=device)).to(dtype).requires_grad_(True)
+    kv_cache = (0.2 * torch.randn(batch_size, seqlen_k, 1, d_nope, device=device)).to(dtype).requires_grad_(True)
+    q_nope = (0.2 * torch.randn(batch_size, seqlen_q, num_heads, d_nope, device=device)).to(dtype).requires_grad_(True)
+    sparse_indices = torch.randperm(seqlen_k, device=device, dtype=torch.int32)[:topk]
+    topk_indices = sparse_indices.view(1, 1, topk).expand(batch_size, seqlen_q, topk).contiguous()
+    grad_out = torch.randn(batch_size, seqlen_q, num_heads, d_nope, device=device, dtype=dtype)
+
+    q_pe_eager = q_pe.detach().clone().requires_grad_(True)
+    k_pe_eager = k_pe.detach().clone().requires_grad_(True)
+    kv_cache_eager = kv_cache.detach().clone().requires_grad_(True)
+    q_nope_eager = q_nope.detach().clone().requires_grad_(True)
+
+    out_kernel = dsa.flash_mla_sparse_attention_with_cudnn_backward(
+        q_pe,
+        k_pe,
+        kv_cache,
+        q_nope,
+        topk_indices,
+        softmax_scale=softmax_scale,
+    )
+    out_eager = _eager_sparse_mla_forward(
+        q_pe_eager,
+        k_pe_eager,
+        kv_cache_eager,
+        q_nope_eager,
+        topk_indices,
+        softmax_scale=softmax_scale,
+    )
+
+    assert out_eager.float().norm() > 1.0
+    torch.testing.assert_close(out_kernel.float(), out_eager.float(), atol=5e-3, rtol=5e-2)
+
+    out_kernel.backward(grad_out)
+    out_eager.backward(grad_out)
+    assert q_pe_eager.grad.float().norm() > 1.0
+    assert k_pe_eager.grad.float().norm() > 1.0
+    assert kv_cache_eager.grad.float().norm() > 1.0
+    assert q_nope_eager.grad.float().norm() > 1.0
+    torch.testing.assert_close(q_pe.grad.float(), q_pe_eager.grad.float(), atol=1e-2, rtol=6e-2)
+    torch.testing.assert_close(k_pe.grad.float(), k_pe_eager.grad.float(), atol=1e-2, rtol=6e-2)
+    torch.testing.assert_close(kv_cache.grad.float(), kv_cache_eager.grad.float(), atol=1e-2, rtol=6e-2)
+    torch.testing.assert_close(q_nope.grad.float(), q_nope_eager.grad.float(), atol=1e-2, rtol=6e-2)
 
 
 @pytest.mark.parametrize(
