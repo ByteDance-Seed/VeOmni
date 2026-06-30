@@ -30,6 +30,7 @@ from ..arguments import MixedPrecisionConfig
 from ..models import load_model_weights, load_model_weights_ep_sharded, rank0_load_and_broadcast_weights
 from ..utils import logging
 from ..utils.device import IS_NPU_AVAILABLE, get_device_type
+from .async_offloading import apply_async_activation_offload
 from .checkpoint import CheckpointFunction
 from .chunk_mbs import apply_chunk_mbs
 from .parallel_plan import get_runtime_parallel_plan
@@ -598,6 +599,10 @@ def build_parallelize_model(
         model.gradient_checkpointing_enable(
             gradient_checkpointing_kwargs=gradient_checkpointing_kwargs,
         )
+
+    # Apply async activation offload AFTER GC enable but BEFORE FSDP2 sharding.
+    if kwargs.pop("enable_async_activation_offload", False):
+        apply_async_activation_offload(model)
 
     if chunk_mbs_config is not None and chunk_mbs_config.enable:
         model = apply_chunk_mbs(model, chunk_mbs_config)

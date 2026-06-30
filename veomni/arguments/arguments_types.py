@@ -452,12 +452,25 @@ class OffloadConfig:
 
     enable_activation: bool = field(
         default=False,
-        metadata={"help": "Enable activation offload to CPU."},
+        metadata={"help": "Enable synchronous activation offload to CPU."},
     )
     activation_gpu_limit: float = field(
         default=0.0,
         metadata={
             "help": "When enabling activation offload, `activation_gpu_limit` GB activations are allowed to reserve on GPU."
+        },
+    )
+    enable_async_activation_offload: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Enable async activation offload to CPU via stream-based D2H/H2D transfers. "
+                "More efficient than synchronous offload. When enabled, takes precedence over "
+                "`enable_activation`. Must be used together with gradient checkpointing "
+                "(recomputation). Offload targets are auto-derived from "
+                "`model._no_split_modules` — the same class names used for FSDP sharding "
+                "boundaries."
+            )
         },
     )
 
@@ -760,12 +773,22 @@ class TrainingArguments:
         self.global_rank = int(os.getenv("RANK", 0))
         self.world_size = int(os.getenv("WORLD_SIZE", 1))
 
+        self._validate_offload()
         self._validate_accelerator()
         self._derive_batch_config()
         self._resolve_checkpoint_paths()
         self._resolve_profile()
 
     # -- validation & derivation helpers (called by __post_init__) -----------------------
+
+    def _validate_offload(self):
+        if self.accelerator.offload_config.enable_async_activation_offload and not self.gradient_checkpointing.enable:
+            raise ValueError(
+                "enable_async_activation_offload requires gradient_checkpointing.enable=True. "
+                "Async activation offload relies on recomputation to release intermediate "
+                "activations from GPU memory. Please enable gradient checkpointing or disable "
+                "async activation offload."
+            )
 
     def _validate_accelerator(self):
         acc = self.accelerator
