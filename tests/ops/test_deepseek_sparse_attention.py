@@ -401,14 +401,14 @@ def test_flash_mla_sparse_attention_with_cudnn_backward_sm100_matches_eager():
 
     out_kernel.backward(grad_out)
     out_eager.backward(grad_out)
-    assert q_pe_eager.grad.float().norm() > 1.0
-    assert k_pe_eager.grad.float().norm() > 1.0
+    assert q_pe_eager.grad.float().norm() > 0.1
+    assert k_pe_eager.grad.float().norm() > 0.1
     assert kv_cache_eager.grad.float().norm() > 1.0
-    assert q_nope_eager.grad.float().norm() > 1.0
-    torch.testing.assert_close(q_pe.grad.float(), q_pe_eager.grad.float(), atol=1e-2, rtol=6e-2)
-    torch.testing.assert_close(k_pe.grad.float(), k_pe_eager.grad.float(), atol=1e-2, rtol=6e-2)
+    assert q_nope_eager.grad.float().norm() > 0.1
+    torch.testing.assert_close(q_pe.grad.float(), q_pe_eager.grad.float(), atol=1e-3, rtol=6e-2)
+    torch.testing.assert_close(k_pe.grad.float(), k_pe_eager.grad.float(), atol=1e-3, rtol=6e-2)
     torch.testing.assert_close(kv_cache.grad.float(), kv_cache_eager.grad.float(), atol=1e-2, rtol=6e-2)
-    torch.testing.assert_close(q_nope.grad.float(), q_nope_eager.grad.float(), atol=1e-2, rtol=6e-2)
+    torch.testing.assert_close(q_nope.grad.float(), q_nope_eager.grad.float(), atol=1e-3, rtol=6e-2)
 
 
 @pytest.mark.parametrize(
