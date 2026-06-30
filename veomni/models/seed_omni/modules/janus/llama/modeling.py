@@ -37,10 +37,10 @@ from transformers import PreTrainedModel
 from veomni.models.transformers.llama.generated.patched_modeling_llama_gpu import LlamaModel
 
 from .configuration import JanusLlamaConfig
-from .modulemixin import JanusLlamaModuleMixin, JanusLlamaTraceMixin
+from .modulemixin import JanusLlamaMetricMeterMixin, JanusLlamaModuleMixin
 
 
-class JanusLlama(JanusLlamaModuleMixin, JanusLlamaTraceMixin, PreTrainedModel):
+class JanusLlama(JanusLlamaModuleMixin, JanusLlamaMetricMeterMixin, PreTrainedModel):
     """LLaMA backbone (no wte, no lm_head).
 
     Multi-modal inputs are already embedded by the sibling encoder modules

@@ -72,16 +72,16 @@ The mixins expose **optional hooks** with safe defaults:
 | `get_parallel_plan()` | build | per-module FSDP/SP plan |
 | `get_assets()` | save | processors / tokenizers to checkpoint |
 | `dummy_inputs(...)` | training | zero placeholders to keep FSDP aligned |
-| `trace_add(...)` / `trace_collect(...)` | training | **optional** per-module token + theoretical-FLOPs meter (`TraceMixin`; driven by the module-trainer, not `pre_forward`) |
+| `metric_meter_add(...)` / `metric_meter_collect(...)` | training | **optional** per-module token + theoretical-FLOPs meter (`MetricMeterMixin`; driven by the module-trainer, not `pre_forward`) |
 
-#### Optional per-module trace (`mixins/tracemixin.py`, `TraceMixin`)
+#### Optional per-module metric meter (`mixins/metric_meter_mixin.py`, `MetricMeterMixin`)
 
 `OmniModel` has no single `model_type` to estimate FLOPs on, so **FLOPs / MFU
 accounting is per-module and opt-in**. The per-module meter is the optional
-`TraceMixin` living on the module itself (`self.base.model` may or may not be a
-`TraceMixin`) — the per-module analogue of how `helper.EnvironMeter` lives on the
-trainer. A module opts in by mixing in `TraceMixin` (alongside `ModuleMixin`) and
-implementing two hooks itself — `trace_token_lengths(method, data)` (its token
+`MetricMeterMixin` living on the module itself (`self.base.model` may or may not be a
+`MetricMeterMixin`) — the per-module analogue of how `helper.EnvironMeter` lives on the
+trainer. A module opts in by mixing in `MetricMeterMixin` (alongside `ModuleMixin`) and
+implementing two hooks itself — `metric_meter_token_lengths(method, data)` (its token
 count) and `estimate_flops(seqlens)` (its own theoretical-FLOPs formula). It does
 **not** touch its own `init_omni_state` / `pre_forward`. There is **no** shared
 whole-model FLOPs counter: that would mis-count at module granularity (e.g. an AR
@@ -118,8 +118,8 @@ Execution is driven by the model itself (not the module's `pre_forward`).
 → `maybe_transition`), and `TrainingGraph.step` runs one node end-to-end, which:
 
 1. runs the module's `pre_forward` → real input tensors;
-2. feeds the meter `trace_add(method, data)` — the analogue of `EnvironMeter.add`.
-   **Each module implements its own** `trace_token_lengths(method, data)` +
+2. feeds the meter `metric_meter_add(method, data)` — the analogue of `EnvironMeter.add`.
+   **Each module implements its own** `metric_meter_token_lengths(method, data)` +
    `estimate_flops(seqlens)` (no generic defaults). For Janus:
    - `janus_llama` (backbone) — packed `cu_seq_lens_q`; FLOPs = transformer
      layers (no `lm_head`/`wte`).
@@ -137,7 +137,7 @@ Execution is driven by the model itself (not the module's `pre_forward`).
    batch, which SP would slice — an accepted limitation;
 3. runs the requested method (through the FSDP wrapper) + `post_forward`.
 
-At the module-trainer's `on_step_end`, `trace_collect()` returns
+At the module-trainer's `on_step_end`, `metric_meter_collect()` returns
 `(estimate_flops(seqlens), seqlens)` — **no timing, no MFU, no reduction**. The
 orchestrator (`OmniEnvironMeterCallback` + `OmniEnvironMeter`, in
 `veomni/utils/omni_helper.py`) owns the single whole-graph timing and the
@@ -409,7 +409,7 @@ Use the `/seedomni-v2` skill for the full checklist. The shape of the work:
 | Path | Responsibility |
 |------|----------------|
 | `mixins/modulemixin.py` | base `ModuleMixin` (shared hook defaults + `init_omni_state`) |
-| `mixins/tracemixin.py` | `TraceMixin` / `TraceResult` (optional per-module FLOPs meter) |
+| `mixins/metric_meter_mixin.py` | `MetricMeterMixin` / `MetricMeterResult` (optional per-module FLOPs meter) |
 | `utils/conversation.py` | `ConversationItem` + carrier helpers |
 | `utils/convert_registry.py` | HF → split-checkpoint conversion registry |
 | `graphs/graph.py` | shared `NodeDef` / `EdgeDef` / `END` |

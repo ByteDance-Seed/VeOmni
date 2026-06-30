@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""TraceMixin — optional per-module training-trace (tokens + theoretical FLOPs).
+"""MetricMeterMixin — optional per-module training meter (tokens + theoretical FLOPs).
 
 Why per-module
 --------------
@@ -27,15 +27,15 @@ What a module computes vs. what the trainer computes
 ----------------------------------------------------
 A module only ever produces **time-independent** quantities:
 
-* :meth:`trace_add` accumulates this module's token lengths — the per-module
+* :meth:`metric_meter_add` accumulates this module's token lengths — the per-module
   analogue of ``EnvironMeter.add``.  The
   :class:`~veomni.trainer.omni.omni_module_trainer.OmniModuleTrainer` calls it right after
   ``pre_forward`` (when the real input tensors are in hand), passing the node's
   ``method`` + the forward ``data``.  **Each module implements its own**
-  :meth:`trace_token_lengths` — there is no generic default, because token
+  :meth:`metric_meter_token_lengths` — there is no generic default, because token
   domains differ and some call-sites shouldn't be counted (e.g. a VQ codec counts
   on ``encode``, returns ``[]`` on ``decode``).
-* :meth:`trace_collect` returns ``(theoretical_flops, seqlens)`` — the total
+* :meth:`metric_meter_collect` returns ``(theoretical_flops, seqlens)`` — the total
   theoretical TFLOPs for this module's compute over the step plus its raw token
   lengths.  **No timing, no MFU, no cross-rank reduction here.**
 
@@ -52,39 +52,39 @@ whatever its modality. Each module implements its own :meth:`estimate_flops`
 mis-count at module granularity).
 
 Opt-in is by **multiple inheritance**, NOT by ``ModuleMixin`` (``ModuleMixin``
-does *not* inherit ``TraceMixin``). A module that wants tracing defines its own
-``XxxTraceMixin(TraceMixin)`` implementing ``estimate_flops`` +
-``trace_token_lengths``, and its concrete model multi-inherits it, e.g.::
+does *not* inherit ``MetricMeterMixin``). A module that wants metering defines its own
+``XxxMetricMeterMixin(MetricMeterMixin)`` implementing ``estimate_flops`` +
+``metric_meter_token_lengths``, and its concrete model multi-inherits it, e.g.::
 
-    class TextEncoder(TextEncoderModuleMixin, TextEncoderTraceMixin, PreTrainedModel): ...
+    class TextEncoder(TextEncoderModuleMixin, TextEncoderMetricMeterMixin, PreTrainedModel): ...
 
-The orchestrator decides whether a module traces with
-``isinstance(model, TraceMixin)``. Modules without a trace mixin contribute
+The orchestrator decides whether a module contributes metrics with
+``isinstance(model, MetricMeterMixin)``. Modules without a metric meter contribute
 nothing.
 """
 
 from typing import Any, Dict, List, Tuple
 
 
-# What a tracing module hands back each step: its total theoretical TFLOPs +
+# What a metered module hands back each step: its total theoretical TFLOPs +
 # the raw (this-rank) per-sample token lengths it processed.
-TraceResult = Tuple[float, List[int]]
+MetricMeterResult = Tuple[float, List[int]]
 
 
-class TraceMixin:
+class MetricMeterMixin:
     """Optional per-module token + theoretical-FLOPs meter for SeedOmni V2."""
 
-    def _trace_seqlen_buffer(self) -> List[int]:
+    def _metric_meter_seqlen_buffer(self) -> List[int]:
         # Lazily initialised so an implementing module never has to touch its own
         # ``init_omni_state`` / ``pre_forward``.
-        if not hasattr(self, "_trace_seqlens"):
-            self._trace_seqlens: List[int] = []
-        return self._trace_seqlens
+        if not hasattr(self, "_metric_meter_seqlens"):
+            self._metric_meter_seqlens: List[int] = []
+        return self._metric_meter_seqlens
 
     def estimate_flops(self, seqlens: List[int]) -> float:
         """Total theoretical TFLOPs for this module's compute over ``seqlens``.
 
-        **Each tracing module implements its own** — :class:`VeomniFlopsCounter`
+        **Each metered module implements its own** — :class:`VeomniFlopsCounter`
         is a *whole-model* estimator and is wrong at module granularity (e.g. an
         AR backbone owns no ``wte`` / ``lm_head`` — those FLOPs belong to the
         ``text_encoder`` module).  Return the total FLOPs in TFLOPs (forward +
@@ -93,13 +93,13 @@ class TraceMixin:
         achieved FLOPs / MFU.
         """
         raise NotImplementedError(
-            f"{type(self).__name__} mixes in TraceMixin but does not implement estimate_flops(seqlens)."
+            f"{type(self).__name__} mixes in MetricMeterMixin but does not implement estimate_flops(seqlens)."
         )
 
-    def trace_token_lengths(self, method: str, data: Dict[str, Any]) -> List[int]:
+    def metric_meter_token_lengths(self, method: str, data: Dict[str, Any]) -> List[int]:
         """Per-sample token lengths this module processes for call-site ``method``.
 
-        **Each tracing module implements its own** — there is no generic default,
+        **Each metered module implements its own** — there is no generic default,
         because token domains differ (text seq len vs image patches vs VQ tokens)
         and some call-sites shouldn't be counted at all.  ``method`` is the graph
         node's call-site (``"forward"`` / ``"encode"`` / ``"decode"`` / …) and
@@ -108,13 +108,13 @@ class TraceMixin:
 
         Return ``[]`` to skip a call — e.g. a VQ codec counts its tokens on
         ``encode`` but returns ``[]`` on ``decode``; empty contributions never
-        enter the trace.
+        enter the meter.
         """
         raise NotImplementedError(
-            f"{type(self).__name__} mixes in TraceMixin but does not implement trace_token_lengths(method, data)."
+            f"{type(self).__name__} mixes in MetricMeterMixin but does not implement metric_meter_token_lengths(method, data)."
         )
 
-    def trace_add(self, method: str, data: Dict[str, Any]) -> None:
+    def metric_meter_add(self, method: str, data: Dict[str, Any]) -> None:
         """Accumulate this micro-batch's token lengths (per-module ``meter.add``).
 
         Called once per micro-batch by the module-trainer right after
@@ -122,9 +122,9 @@ class TraceMixin:
         node's ``method``.  Sums correctly over a whole gradient-accumulation
         step (a call that returns ``[]`` adds nothing).
         """
-        self._trace_seqlen_buffer().extend(self.trace_token_lengths(method, data))
+        self._metric_meter_seqlen_buffer().extend(self.metric_meter_token_lengths(method, data))
 
-    def trace_collect(self) -> TraceResult:
+    def metric_meter_collect(self) -> MetricMeterResult:
         """Return ``(theoretical_flops, seqlens)`` for the step, then reset.
 
         ``theoretical_flops`` is the module's own total theoretical TFLOPs
@@ -133,9 +133,9 @@ class TraceMixin:
         + ranks and divides by the single whole-graph time for achieved FLOPs /
         MFU.
         """
-        seqlens = self._trace_seqlen_buffer()
-        self._trace_seqlens = []
+        seqlens = self._metric_meter_seqlen_buffer()
+        self._metric_meter_seqlens = []
         return self.estimate_flops(seqlens), seqlens
 
 
-__all__ = ["TraceMixin", "TraceResult"]
+__all__ = ["MetricMeterMixin", "MetricMeterResult"]

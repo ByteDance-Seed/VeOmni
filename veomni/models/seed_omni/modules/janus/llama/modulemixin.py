@@ -6,8 +6,8 @@ from veomni.distributed.parallel_state import get_parallel_state
 from veomni.utils.seqlen_pos_transform_utils import prepare_fa_kwargs_from_position_ids, valid_seqlens_from_cu_seqlens
 from veomni.utils.tensor_utils import naflatten, unflatten
 
+from ....mixins.metric_meter_mixin import MetricMeterMixin
 from ....mixins.modulemixin import ModuleMixin, post_forward, pre_forward
-from ....mixins.tracemixin import TraceMixin
 from ....utils.conversation import ConversationItem, is_dummy
 from .configuration import JanusLlamaConfig
 
@@ -250,12 +250,12 @@ def _fold_fsdp_dummy_anchors(
     return inputs_embeds
 
 
-class JanusLlamaTraceMixin(TraceMixin):
-    """Per-module training-trace for the Janus LLaMA backbone (transformer layers only)."""
+class JanusLlamaMetricMeterMixin(MetricMeterMixin):
+    """Per-module training meter for the Janus LLaMA backbone (transformer layers only)."""
 
     config: JanusLlamaConfig
 
-    def trace_token_lengths(self, method: str, data: Dict[str, Any]) -> List[int]:
+    def metric_meter_token_lengths(self, method: str, data: Dict[str, Any]) -> List[int]:
         # Backbone only runs "forward"; its tokens are the packed per-sample
         # sequence lengths (text + spliced image tokens), read from the
         # FlashAttention cu_seqlens its pre_forward built.
@@ -287,4 +287,4 @@ class JanusLlamaTraceMixin(TraceMixin):
         return (dense_flops + attn_flops) / 1e12
 
 
-__all__ = ["JanusLlamaModuleMixin", "JanusLlamaTraceMixin"]
+__all__ = ["JanusLlamaModuleMixin", "JanusLlamaMetricMeterMixin"]

@@ -2,13 +2,13 @@ from typing import Any, Dict, List, Optional
 
 import torch
 
+from ....mixins.metric_meter_mixin import MetricMeterMixin
 from ....mixins.modulemixin import (
     CPUPreprocessor,
     ModuleMixin,
     post_forward,
     pre_forward,
 )
-from ....mixins.tracemixin import TraceMixin
 from ....utils.conversation import ConversationItem, is_dummy, iter_desired_items
 from .configuration import JanusSiglipConfig
 from .processing import JanusSiglipProcessor
@@ -151,12 +151,12 @@ class JanusSiglipModuleMixin(ModuleMixin):
         )
 
 
-class JanusSiglipTraceMixin(TraceMixin):
-    """Per-module training-trace for the SigLIP vision tower."""
+class JanusSiglipMetricMeterMixin(MetricMeterMixin):
+    """Per-module training meter for the SigLIP vision tower."""
 
     config: JanusSiglipConfig
 
-    def trace_token_lengths(self, method: str, data: Dict[str, Any]) -> List[int]:
+    def metric_meter_token_lengths(self, method: str, data: Dict[str, Any]) -> List[int]:
         # One ViT sequence per image; tokens = patches = (image/patch)**2.
         # (SP would slice the image batch dim, so this is the local count — the
         # vision tower has no full-length cu_seqlens to recover from.)
@@ -192,4 +192,4 @@ class JanusSiglipTraceMixin(TraceMixin):
         return (dense_flops + attn_flops) / 1e12
 
 
-__all__ = ["JanusSiglipModuleMixin", "JanusSiglipTraceMixin"]
+__all__ = ["JanusSiglipModuleMixin", "JanusSiglipMetricMeterMixin"]

@@ -6,8 +6,8 @@ import torch.nn.functional as F
 
 from veomni.utils.tensor_utils import naflatten, unflatten
 
+from ....mixins.metric_meter_mixin import MetricMeterMixin
 from ....mixins.modulemixin import ModuleMixin, post_forward, pre_forward
-from ....mixins.tracemixin import TraceMixin
 from ....utils.conversation import ConversationItem, is_dummy, seal_outputs
 from .chat_template import TextEncoderChatTemplate
 from .configuration import TextEncoderConfig
@@ -274,8 +274,8 @@ class TextEncoderModuleMixin(ModuleMixin):
         return {"type": "text", "value": text, "meta": meta}
 
 
-class TextEncoderTraceMixin(TraceMixin):
-    """Per-module training-trace for the text encoder (wte + lm_head)."""
+class TextEncoderMetricMeterMixin(MetricMeterMixin):
+    """Per-module training meter for the text encoder (wte + lm_head)."""
 
     config: TextEncoderConfig
 
@@ -286,7 +286,7 @@ class TextEncoderTraceMixin(TraceMixin):
         lm_head_n = self.config.vocab_size * self.config.hidden_size
         return 6 * lm_head_n * sum(seqlens) / 1e12
 
-    def trace_token_lengths(self, method: str, data: Dict[str, Any]) -> List[int]:
+    def metric_meter_token_lengths(self, method: str, data: Dict[str, Any]) -> List[int]:
         # Count once, on encode: `input_ids` is the full packed sequence
         # (pre-LLM, never SP-sliced → SP-safe). The decode pass runs lm_head over
         # the same sequence, so its FLOPs are already covered by this count;
@@ -299,4 +299,4 @@ class TextEncoderTraceMixin(TraceMixin):
         return [int(input_ids.numel())]
 
 
-__all__ = ["TextEncoderModuleMixin", "TextEncoderTraceMixin"]
+__all__ = ["TextEncoderModuleMixin", "TextEncoderMetricMeterMixin"]

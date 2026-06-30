@@ -214,7 +214,7 @@ class TrainingGraph:
         Like the FSM step, this is self-contained: it resolves the module, scopes
         its :class:`ParallelState` (via ``scope_fn`` — vocab-parallel ``emb`` /
         MoE EP groups), runs ``pre_forward`` → method → ``post_forward``, and
-        feeds the optional per-module trace meter. Training and inference both
+        feeds the optional per-module metric meter. Training and inference both
         call the graph endpoint through the **wrapped** module so DDP/FSDP hooks
         fire. Non-``forward`` node methods are dispatched by temporarily
         pointing ``raw.forward`` at the target method so they still run through
@@ -248,10 +248,10 @@ class TrainingGraph:
         with module_context, profile_context:
             kwargs = raw.pre_forward(method=method, **batch)
 
-            # Opt-in trace meter (only modules multi-inheriting a TraceMixin have
-            # ``trace_add``); token lengths read straight from the real inputs.
-            if hasattr(raw, "trace_add"):
-                raw.trace_add(method, kwargs)
+            # Opt-in metric meter (only modules multi-inheriting a MetricMeterMixin have
+            # ``metric_meter_add``); token lengths read straight from the real inputs.
+            if hasattr(raw, "metric_meter_add"):
+                raw.metric_meter_add(method, kwargs)
 
             out = call_graph_endpoint(wrapped, raw, method=method, kwargs=kwargs)
             out = raw.post_forward(method=method, **out)

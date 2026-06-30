@@ -24,8 +24,8 @@ from .configuration_omni import OmniConfig
 from .graphs.generation_graph import GenerationGraph
 from .graphs.graph import END, EdgeDef, NodeDef
 from .graphs.training_graph import TrainingGraph
+from .mixins.metric_meter_mixin import MetricMeterMixin
 from .mixins.modulemixin import ModuleMixin
-from .mixins.tracemixin import TraceMixin
 from .modeling_omni import OmniModel
 from .modules import (
     OMNI_CONFIG_REGISTRY,
@@ -42,7 +42,7 @@ __all__ = [
     "OmniConfig",
     "OmniModel",
     "ModuleMixin",
-    "TraceMixin",
+    "MetricMeterMixin",
     "TrainingGraph",
     "GenerationGraph",
     "NodeDef",

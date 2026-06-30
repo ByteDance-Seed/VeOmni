@@ -17,10 +17,10 @@ from transformers import PreTrainedModel, PreTrainedTokenizerBase
 from ......distributed.parallel_state import get_parallel_state
 from ......ops.kernels.embed import AllToAllEmbedding, VocabParallelLinear
 from .configuration import TextEncoderConfig
-from .modulemixin import TextEncoderModuleMixin, TextEncoderTraceMixin
+from .modulemixin import TextEncoderMetricMeterMixin, TextEncoderModuleMixin
 
 
-class TextEncoder(TextEncoderModuleMixin, TextEncoderTraceMixin, PreTrainedModel):
+class TextEncoder(TextEncoderModuleMixin, TextEncoderMetricMeterMixin, PreTrainedModel):
     """Word-token embedding + LM head."""
 
     config_class = TextEncoderConfig

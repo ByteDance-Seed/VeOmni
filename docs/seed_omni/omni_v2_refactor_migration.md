@@ -30,7 +30,7 @@ old layout** — resolve them with the path/import maps below.
 | Old path | New path | Notes |
 |----------|----------|-------|
 | `veomni/models/seed_omni/module.py` | `veomni/models/seed_omni/mixins/modulemixin.py` | class is still `ModuleMixin`; adds `CPUPreprocessor` |
-| `veomni/models/seed_omni/tracemixin.py` | `veomni/models/seed_omni/mixins/tracemixin.py` | |
+| `veomni/models/seed_omni/metric_meter_mixin.py` | `veomni/models/seed_omni/mixins/metric_meter_mixin.py` | |
 | `veomni/models/seed_omni/conversation.py` | `veomni/models/seed_omni/utils/conversation.py` | |
 | `veomni/models/seed_omni/graph.py` | `veomni/models/seed_omni/graphs/graph.py` | `NodeDef` / `EdgeDef` / `END` |
 | `veomni/models/seed_omni/generation_graph.py` | `veomni/models/seed_omni/graphs/generation_graph.py` | `GenerationGraph`, `FSM_SIGNAL_KEY` |
@@ -51,7 +51,7 @@ Absolute imports (search-and-replace across your branch):
 
 ```text
 veomni.models.seed_omni.module            → veomni.models.seed_omni.mixins.modulemixin
-veomni.models.seed_omni.tracemixin        → veomni.models.seed_omni.mixins.tracemixin
+veomni.models.seed_omni.metric_meter_mixin        → veomni.models.seed_omni.mixins.metric_meter_mixin
 veomni.models.seed_omni.conversation      → veomni.models.seed_omni.utils.conversation
 veomni.models.seed_omni.graph             → veomni.models.seed_omni.graphs.graph
 veomni.models.seed_omni.generation_graph  → veomni.models.seed_omni.graphs.generation_graph
@@ -66,8 +66,8 @@ Relative imports **inside** `modules/<family>/<sub>/*.py` (4 dots reach `seed_om
 ```text
 from ....module import ModuleMixin, pre_forward, post_forward
     → from ....mixins.modulemixin import ModuleMixin, pre_forward, post_forward, CPUPreprocessor
-from ....tracemixin import TraceMixin
-    → from ....mixins.tracemixin import TraceMixin
+from ....metric_meter_mixin import MetricMeterMixin
+    → from ....mixins.metric_meter_mixin import MetricMeterMixin
 from ....conversation import ConversationItem, iter_desired_items, ...
     → from ....utils.conversation import ConversationItem, iter_desired_items, is_dummy, ...
 from ....generation_graph import FSM_SIGNAL_KEY
@@ -78,7 +78,7 @@ Prefer the re-export hubs where possible (stable across future moves):
 
 ```python
 from veomni.models.seed_omni import OmniModel, OmniConfig, ModuleMixin, build_conversation
-from veomni.models.seed_omni.mixins import ModuleMixin, CPUPreprocessor, pre_forward, post_forward, TraceMixin
+from veomni.models.seed_omni.mixins import ModuleMixin, CPUPreprocessor, pre_forward, post_forward, MetricMeterMixin
 from veomni.models.seed_omni.utils import ConversationItem, iter_desired_items, is_dummy
 from veomni.models.seed_omni.graphs import TrainingGraph, GenerationGraph, NodeDef, EdgeDef, END
 from veomni.trainer.omni import OmniTrainer, OmniInferencer, OmniModuleTrainer, OmniModuleInferencer
@@ -118,7 +118,7 @@ from veomni.models.seed_omni.utils.convert_registry import convert_checkpoint
 - `TrainingGraph.collect_inputs` removed (it was a no-op; the `conversation_list`
   carrier flows through `batch`). The `"outputs"` key of `OmniModel.forward`'s
   return is gone.
-- `OmniTrainer.collect_module_trace` renamed → `OmniTrainer.collect_trace`.
+- `OmniTrainer.collect_module_trace` renamed → `OmniTrainer.collect_metric_meter`.
 
 ### 3.3 Chat templates: per-model subclasses of a base
 - New base `TextEncoderChatTemplate` (`modules/base/text_encoder/chat_template.py`)
@@ -172,7 +172,7 @@ from veomni.models.seed_omni.utils.convert_registry import convert_checkpoint
    - If it's a `modules/<family>/...` model file you added (no move), keep it, then
      **apply the §2 import rewrites** and the §3 API edits.
 3. **Run the import rewrite** over your added files (sed/grep the §2 table).
-4. **Fix API breaks** from §3 (executor removal, `collect_trace`, chat-template
+4. **Fix API breaks** from §3 (executor removal, `collect_metric_meter`, chat-template
    base, CPU preprocessor signature, dummy/source).
 5. **Register your model** (unchanged location): `modules/__init__.py`
    (`OMNI_*_REGISTRY`), plus YAML graphs under `configs/seed_omni/<model>/`.

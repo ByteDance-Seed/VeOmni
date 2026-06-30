@@ -825,7 +825,7 @@ lift 到 `train.accelerator`）。
 - **构建**：`parallelize_model_ddp`（`torch_parallelize.py`）在 meta-init 下先 materialize + 加载全量权重，
   **再** `DDP(...)`（DDP 只复制 + 注册梯度同步 hook，不会 materialize meta 参数、不加载权重）。
 - **分发**：`DistributedDataParallel` 不代理属性访问，所以 `TrainingGraph.step`（训练单节点驱动）/
-  `OmniModuleTrainer.on_step_end` 要 `_unwrap_module(...)` 取 `pre_forward`/`post_forward`/`trace_collect`，
+  `OmniModuleTrainer.on_step_end` 要 `_unwrap_module(...)` 取 `pre_forward`/`post_forward`/`metric_meter_collect`，
   但实际前向仍调 **wrapper** 以触发 hook（FSDP2 原地 `raw is wrapper`；DDP 包装 `raw = wrapper.module`）。
   composed 后的 `OmniModel` 把每个 module 的 wrapped model 作为子模块持有，`TrainingGraph.step` 通过 `OmniModel`
   传入的 wrapped modules 字典取用（与 `GenerationGraph.step` 完全对称）。

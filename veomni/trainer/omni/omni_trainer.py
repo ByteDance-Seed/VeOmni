@@ -63,7 +63,7 @@ from ...data.data_transform import build_data_transform
 from ...distributed.clip_grad_norm import veomni_omni_module_clip_grad_norm
 from ...distributed.parallel_state import use_parallel_state
 from ...models.seed_omni.graphs import GraphProfiler
-from ...models.seed_omni.mixins.tracemixin import TraceResult
+from ...models.seed_omni.mixins.metric_meter_mixin import MetricMeterResult
 from ...models.seed_omni.modeling_omni import OmniModel, _unwrap_module
 from ...ops.batch_invariant_ops import set_batch_invariant_mode
 from ...utils import helper, logging
@@ -437,29 +437,29 @@ class OmniTrainer:
         base._init_callbacks()
         # The single-model EnvironMeterCallback can't meter OmniModel (no single
         # model_type for FLOPs, entry batch carries only conversation_list).
-        # Swap in the per-module trace meter, which delegates token / FLOPs / MFU
-        # to each module's TraceMixin and merges them under ``trace/<module>/``.
+        # Swap in the per-module metric meter, which delegates token / FLOPs / MFU
+        # to each module's MetricMeterMixin and merges them under ``trace/<module>/``.
         base.environ_meter_callback = OmniEnvironMeterCallback(self)
         base.checkpointer_callback = OmniGlobalStateCallback(self)
         base.hf_ckpt_callback = Callback(base)
 
-    # ── Trace metering (gather each module's tokens + theoretical FLOPs) ───────
+    # ── Metric metering (gather each module's tokens + theoretical FLOPs) ──────
 
-    def collect_trace(self) -> Dict[str, TraceResult]:
-        """Gather every tracing module's ``(theoretical_flops, seqlens)``.
+    def collect_metric_meter(self) -> Dict[str, MetricMeterResult]:
+        """Gather every metered module's ``(theoretical_flops, seqlens)``.
 
         Each :class:`OmniModuleTrainer` stashed its time-independent contribution
         in its own ``on_step_end``; here we only read the results.  The meter
         (:class:`~veomni.utils.omni_helper.OmniEnvironMeter`) sums the FLOPs and merges the token
         lengths, then applies the single whole-graph time to get the overall
-        achieved FLOPs / MFU.  Non-tracing modules contribute nothing.
+        achieved FLOPs / MFU.  Non-metered modules contribute nothing.
         """
-        traces: Dict[str, TraceResult] = {}
+        module_metrics: Dict[str, MetricMeterResult] = {}
         for name, module_trainer in self.module_trainers.items():
-            result = module_trainer.collect_trace()
+            result = module_trainer.collect_metric_meter()
             if result is not None:
-                traces[name] = result
-        return traces
+                module_metrics[name] = result
+        return module_metrics
 
     # ── Forward / backward (override single-model path) ────────────────────────
 
@@ -615,9 +615,9 @@ class OmniTrainer:
         self.base.on_step_begin(micro_batches=micro_batches)
 
     def on_step_end(self, loss=None, loss_dict=None, grad_norm=None):
-        # Module-trainers first: each stashes its per-module trace contribution
-        # (``trace_collect`` → theoretical_flops + seqlens) + runs its checkpoint
-        # callbacks. The orchestrator's trace callback (inside ``base.on_step_end``)
+        # Module-trainers first: each stashes its per-module metric contribution
+        # (``metric_meter_collect`` → theoretical_flops + seqlens) + runs its checkpoint
+        # callbacks. The orchestrator's metric callback (inside ``base.on_step_end``)
         # then reads those results, so module-trainers must run *before* it.
         for module_trainer in self.module_trainers.values():
             module_trainer.on_step_end(self.base.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)

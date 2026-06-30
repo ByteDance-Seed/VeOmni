@@ -156,10 +156,11 @@ def test_mixin_registry_contains_all_v2_modules():
     assert _model_cls("bagel_vae").__name__ == "BagelVAE"
 
 
-def test_processor_registry_only_for_vision_modules():
+def test_processor_registry_only_for_modules_with_processor_assets():
     """janus_llama / text_encoder have no per-module asset."""
     assert set(OMNI_PROCESSOR_REGISTRY.valid_keys()) == {
         "bagel_siglip_navit",
+        "bagel_vae",
         "janus_siglip",
         "janus_vqvae",
         "qwen3vl_vision",

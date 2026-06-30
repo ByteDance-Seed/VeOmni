@@ -126,9 +126,9 @@ class ModuleMixin:
     """Unified SeedOmni V2 mixin for both training and inference hooks.
 
     A module opts into the optional per-module training trace separately, by
-    multi-inheriting its own ``XxxTraceMixin(TraceMixin)`` on the concrete model
-    (``ModuleMixin`` itself does **not** inherit ``TraceMixin``).  See
-    :class:`~veomni.models.seed_omni.mixins.tracemixin.TraceMixin`.
+    multi-inheriting its own ``XxxMetricMeterMixin(MetricMeterMixin)`` on the concrete model
+    (``ModuleMixin`` itself does **not** inherit ``MetricMeterMixin``).  See
+    :class:`~veomni.models.seed_omni.mixins.metric_meter_mixin.MetricMeterMixin`.
     """
 
     # Generic / combined processor (e.g. an HF ``XxxProcessor`` wrapping several

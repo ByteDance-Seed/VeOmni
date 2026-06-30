@@ -235,15 +235,15 @@ class EnvironMeterCallback(Callback):
 
 
 class OmniEnvironMeterCallback(Callback):
-    """Per-module trace metering for OmniModel V2.
+    """Per-module metric metering for OmniModel V2.
 
     The single-model :class:`EnvironMeterCallback` can't meter ``OmniModel``: it
     is a composition of sub-modules with no single ``model_type`` to estimate
     FLOPs on, and the entry batch carries only ``conversation_list`` (no
     ``input_ids`` / ``attention_mask`` to count tokens from).  So **FLOPs / MFU**
     are computed per-module by each module's
-    :class:`~veomni.models.seed_omni.mixins.tracemixin.TraceMixin`.  This callback drives the
-    timing, collects every module's ``(metrics, seqlens)`` via the orchestrator,
+    :class:`~veomni.models.seed_omni.mixins.metric_meter_mixin.MetricMeterMixin`.  This callback drives the
+    timing, collects every module's ``(theoretical_flops, seqlens)`` via the orchestrator,
     and hands them to :class:`~veomni.utils.omni_helper.OmniEnvironMeter`, which owns the **global**
     roll-up — merged batch-token statistics, multi-source accounting, and
     device/host memory.
@@ -278,12 +278,12 @@ class OmniEnvironMeterCallback(Callback):
         base = self.trainer.base
         delta_time = time.time() - self.start_time
 
-        # Each TraceMixin module stashed its time-independent contribution
+        # Each MetricMeterMixin module stashed its time-independent contribution
         # ``(theoretical_flops, seqlens)`` in its module-trainer's on_step_end;
         # the meter sums the FLOPs + merges the tokens and applies this single
         # whole-graph delta to get the overall achieved FLOPs / MFU.
-        module_traces = self.trainer.collect_trace()
-        step_env_metrics = base.environ_meter.step(delta_time, state.global_step, module_traces)
+        module_metrics = self.trainer.collect_metric_meter()
+        step_env_metrics = base.environ_meter.step(delta_time, state.global_step, module_metrics)
 
         step_train_metrics = {
             "total_loss": loss,

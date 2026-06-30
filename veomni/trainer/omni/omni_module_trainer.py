@@ -41,7 +41,7 @@ from ...distributed.parallel_state import (
     use_parallel_state,
 )
 from ...models import build_tokenizer
-from ...models.seed_omni.mixins.tracemixin import TraceMixin, TraceResult
+from ...models.seed_omni.mixins.metric_meter_mixin import MetricMeterMixin, MetricMeterResult
 from ...models.seed_omni.modeling_omni import _unwrap_module
 from ...utils import logging
 from ..base import BaseTrainer
@@ -226,11 +226,11 @@ class OmniModuleTrainer:
         # assembled in :meth:`_build_model_assets` above.
         self.base.train_dataloader = None
 
-        # Last-step per-module trace contribution (theoretical_flops, seqlens),
-        # computed at on_step_end from the optional TraceMixin on
+        # Last-step per-module metric contribution (theoretical_flops, seqlens),
+        # computed at on_step_end from the optional MetricMeterMixin on
         # ``self.base.model``.  No per-module timing — the whole-graph delta is
         # owned by the orchestrator (a module's own wall-clock is meaningless).
-        self._trace_result: Optional[TraceResult] = None
+        self._metric_meter_result: Optional[MetricMeterResult] = None
 
         # This module's own checkpoint callbacks (DCP resume + HF/LoRA export),
         # reusing the shared single-model callbacks.  ``subfolder_name`` (the
@@ -309,18 +309,18 @@ class OmniModuleTrainer:
         """Build this module's lr-scheduler (needs ``base.args.train_steps`` set)."""
         self.base._build_lr_scheduler()
 
-    # ── Trace metering ─────────────────────────────────────────────────────────
+    # ── Metric metering ────────────────────────────────────────────────────────
 
-    def collect_trace(self) -> Optional[TraceResult]:
-        """The per-module trace computed at the last :meth:`on_step_end`.
+    def collect_metric_meter(self) -> Optional[MetricMeterResult]:
+        """The per-module metrics computed at the last :meth:`on_step_end`.
 
-        Returns ``(theoretical_flops, seqlens)`` for a tracing module, else
+        Returns ``(theoretical_flops, seqlens)`` for a metered module, else
         ``None``.  The orchestrator reads this once per step and rolls every
         module's contribution into the overall throughput / MFU.
         """
-        return self._trace_result
+        return self._metric_meter_result
 
-    # ── Callbacks (checkpoint + trace; both per-module) ────────────────────────
+    # ── Callbacks (checkpoint + metric meter; both per-module) ─────────────────
 
     def _init_callbacks(self, subfolder_name: str):
         """Build this module's DCP resume + HF/LoRA export callbacks.
@@ -366,16 +366,16 @@ class OmniModuleTrainer:
             self.hf_ckpt_callback.on_step_begin(state, **kwargs)
 
     def on_step_end(self, state, **kwargs):
-        # Stash this module's time-independent trace contribution
+        # Stash this module's time-independent metric contribution
         # (theoretical_flops, seqlens). The orchestrator applies the whole-graph
         # delta to derive achieved FLOPs / MFU; there is no per-module timing
         # (this fires only after the whole graph's fwd+bwd, so a module-local
         # wall-clock would be the whole-step time, not its own).
-        # Tracing is opt-in: only modules that multi-inherit a TraceMixin report.
+        # Metering is opt-in: only modules that multi-inherit a MetricMeterMixin report.
         # Unwrap the DDP wrapper (FSDP2 is in-place) so a DDP-wrapped module's
-        # TraceMixin is still seen.
+        # MetricMeterMixin is still seen.
         model = _unwrap_module(self.base.model)
-        self._trace_result = model.trace_collect() if isinstance(model, TraceMixin) else None
+        self._metric_meter_result = model.metric_meter_collect() if isinstance(model, MetricMeterMixin) else None
         with use_parallel_state(self.parallel_state):
             self.checkpointer_callback.on_step_end(state, **kwargs)
             self.hf_ckpt_callback.on_step_end(state, **kwargs)

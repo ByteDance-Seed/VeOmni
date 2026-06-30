@@ -6,8 +6,8 @@ from typing import Any
 
 import torch
 
+from ....mixins.metric_meter_mixin import MetricMeterMixin
 from ....mixins.modulemixin import CPUPreprocessor, ModuleMixin, post_forward, pre_forward
-from ....mixins.tracemixin import TraceMixin
 from ....utils.conversation import ConversationItem, iter_desired_items
 from ..sources import BAGEL_SIGLIP_CONTEXT
 from .configuration import BagelSiglipNavitConfig
@@ -209,12 +209,12 @@ class BagelSiglipNavitModuleMixin(ModuleMixin):
             raise RuntimeError("BAGEL SigLIP token count mismatch during feature scatter.")
 
 
-class BagelSiglipNavitTraceMixin(TraceMixin):
+class BagelSiglipNavitMetricMeterMixin(MetricMeterMixin):
     """Per-module training trace for BAGEL SigLIP NaViT."""
 
     config: BagelSiglipNavitConfig
 
-    def trace_token_lengths(self, method: str, data: dict[str, Any]) -> list[int]:
+    def metric_meter_token_lengths(self, method: str, data: dict[str, Any]) -> list[int]:
         if method != "forward":
             return []
         token_lens = data.get("token_lens")
@@ -239,4 +239,4 @@ class BagelSiglipNavitTraceMixin(TraceMixin):
         return (dense_flops + attn_flops) / 1e12
 
 
-__all__ = ["BagelSiglipNavitCPUPreprocessor", "BagelSiglipNavitModuleMixin", "BagelSiglipNavitTraceMixin"]
+__all__ = ["BagelSiglipNavitCPUPreprocessor", "BagelSiglipNavitModuleMixin", "BagelSiglipNavitMetricMeterMixin"]

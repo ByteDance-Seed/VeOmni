@@ -6,8 +6,8 @@ from veomni.distributed.parallel_state import get_parallel_state
 from veomni.utils.seqlen_pos_transform_utils import prepare_fa_kwargs_from_position_ids, valid_seqlens_from_cu_seqlens
 from veomni.utils.tensor_utils import naflatten, unflatten
 
+from ....mixins.metric_meter_mixin import MetricMeterMixin
 from ....mixins.modulemixin import ModuleMixin, post_forward, pre_forward
-from ....mixins.tracemixin import TraceMixin
 from ....utils.conversation import ConversationItem, is_dummy
 from .configuration import Qwen3LlmConfig
 
@@ -207,12 +207,12 @@ def _fold_fsdp_dummy_anchors(
     return inputs_embeds
 
 
-class Qwen3LlmTraceMixin(TraceMixin):
-    """Per-module training-trace for the Qwen3 backbone (transformer layers only)."""
+class Qwen3LlmMetricMeterMixin(MetricMeterMixin):
+    """Per-module training meter for the Qwen3 backbone (transformer layers only)."""
 
     config: Qwen3LlmConfig
 
-    def trace_token_lengths(self, method: str, data: Dict[str, Any]) -> List[int]:
+    def metric_meter_token_lengths(self, method: str, data: Dict[str, Any]) -> List[int]:
         # Backbone only runs "forward"; its tokens are the packed per-sample
         # sequence lengths (text + spliced modality tokens), read from the
         # FlashAttention cu_seqlens its pre_forward built.
@@ -244,4 +244,4 @@ class Qwen3LlmTraceMixin(TraceMixin):
         return (dense_flops + attn_flops) / 1e12
 
 
-__all__ = ["Qwen3LlmModuleMixin", "Qwen3LlmTraceMixin"]
+__all__ = ["Qwen3LlmModuleMixin", "Qwen3LlmMetricMeterMixin"]

@@ -9,10 +9,10 @@ from transformers import PreTrainedModel
 from veomni.models.transformers.qwen3.generated.patched_modeling_qwen3_gpu import Qwen3Model
 
 from .configuration import Qwen3LlmConfig
-from .modulemixin import Qwen3LlmModuleMixin, Qwen3LlmTraceMixin
+from .modulemixin import Qwen3LlmMetricMeterMixin, Qwen3LlmModuleMixin
 
 
-class Qwen3Llm(Qwen3LlmModuleMixin, Qwen3LlmTraceMixin, PreTrainedModel):
+class Qwen3Llm(Qwen3LlmModuleMixin, Qwen3LlmMetricMeterMixin, PreTrainedModel):
     """Qwen3 backbone (no wte, no lm_head).
 
     Multi-modal inputs are already embedded by the sibling text encoder and live

@@ -12,11 +12,11 @@ from transformers.models.janus.modeling_janus import JanusVisionAlignerMLP, Janu
 
 from ......distributed.parallel_state import get_parallel_state
 from .configuration import JanusSiglipConfig
-from .modulemixin import JanusSiglipModuleMixin, JanusSiglipTraceMixin
+from .modulemixin import JanusSiglipMetricMeterMixin, JanusSiglipModuleMixin
 from .processing import JanusSiglipProcessor
 
 
-class JanusSiglip(JanusSiglipModuleMixin, JanusSiglipTraceMixin, PreTrainedModel):
+class JanusSiglip(JanusSiglipModuleMixin, JanusSiglipMetricMeterMixin, PreTrainedModel):
     """SigLIP vision tower + MLP aligner for image understanding.
 
     Composes HF :class:`JanusVisionModel` + :class:`JanusVisionAlignerMLP`

@@ -12,10 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""SeedOmni V2 mixins: the per-module graph-hook base + the trace meter."""
+"""SeedOmni V2 mixins: the per-module graph-hook base + the metric meter."""
 
+from .metric_meter_mixin import MetricMeterMixin, MetricMeterResult
 from .modulemixin import CPUPreprocessor, ModuleMixin, post_forward, pre_forward
-from .tracemixin import TraceMixin, TraceResult
 
 
 __all__ = [
@@ -23,6 +23,6 @@ __all__ = [
     "CPUPreprocessor",
     "pre_forward",
     "post_forward",
-    "TraceMixin",
-    "TraceResult",
+    "MetricMeterMixin",
+    "MetricMeterResult",
 ]

@@ -14,10 +14,10 @@
 
 """OmniModel V2 training-efficiency meter.
 
-Split out from :mod:`veomni.utils.helper` because the OmniModel trace is a
+Split out from :mod:`veomni.utils.helper` because the OmniModel metric input is a
 different shape from the single-model :class:`~veomni.utils.helper.EnvironMeter`:
 FLOPs and token lengths are produced **per module** (each module's
-:class:`~veomni.models.seed_omni.mixins.tracemixin.TraceMixin`), so this meter does not
+:class:`~veomni.models.seed_omni.mixins.metric_meter_mixin.MetricMeterMixin`), so this meter does not
 inspect the batch for token lengths at all.  It only owns the global,
 module-agnostic concerns.
 """
@@ -46,14 +46,14 @@ logger = logging.get_logger(__name__)
 
 
 class OmniEnvironMeter:
-    """Training-efficiency meter for OmniModel V2 (per-module trace + global roll-up).
+    """Training-efficiency meter for OmniModel V2 (per-module metrics + global roll-up).
 
     Unlike :class:`~veomni.utils.helper.EnvironMeter` — which counts tokens and
     estimates FLOPs itself from a single ``model_type`` — ``OmniModel`` is a
     *composition* of independent sub-modules with no single config to dispatch a
     FLOPs formula on.  So **FLOPs and token lengths are produced per module** by
-    each module's :class:`~veomni.models.seed_omni.mixins.tracemixin.TraceMixin` and
-    handed to :meth:`step` as ``module_traces``.
+    each module's :class:`~veomni.models.seed_omni.mixins.metric_meter_mixin.MetricMeterMixin` and
+    handed to :meth:`step` as ``module_metrics``.
 
     This meter therefore does **not** inspect the batch for token lengths.  Its
     only jobs are:
@@ -61,7 +61,7 @@ class OmniEnvironMeter:
     * :meth:`add` (per micro-batch) — count the number of training samples
       (``batch_count``) and gather the per-sample multi-source dataset indices.
       **No token-length computation here.**
-    * :meth:`step` (per global step) — roll up the per-module traces:
+    * :meth:`step` (per global step) — roll up the per-module metrics:
       **sum** the theoretical FLOPs (→ one overall MFU) but keep token statistics
       **per-module** (``trace/<module>/…``), since the backbone's tokens already
       include the other modules' tokens and merging would double-count. Reports
@@ -118,7 +118,7 @@ class OmniEnvironMeter:
         """Accumulate the sample count + multi-source dataset indices.
 
         Called once per micro-batch.  **Token lengths are NOT computed here** —
-        they come from the modules' traces at :meth:`step`.  Here we only count
+        they come from the modules' metric meters at :meth:`step`.  Here we only count
         the training samples (one per conversation) and, for multi-source, gather
         the per-sample dataset indices.
         """
@@ -132,12 +132,12 @@ class OmniEnvironMeter:
         self,
         delta_time: float,
         global_step: int,
-        module_traces: Dict[str, Any],
+        module_metrics: Dict[str, Any],
     ) -> Dict[str, Any]:
-        """Roll up per-module ``(theoretical_flops, seqlens)`` into the trace.
+        """Roll up per-module ``(theoretical_flops, seqlens)`` into metrics.
 
-        ``module_traces`` maps ``module_name → (theoretical_flops, seqlens)`` from
-        every tracing module (its time-independent contribution this step).
+        ``module_metrics`` maps ``module_name → (theoretical_flops, seqlens)`` from
+        every metered module (its time-independent contribution this step).
 
         * **FLOPs / MFU are summed across modules** — each module's FLOPs is a
           distinct compute (backbone layers vs ViT vs lm_head), so summing is
@@ -150,13 +150,13 @@ class OmniEnvironMeter:
         Everything is DP-reduced in a single all-reduce, then the one whole-graph
         ``delta_time`` is applied.
         """
-        names = list(module_traces.keys())
+        names = list(module_metrics.keys())
 
         # Pack one DP all-reduce: [total_flops, real_samples, (tokens_m, chunks_m)*].
-        total_flops_local = sum(flops for flops, _ in module_traces.values())
+        total_flops_local = sum(flops for flops, _ in module_metrics.values())
         packed = [float(total_flops_local), float(self.batch_count)]
         for name in names:
-            _flops, seqlens = module_traces[name]
+            _flops, seqlens = module_metrics[name]
             packed.append(float(sum(seqlens)))  # tokens for this module
         reduced = all_reduce(tuple(packed), op="sum", group=get_parallel_state().dp_group)
         if not isinstance(reduced, list):  # single-element edge case
@@ -195,12 +195,12 @@ class OmniEnvironMeter:
             # Multi-source needs one token length per sample; use the module whose
             # seqlens are per-sample (the backbone: len == sample count). Other
             # modules report per-image / single-chunk lengths that don't align.
-            per_sample_seqlens = self._per_sample_seqlens(module_traces, len(self.batch_ds_idx))
+            per_sample_seqlens = self._per_sample_seqlens(module_metrics, len(self.batch_ds_idx))
             if per_sample_seqlens is not None:
                 metrics.update(self.multisource_tracker.step(self.batch_ds_idx, per_sample_seqlens))
             else:
                 logger.warning_once(
-                    "OmniEnvironMeter: multi-source accounting skipped — no traced module reports "
+                    "OmniEnvironMeter: multi-source accounting skipped — no metered module reports "
                     f"per-sample seqlens aligned with ds_idx ({len(self.batch_ds_idx)} samples)."
                 )
 
@@ -216,7 +216,7 @@ class OmniEnvironMeter:
         return metrics
 
     @staticmethod
-    def _per_sample_seqlens(module_traces: Dict[str, Any], num_samples: int) -> Optional[List[int]]:
+    def _per_sample_seqlens(module_metrics: Dict[str, Any], num_samples: int) -> Optional[List[int]]:
         """Canonical per-sample token lengths for multi-source accounting.
 
         Multi-source attributes the *whole training sequence* of each sample to
@@ -231,7 +231,7 @@ class OmniEnvironMeter:
             return None
         best: Optional[List[int]] = None
         best_total = -1
-        for _theoretical_flops, seqlens in module_traces.values():
+        for _theoretical_flops, seqlens in module_metrics.values():
             if len(seqlens) == num_samples:
                 total = sum(seqlens)
                 if total > best_total:

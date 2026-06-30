@@ -19,11 +19,11 @@ from transformers import PreTrainedModel
 from transformers.activations import ACT2FN
 
 from .configuration import BagelSiglipNavitConfig
-from .modulemixin import BagelSiglipNavitModuleMixin, BagelSiglipNavitTraceMixin
+from .modulemixin import BagelSiglipNavitMetricMeterMixin, BagelSiglipNavitModuleMixin
 from .processing import BagelSiglipNavitProcessor
 
 
-class BagelSiglipNavit(BagelSiglipNavitModuleMixin, BagelSiglipNavitTraceMixin, PreTrainedModel):
+class BagelSiglipNavit(BagelSiglipNavitModuleMixin, BagelSiglipNavitMetricMeterMixin, PreTrainedModel):
     config_class = BagelSiglipNavitConfig
     image_processor_class = BagelSiglipNavitProcessor
     base_model_prefix = "bagel_siglip_navit"

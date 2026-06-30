@@ -4,7 +4,7 @@ The packing / scatter / generate logic is **identical** to the dense Qwen3
 backbone, so :class:`Qwen3MoeLlmModuleMixin` subclasses
 :class:`~veomni.models.seed_omni.modules.qwen3.llm.modulemixin.Qwen3LlmModuleMixin`
 and only adds the Expert-Parallel (``ep``) plan for the fused experts.  The
-trace mixin overrides the FLOPs estimate with the MoE (sparse-MLP) cost.
+metric meter mixin overrides the FLOPs estimate with the MoE (sparse-MLP) cost.
 """
 
 from typing import Any, Dict, List
@@ -12,7 +12,7 @@ from typing import Any, Dict, List
 from torch.distributed._tensor import Shard
 
 from ......distributed.parallel_plan import ParallelPlan
-from ....mixins.tracemixin import TraceMixin
+from ....mixins.metric_meter_mixin import MetricMeterMixin
 from ...qwen3.llm.modulemixin import Qwen3LlmModuleMixin
 from .configuration import Qwen3MoeLlmConfig
 
@@ -31,12 +31,12 @@ class Qwen3MoeLlmModuleMixin(Qwen3LlmModuleMixin):
         return ParallelPlan(extra_parallel_plan={"ep": ep_plan})
 
 
-class Qwen3MoeLlmTraceMixin(TraceMixin):
-    """Per-module training-trace for the Qwen3-MoE backbone (transformer layers only)."""
+class Qwen3MoeLlmMetricMeterMixin(MetricMeterMixin):
+    """Per-module training meter for the Qwen3-MoE backbone (transformer layers only)."""
 
     config: Qwen3MoeLlmConfig
 
-    def trace_token_lengths(self, method: str, data: Dict[str, Any]) -> List[int]:
+    def metric_meter_token_lengths(self, method: str, data: Dict[str, Any]) -> List[int]:
         from veomni.utils.seqlen_pos_transform_utils import valid_seqlens_from_cu_seqlens
 
         cu_seq_lens_q = data.get("cu_seq_lens_q")
@@ -72,4 +72,4 @@ class Qwen3MoeLlmTraceMixin(TraceMixin):
         return (dense_flops + attn_flops) / 1e12
 
 
-__all__ = ["Qwen3MoeLlmModuleMixin", "Qwen3MoeLlmTraceMixin"]
+__all__ = ["Qwen3MoeLlmModuleMixin", "Qwen3MoeLlmMetricMeterMixin"]

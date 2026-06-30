@@ -5,13 +5,13 @@ import torch.nn.functional as F
 
 from ......utils import helper
 from ....graphs.generation_graph import FSM_SIGNAL_KEY
+from ....mixins.metric_meter_mixin import MetricMeterMixin
 from ....mixins.modulemixin import (
     CPUPreprocessor,
     ModuleMixin,
     post_forward,
     pre_forward,
 )
-from ....mixins.tracemixin import TraceMixin
 from ....utils.conversation import (
     ConversationItem,
     iter_desired_items,
@@ -307,13 +307,13 @@ class JanusVqvaeModuleMixin(ModuleMixin):
         return torch.multinomial(probs, num_samples=1).squeeze(-1)
 
 
-class JanusVqvaeTraceMixin(TraceMixin):
-    """Per-module training-trace for the Janus VQVAE codec + generation head."""
+class JanusVqvaeMetricMeterMixin(MetricMeterMixin):
+    """Per-module training meter for the Janus VQVAE codec + generation head."""
 
     config: JanusVqvaeConfig
     _image_processor: JanusVqvaeProcessor
 
-    def trace_token_lengths(self, method: str, data: Dict[str, Any]) -> List[int]:
+    def metric_meter_token_lengths(self, method: str, data: Dict[str, Any]) -> List[int]:
         # Count VQ image tokens on encode only; decode is the generation-head /
         # sampling path and contributes nothing (returns []).
         if method != "encode":
@@ -334,4 +334,4 @@ class JanusVqvaeTraceMixin(TraceMixin):
         return 0.0
 
 
-__all__ = ["JanusVqvaeModuleMixin", "JanusVqvaeTraceMixin"]
+__all__ = ["JanusVqvaeModuleMixin", "JanusVqvaeMetricMeterMixin"]

@@ -15,8 +15,7 @@
 """GraphProfiler — request-local execution path and optional node timing.
 
 This is deliberately graph-owned, not a module mixin: the graph knows state,
-node, transition, and endpoint identity. Module-local training token/FLOPs
-accounting remains in ``TraceMixin``.
+node, transition, and endpoint identity.
 """
 
 from __future__ import annotations
