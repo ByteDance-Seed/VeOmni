@@ -109,12 +109,14 @@ def test_sparse_attention_backward_flattens_batched_inputs(monkeypatch):
     assert result["d_sink"].shape == attn_sink.shape
 
 
-def test_flash_mla_sparse_forward_returns_lse(monkeypatch):
+def test_flash_mla_sparse_forward_packs_inputs_and_returns_lse(monkeypatch):
     q_pe = torch.empty(1, 2, 128, 64, dtype=torch.bfloat16)
     k_pe = torch.empty(1, 4, 1, 64, dtype=torch.bfloat16)
     kv_cache = torch.empty(1, 4, 1, 512, dtype=torch.bfloat16)
     q_nope = torch.empty(1, 2, 128, 512, dtype=torch.bfloat16)
     gather = torch.zeros(1, 2, 128, dtype=torch.int32)
+    sink = torch.zeros(128, dtype=torch.float32)
+    topk_length = torch.tensor([[127, 128]], dtype=torch.int64)
     expected_out = torch.zeros(1, 2, 128, 512, dtype=torch.bfloat16)
     expected_lse = torch.arange(256, dtype=torch.float32).reshape(1, 2, 128)
 
@@ -125,8 +127,9 @@ def test_flash_mla_sparse_forward_returns_lse(monkeypatch):
         assert indices.dtype == torch.int32
         assert sm_scale == 0.25
         assert d_v == 512
-        assert attn_sink is None
-        assert topk_length is None
+        assert attn_sink is sink
+        assert topk_length.dtype == torch.int32
+        assert topk_length.tolist() == [127, 128]
         return (
             expected_out.reshape(2, 128, 512),
             torch.empty(2, 128, dtype=torch.float32),
@@ -142,125 +145,68 @@ def test_flash_mla_sparse_forward_returns_lse(monkeypatch):
         q_nope,
         gather,
         softmax_scale=0.25,
+        learnable_sink=sink,
+        topk_length=topk_length,
     )
 
     assert torch.equal(result["out"], expected_out)
     assert torch.equal(result["lse"], expected_lse)
 
 
-def test_flash_mla_sparse_forward_uses_imported_flash_mla_symbol(monkeypatch):
-    q_pe = torch.empty(1, 2, 128, 64, dtype=torch.bfloat16)
-    k_pe = torch.empty(1, 4, 1, 64, dtype=torch.bfloat16)
-    kv_cache = torch.empty(1, 4, 1, 512, dtype=torch.bfloat16)
-    q_nope = torch.empty(1, 2, 128, 512, dtype=torch.bfloat16)
-    gather = torch.zeros(1, 2, 128, dtype=torch.int32)
-
-    def fake_flash_mla_sparse_fwd(q, kv, indices, sm_scale, d_v, *, attn_sink=None, topk_length=None):
-        assert attn_sink is None
-        assert topk_length is None
-        return torch.empty(2, 128, 512, dtype=q.dtype), torch.empty(2, 128), torch.empty(2, 128)
-
-    monkeypatch.setattr(dsa, "flash_mla_sparse_fwd", fake_flash_mla_sparse_fwd)
-
-    result = dsa.flash_mla_sparse_forward(q_pe, k_pe, kv_cache, q_nope, gather)
-    assert set(result) == {"out", "lse"}
-
-
-def test_flash_mla_sparse_forward_compatibility_rejects_unaligned_topk():
-    q_pe = torch.empty(1, 2, 128, 64, dtype=torch.bfloat16)
-    k_pe = torch.empty(1, 4, 1, 64, dtype=torch.bfloat16)
-    kv_cache = torch.empty(1, 4, 1, 512, dtype=torch.bfloat16)
-    q_nope = torch.empty(1, 2, 128, 512, dtype=torch.bfloat16)
-    gather = torch.zeros(1, 2, 64, dtype=torch.int32)
-
-    compatible, reason = dsa.check_flash_mla_sparse_forward_compatible(q_pe, k_pe, kv_cache, q_nope, gather)
-
-    assert not compatible
-    assert "multiple of 128" in reason
-
-
-def test_flash_mla_sparse_forward_compatibility_rejects_unsupported_packed_dim():
-    q_pe = torch.empty(1, 2, 128, 32, dtype=torch.bfloat16)
-    k_pe = torch.empty(1, 4, 1, 32, dtype=torch.bfloat16)
-    kv_cache = torch.empty(1, 4, 1, 512, dtype=torch.bfloat16)
-    q_nope = torch.empty(1, 2, 128, 512, dtype=torch.bfloat16)
-    gather = torch.zeros(1, 2, 128, dtype=torch.int32)
-
-    compatible, reason = dsa.check_flash_mla_sparse_forward_compatible(q_pe, k_pe, kv_cache, q_nope, gather)
-
-    assert not compatible
-    assert "packed q/k dim 576" in reason
-
-
-def test_flash_mla_sparse_forward_compatibility_accepts_sink_and_topk_length():
-    q_pe = torch.empty(1, 2, 128, 64, dtype=torch.bfloat16)
-    k_pe = torch.empty(1, 4, 1, 64, dtype=torch.bfloat16)
-    kv_cache = torch.empty(1, 4, 1, 512, dtype=torch.bfloat16)
-    q_nope = torch.empty(1, 2, 128, 512, dtype=torch.bfloat16)
-    gather = torch.zeros(1, 2, 128, dtype=torch.int32)
-    sink = torch.zeros(128, dtype=torch.float32)
-    topk_length = torch.full((1, 2), 128, dtype=torch.int32)
-
+def test_flash_mla_sparse_forward_accepts_sink_and_topk_length():
     compatible, reason = dsa.check_flash_mla_sparse_forward_compatible(
-        q_pe,
-        k_pe,
-        kv_cache,
-        q_nope,
-        gather,
-        sink,
-        topk_length,
+        torch.empty(1, 2, 128, 64, dtype=torch.bfloat16),
+        torch.empty(1, 4, 1, 64, dtype=torch.bfloat16),
+        torch.empty(1, 4, 1, 512, dtype=torch.bfloat16),
+        torch.empty(1, 2, 128, 512, dtype=torch.bfloat16),
+        torch.zeros(1, 2, 128, dtype=torch.int32),
+        torch.zeros(128, dtype=torch.float32),
+        torch.full((1, 2), 128, dtype=torch.int32),
     )
 
     assert compatible, reason
 
 
-def test_flash_mla_sparse_forward_compatibility_rejects_bad_sink_shape():
-    q_pe = torch.empty(1, 2, 128, 64, dtype=torch.bfloat16)
-    k_pe = torch.empty(1, 4, 1, 64, dtype=torch.bfloat16)
-    kv_cache = torch.empty(1, 4, 1, 512, dtype=torch.bfloat16)
-    q_nope = torch.empty(1, 2, 128, 512, dtype=torch.bfloat16)
-    gather = torch.zeros(1, 2, 128, dtype=torch.int32)
-    sink = torch.zeros(127, dtype=torch.float32)
-
-    compatible, reason = dsa.check_flash_mla_sparse_forward_compatible(q_pe, k_pe, kv_cache, q_nope, gather, sink)
-
-    assert not compatible
-    assert "learnable_sink" in reason
-
-
-def test_flash_mla_sparse_forward_compatibility_rejects_bad_sink_dtype():
-    q_pe = torch.empty(1, 2, 128, 64, dtype=torch.bfloat16)
-    k_pe = torch.empty(1, 4, 1, 64, dtype=torch.bfloat16)
-    kv_cache = torch.empty(1, 4, 1, 512, dtype=torch.bfloat16)
-    q_nope = torch.empty(1, 2, 128, 512, dtype=torch.bfloat16)
-    gather = torch.zeros(1, 2, 128, dtype=torch.int32)
-    sink = torch.zeros(128, dtype=torch.bfloat16)
-
-    compatible, reason = dsa.check_flash_mla_sparse_forward_compatible(q_pe, k_pe, kv_cache, q_nope, gather, sink)
-
-    assert not compatible
-    assert "fp32" in reason
-
-
-def test_flash_mla_sparse_forward_compatibility_rejects_bad_topk_length_shape():
-    q_pe = torch.empty(1, 2, 128, 64, dtype=torch.bfloat16)
-    k_pe = torch.empty(1, 4, 1, 64, dtype=torch.bfloat16)
-    kv_cache = torch.empty(1, 4, 1, 512, dtype=torch.bfloat16)
-    q_nope = torch.empty(1, 2, 128, 512, dtype=torch.bfloat16)
-    gather = torch.zeros(1, 2, 128, dtype=torch.int32)
-    topk_length = torch.full((1, 2, 1), 128, dtype=torch.int32)
+@pytest.mark.parametrize(
+    ("mutate", "expected_reason"),
+    [
+        (lambda tensors: tensors.update(gather=torch.zeros(1, 2, 64, dtype=torch.int32)), "multiple of 128"),
+        (
+            lambda tensors: tensors.update(
+                q_pe=torch.empty(1, 2, 128, 32, dtype=torch.bfloat16),
+                k_pe=torch.empty(1, 4, 1, 32, dtype=torch.bfloat16),
+            ),
+            "packed q/k dim 576",
+        ),
+        (lambda tensors: tensors.update(sink=torch.zeros(127, dtype=torch.float32)), "learnable_sink"),
+        (lambda tensors: tensors.update(sink=torch.zeros(128, dtype=torch.bfloat16)), "fp32"),
+        (lambda tensors: tensors.update(topk_length=torch.full((1, 2, 1), 128, dtype=torch.int32)), "topk_length"),
+    ],
+)
+def test_flash_mla_sparse_forward_rejects_invalid_contracts(mutate, expected_reason):
+    tensors = {
+        "q_pe": torch.empty(1, 2, 128, 64, dtype=torch.bfloat16),
+        "k_pe": torch.empty(1, 4, 1, 64, dtype=torch.bfloat16),
+        "kv_cache": torch.empty(1, 4, 1, 512, dtype=torch.bfloat16),
+        "q_nope": torch.empty(1, 2, 128, 512, dtype=torch.bfloat16),
+        "gather": torch.zeros(1, 2, 128, dtype=torch.int32),
+        "sink": None,
+        "topk_length": None,
+    }
+    mutate(tensors)
 
     compatible, reason = dsa.check_flash_mla_sparse_forward_compatible(
-        q_pe,
-        k_pe,
-        kv_cache,
-        q_nope,
-        gather,
-        topk_length=topk_length,
+        tensors["q_pe"],
+        tensors["k_pe"],
+        tensors["kv_cache"],
+        tensors["q_nope"],
+        tensors["gather"],
+        tensors["sink"],
+        tensors["topk_length"],
     )
 
     assert not compatible
-    assert "topk_length" in reason
+    assert expected_reason in reason
 
 
 def test_deepseek_v4_flashmla_indices_pad_to_128_multiple():
@@ -388,33 +334,16 @@ def test_flash_mla_sparse_attention_with_cudnn_backward_splits_gradients(monkeyp
     assert torch.equal(k_pe.grad, torch.full_like(k_pe, 4.0))
 
 
-def test_sparse_attention_backward_compatibility_rejects_expanded_kv_layout():
+@pytest.mark.parametrize(
+    ("kv", "out_dim", "expected_reason"),
+    [
+        (torch.empty(2, 4, 7, 5, dtype=torch.bfloat16), 5, "unified K=V"),
+        (torch.empty(2, 7, 5, dtype=torch.bfloat16), 6, "value dim"),
+    ],
+)
+def test_sparse_attention_backward_rejects_invalid_contracts(kv, out_dim, expected_reason):
     q = torch.empty(2, 3, 4, 5, dtype=torch.bfloat16)
-    expanded_key = torch.empty(2, 4, 7, 5, dtype=torch.bfloat16)
-    out = torch.empty(2, 3, 4, 5, dtype=torch.bfloat16)
-    dout = torch.empty_like(out)
-    lse = torch.empty(2, 3, 4, dtype=torch.float32)
-    attn_sink = torch.empty(4, dtype=torch.float32)
-    topk_indices = torch.zeros(2, 3, 2, dtype=torch.long)
-
-    compatible, reason = dsa.check_sparse_attention_backward_compatible(
-        q,
-        expanded_key,
-        out,
-        dout,
-        lse,
-        attn_sink,
-        topk_indices,
-    )
-
-    assert not compatible
-    assert "unified K=V" in reason
-
-
-def test_sparse_attention_backward_compatibility_rejects_split_value_dim():
-    q = torch.empty(2, 3, 4, 5, dtype=torch.bfloat16)
-    kv = torch.empty(2, 7, 5, dtype=torch.bfloat16)
-    out = torch.empty(2, 3, 4, 6, dtype=torch.bfloat16)
+    out = torch.empty(2, 3, 4, out_dim, dtype=torch.bfloat16)
     dout = torch.empty_like(out)
     lse = torch.empty(2, 3, 4, dtype=torch.float32)
     attn_sink = torch.empty(4, dtype=torch.float32)
@@ -431,4 +360,4 @@ def test_sparse_attention_backward_compatibility_rejects_split_value_dim():
     )
 
     assert not compatible
-    assert "value dim" in reason
+    assert expected_reason in reason
