@@ -10,6 +10,10 @@ from ....mixins.modulemixin import CPUPreprocessor, ModuleMixin, post_forward, p
 from ....utils.conversation import ConversationItem, is_dummy, iter_desired_items
 from ..sources import BAGEL_GENERATED_LATENT, BAGEL_VAE_CONTEXT
 from .configuration import BagelVAEConfig
+from .processing import crop_latent_to_image_shape
+
+
+BAGEL_VAE_PIXEL_SHAPE = "bagel_vae_pixel_shape"
 
 
 class BagelVAECPUPreprocessor(CPUPreprocessor):
@@ -37,9 +41,10 @@ class BagelVAECPUPreprocessor(CPUPreprocessor):
         inputs = self._image_processor(
             images=[item.value for item in image_items], return_tensors="pt", dtype=self._dtype
         )
-        for item, pixels in zip(image_items, inputs["pixel_values"], strict=True):
+        for item, pixels, pixel_shape in zip(image_items, inputs["pixel_values"], inputs["pixel_shapes"], strict=True):
             item.value = pixels.to(dtype=self._dtype)
             item.source = BAGEL_VAE_CONTEXT
+            item.meta[BAGEL_VAE_PIXEL_SHAPE] = pixel_shape.to(dtype=torch.long)
 
 
 class BagelVAEModuleMixin(ModuleMixin):
@@ -81,7 +86,11 @@ class BagelVAEModuleMixin(ModuleMixin):
         )
         outputs = self.encode(pixel_values=pixel_values)
         for image_item, latent in zip(image_items, outputs["latents"], strict=True):
-            image_item.value = latent.to(device=self.device, dtype=self.dtype)
+            image_item.value = crop_latent_to_image_shape(
+                latent,
+                image_item.meta.get(BAGEL_VAE_PIXEL_SHAPE),
+                downsample=int(self.config.downsample),
+            ).to(device=self.device, dtype=self.dtype)
             image_item.source = BAGEL_VAE_CONTEXT
         return {"conversation_list": conversation_list}
 
@@ -167,7 +176,11 @@ class BagelVAEModuleMixin(ModuleMixin):
 
         for item, latent in zip(encode_items, latents, strict=True):
             item.type = "image"
-            item.value = latent.to(device=self.device, dtype=self.dtype)
+            item.value = crop_latent_to_image_shape(
+                latent,
+                item.meta.get(BAGEL_VAE_PIXEL_SHAPE),
+                downsample=int(self.config.downsample),
+            ).to(device=self.device, dtype=self.dtype)
             item.source = BAGEL_VAE_CONTEXT
         return {"conversation_list": conversation}
 
@@ -275,4 +288,4 @@ class BagelVAEModuleMixin(ModuleMixin):
         return image_items
 
 
-__all__ = ["BagelVAECPUPreprocessor", "BagelVAEModuleMixin"]
+__all__ = ["BAGEL_VAE_PIXEL_SHAPE", "BagelVAECPUPreprocessor", "BagelVAEModuleMixin"]

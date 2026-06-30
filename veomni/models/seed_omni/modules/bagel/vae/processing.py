@@ -74,12 +74,18 @@ class BagelVAEProcessor(BaseImageProcessor):
             )
             for image in image_list
         ]
-        tensor = torch.stack(_pad_to_batch_size(pixel_values), dim=0)
+        pixel_shapes = torch.tensor(
+            [[int(pixel.shape[-2]), int(pixel.shape[-1])] for pixel in pixel_values],
+            dtype=torch.long,
+        )
+        pixel_values = torch.stack(_pad_to_batch_size(pixel_values), dim=0)
+
         if dtype is not None:
-            tensor = tensor.to(dtype=dtype)
+            pixel_values = pixel_values.to(dtype=dtype)
         if device is not None:
-            tensor = tensor.to(device=device)
-        return BatchFeature(data={"pixel_values": tensor})
+            pixel_values = pixel_values.to(device=device)
+            pixel_shapes = pixel_shapes.to(device=device)
+        return BatchFeature(data={"pixel_values": pixel_values, "pixel_shapes": pixel_shapes})
 
     def postprocess(self, images: torch.Tensor | list[torch.Tensor], **kwargs: Any) -> list[Image.Image]:
         del kwargs
@@ -232,6 +238,35 @@ def _pad_to_batch_size(images: list[torch.Tensor]) -> list[torch.Tensor]:
     return padded
 
 
+def crop_latent_to_image_shape(
+    latent: torch.Tensor,
+    pixel_shape: torch.Tensor | None,
+    *,
+    downsample: int,
+) -> torch.Tensor:
+    if not torch.is_tensor(pixel_shape):
+        return latent
+
+    shape = pixel_shape.detach().reshape(-1).to(device="cpu", dtype=torch.long)
+    if int(shape.numel()) != 2:
+        raise ValueError("BAGEL VAE pixel shape metadata must contain [height, width].")
+
+    downsample = max(int(downsample), 1)
+    latent_height = int(shape[0].item()) // downsample
+    latent_width = int(shape[1].item()) // downsample
+    if latent_height <= 0 or latent_width <= 0:
+        raise ValueError(
+            "BAGEL VAE pixel shape metadata produces an empty latent crop: "
+            f"pixel_shape={tuple(int(v.item()) for v in shape)}, downsample={downsample}."
+        )
+    if latent_height > int(latent.shape[-2]) or latent_width > int(latent.shape[-1]):
+        raise ValueError(
+            "BAGEL VAE latent crop exceeds encoded latent shape: "
+            f"crop=({latent_height}, {latent_width}), latent_shape={tuple(latent.shape)}."
+        )
+    return latent[..., :latent_height, :latent_width]
+
+
 def _target_size(
     width: int,
     height: int,
@@ -292,4 +327,5 @@ def _decoded_tensor_to_pil(image: torch.Tensor) -> Image.Image:
 
 __all__ = [
     "BagelVAEProcessor",
+    "crop_latent_to_image_shape",
 ]
