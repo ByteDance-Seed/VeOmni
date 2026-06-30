@@ -114,8 +114,7 @@ def _copy_safetensors_shard(filepath: str, staged_filepath: str) -> None:
             )
     else:
         raise ValueError(
-            "VEOMNI_STAGE_HDFS_SAFETENSORS_COPY_METHOD must be one of: "
-            f"copy_to_local, get, cat. Got {copy_method!r}."
+            f"VEOMNI_STAGE_HDFS_SAFETENSORS_COPY_METHOD must be one of: copy_to_local, get, cat. Got {copy_method!r}."
         )
 
 
