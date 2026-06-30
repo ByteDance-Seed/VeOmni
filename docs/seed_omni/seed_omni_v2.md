@@ -240,14 +240,15 @@ which mirrors `OmniModel.generate` + `GenerationGraph.step`):
 
 ```python
 training_graph.reset()
+profiler = GraphProfiler()
 while not training_graph.is_done():
     # TrainingGraph.step runs the current node end-to-end: unwrap the wrapped
     # sub-module (held by OmniModel), scope its ParallelState, pre_forward →
     # call (through the FSDP/DDP wrapper) → post_forward, merge conversation_list
     # + _loss back into the shared batch (edges are topology only, no input routing).
-    batch = training_graph.step(modules, batch, trace, scope_fn)
-    self._collect_training_loss(batch, trace)   # pop _loss → self._losses[node]
-    training_graph.maybe_transition()
+    batch = training_graph.step(modules, batch, profiler=profiler, scope_fn=scope_fn)
+    self._collect_training_loss(batch, profiler)   # pop _loss → self._losses[node]
+    training_graph.maybe_transition(profiler=profiler)
 total_loss = sum(self._losses.values())
 ```
 

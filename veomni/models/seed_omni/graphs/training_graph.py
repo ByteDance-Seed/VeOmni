@@ -64,6 +64,7 @@ from typing import Any, Callable, ContextManager, Dict, List, Optional
 
 from .dispatch import call_graph_endpoint, unwrap_graph_module
 from .graph import EdgeDef, NodeDef, is_end
+from .profiling import GraphProfiler
 
 
 def _mermaid_id(name: str) -> str:
@@ -205,7 +206,7 @@ class TrainingGraph:
         modules: Dict[str, Any],
         batch: Dict[str, Any],
         *,
-        trace: Optional[List[str]] = None,
+        profiler: Optional[GraphProfiler] = None,
         scope_fn: Optional[Callable[[str], ContextManager]] = None,
     ) -> Dict[str, Any]:
         """Run the node at the cursor — one forward (mirror of ``GenerationGraph.step``).
@@ -243,7 +244,8 @@ class TrainingGraph:
         raw = unwrap_graph_module(wrapped, module_name=node.module)
 
         module_context = scope_fn(node.module) if scope_fn is not None else nullcontext()
-        with module_context:
+        profile_context = profiler.node(f"forward:{node_name}") if profiler is not None else nullcontext()
+        with module_context, profile_context:
             kwargs = raw.pre_forward(method=method, **batch)
 
             # Opt-in trace meter (only modules multi-inheriting a TraceMixin have
@@ -256,12 +258,9 @@ class TrainingGraph:
 
         batch.update(out)
 
-        if trace is not None:
-            trace.append(f"forward:{node_name}")
-
         return batch
 
-    def maybe_transition(self, *, trace: Optional[List[str]] = None) -> bool:
+    def maybe_transition(self, *, profiler: Optional[GraphProfiler] = None) -> bool:
         """Advance the cursor to the next node (mirror of ``GenerationGraph.maybe_transition``).
 
         Training's "transition" is unconditional: a static topological pass just
@@ -270,8 +269,8 @@ class TrainingGraph:
         """
         self._cursor += 1
         moved = not self.is_done()
-        if trace is not None and moved:
-            trace.append(f"transition: -> {self.current_node_name}")
+        if profiler is not None and moved:
+            profiler.record(f"transition: -> {self.current_node_name}")
         return moved
 
     # ── visualization ────────────────────────────────────────────────────────

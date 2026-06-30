@@ -113,6 +113,7 @@ from .graph import (
     NodeDef,
     is_end,
 )
+from .profiling import GraphProfiler
 
 
 # Default method for a bare endpoint in the inference FSM (training uses
@@ -329,7 +330,7 @@ class GenerationGraph:
         self,
         modules: Dict[str, Any],
         ctx: Dict[str, Any],
-        trace: Optional[List[str]] = None,
+        profiler: Optional[GraphProfiler] = None,
         generation_kwargs: Optional[Dict[str, Any]] = None,
         scope_fn: Optional[Callable[[str], ContextManager]] = None,
     ) -> Dict[str, Any]:
@@ -367,10 +368,9 @@ class GenerationGraph:
             Mutable generation context (input_ids, attention_mask, kv
             cache, previously generated tokens, ...).  This call returns
             a *new* dict; the input is not mutated.
-        trace:
-            Optional list to which the FSM appends one
-            ``"<state>:<node>"`` token per executed node — handy for
-            print-driven flow tests.
+        profiler:
+            Optional graph profiler that records node path lines and, when
+            enabled, node timing.
 
         Returns
         -------
@@ -429,12 +429,15 @@ class GenerationGraph:
                 )
             method_name = node.method
             raw = unwrap_graph_module(wrapped, module_name=node.module)
-            if trace is not None:
-                trace.append(f"[State|{state.name}] {node_name}: {node.module}.{method_name}")
             # Optional per-module scope (e.g. make this module's ParallelState
             # current so Extra Parallel groups resolve correctly).
             module_context = scope_fn(node.module) if scope_fn is not None else nullcontext()
-            with module_context:
+            profile_context = (
+                profiler.node(f"[State|{state.name}] {node_name}: {node.module}.{method_name}")
+                if profiler is not None
+                else nullcontext()
+            )
+            with module_context, profile_context:
                 out = call_graph_endpoint(
                     wrapped,
                     raw,
@@ -466,7 +469,7 @@ class GenerationGraph:
 
         return ctx
 
-    def maybe_transition(self, context: Dict[str, Any], *, trace: Optional[List[str]] = None) -> bool:
+    def maybe_transition(self, context: Dict[str, Any], *, profiler: Optional[GraphProfiler] = None) -> bool:
         """Check transitions for the current state.
 
         Returns True if a transition fired (state changed).
@@ -477,8 +480,8 @@ class GenerationGraph:
         state = self._current_state
         for trans in state.transitions:
             if trans.condition.check(context):
-                if trace is not None:
-                    trace.append(f"transition: {state.name} -> {trans.next_state} [{trans.condition.describe()}]")
+                if profiler is not None:
+                    profiler.record(f"transition: {state.name} -> {trans.next_state} [{trans.condition.describe()}]")
                 if trans.condition.type == "module_signal":
                     context.pop(FSM_SIGNAL_KEY, None)
                 self._transition_to(trans.next_state, context)

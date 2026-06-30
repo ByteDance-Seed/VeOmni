@@ -103,10 +103,11 @@ from veomni.models.seed_omni.utils.convert_registry import convert_checkpoint
 - **Now:** `OmniModel.forward` loops the FSM exactly like `OmniModel.generate`:
   ```python
   training_graph.reset()
+  profiler = GraphProfiler()
   while not training_graph.is_done():
-      batch = training_graph.step(modules, batch, trace, scope_fn)  # unwrap + pre/post + dispatch
-      self._collect_training_loss(batch, trace)                     # pop _loss → self._losses
-      training_graph.maybe_transition()
+      batch = training_graph.step(modules, batch, profiler=profiler, scope_fn=scope_fn)
+      self._collect_training_loss(batch, profiler)  # pop _loss → self._losses
+      training_graph.maybe_transition(profiler=profiler)
   ```
   `TrainingGraph` gained `reset()` / `is_done()` / `current_node_name` /
   `maybe_transition()` (mirrors `GenerationGraph`).

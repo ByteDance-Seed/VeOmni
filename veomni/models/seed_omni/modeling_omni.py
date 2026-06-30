@@ -52,7 +52,7 @@ Returns ``{"loss": scalar_or_None, "losses": {node: scalar}}``.
 
 Inference
 ---------
-``generate(request, trace, generation_kwargs)`` loops (it does **not** reset
+``generate(request, profiler, generation_kwargs)`` loops (it does **not** reset
 the FSM — the caller owns request boundaries via :meth:`reset`):
 
   * ``ctx = fsm.step(modules, ctx)`` — one iteration of the current state.
@@ -65,9 +65,9 @@ FSM step return dict when a span ends; :meth:`OmniModel.generate` drains
 those into :attr:`OmniModel.generated` via :meth:`_collect_generated` and
 does not persist them on ``ctx``.
 
-Both ``step`` and ``maybe_transition`` accept an optional ``trace`` list —
-print-driven flow tests collect the visit log from there to assert the
-expected node order and transition timing.
+Both ``step`` and ``maybe_transition`` accept an optional graph profiler.
+Print-driven flow tests collect the visit log from ``profiler.save_records()`` to
+assert the expected node order and transition timing.
 
 ``OmniModel.generate`` always emits a coarse progress trail via
 :meth:`logger.info_rank0` — one line per FSM state entry
@@ -85,6 +85,7 @@ from ...distributed.parallel_state import use_parallel_state
 from ...utils import helper
 from .configuration_omni import OmniConfig
 from .graphs.generation_graph import GenerationGraph
+from .graphs.profiling import GraphProfiler
 from .graphs.training_graph import TrainingGraph
 from .mixins.modulemixin import ModuleMixin
 
@@ -244,7 +245,7 @@ class OmniModel(nn.Module):
 
     # ── Training ──────────────────────────────────────────────────────────────
 
-    def _collect_training_loss(self, batch: Dict[str, Any], trace: Optional[List[str]] = None) -> None:
+    def _collect_training_loss(self, batch: Dict[str, Any], profiler: Optional[GraphProfiler] = None) -> None:
         """Drain ``batch["_loss"]`` for the just-stepped node into :attr:`_losses`.
 
         The training analogue of :meth:`_collect_generated`: the node's
@@ -256,13 +257,13 @@ class OmniModel(nn.Module):
         if loss is not None:
             node = self.training_graph.current_node_name
             self._losses[node] = loss
-            if trace is not None:
-                trace.append(f"loss:{node}")
+            if profiler is not None:
+                profiler.record(f"loss:{node}")
 
     def forward(
         self,
         *,
-        trace: Optional[List[str]] = None,
+        profiler: Optional[GraphProfiler] = None,
         **batch: Any,
     ) -> Dict[str, Any]:
         """Execute the training DAG once over the full ``batch``.
@@ -276,9 +277,8 @@ class OmniModel(nn.Module):
 
         Parameters
         ----------
-        trace:
-            Optional list to which one ``"forward:<node>"`` token is
-            appended per executed node — used by the print-flow tests.
+        profiler:
+            Optional graph profiler used by print-flow tests and diagnostics.
         **batch:
             Raw batch fields, transparently visible to every node.
 
@@ -300,9 +300,9 @@ class OmniModel(nn.Module):
         modules = {name: getattr(self, name) for name in self._module_names}
 
         while not self.training_graph.is_done():
-            batch = self.training_graph.step(modules, batch, trace=trace, scope_fn=self._module_scope)
-            self._collect_training_loss(batch, trace)
-            self.training_graph.maybe_transition(trace=trace)
+            batch = self.training_graph.step(modules, batch, profiler=profiler, scope_fn=self._module_scope)
+            self._collect_training_loss(batch, profiler)
+            self.training_graph.maybe_transition(profiler=profiler)
 
         return {"loss": _sum_losses(self._losses), "losses": dict(self._losses)}
 
@@ -341,17 +341,17 @@ class OmniModel(nn.Module):
         if normalized is not None:
             self._generated.append(normalized)
 
-    def _collect_generated(self, ctx: Dict[str, Any], trace: Optional[List[str]] = None) -> None:
+    def _collect_generated(self, ctx: Dict[str, Any], profiler: Optional[GraphProfiler] = None) -> None:
         """Drain ``ctx["generated"]`` into :attr:`_generated` (one-shot)."""
         generated = ctx.pop("generated", None)
         self._append_generated(generated)
-        if trace is not None and generated is not None:
-            trace.append(f"generated:{generated['type']}")
+        if profiler is not None and generated is not None:
+            profiler.record(f"generated:{generated['type']}")
 
     def _invoke_module_finalize(
         self,
         ctx: Dict[str, Any],
-        trace: Optional[List[str]] = None,
+        profiler: Optional[GraphProfiler] = None,
     ) -> None:
         """Call :meth:`ModuleMixin.finalize` and drain any ``generated`` payload.
 
@@ -363,8 +363,8 @@ class OmniModel(nn.Module):
                 raise TypeError(f"{type(raw).__name__}.finalize must return a dict, got {type(out).__name__}.")
             generated = out.pop("generated", None)
             self._append_generated(generated)
-            if trace is not None and generated is not None:
-                trace.append(f"finalize:{name} | generated:{generated['type']}")
+            if profiler is not None and generated is not None:
+                profiler.record(f"finalize:{name} | generated:{generated['type']}")
 
     def _emit_progress(self, total_steps: int) -> None:
         """Log one ``[FSM] step <N>: <state>`` line on a state change.
@@ -386,7 +386,7 @@ class OmniModel(nn.Module):
     def generate(
         self,
         request: Dict[str, Any],
-        trace: Optional[List[str]] = None,
+        profiler: Optional[GraphProfiler] = None,
         generation_kwargs: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Run inference using the FSM.
@@ -398,8 +398,9 @@ class OmniModel(nn.Module):
             Built by :class:`OmniInferencer` and contains the seed
             ``conversation_list`` (see :func:`build_conversation`).  Modules
             read and mutate it in place each FSM step.
-        trace:
-            Optional list — receives FSM step / transition log for testing.
+        profiler:
+            Optional graph profiler that receives FSM step / transition log
+            and optional node timings.
         generation_kwargs:
             Opaque per-request knobs forwarded to every module's FSM step
             (e.g. ``temperature`` / ``top_p`` / ``guidance_scale``).  The
@@ -448,11 +449,11 @@ class OmniModel(nn.Module):
         while not self.generation_graph.is_done() and total_steps < max_new_tokens:
             self._emit_progress(total_steps)
             ctx = self.generation_graph.step(
-                modules, ctx, trace=trace, generation_kwargs=generation_kwargs, scope_fn=self._module_scope
+                modules, ctx, profiler=profiler, generation_kwargs=generation_kwargs, scope_fn=self._module_scope
             )
             total_steps += 1
-            self._collect_generated(ctx, trace)
-            self.generation_graph.maybe_transition(ctx, trace=trace)
+            self._collect_generated(ctx, profiler)
+            self.generation_graph.maybe_transition(ctx, profiler=profiler)
 
         # Final emit — captures the state the FSM is in after the loop
         # exits.  Usually ``done`` (a module raised its terminating signal);
@@ -461,7 +462,7 @@ class OmniModel(nn.Module):
         self._emit_progress(total_steps)
 
         if not self.generation_graph.is_done():
-            self._invoke_module_finalize(ctx, trace=trace)
+            self._invoke_module_finalize(ctx, profiler=profiler)
 
         return ctx
 

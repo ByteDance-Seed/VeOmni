@@ -13,6 +13,7 @@ from tests.seed_omni.bagel.contracts.helpers import (
     tiny_bagel_qwen2_cfg,
 )
 from veomni.models.seed_omni.graphs.generation_graph import FSM_SIGNAL_KEY
+from veomni.models.seed_omni.graphs.profiling import GraphProfiler
 from veomni.models.seed_omni.mixins.modulemixin import ModuleMixin
 from veomni.models.seed_omni.modeling_omni import OmniModel
 from veomni.models.seed_omni.modules.bagel.qwen2_mot.generation_state import MotGenerationState
@@ -44,10 +45,10 @@ def test_bagel_infer_gen_denoise_signal_smoke():
             "bagel_vae": _InferGenBagelVAE(),
         },
     ).eval()
-    trace: list[str] = []
+    profiler = GraphProfiler()
     ctx = model.generate(
         {"conversation_list": [ConversationItem(type="text", value="prompt", role="user")]},
-        trace=trace,
+        profiler=profiler,
         generation_kwargs={
             "max_new_tokens": 8,
             "do_sample": False,
@@ -56,6 +57,7 @@ def test_bagel_infer_gen_denoise_signal_smoke():
         },
     )
 
+    trace = profiler.save_records()
     assert any("transition: prompt_encode -> query_denoise" in entry for entry in trace)
     assert any("transition: query_denoise -> velocity_collect" in entry for entry in trace)
     assert any("transition: velocity_collect -> image_decode" in entry for entry in trace)
@@ -81,7 +83,7 @@ def test_bagel_infer_edit_defaults_to_denoise_signal_smoke():
             "bagel_vae": _InferEditBagelVAE(),
         },
     ).eval()
-    trace: list[str] = []
+    profiler = GraphProfiler()
     ctx = model.generate(
         {
             "conversation_list": [
@@ -100,7 +102,7 @@ def test_bagel_infer_edit_defaults_to_denoise_signal_smoke():
                 ConversationItem(type="text", value="prompt", role="user"),
             ]
         },
-        trace=trace,
+        profiler=profiler,
         generation_kwargs={
             "max_new_tokens": 8,
             "do_sample": False,
@@ -109,6 +111,7 @@ def test_bagel_infer_edit_defaults_to_denoise_signal_smoke():
         },
     )
 
+    trace = profiler.save_records()
     assert any("transition: prompt_encode -> query_denoise" in entry for entry in trace)
     assert not any("transition: prompt_encode -> text_ar" in entry for entry in trace)
     assert any("transition: image_decode -> done" in entry for entry in trace)
@@ -133,10 +136,10 @@ def test_bagel_infer_gen_cfg_text_branch_signal_smoke():
             "bagel_vae": _InferGenBagelVAE(),
         },
     ).eval()
-    trace: list[str] = []
+    profiler = GraphProfiler()
     ctx = model.generate(
         {"conversation_list": [ConversationItem(type="text", value="prompt", role="user")]},
-        trace=trace,
+        profiler=profiler,
         generation_kwargs={
             "max_new_tokens": 8,
             "do_sample": False,
@@ -147,6 +150,7 @@ def test_bagel_infer_gen_cfg_text_branch_signal_smoke():
         },
     )
 
+    trace = profiler.save_records()
     assert not any("module_signal(need_denoise_branch)" in entry for entry in trace)
     assert any(
         "transition: velocity_collect -> image_decode [module_signal(image_complete)]" in entry for entry in trace
@@ -172,10 +176,10 @@ def test_bagel_infer_gen_cfg_text_and_image_branch_signal_smoke():
             "bagel_vae": _InferGenBagelVAE(),
         },
     ).eval()
-    trace: list[str] = []
+    profiler = GraphProfiler()
     ctx = model.generate(
         {"conversation_list": [ConversationItem(type="text", value="prompt", role="user")]},
-        trace=trace,
+        profiler=profiler,
         generation_kwargs={
             "max_new_tokens": 12,
             "do_sample": False,
@@ -186,6 +190,7 @@ def test_bagel_infer_gen_cfg_text_and_image_branch_signal_smoke():
         },
     )
 
+    trace = profiler.save_records()
     assert not any("module_signal(need_denoise_branch)" in entry for entry in trace)
     assert any(
         "transition: velocity_collect -> image_decode [module_signal(image_complete)]" in entry for entry in trace

@@ -33,6 +33,7 @@ import torch.distributed as dist
 from ...arguments import OmniArguments
 from ...data.multimodal.image_utils import load_image
 from ...models.seed_omni import build_conversation
+from ...models.seed_omni.graphs import GraphProfiler
 from ...models.seed_omni.modeling_omni import OmniModel, _unwrap_module
 from ...models.seed_omni.utils.conversation import ConversationItem
 from ...utils import helper
@@ -211,7 +212,8 @@ class OmniInferencer(OmniTrainer):
             image.save(out_path)
             logger.info_rank0(f"finalize: image #{idx} → {out_path}")
 
-        trace = ctx.get("trace") or []
+        profiler = ctx.get("profiler")
+        trace = profiler.save_records() if isinstance(profiler, GraphProfiler) else []
         trace_path = os.path.join(output_dir, "trace.txt")
         with open(trace_path, "w", encoding="utf-8") as f:
             f.write("\n".join(trace) + "\n")
@@ -264,13 +266,17 @@ class OmniInferencer(OmniTrainer):
             "conversation_list": conversation,
         }
         self.model.reset()
-        trace_buf: list[str] = []
+        profiler = GraphProfiler(
+            enable_wall_time=self.args.infer.profile.enable_wall_time,
+            enable_cuda_events=self.args.infer.profile.enable_cuda_events,
+            enable_memory=self.args.infer.profile.enable_memory,
+        )
         ctx = self.model.generate(
             request=request_dict,
-            trace=trace_buf,
+            profiler=profiler,
             generation_kwargs=req.generation_kwargs,
         )
-        ctx["trace"] = trace_buf
+        ctx["profiler"] = profiler
         return ctx
 
 

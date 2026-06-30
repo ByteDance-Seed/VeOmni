@@ -119,6 +119,28 @@ class OmniModelArguments(ModelArguments):
 
 
 @dataclass
+class OmniInferProfileArguments:
+    """``infer.profile.*`` — graph profiler timing switches.
+
+    The inferencer always writes the graph execution path to ``trace.txt``.
+    These flags only add profiling suffixes to those path lines.
+    """
+
+    enable_wall_time: bool = field(
+        default=False,
+        metadata={"help": "Append per graph-node wall-clock timing to trace.txt."},
+    )
+    enable_cuda_events: bool = field(
+        default=False,
+        metadata={"help": "Append per graph-node CUDA event timing to trace.txt."},
+    )
+    enable_memory: bool = field(
+        default=False,
+        metadata={"help": "Append request-local peak device memory to trace.txt."},
+    )
+
+
+@dataclass
 class OmniInferArguments:
     """``infer.*`` — OmniModel V2 inference configuration + per-call knobs.
 
@@ -165,6 +187,7 @@ class OmniInferArguments:
             )
         },
     )
+    profile: OmniInferProfileArguments = field(default_factory=OmniInferProfileArguments)
     # ---- per-invocation runtime knobs ------------------------------------
     prompt: str = field(
         default="",
