@@ -104,14 +104,14 @@ graph_profile:
   enable_wall_time: true    # append wall_ms=...
   enable_cuda_events: true  # append cuda_ms=...
   enable_memory: true       # append peak_allocated_gb / peak_reserved_gb
-  train_profiling_steps: 10 # training only: save global steps 1-10
+  train_start_step: 1       # training only: save global steps 1-10
+  train_end_step: 10
 ```
 
 Inference always writes the graph path to `<output_dir>/<infer_type>/trace.txt`;
 the `graph_profile.enable_*` switches only add suffix fields to those node lines.
 Training writes rank-0 graph traces only when any detail switch is enabled,
-under `train.checkpoint.output_dir/graph_trace`. `train_profiling_steps=0`
-disables training graph trace files.
+under `train.checkpoint.output_dir/graph_trace`.
 
 Execution is driven by the model itself (not the module's `pre_forward`).
 `OmniModel.forward` loops the FSM (`TrainingGraph.step` → `_collect_training_loss`

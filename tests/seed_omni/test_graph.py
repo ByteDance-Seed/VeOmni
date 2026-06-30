@@ -300,7 +300,7 @@ def test_graph_profiler_can_append_request_peak_memory(monkeypatch):
 
 
 def test_omni_trainer_saves_training_graph_profile_from_top_level_profile(tmp_path):
-    profile = OmniGraphProfileArguments(enable_wall_time=True, train_profiling_steps=3)
+    profile = OmniGraphProfileArguments(enable_wall_time=True, train_start_step=2, train_end_step=3)
     output_dir = tmp_path / "output"
     trainer = OmniTrainer.__new__(OmniTrainer)
     trainer.base = SimpleNamespace(

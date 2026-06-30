@@ -469,7 +469,7 @@ class OmniTrainer:
             return False
         if not profile.enable_graph_profiling():
             return False
-        return 1 <= self.base.state.global_step <= profile.train_profiling_steps
+        return profile.train_start_step <= self.base.state.global_step <= profile.train_end_step
 
     def _build_graph_profiler(self) -> Optional[GraphProfiler]:
         profile = self.base.args.graph_profile

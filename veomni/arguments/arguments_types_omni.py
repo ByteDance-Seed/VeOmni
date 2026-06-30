@@ -127,14 +127,18 @@ class OmniGraphProfileArguments:
     wall/CUDA/memory suffixes.
     """
 
-    train_profiling_steps: int = field(
-        default=0,
+    train_start_step: int = field(
+        default=1,
         metadata={
             "help": (
-                "Number of initial training steps to save graph profiler records for. "
-                "0 disables training graph trace files; 1 records global step 1."
+                "First training global step to save graph profiler records for. "
+                "Only used when at least one graph profiler detail switch is enabled."
             )
         },
+    )
+    train_end_step: int = field(
+        default=2,
+        metadata={"help": "Last training global step to save graph profiler records for."},
     )
     enable_wall_time: bool = field(
         default=False,
