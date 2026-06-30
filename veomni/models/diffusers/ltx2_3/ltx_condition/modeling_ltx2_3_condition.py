@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import math
-import os
 from pathlib import Path
 from typing import Any
 
@@ -12,7 +11,6 @@ from transformers import PreTrainedModel
 
 from .....utils import logging
 from .....utils.device import get_device_type
-from ..ltx_core.model.transformer.rope import LTXRopeType
 from ..ltx_core.model.video_vae import load_video_encoder
 from ..ltx_core.text_encoders.gemma.embeddings_processor import (
     EmbeddingsProcessor,
@@ -68,69 +66,21 @@ class LTX2Scheduler:
         return (1.0 - sigma) * latents + sigma * noise
 
 
-def _infer_connector_dims_from_checkpoint(checkpoint_path: str) -> dict[str, int]:
-    """Infer connector inner_dim from checkpoint weight shapes.
-
-    Peeks at the safetensors file without loading the full checkpoint.
-    Uses ``learnable_registers`` shape ``[num_registers, inner_dim]`` to
-    determine each connector's actual dimension.
-
-    Returns:
-        ``{"video": <dim>, "audio": <dim>}`` (keys absent if not found).
-    """
-    from safetensors import safe_open
-
-    ckpt_path = Path(checkpoint_path)
-    dims: dict[str, int] = {}
-
-    _PROBE_KEYS = {
-        "model.diffusion_model.video_embeddings_connector.learnable_registers": "video",
-        "model.diffusion_model.audio_embeddings_connector.learnable_registers": "audio",
-    }
-
-    if ckpt_path.is_dir():
-        safetensor_files = sorted(ckpt_path.glob("*.safetensors"))
-    elif ckpt_path.suffix == ".safetensors":
-        safetensor_files = [ckpt_path]
-    else:
-        return dims
-
-    for sf_path in safetensor_files:
-        if len(dims) == len(_PROBE_KEYS):
-            break
-        with safe_open(str(sf_path), framework="pt", device="cpu") as f:
-            for key, modality in _PROBE_KEYS.items():
-                if key in f.keys():
-                    dims[modality] = f.get_tensor(key).shape[-1]
-
-    return dims
-
-
 def _load_embeddings_processor_weights(
     embeddings_processor: EmbeddingsProcessor,
     checkpoint_path: str,
     device: torch.device,
     dtype: torch.dtype = torch.bfloat16,
-) -> dict[str, int]:
+):
     """Load EmbeddingsProcessor weights from LTX-2 checkpoint with key remapping.
 
     Uses safetensors safe_open to selectively read only the needed keys,
     avoiding loading the entire (potentially 20+ GB) checkpoint into memory.
-
-    Returns a dict with inferred feature extractor output dimensions:
-    ``{"video": <dim>, "audio": <dim>}`` (keys absent if not found).
     """
     from safetensors import safe_open
 
     ckpt_path = Path(checkpoint_path)
     target_prefixes = tuple(EMBEDDINGS_PROCESSOR_KEY_REMAP.keys())
-    fe_dims: dict[str, int] = {}
-
-    _FE_DIM_KEYS = {
-        "text_embedding_projection.aggregate_embed.weight": ("video", "aggregate_embed"),
-        "text_embedding_projection.video_aggregate_embed.weight": ("video", "video_aggregate_embed"),
-        "text_embedding_projection.audio_aggregate_embed.weight": ("audio", "audio_aggregate_embed"),
-    }
 
     if ckpt_path.is_dir():
         safetensor_files = sorted(ckpt_path.glob("*.safetensors"))
@@ -142,9 +92,6 @@ def _load_embeddings_processor_weights(
         all_state_dict = torch.load(str(ckpt_path), map_location=device, weights_only=True)
         processor_state_dict = {}
         for key, value in all_state_dict.items():
-            if key in _FE_DIM_KEYS:
-                modality, _ = _FE_DIM_KEYS[key]
-                fe_dims[modality] = value.shape[0]
             for old_prefix, new_prefix in EMBEDDINGS_PROCESSOR_KEY_REMAP.items():
                 if key.startswith(old_prefix):
                     new_key = new_prefix + key[len(old_prefix) :]
@@ -155,16 +102,13 @@ def _load_embeddings_processor_weights(
             logger.warning_rank0(f"EmbeddingsProcessor missing keys: {missing}")
         if unexpected:
             logger.warning_rank0(f"EmbeddingsProcessor unexpected keys: {unexpected}")
-        return fe_dims
+        return
 
     processor_state_dict = {}
     for sf_path in safetensor_files:
         with safe_open(str(sf_path), framework="pt", device=str(device)) as f:
             keys = f.keys()
             for key in keys:
-                if key in _FE_DIM_KEYS:
-                    modality, _ = _FE_DIM_KEYS[key]
-                    fe_dims[modality] = f.get_tensor(key).shape[0]
                 if key.startswith(target_prefixes):
                     for old_prefix, new_prefix in EMBEDDINGS_PROCESSOR_KEY_REMAP.items():
                         if key.startswith(old_prefix):
@@ -183,140 +127,6 @@ def _load_embeddings_processor_weights(
         logger.warning_rank0(f"EmbeddingsProcessor missing keys: {missing}")
     if unexpected:
         logger.warning_rank0(f"EmbeddingsProcessor unexpected keys: {unexpected}")
-    return fe_dims
-
-
-def _build_embeddings_processor_with_dims(
-    config: dict,
-    connector_dims: dict[str, int],
-) -> EmbeddingsProcessor:
-    """Build EmbeddingsProcessor with connector dimensions inferred from checkpoint.
-
-    Falls back to config-based creation when checkpoint dims are unavailable.
-    """
-    from ltx_core.text_encoders.gemma.embeddings_connector import Embeddings1DConnector
-
-    transformer_config = config.get("transformer", config)
-
-    video_inner_dim = connector_dims.get("video")
-    audio_inner_dim = connector_dims.get("audio")
-
-    if video_inner_dim is None:
-        return build_embeddings_processor(config, with_feature_extractor=False)
-
-    rope_type = LTXRopeType(transformer_config.get("rope_type", "split"))
-    double_precision_rope = transformer_config.get("frequencies_precision", False) == "float64"
-    pe_max_pos = transformer_config.get("connector_positional_embedding_max_pos", [1])
-    num_layers = transformer_config.get("connector_num_layers", 2)
-    gated = transformer_config.get("connector_apply_gated_attention", False)
-
-    video_heads = transformer_config.get("num_attention_heads", 32)
-    video_head_dim = transformer_config.get("attention_head_dim", 128)
-    if video_heads * video_head_dim != video_inner_dim:
-        video_heads = video_inner_dim // 128 if video_inner_dim % 128 == 0 else 32
-        video_head_dim = video_inner_dim // video_heads
-
-    video_connector = Embeddings1DConnector(
-        num_attention_heads=video_heads,
-        attention_head_dim=video_head_dim,
-        num_layers=num_layers,
-        positional_embedding_max_pos=pe_max_pos,
-        rope_type=rope_type,
-        double_precision_rope=double_precision_rope,
-        apply_gated_attention=gated,
-    )
-
-    audio_connector = None
-    if audio_inner_dim is not None:
-        audio_heads = transformer_config.get("audio_num_attention_heads", 32)
-        audio_head_dim = transformer_config.get("audio_attention_head_dim", 64)
-        if audio_heads * audio_head_dim != audio_inner_dim:
-            audio_heads = audio_inner_dim // 64 if audio_inner_dim % 64 == 0 else 32
-            audio_head_dim = audio_inner_dim // audio_heads
-
-        audio_connector = Embeddings1DConnector(
-            num_attention_heads=audio_heads,
-            attention_head_dim=audio_head_dim,
-            num_layers=transformer_config.get("audio_connector_num_layers", num_layers),
-            positional_embedding_max_pos=pe_max_pos,
-            rope_type=rope_type,
-            double_precision_rope=double_precision_rope,
-            apply_gated_attention=gated,
-        )
-
-    return EmbeddingsProcessor(
-        video_connector=video_connector,
-        audio_connector=audio_connector,
-        feature_extractor=None,
-    )
-
-
-def _get_fe_output_dim(feature_extractor, modality: str) -> int | None:
-    if feature_extractor is None:
-        return None
-    if hasattr(feature_extractor, "aggregate_embed"):
-        return feature_extractor.aggregate_embed.out_features
-    if modality == "video" and hasattr(feature_extractor, "video_aggregate_embed"):
-        return feature_extractor.video_aggregate_embed.out_features
-    if modality == "audio" and hasattr(feature_extractor, "audio_aggregate_embed"):
-        return feature_extractor.audio_aggregate_embed.out_features
-    return None
-
-
-def _create_identity_projection(
-    input_dim: int, output_dim: int, device: torch.device, dtype: torch.dtype
-) -> torch.nn.Linear:
-    proj = torch.nn.Linear(input_dim, output_dim, bias=False, device=device, dtype=dtype)
-    with torch.no_grad():
-        identity = torch.zeros(output_dim, input_dim, device=device, dtype=dtype)
-        min_dim = min(input_dim, output_dim)
-        for i in range(min_dim):
-            identity[i, i] = 1.0
-        proj.weight.copy_(identity)
-    return proj
-
-
-def _create_input_projections(
-    embeddings_processor: EmbeddingsProcessor,
-    device: torch.device,
-    dtype: torch.dtype,
-    fe_dims: dict[str, int] | None = None,
-) -> None:
-    """Create input projections to bridge FE output dim and connector inner_dim mismatch.
-
-    Dimensions are inferred from the feature extractor (if present) or from
-    checkpoint weight shapes (``fe_dims`` returned by
-    ``_load_embeddings_processor_weights``).
-    """
-    video_fe_dim = _get_fe_output_dim(embeddings_processor.feature_extractor, "video")
-    if video_fe_dim is None and fe_dims:
-        video_fe_dim = fe_dims.get("video")
-    if (
-        video_fe_dim is not None
-        and embeddings_processor.video_connector is not None
-        and video_fe_dim != embeddings_processor.video_connector.inner_dim
-    ):
-        logger.info_rank0(
-            f"Creating video_input_proj: {video_fe_dim} -> {embeddings_processor.video_connector.inner_dim}"
-        )
-        embeddings_processor.video_input_proj = _create_identity_projection(
-            video_fe_dim, embeddings_processor.video_connector.inner_dim, device, dtype
-        )
-
-    audio_fe_dim = _get_fe_output_dim(embeddings_processor.feature_extractor, "audio")
-    if audio_fe_dim is None and fe_dims:
-        audio_fe_dim = fe_dims.get("audio")
-    if (
-        audio_fe_dim is not None
-        and embeddings_processor.audio_connector is not None
-        and audio_fe_dim != embeddings_processor.audio_connector.inner_dim
-    ):
-        logger.info_rank0(
-            f"Creating audio_input_proj: {audio_fe_dim} -> {embeddings_processor.audio_connector.inner_dim}"
-        )
-        embeddings_processor.audio_input_proj = _create_identity_projection(
-            audio_fe_dim, embeddings_processor.audio_connector.inner_dim, device, dtype
-        )
 
 
 def _load_transformer_config(checkpoint_path: str) -> dict:
@@ -398,22 +208,13 @@ class LTXVideoConditionModel(PreTrainedModel):
             f"VeOmni audio_connector_num_attention_heads: {_tc.get('audio_connector_num_attention_heads', 'NOT_SET')}"
         )
 
-        connector_dims = _infer_connector_dims_from_checkpoint(base)
-        if connector_dims:
-            logger.info_rank0(f"Inferred connector dimensions from checkpoint: {connector_dims}")
+        self.embeddings_processor = build_embeddings_processor(transformer_config, with_feature_extractor=False)
 
-        self.embeddings_processor = _build_embeddings_processor_with_dims(transformer_config, connector_dims)
-
-        fe_dims = _load_embeddings_processor_weights(
-            self.embeddings_processor, base, device=device, dtype=torch.bfloat16
-        )
-
-        _create_input_projections(self.embeddings_processor, device=device, dtype=torch.bfloat16, fe_dims=fe_dims)
+        _load_embeddings_processor_weights(self.embeddings_processor, base, device=device, dtype=torch.bfloat16)
 
         logger.info_rank0(
             f"VeOmni connector inner_dim={self.embeddings_processor.video_connector.inner_dim}, "
-            f"heads={self.embeddings_processor.video_connector.num_attention_heads}, "
-            f"video_input_proj={self.embeddings_processor.video_input_proj is not None}"
+            f"heads={self.embeddings_processor.video_connector.num_attention_heads}"
         )
 
         self.embeddings_processor = self.embeddings_processor.to(device=device, dtype=torch.bfloat16)

@@ -46,15 +46,11 @@ class EmbeddingsProcessor(nn.Module):
         feature_extractor: nn.Module | None = None,
         video_connector: Embeddings1DConnector,
         audio_connector: Embeddings1DConnector | None = None,
-        video_input_proj: nn.Linear | None = None,
-        audio_input_proj: nn.Linear | None = None,
     ):
         super().__init__()
         self.feature_extractor = feature_extractor
         self.video_connector = video_connector
         self.audio_connector = audio_connector
-        self.video_input_proj = video_input_proj
-        self.audio_input_proj = audio_input_proj
 
     def create_embeddings(
         self,
@@ -70,9 +66,6 @@ class EmbeddingsProcessor(nn.Module):
         sort_idx, mask_for_connector = _compute_right_pad_order(additive_attention_mask)
         video_features = _apply_right_pad_order(video_features, sort_idx)
 
-        if self.video_input_proj is not None:
-            video_features = self.video_input_proj(video_features)
-
         video_encoded, video_mask = self.video_connector(video_features, mask_for_connector)
         binary_mask = _to_binary_mask(video_mask, video_encoded.shape[:2])
         video_encoded = video_encoded * binary_mask
@@ -80,8 +73,6 @@ class EmbeddingsProcessor(nn.Module):
         audio_encoded = None
         if self.audio_connector is not None:
             audio_features = _apply_right_pad_order(audio_features, sort_idx)
-            if self.audio_input_proj is not None:
-                audio_features = self.audio_input_proj(audio_features)
             audio_encoded, _ = self.audio_connector(audio_features, mask_for_connector)
 
         return video_encoded, audio_encoded, binary_mask.squeeze(-1)
