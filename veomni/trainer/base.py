@@ -525,6 +525,7 @@ class BaseTrainer(Stateful, ABC):
 
     def _build_parallelized_model(self):
         args: VeOmniArguments = self.args
+
         kwargs = {}
         cpu_load_param_name = None
         if hasattr(self.model, "get_parallel_plan"):
@@ -554,6 +555,10 @@ class BaseTrainer(Stateful, ABC):
                 f"Checkpoint resume enabled (load_path={args.train.checkpoint.load_path}); "
                 "skipping HF weight materialization before checkpoint restore."
             )
+
+        kwargs["enable_async_activation_offload"] = (
+            args.train.accelerator.offload_config.enable_async_activation_offload
+        )
 
         # Parallelize model
         self.model = build_parallelize_model(
@@ -612,10 +617,20 @@ class BaseTrainer(Stateful, ABC):
 
     def _build_training_context(self):
         """Build training context for distributed training."""
+        offload_config = self.args.train.accelerator.offload_config
+
+        # Async activation offload uses per-module saved_tensors_hooks (applied
+        # before FSDP sharding), so the global fwd/bwd contexts are nullcontext.
+        if offload_config.enable_async_activation_offload:
+            from contextlib import nullcontext
+
+            self.model_fwd_context, self.model_bwd_context = nullcontext(), nullcontext()
+            return
+
         self.model_fwd_context, self.model_bwd_context = build_activation_offloading_context(
-            self.args.train.accelerator.offload_config.enable_activation,
+            offload_config.enable_activation,
             self.args.train.gradient_checkpointing.enable,
-            self.args.train.accelerator.offload_config.activation_gpu_limit,
+            offload_config.activation_gpu_limit,
         )
 
     def _init_callbacks(self):
