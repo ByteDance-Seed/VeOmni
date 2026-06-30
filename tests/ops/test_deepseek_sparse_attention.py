@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from veomni.utils.device import get_gpu_compute_capability
+from veomni.utils.device import get_device_type, get_gpu_compute_capability
 
 
 dsa = pytest.importorskip("veomni.ops.kernels.deepseek_sparse_attention.flashmla_cudnn")
@@ -359,7 +359,7 @@ def test_flash_mla_sparse_attention_with_cudnn_backward_splits_gradients(monkeyp
     reason="FlashMLA/cuDNN DSA numerical parity test requires SM100, e.g. B200.",
 )
 def test_flash_mla_sparse_attention_with_cudnn_backward_sm100_matches_eager():
-    device = "cuda"
+    device = get_device_type()
     dtype = torch.bfloat16
     batch_size, seqlen_q, seqlen_k, topk, num_heads = 1, 2, 192, 128, 128
     d_pe, d_nope = 64, 512
