@@ -2,8 +2,6 @@ import logging
 from typing import Any, List, Tuple
 
 import torch
-from torch import nn
-
 from ltx_core.model.common.normalization import PixelNorm
 from ltx_core.model.transformer.timestep_embedding import PixArtAlphaCombinedTimestepSizeEmbeddings
 from ltx_core.model.video_vae.convolution import make_conv_nd
@@ -12,6 +10,7 @@ from ltx_core.model.video_vae.ops import PerChannelStatistics, patchify, unpatch
 from ltx_core.model.video_vae.resnet import ResnetBlock3D, UNetMidBlock3D
 from ltx_core.model.video_vae.sampling import DepthToSpaceUpsample, SpaceToDepthDownsample
 from ltx_core.types import SpatioTemporalScaleFactors
+from torch import nn
 
 
 logger: logging.Logger = logging.getLogger(__name__)

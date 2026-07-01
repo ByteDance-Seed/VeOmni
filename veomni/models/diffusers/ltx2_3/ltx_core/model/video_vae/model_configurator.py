@@ -3,7 +3,6 @@ from pathlib import Path
 
 import safetensors
 import torch
-
 from ltx_core.model.video_vae.enums import LogVarianceType, NormLayerType, PaddingModeType
 from ltx_core.model.video_vae.video_vae import VideoDecoder, VideoEncoder
 
