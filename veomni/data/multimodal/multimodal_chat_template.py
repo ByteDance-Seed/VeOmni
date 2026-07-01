@@ -533,14 +533,14 @@ class Qwen25OmniChatTemplate(Qwen2VLChatTemplate):
             content_str = message["content"].strip()
             loss_mask = message["loss_mask"]
             role = message["role"]
-            # The "<|im_start|>{role}\n" header is a fixed prompt prefix, never a training target.
-            prefix_len = len(self.tokenizer.encode("<|im_start|>" + message["role"] + "\n", add_special_tokens=False))
-            if content_str:
-                content_str = "<|im_start|>" + message["role"] + "\n" + content_str + "<|im_end|>\n"
-            else:
-                content_str = "<|im_start|>" + message["role"] + "\n"
 
-            message_ids = self.tokenizer.encode(content_str, add_special_tokens=False)
+            message_ids = self.tokenizer.encode("<|im_start|>" + message["role"] + "\n", add_special_tokens=False)
+            prefix_len = len(message_ids)
+            if content_str:
+                content_ids = self.tokenizer.encode(content_str, add_special_tokens=False)
+                end_ids = self.tokenizer.encode("<|im_end|>\n", add_special_tokens=False)
+                message_ids += content_ids + end_ids
+
             input_ids += message_ids
             attention_mask += [1] * len(message_ids)
             if loss_mask == 1:
