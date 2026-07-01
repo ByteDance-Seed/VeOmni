@@ -18,31 +18,11 @@ def apply_rotary_emb(
     freqs_cis: Tuple[torch.Tensor, torch.Tensor],
     rope_type: LTXRopeType = LTXRopeType.SPLIT,
 ) -> torch.Tensor:
-    import os
-
-    _dbg = os.environ.get("LTX_DEBUG_FIXED_NOISE") == "1"
-    _is_first = _dbg and not hasattr(apply_rotary_emb, "_printed")
-    if _is_first:
-        apply_rotary_emb._printed = True
-
-    if _is_first:
-        cos_freqs, sin_freqs = freqs_cis
-        with torch.no_grad():
-            print(
-                f"[LTX-2 ROPE] input: shape={list(input_tensor.shape)}, mean={input_tensor.float().mean().item():.8f}, std={input_tensor.float().std().item():.8f}"
-            )
-            print(
-                f"[LTX-2 ROPE] cos_freqs: shape={list(cos_freqs.shape)}, mean={cos_freqs.float().mean().item():.8f}, std={cos_freqs.float().std().item():.8f}"
-            )
-            print(
-                f"[LTX-2 ROPE] sin_freqs: shape={list(sin_freqs.shape)}, mean={sin_freqs.float().mean().item():.8f}, std={sin_freqs.float().std().item():.8f}"
-            )
-
     if rope_type == LTXRopeType.INTERLEAVED:
         # Note: INTERLEAVED rope is a legacy mode. Prefer SPLIT instead.
-        output = apply_interleaved_rotary_emb(input_tensor, *freqs_cis)
+        return apply_interleaved_rotary_emb(input_tensor, *freqs_cis)
     elif rope_type == LTXRopeType.SPLIT:
-        output = apply_split_rotary_emb(input_tensor, *freqs_cis)
+        return apply_split_rotary_emb(input_tensor, *freqs_cis)
     else:
         raise ValueError(f"Invalid rope type: {rope_type}")
 

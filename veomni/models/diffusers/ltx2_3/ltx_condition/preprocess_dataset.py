@@ -63,7 +63,7 @@ from torch.utils.data import DataLoader, Dataset, Subset
 from tqdm import tqdm
 
 import veomni.models.diffusers.ltx2_3.ltx_core  # noqa: F401
-from veomni.utils.device import get_device_type
+from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type
 
 
 VAE_SPATIAL_FACTOR = 32
@@ -436,7 +436,7 @@ def _caption_with_ltx_trainer(
         print("  pip install ltx-trainer")
         sys.exit(1)
 
-    device_str = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    device_str = device or ("cuda" if IS_CUDA_AVAILABLE else "cpu")
     ct = CaptionerType(captioner_type)
     captioner = create_captioner(captioner_type=ct, device=device_str, instruction=instruction)
 
@@ -1717,7 +1717,7 @@ def main():
     sp_parquet.add_argument("--output_dir", type=str, required=True, help="Output directory for parquet shards")
     sp_parquet.add_argument("--shard_size", type=int, default=1000, help="Number of samples per parquet shard")
     sp_parquet.add_argument(
-        "--pad-to-multiple-of",
+        "--pad_to_multiple_of",
         type=int,
         default=None,
         help="Pad total samples to be divisible by this number (e.g., dp_size for distributed training)",

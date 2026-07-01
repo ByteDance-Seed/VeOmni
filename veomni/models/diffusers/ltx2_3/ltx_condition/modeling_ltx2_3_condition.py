@@ -399,6 +399,20 @@ class LTXVideoConditionModel(PreTrainedModel):
                 device=device,
             )
 
+            if timestep_sampling_mode == "shifted_logit_normal":
+                seq_length = F * H * W
+                timestep = self._sample_shifted_logit_normal(B, seq_length, device).to(
+                    device=device, dtype=compute_dtype
+                )
+            else:
+                timestep_ids = torch.randint(
+                    0,
+                    len(self.scheduler.timesteps),
+                    (B,),
+                    device=device,
+                )
+                timestep = self.scheduler.timesteps[timestep_ids].to(device=device, dtype=compute_dtype)
+
             noisy_latents = self.scheduler.scale_noise(latents_on_device, timestep, noise)
             noisy_latents = noisy_latents.to(device=device)
 
