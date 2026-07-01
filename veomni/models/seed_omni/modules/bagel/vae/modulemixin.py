@@ -163,7 +163,7 @@ class BagelVAEModuleMixin(OfflineEncodingMixin, ModuleMixin):
         return {"pixel_values": pixel_values}
 
     @post_forward("encode", "online_process")
-    def encode_post(self, latents: torch.Tensor) -> dict[str, Any]:
+    def encode_post(self, latents: torch.Tensor | list[torch.Tensor]) -> dict[str, Any]:
         conversation = self._conversation_carrier
         encode_items = self._encode_items
         encode_is_dummy = self._encode_is_dummy
@@ -173,6 +173,8 @@ class BagelVAEModuleMixin(OfflineEncodingMixin, ModuleMixin):
 
         if encode_is_dummy:
             if conversation is not None:
+                if isinstance(latents, list):
+                    latents = latents[0]
                 value = latents.squeeze(0) if latents.dim() == 4 and latents.shape[0] == 1 else latents
                 for sample in conversation:
                     sample.append(
@@ -186,15 +188,21 @@ class BagelVAEModuleMixin(OfflineEncodingMixin, ModuleMixin):
                     )
             return {"conversation_list": conversation}
 
-        for item, latent in zip(encode_items, latents, strict=True):
-            item.type = "image"
-            latent = crop_latent_to_image_shape(
-                latent,
-                item.meta.get(BAGEL_VAE_PIXEL_SHAPE),
-                downsample=int(self.config.downsample),
-            )
-            item.value = latent
-            item.source = BAGEL_VAE_CONTEXT
+        if isinstance(latents, list):
+            for item, latent in zip(encode_items, latents, strict=True):
+                item.type = "image"
+                item.value = latent
+                item.source = BAGEL_VAE_CONTEXT
+        else:
+            for item, latent in zip(encode_items, latents, strict=True):
+                item.type = "image"
+                latent = crop_latent_to_image_shape(
+                    latent,
+                    item.meta.get(BAGEL_VAE_PIXEL_SHAPE),
+                    downsample=int(self.config.downsample),
+                )
+                item.value = latent
+                item.source = BAGEL_VAE_CONTEXT
         return {"conversation_list": conversation}
 
     @post_forward("offline_encode")

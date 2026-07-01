@@ -345,12 +345,12 @@ class OmniTrainer:
     # —— Build: data_transform ───────────────────────────────────────────────────────────
     def _build_data_transform(self):
         mm_configs = getattr(self.base.args.data, "mm_configs", None) or {}
-        self.base.data_transform = build_data_transform("seedomni", **mm_configs)
+        self.base.data_transform = build_data_transform(self.base.args.data.data_type, **mm_configs)
 
     # ── Build: collator ─────────────────────────────────────────────────────────
 
     def _build_collate_fn(self):
-        """list-only ``SeedOmniCollator`` for data_type='seedomni'.
+        """list-only ``SeedOmniCollator`` for SeedOmni data types.
 
         Collects each active module's optional worker-side CPU preprocessor
         (tokenize / image normalize) and hands them to the collator, so that
@@ -381,7 +381,7 @@ class OmniTrainer:
         self.base.collate_fn = SeedOmniCollator(cpu_preprocessors=tuple(cpu_preprocessors))
         logger.info_rank0(
             f"OmniTrainer: SeedOmniCollator with {len(cpu_preprocessors)} worker-side CPU preprocessor(s) "
-            "for data_type='seedomni'."
+            f"for data_type={self.base.args.data.data_type!r}."
         )
 
     def _build_offline_cache_writer(self):

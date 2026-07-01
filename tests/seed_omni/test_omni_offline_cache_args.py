@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from veomni.arguments import OmniTrainingArguments
+from veomni.arguments import DataArguments, OmniTrainingArguments
 
 
 def test_omni_training_args_defaults_to_train_workflow() -> None:
@@ -31,3 +31,9 @@ def test_omni_training_args_rejects_reserved_train_and_cache() -> None:
 def test_omni_training_args_rejects_unknown_train_type() -> None:
     with pytest.raises(ValueError, match="Unknown train.train_type 'other'"):
         OmniTrainingArguments(train_type="other")
+
+
+def test_data_args_accepts_cached_seedomni_without_text_key() -> None:
+    args = DataArguments(data_type="seedomni_cached", train_path="/tmp/cache")
+
+    assert args.text_keys is None
