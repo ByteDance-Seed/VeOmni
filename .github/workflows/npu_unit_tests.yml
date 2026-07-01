@@ -92,6 +92,10 @@ jobs:
       # while pulling large wheels (e.g. torch-npu, virtualenv); bump to
       # 5 min so a slow link doesn't fail the whole sync.
       UV_HTTP_TIMEOUT: "300"
+      # CANN 9.0.0 HCCL: force localhost for single-node 8-card rootInfo exchange.
+      # Default auto-select picks docker bridge IP (172.22.0.x) which causes
+      # hcclCommInitRootInfoConfig error 9 / EI0015 on sub-group creation.
+      HCCL_SOCKET_IFNAME: "lo"
 
     steps:
       - name: Set ASCEND_VISIBLE_DEVICES from runner slice
@@ -126,8 +130,30 @@ jobs:
           echo "ASCEND_RT_VISIBLE_DEVICES=$cards" | tee -a "$GITHUB_ENV"
       - name: Check npu and CANN info
         run: |
+          echo "=== CANN toolkit info ==="
           cat /usr/local/Ascend/ascend-toolkit/latest/"$(uname -i)"-linux/ascend_toolkit_install.info
+          echo "=== npu-smi ==="
           npu-smi info
+          echo "=== driver version ==="
+          cat /usr/local/Ascend/driver/version.info 2>/dev/null || echo "driver version.info not found"
+          echo "=== ascend_install.info (host) ==="
+          cat /etc/ascend_install.info 2>/dev/null || echo "ascend_install.info not found"
+          echo "=== HCCL env ==="
+          env | grep -iE "^HCCL|^ASCEND" || echo "no HCCL/ASCEND env vars"
+          echo "=== /etc/hosts ==="
+          cat /etc/hosts
+          echo "=== net ifaces ==="
+          ip addr 2>/dev/null || ifconfig 2>/dev/null || echo "no ip/ifconfig"
+          echo "=== hccn_tool device IPs ==="
+          for i in $(seq 0 7); do
+            echo "--- device $i ---"
+            hccn_tool -i $i -ip -g 2>/dev/null || echo "hccn_tool failed for device $i"
+          done
+          echo "=== hccn_tool device links ==="
+          for i in $(seq 0 7); do
+            echo "--- device $i ---"
+            hccn_tool -i $i -link -g 2>/dev/null || echo "hccn_tool link check failed for device $i"
+          done
       - name: Check initial pip list from image
         run: |
           pip list
