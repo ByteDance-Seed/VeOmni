@@ -1,8 +1,21 @@
 # Installation with Ascend NPU (ARM)
 
+## Supported Hardware and Operating Systems
+
+This installation guide applies to the following Ascend NPU products on ARM64 architecture:
+
+| Hardware | Operating System | CANN Version | Status |
+|----------|-----------------|--------------|--------|
+| Ascend A2 (910B) | Ubuntu 22.04 | 8.3.RC2 / 9.0.0 | ✅ Supported |
+| Ascend A3 (910B) | Ubuntu 22.04 | 9.0.0 | ✅ Supported |
+| Ascend 950 (A5) | Ubuntu 22.04 | 9.0.0 | ✅ Supported |
+
+> **Note**: A5 refers to the Ascend 950 series products. All existing unit tests and system tests pass on A5.
+> For scenarios pending further validation on A5, please refer to [A5 Features Pending Validation](../../hardware_support/a5_unsupported_features.md).
+
 ## Required Environment
 
-CANN == 8.3.RC1
+CANN == 8.3.RC1 (9.0.0 recommended for A5 and A3)
 
 ## Prepare CANN
 

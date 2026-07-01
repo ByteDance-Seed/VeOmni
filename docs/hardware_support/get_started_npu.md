@@ -14,6 +14,8 @@ This guide provides comprehensive information for using VeOmni framework with As
 
 ## Key Updates
 
+2026/6/6: VeOmni supports Ascend 950 (A5) products. All existing unit tests and system tests pass on A5. See [A5 Features Pending Validation](a5_unsupported_features.md) for scenarios that require additional verification.
+
 2026/5/11: VeOmni provides images of the version of Ascend Cann9.0.0.
 
 2025/12/23: VeOmni supports training on Ascend NPU.
@@ -40,6 +42,20 @@ VeOmni also provides Docker support for Ascend NPUs. For detailed instructions o
 
 - [Ascend A3 Docker Image Build and Usage Guide](./AscendDockerUsage/build_a3_docker.md)
 - [Ascend A2 Docker Image Build and Usage Guide](./AscendDockerUsage/build_a2_docker.md)
+- [Ascend 950 (A5) Docker Image Build and Usage Guide](./AscendDockerUsage/build_a5_docker.md)
+
+### Supported Hardware
+
+VeOmni supports the following Ascend NPU products:
+
+| Product | Chip | Architecture | Max NPUs per node | CANN Version | Status |
+|---------|------|-------------|-------------------|--------------|--------|
+| Ascend A2 (910B) | Ascend 910B | x86_64 / ARM64 | 8 | 8.3rc2 / 9.0.0 | ✅ Supported |
+| Ascend A3 (910B) | Ascend 910B | x86_64 / ARM64 | 16 | 9.0.0 | ✅ Supported |
+| Ascend 950 (A5) | Ascend 950 | x86_64 / ARM64 | 8 | 9.0.0 | ✅ Supported |
+
+> **Note**: A5 refers to the Ascend 950 series products. All existing unit tests and system tests in VeOmni have been verified to pass on A5 hardware.
+> For scenarios pending further validation on A5, please refer to [A5 Features Pending Validation](a5_unsupported_features.md).
 
 ## Version Compatibility
 
@@ -50,26 +66,32 @@ The following table shows the supported software versions for VeOmni when runnin
 | 0.1.0 | 2.7.1                | 2.7.1             | 8.3rc2/9.0.0      | 3.11           |
 | main  | In-development    | In-development | In-development | In-development |
 
-## Supported Models
+## Supported Models on Ascend NPU
 
 VeOmni supports a wide range of models on Ascend NPUs, including large language models, multimodal models, and diffusion models. Below is a comprehensive list of supported models with their features:
 
 | Model                | Model Size       | Support | FSDP1 | FSDP2 | EP | SP | Note                                           |
 |----------------------|------------------|---------|-------|-------|----|----|------------------------------------------------|
-| [Qwen3](../examples/qwen3.md) | 8B              | ✅       |       | ✅     |    | ✅   |
-|                      | 30B               | ✅       |       | ✅     | ✅    | ✅   |
-| [Qwen3.5](../examples/qwen3.md) | 9B    |          |         | ✅    |      |✅    | supporting   |
-|                      | 35B-A3B              |         |       | ✅     |✅    |✅    |  supporting                                   |
-| [Qwen3-VL](../examples/qwen3_vl.md) | 8B               | ✅       |       | ✅     |    | ✅  |                               |
-|                      | 30B              | ✅       |       | ✅     | ✅  | ✅  |                                                |
-| [Wan2.1](../examples/wan2.1.md)    | 1.3B              | ✅       | ✅     |       |    | ✅  | prototype                              |
-| [Qwen3Omni](../examples/qwen3_omni_moe.md)    | 30B              | ✅       |   | ✅        |    | ✅  | prototype                              |
+| [Qwen3](../examples/qwen3.md) | 8B              | ✅       |       | ✅     |    | ✅   | A2/A3/A5 |
+|                      | 30B               | ✅       |       | ✅     | ✅    | ✅   | A2/A3; EP pending validation on A5 |
+| [Qwen3.5](../examples/qwen3.md) | 9B    |          |         | ✅    |      |✅    | supporting; A2/A3/A5 |
+|                      | 35B-A3B              |         |       | ✅     |✅    |✅    | supporting; A2/A3; pending validation on A5 |
+| [Qwen3-VL](../examples/qwen3_vl.md) | 8B               | ✅       |       | ✅     |    | ✅  | A2/A3/A5 |
+|                      | 30B              | ✅       |       | ✅     | ✅  | ✅  | A2/A3; pending validation on A5 |
+| [Wan2.1](../examples/wan2.1.md)    | 1.3B              | ✅       | ✅     |       |    | ✅  | prototype; A2; pending validation on A5 |
+| [Qwen3Omni](../examples/qwen3_omni_moe.md)    | 30B              | ✅       |   | ✅        |    | ✅  | prototype; A2/A3; pending validation on A5 |
 
 **Legend:**
 - **FSDP1**: Fully Sharded Data Parallel version 1
 - **FSDP2**: Fully Sharded Data Parallel version 2 (recommended)
 - **EP**: Expert Parallel - for MoE models
 - **SP**: Sequence Parallel - enables longer sequence training
+
+**Hardware annotations:**
+- **A2**: Ascend A2 (910B) server product
+- **A3**: Ascend A3 (910B) server product
+- **A5**: Ascend 950 server product
+- If a model row does not explicitly list A5, it means that configuration has not yet been validated on A5. See [A5 Features Pending Validation](a5_unsupported_features.md) for details.
 
 For detailed configuration files and training examples, please refer to the [configs](https://github.com/ByteDance-Seed/VeOmni/tree/main/configs) directory in the repository.
 
