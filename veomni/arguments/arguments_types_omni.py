@@ -58,6 +58,8 @@ from .arguments_types import (
 
 logger = logging.get_logger(__name__)
 
+OMNI_TRAIN_WORKFLOWS = {"train", "offline_cache", "train_with_cache", "train_and_cache"}
+
 
 @dataclass
 class OmniTrainingArguments(TrainingArguments):
@@ -72,7 +74,30 @@ class OmniTrainingArguments(TrainingArguments):
     they need the real (top-level) accelerator rather than this field's default.
     """
 
+    train_type: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": (
+                "SeedOmni V2 training workflow. One of: train, offline_cache, "
+                "train_with_cache, train_and_cache. Missing values are normalized to train."
+            )
+        },
+    )
+    offline_cache_dir: Optional[str] = field(
+        default=None,
+        metadata={"help": "Output directory for train_type='offline_cache' cached SeedOmni parquet shards."},
+    )
+
     def __post_init__(self):
+        self.train_type = self.train_type or "train"
+        if self.train_type not in OMNI_TRAIN_WORKFLOWS:
+            known = ", ".join(sorted(OMNI_TRAIN_WORKFLOWS))
+            raise ValueError(f"Unknown train.train_type {self.train_type!r}; expected one of: {known}.")
+        if self.train_type == "train_and_cache":
+            raise NotImplementedError("`train.train_type: train_and_cache` is reserved and is not implemented yet.")
+        if self.train_type == "offline_cache" and not self.offline_cache_dir:
+            raise ValueError("`train.offline_cache_dir` is required when `train.train_type` is 'offline_cache'.")
+
         self._train_steps = -1
         self.local_rank = int(os.getenv("LOCAL_RANK", 0))
         self.global_rank = int(os.getenv("RANK", 0))

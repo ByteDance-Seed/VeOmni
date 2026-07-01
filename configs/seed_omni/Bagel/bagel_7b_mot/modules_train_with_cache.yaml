@@ -1,6 +1,8 @@
 bagel_vae:
   model:
     model_path: bagel_vae
+    model_config:
+      cache_mode: process_only
 
 bagel_siglip_navit:
   model:

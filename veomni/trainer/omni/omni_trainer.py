@@ -65,6 +65,7 @@ from ...distributed.parallel_state import use_parallel_state
 from ...models.seed_omni.graphs import GraphProfiler
 from ...models.seed_omni.mixins.metric_meter_mixin import MetricMeterResult
 from ...models.seed_omni.modeling_omni import OmniModel, _unwrap_module
+from ...models.seed_omni.utils.offline_cache import SeedOmniOfflineCacheWriter
 from ...ops.batch_invariant_ops import set_batch_invariant_mode
 from ...utils import helper, logging
 from ...utils.device import synchronize
@@ -287,6 +288,7 @@ class OmniTrainer:
         self.base._build_dataset()
         self._build_collate_fn()
         self.base._build_dataloader()
+        self._build_offline_cache_writer()
         self._build_optimizer()
         self._build_lr_scheduler()
         self.base._build_training_context()
@@ -381,6 +383,12 @@ class OmniTrainer:
             f"OmniTrainer: SeedOmniCollator with {len(cpu_preprocessors)} worker-side CPU preprocessor(s) "
             "for data_type='seedomni'."
         )
+
+    def _build_offline_cache_writer(self):
+        args: OmniArguments = self.base.args
+        self.offline_cache_writer = None
+        if args.train.train_type == "offline_cache":
+            self.offline_cache_writer = SeedOmniOfflineCacheWriter(args.train.offline_cache_dir)
 
     # ── Build: per-module optimizers + schedulers (drive the module-trainers) ──
 
@@ -579,6 +587,37 @@ class OmniTrainer:
 
         self.on_step_end(loss=total_loss, loss_dict=dict(total_loss_dict), grad_norm=grad_norm)
 
+    def offline_cache_step(self, data_iterator: Any) -> None:
+        base = self.base
+        if self.offline_cache_writer is None:
+            raise RuntimeError("offline_cache_step requires an initialized SeedOmniOfflineCacheWriter.")
+
+        base.state.global_step += 1
+
+        micro_batches: List[Dict[str, Any]] = next(data_iterator)
+        self.on_step_begin(micro_batches=micro_batches)
+        synchronize()
+
+        num_micro_steps = len(micro_batches)
+        for micro_step, micro_batch in enumerate(micro_batches):
+            self.model_reshard(micro_step, num_micro_steps)
+            micro_batch = base.preforward(micro_batch)
+            profiler = self._build_graph_profiler()
+            with (
+                torch.no_grad(),
+                base.model_fwd_context,
+                set_batch_invariant_mode(base.args.train.enable_batch_invariant_mode),
+            ):
+                base.model(profiler=profiler, **micro_batch)
+            self._save_graph_profile(profiler, micro_step=micro_step)
+
+            conversation_list = micro_batch.get("conversation_list")
+            if conversation_list is None:
+                raise RuntimeError("offline_cache graph did not leave `conversation_list` in the micro-batch.")
+            self.offline_cache_writer.save_conversation_list(conversation_list)
+
+        self.on_step_end(loss=0.0, loss_dict={}, grad_norm=0.0)
+
     # ── Callback delegators (trace via base; cascade ckpt into module-trainers) ─
     #
     # ``base.on_*`` fires the orchestrator's trace callbacks (its checkpoint
@@ -648,7 +687,10 @@ class OmniTrainer:
 
             for _ in range(base.start_step, args.train_steps):
                 try:
-                    self.train_step(data_iterator)
+                    if args.train.train_type == "offline_cache":
+                        self.offline_cache_step(data_iterator)
+                    else:
+                        self.train_step(data_iterator)
                 except StopIteration:
                     logger.info(f"epoch:{epoch} Dataloader finished with drop_last {args.data.dataloader.drop_last}")
                     break
@@ -659,6 +701,8 @@ class OmniTrainer:
             helper.print_device_mem_info(f"VRAM usage after epoch {epoch + 1}")
 
         self.on_train_end()
+        if self.offline_cache_writer is not None:
+            self.offline_cache_writer.finalize()
 
         synchronize()
 

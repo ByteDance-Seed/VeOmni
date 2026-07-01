@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 from typing import Any
 
 import numpy as np
@@ -11,6 +12,9 @@ from PIL import Image
 from torchvision.transforms import InterpolationMode
 from torchvision.transforms import functional as TVF
 from transformers.image_processing_utils import BaseImageProcessor, BatchFeature
+
+from ....utils.conversation import ConversationItem, is_dummy
+from ..sources import BAGEL_SIGLIP_CONTEXT, BAGEL_VAE_CONTEXT
 
 
 class BagelVAEProcessor(BaseImageProcessor):
@@ -325,7 +329,64 @@ def _decoded_tensor_to_pil(image: torch.Tensor) -> Image.Image:
     return Image.fromarray(image)
 
 
+def copy_image_item(item: ConversationItem) -> ConversationItem:
+    value = item.value
+    if torch.is_tensor(value):
+        value = value.clone()
+    elif isinstance(value, Image.Image):
+        value = value.copy()
+    else:
+        value = copy.deepcopy(value)
+    return ConversationItem(
+        type=item.type,
+        value=value,
+        role=item.role,
+        source=item.source,
+        meta=copy.deepcopy(item.meta),
+    )
+
+
+def route_image_sources(
+    conversation_list: list[list[ConversationItem]],
+    *,
+    inference: bool,
+    infer_type: object,
+) -> None:
+    for sample in conversation_list:
+        routed: list[ConversationItem] = []
+        for item in sample:
+            if item.type != "image" or is_dummy(item):
+                routed.append(item)
+                continue
+
+            if item.source in {BAGEL_SIGLIP_CONTEXT, BAGEL_VAE_CONTEXT}:
+                routed.append(item)
+                continue
+
+            if item.role == "assistant":
+                item.source = BAGEL_VAE_CONTEXT
+                routed.append(item)
+                continue
+
+            if item.role == "user" and inference and infer_type == "infer_edit":
+                vae_item = copy_image_item(item)
+                vae_item.source = BAGEL_VAE_CONTEXT
+                item.source = BAGEL_SIGLIP_CONTEXT
+                routed.extend([vae_item, item])
+                continue
+
+            # Training edit detection is intentionally not implemented yet.
+            # Raw user images outside infer_edit are the SigLIP branch.
+            if item.role == "user":
+                item.source = BAGEL_SIGLIP_CONTEXT
+            routed.append(item)
+
+        sample[:] = routed
+
+
 __all__ = [
     "BagelVAEProcessor",
+    "copy_image_item",
     "crop_latent_to_image_shape",
+    "route_image_sources",
 ]

@@ -2,10 +2,7 @@
 
 from __future__ import annotations
 
-import copy
-
 import torch
-from PIL import Image
 
 from ....utils.conversation import ConversationItem
 from ..sources import BAGEL_SIGLIP_CONTEXT, BAGEL_VAE_CONTEXT
@@ -39,23 +36,6 @@ def _text_item_length(item: ConversationItem) -> int | None:
     return None
 
 
-def copy_image_item(item: ConversationItem) -> ConversationItem:
-    value = item.value
-    if torch.is_tensor(value):
-        value = value.clone()
-    elif isinstance(value, Image.Image):
-        value = value.copy()
-    else:
-        value = copy.deepcopy(value)
-    return ConversationItem(
-        type=item.type,
-        value=value,
-        role=item.role,
-        source=item.source,
-        meta=copy.deepcopy(item.meta),
-    )
-
-
 def apply_image_marker(
     item: ConversationItem,
     marker_embeds: torch.Tensor,
@@ -83,6 +63,5 @@ def apply_image_marker(
 
 __all__ = [
     "apply_image_marker",
-    "copy_image_item",
     "is_bagel_vision_marker",
 ]

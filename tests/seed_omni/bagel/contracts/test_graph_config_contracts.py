@@ -46,6 +46,53 @@ def test_bagel_train_graph_fan_in_execution_order():
     }
 
 
+def test_bagel_offline_cache_yaml_loads_encode_only_vae():
+    cfg = load_omni_config(
+        modules_path=bagel_cfg_dir() / "modules_train_offline_cache.yaml",
+        train_graph_path=bagel_cfg_dir() / "graph_train_offline_cache.yaml",
+    )
+
+    assert set(cfg.modules) == {"bagel_vae"}
+    assert cfg.module_config("bagel_vae").model.model_config == {"cache_mode": "encode_only"}
+    assert cfg.training_graph == [{"from": "bagel_vae.offline_encode", "to": "end"}]
+
+
+def test_bagel_train_with_cache_yaml_loads_process_only_vae():
+    cfg = load_omni_config(
+        modules_path=bagel_cfg_dir() / "modules_train_with_cache.yaml",
+        train_graph_path=bagel_cfg_dir() / "graph_train_with_cache.yaml",
+    )
+
+    assert set(cfg.modules) == {
+        "bagel_text_encoder",
+        "bagel_siglip_navit",
+        "bagel_qwen2_mot",
+        "bagel_flow_connector",
+        "bagel_vae",
+    }
+    assert cfg.module_config("bagel_vae").model.model_config == {"cache_mode": "process_only"}
+    endpoints = {e["from"] for e in cfg.training_graph} | {e["to"] for e in cfg.training_graph}
+    assert "bagel_vae.online_process" in endpoints
+    assert "bagel_vae.encode" not in endpoints
+
+
+def test_bagel_offline_cache_full_entry_yamls_point_to_cache_graphs():
+    offline_cache = yaml.safe_load((bagel_cfg_dir() / "offline_cache.yaml").read_text())
+    train_with_cache = yaml.safe_load((bagel_cfg_dir() / "train_with_cache.yaml").read_text())
+
+    assert offline_cache["train"]["train_type"] == "offline_cache"
+    assert offline_cache["train"]["offline_cache_dir"] == "outputs/bagel_vae_cached_dataset"
+    assert offline_cache["data"]["data_type"] == "seedomni"
+    assert offline_cache["model"]["modules"].endswith("modules_train_offline_cache.yaml")
+    assert offline_cache["model"]["train_graph"].endswith("graph_train_offline_cache.yaml")
+
+    assert train_with_cache["train"]["train_type"] == "train_with_cache"
+    assert train_with_cache["data"]["data_type"] == "seedomni_cached"
+    assert train_with_cache["data"]["train_path"] == offline_cache["train"]["offline_cache_dir"]
+    assert train_with_cache["model"]["modules"].endswith("modules_train_with_cache.yaml")
+    assert train_with_cache["model"]["train_graph"].endswith("graph_train_with_cache.yaml")
+
+
 @pytest.mark.parametrize(
     "infer_graph",
     ["graph_infer_und.yaml", "graph_infer_gen.yaml", "graph_infer_edit.yaml"],

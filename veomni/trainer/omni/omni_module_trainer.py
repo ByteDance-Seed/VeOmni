@@ -36,12 +36,15 @@ import os
 from contextlib import nullcontext
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
+import torch.distributed as dist
+
 from ...distributed.parallel_state import (
     init_parallel_state,
     use_parallel_state,
 )
 from ...models import build_tokenizer
 from ...models.seed_omni.mixins.metric_meter_mixin import MetricMeterMixin, MetricMeterResult
+from ...models.seed_omni.mixins.offline_encoding import OfflineEncodingMixin
 from ...models.seed_omni.modeling_omni import _unwrap_module
 from ...utils import logging
 from ..base import BaseTrainer
@@ -119,13 +122,74 @@ class _OmniModulePayloadMixin:
         if lr_sd is not None:
             self.trainer.lr_scheduler.load_state_dict(lr_sd)
 
+    def _offline_cache_model(self) -> Optional[OfflineEncodingMixin]:
+        model = _unwrap_module(self.trainer.model)
+        if not isinstance(model, OfflineEncodingMixin) or model.validated_cache_mode() == "full":
+            return None
+        return model
+
+    def _load_partial_dcp_checkpoint(self, model: OfflineEncodingMixin) -> None:
+        load_dir = self._load_dir()
+        if load_dir is None:
+            return
+        self.trainer.checkpointer.wait_for_pending_save()
+        model.load_partial_dcp_checkpoint(load_dir, trainer=self.trainer)
+        if dist.is_initialized():
+            dist.barrier()
+        logger.info_rank0(f"Load partial offline-cache checkpoint from {load_dir} successfully!")
+
+    def _save_partial_dcp_checkpoint(self, model: OfflineEncodingMixin, state: "TrainerState") -> None:
+        model.save_partial_dcp_checkpoint(self._save_dir(state), trainer=self.trainer, state=state)
+        self._last_saved_step = state.global_step
+
+    def _save_full_hf_checkpoint(self, model: OfflineEncodingMixin, state: "TrainerState") -> None:
+        hf_weights_path = os.path.join(self._save_dir(state), "hf_ckpt")
+        if self.trainer.args.train.global_rank == 0:
+            model.save_full_hf_checkpoint(
+                hf_weights_path,
+                source_path=self.trainer.args.model.model_path,
+                trainer=self.trainer,
+                state=state,
+            )
+        if dist.is_initialized():
+            dist.barrier()
+
+        self._last_saved_step = state.global_step
+
 
 class OmniModuleDcpCallback(_OmniModulePayloadMixin, CheckpointerCallback):
-    """Per-module DCP resume checkpoint (model + optimizer + lr_scheduler)."""
+    """Per-module DCP resume checkpoint (model + optimizer + lr_scheduler).
+
+    Non-``full`` offline-cache modules own their partial runtime DCP behavior:
+    modules without online state can no-op, while modules with online state can
+    save/load only the runtime subset they need.
+    """
+
+    def _load_checkpoint(self):
+        model = self._offline_cache_model()
+        if model is None:
+            return super()._load_checkpoint()
+        self._load_partial_dcp_checkpoint(model)
+
+    def _save_checkpoint(self, state: "TrainerState"):
+        model = self._offline_cache_model()
+        if model is None:
+            return super()._save_checkpoint(state)
+        self._save_partial_dcp_checkpoint(model, state)
 
 
 class OmniModuleHfCallback(_OmniModulePayloadMixin, HuggingfaceCkptCallback):
-    """Per-module HuggingFace safetensors export."""
+    """Per-module HuggingFace safetensors export.
+
+    Non-``full`` offline-cache modules own how to materialize a complete HF
+    artifact from source weights plus any partial runtime state.
+    """
+
+    def _save_checkpoint(self, state: "TrainerState", stage: str = "step_end"):
+        model = self._offline_cache_model()
+        if model is None:
+            return super()._save_checkpoint(state, stage=stage)
+        self._save_full_hf_checkpoint(model, state)
 
 
 class OmniModuleLoraCallback(_OmniModulePayloadMixin, HFLoraCkptCallback):
