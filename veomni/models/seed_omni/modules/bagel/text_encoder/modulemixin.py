@@ -98,9 +98,6 @@ class BagelTextEncoderModuleMixin(TextEncoderModuleMixin):
             sampling = self._extract_sampling_kwargs(generation_kwargs, 1.0, 1.0, kwargs)
 
             output_token_id = self._sample_token(hidden_states, **sampling)
-            if output_token_id == self._chat_template.eos_token_id:
-                outputs[FSM_SIGNAL_KEY] = SIGNAL_TEXT_DONE
-                return outputs
             self._text_token_cache.append(output_token_id)
 
             input_ids = self._token_id_tensor(output_token_id)
@@ -108,6 +105,9 @@ class BagelTextEncoderModuleMixin(TextEncoderModuleMixin):
             tail.value = inputs_embeds.to(device=self.device, dtype=self.dtype)
             tail.meta["input_ids"] = input_ids.reshape(-1).detach()
             maybe_merge_outputs(batched[0])
+            if output_token_id == self._chat_template.eos_token_id:
+                outputs[FSM_SIGNAL_KEY] = SIGNAL_TEXT_DONE
+                outputs["generated"] = self._flush_text_generated(batched[0])
             return outputs
 
         outputs: Dict[str, Any] = {"conversation_list": batched[0]}
