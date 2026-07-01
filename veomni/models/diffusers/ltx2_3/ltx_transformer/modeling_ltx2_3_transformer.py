@@ -315,7 +315,6 @@ class LTXVideoTransformerModel(PreTrainedModel, _LTXModelInitShim):
         audio_hidden_states: list[torch.Tensor] | None = None,
         audio_timestep: list[torch.Tensor] | None = None,
         audio_encoder_hidden_states: list[torch.Tensor] | None = None,
-        audio_loss_mask: list[torch.Tensor] | None = None,
         fps: list[float] | None = None,
         training_target: list[torch.Tensor] | None = None,
         audio_training_target: list[torch.Tensor] | None = None,
@@ -361,7 +360,7 @@ class LTXVideoTransformerModel(PreTrainedModel, _LTXModelInitShim):
 
             sample_ctx_mask = context_mask[sample_idx] if context_mask is not None else None
             if sample_ctx_mask is not None:
-                sample_ctx_mask = sample_ctx_mask.to(device=model_device, dtype=compute_dtype)
+                sample_ctx_mask = sample_ctx_mask.to(device=model_device)
 
             video_modality = Modality(
                 latent=latent_tokens,
@@ -418,13 +417,12 @@ class LTXVideoTransformerModel(PreTrainedModel, _LTXModelInitShim):
 
         loss = None
         if training_target is not None:
-            loss_val, loss_dict = compute_ltx2_loss(
+            loss_dict = compute_ltx2_loss(
                 predictions,
                 training_target,
                 video_loss_mask,
                 audio_predictions=audio_predictions if audio_predictions else None,
                 audio_training_targets=audio_training_target,
-                audio_loss_masks=audio_loss_mask,
             )
             loss = loss_dict
 
@@ -466,8 +464,7 @@ def compute_ltx2_loss(
     video_loss_masks: list[torch.Tensor] | None,
     audio_predictions: list[torch.Tensor] | None = None,
     audio_training_targets: list[torch.Tensor] | None = None,
-    audio_loss_masks: list[torch.Tensor] | None = None,
-) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+) -> dict[str, torch.Tensor]:
     per_sample_losses = []
 
     for i, (prediction, target) in enumerate(zip(predictions, training_targets)):
@@ -483,9 +480,11 @@ def compute_ltx2_loss(
 
         if sample_vlm is not None:
             sample_vlm = sample_vlm.to(device=prediction.device, dtype=torch.bool)
-            loss_mask = sample_vlm.view(1, 1, F, H, W).float()
+            mask_batch = sample_vlm.numel() // (F * H * W)
+            assert mask_batch == B, f"Loss mask batch size {mask_batch} != prediction batch size {B}"
+            loss_mask = sample_vlm.view(B, 1, F, H, W).float()
             masked_loss = per_element_loss * loss_mask
-            valid_count = loss_mask.reshape(1, 1, -1).sum(dim=-1).clamp(min=1e-8)
+            valid_count = loss_mask.reshape(B, 1, -1).sum(dim=-1).clamp(min=1e-8)
             per_sample_loss = masked_loss.reshape(B, C, -1).sum(dim=-1).mean(dim=-1) / valid_count
         else:
             per_sample_loss = per_element_loss.reshape(B, -1).mean(dim=1)
@@ -499,9 +498,7 @@ def compute_ltx2_loss(
         per_sample_losses.append(per_sample_loss)
 
     loss = torch.stack(per_sample_losses).mean()
-    loss_dict = {"mse_loss": loss}
-    total_loss = torch.stack(list(loss_dict.values())).sum()
-    return total_loss, loss_dict
+    return {"mse_loss": loss}
 
 
 def apply_veomni_ltx_transformer_patch() -> None:
