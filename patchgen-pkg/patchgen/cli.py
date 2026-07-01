@@ -29,7 +29,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
-from typing import Optional
+
 
 try:
     import tomllib  # py>=3.11
@@ -42,7 +42,7 @@ from . import DiscoveryConfig, build_check_cli, build_run_codegen_cli
 _PROG = "patchgen"
 
 
-def _find_pyproject_with_section(start: Path) -> Optional[tuple[Path, dict]]:
+def _find_pyproject_with_section(start: Path) -> tuple[Path, dict] | None:
     """Walk up from ``start`` looking for a ``pyproject.toml`` containing a
     ``[tool.patchgen]`` table. Returns ``(pyproject_path, section_dict)`` or
     ``None``.
@@ -96,7 +96,7 @@ def _load_discovery() -> DiscoveryConfig:
     return _discovery_from_section(section, pyproject_path.parent)
 
 
-def main(argv: Optional[list[str]] = None) -> int:
+def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else list(argv)
     discovery = _load_discovery()
     if "--check" in argv:

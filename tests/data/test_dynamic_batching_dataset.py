@@ -423,12 +423,11 @@ def test_text_batching_strategy_effective_mode_honors_physical_cap():
 def test_dynamic_batching_size_dataset_effective_mode_can_overflow_total_budget_with_larger_physical_cap():
     class PromptHeavyDataset(IterableDataset):
         def __iter__(self):
-            for sample in [
+            yield from [
                 _make_sample(token_id=1, total_tokens=3, effective_tokens=2),
                 _make_sample(token_id=2, total_tokens=3, effective_tokens=2),
                 _make_sample(token_id=3, total_tokens=3, effective_tokens=2),
-            ]:
-                yield sample
+            ]
 
     dynamic_ds = DynamicBatchingSizeDataset(
         dataset=PromptHeavyDataset(),
@@ -450,12 +449,11 @@ def test_dynamic_batching_size_dataset_effective_mode_can_overflow_total_budget_
 def test_dynamic_batching_size_dataset_effective_mode_honors_physical_cap():
     class PromptHeavyDataset(IterableDataset):
         def __iter__(self):
-            for sample in [
+            yield from [
                 _make_sample(token_id=1, total_tokens=6, effective_tokens=2),
                 _make_sample(token_id=2, total_tokens=6, effective_tokens=2),
                 _make_sample(token_id=3, total_tokens=2, effective_tokens=2),
-            ]:
-                yield sample
+            ]
 
     dynamic_ds = DynamicBatchingSizeDataset(
         dataset=PromptHeavyDataset(),
