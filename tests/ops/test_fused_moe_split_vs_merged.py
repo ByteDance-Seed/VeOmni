@@ -266,12 +266,12 @@ def test_fused_moe_swiglu_limit_split_vs_merged_and_eager(swiglu_limit: float, m
 
 
 def test_fused_moe_duplicate_topk_expert_backward_uses_scattered_token_count(monkeypatch: pytest.MonkeyPatch):
-    """Regression test for top-k routes that duplicate the same expert.
+    """Regression test for duplicate top-k routes to the same expert.
 
-    DeepSeek-V4 hash-MoE can route both top-k slots of a token to the same
-    expert. The grouped-GEMM backward must launch over ``tokens * topk``
-    scattered rows, not the original token count, otherwise the tail rows are
-    left uncomputed and may produce non-finite gradients.
+    ``group_gemm_same_nk`` uses ``max_M`` as a per-expert launch bound. When
+    duplicate routes make one expert receive more than the original token
+    count, the non-EP backward must use a scattered-row bound; otherwise tail
+    rows may be left uncomputed and produce non-finite gradients.
     """
     _skip_if_unsupported()
 

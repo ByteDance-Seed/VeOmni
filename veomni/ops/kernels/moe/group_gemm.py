@@ -181,6 +181,9 @@ class TritonFusedMoeExpertFunction(torch.autograd.Function):
 
         # MOE Step 10
         grad_fc2_output = moe_scatter(grad_output, scatter_index)
+        # ``max_M`` for grouped GEMM is a per-expert launch bound. Duplicate
+        # top-k routes can make one expert receive more rows than the original
+        # token count, so the total scattered row count is a safe bound.
         num_scattered_tokens = grad_fc2_output.shape[0]
 
         # MOE Step 9
@@ -422,6 +425,9 @@ class MergedFc1TritonFusedMoeExpertFunction(torch.autograd.Function):
 
         # MOE Step 10
         grad_fc2_output = moe_scatter(grad_output, scatter_index)
+        # ``max_M`` for grouped GEMM is a per-expert launch bound. Duplicate
+        # top-k routes can make one expert receive more rows than the original
+        # token count, so the total scattered row count is a safe bound.
         num_scattered_tokens = grad_fc2_output.shape[0]
 
         # MOE Step 9 - dgrad
