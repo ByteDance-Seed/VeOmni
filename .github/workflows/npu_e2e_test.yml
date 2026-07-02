@@ -91,7 +91,7 @@ jobs:
       UV_HTTP_TIMEOUT: "300"
       # CANN 9.0.0: override random port selection (new in 9.0.0) with fixed range
       # to avoid port overflow (EI0019) and Docker bridge unreachable (EI0015) errors.
-      HCCL_HOST_SOCKET_PORT_RANGE: "50000-55000"
+      HCCL_HOST_SOCKET_PORT_RANGE: "30000-35000"
 
     steps:
       - name: Set ASCEND_VISIBLE_DEVICES from runner slice
