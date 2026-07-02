@@ -4,18 +4,33 @@ import random
 import subprocess
 import sys
 from functools import partial
+from types import SimpleNamespace
 from typing import Any, Dict, List
+from unittest.mock import patch
 
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import pytest
+import torch
 import yaml
 from tools import resolve_ops_overrides
+from torch.utils.data import DistributedSampler
+from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import PretrainedConfig
-from utils import DummyDataset, FakeModel, compare_global_batch, compare_items, compare_metrics, process_dummy_example
+from utils import (
+    DummyDataset,
+    FakeModel,
+    ShardedMappingDataset,
+    compare_global_batch,
+    compare_items,
+    compare_metrics,
+    process_dummy_example,
+)
 
 from veomni.arguments import parse_args
+from veomni.data.data_collator import MainCollator
+from veomni.data.dataset import DynamicBatchingSizeDataset, _MapStyleSamplerWrapper
 from veomni.distributed.parallel_state import get_parallel_state
 from veomni.trainer.base import BaseTrainer, VeOmniArguments
 from veomni.trainer.callbacks import (
@@ -320,3 +335,145 @@ def test_native_dataset(dataset_type: str, dyn_bsz: bool, dummy_native_dataset_c
     command = build_command(dataset_type, dyn_bsz, data_path=data_path)
     result = subprocess.run(command, check=True)
     assert result.returncode == 0
+
+
+# ---------------------------------------------------------------------------
+# _MapStyleSamplerWrapper unit tests (CPU-only, no torch.distributed init:
+# DistributedSampler is constructed with explicit num_replicas / rank).
+# ---------------------------------------------------------------------------
+
+_WRAPPER_DATASET_SIZE = 50
+_WRAPPER_MICRO_BATCH_SEQ_LENGTH = 64
+_WRAPPER_READY_THRESHOLD = 4
+
+
+def _wrapper_get_length(item):
+    return int(item["attention_mask"].sum())
+
+
+def _wrapper_take_first(micro_batches):
+    # batch_size=1 -> one micro batch per item; module-level so it stays picklable for num_workers > 0.
+    return micro_batches[0]
+
+
+def _wrapper_worker_info(worker_id, num_workers):
+    return None if num_workers == 1 else SimpleNamespace(id=worker_id, num_workers=num_workers)
+
+
+@pytest.mark.parametrize("shuffle", [False, True])
+@pytest.mark.parametrize("drop_last", [False, True])
+@pytest.mark.parametrize("num_replicas", [1, 2, 4])
+@pytest.mark.parametrize("epoch", [0, 3])
+def test_map_style_sampler_wrapper_rank_parity(shuffle, drop_last, num_replicas, epoch):
+    """Per-rank index assignment must be bit-identical to ``DistributedSampler``."""
+    dataset = ShardedMappingDataset(size=_WRAPPER_DATASET_SIZE)
+    seed = 7
+    for rank in range(num_replicas):
+        wrapper = _MapStyleSamplerWrapper(
+            dataset, num_replicas=num_replicas, rank=rank, shuffle=shuffle, seed=seed, drop_last=drop_last
+        )
+        wrapper.set_epoch(epoch)
+        sampler = DistributedSampler(
+            dataset, num_replicas=num_replicas, rank=rank, shuffle=shuffle, seed=seed, drop_last=drop_last
+        )
+        sampler.set_epoch(epoch)
+        assert wrapper._rank_indices() == list(sampler)
+        assert len(wrapper) == sampler.num_samples
+
+
+@pytest.mark.parametrize("num_workers", [1, 8])
+def test_map_style_sampler_wrapper_worker_split(num_workers):
+    """Workers of one rank read disjoint, balanced, strided shares of the rank's indices."""
+    dataset = ShardedMappingDataset(size=_WRAPPER_DATASET_SIZE)
+    wrapper = _MapStyleSamplerWrapper(dataset, num_replicas=2, rank=1, shuffle=True, seed=0)
+    rank_indices = wrapper._rank_indices()
+
+    seen_per_worker = []
+    for worker_id in range(num_workers):
+        worker_wrapper = copy.deepcopy(wrapper)  # real workers iterate their own copy
+        worker_wrapper.output_index_for_resume = True
+        # The wrapper binds get_worker_info via a direct import, so patch it in its own module.
+        with patch("veomni.data.dataset.get_worker_info", return_value=_wrapper_worker_info(worker_id, num_workers)):
+            seen_per_worker.append([idx for _, idx in worker_wrapper])
+
+    counts = [len(seen) for seen in seen_per_worker]
+    assert max(counts) - min(counts) <= 1
+    assert sorted(idx for seen in seen_per_worker for idx in seen) == sorted(rank_indices)
+    for worker_id, seen in enumerate(seen_per_worker):
+        assert seen == rank_indices[worker_id::num_workers]
+
+
+def _build_wrapper_pipeline(num_workers, save_by_idx):
+    """mapping dataset -> _MapStyleSamplerWrapper -> DynamicBatchingSizeDataset -> StatefulDataLoader."""
+    dataset = ShardedMappingDataset(size=_WRAPPER_DATASET_SIZE)
+    wrapper = _MapStyleSamplerWrapper(dataset, num_replicas=2, rank=0, shuffle=True, seed=11)
+    dynamic_ds = DynamicBatchingSizeDataset(
+        dataset=wrapper,
+        micro_batch_seq_length=_WRAPPER_MICRO_BATCH_SEQ_LENGTH,
+        ready_for_micro_batch_threshold=_WRAPPER_READY_THRESHOLD,
+        dynamic_batching_collate_fn=MainCollator(),
+        get_length_fn=_wrapper_get_length,
+        save_by_idx=save_by_idx,
+    )
+    return StatefulDataLoader(dynamic_ds, batch_size=1, num_workers=num_workers, collate_fn=_wrapper_take_first)
+
+
+@pytest.mark.parametrize("num_workers", [0, 2])
+@pytest.mark.parametrize("save_by_idx", [False, True])
+def test_map_style_sampler_wrapper_resume(num_workers, save_by_idx):
+    """An interrupted+resumed run reproduces the uninterrupted batch stream exactly.
+
+    Exercises both the wrapper's own state_dict/load_state_dict (skip the consumed prefix
+    of the deterministic permutation) and its composition with StatefulDataLoader's
+    per-worker snapshots and DynamicBatchingSizeDataset's upstream-state nesting.
+    """
+    golden = list(_build_wrapper_pipeline(num_workers, save_by_idx))
+    assert len(golden) > 4, "test setup must produce enough micro batches"
+
+    dataloader = _build_wrapper_pipeline(num_workers, save_by_idx)
+    it = iter(dataloader)
+    head = [next(it) for _ in range(3)]
+    state = dataloader.state_dict()
+    del it, dataloader
+
+    resumed = _build_wrapper_pipeline(num_workers, save_by_idx)
+    resumed.load_state_dict(state)
+    batches = head + list(resumed)
+
+    assert len(batches) == len(golden)
+    for got, want in zip(batches, golden):
+        assert got.keys() == want.keys()
+        for key in got:
+            if torch.is_tensor(got[key]):
+                assert torch.equal(got[key], want[key]), f"mismatch in {key}"
+
+
+def test_map_style_sampler_wrapper_state_dict_after_resume_before_iter():
+    """state_dict() right after load_state_dict() but before __iter__ must report the
+    restored progress, not 0.
+    """
+    dataset = ShardedMappingDataset(size=_WRAPPER_DATASET_SIZE)
+    kwargs = dict(num_replicas=2, rank=0, shuffle=True, seed=5)
+
+    src = _MapStyleSamplerWrapper(dataset, **kwargs)
+    src.set_epoch(2)
+    it = iter(src)
+    consumed = 3
+    for _ in range(consumed):
+        next(it)
+    state = src.state_dict()
+    assert state == {"epoch": 2, "yielded": consumed}
+
+    # Resume, then query state BEFORE iterating: must still reflect the restored progress.
+    resumed = _MapStyleSamplerWrapper(dataset, **kwargs)
+    resumed.load_state_dict(state)
+    assert resumed.state_dict() == state  # used to return yielded == 0
+
+    # And the resumed iteration actually skips the already-consumed prefix.
+    full = _MapStyleSamplerWrapper(dataset, **kwargs)
+    full.set_epoch(2)
+    full.output_index_for_resume = True
+    resumed.output_index_for_resume = True
+    full_indices = [idx for _, idx in full]
+    resumed_indices = [idx for _, idx in resumed]
+    assert resumed_indices == full_indices[consumed:]

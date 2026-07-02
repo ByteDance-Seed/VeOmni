@@ -6,7 +6,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 from datasets import Dataset as HuggingFaceDataset
-from torch.utils.data import IterableDataset
+from torch.utils.data import Dataset, IterableDataset
 
 from veomni.distributed.parallel_state import init_parallel_state
 from veomni.trainer.callbacks import CheckpointerCallback, TrainerState
@@ -303,6 +303,22 @@ class ShardedIterableDataset(IterableDataset):
         """Restore the iteration state."""
         self._current_idx = state_dict["current_idx"]
         self._just_resumed = True
+
+
+class ShardedMappingDataset(Dataset):
+    """Map-style sibling of :class:`ShardedIterableDataset`.
+
+    Reuses its deterministic per-index sample generation (sample ``i`` = ``i + 1``
+    tokens of value ``i + 1``) but is a plain map-style ``Dataset`` consumed purely by
+    ``__len__`` / ``__getitem__`` -- the form ``_MapStyleSamplerWrapper`` expects.
+    """
+
+    def __init__(self, size: int = 100, transform: Optional[Callable[[Dict[str, torch.Tensor]], Any]] = None):
+        self.size = size
+        self.transform = transform
+
+    __len__ = ShardedIterableDataset.__len__
+    __getitem__ = ShardedIterableDataset.__getitem__
 
 
 class DummyDataset:
