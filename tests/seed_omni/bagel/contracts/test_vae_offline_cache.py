@@ -75,8 +75,26 @@ def test_bagel_vae_offline_encode_hook_writes_unpadded_image_cache_item() -> Non
     assert item.value.shape == (2, 2, 2, 1)
 
 
+def test_bagel_vae_offline_encode_hook_reshapes_flattened_posterior_item() -> None:
+    model = _tiny_vae(downsample=4)
+    item = ConversationItem(
+        type="image",
+        value=torch.zeros(3, 8, 4),
+        role="assistant",
+        source=BAGEL_VAE_CONTEXT,
+        meta={BAGEL_VAE_PIXEL_SHAPE: torch.tensor([8, 4])},
+    )
+    model._conversation_carrier = [[item]]
+    model._encode_items = [item]
+    encoded_cache = torch.zeros(1, 2 * model.config.z_channels, 2, 2)
+
+    model.offline_encode_post(encoded_cache=encoded_cache)
+
+    assert item.value.shape == (2, model.config.z_channels, 2, 1)
+
+
 def test_bagel_vae_online_process_consumes_variable_size_cache_items_without_padding() -> None:
-    model = _tiny_vae(cache_mode="process_only")
+    model = _tiny_vae(support_cache=True, train_type="train_with_cache")
     first = ConversationItem(
         type="image",
         value=torch.zeros(2, 2, 2, 1),
@@ -102,16 +120,37 @@ def test_bagel_vae_online_process_consumes_variable_size_cache_items_without_pad
     assert second.value.shape == (2, 2, 2)
 
 
+def test_bagel_vae_online_process_rejects_flattened_item_cache() -> None:
+    model = _tiny_vae(support_cache=True, train_type="train_with_cache")
+
+    try:
+        model.online_process(encoded_cache=torch.zeros(2 * model.config.z_channels, 2, 1))
+    except ValueError as exc:
+        assert "posterior cache tensor" in str(exc)
+    else:
+        raise AssertionError("expected flattened item cache to be rejected")
+
+
+def test_bagel_vae_online_process_accepts_singleton_batched_item_cache() -> None:
+    model = _tiny_vae(support_cache=True, train_type="train_with_cache")
+
+    out = model.online_process(encoded_cache=torch.zeros(1, 2, model.config.z_channels, 2, 1))
+
+    assert isinstance(out["latents"], list)
+    assert out["latents"][0].shape == (model.config.z_channels, 2, 1)
+
+
 def test_bagel_vae_process_only_skips_codec_modules() -> None:
     encode_model = _tiny_vae()
-    process_model = _tiny_vae(cache_mode="process_only")
+    process_model = _tiny_vae(support_cache=True, train_type="train_with_cache")
     encoded_cache = encode_model.offline_encode(pixel_values=torch.zeros(1, 3, 8, 8))["encoded_cache"]
+    item_cache = encoded_cache[0].reshape(2, process_model.config.z_channels, *encoded_cache.shape[-2:])
 
     assert not hasattr(process_model, "encoder")
     assert not hasattr(process_model, "decoder")
-    latents = process_model.online_process(encoded_cache=encoded_cache)["latents"]
+    latents = process_model.online_process(encoded_cache=item_cache)["latents"]
     assert isinstance(latents, list)
-    assert latents[0].shape == encoded_cache[:, : process_model.config.z_channels].shape
+    assert latents[0].shape == item_cache.shape[1:]
 
     try:
         process_model.encode(pixel_values=torch.zeros(1, 3, 8, 8))
@@ -129,7 +168,7 @@ def test_bagel_vae_process_only_skips_codec_modules() -> None:
 
 
 def test_bagel_vae_encode_only_skips_decoder_module() -> None:
-    model = _tiny_vae(cache_mode="encode_only")
+    model = _tiny_vae(support_cache=True, train_type="offline_cache")
 
     assert hasattr(model, "encoder")
     assert not hasattr(model, "decoder")
@@ -146,13 +185,13 @@ def test_bagel_vae_encode_only_skips_decoder_module() -> None:
         raise AssertionError("expected encode_only decode to require a decoder")
 
 
-def test_bagel_vae_from_pretrained_accepts_cache_mode_override(tmp_path) -> None:
+def test_bagel_vae_from_pretrained_accepts_cache_overrides(tmp_path) -> None:
     model = _tiny_vae()
     model.save_pretrained(tmp_path)
     BagelVAEProcessor.from_config(model.config).save_pretrained(tmp_path)
 
     BagelVAE = model_cls("bagel_vae")
-    loaded = BagelVAE.from_pretrained(tmp_path, cache_mode="process_only")
+    loaded = BagelVAE.from_pretrained(tmp_path, support_cache=True, train_type="train_with_cache")
 
     assert loaded.cache_mode == "process_only"
     assert not hasattr(loaded, "encoder")

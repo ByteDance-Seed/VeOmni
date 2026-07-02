@@ -1,22 +1,28 @@
 from __future__ import annotations
 
 import inspect
-from types import SimpleNamespace
+from collections.abc import Collection
 
 import pytest
 import torch
+from transformers import PretrainedConfig
 
-from veomni.models.seed_omni import OfflineEncodingMixin
-from veomni.models.seed_omni.mixins import offline_encoding
+from veomni.models.seed_omni import OfflineEncodingConfigMixin, OfflineEncodingMixin
 from veomni.models.seed_omni.mixins.modulemixin import ModuleMixin, post_forward, pre_forward
 from veomni.models.seed_omni.utils.conversation import ConversationItem
 
 
+class DummyOfflineConfig(OfflineEncodingConfigMixin, PretrainedConfig):
+    model_type = "dummy_offline_config"
+
+    def __init__(self, marker: str = "default", **kwargs: object) -> None:
+        self.marker = marker
+        super().__init__(**kwargs)
+
+
 class DummyOfflineModule(OfflineEncodingMixin, ModuleMixin):
-    def __init__(self, cache_mode: str | None = None) -> None:
-        self.config = SimpleNamespace()
-        if cache_mode is not None:
-            self.config.cache_mode = cache_mode
+    def __init__(self, support_cache: bool = False, train_type: str = "train") -> None:
+        self.config = DummyOfflineConfig(support_cache=support_cache, train_type=train_type)
         self.calls: list[str] = []
         self._conversation_carrier: list[list[ConversationItem]] | None = None
         super().__init__()
@@ -65,26 +71,39 @@ class DummyOfflineModule(OfflineEncodingMixin, ModuleMixin):
         return {"conversation_list": self._conversation_carrier}
 
 
-def test_missing_config_cache_mode_warns_about_full_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
-    warnings: list[str] = []
-    monkeypatch.setattr(offline_encoding.logger, "warning_rank0", warnings.append)
-
-    assert DummyOfflineModule().cache_mode == "full"
-
-    assert len(warnings) == 1
-    assert "config does not define `cache_mode`" in warnings[0]
-    assert "falling back to 'full'" in warnings[0]
-
-
-def test_invalid_cache_mode_has_clear_error() -> None:
-    module = DummyOfflineModule(cache_mode="invalid")
-
-    with pytest.raises(ValueError, match="DummyOfflineModule.cache_mode must be one of .* got 'invalid'"):
-        module.pre_forward("offline_encode", conversation_list=[])
+@pytest.mark.parametrize(
+    ("support_cache", "train_type", "expected"),
+    [
+        (False, "offline_cache", "full"),
+        (True, "offline_cache", "encode_only"),
+        (True, "train_with_cache", "process_only"),
+        (True, "train", "full"),
+    ],
+)
+def test_cache_mode_is_derived_from_support_cache_and_train_type(
+    support_cache: bool, train_type: str, expected: str
+) -> None:
+    assert DummyOfflineModule(support_cache=support_cache, train_type=train_type).cache_mode == expected
 
 
-def test_pre_forward_rejects_disallowed_cache_mode() -> None:
-    module = DummyOfflineModule(cache_mode="process_only")
+def test_offline_encoding_config_mixin_consumes_hf_runtime_overrides(tmp_path) -> None:
+    DummyOfflineConfig().save_pretrained(tmp_path)
+
+    config, unused = DummyOfflineConfig.from_pretrained(
+        tmp_path,
+        support_cache=True,
+        train_type="train_with_cache",
+        return_unused_kwargs=True,
+    )
+
+    assert config.support_cache is True
+    assert config.train_type == "train_with_cache"
+    assert "support_cache" not in unused
+    assert "train_type" not in unused
+
+
+def test_pre_forward_rejects_process_only_for_offline_encode() -> None:
+    module = DummyOfflineModule(support_cache=True, train_type="train_with_cache")
 
     with pytest.raises(
         ValueError, match="offline_encode requires cache_mode in .* current cache_mode is 'process_only'"
@@ -92,15 +111,24 @@ def test_pre_forward_rejects_disallowed_cache_mode() -> None:
         module.pre_forward("offline_encode", conversation_list=[])
 
 
+def test_pre_forward_rejects_encode_only_for_online_process() -> None:
+    module = DummyOfflineModule(support_cache=True, train_type="offline_cache")
+
+    with pytest.raises(
+        ValueError, match="online_process requires cache_mode in .* current cache_mode is 'encode_only'"
+    ):
+        module.pre_forward("online_process", conversation_list=[])
+
+
 def test_default_partial_dcp_hooks_are_noop() -> None:
-    module = DummyOfflineModule(cache_mode="process_only")
+    module = DummyOfflineModule(support_cache=True, train_type="train_with_cache")
 
     assert module.load_partial_dcp_checkpoint("/tmp/load", trainer=object()) is None
     assert module.save_partial_dcp_checkpoint("/tmp/save", trainer=object(), state=object()) is None
 
 
 def test_default_full_hf_checkpoint_hook_requires_module_implementation() -> None:
-    module = DummyOfflineModule(cache_mode="process_only")
+    module = DummyOfflineModule(support_cache=True, train_type="train_with_cache")
 
     with pytest.raises(NotImplementedError, match="save_full_hf_checkpoint"):
         module.save_full_hf_checkpoint("/tmp/out", source_path="/tmp/source", trainer=object(), state=object())
@@ -154,12 +182,21 @@ def test_decorated_hook_slots_are_dispatched_by_module_mixin() -> None:
 
 
 def test_cache_mode_is_checked_once_per_offline_method() -> None:
-    module = DummyOfflineModule(cache_mode="full")
+    module = DummyOfflineModule(support_cache=False)
     conversation = [[ConversationItem(type="image", value=torch.ones(1), role="assistant")]]
+    calls: list[str] = []
+
+    original = module._check_cache_mode
+
+    def wrapped_check_cache_mode(*, method: str, allowed: Collection[str]) -> None:
+        calls.append(method)
+        return original(method=method, allowed=allowed)
+
+    module._check_cache_mode = wrapped_check_cache_mode  # type: ignore[method-assign]
 
     module.pre_forward("offline_encode", conversation_list=conversation)
-    module.config.cache_mode = "invalid"
     module.pre_forward("offline_encode", conversation_list=conversation)
+    module.pre_forward("online_process", conversation_list=conversation)
+    module.pre_forward("online_process", conversation_list=conversation)
 
-    with pytest.raises(ValueError, match="cache_mode must be one of .* got 'invalid'"):
-        module.pre_forward("online_process", conversation_list=conversation)
+    assert calls == ["offline_encode", "online_process"]

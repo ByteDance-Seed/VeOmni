@@ -308,6 +308,8 @@ class OmniTrainer:
         modules: Dict[str, torch.nn.Module] = {}
         for name in self.module_names:
             module_config = self.omni_config.module_config(name)
+            module_config.model.model_config = dict(module_config.model.model_config or {})
+            module_config.model.model_config["train_type"] = args.train.train_type
             module_trainer = OmniModuleTrainer(module_config, subfolder_name=name)
             self.module_trainers[name] = module_trainer
             modules[name] = module_trainer.base.model

@@ -20,10 +20,39 @@ from abc import abstractmethod
 from collections.abc import Collection
 from typing import Any
 
-from ....utils import logging
 
+class OfflineEncodingConfigMixin:
+    """Config fields shared by modules that support offline-cache workflows."""
 
-logger = logging.get_logger(__name__)
+    DEFAULT_CACHE_MODE = "full"
+    VALID_CACHE_MODES = frozenset({"full", "encode_only", "process_only"})
+
+    def __init__(
+        self,
+        support_cache: bool = False,
+        train_type: str = "train",
+        **kwargs: Any,
+    ) -> None:
+        self.support_cache = support_cache
+        self.train_type = train_type
+        super().__init__(**kwargs)
+
+    @property
+    def cache_mode(self) -> str:
+        if not self.support_cache:
+            return self.DEFAULT_CACHE_MODE
+        if self.train_type == "offline_cache":
+            return "encode_only"
+        if self.train_type == "train_with_cache":
+            return "process_only"
+        return self.DEFAULT_CACHE_MODE
+
+    def validated_cache_mode(self) -> str:
+        mode = self.cache_mode
+        if mode not in self.VALID_CACHE_MODES:
+            valid = ", ".join(sorted(self.VALID_CACHE_MODES))
+            raise ValueError(f"{type(self).__name__}.cache_mode must be one of {{{valid}}}; got {mode!r}.")
+        return mode
 
 
 class OfflineEncodingMixin:
@@ -34,30 +63,12 @@ class OfflineEncodingMixin:
     ``process_only`` needs online processing weights, and ``full`` needs both.
     """
 
-    DEFAULT_CACHE_MODE = "full"
-    VALID_CACHE_MODES = frozenset({"full", "encode_only", "process_only"})
-
     def __init__(self, *args: Any, **kwargs: Any) -> None:
-        config = args[0] if args else kwargs.get("config", getattr(self, "config", None))
-        if not hasattr(config, "cache_mode"):
-            logger.warning_rank0(
-                f"{type(self).__name__} config does not define `cache_mode`; falling back to 'full' and "
-                "loading all weights for offline_encode."
-            )
-
         super().__init__(*args, **kwargs)
 
     @property
     def cache_mode(self) -> str:
-        config = getattr(self, "config", None)
-        return getattr(config, "cache_mode", self.DEFAULT_CACHE_MODE)
-
-    def validated_cache_mode(self) -> str:
-        mode = self.cache_mode
-        if mode not in self.VALID_CACHE_MODES:
-            valid = ", ".join(sorted(self.VALID_CACHE_MODES))
-            raise ValueError(f"{type(self).__name__}.cache_mode must be one of {{{valid}}}; got {mode!r}.")
-        return mode
+        return self.config.validated_cache_mode()
 
     def pre_forward(self, method: str, **kwargs: Any) -> dict[str, Any]:
         """Gate offline-cache call-sites before dispatching module hooks."""
@@ -70,7 +81,7 @@ class OfflineEncodingMixin:
         return super().pre_forward(method=method, **kwargs)
 
     def _check_cache_mode(self, *, method: str, allowed: Collection[str]) -> None:
-        mode = self.validated_cache_mode()
+        mode = self.cache_mode
         if mode not in allowed:
             allowed_text = ", ".join(sorted(allowed))
             raise ValueError(
@@ -115,4 +126,4 @@ class OfflineEncodingMixin:
         """Materialize runtime tensors from offline encoded cache tensors."""
 
 
-__all__ = ["OfflineEncodingMixin"]
+__all__ = ["OfflineEncodingConfigMixin", "OfflineEncodingMixin"]

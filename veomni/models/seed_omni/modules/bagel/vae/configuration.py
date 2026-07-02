@@ -2,8 +2,10 @@
 
 from transformers import PretrainedConfig
 
+from ....mixins.offline_encoding import OfflineEncodingConfigMixin
 
-class BagelVAEConfig(PretrainedConfig):
+
+class BagelVAEConfig(OfflineEncodingConfigMixin, PretrainedConfig):
     """BAGEL FLUX-style latent autoencoder config."""
 
     model_type = "bagel_vae"
@@ -27,7 +29,6 @@ class BagelVAEConfig(PretrainedConfig):
         image_mean: list[float] | None = None,
         image_std: list[float] | None = None,
         freeze: bool = True,
-        cache_mode: str = "full",
         **kwargs,
     ) -> None:
         self.resolution = resolution
@@ -47,7 +48,6 @@ class BagelVAEConfig(PretrainedConfig):
         self.image_mean = [0.5, 0.5, 0.5] if image_mean is None else image_mean
         self.image_std = [0.5, 0.5, 0.5] if image_std is None else image_std
         self.freeze = freeze
-        self.cache_mode = cache_mode
         super().__init__(**kwargs)
 
 

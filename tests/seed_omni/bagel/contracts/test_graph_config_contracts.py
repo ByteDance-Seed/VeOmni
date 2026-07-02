@@ -53,7 +53,7 @@ def test_bagel_offline_cache_yaml_loads_encode_only_vae():
     )
 
     assert set(cfg.modules) == {"bagel_vae"}
-    assert cfg.module_config("bagel_vae").model.model_config == {"cache_mode": "encode_only"}
+    assert cfg.module_config("bagel_vae").model.model_config == {"support_cache": True}
     assert cfg.training_graph == [{"from": "bagel_vae.offline_encode", "to": "end"}]
 
 
@@ -70,7 +70,7 @@ def test_bagel_train_with_cache_yaml_loads_process_only_vae():
         "bagel_flow_connector",
         "bagel_vae",
     }
-    assert cfg.module_config("bagel_vae").model.model_config == {"cache_mode": "process_only"}
+    assert cfg.module_config("bagel_vae").model.model_config == {"support_cache": True}
     endpoints = {e["from"] for e in cfg.training_graph} | {e["to"] for e in cfg.training_graph}
     assert "bagel_vae.online_process" in endpoints
     assert "bagel_vae.encode" not in endpoints

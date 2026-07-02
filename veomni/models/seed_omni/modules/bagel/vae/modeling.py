@@ -35,7 +35,7 @@ class BagelVAE(BagelVAEModuleMixin, PreTrainedModel):
 
     def __init__(self, config: BagelVAEConfig, **kwargs: Any) -> None:
         super().__init__(config, **kwargs)
-        cache_mode = self.validated_cache_mode()
+        cache_mode = self.cache_mode
         if cache_mode in {"full", "encode_only"}:
             self.encoder = Encoder(
                 resolution=config.resolution,
@@ -64,7 +64,7 @@ class BagelVAE(BagelVAEModuleMixin, PreTrainedModel):
             self.requires_grad_(False)
 
     def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs: dict[str, Any] | None = None) -> None:
-        if self.validated_cache_mode() == "process_only":
+        if self.cache_mode == "process_only":
             return
         return super().gradient_checkpointing_enable(gradient_checkpointing_kwargs=gradient_checkpointing_kwargs)
 
@@ -170,15 +170,13 @@ def _posterior_from_cache(
     *,
     z_channels: int,
 ) -> tuple[tuple[torch.Tensor, torch.Tensor], bool]:
-    if cache.dim() == 5 and int(cache.shape[1]) == 2:
-        return (cache[:, 0], cache[:, 1]), False
+    if cache.dim() == 5 and int(cache.shape[0]) == 1:
+        cache = cache.squeeze(0)
     if cache.dim() == 4 and int(cache.shape[0]) == 2 and int(cache.shape[1]) == z_channels:
         return (cache[0].unsqueeze(0), cache[1].unsqueeze(0)), True
-    if cache.dim() == 4:
-        return torch.chunk(cache, 2, dim=1), False
     raise ValueError(
-        "BAGEL VAE posterior cache tensor must be shaped (2, C, H, W), "
-        f"(B, 2, C, H, W), or (B, 2C, H, W); got {tuple(cache.shape)}."
+        "BAGEL VAE posterior cache tensor must be shaped (2, C, H, W) "
+        f"or singleton-batched (1, 2, C, H, W); got {tuple(cache.shape)}."
     )
 
 

@@ -2,7 +2,7 @@ bagel_vae:
   model:
     model_path: bagel_vae
     model_config:
-      cache_mode: process_only
+      support_cache: true
 
 bagel_siglip_navit:
   model:

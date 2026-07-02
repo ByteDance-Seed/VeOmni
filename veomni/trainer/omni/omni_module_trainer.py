@@ -124,7 +124,7 @@ class _OmniModulePayloadMixin:
 
     def _offline_cache_model(self) -> Optional[OfflineEncodingMixin]:
         model = _unwrap_module(self.trainer.model)
-        if not isinstance(model, OfflineEncodingMixin) or model.validated_cache_mode() == "full":
+        if not isinstance(model, OfflineEncodingMixin) or model.cache_mode == "full":
             return None
         return model
 

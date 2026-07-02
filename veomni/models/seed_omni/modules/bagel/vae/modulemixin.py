@@ -68,7 +68,7 @@ class BagelVAEModuleMixin(OfflineEncodingMixin, ModuleMixin):
     def build_cpu_preprocessor(self) -> CPUPreprocessor | None:
         # Full training and offline-cache production preprocess raw images here;
         # process-only training reads preprocessed cached conversations instead.
-        if getattr(self.config, "cache_mode", "full") == "process_only":
+        if self.cache_mode == "process_only":
             return None
         if getattr(self, "_image_processor", None) is None:
             return None
@@ -223,6 +223,9 @@ class BagelVAEModuleMixin(OfflineEncodingMixin, ModuleMixin):
                 item.meta.get(BAGEL_VAE_PIXEL_SHAPE),
                 downsample=int(self.config.downsample),
             )
+            z_channels = int(self.config.z_channels)
+            if cache_tensor.dim() == 3 and int(cache_tensor.shape[0]) == 2 * z_channels:
+                cache_tensor = cache_tensor.reshape(2, z_channels, *cache_tensor.shape[-2:])
             item.value = cache_tensor.detach().to(device=self.device, dtype=self.dtype)
             item.source = BAGEL_VAE_CONTEXT
             item.meta = {}

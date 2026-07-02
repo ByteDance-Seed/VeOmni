@@ -240,7 +240,8 @@ def test_bagel_vae_cache_modes_do_not_construct_reg_and_process_only_has_no_code
             ch_mult=[1],
             num_res_blocks=1,
             z_channels=2,
-            cache_mode="process_only",
+            support_cache=True,
+            train_type="train_with_cache",
         )
     )
 

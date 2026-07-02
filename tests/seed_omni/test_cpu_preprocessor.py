@@ -17,7 +17,6 @@ picklable ``CPUPreprocessor`` run inside ``SeedOmniCollator``:
 
 import copy
 import pickle
-from types import SimpleNamespace
 
 import torch
 
@@ -40,6 +39,7 @@ from veomni.models.seed_omni.modules.bagel.text_encoder.modulemixin import (
 from veomni.models.seed_omni.modules.bagel.text_encoder.modulemixin import (
     BagelTextEncoderCPUPreprocessor,
 )
+from veomni.models.seed_omni.modules.bagel.vae.configuration import BagelVAEConfig
 from veomni.models.seed_omni.modules.bagel.vae.modulemixin import BagelVAECPUPreprocessor, BagelVAEModuleMixin
 from veomni.models.seed_omni.modules.bagel.vae.processing import BagelVAEProcessor
 from veomni.models.seed_omni.modules.janus.siglip.modulemixin import (
@@ -68,10 +68,11 @@ def _worker_dummies(conversation_list, source):
 
 
 class _DummyBagelVAE(BagelVAEModuleMixin):
-    def __init__(self, cache_mode: str) -> None:
-        self.config = SimpleNamespace(cache_mode=cache_mode)
+    def __init__(self, support_cache: bool = False, train_type: str = "train") -> None:
+        self.config = BagelVAEConfig(support_cache=support_cache, train_type=train_type)
         self._image_processor = object()
         self.dtype = torch.float32
+        super().__init__()
 
     def init_omni_state(self) -> None:
         return None
@@ -312,8 +313,8 @@ def test_bagel_siglip_preprocessor_patchifies_and_tags_context():
 
 
 def test_bagel_vae_process_only_skips_cpu_preprocessor():
-    assert _DummyBagelVAE(cache_mode="process_only").build_cpu_preprocessor() is None
-    assert isinstance(_DummyBagelVAE(cache_mode="full").build_cpu_preprocessor(), BagelVAECPUPreprocessor)
+    assert _DummyBagelVAE(support_cache=True, train_type="train_with_cache").build_cpu_preprocessor() is None
+    assert isinstance(_DummyBagelVAE().build_cpu_preprocessor(), BagelVAECPUPreprocessor)
 
 
 def test_bagel_vae_process_only_full_hf_checkpoint_copies_source(tmp_path):
@@ -323,7 +324,7 @@ def test_bagel_vae_process_only_full_hf_checkpoint_copies_source(tmp_path):
     (source / "config.json").write_text("{}", encoding="utf-8")
     (source / "model.safetensors").write_bytes(b"weights")
 
-    _DummyBagelVAE(cache_mode="process_only").save_full_hf_checkpoint(
+    _DummyBagelVAE(support_cache=True, train_type="train_with_cache").save_full_hf_checkpoint(
         str(output),
         source_path=str(source),
         trainer=object(),

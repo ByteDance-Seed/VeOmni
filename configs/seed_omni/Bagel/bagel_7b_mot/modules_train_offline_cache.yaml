@@ -2,4 +2,4 @@ bagel_vae:
   model:
     model_path: bagel_vae
     model_config:
-      cache_mode: encode_only
+      support_cache: true
