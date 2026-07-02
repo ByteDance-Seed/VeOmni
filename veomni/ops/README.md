@@ -18,7 +18,7 @@ veomni/ops/
 │   ├── attention/          Flash attention v2/3/4 + SP-aware wrappers
 │   ├── cross_entropy/      eager / liger / npu-chunk loss (+ ForCausalLMLoss)
 │   ├── load_balancing_loss/  eager + triton fused kernel
-│   ├── rms_norm/           Liger / NPU / triton batch-invariant
+│   ├── rms_norm/           Liger / NPU / triton batch-invariant (+ Qwen3 residual-add fast path)
 │   ├── rotary/             Liger / NPU / deterministic / Wan Triton
 │   ├── swiglu/             Liger SwiGLU MLP
 │   └── moe/                Fused MoE + _kernels/ (group_gemm, quack_gemm)
@@ -79,7 +79,7 @@ modeling symbols it uses:
 |---|---|---|---|---|
 | `llama` | `LlamaRMSNorm` | `apply_rotary_pos_emb` | `LlamaMLP` | — |
 | `qwen2` | `Qwen2RMSNorm` | `apply_rotary_pos_emb` | `Qwen2MLP` | — |
-| `qwen3` | `Qwen3RMSNorm` | `apply_rotary_pos_emb` | `Qwen3MLP` | — |
+| `qwen3` | `Qwen3RMSNorm` | `apply_rotary_pos_emb` | `Qwen3MLP` | `rms_norm_implementation` also controls the fused post-attention `residual + RMSNorm` fast path in `Qwen3DecoderLayer.forward` |
 | `qwen3_moe` | `Qwen3MoeRMSNorm` | `apply_rotary_pos_emb` | `Qwen3MoeMLP` | — |
 | `seed_oss` | `SeedOssRMSNorm` | `apply_rotary_pos_emb` | `SeedOssMLP` | — |
 | `qwen2_vl` | `Qwen2RMSNorm` | `apply_multimodal_rotary_pos_emb` | `Qwen2MLP` | `rotary_pos_emb.npu` disabled; vision RoPE via `custom_patches` |
