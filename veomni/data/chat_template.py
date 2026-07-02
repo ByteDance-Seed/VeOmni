@@ -240,7 +240,7 @@ class ChatmlTemplate(ChatTemplate):
             input_ids += content_ids
             attention_mask += [1] * len(content_ids)
 
-            if hasattr(message, "loss_mask"):
+            if "loss_mask" in message:
                 loss_mask = message["loss_mask"]
             else:
                 loss_mask = 1 if message["role"] == "assistant" else 0

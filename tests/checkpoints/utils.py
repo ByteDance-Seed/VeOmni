@@ -23,21 +23,24 @@ MODEL_CONFIGS = {
 }
 
 
-# Get some dir functions
-def get_output_dir(model_name, ep_size):
-    return f"./test_trainer_saveload_{model_name}_{ep_size}"
+# Get some dir functions.
+# ``dp_replicate_size`` is threaded into the dir name so HSDP runs
+# (dp_replicate>1) don't collide with the pure-FSDP run for the same model/ep.
+def get_output_dir(model_name, ep_size, dp_replicate_size=None):
+    suffix = f"_dpr{dp_replicate_size}" if dp_replicate_size else ""
+    return f"./test_trainer_saveload_{model_name}_{ep_size}{suffix}"
 
 
-def get_checkpoint_dir(model_name, ep_size):
-    return os.path.join(get_output_dir(model_name, ep_size), "checkpoints", "global_step_5")
+def get_checkpoint_dir(model_name, ep_size, dp_replicate_size=None):
+    return os.path.join(get_output_dir(model_name, ep_size, dp_replicate_size), "checkpoints", "global_step_5")
 
 
-def get_hf_output_dir(model_name, ep_size):
-    return os.path.join(get_output_dir(model_name, ep_size), "hf_ckpt")
+def get_hf_output_dir(model_name, ep_size, dp_replicate_size=None):
+    return os.path.join(get_output_dir(model_name, ep_size, dp_replicate_size), "hf_ckpt")
 
 
-def get_model_assets_dir(model_name, ep_size):
-    return os.path.join(get_output_dir(model_name, ep_size), "model_assets")
+def get_model_assets_dir(model_name, ep_size, dp_replicate_size=None):
+    return os.path.join(get_output_dir(model_name, ep_size, dp_replicate_size), "model_assets")
 
 
 # running command functions
@@ -45,10 +48,11 @@ def get_checkpoint_test_command(
     model_name,
     ep_size,
     save_hf_weights=False,
+    dp_replicate_size=None,
 ):
     config_path = MODEL_CONFIGS[model_name]["config_path"]
     tokenizer_path = hf_local_or_remote(MODEL_CONFIGS[model_name]["tokenizer_path"])
-    output_dir = get_output_dir(model_name, ep_size)
+    output_dir = get_output_dir(model_name, ep_size, dp_replicate_size)
     port = find_free_port()
 
     params = [
@@ -79,6 +83,12 @@ def get_checkpoint_test_command(
         "--train.checkpoint.save_async True",
         f"--train.checkpoint.save_hf_weights {save_hf_weights}",
     ]
+    # HSDP: split the FSDP dim into (dp_replicate, dp_shard). dp_shard is
+    # inferred as dp_size // dp_replicate_size by the argument resolver, and the
+    # expert mesh becomes 3D (ep_replicate, ep_fsdp, ep), exercising the
+    # 3-placement save/load path in the DCP checkpointer.
+    if dp_replicate_size is not None:
+        params.append(f"--train.accelerator.dp_replicate_size {dp_replicate_size}")
 
     exec_script = " \\\n".join(params)
 
@@ -88,10 +98,11 @@ def get_checkpoint_test_command(
 def get_merge_dcp_to_hf_command(
     model_name,
     ep_size,
+    dp_replicate_size=None,
 ):
-    checkpoint_dir = get_checkpoint_dir(model_name, ep_size)
-    hf_output_dir = get_hf_output_dir(model_name, ep_size)
-    model_assets_dir = get_model_assets_dir(model_name, ep_size)
+    checkpoint_dir = get_checkpoint_dir(model_name, ep_size, dp_replicate_size)
+    hf_output_dir = get_hf_output_dir(model_name, ep_size, dp_replicate_size)
+    model_assets_dir = get_model_assets_dir(model_name, ep_size, dp_replicate_size)
 
     params = [
         "python",

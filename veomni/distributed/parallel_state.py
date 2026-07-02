@@ -15,13 +15,11 @@
 
 # Adapted from https://github.com/pytorch/torchtitan/blob/main/torchtitan/distributed/parallel_dims.py
 
-import math
 import os
 from dataclasses import dataclass, field
 from functools import cached_property, wraps
 from typing import TYPE_CHECKING, Callable, Dict, Literal, Optional, Tuple
 
-import torch
 from torch import distributed as dist
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 
@@ -48,29 +46,6 @@ def requires_mesh(fn: Callable) -> Callable:
         return fn(self, *args, **kwargs)
 
     return _inner
-
-
-def init_para_mesh_matrix(para_size: int, para_fsdp_size: int, para_outside: bool = False) -> "DeviceMesh":
-    """
-    Initialize the device mesh matrix for the ExtraParallel.
-    Args:
-        para_size (int): The size of the ExtraParallel.
-        para_fsdp_size (int): The size of the ExtraParallel-FSDP.
-        para_outside (bool): Whether the ExtraParallel is outside in para-fsdp group.
-    """
-    if para_outside:
-        with torch.device("cpu"):
-            mesh = torch.arange(math.prod((para_size, para_fsdp_size)), dtype=torch.int).view(
-                para_size, para_fsdp_size
-            )
-    else:
-        with torch.device("cpu"):
-            mesh = (
-                torch.arange(math.prod((para_size, para_fsdp_size)), dtype=torch.int)
-                .view(para_fsdp_size, para_size)
-                .transpose(0, 1)
-            )
-    return mesh
 
 
 @dataclass(frozen=True)
@@ -595,14 +570,31 @@ def init_parallel_state(
         extra_parallel_sizes, extra_parallel_placement_innermost, extra_parallel_names
     ):
         if para_size > 1:
-            world_size = dist.get_world_size()
-            assert world_size % para_size == 0, f"{para_name}_size must be a factor of world_size"
-            para_fsdp_size = world_size // para_size
-            mesh = init_para_mesh_matrix(para_size=para_size, para_fsdp_size=para_fsdp_size, para_outside=para_outside)
-            extra_parallel_fsdp_device_mesh[f"{para_name}"] = DeviceMesh(
+            # TODO: drop para_outside?
+            assert not para_outside, f"{para_name} is not supported when para_outside is True."
+
+            # NOTE: Support HSDP for extra parallel. For example, world_size=1024
+            # - dense param device_mesh: (dp_replicate, dp_shard_sp)=(4, 256)
+            # - ep_size=8, expert parallel device_mesh: (ep_replicate, ep_fsdp, ep)=(4, 32, 8)
+            # Note that ep_size should be a factor of dp_shard_sp_size.
+            param_mesh_shape, para_mesh_dim_names = [], []
+            if dp_replicate_size > 1:
+                param_mesh_shape.append(dp_replicate_size)
+                para_mesh_dim_names.append(f"{para_name}_replicate")
+            dp_shard_sp_size = device_mesh["dp_shard_sp"].size()
+            assert dp_shard_sp_size % para_size == 0, (
+                f"{para_name}_size({para_size}) must be a factor of dp_shard_sp_size({dp_shard_sp_size})"
+            )
+            para_fsdp_size = dp_shard_sp_size // para_size
+            param_mesh_shape.append(para_fsdp_size)
+            param_mesh_shape.append(para_size)
+            para_mesh_dim_names.append(f"{para_name}_fsdp")
+            para_mesh_dim_names.append(para_name)
+
+            extra_parallel_fsdp_device_mesh[f"{para_name}"] = init_device_mesh(
                 device_type=device_type,
-                mesh=mesh,
-                mesh_dim_names=(para_name, f"{para_name}_fsdp"),
+                mesh_shape=param_mesh_shape,
+                mesh_dim_names=para_mesh_dim_names,
             )
 
     logger.info_rank0(f"Device mesh: {device_mesh}")

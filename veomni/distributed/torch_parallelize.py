@@ -233,14 +233,19 @@ def parallelize_model_fsdp2(
     extra_parallel_fsdp_kwargs = {}
     for para in parallel_state.extra_parallel_names:
         if parallel_state.extra_parallel_enabled(para):
-            para_fsdp_mesh = parallel_state.extra_parallel_fsdp_device_mesh[para][f"{para}_fsdp"]
+            para_mesh = parallel_state.extra_parallel_fsdp_device_mesh[para]
+            para_mesh_dim_names = para_mesh.mesh_dim_names
+            # exclude para_size dimension:
+            # - (ep_fsdp, ep) -> (ep_fsdp,)
+            # - (ep_replicate, ep_fsdp, ep) -> (ep_replicate, ep_fsdp)
+            para_fsdp_mesh = para_mesh[para_mesh_dim_names[:-1]]
             para_fsdp_kwargs = dict(fsdp_kwargs)
             para_fsdp_kwargs["mesh"] = para_fsdp_mesh
             shard_dim_for_para = 1
             # Muon zero-comm needs whole experts per rank; otherwise keep the
             # default hidden-dim sharding.
             if muon_expert_zero_comm:
-                ep_fsdp_size = parallel_state.extra_parallel_fsdp_size(para)
+                ep_fsdp_size = para_mesh["ep_fsdp"].size()
                 divisible = _check_extra_parallel_dim0_divisibility(model, para, ep_fsdp_size)
                 if divisible:
                     shard_dim_for_para = 0
@@ -257,6 +262,11 @@ def parallelize_model_fsdp2(
                     )
             para_fsdp_kwargs["shard_placement_fn"] = lambda param, _d=shard_dim_for_para: Shard(_d)
             extra_parallel_fsdp_kwargs[para] = para_fsdp_kwargs
+            # Record the FSDP shard dim on the spec_info so the checkpointer can
+            # build correct DTensor placements (EP dim vs FSDP dim) on save/load.
+            for spec_info in getattr(model, "_fqn2spec_info", {}).values():
+                if spec_info.para_name == para:
+                    spec_info.fsdp_shard_dim = shard_dim_for_para
         else:
             extra_parallel_fsdp_kwargs[para] = None
 
