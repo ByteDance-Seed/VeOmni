@@ -33,9 +33,20 @@ def standard_rms_norm_forward_npu(hidden_states, weight, eps):
     return torch_npu.npu_rms_norm(hidden_states, weight, eps)[0]
 
 
+def standard_rms_norm_residual_add_forward_npu(hidden_states, residual, weight, eps):
+    """NPU optimized implementation for ``residual + hidden_states`` + RMSNorm."""
+    updated_residual = residual + hidden_states
+    return torch_npu.npu_rms_norm(updated_residual, weight, eps)[0], updated_residual
+
+
 def qwen3_5_rms_norm_forward_npu(hidden_states, weight, eps):
     """NPU optimized implementation for Qwen3_5RMSNorm."""
     return torch_npu.npu_rms_norm(hidden_states, 1.0 + weight, eps)[0]
 
 
-__all__ = ["rms_norm_forward_npu", "standard_rms_norm_forward_npu", "qwen3_5_rms_norm_forward_npu"]
+__all__ = [
+    "rms_norm_forward_npu",
+    "standard_rms_norm_forward_npu",
+    "standard_rms_norm_residual_add_forward_npu",
+    "qwen3_5_rms_norm_forward_npu",
+]

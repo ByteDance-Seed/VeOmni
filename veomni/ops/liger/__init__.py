@@ -59,6 +59,43 @@ KERNEL_REGISTRY.register(
 )
 
 
+# ── Liger RMSNorm + residual-add (standard variant) ─────────────────────────
+
+
+def _liger_rms_norm_residual_add_factory():
+    """Return a functional fused ``residual + x`` + RMSNorm kernel.
+
+    Returns ``(normed_hidden_states, updated_residual)``, where
+    ``updated_residual = residual + hidden_states``.
+    """
+    from liger_kernel.ops.fused_add_rms_norm import LigerFusedAddRMSNormFunction
+
+    def liger_rms_norm_residual_add(hidden_states, residual, weight, eps):
+        return LigerFusedAddRMSNormFunction.apply(
+            hidden_states,
+            residual,
+            weight,
+            eps,
+            0.0,  # offset — standard RMSNorm (no weight shift)
+            "llama",  # casting_mode
+            False,  # in_place
+        )
+
+    return liger_rms_norm_residual_add
+
+
+KERNEL_REGISTRY.register(
+    KernelSpec(
+        name="liger_kernel",
+        op_name="rms_norm",
+        variant="residual_add",
+        factory=_liger_rms_norm_residual_add_factory,
+        hardware=HardwareRequirement(device_type="gpu"),
+        description="LigerKernel fused residual-add + RMSNorm",
+    )
+)
+
+
 # ── Liger RMSNorm (Qwen3.5 variant: offset=1.0, zeros init) ──────────────────
 
 
