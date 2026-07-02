@@ -89,15 +89,12 @@ jobs:
       # while pulling large wheels (e.g. torch-npu, virtualenv); bump to
       # 5 min so a slow link doesn't fail the whole sync.
       UV_HTTP_TIMEOUT: "300"
-      # CANN 9.0.0 single-node 8-card HCCL configuration per Ascend official docs:
+      # CANN 9.0.0 single-node 8-card: reserve HCCL ports per Ascend official doc
       # https://www.hiascend.com/document/detail/zh/Pytorch/60RC3/ptmoddevg/trainingmigrguide/PT_LMTMOG_0021.html
-      # https://www.hiascend.com/document/detail/zh/canncommercial/900/maintenref/envvar/envref_07_0143.html
-      HCCL_CONNECT_TIMEOUT: "3600"
-      HCCL_HOST_SOCKET_PORT_RANGE: "60000-60015"
-      HCCL_WHITELIST_DISABLE: "1"
+      HCCL_IF_BASE_PORT: "60000"
 
     steps:
-      - name: Reserve HCCL ports (CANN 9.0.0 single-node requirement)
+      - name: Reserve HCCL ports (Ascend single-node requirement)
         run: sysctl -w net.ipv4.ip_local_reserved_ports=60000-60015
       - name: Set ASCEND_VISIBLE_DEVICES from runner slice
         # See npu_unit_tests.yml for the full rationale. We match the runner
