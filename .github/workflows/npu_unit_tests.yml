@@ -92,13 +92,19 @@ jobs:
       # while pulling large wheels (e.g. torch-npu, virtualenv); bump to
       # 5 min so a slow link doesn't fail the whole sync.
       UV_HTTP_TIMEOUT: "300"
-      # CANN 9.0.0 single-node 8-card: reserve HCCL ports per Ascend official doc
+      # CANN 9.0.0 single-node 8-card HCCL config, aligned with verl Ascend best practice:
+      # https://github.com/verl-project/verl/blob/c98cb8cc/docs/ascend_tutorial/examples/ascend_vllm_best_pratice.rst
+      # Port reservation per Ascend single-node guide:
       # https://www.hiascend.com/document/detail/zh/Pytorch/60RC3/ptmoddevg/trainingmigrguide/PT_LMTMOG_0021.html
-      HCCL_IF_BASE_PORT: "60000"
+      HCCL_CONNECT_TIMEOUT: "3600"
+      HCCL_EXEC_TIMEOUT: "3600"
+      HCCL_HOST_SOCKET_PORT_RANGE: "60000-60050"
+      HCCL_NPU_SOCKET_PORT_RANGE: "61000-61050"
+      HCCL_ASYNC_ERROR_HANDLING: "0"
 
     steps:
       - name: Reserve HCCL ports (Ascend single-node requirement)
-        run: sysctl -w net.ipv4.ip_local_reserved_ports=60000-60015
+        run: sysctl -w net.ipv4.ip_local_reserved_ports=60000-61050
       - name: Set ASCEND_VISIBLE_DEVICES from runner slice
         # Runner name is either:
         #   - exposed as $RUNNER_NAME by the GitHub Actions runner directly (same
