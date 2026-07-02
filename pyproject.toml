@@ -85,11 +85,11 @@ gpu = [
 
 # Ascend NPU x86_64 — superset minus CUDA-only kernels (FA2/3/4, FlashQLA).
 npu = [
-  "torch==2.7.1+cpu",
-  "torch-npu==2.7.1",
-  "torchvision==0.22.1+cpu",
-  "torchaudio==2.7.1+cpu",
-  "torchcodec>=0.4.0,<0.6.0",
+  "torch==2.9.0+cpu",
+  "torch-npu==2.9.0.post2",
+  "torchvision==0.24.0+cpu",
+  "torchaudio==2.9.0+cpu",
+  "torchcodec>=0.8.0,<0.10.0",
   "decorator>=5.2.1",
   "scipy>=1.16.2",
   "av>=14.3.0,<15.0; python_version == '3.11'",
@@ -106,10 +106,10 @@ npu = [
 # aarch64 NPU — torch + torch-npu only; av/torchcodec/librosa/soundfile lack
 # aarch64 wheels (see `[tool.uv.sources].av`, x86_64-only).
 npu_aarch64 = [
-  "torch==2.7.1",
-  "torch-npu==2.7.1",
-  "torchvision==0.22.1",
-  "torchaudio==2.7.1",
+  "torch==2.9.0",
+  "torch-npu==2.9.0.post2",
+  "torchvision==0.24.0",
+  "torchaudio==2.9.0",
   "decorator>=5.2.1",
   "scipy>=1.16.2",
 ]
@@ -159,14 +159,14 @@ override-dependencies = [
     "torchaudio==2.11.0+cu130; (extra == 'gpu')",
     "torchvision==0.26.0+cu130; (extra == 'gpu')",
     "torchcodec==0.12.0; (extra == 'gpu')",
-    "torch==2.7.1; (extra == 'npu_aarch64')",
-    "torchaudio==2.7.1; (extra == 'npu_aarch64')",
-    "torchvision==0.22.1; (extra == 'npu_aarch64')",
+    "torch==2.9.0; (extra == 'npu_aarch64')",
+    "torchaudio==2.9.0; (extra == 'npu_aarch64')",
+    "torchvision==0.24.0; (extra == 'npu_aarch64')",
     # Adding explicit override for NPU backends - x86 variant (default npu)
-    "torch==2.7.1+cpu; (extra == 'npu')",
-    "torchaudio==2.7.1+cpu; (extra == 'npu')",
-    "torchvision==0.22.1+cpu; (extra == 'npu')",
-    "torchcodec>=0.4.0,<0.6.0; (extra == 'npu')",
+    "torch==2.9.0+cpu; (extra == 'npu')",
+    "torchaudio==2.9.0+cpu; (extra == 'npu')",
+    "torchvision==0.24.0+cpu; (extra == 'npu')",
+    "torchcodec>=0.8.0,<0.10.0; (extra == 'npu')",
 ]
 
 conflicts = [

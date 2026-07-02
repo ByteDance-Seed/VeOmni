@@ -49,7 +49,7 @@ jobs:
     runs-on: [self-hosted, 910b-8]
     timeout-minutes: 90
     container:
-      image: quay.io/ascend/veomni:veomni-8.3.rc2-910b-ubuntu22.04-py3.11-tingyang_chore_bump_uv
+      image: quay.io/ascend/veomni:veomni-9.0.0-910b-ubuntu22.04-py3.11-tingyang_chore_bump_uv
       volumes:
         - /usr/local/dcmi:/usr/local/dcmi
         - /usr/local/bin/npu-smi:/usr/local/bin/npu-smi
@@ -92,6 +92,10 @@ jobs:
       # while pulling large wheels (e.g. torch-npu, virtualenv); bump to
       # 5 min so a slow link doesn't fail the whole sync.
       UV_HTTP_TIMEOUT: "300"
+      # CANN 9.0.0: let OS assign HCCL ports (auto) to avoid port exhaustion
+      # and counter overflow to 65536 when many sub-communicators run sequentially.
+      HCCL_HOST_SOCKET_PORT_RANGE: "auto"
+      HCCL_NPU_SOCKET_PORT_RANGE: "auto"
 
     steps:
       - name: Set ASCEND_VISIBLE_DEVICES from runner slice
