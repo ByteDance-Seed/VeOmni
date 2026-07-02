@@ -92,9 +92,10 @@ jobs:
       # while pulling large wheels (e.g. torch-npu, virtualenv); bump to
       # 5 min so a slow link doesn't fail the whole sync.
       UV_HTTP_TIMEOUT: "300"
-      # CANN 9.0.0: lower HCCL base port to prevent overflow to 65536
-      # when multiple test cases accumulate ports in sequence.
-      HCCL_IF_BASE_PORT: "50000"
+      # CANN 9.0.0: let OS assign HCCL ports (auto) to avoid port exhaustion
+      # and counter overflow to 65536 when many sub-communicators run sequentially.
+      HCCL_HOST_SOCKET_PORT_RANGE: "auto"
+      HCCL_NPU_SOCKET_PORT_RANGE: "auto"
 
     steps:
       - name: Set ASCEND_VISIBLE_DEVICES from runner slice
