@@ -297,10 +297,10 @@ NPU validation runs at two times:
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
-| dp_replicate_size | `int` | `-1` | Data parallel replicate size. |
+| dp_replicate_size | `int` | `-1` | Data parallel replicate size for both dense and moe parameters. |
 | dp_shard_size | `int` | `-1` | Data parallel shard degree. |
 | tp_size | `int` | `1` | Tensor parallel size. |
-| ep_size | `int` | `1` | Expert parallel size. |
+| ep_size | `int` | `1` | Expert parallel size, should be fit into dp_shard group if HSDP enabled |
 | ep_outside | `bool` | `False` | Expert parallelism outside in EP-FSDP. |
 | pp_size | `int` | `1` | Pipeline parallel size. |
 | ulysses_size | `int` | `1` | Ulysses sequence parallel size. |

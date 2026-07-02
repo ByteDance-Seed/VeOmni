@@ -33,6 +33,11 @@ class SpecInfo:
     placement: Union[Shard, Replicate]
     fqn: str
     para_fsdp_mesh: DeviceMesh
+    # Tensor dim that FSDP2 shards this param along (set in ``torch_parallelize``
+    # after the ``shard_placement_fn`` is decided: 1 by default, 0 for the
+    # Muon zero-comm layout). Used by the checkpointer to build the correct
+    # DTensor placements when (re)storing the ExtraParallel dim.
+    fsdp_shard_dim: int = 1
 
     @property
     def para_mesh(self):
