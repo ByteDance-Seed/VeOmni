@@ -304,12 +304,26 @@ def get_offload_modules(model, plan: List[str]):
     return matched_submodules
 
 
-def async_offload_modules(modules):
+def async_offload_modules(modules, use_call_level=True):
+    """Apply async activation offload to matched modules.
+
+    Args:
+        modules: List of [name, module, layer_idx, depth]
+        use_call_level: If True, patches ``__call__`` so that ``saved_tensors_hooks``
+            wraps the ``checkpoint`` call emitted by ``GradientCheckpointingLayer``.
+            This is required when the model's gradient checkpointing is driven from
+            ``__call__`` (VeOmni / transformers >= 5 default).
+            If False, patches ``forward`` directly (legacy behaviour, compatible with
+            MindSpeed-MM's explicit ``recompute_wrapper`` pattern).
+    """
     for name, module, layer_idx, depth in modules:
         logger.info_rank0(
             f"Applying activation offload to module: {name}, offload idx: {layer_idx}, offload_layers_num: {depth}"
         )
-        module.forward = with_async_save_on_cpu(name, layer_idx, depth)(module.forward)
+        if use_call_level:
+            module.__call__ = with_async_save_on_cpu(name, layer_idx, depth)(module.__call__)
+        else:
+            module.forward = with_async_save_on_cpu(name, layer_idx, depth)(module.forward)
 
 
 def with_async_save_on_cpu(module_name, layer_idx, depth, prefetch=True, hidden_states_idx=0):
@@ -348,7 +362,18 @@ def with_async_save_on_cpu(module_name, layer_idx, depth, prefetch=True, hidden_
 
 
 def apply_async_activation_offload(model, activation_offload_modules: List[str]):
+    """Apply async activation offload to matched submodules.
+
+    Patches ``__call__`` by default so that ``saved_tensors_hooks`` wraps the
+    ``GradientCheckpointingLayer`` checkpoint boundary, correctly intercepting
+    hidden states saved for backward recomputation.
+
+    Set ``VEOMNI_OFFLOAD_FORWARD_LEVEL=1`` to revert to the legacy forward-level
+    patching (compatible with models that do NOT use ``GradientCheckpointingLayer``).
+    """
     if not activation_offload_modules:
         return
+    import os
+    use_call_level = os.environ.get("VEOMNI_OFFLOAD_FORWARD_LEVEL", "0") != "1"
     matched_modules = get_offload_modules(model, activation_offload_modules)
-    async_offload_modules(matched_modules)
+    async_offload_modules(matched_modules, use_call_level=use_call_level)
