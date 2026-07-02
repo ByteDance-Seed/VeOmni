@@ -225,14 +225,31 @@ NPU validation runs at two times:
 | eval_steps | `int` | `0` | Steps between evaluations. `0` to disable. |
 | eval_epochs | `int` | `1` | Epochs between evaluations. `0` to disable. |
 | seed | `int` | `42` | Random seed. |
-| enable_compile | `bool` | `False` | Enable `torch.compile`. |
+| enable_compile | `bool` | `False` | Deprecated alias for `train.torch_compile.enable`. |
+| compile_backend | `Optional[str]` | `None` | Deprecated alias for `train.torch_compile.backend`. |
+| compile_mode | `Optional[str]` | `None` | Deprecated alias for `train.torch_compile.mode`. |
+| compile_fullgraph | `Optional[bool]` | `None` | Deprecated alias for `train.torch_compile.fullgraph`. |
+| compile_dynamic | `Optional[bool]` | `None` | Deprecated alias for `train.torch_compile.dynamic`. |
 | max_steps | `Optional[int]` | `None` | Max training steps per epoch (debug only). |
 | optimizer | `OptimizerConfig` | — | Optimizer and learning-rate schedule. |
 | wandb | `WandbConfig` | — | Weights & Biases logging. |
 | profile | `ProfileConfig` | — | Torch profiler settings. |
 | gradient_checkpointing | `GradientCheckpointingConfig` | — | Gradient checkpointing settings. |
+| torch_compile | `TorchCompileConfig` | — | Per-block `torch.compile` settings. |
 | accelerator | `AcceleratorConfig` | — | Parallelism and distributed-training topology. |
 | checkpoint | `CheckpointConfig` | — | Checkpoint saving and loading. |
+
+### TorchCompileConfig
+
+`train.torch_compile.*` — Per-block `torch.compile` options for CUDA Graph friendly text training. This path currently supports text trainers only and requires `train.dyn_bsz=True` plus `train.pad_to_length=True`, so packed inputs have stable shapes. Training steps call `torch.compiler.cudagraph_mark_step_begin()` when available so CUDA Graph Trees can separate iterations.
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| enable | `bool` | `False` | Enable per-block `torch.compile` on FSDP2 leaf target modules. |
+| backend | `Optional[str]` | `None` | Backend passed to `torch.compile`; `None` uses PyTorch's default backend. |
+| mode | `Optional[str]` | `"reduce-overhead"` | Mode passed to `torch.compile`; `"reduce-overhead"` enables CUDA Graphs when possible. |
+| fullgraph | `bool` | `False` | Whether to pass `fullgraph=True` to `torch.compile`. |
+| dynamic | `bool` | `False` | Whether to pass `dynamic=True` to `torch.compile`. |
 
 ### OptimizerConfig
 

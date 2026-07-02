@@ -27,6 +27,7 @@ from ..data.data_collator import PostCollator
 from ..distributed.clip_grad_norm import veomni_clip_grad_norm
 from ..distributed.parallel_state import get_parallel_state
 from ..distributed.sequence_parallel import gather_outputs
+from ..distributed.torch_compile import mark_compile_step_begin
 from ..distributed.torch_parallelize import build_parallelize_model
 from ..models import build_foundation_model, build_tokenizer
 from ..ops.batch_invariant_ops import set_batch_invariant_mode
@@ -334,6 +335,7 @@ class TextDPOTrainer:
         args: VeOmniDPOArguments = self.base.args
         self.base.state.global_step += 1
 
+        mark_compile_step_begin(getattr(self.base.model, "_veomni_compile_enabled", False))
         micro_batches: List[Dict[str, Any]] = next(data_iterator)
 
         self.on_step_begin(micro_batches=micro_batches)

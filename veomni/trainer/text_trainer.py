@@ -23,6 +23,7 @@ from ..data import (
     build_data_transform,
 )
 from ..distributed.clip_grad_norm import veomni_clip_grad_norm
+from ..distributed.torch_compile import mark_compile_step_begin
 from ..models import build_tokenizer
 from ..utils import helper
 from ..utils.device import synchronize
@@ -107,6 +108,7 @@ class TextTrainer:
         args: VeOmniArguments = self.base.args
         self.base.state.global_step += 1
 
+        mark_compile_step_begin(getattr(self.base.model, "_veomni_compile_enabled", False))
         micro_batches: List[Dict[str, Any]] = next(data_iterator)
 
         self.on_step_begin(micro_batches=micro_batches)
