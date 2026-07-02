@@ -90,10 +90,7 @@ jobs:
       # 5 min so a slow link doesn't fail the whole sync.
       UV_HTTP_TIMEOUT: "300"
       # CANN 9.0.0 HCCL: force localhost to avoid Docker bridge EI0015.
-      # HCCL_IF_BASE_PORT to pin sub-communicator ports (workaround for
-      # random-port integer overflow bug producing port 65536).
       HCCL_SOCKET_IFNAME: "lo"
-      HCCL_IF_BASE_PORT: "60000"
 
     steps:
       - name: Set ASCEND_VISIBLE_DEVICES from runner slice
