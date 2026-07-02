@@ -100,8 +100,6 @@ jobs:
       HCCL_ASYNC_ERROR_HANDLING: "0"
 
     steps:
-      - name: Reserve HCCL ports (Ascend single-node requirement)
-        run: sysctl -w net.ipv4.ip_local_reserved_ports=60000-61050
       - name: Set ASCEND_VISIBLE_DEVICES from runner slice
         # See npu_unit_tests.yml for the full rationale. We match the runner
         # name (910b-0 .. 910b-5) and map even slices to cards 0-7, odd slices

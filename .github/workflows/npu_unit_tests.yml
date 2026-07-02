@@ -103,8 +103,6 @@ jobs:
       HCCL_ASYNC_ERROR_HANDLING: "0"
 
     steps:
-      - name: Reserve HCCL ports (Ascend single-node requirement)
-        run: sysctl -w net.ipv4.ip_local_reserved_ports=60000-61050
       - name: Set ASCEND_VISIBLE_DEVICES from runner slice
         # Runner name is either:
         #   - exposed as $RUNNER_NAME by the GitHub Actions runner directly (same
