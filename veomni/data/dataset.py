@@ -987,6 +987,10 @@ class DynamicBatchingSizeDataset(IterableDataset):
         # Keep the most recent real micro batch around so infinity_padding has a template
         # to deep-copy padding batches from after the source is exhausted.
         last_micro_batch = None
+        # Guards infinity: if a restart is immediately followed by StopIteration (upstream
+        # is empty), we'd spin forever burning CPU. Set on restart, cleared once next()
+        # yields anything; a StopIteration while still set means the source is empty.
+        just_restarted = False
 
         while True:
             try:
@@ -1009,6 +1013,7 @@ class DynamicBatchingSizeDataset(IterableDataset):
                         logger.warning("dynamic_batching_collate_fn returned None, skip this micro_batch")
 
                 item = next(self._data_iter)
+                just_restarted = False  # upstream produced data, so it isn't empty
                 if self.save_by_idx:
                     item, output_index = item
                 else:
@@ -1039,9 +1044,15 @@ class DynamicBatchingSizeDataset(IterableDataset):
             except Exception as e:
                 if isinstance(e, StopIteration):
                     if self._infinity:
+                        if just_restarted:
+                            raise RuntimeError(
+                                "infinity=True but the upstream dataset produced nothing after a restart; "
+                                "refusing to spin forever on an empty dataset."
+                            ) from None
                         # Restart the upstream dataset and keep going forever; the buffer is
                         # preserved so batching continues to accumulate across epochs.
                         self._data_iter = iter(self.dataset)
+                        just_restarted = True
                         continue
 
                     # Drain the remaining buffered samples into micro batches.
@@ -1063,10 +1074,12 @@ class DynamicBatchingSizeDataset(IterableDataset):
                             return
                         # Keep yielding padding micro batches forever; downstream groups them
                         # into num_micro_batch-sized steps and loss accounting skips them via
-                        # the padding_flag marker.
+                        # the padding_flag marker. One deep copy suffices: downstream is
+                        # read-only on the yielded batch (preforward rebuilds a new dict and
+                        # moves tensors to device before the model sees them).
+                        padding_batch = copy.deepcopy(last_micro_batch)
+                        padding_batch["padding_flag"] = True
                         while True:
-                            padding_batch = copy.deepcopy(last_micro_batch)
-                            padding_batch["padding_flag"] = True
                             yield padding_batch
 
                     return
