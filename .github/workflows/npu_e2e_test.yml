@@ -89,12 +89,15 @@ jobs:
       # while pulling large wheels (e.g. torch-npu, virtualenv); bump to
       # 5 min so a slow link doesn't fail the whole sync.
       UV_HTTP_TIMEOUT: "300"
-      # CANN 9.0.0 HCCL: localhost to avoid Docker bridge EI0015,
-      # max port range to prevent random allocator overflow to 65536.
+      # CANN 9.0.0 HCCL: HCCL_IF_BASE_PORT per Ascend FAQ (not HOST_SOCKET_PORT_RANGE
+      # which ignores A2 MC² constraint). lo to avoid Docker bridge EI0015.
+      # Ref: https://www.hiascend.com/document/detail/zh/Pytorch/700/comref/comaq/commonqa_0029.html
       HCCL_SOCKET_IFNAME: "lo"
-      HCCL_HOST_SOCKET_PORT_RANGE: "60000-65535"
+      HCCL_IF_BASE_PORT: "60000"
 
     steps:
+      - name: Reserve HCCL ports (per Ascend FAQ)
+        run: sysctl -w net.ipv4.ip_local_reserved_ports=60000-60015
       - name: Set ASCEND_VISIBLE_DEVICES from runner slice
         # See npu_unit_tests.yml for the full rationale. We match the runner
         # name (910b-0 .. 910b-5) and map even slices to cards 0-7, odd slices
