@@ -249,9 +249,9 @@ if __name__ == "__main__":
     main()
 
 
-def _run_trainer_saveload_and_verify(model_name: str, ep_size: int):
-    exec_command = get_checkpoint_test_command(model_name, ep_size)
-    merge_command = get_merge_dcp_to_hf_command(model_name, ep_size)
+def _run_trainer_saveload_and_verify(model_name: str, ep_size: int, dp_replicate_size: Optional[int] = None):
+    exec_command = get_checkpoint_test_command(model_name, ep_size, dp_replicate_size=dp_replicate_size)
+    merge_command = get_merge_dcp_to_hf_command(model_name, ep_size, dp_replicate_size=dp_replicate_size)
 
     exec_result = subprocess.run(exec_command, shell=True, check=True)
     assert exec_result.returncode == 0
@@ -260,12 +260,15 @@ def _run_trainer_saveload_and_verify(model_name: str, ep_size: int):
     assert merge_result.returncode == 0
 
     assert verify_dcp_to_hf_conversion(
-        dcp_checkpoint_dir=get_checkpoint_dir(model_name, ep_size),
-        hf_checkpoint_dir=get_hf_output_dir(model_name, ep_size),
+        dcp_checkpoint_dir=get_checkpoint_dir(model_name, ep_size, dp_replicate_size),
+        hf_checkpoint_dir=get_hf_output_dir(model_name, ep_size, dp_replicate_size),
         safe_serialization=True,
-    ), f"Save and Load Checkpoint failed for `{model_name}` with ep_size `{ep_size}`"
+    ), (
+        f"Save and Load Checkpoint failed for `{model_name}` with ep_size `{ep_size}` "
+        f"and dp_replicate_size `{dp_replicate_size}`"
+    )
 
-    shutil.rmtree(get_output_dir(model_name, ep_size))
+    shutil.rmtree(get_output_dir(model_name, ep_size, dp_replicate_size))
 
 
 def _run_trainer_save_hf_safetensor(model_name: str, ep_size: int):
@@ -284,6 +287,17 @@ TEST_EP_SIZES = [1, 4, 8]
 @pytest.mark.parametrize("model_name,ep_size", [(model, ep) for model in TEST_MODELS for ep in TEST_EP_SIZES])
 def test_trainer_saveload(model_name: str, ep_size: int):
     _run_trainer_saveload_and_verify(model_name, ep_size)
+
+
+# HSDP save/load coverage on 8 GPUs: dp = (dp_replicate=2, dp_shard=4). This
+# makes the expert mesh 3D (ep_replicate, ep_fsdp, ep) and exercises the
+# 3-placement restore/drop path in the DCP checkpointer end-to-end (train ->
+# DCP save -> load -> compare golden state dicts, plus DCP->HF merge). Cases:
+#   * ep2: ep mesh (2, 2, 2) — all three dims active (ep_fsdp > 1).
+#   * ep4: ep mesh (2, 1, 4) — degenerate ep_fsdp.
+@pytest.mark.parametrize("ep_size", [2, 4])
+def test_trainer_saveload_hsdp(ep_size: int):
+    _run_trainer_saveload_and_verify("qwen3_moe", ep_size, dp_replicate_size=2)
 
 
 @pytest.mark.parametrize("ep_size", TEST_EP_SIZES)

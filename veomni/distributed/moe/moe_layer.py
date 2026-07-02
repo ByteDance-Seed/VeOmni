@@ -27,6 +27,23 @@ if not is_torch_npu_available():
     from ...ops.kernels.moe._kernels.kernel.group_gemm import group_gemm_same_mn, group_gemm_same_nk
 
 
+def _apply_swiglu_clamp(fc1_1_output, fc1_2_output, swiglu_limit):
+    """gpt-oss / DeepSeek-V4 style clamped SwiGLU pre-activation.
+
+    Returns ``(fc1_1_clamped, fc1_2_clamped, mask_fc1_1, mask_fc1_2)``.
+    No-op (and returns ``None`` masks) when ``swiglu_limit is None``.
+    Mirrors the helper in ``ops/kernels/moe/group_gemm.py`` to keep this
+    module free of circular imports.
+    """
+    if swiglu_limit is None:
+        return fc1_1_output, fc1_2_output, None, None
+    mask_fc1_1 = fc1_1_output <= swiglu_limit
+    mask_fc1_2 = (fc1_2_output >= -swiglu_limit) & (fc1_2_output <= swiglu_limit)
+    fc1_1_output = fc1_1_output.clamp(max=swiglu_limit)
+    fc1_2_output = fc1_2_output.clamp(min=-swiglu_limit, max=swiglu_limit)
+    return fc1_1_output, fc1_2_output, mask_fc1_1, mask_fc1_2
+
+
 def preprocess(
     expert_mask: torch.Tensor,
     num_experts: int,
@@ -146,6 +163,7 @@ class EPGroupGemm(torch.autograd.Function):
         fc1_1_weight,
         fc1_2_weight,
         fc2_weight,
+        swiglu_limit=None,
     ):
         # permute_tokens: [tokens, hidden_dim]
         # cumsum: [local_experts]
@@ -170,6 +188,13 @@ class EPGroupGemm(torch.autograd.Function):
             transpose_b=True,
         )
 
+        # gpt-oss / DeepSeek-V4 style clamped SwiGLU pre-activation. No-op when
+        # swiglu_limit is None (legacy MoE models) — masks are None and the
+        # ``if swiglu_limit is not None`` guards in backward are skipped.
+        fc1_1_output, fc1_2_output, mask_fc1_1, mask_fc1_2 = _apply_swiglu_clamp(
+            fc1_1_output, fc1_2_output, swiglu_limit
+        )
+
         # compute the actication of linear layer fc1-1
         fc1_1_activation = torch.ops.aten.silu(fc1_1_output)
 
@@ -187,6 +212,7 @@ class EPGroupGemm(torch.autograd.Function):
             transpose_b=True,
         )
 
+        ctx.swiglu_limit = swiglu_limit
         ctx.save_for_backward(
             permute_tokens,
             cumsum,
@@ -195,6 +221,8 @@ class EPGroupGemm(torch.autograd.Function):
             fc2_weight,
             fc1_1_output,
             fc1_2_output,
+            mask_fc1_1 if mask_fc1_1 is not None else torch.empty(0, device=permute_tokens.device),
+            mask_fc1_2 if mask_fc1_2 is not None else torch.empty(0, device=permute_tokens.device),
         )
 
         return fc2_output
@@ -210,7 +238,10 @@ class EPGroupGemm(torch.autograd.Function):
             fc2_weight,
             fc1_1_output,
             fc1_2_output,
+            mask_fc1_1,
+            mask_fc1_2,
         ) = ctx.saved_tensors
+        swiglu_limit = ctx.swiglu_limit
         # permute_tokens: [tokens, hidden_dim]
         # cumsum: [local_experts]
 
@@ -244,6 +275,9 @@ class EPGroupGemm(torch.autograd.Function):
         grad_fc1_2_output = fc1_1_activation * grad_fc1_output
         grad_fc1_1_activation = grad_fc1_output * fc1_2_output
 
+        if swiglu_limit is not None:
+            grad_fc1_2_output.masked_fill_(~mask_fc1_2, 0)
+
         # dgrad output 2
         grad_scatter_output_2 = group_gemm_same_nk(
             a=grad_fc1_2_output,
@@ -268,6 +302,8 @@ class EPGroupGemm(torch.autograd.Function):
             )
 
         grad_fc1_1_output = torch.ops.aten.silu_backward(grad_fc1_1_activation, fc1_1_output)
+        if swiglu_limit is not None:
+            grad_fc1_1_output.masked_fill_(~mask_fc1_1, 0)
 
         # dgrad output 1
         grad_scatter_output_1 = group_gemm_same_nk(
@@ -301,6 +337,7 @@ class EPGroupGemm(torch.autograd.Function):
             grad_fc1_1_weight,  # fc1_1_weight
             grad_fc1_2_weight,  # fc1_2_weight
             grad_fc2_weight,  # fc2_weight
+            None,  # swiglu_limit
         )
 
 
@@ -317,6 +354,7 @@ class EPMergedFc1GroupGemm(torch.autograd.Function):
         cumsum,
         fc1_1_2_weight,
         fc2_weight,
+        swiglu_limit=None,
     ):
         # permute_tokens: [tokens, hidden_dim]
         # cumsum: [local_experts]
@@ -337,6 +375,13 @@ class EPMergedFc1GroupGemm(torch.autograd.Function):
         # chunk is a view, no copy
         fc1_1_output, fc1_2_output = fc1_output.chunk(2, dim=-1)
 
+        # gpt-oss / DeepSeek-V4 style clamped SwiGLU pre-activation. ``_apply_swiglu_clamp``
+        # creates new tensors when ``swiglu_limit is not None`` so the saved halves are
+        # independent of ``fc1_output`` storage; otherwise it is a no-op.
+        fc1_1_output, fc1_2_output, mask_fc1_1, mask_fc1_2 = _apply_swiglu_clamp(
+            fc1_1_output, fc1_2_output, swiglu_limit
+        )
+
         # compute the activation of linear layer fc1-1
         fc1_1_activation = torch.ops.aten.silu(fc1_1_output)
 
@@ -353,6 +398,7 @@ class EPMergedFc1GroupGemm(torch.autograd.Function):
             transpose_b=True,
         )
 
+        ctx.swiglu_limit = swiglu_limit
         ctx.save_for_backward(
             permute_tokens,
             cumsum,
@@ -360,6 +406,8 @@ class EPMergedFc1GroupGemm(torch.autograd.Function):
             fc2_weight,
             fc1_1_output,
             fc1_2_output,
+            mask_fc1_1 if mask_fc1_1 is not None else torch.empty(0, device=permute_tokens.device),
+            mask_fc1_2 if mask_fc1_2 is not None else torch.empty(0, device=permute_tokens.device),
         )
 
         return fc2_output
@@ -373,7 +421,10 @@ class EPMergedFc1GroupGemm(torch.autograd.Function):
             fc2_weight,
             fc1_1_output,
             fc1_2_output,
+            mask_fc1_1,
+            mask_fc1_2,
         ) = ctx.saved_tensors
+        swiglu_limit = ctx.swiglu_limit
 
         # recompute
         fc1_1_activation = torch.ops.aten.silu(fc1_1_output)
@@ -407,6 +458,10 @@ class EPMergedFc1GroupGemm(torch.autograd.Function):
         grad_fc1_1_activation = grad_fc1_result * fc1_2_output
         grad_fc1_1_output = torch.ops.aten.silu_backward(grad_fc1_1_activation, fc1_1_output)
 
+        if swiglu_limit is not None:
+            grad_fc1_1_output.masked_fill_(~mask_fc1_1, 0)
+            grad_fc1_2_output.masked_fill_(~mask_fc1_2, 0)
+
         # Merge grads back to [T, 2I]
         grad_fc1_output = torch.cat([grad_fc1_1_output, grad_fc1_2_output], dim=-1)
 
@@ -438,4 +493,5 @@ class EPMergedFc1GroupGemm(torch.autograd.Function):
             None,  # cumsum
             grad_fc1_1_2_weight,  # fc1_1_2_weight
             grad_fc2_weight,  # fc2_weight
+            None,  # swiglu_limit
         )
