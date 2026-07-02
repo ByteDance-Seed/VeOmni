@@ -2,15 +2,19 @@
 
 from __future__ import annotations
 
+import shutil
 from typing import Any
 
 import torch
 
+from veomni.utils.device import get_device_id, get_device_type
+
 from ....mixins.modulemixin import CPUPreprocessor, ModuleMixin, post_forward, pre_forward
+from ....mixins.offline_encoding import OfflineEncodingMixin
 from ....utils.conversation import ConversationItem, is_dummy, iter_desired_items
 from ..sources import BAGEL_GENERATED_LATENT, BAGEL_VAE_CONTEXT
 from .configuration import BagelVAEConfig
-from .processing import crop_latent_to_image_shape
+from .processing import crop_latent_to_image_shape, route_image_sources
 
 
 BAGEL_VAE_PIXEL_SHAPE = "bagel_vae_pixel_shape"
@@ -30,7 +34,9 @@ class BagelVAECPUPreprocessor(CPUPreprocessor):
         inference: bool = False,
         generation_kwargs: dict[str, Any] | None = None,
     ) -> None:
-        del inference, generation_kwargs
+        infer_type = None if generation_kwargs is None else generation_kwargs.get("infer_type")
+        route_image_sources(conversation_list, inference=inference, infer_type=infer_type)
+
         image_items = []
         for item in iter_desired_items(conversation_list, types=["image"], sources=[BAGEL_VAE_CONTEXT]):
             if not is_dummy(item):
@@ -47,7 +53,7 @@ class BagelVAECPUPreprocessor(CPUPreprocessor):
             item.meta[BAGEL_VAE_PIXEL_SHAPE] = pixel_shape.to(dtype=torch.long)
 
 
-class BagelVAEModuleMixin(ModuleMixin):
+class BagelVAEModuleMixin(OfflineEncodingMixin, ModuleMixin):
     """Carrier hooks for raw-image VAE encode and latent decode."""
 
     config: BagelVAEConfig
@@ -60,6 +66,10 @@ class BagelVAEModuleMixin(ModuleMixin):
         self._decode_is_dummy = False
 
     def build_cpu_preprocessor(self) -> CPUPreprocessor | None:
+        # Full training and offline-cache production preprocess raw images here;
+        # process-only training reads preprocessed cached conversations instead.
+        if self.cache_mode == "process_only":
+            return None
         if getattr(self, "_image_processor", None) is None:
             return None
         return BagelVAECPUPreprocessor(self._image_processor, self.dtype)
@@ -86,11 +96,12 @@ class BagelVAEModuleMixin(ModuleMixin):
         )
         outputs = self.encode(pixel_values=pixel_values)
         for image_item, latent in zip(image_items, outputs["latents"], strict=True):
-            image_item.value = crop_latent_to_image_shape(
+            latent = crop_latent_to_image_shape(
                 latent,
                 image_item.meta.get(BAGEL_VAE_PIXEL_SHAPE),
                 downsample=int(self.config.downsample),
-            ).to(device=self.device, dtype=self.dtype)
+            )
+            image_item.value = latent.to(device=self.device, dtype=self.dtype)
             image_item.source = BAGEL_VAE_CONTEXT
         return {"conversation_list": conversation_list}
 
@@ -130,7 +141,7 @@ class BagelVAEModuleMixin(ModuleMixin):
 
     # ── Training hooks ──────────────────────────────────
 
-    @pre_forward("encode")
+    @pre_forward("encode", "offline_encode")
     def encode_pre(
         self,
         conversation_list: list[list[ConversationItem]] | None = None,
@@ -150,8 +161,8 @@ class BagelVAEModuleMixin(ModuleMixin):
         )
         return {"pixel_values": pixel_values}
 
-    @post_forward("encode")
-    def encode_post(self, latents: torch.Tensor) -> dict[str, Any]:
+    @post_forward("encode", "online_process")
+    def encode_post(self, latents: torch.Tensor | list[torch.Tensor]) -> dict[str, Any]:
         conversation = self._conversation_carrier
         encode_items = self._encode_items
         encode_is_dummy = self._encode_is_dummy
@@ -161,6 +172,8 @@ class BagelVAEModuleMixin(ModuleMixin):
 
         if encode_is_dummy:
             if conversation is not None:
+                if isinstance(latents, list):
+                    latents = latents[0]
                 value = latents.squeeze(0) if latents.dim() == 4 and latents.shape[0] == 1 else latents
                 for sample in conversation:
                     sample.append(
@@ -174,15 +187,73 @@ class BagelVAEModuleMixin(ModuleMixin):
                     )
             return {"conversation_list": conversation}
 
-        for item, latent in zip(encode_items, latents, strict=True):
+        if isinstance(latents, list):
+            for item, latent in zip(encode_items, latents, strict=True):
+                item.type = "image"
+                item.value = latent
+                item.source = BAGEL_VAE_CONTEXT
+        else:
+            for item, latent in zip(encode_items, latents, strict=True):
+                item.type = "image"
+                latent = crop_latent_to_image_shape(
+                    latent,
+                    item.meta.get(BAGEL_VAE_PIXEL_SHAPE),
+                    downsample=int(self.config.downsample),
+                )
+                item.value = latent
+                item.source = BAGEL_VAE_CONTEXT
+        return {"conversation_list": conversation}
+
+    @post_forward("offline_encode")
+    def offline_encode_post(self, encoded_cache: torch.Tensor) -> dict[str, Any]:
+        conversation = self._conversation_carrier
+        encode_items = self._encode_items
+        encode_is_dummy = self._encode_is_dummy
+        self._conversation_carrier = None
+        self._encode_items = []
+        self._encode_is_dummy = False
+
+        if encode_is_dummy:
+            return {"conversation_list": conversation}
+
+        for item, cache_tensor in zip(encode_items, encoded_cache, strict=True):
             item.type = "image"
-            item.value = crop_latent_to_image_shape(
-                latent,
+            cache_tensor = crop_latent_to_image_shape(
+                cache_tensor,
                 item.meta.get(BAGEL_VAE_PIXEL_SHAPE),
                 downsample=int(self.config.downsample),
-            ).to(device=self.device, dtype=self.dtype)
+            )
+            z_channels = int(self.config.z_channels)
+            if cache_tensor.dim() == 3 and int(cache_tensor.shape[0]) == 2 * z_channels:
+                cache_tensor = cache_tensor.reshape(2, z_channels, *cache_tensor.shape[-2:])
+            item.value = cache_tensor.detach().to(device=self.device, dtype=self.dtype)
             item.source = BAGEL_VAE_CONTEXT
+            item.meta = {}
         return {"conversation_list": conversation}
+
+    @pre_forward("online_process")
+    def online_process_pre(
+        self,
+        conversation_list: list[list[ConversationItem]] | None = None,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        del kwargs
+        self._conversation_carrier = conversation_list
+        self._encode_items = []
+        self._encode_is_dummy = False
+
+        self._encode_items = self._select_vae_posterior_cache_items(conversation_list)
+        if not self._encode_items:
+            self._encode_is_dummy = True
+            return self.dummy_inputs(kind="online_process")
+
+        encoded_cache: list[torch.Tensor] = []
+        for item in self._encode_items:
+            cache = item.value
+            if not torch.is_tensor(cache):
+                raise ValueError("BAGEL VAE online_process requires tensor posterior cache.")
+            encoded_cache.append(cache.detach().to(device=self._online_process_device()))
+        return {"encoded_cache": encoded_cache}
 
     @pre_forward("decode")
     def decode_pre(
@@ -237,6 +308,20 @@ class BagelVAEModuleMixin(ModuleMixin):
                 )
             }
 
+        if kind == "online_process":
+            size = max(1, int(self.config.resolution) // max(int(self.config.downsample), 1))
+            return {
+                "encoded_cache": torch.zeros(
+                    1,
+                    2,
+                    int(self.config.z_channels),
+                    size,
+                    size,
+                    device=self._online_process_device(),
+                    dtype=self._online_process_dtype(),
+                ),
+            }
+
         size = max(int(self.config.image_stride), int(self.config.downsample))
         return {
             "pixel_values": torch.zeros(
@@ -257,6 +342,23 @@ class BagelVAEModuleMixin(ModuleMixin):
             if not is_dummy(item):
                 encode_items.append(item)
         return encode_items
+
+    def _select_vae_posterior_cache_items(
+        self, conversation_list: list[list[ConversationItem]] | None
+    ) -> list[ConversationItem]:
+        if conversation_list is None:
+            raise ValueError("BagelVAE online_process requires conversation_list to select posterior cache items.")
+
+        cached_items: list[ConversationItem] = []
+        for item in iter_desired_items(
+            conversation_list,
+            types=["image"],
+            sources=[BAGEL_VAE_CONTEXT],
+        ):
+            if is_dummy(item):
+                continue
+            cached_items.append(item)
+        return cached_items
 
     def _select_vae_decode_items(
         self, conversation_list: list[list[ConversationItem]] | None
@@ -287,5 +389,28 @@ class BagelVAEModuleMixin(ModuleMixin):
                 image_items.append(item)
         return image_items
 
+    def _online_process_dtype(self) -> torch.dtype:
+        config_dtype = getattr(self.config, "dtype", None) or getattr(self.config, "torch_dtype", None)
+        if isinstance(config_dtype, torch.dtype):
+            return config_dtype
+        if isinstance(config_dtype, str) and hasattr(torch, config_dtype):
+            dtype = getattr(torch, config_dtype)
+            if isinstance(dtype, torch.dtype):
+                return dtype
+        return torch.get_default_dtype()
 
-__all__ = ["BAGEL_VAE_PIXEL_SHAPE", "BagelVAECPUPreprocessor", "BagelVAEModuleMixin"]
+    def _online_process_device(self) -> torch.device:
+        device_type = get_device_type()
+        if device_type == "cpu":
+            return torch.device("cpu")
+        return torch.device(device_type, get_device_id())
+
+    def save_full_hf_checkpoint(self, output_dir: str, *, source_path: str, trainer: Any, state: Any) -> None:
+        del trainer, state
+        shutil.copytree(source_path, output_dir, dirs_exist_ok=True)
+
+
+__all__ = [
+    "BagelVAECPUPreprocessor",
+    "BagelVAEModuleMixin",
+]

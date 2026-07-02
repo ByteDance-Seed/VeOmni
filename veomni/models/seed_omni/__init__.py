@@ -26,6 +26,7 @@ from .graphs.graph import END, EdgeDef, NodeDef
 from .graphs.training_graph import TrainingGraph
 from .mixins.metric_meter_mixin import MetricMeterMixin
 from .mixins.modulemixin import ModuleMixin
+from .mixins.offline_encoding import OfflineEncodingConfigMixin, OfflineEncodingMixin
 from .modeling_omni import OmniModel
 from .modules import (
     OMNI_CONFIG_REGISTRY,
@@ -43,6 +44,8 @@ __all__ = [
     "OmniModel",
     "ModuleMixin",
     "MetricMeterMixin",
+    "OfflineEncodingConfigMixin",
+    "OfflineEncodingMixin",
     "TrainingGraph",
     "GenerationGraph",
     "NodeDef",

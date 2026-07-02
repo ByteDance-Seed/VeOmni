@@ -77,6 +77,7 @@ def test_bagel_training_flow_metadata_matches_packed_noising_dtype():
 
 
 def test_bagel_vae_infer_encode_updates_vae_context_image_in_place():
+    from veomni.models.seed_omni.modules.bagel.vae.modulemixin import BAGEL_VAE_PIXEL_SHAPE
     from veomni.models.seed_omni.modules.bagel.vae.processing import BagelVAEProcessor
 
     BagelVAE = model_cls("bagel_vae")
@@ -88,6 +89,7 @@ def test_bagel_vae_infer_encode_updates_vae_context_image_in_place():
             ch_mult=[1],
             num_res_blocks=1,
             z_channels=2,
+            downsample=4,
             max_image_size=8,
             min_image_size=8,
             image_stride=4,
@@ -104,6 +106,7 @@ def test_bagel_vae_infer_encode_updates_vae_context_image_in_place():
         value=image.clone(),
         role="user",
         source=BAGEL_VAE_CONTEXT,
+        meta={BAGEL_VAE_PIXEL_SHAPE: torch.tensor([8, 4])},
     )
     siglip_context = ConversationItem(type="image", value=image, role="user")
     conversation = [
@@ -119,8 +122,8 @@ def test_bagel_vae_infer_encode_updates_vae_context_image_in_place():
     assert conversation[0] is vae_context
     assert conversation[0].role == "user"
     assert conversation[0].source == BAGEL_VAE_CONTEXT
-    assert conversation[0].meta == {}
-    assert conversation[0].value.shape == (2, 2, 2)
+    assert torch.equal(conversation[0].meta[BAGEL_VAE_PIXEL_SHAPE], torch.tensor([8, 4]))
+    assert conversation[0].value.shape == (2, 2, 1)
     assert conversation[1] is siglip_context
     assert conversation[1].value is image
 
@@ -147,7 +150,114 @@ def test_bagel_vae_training_encode_marks_context_latent_source():
     assert out["conversation_list"] is conversation
     assert item.type == "image"
     assert item.source == BAGEL_VAE_CONTEXT
+    assert item.meta == {}
     assert item.value.shape == (2, 2, 2)
+
+
+def test_bagel_vae_offline_encode_reuses_training_encode_hooks():
+    BagelVAE = model_cls("bagel_vae")
+    BagelVAEConfig = config_cls("bagel_vae")
+    model = BagelVAE(
+        BagelVAEConfig(
+            resolution=8,
+            ch=32,
+            ch_mult=[1],
+            num_res_blocks=1,
+            z_channels=2,
+        )
+    )
+    item = ConversationItem(
+        type="image",
+        value=torch.zeros(3, 8, 8),
+        role="assistant",
+        source=BAGEL_VAE_CONTEXT,
+    )
+    conversation = [[item]]
+
+    pre = model.pre_forward("offline_encode", conversation_list=conversation)
+    assert pre["pixel_values"].shape == (1, 3, 8, 8)
+
+    out = model.post_forward("offline_encode", encoded_cache=torch.ones(1, 2, 2, 2, 2))
+
+    assert out["conversation_list"] is conversation
+    assert item.source == BAGEL_VAE_CONTEXT
+    assert item.meta == {}
+    assert item.value.shape == (2, 2, 2, 2)
+
+
+def test_bagel_vae_online_process_selects_cached_latents_by_source():
+    BagelVAE = model_cls("bagel_vae")
+    BagelVAEConfig = config_cls("bagel_vae")
+    model = BagelVAE(
+        BagelVAEConfig(
+            resolution=8,
+            ch=32,
+            ch_mult=[1],
+            num_res_blocks=1,
+            z_channels=2,
+        )
+    )
+    item = ConversationItem(
+        type="image",
+        value=torch.ones(2, 2, 2, 2),
+        role="assistant",
+        source=BAGEL_VAE_CONTEXT,
+    )
+    conversation = [[item]]
+
+    pre = model.pre_forward("online_process", conversation_list=conversation)
+    assert isinstance(pre["encoded_cache"], list)
+    assert len(pre["encoded_cache"]) == 1
+    assert torch.equal(pre["encoded_cache"][0], torch.ones_like(pre["encoded_cache"][0]))
+    assert pre["encoded_cache"][0].shape == (2, 2, 2, 2)
+
+    sampled_latents = [torch.ones(2, 2, 2, device=pre["encoded_cache"][0].device)]
+    post = model.post_forward("online_process", latents=sampled_latents)
+
+    assert post["conversation_list"] is conversation
+    assert item.source == BAGEL_VAE_CONTEXT
+    assert item.value.device == sampled_latents[0].device
+    assert torch.equal(item.value, torch.ones_like(item.value))
+
+
+def test_bagel_vae_cache_modes_do_not_construct_reg_and_process_only_has_no_codec() -> None:
+    BagelVAE = model_cls("bagel_vae")
+    BagelVAEConfig = config_cls("bagel_vae")
+
+    full = BagelVAE(
+        BagelVAEConfig(
+            resolution=8,
+            ch=32,
+            ch_mult=[1],
+            num_res_blocks=1,
+            z_channels=2,
+        )
+    )
+    process_only = BagelVAE(
+        BagelVAEConfig(
+            resolution=8,
+            ch=32,
+            ch_mult=[1],
+            num_res_blocks=1,
+            z_channels=2,
+            support_cache=True,
+            train_type="train_with_cache",
+        )
+    )
+
+    assert not hasattr(full, "reg")
+    assert hasattr(full, "encoder")
+    assert hasattr(full, "decoder")
+    assert not hasattr(process_only, "reg")
+    assert not hasattr(process_only, "encoder")
+    assert not hasattr(process_only, "decoder")
+
+    try:
+        process_only.encode(pixel_values=torch.zeros(1, 3, 8, 8))
+    except RuntimeError as exc:
+        assert "VAE encoder" in str(exc)
+    else:
+        raise AssertionError("expected process_only encode to require an encoder")
 
 
 def test_bagel_vae_training_encode_selects_source_routed_assistant_image():

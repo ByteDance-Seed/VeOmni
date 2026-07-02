@@ -37,8 +37,8 @@ sums them.  See ``docs/seed_omni/seed_omni_v2.md`` for the full contract.
 from typing import Any, Callable, Dict, List, Optional, Type
 
 
-def pre_forward(context: str) -> Callable[[Callable], Callable]:
-    """Decorator: register a **pre-hook** for the graph call-site ``context``.
+def pre_forward(*contexts: str) -> Callable[[Callable], Callable]:
+    """Decorator: register a **pre-hook** for one or more graph call-sites.
 
     Instead of one ``pre_forward(method, ...)`` that branches on ``method``, a
     module with multiple call-sites declares one hook per call-site, each tagged
@@ -51,20 +51,26 @@ def pre_forward(context: str) -> Callable[[Callable], Callable]:
         @pre_forward("decode")
         def decode_pre(self, conversation_list=None): ...
 
+        @pre_forward("encode", "offline_encode")
+        def encode_pre(self, conversation_list=None): ...
+
     The framework keeps calling :meth:`ModuleMixin.pre_forward` (the dispatcher),
     which routes to the hook whose ``context`` matches the node's method. A
     single-call-site module may still just override ``pre_forward`` directly.
     """
 
+    if not contexts:
+        raise ValueError("@pre_forward requires at least one context.")
+
     def decorator(fn: Callable) -> Callable:
-        fn._omni_pre_context = context
+        fn._omni_pre_context = tuple(contexts)
         return fn
 
     return decorator
 
 
-def post_forward(context: str) -> Callable[[Callable], Callable]:
-    """Decorator: register a **post-hook** for the graph call-site ``context``.
+def post_forward(*contexts: str) -> Callable[[Callable], Callable]:
+    """Decorator: register a **post-hook** for one or more graph call-sites.
 
     The post counterpart of :func:`pre_forward` — see it for the rationale::
 
@@ -72,8 +78,11 @@ def post_forward(context: str) -> Callable[[Callable], Callable]:
         def encode_post(self, **outputs): ...
     """
 
+    if not contexts:
+        raise ValueError("@post_forward requires at least one context.")
+
     def decorator(fn: Callable) -> Callable:
-        fn._omni_post_context = context
+        fn._omni_post_context = tuple(contexts)
         return fn
 
     return decorator
@@ -179,9 +188,10 @@ class ModuleMixin:
             registry = {}
             for klass in reversed(cls.__mro__):
                 for name, attr in vars(klass).items():
-                    ctx = getattr(attr, marker, None)
-                    if ctx is not None:
-                        registry[ctx] = name
+                    contexts = getattr(attr, marker, None)
+                    if contexts is not None:
+                        for ctx in contexts:
+                            registry[ctx] = name
             setattr(cls, cache_attr, registry)
         return registry.get(context)
 

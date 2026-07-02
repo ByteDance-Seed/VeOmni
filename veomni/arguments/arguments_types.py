@@ -1104,10 +1104,15 @@ class DataArguments:
             "help": "Number of samples for training to compute training steps for non-dynamic batch dataloader."
         },
     )
-    data_type: Literal["plaintext", "conversation", "diffusion", "classification", "dpo", "seedomni"] = field(
-        default="conversation",
-        metadata={"help": "Type of the training data."},
-    )
+    data_type: Literal[
+        "plaintext",
+        "conversation",
+        "diffusion",
+        "classification",
+        "dpo",
+        "seedomni",
+        "seedomni_cached",
+    ] = field(default="conversation", metadata={"help": "Type of the training data."})
     datasets_type: str = field(
         default="mapping",
         metadata={"help": "Type of the datasets."},
@@ -1159,10 +1164,10 @@ class DataArguments:
                 self.text_keys = "text"
             elif self.data_type == "dpo":
                 self.text_keys = "chosen"
-            elif self.data_type == "seedomni":
+            elif self.data_type in {"seedomni", "seedomni_cached"}:
                 # SeedOmni V2 modules own their own tokenization; the transform
                 # reads ``conversations`` / ``images`` columns directly and
-                # ignores ``text_keys``. Leave it unset.
+                # cached rows carry ``conversation_list`` directly. Leave it unset.
                 pass
             else:
                 raise ValueError(f"Unknown data type: {self.data_type}")

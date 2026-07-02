@@ -10,11 +10,7 @@ from transformers import PreTrainedTokenizerBase
 
 from ....utils.conversation import ConversationItem, is_dummy
 from ...base.text_encoder.chat_template import ChatMarkers, TextEncoderChatTemplate
-from ..sources import BAGEL_SIGLIP_CONTEXT, BAGEL_VAE_CONTEXT
-from .processing import (
-    copy_image_item,
-    is_bagel_vision_marker,
-)
+from .processing import is_bagel_vision_marker
 
 
 _OMNI_TOKENIZED = "_omni_tokenized"
@@ -87,9 +83,15 @@ class BagelChatTemplate(TextEncoderChatTemplate):
         inference: bool = False,
         generation_kwargs: dict[str, Any] | None = None,
     ) -> list[ConversationItem]:
-        infer_type = None if generation_kwargs is None else generation_kwargs.get("infer_type")
-        routed = self._route_prompt_context_images(sample, inference=inference, infer_type=infer_type)
-        return self._insert_prompt_context_image_markers(routed)
+        del inference, generation_kwargs
+
+        for item in sample:
+            if item.type == "text" and not is_bagel_vision_marker(item):
+                if not item.meta.get(_OMNI_TOKENIZED) and not torch.is_tensor(item.value):
+                    item.value = f"{self.chat_markers.bos_token}{item.value}{self.chat_markers.eos_token}"
+                    item.meta["loss_mask"] = int(item.role == "assistant")
+
+        return self._insert_prompt_context_image_markers(sample)
 
     def apply_generation_prompt(self, sample: list[ConversationItem]) -> list[ConversationItem]:
         return sample
@@ -129,49 +131,6 @@ class BagelChatTemplate(TextEncoderChatTemplate):
                 dtype=torch.long,
             )
         return token_ids
-
-    def _route_prompt_context_images(
-        self,
-        sample: list[ConversationItem],
-        *,
-        inference: bool,
-        infer_type: object,
-    ) -> list[ConversationItem]:
-        routed: list[ConversationItem] = []
-        for item in sample:
-            if item.type == "text" and not is_bagel_vision_marker(item):
-                if not item.meta.get(_OMNI_TOKENIZED) and not torch.is_tensor(item.value):
-                    item.value = f"{self.chat_markers.bos_token}{item.value}{self.chat_markers.eos_token}"
-                    item.meta["loss_mask"] = int(item.role == "assistant")
-                routed.append(item)
-                continue
-
-            if item.type != "image" or is_dummy(item):
-                routed.append(item)
-                continue
-
-            if item.source in {BAGEL_SIGLIP_CONTEXT, BAGEL_VAE_CONTEXT}:
-                routed.append(item)
-                continue
-
-            if item.role == "assistant":
-                item.source = BAGEL_VAE_CONTEXT
-                routed.append(item)
-                continue
-
-            if item.role == "user" and inference and infer_type == "infer_edit":
-                vae_item = copy_image_item(item)
-                vae_item.source = BAGEL_VAE_CONTEXT
-                item.source = BAGEL_SIGLIP_CONTEXT
-                routed.extend([vae_item, item])
-                continue
-
-            # Training edit detection is intentionally not implemented yet. Raw
-            # user images outside infer_edit are the SigLIP prompt/context branch.
-            if item.role == "user":
-                item.source = BAGEL_SIGLIP_CONTEXT
-            routed.append(item)
-        return routed
 
     def _insert_prompt_context_image_markers(self, sample: list[ConversationItem]) -> list[ConversationItem]:
         out: list[ConversationItem] = []

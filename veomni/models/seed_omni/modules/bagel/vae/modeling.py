@@ -33,26 +33,28 @@ class BagelVAE(BagelVAEModuleMixin, PreTrainedModel):
     _no_split_modules: list[str] = ["ResnetBlock", "AttnBlock"]
     supports_gradient_checkpointing = True
 
-    def __init__(self, config: BagelVAEConfig) -> None:
-        super().__init__(config)
-        self.encoder = Encoder(
-            resolution=config.resolution,
-            in_channels=config.in_channels,
-            ch=config.ch,
-            ch_mult=config.ch_mult,
-            num_res_blocks=config.num_res_blocks,
-            z_channels=config.z_channels,
-        )
-        self.decoder = Decoder(
-            resolution=config.resolution,
-            in_channels=config.in_channels,
-            ch=config.ch,
-            out_ch=config.out_ch,
-            ch_mult=config.ch_mult,
-            num_res_blocks=config.num_res_blocks,
-            z_channels=config.z_channels,
-        )
-        self.reg = DiagonalGaussian()
+    def __init__(self, config: BagelVAEConfig, **kwargs: Any) -> None:
+        super().__init__(config, **kwargs)
+        cache_mode = self.cache_mode
+        if cache_mode in {"full", "encode_only"}:
+            self.encoder = Encoder(
+                resolution=config.resolution,
+                in_channels=config.in_channels,
+                ch=config.ch,
+                ch_mult=config.ch_mult,
+                num_res_blocks=config.num_res_blocks,
+                z_channels=config.z_channels,
+            )
+        if cache_mode == "full":
+            self.decoder = Decoder(
+                resolution=config.resolution,
+                in_channels=config.in_channels,
+                ch=config.ch,
+                out_ch=config.out_ch,
+                ch_mult=config.ch_mult,
+                num_res_blocks=config.num_res_blocks,
+                z_channels=config.z_channels,
+            )
         self._image_processor: BagelVAEProcessor | None = None
         self.post_init()
 
@@ -61,13 +63,30 @@ class BagelVAE(BagelVAEModuleMixin, PreTrainedModel):
             self.eval()
             self.requires_grad_(False)
 
+    def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs: dict[str, Any] | None = None) -> None:
+        if self.cache_mode == "process_only":
+            return
+        return super().gradient_checkpointing_enable(gradient_checkpointing_kwargs=gradient_checkpointing_kwargs)
+
+    def _require_encoder(self) -> Encoder:
+        encoder = getattr(self, "encoder", None)
+        if encoder is None:
+            raise RuntimeError(f"BagelVAE requires the VAE encoder; cache_mode={self.cache_mode!r}.")
+        return encoder
+
+    def _require_decoder(self) -> Decoder:
+        decoder = getattr(self, "decoder", None)
+        if decoder is None:
+            raise RuntimeError(f"BagelVAE requires the VAE decoder; cache_mode={self.cache_mode!r}.")
+        return decoder
+
     @property
     def _encoder_device(self) -> torch.device:
-        return self.encoder.conv_in.weight.device
+        return self._require_encoder().conv_in.weight.device
 
     @property
     def _decoder_device(self) -> torch.device:
-        return self.decoder.conv_in.weight.device
+        return self._require_decoder().conv_in.weight.device
 
     @contextmanager
     def _runtime_context(self, tensor: torch.Tensor):
@@ -90,9 +109,38 @@ class BagelVAE(BagelVAEModuleMixin, PreTrainedModel):
         del kwargs
         pixel_values = pixel_values.to(device=self._encoder_device, dtype=self.dtype)
         with self._runtime_context(pixel_values):
-            latents = self.reg(self.encoder(pixel_values))
-            latents = self.config.scale_factor * (latents - self.config.shift_factor)
+            posterior = self._encode_posterior(pixel_values)
+            latents = self._sample_scaled_latents(posterior)
         return {"latents": latents.to(dtype=self.dtype)}
+
+    def offline_encode(
+        self,
+        pixel_values: torch.Tensor,
+        **kwargs: object,
+    ) -> dict[str, Any]:
+        del kwargs
+        pixel_values = pixel_values.to(device=self._encoder_device, dtype=self.dtype)
+        with self._runtime_context(pixel_values):
+            posterior = self._encode_posterior(pixel_values)
+        return {"encoded_cache": torch.cat(posterior, dim=1).to(dtype=self.dtype)}
+
+    def online_process(
+        self,
+        encoded_cache: torch.Tensor | list[torch.Tensor],
+        **kwargs: object,
+    ) -> dict[str, Any]:
+        del kwargs
+        if not isinstance(encoded_cache, list):
+            encoded_cache = [encoded_cache]
+
+        latents = []
+        for cache in encoded_cache:
+            posterior, is_item_cache = _posterior_from_cache(cache, z_channels=int(self.config.z_channels))
+            latent = self._sample_scaled_latents(posterior)
+            if is_item_cache:
+                latent = latent.squeeze(0)
+            latents.append(latent.to(dtype=cache.dtype))
+        return {"latents": latents}
 
     def decode(
         self,
@@ -100,11 +148,36 @@ class BagelVAE(BagelVAEModuleMixin, PreTrainedModel):
         **kwargs: object,
     ) -> dict[str, Any]:
         del kwargs
+        decoder = self._require_decoder()
         latents = latents.to(device=self._decoder_device, dtype=self.dtype)
         latents = latents / self.config.scale_factor + self.config.shift_factor
         with self._runtime_context(latents):
-            pixel_values = self.decoder(latents)
+            pixel_values = decoder(latents)
         return {"pixel_values": pixel_values.to(dtype=self.dtype)}
+
+    def _encode_posterior(self, pixel_values: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        encoder = self._require_encoder()
+        return torch.chunk(encoder(pixel_values), 2, dim=1)
+
+    def _sample_scaled_latents(self, posterior: tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
+        mean, logvar = posterior
+        latents = mean + torch.exp(0.5 * logvar) * torch.randn_like(mean)
+        return self.config.scale_factor * (latents - self.config.shift_factor)
+
+
+def _posterior_from_cache(
+    cache: torch.Tensor,
+    *,
+    z_channels: int,
+) -> tuple[tuple[torch.Tensor, torch.Tensor], bool]:
+    if cache.dim() == 5 and int(cache.shape[0]) == 1:
+        cache = cache.squeeze(0)
+    if cache.dim() == 4 and int(cache.shape[0]) == 2 and int(cache.shape[1]) == z_channels:
+        return (cache[0].unsqueeze(0), cache[1].unsqueeze(0)), True
+    raise ValueError(
+        "BAGEL VAE posterior cache tensor must be shaped (2, C, H, W) "
+        f"or singleton-batched (1, 2, C, H, W); got {tuple(cache.shape)}."
+    )
 
 
 def swish(x: Tensor) -> Tensor:
@@ -355,20 +428,6 @@ class Decoder(nn.Module):
         hidden_states = self.norm_out(hidden_states)
         hidden_states = swish(hidden_states)
         return self.conv_out(hidden_states)
-
-
-class DiagonalGaussian(nn.Module):
-    def __init__(self, sample: bool = True, chunk_dim: int = 1) -> None:
-        super().__init__()
-        self.sample = sample
-        self.chunk_dim = chunk_dim
-
-    def forward(self, z: Tensor) -> Tensor:
-        mean, logvar = torch.chunk(z, 2, dim=self.chunk_dim)
-        if self.sample:
-            std = torch.exp(0.5 * logvar)
-            return mean + std * torch.randn_like(mean)
-        return mean
 
 
 __all__ = [

@@ -1,0 +1,5 @@
+bagel_vae:
+  model:
+    model_path: bagel_vae
+    model_config:
+      support_cache: true

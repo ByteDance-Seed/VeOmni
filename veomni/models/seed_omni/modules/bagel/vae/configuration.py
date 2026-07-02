@@ -2,8 +2,10 @@
 
 from transformers import PretrainedConfig
 
+from ....mixins.offline_encoding import OfflineEncodingConfigMixin
 
-class BagelVAEConfig(PretrainedConfig):
+
+class BagelVAEConfig(OfflineEncodingConfigMixin, PretrainedConfig):
     """BAGEL FLUX-style latent autoencoder config."""
 
     model_type = "bagel_vae"

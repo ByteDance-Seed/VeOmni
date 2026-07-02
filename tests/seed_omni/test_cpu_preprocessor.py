@@ -39,7 +39,8 @@ from veomni.models.seed_omni.modules.bagel.text_encoder.modulemixin import (
 from veomni.models.seed_omni.modules.bagel.text_encoder.modulemixin import (
     BagelTextEncoderCPUPreprocessor,
 )
-from veomni.models.seed_omni.modules.bagel.vae.modulemixin import BagelVAECPUPreprocessor
+from veomni.models.seed_omni.modules.bagel.vae.configuration import BagelVAEConfig
+from veomni.models.seed_omni.modules.bagel.vae.modulemixin import BagelVAECPUPreprocessor, BagelVAEModuleMixin
 from veomni.models.seed_omni.modules.bagel.vae.processing import BagelVAEProcessor
 from veomni.models.seed_omni.modules.janus.siglip.modulemixin import (
     JanusSiglipCPUPreprocessor,
@@ -64,6 +65,17 @@ from veomni.utils.tensor_utils import naflatten, unflatten
 def _worker_dummies(conversation_list, source):
     """Test helper: worker-appended ``role="dummy"`` placeholders for ``source``."""
     return list(iter_desired_items(conversation_list, roles=["dummy"], sources=[source]))
+
+
+class _DummyBagelVAE(BagelVAEModuleMixin):
+    def __init__(self, support_cache: bool = False, train_type: str = "train") -> None:
+        self.config = BagelVAEConfig(support_cache=support_cache, train_type=train_type)
+        self._image_processor = object()
+        self.dtype = torch.float32
+        super().__init__()
+
+    def init_omni_state(self) -> None:
+        return None
 
 
 # Module-level fakes so the preprocessors stay picklable (workers fork/spawn them).
@@ -235,7 +247,7 @@ def test_bagel_text_preprocessor_tokenizes_plain_items_and_is_idempotent():
     batch = [
         [
             ConversationItem(type="text", value="hi", role="user"),
-            ConversationItem(type="image", value=torch.zeros(3, 4, 4), role="user"),
+            ConversationItem(type="image", value=torch.zeros(3, 4, 4), role="user", source=BAGEL_SIGLIP_CONTEXT),
             ConversationItem(type="text", value="ok", role="assistant"),
         ]
     ]
@@ -300,7 +312,30 @@ def test_bagel_siglip_preprocessor_patchifies_and_tags_context():
     assert item.value.dtype == torch.bfloat16
 
 
-def test_bagel_text_preprocessor_routes_inference_edit_prompt_context():
+def test_bagel_vae_process_only_skips_cpu_preprocessor():
+    assert _DummyBagelVAE(support_cache=True, train_type="train_with_cache").build_cpu_preprocessor() is None
+    assert isinstance(_DummyBagelVAE().build_cpu_preprocessor(), BagelVAECPUPreprocessor)
+
+
+def test_bagel_vae_process_only_full_hf_checkpoint_copies_source(tmp_path):
+    source = tmp_path / "source"
+    output = tmp_path / "output"
+    source.mkdir()
+    (source / "config.json").write_text("{}", encoding="utf-8")
+    (source / "model.safetensors").write_bytes(b"weights")
+
+    _DummyBagelVAE(support_cache=True, train_type="train_with_cache").save_full_hf_checkpoint(
+        str(output),
+        source_path=str(source),
+        trainer=object(),
+        state=object(),
+    )
+
+    assert (output / "config.json").read_text(encoding="utf-8") == "{}"
+    assert (output / "model.safetensors").read_bytes() == b"weights"
+
+
+def test_bagel_preprocessors_route_inference_edit_prompt_context():
     text_pre = BagelTextEncoderCPUPreprocessor(_bagel_template())
     siglip_pre = BagelSiglipNavitCPUPreprocessor(
         BagelSiglipNavitProcessor(patch_size=2, image_size=4, min_image_size=2, max_pixels=16),
@@ -320,7 +355,7 @@ def test_bagel_text_preprocessor_routes_inference_edit_prompt_context():
         ]
     ]
 
-    for preprocessor in (text_pre, siglip_pre, vae_pre):
+    for preprocessor in (vae_pre, siglip_pre, text_pre):
         preprocessor(batch, inference=True, generation_kwargs={"infer_type": "infer_edit"})
 
     sample = batch[0]
@@ -358,11 +393,16 @@ def test_bagel_text_preprocessor_routes_inference_edit_prompt_context():
     assert [int(sample[i].value.numel()) for i in [1, 3, 4, 6, 7, 9]] == [1, 1, 1, 1, 1, 1]
 
 
-def test_bagel_text_preprocessor_routes_inference_und_user_image_to_siglip_only():
+def test_bagel_preprocessors_route_inference_und_user_image_to_siglip_only():
+    vae_pre = BagelVAECPUPreprocessor(
+        BagelVAEProcessor(image_stride=2, min_image_size=4, max_image_size=4, max_pixels=16),
+        dtype=torch.bfloat16,
+    )
     text_pre = BagelTextEncoderCPUPreprocessor(_bagel_template())
     image = torch.full((3, 4, 4), 7, dtype=torch.uint8)
     batch = [[ConversationItem(type="image", value=image.clone(), role="user")]]
 
+    vae_pre(batch, inference=True, generation_kwargs={"infer_type": "infer_und"})
     text_pre(batch, inference=True, generation_kwargs={"infer_type": "infer_und"})
 
     assert [item.type for item in batch[0]] == ["text", "image", "text"]

@@ -3,9 +3,9 @@
 # Single-process load (`python tasks/omni/infer_omni.py ...`): every module
 # loads via `from_pretrained(device_map='auto')`, spread across visible GPUs.
 
-bagel_text_encoder:
+bagel_vae:
   model:
-    model_path: bagel_text_encoder
+    model_path: bagel_vae
   accelerator:
     fsdp_config:
       fsdp_mode: eager
@@ -17,9 +17,9 @@ bagel_siglip_navit:
     fsdp_config:
       fsdp_mode: eager
 
-bagel_vae:
+bagel_text_encoder:
   model:
-    model_path: bagel_vae
+    model_path: bagel_text_encoder
   accelerator:
     fsdp_config:
       fsdp_mode: eager
