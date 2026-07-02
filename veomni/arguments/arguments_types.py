@@ -433,6 +433,32 @@ class CheckpointConfig:
 
 
 @dataclass
+class TorchCompileConfig:
+    """train.torch_compile.* — Per-block torch.compile options."""
+
+    enable: bool = field(
+        default=False,
+        metadata={"help": "Enable per-block torch.compile for CUDA Graph friendly text training."},
+    )
+    backend: Optional[str] = field(
+        default=None,
+        metadata={"help": "Backend passed to torch.compile. None uses PyTorch's default backend."},
+    )
+    mode: Optional[str] = field(
+        default="reduce-overhead",
+        metadata={"help": "Mode passed to torch.compile. 'reduce-overhead' enables CUDA Graphs when possible."},
+    )
+    fullgraph: bool = field(
+        default=False,
+        metadata={"help": "Whether to pass fullgraph=True to torch.compile."},
+    )
+    dynamic: bool = field(
+        default=False,
+        metadata={"help": "Whether to pass dynamic=True to torch.compile."},
+    )
+
+
+@dataclass
 class TrainingArguments:
     """train.* — Top-level training configuration."""
 
@@ -533,7 +559,23 @@ class TrainingArguments:
     )
     enable_compile: bool = field(
         default=False,
-        metadata={"help": "Enable torch compile."},
+        metadata={"help": "Deprecated alias for train.torch_compile.enable."},
+    )
+    compile_backend: Optional[str] = field(
+        default=None,
+        metadata={"help": "Deprecated alias for train.torch_compile.backend."},
+    )
+    compile_mode: Optional[str] = field(
+        default=None,
+        metadata={"help": "Deprecated alias for train.torch_compile.mode."},
+    )
+    compile_fullgraph: Optional[bool] = field(
+        default=None,
+        metadata={"help": "Deprecated alias for train.torch_compile.fullgraph."},
+    )
+    compile_dynamic: Optional[bool] = field(
+        default=None,
+        metadata={"help": "Deprecated alias for train.torch_compile.dynamic."},
     )
     max_steps: Optional[int] = field(
         default=None,
@@ -555,6 +597,7 @@ class TrainingArguments:
     wandb: WandbConfig = field(default_factory=WandbConfig)
     profile: ProfileConfig = field(default_factory=ProfileConfig)
     gradient_checkpointing: GradientCheckpointingConfig = field(default_factory=GradientCheckpointingConfig)
+    torch_compile: TorchCompileConfig = field(default_factory=TorchCompileConfig)
     accelerator: AcceleratorConfig = field(default_factory=AcceleratorConfig)
     checkpoint: CheckpointConfig = field(default_factory=CheckpointConfig)
 
@@ -568,6 +611,22 @@ class TrainingArguments:
         self.local_rank = int(os.getenv("LOCAL_RANK", 0))
         self.global_rank = int(os.getenv("RANK", 0))
         self.world_size = int(os.getenv("WORLD_SIZE", 1))
+
+        deprecated_compile_fields = {
+            "enable": self.enable_compile,
+            "backend": self.compile_backend,
+            "mode": self.compile_mode,
+            "fullgraph": self.compile_fullgraph,
+            "dynamic": self.compile_dynamic,
+        }
+        for field_name, value in deprecated_compile_fields.items():
+            if value is not None and value is not False:
+                logger.warning_rank0(
+                    f"train.compile_{field_name} is deprecated; use train.torch_compile.{field_name} instead."
+                    if field_name != "enable"
+                    else "train.enable_compile is deprecated; use train.torch_compile.enable instead."
+                )
+                setattr(self.torch_compile, field_name, value)
 
         self._validate_accelerator()
         self._derive_batch_config()
@@ -1136,6 +1195,8 @@ class DataloaderConfig:
 class DataArguments:
     """data.* — Dataset paths, tokenization, and batching."""
 
+    supports_torch_compile = True
+
     train_path: str = field(
         metadata={"help": "Local path/HDFS path of the training data. Use comma to separate multiple datasets."},
     )
@@ -1237,6 +1298,24 @@ class VeOmniArguments:
             else:
                 self.train.pad_to_length = self.train.micro_batch_size * self.data.max_seq_len
                 logger.info_rank0(f"set pad_to_length = micro_batch_size * max_seq_len = {self.train.pad_to_length}")
+
+        if self.train.torch_compile.enable:
+            if not getattr(self.data, "supports_torch_compile", True):
+                raise ValueError(
+                    "train.torch_compile.enable currently supports text trainers only. "
+                    "Multimodal/DiT/Omni data pipelines do not implement pad_to_length for static packed shapes yet."
+                )
+            if self.data.data_type not in ("plaintext", "conversation", "classification", "dpo"):
+                raise ValueError(
+                    "train.torch_compile.enable currently supports text data only; "
+                    f"got data.data_type={self.data.data_type!r}."
+                )
+            if not self.train.dyn_bsz or not self.train.pad_to_length:
+                raise ValueError(
+                    "train.torch_compile.enable requires train.dyn_bsz=True and train.pad_to_length=True. "
+                    "Variable packed lengths trigger recompilation and prevent stable CUDA Graph capture; "
+                    "see https://github.com/ByteDance-Seed/VeOmni/issues/401."
+                )
 
     def compute_train_steps(self, dataset_length: Optional[int] = None):
         if self.train.dyn_bsz:
