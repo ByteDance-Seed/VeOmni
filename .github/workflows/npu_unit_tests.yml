@@ -92,9 +92,10 @@ jobs:
       # while pulling large wheels (e.g. torch-npu, virtualenv); bump to
       # 5 min so a slow link doesn't fail the whole sync.
       UV_HTTP_TIMEOUT: "300"
-      # CANN 9.0.0: override random port selection (new in 9.0.0) with fixed range
-      # to avoid port overflow (EI0019) and Docker bridge unreachable (EI0015) errors.
+      # CANN 9.0.0: HCCL random port selection (new in 9.0.0) breaks Docker bridge
+      # networking. Fixed port range + whitelist disable per Ascend best practice.
       HCCL_HOST_SOCKET_PORT_RANGE: "30000-35000"
+      HCCL_WHITELIST_DISABLE: "1"
 
     steps:
       - name: Set ASCEND_VISIBLE_DEVICES from runner slice
