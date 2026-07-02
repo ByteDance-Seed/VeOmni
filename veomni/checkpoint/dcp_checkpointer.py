@@ -39,6 +39,7 @@ from torch.distributed.checkpoint.state_dict import (
 from torch.distributed.checkpoint.stateful import Stateful
 
 from ..distributed.parallel_state import get_parallel_state
+from ..optim.optimizer import restore_optimizer_param_group_defaults
 from ..utils import logging
 from ..utils.checkpoint_utils import _GLOBAL_STEP_PREFIX
 from ..utils.device import empty_cache, synchronize
@@ -274,6 +275,9 @@ class OptimizerState(Stateful):
             )
             # Delegate to MultiOptimizer (it will split/filter correctly)
             self.optimizer.load_state_dict(optim_state_without_extra_parallel_dim)
+            # MultiOptimizer sub-optimizers can also lose param-group hyperparams
+            # (betas/...) for empty groups after load; restore recurses into them.
+            restore_optimizer_param_group_defaults(self.optimizer)
             return
 
         # Single torch optimizer
@@ -282,6 +286,7 @@ class OptimizerState(Stateful):
             optimizers=self.optimizer,
             optim_state_dict=optim_state_from_dcp_load,
         )
+        restore_optimizer_param_group_defaults(self.optimizer)
 
     def get_state_dict_with_extra_parallel_dim_preprocess(self, state_dict, action):
         return _apply_extra_parallel_dim(
