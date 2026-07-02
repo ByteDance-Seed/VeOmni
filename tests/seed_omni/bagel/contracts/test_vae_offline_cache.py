@@ -3,12 +3,7 @@ from __future__ import annotations
 import torch
 
 from tests.seed_omni.bagel.contracts.helpers import config_cls, model_cls
-from veomni.models.seed_omni.mixins.offline_encoding import ENCODED_CACHE_KIND_META_KEY
 from veomni.models.seed_omni.modules.bagel.sources import BAGEL_VAE_CONTEXT
-from veomni.models.seed_omni.modules.bagel.vae.cache import (
-    BAGEL_VAE_POSTERIOR_CACHE_KIND,
-    BagelVAEPosteriorCache,
-)
 from veomni.models.seed_omni.modules.bagel.vae.modulemixin import BAGEL_VAE_PIXEL_SHAPE
 from veomni.models.seed_omni.modules.bagel.vae.processing import BagelVAEProcessor
 from veomni.models.seed_omni.utils.conversation import ConversationItem
@@ -35,27 +30,6 @@ def _tiny_vae(**config_overrides):
     return model
 
 
-def test_bagel_vae_posterior_cache_roundtrips_tensor_payload() -> None:
-    mean = torch.ones(2, 3, 4)
-    logvar = torch.full((2, 3, 4), -1.0)
-
-    item_cache = BagelVAEPosteriorCache(mean=mean, logvar=logvar)
-    item_tensor = item_cache.to_tensor()
-    roundtrip = BagelVAEPosteriorCache.from_tensor(item_tensor)
-
-    assert item_tensor.shape == (2, 2, 3, 4)
-    assert torch.equal(roundtrip.mean, mean)
-    assert torch.equal(roundtrip.logvar, logvar)
-
-    batch_cache = BagelVAEPosteriorCache(mean=mean.unsqueeze(0), logvar=logvar.unsqueeze(0))
-    batch_tensor = batch_cache.to_tensor()
-    batch_roundtrip = BagelVAEPosteriorCache.from_tensor(batch_tensor)
-
-    assert batch_tensor.shape == (1, 2, 2, 3, 4)
-    assert torch.equal(batch_roundtrip.mean, mean.unsqueeze(0))
-    assert torch.equal(batch_roundtrip.logvar, logvar.unsqueeze(0))
-
-
 def test_bagel_vae_processor_reports_unpadded_shapes_for_padded_batch() -> None:
     processor = BagelVAEProcessor(max_image_size=8, min_image_size=4, image_stride=4, max_pixels=64)
 
@@ -75,8 +49,7 @@ def test_bagel_vae_modeling_offline_encode_returns_tensor_cache() -> None:
 
     assert torch.is_tensor(encoded_cache)
     assert encoded_cache.shape[0] == 1
-    assert encoded_cache.shape[1] == 2
-    assert encoded_cache.shape[2] == model.config.z_channels
+    assert encoded_cache.shape[1] == 2 * model.config.z_channels
 
 
 def test_bagel_vae_offline_encode_hook_writes_unpadded_image_cache_item() -> None:
@@ -98,7 +71,7 @@ def test_bagel_vae_offline_encode_hook_writes_unpadded_image_cache_item() -> Non
     assert out["conversation_list"] is conversation
     assert item.type == "image"
     assert item.source == BAGEL_VAE_CONTEXT
-    assert item.meta == {ENCODED_CACHE_KIND_META_KEY: BAGEL_VAE_POSTERIOR_CACHE_KIND}
+    assert item.meta == {}
     assert item.value.shape == (2, 2, 2, 1)
 
 
@@ -109,14 +82,12 @@ def test_bagel_vae_online_process_consumes_variable_size_cache_items_without_pad
         value=torch.zeros(2, 2, 2, 1),
         role="assistant",
         source=BAGEL_VAE_CONTEXT,
-        meta={ENCODED_CACHE_KIND_META_KEY: BAGEL_VAE_POSTERIOR_CACHE_KIND},
     )
     second = ConversationItem(
         type="image",
         value=torch.zeros(2, 2, 2, 2),
         role="assistant",
         source=BAGEL_VAE_CONTEXT,
-        meta={ENCODED_CACHE_KIND_META_KEY: BAGEL_VAE_POSTERIOR_CACHE_KIND},
     )
     conversation = [[first], [second]]
 
@@ -140,7 +111,7 @@ def test_bagel_vae_process_only_skips_codec_modules() -> None:
     assert not hasattr(process_model, "decoder")
     latents = process_model.online_process(encoded_cache=encoded_cache)["latents"]
     assert isinstance(latents, list)
-    assert latents[0].shape == encoded_cache[:, 0].shape
+    assert latents[0].shape == encoded_cache[:, : process_model.config.z_channels].shape
 
     try:
         process_model.encode(pixel_values=torch.zeros(1, 3, 8, 8))
@@ -162,7 +133,10 @@ def test_bagel_vae_encode_only_skips_decoder_module() -> None:
 
     assert hasattr(model, "encoder")
     assert not hasattr(model, "decoder")
-    assert model.offline_encode(pixel_values=torch.zeros(1, 3, 8, 8))["encoded_cache"].shape[:2] == (1, 2)
+    assert model.offline_encode(pixel_values=torch.zeros(1, 3, 8, 8))["encoded_cache"].shape[:2] == (
+        1,
+        2 * model.config.z_channels,
+    )
 
     try:
         model.decode(latents=torch.zeros(1, 2, 2, 2))

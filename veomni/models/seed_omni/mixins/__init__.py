@@ -16,11 +16,7 @@
 
 from .metric_meter_mixin import MetricMeterMixin, MetricMeterResult
 from .modulemixin import CPUPreprocessor, ModuleMixin, post_forward, pre_forward
-from .offline_encoding import (
-    ENCODED_CACHE_KIND_META_KEY,
-    OfflineEncodedCache,
-    OfflineEncodingMixin,
-)
+from .offline_encoding import OfflineEncodingMixin
 
 
 __all__ = [
@@ -30,7 +26,5 @@ __all__ = [
     "post_forward",
     "MetricMeterMixin",
     "MetricMeterResult",
-    "ENCODED_CACHE_KIND_META_KEY",
-    "OfflineEncodedCache",
     "OfflineEncodingMixin",
 ]

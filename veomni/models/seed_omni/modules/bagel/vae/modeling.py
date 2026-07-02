@@ -20,7 +20,6 @@ from einops import rearrange
 from torch import Tensor
 from transformers import PreTrainedModel
 
-from .cache import BagelVAEPosteriorCache
 from .configuration import BagelVAEConfig
 from .modulemixin import BagelVAEModuleMixin
 from .processing import BagelVAEProcessor
@@ -108,10 +107,9 @@ class BagelVAE(BagelVAEModuleMixin, PreTrainedModel):
         **kwargs: object,
     ) -> dict[str, Any]:
         del kwargs
-        encoder = self._require_encoder()
         pixel_values = pixel_values.to(device=self._encoder_device, dtype=self.dtype)
         with self._runtime_context(pixel_values):
-            posterior = self._encode_posterior(encoder(pixel_values))
+            posterior = self._encode_posterior(pixel_values)
             latents = self._sample_scaled_latents(posterior)
         return {"latents": latents.to(dtype=self.dtype)}
 
@@ -121,11 +119,10 @@ class BagelVAE(BagelVAEModuleMixin, PreTrainedModel):
         **kwargs: object,
     ) -> dict[str, Any]:
         del kwargs
-        encoder = self._require_encoder()
         pixel_values = pixel_values.to(device=self._encoder_device, dtype=self.dtype)
         with self._runtime_context(pixel_values):
-            posterior = self._encode_posterior(encoder(pixel_values))
-        return {"encoded_cache": posterior.to_tensor().to(dtype=self.dtype)}
+            posterior = self._encode_posterior(pixel_values)
+        return {"encoded_cache": torch.cat(posterior, dim=1).to(dtype=self.dtype)}
 
     def online_process(
         self,
@@ -136,12 +133,14 @@ class BagelVAE(BagelVAEModuleMixin, PreTrainedModel):
         if not isinstance(encoded_cache, list):
             encoded_cache = [encoded_cache]
 
-        return {
-            "latents": [
-                self._sample_scaled_latents(BagelVAEPosteriorCache.from_tensor(cache)).to(dtype=cache.dtype)
-                for cache in encoded_cache
-            ]
-        }
+        latents = []
+        for cache in encoded_cache:
+            posterior, is_item_cache = _posterior_from_cache(cache, z_channels=int(self.config.z_channels))
+            latent = self._sample_scaled_latents(posterior)
+            if is_item_cache:
+                latent = latent.squeeze(0)
+            latents.append(latent.to(dtype=cache.dtype))
+        return {"latents": latents}
 
     def decode(
         self,
@@ -156,18 +155,31 @@ class BagelVAE(BagelVAEModuleMixin, PreTrainedModel):
             pixel_values = decoder(latents)
         return {"pixel_values": pixel_values.to(dtype=self.dtype)}
 
-    def _encode_posterior(self, posterior_values: torch.Tensor) -> BagelVAEPosteriorCache:
-        mean, logvar = torch.chunk(posterior_values, 2, dim=1)
-        return BagelVAEPosteriorCache(mean=mean, logvar=logvar)
+    def _encode_posterior(self, pixel_values: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        encoder = self._require_encoder()
+        return torch.chunk(encoder(pixel_values), 2, dim=1)
 
-    def _sample_scaled_latents(
-        self,
-        posterior: BagelVAEPosteriorCache,
-    ) -> torch.Tensor:
-        posterior_noise = torch.randn_like(posterior.mean)
-        std = torch.exp(0.5 * posterior.logvar)
-        latents = posterior.mean + std * posterior_noise
+    def _sample_scaled_latents(self, posterior: tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
+        mean, logvar = posterior
+        latents = mean + torch.exp(0.5 * logvar) * torch.randn_like(mean)
         return self.config.scale_factor * (latents - self.config.shift_factor)
+
+
+def _posterior_from_cache(
+    cache: torch.Tensor,
+    *,
+    z_channels: int,
+) -> tuple[tuple[torch.Tensor, torch.Tensor], bool]:
+    if cache.dim() == 5 and int(cache.shape[1]) == 2:
+        return (cache[:, 0], cache[:, 1]), False
+    if cache.dim() == 4 and int(cache.shape[0]) == 2 and int(cache.shape[1]) == z_channels:
+        return (cache[0].unsqueeze(0), cache[1].unsqueeze(0)), True
+    if cache.dim() == 4:
+        return torch.chunk(cache, 2, dim=1), False
+    raise ValueError(
+        "BAGEL VAE posterior cache tensor must be shaped (2, C, H, W), "
+        f"(B, 2, C, H, W), or (B, 2C, H, W); got {tuple(cache.shape)}."
+    )
 
 
 def swish(x: Tensor) -> Tensor:

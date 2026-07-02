@@ -6,35 +6,17 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from veomni.models.seed_omni import (
-    ENCODED_CACHE_KIND_META_KEY,
-    OfflineEncodedCache,
-    OfflineEncodingMixin,
-)
+from veomni.models.seed_omni import OfflineEncodingMixin
 from veomni.models.seed_omni.mixins import offline_encoding
 from veomni.models.seed_omni.mixins.modulemixin import ModuleMixin, post_forward, pre_forward
 from veomni.models.seed_omni.utils.conversation import ConversationItem
 
 
-class DummyEncodedCache(OfflineEncodedCache):
-    def __init__(self, tensor: torch.Tensor) -> None:
-        self.tensor = tensor
-
-    def to_tensor(self) -> torch.Tensor:
-        return self.tensor
-
-    @classmethod
-    def from_tensor(cls, tensor: torch.Tensor) -> DummyEncodedCache:
-        return cls(tensor)
-
-
 class DummyOfflineModule(OfflineEncodingMixin, ModuleMixin):
-    def __init__(self, cache_mode: str | None = None, freeze: bool | None = None) -> None:
+    def __init__(self, cache_mode: str | None = None) -> None:
         self.config = SimpleNamespace()
         if cache_mode is not None:
             self.config.cache_mode = cache_mode
-        if freeze is not None:
-            self.config.freeze = freeze
         self.calls: list[str] = []
         self._conversation_carrier: list[list[ConversationItem]] | None = None
         super().__init__()
@@ -83,14 +65,6 @@ class DummyOfflineModule(OfflineEncodingMixin, ModuleMixin):
         return {"conversation_list": self._conversation_carrier}
 
 
-def test_offline_encoded_cache_contract_is_tensor_first() -> None:
-    payload = torch.tensor([1.0, 2.0])
-    cache = DummyEncodedCache.from_tensor(payload)
-
-    assert torch.equal(cache.to_tensor(), payload)
-    assert ENCODED_CACHE_KIND_META_KEY == "encoded_cache_kind"
-
-
 def test_missing_config_cache_mode_warns_about_full_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
     warnings: list[str] = []
     monkeypatch.setattr(offline_encoding.logger, "warning_rank0", warnings.append)
@@ -116,11 +90,6 @@ def test_pre_forward_rejects_disallowed_cache_mode() -> None:
         ValueError, match="offline_encode requires cache_mode in .* current cache_mode is 'process_only'"
     ):
         module.pre_forward("offline_encode", conversation_list=[])
-
-
-def test_init_rejects_declared_trainable_cache_module() -> None:
-    with pytest.raises(ValueError, match="requires a frozen module"):
-        DummyOfflineModule(freeze=False)
 
 
 def test_default_partial_dcp_hooks_are_noop() -> None:

@@ -10,10 +10,9 @@ import torch
 from veomni.utils.device import get_device_id, get_device_type
 
 from ....mixins.modulemixin import CPUPreprocessor, ModuleMixin, post_forward, pre_forward
-from ....mixins.offline_encoding import ENCODED_CACHE_KIND_META_KEY, OfflineEncodingMixin
+from ....mixins.offline_encoding import OfflineEncodingMixin
 from ....utils.conversation import ConversationItem, is_dummy, iter_desired_items
 from ..sources import BAGEL_GENERATED_LATENT, BAGEL_VAE_CONTEXT
-from .cache import BAGEL_VAE_POSTERIOR_CACHE_KIND
 from .configuration import BagelVAEConfig
 from .processing import crop_latent_to_image_shape, route_image_sources
 
@@ -226,7 +225,7 @@ class BagelVAEModuleMixin(OfflineEncodingMixin, ModuleMixin):
             )
             item.value = cache_tensor.detach().to(device=self.device, dtype=self.dtype)
             item.source = BAGEL_VAE_CONTEXT
-            item.meta = {ENCODED_CACHE_KIND_META_KEY: BAGEL_VAE_POSTERIOR_CACHE_KIND}
+            item.meta = {}
         return {"conversation_list": conversation}
 
     @pre_forward("online_process")
@@ -352,15 +351,9 @@ class BagelVAEModuleMixin(OfflineEncodingMixin, ModuleMixin):
             conversation_list,
             types=["image"],
             sources=[BAGEL_VAE_CONTEXT],
-            meta_keys=[ENCODED_CACHE_KIND_META_KEY],
         ):
             if is_dummy(item):
                 continue
-            kind = item.meta.get(ENCODED_CACHE_KIND_META_KEY)
-            if kind != BAGEL_VAE_POSTERIOR_CACHE_KIND:
-                raise ValueError(
-                    f"BAGEL VAE expected encoded cache kind {BAGEL_VAE_POSTERIOR_CACHE_KIND!r}, got {kind!r}."
-                )
             cached_items.append(item)
         return cached_items
 
@@ -414,4 +407,7 @@ class BagelVAEModuleMixin(OfflineEncodingMixin, ModuleMixin):
         shutil.copytree(source_path, output_dir, dirs_exist_ok=True)
 
 
-__all__ = ["BAGEL_VAE_PIXEL_SHAPE", "BagelVAECPUPreprocessor", "BagelVAEModuleMixin"]
+__all__ = [
+    "BagelVAECPUPreprocessor",
+    "BagelVAEModuleMixin",
+]

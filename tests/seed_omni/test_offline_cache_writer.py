@@ -6,7 +6,6 @@ import torch
 from datasets import load_dataset
 
 from veomni.data.seed_omni.seedomni_transform import process_seedomni_cached_example
-from veomni.models.seed_omni.mixins.offline_encoding import ENCODED_CACHE_KIND_META_KEY
 from veomni.models.seed_omni.utils.conversation import ConversationItem
 from veomni.models.seed_omni.utils.offline_cache import SeedOmniOfflineCacheWriter
 
@@ -17,7 +16,7 @@ def test_seedomni_cached_transform_unpickles_conversation_list() -> None:
             type="image",
             value=torch.ones(2, 3, 4, 4),
             role="assistant",
-            meta={ENCODED_CACHE_KIND_META_KEY: "test_cache"},
+            meta={"cache": "test_cache"},
         )
     ]
 
@@ -26,7 +25,7 @@ def test_seedomni_cached_transform_unpickles_conversation_list() -> None:
     restored = out[0]["conversation_list"]
     assert restored[0].type == "image"
     assert torch.equal(restored[0].value, conversation[0].value)
-    assert restored[0].meta == {ENCODED_CACHE_KIND_META_KEY: "test_cache"}
+    assert restored[0].meta == {"cache": "test_cache"}
 
 
 def test_offline_cache_writer_filters_dummy_and_preserves_encoded_cache(tmp_path) -> None:
@@ -36,7 +35,7 @@ def test_offline_cache_writer_filters_dummy_and_preserves_encoded_cache(tmp_path
         type="image",
         value=torch.arange(8, dtype=torch.float32).view(2, 1, 2, 2),
         role="assistant",
-        meta={ENCODED_CACHE_KIND_META_KEY: "test_cache"},
+        meta={"cache": "test_cache"},
     )
     dummy = ConversationItem(type="image", value=torch.zeros(1), role="dummy")
 
@@ -51,7 +50,7 @@ def test_offline_cache_writer_filters_dummy_and_preserves_encoded_cache(tmp_path
     assert [item.role for item in restored] == ["user", "assistant"]
     assert restored[1].type == "image"
     assert torch.equal(restored[1].value, real_cache.value)
-    assert restored[1].meta == {ENCODED_CACHE_KIND_META_KEY: "test_cache"}
+    assert restored[1].meta == {"cache": "test_cache"}
 
 
 def test_offline_cache_writer_finalize_compacts_shard_numbers(tmp_path) -> None:

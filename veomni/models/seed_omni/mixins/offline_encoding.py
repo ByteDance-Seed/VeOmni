@@ -16,37 +16,14 @@
 
 from __future__ import annotations
 
-from abc import ABC, abstractmethod
+from abc import abstractmethod
 from collections.abc import Collection
-from typing import Any, Self
-
-import torch
+from typing import Any
 
 from ....utils import logging
 
 
-ENCODED_CACHE_KIND_META_KEY = "encoded_cache_kind"
-
 logger = logging.get_logger(__name__)
-
-
-class OfflineEncodedCache(ABC):
-    """Typed DTO for module-local offline cache semantics.
-
-    Conversation items still carry plain tensors in ``value``. Concrete cache
-    views use this DTO only at module boundaries, converting with
-    :meth:`to_tensor` before writing a cache item and :meth:`from_tensor` after
-    reading one back.
-    """
-
-    @abstractmethod
-    def to_tensor(self) -> torch.Tensor:
-        """Pack this typed cache view into a tensor carrier value."""
-
-    @classmethod
-    @abstractmethod
-    def from_tensor(cls, tensor: torch.Tensor) -> Self:
-        """Reconstruct this typed cache view from a tensor carrier value."""
 
 
 class OfflineEncodingMixin:
@@ -138,8 +115,4 @@ class OfflineEncodingMixin:
         """Materialize runtime tensors from offline encoded cache tensors."""
 
 
-__all__ = [
-    "ENCODED_CACHE_KIND_META_KEY",
-    "OfflineEncodedCache",
-    "OfflineEncodingMixin",
-]
+__all__ = ["OfflineEncodingMixin"]
