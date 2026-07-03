@@ -273,7 +273,23 @@ class OmniModuleTrainer:
             # param.requires_grad)``) and the loader writes weights in-place
             # (``param.data.copy_``), so the freeze applied in ``_freeze_model_module``
             # above survives the wrap — no need to re-assert it here.
-            self.base._build_parallelized_model()  # FSDP2 wrap + per-module weight load
+            #
+            # A module may fully own its parallelize + weight-load (+ param
+            # offload) by implementing ``customized_build_parallelize_model`` —
+            # e.g. a huge MoE backbone that streams EP-sharded experts to CPU,
+            # which the generic GPU-materializing loader has no hook for. When it
+            # returns a model we use it verbatim (the override owns fsdp/load/
+            # offload/grad-ckpt); ``None`` (the default) keeps the generic path.
+            customized_builder = getattr(self.base.model, "customized_build_parallelize_model", None)
+            customized_model = (
+                customized_builder(weights_path=self.base.args.model.model_path, args=self.base.args)
+                if callable(customized_builder)
+                else None
+            )
+            if customized_model is not None:
+                self.base.model = customized_model
+            else:
+                self.base._build_parallelized_model()  # FSDP2 wrap + per-module weight load
 
             # Gradient-checkpoint recompute runs during backward — OUTSIDE the
             # per-module ``use_parallel_state`` scope that wraps the forward — so it
