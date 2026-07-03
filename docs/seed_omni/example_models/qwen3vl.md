@@ -38,6 +38,7 @@ Config dir: `configs/seed_omni/Qwen/qwen3vl_2b/`
 |------|------|
 | `base.yaml` | Launcher: `model` / top-level `accelerator` / `data` (incl. `mm_configs`) / `train` + `infer` block. |
 | `modules_train.yaml` | Per-module training overrides (`qwen3vl_vision` / `qwen3vl_text_encoder` / `qwen3vl_llm`). |
+| `modules_train_sp.yaml` | Whole-model Ulysses SP overrides (all modules at the same SP; see [§3.1](#31-sequence-parallelism-ulysses)). |
 | `graph_train.yaml` | Training DAG — flat edge list (`{qwen3vl_vision, qwen3vl_text_encoder.encode} → qwen3vl_llm → qwen3vl_text_encoder.decode → end`). |
 | `data.yaml` | Weighted multisource data list (ShareGPT4V images + LLaVA-Video). |
 | `graph_infer.yaml` | Image/video-understanding (I2T / VQA) generation graph (`infer.infer_type: vision_understanding`). |
@@ -112,6 +113,32 @@ Key knobs (override on the CLI):
 - `--train.checkpoint.output_dir` — run root; DCP checkpoints land in `<output_dir>/checkpoints/`.
 - `--train.wandb.enable false` — disable wandb for quick smoke runs.
 
+### 3.1 Sequence parallelism (Ulysses)
+
+SP is declared **per module** (`accelerator.ulysses_size` in the modules YAML).
+`modules_train_sp.yaml` shards only the vision tower and the LLM backbone at SP=4
+while the text encoder stays unsharded. Each SP=4 module gathers its group's 4
+distinct per-rank sequences — the in-model backbone `qwen3vl_llm` aggregates its
+DeepStack visual embeds, `visual_pos_masks` and 3-row M-RoPE `position_ids` too:
+
+```bash
+NPROC_PER_NODE=4 bash train.sh tasks/omni/train_omni.py \
+  configs/seed_omni/Qwen/qwen3vl_2b/base.yaml \
+  --model.modules configs/seed_omni/Qwen/qwen3vl_2b/modules_train_sp.yaml \
+  --train.global_batch_size 16 --train.micro_batch_size 4
+```
+
+- SP is set **per module** in the modules YAML. Do NOT pass a top-level
+  `--accelerator.ulysses_size > 1`: the orchestrator does no sequence compute, so
+  `OmniTrainer` enforces outer `ulysses_size == 1` (and `cp_size == 1`).
+- `world % ulysses_size == 0`; a larger `micro_batch_size` gives longer packed
+  sequences to slice across SP ranks.
+- The ViT and LLM can shard at **different** sizes — just set each module's
+  `accelerator.ulysses_size` independently (each must divide `world`).
+- If your environment exports `TORCH_DISTRIBUTED_DEBUG=DETAIL`, **unset it** — its
+  `_ProcessGroupWrapper` lacks the coalesced all-gather that FSDP2's tied-head
+  `full_tensor()` needs, which crashes any FSDP2 run (SP or not).
+
 ---
 
 ## 4. Resume
@@ -177,6 +204,7 @@ v2:   qwen3vl_vision → qwen3vl_text_encoder.encode → qwen3vl_llm
 -> max abs diff 0.0 over last_hidden_state  (RESULT: ALIGNED)
 ```
 
-> **Scope**: this recipe covers image understanding (I2T). Video inputs
-> (`<|video_pad|>`) and Ulysses sequence parallelism are not wired into the V2
-> path yet — the backbone raises on `sp_enabled`.
+> **Scope**: this recipe covers image understanding (I2T). Ulysses sequence
+> parallelism is per-module (see [§3.1](#31-sequence-parallelism-ulysses)): the
+> vision tower and the in-model backbone `qwen3vl_llm` each support `module_sp > 1`
+> and can shard independently; the outer trainer always runs SP-disabled.

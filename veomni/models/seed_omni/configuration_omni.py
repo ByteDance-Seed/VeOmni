@@ -208,9 +208,30 @@ class OmniConfig(PretrainedConfig):
             base_cfg["generation_kwargs"] = dict(generation_kwargs or {})
 
         base_cfg["modules"] = {
-            name: _deep_update(asdict(global_args), override) for name, override in modules_overrides.items()
+            name: _deep_update(cls._module_base(asdict(global_args)), override)
+            for name, override in modules_overrides.items()
         }
         return cls.from_dict(base_cfg)
+
+    @staticmethod
+    def _module_base(global_dict: Dict[str, Any]) -> Dict[str, Any]:
+        """Project the outer trainer's args into a per-module config base.
+
+        ``asdict(global_args)`` is a fully post-init'd config, so its DP mesh
+        sizes are already *resolved* for the outer trainer's SP (e.g. outer
+        ``ulysses_size=2`` on 8 GPUs → ``dp_shard_size=4``). A module may run a
+        different ``ulysses_size`` (per-module SP), which gives it a different
+        ``dp_size`` — so those resolved sizes must NOT leak in, or
+        ``TrainingArguments._validate_accelerator`` fails the
+        ``dp_size == dp_replicate_size * dp_shard_size`` invariant. Reset them to
+        the auto sentinel (-1) so each module re-derives its DP mesh from its own
+        SP size; an explicit per-module override still wins via the deep-merge.
+        """
+        acc = global_dict.get("train", {}).get("accelerator")
+        if isinstance(acc, dict):
+            acc["dp_replicate_size"] = -1
+            acc["dp_shard_size"] = -1
+        return global_dict
 
     @staticmethod
     def _load_modules(modules: Union[str, os.PathLike, Dict[str, Any], None]) -> Dict[str, Any]:

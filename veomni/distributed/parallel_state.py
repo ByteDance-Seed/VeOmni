@@ -85,30 +85,19 @@ class ParallelState:
                 f"The product of dp_replicate_size: {self.dp_replicate_size} and dp_shard_size: {self.dp_shard_size} should be equal to dp_size: {self.dp_size}."
             )
 
-        if self.sp_enabled:
-            from ..distributed.sequence_parallel import (
-                init_sequence_parallel,
-                set_context_parallel_group,
-                set_data_parallel_group,
-                set_ulysses_sequence_parallel_group,
-                set_unified_sequence_parallel_group,
+        # SP / DP / CP process groups are NOT cached in module-level globals.
+        # Every ``sequence_parallel.comm`` getter resolves its group from the
+        # *current* ParallelState's device mesh (see ``dp_group`` / ``sp_group``
+        # / ``ulysses_group`` / ``cp_group`` below), so a per-module forward
+        # scoped by ``use_parallel_state`` automatically gets its own groups —
+        # even when sibling Omni modules run at different SP sizes. Meshless SP
+        # is therefore unsupported (a bare ``ParallelState(ulysses_size>1)`` with
+        # no mesh has no group to resolve).
+        if self.sp_enabled and self.device_mesh is None:
+            raise ValueError(
+                "A sequence-parallel ParallelState must be built with a device mesh "
+                "(use init_parallel_state); meshless sequence-parallel init is no longer supported."
             )
-
-            if self.device_mesh is not None:
-                set_data_parallel_group(self.device_mesh.get_group("dp"))
-                if self.ulysses_size > 1:
-                    set_ulysses_sequence_parallel_group(self.device_mesh.get_group("ulysses"))
-                if self.cp_size > 1:
-                    set_context_parallel_group(self.device_mesh.get_group("cp"))
-                # set unified sequence parallel group
-                set_unified_sequence_parallel_group(self.device_mesh.get_group("sp"))
-            else:
-                init_sequence_parallel(
-                    ulysses_size=self.ulysses_size,
-                    sep_dp=True,
-                    ulysses_group_key="default",
-                    cp_size=self.cp_size,
-                )
 
     @property
     def is_initialized(self) -> bool:
@@ -136,22 +125,12 @@ class ParallelState:
         if self.device_mesh is not None:
             return self.device_mesh.get_group("dp")
 
-        if self.sp_enabled:
-            from ..distributed.sequence_parallel import get_data_parallel_group
-
-            return get_data_parallel_group()
-
-        return self.fsdp_group
+        return None
 
     @property
     def dp_rank(self) -> int:
         if self.device_mesh is not None:
             return self.device_mesh.get_local_rank("dp")
-
-        if self.sp_enabled:
-            from ..distributed.sequence_parallel import get_data_parallel_rank
-
-            return get_data_parallel_rank()
 
         return self.fsdp_rank
 
@@ -379,25 +358,15 @@ class ParallelState:
     # ------------------------------ SP ------------------------------ #
     @property
     def sp_group(self) -> Optional["ProcessGroup"]:
-        if self.device_mesh is not None:
+        if self.device_mesh is not None and self.sp_enabled:
             return self.device_mesh.get_group("sp")
-
-        if self.sp_enabled:
-            from .sequence_parallel import get_unified_sequence_parallel_group
-
-            return get_unified_sequence_parallel_group()
 
         return None
 
     @property
     def sp_rank(self) -> int:
-        if self.device_mesh is not None:
+        if self.device_mesh is not None and self.sp_enabled:
             return self.device_mesh.get_local_rank("sp")
-
-        if self.sp_enabled:
-            from .sequence_parallel import get_unified_sequence_parallel_rank
-
-            return get_unified_sequence_parallel_rank()
 
         return -1
 
@@ -411,25 +380,15 @@ class ParallelState:
 
     @property
     def ulysses_group(self) -> Optional["ProcessGroup"]:
-        if self.device_mesh is not None:
+        if self.device_mesh is not None and self.ulysses_enabled:
             return self.device_mesh.get_group("ulysses")
-
-        if self.sp_enabled:
-            from .sequence_parallel import get_ulysses_sequence_parallel_group
-
-            return get_ulysses_sequence_parallel_group()
 
         return None
 
     @property
     def ulysses_rank(self) -> int:
-        if self.device_mesh is not None:
+        if self.device_mesh is not None and self.ulysses_enabled:
             return self.device_mesh.get_local_rank("ulysses")
-
-        if self.sp_enabled:
-            from .sequence_parallel import get_ulysses_sequence_parallel_rank
-
-            return get_ulysses_sequence_parallel_rank()
 
         return -1
 
@@ -439,25 +398,15 @@ class ParallelState:
 
     @property
     def cp_group(self) -> Optional["ProcessGroup"]:
-        if self.device_mesh is not None:
+        if self.device_mesh is not None and self.cp_enabled:
             return self.device_mesh.get_group("cp")
-
-        if self.sp_enabled:
-            from .sequence_parallel import get_context_parallel_group
-
-            return get_context_parallel_group()
 
         return None
 
     @property
     def cp_rank(self) -> int:
-        if self.device_mesh is not None:
+        if self.device_mesh is not None and self.cp_enabled:
             return self.device_mesh.get_local_rank("cp")
-
-        if self.sp_enabled:
-            from .sequence_parallel import get_context_parallel_rank
-
-            return get_context_parallel_rank()
 
         return -1
 
@@ -664,7 +613,12 @@ def init_parallel_state(
 
 def set_parallel_state(parallel_state: "ParallelState") -> Optional["ParallelState"]:
     """
-    Set the global parallel state to ``parallel_state``.
+    Set the global parallel state to ``parallel_state``; returns the previous one.
+
+    The SP / DP / CP process-group getters in ``sequence_parallel.comm`` resolve
+    from whatever state is current here, so an Omni module's forward — scoped by
+    :func:`use_parallel_state` — automatically runs its collectives over its own
+    groups, even when sibling modules use a different SP size.
     """
     global _PARALLEL_STATE
     old = _PARALLEL_STATE
@@ -676,6 +630,10 @@ def set_parallel_state(parallel_state: "ParallelState") -> Optional["ParallelSta
 def use_parallel_state(parallel_state: "ParallelState"):
     """
     Temporarily make ``parallel_state`` the global parallel state, restoring on exit.
+
+    The SP / DP / CP group getters resolve from the current state, so a forward
+    run inside this scope uses ``parallel_state``'s own groups — even when
+    sibling Omni modules use a different SP size.
     """
     old = set_parallel_state(parallel_state)
     try:

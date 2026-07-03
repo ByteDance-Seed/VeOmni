@@ -4,6 +4,14 @@ from typing import Any, Dict, List, Optional
 import torch
 import torch.nn.functional as F
 
+from veomni.distributed.parallel_state import get_parallel_state
+from veomni.distributed.sequence_parallel import (
+    gather_outputs,
+    slice_input_tensor,
+    sp_gather_seqs,
+    sp_pad,
+    sp_take_own_seq,
+)
 from veomni.utils.tensor_utils import naflatten, unflatten
 
 from ....mixins.metric_meter_mixin import MetricMeterMixin
@@ -33,6 +41,15 @@ class TextEncoderModuleMixin(ModuleMixin):
         # Training state
         self._conversation_carrier: Any = None
         self._encode_batch_shape: torch.LongTensor | None = None
+        # SP state for the wte ``encode`` pass (mirrors the backbone), created only
+        # when this module runs SP: the combined SP-group packed length before the
+        # seq pad/slice, the per-rank lengths, and this rank's index within the SP
+        # group — used by ``encode_post`` to gather the embeds back and narrow to
+        # this rank's own segment.
+        if get_parallel_state().sp_enabled:
+            self._encode_sp_seqlen: Optional[int] = None
+            self._encode_sp_rep_lengths: Optional[List[int]] = None
+            self._encode_sp_group_index: int = 0
 
         # Inference state
         self._text_token_cache: list[int] = []
@@ -63,10 +80,57 @@ class TextEncoderModuleMixin(ModuleMixin):
     ) -> Dict[str, Any]:
         self._conversation_carrier = conversation_list
         input_ids = self._prepare_encode_inputs(self._conversation_carrier)
+
+        # Metering: this rank's OWN packed token count, pre-gather / pre-slice.
+        # The meter sums over the DP group only, so each rank reports just its own
+        # tokens (not the module_sp ranks SP aggregates) — identical to the non-SP
+        # run for both SP-disabled and per-module SP.
+        self.metric_meter_set_seqlens("encode", [int(input_ids.numel())])
+
+        ps = get_parallel_state()
+        if ps.sp_enabled:
+            # SP the wte lookup, matching VeOmni's whole-model SP (where the
+            # embedding is sequence-sharded too). ``input_ids`` is the flat packed
+            # token sequence; wte is a per-token lookup, so slicing it is exact.
+            # Mirror the backbone: aggregate the module SP group's distinct
+            # sequences into the combined module-group sequence, pad to a multiple
+            # of module sp_size, and embed only this rank's slice. ``encode_post``
+            # all-gathers the embeds and narrows to this rank's own segment before
+            # the per-item scatter (the carrier stays in the per-rank layout
+            # between graph nodes). wte params are sharded on the dp_shard_sp mesh,
+            # so FSDP's /sp grad averaging is already compensated by the loss-level
+            # ``reduce_sequence_parallel_loss`` (x sp) — no extra scaling here.
+            input_ids, rep_lengths, group_index = sp_gather_seqs(input_ids, dim=0)
+            self._encode_sp_rep_lengths = rep_lengths
+            self._encode_sp_group_index = group_index
+            self._encode_sp_seqlen = input_ids.size(0)
+            input_ids = sp_pad(input_ids, dim=0, pad_value=0)
+            input_ids = slice_input_tensor(input_ids, dim=0, padding=False, group=ps.sp_group)
         return {"input_ids": input_ids}
 
     @post_forward("encode")
     def encode_post(self, inputs_embeds: torch.Tensor) -> Dict[str, Any]:
+        ps = get_parallel_state()
+        if ps.sp_enabled and self._encode_sp_seqlen is not None:
+            # Gather this rank's embed slice back into the combined module-group
+            # sequence over the MODULE SP group, drop the SP pad tail
+            # (autograd-aware), then narrow to this rank's own segment so the
+            # carrier returns to the per-rank layout expected downstream.
+            inputs_embeds = gather_outputs(
+                inputs_embeds,
+                gather_dim=0,
+                padding_dim=0,
+                unpad_dim_size=self._encode_sp_seqlen,
+                group=ps.sp_group,
+            )
+            inputs_embeds = sp_take_own_seq(
+                inputs_embeds,
+                dim=0,
+                seg_lengths=self._encode_sp_rep_lengths,
+                sp_rank=self._encode_sp_group_index,
+            )
+            self._encode_sp_seqlen = None
+            self._encode_sp_rep_lengths = None
         conversation = self._conversation_carrier
         self._conversation_carrier = None
         batch_shape = self._encode_batch_shape
@@ -81,6 +145,24 @@ class TextEncoderModuleMixin(ModuleMixin):
     ) -> Dict[str, Any]:
         self._conversation_carrier = conversation_list
         hidden_states, shift_labels = self._prepare_decode_inputs(self._conversation_carrier)
+        ps = get_parallel_state()
+        if ps.sp_enabled:
+            # Shard the loss span across the MODULE SP group. The backbone already
+            # restored its hidden states to the per-rank layout, so first aggregate
+            # the module SP group's distinct spans into the combined sequence
+            # (autograd-aware), then pad to a multiple of module sp_size (labels
+            # pad with -100 so the tail is ignored) and score only this rank's
+            # slice. ``modeling.decode`` aggregates the per-rank CE via
+            # ``reduce_sequence_parallel_loss`` over the module SP group (which
+            # also undoes FSDP's /sp averaging on the dp_shard_sp mesh).
+            # ``shift_labels`` is already shifted on the FULL sequence, so slicing
+            # stays correct. The loss is a scalar — no per-rank restore needed.
+            hidden_states, _, _ = sp_gather_seqs(hidden_states, dim=0)
+            shift_labels, _, _ = sp_gather_seqs(shift_labels, dim=0)
+            hidden_states = sp_pad(hidden_states, dim=0, pad_value=0)
+            shift_labels = sp_pad(shift_labels, dim=0, pad_value=-100)
+            hidden_states = slice_input_tensor(hidden_states, dim=0, padding=False, group=ps.sp_group)
+            shift_labels = slice_input_tensor(shift_labels, dim=0, padding=False, group=ps.sp_group)
         return {"hidden_states": hidden_states, "shift_labels": shift_labels}
 
     @post_forward("decode")
@@ -286,17 +368,10 @@ class TextEncoderMetricMeterMixin(MetricMeterMixin):
         lm_head_n = self.config.vocab_size * self.config.hidden_size
         return 6 * lm_head_n * sum(seqlens) / 1e12
 
-    def metric_meter_token_lengths(self, method: str, data: Dict[str, Any]) -> List[int]:
-        # Count once, on encode: `input_ids` is the full packed sequence
-        # (pre-LLM, never SP-sliced → SP-safe). The decode pass runs lm_head over
-        # the same sequence, so its FLOPs are already covered by this count;
-        # decode itself contributes nothing (returns []).
-        if method != "encode":
-            return []
-        input_ids = data.get("input_ids")
-        if input_ids is None:
-            return []
-        return [int(input_ids.numel())]
+    # Token lengths come from ``metric_meter_set_seqlens`` in ``encode_pre`` (the
+    # full pre-slice packed length); ``decode`` stashes nothing and contributes
+    # no tokens (its lm_head FLOPs are covered by the ``encode`` count). So the
+    # default ``metric_meter_token_lengths`` (drains the stash) is used as-is.
 
 
 __all__ = ["TextEncoderModuleMixin", "TextEncoderMetricMeterMixin"]

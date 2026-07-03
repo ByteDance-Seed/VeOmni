@@ -54,7 +54,12 @@ def test_vision_dummy_forward_emits_real_shaped_zeros_without_fsdp(monkeypatch):
     vit_metadata = enc._build_vit_metadata([g, g])
 
     real_emb, real_deep = enc._encode(pixel_values, grid_thw, vit_metadata)
-    out = enc.forward(pixel_values=pixel_values, image_grid_thw=grid_thw, vit_metadata=vit_metadata, is_dummy=True)
+    out = enc.forward(
+        pixel_values=pixel_values,
+        image_grid_thw=grid_thw,
+        vit_metadata=vit_metadata,
+        is_dummy=True,
+    )
 
     assert out["image_embeds"] is not None
     assert out["image_embeds"].shape == real_emb.shape

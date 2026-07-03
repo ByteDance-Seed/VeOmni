@@ -1,0 +1,45 @@
+# Per-module Ulysses SP for Qwen3-VL-2B: only the vision tower and the multimodal
+# LLM backbone run SP=4; the text encoder (wte) stays unsharded.
+#
+# The outer (orchestrator) trainer ALWAYS runs with SP disabled (ulysses_size=1) —
+# it does no per-token sequence compute, so SP is declared PER MODULE. Each rank
+# loads its own DP shard; a module with ulysses_size > 1 gathers its SP group's
+# distinct per-rank sequences (sp_gather_seqs), slices across its SP, and
+# narrows the output back per-rank (sp_take_own_seq). The in-model backbone
+# ``qwen3vl_llm`` aggregates its distinct per-rank sequences INCLUDING deepstack
+# visual embeds, ``visual_pos_masks`` and 3-row M-RoPE ``position_ids``.
+#
+# Topology:
+#   * outer trainer        : ulysses_size = 1   (enforced; do NOT pass --accelerator.ulysses_size)
+#   * qwen3vl_vision       : ulysses_size = 4   (module SP)
+#   * qwen3vl_text_encoder : ulysses_size = 1   (no SP)
+#   * qwen3vl_llm          : ulysses_size = 4   (module SP)
+#
+# To shard the vision tower and backbone at DIFFERENT sizes, just set each
+# module's ``accelerator.ulysses_size`` independently (each must divide world).
+#
+# Each ``accelerator`` block only overrides ``ulysses_size``; the global fsdp2
+# config from base.yaml is inherited (deep-merged).
+#
+# World-size rule: world % 4 == 0.
+#
+# Launch (4 GPUs, global_batch_size 16, micro_batch_size 4):
+#   NPROC_PER_NODE=4 bash train.sh tasks/omni/train_omni.py \
+#     configs/seed_omni/Qwen/qwen3vl_2b/base.yaml \
+#     --model.modules configs/seed_omni/Qwen/qwen3vl_2b/modules_train_sp.yaml \
+#     --train.global_batch_size 16 --train.micro_batch_size 4 --train.max_steps 20
+qwen3vl_vision:
+  model:
+    model_path: qwen3vl_vision
+  accelerator:
+    ulysses_size: 4
+
+qwen3vl_text_encoder:
+  model:
+    model_path: qwen3vl_text_encoder
+
+qwen3vl_llm:
+  model:
+    model_path: qwen3vl_llm
+  accelerator:
+    ulysses_size: 4

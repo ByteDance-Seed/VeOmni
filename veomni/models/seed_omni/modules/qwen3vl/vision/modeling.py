@@ -150,11 +150,11 @@ class Qwen3VLVisionEncoder(Qwen3VLVisionEncoderModuleMixin, PreTrainedModel):
         vit_metadata: Optional[Dict[str, Any]] = None,
         is_dummy: bool = False,
     ) -> Dict[str, Any]:
-        # Real input → always encode. A worker-built dummy is only the training
-        # FSDP gradient anchor, so it runs the ViT solely under training + FSDP;
-        # otherwise (inference, or no FSDP) there is nothing to anchor, so skip the
-        # forward but still emit real-shaped zeros so the output is uniform with a
-        # real encode (pre/post never branch on dummy).
+        # ``is_dummy`` is True only when the whole batch is dummy (a worker-built
+        # placeholder that exists solely as the training FSDP gradient anchor). We
+        # still run the ViT under training + FSDP to keep that anchor alive; only an
+        # all-dummy batch with no anchor to maintain (inference / no FSDP)
+        # short-circuits to real-shaped zeros (pre/post stay branch-free).
         if is_dummy and not (self.training and get_parallel_state().fsdp_enabled):
             image_embeds, deepstack_features = self._dummy_outputs(pixel_values, image_grid_thw)
         else:

@@ -15,6 +15,7 @@ from torch.distributed.tensor import DTensor
 from transformers import PreTrainedModel, PreTrainedTokenizerBase
 
 from ......distributed.parallel_state import get_parallel_state
+from ......distributed.sequence_parallel import reduce_sequence_parallel_loss
 from ......ops.kernels.embed import AllToAllEmbedding, VocabParallelLinear
 from .configuration import TextEncoderConfig
 from .modulemixin import TextEncoderMetricMeterMixin, TextEncoderModuleMixin
@@ -121,14 +122,28 @@ class TextEncoder(TextEncoderModuleMixin, TextEncoderMetricMeterMixin, PreTraine
         loss: torch.Tensor | None = None
 
         if shift_labels is not None:
+            flat_labels = shift_labels.view(-1)
             ce_sum = F.cross_entropy(
                 logits.view(-1, logits.size(-1)),
-                shift_labels.view(-1),
+                flat_labels,
                 ignore_index=-100,
                 reduction="sum",
             )
-            n_valid = (shift_labels.view(-1) != -100).sum().clamp(min=1)
-            loss = ce_sum / n_valid
+            # Token-weighted mean over the FULL data-parallel + SP mesh
+            # (``dp_sp`` == ``fsdp_group``): every valid token is weighted equally
+            # and the objective is IDENTICAL no matter how the global batch is
+            # split into DP vs SP — the invariant that makes per-module SP
+            # accuracy-transparent. ``reduce_sequence_parallel_loss`` all-reduces
+            # this rank's local CE sum / valid-token count over ``dp_sp`` and its
+            # backward scales grads by ``|dp_sp|``, exactly cancelling FSDP2's
+            # reduce-scatter (÷dp_shard_sp) + HSDP all-reduce (÷dp_replicate) so
+            # the gradient is the true global token-mean. (A plain per-rank
+            # ``ce_sum/n_valid`` would instead give a DP mean-of-means that
+            # over-weights ranks holding few valid tokens.)
+            ps = get_parallel_state()
+            n_valid_local = (flat_labels != -100).sum()
+            local_mean = ce_sum / n_valid_local.clamp(min=1)
+            loss = reduce_sequence_parallel_loss(local_mean, n_valid_local.to(local_mean.dtype), group=ps.fsdp_group)
         elif labels is not None:
             shift_logits = logits[..., :-1, :].contiguous()
             shift_targets = labels[..., 1:].contiguous()

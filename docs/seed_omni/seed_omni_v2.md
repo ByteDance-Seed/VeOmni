@@ -72,7 +72,7 @@ The mixins expose **optional hooks** with safe defaults:
 | `get_parallel_plan()` | build | per-module FSDP/SP plan |
 | `get_assets()` | save | processors / tokenizers to checkpoint |
 | `dummy_inputs(...)` | training | zero placeholders to keep FSDP aligned |
-| `metric_meter_add(...)` / `metric_meter_collect(...)` | training | **optional** per-module token + theoretical-FLOPs meter (`MetricMeterMixin`; driven by the module-trainer, not `pre_forward`) |
+| `metric_meter_set_seqlens(...)` / `metric_meter_add(...)` / `metric_meter_collect(...)` | training | **optional** per-module token + theoretical-FLOPs meter (`MetricMeterMixin`; tokens stashed in `pre_forward` before any SP slice, drained right after) |
 
 #### Optional per-module metric meter (`mixins/metric_meter_mixin.py`, `MetricMeterMixin`)
 
@@ -80,13 +80,17 @@ The mixins expose **optional hooks** with safe defaults:
 accounting is per-module and opt-in**. The per-module meter is the optional
 `MetricMeterMixin` living on the module itself (`self.base.model` may or may not be a
 `MetricMeterMixin`) — the per-module analogue of how `helper.EnvironMeter` lives on the
-trainer. A module opts in by mixing in `MetricMeterMixin` (alongside `ModuleMixin`) and
-implementing two hooks itself — `metric_meter_token_lengths(method, data)` (its token
-count) and `estimate_flops(seqlens)` (its own theoretical-FLOPs formula). It does
-**not** touch its own `init_omni_state` / `pre_forward`. There is **no** shared
-whole-model FLOPs counter: that would mis-count at module granularity (e.g. an AR
-backbone owns no `wte` / `lm_head`, so those FLOPs belong to the `text_encoder`,
-not the backbone — each module counts only what it actually computes).
+trainer. A module opts in by mixing in `MetricMeterMixin` (alongside `ModuleMixin`) and:
+1. **reporting its tokens** by calling `metric_meter_set_seqlens(method, seqlens)`
+   **inside `pre_forward`, before any SP slice** (the one uniform token entry
+   point — even AR backbones use it, building `seqlens` from their `cu_seqlens`);
+2. **implementing `estimate_flops(seqlens)`** (its own theoretical-FLOPs formula).
+
+The default `metric_meter_token_lengths(method, data)` just drains that stash, so a
+module never reads its (possibly SP-sliced) forward `data` for metering. There is
+**no** shared whole-model FLOPs counter: that would mis-count at module granularity
+(e.g. an AR backbone owns no `wte` / `lm_head`, so those FLOPs belong to the
+`text_encoder`, not the backbone — each module counts only what it actually computes).
 
 A module has exactly **one** `seqlens`: a token is a token, whether it's a text
 token, an image patch, or a VQ token — the mixin does not distinguish modalities.
@@ -117,24 +121,29 @@ Execution is driven by the model itself (not the module's `pre_forward`).
 `OmniModel.forward` loops the FSM (`TrainingGraph.step` → `_collect_training_loss`
 → `maybe_transition`), and `TrainingGraph.step` runs one node end-to-end, which:
 
-1. runs the module's `pre_forward` → real input tensors;
+1. runs the module's `pre_forward` → real input tensors (and, for metered
+   modules, `metric_meter_set_seqlens(method, seqlens)` stashes the token lengths);
 2. feeds the meter `metric_meter_add(method, data)` — the analogue of `EnvironMeter.add`.
-   **Each module implements its own** `metric_meter_token_lengths(method, data)` +
-   `estimate_flops(seqlens)` (no generic defaults). For Janus:
-   - `janus_llama` (backbone) — packed `cu_seq_lens_q`; FLOPs = transformer
-     layers (no `lm_head`/`wte`).
-   - `janus_text_encoder` (via base `text_encoder`) — `input_ids` on `encode`;
-     FLOPs = `lm_head` (`vocab × hidden`).
+   The default `metric_meter_token_lengths` drains the `pre_forward` stash; each
+   module implements only `estimate_flops(seqlens)`. For Janus:
+   - `janus_llama` (backbone) — per-sample lengths from packed `cu_seqlens`; FLOPs
+     = transformer layers (no `lm_head`/`wte`).
+   - `janus_text_encoder` (via base `text_encoder`) — packed `input_ids` length on
+     `encode`; FLOPs = `lm_head` (`vocab × hidden`).
    - `janus_siglip` — patches-per-image from `pixel_values`; FLOPs = ViT.
-   - `janus_vqvae` — VQ tokens on `encode`, `[]` on `decode`; FLOPs = 0 (frozen
+   - `janus_vqvae` — VQ tokens on `encode`, nothing on `decode`; FLOPs = 0 (frozen
      codec, generation head not counted) — token count only.
 
-   **SP note:** the backbone (`cu_seq_lens_q`) and text encoder (`input_ids`,
-   pre-LLM full length) read full-sequence quantities, so the count is correct
-   under sequence parallelism (which is also how the single-model `EnvironMeter`
-   stays SP-safe — it counts the full `attention_mask`/`cu_seqlens` and reduces
-   over `dp_group`, which excludes SP). Vision modules count the local image
-   batch, which SP would slice — an accepted limitation;
+   **SP invariance:** every module stashes its **own** lengths
+   **before** the SP gather/slice — the AR backbones from the pre-gather
+   `position_ids`, the text encoder from the pre-gather `input_ids`, and the
+   vision modules from the pre-gather image count. `OmniEnvironMeter` sums
+   tokens + FLOPs over the **`dp_group`** only (which excludes SP), so
+   "each rank reports its own data" + "DP-sum" reconstructs the true global total.
+   The reported tokens/FLOPs/MFU are therefore **identical** across SP configs —
+   verified `sp1` == `llama-sp4` == `all-sp4` (per-module `consume_tokens` match
+   to the digit). Reporting the *post*-gather aggregate instead would over-count
+   by ~`module_sp` in per-module SP;
 3. runs the requested method (through the FSDP wrapper) + `post_forward`.
 
 At the module-trainer's `on_step_end`, `metric_meter_collect()` returns

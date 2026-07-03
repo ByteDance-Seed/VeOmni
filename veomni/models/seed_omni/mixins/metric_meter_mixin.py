@@ -31,10 +31,16 @@ A module only ever produces **time-independent** quantities:
   analogue of ``EnvironMeter.add``.  The
   :class:`~veomni.trainer.omni.omni_module_trainer.OmniModuleTrainer` calls it right after
   ``pre_forward`` (when the real input tensors are in hand), passing the node's
-  ``method`` + the forward ``data``.  **Each module implements its own**
-  :meth:`metric_meter_token_lengths` — there is no generic default, because token
-  domains differ and some call-sites shouldn't be counted (e.g. a VQ codec counts
-  on ``encode``, returns ``[]`` on ``decode``).
+  ``method`` + the forward ``data``.  A module reports its tokens by calling
+  :meth:`ModuleMixin.metric_meter_set_seqlens
+  <veomni.models.seed_omni.mixins.modulemixin.ModuleMixin.metric_meter_set_seqlens>`
+  inside its ``pre_forward`` **before any SP slice** (that setter lives on
+  ``ModuleMixin`` so the hooks calling it resolve statically; token domains differ
+  — text seq len vs image patches vs VQ tokens — and some call-sites aren't
+  counted, e.g. a VQ codec counts on ``encode`` and stashes nothing on
+  ``decode``). The default :meth:`metric_meter_token_lengths` simply drains that
+  stash, so metering is identical with or without SP (measuring the
+  post-``pre_forward`` shard directly would under-count by ~``sp``).
 * :meth:`metric_meter_collect` returns ``(theoretical_flops, seqlens)`` — the total
   theoretical TFLOPs for this module's compute over the step plus its raw token
   lengths.  **No timing, no MFU, no cross-rank reduction here.**
@@ -53,8 +59,9 @@ mis-count at module granularity).
 
 Opt-in is by **multiple inheritance**, NOT by ``ModuleMixin`` (``ModuleMixin``
 does *not* inherit ``MetricMeterMixin``). A module that wants metering defines its own
-``XxxMetricMeterMixin(MetricMeterMixin)`` implementing ``estimate_flops`` +
-``metric_meter_token_lengths``, and its concrete model multi-inherits it, e.g.::
+``XxxMetricMeterMixin(MetricMeterMixin)`` implementing just ``estimate_flops`` (token
+lengths come from the ``ModuleMixin.metric_meter_set_seqlens`` stash via the default
+``metric_meter_token_lengths``), and its concrete model multi-inherits it, e.g.::
 
     class TextEncoder(TextEncoderModuleMixin, TextEncoderMetricMeterMixin, PreTrainedModel): ...
 
@@ -97,22 +104,25 @@ class MetricMeterMixin:
         )
 
     def metric_meter_token_lengths(self, method: str, data: Dict[str, Any]) -> List[int]:
-        """Per-sample token lengths this module processes for call-site ``method``.
+        """Per-sample token lengths this module processed for call-site ``method``.
 
-        **Each metered module implements its own** — there is no generic default,
-        because token domains differ (text seq len vs image patches vs VQ tokens)
-        and some call-sites shouldn't be counted at all.  ``method`` is the graph
-        node's call-site (``"forward"`` / ``"encode"`` / ``"decode"`` / …) and
-        ``data`` is the post-``pre_forward`` kwargs the module is about to run on
-        (the real forward inputs).
+        Canonical path: drain the FULL, SP-invariant lengths a module stashed via
+        :meth:`ModuleMixin.metric_meter_set_seqlens
+        <veomni.models.seed_omni.mixins.modulemixin.ModuleMixin.metric_meter_set_seqlens>`
+        in its ``pre_forward``. A call-site that stashed nothing (e.g. a VQ codec's
+        ``decode``) returns ``[]`` and contributes nothing — so ``data`` is unused.
 
-        Return ``[]`` to skip a call — e.g. a VQ codec counts its tokens on
-        ``encode`` but returns ``[]`` on ``decode``; empty contributions never
-        enter the meter.
+        This unified stash replaces the old per-module readers that measured the
+        post-``pre_forward`` kwargs directly: under SP those kwargs are this rank's
+        shard, which under-counts tokens/FLOPs by ~``sp``. Stashing the full
+        pre-slice own-data length keeps metering identical across SP configs. A
+        module may still override this, but the stash is the intended mechanism.
         """
-        raise NotImplementedError(
-            f"{type(self).__name__} mixes in MetricMeterMixin but does not implement metric_meter_token_lengths(method, data)."
-        )
+        del data
+        store = getattr(self, "_metric_full_seqlens", None)
+        if store is None:
+            return []
+        return store.pop(method, [])
 
     def metric_meter_add(self, method: str, data: Dict[str, Any]) -> None:
         """Accumulate this micro-batch's token lengths (per-module ``meter.add``).

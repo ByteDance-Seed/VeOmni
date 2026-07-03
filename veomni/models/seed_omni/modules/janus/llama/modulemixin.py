@@ -3,6 +3,13 @@ from typing import Any, Dict, List, Optional
 import torch
 
 from veomni.distributed.parallel_state import get_parallel_state
+from veomni.distributed.sequence_parallel import (
+    gather_outputs,
+    slice_input_tensor,
+    sp_gather_seqs,
+    sp_pad,
+    sp_take_own_seq,
+)
 from veomni.utils.seqlen_pos_transform_utils import prepare_fa_kwargs_from_position_ids, valid_seqlens_from_cu_seqlens
 from veomni.utils.tensor_utils import naflatten, unflatten
 
@@ -17,6 +24,15 @@ class JanusLlamaModuleMixin(ModuleMixin):
         # Training state
         self._conversation_carrier: Optional[list[list[ConversationItem]]] = None
         self._pack_inputs_embeds_shape: Optional[torch.Tensor] = None
+        # Combined module-SP-group packed length captured after the per-rank
+        # aggregation but before the SP seq-pad/slice in ``forward_pre``;
+        # ``forward_post`` gathers the hidden states back and trims to it.
+        self._sp_seqlen: Optional[int] = None
+        # Per-rank packed lengths + this rank's index within the module SP group,
+        # used by ``forward_post`` to narrow the gathered full sequence back to
+        # this rank's own segment.
+        self._sp_rep_lengths: Optional[List[int]] = None
+        self._sp_group_index: int = 0
 
         # Inference state
         self._cfg_active: bool = False
@@ -40,11 +56,47 @@ class JanusLlamaModuleMixin(ModuleMixin):
         self._conversation_carrier = conversation_list
         self._pack_inputs_embeds_shape = inputs_embeds_shape
 
-        if get_parallel_state().sp_enabled:
-            raise NotImplementedError("SP is not supported yet")
-        (cu_seq_lens_q, cu_seq_lens_k), (max_length_q, max_length_k) = prepare_fa_kwargs_from_position_ids(
-            position_ids
-        )
+        # Metering: this rank's OWN per-sample lengths, from the
+        # pre-gather / pre-slice packed ``position_ids``. ``OmniEnvironMeter``
+        # sums tokens+FLOPs over the DP group only, so each rank must report just
+        # its own data — NOT the module_sp ranks the module SP later aggregates
+        # (that would over-count by ~module_sp). This keeps tokens/FLOPs identical
+        # to the non-SP run for both SP-disabled and per-module SP.
+        (_metric_cu, _), _ = prepare_fa_kwargs_from_position_ids(position_ids)
+        self.metric_meter_set_seqlens("forward", [int(s) for s in valid_seqlens_from_cu_seqlens(_metric_cu).tolist()])
+
+        self._sp_seqlen = None
+        self._sp_rep_lengths = None
+        self._sp_group_index = 0
+        ps = get_parallel_state()
+        if ps.sp_enabled:
+            # 1) Per-rank aggregation: this module's SP group of module_sp ranks
+            #    each holds a DISTINCT packed sequence. Concatenate them into the
+            #    combined module-group sequence (autograd-aware).
+            inputs_embeds, rep_lengths, group_index = sp_gather_seqs(inputs_embeds, dim=1)
+            position_ids, _, _ = sp_gather_seqs(position_ids, dim=1)
+            attention_mask, _, _ = sp_gather_seqs(attention_mask, dim=1)
+            self._sp_rep_lengths = rep_lengths
+            self._sp_group_index = group_index
+            # 2) SP seq slice over the MODULE's own SP group: pad the full
+            #    sequence to a multiple of module sp_size, build FA cu_seqlens
+            #    over the FULL padded sequence (the attention all-to-all
+            #    reconstructs it before the varlen kernel), then feed this rank
+            #    only its sequence chunk. ``attention_mask`` stays full (all-ones)
+            #    per the SP contract; ``forward_post`` gathers the hidden states.
+            self._sp_seqlen = inputs_embeds.size(1)
+            inputs_embeds = sp_pad(inputs_embeds, dim=1, pad_value=0)
+            attention_mask = sp_pad(attention_mask, dim=1, pad_value=1)
+            position_ids = sp_pad(position_ids, dim=1, pad_value=0)
+            (cu_seq_lens_q, cu_seq_lens_k), (max_length_q, max_length_k) = prepare_fa_kwargs_from_position_ids(
+                position_ids
+            )
+            inputs_embeds = slice_input_tensor(inputs_embeds, dim=1, padding=False, group=ps.sp_group)
+            position_ids = slice_input_tensor(position_ids, dim=1, padding=False, group=ps.sp_group)
+        else:
+            (cu_seq_lens_q, cu_seq_lens_k), (max_length_q, max_length_k) = prepare_fa_kwargs_from_position_ids(
+                position_ids
+            )
         return dict(
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
@@ -60,8 +112,24 @@ class JanusLlamaModuleMixin(ModuleMixin):
     def forward_post(self, **outputs: Any) -> Dict[str, Any]:
         hidden_states = outputs.get("hidden_states")
 
-        if get_parallel_state().sp_enabled:
-            raise NotImplementedError("SP is not supported yet")
+        ps = get_parallel_state()
+        if ps.sp_enabled:
+            # Gather the per-rank sequence chunks back into the combined
+            # module-group packed sequence over the MODULE's SP group and drop the
+            # SP padding tail (autograd-aware), then narrow back to this rank's own
+            # segment so the carrier returns to the per-rank layout.
+            hidden_states = gather_outputs(
+                hidden_states,
+                gather_dim=1,
+                padding_dim=1,
+                unpad_dim_size=self._sp_seqlen,
+                group=ps.sp_group,
+            )
+            hidden_states = sp_take_own_seq(
+                hidden_states, dim=1, seg_lengths=self._sp_rep_lengths, sp_rank=self._sp_group_index
+            )
+            self._sp_seqlen = None
+            self._sp_rep_lengths = None
 
         conversation = self._conversation_carrier
         pack_shape = self._pack_inputs_embeds_shape
@@ -254,15 +322,6 @@ class JanusLlamaMetricMeterMixin(MetricMeterMixin):
     """Per-module training meter for the Janus LLaMA backbone (transformer layers only)."""
 
     config: JanusLlamaConfig
-
-    def metric_meter_token_lengths(self, method: str, data: Dict[str, Any]) -> List[int]:
-        # Backbone only runs "forward"; its tokens are the packed per-sample
-        # sequence lengths (text + spliced image tokens), read from the
-        # FlashAttention cu_seqlens its pre_forward built.
-        cu_seq_lens_q = data.get("cu_seq_lens_q")
-        if cu_seq_lens_q is None:
-            return []
-        return [int(s) for s in valid_seqlens_from_cu_seqlens(cu_seq_lens_q).tolist()]
 
     def estimate_flops(self, seqlens: List[int]) -> float:
         # Transformer layers only: this backbone owns no wte / lm_head (those

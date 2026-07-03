@@ -33,6 +33,7 @@ from transformers.models.janus.modeling_janus import (
 )
 
 from ......distributed.parallel_state import get_parallel_state
+from ......distributed.sequence_parallel import reduce_sequence_parallel_loss
 from .configuration import JanusVqvaeConfig
 from .modulemixin import JanusVqvaeMetricMeterMixin, JanusVqvaeModuleMixin
 from .processing import JanusVqvaeProcessor
@@ -113,11 +114,11 @@ class JanusVqvae(JanusVqvaeModuleMixin, JanusVqvaeMetricMeterMixin, PreTrainedMo
         pixel_values: Optional[torch.Tensor] = None,
         is_dummy: bool = False,
     ) -> Dict[str, Any]:
-        # Real pixels → always encode. A worker-built dummy is only the training
-        # FSDP gradient anchor, so it runs the codec solely under training + FSDP;
-        # otherwise (inference, or no FSDP) there is nothing to anchor, so skip the
-        # forward but still emit real-shaped zeros so the output is uniform with a
-        # real encode (pre/post never branch on dummy).
+        # ``is_dummy`` is True only when the whole batch is dummy (a worker-built
+        # placeholder that exists solely as the training FSDP gradient anchor). We
+        # still run the codec under training + FSDP to keep that anchor alive; only
+        # an all-dummy batch with no anchor to maintain (inference / no FSDP)
+        # short-circuits to real-shaped zeros (pre/post stay branch-free).
         if is_dummy and not (self.training and get_parallel_state().fsdp_enabled):
             return self._dummy_encode_outputs(pixel_values)
         return self._encode_pixels(pixel_values)
@@ -129,25 +130,40 @@ class JanusVqvae(JanusVqvaeModuleMixin, JanusVqvaeMetricMeterMixin, PreTrainedMo
         is_dummy: bool = False,
         **kwargs: Any,
     ) -> Dict[str, Any]:
-        del kwargs
+        del kwargs, is_dummy
         if hidden_states is None or labels is None:
             return {}
-        if is_dummy:
-            # Under training + FSDP, route the dummy span through the generation
-            # head so its reduce-scatter fires on every rank (the gradient anchor).
-            # Otherwise (inference, or no FSDP) no collective sync is needed, so
-            # return a 0.0 loss directly.
-            if self.training and get_parallel_state().fsdp_enabled:
-                return {"loss": self.generation_head(hidden_states).sum() * 0.0}
-            return {"loss": hidden_states.sum() * 0.0}
+        # Always route through ``_vq_loss`` — it reduces the loss over the whole
+        # ``dp_sp`` (``fsdp_group``) mesh, so EVERY data-parallel rank must reach
+        # the collective (an early ``is_dummy`` return on only some DP ranks would
+        # desync it and hang). An all-dummy span is handled naturally: its rows are
+        # ``-100`` so CE contributes 0 and the clamped denominator yields 0.0 (not
+        # NaN), while ``generation_head`` still runs as the FSDP gradient anchor.
         return {"loss": self._vq_loss(hidden_states, labels)}
 
     def _vq_loss(self, hidden_states: torch.Tensor, gt_token_ids: torch.Tensor) -> torch.Tensor:
         # ``hidden_states`` is already teacher-forcing aligned in
         # ``_prepare_decode_inputs`` (row i = hidden after the previous token,
         # predicting VQ id i), so no further shift here — shifting again would
-        # mis-align by one and bleed across concatenated image spans. Labels are
-        # pure VQ codebook ids (every decoded row is an image token, no -100).
+        # mis-align by one and bleed across concatenated image spans. Labels are VQ
+        # codebook ids with -100 on dummy rows, so CE always uses ``ignore_index=-100``.
+        # ``generation_head`` runs unconditionally (FSDP gradient anchor), and the
+        # loss is a token-weighted mean over VALID rows: summing CE then dividing by
+        # the clamped valid-token count makes an all-dummy span yield 0.0 instead of
+        # NaN, on every path.
         labels = gt_token_ids.to(hidden_states.device)
         logits = self.generation_head(hidden_states)
-        return F.cross_entropy(logits.reshape(-1, logits.size(-1)), labels.reshape(-1))
+        flat_labels = labels.reshape(-1)
+        ce_sum = F.cross_entropy(logits.reshape(-1, logits.size(-1)), flat_labels, ignore_index=-100, reduction="sum")
+        # Token-weighted mean over the FULL data-parallel + SP mesh (``dp_sp`` ==
+        # ``fsdp_group``): the loss/gradient is identical regardless of how the
+        # global batch is split into DP vs SP (per-module SP transparency) and
+        # every valid VQ row is weighted equally. ``reduce_sequence_parallel_loss``
+        # all-reduces the local CE sum / valid-row count over ``dp_sp`` and scales
+        # grads by ``|dp_sp|`` in backward, cancelling FSDP2's reduce-scatter
+        # (÷dp_shard_sp) + HSDP all-reduce (÷dp_replicate) averaging. An all-dummy
+        # span yields 0.0 (clamped denominator), not NaN, on every rank.
+        ps = get_parallel_state()
+        n_valid_local = (flat_labels != -100).sum()
+        local_mean = ce_sum / n_valid_local.clamp(min=1)
+        return reduce_sequence_parallel_loss(local_mean, n_valid_local.to(local_mean.dtype), group=ps.fsdp_group)

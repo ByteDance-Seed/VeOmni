@@ -1,6 +1,6 @@
 sources:
   - /mnt/hdfs/veomni/datasets/sharegpt4v_cap_100k
-  - /mnt/hdfs/veomni/datasets/llava_video
+  - /mnt/hdfs/user_dir/dataset/LLaVA-Video-178K_0_30_s_academic_v0_1
   - /mnt/hdfs/veomni/datasets/tulu-3-sft-mixture/data
 names:
   - sharegpt4v_cap_100k

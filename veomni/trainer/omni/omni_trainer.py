@@ -61,7 +61,7 @@ from ...arguments import OmniArguments
 from ...data import SeedOmniCollator
 from ...data.data_transform import build_data_transform
 from ...distributed.clip_grad_norm import veomni_omni_module_clip_grad_norm
-from ...distributed.parallel_state import use_parallel_state
+from ...distributed.parallel_state import get_parallel_state, use_parallel_state
 from ...models.seed_omni.graphs import GraphProfiler
 from ...models.seed_omni.mixins.metric_meter_mixin import MetricMeterResult
 from ...models.seed_omni.modeling_omni import OmniModel, _unwrap_module
@@ -281,6 +281,16 @@ class OmniTrainer:
         self.base.args = args
 
         self.base._setup()
+
+        # SP is a per-module concern; the orchestrator must run with SP disabled.
+        outer_ps = get_parallel_state()
+        if outer_ps.sp_size != 1:
+            raise ValueError(
+                "OmniTrainer requires the outer (orchestrator) sequence-parallel size to be 1 "
+                f"(got ulysses_size={outer_ps.ulysses_size}, cp_size={outer_ps.cp_size}). "
+                "Declare sequence parallelism per module via each module's accelerator.ulysses_size instead."
+            )
+
         self._build_model()
         self._freeze_model_module()
         self._build_model_assets()

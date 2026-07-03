@@ -7,7 +7,7 @@ and only adds the Expert-Parallel (``ep``) plan for the fused experts.  The
 metric meter mixin overrides the FLOPs estimate with the MoE (sparse-MLP) cost.
 """
 
-from typing import Any, Dict, List
+from typing import List
 
 from torch.distributed._tensor import Shard
 
@@ -35,14 +35,6 @@ class Qwen3MoeLlmMetricMeterMixin(MetricMeterMixin):
     """Per-module training meter for the Qwen3-MoE backbone (transformer layers only)."""
 
     config: Qwen3MoeLlmConfig
-
-    def metric_meter_token_lengths(self, method: str, data: Dict[str, Any]) -> List[int]:
-        from veomni.utils.seqlen_pos_transform_utils import valid_seqlens_from_cu_seqlens
-
-        cu_seq_lens_q = data.get("cu_seq_lens_q")
-        if cu_seq_lens_q is None:
-            return []
-        return [int(s) for s in valid_seqlens_from_cu_seqlens(cu_seq_lens_q).tolist()]
 
     def estimate_flops(self, seqlens: List[int]) -> float:
         # Transformer layers only (no wte / lm_head — those live in text_encoder).
