@@ -6,6 +6,7 @@ This guide provides comprehensive information for using VeOmni framework with As
 
 ### What This Guide Covers
 
+- **Supported Hardware**: List of Ascend NPU products compatible with VeOmni
 - **Installation**: Step-by-step instructions for setting up VeOmni on Ascend NPU platforms
 - **Supported Models**: List of multi-modal models that can be trained on Ascend NPUs
 - **Environment Configuration**: Important environment variables and settings for optimal performance
@@ -17,6 +18,19 @@ This guide provides comprehensive information for using VeOmni framework with As
 2026/5/11: VeOmni provides images of the version of Ascend Cann9.0.0.
 
 2025/12/23: VeOmni supports training on Ascend NPU.
+
+## Supported Hardware
+
+Product Hardware Support List
+
+|Product| Supported |
+|--|:---------:|
+|<term>Ascend 950 Series Products</term>|     ✅     |
+|<term>Atlas A3 Training Series Products</term>|     ✅     |
+|<term>Atlas A2 Training Series Products</term>|     ✅     |
+
+- For the operating systems supported by each hardware product in bare-metal deployment scenarios, please refer to the Compatibility Query Assistant(https://www.hiascend.com/hardware/compatibility).
+- For the operating systems supported by each hardware product in virtual machine and container deployment scenarios, please refer to the "Operating System Compatibility Description"(https://www.hiascend.com/document/detail/zh/canncommercial/900/softwareinst/instg/instg_0101.html?OS=openEuler&InstallType=netyum) chapter of the CANN Software Installation Guide(Commercial Edition) or the "Operating System Compatibility Description"(https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/900/softwareinst/instg/instg_0101.html?OS=openEuler&InstallType=netyum) chapter (Community Edition).
 
 ## Installation
 
