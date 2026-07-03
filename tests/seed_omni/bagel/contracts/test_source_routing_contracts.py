@@ -14,7 +14,8 @@ from veomni.models.seed_omni.modules.bagel.sources import (
     BAGEL_SIGLIP_CONTEXT,
     BAGEL_VAE_CONTEXT,
 )
-from veomni.models.seed_omni.utils.conversation import ConversationItem
+from veomni.models.seed_omni.modules.bagel.vae.processing import route_image_sources
+from veomni.models.seed_omni.utils.conversation import _IMG_TAG_KEY, ConversationItem
 
 
 def test_bagel_qwen2_mot_infer_mode_uses_v2_infer_type() -> None:
@@ -30,6 +31,108 @@ def test_bagel_qwen2_mot_infer_mode_preserves_current_mode_without_infer_type() 
 
     assert state.update_infer_mode({"infer_type": "infer_gen"}) == "gen"
     assert state.update_infer_mode({}) == "gen"
+
+
+def test_bagel_route_image_sources_prefers_img_tag() -> None:
+    und = ConversationItem(
+        type="image",
+        value=torch.zeros(3, 2, 2),
+        role="user",
+        meta={_IMG_TAG_KEY: "und"},
+    )
+    gen = ConversationItem(
+        type="image",
+        value=torch.ones(3, 2, 2),
+        role="assistant",
+        meta={_IMG_TAG_KEY: "gen"},
+    )
+    edit = ConversationItem(
+        type="image",
+        value=torch.full((3, 2, 2), 2),
+        role="user",
+        meta={_IMG_TAG_KEY: "edit"},
+    )
+    sample = [und, gen, edit]
+
+    route_image_sources([sample], inference=False, infer_type=None)
+
+    assert sample[0] is und
+    assert sample[0].source == BAGEL_SIGLIP_CONTEXT
+    assert sample[1] is gen
+    assert sample[1].source == BAGEL_VAE_CONTEXT
+    assert sample[2].source == BAGEL_VAE_CONTEXT
+    assert sample[3] is edit
+    assert sample[3].source == BAGEL_SIGLIP_CONTEXT
+    assert sample[2].meta == sample[3].meta == {_IMG_TAG_KEY: "edit"}
+    assert sample[2] is not sample[3]
+    sample[2].value[0, 0, 0] = 99
+    assert int(sample[3].value[0, 0, 0]) == 2
+
+
+def test_bagel_route_image_sources_requires_img_tag_for_raw_images() -> None:
+    image = ConversationItem(type="image", value=torch.zeros(3, 2, 2), role="assistant")
+
+    with pytest.raises(ValueError, match="_img_tag"):
+        route_image_sources([[image]], inference=False, infer_type=None)
+
+    with pytest.raises(ValueError, match="_img_tag"):
+        route_image_sources([[image]], inference=True, infer_type="infer_gen")
+
+
+def test_bagel_route_image_sources_uses_infer_type_for_raw_inference_images() -> None:
+    edit_user = ConversationItem(type="image", value=torch.full((3, 2, 2), 3), role="user")
+    und_user = ConversationItem(type="image", value=torch.ones(3, 2, 2), role="user")
+    gen_user = ConversationItem(type="image", value=torch.zeros(3, 2, 2), role="user")
+    edit_sample = [edit_user]
+    und_sample = [und_user]
+    gen_sample = [gen_user]
+
+    route_image_sources([edit_sample], inference=True, infer_type="infer_edit")
+    route_image_sources([und_sample], inference=True, infer_type="infer_und")
+    route_image_sources([gen_sample], inference=True, infer_type="infer_gen")
+
+    assert edit_sample[0].source == BAGEL_VAE_CONTEXT
+    assert edit_sample[1] is edit_user
+    assert edit_sample[1].source == BAGEL_SIGLIP_CONTEXT
+    assert und_sample[0] is und_user
+    assert und_user.source == BAGEL_SIGLIP_CONTEXT
+    assert gen_sample[0] is gen_user
+    assert gen_user.source == BAGEL_SIGLIP_CONTEXT
+
+
+def test_bagel_route_image_sources_preserves_already_routed_images_without_img_tag() -> None:
+    siglip = ConversationItem(
+        type="image",
+        value=torch.zeros(3, 2, 2),
+        role="user",
+        source=BAGEL_SIGLIP_CONTEXT,
+    )
+    vae = ConversationItem(
+        type="image",
+        value=torch.ones(3, 2, 2),
+        role="assistant",
+        source=BAGEL_VAE_CONTEXT,
+    )
+    sample = [siglip, vae]
+
+    route_image_sources([sample], inference=True, infer_type="infer_edit")
+
+    assert sample[0] is siglip
+    assert sample[1] is vae
+    assert siglip.source == BAGEL_SIGLIP_CONTEXT
+    assert vae.source == BAGEL_VAE_CONTEXT
+
+
+def test_bagel_route_image_sources_rejects_unknown_img_tag() -> None:
+    image = ConversationItem(
+        type="image",
+        value=torch.zeros(3, 2, 2),
+        role="user",
+        meta={_IMG_TAG_KEY: "other"},
+    )
+
+    with pytest.raises(ValueError, match="_img_tag"):
+        route_image_sources([[image]], inference=False, infer_type=None)
 
 
 def test_bagel_denoise_item_source_lifecycle() -> None:

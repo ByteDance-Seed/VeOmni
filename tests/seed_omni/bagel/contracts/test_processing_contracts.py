@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 from PIL import Image
 
@@ -9,9 +10,10 @@ from tests.seed_omni.bagel.contracts.helpers import config_cls, model_cls
 from veomni.models.seed_omni.modules.bagel.sources import (
     BAGEL_FLOW_VELOCITY,
     BAGEL_GENERATED_LATENT,
+    BAGEL_SIGLIP_CONTEXT,
     BAGEL_VAE_CONTEXT,
 )
-from veomni.models.seed_omni.utils.conversation import ConversationItem
+from veomni.models.seed_omni.utils.conversation import _IMG_TAG_KEY, ConversationItem
 
 
 def test_bagel_training_text_embed_meta_preserves_grad():
@@ -74,6 +76,83 @@ def test_bagel_training_flow_metadata_matches_packed_noising_dtype():
     assert expected_noise.shape == clean.shape
     assert torch.equal(item.meta["flow_velocity_target"], expected_noise - clean)
     assert torch.equal(inputs["latents"], expected_noised)
+
+
+def test_bagel_mot_packing_treats_tagged_edit_vae_as_clean_context():
+    from veomni.models.seed_omni.modules.bagel.qwen2_mot.processing import preprocess_mot_inputs
+
+    edit_context = ConversationItem(
+        type="image",
+        value=torch.ones(2, 4),
+        role="assistant",
+        source=BAGEL_VAE_CONTEXT,
+        meta={_IMG_TAG_KEY: "edit"},
+    )
+    gen_target = ConversationItem(
+        type="image",
+        value=torch.full((2, 4), 2),
+        role="assistant",
+        source=BAGEL_VAE_CONTEXT,
+        meta={_IMG_TAG_KEY: "gen"},
+    )
+    siglip_context = ConversationItem(
+        type="image",
+        value=torch.full((1, 4), 3),
+        role="user",
+        source=BAGEL_SIGLIP_CONTEXT,
+        meta={_IMG_TAG_KEY: "edit"},
+    )
+
+    packed = preprocess_mot_inputs(
+        [[edit_context, gen_target, siglip_context]],
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        hidden_size=4,
+    )
+
+    assert packed is not None
+    assert torch.equal(packed.packed_gen_token_indexes, torch.tensor([2, 3]))
+    assert torch.equal(packed.packed_und_token_indexes, torch.tensor([0, 1, 4]))
+    mask = packed.nested_attention_masks[0]
+    assert torch.isneginf(mask[0, 2])  # clean context cannot attend target/noise tokens
+    assert mask[0, 1] == 0  # edit VAE context uses full attention within its span
+    assert mask[2, 0] == 0  # noised target can still attend previous context
+    assert mask[2, 3] == 0  # noised target attends itself
+    assert torch.isneginf(mask[4, 2])  # later clean context cannot see noised target tokens
+
+
+def test_bagel_mot_packing_treats_untagged_vae_as_inference_context():
+    from veomni.models.seed_omni.modules.bagel.qwen2_mot.processing import preprocess_mot_inputs
+
+    context = ConversationItem(
+        type="image",
+        value=torch.ones(2, 4),
+        role="assistant",
+        source=BAGEL_VAE_CONTEXT,
+        meta={},
+    )
+
+    packed = preprocess_mot_inputs([[context]], device=torch.device("cpu"), dtype=torch.float32, hidden_size=4)
+
+    assert packed is not None
+    assert torch.equal(packed.packed_gen_token_indexes, torch.empty(0, dtype=torch.long))
+    assert torch.equal(packed.packed_und_token_indexes, torch.tensor([0, 1]))
+    assert packed.nested_attention_masks[0][0, 1] == 0
+
+
+def test_bagel_mot_packing_rejects_incompatible_vae_img_tag():
+    from veomni.models.seed_omni.modules.bagel.qwen2_mot.processing import preprocess_mot_inputs
+
+    item = ConversationItem(
+        type="image",
+        value=torch.ones(2, 4),
+        role="assistant",
+        source=BAGEL_VAE_CONTEXT,
+        meta={_IMG_TAG_KEY: "und"},
+    )
+
+    with pytest.raises(ValueError, match="_img_tag"):
+        preprocess_mot_inputs([[item]], device=torch.device("cpu"), dtype=torch.float32, hidden_size=4)
 
 
 def test_bagel_vae_infer_encode_updates_vae_context_image_in_place():

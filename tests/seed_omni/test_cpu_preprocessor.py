@@ -62,7 +62,7 @@ from veomni.models.seed_omni.modules.qwen3vl.vision.modulemixin import (
     _OMNI_GRID,
     Qwen3VLVisionCPUPreprocessor,
 )
-from veomni.models.seed_omni.utils.conversation import ConversationItem, iter_desired_items
+from veomni.models.seed_omni.utils.conversation import _IMG_TAG_KEY, ConversationItem, iter_desired_items
 from veomni.utils.tensor_utils import naflatten, unflatten
 
 
@@ -435,7 +435,9 @@ def test_bagel_preprocessors_route_inference_edit_prompt_context():
         [
             ConversationItem(type="text", value="hi", role="user"),
             ConversationItem(type="image", value=user_image.clone(), role="user"),
-            ConversationItem(type="image", value=assistant_image.clone(), role="assistant"),
+            ConversationItem(
+                type="image", value=assistant_image.clone(), role="assistant", meta={_IMG_TAG_KEY: "gen"}
+            ),
         ]
     ]
 
@@ -475,6 +477,47 @@ def test_bagel_preprocessors_route_inference_edit_prompt_context():
         BAGEL_VAE_CONTEXT,
     ]
     assert [int(sample[i].value.numel()) for i in [1, 3, 4, 6, 7, 9]] == [1, 1, 1, 1, 1, 1]
+
+
+def test_bagel_preprocessors_route_tagged_edit_without_infer_type():
+    text_pre = BagelTextEncoderCPUPreprocessor(_bagel_template())
+    siglip_pre = BagelSiglipNavitCPUPreprocessor(
+        BagelSiglipNavitProcessor(patch_size=2, image_size=4, min_image_size=2, max_pixels=16),
+        dtype=torch.bfloat16,
+    )
+    vae_pre = BagelVAECPUPreprocessor(
+        BagelVAEProcessor(image_stride=2, min_image_size=4, max_image_size=4, max_pixels=16),
+        dtype=torch.bfloat16,
+    )
+    user_image = torch.full((3, 4, 4), 7, dtype=torch.uint8)
+    assistant_image = torch.full((3, 4, 4), 9, dtype=torch.uint8)
+    batch = [
+        [
+            ConversationItem(type="text", value="edit", role="user"),
+            ConversationItem(type="image", value=user_image.clone(), role="user", meta={_IMG_TAG_KEY: "edit"}),
+            ConversationItem(
+                type="image", value=assistant_image.clone(), role="assistant", meta={_IMG_TAG_KEY: "gen"}
+            ),
+        ]
+    ]
+
+    for preprocessor in (vae_pre, siglip_pre, text_pre):
+        preprocessor(batch)
+
+    sample = batch[0]
+    assert [item.source for item in sample if item.type == "image"] == [
+        BAGEL_VAE_CONTEXT,
+        BAGEL_SIGLIP_CONTEXT,
+        BAGEL_VAE_CONTEXT,
+    ]
+    assert [item.meta.get(_IMG_TAG_KEY) for item in sample if item.type == "image"] == ["edit", "edit", "gen"]
+    vae_source, siglip_source, vae_target = (item for item in sample if item.type == "image")
+    assert vae_source.value.shape == (3, 4, 4)
+    assert vae_source.value.dtype == torch.bfloat16
+    assert siglip_source.value.shape == (4, 2 * 2 * 3)
+    assert siglip_source.value.dtype == torch.bfloat16
+    assert vae_target.value.shape == (3, 4, 4)
+    assert vae_target.value.dtype == torch.bfloat16
 
 
 def test_bagel_preprocessors_route_inference_und_user_image_to_siglip_only():
@@ -638,8 +681,18 @@ def test_qwen3vl_vision_preprocessor_splits_and_recombines():
 
 def test_qwen3vl_vision_preprocessor_normalizes_user_and_leaves_assistant_untouched():
     proc = FakeQwen3VLImageProcessor()
-    user_img = ConversationItem(type="image", value=torch.zeros(3, 4, 4, dtype=torch.uint8), role="user")
-    asst_img = ConversationItem(type="image", value=torch.ones(3, 4, 4, dtype=torch.uint8), role="assistant")
+    user_img = ConversationItem(
+        type="image",
+        value=torch.zeros(3, 4, 4, dtype=torch.uint8),
+        role="user",
+        meta={_IMG_TAG_KEY: "gen"},
+    )
+    asst_img = ConversationItem(
+        type="image",
+        value=torch.ones(3, 4, 4, dtype=torch.uint8),
+        role="assistant",
+        meta={_IMG_TAG_KEY: "und"},
+    )
     batch = [[user_img, asst_img]]
     pre = Qwen3VLVisionCPUPreprocessor(
         proc,
@@ -649,8 +702,7 @@ def test_qwen3vl_vision_preprocessor_normalizes_user_and_leaves_assistant_untouc
         dummy_grid=[1, 2, 2],
     )
     pre(batch)
-    # User image normalized (patches on value + grid stashed); assistant image is
-    # left raw — the vision tower only consumes user images.
+    # Qwen3VL is role/type-driven: _img_tag metadata is ignored here.
     assert user_img.value.dtype == torch.bfloat16 and user_img.meta[_OMNI_GRID] == [1, 2, 2]
     assert asst_img.value.dtype == torch.uint8 and _OMNI_GRID not in asst_img.meta
 
@@ -660,9 +712,19 @@ def test_qwen3vl_vision_preprocessor_normalizes_user_and_leaves_assistant_untouc
 
 def _raw_image_sample():
     return [
-        ConversationItem(type="image", value=torch.full((3, 4, 4), 7, dtype=torch.uint8), role="user"),
+        ConversationItem(
+            type="image",
+            value=torch.full((3, 4, 4), 7, dtype=torch.uint8),
+            role="user",
+            meta={_IMG_TAG_KEY: "gen"},
+        ),
         ConversationItem(type="text", value="caption", role="user"),
-        ConversationItem(type="image", value=torch.full((3, 4, 4), 9, dtype=torch.uint8), role="assistant"),
+        ConversationItem(
+            type="image",
+            value=torch.full((3, 4, 4), 9, dtype=torch.uint8),
+            role="assistant",
+            meta={_IMG_TAG_KEY: "und"},
+        ),
     ]
 
 
@@ -673,9 +735,9 @@ def test_siglip_preprocessor_normalizes_only_user_images():
     batch = [_raw_image_sample()]
     pre(batch)
     user_img, _, assistant_img = batch[0]
-    # User image normalized (uint8 → model-dtype pixel tensor).
+    # Janus SigLIP is role-driven: user image is normalized even if _img_tag says gen.
     assert user_img.value.shape == (3, 4, 4) and user_img.value.dtype == torch.bfloat16
-    # Assistant image untouched by the siglip (user-only) preprocessor.
+    # Assistant image untouched by the siglip preprocessor even if _img_tag says und.
     assert assistant_img.value.dtype == torch.uint8
 
 
@@ -686,9 +748,9 @@ def test_vqvae_preprocessor_normalizes_only_assistant_images():
     batch = [_raw_image_sample()]
     pre(batch)
     user_img, _, assistant_img = batch[0]
-    # Assistant image normalized (uint8 → model-dtype pixel tensor); user image
-    # left to siglip.
+    # Janus VQVAE is role-driven: assistant image is normalized even if _img_tag says und.
     assert assistant_img.value.shape == (3, 4, 4) and assistant_img.value.dtype == torch.bfloat16
+    # User image left to siglip even if _img_tag says gen.
     assert user_img.value.dtype == torch.uint8
 
 

@@ -13,8 +13,11 @@ from torchvision.transforms import InterpolationMode
 from torchvision.transforms import functional as TVF
 from transformers.image_processing_utils import BaseImageProcessor, BatchFeature
 
-from ....utils.conversation import ConversationItem, is_dummy
+from ....utils.conversation import _IMG_TAG_KEY, ConversationItem, is_dummy
 from ..sources import BAGEL_SIGLIP_CONTEXT, BAGEL_VAE_CONTEXT
+
+
+_VALID_IMG_TAGS = frozenset({"und", "gen", "edit"})
 
 
 class BagelVAEProcessor(BaseImageProcessor):
@@ -363,23 +366,37 @@ def route_image_sources(
                 routed.append(item)
                 continue
 
-            if item.role == "assistant":
-                item.source = BAGEL_VAE_CONTEXT
-                routed.append(item)
+            # Interactive inference has no dataset preprocessor, so raw user
+            # request images use ``infer_type`` in generation_kwargs for routing.
+            if inference and item.role == "user":
+                if infer_type == "infer_edit":
+                    vae_item = copy_image_item(item)
+                    vae_item.source = BAGEL_VAE_CONTEXT
+                    item.source = BAGEL_SIGLIP_CONTEXT
+                    routed.extend([vae_item, item])
+                else:
+                    item.source = BAGEL_SIGLIP_CONTEXT
+                    routed.append(item)
                 continue
 
-            if item.role == "user" and inference and infer_type == "infer_edit":
+            # Training data declares each raw image's role via ``_img_tag``.
+            tag = item.meta.get(_IMG_TAG_KEY)
+            if tag is None or tag not in _VALID_IMG_TAGS:
+                raise ValueError(f"BAGEL route_image_sources received image with invalid {_IMG_TAG_KEY}: {tag!r}.")
+            if tag == "und":
+                item.source = BAGEL_SIGLIP_CONTEXT
+                routed.append(item)
+            elif tag == "gen":
+                item.source = BAGEL_VAE_CONTEXT
+                routed.append(item)
+            else:
+                # tag == "edit": the same physical image is both VAE context and
+                # SigLIP context. Preserve the infer_edit ordering (VAE before
+                # SigLIP) so downstream marker wrapping stays stable.
                 vae_item = copy_image_item(item)
                 vae_item.source = BAGEL_VAE_CONTEXT
                 item.source = BAGEL_SIGLIP_CONTEXT
                 routed.extend([vae_item, item])
-                continue
-
-            # Training edit detection is intentionally not implemented yet.
-            # Raw user images outside infer_edit are the SigLIP branch.
-            if item.role == "user":
-                item.source = BAGEL_SIGLIP_CONTEXT
-            routed.append(item)
 
         sample[:] = routed
 
