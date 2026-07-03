@@ -40,4 +40,5 @@ See the [Agent Skills specification](https://agentskills.io/specification) for t
 | `veomni-new-op` | Adding a new optimized kernel/operator to veomni/ops/ |
 | `veomni-uv-update` | Dependency management with uv (version bumps, torch, lockfile) |
 | `create-pr` | Create a pull request — handles uncommitted changes, generates CI-compliant title and description |
+| `pr-draft-maintainer` | Maintain PR/MR descriptions and local draft markdown from reports, logs, reviewer feedback, or issue context |
 | `veomni-profile` | Performance profiling — analyze traces/snapshots or generate profiles and optimize |
