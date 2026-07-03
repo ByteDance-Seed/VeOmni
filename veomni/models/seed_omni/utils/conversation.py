@@ -48,6 +48,13 @@ ItemValue = Union[str, torch.Tensor, Image.Image]
 # "repr this explicit meta value" (which may legitimately be ``None``).
 _UNSET = object()
 
+# Per-image data-tag key written on ``meta`` by the data layer (preprocessors).
+# Image-only: text items do NOT carry it. Values: ``"und"`` | ``"gen"`` | ``"edit"``
+# — a model-agnostic declaration of the image's role in the sample. Model-side
+# routing reads it via ``iter_desired_images(..., img_tag=...)`` or
+# ``item.meta.get(_IMG_TAG_KEY)``; this module only owns the key + selector.
+_IMG_TAG_KEY = "_img_tag"
+
 
 @dataclass
 class ConversationItem:
@@ -157,6 +164,34 @@ def iter_desired_items(
             yield item
 
 
+def iter_desired_images(
+    conversation_list: list[list[ConversationItem]],
+    *,
+    roles: list[str] | None = None,
+    sources: list[str] | None = None,
+    img_tag: list[str] | None = None,
+    reverse_item: bool = False,
+) -> Iterator[ConversationItem]:
+    """Yield image items, optionally filtered by ``meta[_IMG_TAG_KEY]``.
+
+    Thin wrapper over :func:`iter_desired_items` with ``types=["image"]`` fixed.
+    ``img_tag`` (e.g. ``["und"]`` / ``["gen"]`` / ``["edit"]``) keeps only images
+    whose ``meta[_IMG_TAG_KEY]`` is in the set; ``None`` returns every image.
+    Composes with ``roles`` / ``sources`` / ``reverse_item`` as usual. Text items
+    are never selected because ``types`` is fixed to ``["image"]``.
+    """
+    for item in iter_desired_items(
+        conversation_list,
+        types=["image"],
+        roles=roles,
+        sources=sources,
+        reverse_item=reverse_item,
+    ):
+        if img_tag is not None and item.meta.get(_IMG_TAG_KEY) not in img_tag:
+            continue
+        yield item
+
+
 def get_tail_output_item(
     conversation_list: list[ConversationItem],
     *,
@@ -207,5 +242,7 @@ __all__ = [
     "seal_outputs",
     "get_tail_output_item",
     "iter_desired_items",
+    "iter_desired_images",
     "collect_desired_values",
+    "_IMG_TAG_KEY",
 ]

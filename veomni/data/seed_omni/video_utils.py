@@ -30,6 +30,7 @@ processor (e.g. ``Qwen3VLVideoProcessor``). See ``docs/seed_omni/design.md``
 
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass
 from io import BytesIO
 from typing import List, Union
@@ -167,18 +168,30 @@ def fetch_videos(
     use_audio_in_video: bool = False,
     **kwargs,
 ) -> list[VideoInputs]:
-    """Decode + OOM-cap a list of clips into :class:`VideoInputs` bundles."""
+    """Decode + OOM-cap a list of clips into :class:`VideoInputs` bundles.
+
+    A repeated ref (the same path / bytes object appearing more than once in the
+    list) is decoded once and deep-copied on reuse, so duplicates don't pay a
+    second decode and each item carries an independent bundle."""
     del kwargs
-    return [
-        load_video(
-            v,
-            fps=fps,
-            max_frames=max_frames,
-            video_max_pixels=video_max_pixels,
-            use_audio_in_video=use_audio_in_video,
-        )
-        for v in videos
-    ]
+    cache: dict = {}
+    out: list[VideoInputs] = []
+    for v in videos:
+        # Hashable refs (str / bytes) key by value; other refs key by identity.
+        key = v if isinstance(v, (str, bytes)) else id(v)
+        if key in cache:
+            out.append(copy.deepcopy(cache[key]))
+        else:
+            bundle = load_video(
+                v,
+                fps=fps,
+                max_frames=max_frames,
+                video_max_pixels=video_max_pixels,
+                use_audio_in_video=use_audio_in_video,
+            )
+            cache[key] = bundle
+            out.append(bundle)
+    return out
 
 
 __all__ = ["VideoInput", "VideoInputs", "load_video", "fetch_videos"]
