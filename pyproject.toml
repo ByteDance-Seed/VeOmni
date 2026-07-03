@@ -103,8 +103,9 @@ npu = [
   "hf_transfer",
 ]
 
-# aarch64 NPU — torch + torch-npu only; av/torchcodec/librosa/soundfile lack
-# aarch64 wheels (see `[tool.uv.sources].av`, x86_64-only).
+# aarch64 NPU — torch + torch-npu only; torchcodec lacks aarch64 wheels for
+# torch 2.9 (0.11+ needs torch 2.10, 0.8-0.9 are x86_64-only).
+# av 14.4.0 has no aarch64 wheel, so pin to 14.2.0 for cp311 too.
 npu_aarch64 = [
   "torch==2.9.0",
   "torch-npu==2.9.0.post2",
@@ -112,6 +113,15 @@ npu_aarch64 = [
   "torchaudio==2.9.0",
   "decorator>=5.2.1",
   "scipy>=1.16.2",
+  "av>=14.2.0,<14.3; python_version == '3.11'",
+  "av>=14.0.0,<14.3; python_version == '3.12'",
+  "librosa>=0.11.0,<0.12",
+  "soundfile>=0.13.1,<0.14",
+  "diffusers==0.37.0",
+  "ftfy",
+  "peft==0.18.1",
+  "megatron-energon>=7.2.1",
+  "hf_transfer",
 ]
 
 [dependency-groups]
@@ -212,12 +222,13 @@ flash-mla = [
 # auto_cp UnboundLocalError (#8), and l2norm dtype preservation (#13).
 flash-qla = { git = "https://github.com/QwenLM/FlashQLA", rev = "6ef4858b5446e05bd461d9658d877e548182dbcb" }
 
-# Pinned wheels avoid FFmpeg build dep in CI. 3.11 → 14.4.0; 3.12 falls back
-# to 14.2.0 (no cp312 wheel for 14.3.0/14.4.0). x86_64 only — npu_aarch64
-# does not match these markers.
+# Pinned wheels avoid FFmpeg build dep in CI. x86_64: 3.11 → 14.4.0,
+# 3.12 → 14.2.0. aarch64: 14.2.0 for both (14.4.0 has no aarch64 wheel).
 av = [
   { url = "https://files.pythonhosted.org/packages/f8/9a/8ffabfcafb42154b4b3a67d63f9b69e68fa8c34cb39ddd5cb813dd049ed4/av-14.4.0-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", marker = "(extra == 'gpu' or extra == 'npu') and python_version == '3.11'" },
   { url = "https://files.pythonhosted.org/packages/ed/e8/cf60f3fcde3d0eedee3e9ff66b674a9b85bffc907dccebbc56fb5ac4a954/av-14.2.0-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", marker = "(extra == 'gpu' or extra == 'npu') and python_version == '3.12'" },
+  { url = "https://files.pythonhosted.org/packages/18/68/a9398e36676721f335720173c856d26c4031203b8323ea43dd132c17cc34/av-14.2.0-cp311-cp311-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", marker = "extra == 'npu_aarch64' and python_version == '3.11'" },
+  { url = "https://files.pythonhosted.org/packages/d3/c3/a174388d393f1564ad4c1b8300eb4f3e972851a4d392c1eba66a6848749e/av-14.2.0-cp312-cp312-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", marker = "extra == 'npu_aarch64' and python_version == '3.12'" },
 ]
 
 [[tool.uv.index]]
