@@ -8,7 +8,7 @@ import torch
 
 from ....graphs.generation_graph import FSM_SIGNAL_KEY
 from ....mixins.modulemixin import ModuleMixin, post_forward, pre_forward
-from ....utils.conversation import ConversationItem, get_tail_output_item, is_dummy, iter_desired_items
+from ....utils.conversation import _IMG_TAG_KEY, ConversationItem, get_tail_output_item, is_dummy, iter_desired_items
 from ..sources import (
     BAGEL_FLOW_HIDDEN,
     BAGEL_FLOW_QUERY,
@@ -210,15 +210,37 @@ class BagelFlowConnectorModuleMixin(ModuleMixin):
             dummy = self.dummy_inputs(kind="embed_latent")
             return self._anchor_dummy_embed_latent_inputs(conversation_list, dummy)
 
-        # Training/module-tier embedding adds flow noising; generation context
-        # calls BagelFlowConnector.embed_latent and uses the clean timestep=0 path.
-        inputs, self._embed_lengths = preprocess_latent_embed(
-            self._embed_items,
-            config=self.config,
-            device=self.device,
-            dtype=self.dtype,
-            timestep_shift=float(self.config.timestep_shift),
-        )
+        parts: list[dict[str, torch.Tensor]] = []
+        for item in self._embed_items:
+            tag = item.meta.get(_IMG_TAG_KEY)
+            if tag == "gen":
+                inputs, lengths = preprocess_latent_embed(
+                    [item],
+                    config=self.config,
+                    device=self.device,
+                    dtype=self.dtype,
+                    timestep_shift=float(self.config.timestep_shift),
+                )
+            elif tag == "edit":
+                inputs, lengths = preprocess_context_latent_embed(
+                    [item],
+                    config=self.config,
+                    device=self.device,
+                    dtype=self.dtype,
+                )
+            else:
+                raise ValueError(
+                    f"BAGEL flow connector training expects VAE image {_IMG_TAG_KEY} to be 'edit' or 'gen', got {tag!r}."
+                )
+
+            parts.append(inputs)
+            self._embed_lengths.extend(lengths)
+
+        inputs = {
+            "latents": torch.cat([part["latents"] for part in parts], dim=0),
+            "position_ids": torch.cat([part["position_ids"] for part in parts], dim=0),
+            "timesteps": torch.cat([part["timesteps"] for part in parts], dim=0),
+        }
         return inputs
 
     @post_forward("embed_latent")

@@ -474,10 +474,51 @@ def test_bagel_flow_embed_latent_infer_context_keeps_numeric_state_out_of_meta()
     assert out["conversation_list"] is conversation
     assert item.value.shape == (4, 4)
     assert len(captured_timesteps) == 1
-    assert torch.equal(captured_timesteps[0], torch.zeros(1, dtype=torch.float32))
+    assert torch.equal(captured_timesteps[0], torch.zeros(4, dtype=torch.float32))
     assert "timestep" not in item.meta
     assert "noise" not in item.meta
     assert "flow_velocity_target" not in item.meta
+
+
+def test_bagel_flow_training_embed_treats_edit_context_as_clean_and_gen_as_target():
+    BagelFlowConnector = model_cls("bagel_flow_connector")
+    BagelFlowConnectorConfig = config_cls("bagel_flow_connector")
+    model = BagelFlowConnector(
+        BagelFlowConnectorConfig(
+            hidden_size=4,
+            z_channels=1,
+            latent_patch_size=1,
+            patch_latent_dim=1,
+            max_latent_size=4,
+            timestep_frequency_embedding_size=4,
+            timestep_shift=1.0,
+        )
+    )
+    edit_context = ConversationItem(
+        type="image",
+        value=torch.ones(1, 1, 2),
+        role="assistant",
+        source=BAGEL_VAE_CONTEXT,
+        meta={_IMG_TAG_KEY: "edit"},
+    )
+    gen_target = ConversationItem(
+        type="image",
+        value=torch.full((1, 1, 2), 2.0),
+        role="assistant",
+        source=BAGEL_VAE_CONTEXT,
+        meta={_IMG_TAG_KEY: "gen"},
+    )
+
+    inputs = model.embed_latent_pre(conversation_list=[[edit_context, gen_target]])
+
+    assert model._embed_items == [edit_context, gen_target]
+    assert model._embed_lengths == [2, 2]
+    assert torch.equal(inputs["latents"][:2], torch.ones(2, 1))
+    assert torch.equal(inputs["timesteps"][:2], torch.zeros(2))
+    assert "flow_velocity_target" not in edit_context.meta
+    assert "timestep" not in edit_context.meta
+    assert gen_target.meta["flow_velocity_target"].shape == (2, 1)
+    assert gen_target.meta["timestep"].shape == (2,)
 
 
 def test_bagel_vae_decode_skips_context_hidden_outputs():

@@ -96,7 +96,7 @@ def preprocess_context_latent_embed(
         {
             "latents": torch.cat(latents, dim=0),
             "position_ids": torch.cat(position_ids, dim=0),
-            "timesteps": torch.zeros(1, device=device, dtype=torch.float32),
+            "timesteps": torch.zeros(sum(embed_lengths), device=device, dtype=torch.float32),
         },
         embed_lengths,
     )

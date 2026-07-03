@@ -450,7 +450,7 @@ def test_bagel_flow_context_embed_consumes_only_vae_context_latents() -> None:
         value=torch.ones(1, 2, 2),
         role="assistant",
         source=BAGEL_VAE_CONTEXT,
-        meta={},
+        meta={_IMG_TAG_KEY: "gen"},
     )
     conversation = [raw_latent, vae_context]
     model.embed_latent = lambda **kwargs: {  # type: ignore[method-assign]
@@ -471,7 +471,7 @@ def test_bagel_flow_training_embed_consumes_only_vae_context_latents() -> None:
         value=torch.ones(1, 2, 2),
         role="assistant",
         source=BAGEL_VAE_CONTEXT,
-        meta={},
+        meta={_IMG_TAG_KEY: "gen"},
     )
 
     out = model.embed_latent_pre(conversation_list=[[raw_latent, vae_context]], timestep_shift=1.0)
