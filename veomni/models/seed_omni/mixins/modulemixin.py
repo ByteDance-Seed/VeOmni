@@ -250,6 +250,52 @@ class ModuleMixin:
         """Return a per-module VeOmni parallel plan, or ``None`` for default."""
         return None
 
+    def customized_build_parallelize_model(
+        self, *, weights_path: Optional[str], args: Any, **kwargs: Any
+    ) -> Optional[Any]:
+        """Optional override: the module owns its OWN parallelize + weight-load
+        (+ optional param offload), bypassing VeOmni's generic
+        ``build_parallelize_model`` / weight loader.
+
+        Motivation
+        ----------
+        The generic path (``BaseTrainer._build_parallelized_model`` ->
+        ``build_parallelize_model`` -> FSDP2 wrap + ``load_model_weights`` /
+        ``rank0_load_and_broadcast_weights``) materializes every parameter on GPU
+        (as an FSDP shard or a rank-0 broadcast buffer) and has no hook for
+        bespoke loading such as per-layer streaming CPU offload of very large
+        (e.g. EP-sharded MoE expert) weights that do not fit on GPU even when
+        sharded. A module with such a need implements this hook to do its own
+        meta-init-aware load / shard / offload and return the ready model.
+
+        Contract
+        --------
+        * Called by :class:`OmniModuleTrainer` AFTER meta-init, INSIDE this
+          module's ``use_parallel_state`` scope — so ``get_parallel_state()``
+          returns THIS module's device mesh, and ``self.config`` /
+          ``self.get_parallel_plan()`` are available.
+        * When it returns a module, that module is used verbatim: the override
+          owns EVERYTHING (parallelize/FSDP-or-not, weight load, param offload,
+          gradient checkpointing, dtype/mixed-precision). VeOmni does not
+          post-process it.
+        * When it returns ``None`` (the default), the trainer falls back to the
+          generic ``build_parallelize_model`` path — behavior is unchanged for
+          every module that does not override this.
+
+        Args:
+            weights_path: This module's split-checkpoint snapshot dir
+                (``args.model.model_path``), or ``None`` for random init.
+            args: The (per-module) ``VeOmniArguments`` — read fsdp / mixed
+                precision / gradient-checkpointing config from
+                ``args.train.accelerator`` as needed.
+
+        Returns:
+            A fully parallelized + weight-loaded ``nn.Module`` ready to
+            train/infer, or ``None`` to use the generic path.
+        """
+        del weights_path, args, kwargs
+        return None
+
     def get_assets(self) -> List[Any]:
         """Module-owned auxiliary artefacts to save alongside the weights."""
         return []
