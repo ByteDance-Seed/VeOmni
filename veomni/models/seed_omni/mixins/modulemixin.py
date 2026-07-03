@@ -209,6 +209,32 @@ class ModuleMixin:
             return kwargs
         return getattr(self, name)(**kwargs)
 
+    def metric_meter_set_seqlens(self, method: str, seqlens: List[int]) -> None:
+        """Stash the FULL (pre-SP-slice) per-sample token lengths for call-site ``method``.
+
+        **Call this inside a ``pre_forward`` hook, BEFORE any SP gather/slice.** It
+        is the single, uniform way a module reports its tokens for the optional
+        per-module meter — even AR backbones use it (built from their
+        ``cu_seqlens``) instead of a custom reader. It lives on ``ModuleMixin``
+        (not ``MetricMeterMixin``) purely so the ``pre_forward`` hooks that call it
+        resolve statically; the value is only ever *consumed* by
+        :meth:`~veomni.models.seed_omni.mixins.metric_meter_mixin.MetricMeterMixin.metric_meter_token_lengths`
+        (a no-op stash on a non-metered module — nothing drains it).
+
+        Why pre-slice / own-data: ``metric_meter_add`` runs *after* ``pre_forward``
+        (see ``TrainingGraph.step``), so its ``data`` is already this SP rank's
+        shard — measuring it under-counts by ~``sp``. But the value must be this
+        rank's **own** lengths (before ``sp_gather_seqs``), NOT the
+        post-gather aggregate: ``OmniEnvironMeter`` sums tokens+FLOPs over the
+        ``dp_group``, and in per-module SP the gather spans ``module_sp`` distinct
+        DP ranks, so a post-gather value would be counted ``module_sp`` times.
+        "Own data (full) + DP-sum" reconstructs the true global total, matching the
+        non-SP run. (See constraints.md 7c.)
+        """
+        if not hasattr(self, "_metric_full_seqlens"):
+            self._metric_full_seqlens: Dict[str, List[int]] = {}
+        self._metric_full_seqlens[method] = [int(s) for s in seqlens]
+
     def forward(self, **kwargs: Any) -> Dict[str, Any]:  # type: ignore[override]
         """Training forward pass.
 

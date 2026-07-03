@@ -14,6 +14,11 @@ class Qwen3VLLlmConfig(PretrainedConfig):
     """
 
     model_type = "qwen3vl_llm"
+    # Register the nested backbone config so transformers propagates
+    # ``attn_implementation`` (e.g. veomni_flash_attention_2_with_sp) down to it —
+    # otherwise the inner ``Qwen3VLTextModel`` silently falls back to SDPA and
+    # breaks under sequence parallelism (sliced q vs full-length mask).
+    sub_configs = {"text_config": Qwen3VLTextConfig}
 
     def __init__(
         self,

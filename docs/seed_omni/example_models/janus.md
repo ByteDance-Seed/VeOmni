@@ -19,6 +19,7 @@ drives the inferencer.
 |------|------|
 | `base.yaml` | Top-level omni launcher: model paths, top-level `accelerator`, data, train, and the `infer` block. References the module/graph files below. |
 | `modules_train.yaml` | Per-module **training** overrides (`model` / `train` / `accelerator` per module). `janus_text_encoder` carries a embed-parallel `emb` extra-parallel block (see below). |
+| `modules_train_sp.yaml` / `modules_train_allsp4.yaml` | Per-module Ulysses SP layouts — LLM-only (`janus_llama` SP=4) / whole-model SP=4 (see [Sequence parallelism](#sequence-parallelism-ulysses)). |
 | `graph_train.yaml` | Training DAG (`training_graph:` flat edge list). |
 | `data.yaml` | Weighted multisource data list (ImageNet + ShareGPT4V). |
 | `modules_infer_fsdp.yaml` | Per-module **inference** overrides — distributed: `janus_text_encoder` vocab-parallel `emb` + `janus_llama` `ddp`, vision modules eager (base.yaml's default `infer.modules`). |
@@ -118,6 +119,39 @@ bash train.sh tasks/omni/train_omni.py \
   --train.checkpoint.save_steps 10 \
   --train.wandb.enable false
 ```
+
+### Sequence parallelism (Ulysses)
+
+SP is declared **per module** in the modules YAML (`accelerator.ulysses_size`).
+The outer trainer always runs SP-disabled — do NOT pass a top-level
+`--accelerator.ulysses_size > 1` (`OmniTrainer` enforces outer `ulysses_size == 1`
+and raises otherwise). Two ready-made layouts:
+
+- **LLM-only SP** (`modules_train_sp.yaml`) — only the `janus_llama` backbone at
+  SP=4 (it gathers its 4-rank SP group's distinct per-rank sequences), other
+  modules unsharded. Runs on **4 GPUs** (`janus_text_encoder` emb-parallel=4):
+
+```bash
+NPROC_PER_NODE=4 bash train.sh tasks/omni/train_omni.py \
+  configs/seed_omni/Janus/janus_1.3b/base.yaml \
+  --model.modules configs/seed_omni/Janus/janus_1.3b/modules_train_sp.yaml \
+  --train.global_batch_size 4 --train.micro_batch_size 1
+```
+
+- **Whole-model SP4** (`modules_train_allsp4.yaml`) — every module at SP=4 (VeOmni's
+  classic "one SP size for the whole model"; wte sequence-sharded too, `emb`
+  dropped). Runs on **4 GPUs**:
+
+```bash
+NPROC_PER_NODE=4 bash train.sh tasks/omni/train_omni.py \
+  configs/seed_omni/Janus/janus_1.3b/base.yaml \
+  --model.modules configs/seed_omni/Janus/janus_1.3b/modules_train_allsp4.yaml \
+  --train.global_batch_size 16 --train.micro_batch_size 4
+```
+
+If your environment exports `TORCH_DISTRIBUTED_DEBUG=DETAIL`, **unset it** — its
+`_ProcessGroupWrapper` lacks the coalesced all-gather that FSDP2's tied-head
+`full_tensor()` needs, which crashes any FSDP2 run (SP or not).
 
 ---
 

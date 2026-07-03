@@ -102,9 +102,16 @@ class BagelSiglipNavitModuleMixin(ModuleMixin):
         self._image_items = self._select_siglip_image_items(conversation_list)
         if not self._image_items:
             self._forward_is_dummy = True
-            return self.dummy_inputs()
-
-        return self._inputs_from_preprocessed_items(self._image_items)
+            out = self.dummy_inputs()
+        else:
+            out = self._inputs_from_preprocessed_items(self._image_items)
+        # Metering: stash the per-image NaViT token counts. BAGEL has no SP, so
+        # this is already the full count — routed through the same stash as every
+        # other module for a uniform metering path.
+        self.metric_meter_set_seqlens(
+            "forward", [int(v) for v in out["token_lens"].detach().cpu().reshape(-1).tolist()]
+        )
+        return out
 
     @post_forward("forward")
     def forward_post(
@@ -213,14 +220,6 @@ class BagelSiglipNavitMetricMeterMixin(MetricMeterMixin):
     """Per-module training trace for BAGEL SigLIP NaViT."""
 
     config: BagelSiglipNavitConfig
-
-    def metric_meter_token_lengths(self, method: str, data: dict[str, Any]) -> list[int]:
-        if method != "forward":
-            return []
-        token_lens = data.get("token_lens")
-        if token_lens is None:
-            return []
-        return [int(value) for value in token_lens.detach().cpu().reshape(-1).tolist()]
 
     def estimate_flops(self, seqlens: list[int]) -> float:
         cfg = self.config

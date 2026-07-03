@@ -3,6 +3,14 @@ from typing import Any, Dict, List, Optional
 import torch
 import torch.nn.functional as F
 
+from ......distributed.parallel_state import get_parallel_state
+from ......distributed.sequence_parallel import (
+    gather_outputs,
+    slice_input_tensor,
+    sp_gather_seqs,
+    sp_pad,
+    sp_take_own_seq,
+)
 from ......utils import helper
 from ....graphs.generation_graph import FSM_SIGNAL_KEY
 from ....mixins.metric_meter_mixin import MetricMeterMixin
@@ -14,6 +22,7 @@ from ....mixins.modulemixin import (
 )
 from ....utils.conversation import (
     ConversationItem,
+    is_dummy,
     iter_desired_items,
     maybe_merge_outputs,
     seal_outputs,
@@ -80,6 +89,11 @@ class JanusVqvaeModuleMixin(ModuleMixin):
     def init_omni_state(self) -> None:
         # Training state
         self._conversation_carrier: Any = None
+        # Per-rank image counts + this rank's index within the module SP group
+        # (set in ``encode_pre``, consumed in ``encode_post`` to narrow the
+        # gathered batch back to this rank's own images when module SP > 1).
+        self._sp_rep_lengths: Optional[List[int]] = None
+        self._sp_group_index: int = 0
 
         # Inference state
         self._vq_buffer: List[int] = []
@@ -98,14 +112,46 @@ class JanusVqvaeModuleMixin(ModuleMixin):
     ) -> Dict[str, Any]:
         self._conversation_carrier = conversation_list
         # Real gen images and worker-built dummies both carry source == _SOURCE
-        # (a batch is all-real or all-dummy, normalized on CPU by the
-        # JanusVqvaeCPUPreprocessor); stack + move. The dummy flag just tags the
-        # batch so modeling.encode can skip the codec off-FSDP.
+        # (normalized on CPU by the JanusVqvaeCPUPreprocessor); stack + move.
         items = list(iter_desired_items(conversation_list, types=["image"], sources=[_SOURCE]))
         pixel_values = torch.stack([it.value for it in items], dim=0).to(
             device=self.device, dtype=self.dtype, non_blocking=True
         )
-        return {"pixel_values": pixel_values, "is_dummy": items[0].role == "dummy"}
+        # Single batch-level dummy flag: True only when *every* fed image is a
+        # worker-injected dummy (the whole batch is dummy); if any image is real
+        # it is False. Passed as a scalar so ``encode`` can short-circuit to a
+        # dummy output when there is no anchor to maintain.
+        is_dummy_flag = all(is_dummy(it) for it in items)
+        # Metering: this rank's OWN image count, pre-gather / pre-slice. The meter
+        # sums over the DP group only, so each rank reports just its own images
+        # (not the module_sp ranks SP aggregates) — identical to the non-SP run
+        # for both SP-disabled and per-module SP.
+        self._metric_meter_stash_tokens(int(pixel_values.shape[0]))
+        self._sp_rep_lengths = None
+        self._sp_group_index = 0
+        ps = get_parallel_state()
+        if ps.sp_enabled:
+            # The VQVAE codec attention does NOT honor Ulysses, so SP shards the
+            # image *batch* dim. First aggregate the module SP group's distinct
+            # image batches (module_sp ranks), then each rank encodes its own
+            # images (zero-padded to a multiple of module sp_size); ``encode_post``
+            # gathers the embeds + VQ ids back and restores the per-rank layout.
+            pixel_values, rep_lengths, group_index = sp_gather_seqs(pixel_values, dim=0)
+            self._sp_rep_lengths = rep_lengths
+            self._sp_group_index = group_index
+            if len(rep_lengths) > 1:
+                # The aggregated batch is "all dummy" only if every SP rank is.
+                # Reduce with MIN so all ranks in the module SP group agree.
+                flag = torch.tensor([1 if is_dummy_flag else 0], device=self.device)
+                torch.distributed.all_reduce(flag, op=torch.distributed.ReduceOp.MIN, group=ps.sp_group)
+                is_dummy_flag = bool(flag.item())
+            pixel_values = slice_input_tensor(pixel_values, dim=0, padding=True, group=ps.sp_group)
+        return {"pixel_values": pixel_values, "is_dummy": is_dummy_flag}
+
+    def _metric_meter_stash_tokens(self, num_images: int) -> None:
+        # VQ image tokens per image; counted on encode only (decode is the
+        # generation-head path and stashes nothing).
+        self.metric_meter_set_seqlens("encode", [int(self._image_processor.num_image_tokens)] * num_images)
 
     @post_forward("encode")
     def encode_post(self, **outputs: Any) -> Dict[str, Any]:
@@ -116,6 +162,25 @@ class JanusVqvaeModuleMixin(ModuleMixin):
         # encode returns one (embed, VQ-id) row per fed item, in source order;
         # scatter them back onto the same source items (real or dummy alike).
         items = list(iter_desired_items(conversation, types=["image"], sources=[_SOURCE]))
+        ps = get_parallel_state()
+        if ps.sp_enabled:
+            # Gather per-rank image embeds + VQ ids (dim 0) over the MODULE SP
+            # group, drop the zero-pad tail to recover the full module-group
+            # batch, then narrow to this rank's own slice.
+            full_count = sum(self._sp_rep_lengths)
+            image_embeds = gather_outputs(
+                image_embeds, gather_dim=0, padding_dim=0, unpad_dim_size=full_count, group=ps.sp_group
+            )
+            vq_token_ids = gather_outputs(
+                vq_token_ids, gather_dim=0, padding_dim=0, unpad_dim_size=full_count, group=ps.sp_group
+            )
+            image_embeds = sp_take_own_seq(
+                image_embeds, dim=0, seg_lengths=self._sp_rep_lengths, sp_rank=self._sp_group_index
+            )
+            vq_token_ids = sp_take_own_seq(
+                vq_token_ids, dim=0, seg_lengths=self._sp_rep_lengths, sp_rank=self._sp_group_index
+            )
+            self._sp_rep_lengths = None
         for item, emb, ids in zip(items, image_embeds, vq_token_ids, strict=True):
             item.value = emb.to(dtype=self.dtype)
             item.meta["janus_vqvae_labels"] = ids.to(dtype=torch.long)
@@ -127,8 +192,33 @@ class JanusVqvaeModuleMixin(ModuleMixin):
         conversation_list: Optional[list[list[ConversationItem]]] = None,
     ) -> Dict[str, Any]:
         self._conversation_carrier = conversation_list
-        hidden_states, labels, is_dummy = self._prepare_decode_inputs(conversation_list)
-        return {"hidden_states": hidden_states, "labels": labels, "is_dummy": is_dummy}
+        hidden_states, labels, is_dummy_flag = self._prepare_decode_inputs(conversation_list)
+        ps = get_parallel_state()
+        if ps.sp_enabled:
+            # Shard the generation-head loss span across the MODULE SP group.
+            # First aggregate the module SP group's distinct spans into the
+            # module-group sequence (autograd-aware), then pad the packed (1, S, D)
+            # span on its seq dim (labels pad with -100 so the tail is ignored) and
+            # score only this rank's slice. ``modeling.decode`` aggregates via
+            # ``reduce_sequence_parallel_loss`` over the module SP group (also
+            # undoing FSDP's /sp grad averaging on the dp_shard_sp mesh). The loss
+            # is a scalar, so no per-rank restore is needed in ``decode_post``.
+            hidden_states, rep_lengths, _ = sp_gather_seqs(hidden_states, dim=1)
+            labels, _, _ = sp_gather_seqs(labels, dim=1)
+            if len(rep_lengths) > 1:
+                # The span is "all dummy" only if every SP rank is. Reduce with MIN
+                # so every rank in the module SP group takes the same decode branch
+                # (keeping the loss collective symmetric). Mixed ranks (flag False)
+                # still ignore their dummy rows via the -100 labels set in
+                # ``_prepare_decode_inputs``.
+                flag = torch.tensor([1 if is_dummy_flag else 0], device=hidden_states.device)
+                torch.distributed.all_reduce(flag, op=torch.distributed.ReduceOp.MIN, group=ps.sp_group)
+                is_dummy_flag = bool(flag.item())
+            hidden_states = sp_pad(hidden_states, dim=1, pad_value=0)
+            labels = sp_pad(labels, dim=1, pad_value=-100)
+            hidden_states = slice_input_tensor(hidden_states, dim=1, padding=False, group=ps.sp_group)
+            labels = slice_input_tensor(labels, dim=1, padding=False, group=ps.sp_group)
+        return {"hidden_states": hidden_states, "labels": labels, "is_dummy": is_dummy_flag}
 
     @post_forward("decode")
     def decode_post(self, **outputs: Any) -> Dict[str, Any]:
@@ -146,16 +236,22 @@ class JanusVqvaeModuleMixin(ModuleMixin):
     ) -> tuple[torch.Tensor, torch.Tensor, bool]:
         hidden_chunks: list[torch.Tensor] = []
         label_chunks: list[torch.Tensor] = []
-        is_dummy: bool = False
         # Real gen images and worker-built dummies are both tagged ``source ==
         # _SOURCE`` (and carry real-shaped ``janus_vqvae_labels`` after encode), so
-        # they build the teacher-forcing span identically; only the ``is_dummy``
-        # flag differs (decode turns a dummy span into the FSDP anchor / 0.0 loss).
+        # they build the teacher-forcing span identically. ``all_dummy`` is the
+        # batch-level flag returned to ``decode``: True only when *every* gen span
+        # is a dummy. Dummy spans are additionally masked with -100 labels so that
+        # a mixed real/dummy span — which happens when a module SP group of
+        # module_sp ranks aggregates distinct per-rank spans — still scores its
+        # real rows and ignores its dummy rows.
+        all_dummy = True
+        saw_span = False
         for sample in conversation_list:
             prev_hidden: torch.Tensor | None = None
             for part in sample:
                 hidden_states = part.value
                 if part.source == _SOURCE:
+                    saw_span = True
                     if prev_hidden is None:
                         raise ValueError(
                             "JanusVqvae._prepare_decode_inputs: generation image has no preceding hidden state."
@@ -166,14 +262,16 @@ class JanusVqvaeModuleMixin(ModuleMixin):
                     assert vq_labels.shape[0] == hidden_states.shape[0]
                     span_hidden = torch.cat([prev_hidden[-1:], hidden_states[:-1]], dim=0)
                     hidden_chunks.append(span_hidden)
+                    if is_dummy(part):
+                        vq_labels = torch.full_like(vq_labels, -100)
+                    else:
+                        all_dummy = False
                     label_chunks.append(vq_labels)
-                    if part.role == "dummy":
-                        is_dummy = True
                 prev_hidden = hidden_states
 
         hidden_states = torch.cat(hidden_chunks, dim=0).unsqueeze(0)
         labels = torch.cat(label_chunks, dim=0).unsqueeze(0)
-        return hidden_states, labels, is_dummy
+        return hidden_states, labels, (all_dummy and saw_span)
 
     def dummy_inputs(self) -> Dict[str, Any]:
         cfg = self.config.vq_config
@@ -312,16 +410,6 @@ class JanusVqvaeMetricMeterMixin(MetricMeterMixin):
 
     config: JanusVqvaeConfig
     _image_processor: JanusVqvaeProcessor
-
-    def metric_meter_token_lengths(self, method: str, data: Dict[str, Any]) -> List[int]:
-        # Count VQ image tokens on encode only; decode is the generation-head /
-        # sampling path and contributes nothing (returns []).
-        if method != "encode":
-            return []
-        pixel_values = data.get("pixel_values")
-        if pixel_values is None:
-            return []
-        return [int(self._image_processor.num_image_tokens)] * int(pixel_values.shape[0])
 
     def estimate_flops(self, seqlens: List[int]) -> float:
         # The inner VQ codec (``vqmodel``) is a frozen conv stack (``config.freeze``

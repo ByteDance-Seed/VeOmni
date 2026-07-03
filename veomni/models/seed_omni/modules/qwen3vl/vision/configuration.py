@@ -29,6 +29,13 @@ class Qwen3VLVisionEncoderConfig(PretrainedConfig):
     """
 
     model_type = "qwen3vl_vision"
+    # Register the nested vision config so transformers propagates
+    # ``attn_implementation`` (e.g. veomni_flash_attention_2_with_sp) down to it —
+    # otherwise the inner ``Qwen3VLVisionModel`` silently falls back to SDPA and
+    # breaks under sequence parallelism (the ViT's Ulysses all-to-all lives in the
+    # flash-attention path; SDPA leaves the sliced patch chunk ungathered while the
+    # cu_seqlens describe the full sequence).
+    sub_configs = {"vision_config": Qwen3VLVisionConfig}
 
     def __init__(
         self,

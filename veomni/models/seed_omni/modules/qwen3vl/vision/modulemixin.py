@@ -1,7 +1,15 @@
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, NamedTuple, Optional, Tuple
 
 import torch
+import torch.distributed as dist
 
+from ......distributed.parallel_state import get_parallel_state
+from ......distributed.sequence_parallel import (
+    gather_outputs,
+    sp_gather_seqs,
+    sp_pad_and_slice,
+    sp_take_own_seq,
+)
 from ....mixins.modulemixin import (
     CPUPreprocessor,
     ModuleMixin,
@@ -17,6 +25,26 @@ from ....utils.conversation import ConversationItem, iter_desired_items
 # ``_pixels_and_grid`` pops it on the main process.
 _OMNI_GRID = "_omni_grid"
 _SOURCE = "qwen3vl_vision"
+
+
+class _VisualOutputSlot(NamedTuple):
+    """How ``forward_post`` scatters one encoded image/video back onto the carrier.
+
+    The ViT returns all items' merged patch tokens as one flat ``(sum_merged,
+    hidden)`` tensor. One slot per encoded item, in the ViT's concat order, records
+    how to split + place that item's slice — the qwen3vl analog of the text
+    backbone's ``_pack_inputs_embeds_shape`` (which unflattens the packed hidden
+    states back into per-item segments):
+
+    * ``item``        — the ``ConversationItem`` to receive its merged tokens.
+    * ``grid``        — its ``(t, h, w)`` grid, restashed on ``item.meta`` for the
+                        backbone's M-RoPE.
+    * ``num_merged``  — its merged-token count, i.e. the split size along dim 0.
+    """
+
+    item: ConversationItem
+    grid: torch.Tensor
+    num_merged: int
 
 
 def _video_metadata(items: list, frames: list) -> list[dict]:
@@ -124,7 +152,15 @@ class Qwen3VLVisionEncoderModuleMixin(ModuleMixin):
 
     def init_omni_state(self) -> None:
         self._conversation_carrier: Any = None
-        self._visual_specs: Optional[list] = None
+        self._visual_output_slots: Optional[List[_VisualOutputSlot]] = None
+        # Set in ``forward_pre`` when the ViT actually ran on an SP-sliced patch
+        # sequence (so ``forward_post`` must gather the merged tokens back).
+        self._sp_gather: bool = False
+        # Per-rank MERGED-token counts + this rank's index within the module SP
+        # group, used by ``forward_post`` to narrow the gathered merged tokens
+        # back to this rank's own items when module SP > 1.
+        self._sp_merged_rep_lengths: Optional[List[int]] = None
+        self._sp_group_index: int = 0
 
     def build_cpu_preprocessor(self) -> Optional[CPUPreprocessor]:
         """Worker-side patchify+normalize (see :class:`Qwen3VLVisionCPUPreprocessor`)."""
@@ -158,8 +194,57 @@ class Qwen3VLVisionEncoderModuleMixin(ModuleMixin):
             image_items = list(
                 iter_desired_items(conversation_list, types=["image"], roles=["dummy"], sources=[_SOURCE])
             )
-        pixel_values, grid_thw, vit_metadata, specs = self._process_visual_items(image_items, video_items)
-        self._visual_specs = specs
+        pixel_values, grid_thw, output_slots = self._process_visual_items(image_items, video_items)
+        self._visual_output_slots = output_slots
+        self._sp_gather = False
+        self._sp_merged_rep_lengths = None
+        self._sp_group_index = 0
+        ps = get_parallel_state()
+        if ps.sp_enabled and pixel_values is not None:
+            # The Qwen3-VL ViT attention honors Ulysses, so SP shards the flat patch
+            # sequence. The module SP group's ``module_sp`` ranks each hold a DISTINCT
+            # sample, so aggregate their patches + per-image grids into one combined
+            # sequence; the ViT then Ulysses-shards the combined sequence. Only the
+            # DATA is gathered — pixels and grid_thw, both via
+            # ``sp_gather_seqs`` in the SAME group order. The ViT metadata
+            # (cu_seqlens) is derived from the post-gather grid below, mirroring the
+            # text backbone deriving its FA cu_seqlens from the gathered
+            # position_ids. Pad+slice the pixels with pad_scale = spatial_merge_size**2
+            # (mirrors MainCollator's DataCollateInfo) so each rank's chunk stays
+            # aligned to merge-group boundaries; the ViT slices its own pos-embeds /
+            # cos / sin internally and runs the sp-pad tail segment. ``forward_post``
+            # gathers the per-rank merged tokens, then narrows to this rank's own
+            # slice (``sp_take_own_seq``).
+            merge_area = self.config.vision_config.spatial_merge_size**2
+            # The generated Qwen3-VL ViT hardcodes its internal SP pad_scale to 4
+            # (pos-embed / cos / sin slicing). Keep the two in lockstep so a future
+            # variant with a different merge size fails loudly instead of mis-slicing.
+            assert merge_area == 4, (
+                "qwen3vl_vision SP requires spatial_merge_size**2 == 4 to match the patchgen ViT pad_scale, "
+                f"got {merge_area}."
+            )
+            # The aggregated batch is "all dummy" only if every SP rank is (MIN so
+            # all ranks agree). ``grid_thw`` rides the same aggregation as the
+            # pixels (same group order).
+            flag = torch.tensor([1 if dummy else 0], device=self.device)
+            dist.all_reduce(flag, op=dist.ReduceOp.MIN, group=ps.sp_group)
+            dummy = bool(flag.item())
+            grid_thw, _, _ = sp_gather_seqs(grid_thw, dim=0)
+            # Aggregate the module SP group's distinct patch sequences (autograd-aware).
+            pixel_values, rep_lengths, group_index = sp_gather_seqs(pixel_values, dim=0)
+            self._sp_merged_rep_lengths = [r // merge_area for r in rep_lengths]
+            self._sp_group_index = group_index
+            pixel_values = sp_pad_and_slice(pixel_values, dim=0, pad_value=0, pad_scale=merge_area)
+            # When the dummy span short-circuits to real-shaped zeros (no FSDP), the
+            # ViT did NOT slice its output, so no gather is needed.
+            self._sp_gather = not (dummy and not (self.training and get_parallel_state().fsdp_enabled))
+        # Build the ViT metadata from the (possibly combined) post-gather grid — its
+        # cu_seqlens / max_seqlen (+ the SP pad tail) describe the exact sequence the
+        # ViT runs, so this is the single, unambiguous place to compute it.
+        vit_metadata = self._build_vit_metadata(grid_thw.tolist()) if grid_thw is not None else None
+        # Single batch-level dummy flag: the whole (aggregated) batch is dummy iff
+        # every SP rank had no real visual input, so ``modeling.forward`` can
+        # short-circuit the off-FSDP ViT.
         return {
             "pixel_values": pixel_values,
             "image_grid_thw": grid_thw,
@@ -175,67 +260,96 @@ class Qwen3VLVisionEncoderModuleMixin(ModuleMixin):
         image_grid_thw: torch.Tensor,
     ) -> Dict[str, Any]:
         conversation = self._conversation_carrier
-        specs = self._visual_specs
+        output_slots = self._visual_output_slots
+        sp_gather = self._sp_gather
+        merged_rep_lengths = self._sp_merged_rep_lengths
+        group_index = self._sp_group_index
         self._conversation_carrier = None
-        self._visual_specs = None
-        # forward returns merged tokens in spec order (real or dummy alike);
+        self._visual_output_slots = None
+        self._sp_gather = False
+        self._sp_merged_rep_lengths = None
+        self._sp_group_index = 0
+        if sp_gather:
+            # Gather per-rank merged tokens (dim 0) over the MODULE's SP group and
+            # trim the sp-pad tail back to the real COMBINED merged-token count
+            # (sum over the module SP group). The slice is autograd-safe — its
+            # backward re-pads the grad before _Gather. Then narrow to this rank's
+            # own segment (``sp_take_own_seq``) so the returned tokens match
+            # this rank's own conversation items.
+            group = get_parallel_state().sp_group
+            total_merged = sum(merged_rep_lengths)
+            image_embeds = gather_outputs(image_embeds, gather_dim=0, group=group)[:total_merged]
+            image_embeds = sp_take_own_seq(image_embeds, dim=0, seg_lengths=merged_rep_lengths, sp_rank=group_index)
+            deepstack_features = [
+                sp_take_own_seq(
+                    gather_outputs(layer, gather_dim=0, group=group)[:total_merged],
+                    dim=0,
+                    seg_lengths=merged_rep_lengths,
+                    sp_rank=group_index,
+                )
+                for layer in deepstack_features
+            ]
+        # forward returns merged tokens in slot order (real or dummy alike);
         # scatter them back onto the originating items.
-        self._scatter_visual_embeds(specs, image_embeds, deepstack_features)
+        self._scatter_visual_embeds(output_slots, image_embeds, deepstack_features)
         return {"conversation_list": conversation}
 
     def _scatter_visual_embeds(
         self,
-        specs: list,
+        output_slots: List[_VisualOutputSlot],
         embeds: torch.Tensor,
         deepstack_features: List[torch.Tensor],
     ) -> None:
-        sizes = [n for (_item, _grid, n) in specs]
+        sizes = [slot.num_merged for slot in output_slots]
         embeds_split = torch.split(embeds, sizes, dim=0)
         deepstack_split = [torch.split(layer, sizes, dim=0) for layer in deepstack_features]
-        for idx, (item, grid, _n) in enumerate(specs):
-            item.value = embeds_split[idx]
-            item.source = _SOURCE
-            item.meta["grid_thw"] = grid
-            item.meta["deepstack"] = [layer[idx] for layer in deepstack_split]
+        for idx, slot in enumerate(output_slots):
+            slot.item.value = embeds_split[idx]
+            slot.item.source = _SOURCE
+            slot.item.meta["grid_thw"] = slot.grid
+            slot.item.meta["deepstack"] = [layer[idx] for layer in deepstack_split]
 
     def _process_visual_items(
         self,
         image_items: list,
         video_items: list,
-    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[Dict[str, Any]], list]:
-        """Process images + videos into one ViT batch. Returns (pixel_values,
-        grid_thw, vit_metadata, specs) where ``specs`` is an ordered list of
-        ``(item, grid_tensor, num_merged_tokens)`` matching the concat order."""
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], List[_VisualOutputSlot]]:
+        """Process images + videos into one ViT batch. Returns ``(pixel_values,
+        grid_thw, output_slots)`` where ``output_slots`` is one
+        :class:`_VisualOutputSlot` per encoded item, in the concat order, telling
+        ``forward_post`` how to scatter the ViT output back. The ViT
+        ``vit_metadata`` (cu_seqlens) is NOT built here — the caller derives it
+        from ``grid_thw`` after any SP gather, so it always describes the exact
+        sequence the ViT runs on."""
         if not image_items and not video_items:
-            return None, None, None, []
+            return None, None, []
 
         pv_list: list[torch.Tensor] = []
         grid_rows: list[list[int]] = []
-        specs: list = []
+        output_slots: List[_VisualOutputSlot] = []
         merge_area = self.config.vision_config.spatial_merge_size**2
 
+        def _add(items: list) -> None:
+            pixel_values, grids = self._pixels_and_grid(items)
+            pv_list.append(pixel_values)
+            for it, g in zip(items, grids):
+                grid_rows.append(g)
+                output_slots.append(
+                    _VisualOutputSlot(
+                        item=it,
+                        grid=torch.tensor(g, dtype=torch.long, device=self.device),
+                        num_merged=int(g[0] * g[1] * g[2]) // merge_area,
+                    )
+                )
+
         if image_items:
-            pixel_values, grids = self._pixels_and_grid(image_items)
-            pv_list.append(pixel_values)
-            for it, g in zip(image_items, grids):
-                grid_rows.append(g)
-                specs.append(
-                    (it, torch.tensor(g, dtype=torch.long, device=self.device), int(g[0] * g[1] * g[2]) // merge_area)
-                )
-
+            _add(image_items)
         if video_items:
-            pixel_values, grids = self._pixels_and_grid(video_items)
-            pv_list.append(pixel_values)
-            for it, g in zip(video_items, grids):
-                grid_rows.append(g)
-                specs.append(
-                    (it, torch.tensor(g, dtype=torch.long, device=self.device), int(g[0] * g[1] * g[2]) // merge_area)
-                )
+            _add(video_items)
 
-        vit_metadata = self._build_vit_metadata(grid_rows)
         pixel_values = torch.cat(pv_list, dim=0).to(device=self.device, dtype=self.dtype)
         grid_thw = torch.tensor(grid_rows, dtype=torch.long, device=self.device)
-        return pixel_values, grid_thw, vit_metadata, specs
+        return pixel_values, grid_thw, output_slots
 
     def _pixels_and_grid(self, items: list) -> Tuple[torch.Tensor, list[list[int]]]:
         """Read back the preprocessed patches (``item.value``) + grid (``meta``).
@@ -249,12 +363,14 @@ class Qwen3VLVisionEncoderModuleMixin(ModuleMixin):
         grids = [it.meta.pop(_OMNI_GRID) for it in items]
         return pixel_values, grids
 
-    @staticmethod
-    def _build_vit_metadata(grid_thw_list: list[list[int]]) -> Dict[str, Any]:
+    def _build_vit_metadata(self, grid_thw_list: list[list[int]]) -> Dict[str, Any]:
         """Host-side ViT metadata so the patched ViT skips per-forward syncs.
 
-        Mirrors the fallback inside ``Qwen3VLVisionModel.forward`` (no SP path —
-        the V2 backbone does not support sequence parallel yet).
+        Mirrors the fallback inside ``Qwen3VLVisionModel.forward``. Under SP the
+        flat patches are pad+sliced with ``pad_scale = spatial_merge_size**2``
+        (see ``forward_pre``); the patched ViT only appends the sp-pad tail to
+        cu_seqlens when it is NOT precomputed, so we append it here to match (the
+        padded tail tokens form one extra attention segment).
         """
         cu: list[int] = [0]
         for t, h, w in grid_thw_list:
@@ -262,6 +378,16 @@ class Qwen3VLVisionEncoderModuleMixin(ModuleMixin):
             for _ in range(t):
                 cu.append(cu[-1] + frame_len)
         max_seqlen = max((c2 - c1 for c1, c2 in zip(cu, cu[1:])), default=0)
+        ps = get_parallel_state()
+        if ps.sp_enabled:
+            merge_area = self.config.vision_config.spatial_merge_size**2
+            total = cu[-1]
+            scale = ps.sp_size * merge_area
+            padded_total = ((total + scale - 1) // scale) * scale
+            sp_pad_seq_len = padded_total - total
+            if sp_pad_seq_len > 0:
+                cu.append(padded_total)
+                max_seqlen = max(max_seqlen, sp_pad_seq_len)
         return {
             "grid_thw_list": grid_thw_list,
             "cu_seqlens": torch.tensor(cu, dtype=torch.int32, device="cpu"),
@@ -293,9 +419,10 @@ class Qwen3VLVisionEncoderModuleMixin(ModuleMixin):
         # Items were patchified by the inference CPU preprocessor before the FSM
         # (patches on ``value`` + grid on ``meta``, exactly as in training), so this
         # only reads them back, runs the ViT, and scatters the merged tokens.
-        pixel_values, grid_thw, vit_metadata, specs = self._process_visual_items(image_items, video_items)
+        pixel_values, grid_thw, output_slots = self._process_visual_items(image_items, video_items)
+        vit_metadata = self._build_vit_metadata(grid_thw.tolist())
         image_embeds, deepstack_features = self._encode(pixel_values, grid_thw, vit_metadata)
-        self._scatter_visual_embeds(specs, image_embeds, deepstack_features)
+        self._scatter_visual_embeds(output_slots, image_embeds, deepstack_features)
         return {"conversation_list": conversation_list}
 
 

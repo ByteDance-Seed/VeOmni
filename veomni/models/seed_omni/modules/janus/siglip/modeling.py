@@ -59,11 +59,11 @@ class JanusSiglip(JanusSiglipModuleMixin, JanusSiglipMetricMeterMixin, PreTraine
         pixel_values: Optional[torch.Tensor],
         is_dummy: bool = False,
     ) -> Dict[str, Any]:
-        # Real pixels → always encode. A worker-built dummy is only the training
-        # FSDP gradient anchor, so it runs the ViT solely under training + FSDP;
-        # otherwise (inference, or no FSDP) there is nothing to anchor, so skip the
-        # forward but still emit real-shaped zeros so the output is uniform with a
-        # real encode (pre/post never branch on dummy).
+        # ``is_dummy`` is True only when the whole batch is dummy (a worker-built
+        # placeholder that exists solely as the training FSDP gradient anchor). We
+        # still run the ViT under training + FSDP to keep that anchor alive; only
+        # an all-dummy batch with no anchor to maintain (inference / no FSDP)
+        # short-circuits to real-shaped zeros, keeping the pre/post hooks branch-free.
         if is_dummy and not (self.training and get_parallel_state().fsdp_enabled):
             image_embeds = self._dummy_image_embeds(pixel_values)
         else:

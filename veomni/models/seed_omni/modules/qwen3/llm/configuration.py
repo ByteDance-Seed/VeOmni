@@ -9,6 +9,11 @@ class Qwen3LlmConfig(PretrainedConfig):
     """Top-level config for the Qwen3 AR backbone (no wte, no lm_head)."""
 
     model_type = "qwen3_llm"
+    # Register the nested backbone config so transformers propagates
+    # ``attn_implementation`` (e.g. veomni_flash_attention_2_with_sp) down to it —
+    # otherwise the inner ``Qwen3Model`` silently falls back to SDPA and breaks
+    # under sequence parallelism (sliced q vs full-length mask).
+    sub_configs = {"text_config": Qwen3Config}
 
     def __init__(
         self,

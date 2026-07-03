@@ -1,0 +1,54 @@
+# Mixed-size per-module SP — Qwen3-0.6B visual instruction tuning: the ViT tower
+# runs Ulysses SP=2 while the LLM backbone runs SP=4 (two DISTINCT SP sizes > 1 in
+# the same graph). This is the config that exercises per-module Ulysses group
+# isolation: the SP process groups are ParallelState-local (resolved from each
+# module's device mesh), so the two modules' attention all-to-alls run over the
+# correct — and different — ranks.
+#
+# The outer (orchestrator) trainer ALWAYS runs with SP disabled (ulysses_size=1);
+# SP is declared PER MODULE. Each rank loads its own DP shard.
+#
+# Topology:
+#   * outer trainer      : ulysses_size = 1   (enforced; do NOT pass --accelerator.ulysses_size)
+#   * qwen3vl_vision     : ulysses_size = 2   (module SP)
+#   * qwen3_llm          : ulysses_size = 4   (module SP)
+#   * qwen3_text_encoder : ulysses_size = 1   (no SP; wte NOT sequence-sharded)
+#
+# Each SP module gathers its group's distinct per-rank sequences
+# (sp_gather_seqs), shards across its OWN SP group, runs the forward
+# (whose attention all-to-all must use that module's group), then narrows the
+# output back per-rank (sp_take_own_seq) in forward_post.
+#
+# See modules_train_visual_instruction_tuning.yaml for the model_config rationale
+# (merger retarget / freeze / enable_image); this file only adds the SP sizes.
+#
+# World-size rule: world % 4 == 0 (max module_sp = 4).
+#
+# Launch (4 GPUs, global_batch_size 16, micro_batch_size 4):
+#   NPROC_PER_NODE=4 bash train.sh tasks/omni/train_omni.py \
+#     configs/seed_omni/Qwen/qwen3_0.6b/visual_instruction_tuning.yaml \
+#     --model.modules configs/seed_omni/Qwen/qwen3_0.6b/modules_train_visual_instruction_tuning_hetero_sp.yaml \
+#     --train.global_batch_size 16 --train.micro_batch_size 4 --train.max_steps 20
+qwen3vl_vision:
+  model:
+    model_path: /mnt/hdfs/veomni/models/seed_omni/Qwen3-VL-2B-Instruct/qwen3vl_vision
+    model_config:
+      out_hidden_size: 1024  # Qwen3-0.6B hidden size (ViT default out_hidden_size is 2048)
+      disable_deepstack: true
+      freeze: true
+
+  accelerator:
+    ulysses_size: 2
+
+qwen3_text_encoder:
+  model:
+    model_path: qwen3_text_encoder
+    model_config:
+      enable_image: true
+
+qwen3_llm:
+  model:
+    model_path: qwen3_llm
+
+  accelerator:
+    ulysses_size: 4
