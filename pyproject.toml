@@ -193,7 +193,8 @@ patchgen = { path = "patchgen-pkg", editable = true }
 # that drop nvidia-* deps and confuse uv into uninstalling them. Update both
 # 3.11 and 3.12 URLs when bumping torch.
 torch = [
-  { index = "pytorch", marker = "(extra == 'npu' or extra == 'npu_aarch64')" },
+  { index = "pytorch", extra = 'npu' },
+  { index = "pytorch", extra = 'npu_aarch64', marker = "platform_machine == 'npu_aarch64'" },
   { url = "https://download.pytorch.org/whl/cu130/torch-2.11.0%2Bcu130-cp311-cp311-manylinux_2_28_x86_64.whl", extra = 'gpu', marker = "python_version == '3.11'" },
   { url = "https://download.pytorch.org/whl/cu130/torch-2.11.0%2Bcu130-cp312-cp312-manylinux_2_28_x86_64.whl", extra = 'gpu', marker = "python_version == '3.12'" },
 ]
