@@ -122,7 +122,6 @@ npu_aarch64 = [
   "peft==0.18.1",
   "megatron-energon>=7.2.1",
   "hf_transfer",
-  "numba>=0.60"
 ]
 
 [dependency-groups]
@@ -170,9 +169,9 @@ override-dependencies = [
     "torchaudio==2.11.0+cu130; (extra == 'gpu')",
     "torchvision==0.26.0+cu130; (extra == 'gpu')",
     "torchcodec==0.12.0; (extra == 'gpu')",
-"torch==2.9.0; extra == 'npu_aarch64' and platform_machine == 'aarch64'",
-"torchaudio==2.9.0; extra == 'npu_aarch64' and platform_machine == 'aarch64'",
-"torchvision==0.24.0; extra == 'npu_aarch64' and platform_machine == 'aarch64'",
+    "torch==2.9.0; (extra == 'npu_aarch64')",
+    "torchaudio==2.9.0; (extra == 'npu_aarch64')",
+    "torchvision==0.24.0; (extra == 'npu_aarch64')",
     # Adding explicit override for NPU backends - x86 variant (default npu)
     "torch==2.9.0+cpu; (extra == 'npu')",
     "torchaudio==2.9.0+cpu; (extra == 'npu')",
