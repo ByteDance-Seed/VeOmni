@@ -83,6 +83,7 @@ key_features/lora.md
 
 design/kernel_selection.md
 design/patchgen.md
+design/deepspec_draft_integration.md
 ```
 
 ```{toctree}
