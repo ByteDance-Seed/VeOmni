@@ -45,6 +45,15 @@ dev = [
   "expecttest>=0.3.0,<0.4"
 ]
 
+# DeepSpec draft-model training integration (opt-in — see
+# veomni/integrations/deepspec, veomni/trainer/deepspec). Only needed to train
+# speculative-decoding draft models. DeepSpec has no PyPI release, so it installs
+# from git (pinned by commit in [tool.uv.sources]); combine with a hardware extra,
+# e.g. `uv sync --extra gpu --extra deepspec`.
+deepspec = [
+  "deepspec",
+]
+
 gpu = [
   "torch==2.11.0+cu130",
   "torchvision==0.26.0+cu130",
@@ -179,6 +188,13 @@ conflicts = [
 
 [tool.uv.sources]
 patchgen = { path = "patchgen-pkg", editable = true }
+# DeepSpec has no PyPI release; install the library from git. Pinned by commit
+# for reproducibility (the integration imports only deepspec.modeling.*,
+# deepspec.data, and deepspec.utils.{config,sampling,metrics}). This commit adds
+# DeepSpec's pyproject.toml (upstream PR deepseek-ai/DeepSpec#54); repoint to the
+# upstream commit once that merges. Only resolved when the `deepspec` extra is
+# selected.
+deepspec = { git = "https://github.com/zhangxin81/DeepSpec", rev = "57a01adb496229f3d93afd10679adf5ced7094a2" }
 # Direct wheel URL for gpu — pytorch index sometimes resolves cu128_full wheels
 # that drop nvidia-* deps and confuse uv into uninstalling them. Update both
 # 3.11 and 3.12 URLs when bumping torch.
@@ -244,6 +260,17 @@ explicit = true
 name = "flash-qla"
 version = "0.1.0"
 requires-dist = ["torch", "tilelang==0.1.8", "apache-tvm-ffi==0.1.9"]
+
+# DeepSpec's own pyproject.toml pins torch==2.9.1 / transformers==5.10.2 to match
+# its standalone repro env. Those conflict with VeOmni's torch 2.11.0+cu130 /
+# transformers 5.9.0 stack, which already satisfies every runtime dep the imported
+# deepspec modules (modeling/data/utils) actually need. Declare empty metadata so
+# uv installs the deepspec source without dragging in — or resolving against — its
+# pinned deps. Version mirrors DeepSpec's pyproject (0.1.0).
+[[tool.uv.dependency-metadata]]
+name = "deepspec"
+version = "0.1.0"
+requires-dist = []
 
 # Seeds the build env (uv-created venvs are not seeded by default).
 [tool.uv.extra-build-dependencies]

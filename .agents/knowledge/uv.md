@@ -102,6 +102,21 @@ Two pyproject knobs make source builds (FA4, FlashQLA) succeed:
 are gone — no FA setup.py runs anywhere now (FA2/3 wheel, FA4 cute is a
 DSL package, flash-qla uses dependency-metadata).
 
+## Optional Integrations
+
+| Extra | Source | Notes |
+|---|---|---|
+| `deepspec` | git: DeepSpec (pinned `rev` in `[tool.uv.sources]`) | opt-in; DeepSpec draft-model training |
+
+`deepspec` is an opt-in extra (`uv sync --extra gpu --extra deepspec`) for the
+DeepSpec draft-model integration. DeepSpec has no PyPI release, so it installs
+from a git commit. Its own `pyproject.toml` pins `torch==2.9.1` /
+`transformers==5.10.2` (its standalone repro env), which conflict with VeOmni's
+stack — so a `[[tool.uv.dependency-metadata]]` block declares empty `requires-dist`
+for `deepspec` (VeOmni already provides every runtime dep the imported modules
+need). This is the same static-metadata escape hatch used for `flash-qla`, but
+for *conflict avoidance* rather than a missing build backend.
+
 ## Common Commands
 
 ```bash

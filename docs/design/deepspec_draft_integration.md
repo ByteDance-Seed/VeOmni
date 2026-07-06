@@ -88,11 +88,14 @@ VeOmni bridge ──────────┴───────────
 
 ### 1. DeepSpec path bootstrap — `veomni/integrations/deepspec/`
 
-DeepSpec ships as a repository, not a pip package. `ensure_deepspec_importable()`
-resolves a checkout (via `$DEEPSPEC_PATH`, or a sibling `DeepSpec/` next to the
-VeOmni repo) and puts it on `sys.path`. The actual `import deepspec` is
-**lazy** (inside the function), so importing the VeOmni model package at startup
-does *not* require DeepSpec to be present — other models are unaffected.
+DeepSpec is normally installed via the `deepspec` extra (a git-pinned dependency;
+see Prerequisites). For local DeepSpec development it can instead be resolved from
+a checkout: `ensure_deepspec_importable()` first honours an already-importable
+`deepspec`, and only if that fails resolves a checkout (via `$DEEPSPEC_PATH`, or a
+sibling `DeepSpec/` next to the VeOmni repo) and puts it on `sys.path`. The actual
+`import deepspec` is **lazy** (inside the function), so importing the VeOmni model
+package at startup does *not* require DeepSpec to be present — other models are
+unaffected.
 
 ### 2. Model + config registration — `veomni/models/transformers/deepspec_draft/`
 
@@ -178,8 +181,24 @@ deterministic.
 
 ### Prerequisites
 
-1. A DeepSpec checkout importable as `deepspec` — set `DEEPSPEC_PATH`, or place a
-   `DeepSpec/` checkout next to the VeOmni repo (the launcher auto-detects it).
+1. The `deepspec` library importable as `deepspec`. Two options:
+   - **Recommended — install the extra** (pins DeepSpec by git commit in
+     `pyproject.toml`, so it is reproducible and needs no env vars):
+     ```bash
+     uv sync --extra gpu --extra deepspec
+     ```
+     DeepSpec has no PyPI release, so the extra installs it from git. The pin is
+     defined in `[tool.uv.sources]`. It currently points at a fork commit that
+     carries DeepSpec's packaging (`pyproject.toml`), proposed upstream in
+     [`deepseek-ai/DeepSpec#54`](https://github.com/deepseek-ai/DeepSpec/pull/54);
+     repoint the `rev` to the upstream commit once that PR merges. VeOmni imports
+     only `deepspec.modeling.*`, `deepspec.data`, and
+     `deepspec.utils.{config,sampling,metrics}`.
+   - **Dev fallback — a local checkout on `sys.path`**: set `DEEPSPEC_PATH`, or
+     place a `DeepSpec/` checkout next to the VeOmni repo (the launcher
+     auto-detects it). Useful when iterating on DeepSpec itself without
+     reinstalling; `ensure_deepspec_importable()` prefers an already-installed
+     `deepspec` and only falls back to this path.
 2. A target cache built with DeepSpec's `scripts/data/prepare_target_cache.py`
    (unchanged DeepSpec tooling; can be large — ~38 TB for Qwen3-4B at defaults).
 

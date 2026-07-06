@@ -12,15 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Locate a DeepSpec checkout and put it on ``sys.path``.
+"""Make ``import deepspec`` work, from an install or a local checkout.
 
-DeepSpec ships as a repository, not a pip package, so ``import deepspec`` only
-works once its repo root is on ``sys.path``. Resolution order:
+DeepSpec is normally installed via VeOmni's ``deepspec`` extra (a git-pinned
+dependency). When it is not installed — e.g. local DeepSpec development — this
+falls back to putting a checkout on ``sys.path``. Resolution order:
 
+0. An already-importable ``deepspec`` (the installed extra) — used as-is.
 1. ``$DEEPSPEC_PATH`` (explicit; may point at the repo root or its parent).
-2. A sibling ``DeepSpec/`` directory next to the VeOmni repo root
-   (the layout in this workspace: ``big_idea/{VeOmni,DeepSpec}``).
-3. Any ``DeepSpec/`` already discoverable because ``deepspec`` imports.
+2. A sibling ``DeepSpec/`` directory next to the VeOmni repo root, or a
+   ``DeepSpec/`` checkout inside the repo root.
 
 The check is memoised so repeated calls (registration + trainer + data) are
 cheap and idempotent.

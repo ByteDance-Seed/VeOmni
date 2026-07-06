@@ -37,10 +37,12 @@ and adapts the thin interfaces VeOmni expects:
   forward/loss/loss-reduction path so DeepSpec's own loss functions drive the
   backward pass (see ``veomni/trainer/deepspec``).
 
-Set-up: the DeepSpec repo is not a pip package, so it must be importable. Call
-``ensure_deepspec_importable()`` (done automatically by the registration and
-trainer modules) which honours the ``DEEPSPEC_PATH`` env var and falls back to a
-sibling ``DeepSpec/`` checkout next to the VeOmni repo.
+Set-up: install the ``deepspec`` extra (``uv sync --extra gpu --extra deepspec``),
+which pulls a git-pinned DeepSpec. For local DeepSpec development a checkout works
+too. Either way call ``ensure_deepspec_importable()`` (done automatically by the
+registration and trainer modules): it prefers an already-importable ``deepspec``
+and otherwise honours the ``DEEPSPEC_PATH`` env var / a sibling ``DeepSpec/``
+checkout next to the VeOmni repo.
 """
 
 from .deepspec_path import DEEPSPEC_ENV_VAR, ensure_deepspec_importable

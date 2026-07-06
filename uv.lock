@@ -48,6 +48,10 @@ overrides = [
 ]
 
 [[manifest.dependency-metadata]]
+name = "deepspec"
+version = "0.1.0"
+
+[[manifest.dependency-metadata]]
 name = "flash-qla"
 version = "0.1.0"
 requires-dist = ["torch", "tilelang==0.1.8", "apache-tvm-ffi==0.1.9"]
@@ -586,6 +590,11 @@ sdist = { url = "https://files.pythonhosted.org/packages/43/fa/6d96a0978d19e17b6
 wheels = [
     { url = "https://files.pythonhosted.org/packages/4e/8c/f3147f5c4b73e7550fe5f9352eaa956ae838d5c51eb58e7a25b9f3e2643b/decorator-5.2.1-py3-none-any.whl", hash = "sha256:d316bb415a2d9e2d2b3abcc4084c6502fc09240e292cd76a76afc106a1c8e04a", size = 9190, upload-time = "2025-02-24T04:41:32.565Z" },
 ]
+
+[[package]]
+name = "deepspec"
+version = "0.1.0"
+source = { git = "https://github.com/zhangxin81/DeepSpec?rev=57a01adb496229f3d93afd10679adf5ced7094a2#57a01adb496229f3d93afd10679adf5ced7094a2" }
 
 [[package]]
 name = "deprecation"
@@ -3325,8 +3334,8 @@ wheels = [
     { url = "https://download-r2.pytorch.org/whl/cpu/torchvision-0.22.1-cp311-cp311-manylinux_2_28_aarch64.whl", hash = "sha256:8b4a53a6067d63adba0c52f2b8dd2290db649d642021674ee43c0c922f0c6a69", upload-time = "2025-06-03T18:37:22Z" },
     { url = "https://download-r2.pytorch.org/whl/cu128/torchvision-0.22.1-cp311-cp311-manylinux_2_28_aarch64.whl", hash = "sha256:299fbd935f02b424e9166b7689de57067e24a228edc00abd5faf84f86c0643a0", upload-time = "2025-06-03T18:37:29Z" },
     { url = "https://download-r2.pytorch.org/whl/cpu/torchvision-0.22.1-cp312-cp312-macosx_11_0_arm64.whl", hash = "sha256:153f1790e505bd6da123e21eee6e83e2e155df05c0fe7d56347303067d8543c5", upload-time = "2025-06-03T18:37:22Z" },
-    { url = "https://download-r2.pytorch.org/whl/cu128/torchvision-0.22.1-cp312-cp312-manylinux_2_28_aarch64.whl", hash = "sha256:2ad7fe412b821333fc05b4046263d77c14ba86f3965366adbada8dc397ea45b4", upload-time = "2025-06-03T18:37:29Z" },
     { url = "https://download-r2.pytorch.org/whl/cpu/torchvision-0.22.1-cp312-cp312-manylinux_2_28_aarch64.whl", hash = "sha256:964414eef19459d55a10e886e2fca50677550e243586d1678f65e3f6f6bac47a", upload-time = "2025-06-03T18:37:23Z" },
+    { url = "https://download-r2.pytorch.org/whl/cu128/torchvision-0.22.1-cp312-cp312-manylinux_2_28_aarch64.whl", hash = "sha256:2ad7fe412b821333fc05b4046263d77c14ba86f3965366adbada8dc397ea45b4", upload-time = "2025-06-03T18:37:29Z" },
 ]
 
 [[package]]
@@ -3529,6 +3538,9 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
+deepspec = [
+    { name = "deepspec" },
+]
 dev = [
     { name = "expecttest" },
     { name = "pre-commit" },
@@ -3635,6 +3647,7 @@ requires-dist = [
     { name = "datasets", specifier = ">=2.20.0,<=2.21.0" },
     { name = "decorator", marker = "extra == 'npu'", specifier = ">=5.2.1" },
     { name = "decorator", marker = "extra == 'npu-aarch64'", specifier = ">=5.2.1" },
+    { name = "deepspec", marker = "extra == 'deepspec'", git = "https://github.com/zhangxin81/DeepSpec?rev=57a01adb496229f3d93afd10679adf5ced7094a2" },
     { name = "diffusers", marker = "extra == 'gpu'", specifier = "==0.37.0" },
     { name = "diffusers", marker = "extra == 'npu'", specifier = "==0.37.0" },
     { name = "einops", specifier = ">=0.8.1" },
@@ -3698,7 +3711,7 @@ requires-dist = [
     { name = "torchvision", marker = "extra == 'npu-aarch64'", specifier = "==0.22.1", index = "https://download.pytorch.org/whl/" },
     { name = "wandb" },
 ]
-provides-extras = ["dev", "gpu", "npu", "npu-aarch64"]
+provides-extras = ["dev", "deepspec", "gpu", "npu", "npu-aarch64"]
 
 [package.metadata.requires-dev]
 dev = [

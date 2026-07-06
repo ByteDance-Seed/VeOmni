@@ -60,6 +60,7 @@ from ...models import build_foundation_model, build_tokenizer
 from ...ops.config.singleton import get_ops_config
 from ...utils import helper
 from ...utils.device import synchronize
+from ...utils.dist_utils import all_reduce
 from ..base import BaseTrainer
 
 
@@ -170,8 +171,10 @@ class DraftModelTrainer(BaseTrainer):
         if hasattr(model, "set_embedding_head_trainable"):
             model.set_embedding_head_trainable(False)
         else:  # defensive: freeze by name if the helper is absent
+            # Substring (not prefix) match: HF nests these under a sub-module, so
+            # the param names are e.g. ``model.embed_tokens.weight`` / ``lm_head.weight``.
             for name, param in model.named_parameters():
-                if name.startswith("embed_tokens") or name.startswith("lm_head"):
+                if "embed_tokens" in name or "lm_head" in name:
                     param.requires_grad_(False)
 
         from ...utils.model_utils import pretty_print_trainable_parameters
@@ -341,11 +344,27 @@ class DraftModelTrainer(BaseTrainer):
         self.lr_scheduler.step()
         self.optimizer.zero_grad()
 
-        # Bridge DeepSpec's own metric buffer (ce_loss, l1_loss, accept_rate@k,
-        # confidence_*, tau_probabilistic, ...) into VeOmni's step metrics.
-        total_loss_dict.update(self._flush_deepspec_metrics())
+        # Reduce the reported loss over *global tokens*. DeepSpec's backward loss
+        # is ``world_size * global_token_loss`` on every rank: each rank divides
+        # its local loss numerator by a denominator already all-reduced over the
+        # whole world, then multiplies by ``world_size`` to cancel FSDP gradient
+        # averaging. A mean all-reduce over the FSDP (== world, per the pure-FSDP
+        # guard) group inverts that scaling exactly, so ``global_loss`` is the true
+        # token-weighted mean — not a mean of per-rank local means (which would
+        # mis-weight ranks with fewer tokens, what DeepSpec's own
+        # ``reduction="mean"`` loss metric would report). Reducing over the fsdp
+        # group (rather than the default world group) keeps this consistent with
+        # VeOmni's metric callback, which re-reduces reported metrics over the
+        # same group (an idempotent no-op on this already-uniform value).
+        global_loss = all_reduce(total_loss, op="mean", group=get_parallel_state().fsdp_group)
 
-        self.on_step_end(loss=total_loss, loss_dict=total_loss_dict, grad_norm=grad_norm)
+        # Bridge DeepSpec's own metric buffer (ce_loss, l1_loss, accept_rate@k,
+        # confidence_*, tau_probabilistic, ...) into VeOmni's step metrics, then
+        # override its rank-local ``loss`` with the global-token reduction above.
+        total_loss_dict.update(self._flush_deepspec_metrics())
+        total_loss_dict["loss"] = global_loss
+
+        self.on_step_end(loss=global_loss, loss_dict=total_loss_dict, grad_norm=grad_norm)
 
     def _flush_deepspec_metrics(self) -> Dict[str, float]:
         """Flush DeepSpec's distributed metric accumulator (all ranks call it).
