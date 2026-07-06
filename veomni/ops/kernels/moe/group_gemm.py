@@ -18,6 +18,7 @@ from ....distributed.moe import EPGroupGemm, EPMergedFc1GroupGemm, preprocess, t
 from ....distributed.parallel_state import get_parallel_state
 from ._kernels.kernel.group_gemm import group_gemm_same_mn, group_gemm_same_nk
 from ._kernels.kernel.moe import expert_histogram, moe_gather, moe_scatter
+from ._scatter import compute_expert_scatter_index
 
 
 def _apply_swiglu_clamp(fc1_1_output, fc1_2_output, swiglu_limit):
@@ -62,8 +63,10 @@ class TritonFusedMoeExpertFunction(torch.autograd.Function):
 
         # MOE Step 3-2: compute the each token's index in result
         # scatter_index shape (batch_size * sequence_len, topk)
-        # TODO(wenyawei): opt it
-        scatter_index = expert_index.flatten().argsort(stable=True).argsort().int().view(expert_index.shape)
+        # ``argsort().argsort()`` is two O(N log N) sorts back-to-back; the second
+        # is only inverting a permutation of [0..N) and can be done in O(N).
+        # ``compute_expert_scatter_index`` inlines that.
+        _, scatter_index = compute_expert_scatter_index(expert_index)
 
         # MOE Step 3-3: compute the result, select tokens by scatter_index, and put them together
         # scatter_output shape (batch_size * sequence_len * topk, hidden_size)
@@ -329,7 +332,7 @@ class MergedFc1TritonFusedMoeExpertFunction(torch.autograd.Function):
         swiglu_limit=None,
     ):
         splits = expert_histogram(expert_index, num_experts)
-        scatter_index = expert_index.flatten().argsort(stable=True).argsort().int().view(expert_index.shape)
+        _, scatter_index = compute_expert_scatter_index(expert_index)
         scatter_output = moe_scatter(hidden_states, scatter_index)
 
         cumsum_t = torch.cumsum(splits, dim=0)
