@@ -115,7 +115,8 @@ jobs:
         run: |
           BASE_IMAGE_FULL=$(grep '^FROM' ./docker/ascend/Dockerfile.ascend_8.3.rc2_a2.x86 | head -1 | cut -d' ' -f2)
           BASE_IMAGE_TAG=$(echo "$BASE_IMAGE_FULL" | cut -d':' -f2)
-          NEW_IMAGE_NAME="veomni-$BASE_IMAGE_TAG"
+          TORCH_VERSION=$(grep -oP 'torch==\K[0-9]+\.[0-9]+\.[0-9]+(?=\+cpu)' pyproject.toml | head -1)
+          NEW_IMAGE_NAME="veomni-${BASE_IMAGE_TAG}-torch${TORCH_VERSION}"
           echo "base_image_tag=$BASE_IMAGE_TAG" >> "$GITHUB_OUTPUT"
           echo "new_image_name=$NEW_IMAGE_NAME" >> "$GITHUB_OUTPUT"
 

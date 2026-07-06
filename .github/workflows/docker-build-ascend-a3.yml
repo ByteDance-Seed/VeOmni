@@ -38,7 +38,9 @@ jobs:
           echo "Base image full: $BASE_IMAGE_FULL"
           BASE_IMAGE_TAG=$(echo "$BASE_IMAGE_FULL" | cut -d':' -f2)
           echo "Base image tag: $BASE_IMAGE_TAG"
-          NEW_IMAGE_NAME="veomni-$BASE_IMAGE_TAG"
+          TORCH_VERSION=$(grep -oP 'torch==\K[0-9]+\.[0-9]+\.[0-9]+(?=\+cpu)' pyproject.toml | head -1)
+          echo "Torch version: $TORCH_VERSION"
+          NEW_IMAGE_NAME="veomni-${BASE_IMAGE_TAG}-torch${TORCH_VERSION}"
           echo "New image name: $NEW_IMAGE_NAME"
           echo "base_image_tag=$BASE_IMAGE_TAG" >> "$GITHUB_OUTPUT"
           echo "new_image_name=$NEW_IMAGE_NAME" >> "$GITHUB_OUTPUT"
