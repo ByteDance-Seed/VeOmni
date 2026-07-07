@@ -76,8 +76,8 @@ class BagelVAE(BagelVAEModuleMixin, PreTrainedModel):
             grad_context = torch.no_grad()
 
         autocast_context = nullcontext()
-        if tensor.device.type == "cuda" and self.dtype != torch.float32:
-            autocast_context = torch.amp.autocast("cuda", enabled=True, dtype=self.dtype)
+        if self.dtype != torch.float32:
+            autocast_context = torch.amp.autocast(tensor.device.type, enabled=True, dtype=self.dtype)
 
         with grad_context, autocast_context:
             yield

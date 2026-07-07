@@ -1,13 +1,22 @@
 """BAGEL Qwen2 MoT backbone."""
 
+import math
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
 import torch
 import torch.nn as nn
-from flash_attn import flash_attn_varlen_func
 from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.nn.functional import scaled_dot_product_attention
+
+from veomni.utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE
+
+
+if IS_CUDA_AVAILABLE:
+    from flash_attn import flash_attn_varlen_func
+
+if IS_NPU_AVAILABLE:
+    import torch_npu
 from transformers import PreTrainedModel
 from transformers.models.qwen2.modeling_qwen2 import Qwen2MLP, Qwen2RMSNorm
 from transformers.utils import ModelOutput
@@ -446,16 +455,53 @@ class BagelQwen2MoTAttention(nn.Module):
 
         cu_seqlens_q = torch.nn.functional.pad(torch.cumsum(query_lens, dim=0), (1, 0))
         cu_seqlens_k = torch.nn.functional.pad(torch.cumsum(key_values_lens, dim=0), (1, 0))
-        packed_attn_output = flash_attn_varlen_func(
-            q=packed_query_states,
-            k=merged_key_states,
-            v=merged_value_states,
-            cu_seqlens_q=cu_seqlens_q.to(torch.int32),
-            cu_seqlens_k=cu_seqlens_k.to(torch.int32),
-            max_seqlen_q=int(query_lens.max().item()),
-            max_seqlen_k=int(key_values_lens.max().item()),
-            causal=is_causal,
-        )
+        max_seqlen_q = int(query_lens.max().item())
+        max_seqlen_k = int(key_values_lens.max().item())
+        if IS_CUDA_AVAILABLE:
+            packed_attn_output = flash_attn_varlen_func(
+                q=packed_query_states,
+                k=merged_key_states,
+                v=merged_value_states,
+                cu_seqlens_q=cu_seqlens_q.to(torch.int32),
+                cu_seqlens_k=cu_seqlens_k.to(torch.int32),
+                max_seqlen_q=max_seqlen_q,
+                max_seqlen_k=max_seqlen_k,
+                causal=is_causal,
+            )
+        else:
+            head_num = packed_query_states.shape[1]
+            if is_causal:
+                atten_mask_npu = torch.triu(torch.ones([2048, 2048]), diagonal=1).bool().to(packed_query_states.device)
+                packed_attn_output = torch_npu.npu_fusion_attention(
+                    packed_query_states,
+                    merged_key_states,
+                    merged_value_states,
+                    head_num,
+                    pse=None,
+                    padding_mask=None,
+                    atten_mask=atten_mask_npu,
+                    scale=1.0 / math.sqrt(packed_query_states.shape[-1]),
+                    keep_prob=1,
+                    input_layout="TND",
+                    actual_seq_qlen=tuple(cu_seqlens_q[1:].cpu().numpy().tolist()),
+                    actual_seq_kvlen=tuple(cu_seqlens_k[1:].cpu().numpy().tolist()),
+                    sparse_mode=3,
+                )[0]
+            else:
+                packed_attn_output = torch_npu.npu_fusion_attention(
+                    packed_query_states,
+                    merged_key_states,
+                    merged_value_states,
+                    head_num,
+                    pse=None,
+                    atten_mask=None,
+                    scale=1.0 / math.sqrt(packed_query_states.shape[-1]),
+                    keep_prob=1,
+                    input_layout="TND",
+                    actual_seq_qlen=tuple(cu_seqlens_q[1:].cpu().numpy().tolist()),
+                    actual_seq_kvlen=tuple(cu_seqlens_k[1:].cpu().numpy().tolist()),
+                )[0]
+
         packed_attn_output = packed_attn_output.reshape(-1, self.hidden_size)
         if not is_gen:
             packed_attn_output = self.o_proj(packed_attn_output)
