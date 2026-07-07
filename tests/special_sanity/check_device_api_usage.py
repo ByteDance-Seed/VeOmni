@@ -52,6 +52,11 @@ CUDA_KEYWORD_CHECK_WHITELIST = [
     # ``veomni.utils.device`` equivalent; the test is gated on
     # ``IS_CUDA_AVAILABLE`` so it skips on non-CUDA hosts.
     "tests/models/test_model_forward_no_implicit_sync.py",
+    # Vendored Ascend Triton kernels for Qwen3.5 gated delta-rule (FLA + Huawei
+    # port) are kept byte-identical to upstream; the FLA-origin code references
+    # ``.cuda`` in fallback/util paths. Excluded wholesale, matching the ruff
+    # exclude in pyproject.toml.
+    "veomni/ops/kernels/gated_delta_rule/_ascend/",
 ]
 
 # directory or file path must contain keyword "nccl"
