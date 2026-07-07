@@ -251,9 +251,9 @@ def _init_parameter(
     """
     pieces = name.split(".")
     if any(p.startswith("lora_") for p in pieces):
-        from ..utils.lora_utils import _init_lora_parameter
+        from ..lora.weight_loading import init_lora_parameter
 
-        _init_lora_parameter(module, name)
+        init_lora_parameter(module, name)
         return
     init_func = None
     for piece in pieces[:-1]:
@@ -320,10 +320,15 @@ def load_model_weights(
     model.to_empty(device=init_device)
     dtensor_to_cpu = init_device == "cpu"
 
-    # Get parallel plan if available
+    # Get parallel plan if available -- via the runtime helper which
+    # detects PEFT and prepends ``base_model.model.`` to every plan
+    # pattern so EP-aware ``parallel_plan.shard_tensor`` matches the
+    # full PEFT-namespaced ``full_param_name`` it'll see below.
     parallel_plan = None
     if hasattr(model, "get_parallel_plan"):
-        parallel_plan = model.get_parallel_plan()
+        from ..distributed.parallel_plan import get_runtime_parallel_plan
+
+        parallel_plan = get_runtime_parallel_plan(model)
 
     # Build LoRA key remapping when loading a base checkpoint into a PEFT-wrapped model.
     # Maps bare base-model param names to PEFT-namespaced FQNs, e.g.:
@@ -332,14 +337,23 @@ def load_model_weights(
     is_peft_model = kwargs.get("is_peft_model", False)
     adapter_path = kwargs.get("adapter_path", None)
     if is_peft_model:
-        from ..utils.lora_utils import build_lora_key_overrides
+        from ..lora.weight_loading import build_lora_key_overrides
 
         lora_key_overrides = build_lora_key_overrides(model)
 
-    def _map_peft_key(name: str) -> str:
+    def _apply_peft_override(bare_name: str) -> str:
+        """Map a *bare* base-model FQN to its PEFT-wrapped destination.
+
+        Applied AFTER ``maybe_convert_checkpoint_tensor`` so converter-produced
+        merged keys (e.g. ``model.layers.0.mlp.experts.gate_up_proj`` from the
+        Qwen3-MoE per-expert -> fused converter) also flow through the
+        ``base_layer.weight`` rename when the experts module is wrapped by
+        ``LoraSharedExperts`` / ``LoraIndependentExperts``. Keys without an
+        override entry receive the plain ``base_model.model.`` prefix.
+        """
         if not is_peft_model:
-            return name
-        return lora_key_overrides.get(name, "base_model.model." + name)
+            return bare_name
+        return lora_key_overrides.get(bare_name, "base_model.model." + bare_name)
 
     converter = get_checkpoint_tensor_converter(model)
     if converter is None and is_peft_model and hasattr(model, "get_base_model"):
@@ -363,25 +377,31 @@ def load_model_weights(
             converted = maybe_convert_checkpoint_tensor(name, tensor, converter)
             if converted is None:
                 continue
-            _dispatch_kv(_map_peft_key(converted.name), converted.tensor)
+            _dispatch_kv(_apply_peft_override(converted.name), converted.tensor)
 
         del state_dict_iterator
         empty_cache()
 
     if converter is not None:
         for result in converter.finalize():
-            _dispatch_kv(_map_peft_key(result.name), result.tensor)
+            _dispatch_kv(_apply_peft_override(result.name), result.tensor)
 
     if is_peft_model and adapter_path:
-        # load peft lora weights if adapter_path is provided, else, init lora model weights in post_process_after_weight_loading
-        from ..utils.lora_utils import load_lora_model_weights
+        # Load LoRA adapter weights when an adapter_path is provided; otherwise
+        # they are initialised in post_process_after_weight_loading. The native
+        # VeOmniLoraModel reads the PEFT-format file without importing peft.
+        from ..lora.weight_loading import load_lora_weights
 
-        load_lora_model_weights(
+        load_lora_weights(
             model,
             adapter_path,
             init_device,
             dtensor_factory,
             parameter_names_to_load=parameter_names_to_load,
+            # EP-aware slicing: ``LoraIndependentExperts`` LoRA tensors are shrunk
+            # from ``[E, ...]`` to ``[E_local, ...]`` inside ``_dispatch_parameter``
+            # before the DTensor copy, or the propagation asserts on shape mismatch.
+            parallel_plan=parallel_plan,
         )
 
     post_process_after_weight_loading(
@@ -626,10 +646,13 @@ def rank0_load_and_broadcast_weights(
     model.to_empty(device=init_device)
     dtensor_to_cpu = init_device == "cpu"
 
-    # Get parallel plan if available
+    # Get parallel plan if available -- routed through the runtime helper
+    # so PEFT-prefix bridging happens once per call (see ``load_model_weights``).
     parallel_plan = None
     if hasattr(model, "get_parallel_plan"):
-        parallel_plan = model.get_parallel_plan()
+        from ..distributed.parallel_plan import get_runtime_parallel_plan
+
+        parallel_plan = get_runtime_parallel_plan(model)
 
     # Build LoRA key remapping when loading a base checkpoint into a PEFT-wrapped model.
     # non-lora-layer: xxx.xxx -> base_model.model.xxx.xxx
@@ -637,14 +660,9 @@ def rank0_load_and_broadcast_weights(
     is_peft_model = kwargs.get("is_peft_model", False)
     adapter_path = kwargs.get("adapter_path", None)
     if is_peft_model:
-        from ..utils.lora_utils import build_lora_key_overrides
+        from ..lora.weight_loading import build_lora_key_overrides
 
         lora_key_overrides = build_lora_key_overrides(model)
-
-    def _map_peft_key(name: str) -> str:
-        if not is_peft_model:
-            return name
-        return lora_key_overrides.get(name, "base_model.model." + name)
 
     converter = get_checkpoint_tensor_converter(model)
     if converter is None and is_peft_model and hasattr(model, "get_base_model"):
@@ -895,7 +913,19 @@ def rank0_load_and_broadcast_weights(
                         converted = maybe_convert_checkpoint_tensor(key, tensor, converter)
                         if converted is None:
                             continue
-                        key, tensor = _map_peft_key(converted.name), converted.tensor
+                        key, tensor = converted.name, converted.tensor
+                        # PEFT override is applied AFTER the converter so that
+                        # converter-produced merged keys (e.g. Qwen3-MoE
+                        # per-expert -> ``...experts.gate_up_proj``) also get
+                        # mapped to their PEFT-wrapped ``...base_layer.weight``
+                        # destination when the experts module is wrapped by
+                        # ``LoraSharedExperts`` / ``LoraIndependentExperts``.
+                        # Bare-key lookup intentionally: ``lora_key_overrides``
+                        # is keyed by base-model FQNs (no ``base_model.model.``
+                        # prefix), and the converter is given the bare key so
+                        # MoE per-expert pattern matches still fire.
+                        if is_peft_model:
+                            key = lora_key_overrides.get(key, "base_model.model." + key)
                         logger.info_rank0(f"loading {key=}")
                         if torch.count_nonzero(tensor) == 0:
                             logger.warning_rank0(
@@ -953,8 +983,14 @@ def rank0_load_and_broadcast_weights(
         for i in range(fin_count):
             if global_rank == 0:
                 result = finalized[i]
-                name = _map_peft_key(result.name)
-                metadata = BroadcastMetadata(False, name, result.tensor.shape, result.tensor.dtype)
+                # Same post-converter PEFT override as the streaming loop
+                # above -- finalize() may emit merged keys after every shard
+                # has been read, e.g. the last gate/up pair for the
+                # Qwen3-MoE per-expert -> fused converter.
+                fin_name = result.name
+                if is_peft_model:
+                    fin_name = lora_key_overrides.get(fin_name, "base_model.model." + fin_name)
+                metadata = BroadcastMetadata(False, fin_name, result.tensor.shape, result.tensor.dtype)
                 tensor = result.tensor
             else:
                 metadata = BroadcastMetadata(False, None, None, None)
@@ -972,15 +1008,23 @@ def rank0_load_and_broadcast_weights(
             _broadcast_and_dispatch(name, shape, dtype, tensor)
 
     if is_peft_model and adapter_path:
-        # load peft lora weights if adapter_path is provided, else, init lora model weights in post_process_after_weight_loading
-        from ..utils.lora_utils import rank0_load_and_broadcast_adapter_weights
+        # Rank-0 reads the PEFT-format adapter file (natively, no peft import)
+        # and broadcasts each tensor to all ranks. The runtime plan is forwarded
+        # so EP-sharded LoRA tensors (registered by
+        # ``_extend_plan_for_moe_lora_independent`` for ``LoraIndependentExperts``)
+        # get sliced from the disk-side ``[E, ...]`` shape down to the local
+        # ``[E_local, ...]`` shape inside ``_dispatch_parameter`` before the
+        # DTensor ``.copy_()`` -- without this the copy asserts on a global-shape
+        # mismatch (the ep_size=2 + ``mode=="independent"`` failure mode).
+        from ..lora.weight_loading import rank0_load_and_broadcast_lora_weights
 
-        rank0_load_and_broadcast_adapter_weights(
+        rank0_load_and_broadcast_lora_weights(
             model,
             adapter_path,
             init_device,
             dtensor_factory,
             parameter_names_to_load=parameter_names_to_load,
+            parallel_plan=parallel_plan,
         )
 
     post_process_after_weight_loading(

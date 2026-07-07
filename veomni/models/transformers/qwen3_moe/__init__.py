@@ -11,8 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from ....lora.target_mapping import convert_fused_moe_lora_targets
 from ....utils.device import IS_NPU_AVAILABLE
-from ....utils.lora_utils import convert_fused_moe_lora_targets
 from ...loader import MODELING_REGISTRY
 
 

@@ -34,6 +34,75 @@ from ..utils import logging
 from .muon import DistributedMuon, split_muon_adamw_params
 
 
+def _collect_ep_replicated_lora_param_ids(model: "nn.Module") -> set[int]:
+    """Return ``id(p)`` of every LoRA Parameter that is *replicated* across the EP mesh.
+
+    ``LoraSharedExperts`` (Mode 2) wraps a MoE experts module so that its
+    extra LoRA tensors live alongside the EP-sharded base experts inside the
+    same module. ``build_parallelize_model`` therefore pulls the LoRA
+    parameters into the inner ``fully_shard(..., mesh=ep_fsdp, Shard(1))``
+    wrap together with the base ``gate_up_proj`` / ``down_proj``. From the
+    optimizer's point of view they look like "ep params" (their DTensor
+    mesh has ``ep_fsdp`` as a dim) and the ExtraParallel-aware grad clipper
+    would all-reduce their squared norms across the ``ep`` group — which
+    is correct for the EP-sliced base experts but **double-counts** the
+    shared LoRA whose values are identical on every EP rank (they are
+    replicated by construction; ``LoraSharedExperts._ensure_ep_grad_sync_hooks``
+    keeps their gradients in lock-step across the EP group).
+
+    Excluding these param ids from the ``"ep"`` optimizer/clip-grad-norm
+    bucket and putting them in the ``"non_extra_parallel"`` bucket gives
+    the right semantics: gradients still get cross-EP-summed (by the
+    LoraSharedExperts hook), the optimizer steps consistently on every
+    rank, and ``clip_grad_norm`` only reduces them across the FSDP mesh
+    (not the EP mesh) so the norm is computed once.
+
+    Detection by class name (``LoraSharedExperts``) so this stays free of
+    a circular import (``veomni.lora.moe_layers`` already imports from
+    ``veomni.distributed.parallel_state``).
+
+    Call-order requirement
+    ----------------------
+    Must run after FSDP wrapping has converted params to DTensors, hence
+    after :func:`build_parallelize_model`. Otherwise the snapshotted
+    ``id(p)`` values point at the pre-wrap ``nn.Parameter`` objects, which
+    get replaced by new DTensor-backed parameters when ``fully_shard``
+    rewraps the wrapper module -- the snapshot then goes stale (Python may
+    reuse those addresses for unrelated objects, causing false positives
+    in :func:`extra_parallel_fsdp2_clip_grad_norm`).
+
+    ``id(p)`` stability after this point is guaranteed because
+    ``build_optimizer`` populates ``model._extra_parallel_param_groups``
+    from the same post-wrap Parameter objects in the same call, and those
+    lists hold long-lived references that prevent garbage collection.
+    """
+    from torch.distributed._tensor import DTensor
+
+    out: set[int] = set()
+    for mod in model.modules():
+        # Walk the MRO so we still match after FSDP2's ``fully_shard`` rebases the
+        # class to ``FSDPLoraSharedExperts(LoraSharedExperts, FSDPModule)``
+        # (see torch's ``_fully_shard``); a bare ``__class__.__name__`` check
+        # would silently skip every wrapper post-FSDP.
+        if any(b.__name__ == "LoraSharedExperts" for b in type(mod).__mro__):
+            for n, p in mod.named_parameters(recurse=True):
+                if not p.requires_grad:
+                    continue
+                # Catches wrong call-order misuse: if any matched LoRA param
+                # is still a plain ``nn.Parameter`` (not a DTensor) at this
+                # point, FSDP2 hasn't wrapped yet -- ``build_optimizer`` was
+                # invoked before ``build_parallelize_model``. The snapshot
+                # we are about to take would be stale immediately.
+                assert isinstance(p, DTensor), (
+                    f"_collect_ep_replicated_lora_param_ids: LoRA param {n!r} on a "
+                    f"LoraSharedExperts wrapper is not a DTensor -- call "
+                    f"build_parallelize_model before build_optimizer so FSDP2 has "
+                    f"converted these params to DTensors before we snapshot id(p)."
+                )
+                out.add(id(p))
+    return out
+
+
 logger = logging.get_logger(__name__)
 
 
@@ -614,6 +683,19 @@ def build_extra_parallel_fsdp2_optimizer(
     model._extra_parallel_param_groups["non_extra_parallel"] = (
         [p for g in non_extra_parallel_groups for p in g.get("params", [])] if non_extra_parallel_groups else []
     )
+    # Sidecar set for the grad clipper: ids of ``LoraSharedExperts`` LoRA params
+    # that landed in some ``extra_parallel_params[para]`` bucket above. They live
+    # on the inner ``ep_fsdp`` FSDP mesh (so they cannot be moved to the
+    # ``non_extra_parallel`` optimizer — its DTensors are on a different mesh and
+    # ``foreach_*`` ops reject mixed-mesh tensor lists), but unlike the EP-sliced
+    # base experts and Mode-1 per-expert LoRA they are *replicated* across the
+    # EP group (kept in lock-step by ``LoraSharedExperts._ensure_ep_grad_sync_hooks``).
+    # ``extra_parallel_fsdp2_clip_grad_norm`` uses this set to skip the EP all-reduce
+    # for these params; otherwise their squared norms are summed once per EP rank
+    # and the global norm comes out larger than the EP=1 baseline, breaking
+    # cross-EP grad-norm parity (and therefore any optimizer step that depends
+    # on the clipped grad).
+    model._ep_replicated_lora_param_ids = _collect_ep_replicated_lora_param_ids(model)
 
     key_names = list(optimizer_dict.keys())
 

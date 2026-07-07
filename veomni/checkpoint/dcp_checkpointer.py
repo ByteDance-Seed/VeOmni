@@ -625,6 +625,9 @@ def _normalize_key(key: str) -> Optional[str]:
     Conversion rules:
     - "model.model.*" -> "model.*" (remove first "model." prefix)
     - "model.lm_head.weight" -> "lm_head.weight" (special case)
+    - "model.base_model.*" -> "base_model.*" (PEFT LoRA adapter case;
+      ``save_lora_adapter_with_dcp`` re-prefixes already-PEFT-prefixed keys
+      with ``model.`` so DCP keeps them, and we strip that here on read)
     - Other "model.*" keys -> log warning and strip "model." prefix
     """
     if not key.startswith("model."):
@@ -636,6 +639,14 @@ def _normalize_key(key: str) -> Optional[str]:
     elif key == "model.lm_head.weight":
         # Special case: model.lm_head.weight -> lm_head.weight
         return "lm_head.weight"
+    elif key.startswith("model.base_model."):
+        # PEFT LoRA adapter save: ``save_lora_adapter_with_dcp`` writes keys
+        # of the form ``model.base_model.model.<...>.lora_A.weight`` so the
+        # DCP-side ``model.`` filter keeps them. The HF-side adapter file is
+        # the standard PEFT layout ``base_model.model.<...>.lora_A.weight``,
+        # which is exactly ``key[6:]``. This is a known, expected pattern
+        # — silent strip, no warning.
+        return key[6:]
     else:
         # Other keys with single "model." prefix - log and strip prefix
         logger.warning(

@@ -1,0 +1,70 @@
+# LoRA fine-tuning config for Qwen3-Omni-MoE.
+#
+# Qwen3-Omni-MoE wraps the LM under a `thinker.` prefix; experts FQN is
+# `thinker.model.layers.*.mlp.experts.{gate_up_proj,down_proj}`. The wrapper
+# auto-detects the fused experts layout regardless of where the experts module
+# sits in the model tree.
+
+model:
+  model_path: Qwen3-Omni-30B-A3B-Instruct
+  ops_implementation:
+    moe_implementation: eager
+    attn_implementation: flash_attention_2
+    cross_entropy_loss_implementation: eager
+    rms_norm_implementation: eager
+    swiglu_mlp_implementation: eager
+    rotary_pos_emb_implementation: eager
+  lora_config:
+    rank: 16
+    alpha: 32
+    use_rslora: false
+    lora_modules:
+      - q_proj
+      - k_proj
+      - v_proj
+      - o_proj
+    target_parameters:
+      - thinker.model.layers.*.mlp.experts.gate_up_proj
+      - thinker.model.layers.*.mlp.experts.down_proj
+    share_expert_lora: true
+
+data:
+  train_path: configs/multimodal/data/tulu_sharegpt4v_llavavideo.yaml
+  data_type: conversation
+  max_seq_len: 8196
+  train_size: 80000000
+  source_name: sharegpt4v_captioner_sft
+  dataloader:
+    num_workers: 0
+  mm_configs:
+    scale_factor: 28
+    image_min_pixels: 3136
+    image_max_pixels: 12845056
+    video_min_pixels: 100352
+    video_max_pixels: 602112
+    max_ratio: 200
+    min_frames: 4
+    max_frames: 20
+    frame_factor: 2
+    sample_rate: 16000
+    fps: 2.0
+    use_audio_in_video: True
+
+train:
+  accelerator:
+    ulysses_size: 1
+    fsdp_config:
+      fsdp_mode: fsdp2
+  optimizer:
+    lr: 1.0e-4
+    lr_decay_style: cosine
+  num_train_epochs: 3
+  micro_batch_size: 1
+  global_batch_size: 32
+  max_steps: 20
+  init_device: meta
+  checkpoint:
+    output_dir: qwen3_omni_lora
+  wandb:
+    project: qwen3_omni
+    name: qwen3_omni_lora

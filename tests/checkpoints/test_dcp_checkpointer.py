@@ -363,6 +363,17 @@ class TestNormalizeKey:
 
         assert _normalize_key("model.embed_tokens.weight") == "embed_tokens.weight"
 
+    def test_peft_lora_base_model_key(self):
+        # GAP-5: ``save_lora_adapter_with_dcp`` re-prefixes already-PEFT-prefixed
+        # keys with ``model.`` so the DCP filter keeps them; on read the leading
+        # ``model.`` is stripped back to the standard PEFT adapter layout.
+        from veomni.checkpoint.dcp_checkpointer import _normalize_key
+
+        assert (
+            _normalize_key("model.base_model.model.layers.0.self_attn.q_proj.lora_A.weight")
+            == "base_model.model.layers.0.self_attn.q_proj.lora_A.weight"
+        )
+
 
 # ---------------------------------------------------------------------------
 # Extra state save/load roundtrip

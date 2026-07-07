@@ -109,6 +109,14 @@ def apply_veomni_fused_moe_patch(fused_moe_kernel: str = "triton") -> None:
     else:
         raise ValueError(f"Invalid fused_moe_kernel: {fused_moe_kernel!r}. Expected one of: 'triton', 'quack', 'npu'.")
 
+    # Bind the LoRA-aware fused MoE kernels (owned by ``veomni.lora.ops``) to
+    # match the base backend just selected. Whether a LoRA kernel exists is a
+    # property of the backend (only ``triton`` ships one today); the lazy import
+    # keeps this free of an ``ops`` <-> ``lora`` import cycle.
+    from ....lora.ops import bind_lora_moe_kernels
+
+    bind_lora_moe_kernels(fused_moe_kernel)
+
 
 # ── OpSlot kernel registrations ──────────────────────────────────────────────
 
