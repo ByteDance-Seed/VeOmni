@@ -418,7 +418,7 @@ def _resolve_safetensors_shards(weights_path: str, **kwargs) -> Tuple[Dict[str, 
         base = os.path.basename(resolved_file)
         with safe_open(resolved_file, framework="pt", device="cpu") as fh:
             keys = list(fh.keys())
-        return {k: base for k in keys}, {base: resolved_file}
+        return dict.fromkeys(keys, base), {base: resolved_file}
 
     raise ValueError(f"ep_sharded_stream_load: no safetensors checkpoint found under {weights_path}.")
 
@@ -554,9 +554,7 @@ def load_model_weights_ep_sharded(
                     real0 = sl.get_shape()[0]
                     expected_full0 = target0 * para_size
                     if real0 > expected_full0:
-                        raise RuntimeError(
-                            f"{name}: checkpoint dim0={real0} exceeds model dim0={expected_full0}."
-                        )
+                        raise RuntimeError(f"{name}: checkpoint dim0={real0} exceeds model dim0={expected_full0}.")
                     if not zero_pad and real0 != expected_full0:
                         # No dim-0 zero-pad converter -> checkpoint must match exactly;
                         # a silent zero-fill here would hide a real shape mismatch.
