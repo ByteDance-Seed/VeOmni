@@ -494,7 +494,7 @@ model:
   model_path: Qwen3-30B-A3B-merge
   ops_implementation:
     attn_implementation: flash_attention_2
-    moe_implementation: fused_triton    # use eager only for debugging / NPU
+    moe_implementation: eager           # EP (ep_size > 1) REQUIRES fused_triton
   lora_config:
     rank: 16
     alpha: 32
@@ -506,7 +506,7 @@ train:
   init_device: meta
   accelerator:
     ulysses_size: 1
-    ep_size: 1                          # set >1 to enable EP; requires fused_triton
+    ep_size: 1                          # set >1 to enable EP; also set moe_implementation: fused_triton
     fsdp_config:
       fsdp_mode: fsdp2
 ```
