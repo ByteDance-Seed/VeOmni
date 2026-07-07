@@ -564,11 +564,16 @@ def load_model_weights_ep_sharded(
                         )
                     start = para_rank * target0
                     end = start + target0
+                    # Real checkpoint rows for this rank are [start, real0); clamp BOTH
+                    # ends to real0 so a rank lying entirely in the zero-pad region
+                    # (start >= real0) reads an in-bounds empty slice (sl[real0:real0])
+                    # instead of relying on out-of-bounds ``get_slice`` semantics, which
+                    # vary by safetensors version. Missing tail rows are zero-filled.
+                    read_start = min(start, real0)
                     read_end = min(end, real0)
-                    read_end = max(read_end, start)  # empty (0-row) slice if this rank is all pad
-                    tensor = sl[start:read_end]
-                    if read_end < end:  # trailing zero rows (dim-0 zero-pad converter)
-                        pad = torch.zeros((end - read_end, *tuple(tensor.shape[1:])), dtype=tensor.dtype)
+                    tensor = sl[read_start:read_end]
+                    if tensor.shape[0] < target0:  # trailing zero rows (dim-0 zero-pad converter)
+                        pad = torch.zeros((target0 - tensor.shape[0], *tuple(tensor.shape[1:])), dtype=tensor.dtype)
                         tensor = torch.cat([tensor, pad], dim=0)
                     # Already the local slice -> parallel_plan=None (do not slice
                     # again); dtensor_factory then shards over the ep_fsdp sub-mesh
