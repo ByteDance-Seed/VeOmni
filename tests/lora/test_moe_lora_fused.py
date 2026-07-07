@@ -14,14 +14,14 @@
 """Triton fused MoE-LoRA forward/backward parity tests (non-EP + EP single-rank).
 
 Exercises the fused experts path in both
-:class:`veomni.utils.moe_lora.LoraSharedExperts` (Mode 2 — shared LoRA) and
-:class:`veomni.utils.moe_lora.LoraIndependentExperts` (Mode 1 — independent
+:class:`veomni.lora.moe_layers.LoraSharedExperts` (Mode 2 — shared LoRA) and
+:class:`veomni.lora.moe_layers.LoraIndependentExperts` (Mode 1 — independent
 per-expert LoRA). Both require the fused experts layout (single
 ``[E, 2I, H]`` ``gate_up_proj`` + single ``[E, H, I]`` ``down_proj``); see
-:func:`veomni.utils.moe_lora._validate_fused_layout`.
+:func:`veomni.lora.moe_layers._validate_fused_layout`.
 
 The ``gate_up_proj`` parameter is covered by **two independent rank-r LoRA
-pairs** (seed-style two-LoRA, see ``veomni.utils.moe_lora`` file
+pairs** (seed-style two-LoRA, see ``veomni.lora.moe_layers`` file
 docstring). All four autograd classes carry the per-half ``(A_gate,
 B_gate, A_up, B_up)`` tensors end-to-end; the EP-class tests below build
 matching leaf tensors so backward parity covers each adapter
@@ -50,13 +50,13 @@ import warnings
 import pytest
 import torch
 
-from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type
-from veomni.utils.moe_lora import (
+from veomni.lora.moe_layers import (
     LoraIndependentExperts,
     LoraSharedExperts,
     apply_independent_moe_lora,
     apply_shared_moe_lora,
 )
+from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type
 
 from .utils import (
     build_toy,
@@ -69,8 +69,8 @@ from .utils import (
 
 # Models exercised by the fused-vs-eager parity tests. All entries must use
 # the v5 fused experts layout (gate_up_proj + down_proj as 3-D nn.Parameters)
-# so :class:`~veomni.utils.moe_lora.LoraSharedExperts` /
-# :class:`~veomni.utils.moe_lora.LoraIndependentExperts` can wrap them and
+# so :class:`~veomni.lora.moe_layers.LoraSharedExperts` /
+# :class:`~veomni.lora.moe_layers.LoraIndependentExperts` can wrap them and
 # the Triton group-gemm kernel can run unmodified. ``qwen3_moe_toy`` is the
 # baseline (smallest config); ``deepseek_v3_toy`` exercises the kernel with
 # different ``num_experts`` / ``moe_intermediate_size`` shapes and the
@@ -99,7 +99,7 @@ _GRAD_L2REL_TOL = 0.02  # 2% — backward stacks a bf16 matmul on top of the dgr
 # Each entry maps the parametrise id (``"shared"`` / ``"independent"``) to:
 #   * the wrapper class (for isinstance checks),
 #   * the ``apply_*`` factory used by ``_wrap_with_lora``,
-#   * the global pointer name on ``veomni.ops.kernels.moe`` that the wrapper
+#   * the global pointer name on ``veomni.lora.ops`` that the wrapper
 #     dispatches against (used by the sanity / dispatch tests).
 _MODES = {
     "shared": (LoraSharedExperts, apply_shared_moe_lora, "_fused_lora_moe_forward"),
@@ -132,22 +132,24 @@ def _restore_moe_pointers():
 
     Tests in this file flip ``moe_implementation`` between fused and eager via
     ``build_toy(..., ops=fused_triton_moe_ops())`` which calls
-    ``apply_veomni_fused_moe_patch("triton")`` and mutates the module-level
-    ``_fused_moe_forward`` / ``_fused_lora_moe_forward`` /
+    ``apply_veomni_fused_moe_patch("triton")`` and mutates the base
+    ``veomni.ops.kernels.moe._fused_moe_forward`` pointer plus the
+    ``veomni.lora.ops._fused_lora_moe_forward`` /
     ``_fused_independent_lora_moe_forward`` pointers. Restoring afterwards
     keeps unrelated MoE tests deterministic regardless of run order.
     """
+    from veomni.lora import ops as _lora_ops
     from veomni.ops.kernels import moe as _moe_ops
 
     saved_base = _moe_ops._fused_moe_forward
-    saved_lora = _moe_ops._fused_lora_moe_forward
-    saved_indep = _moe_ops._fused_independent_lora_moe_forward
+    saved_lora = _lora_ops._fused_lora_moe_forward
+    saved_indep = _lora_ops._fused_independent_lora_moe_forward
     try:
         yield
     finally:
         _moe_ops._fused_moe_forward = saved_base
-        _moe_ops._fused_lora_moe_forward = saved_lora
-        _moe_ops._fused_independent_lora_moe_forward = saved_indep
+        _lora_ops._fused_lora_moe_forward = saved_lora
+        _lora_ops._fused_independent_lora_moe_forward = saved_indep
 
 
 def _wrap_with_lora(model, lora_cfg, *, apply_fn, lora_b_perturb_std: float = 0.0):
@@ -214,12 +216,13 @@ def test_fused_pointer_bound_after_fused_triton_build():
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         build_toy(_TOY, ops=fused_triton_moe_ops())
+    from veomni.lora import ops as _lora_ops
     from veomni.ops.kernels import moe as _moe_ops
 
-    assert _moe_ops._fused_lora_moe_forward is not None, (
+    assert _lora_ops._fused_lora_moe_forward is not None, (
         "apply_veomni_fused_moe_patch('triton') must bind _fused_lora_moe_forward (Mode 2)."
     )
-    assert _moe_ops._fused_independent_lora_moe_forward is not None, (
+    assert _lora_ops._fused_independent_lora_moe_forward is not None, (
         "apply_veomni_fused_moe_patch('triton') must bind _fused_independent_lora_moe_forward (Mode 1)."
     )
     assert _moe_ops._fused_moe_forward is not None, "Sanity: base fused MoE pointer should also be bound."
@@ -240,10 +243,11 @@ def test_wrapper_dispatch_chooses_fused_when_pointer_bound(mode):
     assert out_f.shape == h.shape
 
     # Path B: eager build → pointer is None → wrapper falls back to eager.
+    from veomni.lora import ops as _lora_ops
     from veomni.ops.kernels import moe as _moe_ops
 
     _moe_ops._fused_moe_forward = None
-    setattr(_moe_ops, pointer_name, None)
+    setattr(_lora_ops, pointer_name, None)
     model_e, fqn_e, exp_e, _ = _build_wrapped(mode=mode, fused=False, lora_b_perturb_std=0.0)
     wrapper_e = model_e.get_submodule(fqn_e)
     out_e = wrapper_e(h.cpu().to(next(exp_e.parameters()).device), idx, w)
@@ -394,16 +398,16 @@ def test_ep_class_matches_nonep_class_single_rank(mode):
     """
     _require_cuda_with_triton()
 
-    from veomni.ops.kernels.moe._kernels.kernel.moe import (
-        expert_histogram,
-        moe_gather,
-        moe_scatter,
-    )
-    from veomni.ops.kernels.moe.lora_group_gemm import (
+    from veomni.lora.ops.moe_group_gemm import (
         EPMergedFc1IndependentLoRAGroupGemm,
         EPMergedFc1SharedLoRAGroupGemm,
         MergedFc1IndependentTritonFusedLoRAMoeExpertFunction,
         MergedFc1TritonFusedLoRAMoeExpertFunction,
+    )
+    from veomni.ops.kernels.moe._kernels.kernel.moe import (
+        expert_histogram,
+        moe_gather,
+        moe_scatter,
     )
 
     _CLASSES = {

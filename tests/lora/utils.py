@@ -20,7 +20,7 @@ Conventions:
       ``gate_up_proj`` / ``down_proj``), ``lora_modules`` (PEFT linear
       targets), ``rank`` and ``alpha``.
     * VeOmni MoE-LoRA is v5-only (the wrapper validates a fused experts
-      layout in :func:`veomni.utils.moe_lora._validate_fused_layout`).
+      layout in :func:`veomni.lora.moe_layers._validate_fused_layout`).
       Toys whose model family was added in a later transformers release —
       e.g. ``qwen3_5_moe`` (5.2.0) — declare ``min_transformers_version``
       so :func:`select_lora_yaml` skips cleanly on older envs.
@@ -131,7 +131,7 @@ def fused_triton_moe_ops() -> OpsImplementationConfig:
 
     Selecting ``moe_implementation="fused_triton"`` triggers
     ``apply_veomni_fused_moe_patch("triton")`` during ``build_foundation_model``,
-    which is what installs ``veomni.ops.kernels.moe._fused_lora_moe_forward``.
+    which is what installs ``veomni.lora.ops._fused_lora_moe_forward``.
     The fused MoE-LoRA tests need that pointer to be non-``None`` to actually
     exercise the kernel path inside ``LoraSharedExperts.forward``.
     """

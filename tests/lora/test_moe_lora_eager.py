@@ -15,15 +15,15 @@
 
 Covers BOTH wrapper flavours, parametrised on the ``mode`` axis:
 
-* ``mode="shared"`` → :class:`veomni.utils.moe_lora.LoraSharedExperts` (Mode 2,
+* ``mode="shared"`` → :class:`veomni.lora.moe_layers.LoraSharedExperts` (Mode 2,
   one LoRA pair per layer, broadcast across all experts).
-* ``mode="independent"`` → :class:`veomni.utils.moe_lora.LoraIndependentExperts`
+* ``mode="independent"`` → :class:`veomni.lora.moe_layers.LoraIndependentExperts`
   (Mode 1 — the trainer default — one LoRA pair *per expert*, 3-D tensors).
 
 What this exercises (per ``mode`` × per toy):
 
 1. The wrapper validates the experts layout (fused ``gate_up_proj`` /
-   ``down_proj`` — see :func:`veomni.utils.moe_lora._validate_fused_layout`)
+   ``down_proj`` — see :func:`veomni.lora.moe_layers._validate_fused_layout`)
    and matches the yaml-declared ``target_parameters``.
 2. The wrapper is a true no-op at init (per-expert kaiming-uniform A, zero B).
 3. Backward only flows through ``<spec>.lora_A`` / ``<spec>.lora_B`` parameters
@@ -64,21 +64,17 @@ Run:
 
 from __future__ import annotations
 
-import os
 import warnings
 
 import pytest
 import torch
 
-from veomni.utils.moe_lora import (
+from veomni.lora.moe_layers import (
     _LORA_SPEC_KEYS,
     LoraIndependentExperts,
     LoraSharedExperts,
     apply_independent_moe_lora,
-    apply_moe_lora_from_sidecar,
     apply_shared_moe_lora,
-    read_moe_lora_sidecar,
-    write_moe_lora_sidecar,
 )
 
 from .utils import (
@@ -302,20 +298,19 @@ def test_backward_isolates_to_lora_params(toy_dir: str, mode: str):
 
 @pytest.mark.parametrize("mode", _MODE_CASES)
 def test_save_reload_round_trip_qwen3_moe(tmp_path, mode: str):
-    """End-to-end: PEFT (yaml-declared linears) + MoE-LoRA (yaml patterns) → save+sidecar → reload → identical fwd.
+    """End-to-end (native stack): VeOmniLoraModel (linears + MoE-LoRA patterns) → save → reload → identical fwd.
 
-    Run for both ``shared`` (Mode 2) and ``independent`` (Mode 1) flavours so
-    the parametrised PEFT round-trip + sidecar dispatch logic in
-    :func:`veomni.utils.moe_lora.apply_moe_lora_from_sidecar` is covered for
-    each one. Asserts:
+    Run for both ``shared`` (Mode 2) and ``independent`` (Mode 1) flavours so the
+    PEFT-free ``VeOmniLoraModel`` save / ``from_pretrained`` + ``load_lora_weights``
+    path is covered for each. Asserts:
 
-    * Init delta vs base is < 1e-3 (kaiming-A / zero-B no-op modulo activation
-      checkpointing rounding).
+    * Init delta vs base is < 1e-3 (kaiming-A / zero-B no-op).
     * After perturbing ``<spec>.lora_B`` (so the LoRA contribution is non-trivial),
-      reloading from disk produces a *bit-identical* forward + state-dict for
-      every saved LoRA tensor.
+      reloading from disk produces a *bit-identical* forward + LoRA state-dict.
     """
-    from peft import LoraConfig, PeftModel, get_peft_model
+    from veomni.lora import VeOmniLoraConfig, VeOmniLoraModel
+    from veomni.lora.state_dict import get_lora_state_dict
+    from veomni.lora.weight_loading import load_lora_weights
 
     torch.manual_seed(0)
     with warnings.catch_warnings():
@@ -334,28 +329,26 @@ def test_save_reload_round_trip_qwen3_moe(tmp_path, mode: str):
         base_out = model(input_ids=input_ids).logits.clone()
     base_state = {k: v.clone() for k, v in model.state_dict().items()}
 
-    # Pre-PEFT: count experts modules matching the yaml patterns. PEFT wraps
-    # linears (not experts), so the experts module count is stable across
-    # ``get_peft_model``. We assert on count rather than FQN identity because
-    # PEFT prefixes everything with ``base_model.model.`` once it wraps the
-    # model — and the FQN-identity check is already covered by
-    # ``test_layout_validate_and_wrap`` above.
     expected_n_experts = len(find_all_matching_modules(model, experts_module_globs(patterns)))
     assert expected_n_experts > 0, f"qwen3_moe_toy: yaml patterns {patterns} matched no experts module — stale yaml?"
 
-    # Wrap with the same hyper-params the user-facing yaml declares.
-    peft_cfg = LoraConfig(r=rank, lora_alpha=alpha, target_modules=linear_targets)
-    wrapped_model = get_peft_model(model, peft_cfg)
-    wrapped = _apply(
-        mode,
-        wrapped_model,
-        target_parameter_patterns=patterns,
-        r=rank,
-        lora_alpha=alpha,
-        freeze_base_model=False,  # PEFT already froze
+    # Native wrap: dense linears + MoE-LoRA in one config. ``share_expert_lora``
+    # selects the wrapper flavour (shared→Mode 2, independent→Mode 1).
+    cfg = VeOmniLoraConfig.from_yaml(
+        {
+            "rank": rank,
+            "alpha": alpha,
+            "lora_modules": linear_targets,
+            "target_parameters": patterns,
+            "share_expert_lora": mode == "shared",
+        }
     )
-    assert len(wrapped) == expected_n_experts, (
-        f"{mode}: wrapped {len(wrapped)} experts modules, expected {expected_n_experts}: {wrapped}"
+    wrapped_model = VeOmniLoraModel(model, cfg)
+    from veomni.lora.moe_layers import is_lora_moe_experts
+
+    n_wrapped = sum(1 for _, m in wrapped_model.named_modules() if is_lora_moe_experts(m))
+    assert n_wrapped == expected_n_experts, (
+        f"{mode}: wrapped {n_wrapped} experts modules, expected {expected_n_experts}"
     )
 
     # No-op at init.
@@ -374,23 +367,18 @@ def test_save_reload_round_trip_qwen3_moe(tmp_path, mode: str):
     with torch.no_grad():
         trained_out = wrapped_model(input_ids=input_ids).logits.clone()
 
-    # Save (PEFT writes adapter_config + adapter_model.safetensors; we add the sidecar).
+    # Save the PEFT-format adapter (adapter_config.json + adapter_model files).
     save_dir = str(tmp_path / "adapter")
     wrapped_model.save_pretrained(save_dir)
-    sidecar_path = write_moe_lora_sidecar(wrapped_model, save_dir)
-    assert sidecar_path is not None and os.path.isfile(sidecar_path)
 
-    # Reload into a fresh model with the SAME base weights.
+    # Reload into a fresh model with the SAME base weights via from_pretrained.
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         model2 = build_toy("qwen3_moe_toy")
     model2.load_state_dict(base_state)
     model2.eval()
-    sidecar = read_moe_lora_sidecar(save_dir)
-    assert sidecar is not None
-    assert sidecar["mode"] == mode, f"sidecar mode={sidecar['mode']!r}, expected {mode!r}"
-    apply_moe_lora_from_sidecar(model2, sidecar, freeze_base_model=False)
-    reloaded = PeftModel.from_pretrained(model2, save_dir, is_trainable=True)
+    reloaded = VeOmniLoraModel.from_pretrained(model2, save_dir, is_trainable=True)
+    load_lora_weights(reloaded, save_dir, init_device="cpu")
     reloaded.eval()
     with torch.no_grad():
         reload_out = reloaded(input_ids=input_ids).logits
@@ -399,11 +387,9 @@ def test_save_reload_round_trip_qwen3_moe(tmp_path, mode: str):
     delta = (reload_out - trained_out).abs().max().item()
     assert delta == 0.0, f"{mode}: reload parity broken: max|reload-trained|={delta}"
 
-    # Bit-identical LoRA parameter tensors. Under the PEFT-aligned wrapper
-    # layout every LoRA key contains ``.lora_A.<adapter>.`` / ``.lora_B.<adapter>.``
-    # so a single substring check covers both linear-PEFT and MoE-LoRA.
-    s1, s2 = wrapped_model.state_dict(), reloaded.state_dict()
+    # Bit-identical LoRA parameter tensors (PEFT on-disk key format).
+    s1 = get_lora_state_dict(wrapped_model, config=wrapped_model.get_lora_config())
+    s2 = get_lora_state_dict(reloaded, config=reloaded.get_lora_config())
+    assert set(s1) == set(s2), f"{mode}: reload key set mismatch"
     for k in s1:
-        if ".lora_A." in k or ".lora_B." in k:
-            assert k in s2, f"{mode}: missing in reload: {k}"
-            assert torch.equal(s1[k], s2[k]), f"{mode}: value mismatch: {k}"
+        assert torch.equal(s1[k], s2[k]), f"{mode}: value mismatch: {k}"

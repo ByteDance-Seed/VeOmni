@@ -826,8 +826,8 @@ def _reset_lora_under_ep_worker():
     sys.path.insert(0, os.path.join(os.path.dirname(__file__)))
     from utils import build_toy, full_eager_ops
 
+    from veomni.lora.moe_layers import apply_independent_moe_lora
     from veomni.utils.device import get_device_type
-    from veomni.utils.moe_lora import apply_independent_moe_lora
 
     rank = dist.get_rank()
     world = dist.get_world_size()

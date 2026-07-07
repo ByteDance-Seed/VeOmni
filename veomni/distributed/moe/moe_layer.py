@@ -120,7 +120,7 @@ def dispatch_to_ep_class(
     Args:
         ep_class: The EP autograd ``Function`` class to apply (one of
             :class:`EPGroupGemm`, :class:`EPMergedFc1GroupGemm`, or one of the
-            LoRA variants in ``veomni.ops.kernels.moe.lora_group_gemm``).
+            LoRA variants in ``veomni.lora.ops.moe_group_gemm``).
             ``ep_class.apply`` must accept ``(permute_tokens, cumsum, *ep_class_args)``
             in that order and return a ``[T_local, H]`` permuted-output tensor.
         num_experts: total expert count ``E`` for this MoE layer (global on EP).

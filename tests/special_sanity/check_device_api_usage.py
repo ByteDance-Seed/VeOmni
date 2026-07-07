@@ -46,7 +46,6 @@ CUDA_KEYWORD_CHECK_WHITELIST = [
     "veomni/ops/kernels/moe/_kernels/utils/device.py",
     "tests/special_sanity/check_device_api_usage.py",
     "tests/tools/common_utils.py",
-    "veomni/utils/lora_utils.py",
     # Implicit-CUDA-sync gate. Calls ``torch.cuda.{get,set}_sync_debug_mode``
     # directly because the API is intrinsically CUDA-only and has no
     # ``veomni.utils.device`` equivalent; the test is gated on

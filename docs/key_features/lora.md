@@ -5,20 +5,30 @@ feature of `BaseTrainer`. LoRA injects trainable low-rank matrices into selected
 while freezing the rest of the base model, enabling parameter-efficient fine-tuning with
 significantly reduced GPU memory.
 
+LoRA is implemented by VeOmni's **own** stack, `veomni.lora` — a PEFT-free
+[`peft.PeftModel`](https://huggingface.co/docs/peft) replacement (`VeOmniLoraModel` /
+`VeOmniLoraConfig`). It supports PEFT's main features, adds MoE-LoRA and EP-LoRA, and is
+FSDP2-native. Crucially it stays **format-compatible** with PEFT: it reads and writes
+standard `adapter_config.json` + `adapter_model.{safetensors,bin}` files, so adapters
+train-here / load-there interchangeably with stock `peft`.
+
 ---
 
 ## Installation
 
-LoRA support requires the `peft` library. Install it via the `lora` optional extra:
+No extra dependency is required to *train* LoRA — `veomni.lora` has no `peft` dependency:
+
+```shell
+uv sync --extra gpu --dev
+```
+
+`peft` is only needed to run the cross-compatibility interop test
+(`tests/lora/test_veomni_lora_native.py::test_peft_bidirectional_interop`, which
+`pytest.importorskip`s it). It lives in the `lora` optional extra (`peft==0.19.0`), which CI
+and the Docker images install alongside dev tooling:
 
 ```shell
 uv sync --extra gpu --extra lora --group dev
-```
-
-Or with pip:
-
-```shell
-pip install peft==0.18.0
 ```
 
 ---
@@ -47,15 +57,26 @@ model:
 | `rank` | int | Rank of the decomposition matrices A and B |
 | `alpha` | int | LoRA scaling factor; effective scale = `alpha / rank` |
 | `use_rslora` | bool (optional, default `false`) | Rank-stabilised LoRA scaling (`alpha / sqrt(r)`) |
-| `lora_modules` | list[str] | Standard PEFT target — `nn.Linear` layer name substrings (matched against module FQNs). |
+| `lora_modules` | list[str] or str | `nn.Linear` LoRA targets. List → PEFT substring/suffix match on module FQNs; a single `str` → regex (full match). Alias: `target_modules`. |
+| `exclude_modules` | list[str] or str (optional) | Modules to skip even if matched by `lora_modules`. |
 | `target_parameters` | list[str] (optional) | MoE-LoRA target — glob patterns matching the 3-D `nn.Parameter`s on a v5 MoE experts module (e.g. `model.layers.*.mlp.experts.gate_up_proj`). See §5 below. |
 | `share_expert_lora` | bool (optional, default `false`) | When `target_parameters` is set: `false` → per-expert independent LoRA; `true` → a single LoRA pair shared across all experts of a layer. See §5. |
-| `lora_adapter` | str (optional) | Path to a saved adapter directory to resume from |
-| `is_trainable` | bool (optional, default `true`) | Forwarded to `PeftModel.from_pretrained` when resuming. Set `false` to load adapters for inference only. |
+| `lora_dropout` | float (optional, default `0.0`) | Dropout applied to the LoRA input. |
+| `bias` | str (optional, default `none`) | Which biases stay trainable: `none` / `all` / `lora_only` (PEFT semantics). |
+| `rank_pattern` | dict[str,int] (optional) | Per-module rank overrides, `{regex: r}` (first match wins). |
+| `alpha_pattern` | dict[str,int] (optional) | Per-module alpha overrides, `{regex: alpha}`. |
+| `lora_adapter` | str (optional) | Path to a saved adapter directory to resume from. |
+| `is_trainable` | bool (optional, default `true`) | When resuming, set `false` to load adapters frozen for inference only. |
 
-`lora_modules` and `target_parameters` may be set together — the former is handled by PEFT
-on `nn.Linear` layers (q/k/v/o, MLP, shared_expert, etc.), the latter by VeOmni's MoE-LoRA
-wrappers on the fused experts `nn.Parameter`s. At least one must be non-empty.
+`lora_modules` and `target_parameters` may be set together — the former installs
+`LoraLinear` on `nn.Linear` layers (q/k/v/o, MLP, shared_expert, etc.), the latter installs
+VeOmni's MoE-LoRA wrappers on the fused experts `nn.Parameter`s. At least one must be
+non-empty. (Field names mirror `VeOmniLoraConfig`; the historical `rank`/`alpha`/`lora_modules`
+YAML names and the PEFT-style `r`/`lora_alpha`/`target_modules` names are both accepted.)
+
+> `modules_to_save` is parsed but not yet supported by the native stack (it raises a clear
+> `NotImplementedError`); correctly seeding the extra trainable modules under FSDP2
+> meta-device init is a planned follow-up.
 
 For **resume training**, add the `lora_adapter` key pointing to the saved adapter directory:
 
@@ -73,47 +94,38 @@ model:
 ## 2. LoRA Initialization in BaseTrainer
 
 LoRA wrapping happens in `BaseTrainer._setup_lora()`, called from `_freeze_model_module()`.
-It dispatches to one of two VeOmni-flavoured PEFT entry points (`veomni/utils/moe_lora.py`)
-that transparently combine standard PEFT LoRA with VeOmni MoE-LoRA wrappers:
+A single native path wraps the model with `VeOmniLoraModel`, handling dense `nn.Linear`
+LoRA, MoE expert LoRA, and the two combined:
 
 ```python
 # veomni/trainer/base.py
-from ..utils.moe_lora import veomni_get_peft_model, veomni_peft_model_from_pretrained
-
 def _setup_lora(self):
     lora_config = self.args.model.lora_config
     if not bool(lora_config):
         return
 
+    from ..lora import VeOmniLoraConfig, VeOmniLoraModel
+
+    cfg = VeOmniLoraConfig.from_yaml(lora_config)
     lora_adapter_path = lora_config.get("lora_adapter", None)
     if lora_adapter_path is not None:
-        # Resume: reads the optional veomni_moe_lora.json sidecar to re-install
-        # MoE-LoRA wrappers, then delegates to PeftModel.from_pretrained.
-        self.model = veomni_peft_model_from_pretrained(
+        # Resume: rebuild dense + MoE wrappers from the on-disk adapter_config.json
+        # (MoE mode lives in its `veomni_lora` block). Weights load later.
+        self.model = VeOmniLoraModel.from_pretrained(
             self.model,
             lora_adapter_path,
             is_trainable=lora_config.get("is_trainable", True),
         )
     else:
-        # From scratch: wraps nn.Linear targets with PEFT and installs MoE-LoRA
-        # wrappers on target_parameters in one call.
-        from peft import LoraConfig
-        peft_cfg = LoraConfig(
-            r=lora_config["rank"],
-            lora_alpha=lora_config["alpha"],
-            target_modules=lora_config.get("lora_modules"),
-            target_parameters=lora_config.get("target_parameters"),
-            use_rslora=lora_config.get("use_rslora", False),
-        )
-        self.model = veomni_get_peft_model(
-            self.model,
-            peft_cfg,
-            share_expert_lora=lora_config.get("share_expert_lora", False),
-        )
+        self.model = VeOmniLoraModel(self.model, cfg)
 ```
 
-After both paths, the base model is fully frozen and only the LoRA parameters
-(both PEFT's linear LoRA and VeOmni's MoE-LoRA, if any) have `requires_grad=True`.
+`VeOmniLoraModel` mirrors `peft.PeftModel` structurally: `model.base_model.model` is the
+original model, so every LoRA parameter FQN and every saved adapter key carries the
+`base_model.model.` prefix — byte-identical to a PEFT checkpoint. Attribute access and
+`forward` are forwarded to the wrapped model, so the trainer, loss computation, and
+`generate` are unchanged. After wrapping, the base model is fully frozen and only the LoRA
+parameters (dense `LoraLinear` and MoE-LoRA, if any) have `requires_grad=True`.
 
 `BaseTrainer._init_callbacks()` automatically selects `HFLoraCkptCallback`
 instead of `HuggingfaceCkptCallback` when `lora_config` is set:
@@ -137,17 +149,24 @@ VeOmni LoRA training uses FSDP2 with `init_device: meta`. Weight loading goes th
    `load_model_weights` — the standard FSDP2 path, unchanged for LoRA.
 
 2. **Adapter weights** (resume only): `_build_parallelized_model` passes `adapter_path`
-   to `build_parallelize_model`, which calls `load_lora_model_weights` (all-ranks read)
-   or `rank0_load_and_broadcast_adapter_weights` (rank-0 reads then broadcasts).
-   Both functions remap PEFT keys to model FQNs before dispatching into DTensors.
+   to `build_parallelize_model`, which — for a `VeOmniLoraModel` — calls the native
+   `veomni.lora.weight_loading.load_lora_weights` (all-ranks read) or
+   `rank0_load_and_broadcast_lora_weights` (rank-0 reads then broadcasts). Both read the
+   PEFT-format adapter file natively (safetensors / torch, **no `peft` import**) and remap
+   on-disk keys to model FQNs before dispatching into DTensors. EP-sharded LoRA tensors are
+   sliced from the disk-side `[E, ...]` shape to the local `[E_local, ...]` via the runtime
+   parallel plan, exactly as on the base-weight path.
 
 3. **Adapter weight initialisation from scratch**: `post_process_after_weight_loading`
    calls `_init_lora_parameter` for any LoRA parameter not yet filled, invoking
-   `reset_lora_parameters` to apply kaiming/zero init.
+   `reset_lora_parameters` (kaiming `A` / zero `B`). For MoE wrappers the reset only fires
+   when every wrapper parameter is still on meta device, so a partially-loaded wrapper is
+   never clobbered.
 
-**Key difference from base model loading:** PEFT saves adapter keys without the adapter-name
-infix (e.g. `lora_A.weight`), whereas the live model stores them as
-`lora_A.<adapter_name>.weight`. The `_remap_adapter_key` utility handles this translation.
+**Key difference from base model loading:** the on-disk adapter keys omit the adapter-name
+infix (PEFT convention — e.g. `lora_A.weight`), whereas the live model stores them as
+`lora_A.<adapter_name>.weight`. `veomni.lora.state_dict.insert_adapter_name` /
+`strip_adapter_name` handle the translation in both directions.
 
 ---
 
@@ -164,13 +183,15 @@ extra state) via PyTorch DCP. For LoRA training this includes both base-model pa
 `HFLoraCkptCallback._save_checkpoint` calls `save_lora_adapter_with_dcp`
 (`veomni/utils/save_safetensor_utils.py`), which:
 
-1. Extracts adapter-only tensors via `get_peft_model_state_dict`.
-2. Saves them with `dcp.save` in parallel to a temporary DCP directory.
-3. Consolidates on rank 0 into `adapter_model.bin` and `adapter_config.json`.
-4. For MoE-LoRA runs, also writes a small `veomni_moe_lora.json` sidecar that
-   records the mode (`independent` / `shared`), `target_parameters` patterns
-   and rank/alpha so resume can re-install the right wrappers.
-5. Removes the temporary DCP directory.
+1. Extracts adapter-only tensors via `veomni.lora.state_dict.get_lora_state_dict`
+   (PEFT on-disk key format).
+2. Restores the EP shard dim on `Shard()`-placed LoRA tensors so DCP gathers the full
+   `[E, ...]` shape, then saves with `dcp.save` in parallel to a temporary DCP directory.
+3. Consolidates on rank 0 into `adapter_model.bin` and writes `adapter_config.json` via
+   `VeOmniLoraModel.get_lora_config().save_pretrained` — which embeds any MoE metadata
+   (`target_parameters` + `veomni_lora.moe_mode`) directly in the config. **No separate
+   sidecar.**
+4. Removes the temporary DCP directory.
 
 Output structure for each checkpoint:
 
@@ -181,9 +202,8 @@ Output structure for each checkpoint:
 │       ├── __0_0.distcp
 │       └── .metadata
 └── global_step_N/              ← HF adapter (inference / resume)
-    ├── adapter_config.json
-    ├── adapter_model.bin
-    └── veomni_moe_lora.json    ← MoE-LoRA only
+    ├── adapter_config.json     ← PEFT-format; MoE mode in its `veomni_lora` block
+    └── adapter_model.bin
 ```
 
 ---
@@ -200,7 +220,7 @@ experts.down_proj     : nn.Parameter[E, H,   I]
 
 PEFT's `target_modules` only matches `nn.Module` subclasses (typically `nn.Linear`) and
 therefore cannot reach these parameters. VeOmni's MoE-LoRA wrappers
-(`veomni/utils/moe_lora.py`) target them via `target_parameters`, in two flavours:
+(`veomni/lora/moe_layers.py`) target them via `target_parameters`, in two flavours:
 
 | Mode | Wrapper class | Per-expert LoRA shape | When to use |
 |---|---|---|---|
@@ -267,9 +287,11 @@ Each MoE-LoRA wrapper dispatches based on `model.ops_implementation.moe_implemen
 | `fused_triton` | fused triton kernel | fused triton kernel | Recommended for training. |
 | `eager` | eager loop (reference) | not supported (raises) | Reference / fallback for NPU and Quack. |
 
-The fused path lives in `veomni/ops/kernels/moe/lora_group_gemm.py` and reuses the same
-`group_gemm_same_nk` / `group_gemm_same_mn` primitives as the non-LoRA MoE forward, so it
-inherits the same EP `all-to-all` dispatch pipeline.
+The fused path lives in `veomni/lora/ops/moe_group_gemm.py` and reuses the same
+`group_gemm_same_nk` / `group_gemm_same_mn` primitives (from `veomni/ops/kernels/moe/_kernels/`)
+as the non-LoRA MoE forward, so it inherits the same EP `all-to-all` dispatch pipeline. The
+LoRA fused pointers are bound by `veomni.ops.kernels.moe.apply_veomni_fused_moe_patch` via
+`veomni.lora.ops.bind_lora_moe_kernels`.
 
 ### 5.4 Expert Parallelism (EP)
 
@@ -290,25 +312,26 @@ Both modes work with FSDP2 + EP. EP is only supported on the `fused_triton` forw
 
 ### 5.5 Save / load artefacts
 
-A MoE-LoRA training run writes one extra file alongside the standard PEFT artefacts:
+A MoE-LoRA run writes only the two standard PEFT artefacts — **no sidecar**:
 
 ```
 <output_dir>/global_step_N/
-├── adapter_config.json     # PEFT standard
-├── adapter_model.bin       # PEFT standard — both linear LoRA and MoE-LoRA tensors
-└── veomni_moe_lora.json    # VeOmni sidecar — mode + target_parameters + r/alpha
+├── adapter_config.json     # PEFT-format; MoE mode/rank/alpha in its `veomni_lora` block
+└── adapter_model.bin       # PEFT-format — both linear LoRA and MoE-LoRA tensors
 ```
 
-The sidecar is required at resume — `veomni_peft_model_from_pretrained` reads it to
-decide which wrapper class to install (`LoraIndependentExperts` vs `LoraSharedExperts`)
-**before** delegating to PEFT's standard load. Adapters saved without a sidecar are
-treated as plain PEFT adapters and the MoE-LoRA wrappers are not installed.
+At resume, `VeOmniLoraModel.from_pretrained` reads `adapter_config.json`: the
+`veomni_lora.moe_mode` field decides which wrapper class to install
+(`LoraIndependentExperts` vs `LoraSharedExperts`) **before** weights are loaded. If a
+stock-PEFT adapter (no `veomni_lora` block) is loaded, the MoE mode is inferred from the
+on-disk LoRA tensor shapes (3-D per-expert → independent, 2-D → shared).
 
 The MoE-LoRA tensors in `adapter_model.bin` use PEFT-aligned FQNs
 (`base_model.model.<...>.<spec>.lora_A.<adapter>.weight`), so third-party PEFT tooling
-(HuggingFace Hub, `peft.PeftModel.from_pretrained`) can also load the file — though
-without VeOmni's wrappers re-installed first, the MoE-LoRA half of the keys will be
-silently dropped as `unexpected_keys`.
+(HuggingFace Hub, `peft.PeftModel.from_pretrained`) can also load the file — though without
+VeOmni's wrappers re-installed first, the MoE-LoRA half of the keys will be dropped as
+`unexpected_keys`. The `veomni_lora` block is an unknown top-level key to `peft` and is
+ignored on its side, keeping the file loadable by both stacks.
 
 ### 5.6 Ready-to-use configs
 
@@ -549,6 +572,8 @@ Suite layout:
 
 | Test | Coverage |
 |------|----------|
+| `test_veomni_lora_native.py` | CPU, single-process: `VeOmniLoraConfig` round-trips, dense injection structure / no-op-at-init, `get_lora_state_dict` PEFT key format, save→`from_pretrained`→load parity, `merge_and_unload`, rank/alpha patterns, exclude_modules, rslora scaling, and **bidirectional PEFT interop** (gated on `peft`). |
+| `test_veomni_lora_moe_native.py` | CPU, single-process: native MoE injection (independent/shared), MoE metadata embedded in `adapter_config.json` (no sidecar), state-dict key format/rank, save→reload param round-trip, and MoE-mode inference when the `veomni_lora` block is absent. |
 | `test_moe_lora_eager.py` | Wrapper layout + autograd parity for both Mode 1 (independent) and Mode 2 (shared); covers all v5 MoE configs (qwen3_moe / qwen3_5_moe / qwen3_vl_moe / qwen3_omni_moe / deepseek_v3). |
 | `test_moe_lora_fused.py` | Triton fused MoE-LoRA kernel parity vs eager (forward + backward) and EP autograd-class parity vs non-EP under controlled inputs. |
 | `test_moe_lora_trainer.py` | Production save/load/resume round-trip: writer (DCP shard + HF adapter) → DCP-resume subprocess → adapter-resume subprocess; bit-exact LoRA reload assertion. The yaml enables both `lora_modules` (linear LoRA on `q_proj`/`v_proj`) and `target_parameters` (MoE-LoRA wrappers), so both LoRA flavors round-trip end-to-end. |
@@ -575,6 +600,6 @@ torchrun --nproc_per_node=4 tests/lora/test_moe_lora_trainer.py \
 ```
 
 **What the round-trip test verifies:**
-1. Writer trains `max_steps=4`, writes DCP shards at step 2 / step 4 and HF LoRA adapter (+ `veomni_moe_lora.json` sidecar) at the same cadence; snapshots the full LoRA tensors at `on_train_begin` and `on_train_end`.
+1. Writer trains `max_steps=4`, writes DCP shards at step 2 / step 4 and the HF LoRA adapter (`adapter_config.json` with the `veomni_lora` block + `adapter_model.bin`, no sidecar) at the same cadence; snapshots the full LoRA tensors at `on_train_begin` and `on_train_end`.
 2. DCP-resume subprocess loads the step-2 DCP shard, continues to step 4, and the resulting LoRA tensors must be **bit-exact** vs the writer's `on_train_end` snapshot (DCP ships model + optimizer + RNG + dataloader state).
 3. LoRA-adapter-resume subprocess loads the step-4 HF adapter via `model.lora_config.lora_adapter`, and the resulting `on_train_begin` snapshot (= post-load, pre-train) must be bit-exact vs the writer's `on_train_end` snapshot in bf16 (the on-disk adapter dtype).

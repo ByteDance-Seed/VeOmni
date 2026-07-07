@@ -58,7 +58,7 @@ def _collect_ep_replicated_lora_param_ids(model: "nn.Module") -> set[int]:
     (not the EP mesh) so the norm is computed once.
 
     Detection by class name (``LoraSharedExperts``) so this stays free of
-    a circular import (``veomni.utils.moe_lora`` already imports from
+    a circular import (``veomni.lora.moe_layers`` already imports from
     ``veomni.distributed.parallel_state``).
 
     Call-order requirement

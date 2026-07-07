@@ -247,9 +247,9 @@ def _init_parameter(
     """
     pieces = name.split(".")
     if any(p.startswith("lora_") for p in pieces):
-        from ..utils.lora_utils import _init_lora_parameter
+        from ..lora.weight_loading import init_lora_parameter
 
-        _init_lora_parameter(module, name)
+        init_lora_parameter(module, name)
         return
     init_func = None
     for piece in pieces[:-1]:
@@ -333,7 +333,7 @@ def load_model_weights(
     is_peft_model = kwargs.get("is_peft_model", False)
     adapter_path = kwargs.get("adapter_path", None)
     if is_peft_model:
-        from ..utils.lora_utils import build_lora_key_overrides
+        from ..lora.weight_loading import build_lora_key_overrides
 
         lora_key_overrides = build_lora_key_overrides(model)
 
@@ -358,7 +358,7 @@ def load_model_weights(
     is_peft_model = kwargs.get("is_peft_model", False)
     adapter_path = kwargs.get("adapter_path", None)
     if is_peft_model:
-        from ..utils.lora_utils import build_lora_key_overrides
+        from ..lora.weight_loading import build_lora_key_overrides
 
         lora_key_overrides = build_lora_key_overrides(model)
 
@@ -394,19 +394,20 @@ def load_model_weights(
             _dispatch_kv(_apply_peft_override(result.name), result.tensor)
 
     if is_peft_model and adapter_path:
-        # load peft lora weights if adapter_path is provided, else, init lora model weights in post_process_after_weight_loading
-        from ..utils.lora_utils import load_lora_model_weights
+        # Load LoRA adapter weights when an adapter_path is provided; otherwise
+        # they are initialised in post_process_after_weight_loading. The native
+        # VeOmniLoraModel reads the PEFT-format file without importing peft.
+        from ..lora.weight_loading import load_lora_weights
 
-        load_lora_model_weights(
+        load_lora_weights(
             model,
             adapter_path,
             init_device,
             dtensor_factory,
             parameter_names_to_load=parameter_names_to_load,
-            # Same EP-aware slicing as the rank0-broadcast variant below;
-            # ``LoraIndependentExperts`` LoRA tensors need to be shrunk
-            # from ``[E, ...]`` to ``[E_local, ...]`` before the DTensor
-            # copy or the propagation asserts on shape mismatch.
+            # EP-aware slicing: ``LoraIndependentExperts`` LoRA tensors are shrunk
+            # from ``[E, ...]`` to ``[E_local, ...]`` inside ``_dispatch_parameter``
+            # before the DTensor copy, or the propagation asserts on shape mismatch.
             parallel_plan=parallel_plan,
         )
 
@@ -459,7 +460,7 @@ def rank0_load_and_broadcast_weights(
     is_peft_model = kwargs.get("is_peft_model", False)
     adapter_path = kwargs.get("adapter_path", None)
     if is_peft_model:
-        from ..utils.lora_utils import build_lora_key_overrides
+        from ..lora.weight_loading import build_lora_key_overrides
 
         lora_key_overrides = build_lora_key_overrides(model)
 
@@ -469,7 +470,7 @@ def rank0_load_and_broadcast_weights(
     is_peft_model = kwargs.get("is_peft_model", False)
     adapter_path = kwargs.get("adapter_path", None)
     if is_peft_model:
-        from ..utils.lora_utils import build_lora_key_overrides
+        from ..lora.weight_loading import build_lora_key_overrides
 
         lora_key_overrides = build_lora_key_overrides(model)
 
@@ -815,24 +816,22 @@ def rank0_load_and_broadcast_weights(
             _broadcast_and_dispatch(name, shape, dtype, tensor)
 
     if is_peft_model and adapter_path:
-        # load peft lora weights if adapter_path is provided, else, init lora model weights in post_process_after_weight_loading
-        from ..utils.lora_utils import rank0_load_and_broadcast_adapter_weights
+        # Rank-0 reads the PEFT-format adapter file (natively, no peft import)
+        # and broadcasts each tensor to all ranks. The runtime plan is forwarded
+        # so EP-sharded LoRA tensors (registered by
+        # ``_extend_plan_for_moe_lora_independent`` for ``LoraIndependentExperts``)
+        # get sliced from the disk-side ``[E, ...]`` shape down to the local
+        # ``[E_local, ...]`` shape inside ``_dispatch_parameter`` before the
+        # DTensor ``.copy_()`` -- without this the copy asserts on a global-shape
+        # mismatch (the ep_size=2 + ``mode=="independent"`` failure mode).
+        from ..lora.weight_loading import rank0_load_and_broadcast_lora_weights
 
-        rank0_load_and_broadcast_adapter_weights(
+        rank0_load_and_broadcast_lora_weights(
             model,
             adapter_path,
             init_device,
             dtensor_factory,
             parameter_names_to_load=parameter_names_to_load,
-            # Forward the runtime plan so EP-sharded LoRA tensors
-            # (registered by ``_extend_plan_for_moe_lora_independent``
-            # for ``LoraIndependentExperts``) get sliced from the
-            # disk-side full ``[E, ...]`` shape down to the local
-            # ``[E_local, ...]`` shape inside ``_dispatch_parameter``
-            # before its DTensor ``.copy_()``. Without this the copy
-            # asserts on a global-shape mismatch -- exactly the
-            # failure mode test_moe_lora_ep_save_load_parallel_align
-            # hits at ep_size=2 + ``mode=="independent"``.
             parallel_plan=parallel_plan,
         )
 

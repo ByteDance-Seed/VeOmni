@@ -70,7 +70,7 @@ the chain reduces to two ``F.linear`` calls per side; for Mode 1 each step
 is a grouped-gemm. The right-hand factorisation (``A`` then ``B``) avoids
 materialising the ``[E, I, H]`` / ``[E, H, I]`` deltas — the same memory
 trick the eager wrapper uses (see
-``veomni.utils.moe_lora.LoraSharedExperts._eager_forward`` and
+``veomni.lora.moe_layers.LoraSharedExperts._eager_forward`` and
 ``LoraIndependentExperts._eager_forward``).
 
 Backward is hand-derived (the underlying triton primitives are leaf calls
@@ -97,9 +97,9 @@ from __future__ import annotations
 
 import torch
 
-from ....distributed.parallel_state import get_parallel_state
-from ._kernels.kernel.group_gemm import group_gemm_same_mn, group_gemm_same_nk
-from ._kernels.kernel.moe import expert_histogram, moe_gather, moe_scatter
+from ...distributed.parallel_state import get_parallel_state
+from ...ops.kernels.moe._kernels.kernel.group_gemm import group_gemm_same_mn, group_gemm_same_nk
+from ...ops.kernels.moe._kernels.kernel.moe import expert_histogram, moe_gather, moe_scatter
 
 
 class MergedFc1TritonFusedLoRAMoeExpertFunction(torch.autograd.Function):
@@ -1369,7 +1369,7 @@ def group_gemm_fused_lora_moe_forward(
     if get_parallel_state().ep_enabled:
         # Lazy import — keeps non-EP imports free of distributed deps so
         # eager-only / single-rank tests don't pay the cost.
-        from ....distributed.moe import dispatch_to_ep_class
+        from ...distributed.moe import dispatch_to_ep_class
 
         return dispatch_to_ep_class(
             EPMergedFc1SharedLoRAGroupGemm,
@@ -1457,7 +1457,7 @@ def group_gemm_fused_independent_lora_moe_forward(
           non-LoRA EP fused path).
     """
     if get_parallel_state().ep_enabled:
-        from ....distributed.moe import dispatch_to_ep_class
+        from ...distributed.moe import dispatch_to_ep_class
 
         return dispatch_to_ep_class(
             EPMergedFc1IndependentLoRAGroupGemm,

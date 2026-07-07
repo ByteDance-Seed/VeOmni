@@ -249,7 +249,14 @@ def save_lora_adapter_with_dcp(
     2. Save with ``dcp.save`` in parallel to a temporary DCP directory.
     3. Consolidate on rank 0 into ``adapter_model.bin`` and ``adapter_config.json``.
     """
-    from peft import get_peft_model_state_dict
+    from veomni.lora import is_veomni_lora_model
+    from veomni.lora.state_dict import get_lora_state_dict
+
+    if not is_veomni_lora_model(model):
+        raise TypeError(
+            f"save_lora_adapter_with_dcp expects a VeOmniLoraModel, got {type(model).__name__}. "
+            "LoRA is served exclusively by the native veomni.lora stack."
+        )
 
     synchronize()
     if dist.is_initialized():
@@ -259,7 +266,7 @@ def save_lora_adapter_with_dcp(
     dcp_save_path = os.path.join(save_path, dcp_subdir)
     os.makedirs(dcp_save_path, exist_ok=True)
 
-    lora_state = get_peft_model_state_dict(model)
+    lora_state = get_lora_state_dict(model, adapter_name=adapter_name, config=model.get_lora_config())
     lora_state = {k: v.to(torch.bfloat16) if v.dtype == torch.float32 else v for k, v in lora_state.items()}
 
     # Restore the EP shard dim before DCP sees the LoRA tensors. After
@@ -324,22 +331,10 @@ def save_lora_adapter_with_dcp(
         adapter_model_file = os.path.join(save_path, "adapter_model.bin")
         _save_state_dict(consolidated_state, adapter_model_file, safe_serialization=False)
 
-        if not hasattr(model, "peft_config") or adapter_name not in model.peft_config:
-            raise ValueError(f"Cannot find peft config for adapter '{adapter_name}' on model.")
-        model.peft_config[adapter_name].save_pretrained(save_path)
-
-        # If the model has VeOmni MoE-LoRA wrappers (Mode 1 independent or
-        # Mode 2 shared), write a sidecar next to adapter_config.json so the
-        # resume path can reconstruct them before PEFT loads weights. PEFT
-        # itself doesn't know about these wrappers, but their state_dict
-        # keys round-trip through the standard PEFT save/load path because
-        # they follow the lora_*<adapter> naming convention (see
-        # veomni/utils/moe_lora.py docstring).
-        from .moe_lora import write_moe_lora_sidecar
-
-        sidecar = write_moe_lora_sidecar(model, save_path)
-        if sidecar is not None:
-            logger.info_rank0(f"MoE-LoRA sidecar written: {sidecar}")
+        # VeOmniLoraModel writes a single PEFT-loadable adapter_config.json
+        # (MoE metadata, if any, lives in its ``veomni_lora`` block -- no
+        # separate sidecar).
+        model.get_lora_config().save_pretrained(save_path)
 
         shutil.rmtree(dcp_save_path, ignore_errors=True)
         logger.info_rank0(f"LoRA adapter saved at {save_path} successfully!")

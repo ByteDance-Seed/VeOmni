@@ -369,93 +369,43 @@ class BaseTrainer(Stateful, ABC):
         self.model_config = self.model.config
 
     def _setup_lora(self):
-        """Wrap ``self.model`` with PEFT LoRA if ``lora_config`` is configured.
+        """Wrap ``self.model`` with the PEFT-free :class:`veomni.lora.VeOmniLoraModel`.
 
-        Handles two cases:
-        - Resume: ``lora_config["lora_adapter"]`` is set → use
-          ``PeftModel.from_pretrained`` so the PEFT config is read from disk.
-          Actual adapter *weights* are loaded later during parallelization.
-        - Scratch: ``rank`` / ``alpha`` are set →  use ``get_peft_model``.
+        A single native path handles both dense ``nn.Linear`` LoRA
+        (``lora_modules`` / ``target_modules``) and MoE expert LoRA
+        (``target_parameters``, wrapper flavour selected by
+        ``share_expert_lora``). On resume (``lora_config['lora_adapter']`` set)
+        the wrappers are rebuilt from the on-disk ``adapter_config.json`` (MoE
+        mode lives in its ``veomni_lora`` block); otherwise a fresh adapter is
+        initialised from the yaml config. Either way the actual adapter
+        *weights* are streamed in later during parallelization
+        (``build_parallelize_model`` with ``adapter_path``).
 
         Recognised ``lora_config`` keys (in addition to ``rank`` / ``alpha`` /
-        ``lora_adapter`` / ``is_trainable``):
-
-        - ``lora_modules`` (list[str]): forwarded to PEFT ``target_modules``.
-          Use for ``nn.Linear`` targets (q/k/v/o, dense MLP, shared experts).
-        - ``target_parameters`` (list[str]): identifies the 3-D ``nn.Parameter``
-          MoE expert weights to attach LoRA to, e.g.
-          ``model.layers.*.mlp.experts.gate_up_proj`` /
-          ``model.layers.*.mlp.experts.down_proj``. VeOmni owns this end-to-end
-          via the wrappers in :mod:`veomni.utils.moe_lora`; PEFT's own
-          ``target_parameters`` is **not** used (we replace the experts module,
-          not the parameter, so we can plug fused MoE-LoRA kernels in later).
-        - ``share_expert_lora`` (bool, default ``False``): selects the wrapper
-          flavour for the modules matched by ``target_parameters``:
-
-            * ``False`` (default) → :class:`~veomni.utils.moe_lora.LoraIndependentExperts`
-              (Mode 1): one LoRA pair *per expert* (3-D ``[E, r, H]`` /
-              ``[E, O, r]`` tensors). Mathematically equivalent to PEFT 0.19's
-              ``target_parameters`` 3-D path.
-            * ``True`` → :class:`~veomni.utils.moe_lora.LoraSharedExperts`
-              (Mode 2): a single LoRA pair *shared* across all experts of the
-              layer (2-D ``[r, H]`` / ``[O, r]`` tensors).
-
-          ``lora_modules`` may be provided alongside ``target_parameters`` so
-          standard PEFT LoRA on surrounding ``nn.Linear`` layers (q/k/v/o,
-          shared_expert, router etc.) coexists with the MoE-LoRA wrappers.
-        - ``use_rslora`` (bool, default ``False``): rank-stabilised LoRA
-          scaling (``alpha / sqrt(r)``); forwarded to PEFT and to both
-          MoE-LoRA wrapper flavours.
+        ``lora_adapter`` / ``is_trainable``): ``lora_modules`` (aka
+        ``target_modules``), ``target_parameters``, ``share_expert_lora``,
+        ``use_rslora``, ``lora_dropout``, ``bias``, ``exclude_modules``,
+        ``rank_pattern``, ``alpha_pattern``, ``modules_to_save`` — see
+        :class:`veomni.lora.VeOmniLoraConfig`.
         """
         lora_config = self.args.model.lora_config
         if not bool(lora_config):
             return
 
-        from ..utils.moe_lora import veomni_get_peft_model, veomni_peft_model_from_pretrained
+        from ..lora import VeOmniLoraConfig, VeOmniLoraModel
 
+        cfg = VeOmniLoraConfig.from_yaml(lora_config)
         lora_adapter_path = lora_config.get("lora_adapter", None)
         if lora_adapter_path is not None:
-            logger.info_rank0(f"Wrapping model with PeftModel from {lora_adapter_path}.")
-            self.model = veomni_peft_model_from_pretrained(
+            logger.info_rank0(f"Wrapping model with VeOmniLoraModel from {lora_adapter_path}.")
+            self.model = VeOmniLoraModel.from_pretrained(
                 self.model,
                 lora_adapter_path,
                 is_trainable=lora_config.get("is_trainable", True),
             )
         else:
-            logger.info_rank0("Initialising LoRA adapter from scratch.")
-            from peft import LoraConfig
-
-            target_modules = lora_config.get("lora_modules", None)
-            target_parameters = lora_config.get("target_parameters", None)
-            share_expert_lora = lora_config.get("share_expert_lora", False)
-            use_rslora = lora_config.get("use_rslora", False)
-            if not target_modules and not target_parameters:
-                raise ValueError(
-                    "lora_config must specify at least one of 'lora_modules' (for nn.Linear "
-                    "targets) or 'target_parameters' (for nn.Parameter MoE expert targets)."
-                )
-            # The single LoraConfig captures *both* PEFT-standard linear
-            # targets (``target_modules``) and VeOmni's MoE-LoRA targets
-            # (``target_parameters``). ``veomni_get_peft_model`` reads both
-            # and dispatches: PEFT for the linears, MoE-LoRA wrappers for
-            # the experts (with ``target_parameters`` stripped before the
-            # ``get_peft_model`` call so PEFT does not double-wrap them).
-            peft_cfg = LoraConfig(
-                r=lora_config["rank"],
-                lora_alpha=lora_config["alpha"],
-                target_modules=target_modules,
-                target_parameters=target_parameters,
-                use_rslora=use_rslora,
-            )
-            logger.info_rank0(f"LoraConfig: {peft_cfg.to_dict()}.")
-            self.model = veomni_get_peft_model(
-                self.model,
-                peft_cfg,
-                share_expert_lora=share_expert_lora,
-            )
-
-        if hasattr(self.model, "print_trainable_parameters"):
-            self.model.print_trainable_parameters()
+            logger.info_rank0(f"Initialising VeOmni LoRA adapter from scratch: {cfg}.")
+            self.model = VeOmniLoraModel(self.model, cfg)
 
     def _freeze_model_module(self):
         self._setup_lora()

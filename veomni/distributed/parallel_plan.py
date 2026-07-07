@@ -281,16 +281,16 @@ def _rewrite_plan_for_moe_lora_wrappers(model: nn.Module, parallel_plan: "Parall
        the wrapped FQN ``<wrapper_fqn>.<base_param>.base_layer.weight``.
        The Shard placement is preserved verbatim.
 
-    2. For :class:`~veomni.utils.moe_lora.LoraIndependentExperts` only,
+    2. For :class:`~veomni.lora.moe_layers.LoraIndependentExperts` only,
        enumerate each per-expert LoRA tensor under the wrapper
        (``<spec>.lora_A.<adapter>.weight`` /
        ``<spec>.lora_B.<adapter>.weight``, leading dim = ``num_experts``)
        and add them to the same EP group as ``Shard(0)``.
 
     Imports of the MoE-LoRA module are lazy to avoid the
-    ``veomni.utils.moe_lora`` ↔ ``veomni.distributed`` import cycle.
+    ``veomni.lora.moe_layers`` ↔ ``veomni.distributed`` import cycle.
     """
-    from ..utils.moe_lora import LoraIndependentExperts, _is_lora_param_name, is_lora_moe_experts
+    from ..lora.moe_layers import LoraIndependentExperts, _is_lora_param_name, is_lora_moe_experts
 
     if not any(is_lora_moe_experts(m) for _, m in model.named_modules()):
         return

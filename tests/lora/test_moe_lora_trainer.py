@@ -23,10 +23,10 @@ emit, then validates both resume paths bit-exact (modulo bf16 storage):
          (model + optimizer + extra_state -- the format ``BaseTrainer``
          resumes via ``train.checkpoint.load_path``).
        - HF-format LoRA adapter under ``<output_dir>/global_step_<S>/``
-         (``adapter_model.bin`` + ``adapter_config.json`` + the
-         ``veomni_moe_lora.json`` sidecar that VeOmni's MoE-LoRA wrappers
-         need to re-install themselves on resume) -- the format
-         ``BaseTrainer`` resumes via ``model.lora_config.lora_adapter``.
+         (``adapter_model.bin`` + ``adapter_config.json``; the MoE mode +
+         rank/alpha VeOmni's wrappers need to re-install themselves on resume
+         live in the ``veomni_lora`` block of ``adapter_config.json``) -- the
+         format ``BaseTrainer`` resumes via ``model.lora_config.lora_adapter``.
        - Snapshots ``lora_snapshot_pre.pt`` / ``lora_snapshot_post.pt``
          (full-tensor LoRA dumps gathered on rank 0).
 
@@ -37,15 +37,14 @@ emit, then validates both resume paths bit-exact (modulo bf16 storage):
 
     3. LoRA-adapter resume subprocess:
        ``model.lora_config.lora_adapter=<adapter>`` ->
-       :meth:`BaseTrainer._setup_lora` resume branch (sidecar lookup +
-       :func:`apply_moe_lora_from_sidecar` +
-       :func:`PeftModel.from_pretrained`) -> the FSDP2 adapter-load path
-       inside :func:`build_parallelize_model` -> *post-load* snapshot
-       **bit-exact (in bf16)** vs the writer's *post-train* snapshot.
-       Cast to bf16 because PEFT's ``save_pretrained`` writes the
-       adapter at ``model.dtype`` (bf16 for the toy yaml); fp32
-       equality would require the on-disk format to carry fp32 mantissa
-       bits, which it doesn't.
+       :meth:`BaseTrainer._setup_lora` resume branch
+       (:meth:`veomni.lora.VeOmniLoraModel.from_pretrained`, which rebuilds the
+       MoE wrappers from the ``veomni_lora`` block in adapter_config.json) ->
+       the FSDP2 adapter-load path inside :func:`build_parallelize_model` ->
+       *post-load* snapshot **bit-exact (in bf16)** vs the writer's *post-train*
+       snapshot. Cast to bf16 because the adapter is written at ``model.dtype``
+       (bf16 for the toy yaml); fp32 equality would require the on-disk format
+       to carry fp32 mantissa bits, which it doesn't.
 
 Mirroring production
 --------------------
@@ -289,8 +288,9 @@ class MoeLoraTrainer(BaseTrainer):
         # ``train.checkpoint.load_path`` resume case in the resume test
         # depends on its ``on_train_begin`` reload hook.
         self.checkpointer_callback = CheckpointerCallback(self)
-        # HFLoraCkptCallback emits the HF-format LoRA adapter (and the
-        # veomni_moe_lora.json sidecar) at every save_step. It also
+        # HFLoraCkptCallback emits the HF-format LoRA adapter (adapter_model.bin
+        # + adapter_config.json with the veomni_lora MoE block) at every
+        # save_step. It also
         # extends DCP saves but no-ops if the DCP dir already exists, so
         # pairing it with CheckpointerCallback yields exactly one DCP
         # write + one LoRA HF write per save_step.
@@ -607,9 +607,16 @@ def _assert_writer_artifacts_exist(writer_dir: str, mode: str, *, final_step: in
     assert any(f.endswith(".metadata") for f in dcp_files), f"[{mode}] DCP metadata missing in {dcp_dir}: {dcp_files}"
 
     assert os.path.isdir(hf_dir), f"[{mode}] missing HF LoRA adapter dir at {hf_dir}"
-    for fname in ("adapter_model.bin", "adapter_config.json", "veomni_moe_lora.json"):
+    # VeOmniLoraModel embeds MoE metadata inside adapter_config.json (under the
+    # ``veomni_lora`` block) instead of the legacy ``veomni_moe_lora.json`` sidecar.
+    for fname in ("adapter_model.bin", "adapter_config.json"):
         path = os.path.join(hf_dir, fname)
         assert os.path.isfile(path), f"[{mode}] missing {fname} in {hf_dir}: {os.listdir(hf_dir)}"
+    with open(os.path.join(hf_dir, "adapter_config.json")) as f:
+        adapter_cfg = json.load(f)
+    assert adapter_cfg.get("veomni_lora", {}).get("moe_mode") == mode, (
+        f"[{mode}] adapter_config.json veomni_lora.moe_mode != {mode!r}: {adapter_cfg.get('veomni_lora')}"
+    )
 
     for snap in (SNAPSHOT_PRE, SNAPSHOT_POST):
         path = os.path.join(writer_dir, snap)
@@ -659,9 +666,9 @@ def test_save_load_resume_round_trip(tmp_path, toy_base_dir, mode):
     # ── 3. LoRA-adapter resume ─────────────────────────────────────────
     # Load the writer's final-step HF LoRA adapter via
     # ``model.lora_config.lora_adapter`` -> ``_setup_lora`` resume branch
-    # -> sidecar lookup -> ``apply_moe_lora_from_sidecar`` ->
-    # ``PeftModel.from_pretrained`` -> FSDP2 adapter-load path inside
-    # ``build_parallelize_model``. The resumer's pre-train snapshot is
+    # -> ``VeOmniLoraModel.from_pretrained`` (rebuilds MoE wrappers from the
+    # ``veomni_lora`` block in adapter_config.json) -> FSDP2 adapter-load path
+    # inside ``build_parallelize_model``. The resumer's pre-train snapshot is
     # exactly the writer's saved adapter (= the writer's post-train
     # snapshot, modulo the bf16 cast PEFT applies on save).
     adapter_resumer_dir = str(tmp_path / "resumer_adapter")
