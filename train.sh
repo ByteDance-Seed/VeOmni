@@ -15,6 +15,18 @@ if command -v nvidia-smi &> /dev/null && nvidia-smi --list-gpus &> /dev/null; th
     NPROC_PER_NODE=${NPROC_PER_NODE:=$(nvidia-smi --list-gpus | wc -l)}
   fi
   export NCCL_DEBUG=WARN
+elif command -v rocm-smi &> /dev/null && rocm-smi --showid &> /dev/null; then
+  # AMD GPU (ROCm/HIP). Torch exposes ROCm devices through the CUDA API, and
+  # RCCL reuses the NCCL_* environment variables, so most of the CUDA path
+  # applies. Visibility is controlled by HIP_VISIBLE_DEVICES (falling back to
+  # CUDA_VISIBLE_DEVICES, which ROCm torch also honors).
+  visible_devices="${HIP_VISIBLE_DEVICES:-${CUDA_VISIBLE_DEVICES}}"
+  if [[ -n "${visible_devices}" ]]; then
+    NPROC_PER_NODE=${NPROC_PER_NODE:=$(echo "${visible_devices}" | tr ',' '\n' | wc -l)}
+  else
+    NPROC_PER_NODE=${NPROC_PER_NODE:=$(rocm-smi --showid --csv | grep -c '^card')}
+  fi
+  export NCCL_DEBUG=WARN
 else
   # NPU
   if [[ -n "${ASCEND_RT_VISIBLE_DEVICES}" ]]; then
