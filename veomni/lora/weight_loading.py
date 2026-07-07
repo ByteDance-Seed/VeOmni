@@ -30,7 +30,7 @@ All adapter files are read natively (safetensors / torch), never via ``peft``.
 from __future__ import annotations
 
 import time
-from typing import TYPE_CHECKING, Any, Callable, Literal
+from typing import TYPE_CHECKING, Any, Callable
 
 import torch
 import torch.distributed as dist
@@ -39,6 +39,7 @@ import torch.nn as nn
 from ..distributed.parallel_state import get_parallel_state
 from ..models.module_utils import BroadcastMetadata, _dispatch_parameter
 from ..utils import logging
+from ..utils.device import get_device_type
 from .state_dict import insert_adapter_name, load_adapter_state_dict
 
 
@@ -97,7 +98,7 @@ def build_lora_key_overrides(model: nn.Module) -> dict[str, str]:
 def load_lora_weights(
     model: nn.Module | PreTrainedModel,
     adapter_path: str,
-    init_device: Literal["cpu", "cuda", "npu"] = "cuda",
+    init_device: str | None = None,
     dtensor_factory: Callable[[torch.Tensor, Any, Any], torch.Tensor] | None = None,
     parameter_names_to_load: set | None = None,
     parallel_plan: ParallelPlan | None = None,
@@ -109,6 +110,7 @@ def load_lora_weights(
     (``...lora_A.weight``) to live-model keys (``...lora_A.<adapter>.weight``),
     and dispatches tensors into the (possibly sharded) model.
     """
+    init_device = init_device or get_device_type()
     raw_sd = load_adapter_state_dict(adapter_path, device=init_device)
     for name, tensor in raw_sd.items():
         name = insert_adapter_name(name, adapter_name)
@@ -121,13 +123,14 @@ def load_lora_weights(
 def rank0_load_and_broadcast_lora_weights(
     model: nn.Module | PreTrainedModel,
     adapter_path: str,
-    init_device: Literal["cpu", "cuda", "npu"] = "cuda",
+    init_device: str | None = None,
     dtensor_factory: Callable[[torch.Tensor, Any, Any], torch.Tensor] | None = None,
     parameter_names_to_load: set | None = None,
     parallel_plan: ParallelPlan | None = None,
     adapter_name: str = _DEFAULT_ADAPTER,
 ) -> None:
     """Rank-0 reads the adapter file, then broadcasts each tensor to all ranks."""
+    init_device = init_device or get_device_type()
     global_rank = dist.get_rank() if dist.is_initialized() else 0
 
     adapter_sd: dict[str, torch.Tensor] = {}
