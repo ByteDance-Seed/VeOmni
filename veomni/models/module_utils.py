@@ -45,7 +45,11 @@ from ..utils import logging
 from ..utils.device import get_device_type, synchronize
 from ..utils.helper import empty_cache, get_cache_dir, get_dtype_size
 from ..utils.import_utils import is_diffusers_available
-from .checkpoint_tensor_loading import get_checkpoint_tensor_converter, maybe_convert_checkpoint_tensor
+from .checkpoint_tensor_loading import (
+    checkpoint_converter_is_dim0_zero_pad,
+    get_checkpoint_tensor_converter,
+    maybe_convert_checkpoint_tensor,
+)
 
 
 if TYPE_CHECKING:
@@ -389,6 +393,210 @@ def load_model_weights(
         from .checkpoint_tensor_loading import prepare_fqn_to_index_mapping_for_model
 
         prepare_fqn_to_index_mapping_for_model(model, fqn_to_index_mapping)
+
+
+def _resolve_safetensors_shards(weights_path: str, **kwargs) -> Tuple[Dict[str, str], Dict[str, str]]:
+    """Resolve a (sharded) safetensors checkpoint for per-key streaming reads.
+
+    Returns ``(key_to_file, file_to_path)`` where ``key_to_file`` maps each
+    checkpoint tensor name to its shard **basename** and ``file_to_path`` maps
+    that basename to the resolved local file path. Handles both the sharded
+    (``model.safetensors.index.json`` + ``model-0000x-of-0000y.safetensors``)
+    and single-file (``model.safetensors``) layouts.
+    """
+    cache_kwargs = {"_raise_exceptions_for_missing_entries": False, **kwargs}
+    resolved_index = cached_file(weights_path, SAFE_WEIGHTS_INDEX_NAME, **cache_kwargs)
+    if resolved_index:
+        with open(resolved_index) as fh:
+            weight_map = json.load(fh)["weight_map"]  # key -> shard basename
+        shard_files, _ = get_checkpoint_shard_files(weights_path, resolved_index, **kwargs)
+        file_to_path = {os.path.basename(p): p for p in shard_files}
+        return weight_map, file_to_path
+
+    resolved_file = cached_file(weights_path, SAFE_WEIGHTS_NAME, **cache_kwargs)
+    if resolved_file:
+        base = os.path.basename(resolved_file)
+        with safe_open(resolved_file, framework="pt", device="cpu") as fh:
+            keys = list(fh.keys())
+        return {k: base for k in keys}, {base: resolved_file}
+
+    raise ValueError(f"ep_sharded_stream_load: no safetensors checkpoint found under {weights_path}.")
+
+
+@torch.no_grad()
+def load_model_weights_ep_sharded(
+    model: Union["nn.Module", "PreTrainedModel"],
+    weights_path: str,
+    init_device: Literal["cpu", "cuda", "npu"] = "cuda",
+    dtensor_factory: Optional[Callable[["torch.Tensor", Any, Any], "torch.Tensor"]] = None,
+    **kwargs,
+) -> None:
+    """Per-rank ExtraParallel-slice streaming loader (opt-in alternative to
+    :func:`load_model_weights`).
+
+    For parameters the model's ``get_parallel_plan`` marks ExtraParallel-sharded
+    (e.g. MoE experts, ``Shard(0)`` over the ``ep`` mesh), this reads **only this
+    rank's dim-0 slice** straight from the safetensors shard via
+    ``safe_open(...).get_slice()[start:end]`` -- instead of reading the whole
+    ``[E, ...]`` tensor and slicing it in host memory (what
+    :func:`load_model_weights` does via ``ParallelPlan.shard_tensor``).
+
+    Why it is faster / lighter for large MoE checkpoints:
+      * per-rank disk/HDFS bytes for expert tensors drop from the whole set to
+        ``1/ep`` of it (in aggregate the expert bytes are read ~once across the
+        ``ep`` ranks, in parallel), vs every rank reading the full expert set and
+        discarding ``(ep-1)/ep``;
+      * peak host RAM drops accordingly -- the full ``[E, ...]`` tensor is never
+        materialised, only the ``[E/ep, ...]`` local shard.
+
+    Dense (non-ExtraParallel) params and buffers are read whole (small relative
+    to experts) and dispatched exactly as in :func:`load_model_weights` (FSDP's
+    ``distribute_tensor`` still shards them). The dispatch of a sliced expert is
+    identical to the whole-tensor path's second half: pass the already-sliced
+    ``[E/ep, ...]`` with ``parallel_plan=None`` so it is not sliced again, then
+    the FSDP ``dtensor_factory`` shards it over the ``ep_fsdp`` sub-mesh.
+
+    Raises ``NotImplementedError`` (so the caller may fall back to
+    :func:`load_model_weights`) when the checkpoint/model is unsupported: PEFT,
+    no ExtraParallel ``get_parallel_plan``, or a checkpoint-tensor converter whose
+    transform is not a pure dim-0 zero-pad (a fusion converter needs the whole
+    tensor set). A converter that only zero-pads dim-0 stays streamable -- each
+    rank reads its real-row slice and zero-fills the tail -- and opts in via the
+    optional ``CheckpointTensorConverter.is_dim0_zero_pad`` capability (see
+    :func:`checkpoint_converter_is_dim0_zero_pad`).
+    """
+    if kwargs.get("is_peft_model", False):
+        raise NotImplementedError("ep_sharded_stream_load does not support PEFT models.")
+    # A checkpoint-tensor converter generally needs the whole tensor set (e.g.
+    # per-expert-key fusion) which streaming can't provide. The one streamable
+    # exception is a *pure dim-0 zero-pad* converter, which opts in via the
+    # optional ``is_dim0_zero_pad`` capability; that is enforced per-key below
+    # (dim-0 zero-pad -> stream + tail zero-fill; anything else -> bail).
+    converter = get_checkpoint_tensor_converter(model)
+    get_plan = getattr(model, "get_parallel_plan", None)
+    parallel_plan = get_plan() if get_plan is not None else None
+    if parallel_plan is None or not getattr(parallel_plan, "extra_parallel_plan", None):
+        raise NotImplementedError("ep_sharded_stream_load requires a model with an ExtraParallel parallel_plan.")
+
+    # This streaming loader reads each rank's ExtraParallel slice with a dim-0
+    # ``get_slice()[start:end]`` -- the same dim-0 assumption upstream's
+    # ``ParallelPlan._slice_shard_tensor`` makes (every VeOmni ExtraParallel plan
+    # today is ``Shard(0)``: MoE experts, embed parallel). If a plan ever shards a
+    # non-zero dim, a blind dim-0 slice would silently corrupt weights, so bail to
+    # the whole-tensor loader (which handles arbitrary ``Shard(dim)`` via DTensor).
+    for _pname, _pplan in parallel_plan.extra_parallel_plan.items():
+        for _fqn_pattern, _placement in _pplan.items():
+            _dim = getattr(_placement, "dim", None)
+            if _dim is not None and _dim != 0:
+                raise NotImplementedError(
+                    f"ep_sharded_stream_load only supports dim-0 ExtraParallel sharding (Shard(0)); "
+                    f"'{_pname}' pattern '{_fqn_pattern}' uses Shard({_dim})."
+                )
+
+    buffer_dict = {name: buffer.clone() for name, buffer in model.named_buffers()}
+    param_shapes = {name: tuple(p.shape) for name, p in model.named_parameters()}
+    parameter_names_to_load = set(param_shapes.keys())
+    model.to_empty(device=init_device)
+    dtensor_to_cpu = init_device == "cpu"
+
+    parallel_state = get_parallel_state()
+    key_to_file, file_to_path = _resolve_safetensors_shards(weights_path, **kwargs)
+
+    keys_by_file: Dict[str, List[str]] = {}
+    for key, fname in key_to_file.items():
+        keys_by_file.setdefault(fname, []).append(key)
+
+    n_ep = n_dense = n_buf = 0
+    for fname in tqdm(
+        sorted(keys_by_file),
+        desc="Streaming EP-sharded checkpoint",
+        disable=int(os.getenv("LOCAL_RANK", "-1")) > 0,
+    ):
+        with safe_open(file_to_path[fname], framework="pt", device="cpu") as f:
+            for raw_name in keys_by_file[fname]:
+                name = _convert_weight_key(raw_name, model)
+                if name in buffer_dict:  # persistent buffers: read whole
+                    buffer_dict[name] = f.get_tensor(raw_name).clone()
+                    n_buf += 1
+                    continue
+                if name not in parameter_names_to_load:
+                    logger.info_rank0(f"Unexpected key in state dict: {name}.")
+                    continue
+
+                shard_group = parallel_plan._get_shard_parameter_groupname(name)
+                if shard_group is not None:
+                    # ExtraParallel (e.g. EP / embed) param -> read only this rank's
+                    # dim-0 slice. ``param_shapes[name][0]`` is the per-rank chunk, so
+                    # the model's full dim0 is ``expected_full0 = target0 * para_size``.
+                    # If a converter declares this key a pure dim-0 zero-pad, the model
+                    # may have more rows than the checkpoint (``real0``): read the
+                    # overlap and zero-fill the tail. Otherwise the checkpoint must
+                    # match the model exactly.
+                    zero_pad = checkpoint_converter_is_dim0_zero_pad(converter, name)
+                    if converter is not None and converter.can_handle(name) and not zero_pad:
+                        # A converter that fuses/reshapes this key can't be streamed.
+                        raise NotImplementedError(
+                            f"ep_sharded_stream_load: converter applies a non-dim0-zero-pad "
+                            f"transform to ExtraParallel key '{name}'."
+                        )
+                    target0 = param_shapes[name][0]
+                    para_size = (
+                        parallel_state.extra_parallel_sizes[shard_group]
+                        if parallel_state.extra_parallel_enabled(shard_group)
+                        else 1
+                    )
+                    para_rank = (
+                        parallel_state.extra_parallel_rank(shard_group)
+                        if parallel_state.extra_parallel_enabled(shard_group)
+                        else 0
+                    )
+                    sl = f.get_slice(raw_name)
+                    real0 = sl.get_shape()[0]
+                    expected_full0 = target0 * para_size
+                    if real0 > expected_full0:
+                        raise RuntimeError(
+                            f"{name}: checkpoint dim0={real0} exceeds model dim0={expected_full0}."
+                        )
+                    if not zero_pad and real0 != expected_full0:
+                        # No dim-0 zero-pad converter -> checkpoint must match exactly;
+                        # a silent zero-fill here would hide a real shape mismatch.
+                        raise RuntimeError(
+                            f"{name}: checkpoint dim0={real0} != model dim0={expected_full0} "
+                            f"(no dim-0 zero-pad converter for this key)."
+                        )
+                    start = para_rank * target0
+                    end = start + target0
+                    read_end = min(end, real0)
+                    read_end = max(read_end, start)  # empty (0-row) slice if this rank is all pad
+                    tensor = sl[start:read_end]
+                    if read_end < end:  # trailing zero rows (dim-0 zero-pad converter)
+                        pad = torch.zeros((end - read_end, *tuple(tensor.shape[1:])), dtype=tensor.dtype)
+                        tensor = torch.cat([tensor, pad], dim=0)
+                    # Already the local slice -> parallel_plan=None (do not slice
+                    # again); dtensor_factory then shards over the ep_fsdp sub-mesh
+                    # exactly as the whole-tensor path's post-shard_tensor half.
+                    _dispatch_parameter(model, name, tensor, dtensor_factory, None, dtensor_to_cpu)
+                    n_ep += 1
+                else:
+                    if converter is not None and converter.can_handle(name):
+                        # A streamable (dim-0 zero-pad) converter must only touch
+                        # ExtraParallel tables; a dense key would need its conversion
+                        # applied here, which this path does not do -> bail.
+                        raise NotImplementedError(
+                            f"ep_sharded_stream_load: converter handles non-ExtraParallel key '{name}'."
+                        )
+                    tensor = f.get_tensor(raw_name)
+                    _dispatch_parameter(model, name, tensor, dtensor_factory, parallel_plan, dtensor_to_cpu)
+                    n_dense += 1
+                parameter_names_to_load.discard(name)
+        empty_cache()
+
+    logger.info_rank0(
+        f"ep_sharded_stream_load: read {n_ep} ExtraParallel-sliced, {n_dense} dense, {n_buf} buffer tensors/rank."
+    )
+    post_process_after_weight_loading(
+        model, buffer_dict, parameter_names_to_load, dtensor_factory, dtensor_to_cpu=dtensor_to_cpu
+    )
 
 
 @torch.no_grad()
