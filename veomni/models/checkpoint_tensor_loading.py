@@ -82,6 +82,47 @@ class CheckpointTensorConverter(Protocol):
         """
         ...
 
+    def is_dim0_zero_pad(self, name: str) -> bool:
+        """Optional streaming capability: whether this converter's *only* transform for
+        ``name`` is appending trailing zero rows on dim-0 (no fusion/reshape/dtype change).
+
+        Zero-padding dim-0 commutes with a ``Shard(0)`` split, so a per-rank dim-0
+        streaming loader (:func:`veomni.models.module_utils.load_model_weights_ep_sharded`)
+        can read a rank's real-row slice straight from the checkpoint and zero-fill any
+        tail past the checkpoint's real row count -- never materializing the whole tensor.
+        A converter that fuses or otherwise needs the whole tensor set must return
+        ``False`` (and its ``finalize`` may be non-empty). Implementing this method is
+        optional; the loader treats a missing method as ``False``.
+
+        CAUTION: only declare this for tensors whose padded rows are *semantically
+        inert*, i.e. never read at runtime -- e.g. a vocab/embedding table padded past
+        the real vocab (out-of-range ids are never looked up, so a zero row has no
+        effect). It is NOT valid for MoE expert weights: an expert's dim-0 is the expert
+        index, and the router selects over ALL rows via top-k. A zero-padded "expert" is
+        an active, routable unit (its zero-padded router row yields a finite logit=0 that
+        can win top-k), so a token routed to it silently gets a zeroed contribution ->
+        wrong output. VeOmni EP therefore *requires* ``num_experts % ep == 0`` (the fused
+        MoE kernels assert it) rather than padding experts; declaring this for experts
+        would silently corrupt results.
+        """
+        ...
+
+
+def checkpoint_converter_is_dim0_zero_pad(
+    converter: Optional["CheckpointTensorConverter"],
+    name: str,
+) -> bool:
+    """Safely query the optional :meth:`CheckpointTensorConverter.is_dim0_zero_pad`.
+
+    Returns ``True`` only when *converter* both claims ``name`` (``can_handle``) and
+    declares its transform is a pure dim-0 zero-pad. Any converter lacking the optional
+    method is treated as not stream-safe (``False``).
+    """
+    if converter is None or not converter.can_handle(name):
+        return False
+    fn = getattr(converter, "is_dim0_zero_pad", None)
+    return bool(fn(name)) if callable(fn) else False
+
 
 def get_checkpoint_tensor_converter(
     model: Union["nn.Module", "PreTrainedModel"],

@@ -71,6 +71,7 @@ from ..utils.device import (
     is_nccl_backend,
     synchronize,
 )
+from ..utils.lora_utils import build_peft_lora_targets
 from ..utils.loss_utils import count_loss_token, mean_global_loss
 from ..utils.model_utils import pretty_print_trainable_parameters
 from .callbacks import (
@@ -405,11 +406,19 @@ class BaseTrainer(Stateful, ABC):
             logger.info_rank0("Initialising LoRA adapter from scratch.")
             from peft import LoraConfig, get_peft_model
 
-            peft_cfg = LoraConfig(
-                r=lora_config["rank"],
-                lora_alpha=lora_config["alpha"],
-                target_modules=lora_config["lora_modules"],
+            target_modules, target_parameters = build_peft_lora_targets(self.model, lora_config)
+            logger.info_rank0(
+                f"Using PEFT target_parameters for LoRA: {len(target_parameters)} parameter(s), "
+                f"first={target_parameters[0] if target_parameters else '<none>'}."
             )
+            peft_kwargs = {
+                "r": lora_config["rank"],
+                "lora_alpha": lora_config["alpha"],
+                "target_modules": target_modules,
+            }
+            if target_parameters:
+                peft_kwargs["target_parameters"] = target_parameters
+            peft_cfg = LoraConfig(**peft_kwargs)
             logger.info_rank0(f"LoraConfig: {peft_cfg.to_dict()}.")
             self.model = get_peft_model(self.model, peft_cfg)
 

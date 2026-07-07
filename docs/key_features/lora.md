@@ -42,9 +42,10 @@ model:
 | `rank` | int | Rank of the decomposition matrices A and B |
 | `alpha` | int | LoRA scaling factor; effective scale = `alpha / rank` |
 | `lora_modules` | list[str] | Target linear layer name substrings (matched against module FQNs) |
-| `lora_adapter` | str (optional) | Path to a saved adapter directory to resume from |
+| `lora_adapter` | str (optional) | Path to a saved HF/PEFT adapter directory to load before training |
 
-For **resume training**, add the `lora_adapter` key pointing to the saved adapter directory:
+To continue from a saved HF/PEFT adapter rather than a DCP training checkpoint,
+add the `lora_adapter` key pointing to the saved adapter directory:
 
 ```yaml
 model:
@@ -55,6 +56,10 @@ model:
     lora_adapter: ./exp/my_run/global_step_500   # HF adapter dir to resume from
 ```
 
+For exact training-state resume, including optimizer, scheduler, dataloader state,
+RNG state, and global step, use `train.checkpoint.load_path` instead. See
+[`lora_resume`](#lora_resume-qwen3-moe-dcp-training-state-resume).
+
 ---
 
 ## 2. LoRA Initialization in BaseTrainer
@@ -63,6 +68,8 @@ LoRA wrapping happens in `BaseTrainer._setup_lora()`, called from `_freeze_model
 
 ```python
 # veomni/trainer/base.py
+
+from ..utils.lora_utils import build_peft_lora_targets
 
 def _setup_lora(self):
     lora_config = self.args.model.lora_config
@@ -80,11 +87,15 @@ def _setup_lora(self):
     else:
         # From scratch: wrap with LoraConfig
         from peft import LoraConfig, get_peft_model
-        peft_cfg = LoraConfig(
-            r=lora_config["rank"],
-            lora_alpha=lora_config["alpha"],
-            target_modules=lora_config["lora_modules"],
-        )
+        target_modules, target_parameters = build_peft_lora_targets(self.model, lora_config)
+        peft_kwargs = {
+            "r": lora_config["rank"],
+            "lora_alpha": lora_config["alpha"],
+            "target_modules": target_modules,
+        }
+        if target_parameters:
+            peft_kwargs["target_parameters"] = target_parameters
+        peft_cfg = LoraConfig(**peft_kwargs)
         self.model = get_peft_model(self.model, peft_cfg)
 ```
 
@@ -129,8 +140,9 @@ infix (e.g. `lora_A.weight`), whereas the live model stores them as
 ### DCP checkpoint (training state)
 
 `CheckpointerCallback._save_checkpoint` saves the full distributed state (model + optimizer +
-extra state) via PyTorch DCP. For LoRA training this includes both base-model parameters
-**and** adapter parameters; the optimizer state only covers the trainable adapter parameters.
+extra state) via PyTorch DCP. For LoRA training, the model state is saved with
+`trainable_only=True`, so it contains adapter parameters only rather than frozen
+base-model parameters; the optimizer state covers the trainable adapter parameters.
 
 ### HF LoRA adapter (inference artifact)
 
@@ -258,7 +270,7 @@ bash train.sh tasks/train_text.py configs/text/qwen3_lora.yaml \
     --train.wandb.enable true
 ```
 
-To resume from a saved adapter:
+To resume from the latest DCP training checkpoint:
 
 ```shell
 bash train.sh tasks/train_text.py configs/text/qwen3_lora.yaml \
@@ -268,7 +280,192 @@ bash train.sh tasks/train_text.py configs/text/qwen3_lora.yaml \
     --train.checkpoint.load_path auto          # auto-picks latest DCP checkpoint
 ```
 
-### 5.3 Qwen-Image LoRA (DiT, FSDP2)
+### 5.3 Qwen3-MoE fused expert LoRA (LLM, PEFT target_parameters)
+
+Qwen3-MoE stores expert MLP weights as fused parameters instead of ordinary
+`gate_proj`, `up_proj`, and `down_proj` `Linear` modules. VeOmni lets users keep
+the standard semantic LoRA config; the Qwen3-MoE model registration maps those
+semantic MLP targets to PEFT `target_parameters` for:
+
+```text
+model.layers.*.mlp.experts.gate_up_proj
+model.layers.*.mlp.experts.down_proj
+```
+
+The attention projections remain regular PEFT `target_modules`.
+
+#### lora_train: train and save the fused-MoE adapter
+
+Start from [`configs/text/qwen3-moe.yaml`](../../configs/text/qwen3-moe.yaml)
+so the data, optimizer, FSDP2, and fused-MoE operator settings stay aligned with
+the standard Qwen3-MoE training recipe. Add the LoRA block and enable HF adapter
+saving, for example:
+
+```yaml
+model:
+  model_path: /path/to/Qwen3-30B-A3B-Instruct-2507
+  ops_implementation:
+    attn_implementation: flash_attention_2
+    moe_implementation: fused_triton
+  lora_config:
+    rank: 1024
+    alpha: 2048
+    lora_modules:
+      - q_proj
+      - k_proj
+      - v_proj
+      - o_proj
+      - gate_proj
+      - up_proj
+      - down_proj
+
+data:
+  train_path: /path/to/sft_data
+  data_type: conversation
+  chat_template: chatml
+  max_seq_len: 2048
+  train_size: 750000
+  text_keys: messages
+  dyn_bsz_buffer_size: 200
+
+train:
+  init_device: meta
+  accelerator:
+    fsdp_config:
+      fsdp_mode: fsdp2
+  gradient_checkpointing:
+    enable: true
+  global_batch_size: 8
+  micro_batch_size: 1
+  optimizer:
+    type: adamw
+    lr: 1.0e-4
+    lr_decay_style: cosine
+    max_grad_norm: 1.0
+  num_train_epochs: 1
+  checkpoint:
+    output_dir: ./exp/qwen3_moe_lora
+    manager: dcp
+    save_hf_weights: true
+    save_epochs: 1
+```
+
+Launch it with path-specific overrides:
+
+```shell
+NPROC_PER_NODE=8
+
+bash train.sh tasks/train_text.py configs/text/qwen3_moe_lora.yaml \
+    --model.model_path /path/to/Qwen3-30B-A3B-Instruct-2507 \
+    --data.train_path /path/to/sft_data \
+    --train.global_batch_size 8 \
+    --train.micro_batch_size 1 \
+    --train.checkpoint.output_dir ./exp/qwen3_moe_lora \
+    --train.checkpoint.save_hf_weights true \
+    --train.num_train_epochs 1
+```
+
+The HF/PEFT adapter is saved under:
+
+```text
+./exp/qwen3_moe_lora/global_step_N/
+├── adapter_config.json
+└── adapter_model.bin
+```
+
+For fused-MoE LoRA, `adapter_config.json` should keep dense attention modules
+in `target_modules` and list fused expert parameters in `target_parameters`.
+A 48-layer Qwen3-MoE run with LoRA on `q/k/v/o/gate/up/down` saves LoRA-only
+adapter tensors:
+
+```text
+total adapter tensors: 576
+fused expert LoRA tensors: 192
+non-LoRA tensors: 0
+```
+
+#### lora_resume: Qwen3-MoE DCP training-state resume
+
+Use the DCP checkpoint under `checkpoints/global_step_N` when resuming an
+interrupted training run. This restores the training state, not just the HF
+adapter weights.
+
+```shell
+bash train.sh tasks/train_text.py configs/text/qwen3_moe_lora.yaml \
+    --model.model_path /path/to/Qwen3-30B-A3B-Instruct-2507 \
+    --data.train_path /path/to/sft_data \
+    --train.checkpoint.output_dir ./exp/qwen3_moe_lora \
+    --train.checkpoint.load_path ./exp/qwen3_moe_lora/checkpoints/global_step_5 \
+    --train.checkpoint.save_hf_weights true \
+    --train.num_train_epochs 3
+```
+
+Expected resume evidence in the logs:
+
+```text
+Loaded checkpoint from ./exp/qwen3_moe_lora/checkpoints/global_step_5
+Start step: 0. Train steps: 5. Start epoch: 1. Train epochs: 3.
+```
+
+After resume, later adapter saves should keep the same LoRA-only fused-MoE
+format. In the validation run, `global_step_5`, `global_step_10`, and
+`global_step_15` each had:
+
+```text
+total=576, fused=192, non_lora=0
+```
+
+#### lora_inference: load or merge the trained adapter
+
+The saved adapter can be loaded directly with PEFT:
+
+```python
+import torch
+from peft import PeftModel
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+base_model_path = "/path/to/Qwen3-30B-A3B-Instruct-2507"
+adapter_path = "./exp/qwen3_moe_lora/global_step_15"
+
+tokenizer = AutoTokenizer.from_pretrained(base_model_path, trust_remote_code=True)
+base_model = AutoModelForCausalLM.from_pretrained(
+    base_model_path,
+    dtype=torch.bfloat16,
+    device_map="auto",
+    trust_remote_code=True,
+)
+model = PeftModel.from_pretrained(base_model, adapter_path)
+model.eval()
+
+inputs = tokenizer("Hello, my name is", return_tensors="pt")
+inputs = {key: value.to(next(model.parameters()).device) for key, value in inputs.items()}
+
+with torch.no_grad():
+    outputs = model(**inputs)
+print(outputs.logits.shape)
+```
+
+Loaded fused expert LoRA parameter names include the adapter name, for example
+`.lora_A.default.weight`, while saved adapter keys omit it. This is standard PEFT
+adapter-name remapping.
+
+To produce a merged model without LoRA modules:
+
+```python
+merged = model.merge_and_unload()
+merged.eval()
+
+num_lora_params = sum(1 for name, _ in merged.named_parameters() if "lora_" in name)
+print(num_lora_params)  # expected: 0
+```
+
+PEFT may warn that `Qwen3MoeExperts` is an unsupported layer type. Validate the
+merged model for your deployment path; in the Qwen3-MoE smoke test, direct
+adapter loading, `merge_and_unload()`, forward, and generation completed
+successfully, and representative fused expert base tensors changed after merge,
+confirming that the LoRA delta was folded into `gate_up_proj` and `down_proj`.
+
+### 5.4 Qwen-Image LoRA (DiT, FSDP2)
 
 Config: [`configs/dit/qwen_image_lora.yaml`](../../configs/dit/qwen_image_lora.yaml)
 
@@ -316,7 +513,7 @@ bash train.sh tasks/train_dit.py configs/dit/qwen_image_lora.yaml \
     --train.num_train_epochs 3
 ```
 
-`HFLoraCkptCallback` writes the trained adapter to `${output_dir}/global_step_${step}/{adapter_config.json, adapter_model.{bin,safetensors}}`, which is the standard PEFT format consumable by `PeftModel.from_pretrained` and `diffusers`' `pipeline.transformer.load_lora_adapter` (the adapter keys carry the `base_model.model.` prefix expected by `peft`).
+`HFLoraCkptCallback` writes the trained adapter to `${output_dir}/global_step_${step}/{adapter_config.json, adapter_model.bin}`, which is the standard PEFT format consumable by `PeftModel.from_pretrained` and `diffusers`' `pipeline.transformer.load_lora_adapter` (the adapter keys carry the `base_model.model.` prefix expected by `peft`).
 
 ---
 

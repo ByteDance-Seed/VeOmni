@@ -27,7 +27,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.checkpoint import noop_context_fn
 
 from ..arguments import MixedPrecisionConfig
-from ..models import load_model_weights, rank0_load_and_broadcast_weights
+from ..models import load_model_weights, load_model_weights_ep_sharded, rank0_load_and_broadcast_weights
 from ..utils import logging
 from ..utils.device import IS_NPU_AVAILABLE, get_device_type
 from .checkpoint import CheckpointFunction
@@ -97,6 +97,7 @@ def _apply_weights_load_step(
     max_load_broadcast_size: float,
     distribute_tensor_fn: Callable[..., Any],
     fqn_to_index_mapping: Optional[Mapping[str, int]],
+    ep_sharded_stream_load: bool = False,
 ) -> None:
     """Materialise meta-initialised parameters and (optionally) load weights.
 
@@ -167,6 +168,7 @@ def _apply_weights_load_step(
                 max_load_broadcast_size=max_load_broadcast_size,
                 distribute_tensor_fn=distribute_tensor_fn,
                 fqn_to_index_mapping=None,
+                ep_sharded_stream_load=ep_sharded_stream_load,
             )
         return
 
@@ -187,6 +189,7 @@ def _apply_weights_load_step(
         max_load_broadcast_size=max_load_broadcast_size,
         distribute_tensor_fn=distribute_tensor_fn,
         fqn_to_index_mapping=fqn_to_index_mapping,
+        ep_sharded_stream_load=ep_sharded_stream_load,
     )
 
 
@@ -202,6 +205,7 @@ def _load_one(
     max_load_broadcast_size: float,
     distribute_tensor_fn: Callable[..., Any],
     fqn_to_index_mapping: Optional[Mapping[str, int]],
+    ep_sharded_stream_load: bool = False,
 ) -> None:
     """Materialise + load weights into one (sub-)tree from a single snapshot.
 
@@ -209,7 +213,35 @@ def _load_one(
     the ``str`` and ``Mapping`` branches above share identical loader
     behaviour.  ``model`` here may be the full top-level model or a
     single named child — both are valid ``nn.Module`` instances.
+
+    ``ep_sharded_stream_load`` opts into :func:`load_model_weights_ep_sharded`
+    (each rank reads only its ExtraParallel dim-0 slice of the expert tensors),
+    an independent fast/low-memory path for large MoE checkpoints. It is only
+    valid for the every-rank-reads (non-broadcast) case; if the model/checkpoint
+    is unsupported the loader raises and we fall back to ``load_model_weights``.
     """
+    if ep_sharded_stream_load and not broadcast_from_rank0:
+        logger.info_rank0(
+            "Loading model weights via per-rank ExtraParallel-slice streaming (ep_sharded_stream_load)..."
+        )
+        _dt_local_split = partial(distribute_tensor_fn, src_data_rank=None)
+        try:
+            load_model_weights_ep_sharded(
+                model,
+                weights_path,
+                materialize_device,
+                dtensor_factory=_dt_local_split,
+                is_peft_model=is_peft_model,
+                adapter_path=adapter_path,
+                fqn_to_index_mapping=fqn_to_index_mapping,
+            )
+            return
+        except NotImplementedError as e:
+            logger.warning_rank0(
+                f"ep_sharded_stream_load unsupported for this model/checkpoint ({e}); "
+                "falling back to load_model_weights."
+            )
+
     if broadcast_from_rank0:
         logger.info_rank0("Loading model weights from disk on rank0 then broadcasting to other ranks...")
         rank0_load_and_broadcast_weights(
@@ -350,7 +382,14 @@ def parallelize_model_fsdp2(
         _extra_parallel_mesh = {}
         _extra_parallel_map = {}
         for para in parallel_state.extra_parallel_names:
-            if parallel_state.extra_parallel_enabled(para):
+            # A globally-enabled ExtraParallel (e.g. ``ep``) may not be declared by
+            # THIS model's plan -- e.g. a text-encoder / over-encoder has no experts,
+            # so ``ep`` shards nothing here even though a MoE sibling module uses it.
+            # Treat such a para as a no-op for this model (``None``) instead of
+            # crashing in ``get_extra_parallel_fsdp_no_shard_info`` (which requires
+            # >=1 matching module). Nothing downstream wraps it (its layer para_mods
+            # stay empty).
+            if parallel_state.extra_parallel_enabled(para) and para in parallel_plan.extra_parallel_plan:
                 _extra_parallel_mesh[para] = parallel_state.extra_parallel_fsdp_device_mesh[para]
                 _extra_parallel_map[para] = parallel_plan.get_extra_parallel_fsdp_no_shard_info(model, para)
             else:
@@ -384,17 +423,25 @@ def parallelize_model_fsdp2(
         if parallel_state.any_extra_parallel_enabled:
             for para in parallel_state.extra_parallel_names:
                 if _extra_parallel_map[para] is not None:
-                    para_mod = next(
-                        (
-                            para_mod
-                            for para_mod_fqn, para_mod in _extra_parallel_map[para].items()
-                            if para_mod_fqn.startswith(layer_fqn)
-                        ),
-                        None,
-                    )
+                    # Collect ALL extra-parallel (e.g. ep) modules under this layer,
+                    # not just the first. A single layer may hold more than one such
+                    # module (e.g. multiple experts modules in one decoder layer), and
+                    # EACH must be fully_shard'd over the ep_fsdp mesh. If only the
+                    # first were wrapped, the others would fall through to the regular
+                    # ``fully_shard(layer_mod)`` below and be re-sharded over the
+                    # FSDP mesh -- but their params were already EP-sliced (each rank
+                    # holds a *different* [E/ep, ...] slice), so that second shard
+                    # scrambles them and corrupts the experts.
+                    # Match ``layer_fqn + "."`` (not a bare ``startswith``) so e.g.
+                    # ``model.layers.1`` does not also swallow ``model.layers.10``.
+                    para_mods = [
+                        para_mod
+                        for para_mod_fqn, para_mod in _extra_parallel_map[para].items()
+                        if para_mod_fqn == layer_fqn or para_mod_fqn.startswith(layer_fqn + ".")
+                    ]
                 else:
-                    para_mod = None
-                extra_parallel_mod[para] = para_mod
+                    para_mods = []
+                extra_parallel_mod[para] = para_mods
         layer_pair.append(extra_parallel_mod)
         layer_pairs[layer_fqn] = tuple(layer_pair)
 
@@ -416,7 +463,16 @@ def parallelize_model_fsdp2(
     model._fsdp_cpu_offload_enabled = enable_fsdp_cpu_offload
     if enable_fsdp_cpu_offload:
         logger.info_rank0("Enable FSDP2 CPU offload for parameters, gradients, and optimizer states.")
-        fsdp_kwargs["offload_policy"] = CPUOffloadPolicy()
+        # ``CPUOffloadPolicy`` defaults to ``pin_memory=True``: the offloaded CPU
+        # param shards are page-locked, which (a) is accounted as non-reclaimable
+        # ``Shmem`` against the container memcg and (b) cannot be swapped/evicted.
+        # For a very large model (e.g. the ~1.5 TiB MoT experts) each rank pins
+        # its whole shard, so N ranks/host pin ~N * shard_size of Shmem and OOM
+        # the cgroup during load. ``fsdp_offload_pin_memory=False`` keeps the
+        # shards in ordinary pageable anon memory (what a bespoke manual offload
+        # does) at the cost of a non-pinned (slightly slower) H2D per layer.
+        offload_pin_memory = kwargs.pop("fsdp_offload_pin_memory", True)
+        fsdp_kwargs["offload_policy"] = CPUOffloadPolicy(pin_memory=offload_pin_memory)
 
     if hasattr(model, "get_ignore_modules_in_mixed_precision"):
         modules_to_ignore_in_mixed_precision = model.get_ignore_modules_in_mixed_precision()
@@ -509,14 +565,16 @@ def parallelize_model_fsdp2(
         layer_mod._fsdp_modules = []
 
         for para in parallel_state.extra_parallel_names:
-            # para (e.g. ep, emb) enabled and this layer contains the para (e.g. expert/decoder.moe, embed_tokens/decoder.embed_tokens) module
-            if (
-                parallel_state.extra_parallel_enabled(para)
-                and extra_parallel_mod[para] is not None
-                and not isinstance(extra_parallel_mod[para], FSDPModule)
-            ):
+            # para (e.g. ep, emb) enabled and this layer contains the para module(s)
+            # (e.g. expert/decoder.moe, embed_tokens/decoder.embed_tokens). A layer
+            # may hold more than one (e.g. multiple experts modules) -- wrap each.
+            if not parallel_state.extra_parallel_enabled(para):
+                continue
+            for _para_mod in extra_parallel_mod[para]:
+                if isinstance(_para_mod, FSDPModule):
+                    continue
                 # shard para module (e.g. expert/decoder.moe, embed_tokens/decoder.embed_tokens)
-                fully_shard(extra_parallel_mod[para], **extra_parallel_fsdp_kwargs[para])
+                fully_shard(_para_mod, **extra_parallel_fsdp_kwargs[para])
                 # average para (e.g. ep) grads across para (e.g. ep) ranks
                 # NOTE: in torch 2.8 and later we should use
                 # experts_mod.set_gradient_divide_factor(parallel_state.ep_size)
@@ -525,11 +583,11 @@ def parallelize_model_fsdp2(
                 logger.info(f"setting grad divide factor for {para} module to {gradient_divide_factor}")
                 if IS_NPU_AVAILABLE:
                     # NPU is using torch 2.7
-                    extra_parallel_mod[para].set_reduce_scatter_divide_factor(gradient_divide_factor)
+                    _para_mod.set_reduce_scatter_divide_factor(gradient_divide_factor)
                 else:
                     # from torch 2.8
-                    extra_parallel_mod[para].set_gradient_divide_factor(gradient_divide_factor)
-                layer_mod._fsdp_modules.append(extra_parallel_mod[para])
+                    _para_mod.set_gradient_divide_factor(gradient_divide_factor)
+                layer_mod._fsdp_modules.append(_para_mod)
 
         # shard module that needs to ignore mixed precision control
         if mp_ignored_classes:
@@ -599,6 +657,7 @@ def parallelize_model_fsdp2(
         max_load_broadcast_size=kwargs.get("max_load_broadcast_size", 20.0),
         distribute_tensor_fn=distribute_tensor,
         fqn_to_index_mapping=kwargs.get("fqn_to_index_mapping"),
+        ep_sharded_stream_load=bool(kwargs.get("ep_sharded_stream_load", False)),
     )
 
     # Register grad norm clipping method for FSDP2
