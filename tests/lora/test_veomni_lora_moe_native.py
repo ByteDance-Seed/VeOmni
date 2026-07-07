@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import copy
 import json
+from unittest import mock
 
 import pytest
 import torch
@@ -41,7 +42,7 @@ import torch.nn as nn
 from veomni.lora import VeOmniLoraConfig, VeOmniLoraModel
 from veomni.lora.moe_layers import is_lora_independent_experts, is_lora_moe_experts, is_lora_shared_experts
 from veomni.lora.state_dict import get_lora_state_dict, load_adapter_state_dict
-from veomni.lora.weight_loading import load_lora_weights
+from veomni.lora.weight_loading import init_lora_parameter, load_lora_weights
 
 
 torch.manual_seed(0)
@@ -204,6 +205,42 @@ def test_moe_mode_inferred_when_config_lacks_block(tmp_path, mode):
     on_disk = load_adapter_state_dict(str(tmp_path), device="cpu")
     live = get_lora_state_dict(reloaded, config=reloaded.get_lora_config())
     assert set(on_disk) == set(live)
+
+
+@pytest.mark.parametrize("mode", ["independent", "shared"])
+def test_init_lora_parameter_preserves_loaded_weights(mode):
+    """GAP-1 / BUG-3 guard: post-load init must NOT reset a populated wrapper.
+
+    ``post_process_after_weight_loading`` walks every LoRA param name through
+    ``init_lora_parameter``. For a MoE wrapper the reset only fires when *all*
+    of its params are still on meta device (``_reset_moe_wrapper``); once
+    ``load_lora_weights`` has materialised them (non-meta, as on this CPU
+    model) the reset must be skipped so it cannot re-randomise ``lora_A`` /
+    re-zero ``lora_B``. Assert both the values survive and that the wrapper's
+    ``reset_lora_parameters`` is never called.
+    """
+    model = VeOmniLoraModel(ToyMoE(), _moe_config(mode))
+    experts = _experts(model)
+
+    # Fill every LoRA tensor with a recognizable non-zero sentinel, mimicking
+    # weights just loaded from a checkpoint (lora_B is otherwise zero-init).
+    sentinel = 0.1234
+    with torch.no_grad():
+        for name, p in model.named_parameters():
+            if ".lora_A." in name or ".lora_B." in name:
+                p.fill_(sentinel)
+    before = {n: p.detach().clone() for n, p in model.named_parameters() if ".lora_" in n}
+    assert before, "expected LoRA params on the wrapped MoE model"
+
+    with mock.patch.object(experts, "reset_lora_parameters", wraps=experts.reset_lora_parameters) as reset_spy:
+        for name in before:
+            init_lora_parameter(model, name)
+        reset_spy.assert_not_called()
+
+    after = {n: p for n, p in model.named_parameters() if ".lora_" in n}
+    assert set(after) == set(before)
+    for n, prev in before.items():
+        torch.testing.assert_close(after[n], prev, msg=lambda s, n=n: f"{n} was clobbered by init_lora_parameter\n{s}")
 
 
 if __name__ == "__main__":
