@@ -27,6 +27,7 @@ Features:
 """
 
 import json
+import os
 import queue
 import threading
 from abc import ABC
@@ -66,6 +67,7 @@ from ..utils.device import (
     get_device_type,
     get_dist_comm_backend,
     get_torch_device,
+    is_nccl_backend,
     synchronize,
 )
 from ..utils.loss_utils import count_loss_token, mean_global_loss
@@ -387,14 +389,19 @@ class BaseTrainer(Stateful, ABC):
         ``use_rslora``, ``lora_dropout``, ``bias``, ``exclude_modules``,
         ``rank_pattern``, ``alpha_pattern``, ``modules_to_save`` — see
         :class:`veomni.lora.VeOmniLoraConfig`.
+
+        Fused-MoE models (Qwen3-MoE family) may list the semantic expert module
+        names ``gate_proj`` / ``up_proj`` / ``down_proj`` in ``lora_modules``;
+        these are auto-mapped to the model's fused expert ``target_parameters``
+        (see :func:`veomni.lora.resolve_fused_moe_lora_targets`). Dense models
+        keep those names as ordinary ``nn.Linear`` LoRA targets.
         """
         lora_config = self.args.model.lora_config
         if not bool(lora_config):
             return
 
-        from ..lora import VeOmniLoraConfig, VeOmniLoraModel
+        from ..lora import VeOmniLoraConfig, VeOmniLoraModel, resolve_fused_moe_lora_targets
 
-        cfg = VeOmniLoraConfig.from_yaml(lora_config)
         lora_adapter_path = lora_config.get("lora_adapter", None)
         if lora_adapter_path is not None:
             logger.info_rank0(f"Wrapping model with VeOmniLoraModel from {lora_adapter_path}.")
@@ -404,6 +411,10 @@ class BaseTrainer(Stateful, ABC):
                 is_trainable=lora_config.get("is_trainable", True),
             )
         else:
+            # Rewrite semantic MoE module names onto fused expert parameters
+            # before building the config (no-op for dense models / plain configs).
+            resolved_config = resolve_fused_moe_lora_targets(self.model, lora_config)
+            cfg = VeOmniLoraConfig.from_yaml(resolved_config)
             logger.info_rank0(f"Initialising VeOmni LoRA adapter from scratch: {cfg}.")
             self.model = VeOmniLoraModel(self.model, cfg)
 
@@ -465,9 +476,12 @@ class BaseTrainer(Stateful, ABC):
             bsz_warmup_init_mbtoken=args.train.bsz_warmup_init_mbtoken,
             dyn_bsz=args.train.dyn_bsz,
             dyn_bsz_runtime=args.train.dyn_bsz_runtime,
+            dyn_bsz_count_mode=args.train.dyn_bsz_count_mode,
+            dyn_bsz_physical_overflow_ratio=args.train.dyn_bsz_physical_overflow_ratio,
             dyn_bsz_buffer_size=args.data.dyn_bsz_buffer_size,
             seed=args.train.seed,
             collate_fn=self.collate_fn,
+            save_steps=args.train.checkpoint.save_steps,
             **dataloader_kwargs,
         )
 
@@ -738,8 +752,21 @@ class BaseTrainer(Stateful, ABC):
         self.on_step_end(loss=total_loss, loss_dict=total_loss_dict, grad_norm=grad_norm)
 
     def destroy_distributed(self):
+        if not dist.is_available() or not dist.is_initialized():
+            return
+
+        backend = dist.get_backend()
         helper.empty_cache()
         dist.barrier()
+
+        if is_nccl_backend(backend) and os.getenv("VEOMNI_DESTROY_NCCL_ON_EXIT", "0") != "1":
+            logger.info_rank0(
+                "Skipping explicit NCCL process-group destroy on normal trainer exit. "
+                "Set VEOMNI_DESTROY_NCCL_ON_EXIT=1 to restore the previous teardown behavior."
+            )
+            return
+
+        synchronize()
         dist.destroy_process_group()
 
     def train(self):

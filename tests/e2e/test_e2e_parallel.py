@@ -8,8 +8,8 @@ import pytest
 import torch
 
 from veomni.models.auto import build_foundation_model
-from veomni.utils.device import IS_NPU_AVAILABLE
-from veomni.utils.import_utils import is_diffusers_available
+from veomni.utils.device import IS_NPU_AVAILABLE, get_gpu_compute_capability
+from veomni.utils.import_utils import is_diffusers_available, is_quack_gemm_available
 
 from ..tools import DummyDataset, build_torchrun_cmd, compare_metrics, print_comparison_table
 from ..tools.training_utils import make_eager_ops_config
@@ -28,6 +28,22 @@ _qwen3_5_npu_skip = pytest.mark.skipif(
 _qwen_image_npu_skip = pytest.mark.skipif(IS_NPU_AVAILABLE, reason="Qwen-Image training is GPU-only for now")
 
 
+def _is_fa4_available() -> bool:
+    if get_gpu_compute_capability() < 90:
+        return False
+    try:
+        from flash_attn.cute import flash_attn_func, flash_attn_varlen_func  # noqa: F401
+    except Exception:
+        return False
+    return True
+
+
+_gpt_oss_fa4_quack_skip = pytest.mark.skipif(
+    IS_NPU_AVAILABLE or not is_quack_gemm_available() or not _is_fa4_available(),
+    reason="GPT-OSS fused parallel test requires FA4 plus Quack GEMM on SM90+ CUDA GPUs",
+)
+
+
 def _materialize_weights_dir(config_path: str, output_path: str, save_original_format: bool = True) -> Path:
     # Seed CPU RNG and init on CPU so the materialized checkpoint is bit-identical
     # across pytest invocations *and* across GPU architectures (L20 in CI vs A100
@@ -43,6 +59,7 @@ def _materialize_weights_dir(config_path: str, output_path: str, save_original_f
         init_device="cpu",
         ops_implementation=make_eager_ops_config(),
     )
+
     model.save_pretrained(output_path, save_original_format=save_original_format)
 
 
@@ -55,6 +72,8 @@ def main(
     atol: float,
     train_path: str,
     max_sp_size: int | None = None,
+    max_ep_size: int | None = None,
+    compare_alignment: bool = True,
 ):
     test_path = f"./{model_name}"
     os.makedirs(test_path, exist_ok=True)
@@ -81,7 +100,14 @@ def main(
         output_dir=test_path,
         is_moe=is_moe,
         max_sp_size=max_sp_size,
+        max_ep_size=max_ep_size,
     )
+    if len(command_list) < 1:
+        raise AssertionError("Training tests require at least one parallel mode.")
+    if compare_alignment and len(command_list) < 2:
+        raise AssertionError(
+            "Alignment tests require at least two parallel modes. Use a smoke test for single-mode coverage."
+        )
     res = {}
     log_keys = []
     for task_name, cmd_kwargs in command_list:
@@ -96,9 +122,13 @@ def main(
             assert log_keys == set(output.keys())
         res[task_name] = output
 
+    if compare_alignment:
+        assert len(res) >= 2, "Alignment tests require at least two completed runs."
+
     for key in log_keys:
         print_comparison_table(res, key, title=model_name)
-    compare_metrics(res, rtol=rtol, atol=atol)
+    if compare_alignment:
+        compare_metrics(res, rtol=rtol, atol=atol)
 
     shutil.rmtree(test_path)
 
@@ -114,6 +144,7 @@ text_test_cases = [
         _DEFAULT_RTOL,
         _DEFAULT_ATOL,
         None,  # max_sp_size
+        None,  # max_ep_size
     ),
     pytest.param(
         "qwen2",
@@ -122,6 +153,7 @@ text_test_cases = [
         _DEFAULT_RTOL,
         _DEFAULT_ATOL,
         None,  # max_sp_size
+        None,  # max_ep_size
     ),
     pytest.param(
         "qwen3_moe",
@@ -130,6 +162,7 @@ text_test_cases = [
         _DEFAULT_RTOL,
         _DEFAULT_ATOL,
         None,  # max_sp_size
+        None,  # max_ep_size
     ),
     pytest.param(
         "seed_oss",
@@ -138,6 +171,7 @@ text_test_cases = [
         _DEFAULT_RTOL,
         _DEFAULT_ATOL,
         None,  # max_sp_size
+        None,  # max_ep_size
     ),
     pytest.param(
         "deepseek_v3",
@@ -146,6 +180,38 @@ text_test_cases = [
         _DEFAULT_RTOL,
         _DEFAULT_ATOL,
         None,  # max_sp_size
+        None,  # max_ep_size
+    ),
+]
+
+deepseek_v4_text_smoke_test_cases = [
+    pytest.param(
+        "deepseek_v4",
+        "./tests/toy_config/deepseek_v4_toy",
+        True,  # is_moe
+        _DEFAULT_RTOL,
+        _DEFAULT_ATOL,
+        # DeepSeek-V4 is eager-only (no FA / SDPA / FlexAttention) and the
+        # 4D ``[B, S, hc_mult, D]`` HyperConnection residual stack isn't
+        # SP-aware yet. Force ``max_sp_size=1`` until a v4-specific
+        # eager-SP path lands.
+        1,
+        # The current generic fused MoE EP path does not preserve DeepSeek-V4's
+        # swiglu_limit clamp and is not stable for the merged gate_up layout on
+        # all backends. Keep e2e on the non-EP baseline until a V4-aware fused
+        # EP kernel lands; do not force eager MoE here because eager expert
+        # loops are incompatible with EP-sharded expert weights.
+        1,
+    ),
+    pytest.param(
+        "gpt_oss",
+        "./tests/toy_config/gpt_oss_toy",
+        True,  # is_moe
+        _DEFAULT_RTOL,
+        _DEFAULT_ATOL,
+        None,  # max_sp_size
+        None,  # max_ep_size
+        marks=_gpt_oss_fa4_quack_skip,
     ),
 ]
 
@@ -241,7 +307,20 @@ qwen_image_dit_test_cases = [
         False,
         _DEFAULT_RTOL,
         _DEFAULT_ATOL,
-        1,  # Ulysses SP for Qwen-Image needs a model-specific joint-attention patch.
+        2,  # Ulysses SP enabled via QwenImageSPAttnProcessor + forward patch.
+        marks=[_dit_only, _qwen_image_npu_skip],
+    ),
+]
+
+# Reuses the toy model config; only the dataset differs (odd seq lens).
+qwen_image_dit_padding_test_cases = [
+    pytest.param(
+        "qwen_image",
+        "./tests/toy_config/qwen_image_toy/config.json",
+        False,
+        _DEFAULT_RTOL,
+        _DEFAULT_ATOL,
+        2,
         marks=[_dit_only, _qwen_image_npu_skip],
     ),
 ]
@@ -303,7 +382,15 @@ def dummy_qwen_image_dataset():
     del dummy_dataset
 
 
-@pytest.mark.parametrize("model_name, config_path, is_moe, rtol, atol, max_sp_size", text_test_cases)
+@pytest.fixture(scope="session")
+def dummy_qwen_image_padding_dataset():
+    dummy_dataset = DummyDataset(seq_len=2048, dataset_type="qwen_image_padding")
+    train_path = dummy_dataset.save_path
+    yield train_path
+    del dummy_dataset
+
+
+@pytest.mark.parametrize("model_name, config_path, is_moe, rtol, atol, max_sp_size, max_ep_size", text_test_cases)
 def test_text_parallel_align(
     model_name: str,
     config_path: str,
@@ -311,6 +398,7 @@ def test_text_parallel_align(
     rtol: float,
     atol: float,
     max_sp_size: int | None,
+    max_ep_size: int | None,
     dummy_text_dataset,
 ):
     main(
@@ -322,6 +410,34 @@ def test_text_parallel_align(
         atol=atol,
         train_path=dummy_text_dataset,
         max_sp_size=max_sp_size,
+        max_ep_size=max_ep_size,
+    )
+
+
+@pytest.mark.parametrize(
+    "model_name, config_path, is_moe, rtol, atol, max_sp_size, max_ep_size", deepseek_v4_text_smoke_test_cases
+)
+def test_text_parallel_smoke(
+    model_name: str,
+    config_path: str,
+    is_moe: bool,
+    rtol: float,
+    atol: float,
+    max_sp_size: int | None,
+    max_ep_size: int | None,
+    dummy_text_dataset,
+):
+    main(
+        task_name="train_text_test",
+        model_name=model_name,
+        config_path=config_path,
+        is_moe=is_moe,
+        rtol=rtol,
+        atol=atol,
+        train_path=dummy_text_dataset,
+        max_sp_size=max_sp_size,
+        max_ep_size=max_ep_size,
+        compare_alignment=False,
     )
 
 
@@ -392,6 +508,50 @@ def test_qwen3omni_parallel_align(
     )
 
 
+def test_wan_dit_uses_bfloat16_and_flash_attention():
+    command_list = prepare_exec_cmd(
+        ["train_dit_test"],
+        "wan_t2v",
+        "./tests/toy_config/wan_t2v_toy",
+        model_path="./wan_t2v",
+        train_path="./dummy_wan_t2v",
+        output_dir="./wan_t2v",
+        is_moe=False,
+        max_sp_size=1,
+    )
+
+    assert command_list
+    for _, cmd_kwargs in command_list:
+        cmd = build_torchrun_cmd(**cmd_kwargs)
+        assert cmd_kwargs["extra_args"] == [
+            "--train.accelerator.fsdp_config.mixed_precision.enable=True",
+            "--train.accelerator.fsdp_config.mixed_precision.param_dtype=bfloat16",
+            "--train.accelerator.fsdp_config.mixed_precision.cast_forward_inputs=True",
+        ]
+        assert "--model.ops_implementation.attn_implementation=flash_attention_2" in cmd
+
+
+@_gpt_oss_fa4_quack_skip
+def test_gpt_oss_parallel_uses_fa4_and_quack():
+    command_list = prepare_exec_cmd(
+        ["train_text_test"],
+        "gpt_oss",
+        "./tests/toy_config/gpt_oss_toy",
+        model_path="./gpt_oss",
+        train_path="./dummy_text",
+        output_dir="./gpt_oss",
+        is_moe=True,
+    )
+
+    assert command_list
+    assert {cmd_kwargs["parallel_config"].ep_size for _, cmd_kwargs in command_list} == {1, 2}
+    assert {cmd_kwargs["parallel_config"].sp_size for _, cmd_kwargs in command_list} == {1, 2}
+    for _, cmd_kwargs in command_list:
+        cmd = build_torchrun_cmd(**cmd_kwargs)
+        assert "--model.ops_implementation.attn_implementation=flash_attention_4" in cmd
+        assert "--model.ops_implementation.moe_implementation=fused_quack" in cmd
+
+
 @pytest.mark.parametrize("model_name, config_path, is_moe, rtol, atol", wan_dit_test_cases)
 def test_wan_dit_parallel_align(
     model_name: str, config_path: str, is_moe: bool, rtol: float, atol: float, dummy_wan_t2v_dataset
@@ -420,7 +580,9 @@ def test_qwen_image_dit_parallel_align(
     max_sp_size: int,
     dummy_qwen_image_dataset,
 ):
-    """Validate Qwen-Image toy training under FSDP2 without Ulysses SP."""
+    """Validate that QwenImageTransformer2DModel loss and grad_norm are identical
+    with and without Ulysses sequence-parallelism at equal DP sizes.
+    """
     main(
         task_name="train_dit_test",
         model_name=model_name,
@@ -429,5 +591,30 @@ def test_qwen_image_dit_parallel_align(
         rtol=rtol,
         atol=atol,
         train_path=dummy_qwen_image_dataset,
+        max_sp_size=max_sp_size,
+    )
+
+
+@pytest.mark.parametrize("model_name, config_path, is_moe, rtol, atol, max_sp_size", qwen_image_dit_padding_test_cases)
+def test_qwen_image_dit_parallel_align_padding(
+    model_name: str,
+    config_path: str,
+    is_moe: bool,
+    rtol: float,
+    atol: float,
+    max_sp_size: int,
+    dummy_qwen_image_padding_dataset,
+):
+    """SP-vs-no-SP alignment with non-``sp_size``-divisible image/text lengths,
+    exercising the Ulysses-SP pad/truncate path that the default 16/8 case skips.
+    """
+    main(
+        task_name="train_dit_test",
+        model_name=model_name,
+        config_path=config_path,
+        is_moe=is_moe,
+        rtol=rtol,
+        atol=atol,
+        train_path=dummy_qwen_image_padding_dataset,
         max_sp_size=max_sp_size,
     )

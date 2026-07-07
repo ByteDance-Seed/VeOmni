@@ -149,8 +149,7 @@ GatedDeltaNet has three OpSlot-driven kernels: `rms_norm_gated`, `causal_conv1d`
   training raises at runtime).
 
 To switch `chunk_gated_delta_rule` to QwenLM's [`flash-qla`](https://github.com/QwenLM/FlashQLA)
-kernel, install the optional extra (`uv sync --extra flash-qla ...`) and set the field
-explicitly:
+kernel (already shipped under the `gpu` extra), set the field explicitly:
 
 ```yaml
 model:

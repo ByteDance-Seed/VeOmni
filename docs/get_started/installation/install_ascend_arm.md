@@ -12,7 +12,30 @@ Choose one of the following methods to use CANN:
 
 2. Download and use [the CANN image](https://www.hiascend.com/developer/ascendhub/detail/17da20d1c2b6493cb38765adeba85884)
 
-## Install with pip
+## Install with uv or pip
+
+### UV
+
+> Recommend to use [uv](https://docs.astral.sh/uv/) for faster and easier installation.
+
+```bash
+git clone https://github.com/ByteDance-Seed/VeOmni.git
+cd VeOmni
+
+# use the frozen uv env
+uv sync --frozen  --extra npu_aarch64
+source .venv/bin/activate
+```
+
+> **Note**: For video/audio processing with the `video` or `audio` extra, you also need to install ffmpeg separately:
+> ```bash
+> # Ubuntu/Debian/openEuler
+> sudo apt-get install ffmpeg
+> # or
+> sudo yum install ffmpeg
+> ```
+
+### Pip
 
 ```bash
 git clone https://github.com/ByteDance-Seed/VeOmni.git

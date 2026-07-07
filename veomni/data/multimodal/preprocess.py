@@ -373,6 +373,69 @@ def tulu_3_sft_mixture_preprocess(conversations, **kwargs):
     return constructed_conversation
 
 
+@PREPROCESSOR_REGISTRY.register("qwen_omni_offline_av")
+def qwen_omni_offline_av_preprocess(conversations, **kwargs):
+    """Offline-extracted audio-enabled video shape for Qwen-Omni.
+
+    Use this preprocessor when each sample carries an **audio-enabled video**
+    that has been offline-decoded into a list of frame bytes plus a matching
+    audio track — for example, because frame sampling / shot detection / audio
+    extraction is done in a preceding data pipeline. The video and audio are
+    treated as a single A/V unit aligned in time, **not** as two independent
+    streams, and the Qwen-Omni processor interleaves their tokens via the
+    standard ``use_audio_in_video=True`` path.
+
+    Sample shape::
+
+        {
+            "videos": [
+                {
+                    "frames": [png_bytes_0, png_bytes_1, ...],   # List[bytes]
+                    "audio":  wav_bytes,                          # bytes or np.ndarray
+                    # optional: "video_fps": 2.0, "audio_fps": 16000
+                }
+            ],
+            "audios": ["/path/voice_query.wav"],   # optional, for standalone audio turns
+            "images": ["/path/image.jpg"],         # optional, for image content
+            "conversations": [
+                {"from": "human", "value": "<video>\\nWhat is happening?"},
+                {"from": "gpt",   "value": "Someone is speaking ..."},
+            ],
+        }
+
+    Each ``<video>`` marker consumes one paired-A/V dict from ``sample["videos"]``;
+    each ``<audio>`` marker consumes one standalone audio entry from
+    ``sample["audios"]`` (independent of any video); each ``<image>`` marker
+    consumes one entry from ``sample["images"]``. Marker order in ``value``
+    determines the order of content items. Multiple markers per turn are
+    supported.
+
+    The caller is responsible for keeping the per-modality marker count in each
+    conversation aligned with the corresponding ``sample[...]`` list length —
+    a mismatch surfaces as a ``StopIteration`` deep inside
+    ``process_sample_qwen_omni`` when content items are bound left-to-right.
+    """
+    role_mapping = {"human": "user", "gpt": "assistant"}
+    constructed = []
+    marker_re = re.compile(r"<video>|<audio>|<image>")
+    for message in conversations:
+        role = role_mapping[message["from"]]
+        value = message["value"]
+        items = []
+        cursor = 0
+        for match in marker_re.finditer(value):
+            text_chunk = value[cursor : match.start()]
+            if text_chunk:
+                items.append(("text", text_chunk))
+            items.append((match.group()[1:-1], None))  # "<video>" -> "video"
+            cursor = match.end()
+        tail = value[cursor:]
+        if tail:
+            items.append(("text", tail))
+        constructed.append([role, *items])
+    return constructed
+
+
 # @PREPROCESSOR_REGISTRY.register("your_dataset_name")
 # def your_dataset_preprocess(conversations, **kwargs):
 #     ...

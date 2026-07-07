@@ -9,14 +9,15 @@ Read `.agents/knowledge/uv.md` for the full dependency architecture. The key thi
 
 - uv version is pinned in **three places** (must update together)
 - torch uses **direct wheel URLs** (not just version bumps)
-- hardware extras (`gpu`, `npu`, `npu_aarch64`) are **mutually conflicting**
+- only three extras: `gpu` / `npu` / `npu_aarch64`, mutually exclusive,
+  each a complete superset
 
 ## Scenario 1: Update uv Version
 
 uv is pinned to a specific version. Update **all three locations** together:
 
 1. `pyproject.toml` -> `[tool.uv]` -> `required-version = "==X.Y.Z"`
-2. `docker/cuda/Dockerfile.cu129` -> `COPY --from=ghcr.io/astral-sh/uv:X.Y.Z`
+2. `docker/cuda/Dockerfile.cu130` -> `COPY --from=ghcr.io/astral-sh/uv:X.Y.Z`
 3. `docker/ascend/Dockerfile.ascend_*` -> same pattern (if present)
 
 Then regenerate the lockfile:
@@ -49,7 +50,7 @@ This is the most complex update. torch versions are pinned in **multiple places*
 - `pyproject.toml` -> `[project.optional-dependencies]` -> `gpu` list
 - `pyproject.toml` -> `[tool.uv]` -> `override-dependencies` (the `extra == 'gpu'` entries)
 - `pyproject.toml` -> `[tool.uv.sources]` -> `torch` (direct wheel URL — must update to matching wheel)
-- Related packages: `torchvision`, `torchaudio`, `torchcodec`, `nvidia-cudnn-cu12`
+- Related packages: `torchvision`, `torchaudio`, `torchcodec`, `nvidia-cusparselt-cu13`, `nvidia-nccl-cu13`, `nvidia-cutlass-dsl`
 
 **For NPU (`npu` / `npu_aarch64` extras):**
 - Same pattern but with `+cpu` suffix or no suffix
@@ -57,7 +58,9 @@ This is the most complex update. torch versions are pinned in **multiple places*
 **Steps:**
 1. Identify the target torch version and matching wheel URLs from https://download.pytorch.org/whl/
 2. Update all pinned versions in `pyproject.toml` (extras, overrides, sources)
-3. Check `flash-attn` / `flash-attn-3` wheel compatibility — these are tied to specific torch versions via direct URLs in `[tool.uv.sources]`
+3. Check FA / FlashQLA wheel/source compatibility:
+   - `flash-attn` (cp311 + cp312) and `flash-attn-3` are pinned to Luosuu prebuilt wheel URLs in `[tool.uv.sources]` (cu130/torch2.11/cxx11abi=true). Bumping torch / Python / cuda requires a matching Luosuu release — see https://github.com/Luosuu/flash-attention3-wheels/releases.
+   - `flash-attn-4` and `flash-qla` source-build from git pins; torch ABI bumps may need bumping the git revs. `flash-qla`'s `[[tool.uv.dependency-metadata]]` block mirrors its install_requires (`tilelang==0.1.8`, `apache-tvm-ffi==0.1.9`); refresh the pins if upstream bumps them.
 4. Update `torchcodec` version if needed (compatibility note in pyproject.toml)
 5. Regenerate lockfile:
 

@@ -286,7 +286,7 @@ PR — see `veomni/arguments/arguments_types.py`):
 | `load_balancing_loss_implementation` | `eager`, `triton` | `triton` backend works on CUDA (`triton`) and NPU (`triton-ascend`); introduced in #651 and kept through this refactor |
 | `rms_norm_gated_implementation` | `eager`, `fla` | Qwen3.5 GatedDeltaNet `self.norm`; default `fla`. No NPU backend — selecting any non-eager value on NPU raises at OpSlot bind time (#714) |
 | `causal_conv1d_implementation` | `eager`, `fla` | Qwen3.5 GatedDeltaNet pre-mixer; default `fla`. `eager` has no torch fallback for `cu_seqlens` — varlen training raises at forward time. No NPU backend (#714) |
-| `chunk_gated_delta_rule_implementation` | `eager`, `fla`, `flash_qla` | Qwen3.5 linear attention; default `fla`. `flash_qla` is an opt-in extra (QwenLM FlashQLA). No NPU backend (#714) |
+| `chunk_gated_delta_rule_implementation` | `eager`, `fla`, `flash_qla` | Qwen3.5 linear attention; default `fla`. `flash_qla` (QwenLM FlashQLA) ships under the `gpu` extra and binds on Hopper sm90 only. No NPU backend (#714) |
 
 Convenience preset:
 

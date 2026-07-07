@@ -14,7 +14,7 @@
 
 import math
 import os
-from dataclasses import dataclass, field
+from dataclasses import MISSING, dataclass, field, fields
 from pathlib import Path
 from typing import Dict, List, Literal, Optional
 
@@ -468,6 +468,29 @@ class TrainingArguments:
         default="main",
         metadata={"help": "Which process dynamic batching runs in: main process or DataLoader worker."},
     )
+    dyn_bsz_count_mode: Literal["total", "effective"] = field(
+        default="total",
+        metadata={
+            "help": (
+                "How dynamic batching counts tokens when packing a micro batch. "
+                "'total' (default, legacy) sums attention_mask; 'effective' sums "
+                "only loss-contributing tokens (labels != IGNORE_INDEX), which "
+                "balances effective tokens across DP ranks at the cost of allowing "
+                "controlled physical-token overflow."
+            )
+        },
+    )
+    dyn_bsz_physical_overflow_ratio: float = field(
+        default=1.5,
+        metadata={
+            "help": (
+                "Physical-token cap multiplier used when dyn_bsz_count_mode='effective'. "
+                "The cap is ceil(micro_batch_size * max_seq_len * ratio), so values "
+                "> 1.0 let effective-token batching differ from total-token batching "
+                "while still bounding prompt-heavy micro batches."
+            )
+        },
+    )
     init_device: Literal["cpu", "cuda", "meta", "npu"] = field(
         default="meta",
         metadata={
@@ -536,6 +559,11 @@ class TrainingArguments:
     checkpoint: CheckpointConfig = field(default_factory=CheckpointConfig)
 
     def __post_init__(self):
+        if self.dyn_bsz_physical_overflow_ratio < 1.0:
+            raise ValueError(
+                f"dyn_bsz_physical_overflow_ratio must be >= 1.0, got {self.dyn_bsz_physical_overflow_ratio}."
+            )
+
         self._train_steps = -1
         self.local_rank = int(os.getenv("LOCAL_RANK", 0))
         self.global_rank = int(os.getenv("RANK", 0))
@@ -559,6 +587,7 @@ class TrainingArguments:
             )
         assert acc.tp_size == 1, "Tensor parallel size not supported yet."
         assert acc.pp_size == 1, "Pipeline parallel size not supported yet."
+        assert acc.cp_size == 1, "Context parallel size not supported yet."
 
         acc.dp_size = self.world_size // (acc.pp_size * acc.ulysses_size * acc.cp_size * acc.tp_size)
 
@@ -703,6 +732,16 @@ _NPU_REQUIRED: Dict[str, frozenset] = {
     "moe_implementation": frozenset({"fused_npu"}),
 }
 
+_NPU_DEFAULT_FALLBACK: Dict[str, str] = {
+    "rms_norm_implementation": "npu",
+    "rotary_pos_emb_implementation": "npu",
+    "rotary_pos_emb_vision_implementation": "npu",
+    "swiglu_mlp_implementation": "eager",
+    "load_balancing_loss_implementation": "eager",
+    "cross_entropy_loss_implementation": "npu",
+    "moe_implementation": "fused_npu",
+}
+
 
 @dataclass
 class OpsImplementationConfig:
@@ -820,12 +859,20 @@ class OpsImplementationConfig:
         metadata={
             "help": "Chunk gated delta-rule kernel for Qwen3.5 linear attention. "
             "'fla' (default) uses fla.ops.gated_delta_rule.chunk_gated_delta_rule (requires flash-linear-attention, GPU). "
-            "'flash_qla' uses QwenLM FlashQLA (requires the optional flash-qla extra, Hopper SM90 only — "
+            "'flash_qla' uses QwenLM FlashQLA (ships under the gpu extra, Hopper SM90 only — "
             "no Ampere/Ada below or Blackwell above; SM10x wheels are WIP upstream). "
             "'eager' uses transformers' torch_chunk_gated_delta_rule, which does NOT support "
             "cu_seqlens; varlen training therefore raises at runtime. "
             "Qwen3.5 has no NPU backend today — selecting any non-eager value on NPU raises at OpSlot bind time."
         },
+    )
+    dsa_indexer_backend: Literal["eager", "cudnn"] = field(
+        default="eager",
+        metadata={"help": "DeepSeek sparse attention top-k indexer backend."},
+    )
+    dsa_attention_backend: Literal["eager", "flashmla_cudnn"] = field(
+        default="eager",
+        metadata={"help": "DeepSeek sparse attention backend."},
     )
 
     def __post_init__(self):
@@ -854,7 +901,32 @@ class OpsImplementationConfig:
             )
             self.moe_implementation = resolved
 
+        self._apply_npu_default_fallback()
         self._validate_implementations()
+
+    def _apply_npu_default_fallback(self):
+        """Auto-resolve GPU-only defaults to NPU-compatible alternatives.
+
+        When running on NPU, fields still at their GPU default are silently
+        swapped to the NPU fallback from ``_NPU_DEFAULT_FALLBACK``. Explicit
+        user overrides (non-default values) are left untouched and will be
+        caught by ``_validate_implementations`` if unsupported.
+        """
+        from ..utils.import_utils import is_torch_npu_available
+
+        if not is_torch_npu_available():
+            return
+
+        gpu_defaults = {f.name: f.default for f in fields(self) if f.default is not MISSING}
+        for field_name, npu_value in _NPU_DEFAULT_FALLBACK.items():
+            if field_name not in gpu_defaults:
+                continue
+            current = getattr(self, field_name)
+            if current == gpu_defaults[field_name]:
+                setattr(self, field_name, npu_value)
+                logger.info_rank0(
+                    f"{field_name}: auto-resolved GPU default {current!r} -> {npu_value!r} on Ascend NPU."
+                )
 
     def _validate_implementations(self):
         """Fail fast on hardware/op mismatch at config-parse time.

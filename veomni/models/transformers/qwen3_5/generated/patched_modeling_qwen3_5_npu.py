@@ -761,8 +761,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 raise RuntimeError(
                     "Varlen Qwen3.5 GatedDeltaNet training is GPU-only — NPU has no fla/flash_qla "
                     "backend registered today. On GPU, set chunk_gated_delta_rule_implementation='fla' "
-                    "(and install flash-linear-attention) or 'flash_qla' (with the optional flash-qla "
-                    "extra) in OpsImplementationConfig."
+                    "(and install flash-linear-attention) or 'flash_qla' (ships under the gpu extra, "
+                    "Hopper sm90 only) in OpsImplementationConfig."
                 )
             else:
                 # Modification: use direct args and pass cu_seqlens for varlen FLA attention.
@@ -1059,16 +1059,17 @@ class Qwen3_5DecoderLayer(GradientCheckpointingLayer):
             "cu_seq_lens_q must be provided to support varlen Flash Linear Attention, varlen Conv1D,"
             "and to remove the full Flash Attention CPU-NPU sync."
         )
+        linear_attn_cu_seq_lens_q = kwargs.pop("linear_attn_cu_seq_lens_q", cu_seq_lens_q)
 
         # Token Mixer
         if self.layer_type == "linear_attention":
-            # Modification: pass cu_seq_lens_q through to Qwen3_5GatedDeltaNet.forward.
+            # Modification: pass linear-attention cu_seqlens through to Qwen3_5GatedDeltaNet.forward.
             hidden_states = self.linear_attn(
                 hidden_states=hidden_states,
                 cache_params=past_key_values,
                 cache_position=cache_position,
                 attention_mask=attention_mask,
-                cu_seq_lens_q=cu_seq_lens_q,
+                cu_seq_lens_q=linear_attn_cu_seq_lens_q,
             )
         elif self.layer_type == "full_attention":
             # Self Attention
@@ -2122,6 +2123,8 @@ class Qwen3_5Model(Qwen3_5PreTrainedModel):
         **kwargs: Unpack[TransformersKwargs],
     ) -> tuple | Qwen3_5ModelOutputWithPast:
         r"""
+        cache_position (`torch.LongTensor`, *optional*):
+            Indices describing the positions of the input sequence tokens in the cache.
         image_grid_thw (`torch.LongTensor` of shape `(num_images, 3)`, *optional*):
             The temporal, height and width of feature shape of each image in LLM.
         video_grid_thw (`torch.LongTensor` of shape `(num_videos, 3)`, *optional*):
@@ -2375,6 +2378,8 @@ class Qwen3_5ForCausalLM(Qwen3_5PreTrainedModel, GenerationMixin):
         **kwargs: Unpack[TransformersKwargs],
     ) -> CausalLMOutputWithPast:
         r"""
+        cache_position (`torch.LongTensor`, *optional*):
+            Indices describing the positions of the input sequence tokens in the cache.
         labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
             Labels for computing the masked language modeling loss. Indices should either be in `[0, ...,
             config.vocab_size]` or -100 (see `input_ids` docstring). Tokens with indices set to `-100` are ignored

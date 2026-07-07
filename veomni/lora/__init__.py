@@ -23,6 +23,7 @@ Public API:
 from .config import VeOmniLoraConfig
 from .layers import DEFAULT_ADAPTER, LoraLinear, is_lora_linear
 from .model import LoraModel, VeOmniLoraModel
+from .target_mapping import convert_fused_moe_lora_targets, resolve_fused_moe_lora_targets
 
 
 def is_veomni_lora_model(model) -> bool:
@@ -36,6 +37,8 @@ __all__ = [
     "LoraModel",
     "VeOmniLoraConfig",
     "VeOmniLoraModel",
+    "convert_fused_moe_lora_targets",
     "is_lora_linear",
     "is_veomni_lora_model",
+    "resolve_fused_moe_lora_targets",
 ]

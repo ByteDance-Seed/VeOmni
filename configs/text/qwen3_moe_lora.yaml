@@ -4,12 +4,15 @@
 # and `down_proj` (3D, [num_experts, hidden, intermediate]).
 #
 # `lora_config` schema (`veomni/trainer/base.py::_setup_lora`):
-#   - `lora_modules`         — nn.Linear targets handled by PEFT (q/k/v/o, router, etc.).
-#   - `target_parameters`    — 3D nn.Parameter targets on the experts module.
-#   - `share_expert_lora`    — when True, `target_parameters` are wrapped by VeOmni's
-#                              `LoraSharedExperts` (single 2D LoRA pair shared across
-#                              all experts in each layer) instead of PEFT's per-expert
-#                              `ParamWrapper` (Mode 1, default).
+#   - `lora_modules`         — LoRA targets by module name. `q/k/v/o` etc. install a dense
+#                              `LoraLinear`; the fused-MoE expert names `gate_proj` /
+#                              `up_proj` / `down_proj` are auto-mapped to the experts'
+#                              fused `target_parameters` and wrapped by VeOmni's MoE-LoRA.
+#   - `target_parameters`    — (advanced) explicit glob patterns for the 3D expert params;
+#                              equivalent to listing the semantic names above.
+#   - `share_expert_lora`    — when True, expert LoRA uses `LoraSharedExperts` (single 2D
+#                              LoRA pair shared across all experts in each layer, Mode 2)
+#                              instead of the per-expert `LoraIndependentExperts` (Mode 1).
 #
 # Switch to Mode 1 (independent LoRA per expert) by setting `share_expert_lora: false`.
 
@@ -31,9 +34,9 @@ model:
       - k_proj
       - v_proj
       - o_proj
-    target_parameters:
-      - model.layers.*.mlp.experts.gate_up_proj
-      - model.layers.*.mlp.experts.down_proj
+      - gate_proj
+      - up_proj
+      - down_proj
     share_expert_lora: true
 
 data:

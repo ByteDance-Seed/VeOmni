@@ -100,9 +100,9 @@ def set_device(device: torch.types.Device) -> None:
     get_torch_device().set_device(device)
 
 
-def is_nccl_backend() -> bool:
+def is_nccl_backend(backend: str | None = None) -> bool:
     """Check if the distributed communication backend is NCCL."""
-    return get_dist_comm_backend() == "nccl"
+    return (backend or get_dist_comm_backend()) == "nccl"
 
 
 def is_hccl_backend() -> bool:

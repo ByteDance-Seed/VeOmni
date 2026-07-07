@@ -50,6 +50,7 @@ import warnings
 import pytest
 import torch
 
+from veomni.lora import resolve_fused_moe_lora_targets
 from veomni.lora.moe_layers import (
     LoraIndependentExperts,
     LoraSharedExperts,
@@ -204,7 +205,9 @@ def _build_wrapped(*, mode: str, fused: bool, lora_b_perturb_std: float = 0.02, 
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         model = build_toy(toy, ops=fused_triton_moe_ops() if fused else None)
-    lora_cfg = load_lora_config(toy)
+    # Map semantic MoE names -> fused expert target_parameters (no-op for
+    # configs that list explicit patterns), mirroring BaseTrainer._setup_lora.
+    lora_cfg = resolve_fused_moe_lora_targets(model, load_lora_config(toy))
     _wrap_with_lora(model, lora_cfg, apply_fn=apply_fn, lora_b_perturb_std=lora_b_perturb_std)
     sample_fqn, exp = find_first_matching_module(model, experts_module_globs(lora_cfg["target_parameters"]))
     return model, sample_fqn, exp, lora_cfg

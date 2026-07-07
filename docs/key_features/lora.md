@@ -24,12 +24,9 @@ uv sync --extra gpu --dev
 
 `peft` is only needed to run the cross-compatibility interop test
 (`tests/lora/test_veomni_lora_native.py::test_peft_bidirectional_interop`, which
-`pytest.importorskip`s it). It lives in the `lora` optional extra (`peft==0.19.0`), which CI
-and the Docker images install alongside dev tooling:
-
-```shell
-uv sync --extra gpu --extra lora --group dev
-```
+`pytest.importorskip`s it). It ships inside the hardware extras (`peft==0.18.1` in
+`gpu` / `npu` / `npu_aarch64`), so the standard `uv sync --extra gpu --dev` above already
+installs it — no separate extra is required.
 
 ---
 
@@ -59,7 +56,7 @@ model:
 | `use_rslora` | bool (optional, default `false`) | Rank-stabilised LoRA scaling (`alpha / sqrt(r)`) |
 | `lora_modules` | list[str] or str | `nn.Linear` LoRA targets. List → PEFT substring/suffix match on module FQNs; a single `str` → regex (full match). Alias: `target_modules`. |
 | `exclude_modules` | list[str] or str (optional) | Modules to skip even if matched by `lora_modules`. |
-| `target_parameters` | list[str] (optional) | MoE-LoRA target — glob patterns matching the 3-D `nn.Parameter`s on a v5 MoE experts module (e.g. `model.layers.*.mlp.experts.gate_up_proj`). See §5 below. |
+| `target_parameters` | list[str] (optional) | MoE-LoRA target — glob patterns matching the 3-D `nn.Parameter`s on a v5 MoE experts module (e.g. `model.layers.*.mlp.experts.gate_up_proj`). Usually unnecessary: on fused-MoE models, listing `gate_proj` / `up_proj` / `down_proj` in `lora_modules` maps to these automatically. See §5 below. |
 | `share_expert_lora` | bool (optional, default `false`) | When `target_parameters` is set: `false` → per-expert independent LoRA; `true` → a single LoRA pair shared across all experts of a layer. See §5. |
 | `lora_dropout` | float (optional, default `0.0`) | Dropout applied to the LoRA input. |
 | `bias` | str (optional, default `none`) | Which biases stay trainable: `none` / `all` / `lora_only` (PEFT semantics). |
@@ -71,8 +68,11 @@ model:
 `lora_modules` and `target_parameters` may be set together — the former installs
 `LoraLinear` on `nn.Linear` layers (q/k/v/o, MLP, shared_expert, etc.), the latter installs
 VeOmni's MoE-LoRA wrappers on the fused experts `nn.Parameter`s. At least one must be
-non-empty. (Field names mirror `VeOmniLoraConfig`; the historical `rank`/`alpha`/`lora_modules`
-YAML names and the PEFT-style `r`/`lora_alpha`/`target_modules` names are both accepted.)
+non-empty. On fused-MoE models the expert names `gate_proj` / `up_proj` / `down_proj` in
+`lora_modules` are auto-mapped to the corresponding `target_parameters` (see §5), so you
+rarely need to write the glob patterns by hand. (Field names mirror `VeOmniLoraConfig`; the
+historical `rank`/`alpha`/`lora_modules` YAML names and the PEFT-style
+`r`/`lora_alpha`/`target_modules` names are both accepted.)
 
 > `modules_to_save` is parsed but not yet supported by the native stack (it raises a clear
 > `NotImplementedError`); correctly seeding the extra trainable modules under FSDP2
@@ -227,14 +227,42 @@ therefore cannot reach these parameters. VeOmni's MoE-LoRA wrappers
 | **Independent** (default) | `LoraIndependentExperts` | `[E, r, H]` / `[E, O, r]` | Each expert gets its own LoRA pair; functional drop-in for PEFT 0.19's `target_parameters` 3-D path. |
 | **Shared** | `LoraSharedExperts` | `[r, H]` / `[O, r]` | A single LoRA pair shared across all experts of a layer; ~`E×` fewer LoRA parameters. PEFT does not support this natively. |
 
-Configuration (linear LoRA + MoE-LoRA can be mixed in one `lora_config`):
+### Configuration
+
+**Recommended — semantic module names.** For the supported fused-MoE models
+(see §5.2) just list the expert MLP module names `gate_proj` / `up_proj` /
+`down_proj` in `lora_modules`, exactly as you would for a dense model. VeOmni
+maps them onto the model's fused expert parameters automatically
+(`gate_proj` / `up_proj` → `experts.gate_up_proj`, `down_proj` →
+`experts.down_proj`):
 
 ```yaml
 model:
   lora_config:
     rank: 16
     alpha: 32
-    lora_modules: [q_proj, k_proj, v_proj, o_proj]    # PEFT linear LoRA
+    lora_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+    share_expert_lora: false                           # false = Independent, true = Shared
+```
+
+The mapping is driven by a per-model `_convert_lora_targets_to_parameters` hook
+(registered in the model's `__init__.py`) plus
+`veomni.lora.resolve_fused_moe_lora_targets`, invoked by
+`BaseTrainer._setup_lora` before the adapter is built. It is a **no-op on dense
+models and on models without the hook**, so `gate_proj` / `up_proj` /
+`down_proj` there stay ordinary `nn.Linear` LoRA targets.
+
+**Advanced — explicit `target_parameters`.** You can still point directly at the
+fused expert parameters with glob patterns (mixed freely with `lora_modules`).
+This is equivalent to the recommended form above and is what gets serialized
+into `adapter_config.json`:
+
+```yaml
+model:
+  lora_config:
+    rank: 16
+    alpha: 32
+    lora_modules: [q_proj, k_proj, v_proj, o_proj]    # linear LoRA
     target_parameters:                                 # VeOmni MoE-LoRA
       - model.layers.*.mlp.experts.gate_up_proj
       - model.layers.*.mlp.experts.down_proj
@@ -470,10 +498,8 @@ model:
   lora_config:
     rank: 16
     alpha: 32
-    lora_modules: [q_proj, k_proj, v_proj, o_proj]    # standard PEFT LoRA
-    target_parameters:                                 # MoE-LoRA on routed experts
-      - model.layers.*.mlp.experts.gate_up_proj
-      - model.layers.*.mlp.experts.down_proj
+    # gate_proj/up_proj/down_proj auto-map to the fused expert parameters.
+    lora_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
     share_expert_lora: true                            # one LoRA per layer (Mode 2)
 
 train:

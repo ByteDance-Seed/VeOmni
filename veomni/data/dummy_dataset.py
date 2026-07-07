@@ -348,7 +348,7 @@ class WanT2VDataset(Dataset):
     WIDTH = 16
     TEXT_SEQ_LEN = 10
     TEXT_DIM = 512  # matches toy config text_dim
-    TIMESTEP = 500.0
+    TIMESTEP = 0.5
 
     def __init__(self, size: int = 16) -> None:
         self.size = size
@@ -378,32 +378,39 @@ class QwenImageDataset(Dataset):
     """
     Generates ready-to-use Qwen-Image transformer inputs for FSDP2 smoke tests.
 
-    Dimensions match ``tests/toy_config/qwen_image_toy/config.json``:
-    ``in_channels = 16``, ``joint_attention_dim = 32``, and a packed image
-    sequence of 16 latent patches.
+    Channel/text dimensions match ``tests/toy_config/qwen_image_toy/config.json``.
+    ``image_dims`` and ``text_seq_len`` are parameterised so callers can pick
+    non-``sp_size``-divisible lengths to exercise the Ulysses-SP padding path.
     """
 
     IN_CHANNELS = 16
-    IMAGE_SEQ_LEN = 16
-    TEXT_SEQ_LEN = 8
     TEXT_DIM = 32
     TIMESTEP = 0.5
 
-    def __init__(self, size: int = 16) -> None:
+    def __init__(
+        self,
+        size: int = 16,
+        *,
+        image_dims: tuple[int, int, int] = (1, 4, 4),
+        text_seq_len: int = 8,
+    ) -> None:
         self.size = size
+        self.image_dims = tuple(image_dims)
+        self.image_seq_len = self.image_dims[0] * self.image_dims[1] * self.image_dims[2]
+        self.text_seq_len = text_seq_len
 
     def __len__(self) -> int:
         return self.size
 
     def __getitem__(self, index: int) -> Dict[str, Any]:
         gen = torch.Generator().manual_seed(index)
-        hidden_states = torch.randn(1, self.IMAGE_SEQ_LEN, self.IN_CHANNELS, generator=gen)
-        training_target = torch.randn(1, self.IMAGE_SEQ_LEN, self.IN_CHANNELS, generator=gen)
-        encoder_hidden_states = torch.randn(1, self.TEXT_SEQ_LEN, self.TEXT_DIM, generator=gen)
-        encoder_hidden_states_mask = torch.ones(1, self.TEXT_SEQ_LEN, dtype=torch.long)
-        latents = torch.randn(1, self.IMAGE_SEQ_LEN, self.IN_CHANNELS, generator=gen)
+        hidden_states = torch.randn(1, self.image_seq_len, self.IN_CHANNELS, generator=gen)
+        training_target = torch.randn(1, self.image_seq_len, self.IN_CHANNELS, generator=gen)
+        encoder_hidden_states = torch.randn(1, self.text_seq_len, self.TEXT_DIM, generator=gen)
+        encoder_hidden_states_mask = torch.ones(1, self.text_seq_len, dtype=torch.long)
+        latents = torch.randn(1, self.image_seq_len, self.IN_CHANNELS, generator=gen)
         timestep = torch.tensor([self.TIMESTEP])
-        img_shapes = torch.tensor([[1, 4, 4]], dtype=torch.long)
+        img_shapes = torch.tensor([list(self.image_dims)], dtype=torch.long)
         return [
             {
                 "hidden_states": hidden_states,
@@ -434,5 +441,10 @@ def build_dummy_dataset(task_type: str, size: int, max_seq_len: int) -> "Dataset
         return WanT2VDataset(size=size)
     elif task_type == "qwen_image":
         return QwenImageDataset(size=size)
+    elif task_type == "qwen_image_padding":
+        # Odd image (1*3*5=15) and text (7) lengths so ``sp_size > 1`` runs
+        # actually hit the Ulysses-SP pad/truncate path (the default 16/8 case
+        # is divisible by 2 and silently bypasses it).
+        return QwenImageDataset(size=size, image_dims=(1, 3, 5), text_seq_len=7)
     else:
         raise ValueError(f"Dummy dataset type ({task_type}) is not supported.")

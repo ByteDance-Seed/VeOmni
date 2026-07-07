@@ -351,18 +351,9 @@ def load_model_weights(
             return bare_name
         return lora_key_overrides.get(bare_name, "base_model.model." + bare_name)
 
-    # Build LoRA key remapping when loading a base checkpoint into a PEFT-wrapped model.
-    # Maps bare base-model param names to PEFT-namespaced FQNs, e.g.:
-    #   "layers.0.self_attn.q_proj.weight" -> "base_model.model.layers.0.self_attn.q_proj.base_layer.weight"
-    # Keys not found in the map receive a plain "base_model.model." prefix.
-    is_peft_model = kwargs.get("is_peft_model", False)
-    adapter_path = kwargs.get("adapter_path", None)
-    if is_peft_model:
-        from ..lora.weight_loading import build_lora_key_overrides
-
-        lora_key_overrides = build_lora_key_overrides(model)
-
     converter = get_checkpoint_tensor_converter(model)
+    if converter is None and is_peft_model and hasattr(model, "get_base_model"):
+        converter = get_checkpoint_tensor_converter(model.get_base_model())
     state_dict_iterators = _load_state_dict(weights_path)
 
     def _dispatch_kv(name: str, tensor: "torch.Tensor") -> None:
@@ -379,8 +370,6 @@ def load_model_weights(
     ):
         for name, tensor in state_dict_iterator:
             name = _convert_weight_key(name, model)
-            if is_peft_model:
-                name = lora_key_overrides.get(name, "base_model.model." + name)
             converted = maybe_convert_checkpoint_tensor(name, tensor, converter)
             if converted is None:
                 continue
@@ -464,17 +453,9 @@ def rank0_load_and_broadcast_weights(
 
         lora_key_overrides = build_lora_key_overrides(model)
 
-    # Build LoRA key remapping when loading a base checkpoint into a PEFT-wrapped model.
-    # non-lora-layer: xxx.xxx -> base_model.model.xxx.xxx
-    # lora-layer: xxx.xxx.weight -> base_model.model.xxx.xxx.base_layer.weight
-    is_peft_model = kwargs.get("is_peft_model", False)
-    adapter_path = kwargs.get("adapter_path", None)
-    if is_peft_model:
-        from ..lora.weight_loading import build_lora_key_overrides
-
-        lora_key_overrides = build_lora_key_overrides(model)
-
     converter = get_checkpoint_tensor_converter(model)
+    if converter is None and is_peft_model and hasattr(model, "get_base_model"):
+        converter = get_checkpoint_tensor_converter(model.get_base_model())
     global_rank = get_parallel_state().global_rank
     torch_device = _get_communication_device(init_device)
 

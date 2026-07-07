@@ -216,7 +216,11 @@ def npu_fused_moe_forward(
     fc1_2_weight: torch.Tensor | None,
     fc2_weight: torch.Tensor,
     fc1_1_2_weight: torch.Tensor | None = None,
+    swiglu_limit: float | None = None,
 ):
+    if swiglu_limit is not None:
+        raise NotImplementedError("NPU fused MoE does not support swiglu_limit clamp semantics.")
+
     if get_parallel_state().ep_enabled:
         final_hidden_states = npu_ep_fused_moe_forward(
             num_experts,
