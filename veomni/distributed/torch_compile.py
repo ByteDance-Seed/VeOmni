@@ -14,7 +14,7 @@
 
 import types
 from dataclasses import dataclass
-from typing import Iterable, Optional, Tuple
+from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -28,57 +28,34 @@ logger = logging.get_logger(__name__)
 
 @dataclass
 class CompileConfig:
-    """Runtime options for compiling FSDP2 leaf module forwards."""
+    """Runtime options for compiling FSDP2 decoder blocks."""
 
     enable: bool = False
-    backend: Optional[str] = None
+    backend: Optional[str] = "inductor"
     mode: Optional[str] = "reduce-overhead"
-    fullgraph: bool = False
+    fullgraph: bool = True
     dynamic: bool = False
 
 
-def select_leaf_compile_modules(target_modules: Iterable[Tuple[str, nn.Module]]) -> list[Tuple[str, nn.Module]]:
-    """Keep only target modules that do not contain another target module.
+def _is_decoder_block(module: nn.Module) -> bool:
+    """A decoder block is identified by its class name ending in ``DecoderLayer``.
 
-    If both a parent and one of its children are FSDP targets, compiling the
-    parent forward can pull the child's FSDP collectives into the compiled
-    region. Leaf targets keep FSDP communication at module boundaries.
+    This intentionally excludes ViT / vision blocks (``VisionBlock``,
+    ``VLVisionBlock``, ``VisionEncoderLayer``, ``VLDecoderLayer``'s vision
+    siblings) and the LM head / embedding modules; only the transformer
+    decoder blocks of the language model are compiled.
     """
 
-    modules = list(target_modules)
-    parent_fqns = set()
-    for module_fqn, _ in modules:
-        if module_fqn == "":
-            continue
-        parts = module_fqn.split(".")
-        for idx in range(len(parts)):
-            parent_fqns.add(".".join(parts[:idx]))
-
-    leaf_modules = [(module_fqn, module) for module_fqn, module in modules if module_fqn not in parent_fqns]
-
-    skipped = len(modules) - len(leaf_modules)
-    if skipped:
-        logger.info_rank0(f"Skip compiling {skipped} non-leaf target modules to keep FSDP collectives outside.")
-    return leaf_modules
+    return type(module).__name__.endswith("DecoderLayer")
 
 
-def compile_module_forward(
-    module: nn.Module,
-    *,
-    module_fqn: str,
-    compile_config: CompileConfig,
-) -> bool:
-    """Compile one module's forward method in place.
+def compile_decoder_blocks(model: nn.Module, compile_config: CompileConfig) -> int:
+    """Compile forward of every decoder block inside ``model`` in place.
 
-    Compiling the forward method instead of wrapping the whole module preserves
-    module identity for FSDP2. FSDP's pre/post-forward all-gather and reshard
-    hooks therefore stay outside the compiled region, matching the per-block
-    direction discussed in https://github.com/ByteDance-Seed/VeOmni/issues/401.
+    Compiling the forward method (rather than wrapping the whole module)
+    preserves module identity for FSDP2 — pre/post-forward all-gather and
+    reshard hooks stay outside the compiled region.
     """
-
-    if getattr(module, "_veomni_forward_compiled", False):
-        logger.warning_rank0(f"Skip compiling {module_fqn}: forward is already compiled.")
-        return False
 
     if not hasattr(torch, "compile"):
         raise RuntimeError(
@@ -92,40 +69,34 @@ def compile_module_forward(
     if compile_config.backend is not None:
         compile_kwargs["backend"] = compile_config.backend
     if compile_config.mode is not None:
+        if compile_config.backend == "cudagraphs":
+            raise ValueError(
+                "train.torch_compile.mode is not accepted by the 'cudagraphs' backend. "
+                "Leave mode=None with backend='cudagraphs', or switch backend to 'inductor'."
+            )
         compile_kwargs["mode"] = compile_config.mode
 
-    original_forward = module.forward
-    if hasattr(original_forward, "__func__"):
-        module._veomni_original_forward = original_forward.__func__
-        compiled_forward = torch.compile(original_forward.__func__, **compile_kwargs)
-        module.forward = types.MethodType(compiled_forward, module)
-    else:
-        module._veomni_original_forward = original_forward
-        module.forward = torch.compile(original_forward, **compile_kwargs)
-    module._veomni_forward_compiled = True
-    module._veomni_compile_config = dict(compile_kwargs)
-    logger.info_rank0(f"Compiled forward for {module_fqn} with torch.compile({compile_kwargs}).")
-    return True
-
-
-def compile_module_forwards(
-    target_modules: Iterable[Tuple[str, nn.Module]],
-    compile_config: CompileConfig,
-) -> int:
     compiled = 0
-    seen_modules = set()
-    for module_fqn, module in target_modules:
-        if id(module) in seen_modules:
+    for fqn, module in model.named_modules():
+        if not _is_decoder_block(module):
             continue
-        seen_modules.add(id(module))
-        if compile_module_forward(
-            module,
-            module_fqn=module_fqn,
-            compile_config=compile_config,
-        ):
-            compiled += 1
+        if getattr(module, "_veomni_forward_compiled", False):
+            continue
 
-    logger.info_rank0(f"Compiled {compiled} module forwards with torch.compile.")
+        original_forward = module.forward
+        if hasattr(original_forward, "__func__"):
+            module._veomni_original_forward = original_forward.__func__
+            compiled_forward = torch.compile(original_forward.__func__, **compile_kwargs)
+            module.forward = types.MethodType(compiled_forward, module)
+        else:
+            module._veomni_original_forward = original_forward
+            module.forward = torch.compile(original_forward, **compile_kwargs)
+        module._veomni_forward_compiled = True
+        module._veomni_compile_config = dict(compile_kwargs)
+        logger.info_rank0(f"Compiled decoder block forward for {fqn} with torch.compile({compile_kwargs}).")
+        compiled += 1
+
+    logger.info_rank0(f"Compiled {compiled} decoder blocks with torch.compile.")
     return compiled
 
 

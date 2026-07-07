@@ -17,9 +17,8 @@ from veomni.arguments.arguments_types import (
 )
 from veomni.distributed.torch_compile import (
     CompileConfig,
-    compile_module_forwards,
+    compile_decoder_blocks,
     mark_compile_step_begin,
-    select_leaf_compile_modules,
 )
 
 
@@ -30,7 +29,7 @@ def _model_args() -> ModelArguments:
     )
 
 
-class ToyBlock(nn.Module):
+class ToyDecoderLayer(nn.Module):
     def __init__(self):
         super().__init__()
         self.proj = nn.Linear(4, 4)
@@ -39,7 +38,25 @@ class ToyBlock(nn.Module):
         return self.proj(x)
 
 
-def test_compile_module_forwards_replaces_forward(monkeypatch):
+class ToyVisionBlock(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.proj = nn.Linear(4, 4)
+
+    def forward(self, x):
+        return self.proj(x)
+
+
+class ToyModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.embed_tokens = nn.Embedding(8, 4)
+        self.layers = nn.ModuleList([ToyDecoderLayer(), ToyDecoderLayer()])
+        self.vision = ToyVisionBlock()
+        self.lm_head = nn.Linear(4, 8)
+
+
+def test_compile_decoder_blocks_compiles_only_decoder_layers(monkeypatch):
     calls = []
 
     def fake_compile(fn, **kwargs):
@@ -52,26 +69,67 @@ def test_compile_module_forwards_replaces_forward(monkeypatch):
 
     monkeypatch.setattr(torch, "compile", fake_compile)
 
-    block = ToyBlock()
-    compiled = compile_module_forwards(
-        [("layers.0", block)],
-        CompileConfig(backend="inductor", mode="reduce-overhead", fullgraph=False, dynamic=False),
+    model = ToyModel()
+    compiled = compile_decoder_blocks(
+        model,
+        CompileConfig(backend="inductor", mode="reduce-overhead", fullgraph=True, dynamic=False),
     )
 
-    assert compiled == 1
-    assert block._veomni_forward_compiled is True
-    assert block._veomni_original_forward is ToyBlock.forward
-    assert calls == [{"backend": "inductor", "mode": "reduce-overhead", "fullgraph": False, "dynamic": False}]
-    assert block(torch.ones(2, 4)).shape == (2, 4)
+    assert compiled == 2
+    for layer in model.layers:
+        assert layer._veomni_forward_compiled is True
+        assert layer._veomni_original_forward is ToyDecoderLayer.forward
+    assert not getattr(model.vision, "_veomni_forward_compiled", False)
+    assert not getattr(model.lm_head, "_veomni_forward_compiled", False)
+    assert not getattr(model.embed_tokens, "_veomni_forward_compiled", False)
+    assert calls == [{"fullgraph": True, "dynamic": False, "backend": "inductor", "mode": "reduce-overhead"}] * 2
+    assert model.layers[0](torch.ones(2, 4)).shape == (2, 4)
 
 
-def test_compile_module_forwards_skips_duplicate_module(monkeypatch):
+def test_compile_decoder_blocks_rejects_mode_with_cudagraphs_backend():
+    with pytest.raises(ValueError, match="'cudagraphs' backend"):
+        compile_decoder_blocks(
+            ToyModel(),
+            CompileConfig(backend="cudagraphs", mode="reduce-overhead"),
+        )
+
+
+def test_compile_decoder_blocks_accepts_cudagraphs_backend_without_mode(monkeypatch):
+    calls = []
+
+    def fake_compile(fn, **kwargs):
+        calls.append(kwargs)
+        return fn
+
+    monkeypatch.setattr(torch, "compile", fake_compile)
+
+    compile_decoder_blocks(
+        ToyModel(),
+        CompileConfig(backend="cudagraphs", mode=None, fullgraph=True, dynamic=False),
+    )
+    assert calls == [{"fullgraph": True, "dynamic": False, "backend": "cudagraphs"}] * 2
+
+
+def test_compile_decoder_blocks_skips_already_compiled(monkeypatch):
     monkeypatch.setattr(torch, "compile", lambda fn, **_: fn)
 
-    block = ToyBlock()
-    compiled = compile_module_forwards([("a", block), ("b", block)], CompileConfig())
+    model = ToyModel()
+    first = compile_decoder_blocks(model, CompileConfig())
+    second = compile_decoder_blocks(model, CompileConfig())
 
-    assert compiled == 1
+    assert first == 2
+    assert second == 0
+
+
+def test_compile_decoder_blocks_no_decoder_layers_returns_zero(monkeypatch):
+    monkeypatch.setattr(torch, "compile", lambda fn, **_: fn)
+
+    class NoDecoderModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.vision = ToyVisionBlock()
+
+    assert compile_decoder_blocks(NoDecoderModel(), CompileConfig()) == 0
 
 
 def test_mark_compile_step_begin_calls_torch_compiler_api(monkeypatch):
@@ -104,26 +162,13 @@ def test_mark_compile_step_begin_skips_without_torch_compiler(monkeypatch):
     mark_compile_step_begin(enable_compile=True)
 
 
-def test_select_leaf_compile_modules_skips_parent_targets():
-    parent = nn.Sequential(ToyBlock())
-    sibling = ToyBlock()
-
-    selected = select_leaf_compile_modules(
-        [
-            ("", nn.Sequential(parent, sibling)),
-            ("layers.0", parent),
-            ("layers.0.mlp", parent[0]),
-            ("layers.1", sibling),
-        ]
-    )
-
-    assert selected == [("layers.0.mlp", parent[0]), ("layers.1", sibling)]
-
-
-def test_select_leaf_compile_modules_keeps_root_when_it_is_only_target():
-    root = nn.Sequential(ToyBlock())
-
-    assert select_leaf_compile_modules([("", root)]) == [("", root)]
+def test_torch_compile_config_defaults():
+    cfg = ArgumentsTorchCompileConfig()
+    assert cfg.enable is False
+    assert cfg.backend == "inductor"
+    assert cfg.mode == "reduce-overhead"
+    assert cfg.fullgraph is True
+    assert cfg.dynamic is False
 
 
 def test_enable_compile_requires_dynamic_batching():
@@ -204,37 +249,3 @@ def test_enable_compile_accepts_text_data_argument_subclass():
     )
 
     assert args.train.pad_to_length == 16
-
-
-def test_enable_compile_legacy_alias_sets_compile_enable():
-    args = VeOmniArguments(
-        model=_model_args(),
-        data=DataArguments(train_path="dummy.jsonl", max_seq_len=8),
-        train=TrainingArguments(enable_compile=True, dyn_bsz=True, pad_to_length=True, micro_batch_size=2),
-    )
-
-    assert args.train.torch_compile.enable is True
-    assert args.train.pad_to_length == 16
-
-
-def test_enable_compile_legacy_option_aliases_set_torch_compile_config():
-    args = VeOmniArguments(
-        model=_model_args(),
-        data=DataArguments(train_path="dummy.jsonl", max_seq_len=8),
-        train=TrainingArguments(
-            enable_compile=True,
-            compile_backend="eager",
-            compile_mode="default",
-            compile_fullgraph=True,
-            compile_dynamic=True,
-            dyn_bsz=True,
-            pad_to_length=True,
-            micro_batch_size=2,
-        ),
-    )
-
-    assert args.train.torch_compile.enable is True
-    assert args.train.torch_compile.backend == "eager"
-    assert args.train.torch_compile.mode == "default"
-    assert args.train.torch_compile.fullgraph is True
-    assert args.train.torch_compile.dynamic is True

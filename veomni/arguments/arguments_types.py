@@ -441,15 +441,17 @@ class TorchCompileConfig:
         metadata={"help": "Enable per-block torch.compile for CUDA Graph friendly text training."},
     )
     backend: Optional[str] = field(
-        default=None,
-        metadata={"help": "Backend passed to torch.compile. None uses PyTorch's default backend."},
+        default="inductor",
+        metadata={"help": "Backend passed to torch.compile."},
     )
     mode: Optional[str] = field(
         default="reduce-overhead",
-        metadata={"help": "Mode passed to torch.compile. 'reduce-overhead' enables CUDA Graphs when possible."},
+        metadata={
+            "help": "Mode passed to torch.compile. 'reduce-overhead' enables CUDA Graphs on the inductor backend."
+        },
     )
     fullgraph: bool = field(
-        default=False,
+        default=True,
         metadata={"help": "Whether to pass fullgraph=True to torch.compile."},
     )
     dynamic: bool = field(
@@ -534,26 +536,6 @@ class TrainingArguments:
         default=42,
         metadata={"help": "Random seed."},
     )
-    enable_compile: bool = field(
-        default=False,
-        metadata={"help": "Deprecated alias for train.torch_compile.enable."},
-    )
-    compile_backend: Optional[str] = field(
-        default=None,
-        metadata={"help": "Deprecated alias for train.torch_compile.backend."},
-    )
-    compile_mode: Optional[str] = field(
-        default=None,
-        metadata={"help": "Deprecated alias for train.torch_compile.mode."},
-    )
-    compile_fullgraph: Optional[bool] = field(
-        default=None,
-        metadata={"help": "Deprecated alias for train.torch_compile.fullgraph."},
-    )
-    compile_dynamic: Optional[bool] = field(
-        default=None,
-        metadata={"help": "Deprecated alias for train.torch_compile.dynamic."},
-    )
     max_steps: Optional[int] = field(
         default=None,
         metadata={"help": "Max training steps per epoch. (for debug)"},
@@ -583,22 +565,6 @@ class TrainingArguments:
         self.local_rank = int(os.getenv("LOCAL_RANK", 0))
         self.global_rank = int(os.getenv("RANK", 0))
         self.world_size = int(os.getenv("WORLD_SIZE", 1))
-
-        deprecated_compile_fields = {
-            "enable": self.enable_compile,
-            "backend": self.compile_backend,
-            "mode": self.compile_mode,
-            "fullgraph": self.compile_fullgraph,
-            "dynamic": self.compile_dynamic,
-        }
-        for field_name, value in deprecated_compile_fields.items():
-            if value is not None and value is not False:
-                logger.warning_rank0(
-                    f"train.compile_{field_name} is deprecated; use train.torch_compile.{field_name} instead."
-                    if field_name != "enable"
-                    else "train.enable_compile is deprecated; use train.torch_compile.enable instead."
-                )
-                setattr(self.torch_compile, field_name, value)
 
         self._validate_accelerator()
         self._derive_batch_config()

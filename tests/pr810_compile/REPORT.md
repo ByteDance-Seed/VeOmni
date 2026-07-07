@@ -8,10 +8,10 @@ scripts were used during validation but are intentionally not committed here.
 
 The tested change adds:
 
-- `train.torch_compile.{enable,backend,mode,fullgraph,dynamic}`.
-- Deprecated compatibility aliases under `train.enable_compile` and
-  `train.compile_*`.
-- FSDP2 leaf-target module forward compilation before `fully_shard()`.
+- `train.torch_compile.{enable,backend,mode,fullgraph,dynamic}` (defaults:
+  `backend="inductor"`, `mode="reduce-overhead"`, `fullgraph=True`; `mode` must
+  be `None` when `backend="cudagraphs"`).
+- FSDP2 decoder-block forward compilation before `fully_shard()`.
 - A per-step `torch.compiler.cudagraph_mark_step_begin()` call when CUDA graph
   compile support is active.
 - Guards that currently restrict the feature to CUDA + FSDP2 text training with
@@ -27,11 +27,11 @@ synthetic text dataset to avoid external model or data downloads.
 
 | Area | Result |
 | --- | --- |
-| Unit tests for `veomni.distributed.torch_compile` and argument guards | Passed: 14/14 |
+| Unit tests for `veomni.distributed.torch_compile` and argument guards | Passed |
 | Argument guard: compile enabled without `pad_to_length` | Raised the expected `ValueError` |
-| Deprecated aliases: `train.enable_compile` / `train.compile_*` | Mapped to `train.torch_compile.*` with warnings |
+| Decoder-only compilation | Compiled only `*DecoderLayer` blocks; skipped ViT / LM head |
 | 2-GPU FSDP2 baseline training | Completed; loss decreased normally |
-| 2-GPU FSDP2 training with compile enabled | Completed; compiled the two toy decoder layers |
+| 2-GPU FSDP2 training with compile enabled | Completed; compiled the toy decoder layers |
 | CUDA graph profiling signal | `cudaGraphLaunch` appeared only in the compile run |
 
 ## Functional Results
@@ -45,19 +45,17 @@ synthetic text dataset to avoid external model or data downloads.
 The unit tests covered:
 
 - In-place forward compilation without changing module identity.
-- Duplicate module de-duplication.
-- Leaf-target selection when parent and child FSDP targets both exist.
+- Decoder-block-only selection (`*DecoderLayer` classes) — ViT / LM head are skipped.
+- Re-entry into `compile_decoder_blocks` on an already-compiled model is a no-op.
 - CUDA-only `cudagraph_mark_step_begin()` behavior.
 - Argument validation for dynamic batching and static padding.
-- Deprecated alias compatibility.
 - Rejection of multimodal-style data argument classes.
 
 ### End-to-end FSDP2 training
 
 A 2-layer Qwen3 toy model was trained with 2-GPU FSDP2 in both baseline and
-compile-enabled modes. In the compile-enabled run, VeOmni logged that two module
-forwards were compiled, corresponding to the two decoder layers selected as
-FSDP2 leaf target modules.
+compile-enabled modes. In the compile-enabled run, VeOmni logged that two
+decoder-block forwards were compiled.
 
 Observed behavior:
 
@@ -107,6 +105,6 @@ loss and memory behavior aligned with baseline.
 ## Conclusion
 
 The feature passed unit tests, argument-guard checks, and GPU end-to-end FSDP2
-training validation. The compile path successfully compiled FSDP2 leaf target
-module forwards and produced CUDA Graph launch activity in profiling, while
+training validation. The compile path successfully compiled decoder-block
+forwards and produced CUDA Graph launch activity in profiling, while
 maintaining loss and memory parity with the non-compile baseline.

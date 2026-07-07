@@ -32,7 +32,7 @@ from ..utils import logging
 from ..utils.device import IS_NPU_AVAILABLE, get_device_type
 from .checkpoint import CheckpointFunction
 from .parallel_state import get_parallel_state
-from .torch_compile import CompileConfig, compile_module_forwards, select_leaf_compile_modules
+from .torch_compile import CompileConfig, compile_decoder_blocks
 from .utils import sort_fqn_by_submodule_first
 
 
@@ -206,9 +206,9 @@ def parallelize_model_fsdp2(
                 "communication may be captured inside compiled blocks."
             )
 
-        compiled_count = compile_module_forwards(select_leaf_compile_modules(target_modules), compile_config)
+        compiled_count = compile_decoder_blocks(model, compile_config)
         if compiled_count == 0:
-            raise RuntimeError("train.torch_compile.enable did not compile any FSDP target modules.")
+            raise RuntimeError("train.torch_compile.enable found no decoder blocks to compile.")
         model._veomni_compile_enabled = True
 
     # Step 2: Update fsdp2 kwargs
