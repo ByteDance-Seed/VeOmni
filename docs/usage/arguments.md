@@ -221,6 +221,7 @@ NPU validation runs at two times:
 | bsz_warmup_init_mbtoken | `int` | `200` | Initial number of tokens in a batch during warmup. |
 | init_device | `Literal["cpu", "cuda", "meta", "npu"]` | `"meta"` | Device for model weight initialization. `"meta"` is required for FSDP2. |
 | broadcast_model_weights_from_rank0 | `bool` | `True` | Only rank 0 reads weights from disk; other ranks receive via broadcast. |
+| ep_sharded_stream_load | `bool` | `False` | Opt-in fast/low-memory MoE loader: each rank reads only its ExtraParallel dim-0 slice from the checkpoint. Requires `broadcast_model_weights_from_rank0=False` and a model with an ExtraParallel parallel_plan. |
 | enable_full_determinism | `bool` | `False` | Enable full determinism (bitwise alignment). |
 | enable_batch_invariant_mode | `bool` | `False` | Enable batch invariant mode. |
 | empty_cache_steps | `int` | `500` | Steps between two `torch.cuda.empty_cache()` calls. |

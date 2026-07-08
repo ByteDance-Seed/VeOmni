@@ -436,34 +436,27 @@ def parallelize_model_fsdp2(
             )
         else:
             _dt_local_split = partial(distribute_tensor, src_data_rank=None)
-            # Opt-in fast/low-memory path for large MoE checkpoints: each rank reads
-            # only its ExtraParallel dim-0 slice of the expert tensors straight from
-            # the checkpoint (see ``load_model_weights_ep_sharded``). Only valid on the
-            # every-rank-reads (non-broadcast) path; unsupported model/checkpoint raises
-            # ``NotImplementedError`` and we fall back to the whole-tensor loader.
-            loaded_ep_sharded = False
             if kwargs.get("ep_sharded_stream_load"):
+                # Opt-in fast/low-memory path for large MoE checkpoints: each rank
+                # reads only its ExtraParallel dim-0 slice of the expert tensors
+                # straight from the checkpoint (see ``load_model_weights_ep_sharded``).
+                # Only valid on the every-rank-reads (non-broadcast) path. An
+                # unsupported model/checkpoint raises ``NotImplementedError``, which we
+                # surface directly rather than silently falling back -- an opt-in flag
+                # that quietly degrades is hard to reason about, so fail early instead.
                 logger.info_rank0(
                     "Loading model weights via per-rank ExtraParallel-slice streaming (ep_sharded_stream_load)..."
                 )
-                try:
-                    load_model_weights_ep_sharded(
-                        model,
-                        weights_path,
-                        materialize_device,
-                        dtensor_factory=_dt_local_split,
-                        is_peft_model=is_peft_model,
-                        adapter_path=adapter_path,
-                        fqn_to_index_mapping=fqn_to_index_mapping,
-                    )
-                    loaded_ep_sharded = True
-                except NotImplementedError as e:
-                    logger.warning_rank0(
-                        f"ep_sharded_stream_load unsupported for this model/checkpoint ({e}); "
-                        "falling back to load_model_weights."
-                    )
-
-            if not loaded_ep_sharded:
+                load_model_weights_ep_sharded(
+                    model,
+                    weights_path,
+                    materialize_device,
+                    dtensor_factory=_dt_local_split,
+                    is_peft_model=is_peft_model,
+                    adapter_path=adapter_path,
+                    fqn_to_index_mapping=fqn_to_index_mapping,
+                )
+            else:
                 logger.info_rank0("Every rank would read weights from disk and expect this to be slow!")
                 load_model_weights(
                     model,

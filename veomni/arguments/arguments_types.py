@@ -503,6 +503,12 @@ class TrainingArguments:
             "help": "When enabled, only rank0 reads model weights from HuggingFace safetensor from disk. Other ranks would receive weights through broadcast. This helps to avoid disk I/O bottleneck."
         },
     )
+    ep_sharded_stream_load: bool = field(
+        default=False,
+        metadata={
+            "help": "Opt-in fast/low-memory weight loader for large MoE checkpoints: each rank reads only its ExtraParallel dim-0 slice of the expert tensors straight from the checkpoint. Requires the every-rank-reads path (`broadcast_model_weights_from_rank0=False`) and a model with an ExtraParallel parallel_plan; unsupported model/checkpoint combinations raise `NotImplementedError`."
+        },
+    )
     enable_full_determinism: bool = field(
         default=False,
         metadata={"help": "Enable full determinism."},
@@ -631,6 +637,14 @@ class TrainingArguments:
                     "used with train.accelerator.fsdp_config.fsdp_mode='fsdp2'. "
                     f"Received fsdp_mode={acc.fsdp_config.fsdp_mode!r}. Disable this flag or switch to fsdp2.",
                 )
+
+        # ep_sharded_stream_load only runs on the every-rank-reads path, so it is
+        # mutually exclusive with broadcast_model_weights_from_rank0. Fail early
+        # instead of silently ignoring the flag.
+        assert not (self.ep_sharded_stream_load and self.broadcast_model_weights_from_rank0), (
+            "train.ep_sharded_stream_load requires train.broadcast_model_weights_from_rank0=False "
+            "(it reads each rank's ExtraParallel slice directly and cannot run on the broadcast path)."
+        )
 
     def _derive_batch_config(self):
         acc = self.accelerator

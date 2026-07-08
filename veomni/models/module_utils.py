@@ -456,8 +456,7 @@ def load_model_weights_ep_sharded(
     ``[E/ep, ...]`` with ``parallel_plan=None`` so it is not sliced again, then
     the FSDP ``dtensor_factory`` shards it over the ``ep_fsdp`` sub-mesh.
 
-    Raises ``NotImplementedError`` (so the caller may fall back to
-    :func:`load_model_weights`) when the checkpoint/model is unsupported: PEFT,
+    Raises ``NotImplementedError`` when the checkpoint/model is unsupported: PEFT,
     no ExtraParallel ``get_parallel_plan``, or a checkpoint-tensor converter whose
     transform is not a pure dim-0 zero-pad (a fusion converter needs the whole
     tensor set). A converter that only zero-pads dim-0 stays streamable -- each
