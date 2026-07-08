@@ -346,6 +346,7 @@ class TestGlobalStepInflation:
                     save_async=False,
                     load_path=None,
                     manager="dcp",
+                    dcp_save_to_lowest_rank=False,
                 ),
                 accelerator=SimpleNamespace(fsdp_config=SimpleNamespace(fsdp_mode="fsdp2")),
                 global_rank=0,
