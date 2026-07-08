@@ -164,7 +164,7 @@ pip install triton-ascend==3.2.1 --extra-index-url=https://triton-ascend.osinfra
 ```
 
 See the [triton-ascend quick-start](https://github.com/triton-lang/triton-ascend/blob/main/docs/zh/quick_start.md)
-for prerequisites (CANN 9.0.0, `torch_npu` 2.7.1) and troubleshooting.
+for prerequisites (CANN 9.0.0, `torch_npu` 2.9.0) and troubleshooting.
 
 > **arch35 limitation:** the vendored `causal_conv1d` refuses to run on arch35 NPUs
 > (`Ascend910_95` / `Ascend950`) — its `is_arch35()` guard raises `NotImplementedError`
