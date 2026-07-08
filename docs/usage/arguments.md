@@ -354,6 +354,7 @@ NPU validation runs at two times:
 | output_dir | `str` | `"output"` | Path to save model checkpoints. |
 | manager | `str` | `"dcp"` | Checkpoint manager. |
 | save_async | `bool` | `False` | Save checkpoints asynchronously. |
+| dcp_save_to_lowest_rank | `bool` | `False` | Write each replicated DCP shard from the lowest global rank that holds it instead of load-balancing across replicas. On a non-shared filesystem this concentrates the deduplicated copy onto the lowest-ranked replica group rather than scattering it across replicas; in the standard HSDP layout (shard within a node, replicate across nodes) that group is one node, which then holds a complete checkpoint. Only affects replicated data — unique expert/tensor/pipeline-parallel shards stay distributed. Leave `False` when `output_dir` is shared. |
 | load_path | `Optional[str]` | `None` | Path to checkpoint for resuming training. Use `"auto"` for auto-detection. |
 | save_steps | `int` | `0` | Steps between checkpoint saves. `0` to disable. |
 | save_epochs | `int` | `1` | Epochs between checkpoint saves. `0` to disable. |

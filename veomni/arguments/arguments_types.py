@@ -406,6 +406,23 @@ class CheckpointConfig:
         default=False,
         metadata={"help": "Whether to save checkpoint asynchronously."},
     )
+    dcp_save_to_lowest_rank: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Route each replicated DCP shard to the lowest global rank that holds it, instead "
+                "of load-balancing writes across all replica holders. Useful on a non-shared "
+                "filesystem (each node writes to local disk): it concentrates the deduplicated copy "
+                "onto the lowest-ranked replica group instead of scattering writes across all "
+                "replicas. In the standard HSDP layout (FSDP shard within a node, replication "
+                "across nodes) that lowest replica group lives on one node, so that node holds a "
+                "complete checkpoint. Only affects replicated data (the FSDP/HSDP replicate dim); "
+                "unique expert/tensor/pipeline-parallel shards are never deduplicated and stay "
+                "distributed. Trades write parallelism for locality, so leave False when output_dir "
+                "is shared."
+            )
+        },
+    )
     load_path: Optional[str] = field(
         default=None,
         metadata={"help": "Path to checkpoint to resume from."},

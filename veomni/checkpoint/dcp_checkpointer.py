@@ -27,7 +27,7 @@ from torch.distributed.checkpoint import (
     FileSystemWriter,
     load,
 )
-from torch.distributed.checkpoint.default_planner import DefaultLoadPlanner
+from torch.distributed.checkpoint.default_planner import DefaultLoadPlanner, DefaultSavePlanner
 from torch.distributed.checkpoint.metadata import STATE_DICT_TYPE, Metadata
 from torch.distributed.checkpoint.state_dict import (
     StateDictOptions,
@@ -404,6 +404,7 @@ class DistributedCheckpointer(CheckpointerBase):
         global_steps: int = None,
         storage_writer: Optional[FileSystemWriter] = None,
         trainable_only: bool = False,
+        save_to_lowest_rank: bool = False,
     ) -> None:
         """
         save training state to distributed checkpoint
@@ -420,6 +421,15 @@ class DistributedCheckpointer(CheckpointerBase):
                 state is already trainable-only by construction (the optimizer is built
                 from ``filter(lambda p: p.requires_grad, ...)``), so this flag only
                 affects the model state dump.
+            save_to_lowest_rank: forwarded to the DCP ``DefaultSavePlanner``. When True, each
+                replicated shard is written by the lowest global rank that holds it, instead of
+                being load-balanced across all replica holders. On a non-shared filesystem this
+                concentrates the (already deduplicated) copy onto the lowest-ranked replica group
+                instead of scattering it across replicas; in the standard HSDP layout (shard within
+                a node, replicate across nodes) that group is one node, which then holds a complete
+                checkpoint. Note this only consolidates *replicated* data: unique shards from
+                expert/tensor/pipeline parallelism are never deduplicated and remain distributed.
+                See ``CheckpointConfig.dcp_save_to_lowest_rank``.
         return:
             None
         """
@@ -439,7 +449,12 @@ class DistributedCheckpointer(CheckpointerBase):
         if storage_writer is None:
             storage_writer = cls._create_storage_writer(checkpoint_dir)
 
-        cls.execute_save(save_state=save_state, storage_writer=storage_writer, save_async=save_async)
+        cls.execute_save(
+            save_state=save_state,
+            storage_writer=storage_writer,
+            save_async=save_async,
+            save_to_lowest_rank=save_to_lowest_rank,
+        )
 
         logger.info_rank0(f"Saved checkpoint to {checkpoint_dir}")
 
@@ -528,8 +543,14 @@ class DistributedCheckpointer(CheckpointerBase):
         save_state: Dict[str, Any],
         storage_writer: FileSystemWriter,
         save_async: bool,
+        save_to_lowest_rank: bool = False,
     ) -> None:
-        """Execute DCP save with optional async support."""
+        """Execute DCP save with optional async support.
+
+        ``save_to_lowest_rank`` is forwarded to ``DefaultSavePlanner``; the default
+        (False) preserves DCP's load-balanced write assignment across replica holders.
+        """
+        planner = DefaultSavePlanner(dedup_save_to_lowest_rank=save_to_lowest_rank)
         if save_async:
             # Lazily create a dedicated Gloo process group for async DCP saves
             if cls._async_process_group is None:
@@ -541,11 +562,13 @@ class DistributedCheckpointer(CheckpointerBase):
                 state_dict=save_state,
                 storage_writer=storage_writer,
                 process_group=cls._async_process_group,
+                planner=planner,
             )
         else:
             dcp.save(
                 state_dict=save_state,
                 storage_writer=storage_writer,
+                planner=planner,
             )
             if dist.is_initialized():
                 dist.barrier()
