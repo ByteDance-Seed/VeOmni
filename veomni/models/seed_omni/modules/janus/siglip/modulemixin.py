@@ -31,8 +31,8 @@ class JanusSiglipCPUPreprocessor(CPUPreprocessor):
     Holds only the (picklable) HF image processor + a CPU zero-pixel template —
     never the model. Runs the same normalize as ``_pixels_from_raw_images`` but on
     **CPU** (bf16, to halve worker→main IPC); writes the pixel tensor back into
-    each ``user``-image item. When a micro-batch has **no** user image, appends a
-    ``role="dummy"`` placeholder per sample carrying the zero pixels, so the GPU
+    each ``user``-image item. For each sample without a user image, appends a
+    ``role="dummy"`` placeholder carrying the zero pixels, so the GPU
     forward never builds dummy inputs (the FSDP gradient anchor still runs there).
     """
 
@@ -45,22 +45,19 @@ class JanusSiglipCPUPreprocessor(CPUPreprocessor):
         self, conversation_list: list[list[ConversationItem]], inference: bool = False, **kwargs: Any
     ) -> None:
         del kwargs  # generation_kwargs unused: prep is kwarg-independent
-        image_items = list(iter_desired_items(conversation_list, types=["image"], roles=["user"]))
-        if image_items:
-            # Real user images present → normalize them; no dummy needed. Tag with
-            # the module source so forward_pre/post can pick up real images and
-            # dummies uniformly (single ``source == _SOURCE`` filter).
-            pixel_values = self._image_processor(images=[it.value for it in image_items], return_tensors="pt")[
-                "pixel_values"
-            ]
-            for it, px in zip(image_items, pixel_values, strict=True):
-                it.value = px.to(dtype=self._dtype)
-                it.source = _SOURCE
-        elif not inference:
-            # Training only: a sample with no user image still must run the ViT
-            # (FSDP gradient anchor), so inject a dummy. Inference skips it — a
-            # text-only request just leaves ``generate`` nothing to encode.
-            for sample in conversation_list:
+        for sample in conversation_list:
+            sample_image_items = list(iter_desired_items([sample], types=["image"], roles=["user"]))
+            if sample_image_items:
+                # Real user images present → normalize them; no dummy needed. Tag with
+                # the module source so forward_pre/post can pick up real images and
+                # dummies uniformly (single ``source == _SOURCE`` filter).
+                pixel_values = self._image_processor(
+                    images=[it.value for it in sample_image_items], return_tensors="pt"
+                )["pixel_values"]
+                for it, px in zip(sample_image_items, pixel_values, strict=True):
+                    it.value = px.to(dtype=self._dtype)
+                    it.source = _SOURCE
+            elif not inference:
                 sample.append(
                     ConversationItem(
                         type="image",

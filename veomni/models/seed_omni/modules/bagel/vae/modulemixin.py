@@ -23,9 +23,17 @@ BAGEL_VAE_PIXEL_SHAPE = "bagel_vae_pixel_shape"
 class BagelVAECPUPreprocessor(CPUPreprocessor):
     """Worker-side image normalize for BAGEL VAE context/target images."""
 
-    def __init__(self, image_processor: Any, dtype: torch.dtype) -> None:
+    def __init__(
+        self,
+        image_processor: Any,
+        dtype: torch.dtype,
+        dummy_pixel_values: torch.Tensor,
+        dummy_pixel_shape: torch.Tensor,
+    ) -> None:
         self._image_processor = image_processor
         self._dtype = dtype
+        self._dummy_pixel_values = dummy_pixel_values
+        self._dummy_pixel_shape = dummy_pixel_shape
 
     def __call__(
         self,
@@ -37,20 +45,51 @@ class BagelVAECPUPreprocessor(CPUPreprocessor):
         infer_type = None if generation_kwargs is None else generation_kwargs.get("infer_type")
         route_image_sources(conversation_list, inference=inference, infer_type=infer_type)
 
-        image_items = []
-        for item in iter_desired_items(conversation_list, types=["image"], sources=[BAGEL_VAE_CONTEXT]):
-            if not is_dummy(item):
-                image_items.append(item)
-        if not image_items:
+        image_items: list[ConversationItem] = []
+        missing_samples: list[list[ConversationItem]] = []
+        for sample in conversation_list:
+            sample_image_items = list(iter_desired_items([sample], types=["image"], sources=[BAGEL_VAE_CONTEXT]))
+            if sample_image_items:
+                image_items.extend(sample_image_items)
+            elif not inference:
+                missing_samples.append(sample)
+
+        if image_items:
+            inputs = self._image_processor(
+                images=[item.value for item in image_items], return_tensors="pt", dtype=self._dtype
+            )
+            for item, pixels, pixel_shape in zip(
+                image_items, inputs["pixel_values"], inputs["pixel_shapes"], strict=True
+            ):
+                item.value = pixels.to(dtype=self._dtype)
+                item.source = BAGEL_VAE_CONTEXT
+                item.meta[BAGEL_VAE_PIXEL_SHAPE] = pixel_shape.to(dtype=torch.long)
+
+        if not missing_samples:
             return
 
-        inputs = self._image_processor(
-            images=[item.value for item in image_items], return_tensors="pt", dtype=self._dtype
-        )
-        for item, pixels, pixel_shape in zip(image_items, inputs["pixel_values"], inputs["pixel_shapes"], strict=True):
-            item.value = pixels.to(dtype=self._dtype)
-            item.source = BAGEL_VAE_CONTEXT
-            item.meta[BAGEL_VAE_PIXEL_SHAPE] = pixel_shape.to(dtype=torch.long)
+        if image_items:
+            # VAE encode stacks every context item in the micro-batch, so dummies must
+            # match a real processed image shape whenever the batch has one.
+            reference_item = image_items[0]
+            dummy_pixel_values = torch.zeros_like(reference_item.value, dtype=self._dtype)
+            dummy_pixel_shape = reference_item.meta[BAGEL_VAE_PIXEL_SHAPE].to(dtype=torch.long)
+        else:
+            dummy_pixel_values = self._dummy_pixel_values.to(dtype=self._dtype)
+            dummy_pixel_shape = self._dummy_pixel_shape.to(dtype=torch.long)
+
+        for sample in missing_samples:
+            sample.append(
+                ConversationItem(
+                    type="image",
+                    value=dummy_pixel_values.clone(),
+                    role="dummy",
+                    source=BAGEL_VAE_CONTEXT,
+                    meta={
+                        BAGEL_VAE_PIXEL_SHAPE: dummy_pixel_shape.clone(),
+                    },
+                )
+            )
 
 
 class BagelVAEModuleMixin(OfflineEncodingMixin, ModuleMixin):
@@ -61,9 +100,6 @@ class BagelVAEModuleMixin(OfflineEncodingMixin, ModuleMixin):
     def init_omni_state(self) -> None:
         self._conversation_carrier: list[list[ConversationItem]] | None = None
         self._encode_items: list[ConversationItem] = []
-        self._decode_items: list[ConversationItem] = []
-        self._encode_is_dummy = False
-        self._decode_is_dummy = False
 
     def build_cpu_preprocessor(self) -> CPUPreprocessor | None:
         # Full training and offline-cache production preprocess raw images here;
@@ -72,7 +108,10 @@ class BagelVAEModuleMixin(OfflineEncodingMixin, ModuleMixin):
             return None
         if getattr(self, "_image_processor", None) is None:
             return None
-        return BagelVAECPUPreprocessor(self._image_processor, self.dtype)
+        size = max(int(self.config.image_stride), int(self.config.downsample))
+        dummy = torch.zeros(int(self.config.in_channels), size, size, dtype=self.dtype)
+        dummy_shape = torch.tensor([size, size], dtype=torch.long)
+        return BagelVAECPUPreprocessor(self._image_processor, self.dtype, dummy, dummy_shape)
 
     # ── Graph Entrypoints ──────────────────────────────────
 
@@ -149,13 +188,8 @@ class BagelVAEModuleMixin(OfflineEncodingMixin, ModuleMixin):
     ) -> dict[str, Any]:
         del kwargs
         self._conversation_carrier = conversation_list
-        self._encode_is_dummy = False
 
-        self._encode_items = self._select_vae_encode_items(conversation_list)
-        if not self._encode_items:
-            self._encode_is_dummy = True
-            return self.dummy_inputs(kind="encode")
-
+        self._encode_items = self._select_vae_context_items(conversation_list)
         pixel_values = torch.stack([item.value for item in self._encode_items], dim=0).to(
             device=self.device, dtype=self.dtype, non_blocking=True
         )
@@ -165,27 +199,8 @@ class BagelVAEModuleMixin(OfflineEncodingMixin, ModuleMixin):
     def encode_post(self, latents: torch.Tensor | list[torch.Tensor]) -> dict[str, Any]:
         conversation = self._conversation_carrier
         encode_items = self._encode_items
-        encode_is_dummy = self._encode_is_dummy
         self._conversation_carrier = None
         self._encode_items = []
-        self._encode_is_dummy = False
-
-        if encode_is_dummy:
-            if conversation is not None:
-                if isinstance(latents, list):
-                    latents = latents[0]
-                value = latents.squeeze(0) if latents.dim() == 4 and latents.shape[0] == 1 else latents
-                for sample in conversation:
-                    sample.append(
-                        ConversationItem(
-                            type="image",
-                            value=value,
-                            role="dummy",
-                            source=BAGEL_VAE_CONTEXT,
-                            meta={"source": "bagel_vae"},
-                        )
-                    )
-            return {"conversation_list": conversation}
 
         if isinstance(latents, list):
             for item, latent in zip(encode_items, latents, strict=True):
@@ -208,13 +223,8 @@ class BagelVAEModuleMixin(OfflineEncodingMixin, ModuleMixin):
     def offline_encode_post(self, encoded_cache: torch.Tensor) -> dict[str, Any]:
         conversation = self._conversation_carrier
         encode_items = self._encode_items
-        encode_is_dummy = self._encode_is_dummy
         self._conversation_carrier = None
         self._encode_items = []
-        self._encode_is_dummy = False
-
-        if encode_is_dummy:
-            return {"conversation_list": conversation}
 
         for item, cache_tensor in zip(encode_items, encoded_cache, strict=True):
             item.type = "image"
@@ -240,13 +250,8 @@ class BagelVAEModuleMixin(OfflineEncodingMixin, ModuleMixin):
         del kwargs
         self._conversation_carrier = conversation_list
         self._encode_items = []
-        self._encode_is_dummy = False
 
-        self._encode_items = self._select_vae_posterior_cache_items(conversation_list)
-        if not self._encode_items:
-            self._encode_is_dummy = True
-            return self.dummy_inputs(kind="online_process")
-
+        self._encode_items = self._select_vae_context_items(conversation_list)
         encoded_cache: list[torch.Tensor] = []
         for item in self._encode_items:
             cache = item.value
@@ -255,110 +260,15 @@ class BagelVAEModuleMixin(OfflineEncodingMixin, ModuleMixin):
             encoded_cache.append(cache.detach().to(device=self._online_process_device()))
         return {"encoded_cache": encoded_cache}
 
-    @pre_forward("decode")
-    def decode_pre(
-        self,
-        conversation_list: list[list[ConversationItem]] | None = None,
-        **kwargs: Any,
-    ) -> dict[str, Any]:
-        del kwargs
-        self._conversation_carrier = conversation_list
-        self._decode_items = []
-        self._decode_is_dummy = False
-
-        self._decode_items = self._select_vae_decode_items(conversation_list)
-        if not self._decode_items:
-            self._decode_is_dummy = True
-            return self.dummy_inputs(kind="decode")
-
-        latents = []
-        for item in self._decode_items:
-            latents.append(
-                item.value.detach().squeeze(0)
-                if item.value.dim() == 4 and item.value.shape[0] == 1
-                else item.value.detach()
-            )
-        return {"latents": torch.stack(latents, dim=0).to(device=self.device, dtype=self.dtype)}
-
-    @post_forward("decode")
-    def decode_post(self, pixel_values: torch.Tensor) -> dict[str, Any]:
-        conversation = self._conversation_carrier
-        decode_items = self._decode_items
-        decode_is_dummy = self._decode_is_dummy
-        self._conversation_carrier = None
-        self._decode_items = []
-        self._decode_is_dummy = False
-
-        if decode_is_dummy:
-            return {"conversation_list": conversation}
-
-        for item, image in zip(decode_items, pixel_values, strict=True):
-            item.type = "image"
-            item.value = image.to(device=self.device, dtype=self.dtype)
-        return {"conversation_list": conversation}
-
-    # ── Dummy helpers ──────────────────────────────────
-
-    def dummy_inputs(self, kind: str = "encode") -> dict[str, Any]:
-        if kind == "decode":
-            size = max(1, int(self.config.resolution) // max(int(self.config.downsample), 1))
-            return {
-                "latents": torch.zeros(
-                    1, int(self.config.z_channels), size, size, device=self.device, dtype=self.dtype
-                )
-            }
-
-        if kind == "online_process":
-            size = max(1, int(self.config.resolution) // max(int(self.config.downsample), 1))
-            return {
-                "encoded_cache": torch.zeros(
-                    1,
-                    2,
-                    int(self.config.z_channels),
-                    size,
-                    size,
-                    device=self._online_process_device(),
-                    dtype=self._online_process_dtype(),
-                ),
-            }
-
-        size = max(int(self.config.image_stride), int(self.config.downsample))
-        return {
-            "pixel_values": torch.zeros(
-                1, int(self.config.in_channels), size, size, device=self.device, dtype=self.dtype
-            )
-        }
-
     # ── Internal helpers ──────────────────────────────────
 
-    def _select_vae_encode_items(
+    def _select_vae_context_items(
         self, conversation_list: list[list[ConversationItem]] | None
     ) -> list[ConversationItem]:
         if conversation_list is None:
-            raise ValueError("BagelVAE encode requires conversation_list to select image items.")
+            raise ValueError("BagelVAE requires conversation_list to select VAE context items.")
 
-        encode_items: list[ConversationItem] = []
-        for item in iter_desired_items(conversation_list, types=["image"], sources=[BAGEL_VAE_CONTEXT]):
-            if not is_dummy(item):
-                encode_items.append(item)
-        return encode_items
-
-    def _select_vae_posterior_cache_items(
-        self, conversation_list: list[list[ConversationItem]] | None
-    ) -> list[ConversationItem]:
-        if conversation_list is None:
-            raise ValueError("BagelVAE online_process requires conversation_list to select posterior cache items.")
-
-        cached_items: list[ConversationItem] = []
-        for item in iter_desired_items(
-            conversation_list,
-            types=["image"],
-            sources=[BAGEL_VAE_CONTEXT],
-        ):
-            if is_dummy(item):
-                continue
-            cached_items.append(item)
-        return cached_items
+        return list(iter_desired_items(conversation_list, types=["image"], sources=[BAGEL_VAE_CONTEXT]))
 
     def _select_vae_decode_items(
         self, conversation_list: list[list[ConversationItem]] | None

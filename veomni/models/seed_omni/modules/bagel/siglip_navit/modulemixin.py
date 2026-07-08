@@ -20,9 +20,10 @@ _OMNI_TOKEN_LEN = "bagel_siglip_navit_token_len"
 class BagelSiglipNavitCPUPreprocessor(CPUPreprocessor):
     """Worker-side image patchify for BAGEL SigLIP NaViT context images."""
 
-    def __init__(self, image_processor: Any, dtype: torch.dtype) -> None:
+    def __init__(self, image_processor: Any, dtype: torch.dtype, dummy_pixel_values: torch.Tensor) -> None:
         self._image_processor = image_processor
         self._dtype = dtype
+        self._dummy_pixel_values = dummy_pixel_values
 
     def __call__(
         self,
@@ -31,10 +32,26 @@ class BagelSiglipNavitCPUPreprocessor(CPUPreprocessor):
         inference: bool = False,
         generation_kwargs: dict[str, Any] | None = None,
     ) -> None:
-        del inference, generation_kwargs
+        del generation_kwargs
+
         image_items: list[ConversationItem] = []
-        for item in iter_desired_items(conversation_list, types=["image"], sources=[BAGEL_SIGLIP_CONTEXT]):
-            image_items.append(item)
+        for sample in conversation_list:
+            sample_image_items = list(iter_desired_items([sample], types=["image"], sources=[BAGEL_SIGLIP_CONTEXT]))
+            if sample_image_items:
+                image_items.extend(sample_image_items)
+            elif not inference:
+                sample.append(
+                    ConversationItem(
+                        type="image",
+                        value=self._dummy_pixel_values.to(dtype=self._dtype).clone(),
+                        role="dummy",
+                        source=BAGEL_SIGLIP_CONTEXT,
+                        meta={
+                            _OMNI_POSITION_IDS: torch.zeros(1, dtype=torch.long),
+                            _OMNI_TOKEN_LEN: 1,
+                        },
+                    )
+                )
 
         if not image_items:
             return
@@ -60,13 +77,14 @@ class BagelSiglipNavitModuleMixin(ModuleMixin):
     def init_omni_state(self) -> None:
         self._conversation_carrier: list[list[ConversationItem]] | None = None
         self._image_items: list[ConversationItem] = []
-        self._forward_is_dummy = False
 
     def build_cpu_preprocessor(self) -> CPUPreprocessor | None:
         """Worker-side image patchify for training batches."""
         if getattr(self, "_image_processor", None) is None:
             return None
-        return BagelSiglipNavitCPUPreprocessor(self._image_processor, self.dtype)
+        patch_dim = self.config.num_channels * self.config.patch_size * self.config.patch_size
+        dummy = torch.zeros(1, patch_dim, dtype=self.dtype)
+        return BagelSiglipNavitCPUPreprocessor(self._image_processor, self.dtype, dummy)
 
     # ── Graph Entrypoints ──────────────────────────────────
 
@@ -97,14 +115,9 @@ class BagelSiglipNavitModuleMixin(ModuleMixin):
     ) -> dict[str, Any]:
         del kwargs
         self._conversation_carrier = conversation_list
-        self._forward_is_dummy = False
 
         self._image_items = self._select_siglip_image_items(conversation_list)
-        if not self._image_items:
-            self._forward_is_dummy = True
-            out = self.dummy_inputs()
-        else:
-            out = self._inputs_from_preprocessed_items(self._image_items)
+        out = self._inputs_from_preprocessed_items(self._image_items)
         # Metering: stash the per-image NaViT token counts. BAGEL has no SP, so
         # this is already the full count — routed through the same stash as every
         # other module for a uniform metering path.
@@ -121,43 +134,14 @@ class BagelSiglipNavitModuleMixin(ModuleMixin):
     ) -> dict[str, Any]:
         conversation = self._conversation_carrier
         image_items = self._image_items
-        is_dummy = self._forward_is_dummy
         self._conversation_carrier = None
         self._image_items = []
-        self._forward_is_dummy = False
-
-        if is_dummy:
-            value = image_embeds.squeeze(0) if image_embeds.dim() == 3 and image_embeds.shape[0] == 1 else image_embeds
-            for sample in conversation:
-                sample.append(
-                    ConversationItem(
-                        type="image",
-                        value=value,
-                        role="dummy",
-                        source=BAGEL_SIGLIP_CONTEXT,
-                        meta={"source": "bagel_siglip_navit"},
-                    )
-                )
-            return {"conversation_list": conversation}
 
         if token_lens is None:
             raise ValueError("BagelSiglipNavit.forward_post requires token_lens for non-dummy outputs.")
 
         self._scatter_image_embeds(image_items, image_embeds, token_lens)
         return {"conversation_list": conversation}
-
-    # ── Dummy helpers ──────────────────────────────────
-
-    def dummy_inputs(self) -> dict[str, Any]:
-        patch_dim = self.config.num_channels * self.config.patch_size * self.config.patch_size
-        token_lens = torch.tensor([1], dtype=torch.int32, device=self.device)
-        return {
-            "patchified_pixel_values": torch.zeros(1, patch_dim, device=self.device, dtype=self.dtype),
-            "patchified_position_ids": torch.zeros(1, dtype=torch.long, device=self.device),
-            "cu_seqlens": torch.tensor([0, 1], dtype=torch.int32, device=self.device),
-            "max_seqlen": 1,
-            "token_lens": token_lens,
-        }
 
     # ── Internal helpers ──────────────────────────────────
 

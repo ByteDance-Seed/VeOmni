@@ -240,7 +240,7 @@ class BagelFlowConnectorModuleMixin(ModuleMixin):
                             type="output",
                             value=latent_embeds.squeeze(0),
                             role="dummy",
-                            meta={"source": "bagel_flow_connector"},
+                            source="bagel_flow_connector",
                         )
                     )
             return {"conversation_list": conversation}
@@ -359,9 +359,7 @@ class BagelFlowConnectorModuleMixin(ModuleMixin):
             return dummy
 
         anchor = None
-        for item in iter_desired_items(conversation_list, roles=["dummy"]):
-            if item.meta.get("source") != "bagel_vae":
-                continue
+        for item in iter_desired_items(conversation_list, roles=["dummy"], sources=[BAGEL_VAE_CONTEXT]):
             if not torch.is_tensor(item.value):
                 continue
             anchor = item.value.to(device=self.device, dtype=self.dtype).sum() * 0.0
