@@ -480,7 +480,12 @@ def init_parallel_state(
     cached_state = _PARALLEL_STATE_CACHE.get(cache_key)
     if cached_state is not None:
         logger.info_rank0("Reusing cached parallel state for identical topology.")
-        assert _PARALLEL_STATE is not None
+        # Mirror the build path below: only (re)establish the default global if it
+        # has not been set yet. The cache is a module-level global that outlives the
+        # global state (e.g. tests reset ``_PARALLEL_STATE = None`` at teardown but
+        # never clear the cache), so a same-topology hit may find the global cleared.
+        if _PARALLEL_STATE is None:
+            _PARALLEL_STATE = cached_state
         return cached_state
 
     logger.info_rank0(

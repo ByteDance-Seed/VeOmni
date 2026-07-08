@@ -197,7 +197,10 @@ class _GatherConcatSP(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_full):
-        grad_full = grad_full.contiguous()
+        # Clone before the in-place all-reduce: ``.contiguous()`` is a no-op (returns
+        # the same tensor) when ``grad_full`` is already contiguous, so reducing in
+        # place would scribble on the incoming grad buffer owned by autograd.
+        grad_full = grad_full.contiguous().clone()
         dist.all_reduce(grad_full, op=dist.ReduceOp.SUM, group=ctx.group)
 
         offset = sum(ctx.lengths[: ctx.rank])
