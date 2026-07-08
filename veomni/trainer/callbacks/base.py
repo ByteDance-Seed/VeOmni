@@ -38,6 +38,12 @@ class Callback:
     ) -> None:
         pass
 
+    def on_micro_step_begin(self, state: TrainerState, micro_batch: Dict[str, Any], **kwargs) -> None:
+        pass
+
+    def on_micro_step_end(self, state: TrainerState, **kwargs) -> None:
+        pass
+
     def on_epoch_begin(self, state: TrainerState, **kwargs) -> None:
         pass
 
