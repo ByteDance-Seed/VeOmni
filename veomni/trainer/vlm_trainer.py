@@ -27,7 +27,7 @@ from ..utils import helper
 from ..utils.device import synchronize
 from ..utils.loss_utils import count_loss_token
 from ..utils.model_utils import pretty_print_trainable_parameters
-from .base import BaseTrainer, VeOmniIter, _collect_muon_kwargs
+from .base import BaseTrainer, VeOmniIter, _collect_muon_kwargs, get_router_aux_loss_mask_collate_info
 
 
 logger = helper.create_logger(__name__)
@@ -211,6 +211,9 @@ class VLMTrainer:
         #     runs after SP padding to derive multimodal_metadata.
         get_extra_infos = getattr(model, "get_extra_collate_infos", None)
         data_collate_info = get_extra_infos() if get_extra_infos is not None else {}
+        data_collate_info = dict(data_collate_info)
+        for name, params in get_router_aux_loss_mask_collate_info(self.base.model_config).items():
+            data_collate_info.setdefault(name, params)
         get_metadata_func = getattr(model, "get_metadata_collate_func", None)
         metadata_collate_func = get_metadata_func() if get_metadata_func is not None else None
 
