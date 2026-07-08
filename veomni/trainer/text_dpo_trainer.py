@@ -92,23 +92,29 @@ class TextDPOTrainer:
         self.base.args = args
 
         self.base._setup()
-        self.base._build_model()
-        self.base._freeze_model_module()
+        # All build steps (policy + reference model, optimizer, SP data pipeline)
+        # read the current ParallelState via ``get_parallel_state()``, so scope the
+        # whole build under this trainer's own state. No-op for the single-model
+        # case; keeps each module building over its own mesh once modules build
+        # separately.
+        with use_parallel_state(self.base.parallel_state):
+            self.base._build_model()
+            self.base._freeze_model_module()
 
-        self._build_model_assets()
-        self._build_data_transform()
+            self._build_model_assets()
+            self._build_data_transform()
 
-        self.base._build_dataset()
-        self.base._build_collate_fn()
-        self.base._build_dataloader()
-        self._build_postforward()
-        self.base._build_parallelized_model()
-        self.base._build_optimizer()
-        self.base._build_lr_scheduler()
-        self.base._build_training_context()
-        self.base._init_callbacks()
+            self.base._build_dataset()
+            self.base._build_collate_fn()
+            self.base._build_dataloader()
+            self._build_postforward()
+            self.base._build_parallelized_model()
+            self.base._build_optimizer()
+            self.base._build_lr_scheduler()
+            self.base._build_training_context()
+            self.base._init_callbacks()
 
-        self._build_reference_model()
+            self._build_reference_model()
 
     def _build_model_assets(self):
         args: VeOmniDPOArguments = self.base.args

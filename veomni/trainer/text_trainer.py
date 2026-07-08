@@ -23,6 +23,7 @@ from ..data import (
     build_data_transform,
 )
 from ..distributed.clip_grad_norm import veomni_clip_grad_norm
+from ..distributed.parallel_state import use_parallel_state
 from ..models import build_tokenizer
 from ..utils import helper
 from ..utils.device import synchronize
@@ -43,23 +44,29 @@ class TextTrainer:
         self.base.args = args
 
         self.base._setup()
-        self.base._build_model()
-        self.base._freeze_model_module()
+        # All build steps read the current ParallelState via ``get_parallel_state()``
+        # (meta-init, FSDP2/EP wrap + weight load, optimizer, SP data pipeline), so
+        # scope the whole build under this trainer's own state. No-op for the
+        # single-model case; keeps each module building over its own mesh once
+        # multiple modules build separately.
+        with use_parallel_state(self.base.parallel_state):
+            self.base._build_model()
+            self.base._freeze_model_module()
 
-        # rewrite build_model_assets to support chat_template for conversation dataset
-        self._build_model_assets()
+            # rewrite build_model_assets to support chat_template for conversation dataset
+            self._build_model_assets()
 
-        # rewrite build_data_transform to support conversation dataset
-        self._build_data_transform()
+            # rewrite build_data_transform to support conversation dataset
+            self._build_data_transform()
 
-        self.base._build_dataset()
-        self.base._build_collate_fn()
-        self.base._build_dataloader()
-        self.base._build_parallelized_model()
-        self.base._build_optimizer()
-        self.base._build_lr_scheduler()
-        self.base._build_training_context()
-        self.base._init_callbacks()
+            self.base._build_dataset()
+            self.base._build_collate_fn()
+            self.base._build_dataloader()
+            self.base._build_parallelized_model()
+            self.base._build_optimizer()
+            self.base._build_lr_scheduler()
+            self.base._build_training_context()
+            self.base._init_callbacks()
 
     def _build_model_assets(self):
         args: VeOmniArguments = self.base.args

@@ -290,27 +290,36 @@ class BaseTrainer(Stateful, ABC):
 
         self.args: VeOmniArguments = args
         self._setup()
-        # build model
-        self._build_model()
-        # freeze module and print trainable parameters
-        self._freeze_model_module()
-        # build model assets (config, tokenizer, processor, chat_template)
-        self._build_model_assets()
-        # build dataset and dataloader
-        self._build_data_transform()
-        self._build_dataset()
-        self._build_collate_fn()
-        self._build_dataloader()
+        # Every build step below reads the current ParallelState via
+        # ``get_parallel_state()`` (meta-init, FSDP2/TP/EP wrap + weight load,
+        # EP-/muon-aware optimizer, SP-aware data pipeline). ``init_parallel_state``
+        # only sets the module global on its *first* call, so once multiple modules
+        # each build under their own state a later module would otherwise build over
+        # the first module's mesh. Scope the whole build under this trainer's own
+        # state (a no-op for the single-model case: the global already equals
+        # ``self.parallel_state`` right after ``_setup``).
+        with use_parallel_state(self.parallel_state):
+            # build model
+            self._build_model()
+            # freeze module and print trainable parameters
+            self._freeze_model_module()
+            # build model assets (config, tokenizer, processor, chat_template)
+            self._build_model_assets()
+            # build dataset and dataloader
+            self._build_data_transform()
+            self._build_dataset()
+            self._build_collate_fn()
+            self._build_dataloader()
 
-        # Parallelize model
-        self._build_parallelized_model()
-        # Build optimizer and lr scheduler
-        self._build_optimizer()
-        self._build_lr_scheduler()
-        # Build training context
-        self._build_training_context()
-        # Initialize callbacks
-        self._init_callbacks()
+            # Parallelize model
+            self._build_parallelized_model()
+            # Build optimizer and lr scheduler
+            self._build_optimizer()
+            self._build_lr_scheduler()
+            # Build training context
+            self._build_training_context()
+            # Initialize callbacks
+            self._init_callbacks()
 
     def _setup(self):
         # log args

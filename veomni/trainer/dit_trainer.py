@@ -183,34 +183,40 @@ class DiTTrainer:
         # rewrite _setup, setup arguments for dit training
         self._setup()
 
-        # rewrite _build_model, build condition model & dit model
-        self._build_model()
+        # All build steps read the current ParallelState via ``get_parallel_state()``
+        # (meta-init, FSDP2/EP wrap + weight load, optimizer, SP data pipeline), so
+        # scope the whole build under this trainer's own state. No-op for the
+        # single-model case; keeps each module building over its own mesh once
+        # multiple modules build separately.
+        with use_parallel_state(self.base.parallel_state):
+            # rewrite _build_model, build condition model & dit model
+            self._build_model()
 
-        # rewrite _freeze_model_module, freeze condition model
-        self._freeze_model_module()
+            # rewrite _freeze_model_module, freeze condition model
+            self._freeze_model_module()
 
-        # rewrite _build_model_assets to support processor of condition model
-        self._build_model_assets()
+            # rewrite _build_model_assets to support processor of condition model
+            self._build_model_assets()
 
-        # rewrite _build_data_transform, build data transform for offline or online dit data
-        self._build_data_transform()
+            # rewrite _build_data_transform, build data transform for offline or online dit data
+            self._build_data_transform()
 
-        # rewrite _build_dataset, init offline_embedding_saver after build_dataset
-        self._build_dataset()
+            # rewrite _build_dataset, init offline_embedding_saver after build_dataset
+            self._build_dataset()
 
-        # Do not use maincollator in dit training
-        # self.base._build_collate_fn()
+            # Do not use maincollator in dit training
+            # self.base._build_collate_fn()
 
-        # rewrite _build_dataloader, build dataloader only on sp_rank_0 to save memory
-        self._build_dataloader()
+            # rewrite _build_dataloader, build dataloader only on sp_rank_0 to save memory
+            self._build_dataloader()
 
-        if self.training_task != "offline_embedding":
-            self.base._build_parallelized_model()
-            self.base._build_optimizer()
-            self.base._build_lr_scheduler()
-            self.base._build_training_context()
+            if self.training_task != "offline_embedding":
+                self.base._build_parallelized_model()
+                self.base._build_optimizer()
+                self.base._build_lr_scheduler()
+                self.base._build_training_context()
 
-        self.base._init_callbacks()
+            self.base._init_callbacks()
 
     def _setup(self):
         self.base._setup()
