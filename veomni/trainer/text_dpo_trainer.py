@@ -38,7 +38,7 @@ from .base import BaseTrainer, VeOmniIter
 
 logger = logging.get_logger(__name__)
 
-_NON_MODEL_KEYS = {"labels"}
+_NON_MODEL_KEYS = set()
 
 
 # ================================ DPO Arguments ======================================
