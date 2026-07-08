@@ -58,7 +58,7 @@ from ..data.data_collator import DataCollator, MainCollator
 from ..data.data_transform import build_data_transform
 from ..distributed.clip_grad_norm import veomni_clip_grad_norm
 from ..distributed.offloading import build_activation_offloading_context
-from ..distributed.parallel_state import init_parallel_state
+from ..distributed.parallel_state import init_parallel_state, use_parallel_state
 from ..distributed.torch_parallelize import build_parallelize_model
 from ..models import build_foundation_model, build_tokenizer
 from ..ops.batch_invariant_ops import set_batch_invariant_mode
@@ -328,7 +328,7 @@ class BaseTrainer(Stateful, ABC):
         logger.info(f"Process rank: {self.args.train.global_rank}, world size: {self.args.train.world_size}")
 
         # Initialize parallel state
-        init_parallel_state(
+        self.parallel_state = init_parallel_state(
             dp_size=self.args.train.accelerator.dp_size,
             dp_replicate_size=self.args.train.accelerator.dp_replicate_size,
             dp_shard_size=self.args.train.accelerator.dp_shard_size,
@@ -674,16 +674,20 @@ class BaseTrainer(Stateful, ABC):
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         micro_batch = self.preforward(micro_batch)
 
-        with self.model_fwd_context, set_batch_invariant_mode(self.args.train.enable_batch_invariant_mode):
-            outputs: ModelOutput = self.model(**micro_batch, use_cache=False)
+        # Run the model's forward / loss-reduction / backward under its own
+        # parallel state so the SP / DP / CP group getters resolve from this
+        # model's device mesh (see ``use_parallel_state``).
+        with use_parallel_state(self.parallel_state):
+            with self.model_fwd_context, set_batch_invariant_mode(self.args.train.enable_batch_invariant_mode):
+                outputs: ModelOutput = self.model(**micro_batch, use_cache=False)
 
-        loss: torch.Tensor
-        loss_dict: Dict[str, torch.Tensor]
-        loss, loss_dict = self.postforward(outputs, micro_batch)
+            loss: torch.Tensor
+            loss_dict: Dict[str, torch.Tensor]
+            loss, loss_dict = self.postforward(outputs, micro_batch)
 
-        # Backward pass
-        with self.model_bwd_context, set_batch_invariant_mode(self.args.train.enable_batch_invariant_mode):
-            loss.backward()
+            # Backward pass
+            with self.model_bwd_context, set_batch_invariant_mode(self.args.train.enable_batch_invariant_mode):
+                loss.backward()
 
         del micro_batch
         return loss, loss_dict

@@ -61,8 +61,9 @@ Core entry points:
    - Underlying primitive: `_SeqAllToAll` (autograd-aware `all_to_all_tensor`).
    - Async variants in `async_ulysses*.py` for DiT and pipelined QKV/output projections.
    - Data slicing: `veomni/distributed/sequence_parallel/data.py` — `sp_pad_and_slice()`, `slice_input_tensor()`, `gather_outputs()`.
-   - Loss reduction: `reduce_sequence_parallel_loss()` in `loss.py` aggregates across SP ranks.
-   - Process groups: `comm.py` sets `ulysses_sequence_parallel_group`, `context_parallel_group`, `unified_sequence_parallel_group` from the device mesh.
+   - Loss reduction: `reduce_sequence_parallel_loss()` in `loss.py` aggregates across SP ranks (optional `group=` arg; defaults to the current state's unified SP group).
+   - Process groups: `comm.py` has NO group globals. Its getters (`get_ulysses_sequence_parallel_group`, `get_unified_sequence_parallel_group`, `get_context_parallel_group`, `get_data_parallel_group`) resolve from the *current* `ParallelState`'s device mesh (`get_parallel_state().{ulysses,sp,cp,dp}_group`) — exactly how `fsdp_group` already worked. `set_ulysses_sequence_parallel_group(group)` survives ONLY as a unit-test injection seam (`_ULYSSES_SP_GROUP_OVERRIDE`, `None` in production); no production code calls it. Meshless SP is unsupported — `ParallelState.__post_init__` raises if `sp_enabled and device_mesh is None`; always build via `init_parallel_state`.
+   - Local parallel state: `init_parallel_state()` returns the built `ParallelState` (and caches it by topology). `set_parallel_state(ps)` / `use_parallel_state(ps)` (a contextmanager) swap the current global state, so a forward run inside `with use_parallel_state(ps):` resolves its SP/DP/CP groups from `ps`'s mesh. `BaseTrainer` (and the DiT / DPO trainer wrappers) run each `model(...)` forward + loss-reduce + backward under `use_parallel_state(self.parallel_state)`, letting different models run under different parallel states.
 
 ### Expert Parallel (MoE)
 

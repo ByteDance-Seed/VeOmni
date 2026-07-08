@@ -29,7 +29,7 @@ from ..arguments import DataArguments, ModelArguments, TrainingArguments, VeOmni
 from ..data import build_data_transform, build_dataloader
 from ..data.data_collator import DataCollator
 from ..distributed.clip_grad_norm import veomni_clip_grad_norm
-from ..distributed.parallel_state import get_parallel_state
+from ..distributed.parallel_state import get_parallel_state, use_parallel_state
 from ..models import build_foundation_model
 from ..models.auto import build_config
 from ..models.loader import MODEL_CONFIG_REGISTRY, MODELING_REGISTRY
@@ -456,16 +456,21 @@ class DiTTrainer:
 
         with torch.no_grad():
             micro_batch = self.condition_model.process_condition(**micro_batch)
-        with self.base.model_fwd_context:
-            outputs = self.base.model(**micro_batch)
 
-        loss: torch.Tensor
-        loss_dict: Dict[str, torch.Tensor]
-        loss, loss_dict = self.postforward(outputs, micro_batch)
+        # Run the model's forward / loss-reduction / backward under its own
+        # parallel state so the SP / DP / CP group getters resolve from this
+        # model's device mesh (see ``use_parallel_state``).
+        with use_parallel_state(self.base.parallel_state):
+            with self.base.model_fwd_context:
+                outputs = self.base.model(**micro_batch)
 
-        # Backward pass
-        with self.base.model_bwd_context:
-            loss.backward()
+            loss: torch.Tensor
+            loss_dict: Dict[str, torch.Tensor]
+            loss, loss_dict = self.postforward(outputs, micro_batch)
+
+            # Backward pass
+            with self.base.model_bwd_context:
+                loss.backward()
 
         del micro_batch
         return loss, loss_dict

@@ -275,7 +275,7 @@ def test_reduce_loss_no_nan_when_sp_group_all_padding():
 
     with (
         patch(f"{_RL_PREFIX}.get_unified_sequence_parallel_group", return_value=MagicMock()),
-        patch(f"{_RL_PREFIX}.get_unified_sequence_parallel_world_size", return_value=2),
+        patch(f"{_RL_PREFIX}.dist.get_world_size", return_value=2),
         patch(f"{_RL_PREFIX}.dist.all_reduce", side_effect=_noop_all_reduce),
     ):
         x = torch.tensor(0.5, requires_grad=True)

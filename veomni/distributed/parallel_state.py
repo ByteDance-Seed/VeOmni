@@ -16,6 +16,7 @@
 # Adapted from https://github.com/pytorch/torchtitan/blob/main/torchtitan/distributed/parallel_dims.py
 
 import os
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from functools import cached_property, wraps
 from typing import TYPE_CHECKING, Callable, Dict, Literal, Optional, Tuple
@@ -35,6 +36,9 @@ if TYPE_CHECKING:
 logger = logging.get_logger(__name__)
 
 _PARALLEL_STATE: "ParallelState" = None
+
+# Cache of built parallel states keyed by full topology.
+_PARALLEL_STATE_CACHE: Dict[tuple, "ParallelState"] = {}
 
 
 def requires_mesh(fn: Callable) -> Callable:
@@ -81,30 +85,19 @@ class ParallelState:
                 f"The product of dp_replicate_size: {self.dp_replicate_size} and dp_shard_size: {self.dp_shard_size} should be equal to dp_size: {self.dp_size}."
             )
 
-        if self.sp_enabled:
-            from ..distributed.sequence_parallel import (
-                init_sequence_parallel,
-                set_context_parallel_group,
-                set_data_parallel_group,
-                set_ulysses_sequence_parallel_group,
-                set_unified_sequence_parallel_group,
+        # SP / DP / CP process groups are NOT cached in module-level globals.
+        # Every ``sequence_parallel.comm`` getter resolves its group from the
+        # *current* ParallelState's device mesh (see ``dp_group`` / ``sp_group``
+        # / ``ulysses_group`` / ``cp_group`` below), so a per-module forward
+        # scoped by ``use_parallel_state`` automatically gets its own groups —
+        # even when sibling Omni modules run at different SP sizes. Meshless SP
+        # is therefore unsupported (a bare ``ParallelState(ulysses_size>1)`` with
+        # no mesh has no group to resolve).
+        if self.sp_enabled and self.device_mesh is None:
+            raise ValueError(
+                "A sequence-parallel ParallelState must be built with a device mesh "
+                "(use init_parallel_state); meshless sequence-parallel init is no longer supported."
             )
-
-            if self.device_mesh is not None:
-                set_data_parallel_group(self.device_mesh.get_group("dp"))
-                if self.ulysses_size > 1:
-                    set_ulysses_sequence_parallel_group(self.device_mesh.get_group("ulysses"))
-                if self.cp_size > 1:
-                    set_context_parallel_group(self.device_mesh.get_group("cp"))
-                # set unified sequence parallel group
-                set_unified_sequence_parallel_group(self.device_mesh.get_group("sp"))
-            else:
-                init_sequence_parallel(
-                    ulysses_size=self.ulysses_size,
-                    sep_dp=True,
-                    ulysses_group_key="default",
-                    cp_size=self.cp_size,
-                )
 
     @property
     def is_initialized(self) -> bool:
@@ -132,22 +125,12 @@ class ParallelState:
         if self.device_mesh is not None:
             return self.device_mesh.get_group("dp")
 
-        if self.sp_enabled:
-            from ..distributed.sequence_parallel import get_data_parallel_group
-
-            return get_data_parallel_group()
-
-        return self.fsdp_group
+        return None
 
     @property
     def dp_rank(self) -> int:
         if self.device_mesh is not None:
             return self.device_mesh.get_local_rank("dp")
-
-        if self.sp_enabled:
-            from ..distributed.sequence_parallel import get_data_parallel_rank
-
-            return get_data_parallel_rank()
 
         return self.fsdp_rank
 
@@ -375,25 +358,15 @@ class ParallelState:
     # ------------------------------ SP ------------------------------ #
     @property
     def sp_group(self) -> Optional["ProcessGroup"]:
-        if self.device_mesh is not None:
+        if self.device_mesh is not None and self.sp_enabled:
             return self.device_mesh.get_group("sp")
-
-        if self.sp_enabled:
-            from .sequence_parallel import get_unified_sequence_parallel_group
-
-            return get_unified_sequence_parallel_group()
 
         return None
 
     @property
     def sp_rank(self) -> int:
-        if self.device_mesh is not None:
+        if self.device_mesh is not None and self.sp_enabled:
             return self.device_mesh.get_local_rank("sp")
-
-        if self.sp_enabled:
-            from .sequence_parallel import get_unified_sequence_parallel_rank
-
-            return get_unified_sequence_parallel_rank()
 
         return -1
 
@@ -407,25 +380,15 @@ class ParallelState:
 
     @property
     def ulysses_group(self) -> Optional["ProcessGroup"]:
-        if self.device_mesh is not None:
+        if self.device_mesh is not None and self.ulysses_enabled:
             return self.device_mesh.get_group("ulysses")
-
-        if self.sp_enabled:
-            from .sequence_parallel import get_ulysses_sequence_parallel_group
-
-            return get_ulysses_sequence_parallel_group()
 
         return None
 
     @property
     def ulysses_rank(self) -> int:
-        if self.device_mesh is not None:
+        if self.device_mesh is not None and self.ulysses_enabled:
             return self.device_mesh.get_local_rank("ulysses")
-
-        if self.sp_enabled:
-            from .sequence_parallel import get_ulysses_sequence_parallel_rank
-
-            return get_ulysses_sequence_parallel_rank()
 
         return -1
 
@@ -435,25 +398,15 @@ class ParallelState:
 
     @property
     def cp_group(self) -> Optional["ProcessGroup"]:
-        if self.device_mesh is not None:
+        if self.device_mesh is not None and self.cp_enabled:
             return self.device_mesh.get_group("cp")
-
-        if self.sp_enabled:
-            from .sequence_parallel import get_context_parallel_group
-
-            return get_context_parallel_group()
 
         return None
 
     @property
     def cp_rank(self) -> int:
-        if self.device_mesh is not None:
+        if self.device_mesh is not None and self.cp_enabled:
             return self.device_mesh.get_local_rank("cp")
-
-        if self.sp_enabled:
-            from .sequence_parallel import get_context_parallel_rank
-
-            return get_context_parallel_rank()
 
         return -1
 
@@ -477,14 +430,13 @@ def init_parallel_state(
     extra_parallel_placement_innermost: Tuple[bool] = (False,),
     extra_parallel_names: Tuple[str] = ("ep",),
     async_enabled: Optional[bool] = False,
-) -> None:
+) -> "ParallelState":
     """
-    Initializes global parallel state.
+    Initialize a parallel state, set it as the global state.
     """
     global _PARALLEL_STATE
     if _PARALLEL_STATE is not None:
         logger.warning("Parallel state has already been initialized.")
-        return
 
     if device_type is None:
         device_type = get_device_type()
@@ -493,10 +445,43 @@ def init_parallel_state(
     if dp_size > 1 and dp_shard_size == 1 and dp_replicate_size == 1:
         dp_shard_size = dp_size
 
+    extra_parallel_sizes = tuple(extra_parallel_sizes)
+    extra_parallel_placement_innermost = tuple(extra_parallel_placement_innermost)
+    extra_parallel_names = tuple(extra_parallel_names)
+
     # Note that Expert Parallel is included into Extra Parallel
     assert len(extra_parallel_sizes) == len(extra_parallel_placement_innermost) == len(extra_parallel_names), (
         "each extra parallel should correspond to a size, a placement and a name"
     )
+
+    # Reuse an already-built state for an identical topology (e.g. the omni
+    # orchestrator builds one ParallelState per module, many of which share the
+    # global topology). Building the device mesh / extra-parallel meshes creates
+    # process groups via collectives — all ranks run the same call sequence in
+    # the same order, so cache hits/misses are rank-consistent and no duplicate
+    # groups are created. The key spans every field that shapes the mesh or the
+    # state's behaviour (e.g. ``dp_mode`` is read by grad-clip).
+    cache_key = (
+        dp_size,
+        dp_replicate_size,
+        dp_shard_size,
+        tp_size,
+        pp_size,
+        cp_size,
+        ulysses_size,
+        dp_mode,
+        device_type,
+        include_sp_in_fsdp,
+        extra_parallel_sizes,
+        extra_parallel_placement_innermost,
+        extra_parallel_names,
+        async_enabled,
+    )
+    cached_state = _PARALLEL_STATE_CACHE.get(cache_key)
+    if cached_state is not None:
+        logger.info_rank0("Reusing cached parallel state for identical topology.")
+        assert _PARALLEL_STATE is not None
+        return cached_state
 
     logger.info_rank0(
         f"Initializing parallel state: dp_size {dp_size}, dp_replicate_size {dp_replicate_size}, "
@@ -601,7 +586,7 @@ def init_parallel_state(
     for para_name in extra_parallel_names:
         logger.info_rank0(f"{para_name} FSDP device mesh: {extra_parallel_fsdp_device_mesh[para_name]}")
 
-    _PARALLEL_STATE = ParallelState(
+    parallel_state = ParallelState(
         dp_size=dp_size,
         dp_replicate_size=dp_replicate_size,
         dp_shard_size=dp_shard_size,
@@ -618,6 +603,43 @@ def init_parallel_state(
         extra_parallel_fsdp_device_mesh=extra_parallel_fsdp_device_mesh,
         async_enabled=async_enabled,
     )
+
+    if _PARALLEL_STATE is None:
+        _PARALLEL_STATE = parallel_state
+
+    _PARALLEL_STATE_CACHE[cache_key] = parallel_state
+    return parallel_state
+
+
+def set_parallel_state(parallel_state: "ParallelState") -> Optional["ParallelState"]:
+    """
+    Set the global parallel state to ``parallel_state``; returns the previous one.
+
+    The SP / DP / CP process-group getters in ``sequence_parallel.comm`` resolve
+    from whatever state is current here, so an Omni module's forward — scoped by
+    :func:`use_parallel_state` — automatically runs its collectives over its own
+    groups, even when sibling modules use a different SP size.
+    """
+    global _PARALLEL_STATE
+    old = _PARALLEL_STATE
+    _PARALLEL_STATE = parallel_state
+    return old
+
+
+@contextmanager
+def use_parallel_state(parallel_state: "ParallelState"):
+    """
+    Temporarily make ``parallel_state`` the global parallel state, restoring on exit.
+
+    The SP / DP / CP group getters resolve from the current state, so a forward
+    run inside this scope uses ``parallel_state``'s own groups — even when
+    sibling Omni modules use a different SP size.
+    """
+    old = set_parallel_state(parallel_state)
+    try:
+        yield
+    finally:
+        set_parallel_state(old)
 
 
 def get_parallel_state() -> "ParallelState":

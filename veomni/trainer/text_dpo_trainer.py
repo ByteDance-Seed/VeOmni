@@ -25,7 +25,7 @@ from ..arguments import MixedPrecisionConfig, VeOmniArguments
 from ..data import build_chat_template, build_data_transform
 from ..data.data_collator import PostCollator
 from ..distributed.clip_grad_norm import veomni_clip_grad_norm
-from ..distributed.parallel_state import get_parallel_state
+from ..distributed.parallel_state import get_parallel_state, use_parallel_state
 from ..distributed.sequence_parallel import gather_outputs
 from ..distributed.torch_parallelize import build_parallelize_model
 from ..models import build_foundation_model, build_tokenizer
@@ -278,36 +278,40 @@ class TextDPOTrainer:
 
         micro_batch = self.base.preforward(micro_batch)
 
-        with torch.no_grad():
-            ref_chosen_logps, ref_rejected_logps = self.concatenated_forward(self.reference_model, micro_batch)
+        # Run the reference/policy forward, loss and backward under the model's
+        # own parallel state so the SP / DP / CP group getters resolve from this
+        # model's device mesh (see ``use_parallel_state``).
+        with use_parallel_state(self.base.parallel_state):
+            with torch.no_grad():
+                ref_chosen_logps, ref_rejected_logps = self.concatenated_forward(self.reference_model, micro_batch)
 
-        with self.base.model_fwd_context, set_batch_invariant_mode(args.train.enable_batch_invariant_mode):
-            policy_chosen_logps, policy_rejected_logps = self.concatenated_forward(self.base.model, micro_batch)
+            with self.base.model_fwd_context, set_batch_invariant_mode(args.train.enable_batch_invariant_mode):
+                policy_chosen_logps, policy_rejected_logps = self.concatenated_forward(self.base.model, micro_batch)
 
-        losses, chosen_rewards, rejected_rewards = self.dpo_loss(
-            policy_chosen_logps,
-            policy_rejected_logps,
-            ref_chosen_logps,
-            ref_rejected_logps,
-            beta=dpo_config.beta,
-            label_smoothing=dpo_config.label_smoothing,
-            loss_type=dpo_config.loss_type,
-            reference_free=dpo_config.reference_free,
-        )
+            losses, chosen_rewards, rejected_rewards = self.dpo_loss(
+                policy_chosen_logps,
+                policy_rejected_logps,
+                ref_chosen_logps,
+                ref_rejected_logps,
+                beta=dpo_config.beta,
+                label_smoothing=dpo_config.label_smoothing,
+                loss_type=dpo_config.loss_type,
+                reference_free=dpo_config.reference_free,
+            )
 
-        loss = losses.mean()
+            loss = losses.mean()
 
-        reward_accuracies = (chosen_rewards > rejected_rewards).float().mean()
-        loss_dict: Dict[str, torch.Tensor] = {
-            "dpo_loss": loss.detach(),
-            "chosen_rewards": chosen_rewards.mean().detach(),
-            "rejected_rewards": rejected_rewards.mean().detach(),
-            "reward_accuracy": reward_accuracies.detach(),
-            "reward_margin": (chosen_rewards - rejected_rewards).mean().detach(),
-        }
+            reward_accuracies = (chosen_rewards > rejected_rewards).float().mean()
+            loss_dict: Dict[str, torch.Tensor] = {
+                "dpo_loss": loss.detach(),
+                "chosen_rewards": chosen_rewards.mean().detach(),
+                "rejected_rewards": rejected_rewards.mean().detach(),
+                "reward_accuracy": reward_accuracies.detach(),
+                "reward_margin": (chosen_rewards - rejected_rewards).mean().detach(),
+            }
 
-        with self.base.model_bwd_context, set_batch_invariant_mode(args.train.enable_batch_invariant_mode):
-            loss.backward()
+            with self.base.model_bwd_context, set_batch_invariant_mode(args.train.enable_batch_invariant_mode):
+                loss.backward()
 
         del micro_batch
         return loss, loss_dict
