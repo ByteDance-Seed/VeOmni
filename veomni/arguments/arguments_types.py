@@ -296,6 +296,12 @@ class FSDPConfig:
         default=False,
         metadata={"help": "Enable CPU offload for FSDP2."},
     )
+    offload_pin_memory: bool = field(
+        default=True,
+        metadata={
+            "help": "When FSDP2 CPU offload is enabled, pin (page-lock) the offloaded CPU param shards. Default True matches torch's CPUOffloadPolicy. Set False to keep shards in pageable memory — for very large models (e.g. MoE experts) pinning is charged as non-reclaimable Shmem and can OOM the memcg; False avoids that at the cost of slightly slower non-pinned H2D per layer."
+        },
+    )
     max_load_broadcast_size: float = field(
         default=20.0,
         metadata={
