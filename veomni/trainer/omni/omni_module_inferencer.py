@@ -80,7 +80,23 @@ class OmniModuleInferencer(OmniModuleTrainer):
                 self.base._build_model()
                 self._build_model_assets()
                 self._freeze_model_module()
-                self.base._build_parallelized_model()
+
+                # Mirror OmniModuleTrainer: a module may fully own its
+                # parallelize + weight-load (+ offload) via
+                # ``customized_build_parallelize_model`` (e.g. OE's ~32 GB table
+                # shard needs a no-copy ``distribute_tensor`` to avoid a transient
+                # full-tensor GPU materialization → OOM). Use it verbatim when it
+                # returns a model; ``None`` (the default) keeps the generic path.
+                customized_builder = getattr(self.base.model, "customized_build_parallelize_model", None)
+                customized_model = (
+                    customized_builder(weights_path=self.base.args.model.model_path, args=self.base.args)
+                    if callable(customized_builder)
+                    else None
+                )
+                if customized_model is not None:
+                    self.base.model = customized_model
+                else:
+                    self.base._build_parallelized_model()
                 self.base.model.eval()
 
     @property
