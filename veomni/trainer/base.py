@@ -522,6 +522,7 @@ class BaseTrainer(Stateful, ABC):
             enable_reentrant=args.train.gradient_checkpointing.enable_reentrant,
             enable_forward_prefetch=args.train.accelerator.fsdp_config.forward_prefetch,
             enable_fsdp_offload=args.train.accelerator.fsdp_config.offload,
+            enable_dt_fsdp2=args.train.accelerator.fsdp_config.enable_dt_fsdp2,
             broadcast_model_weights_from_rank0=args.train.broadcast_model_weights_from_rank0,
             max_load_broadcast_size=args.train.accelerator.fsdp_config.max_load_broadcast_size,
             muon_expert_zero_comm=muon_expert_zero_comm,
