@@ -235,6 +235,11 @@ def maybe_convert_checkpoint_tensor(
         ``ConvertedCheckpointTensor`` if tensor is ready for dispatch (pass-through or converted).
         ``None`` if converter consumed the tensor but is still accumulating.
     """
-    if converter is None or not converter.can_handle(name):
+    if converter is None:
+        return ConvertedCheckpointTensor(name=name, tensor=tensor)
+    can_handle_tensor = getattr(converter, "can_handle_tensor", None)
+    if callable(can_handle_tensor) and can_handle_tensor(name, tensor):
+        return converter.convert(name, tensor)
+    if not converter.can_handle(name):
         return ConvertedCheckpointTensor(name=name, tensor=tensor)
     return converter.convert(name, tensor)
