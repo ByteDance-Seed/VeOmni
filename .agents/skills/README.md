@@ -41,4 +41,5 @@ See the [Agent Skills specification](https://agentskills.io/specification) for t
 | `veomni-uv-update` | Dependency management with uv (version bumps, torch, lockfile) |
 | `create-pr` | Create a pull request — handles uncommitted changes, generates CI-compliant title and description |
 | `pr-draft-maintainer` | Maintain PR/MR descriptions and local draft markdown from reports, logs, reviewer feedback, or issue context |
+| `veomni-patch-to-pr` | Apply external diffs/reports and package them into clean VeOmni PRs without scratch artifacts or author/claim leaks |
 | `veomni-profile` | Performance profiling — analyze traces/snapshots or generate profiles and optimize |
