@@ -81,7 +81,7 @@ def _requires_byte_broadcast(dtype: "torch.dtype") -> bool:
 
 
 def _num_storage_bytes(shape: Tuple[int, ...], dtype: "torch.dtype") -> int:
-    if dtype in _FLOAT8_DTYPES:
+    if dtype in _FLOAT8_DTYPES or dtype == torch.bool:
         return math.prod(shape)
     elem_size = torch.finfo(dtype).bits // 8 if dtype.is_floating_point else torch.iinfo(dtype).bits // 8
     return math.prod(shape) * elem_size
@@ -96,6 +96,8 @@ def _view_from_bytes(tensor: "torch.Tensor", dtype: "torch.dtype", shape: Tuple[
 
 
 def _is_all_zero_tensor(tensor: "torch.Tensor") -> bool:
+    if tensor.is_meta:
+        return False
     try:
         return bool(torch.count_nonzero(tensor).item() == 0)
     except NotImplementedError:

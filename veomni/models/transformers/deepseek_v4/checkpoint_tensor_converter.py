@@ -90,6 +90,7 @@ def _weight_name_from_scale_name(name: str) -> str | None:
 
 def _dequantize_scaled_weight(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     """Apply DeepSeek block scales to an FP8/int8 checkpoint weight."""
+    scale = scale.to(device=weight.device)
     if scale.numel() == 1:
         return weight.float() * scale.float()
     if weight.ndim != 2 or scale.ndim != 2:
