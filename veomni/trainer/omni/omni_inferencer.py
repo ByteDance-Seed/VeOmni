@@ -171,7 +171,7 @@ class OmniInferencer(OmniTrainer):
         assert infer_args.prompt, "--infer.prompt is required (use a non-empty string)."
         request = InferenceRequest(
             prompt=infer_args.prompt,
-            images=[load_image(infer_args.image)] if infer_args.image else [],
+            images=[load_image(p) for p in infer_args.images],
             generation_kwargs=self._runtime_generation_kwargs(),
         )
         ctx = self._run(request)

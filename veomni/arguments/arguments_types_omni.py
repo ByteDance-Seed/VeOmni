@@ -44,7 +44,7 @@ validation/derivation that the (deferred) :class:`OmniTrainingArguments` skipped
 
 import os
 from dataclasses import dataclass, field, fields
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from ..utils import logging
 from .arguments_types import (
@@ -234,9 +234,16 @@ class OmniInferArguments:
         default="",
         metadata={"help": "User text prompt (required at generate time)."},
     )
-    image: Optional[str] = field(
-        default=None,
-        metadata={"help": "Optional path or http(s) URL to an image. Omit for text-to-image generation."},
+    images: List[str] = field(
+        default_factory=list,
+        metadata={
+            "help": (
+                "Reference image paths / http(s) URLs (space-separated: "
+                "`--infer.images a.jpg b.jpg c.jpg`). Empty ⇒ text-to-image; one ⇒ single-image "
+                "EDIT; many ⇒ multi-image EDIT / COMPOSE. Each is a `[soi] … [eoi]` ViT + VAE "
+                "reference in request order."
+            )
+        },
     )
     output_dir: str = field(
         default="output",
