@@ -19,7 +19,13 @@ import torch
 import torch.distributed as dist
 import torch_npu
 
-from ....distributed.moe.comm import all_to_all
+from ....distributed.moe.comm import (
+    all_to_all,
+    allgather_tokens_in_ep,
+    reduce_scatter_tokens_in_ep,
+    reset_ep_rank_seq_lens,
+    set_ep_rank_seq_lens,
+)
 from ....distributed.moe.moe_utils import sort_chunks_by_idxs
 from ....distributed.parallel_state import get_parallel_state
 from ....utils.device import stream_synchronize
@@ -129,7 +135,7 @@ def dispatch_preprocess(
     )
     num_local_experts = num_global_experts // ep_size
 
-    num_local_tokens_per_expert = torch.bincount(selected_experts.view(-1), minlength=num_global_experts)
+    num_local_tokens_per_expert = torch.histc(selected_experts.view(-1), bins=num_global_experts, min=0, max=num_global_experts)
 
     if ep_group is None or ep_size <= 1:
         num_global_tokens_per_expert = num_local_tokens_per_expert.view(1, -1)
@@ -205,6 +211,109 @@ def alltoall_combine(
     hidden_states = all_to_all(ep_group, hidden_states, input_splits, output_splits)
     hidden_states = torch_npu.npu_moe_token_unpermute(hidden_states, unpermute_indices, probs=routing_weights)
     return hidden_states
+
+
+def npu_ep_allgather_fused_moe_forward(
+    num_experts: int,
+    routing_weights: torch.Tensor,
+    selected_experts: torch.Tensor,
+    hidden_states: torch.Tensor,
+    fc1_1_weight: torch.Tensor | None,
+    fc1_2_weight: torch.Tensor | None,
+    fc2_weight: torch.Tensor,
+    fc1_1_2_weight: torch.Tensor | None = None,
+    ep_group: Optional[dist.ProcessGroup] = None,
+) -> torch.Tensor:
+    """NPU expert-parallel fused MoE forward pass using allgather dispatch.
+
+    Each rank gathers all tokens from the EP group, processes only the tokens
+    destined for its local experts, then reduce-scatters results back.
+    Supports variable-length token counts across EP ranks (VLM multimodal data).
+    """
+    hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
+
+    with torch.no_grad():
+        set_ep_rank_seq_lens(hidden_states.shape[0], ep_group, hidden_states.device)
+        selected_experts = allgather_tokens_in_ep(selected_experts, ep_group)
+    routing_weights = allgather_tokens_in_ep(routing_weights, ep_group)
+    hidden_states = allgather_tokens_in_ep(hidden_states, ep_group)
+
+    num_experts_local = num_experts // dist.get_world_size(ep_group)
+    ep_rank = dist.get_rank(ep_group)
+    start_expert_id = num_experts_local * ep_rank
+    end_expert_id = num_experts_local * (ep_rank + 1)
+
+    hidden_shape_before_permute = hidden_states.shape
+
+    mask = (selected_experts >= start_expert_id) & (selected_experts < end_expert_id)
+    selected_experts = torch.where(mask, selected_experts - start_expert_id, num_experts_local)
+
+    # Count the number of tokens assigned to each local expert
+    # This is used for the grouped matrix multiplication
+    tokens_per_expert = torch.histc(selected_experts.view(-1), bins=num_experts, min=0, max=num_experts)[
+        :num_experts_local
+    ]
+    num_out_tokens = tokens_per_expert.sum().item()
+    permuted_hidden_states, row_ids_map = torch_npu.npu_moe_token_permute(
+        hidden_states, selected_experts.to(torch.int32), num_out_tokens=num_out_tokens
+    )
+
+    if fc1_1_2_weight is not None:
+        fc1_weight = fc1_1_2_weight
+    else:
+        fc1_weight = torch.cat([fc1_1_weight, fc1_2_weight], dim=1)
+    fc1_weight = fc1_weight.transpose(1, 2)
+    intermediate_hidden_states = npu_group_gemm(permuted_hidden_states, fc1_weight, tokens_per_expert)
+    intermediate_activations = torch_npu.npu_swiglu(intermediate_hidden_states, dim=-1)
+    output = npu_group_gemm(intermediate_activations, fc2_weight.transpose(1, 2), tokens_per_expert)
+
+    hidden_states = torch_npu.npu_moe_token_unpermute(
+        output, row_ids_map, probs=routing_weights, restore_shape=hidden_shape_before_permute
+    )
+
+    hidden_states = reduce_scatter_tokens_in_ep(hidden_states, ep_group)
+    reset_ep_rank_seq_lens()
+    return hidden_states
+
+
+def npu_allgather_fused_moe_forward(
+    num_experts: int,
+    routing_weights: torch.Tensor,
+    selected_experts: torch.Tensor,
+    hidden_states: torch.Tensor,
+    fc1_1_weight: torch.Tensor | None,
+    fc1_2_weight: torch.Tensor | None,
+    fc2_weight: torch.Tensor,
+    fc1_1_2_weight: torch.Tensor | None = None,
+    swiglu_limit: float | None = None,
+):
+    if swiglu_limit is not None:
+        raise NotImplementedError("NPU fused MoE does not support swiglu_limit clamp semantics.")
+
+    if get_parallel_state().ep_enabled:
+        final_hidden_states = npu_ep_allgather_fused_moe_forward(
+            num_experts,
+            routing_weights,
+            selected_experts,
+            hidden_states,
+            fc1_1_weight,
+            fc1_2_weight,
+            fc2_weight,
+            fc1_1_2_weight,
+            ep_group=get_parallel_state().ep_group,
+        )
+    else:
+        final_hidden_states = _npu_fused_moe_forward(
+            num_experts,
+            routing_weights,
+            selected_experts,
+            hidden_states,
+            fc1_1_weight,
+            fc1_2_weight,
+            fc2_weight,
+            fc1_1_2_weight,
+        )
+    return final_hidden_states
 
 
 def npu_fused_moe_forward(
