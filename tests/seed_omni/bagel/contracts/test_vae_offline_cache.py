@@ -120,6 +120,27 @@ def test_bagel_vae_online_process_consumes_variable_size_cache_items_without_pad
     assert second.value.shape == (2, 2, 2)
 
 
+def test_bagel_vae_online_process_preserves_cached_dummy_without_duplication() -> None:
+    model = _tiny_vae(support_cache=True, train_type="train_with_cache")
+    dummy = ConversationItem(
+        type="image",
+        value=torch.zeros(2, model.config.z_channels, 2, 1),
+        role="dummy",
+        source=BAGEL_VAE_CONTEXT,
+    )
+    conversation = [[dummy]]
+
+    pre = model.online_process_pre(conversation_list=conversation)
+    out = model.online_process(encoded_cache=pre["encoded_cache"])
+    post = model.post_forward("online_process", latents=out["latents"])
+
+    assert post["conversation_list"] is conversation
+    assert conversation[0][0].source == BAGEL_VAE_CONTEXT
+    assert conversation[0][0].role == "dummy"
+    assert conversation[0][0].value.shape == (model.config.z_channels, 2, 1)
+    assert conversation[0][0].meta == {}
+
+
 def test_bagel_vae_online_process_rejects_flattened_item_cache() -> None:
     model = _tiny_vae(support_cache=True, train_type="train_with_cache")
 

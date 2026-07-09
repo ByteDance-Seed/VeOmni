@@ -80,8 +80,8 @@ class Qwen3VLVisionCPUPreprocessor(CPUPreprocessor):
     Holds only the (picklable) HF image / video processors + a CPU zero-patch
     template — never the model. Runs them on **CPU** (bf16, to halve IPC), writes
     the per-item normalized patches onto ``item.value`` and stashes ``grid_thw`` on
-    ``meta``. When a micro-batch has **no** user image/video, appends a
-    ``role="dummy"`` placeholder per sample
+    ``meta``. For each sample without a user image/video, appends a
+    ``role="dummy"`` placeholder
     carrying the zero patches + grid (the merger still runs on it in the GPU
     forward for the FSDP gradient anchor).
     """
@@ -104,32 +104,29 @@ class Qwen3VLVisionCPUPreprocessor(CPUPreprocessor):
         self, conversation_list: list[list[ConversationItem]], inference: bool = False, **kwargs: Any
     ) -> None:
         del kwargs  # generation_kwargs unused: prep is kwarg-independent
-        image_items = list(iter_desired_items(conversation_list, types=["image"], roles=["user"]))
-        video_items = list(iter_desired_items(conversation_list, types=["video"], roles=["user"]))
-        if image_items and self._image_processor is not None:
-            out = self._image_processor(images=[it.value for it in image_items], return_tensors="pt")
-            self._store(image_items, out["pixel_values"], out["image_grid_thw"])
-        if video_items and self._video_processor is not None:
-            frames = [it.value.video for it in video_items]
-            out = self._video_processor(
-                videos=frames, video_metadata=_video_metadata(video_items, frames), return_tensors="pt"
-            )
-            self._store(video_items, out["pixel_values_videos"], out["video_grid_thw"])
-        if image_items or video_items or inference:
-            # Real image/video present → no dummy needed. Inference also skips the
-            # dummy: a text-only request just leaves ``generate`` nothing to encode
-            # (no FSDP gradient anchor required at inference).
-            return
         for sample in conversation_list:
-            sample.append(
-                ConversationItem(
-                    type="image",
-                    value=self._dummy_pixel_values,
-                    role="dummy",
-                    source=_SOURCE,
-                    meta={_OMNI_GRID: self._dummy_grid},
+            sample_image_items = list(iter_desired_items([sample], types=["image"], roles=["user"]))
+            sample_video_items = list(iter_desired_items([sample], types=["video"], roles=["user"]))
+            if sample_image_items or sample_video_items:
+                if sample_image_items and self._image_processor is not None:
+                    out = self._image_processor(images=[it.value for it in sample_image_items], return_tensors="pt")
+                    self._store(sample_image_items, out["pixel_values"], out["image_grid_thw"])
+                if sample_video_items and self._video_processor is not None:
+                    frames = [it.value.video for it in sample_video_items]
+                    out = self._video_processor(
+                        videos=frames, video_metadata=_video_metadata(sample_video_items, frames), return_tensors="pt"
+                    )
+                    self._store(sample_video_items, out["pixel_values_videos"], out["video_grid_thw"])
+            elif not inference:
+                sample.append(
+                    ConversationItem(
+                        type="image",
+                        value=self._dummy_pixel_values,
+                        role="dummy",
+                        source=_SOURCE,
+                        meta={_OMNI_GRID: self._dummy_grid},
+                    )
                 )
-            )
 
     def _store(self, items: list, pixel_values: torch.Tensor, grid_thw: torch.Tensor) -> None:
         _store_patches(items, pixel_values, grid_thw, self._dtype)

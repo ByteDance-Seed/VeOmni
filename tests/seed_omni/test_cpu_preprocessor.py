@@ -40,7 +40,11 @@ from veomni.models.seed_omni.modules.bagel.text_encoder.modulemixin import (
     BagelTextEncoderCPUPreprocessor,
 )
 from veomni.models.seed_omni.modules.bagel.vae.configuration import BagelVAEConfig
-from veomni.models.seed_omni.modules.bagel.vae.modulemixin import BagelVAECPUPreprocessor, BagelVAEModuleMixin
+from veomni.models.seed_omni.modules.bagel.vae.modulemixin import (
+    BAGEL_VAE_PIXEL_SHAPE,
+    BagelVAECPUPreprocessor,
+    BagelVAEModuleMixin,
+)
 from veomni.models.seed_omni.modules.bagel.vae.processing import BagelVAEProcessor
 from veomni.models.seed_omni.modules.janus.siglip.modulemixin import (
     JanusSiglipCPUPreprocessor,
@@ -291,6 +295,7 @@ def test_bagel_siglip_preprocessor_patchifies_and_tags_context():
             vit_max_num_patch_per_side=2,
         ),
         dtype=torch.bfloat16,
+        dummy_pixel_values=torch.zeros(1, 2 * 2 * 3, dtype=torch.bfloat16),
     )
     batch = [
         [
@@ -310,6 +315,82 @@ def test_bagel_siglip_preprocessor_patchifies_and_tags_context():
     assert item.meta[BAGEL_SIGLIP_POSITION_IDS].tolist() == [0, 1, 2, 3]
     assert item.value.shape == (4, 2 * 2 * 3)
     assert item.value.dtype == torch.bfloat16
+
+
+def test_bagel_siglip_preprocessor_appends_per_sample_dummy_for_missing_context():
+    pre = BagelSiglipNavitCPUPreprocessor(
+        BagelSiglipNavitProcessor(
+            patch_size=2,
+            image_size=4,
+            min_image_size=2,
+            max_pixels=16,
+            vit_max_num_patch_per_side=2,
+        ),
+        dtype=torch.bfloat16,
+        dummy_pixel_values=torch.zeros(1, 2 * 2 * 3, dtype=torch.bfloat16),
+    )
+    batch = [
+        [
+            ConversationItem(
+                type="image",
+                value=torch.full((3, 4, 4), 7, dtype=torch.uint8),
+                role="user",
+                source=BAGEL_SIGLIP_CONTEXT,
+            )
+        ],
+        [ConversationItem(type="text", value="text-only", role="user")],
+    ]
+
+    pre(batch)
+
+    assert len(_worker_dummies(batch, BAGEL_SIGLIP_CONTEXT)) == 1
+    assert len(batch[0]) == 1
+    dummy = batch[1][-1]
+    assert dummy.type == "image"
+    assert dummy.role == "dummy"
+    assert dummy.source == BAGEL_SIGLIP_CONTEXT
+    assert dummy.meta[BAGEL_SIGLIP_TOKEN_LEN] == 1
+    assert dummy.meta[BAGEL_SIGLIP_POSITION_IDS].tolist() == [0]
+    assert dummy.value.shape == (1, 2 * 2 * 3)
+    assert dummy.value.dtype == torch.bfloat16
+
+
+def test_bagel_siglip_preprocessor_keeps_bs4_sample_aligned_for_0_2_4_images():
+    pre = BagelSiglipNavitCPUPreprocessor(
+        BagelSiglipNavitProcessor(
+            patch_size=2,
+            image_size=4,
+            min_image_size=2,
+            max_pixels=16,
+            vit_max_num_patch_per_side=2,
+        ),
+        dtype=torch.bfloat16,
+        dummy_pixel_values=torch.zeros(1, 2 * 2 * 3, dtype=torch.bfloat16),
+    )
+
+    for real_count in (0, 2, 4):
+        batch = []
+        for index in range(4):
+            if index < real_count:
+                batch.append(
+                    [
+                        ConversationItem(
+                            type="image",
+                            value=torch.full((3, 4, 4), 7, dtype=torch.uint8),
+                            role="user",
+                            source=BAGEL_SIGLIP_CONTEXT,
+                        )
+                    ]
+                )
+            else:
+                batch.append([ConversationItem(type="text", value=f"text-{index}", role="user")])
+
+        pre(batch)
+
+        assert len(_worker_dummies(batch, BAGEL_SIGLIP_CONTEXT)) == 4 - real_count
+        for sample in batch:
+            context_items = [item for item in sample if item.type == "image" and item.source == BAGEL_SIGLIP_CONTEXT]
+            assert len(context_items) == 1
 
 
 def test_bagel_vae_process_only_skips_cpu_preprocessor():
@@ -340,10 +421,13 @@ def test_bagel_preprocessors_route_inference_edit_prompt_context():
     siglip_pre = BagelSiglipNavitCPUPreprocessor(
         BagelSiglipNavitProcessor(patch_size=2, image_size=4, min_image_size=2, max_pixels=16),
         dtype=torch.bfloat16,
+        dummy_pixel_values=torch.zeros(1, 2 * 2 * 3, dtype=torch.bfloat16),
     )
     vae_pre = BagelVAECPUPreprocessor(
         BagelVAEProcessor(image_stride=2, min_image_size=4, max_image_size=4, max_pixels=16),
         dtype=torch.bfloat16,
+        dummy_pixel_values=torch.zeros(3, 2, 2, dtype=torch.bfloat16),
+        dummy_pixel_shape=torch.tensor([2, 2], dtype=torch.long),
     )
     user_image = torch.full((3, 4, 4), 7, dtype=torch.uint8)
     assistant_image = torch.full((3, 4, 4), 9, dtype=torch.uint8)
@@ -397,6 +481,8 @@ def test_bagel_preprocessors_route_inference_und_user_image_to_siglip_only():
     vae_pre = BagelVAECPUPreprocessor(
         BagelVAEProcessor(image_stride=2, min_image_size=4, max_image_size=4, max_pixels=16),
         dtype=torch.bfloat16,
+        dummy_pixel_values=torch.zeros(3, 2, 2, dtype=torch.bfloat16),
+        dummy_pixel_shape=torch.tensor([2, 2], dtype=torch.long),
     )
     text_pre = BagelTextEncoderCPUPreprocessor(_bagel_template())
     image = torch.full((3, 4, 4), 7, dtype=torch.uint8)
@@ -408,6 +494,73 @@ def test_bagel_preprocessors_route_inference_und_user_image_to_siglip_only():
     assert [item.type for item in batch[0]] == ["text", "image", "text"]
     assert batch[0][1].source == BAGEL_SIGLIP_CONTEXT
     assert torch.equal(batch[0][1].value, image)
+
+
+def test_bagel_vae_preprocessor_appends_per_sample_dummy_for_missing_context():
+    pre = BagelVAECPUPreprocessor(
+        BagelVAEProcessor(image_stride=2, min_image_size=4, max_image_size=4, max_pixels=16),
+        dtype=torch.bfloat16,
+        dummy_pixel_values=torch.zeros(3, 2, 2, dtype=torch.bfloat16),
+        dummy_pixel_shape=torch.tensor([2, 2], dtype=torch.long),
+    )
+    batch = [
+        [ConversationItem(type="image", value=torch.full((3, 4, 4), 9, dtype=torch.uint8), role="assistant")],
+        [ConversationItem(type="text", value="text-only", role="user")],
+    ]
+
+    pre(batch)
+
+    real = batch[0][0]
+    assert real.source == BAGEL_VAE_CONTEXT
+    assert real.value.shape == (3, 4, 4)
+    assert real.value.dtype == torch.bfloat16
+    assert real.meta[BAGEL_VAE_PIXEL_SHAPE].tolist() == [4, 4]
+
+    assert len(_worker_dummies(batch, BAGEL_VAE_CONTEXT)) == 1
+    dummy = batch[1][-1]
+    assert dummy.type == "image"
+    assert dummy.role == "dummy"
+    assert dummy.source == BAGEL_VAE_CONTEXT
+    assert dummy.meta[BAGEL_VAE_PIXEL_SHAPE].tolist() == [4, 4]
+    assert dummy.value.shape == real.value.shape
+    assert dummy.value.dtype == torch.bfloat16
+    torch.stack([real.value, dummy.value], dim=0)
+
+
+def test_bagel_vae_preprocessor_keeps_bs4_sample_aligned_for_0_2_4_images():
+    pre = BagelVAECPUPreprocessor(
+        BagelVAEProcessor(image_stride=2, min_image_size=4, max_image_size=4, max_pixels=16),
+        dtype=torch.bfloat16,
+        dummy_pixel_values=torch.zeros(3, 2, 2, dtype=torch.bfloat16),
+        dummy_pixel_shape=torch.tensor([2, 2], dtype=torch.long),
+    )
+
+    for real_count in (0, 2, 4):
+        batch = []
+        for index in range(4):
+            if index < real_count:
+                batch.append(
+                    [
+                        ConversationItem(
+                            type="image",
+                            value=torch.full((3, 4, 4), 9, dtype=torch.uint8),
+                            role="assistant",
+                        )
+                    ]
+                )
+            else:
+                batch.append([ConversationItem(type="text", value=f"text-{index}", role="user")])
+
+        pre(batch)
+
+        assert len(_worker_dummies(batch, BAGEL_VAE_CONTEXT)) == 4 - real_count
+        for sample in batch:
+            context_items = [item for item in sample if item.type == "image" and item.source == BAGEL_VAE_CONTEXT]
+            assert len(context_items) == 1
+        shapes = [tuple(sample[-1].value.shape) for sample in batch]
+        assert len(set(shapes)) == 1
+        expected_shape = (3, 2, 2) if real_count == 0 else (3, 4, 4)
+        assert shapes[0] == expected_shape
 
 
 # ── Qwen3 / Qwen3-VL text preprocessors ─────────────────────────────────────────
@@ -627,6 +780,23 @@ def test_siglip_no_dummy_when_user_image_present():
     assert batch[0][0].value.dtype == torch.bfloat16  # real image normalized instead
 
 
+def test_siglip_appends_dummy_for_missing_samples_in_mixed_batch():
+    pre = JanusSiglipCPUPreprocessor(
+        FakeImageProcessor(), dtype=torch.bfloat16, dummy_pixel_values=torch.zeros(3, 4, 4, dtype=torch.bfloat16)
+    )
+    batch = [
+        [ConversationItem(type="image", value=torch.zeros(3, 4, 4, dtype=torch.uint8), role="user")],
+        [ConversationItem(type="text", value="text-only", role="user")],
+    ]
+    pre(batch)
+
+    dummies = _worker_dummies(batch, "janus_siglip")
+    assert len(dummies) == 1
+    assert len(batch[0]) == 1
+    assert dummies[0] is batch[1][-1]
+    assert dummies[0].source == "janus_siglip"
+
+
 def test_vqvae_appends_dummy_only_when_no_assistant_image():
     pre = JanusVqvaeCPUPreprocessor(
         FakeImageProcessor(), dtype=torch.bfloat16, dummy_pixel_values=torch.zeros(3, 4, 4, dtype=torch.bfloat16)
@@ -636,6 +806,23 @@ def test_vqvae_appends_dummy_only_when_no_assistant_image():
     dummies = _worker_dummies(batch, "janus_vqvae")
     assert len(dummies) == len(batch)
     assert all(d.source == "janus_vqvae" and d.value.shape == (3, 4, 4) for d in dummies)
+
+
+def test_vqvae_appends_dummy_for_missing_samples_in_mixed_batch():
+    pre = JanusVqvaeCPUPreprocessor(
+        FakeImageProcessor(), dtype=torch.bfloat16, dummy_pixel_values=torch.zeros(3, 4, 4, dtype=torch.bfloat16)
+    )
+    batch = [
+        [ConversationItem(type="image", value=torch.zeros(3, 4, 4, dtype=torch.uint8), role="assistant")],
+        [ConversationItem(type="text", value="text-only", role="user")],
+    ]
+    pre(batch)
+
+    dummies = _worker_dummies(batch, "janus_vqvae")
+    assert len(dummies) == 1
+    assert len(batch[0]) == 1
+    assert dummies[0] is batch[1][-1]
+    assert dummies[0].source == "janus_vqvae"
 
 
 def test_qwen3vl_vision_appends_dummy_with_grid_when_no_visual():
@@ -654,6 +841,28 @@ def test_qwen3vl_vision_appends_dummy_with_grid_when_no_visual():
     for d in dummies:
         assert d.value.shape == (4, 8) and d.value.dtype == torch.bfloat16
         assert d.meta[_OMNI_GRID] == [1, 2, 2] and d.source == "qwen3vl_vision"
+
+
+def test_qwen3vl_vision_appends_dummy_for_missing_samples_in_mixed_batch():
+    pre = Qwen3VLVisionCPUPreprocessor(
+        FakeQwen3VLImageProcessor(),
+        None,
+        dtype=torch.bfloat16,
+        dummy_pixel_values=torch.zeros(4, 8, dtype=torch.bfloat16),
+        dummy_grid=[1, 2, 2],
+    )
+    batch = [
+        [ConversationItem(type="image", value=torch.zeros(3, 4, 4, dtype=torch.uint8), role="user")],
+        [ConversationItem(type="text", value="text-only", role="user")],
+    ]
+    pre(batch)
+
+    dummies = _worker_dummies(batch, "qwen3vl_vision")
+    assert len(dummies) == 1
+    assert len(batch[0]) == 1
+    assert dummies[0] is batch[1][-1]
+    assert dummies[0].meta[_OMNI_GRID] == [1, 2, 2]
+    assert dummies[0].source == "qwen3vl_vision"
 
 
 def test_worker_dummy_routes_to_dummy_parts_in_text_template():
@@ -740,10 +949,13 @@ def test_preprocessors_are_picklable():
         BagelSiglipNavitCPUPreprocessor(
             BagelSiglipNavitProcessor(patch_size=2, image_size=4, min_image_size=2, max_pixels=16),
             dtype=torch.bfloat16,
+            dummy_pixel_values=torch.zeros(1, 2 * 2 * 3, dtype=torch.bfloat16),
         ),
         BagelVAECPUPreprocessor(
             BagelVAEProcessor(image_stride=2, min_image_size=4, max_image_size=4, max_pixels=16),
             dtype=torch.bfloat16,
+            dummy_pixel_values=torch.zeros(3, 2, 2, dtype=torch.bfloat16),
+            dummy_pixel_shape=torch.tensor([2, 2], dtype=torch.long),
         ),
         Qwen3VLVisionCPUPreprocessor(
             FakeQwen3VLImageProcessor(),

@@ -42,8 +42,8 @@ class JanusVqvaeCPUPreprocessor(CPUPreprocessor):
     Holds only the (picklable) VQVAE image processor + a CPU zero-pixel template
     — never the model. Runs the HF image processor on **CPU** (bf16, to halve
     IPC); writes the pixel tensor back into each ``assistant``-image item.
-    When a micro-batch has **no** assistant image, appends a ``role="dummy"``
-    placeholder per sample carrying the zero pixels (the codec + generation heads
+    For each sample without an assistant image, appends a ``role="dummy"``
+    placeholder carrying the zero pixels (the codec + generation heads
     still run on it in the GPU forward for the FSDP gradient anchor).
     """
 
@@ -56,22 +56,19 @@ class JanusVqvaeCPUPreprocessor(CPUPreprocessor):
         self, conversation_list: list[list[ConversationItem]], inference: bool = False, **kwargs: Any
     ) -> None:
         del kwargs  # generation_kwargs unused: prep is kwarg-independent
-        image_items = list(iter_desired_items(conversation_list, types=["image"], roles=["assistant"]))
-        if image_items:
-            # Real assistant images present → normalize them; no dummy needed.
-            # Tag with the module source so the decode path can pick up real gen
-            # images and dummies uniformly (single ``source == _SOURCE`` filter).
-            pixel_values = self._image_processor(images=[it.value for it in image_items], return_tensors="pt")[
-                "pixel_values"
-            ]
-            for it, px in zip(image_items, pixel_values, strict=True):
-                it.value = px.to(dtype=self._dtype)
-                it.source = _SOURCE
-        elif not inference:
-            # Training only: inject a dummy so the codec + generation heads still
-            # run (FSDP gradient anchor). At inference the assistant image is
-            # generated token-by-token, so there is nothing to pre-encode here.
-            for sample in conversation_list:
+        for sample in conversation_list:
+            sample_image_items = list(iter_desired_items([sample], types=["image"], roles=["assistant"]))
+            if sample_image_items:
+                # Real assistant images present → normalize them; no dummy needed.
+                # Tag with the module source so the decode path can pick up real gen
+                # images and dummies uniformly (single ``source == _SOURCE`` filter).
+                pixel_values = self._image_processor(
+                    images=[it.value for it in sample_image_items], return_tensors="pt"
+                )["pixel_values"]
+                for it, px in zip(sample_image_items, pixel_values, strict=True):
+                    it.value = px.to(dtype=self._dtype)
+                    it.source = _SOURCE
+            elif not inference:
                 sample.append(
                     ConversationItem(
                         type="image",

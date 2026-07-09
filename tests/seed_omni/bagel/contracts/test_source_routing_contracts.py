@@ -180,7 +180,7 @@ def test_bagel_qwen2_mot_siglip_alignment_uses_source_before_shape() -> None:
         type="image",
         value=torch.ones(1, hidden_size, requires_grad=True),
         role="dummy",
-        meta={"source": "bagel_siglip_navit"},
+        source=BAGEL_SIGLIP_CONTEXT,
     )
     raw_hidden_shaped_image = ConversationItem(
         type="image",
@@ -228,7 +228,7 @@ def test_bagel_qwen2_mot_flow_alignment_requires_real_flow_item() -> None:
         type="output",
         value=torch.ones(1, hidden_size, requires_grad=True),
         role="dummy",
-        meta={"source": "bagel_flow_connector"},
+        source="bagel_flow_connector",
     )
     unrelated_output = ConversationItem(
         type="output",
@@ -259,7 +259,6 @@ def test_bagel_flow_dummy_embed_anchors_to_vae_dummy_output() -> None:
         value=torch.ones(1, 1, 1, requires_grad=True),
         role="dummy",
         source=BAGEL_VAE_CONTEXT,
-        meta={"source": "bagel_vae"},
     )
     conversation = [[vae_dummy]]
 
@@ -273,7 +272,8 @@ def test_bagel_flow_dummy_embed_anchors_to_vae_dummy_output() -> None:
     flow_dummy = conversation[0][-1]
     assert flow_dummy.type == "output"
     assert flow_dummy.role == "dummy"
-    assert flow_dummy.meta == {"source": "bagel_flow_connector"}
+    assert flow_dummy.source == "bagel_flow_connector"
+    assert flow_dummy.meta == {}
     assert torch.is_tensor(flow_dummy.value)
     assert flow_dummy.value.requires_grad
 

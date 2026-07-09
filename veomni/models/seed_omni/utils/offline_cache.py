@@ -24,7 +24,7 @@ from datasets import Dataset
 
 from ....distributed.parallel_state import get_parallel_state
 from ....utils import logging
-from .conversation import ConversationItem, is_dummy
+from .conversation import ConversationItem
 
 
 logger = logging.get_logger(__name__)
@@ -67,11 +67,11 @@ class SeedOmniOfflineCacheWriter:
 
     def save_conversation_list(self, conversation_list: list[list[ConversationItem]]) -> None:
         for sample in conversation_list:
-            filtered = [self._cpu_recursive(item) for item in sample if not is_dummy(item)]
-            if not filtered:
+            persisted = [self._cpu_recursive(item) for item in sample]
+            if not persisted:
                 continue
 
-            self.buffer.append({"conversation_list": pickle.dumps(filtered)})
+            self.buffer.append({"conversation_list": pickle.dumps(persisted)})
             self.rows_written += 1
             if len(self.buffer) >= self.max_rows_per_shard:
                 self.flush()

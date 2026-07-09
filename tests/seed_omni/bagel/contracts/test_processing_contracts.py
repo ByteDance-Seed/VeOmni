@@ -438,10 +438,7 @@ def test_bagel_vae_decode_skips_context_hidden_outputs():
     )
     conversation = [[context_hidden, vae_context, training_latent, velocity, final_latent]]
 
-    out = model.decode_pre(conversation_list=conversation)
-
-    assert model._decode_items == [final_latent]
-    assert out["latents"].shape == (1, 4, 2, 2)
+    assert model._select_vae_decode_items(conversation) == [final_latent]
 
 
 def test_bagel_vae_decode_generated_returns_generated_image():

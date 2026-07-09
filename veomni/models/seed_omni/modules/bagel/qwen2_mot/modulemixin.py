@@ -192,7 +192,7 @@ class BagelQwen2MoTModuleMixin(ModuleMixin):
                             type="output",
                             value=hidden_states[:1].squeeze(0).to(device=self.device),
                             role="dummy",
-                            meta={"source": "bagel_qwen2_mot"},
+                            source="bagel_qwen2_mot",
                         )
                     )
             return {"conversation_list": conversation}
@@ -232,12 +232,12 @@ class BagelQwen2MoTModuleMixin(ModuleMixin):
             if not torch.is_tensor(item.value):
                 continue
 
-            source = item.meta.get("source")
-            if source not in ["bagel_flow_connector", "bagel_siglip_navit"]:
+            source = item.source
+            if source not in ["bagel_flow_connector", BAGEL_SIGLIP_CONTEXT]:
                 continue
             if source == "bagel_flow_connector" and not include_flow_dummy:
                 continue
-            if source == "bagel_siglip_navit" and not include_siglip_dummy:
+            if source == BAGEL_SIGLIP_CONTEXT and not include_siglip_dummy:
                 continue
 
             has_anchor = True
