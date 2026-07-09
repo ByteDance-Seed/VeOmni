@@ -19,31 +19,29 @@ import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
 
-# Test-only injection seam for the Ulysses group.
-#
-# The sequence-parallel unit tests (``tests/parallel/ulysses/*``) exercise the
-# SP collectives against a raw process group WITHOUT building a ParallelState /
-# device mesh, so they set this override directly. In every production path it
-# stays ``None`` and the group is resolved from the current ParallelState (see
-# ``get_ulysses_sequence_parallel_group``).
-_ULYSSES_SP_GROUP_OVERRIDE: Optional[ProcessGroup] = None
-
-
 def _current_state():
     # Lazy import: parallel_state imports this module, so importing at module
     # scope would be circular. The groups intentionally live on the state's
     # device mesh (like dp/fsdp), not in module-level globals — so a per-module
     # forward scoped by ``use_parallel_state`` resolves its own groups, even
     # when sibling Omni modules run at different SP sizes.
-    from ..parallel_state import get_parallel_state
+    #
+    # Reads the module global directly (not ``get_parallel_state()``) so an
+    # UNINITIALIZED process resolves to ``None`` — i.e. "no groups" — instead of
+    # constructing a default ``ParallelState`` that validates against the
+    # distributed world size and raises. Production always initializes via
+    # ``init_parallel_state`` before any SP op runs; this ``None`` path only
+    # covers pre-init / unit-test code (which drives SP via the override seam).
+    from .. import parallel_state
 
-    return get_parallel_state()
+    return parallel_state._PARALLEL_STATE
 
 
 # ------------------------------ Data Parallel ------------------------------ #
 def get_data_parallel_group() -> Optional[dist.ProcessGroup]:
     """Data-parallel group of the current parallel state."""
-    return _current_state().dp_group
+    ps = _current_state()
+    return ps.dp_group if ps is not None else None
 
 
 def get_data_parallel_rank() -> int:
@@ -57,26 +55,17 @@ def get_data_parallel_world_size() -> int:
 
 
 # ----------------------------- Ulysses Parallel ---------------------------- #
-def set_ulysses_sequence_parallel_group(group: Optional[dist.ProcessGroup]):
-    """Inject the Ulysses group directly (unit-test seam).
-
-    Production code MUST NOT call this — the group follows the current
-    ParallelState. It exists only so the SP unit tests can drive the collectives
-    without constructing a device mesh (see ``_ULYSSES_SP_GROUP_OVERRIDE``).
-    """
-    global _ULYSSES_SP_GROUP_OVERRIDE
-    _ULYSSES_SP_GROUP_OVERRIDE = group
-
-
 def get_ulysses_sequence_parallel_group() -> Optional[dist.ProcessGroup]:
     """Ulysses group of the current parallel state.
 
     Scoped per-module by ``use_parallel_state``, so heterogeneous per-module SP
-    sizes each get their own group with no global key bookkeeping. Falls back to
-    the unit-test override when no SP-enabled mesh state is current.
+    sizes each get their own group with no global key bookkeeping. Resolves from
+    the current ``ParallelState``'s device mesh; returns ``None`` when no state is
+    current (uninitialized process). Tests that exercise SP collectives build a
+    real state via ``init_parallel_state(dp_size=1, ulysses_size=world_size)``.
     """
-    group = _current_state().ulysses_group
-    return group if group is not None else _ULYSSES_SP_GROUP_OVERRIDE
+    ps = _current_state()
+    return ps.ulysses_group if ps is not None else None
 
 
 def get_ulysses_sequence_parallel_rank(group: ProcessGroup = None) -> int:
@@ -98,7 +87,8 @@ def get_ulysses_sequence_parallel_world_size(group: ProcessGroup = None) -> int:
 # ----------------------------- Context Parallel ---------------------------- #
 def get_context_parallel_group(check_initialized=True):
     """Get the context parallel group of the current parallel state."""
-    group = _current_state().cp_group
+    ps = _current_state()
+    group = ps.cp_group if ps is not None else None
     if check_initialized:
         assert group is not None, "context parallel group is not initialized"
     return group
@@ -124,7 +114,8 @@ def get_context_parallel_world_size():
 # ----------------------------- Unified Parallel ---------------------------- #
 def get_unified_sequence_parallel_group() -> Optional[dist.ProcessGroup]:
     """Unified (ulysses × cp) sequence-parallel group of the current state."""
-    return _current_state().sp_group
+    ps = _current_state()
+    return ps.sp_group if ps is not None else None
 
 
 def get_unified_sequence_parallel_rank() -> int:

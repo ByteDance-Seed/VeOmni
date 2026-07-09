@@ -86,8 +86,9 @@ graph's `_module_scope`) already scopes `_PARALLEL_STATE` per module for its
 forward and its grad-checkpoint recompute, the global attention integration
 (`veomni_flash_attention_2_with_sp`, which only reaches the group through
 `get_ulysses_sequence_parallel_group()`) automatically all-to-alls over the
-scoped module's own group. No key bookkeeping. (`set_ulysses_sequence_parallel_group`
-survives only as a unit-test seam.)
+scoped module's own group. No key bookkeeping. (No group-injection seam: SP unit
+tests build a real state via `init_parallel_state(dp_size=1, ulysses_size=world_size)`
+and toggle the no-SP path with `set_parallel_state(None)`.)
 
 **Nested-config gotcha:** an SP module whose real weights live in a nested HF
 config (e.g. `Qwen3VLVisionEncoderConfig.vision_config`,
