@@ -484,10 +484,13 @@ def test_bagel_preprocessors_route_tagged_edit_without_infer_type():
     siglip_pre = BagelSiglipNavitCPUPreprocessor(
         BagelSiglipNavitProcessor(patch_size=2, image_size=4, min_image_size=2, max_pixels=16),
         dtype=torch.bfloat16,
+        dummy_pixel_values=torch.zeros(1, 12, dtype=torch.bfloat16),
     )
     vae_pre = BagelVAECPUPreprocessor(
         BagelVAEProcessor(image_stride=2, min_image_size=4, max_image_size=4, max_pixels=16),
         dtype=torch.bfloat16,
+        dummy_pixel_values=torch.zeros(3, 2, 2, dtype=torch.bfloat16),
+        dummy_pixel_shape=torch.tensor([2, 2], dtype=torch.long),
     )
     user_image = torch.full((3, 4, 4), 7, dtype=torch.uint8)
     assistant_image = torch.full((3, 4, 4), 9, dtype=torch.uint8)

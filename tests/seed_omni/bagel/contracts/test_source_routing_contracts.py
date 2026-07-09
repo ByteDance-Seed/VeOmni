@@ -69,14 +69,11 @@ def test_bagel_route_image_sources_prefers_img_tag() -> None:
     assert int(sample[3].value[0, 0, 0]) == 2
 
 
-def test_bagel_route_image_sources_requires_img_tag_for_raw_images() -> None:
+def test_bagel_route_image_sources_requires_img_tag_for_raw_training_images() -> None:
     image = ConversationItem(type="image", value=torch.zeros(3, 2, 2), role="assistant")
 
     with pytest.raises(ValueError, match="_img_tag"):
         route_image_sources([[image]], inference=False, infer_type=None)
-
-    with pytest.raises(ValueError, match="_img_tag"):
-        route_image_sources([[image]], inference=True, infer_type="infer_gen")
 
 
 def test_bagel_route_image_sources_uses_infer_type_for_raw_inference_images() -> None:
@@ -496,7 +493,7 @@ def test_bagel_flow_training_decode_consumes_velocity_target_items() -> None:
 
     out = model.decode_velocity_pre(conversation_list=[[unrelated, target]])
 
-    assert model._decode_items == [target]
+    assert model._decode_target_groups == [[target]]
     assert out["hidden_states"].shape == (2, int(model.config.hidden_size))
 
 
