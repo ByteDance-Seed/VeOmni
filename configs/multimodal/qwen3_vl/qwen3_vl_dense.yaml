@@ -28,6 +28,11 @@ train:
       fsdp_mode: fsdp2
   gradient_checkpointing:
     enable_reentrant: false
+  chunk_mbs_config:
+    enable: false
+    chunk_mbs: 2
+    apply_modules:
+      - model.language_model.layers.*
   wandb:
     enable: false
     project: qwen3_vl_dense

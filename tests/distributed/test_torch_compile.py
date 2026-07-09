@@ -6,6 +6,7 @@ import torch
 import torch.nn as nn
 
 from veomni.arguments.arguments_types import (
+    ChunkMBSConfig,
     DataArguments,
     ModelArguments,
     OpsImplementationConfig,
@@ -238,6 +239,21 @@ def test_enable_compile_requires_dynamic_batching():
             data=DataArguments(train_path="dummy.jsonl", max_seq_len=8),
             train=TrainingArguments(
                 torch_compile=ArgumentsTorchCompileConfig(enable=True), dyn_bsz=False, pad_to_length=False
+            ),
+        )
+
+
+def test_enable_compile_rejects_chunk_mbs():
+    with pytest.raises(ValueError, match="train.chunk_mbs_config.enable is not supported"):
+        VeOmniArguments(
+            model=_model_args(),
+            data=DataArguments(train_path="dummy.jsonl", max_seq_len=8),
+            train=TrainingArguments(
+                torch_compile=ArgumentsTorchCompileConfig(enable=True),
+                chunk_mbs_config=ChunkMBSConfig(enable=True),
+                dyn_bsz=True,
+                pad_to_length=True,
+                micro_batch_size=2,
             ),
         )
 

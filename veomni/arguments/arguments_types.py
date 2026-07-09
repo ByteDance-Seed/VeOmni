@@ -33,6 +33,8 @@ logger = logging.get_logger(__name__)
 #   ├── wandb.*              → WandbConfig
 #   ├── profile.*            → ProfileConfig
 #   ├── gradient_checkpointing.*  → GradientCheckpointingConfig
+#   ├── torch_compile.*      → TorchCompileConfig
+#   ├── chunk_mbs_config.*   → ChunkMBSConfig
 #   ├── accelerator.*        → AcceleratorConfig
 #   │   ├── fsdp_config.*    → FSDPConfig
 #   │   |   └── mixed_precision.* → MixedPrecisionConfig
@@ -233,6 +235,32 @@ class GradientCheckpointingConfig:
     enable_reentrant: bool = field(
         default=False,
         metadata={"help": "Use reentrant gradient checkpointing."},
+    )
+
+
+@dataclass
+class ChunkMBSConfig:
+    """train.chunk_mbs_config.* — Packed-sequence layer micro-batching."""
+
+    enable: bool = field(
+        default=False,
+        metadata={"help": "Enable ChunkMBS for selected packed-sequence modules."},
+    )
+    chunk_mbs: int = field(
+        default=1,
+        metadata={"help": "Number of packed samples per layer chunk."},
+    )
+    apply_modules: List[str] = field(
+        default_factory=list,
+        metadata={"help": "Module FQN patterns to wrap, e.g. model.language_model.layers.*."},
+    )
+    sequence_dim: int = field(
+        default=1,
+        metadata={"help": "Sequence dimension of hidden_states for wrapped modules."},
+    )
+    strict: bool = field(
+        default=True,
+        metadata={"help": "Raise when ChunkMBS cannot be applied exactly."},
     )
 
 
@@ -607,6 +635,7 @@ class TrainingArguments:
     profile: ProfileConfig = field(default_factory=ProfileConfig)
     gradient_checkpointing: GradientCheckpointingConfig = field(default_factory=GradientCheckpointingConfig)
     torch_compile: TorchCompileConfig = field(default_factory=TorchCompileConfig)
+    chunk_mbs_config: ChunkMBSConfig = field(default_factory=ChunkMBSConfig)
     accelerator: AcceleratorConfig = field(default_factory=AcceleratorConfig)
     checkpoint: CheckpointConfig = field(default_factory=CheckpointConfig)
 
@@ -615,6 +644,8 @@ class TrainingArguments:
             raise ValueError(
                 f"dyn_bsz_physical_overflow_ratio must be >= 1.0, got {self.dyn_bsz_physical_overflow_ratio}."
             )
+        if self.chunk_mbs_config.chunk_mbs < 1:
+            raise ValueError(f"chunk_mbs_config.chunk_mbs must be >= 1, got {self.chunk_mbs_config.chunk_mbs}.")
 
         self._train_steps = -1
         self.local_rank = int(os.getenv("LOCAL_RANK", 0))
@@ -1305,6 +1336,11 @@ class VeOmniArguments:
                 logger.info_rank0(f"set pad_to_length = micro_batch_size * max_seq_len = {self.train.pad_to_length}")
 
         if self.train.torch_compile.enable:
+            if self.train.chunk_mbs_config.enable:
+                raise ValueError(
+                    "train.chunk_mbs_config.enable is not supported with train.torch_compile.enable yet. "
+                    "ChunkMBS wraps decoder forwards with per-batch chunk ranges before decoder blocks are compiled."
+                )
             if not getattr(self.data, "supports_torch_compile", True):
                 raise ValueError(
                     "train.torch_compile.enable currently supports text trainers only. "

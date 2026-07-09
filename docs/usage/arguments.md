@@ -65,6 +65,8 @@ Training loop, optimizer, parallelism, checkpointing, profiling, and logging.
     * `WandbConfig` — `train.wandb.*`
     * `ProfileConfig` — `train.profile.*`
     * `GradientCheckpointingConfig` — `train.gradient_checkpointing.*`
+    * `TorchCompileConfig` — `train.torch_compile.*`
+    * `ChunkMBSConfig` — `train.chunk_mbs_config.*`
     * `AcceleratorConfig` — `train.accelerator.*`
         * `FSDPConfig` — `train.accelerator.fsdp_config.*`
           * `MixedPrecisionConfig` — `train.accelerator.fsdp_config.mixed_precision`
@@ -235,6 +237,7 @@ NPU validation runs at two times:
 | profile | `ProfileConfig` | — | Torch profiler settings. |
 | gradient_checkpointing | `GradientCheckpointingConfig` | — | Gradient checkpointing settings. |
 | torch_compile | `TorchCompileConfig` | — | Per-block `torch.compile` settings. |
+| chunk_mbs_config | `ChunkMBSConfig` | — | Packed-sequence layer micro-batching settings. |
 | accelerator | `AcceleratorConfig` | — | Parallelism and distributed-training topology. |
 | checkpoint | `CheckpointConfig` | — | Checkpoint saving and loading. |
 
@@ -303,6 +306,23 @@ NPU validation runs at two times:
 | enable | `bool` | `True` | Enable gradient checkpointing. |
 | debug | `bool` | `False` | Enable [checkpoint debugging](https://docs.pytorch.org/docs/stable/checkpoint.html#torch.utils.checkpoint.set_checkpoint_debug_enabled). |
 | enable_reentrant | `bool` | `False` | Use reentrant gradient checkpointing. |
+
+### ChunkMBSConfig
+
+`train.chunk_mbs_config.*` — Packed-sequence layer micro-batching settings.
+
+`chunk_mbs` is the number of packed samples per layer chunk. With dynamic batching, the runtime sample
+count is inferred from `cu_seq_lens_q`, so it is independent of `train.micro_batch_size`. Chunks are cut
+only on packed sample boundaries. The current implementation requires packed-sequence FlashAttention kwargs,
+sequence parallelism disabled, and ExtraParallel/MoE disabled.
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| enable | `bool` | `False` | Enable ChunkMBS for selected packed-sequence modules. |
+| chunk_mbs | `int` | `1` | Number of packed samples per layer chunk. |
+| apply_modules | `List[str]` | `[]` | Module FQN patterns to wrap, e.g. `model.language_model.layers.*`. |
+| sequence_dim | `int` | `1` | Sequence dimension of `hidden_states` for wrapped modules. |
+| strict | `bool` | `True` | Raise when ChunkMBS cannot be applied exactly. |
 
 ### AcceleratorConfig
 
