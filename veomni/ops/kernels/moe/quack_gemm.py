@@ -30,6 +30,7 @@ from quack.gemm_interface import gemm
 from ....distributed.moe import preprocess, token_pre_all2all, tokens_post_all2all
 from ....distributed.parallel_state import get_parallel_state
 from ._kernels.kernel.moe import expert_histogram, moe_gather, moe_scatter
+from ._scatter import compute_expert_scatter_index
 from .group_gemm import _apply_swiglu_clamp
 
 
@@ -46,9 +47,10 @@ def _build_moe_indices(expert_index: torch.Tensor, num_experts: int):
         scatter_index: [T, topk] indices for moe_gather/moe_scatter (int32).
     """
     topk = expert_index.shape[1]
-    flat = expert_index.flatten()
-    sorted_order = flat.argsort(stable=True)
-    scatter_index = sorted_order.argsort().int().view(expert_index.shape)
+    # ``argsort().argsort()`` on the flat expert_index was two O(N log N) sorts.
+    # ``compute_expert_scatter_index`` returns the same ``sorted_order`` alongside
+    # an O(N) inverse-permutation ``scatter_index``.
+    sorted_order, scatter_index = compute_expert_scatter_index(expert_index)
     # A_idx maps expert-sorted positions to original token indices (0..T-1).
     # sorted_order values are flat indices (t*topk + k), so integer-divide by topk.
     A_idx = (sorted_order // topk).int()

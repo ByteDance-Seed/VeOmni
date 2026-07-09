@@ -1,0 +1,89 @@
+# VeOmni on AMD ROCm (Instinct MI300-series, gfx942).
+#
+# Base: rocm/primus:v26.4 — ships a gfx942-tuned ROCm 7.14 stack
+# (torch 2.12.0+rocm7.14, torchvision, triton, flash-attn 2.8.3). VeOmni has no
+# ROCm/HIP code and its uv.lock pins CUDA wheels, so we do NOT run `uv sync`.
+# Instead we reuse the image ROCm stack as-is and only layer the pure-Python
+# deps + the ROCm-specific fixes validated on 8xMI308X
+# (see rocm_validation/{UNIT,E2E}_TEST_REPORT.md and the wan2.1 / qwen3_omni runs).
+#
+# Build (no COPY in this Dockerfile, so use a tiny build context, NOT the repo
+# root which can be 100s of GB):
+#   docker build -f docker/rocm/Dockerfile.ROCm7.14 -t amdagi/veomni:rocm7.14_torch2.12_py3.12 docker/rocm
+#
+# Run (VeOmni itself is NOT baked in — the working tree can be 100s of GB; mount it):
+#   docker run -it --rm \
+#     --device /dev/kfd --device /dev/dri --group-add video \
+#     --ipc host --shm-size 32g --cap-add SYS_PTRACE \
+#     --security-opt seccomp=unconfined --security-opt label=disable \
+#     -v /path/to/VeOmni:/workspace/VeOmni -w /workspace/VeOmni \
+#     veomni-rocm:primus_v26.4 bash
+#   # once inside, register the editable package (instant, no deps touched):
+#   pip install -e . --no-deps
+#   # GPU detection in train.sh already handles ROCm via rocm-smi.
+FROM rocm/primus:v26.4
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PIP_ROOT_USER_ACTION=ignore \
+    PIP_NO_CACHE_DIR=1 \
+    MAX_JOBS=16
+
+# --- ROCm runtime env baked in ------------------------------------------------
+# MIOPEN_DEBUG_FORCE_IMMED_MODE_FALLBACK: skip MIOpen conv3d exhaustive tuning
+#   (otherwise the Wan VAE conv3d autotunes for minutes on the first call).
+# FLA_TILELANG=0: force fla GatedDeltaNet onto the Triton path; the tilelang
+#   ROCm backend in this stack has a HIP codegen bug (E2E report 2.3).
+ENV MIOPEN_DEBUG_FORCE_IMMED_MODE_FALLBACK=1 \
+    FLA_TILELANG=0 \
+    TOKENIZERS_PARALLELISM=false
+
+# ffmpeg: required by torchcodec for video container decode; git: editable installs.
+RUN apt-get update -y \
+    && apt-get install -y --no-install-recommends ffmpeg git \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# Pin the image ROCm stack so no downstream pip resolution can swap in CUDA wheels.
+RUN printf "%s\n" \
+      "torch==2.12.0+rocm7.14.0a20260608" \
+      "torchvision==0.27.0+rocm7.14.0a20260608" \
+      "triton==3.7.0+gitb4e20bbe.rocm7.14.0a20260608" \
+      "flash_attn==2.8.3" \
+      > /opt/rocm-constraints.txt
+ENV PIP_CONSTRAINT=/opt/rocm-constraints.txt
+
+# --- Pure-Python runtime & test deps (versions validated on MI308X) -----------
+# transformers v5 (VeOmni model patches target v5); diffusers>=0.37 (DiT/Wan
+# classes); liger-kernel (default cross_entropy); the rest are runtime/test deps
+# missing from the base image.
+RUN pip install \
+      "transformers==5.12.1" \
+      "diffusers==0.37.0" \
+      "liger-kernel==0.8.0" \
+      timm expecttest megatron-energon librosa soundfile ftfy hf_transfer rich
+
+# torchcodec CPU build. The default PyPI wheel is a CUDA build linking
+# libnvrtc/libcudart/libc10_cuda/libtorch_cuda and fails to load on ROCm.
+RUN pip install --no-deps torchcodec==0.14.0 --index-url https://download.pytorch.org/whl/cpu
+
+# GatedDeltaNet stack (qwen3_5, optional). flash-linear-attention is split and
+# needs fla-core for fla.modules/fla.ops; causal-conv1d compiles a HIP extension
+# against the in-image ROCm torch (hence --no-build-isolation). Best-effort.
+RUN pip install --no-build-isolation \
+      "flash-linear-attention==0.5.1" "fla-core==0.5.1" "causal-conv1d==1.5.0.post8" \
+      || echo "WARN: GatedDeltaNet stack only partially installed (qwen3_5 is optional)"
+
+# apache-tvm-ffi must stay <0.1.10 for tilelang compat (installed last so nothing
+# bumps it back). With FLA_TILELANG=0 the tilelang path is unused anyway.
+RUN pip install "apache-tvm-ffi==0.1.9"
+
+# PEFT / torchao pin. Newer peft (>=0.19) raises a hard ImportError unless
+# torchao>0.16 (peft.import_utils.is_torchao_available), which breaks the Wan
+# LoRA path. peft 0.18.1 keeps the torchao floor at 0.4.0, so the ROCm-friendly
+# torchao 0.9.0 is accepted. transformers/diffusers otherwise pull peft 0.19+.
+RUN pip install "peft==0.18.1" "torchao==0.9.0"
+
+# torch_shm_manager ships without the executable bit in this ROCm wheel, which
+# crashes DataLoader workers (SIGSEGV) during trainer save/load. Restore +x.
+RUN find /opt -type f -name torch_shm_manager -exec chmod +x {} +
+
+WORKDIR /workspace

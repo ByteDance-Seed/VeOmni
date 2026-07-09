@@ -18,9 +18,11 @@ Linear attention has many variants; this sub-package is scoped to the
 gated delta-rule family that Qwen3.5 uses. Unlike the kernel families in
 sibling sub-packages, none of them have a torch eager fallback that
 supports varlen training: HF's "eager" path here is essentially "raise at
-the first packed-sequence step". The non-eager backends come from the
+the first packed-sequence step". The GPU non-eager backends come from the
 ``flash-linear-attention`` (``fla``) library, plus an alternative
-``flash_qla`` implementation of ``chunk_gated_delta_rule`` from QwenLM.
+``flash_qla`` implementation of ``chunk_gated_delta_rule`` from QwenLM. On
+NPU, all three ops ship a ``npu`` backend backed by vendored Triton kernels
+(``triton-ascend``, kept under ``_ascend/``).
 
 Selection is driven by three fields on ``OpsImplementationConfig``:
 
@@ -29,9 +31,16 @@ Selection is driven by three fields on ``OpsImplementationConfig``:
 - ``chunk_gated_delta_rule_implementation`` ->
   ``OpSlot("chunk_gated_delta_rule", "standard")``
 
-Currently ``rms_norm_gated`` and ``causal_conv1d`` ship a single non-eager
-backend (``fla``); ``chunk_gated_delta_rule`` additionally accepts
-``flash_qla`` (shipped under the ``gpu`` extra).
+Backends per op:
+
+- ``rms_norm_gated``: ``fla`` (GPU), ``npu``.
+- ``causal_conv1d``: ``fla`` (GPU), ``npu``.
+- ``chunk_gated_delta_rule``: ``fla`` (GPU), ``flash_qla`` (GPU ``gpu`` extra,
+  Hopper SM90), ``npu``.
+
+The ``npu`` ``causal_conv1d`` backend is a thin adapter (``npu_causal_conv1d``)
+over the vendored kernel; the ``npu`` ``chunk_gated_delta_rule`` binds the
+vendored kernel directly (its signature already matches the call site).
 """
 
 from __future__ import annotations
@@ -119,6 +128,33 @@ KERNEL_REGISTRY.register(
 )
 
 
+# ── causal_conv1d (NPU vendored Triton) ──────────────────────────────────────
+
+
+def _npu_causal_conv1d_factory():
+    """Return the NPU causal conv1d adapter over the vendored Triton kernel.
+
+    Lazily imported so hosts without ``triton-ascend`` can still load this
+    module; the import (and its transitive Triton import) only fires when the
+    ``npu`` backend is actually selected and bound at ``OpSlot.bind()`` time.
+    """
+    from .npu_causal_conv1d import causal_conv1d
+
+    return causal_conv1d
+
+
+KERNEL_REGISTRY.register(
+    KernelSpec(
+        name="npu",
+        op_name="causal_conv1d",
+        variant="standard",
+        factory=_npu_causal_conv1d_factory,
+        hardware=HardwareRequirement(device_type="npu"),
+        description="NPU vendored Triton causal conv1d (varlen-aware, MindSpeed-MM)",
+    )
+)
+
+
 # ── chunk_gated_delta_rule (FLA + FlashQLA) ──────────────────────────────────
 
 
@@ -168,5 +204,34 @@ KERNEL_REGISTRY.register(
         factory=_flash_qla_chunk_gated_delta_rule_factory,
         hardware=HardwareRequirement(device_type="gpu", min_compute_capability=90, max_compute_capability=90),
         description="QwenLM FlashQLA chunk gated delta rule (Hopper SM90 only, alternative TileLang implementation)",
+    )
+)
+
+
+# ── chunk_gated_delta_rule (NPU vendored Triton) ─────────────────────────────
+
+
+def _npu_chunk_gated_delta_rule_factory():
+    """Return the vendored NPU chunk gated delta rule kernel directly.
+
+    Its public signature already matches the ``Qwen3_5GatedDeltaNet.forward``
+    call site (``q, k, v, g, beta, ..., use_qk_l2norm_in_kernel, cu_seqlens``)
+    and it returns ``(o, final_state)``, so no adapter is needed. Lazily
+    imported so the transitive Triton import only fires under the ``npu``
+    backend.
+    """
+    from ._ascend.chunk_gated_delta_rule_mm import chunk_gated_delta_rule
+
+    return chunk_gated_delta_rule
+
+
+KERNEL_REGISTRY.register(
+    KernelSpec(
+        name="npu",
+        op_name="chunk_gated_delta_rule",
+        variant="standard",
+        factory=_npu_chunk_gated_delta_rule_factory,
+        hardware=HardwareRequirement(device_type="npu"),
+        description="NPU vendored Triton chunk gated delta rule (varlen-aware, MindSpeed-MM)",
     )
 )
