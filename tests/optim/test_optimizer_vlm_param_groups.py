@@ -112,6 +112,32 @@ def test_build_optimizer_skips_empty_vlm_param_groups():
     assert opt.param_groups[0]["lr"] == 2e-5
 
 
+def test_vlm_trainer_style_param_groups_skip_empty_vit():
+    """Mirrors VLMTrainer._build_optimizer: only append groups that have
+    trainable params (freeze_vit -> vit_params == [] must not create a group).
+    """
+    model = _TinyModel()
+    vit_params, other_params = [], []
+    for name, param in model.named_parameters():
+        if param.requires_grad:
+            if "visual" in name:
+                vit_params.append(param)
+            else:
+                other_params.append(param)
+
+    param_groups = []
+    if vit_params:
+        param_groups.append({"params": vit_params, "lr": 1e-6})
+    if other_params:
+        param_groups.append({"params": other_params, "lr": 2e-5})
+
+    assert vit_params == []
+    assert len(param_groups) == 1
+    opt = build_optimizer(model, lr=2e-5, param_groups=param_groups)
+    assert len(opt.param_groups) == 1
+    assert opt.param_groups[0]["lr"] == 2e-5
+
+
 def test_vlm_style_optimizer_dcp_roundtrip_step_succeeds():
     """Reproduces production freeze_vit resume: save/load must keep betas."""
     model = _TinyModel()

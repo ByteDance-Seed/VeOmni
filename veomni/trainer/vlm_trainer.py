@@ -234,10 +234,15 @@ class VLMTrainer:
                 else:
                     other_params.append(param)
 
-        param_groups = [
-            {"params": vit_params, "lr": args.train.vit_lr},
-            {"params": other_params, "lr": args.train.optimizer.lr},
-        ]
+        # Only create groups that have trainable params. An empty vit group
+        # (freeze_vit=true) has no optimizer state under DCP and would raise
+        # KeyError: 'betas' on the first step after resume. VLMRLTrainer
+        # inherits this method, so the guard covers both trainers.
+        param_groups = []
+        if vit_params:
+            param_groups.append({"params": vit_params, "lr": args.train.vit_lr})
+        if other_params:
+            param_groups.append({"params": other_params, "lr": args.train.optimizer.lr})
 
         # Build optimizer
         self.base.optimizer = build_optimizer(
