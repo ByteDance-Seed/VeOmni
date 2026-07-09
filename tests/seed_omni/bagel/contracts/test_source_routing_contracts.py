@@ -577,6 +577,37 @@ def test_bagel_siglip_selector_requires_context_source() -> None:
     assert model._select_siglip_image_items([[context_image]]) == [context_image]
 
 
+def test_bagel_siglip_meter_reports_per_sample_real_image_tokens() -> None:
+    model = _tiny_siglip()
+
+    def real(length: int) -> ConversationItem:
+        return ConversationItem(
+            type="image",
+            value=torch.zeros(length, 8),
+            role="user",
+            source=BAGEL_SIGLIP_CONTEXT,
+            meta={"bagel_siglip_navit_token_len": length},
+        )
+
+    def dummy() -> ConversationItem:
+        return ConversationItem(
+            type="image",
+            value=torch.zeros(1, 8),
+            role="dummy",
+            source=BAGEL_SIGLIP_CONTEXT,
+            meta={"bagel_siglip_navit_token_len": 1},
+        )
+
+    conversation = [
+        [dummy()],
+        [real(4), real(9), real(11), real(16)],
+        [real(7)],
+        [dummy()],
+    ]
+
+    assert model._metric_sample_token_lens(conversation) == [0, 40, 7, 0]
+
+
 def _tiny_siglip():
     BagelSiglip = model_cls("bagel_siglip_navit")
     BagelSiglipConfig = config_cls("bagel_siglip_navit")

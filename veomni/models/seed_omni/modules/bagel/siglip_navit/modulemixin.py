@@ -8,7 +8,7 @@ import torch
 
 from ....mixins.metric_meter_mixin import MetricMeterMixin
 from ....mixins.modulemixin import CPUPreprocessor, ModuleMixin, post_forward, pre_forward
-from ....utils.conversation import ConversationItem, iter_desired_items
+from ....utils.conversation import ConversationItem, is_dummy, iter_desired_items
 from ..sources import BAGEL_SIGLIP_CONTEXT
 from .configuration import BagelSiglipNavitConfig
 
@@ -118,12 +118,7 @@ class BagelSiglipNavitModuleMixin(ModuleMixin):
 
         self._image_items = self._select_siglip_image_items(conversation_list)
         out = self._inputs_from_preprocessed_items(self._image_items)
-        # Metering: stash the per-image NaViT token counts. BAGEL has no SP, so
-        # this is already the full count — routed through the same stash as every
-        # other module for a uniform metering path.
-        self.metric_meter_set_seqlens(
-            "forward", [int(v) for v in out["token_lens"].detach().cpu().reshape(-1).tolist()]
-        )
+        self.metric_meter_set_seqlens("forward", self._metric_sample_token_lens(conversation_list))
         return out
 
     @post_forward("forward")
@@ -182,6 +177,22 @@ class BagelSiglipNavitModuleMixin(ModuleMixin):
             "max_seqlen": int(token_lens.max().item()),
             "token_lens": token_lens,
         }
+
+    def _metric_sample_token_lens(
+        self,
+        conversation_list: list[list[ConversationItem]],
+    ) -> list[int]:
+        sample_lens: list[int] = []
+        for sample in conversation_list:
+            sample_len = 0
+            # SigLIP encodes per image, but multi-source metering needs one
+            # length per sample; dummy carriers only align the batch and count as 0.
+            for item in iter_desired_items([sample], types=["image"], sources=[BAGEL_SIGLIP_CONTEXT]):
+                if is_dummy(item):
+                    continue
+                sample_len += int(item.meta[_OMNI_TOKEN_LEN])
+            sample_lens.append(sample_len)
+        return sample_lens
 
     def _scatter_image_embeds(
         self,
