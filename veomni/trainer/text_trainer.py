@@ -89,23 +89,34 @@ class TextTrainer:
             text_keys=args.data.text_keys,
         )
 
+    # Callbacks run under this trainer's parallel state. For a single-model
+    # trainer this state is constant, so the scope is effectively a no-op; it is
+    # kept explicit so a subclass that drives multiple modules with different
+    # parallel states scopes each callback to the owning module (e.g. DCP
+    # checkpointing reads the current ParallelState at save time).
     def on_train_begin(self):
-        self.base.on_train_begin()
+        with use_parallel_state(self.base.parallel_state):
+            self.base.on_train_begin()
 
     def on_train_end(self):
-        self.base.on_train_end()
+        with use_parallel_state(self.base.parallel_state):
+            self.base.on_train_end()
 
     def on_epoch_begin(self):
-        self.base.on_epoch_begin()
+        with use_parallel_state(self.base.parallel_state):
+            self.base.on_epoch_begin()
 
     def on_epoch_end(self):
-        self.base.on_epoch_end()
+        with use_parallel_state(self.base.parallel_state):
+            self.base.on_epoch_end()
 
     def on_step_begin(self, micro_batches=None):
-        self.base.on_step_begin(micro_batches=micro_batches)
+        with use_parallel_state(self.base.parallel_state):
+            self.base.on_step_begin(micro_batches=micro_batches)
 
     def on_step_end(self, loss=None, loss_dict=None, grad_norm=None):
-        self.base.on_step_end(loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
+        with use_parallel_state(self.base.parallel_state):
+            self.base.on_step_end(loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
 
     def train_step(
         self,
