@@ -19,6 +19,7 @@ from veomni.distributed.torch_compile import (
     CompileConfig,
     compile_decoder_blocks,
     mark_compile_step_begin,
+    validate_compile_config_for_fsdp2,
 )
 
 
@@ -48,6 +49,8 @@ class ToyVisionBlock(nn.Module):
 
 
 class ToyModel(nn.Module):
+    _no_split_modules = ["ToyDecoderLayer"]
+
     def __init__(self):
         super().__init__()
         self.embed_tokens = nn.Embedding(8, 4)
@@ -84,6 +87,35 @@ def test_compile_decoder_blocks_compiles_only_decoder_layers(monkeypatch):
     assert not getattr(model.embed_tokens, "_veomni_forward_compiled", False)
     assert calls == [{"fullgraph": True, "dynamic": False, "backend": "inductor", "mode": "reduce-overhead"}] * 2
     assert model.layers[0](torch.ones(2, 4)).shape == (2, 4)
+
+
+def test_compile_decoder_blocks_uses_no_split_modules(monkeypatch):
+    calls = []
+
+    class ToyOtherDecoderLayer(ToyDecoderLayer):
+        pass
+
+    class MixedDecoderModel(nn.Module):
+        _no_split_modules = ["ToyDecoderLayer"]
+
+        def __init__(self):
+            super().__init__()
+            self.selected = ToyDecoderLayer()
+            self.unselected = ToyOtherDecoderLayer()
+
+    def fake_compile(fn, **kwargs):
+        calls.append(kwargs)
+        return fn
+
+    monkeypatch.setattr(torch, "compile", fake_compile)
+
+    model = MixedDecoderModel()
+    compiled = compile_decoder_blocks(model, CompileConfig())
+
+    assert compiled == 1
+    assert getattr(model.selected, "_veomni_forward_compiled", False)
+    assert not getattr(model.unselected, "_veomni_forward_compiled", False)
+    assert calls == [{"fullgraph": True, "dynamic": False, "backend": "inductor"}]
 
 
 def test_compile_decoder_blocks_rejects_mode_with_cudagraphs_backend():
@@ -135,7 +167,7 @@ def test_compile_decoder_blocks_no_decoder_layers_returns_zero(monkeypatch):
 def test_mark_compile_step_begin_calls_torch_compiler_api(monkeypatch):
     calls = []
 
-    monkeypatch.setattr("veomni.distributed.torch_compile.get_device_type", lambda: "cuda")
+    monkeypatch.setattr("veomni.distributed.torch_compile.IS_CUDA_AVAILABLE", True)
     monkeypatch.setattr(torch, "compiler", SimpleNamespace(cudagraph_mark_step_begin=lambda: calls.append("mark")))
 
     mark_compile_step_begin(enable_compile=True)
@@ -147,7 +179,7 @@ def test_mark_compile_step_begin_calls_torch_compiler_api(monkeypatch):
 def test_mark_compile_step_begin_skips_non_cuda(monkeypatch):
     calls = []
 
-    monkeypatch.setattr("veomni.distributed.torch_compile.get_device_type", lambda: "npu")
+    monkeypatch.setattr("veomni.distributed.torch_compile.IS_CUDA_AVAILABLE", False)
     monkeypatch.setattr(torch, "compiler", SimpleNamespace(cudagraph_mark_step_begin=lambda: calls.append("mark")))
 
     mark_compile_step_begin(enable_compile=True)
@@ -156,17 +188,45 @@ def test_mark_compile_step_begin_skips_non_cuda(monkeypatch):
 
 
 def test_mark_compile_step_begin_skips_without_torch_compiler(monkeypatch):
-    monkeypatch.setattr("veomni.distributed.torch_compile.get_device_type", lambda: "cuda")
+    monkeypatch.setattr("veomni.distributed.torch_compile.IS_CUDA_AVAILABLE", True)
     monkeypatch.delattr(torch, "compiler", raising=False)
 
     mark_compile_step_begin(enable_compile=True)
+
+
+def test_compile_config_detects_cuda_graphs():
+    assert CompileConfig(backend="inductor", mode=None).uses_cuda_graphs() is False
+    assert CompileConfig(backend="inductor", mode="reduce-overhead").uses_cuda_graphs() is True
+    assert CompileConfig(backend="cudagraphs", mode=None).uses_cuda_graphs() is True
+
+
+def test_validate_compile_config_rejects_cuda_graphs_with_forward_reshard():
+    with pytest.raises(RuntimeError, match="reshard_after_forward=False"):
+        validate_compile_config_for_fsdp2(
+            CompileConfig(enable=True, backend="inductor", mode="reduce-overhead"),
+            enable_reshard_after_forward=True,
+        )
+
+
+def test_validate_compile_config_accepts_inductor_default_mode_with_forward_reshard():
+    validate_compile_config_for_fsdp2(
+        CompileConfig(enable=True, backend="inductor", mode=None),
+        enable_reshard_after_forward=True,
+    )
+
+
+def test_validate_compile_config_accepts_cuda_graphs_without_forward_reshard():
+    validate_compile_config_for_fsdp2(
+        CompileConfig(enable=True, backend="inductor", mode="reduce-overhead"),
+        enable_reshard_after_forward=False,
+    )
 
 
 def test_torch_compile_config_defaults():
     cfg = ArgumentsTorchCompileConfig()
     assert cfg.enable is False
     assert cfg.backend == "inductor"
-    assert cfg.mode == "reduce-overhead"
+    assert cfg.mode is None
     assert cfg.fullgraph is True
     assert cfg.dynamic is False
 

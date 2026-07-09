@@ -438,16 +438,20 @@ class TorchCompileConfig:
 
     enable: bool = field(
         default=False,
-        metadata={"help": "Enable per-block torch.compile for CUDA Graph friendly text training."},
+        metadata={"help": "Enable per-block torch.compile for FSDP2 text training."},
     )
     backend: Optional[str] = field(
         default="inductor",
         metadata={"help": "Backend passed to torch.compile."},
     )
     mode: Optional[str] = field(
-        default="reduce-overhead",
+        default=None,
         metadata={
-            "help": "Mode passed to torch.compile. 'reduce-overhead' enables CUDA Graphs on the inductor backend."
+            "help": (
+                "Mode passed to torch.compile. Leave as None to use the inductor default. "
+                "'reduce-overhead' enables CUDA Graphs on the inductor backend and requires "
+                "train.accelerator.fsdp_config.reshard_after_forward=False."
+            )
         },
     )
     fullgraph: bool = field(
@@ -1207,7 +1211,7 @@ class VeOmniArguments:
             if not self.train.dyn_bsz or not self.train.pad_to_length:
                 raise ValueError(
                     "train.torch_compile.enable requires train.dyn_bsz=True and train.pad_to_length=True. "
-                    "Variable packed lengths trigger recompilation and prevent stable CUDA Graph capture; "
+                    "Variable packed lengths trigger recompilation and prevent stable CUDA Graph replay when enabled; "
                     "see https://github.com/ByteDance-Seed/VeOmni/issues/401."
                 )
 

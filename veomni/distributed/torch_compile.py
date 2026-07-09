@@ -14,13 +14,13 @@
 
 import types
 from dataclasses import dataclass
-from typing import Optional
+from typing import Collection, Optional
 
 import torch
 import torch.nn as nn
 
 from ..utils import logging
-from ..utils.device import get_device_type
+from ..utils.device import IS_CUDA_AVAILABLE
 
 
 logger = logging.get_logger(__name__)
@@ -32,21 +32,46 @@ class CompileConfig:
 
     enable: bool = False
     backend: Optional[str] = "inductor"
-    mode: Optional[str] = "reduce-overhead"
+    mode: Optional[str] = None
     fullgraph: bool = True
     dynamic: bool = False
 
+    def uses_cuda_graphs(self) -> bool:
+        """Return whether this config asks torch.compile to use graph replay."""
 
-def _is_decoder_block(module: nn.Module) -> bool:
-    """A decoder block is identified by its class name ending in ``DecoderLayer``.
+        return self.backend == "cudagraphs" or self.mode == "reduce-overhead"
 
-    This intentionally excludes ViT / vision blocks (``VisionBlock``,
-    ``VLVisionBlock``, ``VisionEncoderLayer``, ``VLDecoderLayer``'s vision
-    siblings) and the LM head / embedding modules; only the transformer
-    decoder blocks of the language model are compiled.
+
+def _decoder_block_class_names(model: nn.Module) -> set[str]:
+    no_split_modules = getattr(model, "_no_split_modules", None) or getattr(type(model), "_no_split_modules", None)
+    if no_split_modules is None:
+        return set()
+    return {name for name in no_split_modules if isinstance(name, str) and name.endswith("DecoderLayer")}
+
+
+def _is_decoder_block(module: nn.Module, decoder_block_class_names: Optional[Collection[str]] = None) -> bool:
+    """Check decoder blocks using the model's ``_no_split_modules`` list.
+
+    HuggingFace model classes typically list the decoder layer class in
+    ``_no_split_modules`` for FSDP/Accelerate. Multimodal models may include
+    vision/audio blocks in the same list, so the compile path keeps only
+    entries that are decoder layers.
     """
 
-    return type(module).__name__.endswith("DecoderLayer")
+    if decoder_block_class_names is None:
+        decoder_block_class_names = _decoder_block_class_names(module)
+    return type(module).__name__ in decoder_block_class_names
+
+
+def validate_compile_config_for_fsdp2(compile_config: CompileConfig, enable_reshard_after_forward: bool) -> None:
+    if not compile_config.enable:
+        return
+    if compile_config.uses_cuda_graphs() and enable_reshard_after_forward:
+        raise RuntimeError(
+            "train.torch_compile with CUDA Graphs requires "
+            "train.accelerator.fsdp_config.reshard_after_forward=False. "
+            "Set train.torch_compile.mode=None or disable forward resharding before enabling graph replay."
+        )
 
 
 def compile_decoder_blocks(model: nn.Module, compile_config: CompileConfig) -> int:
@@ -76,9 +101,10 @@ def compile_decoder_blocks(model: nn.Module, compile_config: CompileConfig) -> i
             )
         compile_kwargs["mode"] = compile_config.mode
 
+    decoder_block_class_names = _decoder_block_class_names(model)
     compiled = 0
     for fqn, module in model.named_modules():
-        if not _is_decoder_block(module):
+        if not _is_decoder_block(module, decoder_block_class_names):
             continue
         if getattr(module, "_veomni_forward_compiled", False):
             continue
@@ -103,7 +129,8 @@ def compile_decoder_blocks(model: nn.Module, compile_config: CompileConfig) -> i
 def mark_compile_step_begin(enable_compile: bool) -> None:
     """Mark a new training step for CUDA Graph Trees managed by torch.compile."""
 
-    if not enable_compile or get_device_type() != "cuda":
+    if not enable_compile or not IS_CUDA_AVAILABLE:
         return
-    if hasattr(torch, "compiler") and hasattr(torch.compiler, "cudagraph_mark_step_begin"):
-        torch.compiler.cudagraph_mark_step_begin()
+    mark_step_begin = getattr(getattr(torch, "compiler", None), "cudagraph_mark_step_begin", None)
+    if mark_step_begin is not None:
+        mark_step_begin()

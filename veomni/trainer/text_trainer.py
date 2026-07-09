@@ -108,7 +108,6 @@ class TextTrainer:
         args: VeOmniArguments = self.base.args
         self.base.state.global_step += 1
 
-        mark_compile_step_begin(getattr(self.base.model, "_veomni_compile_enabled", False))
         micro_batches: List[Dict[str, Any]] = next(data_iterator)
 
         self.on_step_begin(micro_batches=micro_batches)
@@ -124,6 +123,7 @@ class TextTrainer:
         num_micro_steps = len(micro_batches)
         # forward and backward pass with gradient_accumulationsteps
         for micro_step, micro_batch in enumerate(micro_batches):
+            mark_compile_step_begin(getattr(self.base.model, "_veomni_compile_uses_cuda_graphs", False))
             self.base.model_reshard(micro_step, num_micro_steps)
             loss: torch.Tensor
             loss_dict: Dict[str, torch.Tensor]

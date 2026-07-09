@@ -9,11 +9,13 @@ scripts were used during validation but are intentionally not committed here.
 The tested change adds:
 
 - `train.torch_compile.{enable,backend,mode,fullgraph,dynamic}` (defaults:
-  `backend="inductor"`, `mode="reduce-overhead"`, `fullgraph=True`; `mode` must
-  be `None` when `backend="cudagraphs"`).
+  `backend="inductor"`, `mode=None`, `fullgraph=True`; CUDA Graphs are an
+  explicit opt-in through `mode="reduce-overhead"` or `backend="cudagraphs"`
+  and require `train.accelerator.fsdp_config.reshard_after_forward=False`;
+  `mode` must be `None` when `backend="cudagraphs"`).
 - FSDP2 decoder-block forward compilation before `fully_shard()`.
-- A per-step `torch.compiler.cudagraph_mark_step_begin()` call when CUDA graph
-  compile support is active.
+- A per-micro-batch `torch.compiler.cudagraph_mark_step_begin()` call when CUDA
+  Graph compile support is explicitly active.
 - Guards that currently restrict the feature to CUDA + FSDP2 text training with
   `train.dyn_bsz=True` and `train.pad_to_length=True`.
 
@@ -45,9 +47,10 @@ synthetic text dataset to avoid external model or data downloads.
 The unit tests covered:
 
 - In-place forward compilation without changing module identity.
-- Decoder-block-only selection (`*DecoderLayer` classes) — ViT / LM head are skipped.
+- Decoder-block-only selection using the model `_no_split_modules` decoder-layer
+  entries — ViT / LM head are skipped.
 - Re-entry into `compile_decoder_blocks` on an already-compiled model is a no-op.
-- CUDA-only `cudagraph_mark_step_begin()` behavior.
+- CUDA Graph `cudagraph_mark_step_begin()` behavior.
 - Argument validation for dynamic batching and static padding.
 - Rejection of multimodal-style data argument classes.
 

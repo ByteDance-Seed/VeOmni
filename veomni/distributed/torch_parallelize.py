@@ -32,7 +32,7 @@ from ..utils import logging
 from ..utils.device import IS_NPU_AVAILABLE, get_device_type
 from .checkpoint import CheckpointFunction
 from .parallel_state import get_parallel_state
-from .torch_compile import CompileConfig, compile_decoder_blocks
+from .torch_compile import CompileConfig, compile_decoder_blocks, validate_compile_config_for_fsdp2
 from .utils import sort_fqn_by_submodule_first
 
 
@@ -205,11 +205,13 @@ def parallelize_model_fsdp2(
                 "train.torch_compile.enable currently does not support ExtraParallel models because EP all-to-all "
                 "communication may be captured inside compiled blocks."
             )
+        validate_compile_config_for_fsdp2(compile_config, enable_reshard_after_forward)
 
         compiled_count = compile_decoder_blocks(model, compile_config)
         if compiled_count == 0:
             raise RuntimeError("train.torch_compile.enable found no decoder blocks to compile.")
         model._veomni_compile_enabled = True
+        model._veomni_compile_uses_cuda_graphs = compile_config.uses_cuda_graphs()
 
     # Step 2: Update fsdp2 kwargs
     fsdp_kwargs = {"mesh": parallel_state.fsdp_mesh, "reshard_after_forward": enable_reshard_after_forward}
