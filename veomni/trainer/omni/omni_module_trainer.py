@@ -487,13 +487,14 @@ class OmniModuleTrainer:
         ``generate`` / ``forward`` raises a clear error later if it truly needs it.
         """
         model = self.base.model
+        cfg = getattr(model, "config", None)
         label = type(model).__name__
         weights_path = self.base.args.model.model_path
 
-        # Per-module assets, tried in order. Each is loaded from the module's own
-        # checkpoint dir via the class declared on the model (``<kind>_class``,
-        # e.g. reads ``preprocessor_config.json`` so a sibling config can't shadow
-        # it) into ``_<kind>``. The tokenizer is the exception — it has no class
+        # Per-module assets, tried in order. Assets that can be derived from the
+        # runtime module config use ``from_config`` so CLI overrides are honored.
+        # Others are loaded from the module's own checkpoint dir via the class
+        # declared on the model. The tokenizer is the exception — it has no class
         # slot (``class_attr is None``) and is built by ``build_tokenizer``.
         # A module that doesn't declare a kind is skipped; a load failure is only
         # a warning (the module raises lazily if that modality is actually used).
@@ -519,7 +520,10 @@ class OmniModuleTrainer:
                     asset_class = getattr(model_type, class_attr, None)
                     if asset_class is None:
                         continue
-                    asset = asset_class.from_pretrained(weights_path)
+                    if cfg is not None and callable(getattr(asset_class, "from_config", None)):
+                        asset = asset_class.from_config(cfg)
+                    else:
+                        asset = asset_class.from_pretrained(weights_path)
                 setattr(model, set_attr, asset)
             except Exception as e:  # noqa: BLE001 — surfaced lazily by the module if the modality is used
                 logger.warning_once(f"OmniModuleTrainer '{label}': could not load {kind} from {weights_path}: {e}.")
@@ -528,7 +532,6 @@ class OmniModuleTrainer:
 
         # Assemble the savable assets (config + own processors + tokenizer).
         assets: List[Any] = []
-        cfg = getattr(model, "config", None)
         if cfg is not None:
             assets.append(cfg)
         for attr in ("_processor", "_image_processor", "_video_processor", "_tokenizer"):
