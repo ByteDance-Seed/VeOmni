@@ -20,7 +20,7 @@ from unittest.mock import patch
 
 import pytest
 
-from veomni.utils.count_flops import VeomniFlopsCounter
+from veomni.utils.count_flops import VeomniFlopsCounter, get_device_flops
 
 
 def _to_namespace(value):
@@ -36,10 +36,20 @@ def _load_toy_config(config_dir):
         return _to_namespace(json.load(fp))
 
 
-@pytest.fixture(autouse=True)
+@pytest.fixture
 def mock_device_flops():
     with patch("veomni.utils.count_flops.get_device_flops", return_value=1000.0):
         yield
+
+
+def test_b300_device_flops():
+    with patch("veomni.utils.count_flops.get_device_name", return_value="NVIDIA B300"):
+        assert get_device_flops() == 2250.0
+
+
+def test_gb300_device_flops():
+    with patch("veomni.utils.count_flops.get_device_name", return_value="NVIDIA GB300"):
+        assert get_device_flops() == 2500.0
 
 
 @pytest.fixture
@@ -65,6 +75,8 @@ def gpt_oss_counter(gpt_oss_config):
 
 
 class TestQwen35Flops:
+    pytestmark = pytest.mark.usefixtures("mock_device_flops")
+
     def test_text_only(self, qwen3_5_counter):
         batch_seqlens = [1024, 1024, 1024, 1024]
         flops, _ = qwen3_5_counter.estimate_flops(batch_seqlens, delta_time=1.0)
@@ -90,6 +102,8 @@ class TestQwen35Flops:
 
 
 class TestQwen35MoeFlops:
+    pytestmark = pytest.mark.usefixtures("mock_device_flops")
+
     def test_text_only(self, qwen3_5_moe_counter):
         batch_seqlens = [1024, 1024, 1024, 1024]
         flops, _ = qwen3_5_moe_counter.estimate_flops(batch_seqlens, delta_time=1.0)
@@ -115,6 +129,8 @@ class TestQwen35MoeFlops:
 
 
 class TestGptOssFlops:
+    pytestmark = pytest.mark.usefixtures("mock_device_flops")
+
     def test_numerical(self, gpt_oss_counter):
         batch_seqlens = [12, 5]
         flops, promised_flops = gpt_oss_counter.estimate_flops(batch_seqlens, delta_time=1.0)
