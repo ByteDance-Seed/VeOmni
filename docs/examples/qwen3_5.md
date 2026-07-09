@@ -141,12 +141,35 @@ bash train.sh tasks/train_text.py configs/text/qwen3_5_sft.yaml \
 ### Selecting linear-attention kernels
 
 GatedDeltaNet has three OpSlot-driven kernels: `rms_norm_gated`, `causal_conv1d`, and
-`chunk_gated_delta_rule`. Each defaults to `auto`, which resolves to:
+`chunk_gated_delta_rule`. All three default to `fla`. Recommended value per platform:
 
 - **GPU** — `fla` (the FLA Triton kernels shipped under the `gpu` extra; required for
   varlen training).
-- **NPU** — `eager` (no FLA / FlashQLA backend is registered for Ascend today; varlen
-  training raises at runtime).
+- **NPU** — `npu` (vendored MindSpeed-MM Triton kernels for all three ops; needs the
+  `triton-ascend` package — see below). Not auto-selected — the default `fla`
+  requires a GPU and raises on NPU, so set the fields explicitly:
+
+```yaml
+model:
+  ops_implementation:
+    rms_norm_gated_implementation: npu
+    causal_conv1d_implementation: npu
+    chunk_gated_delta_rule_implementation: npu
+```
+
+Install `triton-ascend` on the NPU host (this PR was validated against v3.2.1):
+
+```bash
+pip install triton-ascend==3.2.1 --extra-index-url=https://triton-ascend.osinfra.cn/pypi/simple
+```
+
+See the [triton-ascend quick-start](https://github.com/triton-lang/triton-ascend/blob/main/docs/zh/quick_start.md)
+for prerequisites (CANN 9.0.0, `torch_npu` 2.9.0) and troubleshooting.
+
+> **arch35 limitation:** the vendored `causal_conv1d` refuses to run on arch35 NPUs
+> (`Ascend910_95` / `Ascend950`) — its `is_arch35()` guard raises `NotImplementedError`
+> rather than mis-computing. Validated on `Ascend910B2C`. arch35 support would need to come
+> from upstream MindSpeed-MM.
 
 To switch `chunk_gated_delta_rule` to QwenLM's [`flash-qla`](https://github.com/QwenLM/FlashQLA)
 kernel (already shipped under the `gpu` extra), set the field explicitly:

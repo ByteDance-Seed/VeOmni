@@ -503,6 +503,12 @@ class TrainingArguments:
             "help": "When enabled, only rank0 reads model weights from HuggingFace safetensor from disk. Other ranks would receive weights through broadcast. This helps to avoid disk I/O bottleneck."
         },
     )
+    ep_sharded_stream_load: bool = field(
+        default=False,
+        metadata={
+            "help": "Opt-in fast/low-memory weight loader for large MoE checkpoints: each rank reads only its ExtraParallel dim-0 slice of the expert tensors straight from the checkpoint. Requires the every-rank-reads path (`broadcast_model_weights_from_rank0=False`) and a model with an ExtraParallel parallel_plan; unsupported model/checkpoint combinations raise `NotImplementedError`."
+        },
+    )
     enable_full_determinism: bool = field(
         default=False,
         metadata={"help": "Enable full determinism."},
@@ -631,6 +637,14 @@ class TrainingArguments:
                     "used with train.accelerator.fsdp_config.fsdp_mode='fsdp2'. "
                     f"Received fsdp_mode={acc.fsdp_config.fsdp_mode!r}. Disable this flag or switch to fsdp2.",
                 )
+
+        # ep_sharded_stream_load only runs on the every-rank-reads path, so it is
+        # mutually exclusive with broadcast_model_weights_from_rank0. Fail early
+        # instead of silently ignoring the flag.
+        assert not (self.ep_sharded_stream_load and self.broadcast_model_weights_from_rank0), (
+            "train.ep_sharded_stream_load requires train.broadcast_model_weights_from_rank0=False "
+            "(it reads each rank's ExtraParallel slice directly and cannot run on the broadcast path)."
+        )
 
     def _derive_batch_config(self):
         acc = self.accelerator
@@ -763,9 +777,10 @@ class OpsImplementationConfig:
       ``chunk_gated_delta_rule``. These OpSlots only exist in Qwen3.5's
       patched modeling module, so config-parse-time validation would force
       every NPU user to override them even when training non-Qwen3.5 models.
-      The kernel's ``HardwareRequirement`` raises if a non-eager value is
-      requested on NPU; the varlen (``dyn_bsz=True``) caveat is documented
-      in the field metadata.
+      All three ship both a GPU (``fla``) and an NPU (``npu``) backend; the
+      kernel's ``HardwareRequirement`` raises only when the requested value has
+      no backend for the current hardware. The varlen (``dyn_bsz=True``) caveat
+      is documented in the field metadata.
 
     Backends: ``"eager"`` (HF reference, always available),
     ``"liger_kernel"`` (GPU, needs ``liger-kernel``), ``"npu"`` (Ascend),
@@ -851,7 +866,9 @@ class OpsImplementationConfig:
             "'fla' (default) uses fla.modules.convolution.causal_conv1d (requires flash-linear-attention, GPU). "
             "'eager' leaves causal_conv1d_fn unset; the varlen training path then raises "
             "because no torch fallback handles cu_seqlens. "
-            "Qwen3.5 has no NPU backend today — selecting any non-eager value on NPU raises at OpSlot bind time."
+            "'npu' uses the vendored Triton kernel (requires triton-ascend, NPU). "
+            "Only affects varlen (dyn_bsz) training; a non-eager value on hardware without a "
+            "matching backend raises at OpSlot bind time."
         },
     )
     chunk_gated_delta_rule_implementation: str = field(
@@ -863,7 +880,8 @@ class OpsImplementationConfig:
             "no Ampere/Ada below or Blackwell above; SM10x wheels are WIP upstream). "
             "'eager' uses transformers' torch_chunk_gated_delta_rule, which does NOT support "
             "cu_seqlens; varlen training therefore raises at runtime. "
-            "Qwen3.5 has no NPU backend today — selecting any non-eager value on NPU raises at OpSlot bind time."
+            "'npu' uses the vendored Triton kernel (requires triton-ascend, NPU). "
+            "A non-eager value on hardware without a matching backend raises at OpSlot bind time."
         },
     )
     dsa_indexer_backend: Literal["eager", "cudnn"] = field(
