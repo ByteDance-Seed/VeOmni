@@ -1,34 +1,64 @@
 import importlib
 import sys
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
 
+from veomni.utils.device import get_device_type, get_gpu_compute_capability
 
-dsa = pytest.importorskip("veomni.ops.kernels.deepseek_sparse_attention.flashmla_cudnn")
+
+def _common_backend():
+    return pytest.importorskip("veomni.ops.kernels.deepseek_sparse_attention.common")
+
+
+def _flashmla_backend():
+    return pytest.importorskip("veomni.ops.kernels.deepseek_sparse_attention.flashmla_cudnn")
+
+
+def _eager_sparse_mla_forward(q_pe, k_pe, kv_cache, q_nope, topk_indices, *, softmax_scale):
+    packed_q = torch.cat((q_nope, q_pe), dim=-1).float()
+    packed_k = torch.cat((kv_cache.squeeze(2), k_pe.squeeze(2)), dim=-1).float()
+    values = kv_cache.squeeze(2).float()
+    output = torch.empty((*q_pe.shape[:3], kv_cache.shape[-1]), device=q_pe.device, dtype=torch.float32)
+
+    for batch_idx in range(q_pe.shape[0]):
+        for seq_idx in range(q_pe.shape[1]):
+            indices = topk_indices[batch_idx, seq_idx].long()
+            q_row = packed_q[batch_idx, seq_idx]
+            k_row = packed_k[batch_idx, indices]
+            v_row = values[batch_idx, indices]
+            scores = torch.einsum("hd,td->ht", q_row, k_row) * softmax_scale
+            output[batch_idx, seq_idx] = torch.softmax(scores, dim=-1) @ v_row
+
+    return output.to(q_pe.dtype)
 
 
 def test_deepseek_sparse_attention_is_not_eagerly_imported_by_kernels():
     sys.modules.pop("veomni.ops.kernels.deepseek_sparse_attention", None)
     sys.modules.pop("veomni.ops.kernels.deepseek_sparse_attention.flashmla_cudnn", None)
+    sys.modules.pop("veomni.ops.kernels.deepseek_sparse_attention.fa4_cudnn", None)
 
     importlib.import_module("veomni.ops.kernels")
 
     assert "veomni.ops.kernels.deepseek_sparse_attention" not in sys.modules
     assert "veomni.ops.kernels.deepseek_sparse_attention.flashmla_cudnn" not in sys.modules
+    assert "veomni.ops.kernels.deepseek_sparse_attention.fa4_cudnn" not in sys.modules
 
 
-def test_deepseek_sparse_attention_package_does_not_import_flashmla_cudnn_backend():
+def test_deepseek_sparse_attention_package_does_not_import_backend_modules():
     sys.modules.pop("veomni.ops.kernels.deepseek_sparse_attention", None)
     sys.modules.pop("veomni.ops.kernels.deepseek_sparse_attention.flashmla_cudnn", None)
+    sys.modules.pop("veomni.ops.kernels.deepseek_sparse_attention.fa4_cudnn", None)
 
     importlib.import_module("veomni.ops.kernels.deepseek_sparse_attention")
 
     assert "veomni.ops.kernels.deepseek_sparse_attention.flashmla_cudnn" not in sys.modules
+    assert "veomni.ops.kernels.deepseek_sparse_attention.fa4_cudnn" not in sys.modules
 
 
 def test_indexer_select_topk_uses_cudnn_score_wrapper(monkeypatch):
+    common = _common_backend()
     scores = torch.tensor([[[0.1, 0.7, 0.2], [0.9, 0.0, 0.3]]], dtype=torch.float32)
 
     def fake_indexer_forward(q, k, w, *, ratio, qhead_per_kv_head, sm_scale):
@@ -40,9 +70,9 @@ def test_indexer_select_topk_uses_cudnn_score_wrapper(monkeypatch):
         assert sm_scale == 0.5
         return {"scores": scores}
 
-    monkeypatch.setattr(dsa, "DSA", SimpleNamespace(indexer_forward_wrapper=fake_indexer_forward))
+    monkeypatch.setattr(common, "DSA", SimpleNamespace(indexer_forward_wrapper=fake_indexer_forward))
 
-    indices = dsa.indexer_select_topk(
+    indices = common.indexer_select_topk(
         torch.empty(1, 2, 32, 128, dtype=torch.bfloat16),
         torch.empty(1, 3, 128, dtype=torch.bfloat16),
         torch.empty(1, 2, 32, dtype=torch.bfloat16),
@@ -57,6 +87,7 @@ def test_indexer_select_topk_uses_cudnn_score_wrapper(monkeypatch):
 
 
 def test_sparse_attention_backward_flattens_batched_inputs(monkeypatch):
+    common = _common_backend()
     q = torch.empty(2, 3, 4, 5, dtype=torch.bfloat16)
     kv = torch.empty(2, 7, 5, dtype=torch.bfloat16)
     out = torch.empty(2, 3, 4, 5, dtype=torch.bfloat16)
@@ -90,9 +121,11 @@ def test_sparse_attention_backward_flattens_batched_inputs(monkeypatch):
             "d_sink": torch.ones_like(sink),
         }
 
-    monkeypatch.setattr(dsa, "DSA", SimpleNamespace(sparse_attention_backward_wrapper=fake_sparse_attention_backward))
+    monkeypatch.setattr(
+        common, "DSA", SimpleNamespace(sparse_attention_backward_wrapper=fake_sparse_attention_backward)
+    )
 
-    result = dsa.sparse_attention_backward(
+    result = common.sparse_attention_backward(
         q,
         kv,
         out,
@@ -109,22 +142,28 @@ def test_sparse_attention_backward_flattens_batched_inputs(monkeypatch):
     assert result["d_sink"].shape == attn_sink.shape
 
 
-def test_flash_mla_sparse_forward_returns_lse(monkeypatch):
+def test_flash_mla_sparse_forward_packs_inputs_and_returns_lse(monkeypatch):
+    dsa = _flashmla_backend()
     q_pe = torch.empty(1, 2, 128, 64, dtype=torch.bfloat16)
     k_pe = torch.empty(1, 4, 1, 64, dtype=torch.bfloat16)
     kv_cache = torch.empty(1, 4, 1, 512, dtype=torch.bfloat16)
     q_nope = torch.empty(1, 2, 128, 512, dtype=torch.bfloat16)
     gather = torch.zeros(1, 2, 128, dtype=torch.int32)
+    sink = torch.zeros(128, dtype=torch.float32)
+    topk_length = torch.tensor([[127, 128]], dtype=torch.int64)
     expected_out = torch.zeros(1, 2, 128, 512, dtype=torch.bfloat16)
     expected_lse = torch.arange(256, dtype=torch.float32).reshape(1, 2, 128)
 
-    def fake_flash_mla_sparse_fwd(q, kv, indices, sm_scale, d_v):
+    def fake_flash_mla_sparse_fwd(q, kv, indices, sm_scale, d_v, *, attn_sink=None, topk_length=None):
         assert q.shape == (2, 128, 576)
         assert kv.shape == (4, 1, 576)
         assert indices.shape == (2, 1, 128)
         assert indices.dtype == torch.int32
         assert sm_scale == 0.25
         assert d_v == 512
+        assert attn_sink is sink
+        assert topk_length.dtype == torch.int32
+        assert topk_length.tolist() == [127, 128]
         return (
             expected_out.reshape(2, 128, 512),
             torch.empty(2, 128, dtype=torch.float32),
@@ -140,75 +179,192 @@ def test_flash_mla_sparse_forward_returns_lse(monkeypatch):
         q_nope,
         gather,
         softmax_scale=0.25,
+        learnable_sink=sink,
+        topk_length=topk_length,
     )
 
     assert torch.equal(result["out"], expected_out)
     assert torch.equal(result["lse"], expected_lse)
 
 
-def test_flash_mla_sparse_forward_uses_imported_flash_mla_symbol(monkeypatch):
-    q_pe = torch.empty(1, 2, 128, 64, dtype=torch.bfloat16)
-    k_pe = torch.empty(1, 4, 1, 64, dtype=torch.bfloat16)
-    kv_cache = torch.empty(1, 4, 1, 512, dtype=torch.bfloat16)
-    q_nope = torch.empty(1, 2, 128, 512, dtype=torch.bfloat16)
-    gather = torch.zeros(1, 2, 128, dtype=torch.int32)
+def test_fa4_sparse_forward_masks_padded_indices_and_passes_sink(monkeypatch):
+    sys.modules.pop("veomni.ops.kernels.deepseek_sparse_attention.common", None)
+    sys.modules.pop("veomni.ops.kernels.deepseek_sparse_attention.fa4_cudnn", None)
+    fake_cudnn = ModuleType("cudnn")
+    fake_flash_attn = ModuleType("flash_attn")
+    fake_cute = ModuleType("flash_attn.cute")
+    expected_out = torch.zeros(1, 2, 128, 512, dtype=torch.bfloat16)
+    expected_lse = torch.arange(256, dtype=torch.float32).reshape(1, 2, 128)
+    sink = torch.zeros(128, dtype=torch.float32)
 
-    def fake_flash_mla_sparse_fwd(q, kv, indices, sm_scale, d_v):
-        return torch.empty(2, 128, 512, dtype=q.dtype), torch.empty(2, 128), torch.empty(2, 128)
+    def fake_flash_attn_func(q, k, v, **kwargs):
+        assert q.shape == (1, 2, 128, 64)
+        assert k.shape == (1, 4, 1, 64)
+        assert v.shape == (1, 4, 1, 512)
+        assert kwargs["qv"].shape == (1, 2, 128, 512)
+        assert kwargs["softmax_scale"] == 0.25
+        assert kwargs["causal"] is False
+        assert kwargs["learnable_sink"] is sink
+        assert kwargs["learnable_sink"].dtype == torch.float32
+        assert kwargs["gather_kv_indices"].dtype == torch.int32
+        assert kwargs["gather_kv_indices"][0, 0, :4].tolist() == [0, 1, -1, -1]
+        assert kwargs["gather_kv_indices"][0, 1, :4].tolist() == [0, -1, -1, -1]
+        assert kwargs["return_lse"] is True
+        return expected_out, expected_lse, object()
 
-    monkeypatch.setattr(dsa, "flash_mla_sparse_fwd", fake_flash_mla_sparse_fwd)
+    fake_cute.flash_attn_func = fake_flash_attn_func
+    fake_cudnn.DSA = object()
+    monkeypatch.setitem(sys.modules, "cudnn", fake_cudnn)
+    monkeypatch.setitem(sys.modules, "flash_attn", fake_flash_attn)
+    monkeypatch.setitem(sys.modules, "flash_attn.cute", fake_cute)
+    fa4 = importlib.import_module("veomni.ops.kernels.deepseek_sparse_attention.fa4_cudnn")
 
-    result = dsa.flash_mla_sparse_forward(q_pe, k_pe, kv_cache, q_nope, gather)
-    assert set(result) == {"out", "lse"}
+    gather = torch.zeros(1, 2, 128, dtype=torch.long)
+    gather[0, 0, 1] = 1
+    result = fa4.fa4_sparse_forward(
+        torch.empty(1, 2, 128, 64, dtype=torch.bfloat16),
+        torch.empty(1, 4, 1, 64, dtype=torch.bfloat16),
+        torch.empty(1, 4, 1, 512, dtype=torch.bfloat16),
+        torch.empty(1, 2, 128, 512, dtype=torch.bfloat16),
+        gather,
+        softmax_scale=0.25,
+        learnable_sink=sink,
+        topk_length=torch.tensor([[2, 1]], dtype=torch.int64),
+    )
+
+    assert torch.equal(result["out"], expected_out)
+    assert torch.equal(result["lse"], expected_lse)
 
 
-def test_flash_mla_sparse_forward_compatibility_rejects_unaligned_topk():
-    q_pe = torch.empty(1, 2, 128, 64, dtype=torch.bfloat16)
-    k_pe = torch.empty(1, 4, 1, 64, dtype=torch.bfloat16)
-    kv_cache = torch.empty(1, 4, 1, 512, dtype=torch.bfloat16)
-    q_nope = torch.empty(1, 2, 128, 512, dtype=torch.bfloat16)
-    gather = torch.zeros(1, 2, 64, dtype=torch.int32)
+def test_flash_mla_sparse_forward_accepts_sink_and_topk_length():
+    common = _common_backend()
+    compatible, reason = common.check_sparse_mla_forward_compatible(
+        torch.empty(1, 2, 128, 64, dtype=torch.bfloat16),
+        torch.empty(1, 4, 1, 64, dtype=torch.bfloat16),
+        torch.empty(1, 4, 1, 512, dtype=torch.bfloat16),
+        torch.empty(1, 2, 128, 512, dtype=torch.bfloat16),
+        torch.zeros(1, 2, 128, dtype=torch.int32),
+        torch.zeros(128, dtype=torch.float32),
+        torch.full((1, 2), 128, dtype=torch.int32),
+    )
 
-    compatible, reason = dsa.check_flash_mla_sparse_forward_compatible(q_pe, k_pe, kv_cache, q_nope, gather)
+    assert compatible, reason
+
+
+@pytest.mark.parametrize(
+    ("mutate", "expected_reason"),
+    [
+        (lambda tensors: tensors.update(gather=torch.zeros(1, 2, 64, dtype=torch.int32)), "multiple of 128"),
+        (
+            lambda tensors: tensors.update(
+                q_pe=torch.empty(1, 2, 128, 32, dtype=torch.bfloat16),
+                k_pe=torch.empty(1, 4, 1, 32, dtype=torch.bfloat16),
+            ),
+            "packed q/k dim 576",
+        ),
+        (lambda tensors: tensors.update(sink=torch.zeros(127, dtype=torch.float32)), "learnable_sink"),
+        (lambda tensors: tensors.update(sink=torch.zeros(128, dtype=torch.bfloat16)), "fp32"),
+        (lambda tensors: tensors.update(topk_length=torch.full((1, 2, 1), 128, dtype=torch.int32)), "topk_length"),
+    ],
+)
+def test_flash_mla_sparse_forward_rejects_invalid_contracts(mutate, expected_reason):
+    common = _common_backend()
+    tensors = {
+        "q_pe": torch.empty(1, 2, 128, 64, dtype=torch.bfloat16),
+        "k_pe": torch.empty(1, 4, 1, 64, dtype=torch.bfloat16),
+        "kv_cache": torch.empty(1, 4, 1, 512, dtype=torch.bfloat16),
+        "q_nope": torch.empty(1, 2, 128, 512, dtype=torch.bfloat16),
+        "gather": torch.zeros(1, 2, 128, dtype=torch.int32),
+        "sink": None,
+        "topk_length": None,
+    }
+    mutate(tensors)
+
+    compatible, reason = common.check_sparse_mla_forward_compatible(
+        tensors["q_pe"],
+        tensors["k_pe"],
+        tensors["kv_cache"],
+        tensors["q_nope"],
+        tensors["gather"],
+        tensors["sink"],
+        tensors["topk_length"],
+    )
 
     assert not compatible
-    assert "multiple of 128" in reason
+    assert expected_reason in reason
 
 
-def test_flash_mla_sparse_forward_compatibility_rejects_unsupported_packed_dim():
-    q_pe = torch.empty(1, 2, 128, 32, dtype=torch.bfloat16)
-    k_pe = torch.empty(1, 4, 1, 32, dtype=torch.bfloat16)
-    kv_cache = torch.empty(1, 4, 1, 512, dtype=torch.bfloat16)
-    q_nope = torch.empty(1, 2, 128, 512, dtype=torch.bfloat16)
-    gather = torch.zeros(1, 2, 128, dtype=torch.int32)
+def test_deepseek_v4_flashmla_indices_pad_to_128_multiple():
+    from veomni.models.transformers.deepseek_v4.generated.patched_modeling_deepseek_v4_gpu import (
+        _deepseek_v4_build_flashmla_indices,
+    )
 
-    compatible, reason = dsa.check_flash_mla_sparse_forward_compatible(q_pe, k_pe, kv_cache, q_nope, gather)
+    top_k_indices = torch.full((1, 3, 3), -1, dtype=torch.long)
+    top_k_indices[0, 2] = torch.tensor([0, 1, -1])
 
-    assert not compatible
-    assert "packed q/k dim 576" in reason
+    sparse_indices, topk_length = _deepseek_v4_build_flashmla_indices(
+        None,
+        top_k_indices,
+        batch_size=1,
+        seq_len=3,
+        base_kv_len=4,
+        sliding_window=127,
+    )
 
-
-def test_flash_mla_sparse_forward_compatibility_rejects_sink():
-    q_pe = torch.empty(1, 2, 128, 64, dtype=torch.bfloat16)
-    k_pe = torch.empty(1, 4, 1, 64, dtype=torch.bfloat16)
-    kv_cache = torch.empty(1, 4, 1, 512, dtype=torch.bfloat16)
-    q_nope = torch.empty(1, 2, 128, 512, dtype=torch.bfloat16)
-    gather = torch.zeros(1, 2, 128, dtype=torch.int32)
-    sink = torch.zeros(128, dtype=torch.bfloat16)
-
-    compatible, reason = dsa.check_flash_mla_sparse_forward_compatible(q_pe, k_pe, kv_cache, q_nope, gather, sink)
-
-    assert not compatible
-    assert "learnable_sink" in reason
+    assert sparse_indices.shape == (1, 3, 128)
+    assert sparse_indices.dtype == torch.int32
+    assert topk_length.tolist() == [[1, 2, 5]]
+    assert sparse_indices[0, 2, :5].tolist() == [0, 1, 2, 4, 5]
+    assert torch.equal(sparse_indices[0, 2, 5:], torch.zeros(123, dtype=sparse_indices.dtype))
 
 
-def test_pack_flash_mla_tensors_for_sparse_backward():
+def test_deepseek_v4_flashmla_indices_respect_attention_mask():
+    from veomni.models.transformers.deepseek_v4.generated.patched_modeling_deepseek_v4_gpu import (
+        _deepseek_v4_build_flashmla_indices,
+    )
+
+    top_k_indices = torch.full((1, 3, 3), -1, dtype=torch.long)
+    top_k_indices[0, 2] = torch.tensor([0, 1, -1])
+    attention_mask = torch.zeros(1, 1, 3, 4)
+    attention_mask[..., 1] = float("-inf")
+
+    sparse_indices, topk_length = _deepseek_v4_build_flashmla_indices(
+        attention_mask,
+        top_k_indices,
+        batch_size=1,
+        seq_len=3,
+        base_kv_len=4,
+        sliding_window=127,
+    )
+
+    assert sparse_indices.shape == (1, 3, 128)
+    assert sparse_indices.dtype == torch.int32
+    assert topk_length.tolist() == [[1, 1, 4]]
+    assert sparse_indices[0, 2, :4].tolist() == [0, 2, 4, 5]
+    assert torch.equal(sparse_indices[0, 2, 4:], torch.zeros(124, dtype=sparse_indices.dtype))
+
+
+def test_deepseek_v4_masks_future_sparse_indices():
+    from veomni.models.transformers.deepseek_v4.generated.patched_modeling_deepseek_v4_gpu import (
+        _deepseek_v4_mask_future_sparse_indices,
+    )
+
+    top_k_indices = torch.tensor([[[0, 1, 2], [0, 1, 2], [0, 1, 2], [0, 1, 2]]], dtype=torch.long)
+    position_ids = torch.arange(4).unsqueeze(0)
+
+    masked = _deepseek_v4_mask_future_sparse_indices(top_k_indices, position_ids, compress_rate=2)
+
+    assert masked.tolist() == [[[-1, -1, -1], [0, -1, -1], [0, -1, -1], [0, 1, -1]]]
+
+
+def test_pack_sparse_mla_tensors_for_backward():
+    common = _common_backend()
     q_pe = torch.full((1, 2, 128, 64), 2.0, dtype=torch.bfloat16)
     k_pe = torch.full((1, 4, 1, 64), 4.0, dtype=torch.bfloat16)
     kv_cache = torch.full((1, 4, 1, 512), 3.0, dtype=torch.bfloat16)
     q_nope = torch.full((1, 2, 128, 512), 1.0, dtype=torch.bfloat16)
 
-    packed = dsa.pack_flash_mla_tensors_for_sparse_backward(q_pe, k_pe, kv_cache, q_nope)
+    packed = common.pack_sparse_mla_tensors_for_backward(q_pe, k_pe, kv_cache, q_nope)
 
     assert packed["q"].shape == (1, 2, 128, 576)
     assert packed["kv"].shape == (1, 4, 576)
@@ -219,6 +375,7 @@ def test_pack_flash_mla_tensors_for_sparse_backward():
 
 
 def test_flash_mla_sparse_attention_with_cudnn_backward_splits_gradients(monkeypatch):
+    dsa = _flashmla_backend()
     q_pe = torch.empty(1, 2, 128, 64, dtype=torch.bfloat16, requires_grad=True)
     k_pe = torch.empty(1, 4, 1, 64, dtype=torch.bfloat16, requires_grad=True)
     kv_cache = torch.empty(1, 4, 1, 512, dtype=torch.bfloat16, requires_grad=True)
@@ -227,16 +384,30 @@ def test_flash_mla_sparse_attention_with_cudnn_backward_splits_gradients(monkeyp
     out = torch.ones(1, 2, 128, 512, dtype=torch.bfloat16)
     lse = torch.ones(1, 2, 128, dtype=torch.float32)
 
-    def fake_flash_mla_sparse_forward(q_pe_arg, k_pe_arg, kv_cache_arg, q_nope_arg, topk_arg, *, softmax_scale):
+    def fake_flash_mla_sparse_forward(
+        q_pe_arg,
+        k_pe_arg,
+        kv_cache_arg,
+        q_nope_arg,
+        topk_arg,
+        *,
+        softmax_scale,
+        learnable_sink=None,
+        topk_length=None,
+    ):
         assert q_pe_arg is q_pe
         assert k_pe_arg is k_pe
         assert kv_cache_arg is kv_cache
         assert q_nope_arg is q_nope_absorbed
         assert topk_arg.dtype == torch.int32
+        assert learnable_sink is None
+        assert topk_length is None
         assert softmax_scale == 0.25
         return {"out": out, "lse": lse}
 
-    def fake_sparse_attention_backward(q, kv, out_arg, dout, lse_arg, attn_sink, topk_arg, *, softmax_scale):
+    def fake_sparse_attention_backward(
+        q, kv, out_arg, dout, lse_arg, attn_sink, topk_arg, *, softmax_scale, topk_length=None
+    ):
         assert q.shape == (1, 2, 128, 576)
         assert kv.shape == (1, 4, 576)
         assert out_arg.shape == out.shape
@@ -245,7 +416,9 @@ def test_flash_mla_sparse_attention_with_cudnn_backward_splits_gradients(monkeyp
         assert lse_arg.shape == lse.shape
         assert torch.equal(lse_arg, lse)
         assert torch.isneginf(attn_sink).all()
-        assert topk_arg is topk_indices
+        assert topk_arg.dtype == torch.int32
+        assert torch.equal(topk_arg, topk_indices.to(torch.int32))
+        assert topk_length is None
         assert softmax_scale == 0.25
         dq_nope = torch.full((1, 2, 128, 512), 1.0, dtype=torch.bfloat16)
         dq_pe = torch.full((1, 2, 128, 64), 2.0, dtype=torch.bfloat16)
@@ -276,39 +449,81 @@ def test_flash_mla_sparse_attention_with_cudnn_backward_splits_gradients(monkeyp
     assert torch.equal(k_pe.grad, torch.full_like(k_pe, 4.0))
 
 
-def test_sparse_attention_backward_compatibility_rejects_expanded_kv_layout():
-    q = torch.empty(2, 3, 4, 5, dtype=torch.bfloat16)
-    expanded_key = torch.empty(2, 4, 7, 5, dtype=torch.bfloat16)
-    out = torch.empty(2, 3, 4, 5, dtype=torch.bfloat16)
-    dout = torch.empty_like(out)
-    lse = torch.empty(2, 3, 4, dtype=torch.float32)
-    attn_sink = torch.empty(4, dtype=torch.float32)
-    topk_indices = torch.zeros(2, 3, 2, dtype=torch.long)
+@pytest.mark.skipif(
+    get_gpu_compute_capability() != 100,
+    reason="FlashMLA/cuDNN DSA numerical parity test requires SM100, e.g. B200.",
+)
+def test_flash_mla_sparse_attention_with_cudnn_backward_sm100_matches_eager():
+    dsa = _flashmla_backend()
+    device = get_device_type()
+    dtype = torch.bfloat16
+    batch_size, seqlen_q, seqlen_k, topk, num_heads = 1, 2, 192, 128, 128
+    d_pe, d_nope = 64, 512
+    softmax_scale = (d_pe + d_nope) ** -0.5
+    torch.manual_seed(0)
 
-    compatible, reason = dsa.check_sparse_attention_backward_compatible(
-        q,
-        expanded_key,
-        out,
-        dout,
-        lse,
-        attn_sink,
+    q_pe = (0.2 * torch.randn(batch_size, seqlen_q, num_heads, d_pe, device=device)).to(dtype).requires_grad_(True)
+    k_pe = (0.2 * torch.randn(batch_size, seqlen_k, 1, d_pe, device=device)).to(dtype).requires_grad_(True)
+    kv_cache = (0.2 * torch.randn(batch_size, seqlen_k, 1, d_nope, device=device)).to(dtype).requires_grad_(True)
+    q_nope = (0.2 * torch.randn(batch_size, seqlen_q, num_heads, d_nope, device=device)).to(dtype).requires_grad_(True)
+    sparse_indices = torch.randperm(seqlen_k, device=device, dtype=torch.int32)[:topk]
+    topk_indices = sparse_indices.view(1, 1, topk).expand(batch_size, seqlen_q, topk).contiguous()
+    grad_out = torch.randn(batch_size, seqlen_q, num_heads, d_nope, device=device, dtype=dtype)
+
+    q_pe_eager = q_pe.detach().clone().requires_grad_(True)
+    k_pe_eager = k_pe.detach().clone().requires_grad_(True)
+    kv_cache_eager = kv_cache.detach().clone().requires_grad_(True)
+    q_nope_eager = q_nope.detach().clone().requires_grad_(True)
+
+    out_kernel = dsa.flash_mla_sparse_attention_with_cudnn_backward(
+        q_pe,
+        k_pe,
+        kv_cache,
+        q_nope,
         topk_indices,
+        softmax_scale=softmax_scale,
+    )
+    out_eager = _eager_sparse_mla_forward(
+        q_pe_eager,
+        k_pe_eager,
+        kv_cache_eager,
+        q_nope_eager,
+        topk_indices,
+        softmax_scale=softmax_scale,
     )
 
-    assert not compatible
-    assert "unified K=V" in reason
+    assert out_eager.float().norm() > 1.0
+    torch.testing.assert_close(out_kernel.float(), out_eager.float(), atol=5e-3, rtol=5e-2)
+
+    out_kernel.backward(grad_out)
+    out_eager.backward(grad_out)
+    assert q_pe_eager.grad.float().norm() > 0.1
+    assert k_pe_eager.grad.float().norm() > 0.1
+    assert kv_cache_eager.grad.float().norm() > 1.0
+    assert q_nope_eager.grad.float().norm() > 0.1
+    torch.testing.assert_close(q_pe.grad.float(), q_pe_eager.grad.float(), atol=1e-3, rtol=6e-2)
+    torch.testing.assert_close(k_pe.grad.float(), k_pe_eager.grad.float(), atol=1e-3, rtol=6e-2)
+    torch.testing.assert_close(kv_cache.grad.float(), kv_cache_eager.grad.float(), atol=1e-2, rtol=6e-2)
+    torch.testing.assert_close(q_nope.grad.float(), q_nope_eager.grad.float(), atol=1e-3, rtol=6e-2)
 
 
-def test_sparse_attention_backward_compatibility_rejects_split_value_dim():
+@pytest.mark.parametrize(
+    ("kv", "out_dim", "expected_reason"),
+    [
+        (torch.empty(2, 4, 7, 5, dtype=torch.bfloat16), 5, "unified K=V"),
+        (torch.empty(2, 7, 5, dtype=torch.bfloat16), 6, "value dim"),
+    ],
+)
+def test_sparse_attention_backward_rejects_invalid_contracts(kv, out_dim, expected_reason):
+    common = _common_backend()
     q = torch.empty(2, 3, 4, 5, dtype=torch.bfloat16)
-    kv = torch.empty(2, 7, 5, dtype=torch.bfloat16)
-    out = torch.empty(2, 3, 4, 6, dtype=torch.bfloat16)
+    out = torch.empty(2, 3, 4, out_dim, dtype=torch.bfloat16)
     dout = torch.empty_like(out)
     lse = torch.empty(2, 3, 4, dtype=torch.float32)
     attn_sink = torch.empty(4, dtype=torch.float32)
     topk_indices = torch.zeros(2, 3, 2, dtype=torch.long)
 
-    compatible, reason = dsa.check_sparse_attention_backward_compatible(
+    compatible, reason = common.check_sparse_attention_backward_compatible(
         q,
         kv,
         out,
@@ -319,4 +534,4 @@ def test_sparse_attention_backward_compatibility_rejects_split_value_dim():
     )
 
     assert not compatible
-    assert "value dim" in reason
+    assert expected_reason in reason

@@ -12,31 +12,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""FlashMLA forward paired with cuDNN Frontend DeepSeek Sparse Attention backward."""
+"""FlashAttention-4 forward paired with cuDNN FE DSA backward."""
 
 from __future__ import annotations
 
 from typing import Any
 
 import torch
-from flash_mla import flash_mla_sparse_fwd
+from flash_attn.cute import flash_attn_func
 
 from veomni.ops.kernels.deepseek_sparse_attention.common import (
-    _local_topk_to_global,
-    check_sparse_attention_backward_compatible,
     check_sparse_mla_forward_compatible,
-    indexer_scores,
-    indexer_select_topk,
     pack_sparse_mla_tensors_for_backward,
     sparse_attention_backward,
 )
 
 
-check_flash_mla_sparse_forward_compatible = check_sparse_mla_forward_compatible
-pack_flash_mla_tensors_for_sparse_backward = pack_sparse_mla_tensors_for_backward
-
-
-def flash_mla_sparse_forward(
+def fa4_sparse_forward(
     q_pe: torch.Tensor,
     k_pe: torch.Tensor,
     kv_cache: torch.Tensor,
@@ -50,7 +42,7 @@ def flash_mla_sparse_forward(
     topk_length: torch.Tensor | None = None,
     **kwargs: Any,
 ) -> dict[str, torch.Tensor]:
-    """Run FlashMLA sparse prefill and return both output and LSE."""
+    """Run FA4 sparse MLA forward and return both output and LSE."""
     compatible, reason = check_sparse_mla_forward_compatible(
         q_pe,
         k_pe,
@@ -63,40 +55,36 @@ def flash_mla_sparse_forward(
     if not compatible:
         raise ValueError(reason)
     if gather_kv_indices is None:
-        raise ValueError("FlashMLA sparse prefill requires gather_kv_indices")
-
+        raise ValueError("FA4 sparse MLA forward requires gather_kv_indices")
     if causal:
-        raise ValueError("FlashMLA sparse prefill requires causal=False")
+        raise ValueError("FA4 sparse MLA forward requires causal=False")
     if min_seqlen_k is not None:
-        raise ValueError("FlashMLA sparse prefill does not use min_seqlen_k")
+        raise ValueError("FA4 sparse MLA forward does not use min_seqlen_k")
     if kwargs:
-        raise ValueError(f"Unsupported FlashMLA sparse prefill kwargs: {sorted(kwargs)}")
+        raise ValueError(f"Unsupported FA4 sparse MLA forward kwargs: {sorted(kwargs)}")
 
-    packed = pack_sparse_mla_tensors_for_backward(q_pe, k_pe, kv_cache, q_nope)
-    batch_size, seqlen_q, num_heads = q_pe.shape[:3]
-    seqlen_k = k_pe.shape[1]
-    q_flat = packed["q"].reshape(batch_size * seqlen_q, num_heads, packed["q"].shape[-1]).contiguous()
-    kv_flat = packed["kv"].reshape(batch_size * seqlen_k, 1, packed["kv"].shape[-1]).contiguous()
-    indices = _local_topk_to_global(gather_kv_indices, seqlen_k).reshape(batch_size * seqlen_q, 1, -1).contiguous()
-    topk_length_flat = None if topk_length is None else topk_length.reshape(batch_size * seqlen_q).to(torch.int32)
-    sm_scale = q_flat.shape[-1] ** (-0.5) if softmax_scale is None else softmax_scale
-
-    out, _, lse = flash_mla_sparse_fwd(
-        q_flat,
-        kv_flat,
-        indices,
-        sm_scale,
-        d_v=kv_cache.shape[-1],
-        attn_sink=learnable_sink,
-        topk_length=topk_length_flat,
+    sm_scale = (q_pe.shape[-1] + q_nope.shape[-1]) ** (-0.5) if softmax_scale is None else softmax_scale
+    indices = gather_kv_indices.to(torch.int32)
+    if topk_length is not None:
+        positions = torch.arange(indices.shape[-1], device=indices.device, dtype=topk_length.dtype)
+        valid = positions.view(1, 1, -1) < topk_length.unsqueeze(-1)
+        indices = torch.where(valid, indices, torch.full_like(indices, -1))
+    result = flash_attn_func(
+        q_pe,
+        k_pe,
+        kv_cache,
+        qv=q_nope,
+        softmax_scale=sm_scale,
+        causal=False,
+        learnable_sink=learnable_sink,
+        gather_kv_indices=indices,
+        return_lse=True,
     )
-    return {
-        "out": out.reshape(batch_size, seqlen_q, num_heads, kv_cache.shape[-1]),
-        "lse": lse.reshape(batch_size, seqlen_q, num_heads),
-    }
+    out, lse = result[:2]
+    return {"out": out, "lse": lse}
 
 
-class _FlashMLASparseAttentionWithCuDNNBackward(torch.autograd.Function):
+class _FA4SparseAttentionWithCuDNNBackward(torch.autograd.Function):
     @staticmethod
     def forward(
         ctx: Any,
@@ -110,7 +98,7 @@ class _FlashMLASparseAttentionWithCuDNNBackward(torch.autograd.Function):
         softmax_scale: float | None,
     ) -> torch.Tensor:
         topk_indices = topk_indices if topk_indices.dtype == torch.int32 else topk_indices.to(torch.int32)
-        forward_result = flash_mla_sparse_forward(
+        forward_result = fa4_sparse_forward(
             q_pe,
             k_pe,
             kv_cache,
@@ -180,7 +168,7 @@ class _FlashMLASparseAttentionWithCuDNNBackward(torch.autograd.Function):
         )
 
 
-def flash_mla_sparse_attention_with_cudnn_backward(
+def fa4_sparse_attention_with_cudnn_backward(
     q_pe: torch.Tensor,
     k_pe: torch.Tensor,
     kv_cache: torch.Tensor,
@@ -191,8 +179,8 @@ def flash_mla_sparse_attention_with_cudnn_backward(
     topk_length: torch.Tensor | None = None,
     softmax_scale: float | None = None,
 ) -> torch.Tensor:
-    """FlashMLA sparse prefill forward paired with cuDNN FE DSA backward."""
-    return _FlashMLASparseAttentionWithCuDNNBackward.apply(
+    """FA4 sparse MLA forward paired with cuDNN FE DSA backward."""
+    return _FA4SparseAttentionWithCuDNNBackward.apply(
         q_pe,
         k_pe,
         kv_cache,
@@ -205,12 +193,6 @@ def flash_mla_sparse_attention_with_cudnn_backward(
 
 
 __all__ = [
-    "indexer_scores",
-    "indexer_select_topk",
-    "check_flash_mla_sparse_forward_compatible",
-    "flash_mla_sparse_forward",
-    "pack_flash_mla_tensors_for_sparse_backward",
-    "flash_mla_sparse_attention_with_cudnn_backward",
-    "check_sparse_attention_backward_compatible",
-    "sparse_attention_backward",
+    "fa4_sparse_forward",
+    "fa4_sparse_attention_with_cudnn_backward",
 ]

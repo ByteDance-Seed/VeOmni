@@ -222,7 +222,7 @@ class GlmMoeDsaIndexer(nn.Module):
         if indexer_backend not in ("eager", "cudnn"):
             raise ValueError(f"Unknown dsa_indexer_backend={indexer_backend!r}; expected 'eager' or 'cudnn'")
         if indexer_backend == "cudnn":
-            from veomni.ops.kernels.deepseek_sparse_attention.flashmla_cudnn import indexer_select_topk
+            from veomni.ops.kernels.deepseek_sparse_attention.common import indexer_select_topk
 
             qhead_per_kv_head = self.n_heads
             unsupported_reasons = []
@@ -453,25 +453,25 @@ class GlmMoeDsaAttention(nn.Module):
             topk_indices = prev_topk_indices  # [B, S, topk]
 
         attention_backend = veomni_dsa_attention_backend.value
-        if attention_backend not in ("eager", "flashmla_cudnn"):
+        if attention_backend not in ("eager", "flashmla_cudnn", "fa4_cudnn"):
             raise ValueError(
-                f"Unknown dsa_attention_backend={attention_backend!r}; expected 'eager' or 'flashmla_cudnn'"
+                f"Unknown dsa_attention_backend={attention_backend!r}; expected 'eager', 'flashmla_cudnn' or 'fa4_cudnn'"
             )
-        if attention_backend == "flashmla_cudnn":
-            from veomni.ops.kernels.deepseek_sparse_attention.flashmla_cudnn import (
-                check_flash_mla_sparse_forward_compatible,
-                flash_mla_sparse_attention_with_cudnn_backward,
+        if attention_backend in ("flashmla_cudnn", "fa4_cudnn"):
+            from veomni.ops.kernels.deepseek_sparse_attention.common import check_sparse_mla_forward_compatible
+            from veomni.ops.kernels.deepseek_sparse_attention.dispatcher import (
+                sparse_mla_attention_with_cudnn_backward,
             )
 
             if not hidden_states.is_cuda:
-                raise ValueError("dsa_attention_backend='flashmla_cudnn' requires CUDA hidden_states")
+                raise ValueError(f"dsa_attention_backend={attention_backend!r} requires CUDA hidden_states")
             if past_key_values is not None:
-                raise ValueError("dsa_attention_backend='flashmla_cudnn' does not support KV cache")
+                raise ValueError(f"dsa_attention_backend={attention_backend!r} does not support KV cache")
             if self.training and self.attention_dropout != 0:
-                raise ValueError("dsa_attention_backend='flashmla_cudnn' requires attention_dropout=0")
+                raise ValueError(f"dsa_attention_backend={attention_backend!r} requires attention_dropout=0")
 
             if not self.kv_b_proj.weight.is_contiguous():
-                raise ValueError("dsa_attention_backend='flashmla_cudnn' requires contiguous kv_b_proj.weight")
+                raise ValueError(f"dsa_attention_backend={attention_backend!r} requires contiguous kv_b_proj.weight")
             kv_b_weight = self.kv_b_proj.weight.view(
                 self.num_heads,
                 self.qk_nope_head_dim + self.v_head_dim,
@@ -480,7 +480,7 @@ class GlmMoeDsaAttention(nn.Module):
             k_nope_weight = kv_b_weight[:, : self.qk_nope_head_dim, :]
             value_weight = kv_b_weight[:, self.qk_nope_head_dim :, :]
             q_nope_absorbed = torch.einsum("bhsd,hdr->bshr", q_nope, k_nope_weight)
-            compatible, reason = check_flash_mla_sparse_forward_compatible(
+            compatible, reason = check_sparse_mla_forward_compatible(
                 q_pe.transpose(1, 2),
                 k_pe_mqa.transpose(1, 2),
                 k_compressed.unsqueeze(2),
@@ -488,8 +488,9 @@ class GlmMoeDsaAttention(nn.Module):
                 topk_indices,
             )
             if not compatible:
-                raise ValueError("dsa_attention_backend='flashmla_cudnn' is not supported: " + reason)
-            compressed_attn_output = flash_mla_sparse_attention_with_cudnn_backward(
+                raise ValueError(f"dsa_attention_backend={attention_backend!r} is not supported: " + reason)
+            compressed_attn_output = sparse_mla_attention_with_cudnn_backward(
+                attention_backend,
                 q_pe.transpose(1, 2).contiguous(),
                 k_pe_mqa.transpose(1, 2).contiguous(),
                 k_compressed.unsqueeze(2).contiguous(),
