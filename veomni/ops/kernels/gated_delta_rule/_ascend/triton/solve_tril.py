@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 # Copyright (c) 2026, Huawei Technologies Co., Ltd. All rights reserved.
 
