@@ -68,6 +68,7 @@ class VLMTrainingArguments(TrainingArguments):
 
 @dataclass
 class VLMMDataArguments(DataArguments):
+    supports_torch_compile = False
     mm_configs: Optional[Dict] = field(
         default_factory=dict,
         metadata={"help": "Config for multimodal input."},
@@ -241,10 +242,15 @@ class VLMTrainer:
                 else:
                     other_params.append(param)
 
-        param_groups = [
-            {"params": vit_params, "lr": args.train.vit_lr},
-            {"params": other_params, "lr": args.train.optimizer.lr},
-        ]
+        # Only create groups that have trainable params. An empty vit group
+        # (freeze_vit=true) has no optimizer state under DCP and would raise
+        # KeyError: 'betas' on the first step after resume. VLMRLTrainer
+        # inherits this method, so the guard covers both trainers.
+        param_groups = []
+        if vit_params:
+            param_groups.append({"params": vit_params, "lr": args.train.vit_lr})
+        if other_params:
+            param_groups.append({"params": other_params, "lr": args.train.optimizer.lr})
 
         self.base.optimizer = build_optimizer(
             self.base.model,
@@ -258,34 +264,23 @@ class VLMTrainer:
             muon_kwargs=_collect_muon_kwargs(args.train.optimizer),
         )
 
-    # Callbacks run under this trainer's parallel state. For a single-model
-    # trainer this state is constant, so the scope is effectively a no-op; it is
-    # kept explicit so a subclass that drives multiple modules with different
-    # parallel states scopes each callback to the owning module (e.g. DCP
-    # checkpointing reads the current ParallelState at save time).
     def on_train_begin(self):
-        with use_parallel_state(self.base.parallel_state):
-            self.base.on_train_begin()
+        self.base.on_train_begin()
 
     def on_train_end(self):
-        with use_parallel_state(self.base.parallel_state):
-            self.base.on_train_end()
+        self.base.on_train_end()
 
     def on_epoch_begin(self):
-        with use_parallel_state(self.base.parallel_state):
-            self.base.on_epoch_begin()
+        self.base.on_epoch_begin()
 
     def on_epoch_end(self):
-        with use_parallel_state(self.base.parallel_state):
-            self.base.on_epoch_end()
+        self.base.on_epoch_end()
 
     def on_step_begin(self, micro_batches=None):
-        with use_parallel_state(self.base.parallel_state):
-            self.base.on_step_begin(micro_batches=micro_batches)
+        self.base.on_step_begin(micro_batches=micro_batches)
 
     def on_step_end(self, loss=None, loss_dict=None, grad_norm=None):
-        with use_parallel_state(self.base.parallel_state):
-            self.base.on_step_end(loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
+        self.base.on_step_end(loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
 
     def train_step(
         self,
@@ -355,7 +350,11 @@ class VLMTrainer:
 
             for _ in range(self.base.start_step, args.train_steps):
                 try:
-                    self.train_step(self.base.data_iterator)
+                    # Scope the whole optimize step (fwd/bwd, grad clip, optimizer)
+                    # to this model's parallel state so every group getter resolves
+                    # from its own device mesh.
+                    with use_parallel_state(self.base.parallel_state):
+                        self.train_step(self.base.data_iterator)
                 except StopIteration:
                     logger.info(f"epoch:{epoch} Dataloader finished with drop_last {args.data.dataloader.drop_last}")
                     break

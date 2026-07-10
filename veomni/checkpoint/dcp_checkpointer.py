@@ -27,7 +27,7 @@ from torch.distributed.checkpoint import (
     FileSystemWriter,
     load,
 )
-from torch.distributed.checkpoint.default_planner import DefaultLoadPlanner
+from torch.distributed.checkpoint.default_planner import DefaultLoadPlanner, DefaultSavePlanner
 from torch.distributed.checkpoint.metadata import STATE_DICT_TYPE, Metadata
 from torch.distributed.checkpoint.state_dict import (
     StateDictOptions,
@@ -39,6 +39,7 @@ from torch.distributed.checkpoint.state_dict import (
 from torch.distributed.checkpoint.stateful import Stateful
 
 from ..distributed.parallel_state import get_parallel_state
+from ..optim.optimizer import restore_optimizer_param_group_defaults
 from ..utils import logging
 from ..utils.checkpoint_utils import _GLOBAL_STEP_PREFIX
 from ..utils.device import empty_cache, synchronize
@@ -169,13 +170,13 @@ class ModelState(Stateful):
             (already populated from ``model_path``) base params are left untouched.
     """
 
-    def __init__(self, model, trainable_only: bool = False):
+    def __init__(self, model, trainable_only: bool = False, parallel_state=None):
         self.model = model
         self.trainable_only = trainable_only
 
         # Determine whether this is ExtraParallel+FSDP2 case
         # If so, we need to restore Para(e.g. EP)-dim before saving to DCP
-        self.parallel_state = get_parallel_state()
+        self.parallel_state = parallel_state if parallel_state is not None else get_parallel_state()
         self.extra_parallel_fqn2spec_info = getattr(self.model, "_fqn2spec_info", None)
         self.should_extra_parallel_aware = (
             self.extra_parallel_fqn2spec_info is not None and self.parallel_state.dp_mode == "fsdp2"
@@ -240,10 +241,10 @@ class OptimizerState(Stateful):
     ``ModelState.load_state_dict`` for non-LoRA loads.
     """
 
-    def __init__(self, model, optimizer):
+    def __init__(self, model, optimizer, parallel_state=None):
         self.model = model
         self.optimizer = optimizer
-        self.parallel_state = get_parallel_state()
+        self.parallel_state = parallel_state if parallel_state is not None else get_parallel_state()
         self.extra_parallel_fqn2spec_info = getattr(self.model, "_fqn2spec_info", None)
         self.should_extra_parallel_aware = (
             self.extra_parallel_fqn2spec_info is not None and self.parallel_state.dp_mode == "fsdp2"
@@ -274,6 +275,9 @@ class OptimizerState(Stateful):
             )
             # Delegate to MultiOptimizer (it will split/filter correctly)
             self.optimizer.load_state_dict(optim_state_without_extra_parallel_dim)
+            # MultiOptimizer sub-optimizers can also lose param-group hyperparams
+            # (betas/...) for empty groups after load; restore recurses into them.
+            restore_optimizer_param_group_defaults(self.optimizer)
             return
 
         # Single torch optimizer
@@ -282,6 +286,7 @@ class OptimizerState(Stateful):
             optimizers=self.optimizer,
             optim_state_dict=optim_state_from_dcp_load,
         )
+        restore_optimizer_param_group_defaults(self.optimizer)
 
     def get_state_dict_with_extra_parallel_dim_preprocess(self, state_dict, action):
         return _apply_extra_parallel_dim(
@@ -404,6 +409,8 @@ class DistributedCheckpointer(CheckpointerBase):
         global_steps: int = None,
         storage_writer: Optional[FileSystemWriter] = None,
         trainable_only: bool = False,
+        save_to_lowest_rank: bool = False,
+        parallel_state=None,
     ) -> None:
         """
         save training state to distributed checkpoint
@@ -420,6 +427,15 @@ class DistributedCheckpointer(CheckpointerBase):
                 state is already trainable-only by construction (the optimizer is built
                 from ``filter(lambda p: p.requires_grad, ...)``), so this flag only
                 affects the model state dump.
+            save_to_lowest_rank: forwarded to the DCP ``DefaultSavePlanner``. When True, each
+                replicated shard is written by the lowest global rank that holds it, instead of
+                being load-balanced across all replica holders. On a non-shared filesystem this
+                concentrates the (already deduplicated) copy onto the lowest-ranked replica group
+                instead of scattering it across replicas; in the standard HSDP layout (shard within
+                a node, replicate across nodes) that group is one node, which then holds a complete
+                checkpoint. Note this only consolidates *replicated* data: unique shards from
+                expert/tensor/pipeline parallelism are never deduplicated and remain distributed.
+                See ``CheckpointConfig.dcp_save_to_lowest_rank``.
         return:
             None
         """
@@ -432,14 +448,23 @@ class DistributedCheckpointer(CheckpointerBase):
         # saving extra_state first to gurantee that every saved model/optimizer ckpts have their extra_state saved before them
         cls._save_extra_state(checkpoint_dir=checkpoint_dir, state=state)
 
-        save_state = {"model": ModelState(state["model"], trainable_only=trainable_only)}
+        save_state = {
+            "model": ModelState(state["model"], trainable_only=trainable_only, parallel_state=parallel_state)
+        }
         if "optimizer" in state:
-            save_state["optimizer"] = OptimizerState(model=state["model"], optimizer=state["optimizer"])
+            save_state["optimizer"] = OptimizerState(
+                model=state["model"], optimizer=state["optimizer"], parallel_state=parallel_state
+            )
 
         if storage_writer is None:
             storage_writer = cls._create_storage_writer(checkpoint_dir)
 
-        cls.execute_save(save_state=save_state, storage_writer=storage_writer, save_async=save_async)
+        cls.execute_save(
+            save_state=save_state,
+            storage_writer=storage_writer,
+            save_async=save_async,
+            save_to_lowest_rank=save_to_lowest_rank,
+        )
 
         logger.info_rank0(f"Saved checkpoint to {checkpoint_dir}")
 
@@ -451,6 +476,7 @@ class DistributedCheckpointer(CheckpointerBase):
         process_group=None,
         storage_reader: Optional[FileSystemReader] = None,
         trainable_only: bool = False,
+        parallel_state=None,
     ) -> Dict[str, Any]:
         """
         load training state from distributed checkpoint
@@ -476,9 +502,13 @@ class DistributedCheckpointer(CheckpointerBase):
         if "model" not in state:
             raise ValueError("Model must be provided to load a distributed checkpoint.")
 
-        load_state = {"model": ModelState(state["model"], trainable_only=trainable_only)}
+        load_state = {
+            "model": ModelState(state["model"], trainable_only=trainable_only, parallel_state=parallel_state)
+        }
         if "optimizer" in state:
-            load_state["optimizer"] = OptimizerState(model=state["model"], optimizer=state["optimizer"])  # type: ignore[index]
+            load_state["optimizer"] = OptimizerState(
+                model=state["model"], optimizer=state["optimizer"], parallel_state=parallel_state
+            )  # type: ignore[index]
 
         if storage_reader is None:
             storage_reader = cls._create_storage_reader(checkpoint_dir)
@@ -528,8 +558,14 @@ class DistributedCheckpointer(CheckpointerBase):
         save_state: Dict[str, Any],
         storage_writer: FileSystemWriter,
         save_async: bool,
+        save_to_lowest_rank: bool = False,
     ) -> None:
-        """Execute DCP save with optional async support."""
+        """Execute DCP save with optional async support.
+
+        ``save_to_lowest_rank`` is forwarded to ``DefaultSavePlanner``; the default
+        (False) preserves DCP's load-balanced write assignment across replica holders.
+        """
+        planner = DefaultSavePlanner(dedup_save_to_lowest_rank=save_to_lowest_rank)
         if save_async:
             # Lazily create a dedicated Gloo process group for async DCP saves
             if cls._async_process_group is None:
@@ -541,11 +577,13 @@ class DistributedCheckpointer(CheckpointerBase):
                 state_dict=save_state,
                 storage_writer=storage_writer,
                 process_group=cls._async_process_group,
+                planner=planner,
             )
         else:
             dcp.save(
                 state_dict=save_state,
                 storage_writer=storage_writer,
+                planner=planner,
             )
             if dist.is_initialized():
                 dist.barrier()

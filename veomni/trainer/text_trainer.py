@@ -24,6 +24,7 @@ from ..data import (
 )
 from ..distributed.clip_grad_norm import veomni_clip_grad_norm
 from ..distributed.parallel_state import use_parallel_state
+from ..distributed.torch_compile import mark_compile_step_begin
 from ..models import build_tokenizer
 from ..utils import helper
 from ..utils.device import synchronize
@@ -89,34 +90,23 @@ class TextTrainer:
             text_keys=args.data.text_keys,
         )
 
-    # Callbacks run under this trainer's parallel state. For a single-model
-    # trainer this state is constant, so the scope is effectively a no-op; it is
-    # kept explicit so a subclass that drives multiple modules with different
-    # parallel states scopes each callback to the owning module (e.g. DCP
-    # checkpointing reads the current ParallelState at save time).
     def on_train_begin(self):
-        with use_parallel_state(self.base.parallel_state):
-            self.base.on_train_begin()
+        self.base.on_train_begin()
 
     def on_train_end(self):
-        with use_parallel_state(self.base.parallel_state):
-            self.base.on_train_end()
+        self.base.on_train_end()
 
     def on_epoch_begin(self):
-        with use_parallel_state(self.base.parallel_state):
-            self.base.on_epoch_begin()
+        self.base.on_epoch_begin()
 
     def on_epoch_end(self):
-        with use_parallel_state(self.base.parallel_state):
-            self.base.on_epoch_end()
+        self.base.on_epoch_end()
 
     def on_step_begin(self, micro_batches=None):
-        with use_parallel_state(self.base.parallel_state):
-            self.base.on_step_begin(micro_batches=micro_batches)
+        self.base.on_step_begin(micro_batches=micro_batches)
 
     def on_step_end(self, loss=None, loss_dict=None, grad_norm=None):
-        with use_parallel_state(self.base.parallel_state):
-            self.base.on_step_end(loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
+        self.base.on_step_end(loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
 
     def train_step(
         self,
@@ -140,6 +130,7 @@ class TextTrainer:
         num_micro_steps = len(micro_batches)
         # forward and backward pass with gradient_accumulationsteps
         for micro_step, micro_batch in enumerate(micro_batches):
+            mark_compile_step_begin(getattr(self.base.model, "_veomni_compile_uses_cuda_graphs", False))
             self.base.model_reshard(micro_step, num_micro_steps)
             loss: torch.Tensor
             loss_dict: Dict[str, torch.Tensor]
@@ -186,7 +177,11 @@ class TextTrainer:
 
             for _ in range(self.base.start_step, args.train_steps):
                 try:
-                    self.train_step(self.base.data_iterator)
+                    # Scope the whole optimize step (fwd/bwd, grad clip, optimizer)
+                    # to this model's parallel state so every group getter resolves
+                    # from its own device mesh.
+                    with use_parallel_state(self.base.parallel_state):
+                        self.train_step(self.base.data_iterator)
                 except StopIteration:
                     logger.info(f"epoch:{epoch} Dataloader finished with drop_last {args.data.dataloader.drop_last}")
                     break

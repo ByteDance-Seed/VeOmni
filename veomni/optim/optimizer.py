@@ -106,6 +106,76 @@ def _collect_ep_replicated_lora_param_ids(model: "nn.Module") -> set[int]:
 logger = logging.get_logger(__name__)
 
 
+def filter_empty_param_groups(
+    param_groups: Sequence[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Drop param groups with no trainable parameters.
+
+    VLM trainers pass separate vit/backbone groups; when vit is frozen the vit
+    group is empty. PyTorch DCP only persists optimizer state for non-empty
+    groups, so keeping empty groups breaks resume (KeyError: 'betas' on
+    optimizer.step() after set_optimizer_state_dict).
+
+    ``params`` may be a generator/iterator. We materialize it into a list so
+    that (a) an empty iterator is detected correctly (``bool(generator)`` is
+    always True regardless of contents) and (b) it is not exhausted before the
+    optimizer consumes it. Frozen params (``requires_grad=False``) are dropped
+    too: they never receive optimizer state, so a group containing only frozen
+    params is effectively empty and would hit the same resume ``KeyError``.
+    Non-empty groups are returned as shallow copies with the filtered
+    ``params`` list.
+    """
+    total = 0
+    non_empty: List[Dict[str, Any]] = []
+    for group in param_groups:
+        total += 1
+        params = group.get("params")
+        if params is None:
+            continue
+        params_list = [p for p in params if getattr(p, "requires_grad", True)]
+        if not params_list:
+            continue
+        new_group = dict(group)
+        new_group["params"] = params_list
+        non_empty.append(new_group)
+    if len(non_empty) < total:
+        logger.info_rank0(
+            "Dropped %d empty optimizer param group(s) before optimizer construction.",
+            total - len(non_empty),
+        )
+    return non_empty
+
+
+def restore_optimizer_param_group_defaults(optimizer: Any) -> None:
+    """Re-apply optimizer defaults to param groups after DCP load.
+
+    Recurses into containers of optimizers so the safety net reaches every real
+    optimizer regardless of how it was passed:
+
+    * a plain ``dict`` of optimizers (the form PyTorch DCP APIs natively accept),
+    * a ``MultiOptimizer`` (ExtraParallel+FSDP2 / Muon), which has no top-level
+      ``defaults``/``param_groups`` and wraps sub-optimizers in ``optimizers_dict``.
+    """
+    if isinstance(optimizer, dict):
+        for sub_optimizer in optimizer.values():
+            restore_optimizer_param_group_defaults(sub_optimizer)
+        return
+
+    sub_optimizers = getattr(optimizer, "optimizers_dict", None)
+    if sub_optimizers is not None:
+        for sub_optimizer in sub_optimizers.values():
+            restore_optimizer_param_group_defaults(sub_optimizer)
+        return
+
+    defaults = getattr(optimizer, "defaults", None)
+    param_groups = getattr(optimizer, "param_groups", None)
+    if not defaults or not param_groups:
+        return
+    for group in param_groups:
+        for key, value in defaults.items():
+            group.setdefault(key, value)
+
+
 # https://github.com/meta-llama/llama-recipes/blob/v0.0.4/src/llama_recipes/policies/anyprecision_optimizer.py
 class AnyPrecisionAdamW(Optimizer):
     def __init__(
@@ -360,6 +430,11 @@ def build_optimizer(
             muon_kwargs=muon_kwargs,
         )
 
+    if param_groups is not None:
+        param_groups = filter_empty_param_groups(param_groups)
+        if not param_groups:
+            raise ValueError("All optimizer param groups are empty; no trainable parameters to optimize.")
+
     if _should_build_extra_parallel_aware(model):
         return build_extra_parallel_fsdp2_optimizer(
             model, lr, betas, eps, weight_decay, fused, optimizer_type, param_groups, no_decay_modules, no_decay_params
@@ -381,6 +456,13 @@ def build_optimizer(
         if len(no_decay_parameters) > 0:
             logger.info_rank0(f"Parameters without weight decay: {no_decay_parameter_names}")
             param_groups.append({"params": no_decay_parameters, "weight_decay": 0.0})
+
+    # Filter again to cover the auto-built groups above: if the model has no
+    # decayed params requiring grad, the decay group is empty and would carry
+    # the same DCP-resume KeyError as an empty VLM vit group.
+    param_groups = filter_empty_param_groups(param_groups)
+    if not param_groups:
+        raise ValueError("All optimizer param groups are empty; no trainable parameters to optimize.")
 
     if optimizer_type == "adamw":
         foreach = not fused

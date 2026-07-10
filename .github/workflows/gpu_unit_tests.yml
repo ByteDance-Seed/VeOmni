@@ -172,6 +172,7 @@ jobs:
           uv run --frozen pytest -s -x tests/optim/test_muon_unit.py
           uv run --frozen pytest -s -x tests/optim/test_muon_fsdp2_parity.py
           uv run --frozen pytest -s -x tests/optim/test_muon_fsdp2_smoke.py
+          uv run --frozen pytest -s -x tests/optim/test_optimizer_vlm_param_groups.py
       - name: Run LoRA e2e tests
         # peft ships under the `gpu` extra, so the earlier
         # `uv sync --frozen --extra gpu --group dev` step is sufficient — no extra sync needed here.

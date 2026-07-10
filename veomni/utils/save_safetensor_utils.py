@@ -37,6 +37,7 @@ logger = helper.create_logger(__name__)
 def get_model_save_state(
     model: torch.nn.Module,
     fqn_to_index_mapping: Optional[Dict[str, int]],
+    parallel_state=None,
 ) -> Dict[str, torch.Tensor]:
     """Build a flat state dict suitable for HuggingFace safetensors saving.
 
@@ -48,7 +49,7 @@ def get_model_save_state(
 
     # Use flat state dict so DCP FQNs match the original HF weight_map keys
     # (e.g. "model.embed_tokens.weight" instead of "model.model.embed_tokens.weight")
-    save_state = ModelState(model).state_dict()
+    save_state = ModelState(model, parallel_state=parallel_state).state_dict()
 
     # Convert float32 tensors to bfloat16 on a copy of the state dict,
     # so the original model parameters remain unchanged.
@@ -85,6 +86,7 @@ def _save_hf_safetensor_distributed(
     save_path: str,
     fqn_to_index_mapping: Optional[Dict[str, int]],
     model_assets: Optional[Sequence],
+    parallel_state=None,
 ):
     """Distributed HuggingFace safetensors save using HuggingFaceStorageWriter (PyTorch >= 2.9).
 
@@ -99,7 +101,7 @@ def _save_hf_safetensor_distributed(
 
     apply_dcp_consolidation_patch()
 
-    save_state = get_model_save_state(model, fqn_to_index_mapping)
+    save_state = get_model_save_state(model, fqn_to_index_mapping, parallel_state=parallel_state)
 
     # Filter fqn_to_index_mapping to only include keys that exist in save_state.
     # This is necessary when training excludes certain modules (e.g., MTP) but the original
@@ -175,6 +177,7 @@ def save_hf_safetensor(
     # Distributed only
     model: Optional[torch.nn.Module] = None,
     fqn_to_index_mapping: Optional[Dict[str, int]] = None,
+    parallel_state=None,
 ):
     """Save model weights in HuggingFace safetensors format.
 
@@ -218,7 +221,9 @@ def save_hf_safetensor(
         from veomni.models.checkpoint_tensor_loading import resolve_fqn_to_index_mapping_for_save
 
         fqn_to_index_mapping = resolve_fqn_to_index_mapping_for_save(model, fqn_to_index_mapping)
-        _save_hf_safetensor_distributed(model, save_hf_safetensor_path, fqn_to_index_mapping, model_assets)
+        _save_hf_safetensor_distributed(
+            model, save_hf_safetensor_path, fqn_to_index_mapping, model_assets, parallel_state=parallel_state
+        )
     else:
         # Legacy path is rank-0 only; non-rank-0 waits at the barrier below
         if is_rank_0:

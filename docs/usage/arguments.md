@@ -229,14 +229,26 @@ NPU validation runs at two times:
 | eval_steps | `int` | `0` | Steps between evaluations. `0` to disable. |
 | eval_epochs | `int` | `1` | Epochs between evaluations. `0` to disable. |
 | seed | `int` | `42` | Random seed. |
-| enable_compile | `bool` | `False` | Enable `torch.compile`. |
 | max_steps | `Optional[int]` | `None` | Max training steps per epoch (debug only). |
 | optimizer | `OptimizerConfig` | — | Optimizer and learning-rate schedule. |
 | wandb | `WandbConfig` | — | Weights & Biases logging. |
 | profile | `ProfileConfig` | — | Torch profiler settings. |
 | gradient_checkpointing | `GradientCheckpointingConfig` | — | Gradient checkpointing settings. |
+| torch_compile | `TorchCompileConfig` | — | Per-block `torch.compile` settings. |
 | accelerator | `AcceleratorConfig` | — | Parallelism and distributed-training topology. |
 | checkpoint | `CheckpointConfig` | — | Checkpoint saving and loading. |
+
+### TorchCompileConfig
+
+`train.torch_compile.*` — Per-block `torch.compile` options for text training. This path currently supports text trainers only and requires `train.dyn_bsz=True` plus `train.pad_to_length=True`, so packed inputs have stable shapes. The default `mode=None` follows TorchTitan's main path by using the `inductor` backend without CUDA Graph replay. Setting `mode="reduce-overhead"` explicitly enables CUDA Graphs on the `inductor` backend and requires `train.accelerator.fsdp_config.reshard_after_forward=False`. When CUDA Graphs are enabled, each micro-batch calls `torch.compiler.cudagraph_mark_step_begin()` when available so CUDA Graph Trees can separate iterations.
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| enable | `bool` | `False` | Enable per-block `torch.compile` on FSDP2 decoder blocks. |
+| backend | `Optional[str]` | `"inductor"` | Backend passed to `torch.compile`. |
+| mode | `Optional[str]` | `None` | Mode passed to `torch.compile`. `None` uses the `inductor` backend default. `"reduce-overhead"` enables CUDA Graphs on the `inductor` backend, requires `train.accelerator.fsdp_config.reshard_after_forward=False`, and must be `None` when `backend="cudagraphs"`. |
+| fullgraph | `bool` | `True` | Whether to pass `fullgraph=True` to `torch.compile`. |
+| dynamic | `bool` | `False` | Whether to pass `dynamic=True` to `torch.compile`. |
 
 ### OptimizerConfig
 
@@ -355,6 +367,7 @@ NPU validation runs at two times:
 | output_dir | `str` | `"output"` | Path to save model checkpoints. |
 | manager | `str` | `"dcp"` | Checkpoint manager. |
 | save_async | `bool` | `False` | Save checkpoints asynchronously. |
+| dcp_save_to_lowest_rank | `bool` | `False` | Write each replicated DCP shard from the lowest global rank that holds it instead of load-balancing across replicas. On a non-shared filesystem this concentrates the deduplicated copy onto the lowest-ranked replica group rather than scattering it across replicas; in the standard HSDP layout (shard within a node, replicate across nodes) that group is one node, which then holds a complete checkpoint. Only affects replicated data — unique expert/tensor/pipeline-parallel shards stay distributed. Leave `False` when `output_dir` is shared. |
 | load_path | `Optional[str]` | `None` | Path to checkpoint for resuming training. Use `"auto"` for auto-detection. |
 | save_steps | `int` | `0` | Steps between checkpoint saves. `0` to disable. |
 | save_epochs | `int` | `1` | Epochs between checkpoint saves. `0` to disable. |

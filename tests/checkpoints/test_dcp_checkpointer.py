@@ -105,6 +105,44 @@ class TestAllowPartialLoad:
 
 
 # ---------------------------------------------------------------------------
+# Save planner: dcp_save_to_lowest_rank wiring
+# ---------------------------------------------------------------------------
+
+
+class TestSaveToLowestRank:
+    """execute_save() must forward ``save_to_lowest_rank`` to DCP's
+    DefaultSavePlanner, defaulting to False (stock load-balanced writes)."""
+
+    def test_config_default_is_false(self):
+        from veomni.arguments.arguments_types import CheckpointConfig
+
+        assert CheckpointConfig().dcp_save_to_lowest_rank is False
+
+    @pytest.mark.parametrize("flag", [False, True])
+    @patch("veomni.checkpoint.dcp_checkpointer.synchronize")
+    @patch("veomni.checkpoint.dcp_checkpointer.empty_cache")
+    @patch("veomni.checkpoint.dcp_checkpointer.dist")
+    @patch("veomni.checkpoint.dcp_checkpointer.dcp")
+    def test_execute_save_forwards_flag_to_planner(self, mock_dcp, mock_dist, mock_ec, mock_sync, flag):
+        from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
+
+        mock_dist.is_initialized.return_value = False
+        mock_dcp.save = MagicMock()
+
+        DistributedCheckpointer.execute_save(
+            save_state={"model": MagicMock()},
+            storage_writer=MagicMock(),
+            save_async=False,
+            save_to_lowest_rank=flag,
+        )
+
+        mock_dcp.save.assert_called_once()
+        planner = mock_dcp.save.call_args.kwargs.get("planner")
+        assert planner is not None, "save must pass a planner"
+        assert planner.dedup_save_to_lowest_rank is flag
+
+
+# ---------------------------------------------------------------------------
 # Async save lifecycle: wait_for_pending_save()
 # ---------------------------------------------------------------------------
 
@@ -308,6 +346,7 @@ class TestGlobalStepInflation:
                     save_async=False,
                     load_path=None,
                     manager="dcp",
+                    dcp_save_to_lowest_rank=False,
                 ),
                 accelerator=SimpleNamespace(fsdp_config=SimpleNamespace(fsdp_mode="fsdp2")),
                 global_rank=0,

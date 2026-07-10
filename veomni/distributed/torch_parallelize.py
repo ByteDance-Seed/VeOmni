@@ -33,6 +33,7 @@ from ..utils.device import IS_NPU_AVAILABLE, get_device_type
 from .checkpoint import CheckpointFunction
 from .parallel_plan import get_runtime_parallel_plan
 from .parallel_state import get_parallel_state
+from .torch_compile import CompileConfig, compile_decoder_blocks, validate_compile_config_for_fsdp2
 from .utils import sort_fqn_by_submodule_first
 
 
@@ -305,6 +306,7 @@ def parallelize_model_fsdp2(
     mixed_precision: MixedPrecisionConfig = MixedPrecisionConfig(enable=True),  # noqa
     basic_modules: Optional[List[str]] = None,
     muon_expert_zero_comm: bool = False,
+    compile_config: Optional[CompileConfig] = None,
     **kwargs,
 ) -> "nn.Module":
     """
@@ -363,6 +365,9 @@ def parallelize_model_fsdp2(
         (fqn, mod) for fqn, mod in model.named_modules() if mod.__class__.__name__ in target_classes
     ]
     logger.info_rank0(f"target classes to shard: {target_classes}")
+
+    model._veomni_compile_enabled = False
+    compile_config = compile_config or CompileConfig()
 
     # Step 1: Apply ExtraParallel
     #   e.g. Apply expert parallelism (slice expert tensors [128,H,I] -> [16,H,I])
@@ -447,6 +452,22 @@ def parallelize_model_fsdp2(
         layer_pairs[layer_fqn] = tuple(layer_pair)
 
     logger.info_rank0(f"extra_parallel layer pairs: {layer_pairs}")
+
+    if compile_config.enable:
+        if get_device_type() != "cuda":
+            raise RuntimeError("train.torch_compile.enable is CUDA-only for now.")
+        if parallel_state.any_extra_parallel_enabled:
+            raise RuntimeError(
+                "train.torch_compile.enable currently does not support ExtraParallel models because EP all-to-all "
+                "communication may be captured inside compiled blocks."
+            )
+        validate_compile_config_for_fsdp2(compile_config, enable_reshard_after_forward)
+
+        compiled_count = compile_decoder_blocks(model, compile_config)
+        if compiled_count == 0:
+            raise RuntimeError("train.torch_compile.enable found no decoder blocks to compile.")
+        model._veomni_compile_enabled = True
+        model._veomni_compile_uses_cuda_graphs = compile_config.uses_cuda_graphs()
 
     # Step 2: Update fsdp2 kwargs
     fsdp_kwargs = {"mesh": parallel_state.fsdp_mesh, "reshard_after_forward": enable_reshard_after_forward}
@@ -734,6 +755,7 @@ def build_parallelize_model(
     enable_gradient_checkpointing: bool = True,
     basic_modules: Optional[List[str]] = None,
     muon_expert_zero_comm: bool = False,
+    compile_config: Optional[CompileConfig] = None,
     **kwargs,
 ) -> "nn.Module":
     """Apply parallel strategies to the model.
@@ -754,6 +776,7 @@ def build_parallelize_model(
     """
 
     parallel_state = get_parallel_state()
+    compile_config = compile_config or CompileConfig()
 
     if not parallel_state.fsdp_enabled:
         if kwargs.get("init_device") not in ["cuda", "npu"]:
@@ -792,9 +815,14 @@ def build_parallelize_model(
                 mixed_precision=mixed_precision,
                 basic_modules=basic_modules,
                 muon_expert_zero_comm=muon_expert_zero_comm,
+                compile_config=compile_config,
                 **kwargs,
             )
         else:
+            if compile_config.enable:
+                raise RuntimeError("train.torch_compile.enable requires fsdp_mode='fsdp2'; DDP is not supported.")
             model = parallelize_model_ddp(model=model, weights_path=weights_path, **kwargs)
+    elif compile_config.enable:
+        raise RuntimeError("train.torch_compile.enable requires FSDP2; compile without FSDP is not supported.")
 
     return model

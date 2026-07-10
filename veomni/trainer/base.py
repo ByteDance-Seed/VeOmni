@@ -32,7 +32,7 @@ import queue
 import threading
 from abc import ABC
 from collections import defaultdict
-from dataclasses import asdict
+from dataclasses import asdict, fields
 from typing import Any, Callable, Dict, List
 
 import torch
@@ -58,6 +58,7 @@ from ..data.data_transform import build_data_transform
 from ..distributed.clip_grad_norm import veomni_clip_grad_norm
 from ..distributed.offloading import build_activation_offloading_context
 from ..distributed.parallel_state import init_parallel_state, use_parallel_state
+from ..distributed.torch_compile import CompileConfig, mark_compile_step_begin
 from ..distributed.torch_parallelize import build_parallelize_model
 from ..models import build_foundation_model, build_tokenizer
 from ..ops.batch_invariant_ops import set_batch_invariant_mode
@@ -532,6 +533,9 @@ class BaseTrainer(Stateful, ABC):
             ep_sharded_stream_load=args.train.ep_sharded_stream_load,
             max_load_broadcast_size=args.train.accelerator.fsdp_config.max_load_broadcast_size,
             muon_expert_zero_comm=muon_expert_zero_comm,
+            compile_config=CompileConfig(
+                **{field.name: getattr(args.train.torch_compile, field.name) for field in fields(CompileConfig)}
+            ),
             **kwargs,
         )
         self.model.train()
@@ -585,64 +589,46 @@ class BaseTrainer(Stateful, ABC):
             self.hf_ckpt_callback = HuggingfaceCkptCallback(self)
         self.evaluate_callback = EvaluateCallback(self)
         self.moe_monitor_callback = MoERouterMonitorCallback(self)
+        # Ordered dispatch list. Callbacks own their ParallelState explicitly:
+        # each captured it at construction (``Callback.parallel_state``) and the
+        # shared objects they drive (EnvironMeter, DCP checkpointer) are handed
+        # that state directly, so no ambient ``use_parallel_state`` scope is
+        # needed around hook dispatch.
+        self._callbacks = [
+            self.environ_meter_callback,
+            self.tqdm_callback,
+            self.wandb_callback,
+            self.profile_callback,
+            self.checkpointer_callback,
+            self.hf_ckpt_callback,
+            self.evaluate_callback,
+            self.moe_monitor_callback,
+        ]
         self.state = TrainerState()
 
     def on_train_begin(self):
-        self.environ_meter_callback.on_train_begin(self.state)
-        self.tqdm_callback.on_train_begin(self.state)
-        self.wandb_callback.on_train_begin(self.state)
-        self.profile_callback.on_train_begin(self.state)
-        self.checkpointer_callback.on_train_begin(self.state)
-        self.hf_ckpt_callback.on_train_begin(self.state)
-        self.evaluate_callback.on_train_begin(self.state)
-        self.moe_monitor_callback.on_train_begin(self.state)
+        for callback in self._callbacks:
+            callback.on_train_begin(self.state)
 
     def on_train_end(self):
-        self.environ_meter_callback.on_train_end(self.state)
-        self.tqdm_callback.on_train_end(self.state)
-        self.wandb_callback.on_train_end(self.state)
-        self.profile_callback.on_train_end(self.state)
-        self.checkpointer_callback.on_train_end(self.state)
-        self.hf_ckpt_callback.on_train_end(self.state)
-        self.evaluate_callback.on_train_end(self.state)
-        self.moe_monitor_callback.on_train_end(self.state)
+        for callback in self._callbacks:
+            callback.on_train_end(self.state)
 
     def on_epoch_begin(self):
-        self.environ_meter_callback.on_epoch_begin(self.state)
-        self.tqdm_callback.on_epoch_begin(self.state)
-        self.wandb_callback.on_epoch_begin(self.state)
-        self.profile_callback.on_epoch_begin(self.state)
-        self.checkpointer_callback.on_epoch_begin(self.state)
-        self.hf_ckpt_callback.on_epoch_begin(self.state)
-        self.evaluate_callback.on_epoch_begin(self.state)
+        for callback in self._callbacks:
+            callback.on_epoch_begin(self.state)
 
     def on_epoch_end(self):
-        self.environ_meter_callback.on_epoch_end(self.state)
-        self.tqdm_callback.on_epoch_end(self.state)
-        self.wandb_callback.on_epoch_end(self.state)
-        self.profile_callback.on_epoch_end(self.state)
-        self.checkpointer_callback.on_epoch_end(self.state)
-        self.hf_ckpt_callback.on_epoch_end(self.state)
-        self.evaluate_callback.on_epoch_end(self.state)
+        for callback in self._callbacks:
+            callback.on_epoch_end(self.state)
 
     def on_step_begin(self, micro_batches=None):
-        self.environ_meter_callback.on_step_begin(self.state, micro_batches=micro_batches)
-        self.tqdm_callback.on_step_begin(self.state, micro_batches=micro_batches)
-        self.wandb_callback.on_step_begin(self.state, micro_batches=micro_batches)
-        self.profile_callback.on_step_begin(self.state, micro_batches=micro_batches)
-        self.checkpointer_callback.on_step_begin(self.state, micro_batches=micro_batches)
-        self.hf_ckpt_callback.on_step_begin(self.state, micro_batches=micro_batches)
-        self.evaluate_callback.on_step_begin(self.state, micro_batches=micro_batches)
+        for callback in self._callbacks:
+            callback.on_step_begin(self.state, micro_batches=micro_batches)
 
     def on_step_end(self, loss=None, loss_dict=None, grad_norm=None):
-        self.environ_meter_callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
-        self.tqdm_callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
-        self.wandb_callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
-        self.profile_callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
-        self.checkpointer_callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
-        self.hf_ckpt_callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
-        self.evaluate_callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
-        self.moe_monitor_callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
+        for callback in self._callbacks:
+            callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
 
     def preforward(self, micro_batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         """Preprocess micro batches before forward pass.
@@ -681,20 +667,16 @@ class BaseTrainer(Stateful, ABC):
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         micro_batch = self.preforward(micro_batch)
 
-        # Run the model's forward / loss-reduction / backward under its own
-        # parallel state so the SP / DP / CP group getters resolve from this
-        # model's device mesh (see ``use_parallel_state``).
-        with use_parallel_state(self.parallel_state):
-            with self.model_fwd_context, set_batch_invariant_mode(self.args.train.enable_batch_invariant_mode):
-                outputs: ModelOutput = self.model(**micro_batch, use_cache=False)
+        with self.model_fwd_context, set_batch_invariant_mode(self.args.train.enable_batch_invariant_mode):
+            outputs: ModelOutput = self.model(**micro_batch, use_cache=False)
 
-            loss: torch.Tensor
-            loss_dict: Dict[str, torch.Tensor]
-            loss, loss_dict = self.postforward(outputs, micro_batch)
+        loss: torch.Tensor
+        loss_dict: Dict[str, torch.Tensor]
+        loss, loss_dict = self.postforward(outputs, micro_batch)
 
-            # Backward pass
-            with self.model_bwd_context, set_batch_invariant_mode(self.args.train.enable_batch_invariant_mode):
-                loss.backward()
+        # Backward pass
+        with self.model_bwd_context, set_batch_invariant_mode(self.args.train.enable_batch_invariant_mode):
+            loss.backward()
 
         del micro_batch
         return loss, loss_dict
@@ -746,6 +728,7 @@ class BaseTrainer(Stateful, ABC):
         num_micro_steps = len(micro_batches)
         # forward and backward pass with gradient_accumulationsteps
         for micro_step, micro_batch in enumerate(micro_batches):
+            mark_compile_step_begin(getattr(self.model, "_veomni_compile_uses_cuda_graphs", False))
             self.model_reshard(micro_step, num_micro_steps)
             self._configure_hsdp_allreduce(micro_step, num_micro_steps)
             loss: torch.Tensor
@@ -811,7 +794,11 @@ class BaseTrainer(Stateful, ABC):
 
             for _ in range(self.start_step, args.train_steps):
                 try:
-                    self.train_step(self.data_iterator)
+                    # Scope the whole optimize step (fwd/bwd, grad clip, optimizer)
+                    # to this model's parallel state so every group getter resolves
+                    # from its own device mesh.
+                    with use_parallel_state(self.parallel_state):
+                        self.train_step(self.data_iterator)
                 except StopIteration:
                     logger.info(f"epoch:{epoch} Dataloader finished with drop_last {args.data.dataloader.drop_last}")
                     break

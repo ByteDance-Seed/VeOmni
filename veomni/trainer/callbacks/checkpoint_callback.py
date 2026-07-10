@@ -136,6 +136,7 @@ class CheckpointerCallback(Callback):
             load_dir,
             state,
             trainable_only=bool(getattr(args.model, "lora_config", None)),
+            parallel_state=self.parallel_state,
         )
 
         self._load_extra_state(state["extra_state"])
@@ -169,6 +170,8 @@ class CheckpointerCallback(Callback):
             ckpt_state,
             save_async=args.train.checkpoint.save_async,
             trainable_only=bool(getattr(args.model, "lora_config", None)),
+            save_to_lowest_rank=args.train.checkpoint.dcp_save_to_lowest_rank,
+            parallel_state=self.parallel_state,
         )
 
         # Empty cache and barrier
@@ -248,6 +251,7 @@ class HuggingfaceCkptCallback(CheckpointerCallback):
             model=self.trainer.model,
             fqn_to_index_mapping=args.model.fqn_to_index_mapping,
             is_rank_0=args.train.global_rank == 0,
+            parallel_state=self.parallel_state,
         )
 
         # Empty cache and barrier
