@@ -127,6 +127,12 @@ YAML Config -> VeOmniArguments -> Trainer
 6. Load weights (`load_model_weights()` or `rank0_load_and_broadcast_weights()`)
 7. Apply parallelization (`build_parallelize_model()`)
 
+DeepSeek-V3 appends checkpoint-compatible MTP decoder modules after the main
+`num_hidden_layers` blocks when `num_nextn_predict_layers > 0`. Their weighted
+future-token losses are computed in the patched CausalLM forward path; shared
+embedding, final norm, and LM-head checkpoint aliases are consumed by the
+family checkpoint converter so each shared parameter has one FSDP2 owner.
+
 ## Parallelization Flow
 
 VeOmni uses FSDP2 exclusively.

@@ -41,6 +41,12 @@ logger = logging.get_logger(__name__)
 
 # Matches per-expert split keys like: model.layers.0.mlp.experts.3.gate_proj.weight
 _EXPERT_PATTERN = re.compile(r"^(.+\.mlp)\.experts\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight$")
+_MTP_SHARED_PATTERN = re.compile(r"^model\.layers\.\d+\.(embed_tokens|shared_head\.(?:norm|head))\.weight$")
+_MTP_SHARED_TARGETS = {
+    "embed_tokens": "model.embed_tokens.weight",
+    "shared_head.norm": "model.norm.weight",
+    "shared_head.head": "lm_head.weight",
+}
 
 
 class DeepseekV3CheckpointTensorConverter:
@@ -63,9 +69,19 @@ class DeepseekV3CheckpointTensorConverter:
         self._stacked_buffer: Dict[str, Dict[str, torch.Tensor]] = {}
 
     def can_handle(self, name: str) -> bool:
-        return bool(_EXPERT_PATTERN.match(name))
+        return bool(_EXPERT_PATTERN.match(name) or _MTP_SHARED_PATTERN.match(name))
 
     def convert(self, name: str, tensor: "torch.Tensor") -> Optional[ConvertedCheckpointTensor]:
+        # Official DeepSeek-V3 checkpoints repeat the shared embedding, final
+        # norm, and LM-head tensors under every MTP layer. VeOmni keeps one
+        # registered owner for each shared parameter so FSDP2 never sees the
+        # same parameter across nested shard boundaries. Redirect each alias
+        # to that canonical owner; loading it twice is harmless when canonical
+        # keys are also present and remains safe for alias-only checkpoints.
+        shared_match = _MTP_SHARED_PATTERN.match(name)
+        if shared_match:
+            return ConvertedCheckpointTensor(_MTP_SHARED_TARGETS[shared_match.group(1)], tensor)
+
         match = _EXPERT_PATTERN.match(name)
         if not match:
             return None
@@ -135,4 +151,10 @@ def convert_deepseek_v3_fqn_to_index_mapping(fqn_to_index_mapping: Dict[str, int
     """Align HF safetensors index keys with fused expert parameter names."""
     from ..._moe_fused_weight_map import convert_per_expert_fqn_mapping_to_fused
 
-    return convert_per_expert_fqn_mapping_to_fused(fqn_to_index_mapping, _EXPERT_PATTERN)
+    converted = convert_per_expert_fqn_mapping_to_fused(fqn_to_index_mapping, _EXPERT_PATTERN)
+    for name, index in list(converted.items()):
+        match = _MTP_SHARED_PATTERN.match(name)
+        if match:
+            converted.pop(name)
+            converted.setdefault(_MTP_SHARED_TARGETS[match.group(1)], index)
+    return converted

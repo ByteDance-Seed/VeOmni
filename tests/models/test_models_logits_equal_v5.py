@@ -157,7 +157,13 @@ CASES = [
     # to validate the patchgen modeling: it covers the MoE expert dispatch,
     # the OpSlot-guarded cross-entropy, and the v5 ``gate_up_proj`` layout
     # end-to-end.
-    Case("deepseek_v3-eager", _toy("deepseek_v3_toy"), "DeepseekV3ForCausalLM", "causal_lm"),
+    Case(
+        "deepseek_v3-eager",
+        _toy("deepseek_v3_toy"),
+        "DeepseekV3ForCausalLM",
+        "causal_lm",
+        config_overrides={"num_nextn_predict_layers": 0},
+    ),
     # ── GPT-OSS (SWA + learnable sinks + interleaved gate/up MoE) ────────
     # eager+fp32 only for this HF bitwise baseline: fused_quack is covered by
     # ``test_gpt_oss_integration.py`` against VeOmni eager, while this test
@@ -656,7 +662,13 @@ _LOADER_CASES = [
     # stack-and-fuse merge yields the same parameters HF builds in-memory.
     # Eager+fp32 only — see the ``deepseek_v3-eager`` entry in CASES for
     # why fa2/sdpa diverge on MLA today.
-    Case("deepseek_v3-eager-loader", _toy("deepseek_v3_toy"), "DeepseekV3ForCausalLM", "causal_lm"),
+    Case(
+        "deepseek_v3-eager-loader",
+        _toy("deepseek_v3_toy"),
+        "DeepseekV3ForCausalLM",
+        "causal_lm",
+        config_overrides={"num_nextn_predict_layers": 0},
+    ),
     # GPT-OSS uses native interleaved gate/up expert weights plus biases; the
     # loader path should preserve that HF-format layout exactly.
     Case(

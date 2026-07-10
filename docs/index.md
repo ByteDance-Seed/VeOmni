@@ -74,6 +74,7 @@ key_features/preprocessor_registry.md
 key_features/ep_fsdp2.md
 key_features/ulysses.md
 key_features/lora.md
+key_features/deepseek_v3_mtp.md
 
 ```
 
