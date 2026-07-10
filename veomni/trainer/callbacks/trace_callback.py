@@ -17,7 +17,6 @@ from typing import TYPE_CHECKING, Any, Dict, List
 
 from tqdm import trange
 
-from ...distributed.parallel_state import get_parallel_state
 from ...utils import helper
 from ...utils.dist_utils import all_reduce
 from ...utils.logging import get_logger
@@ -62,7 +61,7 @@ class MoERouterMonitorCallback(Callback):
         # mesh is guaranteed to be initialized.
         self.monitor = MoERouterMonitor(num_experts=config.num_experts)
         set_active_monitor(self.monitor)
-        ps = get_parallel_state()
+        ps = self.parallel_state
         logger.info_rank0(
             f"MoE router monitor created: num_experts={config.num_experts}, "
             f"interval={args.train.moe_load_balance_monitor_interval}, "
@@ -77,7 +76,7 @@ class MoERouterMonitorCallback(Callback):
         # fsdp_group is the dp_sp mesh dim — exactly the set of ranks that
         # hold distinct token slices. EP is intentionally not in this group;
         # see MoERouterMonitor.__init__ docstring.
-        self.monitor.dp_group = get_parallel_state().fsdp_group
+        self.monitor.dp_group = self.parallel_state.fsdp_group
 
         attached = attach_moe_router_monitor(self.trainer.model, self.monitor)
         if attached == 0:
@@ -197,6 +196,7 @@ class EnvironMeterCallback(Callback):
             dataloader=trainer.train_dataloader,
             data_path=args.data.train_path,
             gc_steps=args.train.gc_steps,
+            parallel_state=self.parallel_state,
         )
 
     def on_step_begin(self, state: TrainerState, micro_batches: List[Dict[str, Any]] = None, **kwargs) -> None:
@@ -218,8 +218,7 @@ class EnvironMeterCallback(Callback):
 
         # gather training_step_info from all ranks
         step_train_metrics = {
-            f"training/{k}": all_reduce(v, group=get_parallel_state().fsdp_group)
-            for k, v in step_train_metrics.items()
+            f"training/{k}": all_reduce(v, group=self.parallel_state.fsdp_group) for k, v in step_train_metrics.items()
         }
 
         if self.trainer.lr_scheduler is not None:

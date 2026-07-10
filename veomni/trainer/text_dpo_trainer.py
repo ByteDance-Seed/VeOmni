@@ -326,72 +326,57 @@ class TextDPOTrainer:
 
         micro_batch = self.base.preforward(micro_batch)
 
-        # Run the reference/policy forward, loss and backward under the model's
-        # own parallel state so the SP / DP / CP group getters resolve from this
-        # model's device mesh (see ``use_parallel_state``).
-        with use_parallel_state(self.base.parallel_state):
-            with torch.no_grad():
-                ref_chosen_logps, ref_rejected_logps = self.concatenated_forward(self.reference_model, micro_batch)
+        with torch.no_grad():
+            ref_chosen_logps, ref_rejected_logps = self.concatenated_forward(self.reference_model, micro_batch)
 
-            with self.base.model_fwd_context, set_batch_invariant_mode(args.train.enable_batch_invariant_mode):
-                policy_chosen_logps, policy_rejected_logps = self.concatenated_forward(self.base.model, micro_batch)
+        with self.base.model_fwd_context, set_batch_invariant_mode(args.train.enable_batch_invariant_mode):
+            policy_chosen_logps, policy_rejected_logps = self.concatenated_forward(self.base.model, micro_batch)
 
-            losses, chosen_rewards, rejected_rewards = self.dpo_loss(
-                policy_chosen_logps,
-                policy_rejected_logps,
-                ref_chosen_logps,
-                ref_rejected_logps,
-                beta=dpo_config.beta,
-                label_smoothing=dpo_config.label_smoothing,
-                loss_type=dpo_config.loss_type,
-                reference_free=dpo_config.reference_free,
-            )
+        losses, chosen_rewards, rejected_rewards = self.dpo_loss(
+            policy_chosen_logps,
+            policy_rejected_logps,
+            ref_chosen_logps,
+            ref_rejected_logps,
+            beta=dpo_config.beta,
+            label_smoothing=dpo_config.label_smoothing,
+            loss_type=dpo_config.loss_type,
+            reference_free=dpo_config.reference_free,
+        )
 
-            loss = losses.mean()
+        loss = losses.mean()
 
-            reward_accuracies = (chosen_rewards > rejected_rewards).float().mean()
-            loss_dict: Dict[str, torch.Tensor] = {
-                "dpo_loss": loss.detach(),
-                "chosen_rewards": chosen_rewards.mean().detach(),
-                "rejected_rewards": rejected_rewards.mean().detach(),
-                "reward_accuracy": reward_accuracies.detach(),
-                "reward_margin": (chosen_rewards - rejected_rewards).mean().detach(),
-            }
+        reward_accuracies = (chosen_rewards > rejected_rewards).float().mean()
+        loss_dict: Dict[str, torch.Tensor] = {
+            "dpo_loss": loss.detach(),
+            "chosen_rewards": chosen_rewards.mean().detach(),
+            "rejected_rewards": rejected_rewards.mean().detach(),
+            "reward_accuracy": reward_accuracies.detach(),
+            "reward_margin": (chosen_rewards - rejected_rewards).mean().detach(),
+        }
 
-            with self.base.model_bwd_context, set_batch_invariant_mode(args.train.enable_batch_invariant_mode):
-                loss.backward()
+        with self.base.model_bwd_context, set_batch_invariant_mode(args.train.enable_batch_invariant_mode):
+            loss.backward()
 
         del micro_batch
         return loss, loss_dict
 
-    # Callbacks run under this trainer's parallel state. For a single-model
-    # trainer this state is constant, so the scope is effectively a no-op; it is
-    # kept explicit so a subclass that drives multiple modules with different
-    # parallel states scopes each callback to the owning module (e.g. DCP
-    # checkpointing reads the current ParallelState at save time).
     def on_train_begin(self):
-        with use_parallel_state(self.base.parallel_state):
-            self.base.on_train_begin()
+        self.base.on_train_begin()
 
     def on_train_end(self):
-        with use_parallel_state(self.base.parallel_state):
-            self.base.on_train_end()
+        self.base.on_train_end()
 
     def on_epoch_begin(self):
-        with use_parallel_state(self.base.parallel_state):
-            self.base.on_epoch_begin()
+        self.base.on_epoch_begin()
 
     def on_epoch_end(self):
-        with use_parallel_state(self.base.parallel_state):
-            self.base.on_epoch_end()
+        self.base.on_epoch_end()
 
     def on_step_begin(self, micro_batches=None):
-        with use_parallel_state(self.base.parallel_state):
-            self.base.on_step_begin(micro_batches=micro_batches)
+        self.base.on_step_begin(micro_batches=micro_batches)
 
     def on_step_end(self, loss=None, loss_dict=None, grad_norm=None):
-        with use_parallel_state(self.base.parallel_state):
-            self.base.on_step_end(loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
+        self.base.on_step_end(loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
 
     def train_step(self, data_iterator: Any) -> Dict[str, float]:
         args: VeOmniDPOArguments = self.base.args
@@ -449,7 +434,11 @@ class TextDPOTrainer:
 
             for _ in range(self.base.start_step, args.train_steps):
                 try:
-                    self.train_step(self.base.data_iterator)
+                    # Scope the whole optimize step (fwd/bwd, grad clip, optimizer)
+                    # to this model's parallel state so every group getter resolves
+                    # from its own device mesh.
+                    with use_parallel_state(self.base.parallel_state):
+                        self.train_step(self.base.data_iterator)
                 except StopIteration:
                     logger.info(f"epoch:{epoch} Dataloader finished with drop_last {args.data.dataloader.drop_last}")
                     break

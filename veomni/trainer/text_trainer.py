@@ -90,34 +90,23 @@ class TextTrainer:
             text_keys=args.data.text_keys,
         )
 
-    # Callbacks run under this trainer's parallel state. For a single-model
-    # trainer this state is constant, so the scope is effectively a no-op; it is
-    # kept explicit so a subclass that drives multiple modules with different
-    # parallel states scopes each callback to the owning module (e.g. DCP
-    # checkpointing reads the current ParallelState at save time).
     def on_train_begin(self):
-        with use_parallel_state(self.base.parallel_state):
-            self.base.on_train_begin()
+        self.base.on_train_begin()
 
     def on_train_end(self):
-        with use_parallel_state(self.base.parallel_state):
-            self.base.on_train_end()
+        self.base.on_train_end()
 
     def on_epoch_begin(self):
-        with use_parallel_state(self.base.parallel_state):
-            self.base.on_epoch_begin()
+        self.base.on_epoch_begin()
 
     def on_epoch_end(self):
-        with use_parallel_state(self.base.parallel_state):
-            self.base.on_epoch_end()
+        self.base.on_epoch_end()
 
     def on_step_begin(self, micro_batches=None):
-        with use_parallel_state(self.base.parallel_state):
-            self.base.on_step_begin(micro_batches=micro_batches)
+        self.base.on_step_begin(micro_batches=micro_batches)
 
     def on_step_end(self, loss=None, loss_dict=None, grad_norm=None):
-        with use_parallel_state(self.base.parallel_state):
-            self.base.on_step_end(loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
+        self.base.on_step_end(loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
 
     def train_step(
         self,
@@ -188,7 +177,11 @@ class TextTrainer:
 
             for _ in range(self.base.start_step, args.train_steps):
                 try:
-                    self.train_step(self.base.data_iterator)
+                    # Scope the whole optimize step (fwd/bwd, grad clip, optimizer)
+                    # to this model's parallel state so every group getter resolves
+                    # from its own device mesh.
+                    with use_parallel_state(self.base.parallel_state):
+                        self.train_step(self.base.data_iterator)
                 except StopIteration:
                     logger.info(f"epoch:{epoch} Dataloader finished with drop_last {args.data.dataloader.drop_last}")
                     break
