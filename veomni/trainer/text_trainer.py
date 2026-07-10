@@ -44,12 +44,12 @@ class TextTrainer:
         self.base = BaseTrainer.__new__(BaseTrainer)
         self.base.args = args
 
-        self.base._setup()
-        with use_parallel_state(self.base.parallel_state):
-            self._build_components()
+        bootstrap_state = self.base._setup()
+        with use_parallel_state(bootstrap_state):
+            self.base._build_model()
+        self._build_components()
 
     def _build_components(self):
-        self.base._build_model()
         self.base._freeze_model_module()
 
         # rewrite build_model_assets to support chat_template for conversation dataset
@@ -141,9 +141,7 @@ class TextTrainer:
                 total_loss_dict[k] += v.item()
 
         # Gradient clipping
-        grad_norm = veomni_clip_grad_norm(
-            self.base.model, args.train.optimizer.max_grad_norm, parallel_state=self.base.parallel_state
-        )
+        grad_norm = veomni_clip_grad_norm(self.base.model, args.train.optimizer.max_grad_norm)
 
         # Optimizer and scheduler step
         self.base.optimizer.step()

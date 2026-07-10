@@ -1,4 +1,5 @@
 import sys
+from types import SimpleNamespace
 
 import torch
 import torch.distributed as c10d
@@ -14,6 +15,7 @@ import pytest
 import torch.distributed as dist
 from torch.testing._internal.common_utils import run_tests
 
+from veomni.distributed.parallel_state import use_parallel_state
 from veomni.distributed.sequence_parallel.data import gather_outputs, slice_input_tensor
 from veomni.distributed.sequence_parallel.loss import reduce_sequence_parallel_loss
 from veomni.utils.helper import enable_high_precision_for_bf16, set_seed
@@ -74,8 +76,9 @@ class AllToAllCommTest(SequenceParallelTest):
         local_out = AllToAllCommTest._run_forward(local_y)
         local_loss = local_out.mean()
         num_valid_tokens = torch.tensor(1.0, dtype=local_loss.dtype, device=local_loss.device)
-        reduced_loss = reduce_sequence_parallel_loss(local_loss, num_valid_tokens)
-        reduced_loss.backward()
+        with use_parallel_state(SimpleNamespace(sp_group=group)):
+            reduced_loss = reduce_sequence_parallel_loss(local_loss, num_valid_tokens)
+            reduced_loss.backward()
         return reduced_loss.item(), local_x.grad.item()
 
     @staticmethod

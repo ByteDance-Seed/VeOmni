@@ -25,6 +25,7 @@ muon_module = pytest.importorskip("torch.optim._muon")
 from torch.optim import Muon as UpstreamMuon  # noqa: E402
 from torch.optim._muon import _zeropower_via_newtonschulz as upstream_ns  # noqa: E402
 
+from veomni.distributed.parallel_state import ParallelState  # noqa: E402
 from veomni.optim.muon import (  # noqa: E402
     DEFAULT_NS_COEFFICIENTS,
     DEFAULT_NS_STEPS,
@@ -152,6 +153,7 @@ class TestNumerics:
         model_a = _toy_model()
         opt_a = build_optimizer(
             model_a,
+            parallel_state=ParallelState(),
             lr=1e-4,
             weight_decay=0.01,
             optimizer_type="muon",
@@ -175,6 +177,7 @@ class TestNumerics:
         model_b.load_state_dict(model_a.state_dict())
         opt_b = build_optimizer(
             model_b,
+            parallel_state=ParallelState(),
             lr=1e-4,
             weight_decay=0.01,
             optimizer_type="muon",
@@ -198,6 +201,7 @@ class TestBuildOptimizer:
         model = _toy_model()
         opt = build_optimizer(
             model,
+            parallel_state=ParallelState(),
             lr=1e-4,
             weight_decay=0.01,
             optimizer_type="muon",
@@ -213,7 +217,12 @@ class TestBuildOptimizer:
 
         model = nn.LayerNorm(4)
         with pytest.raises(ValueError, match="no eligible 2D/3D parameters"):
-            build_optimizer(model, optimizer_type="muon", muon_kwargs={"lr": 1e-3})
+            build_optimizer(
+                model,
+                parallel_state=ParallelState(),
+                optimizer_type="muon",
+                muon_kwargs={"lr": 1e-3},
+            )
 
 
 class TestBatchedNS:

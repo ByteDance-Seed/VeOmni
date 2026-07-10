@@ -13,14 +13,12 @@ class VLMRLTrainer(VLMTrainer):
         self.base = BaseRLTrainer.__new__(BaseRLTrainer)
         self.base.args = args
 
-        self.base._setup()
-        with use_parallel_state(self.base.parallel_state):
-            self._build_components()
+        bootstrap_state = self.base._setup()
+        with use_parallel_state(bootstrap_state):
+            self._build_model()
+        self._build_components()
 
     def _build_components(self):
-        # rewrite build model to support data balancing
-        self._build_model()
-
         # rewrite freeze_model_module to support freeze multimodal encoder, etc.
         self._freeze_model_module()
 

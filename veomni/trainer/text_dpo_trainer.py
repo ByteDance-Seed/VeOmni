@@ -25,7 +25,12 @@ from ..arguments import MixedPrecisionConfig, VeOmniArguments
 from ..data import build_chat_template, build_data_transform
 from ..data.data_collator import PostCollator
 from ..distributed.clip_grad_norm import veomni_clip_grad_norm
-from ..distributed.parallel_state import get_parallel_state, use_model_parallel_state, use_parallel_state
+from ..distributed.parallel_state import (
+    get_model_parallel_state,
+    get_parallel_state,
+    use_model_parallel_state,
+    use_parallel_state,
+)
 from ..distributed.sequence_parallel import gather_outputs
 from ..distributed.torch_compile import mark_compile_step_begin
 from ..distributed.torch_parallelize import build_parallelize_model
@@ -140,12 +145,12 @@ class TextDPOTrainer:
         self.base = BaseTrainer.__new__(BaseTrainer)
         self.base.args = args
 
-        self.base._setup()
-        with use_parallel_state(self.base.parallel_state):
-            self._build_components()
+        bootstrap_state = self.base._setup()
+        with use_parallel_state(bootstrap_state):
+            self.base._build_model()
+        self._build_components()
 
     def _build_components(self):
-        self.base._build_model()
         self.base._freeze_model_module()
 
         self._build_model_assets()
@@ -180,8 +185,9 @@ class TextDPOTrainer:
         )
 
     def _build_postforward(self):
-        self.post_forward = PostCollator(parallel_state=self.base.parallel_state)
-        self.sp_enabled = self.base.parallel_state.sp_enabled
+        policy_state = get_model_parallel_state(self.base.model)
+        self.post_forward = PostCollator(parallel_state=policy_state)
+        self.sp_enabled = policy_state.sp_enabled
 
     def _build_reference_model(self):
         """Build and freeze a reference model with the same architecture and FSDP sharding."""
@@ -189,6 +195,7 @@ class TextDPOTrainer:
         logger.info_rank0("Building frozen reference model for DPO")
 
         self.reference_model = build_foundation_model(
+            parallel_state=get_model_parallel_state(self.base.model),
             config_path=args.model.config_path,
             weights_path=args.model.model_path,
             torch_dtype=args.dpo_config.refer_model_precision,
@@ -218,7 +225,6 @@ class TextDPOTrainer:
             broadcast_model_weights_from_rank0=args.train.broadcast_model_weights_from_rank0,
             cpu_load_param_name=cpu_load_param_name,
             max_load_broadcast_size=args.train.accelerator.fsdp_config.max_load_broadcast_size,
-            parallel_state=self.base.parallel_state,
         )
         self.reference_model.eval()
         helper.print_device_mem_info("VRAM usage after building reference model")
@@ -408,9 +414,7 @@ class TextDPOTrainer:
             for k, v in loss_dict.items():
                 total_loss_dict[k] += v.item()
 
-        grad_norm = veomni_clip_grad_norm(
-            self.base.model, args.train.optimizer.max_grad_norm, parallel_state=self.base.parallel_state
-        )
+        grad_norm = veomni_clip_grad_norm(self.base.model, args.train.optimizer.max_grad_norm)
 
         self.base.optimizer.step()
         self.base.lr_scheduler.step()

@@ -28,7 +28,7 @@ import torch.nn as nn
 from torch.distributed.fsdp import fully_shard
 from torch.distributed.tensor import DTensor, Replicate, Shard
 
-from veomni.distributed.parallel_state import init_parallel_state
+from veomni.distributed.parallel_state import ParallelState, build_parallel_state
 from veomni.optim.muon import DistributedMuon
 from veomni.utils.device import (
     get_device_type,
@@ -232,11 +232,12 @@ def _eager_ops_config():
     )
 
 
-def _build_qwen3_moe(device: torch.device) -> nn.Module:
+def _build_qwen3_moe(device: torch.device, parallel_state: ParallelState) -> nn.Module:
     """Build the real Qwen3-MoE toy via ``build_foundation_model``."""
     from veomni.models import build_foundation_model
 
     return build_foundation_model(
+        parallel_state=parallel_state,
         config_path=QWEN3_MOE_TOY_CFG,
         weights_path=None,
         torch_dtype="float32",
@@ -245,9 +246,9 @@ def _build_qwen3_moe(device: torch.device) -> nn.Module:
     )
 
 
-def _qwen3_moe_golden_state(device: torch.device, full_shapes: dict) -> dict:
+def _qwen3_moe_golden_state(device: torch.device, full_shapes: dict, parallel_state: ParallelState) -> dict:
     """Single-process golden Muon step on the full Qwen3-MoE toy."""
-    model = _build_qwen3_moe(device)
+    model = _build_qwen3_moe(device, parallel_state)
     _force_reinit(model, SEED, device)
 
     from veomni.optim.muon import split_muon_adamw_params
@@ -285,7 +286,7 @@ def _run_qwen3_moe(use_zero_comm: bool) -> None:
     rank = dist.get_rank()
     assert world_size == 4, f"this test expects exactly 4 ranks, got {world_size}"
 
-    init_parallel_state(
+    ps = build_parallel_state(
         dp_size=world_size,
         dp_shard_size=world_size,
         extra_parallel_sizes=(EP_SIZE,),
@@ -293,16 +294,13 @@ def _run_qwen3_moe(use_zero_comm: bool) -> None:
         extra_parallel_names=("ep",),
         dp_mode="fsdp2",
     )
-    from veomni.distributed.parallel_state import get_parallel_state
-
-    ps = get_parallel_state()
     ep_fsdp_mesh = ps.extra_parallel_fsdp_device_mesh["ep"]["ep_fsdp"]
     ep_mesh = ps.extra_parallel_fsdp_device_mesh["ep"]["ep"]
     fsdp_mesh = ps.fsdp_mesh
 
     device = torch.device(f"{device_type}:{local_rank}")
 
-    model = _build_qwen3_moe(device)
+    model = _build_qwen3_moe(device, ps)
     _force_reinit(model, SEED, device)
 
     full_shapes = {fqn: tuple(p.shape) for fqn, p in model.named_parameters() if p.requires_grad}
@@ -381,7 +379,7 @@ def _run_qwen3_moe(use_zero_comm: bool) -> None:
         device_backend.empty_cache()
 
     if rank == 0:
-        golden = _qwen3_moe_golden_state(device, full_shapes)
+        golden = _qwen3_moe_golden_state(device, full_shapes, ps)
         common = set(fsdp_state.keys()) & set(golden.keys())
         assert common, f"no common keys between fsdp ({list(fsdp_state)[:4]}...) and golden ({list(golden)[:4]}...)"
         first_failure = None

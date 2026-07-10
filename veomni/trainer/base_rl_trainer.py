@@ -31,6 +31,7 @@ from transformers.modeling_outputs import ModelOutput
 
 from ..data.data_collator import MainCollator as Preforward
 from ..data.data_collator import PostCollator as Postforward
+from ..distributed.parallel_state import get_model_parallel_state
 from ..distributed.sequence_parallel import gather_outputs
 from .base import BaseTrainer, VeOmniArguments, build_dataloader
 
@@ -43,8 +44,9 @@ class BaseRLTrainer(BaseTrainer):
     # post init preforward and postforward hooks
     def _build_preforward_postforward(self):
         """Build preforward and postforward hooks."""
-        self.pre_forward = Preforward(parallel_state=self.parallel_state)
-        self.post_forward = Postforward(parallel_state=self.parallel_state)
+        parallel_state = get_model_parallel_state(self.model)
+        self.pre_forward = Preforward(parallel_state=parallel_state)
+        self.post_forward = Postforward(parallel_state=parallel_state)
 
     # rewrite: do not build collate_fn in dataloader, as we pack and sp slice data in training loop in preforward
     def _build_dataloader(self):
@@ -53,6 +55,7 @@ class BaseRLTrainer(BaseTrainer):
         dataloader_kwargs = asdict(args.data.dataloader)
         dataloader_type = dataloader_kwargs.pop("type")
         self.train_dataloader = build_dataloader(
+            parallel_state=get_model_parallel_state(self.model),
             dataloader_type=dataloader_type,
             dataset=self.train_dataset,
             micro_batch_size=args.train.micro_batch_size,
@@ -69,7 +72,6 @@ class BaseRLTrainer(BaseTrainer):
             dyn_bsz_buffer_size=args.data.dyn_bsz_buffer_size,
             seed=args.train.seed,
             build_collate_fn=False,
-            parallel_state=self.parallel_state,
             **dataloader_kwargs,
         )
 
@@ -86,8 +88,9 @@ class BaseRLTrainer(BaseTrainer):
 
         logits = torch.cat(logits, dim=0)
 
-        if self.parallel_state.sp_enabled:
-            labels = gather_outputs(labels, gather_dim=-1, group=self.parallel_state.sp_group)
+        parallel_state = get_model_parallel_state(self.model)
+        if parallel_state.sp_enabled:
+            labels = gather_outputs(labels, gather_dim=-1, group=parallel_state.sp_group)
             labels = labels[:, : logits.shape[0]]  # unpad sp_pad
         else:
             labels = nn.functional.pad(labels, (0, 1), value=-100)

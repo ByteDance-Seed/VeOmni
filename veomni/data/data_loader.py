@@ -21,7 +21,7 @@ from torch.utils.data import Dataset, IterableDataset
 from torchdata.stateful_dataloader import StatefulDataLoader
 from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
 
-from ..distributed.parallel_state import ParallelState, get_parallel_state
+from ..distributed.parallel_state import ParallelState
 from ..utils import logging
 from ..utils.device import get_device_type
 from ..utils.registry import Registry
@@ -39,8 +39,8 @@ DATALOADER_REGISTRY = Registry("dataloader")
 logger = logging.get_logger(__name__)
 
 
-def build_dataloader(dataloader_type: str, **kwargs):
-    return DATALOADER_REGISTRY[dataloader_type](**kwargs)
+def build_dataloader(dataloader_type: str, *, parallel_state: ParallelState, **kwargs):
+    return DATALOADER_REGISTRY[dataloader_type](parallel_state=parallel_state, **kwargs)
 
 
 class DistributedDataloader(StatefulDataLoader):
@@ -69,6 +69,7 @@ def build_native_dataloader(
     dataloader_batch_size: int,
     max_seq_len: int,
     train_steps: int,
+    parallel_state: ParallelState,
     bsz_warmup_ratio: float = 0.02,
     bsz_warmup_init_mbtoken: int = 200,
     dyn_bsz: bool = True,
@@ -89,7 +90,6 @@ def build_native_dataloader(
     collate_fn_kwargs: Optional[Dict[str, Any]] = None,
     multiprocessing_context=None,
     save_steps: int = 0,
-    parallel_state: Optional[ParallelState] = None,
 ) -> "DistributedDataloader":
     """Build the native training dataloader.
 
@@ -142,8 +142,6 @@ def build_native_dataloader(
     """
     if collate_fn_kwargs is None:
         collate_fn_kwargs = {}
-    parallel_state = parallel_state or get_parallel_state()
-
     if collate_fn is None:
         if build_collate_fn:
             collate_fn = MainCollator(parallel_state=parallel_state, **collate_fn_kwargs)

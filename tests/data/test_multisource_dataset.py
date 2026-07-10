@@ -37,7 +37,11 @@ from utils import (
 from veomni.arguments import VeOmniArguments, parse_args
 from veomni.data import build_dataloader
 from veomni.data.dataset import WeightedMultiSourceDataset
-from veomni.distributed.parallel_state import get_parallel_state
+from veomni.distributed.parallel_state import (
+    bind_model_parallel_state,
+    get_model_parallel_state,
+    get_parallel_state,
+)
 from veomni.trainer.base import BaseTrainer
 from veomni.trainer.callbacks import Callback, TrainerState
 from veomni.utils import helper
@@ -98,7 +102,7 @@ class TrainerTest(BaseTrainer):
     multisource_weights = [0.5, 0.5]
 
     def _setup(self):
-        self.device = setup_test_distributed(self.args)
+        self.device, bootstrap_state = setup_test_distributed(self.args)
 
         self.multisource_datasets = [DummyDataset(size=100, dataset_name=name) for name in self.multisource_names]
         self.multisource_paths = [dataset.save_path for dataset in self.multisource_datasets]
@@ -135,12 +139,14 @@ class TrainerTest(BaseTrainer):
         shuffle_field._field_type = dataclasses._FIELD
         self.args.data.__dataclass_fields__["shuffle"] = shuffle_field
         self.args.data.shuffle = False
+        return bootstrap_state
 
     def _freeze_model_module(self):
         pass
 
     def _build_model(self):
         self.model = FakeModel().to(get_device_type())
+        bind_model_parallel_state(self.model, get_parallel_state())
         self.model_config = PretrainedConfig()
 
     def _build_model_assets(self):
@@ -174,6 +180,7 @@ class TrainerTest(BaseTrainer):
         args = self.args
         global_batch_size = cast(int, args.train.global_batch_size)
         self.train_dataloader = build_dataloader(
+            parallel_state=get_model_parallel_state(self.model),
             dataloader_type="native",
             dataset=self.train_dataset,
             micro_batch_size=args.train.micro_batch_size,
@@ -279,6 +286,7 @@ class EnvironMeterCallbackTest(Callback):
             dataloader=trainer.train_dataloader,
             data_path=trainer.tmp_train_path,
             gc_steps=args.train.gc_steps,
+            parallel_state=get_model_parallel_state(trainer.model),
         )
 
     def on_step_begin(self, state: TrainerState, micro_batches: List[Dict[str, Any]] = None, **kwargs) -> None:
@@ -300,7 +308,7 @@ class EnvironMeterCallbackTest(Callback):
         step_train_metrics.update(loss_dict)
         step_train_metrics["grad_norm"] = grad_norm
         step_train_metrics = {
-            f"training/{k}": all_reduce(v, group=get_parallel_state().fsdp_group)
+            f"training/{k}": all_reduce(v, group=get_model_parallel_state(self.trainer.model).fsdp_group)
             for k, v in step_train_metrics.items()
         }
         step_train_metrics["training/lr"] = max(self.trainer.lr_scheduler.get_last_lr())

@@ -8,7 +8,7 @@ import torch.nn as nn
 from datasets import Dataset as HuggingFaceDataset
 from torch.utils.data import IterableDataset
 
-from veomni.distributed.parallel_state import init_parallel_state
+from veomni.distributed.parallel_state import ParallelState, build_parallel_state
 from veomni.trainer.callbacks import CheckpointerCallback, TrainerState
 from veomni.utils import helper
 from veomni.utils.device import get_device_type, get_dist_comm_backend, get_torch_device
@@ -25,7 +25,7 @@ def mock_empty_cache() -> None:
     pass
 
 
-def setup_test_distributed(args) -> torch.device:
+def setup_test_distributed(args) -> tuple[torch.device, ParallelState]:
     """Initialize a minimal distributed runtime for data tests."""
     device_type = get_device_type()
     if device_type != "cpu":
@@ -43,7 +43,7 @@ def setup_test_distributed(args) -> torch.device:
             rank=int(os.environ["RANK"]),
         )
 
-    init_parallel_state(
+    parallel_state = build_parallel_state(
         dp_size=args.train.accelerator.dp_size,
         dp_replicate_size=args.train.accelerator.dp_replicate_size,
         dp_shard_size=args.train.accelerator.dp_shard_size,
@@ -57,7 +57,7 @@ def setup_test_distributed(args) -> torch.device:
         dp_mode=args.train.accelerator.fsdp_config.fsdp_mode,
     )
     helper.set_seed(args.train.seed, args.train.enable_full_determinism)
-    return device
+    return device, parallel_state
 
 
 class StepAwareTestCheckpointerCallback(CheckpointerCallback):

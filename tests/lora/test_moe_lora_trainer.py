@@ -81,6 +81,7 @@ import yaml
 
 from veomni.arguments import VeOmniArguments, parse_args
 from veomni.data import build_dummy_dataset
+from veomni.distributed.parallel_state import get_model_parallel_state
 from veomni.trainer.base import BaseTrainer
 from veomni.trainer.callbacks.base import Callback, TrainerState
 from veomni.trainer.callbacks.checkpoint_callback import CheckpointerCallback, HFLoraCkptCallback
@@ -223,13 +224,11 @@ class _LogDictSaveCallback(Callback):
         Using the trainer's parallel state instead of a hand-rolled
         ``dp_group`` lookup so this stays correct under FSDP1/FSDP2 +
         SP combinations (``dp_group`` already excludes SP/EP/PP per
-        ``init_parallel_state``).
+        ``build_parallel_state``).
         """
         if not (dist.is_available() and dist.is_initialized()):
             return value
-        from veomni.distributed.parallel_state import get_parallel_state
-
-        ps = get_parallel_state()
+        ps = get_model_parallel_state(self.trainer.model)
         dp_group = ps.dp_group
         if dp_group is None or ps.dp_size <= 1:
             return value
@@ -374,6 +373,7 @@ def _build_and_save_toy_base(dest_dir: str) -> None:
     16 experts, 4 layers). Module-scoped means once per pytest invocation.
     """
     from veomni.arguments.arguments_types import OpsImplementationConfig
+    from veomni.distributed.parallel_state import ParallelState
     from veomni.models import build_foundation_model
     from veomni.utils import helper as _helper
 
@@ -387,6 +387,7 @@ def _build_and_save_toy_base(dest_dir: str) -> None:
         rotary_pos_emb_implementation="eager",
     )
     model = build_foundation_model(
+        parallel_state=ParallelState(),
         config_path=_TOY_CONFIG_PATH,
         weights_path=None,
         torch_dtype="bfloat16",

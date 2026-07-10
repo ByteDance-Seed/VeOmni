@@ -21,7 +21,7 @@ import torch
 from ..arguments import DataArguments, ModelArguments, TrainingArguments, VeOmniArguments
 from ..data import MainCollator, build_data_transform, build_multimodal_chat_template
 from ..distributed.clip_grad_norm import veomni_clip_grad_norm
-from ..distributed.parallel_state import use_parallel_state
+from ..distributed.parallel_state import get_model_parallel_state, get_parallel_state, use_parallel_state
 from ..models import build_foundation_model, build_processor
 from ..optim import build_optimizer
 from ..utils import helper
@@ -103,14 +103,12 @@ class VLMTrainer:
         self.base = BaseTrainer.__new__(BaseTrainer)
         self.base.args = args
 
-        self.base._setup()
-        with use_parallel_state(self.base.parallel_state):
-            self._build_components()
+        bootstrap_state = self.base._setup()
+        with use_parallel_state(bootstrap_state):
+            self._build_model()
+        self._build_components()
 
     def _build_components(self):
-        # rewrite build model to support data balancing
-        self._build_model()
-
         # rewrite freeze_model_module to support freeze multimodal encoder, etc.
         self._freeze_model_module()
 
@@ -139,6 +137,7 @@ class VLMTrainer:
         args: VeOmniVLMArguments = self.base.args
         logger.info_rank0("Build model")
         self.base.model = build_foundation_model(
+            parallel_state=get_parallel_state(),
             config_path=args.model.config_path,
             weights_path=args.model.model_path,
             torch_dtype="float32" if args.train.accelerator.fsdp_config.mixed_precision.enable else "bfloat16",
@@ -226,7 +225,7 @@ class VLMTrainer:
             seq_classification=seq_classification,
             data_collate_info=data_collate_info,
             metadata_collate_func=metadata_collate_func,
-            parallel_state=self.base.parallel_state,
+            parallel_state=get_model_parallel_state(self.base.model),
         )
 
     def _build_optimizer(self):
@@ -261,7 +260,6 @@ class VLMTrainer:
             no_decay_modules=args.train.optimizer.no_decay_modules,
             no_decay_params=args.train.optimizer.no_decay_params,
             muon_kwargs=_collect_muon_kwargs(args.train.optimizer),
-            parallel_state=self.base.parallel_state,
         )
 
     def on_train_begin(self):
@@ -316,9 +314,7 @@ class VLMTrainer:
                 total_loss_dict[k] += v.item()
 
         # Gradient clipping
-        grad_norm = veomni_clip_grad_norm(
-            self.base.model, args.train.optimizer.max_grad_norm, parallel_state=self.base.parallel_state
-        )
+        grad_norm = veomni_clip_grad_norm(self.base.model, args.train.optimizer.max_grad_norm)
 
         # Optimizer and scheduler step
         self.base.optimizer.step()

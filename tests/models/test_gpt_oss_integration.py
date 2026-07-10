@@ -4,6 +4,7 @@ import pytest
 import torch
 
 from veomni.arguments.arguments_types import OpsImplementationConfig
+from veomni.distributed.parallel_state import ParallelState
 from veomni.models.auto import build_foundation_model
 from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type
 from veomni.utils.import_utils import is_quack_gemm_available
@@ -44,6 +45,7 @@ def test_gpt_oss_veomni_forward_loss_contract(monkeypatch):
 
     model = build_foundation_model(
         "tests/toy_config/gpt_oss_toy",
+        parallel_state=ParallelState(),
         torch_dtype="float32",
         init_device="cpu",
         ops_implementation=_ops_config(),
@@ -65,6 +67,7 @@ def test_gpt_oss_uses_dedicated_moe_opslot_variant(monkeypatch):
 
     model = build_foundation_model(
         "tests/toy_config/gpt_oss_toy",
+        parallel_state=ParallelState(),
         torch_dtype="float32",
         init_device="cpu",
         ops_implementation=_ops_config(),
@@ -81,6 +84,7 @@ def test_gpt_oss_moe_unbound_slot_does_not_fallback_to_eager(monkeypatch):
 
     model = build_foundation_model(
         "tests/toy_config/gpt_oss_toy",
+        parallel_state=ParallelState(),
         torch_dtype="float32",
         init_device="cpu",
         ops_implementation=_ops_config(moe_implementation="eager"),
@@ -107,6 +111,7 @@ def test_gpt_oss_rejects_triton_moe_backend(monkeypatch):
     with pytest.raises(KeyError, match="Unknown kernel 'triton'.*variant='gpt_oss'"):
         build_foundation_model(
             "tests/toy_config/gpt_oss_toy",
+            parallel_state=ParallelState(),
             torch_dtype="float32",
             init_device="cpu",
             ops_implementation=_ops_config(moe_implementation="fused_triton"),
@@ -124,6 +129,7 @@ def test_gpt_oss_fused_quack_without_sm90_raises(monkeypatch):
     with pytest.raises(RuntimeError, match="compute_capability>=90"):
         build_foundation_model(
             "tests/toy_config/gpt_oss_toy",
+            parallel_state=ParallelState(),
             torch_dtype="float32",
             init_device="cpu",
             ops_implementation=_ops_config(moe_implementation="fused_quack"),
@@ -141,6 +147,7 @@ def test_gpt_oss_fused_moe_matches_eager_cuda(monkeypatch):
     device = get_device_type()
     eager_model = build_foundation_model(
         "tests/toy_config/gpt_oss_toy",
+        parallel_state=ParallelState(),
         torch_dtype="bfloat16",
         init_device=device,
         ops_implementation=_ops_config(moe_implementation="eager"),
@@ -151,6 +158,7 @@ def test_gpt_oss_fused_moe_matches_eager_cuda(monkeypatch):
             layer.mlp.experts.down_proj_bias.normal_(mean=0.0, std=0.02)
     fused_model = build_foundation_model(
         "tests/toy_config/gpt_oss_toy",
+        parallel_state=ParallelState(),
         torch_dtype="bfloat16",
         init_device=device,
         ops_implementation=_ops_config(moe_implementation="fused_quack"),
@@ -178,6 +186,7 @@ def test_gpt_oss_quack_fused_moe_matches_eager_cuda(monkeypatch):
     device = get_device_type()
     eager_model = build_foundation_model(
         "tests/toy_config/gpt_oss_toy",
+        parallel_state=ParallelState(),
         torch_dtype="bfloat16",
         init_device=device,
         ops_implementation=_ops_config(moe_implementation="eager"),
@@ -194,6 +203,7 @@ def test_gpt_oss_quack_fused_moe_matches_eager_cuda(monkeypatch):
 
     fused_model = build_foundation_model(
         "tests/toy_config/gpt_oss_toy",
+        parallel_state=ParallelState(),
         torch_dtype="bfloat16",
         init_device=device,
         ops_implementation=_ops_config(moe_implementation="fused_quack"),

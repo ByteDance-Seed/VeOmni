@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
 
+from ..distributed.parallel_state import ParallelState
 from .device import synchronize
 from .helper import EnvironMeter as OriginalEnvironMeter
 
@@ -95,8 +96,15 @@ class EnvironMeter(OriginalEnvironMeter):
         config: "PretrainedConfig",
         global_batch_size: int,
         empty_cache_steps: int = 500,
+        *,
+        parallel_state: ParallelState,
     ) -> None:
-        super().__init__(config, global_batch_size, empty_cache_steps=empty_cache_steps)
+        super().__init__(
+            config,
+            global_batch_size,
+            empty_cache_steps=empty_cache_steps,
+            parallel_state=parallel_state,
+        )
 
     def add(self, micro_batch: Dict[str, "torch.Tensor"], model_type: Optional[str] = None) -> None:
         if model_type == "wan":

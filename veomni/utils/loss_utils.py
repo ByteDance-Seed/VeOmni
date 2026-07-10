@@ -16,7 +16,7 @@ from typing import Union
 
 import torch
 
-from ..distributed.parallel_state import get_parallel_state
+from ..distributed.parallel_state import ParallelState
 from .constants import IGNORE_INDEX
 from .dist_utils import all_reduce
 
@@ -55,9 +55,10 @@ def mean_global_loss(
     losses: Union[dict[str, torch.Tensor], torch.Tensor],
     micro_batch_token_len: dict[str, torch.Tensor],
     micro_batches_token_len: dict[str, torch.Tensor],
+    parallel_state: ParallelState,
 ):
     """Calcuate the global mean loss. Avg on all_reduced_token_num instead of on dp_size.
-    - cur_losses[key] = cur_loss * cur_token_num / global_batches_token_num * get_parallel_state().fsdp_size
+    - cur_losses[key] = cur_loss * cur_token_num / global_batches_token_num * parallel_state.fsdp_size
     # fsdp by default divides gradients by its size, so we need to multiply by fsdp_size
     """
     loss_dict = {}
@@ -69,21 +70,21 @@ def mean_global_loss(
         loss_name = key.split("_loss")[0]  # foundation/image_decoder/**
 
         cur_token_len = micro_batch_token_len[f"{loss_name}_tokens"]
-        if get_parallel_state().sp_enabled:
-            cur_token_len = all_reduce(cur_token_len.item(), op="sum", group=get_parallel_state().sp_group)
+        if parallel_state.sp_enabled:
+            cur_token_len = all_reduce(cur_token_len.item(), op="sum", group=parallel_state.sp_group)
 
         all_reduced_len = all_reduce((micro_batches_token_len[f"{loss_name}_tokens"].item()), op="sum")
 
         if all_reduced_len != 0:
-            cur_loss = cur_loss * cur_token_len / all_reduced_len * get_parallel_state().fsdp_size
+            cur_loss = cur_loss * cur_token_len / all_reduced_len * parallel_state.fsdp_size
         else:
             if not torch.allclose(cur_loss, torch.zeros_like(cur_loss)):
                 raise ValueError(
                     f"The all_reduced_len for {loss_name}_tokens is 0, but the cur_loss is not 0: {cur_loss}"
                 )
 
-        if get_parallel_state().sp_enabled:
-            cur_loss = cur_loss / get_parallel_state().sp_size
+        if parallel_state.sp_enabled:
+            cur_loss = cur_loss / parallel_state.sp_size
 
         loss_dict[key] = cur_loss
 

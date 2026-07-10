@@ -19,7 +19,12 @@ import torch
 from transformers.initialization import no_init_weights
 
 from ...arguments.arguments_types import OpsImplementationConfig
-from ...distributed.parallel_state import get_parallel_state
+from ...distributed.parallel_state import (
+    ParallelState,
+    bind_model_parallel_state,
+    get_parallel_state,
+    use_parallel_state,
+)
 from ..auto import build_config, build_foundation_model, build_processor, build_tokenizer
 from ..module_utils import init_empty_weights, load_model_weights
 from .configuration_seed_omni import SeedOmniConfig
@@ -73,7 +78,7 @@ def build_omni_processor(
     return omni_processor
 
 
-def build_omni_model(
+def _build_omni_model(
     config_path: str,
     weights_path: Optional[str] = None,
     foundation: Dict[str, str] = None,
@@ -121,6 +126,7 @@ def build_omni_model(
     foundation_config: "PretrainedConfig" = build_config(config_path, **config_kwargs, **foundation)
     if isinstance(foundation_config, SeedOmniConfig):
         return build_foundation_model(
+            parallel_state=get_parallel_state(),
             config_path=config_path,
             weights_path=weights_path,
             torch_dtype=torch_dtype,
@@ -210,3 +216,10 @@ def build_omni_model(
         output_embeddings._parameters["weight"] = input_embeddings._parameters["weight"]
 
     return model
+
+
+def build_omni_model(*args, parallel_state: ParallelState, **kwargs) -> "PreTrainedModel":
+    """Build an omni model under, and bind it to, ``parallel_state``."""
+    with use_parallel_state(parallel_state):
+        model = _build_omni_model(*args, **kwargs)
+    return bind_model_parallel_state(model, parallel_state)

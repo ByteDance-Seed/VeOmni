@@ -5,6 +5,7 @@ import time
 import pytest
 import torch
 
+from veomni.distributed.parallel_state import ParallelState
 from veomni.models import build_foundation_model
 from veomni.utils.device import get_device_type, synchronize
 
@@ -180,6 +181,7 @@ def main(args):
         chunk_gated_delta_rule_implementation="eager",
     )
     dummy_model = build_foundation_model(
+        parallel_state=ParallelState(),
         config_path=args.config_path,
         init_device=args.device,
         ops_implementation=eager_ops,

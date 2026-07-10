@@ -281,10 +281,12 @@ def materialize_weights(config_path: str, output_path: str, save_original_format
 
     This avoids downloading real model weights for CI tests.
     """
+    from veomni.distributed.parallel_state import ParallelState
     from veomni.models.auto import build_foundation_model
     from veomni.utils.device import empty_cache, get_device_type
 
     model = build_foundation_model(
+        parallel_state=ParallelState(),
         config_path=config_path,
         weights_path=None,
         torch_dtype="float32",

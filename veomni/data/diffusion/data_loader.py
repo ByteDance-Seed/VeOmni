@@ -20,7 +20,7 @@ from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
 
 from veomni.utils.device import get_device_type
 
-from ...distributed.parallel_state import get_parallel_state
+from ...distributed.parallel_state import ParallelState
 from ...utils import logging
 from ..data_collator import MainCollator, MakeMicroBatchCollator, NoopDataCollator
 from ..data_loader import DistributedDataloader
@@ -35,6 +35,7 @@ logger = logging.get_logger(__name__)
 
 def build_dit_dataloader(
     dataset: "Dataset",
+    parallel_state: ParallelState,
     micro_batch_size: int,
     global_batch_size: int,
     dataloader_batch_size: int,
@@ -50,7 +51,6 @@ def build_dit_dataloader(
     if collate_fn_kwargs is None:
         collate_fn_kwargs = {}
     # TODO: also need dyn_bsz here?
-    parallel_state = get_parallel_state()
     num_micro_batch = global_batch_size // (
         micro_batch_size * parallel_state.dp_size
     )  # num_micro_batch = num accumulation steps
@@ -63,7 +63,7 @@ def build_dit_dataloader(
     )
 
     if build_collate_fn:
-        collate_fn = MainCollator(**collate_fn_kwargs)
+        collate_fn = MainCollator(parallel_state=parallel_state, **collate_fn_kwargs)
     else:
         collate_fn = NoopDataCollator()
 

@@ -7,6 +7,7 @@ from transformers import AutoTokenizer, TextStreamer
 
 from veomni.arguments import InferArguments, parse_args
 from veomni.arguments.arguments_types import OpsImplementationConfig
+from veomni.distributed.parallel_state import ParallelState
 from veomni.models import build_foundation_model
 from veomni.utils import helper
 from veomni.utils.import_utils import is_flash_attn_2_available
@@ -43,6 +44,7 @@ def main() -> None:
     helper.set_seed(args.infer.seed)
     helper.enable_third_party_logging()
     model = build_foundation_model(
+        parallel_state=ParallelState(),
         config_path=args.infer.model_path,
         weights_path=args.infer.model_path,
         ops_implementation=_INFERENCE_OPS,

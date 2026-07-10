@@ -58,8 +58,12 @@ from ..data.data_transform import build_data_transform
 from ..distributed.clip_grad_norm import veomni_clip_grad_norm
 from ..distributed.offloading import build_activation_offloading_context
 from ..distributed.parallel_state import (
+    ParallelState,
+    bind_model_parallel_state,
+    build_parallel_state,
     clear_parallel_state_cache,
-    init_parallel_state,
+    get_model_parallel_state,
+    get_parallel_state,
     use_model_parallel_state,
     use_parallel_state,
 )
@@ -293,14 +297,13 @@ class BaseTrainer(Stateful, ABC):
         """
 
         self.args: VeOmniArguments = args
-        self._setup()
-        with use_parallel_state(self.parallel_state):
-            self._build_components()
+        bootstrap_state = self._setup()
+        with use_parallel_state(bootstrap_state):
+            self._build_model()
+        self._build_components()
 
     def _build_components(self):
         """Build resources that belong to this trainer's model state."""
-        # build model
-        self._build_model()
         # freeze module and print trainable parameters
         self._freeze_model_module()
         # build model assets (config, tokenizer, processor, chat_template)
@@ -321,7 +324,7 @@ class BaseTrainer(Stateful, ABC):
         # Initialize callbacks
         self._init_callbacks()
 
-    def _setup(self):
+    def _setup(self) -> ParallelState:
         # log args
         logger.info_rank0(json.dumps(asdict(self.args), indent=2))
 
@@ -337,7 +340,7 @@ class BaseTrainer(Stateful, ABC):
         logger.info(f"Process rank: {self.args.train.global_rank}, world size: {self.args.train.world_size}")
 
         # Initialize parallel state
-        self.parallel_state = init_parallel_state(
+        parallel_state = build_parallel_state(
             dp_size=self.args.train.accelerator.dp_size,
             dp_replicate_size=self.args.train.accelerator.dp_replicate_size,
             dp_shard_size=self.args.train.accelerator.dp_shard_size,
@@ -368,10 +371,12 @@ class BaseTrainer(Stateful, ABC):
 
         # Gradient checkpointing debug
         set_checkpoint_debug_enabled(self.args.train.gradient_checkpointing.debug)
+        return parallel_state
 
     def _build_model(self):
         logger.info_rank0("Build model")
         self.model = build_foundation_model(
+            parallel_state=get_parallel_state(),
             config_path=self.args.model.config_path,
             weights_path=self.args.model.model_path,
             torch_dtype="float32" if self.args.train.accelerator.fsdp_config.mixed_precision.enable else "bfloat16",
@@ -411,6 +416,8 @@ class BaseTrainer(Stateful, ABC):
         if not bool(lora_config):
             return
 
+        parallel_state = get_model_parallel_state(self.model)
+
         from ..lora import VeOmniLoraConfig, VeOmniLoraModel, resolve_fused_moe_lora_targets
 
         lora_adapter_path = lora_config.get("lora_adapter", None)
@@ -428,6 +435,7 @@ class BaseTrainer(Stateful, ABC):
             cfg = VeOmniLoraConfig.from_yaml(resolved_config)
             logger.info_rank0(f"Initialising VeOmni LoRA adapter from scratch: {cfg}.")
             self.model = VeOmniLoraModel(self.model, cfg)
+        bind_model_parallel_state(self.model, parallel_state)
 
     def _freeze_model_module(self):
         self._setup_lora()
@@ -449,8 +457,10 @@ class BaseTrainer(Stateful, ABC):
 
     def _build_dataset(self):
         args: VeOmniArguments = self.args
+        parallel_state = get_model_parallel_state(self.model)
         # Build dataset
         self.train_dataset = build_dataset(
+            parallel_state=parallel_state,
             dataset_name=args.data.dataset_name,
             transform=self.data_transform,
             seed=args.train.seed,
@@ -463,20 +473,23 @@ class BaseTrainer(Stateful, ABC):
         self.train_steps = args.train_steps
 
     def _build_collate_fn(self):
+        parallel_state = get_model_parallel_state(self.model)
         seq_classification = self.args.data.data_type == "classification"
         pad_to_length = self.args.train.pad_to_length
         self.collate_fn = MainCollator(
             pad_to_length=pad_to_length,
             seq_classification=seq_classification,
-            parallel_state=self.parallel_state,
+            parallel_state=parallel_state,
         )
 
     def _build_dataloader(self):
         args: VeOmniArguments = self.args
+        parallel_state = get_model_parallel_state(self.model)
         dataloader_kwargs = asdict(args.data.dataloader)
         dataloader_type = dataloader_kwargs.pop("type")
         dataloader_kwargs.pop("use_background_prefetcher", None)
         self.train_dataloader = build_dataloader(
+            parallel_state=parallel_state,
             dataloader_type=dataloader_type,
             dataset=self.train_dataset,
             micro_batch_size=args.train.micro_batch_size,
@@ -493,7 +506,6 @@ class BaseTrainer(Stateful, ABC):
             dyn_bsz_buffer_size=args.data.dyn_bsz_buffer_size,
             seed=args.train.seed,
             collate_fn=self.collate_fn,
-            parallel_state=self.parallel_state,
             save_steps=args.train.checkpoint.save_steps,
             **dataloader_kwargs,
         )
@@ -536,7 +548,6 @@ class BaseTrainer(Stateful, ABC):
             compile_config=CompileConfig(
                 **{field.name: getattr(args.train.torch_compile, field.name) for field in fields(CompileConfig)}
             ),
-            parallel_state=self.parallel_state,
             **kwargs,
         )
         self.model.train()
@@ -553,7 +564,6 @@ class BaseTrainer(Stateful, ABC):
             no_decay_modules=args.train.optimizer.no_decay_modules,
             no_decay_params=args.train.optimizer.no_decay_params,
             muon_kwargs=_collect_muon_kwargs(args.train.optimizer),
-            parallel_state=self.parallel_state,
         )
 
     def _build_lr_scheduler(self):
@@ -677,7 +687,10 @@ class BaseTrainer(Stateful, ABC):
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """Postprocess model outputs after forward pass."""
         loss_dict: Dict[str, torch.Tensor] = mean_global_loss(
-            outputs.loss, self.micro_batch_token_len, self.micro_batches_token_len
+            outputs.loss,
+            self.micro_batch_token_len,
+            self.micro_batches_token_len,
+            get_model_parallel_state(self.model),
         )
         loss = torch.stack(list(loss_dict.values())).sum()
         return loss, loss_dict
@@ -763,9 +776,7 @@ class BaseTrainer(Stateful, ABC):
                 total_loss_dict[k] += v.item()
 
         # Gradient clipping
-        grad_norm = veomni_clip_grad_norm(
-            self.model, args.train.optimizer.max_grad_norm, parallel_state=self.parallel_state
-        )
+        grad_norm = veomni_clip_grad_norm(self.model, args.train.optimizer.max_grad_norm)
 
         # Optimizer and scheduler step
         self.optimizer.step()

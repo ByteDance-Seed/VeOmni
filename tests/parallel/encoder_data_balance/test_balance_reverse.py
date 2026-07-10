@@ -6,7 +6,7 @@ import sys
 import torch
 import torch.distributed as dist
 
-from veomni.distributed.parallel_state import init_parallel_state
+from veomni.distributed.parallel_state import build_parallel_state, use_parallel_state
 from veomni.utils.data_balance.data_balance import Qwen3VLEncoderDataBalance
 from veomni.utils.device import get_device_type, get_dist_comm_backend, get_torch_device
 
@@ -59,7 +59,7 @@ def check_recover_precision(pixel_values, image_grid_thw):
 def main():
     get_torch_device().set_device(f"{get_device_type()}:{os.getenv('RANK')}")
     dist.init_process_group(backend=get_dist_comm_backend())
-    init_parallel_state(
+    parallel_state = build_parallel_state(
         dp_size=int(os.getenv("WORLD_SIZE")),
         dp_mode="fsdp2",
     )
@@ -67,7 +67,8 @@ def main():
     # Construct fake data
     pixel_values, image_grid_thw = construct_data()
     # spatial_merge_unit = 1
-    check_recover_precision(pixel_values, image_grid_thw)
+    with use_parallel_state(parallel_state):
+        check_recover_precision(pixel_values, image_grid_thw)
 
     print("all test passed")
 

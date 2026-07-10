@@ -16,7 +16,7 @@ from torch.distributed._tensor import DTensor, Shard
 from veomni.arguments import TrainingArguments, parse_args
 from veomni.distributed.clip_grad_norm import veomni_clip_grad_norm
 from veomni.distributed.parallel_plan import ParallelPlan
-from veomni.distributed.parallel_state import init_parallel_state
+from veomni.distributed.parallel_state import build_parallel_state
 from veomni.distributed.torch_parallelize import build_parallelize_model
 from veomni.optim import build_optimizer
 from veomni.utils import helper
@@ -126,7 +126,7 @@ def main():
     args = parse_args(Argument)
 
     get_torch_device().set_device(f"{get_device_type()}:{args.train.local_rank}")
-    init_parallel_state(
+    parallel_state = build_parallel_state(
         dp_size=args.train.accelerator.dp_size,
         dp_replicate_size=args.train.accelerator.dp_replicate_size,
         dp_shard_size=args.train.accelerator.dp_shard_size,
@@ -143,6 +143,7 @@ def main():
     model = ToyMoeAndEmbedModel()
     model = build_parallelize_model(
         model,
+        parallel_state=parallel_state,
         init_device=args.train.init_device,
         weights_path=None,
         mixed_precision=args.train.accelerator.fsdp_config.mixed_precision,
@@ -155,9 +156,7 @@ def main():
         max_load_broadcast_size=args.train.accelerator.fsdp_config.max_load_broadcast_size,
     )
 
-    from veomni.distributed.parallel_state import get_parallel_state
-
-    ps = get_parallel_state()
+    ps = parallel_state
     fsdp_group = ps.fsdp_group
     ep_group = ps.extra_parallel_group("ep") if ps.extra_parallel_enabled("ep") else None
     emb_group = ps.extra_parallel_group("emb") if ps.extra_parallel_enabled("emb") else None
@@ -173,6 +172,7 @@ def main():
     # build optimizer to register ep param groups when ep is enabled
     _ = build_optimizer(
         model,
+        parallel_state=parallel_state,
         lr=args.train.optimizer.lr,
         weight_decay=args.train.optimizer.weight_decay,
         fused=True,
@@ -262,7 +262,7 @@ def main():
             + 64 * 16
             + (64 * 16 * 32) * (1 / ps.extra_parallel_sizes["ep"] ** 2)
         )
-        total_grad_norm_pre_clip = veomni_clip_grad_norm(model, max_grad_norm)
+        total_grad_norm_pre_clip = veomni_clip_grad_norm(model, max_grad_norm, parallel_state=parallel_state)
 
         # check whether total grad norm meets our expectation
         torch.testing.assert_close(total_grad_norm_pre_clip, expected=expected_total_grad_norm, atol=1e-6, rtol=1e-6)

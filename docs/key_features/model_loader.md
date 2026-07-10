@@ -89,9 +89,13 @@ Check existing model implementations in the `veomni/models/transformers/` and `v
 The framework will automatically handle model loading based on the configuration. You can load your model using:
 
 ```python
+from veomni.distributed.parallel_state import build_parallel_state
 from veomni.models import build_foundation_model
 
+parallel_state = build_parallel_state(...)
+
 model = build_foundation_model(
+    parallel_state=parallel_state,
     config_path=args.model.config_path,
     weights_path=args.model.model_path,
     ...

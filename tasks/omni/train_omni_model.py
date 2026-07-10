@@ -21,7 +21,7 @@ from veomni.data import (
 from veomni.data.multimodal.multimodal_transform import encode_multimodal_sample
 from veomni.distributed.clip_grad_norm import veomni_clip_grad_norm
 from veomni.distributed.offloading import build_activation_offloading_context
-from veomni.distributed.parallel_state import get_parallel_state, init_parallel_state
+from veomni.distributed.parallel_state import build_parallel_state
 from veomni.distributed.torch_parallelize import build_parallelize_model
 from veomni.models import save_model_assets, save_model_weights
 from veomni.models.seed_omni import SeedOmniModel, build_omni_model, build_omni_processor
@@ -112,7 +112,7 @@ def main():
         dist_backend=args.train.accelerator.fsdp_config.fsdp_mode, ckpt_manager=args.train.checkpoint.manager
     )
 
-    init_parallel_state(
+    parallel_state = build_parallel_state(
         dp_size=args.train.accelerator.dp_size,
         dp_replicate_size=args.train.accelerator.dp_replicate_size,
         dp_shard_size=args.train.accelerator.dp_shard_size,
@@ -127,6 +127,7 @@ def main():
     )
     logger.info_rank0("Prepare model")
     model: SeedOmniModel = build_omni_model(
+        parallel_state=parallel_state,
         config_path=args.model.config_path,
         weights_path=args.model.model_path,
         torch_dtype="float32" if args.train.accelerator.fsdp_config.mixed_precision.enable else "bfloat16",
@@ -165,6 +166,7 @@ def main():
     )
 
     train_dataset = build_dataset(
+        parallel_state=parallel_state,
         dataset_name=args.data.dataset_name,
         transform=transform,
         dataloader_batch_size=args.train.dataloader_batch_size,
@@ -200,6 +202,7 @@ def main():
     }
 
     train_dataloader = build_dataloader(
+        parallel_state=parallel_state,
         dataloader_type=args.data.dataloader.type,
         dataset=train_dataset,
         micro_batch_size=args.train.micro_batch_size,
@@ -250,6 +253,7 @@ def main():
 
     model = build_parallelize_model(
         model,
+        parallel_state=parallel_state,
         weights_path=args.model.model_path,
         enable_reshard_after_forward=args.train.accelerator.fsdp_config.reshard_after_forward,
         mixed_precision=args.train.accelerator.fsdp_config.mixed_precision,
@@ -265,6 +269,7 @@ def main():
     )
     optimizer = build_optimizer(
         model,
+        parallel_state=parallel_state,
         lr=args.train.optimizer.lr,
         weight_decay=args.train.optimizer.weight_decay,
         fused=False,
@@ -310,6 +315,7 @@ def main():
     start_epoch, start_step, global_step = 0, 0, 0
     save_checkpoint_path = None
     environ_meter = helper.EnvironMeter(
+        parallel_state=parallel_state,
         config=model_config,
         global_batch_size=args.train.global_batch_size,
         empty_cache_steps=args.train.empty_cache_steps,
@@ -411,7 +417,7 @@ def main():
 
                 del micro_batch
 
-            grad_norm = veomni_clip_grad_norm(model, args.train.optimizer.max_grad_norm)
+            grad_norm = veomni_clip_grad_norm(model, args.train.optimizer.max_grad_norm, parallel_state=parallel_state)
 
             optimizer.step()
             lr_scheduler.step()
@@ -420,9 +426,9 @@ def main():
                 grad_norm = grad_norm.full_tensor().item()
 
             # collect loss across data parallel group
-            total_loss, grad_norm = all_reduce((total_loss, grad_norm), group=get_parallel_state().fsdp_group)
+            total_loss, grad_norm = all_reduce((total_loss, grad_norm), group=parallel_state.fsdp_group)
             for key, v in total_losses.items():
-                total_losses[key] = all_reduce((v), group=get_parallel_state().fsdp_group)
+                total_losses[key] = all_reduce((v), group=parallel_state.fsdp_group)
             synchronize()
             delta_time = time.time() - start_time
             lr = max(lr_scheduler.get_last_lr())

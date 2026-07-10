@@ -25,7 +25,12 @@ from transformers import (
 )
 
 from ..arguments.arguments_types import OpsImplementationConfig
-from ..distributed.parallel_state import get_parallel_state
+from ..distributed.parallel_state import (
+    ParallelState,
+    bind_model_parallel_state,
+    get_parallel_state,
+    use_parallel_state,
+)
 from ..ops.dispatch import OpsConfigSlot, OpSlot
 from ..utils import logging
 from ..utils.device import is_torch_npu_available
@@ -107,7 +112,7 @@ def _bind_veomni_ops(modeling_module, ops_config: OpsImplementationConfig) -> bo
     return bool(bound)
 
 
-def build_foundation_model(
+def _build_foundation_model(
     config_path: Union[str, PretrainedConfig],
     weights_path: Optional[str] = None,
     torch_dtype: Literal["float16", "bfloat16", "float32"] = "bfloat16",
@@ -275,3 +280,10 @@ def build_foundation_model(
     logger.info_rank0(f"Built foundation model class: {model_class_path}")
 
     return model
+
+
+def build_foundation_model(*args, parallel_state: ParallelState, **kwargs) -> "PreTrainedModel":
+    """Build a foundation model under, and bind it to, ``parallel_state``."""
+    with use_parallel_state(parallel_state):
+        model = _build_foundation_model(*args, **kwargs)
+    return bind_model_parallel_state(model, parallel_state)

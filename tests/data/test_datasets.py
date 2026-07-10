@@ -16,7 +16,7 @@ from transformers import PretrainedConfig
 from utils import DummyDataset, FakeModel, compare_global_batch, compare_items, compare_metrics, process_dummy_example
 
 from veomni.arguments import parse_args
-from veomni.distributed.parallel_state import get_parallel_state
+from veomni.distributed.parallel_state import bind_model_parallel_state, get_model_parallel_state, get_parallel_state
 from veomni.trainer.base import BaseTrainer, VeOmniArguments
 from veomni.trainer.callbacks import (
     Callback,
@@ -51,6 +51,7 @@ class TrainerTest(BaseTrainer):
     def _build_model(self):
         # only build fake model
         self.model = FakeModel().to(get_device_type())
+        bind_model_parallel_state(self.model, get_parallel_state())
         self.model_config = PretrainedConfig()
 
     def _build_model_assets(self):
@@ -146,22 +147,23 @@ class CheckCallback(Callback):
         micro_batches_output = [[k  for k, _ in groupby(micro_batch["input_ids"].tolist()[0])]  for micro_batch in micro_batches]
         logger.error(f"[rank{get_parallel_state().global_rank}][epoch{state.epoch}][curr_step{state.curr_step}][step {state.global_step}] micro_batches_output: {micro_batches_output}")
         """
-        if state.global_step == 1 and get_parallel_state().sp_enabled:
+        parallel_state = get_model_parallel_state(self.trainer.model)
+        if state.global_step == 1 and parallel_state.sp_enabled:
             assert (
-                micro_batches[0]["input_ids"].shape[-1] * get_parallel_state().sp_size
+                micro_batches[0]["input_ids"].shape[-1] * parallel_state.sp_size
                 == micro_batches[0]["attention_mask"].shape[-1]
             )
             assert compare_items(
                 micro_batches[0]["attention_mask"],
-                rank=get_parallel_state().sp_rank,
-                group_size=get_parallel_state().sp_size,
-                group=get_parallel_state().sp_group,
+                rank=parallel_state.sp_rank,
+                group_size=parallel_state.sp_size,
+                group=parallel_state.sp_group,
             )
             assert compare_items(
                 micro_batches[0]["cu_seq_lens_q"],
-                rank=get_parallel_state().sp_rank,
-                group_size=get_parallel_state().sp_size,
-                group=get_parallel_state().sp_group,
+                rank=parallel_state.sp_rank,
+                group_size=parallel_state.sp_size,
+                group=parallel_state.sp_group,
             )
         if self.trainer.start_save_data:
             if not self.trainer.is_resume:

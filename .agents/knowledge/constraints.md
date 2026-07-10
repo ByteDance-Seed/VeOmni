@@ -35,7 +35,7 @@ Violating any of these causes silent bugs, crashes, or incorrect training result
 VeOmni uses FSDP2 exclusively. FSDP1 has been removed.
 
 Core entry points:
-- `veomni/distributed/parallel_state.py` — `init_parallel_state()`, `ParallelState` dataclass
+- `veomni/distributed/parallel_state.py` — `build_parallel_state()`, `ParallelState` dataclass
 - `veomni/distributed/torch_parallelize.py` — `build_parallelize_model()`, `parallelize_model_fsdp2()`
 - `veomni/distributed/parallel_plan.py` — `ParallelPlan`, `SpecInfo`
 
@@ -49,10 +49,11 @@ Core entry points:
 
 5a. **Parallel state is model-owned**
    - `build_parallelize_model(..., parallel_state=ps)` binds `ps` to the model; policy, reference, reward, and drafter models may own different states in one process.
+   - Trainers may hold a local bootstrap state only while constructing the first model. They must not retain `self.parallel_state`; after binding, resolve state from the specific model.
    - Model-owned consumers (optimizer, gradient clipping, checkpointing, collators) must receive the owning state explicitly or resolve it from the model. Do not add new process-global group/state ownership.
-   - `use_model_parallel_state(model)` is a `ContextVar` compatibility bridge for existing modeling code that calls `get_parallel_state()`. Custom autograd functions must capture process groups during forward rather than consulting ambient state during backward.
+   - `use_model_parallel_state(model)` activates the owning state while modeling code calls `get_parallel_state()`. There is no process-global default state: code outside a model/build context must pass `ParallelState` explicitly. Custom autograd functions must capture process groups during forward rather than consulting ambient state during backward.
 
-6. **Device mesh initialization (`init_parallel_state()`)**
+6. **Device mesh construction (`build_parallel_state()`)**
    - Builds a global `DeviceMesh` with named dimensions: `pp`, `dp_replicate`, `dp_shard`, `ulysses`, `cp`, `tp` (each included only if size > 1).
    - Flattens subviews for common usage: `dp` (all data-parallel), `sp` (ulysses+cp), `dp_shard_sp` (FSDP shard × SP), `dp_sp` (for loss/grad sync across SP+DP).
    - For each ExtraParallel name (e.g. `ep`), builds a `[para_size × para_fsdp_size]` submesh via `init_para_mesh_matrix()`.
@@ -75,7 +76,7 @@ Core entry points:
    - Weight sharding: `ParallelPlan` in `parallel_plan.py` defines which expert parameters get `Shard(0)` on the EP mesh. `ParallelPlan.apply()` wraps matching params as DTensors and redistributes to local shards.
    - Token routing: `veomni/distributed/moe/moe_layer.py` — `preprocess()` computes dispatch counts, `token_pre_all2all()` / `tokens_post_all2all()` exchange tokens between EP ranks via `all_to_all` / `all_to_all_async` in `moe/comm.py`.
    - Expert computation: `EPGroupGemm` runs fused expert MLP on grouped tokens per rank.
-   - Device mesh: `init_parallel_state()` builds `[ep × ep_fsdp]` submesh; accessed via `ParallelState.extra_parallel_mesh("ep")`, `ep_group`, `ep_rank`.
+   - Device mesh: `build_parallel_state()` builds `[ep × ep_fsdp]` submesh; accessed via `ParallelState.extra_parallel_mesh("ep")`, `ep_group`, `ep_rank`.
    - In FSDP2: expert modules get `fully_shard()` on the `ep_fsdp` submesh with `Shard(1)` placement so hidden-dim sharding composes with EP's dim-0 sharding.
 
 ## Data Pipeline

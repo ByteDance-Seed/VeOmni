@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from functools import cached_property, wraps
 from typing import TYPE_CHECKING, Any, Callable, Dict, Iterator, Literal, Optional, Tuple
 
+import torch
 from torch import distributed as dist
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 
@@ -36,14 +37,8 @@ if TYPE_CHECKING:
 
 logger = logging.get_logger(__name__)
 
-# Backward-compatible default for code paths that have not been migrated to a
-# model-owned state yet. It is deliberately not mutated when additional models
-# build their own parallel states.
-_PARALLEL_STATE: Optional["ParallelState"] = None
-
-# The active value is execution-context-local and is only a compatibility bridge
-# for modeling code that still calls ``get_parallel_state()``. The source of
-# truth is the state bound to the model being built or executed.
+# The active value is execution-context-local. The source of truth is the state
+# bound to the model being built or executed; there is no process-global default.
 _CURRENT_PARALLEL_STATE: ContextVar[Optional["ParallelState"]] = ContextVar(
     "veomni_current_parallel_state", default=None
 )
@@ -113,8 +108,7 @@ class ParallelState:
 
         if self.sp_enabled and self.device_mesh is None:
             raise ValueError(
-                "A sequence-parallel ParallelState must be built with a device mesh "
-                "through build_parallel_state() or init_parallel_state()."
+                "A sequence-parallel ParallelState must be built with a device mesh through build_parallel_state()."
             )
 
     @property
@@ -611,49 +605,9 @@ def build_parallel_state(
     return parallel_state
 
 
-def init_parallel_state(
-    dp_size: int = 1,
-    dp_replicate_size: int = 1,
-    dp_shard_size: int = 1,
-    tp_size: int = 1,
-    pp_size: int = 1,
-    cp_size: int = 1,
-    ulysses_size: int = 1,
-    dp_mode: Literal["ddp", "fsdp2"] = "fsdp2",
-    device_type: str = None,
-    include_sp_in_fsdp: bool = True,
-    extra_parallel_sizes: Tuple[int] = (1,),
-    extra_parallel_placement_innermost: Tuple[bool] = (False,),
-    extra_parallel_names: Tuple[str] = ("ep",),
-    async_enabled: Optional[bool] = False,
-) -> "ParallelState":
-    """Build a state and install it as the legacy default on first use."""
-    global _PARALLEL_STATE
-    parallel_state = build_parallel_state(
-        dp_size=dp_size,
-        dp_replicate_size=dp_replicate_size,
-        dp_shard_size=dp_shard_size,
-        tp_size=tp_size,
-        pp_size=pp_size,
-        cp_size=cp_size,
-        ulysses_size=ulysses_size,
-        dp_mode=dp_mode,
-        device_type=device_type,
-        include_sp_in_fsdp=include_sp_in_fsdp,
-        extra_parallel_sizes=extra_parallel_sizes,
-        extra_parallel_placement_innermost=extra_parallel_placement_innermost,
-        extra_parallel_names=extra_parallel_names,
-        async_enabled=async_enabled,
-    )
-    if _PARALLEL_STATE is None:
-        _PARALLEL_STATE = parallel_state
-    return parallel_state
-
-
 def clear_parallel_state_cache() -> None:
     """Clear cached meshes after the default distributed process group ends."""
-    global _PARALLEL_STATE, _PARALLEL_STATE_CACHE_PROCESS_GROUP, _PARALLEL_STATE_CACHE_SESSION
-    _PARALLEL_STATE = None
+    global _PARALLEL_STATE_CACHE_PROCESS_GROUP, _PARALLEL_STATE_CACHE_SESSION
     _PARALLEL_STATE_CACHE_PROCESS_GROUP = None
     _PARALLEL_STATE_CACHE_SESSION = object()
     _CURRENT_PARALLEL_STATE.set(None)
@@ -662,7 +616,7 @@ def clear_parallel_state_cache() -> None:
 
 @contextmanager
 def use_parallel_state(parallel_state: "ParallelState") -> Iterator["ParallelState"]:
-    """Expose a model-owned state to legacy modeling code in this context."""
+    """Activate a state for explicit model construction or execution."""
     token = _CURRENT_PARALLEL_STATE.set(parallel_state)
     try:
         yield parallel_state
@@ -671,8 +625,18 @@ def use_parallel_state(parallel_state: "ParallelState") -> Iterator["ParallelSta
 
 
 def bind_model_parallel_state(model: Any, parallel_state: "ParallelState") -> Any:
-    """Bind a non-serialized parallel-state reference to a model."""
+    """Bind state to a model and make every root forward activate that state."""
     setattr(model, _MODEL_PARALLEL_STATE_ATTR, parallel_state)
+    original_forward = getattr(model, "forward", None)
+    if callable(original_forward) and not getattr(model, "_veomni_parallel_forward_wrapped", False):
+
+        @wraps(original_forward)
+        def model_owned_forward(*args, **kwargs):
+            with use_parallel_state(get_model_parallel_state(model)):
+                return original_forward(*args, **kwargs)
+
+        model.forward = model_owned_forward
+        model._veomni_parallel_forward_wrapped = True
     return model
 
 
@@ -688,7 +652,7 @@ def get_model_parallel_state(model: Any) -> "ParallelState":
 
 
 def resolve_model_parallel_state(model: Any, parallel_state: Optional["ParallelState"] = None) -> "ParallelState":
-    """Resolve an explicit state, then a model-owned state, then legacy context."""
+    """Resolve an explicit state, then a model-owned or active build state."""
     if parallel_state is not None:
         return parallel_state
     if (model_state := getattr(model, _MODEL_PARALLEL_STATE_ATTR, None)) is not None:
@@ -698,24 +662,23 @@ def resolve_model_parallel_state(model: Any, parallel_state: Optional["ParallelS
 
 @contextmanager
 def use_model_parallel_state(model: Any) -> Iterator["ParallelState"]:
-    """Run legacy modeling code under the state owned by ``model``."""
+    """Run modeling code under the state owned by ``model``."""
     with use_parallel_state(get_model_parallel_state(model)) as parallel_state:
         yield parallel_state
 
 
+@torch.compiler.assume_constant_result
 def get_parallel_state() -> "ParallelState":
-    """
-    Return the current model-owned state, falling back to the legacy default.
-    """
+    """Return the state active in this explicit build/model execution context."""
     if (parallel_state := _CURRENT_PARALLEL_STATE.get()) is not None:
         return parallel_state
-    if _PARALLEL_STATE is None:
-        logger.warning_once("Parallel state has not been initialized. returning default Single-process state.")
-        return ParallelState()
+    raise RuntimeError(
+        "No ParallelState is active. Build one with build_parallel_state(), bind it to the model, "
+        "and use use_parallel_state() for pre-model build code."
+    )
 
-    return _PARALLEL_STATE
 
-
+@torch.compiler.assume_constant_result
 def get_current_parallel_state() -> Optional["ParallelState"]:
     """Return the state active in this execution context, without fallback."""
     return _CURRENT_PARALLEL_STATE.get()

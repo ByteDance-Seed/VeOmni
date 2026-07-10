@@ -12,7 +12,7 @@ from torch import nn
 
 from veomni.arguments import DataArguments, ModelArguments, TrainingArguments, parse_args
 from veomni.distributed.parallel_plan import ParallelPlan
-from veomni.distributed.parallel_state import init_parallel_state
+from veomni.distributed.parallel_state import build_parallel_state, clear_parallel_state_cache
 from veomni.distributed.torch_parallelize import build_parallelize_model
 from veomni.models.module_utils import load_model_weights, rank0_load_and_broadcast_weights
 from veomni.utils import helper
@@ -218,7 +218,7 @@ def run_rank0_broadcast_test(args: Arguments) -> None:
     get_torch_device().set_device(args.train.local_rank)
     dist.init_process_group(backend=args.test.backend)
 
-    init_parallel_state(
+    parallel_state = build_parallel_state(
         dp_size=args.train.accelerator.dp_size,
         dp_replicate_size=args.train.accelerator.dp_replicate_size,
         dp_shard_size=args.train.accelerator.dp_shard_size,
@@ -274,6 +274,7 @@ def run_rank0_broadcast_test(args: Arguments) -> None:
         # 1.1 rank0_load_model init with no weights_path
         rank0_load_model = build_parallelize_model(
             rank0_load_model,
+            parallel_state=parallel_state,
             weights_path=None,
             init_device=args.train.init_device,
             mixed_precision=args.train.accelerator.fsdp_config.mixed_precision,
@@ -300,6 +301,7 @@ def run_rank0_broadcast_test(args: Arguments) -> None:
         # 2.1 all_rank_load_model init with no weights_path
         all_rank_load_model = build_parallelize_model(
             all_rank_load_model,
+            parallel_state=parallel_state,
             weights_path=None,
             init_device=args.train.init_device,
             mixed_precision=args.train.accelerator.fsdp_config.mixed_precision,
@@ -394,9 +396,7 @@ def run_rank0_broadcast_test(args: Arguments) -> None:
         dist.barrier()
     finally:
         dist.destroy_process_group()
-        from veomni.distributed import parallel_state as _ps
-
-        _ps._PARALLEL_STATE = None
+        clear_parallel_state_cache()
 
 
 @pytest.mark.skipif(not dist.is_available(), reason="torch.distributed required")
@@ -453,7 +453,7 @@ def run_load_weights_test(args: Arguments) -> None:
     get_torch_device().set_device(args.train.local_rank)
     dist.init_process_group(backend=args.test.backend)
 
-    init_parallel_state(
+    parallel_state = build_parallel_state(
         dp_size=args.train.accelerator.dp_size,
         dp_replicate_size=args.train.accelerator.dp_replicate_size,
         dp_shard_size=args.train.accelerator.dp_shard_size,
@@ -472,6 +472,7 @@ def run_load_weights_test(args: Arguments) -> None:
         # (the every-rank-reads-from-disk path, fixed in issue #637).
         fsdp_model = build_parallelize_model(
             ToyModel(),
+            parallel_state=parallel_state,
             weights_path=str(weights_path),
             init_device=args.train.init_device,
             mixed_precision=args.train.accelerator.fsdp_config.mixed_precision,
@@ -561,9 +562,7 @@ def run_load_weights_test(args: Arguments) -> None:
         dist.barrier()
     finally:
         dist.destroy_process_group()
-        from veomni.distributed import parallel_state as _ps
-
-        _ps._PARALLEL_STATE = None
+        clear_parallel_state_cache()
 
 
 @pytest.mark.skipif(not dist.is_available(), reason="torch.distributed required")

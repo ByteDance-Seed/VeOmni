@@ -10,6 +10,7 @@ from veomni.arguments import InferArguments, parse_args
 from veomni.arguments.arguments_types import OpsImplementationConfig
 from veomni.data import build_multimodal_chat_template
 from veomni.data.multimodal.multimodal_transform import mask_input_ids
+from veomni.distributed.parallel_state import ParallelState
 from veomni.models import build_foundation_model, build_processor
 from veomni.models.seed_omni import SeedOmniModel, SeedOmniProcessor
 from veomni.utils import helper
@@ -138,7 +139,12 @@ def main() -> None:
     helper.enable_third_party_logging()
     # config model and processor
     model: SeedOmniModel = (
-        build_foundation_model(args.infer.model_path, args.infer.model_path, ops_implementation=_INFERENCE_OPS)
+        build_foundation_model(
+            args.infer.model_path,
+            args.infer.model_path,
+            parallel_state=ParallelState(),
+            ops_implementation=_INFERENCE_OPS,
+        )
         .eval()
         .to(get_device_type())
     )

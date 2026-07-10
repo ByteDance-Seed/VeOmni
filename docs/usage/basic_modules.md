@@ -70,15 +70,18 @@ class Arguments(VeOmniArguments):
 ## Parallel State
 VeOmni uses torch device meshes to represent parallel state. A state is owned by the model that uses its topology, so one RL trainer can coordinate policy, reference, reward, and drafter models with different DP/SP/EP layouts. `build_parallel_state()` constructs a state without changing another model's state, and `build_parallelize_model(..., parallel_state=ps)` binds it to the model.
 
-`init_parallel_state()` and `get_parallel_state()` remain compatibility APIs for single-model tasks and existing model patches. New orchestration code should retain the returned state and pass it explicitly.
+`init_parallel_state()` and the process-global default state have been removed. Retain the value returned by `build_parallel_state()` long enough to construct the model and data pipeline. Model-aware utilities resolve it from the bound model. `get_parallel_state()` is only valid while a model-owned or explicit build context is active.
+
+Trainers use the constructed state only to build the model and do not keep a trainer-owned copy. After model construction, utilities such as optimizer setup and gradient clipping resolve the state from the model.
 
 More details about torch device mesh, you can refer to the [Getting Started with DeviceMesh](https://pytorch.org/tutorials/recipes/distributed_device_mesh.html).
 
 - source code [veomni/distributed/parallel_state.py](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/distributed/parallel_state.py).
 
 ```python
-from veomni.distributed.parallel_state import build_parallel_state, use_model_parallel_state
+from veomni.distributed.parallel_state import build_parallel_state
 from veomni.distributed.torch_parallelize import build_parallelize_model
+from veomni.models import build_foundation_model
 
 policy_state = build_parallel_state(
     dp_size=args.train.accelerator.dp_size, # data parallel size
@@ -95,14 +98,16 @@ policy_state = build_parallel_state(
     async_enabled=args.train.accelerator.enable_async, # async ulysses
 )
 
+policy_model = build_foundation_model(
+    config_path=args.model.config_path,
+    weights_path=args.model.model_path,
+    parallel_state=policy_state,
+    ops_implementation=args.model.ops_implementation,
+)
 policy_model = build_parallelize_model(
     policy_model,
-    parallel_state=policy_state,
     # other parallelization and weight-loading options
 )
-
-with use_model_parallel_state(policy_model):
-    outputs = policy_model(**batch)
 
 # Access dp state
 dp_mesh = policy_state.dp_mesh
@@ -126,6 +131,7 @@ VeOmni default supports three types of datasets(source code: [veomni/data/datase
 ```python
 from veomni.data import build_dataset
 train_dataset = build_dataset(
+    parallel_state=policy_state,
     dataset_name=args.data.dataset_name,
     transform=transform,
     seed=args.train.seed,
@@ -290,6 +296,7 @@ VeOmni offered a flexible and powerful dataloader implementation, which supports
 ```python
 from veomni.data import build_dataloader
 train_dataloader = build_dataloader(
+    parallel_state=policy_state,
     dataloader_type=args.data.dataloader.type,
     dataset=train_dataset,
     micro_batch_size=args.train.micro_batch_size, # micro batch size
@@ -346,6 +353,7 @@ An example of usage in `def build_data_collate_info` in [veomni/trainer/vlm_trai
 from veomni.models import build_foundation_model
 
 model = build_foundation_model(
+    parallel_state=policy_state,
     config_path=args.model.config_path, # model config path, can be None if weights_path is not None
     weights_path=args.model.model_path, # model weights path, can be None if config_path is not None
     init_device=args.train.init_device, # model init device
@@ -438,13 +446,16 @@ lr_scheduler = build_lr_scheduler(
 After the parallel_state, model, optimizer, and dataloader are initialized, you can start the training loop.
 
 ```python
+from veomni.distributed.parallel_state import use_model_parallel_state
+
 for epoch in range(args.train.num_train_epochs):
     data_iterator = iter(train_dataloader)
     for _ in range(args.train.train_steps):
         micro_batches = next(data_iterator)
-        for micro_batch in micro_batches:
-            loss = model(**micro_batch).loss / len(micro_batches)
-            loss.backward()
+        with use_model_parallel_state(model):
+            for micro_batch in micro_batches:
+                loss = model(**micro_batch).loss / len(micro_batches)
+                loss.backward()
 
         optimizer.step()
         lr_scheduler.step()

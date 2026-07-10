@@ -36,7 +36,7 @@ import torch.nn as nn
 import transformers
 from transformers import set_seed as set_seed_func
 
-from ..distributed.parallel_state import get_parallel_state
+from ..distributed.parallel_state import ParallelState
 from . import logging
 from .count_flops import VeomniFlopsCounter
 from .device import (
@@ -170,12 +170,15 @@ class EnvironMeter:
         data_path: str = "",
         empty_cache_steps: int = 500,
         gc_steps: int = 0,
+        *,
+        parallel_state: ParallelState,
     ) -> None:
         self.config = config
         self.global_batch_size = global_batch_size
         self.enable_multisource = enable_multisource
         self.empty_cache_steps = empty_cache_steps
         self.gc_steps = gc_steps
+        self.parallel_state = parallel_state
         self.world_size = dist.get_world_size()
         self.consume_tokens = 0
         self.consume_chunks = 0
@@ -189,7 +192,9 @@ class EnvironMeter:
                     "`dataloader` and `data_path` is required for `EnvironMeter` with multi-source dataloader."
                 )
 
-            self.multisource_tracker = MultiSourceInfoTracker(dataloader=dataloader, data_path=data_path)
+            self.multisource_tracker = MultiSourceInfoTracker(
+                dataloader=dataloader, data_path=data_path, parallel_state=parallel_state
+            )
 
         # for internal use
         if VALID_CONFIG_TYPE is not None and isinstance(config, VALID_CONFIG_TYPE):
@@ -239,7 +244,7 @@ class EnvironMeter:
         flops_achieved, batch_tokens, real_global_batch_size = all_reduce(
             (flops_achieved, sum(self.batch_seqlens), len(self.batch_seqlens)),
             op="sum",
-            group=get_parallel_state().dp_group,
+            group=self.parallel_state.dp_group,
         )
         flops_promised = flops_promised * self.world_size
         mfu = flops_achieved / flops_promised if flops_promised else 0
@@ -315,13 +320,14 @@ class MultiSourceInfoTracker:
     Tracks the statistics about the weighted multi-source dataset.
     """
 
-    def __init__(self, dataloader: Optional["DataLoader"], data_path: str) -> None:
+    def __init__(self, dataloader: Optional["DataLoader"], data_path: str, parallel_state: ParallelState) -> None:
         self.dataloader = dataloader
         self.accumulate_counter = dict()
         self.batch_idx = 0
         self.multisource_config = parse_multisource_config(data_path)
         self.names = self.multisource_config["names"]
         self.boundary_type = self.multisource_config.get("boundary_type", "token")
+        self.parallel_state = parallel_state
 
     def state_dict(self) -> Dict[str, Any]:
         return {"accumulate_counter": self.accumulate_counter, "batch_idx": self.batch_idx}
@@ -338,8 +344,8 @@ class MultiSourceInfoTracker:
         for ds_idx, seq_len in zip(batch_ds_idx, batch_seqlens):
             counter[ds_idx].increment(seq_len, 1)
 
-        counter_list: List[Dict[int, MultiSourceCounterItem]] = [None for _ in range(get_parallel_state().dp_size)]
-        dist.all_gather_object(counter_list, counter, group=get_parallel_state().dp_group)
+        counter_list: List[Dict[int, MultiSourceCounterItem]] = [None for _ in range(self.parallel_state.dp_size)]
+        dist.all_gather_object(counter_list, counter, group=self.parallel_state.dp_group)
 
         global_counter = defaultdict(MultiSourceCounterItem)
         for counter in counter_list:
@@ -355,7 +361,7 @@ class MultiSourceInfoTracker:
         global_comsumed_samples = sum([item.num_samples for item in self.accumulate_counter.values()])
 
         if hasattr(self.dataloader, "update_consumed_tokens") and (
-            not get_parallel_state().tp_enabled or get_parallel_state().tp_rank == 0
+            not self.parallel_state.tp_enabled or self.parallel_state.tp_rank == 0
         ):  # update at every dp rank
             if self.boundary_type == "token":
                 self.dataloader.update_consumed_tokens((self.batch_idx, global_consumed_tokens))

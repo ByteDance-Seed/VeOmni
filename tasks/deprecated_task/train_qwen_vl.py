@@ -20,7 +20,7 @@ from veomni.data import (
 )
 from veomni.distributed.clip_grad_norm import veomni_clip_grad_norm
 from veomni.distributed.offloading import build_activation_offloading_context
-from veomni.distributed.parallel_state import get_parallel_state, init_parallel_state
+from veomni.distributed.parallel_state import build_parallel_state
 from veomni.distributed.torch_parallelize import build_parallelize_model
 from veomni.models import build_foundation_model, build_processor, save_model_assets
 from veomni.optim import build_lr_scheduler, build_optimizer
@@ -117,7 +117,7 @@ def main():
         dist_backend=args.train.accelerator.fsdp_config.fsdp_mode, ckpt_manager=args.train.checkpoint.manager
     )
 
-    init_parallel_state(
+    parallel_state = build_parallel_state(
         dp_size=args.train.accelerator.dp_size,
         dp_replicate_size=args.train.accelerator.dp_replicate_size,
         dp_shard_size=args.train.accelerator.dp_shard_size,
@@ -134,6 +134,7 @@ def main():
 
     logger.info_rank0("Prepare model")
     model = build_foundation_model(
+        parallel_state=parallel_state,
         config_path=args.model.config_path,
         weights_path=args.model.model_path,
         init_device=args.train.init_device,
@@ -161,6 +162,7 @@ def main():
     )
 
     train_dataset = build_dataset(
+        parallel_state=parallel_state,
         dataset_name=args.data.dataset_name,
         transform=transform,
         dataloader_batch_size=args.train.dataloader_batch_size,
@@ -190,6 +192,7 @@ def main():
         )
 
     train_dataloader = build_dataloader(
+        parallel_state=parallel_state,
         dataloader_type=args.data.dataloader.type,
         dataset=train_dataset,
         micro_batch_size=args.train.micro_batch_size,
@@ -224,6 +227,7 @@ def main():
 
     model = build_parallelize_model(
         model,
+        parallel_state=parallel_state,
         init_device=args.train.init_device,
         weights_path=args.model.model_path,
         enable_reshard_after_forward=args.train.accelerator.fsdp_config.reshard_after_forward,
@@ -235,6 +239,7 @@ def main():
     )
     optimizer = build_optimizer(
         model,
+        parallel_state=parallel_state,
         lr=args.train.optimizer.lr,
         weight_decay=args.train.optimizer.weight_decay,
         fused=False,
@@ -281,6 +286,7 @@ def main():
     start_epoch, start_step, global_step = 0, 0, 0
     save_checkpoint_path = None
     environ_meter = helper.EnvironMeter(
+        parallel_state=parallel_state,
         config=model_config,
         global_batch_size=args.train.global_batch_size,
         enable_multisource=args.data.enable_multisource,
@@ -367,7 +373,7 @@ def main():
                     loss: "torch.Tensor" = model(**micro_batch, use_cache=False).loss
 
                 loss_dict: Dict[str, torch.Tensor] = mean_global_loss(
-                    loss, micro_batch_token_len, micro_batches_token_len
+                    loss, micro_batch_token_len, micro_batches_token_len, parallel_state
                 )
                 loss = torch.stack(list(loss_dict.values())).sum()
                 with model_bwd_context:
@@ -376,14 +382,14 @@ def main():
                 total_loss += loss.item()
                 del micro_batch
 
-            grad_norm = veomni_clip_grad_norm(model, args.train.optimizer.max_grad_norm)
+            grad_norm = veomni_clip_grad_norm(model, args.train.optimizer.max_grad_norm, parallel_state=parallel_state)
 
             optimizer.step()
             lr_scheduler.step()
             optimizer.zero_grad()
 
             # collect mean loss across data parallel group
-            total_loss, grad_norm = all_reduce((total_loss, grad_norm), group=get_parallel_state().fsdp_group)
+            total_loss, grad_norm = all_reduce((total_loss, grad_norm), group=parallel_state.fsdp_group)
             synchronize()
             delta_time = time.time() - start_time
             lr = max(lr_scheduler.get_last_lr())

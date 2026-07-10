@@ -24,6 +24,7 @@ from veomni.data import build_multimodal_chat_template
 from veomni.data.data_transform import (
     process_sample_qwen_vl,
 )
+from veomni.distributed.parallel_state import ParallelState
 from veomni.models import build_foundation_model, build_processor
 from veomni.utils.device import get_device_type
 
@@ -139,6 +140,7 @@ def load_veomni_model(config_path, device):
     )
     print(f"\n[Setup] Building veomni model on device: {device}")
     model = build_foundation_model(
+        parallel_state=ParallelState(),
         config_path=config_path,
         weights_path=None,
         torch_dtype="bfloat16",

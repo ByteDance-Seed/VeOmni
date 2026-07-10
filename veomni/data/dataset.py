@@ -35,7 +35,7 @@ try:
 except ImportError:
     from ..utils.hdfs_io import isdir, listdir
 
-from ..distributed.parallel_state import get_parallel_state
+from ..distributed.parallel_state import ParallelState, get_parallel_state, use_parallel_state
 from ..utils import logging
 from ..utils.constants import IGNORE_INDEX
 from ..utils.dist_utils import main_process_first
@@ -47,8 +47,9 @@ logger = logging.get_logger(__name__)
 DATASET_REGISTRY = Registry("Dataset")
 
 
-def build_dataset(dataset_name: str, **kwargs) -> "Dataset":
-    return DATASET_REGISTRY[dataset_name](**kwargs)
+def build_dataset(dataset_name: str, *, parallel_state: ParallelState, **kwargs) -> "Dataset":
+    with use_parallel_state(parallel_state):
+        return DATASET_REGISTRY[dataset_name](**kwargs)
 
 
 class MappingDataset(Dataset):

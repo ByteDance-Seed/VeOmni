@@ -124,6 +124,7 @@ def _build_model(toy_path: str, ce_impl: str = "chunk_loss"):
     fp16/bf16) and pins the cross-entropy backend.
     """
     from veomni.arguments.arguments_types import OpsImplementationConfig
+    from veomni.distributed.parallel_state import ParallelState
     from veomni.models.auto import build_foundation_model
 
     ops_implementation = OpsImplementationConfig(
@@ -132,6 +133,7 @@ def _build_model(toy_path: str, ce_impl: str = "chunk_loss"):
     )
 
     return build_foundation_model(
+        parallel_state=ParallelState(),
         config_path=toy_path,
         weights_path=None,
         torch_dtype="float32",

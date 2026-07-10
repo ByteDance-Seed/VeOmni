@@ -566,6 +566,7 @@ def _single_rank_process_group():
 
 def _build_veomni_model(case, config):
     """Random-init VeOmni model — we only need forward to run, not match HF."""
+    from veomni.distributed.parallel_state import ParallelState
     from veomni.models.auto import build_foundation_model
     from veomni.ops import apply_ops_config
 
@@ -580,6 +581,7 @@ def _build_veomni_model(case, config):
     torch.manual_seed(0)
     get_torch_device().manual_seed_all(0)
     return build_foundation_model(
+        parallel_state=ParallelState(),
         config_path=config,
         weights_path=None,
         torch_dtype=case.dtype,

@@ -24,15 +24,38 @@ from veomni.distributed.parallel_state import (
 )
 from veomni.distributed.sequence_parallel import comm
 from veomni.distributed.sequence_parallel import loss as sequence_parallel_loss
+from veomni.distributed.torch_compile import CompileConfig, compile_decoder_blocks
 
 
 class _Model:
     pass
 
 
+class _ForwardModel:
+    def forward(self):
+        return get_parallel_state()
+
+
+class _ToyDecoderLayer(torch.nn.Module):
+    def forward(self, value):
+        if get_parallel_state().async_enabled and comm.get_ulysses_sequence_parallel_group() is not None:
+            return value + 1
+        return value - 1
+
+
+class _CompilableModel(torch.nn.Module):
+    _no_split_modules = ["_ToyDecoderLayer"]
+
+    def __init__(self):
+        super().__init__()
+        self.layer = _ToyDecoderLayer()
+
+    def forward(self, value):
+        return self.layer(value)
+
+
 @pytest.fixture(autouse=True)
-def _reset_parallel_state(monkeypatch):
-    monkeypatch.setattr(parallel_state_module, "_PARALLEL_STATE", None)
+def _reset_parallel_state():
     token = parallel_state_module._CURRENT_PARALLEL_STATE.set(None)
     yield
     parallel_state_module._CURRENT_PARALLEL_STATE.reset(token)
@@ -54,10 +77,35 @@ def test_model_owned_state_selects_each_model_independently():
     assert get_model_parallel_state(drafter) is drafter_state
 
 
-def test_model_context_restores_after_exception():
-    default_state = ParallelState(async_enabled=False)
+def test_bound_model_forward_activates_and_restores_owned_state():
     model_state = ParallelState(async_enabled=True)
-    parallel_state_module._PARALLEL_STATE = default_state
+    model = bind_model_parallel_state(_ForwardModel(), model_state)
+
+    assert model.forward() is model_state
+    with pytest.raises(RuntimeError, match="No ParallelState is active"):
+        get_parallel_state()
+
+
+@pytest.mark.skipif(not hasattr(torch, "compile"), reason="torch.compile required")
+def test_fullgraph_compile_captures_each_models_owned_state():
+    enabled_state = SimpleNamespace(async_enabled=True, ulysses_group=object())
+    disabled_state = SimpleNamespace(async_enabled=False, ulysses_group=None)
+    enabled_model = bind_model_parallel_state(_CompilableModel(), enabled_state)
+    disabled_model = bind_model_parallel_state(_CompilableModel(), disabled_state)
+    compile_config = CompileConfig(enable=True, backend="eager", fullgraph=True)
+
+    try:
+        assert compile_decoder_blocks(enabled_model, compile_config) == 1
+        assert compile_decoder_blocks(disabled_model, compile_config) == 1
+        value = torch.tensor(2.0)
+        torch.testing.assert_close(enabled_model(value), torch.tensor(3.0))
+        torch.testing.assert_close(disabled_model(value), torch.tensor(1.0))
+    finally:
+        torch.compiler.reset()
+
+
+def test_model_context_restores_after_exception():
+    model_state = ParallelState(async_enabled=True)
     model = bind_model_parallel_state(_Model(), model_state)
 
     with pytest.raises(RuntimeError, match="boom"):
@@ -65,7 +113,8 @@ def test_model_context_restores_after_exception():
             assert get_parallel_state() is model_state
             raise RuntimeError("boom")
 
-    assert get_parallel_state() is default_state
+    with pytest.raises(RuntimeError, match="No ParallelState is active"):
+        get_parallel_state()
 
 
 def test_resolve_prefers_explicit_then_model_then_context():
@@ -86,13 +135,15 @@ def test_unbound_model_lookup_fails_loudly():
 
 
 def test_context_state_does_not_leak_to_worker_thread():
-    default_state = ParallelState(async_enabled=False)
     model_state = ParallelState(async_enabled=True)
-    parallel_state_module._PARALLEL_STATE = default_state
+
+    def _worker_lookup():
+        with pytest.raises(RuntimeError, match="No ParallelState is active"):
+            get_parallel_state()
 
     with use_parallel_state(model_state), ThreadPoolExecutor(max_workers=1) as executor:
         assert get_parallel_state() is model_state
-        assert executor.submit(get_parallel_state).result() is default_state
+        executor.submit(_worker_lookup).result()
 
 
 def test_build_parallelize_model_binds_explicit_state(monkeypatch):
@@ -112,14 +163,20 @@ def test_build_parallelize_model_binds_explicit_state(monkeypatch):
     assert get_model_parallel_state(model) is model_state
 
 
-def test_model_context_takes_precedence_over_legacy_group_override(monkeypatch):
-    legacy_group = object()
+def test_model_context_takes_precedence_over_test_group_override():
+    test_group = object()
     model_group = object()
-    monkeypatch.setattr(comm, "_ULYSSES_SEQUENCE_PARALLEL_GROUP", {"default": legacy_group})
+    comm.set_ulysses_sequence_parallel_group(test_group)
     model = bind_model_parallel_state(_Model(), SimpleNamespace(ulysses_group=model_group))
 
     with use_model_parallel_state(model):
         assert comm.get_ulysses_sequence_parallel_group() is model_group
+    comm.set_ulysses_sequence_parallel_group(None)
+
+
+def test_production_sequence_group_lookup_requires_active_state():
+    with pytest.raises(RuntimeError, match="active model-owned ParallelState"):
+        comm.get_unified_sequence_parallel_group()
 
 
 def test_worker_collator_drops_process_group_backed_state_before_pickle():

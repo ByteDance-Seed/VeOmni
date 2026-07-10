@@ -2,6 +2,7 @@ import pytest
 import torch
 
 from veomni.data.data_collator import MainCollator
+from veomni.distributed.parallel_state import ParallelState
 from veomni.models import build_foundation_model
 from veomni.ops import apply_ops_config
 from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type
@@ -33,6 +34,7 @@ def test_qwen3_loss_match_with_padded_packed_input(monkeypatch, pad_to_length):
     torch.manual_seed(0)
 
     model = build_foundation_model(
+        parallel_state=ParallelState(),
         config_path="./tests/toy_config/qwen3_toy",
         weights_path=None,
         torch_dtype="float16",

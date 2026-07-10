@@ -26,7 +26,7 @@ import torch.distributed as dist
 from torch.distributed.tensor import DTensor, Shard
 
 from veomni.arguments.arguments_types import MixedPrecisionConfig
-from veomni.distributed.parallel_state import init_parallel_state
+from veomni.distributed.parallel_state import build_parallel_state
 from veomni.distributed.torch_parallelize import build_parallelize_model
 from veomni.optim import build_optimizer
 from veomni.optim.optimizer import MultiOptimizer
@@ -51,7 +51,7 @@ def _distributed_smoke(use_zero_comm: bool) -> None:
     rank = dist.get_rank()
     assert world_size == 4, f"this test expects exactly 4 ranks, got {world_size}"
 
-    init_parallel_state(
+    parallel_state = build_parallel_state(
         dp_size=world_size,
         dp_shard_size=world_size,
         extra_parallel_sizes=(EP_SIZE,),
@@ -75,6 +75,7 @@ def _distributed_smoke(use_zero_comm: bool) -> None:
     )
     # fused_triton MoE requires fp16/bf16 routing weights.
     model = build_foundation_model(
+        parallel_state=parallel_state,
         config_path=QWEN3_MOE_TOY_CFG,
         weights_path=None,
         torch_dtype="bfloat16",
@@ -83,6 +84,7 @@ def _distributed_smoke(use_zero_comm: bool) -> None:
     )
     model = build_parallelize_model(
         model,
+        parallel_state=parallel_state,
         init_device="meta",
         weights_path=None,
         mixed_precision=MixedPrecisionConfig(enable=False),
@@ -108,6 +110,7 @@ def _distributed_smoke(use_zero_comm: bool) -> None:
 
     optimizer = build_optimizer(
         model,
+        parallel_state=parallel_state,
         lr=1e-4,
         weight_decay=0.01,
         fused=True,

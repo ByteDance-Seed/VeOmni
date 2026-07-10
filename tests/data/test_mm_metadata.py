@@ -34,6 +34,8 @@ import os
 
 import torch
 
+from veomni.distributed.parallel_state import ParallelState
+
 
 # Bootstrap a single-rank "process group" env so collator import doesn't crash
 # on `get_parallel_state()`. Mirrors the pattern used by
@@ -77,7 +79,7 @@ def test_packing_collator_packs_grid_thw_and_invokes_hook():
         seen["sp_pad"] = sp_pad
         batch["multimodal_metadata"] = {"ok": True}
 
-    batch = PackingCollator(metadata_collate_func=hook)(
+    batch = PackingCollator(metadata_collate_func=hook, parallel_state=ParallelState())(
         [_mm_sample(16, [[1, 4, 4]]), _mm_sample(8, [[1, 2, 2], [2, 2, 2]])]
     )
     # image_grid_thw packed across the batch: (1+2, 3) = 3 image rows.
@@ -97,7 +99,7 @@ def test_packing_collator_no_hook_is_noop():
         "attention_mask": torch.ones(16, dtype=torch.long),
         "position_ids": torch.arange(16, dtype=torch.long),
     }
-    batch = PackingCollator()([sample, sample])
+    batch = PackingCollator(parallel_state=ParallelState())([sample, sample])
     assert "multimodal_metadata" not in batch
 
 

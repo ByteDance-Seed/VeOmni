@@ -31,11 +31,7 @@ from .comm import (
     get_unified_sequence_parallel_group,
     get_unified_sequence_parallel_rank,
     get_unified_sequence_parallel_world_size,
-    init_sequence_parallel,
-    set_context_parallel_group,
-    set_data_parallel_group,
     set_ulysses_sequence_parallel_group,
-    set_unified_sequence_parallel_group,
 )
 from .data import (
     gather_outputs,
@@ -54,19 +50,15 @@ from .utils import pad_tensor, unpad_tensor, vlm_images_a2a_meta
 
 
 __all__ = [
-    "init_sequence_parallel",
-    "set_data_parallel_group",
     "get_data_parallel_group",
     "get_data_parallel_rank",
     "set_ulysses_sequence_parallel_group",
     "get_ulysses_sequence_parallel_world_size",
     "get_ulysses_sequence_parallel_rank",
     "get_ulysses_sequence_parallel_group",
-    "set_context_parallel_group",
     "get_context_parallel_group",
     "get_context_parallel_rank",
     "get_context_parallel_world_size",
-    "set_unified_sequence_parallel_group",
     "get_unified_sequence_parallel_group",
     "get_unified_sequence_parallel_rank",
     "get_unified_sequence_parallel_world_size",

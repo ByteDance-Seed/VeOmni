@@ -513,6 +513,7 @@ def _build_hf_model(case: Case, config, dtype: torch.dtype):
 
 def _build_veomni_model(case: Case, config, hf_state_dict):
     """VeOmni-generated model with HF state_dict loaded."""
+    from veomni.distributed.parallel_state import ParallelState
     from veomni.models.auto import build_foundation_model
     from veomni.ops import apply_ops_config
 
@@ -529,6 +530,7 @@ def _build_veomni_model(case: Case, config, hf_state_dict):
     apply_ops_config(make_eager_ops_config(attn_implementation=case.attn_implementation))
 
     model = build_foundation_model(
+        parallel_state=ParallelState(),
         config_path=config,
         weights_path=None,
         torch_dtype=case.dtype,
@@ -768,6 +770,7 @@ def _build_veomni_model_from_disk(case: Case, config, hf_state_dict, hf_buffers,
     like ``_experts_implementation`` survive without depending on
     ``PretrainedConfig`` JSON round-trip semantics for underscored attrs.
     """
+    from veomni.distributed.parallel_state import ParallelState
     from veomni.models.auto import build_foundation_model
     from veomni.ops import apply_ops_config
 
@@ -777,6 +780,7 @@ def _build_veomni_model_from_disk(case: Case, config, hf_state_dict, hf_buffers,
     _save_hf_checkpoint(hf_state_dict, config, weights_dir)
 
     model = build_foundation_model(
+        parallel_state=ParallelState(),
         config_path=weights_dir,
         weights_path=weights_dir,
         config_kwargs=dict(case.config_overrides),

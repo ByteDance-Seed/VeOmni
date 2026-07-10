@@ -44,6 +44,7 @@ import transformers
 import yaml
 
 from veomni.arguments.arguments_types import OpsImplementationConfig
+from veomni.distributed.parallel_state import ParallelState
 from veomni.models import build_foundation_model
 from veomni.utils.device import get_device_type
 from veomni.utils.import_utils import is_transformers_version_greater_or_equal_to
@@ -161,6 +162,7 @@ def build_toy(toy_dir: str, *, ops: OpsImplementationConfig | None = None):
     if not os.path.isfile(os.path.join(cfg_path, "config.json")):
         pytest.skip(f"toy config not found: {cfg_path}")
     return build_foundation_model(
+        parallel_state=ParallelState(),
         config_path=cfg_path,
         weights_path=None,
         torch_dtype="bfloat16",

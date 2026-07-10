@@ -12,7 +12,7 @@ veomni/
 │   ├── multimodal/     Vision, audio, video preprocessing and chat templates
 │   └── diffusion/      Diffusion model data loading
 ├── distributed/        All parallelism strategies
-│   ├── parallel_state.py   init_parallel_state(), ParallelState, device mesh setup
+│   ├── parallel_state.py   build_parallel_state(), ParallelState, device mesh setup
 │   ├── torch_parallelize.py  build_parallelize_model(), parallelize_model_fsdp2()
 │   ├── parallel_plan.py    ParallelPlan for ExtraParallel (EP, embedding shard)
 │   ├── fsdp2/          FSDP2 (composable fully_shard), gradient clipping
@@ -131,7 +131,7 @@ YAML Config -> VeOmniArguments -> Trainer
 
 VeOmni uses FSDP2 exclusively.
 
-1. `build_parallel_state()` / compatibility `init_parallel_state()` -> a `ParallelState` with a global `DeviceMesh` containing named dims (`dp_shard`, `ulysses`, `cp`, etc.) + per-ExtraParallel submeshes (`[ep × ep_fsdp]`)
+1. `build_parallel_state()` -> a `ParallelState` with a `DeviceMesh` containing named dims (`dp_shard`, `ulysses`, `cp`, etc.) + per-ExtraParallel submeshes (`[ep × ep_fsdp]`)
 2. Model-specific `parallel_plan.py` -> define EP/embedding weight sharding via `ParallelPlan`
 3. `build_parallelize_model()` -> `parallelize_model_fsdp2()`:
    - `ParallelPlan.apply()` wraps EP/embedding params as DTensors on para mesh
@@ -145,7 +145,9 @@ VeOmni uses FSDP2 exclusively.
 
 `ParallelState` ownership follows the model, not the trainer. `build_parallelize_model(..., parallel_state=ps)` binds a non-serialized state reference to the returned model. Optimizer, gradient clipping, checkpoint, and data-pipeline builders accept that state explicitly. This allows one RL trainer to coordinate policy, reference, reward, and drafter models with different parallel topologies.
 
-Existing patched modeling code still calls `get_parallel_state()`. During migration, `use_model_parallel_state(model)` exposes the model-owned state through a `ContextVar` for the duration of that model's execution. The context is a compatibility bridge rather than the source of truth; new model-owned APIs should accept a `ParallelState` or process group explicitly.
+Trainer setup returns a local bootstrap state used only around model construction. The trainer does not retain a `parallel_state` attribute; once the model is bound, every downstream consumer resolves state from that model.
+
+Patched modeling code calls `get_parallel_state()` during model execution. The model's wrapped root `forward` activates its owned state through a `ContextVar` for exactly that execution. Outside model/build execution there is no default state; APIs must receive a `ParallelState` or process group explicitly.
 
 ## Config Structure
 

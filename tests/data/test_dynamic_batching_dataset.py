@@ -69,7 +69,12 @@ from veomni.data.dataset import (
     get_length_fn_by_count_mode,
 )
 from veomni.data.dynamic_batching import TextBatchingStrategy
-from veomni.distributed.parallel_state import get_parallel_state
+from veomni.distributed.parallel_state import (
+    ParallelState,
+    bind_model_parallel_state,
+    get_model_parallel_state,
+    get_parallel_state,
+)
 from veomni.trainer.base import BaseTrainer
 from veomni.trainer.callbacks import Callback, EnvironMeterCallback, TrainerState
 from veomni.utils import helper
@@ -124,7 +129,7 @@ def setup_dynamic_batching_dataset():
         dataset=iterable_dataset,
         micro_batch_seq_length=MICRO_BATCH_SEQ_LENGTH,
         ready_for_micro_batch_threshold=READY_FOR_MICRO_BATCH_THRESHOLD,
-        dynamic_batching_collate_fn=MainCollator(),
+        dynamic_batching_collate_fn=MainCollator(parallel_state=ParallelState()),
         get_length_fn=get_length_fn,
     )
 
@@ -158,7 +163,7 @@ def test_dynamic_batching_basic(shuffle, seed):
     iterable_ds = ShardedIterableDataset(size=DATASET_SIZE, shuffle=shuffle, seed=seed)
 
     # Create data collator
-    collator = MainCollator()
+    collator = MainCollator(parallel_state=ParallelState())
 
     # Create dynamic batching dataset
     dynamic_ds = DynamicBatchingSizeDataset(
@@ -298,7 +303,7 @@ def test_dynamic_batching_without_get_item():
             dataset=iterable_dataset,
             micro_batch_seq_length=MICRO_BATCH_SEQ_LENGTH,
             ready_for_micro_batch_threshold=READY_FOR_MICRO_BATCH_THRESHOLD,
-            dynamic_batching_collate_fn=MainCollator(),
+            dynamic_batching_collate_fn=MainCollator(parallel_state=ParallelState()),
             get_length_fn=get_length_fn,
             save_by_idx=True,
         )
@@ -489,7 +494,7 @@ def test_save_load_state_dict(save_by_idx):
         dataset=iterable_ds,
         micro_batch_seq_length=MICRO_BATCH_SEQ_LENGTH,
         ready_for_micro_batch_threshold=READY_FOR_MICRO_BATCH_THRESHOLD,
-        dynamic_batching_collate_fn=MainCollator(),
+        dynamic_batching_collate_fn=MainCollator(parallel_state=ParallelState()),
         get_length_fn=get_length_fn,
         save_by_idx=save_by_idx,
     )
@@ -512,7 +517,7 @@ def test_save_load_state_dict(save_by_idx):
         dataset=iterable_ds2,
         micro_batch_seq_length=MICRO_BATCH_SEQ_LENGTH,
         ready_for_micro_batch_threshold=READY_FOR_MICRO_BATCH_THRESHOLD,
-        dynamic_batching_collate_fn=MainCollator(),
+        dynamic_batching_collate_fn=MainCollator(parallel_state=ParallelState()),
         get_length_fn=get_length_fn,
         save_by_idx=save_by_idx,
     )
@@ -633,13 +638,15 @@ class TrainerTest(BaseTrainer):
         super().__init__(args)
 
     def _setup(self):
-        self.device = setup_test_distributed(self.args)
+        self.device, bootstrap_state = setup_test_distributed(self.args)
+        return bootstrap_state
 
     def _freeze_model_module(self):
         pass
 
     def _build_model(self):
         self.model = FakeModel().to(get_device_type())
+        bind_model_parallel_state(self.model, get_parallel_state())
         self.model_config = PretrainedConfig()
 
     def _build_model_assets(self):
@@ -668,6 +675,7 @@ class TrainerTest(BaseTrainer):
         dataloader_type = dataloader_kwargs.pop("type")
         dataloader_kwargs.pop("use_background_prefetcher", None)
         self.train_dataloader = build_dataloader(
+            parallel_state=get_model_parallel_state(self.model),
             dataloader_type=dataloader_type,
             dataset=self.train_dataset,
             micro_batch_size=args.train.micro_batch_size,
@@ -768,16 +776,17 @@ class CheckCallback(Callback):
         if state.global_step == 1:
             helper.print_example(example=micro_batches[0], rank=self.trainer.args.train.local_rank)
             assert 1 < len(micro_batches) <= 4, f"Unexpected micro batch count: {len(micro_batches)}"
-            if get_parallel_state().sp_enabled:
+            parallel_state = get_model_parallel_state(self.trainer.model)
+            if parallel_state.sp_enabled:
                 assert (
-                    micro_batches[0]["input_ids"].shape[-1] * get_parallel_state().sp_size
+                    micro_batches[0]["input_ids"].shape[-1] * parallel_state.sp_size
                     == micro_batches[0]["attention_mask"].shape[-1]
                 )
                 assert compare_items(
                     micro_batches[0]["attention_mask"],
-                    rank=get_parallel_state().sp_rank,
-                    group_size=get_parallel_state().sp_size,
-                    group=get_parallel_state().sp_group,
+                    rank=parallel_state.sp_rank,
+                    group_size=parallel_state.sp_size,
+                    group=parallel_state.sp_group,
                 )
 
         if state.epoch == self.trainer.save_epoch and state.curr_step > self.trainer.save_step:

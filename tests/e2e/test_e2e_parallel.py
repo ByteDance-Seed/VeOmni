@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 import torch
 
+from veomni.distributed.parallel_state import ParallelState
 from veomni.models.auto import build_foundation_model
 from veomni.utils.device import IS_NPU_AVAILABLE, get_gpu_compute_capability
 from veomni.utils.import_utils import is_diffusers_available, is_quack_gemm_available
@@ -53,6 +54,7 @@ def _materialize_weights_dir(config_path: str, output_path: str, save_original_f
     # EP=1 step-2 grad_norm diff was 0.69, blowing past the 0.1 atol+rtol envelope).
     torch.manual_seed(0)
     model = build_foundation_model(
+        parallel_state=ParallelState(),
         config_path=config_path,
         weights_path=None,
         torch_dtype="float32",

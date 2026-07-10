@@ -7,6 +7,7 @@ from torch.distributed.checkpoint.state_dict import (
     set_optimizer_state_dict,
 )
 
+from veomni.distributed.parallel_state import ParallelState
 from veomni.optim.optimizer import (
     build_optimizer,
     filter_empty_param_groups,
@@ -102,6 +103,7 @@ def test_build_optimizer_skips_empty_vlm_param_groups():
     model = _TinyModel()
     opt = build_optimizer(
         model,
+        parallel_state=ParallelState(),
         lr=2e-5,
         param_groups=[
             {"params": [], "lr": 1e-6},
@@ -133,7 +135,7 @@ def test_vlm_trainer_style_param_groups_skip_empty_vit():
 
     assert vit_params == []
     assert len(param_groups) == 1
-    opt = build_optimizer(model, lr=2e-5, param_groups=param_groups)
+    opt = build_optimizer(model, parallel_state=ParallelState(), lr=2e-5, param_groups=param_groups)
     assert len(opt.param_groups) == 1
     assert opt.param_groups[0]["lr"] == 2e-5
 
@@ -143,6 +145,7 @@ def test_vlm_style_optimizer_dcp_roundtrip_step_succeeds():
     model = _TinyModel()
     opt = build_optimizer(
         model,
+        parallel_state=ParallelState(),
         lr=2e-5,
         param_groups=[
             {"params": [], "lr": 1e-6},
@@ -163,6 +166,7 @@ def test_vlm_style_optimizer_dcp_roundtrip_step_succeeds():
     model2 = _TinyModel()
     opt2 = build_optimizer(
         model2,
+        parallel_state=ParallelState(),
         lr=2e-5,
         param_groups=[
             {"params": [], "lr": 1e-6},

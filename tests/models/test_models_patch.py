@@ -21,6 +21,11 @@ from veomni.arguments import (
 )
 from veomni.data.data_collator import MainCollator
 from veomni.distributed.clip_grad_norm import veomni_clip_grad_norm
+from veomni.distributed.parallel_state import (
+    bind_model_parallel_state,
+    get_model_parallel_state,
+    use_parallel_state,
+)
 from veomni.trainer.base import BaseTrainer, VeOmniArguments
 from veomni.utils.device import IS_NPU_AVAILABLE, empty_cache, get_device_type, synchronize
 from veomni.utils.env import get_env
@@ -210,7 +215,11 @@ class TrainerTest(BaseTrainer):
                 # HF expects feature_attention_mask (num_audios, seq_len) for indexing.
                 "feature_attention_mask": (0, False, None, None),
             }
-        self.collate_fn = MainCollator(seq_classification=False, data_collate_info=data_collate_info)
+        self.collate_fn = MainCollator(
+            seq_classification=False,
+            data_collate_info=data_collate_info,
+            parallel_state=get_model_parallel_state(self.model),
+        )
 
     def _build_dataloader(self):
         pass
@@ -263,7 +272,8 @@ class TrainerTest(BaseTrainer):
             self.args.model.ops_implementation.rotary_pos_emb_implementation = "eager"
             self.args.model.ops_implementation.cross_entropy_loss_implementation = "eager"
 
-        self._build_model()
+        with use_parallel_state(get_model_parallel_state(self.model)):
+            self._build_model()
         self._verify_opslot_state(model_mode)
         self._build_optimizer()
         self._build_lr_scheduler()
@@ -281,7 +291,9 @@ class TrainerTest(BaseTrainer):
 
         if self.model_config.model_type in ["qwen2_5_omni", "qwen3_omni_moe"]:
             self.model.disable_talker()
+            parallel_state = get_model_parallel_state(self.model)
             self.model = self.model.thinker
+            bind_model_parallel_state(self.model, parallel_state)
 
         print(f"{'-' * 10} {model_name}_{model_mode} {'-' * 10}")
         args: VeOmniArguments = self.args

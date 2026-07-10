@@ -2,6 +2,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from veomni.distributed.parallel_state import ParallelState
 from veomni.models import build_foundation_model
 from veomni.trainer.vlm_trainer import (
     VeOmniVLMArguments,
@@ -42,6 +43,7 @@ def test_freeze_vit_on_vlm_model(config_path, freeze_vit):
     # forwards.
     ops_implementation = make_eager_ops_config()
     model = build_foundation_model(
+        parallel_state=ParallelState(),
         config_path=config_path,
         weights_path=None,
         torch_dtype="float32",

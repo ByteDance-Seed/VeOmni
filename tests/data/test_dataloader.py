@@ -66,6 +66,7 @@ def test_build_dataloader_dyn_bsz_sp_filling(
     transform = partial(process_dummy_example, max_seq_len=max_seq_len)
 
     dataset = build_dataset(
+        parallel_state=ps,
         dataset_name=dataset_name,
         train_path=dummy_dataset_ci.save_path,
         transform=transform,
@@ -73,6 +74,7 @@ def test_build_dataloader_dyn_bsz_sp_filling(
     )
     dl = build_dataloader(
         "native",
+        parallel_state=ps,
         dataset=dataset,
         micro_batch_size=micro_batch_size,
         global_batch_size=global_batch_size,
@@ -114,6 +116,7 @@ def test_build_dataloader_dyn_bsz_count_mode(
     monkeypatch.setattr(m_col, "get_parallel_state", lambda: ps)
 
     dataset = build_dataset(
+        parallel_state=ps,
         dataset_name="iterable",
         train_path=dummy_dataset_ci.save_path,
         transform=partial(process_dummy_example, max_seq_len=16),
@@ -121,6 +124,7 @@ def test_build_dataloader_dyn_bsz_count_mode(
     )
     dl = build_dataloader(
         "native",
+        parallel_state=ps,
         dataset=dataset,
         micro_batch_size=2,
         global_batch_size=4,
@@ -159,6 +163,7 @@ def test_build_dataloader_dyn_bsz_physical_overflow_ratio(monkeypatch, dummy_dat
     monkeypatch.setattr(m_ds, "get_parallel_state", lambda: ps)
 
     dataset = build_dataset(
+        parallel_state=ps,
         dataset_name="iterable",
         train_path=dummy_dataset_ci.save_path,
         transform=partial(process_dummy_example, max_seq_len=16),
@@ -166,6 +171,7 @@ def test_build_dataloader_dyn_bsz_physical_overflow_ratio(monkeypatch, dummy_dat
     )
     dl = build_dataloader(
         "native",
+        parallel_state=ps,
         dataset=dataset,
         micro_batch_size=2,
         global_batch_size=4,
@@ -195,6 +201,7 @@ def test_build_dataloader_rejects_invalid_physical_overflow_ratio(monkeypatch, d
     monkeypatch.setattr(m_ds, "get_parallel_state", lambda: ps)
 
     dataset = build_dataset(
+        parallel_state=ps,
         dataset_name="iterable",
         train_path=dummy_dataset_ci.save_path,
         transform=partial(process_dummy_example, max_seq_len=16),
@@ -203,6 +210,7 @@ def test_build_dataloader_rejects_invalid_physical_overflow_ratio(monkeypatch, d
     with pytest.raises(ValueError, match="dyn_bsz_physical_overflow_ratio must be >= 1.0"):
         build_dataloader(
             "native",
+            parallel_state=ps,
             dataset=dataset,
             micro_batch_size=2,
             global_batch_size=4,
