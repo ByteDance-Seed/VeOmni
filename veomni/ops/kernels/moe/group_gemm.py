@@ -14,10 +14,11 @@
 
 import torch
 
-from ....distributed.moe import EPGroupGemm, EPMergedFc1GroupGemm, preprocess, token_pre_all2all, tokens_post_all2all
+from ....distributed.moe import EPGroupGemm, EPMergedFc1GroupGemm, dispatch_to_ep_class
 from ....distributed.parallel_state import get_parallel_state
 from ._kernels.kernel.group_gemm import group_gemm_same_mn, group_gemm_same_nk
 from ._kernels.kernel.moe import expert_histogram, moe_gather, moe_scatter
+from ._scatter import compute_expert_scatter_index
 
 
 def _apply_swiglu_clamp(fc1_1_output, fc1_2_output, swiglu_limit):
@@ -62,8 +63,10 @@ class TritonFusedMoeExpertFunction(torch.autograd.Function):
 
         # MOE Step 3-2: compute the each token's index in result
         # scatter_index shape (batch_size * sequence_len, topk)
-        # TODO(wenyawei): opt it
-        scatter_index = expert_index.flatten().argsort(stable=True).argsort().int().view(expert_index.shape)
+        # ``argsort().argsort()`` is two O(N log N) sorts back-to-back; the second
+        # is only inverting a permutation of [0..N) and can be done in O(N).
+        # ``compute_expert_scatter_index`` inlines that.
+        _, scatter_index = compute_expert_scatter_index(expert_index)
 
         # MOE Step 3-3: compute the result, select tokens by scatter_index, and put them together
         # scatter_output shape (batch_size * sequence_len * topk, hidden_size)
@@ -329,7 +332,7 @@ class MergedFc1TritonFusedMoeExpertFunction(torch.autograd.Function):
         swiglu_limit=None,
     ):
         splits = expert_histogram(expert_index, num_experts)
-        scatter_index = expert_index.flatten().argsort(stable=True).argsort().int().view(expert_index.shape)
+        _, scatter_index = compute_expert_scatter_index(expert_index)
         scatter_output = moe_scatter(hidden_states, scatter_index)
 
         cumsum_t = torch.cumsum(splits, dim=0)
@@ -539,62 +542,30 @@ def group_gemm_fused_moe_forward(
         if fc1_1_2_weight is not None:
             if fc1_1_weight is not None or fc1_2_weight is not None:
                 raise ValueError("Provide either split fc1 weights or merged fc1_1_2_weight, not both.")
-        else:
-            if fc1_1_weight is None or fc1_2_weight is None:
-                raise ValueError("EP requires split fc1 weights (fc1_1_weight and fc1_2_weight).")
-        expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=num_experts).permute(2, 1, 0)
-        # preprocess, permute token for ep
-        input_splits, output_splits, num_global_tokens_per_local_expert, num_global_sum_tokens_per_local_expert = (
-            preprocess(
-                expert_mask=expert_mask,
-                num_experts=num_experts,
-                ep_group=get_parallel_state().ep_group,
-            )
-        )
-        permute_tokens, routing_map, local_input_permutation_mapping, org_hidden_states_shape = token_pre_all2all(
-            hidden_states=hidden_states,
-            expert_mask=expert_mask,
-            num_experts=num_experts,
-            input_splits=input_splits,
-            output_splits=output_splits,
-            num_global_tokens_per_local_expert=num_global_tokens_per_local_expert,
-            ep_group=get_parallel_state().ep_group,
-        )
-
-        cumsum = torch.cumsum(num_global_sum_tokens_per_local_expert, dim=0).to(permute_tokens.device)
-
-        if fc1_1_2_weight is not None:
-            final_permute_tokens = EPMergedFc1GroupGemm.apply(
-                permute_tokens,
-                cumsum,
+            final_hidden_states = dispatch_to_ep_class(
+                EPMergedFc1GroupGemm,
+                num_experts,
+                routing_weights,
+                selected_experts,
+                hidden_states,
                 fc1_1_2_weight,
                 fc2_weight,
                 swiglu_limit,
             )
         else:
-            final_permute_tokens = EPGroupGemm.apply(
-                permute_tokens,
-                cumsum,
+            if fc1_1_weight is None or fc1_2_weight is None:
+                raise ValueError("EP requires split fc1 weights (fc1_1_weight and fc1_2_weight).")
+            final_hidden_states = dispatch_to_ep_class(
+                EPGroupGemm,
+                num_experts,
+                routing_weights,
+                selected_experts,
+                hidden_states,
                 fc1_1_weight,
                 fc1_2_weight,
                 fc2_weight,
                 swiglu_limit,
             )
-
-        # unpermute with routing_weight
-        final_hidden_states = tokens_post_all2all(
-            expert_outputs=final_permute_tokens,
-            routing_weights=routing_weights,
-            selected_experts=selected_experts,
-            num_experts=num_experts,
-            input_splits=input_splits,
-            output_splits=output_splits,
-            num_global_tokens_per_local_expert=num_global_tokens_per_local_expert,
-            routing_map=routing_map,
-            local_input_permutation_mapping=local_input_permutation_mapping,
-            org_hidden_states_shape=org_hidden_states_shape,
-            ep_group=get_parallel_state().ep_group,
-        )
     else:
         if fc1_1_2_weight is not None:
             if fc1_1_weight is not None or fc1_2_weight is not None:

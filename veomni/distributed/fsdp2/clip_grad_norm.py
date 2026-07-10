@@ -1,3 +1,4 @@
+import itertools
 import math
 from typing import List
 
@@ -110,9 +111,33 @@ def extra_parallel_fsdp2_clip_grad_norm(
         for para in ps.extra_parallel_names
     }
 
-    # Build param groups for ExtraParallel params and non-ExtraParallel params (filter out params without grads)
+    # ``LoraSharedExperts`` Mode-2 LoRA params live on the same inner ``ep_fsdp``
+    # FSDP mesh as the EP-sharded base experts (the optimizer cannot place them
+    # in the ``non_extra_parallel`` bucket without crossing meshes — see the
+    # comment near ``_ep_replicated_lora_param_ids`` in
+    # ``veomni/optim/optimizer.py``), but they are *replicated* across the EP
+    # group rather than EP-sliced. Including them in the EP-mesh all-reduce path
+    # below would sum their squared norms once per EP rank, inflating the global
+    # grad norm by ~``sqrt(ep_size)`` for the shared-LoRA bucket and breaking
+    # EP=1/EP=N grad-norm parity. Split them off into a separate
+    # ``extra_parallel_replicated_params`` bucket whose reduction skips the
+    # ``ep`` group (only the ``ep_fsdp`` reduction stays — that one is a no-op
+    # at ``ep_fsdp_size=1`` but is the right shape if it grows in the future).
+    ep_replicated_ids: set[int] = getattr(model, "_ep_replicated_lora_param_ids", set())
     extra_parallel_params = {
-        para: [p for p in model._extra_parallel_param_groups.get(para, []) if p.grad is not None]
+        para: [
+            p
+            for p in model._extra_parallel_param_groups.get(para, [])
+            if p.grad is not None and id(p) not in ep_replicated_ids
+        ]
+        for para in ps.extra_parallel_names
+    }
+    extra_parallel_replicated_params = {
+        para: [
+            p
+            for p in model._extra_parallel_param_groups.get(para, [])
+            if p.grad is not None and id(p) in ep_replicated_ids
+        ]
         for para in ps.extra_parallel_names
     }
     non_extra_parallel_params: List[torch.nn.Parameter] = [
@@ -150,16 +175,54 @@ def extra_parallel_fsdp2_clip_grad_norm(
             extra_parallel_total[para] = para_total
             logger.debug_rank0(f"{para} total grad norm: {para_total}")
 
+    # Replicated-across-Para subgroup (currently only Mode-2 shared LoRA on the
+    # ``ep`` mesh): reduce ONLY across para_fsdp -- skipping the ``para`` (e.g.
+    # ``ep``) reduction prevents double-counting since every Para rank holds the
+    # same gradient.
+    extra_parallel_replicated_total = {
+        para: torch.tensor(0.0, device=torch.device(get_device_type()), dtype=torch.float32)
+        for para in ps.extra_parallel_names
+    }
+    for para in ps.extra_parallel_names:
+        if len(extra_parallel_replicated_params[para]) > 0:
+            para_total = _fsdp2_reduce_group(
+                params=extra_parallel_replicated_params[para],
+                norm_type=norm_type,
+                reduce_groups=[
+                    (f"{para}_fsdp", extra_parallel_fsdp_group[para]),
+                ],
+            )
+            extra_parallel_replicated_total[para] = para_total
+            logger.debug_rank0(f"{para} replicated total grad norm: {para_total}")
+
     if math.isinf(norm_type):
-        total_norm = torch.maximum(non_extra_parallel_total, *extra_parallel_total.values())
+        # ``torch.maximum`` is a 2-arg elementwise op, not variadic. Unpacking
+        # ``*extra_parallel_total.values(), *extra_parallel_replicated_total.values()``
+        # silently worked only when the combined dict size was 1 (single
+        # ``extra_parallel_names`` entry + only one of the two buckets
+        # populated). Reduce iteratively so the path holds for any number
+        # of parallelism axes (``ep`` + ``emb`` + ...) and for the Mode-2
+        # shared-LoRA case where both ``extra_parallel_total["ep"]`` and
+        # ``extra_parallel_replicated_total["ep"]`` are populated.
+        total_norm = non_extra_parallel_total
+        for t in itertools.chain(extra_parallel_total.values(), extra_parallel_replicated_total.values()):
+            total_norm = torch.maximum(total_norm, t)
     else:
-        total_norm = _finalize_total_norm(non_extra_parallel_total + sum(extra_parallel_total.values()), norm_type)
+        total_norm = _finalize_total_norm(
+            non_extra_parallel_total
+            + sum(extra_parallel_total.values())
+            + sum(extra_parallel_replicated_total.values()),
+            norm_type,
+        )
 
     _raise_if_nonfinite(total_norm, norm_type, error_if_nonfinite)
 
-    # Apply the same clip coefficient to both groups
+    # Apply the same clip coefficient to all groups
     for para in ps.extra_parallel_names:
         torch.nn.utils.clip_grads_with_norm_(extra_parallel_params[para], max_norm, total_norm, foreach=foreach)
+        torch.nn.utils.clip_grads_with_norm_(
+            extra_parallel_replicated_params[para], max_norm, total_norm, foreach=foreach
+        )
     torch.nn.utils.clip_grads_with_norm_(non_extra_parallel_params, max_norm, total_norm, foreach=foreach)
 
     return total_norm

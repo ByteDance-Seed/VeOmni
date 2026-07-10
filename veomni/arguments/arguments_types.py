@@ -406,6 +406,23 @@ class CheckpointConfig:
         default=False,
         metadata={"help": "Whether to save checkpoint asynchronously."},
     )
+    dcp_save_to_lowest_rank: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Route each replicated DCP shard to the lowest global rank that holds it, instead "
+                "of load-balancing writes across all replica holders. Useful on a non-shared "
+                "filesystem (each node writes to local disk): it concentrates the deduplicated copy "
+                "onto the lowest-ranked replica group instead of scattering writes across all "
+                "replicas. In the standard HSDP layout (FSDP shard within a node, replication "
+                "across nodes) that lowest replica group lives on one node, so that node holds a "
+                "complete checkpoint. Only affects replicated data (the FSDP/HSDP replicate dim); "
+                "unique expert/tensor/pipeline-parallel shards are never deduplicated and stay "
+                "distributed. Trades write parallelism for locality, so leave False when output_dir "
+                "is shared."
+            )
+        },
+    )
     load_path: Optional[str] = field(
         default=None,
         metadata={"help": "Path to checkpoint to resume from."},
@@ -429,6 +446,38 @@ class CheckpointConfig:
     save_hf_weights: bool = field(
         default=True,
         metadata={"help": "Save the huggingface format weights to the last checkpoint dir."},
+    )
+
+
+@dataclass
+class TorchCompileConfig:
+    """train.torch_compile.* — Per-block torch.compile options."""
+
+    enable: bool = field(
+        default=False,
+        metadata={"help": "Enable per-block torch.compile for FSDP2 text training."},
+    )
+    backend: Optional[str] = field(
+        default="inductor",
+        metadata={"help": "Backend passed to torch.compile."},
+    )
+    mode: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Mode passed to torch.compile. Leave as None to use the inductor default. "
+                "'reduce-overhead' enables CUDA Graphs on the inductor backend and requires "
+                "train.accelerator.fsdp_config.reshard_after_forward=False."
+            )
+        },
+    )
+    fullgraph: bool = field(
+        default=True,
+        metadata={"help": "Whether to pass fullgraph=True to torch.compile."},
+    )
+    dynamic: bool = field(
+        default=False,
+        metadata={"help": "Whether to pass dynamic=True to torch.compile."},
     )
 
 
@@ -503,6 +552,12 @@ class TrainingArguments:
             "help": "When enabled, only rank0 reads model weights from HuggingFace safetensor from disk. Other ranks would receive weights through broadcast. This helps to avoid disk I/O bottleneck."
         },
     )
+    ep_sharded_stream_load: bool = field(
+        default=False,
+        metadata={
+            "help": "Opt-in fast/low-memory weight loader for large MoE checkpoints: each rank reads only its ExtraParallel dim-0 slice of the expert tensors straight from the checkpoint. Requires the every-rank-reads path (`broadcast_model_weights_from_rank0=False`) and a model with an ExtraParallel parallel_plan; unsupported model/checkpoint combinations raise `NotImplementedError`."
+        },
+    )
     enable_full_determinism: bool = field(
         default=False,
         metadata={"help": "Enable full determinism."},
@@ -531,10 +586,6 @@ class TrainingArguments:
         default=42,
         metadata={"help": "Random seed."},
     )
-    enable_compile: bool = field(
-        default=False,
-        metadata={"help": "Enable torch compile."},
-    )
     max_steps: Optional[int] = field(
         default=None,
         metadata={"help": "Max training steps per epoch. (for debug)"},
@@ -555,6 +606,7 @@ class TrainingArguments:
     wandb: WandbConfig = field(default_factory=WandbConfig)
     profile: ProfileConfig = field(default_factory=ProfileConfig)
     gradient_checkpointing: GradientCheckpointingConfig = field(default_factory=GradientCheckpointingConfig)
+    torch_compile: TorchCompileConfig = field(default_factory=TorchCompileConfig)
     accelerator: AcceleratorConfig = field(default_factory=AcceleratorConfig)
     checkpoint: CheckpointConfig = field(default_factory=CheckpointConfig)
 
@@ -631,6 +683,14 @@ class TrainingArguments:
                     "used with train.accelerator.fsdp_config.fsdp_mode='fsdp2'. "
                     f"Received fsdp_mode={acc.fsdp_config.fsdp_mode!r}. Disable this flag or switch to fsdp2.",
                 )
+
+        # ep_sharded_stream_load only runs on the every-rank-reads path, so it is
+        # mutually exclusive with broadcast_model_weights_from_rank0. Fail early
+        # instead of silently ignoring the flag.
+        assert not (self.ep_sharded_stream_load and self.broadcast_model_weights_from_rank0), (
+            "train.ep_sharded_stream_load requires train.broadcast_model_weights_from_rank0=False "
+            "(it reads each rank's ExtraParallel slice directly and cannot run on the broadcast path)."
+        )
 
     def _derive_batch_config(self):
         acc = self.accelerator
@@ -763,9 +823,10 @@ class OpsImplementationConfig:
       ``chunk_gated_delta_rule``. These OpSlots only exist in Qwen3.5's
       patched modeling module, so config-parse-time validation would force
       every NPU user to override them even when training non-Qwen3.5 models.
-      The kernel's ``HardwareRequirement`` raises if a non-eager value is
-      requested on NPU; the varlen (``dyn_bsz=True``) caveat is documented
-      in the field metadata.
+      All three ship both a GPU (``fla``) and an NPU (``npu``) backend; the
+      kernel's ``HardwareRequirement`` raises only when the requested value has
+      no backend for the current hardware. The varlen (``dyn_bsz=True``) caveat
+      is documented in the field metadata.
 
     Backends: ``"eager"`` (HF reference, always available),
     ``"liger_kernel"`` (GPU, needs ``liger-kernel``), ``"npu"`` (Ascend),
@@ -851,7 +912,9 @@ class OpsImplementationConfig:
             "'fla' (default) uses fla.modules.convolution.causal_conv1d (requires flash-linear-attention, GPU). "
             "'eager' leaves causal_conv1d_fn unset; the varlen training path then raises "
             "because no torch fallback handles cu_seqlens. "
-            "Qwen3.5 has no NPU backend today — selecting any non-eager value on NPU raises at OpSlot bind time."
+            "'npu' uses the vendored Triton kernel (requires triton-ascend, NPU). "
+            "Only affects varlen (dyn_bsz) training; a non-eager value on hardware without a "
+            "matching backend raises at OpSlot bind time."
         },
     )
     chunk_gated_delta_rule_implementation: str = field(
@@ -863,7 +926,8 @@ class OpsImplementationConfig:
             "no Ampere/Ada below or Blackwell above; SM10x wheels are WIP upstream). "
             "'eager' uses transformers' torch_chunk_gated_delta_rule, which does NOT support "
             "cu_seqlens; varlen training therefore raises at runtime. "
-            "Qwen3.5 has no NPU backend today — selecting any non-eager value on NPU raises at OpSlot bind time."
+            "'npu' uses the vendored Triton kernel (requires triton-ascend, NPU). "
+            "A non-eager value on hardware without a matching backend raises at OpSlot bind time."
         },
     )
     dsa_indexer_backend: Literal["eager", "cudnn"] = field(
@@ -1136,6 +1200,8 @@ class DataloaderConfig:
 class DataArguments:
     """data.* — Dataset paths, tokenization, and batching."""
 
+    supports_torch_compile = True
+
     train_path: str = field(
         metadata={"help": "Local path/HDFS path of the training data. Use comma to separate multiple datasets."},
     )
@@ -1237,6 +1303,24 @@ class VeOmniArguments:
             else:
                 self.train.pad_to_length = self.train.micro_batch_size * self.data.max_seq_len
                 logger.info_rank0(f"set pad_to_length = micro_batch_size * max_seq_len = {self.train.pad_to_length}")
+
+        if self.train.torch_compile.enable:
+            if not getattr(self.data, "supports_torch_compile", True):
+                raise ValueError(
+                    "train.torch_compile.enable currently supports text trainers only. "
+                    "Multimodal/DiT/Omni data pipelines do not implement pad_to_length for static packed shapes yet."
+                )
+            if self.data.data_type not in ("plaintext", "conversation", "classification", "dpo"):
+                raise ValueError(
+                    "train.torch_compile.enable currently supports text data only; "
+                    f"got data.data_type={self.data.data_type!r}."
+                )
+            if not self.train.dyn_bsz or not self.train.pad_to_length:
+                raise ValueError(
+                    "train.torch_compile.enable requires train.dyn_bsz=True and train.pad_to_length=True. "
+                    "Variable packed lengths trigger recompilation and prevent stable CUDA Graph replay when enabled; "
+                    "see https://github.com/ByteDance-Seed/VeOmni/issues/401."
+                )
 
     def compute_train_steps(self, dataset_length: Optional[int] = None):
         if self.train.dyn_bsz:

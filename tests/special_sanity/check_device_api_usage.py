@@ -46,12 +46,16 @@ CUDA_KEYWORD_CHECK_WHITELIST = [
     "veomni/ops/kernels/moe/_kernels/utils/device.py",
     "tests/special_sanity/check_device_api_usage.py",
     "tests/tools/common_utils.py",
-    "veomni/utils/lora_utils.py",
     # Implicit-CUDA-sync gate. Calls ``torch.cuda.{get,set}_sync_debug_mode``
     # directly because the API is intrinsically CUDA-only and has no
     # ``veomni.utils.device`` equivalent; the test is gated on
     # ``IS_CUDA_AVAILABLE`` so it skips on non-CUDA hosts.
     "tests/models/test_model_forward_no_implicit_sync.py",
+    # Vendored Ascend Triton kernels for Qwen3.5 gated delta-rule (FLA + Huawei
+    # port) are kept byte-identical to upstream; the FLA-origin code references
+    # ``.cuda`` in fallback/util paths. Excluded wholesale, matching the ruff
+    # exclude in pyproject.toml.
+    "veomni/ops/kernels/gated_delta_rule/_ascend/",
 ]
 
 # directory or file path must contain keyword "nccl"

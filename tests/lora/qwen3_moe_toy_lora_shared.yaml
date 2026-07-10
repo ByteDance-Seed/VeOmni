@@ -1,0 +1,51 @@
+# Trainer-shaped LoRA config for the Qwen3-MoE toy -- Mode 2 (shared LoRA
+# across experts). Consumed by:
+#
+#   * tests/lora/test_moe_lora_trainer.py     (save/load/resume round-trip)
+#   * tests/lora/test_moe_lora_ep2.py         (EP=2 trainer integration +
+#       EP=2 save / cross-EP adapter resume / EP=2 DCP round-trip parallel
+#       alignment)
+#
+# Identical to ``qwen3_moe_toy_lora_independent.yaml`` except
+# ``share_expert_lora: true``; see that file for context on why we ship
+# one yaml per mode.
+model:
+  config_path: tests/toy_config/qwen3_moe_toy/config.json
+  ops_implementation:
+    attn_implementation: flash_attention_2
+    moe_implementation: eager
+    cross_entropy_loss_implementation: eager
+    rms_norm_implementation: eager
+    swiglu_mlp_implementation: eager
+    rotary_pos_emb_implementation: eager
+  lora_config:
+    rank: 8
+    alpha: 16
+    use_rslora: false
+    lora_modules:
+      - q_proj
+      - v_proj
+    target_parameters:
+      - model.layers.*.mlp.experts.gate_up_proj
+      - model.layers.*.mlp.experts.down_proj
+    share_expert_lora: true
+
+data:
+  train_path: dummy
+  max_seq_len: 128
+
+train:
+  seed: 42
+  accelerator:
+    fsdp_config:
+      fsdp_mode: fsdp2
+  init_device: meta
+  global_batch_size: 4
+  micro_batch_size: 1
+  max_steps: 4
+  checkpoint:
+    output_dir: /tmp/test_moe_lora_saveload
+    save_steps: 2
+    save_hf_weights: true
+    hf_save_steps: 2
+    manager: dcp

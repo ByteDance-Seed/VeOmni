@@ -40,6 +40,7 @@ MAX_PIXELS = 768 * 28 * 28
 
 @dataclass
 class MyDataArguments(DataArguments):
+    supports_torch_compile = False
     max_image_nums: Optional[int] = field(
         default=None,
         metadata={"help": "The max number of images in the sample."},

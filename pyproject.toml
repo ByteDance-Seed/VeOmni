@@ -280,6 +280,7 @@ legacy_patches_prefix = "veomni.models.transformers.qwen3.patches"
 target-version = "py311"
 line-length = 119
 indent-width = 4
+extend-exclude = ["veomni/ops/kernels/gated_delta_rule/_ascend"]
 
 [tool.ruff.lint]
 ignore = ["B905", "C901", "E501", "E741", "W605", "C408"]
@@ -292,6 +293,7 @@ select = ["B", "C", "E", "F", "I", "W"]
 # string literals until patchgen materializes them into the generated file.
 "veomni/models/transformers/**/generated/*.py" = ["E402", "B007"]
 "veomni/models/transformers/**/*_patch_gen_config.py" = ["F821"]
+"veomni/ops/kernels/gated_delta_rule/_ascend/**" = ["I001", "W291", "W292", "W293", "F401", "F811", "F841", "B028"]
 
 [tool.ruff.lint.isort]
 lines-after-imports = 2
