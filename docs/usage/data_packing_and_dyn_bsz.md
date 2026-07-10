@@ -85,6 +85,10 @@ Example fixed batch size = 2 samples:
 `pad_to_length` can pad the packed sequence to a fixed length. This is useful to avoid uneven lengths that can trigger kernel recompilation.
 - Related GitHub issue: [#402](https://github.com/ByteDance-Seed/VeOmni/issues/402)
 `pad_to_length` is useful only when `dyn_bsz` = True, all the packed sequences in a batch will be padded to the `max_seq_len`.
+It is also required when `train.torch_compile.enable=True`, because per-block
+`torch.compile` needs stable packed shapes to avoid repeated recompilation. If
+CUDA Graphs are explicitly enabled, stable shapes are also required for useful
+graph replay.
 
 Important details:
 

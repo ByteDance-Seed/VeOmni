@@ -132,6 +132,7 @@ class DiTModelArguments(ModelArguments):
 
 @dataclass
 class DiTDataArguments(DataArguments):
+    supports_torch_compile = False
     mm_configs: Optional[Dict] = field(
         default_factory=dict,
         metadata={"help": "Config for multimodal input."},

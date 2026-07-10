@@ -141,6 +141,7 @@ class CheckpointerCallback(Callback):
             ckpt_state,
             save_async=args.train.checkpoint.save_async,
             trainable_only=bool(getattr(args.model, "lora_config", None)),
+            save_to_lowest_rank=args.train.checkpoint.dcp_save_to_lowest_rank,
         )
 
         # Empty cache and barrier

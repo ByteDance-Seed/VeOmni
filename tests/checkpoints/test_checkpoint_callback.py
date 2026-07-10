@@ -25,6 +25,7 @@ def _make_mock_trainer(save_path="/tmp/test_ckpt", save_async=False):
         save_async=save_async,
         load_path=None,
         manager="dcp",
+        dcp_save_to_lowest_rank=False,
         save_hf_weights=True,
         hf_save_steps=5,
         hf_save_epochs=1,

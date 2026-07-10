@@ -27,6 +27,7 @@ from ..data.data_collator import PostCollator
 from ..distributed.clip_grad_norm import veomni_clip_grad_norm
 from ..distributed.parallel_state import get_parallel_state
 from ..distributed.sequence_parallel import gather_outputs
+from ..distributed.torch_compile import mark_compile_step_begin
 from ..distributed.torch_parallelize import build_parallelize_model
 from ..models import build_foundation_model, build_tokenizer
 from ..ops.batch_invariant_ops import set_batch_invariant_mode
@@ -38,7 +39,55 @@ from .base import BaseTrainer, VeOmniIter
 
 logger = logging.get_logger(__name__)
 
-_NON_MODEL_KEYS = {"labels"}
+_NON_MODEL_KEYS = set()
+
+
+def _build_dpo_labels_list(
+    all_labels: torch.Tensor,
+    seq_lens: List[int],
+    sp_enabled: bool,
+) -> List[torch.Tensor]:
+    """Split the packed label tensor into per-segment mask targets.
+
+    DPO packs each preference pair as two adjacent segments
+    ``[chosen | rejected]``; multiple pairs are packed together. Aligning
+    the mask to per-token log-probs depends on whether SP is active:
+
+    * SP off — ``SequenceParallelCollator`` does not run; labels are
+      *unshifted*. Apply the causal shift per segment and pad the trailing
+      slot with ``IGNORE_INDEX``.
+    * SP on — ``SequenceParallelCollator`` already applied a single global
+      shift across the packed sequence, so naive slicing leaves each
+      segment's tail label holding the *next* segment's head token
+      (chosen tail = rejected head). That position would leak the wrong
+      target into ``loss_mask`` and pull cross-segment content into the
+      chosen / rejected log-prob sums. Force the trailing slot of every
+      segment to ``IGNORE_INDEX`` to mask the boundary.
+
+    Args:
+        all_labels: flat ``[sum(seq_lens)]`` label tensor, already gathered
+            back from SP ranks by the caller when ``sp_enabled``.
+        seq_lens: per-segment token counts, in order.
+        sp_enabled: whether the SP path applied a global shift upstream.
+
+    Returns:
+        A list of per-segment label tensors, each of length ``seq_lens[i]``,
+        with the segment boundary masked to ``IGNORE_INDEX``.
+    """
+    labels_list: List[torch.Tensor] = []
+    offset = 0
+    if sp_enabled:
+        for sl in seq_lens:
+            seg = all_labels[offset : offset + sl].clone()
+            seg[-1] = IGNORE_INDEX
+            labels_list.append(seg)
+            offset += sl
+    else:
+        for sl in seq_lens:
+            seq_labels = all_labels[offset : offset + sl]
+            labels_list.append(F.pad(seq_labels[1:], (0, 1), value=IGNORE_INDEX))
+            offset += sl
+    return labels_list
 
 
 # ================================ DPO Arguments ======================================
@@ -238,23 +287,16 @@ class TextDPOTrainer:
             log_probs_packed = log_probs_packed[: sum(seq_lens)]
         log_probs_list = list(log_probs_packed.split(seq_lens, dim=0))
 
-        # Reuse the same SP-on / SP-off label mask construction as
-        # before — the kernel's per-token output is aligned to the
-        # original label positions (zero at the trailing pad), so
-        # masking with the per-sequence shifted IGNORE_INDEX boundary
-        # is correct.
+        # Build per-segment label targets aligned to the kernel's per-token
+        # log-probs. ``_build_dpo_labels_list`` handles both SP-on (segment
+        # boundary masking against the global shift) and SP-off (per-segment
+        # causal shift with IGNORE_INDEX trailing pad) — see helper docstring.
         if self.sp_enabled:
             all_labels = gather_outputs(micro_batch["labels"], gather_dim=-1, group=get_parallel_state().sp_group)
             all_labels = all_labels.view(-1)[: sum(seq_lens)]
-            labels_list = list(all_labels.split(seq_lens))
         else:
             all_labels = micro_batch["labels"].view(-1)
-            offset = 0
-            labels_list = []
-            for sl in seq_lens:
-                seq_labels = all_labels[offset : offset + sl]
-                labels_list.append(F.pad(seq_labels[1:], (0, 1), value=IGNORE_INDEX))
-                offset += sl
+        labels_list = _build_dpo_labels_list(all_labels, seq_lens, self.sp_enabled)
 
         average_log_prob = getattr(self.base.args, "dpo_config", None) and self.base.args.dpo_config.average_log_prob
         all_logps: List[torch.Tensor] = []
@@ -345,6 +387,7 @@ class TextDPOTrainer:
 
         num_micro_steps = len(micro_batches)
         for micro_step, micro_batch in enumerate(micro_batches):
+            mark_compile_step_begin(getattr(self.base.model, "_veomni_compile_uses_cuda_graphs", False))
             self.base.model_reshard(micro_step, num_micro_steps)
             loss, loss_dict = self.forward_backward_step(micro_batch)
 
