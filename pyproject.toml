@@ -57,12 +57,11 @@ gpu = [
   # `cutedsl` extra because it pins nvidia-cutlass-dsl==4.5.0, which conflicts with FA4.
   "nvidia-cudnn-frontend>=1.24.0",
   "cuda-python==13.0.3",
-  # See `[tool.uv.sources]` — FA2 (cp311/cp312), FA3 (sm90 abi3), and
-  # FlashMLA (cp311/cp312 sm90a/sm100f) install from prebuilt wheels;
-  # flash-qla source-builds from git.
-  "flash-attn",
-  "flash-attn-3",
-  "flash-mla",
+  # See `[tool.uv.sources]` — FA2 is x86_64-only; FA3 and FlashMLA support
+  # x86_64/aarch64. flash-qla source-builds from git.
+  "flash-attn; sys_platform == 'linux' and platform_machine == 'x86_64'",
+  "flash-attn-3; sys_platform == 'linux' and (platform_machine == 'aarch64' or platform_machine == 'x86_64')",
+  "flash-mla; sys_platform == 'linux' and (platform_machine == 'aarch64' or platform_machine == 'x86_64')",
   # 4.0.0b16 is available from PyPI; newer fa4-v4.0.0.beta17 is tag-only
   # and not yet published as a package release.
   "flash-attn-4==4.0.0b16",
@@ -72,7 +71,8 @@ gpu = [
   "quack-kernels[cu13]==0.5.0",
   "torch-c-dlpack-ext",
   "apache-tvm-ffi==0.1.9",
-  "av>=14.3.0,<15.0; python_version == '3.11'",
+  "av>=14.3.0,<15.0; python_version == '3.11' and platform_machine == 'x86_64'",
+  "av>=14.2.0,<14.3; python_version == '3.11' and platform_machine == 'aarch64'",
   "av>=14.0.0,<14.3; python_version == '3.12'",
   "librosa>=0.11.0,<0.12",
   "soundfile>=0.13.1,<0.14",
@@ -189,20 +189,30 @@ conflicts = [
 
 [tool.uv.sources]
 patchgen = { path = "patchgen-pkg", editable = true }
-# Direct wheel URL for gpu — pytorch index sometimes resolves cu128_full wheels
+# Direct wheel URLs for gpu — pytorch index sometimes resolves cu128_full wheels
 # that drop nvidia-* deps and confuse uv into uninstalling them. Update both
-# 3.11 and 3.12 URLs when bumping torch.
+# Python versions and architectures when bumping torch.
 torch = [
   { index = "pytorch", extra = "npu" },
   { url = "https://files.pythonhosted.org/packages/58/fe/334225e6330e672b36aef23d77451fa906ea12881570c08638a91331a212/torch-2.9.0-cp311-cp311-manylinux_2_28_aarch64.whl", extra = 'npu_aarch64', marker = "python_version == '3.11'" },
   { url = "https://files.pythonhosted.org/packages/d1/d3/3985739f3b8e88675127bf70f82b3a48ae083e39cda56305dbd90398fec0/torch-2.9.0-cp312-cp312-manylinux_2_28_aarch64.whl", extra = 'npu_aarch64', marker = "python_version == '3.12'" },
-  { url = "https://download.pytorch.org/whl/cu130/torch-2.11.0%2Bcu130-cp311-cp311-manylinux_2_28_x86_64.whl", extra = 'gpu', marker = "python_version == '3.11'" },
-  { url = "https://download.pytorch.org/whl/cu130/torch-2.11.0%2Bcu130-cp312-cp312-manylinux_2_28_x86_64.whl", extra = 'gpu', marker = "python_version == '3.12'" },
+  { url = "https://download.pytorch.org/whl/cu130/torch-2.11.0%2Bcu130-cp311-cp311-manylinux_2_28_aarch64.whl", extra = 'gpu', marker = "sys_platform == 'linux' and python_version == '3.11' and platform_machine == 'aarch64'" },
+  { url = "https://download.pytorch.org/whl/cu130/torch-2.11.0%2Bcu130-cp312-cp312-manylinux_2_28_aarch64.whl", extra = 'gpu', marker = "sys_platform == 'linux' and python_version == '3.12' and platform_machine == 'aarch64'" },
+  { url = "https://download.pytorch.org/whl/cu130/torch-2.11.0%2Bcu130-cp311-cp311-manylinux_2_28_x86_64.whl", extra = 'gpu', marker = "sys_platform == 'linux' and python_version == '3.11' and platform_machine == 'x86_64'" },
+  { url = "https://download.pytorch.org/whl/cu130/torch-2.11.0%2Bcu130-cp312-cp312-manylinux_2_28_x86_64.whl", extra = 'gpu', marker = "sys_platform == 'linux' and python_version == '3.12' and platform_machine == 'x86_64'" },
 ]
 torchvision = { index = "pytorch" }
 torchaudio = { index = "pytorch" }
-# FA2 + FA3 use prebuilt wheels hosted by @Luosuu, ABI-aligned with our
-# torch 2.11.0+cu130 cxx11abi=true stack:
+torchcodec = [
+  { url = "https://download.pytorch.org/whl/cu130/torchcodec-0.12.0%2Bcu130-cp311-cp311-manylinux_2_28_aarch64.whl", extra = "gpu", marker = "sys_platform == 'linux' and python_version == '3.11' and platform_machine == 'aarch64'" },
+  { url = "https://download.pytorch.org/whl/cu130/torchcodec-0.12.0%2Bcu130-cp312-cp312-manylinux_2_28_aarch64.whl", extra = "gpu", marker = "sys_platform == 'linux' and python_version == '3.12' and platform_machine == 'aarch64'" },
+  { url = "https://download.pytorch.org/whl/cu130/torchcodec-0.12.0%2Bcu130-cp311-cp311-manylinux_2_28_x86_64.whl", extra = "gpu", marker = "sys_platform == 'linux' and python_version == '3.11' and platform_machine == 'x86_64'" },
+  { url = "https://download.pytorch.org/whl/cu130/torchcodec-0.12.0%2Bcu130-cp312-cp312-manylinux_2_28_x86_64.whl", extra = "gpu", marker = "sys_platform == 'linux' and python_version == '3.12' and platform_machine == 'x86_64'" },
+]
+# FA2 + x86_64 FA3 use prebuilt wheels hosted by @Luosuu, ABI-aligned with
+# our torch 2.11.0+cu130 cxx11abi=true stack. aarch64 FA3 comes from the
+# official PyTorch cu130 index (manylinux_2_34, so aarch64 requires glibc 2.34+),
+# and FlashMLA has @Luosuu wheels for both arches:
 #   - FA2 cp311 (v0.0.3) and cp312 (v0.0.5), both sm80/89/90/100 — covers
 #     Ampere/Ada/Hopper/Blackwell on NGC25.11 (cp312) and cp311 local dev.
 #   - FA3 cp310-abi3 sm90 (v0.0.5) — abi3 loads on cp310+. Non-Hopper users
@@ -210,15 +220,18 @@ torchaudio = { index = "pytorch" }
 #     veomni/ops/kernels/attention/__init__.py), so sm90-only is no-loss.
 # FA4 4.0.0b16 is resolved from PyPI.
 flash-attn = [
-    { url = "https://github.com/Luosuu/flash-attention3-wheels/releases/download/v0.0.3/flash_attn-2.8.4+20260608.cu130torch2110cxx11abitrue.bc58ab.sm80sm89sm90sm100-cp311-cp311-linux_x86_64.whl", marker = "extra == 'gpu' and python_version == '3.11'" },
-    { url = "https://github.com/Luosuu/flash-attention3-wheels/releases/download/v0.0.5/flash_attn-2.8.4+20260610.cu130torch2110cxx11abitrue.fb02fc.sm80sm89sm90sm100-cp312-cp312-linux_x86_64.whl", marker = "extra == 'gpu' and python_version == '3.12'" },
+  { url = "https://github.com/Luosuu/flash-attention3-wheels/releases/download/v0.0.3/flash_attn-2.8.4+20260608.cu130torch2110cxx11abitrue.bc58ab.sm80sm89sm90sm100-cp311-cp311-linux_x86_64.whl", marker = "extra == 'gpu' and sys_platform == 'linux' and python_version == '3.11' and platform_machine == 'x86_64'" },
+  { url = "https://github.com/Luosuu/flash-attention3-wheels/releases/download/v0.0.5/flash_attn-2.8.4+20260610.cu130torch2110cxx11abitrue.fb02fc.sm80sm89sm90sm100-cp312-cp312-linux_x86_64.whl", marker = "extra == 'gpu' and sys_platform == 'linux' and python_version == '3.12' and platform_machine == 'x86_64'" },
 ]
 flash-attn-3 = [
-    { url = "https://github.com/Luosuu/flash-attention3-wheels/releases/download/v0.0.5/flash_attn_3-3.0.0+20260610.cu130torch2110cxx11abitrue.fb02fc.sm90-cp310-abi3-linux_x86_64.whl", marker = "extra == 'gpu'" },
+  { url = "https://download.pytorch.org/whl/cu130/flash_attn_3-3.0.0-cp39-abi3-manylinux_2_34_aarch64.whl", marker = "extra == 'gpu' and sys_platform == 'linux' and platform_machine == 'aarch64'" },
+  { url = "https://github.com/Luosuu/flash-attention3-wheels/releases/download/v0.0.5/flash_attn_3-3.0.0+20260610.cu130torch2110cxx11abitrue.fb02fc.sm90-cp310-abi3-linux_x86_64.whl", marker = "extra == 'gpu' and sys_platform == 'linux' and platform_machine == 'x86_64'" },
 ]
 flash-mla = [
-    { url = "https://github.com/Luosuu/flash-mla-wheels/releases/download/v1.0.0-9241ae3-torch211cu130/flash_mla-1.0.0%2B9241ae3-1torch211cu130cuda131sm90asm100f-cp311-cp311-linux_x86_64.whl", marker = "extra == 'gpu' and python_version == '3.11'" },
-    { url = "https://github.com/Luosuu/flash-mla-wheels/releases/download/v1.0.0-9241ae3-torch211cu130/flash_mla-1.0.0%2B9241ae3-1torch211cu130cuda131sm90asm100f-cp312-cp312-linux_x86_64.whl", marker = "extra == 'gpu' and python_version == '3.12'" },
+  { url = "https://github.com/Luosuu/flash-mla-wheels/releases/download/v1.0.0-9241ae3-torch211cu130/flash_mla-1.0.0%2B9241ae3-1torch211cu130cuda130sm90asm100f-cp311-cp311-linux_aarch64.whl", marker = "extra == 'gpu' and sys_platform == 'linux' and python_version == '3.11' and platform_machine == 'aarch64'" },
+  { url = "https://github.com/Luosuu/flash-mla-wheels/releases/download/v1.0.0-9241ae3-torch211cu130/flash_mla-1.0.0%2B9241ae3-1torch211cu130cuda130sm90asm100f-cp312-cp312-linux_aarch64.whl", marker = "extra == 'gpu' and sys_platform == 'linux' and python_version == '3.12' and platform_machine == 'aarch64'" },
+  { url = "https://github.com/Luosuu/flash-mla-wheels/releases/download/v1.0.0-9241ae3-torch211cu130/flash_mla-1.0.0%2B9241ae3-1torch211cu130cuda131sm90asm100f-cp311-cp311-linux_x86_64.whl", marker = "extra == 'gpu' and sys_platform == 'linux' and python_version == '3.11' and platform_machine == 'x86_64'" },
+  { url = "https://github.com/Luosuu/flash-mla-wheels/releases/download/v1.0.0-9241ae3-torch211cu130/flash_mla-1.0.0%2B9241ae3-1torch211cu130cuda131sm90asm100f-cp312-cp312-linux_x86_64.whl", marker = "extra == 'gpu' and sys_platform == 'linux' and python_version == '3.12' and platform_machine == 'x86_64'" },
 ]
 # Strictly newer than v0.1.0 — picks up fixes for backward gradient count (#10),
 # auto_cp UnboundLocalError (#8), and l2norm dtype preservation (#13).
@@ -227,10 +240,10 @@ flash-qla = { git = "https://github.com/QwenLM/FlashQLA", rev = "6ef4858b5446e05
 # Pinned wheels avoid FFmpeg build dep in CI. x86_64: 3.11 → 14.4.0,
 # 3.12 → 14.2.0. aarch64: 14.2.0 for both (14.4.0 has no aarch64 wheel).
 av = [
-  { url = "https://files.pythonhosted.org/packages/f8/9a/8ffabfcafb42154b4b3a67d63f9b69e68fa8c34cb39ddd5cb813dd049ed4/av-14.4.0-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", marker = "(extra == 'gpu' or extra == 'npu') and python_version == '3.11'" },
-  { url = "https://files.pythonhosted.org/packages/ed/e8/cf60f3fcde3d0eedee3e9ff66b674a9b85bffc907dccebbc56fb5ac4a954/av-14.2.0-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", marker = "(extra == 'gpu' or extra == 'npu') and python_version == '3.12'" },
-  { url = "https://files.pythonhosted.org/packages/18/68/a9398e36676721f335720173c856d26c4031203b8323ea43dd132c17cc34/av-14.2.0-cp311-cp311-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", marker = "extra == 'npu_aarch64' and python_version == '3.11'" },
-  { url = "https://files.pythonhosted.org/packages/d3/c3/a174388d393f1564ad4c1b8300eb4f3e972851a4d392c1eba66a6848749e/av-14.2.0-cp312-cp312-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", marker = "extra == 'npu_aarch64' and python_version == '3.12'" },
+  { url = "https://files.pythonhosted.org/packages/f8/9a/8ffabfcafb42154b4b3a67d63f9b69e68fa8c34cb39ddd5cb813dd049ed4/av-14.4.0-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", marker = "(extra == 'gpu' or extra == 'npu') and sys_platform == 'linux' and python_version == '3.11' and platform_machine == 'x86_64'" },
+  { url = "https://files.pythonhosted.org/packages/ed/e8/cf60f3fcde3d0eedee3e9ff66b674a9b85bffc907dccebbc56fb5ac4a954/av-14.2.0-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", marker = "(extra == 'gpu' or extra == 'npu') and sys_platform == 'linux' and python_version == '3.12' and platform_machine == 'x86_64'" },
+  { url = "https://files.pythonhosted.org/packages/18/68/a9398e36676721f335720173c856d26c4031203b8323ea43dd132c17cc34/av-14.2.0-cp311-cp311-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", marker = "(extra == 'gpu' or extra == 'npu_aarch64') and sys_platform == 'linux' and python_version == '3.11' and platform_machine == 'aarch64'" },
+  { url = "https://files.pythonhosted.org/packages/d3/c3/a174388d393f1564ad4c1b8300eb4f3e972851a4d392c1eba66a6848749e/av-14.2.0-cp312-cp312-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", marker = "(extra == 'gpu' or extra == 'npu_aarch64') and sys_platform == 'linux' and python_version == '3.12' and platform_machine == 'aarch64'" },
 ]
 
 [[tool.uv.index]]
