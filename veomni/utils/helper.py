@@ -41,6 +41,7 @@ from . import logging
 from .count_flops import VeomniFlopsCounter
 from .device import (
     IS_CUDA_AVAILABLE,
+    IS_MLU_AVAILABLE,
     IS_NPU_AVAILABLE,
     get_device_type,
     get_torch_device,
@@ -59,6 +60,9 @@ except (ImportError, ModuleNotFoundError):
 
 if IS_NPU_AVAILABLE:
     import torch_npu
+
+if IS_MLU_AVAILABLE:
+    import torch_mlu
 
 
 # internal use
@@ -403,6 +407,10 @@ def enable_high_precision_for_bf16():
         torch.npu.matmul.allow_tf32 = False
         torch.npu.matmul.allow_bf16_reduced_precision_reduction = False
 
+    if IS_MLU_AVAILABLE:
+        torch.backends.mlu.matmul.allow_tf32 = False
+        torch.backends.mlu.matmul.allow_bf16_reduced_precision_reduction = False
+
 
 def enable_full_determinism(seed: int):
     """
@@ -433,6 +441,10 @@ def enable_full_determinism(seed: int):
     if IS_NPU_AVAILABLE:
         torch.npu.manual_seed(seed)
         torch.npu.manual_seed_all(seed)
+
+    if IS_MLU_AVAILABLE:
+        torch.mlu.manual_seed(seed)
+        torch.mlu.manual_seed_all(seed)
 
 
 def set_seed(seed: int, full_determinism: bool = False) -> None:
@@ -513,7 +525,7 @@ def empty_cache() -> None:
     """
     gc.collect()
 
-    if IS_CUDA_AVAILABLE or IS_NPU_AVAILABLE:
+    if IS_CUDA_AVAILABLE or IS_NPU_AVAILABLE or IS_MLU_AVAILABLE:
         from veomni.utils.device import empty_cache
 
         empty_cache()
@@ -655,7 +667,7 @@ def create_profiler(
     global_rank: int,
 ):
     """
-    Creates a profiler to record the CPU and CUDA activities. Default export to trace.json.
+    Creates a profiler to record the CPU and CUDA / MLU activities. Default export to trace.json.
     Profile steps in [start_step, end_step).
 
     When is_npu_available = True, the profiler will be created as torch_npu.profiler.
@@ -689,7 +701,7 @@ def create_profiler(
             nonlocal npu_trace_handler
             npu_trace_handler(p)
             trace_file = p.prof_if.prof_path
-        elif IS_CUDA_AVAILABLE:
+        elif IS_CUDA_AVAILABLE or IS_MLU_AVAILABLE:
             p.export_chrome_trace(trace_file)
         logger.info(f"Profiling result saved at {trace_file}.")
 
@@ -728,6 +740,10 @@ def create_profiler(
             profiler_level=torch_npu.profiler.ProfilerLevel.Level1,
             data_simplification=False,
         )
+    elif IS_MLU_AVAILABLE:
+        profiler_module = torch.profiler
+        activities = [profiler_module.ProfilerActivity.CPU, profiler_module.ProfilerActivity.MLU]
+        experimental_config = None
     else:
         profiler_module = torch.profiler
         activities = [profiler_module.ProfilerActivity.CPU, profiler_module.ProfilerActivity.CUDA]

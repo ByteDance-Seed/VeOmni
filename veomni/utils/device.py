@@ -19,7 +19,7 @@ from typing import Any
 import torch
 
 from . import logging
-from .import_utils import is_torch_npu_available
+from .import_utils import is_torch_mlu_available, is_torch_npu_available
 
 
 logger = logging.get_logger(__name__)
@@ -27,17 +27,20 @@ logger = logging.get_logger(__name__)
 
 IS_CUDA_AVAILABLE = torch.cuda.is_available()
 IS_NPU_AVAILABLE = is_torch_npu_available()
+IS_MLU_AVAILABLE = is_torch_mlu_available()
 
 if IS_NPU_AVAILABLE:
     torch.npu.config.allow_internal_format = False
 
 
 def get_device_type() -> str:
-    """Get device type based on current machine, currently only support CPU, CUDA, NPU."""
+    """Get device type based on current machine, currently only support CPU, CUDA, NPU, MLU."""
     if IS_CUDA_AVAILABLE:
         device = "cuda"
     elif IS_NPU_AVAILABLE:
         device = "npu"
+    elif IS_MLU_AVAILABLE:
+        device = "mlu"
     else:
         device = "cpu"
 
@@ -71,6 +74,8 @@ def get_dist_comm_backend() -> str:
         return "nccl"
     elif IS_NPU_AVAILABLE:
         return "hccl"
+    elif IS_MLU_AVAILABLE:
+        return "cncl"
     else:
         raise RuntimeError(f"No available distributed communication backend found on device type {get_device_type()}.")
 
@@ -86,6 +91,8 @@ def stream_synchronize() -> None:
         torch.cuda.current_stream().synchronize()
     elif IS_NPU_AVAILABLE:
         torch.npu.current_stream().synchronize()
+    elif IS_MLU_AVAILABLE:
+        torch.mlu.current_stream().synchronize()
     else:
         synchronize()
 
@@ -108,6 +115,11 @@ def is_nccl_backend(backend: str | None = None) -> bool:
 def is_hccl_backend() -> bool:
     """Check if the distributed communication backend is HCCL."""
     return get_dist_comm_backend() == "hccl"
+
+
+def is_cncl_backend(backend: str | None = None) -> bool:
+    """Check if the distributed communication backend is CNCL."""
+    return (backend or get_dist_comm_backend()) == "cncl"
 
 
 def get_gpu_compute_capability() -> int:
@@ -139,8 +151,11 @@ def get_compute_units():
         case "xpu":
             device_properties = torch.xpu.get_device_properties(0)
             NUM_SMS = device_properties.max_compute_units
+        case "mlu":
+            device_properties = torch.mlu.get_device_properties(0)
+            NUM_SMS = device_properties.multi_processor_count
         case _:
-            print("No CUDA or XPU device available. Using CPU.")
+            print("No CUDA, XPU, or MLU device available. Using CPU.")
             # For CPU, you might want to use the number of CPU cores
             NUM_SMS = torch.get_num_threads()
 

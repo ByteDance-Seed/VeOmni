@@ -21,7 +21,7 @@ import torch.nn.functional as F
 from torch import Tensor
 from torch.distributed import ProcessGroup
 
-from veomni.utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE
+from veomni.utils.device import IS_CUDA_AVAILABLE, IS_MLU_AVAILABLE, IS_NPU_AVAILABLE
 
 from .comm import get_ulysses_sequence_parallel_group, get_ulysses_sequence_parallel_world_size
 from .ulysses import all_to_all_tensor
@@ -30,6 +30,9 @@ from .utils import padding_tensor_for_seqeunce_parallel, unpadding_tensor_for_se
 
 if IS_NPU_AVAILABLE:
     import torch_npu
+
+if IS_MLU_AVAILABLE:
+    import torch_mlu
 
 fused_layer_norm_cuda = None
 
@@ -143,12 +146,13 @@ class AsyncUlyssesQKVProjection(torch.autograd.Function):
             norm_k_weight = norm_k_weight.contiguous()
             output_q, mean_q, invvar_q = None, None, None
             output_k, mean_k, invvar_k = None, None, None
-            if IS_CUDA_AVAILABLE:
+            if IS_CUDA_AVAILABLE or IS_MLU_AVAILABLE:
+                # fused_layer_norm_cuda is supported in apex_mlu
                 global fused_layer_norm_cuda
                 if fused_layer_norm_cuda is None:
                     fused_layer_norm_cuda = importlib.import_module("fused_layer_norm_cuda")
             if norm_type == "rmsnorm":
-                if IS_CUDA_AVAILABLE:
+                if IS_CUDA_AVAILABLE or IS_MLU_AVAILABLE:
                     output_q, invvar_q = fused_layer_norm_cuda.rms_forward_affine(
                         q, normalized_shape, norm_q_weight, eps
                     )
@@ -268,7 +272,7 @@ class AsyncUlyssesQKVProjection(torch.autograd.Function):
         # qk normalization backward (if needed)
         if norm_type is not None:
             if norm_type == "rmsnorm":
-                if IS_CUDA_AVAILABLE:
+                if IS_CUDA_AVAILABLE or IS_MLU_AVAILABLE:
                     grad_k, grad_norm_k_weight = fused_layer_norm_cuda.rms_backward_affine(
                         grad_output[1].contiguous(),
                         invvar_k,

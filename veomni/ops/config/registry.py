@@ -163,7 +163,7 @@ def _import_entry(entry: str) -> object:
 
 def _check_requires(requires: tuple[str, ...]) -> None:
     """Validate that the listed packages are importable."""
-    from ...utils.import_utils import is_liger_kernel_available, is_package_available, is_torch_npu_available
+    from ...utils.import_utils import is_liger_kernel_available, is_package_available, is_torch_mlu_available, is_torch_npu_available
 
     for pkg in requires:
         if pkg == "liger_kernel":
@@ -172,6 +172,9 @@ def _check_requires(requires: tuple[str, ...]) -> None:
         elif pkg == "torch_npu":
             if not is_torch_npu_available():
                 raise RuntimeError("npu backend requested but torch_npu is not installed.")
+        elif pkg == "torch_mlu":
+            if not is_torch_mlu_available():
+                raise RuntimeError("mlu backend requested but torch_mlu is not installed.")
         elif pkg == "triton":
             if not is_package_available("triton"):
                 raise RuntimeError(

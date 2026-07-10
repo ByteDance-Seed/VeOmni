@@ -277,7 +277,7 @@ def _dispatch_buffer(
         module._buffers[name].copy_(buffer.to(device=orig_tensor.device, dtype=orig_tensor.dtype))
 
 
-def _get_communication_device(init_device: Literal["cpu", "cuda", "npu"]) -> torch.device:
+def _get_communication_device(init_device: Literal["cpu", "cuda", "npu", "mlu"]) -> torch.device:
     if init_device == "cpu":
         return torch.device(get_device_type())
     return torch.device(init_device)
@@ -347,7 +347,7 @@ def _param_larger_than(shape: Tuple[int, ...], dtype: torch.dtype, max_load_broa
 def load_model_weights(
     model: Union["nn.Module", "PreTrainedModel"],
     weights_path: str,
-    init_device: Literal["cpu", "cuda", "npu"] = "cuda",
+    init_device: Literal["cpu", "cuda", "npu", "mlu"] = "cuda",
     dtensor_factory: Optional[Callable[["torch.Tensor", Any, Any], "torch.Tensor"]] = None,
     **kwargs,
 ) -> None:
@@ -672,7 +672,7 @@ def load_model_weights_ep_sharded(
 def rank0_load_and_broadcast_weights(
     model: Union["nn.Module", "PreTrainedModel"],
     weights_path: str,
-    init_device: Literal["cpu", "cuda", "npu"] = "cuda",
+    init_device: Literal["cpu", "cuda", "npu", "mlu"] = "cuda",
     dtensor_factory: Optional[Callable[["torch.Tensor", Any, Any], "torch.Tensor"]] = None,
     cpu_load_param_name: List[str] = None,
     max_load_broadcast_size: float = 20.0,  # in GB
