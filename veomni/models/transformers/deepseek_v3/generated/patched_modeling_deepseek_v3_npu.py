@@ -15,8 +15,8 @@
 #      Use NPU fused rotary embedding kernel
 #    - class_replacement: DeepseekV3NaiveMoe
 #      Use v5 gate_up_proj expert layout with OpSlot-guarded VeOmni fused-MoE path
-#    - init_modification: DeepseekV3ForCausalLM
-#      Append checkpoint-compatible DeepSeek-V3 MTP modules and tie their shared weights
+#    - method_override: DeepseekV3ForCausalLM.__init__
+#      Construct checkpoint-compatible DeepSeek-V3 MTP modules when enabled
 #    - method_override: DeepseekV3TopkRouter.forward
 #      Disable autocast around fp32 router linear for VeRL actor/rollout parity
 #    - method_override: DeepseekV3MoE.forward
@@ -793,7 +793,7 @@ class DeepseekV3Model(DeepseekV3PreTrainedModel):
 
 # ======================================================================
 # [MODIFIED CLASS] DeepseekV3ForCausalLM
-# Methods patched: forward, configure_mtp_training, get_parallel_plan
+# Methods patched: __init__, forward, configure_mtp_training, get_parallel_plan
 # ======================================================================
 
 
@@ -804,13 +804,28 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel, GenerationMixin):
     _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
 
     def __init__(self, config):
-        super().__init__(config)
+        DeepseekV3PreTrainedModel.__init__(self, config)
         self.model = DeepseekV3Model(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
-        # Initialize weights and apply final processing
+        num_mtp_layers = (
+            getattr(config, "num_nextn_predict_layers", 0) if getattr(config, "_veomni_enable_mtp", False) else 0
+        )
+        if num_mtp_layers:
+            # parallelize_model_fsdp2 uses these exact class names to select
+            # independently sharded decoder blocks before applying root FSDP.
+            self._no_split_modules = [*self._no_split_modules, "DeepseekV3MultiTokenPredictor"]
+        for depth in range(num_mtp_layers):
+            layer_idx = config.num_hidden_layers + depth
+            predictor = DeepseekV3MultiTokenPredictor(config, layer_idx)
+            self.model.layers.append(predictor)
+
         self.post_init()
+        self._mtp_training_enabled = False
+        self._mtp_loss_weight = 0.1
+        for predictor in self.model.layers[self.config.num_hidden_layers :]:
+            predictor.requires_grad_(False)
 
     # ================================================================
     # Patch: DeepseekV3ForCausalLM.forward
@@ -944,9 +959,9 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel, GenerationMixin):
         )
 
     def configure_mtp_training(self, enabled, loss_weight):
-        num_mtp_layers = getattr(self.config, "num_nextn_predict_layers", 0)
+        num_mtp_layers = len(self.model.layers) - self.config.num_hidden_layers
         if enabled and num_mtp_layers <= 0:
-            raise ValueError("DeepSeek-V3 MTP training requires num_nextn_predict_layers > 0.")
+            raise ValueError("DeepSeek-V3 MTP training requires MTP modules to be enabled at model construction.")
         self._mtp_training_enabled = enabled
         self._mtp_loss_weight = loss_weight
         for predictor in self.model.layers[self.config.num_hidden_layers :]:
