@@ -132,6 +132,7 @@ jobs:
         run: |
           uv run --frozen pytest -s -x tests/models/test_model_registry.py
           uv run --frozen pytest -s -x tests/models/test_models_patch.py
+          uv run --frozen pytest -s -x tests/models/test_deepseek_v3_mtp.py
           uv run --frozen pytest -s -x tests/models/test_vlm_trainer.py
           uv run --frozen pytest -s -x tests/models/test_padded_packed_loss.py
           uv run --frozen pytest -s -x tests/models/test_models_logits_equal_v5.py
