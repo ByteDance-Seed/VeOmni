@@ -1024,7 +1024,7 @@ class OpsImplementationConfig:
         user overrides (non-default values) are left untouched and will be
         caught by ``_validate_implementations`` if unsupported.
         """
-        from ..utils.import_utils import is_torch_mlu_available, is_apex_mlu_available
+        from ..utils.import_utils import is_torch_mlu_available
 
         if not is_torch_mlu_available():
             return
@@ -1035,15 +1035,6 @@ class OpsImplementationConfig:
                 continue
 
             current = getattr(self, field_name)
-            if field_name == "moe_implementation":
-                if not is_apex_mlu_available():
-                    if current != "fused_triton":
-                        setattr(self, "moe_implementation", "fused_triton")
-                        logger.info_rank0(
-                            f"moe_implementation: auto-resolved {current!r} -> fused_triton on Cambricon MLU, "
-                            "when using fused_mlu, please install apex_mlu first"
-                        )
-                    continue
             if current == gpu_defaults[field_name]:
                 setattr(self, field_name, mlu_value)
                 logger.info_rank0(
@@ -1061,7 +1052,7 @@ class OpsImplementationConfig:
         """
         from ..ops import config as _ops_config_pkg  # noqa: F401  triggers op registrations
         from ..ops.config.registry import list_ops
-        from ..utils.import_utils import is_package_available, is_torch_mlu_available, is_torch_npu_available
+        from ..utils.import_utils import is_package_available, is_torch_npu_available, is_torch_mlu_available, is_apex_mlu_available
 
         # Coverage check: every registered op must appear in ``_NPU_ALLOWED``,
         # otherwise a future op addition silently bypasses NPU validation.
@@ -1093,13 +1084,18 @@ class OpsImplementationConfig:
             value = getattr(self, field_name)
             if value == "eager":
                 continue
-            if on_mlu and value not in mlu_ok:
-                allowed = sorted(mlu_ok | {"eager"})
-                raise ValueError(
-                    f"{field_name}={value!r} is not supported on Cambricon MLU. "
-                    f"Set to one of {allowed}; 'eager' is the universal fallback "
-                    f"for ops with no MLU kernel for the current model."
-                )
+            if on_mlu:
+                if value == "fused_mlu" and not is_apex_mlu_available():
+                    raise ValueError(
+                        "moe_implementation='fused_mlu' requires apex_mlu installed on Cambricon MLU."
+                    )
+                if value not in mlu_ok:
+                    allowed = sorted(mlu_ok | {"eager"})
+                    raise ValueError(
+                        f"{field_name}={value!r} is not supported on Cambricon MLU. "
+                        f"Set to one of {allowed}; 'eager' is the universal fallback "
+                        f"for ops with no MLU kernel for the current model."
+                    )
 
         # The Triton load-balancing-loss kernel imports ``triton`` at module
         # top — surface a missing package here with an actionable message

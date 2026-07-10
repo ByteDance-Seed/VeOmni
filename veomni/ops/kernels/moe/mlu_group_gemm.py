@@ -19,7 +19,8 @@ class MLUGroupGemm(torch.autograd.Function):
         # permute_tokens: [tokens, hidden_dim]
         # cumsum: [local_experts]
         # compute batch_sizes from cumsum (must be on CPU and int64 for apex backend.gmm)
-        batch_sizes = torch.cat([cumsum[:1], cumsum[1:] - cumsum[:-1]]).cpu().to(torch.int64)
+        cumsum_cpu = cumsum.cpu().to(torch.int64)
+        batch_sizes = torch.cat([cumsum_cpu[:1], cumsum_cpu[1:] - cumsum_cpu[:-1]])
 
         # compute linear layer fc1-1
         fc1_1_output = apex_backend.gmm(
@@ -94,7 +95,8 @@ class MLUGroupGemm(torch.autograd.Function):
         swiglu_limit = ctx.swiglu_limit
         # permute_tokens: [tokens, hidden_dim]
         # cumsum: [local_experts]
-        batch_sizes = torch.cat([cumsum[:1], cumsum[1:] - cumsum[:-1]]).cpu().to(torch.int64)
+        cumsum_cpu = cumsum.cpu().to(torch.int64)
+        batch_sizes = torch.cat([cumsum_cpu[:1], cumsum_cpu[1:] - cumsum_cpu[:-1]])
 
         # dgrad fc1
         grad_fc1_output = apex_backend.gmm(
@@ -199,7 +201,8 @@ class MLUMergedFc1GroupGemm(torch.autograd.Function):
             f"Merged fc1_1_2_weight dim 1 must be even, got {fc1_1_2_weight.shape[1]}"
         )
 
-        batch_sizes = torch.cat([cumsum[:1], cumsum[1:] - cumsum[:-1]]).cpu().to(torch.int64)
+        cumsum_cpu = cumsum.cpu().to(torch.int64)
+        batch_sizes = torch.cat([cumsum_cpu[:1], cumsum_cpu[1:] - cumsum_cpu[:-1]])
 
         # Single fc1 gemm: output shape [T, 2I]
         fc1_output = apex_backend.gmm(
@@ -267,7 +270,8 @@ class MLUMergedFc1GroupGemm(torch.autograd.Function):
         fc1_1_activation = torch.ops.aten.silu(fc1_1_output)
         fc1_result = fc1_1_activation * fc1_2_output
 
-        batch_sizes = torch.cat([cumsum[:1], cumsum[1:] - cumsum[:-1]]).cpu().to(torch.int64)
+        cumsum_cpu = cumsum.cpu().to(torch.int64)
+        batch_sizes = torch.cat([cumsum_cpu[:1], cumsum_cpu[1:] - cumsum_cpu[:-1]])
 
         # dgrad fc2
         grad_fc1_result = apex_backend.gmm(

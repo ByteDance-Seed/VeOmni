@@ -74,7 +74,12 @@ def is_torch_mlu_available() -> bool:
     return _PACKAGE_FLAGS["torch_mlu"]
 
 def is_apex_mlu_available() -> bool:
-    return _PACKAGE_FLAGS["apex"] and ("mlu" in importlib.metadata.version("apex"))
+    if not _PACKAGE_FLAGS["apex"]:
+        return False
+    try:
+        return "mlu" in importlib.metadata.version("apex")
+    except importlib.metadata.PackageNotFoundError:
+        return False
 
 def is_diffusers_available() -> bool:
     return _PACKAGE_FLAGS["diffusers"]
