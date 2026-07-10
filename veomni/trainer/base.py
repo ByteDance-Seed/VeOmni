@@ -370,6 +370,16 @@ class BaseTrainer(Stateful, ABC):
             config_kwargs=self.args.model.model_config,
         )
         self.model_config = self.model.config
+        self._configure_mtp_training()
+
+    def _configure_mtp_training(self):
+        """Apply runtime MTP training arguments without changing checkpoint structure."""
+        configure_mtp = getattr(self.model, "configure_mtp_training", None)
+        if configure_mtp is None:
+            if self.args.train.enable_mtp:
+                raise ValueError("train.enable_mtp=True requires a model that supports MTP training.")
+            return
+        configure_mtp(enabled=self.args.train.enable_mtp, loss_weight=self.args.train.mtp_loss_weight)
 
     def _setup_lora(self):
         """Wrap ``self.model`` with the PEFT-free :class:`veomni.lora.VeOmniLoraModel`.

@@ -505,6 +505,14 @@ class TrainingArguments:
         default=False,
         metadata={"help": "Pad packed sequences to a fixed length when using dynamic batch size."},
     )
+    enable_mtp: bool = field(
+        default=False,
+        metadata={"help": "Enable Multi-Token Prediction loss for models that provide MTP modules."},
+    )
+    mtp_loss_weight: float = field(
+        default=0.1,
+        metadata={"help": "Weight applied to the mean Multi-Token Prediction loss when enable_mtp=True."},
+    )
     bsz_warmup_ratio: float = field(
         default=0,
         metadata={"help": "Ratio of batch size warmup steps."},
@@ -611,6 +619,8 @@ class TrainingArguments:
     checkpoint: CheckpointConfig = field(default_factory=CheckpointConfig)
 
     def __post_init__(self):
+        if not math.isfinite(self.mtp_loss_weight) or self.mtp_loss_weight < 0:
+            raise ValueError(f"mtp_loss_weight must be finite and >= 0, got {self.mtp_loss_weight}.")
         if self.dyn_bsz_physical_overflow_ratio < 1.0:
             raise ValueError(
                 f"dyn_bsz_physical_overflow_ratio must be >= 1.0, got {self.dyn_bsz_physical_overflow_ratio}."

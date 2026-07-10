@@ -1,10 +1,43 @@
+from types import SimpleNamespace
+
 import pytest
 import torch
 
+from veomni.arguments.arguments_types import TrainingArguments
 from veomni.models.transformers.deepseek_v3.checkpoint_tensor_converter import (
     DeepseekV3CheckpointTensorConverter,
     convert_deepseek_v3_fqn_to_index_mapping,
 )
+from veomni.trainer.base import BaseTrainer
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_mtp_training_argument_controls_predictor_gradients(enabled):
+    calls = []
+    model = SimpleNamespace(configure_mtp_training=lambda **kwargs: calls.append(kwargs))
+    trainer = SimpleNamespace(
+        args=SimpleNamespace(train=SimpleNamespace(enable_mtp=enabled, mtp_loss_weight=0.25)),
+        model=model,
+    )
+
+    BaseTrainer._configure_mtp_training(trainer)
+
+    assert calls == [{"enabled": enabled, "loss_weight": 0.25}]
+
+
+def test_enable_mtp_rejects_unsupported_model():
+    trainer = SimpleNamespace(
+        args=SimpleNamespace(train=SimpleNamespace(enable_mtp=True, mtp_loss_weight=0.1)),
+        model=SimpleNamespace(),
+    )
+    with pytest.raises(ValueError, match="model that supports MTP"):
+        BaseTrainer._configure_mtp_training(trainer)
+
+
+@pytest.mark.parametrize("loss_weight", [-1.0, float("nan"), float("inf")])
+def test_mtp_loss_weight_must_be_finite_and_non_negative(loss_weight):
+    with pytest.raises(ValueError, match="finite and >= 0"):
+        TrainingArguments(mtp_loss_weight=loss_weight)
 
 
 def test_mtp_shared_checkpoint_aliases_are_redirected_to_canonical_parameters():
@@ -117,16 +150,23 @@ def test_mtp_loss_backpropagates_to_predictor(monkeypatch):
         qk_rope_head_dim=4,
         v_head_dim=4,
         num_nextn_predict_layers=1,
-        mtp_loss_weight=0.1,
     )
     config._attn_implementation = "eager"
     model = modeling.DeepseekV3ForCausalLM(config)
     input_ids = torch.tensor([[1, 2, 3, 4, 5]])
     position_ids = torch.arange(input_ids.shape[-1]).unsqueeze(0)
 
+    predictor = model.model.layers[config.num_hidden_layers]
+    assert not any(parameter.requires_grad for parameter in predictor.parameters())
+    disabled_outputs = model(input_ids=input_ids, position_ids=position_ids, labels=input_ids, use_cache=False)
+    assert disabled_outputs.loss is not None
+    assert predictor.eh_proj.weight.grad is None
+
+    model.configure_mtp_training(enabled=True, loss_weight=0.1)
     outputs = model(input_ids=input_ids, position_ids=position_ids, labels=input_ids, use_cache=False)
     outputs.loss.backward()
 
-    predictor = model.model.layers[config.num_hidden_layers]
     assert predictor.eh_proj.weight.grad is not None
     assert torch.count_nonzero(predictor.eh_proj.weight.grad) > 0
+    assert "_mtp_training_enabled" not in model.config.to_dict()
+    assert "_mtp_loss_weight" not in model.config.to_dict()

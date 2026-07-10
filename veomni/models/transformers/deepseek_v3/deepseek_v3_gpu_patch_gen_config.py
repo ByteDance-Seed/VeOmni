@@ -262,6 +262,21 @@ def deepseek_v3_forcausallm_init_mtp(original_init, self, config):
         predictor = DeepseekV3MultiTokenPredictor(config, layer_idx)
         predictor.apply(self._initialize_weights)
         self.model.layers.append(predictor)
+    self.configure_mtp_training(enabled=False, loss_weight=0.1)
+
+
+@config.override_method(
+    "DeepseekV3ForCausalLM.configure_mtp_training",
+    description="Configure runtime-only DeepSeek-V3 MTP training state",
+)
+def deepseek_v3_configure_mtp_training(self, enabled, loss_weight):
+    num_mtp_layers = getattr(self.config, "num_nextn_predict_layers", 0)
+    if enabled and num_mtp_layers <= 0:
+        raise ValueError("DeepSeek-V3 MTP training requires num_nextn_predict_layers > 0.")
+    self._mtp_training_enabled = enabled
+    self._mtp_loss_weight = loss_weight
+    for predictor in self.model.layers[self.config.num_hidden_layers :]:
+        predictor.requires_grad_(enabled)
 
 
 def _shift_mtp_inputs(input_ids, labels, position_ids, depth):
@@ -371,7 +386,7 @@ def deepseek_v3_forcausallm_forward_patched(
     # immediately after the main decoder layers (for V3: model.layers.61).
     # Each depth consumes the previous depth's state plus the corresponding
     # future token, then predicts the following token.
-    if loss is not None and getattr(self.config, "num_nextn_predict_layers", 0) > 0:
+    if loss is not None and getattr(self, "_mtp_training_enabled", False):
         if input_ids is None:
             raise ValueError("DeepSeek-V3 MTP training requires input_ids; inputs_embeds alone are insufficient.")
         if position_ids is None:
@@ -410,7 +425,7 @@ def deepseek_v3_forcausallm_forward_patched(
             )
             mtp_loss = mtp_loss + depth_loss
 
-        mtp_loss_weight = getattr(self.config, "mtp_loss_weight", 0.1)
+        mtp_loss_weight = self._mtp_loss_weight
         loss = loss + mtp_loss_weight * mtp_loss / self.config.num_nextn_predict_layers
     # --- Patch.1 ---
 

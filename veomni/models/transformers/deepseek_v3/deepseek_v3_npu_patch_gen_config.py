@@ -34,6 +34,7 @@ from .deepseek_v3_gpu_patch_gen_config import (
     DeepseekV3MultiTokenPredictor,
     PatchedDeepseekV3NaiveMoe,
     _shift_mtp_inputs,
+    deepseek_v3_configure_mtp_training,
     deepseek_v3_forcausallm_forward_patched,
     deepseek_v3_forcausallm_init_mtp,
     deepseek_v3_get_parallel_plan_patched,
@@ -138,6 +139,12 @@ config.override_method(
     "DeepseekV3ForCausalLM.forward",
     replacement=deepseek_v3_forcausallm_forward_patched,
     description="OpSlot guard for fused cross entropy in DeepseekV3ForCausalLM.forward",
+)
+
+config.override_method(
+    "DeepseekV3ForCausalLM.configure_mtp_training",
+    replacement=deepseek_v3_configure_mtp_training,
+    description="Configure runtime-only DeepSeek-V3 MTP training state",
 )
 
 config.override_method(

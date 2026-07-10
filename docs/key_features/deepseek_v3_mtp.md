@@ -1,21 +1,22 @@
 # DeepSeek-V3 Multi-Token Prediction
 
-VeOmni trains the Multi-Token Prediction (MTP) modules included in official
-DeepSeek-V3 checkpoints when `num_nextn_predict_layers` is greater than zero.
-The default DeepSeek-V3 671B configuration enables one predictor and uses:
+VeOmni can optionally train the Multi-Token Prediction (MTP) modules included
+in official DeepSeek-V3 checkpoints. The model's `num_nextn_predict_layers`
+field describes checkpoint structure; training is disabled by default and is
+controlled independently through training arguments:
 
-```json
-{
-  "num_nextn_predict_layers": 1,
-  "mtp_loss_weight": 0.1
-}
+```yaml
+train:
+  enable_mtp: true
+  mtp_loss_weight: 0.1
 ```
 
 The total objective is the normal next-token loss plus the mean MTP loss,
-scaled by `mtp_loss_weight`. MTP targets respect `IGNORE_INDEX`, packed-sample
+scaled by `train.mtp_loss_weight`. MTP targets respect `IGNORE_INDEX`, packed-sample
 boundaries, and sequence-parallel partitions. Setting
-`num_nextn_predict_layers` to zero disables construction and training of the
-MTP modules.
+`train.enable_mtp: false` keeps the checkpoint-compatible modules but freezes
+them and skips their forward/loss computation. Enabling MTP for a model with
+`num_nextn_predict_layers == 0` raises a configuration error.
 
 Official checkpoints repeat the shared token embedding, final norm, and LM
 head under the MTP layer keyspace. VeOmni consumes those aliases during load
