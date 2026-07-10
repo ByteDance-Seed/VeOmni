@@ -268,28 +268,7 @@ class OmniModuleTrainer:
             self._build_model_assets()
             self._freeze_model_module()  # module self-freezes + lora + pretty-print + mem
 
-            # FSDP2 (and the meta-init weight load) preserve ``requires_grad``: the
-            # shard carries it (torch ``_fsdp_param.py``: ``sharded_param.requires_grad_(
-            # param.requires_grad)``) and the loader writes weights in-place
-            # (``param.data.copy_``), so the freeze applied in ``_freeze_model_module``
-            # above survives the wrap — no need to re-assert it here.
-            #
-            # A module may fully own its parallelize + weight-load (+ param
-            # offload) by implementing ``customized_build_parallelize_model`` —
-            # e.g. a huge MoE backbone that streams EP-sharded experts to CPU,
-            # which the generic GPU-materializing loader has no hook for. When it
-            # returns a model we use it verbatim (the override owns fsdp/load/
-            # offload/grad-ckpt); ``None`` (the default) keeps the generic path.
-            customized_builder = getattr(self.base.model, "customized_build_parallelize_model", None)
-            customized_model = (
-                customized_builder(weights_path=self.base.args.model.model_path, args=self.base.args)
-                if callable(customized_builder)
-                else None
-            )
-            if customized_model is not None:
-                self.base.model = customized_model
-            else:
-                self.base._build_parallelized_model()  # FSDP2 wrap + per-module weight load
+            self._build_parallelized_model()  # FSDP2 wrap + per-module weight load (or module-owned)
 
             # Gradient-checkpoint recompute runs during backward — OUTSIDE the
             # per-module ``use_parallel_state`` scope that wraps the forward — so it
@@ -299,6 +278,19 @@ class OmniModuleTrainer:
             # module's state during recompute.
             if self.base.args.train.gradient_checkpointing.enable:
                 self._scope_recompute_to_parallel_state()
+
+            # This module's own checkpoint callbacks (DCP resume + HF/LoRA export),
+            # reusing the shared single-model callbacks.  ``subfolder_name`` (the
+            # module's YAML key) is the ``<module>/`` checkpoint subdir.  Optimizer /
+            # lr-scheduler are built later via :meth:`_build_optimizer` /
+            # :meth:`_build_lr_scheduler` (the orchestrator calls them once
+            # ``args.train_steps`` is known).
+            #
+            # Built inside this module's ``use_parallel_state`` scope so each
+            # ``Callback`` captures it (``Callback.__init__`` → ``get_parallel_state()``)
+            # as its own ``self.parallel_state``; the runtime ``on_*`` dispatch then
+            # needs no wrapper (explicit ownership, mirroring ``BaseTrainer``).
+            self._init_callbacks(subfolder_name)
 
         # Make ``base`` look enough like a single-model trainer for the reused
         # checkpoint callbacks: the dataloader is global (owned by the
@@ -312,13 +304,32 @@ class OmniModuleTrainer:
         # owned by the orchestrator (a module's own wall-clock is meaningless).
         self._metric_meter_result: Optional[MetricMeterResult] = None
 
-        # This module's own checkpoint callbacks (DCP resume + HF/LoRA export),
-        # reusing the shared single-model callbacks.  ``subfolder_name`` (the
-        # module's YAML key) is the ``<module>/`` checkpoint subdir.  Optimizer /
-        # lr-scheduler are built later via :meth:`_build_optimizer` /
-        # :meth:`_build_lr_scheduler` (the orchestrator calls them once
-        # ``args.train_steps`` is known).
-        self._init_callbacks(subfolder_name)
+    def _build_parallelized_model(self):
+        """FSDP2-wrap this module's model and load its weights (or defer to the module).
+
+        FSDP2 (and the meta-init weight load) preserve ``requires_grad``: the
+        shard carries it (torch ``_fsdp_param.py``: ``sharded_param.requires_grad_(
+        param.requires_grad)``) and the loader writes weights in-place
+        (``param.data.copy_``), so the freeze applied in ``_freeze_model_module``
+        survives the wrap — no need to re-assert it here.
+
+        A module may fully own its parallelize + weight-load (+ param offload) by
+        implementing ``customized_build_parallelize_model`` — e.g. a huge MoE
+        backbone that streams EP-sharded experts to CPU, which the generic
+        GPU-materializing loader has no hook for. When it returns a model we use
+        it verbatim (the override owns fsdp/load/offload/grad-ckpt); ``None`` (the
+        default) keeps the generic :meth:`BaseTrainer._build_parallelized_model`
+        path. Called within this module's ``use_parallel_state`` scope so the
+        FSDP2/DDP wrap reads this module's mesh via ``get_parallel_state()``.
+        """
+        customized_builder = getattr(self.base.model, "customized_build_parallelize_model", None)
+        if callable(customized_builder):
+            self.base.model = customized_builder(
+                weights_path=self.base.args.model.model_path,
+                args=self.base.args,
+            )
+        else:
+            self.base._build_parallelized_model()  # FSDP2 wrap + per-module weight load
 
     # ── Parallel state (per-module device mesh) ────────────────────────────────
 
@@ -416,34 +427,25 @@ class OmniModuleTrainer:
         else:
             self.hf_ckpt_callback = OmniModuleHfCallback(base, subfolder_name)
 
-    # Each checkpoint callback (DCP save/load + HF/LoRA export) runs under this
-    # module's ParallelState so the DCP extra-parallel dim
-    # preprocessing reads the right meshes via get_parallel_state().
-
     def on_train_begin(self, state):
-        with use_parallel_state(self.parallel_state):
-            self.checkpointer_callback.on_train_begin(state)
-            self.hf_ckpt_callback.on_train_begin(state)
+        self.checkpointer_callback.on_train_begin(state)
+        self.hf_ckpt_callback.on_train_begin(state)
 
     def on_train_end(self, state):
-        with use_parallel_state(self.parallel_state):
-            self.checkpointer_callback.on_train_end(state)
-            self.hf_ckpt_callback.on_train_end(state)
+        self.checkpointer_callback.on_train_end(state)
+        self.hf_ckpt_callback.on_train_end(state)
 
     def on_epoch_begin(self, state):
-        with use_parallel_state(self.parallel_state):
-            self.checkpointer_callback.on_epoch_begin(state)
-            self.hf_ckpt_callback.on_epoch_begin(state)
+        self.checkpointer_callback.on_epoch_begin(state)
+        self.hf_ckpt_callback.on_epoch_begin(state)
 
     def on_epoch_end(self, state):
-        with use_parallel_state(self.parallel_state):
-            self.checkpointer_callback.on_epoch_end(state)
-            self.hf_ckpt_callback.on_epoch_end(state)
+        self.checkpointer_callback.on_epoch_end(state)
+        self.hf_ckpt_callback.on_epoch_end(state)
 
     def on_step_begin(self, state, **kwargs):
-        with use_parallel_state(self.parallel_state):
-            self.checkpointer_callback.on_step_begin(state, **kwargs)
-            self.hf_ckpt_callback.on_step_begin(state, **kwargs)
+        self.checkpointer_callback.on_step_begin(state, **kwargs)
+        self.hf_ckpt_callback.on_step_begin(state, **kwargs)
 
     def on_step_end(self, state, **kwargs):
         # Stash this module's time-independent metric contribution
@@ -456,9 +458,8 @@ class OmniModuleTrainer:
         # MetricMeterMixin is still seen.
         model = _unwrap_module(self.base.model)
         self._metric_meter_result = model.metric_meter_collect() if isinstance(model, MetricMeterMixin) else None
-        with use_parallel_state(self.parallel_state):
-            self.checkpointer_callback.on_step_end(state, **kwargs)
-            self.hf_ckpt_callback.on_step_end(state, **kwargs)
+        self.checkpointer_callback.on_step_end(state, **kwargs)
+        self.hf_ckpt_callback.on_step_end(state, **kwargs)
 
     def _freeze_model_module(self):
         """Let the module freeze itself (its policy), then run the base report (+ lora)."""
