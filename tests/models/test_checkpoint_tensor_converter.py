@@ -30,6 +30,7 @@ from veomni.models.checkpoint_tensor_loading import (
     get_checkpoint_tensor_converter,
     maybe_convert_checkpoint_tensor,
 )
+from veomni.models.transformers.deepseek_v4 import checkpoint_tensor_converter as deepseek_v4_converter
 from veomni.models.transformers.deepseek_v4.checkpoint_tensor_converter import (
     DeepseekV4CheckpointTensorConverter,
     _dequantize_scaled_weight,
@@ -422,8 +423,8 @@ class TestDeepseekV4ConverterCanHandle:
         assert self.converter.can_handle("model.layers.0.attn.wkv.scale")
         assert self.converter.can_handle("model.layers.0.attn.wkv.weight_scale_inv")
 
-    def test_regular_weight_keys_are_not_name_only_handled(self):
-        assert not self.converter.can_handle("model.layers.0.attn.wkv.weight")
+    def test_prefixed_raw_weight_keys_are_name_handled(self):
+        assert self.converter.can_handle("model.layers.0.attn.wkv.weight")
 
     def test_matches_quantized_weight_tensors(self):
         weight = _to_fp8(torch.arange(16, dtype=torch.float32).reshape(4, 4))
@@ -457,6 +458,28 @@ class TestDeepseekV4ConverterConvert:
         assert result.shape == (1, 64)
         assert torch.equal(result, expected)
 
+    def test_reuses_fp4_lookup_table(self, monkeypatch):
+        weight = torch.full((1, 32), 0x21, dtype=torch.uint8).view(torch.int8)
+        scale = torch.ones(1, 2)
+        original_tensor = torch.tensor
+        table_allocations = 0
+        deepseek_v4_converter._get_fp4_e2m1_table.cache_clear()
+
+        def counted_tensor(*args, **kwargs):
+            nonlocal table_allocations
+            if args and args[0] == deepseek_v4_converter._FP4_E2M1_VALUES:
+                table_allocations += 1
+            return original_tensor(*args, **kwargs)
+
+        monkeypatch.setattr(deepseek_v4_converter.torch, "tensor", counted_tensor)
+
+        try:
+            _dequantize_scaled_weight(weight, scale, packed_fp4=True)
+            _dequantize_scaled_weight(weight, scale, packed_fp4=True)
+            assert table_allocations == 1
+        finally:
+            deepseek_v4_converter._get_fp4_e2m1_table.cache_clear()
+
     def test_dequantizes_conventional_int8_weight_without_unpacking(self):
         weight = torch.arange(16, dtype=torch.int8).reshape(4, 4)
         scale = torch.tensor([[1.0, 2.0], [4.0, 8.0]])
@@ -471,12 +494,17 @@ class TestDeepseekV4ConverterConvert:
         ("raw_name", "converted_name"),
         [
             ("embed.weight", "model.embed_tokens.weight"),
+            ("model.embed.weight", "model.embed_tokens.weight"),
             ("head.weight", "lm_head.weight"),
+            ("model.head.weight", "lm_head.weight"),
             ("norm.weight", "model.norm.weight"),
+            ("model.norm.weight", "model.norm.weight"),
             ("hc_head_fn", "model.hc_head.hc_fn"),
+            ("model.hc_head_fn", "model.hc_head.hc_fn"),
             ("layers.2.attn_norm.weight", "model.layers.2.input_layernorm.weight"),
             ("layers.2.ffn_norm.weight", "model.layers.2.post_attention_layernorm.weight"),
             ("layers.2.attn.wkv.weight", "model.layers.2.self_attn.kv_proj.weight"),
+            ("model.layers.2.attn.wkv.weight", "model.layers.2.self_attn.kv_proj.weight"),
             ("layers.2.attn.wq_a.scale", "model.layers.2.self_attn.q_a_proj.scale"),
             ("layers.2.attn.attn_sink", "model.layers.2.self_attn.sinks"),
             (
@@ -498,12 +526,17 @@ class TestDeepseekV4ConverterConvert:
                 "model.layers.2.mlp.shared_experts.gate_proj.weight",
             ),
             (
+                "model.layers.2.ffn.shared_experts.w1.weight",
+                "model.layers.2.mlp.shared_experts.gate_proj.weight",
+            ),
+            (
                 "layers.2.ffn.experts.7.w3.scale",
                 "model.layers.2.mlp.experts.7.w3.scale",
             ),
             ("layers.2.hc_attn_base", "model.layers.2.attn_hc.base"),
             ("layers.2.hc_ffn_scale", "model.layers.2.ffn_hc.scale"),
             ("mtp.0.attn.wkv.weight", "mtp.0.attn.wkv.weight"),
+            ("model.custom.weight", "model.custom.weight"),
         ],
     )
     def test_converts_deepseek_inference_checkpoint_names(self, raw_name: str, converted_name: str):
@@ -525,6 +558,7 @@ class TestDeepseekV4ConverterConvert:
         converter = DeepseekV4CheckpointTensorConverter(num_experts=NUM_EXPERTS)
         weight_name = "model.layers.0.attn.wkv.weight"
         scale_name = "model.layers.0.attn.wkv.scale"
+        converted_weight_name = "model.layers.0.self_attn.kv_proj.weight"
         weight = _to_fp8(torch.arange(16, dtype=torch.float32).reshape(4, 4))
         scale = torch.tensor([[1.0, 2.0], [4.0, 8.0]])
 
@@ -532,7 +566,7 @@ class TestDeepseekV4ConverterConvert:
         result = maybe_convert_checkpoint_tensor(scale_name, scale, converter)
 
         assert result is not None
-        assert result.name == weight_name
+        assert result.name == converted_weight_name
         assert torch.equal(result.tensor, _dequantize_scaled_weight(weight, scale))
         assert converter.finalize() == []
 
@@ -540,6 +574,7 @@ class TestDeepseekV4ConverterConvert:
         converter = DeepseekV4CheckpointTensorConverter(num_experts=NUM_EXPERTS)
         weight_name = "model.layers.0.attn.wkv.weight"
         scale_name = "model.layers.0.attn.wkv.scale"
+        converted_weight_name = "model.layers.0.self_attn.kv_proj.weight"
         weight = _to_fp8(torch.arange(16, dtype=torch.float32).reshape(4, 4))
         scale = torch.tensor([[1.0, 2.0], [4.0, 8.0]])
 
@@ -547,7 +582,7 @@ class TestDeepseekV4ConverterConvert:
         result = maybe_convert_checkpoint_tensor(weight_name, weight, converter)
 
         assert result is not None
-        assert result.name == weight_name
+        assert result.name == converted_weight_name
         assert torch.equal(result.tensor, _dequantize_scaled_weight(weight, scale))
         assert converter.finalize() == []
 
@@ -555,6 +590,7 @@ class TestDeepseekV4ConverterConvert:
         converter = DeepseekV4CheckpointTensorConverter(num_experts=NUM_EXPERTS)
         weight_name = "model.layers.0.attn.wkv.weight"
         scale_name = "model.layers.0.attn.wkv.weight_scale_inv"
+        converted_weight_name = "model.layers.0.self_attn.kv_proj.weight"
         weight = _to_fp8(torch.arange(16, dtype=torch.float32).reshape(4, 4))
         scale = torch.tensor([[1.0, 2.0], [4.0, 8.0]])
 
@@ -562,7 +598,7 @@ class TestDeepseekV4ConverterConvert:
         result = maybe_convert_checkpoint_tensor(scale_name, scale, converter)
 
         assert result is not None
-        assert result.name == weight_name
+        assert result.name == converted_weight_name
         assert torch.equal(result.tensor, _dequantize_scaled_weight(weight, scale))
         assert converter.finalize() == []
 
@@ -570,6 +606,7 @@ class TestDeepseekV4ConverterConvert:
         converter = DeepseekV4CheckpointTensorConverter(num_experts=NUM_EXPERTS)
         weight_name = "model.layers.0.attn.wkv.weight"
         scale_name = "model.layers.0.attn.wkv.scale"
+        converted_weight_name = "model.layers.0.self_attn.kv_proj.weight"
         weight = _to_fp8(torch.arange(16, dtype=torch.float32).reshape(4, 4))
         scale = torch.tensor(2.0)
 
@@ -577,7 +614,7 @@ class TestDeepseekV4ConverterConvert:
         result = maybe_convert_checkpoint_tensor(scale_name, scale, converter)
 
         assert result is not None
-        assert result.name == weight_name
+        assert result.name == converted_weight_name
         assert torch.equal(result.tensor, weight.float() * scale)
         assert converter.finalize() == []
 
@@ -681,7 +718,8 @@ class TestDeepseekV4ConverterConvert:
             assert torch.equal(down[expert_id], down_expected)
         assert converter.finalize() == []
 
-    def test_raw_inference_fp4_experts_are_unpacked_before_fusing(self):
+    @pytest.mark.parametrize("model_prefix", ("", "model."))
+    def test_raw_inference_fp4_experts_are_unpacked_before_fusing(self, model_prefix: str):
         converter = DeepseekV4CheckpointTensorConverter(num_experts=NUM_EXPERTS)
         dispatched = {}
 
@@ -689,7 +727,7 @@ class TestDeepseekV4ConverterConvert:
             logical_shape = (HIDDEN_DIM, INTERMEDIATE_DIM) if proj == "w2" else (INTERMEDIATE_DIM, HIDDEN_DIM)
             packed_shape = (logical_shape[0], logical_shape[1] // 2)
             for expert_id in range(NUM_EXPERTS):
-                stem = f"layers.0.ffn.experts.{expert_id}.{proj}"
+                stem = f"{model_prefix}layers.0.ffn.experts.{expert_id}.{proj}"
                 packed = torch.full(packed_shape, 0x21, dtype=torch.uint8).view(torch.int8)
                 assert maybe_convert_checkpoint_tensor(f"{stem}.weight", packed, converter) is None
                 result = maybe_convert_checkpoint_tensor(f"{stem}.scale", torch.tensor(1.0), converter)

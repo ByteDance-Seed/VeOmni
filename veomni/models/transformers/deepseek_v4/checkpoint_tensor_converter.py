@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import re
 from collections import defaultdict
+from functools import lru_cache
 
 import torch
 from transformers.conversion_mapping import get_checkpoint_conversion_mapping
@@ -58,7 +59,7 @@ logger = logging.get_logger(__name__)
 #   model.layers.0.mlp.experts.3.w1.weight
 #   model.layers.0.mlp.experts.3.gate_proj.weight
 _EXPERT_PATTERN = re.compile(r"^(.+\.mlp)\.experts\.(\d+)\.(w1|w2|w3|gate_proj|up_proj|down_proj)\.weight$")
-_RAW_FP4_EXPERT_WEIGHT_PATTERN = re.compile(r"^layers\.\d+\.ffn\.experts\.\d+\.w[123]\.weight$")
+_RAW_FP4_EXPERT_WEIGHT_PATTERN = re.compile(r"^(?:model\.)?layers\.\d+\.ffn\.experts\.\d+\.w[123]\.weight$")
 _PROJ_NAME_ALIASES = {
     "w1": "gate_proj",
     "w2": "down_proj",
@@ -69,7 +70,25 @@ _DEEPSEEK_V4_WEIGHT_RENAMINGS = [
     for transform in (get_checkpoint_conversion_mapping("deepseek_v4") or [])
     if isinstance(transform, WeightRenaming)
 ]
-_FP4_E2M1_VALUES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0)
+_FP4_E2M1_VALUES = (
+    0.0,
+    0.5,
+    1.0,
+    1.5,
+    2.0,
+    3.0,
+    4.0,
+    6.0,
+    0.0,
+    -0.5,
+    -1.0,
+    -1.5,
+    -2.0,
+    -3.0,
+    -4.0,
+    -6.0,
+)
+_BASE_MODEL_KEY_PREFIXES = ("embed_tokens.", "hc_head.", "layers.", "norm.")
 _FLOAT8_DTYPES = tuple(
     dtype
     for dtype in (
@@ -87,10 +106,19 @@ def _is_quantized_weight(tensor: torch.Tensor) -> bool:
 
 def convert_deepseek_v4_checkpoint_key(name: str) -> str:
     """Convert DeepSeek's inference checkpoint names to Transformers v5 names."""
-    converted_name, _ = rename_source_key(name, _DEEPSEEK_V4_WEIGHT_RENAMINGS, [])
-    if converted_name.startswith(("embed_tokens.", "hc_head.", "layers.", "norm.")):
-        converted_name = f"model.{converted_name}"
+    has_model_prefix = name.startswith("model.")
+    source_name = name.removeprefix("model.") if has_model_prefix else name
+    converted_name, _ = rename_source_key(source_name, _DEEPSEEK_V4_WEIGHT_RENAMINGS, [])
+    if converted_name.startswith(_BASE_MODEL_KEY_PREFIXES):
+        return f"model.{converted_name}"
+    if has_model_prefix and converted_name == source_name:
+        return name
     return converted_name
+
+
+@lru_cache(maxsize=None)
+def _get_fp4_e2m1_table(device: torch.device) -> torch.Tensor:
+    return torch.tensor(_FP4_E2M1_VALUES, dtype=torch.float32, device=device)
 
 
 def _is_block_scale_tensor(tensor: torch.Tensor) -> bool:
@@ -114,7 +142,7 @@ def _dequantize_scaled_weight(weight: torch.Tensor, scale: torch.Tensor, *, pack
         # DeepSeek-V4 stores two E2M1 FP4 expert values in every int8 byte.
         # Preserve the bit pattern when splitting the low and high nibbles.
         packed = weight.contiguous().view(torch.uint8)
-        table = torch.tensor(_FP4_E2M1_VALUES, dtype=torch.float32, device=weight.device)
+        table = _get_fp4_e2m1_table(weight.device)
         low = table[(packed & 0x0F).long()]
         high = table[((packed >> 4) & 0x0F).long()]
         weight = torch.stack((low, high), dim=-1).flatten(-2)
