@@ -76,7 +76,9 @@ class AllToAllCommTest(SequenceParallelTest):
         local_out = AllToAllCommTest._run_forward(local_y)
         local_loss = local_out.mean()
         num_valid_tokens = torch.tensor(1.0, dtype=local_loss.dtype, device=local_loss.device)
-        with use_parallel_state(SimpleNamespace(sp_group=group)):
+        # This standalone primitive test historically reduces through the
+        # default process group without enabling sequence parallel scaling.
+        with use_parallel_state(SimpleNamespace(sp_group=None)):
             reduced_loss = reduce_sequence_parallel_loss(local_loss, num_valid_tokens)
             reduced_loss.backward()
         return reduced_loss.item(), local_x.grad.item()

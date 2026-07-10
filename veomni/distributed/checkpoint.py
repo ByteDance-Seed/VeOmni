@@ -16,6 +16,8 @@ from torch.utils.checkpoint import (
     set_device_states,
 )
 
+from .parallel_state import get_current_parallel_state, use_parallel_state
+
 
 class CheckpointFunction(torch.autograd.Function):
     @staticmethod
@@ -23,6 +25,7 @@ class CheckpointFunction(torch.autograd.Function):
         check_backward_validity(args)
         ctx.run_function = run_function
         ctx.preserve_rng_state = preserve_rng_state
+        ctx.parallel_state = get_current_parallel_state()
         # Accommodates the (remote) possibility that autocast is enabled for cpu AND gpu.
         ctx.device = _infer_device_type(*args)
         ctx.device_autocast_kwargs, ctx.cpu_autocast_kwargs = _get_autocast_kwargs(ctx.device)
@@ -112,7 +115,15 @@ class CheckpointFunction(torch.autograd.Function):
                 if torch.amp.is_autocast_available(ctx.device)
                 else contextlib.nullcontext()
             )
-            with torch.enable_grad(), device_autocast_ctx, torch.cpu.amp.autocast(**ctx.cpu_autocast_kwargs):  # type: ignore[attr-defined]
+            parallel_state_ctx = (
+                use_parallel_state(ctx.parallel_state) if ctx.parallel_state is not None else contextlib.nullcontext()
+            )
+            with (
+                torch.enable_grad(),
+                device_autocast_ctx,
+                torch.cpu.amp.autocast(**ctx.cpu_autocast_kwargs),  # type: ignore[attr-defined]
+                parallel_state_ctx,
+            ):
                 outputs = ctx.run_function(*detached_inputs)
 
         if isinstance(outputs, torch.Tensor):

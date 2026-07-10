@@ -14,6 +14,7 @@
 
 
 import types
+from contextlib import contextmanager
 from functools import partial
 from typing import List, Optional, Tuple
 
@@ -44,6 +45,26 @@ from .utils import sort_fqn_by_submodule_first
 
 
 logger = logging.get_logger(__name__)
+
+
+@contextmanager
+def _checkpoint_parallel_state_context(parallel_state: ParallelState, context):
+    """Compose a checkpoint context with the state owned by its model."""
+    with use_parallel_state(parallel_state), context:
+        yield
+
+
+def _model_owned_checkpoint_context_fn(parallel_state: ParallelState, context_fn):
+    """Keep model-owned state active during non-reentrant recomputation."""
+
+    def model_owned_context_fn():
+        forward_context, recompute_context = context_fn()
+        return (
+            _checkpoint_parallel_state_context(parallel_state, forward_context),
+            _checkpoint_parallel_state_context(parallel_state, recompute_context),
+        )
+
+    return model_owned_context_fn
 
 
 def _reset_hf_initialized_flag(module: nn.Module) -> None:
@@ -535,13 +556,16 @@ def _build_parallelize_model(
     if enable_gradient_checkpointing and hasattr(model, "gradient_checkpointing_enable"):
         logger.info_rank0("Enable gradient checkpointing.")
         use_reentrant = kwargs.pop("enable_reentrant", False)
+        checkpoint_context_fn = kwargs.pop("recompute_context_fn", noop_context_fn)
         if use_reentrant:
             torch.utils.checkpoint.CheckpointFunction = CheckpointFunction
+        else:
+            checkpoint_context_fn = _model_owned_checkpoint_context_fn(parallel_state, checkpoint_context_fn)
 
         model.gradient_checkpointing_enable(
             gradient_checkpointing_kwargs={
                 "use_reentrant": use_reentrant,
-                "context_fn": kwargs.pop("recompute_context_fn", noop_context_fn),
+                "context_fn": checkpoint_context_fn,
             },
         )
 

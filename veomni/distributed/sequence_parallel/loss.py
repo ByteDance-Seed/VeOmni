@@ -29,7 +29,10 @@ class ReduceLoss(torch.autograd.Function):
         local_num_tokens = num_valid_tokens.detach().clone()
         loss *= num_valid_tokens
         group = get_unified_sequence_parallel_group()
-        ctx.sp_world_size = dist.get_world_size(group)
+        # Match get_unified_sequence_parallel_world_size(): an absent SP group
+        # may still use the default process group for the reduction, but it is
+        # not sequence parallel and therefore contributes no SP grad scaling.
+        ctx.sp_world_size = dist.get_world_size(group) if group is not None else 1
         dist.all_reduce(loss, group=group)
         dist.all_reduce(num_valid_tokens, group=group)
         ctx.save_for_backward(local_num_tokens, num_valid_tokens)

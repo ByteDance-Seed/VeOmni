@@ -11,6 +11,7 @@ import torch.distributed as dist
 from veomni.data.data_collator import MainCollator
 from veomni.distributed import parallel_state as parallel_state_module
 from veomni.distributed import torch_parallelize
+from veomni.distributed.checkpoint import CheckpointFunction
 from veomni.distributed.parallel_state import (
     ParallelState,
     bind_model_parallel_state,
@@ -54,6 +55,37 @@ class _CompilableModel(torch.nn.Module):
         return self.layer(value)
 
 
+class _CheckpointedModel(torch.nn.Module):
+    def __init__(self, parallel_state, observed_states):
+        super().__init__()
+        self.observed_states = observed_states
+        self.checkpoint_context_fn = torch_parallelize._model_owned_checkpoint_context_fn(
+            parallel_state, torch.utils.checkpoint.noop_context_fn
+        )
+
+    def _checkpointed_forward(self, value):
+        self.observed_states.append(get_parallel_state())
+        return torch.sin(value)
+
+    def forward(self, value):
+        return torch.utils.checkpoint.checkpoint(
+            self._checkpointed_forward,
+            value,
+            use_reentrant=False,
+            context_fn=self.checkpoint_context_fn,
+        )
+
+
+class _ReentrantCheckpointedModule(torch.nn.Module):
+    def __init__(self, observed_states):
+        super().__init__()
+        self.observed_states = observed_states
+
+    def forward(self, value):
+        self.observed_states.append(get_parallel_state())
+        return torch.sin(value)
+
+
 @pytest.fixture(autouse=True)
 def _reset_parallel_state():
     token = parallel_state_module._CURRENT_PARALLEL_STATE.set(None)
@@ -82,6 +114,38 @@ def test_bound_model_forward_activates_and_restores_owned_state():
     model = bind_model_parallel_state(_ForwardModel(), model_state)
 
     assert model.forward() is model_state
+    with pytest.raises(RuntimeError, match="No ParallelState is active"):
+        get_parallel_state()
+
+
+def test_checkpoint_recompute_activates_model_owned_state():
+    model_state = ParallelState(async_enabled=True)
+    observed_states = []
+    model = bind_model_parallel_state(_CheckpointedModel(model_state, observed_states), model_state)
+    value = torch.tensor(1.0, requires_grad=True)
+
+    model(value).backward()
+
+    assert observed_states == [model_state, model_state]
+    with pytest.raises(RuntimeError, match="No ParallelState is active"):
+        get_parallel_state()
+
+
+def test_reentrant_checkpoint_recompute_restores_captured_model_state():
+    model_state = ParallelState(async_enabled=True)
+    caller_state = ParallelState(async_enabled=False)
+    observed_states = []
+    checkpointed_module = _ReentrantCheckpointedModule(observed_states)
+    value = torch.tensor(1.0, requires_grad=True)
+
+    with use_parallel_state(model_state):
+        output = CheckpointFunction.apply(checkpointed_module, True, value)
+
+    with use_parallel_state(caller_state):
+        output.backward()
+        assert get_parallel_state() is caller_state
+
+    assert observed_states == [model_state, model_state]
     with pytest.raises(RuntimeError, match="No ParallelState is active"):
         get_parallel_state()
 
