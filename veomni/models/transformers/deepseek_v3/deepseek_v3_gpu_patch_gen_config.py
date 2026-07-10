@@ -246,12 +246,16 @@ class DeepseekV3MultiTokenPredictor(DeepseekV3DecoderLayer):
 config.add_helper_after("DeepseekV3DecoderLayer", DeepseekV3MultiTokenPredictor)
 
 
-@config.modify_init(
-    "DeepseekV3ForCausalLM",
-    description="Append checkpoint-compatible DeepSeek-V3 MTP modules and tie their shared weights",
+@config.override_method(
+    "DeepseekV3ForCausalLM.__init__",
+    description="Construct checkpoint-compatible DeepSeek-V3 MTP modules when enabled",
 )
-def deepseek_v3_forcausallm_init_mtp(original_init, self, config):
-    original_init(self, config)
+def deepseek_v3_forcausallm_init_mtp(self, config):
+    DeepseekV3PreTrainedModel.__init__(self, config)
+    self.model = DeepseekV3Model(config)
+    self.vocab_size = config.vocab_size
+    self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+
     num_mtp_layers = (
         getattr(config, "num_nextn_predict_layers", 0) if getattr(config, "_veomni_enable_mtp", False) else 0
     )
@@ -262,9 +266,13 @@ def deepseek_v3_forcausallm_init_mtp(original_init, self, config):
     for depth in range(num_mtp_layers):
         layer_idx = config.num_hidden_layers + depth
         predictor = DeepseekV3MultiTokenPredictor(config, layer_idx)
-        predictor.apply(self._initialize_weights)
         self.model.layers.append(predictor)
-    self.configure_mtp_training(enabled=False, loss_weight=0.1)
+
+    self.post_init()
+    self._mtp_training_enabled = False
+    self._mtp_loss_weight = 0.1
+    for predictor in self.model.layers[self.config.num_hidden_layers :]:
+        predictor.requires_grad_(False)
 
 
 @config.override_method(

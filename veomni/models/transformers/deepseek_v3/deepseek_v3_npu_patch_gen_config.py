@@ -118,10 +118,11 @@ config.replace_class(
 config.add_helper_after("DeepseekV3DecoderLayer", DeepseekV3MultiTokenPredictor)
 config.add_helper(_shift_mtp_inputs)
 
-config.modify_init(
-    "DeepseekV3ForCausalLM",
-    description="Append checkpoint-compatible DeepSeek-V3 MTP modules and tie their shared weights",
-)(deepseek_v3_forcausallm_init_mtp)
+config.override_method(
+    "DeepseekV3ForCausalLM.__init__",
+    replacement=deepseek_v3_forcausallm_init_mtp,
+    description="Construct checkpoint-compatible DeepSeek-V3 MTP modules when enabled",
+)
 
 config.override_method(
     "DeepseekV3TopkRouter.forward",
