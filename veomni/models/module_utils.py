@@ -483,6 +483,13 @@ def load_model_weights_ep_sharded(
     rank reads its real-row slice and zero-fills the tail -- and opts in via the
     optional ``CheckpointTensorConverter.is_dim0_zero_pad`` capability (see
     :func:`checkpoint_converter_is_dim0_zero_pad`).
+
+    PEFT NOTE: the body below has partial PEFT wiring (base-key ``base_layer``
+    remap + ``rank0_load_and_broadcast_lora_weights`` + fresh LoRA init), but the
+    streaming PEFT path currently fails with "Cannot copy out of meta tensor" for
+    the MoT MoE-LoRA wrappers, so it stays guarded off. A LoRA reload therefore
+    takes the whole-tensor :func:`load_model_weights` fallback (higher host-RAM
+    peak). Re-enabling streaming PEFT is tracked separately.
     """
     if kwargs.get("is_peft_model", False):
         raise NotImplementedError("ep_sharded_stream_load does not support PEFT models.")

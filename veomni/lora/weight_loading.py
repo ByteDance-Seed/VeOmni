@@ -227,6 +227,19 @@ def init_lora_parameter(model: nn.Module, name: str) -> None:
 
 
 def _reset_moe_wrapper(module: nn.Module) -> None:
-    """Reset a MoE wrapper only when all its params are still meta (BUG-3 guard)."""
-    if all(p.is_meta for _, p in module.named_parameters()):
-        module.reset_lora_parameters(init_lora_weights=True)
+    """Fresh-init a MoE wrapper's LoRA params (kaiming ``A`` / zero ``B``).
+
+    ``init_lora_parameter`` is only ever invoked for LoRA tensors the weight
+    loader left *un-loaded* (they stay in ``parameter_names_left``), so a wrapper
+    reaching here always needs initialisation. The previous ``all(p.is_meta)``
+    guard is dead under the standard loaders, which run ``model.to_empty(...)``
+    *before* init — after that no param is on meta, so the guard silently skipped
+    the reset and left the wrapper's ``lora_A`` / ``lora_B`` as the uninitialised
+    (garbage / NaN) storage ``to_empty`` produced. We reset once per wrapper
+    (idempotent); when an adapter *is* loaded, its LoRA tensors are removed from
+    the un-loaded set so this path is never taken for them (loaded weights are
+    never clobbered)."""
+    if getattr(module, "_lora_fresh_reset_done", False):
+        return
+    module.reset_lora_parameters(init_lora_weights=True)
+    module._lora_fresh_reset_done = True

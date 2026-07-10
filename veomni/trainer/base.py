@@ -412,6 +412,17 @@ class BaseTrainer(Stateful, ABC):
         if not bool(lora_config):
             return
 
+        # A model may fully own its LoRA wrapping (e.g. a MoE backbone whose
+        # expert kernel is incompatible with veomni's generic MoE-LoRA wrappers)
+        # via a ``customized_setup_lora`` hook returning the wrapped model. It is
+        # handed the raw ``lora_config`` dict (``lora_adapter`` key drives the
+        # resume-vs-fresh choice, same as below); the adapter *weights* are still
+        # streamed later by ``build_parallelize_model(adapter_path=...)``.
+        customized = getattr(self.model, "customized_setup_lora", None)
+        if callable(customized):
+            self.model = customized(lora_config)
+            return
+
         from ..lora import VeOmniLoraConfig, VeOmniLoraModel, resolve_fused_moe_lora_targets
 
         lora_adapter_path = lora_config.get("lora_adapter", None)
