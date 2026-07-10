@@ -85,11 +85,11 @@ gpu = [
 
 # Ascend NPU x86_64 — superset minus CUDA-only kernels (FA2/3/4, FlashQLA).
 npu = [
-  "torch==2.9.0+cpu",
-  "torch-npu==2.9.0.post2",
-  "torchvision==0.24.0+cpu",
-  "torchaudio==2.9.0+cpu",
-  "torchcodec>=0.8.0,<0.10.0",
+  "torch==2.10.0+cpu",
+  "torch-npu==2.10.0",
+  "torchvision==0.25.0+cpu",
+  "torchaudio==2.10.0+cpu",
+  "torchcodec==0.10.0",
   "decorator>=5.2.1",
   "scipy>=1.16.2",
   "av>=14.3.0,<15.0; python_version == '3.11'",
@@ -107,10 +107,10 @@ npu = [
 # torch 2.9 (0.11+ needs torch 2.10, 0.8-0.9 are x86_64-only).
 # av 14.4.0 has no aarch64 wheel, so pin to 14.2.0 for cp311 too.
 npu_aarch64 = [
-  "torch==2.9.0",
-  "torch-npu==2.9.0.post2",
-  "torchvision==0.24.0",
-  "torchaudio==2.9.0",
+  "torch==2.10.0",
+  "torch-npu==2.10.0",
+  "torchvision==0.25.0",
+  "torchaudio==2.10.0",
   "decorator>=5.2.1",
   "scipy>=1.16.2",
   "av>=14.2.0,<14.3; python_version == '3.11'",
@@ -169,14 +169,14 @@ override-dependencies = [
     "torchaudio==2.11.0+cu130; (extra == 'gpu')",
     "torchvision==0.26.0+cu130; (extra == 'gpu')",
     "torchcodec==0.12.0; (extra == 'gpu')",
-    "torch==2.9.0; (extra == 'npu_aarch64')",
-    "torchaudio==2.9.0; (extra == 'npu_aarch64')",
-    "torchvision==0.24.0; (extra == 'npu_aarch64')",
+    "torch==2.10.0; (extra == 'npu_aarch64')",
+    "torchaudio==2.10.0; (extra == 'npu_aarch64')",
+    "torchvision==0.25.0; (extra == 'npu_aarch64')",
     # Adding explicit override for NPU backends - x86 variant (default npu)
-    "torch==2.9.0+cpu; (extra == 'npu')",
-    "torchaudio==2.9.0+cpu; (extra == 'npu')",
-    "torchvision==0.24.0+cpu; (extra == 'npu')",
-    "torchcodec>=0.8.0,<0.10.0; (extra == 'npu')",
+    "torch==2.10.0+cpu; (extra == 'npu')",
+    "torchaudio==2.10.0+cpu; (extra == 'npu')",
+    "torchvision==0.25.0+cpu; (extra == 'npu')",
+    "torchcodec==0.10.0; (extra == 'npu')",
 ]
 
 conflicts = [
@@ -194,8 +194,8 @@ patchgen = { path = "patchgen-pkg", editable = true }
 # 3.11 and 3.12 URLs when bumping torch.
 torch = [
   { index = "pytorch", extra = "npu" },
-  { url = "https://files.pythonhosted.org/packages/58/fe/334225e6330e672b36aef23d77451fa906ea12881570c08638a91331a212/torch-2.9.0-cp311-cp311-manylinux_2_28_aarch64.whl", extra = 'npu_aarch64', marker = "python_version == '3.11'" },
-  { url = "https://files.pythonhosted.org/packages/d1/d3/3985739f3b8e88675127bf70f82b3a48ae083e39cda56305dbd90398fec0/torch-2.9.0-cp312-cp312-manylinux_2_28_aarch64.whl", extra = 'npu_aarch64', marker = "python_version == '3.12'" },
+  { url = "https://files.pythonhosted.org/packages/78/89/f5554b13ebd71e05c0b002f95148033e730d3f7067f67423026cc9c69410/torch-2.10.0-cp311-cp311-manylinux_2_28_aarch64.whl", extra = 'npu_aarch64', marker = "python_version == '3.11'" },
+  { url = "https://files.pythonhosted.org/packages/cc/af/758e242e9102e9988969b5e621d41f36b8f258bb4a099109b7a4b4b50ea4/torch-2.10.0-cp312-cp312-manylinux_2_28_aarch64.whl", extra = 'npu_aarch64', marker = "python_version == '3.12'" },
   { url = "https://download.pytorch.org/whl/cu130/torch-2.11.0%2Bcu130-cp311-cp311-manylinux_2_28_x86_64.whl", extra = 'gpu', marker = "python_version == '3.11'" },
   { url = "https://download.pytorch.org/whl/cu130/torch-2.11.0%2Bcu130-cp312-cp312-manylinux_2_28_x86_64.whl", extra = 'gpu', marker = "python_version == '3.12'" },
 ]
