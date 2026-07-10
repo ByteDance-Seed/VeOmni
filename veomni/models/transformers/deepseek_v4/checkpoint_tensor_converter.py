@@ -104,8 +104,14 @@ def _is_quantized_weight(tensor: torch.Tensor) -> bool:
     return tensor.dtype in _QUANTIZED_WEIGHT_DTYPES
 
 
+def _is_mtp_checkpoint_key(name: str) -> bool:
+    return name.removeprefix("model.").startswith("mtp.")
+
+
 def convert_deepseek_v4_checkpoint_key(name: str) -> str:
     """Convert DeepSeek's inference checkpoint names to Transformers v5 names."""
+    if _is_mtp_checkpoint_key(name):
+        return name
     has_model_prefix = name.startswith("model.")
     source_name = name.removeprefix("model.") if has_model_prefix else name
     converted_name, _ = rename_source_key(source_name, _DEEPSEEK_V4_WEIGHT_RENAMINGS, [])
@@ -153,12 +159,12 @@ def _dequantize_scaled_weight(weight: torch.Tensor, scale: torch.Tensor, *, pack
         return weight * scale.float()
     if weight.ndim != 2 or scale.ndim != 2:
         raise ValueError(
-            "DeepseekV4 FP8 checkpoint weight scales must be scalar or 2D block scales; "
+            "DeepseekV4 quantized checkpoint weight scales must be scalar or 2D block scales; "
             f"got weight shape {tuple(weight.shape)} and scale shape {tuple(scale.shape)}."
         )
     if weight.shape[0] % scale.shape[0] != 0 or weight.shape[1] % scale.shape[1] != 0:
         raise ValueError(
-            "DeepseekV4 FP8 checkpoint weight shape must be divisible by scale shape; "
+            "DeepseekV4 quantized checkpoint weight shape must be divisible by scale shape; "
             f"got weight shape {tuple(weight.shape)} and scale shape {tuple(scale.shape)}."
         )
 
@@ -190,10 +196,10 @@ class DeepseekV4CheckpointTensorConverter:
         # {prefix: {proj_name: stacked_tensor}} for gate/up merge waiting
         self._stacked_buffer: dict[str, dict[str, torch.Tensor]] = {}
         # {weight_name: {"weight": tensor, "scale": tensor}} for FP8/int8 checkpoint pairs.
-        self._scaled_weight_buffer: dict[str, dict[str, torch.Tensor | str]] = {}
+        self._scaled_weight_buffer: dict[str, dict[str, torch.Tensor | str | bool]] = {}
 
     def can_handle(self, name: str) -> bool:
-        if name.startswith("mtp."):
+        if _is_mtp_checkpoint_key(name):
             return False
         converted_name = convert_deepseek_v4_checkpoint_key(name)
         return (
@@ -203,12 +209,14 @@ class DeepseekV4CheckpointTensorConverter:
         )
 
     def can_handle_tensor(self, name: str, tensor: torch.Tensor) -> bool:
-        if name.startswith("mtp."):
+        if _is_mtp_checkpoint_key(name):
             return False
         converted_name = convert_deepseek_v4_checkpoint_key(name)
         return self.can_handle(name) or (converted_name.endswith(".weight") and _is_quantized_weight(tensor))
 
     def convert(self, name: str, tensor: torch.Tensor) -> ConvertedCheckpointTensor | None:
+        if _is_mtp_checkpoint_key(name):
+            return ConvertedCheckpointTensor(name, tensor)
         packed_fp4 = tensor.dtype == torch.int8 and bool(_RAW_FP4_EXPERT_WEIGHT_PATTERN.fullmatch(name))
         name = convert_deepseek_v4_checkpoint_key(name)
         weight_name = _weight_name_from_scale_name(name)

@@ -30,10 +30,10 @@ from veomni.models.checkpoint_tensor_loading import (
     get_checkpoint_tensor_converter,
     maybe_convert_checkpoint_tensor,
 )
-from veomni.models.transformers.deepseek_v4 import checkpoint_tensor_converter as deepseek_v4_converter
 from veomni.models.transformers.deepseek_v4.checkpoint_tensor_converter import (
     DeepseekV4CheckpointTensorConverter,
     _dequantize_scaled_weight,
+    _get_fp4_e2m1_table,
     convert_deepseek_v4_checkpoint_key,
     convert_deepseek_v4_fqn_to_index_mapping,
     create_deepseek_v4_checkpoint_tensor_converter,
@@ -438,6 +438,18 @@ class TestDeepseekV4ConverterCanHandle:
     def test_rejects_non_tensor_keys(self):
         assert not self.converter.can_handle("model.layers.0.mlp.experts.gate_up_proj")
 
+    @pytest.mark.parametrize("model_prefix", ("", "model."))
+    def test_ignores_mtp_checkpoint_keys(self, model_prefix: str):
+        stem = f"{model_prefix}mtp.0.attn.wkv"
+        weight = torch.ones(4, 4, dtype=torch.int8)
+
+        assert not self.converter.can_handle(f"{stem}.scale")
+        assert not self.converter.can_handle_tensor(f"{stem}.weight", weight)
+        result = maybe_convert_checkpoint_tensor(f"{stem}.weight", weight, self.converter)
+        assert result is not None
+        assert result.name == f"{stem}.weight"
+        assert result.tensor is weight
+
 
 class TestDeepseekV4ConverterConvert:
     def test_dequantizes_block_scaled_fp8_weight(self):
@@ -458,27 +470,14 @@ class TestDeepseekV4ConverterConvert:
         assert result.shape == (1, 64)
         assert torch.equal(result, expected)
 
-    def test_reuses_fp4_lookup_table(self, monkeypatch):
-        weight = torch.full((1, 32), 0x21, dtype=torch.uint8).view(torch.int8)
-        scale = torch.ones(1, 2)
-        original_tensor = torch.tensor
-        table_allocations = 0
-        deepseek_v4_converter._get_fp4_e2m1_table.cache_clear()
-
-        def counted_tensor(*args, **kwargs):
-            nonlocal table_allocations
-            if args and args[0] == deepseek_v4_converter._FP4_E2M1_VALUES:
-                table_allocations += 1
-            return original_tensor(*args, **kwargs)
-
-        monkeypatch.setattr(deepseek_v4_converter.torch, "tensor", counted_tensor)
-
+    def test_reuses_fp4_lookup_table(self):
+        _get_fp4_e2m1_table.cache_clear()
         try:
-            _dequantize_scaled_weight(weight, scale, packed_fp4=True)
-            _dequantize_scaled_weight(weight, scale, packed_fp4=True)
-            assert table_allocations == 1
+            first = _get_fp4_e2m1_table(torch.device("cpu"))
+            second = _get_fp4_e2m1_table(torch.device("cpu"))
+            assert first is second
         finally:
-            deepseek_v4_converter._get_fp4_e2m1_table.cache_clear()
+            _get_fp4_e2m1_table.cache_clear()
 
     def test_dequantizes_conventional_int8_weight_without_unpacking(self):
         weight = torch.arange(16, dtype=torch.int8).reshape(4, 4)
@@ -536,6 +535,7 @@ class TestDeepseekV4ConverterConvert:
             ("layers.2.hc_attn_base", "model.layers.2.attn_hc.base"),
             ("layers.2.hc_ffn_scale", "model.layers.2.ffn_hc.scale"),
             ("mtp.0.attn.wkv.weight", "mtp.0.attn.wkv.weight"),
+            ("model.mtp.0.attn.wkv.weight", "model.mtp.0.attn.wkv.weight"),
             ("model.custom.weight", "model.custom.weight"),
         ],
     )
@@ -803,6 +803,14 @@ class TestDeepseekV4ConverterFactoryAndMapping:
             "model.layers.0.mlp.experts.gate_up_proj": 2,
             "model.layers.0.mlp.experts.down_proj": 3,
         }
+
+    def test_fqn_mapping_preserves_mtp_keys(self):
+        mapping = {
+            "mtp.0.attn.wkv.weight": 0,
+            "model.mtp.0.attn.wkv.weight": 1,
+        }
+
+        assert convert_deepseek_v4_fqn_to_index_mapping(mapping) == mapping
 
 
 # ---------------------------------------------------------------------------
