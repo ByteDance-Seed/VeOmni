@@ -25,7 +25,7 @@ from ..arguments import MixedPrecisionConfig, VeOmniArguments
 from ..data import build_chat_template, build_data_transform
 from ..data.data_collator import PostCollator
 from ..distributed.clip_grad_norm import veomni_clip_grad_norm
-from ..distributed.parallel_state import get_parallel_state
+from ..distributed.parallel_state import get_parallel_state, use_model_parallel_state, use_parallel_state
 from ..distributed.sequence_parallel import gather_outputs
 from ..distributed.torch_compile import mark_compile_step_begin
 from ..distributed.torch_parallelize import build_parallelize_model
@@ -141,6 +141,10 @@ class TextDPOTrainer:
         self.base.args = args
 
         self.base._setup()
+        with use_parallel_state(self.base.parallel_state):
+            self._build_components()
+
+    def _build_components(self):
         self.base._build_model()
         self.base._freeze_model_module()
 
@@ -176,8 +180,8 @@ class TextDPOTrainer:
         )
 
     def _build_postforward(self):
-        self.post_forward = PostCollator()
-        self.sp_enabled = get_parallel_state().sp_enabled
+        self.post_forward = PostCollator(parallel_state=self.base.parallel_state)
+        self.sp_enabled = self.base.parallel_state.sp_enabled
 
     def _build_reference_model(self):
         """Build and freeze a reference model with the same architecture and FSDP sharding."""
@@ -214,6 +218,7 @@ class TextDPOTrainer:
             broadcast_model_weights_from_rank0=args.train.broadcast_model_weights_from_rank0,
             cpu_load_param_name=cpu_load_param_name,
             max_load_broadcast_size=args.train.accelerator.fsdp_config.max_load_broadcast_size,
+            parallel_state=self.base.parallel_state,
         )
         self.reference_model.eval()
         helper.print_device_mem_info("VRAM usage after building reference model")
@@ -254,7 +259,9 @@ class TextDPOTrainer:
 
         return losses, chosen_rewards, rejected_rewards
 
-    def concatenated_forward(self, model: nn.Module, micro_batch: Dict[str, Any]) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _concatenated_forward(
+        self, model: nn.Module, micro_batch: Dict[str, Any]
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Run a single forward pass on the packed batch containing chosen+rejected pairs.
 
         Each DPO sample contributes two consecutive sequences (chosen
@@ -312,6 +319,11 @@ class TextDPOTrainer:
         all_logps_t = torch.stack(all_logps)
         return all_logps_t[0::2], all_logps_t[1::2]
 
+    def concatenated_forward(self, model: nn.Module, micro_batch: Dict[str, Any]) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Run DPO forward under the state owned by ``model``."""
+        with use_model_parallel_state(model):
+            return self._concatenated_forward(model, micro_batch)
+
     def forward_backward_step(
         self, micro_batch: Dict[str, torch.Tensor]
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
@@ -348,8 +360,9 @@ class TextDPOTrainer:
             "reward_margin": (chosen_rewards - rejected_rewards).mean().detach(),
         }
 
-        with self.base.model_bwd_context, set_batch_invariant_mode(args.train.enable_batch_invariant_mode):
-            loss.backward()
+        with use_model_parallel_state(self.base.model):
+            with self.base.model_bwd_context, set_batch_invariant_mode(args.train.enable_batch_invariant_mode):
+                loss.backward()
 
         del micro_batch
         return loss, loss_dict
@@ -395,7 +408,9 @@ class TextDPOTrainer:
             for k, v in loss_dict.items():
                 total_loss_dict[k] += v.item()
 
-        grad_norm = veomni_clip_grad_norm(self.base.model, args.train.optimizer.max_grad_norm)
+        grad_norm = veomni_clip_grad_norm(
+            self.base.model, args.train.optimizer.max_grad_norm, parallel_state=self.base.parallel_state
+        )
 
         self.base.optimizer.step()
         self.base.lr_scheduler.step()

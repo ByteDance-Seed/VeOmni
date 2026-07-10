@@ -15,7 +15,7 @@
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from dataclasses import asdict, dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -40,6 +40,9 @@ from ..utils.seqlen_pos_transform_utils import (
 # Signature: ``fn(batch: dict, sp_pad: dict[str, int]) -> None`` — mutates
 # ``batch`` in place, writing ``batch["multimodal_metadata"]``.
 MetadataCollateFunc = Callable[[Dict[str, Any], Dict[str, int]], None]
+
+if TYPE_CHECKING:
+    from ..distributed.parallel_state import ParallelState
 
 
 logger = logging.get_logger(__name__)
@@ -210,9 +213,14 @@ class PackingCollator(DataCollator):
     # Model-provided hook (see ``MetadataCollateFunc``). ``None`` for text
     # models / pipelines without multimodal metadata — then this is a no-op.
     metadata_collate_func: Optional[MetadataCollateFunc] = None
+    parallel_state: Optional["ParallelState"] = None
 
     def __post_init__(self):
-        self.sp_enabled = get_parallel_state().sp_enabled
+        parallel_state = self.parallel_state or get_parallel_state()
+        self.sp_enabled = parallel_state.sp_enabled
+        # Worker-side collators must stay pickle-safe for the documented spawn
+        # path. DeviceMesh/ProcessGroup objects remain in the parent process.
+        self.parallel_state = None
 
     def pad_feature_to_length(
         self,
@@ -307,10 +315,13 @@ class SequenceParallelCollator(DataCollator):
     # Model-provided hook (see ``MetadataCollateFunc``). ``None`` for text
     # models / pipelines without multimodal metadata — then this is a no-op.
     metadata_collate_func: Optional[MetadataCollateFunc] = None
+    parallel_state: Optional["ParallelState"] = None
 
     def __post_init__(self):
-        self.sp_size = get_parallel_state().sp_size
-        self.sp_rank = get_parallel_state().sp_rank
+        parallel_state = self.parallel_state or get_parallel_state()
+        self.sp_size = parallel_state.sp_size
+        self.sp_rank = parallel_state.sp_rank
+        self.parallel_state = None
 
     def sp_slice(self, key: str, feature: torch.Tensor, dim: int = -1) -> torch.Tensor:
         if isinstance(feature, list):
@@ -418,6 +429,7 @@ class MainCollator(DataCollator):
     pad_to_length: bool = False
     seq_classification: bool = False
     metadata_collate_func: Optional[MetadataCollateFunc] = None
+    parallel_state: Optional["ParallelState"] = None
 
     """
     Data collator pipeline with a unified collate info.
@@ -436,6 +448,8 @@ class MainCollator(DataCollator):
     """
 
     def __post_init__(self):
+        parallel_state = self.parallel_state or get_parallel_state()
+        self.parallel_state = None
         self.preforward_pipeline = []
         self.collate_infos: Dict[str, DataCollateInfo] = {}
 
@@ -465,14 +479,16 @@ class MainCollator(DataCollator):
                 pad_to_length=self.pad_to_length,
                 seq_classification=self.seq_classification,
                 metadata_collate_func=self.metadata_collate_func,
+                parallel_state=parallel_state,
             )
         )
-        if get_parallel_state().sp_enabled:
+        if parallel_state.sp_enabled:
             self.preforward_pipeline.append(
                 SequenceParallelCollator(
                     collate_infos=self.collate_infos,
                     seq_classification=self.seq_classification,
                     metadata_collate_func=self.metadata_collate_func,
+                    parallel_state=parallel_state,
                 )
             )
         logger.info_rank0(self.log_collate_infos())
@@ -508,10 +524,11 @@ class MainCollator(DataCollator):
 
 @dataclass
 class PostCollator(DataCollator):
-    def __init__(self):
+    def __init__(self, parallel_state: Optional["ParallelState"] = None):
+        self.parallel_state = parallel_state or get_parallel_state()
         self.postforward_pipeline = []
         self.compute_seqlens_func = SeqlensComputePostCollator()
-        self.postforward_pipeline.append(PackingPostCollator())
+        self.postforward_pipeline.append(PackingPostCollator(parallel_state=self.parallel_state))
 
     def __call__(self, outputs: ModelOutput, micro_batch: Dict[str, torch.Tensor]):
         seq_lens = self.compute_seqlens_func(micro_batch)
@@ -529,10 +546,15 @@ class SeqlensComputePostCollator(DataCollator):
 
 @dataclass
 class PackingPostCollator(DataCollator):
+    parallel_state: Optional["ParallelState"] = None
+
+    def __post_init__(self):
+        self.parallel_state = self.parallel_state or get_parallel_state()
+
     def __call__(self, outputs: ModelOutput, seq_lens):
         logits = outputs.logits
-        if get_parallel_state().sp_enabled:
-            logits = gather_outputs(logits, gather_dim=0, group=get_parallel_state().sp_group)
+        if self.parallel_state.sp_enabled:
+            logits = gather_outputs(logits, gather_dim=0, group=self.parallel_state.sp_group)
             logits = logits[: sum(seq_lens)]  # remove sp padding
         logits_list = logits.split(seq_lens, dim=0)
         outputs.logits = logits_list

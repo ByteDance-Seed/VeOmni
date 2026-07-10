@@ -131,7 +131,7 @@ YAML Config -> VeOmniArguments -> Trainer
 
 VeOmni uses FSDP2 exclusively.
 
-1. `init_parallel_state()` -> global `DeviceMesh` with named dims (`dp_shard`, `ulysses`, `cp`, etc.) + per-ExtraParallel submeshes (`[ep × ep_fsdp]`)
+1. `build_parallel_state()` / compatibility `init_parallel_state()` -> a `ParallelState` with a global `DeviceMesh` containing named dims (`dp_shard`, `ulysses`, `cp`, etc.) + per-ExtraParallel submeshes (`[ep × ep_fsdp]`)
 2. Model-specific `parallel_plan.py` -> define EP/embedding weight sharding via `ParallelPlan`
 3. `build_parallelize_model()` -> `parallelize_model_fsdp2()`:
    - `ParallelPlan.apply()` wraps EP/embedding params as DTensors on para mesh
@@ -140,6 +140,12 @@ VeOmni uses FSDP2 exclusively.
    - `fully_shard()` on root model
 4. SP is orthogonal to FSDP2 — models call Ulysses all-to-all (`gather_seq_scatter_heads` / `gather_heads_scatter_seq`) around attention; the FSDP shard mesh fuses with SP mesh (`dp_shard_sp`)
 5. EP token routing is in model MoE code + `moe_layer.py` using `ep_group` from `ParallelState`
+
+### Model-owned parallel state
+
+`ParallelState` ownership follows the model, not the trainer. `build_parallelize_model(..., parallel_state=ps)` binds a non-serialized state reference to the returned model. Optimizer, gradient clipping, checkpoint, and data-pipeline builders accept that state explicitly. This allows one RL trainer to coordinate policy, reference, reward, and drafter models with different parallel topologies.
+
+Existing patched modeling code still calls `get_parallel_state()`. During migration, `use_model_parallel_state(model)` exposes the model-owned state through a `ContextVar` for the duration of that model's execution. The context is a compatibility bridge rather than the source of truth; new model-owned APIs should accept a `ParallelState` or process group explicitly.
 
 ## Config Structure
 

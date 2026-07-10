@@ -57,7 +57,12 @@ from ..data.data_collator import DataCollator, MainCollator
 from ..data.data_transform import build_data_transform
 from ..distributed.clip_grad_norm import veomni_clip_grad_norm
 from ..distributed.offloading import build_activation_offloading_context
-from ..distributed.parallel_state import init_parallel_state
+from ..distributed.parallel_state import (
+    clear_parallel_state_cache,
+    init_parallel_state,
+    use_model_parallel_state,
+    use_parallel_state,
+)
 from ..distributed.torch_compile import CompileConfig, mark_compile_step_begin
 from ..distributed.torch_parallelize import build_parallelize_model
 from ..models import build_foundation_model, build_tokenizer
@@ -289,6 +294,11 @@ class BaseTrainer(Stateful, ABC):
 
         self.args: VeOmniArguments = args
         self._setup()
+        with use_parallel_state(self.parallel_state):
+            self._build_components()
+
+    def _build_components(self):
+        """Build resources that belong to this trainer's model state."""
         # build model
         self._build_model()
         # freeze module and print trainable parameters
@@ -327,7 +337,7 @@ class BaseTrainer(Stateful, ABC):
         logger.info(f"Process rank: {self.args.train.global_rank}, world size: {self.args.train.world_size}")
 
         # Initialize parallel state
-        init_parallel_state(
+        self.parallel_state = init_parallel_state(
             dp_size=self.args.train.accelerator.dp_size,
             dp_replicate_size=self.args.train.accelerator.dp_replicate_size,
             dp_shard_size=self.args.train.accelerator.dp_shard_size,
@@ -458,6 +468,7 @@ class BaseTrainer(Stateful, ABC):
         self.collate_fn = MainCollator(
             pad_to_length=pad_to_length,
             seq_classification=seq_classification,
+            parallel_state=self.parallel_state,
         )
 
     def _build_dataloader(self):
@@ -482,6 +493,7 @@ class BaseTrainer(Stateful, ABC):
             dyn_bsz_buffer_size=args.data.dyn_bsz_buffer_size,
             seed=args.train.seed,
             collate_fn=self.collate_fn,
+            parallel_state=self.parallel_state,
             save_steps=args.train.checkpoint.save_steps,
             **dataloader_kwargs,
         )
@@ -524,6 +536,7 @@ class BaseTrainer(Stateful, ABC):
             compile_config=CompileConfig(
                 **{field.name: getattr(args.train.torch_compile, field.name) for field in fields(CompileConfig)}
             ),
+            parallel_state=self.parallel_state,
             **kwargs,
         )
         self.model.train()
@@ -540,6 +553,7 @@ class BaseTrainer(Stateful, ABC):
             no_decay_modules=args.train.optimizer.no_decay_modules,
             no_decay_params=args.train.optimizer.no_decay_params,
             muon_kwargs=_collect_muon_kwargs(args.train.optimizer),
+            parallel_state=self.parallel_state,
         )
 
     def _build_lr_scheduler(self):
@@ -673,16 +687,17 @@ class BaseTrainer(Stateful, ABC):
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         micro_batch = self.preforward(micro_batch)
 
-        with self.model_fwd_context, set_batch_invariant_mode(self.args.train.enable_batch_invariant_mode):
-            outputs: ModelOutput = self.model(**micro_batch, use_cache=False)
+        with use_model_parallel_state(self.model):
+            with self.model_fwd_context, set_batch_invariant_mode(self.args.train.enable_batch_invariant_mode):
+                outputs: ModelOutput = self.model(**micro_batch, use_cache=False)
 
-        loss: torch.Tensor
-        loss_dict: Dict[str, torch.Tensor]
-        loss, loss_dict = self.postforward(outputs, micro_batch)
+            loss: torch.Tensor
+            loss_dict: Dict[str, torch.Tensor]
+            loss, loss_dict = self.postforward(outputs, micro_batch)
 
-        # Backward pass
-        with self.model_bwd_context, set_batch_invariant_mode(self.args.train.enable_batch_invariant_mode):
-            loss.backward()
+            # Backward pass
+            with self.model_bwd_context, set_batch_invariant_mode(self.args.train.enable_batch_invariant_mode):
+                loss.backward()
 
         del micro_batch
         return loss, loss_dict
@@ -748,7 +763,9 @@ class BaseTrainer(Stateful, ABC):
                 total_loss_dict[k] += v.item()
 
         # Gradient clipping
-        grad_norm = veomni_clip_grad_norm(self.model, args.train.optimizer.max_grad_norm)
+        grad_norm = veomni_clip_grad_norm(
+            self.model, args.train.optimizer.max_grad_norm, parallel_state=self.parallel_state
+        )
 
         # Optimizer and scheduler step
         self.optimizer.step()
@@ -774,6 +791,7 @@ class BaseTrainer(Stateful, ABC):
 
         synchronize()
         dist.destroy_process_group()
+        clear_parallel_state_cache()
 
     def train(self):
         args: VeOmniArguments = self.args

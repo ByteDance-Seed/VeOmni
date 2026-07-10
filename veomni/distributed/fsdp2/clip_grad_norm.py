@@ -9,16 +9,28 @@ from torch.utils._foreach_utils import _device_has_foreach_support, _has_foreach
 
 from ...utils.device import get_device_type
 from ...utils.logging import get_logger
-from ..parallel_state import get_parallel_state
+from ..parallel_state import ParallelState, get_parallel_state, resolve_model_parallel_state
 
 
 logger = get_logger(__name__)
 _LOCAL_NORM_CHUNK_SIZE = 128
 
 
+def _resolve_parallel_state(model, parallel_state: ParallelState | None) -> ParallelState:
+    if parallel_state is None and getattr(model, "_veomni_parallel_state", None) is None:
+        parallel_state = get_parallel_state()
+    return resolve_model_parallel_state(model, parallel_state)
+
+
 def clip_grad_norm(
-    model, max_norm: float, norm_type: float = 2.0, error_if_nonfinite: bool = False, foreach: bool | None = None
+    model,
+    max_norm: float,
+    norm_type: float = 2.0,
+    error_if_nonfinite: bool = False,
+    foreach: bool | None = None,
+    parallel_state: ParallelState | None = None,
 ) -> torch.Tensor:
+    parallel_state = _resolve_parallel_state(model, parallel_state)
     if hasattr(model, "_extra_parallel_param_groups"):
         return extra_parallel_fsdp2_clip_grad_norm(
             model,
@@ -26,6 +38,7 @@ def clip_grad_norm(
             norm_type=norm_type,
             error_if_nonfinite=error_if_nonfinite,
             foreach=foreach,
+            parallel_state=parallel_state,
         )
 
     if getattr(model, "_fsdp_cpu_offload_enabled", False):
@@ -35,6 +48,7 @@ def clip_grad_norm(
             norm_type=norm_type,
             error_if_nonfinite=error_if_nonfinite,
             foreach=foreach,
+            parallel_state=parallel_state,
         )
 
     grad_norm = torch.nn.utils.clip_grad_norm_(
@@ -67,9 +81,14 @@ def _fsdp_grad_norm_reduce_groups(ps) -> List[tuple[str, dist.ProcessGroup | Non
 
 @torch.no_grad()
 def _cpu_offload_fsdp2_clip_grad_norm(
-    model, max_norm: float, norm_type: float = 2.0, error_if_nonfinite: bool = False, foreach: bool | None = None
+    model,
+    max_norm: float,
+    norm_type: float = 2.0,
+    error_if_nonfinite: bool = False,
+    foreach: bool | None = None,
+    parallel_state: ParallelState | None = None,
 ) -> torch.Tensor:
-    ps = get_parallel_state()
+    ps = _resolve_parallel_state(model, parallel_state)
     params = [p for p in model.parameters() if p.grad is not None]
     total_norm_or_pth_sum = _fsdp2_reduce_group(
         params=params,
@@ -86,7 +105,12 @@ def _cpu_offload_fsdp2_clip_grad_norm(
 
 @torch.no_grad()
 def extra_parallel_fsdp2_clip_grad_norm(
-    model, max_norm: float, norm_type: float = 2.0, error_if_nonfinite: bool = False, foreach: bool | None = None
+    model,
+    max_norm: float,
+    norm_type: float = 2.0,
+    error_if_nonfinite: bool = False,
+    foreach: bool | None = None,
+    parallel_state: ParallelState | None = None,
 ) -> torch.Tensor:
     """
     ExtraParallel-aware gradient clipping for composable FSDP2:
@@ -98,7 +122,7 @@ def extra_parallel_fsdp2_clip_grad_norm(
     - For inf-norm: take elementwise MAX with the same reduction groups (MAX).
     - Use a single global clip coefficient for both groups.
     """
-    ps = get_parallel_state()
+    ps = _resolve_parallel_state(model, parallel_state)
     extra_parallel_group = {
         para: ps.extra_parallel_group(para) if ps.extra_parallel_enabled(para) else None
         for para in ps.extra_parallel_names

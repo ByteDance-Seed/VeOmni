@@ -47,6 +47,11 @@ Core entry points:
    - When SP is enabled, the FSDP shard mesh fuses with the SP mesh (`dp_shard_sp`) so sequence-parallel ranks co-shard via FSDP.
    - Gradient clipping: `veomni/distributed/fsdp2/clip_grad_norm.py` — handles DTensor grads and ExtraParallel param groups.
 
+5a. **Parallel state is model-owned**
+   - `build_parallelize_model(..., parallel_state=ps)` binds `ps` to the model; policy, reference, reward, and drafter models may own different states in one process.
+   - Model-owned consumers (optimizer, gradient clipping, checkpointing, collators) must receive the owning state explicitly or resolve it from the model. Do not add new process-global group/state ownership.
+   - `use_model_parallel_state(model)` is a `ContextVar` compatibility bridge for existing modeling code that calls `get_parallel_state()`. Custom autograd functions must capture process groups during forward rather than consulting ambient state during backward.
+
 6. **Device mesh initialization (`init_parallel_state()`)**
    - Builds a global `DeviceMesh` with named dimensions: `pp`, `dp_replicate`, `dp_shard`, `ulysses`, `cp`, `tp` (each included only if size > 1).
    - Flattens subviews for common usage: `dp` (all data-parallel), `sp` (ulysses+cp), `dp_shard_sp` (FSDP shard × SP), `dp_sp` (for loss/grad sync across SP+DP).

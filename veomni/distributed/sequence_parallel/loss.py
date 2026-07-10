@@ -18,10 +18,7 @@ from typing import Optional, Tuple
 import torch
 import torch.distributed as dist
 
-from .comm import (
-    get_unified_sequence_parallel_group,
-    get_unified_sequence_parallel_world_size,
-)
+from .comm import get_unified_sequence_parallel_group
 
 
 class ReduceLoss(torch.autograd.Function):
@@ -32,6 +29,7 @@ class ReduceLoss(torch.autograd.Function):
         local_num_tokens = num_valid_tokens.detach().clone()
         loss *= num_valid_tokens
         group = get_unified_sequence_parallel_group()
+        ctx.sp_world_size = dist.get_world_size(group)
         dist.all_reduce(loss, group=group)
         dist.all_reduce(num_valid_tokens, group=group)
         ctx.save_for_backward(local_num_tokens, num_valid_tokens)
@@ -51,12 +49,7 @@ class ReduceLoss(torch.autograd.Function):
 
         # FIX: Mirror the forward guard — zero grad when global tokens = 0,
         # preventing NaN grad_output from corrupting downstream parameters.
-        grad_output = (
-            get_unified_sequence_parallel_world_size()
-            * local_num_tokens
-            * grad_output
-            / global_num_tokens.clamp(min=1)
-        )
+        grad_output = ctx.sp_world_size * local_num_tokens * grad_output / global_num_tokens.clamp(min=1)
         return grad_output, None
 
 

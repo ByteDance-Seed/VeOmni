@@ -29,7 +29,7 @@ from torch.distributed.checkpoint.stateful import Stateful
 from torch.optim import AdamW
 from torch.optim.optimizer import Optimizer
 
-from ..distributed.parallel_state import get_parallel_state
+from ..distributed.parallel_state import ParallelState, resolve_model_parallel_state
 from ..utils import logging
 from .muon import DistributedMuon, split_muon_adamw_params
 
@@ -349,8 +349,8 @@ class MultiOptimizer(Optimizer, Stateful):
         return len(self.optimizers_dict)
 
 
-def _should_build_extra_parallel_aware(model: "nn.Module") -> bool:
-    ps = get_parallel_state()
+def _should_build_extra_parallel_aware(model: "nn.Module", parallel_state: ParallelState) -> bool:
+    ps = parallel_state
     if ps.dp_mode == "fsdp2" and ps.any_extra_parallel_enabled:
         return True
 
@@ -409,7 +409,9 @@ def build_optimizer(
     no_decay_modules: Optional[List[str]] = None,
     no_decay_params: Optional[List[str]] = None,
     muon_kwargs: Optional[Dict[str, Any]] = None,
+    parallel_state: Optional[ParallelState] = None,
 ) -> "torch.optim.Optimizer":
+    parallel_state = resolve_model_parallel_state(model, parallel_state)
     if optimizer_type == "muon":
         if param_groups is not None:
             logger.warning_rank0(
@@ -428,6 +430,7 @@ def build_optimizer(
             no_decay_modules=no_decay_modules,
             no_decay_params=no_decay_params,
             muon_kwargs=muon_kwargs,
+            parallel_state=parallel_state,
         )
 
     if param_groups is not None:
@@ -435,9 +438,19 @@ def build_optimizer(
         if not param_groups:
             raise ValueError("All optimizer param groups are empty; no trainable parameters to optimize.")
 
-    if _should_build_extra_parallel_aware(model):
+    if _should_build_extra_parallel_aware(model, parallel_state):
         return build_extra_parallel_fsdp2_optimizer(
-            model, lr, betas, eps, weight_decay, fused, optimizer_type, param_groups, no_decay_modules, no_decay_params
+            model,
+            lr,
+            betas,
+            eps,
+            weight_decay,
+            fused,
+            optimizer_type,
+            param_groups,
+            no_decay_modules,
+            no_decay_params,
+            parallel_state,
         )
     if param_groups is None:
         decay_param_names = get_parameter_names(model, no_decay_modules, no_decay_params)
@@ -501,6 +514,7 @@ def _build_muon_with_adamw(
     no_decay_modules: Optional[List[str]],
     no_decay_params: Optional[List[str]],
     muon_kwargs: Optional[Dict[str, Any]],
+    parallel_state: ParallelState,
 ) -> "MultiOptimizer":
     """Build a Muon (2D/3D hidden weights) + AdamW (everything else) MultiOptimizer.
 
@@ -519,8 +533,7 @@ def _build_muon_with_adamw(
             "Falling back to AdamW would be silent so we raise instead."
         )
 
-    extra_parallel_aware = _should_build_extra_parallel_aware(model)
-    parallel_state = get_parallel_state() if extra_parallel_aware else None
+    extra_parallel_aware = _should_build_extra_parallel_aware(model, parallel_state)
     extra_parallel_names = list(parallel_state.extra_parallel_names) if extra_parallel_aware else []
 
     def _split_by_ep(
@@ -611,6 +624,7 @@ def build_extra_parallel_fsdp2_optimizer(
     param_groups: Optional[List[Dict[str, Any]]] = None,
     no_decay_modules: Optional[List[str]] = None,
     no_decay_params: Optional[List[str]] = None,
+    parallel_state: Optional[ParallelState] = None,
 ):
     """
     Build a MultiOptimizer instance when model is parallelized with ExtraParallel+FSDP2
@@ -622,7 +636,7 @@ def build_extra_parallel_fsdp2_optimizer(
     - Each group's params are automatically split into ExtraParallel1, ExtraParallel2, ... and non-ExtraParallel based on DTensor mesh
     - Custom learning rates and other optimizer settings are preserved per group
     """
-    parallel_state = get_parallel_state()
+    parallel_state = resolve_model_parallel_state(model, parallel_state)
 
     # Collect all ExtraParallel and non-ExtraParallel parameters across all groups
     extra_parallel_groups = {

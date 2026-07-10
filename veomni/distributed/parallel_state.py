@@ -16,9 +16,11 @@
 # Adapted from https://github.com/pytorch/torchtitan/blob/main/torchtitan/distributed/parallel_dims.py
 
 import os
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from functools import cached_property, wraps
-from typing import TYPE_CHECKING, Callable, Dict, Literal, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, Iterator, Literal, Optional, Tuple
 
 from torch import distributed as dist
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
@@ -34,7 +36,35 @@ if TYPE_CHECKING:
 
 logger = logging.get_logger(__name__)
 
-_PARALLEL_STATE: "ParallelState" = None
+# Backward-compatible default for code paths that have not been migrated to a
+# model-owned state yet. It is deliberately not mutated when additional models
+# build their own parallel states.
+_PARALLEL_STATE: Optional["ParallelState"] = None
+
+# The active value is execution-context-local and is only a compatibility bridge
+# for modeling code that still calls ``get_parallel_state()``. The source of
+# truth is the state bound to the model being built or executed.
+_CURRENT_PARALLEL_STATE: ContextVar[Optional["ParallelState"]] = ContextVar(
+    "veomni_current_parallel_state", default=None
+)
+
+_MODEL_PARALLEL_STATE_ATTR = "_veomni_parallel_state"
+
+# Process-group creation is collective and expensive. States with identical
+# topologies share their meshes within one default-process-group lifetime.
+_PARALLEL_STATE_CACHE: Dict[tuple, "ParallelState"] = {}
+_PARALLEL_STATE_CACHE_PROCESS_GROUP: Any = None
+_PARALLEL_STATE_CACHE_SESSION = object()
+
+
+def _parallel_state_cache_session():
+    """Return an identity token for the current default-process-group lifetime."""
+    global _PARALLEL_STATE_CACHE_PROCESS_GROUP, _PARALLEL_STATE_CACHE_SESSION
+    default_group = dist.group.WORLD if dist.is_initialized() else None
+    if default_group is not _PARALLEL_STATE_CACHE_PROCESS_GROUP:
+        _PARALLEL_STATE_CACHE_PROCESS_GROUP = default_group
+        _PARALLEL_STATE_CACHE_SESSION = object()
+    return _PARALLEL_STATE_CACHE_SESSION
 
 
 def requires_mesh(fn: Callable) -> Callable:
@@ -81,30 +111,11 @@ class ParallelState:
                 f"The product of dp_replicate_size: {self.dp_replicate_size} and dp_shard_size: {self.dp_shard_size} should be equal to dp_size: {self.dp_size}."
             )
 
-        if self.sp_enabled:
-            from ..distributed.sequence_parallel import (
-                init_sequence_parallel,
-                set_context_parallel_group,
-                set_data_parallel_group,
-                set_ulysses_sequence_parallel_group,
-                set_unified_sequence_parallel_group,
+        if self.sp_enabled and self.device_mesh is None:
+            raise ValueError(
+                "A sequence-parallel ParallelState must be built with a device mesh "
+                "through build_parallel_state() or init_parallel_state()."
             )
-
-            if self.device_mesh is not None:
-                set_data_parallel_group(self.device_mesh.get_group("dp"))
-                if self.ulysses_size > 1:
-                    set_ulysses_sequence_parallel_group(self.device_mesh.get_group("ulysses"))
-                if self.cp_size > 1:
-                    set_context_parallel_group(self.device_mesh.get_group("cp"))
-                # set unified sequence parallel group
-                set_unified_sequence_parallel_group(self.device_mesh.get_group("sp"))
-            else:
-                init_sequence_parallel(
-                    ulysses_size=self.ulysses_size,
-                    sep_dp=True,
-                    ulysses_group_key="default",
-                    cp_size=self.cp_size,
-                )
 
     @property
     def is_initialized(self) -> bool:
@@ -131,23 +142,12 @@ class ParallelState:
     def dp_group(self) -> Optional["ProcessGroup"]:
         if self.device_mesh is not None:
             return self.device_mesh.get_group("dp")
-
-        if self.sp_enabled:
-            from ..distributed.sequence_parallel import get_data_parallel_group
-
-            return get_data_parallel_group()
-
-        return self.fsdp_group
+        return None
 
     @property
     def dp_rank(self) -> int:
         if self.device_mesh is not None:
             return self.device_mesh.get_local_rank("dp")
-
-        if self.sp_enabled:
-            from ..distributed.sequence_parallel import get_data_parallel_rank
-
-            return get_data_parallel_rank()
 
         return self.fsdp_rank
 
@@ -375,26 +375,14 @@ class ParallelState:
     # ------------------------------ SP ------------------------------ #
     @property
     def sp_group(self) -> Optional["ProcessGroup"]:
-        if self.device_mesh is not None:
+        if self.device_mesh is not None and self.sp_enabled:
             return self.device_mesh.get_group("sp")
-
-        if self.sp_enabled:
-            from .sequence_parallel import get_unified_sequence_parallel_group
-
-            return get_unified_sequence_parallel_group()
-
         return None
 
     @property
     def sp_rank(self) -> int:
-        if self.device_mesh is not None:
+        if self.device_mesh is not None and self.sp_enabled:
             return self.device_mesh.get_local_rank("sp")
-
-        if self.sp_enabled:
-            from .sequence_parallel import get_unified_sequence_parallel_rank
-
-            return get_unified_sequence_parallel_rank()
-
         return -1
 
     @property
@@ -407,26 +395,14 @@ class ParallelState:
 
     @property
     def ulysses_group(self) -> Optional["ProcessGroup"]:
-        if self.device_mesh is not None:
+        if self.device_mesh is not None and self.ulysses_enabled:
             return self.device_mesh.get_group("ulysses")
-
-        if self.sp_enabled:
-            from .sequence_parallel import get_ulysses_sequence_parallel_group
-
-            return get_ulysses_sequence_parallel_group()
-
         return None
 
     @property
     def ulysses_rank(self) -> int:
-        if self.device_mesh is not None:
+        if self.device_mesh is not None and self.ulysses_enabled:
             return self.device_mesh.get_local_rank("ulysses")
-
-        if self.sp_enabled:
-            from .sequence_parallel import get_ulysses_sequence_parallel_rank
-
-            return get_ulysses_sequence_parallel_rank()
-
         return -1
 
     @property
@@ -435,26 +411,14 @@ class ParallelState:
 
     @property
     def cp_group(self) -> Optional["ProcessGroup"]:
-        if self.device_mesh is not None:
+        if self.device_mesh is not None and self.cp_enabled:
             return self.device_mesh.get_group("cp")
-
-        if self.sp_enabled:
-            from .sequence_parallel import get_context_parallel_group
-
-            return get_context_parallel_group()
-
         return None
 
     @property
     def cp_rank(self) -> int:
-        if self.device_mesh is not None:
+        if self.device_mesh is not None and self.cp_enabled:
             return self.device_mesh.get_local_rank("cp")
-
-        if self.sp_enabled:
-            from .sequence_parallel import get_context_parallel_rank
-
-            return get_context_parallel_rank()
-
         return -1
 
     @property
@@ -462,7 +426,7 @@ class ParallelState:
         return self.cp_size > 1
 
 
-def init_parallel_state(
+def build_parallel_state(
     dp_size: int = 1,
     dp_replicate_size: int = 1,
     dp_shard_size: int = 1,
@@ -477,15 +441,14 @@ def init_parallel_state(
     extra_parallel_placement_innermost: Tuple[bool] = (False,),
     extra_parallel_names: Tuple[str] = ("ep",),
     async_enabled: Optional[bool] = False,
-) -> None:
+) -> "ParallelState":
     """
-    Initializes global parallel state.
-    """
-    global _PARALLEL_STATE
-    if _PARALLEL_STATE is not None:
-        logger.warning("Parallel state has already been initialized.")
-        return
+    Build or reuse a parallel state without changing the default state.
 
+    All ranks must request topologies in the same order because creating device
+    meshes is collective. Cache entries are scoped to the current default
+    process group so distributed teardown cannot leave reusable stale groups.
+    """
     if device_type is None:
         device_type = get_device_type()
 
@@ -493,10 +456,35 @@ def init_parallel_state(
     if dp_size > 1 and dp_shard_size == 1 and dp_replicate_size == 1:
         dp_shard_size = dp_size
 
+    extra_parallel_sizes = tuple(extra_parallel_sizes)
+    extra_parallel_placement_innermost = tuple(extra_parallel_placement_innermost)
+    extra_parallel_names = tuple(extra_parallel_names)
+
     # Note that Expert Parallel is included into Extra Parallel
     assert len(extra_parallel_sizes) == len(extra_parallel_placement_innermost) == len(extra_parallel_names), (
         "each extra parallel should correspond to a size, a placement and a name"
     )
+
+    cache_key = (
+        _parallel_state_cache_session(),
+        dp_size,
+        dp_replicate_size,
+        dp_shard_size,
+        tp_size,
+        pp_size,
+        cp_size,
+        ulysses_size,
+        dp_mode,
+        device_type,
+        include_sp_in_fsdp,
+        extra_parallel_sizes,
+        extra_parallel_placement_innermost,
+        extra_parallel_names,
+        async_enabled,
+    )
+    if cached_state := _PARALLEL_STATE_CACHE.get(cache_key):
+        logger.info_rank0("Reusing parallel state for an identical topology.")
+        return cached_state
 
     logger.info_rank0(
         f"Initializing parallel state: dp_size {dp_size}, dp_replicate_size {dp_replicate_size}, "
@@ -601,7 +589,7 @@ def init_parallel_state(
     for para_name in extra_parallel_names:
         logger.info_rank0(f"{para_name} FSDP device mesh: {extra_parallel_fsdp_device_mesh[para_name]}")
 
-    _PARALLEL_STATE = ParallelState(
+    parallel_state = ParallelState(
         dp_size=dp_size,
         dp_replicate_size=dp_replicate_size,
         dp_shard_size=dp_shard_size,
@@ -619,13 +607,115 @@ def init_parallel_state(
         async_enabled=async_enabled,
     )
 
+    _PARALLEL_STATE_CACHE[cache_key] = parallel_state
+    return parallel_state
+
+
+def init_parallel_state(
+    dp_size: int = 1,
+    dp_replicate_size: int = 1,
+    dp_shard_size: int = 1,
+    tp_size: int = 1,
+    pp_size: int = 1,
+    cp_size: int = 1,
+    ulysses_size: int = 1,
+    dp_mode: Literal["ddp", "fsdp2"] = "fsdp2",
+    device_type: str = None,
+    include_sp_in_fsdp: bool = True,
+    extra_parallel_sizes: Tuple[int] = (1,),
+    extra_parallel_placement_innermost: Tuple[bool] = (False,),
+    extra_parallel_names: Tuple[str] = ("ep",),
+    async_enabled: Optional[bool] = False,
+) -> "ParallelState":
+    """Build a state and install it as the legacy default on first use."""
+    global _PARALLEL_STATE
+    parallel_state = build_parallel_state(
+        dp_size=dp_size,
+        dp_replicate_size=dp_replicate_size,
+        dp_shard_size=dp_shard_size,
+        tp_size=tp_size,
+        pp_size=pp_size,
+        cp_size=cp_size,
+        ulysses_size=ulysses_size,
+        dp_mode=dp_mode,
+        device_type=device_type,
+        include_sp_in_fsdp=include_sp_in_fsdp,
+        extra_parallel_sizes=extra_parallel_sizes,
+        extra_parallel_placement_innermost=extra_parallel_placement_innermost,
+        extra_parallel_names=extra_parallel_names,
+        async_enabled=async_enabled,
+    )
+    if _PARALLEL_STATE is None:
+        _PARALLEL_STATE = parallel_state
+    return parallel_state
+
+
+def clear_parallel_state_cache() -> None:
+    """Clear cached meshes after the default distributed process group ends."""
+    global _PARALLEL_STATE, _PARALLEL_STATE_CACHE_PROCESS_GROUP, _PARALLEL_STATE_CACHE_SESSION
+    _PARALLEL_STATE = None
+    _PARALLEL_STATE_CACHE_PROCESS_GROUP = None
+    _PARALLEL_STATE_CACHE_SESSION = object()
+    _CURRENT_PARALLEL_STATE.set(None)
+    _PARALLEL_STATE_CACHE.clear()
+
+
+@contextmanager
+def use_parallel_state(parallel_state: "ParallelState") -> Iterator["ParallelState"]:
+    """Expose a model-owned state to legacy modeling code in this context."""
+    token = _CURRENT_PARALLEL_STATE.set(parallel_state)
+    try:
+        yield parallel_state
+    finally:
+        _CURRENT_PARALLEL_STATE.reset(token)
+
+
+def bind_model_parallel_state(model: Any, parallel_state: "ParallelState") -> Any:
+    """Bind a non-serialized parallel-state reference to a model."""
+    setattr(model, _MODEL_PARALLEL_STATE_ATTR, parallel_state)
+    return model
+
+
+def get_model_parallel_state(model: Any) -> "ParallelState":
+    """Return the state owned by ``model`` or raise when it is unbound."""
+    parallel_state = getattr(model, _MODEL_PARALLEL_STATE_ATTR, None)
+    if parallel_state is None:
+        raise ValueError(
+            "The model has no bound ParallelState. Pass parallel_state to build_parallelize_model() "
+            "or call bind_model_parallel_state() first."
+        )
+    return parallel_state
+
+
+def resolve_model_parallel_state(model: Any, parallel_state: Optional["ParallelState"] = None) -> "ParallelState":
+    """Resolve an explicit state, then a model-owned state, then legacy context."""
+    if parallel_state is not None:
+        return parallel_state
+    if (model_state := getattr(model, _MODEL_PARALLEL_STATE_ATTR, None)) is not None:
+        return model_state
+    return get_parallel_state()
+
+
+@contextmanager
+def use_model_parallel_state(model: Any) -> Iterator["ParallelState"]:
+    """Run legacy modeling code under the state owned by ``model``."""
+    with use_parallel_state(get_model_parallel_state(model)) as parallel_state:
+        yield parallel_state
+
 
 def get_parallel_state() -> "ParallelState":
     """
-    Returns global parallel state.
+    Return the current model-owned state, falling back to the legacy default.
     """
+    if (parallel_state := _CURRENT_PARALLEL_STATE.get()) is not None:
+        return parallel_state
     if _PARALLEL_STATE is None:
         logger.warning_once("Parallel state has not been initialized. returning default Single-process state.")
         return ParallelState()
 
     return _PARALLEL_STATE
+
+
+def get_current_parallel_state() -> Optional["ParallelState"]:
+    """Return the state active in this execution context, without fallback."""
+    return _CURRENT_PARALLEL_STATE.get()

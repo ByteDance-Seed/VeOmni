@@ -38,7 +38,7 @@ from torch.distributed.checkpoint.state_dict import (
 )
 from torch.distributed.checkpoint.stateful import Stateful
 
-from ..distributed.parallel_state import get_parallel_state
+from ..distributed.parallel_state import ParallelState, get_parallel_state, resolve_model_parallel_state
 from ..optim.optimizer import restore_optimizer_param_group_defaults
 from ..utils import logging
 from ..utils.checkpoint_utils import _GLOBAL_STEP_PREFIX
@@ -170,13 +170,15 @@ class ModelState(Stateful):
             (already populated from ``model_path``) base params are left untouched.
     """
 
-    def __init__(self, model, trainable_only: bool = False):
+    def __init__(self, model, trainable_only: bool = False, parallel_state: Optional[ParallelState] = None):
         self.model = model
         self.trainable_only = trainable_only
 
         # Determine whether this is ExtraParallel+FSDP2 case
         # If so, we need to restore Para(e.g. EP)-dim before saving to DCP
-        self.parallel_state = get_parallel_state()
+        if parallel_state is None and getattr(model, "_veomni_parallel_state", None) is None:
+            parallel_state = get_parallel_state()
+        self.parallel_state = resolve_model_parallel_state(model, parallel_state)
         self.extra_parallel_fqn2spec_info = getattr(self.model, "_fqn2spec_info", None)
         self.should_extra_parallel_aware = (
             self.extra_parallel_fqn2spec_info is not None and self.parallel_state.dp_mode == "fsdp2"
@@ -241,10 +243,12 @@ class OptimizerState(Stateful):
     ``ModelState.load_state_dict`` for non-LoRA loads.
     """
 
-    def __init__(self, model, optimizer):
+    def __init__(self, model, optimizer, parallel_state: Optional[ParallelState] = None):
         self.model = model
         self.optimizer = optimizer
-        self.parallel_state = get_parallel_state()
+        if parallel_state is None and getattr(model, "_veomni_parallel_state", None) is None:
+            parallel_state = get_parallel_state()
+        self.parallel_state = resolve_model_parallel_state(model, parallel_state)
         self.extra_parallel_fqn2spec_info = getattr(self.model, "_fqn2spec_info", None)
         self.should_extra_parallel_aware = (
             self.extra_parallel_fqn2spec_info is not None and self.parallel_state.dp_mode == "fsdp2"

@@ -29,7 +29,11 @@ from ..arguments import DataArguments, ModelArguments, TrainingArguments, VeOmni
 from ..data import build_data_transform, build_dataloader
 from ..data.data_collator import DataCollator
 from ..distributed.clip_grad_norm import veomni_clip_grad_norm
-from ..distributed.parallel_state import get_parallel_state
+from ..distributed.parallel_state import (
+    bind_model_parallel_state,
+    use_model_parallel_state,
+    use_parallel_state,
+)
 from ..models import build_foundation_model
 from ..models.auto import build_config
 from ..models.loader import MODEL_CONFIG_REGISTRY, MODELING_REGISTRY
@@ -183,7 +187,10 @@ class DiTTrainer:
 
         # rewrite _setup, setup arguments for dit training
         self._setup()
+        with use_parallel_state(self.base.parallel_state):
+            self._build_components()
 
+    def _build_components(self):
         # rewrite _build_model, build condition model & dit model
         self._build_model()
 
@@ -220,7 +227,7 @@ class DiTTrainer:
         args.train.micro_batch_size = 1
         # dataloader_batch_size was computed in __post_init__ when dyn_bsz was still True
         # (default), so it was set to 1. Recompute now that dyn_bsz=False.
-        args.train.dataloader_batch_size = args.train.global_batch_size // get_parallel_state().dp_size
+        args.train.dataloader_batch_size = args.train.global_batch_size // self.base.parallel_state.dp_size
         if args.train.training_task == "offline_embedding":
             assert args.data.datasets_type == "mapping", "Datasets type must be mapping for offline embedding."
             if args.data.offline_embedding_save_dir is None:
@@ -235,7 +242,7 @@ class DiTTrainer:
             # No gradient accumulation needed; process one sample per step to
             # avoid broadcast_object_list serialising all micro-batches at once
             # which can OOM CPU memory with large video data.
-            args.train.global_batch_size = get_parallel_state().dp_size
+            args.train.global_batch_size = self.base.parallel_state.dp_size
             args.train.dataloader_batch_size = 1
             logger.info_rank0(
                 f"Task offline_embedding. Drop last: {args.data.drop_last}, shuffle: {args.data.shuffle}"
@@ -293,6 +300,7 @@ class DiTTrainer:
             self.condition_model = model_class._from_config(condition_cfg)
             self.condition_model.to(get_device_type())
             logger.info_rank0("Condition model loaded.")
+        bind_model_parallel_state(self.condition_model, self.base.parallel_state)
 
     def _freeze_model_module(self):
         self.condition_model.requires_grad_(False)
@@ -318,14 +326,15 @@ class DiTTrainer:
 
     def _build_dataset(self):
         args: VeOmniDiTArguments = self.base.args
+        parallel_state = self.base.parallel_state
         self.base._build_dataset()
-        if get_parallel_state().sp_enabled and get_parallel_state().sp_rank != 0:
+        if parallel_state.sp_enabled and parallel_state.sp_rank != 0:
             self.base.train_dataset = None
 
         if self.training_task == "offline_embedding":
-            if not get_parallel_state().sp_enabled or get_parallel_state().sp_rank == 0:
-                dp_rank = get_parallel_state().dp_rank
-                dp_size = get_parallel_state().dp_size
+            if not parallel_state.sp_enabled or parallel_state.sp_rank == 0:
+                dp_rank = parallel_state.dp_rank
+                dp_size = parallel_state.dp_size
                 dataset_len = len(self.base.train_dataset)
                 base_count = dataset_len // dp_size
                 extra = dataset_len % dp_size
@@ -347,14 +356,14 @@ class DiTTrainer:
 
         # Sync _train_steps across the SP group AFTER padding so every rank
         # agrees on step count (required to avoid deadlocks in broadcast_object_list).
-        if get_parallel_state().sp_enabled:
+        if parallel_state.sp_enabled:
             steps_t = torch.zeros(1, dtype=torch.int64, device=torch.device(get_device_type()))
-            if get_parallel_state().sp_rank == 0:
+            if parallel_state.sp_rank == 0:
                 steps_t[0] = args._train_steps
             dist.broadcast(
                 steps_t,
-                src=dist.get_global_rank(get_parallel_state().sp_group, 0),
-                group=get_parallel_state().sp_group,
+                src=dist.get_global_rank(parallel_state.sp_group, 0),
+                group=parallel_state.sp_group,
             )
             args._train_steps = int(steps_t.item())
             self.base.train_steps = args.train_steps
@@ -362,7 +371,8 @@ class DiTTrainer:
     def _build_dataloader(self):
         """Build dataloader with dyn_bsz=False for DiT (fixed batch)."""
         args = self.base.args
-        if not get_parallel_state().sp_enabled or get_parallel_state().sp_rank == 0:
+        parallel_state = self.base.parallel_state
+        if not parallel_state.sp_enabled or parallel_state.sp_rank == 0:
             self.base.train_dataloader = build_dataloader(
                 dataloader_type=args.data.dataloader.type,
                 dataset=self.base.train_dataset,
@@ -384,6 +394,7 @@ class DiTTrainer:
                 prefetch_factor=args.data.dataloader.prefetch_factor,
                 seed=args.train.seed,
                 collate_fn=DiTDataCollator(),
+                parallel_state=parallel_state,
                 save_steps=args.train.checkpoint.save_steps,
             )
         else:
@@ -445,7 +456,7 @@ class DiTTrainer:
     def forward_backward_step(self, micro_batch: Dict[str, torch.Tensor]) -> tuple:
         micro_batch = self.preforward(micro_batch)
         if self.training_task == "online_training" or self.training_task == "offline_embedding":
-            with torch.no_grad():
+            with use_model_parallel_state(self.condition_model), torch.no_grad():
                 micro_batch = self.condition_model.get_condition(**micro_batch)
 
         if self.training_task == "offline_embedding":
@@ -455,29 +466,31 @@ class DiTTrainer:
             del micro_batch
             return 0.0, {}
 
-        with torch.no_grad():
+        with use_model_parallel_state(self.condition_model), torch.no_grad():
             micro_batch = self.condition_model.process_condition(**micro_batch)
-        with self.base.model_fwd_context:
-            outputs = self.base.model(**micro_batch)
+        with use_model_parallel_state(self.base.model):
+            with self.base.model_fwd_context:
+                outputs = self.base.model(**micro_batch)
 
-        loss: torch.Tensor
-        loss_dict: Dict[str, torch.Tensor]
-        loss, loss_dict = self.postforward(outputs, micro_batch)
+            loss: torch.Tensor
+            loss_dict: Dict[str, torch.Tensor]
+            loss, loss_dict = self.postforward(outputs, micro_batch)
 
-        # Backward pass
-        with self.base.model_bwd_context:
-            loss.backward()
+            # Backward pass
+            with self.base.model_bwd_context:
+                loss.backward()
 
         del micro_batch
         return loss, loss_dict
 
     def train_step(self, data_iterator: Any) -> Dict[str, float]:
         args = self.base.args
+        parallel_state = self.base.parallel_state
         self.base.state.global_step += 1
 
         # broadcast micro_batches from sp_rank_0 to all ranks
-        if get_parallel_state().sp_enabled:
-            if get_parallel_state().sp_rank == 0:
+        if parallel_state.sp_enabled:
+            if parallel_state.sp_rank == 0:
                 micro_batches = next(data_iterator)
             else:
                 micro_batches = None
@@ -485,8 +498,8 @@ class DiTTrainer:
             obj_list = [micro_batches]
             dist.broadcast_object_list(
                 obj_list,
-                src=dist.get_global_rank(get_parallel_state().sp_group, 0),
-                group=get_parallel_state().sp_group,
+                src=dist.get_global_rank(parallel_state.sp_group, 0),
+                group=parallel_state.sp_group,
             )
             micro_batches = obj_list[0]
         else:
@@ -517,7 +530,9 @@ class DiTTrainer:
                     total_loss_dict[k] += v.item()
 
         if self.training_task != "offline_embedding":
-            grad_norm = veomni_clip_grad_norm(self.base.model, args.train.optimizer.max_grad_norm)
+            grad_norm = veomni_clip_grad_norm(
+                self.base.model, args.train.optimizer.max_grad_norm, parallel_state=parallel_state
+            )
             self.base.optimizer.step()
             self.base.lr_scheduler.step()
             self.base.optimizer.zero_grad()

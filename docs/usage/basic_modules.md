@@ -68,16 +68,19 @@ class Arguments(VeOmniArguments):
 ```
 
 ## Parallel State
-VeOmni use torch device mesh to manage all the parallel state, which is useful and concise when working with multi-dimensional parallelism (i.e. 3-D parallel) where parallelism composability is required. You can create the parallel state by calling the `init_parallel_state` function. and get the parallel state by calling the `get_parallel_state` function.
+VeOmni uses torch device meshes to represent parallel state. A state is owned by the model that uses its topology, so one RL trainer can coordinate policy, reference, reward, and drafter models with different DP/SP/EP layouts. `build_parallel_state()` constructs a state without changing another model's state, and `build_parallelize_model(..., parallel_state=ps)` binds it to the model.
+
+`init_parallel_state()` and `get_parallel_state()` remain compatibility APIs for single-model tasks and existing model patches. New orchestration code should retain the returned state and pass it explicitly.
 
 More details about torch device mesh, you can refer to the [Getting Started with DeviceMesh](https://pytorch.org/tutorials/recipes/distributed_device_mesh.html).
 
 - source code [veomni/distributed/parallel_state.py](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/distributed/parallel_state.py).
 
 ```python
-from veomni.distributed.parallel_state import get_parallel_state, init_parallel_state
+from veomni.distributed.parallel_state import build_parallel_state, use_model_parallel_state
+from veomni.distributed.torch_parallelize import build_parallelize_model
 
-init_parallel_state(
+policy_state = build_parallel_state(
     dp_size=args.train.accelerator.dp_size, # data parallel size
     dp_replicate_size=args.train.accelerator.dp_replicate_size, # data parallel replicate size
     dp_shard_size=args.train.accelerator.dp_shard_size, # data parallel shard degree
@@ -88,23 +91,30 @@ init_parallel_state(
     extra_parallel_sizes=args.train.accelerator.extra_parallel_sizes, # including expert parallel size
     extra_parallel_placement_innermost=args.train.accelerator.extra_parallel_placement_innermost,
     extra_parallel_names=args.train.accelerator.extra_parallel_names,
-    mode=args.train.accelerator.fsdp_config.fsdp_mode, # data parallel mode, can be "ddp" or "fsdp2"
+    dp_mode=args.train.accelerator.fsdp_config.fsdp_mode, # data parallel mode, can be "ddp" or "fsdp2"
     async_enabled=args.train.accelerator.enable_async, # async ulysses
 )
 
-parallel_state = get_parallel_state()
+policy_model = build_parallelize_model(
+    policy_model,
+    parallel_state=policy_state,
+    # other parallelization and weight-loading options
+)
+
+with use_model_parallel_state(policy_model):
+    outputs = policy_model(**batch)
 
 # Access dp state
-dp_mesh = parallel_state.dp_mesh
-dp_group = parallel_state.dp_group
+dp_mesh = policy_state.dp_mesh
+dp_group = policy_state.dp_group
 
 # Access sp state
-sp_group = parallel_state.sp_group
-sp_rank = parallel_state.sp_rank
+sp_group = policy_state.sp_group
+sp_rank = policy_state.sp_rank
 
 # Access tp state
-tp_group = parallel_state.tp_group
-tp_mesh = parallel_state.tp_mesh
+tp_group = policy_state.tp_group
+tp_mesh = policy_state.tp_mesh
 ```
 
 ## Dataset

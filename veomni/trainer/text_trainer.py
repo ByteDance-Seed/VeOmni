@@ -23,6 +23,7 @@ from ..data import (
     build_data_transform,
 )
 from ..distributed.clip_grad_norm import veomni_clip_grad_norm
+from ..distributed.parallel_state import use_parallel_state
 from ..distributed.torch_compile import mark_compile_step_begin
 from ..models import build_tokenizer
 from ..utils import helper
@@ -44,6 +45,10 @@ class TextTrainer:
         self.base.args = args
 
         self.base._setup()
+        with use_parallel_state(self.base.parallel_state):
+            self._build_components()
+
+    def _build_components(self):
         self.base._build_model()
         self.base._freeze_model_module()
 
@@ -136,7 +141,9 @@ class TextTrainer:
                 total_loss_dict[k] += v.item()
 
         # Gradient clipping
-        grad_norm = veomni_clip_grad_norm(self.base.model, args.train.optimizer.max_grad_norm)
+        grad_norm = veomni_clip_grad_norm(
+            self.base.model, args.train.optimizer.max_grad_norm, parallel_state=self.base.parallel_state
+        )
 
         # Optimizer and scheduler step
         self.base.optimizer.step()

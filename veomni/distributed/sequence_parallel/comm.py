@@ -32,6 +32,21 @@ _UNIFIED_SEQUENCE_PARALLEL_GROUP = None
 _UNIFIED_SEQUENCE_PARALLEL_CPU_GROUP = None
 
 
+def _current_parallel_state():
+    # Lazy import avoids the parallel_state -> sequence_parallel import cycle.
+    # Production groups resolve from the model-owned state; the globals below
+    # remain only for legacy meshless initialization and unit-test injection.
+    from ..parallel_state import get_current_parallel_state
+
+    return get_current_parallel_state()
+
+
+def _fallback_parallel_state():
+    from ..parallel_state import get_parallel_state
+
+    return get_parallel_state()
+
+
 # ------------------------------ Data Parallel ------------------------------ #
 def set_data_parallel_group(group: dist.ProcessGroup):
     """
@@ -45,8 +60,12 @@ def get_data_parallel_group() -> Optional[dist.ProcessGroup]:
     """
     Get data parallel process group.
     """
-    global _DATA_PARALLEL_GROUP
-    return _DATA_PARALLEL_GROUP
+    current_state = _current_parallel_state()
+    if current_state is not None:
+        return current_state.dp_group
+    if _DATA_PARALLEL_GROUP is not None:
+        return _DATA_PARALLEL_GROUP
+    return _fallback_parallel_state().dp_group
 
 
 def get_data_parallel_rank() -> Optional[dist.ProcessGroup]:
@@ -106,7 +125,12 @@ def get_ulysses_sequence_parallel_group() -> Optional[dist.ProcessGroup]:
     group_key = get_ulysses_sequence_parallel_group_key()
     if group_key not in _ULYSSES_SEQUENCE_PARALLEL_GROUP:
         raise RuntimeError(f"Unknown key {group_key} in Ulysses sequence parallel group!")
-    return _ULYSSES_SEQUENCE_PARALLEL_GROUP[group_key]
+    current_state = _current_parallel_state()
+    if current_state is not None:
+        return current_state.ulysses_group
+    if (group := _ULYSSES_SEQUENCE_PARALLEL_GROUP[group_key]) is not None:
+        return group
+    return _fallback_parallel_state().ulysses_group
 
 
 def get_ulysses_sequence_parallel_cpu_group() -> Optional[dist.ProcessGroup]:
@@ -170,9 +194,16 @@ def set_context_parallel_group(cp_group: dist.ProcessGroup):
 def get_context_parallel_group(check_initialized=True):
     """Get the context parallel group the caller rank belongs to."""
     global _CONTEXT_PARALLEL_GROUP
+    current_state = _current_parallel_state()
+    if current_state is not None:
+        group = current_state.cp_group
+    elif _CONTEXT_PARALLEL_GROUP is not None:
+        group = _CONTEXT_PARALLEL_GROUP
+    else:
+        group = _fallback_parallel_state().cp_group
     if check_initialized:
-        assert _CONTEXT_PARALLEL_GROUP is not None, "context parallel group is not initialized"
-    return _CONTEXT_PARALLEL_GROUP
+        assert group is not None, "context parallel group is not initialized"
+    return group
 
 
 def get_context_parallel_rank():
@@ -213,8 +244,12 @@ def get_unified_sequence_parallel_group() -> Optional[dist.ProcessGroup]:
     """
     Get unified sequence parallel process group.
     """
-    global _UNIFIED_SEQUENCE_PARALLEL_GROUP
-    return _UNIFIED_SEQUENCE_PARALLEL_GROUP
+    current_state = _current_parallel_state()
+    if current_state is not None:
+        return current_state.sp_group
+    if _UNIFIED_SEQUENCE_PARALLEL_GROUP is not None:
+        return _UNIFIED_SEQUENCE_PARALLEL_GROUP
+    return _fallback_parallel_state().sp_group
 
 
 def get_unified_sequence_parallel_cpu_group() -> Optional[dist.ProcessGroup]:
@@ -336,7 +371,7 @@ def is_context_parallel_initialized() -> bool:
     """
     Check if ulysses sequence parallel is initialized.
     """
-    return get_context_parallel_group() is not None
+    return get_context_parallel_group(check_initialized=False) is not None
 
 
 def get_ulysses_group_key_context(group_key: str = "default"):

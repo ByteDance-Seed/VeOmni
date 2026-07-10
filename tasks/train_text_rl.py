@@ -1,4 +1,5 @@
 from veomni.arguments import parse_args
+from veomni.distributed.parallel_state import use_parallel_state
 from veomni.trainer.base_rl_trainer import BaseRLTrainer
 from veomni.trainer.text_trainer import TextTrainer, VeOmniArguments
 
@@ -13,6 +14,10 @@ class TextRLTrainer(TextTrainer):
         self.base.args = args
 
         self.base._setup()
+        with use_parallel_state(self.base.parallel_state):
+            self._build_components()
+
+    def _build_components(self):
         self.base._build_model()
         self.base._freeze_model_module()
 

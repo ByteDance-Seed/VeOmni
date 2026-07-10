@@ -21,6 +21,7 @@ import torch
 from ..arguments import DataArguments, ModelArguments, TrainingArguments, VeOmniArguments
 from ..data import MainCollator, build_data_transform, build_multimodal_chat_template
 from ..distributed.clip_grad_norm import veomni_clip_grad_norm
+from ..distributed.parallel_state import use_parallel_state
 from ..models import build_foundation_model, build_processor
 from ..optim import build_optimizer
 from ..utils import helper
@@ -103,7 +104,10 @@ class VLMTrainer:
         self.base.args = args
 
         self.base._setup()
+        with use_parallel_state(self.base.parallel_state):
+            self._build_components()
 
+    def _build_components(self):
         # rewrite build model to support data balancing
         self._build_model()
 
@@ -222,6 +226,7 @@ class VLMTrainer:
             seq_classification=seq_classification,
             data_collate_info=data_collate_info,
             metadata_collate_func=metadata_collate_func,
+            parallel_state=self.base.parallel_state,
         )
 
     def _build_optimizer(self):
@@ -256,6 +261,7 @@ class VLMTrainer:
             no_decay_modules=args.train.optimizer.no_decay_modules,
             no_decay_params=args.train.optimizer.no_decay_params,
             muon_kwargs=_collect_muon_kwargs(args.train.optimizer),
+            parallel_state=self.base.parallel_state,
         )
 
     def on_train_begin(self):
@@ -310,7 +316,9 @@ class VLMTrainer:
                 total_loss_dict[k] += v.item()
 
         # Gradient clipping
-        grad_norm = veomni_clip_grad_norm(self.base.model, args.train.optimizer.max_grad_norm)
+        grad_norm = veomni_clip_grad_norm(
+            self.base.model, args.train.optimizer.max_grad_norm, parallel_state=self.base.parallel_state
+        )
 
         # Optimizer and scheduler step
         self.base.optimizer.step()

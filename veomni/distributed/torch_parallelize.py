@@ -32,7 +32,13 @@ from ..utils import logging
 from ..utils.device import IS_NPU_AVAILABLE, get_device_type
 from .checkpoint import CheckpointFunction
 from .parallel_plan import get_runtime_parallel_plan
-from .parallel_state import get_parallel_state
+from .parallel_state import (
+    ParallelState,
+    bind_model_parallel_state,
+    get_parallel_state,
+    resolve_model_parallel_state,
+    use_parallel_state,
+)
 from .torch_compile import CompileConfig, compile_decoder_blocks, validate_compile_config_for_fsdp2
 from .utils import sort_fqn_by_submodule_first
 
@@ -498,7 +504,7 @@ def parallelize_model_fsdp2(
     return model
 
 
-def build_parallelize_model(
+def _build_parallelize_model(
     model: "nn.Module",
     weights_path: Optional[str] = None,
     enable_reshard_after_forward: bool = True,
@@ -567,3 +573,33 @@ def build_parallelize_model(
         raise RuntimeError("train.torch_compile.enable requires FSDP2; compile without FSDP is not supported.")
 
     return model
+
+
+def build_parallelize_model(
+    model: "nn.Module",
+    weights_path: Optional[str] = None,
+    enable_reshard_after_forward: bool = True,
+    mixed_precision: MixedPrecisionConfig = MixedPrecisionConfig(enable=True),  # noqa
+    enable_gradient_checkpointing: bool = True,
+    basic_modules: Optional[List[str]] = None,
+    muon_expert_zero_comm: bool = False,
+    compile_config: Optional[CompileConfig] = None,
+    parallel_state: Optional[ParallelState] = None,
+    **kwargs,
+) -> "nn.Module":
+    """Parallelize ``model`` and bind the state that owns its topology."""
+    parallel_state = resolve_model_parallel_state(model, parallel_state)
+    bind_model_parallel_state(model, parallel_state)
+    with use_parallel_state(parallel_state):
+        model = _build_parallelize_model(
+            model=model,
+            weights_path=weights_path,
+            enable_reshard_after_forward=enable_reshard_after_forward,
+            mixed_precision=mixed_precision,
+            enable_gradient_checkpointing=enable_gradient_checkpointing,
+            basic_modules=basic_modules,
+            muon_expert_zero_comm=muon_expert_zero_comm,
+            compile_config=compile_config,
+            **kwargs,
+        )
+    return bind_model_parallel_state(model, parallel_state)

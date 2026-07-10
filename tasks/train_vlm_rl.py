@@ -1,4 +1,5 @@
 from veomni.arguments import parse_args
+from veomni.distributed.parallel_state import use_parallel_state
 from veomni.trainer.base_rl_trainer import BaseRLTrainer
 from veomni.trainer.vlm_trainer import VeOmniVLMArguments, VLMTrainer
 
@@ -13,7 +14,10 @@ class VLMRLTrainer(VLMTrainer):
         self.base.args = args
 
         self.base._setup()
+        with use_parallel_state(self.base.parallel_state):
+            self._build_components()
 
+    def _build_components(self):
         # rewrite build model to support data balancing
         self._build_model()
 
