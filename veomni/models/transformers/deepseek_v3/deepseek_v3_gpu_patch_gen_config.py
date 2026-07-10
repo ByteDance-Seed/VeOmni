@@ -252,7 +252,9 @@ config.add_helper_after("DeepseekV3DecoderLayer", DeepseekV3MultiTokenPredictor)
 )
 def deepseek_v3_forcausallm_init_mtp(original_init, self, config):
     original_init(self, config)
-    num_mtp_layers = getattr(config, "num_nextn_predict_layers", 0)
+    num_mtp_layers = (
+        getattr(config, "num_nextn_predict_layers", 0) if getattr(config, "_veomni_enable_mtp", False) else 0
+    )
     if num_mtp_layers:
         # parallelize_model_fsdp2 uses these exact class names to select
         # independently sharded decoder blocks before applying root FSDP.
@@ -270,9 +272,9 @@ def deepseek_v3_forcausallm_init_mtp(original_init, self, config):
     description="Configure runtime-only DeepSeek-V3 MTP training state",
 )
 def deepseek_v3_configure_mtp_training(self, enabled, loss_weight):
-    num_mtp_layers = getattr(self.config, "num_nextn_predict_layers", 0)
+    num_mtp_layers = len(self.model.layers) - self.config.num_hidden_layers
     if enabled and num_mtp_layers <= 0:
-        raise ValueError("DeepSeek-V3 MTP training requires num_nextn_predict_layers > 0.")
+        raise ValueError("DeepSeek-V3 MTP training requires MTP modules to be enabled at model construction.")
     self._mtp_training_enabled = enabled
     self._mtp_loss_weight = loss_weight
     for predictor in self.model.layers[self.config.num_hidden_layers :]:

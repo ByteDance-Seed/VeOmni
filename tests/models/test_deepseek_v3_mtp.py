@@ -34,6 +34,38 @@ def test_enable_mtp_rejects_unsupported_model():
         BaseTrainer._configure_mtp_training(trainer)
 
 
+def test_disabled_argument_overrides_private_model_config(monkeypatch):
+    captured_kwargs = {}
+
+    def fake_build_foundation_model(**kwargs):
+        captured_kwargs.update(kwargs["config_kwargs"])
+        return SimpleNamespace(config=SimpleNamespace(**kwargs["config_kwargs"]))
+
+    monkeypatch.setattr("veomni.trainer.base.build_foundation_model", fake_build_foundation_model)
+    trainer = SimpleNamespace(
+        args=SimpleNamespace(
+            model=SimpleNamespace(
+                config_path="unused",
+                model_path=None,
+                model_config={"_veomni_enable_mtp": True},
+                ops_implementation=None,
+            ),
+            train=SimpleNamespace(
+                enable_mtp=False,
+                mtp_loss_weight=0.1,
+                init_device="meta",
+                accelerator=SimpleNamespace(fsdp_config=SimpleNamespace(mixed_precision=SimpleNamespace(enable=True))),
+            ),
+        ),
+        _configure_mtp_training=lambda: None,
+    )
+
+    BaseTrainer._build_model(trainer)
+
+    assert captured_kwargs["_veomni_enable_mtp"] is False
+    assert not hasattr(trainer.model.config, "_veomni_enable_mtp")
+
+
 @pytest.mark.parametrize("loss_weight", [-1.0, float("nan"), float("inf")])
 def test_mtp_loss_weight_must_be_finite_and_non_negative(loss_weight):
     with pytest.raises(ValueError, match="finite and >= 0"):
@@ -60,6 +92,23 @@ def test_mtp_shared_checkpoint_aliases_are_redirected_to_canonical_parameters():
         "model.norm.weight": 4,
         "lm_head.weight": 5,
     }
+
+
+def test_disabled_mtp_converter_consumes_all_predictor_weights():
+    converter = DeepseekV3CheckpointTensorConverter(
+        num_experts=2,
+        num_hidden_layers=1,
+        mtp_enabled=False,
+    )
+    mtp_weights = [
+        "model.layers.1.eh_proj.weight",
+        "model.layers.1.self_attn.q_proj.weight",
+        "model.layers.1.mlp.experts.0.gate_proj.weight",
+    ]
+    for name in mtp_weights:
+        assert converter.can_handle(name)
+        assert converter.convert(name, torch.empty(1)) is None
+    assert converter.finalize() == []
 
 
 @pytest.mark.parametrize(
@@ -107,6 +156,7 @@ def test_mtp_module_uses_official_checkpoint_keys():
         qk_rope_head_dim=4,
         v_head_dim=4,
         num_nextn_predict_layers=1,
+        _veomni_enable_mtp=True,
     )
     model = modeling.DeepseekV3ForCausalLM(config)
     state_keys = set(model.state_dict())
@@ -121,6 +171,10 @@ def test_mtp_module_uses_official_checkpoint_keys():
     target_classes = set(model._no_split_modules)
     fsdp_block_names = {name for name, module in model.named_modules() if module.__class__.__name__ in target_classes}
     assert "model.layers.1" in fsdp_block_names
+
+    config._veomni_enable_mtp = False
+    disabled_model = modeling.DeepseekV3ForCausalLM(config)
+    assert len(disabled_model.model.layers) == config.num_hidden_layers
 
 
 def test_mtp_loss_backpropagates_to_predictor(monkeypatch):
@@ -150,6 +204,7 @@ def test_mtp_loss_backpropagates_to_predictor(monkeypatch):
         qk_rope_head_dim=4,
         v_head_dim=4,
         num_nextn_predict_layers=1,
+        _veomni_enable_mtp=True,
     )
     config._attn_implementation = "eager"
     model = modeling.DeepseekV3ForCausalLM(config)

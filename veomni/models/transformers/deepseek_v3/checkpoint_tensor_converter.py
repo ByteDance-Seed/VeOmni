@@ -42,6 +42,7 @@ logger = logging.get_logger(__name__)
 # Matches per-expert split keys like: model.layers.0.mlp.experts.3.gate_proj.weight
 _EXPERT_PATTERN = re.compile(r"^(.+\.mlp)\.experts\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight$")
 _MTP_SHARED_PATTERN = re.compile(r"^model\.layers\.\d+\.(embed_tokens|shared_head\.(?:norm|head))\.weight$")
+_MODEL_LAYER_PATTERN = re.compile(r"^model\.layers\.(\d+)\.")
 _MTP_SHARED_TARGETS = {
     "embed_tokens": "model.embed_tokens.weight",
     "shared_head.norm": "model.norm.weight",
@@ -61,17 +62,30 @@ class DeepseekV3CheckpointTensorConverter:
             in v5 DeepseekV3).
     """
 
-    def __init__(self, num_experts: int):
+    def __init__(self, num_experts: int, num_hidden_layers: Optional[int] = None, mtp_enabled: bool = True):
         self.num_experts = num_experts
+        self.num_hidden_layers = num_hidden_layers
+        self.mtp_enabled = mtp_enabled
         # {(prefix, proj_name): {expert_id: tensor}}
         self._expert_buffer: Dict[Tuple[str, str], Dict[int, torch.Tensor]] = {}
         # {prefix: {proj_name: stacked_tensor}} for gate/up merge waiting
         self._stacked_buffer: Dict[str, Dict[str, torch.Tensor]] = {}
 
     def can_handle(self, name: str) -> bool:
-        return bool(_EXPERT_PATTERN.match(name) or _MTP_SHARED_PATTERN.match(name))
+        return self._is_disabled_mtp_key(name) or bool(_EXPERT_PATTERN.match(name) or _MTP_SHARED_PATTERN.match(name))
+
+    def _is_disabled_mtp_key(self, name: str) -> bool:
+        layer_match = _MODEL_LAYER_PATTERN.match(name)
+        return (
+            not self.mtp_enabled
+            and self.num_hidden_layers is not None
+            and layer_match is not None
+            and int(layer_match.group(1)) >= self.num_hidden_layers
+        )
 
     def convert(self, name: str, tensor: "torch.Tensor") -> Optional[ConvertedCheckpointTensor]:
+        if self._is_disabled_mtp_key(name):
+            return None
         # Official DeepSeek-V3 checkpoints repeat the shared embedding, final
         # norm, and LM-head tensors under every MTP layer. VeOmni keeps one
         # registered owner for each shared parameter so FSDP2 never sees the
@@ -142,8 +156,11 @@ class DeepseekV3CheckpointTensorConverter:
 
 def create_deepseek_v3_checkpoint_tensor_converter(model):
     """Factory function registered on model classes via _create_checkpoint_tensor_converter."""
+    decoder = getattr(model, "model", model)
     return DeepseekV3CheckpointTensorConverter(
         num_experts=model.config.n_routed_experts,
+        num_hidden_layers=model.config.num_hidden_layers,
+        mtp_enabled=len(decoder.layers) > model.config.num_hidden_layers,
     )
 
 

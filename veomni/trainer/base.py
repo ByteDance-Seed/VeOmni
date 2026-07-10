@@ -361,14 +361,18 @@ class BaseTrainer(Stateful, ABC):
 
     def _build_model(self):
         logger.info_rank0("Build model")
+        config_kwargs = dict(self.args.model.model_config)
+        config_kwargs["_veomni_enable_mtp"] = self.args.train.enable_mtp
         self.model = build_foundation_model(
             config_path=self.args.model.config_path,
             weights_path=self.args.model.model_path,
             torch_dtype="float32" if self.args.train.accelerator.fsdp_config.mixed_precision.enable else "bfloat16",
             init_device=self.args.train.init_device,
             ops_implementation=self.args.model.ops_implementation,
-            config_kwargs=self.args.model.model_config,
+            config_kwargs=config_kwargs,
         )
+        if hasattr(self.model.config, "_veomni_enable_mtp"):
+            delattr(self.model.config, "_veomni_enable_mtp")
         self.model_config = self.model.config
         self._configure_mtp_training()
 

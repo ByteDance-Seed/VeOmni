@@ -14,8 +14,9 @@ train:
 The total objective is the normal next-token loss plus the mean MTP loss,
 scaled by `train.mtp_loss_weight`. MTP targets respect `IGNORE_INDEX`, packed-sample
 boundaries, and sequence-parallel partitions. Setting
-`train.enable_mtp: false` keeps the checkpoint-compatible modules but freezes
-them and skips their forward/loss computation. Enabling MTP for a model with
+`train.enable_mtp: false` does not construct or load the MTP decoder modules;
+their checkpoint tensors are consumed by the loader without allocating model,
+FSDP, gradient, or optimizer storage. Enabling MTP for a model with
 `num_nextn_predict_layers == 0` raises a configuration error.
 
 Official checkpoints repeat the shared token embedding, final norm, and LM
