@@ -36,6 +36,8 @@ usage/support_new_models/dit_model_guide.md
 usage/checkpoint_conversion.md
 usage/trainer.md
 usage/agent_workflow.md
+usage/hdfs_fuse_patch.md
+testing.md
 ```
 
 ```{toctree}
@@ -50,6 +52,7 @@ hardware_support/profiling_analysis.md
 hardware_support/AscendDockerUsage/build_a2_docker.md
 hardware_support/AscendDockerUsage/build_a3_docker.md
 hardware_support/FAQ.md
+hardware_support/rocm/README.md
 ```
 
 ```{toctree}
@@ -61,7 +64,9 @@ examples/qwen3_5.md
 examples/qwen3_moe.md
 examples/qwen3_vl.md
 examples/qwen3_omni_moe.md
+examples/qwen3_omni_offline_av.md
 examples/wan2.1.md
+examples/wan2.1_I2V_1.3B.md
 examples/qwen3_dpo.md
 ```
 
@@ -72,6 +77,7 @@ examples/qwen3_dpo.md
 key_features/model_loader.md
 key_features/preprocessor_registry.md
 key_features/ep_fsdp2.md
+key_features/extra_parallel.md
 key_features/ulysses.md
 key_features/lora.md
 
@@ -83,6 +89,8 @@ key_features/lora.md
 
 design/kernel_selection.md
 design/patchgen.md
+design/unified_kernel_registry.md
+design/verl_topk_distill_integration.md
 ```
 
 ```{toctree}

@@ -133,7 +133,7 @@ docker run --runtime=runc -it \
 After starting the container with appropriate mounts, you can run training commands. Here's an example for Qwen3-VL training using generic paths:
 
 ```bash
-bash train.sh tasks/deprecated_task/train_qwen_vl.py configs/multimodal/qwen3_vl/qwen3_vl_dense.yaml \
+bash train.sh tasks/train_vlm.py configs/multimodal/qwen3_vl/qwen3_vl_dense.yaml \
     --model.model_path /app/ckpt/your-model-checkpoint \
     --data.train_path /app/dataset/your-dataset.json \
     --data.datasets_type iterable \
