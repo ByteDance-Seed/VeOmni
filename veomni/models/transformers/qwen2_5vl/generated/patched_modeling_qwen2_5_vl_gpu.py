@@ -1730,7 +1730,7 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
         if video_mask is None and image_mask is None:
             input_ids_list = [torch.zeros_like(input_ids) for _ in range(get_parallel_state().sp_size)]
             dist.all_gather(input_ids_list, input_ids, group=get_parallel_state().sp_group)
-            image_mask, video_mask = self.get_placeholder_mask(torch.cat(input_ids_list, dim=0))
+            image_mask, video_mask = self.get_placeholder_mask(torch.cat(input_ids_list, dim=1))
         # --- Patch.2 ---
 
         # --- Patch.3 ---
