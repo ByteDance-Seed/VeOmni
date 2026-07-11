@@ -329,18 +329,6 @@ class BagelQwen2MoTAttention(nn.Module):
             unsqueeze_dim=1,
         )
 
-        packed_key_states_ = packed_key_states_[:, :, None, :].repeat(
-            1, 1, self.num_heads // self.num_key_value_heads, 1
-        )
-        packed_key_states_ = packed_key_states_.reshape(-1, self.num_heads, self.head_dim)
-        packed_value_states = packed_value_states[:, :, None, :].repeat(
-            1,
-            1,
-            self.num_heads // self.num_key_value_heads,
-            1,
-        )
-        packed_value_states = packed_value_states.reshape(-1, self.num_heads, self.head_dim)
-
         ps = get_parallel_state()
         if ps.sp_enabled:
             if self.num_heads % ps.ulysses_size != 0:
@@ -348,11 +336,24 @@ class BagelQwen2MoTAttention(nn.Module):
                     "BAGEL Qwen2-MoT attention heads must be divisible by "
                     f"ulysses_size: num_heads={self.num_heads}, ulysses_size={ps.ulysses_size}."
                 )
+            if self.num_key_value_heads % ps.ulysses_size != 0:
+                raise ValueError(
+                    "BAGEL Qwen2-MoT KV heads must be divisible by "
+                    f"ulysses_size for native GQA: num_key_value_heads={self.num_key_value_heads}, "
+                    f"ulysses_size={ps.ulysses_size}."
+                )
+            local_query_heads = self.num_heads // ps.ulysses_size
+            local_key_value_heads = self.num_key_value_heads // ps.ulysses_size
+            if local_query_heads % local_key_value_heads != 0:
+                raise ValueError(
+                    "BAGEL Qwen2-MoT local query heads must be divisible by local KV heads: "
+                    f"query_heads={local_query_heads}, key_value_heads={local_key_value_heads}."
+                )
             unpadded_seq_len = sum(sample_lens)
 
             # Ulysses all-to-all gathers the complete packed sequence while
-            # sharding Q/K/V heads. Span-wise FA can then apply the global BAGEL
-            # layout without communicating or expanding a dense attention mask.
+            # sharding Q and native GQA K/V heads. Span-wise FA can then apply
+            # the global BAGEL layout without expanding K/V or a dense mask.
             packed_query_states_ = gather_seq_scatter_heads(
                 packed_query_states_,
                 seq_dim=0,
@@ -424,6 +425,27 @@ class BagelQwen2MoTAttention(nn.Module):
                 "BAGEL Qwen2-MoT attention requires one attention-mode list per sample split list, "
                 f"got {len(sample_splits)} and {len(sample_attn_modes)}."
             )
+        if key_states.shape != value_states.shape:
+            raise ValueError(
+                "BAGEL Qwen2-MoT attention requires matching K/V shapes, "
+                f"got key={tuple(key_states.shape)}, value={tuple(value_states.shape)}."
+            )
+        if query_states.shape[0] != key_states.shape[0]:
+            raise ValueError(
+                "BAGEL Qwen2-MoT attention requires matching Q/K sequence lengths, "
+                f"got query={query_states.shape[0]}, key={key_states.shape[0]}."
+            )
+        if query_states.shape[-1] != key_states.shape[-1]:
+            raise ValueError(
+                "BAGEL Qwen2-MoT attention requires matching Q/K head dimensions, "
+                f"got query={query_states.shape[-1]}, key={key_states.shape[-1]}."
+            )
+        if query_states.shape[1] % key_states.shape[1] != 0:
+            raise ValueError(
+                "BAGEL Qwen2-MoT query heads must be divisible by KV heads, "
+                f"got query={query_states.shape[1]}, key_value={key_states.shape[1]}."
+            )
+
         expected_seq_len = sum(sum(split_lens) for split_lens in sample_splits)
         if expected_seq_len != query_states.shape[0]:
             raise ValueError(

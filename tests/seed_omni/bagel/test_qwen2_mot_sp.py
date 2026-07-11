@@ -135,6 +135,10 @@ def _qwen2_mot_sp_worker() -> None:
     BagelQwen2MoTConfig = config_cls("bagel_qwen2_mot")
     config_kwargs = {
         **tiny_bagel_qwen2_cfg(),
+        "hidden_size": 112,
+        "intermediate_size": 224,
+        "num_attention_heads": 28,
+        "num_key_value_heads": 4,
         "attn_implementation": "veomni_flash_attention_2_with_sp",
     }
     torch.manual_seed(9102)
