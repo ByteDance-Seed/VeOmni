@@ -12,9 +12,6 @@ from torch.nn.functional import scaled_dot_product_attention
 from veomni.utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE
 
 
-if IS_CUDA_AVAILABLE:
-    from flash_attn import flash_attn_varlen_func
-
 if IS_NPU_AVAILABLE:
     import torch_npu
 from transformers import PreTrainedModel
@@ -589,16 +586,23 @@ class BagelQwen2MoTAttention(nn.Module):
         max_seqlen_q = int(query_lens.max().item())
         max_seqlen_k = int(key_values_lens.max().item())
         if IS_CUDA_AVAILABLE:
-            packed_attn_output = flash_attn_varlen_func(
-                q=packed_query_states,
-                k=merged_key_states,
-                v=merged_value_states,
-                cu_seqlens_q=cu_seqlens_q.to(torch.int32),
-                cu_seqlens_k=cu_seqlens_k.to(torch.int32),
-                max_seqlen_q=max_seqlen_q,
-                max_seqlen_k=max_seqlen_k,
-                causal=is_causal,
+            packed_attn_output, _ = flash_attention_forward(
+                self,
+                packed_query_states.transpose(0, 1).unsqueeze(0),
+                merged_key_states.transpose(0, 1).unsqueeze(0),
+                merged_value_states.transpose(0, 1).unsqueeze(0),
+                attention_mask=None,
+                dropout=0.0,
+                is_causal=is_causal,
+                cu_seq_lens_q=cu_seqlens_q.to(torch.int32),
+                cu_seq_lens_k=cu_seqlens_k.to(torch.int32),
+                max_length_q=max_seqlen_q,
+                max_length_k=max_seqlen_k,
+                # Inference owns its packed KV-cache layout and does not enter the
+                # training-only module Ulysses redistribution.
+                skip_ulysses=True,
             )
+            packed_attn_output = packed_attn_output.squeeze(0)
         else:
             head_num = packed_query_states.shape[1]
             if is_causal:
@@ -632,7 +636,6 @@ class BagelQwen2MoTAttention(nn.Module):
                     actual_seq_qlen=tuple(cu_seqlens_q[1:].cpu().numpy().tolist()),
                     actual_seq_kvlen=tuple(cu_seqlens_k[1:].cpu().numpy().tolist()),
                 )[0]
-
         packed_attn_output = packed_attn_output.reshape(-1, self.hidden_size)
         if not is_gen:
             packed_attn_output = self.o_proj(packed_attn_output)
