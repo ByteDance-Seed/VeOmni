@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from bisect import bisect_left, bisect_right
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -36,6 +37,8 @@ class PackedSequenceRange:
     token_start: int
     token_end: int
     max_length: int
+    linear_attn_segment_start: Optional[int] = None
+    linear_attn_segment_end: Optional[int] = None
 
 
 _chunk_mbs_ranges: ContextVar[Optional[list[PackedSequenceRange]]] = ContextVar("chunk_mbs_ranges", default=None)
@@ -74,10 +77,13 @@ def build_chunk_mbs_ranges(batch: dict[str, Any], config: Any) -> Optional[list[
         return None
 
     cu_values = [int(v) for v in cu_seq_lens_q.tolist()]
+    if not cu_values or cu_values[0] != 0:
+        raise ValueError("ChunkMBS requires cu_seq_lens_q to start from 0.")
     segment_lengths = [end - start for start, end in zip(cu_values, cu_values[1:])]
     if any(length <= 0 for length in segment_lengths):
         raise ValueError("ChunkMBS requires strictly increasing cu_seq_lens_q.")
 
+    linear_attn_values = _linear_attn_cu_values(batch.get("linear_attn_cu_seq_lens_q"), cu_values[-1])
     num_segments = len(segment_lengths)
     if num_segments <= chunk_mbs:
         return None
@@ -88,6 +94,11 @@ def build_chunk_mbs_ranges(batch: dict[str, Any], config: Any) -> Optional[list[
         token_start = cu_values[segment_start]
         token_end = cu_values[segment_end]
         max_length = max(segment_lengths[segment_start:segment_end])
+        linear_attn_segment_start = None
+        linear_attn_segment_end = None
+        if linear_attn_values is not None:
+            linear_attn_segment_start = bisect_right(linear_attn_values, token_start)
+            linear_attn_segment_end = bisect_left(linear_attn_values, token_end)
         ranges.append(
             PackedSequenceRange(
                 segment_start=segment_start,
@@ -95,9 +106,28 @@ def build_chunk_mbs_ranges(batch: dict[str, Any], config: Any) -> Optional[list[
                 token_start=token_start,
                 token_end=token_end,
                 max_length=max_length,
+                linear_attn_segment_start=linear_attn_segment_start,
+                linear_attn_segment_end=linear_attn_segment_end,
             )
         )
     return ranges
+
+
+def _linear_attn_cu_values(cu_seq_lens: Optional[torch.Tensor], expected_total: int) -> Optional[list[int]]:
+    if cu_seq_lens is None:
+        return None
+    if cu_seq_lens.ndim != 1:
+        raise ValueError(f"linear_attn_cu_seq_lens_q must be a 1D tensor, got shape {tuple(cu_seq_lens.shape)}.")
+    if cu_seq_lens.device.type != "cpu":
+        raise RuntimeError("ChunkMBS ranges must be built before linear_attn_cu_seq_lens_q is moved off CPU.")
+    cu_values = [int(v) for v in cu_seq_lens.tolist()]
+    if not cu_values or cu_values[0] != 0:
+        raise ValueError("ChunkMBS requires linear_attn_cu_seq_lens_q to start from 0.")
+    if any(end <= start for start, end in zip(cu_values, cu_values[1:])):
+        raise ValueError("ChunkMBS requires strictly increasing linear_attn_cu_seq_lens_q.")
+    if cu_values[-1] != expected_total:
+        raise ValueError("ChunkMBS requires linear_attn_cu_seq_lens_q to end at cu_seq_lens_q[-1].")
+    return cu_values
 
 
 def apply_chunk_mbs(model: nn.Module, config: Any) -> nn.Module:
@@ -283,10 +313,16 @@ def _slice_cu_seq_lens(cu_seq_lens: torch.Tensor, seq_range: PackedSequenceRange
 def _slice_linear_attn_cu_seq_lens(cu_seq_lens: torch.Tensor, seq_range: PackedSequenceRange) -> torch.Tensor:
     if cu_seq_lens.ndim != 1:
         raise ValueError(f"linear_attn_cu_seq_lens_q must be a 1D tensor, got shape {tuple(cu_seq_lens.shape)}.")
+    if seq_range.linear_attn_segment_start is None or seq_range.linear_attn_segment_end is None:
+        raise RuntimeError("ChunkMBS ranges were built without linear_attn_cu_seq_lens_q.")
 
     start = cu_seq_lens.new_tensor([seq_range.token_start])
     end = cu_seq_lens.new_tensor([seq_range.token_end])
-    inner = cu_seq_lens[(cu_seq_lens > seq_range.token_start) & (cu_seq_lens < seq_range.token_end)]
+    inner = cu_seq_lens.narrow(
+        0,
+        seq_range.linear_attn_segment_start,
+        seq_range.linear_attn_segment_end - seq_range.linear_attn_segment_start,
+    )
     return torch.cat((start, inner, end), dim=0) - start
 
 

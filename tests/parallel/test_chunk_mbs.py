@@ -7,7 +7,12 @@ import torch
 import torch.nn as nn
 from torch.utils.checkpoint import checkpoint
 
-from veomni.distributed.chunk_mbs import apply_chunk_mbs, build_chunk_mbs_ranges, chunk_mbs_context
+from veomni.distributed.chunk_mbs import (
+    PackedSequenceRange,
+    apply_chunk_mbs,
+    build_chunk_mbs_ranges,
+    chunk_mbs_context,
+)
 
 
 def _config(chunk_mbs=2, apply_modules=None, strict=True):
@@ -87,6 +92,28 @@ def test_build_chunk_mbs_ranges_noops_when_micro_batch_is_small():
 def test_build_chunk_mbs_ranges_rejects_non_increasing_segments(cu_seq_lens_q):
     with pytest.raises(ValueError, match="strictly increasing cu_seq_lens_q"):
         build_chunk_mbs_ranges({"cu_seq_lens_q": cu_seq_lens_q}, _config(chunk_mbs=4))
+
+
+def test_build_chunk_mbs_ranges_rejects_nonzero_start():
+    with pytest.raises(ValueError, match="start from 0"):
+        build_chunk_mbs_ranges({"cu_seq_lens_q": torch.tensor([1, 3, 5], dtype=torch.int32)}, _config(chunk_mbs=1))
+
+
+@pytest.mark.parametrize(
+    ("linear_attn_cu_seq_lens_q", "match"),
+    [
+        (torch.tensor([1, 3, 5, 10], dtype=torch.int32), "start from 0"),
+        (torch.tensor([0, 5, 3, 10], dtype=torch.int32), "strictly increasing linear_attn_cu_seq_lens_q"),
+        (torch.tensor([0, 3, 5, 9], dtype=torch.int32), "end at cu_seq_lens_q"),
+    ],
+)
+def test_build_chunk_mbs_ranges_rejects_invalid_linear_attn_cu_seq_lens(linear_attn_cu_seq_lens_q, match):
+    batch = {
+        "cu_seq_lens_q": torch.tensor([0, 3, 5, 10], dtype=torch.int32),
+        "linear_attn_cu_seq_lens_q": linear_attn_cu_seq_lens_q,
+    }
+    with pytest.raises(ValueError, match=match):
+        build_chunk_mbs_ranges(batch, _config(chunk_mbs=2))
 
 
 def test_build_chunk_mbs_ranges_rejects_non_packed_batch_dim():
@@ -219,7 +246,10 @@ def test_apply_chunk_mbs_slices_packed_samples(monkeypatch):
     assert getattr(layer, "_chunk_mbs_wrapped", False)
     assert not getattr(layer.proj, "_chunk_mbs_wrapped", False)
 
-    batch = {"cu_seq_lens_q": torch.tensor([0, 3, 5, 9, 10], dtype=torch.int32)}
+    batch = {
+        "cu_seq_lens_q": torch.tensor([0, 3, 5, 9, 10], dtype=torch.int32),
+        "linear_attn_cu_seq_lens_q": torch.tensor([0, 3, 5, 10], dtype=torch.int32),
+    }
     ranges = build_chunk_mbs_ranges(batch, _config(chunk_mbs=2))
     hidden_states = torch.arange(20, dtype=torch.float32).view(1, 10, 2).requires_grad_()
     position_ids = torch.arange(10).view(1, 10)
@@ -236,7 +266,7 @@ def test_apply_chunk_mbs_slices_packed_samples(monkeypatch):
             cu_seq_lens_k=batch["cu_seq_lens_q"],
             max_length_q=4,
             max_length_k=4,
-            linear_attn_cu_seq_lens_q=torch.tensor([0, 3, 5, 10], dtype=torch.int32),
+            linear_attn_cu_seq_lens_q=batch["linear_attn_cu_seq_lens_q"],
         )
 
     expected = hidden_states + position_ids.unsqueeze(-1).to(hidden_states.dtype) + 3.0
@@ -254,12 +284,24 @@ def test_apply_chunk_mbs_slices_packed_samples(monkeypatch):
     assert [call["linear_attn_cu_seq_lens_q"].tolist() for call in layer.calls] == [[0, 3, 5], [0, 5]]
 
 
+def test_slice_kwargs_slices_multimodal_position_ids():
+    import veomni.distributed.chunk_mbs as chunk_mbs
+
+    position_ids = torch.arange(40).view(4, 1, 10)
+    seq_range = PackedSequenceRange(segment_start=1, segment_end=3, token_start=3, token_end=9, max_length=4)
+
+    chunk_kwargs = chunk_mbs._slice_kwargs({"position_ids": position_ids}, seq_range, full_seq_len=10, sequence_dim=1)
+
+    assert torch.equal(chunk_kwargs["position_ids"], position_ids[:, :, 3:9])
+
+
 @pytest.mark.parametrize("use_checkpoint", [False, True])
 def test_apply_chunk_mbs_matches_qwen3_vl_decoder_layer(monkeypatch, use_checkpoint):
     import veomni.distributed.chunk_mbs as chunk_mbs
     from veomni.models.transformers.qwen3_vl.generated.patched_modeling_qwen3_vl_gpu import (
         Qwen3VLTextConfig,
         Qwen3VLTextDecoderLayer,
+        Qwen3VLTextRotaryEmbedding,
     )
 
     monkeypatch.setattr(
@@ -296,11 +338,19 @@ def test_apply_chunk_mbs_matches_qwen3_vl_decoder_layer(monkeypatch, use_checkpo
     cu_seq_lens = torch.tensor([0, 3, 5, 9], dtype=torch.int32)
     ranges = build_chunk_mbs_ranges({"cu_seq_lens_q": cu_seq_lens}, _config(chunk_mbs=2))
     hidden_states = torch.randn(1, 9, config.hidden_size)
-    position_ids = torch.arange(9, dtype=torch.long).view(1, 9)
-    position_embeddings = (
-        torch.ones(1, 9, config.head_dim),
-        torch.zeros(1, 9, config.head_dim),
+    text_position_ids = torch.arange(9, dtype=torch.long).view(1, 9)
+    position_ids = torch.stack(
+        (
+            text_position_ids,
+            text_position_ids,
+            text_position_ids // 2,
+            text_position_ids % 3,
+        ),
+        dim=0,
     )
+    rotary_emb = Qwen3VLTextRotaryEmbedding(config)
+    position_embeddings = rotary_emb(hidden_states, position_ids[1:])
+    assert position_embeddings[0].shape == (1, 9, config.head_dim)
     attention_mask = _packed_causal_attention_mask(cu_seq_lens, hidden_states.dtype)
     max_length = int((cu_seq_lens[1:] - cu_seq_lens[:-1]).max().item())
 
@@ -309,7 +359,7 @@ def test_apply_chunk_mbs_matches_qwen3_vl_decoder_layer(monkeypatch, use_checkpo
         hidden_states,
         position_embeddings,
         attention_mask,
-        position_ids,
+        position_ids[0],
         cu_seq_lens,
         max_length,
         ranges=None,
@@ -320,7 +370,7 @@ def test_apply_chunk_mbs_matches_qwen3_vl_decoder_layer(monkeypatch, use_checkpo
         hidden_states,
         position_embeddings,
         attention_mask,
-        position_ids,
+        position_ids[0],
         cu_seq_lens,
         max_length,
         ranges=ranges,
