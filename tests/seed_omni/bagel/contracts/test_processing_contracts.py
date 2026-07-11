@@ -6,7 +6,7 @@ import pytest
 import torch
 from PIL import Image
 
-from tests.seed_omni.bagel.contracts.helpers import config_cls, model_cls
+from tests.seed_omni.bagel.contracts.helpers import config_cls, model_cls, tiny_bagel_qwen2_cfg
 from veomni.models.seed_omni.modules.bagel.sources import (
     BAGEL_FLOW_VELOCITY,
     BAGEL_GENERATED_LATENT,
@@ -78,8 +78,24 @@ def test_bagel_training_flow_metadata_matches_packed_noising_dtype():
     assert torch.equal(inputs["latents"], expected_noised)
 
 
-def test_bagel_mot_packing_treats_tagged_edit_vae_as_clean_context():
+@pytest.mark.parametrize("conversation_list", [None, []])
+def test_bagel_mot_packing_rejects_missing_conversation_list(conversation_list):
     from veomni.models.seed_omni.modules.bagel.qwen2_mot.processing import preprocess_mot_inputs
+
+    with pytest.raises(ValueError, match="requires a non-empty conversation_list"):
+        preprocess_mot_inputs(
+            conversation_list,
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+            hidden_size=4,
+        )
+
+
+def test_bagel_mot_packing_treats_tagged_edit_vae_as_clean_context():
+    from veomni.models.seed_omni.modules.bagel.qwen2_mot.processing import (
+        build_mot_attention_masks,
+        preprocess_mot_inputs,
+    )
 
     edit_context = ConversationItem(
         type="image",
@@ -111,9 +127,12 @@ def test_bagel_mot_packing_treats_tagged_edit_vae_as_clean_context():
     )
 
     assert packed is not None
-    assert torch.equal(packed.packed_gen_token_indexes, torch.tensor([2, 3]))
-    assert torch.equal(packed.packed_und_token_indexes, torch.tensor([0, 1, 4]))
-    mask = packed.nested_attention_masks[0]
+    assert torch.equal(packed.packed_token_type_ids, torch.tensor([0, 0, 1, 1, 0]))
+    mask = build_mot_attention_masks(
+        packed.sample_splits,
+        packed.sample_attn_modes,
+        device=torch.device("cpu"),
+    )[0]
     assert torch.isneginf(mask[0, 2])  # clean context cannot attend target/noise tokens
     assert mask[0, 1] == 0  # edit VAE context uses full attention within its span
     assert mask[2, 0] == 0  # noised target can still attend previous context
@@ -122,7 +141,10 @@ def test_bagel_mot_packing_treats_tagged_edit_vae_as_clean_context():
 
 
 def test_bagel_mot_packing_treats_untagged_vae_as_inference_context():
-    from veomni.models.seed_omni.modules.bagel.qwen2_mot.processing import preprocess_mot_inputs
+    from veomni.models.seed_omni.modules.bagel.qwen2_mot.processing import (
+        build_mot_attention_masks,
+        preprocess_mot_inputs,
+    )
 
     context = ConversationItem(
         type="image",
@@ -135,9 +157,65 @@ def test_bagel_mot_packing_treats_untagged_vae_as_inference_context():
     packed = preprocess_mot_inputs([[context]], device=torch.device("cpu"), dtype=torch.float32, hidden_size=4)
 
     assert packed is not None
-    assert torch.equal(packed.packed_gen_token_indexes, torch.empty(0, dtype=torch.long))
-    assert torch.equal(packed.packed_und_token_indexes, torch.tensor([0, 1]))
-    assert packed.nested_attention_masks[0][0, 1] == 0
+    assert torch.equal(packed.packed_token_type_ids, torch.tensor([0, 0]))
+    mask = build_mot_attention_masks(
+        packed.sample_splits,
+        packed.sample_attn_modes,
+        device=torch.device("cpu"),
+    )[0]
+    assert mask[0, 1] == 0
+
+
+def test_bagel_mot_packing_exposes_sp_metadata_without_rewriting_spans():
+    from veomni.models.seed_omni.modules.bagel.qwen2_mot.processing import (
+        build_mot_attention_masks,
+        preprocess_mot_inputs,
+    )
+
+    text = ConversationItem(type="text", value=torch.ones(2, 4), role="user")
+    gen_target = ConversationItem(
+        type="image",
+        value=torch.full((3, 4), 2),
+        role="assistant",
+        source=BAGEL_VAE_CONTEXT,
+        meta={_IMG_TAG_KEY: "gen"},
+    )
+
+    packed = preprocess_mot_inputs(
+        [[text, gen_target]], device=torch.device("cpu"), dtype=torch.float32, hidden_size=4
+    )
+
+    assert packed is not None
+    assert [span.start for span in packed.spans] == [0, 2]
+    assert packed.sample_splits == [[2, 3]]
+    assert packed.sample_attn_modes == [["causal", "noise"]]
+    assert torch.equal(packed.packed_token_type_ids, torch.tensor([0, 0, 1, 1, 1]))
+    masks = build_mot_attention_masks(packed.sample_splits, packed.sample_attn_modes, device=torch.device("cpu"))
+    assert len(masks) == 1
+    assert masks[0].shape == (5, 5)
+    assert torch.isneginf(masks[0][0, 2])
+
+
+def test_bagel_mot_forward_pre_builds_non_sp_routing_from_token_types():
+    BagelQwen2MoT = model_cls("bagel_qwen2_mot")
+    BagelQwen2MoTConfig = config_cls("bagel_qwen2_mot")
+    model = BagelQwen2MoT(BagelQwen2MoTConfig(**tiny_bagel_qwen2_cfg())).train()
+    hidden_size = int(model.config.hidden_size)
+    text = ConversationItem(type="text", value=torch.ones(2, hidden_size), role="user")
+    gen_target = ConversationItem(
+        type="image",
+        value=torch.ones(3, hidden_size),
+        role="assistant",
+        source=BAGEL_VAE_CONTEXT,
+        meta={_IMG_TAG_KEY: "gen"},
+    )
+
+    inputs = model.forward_pre(conversation_list=[[text, gen_target]])
+
+    assert "packed_token_type_ids" not in inputs
+    assert inputs["sample_lens"] == [5]
+    assert torch.equal(inputs["packed_und_token_indexes"], torch.tensor([0, 1]))
+    assert torch.equal(inputs["packed_gen_token_indexes"], torch.tensor([2, 3, 4]))
 
 
 def test_bagel_mot_packing_rejects_incompatible_vae_img_tag():

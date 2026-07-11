@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -350,6 +352,52 @@ def test_bagel_qwen2_mot_flow_alignment_requires_real_flow_item() -> None:
     out = model._fold_dummy_anchors(packed_sequence, [[flow_output, flow_dummy]])
     assert out is not packed_sequence
     assert out.requires_grad
+
+
+def test_bagel_qwen2_mot_dummy_forward_pre_folds_upstream_dummy_anchor(monkeypatch) -> None:
+    model = _tiny_qwen2_mot()
+    hidden_size = int(model.config.hidden_size)
+    siglip_dummy = ConversationItem(
+        type="image",
+        value=torch.ones(1, hidden_size, requires_grad=True),
+        role="dummy",
+        source=BAGEL_SIGLIP_CONTEXT,
+    )
+    monkeypatch.setattr(model, "_has_valid_upstream_embeddings", lambda conversation_list: (True, False))
+
+    inputs = model.forward_pre(conversation_list=[[siglip_dummy]])
+
+    assert model._packed_is_dummy
+    assert model._packed_training is not None
+    assert model._packed_training.spans == []
+    assert inputs["packed_sequence"].requires_grad
+    assert inputs["sample_lens"] == [1]
+    assert torch.equal(inputs["attention_mask"][0], torch.zeros(1, 1))
+    inputs["packed_sequence"].sum().backward()
+    assert siglip_dummy.value.grad is not None
+
+
+def test_bagel_qwen2_mot_rejects_context_parallel_training(monkeypatch) -> None:
+    from veomni.models.seed_omni.modules.bagel.qwen2_mot import modulemixin
+
+    model = _tiny_qwen2_mot()
+    monkeypatch.setattr(
+        modulemixin,
+        "get_parallel_state",
+        lambda: SimpleNamespace(sp_enabled=True, cp_size=2),
+    )
+
+    packed = model._dummy_packed_training()
+    with pytest.raises(ValueError, match="Ulysses sequence parallelism only"):
+        model._prepare_training_sp_inputs(
+            {
+                "packed_sequence": packed.packed_sequence,
+                "packed_position_ids": packed.packed_position_ids,
+                "packed_token_type_ids": packed.packed_token_type_ids,
+            },
+            sample_splits=packed.sample_splits,
+            sample_attn_modes=packed.sample_attn_modes,
+        )
 
 
 def test_bagel_flow_dummy_embed_anchors_to_vae_dummy_output() -> None:

@@ -21,6 +21,8 @@ from transformers import PreTrainedModel
 from transformers.models.qwen2.modeling_qwen2 import Qwen2MLP, Qwen2RMSNorm
 from transformers.utils import ModelOutput
 
+from ......distributed.parallel_state import get_parallel_state
+from ......distributed.sequence_parallel import gather_heads_scatter_seq, gather_seq_scatter_heads
 from .configuration import BagelQwen2MoTConfig
 from .modulemixin import BagelQwen2MoTMetricMeterMixin, BagelQwen2MoTModuleMixin
 
@@ -318,19 +320,49 @@ class BagelQwen2MoTAttention(nn.Module):
             unsqueeze_dim=1,
         )
 
-        if isinstance(attention_mask, list):
-            packed_key_states_ = packed_key_states_[:, :, None, :].repeat(
-                1, 1, self.num_heads // self.num_key_value_heads, 1
-            )
-            packed_key_states_ = packed_key_states_.reshape(-1, self.num_heads, self.head_dim)
-            packed_value_states = packed_value_states[:, :, None, :].repeat(
-                1,
-                1,
-                self.num_heads // self.num_key_value_heads,
-                1,
-            )
-            packed_value_states = packed_value_states.reshape(-1, self.num_heads, self.head_dim)
+        packed_key_states_ = packed_key_states_[:, :, None, :].repeat(
+            1, 1, self.num_heads // self.num_key_value_heads, 1
+        )
+        packed_key_states_ = packed_key_states_.reshape(-1, self.num_heads, self.head_dim)
+        packed_value_states = packed_value_states[:, :, None, :].repeat(
+            1,
+            1,
+            self.num_heads // self.num_key_value_heads,
+            1,
+        )
+        packed_value_states = packed_value_states.reshape(-1, self.num_heads, self.head_dim)
 
+        ps = get_parallel_state()
+        if ps.sp_enabled:
+            if self.num_heads % ps.ulysses_size != 0:
+                raise ValueError(
+                    "BAGEL Qwen2-MoT attention heads must be divisible by "
+                    f"ulysses_size: num_heads={self.num_heads}, ulysses_size={ps.ulysses_size}."
+                )
+            unpadded_seq_len = sum(sample_lens)
+            packed_query_states_ = gather_seq_scatter_heads(
+                packed_query_states_,
+                seq_dim=0,
+                head_dim=1,
+                group=ps.ulysses_group,
+                unpadded_dim_size=unpadded_seq_len,
+            )
+            packed_key_states_ = gather_seq_scatter_heads(
+                packed_key_states_,
+                seq_dim=0,
+                head_dim=1,
+                group=ps.ulysses_group,
+                unpadded_dim_size=unpadded_seq_len,
+            )
+            packed_value_states = gather_seq_scatter_heads(
+                packed_value_states,
+                seq_dim=0,
+                head_dim=1,
+                group=ps.ulysses_group,
+                unpadded_dim_size=unpadded_seq_len,
+            )
+
+        if isinstance(attention_mask, list):
             unpacked_query_states = packed_query_states_.transpose(0, 1).split(sample_lens, dim=1)
             unpacked_key_states = packed_key_states_.transpose(0, 1).split(sample_lens, dim=1)
             unpacked_value_states = packed_value_states.transpose(0, 1).split(sample_lens, dim=1)
@@ -354,7 +386,15 @@ class BagelQwen2MoTAttention(nn.Module):
         else:
             raise NotImplementedError("BAGEL Qwen2 MoT training currently requires nested attention masks.")
 
-        packed_attn_output = packed_attn_output.transpose(0, 1).reshape(-1, self.num_heads * self.head_dim)
+        packed_attn_output = packed_attn_output.transpose(0, 1)
+        if ps.sp_enabled:
+            packed_attn_output = gather_heads_scatter_seq(
+                packed_attn_output,
+                seq_dim=0,
+                head_dim=1,
+                group=ps.ulysses_group,
+            )
+        packed_attn_output = packed_attn_output.reshape(-1, self.num_heads * self.head_dim)
         packed_attn_output_ = packed_attn_output.new_zeros(packed_attn_output.shape)
         attn_output_und = self.o_proj(packed_attn_output[packed_und_token_indexes])
         attn_output_gen = self.o_proj_moe_gen(packed_attn_output[packed_gen_token_indexes])

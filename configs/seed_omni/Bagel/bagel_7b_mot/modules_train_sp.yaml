@@ -1,0 +1,35 @@
+# Per-module SP for BAGEL MoT: only bagel_qwen2_mot shards sequence compute.
+#
+# The outer Omni trainer must keep ulysses_size=1. Each rank loads its own DP
+# shard; bagel_qwen2_mot gathers its module-SP group's distinct packed sequences,
+# slices the gathered sequence across SP ranks, runs MoT attention/MLP on the
+# local chunk, then narrows the output back to each rank's own carrier segment.
+#
+# Topology:
+#   * outer trainer          : ulysses_size = 1
+#   * bagel_qwen2_mot        : ulysses_size = 4
+#   * all other Bagel modules: ulysses_size = 1
+#
+# World-size rule: world % 4 == 0.
+bagel_vae:
+  model:
+    model_path: bagel_vae
+
+bagel_siglip_navit:
+  model:
+    model_path: bagel_siglip_navit
+
+bagel_text_encoder:
+  model:
+    model_path: bagel_text_encoder
+
+bagel_flow_connector:
+  model:
+    model_path: bagel_flow_connector
+
+bagel_qwen2_mot:
+  model:
+    model_path: bagel_qwen2_mot
+
+  accelerator:
+    ulysses_size: 4

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable
 
 import torch
 
@@ -51,11 +50,10 @@ class PackedSpan:
 @dataclass
 class PackedConversation:
     packed_sequence: torch.Tensor
-    sample_lens: list[int]
-    nested_attention_masks: list[torch.Tensor]
+    sample_splits: list[list[int]]
+    sample_attn_modes: list[list[str]]
     packed_position_ids: torch.Tensor
-    packed_und_token_indexes: torch.Tensor
-    packed_gen_token_indexes: torch.Tensor
+    packed_token_type_ids: torch.Tensor
     spans: list[PackedSpan]
 
 
@@ -73,14 +71,13 @@ def preprocess_mot_inputs(
     """
 
     if not conversation_list:
-        return None
+        raise ValueError("BAGEL Qwen2-MoT preprocessing requires a non-empty conversation_list.")
 
     sequence_parts: list[torch.Tensor] = []
-    sample_lens: list[int] = []
-    nested_attention_masks: list[torch.Tensor] = []
+    sample_splits_by_sample: list[list[int]] = []
+    sample_attn_modes_by_sample: list[list[str]] = []
     position_parts: list[torch.Tensor] = []
-    und_indexes: list[torch.Tensor] = []
-    gen_indexes: list[torch.Tensor] = []
+    token_type_parts: list[torch.Tensor] = []
     spans: list[PackedSpan] = []
     sequence_cursor = 0
 
@@ -146,16 +143,15 @@ def preprocess_mot_inputs(
             sequence_cursor += length
 
             gen_token_indexes = _mot_gen_token_indexes_for_span(span, indexes)
+            token_type_ids = torch.zeros(length, device=device, dtype=torch.long)
             if gen_token_indexes.numel() > 0:
-                gen_indexes.append(gen_token_indexes)
-            if int(gen_token_indexes.numel()) < int(indexes.numel()):
-                und_indexes.append(_index_difference(indexes, gen_token_indexes))
+                token_type_ids[(gen_token_indexes - indexes[0]).to(device=device, dtype=torch.long)] = 1
+            token_type_parts.append(token_type_ids)
 
         sample_len = sequence_cursor - sample_start
         if sample_len > 0:
-            sample_lens.append(sample_len)
-            attention_mask = _mot_attn_mask_for_sample(sample_splits, sample_attn_modes)
-            nested_attention_masks.append(attention_mask.to(device=device))
+            sample_splits_by_sample.append(list(sample_splits))
+            sample_attn_modes_by_sample.append(list(sample_attn_modes))
 
     if not sequence_parts:
         return None
@@ -163,21 +159,53 @@ def preprocess_mot_inputs(
     packed_sequence = torch.cat(sequence_parts, dim=0).to(device=device, dtype=dtype)
     return PackedConversation(
         packed_sequence=packed_sequence,
-        sample_lens=sample_lens,
-        nested_attention_masks=nested_attention_masks,
+        sample_splits=sample_splits_by_sample,
+        sample_attn_modes=sample_attn_modes_by_sample,
         packed_position_ids=torch.cat(position_parts, dim=0).to(device=device, dtype=torch.long),
-        packed_und_token_indexes=(
-            torch.cat(und_indexes, dim=0).to(device=device, dtype=torch.long)
-            if und_indexes
-            else torch.empty(0, device=device, dtype=torch.long)
-        ),
-        packed_gen_token_indexes=(
-            torch.cat(gen_indexes, dim=0).to(device=device, dtype=torch.long)
-            if gen_indexes
-            else torch.empty(0, device=device, dtype=torch.long)
-        ),
+        packed_token_type_ids=torch.cat(token_type_parts, dim=0).to(device=device, dtype=torch.long),
         spans=spans,
     )
+
+
+def build_mot_attention_masks(
+    sample_splits: list[list[int]],
+    sample_attn_modes: list[list[str]],
+    *,
+    device: torch.device,
+) -> list[torch.Tensor]:
+    masks: list[torch.Tensor] = []
+    for split_lens, attn_modes in zip(sample_splits, sample_attn_modes, strict=True):
+        sample_len = sum(split_lens)
+        attention_mask = torch.zeros((sample_len, sample_len), dtype=torch.bool)
+
+        # Build the base packed-sequence visibility: every span can attend previous
+        # context, while text spans keep causal visibility inside the span.
+        cursor = 0
+        for length, mode in zip(split_lens, attn_modes, strict=True):
+            if mode == "causal":
+                attention_mask[cursor : cursor + length, cursor : cursor + length] = torch.ones(
+                    (length, length), dtype=torch.bool
+                ).tril()
+            else:
+                attention_mask[cursor : cursor + length, cursor : cursor + length] = True
+            attention_mask[cursor : cursor + length, :cursor] = True
+            cursor += length
+
+        # Noise/output spans can attend themselves and previous context, but no
+        # other span should see noise tokens as context.
+        cursor = 0
+        for length, mode in zip(split_lens, attn_modes, strict=True):
+            if mode == "noise":
+                attention_mask[:, cursor : cursor + length] = False
+                attention_mask[cursor : cursor + length, cursor : cursor + length] = True
+            cursor += length
+
+        masks.append(
+            torch.zeros_like(attention_mask, dtype=torch.float32)
+            .masked_fill_(~attention_mask, float("-inf"))
+            .to(device=device)
+        )
+    return masks
 
 
 def _mot_value_for_item(
@@ -271,15 +299,6 @@ def _mot_gen_token_indexes_for_span(span: PackedSpan, indexes: torch.Tensor) -> 
     return indexes
 
 
-def _index_difference(indexes: torch.Tensor, remove: torch.Tensor) -> torch.Tensor:
-    if remove.numel() == 0:
-        return indexes
-    keep = torch.ones(indexes.shape, device=indexes.device, dtype=torch.bool)
-    start = int(indexes[0].item())
-    keep[(remove - start).to(device=indexes.device, dtype=torch.long)] = False
-    return indexes[keep]
-
-
 def _is_vision_marker_triplet_at(items: list[ConversationItem], index: int) -> bool:
     if index + 2 >= len(items):
         return False
@@ -316,39 +335,9 @@ def _text_item_length(item: ConversationItem) -> int | None:
     return None
 
 
-def _mot_attn_mask_for_sample(split_lens: Iterable[int], attn_modes: Iterable[str]) -> torch.Tensor:
-    split_lens = list(split_lens)
-    attn_modes = list(attn_modes)
-    sample_len = sum(split_lens)
-    attention_mask = torch.zeros((sample_len, sample_len), dtype=torch.bool)
-
-    # Build the base packed-sequence visibility: every span can attend previous
-    # context, while text spans keep causal visibility inside the span.
-    cursor = 0
-    for length, mode in zip(split_lens, attn_modes, strict=True):
-        if mode == "causal":
-            attention_mask[cursor : cursor + length, cursor : cursor + length] = torch.ones(
-                (length, length), dtype=torch.bool
-            ).tril()
-        else:
-            attention_mask[cursor : cursor + length, cursor : cursor + length] = True
-        attention_mask[cursor : cursor + length, :cursor] = True
-        cursor += length
-
-    # Noise/output spans can attend themselves and previous context, but no
-    # other span should see noise tokens as context.
-    cursor = 0
-    for length, mode in zip(split_lens, attn_modes, strict=True):
-        if mode == "noise":
-            attention_mask[:, cursor : cursor + length] = False
-            attention_mask[cursor : cursor + length, cursor : cursor + length] = True
-        cursor += length
-
-    return torch.zeros_like(attention_mask, dtype=torch.float32).masked_fill_(~attention_mask, float("-inf"))
-
-
 __all__ = [
     "PackedConversation",
     "PackedSpan",
+    "build_mot_attention_masks",
     "preprocess_mot_inputs",
 ]
