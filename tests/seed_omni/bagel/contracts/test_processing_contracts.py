@@ -92,10 +92,7 @@ def test_bagel_mot_packing_rejects_missing_conversation_list(conversation_list):
 
 
 def test_bagel_mot_packing_treats_tagged_edit_vae_as_clean_context():
-    from veomni.models.seed_omni.modules.bagel.qwen2_mot.processing import (
-        build_mot_attention_masks,
-        preprocess_mot_inputs,
-    )
+    from veomni.models.seed_omni.modules.bagel.qwen2_mot.processing import preprocess_mot_inputs
 
     edit_context = ConversationItem(
         type="image",
@@ -128,23 +125,12 @@ def test_bagel_mot_packing_treats_tagged_edit_vae_as_clean_context():
 
     assert packed is not None
     assert torch.equal(packed.packed_token_type_ids, torch.tensor([0, 0, 1, 1, 0]))
-    mask = build_mot_attention_masks(
-        packed.sample_splits,
-        packed.sample_attn_modes,
-        device=torch.device("cpu"),
-    )[0]
-    assert torch.isneginf(mask[0, 2])  # clean context cannot attend target/noise tokens
-    assert mask[0, 1] == 0  # edit VAE context uses full attention within its span
-    assert mask[2, 0] == 0  # noised target can still attend previous context
-    assert mask[2, 3] == 0  # noised target attends itself
-    assert torch.isneginf(mask[4, 2])  # later clean context cannot see noised target tokens
+    assert packed.sample_splits == [[2, 2, 1]]
+    assert packed.sample_attn_modes == [["full", "noise", "full"]]
 
 
 def test_bagel_mot_packing_treats_untagged_vae_as_inference_context():
-    from veomni.models.seed_omni.modules.bagel.qwen2_mot.processing import (
-        build_mot_attention_masks,
-        preprocess_mot_inputs,
-    )
+    from veomni.models.seed_omni.modules.bagel.qwen2_mot.processing import preprocess_mot_inputs
 
     context = ConversationItem(
         type="image",
@@ -158,19 +144,12 @@ def test_bagel_mot_packing_treats_untagged_vae_as_inference_context():
 
     assert packed is not None
     assert torch.equal(packed.packed_token_type_ids, torch.tensor([0, 0]))
-    mask = build_mot_attention_masks(
-        packed.sample_splits,
-        packed.sample_attn_modes,
-        device=torch.device("cpu"),
-    )[0]
-    assert mask[0, 1] == 0
+    assert packed.sample_splits == [[2]]
+    assert packed.sample_attn_modes == [["full"]]
 
 
 def test_bagel_mot_packing_exposes_sp_metadata_without_rewriting_spans():
-    from veomni.models.seed_omni.modules.bagel.qwen2_mot.processing import (
-        build_mot_attention_masks,
-        preprocess_mot_inputs,
-    )
+    from veomni.models.seed_omni.modules.bagel.qwen2_mot.processing import preprocess_mot_inputs
 
     text = ConversationItem(type="text", value=torch.ones(2, 4), role="user")
     gen_target = ConversationItem(
@@ -190,10 +169,6 @@ def test_bagel_mot_packing_exposes_sp_metadata_without_rewriting_spans():
     assert packed.sample_splits == [[2, 3]]
     assert packed.sample_attn_modes == [["causal", "noise"]]
     assert torch.equal(packed.packed_token_type_ids, torch.tensor([0, 0, 1, 1, 1]))
-    masks = build_mot_attention_masks(packed.sample_splits, packed.sample_attn_modes, device=torch.device("cpu"))
-    assert len(masks) == 1
-    assert masks[0].shape == (5, 5)
-    assert torch.isneginf(masks[0][0, 2])
 
 
 def test_bagel_mot_forward_pre_builds_non_sp_routing_from_token_types():

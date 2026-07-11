@@ -15,6 +15,13 @@ _VALID_IMG_TAGS = frozenset({"und", "gen", "edit"})
 
 @dataclass(frozen=True)
 class PackedSpan:
+    """Describe one logical span in the packed sequence.
+
+    Most spans contain one carrier item. A VAE image span can group its leading
+    marker, image, and trailing marker; ``primary_index`` identifies the image,
+    while ``lengths`` preserves each item's subrange for routing and writeback.
+    """
+
     start: int
     items: tuple[ConversationItem, ...]
     lengths: tuple[int, ...]
@@ -49,6 +56,13 @@ class PackedSpan:
 
 @dataclass
 class PackedConversation:
+    """Result of packing an embedded conversation batch for MoT.
+
+    Packed tensors concatenate all samples. ``sample_splits`` and
+    ``sample_attn_modes`` preserve their logical attention boundaries, while
+    ``spans`` maps model outputs back to the original carrier items.
+    """
+
     packed_sequence: torch.Tensor
     sample_splits: list[list[int]]
     sample_attn_modes: list[list[str]]
@@ -165,47 +179,6 @@ def preprocess_mot_inputs(
         packed_token_type_ids=torch.cat(token_type_parts, dim=0).to(device=device, dtype=torch.long),
         spans=spans,
     )
-
-
-def build_mot_attention_masks(
-    sample_splits: list[list[int]],
-    sample_attn_modes: list[list[str]],
-    *,
-    device: torch.device,
-) -> list[torch.Tensor]:
-    masks: list[torch.Tensor] = []
-    for split_lens, attn_modes in zip(sample_splits, sample_attn_modes, strict=True):
-        sample_len = sum(split_lens)
-        attention_mask = torch.zeros((sample_len, sample_len), dtype=torch.bool)
-
-        # Build the base packed-sequence visibility: every span can attend previous
-        # context, while text spans keep causal visibility inside the span.
-        cursor = 0
-        for length, mode in zip(split_lens, attn_modes, strict=True):
-            if mode == "causal":
-                attention_mask[cursor : cursor + length, cursor : cursor + length] = torch.ones(
-                    (length, length), dtype=torch.bool
-                ).tril()
-            else:
-                attention_mask[cursor : cursor + length, cursor : cursor + length] = True
-            attention_mask[cursor : cursor + length, :cursor] = True
-            cursor += length
-
-        # Noise/output spans can attend themselves and previous context, but no
-        # other span should see noise tokens as context.
-        cursor = 0
-        for length, mode in zip(split_lens, attn_modes, strict=True):
-            if mode == "noise":
-                attention_mask[:, cursor : cursor + length] = False
-                attention_mask[cursor : cursor + length, cursor : cursor + length] = True
-            cursor += length
-
-        masks.append(
-            torch.zeros_like(attention_mask, dtype=torch.float32)
-            .masked_fill_(~attention_mask, float("-inf"))
-            .to(device=device)
-        )
-    return masks
 
 
 def _mot_value_for_item(
@@ -338,6 +311,5 @@ def _text_item_length(item: ConversationItem) -> int | None:
 __all__ = [
     "PackedConversation",
     "PackedSpan",
-    "build_mot_attention_masks",
     "preprocess_mot_inputs",
 ]

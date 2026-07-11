@@ -372,7 +372,8 @@ def test_bagel_qwen2_mot_dummy_forward_pre_folds_upstream_dummy_anchor(monkeypat
     assert model._packed_training.spans == []
     assert inputs["packed_sequence"].requires_grad
     assert inputs["sample_lens"] == [1]
-    assert torch.equal(inputs["attention_mask"][0], torch.zeros(1, 1))
+    assert inputs["sample_splits"] == [[1]]
+    assert inputs["sample_attn_modes"] == [["full"]]
     inputs["packed_sequence"].sum().backward()
     assert siglip_dummy.value.grad is not None
 

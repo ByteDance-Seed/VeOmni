@@ -189,6 +189,7 @@ def test_mot_forward_post_scatters_virtual_marker_triplet_hidden_states() -> Non
         device=torch.device("cpu"),
         _conversation_carrier=[sample],
         _packed_training=packed,
+        _packed_is_dummy=False,
     )
     hidden_states = torch.arange(11 * _HIDDEN_SIZE, dtype=torch.float32).reshape(11, _HIDDEN_SIZE)
 

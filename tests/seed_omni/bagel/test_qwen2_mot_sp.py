@@ -133,13 +133,15 @@ def _qwen2_mot_sp_worker() -> None:
 
     BagelQwen2MoT = model_cls("bagel_qwen2_mot")
     BagelQwen2MoTConfig = config_cls("bagel_qwen2_mot")
+    config_kwargs = {
+        **tiny_bagel_qwen2_cfg(),
+        "attn_implementation": "veomni_flash_attention_2_with_sp",
+    }
     torch.manual_seed(9102)
-    reference = (
-        BagelQwen2MoT(BagelQwen2MoTConfig(**tiny_bagel_qwen2_cfg())).to(device=device, dtype=torch.bfloat16).train()
-    )
+    reference = BagelQwen2MoT(BagelQwen2MoTConfig(**config_kwargs)).to(device=device, dtype=torch.bfloat16).train()
     torch.manual_seed(9102)
     sequence_parallel = (
-        BagelQwen2MoT(BagelQwen2MoTConfig(**tiny_bagel_qwen2_cfg())).to(device=device, dtype=torch.bfloat16).train()
+        BagelQwen2MoT(BagelQwen2MoTConfig(**config_kwargs)).to(device=device, dtype=torch.bfloat16).train()
     )
     sequence_parallel.load_state_dict(reference.state_dict())
 

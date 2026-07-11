@@ -30,7 +30,6 @@ from .generation_state import MotCacheContext, MotGenerationState
 from .processing import (
     PackedConversation,
     PackedSpan,
-    build_mot_attention_masks,
     preprocess_mot_inputs,
 )
 
@@ -398,12 +397,11 @@ class BagelQwen2MoTModuleMixin(ModuleMixin):
                 packed_token_type_ids, dim=0, padding=False, group=ps.sp_group
             )
 
+        # Keep the compact global span layout. Attention reconstructs its
+        # causal/full/noise visibility span-wise instead of allocating masks.
         inputs["sample_lens"] = [sum(splits) for splits in gathered_splits]
-        inputs["attention_mask"] = build_mot_attention_masks(
-            gathered_splits,
-            gathered_modes,
-            device=self.device,
-        )
+        inputs["sample_splits"] = gathered_splits
+        inputs["sample_attn_modes"] = gathered_modes
         packed_token_type_ids = inputs.pop("packed_token_type_ids")
         inputs["packed_und_token_indexes"] = torch.nonzero(
             packed_token_type_ids == 0,
