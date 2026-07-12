@@ -11,8 +11,9 @@
 #   * outer trainer          : ulysses_size = 1
 #   * bagel_vae              : ulysses_size = 4  (image-batch redistribution)
 #   * bagel_siglip_navit     : ulysses_size = 4  (image-batch redistribution)
+#   * bagel_text_encoder     : ulysses_size = 4  (embedding / LM-head sequence)
 #   * bagel_qwen2_mot        : ulysses_size = 4
-#   * remaining Bagel modules: ulysses_size = 1
+#   * bagel_flow_connector   : ulysses_size = 1
 #
 # World-size rule: world % 4 == 0.
 bagel_vae:
@@ -32,6 +33,9 @@ bagel_siglip_navit:
 bagel_text_encoder:
   model:
     model_path: bagel_text_encoder
+
+  accelerator:
+    ulysses_size: 4
 
 bagel_flow_connector:
   model:
