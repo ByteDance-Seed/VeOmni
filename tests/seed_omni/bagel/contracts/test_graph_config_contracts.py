@@ -30,7 +30,7 @@ def test_bagel_train_yaml_loads_with_v2_module_names():
     assert "end" in endpoints
 
 
-def test_bagel_train_sp_yaml_only_enables_qwen2_mot_sp():
+def test_bagel_train_sp_yaml_enables_image_redistribution_and_qwen2_mot_sp():
     cfg = load_omni_config(
         modules_path=bagel_cfg_dir() / "modules_train_sp.yaml",
         train_graph_path=bagel_cfg_dir() / "graph_train.yaml",
@@ -43,8 +43,10 @@ def test_bagel_train_sp_yaml_only_enables_qwen2_mot_sp():
         "bagel_flow_connector",
         "bagel_vae",
     }
-    assert cfg.modules["bagel_qwen2_mot"]["train"]["accelerator"]["ulysses_size"] == 4
-    for module_name in set(cfg.modules) - {"bagel_qwen2_mot"}:
+    sp_modules = {"bagel_vae", "bagel_siglip_navit", "bagel_qwen2_mot"}
+    for module_name in sp_modules:
+        assert cfg.modules[module_name]["train"]["accelerator"]["ulysses_size"] == 4
+    for module_name in set(cfg.modules) - sp_modules:
         assert cfg.modules[module_name]["train"]["accelerator"]["ulysses_size"] == 1
 
 

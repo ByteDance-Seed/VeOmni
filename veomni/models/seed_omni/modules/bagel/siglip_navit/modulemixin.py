@@ -6,6 +6,8 @@ from typing import Any
 
 import torch
 
+from ......distributed.parallel_state import get_parallel_state
+from ......distributed.sequence_parallel import gather_outputs, sp_gather_seqs, sp_take_own_seq
 from ....mixins.metric_meter_mixin import MetricMeterMixin
 from ....mixins.modulemixin import CPUPreprocessor, ModuleMixin, post_forward, pre_forward
 from ....utils.conversation import ConversationItem, iter_desired_items
@@ -77,6 +79,9 @@ class BagelSiglipNavitModuleMixin(ModuleMixin):
     def init_omni_state(self) -> None:
         self._conversation_carrier: list[list[ConversationItem]] | None = None
         self._image_items: list[ConversationItem] = []
+        self._forward_sp_token_rep_lengths: list[int] | None = None
+        self._forward_sp_group_index = 0
+        self._forward_sp_local_token_lens: torch.Tensor | None = None
 
     def build_cpu_preprocessor(self) -> CPUPreprocessor | None:
         """Worker-side image patchify for training batches."""
@@ -119,7 +124,7 @@ class BagelSiglipNavitModuleMixin(ModuleMixin):
         self._image_items = self._select_siglip_image_items(conversation_list)
         out = self._inputs_from_preprocessed_items(self._image_items)
         self.metric_meter_set_seqlens("forward", self._metric_sample_token_lens(conversation_list))
-        return out
+        return self._redistribute_forward_batch(out)
 
     @post_forward("forward")
     def forward_post(
@@ -135,8 +140,82 @@ class BagelSiglipNavitModuleMixin(ModuleMixin):
         if token_lens is None:
             raise ValueError("BagelSiglipNavit.forward_post requires token_lens for non-dummy outputs.")
 
+        image_embeds, token_lens = self._restore_forward_batch(image_embeds, token_lens)
         self._scatter_image_embeds(image_items, image_embeds, token_lens)
         return {"conversation_list": conversation}
+
+    # ── Sequence-parallel helpers ──────────────────────
+
+    def _redistribute_forward_batch(self, inputs: dict[str, Any]) -> dict[str, Any]:
+        self._forward_sp_token_rep_lengths = None
+        self._forward_sp_group_index = 0
+        self._forward_sp_local_token_lens = None
+        ps = get_parallel_state()
+        if not ps.sp_enabled:
+            return inputs
+
+        local_token_lens = inputs["token_lens"]
+        full_token_lens, image_rep_lengths, group_index = sp_gather_seqs(local_token_lens, dim=0)
+        full_pixels, token_rep_lengths, _ = sp_gather_seqs(inputs["patchified_pixel_values"], dim=0)
+        full_position_ids, _, _ = sp_gather_seqs(inputs["patchified_position_ids"], dim=0)
+        if int(full_token_lens.sum().item()) != int(full_pixels.shape[0]):
+            raise RuntimeError("BAGEL SigLIP SP image lengths do not match the gathered patch sequence.")
+
+        image_start, image_end = self._balanced_image_bounds(
+            sum(image_rep_lengths),
+            group_index,
+            ps.sp_size,
+        )
+
+        full_cu_seqlens = torch.nn.functional.pad(torch.cumsum(full_token_lens, dim=0), (1, 0))
+        token_start = int(full_cu_seqlens[image_start].item())
+        token_end = int(full_cu_seqlens[image_end].item())
+        token_lens = full_token_lens[image_start:image_end].contiguous()
+
+        self._forward_sp_token_rep_lengths = token_rep_lengths
+        self._forward_sp_group_index = group_index
+        self._forward_sp_local_token_lens = local_token_lens
+        return {
+            "patchified_pixel_values": full_pixels[token_start:token_end].contiguous(),
+            "patchified_position_ids": full_position_ids[token_start:token_end].contiguous(),
+            "cu_seqlens": torch.nn.functional.pad(torch.cumsum(token_lens, dim=0), (1, 0)).to(torch.int32),
+            "max_seqlen": int(token_lens.max().item()),
+            "token_lens": token_lens,
+        }
+
+    def _restore_forward_batch(
+        self,
+        image_embeds: torch.Tensor,
+        token_lens: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        rep_lengths = self._forward_sp_token_rep_lengths
+        group_index = self._forward_sp_group_index
+        local_token_lens = self._forward_sp_local_token_lens
+        self._forward_sp_token_rep_lengths = None
+        self._forward_sp_group_index = 0
+        self._forward_sp_local_token_lens = None
+        if rep_lengths is None:
+            return image_embeds, token_lens
+
+        image_embeds = gather_outputs(
+            image_embeds,
+            gather_dim=0,
+            group=get_parallel_state().sp_group,
+        )
+        image_embeds = sp_take_own_seq(
+            image_embeds,
+            dim=0,
+            seg_lengths=rep_lengths,
+            sp_rank=group_index,
+        )
+        return image_embeds, local_token_lens
+
+    @staticmethod
+    def _balanced_image_bounds(num_images: int, rank: int, world_size: int) -> tuple[int, int]:
+        images_per_rank, remainder = divmod(num_images, world_size)
+        start = rank * images_per_rank + min(rank, remainder)
+        count = images_per_rank + int(rank < remainder)
+        return start, start + count
 
     # ── Internal helpers ──────────────────────────────────
 
