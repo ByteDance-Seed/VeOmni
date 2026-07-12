@@ -6,6 +6,7 @@ import pytest
 import torch
 import torch.nn as nn
 from torch.utils.checkpoint import checkpoint
+from transformers.modeling_layers import GradientCheckpointingLayer
 
 from veomni.distributed.chunk_mbs import (
     PackedSequenceRange,
@@ -123,7 +124,7 @@ def test_build_chunk_mbs_ranges_rejects_non_packed_batch_dim():
         build_chunk_mbs_ranges(batch, _config(chunk_mbs=2))
 
 
-class _ToyLayer(nn.Module):
+class _ToyLayer(GradientCheckpointingLayer):
     def __init__(self):
         super().__init__()
         self.proj = nn.Linear(2, 2)
@@ -139,6 +140,10 @@ class _ToyLayer(nn.Module):
         cu_seq_lens_k=None,
         max_length_q=None,
         max_length_k=None,
+        use_cache=None,
+        past_key_value=None,
+        past_key_values=None,
+        layer_past=None,
         **kwargs,
     ):
         linear_attn_cu_seq_lens_q = kwargs.get("linear_attn_cu_seq_lens_q")
@@ -155,6 +160,10 @@ class _ToyLayer(nn.Module):
                 "linear_attn_cu_seq_lens_q": (
                     linear_attn_cu_seq_lens_q.clone() if linear_attn_cu_seq_lens_q is not None else None
                 ),
+                "use_cache": use_cache,
+                "past_key_value": past_key_value,
+                "past_key_values": past_key_values,
+                "layer_past": layer_past,
             }
         )
         cos, sin = position_embeddings
@@ -172,6 +181,15 @@ class _ToyRoot(nn.Module):
         super().__init__()
         self.model = nn.Module()
         self.model.language_model = _ToyLanguageModel()
+
+    def gradient_checkpointing_enable(self, checkpoint_func):
+        for layer in self.model.language_model.layers:
+            layer.gradient_checkpointing = True
+            layer._gradient_checkpointing_func = checkpoint_func
+
+    def gradient_checkpointing_disable(self):
+        for layer in self.model.language_model.layers:
+            layer.gradient_checkpointing = False
 
 
 class _Qwen3VLRoot(nn.Module):
@@ -201,12 +219,8 @@ def _run_qwen3_vl_decoder_layer(
     cu_seq_lens: torch.Tensor,
     max_length: int,
     ranges,
-    use_checkpoint: bool,
 ):
     layer.train()
-    layer.gradient_checkpointing = use_checkpoint
-    if use_checkpoint:
-        layer._gradient_checkpointing_func = partial(checkpoint, use_reentrant=False)
     for param in layer.parameters():
         param.grad = None
 
@@ -284,6 +298,71 @@ def test_apply_chunk_mbs_slices_packed_samples(monkeypatch):
     assert [call["linear_attn_cu_seq_lens_q"].tolist() for call in layer.calls] == [[0, 3, 5], [0, 5]]
 
 
+def test_apply_chunk_mbs_preserves_gradient_checkpointing_without_ranges(monkeypatch):
+    import veomni.distributed.chunk_mbs as chunk_mbs
+
+    monkeypatch.setattr(
+        chunk_mbs,
+        "get_parallel_state",
+        lambda: types.SimpleNamespace(sp_enabled=False, any_extra_parallel_enabled=False),
+    )
+
+    model = _ToyRoot()
+    layer = model.model.language_model.layers[0]
+    checkpoint_calls = []
+
+    def checkpoint_func(function, *args):
+        checkpoint_calls.append(None)
+        return function(*args)
+
+    layer.gradient_checkpointing = True
+    layer._gradient_checkpointing_func = checkpoint_func
+    apply_chunk_mbs(model, _config(chunk_mbs=2))
+
+    hidden_states = torch.zeros(1, 2, 2)
+    position_ids = torch.arange(2).view(1, 2)
+    forward_kwargs = dict(
+        position_embeddings=(torch.ones_like(hidden_states), torch.ones_like(hidden_states)),
+        attention_mask=torch.ones(1, 1, 2, 2),
+        position_ids=position_ids,
+        cu_seq_lens_q=torch.tensor([0, 2], dtype=torch.int32),
+        cu_seq_lens_k=torch.tensor([0, 2], dtype=torch.int32),
+        max_length_q=2,
+        max_length_k=2,
+    )
+    output = layer(hidden_states, **forward_kwargs)
+
+    assert output.shape == hidden_states.shape
+    assert checkpoint_calls == [None]
+    assert layer.gradient_checkpointing
+
+    model.gradient_checkpointing_disable()
+    layer(hidden_states, **forward_kwargs)
+    assert checkpoint_calls == [None]
+
+    model.gradient_checkpointing_enable(checkpoint_func)
+    layer.eval()
+    layer(hidden_states, **forward_kwargs)
+    assert checkpoint_calls == [None]
+
+    layer.train()
+    cache = object()
+    layer(
+        hidden_states,
+        **forward_kwargs,
+        use_cache=True,
+        past_key_value=cache,
+        past_key_values=cache,
+        layer_past=cache,
+    )
+    assert checkpoint_calls == [None, None]
+    assert layer.calls[-1]["use_cache"] is False
+    assert layer.calls[-1]["past_key_value"] is None
+    assert layer.calls[-1]["past_key_values"] is None
+    assert layer.calls[-1]["layer_past"] is None
+    assert layer.gradient_checkpointing
+
+
 def test_slice_kwargs_slices_multimodal_position_ids():
     import veomni.distributed.chunk_mbs as chunk_mbs
 
@@ -330,8 +409,28 @@ def test_apply_chunk_mbs_matches_qwen3_vl_decoder_layer(monkeypatch, use_checkpo
 
     baseline_layer = Qwen3VLTextDecoderLayer(config, layer_idx=0)
     chunked_root = _Qwen3VLRoot(copy.deepcopy(baseline_layer))
-    apply_chunk_mbs(chunked_root, _config(chunk_mbs=2))
     chunked_layer = chunked_root.model.language_model.layers[0]
+    checkpoint_calls = []
+    baseline_hook_calls = []
+    chunked_hook_calls = []
+
+    baseline_layer.register_forward_pre_hook(lambda *_: baseline_hook_calls.append("pre"))
+    baseline_layer.register_forward_hook(lambda *_: baseline_hook_calls.append("post"))
+    chunked_layer.register_forward_pre_hook(lambda *_: chunked_hook_calls.append("pre"))
+    chunked_layer.register_forward_hook(lambda *_: chunked_hook_calls.append("post"))
+
+    if use_checkpoint:
+        baseline_layer.gradient_checkpointing = True
+        baseline_layer._gradient_checkpointing_func = partial(checkpoint, use_reentrant=False)
+
+        def checkpoint_func(function, *args):
+            checkpoint_calls.append(None)
+            return checkpoint(function, *args, use_reentrant=False)
+
+        chunked_layer.gradient_checkpointing = True
+        chunked_layer._gradient_checkpointing_func = checkpoint_func
+
+    apply_chunk_mbs(chunked_root, _config(chunk_mbs=2))
 
     assert getattr(chunked_layer, "_chunk_mbs_wrapped", False)
 
@@ -363,7 +462,6 @@ def test_apply_chunk_mbs_matches_qwen3_vl_decoder_layer(monkeypatch, use_checkpo
         cu_seq_lens,
         max_length,
         ranges=None,
-        use_checkpoint=use_checkpoint,
     )
     chunked_output, chunked_hidden_grad, chunked_param_grads = _run_qwen3_vl_decoder_layer(
         chunked_layer,
@@ -374,8 +472,13 @@ def test_apply_chunk_mbs_matches_qwen3_vl_decoder_layer(monkeypatch, use_checkpo
         cu_seq_lens,
         max_length,
         ranges=ranges,
-        use_checkpoint=use_checkpoint,
     )
+
+    if use_checkpoint:
+        assert checkpoint_calls == [None]
+        assert chunked_layer.gradient_checkpointing
+
+    assert chunked_hook_calls == baseline_hook_calls
 
     torch.testing.assert_close(chunked_output, baseline_output, rtol=1e-5, atol=1e-5)
     torch.testing.assert_close(chunked_hidden_grad, baseline_hidden_grad, rtol=1e-5, atol=1e-5)

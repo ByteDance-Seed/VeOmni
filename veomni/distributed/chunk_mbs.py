@@ -156,6 +156,7 @@ def apply_chunk_mbs(model: nn.Module, config: Any) -> nn.Module:
     for fqn, module in target_modules:
         _wrap_module_forward(module, config)
         logger.info_rank0(f"Enable ChunkMBS for module: {fqn}")
+    _wrap_gradient_checkpointing_methods(model, [module for _, module in target_modules])
     return model
 
 
@@ -181,6 +182,7 @@ def _wrap_module_forward(module: nn.Module, config: Any) -> None:
         return
 
     orig_forward = module.forward
+    _wrap_gradient_checkpointing_func(module)
 
     @wraps(orig_forward)
     def wrapped_forward(*args, **kwargs):
@@ -193,6 +195,51 @@ def _wrap_module_forward(module: nn.Module, config: Any) -> None:
     module._chunk_mbs_wrapped = True
 
 
+def _wrap_gradient_checkpointing_func(module: nn.Module) -> None:
+    if not getattr(module, "gradient_checkpointing", False):
+        return
+    checkpoint_func = getattr(module, "_gradient_checkpointing_func", None)
+    if checkpoint_func is None:
+        raise RuntimeError("ChunkMBS found gradient checkpointing enabled without a checkpoint function.")
+    if getattr(checkpoint_func, "_chunk_mbs_wrapped", False):
+        return
+
+    @wraps(checkpoint_func)
+    def wrapped_checkpoint_func(function, *args, **kwargs):
+        ranges = _chunk_mbs_ranges.get()
+        if not ranges:
+            return checkpoint_func(function, *args, **kwargs)
+
+        @wraps(function)
+        def forward_with_chunk_mbs_context(*forward_args, **forward_kwargs):
+            with chunk_mbs_context(ranges):
+                return function(*forward_args, **forward_kwargs)
+
+        return checkpoint_func(forward_with_chunk_mbs_context, *args, **kwargs)
+
+    wrapped_checkpoint_func._chunk_mbs_wrapped = True
+    module._gradient_checkpointing_func = wrapped_checkpoint_func
+
+
+def _wrap_gradient_checkpointing_methods(model: nn.Module, target_modules: list[nn.Module]) -> None:
+    if getattr(model, "_chunk_mbs_gradient_checkpointing_wrapped", False):
+        return
+
+    gradient_checkpointing_enable = getattr(model, "gradient_checkpointing_enable", None)
+    if gradient_checkpointing_enable is not None:
+
+        @wraps(gradient_checkpointing_enable)
+        def wrapped_enable(*args, **kwargs):
+            result = gradient_checkpointing_enable(*args, **kwargs)
+            for module in target_modules:
+                _wrap_gradient_checkpointing_func(module)
+            return result
+
+        model.gradient_checkpointing_enable = wrapped_enable
+
+    model._chunk_mbs_gradient_checkpointing_wrapped = True
+
+
 def _chunked_forward(
     orig_forward: Any,
     ranges: list[PackedSequenceRange],
@@ -200,7 +247,9 @@ def _chunked_forward(
     args: tuple[Any, ...],
     kwargs: dict[str, Any],
 ) -> torch.Tensor:
-    if kwargs.get("use_cache") or kwargs.get("past_key_values") is not None:
+    if kwargs.get("use_cache") or any(
+        kwargs.get(key) is not None for key in ("past_key_value", "past_key_values", "layer_past")
+    ):
         raise RuntimeError("ChunkMBS is only supported for training without KV cache.")
 
     sequence_dim = getattr(config, "sequence_dim", 1)
