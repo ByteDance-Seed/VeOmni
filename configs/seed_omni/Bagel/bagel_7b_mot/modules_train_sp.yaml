@@ -12,8 +12,8 @@
 #   * bagel_vae              : ulysses_size = 4  (image-batch redistribution)
 #   * bagel_siglip_navit     : ulysses_size = 4  (image-batch redistribution)
 #   * bagel_text_encoder     : ulysses_size = 4  (embedding / LM-head sequence)
+#   * bagel_flow_connector   : ulysses_size = 4  (latent-token redistribution)
 #   * bagel_qwen2_mot        : ulysses_size = 4
-#   * bagel_flow_connector   : ulysses_size = 1
 #
 # World-size rule: world % 4 == 0.
 bagel_vae:
@@ -40,6 +40,9 @@ bagel_text_encoder:
 bagel_flow_connector:
   model:
     model_path: bagel_flow_connector
+
+  accelerator:
+    ulysses_size: 4
 
 bagel_qwen2_mot:
   model:

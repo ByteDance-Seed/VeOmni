@@ -43,7 +43,13 @@ def test_bagel_train_sp_yaml_enables_supported_module_sp():
         "bagel_flow_connector",
         "bagel_vae",
     }
-    sp_modules = {"bagel_vae", "bagel_siglip_navit", "bagel_text_encoder", "bagel_qwen2_mot"}
+    sp_modules = {
+        "bagel_vae",
+        "bagel_siglip_navit",
+        "bagel_text_encoder",
+        "bagel_flow_connector",
+        "bagel_qwen2_mot",
+    }
     for module_name in sp_modules:
         assert cfg.modules[module_name]["train"]["accelerator"]["ulysses_size"] == 4
     for module_name in set(cfg.modules) - sp_modules:

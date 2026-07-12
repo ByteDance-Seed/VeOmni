@@ -6,6 +6,14 @@ from typing import Any
 
 import torch
 
+from ......distributed.parallel_state import get_parallel_state
+from ......distributed.sequence_parallel import (
+    gather_outputs,
+    slice_input_tensor,
+    sp_gather_seqs,
+    sp_pad,
+    sp_take_own_seq,
+)
 from ....graphs.generation_graph import FSM_SIGNAL_KEY
 from ....mixins.metric_meter_mixin import MetricMeterMixin
 from ....mixins.modulemixin import ModuleMixin, post_forward, pre_forward
@@ -40,9 +48,15 @@ class BagelFlowConnectorModuleMixin(ModuleMixin):
         self._conversation_carrier: list[list[ConversationItem]] | None = None
         self._embed_items: list[ConversationItem] = []
         self._embed_lengths: list[int] = []
+        self._embed_sp_seqlen: int | None = None
+        self._embed_sp_rep_lengths: list[int] | None = None
+        self._embed_sp_group_index = 0
         self._decode_target_groups: list[list[ConversationItem]] = []
         self._decode_lengths: list[int] = []
         self._decode_target: torch.Tensor | None = None
+        self._decode_sp_seqlen: int | None = None
+        self._decode_sp_rep_lengths: list[int] | None = None
+        self._decode_sp_group_index = 0
         self._generation_state = FlowGenerationState()
 
     def reset_local_inference_state(self) -> None:
@@ -201,6 +215,7 @@ class BagelFlowConnectorModuleMixin(ModuleMixin):
         del kwargs
         self._conversation_carrier = conversation_list
         self._embed_lengths = []
+        self._clear_embed_sp_state()
 
         self._embed_items = self._select_vae_context_latent_items(conversation_list)
         if not self._embed_items:
@@ -254,6 +269,12 @@ class BagelFlowConnectorModuleMixin(ModuleMixin):
             "position_ids": torch.cat([part["position_ids"] for part in parts], dim=0),
             "timesteps": torch.cat([part["timesteps"] for part in parts], dim=0),
         }
+        inputs, self._embed_sp_seqlen, self._embed_sp_rep_lengths, self._embed_sp_group_index = (
+            self._redistribute_training_inputs(
+                inputs,
+                pad_values={"latents": 0, "position_ids": 0, "timesteps": 0},
+            )
+        )
         return inputs
 
     @post_forward("embed_latent")
@@ -265,6 +286,13 @@ class BagelFlowConnectorModuleMixin(ModuleMixin):
         self._embed_items = []
         self._embed_lengths = []
 
+        latent_embeds = self._restore_training_output(
+            latent_embeds,
+            seqlen=self._embed_sp_seqlen,
+            rep_lengths=self._embed_sp_rep_lengths,
+            group_index=self._embed_sp_group_index,
+        )
+        self._clear_embed_sp_state()
         self._scatter_latent_embeds(embed_items, embed_lengths, latent_embeds)
         return {"conversation_list": conversation}
 
@@ -278,6 +306,7 @@ class BagelFlowConnectorModuleMixin(ModuleMixin):
         self._conversation_carrier = conversation_list
         self._decode_lengths = []
         self._decode_target = None
+        self._clear_decode_sp_state()
 
         self._decode_target_groups = self._select_velocity_target_groups(conversation_list)
 
@@ -304,7 +333,13 @@ class BagelFlowConnectorModuleMixin(ModuleMixin):
         if target_parts:
             self._decode_target = torch.cat(target_parts, dim=0)
 
-        return {"hidden_states": torch.cat([part["hidden_states"] for part in inputs_parts], dim=0)}
+        inputs, self._decode_sp_seqlen, self._decode_sp_rep_lengths, self._decode_sp_group_index = (
+            self._redistribute_training_inputs(
+                {"hidden_states": torch.cat([part["hidden_states"] for part in inputs_parts], dim=0)},
+                pad_values={"hidden_states": 0},
+            )
+        )
+        return inputs
 
     @post_forward("decode_velocity")
     def decode_velocity_post(self, velocity: torch.Tensor) -> dict[str, Any]:
@@ -317,6 +352,13 @@ class BagelFlowConnectorModuleMixin(ModuleMixin):
         self._decode_lengths = []
         self._decode_target = None
 
+        velocity = self._restore_training_output(
+            velocity,
+            seqlen=self._decode_sp_seqlen,
+            rep_lengths=self._decode_sp_rep_lengths,
+            group_index=self._decode_sp_group_index,
+        )
+        self._clear_decode_sp_state()
         real_velocity_parts = self._scatter_velocity(decode_target_groups, decode_lengths, velocity)
         loss = velocity.sum() * 0.0
         if target is not None and real_velocity_parts:
@@ -325,6 +367,72 @@ class BagelFlowConnectorModuleMixin(ModuleMixin):
             token_count = torch.tensor(float(mse.shape[0]), device=mse.device, dtype=mse.dtype)
             loss = loss + mse.mean(dim=-1).sum() / token_count
         return {"conversation_list": conversation, "_loss": loss}
+
+    # ── Sequence-parallel helpers ──────────────────────
+
+    def _redistribute_training_inputs(
+        self,
+        inputs: dict[str, torch.Tensor],
+        *,
+        pad_values: dict[str, int],
+    ) -> tuple[dict[str, torch.Tensor], int | None, list[int] | None, int]:
+        ps = get_parallel_state()
+        if not ps.sp_enabled:
+            return inputs, None, None, 0
+        if ps.cp_size != 1:
+            raise ValueError(
+                f"BAGEL flow connector training supports Ulysses sequence parallelism only; got cp_size={ps.cp_size}."
+            )
+
+        redistributed: dict[str, torch.Tensor] = {}
+        seqlen: int | None = None
+        rep_lengths: list[int] | None = None
+        group_index = 0
+        for name, tensor in inputs.items():
+            gathered, tensor_rep_lengths, tensor_group_index = sp_gather_seqs(tensor, dim=0)
+            if rep_lengths is None:
+                seqlen = int(gathered.shape[0])
+                rep_lengths = tensor_rep_lengths
+                group_index = tensor_group_index
+            elif tensor_rep_lengths != rep_lengths:
+                raise RuntimeError("BAGEL flow connector SP inputs must have matching per-rank token lengths.")
+
+            gathered = sp_pad(gathered, dim=0, pad_value=pad_values[name])
+            redistributed[name] = slice_input_tensor(gathered, dim=0, padding=False, group=ps.sp_group)
+
+        return redistributed, seqlen, rep_lengths, group_index
+
+    def _restore_training_output(
+        self,
+        output: torch.Tensor,
+        *,
+        seqlen: int | None,
+        rep_lengths: list[int] | None,
+        group_index: int,
+    ) -> torch.Tensor:
+        if seqlen is None:
+            return output
+        if rep_lengths is None:
+            raise RuntimeError("BAGEL flow connector SP output state was not initialized.")
+
+        output = gather_outputs(
+            output,
+            gather_dim=0,
+            padding_dim=0,
+            unpad_dim_size=seqlen,
+            group=get_parallel_state().sp_group,
+        )
+        return sp_take_own_seq(output, dim=0, seg_lengths=rep_lengths, sp_rank=group_index)
+
+    def _clear_embed_sp_state(self) -> None:
+        self._embed_sp_seqlen = None
+        self._embed_sp_rep_lengths = None
+        self._embed_sp_group_index = 0
+
+    def _clear_decode_sp_state(self) -> None:
+        self._decode_sp_seqlen = None
+        self._decode_sp_rep_lengths = None
+        self._decode_sp_group_index = 0
 
     # ── Dummy helpers ──────────────────────────────────
 
