@@ -17,14 +17,14 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from functools import wraps
-from typing import Any, Iterable, Iterator, Optional
+from typing import Any, Iterator, Optional
 
 import torch
 import torch.nn as nn
+from transformers.modeling_layers import GradientCheckpointingLayer
 
 from ..utils import logging
 from .parallel_state import get_parallel_state
-from .utils import check_any_fqn_match
 
 
 logger = logging.get_logger(__name__)
@@ -140,16 +140,44 @@ def apply_chunk_mbs(model: nn.Module, config: Any) -> nn.Module:
     if parallel_state.any_extra_parallel_enabled:
         raise RuntimeError("ChunkMBS currently does not support ExtraParallel/MoE.")
 
-    patterns = list(getattr(config, "apply_modules", []) or [])
-    if not patterns:
-        raise ValueError("chunk_mbs_config.apply_modules must be non-empty when ChunkMBS is enabled.")
-
     strict = getattr(config, "strict", True)
-    target_modules = _find_target_modules(model, patterns)
-    if not target_modules:
-        message = f"ChunkMBS did not match any module from apply_modules={patterns!r}."
+    target_classes = _decoder_layer_class_names(model)
+    if len(target_classes) != 1:
+        message = (
+            "ChunkMBS requires exactly one decoder layer class in model._no_split_modules, "
+            f"got {sorted(target_classes)!r}."
+        )
         if strict:
             raise ValueError(message)
+        logger.warning_rank0(message)
+        return model
+
+    target_modules = _find_target_modules(model, target_classes)
+    if not target_modules:
+        message = "ChunkMBS did not match any decoder layer listed in model._no_split_modules."
+        if strict:
+            raise ValueError(message)
+        logger.warning_rank0(message)
+        return model
+
+    target_stacks = {fqn.rpartition(".")[0] for fqn, _ in target_modules}
+    if len(target_stacks) != 1:
+        message = f"ChunkMBS requires exactly one decoder stack, got {sorted(target_stacks)!r}."
+        if strict:
+            raise ValueError(message)
+        logger.warning_rank0(message)
+        return model
+
+    incompatible_modules = [
+        fqn for fqn, module in target_modules if not isinstance(module, GradientCheckpointingLayer)
+    ]
+    if incompatible_modules:
+        message = (
+            "ChunkMBS requires decoder layers to inherit transformers.modeling_layers.GradientCheckpointingLayer, "
+            f"got incompatible modules {incompatible_modules!r}."
+        )
+        if strict:
+            raise TypeError(message)
         logger.warning_rank0(message)
         return model
 
@@ -160,21 +188,21 @@ def apply_chunk_mbs(model: nn.Module, config: Any) -> nn.Module:
     return model
 
 
-def _find_target_modules(model: nn.Module, patterns: Iterable[str]) -> list[tuple[str, nn.Module]]:
-    normalized_patterns = [_normalize_pattern(pattern) for pattern in patterns]
+def _decoder_layer_class_names(model: nn.Module) -> set[str]:
+    no_split_modules = getattr(model, "_no_split_modules", None) or []
+    return {name for name in no_split_modules if isinstance(name, str) and name.endswith("DecoderLayer")}
+
+
+def _find_target_modules(model: nn.Module, target_classes: set[str]) -> list[tuple[str, nn.Module]]:
     target_modules: list[tuple[str, nn.Module]] = []
     seen: set[int] = set()
     for fqn, module in model.named_modules():
         if id(module) in seen:
             continue
-        if check_any_fqn_match(normalized_patterns, fqn):
+        if module.__class__.__name__ in target_classes:
             target_modules.append((fqn, module))
             seen.add(id(module))
     return target_modules
-
-
-def _normalize_pattern(pattern: str) -> str:
-    return pattern.replace("{*}", "*")
 
 
 def _wrap_module_forward(module: nn.Module, config: Any) -> None:

@@ -16,11 +16,10 @@ from veomni.distributed.chunk_mbs import (
 )
 
 
-def _config(chunk_mbs=2, apply_modules=None, strict=True):
+def _config(chunk_mbs=2, strict=True):
     return types.SimpleNamespace(
         enable=True,
         chunk_mbs=chunk_mbs,
-        apply_modules=apply_modules or ["model.language_model.layers.*"],
         sequence_dim=1,
         strict=strict,
     )
@@ -124,7 +123,7 @@ def test_build_chunk_mbs_ranges_rejects_non_packed_batch_dim():
         build_chunk_mbs_ranges(batch, _config(chunk_mbs=2))
 
 
-class _ToyLayer(GradientCheckpointingLayer):
+class _ToyDecoderLayer(GradientCheckpointingLayer):
     def __init__(self):
         super().__init__()
         self.proj = nn.Linear(2, 2)
@@ -173,14 +172,32 @@ class _ToyLayer(GradientCheckpointingLayer):
 class _ToyLanguageModel(nn.Module):
     def __init__(self):
         super().__init__()
-        self.layers = nn.ModuleList([_ToyLayer(), _ToyLayer()])
+        self.layers = nn.ModuleList([_ToyDecoderLayer(), _ToyDecoderLayer()])
+
+
+class _ToyVisionBlock(nn.Module):
+    def forward(self, hidden_states):
+        return hidden_states
+
+
+class _AuxDecoderLayer(GradientCheckpointingLayer):
+    def forward(self, hidden_states):
+        return hidden_states
+
+
+class _PlainDecoderLayer(nn.Module):
+    def forward(self, hidden_states):
+        return hidden_states
 
 
 class _ToyRoot(nn.Module):
+    _no_split_modules = ["_ToyDecoderLayer", "_ToyVisionBlock"]
+
     def __init__(self):
         super().__init__()
         self.model = nn.Module()
         self.model.language_model = _ToyLanguageModel()
+        self.model.visual = _ToyVisionBlock()
 
     def gradient_checkpointing_enable(self, checkpoint_func):
         for layer in self.model.language_model.layers:
@@ -193,6 +210,8 @@ class _ToyRoot(nn.Module):
 
 
 class _Qwen3VLRoot(nn.Module):
+    _no_split_modules = ["Qwen3VLTextDecoderLayer", "Qwen3VLVisionBlock"]
+
     def __init__(self, layer):
         super().__init__()
         self.model = nn.Module()
@@ -259,6 +278,7 @@ def test_apply_chunk_mbs_slices_packed_samples(monkeypatch):
 
     assert getattr(layer, "_chunk_mbs_wrapped", False)
     assert not getattr(layer.proj, "_chunk_mbs_wrapped", False)
+    assert not getattr(model.model.visual, "_chunk_mbs_wrapped", False)
 
     batch = {
         "cu_seq_lens_q": torch.tensor([0, 3, 5, 9, 10], dtype=torch.int32),
@@ -512,3 +532,81 @@ def test_apply_chunk_mbs_rejects_sequence_parallel(monkeypatch):
 
     with pytest.raises(RuntimeError, match="sequence parallelism"):
         apply_chunk_mbs(_ToyRoot(), _config(chunk_mbs=2))
+
+
+def test_apply_chunk_mbs_requires_decoder_layer_in_no_split_modules(monkeypatch):
+    import veomni.distributed.chunk_mbs as chunk_mbs
+
+    monkeypatch.setattr(
+        chunk_mbs,
+        "get_parallel_state",
+        lambda: types.SimpleNamespace(sp_enabled=False, any_extra_parallel_enabled=False),
+    )
+
+    model = nn.Module()
+    model._no_split_modules = ["_ToyVisionBlock"]
+
+    with pytest.raises(ValueError, match="model._no_split_modules"):
+        apply_chunk_mbs(model, _config(chunk_mbs=2))
+    assert apply_chunk_mbs(model, _config(chunk_mbs=2, strict=False)) is model
+
+
+def test_apply_chunk_mbs_rejects_ambiguous_decoder_layer_classes(monkeypatch):
+    import veomni.distributed.chunk_mbs as chunk_mbs
+
+    monkeypatch.setattr(
+        chunk_mbs,
+        "get_parallel_state",
+        lambda: types.SimpleNamespace(sp_enabled=False, any_extra_parallel_enabled=False),
+    )
+
+    model = nn.Module()
+    model._no_split_modules = ["_ToyDecoderLayer", "_AuxDecoderLayer"]
+    model.decoder = _ToyDecoderLayer()
+    model.aux_decoder = _AuxDecoderLayer()
+
+    with pytest.raises(ValueError, match="exactly one decoder layer class"):
+        apply_chunk_mbs(model, _config(chunk_mbs=2))
+    assert apply_chunk_mbs(model, _config(chunk_mbs=2, strict=False)) is model
+    assert not getattr(model.decoder, "_chunk_mbs_wrapped", False)
+    assert not getattr(model.aux_decoder, "_chunk_mbs_wrapped", False)
+
+
+def test_apply_chunk_mbs_rejects_ambiguous_decoder_stacks(monkeypatch):
+    import veomni.distributed.chunk_mbs as chunk_mbs
+
+    monkeypatch.setattr(
+        chunk_mbs,
+        "get_parallel_state",
+        lambda: types.SimpleNamespace(sp_enabled=False, any_extra_parallel_enabled=False),
+    )
+
+    model = nn.Module()
+    model._no_split_modules = ["_ToyDecoderLayer"]
+    model.decoder = nn.ModuleList([_ToyDecoderLayer()])
+    model.aux_decoder = nn.ModuleList([_ToyDecoderLayer()])
+
+    with pytest.raises(ValueError, match="exactly one decoder stack"):
+        apply_chunk_mbs(model, _config(chunk_mbs=2))
+    assert apply_chunk_mbs(model, _config(chunk_mbs=2, strict=False)) is model
+    assert not getattr(model.decoder[0], "_chunk_mbs_wrapped", False)
+    assert not getattr(model.aux_decoder[0], "_chunk_mbs_wrapped", False)
+
+
+def test_apply_chunk_mbs_rejects_incompatible_decoder_layer(monkeypatch):
+    import veomni.distributed.chunk_mbs as chunk_mbs
+
+    monkeypatch.setattr(
+        chunk_mbs,
+        "get_parallel_state",
+        lambda: types.SimpleNamespace(sp_enabled=False, any_extra_parallel_enabled=False),
+    )
+
+    model = nn.Module()
+    model._no_split_modules = ["_PlainDecoderLayer"]
+    model.decoder = _PlainDecoderLayer()
+
+    with pytest.raises(TypeError, match="GradientCheckpointingLayer"):
+        apply_chunk_mbs(model, _config(chunk_mbs=2))
+    assert apply_chunk_mbs(model, _config(chunk_mbs=2, strict=False)) is model
+    assert not getattr(model.decoder, "_chunk_mbs_wrapped", False)

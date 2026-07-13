@@ -244,15 +244,11 @@ class ChunkMBSConfig:
 
     enable: bool = field(
         default=False,
-        metadata={"help": "Enable ChunkMBS for selected packed-sequence modules."},
+        metadata={"help": "Enable ChunkMBS for packed-sequence decoder layers."},
     )
     chunk_mbs: int = field(
         default=1,
         metadata={"help": "Number of packed samples per layer chunk."},
-    )
-    apply_modules: List[str] = field(
-        default_factory=list,
-        metadata={"help": "Module FQN patterns to wrap, e.g. model.language_model.layers.*."},
     )
     sequence_dim: int = field(
         default=1,
