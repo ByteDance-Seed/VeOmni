@@ -108,7 +108,7 @@ def _is_mtp_checkpoint_key(name: str) -> bool:
     return name.removeprefix("model.").startswith("mtp.")
 
 
-def convert_deepseek_v4_checkpoint_key(name: str) -> str:
+def convert_deepseek_v4_checkpoint_key(name: str, *, target_model_prefix: str = "model.") -> str:
     """Convert DeepSeek's inference checkpoint names to Transformers v5 names."""
     if _is_mtp_checkpoint_key(name):
         return name
@@ -116,7 +116,7 @@ def convert_deepseek_v4_checkpoint_key(name: str) -> str:
     source_name = name.removeprefix("model.") if has_model_prefix else name
     converted_name, _ = rename_source_key(source_name, _DEEPSEEK_V4_WEIGHT_RENAMINGS, [])
     if converted_name.startswith(_BASE_MODEL_KEY_PREFIXES):
-        return f"model.{converted_name}"
+        return f"{target_model_prefix}{converted_name}"
     if has_model_prefix and converted_name == source_name:
         return name
     return converted_name
@@ -189,8 +189,9 @@ class DeepseekV4CheckpointTensorConverter:
             via ``DeepseekV4Config.attribute_map``).
     """
 
-    def __init__(self, num_experts: int):
+    def __init__(self, num_experts: int, *, target_model_prefix: str = "model."):
         self.num_experts = num_experts
+        self.target_model_prefix = target_model_prefix
         # {(prefix, proj_name): {expert_id: tensor}}
         self._expert_buffer: dict[tuple[str, str], dict[int, torch.Tensor]] = {}
         # {prefix: {proj_name: stacked_tensor}} for gate/up merge waiting
@@ -201,7 +202,7 @@ class DeepseekV4CheckpointTensorConverter:
     def can_handle(self, name: str) -> bool:
         if _is_mtp_checkpoint_key(name):
             return False
-        converted_name = convert_deepseek_v4_checkpoint_key(name)
+        converted_name = convert_deepseek_v4_checkpoint_key(name, target_model_prefix=self.target_model_prefix)
         return (
             converted_name != name
             or bool(_EXPERT_PATTERN.match(converted_name))
@@ -211,14 +212,14 @@ class DeepseekV4CheckpointTensorConverter:
     def can_handle_tensor(self, name: str, tensor: torch.Tensor) -> bool:
         if _is_mtp_checkpoint_key(name):
             return False
-        converted_name = convert_deepseek_v4_checkpoint_key(name)
+        converted_name = convert_deepseek_v4_checkpoint_key(name, target_model_prefix=self.target_model_prefix)
         return self.can_handle(name) or (converted_name.endswith(".weight") and _is_quantized_weight(tensor))
 
     def convert(self, name: str, tensor: torch.Tensor) -> ConvertedCheckpointTensor | None:
         if _is_mtp_checkpoint_key(name):
             return ConvertedCheckpointTensor(name, tensor)
         packed_fp4 = tensor.dtype == torch.int8 and bool(_RAW_FP4_EXPERT_WEIGHT_PATTERN.fullmatch(name))
-        name = convert_deepseek_v4_checkpoint_key(name)
+        name = convert_deepseek_v4_checkpoint_key(name, target_model_prefix=self.target_model_prefix)
         weight_name = _weight_name_from_scale_name(name)
         if weight_name is not None:
             if not _is_block_scale_tensor(tensor):
@@ -332,17 +333,34 @@ def create_deepseek_v4_checkpoint_tensor_converter(model):
     """Factory function registered on model classes via _create_checkpoint_tensor_converter."""
     return DeepseekV4CheckpointTensorConverter(
         num_experts=model.config.n_routed_experts,
+        target_model_prefix=_get_deepseek_v4_target_model_prefix(model),
     )
 
 
-def convert_deepseek_v4_fqn_to_index_mapping(fqn_to_index_mapping: dict[str, int]) -> dict[str, int]:
+def _get_deepseek_v4_target_model_prefix(model) -> str:
+    named_parameters = getattr(model, "named_parameters", None)
+    if callable(named_parameters):
+        for name, _ in named_parameters():
+            if name.startswith("model."):
+                return "model."
+            if name.startswith(_BASE_MODEL_KEY_PREFIXES):
+                return ""
+
+    if type(model).__name__.endswith("ForCausalLM"):
+        return "model."
+    return ""
+
+
+def convert_deepseek_v4_fqn_to_index_mapping(
+    fqn_to_index_mapping: dict[str, int], *, target_model_prefix: str = "model."
+) -> dict[str, int]:
     """Align HF safetensors index keys with fused expert parameter names."""
     gate_up_shard_indices: dict[str, list[int]] = defaultdict(list)
     down_shard_indices: dict[str, list[int]] = defaultdict(list)
     converted: dict[str, int] = {}
 
     for fqn, shard_idx in fqn_to_index_mapping.items():
-        fqn = convert_deepseek_v4_checkpoint_key(fqn)
+        fqn = convert_deepseek_v4_checkpoint_key(fqn, target_model_prefix=target_model_prefix)
         match = _EXPERT_PATTERN.match(fqn)
         if not match:
             converted[fqn] = shard_idx

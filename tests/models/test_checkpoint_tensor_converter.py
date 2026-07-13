@@ -542,6 +542,23 @@ class TestDeepseekV4ConverterConvert:
     def test_converts_deepseek_inference_checkpoint_names(self, raw_name: str, converted_name: str):
         assert convert_deepseek_v4_checkpoint_key(raw_name) == converted_name
 
+    @pytest.mark.parametrize(
+        ("raw_name", "converted_name"),
+        [
+            ("embed.weight", "embed_tokens.weight"),
+            ("model.embed.weight", "embed_tokens.weight"),
+            ("norm.weight", "norm.weight"),
+            ("model.norm.weight", "norm.weight"),
+            ("layers.2.attn.wkv.weight", "layers.2.self_attn.kv_proj.weight"),
+            ("model.layers.2.attn.wkv.weight", "layers.2.self_attn.kv_proj.weight"),
+            ("layers.2.ffn.experts.7.w3.scale", "layers.2.mlp.experts.7.w3.scale"),
+            ("head.weight", "lm_head.weight"),
+            ("model.custom.weight", "model.custom.weight"),
+        ],
+    )
+    def test_converts_deepseek_inference_checkpoint_names_for_base_model(self, raw_name: str, converted_name: str):
+        assert convert_deepseek_v4_checkpoint_key(raw_name, target_model_prefix="") == converted_name
+
     def test_raw_inference_fp8_pair_emits_hf_name(self):
         converter = DeepseekV4CheckpointTensorConverter(num_experts=NUM_EXPERTS)
         weight = _to_fp8(torch.arange(16, dtype=torch.float32).reshape(4, 4))
@@ -552,6 +569,18 @@ class TestDeepseekV4ConverterConvert:
 
         assert result is not None
         assert result.name == "model.layers.0.self_attn.kv_proj.weight"
+        assert torch.equal(result.tensor, weight.float())
+
+    def test_raw_inference_fp8_pair_emits_base_model_name(self):
+        converter = DeepseekV4CheckpointTensorConverter(num_experts=NUM_EXPERTS, target_model_prefix="")
+        weight = _to_fp8(torch.arange(16, dtype=torch.float32).reshape(4, 4))
+        scale = torch.ones(2, 2)
+
+        assert maybe_convert_checkpoint_tensor("layers.0.attn.wkv.weight", weight, converter) is None
+        result = maybe_convert_checkpoint_tensor("layers.0.attn.wkv.scale", scale, converter)
+
+        assert result is not None
+        assert result.name == "layers.0.self_attn.kv_proj.weight"
         assert torch.equal(result.tensor, weight.float())
 
     def test_fp8_weight_scale_pair_emits_dequantized_weight(self):
@@ -767,10 +796,24 @@ class TestDeepseekV4ConverterConvert:
 
 class TestDeepseekV4ConverterFactoryAndMapping:
     def test_factory_creates_converter(self):
-        model = SimpleNamespace(config=SimpleNamespace(n_routed_experts=8))
+        model = SimpleNamespace(
+            config=SimpleNamespace(n_routed_experts=8),
+            named_parameters=lambda: iter([("model.embed_tokens.weight", torch.nn.Parameter(torch.empty(1)))]),
+        )
         converter = create_deepseek_v4_checkpoint_tensor_converter(model)
         assert isinstance(converter, DeepseekV4CheckpointTensorConverter)
         assert converter.num_experts == 8
+        assert converter.target_model_prefix == "model."
+
+    def test_factory_creates_base_model_converter(self):
+        model = SimpleNamespace(
+            config=SimpleNamespace(n_routed_experts=8),
+            named_parameters=lambda: iter([("embed_tokens.weight", torch.nn.Parameter(torch.empty(1)))]),
+        )
+        converter = create_deepseek_v4_checkpoint_tensor_converter(model)
+        assert isinstance(converter, DeepseekV4CheckpointTensorConverter)
+        assert converter.num_experts == 8
+        assert converter.target_model_prefix == ""
 
     def test_fqn_mapping_accepts_raw_w_keys(self):
         mapping = {
@@ -802,6 +845,24 @@ class TestDeepseekV4ConverterFactoryAndMapping:
             "model.layers.0.self_attn.kv_proj.weight": 1,
             "model.layers.0.mlp.experts.gate_up_proj": 2,
             "model.layers.0.mlp.experts.down_proj": 3,
+        }
+
+    def test_fqn_mapping_converts_inference_checkpoint_keys_for_base_model(self):
+        mapping = {
+            "embed.weight": 0,
+            "layers.0.attn.wkv.weight": 1,
+            "layers.0.ffn.experts.0.w1.weight": 2,
+            "layers.0.ffn.experts.0.w2.weight": 3,
+            "layers.0.ffn.experts.0.w3.weight": 4,
+        }
+
+        converted = convert_deepseek_v4_fqn_to_index_mapping(mapping, target_model_prefix="")
+
+        assert converted == {
+            "embed_tokens.weight": 0,
+            "layers.0.self_attn.kv_proj.weight": 1,
+            "layers.0.mlp.experts.gate_up_proj": 2,
+            "layers.0.mlp.experts.down_proj": 3,
         }
 
     def test_fqn_mapping_preserves_mtp_keys(self):

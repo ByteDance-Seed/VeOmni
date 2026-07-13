@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from functools import partial
+
 from ...loader import MODELING_REGISTRY
 
 
@@ -26,9 +28,17 @@ def register_deepseek_v4_modeling(architecture: str):
     DeepseekV4ForCausalLM = gen.DeepseekV4ForCausalLM
     DeepseekV4Model = gen.DeepseekV4Model
 
-    for model_cls in (DeepseekV4ForCausalLM, DeepseekV4Model):
-        model_cls._create_checkpoint_tensor_converter = staticmethod(create_deepseek_v4_checkpoint_tensor_converter)
-        model_cls._convert_fqn_to_index_mapping = staticmethod(convert_deepseek_v4_fqn_to_index_mapping)
+    DeepseekV4ForCausalLM._create_checkpoint_tensor_converter = staticmethod(
+        create_deepseek_v4_checkpoint_tensor_converter
+    )
+    DeepseekV4ForCausalLM._convert_fqn_to_index_mapping = staticmethod(
+        partial(convert_deepseek_v4_fqn_to_index_mapping, target_model_prefix="model.")
+    )
+
+    DeepseekV4Model._create_checkpoint_tensor_converter = staticmethod(create_deepseek_v4_checkpoint_tensor_converter)
+    DeepseekV4Model._convert_fqn_to_index_mapping = staticmethod(
+        partial(convert_deepseek_v4_fqn_to_index_mapping, target_model_prefix="")
+    )
 
     if "ForCausalLM" in architecture:
         return DeepseekV4ForCausalLM
