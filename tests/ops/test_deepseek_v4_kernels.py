@@ -1,0 +1,201 @@
+# Copyright 2026 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import importlib
+import sys
+
+import pytest
+import torch
+import torch.nn.functional as F
+
+from veomni.ops.kernels.deepseek_v4 import linear_bf16_fp32
+
+
+def test_kernel_package_does_not_import_tilelang_eagerly():
+    sys.modules.pop("veomni.ops.kernels.deepseek_v4", None)
+    before = "tilelang" in sys.modules
+
+    importlib.import_module("veomni.ops.kernels.deepseek_v4")
+
+    assert ("tilelang" in sys.modules) is before
+
+
+def test_linear_bf16_fp32_matches_bf16_rounded_fp32_reference():
+    x = torch.randn(2, 3, 8, dtype=torch.float32, requires_grad=True)
+    weight = torch.randn(5, 8, dtype=torch.float32, requires_grad=True)
+
+    actual = linear_bf16_fp32(x, weight)
+    expected = x.to(torch.bfloat16).float() @ weight.to(torch.bfloat16).float().t()
+
+    torch.testing.assert_close(actual, expected)
+    assert actual.dtype == torch.float32
+
+
+def test_linear_bf16_fp32_backward_matches_reference():
+    x = torch.randn(7, 8, dtype=torch.float32, requires_grad=True)
+    weight = torch.randn(5, 8, dtype=torch.float32, requires_grad=True)
+    grad = torch.randn(7, 5)
+
+    linear_bf16_fp32(x, weight).backward(grad)
+    expected_x_grad = grad @ weight.detach().to(torch.bfloat16).float()
+    expected_weight_grad = grad.t() @ x.detach().to(torch.bfloat16).float()
+
+    torch.testing.assert_close(x.grad, expected_x_grad)
+    torch.testing.assert_close(weight.grad, expected_weight_grad)
+
+
+def _require_tilelang_cuda():
+    pytest.importorskip("tilelang")
+    if not torch.cuda.is_available():
+        pytest.skip("DeepSeek V4 TileLang kernels require CUDA")
+
+
+def _indexer_reference(q, k, weights, topk_indices):
+    logits = torch.einsum("sbhd,tbd->bsht", q.float(), k.float())
+    logits = (logits.relu() * weights.permute(1, 0, 2).float().unsqueeze(-1)).sum(dim=2)
+    valid = (topk_indices >= 0) & (topk_indices < logits.shape[-1])
+    scores = logits.gather(-1, topk_indices.clamp(0, logits.shape[-1] - 1).long())
+    return torch.where(valid, scores, float("-inf"))
+
+
+def _cosine_similarity(actual, expected):
+    return F.cosine_similarity(actual.float().flatten(), expected.float().flatten(), dim=0)
+
+
+def test_tilelang_indexer_non_power_of_two_topk_forward_backward():
+    _require_tilelang_cuda()
+    from veomni.ops.kernels.deepseek_v4 import v4_lighting_indexer
+
+    torch.manual_seed(0)
+    seqlen, batch, heads, dim, compress_ratio, topk = 130, 2, 8, 128, 4, 65
+    kv_len = seqlen // compress_ratio
+    q = torch.randn(seqlen, batch, heads, dim, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    k = torch.randn(kv_len, batch, dim, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    weights = (torch.randn(seqlen, batch, heads, device="cuda") * 0.01).requires_grad_()
+
+    indices = torch.full((batch, seqlen, topk), -1, device="cuda", dtype=torch.int32)
+    for position in range(seqlen):
+        valid_count = min((position + 1) // compress_ratio, kv_len, topk)
+        if valid_count:
+            indices[:, position, :valid_count] = torch.arange(valid_count, device="cuda", dtype=torch.int32)
+    indices[..., -3] = -1
+    indices[..., -2] = -2
+    indices[..., -1] = kv_len
+
+    actual, actual_indices = v4_lighting_indexer(q, k, weights, compress_ratio, topk, indices)
+    expected = _indexer_reference(q, k, weights, indices)
+    valid = (indices >= 0) & (indices < kv_len)
+    torch.testing.assert_close(actual[valid], expected[valid], rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(actual_indices, indices)
+
+    grad = torch.randn_like(actual).masked_fill(~valid, 0)
+    expected_grads = torch.autograd.grad((expected.masked_fill(~valid, 0) * grad).sum(), (q, k, weights))
+    actual.backward(grad)
+    for actual_grad, expected_grad in zip((q.grad, k.grad, weights.grad), expected_grads, strict=True):
+        assert actual_grad is not None and torch.isfinite(actual_grad).all()
+        assert _cosine_similarity(actual_grad, expected_grad) > 0.95
+
+
+def test_tilelang_indexer_rejects_unsupported_head_count():
+    _require_tilelang_cuda()
+    from veomni.ops.kernels.deepseek_v4 import v4_lighting_indexer
+
+    q = torch.empty(8, 1, 7, 128, device="cuda", dtype=torch.bfloat16)
+    k = torch.empty(2, 1, 128, device="cuda", dtype=torch.bfloat16)
+    weights = torch.empty(8, 1, 7, device="cuda")
+    with pytest.raises(ValueError, match="divisible by 8"):
+        v4_lighting_indexer(q, k, weights, compress_ratio=4, topk=2)
+
+
+def _sparse_attention_reference(q, kv, sinks, indices, scale):
+    valid = (indices >= 0) & (indices < kv.shape[1])
+    safe = indices.clamp(0, kv.shape[1] - 1).long()
+    gathered = kv[:, None, :, :].expand(-1, q.shape[1], -1, -1)
+    gathered = gathered.gather(2, safe.unsqueeze(-1).expand(-1, -1, -1, kv.shape[-1]))
+    scores = torch.einsum("bmhd,bmkd->bmhk", q.float(), gathered.float()) * scale
+    scores = scores.masked_fill(~valid.unsqueeze(2), float("-inf"))
+    max_score = scores.max(dim=-1, keepdim=True).values.clamp_min(-1e30)
+    exp_scores = (scores - max_score).exp()
+    numerator = torch.einsum("bmhk,bmkd->bmhd", exp_scores, gathered.float())
+    denominator = exp_scores.sum(-1) + (sinks.view(1, 1, -1) - max_score.squeeze(-1)).exp()
+    return numerator / denominator.unsqueeze(-1)
+
+
+def test_tilelang_sparse_attention_forward_backward_with_invalid_indices():
+    _require_tilelang_cuda()
+    from veomni.ops.kernels.deepseek_v4 import sparse_attn_tilelang
+
+    torch.manual_seed(1)
+    batch, seqlen, heads, dim, kv_len, topk = 1, 32, 8, 512, 48, 65
+    q = torch.randn(batch, seqlen, heads, dim, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    kv = torch.randn(batch, kv_len, dim, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    sinks = torch.randn(heads, device="cuda", requires_grad=True)
+    indices = torch.randint(kv_len, (batch, seqlen, topk), device="cuda", dtype=torch.int32)
+    indices[..., -9:-6] = -1
+    indices[..., -6:-3] = -2
+    indices[..., -3:] = kv_len
+    scale = dim**-0.5
+
+    actual = sparse_attn_tilelang(q, kv, sinks, indices, scale)
+    expected = _sparse_attention_reference(q, kv, sinks, indices, scale)
+    torch.testing.assert_close(actual.float(), expected, rtol=2e-2, atol=2e-2)
+
+    grad = torch.randn(batch, heads, seqlen, dim, device="cuda", dtype=actual.dtype).transpose(1, 2)
+    assert not grad.is_contiguous()
+    expected_grads = torch.autograd.grad((expected * grad.float()).sum(), (q, kv, sinks))
+    actual.backward(grad)
+    for actual_grad, expected_grad in zip((q.grad, kv.grad, sinks.grad), expected_grads, strict=True):
+        assert actual_grad is not None and torch.isfinite(actual_grad).all()
+        assert _cosine_similarity(actual_grad, expected_grad) > 0.95
+
+
+def test_tilelang_act_quant_shapes_scales_and_inplace():
+    _require_tilelang_cuda()
+    from veomni.ops.kernels.deepseek_v4 import act_quant
+
+    torch.manual_seed(2)
+    x = torch.randn(3, 256, device="cuda", dtype=torch.bfloat16)
+    quantized, scales = act_quant(x, block_size=128)
+
+    assert quantized.shape == x.shape
+    assert quantized.dtype == torch.float8_e4m3fn
+    assert scales.shape == (3, 2)
+    expected_scales = x.float().view(3, 2, 128).abs().amax(-1).clamp_min(1e-4) / 448.0
+    torch.testing.assert_close(scales, expected_scales, rtol=1e-5, atol=1e-7)
+    expanded_scales = expected_scales.repeat_interleave(128, dim=-1)
+    expected_quantized = (x.float() / expanded_scales).clamp(-448, 448).to(torch.float8_e4m3fn)
+    torch.testing.assert_close(quantized.float(), expected_quantized.float(), rtol=0, atol=0)
+    expected_dequantized = (expected_quantized.float() * expanded_scales).to(torch.bfloat16)
+    actual_dequantized = (quantized.float() * scales.repeat_interleave(128, dim=-1)).to(torch.bfloat16)
+    torch.testing.assert_close(actual_dequantized, expected_dequantized, rtol=0, atol=0)
+
+    inplace = x.clone()
+    result = act_quant(inplace, block_size=128, inplace=True)
+    assert result.data_ptr() == inplace.data_ptr()
+    torch.testing.assert_close(result, expected_dequantized, rtol=0, atol=0)
+
+    x_mx = x.clone()
+    x_mx[0].zero_()
+    quantized_mx, scales_mx = act_quant(
+        x_mx,
+        block_size=128,
+        scale_fmt="ue8m0",
+        scale_dtype=torch.float8_e8m0fnu,
+    )
+    amax_mx = x_mx.float().view(3, 2, 128).abs().amax(-1).clamp_min(1e-4)
+    expected_scales_mx = torch.pow(2.0, torch.ceil(torch.log2(amax_mx / 448.0)))
+    torch.testing.assert_close(scales_mx.float(), expected_scales_mx, rtol=0, atol=0)
+    expanded_scales_mx = expected_scales_mx.repeat_interleave(128, dim=-1)
+    expected_quantized_mx = (x_mx.float() / expanded_scales_mx).clamp(-448, 448).to(torch.float8_e4m3fn)
+    torch.testing.assert_close(quantized_mx.float(), expected_quantized_mx.float(), rtol=0, atol=0)

@@ -17,6 +17,7 @@ veomni/ops/
 ├── kernels/                Kernel implementations, one subpackage per op
 │   ├── attention/          Flash attention v2/3/4 + SP-aware wrappers
 │   ├── cross_entropy/      eager / liger / npu-chunk loss (+ ForCausalLMLoss)
+│   ├── deepseek_v4/        TileLang sparse attention/indexer + precision helpers
 │   ├── load_balancing_loss/  eager + triton fused kernel
 │   ├── rms_norm/           Liger / NPU / triton batch-invariant
 │   ├── rotary/             Liger / NPU / deterministic / Wan Triton
@@ -102,6 +103,17 @@ model:
 ```
 
 See `docs/design/kernel_selection.md` for the user-facing lifecycle diagram.
+
+### DeepSeek V4 library kernels
+
+`kernels/deepseek_v4/` contains model-specific library ops adapted from the
+Apache-2.0 `radixark/miles` implementation: TileLang sparse-attention and
+Lightning Indexer forward/backward kernels, block-wise FP8 activation
+quantization, and a BF16-input/FP32-accumulation linear autograd function.
+The package does not import TileLang eagerly, so CPU and NPU installations can
+still import VeOmni. Callers that use a TileLang entry point must have the GPU
+extra installed; `tilelang==0.1.8` is supplied by the existing FlashQLA
+dependency chain.
 
 ---
 
