@@ -250,14 +250,6 @@ class ChunkMBSConfig:
         default=1,
         metadata={"help": "Number of packed samples per layer chunk."},
     )
-    sequence_dim: int = field(
-        default=1,
-        metadata={"help": "Sequence dimension of hidden_states for wrapped modules."},
-    )
-    strict: bool = field(
-        default=True,
-        metadata={"help": "Raise when ChunkMBS cannot be applied exactly."},
-    )
 
 
 @dataclass

@@ -315,15 +315,15 @@ NPU validation runs at two times:
 count is inferred from `cu_seq_lens_q`, so it is independent of `train.micro_batch_size`. Chunks are cut
 only on packed sample boundaries. The current implementation requires packed-sequence FlashAttention kwargs,
 exactly one `*DecoderLayer` class and one matching decoder stack, decoder layers derived from Transformers'
-`GradientCheckpointingLayer`, sequence parallelism disabled, and ExtraParallel/MoE disabled. Models with ambiguous
-decoder classes or stacks fail validation instead of applying ChunkMBS to multiple stacks.
+`GradientCheckpointingLayer`, batch-first `[batch, sequence, hidden]` decoder states, sequence parallelism disabled,
+and ExtraParallel/MoE disabled. Chunk boundaries must also align with linear-attention cumulative sequence boundaries
+when that metadata is present. Models with ambiguous decoder classes or stacks fail validation instead of applying
+ChunkMBS to multiple stacks.
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | enable | `bool` | `False` | Enable ChunkMBS for packed-sequence decoder layers listed in `model._no_split_modules`. |
 | chunk_mbs | `int` | `1` | Number of packed samples per layer chunk. |
-| sequence_dim | `int` | `1` | Sequence dimension of `hidden_states` for wrapped modules. |
-| strict | `bool` | `True` | Raise when ChunkMBS cannot be applied exactly. |
 
 ### AcceleratorConfig
 

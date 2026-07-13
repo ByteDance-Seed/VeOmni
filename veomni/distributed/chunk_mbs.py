@@ -62,19 +62,14 @@ def build_chunk_mbs_ranges(batch: dict[str, Any], config: Any) -> Optional[list[
         raise ValueError(f"chunk_mbs_config.chunk_mbs must be >= 1, got {chunk_mbs}.")
 
     cu_seq_lens_q = batch.get("cu_seq_lens_q")
-    strict = getattr(config, "strict", True)
     if cu_seq_lens_q is None:
-        if strict:
-            raise ValueError("ChunkMBS requires packed-sequence FlashAttention kwargs: missing cu_seq_lens_q.")
-        return None
+        raise ValueError("ChunkMBS requires packed-sequence FlashAttention kwargs: missing cu_seq_lens_q.")
 
     if cu_seq_lens_q.ndim != 1:
         raise ValueError(f"cu_seq_lens_q must be a 1D tensor, got shape {tuple(cu_seq_lens_q.shape)}.")
 
     if cu_seq_lens_q.device.type != "cpu":
-        if strict:
-            raise RuntimeError("ChunkMBS ranges must be built before cu_seq_lens_q is moved off CPU.")
-        return None
+        raise RuntimeError("ChunkMBS ranges must be built before cu_seq_lens_q is moved off CPU.")
 
     cu_values = [int(v) for v in cu_seq_lens_q.tolist()]
     if not cu_values or cu_values[0] != 0:
@@ -84,6 +79,7 @@ def build_chunk_mbs_ranges(batch: dict[str, Any], config: Any) -> Optional[list[
         raise ValueError("ChunkMBS requires strictly increasing cu_seq_lens_q.")
 
     linear_attn_values = _linear_attn_cu_values(batch.get("linear_attn_cu_seq_lens_q"), cu_values[-1])
+    linear_attn_boundaries = set(linear_attn_values) if linear_attn_values is not None else None
     num_segments = len(segment_lengths)
     if num_segments <= chunk_mbs:
         return None
@@ -97,6 +93,8 @@ def build_chunk_mbs_ranges(batch: dict[str, Any], config: Any) -> Optional[list[
         linear_attn_segment_start = None
         linear_attn_segment_end = None
         if linear_attn_values is not None:
+            if token_start not in linear_attn_boundaries or token_end not in linear_attn_boundaries:
+                raise ValueError("ChunkMBS chunk boundaries must align with linear_attn_cu_seq_lens_q boundaries.")
             linear_attn_segment_start = bisect_right(linear_attn_values, token_start)
             linear_attn_segment_end = bisect_left(linear_attn_values, token_end)
         ranges.append(
@@ -140,49 +138,32 @@ def apply_chunk_mbs(model: nn.Module, config: Any) -> nn.Module:
     if parallel_state.any_extra_parallel_enabled:
         raise RuntimeError("ChunkMBS currently does not support ExtraParallel/MoE.")
 
-    strict = getattr(config, "strict", True)
     target_classes = _decoder_layer_class_names(model)
     if len(target_classes) != 1:
-        message = (
+        raise ValueError(
             "ChunkMBS requires exactly one decoder layer class in model._no_split_modules, "
             f"got {sorted(target_classes)!r}."
         )
-        if strict:
-            raise ValueError(message)
-        logger.warning_rank0(message)
-        return model
 
     target_modules = _find_target_modules(model, target_classes)
     if not target_modules:
-        message = "ChunkMBS did not match any decoder layer listed in model._no_split_modules."
-        if strict:
-            raise ValueError(message)
-        logger.warning_rank0(message)
-        return model
+        raise ValueError("ChunkMBS did not match any decoder layer listed in model._no_split_modules.")
 
     target_stacks = {fqn.rpartition(".")[0] for fqn, _ in target_modules}
     if len(target_stacks) != 1:
-        message = f"ChunkMBS requires exactly one decoder stack, got {sorted(target_stacks)!r}."
-        if strict:
-            raise ValueError(message)
-        logger.warning_rank0(message)
-        return model
+        raise ValueError(f"ChunkMBS requires exactly one decoder stack, got {sorted(target_stacks)!r}.")
 
     incompatible_modules = [
         fqn for fqn, module in target_modules if not isinstance(module, GradientCheckpointingLayer)
     ]
     if incompatible_modules:
-        message = (
+        raise TypeError(
             "ChunkMBS requires decoder layers to inherit transformers.modeling_layers.GradientCheckpointingLayer, "
             f"got incompatible modules {incompatible_modules!r}."
         )
-        if strict:
-            raise TypeError(message)
-        logger.warning_rank0(message)
-        return model
 
     for fqn, module in target_modules:
-        _wrap_module_forward(module, config)
+        _wrap_module_forward(module)
         logger.info_rank0(f"Enable ChunkMBS for module: {fqn}")
     _wrap_gradient_checkpointing_methods(model, [module for _, module in target_modules])
     return model
@@ -205,7 +186,7 @@ def _find_target_modules(model: nn.Module, target_classes: set[str]) -> list[tup
     return target_modules
 
 
-def _wrap_module_forward(module: nn.Module, config: Any) -> None:
+def _wrap_module_forward(module: nn.Module) -> None:
     if getattr(module, "_chunk_mbs_wrapped", False):
         return
 
@@ -217,7 +198,7 @@ def _wrap_module_forward(module: nn.Module, config: Any) -> None:
         ranges = _chunk_mbs_ranges.get()
         if not ranges:
             return orig_forward(*args, **kwargs)
-        return _chunked_forward(orig_forward, ranges, config, args, kwargs)
+        return _chunked_forward(orig_forward, ranges, args, kwargs)
 
     module.forward = wrapped_forward
     module._chunk_mbs_wrapped = True
@@ -271,7 +252,6 @@ def _wrap_gradient_checkpointing_methods(model: nn.Module, target_modules: list[
 def _chunked_forward(
     orig_forward: Any,
     ranges: list[PackedSequenceRange],
-    config: Any,
     args: tuple[Any, ...],
     kwargs: dict[str, Any],
 ) -> torch.Tensor:
@@ -280,12 +260,11 @@ def _chunked_forward(
     ):
         raise RuntimeError("ChunkMBS is only supported for training without KV cache.")
 
-    sequence_dim = getattr(config, "sequence_dim", 1)
     hidden_states = _get_hidden_states(args, kwargs)
     if not isinstance(hidden_states, torch.Tensor):
         raise TypeError("ChunkMBS expects hidden_states to be a torch.Tensor.")
 
-    sequence_dim = _canonical_dim(hidden_states, sequence_dim)
+    sequence_dim = _canonical_dim(hidden_states, 1)
     full_seq_len = hidden_states.shape[sequence_dim]
     if ranges[-1].token_end != full_seq_len:
         raise ValueError(
@@ -297,7 +276,7 @@ def _chunked_forward(
         chunk_args, chunk_kwargs = _replace_hidden_states(
             args, kwargs, _slice_tensor(hidden_states, seq_range, sequence_dim)
         )
-        chunk_kwargs = _slice_kwargs(chunk_kwargs, seq_range, full_seq_len, sequence_dim)
+        chunk_kwargs = _slice_kwargs(chunk_kwargs, seq_range, full_seq_len)
         outputs.append(orig_forward(*chunk_args, **chunk_kwargs))
 
     return _concat_outputs(outputs, sequence_dim)
@@ -323,13 +302,21 @@ def _slice_kwargs(
     kwargs: dict[str, Any],
     seq_range: PackedSequenceRange,
     full_seq_len: int,
-    sequence_dim: int,
 ) -> dict[str, Any]:
     chunk_kwargs = dict(kwargs)
 
-    for key in ("position_ids", "position_embeddings", "cache_position"):
-        if key in chunk_kwargs:
-            chunk_kwargs[key] = _slice_by_matching_length(chunk_kwargs[key], seq_range, full_seq_len, sequence_dim)
+    if "position_ids" in chunk_kwargs:
+        chunk_kwargs["position_ids"] = _slice_by_sequence_dim(
+            chunk_kwargs["position_ids"], seq_range, full_seq_len, -1, "position_ids"
+        )
+    if "position_embeddings" in chunk_kwargs:
+        chunk_kwargs["position_embeddings"] = _slice_by_sequence_dim(
+            chunk_kwargs["position_embeddings"], seq_range, full_seq_len, -2, "position_embeddings"
+        )
+    if "cache_position" in chunk_kwargs:
+        chunk_kwargs["cache_position"] = _slice_by_sequence_dim(
+            chunk_kwargs["cache_position"], seq_range, full_seq_len, -1, "cache_position"
+        )
 
     if "attention_mask" in chunk_kwargs:
         chunk_kwargs["attention_mask"] = _slice_attention_mask(chunk_kwargs["attention_mask"], seq_range, full_seq_len)
@@ -355,28 +342,47 @@ def _slice_tensor(tensor: torch.Tensor, seq_range: PackedSequenceRange, dim: int
     return tensor[tuple(slices)]
 
 
-def _slice_by_matching_length(data: Any, seq_range: PackedSequenceRange, full_seq_len: int, preferred_dim: int) -> Any:
+def _slice_by_sequence_dim(
+    data: Any,
+    seq_range: PackedSequenceRange,
+    full_seq_len: int,
+    dim: int,
+    name: str,
+) -> Any:
     if isinstance(data, torch.Tensor):
-        dim = _matching_dim(data, full_seq_len, preferred_dim)
-        if dim is None:
-            return data
+        dim = _canonical_dim(data, dim)
+        if data.shape[dim] != full_seq_len:
+            raise ValueError(
+                f"{name} sequence dimension must have length {full_seq_len}, got shape {tuple(data.shape)}."
+            )
         return _slice_tensor(data, seq_range, dim)
     if isinstance(data, tuple):
-        return tuple(_slice_by_matching_length(v, seq_range, full_seq_len, preferred_dim) for v in data)
+        return tuple(_slice_by_sequence_dim(v, seq_range, full_seq_len, dim, name) for v in data)
     if isinstance(data, list):
-        return [_slice_by_matching_length(v, seq_range, full_seq_len, preferred_dim) for v in data]
+        return [_slice_by_sequence_dim(v, seq_range, full_seq_len, dim, name) for v in data]
     if isinstance(data, dict):
-        return {k: _slice_by_matching_length(v, seq_range, full_seq_len, preferred_dim) for k, v in data.items()}
+        return {k: _slice_by_sequence_dim(v, seq_range, full_seq_len, dim, name) for k, v in data.items()}
     return data
 
 
 def _slice_attention_mask(data: Any, seq_range: PackedSequenceRange, full_seq_len: int) -> Any:
     if isinstance(data, torch.Tensor):
+        if data.ndim == 0:
+            return data
         sliced = data
-        for dim, size in reversed(list(enumerate(data.shape))):
-            if size == full_seq_len:
-                sliced = _slice_tensor(sliced, seq_range, dim)
+        if data.ndim == 2 and data.shape == (full_seq_len, full_seq_len):
+            candidate_dims = (-2, -1)
+        else:
+            candidate_dims = (-1,) if data.ndim <= 2 else (-2, -1)
+        for dim in candidate_dims:
+            canonical_dim = _canonical_dim(data, dim)
+            if data.shape[canonical_dim] == full_seq_len:
+                sliced = _slice_tensor(sliced, seq_range, canonical_dim)
         return sliced
+    if isinstance(data, tuple):
+        return tuple(_slice_attention_mask(v, seq_range, full_seq_len) for v in data)
+    if isinstance(data, list):
+        return [_slice_attention_mask(v, seq_range, full_seq_len) for v in data]
     if isinstance(data, dict):
         return {k: _slice_attention_mask(v, seq_range, full_seq_len) for k, v in data.items()}
     return data
@@ -401,18 +407,6 @@ def _slice_linear_attn_cu_seq_lens(cu_seq_lens: torch.Tensor, seq_range: PackedS
         seq_range.linear_attn_segment_end - seq_range.linear_attn_segment_start,
     )
     return torch.cat((start, inner, end), dim=0) - start
-
-
-def _matching_dim(tensor: torch.Tensor, full_seq_len: int, preferred_dim: int) -> Optional[int]:
-    if tensor.ndim == 0:
-        return None
-    preferred_dim = _canonical_dim(tensor, preferred_dim)
-    if tensor.shape[preferred_dim] == full_seq_len:
-        return preferred_dim
-    for dim, size in enumerate(tensor.shape):
-        if size == full_seq_len:
-            return dim
-    return None
 
 
 def _canonical_dim(tensor: torch.Tensor, dim: int) -> int:

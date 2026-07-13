@@ -8,6 +8,7 @@ import torch.nn as nn
 from torch.utils.checkpoint import checkpoint
 from transformers.modeling_layers import GradientCheckpointingLayer
 
+from veomni.arguments import ChunkMBSConfig, MixedPrecisionConfig
 from veomni.distributed.chunk_mbs import (
     PackedSequenceRange,
     apply_chunk_mbs,
@@ -16,13 +17,8 @@ from veomni.distributed.chunk_mbs import (
 )
 
 
-def _config(chunk_mbs=2, strict=True):
-    return types.SimpleNamespace(
-        enable=True,
-        chunk_mbs=chunk_mbs,
-        sequence_dim=1,
-        strict=strict,
-    )
+def _config(chunk_mbs=2):
+    return ChunkMBSConfig(enable=True, chunk_mbs=chunk_mbs)
 
 
 def test_build_chunk_mbs_ranges_from_dynamic_packed_batch():
@@ -116,6 +112,16 @@ def test_build_chunk_mbs_ranges_rejects_invalid_linear_attn_cu_seq_lens(linear_a
         build_chunk_mbs_ranges(batch, _config(chunk_mbs=2))
 
 
+def test_build_chunk_mbs_ranges_rejects_misaligned_linear_attn_boundary():
+    batch = {
+        "cu_seq_lens_q": torch.tensor([0, 3, 5, 9, 10], dtype=torch.int32),
+        "linear_attn_cu_seq_lens_q": torch.tensor([0, 3, 5, 10], dtype=torch.int32),
+    }
+
+    with pytest.raises(ValueError, match="must align with linear_attn_cu_seq_lens_q"):
+        build_chunk_mbs_ranges(batch, _config(chunk_mbs=3))
+
+
 def test_build_chunk_mbs_ranges_rejects_non_packed_batch_dim():
     batch = {"hidden_states": torch.ones(4, 8, 2)}
 
@@ -199,7 +205,9 @@ class _ToyRoot(nn.Module):
         self.model.language_model = _ToyLanguageModel()
         self.model.visual = _ToyVisionBlock()
 
-    def gradient_checkpointing_enable(self, checkpoint_func):
+    def gradient_checkpointing_enable(self, checkpoint_func=None, gradient_checkpointing_kwargs=None):
+        if checkpoint_func is None:
+            checkpoint_func = partial(checkpoint, **(gradient_checkpointing_kwargs or {}))
         for layer in self.model.language_model.layers:
             layer.gradient_checkpointing = True
             layer._gradient_checkpointing_func = checkpoint_func
@@ -386,12 +394,45 @@ def test_apply_chunk_mbs_preserves_gradient_checkpointing_without_ranges(monkeyp
 def test_slice_kwargs_slices_multimodal_position_ids():
     import veomni.distributed.chunk_mbs as chunk_mbs
 
-    position_ids = torch.arange(40).view(4, 1, 10)
-    seq_range = PackedSequenceRange(segment_start=1, segment_end=3, token_start=3, token_end=9, max_length=4)
+    position_ids = torch.arange(16).view(4, 1, 4)
+    seq_range = PackedSequenceRange(segment_start=0, segment_end=1, token_start=0, token_end=2, max_length=2)
 
-    chunk_kwargs = chunk_mbs._slice_kwargs({"position_ids": position_ids}, seq_range, full_seq_len=10, sequence_dim=1)
+    chunk_kwargs = chunk_mbs._slice_kwargs({"position_ids": position_ids}, seq_range, full_seq_len=4)
 
-    assert torch.equal(chunk_kwargs["position_ids"], position_ids[:, :, 3:9])
+    assert torch.equal(chunk_kwargs["position_ids"], position_ids[:, :, :2])
+
+
+def test_slice_kwargs_slices_one_dimensional_cache_position():
+    import veomni.distributed.chunk_mbs as chunk_mbs
+
+    cache_position = torch.arange(4)
+    seq_range = PackedSequenceRange(segment_start=1, segment_end=2, token_start=2, token_end=4, max_length=2)
+
+    chunk_kwargs = chunk_mbs._slice_kwargs({"cache_position": cache_position}, seq_range, full_seq_len=4)
+
+    assert torch.equal(chunk_kwargs["cache_position"], cache_position[2:4])
+
+
+def test_slice_kwargs_does_not_slice_attention_head_dimension():
+    import veomni.distributed.chunk_mbs as chunk_mbs
+
+    attention_mask = torch.arange(64).view(1, 4, 4, 4)
+    seq_range = PackedSequenceRange(segment_start=0, segment_end=1, token_start=1, token_end=3, max_length=2)
+
+    chunk_kwargs = chunk_mbs._slice_kwargs({"attention_mask": attention_mask}, seq_range, full_seq_len=4)
+
+    assert torch.equal(chunk_kwargs["attention_mask"], attention_mask[:, :, 1:3, 1:3])
+
+
+def test_slice_kwargs_slices_two_dimensional_square_attention_mask():
+    import veomni.distributed.chunk_mbs as chunk_mbs
+
+    attention_mask = torch.arange(16).view(4, 4)
+    seq_range = PackedSequenceRange(segment_start=0, segment_end=1, token_start=1, token_end=3, max_length=2)
+
+    chunk_kwargs = chunk_mbs._slice_kwargs({"attention_mask": attention_mask}, seq_range, full_seq_len=4)
+
+    assert torch.equal(chunk_kwargs["attention_mask"], attention_mask[1:3, 1:3])
 
 
 @pytest.mark.parametrize("use_checkpoint", [False, True])
@@ -548,7 +589,6 @@ def test_apply_chunk_mbs_requires_decoder_layer_in_no_split_modules(monkeypatch)
 
     with pytest.raises(ValueError, match="model._no_split_modules"):
         apply_chunk_mbs(model, _config(chunk_mbs=2))
-    assert apply_chunk_mbs(model, _config(chunk_mbs=2, strict=False)) is model
 
 
 def test_apply_chunk_mbs_rejects_ambiguous_decoder_layer_classes(monkeypatch):
@@ -567,7 +607,6 @@ def test_apply_chunk_mbs_rejects_ambiguous_decoder_layer_classes(monkeypatch):
 
     with pytest.raises(ValueError, match="exactly one decoder layer class"):
         apply_chunk_mbs(model, _config(chunk_mbs=2))
-    assert apply_chunk_mbs(model, _config(chunk_mbs=2, strict=False)) is model
     assert not getattr(model.decoder, "_chunk_mbs_wrapped", False)
     assert not getattr(model.aux_decoder, "_chunk_mbs_wrapped", False)
 
@@ -588,7 +627,6 @@ def test_apply_chunk_mbs_rejects_ambiguous_decoder_stacks(monkeypatch):
 
     with pytest.raises(ValueError, match="exactly one decoder stack"):
         apply_chunk_mbs(model, _config(chunk_mbs=2))
-    assert apply_chunk_mbs(model, _config(chunk_mbs=2, strict=False)) is model
     assert not getattr(model.decoder[0], "_chunk_mbs_wrapped", False)
     assert not getattr(model.aux_decoder[0], "_chunk_mbs_wrapped", False)
 
@@ -608,5 +646,57 @@ def test_apply_chunk_mbs_rejects_incompatible_decoder_layer(monkeypatch):
 
     with pytest.raises(TypeError, match="GradientCheckpointingLayer"):
         apply_chunk_mbs(model, _config(chunk_mbs=2))
-    assert apply_chunk_mbs(model, _config(chunk_mbs=2, strict=False)) is model
     assert not getattr(model.decoder, "_chunk_mbs_wrapped", False)
+
+
+def test_build_parallelize_model_applies_chunk_mbs_before_fsdp2(monkeypatch):
+    import veomni.distributed.chunk_mbs as chunk_mbs
+    import veomni.distributed.torch_parallelize as torch_parallelize
+
+    monkeypatch.setattr(
+        chunk_mbs,
+        "get_parallel_state",
+        lambda: types.SimpleNamespace(sp_enabled=False, any_extra_parallel_enabled=False),
+    )
+    monkeypatch.setattr(
+        torch_parallelize,
+        "get_parallel_state",
+        lambda: types.SimpleNamespace(fsdp_enabled=True, tp_enabled=False, dp_mode="fsdp2"),
+    )
+
+    model = _ToyRoot()
+
+    def fake_parallelize_model_fsdp2(model, **kwargs):
+        layer = model.model.language_model.layers[0]
+        assert getattr(layer, "_chunk_mbs_wrapped", False)
+        assert layer.gradient_checkpointing
+        assert getattr(layer._gradient_checkpointing_func, "_chunk_mbs_wrapped", False)
+        return model
+
+    monkeypatch.setattr(torch_parallelize, "parallelize_model_fsdp2", fake_parallelize_model_fsdp2)
+
+    result = torch_parallelize.build_parallelize_model(
+        model,
+        mixed_precision=MixedPrecisionConfig(enable=False),
+        chunk_mbs_config=_config(chunk_mbs=2),
+    )
+
+    assert result is model
+
+    cu_seq_lens = torch.tensor([0, 1, 2, 3, 4], dtype=torch.int32)
+    ranges = build_chunk_mbs_ranges({"cu_seq_lens_q": cu_seq_lens}, _config(chunk_mbs=2))
+    hidden_states = torch.zeros(1, 4, 2, requires_grad=True)
+    with chunk_mbs_context(ranges):
+        output = result.model.language_model.layers[0](
+            hidden_states,
+            position_embeddings=(torch.ones_like(hidden_states), torch.ones_like(hidden_states)),
+            attention_mask=torch.ones(1, 1, 4, 4),
+            position_ids=torch.arange(4).view(1, 4),
+            cu_seq_lens_q=cu_seq_lens,
+            cu_seq_lens_k=cu_seq_lens,
+            max_length_q=1,
+            max_length_k=1,
+        )
+        output.sum().backward()
+
+    assert torch.equal(hidden_states.grad, torch.ones_like(hidden_states))
