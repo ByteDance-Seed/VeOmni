@@ -2,9 +2,8 @@
 
 Covers the model-agnostic data-layer work only:
 
-* :func:`iter_desired_images` — an image-only selector that reuses
-  :func:`iter_desired_items` with ``types=["image"]`` and adds an ``img_tag``
-  filter over ``meta[_IMG_TAG_KEY]``.
+* :func:`iter_desired_items` — generic item selection with optional direct
+  matching over configured ``meta`` values.
 * The optional ``(type, value, meta)`` 3-tuple meta channel in
   ``_build_conversation_list`` (2-tuple stays backward compatible) — pure
   sequential image/video pairing; the preprocessor owns the ref-list layout.
@@ -28,7 +27,7 @@ from veomni.data.seed_omni.seedomni_transform import _build_conversation_list
 from veomni.models.seed_omni.utils.conversation import (
     _IMG_TAG_KEY,
     ConversationItem,
-    iter_desired_images,
+    iter_desired_items,
 )
 
 
@@ -86,36 +85,45 @@ def _build(source: str, conversations, example: dict):
     return constructed, image_refs, video_refs, items
 
 
-# ── iter_desired_images selector ───────────────────────────────────────────────
+# ── iter_desired_items meta selector ───────────────────────────────────────────
 
 
-def test_iter_desired_images_no_filter_returns_all_images():
+def test_iter_desired_items_no_meta_filter_returns_all_images():
     batch = [[_img("und"), _img("gen"), _img("edit")]]
-    items = list(iter_desired_images(batch))
+    items = list(iter_desired_items(batch, types=["image"]))
     assert [it.meta.get(_IMG_TAG_KEY) for it in items] == ["und", "gen", "edit"]
 
 
-def test_iter_desired_images_filters_by_each_tag():
+def test_iter_desired_items_filters_by_each_meta_value():
     batch = [[_img("und"), _img("gen"), _img("edit"), _img("und"), _img("gen")]]
-    assert [it.meta.get(_IMG_TAG_KEY) for it in iter_desired_images(batch, img_tag=["und"])] == ["und", "und"]
-    assert [it.meta.get(_IMG_TAG_KEY) for it in iter_desired_images(batch, img_tag=["gen"])] == ["gen", "gen"]
-    assert [it.meta.get(_IMG_TAG_KEY) for it in iter_desired_images(batch, img_tag=["edit"])] == ["edit"]
+    assert [
+        it.meta.get(_IMG_TAG_KEY) for it in iter_desired_items(batch, types=["image"], meta={_IMG_TAG_KEY: ["und"]})
+    ] == ["und", "und"]
+    assert [
+        it.meta.get(_IMG_TAG_KEY) for it in iter_desired_items(batch, types=["image"], meta={_IMG_TAG_KEY: ["gen"]})
+    ] == ["gen", "gen"]
+    assert [
+        it.meta.get(_IMG_TAG_KEY) for it in iter_desired_items(batch, types=["image"], meta={_IMG_TAG_KEY: ["edit"]})
+    ] == ["edit"]
 
 
-def test_iter_desired_images_tag_set_matches_multiple():
+def test_iter_desired_items_meta_value_set_matches_multiple():
     batch = [[_img("und"), _img("gen"), _img("edit")]]
-    got = [it.meta.get(_IMG_TAG_KEY) for it in iter_desired_images(batch, img_tag=["und", "edit"])]
+    got = [
+        it.meta.get(_IMG_TAG_KEY)
+        for it in iter_desired_items(batch, types=["image"], meta={_IMG_TAG_KEY: ["und", "edit"]})
+    ]
     assert got == ["und", "edit"]
 
 
-def test_iter_desired_images_never_selects_text_items():
+def test_iter_desired_items_type_filter_excludes_text_items():
     batch = [[_img("und"), _txt("user"), _txt("assistant")]]
-    items = list(iter_desired_images(batch))
+    items = list(iter_desired_items(batch, types=["image"]))
     assert len(items) == 1
     assert items[0].type == "image"
 
 
-def test_iter_desired_images_composes_with_roles_and_sources():
+def test_iter_desired_items_meta_composes_with_roles_and_sources():
     batch = [
         [
             _img("und", role="user", source="siglip"),
@@ -123,33 +131,49 @@ def test_iter_desired_images_composes_with_roles_and_sources():
             _img("edit", role="user", source="siglip"),
         ]
     ]
-    by_role = [it.meta.get(_IMG_TAG_KEY) for it in iter_desired_images(batch, roles=["user"])]
+    by_role = [it.meta.get(_IMG_TAG_KEY) for it in iter_desired_items(batch, types=["image"], roles=["user"])]
     assert by_role == ["und", "edit"]
-    by_source = [it.meta.get(_IMG_TAG_KEY) for it in iter_desired_images(batch, sources=["siglip"])]
+    by_source = [it.meta.get(_IMG_TAG_KEY) for it in iter_desired_items(batch, types=["image"], sources=["siglip"])]
     assert by_source == ["und", "edit"]
-    by_both = [it.meta.get(_IMG_TAG_KEY) for it in iter_desired_images(batch, roles=["assistant"], sources=["vqvae"])]
+    by_both = [
+        it.meta.get(_IMG_TAG_KEY)
+        for it in iter_desired_items(
+            batch,
+            types=["image"],
+            roles=["assistant"],
+            sources=["vqvae"],
+        )
+    ]
     assert by_both == ["gen"]
     with_tag_and_role = [
-        it.meta.get(_IMG_TAG_KEY) for it in iter_desired_images(batch, img_tag=["edit"], roles=["user"])
+        it.meta.get(_IMG_TAG_KEY)
+        for it in iter_desired_items(
+            batch,
+            types=["image"],
+            roles=["user"],
+            meta={_IMG_TAG_KEY: ["edit"]},
+        )
     ]
     assert with_tag_and_role == ["edit"]
 
 
-def test_iter_desired_images_micro_batch_order_and_reverse():
+def test_iter_desired_items_meta_preserves_micro_batch_order_and_reverse():
     a, b, c = _img("und"), _img("gen"), _img("edit")
     batch = [[a, b], [c]]
-    assert list(iter_desired_images(batch)) == [a, b, c]
+    assert list(iter_desired_items(batch, types=["image"])) == [a, b, c]
     # reverse_item reverses within each sample.
-    assert list(iter_desired_images(batch, reverse_item=True)) == [b, a, c]
+    assert list(iter_desired_items(batch, types=["image"], reverse_item=True)) == [b, a, c]
 
 
-def test_iter_desired_images_untagged_image_excluded_when_tag_filter_set():
+def test_iter_desired_items_missing_meta_key_is_excluded_when_filter_set():
     # An image with no _img_tag is dropped when a tag filter is active, but kept
-    # when img_tag is None (selector must not crash on missing meta key).
+    # when meta is None (selector must not crash on a missing meta key).
     untagged = ConversationItem(type="image", value=torch.zeros(3, 2, 2, dtype=torch.uint8), role="user")
     batch = [[untagged, _img("gen")]]
-    assert [it.meta.get(_IMG_TAG_KEY) for it in iter_desired_images(batch, img_tag=["gen"])] == ["gen"]
-    assert len(list(iter_desired_images(batch))) == 2
+    assert [
+        it.meta.get(_IMG_TAG_KEY) for it in iter_desired_items(batch, types=["image"], meta={_IMG_TAG_KEY: ["gen"]})
+    ] == ["gen"]
+    assert len(list(iter_desired_items(batch, types=["image"]))) == 2
 
 
 # ── 3-tuple meta channel in _build_conversation_list ───────────────────────────

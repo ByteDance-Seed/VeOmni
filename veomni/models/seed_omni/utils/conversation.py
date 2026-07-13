@@ -51,8 +51,8 @@ _UNSET = object()
 # Per-image data-tag key written on ``meta`` by the data layer (preprocessors).
 # Image-only: text items do NOT carry it. Values: ``"und"`` | ``"gen"`` | ``"edit"``
 # — a model-agnostic declaration of the image's role in the sample. Model-side
-# routing reads it via ``iter_desired_images(..., img_tag=...)`` or
-# ``item.meta.get(_IMG_TAG_KEY)``; this module only owns the key + selector.
+# routing reads it via ``iter_desired_items(..., meta={_IMG_TAG_KEY: [...]})`` or
+# ``item.meta.get(_IMG_TAG_KEY)``; this module only owns the key.
 _IMG_TAG_KEY = "_img_tag"
 
 
@@ -147,8 +147,13 @@ def iter_desired_items(
     reverse_item: bool = False,
     *,
     meta_keys: list[str] | None = None,
+    meta: dict[str, list[Any]] | None = None,
 ) -> Iterator[ConversationItem]:
-    """Yield matching items in micro-batch order (sample 0, then sample 1, …)."""
+    """Yield matching items in micro-batch order (sample 0, then sample 1, …).
+
+    ``meta`` requires every configured key to exist and its value to match one
+    of the corresponding allowed values.
+    """
 
     for sample in conversation_list:
         items = reversed(sample) if reverse_item else sample
@@ -161,35 +166,11 @@ def iter_desired_items(
                 continue
             if meta_keys is not None and any(key not in item.meta for key in meta_keys):
                 continue
+            if meta is not None and any(
+                key not in item.meta or item.meta[key] not in allowed_values for key, allowed_values in meta.items()
+            ):
+                continue
             yield item
-
-
-def iter_desired_images(
-    conversation_list: list[list[ConversationItem]],
-    *,
-    roles: list[str] | None = None,
-    sources: list[str] | None = None,
-    img_tag: list[str] | None = None,
-    reverse_item: bool = False,
-) -> Iterator[ConversationItem]:
-    """Yield image items, optionally filtered by ``meta[_IMG_TAG_KEY]``.
-
-    Thin wrapper over :func:`iter_desired_items` with ``types=["image"]`` fixed.
-    ``img_tag`` (e.g. ``["und"]`` / ``["gen"]`` / ``["edit"]``) keeps only images
-    whose ``meta[_IMG_TAG_KEY]`` is in the set; ``None`` returns every image.
-    Composes with ``roles`` / ``sources`` / ``reverse_item`` as usual. Text items
-    are never selected because ``types`` is fixed to ``["image"]``.
-    """
-    for item in iter_desired_items(
-        conversation_list,
-        types=["image"],
-        roles=roles,
-        sources=sources,
-        reverse_item=reverse_item,
-    ):
-        if img_tag is not None and item.meta.get(_IMG_TAG_KEY) not in img_tag:
-            continue
-        yield item
 
 
 def get_tail_output_item(
@@ -242,7 +223,6 @@ __all__ = [
     "seal_outputs",
     "get_tail_output_item",
     "iter_desired_items",
-    "iter_desired_images",
     "collect_desired_values",
     "_IMG_TAG_KEY",
 ]

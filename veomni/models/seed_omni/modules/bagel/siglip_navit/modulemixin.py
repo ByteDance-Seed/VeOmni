@@ -8,7 +8,7 @@ import torch
 
 from ....mixins.metric_meter_mixin import MetricMeterMixin
 from ....mixins.modulemixin import CPUPreprocessor, ModuleMixin, post_forward, pre_forward
-from ....utils.conversation import ConversationItem, is_dummy, iter_desired_items
+from ....utils.conversation import ConversationItem, iter_desired_items
 from ..sources import BAGEL_SIGLIP_CONTEXT
 from .configuration import BagelSiglipNavitConfig
 
@@ -185,11 +185,9 @@ class BagelSiglipNavitModuleMixin(ModuleMixin):
         sample_lens: list[int] = []
         for sample in conversation_list:
             sample_len = 0
-            # SigLIP encodes per image, but multi-source metering needs one
-            # length per sample; dummy carriers only align the batch and count as 0.
+            # SigLIP encodes per image, including dummy carriers, but
+            # multi-source metering needs one aggregated length per sample.
             for item in iter_desired_items([sample], types=["image"], sources=[BAGEL_SIGLIP_CONTEXT]):
-                if is_dummy(item):
-                    continue
                 sample_len += int(item.meta[_OMNI_TOKEN_LEN])
             sample_lens.append(sample_len)
         return sample_lens

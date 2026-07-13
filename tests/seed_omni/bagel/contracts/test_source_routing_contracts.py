@@ -577,7 +577,7 @@ def test_bagel_siglip_selector_requires_context_source() -> None:
     assert model._select_siglip_image_items([[context_image]]) == [context_image]
 
 
-def test_bagel_siglip_meter_reports_per_sample_real_image_tokens() -> None:
+def test_bagel_siglip_meter_reports_per_sample_processed_image_tokens() -> None:
     model = _tiny_siglip()
 
     def real(length: int) -> ConversationItem:
@@ -605,7 +605,7 @@ def test_bagel_siglip_meter_reports_per_sample_real_image_tokens() -> None:
         [dummy()],
     ]
 
-    assert model._metric_sample_token_lens(conversation) == [0, 40, 7, 0]
+    assert model._metric_sample_token_lens(conversation) == [1, 40, 7, 1]
 
 
 def _tiny_siglip():
