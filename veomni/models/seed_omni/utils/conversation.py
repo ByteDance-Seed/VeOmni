@@ -48,6 +48,13 @@ ItemValue = Union[str, torch.Tensor, Image.Image]
 # "repr this explicit meta value" (which may legitimately be ``None``).
 _UNSET = object()
 
+# Per-image data-tag key written on ``meta`` by the data layer (preprocessors).
+# Image-only: text items do NOT carry it. Values: ``"und"`` | ``"gen"`` | ``"edit"``
+# — a model-agnostic declaration of the image's role in the sample. Model-side
+# routing reads it via ``iter_desired_items(..., meta={_IMG_TAG_KEY: [...]})`` or
+# ``item.meta.get(_IMG_TAG_KEY)``; this module only owns the key.
+_IMG_TAG_KEY = "_img_tag"
+
 
 @dataclass
 class ConversationItem:
@@ -140,8 +147,13 @@ def iter_desired_items(
     reverse_item: bool = False,
     *,
     meta_keys: list[str] | None = None,
+    meta: dict[str, list[Any]] | None = None,
 ) -> Iterator[ConversationItem]:
-    """Yield matching items in micro-batch order (sample 0, then sample 1, …)."""
+    """Yield matching items in micro-batch order (sample 0, then sample 1, …).
+
+    ``meta`` requires every configured key to exist and its value to match one
+    of the corresponding allowed values.
+    """
 
     for sample in conversation_list:
         items = reversed(sample) if reverse_item else sample
@@ -153,6 +165,10 @@ def iter_desired_items(
             if sources is not None and item.source not in sources:
                 continue
             if meta_keys is not None and any(key not in item.meta for key in meta_keys):
+                continue
+            if meta is not None and any(
+                key not in item.meta or item.meta[key] not in allowed_values for key, allowed_values in meta.items()
+            ):
                 continue
             yield item
 
@@ -208,4 +224,5 @@ __all__ = [
     "get_tail_output_item",
     "iter_desired_items",
     "collect_desired_values",
+    "_IMG_TAG_KEY",
 ]

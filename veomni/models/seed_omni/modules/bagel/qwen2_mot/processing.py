@@ -7,8 +7,11 @@ from typing import Iterable
 
 import torch
 
-from ....utils.conversation import ConversationItem, iter_desired_items
+from ....utils.conversation import _IMG_TAG_KEY, ConversationItem, iter_desired_items
 from ..sources import BAGEL_SIGLIP_CONTEXT, BAGEL_VAE_CONTEXT
+
+
+_VALID_IMG_TAGS = frozenset({"und", "gen", "edit"})
 
 
 @dataclass(frozen=True)
@@ -220,7 +223,23 @@ def _mot_attn_mode_for_item(item: ConversationItem) -> str:
     if item.type == "output":
         return "noise"
     if item.type == "image":
-        return "noise" if item.source == BAGEL_VAE_CONTEXT else "full"
+        if item.source != BAGEL_VAE_CONTEXT:
+            # SigLIP context (and any non-VAE image) is clean/full-attention
+            # regardless of ``_img_tag``; the tag only disambiguates VAE roles.
+            return "full"
+        tag = item.meta.get(_IMG_TAG_KEY)
+        if tag is None:
+            # Untagged VAE images come from inference prompt routing. Training
+            # targets must carry ``_img_tag="gen"``.
+            return "full"
+        if tag not in _VALID_IMG_TAGS:
+            raise ValueError(f"BAGEL Qwen2-MoT received image with unknown {_IMG_TAG_KEY}: {tag!r}.")
+        if tag == "gen":
+            return "noise"
+        if tag == "edit":
+            # Edit VAE context is a clean conditioning image, not a noised target.
+            return "full"
+        raise ValueError(f"BAGEL Qwen2-MoT received VAE image with incompatible {_IMG_TAG_KEY}: {tag!r}.")
     return "causal"
 
 
@@ -230,6 +249,21 @@ def _mot_gen_token_indexes_for_span(span: PackedSpan, indexes: torch.Tensor) -> 
         return indexes
     if item.type != "image" or item.source != BAGEL_VAE_CONTEXT:
         return indexes.new_empty(0)
+
+    tag = item.meta.get(_IMG_TAG_KEY)
+    if tag is not None and tag not in _VALID_IMG_TAGS:
+        raise ValueError(f"BAGEL Qwen2-MoT received image with unknown {_IMG_TAG_KEY}: {tag!r}.")
+    if tag == "und":
+        raise ValueError(f"BAGEL Qwen2-MoT received VAE image with incompatible {_IMG_TAG_KEY}: {tag!r}.")
+
+    if tag is None:
+        # Inference VAE prompt context is conditioning, not a generation target.
+        return indexes.new_empty(0)
+    if tag == "edit":
+        # Edit VAE context tokens are conditioning, not generation targets.
+        return indexes.new_empty(0)
+
+    # ``gen`` VAE images are true generation targets.
     if span.is_image_triplet:
         primary_start = span.primary_start
         primary_end = primary_start + span.primary_length

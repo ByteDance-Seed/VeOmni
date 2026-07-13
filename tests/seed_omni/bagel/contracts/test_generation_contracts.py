@@ -66,6 +66,51 @@ def test_bagel_infer_gen_denoise_signal_smoke():
     assert "timestep" not in ctx["conversation_list"][-1].meta
 
 
+def test_bagel_infer_gen_user_image_runs_siglip_context_only():
+    cfg = load_omni_config(
+        modules_path=bagel_cfg_dir() / "modules_train.yaml",
+        train_graph_path=bagel_cfg_dir() / "graph_train.yaml",
+        infer_modules=bagel_cfg_dir() / "modules_infer_eager.yaml",
+        infer_graph_path=bagel_cfg_dir() / "graph_infer_gen.yaml",
+    )
+    siglip = _CountingInferGenBagelSiglip()
+    model = OmniModel(
+        cfg,
+        {
+            "bagel_text_encoder": _InferGenTextEncoder(),
+            "bagel_siglip_navit": siglip,
+            "bagel_qwen2_mot": _InferGenBagelQwen(),
+            "bagel_flow_connector": _InferGenBagelFlow(),
+            "bagel_vae": _InferGenBagelVAE(),
+        },
+    ).eval()
+    ctx = model.generate(
+        {
+            "conversation_list": [
+                ConversationItem(
+                    type="image",
+                    value=Image.new("RGB", (1, 1)),
+                    role="user",
+                    source=BAGEL_SIGLIP_CONTEXT,
+                ),
+                ConversationItem(type="text", value="prompt", role="user"),
+            ]
+        },
+        generation_kwargs={
+            "max_new_tokens": 8,
+            "do_sample": False,
+            "image_height": 64,
+            "image_width": 64,
+        },
+    )
+
+    assert siglip.calls == 1
+    assert all(item.source != BAGEL_VAE_CONTEXT for item in ctx["conversation_list"])
+    assert torch.equal(ctx["conversation_list"][0].value[0], torch.zeros(8))
+    assert torch.equal(ctx["conversation_list"][0].value[1:], torch.ones(3, 8))
+    assert any(item["type"] == "image" for item in model.generated)
+
+
 def test_bagel_infer_edit_defaults_to_denoise_signal_smoke():
     cfg = load_omni_config(
         modules_path=bagel_cfg_dir() / "modules_train.yaml",
@@ -441,6 +486,22 @@ def _fake_cfg_branch_count(generation_kwargs: dict | None) -> int:
 class _NoopBagelSiglip(ModuleMixin, nn.Module):
     def generate(self, conversation_list: list[ConversationItem] | None = None, **kwargs):
         del kwargs
+        return {"conversation_list": conversation_list}
+
+
+class _CountingInferGenBagelSiglip(ModuleMixin, nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.calls = 0
+
+    def generate(self, conversation_list: list[ConversationItem] | None = None, **kwargs):
+        del kwargs
+        assert conversation_list is not None
+        self.calls += 1
+        assert not any(item.type == "image" and item.source == BAGEL_VAE_CONTEXT for item in conversation_list)
+        for item in conversation_list:
+            if item.type == "image" and item.source == BAGEL_SIGLIP_CONTEXT:
+                item.value = torch.ones(2, 8)
         return {"conversation_list": conversation_list}
 
 

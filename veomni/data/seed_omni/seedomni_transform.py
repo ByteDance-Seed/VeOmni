@@ -81,10 +81,12 @@ else:
         return []
 
 
-# Tuple-form turn entry used by ``conv_preprocess``: ``(type, value)``.
-# For ``type == "image"`` the inline ``value`` is always ``None`` — the actual
-# tensor is pulled from the per-sample image list in source order.
-_TupleTurn = List  # ``[role: str, (type, value), ...]``
+# Tuple-form turn entry used by ``conv_preprocess``: ``(type, value)`` or the
+# optional 3-tuple ``(type, value, meta)`` where ``meta`` is merged into the
+# resulting ``ConversationItem.meta`` (e.g. ``{_IMG_TAG_KEY: "und"}``). For
+# ``type == "image"`` / ``"video"`` the inline ``value`` is always ``None`` —
+# the actual tensor is pulled from the per-sample media list in source order.
+_TupleTurn = List  # ``[role: str, (type, value) | (type, value, meta), ...]``
 
 
 def _build_conversation_list(
@@ -92,13 +94,20 @@ def _build_conversation_list(
     image_tensors: list[torch.Tensor],
     video_inputs: list[VideoInputs],
 ) -> list[ConversationItem]:
-    """Flatten ``[[role, (type, value), ...], ...]`` into
+    """Flatten ``[[role, (type, value) | (type, value, meta), ...], ...]`` into
     :class:`ConversationItem` rows and pair image / video turns with
     ``image_tensors`` / ``video_inputs`` in source order.
 
     A video turn's value is a :class:`VideoInputs` bundling the decoded frame
     tensor and the optional in-video audio waveform — the single carrier the
     downstream video / audio modules each read their own stream from.
+
+    An optional 3-tuple ``(type, value, meta)`` carries per-item ``meta``
+    (merged into ``ConversationItem.meta``), e.g. ``{_IMG_TAG_KEY: "und"}``.
+    Pairing is pure sequential — every ``("image", _)`` turn consumes the next
+    image tensor and every ``("video", _)`` turn consumes the next video bundle,
+    so the caller's preprocessor is responsible for emitting a ref list whose
+    length matches the flattened image/video entry count.
 
     Raises:
         ValueError: if the number of ``("image"|"video", _)`` turns doesn't
@@ -117,8 +126,14 @@ def _build_conversation_list(
         role = turn[0]
         assert role in ["user", "assistant"], f"role must be user or assistant, got {role}"
         for entry in turn[1:]:
-            assert len(entry) == 2, f"turn entry must be a (type, value) pair, got {entry}"
-            type_, value = entry
+            assert len(entry) in (2, 3), (
+                f"turn entry must be a (type, value) or (type, value, meta) tuple, got {entry}"
+            )
+            type_ = entry[0]
+            value = entry[1]
+
+            # 2-tuples keep an empty meta.
+            meta = dict(entry[2]) if len(entry) == 3 else {}
             if type_ == "image":
                 value: torch.Tensor = next(image_iter)
                 image_consumed += 1
@@ -129,7 +144,7 @@ def _build_conversation_list(
                 assert value is not None, "text value must not be None"
             else:
                 raise ValueError(f"modality type {type_!r} is not yet handled")
-            out.append(ConversationItem(type=type_, value=value, role=role))
+            out.append(ConversationItem(type=type_, value=value, role=role, meta=meta))
     leftover_images = list(image_iter)
     assert len(leftover_images) == 0, (
         f"sample has {len(leftover_images)} unused image(s) after consuming {image_consumed}"
@@ -157,10 +172,15 @@ def process_seedomni_example(
               native schema (``conv_preprocess`` translates it).  May be
               JSON-encoded ``bytes`` for parquet/arrow formats.
             - ``"images"`` (optional): list of image refs (paths / bytes /
-              URLs / PIL).  Length must match the number of ``("image", _)``
-              turns produced by the preprocessor.
+              URLs / PIL).  The preprocessor reorganizes these into the ref
+              list actually decoded, according to the data layout it emits —
+              the decoded length matches the flattened ``("image", _)`` turns
+              so ``_build_conversation_list`` can pair them in order.
+            - ``"videos"`` (optional): list of video refs.  The preprocessor
+              returns the ref list paired in order with the flattened
+              ``("video", _)`` turns.
         **kwargs: forwarded to both ``conv_preprocess`` (e.g.
-            ``generation_ratio``) and ``fetch_images``
+            ``generation_ratio``) and ``fetch_images`` / ``fetch_videos``
             (e.g. ``image_min_pixels`` / ``image_max_pixels`` /
             ``scale_factor`` / ``max_ratio`` — see ``image_utils.smart_resize``).
             ``OmniTrainer`` injects ``tokenizer`` / ``max_seq_len`` /
@@ -187,10 +207,10 @@ def process_seedomni_example(
     if isinstance(conversations, (bytes, bytearray)):
         conversations = json.loads(conversations.decode("utf-8"))
 
-    constructed = conv_preprocess(source, conversations, **kwargs)
+    constructed, image_refs, video_refs = conv_preprocess(source, conversations, example, **kwargs)
 
-    image_tensors = fetch_images(example.get("images", []) or [], **kwargs)
-    video_inputs = fetch_videos(example.get("videos", []) or [], **kwargs)
+    image_tensors = fetch_images(image_refs, **kwargs)
+    video_inputs = fetch_videos(video_refs, **kwargs)
 
     conversation_list = _build_conversation_list(constructed, image_tensors, video_inputs)
     return [{"conversation_list": conversation_list}]

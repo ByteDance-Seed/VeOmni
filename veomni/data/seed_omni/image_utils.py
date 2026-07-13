@@ -79,10 +79,24 @@ def fetch_images(images: list[ImageInput], image_max_pixels: int | None = None, 
     """Load + (optionally) OOM-cap a list of images, returning ``(C, H, W) uint8``
     tensors ready to carry on a conversation item.
 
-    ``image_max_pixels`` is the only knob; everything else (``**kwargs``) is
-    ignored here and handled by the vision module's processor downstream."""
+    A repeated ref (the same path / bytes object appearing more than once in the
+    list) is decoded once and cloned on reuse, so duplicates don't pay a second
+    decode and each item carries an independent tensor. ``image_max_pixels`` is
+    the only other knob; everything else (``**kwargs``) is ignored here and
+    handled by the vision module's processor downstream."""
     del kwargs
-    return [pil_to_uint8_tensor(resize_to_max_pixels(load_image(image), image_max_pixels)) for image in images]
+    cache: dict = {}
+    out: list[torch.Tensor] = []
+    for image in images:
+        # Hashable refs (str / bytes) key by value; other refs key by identity.
+        key = image if isinstance(image, (str, bytes)) else id(image)
+        if key in cache:
+            out.append(cache[key].clone())
+        else:
+            tensor = pil_to_uint8_tensor(resize_to_max_pixels(load_image(image), image_max_pixels))
+            cache[key] = tensor
+            out.append(tensor)
+    return out
 
 
 def pil_to_uint8_tensor(image: Image.Image) -> torch.Tensor:

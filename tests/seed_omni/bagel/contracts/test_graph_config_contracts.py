@@ -46,6 +46,16 @@ def test_bagel_train_graph_fan_in_execution_order():
     }
 
 
+def test_bagel_infer_gen_graph_uses_siglip_context_without_vae_context():
+    data = yaml.safe_load((bagel_cfg_dir() / "graph_infer_gen.yaml").read_text())
+    prompt_body = data["generation_graph"]["states"]["prompt_encode"]["body"]
+
+    assert {"from": "bagel_text_encoder", "to": "bagel_qwen2_mot"} in prompt_body
+    assert {"from": "bagel_siglip_navit", "to": "bagel_qwen2_mot"} in prompt_body
+    assert all(edge["from"] != "bagel_vae.encode_context" for edge in prompt_body)
+    assert all(edge["from"] != "bagel_flow_connector.embed_context_latents" for edge in prompt_body)
+
+
 def test_bagel_offline_cache_yaml_loads_encode_only_vae():
     cfg = load_omni_config(
         modules_path=bagel_cfg_dir() / "modules_train_offline_cache.yaml",
