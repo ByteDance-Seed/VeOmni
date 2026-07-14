@@ -8,7 +8,7 @@ import pytest
 import torch
 
 from veomni.models.auto import build_foundation_model
-from veomni.utils.device import IS_NPU_AVAILABLE, get_gpu_compute_capability
+from veomni.utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE, get_gpu_compute_capability
 from veomni.utils.import_utils import is_diffusers_available, is_quack_gemm_available
 
 from ..tools import DummyDataset, build_torchrun_cmd, compare_metrics, print_comparison_table
@@ -43,6 +43,17 @@ _gpt_oss_fa4_quack_skip = pytest.mark.skipif(
     reason="GPT-OSS fused parallel test requires FA4 plus Quack GEMM on SM90+ CUDA GPUs",
 )
 
+_deepseek_v4_tilelang_skip = pytest.mark.skipif(
+    torch.version.hip is not None or not IS_CUDA_AVAILABLE or get_gpu_compute_capability() < 90,
+    reason="DeepSeek V4 TileLang smoke tests require an SM90+ NVIDIA CUDA GPU",
+)
+
+_DEEPSEEK_V4_TILELANG_TRAINING_ARGS = [
+    "--train.dyn_bsz=True",
+    "--model.ops_implementation.dsa_indexer_backend=tilelang",
+    "--model.ops_implementation.dsa_attention_backend=tilelang_sparse",
+]
+
 
 def _materialize_weights_dir(config_path: str, output_path: str, save_original_format: bool = True) -> Path:
     # Seed CPU RNG and init on CPU so the materialized checkpoint is bit-identical
@@ -74,6 +85,7 @@ def main(
     max_sp_size: int | None = None,
     max_ep_size: int | None = None,
     compare_alignment: bool = True,
+    extra_args: list[str] | None = None,
 ):
     test_path = f"./{model_name}"
     os.makedirs(test_path, exist_ok=True)
@@ -112,6 +124,8 @@ def main(
     log_keys = []
     for task_name, cmd_kwargs in command_list:
         print(f"{'-' * 10} {task_name} {'-' * 10}")
+        if extra_args:
+            cmd_kwargs["extra_args"] = [*cmd_kwargs.get("extra_args", []), *extra_args]
         cmd = build_torchrun_cmd(**cmd_kwargs)
         subprocess.run(cmd, check=True)
         with open(os.path.join(test_path, f"{task_name}/log_dict.json")) as f:
@@ -211,6 +225,19 @@ deepseek_v4_text_smoke_test_cases = [
         None,  # max_sp_size
         None,  # max_ep_size
         marks=_gpt_oss_fa4_quack_skip,
+    ),
+]
+
+deepseek_v4_tilelang_dyn_bsz_test_cases = [
+    pytest.param(
+        "dummy_deepseek_v4_packed_text_dataset",
+        [],
+        id="packed-2x1024",
+    ),
+    pytest.param(
+        "dummy_deepseek_v4_dense_packed_text_dataset",
+        ["--train.gradient_checkpointing.enable=False"],
+        id="packed-4x512-no-gc",
     ),
 ]
 
@@ -334,6 +361,30 @@ def dummy_text_dataset():
 
 
 @pytest.fixture(scope="session")
+def dummy_deepseek_v4_packed_text_dataset():
+    dummy_dataset = DummyDataset(
+        seq_len=1024,
+        dataset_type="text",
+        cache_name="deepseek_v4_packed_text",
+    )
+    train_path = dummy_dataset.save_path
+    yield train_path
+    del dummy_dataset
+
+
+@pytest.fixture(scope="session")
+def dummy_deepseek_v4_dense_packed_text_dataset():
+    dummy_dataset = DummyDataset(
+        seq_len=512,
+        dataset_type="text",
+        cache_name="deepseek_v4_dense_packed_text",
+    )
+    train_path = dummy_dataset.save_path
+    yield train_path
+    del dummy_dataset
+
+
+@pytest.fixture(scope="session")
 def dummy_qwen2vl_dataset():
     dummy_dataset = DummyDataset(seq_len=2048, dataset_type="qwen2vl")
     train_path = dummy_dataset.save_path
@@ -437,6 +488,29 @@ def test_text_parallel_smoke(
         max_sp_size=max_sp_size,
         max_ep_size=max_ep_size,
         compare_alignment=False,
+    )
+
+
+@_deepseek_v4_tilelang_skip
+@pytest.mark.parametrize("dataset_fixture, case_args", deepseek_v4_tilelang_dyn_bsz_test_cases)
+def test_deepseek_v4_tilelang_dyn_bsz_smoke(
+    dataset_fixture: str,
+    case_args: list[str],
+    request: pytest.FixtureRequest,
+):
+    """Train packed dynamic batches through TileLang indexer and sparse attention."""
+    main(
+        task_name="train_text_test",
+        model_name="deepseek_v4",
+        config_path="./tests/toy_config/deepseek_v4_toy",
+        is_moe=True,
+        rtol=_DEFAULT_RTOL,
+        atol=_DEFAULT_ATOL,
+        train_path=request.getfixturevalue(dataset_fixture),
+        max_sp_size=1,
+        max_ep_size=1,
+        compare_alignment=False,
+        extra_args=[*_DEEPSEEK_V4_TILELANG_TRAINING_ARGS, *case_args],
     )
 
 

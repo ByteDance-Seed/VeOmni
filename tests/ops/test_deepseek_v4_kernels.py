@@ -145,6 +145,57 @@ def test_tilelang_indexer_non_power_of_two_topk_forward_backward():
         assert _cosine_similarity(actual_grad, expected_grad) > 0.95
 
 
+def test_tilelang_indexer_packed_forward_backward():
+    _require_tilelang_cuda()
+    from veomni.ops.kernels.deepseek_v4 import v4_lighting_indexer
+
+    torch.manual_seed(4)
+    segment_len, heads, dim, compress_ratio, topk = 64, 8, 128, 4, 7
+    seqlen = 2 * segment_len
+    kv_per_segment = segment_len // compress_ratio
+    kv_len = 2 * kv_per_segment
+    q = torch.randn(seqlen, 1, heads, dim, device=DEVICE, dtype=torch.bfloat16, requires_grad=True)
+    k = torch.randn(kv_len, 1, dim, device=DEVICE, dtype=torch.bfloat16, requires_grad=True)
+    weights = (torch.randn(seqlen, 1, heads, device=DEVICE) * 0.01).requires_grad_()
+
+    local_positions = torch.arange(segment_len, device=DEVICE, dtype=torch.int32).repeat(2)
+    cu_seqlen_ks = torch.cat(
+        [
+            torch.zeros(segment_len, device=DEVICE, dtype=torch.int32),
+            torch.full((segment_len,), kv_per_segment, device=DEVICE, dtype=torch.int32),
+        ]
+    )
+    cu_seqlen_ke = cu_seqlen_ks + (local_positions + 1) // compress_ratio
+
+    actual, actual_indices = v4_lighting_indexer(
+        q,
+        k,
+        weights,
+        compress_ratio,
+        topk,
+        cu_seqlen_ks=cu_seqlen_ks,
+        cu_seqlen_ke=cu_seqlen_ke,
+    )
+    logits = torch.einsum("sbhd,tbd->bsht", q.float(), k.float())
+    logits = (logits.relu() * weights.permute(1, 0, 2).float().unsqueeze(-1)).sum(dim=2)
+    entries = torch.arange(kv_len, device=DEVICE)
+    valid_ranges = (entries >= cu_seqlen_ks[:, None]) & (entries < cu_seqlen_ke[:, None])
+    masked_logits = logits.masked_fill(~valid_ranges.unsqueeze(0), float("-inf"))
+    expected, expected_indices = masked_logits.topk(topk, dim=-1)
+    expected_indices = expected_indices.to(torch.int32).masked_fill(expected == -torch.inf, -1)
+
+    torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(actual_indices, expected_indices)
+
+    valid = actual_indices >= 0
+    grad = torch.randn_like(actual).masked_fill(~valid, 0)
+    expected_grads = torch.autograd.grad((expected.masked_fill(~valid, 0) * grad).sum(), (q, k, weights))
+    actual.backward(grad)
+    for actual_grad, expected_grad in zip((q.grad, k.grad, weights.grad), expected_grads, strict=True):
+        assert actual_grad is not None and torch.isfinite(actual_grad).all()
+        assert _cosine_similarity(actual_grad, expected_grad) > 0.95
+
+
 def test_tilelang_indexer_rejects_unsupported_head_count():
     _require_tilelang_cuda()
     from veomni.ops.kernels.deepseek_v4 import v4_lighting_indexer
@@ -241,6 +292,7 @@ def test_deepseek_v4_generated_indexer_dispatch_and_position_fallback(monkeypatc
     from transformers import AutoConfig
 
     from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling
+    from veomni.models.transformers.deepseek_v4.packed_utils import build_packed_compression_metadata
 
     config = AutoConfig.from_pretrained("tests/toy_config/deepseek_v4_toy")
     indexer = modeling.DeepseekV4Indexer(config).to(device=DEVICE, dtype=torch.bfloat16)
@@ -250,9 +302,9 @@ def test_deepseek_v4_generated_indexer_dispatch_and_position_fallback(monkeypatc
     canonical_positions = torch.arange(seq_len, device=DEVICE).unsqueeze(0)
     calls = []
 
-    def fake_tilelang(q, k, weights, compress_ratio, topk):
-        calls.append((q.shape, k.shape, weights.shape, compress_ratio, topk))
-        indices = torch.zeros(1, seq_len, topk, device=DEVICE, dtype=torch.int32)
+    def fake_tilelang(q, k, weights, compress_ratio, topk, **kwargs):
+        calls.append((q.shape, k.shape, weights.shape, compress_ratio, topk, kwargs))
+        indices = torch.zeros(1, q.shape[0], topk, device=DEVICE, dtype=torch.int32)
         return torch.zeros_like(indices, dtype=torch.float32), indices
 
     monkeypatch.setattr(modeling, "v4_lighting_indexer", fake_tilelang)
@@ -263,11 +315,126 @@ def test_deepseek_v4_generated_indexer_dispatch_and_position_fallback(monkeypatc
         expected_topk = seq_len // config.compress_rates["compressed_sparse_attention"]
         assert tilelang_indices.shape == (1, seq_len, expected_topk)
 
+        packed_positions = torch.arange(seq_len, device=DEVICE).repeat(2).unsqueeze(0)
+        packed_hidden = hidden_states.repeat(1, 2, 1)
+        packed_q_residual = q_residual.repeat(1, 2, 1)
+        packed_slices = ((0, seq_len), (seq_len, 2 * seq_len))
+        packed_metadata = build_packed_compression_metadata(
+            packed_hidden,
+            packed_positions,
+            packed_slices,
+            tuple(config.compress_rates.values()),
+        )
+        packed_indices = indexer(
+            packed_hidden,
+            packed_q_residual,
+            packed_positions,
+            None,
+            0,
+            packed_sequence_slices=packed_slices,
+            packed_compression_metadata=packed_metadata,
+        )
+        assert len(calls) == 2
+        packed_kwargs = calls[-1][-1]
+        torch.testing.assert_close(
+            packed_kwargs["cu_seqlen_ks"],
+            torch.tensor([0] * seq_len + [expected_topk] * seq_len, device=DEVICE, dtype=torch.int32),
+        )
+        assert packed_kwargs["cu_seqlen_ke"][-1] == 2 * expected_topk
+        assert packed_indices.shape == (1, 2 * seq_len, 2 * expected_topk)
+
         eager_indices = indexer(hidden_states, q_residual, canonical_positions + 1, None, 0)
-        assert len(calls) == 1
+        assert len(calls) == 2
         assert eager_indices.shape == tilelang_indices.shape
     finally:
         modeling.veomni_dsa_indexer_backend.bind(SimpleNamespace(dsa_indexer_backend="eager"))
+
+
+def test_deepseek_v4_packed_compressors_match_independent_sequences():
+    from transformers import AutoConfig
+
+    from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling
+    from veomni.models.transformers.deepseek_v4.packed_utils import build_packed_compression_metadata
+
+    torch.manual_seed(5)
+    config = AutoConfig.from_pretrained("tests/toy_config/deepseek_v4_toy")
+    segment_lengths = (64, 96)
+    total_len = sum(segment_lengths)
+    hidden_states = torch.randn(1, total_len, config.hidden_size)
+    q_residual = torch.randn(1, total_len, config.q_lora_rank)
+    position_ids = torch.cat([torch.arange(length) for length in segment_lengths]).unsqueeze(0)
+    sequence_slices = ((0, segment_lengths[0]), (segment_lengths[0], total_len))
+    packed_metadata = build_packed_compression_metadata(
+        hidden_states,
+        position_ids,
+        sequence_slices,
+        tuple(config.compress_rates.values()),
+        block_bias_rates=(config.compress_rates["heavily_compressed_attention"],),
+    )
+
+    modeling.veomni_dsa_indexer_backend.bind(SimpleNamespace(dsa_indexer_backend="eager"))
+    for compressor_cls in (modeling.DeepseekV4HCACompressor, modeling.DeepseekV4CSACompressor):
+        compressor = compressor_cls(config)
+        packed_kv, packed_bias = compressor(
+            hidden_states,
+            q_residual,
+            position_ids,
+            None,
+            0,
+            packed_sequence_slices=sequence_slices,
+            packed_compression_metadata=packed_metadata,
+        )
+
+        segment_outputs = []
+        segment_biases = []
+        for start, end in sequence_slices:
+            segment_kv, segment_bias = compressor(
+                hidden_states[:, start:end],
+                q_residual[:, start:end],
+                position_ids[:, start:end],
+                None,
+                0,
+            )
+            segment_outputs.append(segment_kv)
+            segment_biases.append(segment_bias)
+
+        expected_kv = torch.cat(segment_outputs, dim=2)
+        torch.testing.assert_close(packed_kv, expected_kv)
+        kv_offset = 0
+        for (start, end), segment_kv, segment_bias in zip(
+            sequence_slices, segment_outputs, segment_biases, strict=True
+        ):
+            kv_end = kv_offset + segment_kv.shape[2]
+            torch.testing.assert_close(packed_bias[:, :, start:end, kv_offset:kv_end], segment_bias)
+            assert torch.isneginf(packed_bias[:, :, start:end, :kv_offset]).all()
+            assert torch.isneginf(packed_bias[:, :, start:end, kv_end:]).all()
+            kv_offset = kv_end
+
+
+def test_deepseek_v4_packed_causal_mask_blocks_previous_samples():
+    from transformers import AutoConfig
+    from transformers.cache_utils import DynamicCache
+    from transformers.masking_utils import create_sliding_window_causal_mask
+
+    from veomni.models.transformers.deepseek_v4.packed_utils import isolate_packed_causal_mask_
+
+    config = AutoConfig.from_pretrained("tests/toy_config/deepseek_v4_toy")
+    config._attn_implementation = "eager"
+    hidden_states = torch.randn(1, 8, config.hidden_size)
+    position_ids = torch.tensor([[0, 1, 2, 3, 0, 1, 2, 3]])
+    causal_mask = create_sliding_window_causal_mask(
+        config=config,
+        inputs_embeds=hidden_states,
+        attention_mask=torch.ones(1, 8, dtype=torch.long),
+        past_key_values=DynamicCache(config=config),
+        position_ids=position_ids,
+    )
+    assert causal_mask is not None and (causal_mask[0, 0, 4, :4] == 0).all()
+
+    isolate_packed_causal_mask_(causal_mask, ((0, 4), (4, 8)))
+
+    assert (causal_mask[0, 0, 4:, :4] == torch.finfo(causal_mask.dtype).min).all()
+    assert causal_mask[0, 0, 4, 4] == 0
 
 
 def test_tilelang_act_quant_shapes_scales_and_inplace():

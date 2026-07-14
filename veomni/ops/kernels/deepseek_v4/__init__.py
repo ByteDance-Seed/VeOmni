@@ -54,11 +54,22 @@ def v4_lighting_indexer(
     compress_ratio: int,
     topk: int,
     topk_indices: torch.Tensor | None = None,
+    cu_seqlen_ks: torch.Tensor | None = None,
+    cu_seqlen_ke: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     _require_tilelang_sm90()
     from .tilelang_indexer import v4_lighting_indexer as impl
 
-    return impl(index_q, index_k, weights, compress_ratio, topk, topk_indices)
+    return impl(
+        index_q,
+        index_k,
+        weights,
+        compress_ratio,
+        topk,
+        topk_indices,
+        cu_seqlen_ks,
+        cu_seqlen_ke,
+    )
 
 
 def act_quant(

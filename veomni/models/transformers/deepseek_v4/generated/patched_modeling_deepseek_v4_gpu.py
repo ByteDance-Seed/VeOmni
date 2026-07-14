@@ -9,10 +9,18 @@
 #  It contains a patched version of the original HuggingFace modeling code.
 #
 #  Patches applied:
+#    - method_override: DeepseekV4HCACompressor.forward
+#      Keep HCA compression local to packed sequences
+#    - method_override: DeepseekV4CSACompressor.forward
+#      Keep CSA compression and indexing local to packed sequences
 #    - method_override: DeepseekV4Indexer.forward
 #      Optional TileLang Lightning Indexer dispatch
+#    - method_override: DeepseekV4Attention.forward
+#      Forward packed sequence boundaries to HCA and CSA compressors
 #    - function_replacement: eager_attention_forward
 #      Optional TileLang sparse MQA dispatch
+#    - method_override: DeepseekV4Model.forward
+#      Propagate packed sequence boundaries to compressed attention
 #    - class_replacement: DeepseekV4Experts
 #      Use v5 gate_up_proj expert layout with OpSlot-guarded VeOmni fused-MoE path
 #    - method_override: DeepseekV4ForCausalLM.forward
@@ -22,7 +30,6 @@
 #
 # ==============================================================================
 
-from collections.abc import Callable
 from typing import Optional
 
 import torch
@@ -34,7 +41,6 @@ from transformers.cache_utils import Cache, DynamicCache, DynamicSlidingWindowLa
 from transformers.generation import GenerationMixin
 from transformers.integrations import use_kernel_forward_from_hub
 from transformers.masking_utils import create_sliding_window_causal_mask
-from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 from transformers.modeling_layers import GradientCheckpointingLayer
 from transformers.modeling_outputs import MoeModelOutputWithPast
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
@@ -44,6 +50,14 @@ from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, auto_docstring, can_return_tuple
 from transformers.utils.generic import maybe_autocast, merge_with_config_defaults
 from transformers.utils.output_capturing import OutputRecorder, capture_outputs
+
+from veomni.models.transformers.deepseek_v4.packed_utils import (
+    build_packed_compression_metadata,
+    compress_packed_windows,
+    isolate_packed_causal_mask_,
+    packed_compressed_block_bias,
+    packed_compressed_causal_ranges,
+)
 
 # Additional imports for patches
 from veomni.ops import fused_moe_forward
@@ -378,6 +392,12 @@ def apply_rotary_pos_emb(
     return torch.cat([nope, rotated], dim=-1)
 
 
+# ======================================================================
+# [MODIFIED CLASS] DeepseekV4HCACompressor
+# Methods patched: forward
+# ======================================================================
+
+
 class DeepseekV4HCACompressor(nn.Module):
     """
     Heavily Compressed Attention compressor (paper §2.3.2, eqs. 20–23). compresses
@@ -410,6 +430,11 @@ class DeepseekV4HCACompressor(nn.Module):
         self.kv_norm = DeepseekV4RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.rotary_emb = DeepseekV4RotaryEmbedding(config)
 
+    # ================================================================
+    # Patch: packed compressed-attention windows
+    # 1. Keep every HCA/CSA compression window within one packed sequence.
+    # 2. Reset compressed RoPE positions and causal ranges at each boundary.
+    # ================================================================
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -417,18 +442,41 @@ class DeepseekV4HCACompressor(nn.Module):
         position_ids: torch.Tensor,
         past_key_values: Cache | None,
         layer_idx: int,
+        packed_sequence_slices: tuple[tuple[int, int], ...] | None = None,
+        packed_compression_metadata: dict[int, dict[str, torch.Tensor]] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if (packed_sequence_slices is None) != (packed_compression_metadata is None):
+            raise ValueError("Packed sequence slices and compression metadata must be provided together")
         batch, _, _ = hidden_states.shape
         cache_layer: DeepseekV4HCACache = past_key_values.layers[layer_idx] if past_key_values is not None else None
         kv = self.kv_proj(hidden_states)
         gate = self.gate_proj(hidden_states)
+
+        if cache_layer is None and packed_sequence_slices is not None and packed_compression_metadata is not None:
+            rate_metadata = packed_compression_metadata[self.compress_rate]
+            compressed = compress_packed_windows(
+                kv,
+                gate,
+                self.position_bias,
+                self.head_dim,
+                self.compress_rate,
+                self.kv_norm,
+                self.rotary_emb,
+                self.rope_layer_type,
+                position_ids,
+                rate_metadata,
+                overlap=False,
+            )
+            block_bias = packed_compressed_block_bias(rate_metadata)
+            return compressed.unsqueeze(1), block_bias
+
         if cache_layer is None:
             usable = (kv.shape[1] // self.compress_rate) * self.compress_rate
             chunk_kv, chunk_gate, first_window_position = kv[:, :usable], gate[:, :usable], 0
         else:
             chunk_kv, chunk_gate, first_window_position = cache_layer.store_compression_weights("compressor", kv, gate)
 
-        if chunk_kv.shape[1] > 0:  # there were at least self.compress_rate tokens
+        if chunk_kv.shape[1] > 0:
             n_windows = chunk_kv.shape[1] // self.compress_rate
             chunk_kv = chunk_kv.view(batch, n_windows, self.compress_rate, -1)
             chunk_gate = chunk_gate.view(batch, n_windows, self.compress_rate, -1) + self.position_bias.to(
@@ -453,9 +501,8 @@ class DeepseekV4HCACompressor(nn.Module):
         if seq_len == 1 or compressed_len == 0:
             return compressed_kv, None
 
-        # query `t` may only see cache entries at pos `w` t > w * compress_rate (ex: t=7, w=2 t does not attend to it).
         entry_indices = torch.arange(compressed_len, device=compressed_kv.device)
-        causal_threshold = (position_ids + 1) // self.compress_rate  # [B, S]
+        causal_threshold = (position_ids + 1) // self.compress_rate
         block_bias = compressed_kv.new_zeros((batch, 1, seq_len, compressed_len))
         block_bias = block_bias.masked_fill(
             entry_indices.view(1, 1, 1, -1) >= causal_threshold.unsqueeze(1).unsqueeze(-1),
@@ -530,19 +577,42 @@ class DeepseekV4Indexer(nn.Module):
         position_ids: torch.Tensor,
         past_key_values: Cache | None,
         layer_idx: int,
+        packed_sequence_slices: tuple[tuple[int, int], ...] | None = None,
+        packed_compression_metadata: dict[int, dict[str, torch.Tensor]] | None = None,
     ) -> torch.LongTensor:
+        if (packed_sequence_slices is None) != (packed_compression_metadata is None):
+            raise ValueError("Packed sequence slices and compression metadata must be provided together")
         batch, seq_len, _ = hidden_states.shape
         cache_layer: DeepseekV4CSACache = past_key_values.layers[layer_idx] if past_key_values is not None else None
         kv = self.kv_proj(hidden_states)
         gate = self.gate_proj(hidden_states)
 
-        if cache_layer is None:
+        if cache_layer is None and packed_sequence_slices is not None and packed_compression_metadata is not None:
+            rate_metadata = packed_compression_metadata[self.compress_rate]
+            compressed = compress_packed_windows(
+                kv,
+                gate,
+                self.position_bias,
+                self.head_dim,
+                self.compress_rate,
+                self.kv_norm,
+                self.rotary_emb,
+                self.rope_layer_type,
+                position_ids,
+                rate_metadata,
+                overlap=True,
+            )
+            chunk_kv = chunk_gate = None
+            first_window_position = 0
+        elif cache_layer is None:
             usable = (kv.shape[1] // self.compress_rate) * self.compress_rate
             chunk_kv, chunk_gate, first_window_position = kv[:, :usable], gate[:, :usable], 0
         else:
             chunk_kv, chunk_gate, first_window_position = cache_layer.store_compression_weights("indexer", kv, gate)
 
-        if chunk_kv.shape[1] > 0:
+        if packed_compression_metadata is not None and cache_layer is None:
+            pass
+        elif chunk_kv.shape[1] > 0:
             n_windows = chunk_kv.shape[1] // self.compress_rate
             ratio = self.compress_rate
             chunk_kv = chunk_kv.view(batch, n_windows, ratio, -1)
@@ -590,6 +660,9 @@ class DeepseekV4Indexer(nn.Module):
                 f"DeepSeek-V4 does not support dsa_indexer_backend={indexer_backend!r}; expected 'eager' or 'tilelang'"
             )
         canonical_positions = torch.arange(seq_len, device=position_ids.device).unsqueeze(0).expand_as(position_ids)
+        packed_ranges = None
+        if packed_compression_metadata is not None and cache_layer is None:
+            packed_ranges = packed_compressed_causal_ranges(packed_compression_metadata[self.compress_rate])
         use_tilelang = (
             indexer_backend == "tilelang"
             and hidden_states.is_cuda
@@ -597,10 +670,11 @@ class DeepseekV4Indexer(nn.Module):
             and compressed_kv.dtype == torch.bfloat16
             and self.num_heads <= 64
             and self.num_heads % 8 == 0
+            and self.head_dim >= 32
             and self.head_dim == 1 << (self.head_dim - 1).bit_length()
             and cache_layer is None
             and compressed_len > 0
-            and torch.equal(position_ids, canonical_positions)
+            and (packed_ranges is not None or torch.equal(position_ids, canonical_positions))
         )
         if use_tilelang:
             _, top_k_indices = v4_lighting_indexer(
@@ -609,6 +683,8 @@ class DeepseekV4Indexer(nn.Module):
                 weights.transpose(0, 1).contiguous(),
                 self.compress_rate,
                 top_k,
+                cu_seqlen_ks=None if packed_ranges is None else packed_ranges[0],
+                cu_seqlen_ke=None if packed_ranges is None else packed_ranges[1],
             )
             return top_k_indices.to(torch.long)
         # --- Patch.1 ---
@@ -618,14 +694,26 @@ class DeepseekV4Indexer(nn.Module):
         eager_weights = self.weights_proj(hidden_states).float() * self.weights_scaling
         index_scores = (scores * eager_weights.unsqueeze(-1)).sum(dim=2)
         if compressed_len > 0:
-            causal_threshold = (position_ids + 1) // self.compress_rate
             entry_indices = torch.arange(compressed_len, device=index_scores.device)
-            future_mask = entry_indices.view(1, 1, -1) >= causal_threshold.unsqueeze(-1)
+            if packed_ranges is None:
+                causal_starts = torch.zeros_like(position_ids)
+                causal_ends = (position_ids + 1) // self.compress_rate
+            else:
+                causal_starts, causal_ends = (value.unsqueeze(0) for value in packed_ranges)
+            future_mask = (entry_indices.view(1, 1, -1) < causal_starts.unsqueeze(-1)) | (
+                entry_indices.view(1, 1, -1) >= causal_ends.unsqueeze(-1)
+            )
             index_scores = index_scores.masked_fill(future_mask, float("-inf"))
             top_k_indices = index_scores.topk(top_k, dim=-1).indices
-            invalid = top_k_indices >= causal_threshold.unsqueeze(-1)
+            invalid = (top_k_indices < causal_starts.unsqueeze(-1)) | (top_k_indices >= causal_ends.unsqueeze(-1))
             return torch.where(invalid, torch.full_like(top_k_indices, -1), top_k_indices)
         return index_scores.topk(top_k, dim=-1).indices
+
+
+# ======================================================================
+# [MODIFIED CLASS] DeepseekV4CSACompressor
+# Methods patched: forward
+# ======================================================================
 
 
 class DeepseekV4CSACompressor(nn.Module):
@@ -669,11 +757,47 @@ class DeepseekV4CSACompressor(nn.Module):
         position_ids: torch.Tensor,
         past_key_values: Cache | None,
         layer_idx: int,
-    ) -> torch.Tensor:
+        packed_sequence_slices: tuple[tuple[int, int], ...] | None = None,
+        packed_compression_metadata: dict[int, dict[str, torch.Tensor]] | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if (packed_sequence_slices is None) != (packed_compression_metadata is None):
+            raise ValueError("Packed sequence slices and compression metadata must be provided together")
         batch, seq_len, _ = hidden_states.shape
         cache_layer: DeepseekV4CSACache = past_key_values.layers[layer_idx] if past_key_values is not None else None
         kv = self.kv_proj(hidden_states)
         gate = self.gate_proj(hidden_states)
+
+        if cache_layer is None and packed_sequence_slices is not None and packed_compression_metadata is not None:
+            rate_metadata = packed_compression_metadata[self.compress_rate]
+            compressed = compress_packed_windows(
+                kv,
+                gate,
+                self.position_bias,
+                self.head_dim,
+                self.compress_rate,
+                self.kv_norm,
+                self.rotary_emb,
+                self.rope_layer_type,
+                position_ids,
+                rate_metadata,
+                overlap=True,
+            )
+            compressed_kv = compressed.unsqueeze(1)
+            top_k_indices = self.indexer(
+                hidden_states,
+                q_residual,
+                position_ids,
+                past_key_values,
+                layer_idx,
+                packed_sequence_slices=packed_sequence_slices,
+                packed_compression_metadata=packed_compression_metadata,
+            )
+            compressed_len = compressed_kv.shape[2]
+            valid = top_k_indices >= 0
+            safe_indices = torch.where(valid, top_k_indices, torch.full_like(top_k_indices, compressed_len))
+            block_bias = compressed_kv.new_full((batch, 1, seq_len, compressed_len + 1), float("-inf"))
+            block_bias.scatter_(-1, safe_indices.unsqueeze(1), 0.0)
+            return compressed_kv, block_bias[..., :compressed_len]
 
         if cache_layer is None:
             usable = (kv.shape[1] // self.compress_rate) * self.compress_rate
@@ -686,13 +810,6 @@ class DeepseekV4CSACompressor(nn.Module):
             ratio = self.compress_rate
             chunk_kv = chunk_kv.view(batch, n_windows, ratio, -1)
             chunk_gate = chunk_gate.view(batch, n_windows, ratio, -1) + self.position_bias.to(chunk_gate.dtype)
-
-            # Lay out the two series in [B, n_win, 2*ratio, head_dim]: Cb
-            # (`[..., head_dim:]`) goes in the second half (current window),
-            # Ca of the previous window (`[..., :head_dim]`) goes in the
-            # first half. Window 0's first half stays zero-kv / -inf-gate
-            # (softmax weight 0) on the very first forward call; on later
-            # calls the cache fills it with the saved Ca slice.
             new_kv = chunk_kv.new_zeros((batch, n_windows, 2 * ratio, self.head_dim))
             new_gate = chunk_gate.new_full((batch, n_windows, 2 * ratio, self.head_dim), float("-inf"))
             new_kv[:, :, ratio:] = chunk_kv[..., self.head_dim :]
@@ -707,9 +824,6 @@ class DeepseekV4CSACompressor(nn.Module):
                 if prior_kv is not None:
                     new_kv[:, 0, :ratio] = prior_kv.to(new_kv.dtype)
                     new_gate[:, 0, :ratio] = prior_gate.to(new_gate.dtype)
-
-            # Softmax in fp32 for stability (logits in bf16/fp16 can collapse pairs that
-            # only differ by a small amount, especially with large window widths).
             compressed = self.kv_norm(
                 (new_kv * new_gate.softmax(dim=2, dtype=torch.float32).to(new_kv.dtype)).sum(dim=2)
             )
@@ -724,18 +838,9 @@ class DeepseekV4CSACompressor(nn.Module):
         if cache_layer is not None:
             compressed = cache_layer.update_compressor_states("compressor", compressed)
         compressed_kv = compressed.unsqueeze(1)
-
-        # Lightning Indexer: gather top-`index_topk` compressed entries per query.
-        # in some cases, the output index can return top-k positions that should not be attended to.
-        # Ex: for query at index 5, m=4, and `index_topk=1024`, 1024 index are return but only 2 should be
-        # attended to. The indexer marks the rest with `-1`; we clamp before the gather and keep the `valid`
-        # to drop them from the per-query block mask afterwards.
-        top_k_indices = self.indexer(hidden_states, q_residual, position_ids, past_key_values, layer_idx)  # [B, S, k]
+        top_k_indices = self.indexer(hidden_states, q_residual, position_ids, past_key_values, layer_idx)
         compressed_len = compressed_kv.shape[2]
-        valid = top_k_indices >= 0  # [B, S, k]
-        # Per-query block bias: query `t` may only see the cache entries that are <= `seq_len // m`
-        # and in these, only the ones marked valid by the indexer. Everything else is `-inf`.
-        # While the above negated the indexer, here we apply the "causal" masking.
+        valid = top_k_indices >= 0
         safe_indices = torch.where(valid, top_k_indices, torch.full_like(top_k_indices, compressed_len))
         block_bias = compressed_kv.new_full((batch, 1, seq_len, compressed_len + 1), float("-inf"))
         block_bias.scatter_(-1, safe_indices.unsqueeze(1), 0.0)
@@ -848,6 +953,12 @@ COMPRESSOR_CLASSES = {
 }
 
 
+# ======================================================================
+# [MODIFIED CLASS] DeepseekV4Attention
+# Methods patched: forward
+# ======================================================================
+
+
 class DeepseekV4Attention(nn.Module):
     r"""
     Diff with classic attentions:
@@ -894,6 +1005,10 @@ class DeepseekV4Attention(nn.Module):
             COMPRESSOR_CLASSES[self.layer_type](config) if self.layer_type != "sliding_attention" else None
         )
 
+    # ================================================================
+    # Patch: DeepseekV4Attention.forward
+    # 1. Pass the collator-provided packed sequence slices into compressors.
+    # ================================================================
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -901,12 +1016,10 @@ class DeepseekV4Attention(nn.Module):
         position_ids: torch.Tensor,
         attention_mask: torch.Tensor | None,
         past_key_values: Cache | None = None,
-        **kwargs: Unpack[FlashAttentionKwargs],
+        **kwargs: Unpack[TransformersKwargs],
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
-        # position_embeddings is a {"main", "compress"} dict from the model; pick the
-        # one that matches this layer's rope type (sliding → main, CSA/HCA → compress).
         cos, sin = position_embeddings[self.rope_layer_type]
 
         q_residual = self.q_a_norm(self.q_a_proj(hidden_states))
@@ -917,29 +1030,29 @@ class DeepseekV4Attention(nn.Module):
         kv = self.kv_norm(self.kv_proj(hidden_states)).view(*hidden_shape).transpose(1, 2)
         kv = apply_rotary_pos_emb(kv, cos, sin)
 
-        if past_key_values is not None:  # sliding where K==V
+        if past_key_values is not None:
             kv = past_key_values.update(kv, kv, self.layer_idx)[0]
 
         block_bias = None
-        if self.compressor is not None:  # Compressed KV (CSA or HCA)
+        if self.compressor is not None:
             compressed_kv, block_bias = self.compressor(
-                hidden_states, q_residual, position_ids, past_key_values, self.layer_idx
+                hidden_states,
+                q_residual,
+                position_ids,
+                past_key_values,
+                self.layer_idx,
+                packed_sequence_slices=kwargs.get("packed_sequence_slices"),
+                packed_compression_metadata=kwargs.get("packed_compression_metadata"),
             )
             kv = torch.cat([kv, compressed_kv], dim=2)
 
-        # The compressor path concatenates extra entries onto the KV axis after the
-        # standard sliding-window cache update, so a tensor `attention_mask` (built
-        # for the pre-concat KV length) needs to be extended to cover them. The
-        # compressor returns a `block_bias` carrying per-query causality + indexer
-        # validity over those new slots — cat it in instead of zero-padding (which
-        # would let every query see every compressed slot).
         if isinstance(attention_mask, torch.Tensor) and kv.shape[2] > attention_mask.shape[-1]:
             if block_bias is not None:
                 attention_mask = torch.cat([attention_mask, block_bias.to(attention_mask.dtype)], dim=-1)
             else:
                 attention_mask = F.pad(attention_mask, (0, kv.shape[2] - attention_mask.shape[-1]), value=0.0)
 
-        attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
+        attention_interface = ALL_ATTENTION_FUNCTIONS.get_interface(
             self.config._attn_implementation, eager_attention_forward
         )
         attn_output, attn_weights = attention_interface(
@@ -955,14 +1068,7 @@ class DeepseekV4Attention(nn.Module):
             **kwargs,
         )
 
-        # K=V in V4, so V picked up rope on its trailing rope slice. Apply the conjugate
-        # rotation (`-sin`) at the query position to undo it on the rope slice of the
-        # output before the grouped output projection mixes heads. The transpose pair is
-        # just a layout fix-up: apply_rotary_pos_emb expects `[B, S, H, D]` (its
-        # `unsqueeze_dim=1` adds a head-broadcast dim to cos/sin); attention gave us
-        # `[B, H, S, D]`.
         attn_output = apply_rotary_pos_emb(attn_output.transpose(1, 2), cos, -sin).transpose(1, 2)
-
         grouped = attn_output.reshape(*input_shape, self.config.o_groups, -1)
         grouped = self.o_a_proj(grouped).flatten(2)
         output = self.o_b_proj(grouped)
@@ -1387,6 +1493,12 @@ class DeepseekV4PreTrainedModel(PreTrainedModel):
                 init.copy_(getattr(module, f"{layer_type}_original_inv_freq"), curr_inv_freq)
 
 
+# ======================================================================
+# [MODIFIED CLASS] DeepseekV4Model
+# Methods patched: forward
+# ======================================================================
+
+
 @auto_docstring
 class DeepseekV4Model(DeepseekV4PreTrainedModel):
     def __init__(self, config: DeepseekV4Config):
@@ -1406,6 +1518,10 @@ class DeepseekV4Model(DeepseekV4PreTrainedModel):
         # Initialize weights and apply final processing
         self.post_init()
 
+    # ================================================================
+    # Patch: DeepseekV4Model.forward
+    # 1. Convert collator-provided cu-seqlens into reusable packed slices once.
+    # ================================================================
     @merge_with_config_defaults
     @capture_outputs
     @auto_docstring
@@ -1430,9 +1546,31 @@ class DeepseekV4Model(DeepseekV4PreTrainedModel):
             past_seen = past_key_values.get_seq_length()
             position_ids = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device) + past_seen
             position_ids = position_ids.unsqueeze(0)
-            # `generate()` may pass a per-layer-type mask dict already built by
-            # `create_masks_for_generate`; all V4 layer types use the same sliding-window
-            # mask, so use the prebuilt one directly. Otherwise build it here.
+
+        cu_seq_lens_q = kwargs.get("cu_seq_lens_q")
+        if isinstance(cu_seq_lens_q, torch.Tensor) and inputs_embeds.shape[0] == 1:
+            boundaries = cu_seq_lens_q.detach().cpu().tolist()
+            if boundaries[0] != 0 or boundaries[-1] != inputs_embeds.shape[1]:
+                raise ValueError(
+                    "DeepSeek V4 packed cu_seq_lens_q must span the full sequence; "
+                    f"got {boundaries} for length {inputs_embeds.shape[1]}"
+                )
+            packed_sequence_slices = tuple(zip(boundaries[:-1], boundaries[1:], strict=True))
+            kwargs["packed_sequence_slices"] = packed_sequence_slices
+            compress_rates = tuple(self.config.compress_rates.values())
+            hca_rate = self.config.compress_rates["heavily_compressed_attention"]
+            kwargs["packed_compression_metadata"] = build_packed_compression_metadata(
+                inputs_embeds,
+                position_ids,
+                packed_sequence_slices,
+                compress_rates,
+                block_bias_rates=(hca_rate,),
+            )
+            # Packed training combines independent samples in one physical row;
+            # treating that row as a decode cache would merge their KV histories.
+            past_key_values = None
+            return_cache = None
+
         if isinstance(attention_mask, dict):
             causal_mask = next(iter(attention_mask.values()))
         else:
@@ -1443,6 +1581,8 @@ class DeepseekV4Model(DeepseekV4PreTrainedModel):
                 past_key_values=past_key_values,
                 position_ids=position_ids,
             )
+        if "packed_sequence_slices" in kwargs:
+            causal_mask = isolate_packed_causal_mask_(causal_mask, kwargs["packed_sequence_slices"])
         hidden_states = inputs_embeds.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1).contiguous()
         position_embeddings = {
             "main": self.rotary_emb(inputs_embeds, position_ids=position_ids, layer_type="main"),
