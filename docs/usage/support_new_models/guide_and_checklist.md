@@ -143,7 +143,7 @@ Two common issues:
 
 ### Step 7: Write the Data Transform Function
 
-Add `process_sample_your_model()` to [veomni/data/multimodal/multimodal_transform.py](../../../veomni/data/multimodal/multimodal_transform.py). See the example docs for the full function signature and steps.
+Add `process_sample_your_model()` to [veomni/data/data_transform.py](../../../veomni/data/data_transform.py). See the example docs for the full function signature and steps.
 
 ### Step 8: Hook into the Trainer
 
