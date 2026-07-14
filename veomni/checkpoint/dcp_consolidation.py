@@ -32,11 +32,13 @@ import types
 _dcp_consolidation_patch_applied = False
 
 # Fixed torch versions for this patch - update when upgrading torch
-_SUPPORTED_TORCH_VERSION_PREFIXES = ("2.9", "2.11")
+_SUPPORTED_TORCH_VERSION_PREFIXES = ("2.9", "2.10", "2.11")
 _EXPECTED_PROCESS_OUTPUT_FILE_ARGS = ("output_file", "output_data", "input_files_data")
 _SUPPORTED_PROCESS_OUTPUT_FILE_SHA256 = {
     # torch 2.9.1
     "0837813477b4ca319890ef671b954f83bbe966f21a751875606b74e4e8e30ea8",
+    # torch 2.10.0
+    "794961d5aab4bcc419b08e9a41fbb4c80cb70ff19b07847c96f00cc193cee3a2",
     # torch 2.11.0 upstream source
     "ff25a85cc52018707334f1206760fe186146771e5357388f0b4d6bc19bdf61c1",
     # torch 2.11.0+cu130 CI wheel

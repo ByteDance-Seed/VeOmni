@@ -32,6 +32,7 @@ import queue
 import threading
 from abc import ABC
 from collections import defaultdict
+from contextlib import nullcontext
 from dataclasses import asdict, fields
 from typing import Any, Callable, Dict, List
 
@@ -74,6 +75,7 @@ from ..utils.device import (
 from ..utils.loss_utils import count_loss_token, mean_global_loss
 from ..utils.model_utils import pretty_print_trainable_parameters
 from .callbacks import (
+    ChannelLossCallback,
     CheckpointerCallback,
     EnvironMeterCallback,
     EvaluateCallback,
@@ -586,14 +588,20 @@ class BaseTrainer(Stateful, ABC):
             self.hf_ckpt_callback = HuggingfaceCkptCallback(self)
         self.evaluate_callback = EvaluateCallback(self)
         self.moe_monitor_callback = MoERouterMonitorCallback(self)
+        self.channel_loss_callback = ChannelLossCallback(self)
         # Ordered dispatch list. Callbacks own their ParallelState explicitly:
         # each captured it at construction (``Callback.parallel_state``) and the
         # shared objects they drive (EnvironMeter, DCP checkpointer) are handed
         # that state directly, so no ambient ``use_parallel_state`` scope is
         # needed around hook dispatch.
+        #
+        # ``channel_loss_callback`` is ordered after the meter (which resets
+        # ``step_*_metrics`` in ``on_step_end``) and before ``wandb`` (which
+        # logs them), so its per-source metrics survive into the logged payload.
         self._callbacks = [
             self.environ_meter_callback,
             self.tqdm_callback,
+            self.channel_loss_callback,
             self.wandb_callback,
             self.profile_callback,
             self.checkpointer_callback,
@@ -619,9 +627,9 @@ class BaseTrainer(Stateful, ABC):
         for callback in self._callbacks:
             callback.on_epoch_end(self.state)
 
-    def on_step_begin(self, micro_batches=None):
+    def on_step_begin(self, micro_batches=None, **kwargs):
         for callback in self._callbacks:
-            callback.on_step_begin(self.state, micro_batches=micro_batches)
+            callback.on_step_begin(self.state, micro_batches=micro_batches, **kwargs)
 
     def on_step_end(self, loss=None, loss_dict=None, grad_norm=None):
         for callback in self._callbacks:
@@ -662,21 +670,37 @@ class BaseTrainer(Stateful, ABC):
     def forward_backward_step(
         self, micro_batch: dict[str, torch.Tensor]
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        micro_batch = self.preforward(micro_batch)
+        channel_loss_callback = getattr(self, "channel_loss_callback", None)
+        micro_step_context = (
+            channel_loss_callback.micro_step_context(self.state, micro_batch)
+            if channel_loss_callback is not None
+            else nullcontext()
+        )
+        with micro_step_context:
+            micro_batch = self.preforward(micro_batch)
+            if channel_loss_callback is not None:
+                channel_loss_callback.strip_model_inputs(micro_batch)
 
-        with self.model_fwd_context, set_batch_invariant_mode(self.args.train.enable_batch_invariant_mode):
-            outputs: ModelOutput = self.model(**micro_batch, use_cache=False)
+            channel_forward_context = (
+                channel_loss_callback.model_forward_context() if channel_loss_callback is not None else nullcontext()
+            )
+            with (
+                self.model_fwd_context,
+                set_batch_invariant_mode(self.args.train.enable_batch_invariant_mode),
+                channel_forward_context,
+            ):
+                outputs: ModelOutput = self.model(**micro_batch, use_cache=False)
 
-        loss: torch.Tensor
-        loss_dict: Dict[str, torch.Tensor]
-        loss, loss_dict = self.postforward(outputs, micro_batch)
+            loss: torch.Tensor
+            loss_dict: Dict[str, torch.Tensor]
+            loss, loss_dict = self.postforward(outputs, micro_batch)
 
-        # Backward pass
-        with self.model_bwd_context, set_batch_invariant_mode(self.args.train.enable_batch_invariant_mode):
-            loss.backward()
+            # Backward pass
+            with self.model_bwd_context, set_batch_invariant_mode(self.args.train.enable_batch_invariant_mode):
+                loss.backward()
 
-        del micro_batch
-        return loss, loss_dict
+            del micro_batch
+            return loss, loss_dict
 
     def model_reshard(self, micro_step: int, num_micro_steps: int):
         """Reshard model after backward pass."""

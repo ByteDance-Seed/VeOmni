@@ -11,7 +11,7 @@ This document walks through the specific patches applied to integrate **Qwen3-VL
 > patterns (FSDP dummy forward, SP slicing, fused MoE, EP plan) are unchanged;
 > what has changed is *where* the patches are declared (in the patchgen config
 > and emitted into `generated/`) rather than applied at import time. See
-> [docs/transformers_v5/patchgen.md](../../transformers_v5/patchgen.md) and
+> [the patchgen design guide](../../design/patchgen.md) and
 > the `veomni-migrate-transformers-v5` agent skill for the current flow.
 
 ---

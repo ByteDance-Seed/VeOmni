@@ -11,11 +11,11 @@ As EP+FSDP2 is well supported in VeOmni, similar parallelism is also needed for 
 
 * Support any length of list of parallelism sizes for different parallism patterns in FSDP2 training.
 * Support checkpoint save and (resharding) load for different parallelism patterns.
-* Support prefetching to overlap communication and computation as [ep_fsdp2.md](./key_features/ep_fsdp2.md).
+* Support prefetching to overlap communication and computation as described in [ep_fsdp2.md](./ep_fsdp2.md).
 
 ## Design Overview
 
-The overall design of extra parallelism is similar to EP+FSDP2, except that it is applied on different parallel modules. Before reading this document, please read [ep_fsdp2.md](./key_features/ep_fsdp2.md). The key requirement:
+The overall design of extra parallelism is similar to EP+FSDP2, except that it is applied on different parallel modules. Before reading this document, please read [ep_fsdp2.md](./ep_fsdp2.md). The key requirement:
 
 * The sharded modules need to be sorted in reverse order from submodules to parent modules to avoid sharding twice, as `fully_shard` is applied from bottom to top.
 

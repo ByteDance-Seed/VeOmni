@@ -47,12 +47,14 @@ Intentionally NOT patched:
   untouched) plus an interleaved ``repeat_interleave(2)`` cos/sin layout
   that ``liger_rotary_pos_emb`` does not implement. SKILL.md flags this
   exact case (partial_rotary -> liger NaN).
-- ``DeepseekV4Attention.forward`` — V4 ships eager-only
+- ``DeepseekV4Attention.forward`` — V4 attention is eager-only
   (``_supports_flash_attn = False`` / ``_supports_sdpa = False`` /
   ``_supports_flex_attn = False``: ``head_dim=512`` exceeds FlashAttention's
   256 cap, SDPA lacks the per-head learnable sink, and FlexAttention can't
-  resize BlockMask after the in-block compressor concatenation). Sequence
-  parallel for V4 attention is out of scope for this patchgen pass and
+  resize BlockMask after the in-block compressor concatenation). MoE does not
+  share this limitation: the experts patch above binds VeOmni fused MoE by
+  default on GPU.
+  Sequence parallel for V4 attention is out of scope for this patchgen pass and
   needs a dedicated eager-SP path before the model can train under SP.
 - ``DeepseekV4Model.forward`` — top-level ``hidden_states`` is *4D*
   (``[B, S, hc_mult, D]`` for the manifold-constrained Hyper-Connection
@@ -127,7 +129,8 @@ config.add_post_import_block(
 #    MoE kernel.
 # 2. OpSlot guard for fused-MoE: when ``veomni_moe_experts_forward`` is
 #    bound to a non-eager kernel, call ``fused_moe_forward`` with stacked
-#    ``gate_up_proj``. Otherwise fall through to the eager loop.
+#    ``gate_up_proj`` and pass ``swiglu_limit`` explicitly. Otherwise fall
+#    through to the eager loop.
 # 3. Preserve V4's gpt-oss-style ``swiglu_limit`` clamp on gate / up
 #    pre-activations (paper §2.1 — required for V4's training stability).
 # Layout matches v5 upstream (direct, no transpose):
@@ -169,6 +172,7 @@ class PatchedDeepseekV4Experts(nn.Module):
                 fc1_2_weight=None,
                 fc2_weight=self.down_proj,
                 fc1_1_2_weight=self.gate_up_proj,
+                swiglu_limit=self.limit,
             )
         # --- Patch.2 ---
 

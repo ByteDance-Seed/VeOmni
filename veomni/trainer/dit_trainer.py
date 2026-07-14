@@ -178,6 +178,10 @@ class DiTTrainer:
     offline_embedding_saver: OfflineEmbeddingSaver = None
 
     def __init__(self, args: VeOmniDiTArguments):
+        if args.train.channel_loss.enable:
+            raise ValueError(
+                "train.channel_loss is only supported by causal-LM trainers; DiTTrainer uses diffusion objectives."
+            )
         self.base = BaseTrainer.__new__(BaseTrainer)
         self.base.args = args
 
