@@ -115,11 +115,12 @@ class _OmniModulePayloadMixin:
     def _extra_state(self, state: "TrainerState") -> Dict[str, Any]:
         # Per-model only — the global step / dataloader / environ-meter / rng are
         # saved once by OmniGlobalStateCallback on the orchestrator.
-        return {"lr_scheduler": self.trainer.lr_scheduler.state_dict()}
+        lr_scheduler = self.trainer.lr_scheduler
+        return {"lr_scheduler": None if lr_scheduler is None else lr_scheduler.state_dict()}
 
     def _load_extra_state(self, extra_state: Dict[str, Any]) -> None:
         lr_sd = extra_state.get("lr_scheduler")
-        if lr_sd is not None:
+        if lr_sd is not None and self.trainer.lr_scheduler is not None:
             self.trainer.lr_scheduler.load_state_dict(lr_sd)
 
     def _offline_cache_model(self) -> Optional[OfflineEncodingMixin]:
@@ -397,12 +398,25 @@ class OmniModuleTrainer:
 
     # ── Optimizer / lr-scheduler (built here; the orchestrator only calls) ─────
 
+    def _has_trainable_parameters(self) -> bool:
+        return any(param.requires_grad for param in self.base.model.parameters())
+
     def _build_optimizer(self):
         """Build this module's optimizer over its still-trainable params."""
+        if not self._has_trainable_parameters():
+            self.base.optimizer = None
+            logger.info_rank0(
+                f"OmniModuleTrainer '{type(_unwrap_module(self.base.model)).__name__}': "
+                "skipping optimizer build because the module has no trainable parameters."
+            )
+            return
         self.base._build_optimizer()
 
     def _build_lr_scheduler(self):
         """Build this module's lr-scheduler (needs ``base.args.train_steps`` set)."""
+        if self.base.optimizer is None:
+            self.base.lr_scheduler = None
+            return
         self.base._build_lr_scheduler()
 
     # ── Metric metering ────────────────────────────────────────────────────────

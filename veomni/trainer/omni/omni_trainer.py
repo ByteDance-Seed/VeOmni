@@ -420,7 +420,11 @@ class OmniTrainer:
         for name, module_trainer in self.module_trainers.items():
             with use_parallel_state(module_trainer.parallel_state):
                 module_trainer._build_optimizer()
+            if module_trainer.base.optimizer is None:
+                continue
             self.optimizers[name] = module_trainer.base.optimizer
+        if not self.optimizers:
+            raise ValueError("OmniTrainer found no trainable module optimizers to build.")
         base.optimizer = MultiOptimizer(self.optimizers)
         logger.info_rank0(f"OmniTrainer: built {len(self.optimizers)} optimizer(s): {list(self.optimizers)}.")
 
@@ -434,8 +438,12 @@ class OmniTrainer:
         base = self.base
         self.lr_schedulers: Dict[str, Any] = {}
         for name, module_trainer in self.module_trainers.items():
+            if module_trainer.base.optimizer is None:
+                continue
             module_trainer.base.args._train_steps = base.args._train_steps
             module_trainer._build_lr_scheduler()
+            if module_trainer.base.lr_scheduler is None:
+                continue
             self.lr_schedulers[name] = module_trainer.base.lr_scheduler
         base.lr_scheduler = MultiLRScheduler(self.lr_schedulers)
 
