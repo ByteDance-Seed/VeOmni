@@ -254,7 +254,7 @@ class OmniEnvironMeterCallback(Callback):
     """
 
     def __init__(self, trainer: "OmniTrainer") -> None:
-        self.trainer = trainer
+        super().__init__(trainer)
         base = trainer.base
         args: "VeOmniArguments" = base.args
         base.environ_meter = OmniEnvironMeter(

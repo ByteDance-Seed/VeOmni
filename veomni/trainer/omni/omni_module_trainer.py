@@ -115,12 +115,14 @@ class _OmniModulePayloadMixin:
     def _extra_state(self, state: "TrainerState") -> Dict[str, Any]:
         # Per-model only — the global step / dataloader / environ-meter / rng are
         # saved once by OmniGlobalStateCallback on the orchestrator.
-        return {"lr_scheduler": self.trainer.lr_scheduler.state_dict()}
+        lr_scheduler = getattr(self.trainer, "lr_scheduler", None)
+        return {"lr_scheduler": None if lr_scheduler is None else lr_scheduler.state_dict()}
 
     def _load_extra_state(self, extra_state: Dict[str, Any]) -> None:
         lr_sd = extra_state.get("lr_scheduler")
-        if lr_sd is not None:
-            self.trainer.lr_scheduler.load_state_dict(lr_sd)
+        lr_scheduler = getattr(self.trainer, "lr_scheduler", None)
+        if lr_sd is not None and lr_scheduler is not None:
+            lr_scheduler.load_state_dict(lr_sd)
 
     def _offline_cache_model(self) -> Optional[OfflineEncodingMixin]:
         model = _unwrap_module(self.trainer.model)
@@ -240,6 +242,7 @@ class OmniModuleTrainer:
 
     base: BaseTrainer
     parallel_state: "ParallelState"
+    _has_trainable_parameters: bool = None
 
     def __init__(
         self,
@@ -322,12 +325,17 @@ class OmniModuleTrainer:
         path. Called within this module's ``use_parallel_state`` scope so the
         FSDP2/DDP wrap reads this module's mesh via ``get_parallel_state()``.
         """
-        customized_builder = getattr(self.base.model, "customized_build_parallelize_model", None)
-        if callable(customized_builder):
-            self.base.model = customized_builder(
-                weights_path=self.base.args.model.model_path,
-                args=self.base.args,
-            )
+        customized_builder = getattr(
+            self.base.model,
+            "customized_build_parallelize_model",
+            lambda **kwargs: None,
+        )
+        customized_model = customized_builder(
+            weights_path=self.base.args.model.model_path,
+            args=self.base.args,
+        )
+        if customized_model is not None:
+            self.base.model = customized_model
         else:
             self.base._build_parallelized_model()  # FSDP2 wrap + per-module weight load
 
@@ -391,6 +399,12 @@ class OmniModuleTrainer:
         )
 
     # ── Optimizer / lr-scheduler (built here; the orchestrator only calls) ─────
+
+    @property
+    def has_trainable_parameters(self) -> bool:
+        if self._has_trainable_parameters is None:
+            self._has_trainable_parameters = any(param.requires_grad for param in self.base.model.parameters())
+        return self._has_trainable_parameters
 
     def _build_optimizer(self):
         """Build this module's optimizer over its still-trainable params."""
