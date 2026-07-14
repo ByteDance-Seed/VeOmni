@@ -64,6 +64,7 @@ Training loop, optimizer, parallelism, checkpointing, profiling, and logging.
     * `OptimizerConfig` — `train.optimizer.*`
     * `WandbConfig` — `train.wandb.*`
     * `ProfileConfig` — `train.profile.*`
+    * `ChannelLossConfig` — `train.channel_loss.*`
     * `GradientCheckpointingConfig` — `train.gradient_checkpointing.*`
     * `AcceleratorConfig` — `train.accelerator.*`
         * `FSDPConfig` — `train.accelerator.fsdp_config.*`
@@ -239,6 +240,7 @@ NPU validation runs at two times:
 | optimizer | `OptimizerConfig` | — | Optimizer and learning-rate schedule. |
 | wandb | `WandbConfig` | — | Weights & Biases logging. |
 | profile | `ProfileConfig` | — | Torch profiler settings. |
+| channel_loss | `ChannelLossConfig` | — | Detached per-channel causal-LM loss logging. |
 | gradient_checkpointing | `GradientCheckpointingConfig` | — | Gradient checkpointing settings. |
 | torch_compile | `TorchCompileConfig` | — | Per-block `torch.compile` settings. |
 | accelerator | `AcceleratorConfig` | — | Parallelism and distributed-training topology. |
@@ -309,6 +311,40 @@ NPU validation runs at two times:
 | with_stack | `bool` | `True` | Record stack traces. |
 | with_modules | `bool` | `False` | Record module hierarchy in profiler traces. |
 | rank0_only | `bool` | `True` | Profile rank 0 only. |
+
+### ChannelLossConfig
+
+`train.channel_loss.*` — Detached per-channel causal-LM loss logging.
+
+This is an observability-only side channel. It computes detached per-token CE
+from the model loss inputs, aggregates by packed-sequence source metadata, and
+adds metrics such as `channel_loss/<source-id>__<source>` to the normal step metrics. It does
+not change the returned training loss or gradients. Fused-loss backends may
+recompute the LM-head projection on sampled steps, so the default interval is
+10 steps; set `interval=1` for per-step metrics. DiT trainers and
+`data.data_type="classification"` are not supported because they do not optimize
+a causal-LM objective. SeedOmni's `Qwen3MoeFoundationModel` is also unsupported
+because its legacy forward bypasses the observable loss dispatch. `BaseRLTrainer`
+is unsupported because it packs source alignment metadata after the common step
+lifecycle. In DPO training, only the policy-model forward is observed; the
+reference-model forward is excluded, and the chosen/rejected segments both use
+their preference pair's source metadata. If distinct source names sanitize to
+the same metric key, the stable source-ID prefix keeps their time series
+distinct from the first emission.
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| enable | `bool` | `False` | Enable channel loss logging. |
+| interval | `int` | `10` | Compute and log channel loss every N optimizer steps. |
+| source_id_keys | `List[str]` | `["channel_id", "source_id", "dataset_id", "ds_idx"]` | Batch metadata keys to read as channel/source IDs. |
+| source_name_keys | `List[str]` | `["channel_name", "source_name", "dataset_name", "data_name"]` | Batch metadata keys to read as display names. |
+| extra_strip_keys | `List[str]` | `["cur_token_num"]` | Extra metadata keys removed before model forward. |
+| loss_metric_prefix | `str` | `"channel_loss"` | Prefix for average CE metrics. |
+| weighted_loss_metric_prefix | `str` | `"channel_loss_weighted"` | Prefix for loss-sum divided by all logged step tokens. |
+| token_count_metric_prefix | `str` | `"channel_tokens"` | Prefix for supervised token-count metrics. |
+| log_weighted_loss | `bool` | `True` | Log weighted loss metrics. |
+| log_token_count | `bool` | `True` | Log token-count metrics. |
+| strict | `bool` | `False` | Raise when source metadata is missing or cannot be aligned with packed segments; otherwise skip invalid batches. |
 
 ### GradientCheckpointingConfig
 

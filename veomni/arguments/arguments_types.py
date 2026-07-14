@@ -32,6 +32,7 @@ logger = logging.get_logger(__name__)
 #   ├── optimizer.*          → OptimizerConfig
 #   ├── wandb.*              → WandbConfig
 #   ├── profile.*            → ProfileConfig
+#   ├── channel_loss.*       → ChannelLossConfig
 #   ├── gradient_checkpointing.*  → GradientCheckpointingConfig
 #   ├── accelerator.*        → AcceleratorConfig
 #   │   ├── fsdp_config.*    → FSDPConfig
@@ -214,6 +215,91 @@ class ProfileConfig:
             "help": "whether to profile rank0 only. When false, every rank will be profiled; Please expect many files to save, which can be slow and take a lot of disk space."
         },
     )
+
+
+@dataclass
+class ChannelLossConfig:
+    """train.channel_loss.* — Per-channel causal-LM loss logging."""
+
+    enable: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Enable detached per-channel cross-entropy logging. This is an observability-only "
+                "side channel and does not change the training objective."
+            )
+        },
+    )
+    interval: int = field(
+        default=10,
+        metadata={
+            "help": (
+                "Compute and log channel loss every N optimizer steps. The detached fused-loss "
+                "fallback recomputes the LM-head projection on sampled steps; use 1 to sample every step."
+            )
+        },
+    )
+    source_id_keys: List[str] = field(
+        default_factory=lambda: ["channel_id", "source_id", "dataset_id", "ds_idx"],
+        metadata={
+            "help": (
+                "Batch metadata keys to read as channel/source IDs. The first key found in each "
+                "micro-batch is used. Values should be one per packed sequence."
+            )
+        },
+    )
+    source_name_keys: List[str] = field(
+        default_factory=lambda: ["channel_name", "source_name", "dataset_name", "data_name"],
+        metadata={
+            "help": (
+                "Batch metadata keys to read as display names for channel/source IDs. Values should "
+                "align with source_id_keys when provided."
+            )
+        },
+    )
+    extra_strip_keys: List[str] = field(
+        default_factory=lambda: ["cur_token_num"],
+        metadata={
+            "help": (
+                "Extra metadata keys to remove from each micro-batch before model forward when "
+                "channel loss is enabled."
+            )
+        },
+    )
+    loss_metric_prefix: str = field(
+        default="channel_loss",
+        metadata={"help": "Metric prefix for per-channel average CE."},
+    )
+    weighted_loss_metric_prefix: str = field(
+        default="channel_loss_weighted",
+        metadata={"help": "Metric prefix for per-channel CE weighted by all logged tokens in the step."},
+    )
+    token_count_metric_prefix: str = field(
+        default="channel_tokens",
+        metadata={"help": "Metric prefix for per-channel supervised token counts."},
+    )
+    log_weighted_loss: bool = field(
+        default=True,
+        metadata={"help": "Log loss_sum / total_step_tokens for each channel."},
+    )
+    log_token_count: bool = field(
+        default=True,
+        metadata={"help": "Log supervised token count for each channel."},
+    )
+    strict: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Raise when enabled but a micro-batch has no configured source ID, or when "
+                "source metadata cannot be aligned with packed segments. Default False skips "
+                "micro-batches with missing or mismatched metadata."
+            )
+        },
+    )
+
+    def __post_init__(self) -> None:
+        if self.interval < 1:
+            raise ValueError("train.channel_loss.interval must be at least 1.")
 
 
 @dataclass
@@ -605,6 +691,7 @@ class TrainingArguments:
     optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
     wandb: WandbConfig = field(default_factory=WandbConfig)
     profile: ProfileConfig = field(default_factory=ProfileConfig)
+    channel_loss: ChannelLossConfig = field(default_factory=ChannelLossConfig)
     gradient_checkpointing: GradientCheckpointingConfig = field(default_factory=GradientCheckpointingConfig)
     torch_compile: TorchCompileConfig = field(default_factory=TorchCompileConfig)
     accelerator: AcceleratorConfig = field(default_factory=AcceleratorConfig)
