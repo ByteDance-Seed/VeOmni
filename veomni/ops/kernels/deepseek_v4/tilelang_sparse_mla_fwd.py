@@ -39,9 +39,13 @@ def sparse_mqa_fwd(
     topk,
     sm_scale=None,
     block_I=64,
-    num_stages=2,
+    num_stages=0,
     threads=256,
 ):
+    # The bounds-safe indirect gather depends on per-iteration register indices.
+    # TileLang 0.1.9 cannot legally software-pipeline that dependency, so keep
+    # this loop unpipelined (num_stages=0).
+    assert num_stages == 0, "bounds-safe sparse gathers do not support software pipelining"
     assert dim == tilelang.math.next_power_of_2(dim), f"dim must be power of 2, got {dim}"
     assert topk % block_I == 0, f"topk ({topk}) must be divisible by block_I ({block_I})"
     if sm_scale is None:
@@ -169,7 +173,7 @@ def sparse_mqa_fwd(
     return main
 
 
-def sparse_mqa_fwd_interface(q, kv, attn_sink, topk_idxs, sm_scale=None, block_I=64, num_stages=2, threads=256):
+def sparse_mqa_fwd_interface(q, kv, attn_sink, topk_idxs, sm_scale=None, block_I=64, num_stages=0, threads=256):
     """Forward interface for V4 sparse MQA attention.
 
     Args:

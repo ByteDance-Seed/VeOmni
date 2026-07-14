@@ -113,6 +113,9 @@ from veomni.utils.model_outputs import MoeCausalLMOutputWithLogProbs
 veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
 veomni_moe_experts_forward = OpSlot("moe_experts", "standard")
 veomni_load_balancing_loss = OpSlot("load_balancing_loss", "standard")
+veomni_mhc_pre = OpSlot("mhc", "pre")
+veomni_mhc_post = OpSlot("mhc", "post")
+veomni_mhc_head = OpSlot("mhc", "head")
 veomni_dsa_indexer_backend = OpsConfigSlot("dsa_indexer_backend")
 veomni_dsa_attention_backend = OpsConfigSlot("dsa_attention_backend")
 
@@ -157,10 +160,104 @@ config.add_post_import_block(
     veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
     veomni_moe_experts_forward = OpSlot("moe_experts", "standard")
     veomni_load_balancing_loss = OpSlot("load_balancing_loss", "standard")
+    veomni_mhc_pre = OpSlot("mhc", "pre")
+    veomni_mhc_post = OpSlot("mhc", "post")
+    veomni_mhc_head = OpSlot("mhc", "head")
     veomni_dsa_indexer_backend = OpsConfigSlot("dsa_indexer_backend")
     veomni_dsa_attention_backend = OpsConfigSlot("dsa_attention_backend")
     """
 )
+
+
+# ================================================================
+# Patch: TileKernels mHC dispatch
+# ================================================================
+@config.override_method(
+    "DeepseekV4HyperConnection.forward",
+    description="Dispatch DeepSeek V4 mHC pre/Sinkhorn/collapse through an OpSlot",
+)
+def deepseek_v4_hyper_connection_forward_patched(
+    self,
+    hidden_streams: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if veomni_mhc_pre.use_non_eager_impl:
+        return veomni_mhc_pre(
+            hidden_streams,
+            self.fn,
+            self.scale,
+            self.base,
+            self.input_norm.eps,
+            self.hc_mult,
+            self.hc_sinkhorn_iters,
+            self.hc_eps,
+        )
+
+    hc = self.hc_mult
+    flat = self.input_norm(hidden_streams.flatten(start_dim=2).float())
+    pre_w, post_w, comb_w = F.linear(flat, self.fn.float()).split([hc, hc, hc * hc], dim=-1)
+    pre_b, post_b, comb_b = self.base.split([hc, hc, hc * hc])
+    pre_scale, post_scale, comb_scale = self.scale.unbind(0)
+    pre = torch.sigmoid(pre_w * pre_scale + pre_b) + self.hc_eps
+    post = 2 * torch.sigmoid(post_w * post_scale + post_b)
+    comb_logits = comb_w.view(*comb_w.shape[:-1], hc, hc) * comb_scale + comb_b.view(hc, hc)
+    comb = torch.softmax(comb_logits, dim=-1) + self.hc_eps
+    comb = comb / (comb.sum(dim=-2, keepdim=True) + self.hc_eps)
+    for _ in range(self.hc_sinkhorn_iters - 1):
+        comb = comb / (comb.sum(dim=-1, keepdim=True) + self.hc_eps)
+        comb = comb / (comb.sum(dim=-2, keepdim=True) + self.hc_eps)
+    collapsed = (pre.unsqueeze(-1) * hidden_streams).sum(dim=2).to(hidden_streams.dtype)
+    return post, comb, collapsed
+
+
+@config.override_method(
+    "DeepseekV4HyperHead.forward",
+    description="Dispatch the final DeepSeek V4 mHC collapse through an OpSlot",
+)
+def deepseek_v4_hyper_head_forward_patched(self, x: torch.Tensor) -> torch.Tensor:
+    if veomni_mhc_head.use_non_eager_impl:
+        return veomni_mhc_head(
+            x,
+            self.hc_fn,
+            self.hc_scale,
+            self.hc_base,
+            self.input_norm.eps,
+            self.hc_mult,
+            self.eps,
+        )
+
+    flat = self.input_norm(x.flatten(2).float())
+    mixes = F.linear(flat, self.hc_fn.float())
+    pre = torch.sigmoid(mixes * self.hc_scale.float() + self.hc_base.float()) + self.eps
+    return (pre.unsqueeze(-1) * x).sum(dim=2).to(x.dtype)
+
+
+@config.override_method(
+    "DeepseekV4DecoderLayer.forward",
+    description="Dispatch DeepSeek V4 mHC residual post-mixing through an OpSlot",
+)
+def deepseek_v4_decoder_layer_forward_patched(
+    self,
+    hidden_states: torch.Tensor,
+    input_ids: torch.Tensor | None = None,
+    **kwargs: Unpack[TransformersKwargs],
+) -> torch.Tensor:
+    dtype = hidden_states.dtype
+    post, comb, collapsed = self.attn_hc(hidden_states)
+    attn_output, _ = self.self_attn(self.input_layernorm(collapsed), **kwargs)
+    if veomni_mhc_post.use_non_eager_impl:
+        hidden_states = veomni_mhc_post(attn_output, hidden_states, post, comb)
+    else:
+        hidden_states = post.to(dtype).unsqueeze(-1) * attn_output.unsqueeze(-2) + torch.matmul(
+            comb.to(dtype).transpose(-1, -2), hidden_states
+        )
+
+    post, comb, collapsed = self.ffn_hc(hidden_states)
+    mlp_output = self.mlp(self.post_attention_layernorm(collapsed), input_ids=input_ids)
+    if veomni_mhc_post.use_non_eager_impl:
+        return veomni_mhc_post(mlp_output, hidden_states, post, comb)
+    return post.to(dtype).unsqueeze(-1) * mlp_output.unsqueeze(-2) + torch.matmul(
+        comb.to(dtype).transpose(-1, -2), hidden_states
+    )
 
 
 # ================================================================

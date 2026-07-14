@@ -1,7 +1,8 @@
 # Kernel Selection in VeOmni
 
-VeOmni selects optimized kernel implementations for attention, cross-entropy
-loss, Liger fused ops (RMSNorm, RoPE, SwiGLU), MoE, and load-balancing loss.
+VeOmni selects optimized kernel implementations for attention, mHC,
+cross-entropy loss, Liger fused ops (RMSNorm, RoPE, SwiGLU), MoE, and
+load-balancing loss.
 All selections are driven by config fields in `OpsImplementationConfig`.
 
 ## Quick Reference
@@ -16,6 +17,7 @@ selection knob.
 | Attention | `attn_implementation` | `eager`, `sdpa`, `flash_attention_2`, `flash_attention_3`, `flash_attention_4`, `native-sparse` | `"flash_attention_2"` | Config `__post_init__` + `build_foundation_model` |
 | DSA indexer | `dsa_indexer_backend` | `eager`, `cudnn` (GLM-DSA), `tilelang` (DeepSeek-V4) | `"eager"` | Model build via `OpsConfigSlot` |
 | DSA attention | `dsa_attention_backend` | `eager`, `flashmla_cudnn` (GLM-DSA), `tilelang_sparse` (DeepSeek-V4) | `"eager"` | Model build via `OpsConfigSlot` |
+| mHC | `mhc_backend` | `eager`, `tile_kernels` (DeepSeek-V4, SM90+) | `"eager"` | Model build via three `OpSlot`s (`pre`, `post`, `head`) |
 | Cross-entropy loss | `cross_entropy_loss_implementation` | `eager`, `liger_kernel`, `chunk_loss`, `npu` | `"liger_kernel"` (GPU) | `apply_ops_config()` (before model build) |
 | RMSNorm | `rms_norm_implementation` | `eager`, `liger_kernel`, `npu`, `triton` (per-model; DeepSeek-V3) | `"liger_kernel"` (GPU) | Model registration via ops config singleton |
 | SwiGLU MLP | `swiglu_mlp_implementation` | `eager`, `liger_kernel` | `"liger_kernel"` (GPU) | Model registration via ops config singleton |
@@ -63,6 +65,7 @@ model.forward()                               # (4) runtime
   ├─ loss: self.loss_function(...) -> LOSS_MAPPING[...] (pre-bound partial)
   │         OR veomni_causal_lm_loss(...) via OpSlot.use_non_eager_impl guard
   ├─ RMSNorm/RoPE/SwiGLU: Liger or HF default (set at registration)
+  ├─ mHC: TileKernels pre/post/head or original Transformers implementation
   └─ MoE: fused_moe_forward(...) or eager loop
 ```
 
@@ -121,6 +124,26 @@ with DeepSpeed Ulysses sequence parallelism gather/scatter.
 - Config: `veomni/arguments/arguments_types.py` — `OpsImplementationConfig`
 - Registration: `veomni/ops/kernels/attention/__init__.py` — `apply_veomni_attention_patch()`
 - Plumbing: `veomni/models/auto.py` — `build_foundation_model(attn_implementation=...)`
+
+### DeepSeek V4 DSA and mHC
+
+DeepSeek V4 exposes three independent model-specific selections. The TileLang
+indexer and sparse attention backends support packed dynamic batches; the
+TileKernels mHC backend replaces the pre/Sinkhorn/collapse, residual post-mix,
+and final head collapse through registry-backed `OpSlot`s:
+
+```yaml
+model:
+  ops_implementation:
+    dsa_indexer_backend: tilelang
+    dsa_attention_backend: tilelang_sparse
+    mhc_backend: tile_kernels
+```
+
+All three optimized paths require NVIDIA SM90 or later. `mhc_backend` defaults
+to `eager` and never silently falls back after `tile_kernels` is selected.
+TileKernels' training path supports forward and backward with BF16 activations
+and DeepSeek V4's `hc_mult=4` layout.
 
 ---
 

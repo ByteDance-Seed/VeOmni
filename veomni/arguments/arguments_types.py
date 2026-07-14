@@ -938,6 +938,13 @@ class OpsImplementationConfig:
         default="eager",
         metadata={"help": "DeepSeek sparse attention backend: 'eager', 'flashmla_cudnn', or 'tilelang_sparse'."},
     )
+    mhc_backend: Literal["eager", "tile_kernels"] = field(
+        default="eager",
+        metadata={
+            "help": "Manifold-constrained Hyper-Connection backend. 'tile_kernels' enables the "
+            "DeepSeek V4 TileKernels forward/backward path on NVIDIA SM90+; 'eager' uses PyTorch."
+        },
+    )
 
     def __post_init__(self):
         if get_env("MODELING_BACKEND") == "veomni":

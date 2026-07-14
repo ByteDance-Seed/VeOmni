@@ -9,6 +9,12 @@
 #  It contains a patched version of the original HuggingFace modeling code.
 #
 #  Patches applied:
+#    - method_override: DeepseekV4HyperConnection.forward
+#      Dispatch DeepSeek V4 mHC pre/Sinkhorn/collapse through an OpSlot
+#    - method_override: DeepseekV4HyperHead.forward
+#      Dispatch the final DeepSeek V4 mHC collapse through an OpSlot
+#    - method_override: DeepseekV4DecoderLayer.forward
+#      Dispatch DeepSeek V4 mHC residual post-mixing through an OpSlot
 #    - method_override: DeepseekV4HCACompressor.forward
 #      Keep HCA compression local to packed sequences
 #    - method_override: DeepseekV4CSACompressor.forward
@@ -71,6 +77,9 @@ from veomni.utils.model_outputs import MoeCausalLMOutputWithLogProbs
 veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
 veomni_moe_experts_forward = OpSlot("moe_experts", "standard")
 veomni_load_balancing_loss = OpSlot("load_balancing_loss", "standard")
+veomni_mhc_pre = OpSlot("mhc", "pre")
+veomni_mhc_post = OpSlot("mhc", "post")
+veomni_mhc_head = OpSlot("mhc", "head")
 veomni_dsa_indexer_backend = OpsConfigSlot("dsa_indexer_backend")
 veomni_dsa_attention_backend = OpsConfigSlot("dsa_attention_backend")
 
@@ -1075,6 +1084,12 @@ class DeepseekV4Attention(nn.Module):
         return output, attn_weights
 
 
+# ======================================================================
+# [MODIFIED CLASS] DeepseekV4HyperConnection
+# Methods patched: forward
+# ======================================================================
+
+
 class DeepseekV4HyperConnection(nn.Module):
     r"""
     Manifold-Constrained Hyper-Connections
@@ -1123,22 +1138,30 @@ class DeepseekV4HyperConnection(nn.Module):
         # doubly-stochastic manifold). Each output gets its own learned scale.
         self.scale = nn.Parameter(torch.empty(3))
 
-    def forward(self, hidden_streams: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        r"""
-        Compute `pre`, `post`, `comb` from the mHC mapping (paper §2.2 eq. 8).
-        `comb` is projected onto the doubly-stochastic manifold via Sinkhorn-
-        Knopp: starting from the sigmoid-positive matrix, alternate row and
-        column normalisation for `hc_sinkhorn_iters` steps. `pre` then collapses
-        the `hc_mult` parallel streams into a single sequence (input projection
-        into the sublayer); `post` and `comb` are returned for the caller to
-        apply on the sublayer output.
-        """
+    # ================================================================
+    # Patch: TileKernels mHC dispatch
+    # ================================================================
+    def forward(
+        self,
+        hidden_streams: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if veomni_mhc_pre.use_non_eager_impl:
+            return veomni_mhc_pre(
+                hidden_streams,
+                self.fn,
+                self.scale,
+                self.base,
+                self.input_norm.eps,
+                self.hc_mult,
+                self.hc_sinkhorn_iters,
+                self.hc_eps,
+            )
+
         hc = self.hc_mult
         flat = self.input_norm(hidden_streams.flatten(start_dim=2).float())
         pre_w, post_w, comb_w = F.linear(flat, self.fn.float()).split([hc, hc, hc * hc], dim=-1)
         pre_b, post_b, comb_b = self.base.split([hc, hc, hc * hc])
         pre_scale, post_scale, comb_scale = self.scale.unbind(0)
-
         pre = torch.sigmoid(pre_w * pre_scale + pre_b) + self.hc_eps
         post = 2 * torch.sigmoid(post_w * post_scale + post_b)
         comb_logits = comb_w.view(*comb_w.shape[:-1], hc, hc) * comb_scale + comb_b.view(hc, hc)
@@ -1147,11 +1170,14 @@ class DeepseekV4HyperConnection(nn.Module):
         for _ in range(self.hc_sinkhorn_iters - 1):
             comb = comb / (comb.sum(dim=-1, keepdim=True) + self.hc_eps)
             comb = comb / (comb.sum(dim=-2, keepdim=True) + self.hc_eps)
-        # Collapse the `hc_mult` parallel streams down to a single sequence using
-        # the `pre` weights: one weighted sum across the stream axis, ready for
-        # the sublayer (attn / MLP).
         collapsed = (pre.unsqueeze(-1) * hidden_streams).sum(dim=2).to(hidden_streams.dtype)
         return post, comb, collapsed
+
+
+# ======================================================================
+# [MODIFIED CLASS] DeepseekV4HyperHead
+# Methods patched: forward
+# ======================================================================
 
 
 class DeepseekV4HyperHead(nn.Module):
@@ -1167,6 +1193,17 @@ class DeepseekV4HyperHead(nn.Module):
         self.hc_scale = nn.Parameter(torch.empty(1))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if veomni_mhc_head.use_non_eager_impl:
+            return veomni_mhc_head(
+                x,
+                self.hc_fn,
+                self.hc_scale,
+                self.hc_base,
+                self.input_norm.eps,
+                self.hc_mult,
+                self.eps,
+            )
+
         flat = self.input_norm(x.flatten(2).float())
         mixes = F.linear(flat, self.hc_fn.float())
         pre = torch.sigmoid(mixes * self.hc_scale.float() + self.hc_base.float()) + self.eps
@@ -1348,6 +1385,12 @@ class DeepseekV4SparseMoeBlock(nn.Module):
         return routed + self.shared_experts(residual)
 
 
+# ======================================================================
+# [MODIFIED CLASS] DeepseekV4DecoderLayer
+# Methods patched: forward
+# ======================================================================
+
+
 class DeepseekV4DecoderLayer(GradientCheckpointingLayer):
     r"""DeepSeek-V4 decoder block (paper §2). Differs from a classic residual block in
     two places:
@@ -1378,22 +1421,20 @@ class DeepseekV4DecoderLayer(GradientCheckpointingLayer):
         input_ids: torch.Tensor | None = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> torch.Tensor:
-        # hidden_states throughout: [B, S, hc_mult, hidden].
-        # `post` / `comb` come out of the HC modules in fp32 (Sinkhorn projection runs
-        # in float); the .to(dtype) puts everything back to the input dtype before mixing
-        # so both sites stay consistent with `hidden_states`'s entry dtype.
-        # comb is consumed transposed: indexed as sum_j comb[j, k] * residual[j, d]
-        # (sum over the FIRST hc axis), equivalent to comb.T @ residual. Sinkhorn
-        # produces a doubly-stochastic but non-symmetric matrix, so the direction matters.
         dtype = hidden_states.dtype
         post, comb, collapsed = self.attn_hc(hidden_states)
         attn_output, _ = self.self_attn(self.input_layernorm(collapsed), **kwargs)
-        hidden_states = post.to(dtype).unsqueeze(-1) * attn_output.unsqueeze(-2) + torch.matmul(
-            comb.to(dtype).transpose(-1, -2), hidden_states
-        )
+        if veomni_mhc_post.use_non_eager_impl:
+            hidden_states = veomni_mhc_post(attn_output, hidden_states, post, comb)
+        else:
+            hidden_states = post.to(dtype).unsqueeze(-1) * attn_output.unsqueeze(-2) + torch.matmul(
+                comb.to(dtype).transpose(-1, -2), hidden_states
+            )
 
         post, comb, collapsed = self.ffn_hc(hidden_states)
         mlp_output = self.mlp(self.post_attention_layernorm(collapsed), input_ids=input_ids)
+        if veomni_mhc_post.use_non_eager_impl:
+            return veomni_mhc_post(mlp_output, hidden_states, post, comb)
         return post.to(dtype).unsqueeze(-1) * mlp_output.unsqueeze(-2) + torch.matmul(
             comb.to(dtype).transpose(-1, -2), hidden_states
         )
