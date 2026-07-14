@@ -106,9 +106,9 @@ class TextTrainer:
         data_iterator: Any,
     ) -> Dict[str, float]:
         args: VeOmniArguments = self.base.args
-        self.base.state.global_step += 1
 
         micro_batches: List[Dict[str, Any]] = next(data_iterator)
+        self.base.state.global_step += 1
 
         self.on_step_begin(micro_batches=micro_batches)
 

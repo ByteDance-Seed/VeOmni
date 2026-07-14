@@ -39,6 +39,7 @@ class CheckpointerCallback(Callback):
         self.every_n_steps = args.train.checkpoint.save_steps
         self.every_n_epochs = args.train.checkpoint.save_epochs
         self._last_saved_step: int = -1
+        self._epoch_start_global_step: int = 0
         self.trainer.checkpointer: CheckpointerBase = build_checkpointer(
             dist_backend=args.train.accelerator.fsdp_config.fsdp_mode, ckpt_manager=args.train.checkpoint.manager
         )
@@ -47,7 +48,22 @@ class CheckpointerCallback(Callback):
         if self.every_n_steps and state.global_step % self.every_n_steps == 0:
             self._save_checkpoint(state)
 
+    def on_epoch_begin(self, state: TrainerState, **kwargs) -> None:
+        self._epoch_start_global_step = state.global_step
+
+    def _epoch_had_no_training(self, state: TrainerState, kind: str) -> bool:
+        """Return True if global_step did not advance this epoch (logs the skip)."""
+        if state.global_step <= self._epoch_start_global_step:
+            logger.info_rank0(
+                f"Skipping {kind} checkpoint save at epoch_end (epoch {state.epoch}: no training "
+                f"step ran, global_step still {state.global_step})."
+            )
+            return True
+        return False
+
     def on_epoch_end(self, state: TrainerState, **kwargs):
+        if self._epoch_had_no_training(state, kind="DCP"):
+            return
         if self.every_n_epochs and (state.epoch + 1) % self.every_n_epochs == 0:
             if state.global_step != self._last_saved_step:
                 self._save_checkpoint(state)
@@ -184,6 +200,8 @@ class HuggingfaceCkptCallback(CheckpointerCallback):
             self._save_checkpoint(state)
 
     def on_epoch_end(self, state: TrainerState, **kwargs):
+        if self._epoch_had_no_training(state, kind="HF"):
+            return
         if self.save_hf_weights and self.every_n_epochs and (state.epoch + 1) % self.every_n_epochs == 0:
             if state.global_step != self._last_saved_step:
                 self._save_checkpoint(state)

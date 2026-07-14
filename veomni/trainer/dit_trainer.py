@@ -477,9 +477,7 @@ class DiTTrainer:
 
     def train_step(self, data_iterator: Any) -> Dict[str, float]:
         args = self.base.args
-        self.base.state.global_step += 1
 
-        # broadcast micro_batches from sp_rank_0 to all ranks
         if get_parallel_state().sp_enabled:
             if get_parallel_state().sp_rank == 0:
                 micro_batches = next(data_iterator)
@@ -495,6 +493,8 @@ class DiTTrainer:
             micro_batches = obj_list[0]
         else:
             micro_batches = next(data_iterator)
+
+        self.base.state.global_step += 1
 
         self.on_step_begin(micro_batches=micro_batches)
 
