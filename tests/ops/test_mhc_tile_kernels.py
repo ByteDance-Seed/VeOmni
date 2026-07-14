@@ -22,10 +22,11 @@ import torch.nn.functional as F
 
 from veomni.ops.dispatch import OpSlot
 from veomni.ops.kernel_registry import KERNEL_REGISTRY
-from veomni.utils.device import IS_CUDA_AVAILABLE, get_gpu_compute_capability
+from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type, get_gpu_compute_capability
 
 
 _REGISTRY_MODULE = "veomni.ops.kernel_registry"
+DEVICE = get_device_type()
 _MHC_GPU_AVAILABLE = (
     IS_CUDA_AVAILABLE and get_gpu_compute_capability() >= 90 and importlib.util.find_spec("tile_kernels") is not None
 )
@@ -80,10 +81,10 @@ def test_tile_kernels_mhc_pre_post_forward_backward_matches_eager():
     batch, seq_len, hc_mult, hidden = 1, 32, 4, 256
     norm_eps, hc_eps, sinkhorn_iters = 1e-6, 1e-6, 20
     mix = (2 + hc_mult) * hc_mult
-    x = torch.randn(batch, seq_len, hc_mult, hidden, device="cuda", dtype=torch.bfloat16)
-    fn = torch.randn(mix, hc_mult * hidden, device="cuda", dtype=torch.float32) * 0.01
-    scale = torch.randn(3, device="cuda", dtype=torch.float32) * 0.01
-    base = torch.randn(mix, device="cuda", dtype=torch.float32) * 0.01
+    x = torch.randn(batch, seq_len, hc_mult, hidden, device=DEVICE, dtype=torch.bfloat16)
+    fn = torch.randn(mix, hc_mult * hidden, device=DEVICE, dtype=torch.float32) * 0.01
+    scale = torch.randn(3, device=DEVICE, dtype=torch.float32) * 0.01
+    base = torch.randn(mix, device=DEVICE, dtype=torch.float32) * 0.01
 
     with torch.no_grad():
         inference_outputs = mhc_pre_tile_kernels(x, fn, scale, base, norm_eps, hc_mult, sinkhorn_iters, hc_eps)
@@ -121,10 +122,10 @@ def test_tile_kernels_mhc_head_forward_backward_matches_eager():
     torch.manual_seed(23)
     batch, seq_len, hc_mult, hidden = 1, 32, 4, 256
     norm_eps, hc_eps = 1e-6, 1e-6
-    x = torch.randn(batch, seq_len, hc_mult, hidden, device="cuda", dtype=torch.bfloat16)
-    fn = torch.randn(hc_mult, hc_mult * hidden, device="cuda", dtype=torch.float32) * 0.01
-    scale = torch.randn(1, device="cuda", dtype=torch.float32) * 0.01
-    base = torch.randn(hc_mult, device="cuda", dtype=torch.float32) * 0.01
+    x = torch.randn(batch, seq_len, hc_mult, hidden, device=DEVICE, dtype=torch.bfloat16)
+    fn = torch.randn(hc_mult, hc_mult * hidden, device=DEVICE, dtype=torch.float32) * 0.01
+    scale = torch.randn(1, device=DEVICE, dtype=torch.float32) * 0.01
+    base = torch.randn(hc_mult, device=DEVICE, dtype=torch.float32) * 0.01
     kernel_inputs = tuple(_clone_with_grad(tensor) for tensor in (x, fn, scale, base))
     eager_inputs = tuple(_clone_with_grad(tensor) for tensor in (x, fn, scale, base))
 
