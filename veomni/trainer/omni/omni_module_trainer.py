@@ -322,12 +322,17 @@ class OmniModuleTrainer:
         path. Called within this module's ``use_parallel_state`` scope so the
         FSDP2/DDP wrap reads this module's mesh via ``get_parallel_state()``.
         """
-        customized_builder = getattr(self.base.model, "customized_build_parallelize_model", None)
-        if callable(customized_builder):
-            self.base.model = customized_builder(
-                weights_path=self.base.args.model.model_path,
-                args=self.base.args,
-            )
+        customized_builder = getattr(
+            self.base.model,
+            "customized_build_parallelize_model",
+            lambda **kwargs: None,
+        )
+        customized_model = customized_builder(
+            weights_path=self.base.args.model.model_path,
+            args=self.base.args,
+        )
+        if customized_model is not None:
+            self.base.model = customized_model
         else:
             self.base._build_parallelized_model()  # FSDP2 wrap + per-module weight load
 
