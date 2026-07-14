@@ -530,6 +530,12 @@ class BagelQwen2MoTAttention(nn.Module):
         mode: str = "und",
         packed_vae_token_indexes: Optional[torch.Tensor] = None,
         packed_text_indexes: Optional[torch.Tensor] = None,
+        *,
+        cu_seq_lens_q: torch.Tensor,
+        cu_seq_lens_k: torch.Tensor,
+        max_length_q: int,
+        max_length_k: int,
+        total_key_value_tokens: int,
     ) -> tuple[torch.Tensor, Optional[NaiveCache]]:
         is_gen = _check_packed_inference_mode(mode)
         if not is_gen:
@@ -590,7 +596,7 @@ class BagelQwen2MoTAttention(nn.Module):
             past_key_states = past_key_values.key_cache[self.layer_idx]
             past_value_states = past_key_values.value_cache[self.layer_idx]
 
-            seqlens = int(query_lens.sum().item() + key_values_lens.sum().item())
+            seqlens = total_key_value_tokens
             merged_key_states = past_key_states.new_zeros((seqlens, self.num_key_value_heads, self.head_dim))
             merged_value_states = past_key_states.new_zeros((seqlens, self.num_key_value_heads, self.head_dim))
             merged_key_states[packed_query_indexes] = packed_key_states
@@ -603,10 +609,6 @@ class BagelQwen2MoTAttention(nn.Module):
             merged_value_states = packed_value_states
             key_values_lens = query_lens
 
-        cu_seqlens_q = torch.nn.functional.pad(torch.cumsum(query_lens, dim=0), (1, 0))
-        cu_seqlens_k = torch.nn.functional.pad(torch.cumsum(key_values_lens, dim=0), (1, 0))
-        max_seqlen_q = int(query_lens.max().item())
-        max_seqlen_k = int(key_values_lens.max().item())
         if IS_CUDA_AVAILABLE:
             packed_attn_output, _ = flash_attention_forward(
                 self,
@@ -616,10 +618,10 @@ class BagelQwen2MoTAttention(nn.Module):
                 attention_mask=None,
                 dropout=0.0,
                 is_causal=is_causal,
-                cu_seq_lens_q=cu_seqlens_q.to(torch.int32),
-                cu_seq_lens_k=cu_seqlens_k.to(torch.int32),
-                max_length_q=max_seqlen_q,
-                max_length_k=max_seqlen_k,
+                cu_seq_lens_q=cu_seq_lens_q,
+                cu_seq_lens_k=cu_seq_lens_k,
+                max_length_q=max_length_q,
+                max_length_k=max_length_k,
                 # Inference owns its packed KV-cache layout and does not enter the
                 # training-only module Ulysses redistribution.
                 skip_ulysses=True,
@@ -755,6 +757,12 @@ class BagelQwen2MoTDecoderLayer(nn.Module):
         mode: str = "und",
         packed_vae_token_indexes: Optional[torch.Tensor] = None,
         packed_text_indexes: Optional[torch.Tensor] = None,
+        *,
+        cu_seq_lens_q: torch.Tensor,
+        cu_seq_lens_k: torch.Tensor,
+        max_length_q: int,
+        max_length_k: int,
+        total_key_value_tokens: int,
     ) -> tuple[torch.Tensor, Optional[NaiveCache]]:
         is_gen = _check_packed_inference_mode(mode)
         residual = packed_query_sequence
@@ -782,6 +790,11 @@ class BagelQwen2MoTDecoderLayer(nn.Module):
             mode=mode,
             packed_vae_token_indexes=packed_vae_token_indexes,
             packed_text_indexes=packed_text_indexes,
+            cu_seq_lens_q=cu_seq_lens_q,
+            cu_seq_lens_k=cu_seq_lens_k,
+            max_length_q=max_length_q,
+            max_length_k=max_length_k,
+            total_key_value_tokens=total_key_value_tokens,
         )
         packed_query_sequence = residual + packed_query_sequence
 
@@ -911,6 +924,16 @@ class BagelQwen2MoTBackbone(nn.Module):
         cos, sin = self.rotary_emb(packed_query_sequence, packed_query_position_ids.unsqueeze(0))
         packed_query_position_embeddings = (cos.squeeze(0), sin.squeeze(0))
 
+        cache_has_values = past_key_values.key_cache[0] is not None
+        if cache_has_values and key_values_lens is None:
+            raise ValueError("key_values_lens is required when cache is non-empty.")
+        effective_key_values_lens = key_values_lens + query_lens if cache_has_values else query_lens
+        cu_seq_lens_q = torch.nn.functional.pad(torch.cumsum(query_lens, dim=0), (1, 0)).to(torch.int32)
+        cu_seq_lens_k = torch.nn.functional.pad(torch.cumsum(effective_key_values_lens, dim=0), (1, 0)).to(torch.int32)
+        max_length_q = int(query_lens.max().item())
+        max_length_k = int(effective_key_values_lens.max().item())
+        total_key_value_tokens = int(effective_key_values_lens.sum().item())
+
         for decoder_layer in self.layers:
             packed_query_sequence, past_key_values = decoder_layer(
                 packed_query_sequence=packed_query_sequence,
@@ -925,6 +948,11 @@ class BagelQwen2MoTBackbone(nn.Module):
                 mode=mode,
                 packed_vae_token_indexes=packed_vae_token_indexes,
                 packed_text_indexes=packed_text_indexes,
+                cu_seq_lens_q=cu_seq_lens_q,
+                cu_seq_lens_k=cu_seq_lens_k,
+                max_length_q=max_length_q,
+                max_length_k=max_length_k,
+                total_key_value_tokens=total_key_value_tokens,
             )
 
         if not is_gen:
