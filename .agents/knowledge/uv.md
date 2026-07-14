@@ -25,7 +25,7 @@ pyproject.toml
 │   │                  + FA2 on x86_64 (cp311/cp312 wheels)
 │   │                  + FA3 / FlashMLA wheels on both architectures
 │   │                  + FA4 (PyPI) / FlashQLA (source-built from git)
-│   │                  + liger-kernel + FLA + quack + DLPack ext
+│   │                  + liger-kernel + FLA + quack + TileLang/TileKernels + DLPack ext
 │   │                  + diffusers / av / librosa / soundfile / ftfy / peft
 │   │                  + megatron-energon (optional dataset format)
 │   ├── npu          Ascend NPU x86_64 — full superset, minus CUDA-only kernels:
@@ -86,7 +86,8 @@ forced into a specific 5.x patch.
 | `flash-attn-3` (Hopper) | cp310-abi3 Luosuu wheel on x86_64; cp39-abi3 PyTorch cu130 wheel on aarch64 | abi3 covers supported Python versions; aarch64 requires glibc 2.34+ |
 | `flash-mla` | cp311/cp312 Luosuu cu130/torch2.11/sm90a+sm100f wheels | architecture-specific x86_64/aarch64 wheels |
 | `flash-attn-4` (cute) | PyPI `4.0.0b16` | pure-Python wheel |
-| `flash-qla` | git: QwenLM/FlashQLA | source-built |
+| `flash-qla` | git: QwenLM/FlashQLA | source-built; uv overrides its TileLang 0.1.8 metadata pin |
+| `tile-kernels` | PyPI `1.0.0` | DeepSeek V4 mHC forward/backward; requires TileLang 0.1.9 and SM90+ |
 
 Two pyproject knobs make the remaining FlashQLA source build succeed:
 
@@ -98,6 +99,11 @@ Two pyproject knobs make the remaining FlashQLA source build succeed:
    — `flash_qla/__init__.py` top-level imports `tilelang`, so they have to
    ship alongside, even though the `flash_qla` kernel itself only binds on
    sm90 (gated by `KernelSpec(min_compute_capability=90)`).
+
+   The GPU extra also installs `tile-kernels==1.0.0`, which requires
+   `tilelang>=0.1.9`. `[tool.uv].override-dependencies` therefore pins the
+   shared GPU environment to `tilelang==0.1.9`; DeepSeek V4 TileLang and
+   TileKernels tests cover that resolved combination.
 
 2. **`[tool.uv.extra-build-dependencies]`** seeds `setuptools / wheel /
    packaging / ninja` (+ `torch` where needed) — uv venvs are not seeded.
