@@ -93,11 +93,15 @@ class CheckpointerCallback(Callback):
         else:
             train_dataloader_state = {}
 
+        channel_loss_callback = getattr(self.trainer, "channel_loss_callback", None)
+        channel_loss_state = channel_loss_callback.state_dict() if channel_loss_callback is not None else {}
+
         return {
             "global_step": state.global_step,
             "lr_scheduler": self.trainer.lr_scheduler.state_dict(),
             "train_dataloader": train_dataloader_state,
             "environ_meter": self.trainer.environ_meter.state_dict(),
+            "channel_loss_callback": channel_loss_state,
             "torch_rng_state": torch.get_rng_state(),
         }
 
@@ -112,6 +116,10 @@ class CheckpointerCallback(Callback):
         if self.trainer.train_dataloader is not None and extra_state.get("train_dataloader", None) is not None:
             self.trainer.train_dataloader.load_state_dict(extra_state["train_dataloader"])
         self.trainer.environ_meter.load_state_dict(extra_state["environ_meter"])
+        channel_loss_state = extra_state.get("channel_loss_callback")
+        channel_loss_callback = getattr(self.trainer, "channel_loss_callback", None)
+        if channel_loss_state is not None and channel_loss_callback is not None:
+            channel_loss_callback.load_state_dict(channel_loss_state)
         torch.set_rng_state(extra_state["torch_rng_state"])
         if self.trainer.start_step == 0:
             # If resume at the end of epoch, clear resume state and prefetch data

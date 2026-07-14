@@ -261,7 +261,10 @@ def get_runtime_parallel_plan(model: nn.Module) -> "ParallelPlan":
     ``rank0_load_and_broadcast_weights`` / ``load_model_weights``)
     pick up the same prefixed + extended plan via this helper.
     """
-    parallel_plan = model.get_parallel_plan()
+    get_plan = getattr(model, "get_parallel_plan", None)
+    if get_plan is None:
+        return None
+    parallel_plan = get_plan()
     if parallel_plan is None:
         return parallel_plan
 

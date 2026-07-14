@@ -60,7 +60,7 @@ if they implement the same variant.
 | `apply_rotary_pos_emb` | `full`, `partial` | Full: rotate all dims. Partial: rotate first `rotary_dim`, passthrough rest |
 | `swiglu_mlp` | `standard` | SwiGLU MLP (gate/up/down) |
 | `attention` | `standard` | Multi-head / GQA attention (existing `ALL_ATTENTION_FUNCTIONS` — unchanged) |
-| `moe_experts` | `standard` | Expert GEMM dispatch (merged gate+up projection, HF v5 convention) |
+| `moe_experts` | `standard` | Expert GEMM dispatch (merged gate+up projection, HF v5 convention; DeepSeek-V4 additionally forwards `swiglu_limit` to clamp-aware backends) |
 | `cross_entropy_loss` | `causal`, `seq_cls` | Causal-LM CE (shifts labels) vs. sequence-classification CE (no shift) |
 | `moe_load_balancing_loss` | `standard` | Switch Transformer auxiliary loss |
 
@@ -772,7 +772,7 @@ model.forward()                                    # (5) runtime
 | `VEOMNI_USE_LIGER_KERNEL=1` env var | `rms_norm_implementation: liger` etc. | Deprecate env var; keep compat for 1 release |
 | `gpu_patch.py` monkey-patching | patchgen + `OpSlot` guards | Remove `gpu_patch.py` files |
 | `apply_veomni_loss_patch()` at import | `cross_entropy_loss_implementation` + `OpSlot` | Remove import-time patch |
-| `apply_veomni_fused_moe_patch()` | `OpSlot("moe_experts", ...)` | All MoE models (qwen3_moe, qwen3_5_moe, qwen3_vl_moe, qwen3_omni_moe, deepseek_v3) now bind through OpSlot; the function is kept only as the binding helper invoked from `_bind_veomni_ops` to set the global `_fused_moe_forward` pointer used inside the OpSlot guards. |
+| `apply_veomni_fused_moe_patch()` | `OpSlot("moe_experts", ...)` | All MoE models (qwen3_moe, qwen3_5_moe, qwen3_vl_moe, qwen3_omni_moe, deepseek_v3, deepseek_v4) now bind through OpSlot guards; the function is kept only as the binding helper invoked from `_bind_veomni_ops` to set the global `_fused_moe_forward` pointer. DeepSeek-V4 attention is still eager-only, but its MoE keeps a direct `fused_moe_forward(...)` call under that guard so it can pass its merged `gate_up_proj` layout and `swiglu_limit` clamp explicitly; clamp-aware V4 fused MoE is currently provided by the GPU backends and defaults to `fused_triton` on GPU, while `fused_npu` raises until the NPU kernel implements `swiglu_limit`. |
 | `moe_implementation: fused` (auto-picks Triton on GPU / NPU group-gemm on NPU) | `moe_implementation: fused_triton` or `fused_npu` | Breaking change — `"fused"` renamed to `"fused_triton"` and the silent NPU auto-pick replaced by explicit `"fused_npu"`. `fused_quack` is unchanged. |
 
 ---

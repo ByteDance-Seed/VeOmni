@@ -80,11 +80,16 @@ def test_dpo_main_collator_sp_disabled(monkeypatch):
 
     s1 = _make_flat_dpo_sample([1, 2, 3], [4, 5, 6])
     s2 = _make_flat_dpo_sample([7, 8], [9, 10])
+    s1.update(ds_idx=3, source_name="train/a")
+    s2.update(ds_idx=4, source_name="train/b")
     batch = m.MainCollator()([s1, s2])
 
     assert batch["input_ids"].view(-1).tolist() == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
     assert batch["position_ids"].view(-1).tolist() == [0, 1, 2, 0, 1, 2, 0, 1, 0, 1]
     assert batch["cu_seq_lens_q"].tolist() == [0, 3, 6, 8, 10]
+    assert batch["ds_idx"].tolist() == [3, 4]
+    assert batch["source_name"] == ["train/a", "train/b"]
+    assert batch["position_ids"].eq(0).sum().item() == 2 * batch["ds_idx"].numel()
 
 
 def test_dpo_main_collator_sp_enabled(monkeypatch):

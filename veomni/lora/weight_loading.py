@@ -94,6 +94,31 @@ def build_lora_key_overrides(model: nn.Module) -> dict[str, str]:
     return overrides
 
 
+def make_peft_key_mapper(model: nn.Module, is_peft_model: bool) -> Callable[[str], str]:
+    """Return a fn mapping a *bare* base-model FQN to its live-model destination.
+
+    Centralises the checkpoint-key remap every weight loader
+    (:func:`~veomni.models.module_utils.load_model_weights` /
+    ``load_model_weights_ep_sharded`` / ``rank0_load_and_broadcast_weights``)
+    needs when a base checkpoint is loaded into a LoRA-wrapped model:
+
+    * ``is_peft_model=False`` -> identity (the checkpoint key is already the
+      live-model key).
+    * ``is_peft_model=True``  -> :func:`build_lora_key_overrides` remap (wrapped
+      targets go to ``...base_layer.weight``) with a plain ``base_model.model.``
+      prefix fallback for un-wrapped params.
+
+    Apply it *after* ``maybe_convert_checkpoint_tensor`` so converter-produced
+    merged keys (e.g. the Qwen3-MoE per-expert -> fused ``...experts.gate_up_proj``)
+    also flow through the ``base_layer.weight`` rename when their experts module is
+    wrapped by ``LoraSharedExperts`` / ``LoraIndependentExperts``.
+    """
+    if not is_peft_model:
+        return lambda bare_name: bare_name
+    overrides = build_lora_key_overrides(model)
+    return lambda bare_name: overrides.get(bare_name, "base_model.model." + bare_name)
+
+
 @torch.no_grad()
 def load_lora_weights(
     model: nn.Module | PreTrainedModel,

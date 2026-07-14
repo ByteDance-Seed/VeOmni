@@ -38,14 +38,14 @@ Our guiding principles when building VeOmni are:
 
 
 ## 📚 Key Features
-- **FSDP**, **FSDP2** backend for training.
+- **FSDP2** backend for training.
 - **Sequence Parallelism** with [Deepspeed Ulysess](https://arxiv.org/abs/2309.14509), support with non-async and async mode.
 - **Experts Parallelism** support large MOE model training, like [Qwen3-Moe](https://veomni.readthedocs.io/en/latest/key_features/ep_fsdp2.html).
 - Efficient **GroupGemm** kernel for Moe model, [Liger-Kernel](https://github.com/linkedin/Liger-Kernel).
 - Compatible with HuggingFace Transformers models. [Qwen3](https://veomni.readthedocs.io/en/latest/examples/qwen3.html), [Qwen3-VL](https://veomni.readthedocs.io/en/latest/examples/qwen3_vl.html), Qwen3-Moe, etc
 - Dynamic batching strategy, Omnidata processing
 - [**Torch Distributed Checkpoint**](https://docs.pytorch.org/docs/stable/distributed.checkpoint.html) for checkpoint.
-- Support for both Nvidia-GPU and Ascend-NPU training.
+- Support for NVIDIA GPU, AMD ROCm, and Ascend NPU training.
 - Experiment tracking with wandb
 
 ## 📝 Upcoming Features and Changes
@@ -70,6 +70,7 @@ Our guiding principles when building VeOmni are:
 | Model                                                    | Model size                    | Example config File                                                   |
 | -------------------------------------------------------- | ----------------------------- | ----------------------------------------------------------------------|
 | [DeepSeek2.5/3/R1](https://huggingface.co/deepseek-ai)   | 236B/671B                     | [deepseek.yaml](configs/text/deepseek.yaml)                           |
+| [DeepSeek-V4](https://huggingface.co/deepseek-ai)        | Checkpoint-dependent          | [deepseek.yaml](configs/text/deepseek.yaml) template; set V4 path and eager attention (MoE stays `fused_triton` on GPU) |
 | [Llama3-3.3](https://huggingface.co/meta-llama)          | 1B/3B/8B/70B                  | [llama3.yaml](configs/text/llama3.yaml)                               |
 | [Qwen2-3](https://huggingface.co/Qwen)                   | 0.5B/1.5B/3B/7B/14B/32B/72B/  | [qwen2_5.yaml](configs/text/qwen2_5.yaml)                             |
 | [Qwen2-3 VL/QVQ](https://huggingface.co/Qwen)            | 2B/3B/7B/32B/72B              | [qwen3_vl_dense.yaml](configs/multimodal/qwen3_vl/qwen3_vl_dense.yaml)|

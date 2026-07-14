@@ -184,6 +184,10 @@ class TritonFusedMoeExpertFunction(torch.autograd.Function):
 
         # MOE Step 10
         grad_fc2_output = moe_scatter(grad_output, scatter_index)
+        # ``max_M`` for grouped GEMM is a per-expert launch bound. Duplicate
+        # top-k routes can make one expert receive more rows than the original
+        # token count, so the total scattered row count is a safe bound.
+        num_scattered_tokens = grad_fc2_output.shape[0]
 
         # MOE Step 9
         # grad_fc1_weighted_output = torch.empty_like(fc1_weighted_output)
@@ -193,7 +197,7 @@ class TritonFusedMoeExpertFunction(torch.autograd.Function):
             a=grad_fc2_output,
             b=fc2_weight,
             cumsum_M=cumsum_t,
-            max_M=grad_output.shape[0],
+            max_M=num_scattered_tokens,
             transpose_b=False,
         )
 
@@ -206,7 +210,7 @@ class TritonFusedMoeExpertFunction(torch.autograd.Function):
                 b=fc1_weighted_output,
                 c=grad_fc2_weight,
                 cumsum_K=cumsum_t,
-                max_K=grad_output.shape[0],
+                max_K=num_scattered_tokens,
                 transpose_a=True,
                 transpose_b=False,
             )
@@ -241,7 +245,7 @@ class TritonFusedMoeExpertFunction(torch.autograd.Function):
             a=grad_fc1_2_output,
             b=fc1_2_weight,
             cumsum_M=cumsum_t,
-            max_M=grad_output.shape[0],
+            max_M=num_scattered_tokens,
             transpose_b=False,
         )
 
@@ -254,7 +258,7 @@ class TritonFusedMoeExpertFunction(torch.autograd.Function):
                 b=scatter_output,
                 c=grad_fc1_2_weight,
                 cumsum_K=cumsum_t,
-                max_K=grad_output.shape[0],
+                max_K=num_scattered_tokens,
                 transpose_a=True,
                 transpose_b=False,
             )
@@ -272,7 +276,7 @@ class TritonFusedMoeExpertFunction(torch.autograd.Function):
             a=grad_fc1_1_output,
             b=fc1_1_weight,
             cumsum_M=cumsum_t,
-            max_M=grad_output.shape[0],
+            max_M=num_scattered_tokens,
             transpose_b=False,
         )
 
@@ -285,7 +289,7 @@ class TritonFusedMoeExpertFunction(torch.autograd.Function):
                 b=scatter_output,
                 c=grad_fc1_1_weight,
                 cumsum_K=cumsum_t,
-                max_K=grad_output.shape[0],
+                max_K=num_scattered_tokens,
                 transpose_a=True,
                 transpose_b=False,
             )
@@ -424,13 +428,17 @@ class MergedFc1TritonFusedMoeExpertFunction(torch.autograd.Function):
 
         # MOE Step 10
         grad_fc2_output = moe_scatter(grad_output, scatter_index)
+        # ``max_M`` for grouped GEMM is a per-expert launch bound. Duplicate
+        # top-k routes can make one expert receive more rows than the original
+        # token count, so the total scattered row count is a safe bound.
+        num_scattered_tokens = grad_fc2_output.shape[0]
 
         # MOE Step 9 - dgrad
         grad_fc1_weighted_output = group_gemm_same_nk(
             a=grad_fc2_output,
             b=fc2_weight,
             cumsum_M=cumsum_t,
-            max_M=grad_output.shape[0],
+            max_M=num_scattered_tokens,
             transpose_b=False,
         )
 
@@ -443,7 +451,7 @@ class MergedFc1TritonFusedMoeExpertFunction(torch.autograd.Function):
                 b=fc1_weighted_output,
                 c=grad_fc2_weight,
                 cumsum_K=cumsum_t,
-                max_K=grad_output.shape[0],
+                max_K=num_scattered_tokens,
                 transpose_a=True,
                 transpose_b=False,
             )
@@ -479,7 +487,7 @@ class MergedFc1TritonFusedMoeExpertFunction(torch.autograd.Function):
             a=grad_fc1_output,
             b=fc1_1_2_weight,
             cumsum_M=cumsum_t,
-            max_M=grad_output.shape[0],
+            max_M=num_scattered_tokens,
             transpose_b=False,
         )
 
@@ -492,7 +500,7 @@ class MergedFc1TritonFusedMoeExpertFunction(torch.autograd.Function):
                 b=scatter_output,
                 c=grad_fc1_1_2_weight,
                 cumsum_K=cumsum_t,
-                max_K=grad_output.shape[0],
+                max_K=num_scattered_tokens,
                 transpose_a=True,
                 transpose_b=False,
             )

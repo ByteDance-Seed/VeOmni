@@ -301,6 +301,15 @@ at ``apply_veomni_fused_moe_patch`` time — no silent hardware fallback.
 | `fused_quack` | Quack CUTLASS/CuTe | GPU, SM90+ (H100+) | No |
 | `fused_npu` | NPU group-gemm | Ascend NPU | Yes |
 
+DeepSeek-V4 attention remains eager-only, but its MoE path uses the same
+`moe_implementation` selection and therefore defaults to `fused_triton` on GPU.
+The v4-specific patched experts path passes the merged `gate_up_proj` tensor
+directly to `fused_moe_forward(...)` and forwards `swiglu_limit` so backends
+that implement the clamp preserve V4's clamped SwiGLU pre-activation semantics.
+Clamp-aware fused V4 support is GPU-only today (`fused_triton` / `fused_quack`);
+selecting `fused_npu` for a V4 model raises because the NPU fused MoE kernel
+does not yet implement `swiglu_limit`.
+
 ### Key files
 
 - Config: `veomni/arguments/arguments_types.py` — `OpsImplementationConfig`
