@@ -1,6 +1,10 @@
 model:
+  # Set this to the target DeepSeek checkpoint, e.g. DeepSeek-V3/R1 or DeepSeek-V4.
   # model_path: deepseek-ai/DeepSeek-V3-0324
+  # model_path: <path-or-id-to-DeepSeek-V4-checkpoint>
   ops_implementation:
+    # DeepSeek-V4 attention is eager-only; set this to eager for V4 checkpoints.
+    # Keep moe_implementation as fused_triton on GPU so V4 uses clamp-aware fused MoE.
     attn_implementation: flash_attention_2
     moe_implementation: fused_triton
 

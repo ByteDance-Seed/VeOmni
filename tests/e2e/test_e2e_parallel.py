@@ -191,16 +191,15 @@ deepseek_v4_text_smoke_test_cases = [
         True,  # is_moe
         _DEFAULT_RTOL,
         _DEFAULT_ATOL,
-        # DeepSeek-V4 is eager-only (no FA / SDPA / FlexAttention) and the
-        # 4D ``[B, S, hc_mult, D]`` HyperConnection residual stack isn't
-        # SP-aware yet. Force ``max_sp_size=1`` until a v4-specific
+        # DeepSeek-V4 attention is eager-only (no FA / SDPA / FlexAttention)
+        # and the 4D ``[B, S, hc_mult, D]`` HyperConnection residual stack
+        # is not SP-aware yet. Force ``max_sp_size=1`` until a V4-specific
         # eager-SP path lands.
         1,
-        # The current generic fused MoE EP path does not preserve DeepSeek-V4's
-        # swiglu_limit clamp and is not stable for the merged gate_up layout on
-        # all backends. Keep e2e on the non-EP baseline until a V4-aware fused
-        # EP kernel lands; do not force eager MoE here because eager expert
-        # loops are incompatible with EP-sharded expert weights.
+        # The GPU fused-MoE path now preserves DeepSeek-V4's ``swiglu_limit``
+        # clamp, so keep the smoke test on the default fused_triton MoE path.
+        # EP remains disabled here because the surrounding V4 e2e coverage is
+        # a single-mode smoke test, not an EP alignment test.
         1,
     ),
     pytest.param(

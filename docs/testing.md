@@ -18,6 +18,7 @@ tests/
 │   ├── test_vlm_trainer.py         # VLM freeze_vit smoke test
 │   ├── test_model_registry.py      # Model loader registry (HF vs VeOmni)
 │   ├── test_checkpoint_tensor_converter.py  # Checkpoint tensor conversion (e.g. Qwen3MoE fuse)
+│   ├── test_deepseek_v4_fused_moe.py  # DeepSeek-V4 fused MoE swiglu_limit plumbing
 │   ├── test_padded_packed_loss.py   # Padded vs packed (cu_seqlens) loss equivalence
 │   ├── utils.py                    # ModelMode, prepare_model_modes, prepare_data
 │   └── weight_sync_adapters.py     # State-dict alignment for HF↔VeOmni comparison
@@ -144,15 +145,18 @@ Additional per-directory helpers:
 |---|---|
 | Modeling backend | HuggingFace, VeOmni |
 | Attention implementation | `eager`, `flash_attention_2`, `flash_attention_3`, `veomni_flash_attention_2_with_sp`, `veomni_flash_attention_3_with_sp` |
-| MoE implementation | `eager`, `fused` (MoE models only) |
+| MoE implementation | `eager`, hardware fused backend (`fused_triton` on GPU, `fused_npu` on NPU where supported) |
 | Liger kernel | `True`, `False` (VeOmni only) |
 
 **Models covered**:
-- Text / MoE: llama3_1, qwen2, qwen3_5, qwen3_5_moe, seed_oss, deepseek_v3
+- Text / MoE: llama3_1, qwen2, qwen3_5, qwen3_5_moe, seed_oss, deepseek_v3, deepseek_v4
 - VLM: qwen2_vl, qwen2_5_vl, qwen3_vl, qwen3_vl_moe
 - Omni: qwen2_5_omni, qwen3_omni_moe
 
 **GPU**: 1 GPU, runs serially per model mode.
+
+DeepSeek-V4's fused-MoE-specific merged `gate_up_proj` and `swiglu_limit`
+forwarding are covered by `tests/models/test_deepseek_v4_fused_moe.py` (CPU).
 
 ---
 
