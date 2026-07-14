@@ -369,33 +369,18 @@ def load_model_weights(
 
         parallel_plan = get_runtime_parallel_plan(model)
 
-    # Build LoRA key remapping when loading a base checkpoint into a PEFT-wrapped model.
-    # Maps bare base-model param names to PEFT-namespaced FQNs, e.g.:
-    #   "layers.0.self_attn.q_proj.weight" -> "base_model.model.layers.0.self_attn.q_proj.base_layer.weight"
-    # Keys not found in the map receive a plain "base_model.model." prefix.
+    # Remap bare base-model checkpoint keys to their live (PEFT-wrapped) FQNs.
+    # Applied AFTER ``maybe_convert_checkpoint_tensor`` so converter-produced merged
+    # keys (e.g. Qwen3-MoE per-expert -> fused ``...experts.gate_up_proj``) also flow
+    # through the ``base_layer.weight`` rename. No-op when not PEFT.
     is_peft_model = kwargs.get("is_peft_model", False)
     adapter_path = kwargs.get("adapter_path", None)
-    if is_peft_model:
-        from ..lora.weight_loading import build_lora_key_overrides
+    from ..lora.weight_loading import make_peft_key_mapper
 
-        lora_key_overrides = build_lora_key_overrides(model)
-
-    def _apply_peft_override(bare_name: str) -> str:
-        """Map a *bare* base-model FQN to its PEFT-wrapped destination.
-
-        Applied AFTER ``maybe_convert_checkpoint_tensor`` so converter-produced
-        merged keys (e.g. ``model.layers.0.mlp.experts.gate_up_proj`` from the
-        Qwen3-MoE per-expert -> fused converter) also flow through the
-        ``base_layer.weight`` rename when the experts module is wrapped by
-        ``LoraSharedExperts`` / ``LoraIndependentExperts``. Keys without an
-        override entry receive the plain ``base_model.model.`` prefix.
-        """
-        if not is_peft_model:
-            return bare_name
-        return lora_key_overrides.get(bare_name, "base_model.model." + bare_name)
+    _apply_peft_override = make_peft_key_mapper(model, is_peft_model)
 
     converter = get_checkpoint_tensor_converter(model)
-    if converter is None and is_peft_model and hasattr(model, "get_base_model"):
+    if converter is None and is_peft_model:
         converter = get_checkpoint_tensor_converter(model.get_base_model())
     state_dict_iterators = _load_state_dict(weights_path)
 
@@ -515,26 +500,56 @@ def load_model_weights_ep_sharded(
     ``[E/ep, ...]`` with ``parallel_plan=None`` so it is not sliced again, then
     the FSDP ``dtensor_factory`` shards it over the ``ep_fsdp`` sub-mesh.
 
-    Raises ``NotImplementedError`` when the checkpoint/model is unsupported: PEFT,
-    no ExtraParallel ``get_parallel_plan``, or a checkpoint-tensor converter whose
+    Raises ``NotImplementedError`` when the checkpoint/model is unsupported: no
+    ExtraParallel ``get_parallel_plan``, or a checkpoint-tensor converter whose
     transform is not a pure dim-0 zero-pad (a fusion converter needs the whole
     tensor set). A converter that only zero-pads dim-0 stays streamable -- each
     rank reads its real-row slice and zero-fills the tail -- and opts in via the
     optional ``CheckpointTensorConverter.is_dim0_zero_pad`` capability (see
     :func:`checkpoint_converter_is_dim0_zero_pad`).
+
+    PEFT is supported. Base-checkpoint keys are remapped to their PEFT
+    ``base_layer`` FQNs (:func:`build_lora_key_overrides`) and streamed exactly
+    like the non-PEFT base -- each rank keeps only its ``[E/ep, ...]`` expert
+    slice (the fused MoE experts live under ``...experts.<spec>.base_layer.weight``
+    and stay EP ``Shard(0)`` in the runtime plan). The LoRA adapter then streams via
+    :func:`_stream_lora_adapter_ep_sharded` with that same runtime plan, which decides
+    sharding per tensor: **independent** MoE LoRA tensors are 3-D ``Shard(0)`` over the
+    ep group, so each rank reads only its own expert-row dim-0 slice from the
+    safetensors adapter; **shared** MoE LoRA (2-D) and dense LoRA tensors are not in
+    the plan, so every rank reads them whole (replicated). Un-loaded LoRA params -- a
+    fresh build (no ``adapter_path``) or any params the adapter omits -- are
+    kaiming-``A``/zero-``B`` initialised in ``post_process_after_weight_loading``.
     """
-    if kwargs.get("is_peft_model", False):
-        raise NotImplementedError("ep_sharded_stream_load does not support PEFT models.")
+    is_peft_model = kwargs.get("is_peft_model", False)
+    adapter_path = kwargs.get("adapter_path", None)
+
     # A checkpoint-tensor converter generally needs the whole tensor set (e.g.
     # per-expert-key fusion) which streaming can't provide. The one streamable
     # exception is a *pure dim-0 zero-pad* converter, which opts in via the
     # optional ``is_dim0_zero_pad`` capability; that is enforced per-key below
-    # (dim-0 zero-pad -> stream + tail zero-fill; anything else -> bail).
+    # (dim-0 zero-pad -> stream + tail zero-fill; anything else -> bail). Under
+    # PEFT the converter lives on the *base* model (the wrapper has none).
     converter = get_checkpoint_tensor_converter(model)
-    get_plan = getattr(model, "get_parallel_plan", None)
-    parallel_plan = get_plan() if get_plan is not None else None
+    if converter is None and is_peft_model:
+        converter = get_checkpoint_tensor_converter(model.get_base_model())
+
+    # Runtime plan: PEFT-prefixes every pattern with ``base_model.model.`` and
+    # registers the MoE-LoRA wrapper FQNs -- base experts under ``base_layer.weight``
+    # stay EP ``Shard(0)``, and ``LoraIndependentExperts`` per-expert LoRA tensors
+    # are added as ``Shard(0)`` (shared-LoRA tensors are left replicated). For a
+    # non-PEFT / non-LoRA model this is a passthrough of ``get_parallel_plan()``.
+    from ..distributed.parallel_plan import get_runtime_parallel_plan
+
+    parallel_plan = get_runtime_parallel_plan(model)
     if parallel_plan is None or not getattr(parallel_plan, "extra_parallel_plan", None):
         raise NotImplementedError("ep_sharded_stream_load requires a model with an ExtraParallel parallel_plan.")
+
+    # Base-checkpoint keys (bare base-model FQNs) -> their PEFT-wrapped destinations
+    # (``base_model.model.<...>.base_layer.weight``). No-op when not PEFT.
+    from ..lora.weight_loading import make_peft_key_mapper
+
+    _apply_peft_override = make_peft_key_mapper(model, is_peft_model)
 
     # This streaming loader reads each rank's ExtraParallel slice with a dim-0
     # ``get_slice()[start:end]`` -- the same dim-0 assumption upstream's
@@ -554,11 +569,43 @@ def load_model_weights_ep_sharded(
     buffer_dict = {name: buffer.clone() for name, buffer in model.named_buffers()}
     param_shapes = {name: tuple(p.shape) for name, p in model.named_parameters()}
     parameter_names_to_load = set(param_shapes.keys())
-    model.to_empty(device=init_device)
-    dtensor_to_cpu = init_device == "cpu"
 
     parallel_state = get_parallel_state()
     key_to_file, file_to_path = _resolve_safetensors_shards(weights_path, **kwargs)
+
+    # Up-front bail for a converter that needs a *non-dim0-zero-pad* transform to
+    # reach the modeling layout (per-expert -> fused MoE stacking/cat, reshape,
+    # dtype change). Only a pure dim-0 zero-pad commutes with per-rank Shard(0)
+    # streaming; anything else needs the whole tensor set, which this loader can't
+    # provide -- so raise here (before materialising anything) and let the caller
+    # fall back to the whole-tensor ``load_model_weights`` (which applies the
+    # converter then EP-shards via DTensor).
+    #
+    # This MUST be an up-front scan over the *raw checkpoint keys*, not the
+    # per-destination check the main loop does: a fusion converter's per-expert
+    # keys (e.g. ``model.layers.0.mlp.experts.3.gate_proj.weight``) do not map 1:1
+    # to a model param -- the model holds the fused ``...experts.gate_up_proj`` --
+    # so ``name`` is absent from ``parameter_names_to_load`` and the loop's
+    # "unexpected key" skip would silently drop every per-expert key, leaving the
+    # fused expert un-loaded (all-zero) and the model quietly broken. Qwen3-MoE
+    # (HF per-expert checkpoint + ``Qwen3MoeCheckpointTensorConverter``) is the
+    # canonical case this guards against.
+    if converter is not None:
+        for raw_name in key_to_file:
+            bare_name = _convert_weight_key(raw_name, model)
+            if converter.can_handle(bare_name) and not checkpoint_converter_is_dim0_zero_pad(converter, bare_name):
+                raise NotImplementedError(
+                    f"ep_sharded_stream_load: checkpoint-tensor converter "
+                    f"{type(converter).__name__} needs a non-dim0-zero-pad transform for key "
+                    f"'{bare_name}' (e.g. per-expert -> fused MoE experts). Per-rank slice "
+                    f"streaming cannot reconstruct the whole tensor set from a single shard, so "
+                    f"this model/checkpoint combination is unsupported. Either save the checkpoint "
+                    f"in the model's fused expert layout, or disable train.ep_sharded_stream_load "
+                    f"to use the whole-tensor loader (broadcast or every-rank-read)."
+                )
+
+    model.to_empty(device=init_device)
+    dtensor_to_cpu = init_device == "cpu"
 
     keys_by_file: Dict[str, List[str]] = {}
     for key, fname in key_to_file.items():
@@ -572,18 +619,16 @@ def load_model_weights_ep_sharded(
     ):
         with safe_open(file_to_path[fname], framework="pt", device="cpu") as f:
             for raw_name in keys_by_file[fname]:
-                name = _convert_weight_key(raw_name, model)
+                # ``bare_name`` is the base-model FQN the converter is keyed on;
+                # ``name`` is the live model destination (PEFT ``base_layer`` FQN
+                # under PEFT, else identical to ``bare_name``).
+                bare_name = _convert_weight_key(raw_name, model)
+                name = _apply_peft_override(bare_name)
                 if name in buffer_dict:  # persistent buffers: read whole
                     buffer_dict[name] = f.get_tensor(raw_name).clone()
                     n_buf += 1
                     continue
                 if name not in parameter_names_to_load:
-                    if converter is not None and converter.can_handle(name):
-                        raise NotImplementedError(
-                            "ep_sharded_stream_load does not support checkpoint tensor conversion for "
-                            f"unexpected key '{name}'. Use load_model_weights or rank0_load_and_broadcast_weights "
-                            "for FP8/int8 scaled checkpoints."
-                        )
                     logger.info_rank0(f"Unexpected key in state dict: {name}.")
                     continue
 
@@ -596,8 +641,8 @@ def load_model_weights_ep_sharded(
                     # may have more rows than the checkpoint (``real0``): read the
                     # overlap and zero-fill the tail. Otherwise the checkpoint must
                     # match the model exactly.
-                    zero_pad = checkpoint_converter_is_dim0_zero_pad(converter, name)
-                    if converter is not None and converter.can_handle(name) and not zero_pad:
+                    zero_pad = checkpoint_converter_is_dim0_zero_pad(converter, bare_name)
+                    if converter is not None and converter.can_handle(bare_name) and not zero_pad:
                         # A converter that fuses/reshapes this key can't be streamed.
                         raise NotImplementedError(
                             f"ep_sharded_stream_load: converter applies a non-dim0-zero-pad "
@@ -645,17 +690,15 @@ def load_model_weights_ep_sharded(
                     _dispatch_parameter(model, name, tensor, dtensor_factory, None, dtensor_to_cpu)
                     n_ep += 1
                 else:
-                    tensor = f.get_tensor(raw_name)
-                    converted = maybe_convert_checkpoint_tensor(name, tensor, converter)
-                    if converted is None:
+                    if converter is not None and converter.can_handle(bare_name):
+                        # A streamable (dim-0 zero-pad) converter must only touch
+                        # ExtraParallel tables; a dense key would need its conversion
+                        # applied here, which this path does not do -> bail.
                         raise NotImplementedError(
-                            "ep_sharded_stream_load does not support checkpoint tensor conversion that buffers "
-                            f"dense key '{name}'. Use load_model_weights or rank0_load_and_broadcast_weights "
-                            "for FP8/int8 scaled checkpoints."
+                            f"ep_sharded_stream_load: converter handles non-ExtraParallel key '{name}'."
                         )
-                    _dispatch_parameter(
-                        model, converted.name, converted.tensor, dtensor_factory, parallel_plan, dtensor_to_cpu
-                    )
+                    tensor = f.get_tensor(raw_name)
+                    _dispatch_parameter(model, name, tensor, dtensor_factory, parallel_plan, dtensor_to_cpu)
                     n_dense += 1
                 parameter_names_to_load.discard(name)
         empty_cache()
@@ -663,8 +706,133 @@ def load_model_weights_ep_sharded(
     logger.info_rank0(
         f"ep_sharded_stream_load: read {n_ep} ExtraParallel-sliced, {n_dense} dense, {n_buf} buffer tensors/rank."
     )
+
+    if is_peft_model and adapter_path:
+        # Stream the LoRA adapter the same per-rank way as the base: independent MoE
+        # LoRA (3-D ``Shard(0)`` in the runtime plan) is read one dim-0 expert slice
+        # per rank; shared/dense LoRA (not in the plan) is read whole on every rank
+        # (replicated). When ``adapter_path`` is None (fresh build) the LoRA params
+        # stay un-loaded and are kaiming-A/zero-B init'd below.
+        _stream_lora_adapter_ep_sharded(
+            model,
+            adapter_path,
+            init_device,
+            dtensor_factory,
+            parallel_plan,
+            parameter_names_to_load,
+            param_shapes,
+            parallel_state,
+            dtensor_to_cpu,
+        )
+
     post_process_after_weight_loading(
         model, buffer_dict, parameter_names_to_load, dtensor_factory, dtensor_to_cpu=dtensor_to_cpu
+    )
+
+
+@torch.no_grad()
+def _stream_lora_adapter_ep_sharded(
+    model: "nn.Module",
+    adapter_path: str,
+    init_device: str,
+    dtensor_factory: Optional[Callable[["torch.Tensor", Any, Any], "torch.Tensor"]],
+    parallel_plan: Any,
+    parameter_names_to_load: set,
+    param_shapes: Dict[str, tuple],
+    parallel_state: Any,
+    dtensor_to_cpu: bool,
+    adapter_name: str = "default",
+) -> None:
+    """Per-rank ExtraParallel-slice streaming of a PEFT adapter.
+
+    The adapter companion to :func:`load_model_weights_ep_sharded`. Reads the
+    consolidated PEFT adapter (``adapter_model.safetensors``, full gathered
+    ``[E, ...]`` tensors) and dispatches per tensor by the runtime ``parallel_plan``:
+
+    * **independent** MoE LoRA tensors (3-D, ``Shard(0)`` over the ep group) are read
+      one dim-0 expert slice per rank -- ``get_slice()[start:end]`` -- so each rank
+      only ever materialises its ``[E/ep, ...]`` chunk (no whole-tensor host copy),
+      then ``dtensor_factory`` shards it over the ``ep_fsdp`` sub-mesh (dispatch with
+      ``parallel_plan=None`` since it's already the local slice);
+    * **shared** MoE LoRA (2-D) and **dense** LoRA tensors are not in the plan, so
+      every rank reads them whole (replicated) and dispatches through the plan (FSDP
+      shards them normally) -- matching the user contract "shared 不用切分, each rank
+      reads the full adapter".
+
+    A pickled ``.bin`` adapter can't be partially read, so it falls back to the
+    whole-file :func:`load_lora_weights` (correct, but independent LoRA is not
+    streamed per-rank). Newly saved adapters are safetensors (see
+    :func:`save_lora_adapter_with_dcp`).
+    """
+    from ..lora.state_dict import _find_adapter_file, insert_adapter_name
+
+    try:
+        file_path, is_safetensors = _find_adapter_file(adapter_path)
+    except FileNotFoundError:
+        logger.warning_rank0(f"ep_sharded adapter: no adapter file under {adapter_path}; skipping.")
+        return
+
+    if not is_safetensors:
+        from ..lora.weight_loading import load_lora_weights
+
+        logger.warning_rank0(
+            f"ep_sharded adapter: {adapter_path} is a pickled .bin (not sliceable); falling back to "
+            "whole-file load_lora_weights (independent LoRA won't be streamed per-rank)."
+        )
+        load_lora_weights(
+            model,
+            adapter_path,
+            init_device,
+            dtensor_factory,
+            parameter_names_to_load=parameter_names_to_load,
+            parallel_plan=parallel_plan,
+            adapter_name=adapter_name,
+        )
+        return
+
+    n_ep = n_rep = 0
+    with safe_open(file_path, framework="pt", device="cpu") as f:
+        for raw_key in f.keys():
+            name = insert_adapter_name(raw_key, adapter_name)
+            if name not in parameter_names_to_load:
+                logger.info_rank0(f"ep_sharded adapter: unexpected key {name}.")
+                continue
+            shard_group = parallel_plan._get_shard_parameter_groupname(name)
+            if shard_group is not None:
+                # independent per-expert LoRA -> read only this rank's dim-0 slice.
+                target0 = param_shapes[name][0]
+                para_size = (
+                    parallel_state.extra_parallel_sizes[shard_group]
+                    if parallel_state.extra_parallel_enabled(shard_group)
+                    else 1
+                )
+                para_rank = (
+                    parallel_state.extra_parallel_rank(shard_group)
+                    if parallel_state.extra_parallel_enabled(shard_group)
+                    else 0
+                )
+                sl = f.get_slice(raw_key)
+                real0 = sl.get_shape()[0]
+                expected_full0 = target0 * para_size
+                if real0 != expected_full0:
+                    raise RuntimeError(
+                        f"ep_sharded adapter {name}: file dim0={real0} != model dim0={expected_full0} "
+                        f"(independent LoRA expects the gathered [E, ...] tensor)."
+                    )
+                start = para_rank * target0
+                tensor = sl[start : start + target0]
+                _dispatch_parameter(model, name, tensor, dtensor_factory, None, dtensor_to_cpu)
+                n_ep += 1
+            else:
+                # shared / dense LoRA -> read whole (replicated); FSDP shards via plan.
+                tensor = f.get_tensor(raw_key)
+                _dispatch_parameter(model, name, tensor, dtensor_factory, parallel_plan, dtensor_to_cpu)
+                n_rep += 1
+            parameter_names_to_load.discard(name)
+
+    logger.info_rank0(
+        f"ep_sharded adapter: streamed {n_ep} EP-sliced (independent) + {n_rep} whole "
+        "(shared/dense) adapter tensors/rank."
     )
 
 
@@ -705,13 +873,12 @@ def rank0_load_and_broadcast_weights(
     # lora-layer: xxx.xxx.weight -> base_model.model.xxx.xxx.base_layer.weight
     is_peft_model = kwargs.get("is_peft_model", False)
     adapter_path = kwargs.get("adapter_path", None)
-    if is_peft_model:
-        from ..lora.weight_loading import build_lora_key_overrides
+    from ..lora.weight_loading import make_peft_key_mapper
 
-        lora_key_overrides = build_lora_key_overrides(model)
+    _apply_peft_override = make_peft_key_mapper(model, is_peft_model)
 
     converter = get_checkpoint_tensor_converter(model)
-    if converter is None and is_peft_model and hasattr(model, "get_base_model"):
+    if converter is None and is_peft_model:
         converter = get_checkpoint_tensor_converter(model.get_base_model())
     global_rank = get_parallel_state().global_rank
     torch_device = _get_communication_device(init_device)
@@ -998,12 +1165,9 @@ def rank0_load_and_broadcast_weights(
                         # mapped to their PEFT-wrapped ``...base_layer.weight``
                         # destination when the experts module is wrapped by
                         # ``LoraSharedExperts`` / ``LoraIndependentExperts``.
-                        # Bare-key lookup intentionally: ``lora_key_overrides``
-                        # is keyed by base-model FQNs (no ``base_model.model.``
-                        # prefix), and the converter is given the bare key so
-                        # MoE per-expert pattern matches still fire.
-                        if is_peft_model:
-                            key = lora_key_overrides.get(key, "base_model.model." + key)
+                        # Bare key in (converter matches on base-model FQNs) ->
+                        # live-model key out; no-op when not PEFT.
+                        key = _apply_peft_override(key)
                         logger.info_rank0(f"loading {key=}")
                         if _is_all_zero_tensor(tensor):
                             logger.warning_rank0(
@@ -1065,9 +1229,7 @@ def rank0_load_and_broadcast_weights(
                 # above -- finalize() may emit merged keys after every shard
                 # has been read, e.g. the last gate/up pair for the
                 # Qwen3-MoE per-expert -> fused converter.
-                fin_name = result.name
-                if is_peft_model:
-                    fin_name = lora_key_overrides.get(fin_name, "base_model.model." + fin_name)
+                fin_name = _apply_peft_override(result.name)
                 metadata = BroadcastMetadata(False, fin_name, result.tensor.shape, result.tensor.dtype)
                 tensor = result.tensor
             else:

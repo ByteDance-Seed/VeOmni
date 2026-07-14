@@ -94,6 +94,31 @@ def build_lora_key_overrides(model: nn.Module) -> dict[str, str]:
     return overrides
 
 
+def make_peft_key_mapper(model: nn.Module, is_peft_model: bool) -> Callable[[str], str]:
+    """Return a fn mapping a *bare* base-model FQN to its live-model destination.
+
+    Centralises the checkpoint-key remap every weight loader
+    (:func:`~veomni.models.module_utils.load_model_weights` /
+    ``load_model_weights_ep_sharded`` / ``rank0_load_and_broadcast_weights``)
+    needs when a base checkpoint is loaded into a LoRA-wrapped model:
+
+    * ``is_peft_model=False`` -> identity (the checkpoint key is already the
+      live-model key).
+    * ``is_peft_model=True``  -> :func:`build_lora_key_overrides` remap (wrapped
+      targets go to ``...base_layer.weight``) with a plain ``base_model.model.``
+      prefix fallback for un-wrapped params.
+
+    Apply it *after* ``maybe_convert_checkpoint_tensor`` so converter-produced
+    merged keys (e.g. the Qwen3-MoE per-expert -> fused ``...experts.gate_up_proj``)
+    also flow through the ``base_layer.weight`` rename when their experts module is
+    wrapped by ``LoraSharedExperts`` / ``LoraIndependentExperts``.
+    """
+    if not is_peft_model:
+        return lambda bare_name: bare_name
+    overrides = build_lora_key_overrides(model)
+    return lambda bare_name: overrides.get(bare_name, "base_model.model." + bare_name)
+
+
 @torch.no_grad()
 def load_lora_weights(
     model: nn.Module | PreTrainedModel,
@@ -227,6 +252,19 @@ def init_lora_parameter(model: nn.Module, name: str) -> None:
 
 
 def _reset_moe_wrapper(module: nn.Module) -> None:
-    """Reset a MoE wrapper only when all its params are still meta (BUG-3 guard)."""
-    if all(p.is_meta for _, p in module.named_parameters()):
-        module.reset_lora_parameters(init_lora_weights=True)
+    """Fresh-init a MoE wrapper's LoRA params (kaiming ``A`` / zero ``B``).
+
+    ``init_lora_parameter`` is only ever invoked for LoRA tensors the weight
+    loader left *un-loaded* (they stay in ``parameter_names_left``), so a wrapper
+    reaching here always needs initialisation. The previous ``all(p.is_meta)``
+    guard is dead under the standard loaders, which run ``model.to_empty(...)``
+    *before* init — after that no param is on meta, so the guard silently skipped
+    the reset and left the wrapper's ``lora_A`` / ``lora_B`` as the uninitialised
+    (garbage / NaN) storage ``to_empty`` produced. We reset once per wrapper
+    (idempotent); when an adapter *is* loaded, its LoRA tensors are removed from
+    the un-loaded set so this path is never taken for them (loaded weights are
+    never clobbered)."""
+    if getattr(module, "_lora_fresh_reset_done", False):
+        return
+    module.reset_lora_parameters(init_lora_weights=True)
+    module._lora_fresh_reset_done = True

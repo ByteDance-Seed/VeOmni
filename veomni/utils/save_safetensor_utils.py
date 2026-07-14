@@ -247,7 +247,13 @@ def save_lora_adapter_with_dcp(
     All ranks must call this function. It performs:
     1. Extract LoRA-only state from the live model.
     2. Save with ``dcp.save`` in parallel to a temporary DCP directory.
-    3. Consolidate on rank 0 into ``adapter_model.bin`` and ``adapter_config.json``.
+    3. Consolidate on rank 0 into ``adapter_model.safetensors`` and ``adapter_config.json``.
+
+    The consolidated adapter is written as **safetensors** (not a pickled ``.bin``)
+    so a per-rank ExtraParallel-slice reader (``load_model_weights_ep_sharded`` under
+    ``is_peft_model``) can stream only each rank's expert rows of an *independent*
+    MoE-LoRA adapter instead of every rank reading the whole gathered ``[E, ...]``
+    tensor. ``load_adapter_state_dict`` already prefers ``adapter_model.safetensors``.
     """
     from veomni.lora import is_veomni_lora_model
     from veomni.lora.state_dict import get_lora_state_dict
@@ -328,8 +334,11 @@ def save_lora_adapter_with_dcp(
             save_checkpoint_path=dcp_save_path,
             ckpt_manager="dcp",
         )
-        adapter_model_file = os.path.join(save_path, "adapter_model.bin")
-        _save_state_dict(consolidated_state, adapter_model_file, safe_serialization=False)
+        # safetensors needs contiguous, non-aliased tensors; consolidation returns
+        # fresh tensors but ``.contiguous()`` is a cheap no-op when already so.
+        consolidated_state = {k: v.contiguous() for k, v in consolidated_state.items()}
+        adapter_model_file = os.path.join(save_path, "adapter_model.safetensors")
+        _save_state_dict(consolidated_state, adapter_model_file, safe_serialization=True)
 
         # VeOmniLoraModel writes a single PEFT-loadable adapter_config.json
         # (MoE metadata, if any, lives in its ``veomni_lora`` block -- no
