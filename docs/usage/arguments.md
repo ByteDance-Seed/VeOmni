@@ -27,6 +27,7 @@ Top-level configuration that assembles all argument groups.
 
 * `VeOmniArguments` — Root config: `model` + `data` + `train`
 * `VeOmniVLMArguments` — VLM extension of `VeOmniArguments`
+* `VeOmniDiTArguments` — diffusion-transformer extension of `VeOmniArguments`
 
 ---
 
@@ -41,6 +42,10 @@ Model architecture, paths, and multimodal encoder / decoder setup.
 
 * `VLMMModelArguments` — extends `ModelArguments` with encoder data-balancing options
 
+### DiT Extensions
+
+* `DiTModelArguments` — extends `ModelArguments` with condition-model settings
+
 ---
 
 ## Data
@@ -53,6 +58,10 @@ Dataset paths, tokenization, and batching configuration.
 ### VLM Extensions
 
 * `VLMMDataArguments` — extends `DataArguments` with multimodal configs (`mm_configs`)
+
+### DiT Extensions
+
+* `DiTDataArguments` — extends `DataArguments` with diffusion input and offline-embedding settings
 
 ---
 
@@ -74,6 +83,10 @@ Training loop, optimizer, parallelism, checkpointing, profiling, and logging.
 ### VLM Extensions
 
 * `VLMTrainingArguments` — extends `TrainingArguments` with ViT / audio freeze & learning-rate options
+
+### DiT Extensions
+
+* `DiTTrainingArguments` — extends `TrainingArguments` with the diffusion training workflow
 
 ---
 
@@ -241,8 +254,8 @@ NPU validation runs at two times:
 | ep_sharded_stream_load | `bool` | `False` | Opt-in fast/low-memory MoE loader: each rank reads only its ExtraParallel dim-0 slice from the checkpoint. Requires `broadcast_model_weights_from_rank0=False` and a model with an ExtraParallel parallel_plan. |
 | enable_full_determinism | `bool` | `False` | Enable full determinism (bitwise alignment). |
 | enable_batch_invariant_mode | `bool` | `False` | Enable batch invariant mode. |
-| empty_cache_steps | `int` | `500` | Steps between two `torch.cuda.empty_cache()` calls. |
-| gc_steps | `int` | `500` | Steps between two `gc.collect()` calls. Disabled if positive. |
+| empty_cache_steps | `int` | `500` | Steps between device-cache cleanup calls. A non-positive value disables scheduled cleanup. |
+| gc_steps | `int` | `500` | When positive, disable automatic Python GC and run `gc.collect()` every N steps. A non-positive value leaves automatic GC enabled and disables scheduled collection. |
 | eval_steps | `int` | `0` | Steps between evaluations. `0` to disable. |
 | eval_epochs | `int` | `1` | Epochs between evaluations. `0` to disable. |
 | seed | `int` | `42` | Random seed. |
@@ -452,6 +465,35 @@ Extends `DataArguments` with multimodal input configs.
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | mm_configs | `Optional[Dict]` | `{}` | Multimodal input configuration. |
+
+---
+
+## DiT Extensions
+
+Additional fields for diffusion-transformer training, defined in
+`veomni.trainer.dit_trainer`. The root `VeOmniDiTArguments` combines the three
+derived argument groups below.
+
+### DiTModelArguments
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| condition_model_path | `Optional[str]` | `None` | Path to the condition model. |
+| condition_model_cfg | `Optional[Dict]` | `{}` | Condition-model configuration. |
+
+### DiTDataArguments
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| mm_configs | `Optional[Dict]` | `{}` | Multimodal input configuration. |
+| offline_embedding_save_dir | `Optional[str]` | `None` | Directory used to save offline embeddings. |
+| shuffle | `bool` | `True` | Shuffle the training dataset. |
+
+### DiTTrainingArguments
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| training_task | `Literal["offline_training", "online_training", "offline_embedding"]` | `"online_training"` | Select offline training, online training, or offline embedding generation. |
 
 ---
 

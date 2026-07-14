@@ -127,7 +127,7 @@ with DeepSpeed Ulysses sequence parallelism gather/scatter.
 
 - Config: `veomni/arguments/arguments_types.py` — `OpsImplementationConfig`
 - Registration: `veomni/ops/kernels/attention/__init__.py` — `apply_veomni_attention_patch()`
-- Plumbing: `veomni/models/auto.py` — `build_foundation_model(attn_implementation=...)`
+- Plumbing: `veomni/models/auto.py` — `build_foundation_model(ops_implementation=...)`
 
 ---
 
@@ -355,7 +355,7 @@ does not yet implement `swiglu_limit`.
 
 - Config: `veomni/arguments/arguments_types.py` — `OpsImplementationConfig`
 - Dispatch: `veomni/ops/kernels/moe/__init__.py` — `apply_veomni_fused_moe_patch()`
-- Plumbing: `veomni/models/auto.py` — `build_foundation_model(moe_implementation=...)`
+- Plumbing: `veomni/models/auto.py` — `build_foundation_model(ops_implementation=...)`
 
 ---
 

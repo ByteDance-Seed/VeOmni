@@ -570,7 +570,7 @@ Inspired by HuggingFace's own `modular_model_converter.py`, we:
 
 ## Limitations
 
-- **Python 3.9+** required (uses `ast.unparse`)
+- **Python 3.10+** required (matches the standalone `patchgen` package metadata)
 - Generated code may need manual adjustment for complex patches
 - Some HF decorators (e.g., `@use_kernel_forward_from_hub`) may need special handling
 - Does not handle dynamic/conditional patches (use config flags in patches instead)

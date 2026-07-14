@@ -81,8 +81,8 @@ cd ..
 git clone https://github.com/meta-pytorch/torchcodec.git
 cd torchcodec
 
-# Checkout to a specific version for compatibility
-git checkout v0.5.0
+# TorchCodec 0.10 is the release compatible with the PyTorch 2.10 stack above
+git checkout v0.10.0
 
 # Copy the installation script to the torchcodec source directory
 cp ../VeOmni/docs/get_started/installation/install_torchcodec_Ascend.sh .
@@ -100,3 +100,6 @@ pip show torchcodec
 python -c "from torchcodec.decoders import VideoDecoder; print('Success')"
 # If the terminal outputs'Success', it indicates that the torchcodec installation was successful. If an error message is output, it indicates that the installation was not successful
 ```
+
+The helper script performs a source build adapted for Ascend hosts. Validate the import and
+video decode path on the target NPU image after any PyTorch, TorchCodec, CANN, or FFmpeg update.

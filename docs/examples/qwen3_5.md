@@ -94,7 +94,7 @@ bash train.sh tasks/train_text.py configs/text/qwen3_5_sft.yaml \
     --train.accelerator.fsdp_config.fsdp_mode fsdp2 \
     --train.init_device meta \
     --train.max_steps 20 \
-    --train.checkpoint.output_dir /mnt/local/localcache00
+    --train.checkpoint.output_dir ./exp/qwen3_5_9b_sft
 ```
 
 Qwen3.5-35B-A3B. 8X80GB GPU will likely OOM due to the model size. Use 8X192GB GPU or more GPUs.
@@ -107,7 +107,7 @@ bash train.sh tasks/train_text.py configs/text/qwen3_5_sft.yaml \
     --train.accelerator.fsdp_config.fsdp_mode fsdp2 \
     --train.init_device meta \
     --train.global_batch_size 16 \
-    --train.checkpoint.output_dir /mnt/local/localcache00
+    --train.checkpoint.output_dir ./exp/qwen3_5_35b_a3b_sft
 ```
 
 ## Ulysses Sequence Parallelism
@@ -116,17 +116,19 @@ Qwen3.5 supports Ulysses sequence parallelism for both its softmax attention lay
 linear attention (GatedDeltaNet) layers. This enables training with longer sequences by
 distributing the sequence across multiple GPUs.
 
-To enable Ulysses SP, set `ulysses_parallel_size` in your config. The total GPU count must
-equal `data_parallel_size * ulysses_parallel_size`.
+To enable Ulysses SP, set `train.accelerator.ulysses_size`. VeOmni derives the effective
+data-parallel size from the world size and the other parallel dimensions; set
+`train.accelerator.dp_shard_size` only when you need to pin the FSDP shard degree explicitly.
+For the example below, the total GPU count is `dp_shard_size * ulysses_size = 4 * 2 = 8`.
 
 ```shell
 # Example: 8 GPUs, dp=4, sp=2
 bash train.sh tasks/train_text.py configs/text/qwen3_5_sft.yaml \
     --model.model_path ${HOME}/Qwen3.5-9B \
     --data.train_path ${HOME}/tulu-first2000.parquet \
-    --train.data_parallel_size 4 \
-    --train.ulysses_parallel_size 2 \
-    --train.attn_implementation flash_attention_3
+    --train.accelerator.dp_shard_size 4 \
+    --train.accelerator.ulysses_size 2 \
+    --model.ops_implementation.attn_implementation flash_attention_3
 ```
 
 ### Requirements
@@ -136,7 +138,7 @@ bash train.sh tasks/train_text.py configs/text/qwen3_5_sft.yaml \
 - [flash-linear-attention](https://github.com/fla-org/flash-linear-attention) installed
   (for GatedDeltaNet triton kernels).
 - `num_k_heads` and `num_v_heads` (linear attention head counts) must be divisible by
-  `ulysses_parallel_size`.
+  `ulysses_size`.
 
 ### Selecting linear-attention kernels
 

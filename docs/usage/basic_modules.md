@@ -84,7 +84,7 @@ init_parallel_state(
     extra_parallel_sizes=args.train.accelerator.extra_parallel_sizes, # including expert parallel size
     extra_parallel_placement_innermost=args.train.accelerator.extra_parallel_placement_innermost,
     extra_parallel_names=args.train.accelerator.extra_parallel_names,
-    mode=args.train.accelerator.fsdp_config.fsdp_mode, # data parallel mode, can be "ddp" or "fsdp2"
+    dp_mode=args.train.accelerator.fsdp_config.fsdp_mode, # data parallel mode, can be "ddp" or "fsdp2"
     async_enabled=args.train.accelerator.enable_async, # async ulysses
 )
 
@@ -104,10 +104,13 @@ tp_mesh = parallel_state.tp_mesh
 ```
 
 ## Dataset
-VeOmni default supports three types of datasets(source code: [veomni/data/dataset.py](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/data/dataset.py)):
-1. **IterativeDataset** (recommended for large datasets)  
-2. **MappingDataset** (default for small datasets)
-3. **InterleaveDataset** (InterleavedMappingDataset | InterleavedIterableDataset)
+VeOmni registers five dataset builders in [veomni/data/dataset.py](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/data/dataset.py):
+
+1. `mapping` — mapping-style datasets (default for small datasets)
+2. `iterable` — iterable datasets (recommended for large datasets)
+3. `interleave` — interleaved mapping or iterable multisource datasets
+4. `energon` — Megatron-Energon datasets
+5. `veomni_weighted_multisource` — weighted multisource iterable datasets
 
 ```python
 from veomni.data import build_dataset
@@ -183,22 +186,24 @@ def build_custom_dataset(
 ### Data Transform (Preprocess)
 
 #### Text Transform
-VeOmni default supports two types of transform(source code: [veomni/data/data_transform.py](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/data/data_transform.py)):
-1. **process_pretrain_example** (recommended for pretrain task)
-2. **process_sft_example** (recommended for sft task)
+The text transforms are registered in [veomni/data/data_transform.py](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/data/data_transform.py):
+
+1. `plaintext` → `process_plaintext_example`
+2. `conversation` → `process_conversation_example`
+3. `dpo` → `process_dpo_example`
+4. `classification` → `process_classification_example`
 
 **Pretrain Example**:  
 ```python
-from functools import partial
-from veomni.data.data_transform import process_pretrain_example
+from veomni.data import build_data_transform
 from veomni.models import build_tokenizer
 
 tokenizer = build_tokenizer(args.model.tokenizer_path)
 # Can replace with the following code if you want to use the AutoTokenizer from transformers.
 # tokenizer = AutoTokenizer.from_pretrained(args.model.tokenizer_path)
 
-transform = partial(
-    process_pretrain_example,
+transform = build_data_transform(
+    "plaintext",
     tokenizer=tokenizer,
     max_seq_len=args.data.max_seq_len,
     text_keys=args.data.text_keys,
@@ -207,11 +212,12 @@ transform = partial(
 
 **SFT Example**:  
 ```python
+from veomni.data import build_data_transform
 from veomni.data.chat_template import build_chat_template
 
 chat_template = build_chat_template(args.data.chat_template, tokenizer)
-transform = partial(
-    process_sft_example,
+transform = build_data_transform(
+    "conversation",
     chat_template=chat_template,
     max_seq_len=args.data.max_seq_len,
     text_keys=args.data.text_keys,
@@ -219,20 +225,21 @@ transform = partial(
 ```
 
 #### Multimodal Transform
-VeOmni offers several multimodal transform functions (source code: [veomni/data/multimodal/data_transform.py](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/data/multimodal/data_transform.py)):
-1. **process_sample_qwen2_5_vl** (process function for Qwen2VL & Qwen2.5VL)
-2. **process_sample_qwen3_vl** (process function for Qwen3VL-MoE & Qwen3VL-dense)
-3. **process_sample_qwen_omni** (process function for Qwen2.5Omni & Qwen3Omni-MoE)
+VeOmni offers unified multimodal transform functions in [veomni/data/data_transform.py](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/data/data_transform.py):
 
-Example usage in `def build_data_transform` in [veomni/trainer/vlm_trainer.py](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/trainer/vlm_trainer.py).
+1. `process_sample_qwen_vl` for Qwen2-VL, Qwen2.5-VL, Qwen3-VL, and Qwen3.5
+2. `process_sample_qwen_omni` for Qwen2.5-Omni and Qwen3-Omni-MoE
+
+Example usage in `_build_data_transform` in [veomni/trainer/vlm_trainer.py](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/trainer/vlm_trainer.py).
 ```python
+from veomni.data import build_data_transform, build_multimodal_chat_template
 from veomni.models import build_processor
-from veomni.data import build_multimodal_chat_template
+
 processor = build_processor(args.model.tokenizer_path)
 chat_template = build_multimodal_chat_template(args.data.chat_template, processor.tokenizer)
 position_id_func = model.get_position_id_func()
-transform = partial(
-    process_function,
+transform = build_data_transform(
+    model.config.model_type,
     processor=processor,
     chat_template=chat_template,
     position_id_func=position_id_func,
@@ -282,11 +289,11 @@ train_dataloader = build_dataloader(
     global_batch_size=args.train.global_batch_size, # global batch size
     dataloader_batch_size=args.train.dataloader_batch_size, # dataloader batch size, how many micro batches to get with next(train_dataloader), automatically calculate
     max_seq_len=args.data.max_seq_len, # max sequence length
-    train_steps=args.train.train_steps, # train steps, calculate by args.train.compute_train_steps
+    train_steps=args.train_steps, # calculated by args.compute_train_steps
     dyn_bsz=args.train.dyn_bsz, # enable dynamic batching
     bsz_warmup_ratio=args.train.bsz_warmup_ratio, # bsz warmup ratio
     bsz_warmup_init_mbtoken=args.train.bsz_warmup_init_mbtoken, # bsz warmup init micro batch token
-    dyn_bsz_buffer_size=args.train.dyn_bsz_buffer_size, # dynamic batching buffer size
+    dyn_bsz_buffer_size=args.data.dyn_bsz_buffer_size, # dynamic batching buffer size
     num_workers=args.data.dataloader.num_workers, # dataloader num workers
     drop_last=args.data.dataloader.drop_last,  # dataloader drop last
     pin_memory=args.data.dataloader.pin_memory,  # dataloader pin memory
@@ -336,8 +343,7 @@ model = build_foundation_model(
     weights_path=args.model.model_path, # model weights path, can be None if config_path is not None
     init_device=args.train.init_device, # model init device
     torch_dtype="float32" if args.train.accelerator.fsdp_config.mixed_precision.enable else "bfloat16",
-    attn_implementation=args.model.ops_implementation.attn_implementation,
-    moe_implementation=args.model.ops_implementation.moe_implementation,
+    ops_implementation=args.model.ops_implementation,
     config_kwargs=config_kwargs,
 )
 
@@ -352,7 +358,6 @@ model = build_parallelize_model(
     model,
     init_device=args.train.init_device, # model init device
     weights_path=args.model.model_path,
-    enable_full_shard=args.train.accelerator.fsdp_config.full_shard, # enable full shard, same to Zero3
     enable_reshard_after_forward=args.train.accelerator.fsdp_config.reshard_after_forward, # enable reshard after forward for FSDP2
     mixed_precision=args.train.accelerator.fsdp_config.mixed_precision, # enable mixed precision
     enable_gradient_checkpointing=args.train.gradient_checkpointing.enable, # enable gradient checkpointing
@@ -361,6 +366,7 @@ model = build_parallelize_model(
     enable_reentrant=args.train.gradient_checkpointing.enable_reentrant,
     enable_forward_prefetch=args.train.accelerator.fsdp_config.forward_prefetch,
     broadcast_model_weights_from_rank0=args.train.broadcast_model_weights_from_rank0, # load model weights
+    ep_sharded_stream_load=args.train.ep_sharded_stream_load,
     max_load_broadcast_size=args.train.accelerator.fsdp_config.max_load_broadcast_size, # max load broadcast size
 )
 ```
@@ -414,7 +420,7 @@ optimizer = build_optimizer(
 
 lr_scheduler = build_lr_scheduler(
     optimizer,
-    train_steps=args.train.train_steps * args.train.num_train_epochs,
+    train_steps=args.train_steps * args.train.num_train_epochs,
     # ... other parameters
 )
 ```
@@ -426,7 +432,7 @@ After the parallel_state, model, optimizer, and dataloader are initialized, you 
 ```python
 for epoch in range(args.train.num_train_epochs):
     data_iterator = iter(train_dataloader)
-    for _ in range(args.train.train_steps):
+    for _ in range(args.train_steps):
         micro_batches = next(data_iterator)
         for micro_batch in micro_batches:
             loss = model(**micro_batch).loss / len(micro_batches)

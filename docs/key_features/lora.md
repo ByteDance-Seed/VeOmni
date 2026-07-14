@@ -522,13 +522,18 @@ bash train.sh tasks/train_text.py configs/text/qwen3_moe_lora.yaml \
     --train.checkpoint.load_path auto
 ```
 
-Resume from a saved adapter (DCP path is auto-detected via `load_path: auto`; an HF
-adapter resume goes through `model.lora_config.lora_adapter`):
+Resume from a saved adapter by setting `lora_adapter` inside the YAML dictionary. DCP
+checkpoints remain auto-detected through `train.checkpoint.load_path: auto`.
+
+```yaml
+model:
+  lora_config:
+    lora_adapter: ./exp/qwen3_moe_lora/global_step_500
+```
 
 ```shell
 bash train.sh tasks/train_text.py configs/text/qwen3_moe_lora.yaml \
-    --model.model_path                 /path/to/Qwen3-30B-A3B \
-    --model.lora_config.lora_adapter   ./exp/qwen3_moe_lora/global_step_500
+    --model.model_path /path/to/Qwen3-30B-A3B
 ```
 
 DeepSeek-V3 (v5) follows the same shape — see

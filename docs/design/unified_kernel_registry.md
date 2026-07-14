@@ -268,15 +268,19 @@ class OpsImplementationConfig:
         "native-sparse",
     ] = "flash_attention_2"
 
-    # Per-op implementation selection (all default to "eager" = original HF code)
-    rms_norm_implementation: str = "eager"
-    rms_norm_gated_implementation: str = "eager"   # (proposed — not yet shipped)
-    rotary_pos_emb_implementation: str = "eager"
-    swiglu_mlp_implementation: str = "eager"
-    # MoE: single-field backend selection — no silent hardware fallback.
-    moe_implementation: Literal["eager", "fused_triton", "fused_quack", "fused_npu"] = "eager"
-    cross_entropy_loss_implementation: str = "eager"
-    load_balancing_loss_implementation: str = "eager"
+    # Per-op fields remain strings so third-party backends can register values.
+    moe_implementation: str = "fused_triton"
+    cross_entropy_loss_implementation: str = "liger_kernel"
+    rms_norm_implementation: str = "liger_kernel"
+    swiglu_mlp_implementation: str = "liger_kernel"
+    rotary_pos_emb_implementation: str = "liger_kernel"
+    rotary_pos_emb_vision_implementation: str = "eager"
+    load_balancing_loss_implementation: str = "triton"
+    rms_norm_gated_implementation: str = "fla"
+    causal_conv1d_implementation: str = "fla"
+    chunk_gated_delta_rule_implementation: str = "fla"
+    dsa_indexer_backend: Literal["eager", "cudnn"] = "eager"
+    dsa_attention_backend: Literal["eager", "flashmla_cudnn"] = "eager"
 ```
 
 **Shipped today** (what is actually on `OpsImplementationConfig` as of this
@@ -347,10 +351,10 @@ User YAML                    OpsImplementationConfig              OpSlot.bind()
 ─────────                    ───────────────────────              ─────────────
 model:                       @dataclass
   ops_implementation:  ───→  class OpsImplementationConfig:
-    moe_implementation:          moe_implementation: Literal[...]
+    moe_implementation:          moe_implementation: str
       fused_triton                         │
                                            ▼
-                             build_foundation_model(config)
+                             build_foundation_model(config, ops_implementation=ops)
                                ├─ import patched_modeling_qwen3_5_moe_gpu
                                │    └─ module-level OpSlot instances created:
                                │         veomni_apply_rotary_pos_emb = OpSlot(...)
@@ -729,7 +733,7 @@ OpsImplementationConfig.__post_init__()            # (3) config parse time
   └─ rewrite attn_implementation for SP
   └─ validate configured backends
 
-build_foundation_model(config)                     # (4) model build time
+build_foundation_model(config, ops_implementation=ops) # (4) model build time
   ├─ import patched_modeling_qwen3_5_moe_gpu       #     generated module
   │    └─ module-level OpSlot instances created:    #     (at import time)
   │         veomni_apply_rotary_pos_emb  = OpSlot("apply_rotary_pos_emb", "partial")
