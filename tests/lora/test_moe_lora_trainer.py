@@ -23,7 +23,7 @@ emit, then validates both resume paths bit-exact (modulo bf16 storage):
          (model + optimizer + extra_state -- the format ``BaseTrainer``
          resumes via ``train.checkpoint.load_path``).
        - HF-format LoRA adapter under ``<output_dir>/global_step_<S>/``
-         (``adapter_model.bin`` + ``adapter_config.json``; the MoE mode +
+         (``adapter_model.safetensors`` + ``adapter_config.json``; the MoE mode +
          rank/alpha VeOmni's wrappers need to re-install themselves on resume
          live in the ``veomni_lora`` block of ``adapter_config.json``) -- the
          format ``BaseTrainer`` resumes via ``model.lora_config.lora_adapter``.
@@ -288,7 +288,7 @@ class MoeLoraTrainer(BaseTrainer):
         # ``train.checkpoint.load_path`` resume case in the resume test
         # depends on its ``on_train_begin`` reload hook.
         self.checkpointer_callback = CheckpointerCallback(self)
-        # HFLoraCkptCallback emits the HF-format LoRA adapter (adapter_model.bin
+        # HFLoraCkptCallback emits the HF-format LoRA adapter (adapter_model.safetensors
         # + adapter_config.json with the veomni_lora MoE block) at every
         # save_step. It also
         # extends DCP saves but no-ops if the DCP dir already exists, so
@@ -484,7 +484,7 @@ def _compare_snapshots_bit_exact(actual_path: str, ref_path: str, *, label: str)
     Both sides are cast to bf16 before ``torch.equal`` because that's the
     coarsest precision either resume path round-trips through:
 
-    * The HF LoRA-adapter path writes ``adapter_model.bin`` at the
+    * The HF LoRA-adapter path writes ``adapter_model.safetensors`` at the
       model's storage dtype (bf16 for the toy yaml -- PEFT's
       ``save_pretrained`` casts to ``model.dtype``), so the on-disk
       bytes are bf16.
@@ -609,7 +609,9 @@ def _assert_writer_artifacts_exist(writer_dir: str, mode: str, *, final_step: in
     assert os.path.isdir(hf_dir), f"[{mode}] missing HF LoRA adapter dir at {hf_dir}"
     # VeOmniLoraModel embeds MoE metadata inside adapter_config.json (under the
     # ``veomni_lora`` block) instead of the legacy ``veomni_moe_lora.json`` sidecar.
-    for fname in ("adapter_model.bin", "adapter_config.json"):
+    # The consolidated adapter is written as safetensors (sliceable per-rank by
+    # the ep_sharded streaming loader), not the legacy ``adapter_model.bin``.
+    for fname in ("adapter_model.safetensors", "adapter_config.json"):
         path = os.path.join(hf_dir, fname)
         assert os.path.isfile(path), f"[{mode}] missing {fname} in {hf_dir}: {os.listdir(hf_dir)}"
     with open(os.path.join(hf_dir, "adapter_config.json")) as f:

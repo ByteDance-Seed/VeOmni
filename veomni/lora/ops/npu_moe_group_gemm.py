@@ -146,10 +146,14 @@ def _npu_fused_lora_moe_forward(
 ) -> torch.Tensor:
     """NPU single-device (non-EP) fused MoE forward + seed-style two-LoRA."""
     hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
-    permuted_hidden_states, row_ids_map = torch_npu.npu_moe_token_permute(
-        hidden_states, selected_experts.to(torch.int32)
+    # ``selected_experts`` is int64 (topk); NPU permute + the group-gemm group
+    # list both need int32. ``torch.histc`` only accepts float input and returns
+    # float, so bin on float32 and cast the counts back to int32.
+    selected_experts = selected_experts.to(torch.int32)
+    permuted_hidden_states, row_ids_map = torch_npu.npu_moe_token_permute(hidden_states, selected_experts)
+    tokens_per_expert = torch.histc(selected_experts.to(torch.float32), bins=num_experts, min=0, max=num_experts).to(
+        torch.int32
     )
-    tokens_per_expert = torch.histc(selected_experts, bins=num_experts, min=0, max=num_experts)
 
     gate_up = npu_group_gemm(permuted_hidden_states, fc1_1_2_weight.transpose(1, 2), tokens_per_expert)
     gate_up = gate_up + _lora_gate_up_delta(
@@ -200,6 +204,10 @@ def _npu_ep_fused_lora_moe_forward(
     count the base group-gemm uses.
     """
     hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
+    # NPU expert routing/indexing (dispatch_preprocess + alltoall_dispatch)
+    # expects int32; ``selected_experts`` is int64 (topk), so cast up front to
+    # match the non-EP path and avoid dtype mismatches in the dispatch.
+    selected_experts = selected_experts.to(torch.int32)
     input_splits, output_splits, num_global_tokens_per_local_expert, num_global_sum_tokens_per_local_expert = (
         dispatch_preprocess(selected_experts, num_experts, ep_group)
     )
