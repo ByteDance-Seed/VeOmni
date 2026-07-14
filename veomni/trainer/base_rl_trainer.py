@@ -41,6 +41,12 @@ class BaseRLTrainer(BaseTrainer):
         super().__init__(args)
         self._build_preforward_postforward()
 
+    def _setup(self):
+        if self.args.train.chunk_mbs_config.enable:
+            raise ValueError("ChunkMBS is not supported by RL trainers yet.")
+
+        super()._setup()
+
     # post init preforward and postforward hooks
     def _build_preforward_postforward(self):
         """Build preforward and postforward hooks."""

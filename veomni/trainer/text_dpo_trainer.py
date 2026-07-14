@@ -24,7 +24,6 @@ from transformers import PreTrainedModel
 from ..arguments import MixedPrecisionConfig, VeOmniArguments
 from ..data import build_chat_template, build_data_transform
 from ..data.data_collator import PostCollator
-from ..distributed.chunk_mbs import chunk_mbs_context
 from ..distributed.clip_grad_norm import veomni_clip_grad_norm
 from ..distributed.parallel_state import get_parallel_state
 from ..distributed.sequence_parallel import gather_outputs
@@ -138,6 +137,8 @@ class TextDPOTrainer:
     reference_model: PreTrainedModel
 
     def __init__(self, args: VeOmniDPOArguments):
+        if args.train.chunk_mbs_config.enable:
+            raise ValueError("ChunkMBS is not supported by the DPO trainer yet.")
         self.base = BaseTrainer.__new__(BaseTrainer)
         self.base.args = args
 
@@ -215,7 +216,6 @@ class TextDPOTrainer:
             broadcast_model_weights_from_rank0=args.train.broadcast_model_weights_from_rank0,
             cpu_load_param_name=cpu_load_param_name,
             max_load_broadcast_size=args.train.accelerator.fsdp_config.max_load_broadcast_size,
-            chunk_mbs_config=args.train.chunk_mbs_config if args.train.chunk_mbs_config.enable else None,
         )
         self.reference_model.eval()
         helper.print_device_mem_info("VRAM usage after building reference model")
@@ -321,16 +321,11 @@ class TextDPOTrainer:
         dpo_config = args.dpo_config
 
         micro_batch = self.base.preforward(micro_batch)
-        chunk_ranges = getattr(self.base, "_chunk_mbs_ranges", None)
 
-        with chunk_mbs_context(chunk_ranges), torch.no_grad():
+        with torch.no_grad():
             ref_chosen_logps, ref_rejected_logps = self.concatenated_forward(self.reference_model, micro_batch)
 
-        with (
-            chunk_mbs_context(chunk_ranges),
-            self.base.model_fwd_context,
-            set_batch_invariant_mode(args.train.enable_batch_invariant_mode),
-        ):
+        with self.base.model_fwd_context, set_batch_invariant_mode(args.train.enable_batch_invariant_mode):
             policy_chosen_logps, policy_rejected_logps = self.concatenated_forward(self.base.model, micro_batch)
 
         losses, chosen_rewards, rejected_rewards = self.dpo_loss(
@@ -355,11 +350,7 @@ class TextDPOTrainer:
             "reward_margin": (chosen_rewards - rejected_rewards).mean().detach(),
         }
 
-        with (
-            chunk_mbs_context(chunk_ranges),
-            self.base.model_bwd_context,
-            set_batch_invariant_mode(args.train.enable_batch_invariant_mode),
-        ):
+        with self.base.model_bwd_context, set_batch_invariant_mode(args.train.enable_batch_invariant_mode):
             loss.backward()
 
         del micro_batch

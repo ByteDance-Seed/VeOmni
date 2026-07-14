@@ -1,4 +1,5 @@
 import copy
+import sys
 import types
 from functools import partial
 
@@ -93,6 +94,44 @@ def test_build_chunk_mbs_ranges_rejects_non_increasing_segments(cu_seq_lens_q):
 def test_build_chunk_mbs_ranges_rejects_nonzero_start():
     with pytest.raises(ValueError, match="start from 0"):
         build_chunk_mbs_ranges({"cu_seq_lens_q": torch.tensor([1, 3, 5], dtype=torch.int32)}, _config(chunk_mbs=1))
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bool, torch.int64])
+def test_build_chunk_mbs_ranges_rejects_invalid_cu_seq_lens_dtype(dtype):
+    with pytest.raises(TypeError, match="cu_seq_lens_q must use torch.int32"):
+        build_chunk_mbs_ranges({"cu_seq_lens_q": torch.tensor([0, 3, 5], dtype=dtype)}, _config(chunk_mbs=1))
+
+
+def test_build_chunk_mbs_ranges_rejects_asymmetric_qk_metadata():
+    batch = {
+        "cu_seq_lens_q": torch.tensor([0, 3, 5], dtype=torch.int32),
+        "cu_seq_lens_k": torch.tensor([0, 2, 5], dtype=torch.int32),
+    }
+
+    with pytest.raises(ValueError, match="identical cu_seq_lens_q and cu_seq_lens_k"):
+        build_chunk_mbs_ranges(batch, _config(chunk_mbs=1))
+
+
+def test_build_chunk_mbs_ranges_rejects_asymmetric_qk_max_lengths():
+    batch = {
+        "cu_seq_lens_q": torch.tensor([0, 3, 5], dtype=torch.int32),
+        "cu_seq_lens_k": torch.tensor([0, 3, 5], dtype=torch.int32),
+        "max_length_q": 3,
+        "max_length_k": 4,
+    }
+
+    with pytest.raises(ValueError, match="identical max_length_q and max_length_k"):
+        build_chunk_mbs_ranges(batch, _config(chunk_mbs=1))
+
+
+def test_build_chunk_mbs_ranges_rejects_non_integer_linear_attn_cu_seq_lens():
+    batch = {
+        "cu_seq_lens_q": torch.tensor([0, 3, 5], dtype=torch.int32),
+        "linear_attn_cu_seq_lens_q": torch.tensor([0.0, 3.0, 5.0]),
+    }
+
+    with pytest.raises(TypeError, match="linear_attn_cu_seq_lens_q must use torch.int32"):
+        build_chunk_mbs_ranges(batch, _config(chunk_mbs=1))
 
 
 @pytest.mark.parametrize(
@@ -191,6 +230,10 @@ class _AuxDecoderLayer(GradientCheckpointingLayer):
         return hidden_states
 
 
+class _ToyMoeDecoderLayer(_ToyDecoderLayer):
+    pass
+
+
 class _PlainDecoderLayer(nn.Module):
     def forward(self, hidden_states):
         return hidden_states
@@ -215,6 +258,106 @@ class _ToyRoot(nn.Module):
     def gradient_checkpointing_disable(self):
         for layer in self.model.language_model.layers:
             layer.gradient_checkpointing = False
+
+
+class _FSDPDecoderLayer(GradientCheckpointingLayer):
+    def __init__(self):
+        super().__init__()
+        self.proj = nn.Linear(4, 4)
+
+    def forward(self, hidden_states, **kwargs):
+        return self.proj(hidden_states)
+
+
+class _FSDPRoot(nn.Module):
+    _no_split_modules = ["_FSDPDecoderLayer"]
+
+    def __init__(self):
+        super().__init__()
+        self.layers = nn.ModuleList([_FSDPDecoderLayer()])
+
+    def gradient_checkpointing_enable(self, checkpoint_func=None, gradient_checkpointing_kwargs=None):
+        if checkpoint_func is None:
+            checkpoint_func = partial(checkpoint, **(gradient_checkpointing_kwargs or {}))
+        for layer in self.layers:
+            layer.gradient_checkpointing = True
+            layer._gradient_checkpointing_func = checkpoint_func
+
+
+def _local_tensor(tensor):
+    return tensor.to_local() if hasattr(tensor, "to_local") else tensor
+
+
+def _run_real_fsdp2_chunk_mbs(rank, world_size, init_path):
+    import torch.distributed as dist
+    from torch.distributed._composable.fsdp import fully_shard
+    from torch.distributed.device_mesh import init_device_mesh
+
+    import veomni.distributed.chunk_mbs as chunk_mbs
+
+    dist.init_process_group("gloo", init_method=f"file://{init_path}", rank=rank, world_size=world_size)
+    try:
+        chunk_mbs.get_parallel_state = lambda: types.SimpleNamespace(
+            sp_enabled=False,
+            tp_enabled=False,
+            pp_enabled=False,
+            any_extra_parallel_enabled=False,
+        )
+        torch.manual_seed(0)
+        baseline_root = _FSDPRoot()
+        chunked_root = copy.deepcopy(baseline_root)
+        baseline_layer = baseline_root.layers[0]
+        chunked_layer = chunked_root.layers[0]
+        checkpoint_calls = []
+        hook_calls = []
+
+        baseline_root.gradient_checkpointing_enable(partial(checkpoint, use_reentrant=False))
+
+        def checkpoint_func(function, *args, **kwargs):
+            checkpoint_calls.append(None)
+            return checkpoint(function, *args, use_reentrant=False, **kwargs)
+
+        chunked_root.gradient_checkpointing_enable(checkpoint_func)
+        apply_chunk_mbs(chunked_root, _config(chunk_mbs=2))
+
+        mesh = init_device_mesh("cpu", (world_size,))
+        fully_shard(baseline_layer, mesh=mesh)
+        fully_shard(chunked_layer, mesh=mesh)
+        chunked_layer.register_forward_pre_hook(lambda *_: hook_calls.append("pre"))
+        chunked_layer.register_forward_hook(lambda *_: hook_calls.append("post"))
+
+        cu_seq_lens = torch.tensor([0, 1, 2, 3, 4], dtype=torch.int32)
+        ranges = build_chunk_mbs_ranges(
+            {"cu_seq_lens_q": cu_seq_lens, "cu_seq_lens_k": cu_seq_lens}, _config(chunk_mbs=2)
+        )
+        baseline_hidden = torch.randn(1, 4, 4, requires_grad=True)
+        chunked_hidden = baseline_hidden.detach().clone().requires_grad_()
+        forward_kwargs = {
+            "attention_mask": torch.ones(1, 1, 4, 4),
+            "position_ids": torch.arange(4).view(1, 4),
+            "cu_seq_lens_q": cu_seq_lens,
+            "cu_seq_lens_k": cu_seq_lens,
+            "max_length_q": 1,
+            "max_length_k": 1,
+        }
+
+        baseline_output = baseline_layer(baseline_hidden, **forward_kwargs)
+        baseline_output.float().square().mean().backward()
+        with chunk_mbs_context(ranges):
+            chunked_output = chunked_layer(chunked_hidden, **forward_kwargs)
+            chunked_output.float().square().mean().backward()
+
+        torch.testing.assert_close(chunked_output, baseline_output)
+        torch.testing.assert_close(chunked_hidden.grad, baseline_hidden.grad)
+        baseline_grads = {name: _local_tensor(param.grad) for name, param in baseline_layer.named_parameters()}
+        chunked_grads = {name: _local_tensor(param.grad) for name, param in chunked_layer.named_parameters()}
+        assert chunked_grads.keys() == baseline_grads.keys()
+        for name, baseline_grad in baseline_grads.items():
+            torch.testing.assert_close(chunked_grads[name], baseline_grad)
+        assert checkpoint_calls == [None, None]
+        assert hook_calls == ["pre", "post"]
+    finally:
+        dist.destroy_process_group()
 
 
 class _Qwen3VLRoot(nn.Module):
@@ -484,9 +627,9 @@ def test_apply_chunk_mbs_matches_qwen3_vl_decoder_layer(monkeypatch, use_checkpo
         baseline_layer.gradient_checkpointing = True
         baseline_layer._gradient_checkpointing_func = partial(checkpoint, use_reentrant=False)
 
-        def checkpoint_func(function, *args):
+        def checkpoint_func(function, *args, **kwargs):
             checkpoint_calls.append(None)
-            return checkpoint(function, *args, use_reentrant=False)
+            return checkpoint(function, *args, use_reentrant=False, **kwargs)
 
         chunked_layer.gradient_checkpointing = True
         chunked_layer._gradient_checkpointing_func = checkpoint_func
@@ -536,10 +679,13 @@ def test_apply_chunk_mbs_matches_qwen3_vl_decoder_layer(monkeypatch, use_checkpo
     )
 
     if use_checkpoint:
-        assert checkpoint_calls == [None]
+        assert checkpoint_calls == [None, None]
         assert chunked_layer.gradient_checkpointing
-
-    assert chunked_hook_calls == baseline_hook_calls
+        assert baseline_hook_calls[:2] == ["pre", "post"]
+        assert baseline_hook_calls.count("pre") == 2
+        assert chunked_hook_calls == ["pre", "post"]
+    else:
+        assert chunked_hook_calls == baseline_hook_calls == ["pre", "post"]
 
     torch.testing.assert_close(chunked_output, baseline_output, rtol=1e-5, atol=1e-5)
     torch.testing.assert_close(chunked_hidden_grad, baseline_hidden_grad, rtol=1e-5, atol=1e-5)
@@ -562,6 +708,48 @@ def test_replace_hidden_states_does_not_mutate_kwargs():
     assert kwargs["hidden_states"] is hidden_states
 
 
+def test_chunk_mbs_checkpoint_tracks_keyword_hidden_states(monkeypatch):
+    import veomni.distributed.chunk_mbs as chunk_mbs
+
+    monkeypatch.setattr(
+        chunk_mbs,
+        "get_parallel_state",
+        lambda: types.SimpleNamespace(sp_enabled=False, any_extra_parallel_enabled=False),
+    )
+    model = _ToyRoot()
+    layer = model.model.language_model.layers[0]
+    model.gradient_checkpointing_enable(partial(checkpoint, use_reentrant=False))
+    apply_chunk_mbs(model, _config(chunk_mbs=2))
+
+    cu_seq_lens = torch.tensor([0, 1, 2, 3, 4], dtype=torch.int32)
+    ranges = build_chunk_mbs_ranges({"cu_seq_lens_q": cu_seq_lens, "cu_seq_lens_k": cu_seq_lens}, _config(chunk_mbs=2))
+    hidden_states = torch.zeros(1, 4, 2, requires_grad=True)
+    with chunk_mbs_context(ranges):
+        output = layer(
+            hidden_states=hidden_states,
+            position_embeddings=(torch.ones_like(hidden_states), torch.ones_like(hidden_states)),
+            attention_mask=torch.ones(1, 1, 4, 4),
+            position_ids=torch.arange(4).view(1, 4),
+            cu_seq_lens_q=cu_seq_lens,
+            cu_seq_lens_k=cu_seq_lens,
+            max_length_q=1,
+            max_length_k=1,
+        )
+        output.sum().backward()
+
+    assert torch.equal(hidden_states.grad, torch.ones_like(hidden_states))
+
+
+@pytest.mark.parametrize("shape", [(2, 4, 2), (4, 2)])
+def test_chunked_forward_rejects_non_packed_hidden_state_shape(shape):
+    import veomni.distributed.chunk_mbs as chunk_mbs
+
+    ranges = [PackedSequenceRange(segment_start=0, segment_end=1, token_start=0, token_end=4, max_length=4)]
+
+    with pytest.raises(ValueError, match=r"shape \[1, sequence, hidden\]"):
+        chunk_mbs._chunked_forward(lambda hidden_states: hidden_states, ranges, (torch.zeros(shape),), {})
+
+
 def test_apply_chunk_mbs_rejects_sequence_parallel(monkeypatch):
     import veomni.distributed.chunk_mbs as chunk_mbs
 
@@ -573,6 +761,39 @@ def test_apply_chunk_mbs_rejects_sequence_parallel(monkeypatch):
 
     with pytest.raises(RuntimeError, match="sequence parallelism"):
         apply_chunk_mbs(_ToyRoot(), _config(chunk_mbs=2))
+
+
+@pytest.mark.parametrize("mode", ["tp_enabled", "pp_enabled"])
+def test_apply_chunk_mbs_rejects_tensor_and_pipeline_parallelism(monkeypatch, mode):
+    import veomni.distributed.chunk_mbs as chunk_mbs
+
+    parallel_state = types.SimpleNamespace(
+        sp_enabled=False,
+        tp_enabled=False,
+        pp_enabled=False,
+        any_extra_parallel_enabled=False,
+    )
+    setattr(parallel_state, mode, True)
+    monkeypatch.setattr(chunk_mbs, "get_parallel_state", lambda: parallel_state)
+
+    with pytest.raises(RuntimeError, match="tensor or pipeline parallelism"):
+        apply_chunk_mbs(_ToyRoot(), _config(chunk_mbs=2))
+
+
+def test_apply_chunk_mbs_rejects_moe_decoder_layer(monkeypatch):
+    import veomni.distributed.chunk_mbs as chunk_mbs
+
+    monkeypatch.setattr(
+        chunk_mbs,
+        "get_parallel_state",
+        lambda: types.SimpleNamespace(sp_enabled=False, any_extra_parallel_enabled=False),
+    )
+    model = nn.Module()
+    model._no_split_modules = ["_ToyMoeDecoderLayer"]
+    model.decoder = nn.ModuleList([_ToyMoeDecoderLayer()])
+
+    with pytest.raises(RuntimeError, match="MoE decoder layers"):
+        apply_chunk_mbs(model, _config(chunk_mbs=2))
 
 
 def test_apply_chunk_mbs_requires_decoder_layer_in_no_split_modules(monkeypatch):
@@ -700,3 +921,37 @@ def test_build_parallelize_model_applies_chunk_mbs_before_fsdp2(monkeypatch):
         output.sum().backward()
 
     assert torch.equal(hidden_states.grad, torch.ones_like(hidden_states))
+
+
+@pytest.mark.skipif(sys.platform == "darwin", reason="CPU FSDP2 process groups are not supported on macOS CI.")
+def test_chunk_mbs_recompute_with_real_fsdp2(tmp_path):
+    torch.multiprocessing.spawn(
+        _run_real_fsdp2_chunk_mbs,
+        args=(2, str(tmp_path / "pg")),
+        nprocs=2,
+        join=True,
+    )
+
+
+@pytest.mark.parametrize(
+    ("compile_config", "enable_reentrant", "match"),
+    [
+        (types.SimpleNamespace(enable=True), False, "not supported with torch.compile"),
+        (None, True, "requires non-reentrant gradient checkpointing"),
+    ],
+)
+def test_build_parallelize_model_rejects_unsupported_chunk_mbs_combinations(
+    monkeypatch, compile_config, enable_reentrant, match
+):
+    import veomni.distributed.torch_parallelize as torch_parallelize
+
+    monkeypatch.setattr(torch_parallelize, "get_parallel_state", lambda: object())
+
+    with pytest.raises(ValueError, match=match):
+        torch_parallelize.build_parallelize_model(
+            _ToyRoot(),
+            mixed_precision=MixedPrecisionConfig(enable=False),
+            compile_config=compile_config,
+            chunk_mbs_config=_config(chunk_mbs=2),
+            enable_reentrant=enable_reentrant,
+        )

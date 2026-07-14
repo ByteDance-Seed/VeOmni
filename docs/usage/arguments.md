@@ -329,12 +329,15 @@ NPU validation runs at two times:
 
 `chunk_mbs` is the number of packed samples per layer chunk. With dynamic batching, the runtime sample
 count is inferred from `cu_seq_lens_q`, so it is independent of `train.micro_batch_size`. Chunks are cut
-only on packed sample boundaries. The current implementation requires packed-sequence FlashAttention kwargs,
-exactly one `*DecoderLayer` class and one matching decoder stack, decoder layers derived from Transformers'
-`GradientCheckpointingLayer`, batch-first `[batch, sequence, hidden]` decoder states, sequence parallelism disabled,
-and ExtraParallel/MoE disabled. Chunk boundaries must also align with linear-attention cumulative sequence boundaries
-when that metadata is present. Models with ambiguous decoder classes or stacks fail validation instead of applying
-ChunkMBS to multiple stacks.
+only on packed sample boundaries. The current implementation supports trainer-based SFT with packed-sequence
+FlashAttention kwargs using `torch.int32` cumulative lengths, identical query/key metadata, exactly one
+`*DecoderLayer` class and one matching decoder stack, decoder layers derived from Transformers'
+`GradientCheckpointingLayer`, and decoder states with shape `[1, sequence, hidden]`. Gradient checkpointing may be
+enabled or disabled; when enabled, it must use the non-reentrant implementation. Sequence parallelism,
+tensor parallelism, pipeline parallelism, ExtraParallel/MoE, RL trainers, DPO, the custom Omni training loop,
+`pad_to_length`, and `torch.compile` are not supported. Chunk boundaries must also align with linear-attention
+cumulative sequence boundaries when that metadata is present. Models with ambiguous decoder classes or stacks fail
+validation instead of applying ChunkMBS to multiple stacks.
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |

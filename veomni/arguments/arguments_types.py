@@ -1323,6 +1323,17 @@ class VeOmniArguments:
                 self.train.pad_to_length = self.train.micro_batch_size * self.data.max_seq_len
                 logger.info_rank0(f"set pad_to_length = micro_batch_size * max_seq_len = {self.train.pad_to_length}")
 
+        if self.train.chunk_mbs_config.enable:
+            if self.train.pad_to_length:
+                raise ValueError("train.chunk_mbs_config.enable is not supported with train.pad_to_length yet.")
+            if self.train.gradient_checkpointing.enable and self.train.gradient_checkpointing.enable_reentrant:
+                raise ValueError(
+                    "train.chunk_mbs_config.enable requires non-reentrant gradient checkpointing. "
+                    "Set train.gradient_checkpointing.enable_reentrant=False."
+                )
+            if self.data.data_type == "dpo":
+                raise ValueError("train.chunk_mbs_config.enable is not supported by the DPO trainer yet.")
+
         if self.train.torch_compile.enable:
             if self.train.chunk_mbs_config.enable:
                 raise ValueError(

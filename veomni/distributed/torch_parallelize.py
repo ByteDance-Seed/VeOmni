@@ -519,6 +519,13 @@ def build_parallelize_model(
 
     parallel_state = get_parallel_state()
     compile_config = compile_config or CompileConfig()
+    chunk_mbs_config = kwargs.pop("chunk_mbs_config", None)
+
+    if chunk_mbs_config is not None and chunk_mbs_config.enable:
+        if compile_config.enable:
+            raise ValueError("ChunkMBS is not supported with torch.compile yet.")
+        if enable_gradient_checkpointing and kwargs.get("enable_reentrant", False):
+            raise ValueError("ChunkMBS requires non-reentrant gradient checkpointing.")
 
     if not parallel_state.fsdp_enabled:
         if kwargs.get("init_device") not in ["cuda", "npu"]:
@@ -540,7 +547,6 @@ def build_parallelize_model(
             },
         )
 
-    chunk_mbs_config = kwargs.pop("chunk_mbs_config", None)
     if chunk_mbs_config is not None and chunk_mbs_config.enable:
         model = apply_chunk_mbs(model, chunk_mbs_config)
 

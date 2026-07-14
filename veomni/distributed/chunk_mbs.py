@@ -42,6 +42,7 @@ class PackedSequenceRange:
 
 
 _chunk_mbs_ranges: ContextVar[Optional[list[PackedSequenceRange]]] = ContextVar("chunk_mbs_ranges", default=None)
+_chunk_mbs_checkpoint_func: ContextVar[Optional[Any]] = ContextVar("chunk_mbs_checkpoint_func", default=None)
 
 
 @contextmanager
@@ -65,11 +66,16 @@ def build_chunk_mbs_ranges(batch: dict[str, Any], config: Any) -> Optional[list[
     if cu_seq_lens_q is None:
         raise ValueError("ChunkMBS requires packed-sequence FlashAttention kwargs: missing cu_seq_lens_q.")
 
-    if cu_seq_lens_q.ndim != 1:
-        raise ValueError(f"cu_seq_lens_q must be a 1D tensor, got shape {tuple(cu_seq_lens_q.shape)}.")
-
-    if cu_seq_lens_q.device.type != "cpu":
-        raise RuntimeError("ChunkMBS ranges must be built before cu_seq_lens_q is moved off CPU.")
+    _validate_cu_seq_lens(cu_seq_lens_q, "cu_seq_lens_q")
+    cu_seq_lens_k = batch.get("cu_seq_lens_k")
+    if cu_seq_lens_k is not None:
+        _validate_cu_seq_lens(cu_seq_lens_k, "cu_seq_lens_k")
+        if not torch.equal(cu_seq_lens_q, cu_seq_lens_k):
+            raise ValueError("ChunkMBS currently requires identical cu_seq_lens_q and cu_seq_lens_k.")
+    max_length_q = batch.get("max_length_q")
+    max_length_k = batch.get("max_length_k")
+    if max_length_q is not None and max_length_k is not None and max_length_q != max_length_k:
+        raise ValueError("ChunkMBS currently requires identical max_length_q and max_length_k.")
 
     cu_values = [int(v) for v in cu_seq_lens_q.tolist()]
     if not cu_values or cu_values[0] != 0:
@@ -114,10 +120,7 @@ def build_chunk_mbs_ranges(batch: dict[str, Any], config: Any) -> Optional[list[
 def _linear_attn_cu_values(cu_seq_lens: Optional[torch.Tensor], expected_total: int) -> Optional[list[int]]:
     if cu_seq_lens is None:
         return None
-    if cu_seq_lens.ndim != 1:
-        raise ValueError(f"linear_attn_cu_seq_lens_q must be a 1D tensor, got shape {tuple(cu_seq_lens.shape)}.")
-    if cu_seq_lens.device.type != "cpu":
-        raise RuntimeError("ChunkMBS ranges must be built before linear_attn_cu_seq_lens_q is moved off CPU.")
+    _validate_cu_seq_lens(cu_seq_lens, "linear_attn_cu_seq_lens_q")
     cu_values = [int(v) for v in cu_seq_lens.tolist()]
     if not cu_values or cu_values[0] != 0:
         raise ValueError("ChunkMBS requires linear_attn_cu_seq_lens_q to start from 0.")
@@ -128,6 +131,17 @@ def _linear_attn_cu_values(cu_seq_lens: Optional[torch.Tensor], expected_total: 
     return cu_values
 
 
+def _validate_cu_seq_lens(cu_seq_lens: Any, name: str) -> None:
+    if not isinstance(cu_seq_lens, torch.Tensor):
+        raise TypeError(f"{name} must be a torch.Tensor, got {type(cu_seq_lens).__name__}.")
+    if cu_seq_lens.ndim != 1:
+        raise ValueError(f"{name} must be a 1D tensor, got shape {tuple(cu_seq_lens.shape)}.")
+    if cu_seq_lens.dtype != torch.int32:
+        raise TypeError(f"{name} must use torch.int32, got {cu_seq_lens.dtype}.")
+    if cu_seq_lens.device.type != "cpu":
+        raise RuntimeError(f"ChunkMBS ranges must be built before {name} is moved off CPU.")
+
+
 def apply_chunk_mbs(model: nn.Module, config: Any) -> nn.Module:
     if not getattr(config, "enable", False):
         return model
@@ -135,6 +149,8 @@ def apply_chunk_mbs(model: nn.Module, config: Any) -> nn.Module:
     parallel_state = get_parallel_state()
     if parallel_state.sp_enabled:
         raise RuntimeError("ChunkMBS currently supports packed sequences without sequence parallelism.")
+    if getattr(parallel_state, "tp_enabled", False) or getattr(parallel_state, "pp_enabled", False):
+        raise RuntimeError("ChunkMBS currently does not support tensor or pipeline parallelism.")
     if parallel_state.any_extra_parallel_enabled:
         raise RuntimeError("ChunkMBS currently does not support ExtraParallel/MoE.")
 
@@ -144,6 +160,8 @@ def apply_chunk_mbs(model: nn.Module, config: Any) -> nn.Module:
             "ChunkMBS requires exactly one decoder layer class in model._no_split_modules, "
             f"got {sorted(target_classes)!r}."
         )
+    if any("moe" in name.lower() for name in target_classes):
+        raise RuntimeError("ChunkMBS currently does not support MoE decoder layers.")
 
     target_modules = _find_target_modules(model, target_classes)
     if not target_modules:
@@ -219,12 +237,11 @@ def _wrap_gradient_checkpointing_func(module: nn.Module) -> None:
         if not ranges:
             return checkpoint_func(function, *args, **kwargs)
 
-        @wraps(function)
-        def forward_with_chunk_mbs_context(*forward_args, **forward_kwargs):
-            with chunk_mbs_context(ranges):
-                return function(*forward_args, **forward_kwargs)
-
-        return checkpoint_func(forward_with_chunk_mbs_context, *args, **kwargs)
+        token = _chunk_mbs_checkpoint_func.set(checkpoint_func)
+        try:
+            return function(*args, **kwargs)
+        finally:
+            _chunk_mbs_checkpoint_func.reset(token)
 
     wrapped_checkpoint_func._chunk_mbs_wrapped = True
     module._gradient_checkpointing_func = wrapped_checkpoint_func
@@ -263,6 +280,11 @@ def _chunked_forward(
     hidden_states = _get_hidden_states(args, kwargs)
     if not isinstance(hidden_states, torch.Tensor):
         raise TypeError("ChunkMBS expects hidden_states to be a torch.Tensor.")
+    if hidden_states.ndim != 3 or hidden_states.shape[0] != 1:
+        raise ValueError(
+            "ChunkMBS expects packed hidden_states with shape [1, sequence, hidden], "
+            f"got {tuple(hidden_states.shape)}."
+        )
 
     sequence_dim = _canonical_dim(hidden_states, 1)
     full_seq_len = hidden_states.shape[sequence_dim]
@@ -272,12 +294,16 @@ def _chunked_forward(
             f"({full_seq_len})."
         )
     outputs = []
+    checkpoint_func = _chunk_mbs_checkpoint_func.get()
     for seq_range in ranges:
         chunk_args, chunk_kwargs = _replace_hidden_states(
             args, kwargs, _slice_tensor(hidden_states, seq_range, sequence_dim)
         )
         chunk_kwargs = _slice_kwargs(chunk_kwargs, seq_range, full_seq_len)
-        outputs.append(orig_forward(*chunk_args, **chunk_kwargs))
+        if checkpoint_func is None:
+            outputs.append(orig_forward(*chunk_args, **chunk_kwargs))
+        else:
+            outputs.append(checkpoint_func(orig_forward, *chunk_args, **chunk_kwargs))
 
     return _concat_outputs(outputs, sequence_dim)
 
