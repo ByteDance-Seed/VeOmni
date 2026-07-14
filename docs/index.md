@@ -49,6 +49,7 @@ hardware_support/precision_analysis.md
 hardware_support/profiling_analysis.md
 hardware_support/AscendDockerUsage/build_a2_docker.md
 hardware_support/AscendDockerUsage/build_a3_docker.md
+hardware_support/a5_unsupported_features.md
 hardware_support/FAQ.md
 ```
 
