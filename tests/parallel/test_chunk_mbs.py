@@ -234,6 +234,32 @@ class _ToyMoeDecoderLayer(_ToyDecoderLayer):
     pass
 
 
+class DeepseekV3MoE(nn.Module):
+    pass
+
+
+class DeepseekV3DecoderLayer(GradientCheckpointingLayer):
+    def __init__(self):
+        super().__init__()
+        self.mlp = DeepseekV3MoE()
+
+    def forward(self, hidden_states):
+        return hidden_states
+
+
+class GptOssExperts(nn.Module):
+    pass
+
+
+class GptOssDecoderLayer(GradientCheckpointingLayer):
+    def __init__(self):
+        super().__init__()
+        self.experts = GptOssExperts()
+
+    def forward(self, hidden_states):
+        return hidden_states
+
+
 class _PlainDecoderLayer(nn.Module):
     def forward(self, hidden_states):
         return hidden_states
@@ -796,6 +822,23 @@ def test_apply_chunk_mbs_rejects_moe_decoder_layer(monkeypatch):
         apply_chunk_mbs(model, _config(chunk_mbs=2))
 
 
+@pytest.mark.parametrize("decoder_cls", [DeepseekV3DecoderLayer, GptOssDecoderLayer])
+def test_apply_chunk_mbs_rejects_moe_submodules_when_ep_is_disabled(monkeypatch, decoder_cls):
+    import veomni.distributed.chunk_mbs as chunk_mbs
+
+    monkeypatch.setattr(
+        chunk_mbs,
+        "get_parallel_state",
+        lambda: types.SimpleNamespace(sp_enabled=False, any_extra_parallel_enabled=False),
+    )
+    model = nn.Module()
+    model._no_split_modules = [decoder_cls.__name__]
+    model.decoder = nn.ModuleList([decoder_cls()])
+
+    with pytest.raises(RuntimeError, match="MoE decoder layers"):
+        apply_chunk_mbs(model, _config(chunk_mbs=2))
+
+
 def test_apply_chunk_mbs_requires_decoder_layer_in_no_split_modules(monkeypatch):
     import veomni.distributed.chunk_mbs as chunk_mbs
 
@@ -931,6 +974,20 @@ def test_chunk_mbs_recompute_with_real_fsdp2(tmp_path):
         nprocs=2,
         join=True,
     )
+
+
+def test_dit_trainer_rejects_chunk_mbs():
+    from veomni.trainer.dit_trainer import DiTTrainer
+
+    args = types.SimpleNamespace(
+        train=types.SimpleNamespace(
+            chunk_mbs_config=_config(chunk_mbs=2),
+            channel_loss=types.SimpleNamespace(enable=False),
+        )
+    )
+
+    with pytest.raises(ValueError, match="not supported by DiTTrainer"):
+        DiTTrainer(args)
 
 
 @pytest.mark.parametrize(

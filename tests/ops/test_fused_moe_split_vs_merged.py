@@ -265,6 +265,104 @@ def test_fused_moe_swiglu_limit_split_vs_merged_and_eager(swiglu_limit: float, m
     torch.testing.assert_close(fc1_merged.grad, fc1_eager_grad, rtol=5e-2, atol=5e-2)
 
 
+def test_fused_moe_duplicate_topk_expert_backward_uses_scattered_token_count(monkeypatch: pytest.MonkeyPatch):
+    """Regression test for duplicate top-k routes to the same expert.
+
+    ``group_gemm_same_nk`` uses ``max_M`` as a per-expert launch bound. When
+    duplicate routes make one expert receive more than the original token
+    count, the non-EP backward must use a scattered-row bound; otherwise tail
+    rows may be left uncomputed and produce non-finite gradients.
+    """
+    _skip_if_unsupported()
+
+    torch.manual_seed(7)
+    device = torch.device(get_device_type())
+    dtype = torch.bfloat16
+    num_tokens, num_experts, hidden_dim, ffn_dim, topk = 256, 4, 128, 64, 2
+    swiglu_limit = 10.0
+
+    hidden_states = 0.1 * torch.randn(num_tokens, hidden_dim, device=device, dtype=dtype)
+    selected_experts = torch.zeros(num_tokens, topk, device=device, dtype=torch.long)
+    routing_weights = torch.full((num_tokens, topk), 0.75, device=device, dtype=dtype)
+    fc1_1_weight = 0.1 * torch.randn(num_experts, ffn_dim, hidden_dim, device=device, dtype=dtype)
+    fc1_2_weight = 0.1 * torch.randn(num_experts, ffn_dim, hidden_dim, device=device, dtype=dtype)
+    fc1_1_2_weight = torch.cat([fc1_1_weight, fc1_2_weight], dim=1).contiguous()
+    fc2_weight = 0.1 * torch.randn(num_experts, hidden_dim, ffn_dim, device=device, dtype=dtype)
+
+    monkeypatch.setattr(fused_moe, "_fused_moe_forward", group_gemm_fused_moe_forward)
+
+    hs_split = hidden_states.clone().detach().requires_grad_(True)
+    fc1_1_split = fc1_1_weight.clone().detach().requires_grad_(True)
+    fc1_2_split = fc1_2_weight.clone().detach().requires_grad_(True)
+    fc2_split = fc2_weight.clone().detach().requires_grad_(True)
+    out_split = fused_moe_forward(
+        num_experts=num_experts,
+        routing_weights=routing_weights,
+        selected_experts=selected_experts,
+        hidden_states=hs_split,
+        fc1_1_weight=fc1_1_split,
+        fc1_2_weight=fc1_2_split,
+        fc2_weight=fc2_split,
+        swiglu_limit=swiglu_limit,
+    )
+    out_split.sum().backward()
+
+    hs_merged = hidden_states.clone().detach().requires_grad_(True)
+    fc1_merged = fc1_1_2_weight.clone().detach().requires_grad_(True)
+    fc2_merged = fc2_weight.clone().detach().requires_grad_(True)
+    out_merged = fused_moe_forward(
+        num_experts=num_experts,
+        routing_weights=routing_weights,
+        selected_experts=selected_experts,
+        hidden_states=hs_merged,
+        fc1_1_weight=None,
+        fc1_2_weight=None,
+        fc2_weight=fc2_merged,
+        fc1_1_2_weight=fc1_merged,
+        swiglu_limit=swiglu_limit,
+    )
+    out_merged.sum().backward()
+
+    hs_eager = hidden_states.clone().detach().requires_grad_(True)
+    fc1_1_eager = fc1_1_weight.clone().detach().requires_grad_(True)
+    fc1_2_eager = fc1_2_weight.clone().detach().requires_grad_(True)
+    fc2_eager = fc2_weight.clone().detach().requires_grad_(True)
+    out_eager = _eager_moe_forward(
+        num_experts=num_experts,
+        routing_weights=routing_weights,
+        selected_experts=selected_experts,
+        hidden_states=hs_eager,
+        fc1_1_weight=fc1_1_eager,
+        fc1_2_weight=fc1_2_eager,
+        fc2_weight=fc2_eager,
+        swiglu_limit=swiglu_limit,
+    )
+    out_eager.sum().backward()
+
+    for grad in (
+        hs_split.grad,
+        fc1_1_split.grad,
+        fc1_2_split.grad,
+        fc2_split.grad,
+        hs_merged.grad,
+        fc1_merged.grad,
+        fc2_merged.grad,
+    ):
+        assert torch.isfinite(grad).all()
+
+    torch.testing.assert_close(out_split, out_merged, rtol=0, atol=0)
+    torch.testing.assert_close(hs_split.grad, hs_merged.grad, rtol=3e-2, atol=3e-2)
+    torch.testing.assert_close(fc2_split.grad, fc2_merged.grad, rtol=0, atol=0)
+    fc1_split_grad = torch.cat([fc1_1_split.grad, fc1_2_split.grad], dim=1)
+    torch.testing.assert_close(fc1_split_grad, fc1_merged.grad, rtol=0, atol=0)
+
+    torch.testing.assert_close(out_merged, out_eager, rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(hs_merged.grad, hs_eager.grad, rtol=6e-2, atol=6e-2)
+    torch.testing.assert_close(fc2_merged.grad, fc2_eager.grad, rtol=2e-2, atol=2e-2)
+    fc1_eager_grad = torch.cat([fc1_1_eager.grad, fc1_2_eager.grad], dim=1)
+    torch.testing.assert_close(fc1_merged.grad, fc1_eager_grad, rtol=5e-2, atol=5e-2)
+
+
 def _make_ep_inputs(num_tokens, num_experts, hidden_dim, ffn_dim, seed):
     """Create synthetic EP test inputs: permute_tokens, cumsum, and weights."""
     torch.manual_seed(seed)

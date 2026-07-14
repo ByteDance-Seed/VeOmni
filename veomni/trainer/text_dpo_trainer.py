@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from collections import defaultdict
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Literal, Tuple
 
@@ -317,44 +318,60 @@ class TextDPOTrainer:
     def forward_backward_step(
         self, micro_batch: Dict[str, torch.Tensor]
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        args: VeOmniDPOArguments = self.base.args
-        dpo_config = args.dpo_config
-
-        micro_batch = self.base.preforward(micro_batch)
-
-        with torch.no_grad():
-            ref_chosen_logps, ref_rejected_logps = self.concatenated_forward(self.reference_model, micro_batch)
-
-        with self.base.model_fwd_context, set_batch_invariant_mode(args.train.enable_batch_invariant_mode):
-            policy_chosen_logps, policy_rejected_logps = self.concatenated_forward(self.base.model, micro_batch)
-
-        losses, chosen_rewards, rejected_rewards = self.dpo_loss(
-            policy_chosen_logps,
-            policy_rejected_logps,
-            ref_chosen_logps,
-            ref_rejected_logps,
-            beta=dpo_config.beta,
-            label_smoothing=dpo_config.label_smoothing,
-            loss_type=dpo_config.loss_type,
-            reference_free=dpo_config.reference_free,
+        channel_loss_callback = getattr(self.base, "channel_loss_callback", None)
+        micro_step_context = (
+            channel_loss_callback.micro_step_context(self.base.state, micro_batch)
+            if channel_loss_callback is not None
+            else nullcontext()
         )
+        with micro_step_context:
+            args: VeOmniDPOArguments = self.base.args
+            dpo_config = args.dpo_config
 
-        loss = losses.mean()
+            micro_batch = self.base.preforward(micro_batch)
+            if channel_loss_callback is not None:
+                channel_loss_callback.strip_model_inputs(micro_batch)
 
-        reward_accuracies = (chosen_rewards > rejected_rewards).float().mean()
-        loss_dict: Dict[str, torch.Tensor] = {
-            "dpo_loss": loss.detach(),
-            "chosen_rewards": chosen_rewards.mean().detach(),
-            "rejected_rewards": rejected_rewards.mean().detach(),
-            "reward_accuracy": reward_accuracies.detach(),
-            "reward_margin": (chosen_rewards - rejected_rewards).mean().detach(),
-        }
+            with torch.no_grad():
+                ref_chosen_logps, ref_rejected_logps = self.concatenated_forward(self.reference_model, micro_batch)
 
-        with self.base.model_bwd_context, set_batch_invariant_mode(args.train.enable_batch_invariant_mode):
-            loss.backward()
+            channel_forward_context = (
+                channel_loss_callback.model_forward_context() if channel_loss_callback is not None else nullcontext()
+            )
+            with (
+                self.base.model_fwd_context,
+                set_batch_invariant_mode(args.train.enable_batch_invariant_mode),
+                channel_forward_context,
+            ):
+                policy_chosen_logps, policy_rejected_logps = self.concatenated_forward(self.base.model, micro_batch)
 
-        del micro_batch
-        return loss, loss_dict
+            losses, chosen_rewards, rejected_rewards = self.dpo_loss(
+                policy_chosen_logps,
+                policy_rejected_logps,
+                ref_chosen_logps,
+                ref_rejected_logps,
+                beta=dpo_config.beta,
+                label_smoothing=dpo_config.label_smoothing,
+                loss_type=dpo_config.loss_type,
+                reference_free=dpo_config.reference_free,
+            )
+
+            loss = losses.mean()
+
+            reward_accuracies = (chosen_rewards > rejected_rewards).float().mean()
+            loss_dict: Dict[str, torch.Tensor] = {
+                "dpo_loss": loss.detach(),
+                "chosen_rewards": chosen_rewards.mean().detach(),
+                "rejected_rewards": rejected_rewards.mean().detach(),
+                "reward_accuracy": reward_accuracies.detach(),
+                "reward_margin": (chosen_rewards - rejected_rewards).mean().detach(),
+            }
+
+            with self.base.model_bwd_context, set_batch_invariant_mode(args.train.enable_batch_invariant_mode):
+                loss.backward()
+
+            del micro_batch
+            return loss, loss_dict
 
     def on_train_begin(self):
         self.base.on_train_begin()
@@ -369,7 +386,9 @@ class TextDPOTrainer:
         self.base.on_epoch_end()
 
     def on_step_begin(self, micro_batches=None):
-        self.base.on_step_begin(micro_batches=micro_batches)
+        # Each DPO preference pair is packed as two consecutive causal-LM
+        # segments (chosen, rejected) but carries one source metadata entry.
+        self.base.on_step_begin(micro_batches=micro_batches, channel_loss_source_repeat=2)
 
     def on_step_end(self, loss=None, loss_dict=None, grad_norm=None):
         self.base.on_step_end(loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)

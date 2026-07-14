@@ -42,8 +42,11 @@ from __future__ import annotations
 
 import re
 from collections import defaultdict
+from functools import lru_cache
 
 import torch
+from transformers.conversion_mapping import get_checkpoint_conversion_mapping
+from transformers.core_model_loading import WeightRenaming, rename_source_key
 
 from ....utils import logging
 from ...checkpoint_tensor_loading import ConvertedCheckpointTensor
@@ -56,11 +59,36 @@ logger = logging.get_logger(__name__)
 #   model.layers.0.mlp.experts.3.w1.weight
 #   model.layers.0.mlp.experts.3.gate_proj.weight
 _EXPERT_PATTERN = re.compile(r"^(.+\.mlp)\.experts\.(\d+)\.(w1|w2|w3|gate_proj|up_proj|down_proj)\.weight$")
+_RAW_FP4_EXPERT_WEIGHT_PATTERN = re.compile(r"^(?:model\.)?layers\.\d+\.ffn\.experts\.\d+\.w[123]\.weight$")
 _PROJ_NAME_ALIASES = {
     "w1": "gate_proj",
     "w2": "down_proj",
     "w3": "up_proj",
 }
+_DEEPSEEK_V4_WEIGHT_RENAMINGS = [
+    transform
+    for transform in (get_checkpoint_conversion_mapping("deepseek_v4") or [])
+    if isinstance(transform, WeightRenaming)
+]
+_FP4_E2M1_VALUES = (
+    0.0,
+    0.5,
+    1.0,
+    1.5,
+    2.0,
+    3.0,
+    4.0,
+    6.0,
+    0.0,
+    -0.5,
+    -1.0,
+    -1.5,
+    -2.0,
+    -3.0,
+    -4.0,
+    -6.0,
+)
+_BASE_MODEL_KEY_PREFIXES = ("embed_tokens.", "hc_head.", "layers.", "norm.")
 _FLOAT8_DTYPES = tuple(
     dtype
     for dtype in (
@@ -76,6 +104,29 @@ def _is_quantized_weight(tensor: torch.Tensor) -> bool:
     return tensor.dtype in _QUANTIZED_WEIGHT_DTYPES
 
 
+def _is_mtp_checkpoint_key(name: str) -> bool:
+    return name.removeprefix("model.").startswith("mtp.")
+
+
+def convert_deepseek_v4_checkpoint_key(name: str, *, target_model_prefix: str = "model.") -> str:
+    """Convert DeepSeek's inference checkpoint names to Transformers v5 names."""
+    if _is_mtp_checkpoint_key(name):
+        return name
+    has_model_prefix = name.startswith("model.")
+    source_name = name.removeprefix("model.") if has_model_prefix else name
+    converted_name, _ = rename_source_key(source_name, _DEEPSEEK_V4_WEIGHT_RENAMINGS, [])
+    if converted_name.startswith(_BASE_MODEL_KEY_PREFIXES):
+        return f"{target_model_prefix}{converted_name}"
+    if has_model_prefix and converted_name == source_name:
+        return name
+    return converted_name
+
+
+@lru_cache(maxsize=None)
+def _get_fp4_e2m1_table(device: torch.device) -> torch.Tensor:
+    return torch.tensor(_FP4_E2M1_VALUES, dtype=torch.float32, device=device)
+
+
 def _is_block_scale_tensor(tensor: torch.Tensor) -> bool:
     return tensor.ndim == 2 or tensor.numel() == 1
 
@@ -88,27 +139,39 @@ def _weight_name_from_scale_name(name: str) -> str | None:
     return None
 
 
-def _dequantize_scaled_weight(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
-    """Apply DeepSeek block scales to an FP8/int8 checkpoint weight."""
+def _dequantize_scaled_weight(weight: torch.Tensor, scale: torch.Tensor, *, packed_fp4: bool = False) -> torch.Tensor:
+    """Apply DeepSeek block scales to an FP8 or packed E2M1 FP4 weight."""
     scale = scale.to(device=weight.device)
+    if packed_fp4:
+        if weight.dtype != torch.int8:
+            raise TypeError(f"Packed E2M1 FP4 weights must use int8 storage, got {weight.dtype}.")
+        # DeepSeek-V4 stores two E2M1 FP4 expert values in every int8 byte.
+        # Preserve the bit pattern when splitting the low and high nibbles.
+        packed = weight.contiguous().view(torch.uint8)
+        table = _get_fp4_e2m1_table(weight.device)
+        low = table[(packed & 0x0F).long()]
+        high = table[((packed >> 4) & 0x0F).long()]
+        weight = torch.stack((low, high), dim=-1).flatten(-2)
+    else:
+        weight = weight.float()
+
     if scale.numel() == 1:
-        return weight.float() * scale.float()
+        return weight * scale.float()
     if weight.ndim != 2 or scale.ndim != 2:
         raise ValueError(
-            "DeepseekV4 FP8 checkpoint weight scales must be scalar or 2D block scales; "
+            "DeepseekV4 quantized checkpoint weight scales must be scalar or 2D block scales; "
             f"got weight shape {tuple(weight.shape)} and scale shape {tuple(scale.shape)}."
         )
     if weight.shape[0] % scale.shape[0] != 0 or weight.shape[1] % scale.shape[1] != 0:
         raise ValueError(
-            "DeepseekV4 FP8 checkpoint weight shape must be divisible by scale shape; "
+            "DeepseekV4 quantized checkpoint weight shape must be divisible by scale shape; "
             f"got weight shape {tuple(weight.shape)} and scale shape {tuple(scale.shape)}."
         )
 
     block_rows = weight.shape[0] // scale.shape[0]
     block_cols = weight.shape[1] // scale.shape[1]
     return (
-        weight.float()
-        .view(scale.shape[0], block_rows, scale.shape[1], block_cols)
+        weight.view(scale.shape[0], block_rows, scale.shape[1], block_cols)
         .mul(scale.float().view(scale.shape[0], 1, scale.shape[1], 1))
         .reshape(weight.shape)
     )
@@ -126,22 +189,37 @@ class DeepseekV4CheckpointTensorConverter:
             via ``DeepseekV4Config.attribute_map``).
     """
 
-    def __init__(self, num_experts: int):
+    def __init__(self, num_experts: int, *, target_model_prefix: str = "model."):
         self.num_experts = num_experts
+        self.target_model_prefix = target_model_prefix
         # {(prefix, proj_name): {expert_id: tensor}}
         self._expert_buffer: dict[tuple[str, str], dict[int, torch.Tensor]] = {}
         # {prefix: {proj_name: stacked_tensor}} for gate/up merge waiting
         self._stacked_buffer: dict[str, dict[str, torch.Tensor]] = {}
         # {weight_name: {"weight": tensor, "scale": tensor}} for FP8/int8 checkpoint pairs.
-        self._scaled_weight_buffer: dict[str, dict[str, torch.Tensor | str]] = {}
+        self._scaled_weight_buffer: dict[str, dict[str, torch.Tensor | str | bool]] = {}
 
     def can_handle(self, name: str) -> bool:
-        return bool(_EXPERT_PATTERN.match(name)) or _weight_name_from_scale_name(name) is not None
+        if _is_mtp_checkpoint_key(name):
+            return False
+        converted_name = convert_deepseek_v4_checkpoint_key(name, target_model_prefix=self.target_model_prefix)
+        return (
+            converted_name != name
+            or bool(_EXPERT_PATTERN.match(converted_name))
+            or _weight_name_from_scale_name(converted_name) is not None
+        )
 
     def can_handle_tensor(self, name: str, tensor: torch.Tensor) -> bool:
-        return self.can_handle(name) or (name.endswith(".weight") and _is_quantized_weight(tensor))
+        if _is_mtp_checkpoint_key(name):
+            return False
+        converted_name = convert_deepseek_v4_checkpoint_key(name, target_model_prefix=self.target_model_prefix)
+        return self.can_handle(name) or (converted_name.endswith(".weight") and _is_quantized_weight(tensor))
 
     def convert(self, name: str, tensor: torch.Tensor) -> ConvertedCheckpointTensor | None:
+        if _is_mtp_checkpoint_key(name):
+            return ConvertedCheckpointTensor(name, tensor)
+        packed_fp4 = tensor.dtype == torch.int8 and bool(_RAW_FP4_EXPERT_WEIGHT_PATTERN.fullmatch(name))
+        name = convert_deepseek_v4_checkpoint_key(name, target_model_prefix=self.target_model_prefix)
         weight_name = _weight_name_from_scale_name(name)
         if weight_name is not None:
             if not _is_block_scale_tensor(tensor):
@@ -149,15 +227,23 @@ class DeepseekV4CheckpointTensorConverter:
             return self._convert_scaled_weight_part(weight_name, "scale", tensor, name)
 
         if name.endswith(".weight") and _is_quantized_weight(tensor):
-            return self._convert_scaled_weight_part(name, "weight", tensor, None)
+            return self._convert_scaled_weight_part(name, "weight", tensor, None, packed_fp4=packed_fp4)
 
         return self._convert_weight(name, tensor)
 
     def _convert_scaled_weight_part(
-        self, weight_name: str, part_name: str, tensor: torch.Tensor, scale_name: str | None
+        self,
+        weight_name: str,
+        part_name: str,
+        tensor: torch.Tensor,
+        scale_name: str | None,
+        *,
+        packed_fp4: bool = False,
     ) -> ConvertedCheckpointTensor | None:
         parts = self._scaled_weight_buffer.setdefault(weight_name, {})
         parts[part_name] = tensor
+        if part_name == "weight":
+            parts["packed_fp4"] = packed_fp4
         if scale_name is not None:
             parts["scale_name"] = scale_name
         if "weight" not in parts or "scale" not in parts:
@@ -168,7 +254,10 @@ class DeepseekV4CheckpointTensorConverter:
         del self._scaled_weight_buffer[weight_name]
         assert isinstance(weight, torch.Tensor)
         assert isinstance(scale, torch.Tensor)
-        return self._convert_weight(weight_name, _dequantize_scaled_weight(weight, scale))
+        return self._convert_weight(
+            weight_name,
+            _dequantize_scaled_weight(weight, scale, packed_fp4=bool(parts.get("packed_fp4", False))),
+        )
 
     def _convert_weight(self, name: str, tensor: torch.Tensor) -> ConvertedCheckpointTensor | None:
         match = _EXPERT_PATTERN.match(name)
@@ -244,16 +333,34 @@ def create_deepseek_v4_checkpoint_tensor_converter(model):
     """Factory function registered on model classes via _create_checkpoint_tensor_converter."""
     return DeepseekV4CheckpointTensorConverter(
         num_experts=model.config.n_routed_experts,
+        target_model_prefix=_get_deepseek_v4_target_model_prefix(model),
     )
 
 
-def convert_deepseek_v4_fqn_to_index_mapping(fqn_to_index_mapping: dict[str, int]) -> dict[str, int]:
+def _get_deepseek_v4_target_model_prefix(model) -> str:
+    named_parameters = getattr(model, "named_parameters", None)
+    if callable(named_parameters):
+        for name, _ in named_parameters():
+            if name.startswith("model."):
+                return "model."
+            if name.startswith(_BASE_MODEL_KEY_PREFIXES):
+                return ""
+
+    if type(model).__name__.endswith("ForCausalLM"):
+        return "model."
+    return ""
+
+
+def convert_deepseek_v4_fqn_to_index_mapping(
+    fqn_to_index_mapping: dict[str, int], *, target_model_prefix: str = "model."
+) -> dict[str, int]:
     """Align HF safetensors index keys with fused expert parameter names."""
     gate_up_shard_indices: dict[str, list[int]] = defaultdict(list)
     down_shard_indices: dict[str, list[int]] = defaultdict(list)
     converted: dict[str, int] = {}
 
     for fqn, shard_idx in fqn_to_index_mapping.items():
+        fqn = convert_deepseek_v4_checkpoint_key(fqn, target_model_prefix=target_model_prefix)
         match = _EXPERT_PATTERN.match(fqn)
         if not match:
             converted[fqn] = shard_idx

@@ -86,6 +86,11 @@ class CheckpointerCallback(Callback):
 
         self.trainer.lr_scheduler.load_state_dict(state["extra_state"]["lr_scheduler"])
 
+        channel_loss_state = state["extra_state"].get("channel_loss_callback")
+        channel_loss_callback = getattr(self.trainer, "channel_loss_callback", None)
+        if channel_loss_state is not None and channel_loss_callback is not None:
+            channel_loss_callback.load_state_dict(channel_loss_state)
+
         # dataloader may only init on sp_rank_0 to save memory
         if (
             self.trainer.train_dataloader is not None
@@ -115,6 +120,9 @@ class CheckpointerCallback(Callback):
         else:
             train_dataloader_state = {}
 
+        channel_loss_callback = getattr(self.trainer, "channel_loss_callback", None)
+        channel_loss_state = channel_loss_callback.state_dict() if channel_loss_callback is not None else {}
+
         ckpt_state = {
             "model": self.trainer.model,
             "optimizer": self.trainer.optimizer,
@@ -123,6 +131,7 @@ class CheckpointerCallback(Callback):
                 "lr_scheduler": self.trainer.lr_scheduler.state_dict(),
                 "train_dataloader": train_dataloader_state,
                 "environ_meter": self.trainer.environ_meter.state_dict(),
+                "channel_loss_callback": channel_loss_state,
                 "torch_rng_state": torch.get_rng_state(),
             },
         }

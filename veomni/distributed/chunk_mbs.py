@@ -160,12 +160,11 @@ def apply_chunk_mbs(model: nn.Module, config: Any) -> nn.Module:
             "ChunkMBS requires exactly one decoder layer class in model._no_split_modules, "
             f"got {sorted(target_classes)!r}."
         )
-    if any("moe" in name.lower() for name in target_classes):
-        raise RuntimeError("ChunkMBS currently does not support MoE decoder layers.")
-
     target_modules = _find_target_modules(model, target_classes)
     if not target_modules:
         raise ValueError("ChunkMBS did not match any decoder layer listed in model._no_split_modules.")
+    if any(_contains_moe_submodule(module) for _, module in target_modules):
+        raise RuntimeError("ChunkMBS currently does not support MoE decoder layers.")
 
     target_stacks = {fqn.rpartition(".")[0] for fqn, _ in target_modules}
     if len(target_stacks) != 1:
@@ -190,6 +189,13 @@ def apply_chunk_mbs(model: nn.Module, config: Any) -> nn.Module:
 def _decoder_layer_class_names(model: nn.Module) -> set[str]:
     no_split_modules = getattr(model, "_no_split_modules", None) or []
     return {name for name in no_split_modules if isinstance(name, str) and name.endswith("DecoderLayer")}
+
+
+def _contains_moe_submodule(module: nn.Module) -> bool:
+    return any(
+        "moe" in submodule.__class__.__name__.lower() or "expert" in submodule.__class__.__name__.lower()
+        for submodule in module.modules()
+    )
 
 
 def _find_target_modules(model: nn.Module, target_classes: set[str]) -> list[tuple[str, nn.Module]]:
