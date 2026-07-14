@@ -75,10 +75,26 @@ def test_tilelang_wrappers_reject_pre_sm90_before_import(monkeypatch):
         kernels.act_quant(torch.empty(0))
 
 
+def test_tilelang_wrappers_reject_rocm_before_import(monkeypatch):
+    import veomni.ops.kernels.deepseek_v4 as kernels
+
+    monkeypatch.setattr(kernels.torch.version, "hip", "6.0", raising=False)
+    monkeypatch.setattr(kernels, "IS_CUDA_AVAILABLE", True)
+    monkeypatch.setattr(kernels, "get_gpu_compute_capability", lambda: 90)
+    args = (torch.empty(0),) * 4
+
+    with pytest.raises(RuntimeError, match="NVIDIA CUDA"):
+        kernels.sparse_attn_tilelang(*args)
+    with pytest.raises(RuntimeError, match="NVIDIA CUDA"):
+        kernels.v4_lighting_indexer(*args[:3], compress_ratio=1, topk=1)
+    with pytest.raises(RuntimeError, match="NVIDIA CUDA"):
+        kernels.act_quant(torch.empty(0))
+
+
 def _require_tilelang_cuda():
     pytest.importorskip("tilelang")
-    if not IS_CUDA_AVAILABLE:
-        pytest.skip("DeepSeek V4 TileLang kernels require a GPU")
+    if torch.version.hip is not None or not IS_CUDA_AVAILABLE:
+        pytest.skip("DeepSeek V4 TileLang kernels require an NVIDIA CUDA GPU")
     if get_gpu_compute_capability() < 90:
         pytest.skip("DeepSeek V4 TileLang kernels require SM90 or later")
 

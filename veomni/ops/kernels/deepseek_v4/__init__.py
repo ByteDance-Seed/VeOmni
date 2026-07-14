@@ -30,8 +30,8 @@ if TYPE_CHECKING:
 
 
 def _require_tilelang_sm90() -> None:
-    if not IS_CUDA_AVAILABLE or get_gpu_compute_capability() < 90:
-        raise RuntimeError("DeepSeek V4 TileLang kernels require an SM90 or later CUDA GPU")
+    if torch.version.hip is not None or not IS_CUDA_AVAILABLE or get_gpu_compute_capability() < 90:
+        raise RuntimeError("DeepSeek V4 TileLang kernels require an SM90 or later NVIDIA CUDA GPU")
 
 
 def sparse_attn_tilelang(
