@@ -166,9 +166,10 @@ class BagelQwen2MoTModuleMixin(ModuleMixin):
             hidden_size=int(self.config.hidden_size),
         )
         if self._packed_training is None:
-            # Dummy step: no real tokens → contribute nothing to FLOPs/MFU.
-            self.metric_meter_set_seqlens("forward", [])
-            return self.dummy_inputs()
+            raise ValueError(
+                "BAGEL Qwen2-MoT forward requires a non-empty conversation_list with real tokens; "
+                "got no packable tokens across the whole batch."
+            )
 
         # Metering: per-sample packed token counts.
         # If add SP for BAGEL, the sample_lens is the full own-data count.
