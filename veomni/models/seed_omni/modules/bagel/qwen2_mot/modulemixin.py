@@ -7,6 +7,7 @@ from typing import Any
 import torch
 import torch.distributed as dist
 
+from ....mixins.metric_meter_mixin import MetricMeterMixin
 from ....mixins.modulemixin import ModuleMixin, post_forward, pre_forward
 from ....utils.conversation import ConversationItem, get_tail_output_item, iter_desired_items
 from ..sources import (
@@ -16,6 +17,7 @@ from ..sources import (
     BAGEL_SIGLIP_CONTEXT,
     BAGEL_VAE_CONTEXT,
 )
+from .configuration import BagelQwen2MoTConfig
 from .generation_state import MotCacheContext, MotGenerationState
 from .processing import (
     PackedConversation,
@@ -164,7 +166,13 @@ class BagelQwen2MoTModuleMixin(ModuleMixin):
             hidden_size=int(self.config.hidden_size),
         )
         if self._packed_training is None:
+            # Dummy step: no real tokens → contribute nothing to FLOPs/MFU.
+            self.metric_meter_set_seqlens("forward", [])
             return self.dummy_inputs()
+
+        # Metering: per-sample packed token counts.
+        # If add SP for BAGEL, the sample_lens is the full own-data count.
+        self.metric_meter_set_seqlens("forward", [int(s) for s in self._packed_training.sample_lens])
 
         packed_sequence = self._fold_dummy_anchors(self._packed_training.packed_sequence, conversation_list)
         return {
@@ -524,4 +532,31 @@ class BagelQwen2MoTModuleMixin(ModuleMixin):
         return NaiveCache(len(self.model.layers))
 
 
-__all__ = ["BagelQwen2MoTModuleMixin"]
+class BagelQwen2MoTMetricMeterMixin(MetricMeterMixin):
+    """Per-module training meter for BAGEL's Qwen2-MoT backbone (transformer layers only)."""
+
+    config: BagelQwen2MoTConfig
+
+    def estimate_flops(self, seqlens: list[int]) -> float:
+        cfg = self.config
+        hidden = cfg.hidden_size
+        num_layers = cfg.num_hidden_layers
+        num_heads = cfg.num_attention_heads
+        num_kv_heads = cfg.num_key_value_heads
+        # Attention uses head_dim = hidden // num_heads (see BagelQwen2MoTAttention).
+        head_dim = hidden // num_heads
+
+        # SwiGLU MLP (gate/up/down) + attention projections (q, o over num_heads;
+        # k, v over num_kv_heads). Biases are O(hidden) → negligible, ignored.
+        mlp_n = hidden * cfg.intermediate_size * 3
+        attn_linear_n = hidden * head_dim * (num_heads * 2 + num_kv_heads * 2)
+        dense_n = (mlp_n + attn_linear_n) * num_layers
+
+        tokens = sum(seqlens)
+        seqlen_sq = sum(s * s for s in seqlens)
+        dense_flops = 6 * dense_n * tokens
+        attn_flops = 12 * seqlen_sq * head_dim * num_heads * num_layers
+        return (dense_flops + attn_flops) / 1e12
+
+
+__all__ = ["BagelQwen2MoTModuleMixin", "BagelQwen2MoTMetricMeterMixin"]

@@ -9,6 +9,7 @@ import torch
 
 from veomni.utils.device import get_device_id, get_device_type
 
+from ....mixins.metric_meter_mixin import MetricMeterMixin
 from ....mixins.modulemixin import CPUPreprocessor, ModuleMixin, post_forward, pre_forward
 from ....mixins.offline_encoding import OfflineEncodingMixin
 from ....utils.conversation import ConversationItem, is_dummy, iter_desired_items
@@ -190,6 +191,9 @@ class BagelVAEModuleMixin(OfflineEncodingMixin, ModuleMixin):
         self._conversation_carrier = conversation_list
 
         self._encode_items = self._select_vae_context_items(conversation_list)
+
+        self._metric_meter_stash_latent_tokens(self._vae_latent_token_lengths())
+
         pixel_values = torch.stack([item.value for item in self._encode_items], dim=0).to(
             device=self.device, dtype=self.dtype, non_blocking=True
         )
@@ -299,6 +303,27 @@ class BagelVAEModuleMixin(OfflineEncodingMixin, ModuleMixin):
                 image_items.append(item)
         return image_items
 
+    def _vae_latent_token_lengths(self) -> list[int]:
+        # Latent tokens per image = (H // ds) * (W // ds), using the real pixel shape
+        ds = max(int(self.config.downsample), 1)
+        lengths: list[int] = []
+        for item in self._encode_items:
+            if is_dummy(item):
+                continue
+            shape = item.meta.get(BAGEL_VAE_PIXEL_SHAPE)
+            if torch.is_tensor(shape):
+                dims = shape.detach().reshape(-1).tolist()
+                height, width = int(dims[0]), int(dims[1])
+            else:
+                height, width = int(item.value.shape[-2]), int(item.value.shape[-1])
+            lengths.append((height // ds) * (width // ds))
+        return lengths
+
+    def _metric_meter_stash_latent_tokens(self, lengths: list[int]) -> None:
+        # currently use the same counts for encode and offline_encode
+        self.metric_meter_set_seqlens("encode", lengths)
+        self.metric_meter_set_seqlens("offline_encode", lengths)
+
     def _online_process_dtype(self) -> torch.dtype:
         config_dtype = getattr(self.config, "dtype", None) or getattr(self.config, "torch_dtype", None)
         if isinstance(config_dtype, torch.dtype):
@@ -320,7 +345,61 @@ class BagelVAEModuleMixin(OfflineEncodingMixin, ModuleMixin):
         shutil.copytree(source_path, output_dir, dirs_exist_ok=True)
 
 
+class BagelVAEMetricMeterMixin(MetricMeterMixin):
+    """Per-module training meter for BAGEL's latent VAE codec (FLUX-style conv AE)."""
+
+    config: BagelVAEConfig
+
+    def estimate_flops(self, seqlens: list[int]) -> float:
+        cfg = self.config
+
+        if getattr(cfg, "freeze", True):
+            return 0.0
+
+        ch = int(cfg.ch)
+        ch_mult = [int(m) for m in cfg.ch_mult]
+        in_ch_mult = [1, *ch_mult]
+        num_res = len(ch_mult)
+        num_res_blocks = int(cfg.num_res_blocks)
+        in_channels = int(cfg.in_channels)
+        z_channels = int(cfg.z_channels)
+
+        # Conv MACs per latent token (linear term): area(level i) = N · 4**(num_res-1-i).
+        def area_factor(level: int) -> int:
+            return 4 ** (num_res - 1 - level)
+
+        lin_macs_per_token = in_channels * ch * 9 * area_factor(0)  # conv_in (3×3)
+
+        for i in range(num_res):
+            af = area_factor(i)
+            block_in = ch * in_ch_mult[i]
+            block_out = ch * ch_mult[i]
+            for j in range(num_res_blocks):
+                cin = block_in if j == 0 else block_out
+                lin_macs_per_token += cin * block_out * 9 * af  # ResnetBlock.conv1
+                lin_macs_per_token += block_out * block_out * 9 * af  # ResnetBlock.conv2
+                if j == 0 and block_in != block_out:
+                    lin_macs_per_token += block_in * block_out * af  # 1×1 nin_shortcut
+            if i != num_res - 1:
+                # Strided Downsample (3×3) emits the next level's spatial area.
+                lin_macs_per_token += block_out * block_out * 9 * area_factor(i + 1)
+
+        # Mid block at the latent resolution (area factor 1): two ResnetBlocks + AttnBlock.
+        bc = ch * ch_mult[-1]
+        lin_macs_per_token += 4 * (bc * bc * 9)  # block_1 + block_2 (conv1 + conv2 each)
+        lin_macs_per_token += 4 * (bc * bc)  # attn q/k/v/proj_out are 1×1 convs
+        lin_macs_per_token += bc * (2 * z_channels) * 9  # conv_out (3×3)
+
+        tokens = sum(seqlens)
+        # Mid self-attention (single head, dim = bc): QK^T + attn·V ⇒ 2·N**2·bc MACs.
+        attn_macs = sum(2 * (n * n) * bc for n in seqlens)
+
+        total_macs = lin_macs_per_token * tokens + attn_macs
+        return 6 * total_macs / 1e12
+
+
 __all__ = [
     "BagelVAECPUPreprocessor",
     "BagelVAEModuleMixin",
+    "BagelVAEMetricMeterMixin",
 ]

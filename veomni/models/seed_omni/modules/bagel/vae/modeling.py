@@ -21,11 +21,11 @@ from torch import Tensor
 from transformers import PreTrainedModel
 
 from .configuration import BagelVAEConfig
-from .modulemixin import BagelVAEModuleMixin
+from .modulemixin import BagelVAEMetricMeterMixin, BagelVAEModuleMixin
 from .processing import BagelVAEProcessor
 
 
-class BagelVAE(BagelVAEModuleMixin, PreTrainedModel):
+class BagelVAE(BagelVAEModuleMixin, BagelVAEMetricMeterMixin, PreTrainedModel):
     config_class = BagelVAEConfig
     image_processor_class = BagelVAEProcessor
     base_model_prefix = "bagel_vae"
