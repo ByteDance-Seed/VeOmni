@@ -354,7 +354,7 @@ For a complete working example of how preprocessors integrate into the training 
    - Launches distributed training with torchrun
 
 **2. Training Script**: [tasks/train_vlm.py](../../tasks/train_vlm.py)
-   - [data/multimodal/data_transform.py](../../veomni/data/multimodal/data_transform.py) Imports `conv_preprocess` from the preprocessor registry
+   - [data/multimodal/multimodal_transform.py](../../veomni/data/multimodal/multimodal_transform.py) imports `conv_preprocess` from the preprocessor registry
    - Each transform function defines `process_sample()` function that:
      - Calls `conv_preprocess()` at to apply the registered preprocessor
      - Handles image processing and tokenization

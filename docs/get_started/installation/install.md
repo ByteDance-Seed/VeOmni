@@ -2,7 +2,9 @@
 
 In this section, we provide the installation guide for Nvidia GPU.
 
-VeOmni also supports other hardware platform, please refer to [Ascend](install_ascend.md).
+VeOmni also supports other hardware platforms. See the installation guides for
+[Ascend x86](install_ascend_x86.md), [Ascend ARM](install_ascend_arm.md), and
+[AMD ROCm](../../hardware_support/rocm/README.md).
 
 ## Required Environment
 
