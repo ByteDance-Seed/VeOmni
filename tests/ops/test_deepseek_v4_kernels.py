@@ -375,6 +375,12 @@ def test_deepseek_v4_packed_compressors_match_independent_sequences():
     modeling.veomni_dsa_indexer_backend.bind(SimpleNamespace(dsa_indexer_backend="eager"))
     for compressor_cls in (modeling.DeepseekV4HCACompressor, modeling.DeepseekV4CSACompressor):
         compressor = compressor_cls(config)
+        # Direct construction bypasses DeepseekV4PreTrainedModel._init_weights,
+        # which zeros the torch.empty-backed position biases in production.
+        with torch.no_grad():
+            compressor.position_bias.zero_()
+            if isinstance(compressor, modeling.DeepseekV4CSACompressor):
+                compressor.indexer.position_bias.zero_()
         packed_kv, packed_bias = compressor(
             hidden_states,
             q_residual,
