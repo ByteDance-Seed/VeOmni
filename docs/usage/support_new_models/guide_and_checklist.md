@@ -13,7 +13,7 @@
 > read as describing what the *generated* file does, with the actual edits
 > happening in `<model>_gpu_patch_gen_config.py`. For step-by-step
 > instructions on the patchgen flow, see
-> [docs/transformers_v5/patchgen.md](../../transformers_v5/patchgen.md) and
+> [the patchgen design guide](../../design/patchgen.md) and
 > the `veomni-migrate-transformers-v5` agent skill.
 
 ---
@@ -143,7 +143,7 @@ Two common issues:
 
 ### Step 7: Write the Data Transform Function
 
-Add `process_sample_your_model()` to [veomni/data/multimodal/data_transform.py](../../../veomni/data/multimodal/data_transform.py). See the example docs for the full function signature and steps.
+Add `process_sample_your_model()` to [veomni/data/data_transform.py](../../../veomni/data/data_transform.py). See the example docs for the full function signature and steps.
 
 ### Step 8: Hook into the Trainer
 

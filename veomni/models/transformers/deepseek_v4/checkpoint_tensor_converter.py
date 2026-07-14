@@ -61,6 +61,57 @@ _PROJ_NAME_ALIASES = {
     "w2": "down_proj",
     "w3": "up_proj",
 }
+_FLOAT8_DTYPES = tuple(
+    dtype
+    for dtype in (
+        getattr(torch, name, None)
+        for name in ("float8_e4m3fn", "float8_e5m2", "float8_e4m3fnuz", "float8_e5m2fnuz", "float8_e8m0fnu")
+    )
+    if dtype
+)
+_QUANTIZED_WEIGHT_DTYPES = _FLOAT8_DTYPES + (torch.int8,)
+
+
+def _is_quantized_weight(tensor: torch.Tensor) -> bool:
+    return tensor.dtype in _QUANTIZED_WEIGHT_DTYPES
+
+
+def _is_block_scale_tensor(tensor: torch.Tensor) -> bool:
+    return tensor.ndim == 2 or tensor.numel() == 1
+
+
+def _weight_name_from_scale_name(name: str) -> str | None:
+    if name.endswith(".scale"):
+        return f"{name.removesuffix('.scale')}.weight"
+    if name.endswith(".weight_scale_inv"):
+        return f"{name.removesuffix('.weight_scale_inv')}.weight"
+    return None
+
+
+def _dequantize_scaled_weight(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    """Apply DeepSeek block scales to an FP8/int8 checkpoint weight."""
+    scale = scale.to(device=weight.device)
+    if scale.numel() == 1:
+        return weight.float() * scale.float()
+    if weight.ndim != 2 or scale.ndim != 2:
+        raise ValueError(
+            "DeepseekV4 FP8 checkpoint weight scales must be scalar or 2D block scales; "
+            f"got weight shape {tuple(weight.shape)} and scale shape {tuple(scale.shape)}."
+        )
+    if weight.shape[0] % scale.shape[0] != 0 or weight.shape[1] % scale.shape[1] != 0:
+        raise ValueError(
+            "DeepseekV4 FP8 checkpoint weight shape must be divisible by scale shape; "
+            f"got weight shape {tuple(weight.shape)} and scale shape {tuple(scale.shape)}."
+        )
+
+    block_rows = weight.shape[0] // scale.shape[0]
+    block_cols = weight.shape[1] // scale.shape[1]
+    return (
+        weight.float()
+        .view(scale.shape[0], block_rows, scale.shape[1], block_cols)
+        .mul(scale.float().view(scale.shape[0], 1, scale.shape[1], 1))
+        .reshape(weight.shape)
+    )
 
 
 class DeepseekV4CheckpointTensorConverter:
@@ -81,14 +132,48 @@ class DeepseekV4CheckpointTensorConverter:
         self._expert_buffer: dict[tuple[str, str], dict[int, torch.Tensor]] = {}
         # {prefix: {proj_name: stacked_tensor}} for gate/up merge waiting
         self._stacked_buffer: dict[str, dict[str, torch.Tensor]] = {}
+        # {weight_name: {"weight": tensor, "scale": tensor}} for FP8/int8 checkpoint pairs.
+        self._scaled_weight_buffer: dict[str, dict[str, torch.Tensor | str]] = {}
 
     def can_handle(self, name: str) -> bool:
-        return bool(_EXPERT_PATTERN.match(name))
+        return bool(_EXPERT_PATTERN.match(name)) or _weight_name_from_scale_name(name) is not None
+
+    def can_handle_tensor(self, name: str, tensor: torch.Tensor) -> bool:
+        return self.can_handle(name) or (name.endswith(".weight") and _is_quantized_weight(tensor))
 
     def convert(self, name: str, tensor: torch.Tensor) -> ConvertedCheckpointTensor | None:
+        weight_name = _weight_name_from_scale_name(name)
+        if weight_name is not None:
+            if not _is_block_scale_tensor(tensor):
+                return ConvertedCheckpointTensor(name, tensor)
+            return self._convert_scaled_weight_part(weight_name, "scale", tensor, name)
+
+        if name.endswith(".weight") and _is_quantized_weight(tensor):
+            return self._convert_scaled_weight_part(name, "weight", tensor, None)
+
+        return self._convert_weight(name, tensor)
+
+    def _convert_scaled_weight_part(
+        self, weight_name: str, part_name: str, tensor: torch.Tensor, scale_name: str | None
+    ) -> ConvertedCheckpointTensor | None:
+        parts = self._scaled_weight_buffer.setdefault(weight_name, {})
+        parts[part_name] = tensor
+        if scale_name is not None:
+            parts["scale_name"] = scale_name
+        if "weight" not in parts or "scale" not in parts:
+            return None
+
+        weight = parts["weight"]
+        scale = parts["scale"]
+        del self._scaled_weight_buffer[weight_name]
+        assert isinstance(weight, torch.Tensor)
+        assert isinstance(scale, torch.Tensor)
+        return self._convert_weight(weight_name, _dequantize_scaled_weight(weight, scale))
+
+    def _convert_weight(self, name: str, tensor: torch.Tensor) -> ConvertedCheckpointTensor | None:
         match = _EXPERT_PATTERN.match(name)
         if not match:
-            return None
+            return ConvertedCheckpointTensor(name, tensor)
 
         prefix, expert_id_str, proj_name = match.groups()
         proj_name = _PROJ_NAME_ALIASES.get(proj_name, proj_name)
@@ -140,9 +225,19 @@ class DeepseekV4CheckpointTensorConverter:
         if self._stacked_buffer:
             unflushed = {k: list(v.keys()) for k, v in self._stacked_buffer.items()}
             errors.append(f"unflushed stacked buffer (missing gate/up pair): {unflushed}")
+        finalized: list[ConvertedCheckpointTensor] = []
+        for weight_name, parts in self._scaled_weight_buffer.items():
+            if "weight" in parts:
+                errors.append(f"unflushed scaled weight buffer (missing scale for {weight_name})")
+                continue
+            scale = parts.get("scale")
+            scale_name = parts.get("scale_name")
+            if isinstance(scale, torch.Tensor) and isinstance(scale_name, str):
+                finalized.append(ConvertedCheckpointTensor(scale_name, scale))
         if errors:
             raise RuntimeError("DeepseekV4 checkpoint converter: incomplete checkpoint detected. " + "; ".join(errors))
-        return []
+        self._scaled_weight_buffer.clear()
+        return finalized
 
 
 def create_deepseek_v4_checkpoint_tensor_converter(model):

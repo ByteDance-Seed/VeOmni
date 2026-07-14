@@ -38,14 +38,14 @@ Our guiding principles when building VeOmni are:
 
 
 ## 📚 Key Features
-- **FSDP**, **FSDP2** backend for training.
+- **FSDP2** backend for training.
 - **Sequence Parallelism** with [Deepspeed Ulysess](https://arxiv.org/abs/2309.14509), support with non-async and async mode.
 - **Experts Parallelism** support large MOE model training, like [Qwen3-Moe](https://veomni.readthedocs.io/en/latest/key_features/ep_fsdp2.html).
 - Efficient **GroupGemm** kernel for Moe model, [Liger-Kernel](https://github.com/linkedin/Liger-Kernel).
 - Compatible with HuggingFace Transformers models. [Qwen3](https://veomni.readthedocs.io/en/latest/examples/qwen3.html), [Qwen3-VL](https://veomni.readthedocs.io/en/latest/examples/qwen3_vl.html), Qwen3-Moe, etc
 - Dynamic batching strategy, Omnidata processing
 - [**Torch Distributed Checkpoint**](https://docs.pytorch.org/docs/stable/distributed.checkpoint.html) for checkpoint.
-- Support for both Nvidia-GPU and Ascend-NPU training.
+- Support for NVIDIA GPU, AMD ROCm, and Ascend NPU training.
 - Experiment tracking with wandb
 
 ## 📝 Upcoming Features and Changes

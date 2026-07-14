@@ -63,6 +63,47 @@ if TYPE_CHECKING:
 logger = logging.get_logger(__name__)
 
 
+_FLOAT8_DTYPES = tuple(
+    dtype
+    for dtype in (
+        getattr(torch, "float8_e4m3fn", None),
+        getattr(torch, "float8_e4m3fnuz", None),
+        getattr(torch, "float8_e5m2", None),
+        getattr(torch, "float8_e5m2fnuz", None),
+        getattr(torch, "float8_e8m0fnu", None),
+    )
+    if dtype is not None
+)
+
+
+def _requires_byte_broadcast(dtype: "torch.dtype") -> bool:
+    return dtype in _FLOAT8_DTYPES
+
+
+def _num_storage_bytes(shape: Tuple[int, ...], dtype: "torch.dtype") -> int:
+    if dtype in _FLOAT8_DTYPES or dtype == torch.bool:
+        return math.prod(shape)
+    elem_size = torch.finfo(dtype).bits // 8 if dtype.is_floating_point else torch.iinfo(dtype).bits // 8
+    return math.prod(shape) * elem_size
+
+
+def _view_as_bytes(tensor: "torch.Tensor") -> "torch.Tensor":
+    return tensor.contiguous().view(torch.uint8).reshape(-1)
+
+
+def _view_from_bytes(tensor: "torch.Tensor", dtype: "torch.dtype", shape: Tuple[int, ...]) -> "torch.Tensor":
+    return tensor.view(dtype).reshape(shape)
+
+
+def _is_all_zero_tensor(tensor: "torch.Tensor") -> bool:
+    if tensor.is_meta:
+        return False
+    try:
+        return bool(torch.count_nonzero(tensor).item() == 0)
+    except NotImplementedError:
+        return False
+
+
 @contextmanager
 def init_empty_weights():
     """
@@ -298,9 +339,7 @@ def _param_larger_than(shape: Tuple[int, ...], dtype: torch.dtype, max_load_broa
     """
     Check if a parameter is large enough to be sharded.
     """
-    num_elem = math.prod(shape)
-    elem_size = torch.finfo(dtype).bits // 8 if dtype.is_floating_point else torch.iinfo(dtype).bits // 8
-    param_size = num_elem * elem_size
+    param_size = _num_storage_bytes(tuple(shape), dtype)
     return param_size >= max_load_broadcast_size * (1024**3)
 
 
@@ -539,6 +578,12 @@ def load_model_weights_ep_sharded(
                     n_buf += 1
                     continue
                 if name not in parameter_names_to_load:
+                    if converter is not None and converter.can_handle(name):
+                        raise NotImplementedError(
+                            "ep_sharded_stream_load does not support checkpoint tensor conversion for "
+                            f"unexpected key '{name}'. Use load_model_weights or rank0_load_and_broadcast_weights "
+                            "for FP8/int8 scaled checkpoints."
+                        )
                     logger.info_rank0(f"Unexpected key in state dict: {name}.")
                     continue
 
@@ -600,15 +645,17 @@ def load_model_weights_ep_sharded(
                     _dispatch_parameter(model, name, tensor, dtensor_factory, None, dtensor_to_cpu)
                     n_ep += 1
                 else:
-                    if converter is not None and converter.can_handle(name):
-                        # A streamable (dim-0 zero-pad) converter must only touch
-                        # ExtraParallel tables; a dense key would need its conversion
-                        # applied here, which this path does not do -> bail.
-                        raise NotImplementedError(
-                            f"ep_sharded_stream_load: converter handles non-ExtraParallel key '{name}'."
-                        )
                     tensor = f.get_tensor(raw_name)
-                    _dispatch_parameter(model, name, tensor, dtensor_factory, parallel_plan, dtensor_to_cpu)
+                    converted = maybe_convert_checkpoint_tensor(name, tensor, converter)
+                    if converted is None:
+                        raise NotImplementedError(
+                            "ep_sharded_stream_load does not support checkpoint tensor conversion that buffers "
+                            f"dense key '{name}'. Use load_model_weights or rank0_load_and_broadcast_weights "
+                            "for FP8/int8 scaled checkpoints."
+                        )
+                    _dispatch_parameter(
+                        model, converted.name, converted.tensor, dtensor_factory, parallel_plan, dtensor_to_cpu
+                    )
                     n_dense += 1
                 parameter_names_to_load.discard(name)
         empty_cache()
@@ -672,16 +719,26 @@ def rank0_load_and_broadcast_weights(
     def _broadcast_and_dispatch(name, shape, dtype, tensor):
         """Broadcast a single (name, tensor) from rank0 and dispatch it."""
         logger.info_rank0(f"rank0_load_and_broadcast_weights: broadcasting {name=}")
-        if global_rank != 0:
-            tensor = torch.empty(shape, dtype=dtype, device=torch_device)
-        else:
+        broadcast_as_bytes = _requires_byte_broadcast(dtype)
+        if global_rank == 0:
             tensor = tensor.to(torch_device, non_blocking=True)
+            broadcast_tensor = _view_as_bytes(tensor) if broadcast_as_bytes else tensor
+        else:
+            if broadcast_as_bytes:
+                broadcast_tensor = torch.empty(
+                    _num_storage_bytes(shape, dtype), dtype=torch.uint8, device=torch_device
+                )
+            else:
+                tensor = torch.empty(shape, dtype=dtype, device=torch_device)
+                broadcast_tensor = tensor
 
         start_time = time.perf_counter()
-        dist.broadcast(tensor, src=0)
+        dist.broadcast(broadcast_tensor, src=0)
         logger.info_rank0(
             f"{name=}, {shape=}, {dtype=}, broadcast time (ms) spent: {1000 * (time.perf_counter() - start_time)}"
         )
+        if broadcast_as_bytes:
+            tensor = _view_from_bytes(broadcast_tensor, dtype, shape)
 
         if name in buffer_dict:
             buffer_dict[name] = tensor.detach().clone()
@@ -804,11 +861,19 @@ def rank0_load_and_broadcast_weights(
             placements = None
             shard_comm_device = _get_communication_device(init_device)
 
-        broadcast_buffer = torch.empty(
-            shard_tensor.shape,
-            dtype=shard_tensor.dtype,
-            device=shard_comm_device,
-        )
+        chunk_broadcast_as_bytes = _requires_byte_broadcast(shard_tensor.dtype)
+        if chunk_broadcast_as_bytes:
+            broadcast_buffer = torch.empty(
+                _num_storage_bytes(tuple(shard_tensor.shape), shard_tensor.dtype),
+                dtype=torch.uint8,
+                device=shard_comm_device,
+            )
+        else:
+            broadcast_buffer = torch.empty(
+                shard_tensor.shape,
+                dtype=shard_tensor.dtype,
+                device=shard_comm_device,
+            )
         shard_dst_ranks = _get_extra_parallel_shard_dst_ranks(
             parallel_state, para_group_name, para_size, shard_comm_device
         )
@@ -825,7 +890,11 @@ def rank0_load_and_broadcast_weights(
             #     when chunk_id = 3, send_seq = [3, 7], p2p tag = [6, 6]
 
             if dist.get_rank() == 0:
-                broadcast_buffer.copy_(chunk_loaded_data[chunk_id].contiguous())
+                if chunk_broadcast_as_bytes:
+                    chunk_tensor = chunk_loaded_data[chunk_id].to(device=shard_comm_device, dtype=shard_tensor.dtype)
+                    broadcast_buffer.copy_(_view_as_bytes(chunk_tensor))
+                else:
+                    broadcast_buffer.copy_(chunk_loaded_data[chunk_id].contiguous())
             dst_ranks = sorted(shard_dst_ranks[chunk_id])
             # One tag increment per chunk_id on every rank so the counter stays aligned.
             tag = _next_chunk_p2p_tag()
@@ -837,13 +906,18 @@ def rank0_load_and_broadcast_weights(
                     dist.send(broadcast_buffer, dst=dst, tag=tag)
 
                 if global_rank in dst_ranks:
+                    dispatch_buffer = (
+                        _view_from_bytes(broadcast_buffer, shard_tensor.dtype, tuple(shard_tensor.shape))
+                        if chunk_broadcast_as_bytes
+                        else broadcast_buffer
+                    )
                     if is_shard_tensor_dtensor:
-                        chunk_tensor = dtensor_factory(broadcast_buffer, device_mesh, placements).contiguous()
+                        chunk_tensor = dtensor_factory(dispatch_buffer, device_mesh, placements).contiguous()
                         if dtensor_to_cpu:
                             chunk_tensor = chunk_tensor.to("cpu")
                         shard_tensor.copy_(chunk_tensor)
                     else:
-                        shard_tensor.copy_(broadcast_buffer.to(shard_tensor.device).contiguous())
+                        shard_tensor.copy_(dispatch_buffer.to(shard_tensor.device).contiguous())
 
             elif global_rank in send_seq:
                 if is_shard_tensor_dtensor:
@@ -854,13 +928,18 @@ def rank0_load_and_broadcast_weights(
                 assert extra_para_local_rank == chunk_id, f"Rank {global_rank} is not the shard {chunk_id} rank."
                 dist.recv(broadcast_buffer, src=0, tag=tag)
 
+                dispatch_buffer = (
+                    _view_from_bytes(broadcast_buffer, shard_tensor.dtype, tuple(shard_tensor.shape))
+                    if chunk_broadcast_as_bytes
+                    else broadcast_buffer
+                )
                 if is_shard_tensor_dtensor:
-                    chunk_tensor = dtensor_factory(broadcast_buffer, device_mesh, placements).contiguous()
+                    chunk_tensor = dtensor_factory(dispatch_buffer, device_mesh, placements).contiguous()
                     if dtensor_to_cpu:
                         chunk_tensor = chunk_tensor.to("cpu")
                     shard_tensor.copy_(chunk_tensor)
                 else:
-                    shard_tensor.copy_(broadcast_buffer.to(shard_tensor.device).contiguous())
+                    shard_tensor.copy_(dispatch_buffer.to(shard_tensor.device).contiguous())
 
         logger.info_rank0(
             f"{name=}, {shape=}, {dtype=}, chunk and broadcast time (ms) spent: {1000 * (time.perf_counter() - start_time)}"
@@ -926,7 +1005,7 @@ def rank0_load_and_broadcast_weights(
                         if is_peft_model:
                             key = lora_key_overrides.get(key, "base_model.model." + key)
                         logger.info_rank0(f"loading {key=}")
-                        if torch.count_nonzero(tensor) == 0:
+                        if _is_all_zero_tensor(tensor):
                             logger.warning_rank0(
                                 f"Detected tensor with all-zero values when reading safetensor: {key=}"
                             )

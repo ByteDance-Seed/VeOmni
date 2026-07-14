@@ -7,14 +7,10 @@
 2. **Run Example Script**  
    Verify training startup: (need download the dataset first)
 
-    - Use plain python scripts:
-        ```bash
-        bash train.sh tasks/deprecated_task/train_torch.py configs/text/qwen2_5.yaml
-        ```
-    - Use trainer:
-        ```bash
-        bash train.sh tasks/train_text.py configs/text/qwen2_5.yaml
-        ```
+    Use the text trainer entry point:
+    ```bash
+    bash train.sh tasks/train_text.py configs/text/qwen2_5.yaml
+    ```
 
 3. **Create Custom Task Directory**  
     [`train_text.py`](https://github.com/ByteDance-Seed/VeOmni/blob/main/tasks/train_text.py) can be used for most of task pre-training and post-training tasks, you can just modify the train config to complete your task. However, if you want to create a new task, you can copy the `train_text.py` file from the `tasks` directory and modify it. like [`tasks/train_vlm.py`](https://github.com/ByteDance-Seed/VeOmni/blob/main/tasks/train_vlm.py)
