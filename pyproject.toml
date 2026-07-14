@@ -71,6 +71,10 @@ gpu = [
   "quack-kernels[cu13]==0.5.0",
   "torch-c-dlpack-ext",
   "apache-tvm-ffi==0.1.9",
+  # Training-capable DeepSeek V4 mHC kernels. TileKernels 1.0.0 requires
+  # TileLang >=0.1.9; the explicit pin is shared with existing TileLang ops.
+  "tile-kernels==1.0.0",
+  "tilelang==0.1.9",
   "av>=14.3.0,<15.0; python_version == '3.11' and platform_machine == 'x86_64'",
   "av>=14.2.0,<14.3; python_version == '3.11' and platform_machine == 'aarch64'",
   "av>=14.0.0,<14.3; python_version == '3.12'",
@@ -177,6 +181,9 @@ override-dependencies = [
     "torchaudio==2.10.0+cpu; (extra == 'npu')",
     "torchvision==0.25.0+cpu; (extra == 'npu')",
     "torchcodec==0.10.0; (extra == 'npu')",
+    # FlashQLA's setup metadata pins TileLang 0.1.8, while TileKernels 1.0.0
+    # requires >=0.1.9. Both backends are validated against this shared pin.
+    "tilelang==0.1.9; (extra == 'gpu')",
 ]
 
 conflicts = [

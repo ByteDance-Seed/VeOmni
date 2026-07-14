@@ -270,6 +270,7 @@ class OpsImplementationConfig:
     moe_implementation: Literal["eager", "fused_triton", "fused_quack", "fused_npu"] = "eager"
     cross_entropy_loss_implementation: str = "eager"
     load_balancing_loss_implementation: str = "eager"
+    mhc_backend: Literal["eager", "tile_kernels"] = "eager"
 ```
 
 **Shipped today** (what is actually on `OpsImplementationConfig` as of this
@@ -287,6 +288,7 @@ PR — see `veomni/arguments/arguments_types.py`):
 | `rms_norm_gated_implementation` | `eager`, `fla` | Qwen3.5 GatedDeltaNet `self.norm`; default `fla`. No NPU backend — selecting any non-eager value on NPU raises at OpSlot bind time (#714) |
 | `causal_conv1d_implementation` | `eager`, `fla` | Qwen3.5 GatedDeltaNet pre-mixer; default `fla`. `eager` has no torch fallback for `cu_seqlens` — varlen training raises at forward time. No NPU backend (#714) |
 | `chunk_gated_delta_rule_implementation` | `eager`, `fla`, `flash_qla` | Qwen3.5 linear attention; default `fla`. `flash_qla` (QwenLM FlashQLA) ships under the `gpu` extra and binds on Hopper sm90 only. No NPU backend (#714) |
+| `mhc_backend` | `eager`, `tile_kernels` | DeepSeek V4 manifold-constrained Hyper-Connection pre/post/head kernels. The three `OpSlot("mhc", variant)` instances share this selection and require NVIDIA SM90+ for `tile_kernels`. |
 
 Convenience preset:
 
@@ -772,7 +774,7 @@ model.forward()                                    # (5) runtime
 | `VEOMNI_USE_LIGER_KERNEL=1` env var | `rms_norm_implementation: liger` etc. | Deprecate env var; keep compat for 1 release |
 | `gpu_patch.py` monkey-patching | patchgen + `OpSlot` guards | Remove `gpu_patch.py` files |
 | `apply_veomni_loss_patch()` at import | `cross_entropy_loss_implementation` + `OpSlot` | Remove import-time patch |
-| `apply_veomni_fused_moe_patch()` | `OpSlot("moe_experts", ...)` | All MoE models (qwen3_moe, qwen3_5_moe, qwen3_vl_moe, qwen3_omni_moe, deepseek_v3, deepseek_v4) now bind through OpSlot guards; the function is kept only as the binding helper invoked from `_bind_veomni_ops` to set the global `_fused_moe_forward` pointer. DeepSeek-V4 attention is still eager-only, but its MoE keeps a direct `fused_moe_forward(...)` call under that guard so it can pass its merged `gate_up_proj` layout and `swiglu_limit` clamp explicitly; clamp-aware V4 fused MoE is currently provided by the GPU backends and defaults to `fused_triton` on GPU, while `fused_npu` raises until the NPU kernel implements `swiglu_limit`. |
+| `apply_veomni_fused_moe_patch()` | `OpSlot("moe_experts", ...)` | All MoE models (qwen3_moe, qwen3_5_moe, qwen3_vl_moe, qwen3_omni_moe, deepseek_v3, deepseek_v4) now bind through OpSlot guards; the function is kept only as the binding helper invoked from `_bind_veomni_ops` to set the global `_fused_moe_forward` pointer. DeepSeek-V4 separately exposes TileLang DSA indexer/attention config slots and three registry-backed TileKernels mHC slots. Its MoE keeps a direct `fused_moe_forward(...)` call under the experts guard so it can pass its merged `gate_up_proj` layout and `swiglu_limit` clamp explicitly; clamp-aware V4 fused MoE is currently provided by the GPU backends and defaults to `fused_triton` on GPU, while `fused_npu` raises until the NPU kernel implements `swiglu_limit`. |
 | `moe_implementation: fused` (auto-picks Triton on GPU / NPU group-gemm on NPU) | `moe_implementation: fused_triton` or `fused_npu` | Breaking change — `"fused"` renamed to `"fused_triton"` and the silent NPU auto-pick replaced by explicit `"fused_npu"`. `fused_quack` is unchanged. |
 
 ---

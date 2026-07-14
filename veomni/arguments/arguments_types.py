@@ -1017,13 +1017,20 @@ class OpsImplementationConfig:
             "A non-eager value on hardware without a matching backend raises at OpSlot bind time."
         },
     )
-    dsa_indexer_backend: Literal["eager", "cudnn"] = field(
+    dsa_indexer_backend: Literal["eager", "cudnn", "tilelang"] = field(
         default="eager",
-        metadata={"help": "DeepSeek sparse attention top-k indexer backend."},
+        metadata={"help": "DeepSeek sparse attention top-k indexer backend: 'eager', 'cudnn', or 'tilelang'."},
     )
-    dsa_attention_backend: Literal["eager", "flashmla_cudnn"] = field(
+    dsa_attention_backend: Literal["eager", "flashmla_cudnn", "tilelang_sparse"] = field(
         default="eager",
-        metadata={"help": "DeepSeek sparse attention backend."},
+        metadata={"help": "DeepSeek sparse attention backend: 'eager', 'flashmla_cudnn', or 'tilelang_sparse'."},
+    )
+    mhc_backend: Literal["eager", "tile_kernels"] = field(
+        default="eager",
+        metadata={
+            "help": "Manifold-constrained Hyper-Connection backend. 'tile_kernels' enables the "
+            "DeepSeek V4 TileKernels forward/backward path on NVIDIA SM90+; 'eager' uses PyTorch."
+        },
     )
 
     def __post_init__(self):
