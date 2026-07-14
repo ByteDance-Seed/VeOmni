@@ -14,6 +14,8 @@ selection knob.
 | Kernel | Config field | Available values | Default | Selection time |
 |--------|-------------|------------------|---------|----------------|
 | Attention | `attn_implementation` | `eager`, `sdpa`, `flash_attention_2`, `flash_attention_3`, `flash_attention_4`, `native-sparse` | `"flash_attention_2"` | Config `__post_init__` + `build_foundation_model` |
+| DSA indexer | `dsa_indexer_backend` | `eager`, `cudnn` (GLM-DSA), `tilelang` (DeepSeek-V4) | `"eager"` | Model build via `OpsConfigSlot` |
+| DSA attention | `dsa_attention_backend` | `eager`, `flashmla_cudnn` (GLM-DSA), `tilelang_sparse` (DeepSeek-V4) | `"eager"` | Model build via `OpsConfigSlot` |
 | Cross-entropy loss | `cross_entropy_loss_implementation` | `eager`, `liger_kernel`, `chunk_loss`, `npu` | `"liger_kernel"` (GPU) | `apply_ops_config()` (before model build) |
 | RMSNorm | `rms_norm_implementation` | `eager`, `liger_kernel`, `npu`, `triton` (per-model; DeepSeek-V3) | `"liger_kernel"` (GPU) | Model registration via ops config singleton |
 | SwiGLU MLP | `swiglu_mlp_implementation` | `eager`, `liger_kernel` | `"liger_kernel"` (GPU) | Model registration via ops config singleton |

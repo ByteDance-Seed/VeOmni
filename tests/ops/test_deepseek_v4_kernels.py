@@ -14,6 +14,7 @@
 
 import importlib
 import sys
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -158,6 +159,78 @@ def test_tilelang_sparse_attention_forward_backward_with_invalid_indices():
     for actual_grad, expected_grad in zip((q.grad, kv.grad, sinks.grad), expected_grads, strict=True):
         assert actual_grad is not None and torch.isfinite(actual_grad).all()
         assert _cosine_similarity(actual_grad, expected_grad) > 0.95
+
+
+def test_deepseek_v4_generated_attention_dispatch_matches_eager():
+    _require_tilelang_cuda()
+    from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling
+
+    torch.manual_seed(3)
+    batch, seqlen, heads, dim = 1, 32, 8, 512
+    query = torch.randn(batch, heads, seqlen, dim, device="cuda", dtype=torch.bfloat16)
+    key = torch.randn(batch, 1, seqlen, dim, device="cuda", dtype=torch.bfloat16)
+    causal_mask = torch.full((batch, 1, seqlen, seqlen), float("-inf"), device="cuda")
+    causal_mask = torch.triu(causal_mask, diagonal=1)
+    module = SimpleNamespace(
+        num_key_value_groups=heads,
+        sinks=torch.randn(heads, device="cuda"),
+        training=False,
+        sliding_window=seqlen,
+        compressor=None,
+    )
+
+    try:
+        modeling.veomni_dsa_attention_backend.bind(SimpleNamespace(dsa_attention_backend="eager"))
+        expected, _ = modeling.eager_attention_forward(module, query, key, key, causal_mask, dim**-0.5, dropout=0.0)
+        modeling.veomni_dsa_attention_backend.bind(SimpleNamespace(dsa_attention_backend="tilelang_sparse"))
+        actual, weights = modeling.eager_attention_forward(
+            module, query, key, key, causal_mask, dim**-0.5, dropout=0.0
+        )
+
+        assert weights is None
+        torch.testing.assert_close(actual.float(), expected.float(), rtol=2e-2, atol=2e-2)
+
+        fp32_output, fp32_weights = modeling.eager_attention_forward(
+            module, query.float(), key.float(), key.float(), causal_mask, dim**-0.5, dropout=0.0
+        )
+        assert fp32_weights is not None
+        assert fp32_output.dtype == torch.float32
+    finally:
+        modeling.veomni_dsa_attention_backend.bind(SimpleNamespace(dsa_attention_backend="eager"))
+
+
+def test_deepseek_v4_generated_indexer_dispatch_and_position_fallback(monkeypatch):
+    _require_tilelang_cuda()
+    from transformers import AutoConfig
+
+    from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling
+
+    config = AutoConfig.from_pretrained("tests/toy_config/deepseek_v4_toy")
+    indexer = modeling.DeepseekV4Indexer(config).to(device="cuda", dtype=torch.bfloat16)
+    seq_len = 8
+    hidden_states = torch.randn(1, seq_len, config.hidden_size, device="cuda", dtype=torch.bfloat16)
+    q_residual = torch.randn(1, seq_len, config.q_lora_rank, device="cuda", dtype=torch.bfloat16)
+    canonical_positions = torch.arange(seq_len, device="cuda").unsqueeze(0)
+    calls = []
+
+    def fake_tilelang(q, k, weights, compress_ratio, topk):
+        calls.append((q.shape, k.shape, weights.shape, compress_ratio, topk))
+        indices = torch.zeros(1, seq_len, topk, device="cuda", dtype=torch.int32)
+        return torch.zeros_like(indices, dtype=torch.float32), indices
+
+    monkeypatch.setattr(modeling, "v4_lighting_indexer", fake_tilelang)
+    try:
+        modeling.veomni_dsa_indexer_backend.bind(SimpleNamespace(dsa_indexer_backend="tilelang"))
+        tilelang_indices = indexer(hidden_states, q_residual, canonical_positions, None, 0)
+        assert calls
+        expected_topk = seq_len // config.compress_rates["compressed_sparse_attention"]
+        assert tilelang_indices.shape == (1, seq_len, expected_topk)
+
+        eager_indices = indexer(hidden_states, q_residual, canonical_positions + 1, None, 0)
+        assert len(calls) == 1
+        assert eager_indices.shape == tilelang_indices.shape
+    finally:
+        modeling.veomni_dsa_indexer_backend.bind(SimpleNamespace(dsa_indexer_backend="eager"))
 
 
 def test_tilelang_act_quant_shapes_scales_and_inplace():

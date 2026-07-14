@@ -9,6 +9,10 @@
 #  It contains a patched version of the original HuggingFace modeling code.
 #
 #  Patches applied:
+#    - method_override: DeepseekV4Indexer.forward
+#      Optional TileLang Lightning Indexer dispatch
+#    - function_replacement: eager_attention_forward
+#      Optional TileLang sparse MQA dispatch
 #    - class_replacement: DeepseekV4Experts
 #      Use v5 gate_up_proj expert layout with OpSlot-guarded VeOmni fused-MoE path
 #    - method_override: DeepseekV4ForCausalLM.forward
@@ -45,13 +49,16 @@ from transformers.utils.output_capturing import OutputRecorder, capture_outputs
 from veomni.ops import fused_moe_forward
 
 # Additional import blocks for patches
-from veomni.ops.dispatch import OpSlot
+from veomni.ops.dispatch import OpsConfigSlot, OpSlot
+from veomni.ops.kernels.deepseek_v4 import sparse_attn_tilelang, v4_lighting_indexer
 from veomni.utils.model_outputs import MoeCausalLMOutputWithLogProbs
 
 
 veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
 veomni_moe_experts_forward = OpSlot("moe_experts", "standard")
 veomni_load_balancing_loss = OpSlot("load_balancing_loss", "standard")
+veomni_dsa_indexer_backend = OpsConfigSlot("dsa_indexer_backend")
+veomni_dsa_attention_backend = OpsConfigSlot("dsa_attention_backend")
 
 
 @use_kernel_forward_from_hub("RMSNorm")
@@ -457,6 +464,12 @@ class DeepseekV4HCACompressor(nn.Module):
         return compressed_kv, block_bias
 
 
+# ======================================================================
+# [MODIFIED CLASS] DeepseekV4Indexer
+# Methods patched: forward
+# ======================================================================
+
+
 class DeepseekV4Indexer(nn.Module):
     r"""Lightning Indexer (paper §2.3.1, eqs. 13–17). Used by Compressed Sparse
     Attention (CSA) to pick the top-`k` compressed KV blocks per query, with
@@ -504,6 +517,12 @@ class DeepseekV4Indexer(nn.Module):
         self.weights_proj = nn.Linear(config.hidden_size, self.num_heads, bias=False)
         self.rotary_emb = DeepseekV4RotaryEmbedding(config)
 
+    # ================================================================
+    # Patch: DeepseekV4Indexer.forward
+    # 1. Dispatch CUDA prefill/training index scoring to the TileLang Lightning
+    #    Indexer when ``dsa_indexer_backend=tilelang``. Cache/decode and unusual
+    #    position layouts retain the upstream eager implementation.
+    # ================================================================
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -529,7 +548,6 @@ class DeepseekV4Indexer(nn.Module):
             chunk_kv = chunk_kv.view(batch, n_windows, ratio, -1)
             chunk_gate = chunk_gate.view(batch, n_windows, ratio, -1) + self.position_bias.to(chunk_gate.dtype)
 
-            # Same Ca / Cb overlap layout as the outer CSA compressor, at index_head_dim.
             new_kv = chunk_kv.new_zeros((batch, n_windows, 2 * ratio, self.head_dim))
             new_gate = chunk_gate.new_full((batch, n_windows, 2 * ratio, self.head_dim), float("-inf"))
             new_kv[:, :, ratio:] = chunk_kv[..., self.head_dim :]
@@ -561,30 +579,52 @@ class DeepseekV4Indexer(nn.Module):
         cos_q, sin_q = self.rotary_emb(hidden_states, position_ids=position_ids, layer_type=self.rope_layer_type)
         q = self.q_b_proj(q_residual).view(batch, seq_len, -1, self.head_dim).transpose(1, 2)
         q = apply_rotary_pos_emb(q, cos_q, sin_q).transpose(1, 2)
-
-        # ReLU(q·kᵀ) * weights, then top-k
-        scores = torch.matmul(q.float(), compressed_kv.transpose(-1, -2).float().unsqueeze(1))  # [B, S, H, T]
-        scores = F.relu(scores) * self.softmax_scale
-        weights = self.weights_proj(hidden_states).float() * self.weights_scaling  # [B, S, H]
-        index_scores = (scores * weights.unsqueeze(-1)).sum(dim=2)  # [B, S, T]
+        weights = self.weights_proj(hidden_states).float() * (self.weights_scaling * self.softmax_scale)
         compressed_len = compressed_kv.shape[1]
         top_k = min(self.index_topk, compressed_len)
 
-        # not all queries can attend to the compressed entries. If a query's position
-        # is small than the relative position of the key (say m=4, query 2 cannot attend
-        # to compressed key at position 4, because it compressed info for states at position
-        # 12 to 16. Thus we need to make sure that top_k does not land in that range.
-        # Picks that still point past `causal_threshold` (early queries with too few ready
-        # blocks) are replaced with a `-1` sentinel that the compresser treats as invalid.
+        # --- Patch.1 ---
+        indexer_backend = veomni_dsa_indexer_backend.value
+        if indexer_backend not in {"eager", "tilelang"}:
+            raise ValueError(
+                f"DeepSeek-V4 does not support dsa_indexer_backend={indexer_backend!r}; expected 'eager' or 'tilelang'"
+            )
+        canonical_positions = torch.arange(seq_len, device=position_ids.device).unsqueeze(0).expand_as(position_ids)
+        use_tilelang = (
+            indexer_backend == "tilelang"
+            and hidden_states.is_cuda
+            and q.dtype == torch.bfloat16
+            and compressed_kv.dtype == torch.bfloat16
+            and self.num_heads <= 64
+            and self.num_heads % 8 == 0
+            and self.head_dim == 1 << (self.head_dim - 1).bit_length()
+            and cache_layer is None
+            and compressed_len > 0
+            and torch.equal(position_ids, canonical_positions)
+        )
+        if use_tilelang:
+            _, top_k_indices = v4_lighting_indexer(
+                q.transpose(0, 1).contiguous(),
+                compressed_kv.transpose(0, 1).contiguous(),
+                weights.transpose(0, 1).contiguous(),
+                self.compress_rate,
+                top_k,
+            )
+            return top_k_indices.to(torch.long)
+        # --- Patch.1 ---
+
+        scores = torch.matmul(q.float(), compressed_kv.transpose(-1, -2).float().unsqueeze(1))
+        scores = F.relu(scores) * self.softmax_scale
+        eager_weights = self.weights_proj(hidden_states).float() * self.weights_scaling
+        index_scores = (scores * eager_weights.unsqueeze(-1)).sum(dim=2)
         if compressed_len > 0:
-            causal_threshold = (position_ids + 1) // self.compress_rate  # [B, S]
+            causal_threshold = (position_ids + 1) // self.compress_rate
             entry_indices = torch.arange(compressed_len, device=index_scores.device)
-            future_mask = entry_indices.view(1, 1, -1) >= causal_threshold.unsqueeze(-1)  # [B, S, T]
+            future_mask = entry_indices.view(1, 1, -1) >= causal_threshold.unsqueeze(-1)
             index_scores = index_scores.masked_fill(future_mask, float("-inf"))
-            top_k_indices = index_scores.topk(top_k, dim=-1).indices  # [B, S, k]
+            top_k_indices = index_scores.topk(top_k, dim=-1).indices
             invalid = top_k_indices >= causal_threshold.unsqueeze(-1)
             return torch.where(invalid, torch.full_like(top_k_indices, -1), top_k_indices)
-
         return index_scores.topk(top_k, dim=-1).indices
 
 
@@ -714,6 +754,19 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
 
 
+# ======================================================================
+# [PATCHED FUNCTION] eager_attention_forward
+# Reason: Optional TileLang sparse MQA dispatch
+# Source: veomni.models.transformers.deepseek_v4.deepseek_v4_gpu_patch_gen_config
+# ======================================================================
+# ================================================================
+# Patch: eager_attention_forward
+# 1. Dispatch DeepSeek-V4 attention to the TileLang sparse MQA kernel when
+#    ``dsa_attention_backend=tilelang_sparse``. The existing additive mask is
+#    converted to a compact fixed-width index list, preserving sliding-window,
+#    compressor, causal, and invalid-index semantics.
+# 2. Preserve the upstream eager implementation as the default fallback.
+# ================================================================
 def eager_attention_forward(
     module: nn.Module,
     query: torch.Tensor,
@@ -724,6 +777,52 @@ def eager_attention_forward(
     dropout: float | int = 0.0,
     **kwargs,
 ):
+    # --- Patch.1 ---
+    attention_backend = veomni_dsa_attention_backend.value
+    if attention_backend not in {"eager", "tilelang_sparse"}:
+        raise ValueError(
+            f"DeepSeek-V4 does not support dsa_attention_backend={attention_backend!r}; "
+            "expected 'eager' or 'tilelang_sparse'"
+        )
+    use_tilelang = (
+        attention_backend == "tilelang_sparse"
+        and query.is_cuda
+        and query.dtype == torch.bfloat16
+        and key.dtype == torch.bfloat16
+        and value.dtype == torch.bfloat16
+        and query.shape[-1] == 1 << (query.shape[-1] - 1).bit_length()
+        and isinstance(attention_mask, torch.Tensor)
+        and dropout == 0
+        and key.shape[1] == 1
+    )
+    if use_tilelang:
+        batch, _, seq_len, _ = query.shape
+        kv_len = key.shape[-2]
+        compressed_len = max(0, kv_len - seq_len)
+        compressed_budget = compressed_len
+        indexer = getattr(getattr(module, "compressor", None), "indexer", None)
+        if indexer is not None:
+            compressed_budget = min(compressed_len, indexer.index_topk)
+        selected_width = min(kv_len, module.sliding_window + compressed_budget)
+
+        mask = attention_mask
+        if mask.shape[0] == 1 and batch > 1:
+            mask = mask.expand(batch, -1, -1, -1)
+        allowed = mask[:, 0] if mask.dtype == torch.bool else mask[:, 0] >= 0
+        _, topk_indices = allowed.to(torch.int8).topk(selected_width, dim=-1, sorted=False)
+        selected_valid = allowed.gather(-1, topk_indices)
+        topk_indices = topk_indices.to(torch.int32).masked_fill(~selected_valid, -1).contiguous()
+        attn_output = sparse_attn_tilelang(
+            query.transpose(1, 2).contiguous(),
+            key[:, 0].contiguous(),
+            module.sinks.float().contiguous(),
+            topk_indices,
+            scaling,
+        )
+        return attn_output, None
+    # --- Patch.1 ---
+
+    # --- Patch.2 ---
     key_states = repeat_kv(key, module.num_key_value_groups)
     value_states = repeat_kv(value, module.num_key_value_groups)
     attn_weights = torch.matmul(query, key_states.transpose(2, 3)) * scaling
@@ -732,17 +831,14 @@ def eager_attention_forward(
 
     sinks = module.sinks.reshape(1, -1, 1, 1).expand(query.shape[0], -1, query.shape[-2], -1)
     combined_logits = torch.cat([attn_weights, sinks], dim=-1)
-
-    # This was not in the original implementation and slightly affect results; it prevents overflow in BF16/FP16
-    # when training with bsz>1 we clamp max values.
-
     combined_logits = combined_logits - combined_logits.max(dim=-1, keepdim=True).values
     probs = F.softmax(combined_logits, dim=-1, dtype=combined_logits.dtype)
-    scores = probs[..., :-1]  # we drop the sink here
+    scores = probs[..., :-1]
     attn_weights = nn.functional.dropout(scores, p=dropout, training=module.training).to(value_states.dtype)
     attn_output = torch.matmul(attn_weights, value_states)
     attn_output = attn_output.transpose(1, 2).contiguous()
     return attn_output, attn_weights
+    # --- Patch.2 ---
 
 
 COMPRESSOR_CLASSES = {

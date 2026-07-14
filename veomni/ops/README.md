@@ -115,6 +115,10 @@ still import VeOmni. Callers that use a TileLang entry point must have the GPU
 extra installed; `tilelang==0.1.8` is supplied by the existing FlashQLA
 dependency chain.
 
+DeepSeek-V4 selects these kernels with `dsa_indexer_backend: tilelang` and
+`dsa_attention_backend: tilelang_sparse`. Both default to `eager`; unsupported
+cache, position, or dropout layouts retain the upstream eager implementation.
+
 ---
 
 ## Recipe 1: Add a new backend to an existing op

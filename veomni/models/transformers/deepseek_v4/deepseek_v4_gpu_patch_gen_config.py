@@ -18,16 +18,22 @@ Regen command:
 patchgen veomni.models.transformers.deepseek_v4.deepseek_v4_gpu_patch_gen_config -o veomni/models/transformers/deepseek_v4/generated --diff
 
 Patches:
-1. ``DeepseekV4Experts`` — drops upstream ``@use_experts_implementation``
+1. ``DeepseekV4Indexer.forward`` — optional TileLang Lightning Indexer for
+   canonical CUDA prefill/training positions, selected by
+   ``dsa_indexer_backend=tilelang`` with eager cache/decode fallback.
+2. ``eager_attention_forward`` — optional TileLang sparse MQA attention,
+   selected by ``dsa_attention_backend=tilelang_sparse``. Converts the
+   upstream additive sliding/compressor mask into compact indices.
+3. ``DeepseekV4Experts`` — drops upstream ``@use_experts_implementation``
    (which would otherwise dispatch to ``grouped_mm`` and bypass VeOmni's
    fused MoE kernel). Keeps the v5 stacked ``gate_up_proj [E, 2*I, H]`` /
    ``down_proj [E, H, I]`` layout and the gpt-oss-style ``swiglu_limit``
    clamp. Dispatch is OpSlot-guarded (``veomni_moe_experts_forward``):
    non-eager -> ``fused_moe_forward``; eager -> per-expert loop.
-2. ``DeepseekV4ForCausalLM.forward`` — OpSlot guard for fused
+4. ``DeepseekV4ForCausalLM.forward`` — OpSlot guard for fused
    cross-entropy (``veomni_causal_lm_loss``) + ``MoeCausalLMOutputWithLogProbs``
    so callers can read per-token log-probs / entropy alongside the loss.
-3. Register ``get_parallel_plan`` on ``DeepseekV4ForCausalLM``.
+5. Register ``get_parallel_plan`` on ``DeepseekV4ForCausalLM``.
 
 Intentionally NOT patched:
 
@@ -53,9 +59,11 @@ Intentionally NOT patched:
   256 cap, SDPA lacks the per-head learnable sink, and FlexAttention can't
   resize BlockMask after the in-block compressor concatenation). MoE does not
   share this limitation: the experts patch above binds VeOmni fused MoE by
-  default on GPU.
-  Sequence parallel for V4 attention is out of scope for this patchgen pass and
-  needs a dedicated eager-SP path before the model can train under SP.
+  default on GPU. The module-level eager attention interface is patched for
+  optional TileLang sparse dispatch without changing the class forward
+  contract. Sequence parallel for V4 attention is out of scope for this
+  patchgen pass and needs a dedicated eager-SP path before the model can train
+  under SP.
 - ``DeepseekV4Model.forward`` — top-level ``hidden_states`` is *4D*
   (``[B, S, hc_mult, D]`` for the manifold-constrained Hyper-Connection
   residual stack); existing VeOmni SP collators assume 3D
@@ -72,12 +80,17 @@ from torch import nn
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache
 from transformers.modeling_outputs import MoeModelOutputWithPast
-from transformers.models.deepseek_v4.modeling_deepseek_v4 import load_balancing_loss_func
+from transformers.models.deepseek_v4.modeling_deepseek_v4 import (
+    DeepseekV4CSACache,
+    apply_rotary_pos_emb,
+    load_balancing_loss_func,
+)
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs
 
 from veomni.ops import fused_moe_forward
-from veomni.ops.dispatch import OpSlot
+from veomni.ops.dispatch import OpsConfigSlot, OpSlot
+from veomni.ops.kernels.deepseek_v4 import sparse_attn_tilelang, v4_lighting_indexer
 from veomni.patchgen.patch_spec import PatchConfig
 from veomni.utils.model_outputs import MoeCausalLMOutputWithLogProbs
 
@@ -90,6 +103,8 @@ from veomni.utils.model_outputs import MoeCausalLMOutputWithLogProbs
 veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
 veomni_moe_experts_forward = OpSlot("moe_experts", "standard")
 veomni_load_balancing_loss = OpSlot("load_balancing_loss", "standard")
+veomni_dsa_indexer_backend = OpsConfigSlot("dsa_indexer_backend")
+veomni_dsa_attention_backend = OpsConfigSlot("dsa_attention_backend")
 
 
 config = PatchConfig(
@@ -99,6 +114,10 @@ config = PatchConfig(
 )
 
 config.add_import("veomni.ops", names=["fused_moe_forward"])
+config.add_import(
+    "veomni.ops.kernels.deepseek_v4",
+    names=["sparse_attn_tilelang", "v4_lighting_indexer"],
+)
 
 # Surface ``MoeCausalLMOutputWithLogProbs`` so the patched ``forward`` can
 # return per-token log-probs / entropy as constructor fields. Mutating
@@ -114,12 +133,205 @@ config.drop_import_names("MoeCausalLMOutputWithPast")
 
 config.add_post_import_block(
     """
-    from veomni.ops.dispatch import OpSlot
+    from veomni.ops.dispatch import OpSlot, OpsConfigSlot
     veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
     veomni_moe_experts_forward = OpSlot("moe_experts", "standard")
     veomni_load_balancing_loss = OpSlot("load_balancing_loss", "standard")
+    veomni_dsa_indexer_backend = OpsConfigSlot("dsa_indexer_backend")
+    veomni_dsa_attention_backend = OpsConfigSlot("dsa_attention_backend")
     """
 )
+
+
+# ================================================================
+# Patch: DeepseekV4Indexer.forward
+# 1. Dispatch CUDA prefill/training index scoring to the TileLang Lightning
+#    Indexer when ``dsa_indexer_backend=tilelang``. Cache/decode and unusual
+#    position layouts retain the upstream eager implementation.
+# ================================================================
+@config.override_method("DeepseekV4Indexer.forward", description="Optional TileLang Lightning Indexer dispatch")
+def deepseek_v4_indexer_forward_patched(
+    self,
+    hidden_states: torch.Tensor,
+    q_residual: torch.Tensor,
+    position_ids: torch.Tensor,
+    past_key_values: Cache | None,
+    layer_idx: int,
+) -> torch.LongTensor:
+    batch, seq_len, _ = hidden_states.shape
+    cache_layer: DeepseekV4CSACache = past_key_values.layers[layer_idx] if past_key_values is not None else None
+    kv = self.kv_proj(hidden_states)
+    gate = self.gate_proj(hidden_states)
+
+    if cache_layer is None:
+        usable = (kv.shape[1] // self.compress_rate) * self.compress_rate
+        chunk_kv, chunk_gate, first_window_position = kv[:, :usable], gate[:, :usable], 0
+    else:
+        chunk_kv, chunk_gate, first_window_position = cache_layer.store_compression_weights("indexer", kv, gate)
+
+    if chunk_kv.shape[1] > 0:
+        n_windows = chunk_kv.shape[1] // self.compress_rate
+        ratio = self.compress_rate
+        chunk_kv = chunk_kv.view(batch, n_windows, ratio, -1)
+        chunk_gate = chunk_gate.view(batch, n_windows, ratio, -1) + self.position_bias.to(chunk_gate.dtype)
+
+        new_kv = chunk_kv.new_zeros((batch, n_windows, 2 * ratio, self.head_dim))
+        new_gate = chunk_gate.new_full((batch, n_windows, 2 * ratio, self.head_dim), float("-inf"))
+        new_kv[:, :, ratio:] = chunk_kv[..., self.head_dim :]
+        new_gate[:, :, ratio:] = chunk_gate[..., self.head_dim :]
+        if n_windows > 1:
+            new_kv[:, 1:, :ratio] = chunk_kv[:, :-1, :, : self.head_dim]
+            new_gate[:, 1:, :ratio] = chunk_gate[:, :-1, :, : self.head_dim]
+        if cache_layer is not None:
+            prior_kv, prior_gate = cache_layer.update_overlap_state("indexer", chunk_kv, chunk_gate, self.head_dim)
+            if prior_kv is not None:
+                new_kv[:, 0, :ratio] = prior_kv.to(new_kv.dtype)
+                new_gate[:, 0, :ratio] = prior_gate.to(new_gate.dtype)
+
+        compressed = self.kv_norm((new_kv * new_gate.softmax(dim=2, dtype=torch.float32).to(new_kv.dtype)).sum(dim=2))
+        positions = torch.arange(n_windows, device=compressed.device)
+        positions = positions * self.compress_rate + first_window_position
+        positions = positions.unsqueeze(0).expand(batch, -1)
+        cos, sin = self.rotary_emb(compressed, position_ids=positions, layer_type=self.rope_layer_type)
+        compressed = apply_rotary_pos_emb(compressed.unsqueeze(1), cos, sin).squeeze(1)
+    else:
+        compressed = chunk_kv.new_zeros((batch, 0, self.head_dim))
+
+    compressed_kv = compressed if cache_layer is None else cache_layer.update_compressor_states("indexer", compressed)
+
+    cos_q, sin_q = self.rotary_emb(hidden_states, position_ids=position_ids, layer_type=self.rope_layer_type)
+    q = self.q_b_proj(q_residual).view(batch, seq_len, -1, self.head_dim).transpose(1, 2)
+    q = apply_rotary_pos_emb(q, cos_q, sin_q).transpose(1, 2)
+    weights = self.weights_proj(hidden_states).float() * (self.weights_scaling * self.softmax_scale)
+    compressed_len = compressed_kv.shape[1]
+    top_k = min(self.index_topk, compressed_len)
+
+    # --- Patch.1 ---
+    indexer_backend = veomni_dsa_indexer_backend.value
+    if indexer_backend not in {"eager", "tilelang"}:
+        raise ValueError(
+            f"DeepSeek-V4 does not support dsa_indexer_backend={indexer_backend!r}; expected 'eager' or 'tilelang'"
+        )
+    canonical_positions = torch.arange(seq_len, device=position_ids.device).unsqueeze(0).expand_as(position_ids)
+    use_tilelang = (
+        indexer_backend == "tilelang"
+        and hidden_states.is_cuda
+        and q.dtype == torch.bfloat16
+        and compressed_kv.dtype == torch.bfloat16
+        and self.num_heads <= 64
+        and self.num_heads % 8 == 0
+        and self.head_dim == 1 << (self.head_dim - 1).bit_length()
+        and cache_layer is None
+        and compressed_len > 0
+        and torch.equal(position_ids, canonical_positions)
+    )
+    if use_tilelang:
+        _, top_k_indices = v4_lighting_indexer(
+            q.transpose(0, 1).contiguous(),
+            compressed_kv.transpose(0, 1).contiguous(),
+            weights.transpose(0, 1).contiguous(),
+            self.compress_rate,
+            top_k,
+        )
+        return top_k_indices.to(torch.long)
+    # --- Patch.1 ---
+
+    scores = torch.matmul(q.float(), compressed_kv.transpose(-1, -2).float().unsqueeze(1))
+    scores = F.relu(scores) * self.softmax_scale
+    eager_weights = self.weights_proj(hidden_states).float() * self.weights_scaling
+    index_scores = (scores * eager_weights.unsqueeze(-1)).sum(dim=2)
+    if compressed_len > 0:
+        causal_threshold = (position_ids + 1) // self.compress_rate
+        entry_indices = torch.arange(compressed_len, device=index_scores.device)
+        future_mask = entry_indices.view(1, 1, -1) >= causal_threshold.unsqueeze(-1)
+        index_scores = index_scores.masked_fill(future_mask, float("-inf"))
+        top_k_indices = index_scores.topk(top_k, dim=-1).indices
+        invalid = top_k_indices >= causal_threshold.unsqueeze(-1)
+        return torch.where(invalid, torch.full_like(top_k_indices, -1), top_k_indices)
+    return index_scores.topk(top_k, dim=-1).indices
+
+
+# ================================================================
+# Patch: eager_attention_forward
+# 1. Dispatch DeepSeek-V4 attention to the TileLang sparse MQA kernel when
+#    ``dsa_attention_backend=tilelang_sparse``. The existing additive mask is
+#    converted to a compact fixed-width index list, preserving sliding-window,
+#    compressor, causal, and invalid-index semantics.
+# 2. Preserve the upstream eager implementation as the default fallback.
+# ================================================================
+@config.replace_function("eager_attention_forward", description="Optional TileLang sparse MQA dispatch")
+def deepseek_v4_eager_attention_forward_patched(
+    module: nn.Module,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attention_mask: torch.Tensor | None,
+    scaling: float,
+    dropout: float | int = 0.0,
+    **kwargs,
+):
+    # --- Patch.1 ---
+    attention_backend = veomni_dsa_attention_backend.value
+    if attention_backend not in {"eager", "tilelang_sparse"}:
+        raise ValueError(
+            f"DeepSeek-V4 does not support dsa_attention_backend={attention_backend!r}; "
+            "expected 'eager' or 'tilelang_sparse'"
+        )
+    use_tilelang = (
+        attention_backend == "tilelang_sparse"
+        and query.is_cuda
+        and query.dtype == torch.bfloat16
+        and key.dtype == torch.bfloat16
+        and value.dtype == torch.bfloat16
+        and query.shape[-1] == 1 << (query.shape[-1] - 1).bit_length()
+        and isinstance(attention_mask, torch.Tensor)
+        and dropout == 0
+        and key.shape[1] == 1
+    )
+    if use_tilelang:
+        batch, _, seq_len, _ = query.shape
+        kv_len = key.shape[-2]
+        compressed_len = max(0, kv_len - seq_len)
+        compressed_budget = compressed_len
+        indexer = getattr(getattr(module, "compressor", None), "indexer", None)
+        if indexer is not None:
+            compressed_budget = min(compressed_len, indexer.index_topk)
+        selected_width = min(kv_len, module.sliding_window + compressed_budget)
+
+        mask = attention_mask
+        if mask.shape[0] == 1 and batch > 1:
+            mask = mask.expand(batch, -1, -1, -1)
+        allowed = mask[:, 0] if mask.dtype == torch.bool else mask[:, 0] >= 0
+        _, topk_indices = allowed.to(torch.int8).topk(selected_width, dim=-1, sorted=False)
+        selected_valid = allowed.gather(-1, topk_indices)
+        topk_indices = topk_indices.to(torch.int32).masked_fill(~selected_valid, -1).contiguous()
+        attn_output = sparse_attn_tilelang(
+            query.transpose(1, 2).contiguous(),
+            key[:, 0].contiguous(),
+            module.sinks.float().contiguous(),
+            topk_indices,
+            scaling,
+        )
+        return attn_output, None
+    # --- Patch.1 ---
+
+    # --- Patch.2 ---
+    key_states = repeat_kv(key, module.num_key_value_groups)
+    value_states = repeat_kv(value, module.num_key_value_groups)
+    attn_weights = torch.matmul(query, key_states.transpose(2, 3)) * scaling
+    if attention_mask is not None:
+        attn_weights = attn_weights + attention_mask
+
+    sinks = module.sinks.reshape(1, -1, 1, 1).expand(query.shape[0], -1, query.shape[-2], -1)
+    combined_logits = torch.cat([attn_weights, sinks], dim=-1)
+    combined_logits = combined_logits - combined_logits.max(dim=-1, keepdim=True).values
+    probs = F.softmax(combined_logits, dim=-1, dtype=combined_logits.dtype)
+    scores = probs[..., :-1]
+    attn_weights = nn.functional.dropout(scores, p=dropout, training=module.training).to(value_states.dtype)
+    attn_output = torch.matmul(attn_weights, value_states)
+    attn_output = attn_output.transpose(1, 2).contiguous()
+    return attn_output, attn_weights
+    # --- Patch.2 ---
 
 
 # ================================================================
