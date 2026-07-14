@@ -7,6 +7,7 @@ from typing import Any
 import torch
 
 from ....graphs.generation_graph import FSM_SIGNAL_KEY
+from ....mixins.metric_meter_mixin import MetricMeterMixin
 from ....mixins.modulemixin import ModuleMixin, post_forward, pre_forward
 from ....utils.conversation import _IMG_TAG_KEY, ConversationItem, get_tail_output_item, is_dummy, iter_desired_items
 from ..sources import (
@@ -206,6 +207,7 @@ class BagelFlowConnectorModuleMixin(ModuleMixin):
             raise ValueError("BAGEL flow connector requires per-sample VAE context carriers before embed_latent.")
 
         parts: list[dict[str, torch.Tensor]] = []
+        meter_lengths: list[int] = []
         for item in self._embed_items:
             if is_dummy(item):
                 inputs, lengths = preprocess_context_latent_embed(
@@ -243,6 +245,9 @@ class BagelFlowConnectorModuleMixin(ModuleMixin):
 
             parts.append(inputs)
             self._embed_lengths.extend(lengths)
+            meter_lengths.extend(int(v) for v in lengths)
+
+        self.metric_meter_set_seqlens("embed_latent", meter_lengths)
 
         inputs = {
             "latents": torch.cat([part["latents"] for part in parts], dim=0),
@@ -473,4 +478,16 @@ class BagelFlowConnectorModuleMixin(ModuleMixin):
         return {"conversation_list": conversation_list, FSM_SIGNAL_KEY: SIGNAL_IMAGE_COMPLETE}
 
 
-__all__ = ["BagelFlowConnectorModuleMixin"]
+class BagelFlowConnectorMetricMeterMixin(MetricMeterMixin):
+    """Per-module training meter for BAGEL's flow connector."""
+
+    config: BagelFlowConnectorConfig
+
+    def estimate_flops(self, seqlens: list[int]) -> float:
+        cfg = self.config
+        proj_n = int(cfg.patch_latent_dim) * int(cfg.hidden_size) * 2
+        tokens = sum(seqlens)
+        return 6 * proj_n * tokens / 1e12
+
+
+__all__ = ["BagelFlowConnectorModuleMixin", "BagelFlowConnectorMetricMeterMixin"]

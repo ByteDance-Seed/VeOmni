@@ -13,10 +13,10 @@ from transformers.models.qwen2.modeling_qwen2 import Qwen2MLP, Qwen2RMSNorm
 from transformers.utils import ModelOutput
 
 from .configuration import BagelQwen2MoTConfig
-from .modulemixin import BagelQwen2MoTModuleMixin
+from .modulemixin import BagelQwen2MoTMetricMeterMixin, BagelQwen2MoTModuleMixin
 
 
-class BagelQwen2MoT(BagelQwen2MoTModuleMixin, PreTrainedModel):
+class BagelQwen2MoT(BagelQwen2MoTModuleMixin, BagelQwen2MoTMetricMeterMixin, PreTrainedModel):
     config_class = BagelQwen2MoTConfig
     base_model_prefix = "bagel_qwen2_mot"
     main_input_name = "inputs_embeds"
