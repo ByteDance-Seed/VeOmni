@@ -21,6 +21,10 @@ import torch
 import torch.nn.functional as F
 
 from veomni.ops.kernels.deepseek_v4 import linear_bf16_fp32
+from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type
+
+
+DEVICE = get_device_type()
 
 
 def test_kernel_package_does_not_import_tilelang_eagerly():
@@ -58,8 +62,8 @@ def test_linear_bf16_fp32_backward_matches_reference():
 
 def _require_tilelang_cuda():
     pytest.importorskip("tilelang")
-    if not torch.cuda.is_available():
-        pytest.skip("DeepSeek V4 TileLang kernels require CUDA")
+    if not IS_CUDA_AVAILABLE:
+        pytest.skip("DeepSeek V4 TileLang kernels require a GPU")
 
 
 def _indexer_reference(q, k, weights, topk_indices):
@@ -81,15 +85,15 @@ def test_tilelang_indexer_non_power_of_two_topk_forward_backward():
     torch.manual_seed(0)
     seqlen, batch, heads, dim, compress_ratio, topk = 130, 2, 8, 128, 4, 65
     kv_len = seqlen // compress_ratio
-    q = torch.randn(seqlen, batch, heads, dim, device="cuda", dtype=torch.bfloat16, requires_grad=True)
-    k = torch.randn(kv_len, batch, dim, device="cuda", dtype=torch.bfloat16, requires_grad=True)
-    weights = (torch.randn(seqlen, batch, heads, device="cuda") * 0.01).requires_grad_()
+    q = torch.randn(seqlen, batch, heads, dim, device=DEVICE, dtype=torch.bfloat16, requires_grad=True)
+    k = torch.randn(kv_len, batch, dim, device=DEVICE, dtype=torch.bfloat16, requires_grad=True)
+    weights = (torch.randn(seqlen, batch, heads, device=DEVICE) * 0.01).requires_grad_()
 
-    indices = torch.full((batch, seqlen, topk), -1, device="cuda", dtype=torch.int32)
+    indices = torch.full((batch, seqlen, topk), -1, device=DEVICE, dtype=torch.int32)
     for position in range(seqlen):
         valid_count = min((position + 1) // compress_ratio, kv_len, topk)
         if valid_count:
-            indices[:, position, :valid_count] = torch.arange(valid_count, device="cuda", dtype=torch.int32)
+            indices[:, position, :valid_count] = torch.arange(valid_count, device=DEVICE, dtype=torch.int32)
     indices[..., -3] = -1
     indices[..., -2] = -2
     indices[..., -1] = kv_len
@@ -112,9 +116,9 @@ def test_tilelang_indexer_rejects_unsupported_head_count():
     _require_tilelang_cuda()
     from veomni.ops.kernels.deepseek_v4 import v4_lighting_indexer
 
-    q = torch.empty(8, 1, 7, 128, device="cuda", dtype=torch.bfloat16)
-    k = torch.empty(2, 1, 128, device="cuda", dtype=torch.bfloat16)
-    weights = torch.empty(8, 1, 7, device="cuda")
+    q = torch.empty(8, 1, 7, 128, device=DEVICE, dtype=torch.bfloat16)
+    k = torch.empty(2, 1, 128, device=DEVICE, dtype=torch.bfloat16)
+    weights = torch.empty(8, 1, 7, device=DEVICE)
     with pytest.raises(ValueError, match="divisible by 8"):
         v4_lighting_indexer(q, k, weights, compress_ratio=4, topk=2)
 
@@ -139,10 +143,10 @@ def test_tilelang_sparse_attention_forward_backward_with_invalid_indices():
 
     torch.manual_seed(1)
     batch, seqlen, heads, dim, kv_len, topk = 1, 32, 8, 512, 48, 65
-    q = torch.randn(batch, seqlen, heads, dim, device="cuda", dtype=torch.bfloat16, requires_grad=True)
-    kv = torch.randn(batch, kv_len, dim, device="cuda", dtype=torch.bfloat16, requires_grad=True)
-    sinks = torch.randn(heads, device="cuda", requires_grad=True)
-    indices = torch.randint(kv_len, (batch, seqlen, topk), device="cuda", dtype=torch.int32)
+    q = torch.randn(batch, seqlen, heads, dim, device=DEVICE, dtype=torch.bfloat16, requires_grad=True)
+    kv = torch.randn(batch, kv_len, dim, device=DEVICE, dtype=torch.bfloat16, requires_grad=True)
+    sinks = torch.randn(heads, device=DEVICE, requires_grad=True)
+    indices = torch.randint(kv_len, (batch, seqlen, topk), device=DEVICE, dtype=torch.int32)
     indices[..., -9:-6] = -1
     indices[..., -6:-3] = -2
     indices[..., -3:] = kv_len
@@ -152,7 +156,7 @@ def test_tilelang_sparse_attention_forward_backward_with_invalid_indices():
     expected = _sparse_attention_reference(q, kv, sinks, indices, scale)
     torch.testing.assert_close(actual.float(), expected, rtol=2e-2, atol=2e-2)
 
-    grad = torch.randn(batch, heads, seqlen, dim, device="cuda", dtype=actual.dtype).transpose(1, 2)
+    grad = torch.randn(batch, heads, seqlen, dim, device=DEVICE, dtype=actual.dtype).transpose(1, 2)
     assert not grad.is_contiguous()
     expected_grads = torch.autograd.grad((expected * grad.float()).sum(), (q, kv, sinks))
     actual.backward(grad)
@@ -167,13 +171,13 @@ def test_deepseek_v4_generated_attention_dispatch_matches_eager():
 
     torch.manual_seed(3)
     batch, seqlen, heads, dim = 1, 32, 8, 512
-    query = torch.randn(batch, heads, seqlen, dim, device="cuda", dtype=torch.bfloat16)
-    key = torch.randn(batch, 1, seqlen, dim, device="cuda", dtype=torch.bfloat16)
-    causal_mask = torch.full((batch, 1, seqlen, seqlen), float("-inf"), device="cuda")
+    query = torch.randn(batch, heads, seqlen, dim, device=DEVICE, dtype=torch.bfloat16)
+    key = torch.randn(batch, 1, seqlen, dim, device=DEVICE, dtype=torch.bfloat16)
+    causal_mask = torch.full((batch, 1, seqlen, seqlen), float("-inf"), device=DEVICE)
     causal_mask = torch.triu(causal_mask, diagonal=1)
     module = SimpleNamespace(
         num_key_value_groups=heads,
-        sinks=torch.randn(heads, device="cuda"),
+        sinks=torch.randn(heads, device=DEVICE),
         training=False,
         sliding_window=seqlen,
         compressor=None,
@@ -206,16 +210,16 @@ def test_deepseek_v4_generated_indexer_dispatch_and_position_fallback(monkeypatc
     from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling
 
     config = AutoConfig.from_pretrained("tests/toy_config/deepseek_v4_toy")
-    indexer = modeling.DeepseekV4Indexer(config).to(device="cuda", dtype=torch.bfloat16)
+    indexer = modeling.DeepseekV4Indexer(config).to(device=DEVICE, dtype=torch.bfloat16)
     seq_len = 8
-    hidden_states = torch.randn(1, seq_len, config.hidden_size, device="cuda", dtype=torch.bfloat16)
-    q_residual = torch.randn(1, seq_len, config.q_lora_rank, device="cuda", dtype=torch.bfloat16)
-    canonical_positions = torch.arange(seq_len, device="cuda").unsqueeze(0)
+    hidden_states = torch.randn(1, seq_len, config.hidden_size, device=DEVICE, dtype=torch.bfloat16)
+    q_residual = torch.randn(1, seq_len, config.q_lora_rank, device=DEVICE, dtype=torch.bfloat16)
+    canonical_positions = torch.arange(seq_len, device=DEVICE).unsqueeze(0)
     calls = []
 
     def fake_tilelang(q, k, weights, compress_ratio, topk):
         calls.append((q.shape, k.shape, weights.shape, compress_ratio, topk))
-        indices = torch.zeros(1, seq_len, topk, device="cuda", dtype=torch.int32)
+        indices = torch.zeros(1, seq_len, topk, device=DEVICE, dtype=torch.int32)
         return torch.zeros_like(indices, dtype=torch.float32), indices
 
     monkeypatch.setattr(modeling, "v4_lighting_indexer", fake_tilelang)
@@ -238,7 +242,7 @@ def test_tilelang_act_quant_shapes_scales_and_inplace():
     from veomni.ops.kernels.deepseek_v4 import act_quant
 
     torch.manual_seed(2)
-    x = torch.randn(3, 256, device="cuda", dtype=torch.bfloat16)
+    x = torch.randn(3, 256, device=DEVICE, dtype=torch.bfloat16)
     quantized, scales = act_quant(x, block_size=128)
 
     assert quantized.shape == x.shape
