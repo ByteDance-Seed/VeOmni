@@ -197,6 +197,13 @@ model:
 | `triton` | Model-specific Triton kernel registered via `extra_backends` (e.g. DeepSeek-V3 batch-invariant RMSNorm) | `triton`, per-model registration |
 | `eager` | HuggingFace default (`{Model}RMSNorm`) | — |
 
+For `qwen3`, the same `rms_norm_implementation` selection also controls the
+patched post-attention `residual + RMSNorm` fast path in
+`Qwen3DecoderLayer.forward`: `liger_kernel` binds Liger's fused
+`add + RMSNorm` kernel, `npu` binds the NPU wrapper, and `eager` keeps the
+original `residual + hidden_states` then `post_attention_layernorm(...)`
+sequence.
+
 #### `rotary_pos_emb_implementation`
 
 | Value | Implementation | Requirements |
