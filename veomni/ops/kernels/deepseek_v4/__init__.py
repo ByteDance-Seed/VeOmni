@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""DeepSeek V4 model-specific GPU kernels adapted from radixark/miles.
+"""DeepSeek V4 model-specific SM90+ GPU kernels adapted from radixark/miles.
 
 Imports stay inside the public wrappers because TileLang is an optional,
 GPU-only dependency. Importing VeOmni on CPU or NPU must not load it.
@@ -22,9 +22,16 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from ....utils.device import IS_CUDA_AVAILABLE, get_gpu_compute_capability
+
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+
+
+def _require_tilelang_sm90() -> None:
+    if not IS_CUDA_AVAILABLE or get_gpu_compute_capability() < 90:
+        raise RuntimeError("DeepSeek V4 TileLang kernels require an SM90 or later CUDA GPU")
 
 
 def sparse_attn_tilelang(
@@ -34,6 +41,7 @@ def sparse_attn_tilelang(
     topk_idxs: torch.Tensor,
     sm_scale: float | None = None,
 ) -> torch.Tensor:
+    _require_tilelang_sm90()
     from .tilelang_sparse_mla import sparse_attn_tilelang as impl
 
     return impl(q, kv, attn_sink, topk_idxs, sm_scale)
@@ -47,6 +55,7 @@ def v4_lighting_indexer(
     topk: int,
     topk_indices: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    _require_tilelang_sm90()
     from .tilelang_indexer import v4_lighting_indexer as impl
 
     return impl(index_q, index_k, weights, compress_ratio, topk, topk_indices)
@@ -59,6 +68,7 @@ def act_quant(
     scale_dtype: torch.dtype = torch.float32,
     inplace: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    _require_tilelang_sm90()
     from .act_quant import act_quant as impl
 
     return impl(x, block_size, scale_fmt, scale_dtype, inplace)

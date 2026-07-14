@@ -21,7 +21,7 @@ import torch
 import torch.nn.functional as F
 
 from veomni.ops.kernels.deepseek_v4 import linear_bf16_fp32
-from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type
+from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type, get_gpu_compute_capability
 
 
 DEVICE = get_device_type()
@@ -60,10 +60,27 @@ def test_linear_bf16_fp32_backward_matches_reference():
     torch.testing.assert_close(weight.grad, expected_weight_grad)
 
 
+def test_tilelang_wrappers_reject_pre_sm90_before_import(monkeypatch):
+    import veomni.ops.kernels.deepseek_v4 as kernels
+
+    monkeypatch.setattr(kernels, "IS_CUDA_AVAILABLE", True)
+    monkeypatch.setattr(kernels, "get_gpu_compute_capability", lambda: 89)
+    args = (torch.empty(0),) * 4
+
+    with pytest.raises(RuntimeError, match="SM90 or later"):
+        kernels.sparse_attn_tilelang(*args)
+    with pytest.raises(RuntimeError, match="SM90 or later"):
+        kernels.v4_lighting_indexer(*args[:3], compress_ratio=1, topk=1)
+    with pytest.raises(RuntimeError, match="SM90 or later"):
+        kernels.act_quant(torch.empty(0))
+
+
 def _require_tilelang_cuda():
     pytest.importorskip("tilelang")
     if not IS_CUDA_AVAILABLE:
         pytest.skip("DeepSeek V4 TileLang kernels require a GPU")
+    if get_gpu_compute_capability() < 90:
+        pytest.skip("DeepSeek V4 TileLang kernels require SM90 or later")
 
 
 def _indexer_reference(q, k, weights, topk_indices):

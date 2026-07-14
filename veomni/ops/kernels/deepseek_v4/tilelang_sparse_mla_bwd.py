@@ -280,17 +280,15 @@ def sparse_mqa_bwd_interface(q, kv, attn_sink, o, do, topk_idxs, lse, sm_scale=N
     _, S_kv, _ = kv.shape
     topk = topk_idxs.shape[-1]
 
-    padded_H = max(tilelang.math.next_power_of_2(H), 16)
-
     # Pad topk to next multiple of block_size (kernel requires divisibility)
-    # Match the low-shared-memory forward path for small head shards.
-    block_size = 16 if padded_H == 16 else 32
+    block_size = 32
     padded_topk = (topk + block_size - 1) // block_size * block_size
     if padded_topk != topk:
         pad = torch.full((B, S, padded_topk - topk), -1, device=topk_idxs.device, dtype=topk_idxs.dtype)
         topk_idxs = torch.cat([topk_idxs, pad], dim=-1).contiguous()
         topk = padded_topk
 
+    padded_H = max(tilelang.math.next_power_of_2(H), 16)
     if padded_H != H:
         head_pad = padded_H - H
         q = torch.cat([q, q.new_zeros(B, S, head_pad, D)], dim=2).contiguous()
@@ -300,7 +298,7 @@ def sparse_mqa_bwd_interface(q, kv, attn_sink, o, do, topk_idxs, lse, sm_scale=N
         attn_sink = torch.cat([attn_sink, attn_sink.new_zeros(head_pad)])
 
     preprocess_kernel = preprocess(B, S, padded_H, D)
-    bwd_kernel = bwd(B, S, S_kv, padded_H, D, topk, sm_scale, block_size=block_size)
+    bwd_kernel = bwd(B, S, S_kv, padded_H, D, topk, sm_scale)
     postprocess_kernel = postprocess(B, S_kv, D)
 
     delta = preprocess_kernel(o, do)

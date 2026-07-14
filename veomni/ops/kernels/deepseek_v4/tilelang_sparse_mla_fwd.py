@@ -169,7 +169,7 @@ def sparse_mqa_fwd(
     return main
 
 
-def sparse_mqa_fwd_interface(q, kv, attn_sink, topk_idxs, sm_scale=None, block_I=None, num_stages=2, threads=256):
+def sparse_mqa_fwd_interface(q, kv, attn_sink, topk_idxs, sm_scale=None, block_I=64, num_stages=2, threads=256):
     """Forward interface for V4 sparse MQA attention.
 
     Args:
@@ -189,12 +189,6 @@ def sparse_mqa_fwd_interface(q, kv, attn_sink, topk_idxs, sm_scale=None, block_I
     assert kv_dim == dim
     _, _, topk = topk_idxs.shape
 
-    padded_heads = max(tilelang.math.next_power_of_2(heads), 16)
-    if block_I is None:
-        # Small-head test and sequence-parallel shards need a smaller tile to
-        # stay below the 99 KiB shared-memory limit of Ada GPUs such as L20.
-        block_I = 16 if padded_heads == 16 else 64
-
     # Pad topk to next multiple of block_I (kernel requires divisibility)
     padded_topk = (topk + block_I - 1) // block_I * block_I
     if padded_topk != topk:
@@ -202,6 +196,7 @@ def sparse_mqa_fwd_interface(q, kv, attn_sink, topk_idxs, sm_scale=None, block_I
         topk_idxs = torch.cat([topk_idxs, pad], dim=-1).contiguous()
         topk = padded_topk
 
+    padded_heads = max(tilelang.math.next_power_of_2(heads), 16)
     if padded_heads != heads:
         q = torch.cat([q, q.new_zeros(batch, seq_len, padded_heads - heads, dim)], dim=2).contiguous()
         attn_sink = torch.cat([attn_sink, attn_sink.new_zeros(padded_heads - heads)])
