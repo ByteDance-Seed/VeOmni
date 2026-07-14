@@ -521,7 +521,13 @@ def test_models_patch_fwd_bwd(
     del trainer.model, trainer.optimizer, trainer.lr_scheduler
 
     model_config = trainer.model_config
-    dummy_data_loader = prepare_data(case_id, max_seq_len=1024, model_config=model_config)
+    # Upstream DeepSeek-V4 eager attention does not consume packed cu-seqlens.
+    # Comparing it with VeOmni's boundary-aware packed path on two concatenated
+    # samples would therefore compare different attention semantics. Keep this
+    # HF↔VeOmni patch-alignment case to one sequence; multi-sample packed V4 is
+    # covered by ``test_deepseek_v4_tilelang_dyn_bsz_smoke``.
+    num_samples = 1 if case_id == "deepseek_v4" else 2
+    dummy_data_loader = prepare_data(case_id, max_seq_len=1024, model_config=model_config, num_samples=num_samples)
 
     res = {}
     log_keys = []
