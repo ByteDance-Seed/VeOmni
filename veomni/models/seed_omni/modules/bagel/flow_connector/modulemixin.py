@@ -235,6 +235,7 @@ class BagelFlowConnectorModuleMixin(ModuleMixin):
                 inputs["latents"] = inputs["latents"] + anchor
                 parts.append(inputs)
                 self._embed_lengths.extend(lengths)
+                meter_lengths.extend(int(v) for v in lengths)
                 continue
 
             tag = item.meta.get(_IMG_TAG_KEY)
@@ -333,6 +334,7 @@ class BagelFlowConnectorModuleMixin(ModuleMixin):
         if target_parts:
             self._decode_target = torch.cat(target_parts, dim=0)
 
+        self.metric_meter_set_seqlens("decode_velocity", [int(v) for v in self._decode_lengths])
         inputs, self._decode_sp_seqlen, self._decode_sp_rep_lengths, self._decode_sp_group_index = (
             self._redistribute_training_inputs(
                 {"hidden_states": torch.cat([part["hidden_states"] for part in inputs_parts], dim=0)},

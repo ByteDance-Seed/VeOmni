@@ -40,7 +40,6 @@ class BagelQwen2MoTModuleMixin(ModuleMixin):
     def init_omni_state(self) -> None:
         self._conversation_carrier: list[list[ConversationItem]] | None = None
         self._packed_training: PackedConversation | None = None
-        self._packed_is_dummy: bool = False
         self._sp_seqlen: int | None = None
         self._sp_rep_lengths: list[int] | None = None
         self._sp_group_index: int = 0
@@ -177,12 +176,11 @@ class BagelQwen2MoTModuleMixin(ModuleMixin):
             dtype=self.dtype,
             hidden_size=int(self.config.hidden_size),
         )
-        # A non-empty local carrier may contain only upstream dummy items while
-        # peer ranks have real MoT inputs. Keep this rank in the same forward and
-        # collective sequence, and preserve the dummy autograd chain.
-        self._packed_is_dummy = self._packed_training is None
         if self._packed_training is None:
-            self._packed_training = self._dummy_packed_training()
+            raise ValueError(
+                "BAGEL Qwen2-MoT forward requires a non-empty conversation_list with real tokens; "
+                "got no packable tokens across the whole batch."
+            )
 
         # Metering: per-sample packed token counts.
         # For module-SP this is the full own-data count before gather/slice.
@@ -207,10 +205,8 @@ class BagelQwen2MoTModuleMixin(ModuleMixin):
         del kwargs
         conversation = self._conversation_carrier
         packed = self._packed_training
-        packed_is_dummy = self._packed_is_dummy
         self._conversation_carrier = None
         self._packed_training = None
-        self._packed_is_dummy = False
 
         ps = get_parallel_state()
         if ps.sp_enabled:
@@ -232,19 +228,6 @@ class BagelQwen2MoTModuleMixin(ModuleMixin):
             )
             self._clear_sp_state()
 
-        if packed_is_dummy:
-            if conversation is not None:
-                for sample in conversation:
-                    sample.append(
-                        ConversationItem(
-                            type="output",
-                            value=hidden_states[:1].squeeze(0).to(device=self.device),
-                            role="dummy",
-                            source="bagel_qwen2_mot",
-                        )
-                    )
-            return {"conversation_list": conversation}
-
         for span in packed.spans:
             span_hidden = hidden_states[span.start : span.start + span.length].to(device=self.device)
             offset = 0
@@ -252,18 +235,6 @@ class BagelQwen2MoTModuleMixin(ModuleMixin):
                 item.value = span_hidden[offset : offset + length]
                 offset += length
         return {"conversation_list": conversation}
-
-    # ── Dummy helpers ──────────────────────────────────
-
-    def _dummy_packed_training(self) -> PackedConversation:
-        return PackedConversation(
-            packed_sequence=torch.zeros(1, int(self.config.hidden_size), device=self.device, dtype=self.dtype),
-            packed_position_ids=torch.zeros(1, device=self.device, dtype=torch.long),
-            packed_token_type_ids=torch.zeros(1, device=self.device, dtype=torch.long),
-            spans=[],
-            sample_splits=[[1]],
-            sample_attn_modes=[["full"]],
-        )
 
     def _fold_dummy_anchors(
         self,

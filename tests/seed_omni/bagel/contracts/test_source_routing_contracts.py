@@ -354,7 +354,7 @@ def test_bagel_qwen2_mot_flow_alignment_requires_real_flow_item() -> None:
     assert out.requires_grad
 
 
-def test_bagel_qwen2_mot_dummy_forward_pre_folds_upstream_dummy_anchor(monkeypatch) -> None:
+def test_bagel_qwen2_mot_forward_pre_rejects_only_upstream_dummy_anchor(monkeypatch) -> None:
     model = _tiny_qwen2_mot()
     hidden_size = int(model.config.hidden_size)
     siglip_dummy = ConversationItem(
@@ -365,17 +365,8 @@ def test_bagel_qwen2_mot_dummy_forward_pre_folds_upstream_dummy_anchor(monkeypat
     )
     monkeypatch.setattr(model, "_has_valid_upstream_embeddings", lambda conversation_list: (True, False))
 
-    inputs = model.forward_pre(conversation_list=[[siglip_dummy]])
-
-    assert model._packed_is_dummy
-    assert model._packed_training is not None
-    assert model._packed_training.spans == []
-    assert inputs["packed_sequence"].requires_grad
-    assert inputs["sample_lens"] == [1]
-    assert inputs["sample_splits"] == [[1]]
-    assert inputs["sample_attn_modes"] == [["full"]]
-    inputs["packed_sequence"].sum().backward()
-    assert siglip_dummy.value.grad is not None
+    with pytest.raises(ValueError, match="got no packable tokens"):
+        model.forward_pre(conversation_list=[[siglip_dummy]])
 
 
 def test_bagel_qwen2_mot_rejects_context_parallel_training(monkeypatch) -> None:
@@ -388,16 +379,17 @@ def test_bagel_qwen2_mot_rejects_context_parallel_training(monkeypatch) -> None:
         lambda: SimpleNamespace(sp_enabled=True, cp_size=2),
     )
 
-    packed = model._dummy_packed_training()
     with pytest.raises(ValueError, match="Ulysses sequence parallelism only"):
         model._prepare_training_sp_inputs(
             {
-                "packed_sequence": packed.packed_sequence,
-                "packed_position_ids": packed.packed_position_ids,
-                "packed_token_type_ids": packed.packed_token_type_ids,
+                "packed_sequence": torch.zeros(
+                    1, int(model.config.hidden_size), device=model.device, dtype=model.dtype
+                ),
+                "packed_position_ids": torch.zeros(1, device=model.device, dtype=torch.long),
+                "packed_token_type_ids": torch.zeros(1, device=model.device, dtype=torch.long),
             },
-            sample_splits=packed.sample_splits,
-            sample_attn_modes=packed.sample_attn_modes,
+            sample_splits=[[1]],
+            sample_attn_modes=[["full"]],
         )
 
 

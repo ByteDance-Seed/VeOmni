@@ -60,28 +60,15 @@ def _rank_items(
         items = [ConversationItem(type="text", value=values[0], role="assistant")]
     else:
         values = [make_tensor(1)]
-        items = [
-            ConversationItem(
-                type="image",
-                value=values[0],
-                role="dummy",
-                source=BAGEL_SIGLIP_CONTEXT,
-            )
-        ]
+        items = [ConversationItem(type="text", value=values[0], role="user")]
     return items, values
 
 
 def _carrier_hidden(conversation: list[list[ConversationItem]]) -> torch.Tensor:
     sample = conversation[0]
-    real_hidden = [item.value for item in sample if item.role != "dummy" and torch.is_tensor(item.value)]
-    if real_hidden:
-        return torch.cat(real_hidden, dim=0)
-
-    dummy_output = sample[-1]
-    assert dummy_output.role == "dummy"
-    assert dummy_output.source == "bagel_qwen2_mot"
-    hidden = dummy_output.value
-    return hidden.unsqueeze(0) if hidden.dim() == 1 else hidden
+    real_hidden = [item.value for item in sample if torch.is_tensor(item.value)]
+    assert real_hidden
+    return torch.cat(real_hidden, dim=0)
 
 
 def _forward_carrier(

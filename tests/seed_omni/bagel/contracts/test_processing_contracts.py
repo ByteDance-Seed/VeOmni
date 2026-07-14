@@ -425,6 +425,41 @@ def test_bagel_vae_training_encode_selects_source_routed_assistant_image():
     assert out["pixel_values"].shape == (1, 3, 8, 8)
 
 
+def test_bagel_vae_meter_reports_latent_tokens_including_dummy() -> None:
+    from veomni.models.seed_omni.modules.bagel.vae.modulemixin import BAGEL_VAE_PIXEL_SHAPE
+
+    BagelVAE = model_cls("bagel_vae")
+    BagelVAEConfig = config_cls("bagel_vae")
+    model = BagelVAE(
+        BagelVAEConfig(
+            resolution=8,
+            downsample=4,
+            ch=32,
+            ch_mult=[1],
+            num_res_blocks=1,
+            z_channels=2,
+        )
+    )
+    real = ConversationItem(
+        type="image",
+        value=torch.zeros(3, 8, 4),
+        role="assistant",
+        source=BAGEL_VAE_CONTEXT,
+        meta={BAGEL_VAE_PIXEL_SHAPE: torch.tensor([8, 4])},
+    )
+    dummy = ConversationItem(
+        type="image",
+        value=torch.zeros(3, 4, 4),
+        role="dummy",
+        source=BAGEL_VAE_CONTEXT,
+        meta={BAGEL_VAE_PIXEL_SHAPE: torch.tensor([4, 4])},
+    )
+
+    model._encode_items = [real, dummy]
+
+    assert model._vae_latent_token_lengths() == [2, 1]
+
+
 def test_bagel_vae_training_encode_crops_padded_latents_before_flow_patchify():
     from veomni.models.seed_omni.modules.bagel.flow_connector.processing import preprocess_latent_embed
     from veomni.models.seed_omni.modules.bagel.vae.modulemixin import BAGEL_VAE_PIXEL_SHAPE
