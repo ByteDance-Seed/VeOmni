@@ -40,6 +40,9 @@ If you are using Cursor or another AI coding tool on this project, the workflow 
 | "Add a fused RoPE kernel" | `/veomni-new-op` |
 | "Refactor the data collator" | `/veomni-develop` |
 | "Update torch to 2.10" | `/veomni-uv-update` |
+| "Port Qwen3 to transformers v5 patchgen" | `/veomni-migrate-transformers-v5` |
+| "Analyze this Chrome trace" | `/veomni-profile` |
+| "Submit the current branch as a PR" | `/create-pr` |
 
 ## Directory Structure
 
@@ -53,8 +56,11 @@ Each skill is a folder containing a `SKILL.md` file with YAML frontmatter (`name
 ├── veomni-debug/SKILL.md      # Bug fix and debugging (quick path + full protocol)
 ├── veomni-review/SKILL.md     # Pre-commit code review (mandatory)
 ├── veomni-new-model/SKILL.md  # Add a new model to VeOmni
+├── veomni-migrate-transformers-v5/SKILL.md  # Migrate model patches to transformers v5
 ├── veomni-new-op/SKILL.md     # Add a new kernel/operator
-└── veomni-uv-update/SKILL.md  # Dependency management with uv
+├── veomni-uv-update/SKILL.md  # Dependency management with uv
+├── veomni-profile/SKILL.md    # Performance profiling and optimization
+└── create-pr/SKILL.md         # Create or update a pull request
 ```
 
 The `description` field in frontmatter tells the agent when to apply the skill. Agents that support auto-discovery (Cursor, Claude Code) will offer the relevant skill automatically based on the task description.
@@ -67,6 +73,7 @@ Domain knowledge that agents should read before making changes:
 |------|---------|
 | `constraints.md` | 22 hard constraints — violating any one causes bugs or crashes |
 | `architecture.md` | Module map, trainer hierarchy, data flow, model loading flow, test mapping |
+| `multimodal_metadata.md` | Canonical multimodal metadata keys and ownership boundaries |
 | `uv.md` | Dependency management architecture (uv, extras, lockfile, torch sources) |
 
 ### `.cursor/rules/`

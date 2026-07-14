@@ -807,17 +807,20 @@ _NPU_DEFAULT_FALLBACK: Dict[str, str] = {
 class OpsImplementationConfig:
     """model.ops_implementation.* — kernel backend selection per op.
 
-    Defaults are GPU-optimal (Liger / Triton / fused_triton); they raise on
-    NPU. NPU users must pin every per-op field to an NPU-supported value, or
-    ``"eager"`` when the op has no NPU kernel. Per-op fields are ``str`` so
-    third-party backends can register without changing this dataclass.
+    Defaults are GPU-optimal (Liger / Triton / fused_triton). On NPU, values
+    still equal to the dataclass defaults listed in ``_NPU_DEFAULT_FALLBACK``
+    are automatically mapped to NPU-compatible or eager implementations;
+    explicit non-default overrides are validated and unsupported values raise.
+    Per-op fields are ``str`` so third-party backends can register without
+    changing this dataclass.
 
     NPU validation runs at two times:
 
     - **Config-parse time** (``__post_init__``) for ops registered in the
       legacy per-model registry: ``rms_norm``, ``rotary_pos_emb``,
-      ``swiglu_mlp``, ``load_balancing_loss``, plus ``cross_entropy_loss``
-      and ``moe``. Errors fire immediately with a model-agnostic allow-list.
+      ``rotary_pos_emb_vision``, ``swiglu_mlp``, ``load_balancing_loss``, plus
+      ``cross_entropy_loss`` and ``moe``. Errors fire immediately with a
+      model-agnostic allow-list.
     - **Model-build time** (``OpSlot.bind`` via ``KERNEL_REGISTRY.resolve``)
       for Qwen3.5-only ops: ``rms_norm_gated``, ``causal_conv1d``,
       ``chunk_gated_delta_rule``. These OpSlots only exist in Qwen3.5's
@@ -830,7 +833,9 @@ class OpsImplementationConfig:
 
     Backends: ``"eager"`` (HF reference, always available),
     ``"liger_kernel"`` (GPU, needs ``liger-kernel``), ``"npu"`` (Ascend),
-    ``"triton"`` (CUDA ``triton`` / NPU ``triton-ascend``).
+    ``"triton"`` (CUDA ``triton``). The load-balancing registry also has an
+    NPU ``triton-ascend`` implementation, but values equal to the dataclass
+    default are currently normalized to ``"eager"`` before registry binding.
     """
 
     attn_implementation: Optional[
@@ -892,8 +897,8 @@ class OpsImplementationConfig:
     load_balancing_loss_implementation: str = field(
         default="triton",
         metadata={
-            "help": "MoE load-balancing loss. 'triton' (default; needs 'triton' on CUDA "
-            "or 'triton-ascend' on NPU — raises at validation if missing) | 'eager'."
+            "help": "MoE load-balancing loss. 'triton' (default; needs 'triton' on CUDA) | 'eager'. "
+            "On NPU, config normalization maps the default 'triton' value to 'eager'."
         },
     )
     rms_norm_gated_implementation: str = field(

@@ -2,11 +2,16 @@
 
 ## Status
 
-**Proposal** | 2026-03-16
+**Historical proposal** | 2026-03-16
+
+> This document records the original registry design and contains illustrative
+> pseudocode. It is not the source of truth for runnable configuration. See
+> [Kernel Selection in VeOmni](kernel_selection.md) for the current config
+> fields, defaults, backends, lifecycle, and implementation paths.
 
 ## Problem
 
-VeOmni's current kernel selection is fragmented:
+At the time of this proposal, VeOmni's kernel selection was fragmented:
 
 1. **Inconsistent config surface.** Attention and MoE use `OpsImplementationConfig`
    fields; RMSNorm/RoPE/SwiGLU use `VEOMNI_USE_LIGER_KERNEL` env var; loss uses
@@ -146,7 +151,9 @@ class KernelRegistry:
 KERNEL_REGISTRY = KernelRegistry()
 ```
 
-**OSS registrations** (in `veomni/ops/kernel_defaults.py`, imported at `veomni` init):
+**Illustrative proposal registrations.** The shipped registrations are
+distributed under `veomni/ops/kernels/*` and `veomni/ops/liger/`; they are
+imported by `veomni/ops/__init__.py`.
 
 ```python
 from .kernel_registry import KERNEL_REGISTRY, KernelSpec, HardwareRequirement
@@ -282,23 +289,14 @@ PR — see `veomni/arguments/arguments_types.py`):
 | `rotary_pos_emb_implementation` | `eager`, `liger_kernel`, `npu`, `triton` (per-model; DeepSeek-V3) | |
 | `swiglu_mlp_implementation` | `eager`, `liger_kernel` | |
 | `moe_implementation` | `eager`, `fused_triton`, `fused_quack`, `fused_npu` | Single field; mismatches (e.g. `fused_triton` on NPU) raise in `apply_veomni_fused_moe_patch` rather than silently falling back |
-| `cross_entropy_loss_implementation` | `eager`, `liger_kernel`, `npu` | |
-| `load_balancing_loss_implementation` | `eager`, `triton` | `triton` backend works on CUDA (`triton`) and NPU (`triton-ascend`); introduced in #651 and kept through this refactor |
-| `rms_norm_gated_implementation` | `eager`, `fla` | Qwen3.5 GatedDeltaNet `self.norm`; default `fla`. No NPU backend — selecting any non-eager value on NPU raises at OpSlot bind time (#714) |
-| `causal_conv1d_implementation` | `eager`, `fla` | Qwen3.5 GatedDeltaNet pre-mixer; default `fla`. `eager` has no torch fallback for `cu_seqlens` — varlen training raises at forward time. No NPU backend (#714) |
-| `chunk_gated_delta_rule_implementation` | `eager`, `fla`, `flash_qla` | Qwen3.5 linear attention; default `fla`. `flash_qla` (QwenLM FlashQLA) ships under the `gpu` extra and binds on Hopper sm90 only. No NPU backend (#714) |
+| `cross_entropy_loss_implementation` | `eager`, `liger_kernel`, `chunk_loss`, `npu` | |
+| `load_balancing_loss_implementation` | `eager`, `triton` | The registry has CUDA `triton` and NPU `triton-ascend` implementations, but current NPU config normalization maps the default-valued `triton` selection to `eager` before binding |
+| `rms_norm_gated_implementation` | `eager`, `fla`, `npu` | Qwen3.5 GatedDeltaNet `self.norm`; default `fla` |
+| `causal_conv1d_implementation` | `eager`, `fla`, `npu` | Qwen3.5 GatedDeltaNet pre-mixer; `eager` has no `cu_seqlens` path |
+| `chunk_gated_delta_rule_implementation` | `eager`, `fla`, `flash_qla`, `npu` | Qwen3.5 linear attention; `flash_qla` is Hopper SM90-only, while `npu` uses the vendored MindSpeed-MM kernel |
 
-Convenience preset:
-
-```yaml
-model:
-  ops_implementation:
-    preset: liger   # expands to rms_norm=liger, rope=liger, swiglu=liger, loss=liger_fused
-    moe_implementation: fused_triton  # override individual op
-```
-
-Preset expansion is best-effort: if the model's variant for an op has no `liger`
-registration, that op stays `eager` (no error).
+No preset field was shipped. Configure each `OpsImplementationConfig` field
+explicitly; unknown fields such as `preset` are invalid.
 
 ### 4. Op Slots
 
@@ -688,7 +686,7 @@ def load_balancing_loss_func(gate_logits, num_experts, top_k, attention_mask=Non
 | `Qwen3_5MoeExperts.forward` | 2-line guard at top of method | +2 |
 | `load_balancing_loss_func` | 2-line guard at top of function | +2 |
 | `ForConditionalGeneration.forward` | If-else guard around loss call | +3 |
-| `Qwen3_5MoeRMSNorm` | **Unchanged** (qwen3_5 variant, no kernel) | 0 |
+| `Qwen3_5MoeRMSNorm` | Variant-aware OpSlot guard (`liger_kernel`/`npu`/`eager`) | +2 |
 | `Qwen3_5MoeAttention.forward` | **Unchanged** (call sites not modified) | 0 |
 | Module-level `OpSlot` declarations | New lines | +4 |
 
@@ -701,10 +699,10 @@ Total diff from upstream HF: ~13 lines added. Function bodies unchanged
 model:
   ops_implementation:
     attn_implementation: flash_attention_2
-    rms_norm_implementation: eager              # only eager for qwen3_5 variant
-    rotary_pos_emb_implementation: eager  # only eager for partial variant
+    rms_norm_implementation: liger_kernel
+    rotary_pos_emb_implementation: eager
     moe_implementation: fused_triton
-    cross_entropy_loss_implementation: liger_fused
+    cross_entropy_loss_implementation: liger_kernel
     load_balancing_loss_implementation: eager
 ```
 
@@ -712,25 +710,24 @@ model:
 
 ```
 # User mistakenly sets:
-rms_norm_implementation: liger
+rms_norm_implementation: unknown_backend
 
 # Error (from KERNEL_REGISTRY.resolve):
-KeyError: No kernel 'liger' for op='rms_norm', variant='qwen3_5'.
-Available: ['eager']
+KeyError: Unknown kernel 'unknown_backend' for op='rms_norm', variant='qwen3_5'.
 ```
 
 ### 10. Lifecycle
 
 ```
 import veomni                                     # (1) import time
-  └─ import kernel_defaults                        #     register OSS kernels
+  └─ import veomni.ops.{kernels,liger}             #     register OSS kernels
 
 (optional) import internal_kernels.register        # (2) internal registration
   └─ KERNEL_REGISTRY.register(...)                 #     add internal kernels
 
 OpsImplementationConfig.__post_init__()            # (3) config parse time
   └─ rewrite attn_implementation for SP
-  └─ expand preset if set
+  └─ validate configured backends
 
 build_foundation_model(config)                     # (4) model build time
   ├─ import patched_modeling_qwen3_5_moe_gpu       #     generated module
@@ -769,9 +766,9 @@ model.forward()                                    # (5) runtime
 
 | Current mechanism | New mechanism | Migration |
 |---|---|---|
-| `VEOMNI_USE_LIGER_KERNEL=1` env var | `rms_norm_implementation: liger` etc. | Deprecate env var; keep compat for 1 release |
-| `gpu_patch.py` monkey-patching | patchgen + `OpSlot` guards | Remove `gpu_patch.py` files |
-| `apply_veomni_loss_patch()` at import | `cross_entropy_loss_implementation` + `OpSlot` | Remove import-time patch |
+| `VEOMNI_USE_LIGER_KERNEL=1` env var | Per-op `*_implementation: liger_kernel` fields | Removed; configure fields explicitly |
+| `gpu_patch.py` monkey-patching | patchgen + registry/`OpSlot` dispatch | Removed from current model paths |
+| `apply_veomni_loss_patch()` at import | `cross_entropy_loss_implementation` + `apply_ops_config()` | Replaced by the unified config install point |
 | `apply_veomni_fused_moe_patch()` | `OpSlot("moe_experts", ...)` | All MoE models (qwen3_moe, qwen3_5_moe, qwen3_vl_moe, qwen3_omni_moe, deepseek_v3, deepseek_v4) now bind through OpSlot guards; the function is kept only as the binding helper invoked from `_bind_veomni_ops` to set the global `_fused_moe_forward` pointer. DeepSeek-V4 attention is still eager-only, but its MoE keeps a direct `fused_moe_forward(...)` call under that guard so it can pass its merged `gate_up_proj` layout and `swiglu_limit` clamp explicitly; clamp-aware V4 fused MoE is currently provided by the GPU backends and defaults to `fused_triton` on GPU, while `fused_npu` raises until the NPU kernel implements `swiglu_limit`. |
 | `moe_implementation: fused` (auto-picks Triton on GPU / NPU group-gemm on NPU) | `moe_implementation: fused_triton` or `fused_npu` | Breaking change — `"fused"` renamed to `"fused_triton"` and the silent NPU auto-pick replaced by explicit `"fused_npu"`. `fused_quack` is unchanged. |
 
@@ -779,8 +776,8 @@ model.forward()                                    # (5) runtime
 
 ## Open Questions
 
-1. **Preset system:** Should `preset: liger` silently skip ops where the
-   model's variant has no `liger` registration, or warn?
+1. ~~**Preset system:** Should a Liger preset silently skip unsupported
+   ops?~~ **Resolved:** no preset field was shipped; users configure each op.
 2. **Attention:** Keep in `ALL_ATTENTION_FUNCTIONS` (shared with HF) or unify
    under `KERNEL_REGISTRY`?
 3. ~~**NPU auto-selection:** Should NPU be an explicit `npu_group_gemm`

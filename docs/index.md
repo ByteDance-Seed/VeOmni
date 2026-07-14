@@ -88,6 +88,7 @@ key_features/lora.md
 :caption: Design
 
 design/kernel_selection.md
+design/fused_moe_kernels.md
 design/patchgen.md
 design/unified_kernel_registry.md
 design/verl_topk_distill_integration.md

@@ -1,6 +1,6 @@
 ---
 name: veomni-migrate-transformers-v5
-description: "Use this skill when adding or refreshing a patchgen-generated modeling file for a VeOmni model under veomni/models/transformers/<model>/generated/ — GPU-only or GPU+NPU, dense or MoE, text-only / VLM / Omni-thinker+talker. Covers: creating <model>_{gpu,npu}_patch_gen_config.py, using patchgen decorators (replace_class/override_method/replace_function/modify_init/add_post_import_block/drop_import_names), reusing sibling-model patches via name_map, handling MoE weight-loading (CheckpointTensorConverter + fused gate_up_proj layout), multimodal/VLM forward with Ulysses SP, excluding speech/vocoder subtrees in Omni models (talker/token2wav/DiT/BigVGAN), wiring __init__.py for the patchgen-generated classes, running codegen, and adding test cases. Trigger: 'port <model> to patchgen', 'add patchgen for <model>', 'transformers v5 migration', 'add NPU patchgen'. Do NOT edit files under generated/ manually — always regenerate via patchgen."
+description: "Use this skill when adding or refreshing a patchgen-generated modeling file for a VeOmni model under its generated directory — GPU-only or GPU+NPU, dense or MoE, text-only / VLM / Omni-thinker+talker. Covers: creating GPU and NPU patchgen configs, using patchgen decorators (replace_class/override_method/replace_function/modify_init/add_post_import_block/drop_import_names), reusing sibling-model patches via name_map, handling MoE weight-loading (CheckpointTensorConverter + fused gate_up_proj layout), multimodal/VLM forward with Ulysses SP, excluding speech/vocoder subtrees in Omni models (talker/token2wav/DiT/BigVGAN), wiring __init__.py for the patchgen-generated classes, running codegen, and adding test cases. Trigger: 'port a model to patchgen', 'add patchgen for a model', 'transformers v5 migration', 'add NPU patchgen'. Do NOT edit files under generated/ manually — always regenerate via patchgen."
 ---
 
 # VeOmni Transformers v5 Patchgen Protocol
@@ -1003,12 +1003,13 @@ Extra e2e gotchas:
   `AssertionError: len(cumsum_M) == b.shape[0]` inside `group_gemm_same_nk`
   (cumsum length = `E_local`, but the weight has all `E` experts). See
   `veomni/models/transformers/deepseek_v3/parallel_plan.py`.
-- **Sync-weight adapters must detect the fused layout** — HF checkpoints may
-  already ship `experts.gate_up_proj` / `experts.down_proj`. Test adapters in
-  `tests/models/weight_sync_adapters.py::sync_weight_<m>` that unconditionally
-  stack per-expert `gate_proj`/`up_proj`/`down_proj` will raise
-  `KeyError: '...experts.0.gate_proj.weight'`. Guard with a key-existence
-  check and skip stacking when the fused keys are already present.
+- **Checkpoint converters must detect the fused layout** — HF checkpoints may
+  already ship `experts.gate_up_proj` / `experts.down_proj`. A
+  `CheckpointTensorConverter` that unconditionally stacks per-expert
+  `gate_proj`/`up_proj`/`down_proj` will raise
+  `KeyError: '...experts.0.gate_proj.weight'`. Guard with a key-existence check,
+  skip stacking when fused keys are already present, and cover both layouts in
+  `tests/models/test_checkpoint_tensor_converter.py`.
 
 ---
 

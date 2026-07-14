@@ -15,7 +15,9 @@ This guide provides comprehensive information for using VeOmni framework with As
 
 ## Key Updates
 
-2026/5/11: VeOmni provides images of the version of Ascend Cann9.0.0.
+2026/7/14: VeOmni main uses PyTorch and torch_npu 2.10.0.
+
+2026/5/11: VeOmni provides images based on Ascend CANN 9.0.0.
 
 2025/12/23: VeOmni supports training on Ascend NPU.
 
@@ -34,12 +36,12 @@ Product Hardware Support List
 
 ## Installation
 
-VeOmni supports two installation methods for Ascend NPUs: `uv` (recommended for faster installation) and `pip`. Note that ARM architecture machines only support `pip` installation.
+VeOmni supports two installation methods for Ascend NPUs: `uv` (recommended for faster installation) and `pip`.
 
 ### Installation Options
 
 - **x86 Architecture**: Supports both `uv` and `pip` installation methods
-- **ARM Architecture**: Only supports `pip` installation method
+- **ARM Architecture**: Supports both `uv` and `pip` through the `npu_aarch64` extra
 
 ### Detailed Installation Guide
 
@@ -62,7 +64,11 @@ The following table shows the supported software versions for VeOmni when runnin
 | VeOmni Version | PyTorch | torch_npu | CANN Version | Python Version |
 |----------------|-------- | -----------|--------------|----------------|
 | 0.1.0 | 2.7.1                | 2.7.1             | 8.3rc2/9.0.0      | 3.11           |
-| main  | In-development    | In-development | In-development | In-development |
+| main  | 2.10.0 | 2.10.0 | 9.0.0 (CI) | 3.11/3.12 |
+
+Repository Docker definitions also cover CANN 8.3.RC2. Treat the PyTorch,
+torch_npu, CANN, and `triton-ascend` versions as one compatibility set and
+validate non-CI combinations on the target hardware.
 
 ## Supported Models
 

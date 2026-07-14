@@ -68,18 +68,22 @@ model:
     rms_norm_implementation: npu
     rotary_pos_emb_implementation: npu
     swiglu_mlp_implementation: eager           # no NPU backend available
-    load_balancing_loss_implementation: eager  # triton-ascend not exposed as `triton`
-    # Qwen3.5 GatedDeltaNet trio — only meaningful for Qwen3.5 MoE models;
-    # pin to eager on NPU (no NPU kernel) and set train.dyn_bsz=False:
-    rms_norm_gated_implementation: eager
-    causal_conv1d_implementation: eager
-    chunk_gated_delta_rule_implementation: eager
+    load_balancing_loss_implementation: eager  # current NPU config normalization selects eager
+    # Qwen3.5 GatedDeltaNet trio — for both dense and MoE Qwen3.5 models;
+    # select the NPU kernels explicitly; the default `fla` backend is GPU-only:
+    rms_norm_gated_implementation: npu
+    causal_conv1d_implementation: npu
+    chunk_gated_delta_rule_implementation: npu
 ```
 
 These configurations specify the optimal implementation for each operator type when running on NPUs:
 - Use NPU-optimized implementations where available (rms_norm_implementation: npu)
-- Fall back to compatible implementations for operations without NPU support (eager)
+- Fall back to compatible implementations for operations without NPU support (`eager`)
 - Configure specialized settings for model-specific components (Qwen3.5 GatedDeltaNet)
+
+The Qwen3.5 GatedDeltaNet NPU kernels require `triton-ascend`. Do not use
+`eager` for dynamic batching: its causal-convolution and gated-delta-rule
+fallbacks do not accept `cu_seqlens`.
 
 **Note**: Some models with structurally-incompatible kernels (e.g., Wan rope_apply, Qwen2-VL multimodal RoPE) already include these NPU-friendly configurations in their default YAML files.
 

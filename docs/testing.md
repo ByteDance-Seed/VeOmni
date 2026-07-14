@@ -20,8 +20,8 @@ tests/
 │   ├── test_checkpoint_tensor_converter.py  # Checkpoint tensor conversion (e.g. Qwen3MoE fuse)
 │   ├── test_deepseek_v4_fused_moe.py  # DeepSeek-V4 fused MoE swiglu_limit plumbing
 │   ├── test_padded_packed_loss.py   # Padded vs packed (cu_seqlens) loss equivalence
-│   ├── utils.py                    # ModelMode, prepare_model_modes, prepare_data
-│   └── weight_sync_adapters.py     # State-dict alignment for HF↔VeOmni comparison
+│   ├── test_models_logits_equal_v5.py  # HF↔VeOmni logits through the real loader
+│   └── utils.py                    # ModelMode, prepare_model_modes, prepare_data
 │
 ├── ops/                            # Fused kernel correctness & performance
 │   ├── test_fused_moe_split_vs_merged.py   # Split vs merged MoE fc1
@@ -126,7 +126,7 @@ Additional per-directory helpers:
 | File | Scope | Key Exports |
 |---|---|---|
 | `tests/models/utils.py` | Model patch tests | `ModelMode`, `prepare_model_modes`, `prepare_data` |
-| `tests/models/weight_sync_adapters.py` | Model patch tests | HF↔VeOmni state-dict alignment functions |
+| `tests/models/test_checkpoint_tensor_converter.py` | Model loading | Runtime checkpoint layout conversion and fused-expert weight mapping |
 | `tests/e2e/utils.py` | E2E tests | `prepare_exec_cmd`, `parse_training_log`, `ParallelMode` |
 | `tests/checkpoints/utils.py` | Checkpoint tests | Command/config builders for trainer save/load |
 | `tests/parallel/ulysses/utils.py` | SP tests | `SequenceParallelTest` base class, `sync_tensor` |
@@ -307,7 +307,7 @@ See also: [Testing a New Model for Transformers v5](transformers_v5/testing_new_
 | **MoE model** | `tests/models/test_models_patch.py` | Set `is_moe=True` to test `eager` vs `fused` MoE backends. |
 | **MoE model** | `tests/e2e/test_e2e_parallel.py` | Set `is_moe=True` to include `ep_size` iteration. |
 | **MoE with fused experts** | `tests/models/test_checkpoint_tensor_converter.py` | Add converter tests if a custom `CheckpointTensorConverter` is needed. |
-| **Custom weight layout** | `tests/models/weight_sync_adapters.py` | Add sync function if HF↔VeOmni state-dict keys differ. |
+| **Custom checkpoint layout** | `tests/models/test_checkpoint_tensor_converter.py` | Add converter tests for any on-disk HF↔VeOmni key or tensor-layout conversion. |
 | **Custom fused kernels** | `tests/ops/` | Add kernel-specific correctness tests. |
 | **New data modality** | `tests/data/` | Add data processing and collation tests. |
 

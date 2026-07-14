@@ -103,9 +103,8 @@ npu = [
   "hf_transfer",
 ]
 
-# aarch64 NPU — torch + torch-npu only; torchcodec lacks aarch64 wheels for
-# torch 2.9 (0.11+ needs torch 2.10, 0.8-0.9 are x86_64-only).
-# av 14.4.0 has no aarch64 wheel, so pin to 14.2.0 for cp311 too.
+# Ascend NPU aarch64 — full superset except torchcodec, which lacks compatible
+# aarch64 wheels. av 14.4.0 has no aarch64 wheel, so pin to 14.2.0 for cp311.
 npu_aarch64 = [
   "torch==2.10.0",
   "torch-npu==2.10.0",
