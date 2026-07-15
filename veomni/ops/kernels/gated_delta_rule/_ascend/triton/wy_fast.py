@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 # Copyright (c) 2026, Huawei Technologies Co., Ltd.  All rights reserved.
 
@@ -64,9 +63,9 @@ def prepare_wy_repr_bwd_kernel(
                 i_t = idx
                 bos, eos = i_b * T, i_b * T + T
 
-            o_t = i_t * BT + tl.arange(0, BT)	
-            m_t = o_t < T	
-            m_A = (o_t[:, None] > o_t[None, :]) & (m_t[:, None] & m_t)	
+            o_t = i_t * BT + tl.arange(0, BT)
+            m_t = o_t < T
+            m_A = (o_t[:, None] > o_t[None, :]) & (m_t[:, None] & m_t)
             for i_h in range(0, H):
                 if IS_VARLEN:
                     offset = bos + i_h * T_max
@@ -113,12 +112,12 @@ def prepare_wy_repr_bwd_kernel(
                     b_dbeta += tl.sum(b_dv_beta * b_v, 1)
                     tl.store(p_dv, b_dv.to(p_dv.dtype.element_ty), boundary_check=(0, 1))
 
-                b_dA = tl.where(m_A, b_dA, 0)	
-                b_dA = tl.dot(b_dA.to(b_A.dtype), b_A)	
-                b_dA = tl.dot(b_A, b_dA.to(b_A.dtype))	
-                b_dA = tl.where(m_A, -b_dA * exp(b_g[:, None] - b_g[None, :]), 0)	
-                b_dA = b_dA.to(k.dtype.element_ty)	
-                b_A = tl.zeros([BT, BT], dtype=tl.float32)	
+                b_dA = tl.where(m_A, b_dA, 0)
+                b_dA = tl.dot(b_dA.to(b_A.dtype), b_A)
+                b_dA = tl.dot(b_A, b_dA.to(b_A.dtype))
+                b_dA = tl.where(m_A, -b_dA * exp(b_g[:, None] - b_g[None, :]), 0)
+                b_dA = b_dA.to(k.dtype.element_ty)
+                b_A = tl.zeros([BT, BT], dtype=tl.float32)
 
                 for i_k in range(tl.cdiv(K, BK)):
                     p_k = tl.make_block_ptr(k + (bos * H + i_h) * K, (T, K), (H * K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))

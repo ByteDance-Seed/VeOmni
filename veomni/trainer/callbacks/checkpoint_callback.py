@@ -78,6 +78,7 @@ class CheckpointerCallback(Callback):
             args.train.checkpoint.load_path,
             state,
             trainable_only=bool(getattr(args.model, "lora_config", None)),
+            parallel_state=self.parallel_state,
         )
 
         self.trainer.state.global_step = state["extra_state"]["global_step"]
@@ -85,6 +86,11 @@ class CheckpointerCallback(Callback):
         self.trainer.start_step = self.trainer.state.global_step % args.train_steps
 
         self.trainer.lr_scheduler.load_state_dict(state["extra_state"]["lr_scheduler"])
+
+        channel_loss_state = state["extra_state"].get("channel_loss_callback")
+        channel_loss_callback = getattr(self.trainer, "channel_loss_callback", None)
+        if channel_loss_state is not None and channel_loss_callback is not None:
+            channel_loss_callback.load_state_dict(channel_loss_state)
 
         # dataloader may only init on sp_rank_0 to save memory
         if (
@@ -115,6 +121,9 @@ class CheckpointerCallback(Callback):
         else:
             train_dataloader_state = {}
 
+        channel_loss_callback = getattr(self.trainer, "channel_loss_callback", None)
+        channel_loss_state = channel_loss_callback.state_dict() if channel_loss_callback is not None else {}
+
         ckpt_state = {
             "model": self.trainer.model,
             "optimizer": self.trainer.optimizer,
@@ -123,6 +132,7 @@ class CheckpointerCallback(Callback):
                 "lr_scheduler": self.trainer.lr_scheduler.state_dict(),
                 "train_dataloader": train_dataloader_state,
                 "environ_meter": self.trainer.environ_meter.state_dict(),
+                "channel_loss_callback": channel_loss_state,
                 "torch_rng_state": torch.get_rng_state(),
             },
         }
@@ -142,6 +152,7 @@ class CheckpointerCallback(Callback):
             save_async=args.train.checkpoint.save_async,
             trainable_only=bool(getattr(args.model, "lora_config", None)),
             save_to_lowest_rank=args.train.checkpoint.dcp_save_to_lowest_rank,
+            parallel_state=self.parallel_state,
         )
 
         # Empty cache and barrier
@@ -217,6 +228,7 @@ class HuggingfaceCkptCallback(CheckpointerCallback):
             model=self.trainer.model,
             fqn_to_index_mapping=args.model.fqn_to_index_mapping,
             is_rank_0=args.train.global_rank == 0,
+            parallel_state=self.parallel_state,
         )
 
         # Empty cache and barrier

@@ -73,6 +73,7 @@ Training loop, optimizer, parallelism, checkpointing, profiling, and logging.
     * `OptimizerConfig` — `train.optimizer.*`
     * `WandbConfig` — `train.wandb.*`
     * `ProfileConfig` — `train.profile.*`
+    * `ChannelLossConfig` — `train.channel_loss.*`
     * `GradientCheckpointingConfig` — `train.gradient_checkpointing.*`
     * `AcceleratorConfig` — `train.accelerator.*`
         * `FSDPConfig` — `train.accelerator.fsdp_config.*`
@@ -190,12 +191,13 @@ NPU validation runs at two times:
 | swiglu_mlp_implementation | `str` | `"liger_kernel"` | SwiGLU MLP. Known values: `liger_kernel` (default, GPU only), `eager`. There is no NPU backend, so a value still equal to the default auto-resolves to `eager` on NPU. |
 | rotary_pos_emb_implementation | `str` | `"liger_kernel"` | Rotary pos emb. Known values: `liger_kernel` (default, GPU only), `npu`, `triton` (DeepSeek-V3 only; GPU only), `eager`. |
 | rotary_pos_emb_vision_implementation | `str` | `"eager"` | Vision rotary positional embedding. Known values: `eager`, `npu`. |
-| load_balancing_loss_implementation | `str` | `"triton"` | MoE load-balancing loss. `triton` uses the fused CUDA kernel; `eager` is the pure-PyTorch reference. On NPU, config normalization maps every value equal to the default `triton` (including an explicit YAML value) to `eager`, so the registry's `triton-ascend` implementation is not selectable through ordinary model config currently. |
+| load_balancing_loss_implementation | `str` | `"triton"` | MoE load-balancing loss. `triton` uses the fused CUDA kernel; `eager` is the pure-PyTorch reference. On NPU, config normalization maps every value equal to the default `triton` (including an explicit YAML value) to `eager`. |
 | rms_norm_gated_implementation | `str` | `"fla"` | Gated RMSNorm (Qwen3.5 GatedDeltaNet `self.norm`). Known values: `eager`, `fla` (FLA `FusedRMSNormGated`, GPU), `npu`. |
 | causal_conv1d_implementation | `str` | `"fla"` | Varlen depthwise causal conv1d (Qwen3.5 GatedDeltaNet pre-mixer). Known values: `eager`, `fla` (GPU), `npu` (requires `triton-ascend`). `eager` does not support the varlen path. |
 | chunk_gated_delta_rule_implementation | `str` | `"fla"` | Chunk gated delta-rule kernel for Qwen3.5 linear attention. Known values: `eager`, `fla` (GPU), `flash_qla` (Hopper SM90), `npu` (requires `triton-ascend`). `eager` does not support varlen training. |
-| dsa_indexer_backend | `Literal["eager", "cudnn"]` | `"eager"` | DeepSeek sparse-attention top-k indexer backend. |
-| dsa_attention_backend | `Literal["eager", "flashmla_cudnn"]` | `"eager"` | DeepSeek sparse-attention backend. |
+| dsa_indexer_backend | `Literal["eager", "cudnn", "tilelang"]` | `"eager"` | DeepSeek sparse-attention top-k indexer backend. `tilelang` selects the DeepSeek-V4 Lightning Indexer kernel and requires an SM90+ CUDA GPU. |
+| dsa_attention_backend | `Literal["eager", "flashmla_cudnn", "tilelang_sparse"]` | `"eager"` | DeepSeek sparse-attention backend. `tilelang_sparse` selects the DeepSeek-V4 sparse MQA kernel and requires an SM90+ CUDA GPU. |
+| mhc_backend | `Literal["eager", "tile_kernels"]` | `"eager"` | DeepSeek V4 manifold-constrained Hyper-Connection backend. `tile_kernels` enables the TileKernels forward/backward path and requires an SM90+ CUDA GPU. |
 
 ### DataArguments
 
@@ -212,7 +214,7 @@ NPU validation runs at two times:
 | multisource_datasets_type | `str` | `"interleave"` | Dataset type for multisource training. |
 | source_name | `str` | `None` | Dataset name. Loaded from multisource YAML if multisource is enabled. |
 | dyn_bsz_buffer_size | `int` | `200` | Buffer size for dynamic batch size. |
-| text_keys | `str` | `None` | Key to retrieve text from data. Auto-resolved: `"content_split"` for plaintext, `"messages"` for conversation, `"text"` for classification. |
+| text_keys | `str` | `None` | Key to retrieve text from data. Auto-resolved: `"content_split"` for plaintext, `"messages"` for conversation, `"text"` for classification, `"chosen"` for DPO. |
 | chat_template | `str` | `"default"` | Chat template name. |
 | max_seq_len | `int` | `2048` | Maximum sequence length. |
 | silent_exception | `bool` | `False` | Whether to ignore exceptions when loading data. |
@@ -264,6 +266,7 @@ NPU validation runs at two times:
 | optimizer | `OptimizerConfig` | — | Optimizer and learning-rate schedule. |
 | wandb | `WandbConfig` | — | Weights & Biases logging. |
 | profile | `ProfileConfig` | — | Torch profiler settings. |
+| channel_loss | `ChannelLossConfig` | — | Detached per-channel causal-LM loss logging. |
 | gradient_checkpointing | `GradientCheckpointingConfig` | — | Gradient checkpointing settings. |
 | torch_compile | `TorchCompileConfig` | — | Per-block `torch.compile` settings. |
 | accelerator | `AcceleratorConfig` | — | Parallelism and distributed-training topology. |
@@ -334,6 +337,40 @@ NPU validation runs at two times:
 | with_stack | `bool` | `True` | Record stack traces. |
 | with_modules | `bool` | `False` | Record module hierarchy in profiler traces. |
 | rank0_only | `bool` | `True` | Profile rank 0 only. |
+
+### ChannelLossConfig
+
+`train.channel_loss.*` — Detached per-channel causal-LM loss logging.
+
+This is an observability-only side channel. It computes detached per-token CE
+from the model loss inputs, aggregates by packed-sequence source metadata, and
+adds metrics such as `channel_loss/<source-id>__<source>` to the normal step metrics. It does
+not change the returned training loss or gradients. Fused-loss backends may
+recompute the LM-head projection on sampled steps, so the default interval is
+10 steps; set `interval=1` for per-step metrics. DiT trainers and
+`data.data_type="classification"` are not supported because they do not optimize
+a causal-LM objective. SeedOmni's `Qwen3MoeFoundationModel` is also unsupported
+because its legacy forward bypasses the observable loss dispatch. `BaseRLTrainer`
+is unsupported because it packs source alignment metadata after the common step
+lifecycle. In DPO training, only the policy-model forward is observed; the
+reference-model forward is excluded, and the chosen/rejected segments both use
+their preference pair's source metadata. If distinct source names sanitize to
+the same metric key, the stable source-ID prefix keeps their time series
+distinct from the first emission.
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| enable | `bool` | `False` | Enable channel loss logging. |
+| interval | `int` | `10` | Compute and log channel loss every N optimizer steps. |
+| source_id_keys | `List[str]` | `["channel_id", "source_id", "dataset_id", "ds_idx"]` | Batch metadata keys to read as channel/source IDs. |
+| source_name_keys | `List[str]` | `["channel_name", "source_name", "dataset_name", "data_name"]` | Batch metadata keys to read as display names. |
+| extra_strip_keys | `List[str]` | `["cur_token_num"]` | Extra metadata keys removed before model forward. |
+| loss_metric_prefix | `str` | `"channel_loss"` | Prefix for average CE metrics. |
+| weighted_loss_metric_prefix | `str` | `"channel_loss_weighted"` | Prefix for loss-sum divided by all logged step tokens. |
+| token_count_metric_prefix | `str` | `"channel_tokens"` | Prefix for supervised token-count metrics. |
+| log_weighted_loss | `bool` | `True` | Log weighted loss metrics. |
+| log_token_count | `bool` | `True` | Log token-count metrics. |
+| strict | `bool` | `False` | Raise when source metadata is missing or cannot be aligned with packed segments; otherwise skip invalid batches. |
 
 ### GradientCheckpointingConfig
 

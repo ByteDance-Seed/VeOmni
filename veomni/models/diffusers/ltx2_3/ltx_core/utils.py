@@ -55,8 +55,12 @@ def to_denoised(
 def find_matching_file(root_path: str, pattern: str) -> Path:
     """
     Recursively search for files matching a glob pattern and return the first match.
+    If root_path is already a file matching the pattern, return it directly.
     """
-    matches = list(Path(root_path).rglob(pattern))
+    p = Path(root_path)
+    if p.is_file() and p.match(pattern):
+        return p
+    matches = list(p.rglob(pattern))
     if not matches:
         raise FileNotFoundError(f"No files matching pattern '{pattern}' found under {root_path}")
     return matches[0]

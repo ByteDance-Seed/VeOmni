@@ -1,7 +1,8 @@
 # Kernel Selection in VeOmni
 
-VeOmni selects optimized kernel implementations for attention, cross-entropy
-loss, Liger fused ops (RMSNorm, RoPE, SwiGLU), MoE, and load-balancing loss.
+VeOmni selects optimized kernel implementations for attention, mHC,
+cross-entropy loss, Liger fused ops (RMSNorm, RoPE, SwiGLU), MoE, and
+load-balancing loss.
 All selections are driven by config fields in `OpsImplementationConfig`.
 
 ## Quick Reference
@@ -14,6 +15,9 @@ selection knob.
 | Kernel | Config field | Available values | Default | Selection time |
 |--------|-------------|------------------|---------|----------------|
 | Attention | `attn_implementation` | `eager`, `sdpa`, `flash_attention_2`, `flash_attention_3`, `flash_attention_4`, `native-sparse` | `"flash_attention_2"` | Config `__post_init__` + `build_foundation_model` |
+| DSA indexer | `dsa_indexer_backend` | `eager`, `cudnn` (GLM-DSA), `tilelang` (DeepSeek-V4) | `"eager"` | Model build via `OpsConfigSlot` |
+| DSA attention | `dsa_attention_backend` | `eager`, `flashmla_cudnn` (GLM-DSA), `tilelang_sparse` (DeepSeek-V4) | `"eager"` | Model build via `OpsConfigSlot` |
+| mHC | `mhc_backend` | `eager`, `tile_kernels` (DeepSeek-V4, SM90+) | `"eager"` | Model build via three `OpSlot`s (`pre`, `post`, `head`) |
 | Cross-entropy loss | `cross_entropy_loss_implementation` | `eager`, `liger_kernel`, `chunk_loss`, `npu` | `"liger_kernel"` (GPU) | `apply_ops_config()` (before model build) |
 | RMSNorm | `rms_norm_implementation` | `eager`, `liger_kernel`, `npu`, `triton` (per-model; DeepSeek-V3) | `"liger_kernel"` (GPU) | Model registration via ops config singleton |
 | SwiGLU MLP | `swiglu_mlp_implementation` | `eager`, `liger_kernel` | `"liger_kernel"` (GPU) | Model registration via ops config singleton |
@@ -22,8 +26,6 @@ selection knob.
 | Gated RMSNorm | `rms_norm_gated_implementation` | `eager`, `fla`, `npu` | `"fla"` (GPU) | Qwen3.5 OpSlot binding |
 | Causal Conv1D | `causal_conv1d_implementation` | `eager`, `fla`, `npu` | `"fla"` (GPU) | Qwen3.5 OpSlot binding |
 | Gated delta rule | `chunk_gated_delta_rule_implementation` | `eager`, `fla`, `flash_qla` (SM90), `npu` | `"fla"` (GPU) | Qwen3.5 OpSlot binding |
-| DSA indexer | `dsa_indexer_backend` | `eager`, `cudnn` | `"eager"` | DeepSeek sparse-attention setup |
-| DSA attention | `dsa_attention_backend` | `eager`, `flashmla_cudnn` | `"eager"` | DeepSeek sparse-attention setup |
 | Load-balancing loss | `load_balancing_loss_implementation` | `eager`, `triton` (CUDA; NPU config normalizes this default to `eager`) | `"triton"` | `apply_ops_config()` (before model build) |
 | MoE experts | `moe_implementation` | `eager`, `fused_triton`, `fused_quack` (SM90+), `fused_npu` | `"fused_triton"` (GPU) | `build_foundation_model` |
 
@@ -70,6 +72,7 @@ model.forward()                               # (4) runtime
   ├─ loss: self.loss_function(...) -> LOSS_MAPPING[...] (pre-bound partial)
   │         OR veomni_causal_lm_loss(...) via OpSlot.use_non_eager_impl guard
   ├─ RMSNorm/RoPE/SwiGLU: Liger or HF default (set at registration)
+  ├─ mHC: TileKernels pre/post/head or original Transformers implementation
   └─ MoE: fused_moe_forward(...) or eager loop
 ```
 
@@ -128,6 +131,26 @@ with DeepSpeed Ulysses sequence parallelism gather/scatter.
 - Config: `veomni/arguments/arguments_types.py` — `OpsImplementationConfig`
 - Registration: `veomni/ops/kernels/attention/__init__.py` — `apply_veomni_attention_patch()`
 - Plumbing: `veomni/models/auto.py` — `build_foundation_model(ops_implementation=...)`
+
+### DeepSeek V4 DSA and mHC
+
+DeepSeek V4 exposes three independent model-specific selections. The TileLang
+indexer and sparse attention backends support packed dynamic batches; the
+TileKernels mHC backend replaces the pre/Sinkhorn/collapse, residual post-mix,
+and final head collapse through registry-backed `OpSlot`s:
+
+```yaml
+model:
+  ops_implementation:
+    dsa_indexer_backend: tilelang
+    dsa_attention_backend: tilelang_sparse
+    mhc_backend: tile_kernels
+```
+
+All three optimized paths require NVIDIA SM90 or later. `mhc_backend` defaults
+to `eager` and never silently falls back after `tile_kernels` is selected.
+TileKernels' training path supports forward and backward with BF16 activations
+and DeepSeek V4's `hc_mult=4` layout.
 
 ---
 
@@ -297,10 +320,10 @@ model:
 | `triton` | Fused Triton kernel (`_load_balancing_loss` is rebound by `apply_ops_config` via the registry's `global_slot`) | `triton` on CUDA |
 | `eager` | Pure-PyTorch reference (`load_balancing_loss_pytorch`) | — |
 
-The registry contains a `triton-ascend` implementation under the backend name
-`triton`, but normal NPU config construction maps every value equal to the
-dataclass default `triton`—including an explicit YAML value—to `eager` before
-registry binding. Select `eager` in current NPU configs.
+Normal NPU config construction maps every value equal to the dataclass default
+`triton`—including an explicit YAML value—to `eager` before registry binding.
+The optimized `triton` implementation is CUDA-only; select `eager` in current
+NPU configs.
 
 This is a `GLOBAL`-scope op: the function pointer
 `veomni.ops.kernels.load_balancing_loss._load_balancing_loss` is rebound
@@ -330,10 +353,14 @@ model:
 ```
 
 **Field:** `OpsImplementationConfig.moe_implementation`
-**Default:** `"fused_triton"` (GPU). On NPU set to `"fused_npu"` or `"eager"` — `fused_triton` / `fused_quack` raise at config validation time.
+**Default:** `"fused_triton"` (GPU). On NPU, a value still equal to this
+dataclass default—including an explicit YAML value—is normalized to
+`"fused_npu"`. Set `"fused_npu"` explicitly for clarity; incompatible
+non-default overrides such as `"fused_quack"` raise at config validation time.
 
-The mode and kernel backend are expressed as a single field. Mismatches raise
-at ``apply_veomni_fused_moe_patch`` time — no silent hardware fallback.
+The mode and kernel backend are expressed as a single field. After the
+default-value compatibility normalization above, remaining hardware mismatches
+raise during config validation or kernel binding.
 
 | Value | Kernel | Hardware | EP support |
 |-------|--------|----------|:----------:|
@@ -342,8 +369,10 @@ at ``apply_veomni_fused_moe_patch`` time — no silent hardware fallback.
 | `fused_quack` | Quack CUTLASS/CuTe | GPU, SM90+ (H100+) | No |
 | `fused_npu` | NPU group-gemm | Ascend NPU | Yes |
 
-DeepSeek-V4 attention remains eager-only, but its MoE path uses the same
-`moe_implementation` selection and therefore defaults to `fused_triton` on GPU.
+DeepSeek-V4 keeps eager DSA indexer and attention as its defaults, with optional
+SM90+ `tilelang` indexer and `tilelang_sparse` attention backends. Its MoE path
+uses the independent `moe_implementation` selection and therefore defaults to
+`fused_triton` on GPU.
 The v4-specific patched experts path passes the merged `gate_up_proj` tensor
 directly to `fused_moe_forward(...)` and forwards `swiglu_limit` so backends
 that implement the clamp preserve V4's clamped SwiGLU pre-activation semantics.

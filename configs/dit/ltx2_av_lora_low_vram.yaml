@@ -1,0 +1,144 @@
+# =============================================================================
+# LTX-2.3 Audio-Video LoRA Training Configuration (Low VRAM)
+# =============================================================================
+#
+# Entry point: tasks/train_dit.py  (DiTTrainer + VeOmniDiTArguments)
+# Usage: bash train.sh tasks/train_dit.py configs/dit/ltx2_av_lora_low_vram.yaml
+#
+# This is a memory-optimized variant of the standard audio-video LoRA config.
+# It uses reduced LoRA rank to minimize GPU memory usage while maintaining
+# good training quality.
+#
+# Memory optimizations applied:
+#   - Lower LoRA rank (16 vs 32, reduces trainable parameters)
+#   - Gradient checkpointing enabled
+#
+# Recommended for GPUs with limited VRAM.
+#
+# Dataset input for offline training is the parquet output produced by
+# preprocess_dataset.py save-parquet. Latent tensors and condition embeddings
+# are stored in each shard.
+#
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Model Configuration
+# -----------------------------------------------------------------------------
+model:
+  # Path to the directory containing LTX-2.3 transformer .safetensors files
+  model_path: "/path/to/models/LTX-2.3"
+
+  # Path to the same LTX-2.3 checkpoint directory used to build the condition model.
+  # Its root config.json initializes the condition config; component discovery
+  # also checks transformer/config.json and model_index.json.
+  condition_model_path: "/path/to/models/LTX-2.3"
+
+  config_path: "configs/model_configs/ltx2_3/ltx2_3_av.json"
+
+  # Extra config passed to LTXVideoConditionModelConfig.from_pretrained()
+  condition_model_cfg:
+    # Whether to enable audio modality in the condition model
+    with_audio: true
+    # Probability of conditioning on the first frame during training
+    first_frame_conditioning_p: 0.5
+    # --- Flow matching ---
+    timestep_sampling_mode: "shifted_logit_normal"
+
+  # LoRA configuration — lower rank (16) for memory-constrained setups
+  lora_config:
+    rank: 16
+    alpha: 16
+    dropout: 0.0
+    lora_modules:
+      # Attention layers (matches both video and audio branches)
+      - "to_k"
+      - "to_q"
+      - "to_v"
+      - "to_out.0"
+      # Uncomment below to also train feed-forward layers:
+      # - "ff.net.0.proj"
+      # - "ff.net.2"
+      # - "audio_ff.net.0.proj"
+      # - "audio_ff.net.2"
+
+  # LTX-2.3 has non-standard RoPE, pin to eager until a dedicated kernel exists
+  ops_implementation:
+    attn_implementation: eager
+    rotary_pos_emb_implementation: eager
+    rms_norm_implementation: eager
+    swiglu_mlp_implementation: eager
+    cross_entropy_loss_implementation: eager
+    moe_implementation: eager
+    load_balancing_loss_implementation: eager
+
+# -----------------------------------------------------------------------------
+# Data Configuration
+# -----------------------------------------------------------------------------
+data:
+  # Directory containing parquet shards produced by the save-parquet command.
+  train_path: "/path/to/parquet_output"
+
+  data_type: diffusion
+  datasets_type: iterable
+  text_keys: text
+  max_seq_len: 8192
+  dataloader:
+    type: native
+    num_workers: 2
+    drop_last: true
+
+# -----------------------------------------------------------------------------
+# Training Configuration
+# -----------------------------------------------------------------------------
+train:
+  # LTX-2.3 only supports "offline_training" (pre-computed Gemma features + VAE latents).
+  # Run preprocess_dataset.py first to generate latents, conditions, and optionally audio_latents.
+  training_task: offline_training
+
+  global_batch_size: 8
+  micro_batch_size: 1
+  dyn_bsz: false
+
+  init_device: meta
+  seed: 42
+
+  num_train_epochs: 1
+  max_steps: 2000
+
+  gradient_checkpointing:
+    enable: true
+
+  optimizer:
+    # NOTE: "adamw8bit" is not a supported OptimizerConfig.type in VeOmni.
+    # VeOmni supports: "adamw", "anyprecision_adamw", "muon".
+    # For memory-efficient training, consider "anyprecision_adamw" or reduce
+    # global_batch_size / use gradient checkpointing.
+    type: adamw
+    lr: 1.0e-4
+    lr_decay_style: linear
+    lr_min: 1.0e-5
+    lr_warmup_ratio: 0.0
+    weight_decay: 0.01
+    max_grad_norm: 1.0
+
+  accelerator:
+    ulysses_size: 1
+    fsdp_config:
+      fsdp_mode: fsdp2
+      offload: true
+      mixed_precision:
+        enable: true
+        param_dtype: bfloat16
+        cast_forward_inputs: false
+    offload_config:
+      enable_activation: true
+      activation_gpu_limit: 2.0
+
+  checkpoint:
+    output_dir: "outputs/ltx2_av_lora_low_vram"
+    save_steps: 250
+    save_hf_weights: false
+
+  wandb:
+    enable: false
+    project: "ltx2_av_lora_low_vram"

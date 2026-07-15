@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 
 # pylint: disable=no-name-in-module,consider-using-from-import,pointless-string-statement,redefined-outer-name

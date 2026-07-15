@@ -64,14 +64,23 @@ class Arguments(VeOmniArguments):
 ```
 
 ## Parallel State
-VeOmni use torch device mesh to manage all the parallel state, which is useful and concise when working with multi-dimensional parallelism (i.e. 3-D parallel) where parallelism composability is required. You can create the parallel state by calling the `init_parallel_state` function. and get the parallel state by calling the `get_parallel_state` function.
+VeOmni uses PyTorch DeviceMesh to manage multidimensional parallel topologies.
+`init_parallel_state` registers a state under a logical name, while
+`use_parallel_state` scopes operations that need to resolve the current
+process groups. See [Local Parallel State Registry and Scoping](../design/local_parallel_state.md)
+for the registry, topology-cache, and teardown rules.
 
 More details about torch device mesh, you can refer to the [Getting Started with DeviceMesh](https://pytorch.org/tutorials/recipes/distributed_device_mesh.html).
 
 - source code [veomni/distributed/parallel_state.py](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/distributed/parallel_state.py).
 
 ```python
-from veomni.distributed.parallel_state import get_parallel_state, init_parallel_state
+from veomni.distributed.parallel_state import (
+    get_parallel_state,
+    get_parallel_state_by_name,
+    init_parallel_state,
+    use_parallel_state,
+)
 
 init_parallel_state(
     dp_size=args.train.accelerator.dp_size, # data parallel size
@@ -86,9 +95,14 @@ init_parallel_state(
     extra_parallel_names=args.train.accelerator.extra_parallel_names,
     dp_mode=args.train.accelerator.fsdp_config.fsdp_mode, # data parallel mode, can be "ddp" or "fsdp2"
     async_enabled=args.train.accelerator.enable_async, # async ulysses
+    name="base",
 )
 
 parallel_state = get_parallel_state()
+assert parallel_state is get_parallel_state_by_name("base")
+
+with use_parallel_state("base"):
+    output = model(input_ids)
 
 # Access dp state
 dp_mesh = parallel_state.dp_mesh

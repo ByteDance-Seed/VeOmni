@@ -33,7 +33,7 @@
   "o_groups": 2,
   "o_lora_rank": 64,
   "index_n_heads": 8,
-  "index_head_dim": 16,
+  "index_head_dim": 128,
   "index_topk": 32,
   "num_nextn_predict_layers": 0,
   "output_router_logits": false,

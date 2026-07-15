@@ -29,7 +29,7 @@ from ..arguments import DataArguments, ModelArguments, TrainingArguments, VeOmni
 from ..data import build_data_transform, build_dataloader
 from ..data.data_collator import DataCollator
 from ..distributed.clip_grad_norm import veomni_clip_grad_norm
-from ..distributed.parallel_state import get_parallel_state
+from ..distributed.parallel_state import get_parallel_state, use_parallel_state
 from ..models import build_foundation_model
 from ..models.auto import build_config
 from ..models.loader import MODEL_CONFIG_REGISTRY, MODELING_REGISTRY
@@ -178,43 +178,55 @@ class DiTTrainer:
     offline_embedding_saver: OfflineEmbeddingSaver = None
 
     def __init__(self, args: VeOmniDiTArguments):
+        if args.train.channel_loss.enable:
+            raise ValueError(
+                "train.channel_loss is only supported by causal-LM trainers; DiTTrainer uses diffusion objectives."
+            )
         self.base = BaseTrainer.__new__(BaseTrainer)
         self.base.args = args
 
-        # rewrite _setup, setup arguments for dit training
+        # rewrite _setup, setup arguments for dit training.
+        # ``base._setup`` registers ParallelState; DiT then recomputes
+        # dataloader_batch_size from ``dp_size``.
         self._setup()
 
-        # rewrite _build_model, build condition model & dit model
-        self._build_model()
+        # All build steps read the current ParallelState via ``get_parallel_state()``
+        # (meta-init, FSDP2/EP wrap + weight load, optimizer, SP data pipeline), so
+        # scope the whole build under this trainer's own state. No-op for the
+        # single-model case; keeps each module building over its own mesh once
+        # multiple modules build separately.
+        with use_parallel_state("base"):
+            # rewrite _build_model, build condition model & dit model
+            self._build_model()
 
-        # rewrite _freeze_model_module, freeze condition model
-        self._freeze_model_module()
+            # rewrite _freeze_model_module, freeze condition model
+            self._freeze_model_module()
 
-        # rewrite _build_model_assets to support processor of condition model
-        self._build_model_assets()
+            # rewrite _build_model_assets to support processor of condition model
+            self._build_model_assets()
 
-        # rewrite _build_data_transform, build data transform for offline or online dit data
-        self._build_data_transform()
+            # rewrite _build_data_transform, build data transform for offline or online dit data
+            self._build_data_transform()
 
-        # rewrite _build_dataset, init offline_embedding_saver after build_dataset
-        self._build_dataset()
+            # rewrite _build_dataset, init offline_embedding_saver after build_dataset
+            self._build_dataset()
 
-        # Do not use maincollator in dit training
-        # self.base._build_collate_fn()
+            # Do not use maincollator in dit training
+            # self.base._build_collate_fn()
 
-        # rewrite _build_dataloader, build dataloader only on sp_rank_0 to save memory
-        self._build_dataloader()
+            # rewrite _build_dataloader, build dataloader only on sp_rank_0 to save memory
+            self._build_dataloader()
 
-        if self.training_task != "offline_embedding":
-            self.base._build_parallelized_model()
-            self.base._build_optimizer()
-            self.base._build_lr_scheduler()
-            self.base._build_training_context()
+            if self.training_task != "offline_embedding":
+                self.base._build_parallelized_model()
+                self.base._build_optimizer()
+                self.base._build_lr_scheduler()
+                self.base._build_training_context()
 
-        self.base._init_callbacks()
+            self.base._init_callbacks()
 
     def _setup(self):
-        self.base._setup()
+        self.base._setup()  # registers ParallelState("base") before seed
         args: VeOmniDiTArguments = self.base.args
         args.train.dyn_bsz = False
         args.train.micro_batch_size = 1
@@ -457,15 +469,16 @@ class DiTTrainer:
 
         with torch.no_grad():
             micro_batch = self.condition_model.process_condition(**micro_batch)
-        with self.base.model_fwd_context:
+
+        with use_parallel_state("base"), self.base.model_fwd_context:
             outputs = self.base.model(**micro_batch)
 
         loss: torch.Tensor
         loss_dict: Dict[str, torch.Tensor]
+        # DiT postforward does not read ambient ParallelState.
         loss, loss_dict = self.postforward(outputs, micro_batch)
 
-        # Backward pass
-        with self.base.model_bwd_context:
+        with use_parallel_state("base"), self.base.model_bwd_context:
             loss.backward()
 
         del micro_batch
@@ -475,22 +488,23 @@ class DiTTrainer:
         args = self.base.args
         self.base.state.global_step += 1
 
-        # broadcast micro_batches from sp_rank_0 to all ranks
-        if get_parallel_state().sp_enabled:
-            if get_parallel_state().sp_rank == 0:
-                micro_batches = next(data_iterator)
-            else:
-                micro_batches = None
+        # SP broadcast of micro_batches
+        with use_parallel_state("base"):
+            if get_parallel_state().sp_enabled:
+                if get_parallel_state().sp_rank == 0:
+                    micro_batches = next(data_iterator)
+                else:
+                    micro_batches = None
 
-            obj_list = [micro_batches]
-            dist.broadcast_object_list(
-                obj_list,
-                src=dist.get_global_rank(get_parallel_state().sp_group, 0),
-                group=get_parallel_state().sp_group,
-            )
-            micro_batches = obj_list[0]
-        else:
-            micro_batches = next(data_iterator)
+                obj_list = [micro_batches]
+                dist.broadcast_object_list(
+                    obj_list,
+                    src=dist.get_global_rank(get_parallel_state().sp_group, 0),
+                    group=get_parallel_state().sp_group,
+                )
+                micro_batches = obj_list[0]
+            else:
+                micro_batches = next(data_iterator)
 
         self.on_step_begin(micro_batches=micro_batches)
 
@@ -517,7 +531,8 @@ class DiTTrainer:
                     total_loss_dict[k] += v.item()
 
         if self.training_task != "offline_embedding":
-            grad_norm = veomni_clip_grad_norm(self.base.model, args.train.optimizer.max_grad_norm)
+            with use_parallel_state("base"):
+                grad_norm = veomni_clip_grad_norm(self.base.model, args.train.optimizer.max_grad_norm)
             self.base.optimizer.step()
             self.base.lr_scheduler.step()
             self.base.optimizer.zero_grad()

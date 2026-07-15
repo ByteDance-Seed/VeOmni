@@ -1,9 +1,8 @@
 from typing import NamedTuple
 
 import torch
-from torch import nn
-
 from ltx_core.text_encoders.gemma.embeddings_connector import Embeddings1DConnector
+from torch import nn
 
 
 class EmbeddingsProcessorOutput(NamedTuple):
@@ -66,6 +65,7 @@ class EmbeddingsProcessor(nn.Module):
 
         sort_idx, mask_for_connector = _compute_right_pad_order(additive_attention_mask)
         video_features = _apply_right_pad_order(video_features, sort_idx)
+
         video_encoded, video_mask = self.video_connector(video_features, mask_for_connector)
         binary_mask = _to_binary_mask(video_mask, video_encoded.shape[:2])
         video_encoded = video_encoded * binary_mask

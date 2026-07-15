@@ -27,6 +27,8 @@ tests/
 │   ├── test_fused_moe_split_vs_merged.py   # Split vs merged MoE fc1
 │   ├── test_quack_fused_moe.py             # Quack GEMM MoE (SM90+)
 │   ├── test_fused_load_balancing_loss.py    # Triton load-balancing loss kernel
+│   ├── test_deepseek_v4_kernels.py           # DeepSeek-V4 TileLang guards and numerical parity
+│   ├── test_mhc_tile_kernels.py              # DeepSeek-V4 TileKernels mHC dispatch and parity
 │   ├── test_flash_attn_varlen_padding.py   # Flash-attn variable-length padding
 │   ├── test_seqcls_loss.py                 # Sequence classification loss
 │   └── test_comp.py                        # Position embedding computation
@@ -99,7 +101,7 @@ tests/
 | Category | Directory | GPU Req | Execution | Purpose |
 |---|---|---|---|---|
 | **Model patch** | `tests/models/` | 1 GPU | pytest | Fwd/bwd correctness across attn/MoE backends |
-| **Ops / kernels** | `tests/ops/` | 1 GPU (SM90+ for Quack) | pytest | Fused kernel correctness & perf |
+| **Ops / kernels** | `tests/ops/` | 0-1 GPU (SM90+ for Quack, DeepSeek-V4 TileLang, and mHC TileKernels) | pytest | Fused kernel guards, dispatch, correctness, and performance |
 | **Data pipeline** | `tests/data/` | 0-1 GPU | pytest | Data loading, collation, preprocessing |
 | **Parallelism** | `tests/parallel/` | 4-8 GPUs | torchrun / pytest | SP, EP, data-balance primitives |
 | **FSDP correctness** | `tests/distributed/` | 2+ GPUs | torchrun (subprocess + mp.spawn) | Single-GPU vs FSDP2 equivalence, dummy forward |
@@ -157,6 +159,13 @@ Additional per-directory helpers:
 
 DeepSeek-V4's fused-MoE-specific merged `gate_up_proj` and `swiglu_limit`
 forwarding are covered by `tests/models/test_deepseek_v4_fused_moe.py` (CPU).
+Its kernel package import behavior, hardware guards, BF16/FP32 utility, and
+TileLang DSA indexer/attention numerical checks are covered by
+`tests/ops/test_deepseek_v4_kernels.py`. The guard and utility cases run on
+CPU; optimized numerical tests require TileLang on an SM90+ NVIDIA GPU.
+Registry binding plus mHC pre/post/head forward and backward parity are covered
+by `tests/ops/test_mhc_tile_kernels.py`, which requires TileKernels on an SM90+
+NVIDIA GPU for kernel execution.
 
 ---
 
@@ -263,6 +272,8 @@ forwarding are covered by `tests/models/test_deepseek_v4_fused_moe.py` (CPU).
 | `test_quack_fused_moe.py` | Quack GEMM MoE backend | SM90+ |
 | `test_kernel_registry_numerical.py` | Numerical alignment per (op, variant, impl) | CUDA; the FlashQLA `chunk_gated_delta_rule` case skips unless running on SM90 (Hopper) — SM10x WIP upstream. |
 | `test_fused_load_balancing_loss.py` | Triton load-balancing loss | CUDA |
+| `test_deepseek_v4_kernels.py` | CPU import/hardware guards plus TileLang DSA numerical parity | CPU for guards; TileLang + NVIDIA SM90+ for optimized kernels |
+| `test_mhc_tile_kernels.py` | TileKernels mHC registry dispatch and forward/backward parity | TileKernels + NVIDIA SM90+ |
 | `test_flash_attn_varlen_padding.py` | Flash-attn variable-length padding | CUDA |
 | `test_seqcls_loss.py` | Sequence classification loss | CUDA (optional) |
 | `test_comp.py` | Position embedding computation | CUDA |

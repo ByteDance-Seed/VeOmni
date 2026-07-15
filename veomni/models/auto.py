@@ -88,6 +88,8 @@ def _bind_veomni_ops(modeling_module, ops_config: OpsImplementationConfig) -> bo
             )
             if impl_name != "eager" and obj.variant == "standard":
                 moe_experts_kernel = impl_name
+        elif obj.op_name == "mhc":
+            impl_name = ops_config.mhc_backend
         else:
             impl_name = getattr(ops_config, f"{obj.op_name}_implementation", "eager")
         obj.bind(impl_name)

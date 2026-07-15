@@ -1,0 +1,185 @@
+# =============================================================================
+# LTX-2.3 Audio-Video LoRA Training Configuration
+# =============================================================================
+#
+# Entry point: tasks/train_dit.py  (DiTTrainer + VeOmniDiTArguments)
+# Usage: bash train.sh tasks/train_dit.py configs/dit/ltx2_av_lora.yaml
+#
+# This configuration is for training LoRA adapters on the LTX-2.3 model for
+# text-to-video generation. It supports both video-only and joint audio-video
+# training modes.
+#
+# Use this configuration when you want to:
+#   - Fine-tune LTX-2.3 on your own video dataset
+#   - Train with or without audio generation
+#   - Create custom video generation styles or audiovisual concepts
+#
+# Dataset input for offline training is the parquet output produced by
+# preprocess_dataset.py save-parquet. Latent tensors and condition embeddings
+# are stored in each shard.
+#
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Model Configuration
+# -----------------------------------------------------------------------------
+# model.* maps to DiTModelArguments (extends ModelArguments).
+model:
+  # Path to the directory containing LTX-2.3 transformer .safetensors files
+  model_path: "/path/to/models/LTX-2.3"
+
+  # Path to the same LTX-2.3 checkpoint directory used to build the condition model.
+  # Its root config.json initializes the condition config; component discovery
+  # also checks transformer/config.json and model_index.json.
+  condition_model_path: "/path/to/models/LTX-2.3"
+
+  config_path: "configs/model_configs/ltx2_3/ltx2_3_av.json"
+
+  # Extra config passed to LTXVideoConditionModelConfig.from_pretrained()
+  condition_model_cfg:
+    # Whether to enable audio modality in the condition model
+    with_audio: true
+    # Probability of conditioning on the first frame during training
+    first_frame_conditioning_p: 0.5
+    # --- Flow matching ---
+    timestep_sampling_mode: "shifted_logit_normal"
+
+  # LoRA configuration — maps to model.lora_config (dict)
+  # Presence of lora_config implicitly selects LoRA mode.
+  lora_config:
+    # Rank of the LoRA matrices (higher = more capacity but more parameters)
+    # Typical values: 8, 16, 32, 64. Start with 32 for general fine-tuning.
+    rank: 32
+
+    # Alpha scaling factor (usually set equal to rank)
+    # The effective scaling is alpha/rank, so alpha=rank means scaling of 1.0
+    alpha: 32
+
+    # Dropout probability for LoRA layers (0.0 = no dropout)
+    # Can help with regularization if overfitting occurs
+    dropout: 0.0
+
+    # Which transformer modules to apply LoRA to (use "lora_modules" key)
+    # The LTX-2.3 transformer has separate attention and FFN blocks for video and audio:
+    #
+    # VIDEO MODULES:
+    #   - attn1.to_k, attn1.to_q, attn1.to_v, attn1.to_out.0  (video self-attention)
+    #   - attn2.to_k, attn2.to_q, attn2.to_v, attn2.to_out.0  (video cross-attention to text)
+    #   - ff.net.0.proj, ff.net.2                             (video feed-forward)
+    #
+    # AUDIO MODULES:
+    #   - audio_attn1.to_k, audio_attn1.to_q, audio_attn1.to_v, audio_attn1.to_out.0
+    #   - audio_attn2.to_k, audio_attn2.to_q, audio_attn2.to_v, audio_attn2.to_out.0
+    #   - audio_ff.net.0.proj, audio_ff.net.2
+    #
+    # AUDIO-VIDEO CROSS-ATTENTION MODULES (for cross-modal interaction):
+    #   - audio_to_video_attn.to_k, .to_q, .to_v, .to_out.0
+    #   - video_to_audio_attn.to_k, .to_q, .to_v, .to_out.0
+    #
+    # Using short patterns like "to_k" matches ALL attention modules (video, audio, and cross-modal).
+    # For audio-video training, this is the recommended approach.
+    lora_modules:
+      # Attention layers (matches both video and audio branches)
+      - "to_k"
+      - "to_q"
+      - "to_v"
+      - "to_out.0"
+      # Uncomment below to also train feed-forward layers (can increase the LoRA's capacity):
+      # - "ff.net.0.proj"
+      # - "ff.net.2"
+      # - "audio_ff.net.0.proj"
+      # - "audio_ff.net.2"
+
+  # LTX-2.3 has non-standard RoPE, pin to eager until a dedicated kernel exists
+  ops_implementation:
+    attn_implementation: eager
+    rotary_pos_emb_implementation: eager
+    rms_norm_implementation: eager
+    swiglu_mlp_implementation: eager
+    cross_entropy_loss_implementation: eager
+    moe_implementation: eager
+    load_balancing_loss_implementation: eager
+
+# -----------------------------------------------------------------------------
+# Data Configuration
+# -----------------------------------------------------------------------------
+# data.* maps to DiTDataArguments (extends DataArguments).
+data:
+  # Directory containing parquet shards produced by the save-parquet command.
+  train_path: "/path/to/parquet_output"
+
+  data_type: diffusion
+  datasets_type: iterable
+  text_keys: text
+  max_seq_len: 8192
+  dataloader:
+    type: native
+    num_workers: 2
+    drop_last: true
+
+# -----------------------------------------------------------------------------
+# Training Configuration
+# -----------------------------------------------------------------------------
+# train.* maps to DiTTrainingArguments (extends TrainingArguments).
+# Note: DiTTrainer._setup() overrides dyn_bsz=False and micro_batch_size=1.
+train:
+  # LTX-2.3 only supports "offline_training" (pre-computed Gemma features + VAE latents).
+  # Run preprocess_dataset.py first to generate latents, conditions, and optionally audio_latents.
+  training_task: offline_training
+
+  # DiT always uses fixed batch (dyn_bsz=False is forced in _setup).
+  # global_batch_size = micro_batch_size(=1) * dp_size * gradient_accumulation_steps.
+  # For 8 GPUs: global_batch_size=8 → effective grad_accum=1 per GPU.
+  # For 1 GPU: global_batch_size=1 → no grad accumulation.
+  # Adjust global_batch_size to match desired gradient_accumulation_steps.
+  global_batch_size: 8
+  micro_batch_size: 1
+  dyn_bsz: false
+
+  # Device for model init — "meta" required for FSDP2
+  init_device: meta
+  seed: 42
+
+  num_train_epochs: 1
+  max_steps: 2000
+
+  # Gradient checkpointing — reduces memory at ~20-30% slower training
+  gradient_checkpointing:
+    enable: true
+
+  # Optimizer settings
+  optimizer:
+    type: adamw
+    lr: 1.0e-4
+    lr_decay_style: linear
+    lr_min: 1.0e-5  # 10% of lr, matches LTX-2 LinearLR end_factor=0.1
+    lr_warmup_ratio: 0.0  # no warmup, matches LTX-2 (which uses LinearLR without warmup)
+    weight_decay: 0.01  # LTX-2 uses PyTorch default (no weight decay)
+    max_grad_norm: 1.0
+
+  # Parallelism & mixed precision
+  accelerator:
+    ulysses_size: 1
+    fsdp_config:
+      fsdp_mode: fsdp2
+      offload: true
+      mixed_precision:
+        enable: true
+        param_dtype: bfloat16
+        cast_forward_inputs: false
+    offload_config:
+      enable_activation: true
+      activation_gpu_limit: 2.0
+
+  # Checkpoint settings
+  checkpoint:
+    output_dir: "outputs/ltx2_av_lora"
+    save_steps: 250
+    save_hf_weights: false
+    # Optional: resume from a previous checkpoint
+    # load_path: "path/to/checkpoint"
+
+  # W&B logging
+  wandb:
+    enable: false
+    project: "ltx2_av_lora"
