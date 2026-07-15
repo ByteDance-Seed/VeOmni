@@ -129,8 +129,15 @@ config = PatchConfig(
 config.add_import("veomni.ops", names=["fused_moe_forward"])
 config.add_import(
     "veomni.ops.kernels.deepseek_v4",
-    names=["sparse_attn_tilelang", "v4_lighting_indexer"],
+    names=[
+        "act_quant",
+        "fp4_act_quant",
+        "fp4_gemm",
+        "sparse_attn_tilelang",
+        "v4_lighting_indexer",
+    ],
 )
+config.add_import("veomni.distributed.parallel_state", names=["get_parallel_state"])
 config.add_import(
     "veomni.models.transformers.deepseek_v4.packed_utils",
     names=[
@@ -661,13 +668,18 @@ def deepseek_v4_attention_forward_patched(
 
 # ================================================================
 # Patch: eager_attention_forward
-# 1. Dispatch DeepSeek-V4 attention to the TileLang sparse MQA kernel when
+# 1. Optionally apply the official inference path's FP8 fake quantization to
+#    non-RoPE KV channels immediately before attention.
+# 2. Dispatch DeepSeek-V4 attention to the TileLang sparse MQA kernel when
 #    ``dsa_attention_backend=tilelang_sparse``. The existing additive mask is
 #    converted to a compact fixed-width index list, preserving sliding-window,
 #    compressor, causal, and invalid-index semantics.
-# 2. Preserve the upstream eager implementation as the default fallback.
+# 3. Preserve the upstream eager implementation as the default fallback.
 # ================================================================
-@config.replace_function("eager_attention_forward", description="Optional TileLang sparse MQA dispatch")
+@config.replace_function(
+    "eager_attention_forward",
+    description="Optional official FP8 KV quantization and TileLang sparse MQA dispatch",
+)
 def deepseek_v4_eager_attention_forward_patched(
     module: nn.Module,
     query: torch.Tensor,
@@ -679,6 +691,19 @@ def deepseek_v4_eager_attention_forward_patched(
     **kwargs,
 ):
     # --- Patch.1 ---
+    if getattr(module, "use_fp8_kv_quantization", False):
+        # DeepSeek-V4 uses the same normalized MQA tensor for keys and values.
+        key = key.clone()
+        act_quant(
+            key[..., : -module.config.qk_rope_head_dim],
+            block_size=64,
+            scale_fmt="ue8m0",
+            scale_dtype=torch.float8_e8m0fnu,
+            inplace=True,
+        )
+        value = key
+
+    # --- Patch.2 ---
     attention_backend = veomni_dsa_attention_backend.value
     if attention_backend not in {"eager", "tilelang_sparse"}:
         raise ValueError(
@@ -721,9 +746,9 @@ def deepseek_v4_eager_attention_forward_patched(
             scaling,
         )
         return attn_output, None
-    # --- Patch.1 ---
-
     # --- Patch.2 ---
+
+    # --- Patch.3 ---
     key_states = repeat_kv(key, module.num_key_value_groups)
     value_states = repeat_kv(value, module.num_key_value_groups)
     attn_weights = torch.matmul(query, key_states.transpose(2, 3)) * scaling
@@ -739,7 +764,7 @@ def deepseek_v4_eager_attention_forward_patched(
     attn_output = torch.matmul(attn_weights, value_states)
     attn_output = attn_output.transpose(1, 2).contiguous()
     return attn_output, attn_weights
-    # --- Patch.2 ---
+    # --- Patch.3 ---
 
 
 # ================================================================
@@ -858,6 +883,10 @@ class PatchedDeepseekV4Experts(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.num_experts = config.num_local_experts
+        self.expert_dtype = getattr(config, "expert_dtype", None)
+        self.use_ondemand_fp4 = False
+        self.use_ondemand_fp8 = False
+        self.assume_replicated_ep_inputs = False
         self.hidden_dim = config.hidden_size
         self.intermediate_dim = config.intermediate_size
         self.gate_up_proj = nn.Parameter(torch.empty(self.num_experts, 2 * self.intermediate_dim, self.hidden_dim))
@@ -872,6 +901,12 @@ class PatchedDeepseekV4Experts(nn.Module):
         top_k_weights: torch.Tensor,
     ) -> torch.Tensor:
         final_hidden_states = torch.zeros_like(hidden_states)
+
+        if not self.training and self.expert_dtype == "fp4":
+            if self.use_ondemand_fp4:
+                return self._forward_fp4(hidden_states, top_k_index, top_k_weights)
+            if self.use_ondemand_fp8:
+                return self._forward_fp8(hidden_states, top_k_index, top_k_weights)
 
         # --- Patch.2 ---
         if veomni_moe_experts_forward.use_non_eager_impl:
@@ -906,6 +941,120 @@ class PatchedDeepseekV4Experts(nn.Module):
 
         return final_hidden_states
 
+    def _forward_fp4(
+        self,
+        hidden_states: torch.Tensor,
+        top_k_index: torch.Tensor,
+        top_k_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        """Experimental inference from BF16-resident, on-demand FP4 weights."""
+        parallel_state = get_parallel_state()
+        if parallel_state.ep_enabled and not self.assume_replicated_ep_inputs:
+            raise RuntimeError("The on-demand FP4 reference path requires replicated inputs when EP is enabled")
+        gate_up_weights = self.gate_up_proj.to_local() if hasattr(self.gate_up_proj, "to_local") else self.gate_up_proj
+        down_weights = self.down_proj.to_local() if hasattr(self.down_proj, "to_local") else self.down_proj
+        local_experts = gate_up_weights.shape[0]
+        expert_start = parallel_state.ep_rank * local_experts if parallel_state.ep_enabled else 0
+        output = torch.zeros_like(hidden_states, dtype=torch.float32)
+        quantized_gate_up, gate_up_scales = fp4_act_quant(gate_up_weights.contiguous())
+        quantized_down, down_scales = fp4_act_quant(down_weights.contiguous())
+
+        for local_idx in range(local_experts):
+            expert_idx = expert_start + local_idx
+            token_idx, top_k_pos = torch.where(top_k_index == expert_idx)
+            if token_idx.numel() == 0:
+                continue
+
+            current = hidden_states[token_idx].contiguous()
+            quantized_input, input_scale = act_quant(
+                current,
+                block_size=128,
+                scale_fmt="ue8m0",
+                scale_dtype=torch.float8_e8m0fnu,
+            )
+            gate_up = fp4_gemm(
+                quantized_input,
+                input_scale,
+                quantized_gate_up[local_idx].contiguous(),
+                gate_up_scales[local_idx].contiguous(),
+                torch.float8_e8m0fnu,
+            ).float()
+            gate, up = gate_up.chunk(2, dim=-1)
+            gate = gate.clamp(max=self.limit)
+            up = up.clamp(min=-self.limit, max=self.limit)
+            current = F.silu(gate) * up
+            current = current * top_k_weights[token_idx, top_k_pos, None].float()
+
+            quantized_input, input_scale = act_quant(
+                current.to(hidden_states.dtype).contiguous(),
+                block_size=128,
+                scale_fmt="ue8m0",
+                scale_dtype=torch.float8_e8m0fnu,
+            )
+            current = fp4_gemm(
+                quantized_input,
+                input_scale,
+                quantized_down[local_idx].contiguous(),
+                down_scales[local_idx].contiguous(),
+                torch.float8_e8m0fnu,
+            )
+            output.index_add_(0, token_idx, current.float())
+
+        if parallel_state.ep_enabled:
+            torch.distributed.all_reduce(output, group=parallel_state.ep_group)
+        return output.to(hidden_states.dtype)
+
+    def _forward_fp8(
+        self,
+        hidden_states: torch.Tensor,
+        top_k_index: torch.Tensor,
+        top_k_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        """Quantize activations on demand while retaining BF16 expert weights."""
+        parallel_state = get_parallel_state()
+        if parallel_state.ep_enabled and not self.assume_replicated_ep_inputs:
+            raise RuntimeError("The on-demand FP8 reference path requires replicated inputs when EP is enabled")
+        gate_up_weights = self.gate_up_proj.to_local() if hasattr(self.gate_up_proj, "to_local") else self.gate_up_proj
+        down_weights = self.down_proj.to_local() if hasattr(self.down_proj, "to_local") else self.down_proj
+        local_experts = gate_up_weights.shape[0]
+        expert_start = parallel_state.ep_rank * local_experts if parallel_state.ep_enabled else 0
+        output = torch.zeros_like(hidden_states, dtype=torch.float32)
+
+        for local_idx in range(local_experts):
+            expert_idx = expert_start + local_idx
+            token_idx, top_k_pos = torch.where(top_k_index == expert_idx)
+            if token_idx.numel() == 0:
+                continue
+
+            current = hidden_states[token_idx].contiguous().clone()
+            act_quant(
+                current,
+                block_size=128,
+                scale_fmt="ue8m0",
+                scale_dtype=torch.float8_e8m0fnu,
+                inplace=True,
+            )
+            gate_up = F.linear(current.float(), gate_up_weights[local_idx].float()).to(hidden_states.dtype).float()
+            gate, up = gate_up.chunk(2, dim=-1)
+            gate = gate.clamp(max=self.limit)
+            up = up.clamp(min=-self.limit, max=self.limit)
+            current = F.silu(gate) * up
+            current = current * top_k_weights[token_idx, top_k_pos, None].float()
+            current = current.to(hidden_states.dtype).contiguous()
+            act_quant(
+                current,
+                block_size=128,
+                scale_fmt="ue8m0",
+                scale_dtype=torch.float8_e8m0fnu,
+                inplace=True,
+            )
+            current = F.linear(current.float(), down_weights[local_idx].float()).to(hidden_states.dtype)
+            output.index_add_(0, token_idx, current.float())
+
+        if parallel_state.ep_enabled:
+            torch.distributed.all_reduce(output, group=parallel_state.ep_group)
+        return output.to(hidden_states.dtype)
+
     def _apply_gate(self, gate_up: torch.Tensor) -> torch.Tensor:
         # --- Patch.3 ---
         # gpt-oss-style clamped SwiGLU. Lives on the class so
@@ -917,6 +1066,49 @@ class PatchedDeepseekV4Experts(nn.Module):
         up = up.clamp(min=-self.limit, max=self.limit)
         return self.act_fn(gate) * up
         # --- Patch.3 ---
+
+
+@config.override_method(
+    "DeepseekV4TopKRouter.forward",
+    description="Match the official DeepSeek-V4 FP32 router projection",
+)
+def deepseek_v4_topk_router_forward_patched(
+    self,
+    hidden_states: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    flat = hidden_states.reshape(-1, self.hidden_dim)
+    if getattr(self, "use_fp32_projection", False):
+        logits = F.linear(flat.float(), self.weight.float())
+        correction_bias = self.e_score_correction_bias.float()
+    else:
+        logits = F.linear(flat, self.weight)
+        correction_bias = self.e_score_correction_bias
+    scores = self.score_fn(logits)
+    indices = torch.topk(scores + correction_bias, self.top_k, dim=-1, sorted=False).indices
+    weights = scores.gather(1, indices)
+    weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-20)
+    return logits, weights * self.routed_scaling_factor, indices
+
+
+@config.override_method(
+    "DeepseekV4HashRouter.forward",
+    description="Match the official DeepSeek-V4 FP32 hash-router projection",
+)
+def deepseek_v4_hash_router_forward_patched(
+    self,
+    hidden_states: torch.Tensor,
+    input_ids: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    flat = hidden_states.reshape(-1, self.hidden_dim)
+    if getattr(self, "use_fp32_projection", False):
+        logits = F.linear(flat.float(), self.weight.float())
+    else:
+        logits = F.linear(flat, self.weight)
+    scores = self.score_fn(logits)
+    indices = self.tid2eid[input_ids.reshape(-1)].long()
+    weights = scores.gather(1, indices)
+    weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-20)
+    return logits, weights * self.routed_scaling_factor, indices
 
 
 # ================================================================

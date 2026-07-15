@@ -7,6 +7,7 @@ The input token tensor is read from the trace produced by
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 from pathlib import Path
@@ -15,13 +16,21 @@ from types import SimpleNamespace
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+from safetensors import safe_open
 
 from veomni.arguments.arguments_types import MixedPrecisionConfig, OpsImplementationConfig
 from veomni.distributed.parallel_state import init_parallel_state
 from veomni.distributed.torch_parallelize import build_parallelize_model
 from veomni.models import build_foundation_model
+from veomni.models.transformers.deepseek_v4.checkpoint_tensor_converter import convert_deepseek_v4_checkpoint_key
 from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling_module
-from veomni.ops.kernels.deepseek_v4 import act_quant, fp4_act_quant, linear_bf16_fp32
+from veomni.ops.kernels.deepseek_v4 import (
+    act_quant,
+    fp4_act_quant,
+    fp8_gemm,
+    fp8_weight_quant_with_scale,
+    linear_bf16_fp32,
+)
 from veomni.utils import helper
 
 
@@ -39,6 +48,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eager-dsa-output", type=Path)
     parser.add_argument("--eager-mhc-output", type=Path)
     parser.add_argument("--same-input-indexer-reference", action="store_true")
+    router_group = parser.add_mutually_exclusive_group()
+    router_group.add_argument("--reference-router-fp32", action="store_true")
+    router_group.add_argument(
+        "--reference-score-router-fp32",
+        action="store_true",
+        help="Use the official FP32 projection only for score-routed layers, leaving hash-router weights in BF16",
+    )
     parser.add_argument("--reference-quantization", action="store_true")
     parser.add_argument(
         "--reference-attention-kv-quantization",
@@ -55,10 +71,27 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Match the official compressor's BF16-input/weight GEMMs with FP32 outputs and pooling",
     )
-    parser.add_argument(
+    quantized_linear_group = parser.add_mutually_exclusive_group()
+    quantized_linear_group.add_argument(
         "--reference-quantized-linear-fp32",
         action="store_true",
         help="Apply official FP8 activation simulation and FP32 accumulation to dequantized linear weights",
+    )
+    quantized_linear_group.add_argument(
+        "--reference-quantized-linear-fp8",
+        action="store_true",
+        help="Repack BF16-resident checkpoint linears to FP8 on demand and use official FP8 GEMMs",
+    )
+    routed_expert_group = parser.add_mutually_exclusive_group()
+    routed_expert_group.add_argument(
+        "--reference-routed-expert-ondemand-fp4",
+        action="store_true",
+        help="Quantize BF16 routed-expert weights to FP4 on demand and use official FP8 activation GEMMs",
+    )
+    routed_expert_group.add_argument(
+        "--reference-routed-expert-ondemand-fp8",
+        action="store_true",
+        help="Apply official in-place FP8 activation quantization before both BF16 routed-expert GEMMs",
     )
     return parser.parse_args()
 
@@ -89,6 +122,16 @@ def make_ops_config(args: argparse.Namespace) -> OpsImplementationConfig:
 
 def main() -> None:
     args = parse_args()
+    specialized_quantization = (
+        args.reference_attention_kv_quantization
+        or args.reference_indexer_fp4_quantization
+        or args.reference_quantized_linear_fp32
+        or args.reference_quantized_linear_fp8
+        or args.reference_routed_expert_ondemand_fp4
+        or args.reference_routed_expert_ondemand_fp8
+    )
+    if args.reference_quantization and specialized_quantization:
+        raise ValueError("--reference-quantization cannot be combined with specialized quantization modes")
     dist.init_process_group("nccl")
     rank = dist.get_rank()
     world_size = dist.get_world_size()
@@ -128,6 +171,25 @@ def main() -> None:
         ep_sharded_stream_load=False,
     )
     model.eval()
+
+    if args.reference_router_fp32:
+        for layer in model.model.layers:
+            layer.mlp.gate.use_fp32_projection = True
+    if args.reference_score_router_fp32:
+        for layer in model.model.layers:
+            if isinstance(layer.mlp.gate, modeling_module.DeepseekV4TopKRouter):
+                layer.mlp.gate.use_fp32_projection = True
+    if args.reference_quantization or args.reference_attention_kv_quantization:
+        for layer in model.model.layers:
+            layer.self_attn.use_fp8_kv_quantization = True
+    if args.reference_routed_expert_ondemand_fp4:
+        for layer in model.model.layers:
+            layer.mlp.experts.use_ondemand_fp4 = True
+            layer.mlp.experts.assume_replicated_ep_inputs = True
+    if args.reference_routed_expert_ondemand_fp8:
+        for layer in model.model.layers:
+            layer.mlp.experts.use_ondemand_fp8 = True
+            layer.mlp.experts.assume_replicated_ep_inputs = True
 
     if args.reference_compressor_fp32:
         projection_count = 0
@@ -170,10 +232,78 @@ def main() -> None:
         return x + (quantized - x).detach()
 
     quantized_linear_pattern = re.compile(
-        r"(?:\.self_attn\.(?:q_a_proj|q_b_proj|kv_proj|o_a_proj|o_b_proj)"
+        r"(?:\.self_attn\.(?:q_a_proj|q_b_proj|kv_proj|o_b_proj)"
         r"|\.self_attn\.compressor\.indexer\.q_b_proj"
         r"|\.mlp\.shared_experts\.(?:gate_proj|up_proj|down_proj))$"
     )
+    if args.reference_quantized_linear_fp8:
+        modules = dict(model.named_modules())
+        expected_modules = {name for name in modules if quantized_linear_pattern.search(name)}
+        index_path = args.checkpoint / "model.safetensors.index.json"
+        weight_map = json.loads(index_path.read_text())["weight_map"]
+        scale_by_module: dict[str, tuple[str, str]] = {}
+        duplicate_modules: set[str] = set()
+        for raw_name, filename in weight_map.items():
+            if raw_name.startswith("mtp."):
+                continue
+            converted_name = convert_deepseek_v4_checkpoint_key(raw_name)
+            if converted_name.endswith(".scale"):
+                module_name = converted_name.removesuffix(".scale")
+            elif converted_name.endswith(".weight_scale_inv"):
+                module_name = converted_name.removesuffix(".weight_scale_inv")
+            else:
+                continue
+            if module_name not in expected_modules:
+                continue
+            if module_name in scale_by_module:
+                duplicate_modules.add(module_name)
+            scale_by_module[module_name] = (filename, raw_name)
+
+        missing_modules = expected_modules - scale_by_module.keys()
+        if missing_modules or duplicate_modules:
+            problems = []
+            if missing_modules:
+                problems.append(f"missing scales for {sorted(missing_modules)}")
+            if duplicate_modules:
+                problems.append(f"duplicate scales for {sorted(duplicate_modules)}")
+            raise RuntimeError("Incomplete FP8 checkpoint scale map: " + "; ".join(problems))
+
+        scale_keys_by_file: dict[str, list[tuple[str, str]]] = {}
+        for module_name, (filename, raw_name) in scale_by_module.items():
+            scale_keys_by_file.setdefault(filename, []).append((raw_name, module_name))
+
+        quantized_linears = 0
+        for filename, entries in scale_keys_by_file.items():
+            with safe_open(args.checkpoint / filename, framework="pt", device="cpu") as checkpoint_file:
+                for raw_name, module_name in entries:
+                    module = modules[module_name]
+                    weight_scale = checkpoint_file.get_tensor(raw_name).to(
+                        device=device,
+                        dtype=torch.float8_e8m0fnu,
+                    )
+
+                    def quantized_linear_fp8_hook(linear, inputs, _output, *, weight_scale=weight_scale):
+                        weight = linear.weight.to_local() if hasattr(linear.weight, "to_local") else linear.weight
+                        quantized_weight = fp8_weight_quant_with_scale(weight.contiguous(), weight_scale)
+                        quantized_input, input_scale = act_quant(
+                            inputs[0].contiguous(),
+                            block_size=128,
+                            scale_fmt="ue8m0",
+                            scale_dtype=torch.float8_e8m0fnu,
+                        )
+                        return fp8_gemm(
+                            quantized_input,
+                            input_scale,
+                            quantized_weight,
+                            weight_scale,
+                            torch.float8_e8m0fnu,
+                        )
+
+                    module.register_forward_hook(quantized_linear_fp8_hook)
+                    quantized_linears += 1
+        if rank == 0:
+            print(f"enabled on-demand checkpoint-scale FP8 execution on {quantized_linears} linear modules")
+
     if args.reference_quantized_linear_fp32:
         quantized_linears = 0
         for module_name, module in model.named_modules():
@@ -237,12 +367,22 @@ def main() -> None:
     )
     if args.reference_attention_kv_quantization:
         implementation += "_attention_kv_fp8_simulation"
+    if args.reference_router_fp32:
+        implementation += "_router_fp32"
+    if args.reference_score_router_fp32:
+        implementation += "_score_router_fp32"
     if args.reference_indexer_fp4_quantization:
         implementation += "_indexer_fp4_simulation"
     if args.reference_compressor_fp32:
         implementation += "_compressor_fp32"
     if args.reference_quantized_linear_fp32:
         implementation += "_quantized_linear_fp32"
+    if args.reference_quantized_linear_fp8:
+        implementation += "_quantized_linear_fp8"
+    if args.reference_routed_expert_ondemand_fp4:
+        implementation += "_routed_expert_ondemand_fp4"
+    if args.reference_routed_expert_ondemand_fp8:
+        implementation += "_routed_expert_ondemand_fp8"
     trace = make_trace(implementation)
 
     layers = model.model.layers
@@ -324,9 +464,6 @@ def main() -> None:
     def traced_sparse_attn(q, kv, attn_sink, topk_idxs, sm_scale=None):
         if rank == 0:
             trace["attention_topk"][active_layer["id"]] = topk_idxs.detach().to(torch.int32).cpu()
-        if args.reference_quantization or args.reference_attention_kv_quantization:
-            rope_dim = 64
-            kv = torch.cat((fake_quant_fp8(kv[..., :-rope_dim], block_size=64), kv[..., -rope_dim:]), dim=-1)
         return original_sparse_attn(q, kv, attn_sink, topk_idxs, sm_scale)
 
     modeling_module.sparse_attn_tilelang = traced_sparse_attn
