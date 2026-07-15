@@ -86,8 +86,13 @@ CACHE_DIR = os.path.expanduser(os.getenv("CACHE_DIR", os.path.join("~/.cache", "
 def _compute_seqlens(micro_batch: Dict[str, "torch.Tensor"]) -> List[int]:
     if "cu_seq_lens_q" in micro_batch:
         # packed micro batch
-        seqlens = valid_seqlens_from_cu_seqlens(micro_batch["cu_seq_lens_q"]).tolist()
+        tail_padding_length = micro_batch.get("tail_padding_length")
+        seqlens = valid_seqlens_from_cu_seqlens(
+            micro_batch["cu_seq_lens_q"],
+            tail_padding_length=int(tail_padding_length) if tail_padding_length is not None else None,
+        ).tolist()
         return seqlens
+
     elif "attention_mask" in micro_batch:
         # unpacked sample
         attention_mask = micro_batch["attention_mask"]

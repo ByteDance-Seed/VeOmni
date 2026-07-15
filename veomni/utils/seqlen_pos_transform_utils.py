@@ -106,12 +106,12 @@ def coalesce_tail_padding_cu_seqlens(cu_seqlens: torch.Tensor, tail_padding_leng
     Coalesce per-token tail padding segments into one sequence segment.
 
     ``position_ids == 0`` marks packed sequence boundaries. When a collator pads
-    the tail with zero position ids, the FlashAttention cu-seqlens intentionally
-    contains one synthetic 1-token segment per padding token. Some linear
-    attention kernels compile or allocate per segment, so forwarding those
-    padding-only boundaries can create many unnecessary kernel shapes. This
-    helper preserves the padded tensor length while presenting the tail padding
-    as one independent segment for linear-attention style kernels.
+    the tail with zero position ids, ``prepare_fa_kwargs_from_position_ids`` builds
+    one synthetic 1-token segment per padding token. FlashAttention on Ascend NPU
+    (``npu_fusion_attention``) SIGSEGVs on that uncoalesced form, and some linear
+    attention kernels also compile or allocate per segment. This helper preserves
+    the padded tensor length while presenting the tail padding as one independent
+    segment for both FlashAttention and linear-attention style kernels.
     """
     if tail_padding_length <= 0:
         return cu_seqlens
