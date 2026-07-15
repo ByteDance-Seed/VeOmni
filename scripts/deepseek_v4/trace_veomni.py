@@ -39,6 +39,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eager-mhc-output", type=Path)
     parser.add_argument("--same-input-indexer-reference", action="store_true")
     parser.add_argument("--reference-quantization", action="store_true")
+    parser.add_argument(
+        "--reference-attention-kv-quantization",
+        action="store_true",
+        help="Apply only the official FP8 E4M3/UE8M0 fake quantization to attention KV tensors",
+    )
     return parser.parse_args()
 
 
@@ -162,6 +167,8 @@ def main() -> None:
         f"veomni_moe={args.moe_backend}_indexer={args.indexer_backend}_attention={args.attention_backend}"
         f"_mhc={args.mhc_backend}"
     )
+    if args.reference_attention_kv_quantization:
+        implementation += "_attention_kv_fp8_simulation"
     trace = make_trace(implementation)
 
     layers = model.model.layers
@@ -243,7 +250,7 @@ def main() -> None:
     def traced_sparse_attn(q, kv, attn_sink, topk_idxs, sm_scale=None):
         if rank == 0:
             trace["attention_topk"][active_layer["id"]] = topk_idxs.detach().to(torch.int32).cpu()
-        if args.reference_quantization:
+        if args.reference_quantization or args.reference_attention_kv_quantization:
             rope_dim = 64
             kv = torch.cat((fake_quant_fp8(kv[..., :-rope_dim], block_size=64), kv[..., -rope_dim:]), dim=-1)
         return original_sparse_attn(q, kv, attn_sink, topk_idxs, sm_scale)
