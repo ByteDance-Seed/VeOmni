@@ -19,7 +19,7 @@ import os
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from functools import cached_property, wraps
-from typing import TYPE_CHECKING, Callable, Dict, Literal, Optional, Tuple
+from typing import TYPE_CHECKING, Callable, Dict, Literal, Optional, Tuple, Union
 
 from torch import distributed as dist
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
@@ -39,6 +39,10 @@ _PARALLEL_STATE: "ParallelState" = None
 
 # Cache of built parallel states keyed by full topology.
 _PARALLEL_STATE_CACHE: Dict[tuple, "ParallelState"] = {}
+
+# Named registry of parallel states (independent of the topology cache).
+# This round every trainer registers under ``"base"``; multi-module names later.
+_PARALLEL_STATE_REGISTRY: Dict[str, "ParallelState"] = {}
 
 
 def requires_mesh(fn: Callable) -> Callable:
@@ -415,6 +419,28 @@ class ParallelState:
         return self.cp_size > 1
 
 
+def clear_parallel_state() -> None:
+    """
+    Drop the ambient state, topology cache, and named registry.
+
+    Call after ``destroy_process_group()`` (or in test teardown) so a later
+    ``init_parallel_state`` with the same topology cannot reuse DeviceMesh /
+    process groups from a destroyed distributed session.
+    """
+    global _PARALLEL_STATE
+    _PARALLEL_STATE = None
+    _PARALLEL_STATE_CACHE.clear()
+    _PARALLEL_STATE_REGISTRY.clear()
+
+
+def get_parallel_state_by_name(name: str) -> "ParallelState":
+    """Look up a registered parallel state by module name."""
+    if name not in _PARALLEL_STATE_REGISTRY:
+        registered = sorted(_PARALLEL_STATE_REGISTRY)
+        raise ValueError(f"Parallel state {name!r} is not registered. Registered names: {registered}")
+    return _PARALLEL_STATE_REGISTRY[name]
+
+
 def init_parallel_state(
     dp_size: int = 1,
     dp_replicate_size: int = 1,
@@ -430,11 +456,23 @@ def init_parallel_state(
     extra_parallel_placement_innermost: Tuple[bool] = (False,),
     extra_parallel_names: Tuple[str] = ("ep",),
     async_enabled: Optional[bool] = False,
+    name: str = "base",
 ) -> "ParallelState":
     """
-    Initialize a parallel state, set it as the global state.
+    Initialize a parallel state, register it under ``name``, and set it as the
+    global state when none is current yet.
+
+    If ``name`` is already registered, log a warning and return the existing
+    state without building, caching, or overwriting anything.
     """
     global _PARALLEL_STATE
+
+    if name in _PARALLEL_STATE_REGISTRY:
+        logger.warning(
+            f"Parallel state {name!r} is already registered; returning the existing state without rebuilding."
+        )
+        return _PARALLEL_STATE_REGISTRY[name]
+
     if _PARALLEL_STATE is not None:
         logger.warning("Parallel state has already been initialized.")
 
@@ -486,6 +524,7 @@ def init_parallel_state(
         # never clear the cache), so a same-topology hit may find the global cleared.
         if _PARALLEL_STATE is None:
             _PARALLEL_STATE = cached_state
+        _PARALLEL_STATE_REGISTRY[name] = cached_state
         return cached_state
 
     logger.info_rank0(
@@ -505,13 +544,13 @@ def init_parallel_state(
 
     mesh_shape = []
     mesh_dim_names = []
-    for d, name in zip(
+    for d, dim_name in zip(
         [pp_size, dp_replicate_size, dp_shard_size, ulysses_size, cp_size, tp_size],
         ["pp", "dp_replicate", "dp_shard", "ulysses", "cp", "tp"],
     ):
-        if d > 1 or name in ["dp_shard"]:
+        if d > 1 or dim_name in ["dp_shard"]:
             mesh_shape.append(d)
-            mesh_dim_names.append(name)
+            mesh_dim_names.append(dim_name)
 
     device_mesh = init_device_mesh(
         device_type=device_type,
@@ -613,6 +652,7 @@ def init_parallel_state(
         _PARALLEL_STATE = parallel_state
 
     _PARALLEL_STATE_CACHE[cache_key] = parallel_state
+    _PARALLEL_STATE_REGISTRY[name] = parallel_state
     return parallel_state
 
 
@@ -632,14 +672,17 @@ def set_parallel_state(parallel_state: "ParallelState") -> Optional["ParallelSta
 
 
 @contextmanager
-def use_parallel_state(parallel_state: "ParallelState"):
+def use_parallel_state(parallel_state: Union[str, "ParallelState"]):
     """
     Temporarily make ``parallel_state`` the global parallel state, restoring on exit.
 
-    The SP / DP / CP group getters resolve from the current state, so a forward
-    run inside this scope uses ``parallel_state``'s own groups — even when
-    sibling Omni modules use a different SP size.
+    ``parallel_state`` may be a registered module name (``str``) or a
+    ``ParallelState`` object. The SP / DP / CP group getters resolve from the
+    current state, so a forward run inside this scope uses that state's own
+    groups — even when sibling Omni modules use a different SP size.
     """
+    if isinstance(parallel_state, str):
+        parallel_state = get_parallel_state_by_name(parallel_state)
     old = set_parallel_state(parallel_state)
     try:
         yield

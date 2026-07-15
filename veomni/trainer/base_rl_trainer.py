@@ -42,7 +42,7 @@ class BaseRLTrainer(BaseTrainer):
         # ``super().__init__`` builds under its own ``use_parallel_state`` scope
         # and exits it; the collators built here also read the current
         # ParallelState, so re-enter this trainer's state for them.
-        with use_parallel_state(self.parallel_state):
+        with use_parallel_state("base"):
             self._build_preforward_postforward()
 
     # post init preforward and postforward hooks

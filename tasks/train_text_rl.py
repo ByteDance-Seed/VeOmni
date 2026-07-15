@@ -14,9 +14,10 @@ class TextRLTrainer(TextTrainer):
         self.base.args = args
 
         self.base._setup()
+        self.base.register_parallel_state("base")
         # All build steps read the current ParallelState via ``get_parallel_state()``,
         # so scope the whole build under this trainer's own state (see BaseTrainer).
-        with use_parallel_state(self.base.parallel_state):
+        with use_parallel_state("base"):
             self.base._build_model()
             self.base._freeze_model_module()
 

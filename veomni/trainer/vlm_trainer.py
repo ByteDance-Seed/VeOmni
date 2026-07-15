@@ -104,13 +104,14 @@ class VLMTrainer:
         self.base.args = args
 
         self.base._setup()
+        self.base.register_parallel_state("base")
 
         # All build steps read the current ParallelState via ``get_parallel_state()``
         # (meta-init, FSDP2/EP wrap + weight load, optimizer, SP data pipeline), so
         # scope the whole build under this trainer's own state. No-op for the
         # single-model case; keeps each module building over its own mesh once
         # multiple modules build separately.
-        with use_parallel_state(self.base.parallel_state):
+        with use_parallel_state("base"):
             # rewrite build model to support data balancing
             self._build_model()
 
@@ -315,8 +316,9 @@ class VLMTrainer:
             for k, v in loss_dict.items():
                 total_loss_dict[k] += v.item()
 
-        # Gradient clipping
-        grad_norm = veomni_clip_grad_norm(self.base.model, args.train.optimizer.max_grad_norm)
+        # Gradient clipping (reads FSDP/EP groups from current ParallelState)
+        with use_parallel_state("base"):
+            grad_norm = veomni_clip_grad_norm(self.base.model, args.train.optimizer.max_grad_norm)
 
         # Optimizer and scheduler step
         self.base.optimizer.step()
@@ -350,11 +352,7 @@ class VLMTrainer:
 
             for _ in range(self.base.start_step, args.train_steps):
                 try:
-                    # Scope the whole optimize step (fwd/bwd, grad clip, optimizer)
-                    # to this model's parallel state so every group getter resolves
-                    # from its own device mesh.
-                    with use_parallel_state(self.base.parallel_state):
-                        self.train_step(self.base.data_iterator)
+                    self.train_step(self.base.data_iterator)
                 except StopIteration:
                     logger.info(f"epoch:{epoch} Dataloader finished with drop_last {args.data.dataloader.drop_last}")
                     break
