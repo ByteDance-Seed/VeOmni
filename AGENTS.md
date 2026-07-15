@@ -95,6 +95,8 @@ Skills follow the [Agent Skills](https://agentskills.io) open standard. Each ski
 | Add new op/kernel | `/veomni-new-op` |
 | Update dependencies (uv) | `/veomni-uv-update` |
 | Performance profiling | `/veomni-profile` |
+| PR/MR draft maintenance | `/pr-draft-maintainer` |
+| Patch/apply-to-PR packaging | `/veomni-patch-to-pr` |
 
 ### Quick Decision Guide
 
@@ -105,3 +107,5 @@ Skills follow the [Agent Skills](https://agentskills.io) open standard. Each ski
 - **"Add a new capability" / "refactor" / "clean up"** → `/veomni-develop`
 - **"Update package X" / "bump uv" / "upgrade torch"** → `/veomni-uv-update`
 - **"Analyze this trace" / "why is training slow" / "profile" / "MFU"** → `/veomni-profile`
+- **"Update PR description" / "sync PR draft" / "add benchmark results to PR"** → `/pr-draft-maintainer`
+- **"Apply this diff" / "write a PR from this report" / "push this patch"** → `/veomni-patch-to-pr`

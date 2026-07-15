@@ -1,0 +1,4 @@
+interface:
+  display_name: "PR Draft Maintainer"
+  short_description: "Maintain PR descriptions and local drafts"
+  default_prompt: "Use $pr-draft-maintainer to update a pull request description from test results, reviewer feedback, or a report."

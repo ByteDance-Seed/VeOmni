@@ -1,0 +1,4 @@
+interface:
+  display_name: "VeOmni Patch to PR"
+  short_description: "Apply an external patch and turn it into a clean PR"
+  default_prompt: "Use $veomni-patch-to-pr to apply a diff/report bundle, clean it up, create a branch, and open or update a VeOmni PR."
