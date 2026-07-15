@@ -121,17 +121,16 @@ class TokenizerTemplate(ChatTemplate):
                 )
 
             rewritten_positions = [index for index in range(previous_length) if input_ids[index] != current_ids[index]]
-            is_gpt_oss_terminal_rewrite = False
+            is_safe_terminal_rewrite = False
             if rewritten_positions == [previous_length - 1] and current_length > previous_length:
-                rewritten_tokens = self.tokenizer.convert_ids_to_tokens(
-                    [input_ids[-1], current_ids[previous_length - 1], current_ids[previous_length]]
-                )
-                is_gpt_oss_terminal_rewrite = rewritten_tokens == ["<|return|>", "<|end|>", "<|start|>"]
+                # A substitution is safe only when the old terminal was not
+                # shifted into the appended suffix, which would be an insertion.
+                is_safe_terminal_rewrite = input_ids[-1] not in current_ids[previous_length:]
 
-            if rewritten_positions and not is_gpt_oss_terminal_rewrite:
+            if rewritten_positions and not is_safe_terminal_rewrite:
                 raise ValueError(
                     "The tokenizer chat template structurally rewrote an earlier conversation prefix; "
-                    "only the GPT-OSS terminal-token substitution is supported."
+                    "only terminal-token substitutions are supported."
                 )
 
             # Native templates may rewrite an earlier terminal token as the

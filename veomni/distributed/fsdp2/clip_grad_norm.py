@@ -259,8 +259,13 @@ def _local_pth_sum(params: List[torch.nn.Parameter], p: float) -> torch.Tensor:
             # ``dtype`` controls accumulation inside the reduction kernel. In
             # contrast, ``g.to(float32)`` creates a full-size temporary, which
             # can exceed the remaining VRAM for multi-billion-element experts.
-            reduction_dtype = torch.float64 if g.dtype == torch.float64 else torch.float32
-            norm = torch.linalg.vector_norm(g, ord=p, dtype=reduction_dtype)
+            if g.dtype in (torch.float16, torch.bfloat16, torch.float32):
+                norm = torch.linalg.vector_norm(g, ord=p, dtype=torch.float32)
+            else:
+                # Preserve the previous implementation's behavior for wider
+                # or uncommon dtypes. The memory-sensitive training dtypes
+                # above use in-kernel FP32 accumulation without this copy.
+                norm = torch.linalg.vector_norm(g.to(torch.float32), ord=p)
             res = res + norm.pow(p).to(device=reduce_device, dtype=torch.float32)
     return res
 

@@ -14,10 +14,6 @@ class _PrefixStableTokenizer:
             input_ids.extend([role_ids[message["role"]], *message["content"]])
         return {"input_ids": input_ids}
 
-    def convert_ids_to_tokens(self, token_ids):
-        token_names = {2: "<|start|>", 50: "<|end|>", 51: "<|return|>"}
-        return [token_names.get(token_id, str(token_id)) for token_id in token_ids]
-
 
 def test_tokenizer_template_masks_non_assistant_turns_and_truncates():
     template = TokenizerTemplate(_PrefixStableTokenizer())
@@ -35,8 +31,8 @@ def test_tokenizer_template_masks_non_assistant_turns_and_truncates():
     }
 
 
-def test_tokenizer_template_supports_gpt_oss_terminal_token_rewrite():
-    class GptOssStyleTokenizer(_PrefixStableTokenizer):
+def test_tokenizer_template_supports_terminal_token_rewrite():
+    class TerminalRewritingTokenizer(_PrefixStableTokenizer):
         def apply_chat_template(self, messages, **kwargs):
             encoded = super().apply_chat_template(messages, **kwargs)
             # GPT-OSS renders a terminal assistant turn with <|return|>, then
@@ -48,7 +44,7 @@ def test_tokenizer_template_supports_gpt_oss_terminal_token_rewrite():
                 encoded["input_ids"][-1] = 51
             return encoded
 
-    template = TokenizerTemplate(GptOssStyleTokenizer())
+    template = TokenizerTemplate(TerminalRewritingTokenizer())
     encoded = template.encode_messages(
         [
             {"role": "user", "content": [10]},
@@ -83,7 +79,8 @@ def test_tokenizer_template_rejects_structural_prefix_rewrite():
         )
 
 
-def test_tokenizer_template_rejects_insertion_at_terminal_boundary():
+@pytest.mark.parametrize("inserted_tokens", [[], [77]])
+def test_tokenizer_template_rejects_insertion_at_terminal_boundary(inserted_tokens):
     class BoundaryInsertionTokenizer(_PrefixStableTokenizer):
         def apply_chat_template(self, messages, **kwargs):
             if len(messages) == 1:
@@ -91,7 +88,7 @@ def test_tokenizer_template_rejects_insertion_at_terminal_boundary():
             # An inserted <|end|> can look like a terminal replacement when
             # only absolute positions are compared, but the old terminal is
             # displaced instead of replaced.
-            return {"input_ids": [99, 3, 50, 51, 2, 30]}
+            return {"input_ids": [99, 3, 50, *inserted_tokens, 51, 2, 30]}
 
     template = TokenizerTemplate(BoundaryInsertionTokenizer())
 

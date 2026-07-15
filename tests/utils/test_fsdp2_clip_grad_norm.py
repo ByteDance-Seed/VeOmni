@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from veomni.distributed.fsdp2.clip_grad_norm import _fsdp_grad_norm_reduce_groups, _local_pth_sum
@@ -73,7 +74,7 @@ def test_local_pth_sum_skips_missing_grads_and_accumulates_in_fp32():
     assert torch.equal(actual.cpu(), torch.tensor(169.0))
 
 
-def test_local_pth_sum_does_not_materialize_fp32_gradients():
+def test_local_pth_sum_accumulates_bfloat16_gradients_in_fp32():
     p1 = torch.nn.Parameter(torch.tensor([1.0, -2.0], dtype=torch.bfloat16))
     p2 = torch.nn.Parameter(torch.tensor([3.0], dtype=torch.bfloat16))
     p1.grad = torch.tensor([3.0, 4.0], dtype=torch.bfloat16)
@@ -93,3 +94,20 @@ def test_local_pth_sum_supports_float64_gradients():
 
     assert actual.dtype == torch.float32
     assert torch.equal(actual.cpu(), torch.tensor(25.0))
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32, torch.float64])
+@pytest.mark.parametrize("p", [1.0, 2.0, 3.5])
+def test_local_pth_sum_matches_previous_fp32_conversion(dtype, p):
+    params = [
+        torch.nn.Parameter(torch.zeros(4, dtype=dtype)),
+        torch.nn.Parameter(torch.zeros(3, dtype=dtype)),
+    ]
+    params[0].grad = torch.tensor([0.25, -1.5, 2.0, -0.75], dtype=dtype)
+    params[1].grad = torch.tensor([3.0, -0.5, 1.25], dtype=dtype)
+
+    actual = _local_pth_sum(params, p)
+    expected = sum(torch.linalg.vector_norm(param.grad.to(torch.float32), ord=p).pow(p) for param in params)
+
+    assert actual.dtype == torch.float32
+    torch.testing.assert_close(actual.cpu(), expected.cpu())
