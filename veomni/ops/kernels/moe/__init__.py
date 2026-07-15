@@ -68,7 +68,8 @@ def apply_veomni_fused_moe_patch(fused_moe_kernel: str = "triton") -> None:
         fused_moe_kernel: Which fused MoE kernel to activate. OSS values:
             ``"triton"`` (Triton group-gemm, GPU, SM70+),
             ``"quack"`` (Quack CUTLASS/CuTe, GPU, SM90+),
-            ``"npu"`` (NPU group-gemm, requires torch_npu).
+            ``"npu"`` (NPU group-gemm with alltoall dispatch, requires torch_npu),
+            ``"npu_allgather"`` (NPU group-gemm with allgather dispatch, requires torch_npu).
             The kernel must match the hardware; mismatches raise here rather
             than silently falling back to a different backend.
 
@@ -87,6 +88,15 @@ def apply_veomni_fused_moe_patch(fused_moe_kernel: str = "triton") -> None:
         from .npu_group_gemm import npu_fused_moe_forward
 
         _fused_moe_forward = npu_fused_moe_forward
+    elif fused_moe_kernel == "npu_allgather":
+        if not is_torch_npu_available():
+            raise RuntimeError(
+                "fused_moe_kernel='npu_allgather' requires torch_npu and an NPU device. "
+                "On GPU, use 'triton' or 'quack' instead."
+            )
+        from .npu_group_gemm import npu_allgather_fused_moe_forward
+
+        _fused_moe_forward = npu_allgather_fused_moe_forward
     elif fused_moe_kernel == "quack":
         if is_torch_npu_available():
             raise RuntimeError("fused_moe_kernel='quack' is GPU-only. Use 'npu' on NPU devices.")
@@ -107,7 +117,10 @@ def apply_veomni_fused_moe_patch(fused_moe_kernel: str = "triton") -> None:
 
         _fused_moe_forward = group_gemm_fused_moe_forward
     else:
-        raise ValueError(f"Invalid fused_moe_kernel: {fused_moe_kernel!r}. Expected one of: 'triton', 'quack', 'npu'.")
+        raise ValueError(
+            f"Invalid fused_moe_kernel: {fused_moe_kernel!r}. "
+            "Expected one of: 'triton', 'quack', 'npu', 'npu_allgather'."
+        )
 
     # Bind the LoRA-aware fused MoE kernels (owned by ``veomni.lora.ops``) to
     # match the base backend just selected. Whether a LoRA kernel exists is a
@@ -249,5 +262,23 @@ KERNEL_REGISTRY.register(
         factory=_npu_kernel_factory,
         hardware=HardwareRequirement(device_type="npu"),
         description="NPU group-gemm fused MoE forward",
+    )
+)
+
+
+def _npu_allgather_kernel_factory():
+    from .npu_group_gemm import npu_allgather_fused_moe_forward
+
+    return _make_moe_experts_adapter(npu_allgather_fused_moe_forward)
+
+
+KERNEL_REGISTRY.register(
+    KernelSpec(
+        name="npu_allgather",
+        op_name="moe_experts",
+        variant="standard",
+        factory=_npu_allgather_kernel_factory,
+        hardware=HardwareRequirement(device_type="npu"),
+        description="NPU group-gemm fused MoE forward with allgather dispatch",
     )
 )

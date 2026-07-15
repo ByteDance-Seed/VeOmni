@@ -868,7 +868,7 @@ _NPU_ALLOWED: Dict[str, frozenset] = {
     "swiglu_mlp_implementation": frozenset(),
     "load_balancing_loss_implementation": frozenset({"triton"}),
     "cross_entropy_loss_implementation": frozenset({"chunk_loss", "npu"}),
-    "moe_implementation": frozenset({"fused_npu"}),
+    "moe_implementation": frozenset({"fused_npu", "fused_npu_allgather"}),
 }
 
 _NPU_REQUIRED: Dict[str, frozenset] = {
@@ -876,7 +876,7 @@ _NPU_REQUIRED: Dict[str, frozenset] = {
     "rotary_pos_emb_implementation": frozenset({"npu"}),
     "rotary_pos_emb_vision_implementation": frozenset({"npu"}),
     "cross_entropy_loss_implementation": frozenset({"npu"}),
-    "moe_implementation": frozenset({"fused_npu"}),
+    "moe_implementation": frozenset({"fused_npu", "fused_npu_allgather"}),
 }
 
 _NPU_DEFAULT_FALLBACK: Dict[str, str] = {
@@ -937,7 +937,8 @@ class OpsImplementationConfig:
         default="fused_triton",
         metadata={
             "help": "MoE experts forward. 'fused_triton' (default, GPU SM70+) | "
-            "'fused_quack' (GPU SM90+) | 'fused_npu' (NPU) | 'eager'. "
+            "'fused_quack' (GPU SM90+) | 'fused_npu' (NPU, alltoall dispatch) | "
+            "'fused_npu_allgather' (NPU, allgather dispatch) | 'eager'. "
             "Hardware mismatch raises at config validation. Legacy 'fused' "
             "auto-resolves to fused_quack/fused_npu with a deprecation warning."
         },
