@@ -799,7 +799,12 @@ def parallelize_model_ddp(
             fqn_to_index_mapping=kwargs.get("fqn_to_index_mapping"),
         )
 
-    return DDP(model, device_ids=[parallel_state.local_rank], process_group=parallel_state.dp_group)
+    return DDP(
+        model,
+        device_ids=[parallel_state.local_rank],
+        process_group=parallel_state.dp_group,
+        find_unused_parameters=True,
+    )
 
 
 def build_parallelize_model(

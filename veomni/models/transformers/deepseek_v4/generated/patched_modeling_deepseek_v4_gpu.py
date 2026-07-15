@@ -1000,7 +1000,8 @@ class DeepseekV4MLP(nn.Module):
 #    MoE kernel.
 # 2. OpSlot guard for fused-MoE: when ``veomni_moe_experts_forward`` is
 #    bound to a non-eager kernel, call ``fused_moe_forward`` with stacked
-#    ``gate_up_proj``. Otherwise fall through to the eager loop.
+#    ``gate_up_proj`` and pass ``swiglu_limit`` explicitly. Otherwise fall
+#    through to the eager loop.
 # 3. Preserve V4's gpt-oss-style ``swiglu_limit`` clamp on gate / up
 #    pre-activations (paper §2.1 — required for V4's training stability).
 # Layout matches v5 upstream (direct, no transpose):
@@ -1038,6 +1039,7 @@ class DeepseekV4Experts(nn.Module):
                 fc1_2_weight=None,
                 fc2_weight=self.down_proj,
                 fc1_1_2_weight=self.gate_up_proj,
+                swiglu_limit=self.limit,
             )
         # --- Patch.2 ---
 

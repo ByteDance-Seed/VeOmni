@@ -91,7 +91,7 @@
 
 
  @use_kernel_forward_from_hub("RMSNorm")
-@@ -975,11 +987,29 @@
+@@ -975,11 +987,30 @@
          return down_proj
 
 
@@ -109,7 +109,8 @@
 +#    MoE kernel.
 +# 2. OpSlot guard for fused-MoE: when ``veomni_moe_experts_forward`` is
 +#    bound to a non-eager kernel, call ``fused_moe_forward`` with stacked
-+#    ``gate_up_proj``. Otherwise fall through to the eager loop.
++#    ``gate_up_proj`` and pass ``swiglu_limit`` explicitly. Otherwise fall
++#    through to the eager loop.
 +# 3. Preserve V4's gpt-oss-style ``swiglu_limit`` clamp on gate / up
 +#    pre-activations (paper §2.1 — required for V4's training stability).
 +# Layout matches v5 upstream (direct, no transpose):
@@ -123,7 +124,7 @@
          super().__init__()
          self.num_experts = config.num_local_experts
          self.hidden_dim = config.hidden_size
-@@ -990,30 +1020,56 @@
+@@ -990,30 +1021,57 @@
          self.limit = config.swiglu_limit
 
      def forward(
@@ -147,6 +148,7 @@
 +                fc1_2_weight=None,
 +                fc2_weight=self.down_proj,
 +                fc1_1_2_weight=self.gate_up_proj,
++                swiglu_limit=self.limit,
 +            )
 +        # --- Patch.2 ---
 +
@@ -193,7 +195,7 @@
 
 
  class DeepseekV4TopKRouter(nn.Module):
-@@ -1392,6 +1448,12 @@
+@@ -1392,6 +1450,12 @@
      return overall_loss * num_experts
 
 
@@ -206,7 +208,7 @@
  @auto_docstring
  class DeepseekV4ForCausalLM(DeepseekV4PreTrainedModel, GenerationMixin):
      _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
-@@ -1410,49 +1472,36 @@
+@@ -1410,49 +1474,36 @@
          # Initialize weights and apply final processing
          self.post_init()
 
@@ -276,7 +278,7 @@
          outputs: MoeModelOutputWithPast = self.model(
              input_ids=input_ids,
              attention_mask=attention_mask,
-@@ -1465,26 +1514,64 @@
+@@ -1465,26 +1516,64 @@
          )
 
          hidden_states = outputs.last_hidden_state
@@ -355,7 +357,7 @@
              loss=loss,
              aux_loss=aux_loss,
              logits=logits,
-@@ -1492,7 +1579,17 @@
+@@ -1492,7 +1581,17 @@
              hidden_states=outputs.hidden_states,
              attentions=outputs.attentions,
              router_logits=outputs.router_logits,

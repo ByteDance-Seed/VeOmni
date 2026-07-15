@@ -203,10 +203,17 @@ def _parse_ep_slices(stdout: str) -> tuple[set, dict[str, tuple[int, int, int]]]
 
 
 def _load_adapter(adapter_dir: str) -> dict[str, torch.Tensor]:
-    """Load the consolidated ``adapter_model.bin`` written by HFLoraCkptCallback."""
-    path = os.path.join(adapter_dir, "adapter_model.bin")
-    assert os.path.isfile(path), f"Missing adapter_model.bin at {path}"
-    return torch.load(path, map_location="cpu", weights_only=False)
+    """Load the consolidated ``adapter_model.safetensors`` written by HFLoraCkptCallback.
+
+    ``save_lora_adapter_with_dcp`` consolidates on rank 0 with
+    ``safe_serialization=True``, so the adapter is always safetensors
+    (sliceable per-rank by the ep_sharded streaming loader).
+    """
+    from safetensors.torch import load_file
+
+    path = os.path.join(adapter_dir, "adapter_model.safetensors")
+    assert os.path.isfile(path), f"Missing adapter_model.safetensors at {path}"
+    return load_file(path, device="cpu")
 
 
 def _make_seeder_yaml(base_yaml: str, dest: str, *, max_steps: int, dcp_save_steps: int) -> str:
@@ -393,7 +400,7 @@ def test_ep2_trainer_integration(tmp_path, toy_base_dir, mode):
     * for ``mode="shared"``, NO LoRA tensor shows up in the EP slice
       log (proves the per-expert extension is correctly gated to
       Independent mode and shared LoRA stays replicated);
-    * the saved ``adapter_model.bin`` has the same key set and the
+    * the saved ``adapter_model.safetensors`` has the same key set and the
       same per-tensor shapes as the EP=1 reference (proves DCP
       gathered the EP shards before the PEFT save helper consumed
       them; per-expert tensors come back as ``[16, ...]`` not
@@ -552,7 +559,7 @@ def test_moe_lora_ep_save_load_parallel_align(tmp_path, toy_base_dir, mode):
          * ``HFLoraCkptCallback`` at step ``_ALIGN_MAX_STEPS`` calls
            ``save_lora_adapter_with_dcp`` which uses DCP to gather
            the EP shards back into the full ``[E, r, H]`` tensor on
-           rank 0 before writing ``adapter_model.bin``.
+           rank 0 before writing ``adapter_model.safetensors``.
          * ``CheckpointerCallback`` at steps
            ``_DCP_SAVE_STEP`` (intermediate) and
            ``_ALIGN_MAX_STEPS`` writes sharded DCP shards
@@ -663,7 +670,7 @@ def test_moe_lora_ep_save_load_parallel_align(tmp_path, toy_base_dir, mode):
     )
     seeder_adapter = _writer_adapter_path(seeder_dir, save_step=_ALIGN_MAX_STEPS)
     seeder_dcp = os.path.join(seeder_dir, "checkpoints", f"global_step_{_DCP_SAVE_STEP}")
-    assert os.path.isfile(os.path.join(seeder_adapter, "adapter_model.bin")), (
+    assert os.path.isfile(os.path.join(seeder_adapter, "adapter_model.safetensors")), (
         f"{mode}: seeder failed to write adapter at {seeder_adapter}"
     )
     assert os.path.isdir(seeder_dcp), f"{mode}: seeder failed to write DCP at {seeder_dcp}"

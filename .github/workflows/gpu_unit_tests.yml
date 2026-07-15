@@ -148,6 +148,11 @@ jobs:
       - name: Run fsdp2 all ranks or rank0 load model weights
         run: |
           uv run --frozen pytest -s -x tests/utils/test_rank0_load_and_broadcast_weights.py
+      - name: Run MoE ep_sharded_stream_load matrix (non-PEFT)
+        # Fake EP MoE model: {plain, rank0 broadcast, ep_sharded} x {merged,
+        # per-expert} bit-identical load + the per-expert->fused streaming bail.
+        run: |
+          uv run --frozen pytest -s -x tests/utils/test_moe_ep_sharded_load_matrix.py
       - name: Run checkpoint callback unit tests
         run: |
           uv run --frozen pytest -s -x tests/checkpoints/test_checkpoint_callback.py
@@ -184,6 +189,8 @@ jobs:
         #     bit-exact LoRA reload, also covers linear LoRA on q_proj/v_proj since the
         #     yaml enables both lora_modules and target_parameters)
         #   - moe_lora_ep2: EP=1 vs EP=2 trainer-driven integration + per-step loss/grad_norm alignment
+        #   - moe_lora_ep_sharded_stream_load: PEFT ep_sharded_stream_load vs broadcast, bit-exact
+        #     post-load LoRA weights (independent + shared) on a fused-base Qwen3-MoE at EP=2
         # Order: cheap unit tests first to fail fast, trainer/ep2 last (multi-subprocess, ~5-10 min each).
         run: |
           uv run --frozen pytest -s -x tests/lora/test_target_mapping.py
@@ -192,3 +199,4 @@ jobs:
           uv run --frozen pytest -s -x tests/lora/test_moe_lora_fused.py
           uv run --frozen pytest -s -x tests/lora/test_moe_lora_trainer.py
           uv run --frozen pytest -s -x tests/lora/test_moe_lora_ep2.py
+          uv run --frozen pytest -s -x tests/lora/test_moe_lora_ep_sharded_stream_load.py

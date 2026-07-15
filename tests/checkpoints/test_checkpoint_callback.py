@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
+import torch
 
 from veomni.trainer.callbacks.base import TrainerState
 from veomni.trainer.callbacks.checkpoint_callback import (
@@ -49,6 +50,8 @@ def _make_mock_trainer(save_path="/tmp/test_ckpt", save_async=False):
     trainer.lr_scheduler = MagicMock()
     trainer.train_dataloader = MagicMock()
     trainer.environ_meter = MagicMock()
+    trainer.channel_loss_callback = MagicMock()
+    trainer.channel_loss_callback.state_dict.return_value = {}
     trainer.checkpointer = MagicMock()
     trainer.checkpointer.save_future = None
     trainer.model_assets = []
@@ -82,6 +85,44 @@ class TestCheckpointerCallbackLastSavedStep:
         with pytest.raises(RuntimeError, match="disk full"):
             cb._save_checkpoint(state)
         assert cb._last_saved_step == -1
+
+    def test_save_includes_channel_loss_callback_state(self, mock_helper, mock_dist, mock_build_ckpt):
+        trainer = _make_mock_trainer()
+        trainer.channel_loss_callback.state_dict.return_value = {
+            "source_registry": [(1, "train/a")],
+        }
+        mock_build_ckpt.return_value = trainer.checkpointer
+        cb = CheckpointerCallback(trainer)
+
+        cb._save_checkpoint(TrainerState(global_step=10))
+
+        checkpoint_state = trainer.checkpointer.save.call_args.args[1]
+        assert checkpoint_state["extra_state"]["channel_loss_callback"] == {"source_registry": [(1, "train/a")]}
+
+    def test_load_restores_channel_loss_callback_state(self, mock_helper, mock_dist, mock_build_ckpt):
+        trainer = _make_mock_trainer()
+        trainer.args.train.checkpoint.load_path = "/tmp/test_ckpt/global_step_7"
+        trainer.args.train_steps = 100
+        trainer.state = TrainerState()
+        mock_build_ckpt.return_value = trainer.checkpointer
+        callback_state = {"source_registry": [(1, "train/a")]}
+
+        def load_checkpoint(path, state, **kwargs):
+            state["extra_state"] = {
+                "global_step": 7,
+                "lr_scheduler": {},
+                "train_dataloader": None,
+                "environ_meter": {},
+                "channel_loss_callback": callback_state,
+                "torch_rng_state": torch.get_rng_state(),
+            }
+
+        trainer.checkpointer.load.side_effect = load_checkpoint
+        cb = CheckpointerCallback(trainer)
+
+        cb._load_checkpoint()
+
+        trainer.channel_loss_callback.load_state_dict.assert_called_once_with(callback_state)
 
     def test_epoch_end_retries_after_failed_save(self, mock_helper, mock_dist, mock_build_ckpt):
         """If save fails at step_end, epoch_end should still attempt to save (not skip)."""

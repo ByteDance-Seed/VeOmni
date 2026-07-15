@@ -68,20 +68,19 @@ The following table shows the supported software versions for VeOmni when runnin
 
 VeOmni supports a wide range of models on Ascend NPUs, including large language models, multimodal models, and diffusion models. Below is a comprehensive list of supported models with their features:
 
-| Model                | Model Size       | Support | FSDP1 | FSDP2 | EP | SP | Note                                           |
-|----------------------|------------------|---------|-------|-------|----|----|------------------------------------------------|
-| [Qwen3](../examples/qwen3.md) | 8B              | ✅       |       | ✅     |    | ✅   |
-|                      | 30B               | ✅       |       | ✅     | ✅    | ✅   |
-| [Qwen3.5](../examples/qwen3.md) | 9B    |          |         | ✅    |      |✅    | supporting   |
-|                      | 35B-A3B              |         |       | ✅     |✅    |✅    |  supporting                                   |
-| [Qwen3-VL](../examples/qwen3_vl.md) | 8B               | ✅       |       | ✅     |    | ✅  |                               |
-|                      | 30B              | ✅       |       | ✅     | ✅  | ✅  |                                                |
-| [Wan2.1](../examples/wan2.1.md)    | 1.3B              | ✅       | ✅     |       |    | ✅  | prototype                              |
-| [Qwen3Omni](../examples/qwen3_omni_moe.md)    | 30B              | ✅       |   | ✅        |    | ✅  | prototype                              |
+| Model | Model Size | Support | FSDP2 | EP | SP | Note |
+|---|---|---|---|---|---|---|
+| [Qwen3](../examples/qwen3.md) | 8B | ✅ | ✅ | | ✅ | |
+| | 30B | ✅ | ✅ | ✅ | ✅ | |
+| [Qwen3.5](../examples/qwen3_5.md) | 9B | ✅ | ✅ | | ✅ | |
+| | 35B-A3B | ✅ | ✅ | ✅ | ✅ | |
+| [Qwen3-VL](../examples/qwen3_vl.md) | 8B | ✅ | ✅ | | ✅ | |
+| | 30B | ✅ | ✅ | ✅ | ✅ | |
+| [Wan2.1](../examples/wan2.1.md) | 1.3B | ✅ | ✅ | | ✅ | Prototype |
+| [Qwen3-Omni](../examples/qwen3_omni_moe.md) | 30B | ✅ | ✅ | | ✅ | Prototype |
 
 **Legend:**
-- **FSDP1**: Fully Sharded Data Parallel version 1
-- **FSDP2**: Fully Sharded Data Parallel version 2 (recommended)
+- **FSDP2**: PyTorch composable Fully Sharded Data Parallel, the only FSDP backend supported by VeOmni
 - **EP**: Expert Parallel - for MoE models
 - **SP**: Sequence Parallel - enables longer sequence training
 

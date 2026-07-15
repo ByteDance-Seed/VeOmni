@@ -141,7 +141,7 @@ NPROC_PER_NODE=4 bash train.sh tasks/train_dit.py configs/dit/wan2.1_I2V_1.3B_lo
 
 ## 4. Training Configuration
 
-The default LoRA config (`configs/dit_new/wan_lora.yaml`) targets the attention and feed-forward projections:
+The default LoRA config (`configs/dit/wan2.1_I2V_1.3B_lora.yaml`) targets the attention and feed-forward projections:
 
 ```yaml
 model:

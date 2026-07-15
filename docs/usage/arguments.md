@@ -64,6 +64,7 @@ Training loop, optimizer, parallelism, checkpointing, profiling, and logging.
     * `OptimizerConfig` — `train.optimizer.*`
     * `WandbConfig` — `train.wandb.*`
     * `ProfileConfig` — `train.profile.*`
+    * `ChannelLossConfig` — `train.channel_loss.*`
     * `GradientCheckpointingConfig` — `train.gradient_checkpointing.*`
     * `AcceleratorConfig` — `train.accelerator.*`
         * `FSDPConfig` — `train.accelerator.fsdp_config.*`
@@ -114,6 +115,7 @@ Root config — assembles `model`, `data`, and `train`.
 | --- | --- | --- | --- |
 | config_path | `Optional[str]` | `None` | Path to the model HuggingFace config (e.g. `config.json`). Defaults to `model_path`. |
 | model_path | `Optional[str]` | `None` | Path to the pre-trained model weights. If unset, random init is used. |
+| model_config | `Optional[Dict]` | `{}` | Values used to override the loaded foundation-model config. |
 | tokenizer_path | `Optional[str]` | `None` | Path to the tokenizer. Defaults to `config_path`. |
 | safetensor_idx_path | `Optional[str]` | `None` | Path to `model.safetensors.index.json`. |
 | foundation | `Dict[str, str]` | `{}` | Foundation model extra config. |
@@ -123,6 +125,7 @@ Root config — assembles `model`, `data`, and `train`.
 | output_encoder | `Literal["encoder", "decoder"]` | `"decoder"` | Whether to use the encoder or decoder to encode output images. |
 | encode_target | `bool` | `False` | Whether to encode training targets with decoder (diffusion only). |
 | basic_modules | `Optional[List[str]]` | `[]` | Additional modules beyond `_no_split_modules` to shard in FSDP. |
+| lora_config | `Optional[Dict]` | `{}` | Native VeOmni LoRA configuration. See the LoRA feature guide. |
 | ops_implementation | `OpsImplementationConfig` | — | Attention / MoE kernel configuration. |
 
 ### OpsImplementationConfig
@@ -151,10 +154,8 @@ NPU validation runs at two times:
   `causal_conv1d`, `chunk_gated_delta_rule`). Validating these at config
   parse would force every NPU user to override them even when training
   non-Qwen3.5 models, so the check fires only when Qwen3.5's patched
-  modeling is actually loaded. **Qwen3.5 GatedDeltaNet has no NPU kernel
-  today** — varlen training (`dyn_bsz=True`, the default) is not supported
-  on NPU; non-varlen training works only with all three fields pinned to
-  `"eager"`.
+  modeling is actually loaded. Qwen3.5 on NPU should select the `"npu"`
+  backend for these three operations.
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
@@ -164,10 +165,13 @@ NPU validation runs at two times:
 | rms_norm_implementation | `str` | `"liger_kernel"` | RMSNorm. Known values: `liger_kernel` (default, GPU only), `npu`, `triton` (DeepSeek-V3 only; GPU only), `eager`. |
 | swiglu_mlp_implementation | `str` | `"liger_kernel"` | SwiGLU MLP. Known values: `liger_kernel` (default, GPU only), `eager`. There is no NPU backend — NPU users must set this to `"eager"`. |
 | rotary_pos_emb_implementation | `str` | `"liger_kernel"` | Rotary pos emb. Known values: `liger_kernel` (default, GPU only), `npu`, `triton` (DeepSeek-V3 only; GPU only), `eager`. |
+| rotary_pos_emb_vision_implementation | `str` | `"eager"` | Vision rotary positional embedding. Known values: `eager`, `npu`. |
 | load_balancing_loss_implementation | `str` | `"triton"` | MoE load-balancing loss. `triton` (default) requires the `triton` Python package (or `triton-ascend` on NPU); raises at config validation time if the package is missing. `eager` is the pure-PyTorch reference. |
-| rms_norm_gated_implementation | `str` | `"fla"` | Gated RMSNorm (Qwen3.5 GatedDeltaNet `self.norm`). Known values: `eager`, `fla` (FLA `FusedRMSNormGated`, requires `flash-linear-attention`, GPU). No NPU backend — selecting any non-eager value on NPU raises at OpSlot bind time. |
-| causal_conv1d_implementation | `str` | `"fla"` | Varlen depthwise causal conv1d (Qwen3.5 GatedDeltaNet pre-mixer). Known values: `eager`, `fla` (FLA `causal_conv1d`, requires `flash-linear-attention`, GPU). `eager` raises at forward time for varlen training (no torch fallback handles `cu_seqlens`). No NPU backend. |
-| chunk_gated_delta_rule_implementation | `str` | `"fla"` | Chunk gated delta-rule kernel for Qwen3.5 linear attention. Known values: `eager`, `fla` (FLA `chunk_gated_delta_rule`, GPU), `flash_qla` (QwenLM FlashQLA, ships under the `gpu` extra, Hopper sm90 only). `eager` falls back to transformers' `torch_chunk_gated_delta_rule`, which raises at forward time for varlen training. No NPU backend. |
+| rms_norm_gated_implementation | `str` | `"fla"` | Gated RMSNorm (Qwen3.5 GatedDeltaNet `self.norm`). Known values: `eager`, `fla` (FLA `FusedRMSNormGated`, GPU), `npu`. |
+| causal_conv1d_implementation | `str` | `"fla"` | Varlen depthwise causal conv1d (Qwen3.5 GatedDeltaNet pre-mixer). Known values: `eager`, `fla` (GPU), `npu` (requires `triton-ascend`). `eager` does not support the varlen path. |
+| chunk_gated_delta_rule_implementation | `str` | `"fla"` | Chunk gated delta-rule kernel for Qwen3.5 linear attention. Known values: `eager`, `fla` (GPU), `flash_qla` (Hopper SM90), `npu` (requires `triton-ascend`). `eager` does not support varlen training. |
+| dsa_indexer_backend | `Literal["eager", "cudnn"]` | `"eager"` | DeepSeek sparse-attention top-k indexer backend. |
+| dsa_attention_backend | `Literal["eager", "flashmla_cudnn"]` | `"eager"` | DeepSeek sparse-attention backend. |
 
 ### DataArguments
 
@@ -201,6 +205,8 @@ NPU validation runs at two times:
 | prefetch_factor | `int` | `2` | Number of batches loaded in advance per worker. |
 | drop_last | `bool` | `True` | Whether to drop the last incomplete batch. |
 | pin_memory | `bool` | `True` | Whether to pin memory for the dataloader. |
+| worker_num_threads | `Optional[int]` | `None` | Number of PyTorch threads used by each DataLoader worker. |
+| use_background_prefetcher | `bool` | `False` | Enable background prefetching around the DataLoader. |
 
 ### TrainingArguments
 
@@ -230,9 +236,11 @@ NPU validation runs at two times:
 | eval_epochs | `int` | `1` | Epochs between evaluations. `0` to disable. |
 | seed | `int` | `42` | Random seed. |
 | max_steps | `Optional[int]` | `None` | Max training steps per epoch (debug only). |
+| moe_load_balance_monitor_interval | `int` | `0` | Log a globally reduced MoE expert-load heatmap every N steps. `0` disables monitoring. |
 | optimizer | `OptimizerConfig` | — | Optimizer and learning-rate schedule. |
 | wandb | `WandbConfig` | — | Weights & Biases logging. |
 | profile | `ProfileConfig` | — | Torch profiler settings. |
+| channel_loss | `ChannelLossConfig` | — | Detached per-channel causal-LM loss logging. |
 | gradient_checkpointing | `GradientCheckpointingConfig` | — | Gradient checkpointing settings. |
 | torch_compile | `TorchCompileConfig` | — | Per-block `torch.compile` settings. |
 | accelerator | `AcceleratorConfig` | — | Parallelism and distributed-training topology. |
@@ -256,7 +264,7 @@ NPU validation runs at two times:
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
-| type | `Literal["adamw", "anyprecision_adamw"]` | `"adamw"` | Optimizer type. |
+| type | `Literal["adamw", "anyprecision_adamw", "muon"]` | `"adamw"` | Optimizer type. `muon` builds Muon and AdamW parameter groups. |
 | lr | `float` | `5e-5` | Maximum / default learning rate. |
 | lr_min | `float` | `1e-7` | Minimum learning rate. |
 | lr_start | `float` | `0.0` | Starting learning rate for warmup. |
@@ -267,6 +275,15 @@ NPU validation runs at two times:
 | no_decay_modules | `List[str]` | `[]` | Modules excluded from weight decay (e.g. `RMSNorm`). |
 | no_decay_params | `List[str]` | `[]` | Parameters excluded from weight decay (e.g. `bias`). |
 | max_grad_norm | `float` | `1.0` | Gradient clipping norm. |
+| muon_lr | `float` | `2e-2` | Learning rate for Muon-managed 2-D hidden weights and 3-D expert stacks. |
+| muon_momentum | `float` | `0.95` | Momentum factor for Muon. |
+| muon_nesterov | `bool` | `True` | Enable Nesterov momentum for Muon. |
+| muon_weight_decay | `float` | `0.0` | Decoupled weight decay for Muon parameter groups. |
+| muon_ns_steps | `int` | `5` | Number of Newton–Schulz iterations. |
+| muon_ns_coefficients | `List[float]` | `[3.4445, -4.7750, 2.0315]` | Quintic Newton–Schulz polynomial coefficients. |
+| muon_eps | `float` | `1e-7` | Numerical-stability epsilon used in spectral-norm normalization. |
+| muon_adjust_lr_fn | `Literal["original", "match_rms_adamw"]` | `"match_rms_adamw"` | Per-matrix learning-rate adjustment strategy. |
+| muon_expert_zero_comm | `bool` | `False` | Use whole-expert `Shard(0)` when the FSDP+ExtraParallel topology permits zero-communication expert Muon updates. |
 
 ### WandbConfig
 
@@ -292,7 +309,42 @@ NPU validation runs at two times:
 | record_shapes | `bool` | `True` | Record input tensor shapes. |
 | profile_memory | `bool` | `True` | Record memory usage. |
 | with_stack | `bool` | `True` | Record stack traces. |
+| with_modules | `bool` | `False` | Record module hierarchy in profiler traces. |
 | rank0_only | `bool` | `True` | Profile rank 0 only. |
+
+### ChannelLossConfig
+
+`train.channel_loss.*` — Detached per-channel causal-LM loss logging.
+
+This is an observability-only side channel. It computes detached per-token CE
+from the model loss inputs, aggregates by packed-sequence source metadata, and
+adds metrics such as `channel_loss/<source-id>__<source>` to the normal step metrics. It does
+not change the returned training loss or gradients. Fused-loss backends may
+recompute the LM-head projection on sampled steps, so the default interval is
+10 steps; set `interval=1` for per-step metrics. DiT trainers and
+`data.data_type="classification"` are not supported because they do not optimize
+a causal-LM objective. SeedOmni's `Qwen3MoeFoundationModel` is also unsupported
+because its legacy forward bypasses the observable loss dispatch. `BaseRLTrainer`
+is unsupported because it packs source alignment metadata after the common step
+lifecycle. In DPO training, only the policy-model forward is observed; the
+reference-model forward is excluded, and the chosen/rejected segments both use
+their preference pair's source metadata. If distinct source names sanitize to
+the same metric key, the stable source-ID prefix keeps their time series
+distinct from the first emission.
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| enable | `bool` | `False` | Enable channel loss logging. |
+| interval | `int` | `10` | Compute and log channel loss every N optimizer steps. |
+| source_id_keys | `List[str]` | `["channel_id", "source_id", "dataset_id", "ds_idx"]` | Batch metadata keys to read as channel/source IDs. |
+| source_name_keys | `List[str]` | `["channel_name", "source_name", "dataset_name", "data_name"]` | Batch metadata keys to read as display names. |
+| extra_strip_keys | `List[str]` | `["cur_token_num"]` | Extra metadata keys removed before model forward. |
+| loss_metric_prefix | `str` | `"channel_loss"` | Prefix for average CE metrics. |
+| weighted_loss_metric_prefix | `str` | `"channel_loss_weighted"` | Prefix for loss-sum divided by all logged step tokens. |
+| token_count_metric_prefix | `str` | `"channel_tokens"` | Prefix for supervised token-count metrics. |
+| log_weighted_loss | `bool` | `True` | Log weighted loss metrics. |
+| log_token_count | `bool` | `True` | Log token-count metrics. |
+| strict | `bool` | `False` | Raise when source metadata is missing or cannot be aligned with packed segments; otherwise skip invalid batches. |
 
 ### GradientCheckpointingConfig
 
@@ -315,6 +367,9 @@ NPU validation runs at two times:
 | tp_size | `int` | `1` | Tensor parallel size. |
 | ep_size | `int` | `1` | Expert parallel size, should be fit into dp_shard group if HSDP enabled |
 | ep_outside | `bool` | `False` | Expert parallelism outside in EP-FSDP. |
+| extra_parallel_sizes | `List[int]` | `[]` | Sizes of additional parallel dimensions; EP is appended automatically. |
+| extra_parallel_placement_innermost | `List[bool]` | `[]` | Whether each additional parallel dimension is placed innermost relative to FSDP. |
+| extra_parallel_names | `List[str]` | `[]` | Names of additional parallel dimensions; `ep` is appended automatically. |
 | pp_size | `int` | `1` | Pipeline parallel size. |
 | ulysses_size | `int` | `1` | Ulysses sequence parallel size. |
 | enable_async | `bool` | `False` | Enable async Ulysses. |
