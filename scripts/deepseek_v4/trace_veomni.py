@@ -40,6 +40,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--official-trace", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--logprob-chunk-size", type=int, default=64)
+    parser.add_argument(
+        "--detail-layers",
+        type=int,
+        nargs="*",
+        default=(),
+        help="Store full intermediate tensors for the selected layer IDs",
+    )
+    parser.add_argument(
+        "--force-official-attention-inputs",
+        action="store_true",
+        help="Replace selected layers' normalized attention inputs with tensors from --official-trace",
+    )
     parser.add_argument("--moe-backend", choices=("eager", "fused_triton"), default="fused_triton")
     parser.add_argument("--indexer-backend", choices=("eager", "tilelang"), default="tilelang")
     parser.add_argument("--attention-backend", choices=("eager", "tilelang_sparse"), default="tilelang_sparse")
@@ -347,6 +359,8 @@ def main() -> None:
             print(f"enabled reference activation quantization on {quantized_linears} linear modules")
 
     official_trace = torch.load(args.official_trace, map_location="cpu", weights_only=True)
+    if args.force_official_attention_inputs and not args.detail_layers:
+        raise ValueError("--force-official-attention-inputs requires --detail-layers")
     input_ids = official_trace["input_ids"].to(device)
 
     def make_trace(implementation: str) -> dict[str, object]:
@@ -359,6 +373,7 @@ def main() -> None:
             "indexer_eager_same_input": {},
             "attention_topk": {},
             "hidden": {},
+            "details": {},
         }
 
     implementation = (
@@ -386,6 +401,20 @@ def main() -> None:
     trace = make_trace(implementation)
 
     layers = model.model.layers
+    if args.force_official_attention_inputs:
+        for layer_id in args.detail_layers:
+            official_attention_input = official_trace["details"][layer_id]["attn_input"].to(device)
+
+            def force_attention_input_hook(
+                _module,
+                inputs,
+                *,
+                official_attention_input=official_attention_input,
+            ):
+                return (official_attention_input, *inputs[1:])
+
+            layers[layer_id].self_attn.register_forward_pre_hook(force_attention_input_hook)
+
     if rank == 0:
         for layer_id, layer in enumerate(layers):
 
@@ -397,6 +426,51 @@ def main() -> None:
 
             layer.mlp.gate.register_forward_hook(gate_hook)
             layer.register_forward_hook(layer_hook)
+            if layer_id in args.detail_layers:
+                trace["details"][layer_id] = {}
+
+                def save_tensor(name, tensor, *, layer_id=layer_id):
+                    trace["details"].setdefault(layer_id, {})[name] = tensor.detach().cpu()
+
+                def layer_detail_hook(_module, inputs, output, *, save_tensor=save_tensor):
+                    save_tensor("layer_input", inputs[0])
+                    save_tensor("layer_output", output)
+
+                def attn_input_hook(_module, _inputs, output, *, save_tensor=save_tensor):
+                    save_tensor("attn_input", output)
+
+                def attn_output_hook(_module, _inputs, output, *, save_tensor=save_tensor):
+                    save_tensor("attn_output", output[0])
+
+                def mlp_input_hook(_module, _inputs, output, *, save_tensor=save_tensor):
+                    save_tensor("mlp_input", output)
+
+                def mlp_output_hook(_module, _inputs, output, *, save_tensor=save_tensor):
+                    save_tensor("mlp_output", output)
+
+                def gate_detail_hook(_module, _inputs, output, *, save_tensor=save_tensor):
+                    save_tensor("router_weights", output[1])
+
+                def tensor_output_hook(name, *, save_tensor=save_tensor, shard_last_dim=False):
+                    def hook(_module, _inputs, output):
+                        if shard_last_dim:
+                            output = output[..., : output.shape[-1] // world_size]
+                        save_tensor(name, output)
+
+                    return hook
+
+                layer.register_forward_hook(layer_detail_hook)
+                layer.input_layernorm.register_forward_hook(attn_input_hook)
+                layer.self_attn.register_forward_hook(attn_output_hook)
+                layer.post_attention_layernorm.register_forward_hook(mlp_input_hook)
+                layer.mlp.register_forward_hook(mlp_output_hook)
+                layer.mlp.gate.register_forward_hook(gate_detail_hook)
+                layer.self_attn.q_a_proj.register_forward_hook(tensor_output_hook("q_a_proj"))
+                layer.self_attn.q_a_norm.register_forward_hook(tensor_output_hook("q_a_norm"))
+                layer.self_attn.q_b_proj.register_forward_hook(tensor_output_hook("q_b_proj", shard_last_dim=True))
+                layer.self_attn.kv_proj.register_forward_hook(tensor_output_hook("kv_proj"))
+                layer.self_attn.kv_norm.register_forward_hook(tensor_output_hook("kv_norm"))
+                layer.self_attn.o_b_proj.register_forward_hook(tensor_output_hook("o_b_proj"))
             indexer = getattr(getattr(layer.self_attn, "compressor", None), "indexer", None)
             if indexer is not None:
 

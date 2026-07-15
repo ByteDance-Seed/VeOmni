@@ -43,6 +43,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--seq-len", type=int, default=4096)
     parser.add_argument("--logprob-chunk-size", type=int, default=64)
+    parser.add_argument(
+        "--detail-layers",
+        type=int,
+        nargs="*",
+        default=(),
+        help="Store full intermediate tensors for the selected layer IDs",
+    )
     return parser.parse_args()
 
 
@@ -137,6 +144,7 @@ def main() -> None:
         "indexer_topk": {},
         "attention_topk": {},
         "hidden": {},
+        "details": {},
     }
 
     if rank == 0:
@@ -150,6 +158,50 @@ def main() -> None:
 
             layer.ffn.gate.register_forward_hook(gate_hook)
             layer.register_forward_hook(layer_hook)
+            if layer_id in args.detail_layers:
+                trace["details"][layer_id] = {}
+                details = trace["details"][layer_id]
+
+                def save_tensor(name, tensor, *, details=details):
+                    details[name] = tensor.detach().cpu()
+
+                def layer_detail_hook(_module, inputs, output, *, save_tensor=save_tensor):
+                    save_tensor("layer_input", inputs[0])
+                    save_tensor("layer_output", output)
+
+                def attn_input_hook(_module, _inputs, output, *, save_tensor=save_tensor):
+                    save_tensor("attn_input", output)
+
+                def attn_output_hook(_module, _inputs, output, *, save_tensor=save_tensor):
+                    save_tensor("attn_output", output)
+
+                def mlp_input_hook(_module, _inputs, output, *, save_tensor=save_tensor):
+                    save_tensor("mlp_input", output)
+
+                def mlp_output_hook(_module, _inputs, output, *, save_tensor=save_tensor):
+                    save_tensor("mlp_output", output)
+
+                def gate_detail_hook(_module, _inputs, output, *, save_tensor=save_tensor):
+                    save_tensor("router_weights", output[0])
+
+                def tensor_output_hook(name, *, save_tensor=save_tensor):
+                    def hook(_module, _inputs, output):
+                        save_tensor(name, output)
+
+                    return hook
+
+                layer.register_forward_hook(layer_detail_hook)
+                layer.attn_norm.register_forward_hook(attn_input_hook)
+                layer.attn.register_forward_hook(attn_output_hook)
+                layer.ffn_norm.register_forward_hook(mlp_input_hook)
+                layer.ffn.register_forward_hook(mlp_output_hook)
+                layer.ffn.gate.register_forward_hook(gate_detail_hook)
+                layer.attn.wq_a.register_forward_hook(tensor_output_hook("q_a_proj"))
+                layer.attn.q_norm.register_forward_hook(tensor_output_hook("q_a_norm"))
+                layer.attn.wq_b.register_forward_hook(tensor_output_hook("q_b_proj"))
+                layer.attn.wkv.register_forward_hook(tensor_output_hook("kv_proj"))
+                layer.attn.kv_norm.register_forward_hook(tensor_output_hook("kv_norm"))
+                layer.attn.wo_b.register_forward_hook(tensor_output_hook("o_b_proj"))
             if getattr(layer.attn, "indexer", None) is not None:
 
                 def indexer_hook(_module, _inputs, output, *, layer_id=layer_id):

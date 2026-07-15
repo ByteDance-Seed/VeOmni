@@ -87,6 +87,39 @@ def main() -> None:
         hidden_report[str(layer_id)] = layer_report
     report["hidden"] = hidden_report
 
+    detail_report = {}
+    official_details = official.get("details", {})
+    veomni_details = veomni.get("details", {})
+    for layer_id in sorted(set(official_details) | set(veomni_details)):
+        if layer_id not in official_details or layer_id not in veomni_details:
+            detail_report[str(layer_id)] = {"missing": "official" if layer_id not in official_details else "veomni"}
+            continue
+        layer_report = {}
+        official_layer = official_details[layer_id]
+        veomni_layer = veomni_details[layer_id]
+        for name in sorted(set(official_layer) | set(veomni_layer)):
+            if name not in official_layer or name not in veomni_layer:
+                layer_report[name] = {"missing": "official" if name not in official_layer else "veomni"}
+                continue
+            left = official_layer[name].float()
+            right = veomni_layer[name].float()
+            if left.shape != right.shape:
+                layer_report[name] = {
+                    "shape_match": False,
+                    "official_shape": list(left.shape),
+                    "veomni_shape": list(right.shape),
+                }
+                continue
+            diff = (left - right).abs()
+            layer_report[name] = {
+                "shape_match": True,
+                "max_abs_diff": float(diff.max()),
+                "mean_abs_diff": float(diff.mean()),
+                "rms_diff": float(diff.square().mean().sqrt()),
+            }
+        detail_report[str(layer_id)] = layer_report
+    report["details"] = detail_report
+
     rendered = json.dumps(report, indent=2)
     print(rendered)
     if args.output is not None:
