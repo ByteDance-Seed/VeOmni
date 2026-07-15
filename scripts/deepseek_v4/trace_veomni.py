@@ -60,13 +60,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eager-dsa-output", type=Path)
     parser.add_argument("--eager-mhc-output", type=Path)
     parser.add_argument("--same-input-indexer-reference", action="store_true")
-    router_group = parser.add_mutually_exclusive_group()
-    router_group.add_argument("--reference-router-fp32", action="store_true")
-    router_group.add_argument(
-        "--reference-score-router-fp32",
-        action="store_true",
-        help="Use the official FP32 projection only for score-routed layers, leaving hash-router weights in BF16",
-    )
     parser.add_argument("--reference-quantization", action="store_true")
     parser.add_argument(
         "--reference-attention-kv-quantization",
@@ -93,6 +86,12 @@ def parse_args() -> argparse.Namespace:
         "--reference-quantized-linear-fp8",
         action="store_true",
         help="Repack BF16-resident checkpoint linears to FP8 on demand and use official FP8 GEMMs",
+    )
+    parser.add_argument(
+        "--reference-output-projection-partitions",
+        type=int,
+        default=1,
+        help="Split attention o_b FP8 GEMMs along K before FP32 summation, matching official TP accumulation",
     )
     routed_expert_group = parser.add_mutually_exclusive_group()
     routed_expert_group.add_argument(
@@ -144,6 +143,10 @@ def main() -> None:
     )
     if args.reference_quantization and specialized_quantization:
         raise ValueError("--reference-quantization cannot be combined with specialized quantization modes")
+    if args.reference_output_projection_partitions < 1:
+        raise ValueError("--reference-output-projection-partitions must be positive")
+    if args.reference_output_projection_partitions != 1 and not args.reference_quantized_linear_fp8:
+        raise ValueError("--reference-output-projection-partitions requires --reference-quantized-linear-fp8")
     dist.init_process_group("nccl")
     rank = dist.get_rank()
     world_size = dist.get_world_size()
@@ -184,13 +187,6 @@ def main() -> None:
     )
     model.eval()
 
-    if args.reference_router_fp32:
-        for layer in model.model.layers:
-            layer.mlp.gate.use_fp32_projection = True
-    if args.reference_score_router_fp32:
-        for layer in model.model.layers:
-            if isinstance(layer.mlp.gate, modeling_module.DeepseekV4TopKRouter):
-                layer.mlp.gate.use_fp32_projection = True
     if args.reference_quantization or args.reference_attention_kv_quantization:
         for layer in model.model.layers:
             layer.self_attn.use_fp8_kv_quantization = True
@@ -294,8 +290,49 @@ def main() -> None:
                         dtype=torch.float8_e8m0fnu,
                     )
 
-                    def quantized_linear_fp8_hook(linear, inputs, _output, *, weight_scale=weight_scale):
+                    def quantized_linear_fp8_hook(
+                        linear,
+                        inputs,
+                        _output,
+                        *,
+                        module_name=module_name,
+                        weight_scale=weight_scale,
+                    ):
                         weight = linear.weight.to_local() if hasattr(linear.weight, "to_local") else linear.weight
+                        partitions = (
+                            args.reference_output_projection_partitions
+                            if module_name.endswith(".self_attn.o_b_proj")
+                            else 1
+                        )
+                        if weight.shape[-1] % partitions:
+                            raise ValueError(f"{module_name} input width is not divisible by {partitions=}")
+                        if partitions > 1:
+                            input_chunks = inputs[0].chunk(partitions, dim=-1)
+                            weight_chunks = weight.chunk(partitions, dim=-1)
+                            scale_chunks = weight_scale.chunk(partitions, dim=-1)
+                            partials = []
+                            for input_chunk, weight_chunk, scale_chunk in zip(
+                                input_chunks, weight_chunks, scale_chunks, strict=True
+                            ):
+                                quantized_weight = fp8_weight_quant_with_scale(
+                                    weight_chunk.contiguous(), scale_chunk.contiguous()
+                                )
+                                quantized_input, input_scale = act_quant(
+                                    input_chunk.contiguous(),
+                                    block_size=128,
+                                    scale_fmt="ue8m0",
+                                    scale_dtype=torch.float8_e8m0fnu,
+                                )
+                                partials.append(
+                                    fp8_gemm(
+                                        quantized_input,
+                                        input_scale,
+                                        quantized_weight,
+                                        scale_chunk.contiguous(),
+                                        torch.float8_e8m0fnu,
+                                    )
+                                )
+                            return torch.stack([partial.float() for partial in partials]).sum(0).to(inputs[0].dtype)
                         quantized_weight = fp8_weight_quant_with_scale(weight.contiguous(), weight_scale)
                         quantized_input, input_scale = act_quant(
                             inputs[0].contiguous(),
@@ -382,10 +419,6 @@ def main() -> None:
     )
     if args.reference_attention_kv_quantization:
         implementation += "_attention_kv_fp8_simulation"
-    if args.reference_router_fp32:
-        implementation += "_router_fp32"
-    if args.reference_score_router_fp32:
-        implementation += "_score_router_fp32"
     if args.reference_indexer_fp4_quantization:
         implementation += "_indexer_fp4_simulation"
     if args.reference_compressor_fp32:
@@ -394,6 +427,8 @@ def main() -> None:
         implementation += "_quantized_linear_fp32"
     if args.reference_quantized_linear_fp8:
         implementation += "_quantized_linear_fp8"
+        if args.reference_output_projection_partitions != 1:
+            implementation += f"_output_projection_partitions_{args.reference_output_projection_partitions}"
     if args.reference_routed_expert_ondemand_fp4:
         implementation += "_routed_expert_ondemand_fp4"
     if args.reference_routed_expert_ondemand_fp8:
@@ -459,6 +494,13 @@ def main() -> None:
 
                     return hook
 
+                def o_a_proj_hook(_module, inputs, output, *, save_tensor=save_tensor):
+                    if output.shape[-2] % world_size:
+                        raise ValueError(f"o_a group count {output.shape[-2]} is not divisible by {world_size=}")
+                    local_groups = output.shape[-2] // world_size
+                    save_tensor("o_a_input", inputs[0][..., :local_groups, :])
+                    save_tensor("o_a_proj", output[..., :local_groups, :])
+
                 layer.register_forward_hook(layer_detail_hook)
                 layer.input_layernorm.register_forward_hook(attn_input_hook)
                 layer.self_attn.register_forward_hook(attn_output_hook)
@@ -470,6 +512,7 @@ def main() -> None:
                 layer.self_attn.q_b_proj.register_forward_hook(tensor_output_hook("q_b_proj", shard_last_dim=True))
                 layer.self_attn.kv_proj.register_forward_hook(tensor_output_hook("kv_proj"))
                 layer.self_attn.kv_norm.register_forward_hook(tensor_output_hook("kv_norm"))
+                layer.self_attn.o_a_proj.register_forward_hook(o_a_proj_hook)
                 layer.self_attn.o_b_proj.register_forward_hook(tensor_output_hook("o_b_proj"))
             indexer = getattr(getattr(layer.self_attn, "compressor", None), "indexer", None)
             if indexer is not None:
@@ -538,7 +581,13 @@ def main() -> None:
     def traced_sparse_attn(q, kv, attn_sink, topk_idxs, sm_scale=None):
         if rank == 0:
             trace["attention_topk"][active_layer["id"]] = topk_idxs.detach().to(torch.int32).cpu()
-        return original_sparse_attn(q, kv, attn_sink, topk_idxs, sm_scale)
+        output = original_sparse_attn(q, kv, attn_sink, topk_idxs, sm_scale)
+        if rank == 0 and active_layer["id"] in args.detail_layers:
+            if output.shape[-2] % world_size:
+                raise ValueError(f"attention head count {output.shape[-2]} is not divisible by {world_size=}")
+            local_heads = output.shape[-2] // world_size
+            trace["details"][active_layer["id"]]["sparse_attn_output"] = output[..., :local_heads, :].detach().cpu()
+        return output
 
     modeling_module.sparse_attn_tilelang = traced_sparse_attn
     for layer_id, layer in enumerate(layers):

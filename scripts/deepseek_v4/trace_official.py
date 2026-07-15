@@ -216,9 +216,29 @@ def main() -> None:
     def traced_sparse_attn(q, kv, attn_sink, topk_idxs, softmax_scale):
         if rank == 0:
             trace["attention_topk"][active_layer["id"]] = topk_idxs.detach().to(torch.int32).cpu()
-        return original_sparse_attn(q, kv, attn_sink, topk_idxs, softmax_scale)
+        output = original_sparse_attn(q, kv, attn_sink, topk_idxs, softmax_scale)
+        if rank == 0 and active_layer["id"] in args.detail_layers:
+            trace["details"][active_layer["id"]]["sparse_attn_output"] = output.detach().cpu()
+        return output
 
     official_model.sparse_attn = traced_sparse_attn
+    original_einsum = torch.einsum
+    local_projection_details: dict[int, dict[str, torch.Tensor]] = {}
+
+    def traced_einsum(equation, *operands):
+        output = original_einsum(equation, *operands)
+        if equation == "bsgd,grd->bsgr" and active_layer["id"] in args.detail_layers:
+            local_projection_details[active_layer["id"]] = {
+                "o_a_input": operands[0].detach(),
+                "o_a_proj": output.detach(),
+            }
+            if rank == 0:
+                details = trace["details"][active_layer["id"]]
+                details["o_a_input"] = operands[0].detach().cpu()
+                details["o_a_proj"] = output.detach().cpu()
+        return output
+
+    official_model.torch.einsum = traced_einsum
     for layer_id, layer in enumerate(model.layers):
         original_forward = layer.attn.forward
 
@@ -246,6 +266,15 @@ def main() -> None:
             model.head.weight,
             args.logprob_chunk_size,
         )
+
+    for layer_id in args.detail_layers:
+        local_details = local_projection_details[layer_id]
+        for name in ("o_a_input", "o_a_proj"):
+            local_tensor = local_details[name].contiguous()
+            gathered = [torch.empty_like(local_tensor) for _ in range(dist.get_world_size())]
+            dist.all_gather(gathered, local_tensor)
+            if rank == 0:
+                trace["details"][layer_id][f"{name}_full"] = torch.cat(gathered, dim=2).cpu()
 
     if rank == 0:
         trace["logprobs"] = logprobs
