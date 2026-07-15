@@ -9,6 +9,8 @@
 #  It contains a patched version of the original HuggingFace modeling code.
 #
 #  Patches applied:
+#    - method_override: DeepseekV4RMSNorm.forward
+#      Multiply normalized activations and weights in FP32 before casting to the input dtype
 #    - method_override: DeepseekV4HyperConnection.forward
 #      Dispatch DeepSeek V4 mHC pre/Sinkhorn/collapse through an OpSlot
 #    - method_override: DeepseekV4HyperHead.forward
@@ -84,6 +86,12 @@ veomni_dsa_indexer_backend = OpsConfigSlot("dsa_indexer_backend")
 veomni_dsa_attention_backend = OpsConfigSlot("dsa_attention_backend")
 
 
+# ======================================================================
+# [MODIFIED CLASS] DeepseekV4RMSNorm
+# Methods patched: forward
+# ======================================================================
+
+
 @use_kernel_forward_from_hub("RMSNorm")
 class DeepseekV4RMSNorm(nn.Module):
     def __init__(self, hidden_size, eps: float = 1e-6) -> None:
@@ -94,12 +102,15 @@ class DeepseekV4RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
 
+    # ================================================================
+    # Patch: official weighted RMSNorm precision order
+    # ================================================================
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         input_dtype = hidden_states.dtype
-        hidden_states = hidden_states.to(torch.float32)
-        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states.float()
+        variance = hidden_states.square().mean(-1, keepdim=True)
         hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
-        return self.weight * hidden_states.to(input_dtype)
+        return (self.weight.float() * hidden_states).to(input_dtype)
 
     def extra_repr(self):
         return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"

@@ -33,16 +33,18 @@ Patches:
 4. ``DeepseekV4ForCausalLM.forward`` — OpSlot guard for fused
    cross-entropy (``veomni_causal_lm_loss``) + ``MoeCausalLMOutputWithLogProbs``
    so callers can read per-token log-probs / entropy alongside the loss.
-5. Register ``get_parallel_plan`` on ``DeepseekV4ForCausalLM``.
+5. ``DeepseekV4RMSNorm.forward`` — matches the official inference path's
+   FP32 weight multiply followed by a single cast to the input dtype.
+6. Register ``get_parallel_plan`` on ``DeepseekV4ForCausalLM``.
 
 Intentionally NOT patched:
 
-- ``DeepseekV4RMSNorm`` / ``DeepseekV4UnweightedRMSNorm`` — DeepSeek-V4 ships
-  two RMSNorm flavours (the second is unweighted and used inside the
-  HCA/CSA compressors). LigerRMSNorm replaces only the standard form, and a
-  blind swap would shadow the unweighted variant. RoPE-determinism /
-  batch-invariant RMSNorm are wired separately at runtime by future
-  ``device_patch.py`` infra (mirroring DeepseekV3) when needed.
+- ``DeepseekV4UnweightedRMSNorm`` — DeepSeek-V4 ships two RMSNorm flavours;
+  the unweighted form used inside the HCA/CSA compressors already matches the
+  official inference path. The weighted form is patched above without using
+  LigerRMSNorm, whose replacement would shadow the distinct unweighted
+  variant. RoPE-determinism / batch-invariant RMSNorm remain separate runtime
+  concerns for future ``device_patch.py`` infra (mirroring DeepseekV3).
 - ``DeepseekV4MLP`` — also used as ``shared_experts`` with a custom
   ``moe_intermediate_size`` (via ``attribute_map["intermediate_size"] =
   "moe_intermediate_size"``). ``LigerSwiGLUMLP.__init__`` rejects the
@@ -167,6 +169,21 @@ config.add_post_import_block(
     veomni_dsa_attention_backend = OpsConfigSlot("dsa_attention_backend")
     """
 )
+
+
+# ================================================================
+# Patch: official weighted RMSNorm precision order
+# ================================================================
+@config.override_method(
+    "DeepseekV4RMSNorm.forward",
+    description="Multiply normalized activations and weights in FP32 before casting to the input dtype",
+)
+def deepseek_v4_rms_norm_forward_patched(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    input_dtype = hidden_states.dtype
+    hidden_states = hidden_states.float()
+    variance = hidden_states.square().mean(-1, keepdim=True)
+    hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+    return (self.weight.float() * hidden_states).to(input_dtype)
 
 
 # ================================================================
