@@ -96,6 +96,72 @@ class DefaultTemplate(ChatTemplate):
         )
 
 
+@CHAT_TEMPLATE_REGISTRY.register("tokenizer")
+class TokenizerTemplate(ChatTemplate):
+    """Use the tokenizer's native chat template with assistant-only labels."""
+
+    def encode_messages(self, messages: Sequence[Dict[str, str]], max_seq_len: int = 8192) -> Dict[str, List[int]]:
+        input_ids: List[int] = []
+        labels: List[int] = []
+        previous_length = 0
+
+        for end, message in enumerate(messages, start=1):
+            encoded = self.tokenizer.apply_chat_template(
+                messages[:end],
+                tokenize=True,
+                add_generation_prompt=False,
+                return_dict=True,
+            )
+            current_ids = encoded["input_ids"]
+            current_length = len(current_ids)
+            if current_length < previous_length:
+                raise ValueError(
+                    "The tokenizer chat template shortened the conversation after adding a message; "
+                    "assistant-only loss masking requires monotonic message boundaries."
+                )
+
+            rewritten_positions = [index for index in range(previous_length) if input_ids[index] != current_ids[index]]
+            is_gpt_oss_terminal_rewrite = False
+            if rewritten_positions == [previous_length - 1] and current_length > previous_length:
+                rewritten_tokens = self.tokenizer.convert_ids_to_tokens(
+                    [input_ids[-1], current_ids[previous_length - 1], current_ids[previous_length]]
+                )
+                is_gpt_oss_terminal_rewrite = rewritten_tokens == ["<|return|>", "<|end|>", "<|start|>"]
+
+            if rewritten_positions and not is_gpt_oss_terminal_rewrite:
+                raise ValueError(
+                    "The tokenizer chat template structurally rewrote an earlier conversation prefix; "
+                    "only the GPT-OSS terminal-token substitution is supported."
+                )
+
+            # Native templates may rewrite an earlier terminal token as the
+            # conversation grows (GPT-OSS changes <|return|> to <|end|>).
+            # Preserve the existing loss mask while keeping labeled token IDs
+            # aligned with the final rendering.
+            for index in rewritten_positions:
+                if labels[index] != IGNORE_INDEX:
+                    labels[index] = current_ids[index]
+
+            loss_mask = message.get("loss_mask", 1 if message["role"] == "assistant" else 0)
+            new_ids = current_ids[previous_length:]
+            labels.extend(new_ids if loss_mask == 1 else [IGNORE_INDEX] * len(new_ids))
+            input_ids = current_ids
+            previous_length = current_length
+
+        input_ids = input_ids[-max_seq_len:]
+        labels = labels[-max_seq_len:]
+        return {
+            "input_ids": input_ids,
+            "attention_mask": [1] * len(input_ids),
+            "labels": labels,
+        }
+
+    def get_jinja_template(self) -> str:
+        if not self.tokenizer.chat_template:
+            raise ValueError("The tokenizer does not define a native chat template.")
+        return self.tokenizer.chat_template
+
+
 @CHAT_TEMPLATE_REGISTRY.register("llama2")
 class Llama2Template(ChatTemplate):
     def encode_messages(self, messages: Sequence[Dict[str, str]], max_seq_len: int = 8192) -> Dict[str, List[int]]:
