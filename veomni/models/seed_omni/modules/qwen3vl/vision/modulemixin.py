@@ -1,20 +1,16 @@
 from typing import Any, Dict, List, NamedTuple, Optional, Tuple
 
 import torch
-import torch.distributed as dist
 
 from ......distributed.parallel_state import get_parallel_state
-from ......distributed.sequence_parallel import (
-    gather_outputs,
-    sp_gather_seqs,
-    sp_pad_and_slice,
-    sp_take_own_seq,
-)
+from ......distributed.sequence_parallel import sp_gather_to_owner, sp_pad_and_slice
 from ....mixins.modulemixin import (
     CPUPreprocessor,
     ModuleMixin,
     post_forward,
     pre_forward,
+    sp_post_forward,
+    sp_pre_forward,
 )
 from ....utils.conversation import ConversationItem, iter_desired_items
 
@@ -150,14 +146,10 @@ class Qwen3VLVisionEncoderModuleMixin(ModuleMixin):
     def init_omni_state(self) -> None:
         self._conversation_carrier: Any = None
         self._visual_output_slots: Optional[List[_VisualOutputSlot]] = None
-        # Set in ``forward_pre`` when the ViT actually ran on an SP-sliced patch
-        # sequence (so ``forward_post`` must gather the merged tokens back).
-        self._sp_gather: bool = False
-        # Per-rank MERGED-token counts + this rank's index within the module SP
-        # group, used by ``forward_post`` to narrow the gathered merged tokens
-        # back to this rank's own items when module SP > 1.
-        self._sp_merged_rep_lengths: Optional[List[int]] = None
-        self._sp_group_index: int = 0
+        # The active owner's real MERGED-token count, stashed by ``forward_sp_pre``
+        # so ``forward_sp_post`` can drop the sp-pad tail from the owner's gathered
+        # merged tokens on the iteration this rank IS the owner.
+        self._sp_own_len: Optional[int] = None
 
     def build_cpu_preprocessor(self) -> Optional[CPUPreprocessor]:
         """Worker-side patchify+normalize (see :class:`Qwen3VLVisionCPUPreprocessor`)."""
@@ -193,60 +185,87 @@ class Qwen3VLVisionEncoderModuleMixin(ModuleMixin):
             )
         pixel_values, grid_thw, output_slots = self._process_visual_items(image_items, video_items)
         self._visual_output_slots = output_slots
-        self._sp_gather = False
-        self._sp_merged_rep_lengths = None
-        self._sp_group_index = 0
-        ps = get_parallel_state()
-        if ps.sp_enabled and pixel_values is not None:
-            # The Qwen3-VL ViT attention honors Ulysses, so SP shards the flat patch
-            # sequence. The module SP group's ``module_sp`` ranks each hold a DISTINCT
-            # sample, so aggregate their patches + per-image grids into one combined
-            # sequence; the ViT then Ulysses-shards the combined sequence. Only the
-            # DATA is gathered — pixels and grid_thw, both via
-            # ``sp_gather_seqs`` in the SAME group order. The ViT metadata
-            # (cu_seqlens) is derived from the post-gather grid below, mirroring the
-            # text backbone deriving its FA cu_seqlens from the gathered
-            # position_ids. Pad+slice the pixels with pad_scale = spatial_merge_size**2
-            # (mirrors MainCollator's DataCollateInfo) so each rank's chunk stays
-            # aligned to merge-group boundaries; the ViT slices its own pos-embeds /
-            # cos / sin internally and runs the sp-pad tail segment. ``forward_post``
-            # gathers the per-rank merged tokens, then narrows to this rank's own
-            # slice (``sp_take_own_seq``).
-            merge_area = self.config.vision_config.spatial_merge_size**2
-            # The generated Qwen3-VL ViT hardcodes its internal SP pad_scale to 4
-            # (pos-embed / cos / sin slicing). Keep the two in lockstep so a future
-            # variant with a different merge size fails loudly instead of mis-slicing.
-            assert merge_area == 4, (
-                "qwen3vl_vision SP requires spatial_merge_size**2 == 4 to match the patchgen ViT pad_scale, "
-                f"got {merge_area}."
-            )
-            # The aggregated batch is "all dummy" only if every SP rank is (MIN so
-            # all ranks agree). ``grid_thw`` rides the same aggregation as the
-            # pixels (same group order).
-            flag = torch.tensor([1 if dummy else 0], device=self.device)
-            dist.all_reduce(flag, op=dist.ReduceOp.MIN, group=ps.sp_group)
-            dummy = bool(flag.item())
-            grid_thw, _, _ = sp_gather_seqs(grid_thw, dim=0)
-            # Aggregate the module SP group's distinct patch sequences (autograd-aware).
-            pixel_values, rep_lengths, group_index = sp_gather_seqs(pixel_values, dim=0)
-            self._sp_merged_rep_lengths = [r // merge_area for r in rep_lengths]
-            self._sp_group_index = group_index
-            pixel_values = sp_pad_and_slice(pixel_values, dim=0, pad_value=0, pad_scale=merge_area)
-            # When the dummy span short-circuits to real-shaped zeros (no FSDP), the
-            # ViT did NOT slice its output, so no gather is needed.
-            self._sp_gather = not (dummy and not (self.training and get_parallel_state().fsdp_enabled))
-        # Build the ViT metadata from the (possibly combined) post-gather grid — its
-        # cu_seqlens / max_seqlen (+ the SP pad tail) describe the exact sequence the
-        # ViT runs, so this is the single, unambiguous place to compute it.
+        # SP-agnostic: process only THIS rank's own items. Under per-module SP the
+        # loop-head (``forward_sp_pre``) broadcasts one owner's patches/grid to the
+        # group and Ulysses-shards them; ``vit_metadata`` built here is consumed only
+        # by the plain (SP-disabled) forward (it rebuilds it per owner otherwise).
         vit_metadata = self._build_vit_metadata(grid_thw.tolist()) if grid_thw is not None else None
-        # Single batch-level dummy flag: the whole (aggregated) batch is dummy iff
-        # every SP rank had no real visual input, so ``modeling.forward`` can
-        # short-circuit the off-FSDP ViT.
+        # ``is_dummy`` is only a non-SP inference/eval short-circuit (skip the ViT for
+        # an all-dummy batch with no anchor). The per-module SP loop is a training path
+        # that always runs the ViT (the FSDP grad anchor), so ``forward_sp_pre`` drops
+        # it — here it stays for the plain (non-SP) forward.
         return {
             "pixel_values": pixel_values,
             "image_grid_thw": grid_thw,
             "vit_metadata": vit_metadata,
             "is_dummy": dummy,
+        }
+
+    @sp_pre_forward("forward")
+    def forward_sp_pre(
+        self,
+        pixel_values: torch.Tensor,
+        image_grid_thw: torch.Tensor,
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
+        """SP loop-head: hand this rank its Ulysses shard of ONE owner's flat patch
+        sequence.
+
+        The driver has broadcast the active owner's patches + ``grid_thw`` to the
+        whole group, so both are the SAME owner tensors on every rank. Pad+slice the
+        patches with ``pad_scale = spatial_merge_size**2`` (keeps each chunk aligned
+        to merge-group boundaries) and rebuild the ViT ``cu_seqlens`` (+ sp-pad tail)
+        from the owner grid — the ViT slices its own pos-embeds / cos / sin internally
+        and runs the sp-pad tail segment. ``forward_sp_post`` gathers the merged tokens
+        back to the owner. ``is_dummy`` / the passed-through ``vit_metadata`` are
+        dropped (see ``forward_pre``): the SP path always encodes and rebuilds metadata
+        for the owner here.
+        """
+        del kwargs
+        merge_area = self.config.vision_config.spatial_merge_size**2
+        # The generated Qwen3-VL ViT hardcodes its internal SP pad_scale to 4
+        # (pos-embed / cos / sin slicing). Keep the two in lockstep so a future
+        # variant with a different merge size fails loudly instead of mis-slicing.
+        assert merge_area == 4, (
+            "qwen3vl_vision SP requires spatial_merge_size**2 == 4 to match the patchgen ViT pad_scale, "
+            f"got {merge_area}."
+        )
+        # Owner's real merged-token count (drop the sp-pad tail with it in the loop-tail).
+        self._sp_own_len = int(image_grid_thw.prod(dim=1).sum().item()) // merge_area
+        pixel_values = sp_pad_and_slice(pixel_values, dim=0, pad_value=0, pad_scale=merge_area)
+        vit_metadata = self._build_vit_metadata(image_grid_thw.tolist())
+        return {
+            "pixel_values": pixel_values,
+            "image_grid_thw": image_grid_thw,
+            "vit_metadata": vit_metadata,
+        }
+
+    @sp_post_forward("forward")
+    def forward_sp_post(
+        self,
+        owner: int,
+        image_embeds: torch.Tensor,
+        deepstack_features: List[torch.Tensor],
+        image_grid_thw: torch.Tensor,
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
+        """SP loop-tail: gather this rank's Ulysses shard of the owner's merged tokens
+        (+ each deepstack layer) back to the ``owner`` along the token dim, and on the
+        iteration this rank IS the owner drop the sp-pad tail to its real merged count."""
+        del kwargs
+        ps = get_parallel_state()
+        group = ps.sp_group
+
+        def _to_owner(t: torch.Tensor) -> torch.Tensor:
+            t = sp_gather_to_owner(t, dim=0, dst_group_rank=owner, group=group)
+            return t.narrow(0, 0, self._sp_own_len) if owner == ps.sp_rank else t
+
+        image_embeds = _to_owner(image_embeds)
+        deepstack_features = [_to_owner(layer) for layer in deepstack_features]
+        return {
+            "image_embeds": image_embeds,
+            "deepstack_features": deepstack_features,
+            "image_grid_thw": image_grid_thw,
         }
 
     @post_forward("forward")
@@ -258,36 +277,12 @@ class Qwen3VLVisionEncoderModuleMixin(ModuleMixin):
     ) -> Dict[str, Any]:
         conversation = self._conversation_carrier
         output_slots = self._visual_output_slots
-        sp_gather = self._sp_gather
-        merged_rep_lengths = self._sp_merged_rep_lengths
-        group_index = self._sp_group_index
         self._conversation_carrier = None
         self._visual_output_slots = None
-        self._sp_gather = False
-        self._sp_merged_rep_lengths = None
-        self._sp_group_index = 0
-        if sp_gather:
-            # Gather per-rank merged tokens (dim 0) over the MODULE's SP group and
-            # trim the sp-pad tail back to the real COMBINED merged-token count
-            # (sum over the module SP group). The slice is autograd-safe — its
-            # backward re-pads the grad before _Gather. Then narrow to this rank's
-            # own segment (``sp_take_own_seq``) so the returned tokens match
-            # this rank's own conversation items.
-            group = get_parallel_state().sp_group
-            total_merged = sum(merged_rep_lengths)
-            image_embeds = gather_outputs(image_embeds, gather_dim=0, group=group)[:total_merged]
-            image_embeds = sp_take_own_seq(image_embeds, dim=0, seg_lengths=merged_rep_lengths, sp_rank=group_index)
-            deepstack_features = [
-                sp_take_own_seq(
-                    gather_outputs(layer, gather_dim=0, group=group)[:total_merged],
-                    dim=0,
-                    seg_lengths=merged_rep_lengths,
-                    sp_rank=group_index,
-                )
-                for layer in deepstack_features
-            ]
-        # forward returns merged tokens in slot order (real or dummy alike);
-        # scatter them back onto the originating items.
+        # forward returns merged tokens in slot order (real or dummy alike); scatter
+        # them back onto the originating items. Under per-module SP the loop-tail
+        # (``forward_sp_post``) has already gathered this rank's own merged tokens
+        # back, so the counts match its conversation items here.
         self._scatter_visual_embeds(output_slots, image_embeds, deepstack_features)
         return {"conversation_list": conversation}
 

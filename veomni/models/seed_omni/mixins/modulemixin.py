@@ -88,6 +88,63 @@ def post_forward(*contexts: str) -> Callable[[Callable], Callable]:
     return decorator
 
 
+def sp_pre_forward(*contexts: str) -> Callable[[Callable], Callable]:
+    """Decorator: register a **per-module sequence-parallel loop-head hook**.
+
+    A module opts into per-module SP (Ulysses) for a call-site by declaring this
+    hook. The graph runs the endpoint ``sp_size`` times (one SP-group member per
+    iteration); the driver first broadcasts the active owner's ``pre_forward``
+    output to the whole group, THEN calls this hook with that shared data. So the
+    hook only slices its inputs to this rank's ``1/sp_size`` chunk (+ any per-shard
+    precompute such as ``cu_seqlens``), returning the plain ``forward`` kwargs::
+
+        @sp_pre_forward("forward")
+        def forward_sp_pre(self, inputs_embeds, ...): ...
+
+    There is no ``owner`` argument and no broadcast here — every rank already
+    holds the owner's data; the slice is owner-agnostic. Its :func:`sp_post_forward`
+    counterpart gathers the output shard back to the owner (that one IS
+    owner-/axis-aware). See :meth:`ModuleMixin.sp_pre_forward`.
+    """
+
+    if not contexts:
+        raise ValueError("@sp_pre_forward requires at least one context.")
+
+    def decorator(fn: Callable) -> Callable:
+        fn._omni_sp_pre_context = tuple(contexts)
+        return fn
+
+    return decorator
+
+
+def sp_post_forward(*contexts: str) -> Callable[[Callable], Callable]:
+    """Decorator: register a **per-module sequence-parallel loop-tail hook**.
+
+    The output counterpart of :func:`sp_pre_forward`: called at the END of each SP
+    iteration with the active ``owner`` and the plain ``forward`` output, it
+    gathers this rank's output shard to the owner (``sp_gather_to_owner``) so the
+    owner reconstructs its full sample::
+
+        @sp_post_forward("forward")
+        def forward_sp_post(self, owner, hidden_states, ...): ...
+
+    ``owner`` is the gather DESTINATION the driver dispatches — the hook must NOT use
+    it to decide which rank keeps data (that is the driver's ``own_out`` selection).
+    Stripping any SP padding the loop-head added IS this hook's job (SP-specific
+    cleanup, done on the destination rank) — keep it out of the SP-agnostic
+    ``post_forward``.
+    """
+
+    if not contexts:
+        raise ValueError("@sp_post_forward requires at least one context.")
+
+    def decorator(fn: Callable) -> Callable:
+        fn._omni_sp_post_context = tuple(contexts)
+        return fn
+
+    return decorator
+
+
 class CPUPreprocessor:
     """Picklable, weight-free CPU input-prep run inside DataLoader workers.
 
@@ -258,6 +315,40 @@ class ModuleMixin:
             return outputs
         return getattr(self, name)(**outputs)
 
+    def supports_sp(self, method: str) -> bool:
+        """True when this module declares a per-module SP loop for call-site ``method``.
+
+        Opt-in: a module supports the looped Ulysses path for ``method`` iff it has
+        an ``@sp_pre_forward(method)``-decorated hook. The graph only drives the SP
+        loop (:func:`~veomni.models.seed_omni.graphs.dispatch.run_sp_looped_endpoint`)
+        when this is ``True`` and the module's scoped ``sp_size > 1``; otherwise the
+        plain ``method`` runs once.
+        """
+        return type(self)._omni_hook_name("_omni_sp_pre_context", method) is not None
+
+    def sp_pre_forward(self, method: str, **kwargs: Any) -> Dict[str, Any]:
+        """Dispatch to the ``@sp_pre_forward(method)`` loop-head hook.
+
+        The graph driver has already broadcast the active owner's ``pre_forward``
+        output to the whole SP group, so ``**kwargs`` is data every rank shares; the
+        hook only slices it to this rank's ``1/sp_size`` shard (+ any per-shard
+        precompute). No ``owner`` — the slice is owner-agnostic."""
+        name = type(self)._omni_hook_name("_omni_sp_pre_context", method)
+        if name is None:
+            raise NotImplementedError(
+                f"{type(self).__name__} has no @sp_pre_forward('{method}') hook; "
+                "check `supports_sp(method)` before driving the SP loop."
+            )
+        return getattr(self, name)(**kwargs)
+
+    def sp_post_forward(self, method: str, owner: int, **outputs: Any) -> Dict[str, Any]:
+        """Dispatch to the ``@sp_post_forward(method)`` loop-tail hook (gather this
+        rank's output shard back to the ``owner``). Default: identity pass-through."""
+        name = type(self)._omni_hook_name("_omni_sp_post_context", method)
+        if name is None:
+            return outputs
+        return getattr(self, name)(owner=owner, **outputs)
+
     def build_cpu_preprocessor(self) -> Optional["CPUPreprocessor"]:
         """Optional: return a picklable, weight-free :class:`CPUPreprocessor`.
 
@@ -408,4 +499,6 @@ __all__ = [
     "CPUPreprocessor",
     "pre_forward",
     "post_forward",
+    "sp_pre_forward",
+    "sp_post_forward",
 ]

@@ -15,12 +15,13 @@ right-padded ``(B, T, D)`` for the decode heads.
 
 Sequence parallelism
 --------------------
-When the global :class:`ParallelState` has SP enabled, :meth:`pre_forward`
-slices every sequence-domain tensor with
-:func:`veomni.distributed.sequence_parallel.data.sp_pad_and_slice` and
-:meth:`post_forward` all-gathers ``hidden_states`` back to full length so
-downstream nodes (``tok_decode`` / ``vae_decode``) receive non-sliced
-tensors.
+``forward`` is SP-unaware — it computes on whatever (already-sliced) sequence
+it is handed. Per-module SP is driven OUTSIDE the model: when ``sp_size > 1``
+the graph loops over the SP group and, per owner, the mixin's
+``@sp_pre_forward`` hook slices one owner's packed sample to this rank's shard
+(rebuilding the varlen ``cu_seqlens``) and the ``@sp_post_forward`` hook gathers
+the output shard back to the owner (``forward_sp_pre`` / ``forward_sp_post`` in
+``modulemixin.py``). ``post_forward`` then stays SP-agnostic (plain unpack).
 
 Connection outputs
 ------------------

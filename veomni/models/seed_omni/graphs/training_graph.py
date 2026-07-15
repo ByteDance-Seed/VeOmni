@@ -62,7 +62,7 @@ from collections import defaultdict, deque
 from contextlib import nullcontext
 from typing import Any, Callable, ContextManager, Dict, List, Optional
 
-from .dispatch import call_graph_endpoint, unwrap_graph_module
+from .dispatch import call_graph_endpoint, run_sp_looped_endpoint, unwrap_graph_module
 from .graph import EdgeDef, NodeDef, is_end
 from .profiling import GraphProfiler
 
@@ -208,6 +208,7 @@ class TrainingGraph:
         *,
         profiler: Optional[GraphProfiler] = None,
         scope_fn: Optional[Callable[[str], ContextManager]] = None,
+        sp_keep_unsharded_fn: Optional[Callable[[str], bool]] = None,
     ) -> Dict[str, Any]:
         """Run the node at the cursor — one forward (mirror of ``GenerationGraph.step``).
 
@@ -253,12 +254,49 @@ class TrainingGraph:
             if hasattr(raw, "metric_meter_add"):
                 raw.metric_meter_add(method, kwargs)
 
-            out = call_graph_endpoint(wrapped, raw, method=method, kwargs=kwargs)
+            if self._use_sp_loop(raw, method):
+                # Per-module SP (Ulysses): run the endpoint once per SP-group member
+                # (broadcast owner → slice → forward → gather-to-owner). ``post_forward``
+                # still runs once, on this rank's own-owner output. Modeling stays
+                # SP-unaware. Optionally wrap in ``no_reshard_after_forward`` so those
+                # ``sp_size`` forwards all-gather FSDP2 params once instead of per
+                # forward — opt-in per module via the YAML knob ``train.accelerator.
+                # fsdp_config.sp_keep_params_unsharded`` (read at this use-site from
+                # ``sp_keep_unsharded_fn``, which the OmniModel resolves off its config),
+                # since keeping a large backbone's params resident for the whole burst
+                # can OOM; the memory-safe default (knob absent/False) re-fires the FSDP
+                # hooks each forward.
+                if sp_keep_unsharded_fn is not None and sp_keep_unsharded_fn(node.module):
+                    from veomni.distributed.torch_parallelize import no_reshard_after_forward
+
+                    loop_context = no_reshard_after_forward(wrapped)
+                else:
+                    loop_context = nullcontext()
+                with loop_context:
+                    out = run_sp_looped_endpoint(wrapped, raw, method=method, kwargs=kwargs)
+            else:
+                out = call_graph_endpoint(wrapped, raw, method=method, kwargs=kwargs)
             out = raw.post_forward(method=method, **out)
 
         batch.update(out)
 
         return batch
+
+    @staticmethod
+    def _use_sp_loop(raw: Any, method: str) -> bool:
+        """Whether this node runs the per-module SP loop for call-site ``method``.
+
+        True iff the module opts in with an ``@sp_pre_forward(method)`` hook
+        (``raw.supports_sp``) AND its scoped :class:`ParallelState` has ``sp_size >
+        1``. Otherwise the plain ``method`` runs once. Not-yet-migrated modules that
+        still do SP inside ``pre_forward``/``post_forward`` (gather-concat) declare
+        no such hook, so they keep taking the plain path unchanged.
+        """
+        # Local import keeps the graph package import-light and avoids a cycle with
+        # the distributed stack.
+        from veomni.distributed.parallel_state import get_parallel_state
+
+        return raw.supports_sp(method) and get_parallel_state().sp_size > 1
 
     def maybe_transition(self, *, profiler: Optional[GraphProfiler] = None) -> bool:
         """Advance the cursor to the next node (mirror of ``GenerationGraph.maybe_transition``).

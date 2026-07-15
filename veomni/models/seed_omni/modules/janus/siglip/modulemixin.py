@@ -3,12 +3,7 @@ from typing import Any, Dict, List, Optional
 import torch
 
 from veomni.distributed.parallel_state import get_parallel_state
-from veomni.distributed.sequence_parallel import (
-    gather_outputs,
-    slice_input_tensor,
-    sp_gather_seqs,
-    sp_take_own_seq,
-)
+from veomni.distributed.sequence_parallel import slice_input_tensor, sp_gather_to_owner
 
 from ....mixins.metric_meter_mixin import MetricMeterMixin
 from ....mixins.modulemixin import (
@@ -16,6 +11,8 @@ from ....mixins.modulemixin import (
     ModuleMixin,
     post_forward,
     pre_forward,
+    sp_post_forward,
+    sp_pre_forward,
 )
 from ....utils.conversation import ConversationItem, is_dummy, iter_desired_items
 from .configuration import JanusSiglipConfig
@@ -75,11 +72,10 @@ class JanusSiglipModuleMixin(ModuleMixin):
     def init_omni_state(self) -> None:
         # Training state
         self._conversation_carrier: Any = None
-        # Per-rank image counts + this rank's index within the module SP group,
-        # used by ``forward_post`` to narrow the gathered batch back to this
-        # rank's own images when module SP > 1.
-        self._sp_rep_lengths: Optional[List[int]] = None
-        self._sp_group_index: int = 0
+        # This rank's OWN image count. Under per-module SP the loop-tail
+        # (``forward_sp_post``) narrows the owner's gathered (batch-padded) embeds
+        # back to it on the iteration this rank is the owner.
+        self._sp_own_len: Optional[int] = None
 
     def build_cpu_preprocessor(self) -> Optional[CPUPreprocessor]:
         """Worker-side image normalize (see :class:`JanusSiglipCPUPreprocessor`)."""
@@ -104,31 +100,44 @@ class JanusSiglipModuleMixin(ModuleMixin):
         # is dummy; if any image is real it is False. Passed as a scalar so the
         # modeling forward can short-circuit to a dummy output when appropriate.
         is_dummy_flag = all(is_dummy(it) for it in items)
-        # Metering: this rank's OWN image count, pre-gather / pre-slice. The meter
-        # sums over the DP group only, so each rank reports just its own images
-        # (not the module_sp ranks SP aggregates) — identical to the non-SP run
-        # for both SP-disabled and per-module SP.
+        # Metering: this rank's OWN image count. The meter sums over the DP group
+        # only, so each rank reports just its own images (not the module_sp peers a
+        # per-module SP forward redistributes) — identical to the non-SP run for
+        # both SP-disabled and per-module SP.
         self._metric_meter_stash_tokens(int(pixel_values.shape[0]))
-        self._sp_rep_lengths = None
-        self._sp_group_index = 0
-        ps = get_parallel_state()
-        if ps.sp_enabled:
-            # SigLIP ViT attention does NOT honor Ulysses, so SP shards the image
-            # *batch* dim instead. First aggregate the module SP group's distinct
-            # image batches (module_sp ranks), then each rank encodes its own
-            # images (zero-padded to a multiple of module sp_size);
-            # ``forward_post`` gathers them back.
-            pixel_values, rep_lengths, group_index = sp_gather_seqs(pixel_values, dim=0)
-            self._sp_rep_lengths = rep_lengths
-            self._sp_group_index = group_index
-            if len(rep_lengths) > 1:
-                # The aggregated batch is "all dummy" only if every SP rank is.
-                # Reduce with MIN so all ranks in the module SP group agree.
-                flag = torch.tensor([1 if is_dummy_flag else 0], device=self.device)
-                torch.distributed.all_reduce(flag, op=torch.distributed.ReduceOp.MIN, group=ps.sp_group)
-                is_dummy_flag = bool(flag.item())
-            pixel_values = slice_input_tensor(pixel_values, dim=0, padding=True, group=ps.sp_group)
+        # ``is_dummy`` is only a non-SP inference/eval short-circuit (skip the ViT
+        # for an all-dummy batch that has no anchor to keep). The per-module SP loop
+        # is a training path where we always run the ViT (the FSDP grad anchor), so
+        # ``forward_sp_pre`` drops it — here it stays for the plain (non-SP) forward.
         return {"pixel_values": pixel_values, "is_dummy": is_dummy_flag}
+
+    @sp_pre_forward("forward")
+    def forward_sp_pre(self, pixel_values: torch.Tensor, **kwargs: Any) -> Dict[str, Any]:
+        """SP loop-head: hand this rank its ``1/sp_size`` slice of ONE owner's image
+        batch (SigLIP shards the batch dim — its ViT attention is not Ulysses).
+
+        The driver has already broadcast the active owner's image batch to the whole
+        group, so ``pixel_values`` is the SAME owner batch on every rank; pad it to a
+        multiple of ``sp_size`` and take this rank's contiguous chunk.
+        ``forward_sp_post`` gathers the per-image embeds back to the owner. ``is_dummy``
+        is intentionally dropped (see ``forward_pre``): the SP path always encodes.
+        """
+        del kwargs
+        self._sp_own_len = pixel_values.size(0)
+        pixel_values = slice_input_tensor(pixel_values, dim=0, padding=True, group=get_parallel_state().sp_group)
+        return {"pixel_values": pixel_values}
+
+    @sp_post_forward("forward")
+    def forward_sp_post(self, owner: int, image_embeds: torch.Tensor, **kwargs: Any) -> Dict[str, Any]:
+        """SP loop-tail: gather this rank's per-image embed shard back to the ``owner``
+        (batch dim) and, on the iteration this rank IS the owner, drop the batch pad
+        tail back to its own image count."""
+        del kwargs
+        ps = get_parallel_state()
+        image_embeds = sp_gather_to_owner(image_embeds, dim=0, dst_group_rank=owner, group=ps.sp_group)
+        if owner == ps.sp_rank:
+            image_embeds = image_embeds.narrow(0, 0, self._sp_own_len)
+        return {"image_embeds": image_embeds}
 
     def _metric_meter_stash_tokens(self, num_images: int) -> None:
         # One ViT sequence per image; tokens = patches = (image/patch)**2.
@@ -141,26 +150,10 @@ class JanusSiglipModuleMixin(ModuleMixin):
         conversation = self._conversation_carrier
         self._conversation_carrier = None
         # forward returns one embed row per fed item, in source order; scatter them
-        # back onto the same source items (real or dummy alike).
+        # back onto the same source items (real or dummy alike). Under per-module SP
+        # the loop-tail (``forward_sp_post``) has already gathered this rank's own
+        # images back, so the count matches its conversation items here.
         items = list(iter_desired_items(conversation, types=["image"], sources=[_SOURCE]))
-        ps = get_parallel_state()
-        if ps.sp_enabled:
-            # Gather the per-rank image embeds back (dim 0) over the MODULE SP
-            # group and drop the zero-pad tail to recover the full module-group
-            # batch, then narrow to this rank's own slice so the count matches its
-            # conversation items again.
-            full_count = sum(self._sp_rep_lengths)
-            image_embeds = gather_outputs(
-                image_embeds,
-                gather_dim=0,
-                padding_dim=0,
-                unpad_dim_size=full_count,
-                group=ps.sp_group,
-            )
-            image_embeds = sp_take_own_seq(
-                image_embeds, dim=0, seg_lengths=self._sp_rep_lengths, sp_rank=self._sp_group_index
-            )
-            self._sp_rep_lengths = None
         for item, emb in zip(items, image_embeds, strict=True):
             item.value = emb
         return {"conversation_list": conversation}

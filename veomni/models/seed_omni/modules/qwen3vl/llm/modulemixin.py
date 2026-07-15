@@ -1,19 +1,12 @@
 from typing import Any, Dict, List, Optional
 
 import torch
-import torch.distributed as dist
 
 from veomni.distributed.parallel_state import get_parallel_state
-from veomni.distributed.sequence_parallel import (
-    gather_outputs,
-    slice_input_tensor,
-    sp_gather_seqs,
-    sp_pad,
-    sp_take_own_seq,
-)
+from veomni.distributed.sequence_parallel import slice_input_tensor, sp_gather_to_owner, sp_pad
 from veomni.utils.tensor_utils import naflatten, unflatten
 
-from ....mixins.modulemixin import ModuleMixin, post_forward, pre_forward
+from ....mixins.modulemixin import ModuleMixin, post_forward, pre_forward, sp_post_forward, sp_pre_forward
 from ....utils.conversation import ConversationItem, is_dummy
 
 
@@ -31,15 +24,10 @@ class Qwen3VLLlmModuleMixin(ModuleMixin):
         self._pack_inputs_embeds_shape: Optional[torch.Tensor] = None
         self._past_key_values: Any = None
         self._next_position: int = 0
-        # Combined module-SP-group packed length captured after the per-rank
-        # aggregation but before the SP seq-pad/slice in ``forward_pre``;
-        # ``forward_post`` gathers the hidden states and trims to it.
-        self._sp_seqlen: Optional[int] = None
-        # Per-rank packed lengths + this rank's index within the module SP group,
-        # used by ``forward_post`` to narrow the gathered full sequence back to
-        # this rank's own segment (``sp_take_own_seq``).
-        self._sp_rep_lengths: Optional[List[int]] = None
-        self._sp_group_index: int = 0
+        # This rank's OWN pre-pad packed length. Under per-module SP the loop-tail
+        # (``forward_sp_post``) narrows the owner's gathered (padded) output back to
+        # it on the iteration this rank is the owner.
+        self._sp_own_len: Optional[int] = None
 
     @property
     def _spatial_merge_size(self) -> int:
@@ -61,150 +49,133 @@ class Qwen3VLLlmModuleMixin(ModuleMixin):
         self._conversation_carrier = conversation_list
         self._pack_inputs_embeds_shape = packed["inputs_embeds_shape"]
 
-        position_ids = packed["position_ids"]
-        visual_pos_masks = packed["visual_pos_masks"]
-        deepstack_visual_embeds = packed["deepstack_visual_embeds"]
-        cu_seq_lens = packed["cu_seq_lens"]
-        max_length = packed["max_length"]
-
-        self._sp_seqlen = None
-        self._sp_rep_lengths = None
-        self._sp_group_index = 0
-        if get_parallel_state().sp_enabled:
-            (
-                inputs_embeds,
-                position_ids,
-                visual_pos_masks,
-                deepstack_visual_embeds,
-                cu_seq_lens,
-                max_length,
-            ) = self._sp_gather_and_slice_forward_inputs(
-                inputs_embeds, position_ids, visual_pos_masks, deepstack_visual_embeds, cu_seq_lens, max_length
-            )
+        # Normalize the visual side to always-broadcastable tensors: per-module SP
+        # ships ONE owner's ``forward_pre`` output to the group and the driver only
+        # broadcasts tensors (not Python ``None`` / lists). So ``visual_pos_masks``
+        # becomes a real (possibly all-False) bool tensor and the per-layer DeepStack
+        # embeds become one stacked ``(num_layers, N, D)`` tensor (the generated
+        # modeling indexes it per layer exactly like the list). The old cross-rank
+        # reconciliation (all_gather_object cu_seqlens, MAX-reduce has_visual) is
+        # gone — each owner's sample is self-describing.
+        inputs_embeds, visual_pos_masks, deepstack_visual_embeds = self._normalize_visual_inputs(
+            inputs_embeds, packed["visual_pos_masks"], packed["deepstack_visual_embeds"]
+        )
 
         return dict(
             inputs_embeds=inputs_embeds,
-            position_ids=position_ids,
+            position_ids=packed["position_ids"],
             visual_pos_masks=visual_pos_masks,
             deepstack_visual_embeds=deepstack_visual_embeds,
-            cu_seq_lens_q=cu_seq_lens,
-            cu_seq_lens_k=cu_seq_lens,
-            max_length_q=max_length,
-            max_length_k=max_length,
+            cu_seq_lens_q=packed["cu_seq_lens"],
+            cu_seq_lens_k=packed["cu_seq_lens"],
+            max_length_q=packed["max_length"],
+            max_length_k=packed["max_length"],
             **kwargs,
         )
 
-    def _sp_gather_and_slice_forward_inputs(
+    def _normalize_visual_inputs(
+        self,
+        inputs_embeds: torch.Tensor,
+        visual_pos_masks: Optional[torch.Tensor],
+        deepstack_visual_embeds: Optional[List[torch.Tensor]],
+    ) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        """Turn the packed visual side into broadcast-safe tensors (see ``forward_pre``).
+
+        Real visuals: stack the per-layer DeepStack embeds into ``(num_layers, N, D)``.
+        All-text sample: return an all-False mask + an EMPTY ``(num_layers, 0, D)``
+        deepstack, and fold the dummy DeepStack anchor into ``inputs_embeds`` so the
+        vision mergers that produced it still get (zero) gradient. This replaces the
+        modeling's ``visual_pos_masks=None`` anchor path, which we can no longer use
+        because SP must broadcast a real mask.
+        """
+        if visual_pos_masks is not None:
+            return inputs_embeds, visual_pos_masks, torch.stack(deepstack_visual_embeds, dim=0)
+
+        mask = torch.zeros(1, inputs_embeds.size(1), dtype=torch.bool, device=self.device)
+        if not deepstack_visual_embeds:
+            # No DeepStack layers to anchor (e.g. text-only run without vision).
+            return inputs_embeds, mask, None
+        num_layers = len(deepstack_visual_embeds)
+        hidden_dim = deepstack_visual_embeds[0].size(-1)
+        anchor = sum(layer.float().mean() for layer in deepstack_visual_embeds) * 0.0
+        inputs_embeds = inputs_embeds + anchor.to(inputs_embeds.dtype)
+        empty_deepstack = inputs_embeds.new_zeros(num_layers, 0, hidden_dim)
+        return inputs_embeds, mask, empty_deepstack
+
+    @sp_pre_forward("forward")
+    def forward_sp_pre(
         self,
         inputs_embeds: torch.Tensor,
         position_ids: torch.Tensor,
-        visual_pos_masks: Optional[torch.Tensor],
-        deepstack_visual_embeds: Optional[List[torch.Tensor]],
-        cu_seq_lens: torch.Tensor,
-        max_length: int,
-    ):
-        """Aggregate the module SP group's distinct packed sequences, then SP-slice.
+        visual_pos_masks: torch.Tensor,
+        deepstack_visual_embeds: Optional[torch.Tensor],
+        cu_seq_lens_q: torch.Tensor,
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
+        """SP loop-head: slice ONE owner's (already-broadcast) packed sample to this
+        rank's Ulysses shard, including the M-RoPE positions and DeepStack rows.
 
-        Each SP rank packs a DISTINCT bs=1 sequence (the orchestrator runs
-        SP-disabled). We first concatenate the group's sequences into one combined
-        packed sequence — ``inputs_embeds``, 3-row M-RoPE ``position_ids``,
-        ``visual_pos_masks`` and the per-layer DeepStack visual embeds in lockstep
-        — rebuild the varlen ``cu_seqlens`` from the combined per-sample lengths,
-        then pad the combined sequence to a multiple of sp_size and feed this rank
-        only its chunk (the attention all-to-all reconstructs the full sequence).
-        ``forward_post`` gathers the hidden states and narrows back to this rank's
-        own segment.
-
-        A "text-only" rank carries ``visual_pos_masks=None`` + a dummy DeepStack
-        anchor; if ANY rank in the group has real visuals (MAX-reduced) the
-        combined sequence uses the real DeepStack-injection path — text-only ranks
-        then contribute an all-False mask + empty visual rows (their dummy anchor
-        fixes num_layers + hidden dim) — otherwise the all-dummy anchor path is
-        kept.
+        Every rank holds the owner's exact ``forward_pre`` output. Pad the sample to
+        a multiple of ``sp_size``, extend the full-sample varlen ``cu_seqlens`` with
+        the pad tail (the attention all-to-all reconstructs the full sequence before
+        the kernel), then hand this rank only its ``1/sp_size`` chunk of embeds
+        (dim 1), 3-row positions (dim 2) and ``visual_pos_masks`` (dim 1). The
+        DeepStack embeds are indexed by visual position, so slice out exactly the
+        rows whose visual tokens fall in this rank's chunk (``n_before`` skipped +
+        ``k_local`` kept).
         """
+        del kwargs
         ps = get_parallel_state()
-        sp_size, sp_rank = ps.sp_size, ps.sp_rank
-        group = ps.sp_group
+        group, sp_size, sp_rank = ps.sp_group, ps.sp_size, ps.sp_rank
 
-        local_len = inputs_embeds.size(1)
+        self._sp_own_len = inputs_embeds.size(1)
+        cu = cu_seq_lens_q
+        max_length = int((cu[1:] - cu[:-1]).max().item()) if cu.numel() > 1 else 0
 
-        # Combined per-sample lengths (host metadata) → combined varlen cu_seqlens.
-        local_sample_lengths = [int(x) for x in (cu_seq_lens[1:] - cu_seq_lens[:-1]).tolist()]
-        gathered_sample_lengths: List[Optional[List[int]]] = [None] * sp_size
-        dist.all_gather_object(gathered_sample_lengths, local_sample_lengths, group=group)
-        combined_sample_lengths = [s for lst in gathered_sample_lengths for s in lst]
-        cu_seq_lens = torch.tensor([0, *_cumsum(combined_sample_lengths)], dtype=torch.int32, device=self.device)
-        max_length = max(combined_sample_lengths) if combined_sample_lengths else 0
-
-        # Reconcile whether the COMBINED sequence has any real visual positions.
-        has_visual = torch.tensor([0 if visual_pos_masks is None else 1], device=self.device)
-        dist.all_reduce(has_visual, op=dist.ReduceOp.MAX, group=group)
-        combined_has_visual = bool(has_visual.item())
-
-        # Aggregate the distinct per-rank sequences (autograd-aware for embeds).
-        inputs_embeds, rep_lengths, group_index = sp_gather_seqs(inputs_embeds, dim=1)
-        position_ids, _, _ = sp_gather_seqs(position_ids, dim=2)
-        self._sp_rep_lengths = rep_lengths
-        self._sp_group_index = group_index
-
-        if combined_has_visual:
-            if visual_pos_masks is None:
-                # Text-only rank: contribute an all-False mask + empty (0, D) rows;
-                # its dummy DeepStack anchor fixes num_layers + hidden dim.
-                visual_pos_masks = torch.zeros(1, local_len, dtype=torch.bool, device=self.device)
-                deepstack_visual_embeds = [layer[:0] for layer in deepstack_visual_embeds]
-            visual_pos_masks, _, _ = sp_gather_seqs(visual_pos_masks, dim=1)
-            deepstack_visual_embeds = [sp_gather_seqs(layer, dim=0)[0] for layer in deepstack_visual_embeds]
-        else:
-            # All-dummy combined batch: keep the None + per-rank dummy-anchor path.
-            visual_pos_masks = None
-
-        # ── SP seq slice over the combined sequence ──
-        self._sp_seqlen = inputs_embeds.size(1)
-        inputs_embeds = sp_pad(inputs_embeds, dim=1, pad_value=0)
-        position_ids = sp_pad(position_ids, dim=2, pad_value=0)
-        padded_len = inputs_embeds.size(1)
-        pad_len = padded_len - self._sp_seqlen
+        embeds = sp_pad(inputs_embeds, dim=1, pad_value=0)
+        pids = sp_pad(position_ids, dim=2, pad_value=0)
+        mask = sp_pad(visual_pos_masks, dim=1, pad_value=0)
+        padded_len = embeds.size(1)
+        pad_len = padded_len - self._sp_own_len
         if pad_len > 0:
-            tail = torch.tensor([padded_len], dtype=cu_seq_lens.dtype, device=cu_seq_lens.device)
-            cu_seq_lens = torch.cat([cu_seq_lens, tail], dim=0)
+            tail = torch.tensor([padded_len], dtype=cu.dtype, device=cu.device)
+            cu = torch.cat([cu, tail], dim=0)
             max_length = max(max_length, pad_len)
 
-        if visual_pos_masks is not None:
-            visual_pos_masks = sp_pad(visual_pos_masks, dim=1, pad_value=0)
-            unit = padded_len // sp_size
-            n_before = int(visual_pos_masks[:, : unit * sp_rank].sum().item())
-            visual_pos_masks = slice_input_tensor(visual_pos_masks, dim=1, padding=False, group=group)
-            k_local = int(visual_pos_masks.sum().item())
-            deepstack_visual_embeds = [layer[n_before : n_before + k_local] for layer in deepstack_visual_embeds]
+        unit = padded_len // sp_size
+        n_before = int(mask[:, : unit * sp_rank].sum().item())
+        embeds = slice_input_tensor(embeds, dim=1, padding=False, group=group)
+        pids = slice_input_tensor(pids, dim=2, padding=False, group=group)
+        mask = slice_input_tensor(mask, dim=1, padding=False, group=group)
+        if deepstack_visual_embeds is not None:
+            k_local = int(mask.sum().item())
+            deepstack_visual_embeds = deepstack_visual_embeds[:, n_before : n_before + k_local, :]
 
-        inputs_embeds = slice_input_tensor(inputs_embeds, dim=1, padding=False, group=group)
-        position_ids = slice_input_tensor(position_ids, dim=2, padding=False, group=group)
-        return inputs_embeds, position_ids, visual_pos_masks, deepstack_visual_embeds, cu_seq_lens, max_length
+        return dict(
+            inputs_embeds=embeds,
+            position_ids=pids,
+            visual_pos_masks=mask,
+            deepstack_visual_embeds=deepstack_visual_embeds,
+            cu_seq_lens_q=cu,
+            cu_seq_lens_k=cu,
+            max_length_q=max_length,
+            max_length_k=max_length,
+        )
+
+    @sp_post_forward("forward")
+    def forward_sp_post(self, owner: int, hidden_states: torch.Tensor, **kwargs: Any) -> Dict[str, Any]:
+        """SP loop-tail: gather this rank's output shard back to the ``owner`` and, on
+        the iteration this rank IS the owner, strip the SP padding to its own length."""
+        del kwargs
+        ps = get_parallel_state()
+        hidden = sp_gather_to_owner(hidden_states, dim=1, dst_group_rank=owner, group=ps.sp_group)
+        if owner == ps.sp_rank:
+            hidden = hidden.narrow(1, 0, self._sp_own_len)
+        return {"hidden_states": hidden, "past_key_values": None}
 
     @post_forward("forward")
     def forward_post(self, **outputs: Any) -> Dict[str, Any]:
         hidden_states = outputs.get("hidden_states")
-
-        ps = get_parallel_state()
-        if ps.sp_enabled:
-            # Gather the per-rank sequence chunks back into the full combined
-            # packed sequence over the MODULE's SP group and drop the SP padding
-            # tail (autograd-aware), then narrow back to this rank's own segment
-            # so the carrier returns to the per-rank layout.
-            hidden_states = gather_outputs(
-                hidden_states,
-                gather_dim=1,
-                padding_dim=1,
-                unpad_dim_size=self._sp_seqlen,
-                group=ps.sp_group,
-            )
-            hidden_states = sp_take_own_seq(
-                hidden_states, dim=1, seg_lengths=self._sp_rep_lengths, sp_rank=self._sp_group_index
-            )
-            self._sp_seqlen = None
-            self._sp_rep_lengths = None
-            self._sp_group_index = 0
 
         conversation = self._conversation_carrier
         pack_shape = self._pack_inputs_embeds_shape

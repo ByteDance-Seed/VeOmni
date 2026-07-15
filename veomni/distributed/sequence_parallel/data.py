@@ -296,3 +296,165 @@ def sp_take_own_seq(full: Tensor, dim: int, seg_lengths: List[int], sp_rank: int
         return full
     offset = sum(seg_lengths[:sp_rank])
     return full.narrow(dim, offset, seg_lengths[sp_rank])
+
+
+# ── Looped per-sample SP (memory-bounded alternative to gather-concat) ─────────
+#
+# The gather-concat path (``sp_gather_seqs`` → slice → forward → ``gather_outputs``
+# → ``sp_take_own_seq``) packs the SP group's ``sp_size`` DISTINCT samples into ONE
+# sequence and runs a single forward. Because the orchestrator pins outer SP to 1
+# (so ``dp == world_size`` and every rank owns a distinct sample), that concat
+# makes the module's effective micro-batch ``sp_size`` samples and all-gathers an
+# ``sp_size``× buffer onto every rank — an OOM that scales with the SP size and
+# defeats SP's purpose (splitting ONE large sample).
+#
+# The looped path keeps the micro-batch at ONE sample: the graph driver
+# (``graphs/dispatch.run_sp_looped_endpoint``) loops over the SP group and, per
+# iteration, redistributes a single owner's sample across the whole group (standard
+# Ulysses on one sample) via the module's ``@sp_pre_forward`` / ``@sp_post_forward``
+# hooks, so the peak footprint is ≈ one sample sharded to ``1/sp_size`` rather than
+# ``sp_size`` samples.
+#
+# * ``_BroadcastFromOwnerSP`` (input side) replaces the all-gather-concat: it
+#   broadcasts ONE owner's sample to the group (autograd-aware; backward sums the
+#   group's grads back to the owner). Only one sample is materialized at a time.
+# * ``_GatherToOwnerSP`` (output side) gathers the per-rank output shards to the
+#   iteration's OWNER only — the owner reconstructs its full sample, non-owners
+#   keep just their ``1/sp_size`` shard — so the output side never holds
+#   ``sp_size`` full samples either. Backward scatters the owner's grad back to
+#   every rank's shard.
+# * A zero-magnitude anchor keeps every iteration reachable from the loss on every
+#   rank, so all ranks traverse each iteration's collectives in the same
+#   (autograd-deterministic) order — no hang, no grad corruption.
+
+
+def _sp_global_rank(group: ProcessGroup, group_rank: int) -> int:
+    """Translate an SP-group-local rank into its global process rank."""
+    return dist.get_global_rank(group, group_rank)
+
+
+class _BroadcastFromOwnerSP(torch.autograd.Function):
+    """Autograd-aware broadcast of ONE owner's tensor to the whole SP group.
+
+    Forward broadcasts the owner's ``tensor`` (shape included, so peers need not
+    know the owner's per-sample length) from ``src_group_rank`` to every rank.
+
+    Backward: the broadcast value was consumed by a *different* shard on each rank,
+    so the grad wrt the owner's tensor is the SUM of the group's grads (a reduce
+    onto the owner). Only the owner rank receives a grad for its input — peers pass
+    their own (unused) tensor and get ``None``, so across the ``sp_size`` calls a
+    rank makes (one per owner) only the ``i == my_rank`` call carries its grad.
+    """
+
+    @staticmethod
+    def forward(ctx, group, src_group_rank, tensor):  # noqa: D401
+        my_rank = dist.get_rank(group)
+        src_global = _sp_global_rank(group, src_group_rank)
+        is_src = my_rank == src_group_rank
+
+        # Broadcast the owner's rank/shape so peers can allocate a matching buffer.
+        # After each broadcast every rank holds the owner's value.
+        ndim = torch.tensor([tensor.dim() if is_src else 0], device=tensor.device, dtype=torch.long)
+        dist.broadcast(ndim, src=src_global, group=group)
+        if is_src:
+            shape = torch.tensor(list(tensor.shape), device=tensor.device, dtype=torch.long)
+        else:
+            shape = torch.empty(int(ndim.item()), device=tensor.device, dtype=torch.long)
+        dist.broadcast(shape, src=src_global, group=group)
+        full_shape = torch.Size([int(x) for x in shape.tolist()])
+
+        if is_src:
+            buf = tensor.contiguous().clone()
+        else:
+            buf = torch.empty(full_shape, dtype=tensor.dtype, device=tensor.device)
+        dist.broadcast(buf, src=src_global, group=group)
+
+        ctx.group = group
+        ctx.src_global = src_global
+        ctx.is_src = is_src
+        return buf
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        grad_out = grad_out.contiguous().clone()
+        dist.reduce(grad_out, dst=ctx.src_global, op=dist.ReduceOp.SUM, group=ctx.group)
+        grad_tensor = grad_out if ctx.is_src else None
+        return None, None, grad_tensor
+
+
+class _GatherToOwnerSP(torch.autograd.Function):
+    """Gather the group's per-rank output shards to ONE owner (dim-``dim`` concat).
+
+    Under Ulysses each rank holds an equal ``1/sp_size`` shard of the (padded)
+    sample. Forward gathers those shards onto ``dst_group_rank`` only and
+    concatenates them into the owner's full (padded) sample; peers keep their own
+    shard as a pass-through so it stays in the autograd graph (the caller anchors
+    it with a zero-magnitude term).
+
+    Backward: the owner splits its grad into ``sp_size`` shards and scatters them
+    back, so every rank recovers the grad of its own shard — peers ignore the
+    (zero) grad arriving from the anchor and use the scattered one instead.
+    """
+
+    @staticmethod
+    def forward(ctx, group, dst_group_rank, dim, chunk):  # noqa: D401
+        sp_size = dist.get_world_size(group)
+        my_rank = dist.get_rank(group)
+        dst_global = _sp_global_rank(group, dst_group_rank)
+        chunk = chunk.contiguous()
+
+        ctx.group = group
+        ctx.dim = dim
+        ctx.dst_global = dst_global
+        ctx.is_dst = my_rank == dst_group_rank
+        ctx.sp_size = sp_size
+        ctx.chunk_shape = chunk.shape
+        ctx.chunk_dtype = chunk.dtype
+
+        if my_rank == dst_group_rank:
+            gathered = [torch.empty_like(chunk) for _ in range(sp_size)]
+            dist.gather(chunk, gather_list=gathered, dst=dst_global, group=group)
+            return torch.cat(gathered, dim=dim)
+        dist.gather(chunk, gather_list=None, dst=dst_global, group=group)
+        return chunk
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        if ctx.is_dst:
+            grads = [g.contiguous() for g in grad_out.contiguous().chunk(ctx.sp_size, dim=ctx.dim)]
+            local_grad = torch.empty(ctx.chunk_shape, dtype=grad_out.dtype, device=grad_out.device)
+            dist.scatter(local_grad, scatter_list=grads, src=ctx.dst_global, group=ctx.group)
+            return None, None, None, local_grad
+        local_grad = torch.empty(ctx.chunk_shape, dtype=ctx.chunk_dtype, device=grad_out.device)
+        dist.scatter(local_grad, scatter_list=None, src=ctx.dst_global, group=ctx.group)
+        return None, None, None, local_grad
+
+
+def sp_broadcast_from_owner(tensor: Tensor, src_group_rank: int, group: ProcessGroup) -> Tensor:
+    """Autograd-aware broadcast of one owner's ``tensor`` to the SP ``group``.
+
+    The owner→all-ranks counterpart of :func:`sp_gather_to_owner` (all-ranks→owner).
+    Thin wrapper around :class:`_BroadcastFromOwnerSP` (see it for the backward
+    contract). The whole tensor (shape included) is broadcast, so there is no
+    axis/``dim`` to specify — every rank ends up holding the owner's exact tensor.
+    """
+    return _BroadcastFromOwnerSP.apply(group, src_group_rank, tensor)
+
+
+def sp_gather_to_owner(chunk: Tensor, dim: int, dst_group_rank: int, group: ProcessGroup) -> Tensor:
+    """Gather the group's shards of one sample to its owner along ``dim``.
+
+    Thin wrapper around :class:`_GatherToOwnerSP`.
+    """
+    return _GatherToOwnerSP.apply(group, dst_group_rank, dim, chunk)
+
+
+# The looped per-sample SP path now lives in the graph:
+# ``graphs/dispatch.run_sp_looped_endpoint`` drives the per-owner loop, threads the
+# deterministic backward-collective link, and broadcasts each owner's ``pre_forward``
+# output to the group with :func:`sp_broadcast_from_owner` (whole-dict, axis-agnostic
+# — no ``dim``). Modules then supply only the axis-aware halves: an ``@sp_pre_forward``
+# hook that slices the shared data, and an ``@sp_post_forward`` hook that calls
+# :func:`sp_gather_to_owner` along its own known axis. The primitives above
+# (``_BroadcastFromOwnerSP`` / ``_GatherToOwnerSP`` and their wrappers) are the
+# building blocks the driver and those hooks use.
