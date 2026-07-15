@@ -18,12 +18,18 @@ class DummyDataset:
     cache directory so that the VeOmni data pipeline can load them.
     """
 
-    def __init__(self, num_samples=16, seq_len=8192, dataset_type: str = "text") -> None:
+    def __init__(
+        self,
+        num_samples=16,
+        seq_len=8192,
+        dataset_type: str = "text",
+        cache_name: str | None = None,
+    ) -> None:
         self.num_samples = num_samples
         self.seq_len = seq_len
         self.num_shard = 2
 
-        self.save_path = get_cache_dir(f"./{dataset_type}")
+        self.save_path = get_cache_dir(f"./{cache_name or dataset_type}")
 
         if not dist.is_initialized() or dist.get_rank() == 0:
             self.dataset = build_dummy_dataset(dataset_type, self.num_samples, self.seq_len)

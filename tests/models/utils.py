@@ -171,24 +171,21 @@ def _to_feature_dict(example: list, token_ids_dict: dict) -> dict:
     return example
 
 
-def prepare_data(model_name: str, max_seq_len: int, model_config):
+def prepare_data(model_name: str, max_seq_len: int, model_config, num_samples: int = 2):
     """
-    Build a DummyDataLoader that yields raw features (list of 2 dicts).
+    Build a DummyDataLoader that yields ``num_samples`` raw features.
     MainCollator packing + cu_seqlens precompute is done in the trainer (TrainerTest).
     """
 
     dataset_name = MODEL_TO_DATASET.get(model_name, "text")
-    dataset = build_dummy_dataset(dataset_name, 2, max_seq_len)
+    dataset = build_dummy_dataset(dataset_name, num_samples, max_seq_len)
 
     token_ids_dict = parse_token_id_from_config(model_config)
 
     class DummyDataLoader:
         def __iter__(self):
             set_seed(42)
-            features = [
-                _to_feature_dict(dataset[0], token_ids_dict),
-                _to_feature_dict(dataset[1], token_ids_dict),
-            ]
+            features = [_to_feature_dict(dataset[index], token_ids_dict) for index in range(num_samples)]
             yield features
 
     return DummyDataLoader()
