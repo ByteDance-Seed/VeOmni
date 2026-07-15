@@ -14,13 +14,14 @@ from types import SimpleNamespace
 
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 
 from veomni.arguments.arguments_types import MixedPrecisionConfig, OpsImplementationConfig
 from veomni.distributed.parallel_state import init_parallel_state
 from veomni.distributed.torch_parallelize import build_parallelize_model
 from veomni.models import build_foundation_model
 from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling_module
-from veomni.ops.kernels.deepseek_v4 import act_quant, fp4_act_quant
+from veomni.ops.kernels.deepseek_v4 import act_quant, fp4_act_quant, linear_bf16_fp32
 from veomni.utils import helper
 
 
@@ -43,6 +44,21 @@ def parse_args() -> argparse.Namespace:
         "--reference-attention-kv-quantization",
         action="store_true",
         help="Apply only the official FP8 E4M3/UE8M0 fake quantization to attention KV tensors",
+    )
+    parser.add_argument(
+        "--reference-indexer-fp4-quantization",
+        action="store_true",
+        help="Apply only the official Hadamard rotation and FP4 fake quantization to indexer Q/K",
+    )
+    parser.add_argument(
+        "--reference-compressor-fp32",
+        action="store_true",
+        help="Match the official compressor's BF16-input/weight GEMMs with FP32 outputs and pooling",
+    )
+    parser.add_argument(
+        "--reference-quantized-linear-fp32",
+        action="store_true",
+        help="Apply official FP8 activation simulation and FP32 accumulation to dequantized linear weights",
     )
     return parser.parse_args()
 
@@ -113,6 +129,35 @@ def main() -> None:
     )
     model.eval()
 
+    if args.reference_compressor_fp32:
+        projection_count = 0
+        for layer in model.model.layers:
+            compressor = getattr(layer.self_attn, "compressor", None)
+            components = (compressor, getattr(compressor, "indexer", None))
+            for component in components:
+                if component is None:
+                    continue
+                for projection_name in ("kv_proj", "gate_proj"):
+                    projection = getattr(component, projection_name, None)
+                    if projection is None:
+                        continue
+
+                    def fp32_projection_hook(module, inputs, _output):
+                        return linear_bf16_fp32(inputs[0], module.weight)
+
+                    projection.register_forward_hook(fp32_projection_hook)
+                    projection_count += 1
+
+                kv_norm = getattr(component, "kv_norm", None)
+                if kv_norm is not None:
+
+                    def compressor_norm_pre_hook(_module, inputs):
+                        return (inputs[0].to(torch.bfloat16), *inputs[1:])
+
+                    kv_norm.register_forward_pre_hook(compressor_norm_pre_hook)
+        if rank == 0:
+            print(f"enabled FP32-output compressor projections on {projection_count} linear modules")
+
     def fake_quant_fp8(x: torch.Tensor, block_size: int = 128) -> torch.Tensor:
         quantized = x.detach().clone()
         act_quant(
@@ -125,10 +170,33 @@ def main() -> None:
         return x + (quantized - x).detach()
 
     quantized_linear_pattern = re.compile(
-        r"(?:\.self_attn\.(?:q_a_proj|q_b_proj|kv_proj|o_b_proj)"
+        r"(?:\.self_attn\.(?:q_a_proj|q_b_proj|kv_proj|o_a_proj|o_b_proj)"
         r"|\.self_attn\.compressor\.indexer\.q_b_proj"
         r"|\.mlp\.shared_experts\.(?:gate_proj|up_proj|down_proj))$"
     )
+    if args.reference_quantized_linear_fp32:
+        quantized_linears = 0
+        for module_name, module in model.named_modules():
+            if quantized_linear_pattern.search(module_name):
+
+                def quantized_linear_fp32_hook(linear, inputs, output):
+                    quantized_input = fake_quant_fp8(inputs[0])
+                    if hasattr(linear, "n_groups"):
+                        input_shape = quantized_input.shape[:-2]
+                        hidden_dim = quantized_input.shape[-1]
+                        weight = linear.weight.float().view(linear.n_groups, -1, hidden_dim).transpose(1, 2)
+                        grouped_input = (
+                            quantized_input.float().reshape(-1, linear.n_groups, hidden_dim).transpose(0, 1)
+                        )
+                        grouped_output = torch.bmm(grouped_input, weight).transpose(0, 1)
+                        return grouped_output.reshape(*input_shape, linear.n_groups, -1).to(output.dtype)
+                    return F.linear(quantized_input.float(), linear.weight.float()).to(output.dtype)
+
+                module.register_forward_hook(quantized_linear_fp32_hook)
+                quantized_linears += 1
+        if rank == 0:
+            print(f"enabled FP8-input/FP32-accumulation simulation on {quantized_linears} linear modules")
+
     if args.reference_quantization:
         quantized_linears = 0
         for module_name, module in model.named_modules():
@@ -169,6 +237,12 @@ def main() -> None:
     )
     if args.reference_attention_kv_quantization:
         implementation += "_attention_kv_fp8_simulation"
+    if args.reference_indexer_fp4_quantization:
+        implementation += "_indexer_fp4_simulation"
+    if args.reference_compressor_fp32:
+        implementation += "_compressor_fp32"
+    if args.reference_quantized_linear_fp32:
+        implementation += "_quantized_linear_fp32"
     trace = make_trace(implementation)
 
     layers = model.model.layers
@@ -204,7 +278,7 @@ def main() -> None:
         cu_seqlen_ks=None,
         cu_seqlen_ke=None,
     ):
-        if args.reference_quantization:
+        if args.reference_quantization or args.reference_indexer_fp4_quantization:
             from fast_hadamard_transform import hadamard_transform
 
             q = hadamard_transform(q, scale=q.shape[-1] ** -0.5)

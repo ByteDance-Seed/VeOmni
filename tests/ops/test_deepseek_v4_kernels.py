@@ -76,6 +76,8 @@ def test_tilelang_wrappers_reject_pre_sm90_before_import(monkeypatch):
         kernels.act_quant(torch.empty(0))
     with pytest.raises(RuntimeError, match="SM90 or later"):
         kernels.fp4_act_quant(torch.empty(0))
+    with pytest.raises(RuntimeError, match="SM90 or later"):
+        kernels.fp4_gemm(*args)
 
 
 def test_tilelang_wrappers_reject_rocm_before_import(monkeypatch):
@@ -94,6 +96,8 @@ def test_tilelang_wrappers_reject_rocm_before_import(monkeypatch):
         kernels.act_quant(torch.empty(0))
     with pytest.raises(RuntimeError, match="NVIDIA CUDA"):
         kernels.fp4_act_quant(torch.empty(0))
+    with pytest.raises(RuntimeError, match="NVIDIA CUDA"):
+        kernels.fp4_gemm(*args)
 
 
 def _require_tilelang_cuda():
@@ -114,6 +118,36 @@ def _indexer_reference(q, k, weights, topk_indices):
 
 def _cosine_similarity(actual, expected):
     return F.cosine_similarity(actual.float().flatten(), expected.float().flatten(), dim=0)
+
+
+def test_fp4_gemm_matches_dequantized_reference():
+    _require_tilelang_cuda()
+    from veomni.ops.kernels.deepseek_v4 import act_quant, fp4_act_quant, fp4_gemm
+
+    torch.manual_seed(5)
+    x = torch.randn(37, 256, device=DEVICE, dtype=torch.bfloat16)
+    weight = torch.randn(128, 256, device=DEVICE, dtype=torch.bfloat16)
+    quantized_x, x_scale = act_quant(
+        x,
+        block_size=128,
+        scale_fmt="ue8m0",
+        scale_dtype=torch.float8_e8m0fnu,
+    )
+    quantized_weight, weight_scale = fp4_act_quant(weight)
+
+    actual = fp4_gemm(quantized_x, x_scale, quantized_weight, weight_scale, torch.float8_e8m0fnu)
+    dequantized_x = act_quant(
+        x.clone(),
+        block_size=128,
+        scale_fmt="ue8m0",
+        scale_dtype=torch.float8_e8m0fnu,
+        inplace=True,
+    )
+    dequantized_weight = fp4_act_quant(weight.clone(), inplace=True)
+    expected = F.linear(dequantized_x.float(), dequantized_weight.float())
+
+    assert actual.dtype == torch.bfloat16
+    torch.testing.assert_close(actual.float(), expected, rtol=3e-2, atol=3e-1)
 
 
 def test_tilelang_indexer_non_power_of_two_topk_forward_backward():
