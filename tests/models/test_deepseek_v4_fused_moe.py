@@ -45,26 +45,34 @@ def test_deepseek_v4_test_overrides_keep_eager_attention_and_expected_moe():
     assert f"--model.ops_implementation.moe_implementation={expected_moe}" in overrides
 
 
-def test_deepseek_v4_topk_router_uses_fp32_projection():
+def test_deepseek_v4_routers_use_fp32_projection_under_autocast():
     config = SimpleNamespace(
         num_experts_per_tok=2,
         num_local_experts=4,
         hidden_size=8,
         scoring_func="sigmoid",
         routed_scaling_factor=1.0,
+        vocab_size=16,
     )
-    router = dsv4.DeepseekV4TopKRouter(config).to(torch.bfloat16)
+    topk_router = dsv4.DeepseekV4TopKRouter(config).to(torch.bfloat16)
+    hash_router = dsv4.DeepseekV4HashRouter(config).to(torch.bfloat16)
     hidden_states = torch.linspace(-1.0, 1.0, 24, dtype=torch.bfloat16).reshape(1, 3, 8)
+    input_ids = torch.tensor([[0, 1, 2]])
 
-    logits, weights, indices = router(hidden_states)
-    expected_logits = F.linear(hidden_states.reshape(-1, 8).float(), router.weight.float())
+    with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+        logits, weights, indices = topk_router(hidden_states)
+        hash_logits, _, _ = hash_router(hidden_states, input_ids)
+    expected_logits = F.linear(hidden_states.reshape(-1, 8).float(), topk_router.weight.float())
+    expected_hash_logits = F.linear(hidden_states.reshape(-1, 8).float(), hash_router.weight.float())
     expected_scores = expected_logits.sigmoid()
     expected_indices = torch.topk(expected_scores, 2, dim=-1, sorted=False).indices
     expected_weights = expected_scores.gather(1, expected_indices)
     expected_weights /= expected_weights.sum(dim=-1, keepdim=True) + 1e-20
 
     assert logits.dtype == torch.float32
+    assert hash_logits.dtype == torch.float32
     torch.testing.assert_close(logits, expected_logits, rtol=0, atol=0)
+    torch.testing.assert_close(hash_logits, expected_hash_logits, rtol=0, atol=0)
     torch.testing.assert_close(indices, expected_indices, rtol=0, atol=0)
     torch.testing.assert_close(weights, expected_weights, rtol=0, atol=0)
 
@@ -86,6 +94,41 @@ def test_deepseek_v4_weighted_rms_norm_matches_official_fp32_multiply_order():
 
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     assert not torch.equal(actual, old_cast_order)
+
+
+def test_deepseek_v4_shared_expert_matches_official_clamped_fp32_swiglu():
+    config = SimpleNamespace(
+        hidden_size=2,
+        intermediate_size=2,
+        mlp_bias=False,
+        hidden_act="silu",
+        swiglu_limit=10.0,
+    )
+    mlp = dsv4.DeepseekV4MLP(config).to(torch.bfloat16)
+    with torch.no_grad():
+        mlp.gate_proj.weight.copy_(torch.eye(2, dtype=torch.bfloat16).mul_(20))
+        mlp.up_proj.weight.copy_(torch.eye(2, dtype=torch.bfloat16).mul_(20))
+        mlp.down_proj.weight.copy_(torch.eye(2, dtype=torch.bfloat16))
+
+    hidden_states = torch.tensor([[1.0, -1.0]], dtype=torch.bfloat16)
+    gate = mlp.gate_proj(hidden_states).float().clamp(max=config.swiglu_limit)
+    up = (
+        mlp.up_proj(hidden_states)
+        .float()
+        .clamp(
+            min=-config.swiglu_limit,
+            max=config.swiglu_limit,
+        )
+    )
+    expected = mlp.down_proj((F.silu(gate) * up).to(hidden_states.dtype))
+    unclamped = mlp.down_proj(
+        (F.silu(mlp.gate_proj(hidden_states).float()) * mlp.up_proj(hidden_states).float()).to(hidden_states.dtype)
+    )
+
+    actual = mlp(hidden_states)
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert not torch.equal(actual, unclamped)
 
 
 def test_deepseek_v4_attention_matches_official_q_norm_and_rope_dtype_modes(monkeypatch):

@@ -33,12 +33,14 @@
 #      Propagate packed boundaries and preserve stateless indexer dispatch
 #    - class_replacement: DeepseekV4Experts
 #      Use v5 gate_up_proj expert layout with OpSlot-guarded VeOmni fused-MoE path
-#    - method_override: DeepseekV4ForCausalLM.forward
-#      OpSlot guard for fused cross entropy in DeepseekV4ForCausalLM.forward
+#    - method_override: DeepseekV4MLP.forward
+#      Match official FP32 clamped SwiGLU arithmetic for shared experts
 #    - method_override: DeepseekV4TopKRouter.forward
 #      Match the official DeepSeek-V4 FP32 router projection
 #    - method_override: DeepseekV4HashRouter.forward
 #      Match the official DeepSeek-V4 FP32 hash-router projection
+#    - method_override: DeepseekV4ForCausalLM.forward
+#      OpSlot guard for fused cross entropy in DeepseekV4ForCausalLM.forward
 #    - method_override: DeepseekV4ForCausalLM.get_parallel_plan
 #      Register DeepseekV4 expert parallel plan for v5 generated modeling
 #
@@ -1235,6 +1237,12 @@ class DeepseekV4HyperHead(nn.Module):
         return (pre.unsqueeze(-1) * x).sum(dim=2).to(x.dtype)
 
 
+# ======================================================================
+# [MODIFIED CLASS] DeepseekV4MLP
+# Methods patched: forward
+# ======================================================================
+
+
 class DeepseekV4MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -1246,9 +1254,25 @@ class DeepseekV4MLP(nn.Module):
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=config.mlp_bias)
         self.act_fn = ACT2FN[config.hidden_act]
 
-    def forward(self, x):
-        down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
-        return down_proj
+    # ================================================================
+    # Patch: DeepseekV4MLP.forward
+    # The shared expert uses the same FP32 clamped SwiGLU as official inference.
+    # Keep the existing class because its V4-specific intermediate-size mapping
+    # is incompatible with LigerSwiGLUMLP construction.
+    # ================================================================
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        dtype = x.dtype
+        gate = self.gate_proj(x).float().clamp(max=self.config.swiglu_limit)
+        up = (
+            self.up_proj(x)
+            .float()
+            .clamp(
+                min=-self.config.swiglu_limit,
+                max=self.config.swiglu_limit,
+            )
+        )
+        hidden_states = self.act_fn(gate) * up
+        return self.down_proj(hidden_states.to(dtype))
 
 
 # ======================================================================
@@ -1355,15 +1379,14 @@ class DeepseekV4TopKRouter(nn.Module):
         self.routed_scaling_factor = config.routed_scaling_factor
         self.register_buffer("e_score_correction_bias", torch.zeros(self.num_experts), persistent=True)
 
-    # ================================================================
-    # Patch: official FP32 router projections
-    # ================================================================
     def forward(
         self,
         hidden_states: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         flat = hidden_states.reshape(-1, self.hidden_dim)
-        logits = F.linear(flat.float(), self.weight.float())
+        device_type = flat.device.type if isinstance(flat.device.type, str) and flat.device.type != "mps" else "cpu"
+        with maybe_autocast(device_type=device_type, enabled=False):
+            logits = F.linear(flat.float(), self.weight.float())
         correction_bias = self.e_score_correction_bias.float()
         scores = self.score_fn(logits)
         indices = torch.topk(scores + correction_bias, self.top_k, dim=-1, sorted=False).indices
@@ -1403,7 +1426,9 @@ class DeepseekV4HashRouter(nn.Module):
         input_ids: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         flat = hidden_states.reshape(-1, self.hidden_dim)
-        logits = F.linear(flat.float(), self.weight.float())
+        device_type = flat.device.type if isinstance(flat.device.type, str) and flat.device.type != "mps" else "cpu"
+        with maybe_autocast(device_type=device_type, enabled=False):
+            logits = F.linear(flat.float(), self.weight.float())
         scores = self.score_fn(logits)
         indices = self.tid2eid[input_ids.reshape(-1)].long()
         weights = scores.gather(1, indices)

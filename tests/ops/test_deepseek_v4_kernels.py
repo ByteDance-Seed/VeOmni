@@ -399,12 +399,12 @@ def test_deepseek_v4_stateless_model_reaches_tilelang_indexer(monkeypatch):
 
     monkeypatch.setattr(modeling, "v4_lighting_indexer", fake_tilelang)
     try:
-        modeling.veomni_dsa_indexer_backend.bind(SimpleNamespace(dsa_indexer_backend="tilelang"))
+        modeling.veomni_dsa_indexer_implementation.bind(SimpleNamespace(dsa_indexer_implementation="tilelang"))
         with torch.no_grad():
             model(input_ids=torch.arange(8, device=DEVICE).unsqueeze(0), use_cache=False)
         assert calls
     finally:
-        modeling.veomni_dsa_indexer_backend.bind(SimpleNamespace(dsa_indexer_backend="eager"))
+        modeling.veomni_dsa_indexer_implementation.bind(SimpleNamespace(dsa_indexer_implementation="eager"))
 
 
 def test_deepseek_v4_packed_compressors_match_independent_sequences():
