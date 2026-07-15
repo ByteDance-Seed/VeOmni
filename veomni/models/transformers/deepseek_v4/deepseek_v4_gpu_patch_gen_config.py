@@ -35,13 +35,16 @@ Patches:
    so callers can read per-token log-probs / entropy alongside the loss.
 5. ``DeepseekV4RMSNorm.forward`` — matches the official inference path's
    FP32 weight multiply followed by a single cast to the input dtype.
-6. ``DeepseekV4RotaryEmbedding.forward`` — retains FP32 cos/sin tables so
-   partial RoPE matches the official complex-FP32 multiply.
+6. ``DeepseekV4RotaryEmbedding.forward`` — retains FP32 cos/sin tables for
+   official-compatible inference and casts them to the activation dtype during
+   training so FSDP activation-checkpoint recomputation sees stable metadata.
 7. ``DeepseekV4Attention.forward`` — matches the official BF16 per-head Q
    normalization before RoPE.
 8. ``DeepseekV4TopKRouter.forward`` / ``DeepseekV4HashRouter.forward`` —
    always perform the official FP32 router projection.
-9. Register ``get_parallel_plan`` on ``DeepseekV4ForCausalLM``.
+9. ``DeepseekV4MLP.forward`` — applies the official FP32, clamped SwiGLU
+   used by shared experts before casting back for the down projection.
+10. Register ``get_parallel_plan`` on ``DeepseekV4ForCausalLM``.
 
 Intentionally NOT patched:
 
@@ -49,13 +52,13 @@ Intentionally NOT patched:
   the unweighted form used inside the HCA/CSA compressors already matches the
   official inference path. The weighted form is patched above without using
   LigerRMSNorm, whose replacement would shadow the distinct unweighted
-  variant. RoPE-determinism / batch-invariant RMSNorm remain separate runtime
-  concerns for future ``device_patch.py`` infra (mirroring DeepseekV3).
-- ``DeepseekV4MLP`` — also used as ``shared_experts`` with a custom
-  ``moe_intermediate_size`` (via ``attribute_map["intermediate_size"] =
-  "moe_intermediate_size"``). ``LigerSwiGLUMLP.__init__`` rejects the
-  ``intermediate_size`` kwarg pattern that DeepSeek-V4 uses, so swapping
-  would break shared-expert construction. Same reasoning as DeepseekV3.
+  variant. Batch-invariant RMSNorm remains a separate runtime concern for
+  future ``device_patch.py`` infra (mirroring DeepseekV3).
+- ``LigerSwiGLUMLP`` — ``DeepseekV4MLP`` is used as ``shared_experts`` with
+  a custom ``moe_intermediate_size`` (via
+  ``attribute_map["intermediate_size"] = "moe_intermediate_size"``).
+  ``LigerSwiGLUMLP.__init__`` rejects that construction pattern, so the
+  existing class is retained and only its forward arithmetic is patched.
 - ``apply_rotary_pos_emb`` — DeepSeek-V4 uses a *partial* RoPE (the
   trailing ``qk_rope_head_dim`` slice only, with the leading nope channels
   untouched) plus an interleaved ``repeat_interleave(2)`` cos/sin layout
@@ -966,6 +969,67 @@ class PatchedDeepseekV4Experts(nn.Module):
 
 
 # ================================================================
+# Patch: DeepseekV4MLP.forward
+# The shared expert uses the same FP32 clamped SwiGLU as official inference.
+# Keep the existing class because its V4-specific intermediate-size mapping
+# is incompatible with LigerSwiGLUMLP construction.
+# ================================================================
+@config.override_method(
+    "DeepseekV4MLP.forward",
+    description="Match official FP32 clamped SwiGLU arithmetic for shared experts",
+)
+def deepseek_v4_mlp_forward_patched(self, x: torch.Tensor) -> torch.Tensor:
+    dtype = x.dtype
+    gate = self.gate_proj(x).float().clamp(max=self.config.swiglu_limit)
+    up = (
+        self.up_proj(x)
+        .float()
+        .clamp(
+            min=-self.config.swiglu_limit,
+            max=self.config.swiglu_limit,
+        )
+    )
+    hidden_states = self.act_fn(gate) * up
+    return self.down_proj(hidden_states.to(dtype))
+
+
+@config.override_method(
+    "DeepseekV4TopKRouter.forward",
+    description="Match the official DeepSeek-V4 FP32 router projection",
+)
+def deepseek_v4_topk_router_forward_patched(
+    self,
+    hidden_states: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    flat = hidden_states.reshape(-1, self.hidden_dim)
+    logits = F.linear(flat.float(), self.weight.float())
+    correction_bias = self.e_score_correction_bias.float()
+    scores = self.score_fn(logits)
+    indices = torch.topk(scores + correction_bias, self.top_k, dim=-1, sorted=False).indices
+    weights = scores.gather(1, indices)
+    weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-20)
+    return logits, weights * self.routed_scaling_factor, indices
+
+
+@config.override_method(
+    "DeepseekV4HashRouter.forward",
+    description="Match the official DeepSeek-V4 FP32 hash-router projection",
+)
+def deepseek_v4_hash_router_forward_patched(
+    self,
+    hidden_states: torch.Tensor,
+    input_ids: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    flat = hidden_states.reshape(-1, self.hidden_dim)
+    logits = F.linear(flat.float(), self.weight.float())
+    scores = self.score_fn(logits)
+    indices = self.tid2eid[input_ids.reshape(-1)].long()
+    weights = scores.gather(1, indices)
+    weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-20)
+    return logits, weights * self.routed_scaling_factor, indices
+
+
+# ================================================================
 # Patch: DeepseekV4ForCausalLM.forward
 # 1. OpSlot guard for fused cross-entropy loss; falls back to the eager
 #    HF loss path when no fused kernel is bound. Returns the unified
@@ -1076,45 +1140,6 @@ def deepseek_v4_forcausallm_forward_patched(
         router_logits=outputs.router_logits,
         fused_linear_aux=fused_linear_aux,
     )
-
-
-# ================================================================
-# Patch: official FP32 router projections
-# ================================================================
-@config.override_method(
-    "DeepseekV4TopKRouter.forward",
-    description="Match the official DeepSeek-V4 FP32 router projection",
-)
-def deepseek_v4_topk_router_forward_patched(
-    self,
-    hidden_states: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    flat = hidden_states.reshape(-1, self.hidden_dim)
-    logits = F.linear(flat.float(), self.weight.float())
-    correction_bias = self.e_score_correction_bias.float()
-    scores = self.score_fn(logits)
-    indices = torch.topk(scores + correction_bias, self.top_k, dim=-1, sorted=False).indices
-    weights = scores.gather(1, indices)
-    weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-20)
-    return logits, weights * self.routed_scaling_factor, indices
-
-
-@config.override_method(
-    "DeepseekV4HashRouter.forward",
-    description="Match the official DeepSeek-V4 FP32 hash-router projection",
-)
-def deepseek_v4_hash_router_forward_patched(
-    self,
-    hidden_states: torch.Tensor,
-    input_ids: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    flat = hidden_states.reshape(-1, self.hidden_dim)
-    logits = F.linear(flat.float(), self.weight.float())
-    scores = self.score_fn(logits)
-    indices = self.tid2eid[input_ids.reshape(-1)].long()
-    weights = scores.gather(1, indices)
-    weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-20)
-    return logits, weights * self.routed_scaling_factor, indices
 
 
 # ================================================================

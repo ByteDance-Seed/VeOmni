@@ -88,6 +88,41 @@ def test_deepseek_v4_weighted_rms_norm_matches_official_fp32_multiply_order():
     assert not torch.equal(actual, old_cast_order)
 
 
+def test_deepseek_v4_shared_expert_matches_official_clamped_fp32_swiglu():
+    config = SimpleNamespace(
+        hidden_size=2,
+        intermediate_size=2,
+        mlp_bias=False,
+        hidden_act="silu",
+        swiglu_limit=10.0,
+    )
+    mlp = dsv4.DeepseekV4MLP(config).to(torch.bfloat16)
+    with torch.no_grad():
+        mlp.gate_proj.weight.copy_(torch.eye(2, dtype=torch.bfloat16).mul_(20))
+        mlp.up_proj.weight.copy_(torch.eye(2, dtype=torch.bfloat16).mul_(20))
+        mlp.down_proj.weight.copy_(torch.eye(2, dtype=torch.bfloat16))
+
+    hidden_states = torch.tensor([[1.0, -1.0]], dtype=torch.bfloat16)
+    gate = mlp.gate_proj(hidden_states).float().clamp(max=config.swiglu_limit)
+    up = (
+        mlp.up_proj(hidden_states)
+        .float()
+        .clamp(
+            min=-config.swiglu_limit,
+            max=config.swiglu_limit,
+        )
+    )
+    expected = mlp.down_proj((F.silu(gate) * up).to(hidden_states.dtype))
+    unclamped = mlp.down_proj(
+        (F.silu(mlp.gate_proj(hidden_states).float()) * mlp.up_proj(hidden_states).float()).to(hidden_states.dtype)
+    )
+
+    actual = mlp(hidden_states)
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert not torch.equal(actual, unclamped)
+
+
 def test_deepseek_v4_attention_matches_official_q_norm_and_rope_dtype_modes(monkeypatch):
     config = dsv4.DeepseekV4Config.from_pretrained("tests/toy_config/deepseek_v4_toy")
     torch.manual_seed(42)
