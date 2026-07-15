@@ -185,9 +185,10 @@ class DiTTrainer:
         self.base = BaseTrainer.__new__(BaseTrainer)
         self.base.args = args
 
-        # rewrite _setup, setup arguments for dit training
+        # rewrite _setup, setup arguments for dit training.
+        # ``_setup`` registers ParallelState before reading ``dp_size`` (unlike
+        # TextTrainer, DiT recomputes dataloader_batch_size inside ``_setup``).
         self._setup()
-        self.base.register_parallel_state("base")
 
         # All build steps read the current ParallelState via ``get_parallel_state()``
         # (meta-init, FSDP2/EP wrap + weight load, optimizer, SP data pipeline), so
@@ -226,6 +227,7 @@ class DiTTrainer:
 
     def _setup(self):
         self.base._setup()
+        self.base.register_parallel_state("base")
         args: VeOmniDiTArguments = self.base.args
         args.train.dyn_bsz = False
         args.train.micro_batch_size = 1
