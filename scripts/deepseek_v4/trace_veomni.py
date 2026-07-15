@@ -60,6 +60,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eager-dsa-output", type=Path)
     parser.add_argument("--eager-mhc-output", type=Path)
     parser.add_argument("--same-input-indexer-reference", action="store_true")
+    parser.add_argument(
+        "--reference-moe-topk",
+        action="store_true",
+        help="Replay official MoE expert IDs while retaining VeOmni router weights and expert execution",
+    )
     parser.add_argument("--reference-quantization", action="store_true")
     parser.add_argument(
         "--reference-attention-kv-quantization",
@@ -417,6 +422,8 @@ def main() -> None:
         f"veomni_moe={args.moe_backend}_indexer={args.indexer_backend}_attention={args.attention_backend}"
         f"_mhc={args.mhc_backend}"
     )
+    if args.reference_moe_topk:
+        implementation += "_official_moe_topk"
     if args.reference_attention_kv_quantization:
         implementation += "_attention_kv_fp8_simulation"
     if args.reference_indexer_fp4_quantization:
@@ -436,6 +443,33 @@ def main() -> None:
     trace = make_trace(implementation)
 
     layers = model.model.layers
+    if args.reference_moe_topk:
+        missing_layers = set(range(len(layers))) - set(official_trace["moe_topk"])
+        if missing_layers:
+            raise ValueError(f"Official trace is missing MoE top-k tensors for layers {sorted(missing_layers)}")
+        for layer_id, layer in enumerate(layers):
+            official_indices = official_trace["moe_topk"][layer_id].to(device=device, dtype=torch.long)
+
+            def replay_official_topk(
+                module,
+                _inputs,
+                output,
+                *,
+                layer_id=layer_id,
+                official_indices=official_indices,
+            ):
+                logits, _weights, veomni_indices = output
+                if veomni_indices.shape != official_indices.shape:
+                    raise ValueError(
+                        f"Layer {layer_id} router shape mismatch: VeOmni {tuple(veomni_indices.shape)} "
+                        f"vs official {tuple(official_indices.shape)}"
+                    )
+                scores = module.score_fn(logits)
+                weights = scores.gather(1, official_indices)
+                weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-20)
+                return logits, weights * module.routed_scaling_factor, official_indices
+
+            layer.mlp.gate.register_forward_hook(replay_official_topk)
     if args.force_official_attention_inputs:
         for layer_id in args.detail_layers:
             official_attention_input = official_trace["details"][layer_id]["attn_input"].to(device)
