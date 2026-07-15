@@ -55,7 +55,6 @@ def test_deepseek_v4_topk_router_uses_fp32_projection():
         routed_scaling_factor=1.0,
     )
     router = dsv4.DeepseekV4TopKRouter(config).to(torch.bfloat16)
-    router.use_fp32_projection = True
     hidden_states = torch.linspace(-1.0, 1.0, 24, dtype=torch.bfloat16).reshape(1, 3, 8)
 
     logits, weights, indices = router(hidden_states)
@@ -88,6 +87,59 @@ def test_deepseek_v4_weighted_rms_norm_matches_official_fp32_multiply_order():
 
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     assert not torch.equal(actual, old_cast_order)
+
+
+def test_deepseek_v4_attention_matches_official_q_norm_and_fp32_rope(monkeypatch):
+    config = dsv4.DeepseekV4Config.from_pretrained("tests/toy_config/deepseek_v4_toy")
+    torch.manual_seed(42)
+    attention = dsv4.DeepseekV4Attention(config, layer_idx=0).to(torch.bfloat16).eval()
+    hidden_states = torch.randn(1, 7, config.hidden_size, dtype=torch.bfloat16)
+    position_ids = torch.arange(hidden_states.shape[1]).unsqueeze(0)
+    rotary = dsv4.DeepseekV4RotaryEmbedding(config)
+    cos, sin = rotary(hidden_states, position_ids, layer_type="main")
+
+    assert cos.dtype == torch.float32
+    assert sin.dtype == torch.float32
+
+    captured = {}
+
+    def fake_attention(_module, query, _key, _value, _mask, **_kwargs):
+        captured["query"] = query
+        return torch.zeros_like(query.transpose(1, 2)), None
+
+    monkeypatch.setattr(
+        dsv4,
+        "ALL_ATTENTION_FUNCTIONS",
+        SimpleNamespace(get_interface=lambda *_args: fake_attention),
+    )
+    attention(
+        hidden_states,
+        position_embeddings={"main": (cos, sin), "compress": (cos, sin)},
+        position_ids=position_ids,
+        attention_mask=None,
+    )
+
+    q_residual = attention.q_a_norm(attention.q_a_proj(hidden_states))
+    q_raw = attention.q_b_proj(q_residual).view(
+        hidden_states.shape[0], hidden_states.shape[1], config.num_attention_heads, config.head_dim
+    )
+    expected = q_raw * torch.rsqrt(q_raw.square().mean(-1, keepdim=True) + config.rms_norm_eps)
+    expected = dsv4.apply_rotary_pos_emb(expected.transpose(1, 2), cos, sin)
+    old_fp32_norm = attention.q_b_norm(q_raw.transpose(1, 2))
+    old_fp32_norm = dsv4.apply_rotary_pos_emb(old_fp32_norm, cos, sin)
+
+    torch.testing.assert_close(captured["query"], expected, rtol=0, atol=0)
+    assert not torch.equal(captured["query"], old_fp32_norm)
+
+    rope_dim = cos.shape[-1] * 2
+    expected_rope = torch.view_as_real(
+        torch.view_as_complex(expected[..., -rope_dim:].float().unflatten(-1, (-1, 2)))
+        * torch.complex(cos, sin).unsqueeze(1)
+    ).flatten(-2)
+    actual_twice_rotated = dsv4.apply_rotary_pos_emb(expected, cos, sin)
+    torch.testing.assert_close(
+        actual_twice_rotated[..., -rope_dim:], expected_rope.to(torch.bfloat16), rtol=0, atol=2**-13
+    )
 
 
 def test_deepseek_v4_fused_moe_receives_merged_weights_and_swiglu_limit(monkeypatch):

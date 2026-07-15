@@ -11,6 +11,8 @@
 #  Patches applied:
 #    - method_override: DeepseekV4RMSNorm.forward
 #      Multiply normalized activations and weights in FP32 before casting to the input dtype
+#    - method_override: DeepseekV4RotaryEmbedding.forward
+#      Retain FP32 cos/sin tables for the official complex-FP32 RoPE arithmetic
 #    - method_override: DeepseekV4HyperConnection.forward
 #      Dispatch DeepSeek V4 mHC pre/Sinkhorn/collapse through an OpSlot
 #    - method_override: DeepseekV4HyperHead.forward
@@ -136,6 +138,12 @@ class DeepseekV4UnweightedRMSNorm(nn.Module):
         return x * torch.rsqrt(x.float().square().mean(-1, keepdim=True) + self.eps).to(x.dtype)
 
 
+# ======================================================================
+# [MODIFIED CLASS] DeepseekV4RotaryEmbedding
+# Methods patched: forward
+# ======================================================================
+
+
 class DeepseekV4RotaryEmbedding(nn.Module):
     """
     Multi-layer-type rotary embedding (Laguna pattern: partial rotary on top of
@@ -212,14 +220,12 @@ class DeepseekV4RotaryEmbedding(nn.Module):
         )
         return inv_freq, attention_factor
 
+    # ================================================================
+    # Patch: official RoPE table precision
+    # ================================================================
     @torch.no_grad()
     @dynamic_rope_update  # power user: used with advanced RoPE types (e.g. dynamic rope)
     def forward(self, x, position_ids, layer_type=None):
-        # Key difference vs Laguna's forward: no `torch.cat([freqs, freqs], dim=-1)`
-        # duplication. V4's interleaved RoPE pairs consecutive channels, so we only need
-        # `rope_head_dim // 2` unique θ entries — the `apply_rotary_pos_emb` helper does
-        # the `repeat_interleave(2)` next to the rotation math, where the link between
-        # the doubled dim and `rotate_half` is local and obvious.
         inv_freq = getattr(self, f"{layer_type}_inv_freq")
         attention_scaling = getattr(self, f"{layer_type}_attention_scaling")
         inv_freq_expanded = inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)
@@ -229,7 +235,7 @@ class DeepseekV4RotaryEmbedding(nn.Module):
             freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
             cos = freqs.cos() * attention_scaling
             sin = freqs.sin() * attention_scaling
-        return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
+        return cos, sin
 
 
 class DeepseekV4HCACache(DynamicSlidingWindowLayer):
@@ -1069,8 +1075,9 @@ class DeepseekV4Attention(nn.Module):
         cos, sin = position_embeddings[self.rope_layer_type]
 
         q_residual = self.q_a_norm(self.q_a_proj(hidden_states))
-        q = self.q_b_proj(q_residual).view(*hidden_shape).transpose(1, 2)
-        q = self.q_b_norm(q)
+        q = self.q_b_proj(q_residual).view(*hidden_shape)
+        q = q * torch.rsqrt(q.square().mean(-1, keepdim=True) + self.q_b_norm.eps)
+        q = q.transpose(1, 2)
         q = apply_rotary_pos_emb(q, cos, sin)
 
         kv = self.kv_norm(self.kv_proj(hidden_states)).view(*hidden_shape).transpose(1, 2)
@@ -1496,12 +1503,8 @@ class DeepseekV4TopKRouter(nn.Module):
         hidden_states: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         flat = hidden_states.reshape(-1, self.hidden_dim)
-        if getattr(self, "use_fp32_projection", False):
-            logits = F.linear(flat.float(), self.weight.float())
-            correction_bias = self.e_score_correction_bias.float()
-        else:
-            logits = F.linear(flat, self.weight)
-            correction_bias = self.e_score_correction_bias
+        logits = F.linear(flat.float(), self.weight.float())
+        correction_bias = self.e_score_correction_bias.float()
         scores = self.score_fn(logits)
         indices = torch.topk(scores + correction_bias, self.top_k, dim=-1, sorted=False).indices
         weights = scores.gather(1, indices)
@@ -1540,10 +1543,7 @@ class DeepseekV4HashRouter(nn.Module):
         input_ids: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         flat = hidden_states.reshape(-1, self.hidden_dim)
-        if getattr(self, "use_fp32_projection", False):
-            logits = F.linear(flat.float(), self.weight.float())
-        else:
-            logits = F.linear(flat, self.weight)
+        logits = F.linear(flat.float(), self.weight.float())
         scores = self.score_fn(logits)
         indices = self.tid2eid[input_ids.reshape(-1)].long()
         weights = scores.gather(1, indices)

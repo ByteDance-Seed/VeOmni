@@ -35,7 +35,13 @@ Patches:
    so callers can read per-token log-probs / entropy alongside the loss.
 5. ``DeepseekV4RMSNorm.forward`` — matches the official inference path's
    FP32 weight multiply followed by a single cast to the input dtype.
-6. Register ``get_parallel_plan`` on ``DeepseekV4ForCausalLM``.
+6. ``DeepseekV4RotaryEmbedding.forward`` — retains FP32 cos/sin tables so
+   partial RoPE matches the official complex-FP32 multiply.
+7. ``DeepseekV4Attention.forward`` — matches the official BF16 per-head Q
+   normalization before RoPE.
+8. ``DeepseekV4TopKRouter.forward`` / ``DeepseekV4HashRouter.forward`` —
+   always perform the official FP32 router projection.
+9. Register ``get_parallel_plan`` on ``DeepseekV4ForCausalLM``.
 
 Intentionally NOT patched:
 
@@ -191,6 +197,26 @@ def deepseek_v4_rms_norm_forward_patched(self, hidden_states: torch.Tensor) -> t
     variance = hidden_states.square().mean(-1, keepdim=True)
     hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
     return (self.weight.float() * hidden_states).to(input_dtype)
+
+
+# ================================================================
+# Patch: official RoPE table precision
+# ================================================================
+@config.override_method(
+    "DeepseekV4RotaryEmbedding.forward",
+    description="Retain FP32 cos/sin tables for the official complex-FP32 RoPE arithmetic",
+)
+def deepseek_v4_rotary_embedding_forward_patched(self, x, position_ids, layer_type=None):
+    inv_freq = getattr(self, f"{layer_type}_inv_freq")
+    attention_scaling = getattr(self, f"{layer_type}_attention_scaling")
+    inv_freq_expanded = inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)
+    position_ids_expanded = position_ids[:, None, :].float()
+    device_type = x.device.type if isinstance(x.device.type, str) and x.device.type != "mps" else "cpu"
+    with maybe_autocast(device_type=device_type, enabled=False):
+        freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
+        cos = freqs.cos() * attention_scaling
+        sin = freqs.sin() * attention_scaling
+    return cos, sin
 
 
 # ================================================================
@@ -631,8 +657,9 @@ def deepseek_v4_attention_forward_patched(
     cos, sin = position_embeddings[self.rope_layer_type]
 
     q_residual = self.q_a_norm(self.q_a_proj(hidden_states))
-    q = self.q_b_proj(q_residual).view(*hidden_shape).transpose(1, 2)
-    q = self.q_b_norm(q)
+    q = self.q_b_proj(q_residual).view(*hidden_shape)
+    q = q * torch.rsqrt(q.square().mean(-1, keepdim=True) + self.q_b_norm.eps)
+    q = q.transpose(1, 2)
     q = apply_rotary_pos_emb(q, cos, sin)
 
     kv = self.kv_norm(self.kv_proj(hidden_states)).view(*hidden_shape).transpose(1, 2)
@@ -1094,12 +1121,8 @@ def deepseek_v4_topk_router_forward_patched(
     hidden_states: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     flat = hidden_states.reshape(-1, self.hidden_dim)
-    if getattr(self, "use_fp32_projection", False):
-        logits = F.linear(flat.float(), self.weight.float())
-        correction_bias = self.e_score_correction_bias.float()
-    else:
-        logits = F.linear(flat, self.weight)
-        correction_bias = self.e_score_correction_bias
+    logits = F.linear(flat.float(), self.weight.float())
+    correction_bias = self.e_score_correction_bias.float()
     scores = self.score_fn(logits)
     indices = torch.topk(scores + correction_bias, self.top_k, dim=-1, sorted=False).indices
     weights = scores.gather(1, indices)
@@ -1117,10 +1140,7 @@ def deepseek_v4_hash_router_forward_patched(
     input_ids: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     flat = hidden_states.reshape(-1, self.hidden_dim)
-    if getattr(self, "use_fp32_projection", False):
-        logits = F.linear(flat.float(), self.weight.float())
-    else:
-        logits = F.linear(flat, self.weight)
+    logits = F.linear(flat.float(), self.weight.float())
     scores = self.score_fn(logits)
     indices = self.tid2eid[input_ids.reshape(-1)].long()
     weights = scores.gather(1, indices)
