@@ -48,9 +48,11 @@ train:
     fsdp_config:
       fsdp_mode: fsdp2
       mixed_precision:
-        # The checkpoint parameters are already BF16. Avoid FSDP's additional
-        # mixed-precision parameter/casting buffers on this memory-tight run.
-        enable: false
+        # LoRA keeps gradients and optimizer states small enough for FP32
+        # sharded storage, BF16 compute/all-gathers, and FP32 reductions.
+        enable: true
+        param_dtype: bfloat16
+        reduce_dtype: float32
     offload_config:
       enable_activation: false
   gradient_checkpointing:
