@@ -96,6 +96,8 @@ class Arguments(VeOmniArguments):
 
 def main():
     args = parse_args(Arguments)
+    if args.train.chunk_mbs_config.enable:
+        raise ValueError("ChunkMBS is not supported by tasks/omni/train_omni_model.py yet.")
     logger.info(f"Process rank: {args.train.global_rank}, world size: {args.train.world_size}")
     logger.info_rank0(json.dumps(asdict(args), indent=2))
     get_torch_device().set_device(f"{get_device_type()}:{args.train.local_rank}")

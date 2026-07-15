@@ -138,6 +138,8 @@ class TextDPOTrainer:
     reference_model: PreTrainedModel
 
     def __init__(self, args: VeOmniDPOArguments):
+        if args.train.chunk_mbs_config.enable:
+            raise ValueError("ChunkMBS is not supported by the DPO trainer yet.")
         self.base = BaseTrainer.__new__(BaseTrainer)
         self.base.args = args
 

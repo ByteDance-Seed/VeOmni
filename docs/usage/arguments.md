@@ -75,6 +75,8 @@ Training loop, optimizer, parallelism, checkpointing, profiling, and logging.
     * `ProfileConfig` — `train.profile.*`
     * `ChannelLossConfig` — `train.channel_loss.*`
     * `GradientCheckpointingConfig` — `train.gradient_checkpointing.*`
+    * `TorchCompileConfig` — `train.torch_compile.*`
+    * `ChunkMBSConfig` — `train.chunk_mbs_config.*`
     * `AcceleratorConfig` — `train.accelerator.*`
         * `FSDPConfig` — `train.accelerator.fsdp_config.*`
           * `MixedPrecisionConfig` — `train.accelerator.fsdp_config.mixed_precision`
@@ -269,6 +271,7 @@ NPU validation runs at two times:
 | channel_loss | `ChannelLossConfig` | — | Detached per-channel causal-LM loss logging. |
 | gradient_checkpointing | `GradientCheckpointingConfig` | — | Gradient checkpointing settings. |
 | torch_compile | `TorchCompileConfig` | — | Per-block `torch.compile` settings. |
+| chunk_mbs_config | `ChunkMBSConfig` | — | Packed-sequence layer micro-batching settings. |
 | accelerator | `AcceleratorConfig` | — | Parallelism and distributed-training topology. |
 | checkpoint | `CheckpointConfig` | — | Checkpoint saving and loading. |
 
@@ -381,6 +384,27 @@ distinct from the first emission.
 | enable | `bool` | `True` | Enable gradient checkpointing. |
 | debug | `bool` | `False` | Enable [checkpoint debugging](https://docs.pytorch.org/docs/stable/checkpoint.html#torch.utils.checkpoint.set_checkpoint_debug_enabled). |
 | enable_reentrant | `bool` | `False` | Use reentrant gradient checkpointing. |
+
+### ChunkMBSConfig
+
+`train.chunk_mbs_config.*` — Packed-sequence layer micro-batching settings.
+
+`chunk_mbs` is the number of packed samples per layer chunk. With dynamic batching, the runtime sample
+count is inferred from `cu_seq_lens_q`, so it is independent of `train.micro_batch_size`. Chunks are cut
+only on packed sample boundaries. The current implementation supports trainer-based SFT with packed-sequence
+FlashAttention kwargs using `torch.int32` cumulative lengths, identical query/key metadata, exactly one
+`*DecoderLayer` class and one matching decoder stack, decoder layers derived from Transformers'
+`GradientCheckpointingLayer`, and decoder states with shape `[1, sequence, hidden]`. Gradient checkpointing may be
+enabled or disabled; when enabled, it must use the non-reentrant implementation. Sequence parallelism,
+tensor parallelism, pipeline parallelism, ExtraParallel/MoE, DiT trainers, RL trainers, DPO, the custom Omni training loop,
+`pad_to_length`, and `torch.compile` are not supported. Chunk boundaries must also align with linear-attention
+cumulative sequence boundaries when that metadata is present. Models with ambiguous decoder classes or stacks fail
+validation instead of applying ChunkMBS to multiple stacks.
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| enable | `bool` | `False` | Enable ChunkMBS for packed-sequence decoder layers listed in `model._no_split_modules`. |
+| chunk_mbs | `int` | `1` | Number of packed samples per layer chunk. |
 
 ### AcceleratorConfig
 

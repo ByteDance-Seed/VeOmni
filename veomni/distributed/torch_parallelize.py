@@ -31,6 +31,7 @@ from ..models import load_model_weights, load_model_weights_ep_sharded, rank0_lo
 from ..utils import logging
 from ..utils.device import IS_NPU_AVAILABLE, get_device_type
 from .checkpoint import CheckpointFunction
+from .chunk_mbs import apply_chunk_mbs
 from .parallel_plan import get_runtime_parallel_plan
 from .parallel_state import get_parallel_state
 from .torch_compile import CompileConfig, compile_decoder_blocks, validate_compile_config_for_fsdp2
@@ -518,6 +519,13 @@ def build_parallelize_model(
 
     parallel_state = get_parallel_state()
     compile_config = compile_config or CompileConfig()
+    chunk_mbs_config = kwargs.pop("chunk_mbs_config", None)
+
+    if chunk_mbs_config is not None and chunk_mbs_config.enable:
+        if compile_config.enable:
+            raise ValueError("ChunkMBS is not supported with torch.compile yet.")
+        if enable_gradient_checkpointing and kwargs.get("enable_reentrant", False):
+            raise ValueError("ChunkMBS requires non-reentrant gradient checkpointing.")
 
     if not parallel_state.fsdp_enabled:
         if kwargs.get("init_device") not in ["cuda", "npu"]:
@@ -538,6 +546,9 @@ def build_parallelize_model(
                 "context_fn": kwargs.pop("recompute_context_fn", noop_context_fn),
             },
         )
+
+    if chunk_mbs_config is not None and chunk_mbs_config.enable:
+        model = apply_chunk_mbs(model, chunk_mbs_config)
 
     if parallel_state.tp_enabled:
         logger.info_rank0("Apply tensor parallel to the model.")

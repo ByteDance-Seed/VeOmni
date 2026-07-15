@@ -6,7 +6,9 @@ import torch
 import torch.nn as nn
 
 from veomni.arguments.arguments_types import (
+    ChunkMBSConfig,
     DataArguments,
+    GradientCheckpointingConfig,
     ModelArguments,
     OpsImplementationConfig,
     TrainingArguments,
@@ -240,6 +242,73 @@ def test_enable_compile_requires_dynamic_batching():
                 torch_compile=ArgumentsTorchCompileConfig(enable=True), dyn_bsz=False, pad_to_length=False
             ),
         )
+
+
+def test_enable_compile_rejects_chunk_mbs():
+    with pytest.raises(ValueError, match="train.chunk_mbs_config.enable is not supported"):
+        VeOmniArguments(
+            model=_model_args(),
+            data=DataArguments(train_path="dummy.jsonl", max_seq_len=8),
+            train=TrainingArguments(
+                torch_compile=ArgumentsTorchCompileConfig(enable=True),
+                chunk_mbs_config=ChunkMBSConfig(enable=True),
+                dyn_bsz=True,
+                pad_to_length=False,
+            ),
+        )
+
+
+def test_chunk_mbs_rejects_static_padding():
+    with pytest.raises(ValueError, match="not supported with train.pad_to_length"):
+        VeOmniArguments(
+            model=_model_args(),
+            data=DataArguments(train_path="dummy.jsonl", max_seq_len=8),
+            train=TrainingArguments(
+                chunk_mbs_config=ChunkMBSConfig(enable=True),
+                dyn_bsz=True,
+                pad_to_length=True,
+                micro_batch_size=2,
+            ),
+        )
+
+
+def test_chunk_mbs_rejects_reentrant_gradient_checkpointing():
+    with pytest.raises(ValueError, match="requires non-reentrant gradient checkpointing"):
+        VeOmniArguments(
+            model=_model_args(),
+            data=DataArguments(train_path="dummy.jsonl", max_seq_len=8),
+            train=TrainingArguments(
+                chunk_mbs_config=ChunkMBSConfig(enable=True),
+                gradient_checkpointing=GradientCheckpointingConfig(enable_reentrant=True),
+            ),
+        )
+
+
+def test_chunk_mbs_rejects_dpo_trainer():
+    with pytest.raises(ValueError, match="not supported by the DPO trainer"):
+        VeOmniArguments(
+            model=_model_args(),
+            data=DataArguments(train_path="dummy.jsonl", max_seq_len=8, data_type="dpo"),
+            train=TrainingArguments(chunk_mbs_config=ChunkMBSConfig(enable=True)),
+        )
+
+
+def test_dpo_trainer_rejects_chunk_mbs_regardless_of_data_type():
+    from veomni.trainer.text_dpo_trainer import TextDPOTrainer
+
+    args = SimpleNamespace(train=SimpleNamespace(chunk_mbs_config=ChunkMBSConfig(enable=True)))
+    with pytest.raises(ValueError, match="not supported by the DPO trainer"):
+        TextDPOTrainer(args)
+
+
+def test_rl_trainer_rejects_chunk_mbs():
+    from veomni.trainer.base_rl_trainer import BaseRLTrainer
+
+    args = SimpleNamespace(train=SimpleNamespace(chunk_mbs_config=ChunkMBSConfig(enable=True)))
+    trainer = BaseRLTrainer.__new__(BaseRLTrainer)
+    trainer.args = args
+    with pytest.raises(ValueError, match="not supported by RL trainers"):
+        trainer._setup()
 
 
 def test_enable_compile_requires_padding_for_dynamic_batching():

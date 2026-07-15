@@ -34,6 +34,8 @@ logger = logging.get_logger(__name__)
 #   ├── profile.*            → ProfileConfig
 #   ├── channel_loss.*       → ChannelLossConfig
 #   ├── gradient_checkpointing.*  → GradientCheckpointingConfig
+#   ├── torch_compile.*      → TorchCompileConfig
+#   ├── chunk_mbs_config.*   → ChunkMBSConfig
 #   ├── accelerator.*        → AcceleratorConfig
 #   │   ├── fsdp_config.*    → FSDPConfig
 #   │   |   └── mixed_precision.* → MixedPrecisionConfig
@@ -319,6 +321,20 @@ class GradientCheckpointingConfig:
     enable_reentrant: bool = field(
         default=False,
         metadata={"help": "Use reentrant gradient checkpointing."},
+    )
+
+
+@dataclass
+class ChunkMBSConfig:
+    """train.chunk_mbs_config.* — Packed-sequence layer micro-batching."""
+
+    enable: bool = field(
+        default=False,
+        metadata={"help": "Enable ChunkMBS for packed-sequence decoder layers."},
+    )
+    chunk_mbs: int = field(
+        default=1,
+        metadata={"help": "Number of packed samples per layer chunk."},
     )
 
 
@@ -694,6 +710,7 @@ class TrainingArguments:
     channel_loss: ChannelLossConfig = field(default_factory=ChannelLossConfig)
     gradient_checkpointing: GradientCheckpointingConfig = field(default_factory=GradientCheckpointingConfig)
     torch_compile: TorchCompileConfig = field(default_factory=TorchCompileConfig)
+    chunk_mbs_config: ChunkMBSConfig = field(default_factory=ChunkMBSConfig)
     accelerator: AcceleratorConfig = field(default_factory=AcceleratorConfig)
     checkpoint: CheckpointConfig = field(default_factory=CheckpointConfig)
 
@@ -702,6 +719,8 @@ class TrainingArguments:
             raise ValueError(
                 f"dyn_bsz_physical_overflow_ratio must be >= 1.0, got {self.dyn_bsz_physical_overflow_ratio}."
             )
+        if self.chunk_mbs_config.chunk_mbs < 1:
+            raise ValueError(f"chunk_mbs_config.chunk_mbs must be >= 1, got {self.chunk_mbs_config.chunk_mbs}.")
 
         self._train_steps = -1
         self.local_rank = int(os.getenv("LOCAL_RANK", 0))
@@ -1403,7 +1422,23 @@ class VeOmniArguments:
                 self.train.pad_to_length = self.train.micro_batch_size * self.data.max_seq_len
                 logger.info_rank0(f"set pad_to_length = micro_batch_size * max_seq_len = {self.train.pad_to_length}")
 
+        if self.train.chunk_mbs_config.enable:
+            if self.train.pad_to_length:
+                raise ValueError("train.chunk_mbs_config.enable is not supported with train.pad_to_length yet.")
+            if self.train.gradient_checkpointing.enable and self.train.gradient_checkpointing.enable_reentrant:
+                raise ValueError(
+                    "train.chunk_mbs_config.enable requires non-reentrant gradient checkpointing. "
+                    "Set train.gradient_checkpointing.enable_reentrant=False."
+                )
+            if self.data.data_type == "dpo":
+                raise ValueError("train.chunk_mbs_config.enable is not supported by the DPO trainer yet.")
+
         if self.train.torch_compile.enable:
+            if self.train.chunk_mbs_config.enable:
+                raise ValueError(
+                    "train.chunk_mbs_config.enable is not supported with train.torch_compile.enable yet. "
+                    "ChunkMBS wraps decoder forwards with per-batch chunk ranges before decoder blocks are compiled."
+                )
             if not getattr(self.data, "supports_torch_compile", True):
                 raise ValueError(
                     "train.torch_compile.enable currently supports text trainers only. "
