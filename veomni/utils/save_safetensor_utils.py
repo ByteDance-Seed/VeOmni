@@ -231,19 +231,8 @@ def save_hf_safetensor(
         fqn_to_index_mapping = resolve_fqn_to_index_mapping_for_save(model, fqn_to_index_mapping)
         _save_hf_safetensor_distributed(model, save_hf_safetensor_path, fqn_to_index_mapping, model_assets)
     else:
-        # Legacy path is rank-0 only; non-rank-0 waits at the barrier below.
-        # Resolve ``is_rank_0`` from the process group when the caller did not
-        # explicitly pass it (e.g. when the distributed path was disabled at
-        # runtime via the NPU guard).
-        if not is_rank_0 and dist.is_initialized():
-            is_rank_0 = dist.get_rank() == 0
+        # Legacy path is rank-0 only; non-rank-0 waits at the barrier below
         if is_rank_0:
-            if not save_checkpoint_path:
-                raise ValueError(
-                    "save_checkpoint_path is required for the legacy HF safetensors path. "
-                    "The distributed `HuggingFaceStorageWriter` path is disabled on this platform "
-                    "(e.g. NPU), so the legacy rank-0 conversion from a DCP checkpoint must be used."
-                )
             _save_hf_safetensor_legacy(
                 save_checkpoint_path,
                 save_hf_safetensor_path,
