@@ -31,17 +31,16 @@ from .comm import (
     get_unified_sequence_parallel_group,
     get_unified_sequence_parallel_rank,
     get_unified_sequence_parallel_world_size,
-    init_sequence_parallel,
-    set_context_parallel_group,
-    set_data_parallel_group,
     set_ulysses_sequence_parallel_group,
-    set_unified_sequence_parallel_group,
 )
 from .data import (
     gather_outputs,
     slice_input_tensor,
     slice_input_tensor_scale_grad,
+    sp_gather_seqs,
+    sp_pad,
     sp_pad_and_slice,
+    sp_take_own_seq,
 )
 from .loss import reduce_sequence_parallel_loss
 from .ulysses import (
@@ -54,24 +53,23 @@ from .utils import pad_tensor, unpad_tensor, vlm_images_a2a_meta
 
 
 __all__ = [
-    "init_sequence_parallel",
-    "set_data_parallel_group",
     "get_data_parallel_group",
     "get_data_parallel_rank",
     "set_ulysses_sequence_parallel_group",
     "get_ulysses_sequence_parallel_world_size",
     "get_ulysses_sequence_parallel_rank",
     "get_ulysses_sequence_parallel_group",
-    "set_context_parallel_group",
     "get_context_parallel_group",
     "get_context_parallel_rank",
     "get_context_parallel_world_size",
-    "set_unified_sequence_parallel_group",
     "get_unified_sequence_parallel_group",
     "get_unified_sequence_parallel_rank",
     "get_unified_sequence_parallel_world_size",
     "slice_input_tensor",
     "slice_input_tensor_scale_grad",
+    "sp_gather_seqs",
+    "sp_take_own_seq",
+    "sp_pad",
     "sp_pad_and_slice",
     "gather_heads_scatter_seq",
     "gather_seq_scatter_heads",

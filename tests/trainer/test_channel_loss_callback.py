@@ -923,6 +923,7 @@ def test_base_forward_backward_strips_channel_metadata_after_preforward():
 
 def test_base_forward_backward_composes_channel_loss_and_chunk_mbs_contexts(monkeypatch):
     import veomni.distributed.chunk_mbs as chunk_mbs
+    import veomni.trainer.base as base_trainer_module
 
     capture_states = []
     range_states = []
@@ -1004,6 +1005,7 @@ def test_base_forward_backward_composes_channel_loss_and_chunk_mbs_contexts(monk
         "get_parallel_state",
         lambda: SimpleNamespace(sp_enabled=False, any_extra_parallel_enabled=False),
     )
+    monkeypatch.setattr(base_trainer_module, "use_parallel_state", lambda _: nullcontext())
     chunk_mbs.apply_chunk_mbs(trainer.model, trainer.args.train.chunk_mbs_config)
     trainer.model_fwd_context = nullcontext()
     trainer.model_bwd_context = nullcontext()
@@ -1158,12 +1160,12 @@ def test_dpo_channel_loss_emits_policy_totals():
     base.channel_loss_callback = ChannelLossCallback(base)
     step_begin_args = {}
 
-    def on_step_begin(micro_batches=None, channel_loss_source_repeat=1):
-        step_begin_args["source_repeat"] = channel_loss_source_repeat
+    def on_step_begin(micro_batches=None, **kwargs):
+        step_begin_args["source_repeat"] = kwargs.get("source_repeat", 1)
         base.channel_loss_callback.on_step_begin(
             state,
             micro_batches=micro_batches,
-            source_repeat=channel_loss_source_repeat,
+            **kwargs,
         )
 
     base.on_step_begin = on_step_begin

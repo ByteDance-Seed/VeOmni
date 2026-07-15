@@ -3,7 +3,6 @@ from typing import Optional, Tuple
 
 import einops
 import torch
-
 from ltx_core.components.protocols import Patchifier
 from ltx_core.types import AudioLatentShape, SpatioTemporalScaleFactors, VideoLatentShape
 
@@ -79,9 +78,9 @@ class VideoLatentPatchifier(Patchifier):
         assert batch_size > 0
 
         grid_coords = torch.meshgrid(
-            torch.arange(start=0, end=frames, step=self._patch_size[0], device=device),
-            torch.arange(start=0, end=height, step=self._patch_size[1], device=device),
-            torch.arange(start=0, end=width, step=self._patch_size[2], device=device),
+            torch.arange(start=0, end=frames, step=self._patch_size[0]),
+            torch.arange(start=0, end=height, step=self._patch_size[1]),
+            torch.arange(start=0, end=width, step=self._patch_size[2]),
             indexing="ij",
         )
 
@@ -89,9 +88,12 @@ class VideoLatentPatchifier(Patchifier):
 
         patch_size_delta = torch.tensor(
             self._patch_size,
-            device=patch_starts.device,
             dtype=patch_starts.dtype,
         ).view(3, 1, 1, 1)
+
+        if device is not None:
+            patch_starts = patch_starts.to(device=device)
+            patch_size_delta = patch_size_delta.to(device=device)
 
         patch_ends = patch_starts + patch_size_delta
 

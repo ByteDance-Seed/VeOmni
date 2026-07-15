@@ -25,8 +25,11 @@ def mock_empty_cache() -> None:
     pass
 
 
-def setup_test_distributed(args) -> torch.device:
-    """Initialize a minimal distributed runtime for data tests."""
+def setup_test_distributed(args):
+    """Initialize a minimal distributed runtime for data tests.
+
+    Returns the device and the ``ParallelState``.
+    """
     device_type = get_device_type()
     if device_type != "cpu":
         device_str = f"{device_type}:{args.train.local_rank}"
@@ -43,7 +46,7 @@ def setup_test_distributed(args) -> torch.device:
             rank=int(os.environ["RANK"]),
         )
 
-    init_parallel_state(
+    parallel_state = init_parallel_state(
         dp_size=args.train.accelerator.dp_size,
         dp_replicate_size=args.train.accelerator.dp_replicate_size,
         dp_shard_size=args.train.accelerator.dp_shard_size,
@@ -57,7 +60,7 @@ def setup_test_distributed(args) -> torch.device:
         dp_mode=args.train.accelerator.fsdp_config.fsdp_mode,
     )
     helper.set_seed(args.train.seed, args.train.enable_full_determinism)
-    return device
+    return device, parallel_state
 
 
 class StepAwareTestCheckpointerCallback(CheckpointerCallback):

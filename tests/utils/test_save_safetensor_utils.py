@@ -242,7 +242,7 @@ class TestExecutionOrdering(unittest.TestCase):
     def test_save_state_computed_before_writer(self):
         call_order = []
 
-        def fake_get_state(model, mapping):
+        def fake_get_state(model, mapping, parallel_state=None):
             call_order.append("get_state")
             return {"a": torch.randn(2, 2, dtype=torch.bfloat16)}
 

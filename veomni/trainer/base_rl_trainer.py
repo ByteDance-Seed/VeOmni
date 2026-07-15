@@ -31,7 +31,7 @@ from transformers.modeling_outputs import ModelOutput
 
 from ..data.data_collator import MainCollator as Preforward
 from ..data.data_collator import PostCollator as Postforward
-from ..distributed.parallel_state import get_parallel_state
+from ..distributed.parallel_state import get_parallel_state, use_parallel_state
 from ..distributed.sequence_parallel import gather_outputs
 from .base import BaseTrainer, VeOmniArguments, build_dataloader
 
@@ -39,7 +39,11 @@ from .base import BaseTrainer, VeOmniArguments, build_dataloader
 class BaseRLTrainer(BaseTrainer):
     def __init__(self, args: VeOmniArguments):
         super().__init__(args)
-        self._build_preforward_postforward()
+        # ``super().__init__`` builds under its own ``use_parallel_state`` scope
+        # and exits it; the collators built here also read the current
+        # ParallelState, so re-enter this trainer's state for them.
+        with use_parallel_state("base"):
+            self._build_preforward_postforward()
 
     def _setup(self):
         if self.args.train.chunk_mbs_config.enable:
