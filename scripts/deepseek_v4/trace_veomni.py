@@ -52,6 +52,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Replace selected layers' normalized attention inputs with tensors from --official-trace",
     )
+    parser.add_argument(
+        "--force-official-mlp-inputs",
+        action="store_true",
+        help="Replace selected layers' normalized MLP inputs with tensors from --official-trace",
+    )
     parser.add_argument("--moe-backend", choices=("eager", "fused_triton"), default="fused_triton")
     parser.add_argument("--indexer-backend", choices=("eager", "tilelang"), default="tilelang")
     parser.add_argument("--attention-backend", choices=("eager", "tilelang_sparse"), default="tilelang_sparse")
@@ -64,6 +69,16 @@ def parse_args() -> argparse.Namespace:
         "--reference-moe-topk",
         action="store_true",
         help="Replay official MoE expert IDs while retaining VeOmni router weights and expert execution",
+    )
+    parser.add_argument(
+        "--reference-moe-router-weights",
+        action="store_true",
+        help="Replay official MoE router weights during a top-k reference pass",
+    )
+    parser.add_argument(
+        "--official-moe-topk-output",
+        type=Path,
+        help="Write a second pass that replays official MoE expert IDs after the primary pass",
     )
     parser.add_argument("--reference-quantization", action="store_true")
     parser.add_argument(
@@ -152,6 +167,10 @@ def main() -> None:
         raise ValueError("--reference-output-projection-partitions must be positive")
     if args.reference_output_projection_partitions != 1 and not args.reference_quantized_linear_fp8:
         raise ValueError("--reference-output-projection-partitions requires --reference-quantized-linear-fp8")
+    if args.reference_moe_topk and args.official_moe_topk_output is not None:
+        raise ValueError("--reference-moe-topk and --official-moe-topk-output are mutually exclusive")
+    if args.reference_moe_router_weights and not (args.reference_moe_topk or args.official_moe_topk_output):
+        raise ValueError("--reference-moe-router-weights requires --reference-moe-topk or --official-moe-topk-output")
     dist.init_process_group("nccl")
     rank = dist.get_rank()
     world_size = dist.get_world_size()
@@ -411,11 +430,13 @@ def main() -> None:
             "implementation": implementation,
             "input_ids": input_ids.cpu(),
             "moe_topk": {},
+            "moe_weights": {},
             "indexer_topk": {},
             "indexer_eager_same_input": {},
             "attention_topk": {},
             "hidden": {},
             "details": {},
+            "terminal": {},
         }
 
     implementation = (
@@ -424,6 +445,8 @@ def main() -> None:
     )
     if args.reference_moe_topk:
         implementation += "_official_moe_topk"
+    if args.reference_moe_router_weights and args.reference_moe_topk:
+        implementation += "_official_moe_router_weights"
     if args.reference_attention_kv_quantization:
         implementation += "_attention_kv_fp8_simulation"
     if args.reference_indexer_fp4_quantization:
@@ -443,12 +466,23 @@ def main() -> None:
     trace = make_trace(implementation)
 
     layers = model.model.layers
-    if args.reference_moe_topk:
+    replay_moe_topk = {"enabled": args.reference_moe_topk}
+    replay_moe_router_weights = {"enabled": args.reference_moe_topk and args.reference_moe_router_weights}
+    if args.reference_moe_topk or args.official_moe_topk_output is not None:
         missing_layers = set(range(len(layers))) - set(official_trace["moe_topk"])
         if missing_layers:
             raise ValueError(f"Official trace is missing MoE top-k tensors for layers {sorted(missing_layers)}")
+        if args.reference_moe_router_weights:
+            missing_weight_layers = set(range(len(layers))) - set(official_trace.get("moe_weights", {}))
+            if missing_weight_layers:
+                raise ValueError(
+                    f"Official trace is missing MoE router-weight tensors for layers {sorted(missing_weight_layers)}"
+                )
         for layer_id, layer in enumerate(layers):
             official_indices = official_trace["moe_topk"][layer_id].to(device=device, dtype=torch.long)
+            official_weights = None
+            if args.reference_moe_router_weights:
+                official_weights = official_trace["moe_weights"][layer_id].to(device=device)
 
             def replay_official_topk(
                 module,
@@ -457,19 +491,41 @@ def main() -> None:
                 *,
                 layer_id=layer_id,
                 official_indices=official_indices,
+                official_weights=official_weights,
             ):
+                if not replay_moe_topk["enabled"]:
+                    return output
                 logits, _weights, veomni_indices = output
                 if veomni_indices.shape != official_indices.shape:
                     raise ValueError(
                         f"Layer {layer_id} router shape mismatch: VeOmni {tuple(veomni_indices.shape)} "
                         f"vs official {tuple(official_indices.shape)}"
                     )
-                scores = module.score_fn(logits)
-                weights = scores.gather(1, official_indices)
-                weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-20)
-                return logits, weights * module.routed_scaling_factor, official_indices
+                if official_weights is not None and replay_moe_router_weights["enabled"]:
+                    if _weights.shape != official_weights.shape:
+                        raise ValueError(
+                            f"Layer {layer_id} router-weight shape mismatch: VeOmni {tuple(_weights.shape)} "
+                            f"vs official {tuple(official_weights.shape)}"
+                        )
+                    weights = official_weights.to(dtype=_weights.dtype)
+                else:
+                    scores = module.score_fn(logits)
+                    weights = scores.gather(1, official_indices)
+                    weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-20)
+                    weights = weights * module.routed_scaling_factor
+                return logits, weights, official_indices
 
             layer.mlp.gate.register_forward_hook(replay_official_topk)
+    if rank == 0:
+
+        def terminal_hook(name):
+            def hook(_module, _inputs, output):
+                trace["terminal"][name] = output.detach().cpu()
+
+            return hook
+
+        model.model.hc_head.register_forward_hook(terminal_hook("collapsed"))
+        model.model.norm.register_forward_hook(terminal_hook("normalized"))
     if args.force_official_attention_inputs:
         for layer_id in args.detail_layers:
             official_attention_input = official_trace["details"][layer_id]["attn_input"].to(device)
@@ -483,11 +539,26 @@ def main() -> None:
                 return (official_attention_input, *inputs[1:])
 
             layers[layer_id].self_attn.register_forward_pre_hook(force_attention_input_hook)
+    if args.force_official_mlp_inputs:
+        for layer_id in args.detail_layers:
+            official_mlp_input = official_trace["details"][layer_id]["mlp_input"].to(device)
+
+            def force_mlp_input_hook(
+                _module,
+                _inputs,
+                _output,
+                *,
+                official_mlp_input=official_mlp_input,
+            ):
+                return official_mlp_input
+
+            layers[layer_id].post_attention_layernorm.register_forward_hook(force_mlp_input_hook)
 
     if rank == 0:
         for layer_id, layer in enumerate(layers):
 
             def gate_hook(_module, _inputs, output, *, layer_id=layer_id):
+                trace["moe_weights"][layer_id] = output[1].detach().cpu()
                 trace["moe_topk"][layer_id] = output[2].detach().to(torch.int32).cpu()
 
             def layer_hook(_module, _inputs, output, *, layer_id=layer_id):
@@ -528,6 +599,12 @@ def main() -> None:
 
                     return hook
 
+                def tensor_input_hook(name, *, save_tensor=save_tensor):
+                    def hook(_module, inputs):
+                        save_tensor(name, inputs[0])
+
+                    return hook
+
                 def o_a_proj_hook(_module, inputs, output, *, save_tensor=save_tensor):
                     if output.shape[-2] % world_size:
                         raise ValueError(f"o_a group count {output.shape[-2]} is not divisible by {world_size=}")
@@ -541,6 +618,11 @@ def main() -> None:
                 layer.post_attention_layernorm.register_forward_hook(mlp_input_hook)
                 layer.mlp.register_forward_hook(mlp_output_hook)
                 layer.mlp.gate.register_forward_hook(gate_detail_hook)
+                layer.mlp.shared_experts.register_forward_hook(tensor_output_hook("shared_expert_output"))
+                layer.mlp.shared_experts.gate_proj.register_forward_hook(tensor_output_hook("shared_gate_proj"))
+                layer.mlp.shared_experts.up_proj.register_forward_hook(tensor_output_hook("shared_up_proj"))
+                layer.mlp.shared_experts.down_proj.register_forward_pre_hook(tensor_input_hook("shared_down_input"))
+                layer.mlp.shared_experts.down_proj.register_forward_hook(tensor_output_hook("shared_down_proj"))
                 layer.self_attn.q_a_proj.register_forward_hook(tensor_output_hook("q_a_proj"))
                 layer.self_attn.q_a_norm.register_forward_hook(tensor_output_hook("q_a_norm"))
                 layer.self_attn.q_b_proj.register_forward_hook(tensor_output_hook("q_b_proj", shard_last_dim=True))
@@ -631,8 +713,9 @@ def main() -> None:
 
         layer.self_attn.register_forward_pre_hook(attention_pre_hook)
 
-    labels = torch.full_like(input_ids, -100)
-    labels[:, :-1] = input_ids[:, 1:]
+    # chunk_logprobs_function applies the causal labels[..., 1:] shift.
+    # Passing pre-shifted labels here would compare token t against t+2.
+    labels = input_ids
 
     def run_pass(output_path: Path) -> None:
         # FSDP2's unshard hooks preserve tensor version counters, which are
@@ -657,6 +740,15 @@ def main() -> None:
             print(f"saved VeOmni trace to {output_path}")
 
     run_pass(args.output)
+
+    if args.official_moe_topk_output is not None:
+        replay_moe_topk["enabled"] = True
+        replay_moe_router_weights["enabled"] = args.reference_moe_router_weights
+        replay_suffix = "_official_moe_routing" if args.reference_moe_router_weights else "_official_moe_topk"
+        trace = make_trace(implementation + replay_suffix)
+        run_pass(args.official_moe_topk_output)
+        replay_moe_topk["enabled"] = False
+        replay_moe_router_weights["enabled"] = False
 
     if args.eager_dsa_output is not None:
         modeling_module.veomni_dsa_indexer_backend.bind(SimpleNamespace(dsa_indexer_backend="eager"))

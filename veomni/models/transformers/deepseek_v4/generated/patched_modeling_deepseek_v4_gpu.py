@@ -33,6 +33,8 @@
 #      Propagate packed boundaries and preserve stateless indexer dispatch
 #    - class_replacement: DeepseekV4Experts
 #      Use v5 gate_up_proj expert layout with OpSlot-guarded VeOmni fused-MoE path
+#    - method_override: DeepseekV4MLP.forward
+#      Match official FP32 clamped SwiGLU arithmetic for shared experts
 #    - method_override: DeepseekV4TopKRouter.forward
 #      Match the official DeepSeek-V4 FP32 router projection
 #    - method_override: DeepseekV4HashRouter.forward
@@ -1254,6 +1256,12 @@ class DeepseekV4HyperHead(nn.Module):
         return (pre.unsqueeze(-1) * x).sum(dim=2).to(x.dtype)
 
 
+# ======================================================================
+# [MODIFIED CLASS] DeepseekV4MLP
+# Methods patched: forward
+# ======================================================================
+
+
 class DeepseekV4MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -1265,9 +1273,25 @@ class DeepseekV4MLP(nn.Module):
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=config.mlp_bias)
         self.act_fn = ACT2FN[config.hidden_act]
 
-    def forward(self, x):
-        down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
-        return down_proj
+    # ================================================================
+    # Patch: DeepseekV4MLP.forward
+    # The shared expert uses the same FP32 clamped SwiGLU as official inference.
+    # Keep the existing class because its V4-specific intermediate-size mapping
+    # is incompatible with LigerSwiGLUMLP construction.
+    # ================================================================
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        dtype = x.dtype
+        gate = self.gate_proj(x).float().clamp(max=self.config.swiglu_limit)
+        up = (
+            self.up_proj(x)
+            .float()
+            .clamp(
+                min=-self.config.swiglu_limit,
+                max=self.config.swiglu_limit,
+            )
+        )
+        hidden_states = self.act_fn(gate) * up
+        return self.down_proj(hidden_states.to(dtype))
 
 
 # ======================================================================

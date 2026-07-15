@@ -41,7 +41,9 @@ Patches:
    normalization before RoPE.
 8. ``DeepseekV4TopKRouter.forward`` / ``DeepseekV4HashRouter.forward`` —
    always perform the official FP32 router projection.
-9. Register ``get_parallel_plan`` on ``DeepseekV4ForCausalLM``.
+9. ``DeepseekV4MLP.forward`` — applies the official FP32, clamped SwiGLU
+   used by shared experts before casting back for the down projection.
+10. Register ``get_parallel_plan`` on ``DeepseekV4ForCausalLM``.
 
 Intentionally NOT patched:
 
@@ -51,11 +53,11 @@ Intentionally NOT patched:
   LigerRMSNorm, whose replacement would shadow the distinct unweighted
   variant. RoPE-determinism / batch-invariant RMSNorm remain separate runtime
   concerns for future ``device_patch.py`` infra (mirroring DeepseekV3).
-- ``DeepseekV4MLP`` — also used as ``shared_experts`` with a custom
-  ``moe_intermediate_size`` (via ``attribute_map["intermediate_size"] =
-  "moe_intermediate_size"``). ``LigerSwiGLUMLP.__init__`` rejects the
-  ``intermediate_size`` kwarg pattern that DeepSeek-V4 uses, so swapping
-  would break shared-expert construction. Same reasoning as DeepseekV3.
+- ``LigerSwiGLUMLP`` — ``DeepseekV4MLP`` is used as ``shared_experts`` with
+  a custom ``moe_intermediate_size`` (via
+  ``attribute_map["intermediate_size"] = "moe_intermediate_size"``).
+  ``LigerSwiGLUMLP.__init__`` rejects that construction pattern, so the
+  existing class is retained and only its forward arithmetic is patched.
 - ``apply_rotary_pos_emb`` — DeepSeek-V4 uses a *partial* RoPE (the
   trailing ``qk_rope_head_dim`` slice only, with the leading nope channels
   untouched) plus an interleaved ``repeat_interleave(2)`` cos/sin layout
@@ -1110,6 +1112,31 @@ class PatchedDeepseekV4Experts(nn.Module):
         up = up.clamp(min=-self.limit, max=self.limit)
         return self.act_fn(gate) * up
         # --- Patch.3 ---
+
+
+# ================================================================
+# Patch: DeepseekV4MLP.forward
+# The shared expert uses the same FP32 clamped SwiGLU as official inference.
+# Keep the existing class because its V4-specific intermediate-size mapping
+# is incompatible with LigerSwiGLUMLP construction.
+# ================================================================
+@config.override_method(
+    "DeepseekV4MLP.forward",
+    description="Match official FP32 clamped SwiGLU arithmetic for shared experts",
+)
+def deepseek_v4_mlp_forward_patched(self, x: torch.Tensor) -> torch.Tensor:
+    dtype = x.dtype
+    gate = self.gate_proj(x).float().clamp(max=self.config.swiglu_limit)
+    up = (
+        self.up_proj(x)
+        .float()
+        .clamp(
+            min=-self.config.swiglu_limit,
+            max=self.config.swiglu_limit,
+        )
+    )
+    hidden_states = self.act_fn(gate) * up
+    return self.down_proj(hidden_states.to(dtype))
 
 
 @config.override_method(

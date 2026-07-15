@@ -87,6 +87,31 @@ def main() -> None:
         hidden_report[str(layer_id)] = layer_report
     report["hidden"] = hidden_report
 
+    terminal_report = {}
+    official_terminal = official.get("terminal", {})
+    veomni_terminal = veomni.get("terminal", {})
+    for name in sorted(set(official_terminal) | set(veomni_terminal)):
+        if name not in official_terminal or name not in veomni_terminal:
+            terminal_report[name] = {"missing": "official" if name not in official_terminal else "veomni"}
+            continue
+        left = official_terminal[name].float()
+        right = veomni_terminal[name].float()
+        if left.shape != right.shape:
+            terminal_report[name] = {
+                "shape_match": False,
+                "official_shape": list(left.shape),
+                "veomni_shape": list(right.shape),
+            }
+            continue
+        diff = (left - right).abs()
+        terminal_report[name] = {
+            "shape_match": True,
+            "max_abs_diff": float(diff.max()),
+            "mean_abs_diff": float(diff.mean()),
+            "rms_diff": float(diff.square().mean().sqrt()),
+        }
+    report["terminal"] = terminal_report
+
     detail_report = {}
     official_details = official.get("details", {})
     veomni_details = veomni.get("details", {})

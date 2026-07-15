@@ -141,16 +141,19 @@ def main() -> None:
         "implementation": "official",
         "input_ids": input_ids.cpu(),
         "moe_topk": {},
+        "moe_weights": {},
         "indexer_topk": {},
         "attention_topk": {},
         "hidden": {},
         "details": {},
+        "terminal": {},
     }
 
     if rank == 0:
         for layer_id, layer in enumerate(model.layers):
 
             def gate_hook(_module, _inputs, output, *, layer_id=layer_id):
+                trace["moe_weights"][layer_id] = output[0].detach().cpu()
                 trace["moe_topk"][layer_id] = output[1].detach().to(torch.int32).cpu()
 
             def layer_hook(_module, _inputs, output, *, layer_id=layer_id):
@@ -190,12 +193,23 @@ def main() -> None:
 
                     return hook
 
+                def tensor_input_hook(name, *, save_tensor=save_tensor):
+                    def hook(_module, inputs):
+                        save_tensor(name, inputs[0])
+
+                    return hook
+
                 layer.register_forward_hook(layer_detail_hook)
                 layer.attn_norm.register_forward_hook(attn_input_hook)
                 layer.attn.register_forward_hook(attn_output_hook)
                 layer.ffn_norm.register_forward_hook(mlp_input_hook)
                 layer.ffn.register_forward_hook(mlp_output_hook)
                 layer.ffn.gate.register_forward_hook(gate_detail_hook)
+                layer.ffn.shared_experts.register_forward_hook(tensor_output_hook("shared_expert_output"))
+                layer.ffn.shared_experts.w1.register_forward_hook(tensor_output_hook("shared_gate_proj"))
+                layer.ffn.shared_experts.w3.register_forward_hook(tensor_output_hook("shared_up_proj"))
+                layer.ffn.shared_experts.w2.register_forward_pre_hook(tensor_input_hook("shared_down_input"))
+                layer.ffn.shared_experts.w2.register_forward_hook(tensor_output_hook("shared_down_proj"))
                 layer.attn.wq_a.register_forward_hook(tensor_output_hook("q_a_proj"))
                 layer.attn.q_norm.register_forward_hook(tensor_output_hook("q_a_norm"))
                 layer.attn.wq_b.register_forward_hook(tensor_output_hook("q_b_proj"))
@@ -260,6 +274,9 @@ def main() -> None:
             model.hc_head_base,
         )
         normalized = model.norm(collapsed)
+        if rank == 0:
+            trace["terminal"]["collapsed"] = collapsed.detach().cpu()
+            trace["terminal"]["normalized"] = normalized.detach().cpu()
         logprobs = distributed_target_logprobs(
             normalized,
             input_ids,
