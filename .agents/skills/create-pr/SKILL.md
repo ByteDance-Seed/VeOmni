@@ -64,6 +64,7 @@ description: "Create a pull request for the current branch. Handles uncommitted 
    | `veomni/checkpoint/` | `ckpt` |
    | `veomni/optim/` | `optim` |
    | `veomni/logging/` | `logging` |
+   | `veomni/lora/` | `lora` |
    | `configs/` | `config` |
    | `docs/` | `docs` |
    | `tests/`, `.github/workflows/` | `ci` |
@@ -73,7 +74,7 @@ description: "Create a pull request for the current branch. Handles uncommitted 
    | `.agents/` | `agent` |
    | other / mixed | `misc` |
 
-   Allowed modules: `misc`, `ci`, `config`, `docs`, `data`, `dist`, `omni`, `logging`, `model`, `optim`, `ckpt`, `release`, `task`, `perf`, `ops`, `parallel`, `docker`, `trainer`, `agent`
+   Allowed modules: `misc`, `ci`, `config`, `docs`, `data`, `dist`, `omni`, `logging`, `model`, `optim`, `ckpt`, `release`, `task`, `perf`, `ops`, `parallel`, `docker`, `trainer`, `agent`, `lora`
 
 3. Determine **change type**:
 

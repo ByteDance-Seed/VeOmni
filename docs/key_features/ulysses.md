@@ -202,7 +202,8 @@ After the collator, the model receives:
 ### Softmax Attention (Flash Attention) SP Flow
 
 For standard softmax attention layers (e.g., `Qwen3_5Attention`), Ulysses SP is handled
-**internally** by `flash_attention_forward` in `veomni/ops/flash_attn/__init__.py`.
+**internally** by `flash_attention_forward` in
+`veomni/ops/kernels/attention/__init__.py`.
 
 The flow through a softmax attention layer:
 

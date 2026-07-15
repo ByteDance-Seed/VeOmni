@@ -67,6 +67,7 @@ examples/qwen3_omni_moe.md
 examples/qwen3_omni_offline_av.md
 examples/wan2.1.md
 examples/wan2.1_I2V_1.3B.md
+examples/ltx-2.3.md
 examples/qwen3_dpo.md
 ```
 
@@ -88,6 +89,8 @@ key_features/lora.md
 :caption: Design
 
 design/kernel_selection.md
+design/fused_moe_kernels.md
+design/local_parallel_state.md
 design/patchgen.md
 design/unified_kernel_registry.md
 design/verl_topk_distill_integration.md

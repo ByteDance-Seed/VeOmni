@@ -117,7 +117,7 @@ unpatched (or non-Transformers) Python code.
    - Test edge cases: empty inputs, single-element tensors, extreme shapes
 
 2. **Add benchmark** (optional but recommended for performance-critical ops):
-   - Use `veomni/ops/group_gemm/utils/benchmark_utils.py` as reference
+   - Use `veomni/ops/kernels/moe/_kernels/utils/benchmark_utils.py` as reference
    - Compare against baseline implementation
 
 3. Run: `pytest tests/ops/ -v`

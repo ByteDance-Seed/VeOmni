@@ -22,7 +22,7 @@ veomni/
 │   ├── auto.py         High-level API: build_foundation_model, build_tokenizer, build_processor
 │   ├── loader.py       Registry-based model loading (MODELING_REGISTRY, MODEL_CONFIG_REGISTRY)
 │   ├── transformers/   Per-model patches (one subpackage per model family)
-│   ├── diffusers/      Diffusion model definitions (Wan T2V)
+│   ├── diffusers/      Diffusion model families (Wan, LTX, Qwen-Image)
 │   └── seed_omni/      Omni-model architecture (encoder-foundation-decoder)
 ├── optim/              Optimizer and LR scheduler construction
 │   ├── optimizer.py    build_optimizer() factory + MultiOptimizer wrapper.
@@ -96,7 +96,7 @@ BaseTrainer (ABC)
 
 Subclasses override specific methods (e.g., `compute_loss()`, custom data transforms) rather than the entire training loop.
 
-**Parallel-state scoping**: `_setup()` registers `ParallelState("base")` before seed/determinism; then each trainer builds under `use_parallel_state("base")`. Run time uses **per-op** wraps with `"base"` (forward / postforward / backward / clip). No `self.parallel_state` on trainers. See `.agents/knowledge/constraints.md` §7 and `docs/superpowers/specs/2026-07-15-local-parallel-state-registry-design.md`.
+**Parallel-state scoping**: `_setup()` calls `init_parallel_state(name="base")` before seed/determinism; then each trainer builds under `use_parallel_state("base")`. Run time uses **per-op** wraps with `"base"` (forward / postforward / backward / clip). No `self.parallel_state` on trainers. See `.agents/knowledge/constraints.md` §7 and `docs/design/local_parallel_state.md`.
 
 ## Data Flow
 

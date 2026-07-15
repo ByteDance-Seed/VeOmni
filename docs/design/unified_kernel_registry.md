@@ -2,11 +2,16 @@
 
 ## Status
 
-**Proposal** | 2026-03-16
+**Historical proposal** | 2026-03-16
+
+> This document records the original registry design and contains illustrative
+> pseudocode. It is not the source of truth for runnable configuration. See
+> [Kernel Selection in VeOmni](kernel_selection.md) for the current config
+> fields, defaults, backends, lifecycle, and implementation paths.
 
 ## Problem
 
-VeOmni's current kernel selection is fragmented:
+At the time of this proposal, VeOmni's kernel selection was fragmented:
 
 1. **Inconsistent config surface.** Attention and MoE use `OpsImplementationConfig`
    fields; RMSNorm/RoPE/SwiGLU use `VEOMNI_USE_LIGER_KERNEL` env var; loss uses
@@ -62,7 +67,7 @@ if they implement the same variant.
 | `attention` | `standard` | Multi-head / GQA attention (existing `ALL_ATTENTION_FUNCTIONS` — unchanged) |
 | `moe_experts` | `standard` | Expert GEMM dispatch (merged gate+up projection, HF v5 convention; DeepSeek-V4 additionally forwards `swiglu_limit` to clamp-aware backends) |
 | `cross_entropy_loss` | `causal`, `seq_cls` | Causal-LM CE (shifts labels) vs. sequence-classification CE (no shift) |
-| `moe_load_balancing_loss` | `standard` | Switch Transformer auxiliary loss |
+| `load_balancing_loss` | `standard` | Switch Transformer auxiliary loss |
 
 ### 2. Kernel Registry
 
@@ -146,7 +151,9 @@ class KernelRegistry:
 KERNEL_REGISTRY = KernelRegistry()
 ```
 
-**OSS registrations** (in `veomni/ops/kernel_defaults.py`, imported at `veomni` init):
+**Illustrative proposal registrations.** The shipped registrations are
+distributed under `veomni/ops/kernels/*` and `veomni/ops/liger/`; they are
+imported by `veomni/ops/__init__.py`.
 
 ```python
 from .kernel_registry import KERNEL_REGISTRY, KernelSpec, HardwareRequirement
@@ -261,15 +268,19 @@ class OpsImplementationConfig:
         "native-sparse",
     ] = "flash_attention_2"
 
-    # Per-op implementation selection (all default to "eager" = original HF code)
-    rms_norm_implementation: str = "eager"
-    rms_norm_gated_implementation: str = "eager"   # (proposed — not yet shipped)
-    rotary_pos_emb_implementation: str = "eager"
-    swiglu_mlp_implementation: str = "eager"
-    # MoE: single-field backend selection — no silent hardware fallback.
-    moe_implementation: Literal["eager", "fused_triton", "fused_quack", "fused_npu"] = "eager"
-    cross_entropy_loss_implementation: str = "eager"
-    load_balancing_loss_implementation: str = "eager"
+    # Per-op fields remain strings so third-party backends can register values.
+    moe_implementation: str = "fused_triton"
+    cross_entropy_loss_implementation: str = "liger_kernel"
+    rms_norm_implementation: str = "liger_kernel"
+    swiglu_mlp_implementation: str = "liger_kernel"
+    rotary_pos_emb_implementation: str = "liger_kernel"
+    rotary_pos_emb_vision_implementation: str = "eager"
+    load_balancing_loss_implementation: str = "triton"
+    rms_norm_gated_implementation: str = "fla"
+    causal_conv1d_implementation: str = "fla"
+    chunk_gated_delta_rule_implementation: str = "fla"
+    dsa_indexer_backend: Literal["eager", "cudnn", "tilelang"] = "eager"
+    dsa_attention_backend: Literal["eager", "flashmla_cudnn", "tilelang_sparse"] = "eager"
     mhc_backend: Literal["eager", "tile_kernels"] = "eager"
 ```
 
@@ -282,25 +293,18 @@ PR — see `veomni/arguments/arguments_types.py`):
 | `rms_norm_implementation` | `eager`, `liger_kernel`, `npu`, `triton` (per-model; DeepSeek-V3) | |
 | `rotary_pos_emb_implementation` | `eager`, `liger_kernel`, `npu`, `triton` (per-model; DeepSeek-V3) | |
 | `swiglu_mlp_implementation` | `eager`, `liger_kernel` | |
-| `moe_implementation` | `eager`, `fused_triton`, `fused_quack`, `fused_npu` | Single field; mismatches (e.g. `fused_triton` on NPU) raise in `apply_veomni_fused_moe_patch` rather than silently falling back |
-| `cross_entropy_loss_implementation` | `eager`, `liger_kernel`, `npu` | |
-| `load_balancing_loss_implementation` | `eager`, `triton` | `triton` backend works on CUDA (`triton`) and NPU (`triton-ascend`); introduced in #651 and kept through this refactor |
-| `rms_norm_gated_implementation` | `eager`, `fla` | Qwen3.5 GatedDeltaNet `self.norm`; default `fla`. No NPU backend — selecting any non-eager value on NPU raises at OpSlot bind time (#714) |
-| `causal_conv1d_implementation` | `eager`, `fla` | Qwen3.5 GatedDeltaNet pre-mixer; default `fla`. `eager` has no torch fallback for `cu_seqlens` — varlen training raises at forward time. No NPU backend (#714) |
-| `chunk_gated_delta_rule_implementation` | `eager`, `fla`, `flash_qla` | Qwen3.5 linear attention; default `fla`. `flash_qla` (QwenLM FlashQLA) ships under the `gpu` extra and binds on Hopper sm90 only. No NPU backend (#714) |
+| `moe_implementation` | `eager`, `fused_triton`, `fused_quack`, `fused_npu` | Single field. On NPU, a value still equal to the GPU default `fused_triton` is normalized to `fused_npu`; incompatible non-default overrides raise. |
+| `cross_entropy_loss_implementation` | `eager`, `liger_kernel`, `chunk_loss`, `npu` | |
+| `load_balancing_loss_implementation` | `eager`, `triton` | `triton` is CUDA-only; current NPU config normalization maps the default-valued `triton` selection to `eager` before binding. |
+| `rms_norm_gated_implementation` | `eager`, `fla`, `npu` | Qwen3.5 GatedDeltaNet `self.norm`; default `fla` |
+| `causal_conv1d_implementation` | `eager`, `fla`, `npu` | Qwen3.5 GatedDeltaNet pre-mixer; `eager` has no `cu_seqlens` path |
+| `chunk_gated_delta_rule_implementation` | `eager`, `fla`, `flash_qla`, `npu` | Qwen3.5 linear attention; `flash_qla` is Hopper SM90-only, while `npu` uses the vendored MindSpeed-MM kernel |
+| `dsa_indexer_backend` | `eager`, `cudnn`, `tilelang` | GLM-DSA supports `cudnn`; DeepSeek V4 supports `tilelang`. Optimized backends require compatible NVIDIA hardware. |
+| `dsa_attention_backend` | `eager`, `flashmla_cudnn`, `tilelang_sparse` | GLM-DSA supports `flashmla_cudnn`; DeepSeek V4 supports `tilelang_sparse`. Optimized backends require compatible NVIDIA hardware. |
 | `mhc_backend` | `eager`, `tile_kernels` | DeepSeek V4 manifold-constrained Hyper-Connection pre/post/head kernels. The three `OpSlot("mhc", variant)` instances share this selection and require NVIDIA SM90+ for `tile_kernels`. |
 
-Convenience preset:
-
-```yaml
-model:
-  ops_implementation:
-    preset: liger   # expands to rms_norm=liger, rope=liger, swiglu=liger, loss=liger_fused
-    moe_implementation: fused_triton  # override individual op
-```
-
-Preset expansion is best-effort: if the model's variant for an op has no `liger`
-registration, that op stays `eager` (no error).
+No preset field was shipped. Configure each `OpsImplementationConfig` field
+explicitly; unknown fields such as `preset` are invalid.
 
 ### 4. Op Slots
 
@@ -351,10 +355,10 @@ User YAML                    OpsImplementationConfig              OpSlot.bind()
 ─────────                    ───────────────────────              ─────────────
 model:                       @dataclass
   ops_implementation:  ───→  class OpsImplementationConfig:
-    moe_implementation:          moe_implementation: Literal[...]
+    moe_implementation:          moe_implementation: str
       fused_triton                         │
                                            ▼
-                             build_foundation_model(config)
+                             build_foundation_model(config, ops_implementation=ops)
                                ├─ import patched_modeling_qwen3_5_moe_gpu
                                │    └─ module-level OpSlot instances created:
                                │         veomni_apply_rotary_pos_emb = OpSlot(...)
@@ -402,6 +406,12 @@ Both options use `veomni/patchgen/codegen.py`. The generated file is a
 self-contained copy of the HF modeling file. The key question is how the
 kernel dispatch is wired in.
 
+> **Proposal-only examples:** The Qwen3.5 MoE snippets in this section record
+> alternatives considered in March 2026; they are not excerpts from the
+> current generated GPU module. Current Qwen3.5 MoE has no rotary `OpSlot` and
+> exposes the seven slots listed under
+> [Current generated dispatch coverage](#current-generated-dispatch-coverage).
+
 #### Option A: If-Else Guard (Recommended)
 
 The only diff from upstream HF is a 2-line early-return guard at the top of
@@ -423,12 +433,12 @@ each replaceable function or method. Call sites stay unchanged.
 5. At `build_foundation_model` time, `.bind(impl_name)` is called on each
    slot.
 
-**Concrete example — `apply_rotary_pos_emb` in Qwen3.5 MoE:**
+**Original proposal example — a partial-RoPE guard:**
 
 Patchgen config:
 
 ```python
-# qwen3_5_moe_gpu_patch_gen_config.py
+# Proposal pseudocode; not the current Qwen3.5 MoE GPU patchgen config.
 
 config.add_import("veomni.ops.dispatch", names=["OpSlot"])
 
@@ -459,10 +469,10 @@ def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
 #   query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 ```
 
-Generated output:
+Illustrative output proposed at the time:
 
 ```python
-# In generated/patched_modeling_qwen3_5_moe_gpu.py
+# Proposal pseudocode; not the current generated Qwen3.5 MoE module.
 
 from veomni.ops.dispatch import OpSlot
 
@@ -495,15 +505,15 @@ class Qwen3_5MoeAttention(nn.Module):
         ...
 ```
 
-The diff from upstream HF: **2 lines** added at the top of the function.
-The function body is unchanged. All call sites are unchanged.
+Under this proposal, the diff from upstream HF would have been two guard lines
+at the top of the function, with unchanged call sites.
 
-**Concrete example — `Qwen3_5MoeExperts.forward`:**
+**Original proposal example — `Qwen3_5MoeExperts.forward`:**
 
 Same pattern — early-return guard at the top of the method.
 
 ```python
-# In generated/patched_modeling_qwen3_5_moe_gpu.py
+# Proposal pseudocode illustrating the guard shape.
 
 veomni_moe_experts_forward = OpSlot("moe_experts", "standard")
 
@@ -552,20 +562,22 @@ class Qwen3_5MoeExperts(nn.Module):
         return final_hidden_states
 ```
 
-The diff from upstream HF is **2 lines** at the top of `forward`. Everything
-below the guard is the original HF code, verbatim.
+Under the proposal, the only conceptual addition was an early-return guard;
+inspect the current generated module for the exact shipped output.
 
-**Concrete example — `Qwen3_5MoeRMSNorm` (no dispatch needed):**
+**Superseded proposal assumption — `Qwen3_5MoeRMSNorm` without dispatch:**
 
 ```python
-# In generated/patched_modeling_qwen3_5_moe_gpu.py
-# Qwen3.5 MoE uses qwen3_5 variant; no non-eager kernel exists.
-# Original HF code emitted verbatim. No slot, no guard.
+# Historical proposal only. Current Qwen3.5 MoE has
+# OpSlot("rms_norm", "qwen3_5"); this no-slot assumption was superseded.
 
 class Qwen3_5MoeRMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
         # ... identical to upstream ...
 ```
+
+The shipped implementation now binds RMSNorm through its `qwen3_5` variant;
+this snippet is retained only to explain the rejected alternative.
 
 **Properties:**
 
@@ -664,7 +676,7 @@ veomni_seq_cls_loss   = OpSlot("cross_entropy_loss", "seq_cls")
 #### MoE Load-Balancing Loss
 
 ```python
-veomni_load_balancing_loss = OpSlot("moe_load_balancing_loss", "standard")
+veomni_load_balancing_loss = OpSlot("load_balancing_loss", "standard")
 
 # Original HF function — UNCHANGED
 def load_balancing_loss_func(gate_logits, num_experts, top_k, attention_mask=None):
@@ -682,20 +694,22 @@ def load_balancing_loss_func(gate_logits, num_experts, top_k, attention_mask=Non
 
 ### 9. Full Example: Qwen3.5 MoE
 
-**Summary of generated code changes from upstream HF:**
+#### Current generated dispatch coverage
 
-| Component | Change from HF | Lines added |
-|-----------|---------------|-------------|
-| `apply_rotary_pos_emb` | 2-line guard at top of function | +2 |
-| `Qwen3_5MoeExperts.forward` | 2-line guard at top of method | +2 |
-| `load_balancing_loss_func` | 2-line guard at top of function | +2 |
-| `ForConditionalGeneration.forward` | If-else guard around loss call | +3 |
-| `Qwen3_5MoeRMSNorm` | **Unchanged** (qwen3_5 variant, no kernel) | 0 |
-| `Qwen3_5MoeAttention.forward` | **Unchanged** (call sites not modified) | 0 |
-| Module-level `OpSlot` declarations | New lines | +4 |
+| OpSlot | Purpose |
+|--------|---------|
+| `OpSlot("rms_norm", "qwen3_5")` | Qwen3.5 MoE RMSNorm |
+| `OpSlot("moe_experts", "standard")` | Fused or eager MoE expert forward |
+| `OpSlot("cross_entropy_loss", "causal")` | Causal language-model loss |
+| `OpSlot("load_balancing_loss", "standard")` | MoE auxiliary load-balancing loss |
+| `OpSlot("rms_norm_gated", "standard")` | GatedDeltaNet gated RMSNorm |
+| `OpSlot("causal_conv1d", "standard")` | GatedDeltaNet causal convolution |
+| `OpSlot("chunk_gated_delta_rule", "standard")` | GatedDeltaNet recurrent update |
 
-Total diff from upstream HF: ~13 lines added. Function bodies unchanged
-(only 2-line guards prepended). All call sites unchanged.
+Patchgen injects these module-level slots and narrow guards at their current
+call sites. The exact generated line count is intentionally not treated as an
+API guarantee and may change when the upstream Transformers implementation
+changes.
 
 **User YAML:**
 
@@ -703,10 +717,10 @@ Total diff from upstream HF: ~13 lines added. Function bodies unchanged
 model:
   ops_implementation:
     attn_implementation: flash_attention_2
-    rms_norm_implementation: eager              # only eager for qwen3_5 variant
-    rotary_pos_emb_implementation: eager  # only eager for partial variant
+    rms_norm_implementation: liger_kernel
+    rotary_pos_emb_implementation: eager
     moe_implementation: fused_triton
-    cross_entropy_loss_implementation: liger_fused
+    cross_entropy_loss_implementation: liger_kernel
     load_balancing_loss_implementation: eager
 ```
 
@@ -714,33 +728,35 @@ model:
 
 ```
 # User mistakenly sets:
-rms_norm_implementation: liger
+rms_norm_implementation: unknown_backend
 
 # Error (from KERNEL_REGISTRY.resolve):
-KeyError: No kernel 'liger' for op='rms_norm', variant='qwen3_5'.
-Available: ['eager']
+KeyError: Unknown kernel 'unknown_backend' for op='rms_norm', variant='qwen3_5'.
 ```
 
 ### 10. Lifecycle
 
 ```
 import veomni                                     # (1) import time
-  └─ import kernel_defaults                        #     register OSS kernels
+  └─ import veomni.ops.{kernels,liger}             #     register OSS kernels
 
 (optional) import internal_kernels.register        # (2) internal registration
   └─ KERNEL_REGISTRY.register(...)                 #     add internal kernels
 
 OpsImplementationConfig.__post_init__()            # (3) config parse time
   └─ rewrite attn_implementation for SP
-  └─ expand preset if set
+  └─ validate configured backends
 
-build_foundation_model(config)                     # (4) model build time
+build_foundation_model(config, ops_implementation=ops) # (4) model build time
   ├─ import patched_modeling_qwen3_5_moe_gpu       #     generated module
   │    └─ module-level OpSlot instances created:    #     (at import time)
-  │         veomni_apply_rotary_pos_emb  = OpSlot("apply_rotary_pos_emb", "partial")
+  │         veomni_rms_norm               = OpSlot("rms_norm", "qwen3_5")
   │         veomni_moe_experts_forward   = OpSlot("moe_experts", "standard")
-  │         veomni_load_balancing_loss   = OpSlot("moe_load_balancing_loss", "standard")
+  │         veomni_load_balancing_loss   = OpSlot("load_balancing_loss", "standard")
   │         veomni_causal_lm_loss        = OpSlot("cross_entropy_loss", "causal")
+  │         veomni_rms_norm_gated        = OpSlot("rms_norm_gated", "standard")
+  │         veomni_causal_conv1d         = OpSlot("causal_conv1d", "standard")
+  │         veomni_chunk_gated_delta_rule= OpSlot("chunk_gated_delta_rule", "standard")
   │         (all start with _kernel = None)
   │
   ├─ _bind_veomni_ops(module, ops_config):          #     bind from config
@@ -752,11 +768,9 @@ build_foundation_model(config)                     # (4) model build time
   └─ model init + weight loading
 
 model.forward()                                    # (5) runtime
-  ├─ apply_rotary_pos_emb(...)                     #     function called as normal
-  │   └─ if veomni_apply_rotary_pos_emb.use_non_eager_impl:#     guard checks module global
-  │        return veomni_apply_rotary_pos_emb(...)  #     → fused kernel
-  │      else: <original HF code>                   #     → eager fallback
-  ├─ attention: ALL_ATTENTION_FUNCTIONS[...]         #     unchanged
+  ├─ RMSNorm / gated RMSNorm / causal Conv1D / gated delta rule
+  │   └─ each guard dispatches through its bound OpSlot or keeps the HF path
+  ├─ attention: ALL_ATTENTION_FUNCTIONS[...]        #     separate attention dispatch
   ├─ experts.forward(...)
   │   └─ if veomni_moe_experts_forward.use_non_eager_impl:
   │        return veomni_moe_experts_forward(...)    #     → fused kernel
@@ -771,24 +785,25 @@ model.forward()                                    # (5) runtime
 
 | Current mechanism | New mechanism | Migration |
 |---|---|---|
-| `VEOMNI_USE_LIGER_KERNEL=1` env var | `rms_norm_implementation: liger` etc. | Deprecate env var; keep compat for 1 release |
-| `gpu_patch.py` monkey-patching | patchgen + `OpSlot` guards | Remove `gpu_patch.py` files |
-| `apply_veomni_loss_patch()` at import | `cross_entropy_loss_implementation` + `OpSlot` | Remove import-time patch |
+| `VEOMNI_USE_LIGER_KERNEL=1` env var | Per-op `*_implementation: liger_kernel` fields | Removed; configure fields explicitly |
+| `gpu_patch.py` monkey-patching | patchgen + registry/`OpSlot` dispatch | Removed from current model paths |
+| `apply_veomni_loss_patch()` at import | `cross_entropy_loss_implementation` + `apply_ops_config()` | Replaced by the unified config install point |
 | `apply_veomni_fused_moe_patch()` | `OpSlot("moe_experts", ...)` | All MoE models (qwen3_moe, qwen3_5_moe, qwen3_vl_moe, qwen3_omni_moe, deepseek_v3, deepseek_v4) now bind through OpSlot guards; the function is kept only as the binding helper invoked from `_bind_veomni_ops` to set the global `_fused_moe_forward` pointer. DeepSeek-V4 separately exposes TileLang DSA indexer/attention config slots and three registry-backed TileKernels mHC slots. Its MoE keeps a direct `fused_moe_forward(...)` call under the experts guard so it can pass its merged `gate_up_proj` layout and `swiglu_limit` clamp explicitly; clamp-aware V4 fused MoE is currently provided by the GPU backends and defaults to `fused_triton` on GPU, while `fused_npu` raises until the NPU kernel implements `swiglu_limit`. |
-| `moe_implementation: fused` (auto-picks Triton on GPU / NPU group-gemm on NPU) | `moe_implementation: fused_triton` or `fused_npu` | Breaking change — `"fused"` renamed to `"fused_triton"` and the silent NPU auto-pick replaced by explicit `"fused_npu"`. `fused_quack` is unchanged. |
+| `moe_implementation: fused` | `moe_implementation: fused_triton`, `fused_quack`, or `fused_npu` | The legacy `"fused"` alias remains deprecated: it resolves to `fused_quack` on GPU and `fused_npu` on NPU with a warning. The default-valued `fused_triton` selection is also normalized to `fused_npu` on NPU for compatibility; explicit backend names are recommended. |
 
 ---
 
 ## Open Questions
 
-1. **Preset system:** Should `preset: liger` silently skip ops where the
-   model's variant has no `liger` registration, or warn?
+1. ~~**Preset system:** Should a Liger preset silently skip unsupported
+   ops?~~ **Resolved:** no preset field was shipped; users configure each op.
 2. **Attention:** Keep in `ALL_ATTENTION_FUNCTIONS` (shared with HF) or unify
    under `KERNEL_REGISTRY`?
 3. ~~**NPU auto-selection:** Should NPU be an explicit `npu_group_gemm`
-   implementation name, or remain automatic?~~ **Resolved:** NPU is now opted
-   into explicitly via `moe_implementation: fused_npu`; the previous silent
-   auto-pick was removed so mismatched selections raise at patch/bind time.
+   implementation name, or remain automatic?~~ **Resolved:**
+   `moe_implementation: fused_npu` is the explicit, recommended spelling. For
+   compatibility, the GPU dataclass default `fused_triton` still normalizes to
+   `fused_npu` on NPU; incompatible non-default overrides raise.
 4. **Multi-model processes:** Each generated module has its own `OpSlot`
    instances, so different models work independently. But two instances of the
    same model with different ops configs share the same `OpSlot` objects.

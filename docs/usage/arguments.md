@@ -27,6 +27,7 @@ Top-level configuration that assembles all argument groups.
 
 * `VeOmniArguments` — Root config: `model` + `data` + `train`
 * `VeOmniVLMArguments` — VLM extension of `VeOmniArguments`
+* `VeOmniDiTArguments` — diffusion-transformer extension of `VeOmniArguments`
 
 ---
 
@@ -41,6 +42,10 @@ Model architecture, paths, and multimodal encoder / decoder setup.
 
 * `VLMMModelArguments` — extends `ModelArguments` with encoder data-balancing options
 
+### DiT Extensions
+
+* `DiTModelArguments` — extends `ModelArguments` with condition-model settings
+
 ---
 
 ## Data
@@ -53,6 +58,10 @@ Dataset paths, tokenization, and batching configuration.
 ### VLM Extensions
 
 * `VLMMDataArguments` — extends `DataArguments` with multimodal configs (`mm_configs`)
+
+### DiT Extensions
+
+* `DiTDataArguments` — extends `DataArguments` with diffusion input and offline-embedding settings
 
 ---
 
@@ -75,6 +84,10 @@ Training loop, optimizer, parallelism, checkpointing, profiling, and logging.
 ### VLM Extensions
 
 * `VLMTrainingArguments` — extends `TrainingArguments` with ViT / audio freeze & learning-rate options
+
+### DiT Extensions
+
+* `DiTTrainingArguments` — extends `TrainingArguments` with the diffusion training workflow
 
 ---
 
@@ -136,18 +149,30 @@ Each `*_implementation` field selects the kernel backend for that operation.
 The type is `str` (not `Literal`) so third-party backends can be registered
 without modifying the config class.
 
-**Defaults are GPU-optimal** (Liger / Triton / fused_triton). On Ascend NPU
-these defaults raise; NPU users must set every field explicitly to an
-NPU-supported value (`"npu"`, `"chunk_loss"`, `"fused_npu"`, `"triton"` for
-load-balancing loss via `triton-ascend`) or to `"eager"` when the op has no
-NPU backend (e.g. `swiglu_mlp_implementation`, DeepSeek-V3 / Qwen2-VL
-multimodal RoPE).
+**Defaults are GPU-optimal** (Liger / Triton / fused_triton). On Ascend NPU,
+values that are still equal to the dataclass defaults automatically resolve as
+follows:
+
+| GPU default field | NPU fallback |
+|---|---|
+| `rms_norm_implementation` | `npu` |
+| `rotary_pos_emb_implementation` | `npu` |
+| `rotary_pos_emb_vision_implementation` | `npu` |
+| `swiglu_mlp_implementation` | `eager` |
+| `load_balancing_loss_implementation` | `eager` |
+| `cross_entropy_loss_implementation` | `npu` |
+| `moe_implementation` | `fused_npu` |
+
+Explicit non-default overrides are not rewritten; unsupported NPU values raise
+during validation. Qwen3.5's model-specific GatedDeltaNet fields are not in
+this global fallback table and must be set to `npu` explicitly on NPU.
 
 NPU validation runs at two times:
 
 - **Config-parse time** (`OpsImplementationConfig.__post_init__`) for the
-  six general-purpose ops (`moe`, `cross_entropy_loss`, `rms_norm`,
-  `swiglu_mlp`, `rotary_pos_emb`, `load_balancing_loss`). Errors fire
+  seven general-purpose ops (`moe`, `cross_entropy_loss`, `rms_norm`,
+  `swiglu_mlp`, `rotary_pos_emb`, `rotary_pos_emb_vision`,
+  `load_balancing_loss`). Errors fire
   immediately with a model-agnostic allow-list.
 - **OpSlot-bind time** (`KERNEL_REGISTRY.resolve` via the kernel's
   `HardwareRequirement`) for Qwen3.5-only ops (`rms_norm_gated`,
@@ -160,18 +185,19 @@ NPU validation runs at two times:
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | attn_implementation | `Optional[Literal[...]]` | `"flash_attention_2"` | Attention implementation to use. |
-| moe_implementation | `str` | `"fused_triton"` | MoE experts forward implementation. `fused_triton` uses Triton group-gemm (GPU, SM70+); `fused_quack` uses Quack CUTLASS/CuTe (GPU, SM90+); `fused_npu` uses the NPU group-gemm kernel; `eager` is the reference loop. Mismatches (e.g. `fused_triton` on NPU) raise at config validation time — no silent fallback. |
+| moe_implementation | `str` | `"fused_triton"` | MoE experts forward implementation. `fused_triton` uses Triton group-gemm (GPU, SM70+); `fused_quack` uses Quack CUTLASS/CuTe (GPU, SM90+); `fused_npu` uses the NPU group-gemm kernel; `eager` is the reference loop. A value still equal to the GPU default auto-resolves to `fused_npu` on NPU; explicit incompatible non-default overrides raise. |
 | cross_entropy_loss_implementation | `str` | `"liger_kernel"` | Cross-entropy loss. `liger_kernel` (default, GPU only) fuses `lm_head` linear + CE; requires VeOmni-patched modeling files that pass `hidden_states=`/`weights=` to `self.loss_function(...)` — unpatched HF models that pass logits will RuntimeError. `chunk_loss` is the hardware-agnostic chunked F.linear+CE (CUDA + NPU). `npu` is a back-compat alias for `chunk_loss`. `eager` is `F.cross_entropy`. |
 | rms_norm_implementation | `str` | `"liger_kernel"` | RMSNorm. Known values: `liger_kernel` (default, GPU only), `npu`, `triton` (DeepSeek-V3 only; GPU only), `eager`. |
-| swiglu_mlp_implementation | `str` | `"liger_kernel"` | SwiGLU MLP. Known values: `liger_kernel` (default, GPU only), `eager`. There is no NPU backend — NPU users must set this to `"eager"`. |
+| swiglu_mlp_implementation | `str` | `"liger_kernel"` | SwiGLU MLP. Known values: `liger_kernel` (default, GPU only), `eager`. There is no NPU backend, so a value still equal to the default auto-resolves to `eager` on NPU. |
 | rotary_pos_emb_implementation | `str` | `"liger_kernel"` | Rotary pos emb. Known values: `liger_kernel` (default, GPU only), `npu`, `triton` (DeepSeek-V3 only; GPU only), `eager`. |
 | rotary_pos_emb_vision_implementation | `str` | `"eager"` | Vision rotary positional embedding. Known values: `eager`, `npu`. |
-| load_balancing_loss_implementation | `str` | `"triton"` | MoE load-balancing loss. `triton` (default) requires the `triton` Python package (or `triton-ascend` on NPU); raises at config validation time if the package is missing. `eager` is the pure-PyTorch reference. |
+| load_balancing_loss_implementation | `str` | `"triton"` | MoE load-balancing loss. `triton` uses the fused CUDA kernel; `eager` is the pure-PyTorch reference. On NPU, config normalization maps every value equal to the default `triton` (including an explicit YAML value) to `eager`. |
 | rms_norm_gated_implementation | `str` | `"fla"` | Gated RMSNorm (Qwen3.5 GatedDeltaNet `self.norm`). Known values: `eager`, `fla` (FLA `FusedRMSNormGated`, GPU), `npu`. |
 | causal_conv1d_implementation | `str` | `"fla"` | Varlen depthwise causal conv1d (Qwen3.5 GatedDeltaNet pre-mixer). Known values: `eager`, `fla` (GPU), `npu` (requires `triton-ascend`). `eager` does not support the varlen path. |
 | chunk_gated_delta_rule_implementation | `str` | `"fla"` | Chunk gated delta-rule kernel for Qwen3.5 linear attention. Known values: `eager`, `fla` (GPU), `flash_qla` (Hopper SM90), `npu` (requires `triton-ascend`). `eager` does not support varlen training. |
 | dsa_indexer_backend | `Literal["eager", "cudnn", "tilelang"]` | `"eager"` | DeepSeek sparse-attention top-k indexer backend. `tilelang` selects the DeepSeek-V4 Lightning Indexer kernel and requires an SM90+ CUDA GPU. |
 | dsa_attention_backend | `Literal["eager", "flashmla_cudnn", "tilelang_sparse"]` | `"eager"` | DeepSeek sparse-attention backend. `tilelang_sparse` selects the DeepSeek-V4 sparse MQA kernel and requires an SM90+ CUDA GPU. |
+| mhc_backend | `Literal["eager", "tile_kernels"]` | `"eager"` | DeepSeek V4 manifold-constrained Hyper-Connection backend. `tile_kernels` enables the TileKernels forward/backward path and requires an SM90+ CUDA GPU. |
 
 ### DataArguments
 
@@ -183,12 +209,12 @@ NPU validation runs at two times:
 | eval_path | `Optional[str]` | `None` | Path of the evaluation dataset. |
 | train_size | `int` | `10_000_000` | Number of tokens for training (used to compute steps under dynamic batch). |
 | train_sample | `int` | `10_000` | Number of samples for training (used to compute steps under non-dynamic batch). |
-| data_type | `Literal["plaintext", "conversation", "diffusion", "classification"]` | `"conversation"` | Type of the training data. |
+| data_type | `Literal["plaintext", "conversation", "diffusion", "classification", "dpo"]` | `"conversation"` | Type of the training data. |
 | datasets_type | `str` | `"mapping"` | `IterableDataset` or `MappingDataset` (or custom). |
 | multisource_datasets_type | `str` | `"interleave"` | Dataset type for multisource training. |
 | source_name | `str` | `None` | Dataset name. Loaded from multisource YAML if multisource is enabled. |
 | dyn_bsz_buffer_size | `int` | `200` | Buffer size for dynamic batch size. |
-| text_keys | `str` | `None` | Key to retrieve text from data. Auto-resolved: `"content_split"` for plaintext, `"messages"` for conversation, `"text"` for classification. |
+| text_keys | `str` | `None` | Key to retrieve text from data. Auto-resolved: `"content_split"` for plaintext, `"messages"` for conversation, `"text"` for classification, `"chosen"` for DPO. |
 | chat_template | `str` | `"default"` | Chat template name. |
 | max_seq_len | `int` | `2048` | Maximum sequence length. |
 | silent_exception | `bool` | `False` | Whether to ignore exceptions when loading data. |
@@ -230,8 +256,8 @@ NPU validation runs at two times:
 | ep_sharded_stream_load | `bool` | `False` | Opt-in fast/low-memory MoE loader: each rank reads only its ExtraParallel dim-0 slice from the checkpoint. Requires `broadcast_model_weights_from_rank0=False` and a model with an ExtraParallel parallel_plan. |
 | enable_full_determinism | `bool` | `False` | Enable full determinism (bitwise alignment). |
 | enable_batch_invariant_mode | `bool` | `False` | Enable batch invariant mode. |
-| empty_cache_steps | `int` | `500` | Steps between two `torch.cuda.empty_cache()` calls. |
-| gc_steps | `int` | `500` | Steps between two `gc.collect()` calls. Disabled if positive. |
+| empty_cache_steps | `int` | `500` | Steps between device-cache cleanup calls. A non-positive value disables scheduled cleanup. |
+| gc_steps | `int` | `500` | When positive, disable automatic Python GC and run `gc.collect()` every N steps. A non-positive value leaves automatic GC enabled and disables scheduled collection. |
 | eval_steps | `int` | `0` | Steps between evaluations. `0` to disable. |
 | eval_epochs | `int` | `1` | Epochs between evaluations. `0` to disable. |
 | seed | `int` | `42` | Random seed. |
@@ -476,6 +502,35 @@ Extends `DataArguments` with multimodal input configs.
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | mm_configs | `Optional[Dict]` | `{}` | Multimodal input configuration. |
+
+---
+
+## DiT Extensions
+
+Additional fields for diffusion-transformer training, defined in
+`veomni.trainer.dit_trainer`. The root `VeOmniDiTArguments` combines the three
+derived argument groups below.
+
+### DiTModelArguments
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| condition_model_path | `Optional[str]` | `None` | Path to the condition model. |
+| condition_model_cfg | `Optional[Dict]` | `{}` | Condition-model configuration. |
+
+### DiTDataArguments
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| mm_configs | `Optional[Dict]` | `{}` | Multimodal input configuration. |
+| offline_embedding_save_dir | `Optional[str]` | `None` | Directory used to save offline embeddings. |
+| shuffle | `bool` | `True` | Shuffle the training dataset. |
+
+### DiTTrainingArguments
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| training_task | `Literal["offline_training", "online_training", "offline_embedding"]` | `"online_training"` | Select offline training, online training, or offline embedding generation. |
 
 ---
 

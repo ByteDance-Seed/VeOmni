@@ -857,10 +857,9 @@ class TrainingArguments:
 # always allowed implicitly. A value not in ``_NPU_ALLOWED[field]`` raises on
 # NPU; a value in ``_NPU_REQUIRED[field]`` raises off NPU.
 #
-# Hardcoded (not inferred from ``BackendSpec.requires``) because the name
-# ``"triton"`` is reused with different hardware semantics — NPU
-# triton-ascend for load-balancing loss vs. CUDA-only mainline triton for
-# DeepSeek-V3 RMSNorm / RoPE.
+# Hardcoded (not inferred from ``BackendSpec.requires``) because backend names
+# alone do not capture per-model and per-hardware compatibility. The NPU
+# default-normalization step runs before this allow-list validation.
 _NPU_ALLOWED: Dict[str, frozenset] = {
     "rms_norm_implementation": frozenset({"npu"}),
     "rotary_pos_emb_implementation": frozenset({"npu"}),
@@ -894,17 +893,20 @@ _NPU_DEFAULT_FALLBACK: Dict[str, str] = {
 class OpsImplementationConfig:
     """model.ops_implementation.* — kernel backend selection per op.
 
-    Defaults are GPU-optimal (Liger / Triton / fused_triton); they raise on
-    NPU. NPU users must pin every per-op field to an NPU-supported value, or
-    ``"eager"`` when the op has no NPU kernel. Per-op fields are ``str`` so
-    third-party backends can register without changing this dataclass.
+    Defaults are GPU-optimal (Liger / Triton / fused_triton). On NPU, values
+    still equal to the dataclass defaults listed in ``_NPU_DEFAULT_FALLBACK``
+    are automatically mapped to NPU-compatible or eager implementations;
+    explicit non-default overrides are validated and unsupported values raise.
+    Per-op fields are ``str`` so third-party backends can register without
+    changing this dataclass.
 
     NPU validation runs at two times:
 
     - **Config-parse time** (``__post_init__``) for ops registered in the
       legacy per-model registry: ``rms_norm``, ``rotary_pos_emb``,
-      ``swiglu_mlp``, ``load_balancing_loss``, plus ``cross_entropy_loss``
-      and ``moe``. Errors fire immediately with a model-agnostic allow-list.
+      ``rotary_pos_emb_vision``, ``swiglu_mlp``, ``load_balancing_loss``, plus
+      ``cross_entropy_loss`` and ``moe``. Errors fire immediately with a
+      model-agnostic allow-list.
     - **Model-build time** (``OpSlot.bind`` via ``KERNEL_REGISTRY.resolve``)
       for Qwen3.5-only ops: ``rms_norm_gated``, ``causal_conv1d``,
       ``chunk_gated_delta_rule``. These OpSlots only exist in Qwen3.5's
@@ -917,7 +919,9 @@ class OpsImplementationConfig:
 
     Backends: ``"eager"`` (HF reference, always available),
     ``"liger_kernel"`` (GPU, needs ``liger-kernel``), ``"npu"`` (Ascend),
-    ``"triton"`` (CUDA ``triton`` / NPU ``triton-ascend``).
+    ``"triton"`` (CUDA ``triton``). Load-balancing loss has a CUDA Triton
+    backend; on NPU, values equal to the dataclass default are normalized to
+    ``"eager"`` before registry binding.
     """
 
     attn_implementation: Optional[
@@ -938,7 +942,8 @@ class OpsImplementationConfig:
         metadata={
             "help": "MoE experts forward. 'fused_triton' (default, GPU SM70+) | "
             "'fused_quack' (GPU SM90+) | 'fused_npu' (NPU) | 'eager'. "
-            "Hardware mismatch raises at config validation. Legacy 'fused' "
+            "On NPU, a default-valued 'fused_triton' selection maps to 'fused_npu'; "
+            "incompatible non-default overrides raise. Legacy 'fused' "
             "auto-resolves to fused_quack/fused_npu with a deprecation warning."
         },
     )
@@ -979,8 +984,8 @@ class OpsImplementationConfig:
     load_balancing_loss_implementation: str = field(
         default="triton",
         metadata={
-            "help": "MoE load-balancing loss. 'triton' (default; needs 'triton' on CUDA "
-            "or 'triton-ascend' on NPU — raises at validation if missing) | 'eager'."
+            "help": "MoE load-balancing loss. 'triton' (default; needs 'triton' on CUDA) | 'eager'. "
+            "On NPU, config normalization maps the default 'triton' value to 'eager'."
         },
     )
     rms_norm_gated_implementation: str = field(
@@ -1065,7 +1070,7 @@ class OpsImplementationConfig:
     def _apply_npu_default_fallback(self):
         """Auto-resolve GPU-only defaults to NPU-compatible alternatives.
 
-        When running on NPU, fields still at their GPU default are silently
+        When running on NPU, fields still at their GPU default are automatically
         swapped to the NPU fallback from ``_NPU_DEFAULT_FALLBACK``. Explicit
         user overrides (non-default values) are left untouched and will be
         caught by ``_validate_implementations`` if unsupported.
@@ -1130,7 +1135,7 @@ class OpsImplementationConfig:
         if self.load_balancing_loss_implementation == "triton" and not is_package_available("triton"):
             raise ValueError(
                 "load_balancing_loss_implementation='triton' requires the 'triton' package "
-                "(or 'triton-ascend' on NPU). Install it or set the field to 'eager'."
+                "on CUDA. Install it or set the field to 'eager'."
             )
 
 

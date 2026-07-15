@@ -52,7 +52,7 @@ No manual action is required. The patch is guarded by `_dcp_consolidation_patch_
 
 ## Requirements
 
-- **PyTorch Version**: Requires PyTorch 2.9.x (e.g., 2.9.0, 2.9.1)
+- **PyTorch Version**: Verified against PyTorch 2.9.1, 2.10.0, and the allow-listed 2.11.0 upstream/CI-wheel implementations. Other patch releases or builds fail the source-hash guard until explicitly verified and added.
 - **Tensors must be sorted by offset** before writing (already ensured by the implementation)
 
 ## Implementation Details
@@ -63,19 +63,20 @@ See `veomni/checkpoint/dcp_consolidation.py` for full implementation.
 
 1. User calls `_save_hf_safetensor_distributed()`
 2. Function applies patch via `apply_dcp_consolidation_patch()`
-3. Patch verifies torch version (must be 2.9.x)
+3. Patch verifies that the torch version and `_process_output_file` implementation are known-compatible
 4. Patch replaces `_process_output_file` in `torch.distributed.checkpoint._consolidate_hf_safetensors`
 5. `dcp.save()` proceeds with patched function
 
 ### Guards
 
 - `_dcp_consolidation_patch_applied`: Module-level flag to prevent duplicate patching
-- `_REQUIRED_TORCH_VERSION`: Version check to ensure patch compatibility
+- `_SUPPORTED_TORCH_VERSION_PREFIXES`: Allowed PyTorch version prefixes
+- `_SUPPORTED_PROCESS_OUTPUT_FILE_SHA256`: Hashes of verified `_process_output_file` implementations
 
 ## When to Update
 
-When upgrading PyTorch to a version other than 2.9.x:
+When upgrading PyTorch beyond the currently supported versions:
 
-1. Update `_REQUIRED_TORCH_VERSION` in `veomni/checkpoint/dcp_consolidation.py`
-2. Verify that `_process_output_file` function signature hasn't changed in the new PyTorch version
-3. Test this patch with HDFS FUSE to ensure compatibility
+1. Verify that the `_process_output_file` signature and implementation remain compatible
+2. Add the version prefix and verified implementation hash in `veomni/checkpoint/dcp_consolidation.py`
+3. Test the patch with HDFS FUSE before documenting the new version as supported

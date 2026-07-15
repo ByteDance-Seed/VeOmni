@@ -34,7 +34,7 @@ MASTER_PORT=${MASTER_PORT:=12345}
 NPROC_PER_NODE=${NPROC_PER_NODE:=8}
 ```
 
-> **Configuration Location**: These parameters are in `train.sh` (lines 9-37).
+> **Configuration Location**: These parameters are defined near the top of `train.sh`.
 
 **Parameter Explanations**:
 - `NNODES`: Total number of nodes in your cluster
@@ -57,21 +57,27 @@ Configure the operators in your YAML configuration file:
 ```yaml
 model:
   ops_implementation:
-    # Attention implementation selection
-    attn_implementation: "flash_attention_2"  # Options: "eager", "sdpa", "flash_attention_2", "flash_attention_3", "flash_attention_4", "native-sparse"
-    # MoE implementation selection
-    moe_implementation: "fused_npu"    # Options: "eager", "fused_npu"
+    # Use these only when replacing explicit GPU-only overrides.
+    rms_norm_implementation: "npu"
+    rotary_pos_emb_implementation: "npu"
+    swiglu_mlp_implementation: "eager"
+    moe_implementation: "fused_npu"
 ```
 
-> **Configuration Location**: These parameters are in your YAML configuration file (see `arguments.md` lines 127-135).
+> **Configuration Location**: See the [operator implementation arguments](../usage/arguments.md#opsimplementationconfig).
 
 **NPU Optimized Operators**:
-VeOmni automatically detects NPU environment and uses optimized operators:
-- `npu_group_gemm`: MoE GroupGEMM operator (`npu_group_gemm.py:1-114`)
-- `npu_rms_norm`: RMS normalization operator (`npu_fused_operator.py:20-26`)
-- `npu_rotary_mul`: RoPE positional encoding operator (`npu_fused_operator.py:28-52`)
+VeOmni automatically maps default-valued general operator settings to NPU-compatible
+implementations:
 
-**Note**: NPU automatically selects optimal operator implementations. For Attention, it uses SDPA or CANN built-in operators; for MoE, it uses `npu_group_gemm`.
+- `npu_group_gemm`: [MoE GroupGEMM operator](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/ops/kernels/moe/npu_group_gemm.py)
+- `npu_rms_norm`: [RMS normalization operator](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/ops/kernels/rms_norm/npu.py)
+- `npu_rotary_mul`: [RoPE positional encoding operator](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/ops/kernels/rotary/npu.py)
+
+**Note**: Only fields that still equal their dataclass defaults are auto-mapped. Explicit
+non-default overrides are preserved and rejected if unsupported. Attention continues to use
+the configured HuggingFace attention backend. Qwen3.5's `rms_norm_gated`, `causal_conv1d`,
+and `chunk_gated_delta_rule` fields are model-specific and must be set to `npu` explicitly.
 
 ## Q: How to resolve "'global batch size' should be a multiple of 8/16/32" error?
 

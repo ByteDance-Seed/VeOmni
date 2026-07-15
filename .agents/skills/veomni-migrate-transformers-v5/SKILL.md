@@ -1,6 +1,6 @@
 ---
 name: veomni-migrate-transformers-v5
-description: "Use this skill when adding or refreshing a patchgen-generated modeling file for a VeOmni model under veomni/models/transformers/<model>/generated/ — GPU-only or GPU+NPU, dense or MoE, text-only / VLM / Omni-thinker+talker. Covers: creating <model>_{gpu,npu}_patch_gen_config.py, using patchgen decorators (replace_class/override_method/replace_function/modify_init/add_post_import_block/drop_import_names), reusing sibling-model patches via name_map, handling MoE weight-loading (CheckpointTensorConverter + fused gate_up_proj layout), multimodal/VLM forward with Ulysses SP, excluding speech/vocoder subtrees in Omni models (talker/token2wav/DiT/BigVGAN), wiring __init__.py for the patchgen-generated classes, running codegen, and adding test cases. Trigger: 'port <model> to patchgen', 'add patchgen for <model>', 'transformers v5 migration', 'add NPU patchgen'. Do NOT edit files under generated/ manually — always regenerate via patchgen."
+description: "Use this skill when adding or refreshing a patchgen-generated modeling file for a VeOmni model under its generated directory — GPU-only or GPU+NPU, dense or MoE, text-only / VLM / Omni-thinker+talker. Covers: creating GPU and NPU patchgen configs, using patchgen decorators (replace_class/override_method/replace_function/modify_init/add_post_import_block/drop_import_names), reusing sibling-model patches via name_map, handling MoE weight-loading (CheckpointTensorConverter + fused gate_up_proj layout), multimodal/VLM forward with Ulysses SP, excluding speech/vocoder subtrees in Omni models (talker/token2wav/DiT/BigVGAN), wiring __init__.py for the patchgen-generated classes, running codegen, and adding test cases. Trigger: 'port a model to patchgen', 'add patchgen for a model', 'transformers v5 migration', 'add NPU patchgen'. Do NOT edit files under generated/ manually — always regenerate via patchgen."
 ---
 
 # VeOmni Transformers v5 Patchgen Protocol
@@ -13,7 +13,7 @@ supported model; legacy v4 monkey-patches have been retired.
 **References (read first, load on demand):**
 
 - `docs/transformers_v5/index.md` — overview of what v5 migration covers
-- `docs/transformers_v5/patchgen.md` — patchgen DSL, CLI, CI drift check
+- `docs/design/patchgen.md` — patchgen DSL, CLI, CI drift check
 - `docs/transformers_v5/transformers_v5_moe_weight_loading.md` — MoE fused-expert layout + runtime converter
 - `docs/transformers_v5/veomni_flash_attention_kernel_adapter.md` — FA custom-name adapter
 - `docs/transformers_v5/testing_new_model.md` — v5 test case SOP
@@ -191,7 +191,8 @@ Drop phases that don't apply (e.g. Phase 3 for non-MoE models).
    - Omni MoE → reference `qwen3_omni_moe/`
 5. Check upstream source (`from transformers.models.<m> import modeling_<m>`).
    Confirm class/function names still exist; MoE expert layouts especially
-   diverge between sibling models — see `transformers_v5_moe_weight_loading.md`.
+   diverge between sibling models — see
+   `docs/transformers_v5/transformers_v5_moe_weight_loading.md`.
 6. Note related configs/loaders to preserve: `MODELING_REGISTRY`,
    `MODEL_CONFIG_REGISTRY` in `veomni/models/loader.py`; any auto-config
    registrations.
@@ -391,7 +392,8 @@ duplicating ~hundreds of lines per sibling model.
 (`veomni_flash_attention_{2,3,4}_with_sp`) are handled globally by
 `transformers.integrations.hub_kernels.load_and_register_attn_kernel` adapter —
 **no per-model patching needed**. Just keep `attn_implementation` names unchanged
-in configs. See `veomni_flash_attention_kernel_adapter.md`.
+in configs. See
+`docs/transformers_v5/veomni_flash_attention_kernel_adapter.md`.
 
 **Patch comment style:**
 
@@ -506,7 +508,8 @@ Two authoritative sources:
 1. Copy the matching template above.
 2. Update the regex `_EXPERT_PATTERN` to match your upstream key layout.
 3. Update merge order / transpose for the HF-side layout. Three layouts exist
-   — see table in `transformers_v5_moe_weight_loading.md`:
+   — see table in
+   `docs/transformers_v5/transformers_v5_moe_weight_loading.md`:
    - qwen3_moe: per-expert split → stack on dim 0.
    - qwen3_vl_moe: fused, transposed (`[E, H, 2*I]` / `[E, I, H]`) → `transpose(1, 2)`.
    - qwen3_5_moe: fused, direct (`[E, 2*I, H]` / `[E, H, I]`) → no-op (no converter needed).
@@ -1003,12 +1006,13 @@ Extra e2e gotchas:
   `AssertionError: len(cumsum_M) == b.shape[0]` inside `group_gemm_same_nk`
   (cumsum length = `E_local`, but the weight has all `E` experts). See
   `veomni/models/transformers/deepseek_v3/parallel_plan.py`.
-- **Sync-weight adapters must detect the fused layout** — HF checkpoints may
-  already ship `experts.gate_up_proj` / `experts.down_proj`. Test adapters in
-  `tests/models/weight_sync_adapters.py::sync_weight_<m>` that unconditionally
-  stack per-expert `gate_proj`/`up_proj`/`down_proj` will raise
-  `KeyError: '...experts.0.gate_proj.weight'`. Guard with a key-existence
-  check and skip stacking when the fused keys are already present.
+- **Checkpoint converters must detect the fused layout** — HF checkpoints may
+  already ship `experts.gate_up_proj` / `experts.down_proj`. A
+  `CheckpointTensorConverter` that unconditionally stacks per-expert
+  `gate_proj`/`up_proj`/`down_proj` will raise
+  `KeyError: '...experts.0.gate_proj.weight'`. Guard with a key-existence check,
+  skip stacking when fused keys are already present, and cover both layouts in
+  `tests/models/test_checkpoint_tensor_converter.py`.
 
 ---
 

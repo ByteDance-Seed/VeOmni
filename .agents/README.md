@@ -11,12 +11,15 @@ Reusable skills and knowledge for AI coding agents working on VeOmni. Follows th
 │   ├── veomni-debug/
 │   ├── veomni-review/
 │   ├── veomni-new-model/
+│   ├── veomni-migrate-transformers-v5/
 │   ├── veomni-new-op/
 │   ├── veomni-uv-update/
+│   ├── veomni-profile/
 │   └── create-pr/
 ├── knowledge/           # Shared knowledge base
 │   ├── architecture.md
 │   ├── constraints.md
+│   ├── multimodal_metadata.md
 │   └── uv.md
 ├── setup_agent.sh       # Bootstrap script (see below)
 └── README.md
@@ -49,4 +52,5 @@ The `knowledge/` directory contains domain-specific context loaded by agents on 
 
 - **architecture.md** — module map, trainer hierarchy, data flow
 - **constraints.md** — hard constraints checked before any code change
+- **multimodal_metadata.md** — canonical multimodal metadata keys and ownership
 - **uv.md** — dependency management architecture

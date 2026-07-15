@@ -126,7 +126,7 @@ Based on findings, suggest and implement optimizations:
 
 | Bottleneck | Typical solutions |
 |------------|-------------------|
-| Attention kernels dominate | Switch to FlashAttention 3/4 (`veomni/ops/flash_attn/`), check FA is actually active |
+| Attention kernels dominate | Switch to FlashAttention 3/4 (`veomni/ops/kernels/attention/`), check FA is actually active |
 | NCCL communication > 30% | Increase compute/comm overlap, adjust FSDP reshard policy, try async SP |
 | Memory OOM / high peak | Enable activation checkpointing, reduce micro-batch size, check for memory leaks |
 | Data loading stalls | Increase `num_workers`, enable prefetch, check I/O throughput |

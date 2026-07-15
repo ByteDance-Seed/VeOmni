@@ -14,11 +14,9 @@
 #   - Train with or without audio generation
 #   - Create custom video generation styles or audiovisual concepts
 #
-# Dataset structure for text-to-video training:
-#   preprocessed_data_root/
-#   ├── audio_latents/  # Audio latents (only if with_audio: true)
-#   ├── conditions/     # Text embeddings for each video
-#   └── latents/        # Video latents (VAE-encoded videos)
+# Dataset input for offline training is the parquet output produced by
+# preprocess_dataset.py save-parquet. Latent tensors and condition embeddings
+# are stored in each shard.
 #
 # =============================================================================
 
@@ -28,11 +26,12 @@
 # model.* maps to DiTModelArguments (extends ModelArguments).
 model:
   # Path to the directory containing LTX-2.3 transformer .safetensors files
-  model_path: "path/to/ltx-2.3-model/"
+  model_path: "/path/to/models/LTX-2.3"
 
-  # Path to the LTX-2.3 checkpoint directory. This directory must contain:
-  #   - config.json (for LTXVideoConditionModelConfig)
-  condition_model_path: "path/to/ltx-2.3-checkpoint"
+  # Path to the same LTX-2.3 checkpoint directory used to build the condition model.
+  # Its root config.json initializes the condition config; component discovery
+  # also checks transformer/config.json and model_index.json.
+  condition_model_path: "/path/to/models/LTX-2.3"
 
   config_path: "configs/model_configs/ltx2_3/ltx2_3_av.json"
 
@@ -40,12 +39,8 @@ model:
   condition_model_cfg:
     # Whether to enable audio modality in the condition model
     with_audio: true
-    # Strategy name: "text_to_video" for standard text-to-video training
-    name: "text_to_video"
     # Probability of conditioning on the first frame during training
     first_frame_conditioning_p: 0.5
-    # Directory name (within train_path) containing audio latents
-    audio_latents_dir: "audio_latents"
     # --- Flow matching ---
     timestep_sampling_mode: "shifted_logit_normal"
 
@@ -110,9 +105,8 @@ model:
 # -----------------------------------------------------------------------------
 # data.* maps to DiTDataArguments (extends DataArguments).
 data:
-  # Path to preprocessed training data (required — no default)
-  # Should contain: latents/, conditions/, and optionally audio_latents/
-  train_path: "/path/to/preprocessed/data"
+  # Directory containing parquet shards produced by the save-parquet command.
+  train_path: "/path/to/parquet_output"
 
   data_type: diffusion
   datasets_type: iterable
