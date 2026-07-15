@@ -56,7 +56,7 @@ def expert_histogram(input: torch.Tensor, num_bins: int) -> torch.Tensor:
     probably should go for some other histogram method.
     """
 
-    assert input.is_cuda
+    assert (input.is_cuda or input.is_mlu)
     assert input.dtype == torch.int32 or input.dtype == torch.int64
     assert input.numel() < (1 << 31) - 1, "Too many elements."
     flattened = input.flatten().contiguous()
@@ -127,7 +127,7 @@ def _moe_gather_kernel(
 
 
 def moe_gather(x: torch.Tensor, index: torch.Tensor, out_dtype=None):
-    assert x.is_cuda and index.is_cuda
+    assert (x.is_cuda or x.is_mlu) and (index.is_cuda or index.is_mlu)
     M, topk = index.shape
     assert x.shape[0] == M * topk
     N = x.shape[1]
@@ -210,7 +210,7 @@ def _moe_add_gather_kernel(
 
 
 def moe_add_gather(x: torch.Tensor, y: torch.Tensor, index: torch.Tensor, out_dtype=None):
-    assert x.is_cuda and y.is_cuda and index.is_cuda
+    assert (x.is_cuda or x.is_mlu) and (y.is_cuda or y.is_mlu) and (index.is_cuda or index.is_mlu)
     assert x.shape == y.shape
     assert x.dtype == y.dtype
     M, topk = index.shape
@@ -300,7 +300,7 @@ def _moe_scatter_kernel(
 
 
 def moe_scatter(x: torch.Tensor, index: torch.Tensor, out_dtype=None):
-    assert x.is_cuda and index.is_cuda
+    assert (x.is_cuda or x.is_mlu) and (index.is_cuda or index.is_mlu)
     assert x.shape[0] == index.shape[0]
 
     assert x.device == index.device, f"x.device = {x.device}, index.device = {index.device}"

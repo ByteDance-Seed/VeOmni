@@ -43,6 +43,8 @@ _PACKAGE_FLAGS: Dict[str, bool] = {
     "flash_attn": _is_package_available("flash_attn"),
     "liger_kernel": _is_package_available("liger_kernel"),
     "torch_npu": _is_package_available("torch_npu"),
+    "torch_mlu": _is_package_available("torch_mlu"),
+    "apex": _is_package_available("apex"),
     "diffusers": _is_package_available("diffusers"),
     "av": _is_package_available("av"),
     "librosa": _is_package_available("librosa"),
@@ -68,6 +70,16 @@ def is_liger_kernel_available() -> bool:
 def is_torch_npu_available() -> bool:
     return _PACKAGE_FLAGS["torch_npu"]
 
+def is_torch_mlu_available() -> bool:
+    return _PACKAGE_FLAGS["torch_mlu"]
+
+def is_apex_mlu_available() -> bool:
+    if not _PACKAGE_FLAGS["apex"]:
+        return False
+    try:
+        return "mlu" in importlib.metadata.version("apex")
+    except importlib.metadata.PackageNotFoundError:
+        return False
 
 def is_diffusers_available() -> bool:
     return _PACKAGE_FLAGS["diffusers"]
@@ -76,7 +88,7 @@ def is_diffusers_available() -> bool:
 def is_fused_moe_available() -> bool:
     import torch
 
-    return torch.cuda.is_available() and not _PACKAGE_FLAGS["torch_npu"] and _PACKAGE_FLAGS["triton"]
+    return (torch.cuda.is_available() or _PACKAGE_FLAGS["torch_mlu"]) and not _PACKAGE_FLAGS["torch_npu"] and _PACKAGE_FLAGS["triton"]
 
 
 def is_quack_package_available() -> bool:
@@ -88,7 +100,7 @@ def is_quack_gemm_available() -> bool:
     """Check if quack GEMM kernels can run (package installed + SM90+ GPU)."""
     from .device import is_sm90_or_above
 
-    return is_quack_package_available() and not _PACKAGE_FLAGS["torch_npu"] and is_sm90_or_above()
+    return is_quack_package_available() and not _PACKAGE_FLAGS["torch_npu"] and not _PACKAGE_FLAGS["torch_mlu"] and is_sm90_or_above()
 
 
 def is_video_audio_available() -> bool:

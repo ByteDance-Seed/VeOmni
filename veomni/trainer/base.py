@@ -70,6 +70,7 @@ from ..utils.device import (
     get_dist_comm_backend,
     get_torch_device,
     is_nccl_backend,
+    is_cncl_backend,
     synchronize,
 )
 from ..utils.loss_utils import count_loss_token, mean_global_loss
@@ -796,6 +797,13 @@ class BaseTrainer(Stateful, ABC):
             logger.info_rank0(
                 "Skipping explicit NCCL process-group destroy on normal trainer exit. "
                 "Set VEOMNI_DESTROY_NCCL_ON_EXIT=1 to restore the previous teardown behavior."
+            )
+            return
+
+        if is_cncl_backend(backend) and os.getenv("VEOMNI_DESTROY_CNCL_ON_EXIT", "0") != "1":
+            logger.info_rank0(
+                "Skipping explicit CNCL process-group destroy on normal trainer exit. "
+                "Set VEOMNI_DESTROY_CNCL_ON_EXIT=1 to restore the previous teardown behavior."
             )
             return
 

@@ -19,6 +19,7 @@ from ....utils.import_utils import (
     is_fused_moe_available,
     is_quack_gemm_available,
     is_torch_npu_available,
+    is_torch_mlu_available,
 )
 
 
@@ -66,9 +67,10 @@ def apply_veomni_fused_moe_patch(fused_moe_kernel: str = "triton") -> None:
 
     Args:
         fused_moe_kernel: Which fused MoE kernel to activate. OSS values:
-            ``"triton"`` (Triton group-gemm, GPU, SM70+),
+            ``"triton"`` (Triton group-gemm, GPU, SM70+, MLU),
             ``"quack"`` (Quack CUTLASS/CuTe, GPU, SM90+),
             ``"npu"`` (NPU group-gemm, requires torch_npu).
+            ``"mlu"`` (MLU group-gemm, requires torch_mlu).
             The kernel must match the hardware; mismatches raise here rather
             than silently falling back to a different backend.
 
@@ -87,6 +89,14 @@ def apply_veomni_fused_moe_patch(fused_moe_kernel: str = "triton") -> None:
         from .npu_group_gemm import npu_fused_moe_forward
 
         _fused_moe_forward = npu_fused_moe_forward
+    elif fused_moe_kernel == "mlu":
+        if not is_torch_mlu_available():
+            raise RuntimeError(
+                "fused_moe_kernel='mlu' requires torch_mlu and an MLU device. On GPU, use 'triton' or 'quack' instead."
+            )
+        from .mlu_group_gemm import mlu_group_gemm_fused_moe_forward
+
+        _fused_moe_forward = mlu_group_gemm_fused_moe_forward
     elif fused_moe_kernel == "quack":
         if is_torch_npu_available():
             raise RuntimeError("fused_moe_kernel='quack' is GPU-only. Use 'npu' on NPU devices.")
@@ -102,12 +112,12 @@ def apply_veomni_fused_moe_patch(fused_moe_kernel: str = "triton") -> None:
         if is_torch_npu_available():
             raise RuntimeError("fused_moe_kernel='triton' is GPU-only. Use 'npu' on NPU devices.")
         if not is_fused_moe_available():
-            raise RuntimeError("fused_moe_kernel='triton' requires triton to be installed and a supported GPU.")
+            raise RuntimeError("fused_moe_kernel='triton' requires triton to be installed and a supported GPU or MLU.")
         from .group_gemm import group_gemm_fused_moe_forward
 
         _fused_moe_forward = group_gemm_fused_moe_forward
     else:
-        raise ValueError(f"Invalid fused_moe_kernel: {fused_moe_kernel!r}. Expected one of: 'triton', 'quack', 'npu'.")
+        raise ValueError(f"Invalid fused_moe_kernel: {fused_moe_kernel!r}. Expected one of: 'triton', 'quack', 'npu', 'mlu'.")
 
     # Bind the LoRA-aware fused MoE kernels (owned by ``veomni.lora.ops``) to
     # match the base backend just selected. Whether a LoRA kernel exists is a
@@ -193,7 +203,7 @@ KERNEL_REGISTRY.register(
         op_name="moe_experts",
         variant="standard",
         factory=_triton_kernel_factory,
-        hardware=HardwareRequirement(device_type="gpu", min_compute_capability=70),
+        hardware=HardwareRequirement(device_type=["gpu", "mlu"], min_compute_capability=70),
         description="Triton group-gemm fused MoE forward",
     )
 )
@@ -249,5 +259,22 @@ KERNEL_REGISTRY.register(
         factory=_npu_kernel_factory,
         hardware=HardwareRequirement(device_type="npu"),
         description="NPU group-gemm fused MoE forward",
+    )
+)
+
+def _mlu_kernel_factory():
+    from .mlu_group_gemm import mlu_group_gemm_fused_moe_forward
+
+    return _make_moe_experts_adapter(mlu_group_gemm_fused_moe_forward)
+
+
+KERNEL_REGISTRY.register(
+    KernelSpec(
+        name="mlu",
+        op_name="moe_experts",
+        variant="standard",
+        factory=_mlu_kernel_factory,
+        hardware=HardwareRequirement(device_type="mlu"),
+        description="mlu group-gemm fused MoE forward",
     )
 )

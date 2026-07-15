@@ -25,7 +25,7 @@ from dataclasses import dataclass
 from typing import Callable
 
 from ..utils import logging
-from ..utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE, get_gpu_compute_capability
+from ..utils.device import IS_CUDA_AVAILABLE, IS_MLU_AVAILABLE, IS_NPU_AVAILABLE, get_gpu_compute_capability
 
 
 logger = logging.get_logger(__name__)
@@ -35,7 +35,7 @@ logger = logging.get_logger(__name__)
 class HardwareRequirement:
     """Describes hardware constraints for a kernel."""
 
-    device_type: str  # "gpu" | "npu"
+    device_type: str | list # "gpu" | "npu" | "mlu"
     min_compute_capability: int | None = None  # e.g. 70, 80, 90
     # Inclusive upper bound for kernels that don't yet support newer arches
     # (e.g. FlashQLA today only ships SM90; SM100/SM120 wheels are WIP per
@@ -43,8 +43,8 @@ class HardwareRequirement:
     # adds forward-compatibility for higher arches.
     max_compute_capability: int | None = None
 
-    def is_satisfied(self) -> bool:
-        if self.device_type == "gpu":
+    def _is_single_device_satisfied(self, device_type: str) -> bool:
+        if device_type == "gpu":
             if not IS_CUDA_AVAILABLE:
                 return False
             cc = get_gpu_compute_capability()
@@ -53,19 +53,28 @@ class HardwareRequirement:
             if self.max_compute_capability is not None and cc > self.max_compute_capability:
                 return False
             return True
-        if self.device_type == "npu":
+        if device_type == "npu":
             # IS_NPU_AVAILABLE == is_torch_npu_available(): requires both the
             # torch_npu package AND an actual NPU device (unlike a bare import
             # check, which passes on dev boxes that merely have the library).
             return IS_NPU_AVAILABLE
-        if self.device_type == "any":
+        if device_type == "mlu":
+            return IS_MLU_AVAILABLE
+        if device_type == "any":
             # Hardware-agnostic kernel (pure PyTorch). Used e.g. by chunk_loss
             # (F.linear + eager_cross_entropy in a chunked autograd Function),
             # which has no device-specific calls. Always satisfied — including
             # on CPU-only hosts (unit tests, weight materialization, dev boxes
             # without an accelerator).
             return True
-        raise ValueError(f"Unknown device_type: {self.device_type!r} (expected 'gpu' | 'npu' | 'any')")
+        raise ValueError(f"Unknown device_type: {device_type!r} (expected 'gpu' | 'npu' | 'mlu' | 'any')")
+    
+    def is_satisfied(self) -> bool:
+        if isinstance(self.device_type, str):
+            return self._is_single_device_satisfied(self.device_type)
+        else:
+            return any(self._is_single_device_satisfied(device_type) for device_type in self.device_type)
+
 
 
 @dataclass(frozen=True)
