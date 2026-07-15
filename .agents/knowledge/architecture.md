@@ -96,7 +96,7 @@ BaseTrainer (ABC)
 
 Subclasses override specific methods (e.g., `compute_loss()`, custom data transforms) rather than the entire training loop.
 
-**Parallel-state scoping**: after `_setup()`, each trainer explicitly calls `register_parallel_state("base")`, then builds under `use_parallel_state("base")`. Run time uses **per-op** wraps with `"base"` (forward / postforward / backward / clip). No `self.parallel_state` on trainers. See `.agents/knowledge/constraints.md` §7 and `docs/superpowers/specs/2026-07-15-local-parallel-state-registry-design.md`.
+**Parallel-state scoping**: `_setup()` registers `ParallelState("base")` before seed/determinism; then each trainer builds under `use_parallel_state("base")`. Run time uses **per-op** wraps with `"base"` (forward / postforward / backward / clip). No `self.parallel_state` on trainers. See `.agents/knowledge/constraints.md` §7 and `docs/superpowers/specs/2026-07-15-local-parallel-state-registry-design.md`.
 
 ## Data Flow
 

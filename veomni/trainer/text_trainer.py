@@ -44,8 +44,7 @@ class TextTrainer:
         self.base = BaseTrainer.__new__(BaseTrainer)
         self.base.args = args
 
-        self.base._setup()
-        self.base.register_parallel_state("base")
+        self.base._setup()  # registers ParallelState("base") before seed
         # All build steps read the current ParallelState via ``get_parallel_state()``
         # (meta-init, FSDP2/EP wrap + weight load, optimizer, SP data pipeline), so
         # scope the whole build under this trainer's own state. No-op for the

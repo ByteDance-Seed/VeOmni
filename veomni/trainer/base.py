@@ -290,8 +290,11 @@ class BaseTrainer(Stateful, ABC):
         """
 
         self.args: VeOmniArguments = args
+        # ``_setup`` registers ParallelState ("base") before seed/determinism so
+        # device-mesh process groups are created with default NCCL settings —
+        # matching pre-registry init order (avoids L20 SIGSEGV when
+        # NCCL_DETERMINISTIC=1 is set before mesh construction).
         self._setup()
-        self.register_parallel_state("base")
         # Every build step below reads the current ParallelState via
         # ``get_parallel_state()`` (meta-init, FSDP2/TP/EP wrap + weight load,
         # EP-/muon-aware optimizer, SP-aware data pipeline). Scope the whole
@@ -334,6 +337,10 @@ class BaseTrainer(Stateful, ABC):
             dist.init_process_group(backend=get_dist_comm_backend())
 
         logger.info(f"Process rank: {self.args.train.global_rank}, world size: {self.args.train.world_size}")
+
+        # Register ParallelState before seed/determinism env vars. Mesh creation
+        # must not run under NCCL_DETERMINISTIC=1 on some GPU platforms (L20).
+        self.register_parallel_state("base")
 
         # Set random seed
         helper.set_seed(self.args.train.seed, self.args.train.enable_full_determinism)

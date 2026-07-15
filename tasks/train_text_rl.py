@@ -13,8 +13,7 @@ class TextRLTrainer(TextTrainer):
         self.base = BaseRLTrainer.__new__(BaseRLTrainer)
         self.base.args = args
 
-        self.base._setup()
-        self.base.register_parallel_state("base")
+        self.base._setup()  # registers ParallelState("base") before seed
         # All build steps read the current ParallelState via ``get_parallel_state()``,
         # so scope the whole build under this trainer's own state (see BaseTrainer).
         with use_parallel_state("base"):

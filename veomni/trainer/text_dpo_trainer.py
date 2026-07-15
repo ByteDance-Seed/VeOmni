@@ -141,8 +141,7 @@ class TextDPOTrainer:
         self.base = BaseTrainer.__new__(BaseTrainer)
         self.base.args = args
 
-        self.base._setup()
-        self.base.register_parallel_state("base")
+        self.base._setup()  # registers ParallelState("base") before seed
         # All build steps (policy + reference model, optimizer, SP data pipeline)
         # read the current ParallelState via ``get_parallel_state()``, so scope the
         # whole build under this trainer's own state. No-op for the single-model
