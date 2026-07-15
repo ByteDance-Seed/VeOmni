@@ -58,7 +58,7 @@ from ..data.data_collator import DataCollator, MainCollator
 from ..data.data_transform import build_data_transform
 from ..distributed.clip_grad_norm import veomni_clip_grad_norm
 from ..distributed.offloading import build_activation_offloading_context
-from ..distributed.parallel_state import init_parallel_state
+from ..distributed.parallel_state import clear_parallel_state, init_parallel_state, use_parallel_state
 from ..distributed.torch_compile import CompileConfig, mark_compile_step_begin
 from ..distributed.torch_parallelize import build_parallelize_model
 from ..models import build_foundation_model, build_tokenizer
@@ -290,28 +290,38 @@ class BaseTrainer(Stateful, ABC):
         """
 
         self.args: VeOmniArguments = args
+        # ``_setup`` registers ParallelState ("base") before seed/determinism so
+        # device-mesh process groups are created with default NCCL settings —
+        # matching pre-registry init order (avoids L20 SIGSEGV when
+        # NCCL_DETERMINISTIC=1 is set before mesh construction).
         self._setup()
-        # build model
-        self._build_model()
-        # freeze module and print trainable parameters
-        self._freeze_model_module()
-        # build model assets (config, tokenizer, processor, chat_template)
-        self._build_model_assets()
-        # build dataset and dataloader
-        self._build_data_transform()
-        self._build_dataset()
-        self._build_collate_fn()
-        self._build_dataloader()
+        # Every build step below reads the current ParallelState via
+        # ``get_parallel_state()`` (meta-init, FSDP2/TP/EP wrap + weight load,
+        # EP-/muon-aware optimizer, SP-aware data pipeline). Scope the whole
+        # build under the registered name (a no-op for the single-model case:
+        # the global already equals the registered ``"base"`` state).
+        with use_parallel_state("base"):
+            # build model
+            self._build_model()
+            # freeze module and print trainable parameters
+            self._freeze_model_module()
+            # build model assets (config, tokenizer, processor, chat_template)
+            self._build_model_assets()
+            # build dataset and dataloader
+            self._build_data_transform()
+            self._build_dataset()
+            self._build_collate_fn()
+            self._build_dataloader()
 
-        # Parallelize model
-        self._build_parallelized_model()
-        # Build optimizer and lr scheduler
-        self._build_optimizer()
-        self._build_lr_scheduler()
-        # Build training context
-        self._build_training_context()
-        # Initialize callbacks
-        self._init_callbacks()
+            # Parallelize model
+            self._build_parallelized_model()
+            # Build optimizer and lr scheduler
+            self._build_optimizer()
+            self._build_lr_scheduler()
+            # Build training context
+            self._build_training_context()
+            # Initialize callbacks
+            self._init_callbacks()
 
     def _setup(self):
         # log args
@@ -328,21 +338,9 @@ class BaseTrainer(Stateful, ABC):
 
         logger.info(f"Process rank: {self.args.train.global_rank}, world size: {self.args.train.world_size}")
 
-        # Initialize parallel state
-        init_parallel_state(
-            dp_size=self.args.train.accelerator.dp_size,
-            dp_replicate_size=self.args.train.accelerator.dp_replicate_size,
-            dp_shard_size=self.args.train.accelerator.dp_shard_size,
-            tp_size=self.args.train.accelerator.tp_size,
-            pp_size=self.args.train.accelerator.pp_size,
-            cp_size=self.args.train.accelerator.cp_size,
-            ulysses_size=self.args.train.accelerator.ulysses_size,
-            extra_parallel_sizes=self.args.train.accelerator.extra_parallel_sizes,
-            extra_parallel_placement_innermost=self.args.train.accelerator.extra_parallel_placement_innermost,
-            extra_parallel_names=self.args.train.accelerator.extra_parallel_names,
-            dp_mode=self.args.train.accelerator.fsdp_config.fsdp_mode,
-            async_enabled=self.args.train.accelerator.enable_async,
-        )
+        # Register ParallelState before seed/determinism env vars. Mesh creation
+        # must not run under NCCL_DETERMINISTIC=1 on some GPU platforms (L20).
+        self.register_parallel_state("base")
 
         # Set random seed
         helper.set_seed(self.args.train.seed, self.args.train.enable_full_determinism)
@@ -360,6 +358,24 @@ class BaseTrainer(Stateful, ABC):
 
         # Gradient checkpointing debug
         set_checkpoint_debug_enabled(self.args.train.gradient_checkpointing.debug)
+
+    def register_parallel_state(self, name: str = "base"):
+        """Register this trainer's ParallelState under ``name`` in the registry."""
+        init_parallel_state(
+            dp_size=self.args.train.accelerator.dp_size,
+            dp_replicate_size=self.args.train.accelerator.dp_replicate_size,
+            dp_shard_size=self.args.train.accelerator.dp_shard_size,
+            tp_size=self.args.train.accelerator.tp_size,
+            pp_size=self.args.train.accelerator.pp_size,
+            cp_size=self.args.train.accelerator.cp_size,
+            ulysses_size=self.args.train.accelerator.ulysses_size,
+            extra_parallel_sizes=self.args.train.accelerator.extra_parallel_sizes,
+            extra_parallel_placement_innermost=self.args.train.accelerator.extra_parallel_placement_innermost,
+            extra_parallel_names=self.args.train.accelerator.extra_parallel_names,
+            dp_mode=self.args.train.accelerator.fsdp_config.fsdp_mode,
+            async_enabled=self.args.train.accelerator.enable_async,
+            name=name,
+        )
 
     def _build_model(self):
         logger.info_rank0("Build model")
@@ -580,72 +596,51 @@ class BaseTrainer(Stateful, ABC):
         self.evaluate_callback = EvaluateCallback(self)
         self.moe_monitor_callback = MoERouterMonitorCallback(self)
         self.channel_loss_callback = ChannelLossCallback(self)
+        # Ordered dispatch list. Callbacks own their ParallelState explicitly:
+        # each captured it at construction (``Callback.parallel_state``), and
+        # ChannelLossComputer receives that same cached state. Shared objects
+        # (EnvironMeter, DCP checkpointer) are handed the state directly, so
+        # no ambient ``use_parallel_state`` scope is needed around hook dispatch.
+        #
+        # ``channel_loss_callback`` is ordered after the meter (which resets
+        # ``step_*_metrics`` in ``on_step_end``) and before ``wandb`` (which
+        # logs them), so its per-source metrics survive into the logged payload.
+        self._callbacks = [
+            self.environ_meter_callback,
+            self.tqdm_callback,
+            self.channel_loss_callback,
+            self.wandb_callback,
+            self.profile_callback,
+            self.checkpointer_callback,
+            self.hf_ckpt_callback,
+            self.evaluate_callback,
+            self.moe_monitor_callback,
+        ]
         self.state = TrainerState()
 
     def on_train_begin(self):
-        self.channel_loss_callback.on_train_begin(self.state)
-        self.environ_meter_callback.on_train_begin(self.state)
-        self.tqdm_callback.on_train_begin(self.state)
-        self.wandb_callback.on_train_begin(self.state)
-        self.profile_callback.on_train_begin(self.state)
-        self.checkpointer_callback.on_train_begin(self.state)
-        self.hf_ckpt_callback.on_train_begin(self.state)
-        self.evaluate_callback.on_train_begin(self.state)
-        self.moe_monitor_callback.on_train_begin(self.state)
+        for callback in self._callbacks:
+            callback.on_train_begin(self.state)
 
     def on_train_end(self):
-        self.environ_meter_callback.on_train_end(self.state)
-        self.tqdm_callback.on_train_end(self.state)
-        self.wandb_callback.on_train_end(self.state)
-        self.profile_callback.on_train_end(self.state)
-        self.checkpointer_callback.on_train_end(self.state)
-        self.hf_ckpt_callback.on_train_end(self.state)
-        self.evaluate_callback.on_train_end(self.state)
-        self.moe_monitor_callback.on_train_end(self.state)
-        self.channel_loss_callback.on_train_end(self.state)
+        for callback in self._callbacks:
+            callback.on_train_end(self.state)
 
     def on_epoch_begin(self):
-        self.environ_meter_callback.on_epoch_begin(self.state)
-        self.tqdm_callback.on_epoch_begin(self.state)
-        self.wandb_callback.on_epoch_begin(self.state)
-        self.profile_callback.on_epoch_begin(self.state)
-        self.checkpointer_callback.on_epoch_begin(self.state)
-        self.hf_ckpt_callback.on_epoch_begin(self.state)
-        self.evaluate_callback.on_epoch_begin(self.state)
+        for callback in self._callbacks:
+            callback.on_epoch_begin(self.state)
 
     def on_epoch_end(self):
-        self.environ_meter_callback.on_epoch_end(self.state)
-        self.tqdm_callback.on_epoch_end(self.state)
-        self.wandb_callback.on_epoch_end(self.state)
-        self.profile_callback.on_epoch_end(self.state)
-        self.checkpointer_callback.on_epoch_end(self.state)
-        self.hf_ckpt_callback.on_epoch_end(self.state)
-        self.evaluate_callback.on_epoch_end(self.state)
+        for callback in self._callbacks:
+            callback.on_epoch_end(self.state)
 
-    def on_step_begin(self, micro_batches=None, channel_loss_source_repeat: int = 1):
-        self.channel_loss_callback.on_step_begin(
-            self.state,
-            micro_batches=micro_batches,
-            source_repeat=channel_loss_source_repeat,
-        )
-        self.environ_meter_callback.on_step_begin(self.state, micro_batches=micro_batches)
-        self.tqdm_callback.on_step_begin(self.state, micro_batches=micro_batches)
-        self.wandb_callback.on_step_begin(self.state, micro_batches=micro_batches)
-        self.profile_callback.on_step_begin(self.state, micro_batches=micro_batches)
-        self.checkpointer_callback.on_step_begin(self.state, micro_batches=micro_batches)
-        self.hf_ckpt_callback.on_step_begin(self.state, micro_batches=micro_batches)
-        self.evaluate_callback.on_step_begin(self.state, micro_batches=micro_batches)
+    def on_step_begin(self, micro_batches=None, **kwargs):
+        for callback in self._callbacks:
+            callback.on_step_begin(self.state, micro_batches=micro_batches, **kwargs)
 
     def on_step_end(self, loss=None, loss_dict=None, grad_norm=None):
-        self.environ_meter_callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
-        self.tqdm_callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
-        self.channel_loss_callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
-        self.wandb_callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
-        self.profile_callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
-        self.checkpointer_callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
-        self.hf_ckpt_callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
-        self.evaluate_callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
-        self.moe_monitor_callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
+        for callback in self._callbacks:
+            callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
 
     def preforward(self, micro_batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         """Preprocess micro batches before forward pass.
@@ -697,18 +692,21 @@ class BaseTrainer(Stateful, ABC):
                 channel_loss_callback.model_forward_context() if channel_loss_callback is not None else nullcontext()
             )
             with (
+                use_parallel_state("base"),
                 self.model_fwd_context,
                 set_batch_invariant_mode(self.args.train.enable_batch_invariant_mode),
                 channel_forward_context,
             ):
                 outputs: ModelOutput = self.model(**micro_batch, use_cache=False)
 
-            loss: torch.Tensor
-            loss_dict: Dict[str, torch.Tensor]
-            loss, loss_dict = self.postforward(outputs, micro_batch)
+            with use_parallel_state("base"):
+                loss, loss_dict = self.postforward(outputs, micro_batch)
 
-            # Backward pass
-            with self.model_bwd_context, set_batch_invariant_mode(self.args.train.enable_batch_invariant_mode):
+            with (
+                use_parallel_state("base"),
+                self.model_bwd_context,
+                set_batch_invariant_mode(self.args.train.enable_batch_invariant_mode),
+            ):
                 loss.backward()
 
             del micro_batch
@@ -774,8 +772,9 @@ class BaseTrainer(Stateful, ABC):
             for k, v in loss_dict.items():
                 total_loss_dict[k] += v.item()
 
-        # Gradient clipping
-        grad_norm = veomni_clip_grad_norm(self.model, args.train.optimizer.max_grad_norm)
+        # Gradient clipping (reads FSDP/EP groups from current ParallelState)
+        with use_parallel_state("base"):
+            grad_norm = veomni_clip_grad_norm(self.model, args.train.optimizer.max_grad_norm)
 
         # Optimizer and scheduler step
         self.optimizer.step()
@@ -801,6 +800,7 @@ class BaseTrainer(Stateful, ABC):
 
         synchronize()
         dist.destroy_process_group()
+        clear_parallel_state()
 
     def train(self):
         args: VeOmniArguments = self.args

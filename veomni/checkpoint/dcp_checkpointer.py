@@ -170,13 +170,13 @@ class ModelState(Stateful):
             (already populated from ``model_path``) base params are left untouched.
     """
 
-    def __init__(self, model, trainable_only: bool = False):
+    def __init__(self, model, trainable_only: bool = False, parallel_state=None):
         self.model = model
         self.trainable_only = trainable_only
 
         # Determine whether this is ExtraParallel+FSDP2 case
         # If so, we need to restore Para(e.g. EP)-dim before saving to DCP
-        self.parallel_state = get_parallel_state()
+        self.parallel_state = parallel_state if parallel_state is not None else get_parallel_state()
         self.extra_parallel_fqn2spec_info = getattr(self.model, "_fqn2spec_info", None)
         self.should_extra_parallel_aware = (
             self.extra_parallel_fqn2spec_info is not None and self.parallel_state.dp_mode == "fsdp2"
@@ -241,10 +241,10 @@ class OptimizerState(Stateful):
     ``ModelState.load_state_dict`` for non-LoRA loads.
     """
 
-    def __init__(self, model, optimizer):
+    def __init__(self, model, optimizer, parallel_state=None):
         self.model = model
         self.optimizer = optimizer
-        self.parallel_state = get_parallel_state()
+        self.parallel_state = parallel_state if parallel_state is not None else get_parallel_state()
         self.extra_parallel_fqn2spec_info = getattr(self.model, "_fqn2spec_info", None)
         self.should_extra_parallel_aware = (
             self.extra_parallel_fqn2spec_info is not None and self.parallel_state.dp_mode == "fsdp2"
@@ -410,6 +410,7 @@ class DistributedCheckpointer(CheckpointerBase):
         storage_writer: Optional[FileSystemWriter] = None,
         trainable_only: bool = False,
         save_to_lowest_rank: bool = False,
+        parallel_state=None,
     ) -> None:
         """
         save training state to distributed checkpoint
@@ -447,9 +448,13 @@ class DistributedCheckpointer(CheckpointerBase):
         # saving extra_state first to gurantee that every saved model/optimizer ckpts have their extra_state saved before them
         cls._save_extra_state(checkpoint_dir=checkpoint_dir, state=state)
 
-        save_state = {"model": ModelState(state["model"], trainable_only=trainable_only)}
+        save_state = {
+            "model": ModelState(state["model"], trainable_only=trainable_only, parallel_state=parallel_state)
+        }
         if "optimizer" in state:
-            save_state["optimizer"] = OptimizerState(model=state["model"], optimizer=state["optimizer"])
+            save_state["optimizer"] = OptimizerState(
+                model=state["model"], optimizer=state["optimizer"], parallel_state=parallel_state
+            )
 
         if storage_writer is None:
             storage_writer = cls._create_storage_writer(checkpoint_dir)
@@ -471,6 +476,7 @@ class DistributedCheckpointer(CheckpointerBase):
         process_group=None,
         storage_reader: Optional[FileSystemReader] = None,
         trainable_only: bool = False,
+        parallel_state=None,
     ) -> Dict[str, Any]:
         """
         load training state from distributed checkpoint
@@ -496,9 +502,13 @@ class DistributedCheckpointer(CheckpointerBase):
         if "model" not in state:
             raise ValueError("Model must be provided to load a distributed checkpoint.")
 
-        load_state = {"model": ModelState(state["model"], trainable_only=trainable_only)}
+        load_state = {
+            "model": ModelState(state["model"], trainable_only=trainable_only, parallel_state=parallel_state)
+        }
         if "optimizer" in state:
-            load_state["optimizer"] = OptimizerState(model=state["model"], optimizer=state["optimizer"])  # type: ignore[index]
+            load_state["optimizer"] = OptimizerState(
+                model=state["model"], optimizer=state["optimizer"], parallel_state=parallel_state
+            )  # type: ignore[index]
 
         if storage_reader is None:
             storage_reader = cls._create_storage_reader(checkpoint_dir)

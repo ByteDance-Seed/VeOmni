@@ -1028,12 +1028,12 @@ def test_dpo_channel_loss_emits_policy_totals():
     base.channel_loss_callback = ChannelLossCallback(base)
     step_begin_args = {}
 
-    def on_step_begin(micro_batches=None, channel_loss_source_repeat=1):
-        step_begin_args["source_repeat"] = channel_loss_source_repeat
+    def on_step_begin(micro_batches=None, **kwargs):
+        step_begin_args["source_repeat"] = kwargs.get("source_repeat", 1)
         base.channel_loss_callback.on_step_begin(
             state,
             micro_batches=micro_batches,
-            source_repeat=channel_loss_source_repeat,
+            **kwargs,
         )
 
     base.on_step_begin = on_step_begin

@@ -26,7 +26,7 @@ from ..arguments import MixedPrecisionConfig, VeOmniArguments
 from ..data import build_chat_template, build_data_transform
 from ..data.data_collator import PostCollator
 from ..distributed.clip_grad_norm import veomni_clip_grad_norm
-from ..distributed.parallel_state import get_parallel_state
+from ..distributed.parallel_state import get_parallel_state, use_parallel_state
 from ..distributed.sequence_parallel import gather_outputs
 from ..distributed.torch_compile import mark_compile_step_begin
 from ..distributed.torch_parallelize import build_parallelize_model
@@ -141,24 +141,30 @@ class TextDPOTrainer:
         self.base = BaseTrainer.__new__(BaseTrainer)
         self.base.args = args
 
-        self.base._setup()
-        self.base._build_model()
-        self.base._freeze_model_module()
+        self.base._setup()  # registers ParallelState("base") before seed
+        # All build steps (policy + reference model, optimizer, SP data pipeline)
+        # read the current ParallelState via ``get_parallel_state()``, so scope the
+        # whole build under this trainer's own state. No-op for the single-model
+        # case; keeps each module building over its own mesh once modules build
+        # separately.
+        with use_parallel_state("base"):
+            self.base._build_model()
+            self.base._freeze_model_module()
 
-        self._build_model_assets()
-        self._build_data_transform()
+            self._build_model_assets()
+            self._build_data_transform()
 
-        self.base._build_dataset()
-        self.base._build_collate_fn()
-        self.base._build_dataloader()
-        self._build_postforward()
-        self.base._build_parallelized_model()
-        self.base._build_optimizer()
-        self.base._build_lr_scheduler()
-        self.base._build_training_context()
-        self.base._init_callbacks()
+            self.base._build_dataset()
+            self.base._build_collate_fn()
+            self.base._build_dataloader()
+            self._build_postforward()
+            self.base._build_parallelized_model()
+            self.base._build_optimizer()
+            self.base._build_lr_scheduler()
+            self.base._build_training_context()
+            self.base._init_callbacks()
 
-        self._build_reference_model()
+            self._build_reference_model()
 
     def _build_model_assets(self):
         args: VeOmniDPOArguments = self.base.args
@@ -178,7 +184,6 @@ class TextDPOTrainer:
 
     def _build_postforward(self):
         self.post_forward = PostCollator()
-        self.sp_enabled = get_parallel_state().sp_enabled
 
     def _build_reference_model(self):
         """Build and freeze a reference model with the same architecture and FSDP sharding."""
@@ -281,10 +286,14 @@ class TextDPOTrainer:
         # (actual log-probabilities; sign already flipped). PostCollator
         # only knows about ``outputs.logits``, so we replicate its
         # SP-gather + per-seq split inline against the log_probs field.
+        # Caller must enter ``use_parallel_state("base")`` so model forward and
+        # SP gathers resolve the correct groups.
         log_probs_packed = outputs.fused_linear_aux.log_probs.squeeze(0)  # [packed_L]
         seq_lens = self.post_forward.compute_seqlens_func(micro_batch)
-        if self.sp_enabled:
-            log_probs_packed = gather_outputs(log_probs_packed, gather_dim=0, group=get_parallel_state().sp_group)
+        sp_enabled = get_parallel_state().sp_enabled
+        if sp_enabled:
+            sp_group = get_parallel_state().sp_group
+            log_probs_packed = gather_outputs(log_probs_packed, gather_dim=0, group=sp_group)
             log_probs_packed = log_probs_packed[: sum(seq_lens)]
         log_probs_list = list(log_probs_packed.split(seq_lens, dim=0))
 
@@ -292,12 +301,12 @@ class TextDPOTrainer:
         # log-probs. ``_build_dpo_labels_list`` handles both SP-on (segment
         # boundary masking against the global shift) and SP-off (per-segment
         # causal shift with IGNORE_INDEX trailing pad) — see helper docstring.
-        if self.sp_enabled:
-            all_labels = gather_outputs(micro_batch["labels"], gather_dim=-1, group=get_parallel_state().sp_group)
+        if sp_enabled:
+            all_labels = gather_outputs(micro_batch["labels"], gather_dim=-1, group=sp_group)
             all_labels = all_labels.view(-1)[: sum(seq_lens)]
         else:
             all_labels = micro_batch["labels"].view(-1)
-        labels_list = _build_dpo_labels_list(all_labels, seq_lens, self.sp_enabled)
+        labels_list = _build_dpo_labels_list(all_labels, seq_lens, sp_enabled)
 
         average_log_prob = getattr(self.base.args, "dpo_config", None) and self.base.args.dpo_config.average_log_prob
         all_logps: List[torch.Tensor] = []
@@ -330,13 +339,14 @@ class TextDPOTrainer:
             if channel_loss_callback is not None:
                 channel_loss_callback.strip_model_inputs(micro_batch)
 
-            with torch.no_grad():
+            with torch.no_grad(), use_parallel_state("base"):
                 ref_chosen_logps, ref_rejected_logps = self.concatenated_forward(self.reference_model, micro_batch)
 
             channel_forward_context = (
                 channel_loss_callback.model_forward_context() if channel_loss_callback is not None else nullcontext()
             )
             with (
+                use_parallel_state("base"),
                 self.base.model_fwd_context,
                 set_batch_invariant_mode(args.train.enable_batch_invariant_mode),
                 channel_forward_context,
@@ -365,7 +375,11 @@ class TextDPOTrainer:
                 "reward_margin": (chosen_rewards - rejected_rewards).mean().detach(),
             }
 
-            with self.base.model_bwd_context, set_batch_invariant_mode(args.train.enable_batch_invariant_mode):
+            with (
+                use_parallel_state("base"),
+                self.base.model_bwd_context,
+                set_batch_invariant_mode(args.train.enable_batch_invariant_mode),
+            ):
                 loss.backward()
 
             del micro_batch
@@ -386,7 +400,7 @@ class TextDPOTrainer:
     def on_step_begin(self, micro_batches=None):
         # Each DPO preference pair is packed as two consecutive causal-LM
         # segments (chosen, rejected) but carries one source metadata entry.
-        self.base.on_step_begin(micro_batches=micro_batches, channel_loss_source_repeat=2)
+        self.base.on_step_begin(micro_batches=micro_batches, source_repeat=2)
 
     def on_step_end(self, loss=None, loss_dict=None, grad_norm=None):
         self.base.on_step_end(loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
@@ -414,7 +428,8 @@ class TextDPOTrainer:
             for k, v in loss_dict.items():
                 total_loss_dict[k] += v.item()
 
-        grad_norm = veomni_clip_grad_norm(self.base.model, args.train.optimizer.max_grad_norm)
+        with use_parallel_state("base"):
+            grad_norm = veomni_clip_grad_norm(self.base.model, args.train.optimizer.max_grad_norm)
 
         self.base.optimizer.step()
         self.base.lr_scheduler.step()

@@ -296,6 +296,8 @@ def test_deepseek_v4_generated_indexer_dispatch_and_position_fallback(monkeypatc
 
     config = AutoConfig.from_pretrained("tests/toy_config/deepseek_v4_toy")
     indexer = modeling.DeepseekV4Indexer(config).to(device=DEVICE, dtype=torch.bfloat16)
+    with torch.no_grad():
+        torch.nn.init.zeros_(indexer.position_bias)
     seq_len = 8
     hidden_states = torch.randn(1, seq_len, config.hidden_size, device=DEVICE, dtype=torch.bfloat16)
     q_residual = torch.randn(1, seq_len, config.q_lora_rank, device=DEVICE, dtype=torch.bfloat16)
@@ -375,6 +377,14 @@ def test_deepseek_v4_packed_compressors_match_independent_sequences():
     modeling.veomni_dsa_indexer_backend.bind(SimpleNamespace(dsa_indexer_backend="eager"))
     for compressor_cls in (modeling.DeepseekV4HCACompressor, modeling.DeepseekV4CSACompressor):
         compressor = compressor_cls(config)
+        # Compressors allocate ``position_bias`` with ``torch.empty``; the full
+        # model zeros it in ``_init_weights``. Standalone construction must do
+        # the same or softmax-gated compression sees allocator garbage / NaNs.
+        with torch.no_grad():
+            torch.nn.init.zeros_(compressor.position_bias)
+            indexer = getattr(compressor, "indexer", None)
+            if indexer is not None:
+                torch.nn.init.zeros_(indexer.position_bias)
         packed_kv, packed_bias = compressor(
             hidden_states,
             q_residual,

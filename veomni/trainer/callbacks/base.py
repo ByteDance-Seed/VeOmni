@@ -15,6 +15,8 @@
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Dict, List
 
+from veomni.distributed.parallel_state import get_parallel_state
+
 
 if TYPE_CHECKING:
     from ..base import BaseTrainer
@@ -29,6 +31,7 @@ class TrainerState:
 class Callback:
     def __init__(self, trainer: "BaseTrainer") -> None:
         self.trainer = trainer
+        self.parallel_state = get_parallel_state()
 
     def on_step_begin(self, state: TrainerState, micro_batches: List[Dict[str, Any]] = None, **kwargs) -> None:
         pass
