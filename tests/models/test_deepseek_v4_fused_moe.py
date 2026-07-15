@@ -71,6 +71,25 @@ def test_deepseek_v4_topk_router_uses_fp32_projection():
     torch.testing.assert_close(weights, expected_weights, rtol=0, atol=0)
 
 
+def test_deepseek_v4_weighted_rms_norm_matches_official_fp32_multiply_order():
+    norm = dsv4.DeepseekV4RMSNorm(32).to(torch.bfloat16)
+    generator = torch.Generator().manual_seed(42)
+    hidden_states = torch.randn(2, 3, 32, generator=generator, dtype=torch.bfloat16)
+    with torch.no_grad():
+        norm.weight.copy_(torch.randn(32, generator=generator, dtype=torch.bfloat16))
+
+    normalized = hidden_states.float()
+    variance = normalized.square().mean(-1, keepdim=True)
+    normalized *= torch.rsqrt(variance + norm.variance_epsilon)
+    expected = (norm.weight.float() * normalized).to(hidden_states.dtype)
+    old_cast_order = norm.weight * normalized.to(hidden_states.dtype)
+
+    actual = norm(hidden_states)
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert not torch.equal(actual, old_cast_order)
+
+
 def test_deepseek_v4_fused_moe_receives_merged_weights_and_swiglu_limit(monkeypatch):
     config = SimpleNamespace(
         num_local_experts=3,
