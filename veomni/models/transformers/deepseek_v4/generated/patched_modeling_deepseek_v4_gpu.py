@@ -26,7 +26,7 @@
 #    - function_replacement: eager_attention_forward
 #      Optional TileLang sparse MQA dispatch
 #    - method_override: DeepseekV4Model.forward
-#      Propagate packed sequence boundaries to compressed attention
+#      Propagate packed boundaries and preserve stateless indexer dispatch
 #    - class_replacement: DeepseekV4Experts
 #      Use v5 gate_up_proj expert layout with OpSlot-guarded VeOmni fused-MoE path
 #    - method_override: DeepseekV4ForCausalLM.forward
@@ -1562,6 +1562,7 @@ class DeepseekV4Model(DeepseekV4PreTrainedModel):
     # ================================================================
     # Patch: DeepseekV4Model.forward
     # 1. Convert collator-provided cu-seqlens into reusable packed slices once.
+    # 2. Keep use_cache=False forwards stateless so the TileLang indexer can run.
     # ================================================================
     @merge_with_config_defaults
     @capture_outputs
@@ -1578,13 +1579,17 @@ class DeepseekV4Model(DeepseekV4PreTrainedModel):
     ) -> MoeModelOutputWithPast:
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
-        return_cache = past_key_values if use_cache else None
-        if past_key_values is None:
+        # Stateless prefill/training must keep the cache absent: the TileLang
+        # Lightning Indexer dispatch is intentionally cache-free, and creating a
+        # DynamicCache here would silently force its eager decode fallback even
+        # when use_cache=False.
+        if past_key_values is None and use_cache:
             past_key_values = DynamicCache(config=self.config)
+        return_cache = past_key_values if use_cache else None
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
         if position_ids is None:
-            past_seen = past_key_values.get_seq_length()
+            past_seen = past_key_values.get_seq_length() if past_key_values is not None else 0
             position_ids = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device) + past_seen
             position_ids = position_ids.unsqueeze(0)
 
