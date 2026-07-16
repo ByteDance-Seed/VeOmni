@@ -28,6 +28,25 @@ from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type, get_gpu_comp
 DEVICE = get_device_type()
 
 
+def _make_eager_ops_config(**overrides):
+    from veomni.arguments.arguments_types import OpsImplementationConfig
+
+    eager_fields = {
+        "attn_implementation": "eager",
+        "moe_implementation": "eager",
+        "cross_entropy_loss_implementation": "eager",
+        "rms_norm_implementation": "eager",
+        "swiglu_mlp_implementation": "eager",
+        "rotary_pos_emb_implementation": "eager",
+        "load_balancing_loss_implementation": "eager",
+        "rms_norm_gated_implementation": "eager",
+        "causal_conv1d_implementation": "eager",
+        "chunk_gated_delta_rule_implementation": "eager",
+    }
+    eager_fields.update(overrides)
+    return OpsImplementationConfig(**eager_fields)
+
+
 def test_kernel_package_does_not_import_tilelang_eagerly():
     sys.modules.pop("veomni.ops.kernels.deepseek_v4", None)
     before = "tilelang" in sys.modules
@@ -754,21 +773,19 @@ def test_deepseek_v4_fp8_activation_qat_rejects_non_bf16_inputs():
 
 
 def test_deepseek_v4_fp8_activation_qat_rejects_npu_config(monkeypatch):
-    from tests.tools.training_utils import make_eager_ops_config
     from veomni.utils import import_utils
 
     monkeypatch.setattr(import_utils, "is_torch_npu_available", lambda: True)
     with pytest.raises(ValueError, match="only supported by the DeepSeek-V4 GPU backend"):
-        make_eager_ops_config(deepseek_v4_fp8_activation_qat=True)
+        _make_eager_ops_config(deepseek_v4_fp8_activation_qat=True)
 
 
 def test_deepseek_v4_fp8_activation_qat_requires_hadamard_dependency(monkeypatch):
-    from tests.tools.training_utils import make_eager_ops_config
     from veomni.utils import import_utils
 
     monkeypatch.setattr(import_utils, "is_package_available", lambda name: name != "fast_hadamard_transform")
     with pytest.raises(ValueError, match="requires fast-hadamard-transform"):
-        make_eager_ops_config(deepseek_v4_fp8_activation_qat=True)
+        _make_eager_ops_config(deepseek_v4_fp8_activation_qat=True)
 
 
 def test_deepseek_v4_fp8_activation_qat_model_forward_backward(monkeypatch):
