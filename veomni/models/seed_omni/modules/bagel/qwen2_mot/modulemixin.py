@@ -9,14 +9,12 @@ import torch.distributed as dist
 
 from ......distributed.parallel_state import get_parallel_state
 from ......distributed.sequence_parallel import (
-    gather_outputs,
     slice_input_tensor,
-    sp_gather_seqs,
+    sp_all_gather_shards,
     sp_pad,
-    sp_take_own_seq,
 )
 from ....mixins.metric_meter_mixin import MetricMeterMixin
-from ....mixins.modulemixin import ModuleMixin, post_forward, pre_forward
+from ....mixins.modulemixin import ModuleMixin, post_forward, pre_forward, sp_post_forward, sp_pre_forward
 from ....utils.conversation import ConversationItem, get_tail_output_item, iter_desired_items
 from ..sources import (
     BAGEL_FLOW_HIDDEN,
@@ -30,6 +28,7 @@ from .generation_state import MotCacheContext, MotGenerationState
 from .processing import (
     PackedConversation,
     PackedSpan,
+    build_mot_attention_mask,
     preprocess_mot_inputs,
 )
 
@@ -40,9 +39,8 @@ class BagelQwen2MoTModuleMixin(ModuleMixin):
     def init_omni_state(self) -> None:
         self._conversation_carrier: list[list[ConversationItem]] | None = None
         self._packed_training: PackedConversation | None = None
-        self._sp_seqlen: int | None = None
-        self._sp_rep_lengths: list[int] | None = None
-        self._sp_group_index: int = 0
+        self._sp_owner_length: int | None = None
+        self._validated_ulysses_size: int | None = None
         self._generation_state = MotGenerationState()
 
     def reset_local_inference_state(self) -> None:
@@ -190,15 +188,17 @@ class BagelQwen2MoTModuleMixin(ModuleMixin):
         )
 
         packed_sequence = self._fold_dummy_anchors(self._packed_training.packed_sequence, conversation_list)
-        return self._prepare_training_sp_inputs(
-            {
-                "packed_sequence": packed_sequence,
-                "packed_position_ids": self._packed_training.packed_position_ids,
-                "packed_token_type_ids": self._packed_training.packed_token_type_ids,
-            },
-            sample_splits=self._packed_training.sample_splits,
-            sample_attn_modes=self._packed_training.sample_attn_modes,
+        attention_mask = build_mot_attention_mask(
+            self._packed_training.sample_splits,
+            self._packed_training.sample_attn_modes,
+            device=self.device,
         )
+        return {
+            "packed_sequence": packed_sequence,
+            "packed_position_ids": self._packed_training.packed_position_ids,
+            "packed_token_type_ids": self._packed_training.packed_token_type_ids,
+            "attention_mask": attention_mask,
+        }
 
     @post_forward("forward")
     def forward_post(self, hidden_states: torch.Tensor, **kwargs: Any) -> dict[str, Any]:
@@ -207,26 +207,7 @@ class BagelQwen2MoTModuleMixin(ModuleMixin):
         packed = self._packed_training
         self._conversation_carrier = None
         self._packed_training = None
-
-        ps = get_parallel_state()
-        if ps.sp_enabled:
-            if self._sp_seqlen is None or self._sp_rep_lengths is None:
-                raise RuntimeError("BAGEL Qwen2-MoT SP post-forward state was not initialized.")
-
-            hidden_states = gather_outputs(
-                hidden_states,
-                gather_dim=0,
-                padding_dim=0,
-                unpad_dim_size=self._sp_seqlen,
-                group=ps.sp_group,
-            )
-            hidden_states = sp_take_own_seq(
-                hidden_states,
-                dim=0,
-                seg_lengths=self._sp_rep_lengths,
-                sp_rank=self._sp_group_index,
-            )
-            self._clear_sp_state()
+        self._sp_owner_length = None
 
         for span in packed.spans:
             span_hidden = hidden_states[span.start : span.start + span.length].to(device=self.device)
@@ -235,6 +216,73 @@ class BagelQwen2MoTModuleMixin(ModuleMixin):
                 item.value = span_hidden[offset : offset + length]
                 offset += length
         return {"conversation_list": conversation}
+
+    # ── Ulysess SP hooks ──────────────────────────────────
+
+    @sp_pre_forward("forward")
+    def forward_sp_pre(
+        self,
+        packed_sequence: torch.Tensor,
+        packed_position_ids: torch.Tensor,
+        packed_token_type_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        """Slice one owner's already-broadcast packed sequence for Ulysses."""
+        del kwargs
+        ps = get_parallel_state()
+        if ps.cp_size != 1:
+            raise ValueError(
+                f"BAGEL Qwen2-MoT training supports Ulysses sequence parallelism only; got cp_size={ps.cp_size}."
+            )
+        if self._validated_ulysses_size != ps.ulysses_size:
+            num_heads = int(self.config.num_attention_heads)
+            num_key_value_heads = int(self.config.num_key_value_heads)
+            if num_heads % ps.ulysses_size != 0:
+                raise ValueError(
+                    "BAGEL Qwen2-MoT attention heads must be divisible by "
+                    f"ulysses_size: num_heads={num_heads}, ulysses_size={ps.ulysses_size}."
+                )
+            if num_key_value_heads % ps.ulysses_size != 0:
+                raise ValueError(
+                    "BAGEL Qwen2-MoT KV heads must be divisible by "
+                    f"ulysses_size for native GQA: num_key_value_heads={num_key_value_heads}, "
+                    f"ulysses_size={ps.ulysses_size}."
+                )
+            self._validated_ulysses_size = ps.ulysses_size
+
+        self._sp_owner_length = int(packed_sequence.shape[0])
+        packed_sequence = sp_pad(packed_sequence, dim=0, pad_value=0)
+        packed_position_ids = sp_pad(packed_position_ids, dim=0, pad_value=0)
+        packed_token_type_ids = sp_pad(packed_token_type_ids, dim=0, pad_value=-1)
+
+        packed_sequence = slice_input_tensor(packed_sequence, dim=0, padding=False, group=ps.sp_group)
+        packed_position_ids = slice_input_tensor(packed_position_ids, dim=0, padding=False, group=ps.sp_group)
+        packed_token_type_ids = slice_input_tensor(
+            packed_token_type_ids,
+            dim=0,
+            padding=False,
+            group=ps.sp_group,
+        )
+        return {
+            "packed_sequence": packed_sequence,
+            "packed_position_ids": packed_position_ids,
+            "packed_token_type_ids": packed_token_type_ids,
+            "attention_mask": attention_mask,
+        }
+
+    @sp_post_forward("forward")
+    def forward_sp_post(self, hidden_states: torch.Tensor, **kwargs: Any) -> dict[str, Any]:
+        """All-gather the active sample's output shards and strip its sequence padding."""
+        del kwargs
+        ps = get_parallel_state()
+        hidden_states = sp_all_gather_shards(hidden_states, dim=0, group=ps.sp_group)
+        if self._sp_owner_length is None:
+            raise RuntimeError("BAGEL Qwen2-MoT SP sample length was not initialized.")
+        hidden_states = hidden_states.narrow(0, 0, self._sp_owner_length)
+        return {"hidden_states": hidden_states}
+
+    # ── Dummy helper ──────────────────────────────────
 
     def _fold_dummy_anchors(
         self,
@@ -260,7 +308,14 @@ class BagelQwen2MoTModuleMixin(ModuleMixin):
                 continue
 
             has_anchor = True
-            anchor = anchor + item.value.to(device=packed_sequence.device).sum() * 0.0
+            anchor = (
+                anchor
+                + item.value.to(
+                    device=packed_sequence.device,
+                    dtype=packed_sequence.dtype,
+                ).sum()
+                * 0.0
+            )
 
         if not has_anchor:
             return packed_sequence
@@ -326,87 +381,6 @@ class BagelQwen2MoTModuleMixin(ModuleMixin):
                 )
             return True
         return False
-
-    # ── Sequence-parallel helpers ──────────────────────
-
-    def _prepare_training_sp_inputs(
-        self,
-        inputs: dict[str, Any],
-        *,
-        sample_splits: list[list[int]],
-        sample_attn_modes: list[list[str]],
-    ) -> dict[str, Any]:
-        self._clear_sp_state()
-
-        ps = get_parallel_state()
-        gathered_splits = sample_splits
-        gathered_modes = sample_attn_modes
-        if ps.sp_enabled:
-            if ps.cp_size != 1:
-                raise ValueError(
-                    f"BAGEL Qwen2-MoT training supports Ulysses sequence parallelism only; got cp_size={ps.cp_size}."
-                )
-
-            packed_sequence, rep_lengths, group_index = sp_gather_seqs(inputs["packed_sequence"], dim=0)
-            packed_position_ids, _, _ = sp_gather_seqs(inputs["packed_position_ids"], dim=0)
-            packed_token_type_ids, _, _ = sp_gather_seqs(inputs["packed_token_type_ids"], dim=0)
-            gathered_splits, gathered_modes = self._gather_sp_attention_metadata(sample_splits, sample_attn_modes)
-
-            self._sp_seqlen = int(packed_sequence.shape[0])
-            self._sp_rep_lengths = rep_lengths
-            self._sp_group_index = group_index
-
-            packed_sequence = sp_pad(packed_sequence, dim=0, pad_value=0)
-            packed_position_ids = sp_pad(packed_position_ids, dim=0, pad_value=0)
-            packed_token_type_ids = sp_pad(packed_token_type_ids, dim=0, pad_value=-1)
-
-            inputs["packed_sequence"] = slice_input_tensor(packed_sequence, dim=0, padding=False, group=ps.sp_group)
-            inputs["packed_position_ids"] = slice_input_tensor(
-                packed_position_ids, dim=0, padding=False, group=ps.sp_group
-            )
-            inputs["packed_token_type_ids"] = slice_input_tensor(
-                packed_token_type_ids, dim=0, padding=False, group=ps.sp_group
-            )
-
-        # Keep the compact global span layout. Attention reconstructs its
-        # causal/full/noise visibility span-wise instead of allocating masks.
-        inputs["sample_lens"] = [sum(splits) for splits in gathered_splits]
-        inputs["sample_splits"] = gathered_splits
-        inputs["sample_attn_modes"] = gathered_modes
-        packed_token_type_ids = inputs.pop("packed_token_type_ids")
-        inputs["packed_und_token_indexes"] = torch.nonzero(
-            packed_token_type_ids == 0,
-            as_tuple=False,
-        ).flatten()
-        inputs["packed_gen_token_indexes"] = torch.nonzero(
-            packed_token_type_ids == 1,
-            as_tuple=False,
-        ).flatten()
-        return inputs
-
-    def _gather_sp_attention_metadata(
-        self,
-        sample_splits: list[list[int]],
-        sample_attn_modes: list[list[str]],
-    ) -> tuple[list[list[int]], list[list[str]]]:
-        ps = get_parallel_state()
-        gathered: list[tuple[list[list[int]], list[list[str]]] | None] = [None for _ in range(ps.sp_size)]
-        dist.all_gather_object(gathered, (sample_splits, sample_attn_modes), group=ps.sp_group)
-
-        merged_splits: list[list[int]] = []
-        merged_modes: list[list[str]] = []
-        for payload in gathered:
-            if payload is None:
-                continue
-            rank_splits, rank_modes = payload
-            merged_splits.extend([list(splits) for splits in rank_splits])
-            merged_modes.extend([list(modes) for modes in rank_modes])
-        return merged_splits, merged_modes
-
-    def _clear_sp_state(self) -> None:
-        self._sp_seqlen = None
-        self._sp_rep_lengths = None
-        self._sp_group_index = 0
 
     # ── Internal helpers ──────────────────────────────────
 

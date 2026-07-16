@@ -1,21 +1,23 @@
-# Per-module SP for BAGEL: VAE/SigLIP redistribute whole images while
-# bagel_qwen2_mot shards packed sequence compute.
+# Per-module SP for BAGEL. Only bagel_qwen2_mot.forward and the inherited base
+# text-encoder encode path use the owner-loop runtime in this configuration.
 #
 # The outer Omni trainer must keep ulysses_size=1. Each rank loads its own DP
-# shard. VAE/SigLIP balance complete images across their module-SP groups without
-# splitting an image's internal codec/ViT sequence. bagel_qwen2_mot gathers its
-# group's distinct packed sequences, shards attention/MLP compute, then restores
-# each rank's own carrier segment.
+# shard. The graph broadcasts one owner's packed MoT tensors at a time; Ulysses
+# shards that owner's Q/K/V heads and sequence, and one dense masked SDPA call per
+# decoder layer preserves BAGEL causal/full/noise visibility. The other Bagel
+# modules listed below retain their legacy redistribution paths.
 #
 # Topology:
 #   * outer trainer          : ulysses_size = 1
-#   * bagel_vae              : ulysses_size = 4  (image-batch redistribution)
-#   * bagel_siglip_navit     : ulysses_size = 4  (image-batch redistribution)
-#   * bagel_text_encoder     : ulysses_size = 4  (embedding / LM-head sequence)
-#   * bagel_flow_connector   : ulysses_size = 4  (latent-token redistribution)
-#   * bagel_qwen2_mot        : ulysses_size = 4
+#   * bagel_vae              : ulysses_size = 4  (legacy image-batch redistribution)
+#   * bagel_siglip_navit     : ulysses_size = 4  (legacy image redistribution)
+#   * bagel_text_encoder     : ulysses_size = 4  (encode inherits base owner-loop)
+#   * bagel_flow_connector   : ulysses_size = 4  (legacy gather-concat)
+#   * bagel_qwen2_mot        : ulysses_size = 4  (owner-loop dense-mask Ulysses)
 #
 # World-size rule: world % 4 == 0.
+# Keep fsdp_config.sp_keep_params_unsharded disabled for bagel_qwen2_mot: the
+# complete MoT parameter set staying resident across an owner burst can OOM.
 bagel_vae:
   model:
     model_path: bagel_vae

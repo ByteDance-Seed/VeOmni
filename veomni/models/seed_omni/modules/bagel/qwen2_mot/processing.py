@@ -71,6 +71,45 @@ class PackedConversation:
     spans: list[PackedSpan]
 
 
+def build_mot_attention_mask(
+    sample_splits: list[list[int]],
+    sample_attn_modes: list[list[str]],
+    *,
+    device: torch.device,
+) -> torch.Tensor:
+    """Build BAGEL's packed causal/full/noise visibility mask.
+
+    The layout metadata is produced by :func:`preprocess_mot_inputs`. Each
+    packed sample occupies an isolated diagonal block. Within a sample, every
+    span can attend to preceding clean spans and to itself according to its
+    mode. Noise spans never become key/value context for later spans.
+    """
+    total_length = sum(sum(split_lens) for split_lens in sample_splits)
+    visible = torch.zeros((total_length, total_length), device=device, dtype=torch.bool)
+    sample_start = 0
+
+    for split_lens, attn_modes in zip(sample_splits, sample_attn_modes, strict=True):
+        clean_spans: list[tuple[int, int]] = []
+        span_start = sample_start
+        for length, mode in zip(split_lens, attn_modes, strict=True):
+            span_end = span_start + length
+            for clean_start, clean_end in clean_spans:
+                visible[span_start:span_end, clean_start:clean_end] = True
+
+            if mode == "causal":
+                visible[span_start:span_end, span_start:span_end].fill_(True).tril_()
+            else:
+                visible[span_start:span_end, span_start:span_end] = True
+
+            if mode != "noise":
+                clean_spans.append((span_start, span_end))
+            span_start = span_end
+
+        sample_start = span_start
+
+    return visible.unsqueeze(0).unsqueeze(0).contiguous()
+
+
 def preprocess_mot_inputs(
     conversation_list: list[list[ConversationItem]] | None,
     *,
@@ -311,5 +350,6 @@ def _text_item_length(item: ConversationItem) -> int | None:
 __all__ = [
     "PackedConversation",
     "PackedSpan",
+    "build_mot_attention_mask",
     "preprocess_mot_inputs",
 ]

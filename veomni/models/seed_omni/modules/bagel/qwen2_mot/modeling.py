@@ -40,21 +40,16 @@ class BagelQwen2MoT(BagelQwen2MoTModuleMixin, BagelQwen2MoTMetricMeterMixin, Pre
     def forward(  # type: ignore[override]
         self,
         packed_sequence: torch.Tensor,
-        sample_lens: list[int],
-        sample_splits: list[list[int]],
-        sample_attn_modes: list[list[str]],
         packed_position_ids: torch.Tensor,
-        packed_und_token_indexes: Optional[torch.Tensor] = None,
-        packed_gen_token_indexes: Optional[torch.Tensor] = None,
-        **kwargs: Any,
+        packed_token_type_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
     ) -> Dict[str, Any]:
-        del kwargs
+        packed_und_token_indexes = torch.nonzero(packed_token_type_ids == 0, as_tuple=False).flatten()
+        packed_gen_token_indexes = torch.nonzero(packed_token_type_ids == 1, as_tuple=False).flatten()
         output = self.model(
             packed_sequence=packed_sequence,
-            sample_lens=sample_lens,
-            sample_splits=sample_splits,
-            sample_attn_modes=sample_attn_modes,
             packed_position_ids=packed_position_ids,
+            attention_mask=attention_mask,
             packed_und_token_indexes=packed_und_token_indexes,
             packed_gen_token_indexes=packed_gen_token_indexes,
         )
@@ -251,20 +246,12 @@ class BagelQwen2MoTAttention(nn.Module):
     def _forward_packed_train(
         self,
         packed_sequence: torch.Tensor,
-        sample_lens: list[int],
-        sample_splits: list[list[int]],
-        sample_attn_modes: list[list[str]],
-        packed_position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        attention_mask: torch.Tensor,
+        packed_position_cos: torch.Tensor,
+        packed_position_sin: torch.Tensor,
         packed_und_token_indexes: torch.Tensor,
         packed_gen_token_indexes: torch.Tensor,
     ) -> torch.Tensor:
-        layout_sample_lens = [sum(split_lens) for split_lens in sample_splits]
-        if sample_lens != layout_sample_lens:
-            raise ValueError(
-                "BAGEL Qwen2-MoT sample lengths do not match the span layout: "
-                f"sample_lens={sample_lens}, layout={layout_sample_lens}."
-            )
-
         packed_query_states = packed_sequence.new_zeros((packed_sequence.shape[0], self.num_heads * self.head_dim))
         packed_key_states = packed_sequence.new_zeros(
             (packed_sequence.shape[0], self.num_key_value_heads * self.head_dim)
@@ -320,68 +307,46 @@ class BagelQwen2MoTAttention(nn.Module):
             packed_query_states_ = _fold_zero_anchors(packed_query_states_, query_states_norm_gen)
             packed_key_states_ = _fold_zero_anchors(packed_key_states_, key_states_norm_gen)
 
-        packed_cos, packed_sin = packed_position_embeddings
         packed_query_states_, packed_key_states_ = _apply_rotary_pos_emb(
             packed_query_states_,
             packed_key_states_,
-            packed_cos,
-            packed_sin,
+            packed_position_cos,
+            packed_position_sin,
             unsqueeze_dim=1,
         )
 
+        sequence_length = int(attention_mask.shape[-1])
         ps = get_parallel_state()
         if ps.sp_enabled:
-            if self.num_heads % ps.ulysses_size != 0:
-                raise ValueError(
-                    "BAGEL Qwen2-MoT attention heads must be divisible by "
-                    f"ulysses_size: num_heads={self.num_heads}, ulysses_size={ps.ulysses_size}."
-                )
-            if self.num_key_value_heads % ps.ulysses_size != 0:
-                raise ValueError(
-                    "BAGEL Qwen2-MoT KV heads must be divisible by "
-                    f"ulysses_size for native GQA: num_key_value_heads={self.num_key_value_heads}, "
-                    f"ulysses_size={ps.ulysses_size}."
-                )
-            local_query_heads = self.num_heads // ps.ulysses_size
-            local_key_value_heads = self.num_key_value_heads // ps.ulysses_size
-            if local_query_heads % local_key_value_heads != 0:
-                raise ValueError(
-                    "BAGEL Qwen2-MoT local query heads must be divisible by local KV heads: "
-                    f"query_heads={local_query_heads}, key_value_heads={local_key_value_heads}."
-                )
-            unpadded_seq_len = sum(sample_lens)
-
-            # Ulysses all-to-all gathers the complete packed sequence while
-            # sharding Q and native GQA K/V heads. Span-wise FA can then apply
-            # the global BAGEL layout without expanding K/V or a dense mask.
+            # Ulysses all-to-all gathers the owner's complete packed sequence
+            # while sharding Q and native-GQA K/V heads.
             packed_query_states_ = gather_seq_scatter_heads(
                 packed_query_states_,
                 seq_dim=0,
                 head_dim=1,
                 group=ps.ulysses_group,
-                unpadded_dim_size=unpadded_seq_len,
+                unpadded_dim_size=sequence_length,
             )
             packed_key_states_ = gather_seq_scatter_heads(
                 packed_key_states_,
                 seq_dim=0,
                 head_dim=1,
                 group=ps.ulysses_group,
-                unpadded_dim_size=unpadded_seq_len,
+                unpadded_dim_size=sequence_length,
             )
             packed_value_states = gather_seq_scatter_heads(
                 packed_value_states,
                 seq_dim=0,
                 head_dim=1,
                 group=ps.ulysses_group,
-                unpadded_dim_size=unpadded_seq_len,
+                unpadded_dim_size=sequence_length,
             )
 
-        packed_attn_output = self._spanwise_flash_attention(
-            packed_query_states_.to(torch.bfloat16),
-            packed_key_states_.to(torch.bfloat16),
-            packed_value_states.to(torch.bfloat16),
-            sample_splits=sample_splits,
-            sample_attn_modes=sample_attn_modes,
+        packed_attn_output = self._masked_dense_attention(
+            packed_query_states_,
+            packed_key_states_,
+            packed_value_states,
+            attention_mask=attention_mask,
         )
         if ps.sp_enabled:
             # Reverse the Ulysses sequence/head redistribution for the attention
@@ -404,26 +369,21 @@ class BagelQwen2MoTAttention(nn.Module):
             packed_attn_output_ = _fold_zero_anchors(packed_attn_output_, attn_output_gen)
         return packed_attn_output_
 
-    def _spanwise_flash_attention(
+    def _masked_dense_attention(
         self,
         query_states: torch.Tensor,
         key_states: torch.Tensor,
         value_states: torch.Tensor,
         *,
-        sample_splits: list[list[int]],
-        sample_attn_modes: list[list[str]],
+        attention_mask: torch.Tensor,
     ) -> torch.Tensor:
-        """Apply BAGEL causal/full/noise visibility one semantic span at a time.
-
-        Each span supplies the queries for one FA call. Its keys and values are
-        the preceding non-noise spans plus itself; noise spans are omitted from
-        later context. Causal spans use bottom-right causal alignment, while full
-        and noise spans use bidirectional attention.
-        """
-        if len(sample_splits) != len(sample_attn_modes):
+        """Apply one native-GQA SDPA call to an owner's complete packed sequence."""
+        if attention_mask.dtype != torch.bool:
+            raise ValueError(f"BAGEL Qwen2-MoT attention mask must be bool, got {attention_mask.dtype}.")
+        sequence_length = int(attention_mask.shape[-1])
+        if attention_mask.shape != (1, 1, sequence_length, sequence_length):
             raise ValueError(
-                "BAGEL Qwen2-MoT attention requires one attention-mode list per sample split list, "
-                f"got {len(sample_splits)} and {len(sample_attn_modes)}."
+                f"BAGEL Qwen2-MoT attention mask must have shape [1, 1, S, S], got {tuple(attention_mask.shape)}."
             )
         if key_states.shape != value_states.shape:
             raise ValueError(
@@ -440,81 +400,29 @@ class BagelQwen2MoTAttention(nn.Module):
                 "BAGEL Qwen2-MoT attention requires matching Q/K head dimensions, "
                 f"got query={query_states.shape[-1]}, key={key_states.shape[-1]}."
             )
-        if query_states.shape[1] % key_states.shape[1] != 0:
+        if sequence_length != query_states.shape[0]:
             raise ValueError(
-                "BAGEL Qwen2-MoT query heads must be divisible by KV heads, "
-                f"got query={query_states.shape[1]}, key_value={key_states.shape[1]}."
+                "BAGEL Qwen2-MoT attention mask does not match the packed sequence length: "
+                f"mask={sequence_length}, sequence={query_states.shape[0]}."
             )
 
-        expected_seq_len = sum(sum(split_lens) for split_lens in sample_splits)
-        if expected_seq_len != query_states.shape[0]:
-            raise ValueError(
-                "BAGEL Qwen2-MoT attention layout does not match the packed sequence length: "
-                f"layout={expected_seq_len}, sequence={query_states.shape[0]}."
-            )
-
-        sample_lens = [sum(split_lens) for split_lens in sample_splits]
-        query_samples = torch.split(query_states, sample_lens, dim=0)
-        key_samples = torch.split(key_states, sample_lens, dim=0)
-        value_samples = torch.split(value_states, sample_lens, dim=0)
-        sample_outputs: list[torch.Tensor] = []
-
-        for query_sample, key_sample, value_sample, split_lens, attn_modes in zip(
-            query_samples,
-            key_samples,
-            value_samples,
-            sample_splits,
-            sample_attn_modes,
-            strict=True,
+        query = query_states.transpose(0, 1).unsqueeze(0)
+        key = key_states.transpose(0, 1).unsqueeze(0)
+        value = value_states.transpose(0, 1).unsqueeze(0)
+        with sdpa_kernel(
+            backends=[SDPBackend.CUDNN_ATTENTION, SDPBackend.MATH],
+            set_priority=True,
         ):
-            if len(split_lens) != len(attn_modes):
-                raise ValueError(
-                    "BAGEL Qwen2-MoT attention requires one mode per span, "
-                    f"got {len(split_lens)} spans and {len(attn_modes)} modes."
-                )
-
-            query_spans = torch.split(query_sample, split_lens, dim=0)
-            key_spans = torch.split(key_sample, split_lens, dim=0)
-            value_spans = torch.split(value_sample, split_lens, dim=0)
-            context_keys: list[torch.Tensor] = []
-            context_values: list[torch.Tensor] = []
-            span_outputs: list[torch.Tensor] = []
-
-            for query_span, key_span, value_span, mode in zip(
-                query_spans,
-                key_spans,
-                value_spans,
-                attn_modes,
-                strict=True,
-            ):
-                if mode not in {"causal", "full", "noise"}:
-                    raise ValueError(f"Unsupported BAGEL Qwen2-MoT attention mode: {mode!r}.")
-
-                keys = torch.cat((*context_keys, key_span), dim=0)
-                values = torch.cat((*context_values, value_span), dim=0)
-                span_output, _ = flash_attention_forward(
-                    self,
-                    query_span.transpose(0, 1).unsqueeze(0),
-                    keys.transpose(0, 1).unsqueeze(0),
-                    values.transpose(0, 1).unsqueeze(0),
-                    attention_mask=None,
-                    dropout=0.0,
-                    is_causal=mode == "causal",
-                    # The full sequence/local-head layout was already produced
-                    # by the outer Ulysses all-to-all above.
-                    skip_ulysses=True,
-                )
-                span_outputs.append(span_output.squeeze(0))
-
-                # Noise spans are independent prediction targets. They can read
-                # previous clean context but never become context for later spans.
-                if mode != "noise":
-                    context_keys.append(key_span)
-                    context_values.append(value_span)
-
-            sample_outputs.append(torch.cat(span_outputs, dim=0))
-
-        return torch.cat(sample_outputs, dim=0).contiguous()
+            output = scaled_dot_product_attention(
+                query,
+                key,
+                value,
+                attn_mask=attention_mask,
+                dropout_p=0.0,
+                is_causal=False,
+                enable_gqa=True,
+            )
+        return output.squeeze(0).transpose(0, 1).contiguous()
 
     def _forward_packed_inference(
         self,
@@ -642,8 +550,8 @@ class BagelQwen2MoTAttention(nn.Module):
                     scale=1.0 / math.sqrt(packed_query_states.shape[-1]),
                     keep_prob=1,
                     input_layout="TND",
-                    actual_seq_qlen=tuple(cu_seqlens_q[1:].cpu().numpy().tolist()),
-                    actual_seq_kvlen=tuple(cu_seqlens_k[1:].cpu().numpy().tolist()),
+                    actual_seq_qlen=tuple(cu_seq_lens_q[1:].cpu().numpy().tolist()),
+                    actual_seq_kvlen=tuple(cu_seq_lens_k[1:].cpu().numpy().tolist()),
                     sparse_mode=3,
                 )[0]
             else:
@@ -657,8 +565,8 @@ class BagelQwen2MoTAttention(nn.Module):
                     scale=1.0 / math.sqrt(packed_query_states.shape[-1]),
                     keep_prob=1,
                     input_layout="TND",
-                    actual_seq_qlen=tuple(cu_seqlens_q[1:].cpu().numpy().tolist()),
-                    actual_seq_kvlen=tuple(cu_seqlens_k[1:].cpu().numpy().tolist()),
+                    actual_seq_qlen=tuple(cu_seq_lens_q[1:].cpu().numpy().tolist()),
+                    actual_seq_kvlen=tuple(cu_seq_lens_k[1:].cpu().numpy().tolist()),
                 )[0]
         packed_attn_output = packed_attn_output.reshape(-1, self.hidden_size)
         if not is_gen:
@@ -697,10 +605,9 @@ class BagelQwen2MoTDecoderLayer(nn.Module):
     def _forward_packed_train(
         self,
         packed_sequence: torch.Tensor,
-        sample_lens: list[int],
-        sample_splits: list[list[int]],
-        sample_attn_modes: list[list[str]],
-        packed_position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        attention_mask: torch.Tensor,
+        packed_position_cos: torch.Tensor,
+        packed_position_sin: torch.Tensor,
         packed_und_token_indexes: torch.Tensor,
         packed_gen_token_indexes: torch.Tensor,
     ) -> torch.Tensor:
@@ -719,10 +626,9 @@ class BagelQwen2MoTDecoderLayer(nn.Module):
 
         packed_sequence_, _ = self.self_attn(
             packed_sequence=packed_sequence_,
-            sample_lens=sample_lens,
-            sample_splits=sample_splits,
-            sample_attn_modes=sample_attn_modes,
-            packed_position_embeddings=packed_position_embeddings,
+            attention_mask=attention_mask,
+            packed_position_cos=packed_position_cos,
+            packed_position_sin=packed_position_sin,
             packed_und_token_indexes=packed_und_token_indexes,
             packed_gen_token_indexes=packed_gen_token_indexes,
         )
@@ -838,15 +744,14 @@ class BagelQwen2MoTBackbone(nn.Module):
     def _forward_packed_train(
         self,
         packed_sequence: torch.Tensor,
-        sample_lens: list[int],
-        sample_splits: list[list[int]],
-        sample_attn_modes: list[list[str]],
         packed_position_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
         packed_und_token_indexes: Optional[torch.Tensor] = None,
         packed_gen_token_indexes: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         cos, sin = self.rotary_emb(packed_sequence, packed_position_ids.unsqueeze(0))
-        packed_position_embeddings = (cos.squeeze(0), sin.squeeze(0))
+        packed_position_cos = cos.squeeze(0)
+        packed_position_sin = sin.squeeze(0)
 
         if self.use_moe:
             if packed_und_token_indexes is None:
@@ -862,20 +767,18 @@ class BagelQwen2MoTBackbone(nn.Module):
                 packed_sequence, _ = self._gradient_checkpointing_func(
                     decoder_layer.__call__,
                     packed_sequence,
-                    sample_lens,
-                    sample_splits,
-                    sample_attn_modes,
-                    packed_position_embeddings,
+                    attention_mask,
+                    packed_position_cos,
+                    packed_position_sin,
                     packed_und_token_indexes,
                     packed_gen_token_indexes,
                 )
             else:
                 packed_sequence, _ = decoder_layer(
                     packed_sequence=packed_sequence,
-                    sample_lens=sample_lens,
-                    sample_splits=sample_splits,
-                    sample_attn_modes=sample_attn_modes,
-                    packed_position_embeddings=packed_position_embeddings,
+                    attention_mask=attention_mask,
+                    packed_position_cos=packed_position_cos,
+                    packed_position_sin=packed_position_sin,
                     packed_und_token_indexes=packed_und_token_indexes,
                     packed_gen_token_indexes=packed_gen_token_indexes,
                 )

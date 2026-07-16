@@ -14,7 +14,24 @@ from veomni.models.seed_omni.modules.bagel.qwen2_mot.modeling import BagelQwen2M
 from veomni.utils.device import get_device_type, get_torch_device
 
 
-@pytest.mark.skipif(get_torch_device().device_count() < 1, reason="device_count should be >= 1")
+def _packed_attention_metadata(
+    query_lens: torch.Tensor,
+    key_value_lens: torch.Tensor | None = None,
+) -> dict[str, Any]:
+    key_value_lens = query_lens if key_value_lens is None else key_value_lens
+    return {
+        "cu_seq_lens_q": torch.nn.functional.pad(torch.cumsum(query_lens, dim=0), (1, 0)).to(torch.int32),
+        "cu_seq_lens_k": torch.nn.functional.pad(torch.cumsum(key_value_lens, dim=0), (1, 0)).to(torch.int32),
+        "max_length_q": int(query_lens.max().item()),
+        "max_length_k": int(key_value_lens.max().item()),
+        "total_key_value_tokens": int(key_value_lens.sum().item()),
+    }
+
+
+@pytest.mark.skipif(
+    get_device_type() != "cuda" or get_torch_device().device_count() < 1,
+    reason="FlashAttention inference parity requires a CUDA device",
+)
 def test_inference_flash_attention_wrapper_matches_varlen_kernel_with_cache(monkeypatch: pytest.MonkeyPatch) -> None:
     device = torch.device(f"{get_device_type()}:0")
     config_type = config_cls("bagel_qwen2_mot")
@@ -86,6 +103,7 @@ def test_inference_flash_attention_wrapper_matches_varlen_kernel_with_cache(monk
         update_past_key_values=True,
         is_causal=True,
         mode="und",
+        **_packed_attention_metadata(prefill_lens),
     )
     assert prefill_output.shape == prefill.shape
 
@@ -111,6 +129,7 @@ def test_inference_flash_attention_wrapper_matches_varlen_kernel_with_cache(monk
         update_past_key_values=True,
         is_causal=True,
         mode="und",
+        **_packed_attention_metadata(decode_lens, prefill_lens + decode_lens),
     )
     assert decode_output.shape == decode.shape
     assert len(calls) == 2

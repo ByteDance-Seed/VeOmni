@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from inspect import Parameter, signature
 from types import SimpleNamespace
 
 import pytest
@@ -171,7 +172,7 @@ def test_bagel_mot_packing_exposes_sp_metadata_without_rewriting_spans():
     assert torch.equal(packed.packed_token_type_ids, torch.tensor([0, 0, 1, 1, 1]))
 
 
-def test_bagel_mot_forward_pre_builds_non_sp_routing_from_token_types():
+def test_bagel_mot_forward_pre_returns_owner_local_tensor_contract():
     BagelQwen2MoT = model_cls("bagel_qwen2_mot")
     BagelQwen2MoTConfig = config_cls("bagel_qwen2_mot")
     model = BagelQwen2MoT(BagelQwen2MoTConfig(**tiny_bagel_qwen2_cfg())).train()
@@ -187,10 +188,139 @@ def test_bagel_mot_forward_pre_builds_non_sp_routing_from_token_types():
 
     inputs = model.forward_pre(conversation_list=[[text, gen_target]])
 
-    assert "packed_token_type_ids" not in inputs
-    assert inputs["sample_lens"] == [5]
-    assert torch.equal(inputs["packed_und_token_indexes"], torch.tensor([0, 1]))
-    assert torch.equal(inputs["packed_gen_token_indexes"], torch.tensor([2, 3, 4]))
+    forward_parameters = signature(model.forward).parameters
+    assert "packed_token_type_ids" in forward_parameters
+    assert "packed_und_token_indexes" not in forward_parameters
+    assert "packed_gen_token_indexes" not in forward_parameters
+    assert all(parameter.kind is not Parameter.VAR_KEYWORD for parameter in forward_parameters.values())
+    assert model.supports_sp("forward") is True
+    assert set(inputs) == {
+        "packed_sequence",
+        "packed_position_ids",
+        "packed_token_type_ids",
+        "attention_mask",
+    }
+    assert torch.equal(inputs["packed_token_type_ids"], torch.tensor([0, 0, 1, 1, 1]))
+    assert inputs["attention_mask"].shape == (1, 1, 5, 5)
+    assert inputs["attention_mask"].dtype == torch.bool
+    assert inputs["attention_mask"].is_contiguous()
+
+
+def test_bagel_mot_forward_opts_into_training_graph_owner_loop(monkeypatch):
+    from veomni.distributed import parallel_state
+    from veomni.models.seed_omni.graphs.training_graph import TrainingGraph
+
+    BagelQwen2MoT = model_cls("bagel_qwen2_mot")
+    BagelQwen2MoTConfig = config_cls("bagel_qwen2_mot")
+    model = BagelQwen2MoT(BagelQwen2MoTConfig(**tiny_bagel_qwen2_cfg())).train()
+    monkeypatch.setattr(parallel_state, "get_parallel_state", lambda: SimpleNamespace(sp_size=4))
+
+    assert TrainingGraph._use_sp_loop(model, "forward") is True
+
+
+def test_bagel_mot_forward_pre_normalizes_owner_broadcast_dtype():
+    BagelQwen2MoT = model_cls("bagel_qwen2_mot")
+    BagelQwen2MoTConfig = config_cls("bagel_qwen2_mot")
+    model = BagelQwen2MoT(BagelQwen2MoTConfig(**tiny_bagel_qwen2_cfg())).to(dtype=torch.bfloat16).train()
+    hidden_size = int(model.config.hidden_size)
+    text = ConversationItem(type="text", value=torch.ones(2, hidden_size, dtype=torch.float32), role="user")
+    image = ConversationItem(
+        type="image",
+        value=torch.ones(2, hidden_size, dtype=torch.bfloat16),
+        role="user",
+        source=BAGEL_SIGLIP_CONTEXT,
+    )
+    dummy = ConversationItem(
+        type="image",
+        value=torch.ones(1, hidden_size, dtype=torch.float64, requires_grad=True),
+        role="dummy",
+        source=BAGEL_SIGLIP_CONTEXT,
+    )
+
+    inputs = model.forward_pre(conversation_list=[[text, image, dummy]])
+
+    assert model.dtype == torch.bfloat16
+    assert inputs["packed_sequence"].dtype == model.dtype
+
+
+def test_bagel_mot_sp_pre_keeps_dense_mask_full_and_marks_sequence_padding(monkeypatch):
+    from veomni.models.seed_omni.modules.bagel.qwen2_mot import modulemixin
+
+    BagelQwen2MoT = model_cls("bagel_qwen2_mot")
+    BagelQwen2MoTConfig = config_cls("bagel_qwen2_mot")
+    model = BagelQwen2MoT(BagelQwen2MoTConfig(**tiny_bagel_qwen2_cfg())).train()
+    monkeypatch.setattr(
+        modulemixin,
+        "get_parallel_state",
+        lambda: SimpleNamespace(cp_size=1, ulysses_size=4, sp_group=object()),
+    )
+
+    def fake_sp_pad(tensor, dim, pad_value):
+        pad_shape = list(tensor.shape)
+        pad_shape[dim] = 3
+        padding = torch.full(pad_shape, pad_value, device=tensor.device, dtype=tensor.dtype)
+        return torch.cat((tensor, padding), dim=dim)
+
+    monkeypatch.setattr(modulemixin, "sp_pad", fake_sp_pad)
+    monkeypatch.setattr(modulemixin, "slice_input_tensor", lambda tensor, **kwargs: tensor)
+    attention_mask = torch.ones(1, 1, 5, 5, dtype=torch.bool)
+
+    inputs = model.forward_sp_pre(
+        packed_sequence=torch.ones(5, int(model.config.hidden_size)),
+        packed_position_ids=torch.arange(5),
+        packed_token_type_ids=torch.tensor([0, 0, 1, 1, 1]),
+        attention_mask=attention_mask,
+    )
+
+    assert inputs["attention_mask"] is attention_mask
+    assert inputs["packed_sequence"].shape[0] == 8
+    assert set(inputs) == {
+        "packed_sequence",
+        "packed_position_ids",
+        "packed_token_type_ids",
+        "attention_mask",
+    }
+    assert torch.equal(inputs["packed_token_type_ids"], torch.tensor([0, 0, 1, 1, 1, -1, -1, -1]))
+
+
+def test_bagel_mot_attention_mask_preserves_causal_full_and_noise_semantics():
+    from veomni.models.seed_omni.modules.bagel.qwen2_mot.processing import build_mot_attention_mask
+
+    mask = build_mot_attention_mask(
+        [[2, 2, 2, 1]],
+        [["causal", "full", "noise", "causal"]],
+        device=torch.device("cpu"),
+    )[0, 0]
+
+    expected = torch.tensor(
+        [
+            [1, 0, 0, 0, 0, 0, 0],
+            [1, 1, 0, 0, 0, 0, 0],
+            [1, 1, 1, 1, 0, 0, 0],
+            [1, 1, 1, 1, 0, 0, 0],
+            [1, 1, 1, 1, 1, 1, 0],
+            [1, 1, 1, 1, 1, 1, 0],
+            [1, 1, 1, 1, 0, 0, 1],
+        ],
+        dtype=torch.bool,
+    )
+    assert torch.equal(mask, expected)
+
+
+def test_bagel_mot_attention_mask_isolates_packed_samples():
+    from veomni.models.seed_omni.modules.bagel.qwen2_mot.processing import build_mot_attention_mask
+
+    mask = build_mot_attention_mask(
+        [[2], [1, 2]],
+        [["full"], ["causal", "noise"]],
+        device=torch.device("cpu"),
+    )
+
+    assert mask.shape == (1, 1, 5, 5)
+    assert mask.dtype == torch.bool
+    assert mask.is_contiguous()
+    assert not mask[0, 0, :2, 2:].any()
+    assert not mask[0, 0, 2:, :2].any()
 
 
 def test_bagel_mot_packing_rejects_incompatible_vae_img_tag():

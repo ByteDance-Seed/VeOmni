@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
+from types import MethodType
 
 import pytest
 import torch
@@ -13,6 +14,7 @@ from torch.distributed.tensor import DTensor
 from tests.seed_omni.bagel.contracts.helpers import config_cls, model_cls, tiny_bagel_qwen2_cfg
 from tests.tools.launch_utils import torchrun
 from veomni.distributed.parallel_state import init_parallel_state, use_parallel_state
+from veomni.models.seed_omni.graphs.dispatch import run_sp_looped_endpoint
 from veomni.models.seed_omni.modules.bagel.sources import BAGEL_SIGLIP_CONTEXT, BAGEL_VAE_CONTEXT
 from veomni.models.seed_omni.utils.conversation import _IMG_TAG_KEY, ConversationItem
 from veomni.utils.device import get_device_type, get_torch_device
@@ -34,17 +36,18 @@ def _rank_items(
         )
 
     if rank == 0:
-        values = [make_tensor(3)]
+        values = [make_tensor(2), make_tensor(3)]
         items = [
+            ConversationItem(type="text", value=values[0], role="user"),
             ConversationItem(
                 type="image",
-                value=values[0],
+                value=values[1],
                 role="user",
                 source=BAGEL_SIGLIP_CONTEXT,
-            )
+            ),
         ]
     elif rank == 1:
-        values = [make_tensor(2), make_tensor(3)]
+        values = [make_tensor(2), make_tensor(3), make_tensor(1)]
         items = [
             ConversationItem(type="text", value=values[0], role="user"),
             ConversationItem(
@@ -54,19 +57,61 @@ def _rank_items(
                 source=BAGEL_VAE_CONTEXT,
                 meta={_IMG_TAG_KEY: "gen"},
             ),
+            ConversationItem(type="text", value=values[2], role="assistant"),
         ]
     elif rank == 2:
-        values = [make_tensor(7)]
-        items = [ConversationItem(type="text", value=values[0], role="assistant")]
+        values = [make_tensor(2), make_tensor(5)]
+        items = [
+            ConversationItem(
+                type="image",
+                value=values[0],
+                role="user",
+                source=BAGEL_SIGLIP_CONTEXT,
+            ),
+            ConversationItem(type="text", value=values[1], role="assistant"),
+        ]
     else:
-        values = [make_tensor(1)]
-        items = [ConversationItem(type="text", value=values[0], role="user")]
+        values = [make_tensor(1), make_tensor(2), make_tensor(2), make_tensor(3)]
+        items = [
+            ConversationItem(type="text", value=values[0], role="user"),
+            ConversationItem(
+                type="image",
+                value=values[1],
+                role="user",
+                source=BAGEL_SIGLIP_CONTEXT,
+            ),
+            ConversationItem(
+                type="image",
+                value=values[2],
+                role="assistant",
+                source=BAGEL_VAE_CONTEXT,
+                meta={_IMG_TAG_KEY: "gen"},
+            ),
+            ConversationItem(
+                type="image",
+                value=values[3],
+                role="assistant",
+                source=BAGEL_VAE_CONTEXT,
+                meta={_IMG_TAG_KEY: "gen"},
+            ),
+        ]
+
+    dummy = make_tensor(1)
+    values.append(dummy)
+    items.append(
+        ConversationItem(
+            type="image",
+            value=dummy,
+            role="dummy",
+            source=BAGEL_SIGLIP_CONTEXT,
+        )
+    )
     return items, values
 
 
 def _carrier_hidden(conversation: list[list[ConversationItem]]) -> torch.Tensor:
     sample = conversation[0]
-    real_hidden = [item.value for item in sample if torch.is_tensor(item.value)]
+    real_hidden = [item.value for item in sample if item.role != "dummy" and torch.is_tensor(item.value)]
     assert real_hidden
     return torch.cat(real_hidden, dim=0)
 
@@ -75,6 +120,7 @@ def _forward_carrier(
     model: torch.nn.Module,
     items: list[ConversationItem],
     parallel_state,
+    owner_shapes: list[tuple[int, tuple[int, ...]]] | None = None,
 ) -> torch.Tensor:
     conversation = [items]
     with (
@@ -85,7 +131,24 @@ def _forward_carrier(
         ),
     ):
         inputs = model.forward_pre(conversation_list=conversation)
-        outputs = model(**inputs)
+        if parallel_state.sp_size > 1:
+            assert model.supports_sp("forward") is True
+            if owner_shapes is not None:
+                original_sp_pre = model.forward_sp_pre
+
+                def recording_sp_pre(self, **kwargs):
+                    owner_shapes.append(
+                        (
+                            int(kwargs["packed_sequence"].shape[0]),
+                            tuple(kwargs["attention_mask"].shape),
+                        )
+                    )
+                    return original_sp_pre(**kwargs)
+
+                model.forward_sp_pre = MethodType(recording_sp_pre, model)
+            outputs = run_sp_looped_endpoint(model, model, method="forward", kwargs=inputs)
+        else:
+            outputs = model(**inputs)
         result = model.forward_post(**outputs)
     return _carrier_hidden(result["conversation_list"])
 
@@ -145,9 +208,13 @@ def _qwen2_mot_sp_worker() -> None:
     hidden_size = int(reference.config.hidden_size)
     reference_items, reference_inputs = _rank_items(rank, device, hidden_size)
     sp_items, sp_inputs = _rank_items(rank, device, hidden_size)
+    expected_owner_lengths = [5, 6, 7, 8]
+    owner_shapes: list[tuple[int, tuple[int, ...]]] = []
 
     reference_hidden = _forward_carrier(reference, reference_items, outer_state)
-    sp_hidden = _forward_carrier(sequence_parallel, sp_items, module_state)
+    sp_hidden = _forward_carrier(sequence_parallel, sp_items, module_state, owner_shapes)
+    assert owner_shapes == [(length, (1, 1, length, length)) for length in expected_owner_lengths]
+    assert sequence_parallel._metric_full_seqlens["forward"] == [expected_owner_lengths[rank]]
     torch.testing.assert_close(sp_hidden, reference_hidden, rtol=2e-2, atol=2e-2)
 
     reference_loss = reference_hidden.float().square().mean()
