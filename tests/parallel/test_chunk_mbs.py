@@ -396,6 +396,44 @@ class _Qwen3VLRoot(nn.Module):
         self.model.language_model.layers = nn.ModuleList([layer])
 
 
+class _Qwen3_5Root(nn.Module):
+    _no_split_modules = ["Qwen3_5DecoderLayer", "Qwen3_5VisionBlock"]
+
+    def __init__(self, layer):
+        super().__init__()
+        self.model = nn.Module()
+        self.model.language_model = nn.Module()
+        self.model.language_model.layers = nn.ModuleList([layer])
+
+
+class _Qwen3_5LinearAttentionStub(nn.Module):
+    def __init__(self, hidden_size: int):
+        super().__init__()
+        self.proj = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.decay = nn.Parameter(torch.tensor(0.25))
+        self.cu_seq_lens_calls = []
+
+    def forward(
+        self,
+        hidden_states,
+        cache_params=None,
+        cache_position=None,
+        attention_mask=None,
+        cu_seq_lens_q=None,
+    ):
+        self.cu_seq_lens_calls.append(cu_seq_lens_q.detach().clone())
+        projected = self.proj(hidden_states)
+        outputs = []
+        decay = torch.sigmoid(self.decay)
+        cu_values = [int(value) for value in cu_seq_lens_q.tolist()]
+        for start, end in zip(cu_values, cu_values[1:]):
+            state = torch.zeros_like(projected[:, 0])
+            for token_idx in range(start, end):
+                state = torch.tanh(projected[:, token_idx] + decay * state)
+                outputs.append(state)
+        return torch.stack(outputs, dim=1)
+
+
 def _packed_causal_attention_mask(cu_seq_lens: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
     cu_values = [int(v) for v in cu_seq_lens.tolist()]
     total_seq_len = cu_values[-1]
@@ -406,7 +444,7 @@ def _packed_causal_attention_mask(cu_seq_lens: torch.Tensor, dtype: torch.dtype)
     return mask
 
 
-def _run_qwen3_vl_decoder_layer(
+def _run_decoder_layer(
     layer: nn.Module,
     hidden_states: torch.Tensor,
     position_embeddings: tuple[torch.Tensor, torch.Tensor],
@@ -415,24 +453,28 @@ def _run_qwen3_vl_decoder_layer(
     cu_seq_lens: torch.Tensor,
     max_length: int,
     ranges,
+    linear_attn_cu_seq_lens: torch.Tensor | None = None,
 ):
     layer.train()
     for param in layer.parameters():
         param.grad = None
 
     hidden_states = hidden_states.detach().clone().requires_grad_(True)
+    forward_kwargs = {
+        "position_embeddings": position_embeddings,
+        "attention_mask": attention_mask,
+        "position_ids": position_ids,
+        "cu_seq_lens_q": cu_seq_lens,
+        "cu_seq_lens_k": cu_seq_lens,
+        "max_length_q": max_length,
+        "max_length_k": max_length,
+        "use_cache": False,
+    }
+    if linear_attn_cu_seq_lens is not None:
+        forward_kwargs["linear_attn_cu_seq_lens_q"] = linear_attn_cu_seq_lens
+
     with chunk_mbs_context(ranges):
-        output = layer(
-            hidden_states,
-            position_embeddings=position_embeddings,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            cu_seq_lens_q=cu_seq_lens,
-            cu_seq_lens_k=cu_seq_lens,
-            max_length_q=max_length,
-            max_length_k=max_length,
-            use_cache=False,
-        )
+        output = layer(hidden_states, **forward_kwargs)
         loss = output.float().square().mean()
         loss.backward()
 
@@ -683,7 +725,7 @@ def test_apply_chunk_mbs_matches_qwen3_vl_decoder_layer(monkeypatch, use_checkpo
     attention_mask = _packed_causal_attention_mask(cu_seq_lens, hidden_states.dtype)
     max_length = int((cu_seq_lens[1:] - cu_seq_lens[:-1]).max().item())
 
-    baseline_output, baseline_hidden_grad, baseline_param_grads = _run_qwen3_vl_decoder_layer(
+    baseline_output, baseline_hidden_grad, baseline_param_grads = _run_decoder_layer(
         baseline_layer,
         hidden_states,
         position_embeddings,
@@ -693,7 +735,7 @@ def test_apply_chunk_mbs_matches_qwen3_vl_decoder_layer(monkeypatch, use_checkpo
         max_length,
         ranges=None,
     )
-    chunked_output, chunked_hidden_grad, chunked_param_grads = _run_qwen3_vl_decoder_layer(
+    chunked_output, chunked_hidden_grad, chunked_param_grads = _run_decoder_layer(
         chunked_layer,
         hidden_states,
         position_embeddings,
@@ -718,6 +760,158 @@ def test_apply_chunk_mbs_matches_qwen3_vl_decoder_layer(monkeypatch, use_checkpo
     assert chunked_param_grads.keys() == baseline_param_grads.keys()
     for name, baseline_grad in baseline_param_grads.items():
         torch.testing.assert_close(chunked_param_grads[name], baseline_grad, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("layer_type", ["full_attention", "linear_attention"])
+@pytest.mark.parametrize("use_checkpoint", [False, True])
+def test_apply_chunk_mbs_matches_qwen3_5_decoder_layer(monkeypatch, layer_type, use_checkpoint):
+    from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+
+    import veomni.distributed.chunk_mbs as chunk_mbs
+    from veomni.models.transformers.qwen3_5.generated.patched_modeling_qwen3_5_gpu import (
+        Qwen3_5DecoderLayer,
+        Qwen3_5TextConfig,
+        Qwen3_5TextRotaryEmbedding,
+        eager_attention_forward,
+    )
+
+    monkeypatch.setattr(
+        chunk_mbs,
+        "get_parallel_state",
+        lambda: types.SimpleNamespace(
+            sp_enabled=False,
+            tp_enabled=False,
+            pp_enabled=False,
+            any_extra_parallel_enabled=False,
+        ),
+    )
+
+    torch.manual_seed(0)
+    config = Qwen3_5TextConfig(
+        vocab_size=64,
+        hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=4,
+        max_position_embeddings=32,
+        attention_dropout=0.0,
+        attention_bias=False,
+        rms_norm_eps=1e-6,
+        linear_num_key_heads=4,
+        linear_num_value_heads=4,
+        linear_key_head_dim=4,
+        linear_value_head_dim=4,
+        layer_types=[layer_type],
+    )
+    attention_metadata_calls = {}
+    attention_backend_name = "qwen3_5_chunk_mbs_test"
+
+    def recording_attention_backend(module, query, key, value, attention_mask, **kwargs):
+        cu_seq_lens_q = kwargs["cu_seq_lens_q"]
+        cu_seq_lens_k = kwargs["cu_seq_lens_k"]
+        attention_metadata_calls.setdefault(id(module), []).append(
+            (
+                tuple(cu_seq_lens_q.tolist()),
+                cu_seq_lens_q.dtype,
+                tuple(cu_seq_lens_k.tolist()),
+                cu_seq_lens_k.dtype,
+                kwargs["max_length_q"],
+                kwargs["max_length_k"],
+            )
+        )
+        return eager_attention_forward(module, query, key, value, attention_mask, **kwargs)
+
+    monkeypatch.setitem(ALL_ATTENTION_FUNCTIONS, attention_backend_name, recording_attention_backend)
+    config._attn_implementation = attention_backend_name if layer_type == "full_attention" else "eager"
+
+    baseline_layer = Qwen3_5DecoderLayer(config, layer_idx=0)
+    if layer_type == "linear_attention":
+        baseline_layer.linear_attn = _Qwen3_5LinearAttentionStub(config.hidden_size)
+    chunked_root = _Qwen3_5Root(copy.deepcopy(baseline_layer))
+    chunked_layer = chunked_root.model.language_model.layers[0]
+    baseline_attention_id = id(baseline_layer.self_attn) if layer_type == "full_attention" else None
+    chunked_attention_id = id(chunked_layer.self_attn) if layer_type == "full_attention" else None
+    checkpoint_calls = []
+
+    if use_checkpoint:
+        baseline_layer.gradient_checkpointing = True
+        baseline_layer._gradient_checkpointing_func = partial(checkpoint, use_reentrant=False)
+
+        def checkpoint_func(function, *args, **kwargs):
+            checkpoint_calls.append(None)
+            return checkpoint(function, *args, use_reentrant=False, **kwargs)
+
+        chunked_layer.gradient_checkpointing = True
+        chunked_layer._gradient_checkpointing_func = checkpoint_func
+
+    apply_chunk_mbs(chunked_root, _config(chunk_mbs=2))
+
+    assert getattr(chunked_layer, "_chunk_mbs_wrapped", False)
+
+    cu_seq_lens = torch.tensor([0, 3, 5, 9], dtype=torch.int32)
+    batch = {
+        "cu_seq_lens_q": cu_seq_lens,
+        "cu_seq_lens_k": cu_seq_lens,
+        "linear_attn_cu_seq_lens_q": cu_seq_lens,
+    }
+    ranges = build_chunk_mbs_ranges(batch, _config(chunk_mbs=2))
+    hidden_states = torch.randn(1, 9, config.hidden_size)
+    position_ids = torch.arange(9, dtype=torch.long).view(1, 9)
+    position_embeddings = Qwen3_5TextRotaryEmbedding(config)(hidden_states, position_ids)
+    attention_mask = _packed_causal_attention_mask(cu_seq_lens, hidden_states.dtype)
+    max_length = int((cu_seq_lens[1:] - cu_seq_lens[:-1]).max().item())
+
+    baseline_output, baseline_hidden_grad, baseline_param_grads = _run_decoder_layer(
+        baseline_layer,
+        hidden_states,
+        position_embeddings,
+        attention_mask,
+        position_ids,
+        cu_seq_lens,
+        max_length,
+        ranges=None,
+        linear_attn_cu_seq_lens=cu_seq_lens,
+    )
+    chunked_output, chunked_hidden_grad, chunked_param_grads = _run_decoder_layer(
+        chunked_layer,
+        hidden_states,
+        position_embeddings,
+        attention_mask,
+        position_ids,
+        cu_seq_lens,
+        max_length,
+        ranges=ranges,
+        linear_attn_cu_seq_lens=cu_seq_lens,
+    )
+
+    if use_checkpoint:
+        assert checkpoint_calls == [None, None]
+        assert chunked_layer.gradient_checkpointing
+
+    torch.testing.assert_close(chunked_output, baseline_output, rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(chunked_hidden_grad, baseline_hidden_grad, rtol=1e-5, atol=1e-5)
+    assert chunked_param_grads.keys() == baseline_param_grads.keys()
+    for name, baseline_grad in baseline_param_grads.items():
+        torch.testing.assert_close(chunked_param_grads[name], baseline_grad, rtol=1e-5, atol=1e-5)
+
+    full_metadata = ((0, 3, 5, 9), torch.int32, (0, 3, 5, 9), torch.int32, 4, 4)
+    first_chunk_metadata = ((0, 3, 5), torch.int32, (0, 3, 5), torch.int32, 3, 3)
+    second_chunk_metadata = ((0, 4), torch.int32, (0, 4), torch.int32, 4, 4)
+    expected_baseline_calls = [full_metadata, full_metadata] if use_checkpoint else [full_metadata]
+    expected_chunked_calls = [first_chunk_metadata, second_chunk_metadata]
+    if use_checkpoint:
+        expected_chunked_calls.extend([second_chunk_metadata, first_chunk_metadata])
+
+    if layer_type == "linear_attention":
+        baseline_calls = [tuple(call.tolist()) for call in baseline_layer.linear_attn.cu_seq_lens_calls]
+        chunked_calls = [tuple(call.tolist()) for call in chunked_layer.linear_attn.cu_seq_lens_calls]
+        assert baseline_calls == [call[0] for call in expected_baseline_calls]
+        assert chunked_calls == [call[0] for call in expected_chunked_calls]
+    else:
+        assert attention_metadata_calls[baseline_attention_id] == expected_baseline_calls
+        assert attention_metadata_calls[chunked_attention_id] == expected_chunked_calls
 
 
 def test_replace_hidden_states_does_not_mutate_kwargs():

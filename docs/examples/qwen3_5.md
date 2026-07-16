@@ -110,6 +110,29 @@ bash train.sh tasks/train_text.py configs/text/qwen3_5_sft.yaml \
     --train.checkpoint.output_dir ./exp/qwen3_5_35b_a3b_sft
 ```
 
+## ChunkMBS
+
+Dense Qwen3.5 packed SFT supports decoder-layer ChunkMBS. It splits the packed sequence only at sample boundaries,
+then runs each `Qwen3_5DecoderLayer` chunk sequentially while keeping the outer FSDP2 layer invocation intact. The
+same token ranges are used by both full-attention and GatedDeltaNet layers, so every ChunkMBS cut must be present in
+both cumulative-length tensors; their internal boundaries may differ.
+
+The example config exposes the feature but keeps it disabled by default:
+
+```yaml
+train:
+  chunk_mbs_config:
+    enable: true
+    chunk_mbs: 2
+```
+
+`chunk_mbs` is the number of packed samples per layer chunk, not a token count or `train.micro_batch_size`.
+ChunkMBS may be combined with non-reentrant gradient checkpointing. It currently does not support Qwen3.5-MoE,
+Ulysses SP, TP/PP, `torch.compile`, `pad_to_length`, DPO, or RL training. See
+[ChunkMBSConfig](../usage/arguments.md#chunkmbsconfig) for the complete support boundary.
+The model-level automated tests cover decoder routing, metadata slicing, outputs, and gradients on CPU. Real
+FlashAttention, FLA, and NPU fused-kernel execution requires separate accelerator validation.
+
 ## Ulysses Sequence Parallelism
 
 Qwen3.5 supports Ulysses sequence parallelism for both its softmax attention layers and

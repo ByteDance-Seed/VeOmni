@@ -395,7 +395,8 @@ only on packed sample boundaries. The current implementation supports trainer-ba
 FlashAttention kwargs using `torch.int32` cumulative lengths, identical query/key metadata, exactly one
 `*DecoderLayer` class and one matching decoder stack, decoder layers derived from Transformers'
 `GradientCheckpointingLayer`, and decoder states with shape `[1, sequence, hidden]`. Gradient checkpointing may be
-enabled or disabled; when enabled, it must use the non-reentrant implementation. Sequence parallelism,
+enabled or disabled; when enabled, it must use the non-reentrant implementation. CPU model-level numerical coverage
+currently includes Qwen3-VL and dense Qwen3.5; accelerator-specific kernels require separate hardware validation. Sequence parallelism,
 tensor parallelism, pipeline parallelism, ExtraParallel/MoE, DiT trainers, RL trainers, DPO, the custom Omni training loop,
 `pad_to_length`, and `torch.compile` are not supported. Chunk boundaries must also align with linear-attention
 cumulative sequence boundaries when that metadata is present. Models with ambiguous decoder classes or stacks fail
