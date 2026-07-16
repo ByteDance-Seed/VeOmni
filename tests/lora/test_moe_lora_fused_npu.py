@@ -17,9 +17,9 @@ Counterpart of ``test_moe_lora_fused.py`` for Ascend. The NPU kernels compose
 ``npu_group_gemm`` + seed-style LoRA deltas under autograd (no hand-written
 backward), so this suite is the correctness gate for that composition:
 
-1. Wrapper fused_npu vs eager — forward hidden states + A/B grads.
+1. Wrapper fused_npu vs eager — forward outputs + ``h.grad`` + A/B grads.
 2. EP vs non-EP single-rank — ``_npu_ep_fused_lora_moe_forward(ep_group=None)``
-   must match ``_npu_fused_lora_moe_forward`` for outputs and LoRA grads.
+   must match ``_npu_fused_lora_moe_forward`` for outputs, ``h.grad``, and LoRA grads.
 
 Skipped on non-NPU hosts. Wired into ``npu_unit_tests.yml``.
 
@@ -169,23 +169,37 @@ def test_npu_fused_vs_eager_forward_parity(mode):
 
 @pytest.mark.parametrize("mode", list(_MODES.keys()))
 def test_npu_fused_vs_eager_backward_parity(mode):
-    """Gradients on <spec>.lora_A / <spec>.lora_B match between NPU fused and eager."""
+    """Gradients on hidden states + <spec>.lora_A / <spec>.lora_B match fused vs eager.
+
+    Hidden-state grad is required: A/B-only checks would miss bugs in
+    ``GmmFunction.backward``'s ``grad_input`` (or the all-to-all backward on the
+    EP path) while every adapter assertion stayed green.
+    """
 
     def _grads(*, fused: bool):
         model, fqn, exp, _ = _build_wrapped(mode=mode, fused=fused, lora_b_perturb_std=0.02)
         wrapper = model.get_submodule(fqn)
         wrapper.train()
         h, idx, w = _make_inputs(exp)
+        h = h.detach().requires_grad_(True)
         loss = wrapper(h, idx, w).float().pow(2).sum()
         loss.backward()
-        return {n: p.grad.detach().clone() for n, p in wrapper.named_parameters() if p.grad is not None}
+        assert h.grad is not None, f"[{mode}] expected grad on hidden-state leaf"
+        param_grads = {n: p.grad.detach().clone() for n, p in wrapper.named_parameters() if p.grad is not None}
+        return param_grads, h.grad.detach().clone()
 
-    grads_eager = _grads(fused=False)
-    grads_fused = _grads(fused=True)
+    grads_eager, hgrad_eager = _grads(fused=False)
+    grads_fused, hgrad_fused = _grads(fused=True)
 
     assert set(grads_eager) == set(grads_fused), (
         f"[{mode}] different param sets received grad: only-eager={set(grads_eager) - set(grads_fused)}, "
         f"only-fused={set(grads_fused) - set(grads_eager)}"
+    )
+    h_l2 = _l2_rel(hgrad_fused, hgrad_eager)
+    assert h_l2 <= _GRAD_L2REL_TOL, (
+        f"[{mode}] hidden-state grad parity broken — L2 relative error {h_l2:.4%} > {_GRAD_L2REL_TOL:.2%} "
+        f"(eager_norm={hgrad_eager.float().norm().item():.3e}, "
+        f"max|fused-eager|={(hgrad_eager - hgrad_fused).abs().max().item():.3e})"
     )
     lora_param_names = sorted(n for n in grads_eager if "lora_A" in n.split(".") or "lora_B" in n.split("."))
     assert lora_param_names, f"[{mode}] expected LoRA A/B params to receive gradients"
@@ -242,7 +256,7 @@ def _single_rank_dist():
 
 @pytest.mark.parametrize("mode", ["shared", "independent"])
 def test_npu_ep_vs_nonep_single_rank_parity(mode, _single_rank_dist):
-    """EP path with ``ep_group=None`` (EP=1) matches the non-EP NPU kernel on outputs + LoRA grads."""
+    """EP path with ``ep_group=None`` (EP=1) matches non-EP on outputs + h/LoRA grads."""
     from veomni.lora.ops.npu_moe_group_gemm import (
         _npu_ep_fused_lora_moe_forward,
         _npu_fused_lora_moe_forward,
@@ -253,22 +267,27 @@ def test_npu_ep_vs_nonep_single_rank_parity(mode, _single_rank_dist):
     B, H, I, E, top_k, r = 32, 64, 96, 4, 2, 8
     scale_gate = scale_up = scale_down = 0.5
     _LORA_KEYS = ("lora_a_gate", "lora_b_gate", "lora_a_up", "lora_b_up", "lora_a_down", "lora_b_down")
+    _GRAD_KEYS = ("hidden_states",) + _LORA_KEYS
 
     torch.manual_seed(0)
-    hidden_states = torch.randn(B, H, dtype=dtype, device=dev)
     selected_experts = torch.randint(0, E, (B, top_k), device=dev)
     routing_weights = torch.softmax(torch.randn(B, top_k, dtype=torch.float32, device=dev), dim=-1).to(dtype)
     gate_up_proj = (torch.randn(E, 2 * I, H, dtype=dtype, device=dev) * 0.05).detach()
     down_proj = (torch.randn(E, H, I, dtype=dtype, device=dev) * 0.05).detach()
+    # Shared base activations so both branches start from the same h values;
+    # each branch then clones its own leaf so autograd graphs stay isolated.
+    torch.manual_seed(1)
+    hidden_states_base = torch.randn(B, H, dtype=dtype, device=dev)
 
     def _run(*, ep: bool):
         torch.manual_seed(123)
         lora = _build_lora_leaves(mode, E=E, H=H, I=I, r=r, dtype=dtype, device=dev)
+        h = hidden_states_base.detach().clone().requires_grad_(True)
         kwargs = dict(
             num_experts=E,
             routing_weights=routing_weights,
             selected_experts=selected_experts,
-            hidden_states=hidden_states,
+            hidden_states=h,
             fc1_1_2_weight=gate_up_proj,
             fc2_weight=down_proj,
             lora_a_gate=lora["lora_a_gate"],
@@ -286,10 +305,10 @@ def test_npu_ep_vs_nonep_single_rank_parity(mode, _single_rank_dist):
             out = _npu_ep_fused_lora_moe_forward(ep_group=None, **kwargs)
         else:
             out = _npu_fused_lora_moe_forward(**kwargs)
-        return out, lora
+        return out, h, lora
 
-    nonep_out, nonep_lora = _run(ep=False)
-    ep_out, ep_lora = _run(ep=True)
+    nonep_out, nonep_h, nonep_lora = _run(ep=False)
+    ep_out, ep_h, ep_lora = _run(ep=True)
 
     fwd_l2 = _l2_rel(ep_out.detach(), nonep_out.detach())
     assert fwd_l2 <= _FWD_L2REL_TOL, (
@@ -301,18 +320,27 @@ def test_npu_ep_vs_nonep_single_rank_parity(mode, _single_rank_dist):
     grad_out = (torch.randn(B, H, dtype=dtype, device=dev) * 0.1).detach()
     nonep_grads = dict(
         zip(
-            _LORA_KEYS,
-            torch.autograd.grad(nonep_out, [nonep_lora[k] for k in _LORA_KEYS], grad_outputs=grad_out),
+            _GRAD_KEYS,
+            torch.autograd.grad(
+                nonep_out,
+                [nonep_h] + [nonep_lora[k] for k in _LORA_KEYS],
+                grad_outputs=grad_out,
+            ),
         )
     )
     ep_grads = dict(
         zip(
-            _LORA_KEYS,
-            torch.autograd.grad(ep_out, [ep_lora[k] for k in _LORA_KEYS], grad_outputs=grad_out),
+            _GRAD_KEYS,
+            torch.autograd.grad(
+                ep_out,
+                [ep_h] + [ep_lora[k] for k in _LORA_KEYS],
+                grad_outputs=grad_out,
+            ),
         )
     )
-    for name in _LORA_KEYS:
+    for name in _GRAD_KEYS:
         g_nonep, g_ep = nonep_grads[name], ep_grads[name]
+        assert g_nonep is not None and g_ep is not None, f"[{mode}] {name}: missing grad"
         assert g_nonep.shape == g_ep.shape, f"[{mode}] {name}: shape mismatch"
         l2 = _l2_rel(g_ep, g_nonep)
         assert l2 <= _GRAD_L2REL_TOL, (
