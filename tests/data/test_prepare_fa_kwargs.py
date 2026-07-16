@@ -1,5 +1,6 @@
 import torch
 
+from veomni.data.data_collator import add_flash_attention_kwargs_from_position_ids
 from veomni.utils.seqlen_pos_transform_utils import (
     coalesce_tail_padding_cu_seqlens,
     prepare_fa_kwargs_from_position_ids,
@@ -93,12 +94,11 @@ def test_linear_attn_cu_seqlens_coalesces_tail_padding():
     ).unsqueeze(0)
 
     (cu_seq_lens_q, _), _ = prepare_fa_kwargs_from_position_ids(pos)
-    linear_attn_cu_seq_lens_q = coalesce_tail_padding_cu_seqlens(cu_seq_lens_q, tail_padding_length)
+    coalesced = coalesce_tail_padding_cu_seqlens(cu_seq_lens_q, tail_padding_length)
 
-    # FlashAttention still sees the zero-padded tail exactly as encoded by position_ids.
+    # Raw prepare_fa_kwargs still encodes one segment per pad token.
     assert torch.equal(cu_seq_lens_q, torch.tensor([0, 4, 7, 8, 9, 10], dtype=torch.int32))
-    # Linear-attention kernels see one independent padding segment instead of one segment per pad token.
-    assert torch.equal(linear_attn_cu_seq_lens_q, torch.tensor([0, 4, 7, 10], dtype=torch.int32))
+    assert torch.equal(coalesced, torch.tensor([0, 4, 7, 10], dtype=torch.int32))
 
 
 def test_linear_attn_cu_seqlens_preserves_real_one_token_sequence():
@@ -112,10 +112,47 @@ def test_linear_attn_cu_seqlens_preserves_real_one_token_sequence():
     ).unsqueeze(0)
 
     (cu_seq_lens_q, _), _ = prepare_fa_kwargs_from_position_ids(pos)
-    linear_attn_cu_seq_lens_q = coalesce_tail_padding_cu_seqlens(cu_seq_lens_q, tail_padding_length)
+    coalesced = coalesce_tail_padding_cu_seqlens(cu_seq_lens_q, tail_padding_length)
 
     assert torch.equal(cu_seq_lens_q, torch.tensor([0, 4, 5, 6, 7, 8], dtype=torch.int32))
-    assert torch.equal(linear_attn_cu_seq_lens_q, torch.tensor([0, 4, 5, 8], dtype=torch.int32))
+    assert torch.equal(coalesced, torch.tensor([0, 4, 5, 8], dtype=torch.int32))
+
+
+def test_add_flash_attention_kwargs_coalesces_fa_and_linear_cu_seqlens():
+    real_lengths = [4, 3]
+    tail_padding_length = 3
+    pos = torch.cat(
+        (
+            make_pos_ids_concat(real_lengths),
+            torch.zeros(tail_padding_length, dtype=torch.long),
+        )
+    ).unsqueeze(0)
+    batch = {"position_ids": pos}
+
+    cu_q, cu_k, max_q, max_k = add_flash_attention_kwargs_from_position_ids(batch, tail_padding_length)
+    expected = torch.tensor([0, 4, 7, 10], dtype=torch.int32)
+
+    assert torch.equal(cu_q, expected)
+    assert torch.equal(cu_k, expected)
+    assert torch.equal(batch["cu_seq_lens_q"], expected)
+    assert torch.equal(batch["cu_seq_lens_k"], expected)
+    assert torch.equal(batch["linear_attn_cu_seq_lens_q"], expected)
+    assert int(batch["tail_padding_length"]) == tail_padding_length
+    assert max_q == 4 and max_k == 4
+    assert torch.equal(
+        valid_seqlens_from_cu_seqlens(cu_q, tail_padding_length=tail_padding_length),
+        torch.tensor([4, 3], dtype=torch.int32),
+    )
+
+
+def test_valid_seqlens_strips_coalesced_pad_segment():
+    coalesced = torch.tensor([0, 4, 7, 10], dtype=torch.int32)
+    expected = torch.tensor([4, 3], dtype=torch.int32)
+
+    assert torch.equal(
+        valid_seqlens_from_cu_seqlens(coalesced, tail_padding_length=3),
+        expected,
+    )
 
 
 def test_valid_seqlens_with_exact_tail_padding_preserves_real_one_token_sequence():
@@ -137,6 +174,11 @@ if __name__ == "__main__":
         "linear_attn_cu_seqlens_preserves_real_one_token_sequence",
         test_linear_attn_cu_seqlens_preserves_real_one_token_sequence,
     )
+    run_test(
+        "add_flash_attention_kwargs_coalesces_fa_and_linear_cu_seqlens",
+        test_add_flash_attention_kwargs_coalesces_fa_and_linear_cu_seqlens,
+    )
+    run_test("valid_seqlens_strips_coalesced_pad_segment", test_valid_seqlens_strips_coalesced_pad_segment)
     run_test(
         "valid_seqlens_with_exact_tail_padding_preserves_real_one_token_sequence",
         test_valid_seqlens_with_exact_tail_padding_preserves_real_one_token_sequence,
