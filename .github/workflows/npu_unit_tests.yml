@@ -195,6 +195,12 @@ jobs:
         # sync needed here.
         run: |
           uv run --frozen pytest -v -s -x tests/lora/test_lora_trainer_saveload.py
+      - name: Run MoE-LoRA NPU fused vs eager parity
+        # Numerical gate for the new NPU fused MoE-LoRA autograd composition
+        # (shared + independent; forward + A/B grads; EP=1 vs non-EP).
+        # Cheap single-process; run before the multi-process stream-load test.
+        run: |
+          uv run --frozen pytest -v -s -x tests/lora/test_moe_lora_fused_npu.py
       - name: Run MoE-LoRA ep_sharded_stream_load (PEFT, EP=2)
         # Exercises the PEFT ep_sharded adapter streaming *and* the NPU
         # fused MoE-LoRA EP kernel (fused_npu): the test auto-selects

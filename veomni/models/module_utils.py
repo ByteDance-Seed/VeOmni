@@ -286,6 +286,7 @@ def _get_communication_device(init_device: Literal["cpu", "cuda", "npu"]) -> tor
 def _init_parameter(
     module: "nn.Module",
     name: str,
+    parameter_names_left: Optional[set[str]] = None,
 ) -> None:
     """
     Initializes parameter in model.
@@ -294,7 +295,7 @@ def _init_parameter(
     if any(p.startswith("lora_") for p in pieces):
         from ..lora.weight_loading import init_lora_parameter
 
-        init_lora_parameter(module, name)
+        init_lora_parameter(module, name, parameter_names_left=parameter_names_left)
         return
     init_func = None
     for piece in pieces[:-1]:
@@ -465,6 +466,64 @@ def _resolve_safetensors_shards(weights_path: str, **kwargs) -> Tuple[Dict[str, 
         return dict.fromkeys(keys, base), {base: resolved_file}
 
     raise ValueError(f"ep_sharded_stream_load: no safetensors checkpoint found under {weights_path}.")
+
+
+def _ep_dim0_slice_meta(parallel_state: Any, shard_group: str, target0: int) -> Tuple[int, int, int]:
+    """Return ``(para_size, para_rank, expected_full0)`` for a dim-0 EP shard."""
+    para_size = (
+        parallel_state.extra_parallel_sizes[shard_group] if parallel_state.extra_parallel_enabled(shard_group) else 1
+    )
+    para_rank = (
+        parallel_state.extra_parallel_rank(shard_group) if parallel_state.extra_parallel_enabled(shard_group) else 0
+    )
+    return para_size, para_rank, target0 * para_size
+
+
+def _read_ep_dim0_slice(
+    sl: Any,
+    *,
+    name: str,
+    target0: int,
+    para_rank: int,
+    expected_full0: int,
+    zero_pad: bool = False,
+    strict_mismatch_message: Optional[str] = None,
+) -> "torch.Tensor":
+    """Read this rank's dim-0 EP slice from a safetensors ``get_slice`` handle.
+
+    Shared by the base-checkpoint and PEFT-adapter ep_sharded loaders so the
+    group lookup / expected-full-dim validation / slice bounds stay in one place.
+
+    * ``zero_pad=False`` (strict, default): checkpoint dim0 must equal
+      ``expected_full0``; used for independent MoE-LoRA adapters.
+    * ``zero_pad=True``: allow ``real0 < expected_full0`` and zero-fill the
+      trailing rows (dim-0 zero-pad converters on the base path).
+    """
+    real0 = sl.get_shape()[0]
+    if real0 > expected_full0:
+        raise RuntimeError(f"{name}: checkpoint dim0={real0} exceeds model dim0={expected_full0}.")
+    if not zero_pad and real0 != expected_full0:
+        if strict_mismatch_message is not None:
+            raise RuntimeError(strict_mismatch_message)
+        raise RuntimeError(
+            f"{name}: checkpoint dim0={real0} != model dim0={expected_full0} "
+            f"(no dim-0 zero-pad converter for this key)."
+        )
+    start = para_rank * target0
+    end = start + target0
+    if not zero_pad:
+        return sl[start:end]
+    # Clamp both ends to real0 so a rank lying entirely in the zero-pad region
+    # (start >= real0) reads an in-bounds empty slice (sl[real0:real0]) instead of
+    # relying on out-of-bounds ``get_slice`` semantics, which vary by safetensors
+    # version. Missing tail rows are zero-filled.
+    read_start = min(start, real0)
+    read_end = min(end, real0)
+    tensor = sl[read_start:read_end]
+    if tensor.shape[0] < target0:
+        pad = torch.zeros((target0 - tensor.shape[0], *tuple(tensor.shape[1:])), dtype=tensor.dtype)
+        tensor = torch.cat([tensor, pad], dim=0)
+    return tensor
 
 
 @torch.no_grad()
@@ -649,41 +708,15 @@ def load_model_weights_ep_sharded(
                             f"transform to ExtraParallel key '{name}'."
                         )
                     target0 = param_shapes[name][0]
-                    para_size = (
-                        parallel_state.extra_parallel_sizes[shard_group]
-                        if parallel_state.extra_parallel_enabled(shard_group)
-                        else 1
+                    _, para_rank, expected_full0 = _ep_dim0_slice_meta(parallel_state, shard_group, target0)
+                    tensor = _read_ep_dim0_slice(
+                        f.get_slice(raw_name),
+                        name=name,
+                        target0=target0,
+                        para_rank=para_rank,
+                        expected_full0=expected_full0,
+                        zero_pad=zero_pad,
                     )
-                    para_rank = (
-                        parallel_state.extra_parallel_rank(shard_group)
-                        if parallel_state.extra_parallel_enabled(shard_group)
-                        else 0
-                    )
-                    sl = f.get_slice(raw_name)
-                    real0 = sl.get_shape()[0]
-                    expected_full0 = target0 * para_size
-                    if real0 > expected_full0:
-                        raise RuntimeError(f"{name}: checkpoint dim0={real0} exceeds model dim0={expected_full0}.")
-                    if not zero_pad and real0 != expected_full0:
-                        # No dim-0 zero-pad converter -> checkpoint must match exactly;
-                        # a silent zero-fill here would hide a real shape mismatch.
-                        raise RuntimeError(
-                            f"{name}: checkpoint dim0={real0} != model dim0={expected_full0} "
-                            f"(no dim-0 zero-pad converter for this key)."
-                        )
-                    start = para_rank * target0
-                    end = start + target0
-                    # Real checkpoint rows for this rank are [start, real0); clamp BOTH
-                    # ends to real0 so a rank lying entirely in the zero-pad region
-                    # (start >= real0) reads an in-bounds empty slice (sl[real0:real0])
-                    # instead of relying on out-of-bounds ``get_slice`` semantics, which
-                    # vary by safetensors version. Missing tail rows are zero-filled.
-                    read_start = min(start, real0)
-                    read_end = min(end, real0)
-                    tensor = sl[read_start:read_end]
-                    if tensor.shape[0] < target0:  # trailing zero rows (dim-0 zero-pad converter)
-                        pad = torch.zeros((target0 - tensor.shape[0], *tuple(tensor.shape[1:])), dtype=tensor.dtype)
-                        tensor = torch.cat([tensor, pad], dim=0)
                     # Already the local slice -> parallel_plan=None (do not slice
                     # again); dtensor_factory then shards over the ep_fsdp sub-mesh
                     # exactly as the whole-tensor path's post-shard_tensor half.
@@ -766,11 +799,10 @@ def _stream_lora_adapter_ep_sharded(
     """
     from ..lora.state_dict import _find_adapter_file, insert_adapter_name
 
-    try:
-        file_path, is_safetensors = _find_adapter_file(adapter_path)
-    except FileNotFoundError:
-        logger.warning_rank0(f"ep_sharded adapter: no adapter file under {adapter_path}; skipping.")
-        return
+    # Fail closed: an explicitly configured adapter_path must resolve. Soft-skip
+    # would let post_process fresh-init a random adapter and training would
+    # proceed as if resume succeeded (other loaders propagate FileNotFoundError).
+    file_path, is_safetensors = _find_adapter_file(adapter_path)
 
     if not is_safetensors:
         from ..lora.weight_loading import load_lora_weights
@@ -801,26 +833,21 @@ def _stream_lora_adapter_ep_sharded(
             if shard_group is not None:
                 # independent per-expert LoRA -> read only this rank's dim-0 slice.
                 target0 = param_shapes[name][0]
-                para_size = (
-                    parallel_state.extra_parallel_sizes[shard_group]
-                    if parallel_state.extra_parallel_enabled(shard_group)
-                    else 1
-                )
-                para_rank = (
-                    parallel_state.extra_parallel_rank(shard_group)
-                    if parallel_state.extra_parallel_enabled(shard_group)
-                    else 0
-                )
+                _, para_rank, expected_full0 = _ep_dim0_slice_meta(parallel_state, shard_group, target0)
                 sl = f.get_slice(raw_key)
                 real0 = sl.get_shape()[0]
-                expected_full0 = target0 * para_size
-                if real0 != expected_full0:
-                    raise RuntimeError(
+                tensor = _read_ep_dim0_slice(
+                    sl,
+                    name=name,
+                    target0=target0,
+                    para_rank=para_rank,
+                    expected_full0=expected_full0,
+                    zero_pad=False,
+                    strict_mismatch_message=(
                         f"ep_sharded adapter {name}: file dim0={real0} != model dim0={expected_full0} "
                         f"(independent LoRA expects the gathered [E, ...] tensor)."
-                    )
-                start = para_rank * target0
-                tensor = sl[start : start + target0]
+                    ),
+                )
                 _dispatch_parameter(model, name, tensor, dtensor_factory, None, dtensor_to_cpu)
                 n_ep += 1
             else:
@@ -1295,7 +1322,7 @@ def post_process_after_weight_loading(
     if parameter_names_left:
         logger.info_rank0(f"Find missing key(s) in state dict: {parameter_names_left}, initialize them.")
         for name in sorted(parameter_names_left):
-            _init_parameter(model, name)
+            _init_parameter(model, name, parameter_names_left=parameter_names_left)
 
     # to_empty() leaves embeddings untied (except under FSDP2 swap-tensor);
     # re-tie only when the config asks for it. Nested multimodal layouts can
