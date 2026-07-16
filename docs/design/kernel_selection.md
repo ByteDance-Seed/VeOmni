@@ -157,9 +157,17 @@ model:
 This keeps BF16 master weights while fake-quantizing attention and compressor
 non-RoPE KV channels in 64-value blocks. Indexer Q/K receive a normalized
 Hadamard rotation followed by 128-value-block FP8 fake quantization. The
-quantizer accepts BF16 activations, uses a straight-through backward pass, and
-requires the GPU extra on NVIDIA SM90 or later. Ascend NPU configuration is
-rejected instead of silently ignoring the option.
+quantizer accepts BF16 activations and uses a straight-through backward pass.
+After syncing the GPU environment, install its CUDA Hadamard dependency with:
+
+```bash
+uv pip install --no-build-isolation \
+  "fast-hadamard-transform @ git+https://github.com/Dao-AILab/fast-hadamard-transform.git@1cc807efbd6cc001df359822d60bf6052dd66859"
+```
+
+Enabling the option without that dependency fails during ops configuration;
+there is no numerical fallback. The QAT path requires NVIDIA SM90 or later,
+and Ascend NPU configuration is rejected instead of silently ignoring it.
 
 ---
 

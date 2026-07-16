@@ -57,33 +57,18 @@ def fp8_simulate_qat(x: torch.Tensor, block_size: int = 128) -> torch.Tensor:
     return _DeepseekV4FP8ActivationQAT.apply(x, block_size)
 
 
-def _torch_hadamard_transform(x: torch.Tensor) -> torch.Tensor:
-    """Apply a normalized power-of-two Hadamard transform in PyTorch."""
-    width = x.shape[-1]
-    if width <= 0 or width & (width - 1):
-        raise ValueError(f"DeepSeek-V4 Hadamard rotation expects a power-of-two width, got {width}")
-
-    # Accumulating in FP32 matches fast-hadamard-transform's BF16 output while
-    # keeping the fallback differentiable and usable without a local CUDA toolkit.
-    output = x.float()
-    stride = 1
-    while stride < width:
-        output = output.reshape(*x.shape[:-1], -1, 2, stride)
-        left = output[..., 0, :]
-        right = output[..., 1, :]
-        output = torch.cat((left + right, left - right), dim=-1)
-        stride *= 2
-    return (output.reshape_as(x) * width**-0.5).to(x.dtype)
-
-
 def rotate_activation(x: torch.Tensor) -> torch.Tensor:
     """Apply the normalized Hadamard rotation used by the V4 indexer QAT path."""
     if x.dtype != torch.bfloat16:
         raise TypeError(f"DeepSeek-V4 Hadamard rotation expects BF16 inputs, got {x.dtype}")
     try:
         from fast_hadamard_transform import hadamard_transform
-    except ImportError:
-        return _torch_hadamard_transform(x)
+    except ImportError as exc:
+        raise RuntimeError(
+            "DeepSeek-V4 FP8 activation QAT requires fast-hadamard-transform; "
+            "install it after syncing the GPU environment as documented in "
+            "docs/design/kernel_selection.md"
+        ) from exc
     return hadamard_transform(x, scale=x.shape[-1] ** -0.5)
 
 

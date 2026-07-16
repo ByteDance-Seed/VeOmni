@@ -1119,6 +1119,12 @@ class OpsImplementationConfig:
                 "deepseek_v4_fp8_activation_qat=True is only supported by the DeepSeek-V4 GPU backend; "
                 "disable it on Ascend NPU."
             )
+        if self.deepseek_v4_fp8_activation_qat and not is_package_available("fast_hadamard_transform"):
+            raise ValueError(
+                "deepseek_v4_fp8_activation_qat=True requires fast-hadamard-transform. "
+                "Install it after syncing the GPU environment; see "
+                "docs/design/kernel_selection.md."
+            )
 
         for field_name, npu_ok in _NPU_ALLOWED.items():
             value = getattr(self, field_name)

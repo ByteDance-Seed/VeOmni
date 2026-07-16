@@ -124,6 +124,11 @@ def _require_tilelang_cuda():
         pytest.skip("DeepSeek V4 TileLang kernels require SM90 or later")
 
 
+def _require_fast_hadamard_transform():
+    if importlib.util.find_spec("fast_hadamard_transform") is None:
+        pytest.skip("DeepSeek V4 activation QAT requires fast-hadamard-transform")
+
+
 def _indexer_reference(q, k, weights, topk_indices):
     logits = torch.einsum("sbhd,tbd->bsht", q.float(), k.float())
     logits = (logits.relu() * weights.permute(1, 0, 2).float().unsqueeze(-1)).sum(dim=2)
@@ -711,37 +716,27 @@ def test_deepseek_v4_fp8_activation_qat_matches_fake_quant_and_uses_ste():
     torch.testing.assert_close(x.grad, grad_output, rtol=0, atol=0)
 
 
-def test_deepseek_v4_qat_hadamard_rotation_backward(monkeypatch):
-    from veomni.ops.kernels.deepseek_v4.qat import rotate_activation
+def test_deepseek_v4_qat_hadamard_rotation_backward():
+    _require_tilelang_cuda()
+    _require_fast_hadamard_transform()
+    from veomni.ops.kernels.deepseek_v4 import rotate_activation
 
-    monkeypatch.setitem(sys.modules, "fast_hadamard_transform", None)
     torch.manual_seed(19)
-    x = torch.randn(4, 128, dtype=torch.bfloat16, requires_grad=True)
+    x = torch.randn(4, 128, device=DEVICE, dtype=torch.bfloat16, requires_grad=True)
     grad_output = torch.randn_like(x)
 
-    hadamard = torch.ones(1, 1)
-    while hadamard.shape[0] < x.shape[-1]:
-        hadamard = torch.cat((torch.cat((hadamard, hadamard), dim=1), torch.cat((hadamard, -hadamard), dim=1)), dim=0)
-    expected = (x.float() @ hadamard.t() * x.shape[-1] ** -0.5).to(torch.bfloat16)
-
-    actual = rotate_activation(x)
-    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-    actual.backward(grad_output)
+    rotate_activation(x).backward(grad_output)
     expected_grad = rotate_activation(grad_output)
 
     torch.testing.assert_close(x.grad, expected_grad, rtol=0, atol=0)
 
 
-def test_deepseek_v4_qat_hadamard_rotation_falls_back_to_torch(monkeypatch):
+def test_deepseek_v4_qat_hadamard_rotation_has_no_fallback(monkeypatch):
     from veomni.ops.kernels.deepseek_v4.qat import rotate_activation
 
     monkeypatch.setitem(sys.modules, "fast_hadamard_transform", None)
-    x = torch.tensor([[1, 2, 3, 4]], dtype=torch.bfloat16)
-
-    actual = rotate_activation(x)
-
-    expected = torch.tensor([[5, -1, -2, 0]], dtype=torch.bfloat16)
-    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    with pytest.raises(RuntimeError, match="requires fast-hadamard-transform"):
+        rotate_activation(torch.zeros(1, 128, dtype=torch.bfloat16))
 
 
 def test_deepseek_v4_fp8_activation_qat_validates_block_shape():
@@ -767,8 +762,18 @@ def test_deepseek_v4_fp8_activation_qat_rejects_npu_config(monkeypatch):
         make_eager_ops_config(deepseek_v4_fp8_activation_qat=True)
 
 
+def test_deepseek_v4_fp8_activation_qat_requires_hadamard_dependency(monkeypatch):
+    from tests.tools.training_utils import make_eager_ops_config
+    from veomni.utils import import_utils
+
+    monkeypatch.setattr(import_utils, "is_package_available", lambda name: name != "fast_hadamard_transform")
+    with pytest.raises(ValueError, match="requires fast-hadamard-transform"):
+        make_eager_ops_config(deepseek_v4_fp8_activation_qat=True)
+
+
 def test_deepseek_v4_fp8_activation_qat_model_forward_backward(monkeypatch):
     _require_tilelang_cuda()
+    _require_fast_hadamard_transform()
     from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling
 
     config = modeling.DeepseekV4Config.from_pretrained("tests/toy_config/deepseek_v4_toy")
