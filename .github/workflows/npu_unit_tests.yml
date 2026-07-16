@@ -164,6 +164,12 @@ jobs:
       - name: Run fsdp2/extra_parallel+fsdp2 (e.g. ep+fsdp2, mb+fsdp2, ep+emb+fsdp2) clip grad norm test
         run: |
           uv run --frozen pytest -v -s -x tests/utils/test_extra_parallel_clip_grad_norm.py
+      - name: Run MoE ep_sharded_stream_load matrix (non-PEFT)
+        # Device-agnostic loader matrix (build_parallelize_model + the 3 weight
+        # loaders over EP+FSDP2 on a fake MoE model; no Triton / MoE kernel, so
+        # it runs on NPU via hccl).
+        run: |
+          uv run --frozen pytest -v -s -x tests/utils/test_moe_ep_sharded_load_matrix.py
       - name: Run checkpoint callback unit tests
         run: |
           uv run --frozen pytest -v -s -x tests/checkpoints/test_checkpoint_callback.py
@@ -190,3 +196,16 @@ jobs:
         # sync needed here.
         run: |
           uv run --frozen pytest -v -s -x tests/lora/test_lora_trainer_saveload.py
+      - name: Run MoE-LoRA NPU fused vs eager parity
+        # Numerical gate for the new NPU fused MoE-LoRA autograd composition
+        # (shared + independent; forward + A/B grads; EP=1 vs non-EP).
+        # Cheap single-process; run before the multi-process stream-load test.
+        run: |
+          uv run --frozen pytest -v -s -x tests/lora/test_moe_lora_fused_npu.py
+      - name: Run MoE-LoRA ep_sharded_stream_load (PEFT, EP=2)
+        # Exercises the PEFT ep_sharded adapter streaming *and* the NPU
+        # fused MoE-LoRA EP kernel (fused_npu): the test auto-selects
+        # fused_npu on Ascend, so both the loader path and the EP forward
+        # are validated on NPU here.
+        run: |
+          uv run --frozen pytest -v -s -x tests/lora/test_moe_lora_ep_sharded_stream_load.py

@@ -22,7 +22,7 @@ Native replacements for the ``peft``-based helpers previously in
 * :func:`load_lora_weights` — every rank reads the PEFT-format adapter file.
 * :func:`rank0_load_and_broadcast_lora_weights` — rank-0 reads then broadcasts.
 * :func:`init_lora_parameter` — post-load kaiming/zero init for un-loaded LoRA
-  params, with the meta-device guard that prevents clobbering loaded weights.
+  params, with a missing-name-set guard that prevents clobbering loaded weights.
 
 All adapter files are read natively (safetensors / torch), never via ``peft``.
 """
@@ -92,6 +92,31 @@ def build_lora_key_overrides(model: nn.Module) -> dict[str, str]:
         for bname, _ in module.base_layer.named_buffers():
             overrides[inner_dot + bname] = wrap_dot + bname
     return overrides
+
+
+def make_peft_key_mapper(model: nn.Module, is_peft_model: bool) -> Callable[[str], str]:
+    """Return a fn mapping a *bare* base-model FQN to its live-model destination.
+
+    Centralises the checkpoint-key remap every weight loader
+    (:func:`~veomni.models.module_utils.load_model_weights` /
+    ``load_model_weights_ep_sharded`` / ``rank0_load_and_broadcast_weights``)
+    needs when a base checkpoint is loaded into a LoRA-wrapped model:
+
+    * ``is_peft_model=False`` -> identity (the checkpoint key is already the
+      live-model key).
+    * ``is_peft_model=True``  -> :func:`build_lora_key_overrides` remap (wrapped
+      targets go to ``...base_layer.weight``) with a plain ``base_model.model.``
+      prefix fallback for un-wrapped params.
+
+    Apply it *after* ``maybe_convert_checkpoint_tensor`` so converter-produced
+    merged keys (e.g. the Qwen3-MoE per-expert -> fused ``...experts.gate_up_proj``)
+    also flow through the ``base_layer.weight`` rename when their experts module is
+    wrapped by ``LoraSharedExperts`` / ``LoraIndependentExperts``.
+    """
+    if not is_peft_model:
+        return lambda bare_name: bare_name
+    overrides = build_lora_key_overrides(model)
+    return lambda bare_name: overrides.get(bare_name, "base_model.model." + bare_name)
 
 
 @torch.no_grad()
@@ -197,28 +222,34 @@ def rank0_load_and_broadcast_lora_weights(
     logger.info_rank0(f"rank0_load_and_broadcast_lora_weights: loaded {num_keys} adapter param(s)")
 
 
-def init_lora_parameter(model: nn.Module, name: str) -> None:
+def init_lora_parameter(
+    model: nn.Module,
+    name: str,
+    parameter_names_left: set[str] | None = None,
+) -> None:
     """Initialise one un-loaded LoRA tensor (kaiming ``A`` / zero ``B``).
 
     Walks ``model`` along ``name`` to the owning LoRA module and calls its
-    ``reset_lora_parameters``. For MoE wrappers the reset only fires when every
-    wrapper parameter is still on meta device, so a wrapper that already had
-    some tensors loaded is never clobbered (guards against re-randomising
-    loaded ``A`` / re-zeroing loaded ``B``).
+    ``reset_lora_parameters``. For MoE wrappers the decision is made at
+    *wrapper* granularity using ``parameter_names_left`` (see
+    :func:`_reset_moe_wrapper`): reset only when every LoRA tensor on that
+    wrapper is missing; never touch a fully- or partially-loaded wrapper.
     """
     module: nn.Module = model
+    prefix_parts: list[str] = []
     for piece in name.split("."):
         if _is_moe_lora_wrapper(module):
-            _reset_moe_wrapper(module)
+            _reset_moe_wrapper(module, ".".join(prefix_parts), parameter_names_left)
             return
         if piece.startswith("lora_"):
             break
         if not hasattr(module, piece):
             return
         module = getattr(module, piece)
+        prefix_parts.append(piece)
 
     if _is_moe_lora_wrapper(module):
-        _reset_moe_wrapper(module)
+        _reset_moe_wrapper(module, ".".join(prefix_parts), parameter_names_left)
         return
 
     if "lora_A" in name and hasattr(module, "reset_lora_parameters"):
@@ -226,7 +257,55 @@ def init_lora_parameter(model: nn.Module, name: str) -> None:
             module.reset_lora_parameters(adapter, init_lora_weights=True)
 
 
-def _reset_moe_wrapper(module: nn.Module) -> None:
-    """Reset a MoE wrapper only when all its params are still meta (BUG-3 guard)."""
-    if all(p.is_meta for _, p in module.named_parameters()):
-        module.reset_lora_parameters(init_lora_weights=True)
+def _moe_wrapper_lora_names(module: nn.Module, wrapper_prefix: str) -> list[str]:
+    """FQNs of every LoRA ``A``/``B`` tensor owned by a MoE wrapper."""
+    names: list[str] = []
+    for local_name, _ in module.named_parameters():
+        parts = local_name.split(".")
+        if "lora_A" not in parts and "lora_B" not in parts:
+            continue
+        names.append(f"{wrapper_prefix}.{local_name}" if wrapper_prefix else local_name)
+    return names
+
+
+def _reset_moe_wrapper(
+    module: nn.Module,
+    wrapper_prefix: str,
+    parameter_names_left: set[str] | None,
+) -> None:
+    """Fresh-init a MoE wrapper's LoRA params (kaiming ``A`` / zero ``B``).
+
+    Decision is at wrapper granularity against ``parameter_names_left`` (the
+    set of FQNs the weight loader did not fill). After ``model.to_empty(...)``
+    every param is non-meta garbage, so a meta-device guard cannot tell "fresh"
+    from "already loaded"; the missing-name set is the source of truth:
+
+    * **all** wrapper LoRA names missing → reset once (idempotent via
+      ``_lora_fresh_reset_done``);
+    * **none** missing → no-op (loaded weights must not be clobbered);
+    * **subset** missing → raise (partial adapter resume is fail-closed).
+    """
+    if getattr(module, "_lora_fresh_reset_done", False):
+        return
+
+    lora_names = _moe_wrapper_lora_names(module, wrapper_prefix)
+    if not lora_names:
+        return
+
+    left = parameter_names_left if parameter_names_left is not None else set()
+    missing = [n for n in lora_names if n in left]
+    if not missing:
+        return
+    if len(missing) != len(lora_names):
+        loaded = sorted(set(lora_names) - set(missing))
+        raise RuntimeError(
+            f"MoE LoRA wrapper {wrapper_prefix!r} is only partially loaded: "
+            f"{len(missing)}/{len(lora_names)} LoRA tensor(s) missing "
+            f"(e.g. {missing[0]!r}). Refusing to reset the wrapper because that "
+            f"would clobber already-loaded weights "
+            f"(e.g. {loaded[0]!r}). Provide a complete adapter or omit "
+            f"adapter_path for a fresh init."
+        )
+
+    module.reset_lora_parameters(init_lora_weights=True)
+    module._lora_fresh_reset_done = True

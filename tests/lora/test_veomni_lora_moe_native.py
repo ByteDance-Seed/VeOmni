@@ -211,12 +211,12 @@ def test_moe_mode_inferred_when_config_lacks_block(tmp_path, mode):
 def test_init_lora_parameter_preserves_loaded_weights(mode):
     """GAP-1 / BUG-3 guard: post-load init must NOT reset a populated wrapper.
 
-    ``post_process_after_weight_loading`` walks every LoRA param name through
+    ``post_process_after_weight_loading`` walks missing LoRA names through
     ``init_lora_parameter``. For a MoE wrapper the reset only fires when *all*
-    of its params are still on meta device (``_reset_moe_wrapper``); once
-    ``load_lora_weights`` has materialised them (non-meta, as on this CPU
-    model) the reset must be skipped so it cannot re-randomise ``lora_A`` /
-    re-zero ``lora_B``. Assert both the values survive and that the wrapper's
+    of its LoRA tensors are in ``parameter_names_left``; once
+    ``load_lora_weights`` has materialised them they are removed from that set,
+    so the reset must be skipped and cannot re-randomise ``lora_A`` / re-zero
+    ``lora_B``. Assert both the values survive and that the wrapper's
     ``reset_lora_parameters`` is never called.
     """
     model = VeOmniLoraModel(ToyMoE(), _moe_config(mode))
@@ -232,15 +232,53 @@ def test_init_lora_parameter_preserves_loaded_weights(mode):
     before = {n: p.detach().clone() for n, p in model.named_parameters() if ".lora_" in n}
     assert before, "expected LoRA params on the wrapped MoE model"
 
+    # Fully loaded adapter -> empty missing set (matches post_process after a
+    # successful load_lora_weights).
     with mock.patch.object(experts, "reset_lora_parameters", wraps=experts.reset_lora_parameters) as reset_spy:
         for name in before:
-            init_lora_parameter(model, name)
+            init_lora_parameter(model, name, parameter_names_left=set())
         reset_spy.assert_not_called()
 
     after = {n: p for n, p in model.named_parameters() if ".lora_" in n}
     assert set(after) == set(before)
     for n, prev in before.items():
         torch.testing.assert_close(after[n], prev, msg=lambda s, n=n: f"{n} was clobbered by init_lora_parameter\n{s}")
+
+
+@pytest.mark.parametrize("mode", ["independent", "shared"])
+def test_init_lora_parameter_resets_when_all_missing(mode):
+    """Fresh wrapper (every LoRA name still missing) must kaiming-A / zero-B once."""
+    model = VeOmniLoraModel(ToyMoE(), _moe_config(mode))
+    experts = _experts(model)
+    lora_names = {n for n, _ in model.named_parameters() if ".lora_A." in n or ".lora_B." in n}
+    assert lora_names
+
+    with torch.no_grad():
+        for name, p in model.named_parameters():
+            if name in lora_names:
+                p.fill_(float("nan"))
+
+    with mock.patch.object(experts, "reset_lora_parameters", wraps=experts.reset_lora_parameters) as reset_spy:
+        for name in sorted(lora_names):
+            init_lora_parameter(model, name, parameter_names_left=set(lora_names))
+        assert reset_spy.call_count == 1
+
+    for name, p in model.named_parameters():
+        if ".lora_B." in name:
+            assert torch.count_nonzero(p).item() == 0, name
+        if ".lora_A." in name:
+            assert torch.isfinite(p).all() and not torch.isnan(p).any(), name
+
+
+@pytest.mark.parametrize("mode", ["independent", "shared"])
+def test_init_lora_parameter_raises_on_partial_missing(mode):
+    """Partial adapter resume must fail closed instead of clobbering loaded A/B."""
+    model = VeOmniLoraModel(ToyMoE(), _moe_config(mode))
+    lora_names = sorted(n for n, _ in model.named_parameters() if ".lora_A." in n or ".lora_B." in n)
+    assert len(lora_names) >= 2
+    missing = {lora_names[0]}
+    with pytest.raises(RuntimeError, match="only partially loaded"):
+        init_lora_parameter(model, lora_names[0], parameter_names_left=missing)
 
 
 if __name__ == "__main__":
