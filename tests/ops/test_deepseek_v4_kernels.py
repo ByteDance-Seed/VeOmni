@@ -82,6 +82,10 @@ def test_tilelang_wrappers_reject_pre_sm90_before_import(monkeypatch):
         kernels.fp8_gemm(*args)
     with pytest.raises(RuntimeError, match="SM90 or later"):
         kernels.fp4_gemm(*args)
+    with pytest.raises(RuntimeError, match="SM90 or later"):
+        kernels.fp8_simulate_qat(torch.empty(0))
+    with pytest.raises(RuntimeError, match="SM90 or later"):
+        kernels.rotate_activation(torch.empty(0))
 
 
 def test_tilelang_wrappers_reject_rocm_before_import(monkeypatch):
@@ -106,6 +110,10 @@ def test_tilelang_wrappers_reject_rocm_before_import(monkeypatch):
         kernels.fp8_gemm(*args)
     with pytest.raises(RuntimeError, match="NVIDIA CUDA"):
         kernels.fp4_gemm(*args)
+    with pytest.raises(RuntimeError, match="NVIDIA CUDA"):
+        kernels.fp8_simulate_qat(torch.empty(0))
+    with pytest.raises(RuntimeError, match="NVIDIA CUDA"):
+        kernels.rotate_activation(torch.empty(0))
 
 
 def _require_tilelang_cuda():
@@ -681,6 +689,128 @@ def test_tilelang_act_quant_shapes_scales_and_inplace():
     expanded_scales_mx = expected_scales_mx.repeat_interleave(128, dim=-1)
     expected_quantized_mx = (x_mx.float() / expanded_scales_mx).clamp(-448, 448).to(torch.float8_e4m3fn)
     torch.testing.assert_close(quantized_mx.float(), expected_quantized_mx.float(), rtol=0, atol=0)
+
+
+def test_deepseek_v4_fp8_activation_qat_matches_fake_quant_and_uses_ste():
+    _require_tilelang_cuda()
+    from veomni.ops.kernels.deepseek_v4.act_quant import act_quant
+    from veomni.ops.kernels.deepseek_v4.qat import fp8_simulate_qat
+
+    torch.manual_seed(11)
+    x = torch.randn(3, 256, device=DEVICE, dtype=torch.bfloat16, requires_grad=True)
+    original = x.detach().clone()
+    expected = original.clone()
+    act_quant(expected, block_size=128, scale_fmt="ue8m0", inplace=True)
+
+    actual = fp8_simulate_qat(x, block_size=128)
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    torch.testing.assert_close(x, original, rtol=0, atol=0)
+    grad_output = torch.randn_like(actual)
+    actual.backward(grad_output)
+    torch.testing.assert_close(x.grad, grad_output, rtol=0, atol=0)
+
+
+def test_deepseek_v4_qat_hadamard_rotation_backward():
+    _require_tilelang_cuda()
+    from veomni.ops.kernels.deepseek_v4 import rotate_activation
+
+    torch.manual_seed(19)
+    x = torch.randn(4, 128, device=DEVICE, dtype=torch.bfloat16, requires_grad=True)
+    grad_output = torch.randn_like(x)
+
+    rotate_activation(x).backward(grad_output)
+    expected_grad = rotate_activation(grad_output)
+
+    torch.testing.assert_close(x.grad, expected_grad, rtol=0, atol=0)
+
+
+def test_deepseek_v4_fp8_activation_qat_validates_block_shape():
+    from veomni.ops.kernels.deepseek_v4.qat import fp8_simulate
+
+    with pytest.raises(ValueError, match="must be divisible"):
+        fp8_simulate(torch.zeros(2, 65, dtype=torch.bfloat16), block_size=64)
+
+
+def test_deepseek_v4_fp8_activation_qat_rejects_non_bf16_inputs():
+    from veomni.ops.kernels.deepseek_v4.qat import fp8_simulate
+
+    with pytest.raises(TypeError, match="expects BF16 inputs"):
+        fp8_simulate(torch.zeros(2, 128, dtype=torch.float32), block_size=128)
+
+
+def test_deepseek_v4_fp8_activation_qat_rejects_npu_config(monkeypatch):
+    from tests.tools.training_utils import make_eager_ops_config
+    from veomni.utils import import_utils
+
+    monkeypatch.setattr(import_utils, "is_torch_npu_available", lambda: True)
+    with pytest.raises(ValueError, match="only supported by the DeepSeek-V4 GPU backend"):
+        make_eager_ops_config(deepseek_v4_fp8_activation_qat=True)
+
+
+def test_deepseek_v4_fp8_activation_qat_model_forward_backward(monkeypatch):
+    _require_tilelang_cuda()
+    from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling
+
+    config = modeling.DeepseekV4Config.from_pretrained("tests/toy_config/deepseek_v4_toy")
+    config.num_hidden_layers = 1
+    config.layer_types = ["compressed_sparse_attention"]
+    config.mlp_layer_types = ["moe"]
+    config.head_dim = 128
+    config.partial_rotary_factor = 0.5
+    config.qk_rope_head_dim = 64
+    config.index_topk = 2
+    config.use_cache = False
+
+    model = modeling.DeepseekV4Model(config).to(device=DEVICE, dtype=torch.bfloat16).train()
+    assert {parameter.dtype for parameter in model.parameters()} == {torch.bfloat16}
+
+    quant_calls = []
+    rotate_calls = []
+    real_quant = modeling.fp8_simulate_qat
+    real_rotate = modeling.rotate_activation
+
+    def record_quant(x, block_size):
+        quant_calls.append((tuple(x.shape), block_size))
+        return real_quant(x, block_size)
+
+    def record_rotate(x):
+        rotate_calls.append(tuple(x.shape))
+        return real_rotate(x)
+
+    monkeypatch.setattr(modeling, "fp8_simulate_qat", record_quant)
+    monkeypatch.setattr(modeling, "rotate_activation", record_rotate)
+
+    inputs = torch.randn(1, 8, config.hidden_size, device=DEVICE, dtype=torch.bfloat16)
+    original_inputs = inputs.clone()
+    position_ids = torch.arange(inputs.shape[1], device=DEVICE).unsqueeze(0)
+
+    try:
+        modeling.veomni_deepseek_v4_fp8_activation_qat.bind(SimpleNamespace(deepseek_v4_fp8_activation_qat=False))
+        with torch.no_grad():
+            baseline = model(inputs_embeds=inputs, position_ids=position_ids, use_cache=False).last_hidden_state
+        assert quant_calls == []
+        assert rotate_calls == []
+
+        modeling.veomni_deepseek_v4_fp8_activation_qat.bind(SimpleNamespace(deepseek_v4_fp8_activation_qat=True))
+        qat_inputs = inputs.detach().clone().requires_grad_(True)
+        actual = model(inputs_embeds=qat_inputs, position_ids=position_ids, use_cache=False).last_hidden_state
+        actual.float().square().mean().backward()
+    finally:
+        modeling.veomni_deepseek_v4_fp8_activation_qat.bind(SimpleNamespace(deepseek_v4_fp8_activation_qat=False))
+
+    assert quant_calls == [
+        ((1, 1, 8, 64), 64),
+        ((1, 2, 64), 64),
+        ((1, 2, 128), 128),
+        ((1, 8, config.index_n_heads, 128), 128),
+    ]
+    assert rotate_calls == [(1, 2, 128), (1, 8, config.index_n_heads, 128)]
+    torch.testing.assert_close(inputs, original_inputs, rtol=0, atol=0)
+    assert not torch.equal(actual, baseline)
+    assert qat_inputs.grad is not None
+    assert torch.isfinite(qat_inputs.grad).all()
+    assert qat_inputs.grad.abs().sum() > 0
 
 
 def test_tilelang_fp4_act_quant_packing_and_inplace():

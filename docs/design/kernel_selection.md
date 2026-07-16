@@ -17,6 +17,7 @@ selection knob.
 | Attention | `attn_implementation` | `eager`, `sdpa`, `flash_attention_2`, `flash_attention_3`, `flash_attention_4`, `native-sparse` | `"flash_attention_2"` | Config `__post_init__` + `build_foundation_model` |
 | DSA indexer | `dsa_indexer_backend` | `eager`, `cudnn` (GLM-DSA), `tilelang` (DeepSeek-V4) | `"eager"` | Model build via `OpsConfigSlot` |
 | DSA attention | `dsa_attention_backend` | `eager`, `flashmla_cudnn` (GLM-DSA), `tilelang_sparse` (DeepSeek-V4) | `"eager"` | Model build via `OpsConfigSlot` |
+| DeepSeek-V4 FP8 activation QAT | `deepseek_v4_fp8_activation_qat` | `false`, `true` | `false` | Model build via `OpsConfigSlot` |
 | mHC | `mhc_backend` | `eager`, `tile_kernels` (DeepSeek-V4, SM90+) | `"eager"` | Model build via three `OpSlot`s (`pre`, `post`, `head`) |
 | Cross-entropy loss | `cross_entropy_loss_implementation` | `eager`, `liger_kernel`, `chunk_loss`, `npu` | `"liger_kernel"` (GPU) | `apply_ops_config()` (before model build) |
 | RMSNorm | `rms_norm_implementation` | `eager`, `liger_kernel`, `npu`, `triton` (per-model; DeepSeek-V3) | `"liger_kernel"` (GPU) | Model registration via ops config singleton |
@@ -144,6 +145,21 @@ All three optimized paths require NVIDIA SM90 or later. `mhc_backend` defaults
 to `eager` and never silently falls back after `tile_kernels` is selected.
 TileKernels' training path supports forward and backward with BF16 activations
 and DeepSeek V4's `hc_mult=4` layout.
+
+DeepSeek-V4 can additionally enable its model-specific activation QAT path:
+
+```yaml
+model:
+  ops_implementation:
+    deepseek_v4_fp8_activation_qat: true
+```
+
+This keeps BF16 master weights while fake-quantizing attention and compressor
+non-RoPE KV channels in 64-value blocks. Indexer Q/K receive a normalized
+Hadamard rotation followed by 128-value-block FP8 fake quantization. The
+quantizer accepts BF16 activations, uses a straight-through backward pass, and
+requires the GPU extra on NVIDIA SM90 or later. Ascend NPU configuration is
+rejected instead of silently ignoring the option.
 
 ---
 

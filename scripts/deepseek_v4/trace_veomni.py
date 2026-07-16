@@ -57,7 +57,7 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Replace selected layers' normalized MLP inputs with tensors from --official-trace",
     )
-    parser.add_argument("--moe-backend", choices=("eager", "fused_triton"), default="fused_triton")
+    parser.add_argument("--moe-backend", choices=("eager", "fused_triton", "fused_quack"), default="fused_triton")
     parser.add_argument("--indexer-backend", choices=("eager", "tilelang"), default="tilelang")
     parser.add_argument("--attention-backend", choices=("eager", "tilelang_sparse"), default="tilelang_sparse")
     parser.add_argument("--mhc-backend", choices=("eager", "tile_kernels"), default="tile_kernels")
@@ -81,6 +81,11 @@ def parse_args() -> argparse.Namespace:
         help="Write a second pass that replays official MoE expert IDs after the primary pass",
     )
     parser.add_argument("--reference-quantization", action="store_true")
+    parser.add_argument(
+        "--fp8-activation-qat",
+        action="store_true",
+        help="Enable the Miles-style DeepSeek-V4 FP8 activation QAT forward path",
+    )
     parser.add_argument(
         "--reference-attention-kv-quantization",
         action="store_true",
@@ -148,6 +153,7 @@ def make_ops_config(args: argparse.Namespace) -> OpsImplementationConfig:
         dsa_indexer_backend=args.indexer_backend,
         dsa_attention_backend=args.attention_backend,
         mhc_backend=args.mhc_backend,
+        deepseek_v4_fp8_activation_qat=args.fp8_activation_qat,
     )
 
 
@@ -447,6 +453,8 @@ def main() -> None:
         implementation += "_official_moe_topk"
     if args.reference_moe_router_weights and args.reference_moe_topk:
         implementation += "_official_moe_router_weights"
+    if args.fp8_activation_qat:
+        implementation += "_fp8_activation_qat"
     if args.reference_attention_kv_quantization:
         implementation += "_attention_kv_fp8_simulation"
     if args.reference_indexer_fp4_quantization:

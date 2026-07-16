@@ -75,6 +75,7 @@ gpu = [
   # TileLang >=0.1.9; the explicit pin is shared with existing TileLang ops.
   "tile-kernels==1.0.0",
   "tilelang==0.1.9",
+  "fast-hadamard-transform==1.1.0",
   "av>=14.3.0,<15.0; python_version == '3.11' and platform_machine == 'x86_64'",
   "av>=14.2.0,<14.3; python_version == '3.11' and platform_machine == 'aarch64'",
   "av>=14.0.0,<14.3; python_version == '3.12'",
@@ -243,6 +244,7 @@ flash-mla = [
 # Strictly newer than v0.1.0 — picks up fixes for backward gradient count (#10),
 # auto_cp UnboundLocalError (#8), and l2norm dtype preservation (#13).
 flash-qla = { git = "https://github.com/QwenLM/FlashQLA", rev = "6ef4858b5446e05bd461d9658d877e548182dbcb" }
+fast-hadamard-transform = { git = "https://github.com/Dao-AILab/fast-hadamard-transform.git", rev = "1cc807efbd6cc001df359822d60bf6052dd66859" }
 
 # Pinned wheels avoid FFmpeg build dep in CI. x86_64: 3.11 → 14.4.0,
 # 3.12 → 14.2.0. aarch64: 14.2.0 for both (14.4.0 has no aarch64 wheel).
@@ -282,6 +284,13 @@ requires-dist = ["torch", "tilelang==0.1.8", "apache-tvm-ffi==0.1.9"]
 [tool.uv.extra-build-dependencies]
 flash-attn-4 = ["setuptools", "wheel", "packaging", "ninja", "torch"]
 flash-qla = ["setuptools", "wheel", "packaging", "ninja", "torch"]
+fast-hadamard-transform = [
+  "setuptools",
+  "wheel",
+  "packaging",
+  "ninja",
+  { requirement = "torch", match-runtime = true },
+]
 
 [tool.setuptools.dynamic]
 version = {attr = "veomni._version.__version__"}
