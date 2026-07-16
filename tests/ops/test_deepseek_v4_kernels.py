@@ -711,18 +711,37 @@ def test_deepseek_v4_fp8_activation_qat_matches_fake_quant_and_uses_ste():
     torch.testing.assert_close(x.grad, grad_output, rtol=0, atol=0)
 
 
-def test_deepseek_v4_qat_hadamard_rotation_backward():
-    _require_tilelang_cuda()
-    from veomni.ops.kernels.deepseek_v4 import rotate_activation
+def test_deepseek_v4_qat_hadamard_rotation_backward(monkeypatch):
+    from veomni.ops.kernels.deepseek_v4.qat import rotate_activation
 
+    monkeypatch.setitem(sys.modules, "fast_hadamard_transform", None)
     torch.manual_seed(19)
-    x = torch.randn(4, 128, device=DEVICE, dtype=torch.bfloat16, requires_grad=True)
+    x = torch.randn(4, 128, dtype=torch.bfloat16, requires_grad=True)
     grad_output = torch.randn_like(x)
 
-    rotate_activation(x).backward(grad_output)
+    hadamard = torch.ones(1, 1)
+    while hadamard.shape[0] < x.shape[-1]:
+        hadamard = torch.cat((torch.cat((hadamard, hadamard), dim=1), torch.cat((hadamard, -hadamard), dim=1)), dim=0)
+    expected = (x.float() @ hadamard.t() * x.shape[-1] ** -0.5).to(torch.bfloat16)
+
+    actual = rotate_activation(x)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    actual.backward(grad_output)
     expected_grad = rotate_activation(grad_output)
 
     torch.testing.assert_close(x.grad, expected_grad, rtol=0, atol=0)
+
+
+def test_deepseek_v4_qat_hadamard_rotation_falls_back_to_torch(monkeypatch):
+    from veomni.ops.kernels.deepseek_v4.qat import rotate_activation
+
+    monkeypatch.setitem(sys.modules, "fast_hadamard_transform", None)
+    x = torch.tensor([[1, 2, 3, 4]], dtype=torch.bfloat16)
+
+    actual = rotate_activation(x)
+
+    expected = torch.tensor([[5, -1, -2, 0]], dtype=torch.bfloat16)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 def test_deepseek_v4_fp8_activation_qat_validates_block_shape():
