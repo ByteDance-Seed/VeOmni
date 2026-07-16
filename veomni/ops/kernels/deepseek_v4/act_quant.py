@@ -166,3 +166,141 @@ def act_quant(
         x.copy_(y)
         return x
     return y, s
+
+
+@tilelang.jit(pass_configs=pass_configs)
+def fp4_quant_kernel(N, block_size=32, in_dtype=BF16, scale_dtype=FE8M0, inplace=False):
+    """Block-wise E2M1 FP4 quantization with power-of-two scales."""
+    M = T.symbolic("M")
+    fp4_max = 6.0
+    fp4_max_inv = 1.0 / fp4_max
+    blk_m = 32
+    group_size = block_size
+    compute_dtype = FP32
+    out_dtype = in_dtype if inplace else FP4
+
+    @T.prim_func
+    def fp4_quant_kernel_(
+        X: T.Tensor[(M, N), in_dtype],
+        Y: T.Tensor[(M, N), out_dtype],
+        S: T.Tensor[(M, T.ceildiv(N, group_size)), scale_dtype],
+    ):
+        with T.Kernel(T.ceildiv(M, blk_m), T.ceildiv(N, group_size), threads=128) as (
+            pid_m,
+            pid_n,
+        ):
+            x_shared = T.alloc_shared((blk_m, group_size), in_dtype)
+            x_local = T.alloc_fragment((blk_m, group_size), in_dtype)
+            amax_local = T.alloc_fragment((blk_m,), compute_dtype)
+            s_local = T.alloc_fragment((blk_m,), compute_dtype)
+            y_local = T.alloc_fragment((blk_m, group_size), out_dtype)
+            y_shared = T.alloc_shared((blk_m, group_size), out_dtype)
+
+            for _ in T.Pipelined(1, num_stages=2):
+                T.copy(X[pid_m * blk_m, pid_n * group_size], x_shared)
+                T.copy(x_shared, x_local)
+                T.reduce_absmax(x_local, amax_local, dim=1)
+                for i in T.Parallel(blk_m):
+                    amax_local[i] = T.max(amax_local[i], 6 * (2**-126))
+                    s_local[i] = fast_round_scale(amax_local[i], fp4_max_inv)
+                if inplace:
+                    for i, j in T.Parallel(blk_m, group_size):
+                        y_local[i, j] = T.Cast(
+                            out_dtype,
+                            T.Cast(
+                                compute_dtype,
+                                T.Cast(FP4, T.clamp(x_local[i, j] / s_local[i], -fp4_max, fp4_max)),
+                            )
+                            * s_local[i],
+                        )
+                else:
+                    for i, j in T.Parallel(blk_m, group_size):
+                        y_local[i, j] = T.clamp(x_local[i, j] / s_local[i], -fp4_max, fp4_max)
+                for i in T.Parallel(blk_m):
+                    S[pid_m * blk_m + i, pid_n] = T.Cast(scale_dtype, s_local[i])
+                T.copy(y_local, y_shared)
+                T.copy(y_shared, Y[pid_m * blk_m, pid_n * group_size])
+
+    return fp4_quant_kernel_
+
+
+def fp4_act_quant(
+    x: torch.Tensor,
+    block_size: int = 32,
+    inplace: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """Block-wise FP4 quantization, optionally dequantizing in place to BF16."""
+    N = x.size(-1)
+    assert N % block_size == 0
+    z = x.contiguous()
+    y = torch.empty_like(z) if inplace else z.new_empty(*z.shape[:-1], N // 2, dtype=torch.float4_e2m1fn_x2)
+    s = z.new_empty(*z.size()[:-1], N // block_size, dtype=torch.float8_e8m0fnu)
+    kernel = fp4_quant_kernel(N, block_size, inplace=inplace)
+    kernel(z.view(-1, N), y.view(-1, y.size(-1)), s.view(-1, N // block_size))
+    if inplace:
+        x.copy_(y)
+        return x
+    return y, s
+
+
+@tilelang.jit(pass_configs=pass_configs)
+def fp8_weight_quant_with_scale_kernel(N, block_size=128, in_dtype=BF16, scale_dtype=FE8M0):
+    """Quantize BF16 weights to E4M3 using retained 128x128 block scales."""
+    M = T.symbolic("M")
+    blk_m = 32
+
+    @T.prim_func
+    def kernel(
+        X: T.Tensor[(M, N), in_dtype],
+        Y: T.Tensor[(M, N), FP8],
+        S: T.Tensor[(T.ceildiv(M, block_size), T.ceildiv(N, block_size)), scale_dtype],
+    ):
+        with T.Kernel(T.ceildiv(M, blk_m), T.ceildiv(N, block_size), threads=128) as (pid_m, pid_n):
+            x_shared = T.alloc_shared((blk_m, block_size), in_dtype)
+            x_local = T.alloc_fragment((blk_m, block_size), in_dtype)
+            y_local = T.alloc_fragment((blk_m, block_size), FP8)
+            y_shared = T.alloc_shared((blk_m, block_size), FP8)
+            scale = T.alloc_fragment((blk_m,), FP32)
+
+            for _ in T.Pipelined(1, num_stages=2):
+                T.copy(X[pid_m * blk_m, pid_n * block_size], x_shared)
+                T.copy(x_shared, x_local)
+                for i in T.Parallel(blk_m):
+                    scale[i] = T.Cast(FP32, S[(pid_m * blk_m + i) // block_size, pid_n])
+                for i, j in T.Parallel(blk_m, block_size):
+                    y_local[i, j] = T.clamp(T.Cast(FP32, x_local[i, j]) / scale[i], -448.0, 448.0)
+                T.copy(y_local, y_shared)
+                T.copy(y_shared, Y[pid_m * blk_m, pid_n * block_size])
+
+    return kernel
+
+
+def fp8_weight_quant_with_scale(
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+    block_size: int = 128,
+) -> torch.Tensor:
+    """Quantize a BF16 matrix to FP8 using retained checkpoint E8M0 scales."""
+    if weight.ndim != 2:
+        raise ValueError(f"Expected a 2D weight matrix, got shape {tuple(weight.shape)}")
+    if weight.dtype != torch.bfloat16:
+        raise TypeError(f"Expected a BF16 weight matrix, got {weight.dtype}")
+    if scale.dtype != torch.float8_e8m0fnu:
+        raise TypeError(f"Expected E8M0 weight scales, got {scale.dtype}")
+    if scale.device != weight.device:
+        raise ValueError(f"Weight and scale must be on the same device, got {weight.device} and {scale.device}")
+    scale_values = scale.float()
+    if not torch.isfinite(scale_values).all() or not torch.all(scale_values > 0):
+        raise ValueError("FP8 weight scales must be finite and positive")
+    M, N = weight.shape
+    if M % block_size != 0 or N % block_size != 0:
+        raise ValueError(f"FP8 weight dimensions {(M, N)} must be divisible by block size {block_size}")
+    expected_scale_shape = (M // block_size, N // block_size)
+    if scale.shape != expected_scale_shape:
+        raise ValueError(f"Expected scale shape {expected_scale_shape}, got {tuple(scale.shape)}")
+    weight = weight.contiguous()
+    scale = scale.contiguous()
+    output = torch.empty_like(weight, dtype=torch.float8_e4m3fn)
+    kernel = fp8_weight_quant_with_scale_kernel(N, block_size)
+    kernel(weight, output, scale)
+    return output

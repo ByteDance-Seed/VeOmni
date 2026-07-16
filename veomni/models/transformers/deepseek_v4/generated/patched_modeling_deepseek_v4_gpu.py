@@ -9,6 +9,10 @@
 #  It contains a patched version of the original HuggingFace modeling code.
 #
 #  Patches applied:
+#    - method_override: DeepseekV4RMSNorm.forward
+#      Multiply normalized activations and weights in FP32 before casting to the input dtype
+#    - method_override: DeepseekV4RotaryEmbedding.forward
+#      Retain FP32 cos/sin for inference and use activation dtype for checkpoint-stable training
 #    - method_override: DeepseekV4HyperConnection.forward
 #      Dispatch DeepSeek V4 mHC pre/Sinkhorn/collapse through an OpSlot
 #    - method_override: DeepseekV4HyperHead.forward
@@ -22,13 +26,19 @@
 #    - method_override: DeepseekV4Indexer.forward
 #      Optional TileLang Lightning Indexer dispatch
 #    - method_override: DeepseekV4Attention.forward
-#      Forward packed sequence boundaries to HCA and CSA compressors
+#      Forward packed sequence boundaries and apply optional activation QAT
 #    - function_replacement: eager_attention_forward
-#      Optional TileLang sparse MQA dispatch
+#      Optional official FP8 KV quantization and TileLang sparse MQA dispatch
 #    - method_override: DeepseekV4Model.forward
-#      Propagate packed sequence boundaries to compressed attention
+#      Propagate packed boundaries and preserve stateless indexer dispatch
 #    - class_replacement: DeepseekV4Experts
 #      Use v5 gate_up_proj expert layout with OpSlot-guarded VeOmni fused-MoE path
+#    - method_override: DeepseekV4MLP.forward
+#      Match official FP32 clamped SwiGLU arithmetic for shared experts
+#    - method_override: DeepseekV4TopKRouter.forward
+#      Match the official DeepSeek-V4 FP32 router projection
+#    - method_override: DeepseekV4HashRouter.forward
+#      Match the official DeepSeek-V4 FP32 hash-router projection
 #    - method_override: DeepseekV4ForCausalLM.forward
 #      OpSlot guard for fused cross entropy in DeepseekV4ForCausalLM.forward
 #    - method_override: DeepseekV4ForCausalLM.get_parallel_plan
@@ -57,6 +67,7 @@ from transformers.utils import TransformersKwargs, auto_docstring, can_return_tu
 from transformers.utils.generic import maybe_autocast, merge_with_config_defaults
 from transformers.utils.output_capturing import OutputRecorder, capture_outputs
 
+from veomni.distributed.parallel_state import get_parallel_state
 from veomni.models.transformers.deepseek_v4.packed_utils import (
     build_packed_compression_metadata,
     compress_packed_windows,
@@ -70,7 +81,15 @@ from veomni.ops import fused_moe_forward
 
 # Additional import blocks for patches
 from veomni.ops.dispatch import OpsConfigSlot, OpSlot
-from veomni.ops.kernels.deepseek_v4 import sparse_attn_tilelang, v4_lighting_indexer
+from veomni.ops.kernels.deepseek_v4 import (
+    act_quant,
+    fp4_act_quant,
+    fp4_gemm,
+    fp8_simulate_qat,
+    rotate_activation,
+    sparse_attn_tilelang,
+    v4_lighting_indexer,
+)
 from veomni.utils.model_outputs import MoeCausalLMOutputWithLogProbs
 
 
@@ -82,6 +101,25 @@ veomni_mhc_post = OpSlot("mhc", "post")
 veomni_mhc_head = OpSlot("mhc", "head")
 veomni_dsa_indexer_backend = OpsConfigSlot("dsa_indexer_backend")
 veomni_dsa_attention_backend = OpsConfigSlot("dsa_attention_backend")
+veomni_deepseek_v4_fp8_activation_qat = OpsConfigSlot("deepseek_v4_fp8_activation_qat", default=False)
+
+
+def _deepseek_v4_fp8_qat_non_rope(x, rope_dim):
+    if not veomni_deepseek_v4_fp8_activation_qat.value or x.numel() == 0:
+        return x
+    return torch.cat([fp8_simulate_qat(x[..., :-rope_dim], 64), x[..., -rope_dim:]], dim=-1)
+
+
+def _deepseek_v4_fp8_qat_indexer(x):
+    if not veomni_deepseek_v4_fp8_activation_qat.value or x.numel() == 0:
+        return x
+    return fp8_simulate_qat(rotate_activation(x), 128)
+
+
+# ======================================================================
+# [MODIFIED CLASS] DeepseekV4RMSNorm
+# Methods patched: forward
+# ======================================================================
 
 
 @use_kernel_forward_from_hub("RMSNorm")
@@ -94,12 +132,15 @@ class DeepseekV4RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
 
+    # ================================================================
+    # Patch: official weighted RMSNorm precision order
+    # ================================================================
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         input_dtype = hidden_states.dtype
-        hidden_states = hidden_states.to(torch.float32)
-        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states.float()
+        variance = hidden_states.square().mean(-1, keepdim=True)
         hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
-        return self.weight * hidden_states.to(input_dtype)
+        return (self.weight.float() * hidden_states).to(input_dtype)
 
     def extra_repr(self):
         return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
@@ -112,6 +153,12 @@ class DeepseekV4UnweightedRMSNorm(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return x * torch.rsqrt(x.float().square().mean(-1, keepdim=True) + self.eps).to(x.dtype)
+
+
+# ======================================================================
+# [MODIFIED CLASS] DeepseekV4RotaryEmbedding
+# Methods patched: forward
+# ======================================================================
 
 
 class DeepseekV4RotaryEmbedding(nn.Module):
@@ -190,14 +237,12 @@ class DeepseekV4RotaryEmbedding(nn.Module):
         )
         return inv_freq, attention_factor
 
+    # ================================================================
+    # Patch: official RoPE table precision and checkpoint-stable training dtype
+    # ================================================================
     @torch.no_grad()
     @dynamic_rope_update  # power user: used with advanced RoPE types (e.g. dynamic rope)
     def forward(self, x, position_ids, layer_type=None):
-        # Key difference vs Laguna's forward: no `torch.cat([freqs, freqs], dim=-1)`
-        # duplication. V4's interleaved RoPE pairs consecutive channels, so we only need
-        # `rope_head_dim // 2` unique θ entries — the `apply_rotary_pos_emb` helper does
-        # the `repeat_interleave(2)` next to the rotation math, where the link between
-        # the doubled dim and `rotate_half` is local and obvious.
         inv_freq = getattr(self, f"{layer_type}_inv_freq")
         attention_scaling = getattr(self, f"{layer_type}_attention_scaling")
         inv_freq_expanded = inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)
@@ -207,7 +252,9 @@ class DeepseekV4RotaryEmbedding(nn.Module):
             freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
             cos = freqs.cos() * attention_scaling
             sin = freqs.sin() * attention_scaling
-        return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
+        if self.training:
+            return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
+        return cos, sin
 
 
 class DeepseekV4HCACache(DynamicSlidingWindowLayer):
@@ -476,6 +523,7 @@ class DeepseekV4HCACompressor(nn.Module):
                 rate_metadata,
                 overlap=False,
             )
+            compressed = _deepseek_v4_fp8_qat_non_rope(compressed, self.rotary_emb.config.qk_rope_head_dim)
             block_bias = packed_compressed_block_bias(rate_metadata)
             return compressed.unsqueeze(1), block_bias
 
@@ -500,6 +548,8 @@ class DeepseekV4HCACompressor(nn.Module):
             compressed = apply_rotary_pos_emb(compressed.unsqueeze(1), cos, sin).squeeze(1)
         else:
             compressed = chunk_kv.new_zeros((batch, 0, self.head_dim))
+
+        compressed = _deepseek_v4_fp8_qat_non_rope(compressed, self.rotary_emb.config.qk_rope_head_dim)
 
         if cache_layer is not None:
             compressed = cache_layer.update_compressor_states("compressor", compressed)
@@ -651,6 +701,7 @@ class DeepseekV4Indexer(nn.Module):
         else:
             compressed = chunk_kv.new_zeros((batch, 0, self.head_dim))
 
+        compressed = _deepseek_v4_fp8_qat_indexer(compressed)
         compressed_kv = (
             compressed if cache_layer is None else cache_layer.update_compressor_states("indexer", compressed)
         )
@@ -658,6 +709,7 @@ class DeepseekV4Indexer(nn.Module):
         cos_q, sin_q = self.rotary_emb(hidden_states, position_ids=position_ids, layer_type=self.rope_layer_type)
         q = self.q_b_proj(q_residual).view(batch, seq_len, -1, self.head_dim).transpose(1, 2)
         q = apply_rotary_pos_emb(q, cos_q, sin_q).transpose(1, 2)
+        q = _deepseek_v4_fp8_qat_indexer(q)
         weights = self.weights_proj(hidden_states).float() * (self.weights_scaling * self.softmax_scale)
         compressed_len = compressed_kv.shape[1]
         top_k = min(self.index_topk, compressed_len)
@@ -791,6 +843,7 @@ class DeepseekV4CSACompressor(nn.Module):
                 rate_metadata,
                 overlap=True,
             )
+            compressed = _deepseek_v4_fp8_qat_non_rope(compressed, self.rotary_emb.config.qk_rope_head_dim)
             compressed_kv = compressed.unsqueeze(1)
             top_k_indices = self.indexer(
                 hidden_states,
@@ -844,6 +897,8 @@ class DeepseekV4CSACompressor(nn.Module):
         else:
             compressed = chunk_kv.new_zeros((batch, 0, self.head_dim))
 
+        compressed = _deepseek_v4_fp8_qat_non_rope(compressed, self.rotary_emb.config.qk_rope_head_dim)
+
         if cache_layer is not None:
             compressed = cache_layer.update_compressor_states("compressor", compressed)
         compressed_kv = compressed.unsqueeze(1)
@@ -870,16 +925,18 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
 
 # ======================================================================
 # [PATCHED FUNCTION] eager_attention_forward
-# Reason: Optional TileLang sparse MQA dispatch
+# Reason: Optional official FP8 KV quantization and TileLang sparse MQA dispatch
 # Source: veomni.models.transformers.deepseek_v4.deepseek_v4_gpu_patch_gen_config
 # ======================================================================
 # ================================================================
 # Patch: eager_attention_forward
-# 1. Dispatch DeepSeek-V4 attention to the TileLang sparse MQA kernel when
+# 1. Optionally apply the official inference path's FP8 fake quantization to
+#    non-RoPE KV channels immediately before attention.
+# 2. Dispatch DeepSeek-V4 attention to the TileLang sparse MQA kernel when
 #    ``dsa_attention_backend=tilelang_sparse``. The existing additive mask is
 #    converted to a compact fixed-width index list, preserving sliding-window,
 #    compressor, causal, and invalid-index semantics.
-# 2. Preserve the upstream eager implementation as the default fallback.
+# 3. Preserve the upstream eager implementation as the default fallback.
 # ================================================================
 def eager_attention_forward(
     module: nn.Module,
@@ -892,6 +949,19 @@ def eager_attention_forward(
     **kwargs,
 ):
     # --- Patch.1 ---
+    if getattr(module, "use_fp8_kv_quantization", False):
+        # DeepSeek-V4 uses the same normalized MQA tensor for keys and values.
+        key = key.clone()
+        act_quant(
+            key[..., : -module.config.qk_rope_head_dim],
+            block_size=64,
+            scale_fmt="ue8m0",
+            scale_dtype=torch.float8_e8m0fnu,
+            inplace=True,
+        )
+        value = key
+
+    # --- Patch.2 ---
     attention_backend = veomni_dsa_attention_backend.value
     if attention_backend not in {"eager", "tilelang_sparse"}:
         raise ValueError(
@@ -934,9 +1004,9 @@ def eager_attention_forward(
             scaling,
         )
         return attn_output, None
-    # --- Patch.1 ---
-
     # --- Patch.2 ---
+
+    # --- Patch.3 ---
     key_states = repeat_kv(key, module.num_key_value_groups)
     value_states = repeat_kv(value, module.num_key_value_groups)
     attn_weights = torch.matmul(query, key_states.transpose(2, 3)) * scaling
@@ -952,7 +1022,7 @@ def eager_attention_forward(
     attn_output = torch.matmul(attn_weights, value_states)
     attn_output = attn_output.transpose(1, 2).contiguous()
     return attn_output, attn_weights
-    # --- Patch.2 ---
+    # --- Patch.3 ---
 
 
 COMPRESSOR_CLASSES = {
@@ -1017,6 +1087,7 @@ class DeepseekV4Attention(nn.Module):
     # ================================================================
     # Patch: DeepseekV4Attention.forward
     # 1. Pass the collator-provided packed sequence slices into compressors.
+    # 2. Fake-quantize the main attention KV tensor before concatenating compressed KV.
     # ================================================================
     def forward(
         self,
@@ -1032,12 +1103,14 @@ class DeepseekV4Attention(nn.Module):
         cos, sin = position_embeddings[self.rope_layer_type]
 
         q_residual = self.q_a_norm(self.q_a_proj(hidden_states))
-        q = self.q_b_proj(q_residual).view(*hidden_shape).transpose(1, 2)
-        q = self.q_b_norm(q)
+        q = self.q_b_proj(q_residual).view(*hidden_shape)
+        q = q * torch.rsqrt(q.square().mean(-1, keepdim=True) + self.q_b_norm.eps)
+        q = q.transpose(1, 2)
         q = apply_rotary_pos_emb(q, cos, sin)
 
         kv = self.kv_norm(self.kv_proj(hidden_states)).view(*hidden_shape).transpose(1, 2)
         kv = apply_rotary_pos_emb(kv, cos, sin)
+        kv = _deepseek_v4_fp8_qat_non_rope(kv, self.config.qk_rope_head_dim)
 
         if past_key_values is not None:
             kv = past_key_values.update(kv, kv, self.layer_idx)[0]
@@ -1210,6 +1283,12 @@ class DeepseekV4HyperHead(nn.Module):
         return (pre.unsqueeze(-1) * x).sum(dim=2).to(x.dtype)
 
 
+# ======================================================================
+# [MODIFIED CLASS] DeepseekV4MLP
+# Methods patched: forward
+# ======================================================================
+
+
 class DeepseekV4MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -1221,9 +1300,25 @@ class DeepseekV4MLP(nn.Module):
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=config.mlp_bias)
         self.act_fn = ACT2FN[config.hidden_act]
 
-    def forward(self, x):
-        down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
-        return down_proj
+    # ================================================================
+    # Patch: DeepseekV4MLP.forward
+    # The shared expert uses the same FP32 clamped SwiGLU as official inference.
+    # Keep the existing class because its V4-specific intermediate-size mapping
+    # is incompatible with LigerSwiGLUMLP construction.
+    # ================================================================
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        dtype = x.dtype
+        gate = self.gate_proj(x).float().clamp(max=self.config.swiglu_limit)
+        up = (
+            self.up_proj(x)
+            .float()
+            .clamp(
+                min=-self.config.swiglu_limit,
+                max=self.config.swiglu_limit,
+            )
+        )
+        hidden_states = self.act_fn(gate) * up
+        return self.down_proj(hidden_states.to(dtype))
 
 
 # ======================================================================
@@ -1252,6 +1347,10 @@ class DeepseekV4Experts(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.num_experts = config.num_local_experts
+        self.expert_dtype = getattr(config, "expert_dtype", None)
+        self.use_ondemand_fp4 = False
+        self.use_ondemand_fp8 = False
+        self.assume_replicated_ep_inputs = False
         self.hidden_dim = config.hidden_size
         self.intermediate_dim = config.intermediate_size
         self.gate_up_proj = nn.Parameter(torch.empty(self.num_experts, 2 * self.intermediate_dim, self.hidden_dim))
@@ -1266,6 +1365,12 @@ class DeepseekV4Experts(nn.Module):
         top_k_weights: torch.Tensor,
     ) -> torch.Tensor:
         final_hidden_states = torch.zeros_like(hidden_states)
+
+        if not self.training and self.expert_dtype == "fp4":
+            if self.use_ondemand_fp4:
+                return self._forward_fp4(hidden_states, top_k_index, top_k_weights)
+            if self.use_ondemand_fp8:
+                return self._forward_fp8(hidden_states, top_k_index, top_k_weights)
 
         # --- Patch.2 ---
         if veomni_moe_experts_forward.use_non_eager_impl:
@@ -1300,6 +1405,120 @@ class DeepseekV4Experts(nn.Module):
 
         return final_hidden_states
 
+    def _forward_fp4(
+        self,
+        hidden_states: torch.Tensor,
+        top_k_index: torch.Tensor,
+        top_k_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        """Experimental inference from BF16-resident, on-demand FP4 weights."""
+        parallel_state = get_parallel_state()
+        if parallel_state.ep_enabled and not self.assume_replicated_ep_inputs:
+            raise RuntimeError("The on-demand FP4 reference path requires replicated inputs when EP is enabled")
+        gate_up_weights = self.gate_up_proj.to_local() if hasattr(self.gate_up_proj, "to_local") else self.gate_up_proj
+        down_weights = self.down_proj.to_local() if hasattr(self.down_proj, "to_local") else self.down_proj
+        local_experts = gate_up_weights.shape[0]
+        expert_start = parallel_state.ep_rank * local_experts if parallel_state.ep_enabled else 0
+        output = torch.zeros_like(hidden_states, dtype=torch.float32)
+        quantized_gate_up, gate_up_scales = fp4_act_quant(gate_up_weights.contiguous())
+        quantized_down, down_scales = fp4_act_quant(down_weights.contiguous())
+
+        for local_idx in range(local_experts):
+            expert_idx = expert_start + local_idx
+            token_idx, top_k_pos = torch.where(top_k_index == expert_idx)
+            if token_idx.numel() == 0:
+                continue
+
+            current = hidden_states[token_idx].contiguous()
+            quantized_input, input_scale = act_quant(
+                current,
+                block_size=128,
+                scale_fmt="ue8m0",
+                scale_dtype=torch.float8_e8m0fnu,
+            )
+            gate_up = fp4_gemm(
+                quantized_input,
+                input_scale,
+                quantized_gate_up[local_idx].contiguous(),
+                gate_up_scales[local_idx].contiguous(),
+                torch.float8_e8m0fnu,
+            ).float()
+            gate, up = gate_up.chunk(2, dim=-1)
+            gate = gate.clamp(max=self.limit)
+            up = up.clamp(min=-self.limit, max=self.limit)
+            current = F.silu(gate) * up
+            current = current * top_k_weights[token_idx, top_k_pos, None].float()
+
+            quantized_input, input_scale = act_quant(
+                current.to(hidden_states.dtype).contiguous(),
+                block_size=128,
+                scale_fmt="ue8m0",
+                scale_dtype=torch.float8_e8m0fnu,
+            )
+            current = fp4_gemm(
+                quantized_input,
+                input_scale,
+                quantized_down[local_idx].contiguous(),
+                down_scales[local_idx].contiguous(),
+                torch.float8_e8m0fnu,
+            )
+            output.index_add_(0, token_idx, current.float())
+
+        if parallel_state.ep_enabled:
+            torch.distributed.all_reduce(output, group=parallel_state.ep_group)
+        return output.to(hidden_states.dtype)
+
+    def _forward_fp8(
+        self,
+        hidden_states: torch.Tensor,
+        top_k_index: torch.Tensor,
+        top_k_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        """Quantize activations on demand while retaining BF16 expert weights."""
+        parallel_state = get_parallel_state()
+        if parallel_state.ep_enabled and not self.assume_replicated_ep_inputs:
+            raise RuntimeError("The on-demand FP8 reference path requires replicated inputs when EP is enabled")
+        gate_up_weights = self.gate_up_proj.to_local() if hasattr(self.gate_up_proj, "to_local") else self.gate_up_proj
+        down_weights = self.down_proj.to_local() if hasattr(self.down_proj, "to_local") else self.down_proj
+        local_experts = gate_up_weights.shape[0]
+        expert_start = parallel_state.ep_rank * local_experts if parallel_state.ep_enabled else 0
+        output = torch.zeros_like(hidden_states, dtype=torch.float32)
+
+        for local_idx in range(local_experts):
+            expert_idx = expert_start + local_idx
+            token_idx, top_k_pos = torch.where(top_k_index == expert_idx)
+            if token_idx.numel() == 0:
+                continue
+
+            current = hidden_states[token_idx].contiguous().clone()
+            act_quant(
+                current,
+                block_size=128,
+                scale_fmt="ue8m0",
+                scale_dtype=torch.float8_e8m0fnu,
+                inplace=True,
+            )
+            gate_up = F.linear(current.float(), gate_up_weights[local_idx].float()).to(hidden_states.dtype).float()
+            gate, up = gate_up.chunk(2, dim=-1)
+            gate = gate.clamp(max=self.limit)
+            up = up.clamp(min=-self.limit, max=self.limit)
+            current = F.silu(gate) * up
+            current = current * top_k_weights[token_idx, top_k_pos, None].float()
+            current = current.to(hidden_states.dtype).contiguous()
+            act_quant(
+                current,
+                block_size=128,
+                scale_fmt="ue8m0",
+                scale_dtype=torch.float8_e8m0fnu,
+                inplace=True,
+            )
+            current = F.linear(current.float(), down_weights[local_idx].float()).to(hidden_states.dtype)
+            output.index_add_(0, token_idx, current.float())
+
+        if parallel_state.ep_enabled:
+            torch.distributed.all_reduce(output, group=parallel_state.ep_group)
+        return output.to(hidden_states.dtype)
+
     def _apply_gate(self, gate_up: torch.Tensor) -> torch.Tensor:
         # --- Patch.3 ---
         # gpt-oss-style clamped SwiGLU. Lives on the class so
@@ -1313,6 +1532,12 @@ class DeepseekV4Experts(nn.Module):
         # --- Patch.3 ---
 
 
+# ======================================================================
+# [MODIFIED CLASS] DeepseekV4TopKRouter
+# Methods patched: forward
+# ======================================================================
+
+
 class DeepseekV4TopKRouter(nn.Module):
     def __init__(self, config: DeepseekV4Config):
         super().__init__()
@@ -1324,14 +1549,24 @@ class DeepseekV4TopKRouter(nn.Module):
         self.routed_scaling_factor = config.routed_scaling_factor
         self.register_buffer("e_score_correction_bias", torch.zeros(self.num_experts), persistent=True)
 
-    def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         flat = hidden_states.reshape(-1, self.hidden_dim)
-        logits = F.linear(flat, self.weight)
+        logits = F.linear(flat.float(), self.weight.float())
+        correction_bias = self.e_score_correction_bias.float()
         scores = self.score_fn(logits)
-        indices = torch.topk(scores + self.e_score_correction_bias, self.top_k, dim=-1, sorted=False).indices
+        indices = torch.topk(scores + correction_bias, self.top_k, dim=-1, sorted=False).indices
         weights = scores.gather(1, indices)
         weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-20)
         return logits, weights * self.routed_scaling_factor, indices
+
+
+# ======================================================================
+# [MODIFIED CLASS] DeepseekV4HashRouter
+# Methods patched: forward
+# ======================================================================
 
 
 class DeepseekV4HashRouter(nn.Module):
@@ -1354,10 +1589,12 @@ class DeepseekV4HashRouter(nn.Module):
         self.register_buffer("tid2eid", torch.zeros(config.vocab_size, self.top_k, dtype=torch.long), persistent=True)
 
     def forward(
-        self, hidden_states: torch.Tensor, input_ids: torch.Tensor
+        self,
+        hidden_states: torch.Tensor,
+        input_ids: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         flat = hidden_states.reshape(-1, self.hidden_dim)
-        logits = F.linear(flat, self.weight)
+        logits = F.linear(flat.float(), self.weight.float())
         scores = self.score_fn(logits)
         indices = self.tid2eid[input_ids.reshape(-1)].long()
         weights = scores.gather(1, indices)
@@ -1562,6 +1799,7 @@ class DeepseekV4Model(DeepseekV4PreTrainedModel):
     # ================================================================
     # Patch: DeepseekV4Model.forward
     # 1. Convert collator-provided cu-seqlens into reusable packed slices once.
+    # 2. Keep use_cache=False forwards stateless so the TileLang indexer can run.
     # ================================================================
     @merge_with_config_defaults
     @capture_outputs
@@ -1578,13 +1816,17 @@ class DeepseekV4Model(DeepseekV4PreTrainedModel):
     ) -> MoeModelOutputWithPast:
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
-        return_cache = past_key_values if use_cache else None
-        if past_key_values is None:
+        # Stateless prefill/training must keep the cache absent: the TileLang
+        # Lightning Indexer dispatch is intentionally cache-free, and creating a
+        # DynamicCache here would silently force its eager decode fallback even
+        # when use_cache=False.
+        if past_key_values is None and use_cache:
             past_key_values = DynamicCache(config=self.config)
+        return_cache = past_key_values if use_cache else None
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
         if position_ids is None:
-            past_seen = past_key_values.get_seq_length()
+            past_seen = past_key_values.get_seq_length() if past_key_values is not None else 0
             position_ids = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device) + past_seen
             position_ids = position_ids.unsqueeze(0)
 

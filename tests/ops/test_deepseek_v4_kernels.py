@@ -14,6 +14,7 @@
 
 import importlib
 import sys
+import types
 from types import SimpleNamespace
 
 import pytest
@@ -25,6 +26,25 @@ from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type, get_gpu_comp
 
 
 DEVICE = get_device_type()
+
+
+def _make_eager_ops_config(**overrides):
+    from veomni.arguments.arguments_types import OpsImplementationConfig
+
+    eager_fields = {
+        "attn_implementation": "eager",
+        "moe_implementation": "eager",
+        "cross_entropy_loss_implementation": "eager",
+        "rms_norm_implementation": "eager",
+        "swiglu_mlp_implementation": "eager",
+        "rotary_pos_emb_implementation": "eager",
+        "load_balancing_loss_implementation": "eager",
+        "rms_norm_gated_implementation": "eager",
+        "causal_conv1d_implementation": "eager",
+        "chunk_gated_delta_rule_implementation": "eager",
+    }
+    eager_fields.update(overrides)
+    return OpsImplementationConfig(**eager_fields)
 
 
 def test_kernel_package_does_not_import_tilelang_eagerly():
@@ -73,6 +93,18 @@ def test_tilelang_wrappers_reject_pre_sm90_before_import(monkeypatch):
         kernels.v4_lighting_indexer(*args[:3], compress_ratio=1, topk=1)
     with pytest.raises(RuntimeError, match="SM90 or later"):
         kernels.act_quant(torch.empty(0))
+    with pytest.raises(RuntimeError, match="SM90 or later"):
+        kernels.fp4_act_quant(torch.empty(0))
+    with pytest.raises(RuntimeError, match="SM90 or later"):
+        kernels.fp8_weight_quant_with_scale(torch.empty(0), torch.empty(0))
+    with pytest.raises(RuntimeError, match="SM90 or later"):
+        kernels.fp8_gemm(*args)
+    with pytest.raises(RuntimeError, match="SM90 or later"):
+        kernels.fp4_gemm(*args)
+    with pytest.raises(RuntimeError, match="SM90 or later"):
+        kernels.fp8_simulate_qat(torch.empty(0))
+    with pytest.raises(RuntimeError, match="SM90 or later"):
+        kernels.rotate_activation(torch.empty(0))
 
 
 def test_tilelang_wrappers_reject_rocm_before_import(monkeypatch):
@@ -89,6 +121,18 @@ def test_tilelang_wrappers_reject_rocm_before_import(monkeypatch):
         kernels.v4_lighting_indexer(*args[:3], compress_ratio=1, topk=1)
     with pytest.raises(RuntimeError, match="NVIDIA CUDA"):
         kernels.act_quant(torch.empty(0))
+    with pytest.raises(RuntimeError, match="NVIDIA CUDA"):
+        kernels.fp4_act_quant(torch.empty(0))
+    with pytest.raises(RuntimeError, match="NVIDIA CUDA"):
+        kernels.fp8_weight_quant_with_scale(torch.empty(0), torch.empty(0))
+    with pytest.raises(RuntimeError, match="NVIDIA CUDA"):
+        kernels.fp8_gemm(*args)
+    with pytest.raises(RuntimeError, match="NVIDIA CUDA"):
+        kernels.fp4_gemm(*args)
+    with pytest.raises(RuntimeError, match="NVIDIA CUDA"):
+        kernels.fp8_simulate_qat(torch.empty(0))
+    with pytest.raises(RuntimeError, match="NVIDIA CUDA"):
+        kernels.rotate_activation(torch.empty(0))
 
 
 def _require_tilelang_cuda():
@@ -97,6 +141,11 @@ def _require_tilelang_cuda():
         pytest.skip("DeepSeek V4 TileLang kernels require an NVIDIA CUDA GPU")
     if get_gpu_compute_capability() < 90:
         pytest.skip("DeepSeek V4 TileLang kernels require SM90 or later")
+
+
+def _require_fast_hadamard_transform():
+    if importlib.util.find_spec("fast_hadamard_transform") is None:
+        pytest.skip("DeepSeek V4 activation QAT requires fast-hadamard-transform")
 
 
 def _indexer_reference(q, k, weights, topk_indices):
@@ -109,6 +158,140 @@ def _indexer_reference(q, k, weights, topk_indices):
 
 def _cosine_similarity(actual, expected):
     return F.cosine_similarity(actual.float().flatten(), expected.float().flatten(), dim=0)
+
+
+def test_deepseek_v4_attention_quantizes_non_rope_kv_on_a_clone(monkeypatch):
+    from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling
+
+    query = torch.randn(1, 2, 3, 8, dtype=torch.bfloat16)
+    key = torch.randn(1, 1, 3, 8, dtype=torch.bfloat16)
+    original_key = key.clone()
+    causal_mask = torch.triu(torch.full((1, 1, 3, 3), float("-inf")), diagonal=1)
+    module = SimpleNamespace(
+        config=SimpleNamespace(qk_rope_head_dim=2),
+        num_key_value_groups=2,
+        sinks=torch.randn(2),
+        training=False,
+        sliding_window=3,
+        compressor=None,
+        use_fp8_kv_quantization=False,
+    )
+    quantized_key = key.clone()
+    quantized_key[..., :-2] = 0
+
+    try:
+        modeling.veomni_dsa_attention_backend.bind(SimpleNamespace(dsa_attention_backend="eager"))
+        expected, _ = modeling.eager_attention_forward(
+            module, query, quantized_key, quantized_key, causal_mask, 8**-0.5, dropout=0.0
+        )
+        calls = []
+
+        def fake_act_quant(x, block_size, scale_fmt, scale_dtype, inplace):
+            calls.append((x.shape, block_size, scale_fmt, scale_dtype, inplace))
+            x.zero_()
+            return x
+
+        monkeypatch.setattr(modeling, "act_quant", fake_act_quant)
+        module.use_fp8_kv_quantization = True
+        actual, _ = modeling.eager_attention_forward(module, query, key, key, causal_mask, 8**-0.5, dropout=0.0)
+    finally:
+        modeling.veomni_dsa_attention_backend.bind(SimpleNamespace(dsa_attention_backend="eager"))
+
+    assert calls == [(torch.Size([1, 1, 3, 6]), 64, "ue8m0", torch.float8_e8m0fnu, True)]
+    torch.testing.assert_close(key, original_key, rtol=0, atol=0)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_fp4_gemm_matches_dequantized_reference():
+    _require_tilelang_cuda()
+    from veomni.ops.kernels.deepseek_v4 import act_quant, fp4_act_quant, fp4_gemm
+
+    torch.manual_seed(5)
+    x = torch.randn(37, 256, device=DEVICE, dtype=torch.bfloat16)
+    weight = torch.randn(128, 256, device=DEVICE, dtype=torch.bfloat16)
+    quantized_x, x_scale = act_quant(
+        x,
+        block_size=128,
+        scale_fmt="ue8m0",
+        scale_dtype=torch.float8_e8m0fnu,
+    )
+    quantized_weight, weight_scale = fp4_act_quant(weight)
+
+    actual = fp4_gemm(quantized_x, x_scale, quantized_weight, weight_scale, torch.float8_e8m0fnu)
+    dequantized_x = act_quant(
+        x.clone(),
+        block_size=128,
+        scale_fmt="ue8m0",
+        scale_dtype=torch.float8_e8m0fnu,
+        inplace=True,
+    )
+    dequantized_weight = fp4_act_quant(weight.clone(), inplace=True)
+    expected = F.linear(dequantized_x.float(), dequantized_weight.float())
+
+    assert actual.dtype == torch.bfloat16
+    torch.testing.assert_close(actual.float(), expected, rtol=3e-2, atol=3e-1)
+
+
+def test_fp8_fixed_scale_repacking_recovers_checkpoint_bits():
+    _require_tilelang_cuda()
+    from veomni.ops.kernels.deepseek_v4 import fp8_weight_quant_with_scale
+
+    torch.manual_seed(7)
+    expected = (torch.randn(256, 256, device=DEVICE) * 32).to(torch.float8_e4m3fn)
+    scale = torch.tensor([[0.25, 0.5], [1.0, 2.0]], device=DEVICE, dtype=torch.float8_e8m0fnu)
+    expanded_scale = scale.float().repeat_interleave(128, dim=0).repeat_interleave(128, dim=1)
+    weight = (expected.float() * expanded_scale).to(torch.bfloat16)
+
+    actual = fp8_weight_quant_with_scale(weight, scale)
+
+    torch.testing.assert_close(actual.view(torch.uint8), expected.view(torch.uint8), rtol=0, atol=0)
+
+
+def test_fp8_gemm_matches_dequantized_reference():
+    _require_tilelang_cuda()
+    from veomni.ops.kernels.deepseek_v4 import act_quant, fp8_gemm, fp8_weight_quant_with_scale
+
+    torch.manual_seed(8)
+    x = torch.randn(37, 256, device=DEVICE, dtype=torch.bfloat16)
+    weight_scale = torch.tensor([[0.25, 0.5], [1.0, 2.0]], device=DEVICE, dtype=torch.float8_e8m0fnu)
+    packed_weight = (torch.randn(256, 256, device=DEVICE) * 32).to(torch.float8_e4m3fn)
+    expanded_weight_scale = weight_scale.float().repeat_interleave(128, dim=0).repeat_interleave(128, dim=1)
+    weight = (packed_weight.float() * expanded_weight_scale).to(torch.bfloat16)
+    quantized_weight = fp8_weight_quant_with_scale(weight, weight_scale)
+    quantized_x, x_scale = act_quant(
+        x,
+        block_size=128,
+        scale_fmt="ue8m0",
+        scale_dtype=torch.float8_e8m0fnu,
+    )
+
+    actual = fp8_gemm(
+        quantized_x,
+        x_scale,
+        quantized_weight,
+        weight_scale,
+        torch.float8_e8m0fnu,
+    )
+    with pytest.raises(ValueError, match="activation scale shape"):
+        fp8_gemm(
+            quantized_x,
+            x_scale[:, :-1].contiguous(),
+            quantized_weight,
+            weight_scale,
+            torch.float8_e8m0fnu,
+        )
+    with pytest.raises(TypeError, match="both scale tensors"):
+        fp8_gemm(
+            quantized_x,
+            x_scale.float(),
+            quantized_weight,
+            weight_scale.float(),
+            torch.float8_e8m0fnu,
+        )
+    expanded_x_scale = x_scale.float().repeat_interleave(128, dim=-1)
+    expected = F.linear(quantized_x.float() * expanded_x_scale, quantized_weight.float() * expanded_weight_scale)
+
+    torch.testing.assert_close(actual.float(), expected, rtol=3e-2, atol=3e-1)
 
 
 def test_tilelang_indexer_non_power_of_two_topk_forward_backward():
@@ -352,6 +535,60 @@ def test_deepseek_v4_generated_indexer_dispatch_and_position_fallback(monkeypatc
         modeling.veomni_dsa_indexer_backend.bind(SimpleNamespace(dsa_indexer_backend="eager"))
 
 
+def test_deepseek_v4_stateless_forward_does_not_create_decode_cache():
+    from transformers import AutoConfig
+    from transformers.cache_utils import DynamicCache
+
+    from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling
+
+    config = AutoConfig.from_pretrained("tests/toy_config/deepseek_v4_toy")
+    model = modeling.DeepseekV4Model(config)
+    seen_caches = []
+
+    for layer in model.layers:
+
+        def passthrough(self, hidden_states, past_key_values=None, **kwargs):
+            seen_caches.append(past_key_values)
+            return hidden_states
+
+        layer.forward = types.MethodType(passthrough, layer)
+
+    input_ids = torch.arange(8).unsqueeze(0)
+    model(input_ids=input_ids, use_cache=False)
+    assert seen_caches and all(cache is None for cache in seen_caches)
+
+    seen_caches.clear()
+    output = model(input_ids=input_ids, use_cache=True)
+    assert seen_caches and all(isinstance(cache, DynamicCache) for cache in seen_caches)
+    assert isinstance(output.past_key_values, DynamicCache)
+
+
+def test_deepseek_v4_stateless_model_reaches_tilelang_indexer(monkeypatch):
+    _require_tilelang_cuda()
+    from transformers import AutoConfig
+
+    from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling
+
+    config = AutoConfig.from_pretrained("tests/toy_config/deepseek_v4_toy")
+    config._attn_implementation = "eager"
+    model = modeling.DeepseekV4Model(config).to(device=DEVICE, dtype=torch.bfloat16).eval()
+    calls = []
+
+    def fake_tilelang(q, k, weights, compress_ratio, topk, *args, **kwargs):
+        calls.append((q.shape, k.shape, weights.shape, compress_ratio, topk))
+        indices = torch.zeros(q.shape[1], q.shape[0], topk, device=DEVICE, dtype=torch.int32)
+        return torch.zeros_like(indices, dtype=torch.float32), indices
+
+    monkeypatch.setattr(modeling, "v4_lighting_indexer", fake_tilelang)
+    try:
+        modeling.veomni_dsa_indexer_backend.bind(SimpleNamespace(dsa_indexer_backend="tilelang"))
+        with torch.no_grad():
+            model(input_ids=torch.arange(8, device=DEVICE).unsqueeze(0), use_cache=False)
+        assert calls
+    finally:
+        modeling.veomni_dsa_indexer_backend.bind(SimpleNamespace(dsa_indexer_backend="eager"))
+
+
 def test_deepseek_v4_packed_compressors_match_independent_sequences():
     from transformers import AutoConfig
 
@@ -486,3 +723,168 @@ def test_tilelang_act_quant_shapes_scales_and_inplace():
     expanded_scales_mx = expected_scales_mx.repeat_interleave(128, dim=-1)
     expected_quantized_mx = (x_mx.float() / expanded_scales_mx).clamp(-448, 448).to(torch.float8_e4m3fn)
     torch.testing.assert_close(quantized_mx.float(), expected_quantized_mx.float(), rtol=0, atol=0)
+
+
+def test_deepseek_v4_fp8_activation_qat_matches_fake_quant_and_uses_ste():
+    _require_tilelang_cuda()
+    from veomni.ops.kernels.deepseek_v4.act_quant import act_quant
+    from veomni.ops.kernels.deepseek_v4.qat import fp8_simulate_qat
+
+    torch.manual_seed(11)
+    x = torch.randn(3, 256, device=DEVICE, dtype=torch.bfloat16, requires_grad=True)
+    original = x.detach().clone()
+    expected = original.clone()
+    act_quant(expected, block_size=128, scale_fmt="ue8m0", inplace=True)
+
+    actual = fp8_simulate_qat(x, block_size=128)
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    torch.testing.assert_close(x, original, rtol=0, atol=0)
+    grad_output = torch.randn_like(actual)
+    actual.backward(grad_output)
+    torch.testing.assert_close(x.grad, grad_output, rtol=0, atol=0)
+
+
+def test_deepseek_v4_qat_hadamard_rotation_backward():
+    _require_tilelang_cuda()
+    _require_fast_hadamard_transform()
+    from veomni.ops.kernels.deepseek_v4 import rotate_activation
+
+    torch.manual_seed(19)
+    x = torch.randn(4, 128, device=DEVICE, dtype=torch.bfloat16, requires_grad=True)
+    grad_output = torch.randn_like(x)
+
+    rotate_activation(x).backward(grad_output)
+    expected_grad = rotate_activation(grad_output)
+
+    torch.testing.assert_close(x.grad, expected_grad, rtol=0, atol=0)
+
+
+def test_deepseek_v4_qat_hadamard_rotation_has_no_fallback(monkeypatch):
+    from veomni.ops.kernels.deepseek_v4.qat import rotate_activation
+
+    monkeypatch.setitem(sys.modules, "fast_hadamard_transform", None)
+    with pytest.raises(RuntimeError, match="requires fast-hadamard-transform"):
+        rotate_activation(torch.zeros(1, 128, dtype=torch.bfloat16))
+
+
+def test_deepseek_v4_fp8_activation_qat_validates_block_shape():
+    from veomni.ops.kernels.deepseek_v4.qat import fp8_simulate
+
+    with pytest.raises(ValueError, match="must be divisible"):
+        fp8_simulate(torch.zeros(2, 65, dtype=torch.bfloat16), block_size=64)
+
+
+def test_deepseek_v4_fp8_activation_qat_rejects_non_bf16_inputs():
+    from veomni.ops.kernels.deepseek_v4.qat import fp8_simulate
+
+    with pytest.raises(TypeError, match="expects BF16 inputs"):
+        fp8_simulate(torch.zeros(2, 128, dtype=torch.float32), block_size=128)
+
+
+def test_deepseek_v4_fp8_activation_qat_rejects_npu_config(monkeypatch):
+    from veomni.utils import import_utils
+
+    monkeypatch.setattr(import_utils, "is_torch_npu_available", lambda: True)
+    with pytest.raises(ValueError, match="only supported by the DeepSeek-V4 GPU backend"):
+        _make_eager_ops_config(deepseek_v4_fp8_activation_qat=True)
+
+
+def test_deepseek_v4_fp8_activation_qat_requires_hadamard_dependency(monkeypatch):
+    from veomni.utils import import_utils
+
+    monkeypatch.setattr(import_utils, "is_package_available", lambda name: name != "fast_hadamard_transform")
+    with pytest.raises(ValueError, match="requires fast-hadamard-transform"):
+        _make_eager_ops_config(deepseek_v4_fp8_activation_qat=True)
+
+
+def test_deepseek_v4_fp8_activation_qat_model_forward_backward(monkeypatch):
+    _require_tilelang_cuda()
+    _require_fast_hadamard_transform()
+    from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling
+
+    config = modeling.DeepseekV4Config.from_pretrained("tests/toy_config/deepseek_v4_toy")
+    config.num_hidden_layers = 1
+    config.layer_types = ["compressed_sparse_attention"]
+    config.mlp_layer_types = ["moe"]
+    config.head_dim = 128
+    config.partial_rotary_factor = 0.5
+    config.qk_rope_head_dim = 64
+    config.index_topk = 2
+    config.use_cache = False
+
+    model = modeling.DeepseekV4Model(config).to(device=DEVICE, dtype=torch.bfloat16).train()
+    assert {parameter.dtype for parameter in model.parameters()} == {torch.bfloat16}
+
+    quant_calls = []
+    rotate_calls = []
+    real_quant = modeling.fp8_simulate_qat
+    real_rotate = modeling.rotate_activation
+
+    def record_quant(x, block_size):
+        quant_calls.append((tuple(x.shape), block_size))
+        return real_quant(x, block_size)
+
+    def record_rotate(x):
+        rotate_calls.append(tuple(x.shape))
+        return real_rotate(x)
+
+    monkeypatch.setattr(modeling, "fp8_simulate_qat", record_quant)
+    monkeypatch.setattr(modeling, "rotate_activation", record_rotate)
+
+    inputs = torch.randn(1, 8, config.hidden_size, device=DEVICE, dtype=torch.bfloat16)
+    original_inputs = inputs.clone()
+    position_ids = torch.arange(inputs.shape[1], device=DEVICE).unsqueeze(0)
+
+    try:
+        modeling.veomni_deepseek_v4_fp8_activation_qat.bind(SimpleNamespace(deepseek_v4_fp8_activation_qat=False))
+        with torch.no_grad():
+            baseline = model(inputs_embeds=inputs, position_ids=position_ids, use_cache=False).last_hidden_state
+        assert quant_calls == []
+        assert rotate_calls == []
+
+        modeling.veomni_deepseek_v4_fp8_activation_qat.bind(SimpleNamespace(deepseek_v4_fp8_activation_qat=True))
+        qat_inputs = inputs.detach().clone().requires_grad_(True)
+        actual = model(inputs_embeds=qat_inputs, position_ids=position_ids, use_cache=False).last_hidden_state
+        actual.float().square().mean().backward()
+    finally:
+        modeling.veomni_deepseek_v4_fp8_activation_qat.bind(SimpleNamespace(deepseek_v4_fp8_activation_qat=False))
+
+    assert quant_calls == [
+        ((1, 1, 8, 64), 64),
+        ((1, 2, 64), 64),
+        ((1, 2, 128), 128),
+        ((1, 8, config.index_n_heads, 128), 128),
+    ]
+    assert rotate_calls == [(1, 2, 128), (1, 8, config.index_n_heads, 128)]
+    torch.testing.assert_close(inputs, original_inputs, rtol=0, atol=0)
+    assert not torch.equal(actual, baseline)
+    assert qat_inputs.grad is not None
+    assert torch.isfinite(qat_inputs.grad).all()
+    assert qat_inputs.grad.abs().sum() > 0
+
+
+def test_tilelang_fp4_act_quant_packing_and_inplace():
+    _require_tilelang_cuda()
+    from veomni.ops.kernels.deepseek_v4 import fp4_act_quant
+
+    values = torch.tensor(
+        [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0],
+        device=DEVICE,
+        dtype=torch.bfloat16,
+    )
+    x = values.repeat(2).unsqueeze(0)
+    quantized, scales = fp4_act_quant(x)
+
+    assert quantized.shape == (1, 16)
+    assert quantized.dtype == torch.float4_e2m1fn_x2
+    torch.testing.assert_close(scales.float(), torch.ones_like(scales.float()), rtol=0, atol=0)
+    codes = torch.tensor([0, 1, 2, 3, 4, 5, 6, 7, 0, 9, 10, 11, 12, 13, 14, 15], device=DEVICE).to(torch.uint8)
+    codes = codes.repeat(2)
+    expected_packed = codes[0::2] | (codes[1::2] << 4)
+    torch.testing.assert_close(quantized.view(torch.uint8), expected_packed.unsqueeze(0), rtol=0, atol=0)
+
+    inplace = x.clone()
+    result = fp4_act_quant(inplace, inplace=True)
+    assert result.data_ptr() == inplace.data_ptr()
+    torch.testing.assert_close(result, x, rtol=0, atol=0)

@@ -72,7 +72,7 @@ def v4_lighting_indexer(
     )
 
 
-def act_quant(
+def _act_quant(
     x: torch.Tensor,
     block_size: int = 128,
     scale_fmt: str | None = None,
@@ -82,7 +82,69 @@ def act_quant(
     _require_tilelang_sm90()
     from .act_quant import act_quant as impl
 
+    # Importing a child module assigns it to the same-named package attribute.
+    # Restore the public lazy wrapper so subsequent package imports stay callable.
+    globals()["act_quant"] = _act_quant
     return impl(x, block_size, scale_fmt, scale_dtype, inplace)
+
+
+def _fp4_act_quant(
+    x: torch.Tensor,
+    block_size: int = 32,
+    inplace: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    _require_tilelang_sm90()
+    from .act_quant import fp4_act_quant as impl
+
+    globals()["act_quant"] = _act_quant
+    globals()["fp4_act_quant"] = _fp4_act_quant
+    return impl(x, block_size, inplace)
+
+
+def fp8_weight_quant_with_scale(
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+    block_size: int = 128,
+) -> torch.Tensor:
+    _require_tilelang_sm90()
+    from .act_quant import fp8_weight_quant_with_scale as impl
+
+    globals()["act_quant"] = _act_quant
+    globals()["fp4_act_quant"] = _fp4_act_quant
+    return impl(weight, scale, block_size)
+
+
+def fp8_gemm(
+    a: torch.Tensor,
+    a_scale: torch.Tensor,
+    b: torch.Tensor,
+    b_scale: torch.Tensor,
+    scale_dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    _require_tilelang_sm90()
+    from .quantized_gemm import fp8_gemm as impl
+
+    globals()["fp4_gemm"] = _fp4_gemm
+    return impl(a, a_scale, b, b_scale, scale_dtype)
+
+
+def _fp4_gemm(
+    a: torch.Tensor,
+    a_scale: torch.Tensor,
+    b: torch.Tensor,
+    b_scale: torch.Tensor,
+    scale_dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    _require_tilelang_sm90()
+    from .quantized_gemm import fp4_gemm as impl
+
+    globals()["fp4_gemm"] = _fp4_gemm
+    return impl(a, a_scale, b, b_scale, scale_dtype)
+
+
+act_quant = _act_quant
+fp4_act_quant = _fp4_act_quant
+fp4_gemm = _fp4_gemm
 
 
 def linear_bf16_fp32(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
@@ -91,4 +153,29 @@ def linear_bf16_fp32(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     return impl(x, weight)
 
 
-__all__ = ["act_quant", "linear_bf16_fp32", "sparse_attn_tilelang", "v4_lighting_indexer"]
+def fp8_simulate_qat(x: torch.Tensor, block_size: int = 128) -> torch.Tensor:
+    _require_tilelang_sm90()
+    from .qat import fp8_simulate_qat as impl
+
+    return impl(x, block_size)
+
+
+def rotate_activation(x: torch.Tensor) -> torch.Tensor:
+    _require_tilelang_sm90()
+    from .qat import rotate_activation as impl
+
+    return impl(x)
+
+
+__all__ = [
+    "act_quant",
+    "fp4_act_quant",
+    "fp4_gemm",
+    "fp8_gemm",
+    "fp8_weight_quant_with_scale",
+    "fp8_simulate_qat",
+    "linear_bf16_fp32",
+    "rotate_activation",
+    "sparse_attn_tilelang",
+    "v4_lighting_indexer",
+]
