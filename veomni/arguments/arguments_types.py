@@ -324,7 +324,12 @@ class GradientCheckpointingConfig:
     )
     early_stop: bool = field(
         default=True,
-        metadata={"help": "Stop non-reentrant checkpoint recomputation as soon as all needed tensors are computed."},
+        metadata={
+            "help": (
+                "Stop non-reentrant checkpoint recomputation as soon as all needed tensors are computed. "
+                "PyTorch ignores this option when enable_reentrant=True."
+            )
+        },
     )
 
 

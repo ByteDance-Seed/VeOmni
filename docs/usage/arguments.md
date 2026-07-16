@@ -384,7 +384,7 @@ distinct from the first emission.
 | enable | `bool` | `True` | Enable gradient checkpointing. |
 | debug | `bool` | `False` | Enable [checkpoint debugging](https://docs.pytorch.org/docs/stable/checkpoint.html#torch.utils.checkpoint.set_checkpoint_debug_enabled). |
 | enable_reentrant | `bool` | `False` | Use reentrant gradient checkpointing. |
-| early_stop | `bool` | `True` | Stop non-reentrant checkpoint recomputation as soon as all needed tensors are computed. |
+| early_stop | `bool` | `True` | Stop non-reentrant checkpoint recomputation as soon as all needed tensors are computed. PyTorch ignores this option when `enable_reentrant=True`. |
 
 ### ChunkMBSConfig
 
