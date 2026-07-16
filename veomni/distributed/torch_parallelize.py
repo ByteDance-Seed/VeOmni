@@ -544,6 +544,7 @@ def build_parallelize_model(
             gradient_checkpointing_kwargs={
                 "use_reentrant": use_reentrant,
                 "context_fn": kwargs.pop("recompute_context_fn", noop_context_fn),
+                "early_stop": kwargs.pop("early_stop", True),
             },
         )
 

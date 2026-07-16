@@ -322,6 +322,10 @@ class GradientCheckpointingConfig:
         default=False,
         metadata={"help": "Use reentrant gradient checkpointing."},
     )
+    early_stop: bool = field(
+        default=True,
+        metadata={"help": "Stop non-reentrant checkpoint recomputation as soon as all needed tensors are computed."},
+    )
 
 
 @dataclass
