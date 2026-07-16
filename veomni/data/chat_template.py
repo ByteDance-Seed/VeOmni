@@ -100,9 +100,7 @@ class DefaultTemplate(ChatTemplate):
 class TokenizerTemplate(ChatTemplate):
     """Use a prefix-stable native chat template with assistant-only labels."""
 
-    def _update_prefix_labels(
-        self, previous_ids: List[int], current_ids: List[int], labels: List[int]
-    ) -> None:
+    def _update_prefix_labels(self, previous_ids: List[int], current_ids: List[int], labels: List[int]) -> None:
         """Validate that adding a message preserved the previously rendered prefix."""
         previous_length = len(previous_ids)
         if current_ids[:previous_length] != previous_ids:
@@ -164,13 +162,9 @@ class GptOssTokenizerTemplate(TokenizerTemplate):
         if self.return_token_id == tokenizer.unk_token_id or self.end_token_id == tokenizer.unk_token_id:
             raise ValueError("The GPT-OSS chat template requires <|return|> and <|end|> tokenizer tokens.")
 
-    def _update_prefix_labels(
-        self, previous_ids: List[int], current_ids: List[int], labels: List[int]
-    ) -> None:
+    def _update_prefix_labels(self, previous_ids: List[int], current_ids: List[int], labels: List[int]) -> None:
         previous_length = len(previous_ids)
-        rewritten_positions = [
-            index for index in range(previous_length) if previous_ids[index] != current_ids[index]
-        ]
+        rewritten_positions = [index for index in range(previous_length) if previous_ids[index] != current_ids[index]]
         if not rewritten_positions:
             return
 
