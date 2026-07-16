@@ -99,19 +99,20 @@ def _sp_add_link(d: Mapping[str, Any], link: torch.Tensor) -> dict[str, Any]:
     return out
 
 
-def _sp_broadcast_owner(kwargs: Mapping[str, Any], src_group_rank: int, group: Any) -> dict[str, Any]:
-    """Broadcast one owner's ``pre_forward`` return to the whole SP group.
+def _sp_broadcast_sample(kwargs: Mapping[str, Any], src_group_rank: int, group: Any) -> dict[str, Any]:
+    """Broadcast one sample's ``pre_forward`` return to the whole SP group.
 
     Every tensor value is broadcast from ``src_group_rank`` (autograd-aware); after
-    this, all ranks hold the owner's exact ``pre_forward`` output. Non-tensor values
-    are passed through unchanged — modules must derive anything owner-specific
-    (e.g. varlen ``cu_seqlens`` / ``max_length``) from the broadcast tensors inside
-    ``sp_pre_forward`` rather than relying on those pass-through leftovers.
+    this, all ranks hold that sample's exact ``pre_forward`` output. Non-tensor
+    values are passed through unchanged — modules must derive anything
+    sample-specific (e.g. varlen ``cu_seqlens`` / ``max_length``) from the
+    broadcast tensors inside ``sp_pre_forward`` rather than relying on those
+    pass-through leftovers.
     """
-    from veomni.distributed.sequence_parallel import sp_broadcast_from_owner
+    from veomni.distributed.sequence_parallel import sp_broadcast_from_rank
 
     return {
-        k: (sp_broadcast_from_owner(v, src_group_rank=src_group_rank, group=group) if torch.is_tensor(v) else v)
+        k: (sp_broadcast_from_rank(v, src_group_rank=src_group_rank, group=group) if torch.is_tensor(v) else v)
         for k, v in kwargs.items()
     }
 
@@ -123,34 +124,28 @@ def run_sp_looped_endpoint(
     method: str,
     kwargs: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """Drive a module's per-module SP endpoint one SP-group member at a time.
+    """Drive a module's per-module SP endpoint over the SP group's sample list.
 
-    The orchestrator pins outer SP to 1, so every rank owns a DISTINCT packed
+    The orchestrator pins outer SP to 1, so every rank holds a DISTINCT packed
     sample. Instead of concatenating the SP group's ``sp_size`` samples into one
-    forward (an ``sp_size``× activation spike), loop over the group and process
-    ONE owner's sample per iteration (micro-batch stays a single sample)::
+    forward (an ``sp_size``× activation spike), materialise the group's samples
+    one at a time and run the same loop on every rank::
 
-        for owner in range(sp_size):
-            data      = broadcast(owner's pre_forward output to the group)  # generic, here
-            sp_kwargs = raw.sp_pre_forward(**data)  # SLICE the shared data (module hook)
-            out       = <plain forward>             # modeling stays SP-unaware
-            out       = raw.sp_post_forward(owner)  # gather shard back to owner (module hook)
+        for sample_idx in range(sp_size):          # identical order on all ranks
+            data      = broadcast(rank sample_idx's pre_forward)  # ≡ list[all-gather][i]
+            sp_kwargs = raw.sp_pre_forward(**data)  # Ulysses / batch slice
+            out       = <plain forward>
+            out       = raw.sp_post_forward(**out)  # all-gather shards → full sample
 
-    then the graph runs ``post_forward`` once on this rank's OWN-owner output. The
-    broadcast is done HERE (whole-dict, axis-agnostic) so ``sp_pre_forward`` just
-    receives data every rank already shares and only slices it; the gather stays in
-    ``sp_post_forward`` because its concat axis is module-specific.
+    Every rank therefore builds the **same** autograd topology (broadcast →
+    slice → forward → all-gather) per sample. Returning only this rank's sample
+    for ``post_forward`` / the conversation carrier, while folding a fixed-order
+    zero-magnitude link over *all* sample outs, keeps every iteration reachable
+    from the loss with a rank-identical backward collective order.
 
-    A zero-magnitude dependency link is threaded iteration→iteration (and folded
-    into the returned own-output). It keeps every iteration reachable from the loss
-    on EVERY rank and pins the backward collective order (iteration ``sp_size-1`` →
-    ``0``) identically across ranks — the per-owner broadcast/gather collectives
-    must fire in matching order or they deadlock. Its value and gradient are
-    exactly zero. Callers MAY wrap this in ``no_reshard_after_forward(wrapped)`` so
-    the ``sp_size`` forwards all-gather FSDP2 params once — an opt-in memory/comm
-    tradeoff the graph gates on the YAML knob ``train.accelerator.fsdp_config.
-    sp_keep_params_unsharded`` (a large backbone kept unsharded for the whole burst
-    can OOM).
+    Callers MAY wrap this in ``no_reshard_after_forward(wrapped)`` so the
+    ``sp_size`` forwards all-gather FSDP2 params once — opt-in via
+    ``train.accelerator.fsdp_config.sp_keep_params_unsharded``.
     """
     from veomni.distributed.parallel_state import get_parallel_state
 
@@ -159,23 +154,23 @@ def run_sp_looped_endpoint(
     my_rank = ps.sp_rank
     group = ps.sp_group
 
-    own_out: dict[str, Any] | None = None
-    link: torch.Tensor | None = None
-    for owner in range(sp_size):
-        owner_kwargs = _sp_broadcast_owner(kwargs, src_group_rank=owner, group=group)
-        sp_kwargs = raw.sp_pre_forward(method=method, **owner_kwargs)
-        if link is not None:
-            sp_kwargs = _sp_add_link(sp_kwargs, link)
+    outs: list[dict[str, Any]] = []
+    for sample_idx in range(sp_size):
+        sample_kwargs = _sp_broadcast_sample(kwargs, src_group_rank=sample_idx, group=group)
+        sp_kwargs = raw.sp_pre_forward(method=method, **sample_kwargs)
         out = call_graph_endpoint(wrapped, raw, method=method, kwargs=sp_kwargs)
-        out = raw.sp_post_forward(method=method, owner=owner, **out)
-        link = _sp_zero_link(out)
-        if owner == my_rank:
-            own_out = out
+        out = raw.sp_post_forward(method=method, **out)
+        outs.append(out)
 
-    assert own_out is not None, "SP loop produced no own-owner output (sp_size < 1?)."
-    if link is not None:
-        own_out = _sp_add_link(own_out, link)
-    return own_out
+    # Carrier / post_forward only needs this rank's sample, but every rank must
+    # attach the *same* zero-link chain (sample 0 … sp_size-1) so backward visits
+    # collectives in lockstep.
+    local_out = dict(outs[my_rank])
+    for sample_out in outs:
+        link = _sp_zero_link(sample_out)
+        if link is not None:
+            local_out = _sp_add_link(local_out, link)
+    return local_out
 
 
 __all__ = ["call_graph_endpoint", "run_sp_looped_endpoint", "unwrap_graph_module"]

@@ -255,12 +255,35 @@ def sp_gather_seqs(local: Tensor, dim: int) -> Tuple[Tensor, List[int], int]:
 
 
 # torch dtype <-> stable integer code, for all-gathering dtypes across ranks.
+# Float codes stay first so ``_sp_unify_dtype`` can index the same table; int/bool
+# codes are only used by ``_BroadcastFromRankSP`` (which must allocate the
+# receive buffer in the *source rank's* dtype, including attention masks / cu_seqlens).
 _SP_DTYPE_CODES: Tuple[torch.dtype, ...] = (
     torch.float32,
     torch.float64,
     torch.float16,
     torch.bfloat16,
+    torch.int64,
+    torch.int32,
+    torch.int16,
+    torch.int8,
+    torch.uint8,
+    torch.bool,
 )
+_SP_FLOAT_DTYPE_CODES: Tuple[torch.dtype, ...] = _SP_DTYPE_CODES[:4]
+
+
+def _sp_dtype_to_code(dtype: torch.dtype) -> int:
+    try:
+        return _SP_DTYPE_CODES.index(dtype)
+    except ValueError as e:
+        raise TypeError(f"Unsupported dtype for SP collective metadata: {dtype}") from e
+
+
+def _sp_code_to_dtype(code: int) -> torch.dtype:
+    if code < 0 or code >= len(_SP_DTYPE_CODES):
+        raise TypeError(f"Unknown SP dtype code: {code}")
+    return _SP_DTYPE_CODES[code]
 
 
 def _sp_unify_dtype(local: Tensor, group: ProcessGroup, sp_size: int) -> Tensor:
@@ -268,9 +291,9 @@ def _sp_unify_dtype(local: Tensor, group: ProcessGroup, sp_size: int) -> Tensor:
 
     No-op unless the tensor is floating point AND the ranks disagree on dtype.
     """
-    if not local.is_floating_point() or local.dtype not in _SP_DTYPE_CODES:
+    if not local.is_floating_point() or local.dtype not in _SP_FLOAT_DTYPE_CODES:
         return local
-    code = _SP_DTYPE_CODES.index(local.dtype)
+    code = _SP_FLOAT_DTYPE_CODES.index(local.dtype)
     code_t = torch.tensor([code], device=local.device, dtype=torch.long)
     code_list = [torch.empty_like(code_t) for _ in range(sp_size)]
     dist.all_gather(code_list, code_t, group=group)
@@ -279,7 +302,7 @@ def _sp_unify_dtype(local: Tensor, group: ProcessGroup, sp_size: int) -> Tensor:
         return local
     promoted = local.dtype
     for c in codes:
-        promoted = torch.promote_types(promoted, _SP_DTYPE_CODES[c])
+        promoted = torch.promote_types(promoted, _SP_FLOAT_DTYPE_CODES[c])
     return local.to(promoted)
 
 
@@ -309,23 +332,19 @@ def sp_take_own_seq(full: Tensor, dim: int, seg_lengths: List[int], sp_rank: int
 # defeats SP's purpose (splitting ONE large sample).
 #
 # The looped path keeps the micro-batch at ONE sample: the graph driver
-# (``graphs/dispatch.run_sp_looped_endpoint``) loops over the SP group and, per
-# iteration, redistributes a single owner's sample across the whole group (standard
-# Ulysses on one sample) via the module's ``@sp_pre_forward`` / ``@sp_post_forward``
-# hooks, so the peak footprint is ≈ one sample sharded to ``1/sp_size`` rather than
-# ``sp_size`` samples.
+# (``graphs/dispatch.run_sp_looped_endpoint``) loops over the SP group's samples
+# (broadcast one sample's ``pre_forward`` → Ulysses slice → forward → all-gather
+# shards) so peak activation is ≈ one sample sharded to ``1/sp_size``, not a
+# concat of ``sp_size`` samples in one forward.
 #
-# * ``_BroadcastFromOwnerSP`` (input side) replaces the all-gather-concat: it
-#   broadcasts ONE owner's sample to the group (autograd-aware; backward sums the
-#   group's grads back to the owner). Only one sample is materialized at a time.
-# * ``_GatherToOwnerSP`` (output side) gathers the per-rank output shards to the
-#   iteration's OWNER only — the owner reconstructs its full sample, non-owners
-#   keep just their ``1/sp_size`` shard — so the output side never holds
-#   ``sp_size`` full samples either. Backward scatters the owner's grad back to
-#   every rank's shard.
-# * A zero-magnitude anchor keeps every iteration reachable from the loss on every
-#   rank, so all ranks traverse each iteration's collectives in the same
-#   (autograd-deterministic) order — no hang, no grad corruption.
+# * ``_BroadcastFromRankSP`` (input side): materialise ONE sample on every rank
+#   (autograd-aware). Equivalent to all-gathering a sample list then indexing —
+#   only one sample's inputs are live per iteration.
+# * ``sp_all_gather_shards`` (output side): all-gather equal Ulysses shards so
+#   EVERY rank reconstructs the same full sample (identical autograd topology).
+# * A zero-magnitude link folds every sample iteration into the returned local
+#   sample out in a **fixed sample order** on every rank, so autograd visits
+#   collectives identically.
 
 
 def _sp_global_rank(group: ProcessGroup, group_rank: int) -> int:
@@ -333,17 +352,16 @@ def _sp_global_rank(group: ProcessGroup, group_rank: int) -> int:
     return dist.get_global_rank(group, group_rank)
 
 
-class _BroadcastFromOwnerSP(torch.autograd.Function):
-    """Autograd-aware broadcast of ONE owner's tensor to the whole SP group.
+class _BroadcastFromRankSP(torch.autograd.Function):
+    """Autograd-aware broadcast of ONE rank's tensor to the whole SP group.
 
-    Forward broadcasts the owner's ``tensor`` (shape included, so peers need not
-    know the owner's per-sample length) from ``src_group_rank`` to every rank.
+    Forward broadcasts ``tensor`` (shape + dtype included, so peers need not know
+    the source length/dtype) from ``src_group_rank`` to every rank.
 
     Backward: the broadcast value was consumed by a *different* shard on each rank,
-    so the grad wrt the owner's tensor is the SUM of the group's grads (a reduce
-    onto the owner). Only the owner rank receives a grad for its input — peers pass
-    their own (unused) tensor and get ``None``, so across the ``sp_size`` calls a
-    rank makes (one per owner) only the ``i == my_rank`` call carries its grad.
+    so the grad wrt the source tensor is the SUM of the group's grads (a reduce
+    onto the source). Only the source rank receives a grad for its input — peers
+    pass their own (unused) tensor and get ``None``.
     """
 
     @staticmethod
@@ -352,10 +370,22 @@ class _BroadcastFromOwnerSP(torch.autograd.Function):
         src_global = _sp_global_rank(group, src_group_rank)
         is_src = my_rank == src_group_rank
 
-        # Broadcast the owner's rank/shape so peers can allocate a matching buffer.
-        # After each broadcast every rank holds the owner's value.
+        # Broadcast ndim / dtype / shape so peers can allocate a matching buffer.
+        # Peers MUST NOT use their local tensor's dtype: under per-module SP each
+        # rank owns a DISTINCT sample, and packed float embeds promote to a dtype
+        # that depends on which modalities that sample contains (e.g. bf16 text vs
+        # float32 vision). Allocating the receive buffer in the local dtype while
+        # the source sends another makes NCCL see mismatched byte counts and hang
+        # (same class of bug as ``sp_gather_seqs`` before ``_sp_unify_dtype``).
         ndim = torch.tensor([tensor.dim() if is_src else 0], device=tensor.device, dtype=torch.long)
         dist.broadcast(ndim, src=src_global, group=group)
+        dtype_code = torch.tensor(
+            [_sp_dtype_to_code(tensor.dtype) if is_src else 0],
+            device=tensor.device,
+            dtype=torch.long,
+        )
+        dist.broadcast(dtype_code, src=src_global, group=group)
+        dtype = _sp_code_to_dtype(int(dtype_code.item()))
         if is_src:
             shape = torch.tensor(list(tensor.shape), device=tensor.device, dtype=torch.long)
         else:
@@ -366,7 +396,7 @@ class _BroadcastFromOwnerSP(torch.autograd.Function):
         if is_src:
             buf = tensor.contiguous().clone()
         else:
-            buf = torch.empty(full_shape, dtype=tensor.dtype, device=tensor.device)
+            buf = torch.empty(full_shape, dtype=dtype, device=tensor.device)
         dist.broadcast(buf, src=src_global, group=group)
 
         ctx.group = group
@@ -382,79 +412,27 @@ class _BroadcastFromOwnerSP(torch.autograd.Function):
         return None, None, grad_tensor
 
 
-class _GatherToOwnerSP(torch.autograd.Function):
-    """Gather the group's per-rank output shards to ONE owner (dim-``dim`` concat).
+def sp_broadcast_from_rank(tensor: Tensor, src_group_rank: int, group: ProcessGroup) -> Tensor:
+    """Autograd-aware broadcast of one SP-rank's ``tensor`` to the whole ``group``.
 
-    Under Ulysses each rank holds an equal ``1/sp_size`` shard of the (padded)
-    sample. Forward gathers those shards onto ``dst_group_rank`` only and
-    concatenates them into the owner's full (padded) sample; peers keep their own
-    shard as a pass-through so it stays in the autograd graph (the caller anchors
-    it with a zero-magnitude term).
-
-    Backward: the owner splits its grad into ``sp_size`` shards and scatters them
-    back, so every rank recovers the grad of its own shard — peers ignore the
-    (zero) grad arriving from the anchor and use the scattered one instead.
+    Thin wrapper around :class:`_BroadcastFromRankSP`. Shape and dtype are part of
+    the protocol, so peers need not match the source locally.
     """
-
-    @staticmethod
-    def forward(ctx, group, dst_group_rank, dim, chunk):  # noqa: D401
-        sp_size = dist.get_world_size(group)
-        my_rank = dist.get_rank(group)
-        dst_global = _sp_global_rank(group, dst_group_rank)
-        chunk = chunk.contiguous()
-
-        ctx.group = group
-        ctx.dim = dim
-        ctx.dst_global = dst_global
-        ctx.is_dst = my_rank == dst_group_rank
-        ctx.sp_size = sp_size
-        ctx.chunk_shape = chunk.shape
-        ctx.chunk_dtype = chunk.dtype
-
-        if my_rank == dst_group_rank:
-            gathered = [torch.empty_like(chunk) for _ in range(sp_size)]
-            dist.gather(chunk, gather_list=gathered, dst=dst_global, group=group)
-            return torch.cat(gathered, dim=dim)
-        dist.gather(chunk, gather_list=None, dst=dst_global, group=group)
-        return chunk
-
-    @staticmethod
-    def backward(ctx, grad_out):
-        if ctx.is_dst:
-            grads = [g.contiguous() for g in grad_out.contiguous().chunk(ctx.sp_size, dim=ctx.dim)]
-            local_grad = torch.empty(ctx.chunk_shape, dtype=grad_out.dtype, device=grad_out.device)
-            dist.scatter(local_grad, scatter_list=grads, src=ctx.dst_global, group=ctx.group)
-            return None, None, None, local_grad
-        local_grad = torch.empty(ctx.chunk_shape, dtype=ctx.chunk_dtype, device=grad_out.device)
-        dist.scatter(local_grad, scatter_list=None, src=ctx.dst_global, group=ctx.group)
-        return None, None, None, local_grad
+    return _BroadcastFromRankSP.apply(group, src_group_rank, tensor)
 
 
-def sp_broadcast_from_owner(tensor: Tensor, src_group_rank: int, group: ProcessGroup) -> Tensor:
-    """Autograd-aware broadcast of one owner's ``tensor`` to the SP ``group``.
+def sp_all_gather_shards(chunk: Tensor, dim: int, group: ProcessGroup) -> Tensor:
+    """All-gather equal Ulysses shards along ``dim`` onto every SP rank.
 
-    The owner→all-ranks counterpart of :func:`sp_gather_to_owner` (all-ranks→owner).
-    Thin wrapper around :class:`_BroadcastFromOwnerSP` (see it for the backward
-    contract). The whole tensor (shape included) is broadcast, so there is no
-    axis/``dim`` to specify — every rank ends up holding the owner's exact tensor.
+    Symmetric output-side primitive for looped per-sample SP: after each sample's
+    sharded forward, every rank holds the same full (padded) sample and the same
+    autograd node. Backward all-reduces the replicated full grad and returns this
+    rank's shard (see :class:`~veomni.distributed.sequence_parallel.ulysses._Gather`).
     """
-    return _BroadcastFromOwnerSP.apply(group, src_group_rank, tensor)
+    return gather_outputs(chunk, gather_dim=dim, scale_grad=False, group=group)
 
 
-def sp_gather_to_owner(chunk: Tensor, dim: int, dst_group_rank: int, group: ProcessGroup) -> Tensor:
-    """Gather the group's shards of one sample to its owner along ``dim``.
-
-    Thin wrapper around :class:`_GatherToOwnerSP`.
-    """
-    return _GatherToOwnerSP.apply(group, dst_group_rank, dim, chunk)
-
-
-# The looped per-sample SP path now lives in the graph:
-# ``graphs/dispatch.run_sp_looped_endpoint`` drives the per-owner loop, threads the
-# deterministic backward-collective link, and broadcasts each owner's ``pre_forward``
-# output to the group with :func:`sp_broadcast_from_owner` (whole-dict, axis-agnostic
-# — no ``dim``). Modules then supply only the axis-aware halves: an ``@sp_pre_forward``
-# hook that slices the shared data, and an ``@sp_post_forward`` hook that calls
-# :func:`sp_gather_to_owner` along its own known axis. The primitives above
-# (``_BroadcastFromOwnerSP`` / ``_GatherToOwnerSP`` and their wrappers) are the
-# building blocks the driver and those hooks use.
+# Looped per-sample SP lives in ``graphs/dispatch.run_sp_looped_endpoint``:
+# broadcast each sample's ``pre_forward`` → ``@sp_pre_forward`` slice → forward →
+# ``@sp_post_forward`` via :func:`sp_all_gather_shards`, then a fixed-order
+# zero-link fold so every rank's backward visits sample iterations identically.

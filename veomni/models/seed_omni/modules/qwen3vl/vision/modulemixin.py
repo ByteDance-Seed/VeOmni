@@ -3,7 +3,7 @@ from typing import Any, Dict, List, NamedTuple, Optional, Tuple
 import torch
 
 from ......distributed.parallel_state import get_parallel_state
-from ......distributed.sequence_parallel import sp_gather_to_owner, sp_pad_and_slice
+from ......distributed.sequence_parallel import sp_all_gather_shards, sp_pad_and_slice
 from ....mixins.modulemixin import (
     CPUPreprocessor,
     ModuleMixin,
@@ -146,9 +146,9 @@ class Qwen3VLVisionEncoderModuleMixin(ModuleMixin):
     def init_omni_state(self) -> None:
         self._conversation_carrier: Any = None
         self._visual_output_slots: Optional[List[_VisualOutputSlot]] = None
-        # The active owner's real MERGED-token count, stashed by ``forward_sp_pre``
-        # so ``forward_sp_post`` can drop the sp-pad tail from the owner's gathered
-        # merged tokens on the iteration this rank IS the owner.
+        # Active sample's real MERGED-token count, stashed by ``forward_sp_pre``
+        # so ``forward_sp_post`` can drop the sp-pad tail from the all-gathered
+        # merged tokens.
         self._sp_own_len: Optional[int] = None
 
     def build_cpu_preprocessor(self) -> Optional[CPUPreprocessor]:
@@ -186,9 +186,9 @@ class Qwen3VLVisionEncoderModuleMixin(ModuleMixin):
         pixel_values, grid_thw, output_slots = self._process_visual_items(image_items, video_items)
         self._visual_output_slots = output_slots
         # SP-agnostic: process only THIS rank's own items. Under per-module SP the
-        # loop-head (``forward_sp_pre``) broadcasts one owner's patches/grid to the
+        # loop-head (``forward_sp_pre``) broadcasts one sample's patches/grid to the
         # group and Ulysses-shards them; ``vit_metadata`` built here is consumed only
-        # by the plain (SP-disabled) forward (it rebuilds it per owner otherwise).
+        # by the plain (SP-disabled) forward (it rebuilds it per sample otherwise).
         vit_metadata = self._build_vit_metadata(grid_thw.tolist()) if grid_thw is not None else None
         # ``is_dummy`` is only a non-SP inference/eval short-circuit (skip the ViT for
         # an all-dummy batch with no anchor). The per-module SP loop is a training path
@@ -208,18 +208,18 @@ class Qwen3VLVisionEncoderModuleMixin(ModuleMixin):
         image_grid_thw: torch.Tensor,
         **kwargs: Any,
     ) -> Dict[str, Any]:
-        """SP loop-head: hand this rank its Ulysses shard of ONE owner's flat patch
+        """SP loop-head: hand this rank its Ulysses shard of one sample's flat patch
         sequence.
 
-        The driver has broadcast the active owner's patches + ``grid_thw`` to the
-        whole group, so both are the SAME owner tensors on every rank. Pad+slice the
+        The driver has broadcast the active sample's patches + ``grid_thw`` to the
+        whole group, so both are the SAME tensors on every rank. Pad+slice the
         patches with ``pad_scale = spatial_merge_size**2`` (keeps each chunk aligned
         to merge-group boundaries) and rebuild the ViT ``cu_seqlens`` (+ sp-pad tail)
-        from the owner grid — the ViT slices its own pos-embeds / cos / sin internally
-        and runs the sp-pad tail segment. ``forward_sp_post`` gathers the merged tokens
-        back to the owner. ``is_dummy`` / the passed-through ``vit_metadata`` are
-        dropped (see ``forward_pre``): the SP path always encodes and rebuilds metadata
-        for the owner here.
+        from the sample grid — the ViT slices its own pos-embeds / cos / sin
+        internally and runs the sp-pad tail segment. ``forward_sp_post`` all-gathers
+        the merged tokens onto every rank. ``is_dummy`` / the passed-through
+        ``vit_metadata`` are dropped (see ``forward_pre``): the SP path always
+        encodes and rebuilds metadata for the active sample here.
         """
         del kwargs
         merge_area = self.config.vision_config.spatial_merge_size**2
@@ -230,7 +230,7 @@ class Qwen3VLVisionEncoderModuleMixin(ModuleMixin):
             "qwen3vl_vision SP requires spatial_merge_size**2 == 4 to match the patchgen ViT pad_scale, "
             f"got {merge_area}."
         )
-        # Owner's real merged-token count (drop the sp-pad tail with it in the loop-tail).
+        # Active sample's real merged-token count (drop the sp-pad tail in the loop-tail).
         self._sp_own_len = int(image_grid_thw.prod(dim=1).sum().item()) // merge_area
         pixel_values = sp_pad_and_slice(pixel_values, dim=0, pad_value=0, pad_scale=merge_area)
         vit_metadata = self._build_vit_metadata(image_grid_thw.tolist())
@@ -243,25 +243,22 @@ class Qwen3VLVisionEncoderModuleMixin(ModuleMixin):
     @sp_post_forward("forward")
     def forward_sp_post(
         self,
-        owner: int,
         image_embeds: torch.Tensor,
         deepstack_features: List[torch.Tensor],
         image_grid_thw: torch.Tensor,
         **kwargs: Any,
     ) -> Dict[str, Any]:
-        """SP loop-tail: gather this rank's Ulysses shard of the owner's merged tokens
-        (+ each deepstack layer) back to the ``owner`` along the token dim, and on the
-        iteration this rank IS the owner drop the sp-pad tail to its real merged count."""
+        """SP loop-tail: all-gather Ulysses shards of merged tokens (+ deepstack)
+        so every rank holds this sample, then drop the sp-pad tail."""
         del kwargs
         ps = get_parallel_state()
         group = ps.sp_group
 
-        def _to_owner(t: torch.Tensor) -> torch.Tensor:
-            t = sp_gather_to_owner(t, dim=0, dst_group_rank=owner, group=group)
-            return t.narrow(0, 0, self._sp_own_len) if owner == ps.sp_rank else t
+        def _to_all(t: torch.Tensor) -> torch.Tensor:
+            return sp_all_gather_shards(t, dim=0, group=group).narrow(0, 0, self._sp_own_len)
 
-        image_embeds = _to_owner(image_embeds)
-        deepstack_features = [_to_owner(layer) for layer in deepstack_features]
+        image_embeds = _to_all(image_embeds)
+        deepstack_features = [_to_all(layer) for layer in deepstack_features]
         return {
             "image_embeds": image_embeds,
             "deepstack_features": deepstack_features,

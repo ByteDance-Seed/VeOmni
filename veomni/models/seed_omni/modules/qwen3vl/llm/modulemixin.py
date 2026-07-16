@@ -3,7 +3,7 @@ from typing import Any, Dict, List, Optional
 import torch
 
 from veomni.distributed.parallel_state import get_parallel_state
-from veomni.distributed.sequence_parallel import slice_input_tensor, sp_gather_to_owner, sp_pad
+from veomni.distributed.sequence_parallel import slice_input_tensor, sp_all_gather_shards, sp_pad
 from veomni.utils.tensor_utils import naflatten, unflatten
 
 from ....mixins.modulemixin import ModuleMixin, post_forward, pre_forward, sp_post_forward, sp_pre_forward
@@ -24,9 +24,8 @@ class Qwen3VLLlmModuleMixin(ModuleMixin):
         self._pack_inputs_embeds_shape: Optional[torch.Tensor] = None
         self._past_key_values: Any = None
         self._next_position: int = 0
-        # This rank's OWN pre-pad packed length. Under per-module SP the loop-tail
-        # (``forward_sp_post``) narrows the owner's gathered (padded) output back to
-        # it on the iteration this rank is the owner.
+        # Active sample's pre-pad packed length. Under per-module SP the loop-tail
+        # (``forward_sp_post``) narrows the all-gathered (padded) output back to it.
         self._sp_own_len: Optional[int] = None
 
     @property
@@ -50,13 +49,13 @@ class Qwen3VLLlmModuleMixin(ModuleMixin):
         self._pack_inputs_embeds_shape = packed["inputs_embeds_shape"]
 
         # Normalize the visual side to always-broadcastable tensors: per-module SP
-        # ships ONE owner's ``forward_pre`` output to the group and the driver only
+        # ships one sample's ``forward_pre`` output to the group and the driver only
         # broadcasts tensors (not Python ``None`` / lists). So ``visual_pos_masks``
         # becomes a real (possibly all-False) bool tensor and the per-layer DeepStack
         # embeds become one stacked ``(num_layers, N, D)`` tensor (the generated
         # modeling indexes it per layer exactly like the list). The old cross-rank
         # reconciliation (all_gather_object cu_seqlens, MAX-reduce has_visual) is
-        # gone — each owner's sample is self-describing.
+        # gone — each sample is self-describing.
         inputs_embeds, visual_pos_masks, deepstack_visual_embeds = self._normalize_visual_inputs(
             inputs_embeds, packed["visual_pos_masks"], packed["deepstack_visual_embeds"]
         )
@@ -112,17 +111,17 @@ class Qwen3VLLlmModuleMixin(ModuleMixin):
         cu_seq_lens_q: torch.Tensor,
         **kwargs: Any,
     ) -> Dict[str, Any]:
-        """SP loop-head: slice ONE owner's (already-broadcast) packed sample to this
-        rank's Ulysses shard, including the M-RoPE positions and DeepStack rows.
+        """SP loop-head: slice one (already-broadcast) packed sample to this rank's
+        Ulysses shard, including the M-RoPE positions and DeepStack rows.
 
-        Every rank holds the owner's exact ``forward_pre`` output. Pad the sample to
-        a multiple of ``sp_size``, extend the full-sample varlen ``cu_seqlens`` with
-        the pad tail (the attention all-to-all reconstructs the full sequence before
-        the kernel), then hand this rank only its ``1/sp_size`` chunk of embeds
-        (dim 1), 3-row positions (dim 2) and ``visual_pos_masks`` (dim 1). The
-        DeepStack embeds are indexed by visual position, so slice out exactly the
-        rows whose visual tokens fall in this rank's chunk (``n_before`` skipped +
-        ``k_local`` kept).
+        Every rank holds the active sample's exact ``forward_pre`` output. Pad the
+        sample to a multiple of ``sp_size``, extend the full-sample varlen
+        ``cu_seqlens`` with the pad tail (the attention all-to-all reconstructs the
+        full sequence before the kernel), then hand this rank only its ``1/sp_size``
+        chunk of embeds (dim 1), 3-row positions (dim 2) and ``visual_pos_masks``
+        (dim 1). The DeepStack embeds are indexed by visual position, so slice out
+        exactly the rows whose visual tokens fall in this rank's chunk
+        (``n_before`` skipped + ``k_local`` kept).
         """
         del kwargs
         ps = get_parallel_state()
@@ -163,14 +162,13 @@ class Qwen3VLLlmModuleMixin(ModuleMixin):
         )
 
     @sp_post_forward("forward")
-    def forward_sp_post(self, owner: int, hidden_states: torch.Tensor, **kwargs: Any) -> Dict[str, Any]:
-        """SP loop-tail: gather this rank's output shard back to the ``owner`` and, on
-        the iteration this rank IS the owner, strip the SP padding to its own length."""
+    def forward_sp_post(self, hidden_states: torch.Tensor, **kwargs: Any) -> Dict[str, Any]:
+        """SP loop-tail: all-gather Ulysses shards so every rank holds this sample,
+        then strip SP padding to the sample's real length."""
         del kwargs
         ps = get_parallel_state()
-        hidden = sp_gather_to_owner(hidden_states, dim=1, dst_group_rank=owner, group=ps.sp_group)
-        if owner == ps.sp_rank:
-            hidden = hidden.narrow(1, 0, self._sp_own_len)
+        hidden = sp_all_gather_shards(hidden_states, dim=1, group=ps.sp_group)
+        hidden = hidden.narrow(1, 0, self._sp_own_len)
         return {"hidden_states": hidden, "past_key_values": None}
 
     @post_forward("forward")

@@ -799,11 +799,20 @@ def parallelize_model_ddp(
             fqn_to_index_mapping=kwargs.get("fqn_to_index_mapping"),
         )
 
+    # Per-module SP runs the DDP-wrapped module ``sp_size`` times before one
+    # backward (``run_sp_looped_endpoint``). DDP's default ``broadcast_buffers=True``
+    # does an in-place ``copy_`` on every buffer at the start of each forward —
+    # including constant index buffers such as Janus SigLIP's ``position_ids``
+    # that ``nn.Embedding`` saves for backward — which then fails autograd version
+    # checks (PyTorch #22095 / #66504). Disable buffer broadcast under SP; module
+    # weights still sync via the gradient allreduce. Non-SP DDP keeps the default
+    # (needed for BatchNorm running stats when those modules use DDP).
     return DDP(
         model,
         device_ids=[parallel_state.local_rank],
         process_group=parallel_state.dp_group,
         find_unused_parameters=True,
+        broadcast_buffers=parallel_state.sp_size <= 1,
     )
 
 

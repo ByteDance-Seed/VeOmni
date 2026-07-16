@@ -53,27 +53,37 @@ own `accelerator.ulysses_size`. Every rank loads its own DP shard directly (no
 rank-0-only dataloader / broadcast).
 
 A module declaring `ulysses_size = S > 1` has an SP group of `S` ranks each
-holding a **distinct** per-rank sequence; it must aggregate those `S` sequences,
-shard, run, then narrow back per-rank. The primitives
-(`distributed/sequence_parallel`):
+holding a **distinct** per-rank sequence. The graph driver
+(`graphs/dispatch.run_sp_looped_endpoint`) loops over the group's samples so
+every rank builds the **same** autograd topology (no gather-to-one-rank)::
 
-- `pre_forward`: `sp_gather_seqs(x, dim)` → `(full, seg_lengths, sp_rank)`
-  (autograd-aware; no-op when the module has no SP), then `sp_pad` +
-  `slice_input_tensor` / `sp_pad_and_slice` to this rank's chunk.
-- `post_forward`: `gather_outputs(...)` (drop the SP pad tail), then
-  `sp_take_own_seq(full, dim, seg_lengths, sp_rank)` to narrow back to
-  this rank's own segment before scattering onto its items.
+    for sample_idx in range(sp_size):
+        data = broadcast(rank sample_idx's pre_forward)   # sp_broadcast_from_rank
+        sp_kwargs = module.sp_pre_forward(**data)         # pad + Ulysses/batch slice
+        out = plain_forward(**sp_kwargs)
+        out = module.sp_post_forward(**out)               # sp_all_gather_shards → full sample
+
+Peak activation stays ≈ one sample / `sp_size`. The driver returns this rank's
+sample for `post_forward` / the carrier, folding a fixed-order zero-link over
+all sample outs so backward visits collectives in lockstep.
+
+Primitives (`distributed/sequence_parallel` + `@sp_pre_forward` / `@sp_post_forward`):
+
+- Loop input: `sp_broadcast_from_rank(tensor, src_group_rank, group)` (shape +
+  dtype in the protocol — peers must not assume the local sample's dtype).
+- Loop head (`@sp_pre_forward`): `sp_pad` + `slice_input_tensor` /
+  `sp_pad_and_slice` to this rank's chunk; stash the sample's real length.
+- Loop tail (`@sp_post_forward`): `sp_all_gather_shards(chunk, dim, group)` so
+  every rank holds the same full sample, then `narrow` off the SP pad.
 
 Which dim shards depends on the module's attention:
 - **Sequence-dim (Ulysses)** — text backbones (`qwen3/llm`, `janus/llama`) shard
   the packed token sequence; the Qwen3-VL ViT (`qwen3vl/vision`) shards the flat
-  patch sequence. Gather only the DATA (pixels **and** `grid_thw`, both through
-  `sp_gather_seqs` so they share group order), then DERIVE the ViT
-  cu_seqlens metadata from the post-gather `grid_thw` — mirroring the text
-  backbone deriving its FA `cu_seqlens` from the gathered `position_ids`. Do not
-  gather/rebuild the metadata separately.
-- **Batch-dim** — SigLIP (`janus/siglip`), whose ViT does not honor Ulysses,
-  shards the image batch instead.
+  patch sequence. Broadcast the DATA (pixels **and** `grid_thw`), then DERIVE
+  the ViT cu_seqlens metadata from the broadcast `grid_thw` — mirroring the text
+  backbone deriving its FA `cu_seqlens` from the broadcast `position_ids`.
+- **Batch-dim** — SigLIP (`janus/siglip`) / VQVAE (`janus/vqvae`), whose attention
+  does not honor Ulysses, shard the image batch instead.
 
 **Per-module group isolation.** Modules may run at *different* SP sizes in the
 same graph (e.g. ViT `ulysses_size=2` while the LLM runs `ulysses_size=4`). This

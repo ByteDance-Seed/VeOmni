@@ -3,7 +3,7 @@ from typing import Any, Dict, List, Optional
 import torch
 
 from veomni.distributed.parallel_state import get_parallel_state
-from veomni.distributed.sequence_parallel import slice_input_tensor, sp_gather_to_owner
+from veomni.distributed.sequence_parallel import slice_input_tensor, sp_all_gather_shards
 
 from ....mixins.metric_meter_mixin import MetricMeterMixin
 from ....mixins.modulemixin import (
@@ -72,9 +72,8 @@ class JanusSiglipModuleMixin(ModuleMixin):
     def init_omni_state(self) -> None:
         # Training state
         self._conversation_carrier: Any = None
-        # This rank's OWN image count. Under per-module SP the loop-tail
-        # (``forward_sp_post``) narrows the owner's gathered (batch-padded) embeds
-        # back to it on the iteration this rank is the owner.
+        # Active sample's image count. Under per-module SP the loop-tail
+        # (``forward_sp_post``) narrows the all-gathered (batch-padded) embeds to it.
         self._sp_own_len: Optional[int] = None
 
     def build_cpu_preprocessor(self) -> Optional[CPUPreprocessor]:
@@ -113,14 +112,12 @@ class JanusSiglipModuleMixin(ModuleMixin):
 
     @sp_pre_forward("forward")
     def forward_sp_pre(self, pixel_values: torch.Tensor, **kwargs: Any) -> Dict[str, Any]:
-        """SP loop-head: hand this rank its ``1/sp_size`` slice of ONE owner's image
-        batch (SigLIP shards the batch dim — its ViT attention is not Ulysses).
+        """SP loop-head: hand this rank its ``1/sp_size`` slice of one image batch
+        (SigLIP shards the batch dim — its ViT attention is not Ulysses).
 
-        The driver has already broadcast the active owner's image batch to the whole
-        group, so ``pixel_values`` is the SAME owner batch on every rank; pad it to a
-        multiple of ``sp_size`` and take this rank's contiguous chunk.
-        ``forward_sp_post`` gathers the per-image embeds back to the owner. ``is_dummy``
-        is intentionally dropped (see ``forward_pre``): the SP path always encodes.
+        The driver has broadcast the active sample's image batch to the whole group;
+        pad it to a multiple of ``sp_size`` and take this rank's contiguous chunk.
+        ``is_dummy`` is dropped (see ``forward_pre``): the SP path always encodes.
         """
         del kwargs
         self._sp_own_len = pixel_values.size(0)
@@ -128,15 +125,13 @@ class JanusSiglipModuleMixin(ModuleMixin):
         return {"pixel_values": pixel_values}
 
     @sp_post_forward("forward")
-    def forward_sp_post(self, owner: int, image_embeds: torch.Tensor, **kwargs: Any) -> Dict[str, Any]:
-        """SP loop-tail: gather this rank's per-image embed shard back to the ``owner``
-        (batch dim) and, on the iteration this rank IS the owner, drop the batch pad
-        tail back to its own image count."""
+    def forward_sp_post(self, image_embeds: torch.Tensor, **kwargs: Any) -> Dict[str, Any]:
+        """SP loop-tail: all-gather batch shards so every rank holds this sample's
+        image embeds, then drop the batch pad tail to the sample's real image count."""
         del kwargs
         ps = get_parallel_state()
-        image_embeds = sp_gather_to_owner(image_embeds, dim=0, dst_group_rank=owner, group=ps.sp_group)
-        if owner == ps.sp_rank:
-            image_embeds = image_embeds.narrow(0, 0, self._sp_own_len)
+        image_embeds = sp_all_gather_shards(image_embeds, dim=0, group=ps.sp_group)
+        image_embeds = image_embeds.narrow(0, 0, self._sp_own_len)
         return {"image_embeds": image_embeds}
 
     def _metric_meter_stash_tokens(self, num_images: int) -> None:

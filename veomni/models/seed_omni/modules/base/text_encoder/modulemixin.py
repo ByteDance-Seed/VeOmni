@@ -5,7 +5,7 @@ import torch
 import torch.nn.functional as F
 
 from veomni.distributed.parallel_state import get_parallel_state
-from veomni.distributed.sequence_parallel import slice_input_tensor, sp_gather_to_owner, sp_pad
+from veomni.distributed.sequence_parallel import slice_input_tensor, sp_all_gather_shards, sp_pad
 from veomni.utils.tensor_utils import naflatten, unflatten
 
 from ....mixins.metric_meter_mixin import MetricMeterMixin
@@ -35,9 +35,8 @@ class TextEncoderModuleMixin(ModuleMixin):
         # Training state
         self._conversation_carrier: Any = None
         self._encode_batch_shape: torch.LongTensor | None = None
-        # This rank's OWN packed token count. Under per-module SP the encode loop-tail
-        # (``encode_sp_post``) narrows the owner's gathered (seq-padded) embeds back to
-        # it on the iteration this rank is the owner.
+        # Active sample's packed token count. Under per-module SP the encode loop-tail
+        # (``encode_sp_post``) narrows the all-gathered (seq-padded) embeds to it.
         self._sp_own_len: Optional[int] = None
 
         # Inference state
@@ -79,14 +78,12 @@ class TextEncoderModuleMixin(ModuleMixin):
 
     @sp_pre_forward("encode")
     def encode_sp_pre(self, input_ids: torch.Tensor, **kwargs: Any) -> Dict[str, Any]:
-        """SP loop-head: hand this rank its ``1/sp_size`` slice of ONE owner's flat
-        packed token sequence (wte is a per-token lookup, so slicing is exact — this
-        mirrors VeOmni's whole-model SP where the embedding is sequence-sharded).
+        """SP loop-head: hand this rank its ``1/sp_size`` slice of one packed token
+        sequence (wte is a per-token lookup, so slicing is exact — mirrors VeOmni's
+        whole-model SP where the embedding is sequence-sharded).
 
-        The driver has broadcast the active owner's ``input_ids`` to the whole group,
-        so it is the SAME owner sequence on every rank; pad it to a multiple of
-        ``sp_size`` and take this rank's contiguous chunk. ``encode_sp_post`` gathers
-        the embeds back to the owner."""
+        The driver has broadcast the active sample's ``input_ids`` to the whole group;
+        pad it to a multiple of ``sp_size`` and take this rank's contiguous chunk."""
         del kwargs
         self._sp_own_len = input_ids.size(0)
         input_ids = sp_pad(input_ids, dim=0, pad_value=0)
@@ -94,21 +91,20 @@ class TextEncoderModuleMixin(ModuleMixin):
         return {"input_ids": input_ids}
 
     @sp_post_forward("encode")
-    def encode_sp_post(self, owner: int, inputs_embeds: torch.Tensor, **kwargs: Any) -> Dict[str, Any]:
-        """SP loop-tail: gather this rank's embed shard back to the ``owner`` (token
-        dim) and, on the iteration this rank IS the owner, drop the seq pad tail back
-        to its own packed length so the carrier returns to the per-rank layout."""
+    def encode_sp_post(self, inputs_embeds: torch.Tensor, **kwargs: Any) -> Dict[str, Any]:
+        """SP loop-tail: all-gather token shards so every rank holds this sample's
+        embeds, then drop the seq pad tail to the sample's real packed length."""
         del kwargs
         ps = get_parallel_state()
-        inputs_embeds = sp_gather_to_owner(inputs_embeds, dim=0, dst_group_rank=owner, group=ps.sp_group)
-        if owner == ps.sp_rank:
-            inputs_embeds = inputs_embeds.narrow(0, 0, self._sp_own_len)
+        inputs_embeds = sp_all_gather_shards(inputs_embeds, dim=0, group=ps.sp_group)
+        inputs_embeds = inputs_embeds.narrow(0, 0, self._sp_own_len)
         return {"inputs_embeds": inputs_embeds}
 
     @post_forward("encode")
     def encode_post(self, inputs_embeds: torch.Tensor) -> Dict[str, Any]:
-        # Under per-module SP the loop-tail (``encode_sp_post``) has already gathered
-        # this rank's own embeds back, so the packed length matches its carrier here.
+        # Under per-module SP the loop-tail (``encode_sp_post``) has already
+        # all-gathered + narrowed to this rank's sample, so packed length matches
+        # its carrier here.
         conversation = self._conversation_carrier
         self._conversation_carrier = None
         batch_shape = self._encode_batch_shape
@@ -128,7 +124,7 @@ class TextEncoderModuleMixin(ModuleMixin):
         # ``reduce_sequence_parallel_loss``), so each rank scoring only its OWN span
         # yields the identical global loss + gradient regardless of the DP/SP split.
         # Skipping the gather-concat keeps peak logits at this rank's own span (the
-        # per-owner loop's gather-to-owner does not fit a single fsdp-reduced scalar).
+        # looped SP path does not fit a single fsdp-reduced scalar).
         return {"hidden_states": hidden_states, "shift_labels": shift_labels}
 
     @post_forward("decode")

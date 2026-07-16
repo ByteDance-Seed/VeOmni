@@ -3,7 +3,7 @@ from typing import Any, Dict, List, Optional
 import torch
 
 from veomni.distributed.parallel_state import get_parallel_state
-from veomni.distributed.sequence_parallel import slice_input_tensor, sp_gather_to_owner, sp_pad
+from veomni.distributed.sequence_parallel import slice_input_tensor, sp_all_gather_shards, sp_pad
 from veomni.utils.seqlen_pos_transform_utils import prepare_fa_kwargs_from_position_ids, valid_seqlens_from_cu_seqlens
 from veomni.utils.tensor_utils import naflatten, unflatten
 
@@ -67,13 +67,13 @@ class Qwen3LlmModuleMixin(ModuleMixin):
         position_ids: torch.Tensor,
         **kwargs: Any,
     ) -> Dict[str, Any]:
-        """SP loop-head: slice ONE owner's (already-broadcast) packed sample to this
-        rank's Ulysses shard (+ per-shard ``cu_seqlens``).
+        """SP loop-head: slice one (already-broadcast) packed sample to this rank's
+        Ulysses shard (+ per-shard ``cu_seqlens``).
 
-        The graph driver has already broadcast the active owner's ``forward_pre``
+        The graph driver has already broadcast the active sample's ``forward_pre``
         output to the whole SP group, so ``inputs_embeds`` / ``attention_mask`` /
-        ``position_ids`` are the SAME owner sample on every rank. This hook pads them
-        to a multiple of ``sp_size``, builds the FA varlen ``cu_seqlens`` over the
+        ``position_ids`` are the SAME on every rank. This hook pads them to a
+        multiple of ``sp_size``, builds the FA varlen ``cu_seqlens`` over the
         padded sample (the attention all-to-all reconstructs the full sequence before
         the kernel, so mask/lengths stay full), then hands this rank only its
         ``1/sp_size`` chunk. The full-sample ``cu_seqlens`` from ``forward_pre`` (in
@@ -81,11 +81,8 @@ class Qwen3LlmModuleMixin(ModuleMixin):
         """
         del kwargs
         group = get_parallel_state().sp_group
-        # The active owner's true (pre-pad) packed length. ``sp_pre``/``sp_post`` run
-        # as a pair per iteration and the narrow in ``forward_sp_post`` only fires
-        # when ``owner == sp_rank`` — where the broadcast data IS this rank's own
-        # sample — so this is exactly this rank's own length on the iteration that
-        # matters.
+        # Active sample's true (pre-pad) packed length; ``forward_sp_post`` narrows
+        # the all-gathered output with it.
         self._sp_own_len = inputs_embeds.size(1)
         embeds = sp_pad(inputs_embeds, dim=1, pad_value=0)
         mask = sp_pad(attention_mask, dim=1, pad_value=1)
@@ -104,24 +101,13 @@ class Qwen3LlmModuleMixin(ModuleMixin):
         )
 
     @sp_post_forward("forward")
-    def forward_sp_post(self, owner: int, hidden_states: torch.Tensor, **kwargs: Any) -> Dict[str, Any]:
-        """SP loop-tail: gather this rank's output shard back to the ``owner``.
-
-        ``owner`` is the gather DESTINATION the driver dispatches — NOT a retention
-        decision (the driver keeps only this rank's own-owner output via ``own_out``).
-        The destination rank reconstructs the owner's full (SP-padded) sample and
-        strips the padding it added in ``forward_sp_pre`` — that un-pad is SP-specific
-        cleanup, so it lives here rather than leaking into the SP-agnostic
-        ``forward_post``. Non-destination ranks return their own shard as a
-        pass-through (kept in the autograd graph by the driver's dependency link).
-        """
+    def forward_sp_post(self, hidden_states: torch.Tensor, **kwargs: Any) -> Dict[str, Any]:
+        """SP loop-tail: all-gather Ulysses shards so every rank holds this sample,
+        then strip the pad from ``forward_sp_pre``."""
         del kwargs
         ps = get_parallel_state()
-        hidden = sp_gather_to_owner(hidden_states, dim=1, dst_group_rank=owner, group=ps.sp_group)
-        # I am the gather destination ⇒ I hold the owner's full padded sample; bring it
-        # back to this rank's own packed length (its true, pre-pad length).
-        if owner == ps.sp_rank:
-            hidden = hidden.narrow(1, 0, self._sp_own_len)
+        hidden = sp_all_gather_shards(hidden_states, dim=1, group=ps.sp_group)
+        hidden = hidden.narrow(1, 0, self._sp_own_len)
         return {"hidden_states": hidden, "past_key_values": None}
 
     @post_forward("forward")

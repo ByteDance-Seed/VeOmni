@@ -255,13 +255,13 @@ class TrainingGraph:
                 raw.metric_meter_add(method, kwargs)
 
             if self._use_sp_loop(raw, method):
-                # Per-module SP (Ulysses): run the endpoint once per SP-group member
-                # (broadcast owner → slice → forward → gather-to-owner). ``post_forward``
-                # still runs once, on this rank's own-owner output. Modeling stays
-                # SP-unaware. Optionally wrap in ``no_reshard_after_forward`` so those
-                # ``sp_size`` forwards all-gather FSDP2 params once instead of per
-                # forward — opt-in per module via the YAML knob ``train.accelerator.
-                # fsdp_config.sp_keep_params_unsharded`` (read at this use-site from
+                # Per-module SP (Ulysses): run the endpoint once per SP-group sample
+                # (broadcast sample → slice → forward → all-gather shards). ``post_forward``
+                # still runs once, on this rank's own sample. Modeling stays SP-unaware.
+                # Optionally wrap in ``no_reshard_after_forward`` so those ``sp_size``
+                # forwards all-gather FSDP2 params once instead of per forward — opt-in
+                # per module via the YAML knob ``train.accelerator.fsdp_config.
+                # sp_keep_params_unsharded`` (read at this use-site from
                 # ``sp_keep_unsharded_fn``, which the OmniModel resolves off its config),
                 # since keeping a large backbone's params resident for the whole burst
                 # can OOM; the memory-safe default (knob absent/False) re-fires the FSDP
