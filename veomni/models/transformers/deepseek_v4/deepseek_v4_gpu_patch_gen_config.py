@@ -35,8 +35,9 @@ Patches:
    so callers can read per-token log-probs / entropy alongside the loss.
 5. ``DeepseekV4RMSNorm.forward`` — matches the official inference path's
    FP32 weight multiply followed by a single cast to the input dtype.
-6. ``DeepseekV4RotaryEmbedding.forward`` — retains FP32 cos/sin tables so
-   partial RoPE matches the official complex-FP32 multiply.
+6. ``DeepseekV4RotaryEmbedding.forward`` — retains FP32 cos/sin tables for
+   official-compatible inference and casts them to the activation dtype during
+   training so FSDP activation-checkpoint recomputation sees stable metadata.
 7. ``DeepseekV4Attention.forward`` — matches the official BF16 per-head Q
    normalization before RoPE.
 8. ``DeepseekV4TopKRouter.forward`` / ``DeepseekV4HashRouter.forward`` —
@@ -54,8 +55,8 @@ Intentionally NOT patched:
   the unweighted form used inside the HCA/CSA compressors already matches the
   official inference path. The weighted form is patched above without using
   LigerRMSNorm, whose replacement would shadow the distinct unweighted
-  variant. RoPE-determinism / batch-invariant RMSNorm remain separate runtime
-  concerns for future ``device_patch.py`` infra (mirroring DeepseekV3).
+  variant. Batch-invariant RMSNorm remains a separate runtime concern for
+  future ``device_patch.py`` infra (mirroring DeepseekV3).
 - ``LigerSwiGLUMLP`` — ``DeepseekV4MLP`` is used as ``shared_experts`` with
   a custom ``moe_intermediate_size`` (via
   ``attribute_map["intermediate_size"] = "moe_intermediate_size"``).
@@ -219,11 +220,11 @@ def deepseek_v4_rms_norm_forward_patched(self, hidden_states: torch.Tensor) -> t
 
 
 # ================================================================
-# Patch: official RoPE table precision
+# Patch: official RoPE table precision and checkpoint-stable training dtype
 # ================================================================
 @config.override_method(
     "DeepseekV4RotaryEmbedding.forward",
-    description="Retain FP32 cos/sin tables for the official complex-FP32 RoPE arithmetic",
+    description="Retain FP32 cos/sin for inference and use activation dtype for checkpoint-stable training",
 )
 def deepseek_v4_rotary_embedding_forward_patched(self, x, position_ids, layer_type=None):
     inv_freq = getattr(self, f"{layer_type}_inv_freq")
@@ -235,6 +236,8 @@ def deepseek_v4_rotary_embedding_forward_patched(self, x, position_ids, layer_ty
         freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
         cos = freqs.cos() * attention_scaling
         sin = freqs.sin() * attention_scaling
+    if self.training:
+        return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
     return cos, sin
 
 

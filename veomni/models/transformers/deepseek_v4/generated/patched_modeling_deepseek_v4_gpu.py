@@ -12,7 +12,7 @@
 #    - method_override: DeepseekV4RMSNorm.forward
 #      Multiply normalized activations and weights in FP32 before casting to the input dtype
 #    - method_override: DeepseekV4RotaryEmbedding.forward
-#      Retain FP32 cos/sin tables for the official complex-FP32 RoPE arithmetic
+#      Retain FP32 cos/sin for inference and use activation dtype for checkpoint-stable training
 #    - method_override: DeepseekV4HyperConnection.forward
 #      Dispatch DeepSeek V4 mHC pre/Sinkhorn/collapse through an OpSlot
 #    - method_override: DeepseekV4HyperHead.forward
@@ -238,7 +238,7 @@ class DeepseekV4RotaryEmbedding(nn.Module):
         return inv_freq, attention_factor
 
     # ================================================================
-    # Patch: official RoPE table precision
+    # Patch: official RoPE table precision and checkpoint-stable training dtype
     # ================================================================
     @torch.no_grad()
     @dynamic_rope_update  # power user: used with advanced RoPE types (e.g. dynamic rope)
@@ -252,6 +252,8 @@ class DeepseekV4RotaryEmbedding(nn.Module):
             freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
             cos = freqs.cos() * attention_scaling
             sin = freqs.sin() * attention_scaling
+        if self.training:
+            return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
         return cos, sin
 
 

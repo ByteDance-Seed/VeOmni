@@ -124,13 +124,19 @@ def test_deepseek_v4_shared_expert_matches_official_clamped_fp32_swiglu():
     assert not torch.equal(actual, unclamped)
 
 
-def test_deepseek_v4_attention_matches_official_q_norm_and_fp32_rope(monkeypatch):
+def test_deepseek_v4_attention_matches_official_q_norm_and_rope_dtype_modes(monkeypatch):
     config = dsv4.DeepseekV4Config.from_pretrained("tests/toy_config/deepseek_v4_toy")
     torch.manual_seed(42)
     attention = dsv4.DeepseekV4Attention(config, layer_idx=0).to(torch.bfloat16).eval()
     hidden_states = torch.randn(1, 7, config.hidden_size, dtype=torch.bfloat16)
     position_ids = torch.arange(hidden_states.shape[1]).unsqueeze(0)
-    rotary = dsv4.DeepseekV4RotaryEmbedding(config)
+    rotary = dsv4.DeepseekV4RotaryEmbedding(config).train()
+    train_cos, train_sin = rotary(hidden_states, position_ids, layer_type="main")
+
+    assert train_cos.dtype == hidden_states.dtype
+    assert train_sin.dtype == hidden_states.dtype
+
+    rotary.eval()
     cos, sin = rotary(hidden_states, position_ids, layer_type="main")
 
     assert cos.dtype == torch.float32
