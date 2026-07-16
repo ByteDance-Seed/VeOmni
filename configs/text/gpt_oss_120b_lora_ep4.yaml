@@ -36,7 +36,7 @@ data:
   train_size: 20000000
   datasets_type: mapping
   data_type: conversation
-  chat_template: tokenizer
+  chat_template: gpt_oss
   max_seq_len: 4096
   text_keys: messages
   dyn_bsz_buffer_size: 200

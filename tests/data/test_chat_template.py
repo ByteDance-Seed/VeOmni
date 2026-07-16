@@ -1,11 +1,15 @@
 import pytest
 
-from veomni.data.chat_template import TokenizerTemplate
+from veomni.data.chat_template import GptOssTokenizerTemplate, TokenizerTemplate
 from veomni.utils.constants import IGNORE_INDEX
 
 
 class _PrefixStableTokenizer:
     chat_template = "{{ messages }}"
+    unk_token_id = -1
+
+    def convert_tokens_to_ids(self, token):
+        return {"<|return|>": 51, "<|end|>": 50}.get(token, self.unk_token_id)
 
     def apply_chat_template(self, messages, **kwargs):
         role_ids = {"system": 1, "user": 2, "assistant": 3, "tool": 4}
@@ -31,7 +35,7 @@ def test_tokenizer_template_masks_non_assistant_turns_and_truncates():
     }
 
 
-def test_tokenizer_template_supports_terminal_token_rewrite():
+def test_gpt_oss_tokenizer_template_supports_terminal_token_rewrite():
     class TerminalRewritingTokenizer(_PrefixStableTokenizer):
         def apply_chat_template(self, messages, **kwargs):
             encoded = super().apply_chat_template(messages, **kwargs)
@@ -44,7 +48,7 @@ def test_tokenizer_template_supports_terminal_token_rewrite():
                 encoded["input_ids"][-1] = 51
             return encoded
 
-    template = TokenizerTemplate(TerminalRewritingTokenizer())
+    template = GptOssTokenizerTemplate(TerminalRewritingTokenizer())
     encoded = template.encode_messages(
         [
             {"role": "user", "content": [10]},
@@ -79,8 +83,26 @@ def test_tokenizer_template_rejects_structural_prefix_rewrite():
         )
 
 
+def test_tokenizer_template_rejects_terminal_rewrite():
+    class TerminalRewritingTokenizer(_PrefixStableTokenizer):
+        def apply_chat_template(self, messages, **kwargs):
+            if len(messages) == 1:
+                return {"input_ids": [99, 3, 51]}
+            return {"input_ids": [99, 3, 50, 2, 30]}
+
+    template = TokenizerTemplate(TerminalRewritingTokenizer())
+
+    with pytest.raises(ValueError, match="prefix-stable"):
+        template.encode_messages(
+            [
+                {"role": "assistant", "content": [20]},
+                {"role": "user", "content": [30]},
+            ]
+        )
+
+
 @pytest.mark.parametrize("inserted_tokens", [[], [77]])
-def test_tokenizer_template_rejects_insertion_at_terminal_boundary(inserted_tokens):
+def test_gpt_oss_tokenizer_template_rejects_insertion_at_terminal_boundary(inserted_tokens):
     class BoundaryInsertionTokenizer(_PrefixStableTokenizer):
         def apply_chat_template(self, messages, **kwargs):
             if len(messages) == 1:
@@ -90,7 +112,7 @@ def test_tokenizer_template_rejects_insertion_at_terminal_boundary(inserted_toke
             # displaced instead of replaced.
             return {"input_ids": [99, 3, 50, *inserted_tokens, 51, 2, 30]}
 
-    template = TokenizerTemplate(BoundaryInsertionTokenizer())
+    template = GptOssTokenizerTemplate(BoundaryInsertionTokenizer())
 
     with pytest.raises(ValueError, match="structurally rewrote"):
         template.encode_messages(

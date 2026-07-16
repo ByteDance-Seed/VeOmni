@@ -98,7 +98,18 @@ class DefaultTemplate(ChatTemplate):
 
 @CHAT_TEMPLATE_REGISTRY.register("tokenizer")
 class TokenizerTemplate(ChatTemplate):
-    """Use the tokenizer's native chat template with assistant-only labels."""
+    """Use a prefix-stable native chat template with assistant-only labels."""
+
+    def _update_prefix_labels(
+        self, previous_ids: List[int], current_ids: List[int], labels: List[int]
+    ) -> None:
+        """Validate that adding a message preserved the previously rendered prefix."""
+        previous_length = len(previous_ids)
+        if current_ids[:previous_length] != previous_ids:
+            raise ValueError(
+                "The tokenizer chat template structurally rewrote an earlier conversation prefix; "
+                "the generic tokenizer template requires prefix-stable rendering."
+            )
 
     def encode_messages(self, messages: Sequence[Dict[str, str]], max_seq_len: int = 8192) -> Dict[str, List[int]]:
         input_ids: List[int] = []
@@ -120,26 +131,7 @@ class TokenizerTemplate(ChatTemplate):
                     "assistant-only loss masking requires monotonic message boundaries."
                 )
 
-            rewritten_positions = [index for index in range(previous_length) if input_ids[index] != current_ids[index]]
-            is_safe_terminal_rewrite = False
-            if rewritten_positions == [previous_length - 1] and current_length > previous_length:
-                # A substitution is safe only when the old terminal was not
-                # shifted into the appended suffix, which would be an insertion.
-                is_safe_terminal_rewrite = input_ids[-1] not in current_ids[previous_length:]
-
-            if rewritten_positions and not is_safe_terminal_rewrite:
-                raise ValueError(
-                    "The tokenizer chat template structurally rewrote an earlier conversation prefix; "
-                    "only terminal-token substitutions are supported."
-                )
-
-            # Native templates may rewrite an earlier terminal token as the
-            # conversation grows (GPT-OSS changes <|return|> to <|end|>).
-            # Preserve the existing loss mask while keeping labeled token IDs
-            # aligned with the final rendering.
-            for index in rewritten_positions:
-                if labels[index] != IGNORE_INDEX:
-                    labels[index] = current_ids[index]
+            self._update_prefix_labels(input_ids, current_ids, labels)
 
             loss_mask = message.get("loss_mask", 1 if message["role"] == "assistant" else 0)
             new_ids = current_ids[previous_length:]
@@ -159,6 +151,44 @@ class TokenizerTemplate(ChatTemplate):
         if not self.tokenizer.chat_template:
             raise ValueError("The tokenizer does not define a native chat template.")
         return self.tokenizer.chat_template
+
+
+@CHAT_TEMPLATE_REGISTRY.register("gpt_oss")
+class GptOssTokenizerTemplate(TokenizerTemplate):
+    """GPT-OSS native template with its terminal assistant-token rewrite."""
+
+    def __init__(self, tokenizer: "PreTrainedTokenizer") -> None:
+        super().__init__(tokenizer)
+        self.return_token_id = tokenizer.convert_tokens_to_ids("<|return|>")
+        self.end_token_id = tokenizer.convert_tokens_to_ids("<|end|>")
+        if self.return_token_id == tokenizer.unk_token_id or self.end_token_id == tokenizer.unk_token_id:
+            raise ValueError("The GPT-OSS chat template requires <|return|> and <|end|> tokenizer tokens.")
+
+    def _update_prefix_labels(
+        self, previous_ids: List[int], current_ids: List[int], labels: List[int]
+    ) -> None:
+        previous_length = len(previous_ids)
+        rewritten_positions = [
+            index for index in range(previous_length) if previous_ids[index] != current_ids[index]
+        ]
+        if not rewritten_positions:
+            return
+
+        is_terminal_rewrite = (
+            rewritten_positions == [previous_length - 1]
+            and len(current_ids) > previous_length
+            and previous_ids[-1] == self.return_token_id
+            and current_ids[previous_length - 1] == self.end_token_id
+            and self.return_token_id not in current_ids[previous_length:]
+        )
+        if not is_terminal_rewrite:
+            raise ValueError(
+                "The GPT-OSS tokenizer chat template structurally rewrote an earlier conversation prefix; "
+                "only the terminal <|return|>-to-<|end|> substitution is supported."
+            )
+
+        if labels[-1] != IGNORE_INDEX:
+            labels[-1] = self.end_token_id
 
 
 @CHAT_TEMPLATE_REGISTRY.register("llama2")
