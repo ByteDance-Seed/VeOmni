@@ -1,0 +1,57 @@
+model:
+  model_path: DeepSeek-V4-Flash-Base
+  ops_implementation:
+    attn_implementation: eager
+    moe_implementation: fused_triton
+    cross_entropy_loss_implementation: liger_kernel
+    dsa_attention_backend: tilelang_sparse
+    dsa_indexer_backend: tilelang
+    mhc_backend: tile_kernels
+    rms_norm_implementation: liger_kernel
+    swiglu_mlp_implementation: liger_kernel
+
+data:
+  train_path: tulu-3-sft-mixture
+  data_type: conversation
+  chat_template: chatml
+  max_seq_len: 2048
+  train_size: 100000000
+  text_keys: messages
+  dyn_bsz_buffer_size: 200
+
+train:
+  dyn_bsz: false
+  accelerator:
+    ulysses_size: 1
+    ep_size: 1
+    fsdp_config:
+      fsdp_mode: fsdp2
+      mixed_precision:
+        enable: true
+    offload:
+      enable_activation: false
+  gradient_checkpointing:
+    enable: false
+  global_batch_size: 8
+  micro_batch_size: 1
+  bsz_warmup_ratio: 0.007
+  optimizer:
+    type: adamw
+    lr: 3.0e-4
+    lr_warmup_ratio: 0.007
+    lr_decay_style: constant
+    lr_decay_ratio: 1.0
+    weight_decay: 0.01
+    max_grad_norm: 1.0
+  init_device: meta
+  enable_full_determinism: false
+  max_steps: 1
+  empty_cache_steps: 500
+  checkpoint:
+    output_dir: deepseek_v4_flash_base_tulu_sft
+    manager: dcp
+    save_steps: 100
+    save_hf_weights: true
+  wandb:
+    project: VeOmni
+    name: deepseek_v4_flash_base_tulu_sft
