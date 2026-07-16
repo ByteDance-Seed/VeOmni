@@ -24,9 +24,7 @@ from contextlib import contextmanager
 from time import perf_counter
 from typing import Iterator
 
-import torch
-
-from ....utils.device import get_torch_device
+from ....utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE, get_torch_device
 
 
 class GraphProfiler:
@@ -50,9 +48,10 @@ class GraphProfiler:
     def node(self, line: str) -> Iterator[None]:
         start_wall = perf_counter() if self.enable_wall_time else None
         start_event = end_event = None
-        if self.enable_cuda_events and torch.cuda.is_available():
-            start_event = torch.cuda.Event(enable_timing=True)
-            end_event = torch.cuda.Event(enable_timing=True)
+        if self.enable_cuda_events and (IS_CUDA_AVAILABLE or IS_NPU_AVAILABLE):
+            device = get_torch_device()
+            start_event = device.Event(enable_timing=True)
+            end_event = device.Event(enable_timing=True)
             start_event.record()
 
         try:

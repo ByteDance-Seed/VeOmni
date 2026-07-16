@@ -123,7 +123,14 @@ class PositionEmbedding(nn.Module):
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
-        self.pos_embed.data.copy_(_get_2d_sincos_pos_embed(self.hidden_size, self.max_num_patch_per_side))
+        new_data = _get_2d_sincos_pos_embed(self.hidden_size, self.max_num_patch_per_side)
+        if hasattr(self.pos_embed.data, "to_local"):
+            self.pos_embed.data.to_local().copy_(new_data)
+        else:
+            self.pos_embed.data.copy_(new_data)
+
+    def _init_weights(self) -> None:
+        self.reset_parameters()
 
     def forward(self, position_ids: torch.LongTensor) -> torch.Tensor:
         return self.pos_embed[position_ids.to(device=self.pos_embed.device)]

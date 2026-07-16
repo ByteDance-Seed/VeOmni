@@ -9,13 +9,22 @@ those feature spans back to the image ``ConversationItem.value`` fields.
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 import numpy as np
 import torch
 import torch.nn as nn
-from flash_attn import flash_attn_varlen_func
 from transformers import PreTrainedModel
+
+from veomni.utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE
+
+
+if IS_CUDA_AVAILABLE:
+    from flash_attn import flash_attn_varlen_func
+
+if IS_NPU_AVAILABLE:
+    import torch_npu
 from transformers.activations import ACT2FN
 
 from .configuration import BagelSiglipNavitConfig
@@ -170,7 +179,14 @@ class PositionEmbedding(nn.Module):
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
-        self.pos_embed.data.copy_(_get_2d_sincos_pos_embed(self.hidden_size, self.max_num_patch_per_side))
+        new_data = _get_2d_sincos_pos_embed(self.hidden_size, self.max_num_patch_per_side)
+        if hasattr(self.pos_embed.data, "to_local"):
+            self.pos_embed.data.to_local().copy_(new_data)
+        else:
+            self.pos_embed.data.copy_(new_data)
+
+    def _init_weights(self) -> None:
+        self.reset_parameters()
 
     def forward(self, position_ids: torch.LongTensor) -> torch.Tensor:
         return self.pos_embed[position_ids.to(device=self.pos_embed.device)]
@@ -267,18 +283,31 @@ class BagelSiglipAttention(nn.Module):
             query_states = torch.cat([qh, qw], dim=-1)
             key_states = torch.cat([kh, kw], dim=-1)
 
-        if not query_states.is_cuda:
-            raise RuntimeError("BagelSiglipNavit attention requires CUDA flash-attn.")
-        attn_output = flash_attn_varlen_func(
-            query_states.to(torch.bfloat16),
-            key_states.to(torch.bfloat16),
-            value_states.to(torch.bfloat16),
-            cu_seqlens_q=cu_seqlens,
-            cu_seqlens_k=cu_seqlens,
-            max_seqlen_q=max_seqlen,
-            max_seqlen_k=max_seqlen,
-            causal=False,
-        )
+        if IS_CUDA_AVAILABLE:
+            attn_output = flash_attn_varlen_func(
+                query_states.to(torch.bfloat16),
+                key_states.to(torch.bfloat16),
+                value_states.to(torch.bfloat16),
+                cu_seqlens_q=cu_seqlens,
+                cu_seqlens_k=cu_seqlens,
+                max_seqlen_q=max_seqlen,
+                max_seqlen_k=max_seqlen,
+                causal=False,
+            )
+        else:
+            attn_output = torch_npu.npu_fusion_attention(
+                query_states.to(torch.bfloat16),
+                key_states.to(torch.bfloat16),
+                value_states.to(torch.bfloat16),
+                query_states.shape[1],
+                pse=None,
+                atten_mask=None,
+                scale=1.0 / math.sqrt(query_states.shape[-1]),
+                keep_prob=1,
+                input_layout="TND",
+                actual_seq_qlen=tuple(cu_seqlens[1:].cpu().numpy().tolist()),
+                actual_seq_kvlen=tuple(cu_seqlens[1:].cpu().numpy().tolist()),
+            )[0]
         return self.out_proj(attn_output.reshape(total_q_len, -1).to(hidden_states.dtype))
 
 

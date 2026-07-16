@@ -32,6 +32,7 @@ from veomni.distributed.torch_parallelize import (
     _load_one,
     _resolve_weights_path_mapping,
 )
+from veomni.utils.device import get_device_type
 
 
 # ── Test fixtures: a model with named children and a fake init_weights ─────
@@ -184,7 +185,7 @@ def test_apply_load_step_str_with_rank0_broadcast(monkeypatch):
     _apply_weights_load_step(
         model=model,
         weights_path="/snap/full",
-        materialize_device="cuda",
+        materialize_device=get_device_type(),
         broadcast_from_rank0=True,
         is_peft_model=False,
         adapter_path=None,
@@ -198,7 +199,7 @@ def test_apply_load_step_str_with_rank0_broadcast(monkeypatch):
     # Positional args: model, weights_path, materialize_device.
     assert args[0] is model
     assert args[1] == "/snap/full"
-    assert args[2] == "cuda"
+    assert args[2] == get_device_type()
     assert kwargs["cpu_load_param_name"] == ["embed.weight"]
     assert kwargs["max_load_broadcast_size"] == 15.0
     assert kwargs["is_peft_model"] is False
@@ -218,7 +219,7 @@ def test_apply_load_step_str_without_rank0_broadcast(monkeypatch):
     _apply_weights_load_step(
         model=model,
         weights_path="/snap/full",
-        materialize_device="cuda",
+        materialize_device=get_device_type(),
         broadcast_from_rank0=False,
         is_peft_model=True,
         adapter_path="/snap/lora",

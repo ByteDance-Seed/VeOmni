@@ -16,6 +16,8 @@ import subprocess
 
 import pytest
 
+from veomni.utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE, get_torch_device
+
 from ..tools.launch_utils import find_free_port
 
 
@@ -47,9 +49,7 @@ def _tmp_dir(tmp_path):
 @pytest.mark.parametrize("nproc", [1, 2])
 def test_omni_fsdp_pipeline(nproc, tmp_path):
     """Two separately FSDP2-wrapped models should train correctly end-to-end."""
-    import torch
-
-    gpu_count = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    gpu_count = get_torch_device().device_count() if (IS_CUDA_AVAILABLE or IS_NPU_AVAILABLE) else 0
     if nproc > gpu_count:
         pytest.skip(f"nproc={nproc} but only {gpu_count} GPU(s) available")
 
