@@ -678,7 +678,7 @@ def _run_ulysses_chunk_mbs(rank, world_size, init_path, use_checkpoint):
         )
 
         reference_hidden = full_hidden.detach().clone().requires_grad_()
-        reference_scale = nn.Parameter(torch.tensor([0.5, 1.0, 1.5, 2.0]))
+        reference_scale = nn.Parameter(torch.tensor([0.5, 1.0, 1.5, 2.0], device=device_type))
         reference_output = _packed_cumsum_reference(
             reference_hidden, full_position_embeddings, position_ids, cu_seq_lens, reference_scale
         )
@@ -884,10 +884,15 @@ def _run_ep_chunk_mbs_single_round_fallback(rank, world_size, init_path):
     import torch.distributed as dist
 
     import veomni.distributed.chunk_mbs as chunk_mbs
+    from veomni.utils.device import get_device_type, get_dist_comm_backend, get_torch_device
 
-    if sys.platform == "darwin":
+    device_type = get_device_type()
+    backend = "gloo" if device_type == "cpu" else get_dist_comm_backend()
+    if device_type == "cpu" and sys.platform == "darwin":
         os.environ["GLOO_SOCKET_IFNAME"] = "lo0"
-    dist.init_process_group("gloo", init_method=f"file://{init_path}", rank=rank, world_size=world_size)
+    if device_type != "cpu":
+        get_torch_device().set_device(rank)
+    dist.init_process_group(backend, init_method=f"file://{init_path}", rank=rank, world_size=world_size)
     try:
         group = dist.group.WORLD
         ep_mesh = types.SimpleNamespace(mesh_dim_names=("ep",), get_group=lambda _name: group)
