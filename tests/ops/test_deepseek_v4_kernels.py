@@ -74,6 +74,10 @@ def test_tilelang_wrappers_reject_pre_sm90_before_import(monkeypatch):
         kernels.v4_lighting_indexer(*args[:3], compress_ratio=1, topk=1)
     with pytest.raises(RuntimeError, match="SM90 or later"):
         kernels.act_quant(torch.empty(0))
+    with pytest.raises(RuntimeError, match="SM90 or later"):
+        kernels.fp4_act_quant(torch.empty(0))
+    with pytest.raises(RuntimeError, match="SM90 or later"):
+        kernels.fp4_gemm(*args)
 
 
 def test_tilelang_wrappers_reject_rocm_before_import(monkeypatch):
@@ -90,6 +94,10 @@ def test_tilelang_wrappers_reject_rocm_before_import(monkeypatch):
         kernels.v4_lighting_indexer(*args[:3], compress_ratio=1, topk=1)
     with pytest.raises(RuntimeError, match="NVIDIA CUDA"):
         kernels.act_quant(torch.empty(0))
+    with pytest.raises(RuntimeError, match="NVIDIA CUDA"):
+        kernels.fp4_act_quant(torch.empty(0))
+    with pytest.raises(RuntimeError, match="NVIDIA CUDA"):
+        kernels.fp4_gemm(*args)
 
 
 def _require_tilelang_cuda():
@@ -110,6 +118,36 @@ def _indexer_reference(q, k, weights, topk_indices):
 
 def _cosine_similarity(actual, expected):
     return F.cosine_similarity(actual.float().flatten(), expected.float().flatten(), dim=0)
+
+
+def test_fp4_gemm_matches_dequantized_reference():
+    _require_tilelang_cuda()
+    from veomni.ops.kernels.deepseek_v4 import act_quant, fp4_act_quant, fp4_gemm
+
+    torch.manual_seed(5)
+    x = torch.randn(37, 256, device=DEVICE, dtype=torch.bfloat16)
+    weight = torch.randn(128, 256, device=DEVICE, dtype=torch.bfloat16)
+    quantized_x, x_scale = act_quant(
+        x,
+        block_size=128,
+        scale_fmt="ue8m0",
+        scale_dtype=torch.float8_e8m0fnu,
+    )
+    quantized_weight, weight_scale = fp4_act_quant(weight)
+
+    actual = fp4_gemm(quantized_x, x_scale, quantized_weight, weight_scale, torch.float8_e8m0fnu)
+    dequantized_x = act_quant(
+        x.clone(),
+        block_size=128,
+        scale_fmt="ue8m0",
+        scale_dtype=torch.float8_e8m0fnu,
+        inplace=True,
+    )
+    dequantized_weight = fp4_act_quant(weight.clone(), inplace=True)
+    expected = F.linear(dequantized_x.float(), dequantized_weight.float())
+
+    assert actual.dtype == torch.bfloat16
+    torch.testing.assert_close(actual.float(), expected, rtol=3e-2, atol=3e-1)
 
 
 def test_tilelang_indexer_non_power_of_two_topk_forward_backward():
@@ -541,3 +579,29 @@ def test_tilelang_act_quant_shapes_scales_and_inplace():
     expanded_scales_mx = expected_scales_mx.repeat_interleave(128, dim=-1)
     expected_quantized_mx = (x_mx.float() / expanded_scales_mx).clamp(-448, 448).to(torch.float8_e4m3fn)
     torch.testing.assert_close(quantized_mx.float(), expected_quantized_mx.float(), rtol=0, atol=0)
+
+
+def test_tilelang_fp4_act_quant_packing_and_inplace():
+    _require_tilelang_cuda()
+    from veomni.ops.kernels.deepseek_v4 import fp4_act_quant
+
+    values = torch.tensor(
+        [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0],
+        device=DEVICE,
+        dtype=torch.bfloat16,
+    )
+    x = values.repeat(2).unsqueeze(0)
+    quantized, scales = fp4_act_quant(x)
+
+    assert quantized.shape == (1, 16)
+    assert quantized.dtype == torch.float4_e2m1fn_x2
+    torch.testing.assert_close(scales.float(), torch.ones_like(scales.float()), rtol=0, atol=0)
+    codes = torch.tensor([0, 1, 2, 3, 4, 5, 6, 7, 0, 9, 10, 11, 12, 13, 14, 15], device=DEVICE).to(torch.uint8)
+    codes = codes.repeat(2)
+    expected_packed = codes[0::2] | (codes[1::2] << 4)
+    torch.testing.assert_close(quantized.view(torch.uint8), expected_packed.unsqueeze(0), rtol=0, atol=0)
+
+    inplace = x.clone()
+    result = fp4_act_quant(inplace, inplace=True)
+    assert result.data_ptr() == inplace.data_ptr()
+    torch.testing.assert_close(result, x, rtol=0, atol=0)

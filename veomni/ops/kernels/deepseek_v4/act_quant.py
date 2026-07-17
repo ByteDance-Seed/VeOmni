@@ -166,3 +166,78 @@ def act_quant(
         x.copy_(y)
         return x
     return y, s
+
+
+@tilelang.jit(pass_configs=pass_configs)
+def fp4_quant_kernel(N, block_size=32, in_dtype=BF16, scale_dtype=FE8M0, inplace=False):
+    """Block-wise E2M1 FP4 quantization with power-of-two scales."""
+    M = T.symbolic("M")
+    fp4_max = 6.0
+    fp4_max_inv = 1.0 / fp4_max
+    blk_m = 32
+    group_size = block_size
+    compute_dtype = FP32
+    out_dtype = in_dtype if inplace else FP4
+
+    @T.prim_func
+    def fp4_quant_kernel_(
+        X: T.Tensor[(M, N), in_dtype],
+        Y: T.Tensor[(M, N), out_dtype],
+        S: T.Tensor[(M, T.ceildiv(N, group_size)), scale_dtype],
+    ):
+        with T.Kernel(T.ceildiv(M, blk_m), T.ceildiv(N, group_size), threads=128) as (
+            pid_m,
+            pid_n,
+        ):
+            x_shared = T.alloc_shared((blk_m, group_size), in_dtype)
+            x_local = T.alloc_fragment((blk_m, group_size), in_dtype)
+            amax_local = T.alloc_fragment((blk_m,), compute_dtype)
+            s_local = T.alloc_fragment((blk_m,), compute_dtype)
+            y_local = T.alloc_fragment((blk_m, group_size), out_dtype)
+            y_shared = T.alloc_shared((blk_m, group_size), out_dtype)
+
+            for _ in T.Pipelined(1, num_stages=2):
+                T.copy(X[pid_m * blk_m, pid_n * group_size], x_shared)
+                T.copy(x_shared, x_local)
+                T.reduce_absmax(x_local, amax_local, dim=1)
+                for i in T.Parallel(blk_m):
+                    amax_local[i] = T.max(amax_local[i], 6 * (2**-126))
+                    s_local[i] = fast_round_scale(amax_local[i], fp4_max_inv)
+                if inplace:
+                    for i, j in T.Parallel(blk_m, group_size):
+                        y_local[i, j] = T.Cast(
+                            out_dtype,
+                            T.Cast(
+                                compute_dtype,
+                                T.Cast(FP4, T.clamp(x_local[i, j] / s_local[i], -fp4_max, fp4_max)),
+                            )
+                            * s_local[i],
+                        )
+                else:
+                    for i, j in T.Parallel(blk_m, group_size):
+                        y_local[i, j] = T.clamp(x_local[i, j] / s_local[i], -fp4_max, fp4_max)
+                for i in T.Parallel(blk_m):
+                    S[pid_m * blk_m + i, pid_n] = T.Cast(scale_dtype, s_local[i])
+                T.copy(y_local, y_shared)
+                T.copy(y_shared, Y[pid_m * blk_m, pid_n * group_size])
+
+    return fp4_quant_kernel_
+
+
+def fp4_act_quant(
+    x: torch.Tensor,
+    block_size: int = 32,
+    inplace: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """Block-wise FP4 quantization, optionally dequantizing in place to BF16."""
+    N = x.size(-1)
+    assert N % block_size == 0
+    z = x.contiguous()
+    y = torch.empty_like(z) if inplace else z.new_empty(*z.shape[:-1], N // 2, dtype=torch.float4_e2m1fn_x2)
+    s = z.new_empty(*z.size()[:-1], N // block_size, dtype=torch.float8_e8m0fnu)
+    kernel = fp4_quant_kernel(N, block_size, inplace=inplace)
+    kernel(z.view(-1, N), y.view(-1, y.size(-1)), s.view(-1, N // block_size))
+    if inplace:
+        x.copy_(y)
+        return x
+    return y, s
