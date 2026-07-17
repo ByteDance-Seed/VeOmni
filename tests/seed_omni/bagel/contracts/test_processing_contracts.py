@@ -172,7 +172,7 @@ def test_bagel_mot_packing_exposes_sp_metadata_without_rewriting_spans():
     assert torch.equal(packed.packed_token_type_ids, torch.tensor([0, 0, 1, 1, 1]))
 
 
-def test_bagel_mot_forward_pre_returns_owner_local_tensor_contract():
+def test_bagel_mot_forward_pre_returns_sample_local_tensor_contract():
     BagelQwen2MoT = model_cls("bagel_qwen2_mot")
     BagelQwen2MoTConfig = config_cls("bagel_qwen2_mot")
     model = BagelQwen2MoT(BagelQwen2MoTConfig(**tiny_bagel_qwen2_cfg())).train()
@@ -206,6 +206,31 @@ def test_bagel_mot_forward_pre_returns_owner_local_tensor_contract():
     assert inputs["attention_mask"].is_contiguous()
 
 
+@pytest.mark.parametrize(
+    ("attention_mask", "error"),
+    [
+        (torch.ones(3, 3, dtype=torch.bool), "must match the full packed sample"),
+        (torch.ones(1, 1, 2, 2, dtype=torch.bool), "must match the full packed sample"),
+    ],
+)
+def test_bagel_mot_training_attention_mask_contract_is_checked_once_at_the_module_boundary(
+    attention_mask: torch.Tensor,
+    error: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from veomni.models.seed_omni.modules.bagel.qwen2_mot import modulemixin
+
+    BagelQwen2MoT = model_cls("bagel_qwen2_mot")
+    BagelQwen2MoTConfig = config_cls("bagel_qwen2_mot")
+    model = BagelQwen2MoT(BagelQwen2MoTConfig(**tiny_bagel_qwen2_cfg())).train()
+    hidden_size = int(model.config.hidden_size)
+    conversation = [[ConversationItem(type="text", value=torch.ones(3, hidden_size), role="user")]]
+    monkeypatch.setattr(modulemixin, "build_mot_attention_mask", lambda *args, **kwargs: attention_mask)
+
+    with pytest.raises(ValueError, match=error):
+        model.forward_pre(conversation_list=conversation)
+
+
 def test_bagel_mot_forward_opts_into_training_graph_owner_loop(monkeypatch):
     from veomni.distributed import parallel_state
     from veomni.models.seed_omni.graphs.training_graph import TrainingGraph
@@ -218,7 +243,7 @@ def test_bagel_mot_forward_opts_into_training_graph_owner_loop(monkeypatch):
     assert TrainingGraph._use_sp_loop(model, "forward") is True
 
 
-def test_bagel_mot_forward_pre_normalizes_owner_broadcast_dtype():
+def test_bagel_mot_forward_pre_normalizes_sample_broadcast_dtype():
     BagelQwen2MoT = model_cls("bagel_qwen2_mot")
     BagelQwen2MoTConfig = config_cls("bagel_qwen2_mot")
     model = BagelQwen2MoT(BagelQwen2MoTConfig(**tiny_bagel_qwen2_cfg())).to(dtype=torch.bfloat16).train()

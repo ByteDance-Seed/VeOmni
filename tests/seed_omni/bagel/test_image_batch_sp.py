@@ -1,4 +1,4 @@
-"""Distributed coverage for BAGEL VAE/SigLIP image-batch redistribution."""
+"""Distributed coverage for BAGEL image-module sequence parallelism."""
 
 from __future__ import annotations
 
@@ -9,9 +9,11 @@ import torch.distributed as dist
 from tests.seed_omni.bagel.contracts.helpers import config_cls, model_cls
 from tests.tools.launch_utils import torchrun
 from veomni.distributed.parallel_state import init_parallel_state, use_parallel_state
+from veomni.models.seed_omni.graphs.dispatch import run_sp_looped_endpoint
 from veomni.models.seed_omni.modules.bagel.siglip_navit.modulemixin import (
     _OMNI_POSITION_IDS,
     _OMNI_TOKEN_LEN,
+    BagelSiglipNavitModuleMixin,
 )
 from veomni.models.seed_omni.modules.bagel.sources import BAGEL_SIGLIP_CONTEXT, BAGEL_VAE_CONTEXT
 from veomni.models.seed_omni.modules.bagel.vae.modulemixin import BAGEL_VAE_PIXEL_SHAPE
@@ -72,6 +74,41 @@ def _siglip_items(rank: int, device: torch.device) -> tuple[list[ConversationIte
     return items, values
 
 
+class _BagelSiglipLoopHarness(BagelSiglipNavitModuleMixin, torch.nn.Module):
+    """Exercise BAGEL's carrier + SP hooks without loading the real vision weights."""
+
+    def __init__(self, device: torch.device) -> None:
+        super().__init__()
+        self._device = device
+        self.forward_token_lens: list[list[int]] = []
+
+    @property
+    def device(self) -> torch.device:
+        return self._device
+
+    @property
+    def dtype(self) -> torch.dtype:
+        return torch.float32
+
+    def forward(
+        self,
+        patchified_pixel_values: torch.Tensor,
+        patchified_position_ids: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: int,
+        token_lens: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        del patchified_position_ids
+        expected_cu = torch.nn.functional.pad(torch.cumsum(token_lens, dim=0), (1, 0)).to(torch.int32)
+        torch.testing.assert_close(cu_seqlens, expected_cu)
+        assert max_seqlen == int(token_lens.max().item())
+        self.forward_token_lens.append(token_lens.detach().cpu().tolist())
+        return {
+            "image_embeds": patchified_pixel_values[:, :1].repeat(1, 4),
+            "token_lens": token_lens,
+        }
+
+
 def _image_batch_sp_worker() -> None:
     rank = dist.get_rank()
     world_size = dist.get_world_size()
@@ -107,29 +144,17 @@ def _image_batch_sp_worker() -> None:
         torch.testing.assert_close(value.grad[0], torch.ones_like(value.grad[0]))
         torch.testing.assert_close(value.grad[1:], torch.zeros_like(value.grad[1:]))
 
-    BagelSiglip = model_cls("bagel_siglip_navit")
-    BagelSiglipConfig = config_cls("bagel_siglip_navit")
-    siglip = BagelSiglip(
-        BagelSiglipConfig(
-            hidden_size=8,
-            output_size=4,
-            image_size=4,
-            min_image_size=1,
-            intermediate_size=16,
-            num_attention_heads=2,
-            num_hidden_layers=1,
-            num_channels=1,
-            patch_size=2,
-            vit_max_num_patch_per_side=2,
-        )
-    ).to(device=device, dtype=torch.float32)
+    siglip = _BagelSiglipLoopHarness(device)
     siglip_items, siglip_values = _siglip_items(rank, device)
     with use_parallel_state(module_state):
         siglip_inputs = siglip.forward_pre(conversation_list=[siglip_items])
-        expected_local_images = 2 if rank == 0 else 1
-        assert int(siglip_inputs["token_lens"].numel()) == expected_local_images
-        image_embeds = siglip_inputs["patchified_pixel_values"][:, :1].repeat(1, 4)
-        siglip_outputs = siglip.forward_post(image_embeds, siglip_inputs["token_lens"])
+        assert siglip.supports_sp("forward") is True
+        assert siglip._metric_full_seqlens["forward"] == ([2] if rank == 0 else [5])
+        siglip_outputs = run_sp_looped_endpoint(siglip, siglip, method="forward", kwargs=siglip_inputs)
+        siglip_outputs = siglip.forward_post(**siglip_outputs)
+
+    expected_forward_token_lens = [[2], [1]] if rank == 0 else [[1], [4]]
+    assert siglip.forward_token_lens == expected_forward_token_lens
 
     assert siglip_outputs["conversation_list"] == [siglip_items]
     for item, original in zip(siglip_items, siglip_values, strict=True):
@@ -144,5 +169,5 @@ def _image_batch_sp_worker() -> None:
 
 
 @pytest.mark.skipif(get_torch_device().device_count() < 2, reason="device_count should be >= 2")
-def test_bagel_vae_and_siglip_redistribute_whole_images_across_sp2() -> None:
+def test_bagel_vae_redistribution_and_siglip_sample_loop_across_sp2() -> None:
     torchrun(_image_batch_sp_worker, world_size=2)

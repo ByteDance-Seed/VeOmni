@@ -25,12 +25,7 @@ from ..sources import (
 )
 from .configuration import BagelQwen2MoTConfig
 from .generation_state import MotCacheContext, MotGenerationState
-from .processing import (
-    PackedConversation,
-    PackedSpan,
-    build_mot_attention_mask,
-    preprocess_mot_inputs,
-)
+from .processing import PackedConversation, PackedSpan, build_mot_attention_mask, preprocess_mot_inputs
 
 
 class BagelQwen2MoTModuleMixin(ModuleMixin):
@@ -39,7 +34,7 @@ class BagelQwen2MoTModuleMixin(ModuleMixin):
     def init_omni_state(self) -> None:
         self._conversation_carrier: list[list[ConversationItem]] | None = None
         self._packed_training: PackedConversation | None = None
-        self._sp_owner_length: int | None = None
+        self._sp_sample_length: int | None = None
         self._validated_ulysses_size: int | None = None
         self._generation_state = MotGenerationState()
 
@@ -181,7 +176,7 @@ class BagelQwen2MoTModuleMixin(ModuleMixin):
             )
 
         # Metering: per-sample packed token counts.
-        # For module-SP this is the full own-data count before gather/slice.
+        # For module-SP this is the rank's full local-sample count before slicing.
         self.metric_meter_set_seqlens(
             "forward",
             [int(sum(splits)) for splits in self._packed_training.sample_splits],
@@ -193,6 +188,13 @@ class BagelQwen2MoTModuleMixin(ModuleMixin):
             self._packed_training.sample_attn_modes,
             device=self.device,
         )
+        sequence_length = int(packed_sequence.shape[0])
+        expected_mask_shape = (1, 1, sequence_length, sequence_length)
+        if tuple(attention_mask.shape) != expected_mask_shape:
+            raise ValueError(
+                "BAGEL Qwen2-MoT attention mask must match the full packed sample: "
+                f"expected {expected_mask_shape}, got {tuple(attention_mask.shape)}."
+            )
         return {
             "packed_sequence": packed_sequence,
             "packed_position_ids": self._packed_training.packed_position_ids,
@@ -207,7 +209,7 @@ class BagelQwen2MoTModuleMixin(ModuleMixin):
         packed = self._packed_training
         self._conversation_carrier = None
         self._packed_training = None
-        self._sp_owner_length = None
+        self._sp_sample_length = None
 
         for span in packed.spans:
             span_hidden = hidden_states[span.start : span.start + span.length].to(device=self.device)
@@ -228,7 +230,7 @@ class BagelQwen2MoTModuleMixin(ModuleMixin):
         attention_mask: torch.Tensor,
         **kwargs: Any,
     ) -> dict[str, Any]:
-        """Slice one owner's already-broadcast packed sequence for Ulysses."""
+        """Slice the active sample's already-broadcast packed sequence for Ulysses."""
         del kwargs
         ps = get_parallel_state()
         if ps.cp_size != 1:
@@ -251,7 +253,7 @@ class BagelQwen2MoTModuleMixin(ModuleMixin):
                 )
             self._validated_ulysses_size = ps.ulysses_size
 
-        self._sp_owner_length = int(packed_sequence.shape[0])
+        self._sp_sample_length = int(packed_sequence.shape[0])
         packed_sequence = sp_pad(packed_sequence, dim=0, pad_value=0)
         packed_position_ids = sp_pad(packed_position_ids, dim=0, pad_value=0)
         packed_token_type_ids = sp_pad(packed_token_type_ids, dim=0, pad_value=-1)
@@ -277,9 +279,9 @@ class BagelQwen2MoTModuleMixin(ModuleMixin):
         del kwargs
         ps = get_parallel_state()
         hidden_states = sp_all_gather_shards(hidden_states, dim=0, group=ps.sp_group)
-        if self._sp_owner_length is None:
+        if self._sp_sample_length is None:
             raise RuntimeError("BAGEL Qwen2-MoT SP sample length was not initialized.")
-        hidden_states = hidden_states.narrow(0, 0, self._sp_owner_length)
+        hidden_states = hidden_states.narrow(0, 0, self._sp_sample_length)
         return {"hidden_states": hidden_states}
 
     # ── Dummy helper ──────────────────────────────────

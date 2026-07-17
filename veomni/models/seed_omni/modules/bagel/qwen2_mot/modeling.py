@@ -318,7 +318,7 @@ class BagelQwen2MoTAttention(nn.Module):
         sequence_length = int(attention_mask.shape[-1])
         ps = get_parallel_state()
         if ps.sp_enabled:
-            # Ulysses all-to-all gathers the owner's complete packed sequence
+            # Ulysses all-to-all gathers the active sample's complete packed sequence
             # while sharding Q and native-GQA K/V heads.
             packed_query_states_ = gather_seq_scatter_heads(
                 packed_query_states_,
@@ -377,34 +377,7 @@ class BagelQwen2MoTAttention(nn.Module):
         *,
         attention_mask: torch.Tensor,
     ) -> torch.Tensor:
-        """Apply one native-GQA SDPA call to an owner's complete packed sequence."""
-        if attention_mask.dtype != torch.bool:
-            raise ValueError(f"BAGEL Qwen2-MoT attention mask must be bool, got {attention_mask.dtype}.")
-        sequence_length = int(attention_mask.shape[-1])
-        if attention_mask.shape != (1, 1, sequence_length, sequence_length):
-            raise ValueError(
-                f"BAGEL Qwen2-MoT attention mask must have shape [1, 1, S, S], got {tuple(attention_mask.shape)}."
-            )
-        if key_states.shape != value_states.shape:
-            raise ValueError(
-                "BAGEL Qwen2-MoT attention requires matching K/V shapes, "
-                f"got key={tuple(key_states.shape)}, value={tuple(value_states.shape)}."
-            )
-        if query_states.shape[0] != key_states.shape[0]:
-            raise ValueError(
-                "BAGEL Qwen2-MoT attention requires matching Q/K sequence lengths, "
-                f"got query={query_states.shape[0]}, key={key_states.shape[0]}."
-            )
-        if query_states.shape[-1] != key_states.shape[-1]:
-            raise ValueError(
-                "BAGEL Qwen2-MoT attention requires matching Q/K head dimensions, "
-                f"got query={query_states.shape[-1]}, key={key_states.shape[-1]}."
-            )
-        if sequence_length != query_states.shape[0]:
-            raise ValueError(
-                "BAGEL Qwen2-MoT attention mask does not match the packed sequence length: "
-                f"mask={sequence_length}, sequence={query_states.shape[0]}."
-            )
+        """Apply one native-GQA SDPA call to the active sample's complete packed sequence."""
 
         query = query_states.transpose(0, 1).unsqueeze(0)
         key = key_states.transpose(0, 1).unsqueeze(0)

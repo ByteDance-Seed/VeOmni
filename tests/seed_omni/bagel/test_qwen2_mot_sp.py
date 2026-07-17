@@ -120,7 +120,7 @@ def _forward_carrier(
     model: torch.nn.Module,
     items: list[ConversationItem],
     parallel_state,
-    owner_shapes: list[tuple[int, tuple[int, ...]]] | None = None,
+    sample_shapes: list[tuple[int, tuple[int, ...]]] | None = None,
 ) -> torch.Tensor:
     conversation = [items]
     with (
@@ -133,11 +133,11 @@ def _forward_carrier(
         inputs = model.forward_pre(conversation_list=conversation)
         if parallel_state.sp_size > 1:
             assert model.supports_sp("forward") is True
-            if owner_shapes is not None:
+            if sample_shapes is not None:
                 original_sp_pre = model.forward_sp_pre
 
                 def recording_sp_pre(self, **kwargs):
-                    owner_shapes.append(
+                    sample_shapes.append(
                         (
                             int(kwargs["packed_sequence"].shape[0]),
                             tuple(kwargs["attention_mask"].shape),
@@ -208,13 +208,13 @@ def _qwen2_mot_sp_worker() -> None:
     hidden_size = int(reference.config.hidden_size)
     reference_items, reference_inputs = _rank_items(rank, device, hidden_size)
     sp_items, sp_inputs = _rank_items(rank, device, hidden_size)
-    expected_owner_lengths = [5, 6, 7, 8]
-    owner_shapes: list[tuple[int, tuple[int, ...]]] = []
+    expected_sample_lengths = [5, 6, 7, 8]
+    sample_shapes: list[tuple[int, tuple[int, ...]]] = []
 
     reference_hidden = _forward_carrier(reference, reference_items, outer_state)
-    sp_hidden = _forward_carrier(sequence_parallel, sp_items, module_state, owner_shapes)
-    assert owner_shapes == [(length, (1, 1, length, length)) for length in expected_owner_lengths]
-    assert sequence_parallel._metric_full_seqlens["forward"] == [expected_owner_lengths[rank]]
+    sp_hidden = _forward_carrier(sequence_parallel, sp_items, module_state, sample_shapes)
+    assert sample_shapes == [(length, (1, 1, length, length)) for length in expected_sample_lengths]
+    assert sequence_parallel._metric_full_seqlens["forward"] == [expected_sample_lengths[rank]]
     torch.testing.assert_close(sp_hidden, reference_hidden, rtol=2e-2, atol=2e-2)
 
     reference_loss = reference_hidden.float().square().mean()
