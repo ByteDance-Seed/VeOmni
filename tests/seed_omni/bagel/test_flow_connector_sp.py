@@ -11,7 +11,7 @@ from torch.distributed.tensor import DTensor
 from tests.seed_omni.bagel.contracts.helpers import config_cls, model_cls
 from tests.tools.launch_utils import torchrun
 from veomni.distributed.parallel_state import init_parallel_state, use_parallel_state
-from veomni.models.seed_omni.graphs.dispatch import call_graph_endpoint
+from veomni.models.seed_omni.graphs.dispatch import run_sp_looped_endpoint
 from veomni.models.seed_omni.modules.bagel.sources import BAGEL_FLOW_HIDDEN, BAGEL_VAE_CONTEXT
 from veomni.models.seed_omni.utils.conversation import _IMG_TAG_KEY, ConversationItem
 from veomni.utils.device import get_device_type, get_torch_device
@@ -108,8 +108,9 @@ def _flow_connector_sp_worker() -> None:
     torch.manual_seed(9300 + rank)
     with use_parallel_state(module_state):
         sp_embed_inputs = sequence_parallel.embed_latent_pre(conversation_list=sp_embed_conversation)
-        assert sp_embed_inputs["latents"].shape[0] == 3
-        sp_embed_output = call_graph_endpoint(
+        assert sequence_parallel.supports_sp("embed_latent")
+        assert sp_embed_inputs["latents"].shape[0] == _TOKEN_COUNTS[rank]
+        sp_embed_output = run_sp_looped_endpoint(
             sequence_parallel,
             sequence_parallel,
             method="embed_latent",
@@ -138,8 +139,9 @@ def _flow_connector_sp_worker() -> None:
 
     with use_parallel_state(module_state):
         sp_decode_inputs = sequence_parallel.decode_velocity_pre(conversation_list=sp_decode_conversation)
-        assert sp_decode_inputs["hidden_states"].shape[0] == 3
-        sp_decode_output = call_graph_endpoint(
+        assert sequence_parallel.supports_sp("decode_velocity")
+        assert sp_decode_inputs["hidden_states"].shape[0] == _TOKEN_COUNTS[rank]
+        sp_decode_output = run_sp_looped_endpoint(
             sequence_parallel,
             sequence_parallel,
             method="decode_velocity",
@@ -247,8 +249,9 @@ def _flow_connector_fsdp2_worker() -> None:
 
     with use_parallel_state(module_state):
         sp_inputs = sequence_parallel.decode_velocity_pre(conversation_list=sp_conversation)
-        assert sp_inputs["hidden_states"].shape[0] == 3
-        sp_output = call_graph_endpoint(
+        assert sequence_parallel.supports_sp("decode_velocity")
+        assert sp_inputs["hidden_states"].shape[0] == _TOKEN_COUNTS[rank]
+        sp_output = run_sp_looped_endpoint(
             sequence_parallel,
             sequence_parallel,
             method="decode_velocity",

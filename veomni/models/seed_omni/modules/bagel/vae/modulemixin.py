@@ -274,7 +274,7 @@ class BagelVAEModuleMixin(OfflineEncodingMixin, ModuleMixin):
             encoded_cache.append(cache.detach().to(device=self._online_process_device()))
         return {"encoded_cache": encoded_cache}
 
-    # ── Looped sequence-parallel hooks ──────────────────
+    # ── Ulysses SP hooks ──────────────────────────────────
 
     @sp_pre_forward("encode", "offline_encode")
     def encode_sp_pre(self, pixel_values: torch.Tensor, **kwargs: Any) -> dict[str, Any]:
