@@ -186,6 +186,85 @@ def test_build_dataloader_dyn_bsz_physical_overflow_ratio(monkeypatch, dummy_dat
     assert dl.batching_strategy.physical_token_cap == 40
 
 
+def test_build_dataloader_suppresses_persistent_workers_with_zero_workers(monkeypatch, dummy_dataset_ci):
+    import veomni.data.data_loader as m_dl
+    import veomni.data.dataset as m_ds
+
+    ps = _fake_ps(sp_size=1)
+    monkeypatch.setattr(m_dl, "get_parallel_state", lambda: ps)
+    monkeypatch.setattr(m_ds, "get_parallel_state", lambda: ps)
+
+    dataset = build_dataset(
+        dataset_name="iterable",
+        train_path=dummy_dataset_ci.save_path,
+        transform=partial(process_dummy_example, max_seq_len=16),
+        seed=0,
+    )
+    dl = build_dataloader(
+        "native",
+        dataset=dataset,
+        micro_batch_size=2,
+        global_batch_size=4,
+        dataloader_batch_size=1,
+        max_seq_len=16,
+        train_steps=1,
+        num_workers=0,
+        dyn_bsz=True,
+        dyn_bsz_runtime="main",
+        dyn_bsz_buffer_size=1,
+        drop_last=True,
+        prefetch_factor=None,
+        persistent_workers=True,
+        in_order=False,
+        seed=0,
+    )
+
+    assert dl._dataloader.persistent_workers is False
+    assert dl._dataloader.in_order is False
+
+
+def test_build_dataloader_forwards_worker_scheduling_kwargs(monkeypatch, dummy_dataset_ci):
+    import veomni.data.data_loader as m_dl
+    import veomni.data.dataset as m_ds
+
+    captured = {}
+
+    class FakeDistributedDataloader:
+        def __init__(self, *args, **kwargs):
+            captured.update(kwargs)
+
+    ps = _fake_ps(sp_size=1)
+    monkeypatch.setattr(m_dl, "get_parallel_state", lambda: ps)
+    monkeypatch.setattr(m_ds, "get_parallel_state", lambda: ps)
+    monkeypatch.setattr(m_dl, "DistributedDataloader", FakeDistributedDataloader)
+
+    dataset = build_dataset(
+        dataset_name="iterable",
+        train_path=dummy_dataset_ci.save_path,
+        transform=partial(process_dummy_example, max_seq_len=16),
+        seed=0,
+    )
+    build_dataloader(
+        "native",
+        dataset=dataset,
+        micro_batch_size=2,
+        global_batch_size=4,
+        dataloader_batch_size=1,
+        max_seq_len=16,
+        train_steps=1,
+        num_workers=2,
+        dyn_bsz=False,
+        drop_last=True,
+        prefetch_factor=2,
+        persistent_workers=True,
+        in_order=False,
+        seed=0,
+    )
+
+    assert captured["persistent_workers"] is True
+    assert captured["in_order"] is False
+
+
 def test_build_dataloader_rejects_invalid_physical_overflow_ratio(monkeypatch, dummy_dataset_ci):
     import veomni.data.data_loader as m_dl
     import veomni.data.dataset as m_ds

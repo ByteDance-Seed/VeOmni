@@ -1309,6 +1309,14 @@ class DataloaderConfig:
         default=2,
         metadata={"help": "Number of batches loaded in advance by each worker."},
     )
+    persistent_workers: bool = field(
+        default=False,
+        metadata={"help": "Keep DataLoader worker processes alive between iterator recreations."},
+    )
+    in_order: bool = field(
+        default=True,
+        metadata={"help": "Return worker-loaded batches in first-in, first-out order."},
+    )
     drop_last: bool = field(
         default=True,
         metadata={"help": "Whether to drop the last incomplete batch."},
