@@ -198,6 +198,9 @@ and `triton-ascend` on a mutually compatible release set.
 > rather than mis-computing. Validated on `Ascend910B2C`. arch35 support would need to come
 > from upstream MindSpeed-MM.
 
+VeOmni's NPU VLM E2E and text FSDP-equivalence suites select these three
+`npu` implementations automatically for Qwen3.5 Dense and MoE toy models.
+
 To switch `chunk_gated_delta_rule` to QwenLM's [`flash-qla`](https://github.com/QwenLM/FlashQLA)
 kernel (already shipped under the `gpu` extra), set the field explicitly:
 

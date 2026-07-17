@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional
 
 from veomni.arguments.arguments_types import OpsImplementationConfig
+from veomni.utils.device import get_device_name
 from veomni.utils.import_utils import is_torch_npu_available
 
 from .launch_utils import find_free_port
@@ -37,6 +38,16 @@ _NPU_OPS_DEFAULTS: Dict[str, str] = {
 }
 
 _NPU_PER_MODEL_OVERRIDES: Dict[str, Dict[str, str]] = {
+    "qwen3_5": {
+        "rms_norm_gated_implementation": "npu",
+        "causal_conv1d_implementation": "npu",
+        "chunk_gated_delta_rule_implementation": "npu",
+    },
+    "qwen3_5_moe": {
+        "rms_norm_gated_implementation": "npu",
+        "causal_conv1d_implementation": "npu",
+        "chunk_gated_delta_rule_implementation": "npu",
+    },
     "deepseek_v3": {
         # batch-invariant RMSNorm + deterministic RoPE are GPU-only Triton
         "rms_norm_implementation": "eager",
@@ -125,6 +136,15 @@ _GPU_PER_MODEL_OVERRIDES: Dict[str, Dict[str, str]] = {
 }
 
 
+def is_npu_arch35() -> bool:
+    """Return whether the active NPU is an unsupported arch35 device."""
+    if not is_torch_npu_available():
+        return False
+
+    device_name = get_device_name()
+    return "Ascend910_95" in device_name or "Ascend950" in device_name
+
+
 def _npu_overrides(model_name: Optional[str]) -> Dict[str, str]:
     merged = dict(_NPU_OPS_DEFAULTS)
     if model_name is not None:
@@ -180,8 +200,9 @@ def make_npu_ops_config(model_name: Optional[str] = None, **overrides) -> OpsImp
     """
     merged = _npu_overrides(model_name)
     merged.update(overrides)
-    # Qwen3.5 GatedDeltaNet ops have no NPU kernel today — pin to eager so the
-    # config validates at parse time.
+    # Non-Qwen3.5 models do not consume these OpSlots. Keep their portable
+    # baseline eager; the per-model table selects all three NPU kernels for
+    # Qwen3.5 Dense and MoE.
     merged.setdefault("rms_norm_gated_implementation", "eager")
     merged.setdefault("causal_conv1d_implementation", "eager")
     merged.setdefault("chunk_gated_delta_rule_implementation", "eager")

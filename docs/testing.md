@@ -266,11 +266,13 @@ NVIDIA GPU for kernel execution.
 
 ### 11. Ops / Kernel Tests (`tests/ops/`)
 
-| Test | Purpose | GPU |
+| Test | Purpose | Hardware |
 |---|---|---|
 | `test_fused_moe_split_vs_merged.py` | Split vs merged fc1 in fused MoE | 1 GPU |
 | `test_quack_fused_moe.py` | Quack GEMM MoE backend | SM90+ |
 | `test_kernel_registry_numerical.py` | Numerical alignment per (op, variant, impl) | CUDA; the FlashQLA `chunk_gated_delta_rule` case skips unless running on SM90 (Hopper) — SM10x WIP upstream. |
+| `test_npu_kernels.py` | Ascend fused-op numerics, including Qwen3.5 varlen causal-conv and gated delta-rule forward/backward alignment | Ascend NPU |
+| `test_gdn_ascend_gate.py` | Qwen3.5 GDN backend registration and accelerator mismatch guards | CPU (mocked hardware gates) |
 | `test_fused_load_balancing_loss.py` | Triton load-balancing loss | CUDA |
 | `test_deepseek_v4_kernels.py` | CPU import/hardware guards plus TileLang DSA numerical parity | CPU for guards; TileLang + NVIDIA SM90+ for optimized kernels |
 | `test_mhc_tile_kernels.py` | TileKernels mHC registry dispatch and forward/backward parity | TileKernels + NVIDIA SM90+ |

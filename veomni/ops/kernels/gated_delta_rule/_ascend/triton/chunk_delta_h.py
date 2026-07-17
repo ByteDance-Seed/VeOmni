@@ -301,7 +301,9 @@ def chunk_gated_delta_rule_fwd_h(
 })
 @triton.autotune(
     configs=get_autotune_config(multibuffer_list=(True, False)),
-    key=['H', 'K', 'V', 'BT', 'BV', 'USE_G', 'IS_VARLEN'],
+    # Ascend's AutoTilingTuner accepts at most six axes. BV is fixed to 128
+    # by chunk_gated_delta_rule_bwd_dhu, so it does not distinguish variants.
+    key=['H', 'K', 'V', 'BT', 'USE_G', 'IS_VARLEN'],
 )
 @triton.jit(do_not_specialize=['T'])
 def chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64(

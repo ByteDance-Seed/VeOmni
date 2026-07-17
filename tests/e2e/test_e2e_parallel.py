@@ -11,7 +11,7 @@ from veomni.models.auto import build_foundation_model
 from veomni.utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE, get_gpu_compute_capability
 from veomni.utils.import_utils import is_diffusers_available, is_quack_gemm_available
 
-from ..tools import DummyDataset, build_torchrun_cmd, compare_metrics, print_comparison_table
+from ..tools import DummyDataset, build_torchrun_cmd, compare_metrics, is_npu_arch35, print_comparison_table
 from ..tools.training_utils import make_eager_ops_config
 from .utils import prepare_exec_cmd
 
@@ -20,10 +20,8 @@ from .utils import prepare_exec_cmd
 # lists with a TODO; uncomment once the corresponding model gains a v5
 # patchgen path.
 _dit_only = pytest.mark.skipif(not is_diffusers_available(), reason="Requires diffusers")
-# Qwen3.5 GatedDeltaNet has no NPU kernel today; eager-only path also requires
-# non-varlen training (dyn_bsz=False), but the e2e command uses dyn_bsz=True.
-_qwen3_5_npu_skip = pytest.mark.skipif(
-    IS_NPU_AVAILABLE, reason="Qwen3.5 GatedDeltaNet has no NPU backend (varlen path)"
+_qwen3_5_arch35_skip = pytest.mark.skipif(
+    is_npu_arch35(), reason="Qwen3.5 causal_conv1d is not supported on arch35 NPUs"
 )
 _qwen_image_npu_skip = pytest.mark.skipif(IS_NPU_AVAILABLE, reason="Qwen-Image training is GPU-only for now")
 
@@ -283,7 +281,7 @@ qwen3vl_test_cases = [
         _DEFAULT_RTOL,
         _DEFAULT_ATOL,
         None,  # max_sp_size
-        marks=_qwen3_5_npu_skip,
+        marks=_qwen3_5_arch35_skip,
     ),
     pytest.param(
         "qwen3_5",
@@ -292,7 +290,7 @@ qwen3vl_test_cases = [
         _DEFAULT_RTOL,
         _DEFAULT_ATOL,
         None,  # max_sp_size
-        marks=_qwen3_5_npu_skip,
+        marks=_qwen3_5_arch35_skip,
     ),
 ]
 
