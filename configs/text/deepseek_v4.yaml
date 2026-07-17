@@ -31,7 +31,7 @@ train:
     offload:
       enable_activation: false
   gradient_checkpointing:
-    enable: false
+    enable: true
   global_batch_size: 8
   micro_batch_size: 1
   bsz_warmup_ratio: 0.007
@@ -45,7 +45,7 @@ train:
     max_grad_norm: 1.0
   init_device: meta
   enable_full_determinism: false
-  max_steps: 1
+  max_steps: 1000
   empty_cache_steps: 500
   checkpoint:
     output_dir: deepseek_v4_flash_base_tulu_sft
