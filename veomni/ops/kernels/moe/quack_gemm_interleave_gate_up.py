@@ -87,10 +87,11 @@ class GptOssQuackFusedMoeExpertFunction(torch.autograd.Function):
             bias=gate_up_proj_bias,
             cu_seqlens_m=cu_seqlens_m,
             A_idx=A_idx,
+            tuned=False,
         )
         fc1_activation = _gpt_oss_mlp_activation(gate_up, alpha, limit)
 
-        fc2_output = gemm(fc1_activation, down_proj, bias=down_proj_bias, cu_seqlens_m=cu_seqlens_m)
+        fc2_output = gemm(fc1_activation, down_proj, bias=down_proj_bias, cu_seqlens_m=cu_seqlens_m, tuned=False)
 
         reshaped_gate_weight = routing_weights.to(hidden_states.dtype).reshape(-1, 1)
         scattered_gate_weight = torch.empty_like(reshaped_gate_weight)
@@ -145,22 +146,22 @@ class GptOssQuackFusedMoeExpertFunction(torch.autograd.Function):
         grad_down_proj_bias = _segment_sum(grad_fc2_output, cu_seqlens_m)
 
         _assert_contiguous(down_proj, "down_proj")
-        grad_fc1_activation = gemm(grad_fc2_output, down_proj.transpose(1, 2), cu_seqlens_m=cu_seqlens_m)
+        grad_fc1_activation = gemm(grad_fc2_output, down_proj.transpose(1, 2), cu_seqlens_m=cu_seqlens_m, tuned=False)
         grad_down_proj = None
         if down_proj.requires_grad:
             _assert_contiguous(fc1_activation, "fc1_activation")
-            grad_down_proj = gemm(fc1_activation.T, grad_fc2_output, cu_seqlens_k=cu_seqlens_m)
+            grad_down_proj = gemm(fc1_activation.T, grad_fc2_output, cu_seqlens_k=cu_seqlens_m, tuned=False)
 
         grad_gate_up = _gpt_oss_mlp_activation_backward(grad_fc1_activation, gate_up, ctx.alpha, ctx.limit)
         grad_gate_up_proj_bias = _segment_sum(grad_gate_up, cu_seqlens_m)
 
         scatter_output = moe_scatter(hidden_states, scatter_index)
         _assert_contiguous(gate_up_proj, "gate_up_proj")
-        grad_scatter_output = gemm(grad_gate_up, gate_up_proj.transpose(1, 2), cu_seqlens_m=cu_seqlens_m)
+        grad_scatter_output = gemm(grad_gate_up, gate_up_proj.transpose(1, 2), cu_seqlens_m=cu_seqlens_m, tuned=False)
         grad_gate_up_proj = None
         if gate_up_proj.requires_grad:
             _assert_contiguous(scatter_output, "scatter_output")
-            grad_gate_up_proj = gemm(scatter_output.T, grad_gate_up, cu_seqlens_k=cu_seqlens_m)
+            grad_gate_up_proj = gemm(scatter_output.T, grad_gate_up, cu_seqlens_k=cu_seqlens_m, tuned=False)
         del scatter_output
 
         grad_hidden_states = moe_gather(grad_scatter_output, scatter_index).reshape(hidden_states.shape)
@@ -196,9 +197,9 @@ class EPGptOssQuackGroupGemm(torch.autograd.Function):
     ):
         cu_seqlens_m = _cumsum_to_cu_seqlens(cumsum)
 
-        gate_up = gemm(permute_tokens, gate_up_proj, bias=gate_up_proj_bias, cu_seqlens_m=cu_seqlens_m)
+        gate_up = gemm(permute_tokens, gate_up_proj, bias=gate_up_proj_bias, cu_seqlens_m=cu_seqlens_m, tuned=False)
         fc1_activation = _gpt_oss_mlp_activation(gate_up, alpha, limit)
-        fc2_output = gemm(fc1_activation, down_proj, bias=down_proj_bias, cu_seqlens_m=cu_seqlens_m)
+        fc2_output = gemm(fc1_activation, down_proj, bias=down_proj_bias, cu_seqlens_m=cu_seqlens_m, tuned=False)
 
         ctx.alpha = alpha
         ctx.limit = limit
@@ -226,21 +227,21 @@ class EPGptOssQuackGroupGemm(torch.autograd.Function):
 
         grad_down_proj_bias = _segment_sum(grad_output, cu_seqlens_m)
         _assert_contiguous(down_proj, "down_proj")
-        grad_fc1_activation = gemm(grad_output, down_proj.transpose(1, 2), cu_seqlens_m=cu_seqlens_m)
+        grad_fc1_activation = gemm(grad_output, down_proj.transpose(1, 2), cu_seqlens_m=cu_seqlens_m, tuned=False)
         grad_down_proj = None
         if down_proj.requires_grad:
             _assert_contiguous(fc1_activation, "fc1_activation")
-            grad_down_proj = gemm(fc1_activation.T, grad_output, cu_seqlens_k=cu_seqlens_m)
+            grad_down_proj = gemm(fc1_activation.T, grad_output, cu_seqlens_k=cu_seqlens_m, tuned=False)
 
         grad_gate_up = _gpt_oss_mlp_activation_backward(grad_fc1_activation, gate_up, ctx.alpha, ctx.limit)
         grad_gate_up_proj_bias = _segment_sum(grad_gate_up, cu_seqlens_m)
 
         _assert_contiguous(gate_up_proj, "gate_up_proj")
-        grad_permute_tokens = gemm(grad_gate_up, gate_up_proj.transpose(1, 2), cu_seqlens_m=cu_seqlens_m)
+        grad_permute_tokens = gemm(grad_gate_up, gate_up_proj.transpose(1, 2), cu_seqlens_m=cu_seqlens_m, tuned=False)
         grad_gate_up_proj = None
         if gate_up_proj.requires_grad:
             _assert_contiguous(permute_tokens, "permute_tokens")
-            grad_gate_up_proj = gemm(permute_tokens.T, grad_gate_up, cu_seqlens_k=cu_seqlens_m)
+            grad_gate_up_proj = gemm(permute_tokens.T, grad_gate_up, cu_seqlens_k=cu_seqlens_m, tuned=False)
 
         return (
             grad_permute_tokens,

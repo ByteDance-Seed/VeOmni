@@ -5,7 +5,6 @@ from typing import List
 import torch
 import torch.distributed as dist
 from torch.distributed._tensor import DTensor
-from torch.utils._foreach_utils import _device_has_foreach_support, _has_foreach_support
 
 from ...utils.device import get_device_type
 from ...utils.logging import get_logger
@@ -13,7 +12,6 @@ from ..parallel_state import get_parallel_state
 
 
 logger = get_logger(__name__)
-_LOCAL_NORM_CHUNK_SIZE = 128
 
 
 def clip_grad_norm(
@@ -246,26 +244,9 @@ def _raise_if_nonfinite(total_norm: torch.Tensor, norm_type: float, error_if_non
 
 
 def _local_pth_sum(params: List[torch.nn.Parameter], p: float) -> torch.Tensor:
-    """Compute the local p-th norm sum with bounded fp32 grad materialization."""
+    """Compute the local p-th norm sum without materializing fp32 gradients."""
     reduce_device = torch.device(get_device_type())
     res = torch.tensor(0.0, device=reduce_device, dtype=torch.float32)
-
-    # Materializing every grad as fp32 at once can OOM on large models, so keep
-    # foreach acceleration local to bounded same-device chunks.
-    chunks: dict[torch.device, list[torch.Tensor]] = {}
-
-    def flush_chunk(device: torch.device) -> None:
-        nonlocal res
-        chunk = chunks.get(device)
-        if not chunk:
-            return
-        chunk_fp32 = [g.to(torch.float32) for g in chunk]
-        if _has_foreach_support(chunk_fp32, device) or _device_has_foreach_support(device):
-            norm_pows = torch._foreach_pow_(torch._foreach_norm(chunk_fp32, p), p)
-        else:
-            norm_pows = [torch.linalg.vector_norm(g, p).pow(p) for g in chunk_fp32]
-        res = res + torch.sum(torch.stack(norm_pows)).to(reduce_device)
-        chunk.clear()
 
     with torch.no_grad():
         for param in params:
@@ -275,13 +256,17 @@ def _local_pth_sum(params: List[torch.nn.Parameter], p: float) -> torch.Tensor:
             if isinstance(g, DTensor):
                 g = g.to_local()
             g = g.detach()
-            chunk = chunks.setdefault(g.device, [])
-            chunk.append(g)
-            if len(chunk) >= _LOCAL_NORM_CHUNK_SIZE:
-                flush_chunk(g.device)
-
-        for device in list(chunks):
-            flush_chunk(device)
+            # ``dtype`` controls accumulation inside the reduction kernel. In
+            # contrast, ``g.to(float32)`` creates a full-size temporary, which
+            # can exceed the remaining VRAM for multi-billion-element experts.
+            if g.dtype in (torch.float16, torch.bfloat16, torch.float32):
+                norm = torch.linalg.vector_norm(g, ord=p, dtype=torch.float32)
+            else:
+                # Preserve the previous implementation's behavior for wider
+                # or uncommon dtypes. The memory-sensitive training dtypes
+                # above use in-kernel FP32 accumulation without this copy.
+                norm = torch.linalg.vector_norm(g.to(torch.float32), ord=p)
+            res = res + norm.pow(p).to(device=reduce_device, dtype=torch.float32)
     return res
 
 

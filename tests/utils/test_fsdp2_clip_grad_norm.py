@@ -1,12 +1,9 @@
-import importlib
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from veomni.distributed.fsdp2.clip_grad_norm import _fsdp_grad_norm_reduce_groups, _local_pth_sum
-
-
-clip_grad_norm_module = importlib.import_module("veomni.distributed.fsdp2.clip_grad_norm")
 
 
 def _parallel_state(
@@ -63,8 +60,7 @@ def test_fsdp_grad_norm_reduce_groups_skip_non_fsdp2_modes():
     assert _fsdp_grad_norm_reduce_groups(ps) == []
 
 
-def test_local_pth_sum_skips_missing_grads_and_accumulates_in_fp32(monkeypatch):
-    monkeypatch.setattr(clip_grad_norm_module, "_LOCAL_NORM_CHUNK_SIZE", 2)
+def test_local_pth_sum_skips_missing_grads_and_accumulates_in_fp32():
     p1 = torch.nn.Parameter(torch.tensor([1.0, -2.0]))
     p2 = torch.nn.Parameter(torch.tensor([3.0]))
     p3 = torch.nn.Parameter(torch.tensor([5.0]))
@@ -78,20 +74,40 @@ def test_local_pth_sum_skips_missing_grads_and_accumulates_in_fp32(monkeypatch):
     assert torch.equal(actual.cpu(), torch.tensor(169.0))
 
 
-def test_local_pth_sum_falls_back_without_foreach_support(monkeypatch):
-    monkeypatch.setattr(clip_grad_norm_module, "_has_foreach_support", lambda tensors, device: False)
-    monkeypatch.setattr(clip_grad_norm_module, "_device_has_foreach_support", lambda device: False)
-
-    def fail_foreach_norm(*args, **kwargs):
-        raise AssertionError("foreach path should not be used")
-
-    monkeypatch.setattr(torch, "_foreach_norm", fail_foreach_norm)
-    p1 = torch.nn.Parameter(torch.tensor([1.0, -2.0]))
-    p2 = torch.nn.Parameter(torch.tensor([3.0]))
-    p1.grad = torch.tensor([3.0, 4.0])
-    p2.grad = torch.tensor([12.0])
+def test_local_pth_sum_accumulates_bfloat16_gradients_in_fp32():
+    p1 = torch.nn.Parameter(torch.tensor([1.0, -2.0], dtype=torch.bfloat16))
+    p2 = torch.nn.Parameter(torch.tensor([3.0], dtype=torch.bfloat16))
+    p1.grad = torch.tensor([3.0, 4.0], dtype=torch.bfloat16)
+    p2.grad = torch.tensor([12.0], dtype=torch.bfloat16)
 
     actual = _local_pth_sum([p1, p2], p=2.0)
 
     assert actual.dtype == torch.float32
     assert torch.equal(actual.cpu(), torch.tensor(169.0))
+
+
+def test_local_pth_sum_supports_float64_gradients():
+    param = torch.nn.Parameter(torch.tensor([1.0, -2.0], dtype=torch.float64))
+    param.grad = torch.tensor([3.0, 4.0], dtype=torch.float64)
+
+    actual = _local_pth_sum([param], p=2.0)
+
+    assert actual.dtype == torch.float32
+    assert torch.equal(actual.cpu(), torch.tensor(25.0))
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32, torch.float64])
+@pytest.mark.parametrize("p", [1.0, 2.0, 3.5])
+def test_local_pth_sum_matches_previous_fp32_conversion(dtype, p):
+    params = [
+        torch.nn.Parameter(torch.zeros(4, dtype=dtype)),
+        torch.nn.Parameter(torch.zeros(3, dtype=dtype)),
+    ]
+    params[0].grad = torch.tensor([0.25, -1.5, 2.0, -0.75], dtype=dtype)
+    params[1].grad = torch.tensor([3.0, -0.5, 1.25], dtype=dtype)
+
+    actual = _local_pth_sum(params, p)
+    expected = sum(torch.linalg.vector_norm(param.grad.to(torch.float32), ord=p).pow(p) for param in params)
+
+    assert actual.dtype == torch.float32
+    torch.testing.assert_close(actual.cpu(), expected.cpu())

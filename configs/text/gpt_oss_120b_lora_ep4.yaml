@@ -1,0 +1,81 @@
+# Put Hub and compiler caches on local NVMe before downloading or training:
+#   export LOCAL_CACHE_ROOT=/path/to/local/nvme/veomni-cache
+#   export HF_HOME=$LOCAL_CACHE_ROOT/huggingface
+#   export TMPDIR=$LOCAL_CACHE_ROOT/tmp
+#   export QUACK_CACHE_DIR=$LOCAL_CACHE_ROOT/quack
+#   hf download unsloth/gpt-oss-120b-BF16 --local-dir $LOCAL_CACHE_ROOT/gpt-oss-120b-bf16
+# Override model.model_path and data.train_path when using these absolute paths.
+
+model:
+  # The OpenAI checkpoint stores MXFP4 blocks/scales for inference. Training
+  # requires dense expert weights, which this repository provides in BF16.
+  model_path: unsloth/gpt-oss-120b-BF16
+  ops_implementation:
+    # GPT-OSS attention uses sliding windows and learnable sinks, which are
+    # supported by VeOmni's FlashAttention 4 integration.
+    attn_implementation: flash_attention_4
+    # GPT-OSS uses interleaved gate/up projections; use its Quack backend.
+    moe_implementation: fused_quack
+  # EP=4 fits the BF16 base, gradients, and activations on 4x192 GB, but full
+  # AdamW states do not. Train attention adapters while keeping the base local.
+  lora_config:
+    rank: 16
+    alpha: 32
+    use_rslora: false
+    lora_modules:
+      - q_proj
+      - k_proj
+      - v_proj
+      - o_proj
+
+data:
+  # Download with:
+  # hf download allenai/tulu-3-sft-mixture --repo-type dataset \
+  #   --local-dir $LOCAL_CACHE_ROOT/tulu-3-sft-mixture
+  train_path: tulu-3-sft-mixture/data
+  train_size: 20000000
+  datasets_type: mapping
+  data_type: conversation
+  chat_template: gpt_oss
+  max_seq_len: 4096
+  text_keys: messages
+  dyn_bsz_buffer_size: 200
+
+train:
+  accelerator:
+    ulysses_size: 1
+    ep_size: 4
+    fsdp_config:
+      fsdp_mode: fsdp2
+      mixed_precision:
+        # LoRA keeps gradients and optimizer states small enough for FP32
+        # sharded storage, BF16 compute/all-gathers, and FP32 reductions.
+        enable: true
+        param_dtype: bfloat16
+        reduce_dtype: float32
+    offload_config:
+      enable_activation: false
+  gradient_checkpointing:
+    enable: true
+  global_batch_size: 4
+  micro_batch_size: 1
+  optimizer:
+    type: adamw
+    lr: 1.0e-5
+    lr_warmup_ratio: 0.01
+    lr_decay_style: cosine
+    weight_decay: 0.1
+    max_grad_norm: 1.0
+  num_train_epochs: 1
+  init_device: meta
+  # Each EP rank reads only its local dense-expert slice from safetensors.
+  broadcast_model_weights_from_rank0: false
+  ep_sharded_stream_load: true
+  empty_cache_steps: 100
+  checkpoint:
+    output_dir: gpt-oss-120b-ep4
+    manager: dcp
+    save_steps: 100
+  wandb:
+    project: VeOmni
+    name: gpt-oss-120b-ep4
