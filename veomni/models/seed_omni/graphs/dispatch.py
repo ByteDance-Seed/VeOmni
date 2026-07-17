@@ -117,6 +117,11 @@ def _sp_broadcast_sample(kwargs: Mapping[str, Any], src_group_rank: int, group: 
     }
 
 
+def _ddp_wrapped(module: nn.Module) -> bool:
+    """True if ``module`` is a ``DistributedDataParallel`` wrapper."""
+    return module.__class__.__name__ == "DistributedDataParallel"
+
+
 def run_sp_looped_endpoint(
     wrapped: nn.Module,
     raw: ModuleMixin,
@@ -143,6 +148,13 @@ def run_sp_looped_endpoint(
     zero-magnitude link over *all* sample outs, keeps every iteration reachable
     from the loss with a rank-identical backward collective order.
 
+    **DDP:** the loop issues ``sp_size`` forwards before one backward. DDP's
+    reducer is built for a single forward/backward pair and mis-handles that
+    pattern (observed: some SP ranks get all-zero grads). Call the raw module
+    inside the loop and let :func:`veomni_omni_module_clip_grad_norm` all-reduce
+    grads over ``fsdp_group`` (``dp_sp``) after backward — same sync surface as
+    FSDP2. FSDP2 stays on ``wrapped`` so its per-forward hooks still run.
+
     Callers MAY wrap this in ``no_reshard_after_forward(wrapped)`` so the
     ``sp_size`` forwards all-gather FSDP2 params once — opt-in via
     ``train.accelerator.fsdp_config.sp_keep_params_unsharded``.
@@ -153,12 +165,15 @@ def run_sp_looped_endpoint(
     sp_size = ps.sp_size
     my_rank = ps.sp_rank
     group = ps.sp_group
+    # Bypass DDP hooks for the multi-forward burst (see docstring). FSDP2 /
+    # unwrapped modules keep ``wrapped``.
+    endpoint_module = raw if _ddp_wrapped(wrapped) else wrapped
 
     outs: list[dict[str, Any]] = []
     for sample_idx in range(sp_size):
         sample_kwargs = _sp_broadcast_sample(kwargs, src_group_rank=sample_idx, group=group)
         sp_kwargs = raw.sp_pre_forward(method=method, **sample_kwargs)
-        out = call_graph_endpoint(wrapped, raw, method=method, kwargs=sp_kwargs)
+        out = call_graph_endpoint(endpoint_module, raw, method=method, kwargs=sp_kwargs)
         out = raw.sp_post_forward(method=method, **out)
         outs.append(out)
 

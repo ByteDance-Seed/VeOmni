@@ -799,7 +799,7 @@ def parallelize_model_ddp(
             fqn_to_index_mapping=kwargs.get("fqn_to_index_mapping"),
         )
 
-    # Per-module SP runs the DDP-wrapped module ``sp_size`` times before one
+    # Per-module SP may run the DDP-wrapped module ``sp_size`` times before one
     # backward (``run_sp_looped_endpoint``). DDP's default ``broadcast_buffers=True``
     # does an in-place ``copy_`` on every buffer at the start of each forward —
     # including constant index buffers such as Janus SigLIP's ``position_ids``
@@ -807,6 +807,11 @@ def parallelize_model_ddp(
     # checks (PyTorch #22095 / #66504). Disable buffer broadcast under SP; module
     # weights still sync via the gradient allreduce. Non-SP DDP keeps the default
     # (needed for BatchNorm running stats when those modules use DDP).
+    #
+    # Note: classic packed SP (one gather → one forward) is a single DDP
+    # forward/backward and needs no special casing beyond ``broadcast_buffers``.
+    # The looped-SP multi-forward burst is handled inside
+    # ``run_sp_looped_endpoint`` (call raw module; grad sync over ``fsdp_group``).
     return DDP(
         model,
         device_ids=[parallel_state.local_rank],

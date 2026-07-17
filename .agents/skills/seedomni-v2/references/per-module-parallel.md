@@ -83,7 +83,10 @@ Which dim shards depends on the module's attention:
   the ViT cu_seqlens metadata from the broadcast `grid_thw` — mirroring the text
   backbone deriving its FA `cu_seqlens` from the broadcast `position_ids`.
 - **Batch-dim** — SigLIP (`janus/siglip`) / VQVAE (`janus/vqvae`), whose attention
-  does not honor Ulysses, shard the image batch instead.
+  does not honor Ulysses, shard the image batch instead. DDP modules: call the
+  raw module inside the SP loop (avoid multi-forward reducer); AVG param grads
+  over `fsdp_group` in `veomni_clip_grad_norm` /
+  `veomni_omni_module_clip_grad_norm` when `sp_size > 1` (same surface as FSDP2).
 
 **Per-module group isolation.** Modules may run at *different* SP sizes in the
 same graph (e.g. ViT `ulysses_size=2` while the LLM runs `ulysses_size=4`). This
