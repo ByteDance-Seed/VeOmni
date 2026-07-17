@@ -46,7 +46,7 @@
 +#    - function_replacement: eager_attention_forward
 +#      Optional TileLang sparse MQA dispatch
 +#    - method_override: DeepseekV4Model.forward
-+#      Propagate packed sequence boundaries to compressed attention
++#      Propagate packed boundaries and preserve stateless indexer dispatch
 +#    - class_replacement: DeepseekV4Experts
 +#      Use v5 gate_up_proj expert layout with OpSlot-guarded VeOmni fused-MoE path
 +#    - method_override: DeepseekV4ForCausalLM.forward
@@ -895,19 +895,36 @@
  @auto_docstring
  class DeepseekV4Model(DeepseekV4PreTrainedModel):
      def __init__(self, config: DeepseekV4Config):
-@@ -1252,6 +1559,10 @@
+@@ -1252,6 +1559,11 @@
          # Initialize weights and apply final processing
          self.post_init()
 
 +    # ================================================================
 +    # Patch: DeepseekV4Model.forward
 +    # 1. Convert collator-provided cu-seqlens into reusable packed slices once.
++    # 2. Keep use_cache=False forwards stateless so the TileLang indexer can run.
 +    # ================================================================
      @merge_with_config_defaults
      @capture_outputs
      @auto_docstring
-@@ -1276,9 +1587,31 @@
-             past_seen = past_key_values.get_seq_length()
+@@ -1267,18 +1579,44 @@
+     ) -> MoeModelOutputWithPast:
+         if (input_ids is None) ^ (inputs_embeds is not None):
+             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
++        # Stateless prefill/training must keep the cache absent: the TileLang
++        # Lightning Indexer dispatch is intentionally cache-free, and creating a
++        # DynamicCache here would silently force its eager decode fallback even
++        # when use_cache=False.
++        if past_key_values is None and use_cache:
++            past_key_values = DynamicCache(config=self.config)
+         return_cache = past_key_values if use_cache else None
+-        if past_key_values is None:
+-            past_key_values = DynamicCache(config=self.config)
+         if inputs_embeds is None:
+             inputs_embeds = self.embed_tokens(input_ids)
+         if position_ids is None:
+-            past_seen = past_key_values.get_seq_length()
++            past_seen = past_key_values.get_seq_length() if past_key_values is not None else 0
              position_ids = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device) + past_seen
              position_ids = position_ids.unsqueeze(0)
 -            # `generate()` may pass a per-layer-type mask dict already built by
@@ -941,7 +958,7 @@
          if isinstance(attention_mask, dict):
              causal_mask = next(iter(attention_mask.values()))
          else:
-@@ -1289,6 +1622,8 @@
+@@ -1289,6 +1627,8 @@
                  past_key_values=past_key_values,
                  position_ids=position_ids,
              )
@@ -950,7 +967,7 @@
          hidden_states = inputs_embeds.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1).contiguous()
          position_embeddings = {
              "main": self.rotary_emb(inputs_embeds, position_ids=position_ids, layer_type="main"),
-@@ -1392,6 +1727,12 @@
+@@ -1392,6 +1732,12 @@
      return overall_loss * num_experts
 
 
@@ -963,7 +980,7 @@
  @auto_docstring
  class DeepseekV4ForCausalLM(DeepseekV4PreTrainedModel, GenerationMixin):
      _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
-@@ -1410,49 +1751,36 @@
+@@ -1410,49 +1756,36 @@
          # Initialize weights and apply final processing
          self.post_init()
 
@@ -1033,7 +1050,7 @@
          outputs: MoeModelOutputWithPast = self.model(
              input_ids=input_ids,
              attention_mask=attention_mask,
-@@ -1465,26 +1793,64 @@
+@@ -1465,26 +1798,64 @@
          )
 
          hidden_states = outputs.last_hidden_state
@@ -1112,7 +1129,7 @@
              loss=loss,
              aux_loss=aux_loss,
              logits=logits,
-@@ -1492,7 +1858,17 @@
+@@ -1492,7 +1863,17 @@
              hidden_states=outputs.hidden_states,
              attentions=outputs.attentions,
              router_logits=outputs.router_logits,
