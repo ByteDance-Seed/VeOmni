@@ -677,6 +677,15 @@ class TrainingArguments:
         default=False,
         metadata={"help": "Enable batch invariant mode."},
     )
+    sync_each_train_step: bool = field(
+        default=True,
+        metadata={
+            "help": (
+                "Synchronize the accelerator before each training step's forward/backward work. "
+                "Disable to allow asynchronous dataloader and H2D work to overlap with the next step."
+            )
+        },
+    )
     empty_cache_steps: int = field(
         default=500,
         metadata={"help": "Number of steps between two empty cache operations."},

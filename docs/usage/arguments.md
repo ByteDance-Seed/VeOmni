@@ -258,6 +258,7 @@ NPU validation runs at two times:
 | ep_sharded_stream_load | `bool` | `False` | Opt-in fast/low-memory MoE loader: each rank reads only its ExtraParallel dim-0 slice from the checkpoint. Requires `broadcast_model_weights_from_rank0=False` and a model with an ExtraParallel parallel_plan. |
 | enable_full_determinism | `bool` | `False` | Enable full determinism (bitwise alignment). |
 | enable_batch_invariant_mode | `bool` | `False` | Enable batch invariant mode. |
+| sync_each_train_step | `bool` | `True` | Synchronize the accelerator before each training step's forward/backward work. Disable to allow async dataloader and H2D work to overlap with the next step. |
 | empty_cache_steps | `int` | `500` | Steps between device-cache cleanup calls. A non-positive value disables scheduled cleanup. |
 | gc_steps | `int` | `500` | When positive, disable automatic Python GC and run `gc.collect()` every N steps. A non-positive value leaves automatic GC enabled and disables scheduled collection. |
 | eval_steps | `int` | `0` | Steps between evaluations. `0` to disable. |
