@@ -73,7 +73,7 @@ from ..utils.device import (
     is_nccl_backend,
     synchronize,
 )
-from ..utils.loss_utils import count_loss_token, mean_global_loss
+from ..utils.loss_utils import count_loss_token, mean_global_loss, reduce_global_loss_token
 from ..utils.model_utils import pretty_print_trainable_parameters
 from .callbacks import (
     ChannelLossCallback,
@@ -675,7 +675,10 @@ class BaseTrainer(Stateful, ABC):
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """Postprocess model outputs after forward pass."""
         loss_dict: Dict[str, torch.Tensor] = mean_global_loss(
-            outputs.loss, self.micro_batch_token_len, self.micro_batches_token_len
+            outputs.loss,
+            self.micro_batch_token_len,
+            self.micro_batches_token_len,
+            getattr(self, "global_micro_batches_token_len", None),
         )
         loss = torch.stack(list(loss_dict.values())).sum()
         return loss, loss_dict
@@ -766,6 +769,7 @@ class BaseTrainer(Stateful, ABC):
 
         # token num for fixed_ce_loss in postforward
         self.micro_batches_token_len = count_loss_token(micro_batches)
+        self.global_micro_batches_token_len = reduce_global_loss_token(self.micro_batches_token_len)
         num_micro_steps = len(micro_batches)
         # forward and backward pass with gradient_accumulationsteps
         for micro_step, micro_batch in enumerate(micro_batches):
