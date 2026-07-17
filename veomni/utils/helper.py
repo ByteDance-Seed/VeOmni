@@ -88,8 +88,13 @@ CACHE_DIR = os.path.expanduser(os.getenv("CACHE_DIR", os.path.join("~/.cache", "
 def _compute_seqlens(micro_batch: Dict[str, "torch.Tensor"]) -> List[int]:
     if "cu_seq_lens_q" in micro_batch:
         # packed micro batch
-        seqlens = valid_seqlens_from_cu_seqlens(micro_batch["cu_seq_lens_q"]).tolist()
+        tail_padding_length = micro_batch.get("tail_padding_length")
+        seqlens = valid_seqlens_from_cu_seqlens(
+            micro_batch["cu_seq_lens_q"],
+            tail_padding_length=int(tail_padding_length) if tail_padding_length is not None else None,
+        ).tolist()
         return seqlens
+
     elif "attention_mask" in micro_batch:
         # unpacked sample
         attention_mask = micro_batch["attention_mask"]
@@ -215,21 +220,15 @@ class EnvironMeter:
         self.batch_ds_idx = []
         self.images_seqlens = []
 
-        self.multisource_tracker = None
         if self.enable_multisource:
-            if dataloader is None:
-                # Under SP only sp_rank 0 owns the dataloader; the other ranks
-                # have nothing to build a multi-source tracker from. Skip it
-                # instead of raising — every dp_group has a uniform sp_rank
-                # (dp ⟂ sp), so the tracker's dp-group all_gather in ``step`` is
-                # still called symmetrically (all-or-none per dp_group).
-                pass
-            elif data_path is None:
-                raise ValueError("`data_path` is required for `EnvironMeter` with multi-source dataloader.")
-            else:
-                self.multisource_tracker = MultiSourceInfoTracker(
-                    dataloader=dataloader, data_path=data_path, parallel_state=self.parallel_state
+            if dataloader is None or data_path is None:
+                raise ValueError(
+                    "`dataloader` and `data_path` is required for `EnvironMeter` with multi-source dataloader."
                 )
+
+            self.multisource_tracker = MultiSourceInfoTracker(
+                dataloader=dataloader, data_path=data_path, parallel_state=self.parallel_state
+            )
 
         # for internal use
         if VALID_CONFIG_TYPE is not None and isinstance(config, VALID_CONFIG_TYPE):
@@ -242,7 +241,7 @@ class EnvironMeter:
 
     def state_dict(self) -> Dict[str, Any]:
         state_dict = {"consume_tokens": self.consume_tokens, "consume_chunks": self.consume_chunks}
-        if self.multisource_tracker is not None:
+        if self.enable_multisource:
             state_dict.update({"multisource_tracker": self.multisource_tracker.state_dict()})
 
         return state_dict
@@ -250,7 +249,7 @@ class EnvironMeter:
     def load_state_dict(self, state_dict: Dict[str, Any]):
         self.consume_tokens = state_dict["consume_tokens"]
         self.consume_chunks = state_dict["consume_chunks"]
-        if self.multisource_tracker is not None and "multisource_tracker" in state_dict:
+        if self.enable_multisource:
             self.multisource_tracker.load_state_dict(state_dict["multisource_tracker"])
 
     def add(self, micro_batch: Union[Dict[str, "torch.Tensor"], List[Dict[str, "torch.Tensor"]]]) -> None:
@@ -304,7 +303,7 @@ class EnvironMeter:
         }
         metrics.update(compute_device_memory_metrics())
 
-        if self.multisource_tracker is not None:
+        if self.enable_multisource:
             metrics.update(self.multisource_tracker.step(self.batch_ds_idx, self.batch_seqlens))
 
         if self.empty_cache_steps > 0 and global_step % self.empty_cache_steps == 0:
@@ -414,7 +413,7 @@ class MultiSourceInfoTracker:
                     f"multi_source/step_consumed_tokens(M)/{self.names[ds_idx]}": global_counter[ds_idx].num_tokens
                     / 1e6,
                     f"multi_source/step_consumed_ratio/{self.names[ds_idx]}": global_counter[ds_idx].num_tokens
-                    / max(step_consumed_tokens, 1),
+                    / step_consumed_tokens,
                 }
             )
 

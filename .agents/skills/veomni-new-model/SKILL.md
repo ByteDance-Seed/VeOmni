@@ -1,6 +1,6 @@
 ---
 name: veomni-new-model
-description: "Use this skill when adding support for a new model to VeOmni. Covers the full lifecycle: analyzing the HuggingFace model, creating model patches, defining parallel plans, writing configs, integrating with the trainer, and testing. Trigger: 'add model', 'support new model', 'integrate <model_name>', 'new model support'."
+description: "Use this skill when adding support for a new model to VeOmni. Covers the full lifecycle: analyzing the HuggingFace model, creating model patches, defining parallel plans, writing configs, integrating with the trainer, and testing. Trigger: 'add model', 'support new model', 'integrate a model', 'new model support'."
 ---
 
 ## Before You Start: Create Todos
@@ -61,7 +61,7 @@ Phase 6: Test                          -> pending
 
 3. If the model is MoE, define expert parallelism plan in addition to FSDP.
 
-4. Reference existing parallel plans for guidance (e.g., `veomni/models/transformers/qwen3/parallel_plan.py`).
+4. Reference existing parallel plans for guidance (e.g., `veomni/models/transformers/qwen3_moe/parallel_plan.py`).
 
 ## Phase 4: Write Training Config
 

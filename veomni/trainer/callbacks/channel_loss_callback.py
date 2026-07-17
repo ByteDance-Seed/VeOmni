@@ -29,7 +29,7 @@ from collections.abc import Hashable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from numbers import Integral
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Callable
 from weakref import WeakSet
 
 import torch
@@ -46,24 +46,13 @@ logger = get_logger(__name__)
 
 
 if TYPE_CHECKING:
+    from ...distributed.parallel_state import ParallelState
     from ..base import BaseTrainer
-
-
-try:
-    from ...distributed.sequence_parallel import (
-        get_unified_sequence_parallel_group,
-        get_unified_sequence_parallel_rank,
-        get_unified_sequence_parallel_world_size,
-    )
-except ImportError:
-    get_unified_sequence_parallel_group = None  # type: ignore[assignment]
-    get_unified_sequence_parallel_rank = None  # type: ignore[assignment]
-    get_unified_sequence_parallel_world_size = None  # type: ignore[assignment]
 
 
 ChannelKey = Hashable
 _LOSS_CALL_POSITIONAL_KEYS = ("logits", "labels", "vocab_size", "num_items_in_batch", "ignore_index")
-_ACTIVE_CHANNEL_LOSS_COMPUTER: ContextVar[Optional["ChannelLossComputer"]] = ContextVar(
+_ACTIVE_CHANNEL_LOSS_COMPUTER: ContextVar[ChannelLossComputer | None] = ContextVar(
     "veomni_active_channel_loss_computer", default=None
 )
 
@@ -84,18 +73,11 @@ class _OpSlotDispatcher:
         return result
 
 
-_OP_SLOT_DISPATCHERS: Dict[Any, _OpSlotDispatcher] = {}
+_OP_SLOT_DISPATCHERS: dict[Any, _OpSlotDispatcher] = {}
 
 
 class ChannelLossMetadataError(ValueError):
     """Raised when channel metadata cannot be aligned with packed segments."""
-
-
-def _is_sp_enabled() -> bool:
-    try:
-        return get_parallel_state().sp_enabled
-    except Exception:
-        return False
 
 
 class ChannelLossComputer:
@@ -103,30 +85,33 @@ class ChannelLossComputer:
 
     EAGER_CHUNK_SIZE = 512
 
-    def __init__(self) -> None:
-        self._original_loss_fn: Optional[Callable[..., Any]] = None
-        self._model_ref: Optional[torch.nn.Module] = None
+    def __init__(self, parallel_state: ParallelState | None = None) -> None:
+        # Cached at construction (same pattern as ``Callback.parallel_state``) so
+        # SP/DP collectives never depend on ambient ``get_parallel_state()``.
+        self.parallel_state = parallel_state if parallel_state is not None else get_parallel_state()
+        self._original_loss_fn: Callable[..., Any] | None = None
+        self._model_ref: torch.nn.Module | None = None
         self._installed = False
-        self._wrapped_opslots: List[Any] = []
+        self._wrapped_opslots: list[Any] = []
 
-        self._source_ids: List[ChannelKey] = []
-        self._position_ids: Optional[torch.Tensor] = None
-        self._attention_mask: Optional[torch.Tensor] = None
-        self._result: Optional[List[Dict[str, Any]]] = None
-        self._per_mb_source_ids: List[List[ChannelKey]] = []
-        self._per_mb_position_ids: List[Optional[torch.Tensor]] = []
-        self._per_mb_attention_masks: List[Optional[torch.Tensor]] = []
+        self._source_ids: list[ChannelKey] = []
+        self._position_ids: torch.Tensor | None = None
+        self._attention_mask: torch.Tensor | None = None
+        self._result: list[dict[str, Any]] | None = None
+        self._per_mb_source_ids: list[list[ChannelKey]] = []
+        self._per_mb_position_ids: list[torch.Tensor | None] = []
+        self._per_mb_attention_masks: list[torch.Tensor | None] = []
         self._micro_step = 0
-        self.step_totals: Dict[ChannelKey, tuple[torch.Tensor, torch.Tensor]] = {}
-        self.source_names: Dict[ChannelKey, str] = {}
+        self.step_totals: dict[ChannelKey, tuple[torch.Tensor, torch.Tensor]] = {}
+        self.source_names: dict[ChannelKey, str] = {}
         self.strict = False
 
     @staticmethod
-    def _resolve_loss_fn_host(model: torch.nn.Module) -> Optional[torch.nn.Module]:
+    def _resolve_loss_fn_host(model: torch.nn.Module) -> torch.nn.Module | None:
         """Walk common wrappers to find the module whose forward calls ``loss_function``."""
 
         visited = set()
-        cur: Optional[torch.nn.Module] = model
+        cur: torch.nn.Module | None = model
         while cur is not None and id(cur) not in visited:
             visited.add(id(cur))
             cls_name = type(cur).__name__
@@ -229,7 +214,7 @@ class ChannelLossComputer:
     def _wrap_causal_loss_opslots(
         self,
         model: torch.nn.Module,
-        host: Optional[torch.nn.Module],
+        host: torch.nn.Module | None,
     ) -> None:
         modules = []
         seen = set()
@@ -285,7 +270,7 @@ class ChannelLossComputer:
         self,
         original_kernel: Callable[..., Any],
         args: tuple[Any, ...],
-        kwargs: Dict[str, Any],
+        kwargs: dict[str, Any],
     ) -> None:
         call_args = _bind_loss_call_args(original_kernel, args, kwargs)
         labels = call_args.get("labels")
@@ -305,9 +290,9 @@ class ChannelLossComputer:
 
     def begin_step(
         self,
-        per_mb_source_ids: List[List[ChannelKey]],
-        per_mb_position_ids: List[Optional[torch.Tensor]],
-        per_mb_attention_masks: List[Optional[torch.Tensor]],
+        per_mb_source_ids: list[list[ChannelKey]],
+        per_mb_position_ids: list[torch.Tensor | None],
+        per_mb_attention_masks: list[torch.Tensor | None],
     ) -> None:
         self._per_mb_source_ids = per_mb_source_ids
         self._per_mb_position_ids = per_mb_position_ids
@@ -344,7 +329,7 @@ class ChannelLossComputer:
         self._result = None
         self._micro_step += 1
 
-    def record_source_names(self, source_ids: List[ChannelKey], source_names: List[str]) -> None:
+    def record_source_names(self, source_ids: list[ChannelKey], source_names: list[str]) -> None:
         if not source_ids or not source_names:
             return
         if len(source_names) == 1:
@@ -380,12 +365,12 @@ class ChannelLossComputer:
 
     def compute_side_channel(
         self,
-        logits: Optional[torch.Tensor],
+        logits: torch.Tensor | None,
         labels: torch.Tensor,
-        vocab_size: Optional[int],
-        hidden_states: Optional[torch.Tensor],
-        weights: Optional[torch.Tensor],
-        shift_labels: Optional[torch.Tensor] = None,
+        vocab_size: int | None,
+        hidden_states: torch.Tensor | None,
+        weights: torch.Tensor | None,
+        shift_labels: torch.Tensor | None = None,
         ignore_index: int = IGNORE_INDEX,
     ) -> None:
         try:
@@ -411,16 +396,16 @@ class ChannelLossComputer:
     @torch.no_grad()
     def _compute_channel_loss(
         self,
-        logits: Optional[torch.Tensor],
+        logits: torch.Tensor | None,
         labels: torch.Tensor,
-        vocab_size: Optional[int],
-        hidden_states: Optional[torch.Tensor],
-        weights: Optional[torch.Tensor],
-        attention_mask: Optional[torch.Tensor],
-        shift_labels: Optional[torch.Tensor],
+        vocab_size: int | None,
+        hidden_states: torch.Tensor | None,
+        weights: torch.Tensor | None,
+        attention_mask: torch.Tensor | None,
+        shift_labels: torch.Tensor | None,
         ignore_index: int,
-    ) -> List[Dict[str, Any]]:
-        sp_enabled = _is_sp_enabled()
+    ) -> list[dict[str, Any]]:
+        sp_enabled = bool(self.parallel_state.sp_enabled)
         if sp_enabled:
             effective_labels = labels
         elif shift_labels is not None:
@@ -449,18 +434,19 @@ class ChannelLossComputer:
             position_ids=self._position_ids,
             ignore_index=ignore_index,
             sp_enabled=sp_enabled,
+            parallel_state=self.parallel_state,
             strict=self.strict,
         )
 
     def _per_token_ce(
         self,
-        logits: Optional[torch.Tensor],
+        logits: torch.Tensor | None,
         labels_flat: torch.Tensor,
-        vocab_size: Optional[int],
-        hidden_states: Optional[torch.Tensor],
-        weights: Optional[torch.Tensor],
+        vocab_size: int | None,
+        hidden_states: torch.Tensor | None,
+        weights: torch.Tensor | None,
         ignore_index: int,
-    ) -> Optional[torch.Tensor]:
+    ) -> torch.Tensor | None:
         if hidden_states is not None and weights is not None:
             hs = hidden_states.detach().reshape(-1, hidden_states.size(-1))
             w = weights.detach()
@@ -518,13 +504,14 @@ class ChannelLossComputer:
     def _aggregate_by_source(
         per_token_loss: torch.Tensor,
         labels_flat: torch.Tensor,
-        attention_mask_flat: Optional[torch.Tensor],
-        source_ids: List[ChannelKey],
-        position_ids: Optional[torch.Tensor],
+        attention_mask_flat: torch.Tensor | None,
+        source_ids: list[ChannelKey],
+        position_ids: torch.Tensor | None,
         ignore_index: int,
         sp_enabled: bool = False,
+        parallel_state: ParallelState | None = None,
         strict: bool = False,
-    ) -> List[Dict[str, Any]]:
+    ) -> list[dict[str, Any]]:
         if not source_ids:
             return []
 
@@ -532,8 +519,8 @@ class ChannelLossComputer:
         per_token_loss = per_token_loss[:seq_len]
         labels_flat = labels_flat[:seq_len]
 
-        segments: List[tuple[int, int, int]] = []
-        pos_flat: Optional[torch.Tensor] = None
+        segments: list[tuple[int, int, int]] = []
+        pos_flat: torch.Tensor | None = None
         if position_ids is not None:
             pos = position_ids
             if pos.dim() == 3:
@@ -544,7 +531,7 @@ class ChannelLossComputer:
                 pos_2d = pos.reshape(pos.size(0), -1)
             pos_flat = pos_2d.reshape(-1)[:seq_len]
 
-            if sp_enabled and get_unified_sequence_parallel_rank is not None:
+            if sp_enabled:
                 return ChannelLossComputer._aggregate_sp(
                     per_token_loss=per_token_loss,
                     labels_flat=labels_flat,
@@ -553,6 +540,7 @@ class ChannelLossComputer:
                     positions=pos_2d,
                     seq_len=seq_len,
                     ignore_index=ignore_index,
+                    parallel_state=parallel_state,
                     strict=strict,
                 )
 
@@ -587,7 +575,7 @@ class ChannelLossComputer:
         if not _validate_segment_count(n_segments, len(source_ids), strict, "packed segment count"):
             return []
 
-        channel_loss: List[Dict[str, Any]] = []
+        channel_loss: list[dict[str, Any]] = []
         for i, (_, start, end) in enumerate(segments):
             labels_slice = labels_flat[start : end + 1]
             loss_slice = per_token_loss[start : end + 1]
@@ -607,16 +595,19 @@ class ChannelLossComputer:
     def _aggregate_sp(
         per_token_loss: torch.Tensor,
         labels_flat: torch.Tensor,
-        attention_mask_flat: Optional[torch.Tensor],
-        source_ids: List[ChannelKey],
+        attention_mask_flat: torch.Tensor | None,
+        source_ids: list[ChannelKey],
         positions: torch.Tensor,
         seq_len: int,
         ignore_index: int,
+        parallel_state: ParallelState | None = None,
         strict: bool = False,
-    ) -> List[Dict[str, Any]]:
-        assert get_unified_sequence_parallel_rank is not None
-        sp_rank = get_unified_sequence_parallel_rank()
-        segments: List[Dict[str, Any]] = []
+    ) -> list[dict[str, Any]]:
+        if parallel_state is None:
+            raise ValueError("parallel_state is required for SP channel-loss aggregation.")
+        sp_group = parallel_state.sp_group
+        sp_rank = dist.get_rank(sp_group) if sp_group is not None else 0
+        segments: list[dict[str, Any]] = []
 
         if positions.dim() == 1:
             positions_2d = positions.reshape(1, -1)
@@ -690,6 +681,7 @@ class ChannelLossComputer:
             segments,
             source_ids,
             device=per_token_loss.device,
+            parallel_state=parallel_state,
             strict=strict,
         )
         return [
@@ -703,11 +695,12 @@ class ChannelLossComputer:
 
     @staticmethod
     def _reduce_sp(
-        local_segments: List[Dict[str, Any]],
-        source_ids: List[ChannelKey],
+        local_segments: list[dict[str, Any]],
+        source_ids: list[ChannelKey],
         device: torch.device,
+        parallel_state: ParallelState | None = None,
         strict: bool = False,
-    ) -> List[Dict[str, Any]]:
+    ) -> list[dict[str, Any]]:
         if local_segments:
             local_zero_position_flags = torch.tensor(
                 [segment["has_only_zero_positions"] for segment in local_segments],
@@ -717,8 +710,10 @@ class ChannelLossComputer:
             for segment, zero_position_flag in zip(local_segments, local_zero_position_flags.unbind()):
                 segment["has_only_zero_positions"] = zero_position_flag
 
-        group = get_unified_sequence_parallel_group()
-        world = get_unified_sequence_parallel_world_size()
+        if parallel_state is None:
+            raise ValueError("parallel_state is required for SP channel-loss reduction.")
+        group = parallel_state.sp_group
+        world = parallel_state.sp_size if group is not None else 1
         if group is None or world <= 1:
             all_segments = local_segments
         else:
@@ -731,7 +726,7 @@ class ChannelLossComputer:
                 }
                 for segment in local_segments
             ]
-            gathered_metadata: List[Optional[List[Dict[str, Any]]]] = [None] * world
+            gathered_metadata: list[list[dict[str, Any]] | None] = [None] * world
             dist.all_gather_object(gathered_metadata, local_metadata, group=group)
             rank_segment_counts = [len(rank_metadata or []) for rank_metadata in gathered_metadata]
             max_segment_count = max(rank_segment_counts, default=0)
@@ -808,8 +803,8 @@ class ChannelLossComputer:
             return []
 
         doc_idx = 0
-        result: List[Dict[str, Any]] = []
-        last_result_idx_by_batch: Dict[int, int] = {}
+        result: list[dict[str, Any]] = []
+        last_result_idx_by_batch: dict[int, int] = {}
         for segment in all_segments:
             batch_idx = int(segment.get("batch_idx", 0))
             if segment["is_start"]:
@@ -842,7 +837,7 @@ class ChannelLossComputer:
 class ChannelLossCallback(Callback):
     """Trainer callback for detached per-source causal-LM loss metrics."""
 
-    def __init__(self, trainer: "BaseTrainer") -> None:
+    def __init__(self, trainer: BaseTrainer) -> None:
         super().__init__(trainer)
         self.config = trainer.args.train.channel_loss
         data_type = getattr(getattr(trainer.args, "data", None), "data_type", None)
@@ -860,19 +855,19 @@ class ChannelLossCallback(Callback):
                 "train.channel_loss does not support BaseRLTrainer because it packs metadata during preforward, "
                 "after the common channel-loss step lifecycle captures alignment metadata."
             )
-        self.computer = ChannelLossComputer()
+        self.computer = ChannelLossComputer(parallel_state=self.parallel_state)
         self._strip_keys = set(self.config.source_id_keys)
         self._strip_keys.update(self.config.source_name_keys)
         self._strip_keys.update(self.config.extra_strip_keys)
         self.computer.strict = bool(self.config.strict)
         self._collect_step = False
-        self._source_registry: Dict[ChannelKey, Optional[str]] = {}
+        self._source_registry: dict[ChannelKey, str | None] = {}
 
     @property
     def enabled(self) -> bool:
         return bool(self.config.enable)
 
-    def state_dict(self) -> Dict[str, Any]:
+    def state_dict(self) -> dict[str, Any]:
         return {
             "source_registry": sorted(
                 self._source_registry.items(),
@@ -880,12 +875,12 @@ class ChannelLossCallback(Callback):
             )
         }
 
-    def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
+    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
         entries = state_dict.get("source_registry", [])
         if not isinstance(entries, (list, tuple)):
             raise ValueError("Channel loss checkpoint source_registry must be a list of pairs.")
 
-        restored: Dict[ChannelKey, Optional[str]] = {}
+        restored: dict[ChannelKey, str | None] = {}
         for entry in entries:
             if not isinstance(entry, (list, tuple)) or len(entry) != 2:
                 raise ValueError("Channel loss checkpoint source_registry entries must be (source_id, source_name).")
@@ -921,7 +916,7 @@ class ChannelLossCallback(Callback):
     def on_step_begin(
         self,
         state: TrainerState,
-        micro_batches: List[Dict[str, Any]] = None,
+        micro_batches: list[dict[str, Any]] = None,
         source_repeat: int = 1,
         **kwargs: Any,
     ) -> None:
@@ -940,9 +935,9 @@ class ChannelLossCallback(Callback):
                     self._require_source_ids(source_ids)
             return
 
-        per_mb_source_ids: List[List[ChannelKey]] = []
-        per_mb_position_ids: List[Optional[torch.Tensor]] = []
-        per_mb_attention_masks: List[Optional[torch.Tensor]] = []
+        per_mb_source_ids: list[list[ChannelKey]] = []
+        per_mb_position_ids: list[torch.Tensor | None] = []
+        per_mb_attention_masks: list[torch.Tensor | None] = []
         for micro_batch in micro_batches or []:
             source_ids, source_names, position_ids, attention_mask = self._extract_metadata(micro_batch)
             if self.config.strict:
@@ -957,10 +952,10 @@ class ChannelLossCallback(Callback):
 
     @staticmethod
     def _repeat_source_metadata(
-        source_ids: List[ChannelKey],
-        source_names: List[str],
+        source_ids: list[ChannelKey],
+        source_names: list[str],
         repeat: int,
-    ) -> tuple[List[ChannelKey], List[str]]:
+    ) -> tuple[list[ChannelKey], list[str]]:
         if repeat == 1:
             return source_ids, source_names
 
@@ -969,7 +964,7 @@ class ChannelLossCallback(Callback):
             source_names = [source_name for source_name in source_names for _ in range(repeat)]
         return repeated_ids, source_names
 
-    def _require_source_ids(self, source_ids: List[ChannelKey]) -> None:
+    def _require_source_ids(self, source_ids: list[ChannelKey]) -> None:
         if source_ids:
             return
         raise ValueError(
@@ -980,14 +975,14 @@ class ChannelLossCallback(Callback):
     def on_micro_step_begin(
         self,
         state: TrainerState,
-        micro_batch: Dict[str, Any],
+        micro_batch: dict[str, Any],
         **kwargs: Any,
     ) -> None:
         if not self._collect_step:
             return
         self.computer.before_micro_step()
 
-    def strip_model_inputs(self, micro_batch: Dict[str, Any]) -> None:
+    def strip_model_inputs(self, micro_batch: dict[str, Any]) -> None:
         if not self.enabled or not isinstance(micro_batch, dict):
             return
         for key in self._strip_keys:
@@ -998,7 +993,7 @@ class ChannelLossCallback(Callback):
             self.computer.after_micro_step()
 
     @contextmanager
-    def micro_step_context(self, state: TrainerState, micro_batch: Dict[str, Any]) -> Iterator[None]:
+    def micro_step_context(self, state: TrainerState, micro_batch: dict[str, Any]) -> Iterator[None]:
         if not self._collect_step:
             yield
             return
@@ -1020,7 +1015,7 @@ class ChannelLossCallback(Callback):
         self,
         state: TrainerState,
         loss: float,
-        loss_dict: Dict[str, float],
+        loss_dict: dict[str, float],
         grad_norm: float,
         **kwargs: Any,
     ) -> None:
@@ -1045,15 +1040,11 @@ class ChannelLossCallback(Callback):
 
     def _reduce_step_totals(
         self,
-        local_totals: Dict[ChannelKey, tuple[torch.Tensor, torch.Tensor]],
-    ) -> tuple[Dict[ChannelKey, tuple[float, int]], Dict[ChannelKey, str]]:
-        try:
-            ps = get_parallel_state()
-            dp_size = ps.dp_size
-            dp_group = ps.dp_group
-        except Exception:
-            dp_size = 1
-            dp_group = None
+        local_totals: dict[ChannelKey, tuple[torch.Tensor, torch.Tensor]],
+    ) -> tuple[dict[ChannelKey, tuple[float, int]], dict[ChannelKey, str]]:
+        ps = self.parallel_state
+        dp_size = ps.dp_size
+        dp_group = ps.dp_group
 
         distributed = dp_size > 1 and dist.is_available() and dist.is_initialized()
         local_metadata = [
@@ -1061,7 +1052,7 @@ class ChannelLossCallback(Callback):
             for source_id in sorted(local_totals, key=_channel_sort_key)
         ]
         if distributed:
-            gathered_metadata: List[Optional[List[tuple[ChannelKey, Optional[str]]]]] = [None] * dp_size
+            gathered_metadata: list[list[tuple[ChannelKey, str | None]] | None] = [None] * dp_size
             dist.all_gather_object(gathered_metadata, local_metadata, group=dp_group)
         else:
             gathered_metadata = [local_metadata]
@@ -1073,13 +1064,13 @@ class ChannelLossCallback(Callback):
         if not source_ids:
             return {}, {}
 
-        name_candidates: Dict[ChannelKey, set[str]] = defaultdict(set)
+        name_candidates: dict[ChannelKey, set[str]] = defaultdict(set)
         for rank_metadata in gathered_metadata:
             for source_id, source_name in rank_metadata or []:
                 if source_name:
                     name_candidates[source_id].add(source_name)
 
-        synchronized_names: Dict[ChannelKey, str] = {}
+        synchronized_names: dict[ChannelKey, str] = {}
         for source_id in source_ids:
             candidates = sorted(name_candidates[source_id])
             if len(candidates) > 1:
@@ -1114,9 +1105,9 @@ class ChannelLossCallback(Callback):
 
     def _register_sources(
         self,
-        source_ids: List[ChannelKey],
-        source_names: Optional[Dict[ChannelKey, str]] = None,
-    ) -> Dict[ChannelKey, str]:
+        source_ids: list[ChannelKey],
+        source_names: dict[ChannelKey, str] | None = None,
+    ) -> dict[ChannelKey, str]:
         source_names = source_names or {}
         for source_id in source_ids:
             incoming_name = source_names.get(source_id)
@@ -1148,7 +1139,7 @@ class ChannelLossCallback(Callback):
 
     def _totals_device(
         self,
-        local_totals: Dict[ChannelKey, tuple[torch.Tensor, torch.Tensor]],
+        local_totals: dict[ChannelKey, tuple[torch.Tensor, torch.Tensor]],
     ) -> torch.device:
         for loss_sum, _ in local_totals.values():
             if isinstance(loss_sum, torch.Tensor):
@@ -1168,12 +1159,12 @@ class ChannelLossCallback(Callback):
 
     def _build_metrics(
         self,
-        totals: Dict[ChannelKey, tuple[float, int]],
-        source_names: Optional[Dict[ChannelKey, str]] = None,
-    ) -> Dict[str, float]:
+        totals: dict[ChannelKey, tuple[float, int]],
+        source_names: dict[ChannelKey, str] | None = None,
+    ) -> dict[str, float]:
         total_tokens = sum(token_count for _, token_count in totals.values())
         metric_names = self._render_metric_names(totals, source_names)
-        metrics: Dict[str, float] = {}
+        metrics: dict[str, float] = {}
         for source_id, (loss_sum, token_count) in sorted(totals.items(), key=lambda item: _channel_sort_key(item[0])):
             if token_count <= 0:
                 continue
@@ -1187,11 +1178,11 @@ class ChannelLossCallback(Callback):
 
     def _render_metric_names(
         self,
-        totals: Dict[ChannelKey, tuple[float, int]],
-        source_names: Optional[Dict[ChannelKey, str]],
-    ) -> Dict[ChannelKey, str]:
+        totals: dict[ChannelKey, tuple[float, int]],
+        source_names: dict[ChannelKey, str] | None,
+    ) -> dict[ChannelKey, str]:
         self._register_sources(list(totals), source_names)
-        rendered: Dict[ChannelKey, str] = {}
+        rendered: dict[ChannelKey, str] = {}
         for source_id in totals:
             source_name = self._source_registry[source_id]
             display_name = (
@@ -1209,7 +1200,7 @@ class ChannelLossCallback(Callback):
 
         return _sanitize_metric_fragment(f"source_{source_id}")
 
-    def _lookup_source_name(self, source_id: ChannelKey) -> Optional[str]:
+    def _lookup_source_name(self, source_id: ChannelKey) -> str | None:
         if source_id in self.computer.source_names:
             return str(self.computer.source_names[source_id])
 
@@ -1226,7 +1217,7 @@ class ChannelLossCallback(Callback):
     def _extract_metadata(
         self,
         micro_batch: Any,
-    ) -> tuple[List[ChannelKey], List[str], Optional[torch.Tensor], Optional[torch.Tensor]]:
+    ) -> tuple[list[ChannelKey], list[str], torch.Tensor | None, torch.Tensor | None]:
         if isinstance(micro_batch, dict):
             source_ids = self._first_present_list(micro_batch, self.config.source_id_keys, _as_channel_key_list)
             source_names = self._first_present_list(micro_batch, self.config.source_name_keys, _as_str_list)
@@ -1240,8 +1231,8 @@ class ChannelLossCallback(Callback):
             )
 
         if isinstance(micro_batch, (list, tuple)):
-            source_ids: List[ChannelKey] = []
-            source_names: List[str] = []
+            source_ids: list[ChannelKey] = []
+            source_names: list[str] = []
             for sample in micro_batch:
                 if not isinstance(sample, dict):
                     continue
@@ -1253,17 +1244,17 @@ class ChannelLossCallback(Callback):
 
     @staticmethod
     def _first_present_list(
-        batch: Dict[str, Any],
-        keys: List[str],
-        converter: Callable[[Any], List[Any]],
-    ) -> List[Any]:
+        batch: dict[str, Any],
+        keys: list[str],
+        converter: Callable[[Any], list[Any]],
+    ) -> list[Any]:
         for key in keys:
             if key in batch:
                 return converter(batch[key])
         return []
 
 
-def _as_flat_list(value: Any) -> List[Any]:
+def _as_flat_list(value: Any) -> list[Any]:
     if value is None:
         return []
     if isinstance(value, torch.Tensor):
@@ -1274,7 +1265,7 @@ def _as_flat_list(value: Any) -> List[Any]:
         except Exception:
             pass
     if isinstance(value, (list, tuple)):
-        result: List[Any] = []
+        result: list[Any] = []
         for item in value:
             result.extend(_as_flat_list(item))
         return result
@@ -1284,8 +1275,8 @@ def _as_flat_list(value: Any) -> List[Any]:
 def _bind_loss_call_args(
     loss_fn: Callable[..., Any],
     args: tuple[Any, ...],
-    kwargs: Dict[str, Any],
-) -> Dict[str, Any]:
+    kwargs: dict[str, Any],
+) -> dict[str, Any]:
     try:
         signature = inspect.signature(loss_fn)
         bound = signature.bind_partial(*args, **kwargs)
@@ -1309,10 +1300,10 @@ def _bind_loss_call_args(
 
 
 def _position_aligned_attention_mask_flat(
-    attention_mask: Optional[torch.Tensor],
+    attention_mask: torch.Tensor | None,
     labels: torch.Tensor,
     effective_labels: torch.Tensor,
-) -> Optional[torch.Tensor]:
+) -> torch.Tensor | None:
     if attention_mask is None:
         return None
 
@@ -1322,22 +1313,22 @@ def _position_aligned_attention_mask_flat(
 
 
 def _filter_surplus_tail_padding_segments(
-    segments: List[tuple[int, int, int]],
+    segments: list[tuple[int, int, int]],
     source_count: int,
     labels_flat: torch.Tensor,
-    positions_flat: Optional[torch.Tensor],
-    attention_mask_flat: Optional[torch.Tensor],
+    positions_flat: torch.Tensor | None,
+    attention_mask_flat: torch.Tensor | None,
     ignore_index: int,
-) -> List[tuple[int, int, int]]:
+) -> list[tuple[int, int, int]]:
     surplus = len(segments) - source_count
     if surplus <= 0:
         return segments
 
-    indexed_by_batch: Dict[int, List[tuple[int, int, int]]] = defaultdict(list)
+    indexed_by_batch: dict[int, list[tuple[int, int, int]]] = defaultdict(list)
     for segment_idx, (batch_idx, start, end) in enumerate(segments):
         indexed_by_batch[batch_idx].append((segment_idx, start, end))
 
-    candidates_by_batch: Dict[int, List[tuple[bool, int]]] = defaultdict(list)
+    candidates_by_batch: dict[int, list[tuple[bool, int]]] = defaultdict(list)
     for batch_idx, row_segments in indexed_by_batch.items():
         for segment_idx, start, end in reversed(row_segments):
             mask_slice = attention_mask_flat[start : end + 1] if attention_mask_flat is not None else None
@@ -1358,20 +1349,20 @@ def _filter_surplus_tail_padding_segments(
 
 
 def _filter_surplus_tail_padding_sp_segments(
-    segments: List[Dict[str, Any]],
+    segments: list[dict[str, Any]],
     source_count: int,
-) -> List[Dict[str, Any]]:
+) -> list[dict[str, Any]]:
     surplus = sum(1 for segment in segments if segment["is_start"]) - source_count
     if surplus <= 0:
         return segments
 
-    indexed_by_batch: Dict[int, List[tuple[int, Dict[str, Any]]]] = defaultdict(list)
+    indexed_by_batch: dict[int, list[tuple[int, dict[str, Any]]]] = defaultdict(list)
     for segment_idx, segment in enumerate(segments):
         indexed_by_batch[int(segment.get("batch_idx", 0))].append((segment_idx, segment))
 
-    candidates_by_batch: Dict[int, List[tuple[bool, List[int]]]] = defaultdict(list)
+    candidates_by_batch: dict[int, list[tuple[bool, list[int]]]] = defaultdict(list)
     for batch_idx, row_partials in indexed_by_batch.items():
-        logical_segments: List[List[tuple[int, Dict[str, Any]]]] = []
+        logical_segments: list[list[tuple[int, dict[str, Any]]]] = []
         for segment_idx, segment in row_partials:
             if segment["is_start"]:
                 logical_segments.append([])
@@ -1399,8 +1390,8 @@ def _filter_surplus_tail_padding_sp_segments(
 
 def _is_padding_only_segment(
     labels_slice: torch.Tensor,
-    positions_slice: Optional[torch.Tensor],
-    attention_mask_slice: Optional[torch.Tensor],
+    positions_slice: torch.Tensor | None,
+    attention_mask_slice: torch.Tensor | None,
     ignore_index: int,
 ) -> bool:
     if labels_slice.numel() == 0 or labels_slice.ne(ignore_index).any().item():
@@ -1416,7 +1407,7 @@ def _is_padding_only_segment(
     return False
 
 
-def _has_explicit_padding_mask(attention_mask_slice: Optional[torch.Tensor]) -> bool:
+def _has_explicit_padding_mask(attention_mask_slice: torch.Tensor | None) -> bool:
     return bool(
         attention_mask_slice is not None
         and attention_mask_slice.numel() > 0
@@ -1425,20 +1416,20 @@ def _has_explicit_padding_mask(attention_mask_slice: Optional[torch.Tensor]) -> 
 
 
 def _select_unambiguous_tail_candidates(
-    candidates_by_batch: Dict[int, List[tuple[bool, Any]]],
+    candidates_by_batch: dict[int, list[tuple[bool, Any]]],
     surplus: int,
-) -> Optional[List[Any]]:
+) -> list[Any] | None:
     # Each layer stores compact backpointers instead of copying payload prefixes.
     batch_ids = sorted(candidates_by_batch)
-    states: Dict[int, tuple[int, bool]] = {0: (0, True)}
-    layers: List[Dict[int, tuple[int, bool, int, int]]] = []
+    states: dict[int, tuple[int, bool]] = {0: (0, True)}
+    layers: list[dict[int, tuple[int, bool, int, int]]] = []
     for batch_idx in batch_ids:
         row_candidates = candidates_by_batch[batch_idx]
         explicit_prefix = [0]
         for has_explicit_mask, _ in row_candidates:
             explicit_prefix.append(explicit_prefix[-1] + int(has_explicit_mask))
 
-        next_layer: Dict[int, tuple[int, bool, int, int]] = {}
+        next_layer: dict[int, tuple[int, bool, int, int]] = {}
         for removed_count, (score, is_unique) in states.items():
             for row_removed in range(len(row_candidates) + 1):
                 new_count = removed_count + row_removed
@@ -1457,7 +1448,7 @@ def _select_unambiguous_tail_candidates(
     if best is None or not best[1]:
         return None
 
-    selected: List[Any] = []
+    selected: list[Any] = []
     removed_count = surplus
     for batch_idx, layer in zip(reversed(batch_ids), reversed(layers)):
         _, _, previous_count, row_removed = layer[removed_count]
@@ -1480,8 +1471,8 @@ def _validate_segment_count(segment_count: int, source_count: int, strict: bool,
     return False
 
 
-def _as_channel_key_list(value: Any) -> List[ChannelKey]:
-    result: List[ChannelKey] = []
+def _as_channel_key_list(value: Any) -> list[ChannelKey]:
+    result: list[ChannelKey] = []
     for item in _as_flat_list(value):
         if item is None:
             continue
@@ -1496,8 +1487,8 @@ def _as_channel_key_list(value: Any) -> List[ChannelKey]:
     return result
 
 
-def _as_str_list(value: Any) -> List[str]:
-    result: List[str] = []
+def _as_str_list(value: Any) -> list[str]:
+    result: list[str] = []
     for item in _as_flat_list(value):
         if item is None:
             continue

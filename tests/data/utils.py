@@ -28,9 +28,7 @@ def mock_empty_cache() -> None:
 def setup_test_distributed(args):
     """Initialize a minimal distributed runtime for data tests.
 
-    Returns the device and the ``ParallelState`` so trainer subclasses that
-    override ``_setup`` can assign ``self.parallel_state`` (required by
-    ``BaseTrainer.__init__``, which scopes the build under it).
+    Returns the device and the ``ParallelState``.
     """
     device_type = get_device_type()
     if device_type != "cpu":

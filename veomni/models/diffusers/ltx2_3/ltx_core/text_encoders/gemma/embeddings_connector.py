@@ -1,5 +1,4 @@
 import torch
-
 from ltx_core.model.transformer.attention import Attention
 from ltx_core.model.transformer.feed_forward import FeedForward
 from ltx_core.model.transformer.rope import (
@@ -177,6 +176,7 @@ class Embeddings1DConnectorConfigurator:
         double_precision_rope = transformer_config.get("frequencies_precision", False) == "float64"
         pe_max_pos = transformer_config.get("connector_positional_embedding_max_pos", [1])
 
+        # Video connector dimensions
         num_attention_heads = transformer_config.get("connector_num_attention_heads", 30)
         attention_head_dim = transformer_config.get("connector_attention_head_dim", 128)
         num_layers = transformer_config.get("connector_num_layers", 2)
@@ -203,6 +203,7 @@ class AudioEmbeddings1DConnectorConfigurator:
         double_precision_rope = transformer_config.get("frequencies_precision", False) == "float64"
         pe_max_pos = transformer_config.get("connector_positional_embedding_max_pos", [1])
 
+        # Audio connector dimensions - fall back to video connector config for backwards compatibility
         num_attention_heads = transformer_config.get(
             "audio_connector_num_attention_heads",
             transformer_config.get("connector_num_attention_heads", 30),

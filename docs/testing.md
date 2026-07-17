@@ -20,13 +20,15 @@ tests/
 │   ├── test_checkpoint_tensor_converter.py  # Checkpoint tensor conversion (e.g. Qwen3MoE fuse)
 │   ├── test_deepseek_v4_fused_moe.py  # DeepSeek-V4 fused MoE swiglu_limit plumbing
 │   ├── test_padded_packed_loss.py   # Padded vs packed (cu_seqlens) loss equivalence
-│   ├── utils.py                    # ModelMode, prepare_model_modes, prepare_data
-│   └── weight_sync_adapters.py     # State-dict alignment for HF↔VeOmni comparison
+│   ├── test_models_logits_equal_v5.py  # HF↔VeOmni logits through the real loader
+│   └── utils.py                    # ModelMode, prepare_model_modes, prepare_data
 │
 ├── ops/                            # Fused kernel correctness & performance
 │   ├── test_fused_moe_split_vs_merged.py   # Split vs merged MoE fc1
 │   ├── test_quack_fused_moe.py             # Quack GEMM MoE (SM90+)
 │   ├── test_fused_load_balancing_loss.py    # Triton load-balancing loss kernel
+│   ├── test_deepseek_v4_kernels.py           # DeepSeek-V4 TileLang guards and numerical parity
+│   ├── test_mhc_tile_kernels.py              # DeepSeek-V4 TileKernels mHC dispatch and parity
 │   ├── test_flash_attn_varlen_padding.py   # Flash-attn variable-length padding
 │   ├── test_seqcls_loss.py                 # Sequence classification loss
 │   └── test_comp.py                        # Position embedding computation
@@ -99,7 +101,7 @@ tests/
 | Category | Directory | GPU Req | Execution | Purpose |
 |---|---|---|---|---|
 | **Model patch** | `tests/models/` | 1 GPU | pytest | Fwd/bwd correctness across attn/MoE backends |
-| **Ops / kernels** | `tests/ops/` | 1 GPU (SM90+ for Quack) | pytest | Fused kernel correctness & perf |
+| **Ops / kernels** | `tests/ops/` | 0-1 GPU (SM90+ for Quack, DeepSeek-V4 TileLang, and mHC TileKernels) | pytest | Fused kernel guards, dispatch, correctness, and performance |
 | **Data pipeline** | `tests/data/` | 0-1 GPU | pytest | Data loading, collation, preprocessing |
 | **Parallelism** | `tests/parallel/` | 4-8 GPUs | torchrun / pytest | SP, EP, data-balance primitives |
 | **FSDP correctness** | `tests/distributed/` | 2+ GPUs | torchrun (subprocess + mp.spawn) | Single-GPU vs FSDP2 equivalence, dummy forward |
@@ -126,7 +128,7 @@ Additional per-directory helpers:
 | File | Scope | Key Exports |
 |---|---|---|
 | `tests/models/utils.py` | Model patch tests | `ModelMode`, `prepare_model_modes`, `prepare_data` |
-| `tests/models/weight_sync_adapters.py` | Model patch tests | HF↔VeOmni state-dict alignment functions |
+| `tests/models/test_checkpoint_tensor_converter.py` | Model loading | Runtime checkpoint layout conversion and fused-expert weight mapping |
 | `tests/e2e/utils.py` | E2E tests | `prepare_exec_cmd`, `parse_training_log`, `ParallelMode` |
 | `tests/checkpoints/utils.py` | Checkpoint tests | Command/config builders for trainer save/load |
 | `tests/parallel/ulysses/utils.py` | SP tests | `SequenceParallelTest` base class, `sync_tensor` |
@@ -157,6 +159,13 @@ Additional per-directory helpers:
 
 DeepSeek-V4's fused-MoE-specific merged `gate_up_proj` and `swiglu_limit`
 forwarding are covered by `tests/models/test_deepseek_v4_fused_moe.py` (CPU).
+Its kernel package import behavior, hardware guards, BF16/FP32 utility, and
+TileLang DSA indexer/attention numerical checks are covered by
+`tests/ops/test_deepseek_v4_kernels.py`. The guard and utility cases run on
+CPU; optimized numerical tests require TileLang on an SM90+ NVIDIA GPU.
+Registry binding plus mHC pre/post/head forward and backward parity are covered
+by `tests/ops/test_mhc_tile_kernels.py`, which requires TileKernels on an SM90+
+NVIDIA GPU for kernel execution.
 
 ---
 
@@ -263,6 +272,8 @@ forwarding are covered by `tests/models/test_deepseek_v4_fused_moe.py` (CPU).
 | `test_quack_fused_moe.py` | Quack GEMM MoE backend | SM90+ |
 | `test_kernel_registry_numerical.py` | Numerical alignment per (op, variant, impl) | CUDA; the FlashQLA `chunk_gated_delta_rule` case skips unless running on SM90 (Hopper) — SM10x WIP upstream. |
 | `test_fused_load_balancing_loss.py` | Triton load-balancing loss | CUDA |
+| `test_deepseek_v4_kernels.py` | CPU import/hardware guards plus TileLang DSA numerical parity | CPU for guards; TileLang + NVIDIA SM90+ for optimized kernels |
+| `test_mhc_tile_kernels.py` | TileKernels mHC registry dispatch and forward/backward parity | TileKernels + NVIDIA SM90+ |
 | `test_flash_attn_varlen_padding.py` | Flash-attn variable-length padding | CUDA |
 | `test_seqcls_loss.py` | Sequence classification loss | CUDA (optional) |
 | `test_comp.py` | Position embedding computation | CUDA |
@@ -307,7 +318,7 @@ See also: [Testing a New Model for Transformers v5](transformers_v5/testing_new_
 | **MoE model** | `tests/models/test_models_patch.py` | Set `is_moe=True` to test `eager` vs `fused` MoE backends. |
 | **MoE model** | `tests/e2e/test_e2e_parallel.py` | Set `is_moe=True` to include `ep_size` iteration. |
 | **MoE with fused experts** | `tests/models/test_checkpoint_tensor_converter.py` | Add converter tests if a custom `CheckpointTensorConverter` is needed. |
-| **Custom weight layout** | `tests/models/weight_sync_adapters.py` | Add sync function if HF↔VeOmni state-dict keys differ. |
+| **Custom checkpoint layout** | `tests/models/test_checkpoint_tensor_converter.py` | Add converter tests for any on-disk HF↔VeOmni key or tensor-layout conversion. |
 | **Custom fused kernels** | `tests/ops/` | Add kernel-specific correctness tests. |
 | **New data modality** | `tests/data/` | Add data processing and collation tests. |
 
@@ -339,7 +350,8 @@ pytest tests/e2e/test_e2e_parallel.py -k <model_name>
 pytest → test_models_patch_fwd_bwd(config, is_moe, ...)
   → prepare_model_modes(is_moe) → [(HF, eager), (HF, fa2), (VeOmni, fa2_sp), ...]
   → for each mode:
-      build_foundation_model(config, attn_impl, moe_impl)
+      apply_ops_config(mode-specific OpsImplementationConfig)
+      BaseTrainer._build_model() → build_foundation_model(config, ops_implementation=...)
       TrainerTest.forward_backward_step(dummy_batch)
       → record loss, grad_norm
   → compare_multi_items(all_results, rtol, atol)

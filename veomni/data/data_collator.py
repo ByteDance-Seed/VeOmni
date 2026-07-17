@@ -63,10 +63,15 @@ def add_flash_attention_kwargs_from_position_ids(
     Args:
         batch: The batch dictionary containing position_ids. Will be modified in-place to add
                cu_seq_lens_q, cu_seq_lens_k, max_length_q, max_length_k, and
-               linear_attn_cu_seq_lens_q.
+               linear_attn_cu_seq_lens_q. When ``linear_attn_tail_padding_length > 0``,
+               also stores ``tail_padding_length`` (0-d ``torch.int32`` tensor) so
+               downstream valid-seqlens helpers can strip the coalesced pad segment and
+               distributed/PP stages preserve the metadata.
         linear_attn_tail_padding_length: Number of known padding tokens appended at the tail by
-               collators. These are kept in FlashAttention cu-seqlens but coalesced into one segment
-               for linear-attention kernels that compile or allocate per segment.
+               collators (``pad_to_length`` / SP pad). ``position_ids == 0`` encodes each pad
+               token as its own 1-token boundary; both FlashAttention and linear-attention
+               cu-seqlens coalesce that tail into one segment. Ascend NPU
+               ``npu_fusion_attention`` SIGSEGVs on the uncoalesced per-token form.
 
     Returns:
         Tuple of (cu_seq_lens_q, cu_seq_lens_k, max_length_q, max_length_k) for additional use.
@@ -76,14 +81,24 @@ def add_flash_attention_kwargs_from_position_ids(
         position_ids = position_ids[:, 0, :]
     (cu_seq_lens_q, cu_seq_lens_k), (max_length_q, max_length_k) = prepare_fa_kwargs_from_position_ids(position_ids)
 
+    if linear_attn_tail_padding_length > 0:
+        cu_seq_lens_q = coalesce_tail_padding_cu_seqlens(cu_seq_lens_q, linear_attn_tail_padding_length)
+        cu_seq_lens_k = cu_seq_lens_q
+        seqlens = cu_seq_lens_q[1:] - cu_seq_lens_q[:-1]
+        max_length_q = int(seqlens.max().item()) if seqlens.numel() else 0
+        max_length_k = max_length_q
+        # Keep as a 0-d tensor so PP / distributed stages preserve the metadata.
+        batch["tail_padding_length"] = torch.tensor(
+            linear_attn_tail_padding_length,
+            dtype=torch.int32,
+            device=cu_seq_lens_q.device,
+        )
+
     batch["cu_seq_lens_q"] = cu_seq_lens_q
     batch["cu_seq_lens_k"] = cu_seq_lens_k
     batch["max_length_q"] = max_length_q
     batch["max_length_k"] = max_length_k
-    batch["linear_attn_cu_seq_lens_q"] = coalesce_tail_padding_cu_seqlens(
-        cu_seq_lens_q,
-        linear_attn_tail_padding_length,
-    )
+    batch["linear_attn_cu_seq_lens_q"] = cu_seq_lens_q
 
     return cu_seq_lens_q, cu_seq_lens_k, max_length_q, max_length_k
 
@@ -523,7 +538,11 @@ class PostCollator(DataCollator):
 @dataclass
 class SeqlensComputePostCollator(DataCollator):
     def __call__(self, micro_batch: Dict[str, torch.Tensor]):
-        seq_lens = valid_seqlens_from_cu_seqlens(micro_batch["cu_seq_lens_q"]).tolist()
+        tail_padding_length = micro_batch.get("tail_padding_length")
+        seq_lens = valid_seqlens_from_cu_seqlens(
+            micro_batch["cu_seq_lens_q"],
+            tail_padding_length=int(tail_padding_length) if tail_padding_length is not None else None,
+        ).tolist()
         return seq_lens
 
 

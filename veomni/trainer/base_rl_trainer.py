@@ -42,8 +42,14 @@ class BaseRLTrainer(BaseTrainer):
         # ``super().__init__`` builds under its own ``use_parallel_state`` scope
         # and exits it; the collators built here also read the current
         # ParallelState, so re-enter this trainer's state for them.
-        with use_parallel_state(self.parallel_state):
+        with use_parallel_state("base"):
             self._build_preforward_postforward()
+
+    def _setup(self):
+        if self.args.train.chunk_mbs_config.enable:
+            raise ValueError("ChunkMBS is not supported by RL trainers yet.")
+
+        super()._setup()
 
     # post init preforward and postforward hooks
     def _build_preforward_postforward(self):

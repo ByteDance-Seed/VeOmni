@@ -94,7 +94,7 @@ BaseTrainer (ABC)
 
 Subclasses override specific methods (e.g., `compute_loss()`, custom data transforms) rather than the entire training loop.
 
-**Parallel-state scoping**: each trainer runs under its own `ParallelState` (returned by `init_parallel_state()`) in three regions — a build region (`with use_parallel_state(self.parallel_state):` around the whole build sequence in `__init__`, right after `_setup()`), the callback delegates (`on_*`), and a run region (`forward_backward_step`). This keeps SP/DP/CP/EP group resolution tied to the trainer's mesh. The Omni orchestrator (`OmniTrainer` / `OmniModuleTrainer`) does the same per-module (build + per-callback + grad-checkpoint recompute scopes), letting distinct modules build and run under distinct parallel states. See `.agents/knowledge/constraints.md` §7d.
+**Parallel-state scoping**: standalone trainers register the `"base"` `ParallelState` in `_setup()` and use `with use_parallel_state("base"):` for the complete build and each ambient-dependent runtime operation (forward, post-forward loss, backward, and clipping). Omni modules keep their returned, unnamed `ParallelState` objects and scope every build, forward, callback, and gradient-checkpoint recompute to that object. Group getters always resolve from the current state, allowing modules with different SP topologies to coexist. See `.agents/knowledge/constraints.md` §7d.
 
 ## Data Flow
 

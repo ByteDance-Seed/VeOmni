@@ -159,9 +159,10 @@ VeOmni LoRA training uses FSDP2 with `init_device: meta`. Weight loading goes th
 
 3. **Adapter weight initialisation from scratch**: `post_process_after_weight_loading`
    calls `_init_lora_parameter` for any LoRA parameter not yet filled, invoking
-   `reset_lora_parameters` (kaiming `A` / zero `B`). For MoE wrappers the reset only fires
-   when every wrapper parameter is still on meta device, so a partially-loaded wrapper is
-   never clobbered.
+   `reset_lora_parameters` (kaiming `A` / zero `B`). For MoE wrappers the decision is made
+   against the missing-name set: reset only when *all* of that wrapper's LoRA tensors are
+   still missing; skip when none are missing; raise on a partial load so already-loaded
+   `A`/`B` tensors are never clobbered.
 
 **Key difference from base model loading:** the on-disk adapter keys omit the adapter-name
 infix (PEFT convention — e.g. `lora_A.weight`), whereas the live model stores them as
@@ -522,13 +523,18 @@ bash train.sh tasks/train_text.py configs/text/qwen3_moe_lora.yaml \
     --train.checkpoint.load_path auto
 ```
 
-Resume from a saved adapter (DCP path is auto-detected via `load_path: auto`; an HF
-adapter resume goes through `model.lora_config.lora_adapter`):
+Resume from a saved adapter by setting `lora_adapter` inside the YAML dictionary. DCP
+checkpoints remain auto-detected through `train.checkpoint.load_path: auto`.
+
+```yaml
+model:
+  lora_config:
+    lora_adapter: ./exp/qwen3_moe_lora/global_step_500
+```
 
 ```shell
 bash train.sh tasks/train_text.py configs/text/qwen3_moe_lora.yaml \
-    --model.model_path                 /path/to/Qwen3-30B-A3B \
-    --model.lora_config.lora_adapter   ./exp/qwen3_moe_lora/global_step_500
+    --model.model_path /path/to/Qwen3-30B-A3B
 ```
 
 DeepSeek-V3 (v5) follows the same shape — see

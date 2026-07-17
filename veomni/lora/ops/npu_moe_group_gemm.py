@@ -146,13 +146,14 @@ def _npu_fused_lora_moe_forward(
 ) -> torch.Tensor:
     """NPU single-device (non-EP) fused MoE forward + seed-style two-LoRA."""
     hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
-    # ``selected_experts`` is int64 (topk); NPU permute + the group-gemm group
-    # list both need int32. ``torch.histc`` only accepts float input and returns
-    # float, so bin on float32 and cast the counts back to int32.
+    # ``selected_experts`` is int64 (topk). ``npu_moe_token_permute`` wants
+    # int32 indices; ``npu_grouped_matmul``'s ``groupList`` wants int64 counts
+    # (int32 raises EZ1001). ``torch.histc`` only accepts float input and
+    # returns float, so bin on float32 then cast counts to int64.
     selected_experts = selected_experts.to(torch.int32)
     permuted_hidden_states, row_ids_map = torch_npu.npu_moe_token_permute(hidden_states, selected_experts)
     tokens_per_expert = torch.histc(selected_experts.to(torch.float32), bins=num_experts, min=0, max=num_experts).to(
-        torch.int32
+        torch.int64
     )
 
     gate_up = npu_group_gemm(permuted_hidden_states, fc1_1_2_weight.transpose(1, 2), tokens_per_expert)
@@ -221,7 +222,8 @@ def _npu_ep_fused_lora_moe_forward(
         ep_group,
     )
 
-    group_list = num_global_sum_tokens_per_local_expert
+    # ``npu_grouped_matmul`` requires int64 groupList (same as non-EP path).
+    group_list = num_global_sum_tokens_per_local_expert.to(torch.int64)
     gate_up = npu_group_gemm(hidden_states, fc1_1_2_weight.transpose(1, 2), group_list)
     gate_up = gate_up + _lora_gate_up_delta(
         hidden_states,

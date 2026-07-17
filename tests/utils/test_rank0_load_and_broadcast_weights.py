@@ -394,9 +394,9 @@ def run_rank0_broadcast_test(args: Arguments) -> None:
         dist.barrier()
     finally:
         dist.destroy_process_group()
-        from veomni.distributed import parallel_state as _ps
+        from veomni.distributed.parallel_state import clear_parallel_state
 
-        _ps._PARALLEL_STATE = None
+        clear_parallel_state()
 
 
 @pytest.mark.skipif(not dist.is_available(), reason="torch.distributed required")
@@ -561,9 +561,9 @@ def run_load_weights_test(args: Arguments) -> None:
         dist.barrier()
     finally:
         dist.destroy_process_group()
-        from veomni.distributed import parallel_state as _ps
+        from veomni.distributed.parallel_state import clear_parallel_state
 
-        _ps._PARALLEL_STATE = None
+        clear_parallel_state()
 
 
 @pytest.mark.skipif(not dist.is_available(), reason="torch.distributed required")

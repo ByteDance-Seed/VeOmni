@@ -56,9 +56,10 @@ from ..data import (
 from ..data.chat_template import ChatTemplate
 from ..data.data_collator import DataCollator, MainCollator
 from ..data.data_transform import build_data_transform
+from ..distributed.chunk_mbs import build_chunk_mbs_ranges, chunk_mbs_context
 from ..distributed.clip_grad_norm import veomni_clip_grad_norm
 from ..distributed.offloading import build_activation_offloading_context
-from ..distributed.parallel_state import init_parallel_state, use_parallel_state
+from ..distributed.parallel_state import clear_parallel_state, init_parallel_state, use_parallel_state
 from ..distributed.torch_compile import CompileConfig, mark_compile_step_begin
 from ..distributed.torch_parallelize import build_parallelize_model
 from ..models import build_foundation_model, build_tokenizer
@@ -290,18 +291,17 @@ class BaseTrainer(Stateful, ABC):
         """
 
         self.args: VeOmniArguments = args
+        # ``_setup`` registers ParallelState ("base") before seed/determinism so
+        # device-mesh process groups are created with default NCCL settings —
+        # matching pre-registry init order (avoids L20 SIGSEGV when
+        # NCCL_DETERMINISTIC=1 is set before mesh construction).
         self._setup()
         # Every build step below reads the current ParallelState via
         # ``get_parallel_state()`` (meta-init, FSDP2/TP/EP wrap + weight load,
-        # EP-/muon-aware optimizer, SP-aware data pipeline). ``init_parallel_state``
-        # only sets the module global on its *first* call, so once multiple modules
-        # each build under their own state a later module would otherwise build over
-        # the first module's mesh. Scope the whole build under this trainer's own
-        # state (a no-op for the single-model case: the global already equals
-        # ``self.parallel_state`` right after ``_setup``). The Omni orchestrator
-        # builds sub-models via ``OmniModuleTrainer`` (its own per-module scope), not
-        # this ``__init__``.
-        with use_parallel_state(self.parallel_state):
+        # EP-/muon-aware optimizer, SP-aware data pipeline). Scope the whole
+        # build under the registered name (a no-op for the single-model case:
+        # the global already equals the registered ``"base"`` state).
+        with use_parallel_state("base"):
             # build model
             self._build_model()
             # freeze module and print trainable parameters
@@ -339,21 +339,9 @@ class BaseTrainer(Stateful, ABC):
 
         logger.info(f"Process rank: {self.args.train.global_rank}, world size: {self.args.train.world_size}")
 
-        # Initialize parallel state
-        self.parallel_state = init_parallel_state(
-            dp_size=self.args.train.accelerator.dp_size,
-            dp_replicate_size=self.args.train.accelerator.dp_replicate_size,
-            dp_shard_size=self.args.train.accelerator.dp_shard_size,
-            tp_size=self.args.train.accelerator.tp_size,
-            pp_size=self.args.train.accelerator.pp_size,
-            cp_size=self.args.train.accelerator.cp_size,
-            ulysses_size=self.args.train.accelerator.ulysses_size,
-            extra_parallel_sizes=self.args.train.accelerator.extra_parallel_sizes,
-            extra_parallel_placement_innermost=self.args.train.accelerator.extra_parallel_placement_innermost,
-            extra_parallel_names=self.args.train.accelerator.extra_parallel_names,
-            dp_mode=self.args.train.accelerator.fsdp_config.fsdp_mode,
-            async_enabled=self.args.train.accelerator.enable_async,
-        )
+        # Register ParallelState before seed/determinism env vars. Mesh creation
+        # must not run under NCCL_DETERMINISTIC=1 on some GPU platforms (L20).
+        self.register_parallel_state("base")
 
         # Set random seed
         helper.set_seed(self.args.train.seed, self.args.train.enable_full_determinism)
@@ -371,6 +359,24 @@ class BaseTrainer(Stateful, ABC):
 
         # Gradient checkpointing debug
         set_checkpoint_debug_enabled(self.args.train.gradient_checkpointing.debug)
+
+    def register_parallel_state(self, name: str = "base"):
+        """Register this trainer's ParallelState under ``name`` in the registry."""
+        init_parallel_state(
+            dp_size=self.args.train.accelerator.dp_size,
+            dp_replicate_size=self.args.train.accelerator.dp_replicate_size,
+            dp_shard_size=self.args.train.accelerator.dp_shard_size,
+            tp_size=self.args.train.accelerator.tp_size,
+            pp_size=self.args.train.accelerator.pp_size,
+            cp_size=self.args.train.accelerator.cp_size,
+            ulysses_size=self.args.train.accelerator.ulysses_size,
+            extra_parallel_sizes=self.args.train.accelerator.extra_parallel_sizes,
+            extra_parallel_placement_innermost=self.args.train.accelerator.extra_parallel_placement_innermost,
+            extra_parallel_names=self.args.train.accelerator.extra_parallel_names,
+            dp_mode=self.args.train.accelerator.fsdp_config.fsdp_mode,
+            async_enabled=self.args.train.accelerator.enable_async,
+            name=name,
+        )
 
     def _build_model(self):
         logger.info_rank0("Build model")
@@ -414,12 +420,6 @@ class BaseTrainer(Stateful, ABC):
         if not bool(lora_config):
             return
 
-        # A model may fully own its LoRA wrapping (e.g. a MoE backbone whose
-        # expert kernel is incompatible with veomni's generic MoE-LoRA wrappers)
-        # via a ``customized_setup_lora`` hook returning the wrapped model. It is
-        # handed the raw ``lora_config`` dict (``lora_adapter`` key drives the
-        # resume-vs-fresh choice, same as below); the adapter *weights* are still
-        # streamed later by ``build_parallelize_model(adapter_path=...)``.
         customized = getattr(self.model, "customized_setup_lora", None)
         if callable(customized):
             self.model = customized(lora_config)
@@ -526,6 +526,8 @@ class BaseTrainer(Stateful, ABC):
 
         if args.model.fqn_to_index_mapping is not None:
             kwargs["fqn_to_index_mapping"] = args.model.fqn_to_index_mapping
+        if args.train.chunk_mbs_config.enable:
+            kwargs["chunk_mbs_config"] = args.train.chunk_mbs_config
 
         # Parallelize model
         self.model = build_parallelize_model(
@@ -604,14 +606,18 @@ class BaseTrainer(Stateful, ABC):
         self.moe_monitor_callback = MoERouterMonitorCallback(self)
         self.channel_loss_callback = ChannelLossCallback(self)
         # Ordered dispatch list. Callbacks own their ParallelState explicitly:
-        # each captured it at construction (``Callback.parallel_state``) and the
-        # shared objects they drive (EnvironMeter, DCP checkpointer) are handed
-        # that state directly, so no ambient ``use_parallel_state`` scope is
-        # needed around hook dispatch.
+        # each captured it at construction (``Callback.parallel_state``), and
+        # ChannelLossComputer receives that same cached state. Shared objects
+        # (EnvironMeter, DCP checkpointer) are handed the state directly, so
+        # no ambient ``use_parallel_state`` scope is needed around hook dispatch.
+        #
+        # ``channel_loss_callback`` is ordered after the meter (which resets
+        # ``step_*_metrics`` in ``on_step_end``) and before ``wandb`` (which
+        # logs them), so its per-source metrics survive into the logged payload.
         self._callbacks = [
-            self.channel_loss_callback,
             self.environ_meter_callback,
             self.tqdm_callback,
+            self.channel_loss_callback,
             self.wandb_callback,
             self.profile_callback,
             self.checkpointer_callback,
@@ -637,13 +643,9 @@ class BaseTrainer(Stateful, ABC):
         for callback in self._callbacks:
             callback.on_epoch_end(self.state)
 
-    def on_step_begin(self, micro_batches=None, channel_loss_source_repeat: int = 1):
+    def on_step_begin(self, micro_batches=None, **kwargs):
         for callback in self._callbacks:
-            callback.on_step_begin(
-                self.state,
-                micro_batches=micro_batches,
-                source_repeat=channel_loss_source_repeat,
-            )
+            callback.on_step_begin(self.state, micro_batches=micro_batches, **kwargs)
 
     def on_step_end(self, loss=None, loss_dict=None, grad_norm=None):
         for callback in self._callbacks:
@@ -665,6 +667,8 @@ class BaseTrainer(Stateful, ABC):
                 return {k: _to_device(vv) for k, vv in v.items()}
             return v
 
+        chunk_mbs_config = getattr(self.args.train, "chunk_mbs_config", None)
+        self._chunk_mbs_ranges = build_chunk_mbs_ranges(micro_batch, chunk_mbs_config)
         micro_batch = {k: _to_device(v) for k, v in micro_batch.items()}
         if getattr(self, "LOG_SAMPLE", True):
             helper.print_example(example=micro_batch, rank=self.args.train.local_rank)
@@ -695,22 +699,29 @@ class BaseTrainer(Stateful, ABC):
             if channel_loss_callback is not None:
                 channel_loss_callback.strip_model_inputs(micro_batch)
 
+            chunk_ranges = getattr(self, "_chunk_mbs_ranges", None)
             channel_forward_context = (
                 channel_loss_callback.model_forward_context() if channel_loss_callback is not None else nullcontext()
             )
             with (
+                use_parallel_state("base"),
+                chunk_mbs_context(chunk_ranges),
                 self.model_fwd_context,
                 set_batch_invariant_mode(self.args.train.enable_batch_invariant_mode),
                 channel_forward_context,
             ):
                 outputs: ModelOutput = self.model(**micro_batch, use_cache=False)
 
-            loss: torch.Tensor
-            loss_dict: Dict[str, torch.Tensor]
-            loss, loss_dict = self.postforward(outputs, micro_batch)
+            with use_parallel_state("base"):
+                loss, loss_dict = self.postforward(outputs, micro_batch)
 
             # Backward pass
-            with self.model_bwd_context, set_batch_invariant_mode(self.args.train.enable_batch_invariant_mode):
+            with (
+                use_parallel_state("base"),
+                chunk_mbs_context(chunk_ranges),
+                self.model_bwd_context,
+                set_batch_invariant_mode(self.args.train.enable_batch_invariant_mode),
+            ):
                 loss.backward()
 
             del micro_batch
@@ -776,8 +787,9 @@ class BaseTrainer(Stateful, ABC):
             for k, v in loss_dict.items():
                 total_loss_dict[k] += v.item()
 
-        # Gradient clipping
-        grad_norm = veomni_clip_grad_norm(self.model, args.train.optimizer.max_grad_norm)
+        # Gradient clipping (reads FSDP/EP groups from current ParallelState)
+        with use_parallel_state("base"):
+            grad_norm = veomni_clip_grad_norm(self.model, args.train.optimizer.max_grad_norm)
 
         # Optimizer and scheduler step
         self.optimizer.step()
@@ -803,6 +815,7 @@ class BaseTrainer(Stateful, ABC):
 
         synchronize()
         dist.destroy_process_group()
+        clear_parallel_state()
 
     def train(self):
         args: VeOmniArguments = self.args
@@ -829,11 +842,7 @@ class BaseTrainer(Stateful, ABC):
 
             for _ in range(self.start_step, args.train_steps):
                 try:
-                    # Scope the whole optimize step (fwd/bwd, grad clip, optimizer)
-                    # to this model's parallel state so every group getter resolves
-                    # from its own device mesh.
-                    with use_parallel_state(self.parallel_state):
-                        self.train_step(self.data_iterator)
+                    self.train_step(self.data_iterator)
                 except StopIteration:
                     logger.info(f"epoch:{epoch} Dataloader finished with drop_last {args.data.dataloader.drop_last}")
                     break

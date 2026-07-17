@@ -94,7 +94,7 @@ bash train.sh tasks/train_text.py configs/text/qwen3_5_sft.yaml \
     --train.accelerator.fsdp_config.fsdp_mode fsdp2 \
     --train.init_device meta \
     --train.max_steps 20 \
-    --train.checkpoint.output_dir /mnt/local/localcache00
+    --train.checkpoint.output_dir ./exp/qwen3_5_9b_sft
 ```
 
 Qwen3.5-35B-A3B. 8X80GB GPU will likely OOM due to the model size. Use 8X192GB GPU or more GPUs.
@@ -107,8 +107,31 @@ bash train.sh tasks/train_text.py configs/text/qwen3_5_sft.yaml \
     --train.accelerator.fsdp_config.fsdp_mode fsdp2 \
     --train.init_device meta \
     --train.global_batch_size 16 \
-    --train.checkpoint.output_dir /mnt/local/localcache00
+    --train.checkpoint.output_dir ./exp/qwen3_5_35b_a3b_sft
 ```
+
+## ChunkMBS
+
+Dense Qwen3.5 packed SFT supports decoder-layer ChunkMBS. It splits the packed sequence only at sample boundaries,
+then runs each `Qwen3_5DecoderLayer` chunk sequentially while keeping the outer FSDP2 layer invocation intact. The
+same token ranges are used by both full-attention and GatedDeltaNet layers, so every ChunkMBS cut must be present in
+both cumulative-length tensors; their internal boundaries may differ.
+
+The example config exposes the feature but keeps it disabled by default:
+
+```yaml
+train:
+  chunk_mbs_config:
+    enable: true
+    chunk_mbs: 2
+```
+
+`chunk_mbs` is the number of packed samples per layer chunk, not a token count or `train.micro_batch_size`.
+ChunkMBS may be combined with non-reentrant gradient checkpointing. It currently does not support Qwen3.5-MoE,
+Ulysses SP, TP/PP, `torch.compile`, `pad_to_length`, DPO, or RL training. See
+[ChunkMBSConfig](../usage/arguments.md#chunkmbsconfig) for the complete support boundary.
+The model-level automated tests cover decoder routing, metadata slicing, outputs, and gradients on CPU. Real
+FlashAttention, FLA, and NPU fused-kernel execution requires separate accelerator validation.
 
 ## Ulysses Sequence Parallelism
 
@@ -116,17 +139,19 @@ Qwen3.5 supports Ulysses sequence parallelism for both its softmax attention lay
 linear attention (GatedDeltaNet) layers. This enables training with longer sequences by
 distributing the sequence across multiple GPUs.
 
-To enable Ulysses SP, set `ulysses_parallel_size` in your config. The total GPU count must
-equal `data_parallel_size * ulysses_parallel_size`.
+To enable Ulysses SP, set `train.accelerator.ulysses_size`. VeOmni derives the effective
+data-parallel size from the world size and the other parallel dimensions; set
+`train.accelerator.dp_shard_size` only when you need to pin the FSDP shard degree explicitly.
+For the example below, the total GPU count is `dp_shard_size * ulysses_size = 4 * 2 = 8`.
 
 ```shell
 # Example: 8 GPUs, dp=4, sp=2
 bash train.sh tasks/train_text.py configs/text/qwen3_5_sft.yaml \
     --model.model_path ${HOME}/Qwen3.5-9B \
     --data.train_path ${HOME}/tulu-first2000.parquet \
-    --train.data_parallel_size 4 \
-    --train.ulysses_parallel_size 2 \
-    --train.attn_implementation flash_attention_3
+    --train.accelerator.dp_shard_size 4 \
+    --train.accelerator.ulysses_size 2 \
+    --model.ops_implementation.attn_implementation flash_attention_3
 ```
 
 ### Requirements
@@ -136,7 +161,7 @@ bash train.sh tasks/train_text.py configs/text/qwen3_5_sft.yaml \
 - [flash-linear-attention](https://github.com/fla-org/flash-linear-attention) installed
   (for GatedDeltaNet triton kernels).
 - `num_k_heads` and `num_v_heads` (linear attention head counts) must be divisible by
-  `ulysses_parallel_size`.
+  `ulysses_size`.
 
 ### Selecting linear-attention kernels
 
@@ -157,14 +182,16 @@ model:
     chunk_gated_delta_rule_implementation: npu
 ```
 
-Install `triton-ascend` on the NPU host (this PR was validated against v3.2.1):
+Install `triton-ascend` on the NPU host. VeOmni main pins PyTorch and
+`torch_npu` 2.10.0; the corresponding CANN 9.0.0 stack uses v3.2.1:
 
 ```bash
 pip install triton-ascend==3.2.1 --extra-index-url=https://triton-ascend.osinfra.cn/pypi/simple
 ```
 
 See the [triton-ascend quick-start](https://github.com/triton-lang/triton-ascend/blob/main/docs/zh/quick_start.md)
-for prerequisites (CANN 9.0.0, `torch_npu` 2.9.0) and troubleshooting.
+for the compatibility matrix and troubleshooting. Keep CANN, `torch_npu`,
+and `triton-ascend` on a mutually compatible release set.
 
 > **arch35 limitation:** the vendored `causal_conv1d` refuses to run on arch35 NPUs
 > (`Ascend910_95` / `Ascend950`) — its `is_arch35()` guard raises `NotImplementedError`

@@ -107,6 +107,10 @@ gpu = [
   "quack-kernels[cu13]==0.5.0",
   "torch-c-dlpack-ext",
   "apache-tvm-ffi==0.1.9",
+  # Training-capable DeepSeek V4 mHC kernels. TileKernels 1.0.0 requires
+  # TileLang >=0.1.9; the explicit pin is shared with existing TileLang ops.
+  "tile-kernels==1.0.0",
+  "tilelang==0.1.9",
   "av>=14.3.0,<15.0; python_version == '3.11' and platform_machine == 'x86_64'",
   "av>=14.2.0,<14.3; python_version == '3.11' and platform_machine == 'aarch64'",
   "av>=14.0.0,<14.3; python_version == '3.12'",
@@ -141,9 +145,8 @@ npu = [
   "hf_transfer",
 ]
 
-# aarch64 NPU — torch + torch-npu only; torchcodec lacks aarch64 wheels for
-# torch 2.9 (0.11+ needs torch 2.10, 0.8-0.9 are x86_64-only).
-# av 14.4.0 has no aarch64 wheel, so pin to 14.2.0 for cp311 too.
+# Ascend NPU aarch64 — full superset except torchcodec, which lacks compatible
+# aarch64 wheels. av 14.4.0 has no aarch64 wheel, so pin to 14.2.0 for cp311.
 npu_aarch64 = [
   "torch==2.10.0",
   "torch-npu==2.10.0",
@@ -215,6 +218,9 @@ override-dependencies = [
     "torchaudio==2.10.0+cpu; (extra == 'npu')",
     "torchvision==0.25.0+cpu; (extra == 'npu')",
     "torchcodec==0.10.0; (extra == 'npu')",
+    # FlashQLA's setup metadata pins TileLang 0.1.8, while TileKernels 1.0.0
+    # requires >=0.1.9. Both backends are validated against this shared pin.
+    "tilelang==0.1.9; (extra == 'gpu')",
 ]
 
 conflicts = [

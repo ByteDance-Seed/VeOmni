@@ -2,13 +2,15 @@
 
 ## Required Environment
 
-CANN == 8.3.RC1
+Use a CANN installation compatible with the selected hardware and
+`torch-npu==2.10.0`. VeOmni provides repository images for CANN 8.3.RC2 and
+9.0.0; see the [NPU version compatibility table](../../hardware_support/get_started_npu.md#version-compatibility).
 
 ## Prepare CANN
 
 Choose one of the following methods to use CANN:
 
-1. Install CANN according to the [official documentation](https://www.hiascend.com/document/detail/zh/canncommercial/83RC1/softwareinst/instg/instg_quick.html?Mode=PmIns&InstallType=local&OS=openEuler&Software=cannToolKit)
+1. Install CANN according to the [official documentation](https://www.hiascend.com/document/detail/zh/canncommercial/900/softwareinst/instg/instg_quick.html?Mode=PmIns&InstallType=local&OS=openEuler&Software=cannToolKit)
 
 2. Download and use [the CANN image](https://www.hiascend.com/developer/ascendhub/detail/17da20d1c2b6493cb38765adeba85884)
 
@@ -27,7 +29,10 @@ uv sync --frozen  --extra npu_aarch64
 source .venv/bin/activate
 ```
 
-> **Note**: For video/audio processing with the `video` or `audio` extra, you also need to install ffmpeg separately:
+`npu_aarch64` installs the Ascend and multimodal dependency superset except
+`torchcodec`, which has no compatible aarch64 wheel.
+
+> **Note**: For video/audio processing, you also need to install FFmpeg separately:
 > ```bash
 > # Ubuntu/Debian/openEuler
 > sudo apt-get install ffmpeg
@@ -76,8 +81,8 @@ cd ..
 git clone https://github.com/meta-pytorch/torchcodec.git
 cd torchcodec
 
-# Checkout to a specific version for compatibility
-git checkout v0.5.0
+# TorchCodec 0.10 is the release compatible with the PyTorch 2.10 stack above
+git checkout v0.10.0
 
 # Copy the installation script to the torchcodec source directory
 cp ../VeOmni/docs/get_started/installation/install_torchcodec_Ascend.sh .
@@ -95,3 +100,6 @@ pip show torchcodec
 python -c "from torchcodec.decoders import VideoDecoder; print('Success')"
 # If the terminal outputs'Success', it indicates that the torchcodec installation was successful. If an error message is output, it indicates that the installation was not successful
 ```
+
+The helper script performs a source build adapted for Ascend hosts. Validate the import and
+video decode path on the target NPU image after any PyTorch, TorchCodec, CANN, or FFmpeg update.

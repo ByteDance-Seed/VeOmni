@@ -47,6 +47,7 @@ conflicts = [[
 
 [manifest]
 overrides = [
+    { name = "tilelang", marker = "extra == 'gpu'", specifier = "==0.1.9" },
     { name = "torch", marker = "python_full_version == '3.11.*' and extra == 'npu-aarch64'", url = "https://files.pythonhosted.org/packages/78/89/f5554b13ebd71e05c0b002f95148033e730d3f7067f67423026cc9c69410/torch-2.10.0-cp311-cp311-manylinux_2_28_aarch64.whl" },
     { name = "torch", marker = "(python_full_version < '3.11' and extra == 'npu-aarch64') or (python_full_version >= '3.13' and extra == 'npu-aarch64')", specifier = "==2.10.0" },
     { name = "torch", marker = "python_full_version == '3.12.*' and extra == 'npu-aarch64'", url = "https://files.pythonhosted.org/packages/cc/af/758e242e9102e9988969b5e621d41f36b8f258bb4a099109b7a4b4b50ea4/torch-2.10.0-cp312-cp312-manylinux_2_28_aarch64.whl" },
@@ -982,7 +983,6 @@ version = "0.1.0"
 source = { git = "https://github.com/QwenLM/FlashQLA?rev=6ef4858b5446e05bd461d9658d877e548182dbcb#6ef4858b5446e05bd461d9658d877e548182dbcb" }
 dependencies = [
     { name = "apache-tvm-ffi" },
-    { name = "tilelang" },
 ]
 
 [[package]]
@@ -3085,8 +3085,17 @@ wheels = [
 ]
 
 [[package]]
+name = "tile-kernels"
+version = "1.0.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/17/70/f0f62438b89c96bfe36d6ed95bfcc101b75df12f771a800cb6feb0fa9337/tile_kernels-1.0.0.tar.gz", hash = "sha256:259b7d70219cce6afa868f724c3032936c6ae331239285b1111554c4baa46eb3", size = 107895, upload-time = "2026-04-23T09:01:30.093Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/d3/74/7511421ab2a2f292ca2c147a7af78eaec90e39bd6d6703283a4ba8fd7dfc/tile_kernels-1.0.0-py3-none-any.whl", hash = "sha256:9f1e09c1bccde32f3189d1ff32ba9725f86fc04ac1d0ac93284e16fcab1a5666", size = 120627, upload-time = "2026-04-23T09:01:28.287Z" },
+]
+
+[[package]]
 name = "tilelang"
-version = "0.1.8"
+version = "0.1.9"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "apache-tvm-ffi" },
@@ -3100,11 +3109,11 @@ dependencies = [
     { name = "typing-extensions" },
     { name = "z3-solver" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/e6/27/6e363f48f878389078e2899756b8fecc326388b585122fd7f8a86590dfab/tilelang-0.1.8.tar.gz", hash = "sha256:da967821698eb7a79a76d27fbe25e314a3273f2b12ba4833e981658139d0e6d9", size = 93247335, upload-time = "2026-02-16T14:03:28.706Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/56/70/5051f65821baa30a3d61fc48f8ba10c776490315e8c90f82559b92089756/tilelang-0.1.9.tar.gz", hash = "sha256:287f727c913bb648fcf6c1968809ba3390e55eeed257a5c6bb9a80bc05966af4", size = 93395292, upload-time = "2026-04-22T09:19:11.988Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/de/17/10ab5c8ccc58783edcc5392ba653f4732702e44a72065224b3d7a4971852/tilelang-0.1.8-cp38-abi3-macosx_11_0_arm64.whl", hash = "sha256:83654bff38448b6b26e143f150c928360619e91bf431289cf6cd74a4b31c7eba", size = 36016575, upload-time = "2026-02-16T14:02:54.054Z" },
-    { url = "https://files.pythonhosted.org/packages/5d/0b/96ba853aa9e4795020d183e0ca832e9e37d82d4f7f48896241323d1b5ece/tilelang-0.1.8-cp38-abi3-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:5a4018e581f55c852d98a42d3b4acf2dbcfb8b7d8b9156ba7c6b0ab61600a10c", size = 43477401, upload-time = "2026-02-16T14:03:02.879Z" },
-    { url = "https://files.pythonhosted.org/packages/e6/db/d130c8db9140bb21a2ef81a455614a4aeec3388088bf9af5df01ad0ba45d/tilelang-0.1.8-cp38-abi3-manylinux_2_34_aarch64.whl", hash = "sha256:bcc2e28202cde516bdd59e1c25b7f6a139d1c52207d92576f4e711c6217e16ba", size = 40422585, upload-time = "2026-02-16T14:03:12.092Z" },
+    { url = "https://files.pythonhosted.org/packages/90/db/4dd76da8c8585c605639a21bc098d504e317fe324a72f01ce3c7370250b4/tilelang-0.1.9-cp38-abi3-macosx_11_0_arm64.whl", hash = "sha256:00ed594fdeb229c5505b9ffa895c3c5daeb28641c78f783fa1f724cf1e08cecd", size = 36599020, upload-time = "2026-04-22T09:14:39.366Z" },
+    { url = "https://files.pythonhosted.org/packages/f7/8a/1cbeee79d62abaa02441c2d00621554e41aa62dbf3b94a4feb3867184b01/tilelang-0.1.9-cp38-abi3-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:4bbccfe9035aed775ffafb6dc25a5994504b24e2c5d95d0f39643edfafa7bf12", size = 45419374, upload-time = "2026-04-22T09:15:56.014Z" },
+    { url = "https://files.pythonhosted.org/packages/c6/a7/f4bfb86f87e107703146e703204cec2c0eae2492b633e0052b0ace3febb6/tilelang-0.1.9-cp38-abi3-manylinux_2_34_aarch64.whl", hash = "sha256:77ab0ee2f40f66ea015b6b21426d482751e28cbc635ef9d1198cbd6502454a7c", size = 42110365, upload-time = "2026-04-22T09:17:18.292Z" },
 ]
 
 [[package]]
@@ -3598,9 +3607,7 @@ name = "torchaudio"
 version = "2.10.0"
 source = { registry = "https://download.pytorch.org/whl/" }
 resolution-markers = [
-    "python_full_version >= '3.12' and platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux'",
     "python_full_version >= '3.12' and sys_platform == 'darwin'",
-    "python_full_version < '3.12' and platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux'",
     "python_full_version < '3.12' and sys_platform == 'darwin'",
 ]
 wheels = [
@@ -3623,14 +3630,16 @@ name = "torchaudio"
 version = "2.10.0+cpu"
 source = { registry = "https://download.pytorch.org/whl/" }
 resolution-markers = [
-    "python_full_version >= '3.12' and platform_machine != 'aarch64' and platform_machine != 'x86_64' and sys_platform == 'linux'",
-    "python_full_version >= '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux'",
-    "python_full_version >= '3.12' and platform_machine == 'aarch64' and sys_platform == 'linux'",
-    "python_full_version >= '3.12' and sys_platform != 'linux'",
-    "python_full_version < '3.12' and platform_machine != 'aarch64' and platform_machine != 'x86_64' and sys_platform == 'linux'",
-    "python_full_version < '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux'",
-    "python_full_version < '3.12' and platform_machine == 'aarch64' and sys_platform == 'linux'",
-    "python_full_version < '3.12' and sys_platform != 'linux'",
+    "python_full_version >= '3.12' and platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64'",
+    "python_full_version < '3.12' and platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64'",
+    "python_full_version >= '3.12' and platform_machine != 'aarch64' and platform_machine != 'x86_64' and sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64'",
+    "python_full_version >= '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64'",
+    "python_full_version >= '3.12' and platform_machine == 'aarch64' and sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64'",
+    "python_full_version >= '3.12' and sys_platform != 'linux' and extra != 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64'",
+    "python_full_version < '3.12' and platform_machine != 'aarch64' and platform_machine != 'x86_64' and sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64'",
+    "python_full_version < '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64'",
+    "python_full_version < '3.12' and platform_machine == 'aarch64' and sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64'",
+    "python_full_version < '3.12' and sys_platform != 'linux' and extra != 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64'",
 ]
 wheels = [
     { url = "https://download-r2.pytorch.org/whl/cpu/torchaudio-2.10.0%2Bcpu-cp311-cp311-manylinux_2_28_aarch64.whl", hash = "sha256:08981b656c71bcb990165f45b2421136df286de46ced976dba372fba5a627d2e", upload-time = "2026-01-21T15:05:37Z" },
@@ -3830,14 +3839,12 @@ name = "torchvision"
 version = "0.25.0"
 source = { registry = "https://download.pytorch.org/whl/" }
 resolution-markers = [
-    "python_full_version >= '3.12' and platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux'",
     "python_full_version >= '3.12' and sys_platform == 'darwin'",
-    "python_full_version < '3.12' and platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux'",
     "python_full_version < '3.12' and sys_platform == 'darwin'",
 ]
 dependencies = [
-    { name = "numpy", marker = "(platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux') or sys_platform == 'darwin'" },
-    { name = "pillow", marker = "(platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux') or sys_platform == 'darwin'" },
+    { name = "numpy", marker = "sys_platform == 'darwin'" },
+    { name = "pillow", marker = "sys_platform == 'darwin'" },
 ]
 wheels = [
     { url = "https://download-r2.pytorch.org/whl/cpu/torchvision-0.25.0-cp311-cp311-macosx_11_0_arm64.whl", hash = "sha256:a76ce7b8d4fce291a25721ee2f921c783acc6dbd4fc32dc741ed2a1d5a8dde2f", upload-time = "2026-01-20T18:32:30Z" },
@@ -3851,18 +3858,20 @@ name = "torchvision"
 version = "0.25.0+cpu"
 source = { registry = "https://download.pytorch.org/whl/" }
 resolution-markers = [
-    "python_full_version >= '3.12' and platform_machine != 'aarch64' and platform_machine != 'x86_64' and sys_platform == 'linux'",
-    "python_full_version >= '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux'",
-    "python_full_version >= '3.12' and platform_machine == 'aarch64' and sys_platform == 'linux'",
-    "python_full_version >= '3.12' and sys_platform != 'linux'",
-    "python_full_version < '3.12' and platform_machine != 'aarch64' and platform_machine != 'x86_64' and sys_platform == 'linux'",
-    "python_full_version < '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux'",
-    "python_full_version < '3.12' and platform_machine == 'aarch64' and sys_platform == 'linux'",
-    "python_full_version < '3.12' and sys_platform != 'linux'",
+    "python_full_version >= '3.12' and platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64'",
+    "python_full_version < '3.12' and platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64'",
+    "python_full_version >= '3.12' and platform_machine != 'aarch64' and platform_machine != 'x86_64' and sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64'",
+    "python_full_version >= '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64'",
+    "python_full_version >= '3.12' and platform_machine == 'aarch64' and sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64'",
+    "python_full_version >= '3.12' and sys_platform != 'linux' and extra != 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64'",
+    "python_full_version < '3.12' and platform_machine != 'aarch64' and platform_machine != 'x86_64' and sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64'",
+    "python_full_version < '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64'",
+    "python_full_version < '3.12' and platform_machine == 'aarch64' and sys_platform == 'linux' and extra != 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64'",
+    "python_full_version < '3.12' and sys_platform != 'linux' and extra != 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu' and extra != 'extra-6-veomni-npu-aarch64'",
 ]
 dependencies = [
-    { name = "numpy" },
-    { name = "pillow" },
+    { name = "numpy", marker = "(platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux' and extra == 'extra-6-veomni-npu-aarch64') or (platform_machine != 'aarch64' and extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (platform_python_implementation != 'CPython' and extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform != 'linux' and extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or extra == 'extra-6-veomni-npu'" },
+    { name = "pillow", marker = "(platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux' and extra == 'extra-6-veomni-npu-aarch64') or (platform_machine != 'aarch64' and extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (platform_python_implementation != 'CPython' and extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform != 'linux' and extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or extra == 'extra-6-veomni-npu'" },
 ]
 wheels = [
     { url = "https://download-r2.pytorch.org/whl/cpu/torchvision-0.25.0%2Bcpu-cp311-cp311-manylinux_2_28_aarch64.whl", hash = "sha256:59be99d1c470ef470b134468aa6afa6f968081a503acb4ee883d70332f822e35", upload-time = "2026-01-20T18:32:30Z" },
@@ -4110,6 +4119,8 @@ gpu = [
     { name = "peft" },
     { name = "quack-kernels", extra = ["cu13"], marker = "extra == 'extra-6-veomni-gpu' or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64')" },
     { name = "soundfile" },
+    { name = "tile-kernels" },
+    { name = "tilelang" },
     { name = "torch", version = "2.11.0+cu130", source = { registry = "https://download.pytorch.org/whl/" }, marker = "(platform_machine != 'aarch64' and platform_machine != 'x86_64' and extra == 'extra-6-veomni-gpu') or (platform_machine != 'aarch64' and platform_machine != 'x86_64' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (platform_machine == 'aarch64' and extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (platform_machine == 'aarch64' and extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (platform_machine == 'aarch64' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (platform_machine == 'x86_64' and extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (platform_machine == 'x86_64' and extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (platform_machine == 'x86_64' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform != 'linux' and extra == 'extra-6-veomni-gpu') or (sys_platform != 'linux' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64')" },
     { name = "torch", version = "2.11.0+cu130", source = { url = "https://download.pytorch.org/whl/cu130/torch-2.11.0%2Bcu130-cp311-cp311-manylinux_2_28_aarch64.whl" }, marker = "(python_full_version < '3.12' and platform_machine == 'aarch64' and sys_platform == 'linux' and extra == 'extra-6-veomni-gpu') or (python_full_version >= '3.12' and extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (python_full_version >= '3.12' and extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (platform_machine != 'aarch64' and extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (platform_machine != 'aarch64' and extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (platform_machine != 'aarch64' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform != 'linux' and extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (sys_platform != 'linux' and extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform != 'linux' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (extra != 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64')" },
     { name = "torch", version = "2.11.0+cu130", source = { url = "https://download.pytorch.org/whl/cu130/torch-2.11.0%2Bcu130-cp311-cp311-manylinux_2_28_x86_64.whl" }, marker = "(python_full_version < '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'extra-6-veomni-gpu') or (python_full_version >= '3.12' and extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (python_full_version >= '3.12' and extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (platform_machine != 'x86_64' and extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (platform_machine != 'x86_64' and extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (platform_machine != 'x86_64' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform != 'linux' and extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (sys_platform != 'linux' and extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform != 'linux' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (extra != 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64')" },
@@ -4160,9 +4171,11 @@ npu-aarch64 = [
     { name = "torch", version = "2.10.0", source = { url = "https://files.pythonhosted.org/packages/78/89/f5554b13ebd71e05c0b002f95148033e730d3f7067f67423026cc9c69410/torch-2.10.0-cp311-cp311-manylinux_2_28_aarch64.whl" }, marker = "(python_full_version < '3.12' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64')" },
     { name = "torch", version = "2.10.0", source = { url = "https://files.pythonhosted.org/packages/cc/af/758e242e9102e9988969b5e621d41f36b8f258bb4a099109b7a4b4b50ea4/torch-2.10.0-cp312-cp312-manylinux_2_28_aarch64.whl" }, marker = "(python_full_version >= '3.12' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64')" },
     { name = "torch-npu" },
-    { name = "torchaudio", version = "2.10.0", source = { registry = "https://download.pytorch.org/whl/" }, marker = "(platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux' and extra == 'extra-6-veomni-npu-aarch64') or (platform_machine != 'aarch64' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (platform_python_implementation != 'CPython' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform != 'linux' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform == 'darwin' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform == 'darwin' and extra != 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64')" },
+    { name = "torchaudio", version = "2.10.0", source = { registry = "https://download.pytorch.org/whl/" }, marker = "(sys_platform == 'darwin' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64')" },
+    { name = "torchaudio", version = "2.10.0+cpu", source = { registry = "https://download.pytorch.org/whl/" }, marker = "(platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux' and extra == 'extra-6-veomni-npu-aarch64') or (platform_machine != 'aarch64' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (platform_python_implementation != 'CPython' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform != 'linux' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64')" },
     { name = "torchaudio", version = "2.10.0+xpu", source = { registry = "https://download.pytorch.org/whl/" }, marker = "(platform_machine != 'aarch64' and sys_platform == 'linux' and extra == 'extra-6-veomni-npu-aarch64') or (platform_python_implementation != 'CPython' and sys_platform == 'linux' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform != 'darwin' and sys_platform != 'linux' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform == 'darwin' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform == 'linux' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64')" },
-    { name = "torchvision", version = "0.25.0", source = { registry = "https://download.pytorch.org/whl/" }, marker = "(platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux' and extra == 'extra-6-veomni-npu-aarch64') or (platform_machine != 'aarch64' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (platform_python_implementation != 'CPython' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform != 'linux' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform == 'darwin' and extra != 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform == 'darwin' and extra != 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64')" },
+    { name = "torchvision", version = "0.25.0", source = { registry = "https://download.pytorch.org/whl/" }, marker = "(sys_platform == 'darwin' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64')" },
+    { name = "torchvision", version = "0.25.0+cpu", source = { registry = "https://download.pytorch.org/whl/" }, marker = "(platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux' and extra == 'extra-6-veomni-npu-aarch64') or (platform_machine != 'aarch64' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (platform_python_implementation != 'CPython' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform != 'linux' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64')" },
     { name = "torchvision", version = "0.25.0+xpu", source = { registry = "https://download.pytorch.org/whl/" }, marker = "(platform_machine != 'aarch64' and sys_platform == 'linux' and extra == 'extra-6-veomni-npu-aarch64') or (platform_python_implementation != 'CPython' and sys_platform == 'linux' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform != 'darwin' and sys_platform != 'linux' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform == 'darwin' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform == 'linux' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64')" },
 ]
 
@@ -4270,6 +4283,8 @@ requires-dist = [
     { name = "soundfile", marker = "extra == 'npu'", specifier = ">=0.13.1,<0.14" },
     { name = "soundfile", marker = "extra == 'npu-aarch64'", specifier = ">=0.13.1,<0.14" },
     { name = "tiktoken", specifier = ">=0.9.0" },
+    { name = "tile-kernels", marker = "extra == 'gpu'", specifier = "==1.0.0" },
+    { name = "tilelang", marker = "extra == 'gpu'", specifier = "==0.1.9" },
     { name = "timm" },
     { name = "torch", marker = "python_full_version == '3.11.*' and extra == 'npu-aarch64'", url = "https://files.pythonhosted.org/packages/78/89/f5554b13ebd71e05c0b002f95148033e730d3f7067f67423026cc9c69410/torch-2.10.0-cp311-cp311-manylinux_2_28_aarch64.whl" },
     { name = "torch", marker = "(python_full_version < '3.11' and extra == 'npu-aarch64') or (python_full_version >= '3.13' and extra == 'npu-aarch64')", specifier = "==2.10.0" },

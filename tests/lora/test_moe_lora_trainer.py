@@ -237,7 +237,8 @@ class _LogDictSaveCallback(Callback):
         # callback runs on every rank inside ``train_step``'s
         # ``on_step_end`` so that invariant holds.
         device = self.trainer.device if hasattr(self.trainer, "device") else torch.device("cpu")
-        t = torch.tensor([float(value)], dtype=torch.float64, device=device)
+        # float32: HCCL allreduce does not support float64 (at::kDouble).
+        t = torch.tensor([float(value)], dtype=torch.float32, device=device)
         dist.all_reduce(t, op=dist.ReduceOp.AVG, group=dp_group)
         return float(t.item())
 
