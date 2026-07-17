@@ -53,7 +53,7 @@ depending on when and where the kernel is bound:
 | RMSNorm | `rms_norm_implementation` | PER_MODEL | `eager` | `liger_kernel`, `npu`, `triton`\* |
 | Rotary pos emb | `rotary_pos_emb_implementation` | PER_MODEL | `eager` | `liger_kernel`, `npu`, `triton`\* |
 | SwiGLU MLP | `swiglu_mlp_implementation` | PER_MODEL | `eager` | `liger_kernel` |
-| mHC | `mhc_backend` | build-time `OpSlot` | `eager` | `tile_kernels` (DeepSeek V4, SM90+) |
+| mHC | `mhc_implementation` | build-time `OpSlot` | `eager` | `tilelang` (DeepSeek V4, SM90+; provided by `tile-kernels`) |
 | Fused MoE | `moe_implementation` | build-time | `eager` | `eager`, `fused_triton` (group-gemm, SM70+), `fused_quack` (CUTLASS/CuTe, SM90+), `fused_npu` (Ascend). Mismatches raise instead of falling back. |
 
 \* The `triton` backend is registered per-model via `extra_backends`: DeepSeek
@@ -72,7 +72,7 @@ own Triton RMSNorm/rotary. See the per-model table below.
 | `moe_implementation=fused_triton` | Triton, SM70+ | `is_fused_moe_available()` |
 | `moe_implementation=fused_quack` | `quack` package, SM90+ | `is_quack_gemm_available()` |
 | `moe_implementation=fused_npu` | `torch_npu` + Ascend NPU | `is_torch_npu_available()` |
-| `mhc_backend=tile_kernels` | `tile-kernels==1.0.0`, BF16, NVIDIA SM90+ | `KernelSpec(HardwareRequirement(..., min_compute_capability=90))` |
+| `mhc_implementation=tilelang` | `tile-kernels==1.0.0`, BF16, NVIDIA SM90+ | `KernelSpec(HardwareRequirement(..., min_compute_capability=90))` |
 
 ### Per-model PER_MODEL coverage
 
@@ -121,10 +121,10 @@ extra installed. The GPU extra pins `tilelang==0.1.9` and
 `tile-kernels==1.0.0`; the uv override resolves FlashQLA's older 0.1.8 metadata
 pin against the shared, validated TileLang version.
 
-DeepSeek-V4 selects these kernels with `dsa_indexer_backend: tilelang` and
-`dsa_attention_backend: tilelang_sparse`. Both default to `eager`; unsupported
+DeepSeek-V4 selects these kernels with `dsa_indexer_implementation: tilelang` and
+`dsa_attention_implementation: tilelang`. Both default to `eager`; unsupported
 cache, position, or dropout layouts retain the upstream eager implementation.
-DeepSeek V4 selects the mHC adapters with `mhc_backend: tile_kernels`; once
+DeepSeek V4 selects the mHC adapters with `mhc_implementation: tilelang`; once
 selected, unsupported dtype, layout, or hardware raises instead of falling
 back to eager.
 

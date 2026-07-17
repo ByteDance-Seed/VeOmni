@@ -42,7 +42,7 @@ for variant, factory, description in (
 ):
     KERNEL_REGISTRY.register(
         KernelSpec(
-            name="tile_kernels",
+            name="tilelang",
             op_name="mhc",
             variant=variant,
             factory=factory,

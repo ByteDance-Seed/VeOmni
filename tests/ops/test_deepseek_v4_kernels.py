@@ -268,9 +268,9 @@ def test_deepseek_v4_generated_attention_dispatch_matches_eager():
     )
 
     try:
-        modeling.veomni_dsa_attention_backend.bind(SimpleNamespace(dsa_attention_backend="eager"))
+        modeling.veomni_dsa_attention_implementation.bind(SimpleNamespace(dsa_attention_implementation="eager"))
         expected, _ = modeling.eager_attention_forward(module, query, key, key, causal_mask, dim**-0.5, dropout=0.0)
-        modeling.veomni_dsa_attention_backend.bind(SimpleNamespace(dsa_attention_backend="tilelang_sparse"))
+        modeling.veomni_dsa_attention_implementation.bind(SimpleNamespace(dsa_attention_implementation="tilelang"))
         actual, weights = modeling.eager_attention_forward(
             module, query, key, key, causal_mask, dim**-0.5, dropout=0.0
         )
@@ -284,7 +284,7 @@ def test_deepseek_v4_generated_attention_dispatch_matches_eager():
         assert fp32_weights is not None
         assert fp32_output.dtype == torch.float32
     finally:
-        modeling.veomni_dsa_attention_backend.bind(SimpleNamespace(dsa_attention_backend="eager"))
+        modeling.veomni_dsa_attention_implementation.bind(SimpleNamespace(dsa_attention_implementation="eager"))
 
 
 def test_deepseek_v4_generated_indexer_dispatch_and_position_fallback(monkeypatch):
@@ -311,7 +311,7 @@ def test_deepseek_v4_generated_indexer_dispatch_and_position_fallback(monkeypatc
 
     monkeypatch.setattr(modeling, "v4_lighting_indexer", fake_tilelang)
     try:
-        modeling.veomni_dsa_indexer_backend.bind(SimpleNamespace(dsa_indexer_backend="tilelang"))
+        modeling.veomni_dsa_indexer_implementation.bind(SimpleNamespace(dsa_indexer_implementation="tilelang"))
         tilelang_indices = indexer(hidden_states, q_residual, canonical_positions, None, 0)
         assert calls
         expected_topk = seq_len // config.compress_rates["compressed_sparse_attention"]
@@ -349,7 +349,7 @@ def test_deepseek_v4_generated_indexer_dispatch_and_position_fallback(monkeypatc
         assert len(calls) == 2
         assert eager_indices.shape == tilelang_indices.shape
     finally:
-        modeling.veomni_dsa_indexer_backend.bind(SimpleNamespace(dsa_indexer_backend="eager"))
+        modeling.veomni_dsa_indexer_implementation.bind(SimpleNamespace(dsa_indexer_implementation="eager"))
 
 
 def test_deepseek_v4_packed_compressors_match_independent_sequences():
@@ -374,7 +374,7 @@ def test_deepseek_v4_packed_compressors_match_independent_sequences():
         block_bias_rates=(config.compress_rates["heavily_compressed_attention"],),
     )
 
-    modeling.veomni_dsa_indexer_backend.bind(SimpleNamespace(dsa_indexer_backend="eager"))
+    modeling.veomni_dsa_indexer_implementation.bind(SimpleNamespace(dsa_indexer_implementation="eager"))
     for compressor_cls in (modeling.DeepseekV4HCACompressor, modeling.DeepseekV4CSACompressor):
         compressor = compressor_cls(config)
         # Compressors allocate ``position_bias`` with ``torch.empty``; the full

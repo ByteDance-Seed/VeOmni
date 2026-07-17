@@ -15,9 +15,9 @@ selection knob.
 | Kernel | Config field | Available values | Default | Selection time |
 |--------|-------------|------------------|---------|----------------|
 | Attention | `attn_implementation` | `eager`, `sdpa`, `flash_attention_2`, `flash_attention_3`, `flash_attention_4`, `native-sparse` | `"flash_attention_2"` | Config `__post_init__` + `build_foundation_model` |
-| DSA indexer | `dsa_indexer_backend` | `eager`, `cudnn` (GLM-DSA), `tilelang` (DeepSeek-V4) | `"eager"` | Model build via `OpsConfigSlot` |
-| DSA attention | `dsa_attention_backend` | `eager`, `flashmla_cudnn` (GLM-DSA), `tilelang_sparse` (DeepSeek-V4) | `"eager"` | Model build via `OpsConfigSlot` |
-| mHC | `mhc_backend` | `eager`, `tile_kernels` (DeepSeek-V4, SM90+) | `"eager"` | Model build via three `OpSlot`s (`pre`, `post`, `head`) |
+| DSA indexer | `dsa_indexer_implementation` | `eager`, `cudnn` (GLM-DSA), `tilelang` (DeepSeek-V4) | `"eager"` | Model build via `OpsConfigSlot` |
+| DSA attention | `dsa_attention_implementation` | `eager`, `flashmla_cudnn` (GLM-DSA), `tilelang` (DeepSeek-V4) | `"eager"` | Model build via `OpsConfigSlot` |
+| mHC | `mhc_implementation` | `eager`, `tilelang` (DeepSeek-V4, SM90+) | `"eager"` | Model build via three `OpSlot`s (`pre`, `post`, `head`) |
 | Cross-entropy loss | `cross_entropy_loss_implementation` | `eager`, `liger_kernel`, `chunk_loss`, `npu` | `"liger_kernel"` (GPU) | `apply_ops_config()` (before model build) |
 | RMSNorm | `rms_norm_implementation` | `eager`, `liger_kernel`, `npu`, `triton` (per-model; DeepSeek-V3) | `"liger_kernel"` (GPU) | Model registration via ops config singleton |
 | SwiGLU MLP | `swiglu_mlp_implementation` | `eager`, `liger_kernel` | `"liger_kernel"` (GPU) | Model registration via ops config singleton |
@@ -142,13 +142,14 @@ and final head collapse through registry-backed `OpSlot`s:
 ```yaml
 model:
   ops_implementation:
-    dsa_indexer_backend: tilelang
-    dsa_attention_backend: tilelang_sparse
-    mhc_backend: tile_kernels
+    dsa_indexer_implementation: tilelang
+    dsa_attention_implementation: tilelang
+    mhc_implementation: tilelang
 ```
 
-All three optimized paths require NVIDIA SM90 or later. `mhc_backend` defaults
-to `eager` and never silently falls back after `tile_kernels` is selected.
+All three optimized paths require NVIDIA SM90 or later. `mhc_implementation` defaults
+to `eager` and never silently falls back after `tilelang` is selected. The mHC
+implementation is provided by the `tile-kernels` package.
 TileKernels' training path supports forward and backward with BF16 activations
 and DeepSeek V4's `hc_mult=4` layout.
 
@@ -370,7 +371,7 @@ raise during config validation or kernel binding.
 | `fused_npu` | NPU group-gemm | Ascend NPU | Yes |
 
 DeepSeek-V4 keeps eager DSA indexer and attention as its defaults, with optional
-SM90+ `tilelang` indexer and `tilelang_sparse` attention backends. Its MoE path
+SM90+ `tilelang` indexer and attention implementations. Its MoE path
 uses the independent `moe_implementation` selection and therefore defaults to
 `fused_triton` on GPU.
 The v4-specific patched experts path passes the merged `gate_up_proj` tensor

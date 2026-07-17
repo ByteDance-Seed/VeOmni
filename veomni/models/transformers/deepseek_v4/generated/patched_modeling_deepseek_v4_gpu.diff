@@ -117,8 +117,8 @@
 +veomni_mhc_pre = OpSlot("mhc", "pre")
 +veomni_mhc_post = OpSlot("mhc", "post")
 +veomni_mhc_head = OpSlot("mhc", "head")
-+veomni_dsa_indexer_backend = OpsConfigSlot("dsa_indexer_backend")
-+veomni_dsa_attention_backend = OpsConfigSlot("dsa_attention_backend")
++veomni_dsa_indexer_implementation = OpsConfigSlot("dsa_indexer_implementation")
++veomni_dsa_attention_implementation = OpsConfigSlot("dsa_attention_implementation")
 
 
  @use_kernel_forward_from_hub("RMSNorm")
@@ -220,7 +220,7 @@
 +    # ================================================================
 +    # Patch: DeepseekV4Indexer.forward
 +    # 1. Dispatch CUDA prefill/training index scoring to the TileLang Lightning
-+    #    Indexer when ``dsa_indexer_backend=tilelang``. Cache/decode and unusual
++    #    Indexer when ``dsa_indexer_implementation=tilelang``. Cache/decode and unusual
 +    #    position layouts retain the upstream eager implementation.
 +    # ================================================================
      def forward(
@@ -277,7 +277,7 @@
              new_kv = chunk_kv.new_zeros((batch, n_windows, 2 * ratio, self.head_dim))
              new_gate = chunk_gate.new_full((batch, n_windows, 2 * ratio, self.head_dim), float("-inf"))
              new_kv[:, :, ratio:] = chunk_kv[..., self.head_dim :]
-@@ -549,31 +658,71 @@
+@@ -549,31 +658,72 @@
          cos_q, sin_q = self.rotary_emb(hidden_states, position_ids=position_ids, layer_type=self.rope_layer_type)
          q = self.q_b_proj(q_residual).view(batch, seq_len, -1, self.head_dim).transpose(1, 2)
          q = apply_rotary_pos_emb(q, cos_q, sin_q).transpose(1, 2)
@@ -298,17 +298,18 @@
 -        # Picks that still point past `causal_threshold` (early queries with too few ready
 -        # blocks) are replaced with a `-1` sentinel that the compresser treats as invalid.
 +        # --- Patch.1 ---
-+        indexer_backend = veomni_dsa_indexer_backend.value
-+        if indexer_backend not in {"eager", "tilelang"}:
++        indexer_implementation = veomni_dsa_indexer_implementation.value
++        if indexer_implementation not in {"eager", "tilelang"}:
 +            raise ValueError(
-+                f"DeepSeek-V4 does not support dsa_indexer_backend={indexer_backend!r}; expected 'eager' or 'tilelang'"
++                "DeepSeek-V4 does not support "
++                f"dsa_indexer_implementation={indexer_implementation!r}; expected 'eager' or 'tilelang'"
 +            )
 +        canonical_positions = torch.arange(seq_len, device=position_ids.device).unsqueeze(0).expand_as(position_ids)
 +        packed_ranges = None
 +        if packed_compression_metadata is not None and cache_layer is None:
 +            packed_ranges = packed_compressed_causal_ranges(packed_compression_metadata[self.compress_rate])
 +        use_tilelang = (
-+            indexer_backend == "tilelang"
++            indexer_implementation == "tilelang"
 +            and hidden_states.is_cuda
 +            and q.dtype == torch.bfloat16
 +            and compressed_kv.dtype == torch.bfloat16
@@ -366,7 +367,7 @@
 
 
  class DeepseekV4CSACompressor(nn.Module):
-@@ -617,11 +766,47 @@
+@@ -617,11 +767,47 @@
          position_ids: torch.Tensor,
          past_key_values: Cache | None,
          layer_idx: int,
@@ -415,7 +416,7 @@
 
          if cache_layer is None:
              usable = (kv.shape[1] // self.compress_rate) * self.compress_rate
-@@ -634,13 +819,6 @@
+@@ -634,13 +820,6 @@
              ratio = self.compress_rate
              chunk_kv = chunk_kv.view(batch, n_windows, ratio, -1)
              chunk_gate = chunk_gate.view(batch, n_windows, ratio, -1) + self.position_bias.to(chunk_gate.dtype)
@@ -429,7 +430,7 @@
              new_kv = chunk_kv.new_zeros((batch, n_windows, 2 * ratio, self.head_dim))
              new_gate = chunk_gate.new_full((batch, n_windows, 2 * ratio, self.head_dim), float("-inf"))
              new_kv[:, :, ratio:] = chunk_kv[..., self.head_dim :]
-@@ -655,9 +833,6 @@
+@@ -655,9 +834,6 @@
                  if prior_kv is not None:
                      new_kv[:, 0, :ratio] = prior_kv.to(new_kv.dtype)
                      new_gate[:, 0, :ratio] = prior_gate.to(new_gate.dtype)
@@ -439,7 +440,7 @@
              compressed = self.kv_norm(
                  (new_kv * new_gate.softmax(dim=2, dtype=torch.float32).to(new_kv.dtype)).sum(dim=2)
              )
-@@ -672,18 +847,9 @@
+@@ -672,18 +848,9 @@
          if cache_layer is not None:
              compressed = cache_layer.update_compressor_states("compressor", compressed)
          compressed_kv = compressed.unsqueeze(1)
@@ -460,7 +461,7 @@
          safe_indices = torch.where(valid, top_k_indices, torch.full_like(top_k_indices, compressed_len))
          block_bias = compressed_kv.new_full((batch, 1, seq_len, compressed_len + 1), float("-inf"))
          block_bias.scatter_(-1, safe_indices.unsqueeze(1), 0.0)
-@@ -702,6 +868,19 @@
+@@ -702,6 +869,19 @@
      return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
 
 
@@ -472,7 +473,7 @@
 +# ================================================================
 +# Patch: eager_attention_forward
 +# 1. Dispatch DeepSeek-V4 attention to the TileLang sparse MQA kernel when
-+#    ``dsa_attention_backend=tilelang_sparse``. The existing additive mask is
++#    ``dsa_attention_implementation=tilelang``. The existing additive mask is
 +#    converted to a compact fixed-width index list, preserving sliding-window,
 +#    compressor, causal, and invalid-index semantics.
 +# 2. Preserve the upstream eager implementation as the default fallback.
@@ -480,19 +481,19 @@
  def eager_attention_forward(
      module: nn.Module,
      query: torch.Tensor,
-@@ -712,6 +891,52 @@
+@@ -712,6 +892,52 @@
      dropout: float | int = 0.0,
      **kwargs,
  ):
 +    # --- Patch.1 ---
-+    attention_backend = veomni_dsa_attention_backend.value
-+    if attention_backend not in {"eager", "tilelang_sparse"}:
++    attention_implementation = veomni_dsa_attention_implementation.value
++    if attention_implementation not in {"eager", "tilelang"}:
 +        raise ValueError(
-+            f"DeepSeek-V4 does not support dsa_attention_backend={attention_backend!r}; "
-+            "expected 'eager' or 'tilelang_sparse'"
++            "DeepSeek-V4 does not support "
++            f"dsa_attention_implementation={attention_implementation!r}; expected 'eager' or 'tilelang'"
 +        )
 +    use_tilelang = (
-+        attention_backend == "tilelang_sparse"
++        attention_implementation == "tilelang"
 +        and query.is_cuda
 +        and query.dtype == torch.bfloat16
 +        and key.dtype == torch.bfloat16
@@ -533,7 +534,7 @@
      key_states = repeat_kv(key, module.num_key_value_groups)
      value_states = repeat_kv(value, module.num_key_value_groups)
      attn_weights = torch.matmul(query, key_states.transpose(2, 3)) * scaling
-@@ -720,17 +945,14 @@
+@@ -720,17 +946,14 @@
 
      sinks = module.sinks.reshape(1, -1, 1, 1).expand(query.shape[0], -1, query.shape[-2], -1)
      combined_logits = torch.cat([attn_weights, sinks], dim=-1)
@@ -553,7 +554,7 @@
 
 
  COMPRESSOR_CLASSES = {
-@@ -738,6 +960,12 @@
+@@ -738,6 +961,12 @@
      "compressed_sparse_attention": DeepseekV4CSACompressor,
      "heavily_compressed_attention": DeepseekV4HCACompressor,
  }
@@ -566,7 +567,7 @@
 
 
  class DeepseekV4Attention(nn.Module):
-@@ -786,6 +1014,10 @@
+@@ -786,6 +1015,10 @@
              COMPRESSOR_CLASSES[self.layer_type](config) if self.layer_type != "sliding_attention" else None
          )
 
@@ -577,7 +578,7 @@
      def forward(
          self,
          hidden_states: torch.Tensor,
-@@ -793,12 +1025,10 @@
+@@ -793,12 +1026,10 @@
          position_ids: torch.Tensor,
          attention_mask: torch.Tensor | None,
          past_key_values: Cache | None = None,
@@ -591,7 +592,7 @@
          cos, sin = position_embeddings[self.rope_layer_type]
 
          q_residual = self.q_a_norm(self.q_a_proj(hidden_states))
-@@ -809,29 +1039,29 @@
+@@ -809,29 +1040,29 @@
          kv = self.kv_norm(self.kv_proj(hidden_states)).view(*hidden_shape).transpose(1, 2)
          kv = apply_rotary_pos_emb(kv, cos, sin)
 
@@ -631,7 +632,7 @@
              self.config._attn_implementation, eager_attention_forward
          )
          attn_output, attn_weights = attention_interface(
-@@ -847,18 +1077,17 @@
+@@ -847,18 +1078,17 @@
              **kwargs,
          )
 
@@ -656,7 +657,7 @@
 
 
  class DeepseekV4HyperConnection(nn.Module):
-@@ -909,22 +1138,30 @@
+@@ -909,22 +1139,30 @@
          # doubly-stochastic manifold). Each output gets its own learned scale.
          self.scale = nn.Parameter(torch.empty(3))
 
@@ -698,7 +699,7 @@
          pre = torch.sigmoid(pre_w * pre_scale + pre_b) + self.hc_eps
          post = 2 * torch.sigmoid(post_w * post_scale + post_b)
          comb_logits = comb_w.view(*comb_w.shape[:-1], hc, hc) * comb_scale + comb_b.view(hc, hc)
-@@ -933,11 +1170,14 @@
+@@ -933,11 +1171,14 @@
          for _ in range(self.hc_sinkhorn_iters - 1):
              comb = comb / (comb.sum(dim=-1, keepdim=True) + self.hc_eps)
              comb = comb / (comb.sum(dim=-2, keepdim=True) + self.hc_eps)
@@ -716,7 +717,7 @@
 
 
  class DeepseekV4HyperHead(nn.Module):
-@@ -953,6 +1193,17 @@
+@@ -953,6 +1194,17 @@
          self.hc_scale = nn.Parameter(torch.empty(1))
 
      def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -734,7 +735,7 @@
          flat = self.input_norm(x.flatten(2).float())
          mixes = F.linear(flat, self.hc_fn.float())
          pre = torch.sigmoid(mixes * self.hc_scale.float() + self.hc_base.float()) + self.eps
-@@ -975,11 +1226,30 @@
+@@ -975,11 +1227,30 @@
          return down_proj
 
 
@@ -767,7 +768,7 @@
          super().__init__()
          self.num_experts = config.num_local_experts
          self.hidden_dim = config.hidden_size
-@@ -990,30 +1260,57 @@
+@@ -990,30 +1261,57 @@
          self.limit = config.swiglu_limit
 
      def forward(
@@ -838,7 +839,7 @@
 
 
  class DeepseekV4TopKRouter(nn.Module):
-@@ -1088,6 +1385,12 @@
+@@ -1088,6 +1386,12 @@
          return routed + self.shared_experts(residual)
 
 
@@ -851,7 +852,7 @@
  class DeepseekV4DecoderLayer(GradientCheckpointingLayer):
      r"""DeepSeek-V4 decoder block (paper §2). Differs from a classic residual block in
      two places:
-@@ -1118,22 +1421,20 @@
+@@ -1118,22 +1422,20 @@
          input_ids: torch.Tensor | None = None,
          **kwargs: Unpack[TransformersKwargs],
      ) -> torch.Tensor:
@@ -882,7 +883,7 @@
          return post.to(dtype).unsqueeze(-1) * mlp_output.unsqueeze(-2) + torch.matmul(
              comb.to(dtype).transpose(-1, -2), hidden_states
          )
-@@ -1233,6 +1534,12 @@
+@@ -1233,6 +1535,12 @@
                  init.copy_(getattr(module, f"{layer_type}_original_inv_freq"), curr_inv_freq)
 
 
@@ -895,7 +896,7 @@
  @auto_docstring
  class DeepseekV4Model(DeepseekV4PreTrainedModel):
      def __init__(self, config: DeepseekV4Config):
-@@ -1252,6 +1559,10 @@
+@@ -1252,6 +1560,10 @@
          # Initialize weights and apply final processing
          self.post_init()
 
@@ -906,7 +907,7 @@
      @merge_with_config_defaults
      @capture_outputs
      @auto_docstring
-@@ -1276,9 +1587,31 @@
+@@ -1276,9 +1588,31 @@
              past_seen = past_key_values.get_seq_length()
              position_ids = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device) + past_seen
              position_ids = position_ids.unsqueeze(0)
@@ -941,7 +942,7 @@
          if isinstance(attention_mask, dict):
              causal_mask = next(iter(attention_mask.values()))
          else:
-@@ -1289,6 +1622,8 @@
+@@ -1289,6 +1623,8 @@
                  past_key_values=past_key_values,
                  position_ids=position_ids,
              )
@@ -950,7 +951,7 @@
          hidden_states = inputs_embeds.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1).contiguous()
          position_embeddings = {
              "main": self.rotary_emb(inputs_embeds, position_ids=position_ids, layer_type="main"),
-@@ -1392,6 +1727,12 @@
+@@ -1392,6 +1728,12 @@
      return overall_loss * num_experts
 
 
@@ -963,7 +964,7 @@
  @auto_docstring
  class DeepseekV4ForCausalLM(DeepseekV4PreTrainedModel, GenerationMixin):
      _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
-@@ -1410,49 +1751,36 @@
+@@ -1410,49 +1752,36 @@
          # Initialize weights and apply final processing
          self.post_init()
 
@@ -1033,7 +1034,7 @@
          outputs: MoeModelOutputWithPast = self.model(
              input_ids=input_ids,
              attention_mask=attention_mask,
-@@ -1465,26 +1793,64 @@
+@@ -1465,26 +1794,64 @@
          )
 
          hidden_states = outputs.last_hidden_state
@@ -1112,7 +1113,7 @@
              loss=loss,
              aux_loss=aux_loss,
              logits=logits,
-@@ -1492,7 +1858,17 @@
+@@ -1492,7 +1859,17 @@
              hidden_states=outputs.hidden_states,
              attentions=outputs.attentions,
              router_logits=outputs.router_logits,
