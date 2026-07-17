@@ -26,7 +26,7 @@
 #    - method_override: DeepseekV4Indexer.forward
 #      Optional TileLang Lightning Indexer dispatch
 #    - method_override: DeepseekV4Attention.forward
-#      Forward packed sequence boundaries to HCA and CSA compressors
+#      Forward packed sequence boundaries and apply optional activation QAT
 #    - function_replacement: eager_attention_forward
 #      Optional TileLang sparse MQA dispatch
 #    - method_override: DeepseekV4Model.forward
@@ -80,7 +80,12 @@ from veomni.ops import fused_moe_forward
 
 # Additional import blocks for patches
 from veomni.ops.dispatch import OpsConfigSlot, OpSlot
-from veomni.ops.kernels.deepseek_v4 import sparse_attn_tilelang, v4_lighting_indexer
+from veomni.ops.kernels.deepseek_v4 import (
+    fp8_simulate_qat,
+    rotate_activation,
+    sparse_attn_tilelang,
+    v4_lighting_indexer,
+)
 from veomni.utils.model_outputs import MoeCausalLMOutputWithLogProbs
 
 
@@ -92,6 +97,19 @@ veomni_mhc_post = OpSlot("mhc", "post")
 veomni_mhc_head = OpSlot("mhc", "head")
 veomni_dsa_indexer_implementation = OpsConfigSlot("dsa_indexer_implementation")
 veomni_dsa_attention_implementation = OpsConfigSlot("dsa_attention_implementation")
+veomni_deepseek_v4_fp8_activation_qat = OpsConfigSlot("deepseek_v4_fp8_activation_qat", default=False)
+
+
+def _deepseek_v4_fp8_qat_non_rope(x, rope_dim):
+    if not veomni_deepseek_v4_fp8_activation_qat.value or x.numel() == 0:
+        return x
+    return torch.cat([fp8_simulate_qat(x[..., :-rope_dim], 64), x[..., -rope_dim:]], dim=-1)
+
+
+def _deepseek_v4_fp8_qat_indexer(x):
+    if not veomni_deepseek_v4_fp8_activation_qat.value or x.numel() == 0:
+        return x
+    return fp8_simulate_qat(rotate_activation(x), 128)
 
 
 # ======================================================================
@@ -501,6 +519,7 @@ class DeepseekV4HCACompressor(nn.Module):
                 rate_metadata,
                 overlap=False,
             )
+            compressed = _deepseek_v4_fp8_qat_non_rope(compressed, self.rotary_emb.config.qk_rope_head_dim)
             block_bias = packed_compressed_block_bias(rate_metadata)
             return compressed.unsqueeze(1), block_bias
 
@@ -525,6 +544,8 @@ class DeepseekV4HCACompressor(nn.Module):
             compressed = apply_rotary_pos_emb(compressed.unsqueeze(1), cos, sin).squeeze(1)
         else:
             compressed = chunk_kv.new_zeros((batch, 0, self.head_dim))
+
+        compressed = _deepseek_v4_fp8_qat_non_rope(compressed, self.rotary_emb.config.qk_rope_head_dim)
 
         if cache_layer is not None:
             compressed = cache_layer.update_compressor_states("compressor", compressed)
@@ -676,6 +697,7 @@ class DeepseekV4Indexer(nn.Module):
         else:
             compressed = chunk_kv.new_zeros((batch, 0, self.head_dim))
 
+        compressed = _deepseek_v4_fp8_qat_indexer(compressed)
         compressed_kv = (
             compressed if cache_layer is None else cache_layer.update_compressor_states("indexer", compressed)
         )
@@ -683,6 +705,7 @@ class DeepseekV4Indexer(nn.Module):
         cos_q, sin_q = self.rotary_emb(hidden_states, position_ids=position_ids, layer_type=self.rope_layer_type)
         q = self.q_b_proj(q_residual).view(batch, seq_len, -1, self.head_dim).transpose(1, 2)
         q = apply_rotary_pos_emb(q, cos_q, sin_q).transpose(1, 2)
+        q = _deepseek_v4_fp8_qat_indexer(q)
         weights = self.weights_proj(hidden_states).float() * (self.weights_scaling * self.softmax_scale)
         compressed_len = compressed_kv.shape[1]
         top_k = min(self.index_topk, compressed_len)
@@ -817,6 +840,7 @@ class DeepseekV4CSACompressor(nn.Module):
                 rate_metadata,
                 overlap=True,
             )
+            compressed = _deepseek_v4_fp8_qat_non_rope(compressed, self.rotary_emb.config.qk_rope_head_dim)
             compressed_kv = compressed.unsqueeze(1)
             top_k_indices = self.indexer(
                 hidden_states,
@@ -869,6 +893,8 @@ class DeepseekV4CSACompressor(nn.Module):
             compressed = apply_rotary_pos_emb(compressed.unsqueeze(1), cos, sin).squeeze(1)
         else:
             compressed = chunk_kv.new_zeros((batch, 0, self.head_dim))
+
+        compressed = _deepseek_v4_fp8_qat_non_rope(compressed, self.rotary_emb.config.qk_rope_head_dim)
 
         if cache_layer is not None:
             compressed = cache_layer.update_compressor_states("compressor", compressed)
@@ -1043,6 +1069,7 @@ class DeepseekV4Attention(nn.Module):
     # ================================================================
     # Patch: DeepseekV4Attention.forward
     # 1. Pass the collator-provided packed sequence slices into compressors.
+    # 2. Fake-quantize the main attention KV tensor before concatenating compressed KV.
     # ================================================================
     def forward(
         self,
@@ -1065,6 +1092,7 @@ class DeepseekV4Attention(nn.Module):
 
         kv = self.kv_norm(self.kv_proj(hidden_states)).view(*hidden_shape).transpose(1, 2)
         kv = apply_rotary_pos_emb(kv, cos, sin)
+        kv = _deepseek_v4_fp8_qat_non_rope(kv, self.config.qk_rope_head_dim)
 
         if past_key_values is not None:
             kv = past_key_values.update(kv, kv, self.layer_idx)[0]

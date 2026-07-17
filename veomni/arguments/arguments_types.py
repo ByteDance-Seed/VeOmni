@@ -1058,6 +1058,10 @@ class OpsImplementationConfig:
         default="eager",
         metadata={"help": "DeepSeek sparse attention implementation: 'eager', 'flashmla_cudnn', or 'tilelang'."},
     )
+    deepseek_v4_fp8_activation_qat: bool = field(
+        default=False,
+        metadata={"help": "Enable DeepSeek-V4 FP8 activation fake quantization with straight-through gradients."},
+    )
     mhc_implementation: Literal["eager", "tilelang"] = field(
         default="eager",
         metadata={
@@ -1142,6 +1146,18 @@ class OpsImplementationConfig:
         )
 
         on_npu = is_torch_npu_available()
+
+        if on_npu and self.deepseek_v4_fp8_activation_qat:
+            raise ValueError(
+                "deepseek_v4_fp8_activation_qat=True is only supported by the DeepSeek-V4 GPU backend; "
+                "disable it on Ascend NPU."
+            )
+        if self.deepseek_v4_fp8_activation_qat and not is_package_available("fast_hadamard_transform"):
+            raise ValueError(
+                "deepseek_v4_fp8_activation_qat=True requires fast-hadamard-transform. "
+                "Install it after syncing the GPU environment; see "
+                "docs/design/kernel_selection.md."
+            )
 
         for field_name, npu_ok in _NPU_ALLOWED.items():
             value = getattr(self, field_name)
