@@ -662,7 +662,11 @@ class BaseTrainer(Stateful, ABC):
             return v
 
         chunk_mbs_config = getattr(self.args.train, "chunk_mbs_config", None)
-        self._chunk_mbs_ranges = build_chunk_mbs_ranges(micro_batch, chunk_mbs_config)
+        if getattr(chunk_mbs_config, "enable", False):
+            with use_parallel_state("base"):
+                self._chunk_mbs_ranges = build_chunk_mbs_ranges(micro_batch, chunk_mbs_config)
+        else:
+            self._chunk_mbs_ranges = None
         micro_batch = {k: _to_device(v) for k, v in micro_batch.items()}
         if getattr(self, "LOG_SAMPLE", True):
             helper.print_example(example=micro_batch, rank=self.args.train.local_rank)

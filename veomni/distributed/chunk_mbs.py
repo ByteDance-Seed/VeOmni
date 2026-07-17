@@ -16,14 +16,17 @@ from bisect import bisect_left, bisect_right
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
-from functools import wraps
+from functools import partial, wraps
+from math import prod
 from typing import Any, Iterator, Optional
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 from transformers.modeling_layers import GradientCheckpointingLayer
 
 from ..utils import logging
+from ..utils.device import get_device_type
 from .parallel_state import get_parallel_state
 
 
@@ -41,8 +44,32 @@ class PackedSequenceRange:
     linear_attn_segment_end: Optional[int] = None
 
 
+@dataclass(frozen=True)
+class _SPChunkPlan:
+    source_start: int
+    source_end: int
+    source_chunk_offset: int
+    target_start: int
+    target_end: int
+    chunk_shard_length: int
+    send_splits: tuple[int, ...]
+    recv_splits: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class _SPChunkContext:
+    plan: _SPChunkPlan
+    group: dist.ProcessGroup
+    restore_router_logits: bool
+
+
 _chunk_mbs_ranges: ContextVar[Optional[list[PackedSequenceRange]]] = ContextVar("chunk_mbs_ranges", default=None)
 _chunk_mbs_checkpoint_func: ContextVar[Optional[Any]] = ContextVar("chunk_mbs_checkpoint_func", default=None)
+_sp_chunk_context: ContextVar[Optional[_SPChunkContext]] = ContextVar("sp_chunk_context", default=None)
+
+_QWEN3_VL_DECODER_CLASSES = {"Qwen3VLTextDecoderLayer", "Qwen3VLMoeTextDecoderLayer"}
+_QWEN3_VL_MOE_DECODER_CLASS = "Qwen3VLMoeTextDecoderLayer"
+_QWEN3_VL_MOE_ROUTER_CLASS = "Qwen3VLMoeTextTopKRouter"
 
 
 @contextmanager
@@ -87,12 +114,13 @@ def build_chunk_mbs_ranges(batch: dict[str, Any], config: Any) -> Optional[list[
     linear_attn_values = _linear_attn_cu_values(batch.get("linear_attn_cu_seq_lens_q"), cu_values[-1])
     linear_attn_boundaries = set(linear_attn_values) if linear_attn_values is not None else None
     num_segments = len(segment_lengths)
-    if num_segments <= chunk_mbs:
+    local_chunk_count = max(1, (num_segments + chunk_mbs - 1) // chunk_mbs)
+    chunk_count = _synchronize_chunk_count(local_chunk_count)
+    if chunk_count == 1:
         return None
 
     ranges: list[PackedSequenceRange] = []
-    for segment_start in range(0, num_segments, chunk_mbs):
-        segment_end = min(segment_start + chunk_mbs, num_segments)
+    for segment_start, segment_end in _segment_chunk_boundaries(num_segments, chunk_mbs, chunk_count):
         token_start = cu_values[segment_start]
         token_end = cu_values[segment_end]
         max_length = max(segment_lengths[segment_start:segment_end])
@@ -115,6 +143,50 @@ def build_chunk_mbs_ranges(batch: dict[str, Any], config: Any) -> Optional[list[
             )
         )
     return ranges
+
+
+def _synchronize_chunk_count(local_chunk_count: int) -> int:
+    parallel_state = get_parallel_state()
+    mesh = None
+    if getattr(parallel_state, "any_extra_parallel_enabled", False):
+        enabled_extra_parallel = _enabled_extra_parallel_names(parallel_state)
+        if enabled_extra_parallel != {"ep"}:
+            return local_chunk_count
+        extra_parallel_meshes = getattr(parallel_state, "extra_parallel_fsdp_device_mesh", None)
+        mesh = extra_parallel_meshes.get("ep") if extra_parallel_meshes is not None else None
+        if mesh is None:
+            raise RuntimeError("ChunkMBS with expert parallelism requires an initialized EP-FSDP device mesh.")
+    elif getattr(parallel_state, "fsdp_enabled", False):
+        mesh = getattr(parallel_state, "fsdp_mesh", None)
+        if mesh is None:
+            raise RuntimeError("ChunkMBS with FSDP requires an initialized FSDP device mesh.")
+    if mesh is None:
+        return local_chunk_count
+
+    chunk_count = torch.tensor(local_chunk_count, dtype=torch.int32, device=get_device_type())
+    for mesh_dim_name in mesh.mesh_dim_names:
+        dist.all_reduce(chunk_count, op=dist.ReduceOp.MIN, group=mesh.get_group(mesh_dim_name))
+    return int(chunk_count.item())
+
+
+def _segment_chunk_boundaries(num_segments: int, chunk_mbs: int, chunk_count: int) -> list[tuple[int, int]]:
+    local_chunk_count = (num_segments + chunk_mbs - 1) // chunk_mbs
+    if chunk_count < 1 or chunk_count > local_chunk_count:
+        raise ValueError(f"ChunkMBS chunk_count must be between 1 and {local_chunk_count}, got {chunk_count}.")
+    if chunk_count == local_chunk_count:
+        return [
+            (segment_start, min(segment_start + chunk_mbs, num_segments))
+            for segment_start in range(0, num_segments, chunk_mbs)
+        ]
+
+    chunk_size, remainder = divmod(num_segments, chunk_count)
+    boundaries = []
+    segment_start = 0
+    for chunk_idx in range(chunk_count):
+        segment_end = segment_start + chunk_size + (chunk_idx < remainder)
+        boundaries.append((segment_start, segment_end))
+        segment_start = segment_end
+    return boundaries
 
 
 def _linear_attn_cu_values(cu_seq_lens: Optional[torch.Tensor], expected_total: int) -> Optional[list[int]]:
@@ -147,23 +219,32 @@ def apply_chunk_mbs(model: nn.Module, config: Any) -> nn.Module:
         return model
 
     parallel_state = get_parallel_state()
-    if parallel_state.sp_enabled:
-        raise RuntimeError("ChunkMBS currently supports packed sequences without sequence parallelism.")
+    if parallel_state.sp_enabled and (
+        not getattr(parallel_state, "ulysses_enabled", False) or getattr(parallel_state, "cp_enabled", False)
+    ):
+        raise RuntimeError("ChunkMBS sequence parallelism currently supports Ulysses without context parallelism.")
+    if parallel_state.sp_enabled and getattr(parallel_state, "async_enabled", False):
+        raise RuntimeError("ChunkMBS currently does not support asynchronous Ulysses.")
     if getattr(parallel_state, "tp_enabled", False) or getattr(parallel_state, "pp_enabled", False):
         raise RuntimeError("ChunkMBS currently does not support tensor or pipeline parallelism.")
-    if parallel_state.any_extra_parallel_enabled:
-        raise RuntimeError("ChunkMBS currently does not support ExtraParallel/MoE.")
-
     target_classes = _decoder_layer_class_names(model)
     if len(target_classes) != 1:
         raise ValueError(
             "ChunkMBS requires exactly one decoder layer class in model._no_split_modules, "
             f"got {sorted(target_classes)!r}."
         )
+    if parallel_state.sp_enabled and not target_classes <= _QWEN3_VL_DECODER_CLASSES:
+        raise RuntimeError("ChunkMBS with Ulysses currently supports Qwen3-VL decoder layers only.")
+    if parallel_state.any_extra_parallel_enabled:
+        enabled_extra_parallel = _enabled_extra_parallel_names(parallel_state)
+        if target_classes != {_QWEN3_VL_MOE_DECODER_CLASS} or enabled_extra_parallel != {"ep"}:
+            raise RuntimeError("ChunkMBS ExtraParallel currently supports Qwen3-VL-MoE with expert parallelism only.")
     target_modules = _find_target_modules(model, target_classes)
     if not target_modules:
         raise ValueError("ChunkMBS did not match any decoder layer listed in model._no_split_modules.")
-    if any(_contains_moe_submodule(module) for _, module in target_modules):
+    if target_classes != {_QWEN3_VL_MOE_DECODER_CLASS} and any(
+        _contains_moe_submodule(module) for _, module in target_modules
+    ):
         raise RuntimeError("ChunkMBS currently does not support MoE decoder layers.")
 
     target_stacks = {fqn.rpartition(".")[0] for fqn, _ in target_modules}
@@ -178,6 +259,9 @@ def apply_chunk_mbs(model: nn.Module, config: Any) -> nn.Module:
             "ChunkMBS requires decoder layers to inherit transformers.modeling_layers.GradientCheckpointingLayer, "
             f"got incompatible modules {incompatible_modules!r}."
         )
+
+    if parallel_state.sp_enabled and target_classes == {_QWEN3_VL_MOE_DECODER_CLASS}:
+        _wrap_qwen3_vl_moe_routers([module for _, module in target_modules])
 
     for fqn, module in target_modules:
         _wrap_module_forward(module)
@@ -196,6 +280,14 @@ def _contains_moe_submodule(module: nn.Module) -> bool:
         "moe" in submodule.__class__.__name__.lower() or "expert" in submodule.__class__.__name__.lower()
         for submodule in module.modules()
     )
+
+
+def _enabled_extra_parallel_names(parallel_state: Any) -> set[str]:
+    enabled = set()
+    for name in getattr(parallel_state, "extra_parallel_names", ()):
+        if parallel_state.extra_parallel_enabled(name):
+            enabled.add(name)
+    return enabled
 
 
 def _find_target_modules(model: nn.Module, target_classes: set[str]) -> list[tuple[str, nn.Module]]:
@@ -226,6 +318,33 @@ def _wrap_module_forward(module: nn.Module) -> None:
 
     module.forward = wrapped_forward
     module._chunk_mbs_wrapped = True
+
+
+def _wrap_qwen3_vl_moe_routers(target_modules: list[nn.Module]) -> None:
+    routers = {
+        id(submodule): submodule
+        for module in target_modules
+        for submodule in module.modules()
+        if submodule.__class__.__name__ == _QWEN3_VL_MOE_ROUTER_CLASS
+    }
+    for router in routers.values():
+        if getattr(router, "_chunk_mbs_wrapped", False):
+            continue
+        orig_forward = router.forward
+
+        @wraps(orig_forward)
+        def wrapped_forward(*args, __orig_forward=orig_forward, **kwargs):
+            outputs = __orig_forward(*args, **kwargs)
+            context = _sp_chunk_context.get()
+            if context is None or not context.restore_router_logits:
+                return outputs
+            if not isinstance(outputs, tuple) or not outputs or not isinstance(outputs[0], torch.Tensor):
+                raise TypeError("ChunkMBS expects the Qwen3-VL-MoE router to return router logits first.")
+            router_logits = _redistribute_from_sp_chunk(outputs[0], 0, context.plan, context.group)
+            return (router_logits, *outputs[1:])
+
+        router.forward = wrapped_forward
+        router._chunk_mbs_wrapped = True
 
 
 def _wrap_gradient_checkpointing_func(module: nn.Module) -> None:
@@ -294,6 +413,9 @@ def _chunked_forward(
 
     sequence_dim = _canonical_dim(hidden_states, 1)
     full_seq_len = hidden_states.shape[sequence_dim]
+    if get_parallel_state().sp_enabled:
+        return _sp_chunked_forward(orig_forward, ranges, args, kwargs, hidden_states, sequence_dim)
+
     if ranges[-1].token_end != full_seq_len:
         raise ValueError(
             f"ChunkMBS range end ({ranges[-1].token_end}) does not match hidden_states sequence length "
@@ -312,6 +434,276 @@ def _chunked_forward(
             outputs.append(checkpoint_func(orig_forward, *chunk_args, **chunk_kwargs))
 
     return _concat_outputs(outputs, sequence_dim)
+
+
+def _sp_chunked_forward(
+    orig_forward: Any,
+    ranges: list[PackedSequenceRange],
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    hidden_states: torch.Tensor,
+    sequence_dim: int,
+) -> torch.Tensor:
+    parallel_state = get_parallel_state()
+    group = parallel_state.ulysses_group
+    if group is None:
+        raise RuntimeError("ChunkMBS with Ulysses requires an initialized Ulysses process group.")
+
+    world_size = dist.get_world_size(group)
+    rank = dist.get_rank(group)
+    local_seq_len = hidden_states.shape[sequence_dim]
+    global_seq_len = ranges[-1].token_end
+    if local_seq_len * world_size != global_seq_len:
+        raise ValueError(
+            "ChunkMBS with Ulysses expects an evenly sharded packed sequence: "
+            f"local length {local_seq_len} x world size {world_size} != global length {global_seq_len}."
+        )
+
+    outputs = []
+    checkpoint_func = _chunk_mbs_checkpoint_func.get()
+    for seq_range in ranges:
+        plan = _build_sp_chunk_plan(seq_range, local_seq_len, world_size, rank)
+        chunk_hidden_states = _redistribute_to_sp_chunk(hidden_states, sequence_dim, plan, group, "hidden_states")
+        chunk_args, chunk_kwargs = _replace_hidden_states(args, kwargs, chunk_hidden_states)
+        chunk_kwargs = _slice_sp_kwargs(chunk_kwargs, seq_range, local_seq_len, plan, group, world_size)
+        context = _SPChunkContext(
+            plan=plan,
+            group=group,
+            restore_router_logits=bool(chunk_kwargs.get("output_router_logits", False)),
+        )
+        chunk_forward = partial(_call_with_sp_chunk_context, orig_forward, context)
+        if checkpoint_func is None:
+            chunk_output = chunk_forward(*chunk_args, **chunk_kwargs)
+        else:
+            chunk_output = checkpoint_func(chunk_forward, *chunk_args, **chunk_kwargs)
+        if not isinstance(chunk_output, torch.Tensor):
+            raise TypeError("ChunkMBS currently supports modules returning a single tensor.")
+        outputs.append(_redistribute_from_sp_chunk(chunk_output, sequence_dim, plan, group))
+
+    output = _concat_outputs(outputs, sequence_dim)
+    if output.shape[sequence_dim] != local_seq_len:
+        raise RuntimeError(
+            f"ChunkMBS with Ulysses restored {output.shape[sequence_dim]} tokens, expected {local_seq_len}."
+        )
+    return output
+
+
+def _call_with_sp_chunk_context(
+    function: Any,
+    context: _SPChunkContext,
+    *args: Any,
+    **kwargs: Any,
+) -> Any:
+    token = _sp_chunk_context.set(context)
+    try:
+        return function(*args, **kwargs)
+    finally:
+        _sp_chunk_context.reset(token)
+
+
+def _build_sp_chunk_plan(
+    seq_range: PackedSequenceRange, local_seq_len: int, world_size: int, rank: int
+) -> _SPChunkPlan:
+    chunk_length = seq_range.token_end - seq_range.token_start
+    chunk_shard_length = (chunk_length + world_size - 1) // world_size
+    source_start = rank * local_seq_len
+    source_end = source_start + local_seq_len
+    source_chunk_offset = max(0, min(local_seq_len, seq_range.token_start - source_start))
+
+    def target_interval(target_rank: int) -> tuple[int, int]:
+        start = min(seq_range.token_start + target_rank * chunk_shard_length, seq_range.token_end)
+        end = min(start + chunk_shard_length, seq_range.token_end)
+        return start, end
+
+    target_start, target_end = target_interval(rank)
+    send_splits = tuple(
+        _overlap_length(source_start, source_end, *target_interval(target_rank)) for target_rank in range(world_size)
+    )
+    recv_splits = tuple(
+        _overlap_length(source_rank * local_seq_len, (source_rank + 1) * local_seq_len, target_start, target_end)
+        for source_rank in range(world_size)
+    )
+    return _SPChunkPlan(
+        source_start=source_start,
+        source_end=source_end,
+        source_chunk_offset=source_chunk_offset,
+        target_start=target_start,
+        target_end=target_end,
+        chunk_shard_length=chunk_shard_length,
+        send_splits=send_splits,
+        recv_splits=recv_splits,
+    )
+
+
+def _overlap_length(left_start: int, left_end: int, right_start: int, right_end: int) -> int:
+    return max(0, min(left_end, right_end) - max(left_start, right_start))
+
+
+class _VariableSplitAllToAll(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, group, input_tensor, output_splits, input_splits):
+        ctx.group = group
+        ctx.output_splits = output_splits
+        ctx.input_splits = input_splits
+        output = input_tensor.new_empty((sum(output_splits), input_tensor.shape[1]))
+        dist.all_to_all_single(
+            output,
+            input_tensor.contiguous(),
+            output_split_sizes=output_splits,
+            input_split_sizes=input_splits,
+            group=group,
+        )
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        grad_input = _VariableSplitAllToAll.apply(ctx.group, grad_output, ctx.input_splits, ctx.output_splits)
+        return None, grad_input, None, None
+
+
+def _all_to_all_sequence(
+    tensor: torch.Tensor,
+    output_splits: tuple[int, ...],
+    input_splits: tuple[int, ...],
+    group: dist.ProcessGroup,
+) -> torch.Tensor:
+    trailing_shape = tensor.shape[1:]
+    flat = tensor.reshape(tensor.shape[0], prod(trailing_shape))
+    output = _VariableSplitAllToAll.apply(group, flat, output_splits, input_splits)
+    return output.reshape(output.shape[0], *trailing_shape)
+
+
+def _redistribute_to_sp_chunk(
+    tensor: torch.Tensor,
+    dim: int,
+    plan: _SPChunkPlan,
+    group: dist.ProcessGroup,
+    name: str,
+) -> torch.Tensor:
+    dim = _canonical_dim(tensor, dim)
+    local = tensor.movedim(dim, 0)
+    expected_local_length = plan.source_end - plan.source_start
+    if local.shape[0] != expected_local_length:
+        raise ValueError(
+            f"{name} sequence dimension must have local length {expected_local_length}, got shape {tuple(tensor.shape)}."
+        )
+
+    pieces = []
+    offset = plan.source_chunk_offset
+    for split in plan.send_splits:
+        pieces.append(local.narrow(0, offset, split))
+        offset += split
+    send = torch.cat(pieces, dim=0)
+    received = _all_to_all_sequence(send, plan.recv_splits, plan.send_splits, group)
+    target_length = plan.target_end - plan.target_start
+    if received.shape[0] != target_length:
+        raise RuntimeError(f"ChunkMBS with Ulysses received {received.shape[0]} tokens, expected {target_length}.")
+    if target_length < plan.chunk_shard_length:
+        padding = received.new_zeros((plan.chunk_shard_length - target_length, *received.shape[1:]))
+        received = torch.cat((received, padding), dim=0)
+    return received.movedim(0, dim)
+
+
+def _redistribute_from_sp_chunk(
+    tensor: torch.Tensor,
+    dim: int,
+    plan: _SPChunkPlan,
+    group: dist.ProcessGroup,
+) -> torch.Tensor:
+    dim = _canonical_dim(tensor, dim)
+    chunk = tensor.movedim(dim, 0)
+    if chunk.shape[0] != plan.chunk_shard_length:
+        raise ValueError(
+            f"ChunkMBS decoder output must have local length {plan.chunk_shard_length}, got shape {tuple(tensor.shape)}."
+        )
+
+    target_length = plan.target_end - plan.target_start
+    chunk = chunk.narrow(0, 0, target_length)
+    pieces = []
+    offset = 0
+    for split in plan.recv_splits:
+        pieces.append(chunk.narrow(0, offset, split))
+        offset += split
+    send = torch.cat(pieces, dim=0)
+    restored = _all_to_all_sequence(send, plan.send_splits, plan.recv_splits, group)
+    return restored.movedim(0, dim)
+
+
+def _slice_sp_kwargs(
+    kwargs: dict[str, Any],
+    seq_range: PackedSequenceRange,
+    local_seq_len: int,
+    plan: _SPChunkPlan,
+    group: dist.ProcessGroup,
+    world_size: int,
+) -> dict[str, Any]:
+    chunk_kwargs = dict(kwargs)
+
+    for key, dim in (("position_ids", -1), ("position_embeddings", -2), ("cache_position", -1)):
+        if key in chunk_kwargs:
+            chunk_kwargs[key] = _redistribute_sp_data(chunk_kwargs[key], dim, local_seq_len, plan, group, key)
+
+    if "attention_mask" in chunk_kwargs and _contains_nonempty_value(chunk_kwargs["attention_mask"]):
+        raise RuntimeError("ChunkMBS with Ulysses requires the mask-free FlashAttention training path.")
+
+    padding_length = plan.chunk_shard_length * world_size - (seq_range.token_end - seq_range.token_start)
+    for key in ("cu_seq_lens_q", "cu_seq_lens_k"):
+        if key in chunk_kwargs and chunk_kwargs[key] is not None:
+            chunk_kwargs[key] = _slice_sp_cu_seq_lens(chunk_kwargs[key], seq_range, padding_length)
+
+    for key in ("max_length_q", "max_length_k"):
+        if key in chunk_kwargs:
+            chunk_kwargs[key] = max(seq_range.max_length, padding_length)
+
+    chunk_kwargs.pop("linear_attn_cu_seq_lens_q", None)
+    return chunk_kwargs
+
+
+def _redistribute_sp_data(
+    data: Any,
+    dim: int,
+    local_seq_len: int,
+    plan: _SPChunkPlan,
+    group: dist.ProcessGroup,
+    name: str,
+) -> Any:
+    if isinstance(data, torch.Tensor):
+        canonical_dim = _canonical_dim(data, dim)
+        if data.shape[canonical_dim] != local_seq_len:
+            raise ValueError(
+                f"{name} sequence dimension must have local length {local_seq_len}, got shape {tuple(data.shape)}."
+            )
+        return _redistribute_to_sp_chunk(data, canonical_dim, plan, group, name)
+    if isinstance(data, tuple):
+        return tuple(_redistribute_sp_data(v, dim, local_seq_len, plan, group, name) for v in data)
+    if isinstance(data, list):
+        return [_redistribute_sp_data(v, dim, local_seq_len, plan, group, name) for v in data]
+    if isinstance(data, dict):
+        return {k: _redistribute_sp_data(v, dim, local_seq_len, plan, group, name) for k, v in data.items()}
+    return data
+
+
+def _contains_nonempty_value(data: Any) -> bool:
+    if isinstance(data, dict):
+        return any(_contains_nonempty_value(value) for value in data.values())
+    if isinstance(data, (tuple, list)):
+        return any(_contains_nonempty_value(value) for value in data)
+    return data is not None
+
+
+def _slice_sp_cu_seq_lens(
+    cu_seq_lens: torch.Tensor, seq_range: PackedSequenceRange, padding_length: int
+) -> torch.Tensor:
+    local = _slice_cu_seq_lens(cu_seq_lens, seq_range)
+    if padding_length == 0:
+        return local
+    chunk_length = seq_range.token_end - seq_range.token_start
+    padding = torch.tensor(
+        [chunk_length + padding_length],
+        dtype=cu_seq_lens.dtype,
+        device=cu_seq_lens.device,
+    )
+    return torch.cat((local, padding), dim=0)
 
 
 def _get_hidden_states(args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:

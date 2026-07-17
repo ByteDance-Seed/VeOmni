@@ -396,11 +396,20 @@ FlashAttention kwargs using `torch.int32` cumulative lengths, identical query/ke
 `*DecoderLayer` class and one matching decoder stack, decoder layers derived from Transformers'
 `GradientCheckpointingLayer`, and decoder states with shape `[1, sequence, hidden]`. Gradient checkpointing may be
 enabled or disabled; when enabled, it must use the non-reentrant implementation. CPU model-level numerical coverage
-currently includes Qwen3-VL and dense Qwen3.5; accelerator-specific kernels require separate hardware validation. Sequence parallelism,
-tensor parallelism, pipeline parallelism, ExtraParallel/MoE, DiT trainers, RL trainers, DPO, the custom Omni training loop,
-`pad_to_length`, and `torch.compile` are not supported. Chunk boundaries must also align with linear-attention
-cumulative sequence boundaries when that metadata is present. Models with ambiguous decoder classes or stacks fail
-validation instead of applying ChunkMBS to multiple stacks.
+currently includes Qwen3-VL and dense Qwen3.5; accelerator-specific kernels require separate hardware validation.
+Qwen3-VL dense and MoE decoder layers support Ulysses sequence parallelism on the mask-free FlashAttention training
+path. Qwen3-VL-MoE also supports expert parallelism, alone or together with Ulysses. FSDP participants synchronize on
+the smallest non-empty chunk count and repartition their local packed samples when dynamic batches differ, so every
+rank executes the same FSDP and MoE collective schedule without sending empty sequences through attention. This may
+make a local chunk contain more than `chunk_mbs` samples; if any participant has only one chunk, its full FSDP mesh uses
+the unchunked decoder path for that micro-batch. Each Ulysses layer chunk is temporarily resharded and padded to an even rank-local
+length before its decoder call; captured router logits are restored to the original rank layout so padding does not
+affect the auxiliary load-balancing loss. Asynchronous Ulysses, context parallelism, tensor parallelism, pipeline parallelism,
+ExtraParallel other than Qwen3-VL-MoE expert parallelism, other MoE models, DiT trainers, RL trainers, DPO, the custom
+Omni training loop, `pad_to_length`, and `torch.compile` are not supported. Linear-attention metadata is not supported
+together with Ulysses; Qwen3-VL's collator compatibility alias is ignored because its decoder has no linear-attention
+layers. Without Ulysses, chunk boundaries must align with linear-attention cumulative sequence boundaries. Models with
+ambiguous decoder classes or stacks fail validation instead of applying ChunkMBS to multiple stacks.
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
