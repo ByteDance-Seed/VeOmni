@@ -536,6 +536,7 @@ class BaseTrainer(Stateful, ABC):
                 set(getattr(self.model, "_no_split_modules", None) or []) | set(args.model.basic_modules)
             ),
             enable_reentrant=args.train.gradient_checkpointing.enable_reentrant,
+            early_stop=args.train.gradient_checkpointing.early_stop,
             enable_forward_prefetch=args.train.accelerator.fsdp_config.forward_prefetch,
             enable_fsdp_offload=args.train.accelerator.fsdp_config.offload,
             broadcast_model_weights_from_rank0=args.train.broadcast_model_weights_from_rank0,
