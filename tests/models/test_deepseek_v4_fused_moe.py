@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 
+import pytest
 import torch
 import torch.nn.functional as F
 
@@ -290,3 +291,59 @@ def test_deepseek_v4_fused_moe_receives_merged_weights_and_swiglu_limit(monkeypa
     torch.testing.assert_close(captured["fc1_1_2_weight"][:, : config.intermediate_size], gate, rtol=0, atol=0)
     torch.testing.assert_close(captured["fc1_1_2_weight"][:, config.intermediate_size :], up, rtol=0, atol=0)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_deepseek_v4_ondemand_fp4_uses_bf16_weights_and_quantizes_both_gemms(monkeypatch):
+    config = SimpleNamespace(
+        num_local_experts=2,
+        hidden_size=32,
+        intermediate_size=32,
+        hidden_act="silu",
+        swiglu_limit=6.0,
+        expert_dtype="fp4",
+    )
+    experts = dsv4.DeepseekV4Experts(config).to(torch.bfloat16).eval()
+    experts.use_ondemand_fp4 = True
+    hidden_states = torch.randn(5, 32, dtype=torch.bfloat16)
+    selected_experts = torch.tensor([[0], [1], [0], [1], [0]])
+    routing_weights = torch.tensor([[0.8], [0.7], [0.6], [0.5], [0.4]])
+    calls = {"act": 0, "weight": 0, "gemm": 0}
+
+    def fake_act_quant(x, **_kwargs):
+        calls["act"] += 1
+        return x, torch.ones(*x.shape[:-1], 1)
+
+    def fake_fp4_act_quant(weight):
+        calls["weight"] += 1
+        return weight, torch.ones(*weight.shape[:-1], 1)
+
+    def fake_fp4_gemm(x, _x_scale, weight, _weight_scale, _scale_dtype=torch.float8_e8m0fnu):
+        calls["gemm"] += 1
+        return F.linear(x, weight)
+
+    monkeypatch.setattr(dsv4, "act_quant", fake_act_quant)
+    monkeypatch.setattr(dsv4, "fp4_act_quant", fake_fp4_act_quant)
+    monkeypatch.setattr(dsv4, "fp4_gemm", fake_fp4_gemm)
+    monkeypatch.setattr(dsv4, "get_parallel_state", lambda: SimpleNamespace(ep_enabled=False, ep_rank=0))
+
+    actual = experts(hidden_states, selected_experts, routing_weights)
+    expected = torch.zeros_like(hidden_states, dtype=torch.float32)
+    for expert_idx in range(2):
+        token_idx, top_k_pos = torch.where(selected_experts == expert_idx)
+        gate_up = F.linear(hidden_states[token_idx], experts.gate_up_proj[expert_idx]).float()
+        gate, up = gate_up.chunk(2, dim=-1)
+        intermediate = F.silu(gate.clamp(max=6.0)) * up.clamp(min=-6.0, max=6.0)
+        intermediate *= routing_weights[token_idx, top_k_pos, None]
+        current = F.linear(intermediate.to(torch.bfloat16), experts.down_proj[expert_idx])
+        expected.index_add_(0, token_idx, current.float())
+
+    assert calls == {"act": 4, "weight": 2, "gemm": 4}
+    torch.testing.assert_close(actual, expected.to(torch.bfloat16), rtol=0, atol=0)
+
+    monkeypatch.setattr(
+        dsv4,
+        "get_parallel_state",
+        lambda: SimpleNamespace(ep_enabled=True, ep_rank=0, ep_group=None),
+    )
+    with pytest.raises(RuntimeError, match="requires replicated inputs"):
+        experts(hidden_states, selected_experts, routing_weights)

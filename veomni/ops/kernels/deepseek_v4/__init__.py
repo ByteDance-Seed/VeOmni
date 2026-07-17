@@ -101,6 +101,33 @@ def _fp4_act_quant(
     return impl(x, block_size, inplace)
 
 
+def fp8_weight_quant_with_scale(
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+    block_size: int = 128,
+) -> torch.Tensor:
+    _require_tilelang_sm90()
+    from .act_quant import fp8_weight_quant_with_scale as impl
+
+    globals()["act_quant"] = _act_quant
+    globals()["fp4_act_quant"] = _fp4_act_quant
+    return impl(weight, scale, block_size)
+
+
+def fp8_gemm(
+    a: torch.Tensor,
+    a_scale: torch.Tensor,
+    b: torch.Tensor,
+    b_scale: torch.Tensor,
+    scale_dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    _require_tilelang_sm90()
+    from .quantized_gemm import fp8_gemm as impl
+
+    globals()["fp4_gemm"] = _fp4_gemm
+    return impl(a, a_scale, b, b_scale, scale_dtype)
+
+
 def _fp4_gemm(
     a: torch.Tensor,
     a_scale: torch.Tensor,
@@ -130,6 +157,8 @@ __all__ = [
     "act_quant",
     "fp4_act_quant",
     "fp4_gemm",
+    "fp8_gemm",
+    "fp8_weight_quant_with_scale",
     "linear_bf16_fp32",
     "sparse_attn_tilelang",
     "v4_lighting_indexer",
