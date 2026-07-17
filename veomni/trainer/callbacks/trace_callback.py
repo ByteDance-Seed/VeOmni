@@ -30,6 +30,18 @@ if TYPE_CHECKING:
     from ..base import BaseTrainer, VeOmniArguments
 
 
+def _reduce_training_metrics(metrics: Dict[str, float], group) -> Dict[str, float]:
+    """Reduce scalar training metrics with one collective when possible."""
+    if not metrics:
+        return {}
+    keys = list(metrics)
+    values = [metrics[key] for key in keys]
+    if not all(isinstance(value, (int, float)) for value in values):
+        return {key: all_reduce(value, group=group) for key, value in metrics.items()}
+    reduced_values = all_reduce(values, group=group)
+    return dict(zip(keys, reduced_values))
+
+
 class MoERouterMonitorCallback(Callback):
     """Monitors MoE expert load distribution and logs heatmaps to wandb.
 
@@ -218,7 +230,8 @@ class EnvironMeterCallback(Callback):
 
         # gather training_step_info from all ranks
         step_train_metrics = {
-            f"training/{k}": all_reduce(v, group=self.parallel_state.fsdp_group) for k, v in step_train_metrics.items()
+            f"training/{k}": v
+            for k, v in _reduce_training_metrics(step_train_metrics, group=self.parallel_state.fsdp_group).items()
         }
 
         if self.trainer.lr_scheduler is not None:
