@@ -28,7 +28,7 @@ from ..utils import helper
 from ..utils.device import synchronize
 from ..utils.loss_utils import count_loss_token
 from ..utils.model_utils import pretty_print_trainable_parameters
-from .base import BaseTrainer, VeOmniIter, _collect_muon_kwargs
+from .base import BaseTrainer, _collect_muon_kwargs
 
 
 logger = helper.create_logger(__name__)
@@ -345,9 +345,7 @@ class VLMTrainer:
             self.on_epoch_begin()
 
             # Create a batch generator
-            self.base.data_iterator = VeOmniIter(
-                self.base.train_dataloader, use_background_prefetcher=args.data.dataloader.use_background_prefetcher
-            )
+            self.base.data_iterator = self.base.build_data_iterator()
 
             for _ in range(self.base.start_step, args.train_steps):
                 try:

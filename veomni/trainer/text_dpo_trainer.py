@@ -35,7 +35,7 @@ from ..ops.batch_invariant_ops import set_batch_invariant_mode
 from ..utils import helper, logging
 from ..utils.constants import IGNORE_INDEX
 from ..utils.device import synchronize
-from .base import BaseTrainer, VeOmniIter
+from .base import BaseTrainer
 
 
 logger = logging.get_logger(__name__)
@@ -458,9 +458,7 @@ class TextDPOTrainer:
             self.on_epoch_begin()
 
             # Create a batch generator
-            self.base.data_iterator = VeOmniIter(
-                self.base.train_dataloader, use_background_prefetcher=args.data.dataloader.use_background_prefetcher
-            )
+            self.base.data_iterator = self.base.build_data_iterator()
 
             for _ in range(self.base.start_step, args.train_steps):
                 try:

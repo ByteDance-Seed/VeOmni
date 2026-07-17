@@ -235,6 +235,7 @@ NPU validation runs at two times:
 | pin_memory | `bool` | `True` | Whether to pin memory for the dataloader. |
 | worker_num_threads | `Optional[int]` | `None` | Number of PyTorch threads used by each DataLoader worker. |
 | use_background_prefetcher | `bool` | `False` | Enable background prefetching around the DataLoader. |
+| use_device_prefetcher | `bool` | `False` | Prefetch the next batch's device transfer on a side stream. |
 
 ### TrainingArguments
 

@@ -67,6 +67,7 @@ from ..ops.batch_invariant_ops import set_batch_invariant_mode
 from ..optim import build_lr_scheduler, build_optimizer
 from ..utils import helper, logging
 from ..utils.device import (
+    IS_CUDA_AVAILABLE,
     get_device_type,
     get_dist_comm_backend,
     get_torch_device,
@@ -91,6 +92,52 @@ from .callbacks import (
 
 
 logger = logging.get_logger(__name__)
+
+
+_DEVICE_PREFETCH_CPU_ONLY_KEYS = {
+    "labels",
+    "image_output_mask",
+    # FlashAttention / ChunkMBS metadata is consumed host-side for range
+    # construction, logging, or NPU compatibility before model code handles it.
+    "cu_seq_lens_q",
+    "cu_seq_lens_k",
+    "linear_attn_cu_seq_lens_q",
+}
+
+
+def _is_device_prefetch_cpu_only_key(key: Any) -> bool:
+    return isinstance(key, str) and (key in _DEVICE_PREFETCH_CPU_ONLY_KEYS or key.endswith("_labels"))
+
+
+def _move_batch_to_device(value: Any, device: torch.device, *, non_blocking: bool = True) -> Any:
+    if isinstance(value, torch.Tensor):
+        if value.device == device:
+            return value
+        return value.to(device, non_blocking=non_blocking)
+    if isinstance(value, dict):
+        return {
+            key: item
+            if _is_device_prefetch_cpu_only_key(key)
+            else _move_batch_to_device(item, device, non_blocking=non_blocking)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_move_batch_to_device(item, device, non_blocking=non_blocking) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_move_batch_to_device(item, device, non_blocking=non_blocking) for item in value)
+    return value
+
+
+def _record_batch_stream(value: Any, stream, device: torch.device) -> None:
+    if isinstance(value, torch.Tensor):
+        if value.device.type == device.type:
+            value.record_stream(stream)
+    elif isinstance(value, dict):
+        for item in value.values():
+            _record_batch_stream(item, stream, device)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            _record_batch_stream(item, stream, device)
 
 
 class BackgroundPrefetcher:
@@ -172,13 +219,27 @@ class VeOmniIter:
     A unified iterator wrapper that handles both standard iteration and background prefetching.
     """
 
-    def __init__(self, dataloader, use_background_prefetcher: bool = False, maxsize: int = 1):
+    def __init__(
+        self,
+        dataloader,
+        use_background_prefetcher: bool = False,
+        maxsize: int = 1,
+        use_device_prefetcher: bool = False,
+        device: torch.device | None = None,
+    ):
         self.dataloader = dataloader
         self.use_background_prefetcher = use_background_prefetcher
+        self.use_device_prefetcher = False
         if use_background_prefetcher:
             self.iterator = BackgroundPrefetcher(dataloader, maxsize=maxsize)
         else:
             self.iterator = iter(dataloader)
+
+        if use_device_prefetcher and device is None:
+            raise ValueError("device must be set when use_device_prefetcher=True.")
+        if use_device_prefetcher and IS_CUDA_AVAILABLE and device.type == get_device_type():
+            self.iterator = DevicePrefetcher(self.iterator, device=device)
+            self.use_device_prefetcher = True
 
     def __iter__(self):
         return self
@@ -187,15 +248,79 @@ class VeOmniIter:
         return next(self.iterator)
 
     def stop(self, timeout: float = 5.0):
-        if self.use_background_prefetcher and hasattr(self.iterator, "stop"):
+        if hasattr(self.iterator, "stop"):
             self.iterator.stop(timeout=timeout)
 
     def state_dict(self):
-        if self.use_background_prefetcher and hasattr(self.iterator, "state_dict"):
+        if hasattr(self.iterator, "state_dict"):
             return self.iterator.state_dict()
         if hasattr(self.dataloader, "state_dict"):
             return self.dataloader.state_dict()
         return {}
+
+
+class DevicePrefetcher:
+    """
+    Prefetches the next batch's device transfer on a side stream.
+
+    This overlaps host-to-device copies with the previous step's compute when the
+    DataLoader uses pinned CPU tensors. The current dataloader state is captured
+    before prefetching the next batch so checkpoint resume still points to the
+    batch that was actually returned to the trainer.
+    """
+
+    def __init__(self, iterator, device: torch.device):
+        self.iterator = iterator
+        self.device = device
+        self.stream = torch.Stream(device=device) if IS_CUDA_AVAILABLE and device.type == get_device_type() else None
+        self.next_batch = None
+        self.next_state = None
+        self.current_state = None
+        self._prefetch()
+
+    def _iterator_state_dict(self):
+        return self.iterator.state_dict() if hasattr(self.iterator, "state_dict") else None
+
+    def _prefetch(self) -> None:
+        self.next_batch = None
+        self.next_state = None
+        try:
+            batch = next(self.iterator)
+        except StopIteration:
+            return
+
+        self.next_state = self._iterator_state_dict()
+        if self.stream is None:
+            self.next_batch = _move_batch_to_device(batch, self.device)
+            return
+
+        with get_torch_device().stream(self.stream):
+            self.next_batch = _move_batch_to_device(batch, self.device)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self.next_batch is None:
+            raise StopIteration
+
+        if self.stream is not None:
+            current_stream = get_torch_device().current_stream()
+            current_stream.wait_stream(self.stream)
+            _record_batch_stream(self.next_batch, current_stream, self.device)
+        batch = self.next_batch
+        self.current_state = self.next_state
+        self._prefetch()
+        return batch
+
+    def state_dict(self):
+        if self.current_state is not None:
+            return self.current_state
+        return self._iterator_state_dict() or {}
+
+    def stop(self, timeout: float = 5.0):
+        if hasattr(self.iterator, "stop"):
+            self.iterator.stop(timeout=timeout)
 
 
 def _collect_muon_kwargs(optimizer_cfg) -> Dict[str, Any]:
@@ -793,6 +918,14 @@ class BaseTrainer(Stateful, ABC):
 
         self.on_step_end(loss=total_loss, loss_dict=total_loss_dict, grad_norm=grad_norm)
 
+    def build_data_iterator(self):
+        return VeOmniIter(
+            self.train_dataloader,
+            use_background_prefetcher=self.args.data.dataloader.use_background_prefetcher,
+            use_device_prefetcher=self.args.data.dataloader.use_device_prefetcher,
+            device=self.device,
+        )
+
     def destroy_distributed(self):
         if not dist.is_available() or not dist.is_initialized():
             return
@@ -831,9 +964,7 @@ class BaseTrainer(Stateful, ABC):
             self.on_epoch_begin()
 
             # Create a batch generator
-            self.data_iterator = VeOmniIter(
-                self.train_dataloader, use_background_prefetcher=args.data.dataloader.use_background_prefetcher
-            )
+            self.data_iterator = self.build_data_iterator()
 
             for _ in range(self.start_step, args.train_steps):
                 try:

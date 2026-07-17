@@ -1321,6 +1321,10 @@ class DataloaderConfig:
         default=False,
         metadata={"help": "Whether to use BackgroundPrefetcher for dataloader."},
     )
+    use_device_prefetcher: bool = field(
+        default=False,
+        metadata={"help": "Whether to prefetch the next batch's device transfer on a side stream."},
+    )
 
 
 @dataclass
