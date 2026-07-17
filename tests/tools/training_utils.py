@@ -141,8 +141,13 @@ def is_npu_arch35() -> bool:
     if not is_torch_npu_available():
         return False
 
-    device_name = get_device_name()
-    return "Ascend910_95" in device_name or "Ascend950" in device_name
+    try:
+        device_name = get_device_name()
+    except RuntimeError:
+        return False
+
+    normalized_name = "".join((device_name or "").split()).upper()
+    return "ASCEND910_95" in normalized_name or "ASCEND950" in normalized_name
 
 
 def _npu_overrides(model_name: Optional[str]) -> Dict[str, str]:

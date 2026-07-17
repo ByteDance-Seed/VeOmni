@@ -281,9 +281,13 @@ class TestNPURmsNormGated:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.skipif(is_npu_arch35(), reason="Qwen3.5 causal_conv1d is not supported on arch35 NPUs")
 class TestNPUGatedDeltaNetVarlen:
     """Validate packed-sequence NPU kernels against segmented eager references."""
+
+    @pytest.fixture(autouse=True)
+    def skip_on_arch35(self):
+        if is_npu_arch35():
+            pytest.skip("Qwen3.5 causal_conv1d is not supported on arch35 NPUs")
 
     def test_causal_conv1d_matches_segmented_eager_forward_backward(self):
         torch.manual_seed(0)
