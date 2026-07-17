@@ -143,35 +143,40 @@ Core files:
     - DCP operations are collective — all ranks must call save/load simultaneously.
     - Calling checkpoint operations from only rank 0 causes deadlocks.
 
+18. **Distributed HF safetensors consolidation must support non-floating tensors**
+    - PyTorch 2.9–2.11 computes consolidated tensor byte sizes with `torch.finfo`, which crashes for valid integer and boolean buffers such as DeepSeek V4 `tid2eid`.
+    - `apply_dcp_consolidation_patch()` in `veomni/checkpoint/dcp_consolidation.py` replaces the metadata parser with `Tensor.element_size()` and verifies the upstream private-function source hash before patching.
+    - Do not remove this patch during torch upgrades until the new upstream consolidator is verified with sharded integer-tensor save/load coverage.
+
 ## Code Quality
 
-18. **Ruff must pass before commit**
+19. **Ruff must pass before commit**
     - `make quality` runs `ruff check` and `ruff format --check`.
     - Pre-commit hooks enforce this automatically (`pre-commit run --all-files`).
 
-19. **All comments and docstrings must be in English**
+20. **All comments and docstrings must be in English**
     - No Chinese or other non-English text in code comments. This is enforced by project convention.
 
-20. **PR title must follow format: `[{modules}] {type}: {description}`**
+21. **PR title must follow format: `[{modules}] {type}: {description}`**
     - Allowed modules and types are defined in `.github/workflows/check_pr_title.yml` (single source of truth).
     - CI checks PR titles automatically on every PR.
 
 ## Hardware
 
-21. **NPU (Ascend) code paths require guards**
+22. **NPU (Ascend) code paths require guards**
     - NPU-specific code must be guarded with `is_torch_npu_available()` or `IS_NPU_AVAILABLE`.
     - NPU kernels live in `veomni/ops/kernels/{rms_norm,rotary}/npu.py` and `veomni/ops/platform/npu/` — they must not be imported on GPU-only environments.
 
-22. **Device-agnostic code must use `veomni.utils.device` helpers**
+23. **Device-agnostic code must use `veomni.utils.device` helpers**
    - Use `get_device_type()`, `get_torch_device()`, `synchronize()`, `empty_cache()` instead of direct `torch.cuda.*` calls.
    - Direct CUDA calls break NPU compatibility.
 
 ## Trainer Extensions
 
-23. **Trainer callback lifecycle changes must cover composed trainers**
+24. **Trainer callback lifecycle changes must cover composed trainers**
    - `TextDPOTrainer` and `DiTTrainer` compose a `BaseTrainer` and override `forward_backward_step()`; they do not inherit the base implementation.
    - Lifecycle work added only inside `BaseTrainer.forward_backward_step()` is skipped by these trainers. Update every supported override or reject the unsupported trainer explicitly.
 
-24. **Module-level OpSlots are shared by every model instance**
+25. **Module-level OpSlots are shared by every model instance**
    - Modeling modules expose `OpSlot` objects such as `veomni_causal_lm_loss` as globals. Policy/reference models in DPO can therefore use the same slot.
    - Temporary interception must use forward-scoped ownership and reference-counted dispatch. A closure bound to one model or callback can observe another model's forward and corrupt side-channel state.
