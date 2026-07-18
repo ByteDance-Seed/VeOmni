@@ -4,9 +4,9 @@ model:
     attn_implementation: eager
     moe_implementation: fused_triton
     cross_entropy_loss_implementation: liger_kernel
-    dsa_attention_backend: tilelang_sparse
-    dsa_indexer_backend: tilelang
-    mhc_backend: tile_kernels
+    dsa_attention_implementation: tilelang
+    dsa_indexer_implementation: tilelang
+    mhc_implementation: tilelang
     rms_norm_implementation: liger_kernel
     swiglu_mlp_implementation: liger_kernel
 

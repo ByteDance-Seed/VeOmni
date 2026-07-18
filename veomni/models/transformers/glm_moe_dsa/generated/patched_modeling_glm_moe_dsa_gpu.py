@@ -51,8 +51,8 @@ from veomni.utils.model_outputs import CausalLMOutputWithLogProbs
 
 
 veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
-veomni_dsa_indexer_backend = OpsConfigSlot("dsa_indexer_backend")
-veomni_dsa_attention_backend = OpsConfigSlot("dsa_attention_backend")
+veomni_dsa_indexer_implementation = OpsConfigSlot("dsa_indexer_implementation")
+veomni_dsa_attention_implementation = OpsConfigSlot("dsa_attention_implementation")
 
 
 @use_kernel_forward_from_hub("RMSNorm")
@@ -218,10 +218,12 @@ class GlmMoeDsaIndexer(nn.Module):
         else:
             has_standard_causal_mask = False
 
-        indexer_backend = veomni_dsa_indexer_backend.value
-        if indexer_backend not in ("eager", "cudnn"):
-            raise ValueError(f"Unknown dsa_indexer_backend={indexer_backend!r}; expected 'eager' or 'cudnn'")
-        if indexer_backend == "cudnn":
+        indexer_implementation = veomni_dsa_indexer_implementation.value
+        if indexer_implementation not in ("eager", "cudnn"):
+            raise ValueError(
+                f"Unknown dsa_indexer_implementation={indexer_implementation!r}; expected 'eager' or 'cudnn'"
+            )
+        if indexer_implementation == "cudnn":
             from veomni.ops.kernels.deepseek_sparse_attention.flashmla_cudnn import indexer_select_topk
 
             qhead_per_kv_head = self.n_heads
@@ -239,7 +241,9 @@ class GlmMoeDsaIndexer(nn.Module):
             if qhead_per_kv_head not in (32, 64):
                 unsupported_reasons.append(f"qhead_per_kv_head must be 32 or 64, got {qhead_per_kv_head}")
             if unsupported_reasons:
-                raise ValueError("dsa_indexer_backend='cudnn' is not supported: " + "; ".join(unsupported_reasons))
+                raise ValueError(
+                    "dsa_indexer_implementation='cudnn' is not supported: " + "; ".join(unsupported_reasons)
+                )
             return indexer_select_topk(
                 q,
                 k_cached,
@@ -452,26 +456,26 @@ class GlmMoeDsaAttention(nn.Module):
         else:
             topk_indices = prev_topk_indices  # [B, S, topk]
 
-        attention_backend = veomni_dsa_attention_backend.value
-        if attention_backend not in ("eager", "flashmla_cudnn"):
+        attention_implementation = veomni_dsa_attention_implementation.value
+        if attention_implementation not in ("eager", "flashmla_cudnn"):
             raise ValueError(
-                f"Unknown dsa_attention_backend={attention_backend!r}; expected 'eager' or 'flashmla_cudnn'"
+                f"Unknown dsa_attention_implementation={attention_implementation!r}; expected 'eager' or 'flashmla_cudnn'"
             )
-        if attention_backend == "flashmla_cudnn":
+        if attention_implementation == "flashmla_cudnn":
             from veomni.ops.kernels.deepseek_sparse_attention.flashmla_cudnn import (
                 check_flash_mla_sparse_forward_compatible,
                 flash_mla_sparse_attention_with_cudnn_backward,
             )
 
             if not hidden_states.is_cuda:
-                raise ValueError("dsa_attention_backend='flashmla_cudnn' requires CUDA hidden_states")
+                raise ValueError("dsa_attention_implementation='flashmla_cudnn' requires CUDA hidden_states")
             if past_key_values is not None:
-                raise ValueError("dsa_attention_backend='flashmla_cudnn' does not support KV cache")
+                raise ValueError("dsa_attention_implementation='flashmla_cudnn' does not support KV cache")
             if self.training and self.attention_dropout != 0:
-                raise ValueError("dsa_attention_backend='flashmla_cudnn' requires attention_dropout=0")
+                raise ValueError("dsa_attention_implementation='flashmla_cudnn' requires attention_dropout=0")
 
             if not self.kv_b_proj.weight.is_contiguous():
-                raise ValueError("dsa_attention_backend='flashmla_cudnn' requires contiguous kv_b_proj.weight")
+                raise ValueError("dsa_attention_implementation='flashmla_cudnn' requires contiguous kv_b_proj.weight")
             kv_b_weight = self.kv_b_proj.weight.view(
                 self.num_heads,
                 self.qk_nope_head_dim + self.v_head_dim,
@@ -488,7 +492,7 @@ class GlmMoeDsaAttention(nn.Module):
                 topk_indices,
             )
             if not compatible:
-                raise ValueError("dsa_attention_backend='flashmla_cudnn' is not supported: " + reason)
+                raise ValueError("dsa_attention_implementation='flashmla_cudnn' is not supported: " + reason)
             compressed_attn_output = flash_mla_sparse_attention_with_cudnn_backward(
                 q_pe.transpose(1, 2).contiguous(),
                 k_pe_mqa.transpose(1, 2).contiguous(),

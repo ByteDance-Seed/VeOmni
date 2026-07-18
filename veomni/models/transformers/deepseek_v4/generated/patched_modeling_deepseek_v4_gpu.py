@@ -80,8 +80,8 @@ veomni_load_balancing_loss = OpSlot("load_balancing_loss", "standard")
 veomni_mhc_pre = OpSlot("mhc", "pre")
 veomni_mhc_post = OpSlot("mhc", "post")
 veomni_mhc_head = OpSlot("mhc", "head")
-veomni_dsa_indexer_backend = OpsConfigSlot("dsa_indexer_backend")
-veomni_dsa_attention_backend = OpsConfigSlot("dsa_attention_backend")
+veomni_dsa_indexer_implementation = OpsConfigSlot("dsa_indexer_implementation")
+veomni_dsa_attention_implementation = OpsConfigSlot("dsa_attention_implementation")
 
 
 @use_kernel_forward_from_hub("RMSNorm")
@@ -576,7 +576,7 @@ class DeepseekV4Indexer(nn.Module):
     # ================================================================
     # Patch: DeepseekV4Indexer.forward
     # 1. Dispatch CUDA prefill/training index scoring to the TileLang Lightning
-    #    Indexer when ``dsa_indexer_backend=tilelang``. Cache/decode and unusual
+    #    Indexer when ``dsa_indexer_implementation=tilelang``. Cache/decode and unusual
     #    position layouts retain the upstream eager implementation.
     # ================================================================
     def forward(
@@ -663,17 +663,18 @@ class DeepseekV4Indexer(nn.Module):
         top_k = min(self.index_topk, compressed_len)
 
         # --- Patch.1 ---
-        indexer_backend = veomni_dsa_indexer_backend.value
-        if indexer_backend not in {"eager", "tilelang"}:
+        indexer_implementation = veomni_dsa_indexer_implementation.value
+        if indexer_implementation not in {"eager", "tilelang"}:
             raise ValueError(
-                f"DeepSeek-V4 does not support dsa_indexer_backend={indexer_backend!r}; expected 'eager' or 'tilelang'"
+                "DeepSeek-V4 does not support "
+                f"dsa_indexer_implementation={indexer_implementation!r}; expected 'eager' or 'tilelang'"
             )
         canonical_positions = torch.arange(seq_len, device=position_ids.device).unsqueeze(0).expand_as(position_ids)
         packed_ranges = None
         if packed_compression_metadata is not None and cache_layer is None:
             packed_ranges = packed_compressed_causal_ranges(packed_compression_metadata[self.compress_rate])
         use_tilelang = (
-            indexer_backend == "tilelang"
+            indexer_implementation == "tilelang"
             and hidden_states.is_cuda
             and q.dtype == torch.bfloat16
             and compressed_kv.dtype == torch.bfloat16
@@ -876,7 +877,7 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
 # ================================================================
 # Patch: eager_attention_forward
 # 1. Dispatch DeepSeek-V4 attention to the TileLang sparse MQA kernel when
-#    ``dsa_attention_backend=tilelang_sparse``. The existing additive mask is
+#    ``dsa_attention_implementation=tilelang``. The existing additive mask is
 #    converted to a compact fixed-width index list, preserving sliding-window,
 #    compressor, causal, and invalid-index semantics.
 # 2. Preserve the upstream eager implementation as the default fallback.
@@ -892,14 +893,14 @@ def eager_attention_forward(
     **kwargs,
 ):
     # --- Patch.1 ---
-    attention_backend = veomni_dsa_attention_backend.value
-    if attention_backend not in {"eager", "tilelang_sparse"}:
+    attention_implementation = veomni_dsa_attention_implementation.value
+    if attention_implementation not in {"eager", "tilelang"}:
         raise ValueError(
-            f"DeepSeek-V4 does not support dsa_attention_backend={attention_backend!r}; "
-            "expected 'eager' or 'tilelang_sparse'"
+            "DeepSeek-V4 does not support "
+            f"dsa_attention_implementation={attention_implementation!r}; expected 'eager' or 'tilelang'"
         )
     use_tilelang = (
-        attention_backend == "tilelang_sparse"
+        attention_implementation == "tilelang"
         and query.is_cuda
         and query.dtype == torch.bfloat16
         and key.dtype == torch.bfloat16
