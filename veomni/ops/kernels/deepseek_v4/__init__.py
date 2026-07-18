@@ -91,4 +91,25 @@ def linear_bf16_fp32(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     return impl(x, weight)
 
 
-__all__ = ["act_quant", "linear_bf16_fp32", "sparse_attn_tilelang", "v4_lighting_indexer"]
+def fp8_simulate_qat(x: torch.Tensor, block_size: int = 128) -> torch.Tensor:
+    _require_tilelang_sm90()
+    from .qat import fp8_simulate_qat as impl
+
+    return impl(x, block_size)
+
+
+def rotate_activation(x: torch.Tensor) -> torch.Tensor:
+    _require_tilelang_sm90()
+    from .qat import rotate_activation as impl
+
+    return impl(x)
+
+
+__all__ = [
+    "act_quant",
+    "fp8_simulate_qat",
+    "linear_bf16_fp32",
+    "rotate_activation",
+    "sparse_attn_tilelang",
+    "v4_lighting_indexer",
+]

@@ -25,7 +25,8 @@ pyproject.toml
 │   │                  + FA2 on x86_64 (cp311/cp312 wheels)
 │   │                  + FA3 / FlashMLA wheels on both architectures
 │   │                  + FA4 (PyPI) / FlashQLA (source-built from git)
-│   │                  + liger-kernel + FLA + quack + TileLang/TileKernels + DLPack ext
+│   │                  + liger-kernel + FLA + quack + TileLang/TileKernels
+│   │                  + DLPack ext
 │   │                  + diffusers / av / librosa / soundfile / ftfy / peft
 │   │                  + megatron-energon (optional dataset format)
 │   ├── npu          Ascend NPU x86_64 — full superset, minus CUDA-only kernels:
@@ -94,8 +95,9 @@ forced into a specific 5.x patch.
 | `flash-attn-4` (cute) | PyPI `4.0.0b16` | pure-Python wheel |
 | `flash-qla` | git: QwenLM/FlashQLA | source-built; uv overrides its TileLang 0.1.8 metadata pin |
 | `tile-kernels` | PyPI `1.0.0` | DeepSeek V4 mHC forward/backward; requires TileLang 0.1.9 and SM90+ |
+| `fast-hadamard-transform` | manual pinned git install after GPU sync | Required by DeepSeek V4 indexer activation QAT; intentionally absent from the GPU extra because its CUDA source build requires nvcc |
 
-Two pyproject knobs make the remaining FlashQLA source build succeed:
+These pyproject knobs keep the remaining source builds reproducible:
 
 1. **`[[tool.uv.dependency-metadata]]`** with `version` for `flash-qla`.
    It has no `pyproject.toml`; without static metadata uv runs its setup.py
@@ -112,7 +114,18 @@ Two pyproject knobs make the remaining FlashQLA source build succeed:
    TileKernels tests cover that resolved combination.
 
 2. **`[tool.uv.extra-build-dependencies]`** seeds `setuptools / wheel /
-   packaging / ninja` (+ `torch` where needed) — uv venvs are not seeded.
+   packaging / ninja` (+ `torch` where needed) for the remaining locked source
+   builds — uv venvs are not seeded.
+
+`fast-hadamard-transform` is deliberately not part of `gpu` or `uv.lock`:
+CPU-only CI installs the GPU extra for patch generation but has no nvcc. Users
+who enable DeepSeek V4 activation QAT install the pinned source after their last
+`uv sync` so it builds against the active torch ABI:
+
+```bash
+uv pip install --no-build-isolation \
+  "fast-hadamard-transform @ git+https://github.com/Dao-AILab/fast-hadamard-transform.git@1cc807efbd6cc001df359822d60bf6052dd66859"
+```
 
 `FLASH_ATTENTION_FORCE_BUILD=TRUE` and `[tool.uv.no-build-isolation-package]`
 are gone — no FA setup.py runs anywhere now (FA2/3 wheel, FA4 cute is a
