@@ -9,6 +9,12 @@
 #  It contains a patched version of the original HuggingFace modeling code.
 #
 #  Patches applied:
+#    - method_override: DeepseekV4RMSNorm.forward
+#      OpSlot guard for Liger fused weighted RMSNorm
+#    - method_override: DeepseekV4UnweightedRMSNorm.forward
+#      OpSlot guard for Liger fused unweighted RMSNorm
+#    - method_override: DeepseekV4MLP.forward
+#      OpSlot guard for Liger fused shared-expert SwiGLU
 #    - method_override: DeepseekV4HyperConnection.forward
 #      Dispatch DeepSeek V4 mHC pre/Sinkhorn/collapse through an OpSlot
 #    - method_override: DeepseekV4HyperHead.forward
@@ -75,6 +81,9 @@ from veomni.utils.model_outputs import MoeCausalLMOutputWithLogProbs
 
 
 veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
+veomni_rms_norm = OpSlot("rms_norm", "standard")
+veomni_unweighted_rms_norm = OpSlot("rms_norm", "unweighted")
+veomni_swiglu_mlp = OpSlot("swiglu_mlp", "standard")
 veomni_moe_experts_forward = OpSlot("moe_experts", "standard")
 veomni_load_balancing_loss = OpSlot("load_balancing_loss", "standard")
 veomni_mhc_pre = OpSlot("mhc", "pre")
@@ -82,6 +91,12 @@ veomni_mhc_post = OpSlot("mhc", "post")
 veomni_mhc_head = OpSlot("mhc", "head")
 veomni_dsa_indexer_backend = OpsConfigSlot("dsa_indexer_backend")
 veomni_dsa_attention_backend = OpsConfigSlot("dsa_attention_backend")
+
+
+# ======================================================================
+# [MODIFIED CLASS] DeepseekV4RMSNorm
+# Methods patched: forward
+# ======================================================================
 
 
 @use_kernel_forward_from_hub("RMSNorm")
@@ -94,7 +109,13 @@ class DeepseekV4RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
 
+    # ================================================================
+    # Patch: DeepSeek V4 RMSNorm dispatch
+    # ================================================================
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if veomni_rms_norm.use_non_eager_impl:
+            return veomni_rms_norm(hidden_states, self.weight, self.variance_epsilon)
+
         input_dtype = hidden_states.dtype
         hidden_states = hidden_states.to(torch.float32)
         variance = hidden_states.pow(2).mean(-1, keepdim=True)
@@ -105,12 +126,21 @@ class DeepseekV4RMSNorm(nn.Module):
         return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
 
 
+# ======================================================================
+# [MODIFIED CLASS] DeepseekV4UnweightedRMSNorm
+# Methods patched: forward
+# ======================================================================
+
+
 class DeepseekV4UnweightedRMSNorm(nn.Module):
     def __init__(self, eps: float = 1.0e-6):
         super().__init__()
         self.eps = eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if veomni_unweighted_rms_norm.use_non_eager_impl:
+            return veomni_unweighted_rms_norm(x, None, self.eps)
+
         return x * torch.rsqrt(x.float().square().mean(-1, keepdim=True) + self.eps).to(x.dtype)
 
 
@@ -1210,6 +1240,12 @@ class DeepseekV4HyperHead(nn.Module):
         return (pre.unsqueeze(-1) * x).sum(dim=2).to(x.dtype)
 
 
+# ======================================================================
+# [MODIFIED CLASS] DeepseekV4MLP
+# Methods patched: forward
+# ======================================================================
+
+
 class DeepseekV4MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -1221,7 +1257,13 @@ class DeepseekV4MLP(nn.Module):
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=config.mlp_bias)
         self.act_fn = ACT2FN[config.hidden_act]
 
+    # ================================================================
+    # Patch: DeepSeek V4 shared-expert SwiGLU dispatch
+    # ================================================================
     def forward(self, x):
+        if veomni_swiglu_mlp.use_non_eager_impl:
+            return veomni_swiglu_mlp(self, x)
+
         down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
         return down_proj
 

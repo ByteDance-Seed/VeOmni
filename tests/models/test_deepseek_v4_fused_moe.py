@@ -40,9 +40,17 @@ def test_deepseek_v4_test_overrides_keep_eager_attention_and_expected_moe():
 
     overrides = resolve_ops_overrides("deepseek_v4")
 
-    expected_moe = "eager" if is_torch_npu_available() else "fused_triton"
+    is_npu = is_torch_npu_available()
+    expected_moe = "eager" if is_npu else "fused_triton"
     assert "--model.ops_implementation.attn_implementation=eager" in overrides
     assert f"--model.ops_implementation.moe_implementation={expected_moe}" in overrides
+    assert "--model.ops_implementation.rotary_pos_emb_implementation=eager" in overrides
+    if is_npu:
+        assert "--model.ops_implementation.rms_norm_implementation=eager" in overrides
+        assert "--model.ops_implementation.swiglu_mlp_implementation=eager" in overrides
+    else:
+        assert not any("rms_norm_implementation" in override for override in overrides)
+        assert not any("swiglu_mlp_implementation" in override for override in overrides)
 
 
 def test_deepseek_v4_fused_moe_receives_merged_weights_and_swiglu_limit(monkeypatch):

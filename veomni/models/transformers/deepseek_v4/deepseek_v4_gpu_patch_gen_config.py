@@ -30,24 +30,20 @@ Patches:
    ``down_proj [E, H, I]`` layout and the gpt-oss-style ``swiglu_limit``
    clamp. Dispatch is OpSlot-guarded (``veomni_moe_experts_forward``):
    non-eager -> ``fused_moe_forward``; eager -> per-expert loop.
-4. ``DeepseekV4ForCausalLM.forward`` — OpSlot guard for fused
+4. ``DeepseekV4RMSNorm`` / ``DeepseekV4UnweightedRMSNorm`` — functional
+   OpSlot dispatch to Liger RMSNorm while preserving the two distinct class
+   layouts. The unweighted form passes ``weight=None`` to Liger's supported
+   non-affine path.
+5. ``DeepseekV4MLP.forward`` — functional OpSlot dispatch to Liger SwiGLU for
+   shared experts without replacing the class constructor. Routed experts
+   remain on the fused-MoE path above so their ``swiglu_limit`` clamp is kept.
+6. ``DeepseekV4ForCausalLM.forward`` — OpSlot guard for fused
    cross-entropy (``veomni_causal_lm_loss``) + ``MoeCausalLMOutputWithLogProbs``
    so callers can read per-token log-probs / entropy alongside the loss.
-5. Register ``get_parallel_plan`` on ``DeepseekV4ForCausalLM``.
+7. Register ``get_parallel_plan`` on ``DeepseekV4ForCausalLM``.
 
 Intentionally NOT patched:
 
-- ``DeepseekV4RMSNorm`` / ``DeepseekV4UnweightedRMSNorm`` — DeepSeek-V4 ships
-  two RMSNorm flavours (the second is unweighted and used inside the
-  HCA/CSA compressors). LigerRMSNorm replaces only the standard form, and a
-  blind swap would shadow the unweighted variant. RoPE-determinism /
-  batch-invariant RMSNorm are wired separately at runtime by future
-  ``device_patch.py`` infra (mirroring DeepseekV3) when needed.
-- ``DeepseekV4MLP`` — also used as ``shared_experts`` with a custom
-  ``moe_intermediate_size`` (via ``attribute_map["intermediate_size"] =
-  "moe_intermediate_size"``). ``LigerSwiGLUMLP.__init__`` rejects the
-  ``intermediate_size`` kwarg pattern that DeepSeek-V4 uses, so swapping
-  would break shared-expert construction. Same reasoning as DeepseekV3.
 - ``apply_rotary_pos_emb`` — DeepSeek-V4 uses a *partial* RoPE (the
   trailing ``qk_rope_head_dim`` slice only, with the leading nope channels
   untouched) plus an interleaved ``repeat_interleave(2)`` cos/sin layout
@@ -111,6 +107,9 @@ from veomni.utils.model_outputs import MoeCausalLMOutputWithLogProbs
 # runtime slots used by the generated modeling are bound at model-build
 # time by ``_bind_veomni_ops()`` in ``veomni/models/auto.py``.
 veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
+veomni_rms_norm = OpSlot("rms_norm", "standard")
+veomni_unweighted_rms_norm = OpSlot("rms_norm", "unweighted")
+veomni_swiglu_mlp = OpSlot("swiglu_mlp", "standard")
 veomni_moe_experts_forward = OpSlot("moe_experts", "standard")
 veomni_load_balancing_loss = OpSlot("load_balancing_loss", "standard")
 veomni_mhc_pre = OpSlot("mhc", "pre")
@@ -158,6 +157,9 @@ config.add_post_import_block(
     """
     from veomni.ops.dispatch import OpSlot, OpsConfigSlot
     veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
+    veomni_rms_norm = OpSlot("rms_norm", "standard")
+    veomni_unweighted_rms_norm = OpSlot("rms_norm", "unweighted")
+    veomni_swiglu_mlp = OpSlot("swiglu_mlp", "standard")
     veomni_moe_experts_forward = OpSlot("moe_experts", "standard")
     veomni_load_balancing_loss = OpSlot("load_balancing_loss", "standard")
     veomni_mhc_pre = OpSlot("mhc", "pre")
@@ -167,6 +169,50 @@ config.add_post_import_block(
     veomni_dsa_attention_backend = OpsConfigSlot("dsa_attention_backend")
     """
 )
+
+
+# ================================================================
+# Patch: DeepSeek V4 RMSNorm dispatch
+# ================================================================
+@config.override_method(
+    "DeepseekV4RMSNorm.forward",
+    description="OpSlot guard for Liger fused weighted RMSNorm",
+)
+def deepseek_v4_rmsnorm_forward_patched(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    if veomni_rms_norm.use_non_eager_impl:
+        return veomni_rms_norm(hidden_states, self.weight, self.variance_epsilon)
+
+    input_dtype = hidden_states.dtype
+    hidden_states = hidden_states.to(torch.float32)
+    variance = hidden_states.pow(2).mean(-1, keepdim=True)
+    hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+    return self.weight * hidden_states.to(input_dtype)
+
+
+@config.override_method(
+    "DeepseekV4UnweightedRMSNorm.forward",
+    description="OpSlot guard for Liger fused unweighted RMSNorm",
+)
+def deepseek_v4_unweighted_rmsnorm_forward_patched(self, x: torch.Tensor) -> torch.Tensor:
+    if veomni_unweighted_rms_norm.use_non_eager_impl:
+        return veomni_unweighted_rms_norm(x, None, self.eps)
+
+    return x * torch.rsqrt(x.float().square().mean(-1, keepdim=True) + self.eps).to(x.dtype)
+
+
+# ================================================================
+# Patch: DeepSeek V4 shared-expert SwiGLU dispatch
+# ================================================================
+@config.override_method(
+    "DeepseekV4MLP.forward",
+    description="OpSlot guard for Liger fused shared-expert SwiGLU",
+)
+def deepseek_v4_mlp_forward_patched(self, x):
+    if veomni_swiglu_mlp.use_non_eager_impl:
+        return veomni_swiglu_mlp(self, x)
+
+    down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+    return down_proj
 
 
 # ================================================================

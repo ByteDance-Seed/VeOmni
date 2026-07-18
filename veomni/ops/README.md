@@ -76,8 +76,8 @@ own Triton RMSNorm/rotary. See the per-model table below.
 
 ### Per-model PER_MODEL coverage
 
-Each model's `device_patch.py` binds the three PER_MODEL ops to the HF
-modeling symbols it uses:
+Each model's `device_patch.py` or patchgen config binds the PER_MODEL ops to
+the HF modeling symbols it uses:
 
 | Model | `rms_norm` target | `rotary_pos_emb` target | `swiglu_mlp` target | Extras |
 |---|---|---|---|---|
@@ -89,6 +89,7 @@ modeling symbols it uses:
 | `qwen2_vl` | `Qwen2RMSNorm` | `apply_multimodal_rotary_pos_emb` | `Qwen2MLP` | `rotary_pos_emb.npu` disabled; vision RoPE via `custom_patches` |
 | `qwen3_vl` | `Qwen3VLTextRMSNorm` | `apply_rotary_pos_emb` | *(n/a)* | `liger_kernel` disabled for RMSNorm/RoPE; vision RoPE via `custom_patches` |
 | `deepseek_v3` | `DeepseekV3RMSNorm` | `apply_rotary_pos_emb` | `DeepseekV3MLP` | `triton` adds batch-invariant RMSNorm + deterministic RoPE (patches `DeepseekV3RotaryEmbedding.forward` via `target_override`) |
+| `deepseek_v4` | `DeepseekV4RMSNorm` + `DeepseekV4UnweightedRMSNorm` | *(eager only)* | `DeepseekV4MLP` shared experts | Patchgen OpSlots; routed experts remain on clamp-aware fused MoE |
 | `wan` (DiT) | `RMSNorm` | `rope_apply` | *(n/a)* | `triton` RMSNorm/rotary via `extra_backends`; attention block wired via `custom_patches` |
 
 ### Full YAML example
