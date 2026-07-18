@@ -7,8 +7,9 @@ model:
     dsa_attention_backend: tilelang_sparse
     dsa_indexer_backend: tilelang
     mhc_backend: tile_kernels
-    rms_norm_implementation: liger_kernel
-    swiglu_mlp_implementation: liger_kernel
+    rms_norm_implementation: eager
+    swiglu_mlp_implementation: eager
+    rotary_pos_emb_implementation: eager
 
 data:
   train_path: tulu-3-sft-mixture
