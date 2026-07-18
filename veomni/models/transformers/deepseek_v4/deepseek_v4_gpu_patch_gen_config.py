@@ -33,21 +33,32 @@ Patches:
 4. ``DeepseekV4ForCausalLM.forward`` — OpSlot guard for fused
    cross-entropy (``veomni_causal_lm_loss``) + ``MoeCausalLMOutputWithLogProbs``
    so callers can read per-token log-probs / entropy alongside the loss.
-5. Register ``get_parallel_plan`` on ``DeepseekV4ForCausalLM``.
+5. ``DeepseekV4RMSNorm.forward`` — matches the official inference path's
+   FP32 weight multiply followed by a single cast to the input dtype.
+6. ``DeepseekV4RotaryEmbedding.forward`` — retains FP32 cos/sin tables for
+   official-compatible inference and casts them to the activation dtype during
+   training so FSDP activation-checkpoint recomputation sees stable metadata.
+7. ``DeepseekV4Attention.forward`` — matches the official BF16 per-head Q
+   normalization before RoPE.
+8. ``DeepseekV4TopKRouter.forward`` / ``DeepseekV4HashRouter.forward`` —
+   always perform the official FP32 router projection.
+9. ``DeepseekV4MLP.forward`` — applies the official FP32, clamped SwiGLU
+   used by shared experts before casting back for the down projection.
+10. Register ``get_parallel_plan`` on ``DeepseekV4ForCausalLM``.
 
 Intentionally NOT patched:
 
-- ``DeepseekV4RMSNorm`` / ``DeepseekV4UnweightedRMSNorm`` — DeepSeek-V4 ships
-  two RMSNorm flavours (the second is unweighted and used inside the
-  HCA/CSA compressors). LigerRMSNorm replaces only the standard form, and a
-  blind swap would shadow the unweighted variant. RoPE-determinism /
-  batch-invariant RMSNorm are wired separately at runtime by future
-  ``device_patch.py`` infra (mirroring DeepseekV3) when needed.
-- ``DeepseekV4MLP`` — also used as ``shared_experts`` with a custom
-  ``moe_intermediate_size`` (via ``attribute_map["intermediate_size"] =
-  "moe_intermediate_size"``). ``LigerSwiGLUMLP.__init__`` rejects the
-  ``intermediate_size`` kwarg pattern that DeepSeek-V4 uses, so swapping
-  would break shared-expert construction. Same reasoning as DeepseekV3.
+- ``DeepseekV4UnweightedRMSNorm`` — DeepSeek-V4 ships two RMSNorm flavours;
+  the unweighted form used inside the HCA/CSA compressors already matches the
+  official inference path. The weighted form is patched above without using
+  LigerRMSNorm, whose replacement would shadow the distinct unweighted
+  variant. Batch-invariant RMSNorm remains a separate runtime concern for
+  future ``device_patch.py`` infra (mirroring DeepseekV3).
+- ``LigerSwiGLUMLP`` — ``DeepseekV4MLP`` is used as ``shared_experts`` with
+  a custom ``moe_intermediate_size`` (via
+  ``attribute_map["intermediate_size"] = "moe_intermediate_size"``).
+  ``LigerSwiGLUMLP.__init__`` rejects that construction pattern, so the
+  existing class is retained and only its forward arithmetic is patched.
 - ``apply_rotary_pos_emb`` — DeepSeek-V4 uses a *partial* RoPE (the
   trailing ``qk_rope_head_dim`` slice only, with the leading nope channels
   untouched) plus an interleaved ``repeat_interleave(2)`` cos/sin layout
@@ -167,6 +178,43 @@ config.add_post_import_block(
     veomni_dsa_attention_implementation = OpsConfigSlot("dsa_attention_implementation")
     """
 )
+
+
+# ================================================================
+# Patch: official weighted RMSNorm precision order
+# ================================================================
+@config.override_method(
+    "DeepseekV4RMSNorm.forward",
+    description="Multiply normalized activations and weights in FP32 before casting to the input dtype",
+)
+def deepseek_v4_rms_norm_forward_patched(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    input_dtype = hidden_states.dtype
+    hidden_states = hidden_states.float()
+    variance = hidden_states.square().mean(-1, keepdim=True)
+    hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+    return (self.weight.float() * hidden_states).to(input_dtype)
+
+
+# ================================================================
+# Patch: official RoPE table precision and checkpoint-stable training dtype
+# ================================================================
+@config.override_method(
+    "DeepseekV4RotaryEmbedding.forward",
+    description="Retain FP32 cos/sin for inference and use activation dtype for checkpoint-stable training",
+)
+def deepseek_v4_rotary_embedding_forward_patched(self, x, position_ids, layer_type=None):
+    inv_freq = getattr(self, f"{layer_type}_inv_freq")
+    attention_scaling = getattr(self, f"{layer_type}_attention_scaling")
+    inv_freq_expanded = inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)
+    position_ids_expanded = position_ids[:, None, :].float()
+    device_type = x.device.type if isinstance(x.device.type, str) and x.device.type != "mps" else "cpu"
+    with maybe_autocast(device_type=device_type, enabled=False):
+        freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
+        cos = freqs.cos() * attention_scaling
+        sin = freqs.sin() * attention_scaling
+    if self.training:
+        return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
+    return cos, sin
 
 
 # ================================================================
@@ -608,8 +656,9 @@ def deepseek_v4_attention_forward_patched(
     cos, sin = position_embeddings[self.rope_layer_type]
 
     q_residual = self.q_a_norm(self.q_a_proj(hidden_states))
-    q = self.q_b_proj(q_residual).view(*hidden_shape).transpose(1, 2)
-    q = self.q_b_norm(q)
+    q = self.q_b_proj(q_residual).view(*hidden_shape)
+    q = q * torch.rsqrt(q.square().mean(-1, keepdim=True) + self.q_b_norm.eps)
+    q = q.transpose(1, 2)
     q = apply_rotary_pos_emb(q, cos, sin)
 
     kv = self.kv_norm(self.kv_proj(hidden_states)).view(*hidden_shape).transpose(1, 2)
@@ -746,10 +795,11 @@ def deepseek_v4_eager_attention_forward_patched(
 # ================================================================
 # Patch: DeepseekV4Model.forward
 # 1. Convert collator-provided cu-seqlens into reusable packed slices once.
+# 2. Keep use_cache=False forwards stateless so the TileLang indexer can run.
 # ================================================================
 @config.override_method(
     "DeepseekV4Model.forward",
-    description="Propagate packed sequence boundaries to compressed attention",
+    description="Propagate packed boundaries and preserve stateless indexer dispatch",
 )
 def deepseek_v4_model_forward_patched(
     self,
@@ -763,13 +813,17 @@ def deepseek_v4_model_forward_patched(
 ) -> MoeModelOutputWithPast:
     if (input_ids is None) ^ (inputs_embeds is not None):
         raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
-    return_cache = past_key_values if use_cache else None
-    if past_key_values is None:
+    # Stateless prefill/training must keep the cache absent: the TileLang
+    # Lightning Indexer dispatch is intentionally cache-free, and creating a
+    # DynamicCache here would silently force its eager decode fallback even
+    # when use_cache=False.
+    if past_key_values is None and use_cache:
         past_key_values = DynamicCache(config=self.config)
+    return_cache = past_key_values if use_cache else None
     if inputs_embeds is None:
         inputs_embeds = self.embed_tokens(input_ids)
     if position_ids is None:
-        past_seen = past_key_values.get_seq_length()
+        past_seen = past_key_values.get_seq_length() if past_key_values is not None else 0
         position_ids = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device) + past_seen
         position_ids = position_ids.unsqueeze(0)
 
@@ -913,6 +967,71 @@ class PatchedDeepseekV4Experts(nn.Module):
         up = up.clamp(min=-self.limit, max=self.limit)
         return self.act_fn(gate) * up
         # --- Patch.3 ---
+
+
+# ================================================================
+# Patch: DeepseekV4MLP.forward
+# The shared expert uses the same FP32 clamped SwiGLU as official inference.
+# Keep the existing class because its V4-specific intermediate-size mapping
+# is incompatible with LigerSwiGLUMLP construction.
+# ================================================================
+@config.override_method(
+    "DeepseekV4MLP.forward",
+    description="Match official FP32 clamped SwiGLU arithmetic for shared experts",
+)
+def deepseek_v4_mlp_forward_patched(self, x: torch.Tensor) -> torch.Tensor:
+    dtype = x.dtype
+    gate = self.gate_proj(x).float().clamp(max=self.config.swiglu_limit)
+    up = (
+        self.up_proj(x)
+        .float()
+        .clamp(
+            min=-self.config.swiglu_limit,
+            max=self.config.swiglu_limit,
+        )
+    )
+    hidden_states = self.act_fn(gate) * up
+    return self.down_proj(hidden_states.to(dtype))
+
+
+@config.override_method(
+    "DeepseekV4TopKRouter.forward",
+    description="Match the official DeepSeek-V4 FP32 router projection",
+)
+def deepseek_v4_topk_router_forward_patched(
+    self,
+    hidden_states: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    flat = hidden_states.reshape(-1, self.hidden_dim)
+    device_type = flat.device.type if isinstance(flat.device.type, str) and flat.device.type != "mps" else "cpu"
+    with maybe_autocast(device_type=device_type, enabled=False):
+        logits = F.linear(flat.float(), self.weight.float())
+    correction_bias = self.e_score_correction_bias.float()
+    scores = self.score_fn(logits)
+    indices = torch.topk(scores + correction_bias, self.top_k, dim=-1, sorted=False).indices
+    weights = scores.gather(1, indices)
+    weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-20)
+    return logits, weights * self.routed_scaling_factor, indices
+
+
+@config.override_method(
+    "DeepseekV4HashRouter.forward",
+    description="Match the official DeepSeek-V4 FP32 hash-router projection",
+)
+def deepseek_v4_hash_router_forward_patched(
+    self,
+    hidden_states: torch.Tensor,
+    input_ids: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    flat = hidden_states.reshape(-1, self.hidden_dim)
+    device_type = flat.device.type if isinstance(flat.device.type, str) and flat.device.type != "mps" else "cpu"
+    with maybe_autocast(device_type=device_type, enabled=False):
+        logits = F.linear(flat.float(), self.weight.float())
+    scores = self.score_fn(logits)
+    indices = self.tid2eid[input_ids.reshape(-1)].long()
+    weights = scores.gather(1, indices)
+    weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-20)
+    return logits, weights * self.routed_scaling_factor, indices
 
 
 # ================================================================
