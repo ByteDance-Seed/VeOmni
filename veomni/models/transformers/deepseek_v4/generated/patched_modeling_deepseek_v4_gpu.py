@@ -10,7 +10,9 @@
 #
 #  Patches applied:
 #    - method_override: DeepseekV4RMSNorm.forward
-#      Multiply normalized activations and weights in FP32 before casting to the input dtype
+#      OpSlot guard for Liger fused weighted RMSNorm with official eager FP32 fallback
+#    - method_override: DeepseekV4UnweightedRMSNorm.forward
+#      OpSlot guard for Liger fused unweighted RMSNorm
 #    - method_override: DeepseekV4RotaryEmbedding.forward
 #      Retain FP32 cos/sin for inference and use activation dtype for checkpoint-stable training
 #    - method_override: DeepseekV4HyperConnection.forward
@@ -34,7 +36,7 @@
 #    - class_replacement: DeepseekV4Experts
 #      Use v5 gate_up_proj expert layout with OpSlot-guarded VeOmni fused-MoE path
 #    - method_override: DeepseekV4MLP.forward
-#      Match official FP32 clamped SwiGLU arithmetic for shared experts
+#      Clamp-aware shared-expert SwiGLU with optional Liger fused silu-mul
 #    - method_override: DeepseekV4TopKRouter.forward
 #      Match the official DeepSeek-V4 FP32 router projection
 #    - method_override: DeepseekV4HashRouter.forward
@@ -85,6 +87,9 @@ from veomni.utils.model_outputs import MoeCausalLMOutputWithLogProbs
 
 
 veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
+veomni_rms_norm = OpSlot("rms_norm", "standard")
+veomni_unweighted_rms_norm = OpSlot("rms_norm", "unweighted")
+veomni_swiglu_mlp = OpSlot("swiglu_mlp", "standard")
 veomni_moe_experts_forward = OpSlot("moe_experts", "standard")
 veomni_load_balancing_loss = OpSlot("load_balancing_loss", "standard")
 veomni_mhc_pre = OpSlot("mhc", "pre")
@@ -111,9 +116,12 @@ class DeepseekV4RMSNorm(nn.Module):
         self.variance_epsilon = eps
 
     # ================================================================
-    # Patch: official weighted RMSNorm precision order
+    # Patch: DeepSeek V4 RMSNorm dispatch
     # ================================================================
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if veomni_rms_norm.use_non_eager_impl:
+            return veomni_rms_norm(hidden_states, self.weight, self.variance_epsilon)
+
         input_dtype = hidden_states.dtype
         hidden_states = hidden_states.float()
         variance = hidden_states.square().mean(-1, keepdim=True)
@@ -124,12 +132,21 @@ class DeepseekV4RMSNorm(nn.Module):
         return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
 
 
+# ======================================================================
+# [MODIFIED CLASS] DeepseekV4UnweightedRMSNorm
+# Methods patched: forward
+# ======================================================================
+
+
 class DeepseekV4UnweightedRMSNorm(nn.Module):
     def __init__(self, eps: float = 1.0e-6):
         super().__init__()
         self.eps = eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if veomni_unweighted_rms_norm.use_non_eager_impl:
+            return veomni_unweighted_rms_norm(x, None, self.eps)
+
         return x * torch.rsqrt(x.float().square().mean(-1, keepdim=True) + self.eps).to(x.dtype)
 
 
@@ -1256,11 +1273,15 @@ class DeepseekV4MLP(nn.Module):
 
     # ================================================================
     # Patch: DeepseekV4MLP.forward
-    # The shared expert uses the same FP32 clamped SwiGLU as official inference.
-    # Keep the existing class because its V4-specific intermediate-size mapping
-    # is incompatible with LigerSwiGLUMLP construction.
+    # Shared experts can use functional Liger SwiGLU via OpSlot. Keep the class
+    # because its V4-specific intermediate-size mapping is incompatible with
+    # LigerSwiGLUMLP construction. Eager fallback retains official FP32 clamp.
     # ================================================================
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Official DeepSeek-V4 shared experts clamp gate/up before silu*mul. Apply
+        # that first, then optionally fuse only the silu*mul via Liger. The generic
+        # ``veomni_swiglu_mlp(self, x)`` path re-runs projections without clamp and
+        # would change arithmetic under the default ``swiglu_limit``.
         dtype = x.dtype
         gate = self.gate_proj(x).float().clamp(max=self.config.swiglu_limit)
         up = (
@@ -1271,6 +1292,11 @@ class DeepseekV4MLP(nn.Module):
                 max=self.config.swiglu_limit,
             )
         )
+        if veomni_swiglu_mlp.use_non_eager_impl:
+            from liger_kernel.ops.swiglu import LigerSiLUMulFunction
+
+            return self.down_proj(LigerSiLUMulFunction.apply(gate.to(dtype), up.to(dtype)))
+
         hidden_states = self.act_fn(gate) * up
         return self.down_proj(hidden_states.to(dtype))
 
