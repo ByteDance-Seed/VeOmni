@@ -23,8 +23,7 @@ per-purpose module/graph files. Both training and inference take the **same**
 | File | Role |
 |------|------|
 | `qwen3_0.6b/base.yaml` | Top-level omni launcher: model paths, top-level `accelerator`, data, train, and the `infer` block. |
-| `qwen3_0.6b/modules_train.yaml` | Per-module training overrides. |
-| `qwen3_0.6b/modules_train_sp.yaml` | Ulysses SP overrides (LLM SP=4, wte unsharded; see [§3.1](#31-sequence-parallelism-ulysses)). |
+| `qwen3_0.6b/modules_train.yaml` | Per-module training overrides. Add `--accelerator.ulysses_size N` to run it under uniform Ulysses SP — no separate SP config (see [§3.1](#31-sequence-parallelism-ulysses)). |
 | `qwen3_0.6b/graph_train.yaml` | Training DAG (`qwen3_text_encoder → qwen3_llm → qwen3_text_encoder.decode`). |
 | `qwen3_0.6b/data.yaml` | Weighted multisource data list (Tulu-3 SFT mixture). |
 | `qwen3_0.6b/graph_infer.yaml` | Text chat generation graph (mapped under `infer.infer_graph.infer_text`). |
@@ -105,28 +104,28 @@ bash train.sh tasks/omni/train_omni.py \
 
 ### 3.1 Sequence parallelism (Ulysses)
 
-Per-module SP: the `qwen3_llm` backbone shards its packed token sequence at SP=4
-while the `qwen3_text_encoder` (wte) stays **unsharded** — i.e. "only the LLM does
-SP" (`modules_train_sp.yaml`). SP is declared **per module** (`qwen3_llm` at
-`ulysses_size: 4`); the outer trainer always runs SP-disabled, so its SP group of
-4 ranks each holds a distinct sample that it gathers into one packed sequence:
+Uniform Ulysses SP (Arch B): the `qwen3_text_encoder` (wte) and the `qwen3_llm`
+backbone both shard the packed token sequence at the outer SP size. SP has **no
+dedicated config** — it is the normal `modules_train.yaml` plus
+`--accelerator.ulysses_size N`. The dataloader replicates each DP shard across the
+SP group; each module slices to its `1/sp` chunk, runs one forward, and all-gathers
+the output back:
 
 ```bash
 NPROC_PER_NODE=4 bash train.sh tasks/omni/train_omni.py \
   configs/seed_omni/Qwen/qwen3_0.6b/base.yaml \
-  --model.modules configs/seed_omni/Qwen/qwen3_0.6b/modules_train_sp.yaml \
+  --model.modules configs/seed_omni/Qwen/qwen3_0.6b/modules_train.yaml \
+  --accelerator.ulysses_size 4 \
   --train.global_batch_size 16 --train.micro_batch_size 4
 ```
 
-- SP is set **per module** in the modules YAML (`accelerator.ulysses_size`). Do
-  NOT pass a top-level `--accelerator.ulysses_size > 1`: the orchestrator does no
-  sequence compute, so `OmniTrainer` enforces outer `ulysses_size == 1` (and
-  `cp_size == 1`) and raises otherwise.
-- `world % 4 == 0` (module_sp = 4); a larger `micro_batch_size` gives longer
-  packed sequences to slice across SP ranks.
-- To shard the wte as well (veomni's classic whole-model SP), set
-  `qwen3_text_encoder.accelerator.ulysses_size: 4` in the modules YAML too (each
-  module still declares its own SP independently).
+- SP is **uniform**: set it once on the outer trainer
+  (`--accelerator.ulysses_size`); modules inherit it. `OmniTrainer` raises
+  unless every module's `ulysses_size` equals the outer size (no per-module
+  overrides). The wte is a per-token lookup, so its sequence shards exactly like
+  the LLM backbone.
+- `world % sp_size == 0`; a larger `micro_batch_size` gives longer packed
+  sequences to slice across SP ranks.
 - If your environment exports `TORCH_DISTRIBUTED_DEBUG=DETAIL`, **unset it** — its
   `_ProcessGroupWrapper` lacks the coalesced all-gather that FSDP2's tied-head
   `full_tensor()` needs, which crashes any FSDP2 run (SP or not).
@@ -313,9 +312,7 @@ suffix:
 | File | Role |
 |------|------|
 | `visual_instruction_tuning.yaml` | Launcher (model paths, accelerator, data, train, infer). |
-| `modules_train_visual_instruction_tuning.yaml` | All overrides: `qwen3vl_vision` merger retarget (`out_hidden_size`) + `disable_deepstack` + `freeze`; `qwen3_text_encoder` image mode + special-token freeze (`ddp` + `weight_decay: 0`); `qwen3_llm` freeze. |
-| `modules_train_visual_instruction_tuning_sp.yaml` | Same overrides + Ulysses SP (ViT + LLM SP=4, text-encoder unsharded; see [§7.5](#75-train-on-sharegpt4v)). |
-| `modules_train_visual_instruction_tuning_hetero_sp.yaml` | Same overrides + **mixed** Ulysses SP (ViT SP=2, LLM SP=4 — two distinct SP sizes; see [§7.5](#75-train-on-sharegpt4v)). |
+| `modules_train_visual_instruction_tuning.yaml` | All overrides: `qwen3vl_vision` merger retarget (`out_hidden_size`) + `disable_deepstack` + `freeze`; `qwen3_text_encoder` image mode + special-token freeze (`ddp` + `weight_decay: 0`); `qwen3_llm` freeze. Add `--accelerator.ulysses_size N` for uniform Ulysses SP — no separate SP config (see [§7.5](#75-train-on-sharegpt4v)). |
 | `graph_train_visual_instruction_tuning.yaml` | `{qwen3vl_vision, qwen3_text_encoder.encode} → qwen3_llm → qwen3_text_encoder.decode → end`. |
 | `data_visual_instruction_tuning.yaml` | ShareGPT4V captions (image + text). |
 | `graph_infer_visual_instruction_tuning.yaml` | I2T generation FSM. |
@@ -331,28 +328,18 @@ Trainable params are exactly `qwen3vl_vision.visual.merger.*` plus the masked
 text-encoder embedding (only the vision special-token rows receive gradient; the
 ViT and LLM are frozen).
 
-**Sequence parallelism** — the ViT **and** the LLM backbone both run Ulysses SP=4
-while the text-encoder stays unsharded (`modules_train_visual_instruction_tuning_sp.yaml`;
-each SP=4 module gathers its group's 4 distinct per-rank sequences). Same
-outer-SP-disabled / `TORCH_DISTRIBUTED_DEBUG` caveats as [§3.1](#31-sequence-parallelism-ulysses):
+**Sequence parallelism** — uniform Ulysses at the outer SP size: the ViT, the
+text-encoder and the LLM backbone all run SP=4. SP has **no dedicated config** — it
+is the normal `modules_train_visual_instruction_tuning.yaml` (the launcher's default
+`model.modules`) plus `--accelerator.ulysses_size N`. The dataloader replicates each
+DP shard across the SP group; each module slices to its `1/sp` chunk, runs one
+forward, and all-gathers the output back. Same uniform-SP / `TORCH_DISTRIBUTED_DEBUG`
+caveats as [§3.1](#31-sequence-parallelism-ulysses):
 
 ```bash
 NPROC_PER_NODE=4 bash train.sh tasks/omni/train_omni.py \
   configs/seed_omni/Qwen/qwen3_0.6b/visual_instruction_tuning.yaml \
-  --model.modules configs/seed_omni/Qwen/qwen3_0.6b/modules_train_visual_instruction_tuning_sp.yaml \
-  --train.global_batch_size 16 --train.micro_batch_size 4
-```
-
-Modules may also run at **different** SP sizes in the same graph — e.g. ViT SP=2
-and LLM SP=4 (`modules_train_visual_instruction_tuning_hetero_sp.yaml`). The SP
-process groups are resolved from the current `ParallelState`'s device mesh (not a
-global), and each module's forward is scoped to its own state, so mixed sizes
-route their attention all-to-all over the correct ranks:
-
-```bash
-NPROC_PER_NODE=4 bash train.sh tasks/omni/train_omni.py \
-  configs/seed_omni/Qwen/qwen3_0.6b/visual_instruction_tuning.yaml \
-  --model.modules configs/seed_omni/Qwen/qwen3_0.6b/modules_train_visual_instruction_tuning_hetero_sp.yaml \
+  --accelerator.ulysses_size 4 \
   --train.global_batch_size 16 --train.micro_batch_size 4
 ```
 

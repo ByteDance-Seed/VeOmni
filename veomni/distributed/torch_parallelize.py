@@ -14,9 +14,8 @@
 
 
 import types
-from contextlib import contextmanager
 from functools import partial
-from typing import Any, Callable, Iterator, List, Mapping, Optional, Tuple, Union
+from typing import Any, Callable, List, Mapping, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -47,60 +46,6 @@ def _reset_hf_initialized_flag(module: nn.Module) -> None:
         module._is_hf_initialized = False
     for child in module.children():
         _reset_hf_initialized_flag(child)
-
-
-@contextmanager
-def no_reshard_after_forward(model: nn.Module) -> Iterator[None]:
-    """Keep every FSDP2 submodule's parameters unsharded across the block.
-
-    Under per-module sequence parallel a module runs its backbone ``sp_size``
-    times back-to-back (one forward per SP-group member; see
-    ``graphs/dispatch.run_sp_looped_endpoint``). With the default
-    ``reshard_after_forward=True`` each
-    of those forwards re-all-gathers the same params, so param comm scales with
-    ``sp_size``. This context flips ``reshard_after_forward`` to ``False`` on all
-    FSDP2 submodules (via ``set_reshard_after_forward``) so the first forward
-    all-gathers each layer once and the remaining ``sp_size - 1`` forwards — plus
-    the shared backward — reuse the resident params: param comm drops to a single
-    all-gather (forward) + reduce-scatter (backward). The trade-off is memory —
-    the full unsharded params stay resident for the whole block, so this is opt-in
-    per module via the YAML knob ``train.accelerator.fsdp_config.sp_keep_params_unsharded``:
-    a large backbone that cannot hold its fully-unsharded params would OOM and should
-    instead let the SP loop re-fire the normal FSDP hooks each forward (the memory-safe
-    default — the graph then simply does not enter this context).
-
-    On exit the exact prior per-module state is restored (crucially, the FSDP2
-    root is specially kept ``reshard_after_forward=False`` at wrap time — see
-    :func:`build_fsdp2_parallelize_model` — so we snapshot/restore rather than
-    blindly setting everything back to ``True``). A non-FSDP2 model (DDP / eager)
-    is a no-op.
-    """
-    saved: List[Tuple[Any, Any, Any, Any]] = []
-    for module in model.modules():
-        if isinstance(module, FSDPModule):
-            state = module._get_fsdp_state()
-            param_group = getattr(state, "_fsdp_param_group", None)
-            saved.append(
-                (
-                    state,
-                    param_group,
-                    getattr(state, "_auto_reshard_after_forward", None),
-                    getattr(param_group, "post_forward_mesh_info", None) if param_group is not None else None,
-                )
-            )
-
-    if not saved:
-        yield
-        return
-
-    model.set_reshard_after_forward(False, recurse=True)
-    try:
-        yield
-    finally:
-        for state, param_group, auto_reshard, post_forward_mesh_info in saved:
-            state._auto_reshard_after_forward = auto_reshard
-            if param_group is not None:
-                param_group.post_forward_mesh_info = post_forward_mesh_info
 
 
 def _resolve_weights_path_mapping(
@@ -810,19 +755,13 @@ def parallelize_model_ddp(
         )
         return model
 
-    # Per-module SP may run the DDP-wrapped module ``sp_size`` times before one
-    # backward (``run_sp_looped_endpoint``). DDP's default ``broadcast_buffers=True``
-    # does an in-place ``copy_`` on every buffer at the start of each forward —
-    # including constant index buffers such as Janus SigLIP's ``position_ids``
-    # that ``nn.Embedding`` saves for backward — which then fails autograd version
-    # checks (PyTorch #22095 / #66504). Disable buffer broadcast under SP; module
-    # weights still sync via the gradient allreduce. Non-SP DDP keeps the default
-    # (needed for BatchNorm running stats when those modules use DDP).
-    #
-    # Note: classic packed SP (one gather → one forward) is a single DDP
-    # forward/backward and needs no special casing beyond ``broadcast_buffers``.
-    # The looped-SP multi-forward burst is handled inside
-    # ``run_sp_looped_endpoint`` (call raw module; grad sync over ``fsdp_group``).
+    # DDP's default ``broadcast_buffers=True`` does an in-place ``copy_`` on every
+    # buffer at the start of each forward — including constant index buffers such as
+    # Janus SigLIP's ``position_ids`` that ``nn.Embedding`` saves for backward —
+    # which can fail autograd version checks (PyTorch #22095 / #66504). Disable
+    # buffer broadcast under SP; module weights still sync via the gradient
+    # allreduce. Non-SP DDP keeps the default (needed for BatchNorm running stats
+    # when those modules use DDP).
     return DDP(
         model,
         device_ids=[parallel_state.local_rank],

@@ -62,7 +62,7 @@ from collections import defaultdict, deque
 from contextlib import nullcontext
 from typing import Any, Callable, ContextManager, Dict, List, Optional
 
-from .dispatch import call_graph_endpoint, run_sp_looped_endpoint, unwrap_graph_module
+from .dispatch import call_graph_endpoint, unwrap_graph_module
 from .graph import EdgeDef, NodeDef, is_end
 from .profiling import GraphProfiler
 
@@ -208,7 +208,6 @@ class TrainingGraph:
         *,
         profiler: Optional[GraphProfiler] = None,
         scope_fn: Optional[Callable[[str], ContextManager]] = None,
-        sp_keep_unsharded_fn: Optional[Callable[[str], bool]] = None,
     ) -> Dict[str, Any]:
         """Run the node at the cursor — one forward (mirror of ``GenerationGraph.step``).
 
@@ -247,56 +246,30 @@ class TrainingGraph:
         module_context = scope_fn(node.module) if scope_fn is not None else nullcontext()
         profile_context = profiler.node(f"forward:{node_name}") if profiler is not None else nullcontext()
         with module_context, profile_context:
+            # ``pre_forward`` does packing / conversation extraction and, when the
+            # module's scoped ``sp_size > 1``, slices its inputs to this rank's
+            # ``1/sp`` shard (classic single-pass Ulysses: every SP rank holds the
+            # SAME replicated sample; the model's attention all-to-alls run over the
+            # SP group internally). ``post_forward`` all-gathers the output shard
+            # back to the full sample on every rank, so downstream nodes run
+            # identically on replicated full data. SP is thus fully contained in the
+            # module's own pre/post hooks — the graph and modeling stay SP-unaware.
             kwargs = raw.pre_forward(method=method, **batch)
 
-            # Opt-in metric meter (only modules multi-inheriting a MetricMeterMixin have
-            # ``metric_meter_add``); token lengths read straight from the real inputs.
+            # Opt-in metric meter (only modules multi-inheriting a MetricMeterMixin
+            # have ``metric_meter_add``). It drains the FULL pre-slice seqlens the
+            # module stashed inside ``pre_forward`` (via ``metric_meter_set_seqlens``,
+            # before any SP slice), so metering is SP-invariant regardless of the
+            # sharded ``kwargs`` handed here.
             if hasattr(raw, "metric_meter_add"):
                 raw.metric_meter_add(method, kwargs)
 
-            if self._use_sp_loop(raw, method):
-                # Per-module SP (Ulysses): run the endpoint once per SP-group sample
-                # (broadcast sample → slice → forward → all-gather shards). ``post_forward``
-                # still runs once, on this rank's own sample. Modeling stays SP-unaware.
-                # Optionally wrap in ``no_reshard_after_forward`` so those ``sp_size``
-                # forwards all-gather FSDP2 params once instead of per forward — opt-in
-                # per module via the YAML knob ``train.accelerator.fsdp_config.
-                # sp_keep_params_unsharded`` (read at this use-site from
-                # ``sp_keep_unsharded_fn``, which the OmniModel resolves off its config),
-                # since keeping a large backbone's params resident for the whole burst
-                # can OOM; the memory-safe default (knob absent/False) re-fires the FSDP
-                # hooks each forward.
-                if sp_keep_unsharded_fn is not None and sp_keep_unsharded_fn(node.module):
-                    from veomni.distributed.torch_parallelize import no_reshard_after_forward
-
-                    loop_context = no_reshard_after_forward(wrapped)
-                else:
-                    loop_context = nullcontext()
-                with loop_context:
-                    out = run_sp_looped_endpoint(wrapped, raw, method=method, kwargs=kwargs)
-            else:
-                out = call_graph_endpoint(wrapped, raw, method=method, kwargs=kwargs)
+            out = call_graph_endpoint(wrapped, raw, method=method, kwargs=kwargs)
             out = raw.post_forward(method=method, **out)
 
         batch.update(out)
 
         return batch
-
-    @staticmethod
-    def _use_sp_loop(raw: Any, method: str) -> bool:
-        """Whether this node runs the per-module SP loop for call-site ``method``.
-
-        True iff the module opts in with an ``@sp_pre_forward(method)`` hook
-        (``raw.supports_sp``) AND its scoped :class:`ParallelState` has ``sp_size >
-        1``. Otherwise the plain ``method`` runs once. Not-yet-migrated modules that
-        still do SP inside ``pre_forward``/``post_forward`` (gather-concat) declare
-        no such hook, so they keep taking the plain path unchanged.
-        """
-        # Local import keeps the graph package import-light and avoids a cycle with
-        # the distributed stack.
-        from veomni.distributed.parallel_state import get_parallel_state
-
-        return raw.supports_sp(method) and get_parallel_state().sp_size > 1
 
     def maybe_transition(self, *, profiler: Optional[GraphProfiler] = None) -> bool:
         """Advance the cursor to the next node (mirror of ``GenerationGraph.maybe_transition``).

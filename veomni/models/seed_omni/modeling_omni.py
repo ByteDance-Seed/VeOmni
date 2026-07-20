@@ -243,23 +243,6 @@ class OmniModel(nn.Module):
         ps = self._module_parallel_states.get(module_name)
         return use_parallel_state(ps) if ps is not None else nullcontext()
 
-    def _module_sp_keep_unsharded(self, module_name: str) -> bool:
-        """Read a module's ``fsdp_config.sp_keep_params_unsharded`` YAML knob.
-
-        Passed to :meth:`TrainingGraph.step` so the per-module SP loop can decide,
-        at its use-site, whether to keep FSDP2 params unsharded across the
-        ``sp_size`` back-to-back forwards (comm/memory tradeoff) — read straight off
-        ``self.config`` rather than being bound onto the module. Safe ``.get`` chain:
-        defaults to ``False`` (memory-safe) when the block is absent (e.g. tests).
-        """
-        return bool(
-            (self.config.modules.get(module_name) or {})
-            .get("train", {})
-            .get("accelerator", {})
-            .get("fsdp_config", {})
-            .get("sp_keep_params_unsharded", False)
-        )
-
     # ── Training ──────────────────────────────────────────────────────────────
 
     def _collect_training_loss(self, batch: Dict[str, Any], profiler: Optional[GraphProfiler] = None) -> None:
@@ -322,7 +305,6 @@ class OmniModel(nn.Module):
                 batch,
                 profiler=profiler,
                 scope_fn=self._module_scope,
-                sp_keep_unsharded_fn=self._module_sp_keep_unsharded,
             )
             self._collect_training_loss(batch, profiler)
             self.training_graph.maybe_transition(profiler=profiler)

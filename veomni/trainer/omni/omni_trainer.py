@@ -295,16 +295,8 @@ class OmniTrainer:
 
         self.base._setup()
 
-        # SP is a per-module concern; the orchestrator must run with SP disabled.
-        outer_ps = get_parallel_state()
-        if outer_ps.sp_size != 1:
-            raise ValueError(
-                "OmniTrainer requires the outer (orchestrator) sequence-parallel size to be 1 "
-                f"(got ulysses_size={outer_ps.ulysses_size}, cp_size={outer_ps.cp_size}). "
-                "Declare sequence parallelism per module via each module's accelerator.ulysses_size instead."
-            )
-
         self._build_model()
+        self._validate_uniform_sp()
         self._freeze_model_module()
         self._build_model_assets()
         self._build_data_transform()
@@ -346,6 +338,35 @@ class OmniTrainer:
         logger.info_rank0(
             f"OmniTrainer: composed OmniModel with {len(self.module_names)} modules ({self.module_names})."
         )
+
+    # ── Uniform sequence-parallel size ─────────────────────────────────────────
+
+    def _validate_uniform_sp(self):
+        """Enforce a single, uniform SP size across the outer trainer + all modules.
+
+        SeedOmni runs classic single-pass Ulysses: the outer dataloader replicates
+        each shard across the SP group (``dp_size = world / sp_size``) and every SP
+        module slices that replicated sample to its ``1/sp_size`` chunk. This only
+        works if the outer mesh and every module share ONE SP size — a module at a
+        different ``ulysses_size`` would form a mismatched process group and slice
+        against the wrong replication factor. Fail loudly at build time.
+        """
+        outer_sp = get_parallel_state().sp_size
+        mismatched = {
+            name: mt.parallel_state.sp_size
+            for name, mt in self.module_trainers.items()
+            if mt.parallel_state.sp_size != outer_sp
+        }
+        if mismatched:
+            raise ValueError(
+                "OmniTrainer requires a uniform sequence-parallel size: every module's "
+                f"ulysses_size must equal the outer trainer's ({outer_sp}). Mismatched "
+                f"modules (name: sp_size): {mismatched}. Set the outer "
+                "top-level `accelerator.ulysses_size` (NOT `train.accelerator.*`, which "
+                "OmniArguments overwrites) and drop per-module SP overrides (or set them "
+                "all to the same value)."
+            )
+        logger.info_rank0(f"OmniTrainer: uniform sequence-parallel size = {outer_sp}.")
 
     # ── Freeze (aggregate report) ───────────────────────────────────────────────
 

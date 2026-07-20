@@ -18,8 +18,7 @@ drives the inferencer.
 | File | Role |
 |------|------|
 | `base.yaml` | Top-level omni launcher: model paths, top-level `accelerator`, data, train, and the `infer` block. References the module/graph files below. |
-| `modules_train.yaml` | Per-module **training** overrides (`model` / `train` / `accelerator` per module). `janus_text_encoder` carries a embed-parallel `emb` extra-parallel block (see below). |
-| `modules_train_sp.yaml` / `modules_train_allsp4.yaml` | Per-module Ulysses SP layouts — LLM-only (`janus_llama` SP=4) / whole-model SP=4 (see [Sequence parallelism](#sequence-parallelism-ulysses)). |
+| `modules_train.yaml` | Per-module **training** overrides (`model` / `train` / `accelerator` per module). `janus_text_encoder` carries a embed-parallel `emb` extra-parallel block (see below). Add `--accelerator.ulysses_size N` to run it under uniform Ulysses SP — no separate SP config (see [Sequence parallelism](#sequence-parallelism-ulysses)). |
 | `graph_train.yaml` | Training DAG (`training_graph:` flat edge list). |
 | `data.yaml` | Weighted multisource data list (ImageNet + ShareGPT4V). |
 | `modules_infer_fsdp.yaml` | Per-module **inference** overrides — distributed: `janus_text_encoder` vocab-parallel `emb` + `janus_llama` `ddp`, vision modules eager (base.yaml's default `infer.modules`). |
@@ -122,31 +121,31 @@ bash train.sh tasks/omni/train_omni.py \
 
 ### Sequence parallelism (Ulysses)
 
-SP is declared **per module** in the modules YAML (`accelerator.ulysses_size`).
-The outer trainer always runs SP-disabled — do NOT pass a top-level
-`--accelerator.ulysses_size > 1` (`OmniTrainer` enforces outer `ulysses_size == 1`
-and raises otherwise). Two ready-made layouts:
+SP is **uniform (Arch B)**: set the SP size on the outer trainer
+(`--accelerator.ulysses_size`) and every module inherits it. Classic
+single-pass Ulysses — the dataloader replicates each DP shard across the SP group,
+each module slices to its `1/sp` chunk, runs one forward, and all-gathers the
+output back. `OmniTrainer` raises unless all modules share the outer SP size (no
+per-module `ulysses_size` overrides). Decision record + deferred future work
+(data-balance, compute-packing, audio/video): [Module-Level Sequence Parallel](../module_level_sp.md).
+Historical memory/timing experiments that motivated dropping the old looped SP:
+[sp_loop_memory_experiments.md](../sp_loop_memory_experiments.md).
 
-- **LLM-only SP** (`modules_train_sp.yaml`) — only the `janus_llama` backbone at
-  SP=4 (it gathers its 4-rank SP group's distinct per-rank sequences), other
-  modules unsharded. Runs on **4 GPUs** (`janus_text_encoder` emb-parallel=4):
+SP has **no dedicated config** — it is the normal `modules_train.yaml` plus
+`--accelerator.ulysses_size N` on the outer trainer; every module inherits that SP
+size. On **4 GPUs** with `ulysses_size 4` this gives `dp=1`. The
+`janus_text_encoder` `emb=4` extra-parallel composes here: on the 4-GPU box the
+`dp_shard_sp` mesh dim (`dp_shard=1 × ulysses=4`) IS the SP group, so the `emb`
+group and the `ulysses` group coincide — harmless, because the vocab lookup is a
+sequence-preserving `AllToAllEmbedding` (each rank still gets embeds for exactly
+its own `1/sp` token shard):
 
 ```bash
 NPROC_PER_NODE=4 bash train.sh tasks/omni/train_omni.py \
   configs/seed_omni/Janus/janus_1.3b/base.yaml \
-  --model.modules configs/seed_omni/Janus/janus_1.3b/modules_train_sp.yaml \
+  --model.modules configs/seed_omni/Janus/janus_1.3b/modules_train.yaml \
+  --accelerator.ulysses_size 4 \
   --train.global_batch_size 4 --train.micro_batch_size 1
-```
-
-- **Whole-model SP4** (`modules_train_allsp4.yaml`) — every module at SP=4 (VeOmni's
-  classic "one SP size for the whole model"; wte sequence-sharded too, `emb`
-  dropped). Runs on **4 GPUs**:
-
-```bash
-NPROC_PER_NODE=4 bash train.sh tasks/omni/train_omni.py \
-  configs/seed_omni/Janus/janus_1.3b/base.yaml \
-  --model.modules configs/seed_omni/Janus/janus_1.3b/modules_train_allsp4.yaml \
-  --train.global_batch_size 16 --train.micro_batch_size 4
 ```
 
 If your environment exports `TORCH_DISTRIBUTED_DEBUG=DETAIL`, **unset it** — its

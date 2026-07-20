@@ -16,13 +16,14 @@ right-padded ``(B, T, D)`` for the decode heads.
 Sequence parallelism
 --------------------
 ``forward`` is SP-unaware — it computes on whatever (already-sliced) sequence
-it is handed. Per-module SP is driven OUTSIDE the model: when ``sp_size > 1``
-the graph loops over the SP group's samples and, per sample, the mixin's
-``@sp_pre_forward`` hook slices the broadcast packed sample to this rank's shard
-(rebuilding the varlen ``cu_seqlens``) and the ``@sp_post_forward`` hook
-all-gathers shards so every rank holds the same full sample
-(``forward_sp_pre`` / ``forward_sp_post`` in ``modulemixin.py``).
-``post_forward`` then stays SP-agnostic (plain unpack).
+it is handed. SP is driven OUTSIDE the model (classic single-pass Ulysses): when
+``sp_size > 1`` the mixin's ``forward_pre`` hook slices the (replicated) packed
+sample to this rank's ``1/sp_size`` shard (rebuilding the varlen ``cu_seqlens``),
+``forward`` runs once (its attention all-to-alls over the SP group internally),
+and the ``forward_post`` hook all-gathers the shards back to the full sequence on
+every rank (both in ``modulemixin.py``, each gated on ``sp_size > 1``). The rest
+of ``forward_post`` (the unpack / scatter) then runs SP-agnostically on the full
+data.
 
 Connection outputs
 ------------------
