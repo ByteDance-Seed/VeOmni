@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""FlexAttention backend and non-distributed adapter implementation."""
+"""FlexAttention backend and SP-aware adapter implementation."""
 
 from typing import Callable, Optional
 
@@ -21,6 +21,11 @@ from torch.nn.attention.flex_attention import BlockMask
 from transformers.integrations.flex_attention import flex_attention_forward as hf_flex_attention_forward
 
 from ....distributed.parallel_state import get_parallel_state
+from .ulysses import (
+    prepare_ulysses_qkv,
+    restore_ulysses_output,
+    slice_ulysses_head_auxiliary,
+)
 
 
 # Module-level patch slot for the underlying Transformers FlexAttention adapter.
@@ -40,7 +45,7 @@ def flex_attention_forward(
     skip_ulysses: bool = False,
     **kwargs,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-    """Run the pinned Transformers FlexAttention adapter without sequence parallelism."""
+    """Run the pinned Transformers FlexAttention adapter with optional Ulysses exchange."""
     if not isinstance(attention_mask, BlockMask):
         raise TypeError(f"FlexAttention requires a BlockMask, got {type(attention_mask).__name__}.")
 
@@ -52,13 +57,36 @@ def flex_attention_forward(
             f"key/value heads ({key.shape[1]})."
         )
 
-    ulysses_enabled = get_parallel_state().ulysses_enabled
-    if ulysses_enabled and not skip_ulysses:
-        raise RuntimeError("FlexAttention sequence parallelism is not enabled by this adapter.")
     if sliding_window is not None:
         raise ValueError("FlexAttention sliding-window semantics must be encoded in the supplied BlockMask.")
 
-    return _flex_attention_forward(
+    parallel_state = get_parallel_state()
+    ulysses_enabled = parallel_state.ulysses_enabled and not skip_ulysses
+    if ulysses_enabled:
+        # Local head indices restart at zero on every Ulysses rank, so head-specific
+        # masks require rank-aware slicing and rebasing before they can be supported.
+        if attention_mask.shape[1] != 1:
+            raise ValueError("FlexAttention with Ulysses requires a head-broadcast BlockMask.")
+
+        query, key, value, query_head_count = prepare_ulysses_qkv(
+            query.transpose(1, 2),
+            key.transpose(1, 2),
+            value.transpose(1, 2),
+            group=parallel_state.ulysses_group,
+            ulysses_size=parallel_state.ulysses_size,
+        )
+        query = query.transpose(1, 2)
+        key = key.transpose(1, 2)
+        value = value.transpose(1, 2)
+        if "s_aux" in kwargs:
+            kwargs["s_aux"] = slice_ulysses_head_auxiliary(
+                kwargs["s_aux"],
+                query_head_count=query_head_count,
+                local_query_head_count=query.shape[1],
+                group=parallel_state.ulysses_group,
+            )
+
+    output, lse = _flex_attention_forward(
         module,
         query,
         key,
@@ -69,3 +97,14 @@ def flex_attention_forward(
         softcap=softcap,
         **kwargs,
     )
+
+    if ulysses_enabled:
+        output = restore_ulysses_output(output, group=parallel_state.ulysses_group)
+        if lse is not None:
+            lse = restore_ulysses_output(
+                lse.transpose(1, 2).unsqueeze(-1),
+                group=parallel_state.ulysses_group,
+            ).squeeze(-1)
+            lse = lse.transpose(1, 2).contiguous()
+
+    return output, lse

@@ -18,16 +18,16 @@ from types import SimpleNamespace
 from typing import Callable, Optional
 
 import torch
-import torch.distributed as dist
 from transformers.modeling_flash_attention_utils import _flash_attention_forward as hf_flash_attention_forward
 
 from ....distributed.parallel_state import get_parallel_state
-from ....distributed.sequence_parallel import (
-    gather_heads_scatter_seq,
-    gather_seq_scatter_heads,
-)
 from ....utils import logging
 from ....utils.import_utils import is_transformers_version_greater_or_equal_to
+from .ulysses import (
+    prepare_ulysses_qkv,
+    restore_ulysses_output,
+    slice_ulysses_head_auxiliary,
+)
 
 
 logger = logging.get_logger(__name__)
@@ -235,53 +235,24 @@ def flash_attention_forward(
     ulysses_enabled = get_parallel_state().ulysses_enabled
     if ulysses_enabled and not skip_ulysses:
         ulysses_group = get_parallel_state().ulysses_group
-        # Sanity Check & Repeat Key & Value
         ulysses_size = get_parallel_state().ulysses_size
-        q_head_num = query.shape[2]
-        kv_head_num = key.shape[2]
-        unpadded_seq_len = None
-
-        assert q_head_num % ulysses_size == 0, (
-            f"num_query_heads ({q_head_num}) must be divisible by ulysses_size ({ulysses_size})"
+        query, key, value, query_head_count = prepare_ulysses_qkv(
+            query,
+            key,
+            value,
+            group=ulysses_group,
+            ulysses_size=ulysses_size,
         )
-        if ulysses_size > kv_head_num:
-            assert ulysses_size % kv_head_num == 0, (
-                f"ulysses_size ({ulysses_size}) must be divisible by num_key_value_heads ({kv_head_num})"
-            )
-            n_repeat = ulysses_size // kv_head_num
-            key = torch.repeat_interleave(key, dim=2, repeats=n_repeat)
-            value = torch.repeat_interleave(value, dim=2, repeats=n_repeat)
-
-        if query.ndim == 4 and query.size(0) == 1:
-            query, key, value = query.squeeze(0), key.squeeze(0), value.squeeze(0)
-            query = gather_seq_scatter_heads(
-                query, seq_dim=0, head_dim=1, group=ulysses_group, unpadded_dim_size=unpadded_seq_len
-            )
-            key = gather_seq_scatter_heads(
-                key, seq_dim=0, head_dim=1, group=ulysses_group, unpadded_dim_size=unpadded_seq_len
-            )
-            value = gather_seq_scatter_heads(
-                value, seq_dim=0, head_dim=1, group=ulysses_group, unpadded_dim_size=unpadded_seq_len
-            )
-            query, key, value = query.unsqueeze(0), key.unsqueeze(0), value.unsqueeze(0)
-        else:
-            query = gather_seq_scatter_heads(
-                query, seq_dim=1, head_dim=2, group=ulysses_group, unpadded_dim_size=unpadded_seq_len
-            )
-            key = gather_seq_scatter_heads(
-                key, seq_dim=1, head_dim=2, group=ulysses_group, unpadded_dim_size=unpadded_seq_len
-            )
-            value = gather_seq_scatter_heads(
-                value, seq_dim=1, head_dim=2, group=ulysses_group, unpadded_dim_size=unpadded_seq_len
-            )
 
         # Only after all_to_all we got the full seq_len
         seq_len = query.shape[1]
-        s_aux = kwargs.get("s_aux")
-        if s_aux is not None and s_aux.ndim == 1 and s_aux.numel() == q_head_num:
-            local_q_head_num = query.shape[2]
-            head_start = dist.get_rank(ulysses_group) * local_q_head_num
-            kwargs["s_aux"] = s_aux.narrow(0, head_start, local_q_head_num).contiguous()
+        if "s_aux" in kwargs:
+            kwargs["s_aux"] = slice_ulysses_head_auxiliary(
+                kwargs["s_aux"],
+                query_head_count=query_head_count,
+                local_query_head_count=query.shape[2],
+                group=ulysses_group,
+            )
 
     # Resolve the token that will be passed to Transformers' lazy_import_flash_attention.
     #
@@ -325,11 +296,6 @@ def flash_attention_forward(
     # Ulysses patch
     if ulysses_enabled and not skip_ulysses:
         ulysses_group = get_parallel_state().ulysses_group
-        if attn_output.ndim == 4 and attn_output.size(0) == 1:
-            attn_output = attn_output.squeeze(0)
-            attn_output = gather_heads_scatter_seq(attn_output, seq_dim=0, head_dim=1, group=ulysses_group)
-            attn_output = attn_output.unsqueeze(0)
-        else:
-            attn_output = gather_heads_scatter_seq(attn_output, seq_dim=1, head_dim=2, group=ulysses_group)
+        attn_output = restore_ulysses_output(attn_output, group=ulysses_group)
 
     return attn_output, None

@@ -18,10 +18,10 @@ from types import SimpleNamespace
 import pytest
 import torch
 from torch import nn
-from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
 from veomni.ops.kernels import attention as veomni_attention
 from veomni.ops.kernels.attention import flash as flash_backend
+from veomni.ops.kernels.attention import ulysses as attention_ulysses
 
 
 _FLASH_IMPLEMENTATIONS = (
@@ -63,103 +63,6 @@ def test_flash_attention_forward_public_signature_is_stable():
     assert signature.parameters["softcap"].default is None
     assert signature.parameters["skip_ulysses"].default is False
     assert signature.parameters["kwargs"].kind is inspect.Parameter.VAR_KEYWORD
-
-
-def test_fused_attention_forward_matches_the_public_attention_signature():
-    flash_signature = inspect.signature(veomni_attention.flash_attention_forward)
-    fused_signature = inspect.signature(veomni_attention.fused_attention_forward)
-
-    assert list(fused_signature.parameters) == list(flash_signature.parameters)
-    for name, flash_parameter in flash_signature.parameters.items():
-        fused_parameter = fused_signature.parameters[name]
-        assert fused_parameter.kind is flash_parameter.kind
-        assert fused_parameter.default == flash_parameter.default
-
-
-def test_apply_veomni_attention_patch_registers_all_flash_implementations(monkeypatch):
-    patch_calls = []
-    monkeypatch.setattr(
-        veomni_attention,
-        "patch_transformers_hub_kernel_loader_for_veomni",
-        lambda: patch_calls.append(True),
-    )
-
-    veomni_attention.apply_veomni_attention_patch()
-
-    assert patch_calls == [True]
-    for implementation, _ in _FLASH_IMPLEMENTATIONS:
-        assert ALL_ATTENTION_FUNCTIONS[implementation] is veomni_attention.fused_attention_forward
-
-
-@pytest.mark.parametrize("implementation", [item[0] for item in _FLASH_IMPLEMENTATIONS])
-def test_fused_attention_forward_dispatches_to_the_selected_flash_adapter(monkeypatch, implementation):
-    captured = {}
-
-    def replacement_adapter(module, query, key, value, attention_mask, **kwargs):
-        captured.update(
-            module=module,
-            query=query,
-            key=key,
-            value=value,
-            attention_mask=attention_mask,
-            kwargs=kwargs,
-        )
-        return query.transpose(1, 2) + 1, "attention-metadata"
-
-    monkeypatch.setitem(veomni_attention._ATTENTION_FORWARD_DISPATCH, implementation, replacement_adapter)
-
-    module = _FakeAttentionModule(implementation)
-    query = torch.randn(2, 4, 3, 4, dtype=torch.float16)
-    key = torch.randn(2, 2, 3, 4, dtype=torch.float16)
-    value = torch.randn(2, 2, 3, 4, dtype=torch.float16)
-    attention_mask = torch.ones(2, 1, 3, 3, dtype=torch.bool)
-    marker = object()
-
-    output, attention_metadata = veomni_attention.fused_attention_forward(
-        module,
-        query,
-        key,
-        value,
-        attention_mask,
-        dropout=0.25,
-        scaling=0.5,
-        sliding_window=16,
-        softcap=30.0,
-        skip_ulysses=True,
-        contract_marker=marker,
-    )
-
-    assert captured["module"] is module
-    assert captured["query"] is query
-    assert captured["key"] is key
-    assert captured["value"] is value
-    assert captured["attention_mask"] is attention_mask
-    assert captured["kwargs"] == {
-        "dropout": 0.25,
-        "scaling": 0.5,
-        "sliding_window": 16,
-        "softcap": 30.0,
-        "skip_ulysses": True,
-        "contract_marker": marker,
-    }
-    torch.testing.assert_close(output, query.transpose(1, 2) + 1)
-    assert attention_metadata == "attention-metadata"
-
-
-def test_fused_attention_forward_rejects_an_unregistered_implementation():
-    module = _FakeAttentionModule("unregistered_attention")
-    query = torch.randn(1, 4, 3, 4, dtype=torch.float16)
-
-    with pytest.raises(
-        ValueError, match="Unsupported VeOmni fused attention implementation: 'unregistered_attention'"
-    ):
-        veomni_attention.fused_attention_forward(
-            module,
-            query,
-            query,
-            query,
-            attention_mask=None,
-        )
 
 
 @pytest.mark.parametrize(("implementation", "expected_backend"), _FLASH_IMPLEMENTATIONS)
@@ -231,33 +134,98 @@ def test_flash_attention_forward_preserves_layout_and_backend_contract(
     assert attention_weights is None
 
 
-def test_flash_module_compute_slot_is_the_called_backend(monkeypatch):
-    replacement_calls = []
+@pytest.mark.parametrize(
+    ("batch_size", "seq_dim", "head_dim"),
+    [(1, 0, 1), (2, 1, 2)],
+)
+def test_ulysses_helpers_preserve_flash_layout(monkeypatch, batch_size, seq_dim, head_dim):
+    exchanges = []
 
-    def replacement_backend(query, key, value, attention_mask, **kwargs):
-        replacement_calls.append((query, key, value, attention_mask, kwargs))
-        return torch.zeros_like(query)
+    def fake_gather_seq(tensor, *, seq_dim, head_dim, group):
+        exchanges.append(("prepare", tensor.shape, seq_dim, head_dim, group))
+        return tensor
 
-    monkeypatch.setattr(flash_backend, "_flash_attention_forward", replacement_backend)
-    monkeypatch.setattr(
-        flash_backend,
-        "get_parallel_state",
-        lambda: SimpleNamespace(ulysses_enabled=False),
+    def fake_gather_heads(tensor, *, seq_dim, head_dim, group):
+        exchanges.append(("restore", tensor.shape, seq_dim, head_dim, group))
+        return tensor
+
+    monkeypatch.setattr(attention_ulysses, "gather_seq_scatter_heads", fake_gather_seq)
+    monkeypatch.setattr(attention_ulysses, "gather_heads_scatter_seq", fake_gather_heads)
+    group = object()
+    query = torch.randn(batch_size, 5, 4, 8)
+    key = torch.randn(batch_size, 5, 1, 8)
+    value = torch.randn(batch_size, 5, 1, 8)
+
+    prepared_query, prepared_key, prepared_value, query_heads = attention_ulysses.prepare_ulysses_qkv(
+        query, key, value, group=group, ulysses_size=2
+    )
+    restored = attention_ulysses.restore_ulysses_output(prepared_query[:, :, :2], group=group)
+
+    assert query_heads == 4
+    torch.testing.assert_close(prepared_key, key.repeat_interleave(2, dim=2))
+    torch.testing.assert_close(prepared_value, value.repeat_interleave(2, dim=2))
+    assert [item[0] for item in exchanges] == ["prepare", "prepare", "prepare", "restore"]
+    assert all(item[2:] == (seq_dim, head_dim, group) for item in exchanges)
+    assert restored.shape == (batch_size, 5, 2, 8)
+
+
+def test_ulysses_head_auxiliary_slices_global_vector_by_rank(monkeypatch):
+    monkeypatch.setattr(attention_ulysses.dist, "get_rank", lambda group: 1)
+    auxiliary = torch.arange(4)
+
+    sliced = attention_ulysses.slice_ulysses_head_auxiliary(
+        auxiliary,
+        query_head_count=4,
+        local_query_head_count=2,
+        group=object(),
     )
 
-    module = _FakeAttentionModule("veomni_flash_attention_2_with_sp")
-    query = torch.randn(1, 4, 3, 4, dtype=torch.float16)
-    key = torch.randn(1, 2, 3, 4, dtype=torch.float16)
-    value = torch.randn(1, 2, 3, 4, dtype=torch.float16)
+    torch.testing.assert_close(sliced, torch.tensor([2, 3]))
 
-    output, attention_weights = veomni_attention.flash_attention_forward(
-        module,
+
+def test_flash_attention_delegates_active_ulysses_to_shared_helpers(monkeypatch):
+    group = object()
+    state = SimpleNamespace(ulysses_enabled=True, ulysses_group=group, ulysses_size=2)
+    calls = []
+
+    def fake_prepare(query, key, value, *, group, ulysses_size):
+        calls.append(("prepare", query, key, value, group, ulysses_size))
+        return query, key, value, 4
+
+    def fake_slice(auxiliary, *, query_head_count, local_query_head_count, group):
+        calls.append(("slice", auxiliary, query_head_count, local_query_head_count, group))
+        return auxiliary[:local_query_head_count]
+
+    def fake_restore(output, *, group):
+        calls.append(("restore", output, group))
+        return output
+
+    def fake_flash(query, key, value, attention_mask, **kwargs):
+        calls.append(("backend", query, key, value, attention_mask, kwargs))
+        return query
+
+    monkeypatch.setattr(flash_backend, "get_parallel_state", lambda: state)
+    monkeypatch.setattr(flash_backend, "prepare_ulysses_qkv", fake_prepare)
+    monkeypatch.setattr(flash_backend, "slice_ulysses_head_auxiliary", fake_slice)
+    monkeypatch.setattr(flash_backend, "restore_ulysses_output", fake_restore)
+    monkeypatch.setattr(flash_backend, "_flash_attention_forward", fake_flash)
+    query = torch.randn(1, 4, 5, 8, dtype=torch.float16)
+    key = torch.randn(1, 2, 5, 8, dtype=torch.float16)
+    value = torch.randn(1, 2, 5, 8, dtype=torch.float16)
+    auxiliary = torch.arange(4, dtype=torch.float16)
+
+    output, _ = flash_backend.flash_attention_forward(
+        _FakeAttentionModule("veomni_flash_attention_2_with_sp"),
         query,
         key,
         value,
         attention_mask=None,
+        s_aux=auxiliary,
     )
 
-    assert len(replacement_calls) == 1
-    assert output.shape == (1, 3, 4, 4)
-    assert attention_weights is None
+    assert [call[0] for call in calls] == ["prepare", "slice", "backend", "restore"]
+    assert calls[0][1].shape == (1, 5, 4, 8)
+    assert calls[0][2].shape == (1, 5, 2, 8)
+    assert calls[0][4:] == (group, 2)
+    torch.testing.assert_close(calls[2][-1]["s_aux"], auxiliary)
+    assert output.shape == (1, 5, 4, 8)

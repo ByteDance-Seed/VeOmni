@@ -959,6 +959,7 @@ class OpsImplementationConfig:
             "flash_attention_2",
             "flash_attention_3",
             "flash_attention_4",
+            "flex_attention",
             "native-sparse",
         ]
     ] = field(
@@ -1072,6 +1073,7 @@ class OpsImplementationConfig:
                 "flash_attention_2": "veomni_flash_attention_2_with_sp",
                 "flash_attention_3": "veomni_flash_attention_3_with_sp",
                 "flash_attention_4": "veomni_flash_attention_4_with_sp",
+                "flex_attention": "veomni_flex_attention_with_sp",
             }
             if self.attn_implementation in replacements:
                 new_impl = replacements[self.attn_implementation]
