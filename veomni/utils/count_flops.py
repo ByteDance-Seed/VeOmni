@@ -250,9 +250,10 @@ class VeomniFlopsCounter:
         attn_linear_N += num_attention_heads * head_dim * o_lora_rank
         attn_linear_N += o_groups * o_lora_rank * hidden_size
 
-        # Every layer computes router logits, top-k routed experts, and one shared expert.
+        # Every layer computes router logits, top-k routed experts, and shared experts.
+        n_shared_experts = getattr(self.config, "n_shared_experts", 1) or 0
         moe_router_N = hidden_size * num_experts
-        moe_expert_N = hidden_size * moe_intermediate_size * (experts_per_token + 1) * 3
+        moe_expert_N = hidden_size * moe_intermediate_size * (experts_per_token + n_shared_experts) * 3
 
         # Each decoder layer has two mHC mappings. The final HyperHead adds one more mapping.
         mhc_mapping_N = (2 + hc_mult) * hc_mult * (hc_mult * hidden_size)
@@ -274,6 +275,8 @@ class VeomniFlopsCounter:
         # mHC applies two HxH residual-stream matrix multiplications per decoder layer.
         mhc_residual_flops = 12 * hc_mult * hc_mult * hidden_size * num_hidden_layers * tokens_sum
 
+        # CSA/HCA layers keep a sliding-window branch and concatenate compressed KV, so
+        # sliding attention scores are counted for every decoder layer.
         sliding_score_sum = self._compute_sliding_attention_score_sum(batch_seqlens, self.config.sliding_window)
         hca_score_sum = 0
         if num_hca_layers > 0:

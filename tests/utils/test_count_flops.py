@@ -187,6 +187,16 @@ class TestDeepseekV4Flops:
 
         assert smaller_topk_flops < baseline_flops
 
+    def test_shared_experts_scale_moe_flops(self, deepseek_v4_config):
+        batch_seqlens = [64]
+        baseline_flops, _ = VeomniFlopsCounter(deepseek_v4_config).estimate_flops(batch_seqlens, delta_time=1.0)
+
+        more_shared_config = deepcopy(deepseek_v4_config)
+        more_shared_config.n_shared_experts = deepseek_v4_config.n_shared_experts + 1
+        more_shared_flops, _ = VeomniFlopsCounter(more_shared_config).estimate_flops(batch_seqlens, delta_time=1.0)
+
+        assert more_shared_flops > baseline_flops
+
     def test_hca_compression_rate_reduces_attention_flops(self, deepseek_v4_config):
         batch_seqlens = [256]
         baseline_flops, _ = VeomniFlopsCounter(deepseek_v4_config).estimate_flops(batch_seqlens, delta_time=1.0)
