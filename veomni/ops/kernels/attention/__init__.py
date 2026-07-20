@@ -19,11 +19,12 @@ from typing import Callable, Optional
 import torch
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
-from . import flash
+from . import flash, flex
 from .flash import (
     flash_attention_forward,
     patch_transformers_hub_kernel_loader_for_veomni,
 )
+from .flex import flex_attention_forward
 
 
 _ATTENTION_FORWARD_DISPATCH: dict[str, Callable] = {
@@ -72,7 +73,7 @@ def fused_attention_forward(
 
 
 def apply_veomni_attention_patch():
-    """Register VeOmni's SP-aware FlashAttention implementations."""
+    """Register VeOmni's fused-attention implementations."""
     patch_transformers_hub_kernel_loader_for_veomni()
     ALL_ATTENTION_FUNCTIONS.register("veomni_flash_attention_2_with_sp", fused_attention_forward)
     ALL_ATTENTION_FUNCTIONS.register("veomni_flash_attention_3_with_sp", fused_attention_forward)
