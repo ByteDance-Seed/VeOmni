@@ -1,0 +1,45 @@
+# Ten-step, eight-GPU SFT validation against the canonical 50k Dolci subset.
+# Checkpoint saving and W&B are disabled because this run validates the full
+# training path rather than producing a model artifact.
+model:
+  model_path: /mgData4/models/Qwen3-0.6B
+  tokenizer_path: /mgData4/models/Qwen3-0.6B
+  attn_implementation: flash_attention_2
+
+data:
+  train_path: /mgData4/datasets/processed/Dolci-Instruct-SFT-veomni-smoke/data
+  dataloader_type: native
+  datasets_type: mapping
+  data_type: conversation
+  chat_template: chatml
+  text_keys: messages
+  max_seq_len: 2048
+  num_workers: 2
+  prefetch_factor: 2
+  drop_last: true
+
+train:
+  output_dir: /mgData4/ckpts/veomni_docker_qwen3_0_6b_dolci_sft_10step_fa274
+  data_parallel_mode: ddp
+  global_batch_size: 8
+  micro_batch_size: 1
+  num_train_epochs: 1
+  max_steps: 10
+  lr: 1.0e-5
+  lr_min: 1.0e-7
+  lr_decay_style: constant
+  lr_warmup_ratio: 0.0
+  weight_decay: 0.0
+  max_grad_norm: 1.0
+  rmpad: false
+  dyn_bsz: false
+  enable_mixed_precision: false
+  enable_gradient_checkpointing: true
+  enable_reentrant: false
+  enable_full_shard: false
+  init_device: cuda
+  ckpt_manager: dcp
+  save_steps: 0
+  save_epochs: 0
+  save_hf_weights: false
+  use_wandb: false

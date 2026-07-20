@@ -81,9 +81,11 @@ class ModelArguments:
         default=False,
         metadata={"help": "Whether to encode target with decoder. Only supports stable diffusion as decoder."},
     )
-    attn_implementation: Optional[Literal["eager", "sdpa", "flash_attention_2", "native-sparse"]] = field(
-        default="flash_attention_2",
-        metadata={"help": "Attention implementation to use."},
+    attn_implementation: Optional[Literal["eager", "sdpa", "flash_attention_2", "flex_attention", "native-sparse"]] = (
+        field(
+            default="flash_attention_2",
+            metadata={"help": "Attention implementation to use."},
+        )
     )
     moe_implementation: Optional[Literal[None, "eager", "fused"]] = field(
         default=None,

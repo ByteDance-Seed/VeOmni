@@ -1,0 +1,17 @@
+.git
+.github
+.agents
+**/__pycache__
+**/*.py[cod]
+**/.pytest_cache
+**/.ruff_cache
+**/.mypy_cache
+**/.cache
+**/.venv
+**/venv
+*.egg-info
+build
+dist
+outputs
+checkpoints
+wandb

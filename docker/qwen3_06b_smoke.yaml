@@ -1,0 +1,36 @@
+# One optimizer step against local assets. This is a functional validation of
+# the historical Qwen3 loader and FlashAttention 2 path, not a training recipe.
+model:
+  model_path: /mgData4/models/Qwen3-0.6B
+  tokenizer_path: /mgData4/models/Qwen3-0.6B
+  attn_implementation: flash_attention_2
+
+data:
+  train_path: /mgData4/datasets/processed/reanchor_sft_smoke/reanchor_smoke.jsonl
+  dataloader_type: native
+  datasets_type: mapping
+  data_type: conversation
+  chat_template: chatml
+  text_keys: messages
+  max_seq_len: 128
+  num_workers: 0
+  drop_last: true
+
+train:
+  output_dir: /mgData4/ckpts/veomni_docker_qwen3_0_6b_smoke
+  data_parallel_mode: ddp
+  global_batch_size: 1
+  micro_batch_size: 1
+  num_train_epochs: 1
+  max_steps: 1
+  rmpad: false
+  dyn_bsz: false
+  enable_mixed_precision: false
+  enable_gradient_checkpointing: true
+  enable_full_shard: false
+  init_device: cuda
+  ckpt_manager: dcp
+  save_steps: 0
+  save_epochs: 0
+  save_hf_weights: false
+  use_wandb: false

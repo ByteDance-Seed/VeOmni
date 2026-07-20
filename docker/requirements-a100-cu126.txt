@@ -1,0 +1,22 @@
+# User-space packages for VeOmni commit 10adfab.
+# CUDA and its compiler toolchain come from NGC 24.08. The matched PyTorch,
+# torchvision, torchaudio, and triton wheels are installed separately in the
+# Dockerfile before these user-space dependencies.
+accelerate==1.10.1
+blobfile==3.0.0
+datasets==2.21.0
+diffusers==0.31.0
+einops==0.8.1
+hf-transfer==0.1.9
+liger-kernel==0.5.6
+ninja==1.11.1.1
+packaging==24.2
+peft==0.17.1
+psutil==6.0.0
+safetensors==0.6.2
+sentencepiece==0.2.1
+tiktoken==0.9.0
+timm==1.0.19
+torchdata==0.11.0
+transformers==4.51.3
+wandb==0.21.3
