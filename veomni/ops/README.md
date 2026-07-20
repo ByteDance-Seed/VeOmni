@@ -15,7 +15,7 @@ veomni/ops/
 │   └── singleton.py        get_ops_config / set_ops_config — bridges the
 │                           resolved config from BaseTrainer to device_patch.py
 ├── kernels/                Kernel implementations, one subpackage per op
-│   ├── attention/          Flash attention v2/3/4 + SP-aware wrappers
+│   ├── attention/          Flash v2/3/4 and FlexAttention + SP-aware wrappers
 │   ├── cross_entropy/      eager / liger / npu-chunk loss (+ ForCausalLMLoss)
 │   ├── deepseek_v4/        TileLang sparse attention/indexer + precision helpers
 │   ├── load_balancing_loss/  eager + triton fused kernel
@@ -47,7 +47,7 @@ depending on when and where the kernel is bound:
 
 | Kernel | Config key | Scope | Default | Available backends |
 |---|---|:-:|---|---|
-| Attention | `attn_implementation` | import-time | `flash_attention_2` | `eager`, `sdpa`, `flash_attention_2/3/4`, `native-sparse` |
+| Attention | `attn_implementation` | import-time | `flash_attention_2` | `eager`, `sdpa`, `flash_attention_2/3/4`, `flex_attention`, `native-sparse` |
 | Cross-entropy loss | `cross_entropy_loss_implementation` | LOSS_MAPPING | `eager` | `eager`, `liger_kernel`, `npu` (chunked loss) |
 | Load-balancing loss | `load_balancing_loss_implementation` | GLOBAL | `eager` | `eager`, `triton` |
 | RMSNorm | `rms_norm_implementation` | PER_MODEL | `eager` | `liger_kernel`, `npu`, `triton`\* |
@@ -69,6 +69,7 @@ own Triton RMSNorm/rotary. See the per-model table below.
 | `npu` | `torch_npu` + Ascend NPU | `BackendSpec.requires=("torch_npu",)` → `is_torch_npu_available()` |
 | `triton` | Triton + CUDA | Validated by the model `extra_backends` registration |
 | `flash_attention_2/3/4` | `flash-attn` / `flash-attn-interface` / `flash-attn.cute` | Validated in `OpsImplementationConfig.__post_init__` |
+| `flex_attention` | PyTorch FlexAttention | Native `BlockMask`; compiled CUDA execution for training |
 | `moe_implementation=fused_triton` | Triton, SM70+ | `is_fused_moe_available()` |
 | `moe_implementation=fused_quack` | `quack` package, SM90+ | `is_quack_gemm_available()` |
 | `moe_implementation=fused_npu` | `torch_npu` + Ascend NPU | `is_torch_npu_available()` |
@@ -106,6 +107,8 @@ model:
 ```
 
 See `docs/design/kernel_selection.md` for the user-facing lifecycle diagram.
+See `docs/transformers_v5/veomni_fused_attention.md` for the Flash/Flex
+facade, native BlockMask contract, and Ulysses behavior.
 
 ### DeepSeek V4 library kernels
 

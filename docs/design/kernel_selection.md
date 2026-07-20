@@ -14,7 +14,7 @@ selection knob.
 
 | Kernel | Config field | Available values | Default | Selection time |
 |--------|-------------|------------------|---------|----------------|
-| Attention | `attn_implementation` | `eager`, `sdpa`, `flash_attention_2`, `flash_attention_3`, `flash_attention_4`, `native-sparse` | `"flash_attention_2"` | Config `__post_init__` + `build_foundation_model` |
+| Attention | `attn_implementation` | `eager`, `sdpa`, `flash_attention_2`, `flash_attention_3`, `flash_attention_4`, `flex_attention`, `native-sparse` | `"flash_attention_2"` | Config `__post_init__` + `build_foundation_model` |
 | DSA indexer | `dsa_indexer_implementation` | `eager`, `cudnn` (GLM-DSA), `tilelang` (DeepSeek-V4) | `"eager"` | Model build via `OpsConfigSlot` |
 | DSA attention | `dsa_attention_implementation` | `eager`, `flashmla_cudnn` (GLM-DSA), `tilelang` (DeepSeek-V4) | `"eager"` | Model build via `OpsConfigSlot` |
 | mHC | `mhc_implementation` | `eager`, `tilelang` (DeepSeek-V4, SM90+) | `"eager"` | Model build via three `OpSlot`s (`pre`, `post`, `head`) |
@@ -50,7 +50,7 @@ without modifying `OpsImplementationConfig`.
 ```
 import veomni                                 # (1) import time
   └─ apply_ops_patch()
-       └─ apply_veomni_attention_patch()      # register FA2/3/4 with SP
+       └─ apply_veomni_attention_patch()      # register Flash/Flex facade names with SP
 
 OpsImplementationConfig.__post_init__()       # (2) config parse time
   ├─ validate requested backends are available
@@ -119,12 +119,20 @@ model:
 | `flash_attention_2` | Flash Attention v2 | Yes | `flash-attn` |
 | `flash_attention_3` | Flash Attention v3 | Yes | `flash-attn-interface` |
 | `flash_attention_4` | Flash Attention v4 | Yes | `flash-attn.cute` |
+| `flex_attention` | PyTorch FlexAttention | Yes | Native `BlockMask`; CUDA for compiled training |
 | `native-sparse` | Sparse attention | No | — |
 
 When `MODELING_BACKEND=veomni` (the default), `__post_init__` automatically
-rewrites `flash_attention_2/3/4` to VeOmni SP-aware variants
-(`veomni_flash_attention_2_with_sp`, etc.) which wrap the underlying kernel
-with DeepSpeed Ulysses sequence parallelism gather/scatter.
+rewrites `flash_attention_2/3/4` and `flex_attention` to VeOmni SP-aware
+variants (`veomni_flash_attention_*_with_sp` and
+`veomni_flex_attention_with_sp`). All VeOmni names enter one
+`fused_attention_forward` facade and then dispatch to the selected backend.
+
+FlexAttention requires a model-provided native `BlockMask`; VeOmni does not
+construct model-specific visibility. With Ulysses enabled, the mask must be
+head-broadcast (`BlockMask.shape[1] == 1`) because rank-local head indices are
+not rebased for head-specific masks. See
+`docs/transformers_v5/veomni_fused_attention.md` for the full contract.
 
 ### Key files
 
