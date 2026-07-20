@@ -96,9 +96,22 @@ class MultiOptimizer:
     (``step`` / ``zero_grad``).  Checkpointing is per-module (handled by each
     module-trainer's :class:`OmniModuleHfCallback` / :class:`OmniModuleLoraCallback`
     against the real per-module optimizer), so no ``state_dict`` is needed here.
+
+    An empty map is allowed when ``allow_empty=True`` (e.g. ``offline_cache`` with
+    every module frozen): ``step`` / ``zero_grad`` become no-ops and
+    ``param_groups`` is ``[]``.
     """
 
-    def __init__(self, optimizers: Dict[str, torch.optim.Optimizer]):
+    def __init__(
+        self,
+        optimizers: Dict[str, torch.optim.Optimizer],
+        *,
+        allow_empty: bool = False,
+    ):
+        if not optimizers:
+            if not allow_empty:
+                raise ValueError("OmniTrainer found no trainable module optimizers to build.")
+            logger.info_rank0("MultiOptimizer: empty — no trainable modules (e.g. offline_cache encode-only).")
         self.optimizers = optimizers
 
     @property
@@ -410,10 +423,9 @@ class OmniTrainer:
         The build lives on the module-trainer; here we only invoke it and
         collect the result.  ``build_optimizer`` only ever puts ``requires_grad``
         params into the optimizer, so a partially-frozen module just trains its
-        remaining params and a fully-frozen one yields a harmless empty optimizer
-        (``step()`` is a no-op) — no per-module freeze bookkeeping needed.
-        Aggregated behind :class:`MultiOptimizer` so the metering callbacks and
-        train loop see the canonical ``base.optimizer`` surface.
+        remaining params.  A fully-frozen module is skipped. Aggregated behind
+        :class:`MultiOptimizer` (``allow_empty`` for ``offline_cache`` when every
+        module is frozen).
         """
         base = self.base
         self.optimizers: Dict[str, torch.optim.Optimizer] = {}
@@ -422,9 +434,10 @@ class OmniTrainer:
                 with use_parallel_state(module_trainer.parallel_state):
                     module_trainer._build_optimizer()
                 self.optimizers[name] = module_trainer.base.optimizer
-        if not self.optimizers:
-            raise ValueError("OmniTrainer found no trainable module optimizers to build.")
-        base.optimizer = MultiOptimizer(self.optimizers)
+        base.optimizer = MultiOptimizer(
+            self.optimizers,
+            allow_empty=base.args.train.train_type == "offline_cache",
+        )
         logger.info_rank0(f"OmniTrainer: built {len(self.optimizers)} optimizer(s): {list(self.optimizers)}.")
 
     def _build_lr_scheduler(self):
@@ -432,7 +445,8 @@ class OmniTrainer:
 
         Module-trainer schedulers read ``args.train_steps`` (fixed by the shared
         dataset); propagate the global value into each module-trainer's private
-        args copy before invoking the build.
+        args copy before invoking the build. An empty map is fine
+        (``get_last_lr`` → ``[0.0]``), e.g. fully-frozen ``offline_cache``.
         """
         base = self.base
         self.lr_schedulers: Dict[str, Any] = {}

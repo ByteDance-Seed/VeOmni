@@ -49,6 +49,7 @@ from ...models.seed_omni.modeling_omni import _unwrap_module
 from ...utils import logging
 from ..base import BaseTrainer
 from ..callbacks import (
+    Callback,
     CheckpointerCallback,
     HFLoraCkptCallback,
     HuggingfaceCkptCallback,
@@ -62,6 +63,10 @@ if TYPE_CHECKING:
 
 
 logger = logging.get_logger(__name__)
+
+
+class _FrozenModuleNoOpCkptCallback(Callback):
+    """No-op checkpoint hooks for fully-frozen modules (no optimizer / DCP save)."""
 
 
 # ── Per-module checkpoint callbacks (reuse the single-model callbacks) ──────────
@@ -433,8 +438,20 @@ class OmniModuleTrainer:
         Mirrors :meth:`BaseTrainer._init_callbacks` (the DCP + HF/LoRA half),
         bound to ``self.base`` so the shared callbacks save / load **this**
         module's weights to its ``<subfolder_name>/`` subdir.
+
+        Fully-frozen modules (no ``requires_grad`` params) get no-op callbacks:
+        there is nothing to train, no optimizer to snapshot, and weights stay
+        at the released checkpoint (e.g. offline_cache OE/ViT/VAE).
         """
         base = self.base
+        if not any(p.requires_grad for p in base.model.parameters()):
+            logger.info_rank0(
+                f"OmniModuleTrainer[{subfolder_name}]: fully frozen — skipping DCP/HF checkpoint callbacks."
+            )
+            self._has_trainable_parameters = False
+            self.checkpointer_callback = _FrozenModuleNoOpCkptCallback(base)
+            self.hf_ckpt_callback = _FrozenModuleNoOpCkptCallback(base)
+            return
         self.checkpointer_callback = OmniModuleDcpCallback(base, subfolder_name)
         if base.args.model.lora_config:
             self.hf_ckpt_callback = OmniModuleLoraCallback(base, subfolder_name)

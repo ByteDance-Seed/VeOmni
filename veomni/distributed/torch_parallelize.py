@@ -800,6 +800,16 @@ def parallelize_model_ddp(
             fqn_to_index_mapping=kwargs.get("fqn_to_index_mapping"),
         )
 
+    # PyTorch DDP rejects modules with zero trainable params. Fully-frozen
+    # encoders (e.g. Seedream offline_cache OE/ViT/VAE under ``no_grad``) still
+    # need the meta→device materialize + weight load above; skip the DDP wrap
+    # and return the bare replica (FSDP2 path already accepts all-frozen).
+    if not any(p.requires_grad for p in model.parameters()):
+        logger.info_rank0(
+            f"Skipping DDP wrap for fully-frozen module {type(model).__name__} (no trainable parameters)."
+        )
+        return model
+
     # Per-module SP may run the DDP-wrapped module ``sp_size`` times before one
     # backward (``run_sp_looped_endpoint``). DDP's default ``broadcast_buffers=True``
     # does an in-place ``copy_`` on every buffer at the start of each forward —
