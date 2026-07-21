@@ -1,3 +1,6 @@
+# Sample DeepSeek-V4-Flash-Base SFT config (FSDP2 + optional EP).
+# Default optimizer is Muon + AdamW. Override with train.optimizer.type=adamw if needed.
+
 model:
   model_path: DeepSeek-V4-Flash-Base
   ops_implementation:
@@ -39,13 +42,26 @@ train:
   micro_batch_size: 1
   bsz_warmup_ratio: 0.007
   optimizer:
-    type: adamw
+    # Muon + AdamW: 2D hidden / 3D expert stacks use Muon; embed/lm_head/norms/bias use AdamW.
+    # Switch back with `type: adamw` if needed.
+    type: muon
     lr: 3.0e-4
     lr_warmup_ratio: 0.007
     lr_decay_style: constant
     lr_decay_ratio: 1.0
     weight_decay: 0.01
     max_grad_norm: 1.0
+    # match_rms_adamw: muon_lr can be omitted and inherits train.optimizer.lr
+    # muon_lr: 3.0e-4
+    muon_momentum: 0.95
+    muon_nesterov: true
+    muon_weight_decay: 0.01
+    muon_ns_steps: 5
+    # std | gram | gram_quack (default; needs gram-newton-schulz + quack on H100/B200/GB200)
+    muon_ns_implementation: gram_quack
+    muon_adjust_lr_fn: match_rms_adamw
+    # MoE + EP: whole-expert Shard(0) when (num_experts/ep_size) % ep_fsdp_size == 0
+    muon_expert_zero_comm: true
   init_device: meta
   enable_full_determinism: false
   max_steps: 1000
