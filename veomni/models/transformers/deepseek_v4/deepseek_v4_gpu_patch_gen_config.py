@@ -30,35 +30,34 @@ Patches:
    ``down_proj [E, H, I]`` layout and the gpt-oss-style ``swiglu_limit``
    clamp. Dispatch is OpSlot-guarded (``veomni_moe_experts_forward``):
    non-eager -> ``fused_moe_forward``; eager -> per-expert loop.
-4. ``DeepseekV4ForCausalLM.forward`` — OpSlot guard for fused
+4. ``DeepseekV4RMSNorm`` / ``DeepseekV4UnweightedRMSNorm`` — functional
+   OpSlot dispatch to Liger RMSNorm while preserving the two distinct class
+   layouts. The unweighted form passes ``weight=None`` to Liger's supported
+   non-affine path; eager keeps the official weighted FP32 multiply order.
+5. ``DeepseekV4MLP.forward`` — shared experts always apply the official
+   ``swiglu_limit`` clamp, then optionally fuse silu*mul via Liger when the
+   SwiGLU OpSlot is non-eager. Routed experts remain on the fused-MoE path
+   above so their clamp is kept there too.
+6. ``DeepseekV4ForCausalLM.forward`` — OpSlot guard for fused
    cross-entropy (``veomni_causal_lm_loss``) + ``MoeCausalLMOutputWithLogProbs``
    so callers can read per-token log-probs / entropy alongside the loss.
-5. ``DeepseekV4RMSNorm.forward`` — matches the official inference path's
-   FP32 weight multiply followed by a single cast to the input dtype.
-6. ``DeepseekV4RotaryEmbedding.forward`` — retains FP32 cos/sin tables for
+7. ``DeepseekV4RotaryEmbedding.forward`` — retains FP32 cos/sin tables for
    official-compatible inference and casts them to the activation dtype during
    training so FSDP activation-checkpoint recomputation sees stable metadata.
-7. ``DeepseekV4Attention.forward`` — matches the official BF16 per-head Q
+8. ``DeepseekV4HyperConnections.pre`` / ``DeepseekV4HyperConnections.post`` /
+   ``DeepseekV4HyperConnections.head`` — optional TileKernels mHC dispatch
+   selected by ``mhc_implementation=tilelang``.
+9. ``DeepseekV4Attention.forward`` — matches the official BF16 per-head Q
    normalization before RoPE.
-8. ``DeepseekV4TopKRouter.forward`` / ``DeepseekV4HashRouter.forward`` —
+10. ``DeepseekV4TopKRouter.forward`` / ``DeepseekV4HashRouter.forward`` —
    always perform the official FP32 router projection.
-9. ``DeepseekV4MLP.forward`` — applies the official FP32, clamped SwiGLU
-   used by shared experts before casting back for the down projection.
-10. Register ``get_parallel_plan`` on ``DeepseekV4ForCausalLM``.
+11. Register ``get_parallel_plan`` on ``DeepseekV4ForCausalLM``.
 
 Intentionally NOT patched:
 
-- ``DeepseekV4UnweightedRMSNorm`` — DeepSeek-V4 ships two RMSNorm flavours;
-  the unweighted form used inside the HCA/CSA compressors already matches the
-  official inference path. The weighted form is patched above without using
-  LigerRMSNorm, whose replacement would shadow the distinct unweighted
-  variant. Batch-invariant RMSNorm remains a separate runtime concern for
-  future ``device_patch.py`` infra (mirroring DeepseekV3).
-- ``LigerSwiGLUMLP`` — ``DeepseekV4MLP`` is used as ``shared_experts`` with
-  a custom ``moe_intermediate_size`` (via
-  ``attribute_map["intermediate_size"] = "moe_intermediate_size"``).
-  ``LigerSwiGLUMLP.__init__`` rejects that construction pattern, so the
-  existing class is retained and only its forward arithmetic is patched.
+- Class-level ``LigerSwiGLUMLP`` / ``LigerRMSNorm`` replacement — keep the
+  native V4 constructors (unweighted norm layout and shared-expert
+  ``moe_intermediate_size`` mapping) and only swap arithmetic through OpSlots.
 - ``apply_rotary_pos_emb`` — DeepSeek-V4 uses a *partial* RoPE (the
   trailing ``qk_rope_head_dim`` slice only, with the leading nope channels
   untouched) plus an interleaved ``repeat_interleave(2)`` cos/sin layout
@@ -122,6 +121,9 @@ from veomni.utils.model_outputs import MoeCausalLMOutputWithLogProbs
 # runtime slots used by the generated modeling are bound at model-build
 # time by ``_bind_veomni_ops()`` in ``veomni/models/auto.py``.
 veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
+veomni_rms_norm = OpSlot("rms_norm", "standard")
+veomni_unweighted_rms_norm = OpSlot("rms_norm", "unweighted")
+veomni_swiglu_mlp = OpSlot("swiglu_mlp", "standard")
 veomni_moe_experts_forward = OpSlot("moe_experts", "standard")
 veomni_load_balancing_loss = OpSlot("load_balancing_loss", "standard")
 veomni_mhc_pre = OpSlot("mhc", "pre")
@@ -169,6 +171,9 @@ config.add_post_import_block(
     """
     from veomni.ops.dispatch import OpSlot, OpsConfigSlot
     veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
+    veomni_rms_norm = OpSlot("rms_norm", "standard")
+    veomni_unweighted_rms_norm = OpSlot("rms_norm", "unweighted")
+    veomni_swiglu_mlp = OpSlot("swiglu_mlp", "standard")
     veomni_moe_experts_forward = OpSlot("moe_experts", "standard")
     veomni_load_balancing_loss = OpSlot("load_balancing_loss", "standard")
     veomni_mhc_pre = OpSlot("mhc", "pre")
@@ -181,18 +186,32 @@ config.add_post_import_block(
 
 
 # ================================================================
-# Patch: official weighted RMSNorm precision order
+# Patch: DeepSeek V4 RMSNorm dispatch
 # ================================================================
 @config.override_method(
     "DeepseekV4RMSNorm.forward",
-    description="Multiply normalized activations and weights in FP32 before casting to the input dtype",
+    description="OpSlot guard for Liger fused weighted RMSNorm with official eager FP32 fallback",
 )
 def deepseek_v4_rms_norm_forward_patched(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    if veomni_rms_norm.use_non_eager_impl:
+        return veomni_rms_norm(hidden_states, self.weight, self.variance_epsilon)
+
     input_dtype = hidden_states.dtype
     hidden_states = hidden_states.float()
     variance = hidden_states.square().mean(-1, keepdim=True)
     hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
     return (self.weight.float() * hidden_states).to(input_dtype)
+
+
+@config.override_method(
+    "DeepseekV4UnweightedRMSNorm.forward",
+    description="OpSlot guard for Liger fused unweighted RMSNorm",
+)
+def deepseek_v4_unweighted_rmsnorm_forward_patched(self, x: torch.Tensor) -> torch.Tensor:
+    if veomni_unweighted_rms_norm.use_non_eager_impl:
+        return veomni_unweighted_rms_norm(x, None, self.eps)
+
+    return x * torch.rsqrt(x.float().square().mean(-1, keepdim=True) + self.eps).to(x.dtype)
 
 
 # ================================================================
@@ -971,15 +990,19 @@ class PatchedDeepseekV4Experts(nn.Module):
 
 # ================================================================
 # Patch: DeepseekV4MLP.forward
-# The shared expert uses the same FP32 clamped SwiGLU as official inference.
-# Keep the existing class because its V4-specific intermediate-size mapping
-# is incompatible with LigerSwiGLUMLP construction.
+# Shared experts can use functional Liger SwiGLU via OpSlot. Keep the class
+# because its V4-specific intermediate-size mapping is incompatible with
+# LigerSwiGLUMLP construction. Eager fallback retains official FP32 clamp.
 # ================================================================
 @config.override_method(
     "DeepseekV4MLP.forward",
-    description="Match official FP32 clamped SwiGLU arithmetic for shared experts",
+    description="Clamp-aware shared-expert SwiGLU with optional Liger fused silu-mul",
 )
 def deepseek_v4_mlp_forward_patched(self, x: torch.Tensor) -> torch.Tensor:
+    # Official DeepSeek-V4 shared experts clamp gate/up before silu*mul. Apply
+    # that first, then optionally fuse only the silu*mul via Liger. The generic
+    # ``veomni_swiglu_mlp(self, x)`` path re-runs projections without clamp and
+    # would change arithmetic under the default ``swiglu_limit``.
     dtype = x.dtype
     gate = self.gate_proj(x).float().clamp(max=self.config.swiglu_limit)
     up = (
@@ -990,6 +1013,11 @@ def deepseek_v4_mlp_forward_patched(self, x: torch.Tensor) -> torch.Tensor:
             max=self.config.swiglu_limit,
         )
     )
+    if veomni_swiglu_mlp.use_non_eager_impl:
+        from liger_kernel.ops.swiglu import LigerSiLUMulFunction
+
+        return self.down_proj(LigerSiLUMulFunction.apply(gate.to(dtype), up.to(dtype)))
+
     hidden_states = self.act_fn(gate) * up
     return self.down_proj(hidden_states.to(dtype))
 

@@ -40,7 +40,8 @@ def test_deepseek_v4_test_overrides_keep_eager_attention_and_expected_moe():
 
     overrides = resolve_ops_overrides("deepseek_v4")
 
-    expected_moe = "eager" if is_torch_npu_available() else "fused_triton"
+    is_npu = is_torch_npu_available()
+    expected_moe = "eager" if is_npu else "fused_triton"
     assert "--model.ops_implementation.attn_implementation=eager" in overrides
     assert f"--model.ops_implementation.moe_implementation={expected_moe}" in overrides
 
