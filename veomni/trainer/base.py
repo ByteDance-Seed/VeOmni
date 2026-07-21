@@ -66,6 +66,7 @@ from ..models import build_foundation_model, build_tokenizer
 from ..ops.batch_invariant_ops import set_batch_invariant_mode
 from ..optim import build_lr_scheduler, build_optimizer
 from ..utils import helper, logging
+from ..utils.checkpoint_utils import should_skip_hf_weight_load
 from ..utils.device import (
     get_device_type,
     get_dist_comm_backend,
@@ -527,7 +528,10 @@ class BaseTrainer(Stateful, ABC):
         # Full DCP resume already contains model weights. Skip the HF materialize
         # pass to avoid a second peak (HF load then DCP overwrite) that can OOM
         # large MoE jobs on resume. LoRA DCPs are trainable-only and still need HF base.
-        skip_weights_load = args.train.checkpoint.load_path is not None and not bool(args.model.lora_config)
+        skip_weights_load = should_skip_hf_weight_load(
+            args.train.checkpoint.load_path,
+            args.model.lora_config,
+        )
         if skip_weights_load:
             logger.info_rank0(
                 f"DCP resume enabled (load_path={args.train.checkpoint.load_path}); "

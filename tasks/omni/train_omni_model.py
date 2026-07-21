@@ -27,6 +27,7 @@ from veomni.models import save_model_assets, save_model_weights
 from veomni.models.seed_omni import SeedOmniModel, build_omni_model, build_omni_processor
 from veomni.optim import build_lr_scheduler, build_optimizer
 from veomni.utils import helper
+from veomni.utils.checkpoint_utils import should_skip_hf_weight_load
 from veomni.utils.device import get_device_type, get_torch_device, synchronize
 from veomni.utils.dist_utils import all_reduce
 from veomni.utils.model_utils import pretty_print_trainable_parameters
@@ -250,8 +251,9 @@ def main():
     if hasattr(model, "get_parallel_plan"):
         cpu_load_param_name = getattr(model.get_parallel_plan(), "cpu_load_param_name", None)
 
-    skip_weights_load = args.train.checkpoint.load_path is not None and not bool(
-        getattr(args.model, "lora_config", None)
+    skip_weights_load = should_skip_hf_weight_load(
+        args.train.checkpoint.load_path,
+        getattr(args.model, "lora_config", None),
     )
     if skip_weights_load:
         logger.info_rank0(

@@ -70,8 +70,7 @@ class TestOptimizerStateNoFill:
 
 
 class TestAllowPartialLoad:
-    """DistributedCheckpointer.load() must pass allow_partial_load=True
-    to DCP so checkpoints saved without placeholder state can be loaded."""
+    """DCP load may be partial for optimizer state, but not full model state."""
 
     def test_load_uses_allow_partial_load_planner(self):
         from veomni.checkpoint.dcp_checkpointer import DefaultLoadPlanner
@@ -102,6 +101,35 @@ class TestAllowPartialLoad:
         planner = mock_dcp.load.call_args.kwargs.get("planner")
         assert planner is not None, "load must pass a planner"
         assert planner.allow_partial_load is True, "load must use DefaultLoadPlanner(allow_partial_load=True)"
+        assert planner.strict_model is True, "full-model load must reject missing model keys"
+
+    @patch("veomni.checkpoint.dcp_checkpointer.get_parallel_state")
+    def test_full_model_load_rejects_missing_checkpoint_key(self, mock_gps, tmp_path):
+        from torch.distributed.checkpoint import CheckpointException
+
+        from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
+
+        mock_gps.return_value = SimpleNamespace(dp_mode="fsdp2")
+        torch.distributed.checkpoint.save({"model": {"weight": torch.full((2, 2), 7.0)}}, checkpoint_id=tmp_path)
+
+        model = nn.Linear(2, 2)
+        with pytest.raises(CheckpointException, match=r"model\.bias"):
+            DistributedCheckpointer.load(path=str(tmp_path), state={"model": model})
+
+    @patch("veomni.checkpoint.dcp_checkpointer.get_parallel_state")
+    def test_trainable_only_model_load_allows_missing_frozen_key(self, mock_gps, tmp_path):
+        from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
+
+        mock_gps.return_value = SimpleNamespace(dp_mode="fsdp2")
+        torch.distributed.checkpoint.save({"model": {"weight": torch.full((2, 2), 7.0)}}, checkpoint_id=tmp_path)
+
+        model = nn.Linear(2, 2)
+        with torch.no_grad():
+            model.bias.fill_(11.0)
+        DistributedCheckpointer.load(path=str(tmp_path), state={"model": model}, trainable_only=True)
+
+        torch.testing.assert_close(model.weight, torch.full_like(model.weight, 7.0))
+        torch.testing.assert_close(model.bias, torch.full_like(model.bias, 11.0))
 
 
 # ---------------------------------------------------------------------------
