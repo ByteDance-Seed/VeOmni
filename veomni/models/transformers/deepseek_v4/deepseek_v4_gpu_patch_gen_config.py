@@ -48,7 +48,8 @@ Patches:
    ``DeepseekV4HyperConnections.head`` — optional TileKernels mHC dispatch
    selected by ``mhc_implementation=tilelang``.
 9. ``DeepseekV4Attention.forward`` — matches the official BF16 per-head Q
-   normalization before RoPE.
+   normalization before RoPE, and adds Ulysses SP (Q head all-to-all + MQA
+   sequence all-gather around compressors / sparse attention).
 10. ``DeepseekV4TopKRouter.forward`` / ``DeepseekV4HashRouter.forward`` —
    always perform the official FP32 router projection.
 11. Register ``get_parallel_plan`` on ``DeepseekV4ForCausalLM``.
@@ -63,23 +64,15 @@ Intentionally NOT patched:
   untouched) plus an interleaved ``repeat_interleave(2)`` cos/sin layout
   that ``liger_rotary_pos_emb`` does not implement. SKILL.md flags this
   exact case (partial_rotary -> liger NaN).
-- ``DeepseekV4Attention.forward`` — V4 attention is eager-only
+- ``DeepseekV4Attention.forward`` remains eager/TileLang-only
   (``_supports_flash_attn = False`` / ``_supports_sdpa = False`` /
   ``_supports_flex_attn = False``: ``head_dim=512`` exceeds FlashAttention's
   256 cap, SDPA lacks the per-head learnable sink, and FlexAttention can't
   resize BlockMask after the in-block compressor concatenation). MoE does not
   share this limitation: the experts patch above binds VeOmni fused MoE by
-  default on GPU. The module-level eager attention interface is patched for
-  optional TileLang sparse dispatch without changing the class forward
-  contract. Sequence parallel for V4 attention is out of scope for this
-  patchgen pass and needs a dedicated eager-SP path before the model can train
-  under SP.
-- ``DeepseekV4Model.forward`` — top-level ``hidden_states`` is *4D*
-  (``[B, S, hc_mult, D]`` for the manifold-constrained Hyper-Connection
-  residual stack); existing VeOmni SP collators assume 3D
-  ``[B, S, D]`` at the embed boundary. Leaving the upstream forward
-  untouched keeps single-rank training / inference correct while a 4D-aware
-  SP path is designed.
+  default on GPU. Ulysses SP is handled inside the patched attention forward
+  (head all-to-all on Q + sequence all-gather on MQA KV / compressor inputs)
+  rather than via FA's ``veomni_flash_attention_*_with_sp`` path.
 """
 
 from typing import Optional
@@ -132,6 +125,12 @@ veomni_mhc_head = OpSlot("mhc", "head")
 veomni_dsa_indexer_implementation = OpsConfigSlot("dsa_indexer_implementation")
 veomni_dsa_attention_implementation = OpsConfigSlot("dsa_attention_implementation")
 
+# Names resolved at codegen time from generated imports.
+get_parallel_state = None
+gather_seq_scatter_heads = None
+gather_heads_scatter_seq = None
+gather_outputs = None
+
 
 config = PatchConfig(
     source_module="transformers.models.deepseek_v4.modeling_deepseek_v4",
@@ -143,6 +142,14 @@ config.add_import("veomni.ops", names=["fused_moe_forward"])
 config.add_import(
     "veomni.ops.kernels.deepseek_v4",
     names=["sparse_attn_tilelang", "v4_lighting_indexer"],
+)
+config.add_import(
+    "veomni.distributed.parallel_state",
+    names=["get_parallel_state"],
+)
+config.add_import(
+    "veomni.distributed.sequence_parallel",
+    names=["gather_heads_scatter_seq", "gather_outputs", "gather_seq_scatter_heads"],
 )
 config.add_import(
     "veomni.models.transformers.deepseek_v4.packed_utils",
@@ -656,10 +663,13 @@ def deepseek_v4_indexer_forward_patched(
 # ================================================================
 # Patch: DeepseekV4Attention.forward
 # 1. Pass the collator-provided packed sequence slices into compressors.
+# 2. Ulysses SP: all-to-all Q heads, sequence all-gather for MQA KV and
+#    compressor inputs (windows/indexers need the full sequence), then
+#    scatter attention outputs back to the local sequence shard.
 # ================================================================
 @config.override_method(
     "DeepseekV4Attention.forward",
-    description="Forward packed sequence boundaries to HCA and CSA compressors",
+    description="Packed compressor path + Ulysses SP for DeepSeek-V4 eager/TileLang attention",
 )
 def deepseek_v4_attention_forward_patched(
     self,
@@ -686,12 +696,43 @@ def deepseek_v4_attention_forward_patched(
     if past_key_values is not None:
         kv = past_key_values.update(kv, kv, self.layer_idx)[0]
 
+    ulysses_enabled = get_parallel_state().ulysses_enabled
+    compressor_hidden = hidden_states
+    compressor_q_residual = q_residual
+    compressor_position_ids = position_ids
+    s_aux = self.sinks
+    if ulysses_enabled:
+        if past_key_values is not None:
+            raise RuntimeError("DeepSeek-V4 Ulysses SP does not support KV-cache decode")
+        ulysses_group = get_parallel_state().ulysses_group
+        ulysses_size = get_parallel_state().ulysses_size
+        ulysses_rank = get_parallel_state().ulysses_rank
+        if self.num_heads % ulysses_size != 0:
+            raise ValueError(
+                f"DeepSeek-V4 Ulysses SP requires num_attention_heads ({self.num_heads}) "
+                f"divisible by ulysses_size ({ulysses_size})"
+            )
+        local_num_heads = self.num_heads // ulysses_size
+        # Compressors / Lightning Indexer window across the full sequence, so
+        # gather the local shard before running them. Q uses true Ulysses
+        # head/sequence exchange; MQA KV stays single-head and is all-gathered.
+        compressor_hidden = gather_outputs(hidden_states, gather_dim=1, group=ulysses_group)
+        compressor_q_residual = gather_outputs(q_residual, gather_dim=1, group=ulysses_group)
+        compressor_position_ids = gather_outputs(position_ids, gather_dim=-1, group=ulysses_group)
+        # Use the same [B, S, H, D] Ulysses layout as FA (seq_dim=1, head_dim=2).
+        q = q.transpose(1, 2).contiguous()
+        q = gather_seq_scatter_heads(q, seq_dim=1, head_dim=2, group=ulysses_group)
+        q = q.transpose(1, 2).contiguous()
+        kv = gather_outputs(kv, gather_dim=2, group=ulysses_group)
+        head_start = ulysses_rank * local_num_heads
+        s_aux = self.sinks.narrow(0, head_start, local_num_heads).contiguous()
+
     block_bias = None
     if self.compressor is not None:
         compressed_kv, block_bias = self.compressor(
-            hidden_states,
-            q_residual,
-            position_ids,
+            compressor_hidden,
+            compressor_q_residual,
+            compressor_position_ids,
             past_key_values,
             self.layer_idx,
             packed_sequence_slices=kwargs.get("packed_sequence_slices"),
@@ -708,6 +749,7 @@ def deepseek_v4_attention_forward_patched(
     attention_interface = ALL_ATTENTION_FUNCTIONS.get_interface(
         self.config._attn_implementation, eager_attention_forward
     )
+    kwargs = {key: value for key, value in kwargs.items() if key != "s_aux"}
     attn_output, attn_weights = attention_interface(
         self,
         q,
@@ -717,9 +759,15 @@ def deepseek_v4_attention_forward_patched(
         dropout=0.0 if not self.training else self.attention_dropout,
         scaling=self.scaling,
         sliding_window=self.sliding_window,
-        s_aux=self.sinks,
+        s_aux=s_aux,
         **kwargs,
     )
+
+    if ulysses_enabled:
+        # eager/TileLang return [B, S_full, H_local, D]; restore local seq + full heads.
+        attn_output = gather_heads_scatter_seq(
+            attn_output, head_dim=2, seq_dim=1, group=get_parallel_state().ulysses_group
+        )
 
     attn_output = apply_rotary_pos_emb(attn_output.transpose(1, 2), cos, -sin).transpose(1, 2)
     grouped = attn_output.reshape(*input_shape, self.config.o_groups, -1)
@@ -782,10 +830,11 @@ def deepseek_v4_eager_attention_forward_patched(
         _, topk_indices = allowed.to(torch.int8).topk(selected_width, dim=-1, sorted=False)
         selected_valid = allowed.gather(-1, topk_indices)
         topk_indices = topk_indices.to(torch.int32).masked_fill(~selected_valid, -1).contiguous()
+        sinks = kwargs.get("s_aux", module.sinks)
         attn_output = sparse_attn_tilelang(
             query.transpose(1, 2).contiguous(),
             key[:, 0].contiguous(),
-            module.sinks.float().contiguous(),
+            sinks.float().contiguous(),
             topk_indices,
             scaling,
         )
@@ -793,13 +842,18 @@ def deepseek_v4_eager_attention_forward_patched(
     # --- Patch.1 ---
 
     # --- Patch.2 ---
-    key_states = repeat_kv(key, module.num_key_value_groups)
-    value_states = repeat_kv(value, module.num_key_value_groups)
+    # Under Ulysses SP, ``query`` only holds a head shard while the module still
+    # reports the full ``num_key_value_groups``. Expand KV to the *local* query
+    # head count so matmul shapes stay consistent.
+    n_rep = query.shape[1] // key.shape[1]
+    key_states = repeat_kv(key, n_rep)
+    value_states = repeat_kv(value, n_rep)
     attn_weights = torch.matmul(query, key_states.transpose(2, 3)) * scaling
     if attention_mask is not None:
         attn_weights = attn_weights + attention_mask
 
-    sinks = module.sinks.reshape(1, -1, 1, 1).expand(query.shape[0], -1, query.shape[-2], -1)
+    sinks = kwargs.get("s_aux", module.sinks)
+    sinks = sinks.reshape(1, -1, 1, 1).expand(query.shape[0], -1, query.shape[-2], -1)
     combined_logits = torch.cat([attn_weights, sinks], dim=-1)
     combined_logits = combined_logits - combined_logits.max(dim=-1, keepdim=True).values
     probs = F.softmax(combined_logits, dim=-1, dtype=combined_logits.dtype)
@@ -815,10 +869,15 @@ def deepseek_v4_eager_attention_forward_patched(
 # Patch: DeepseekV4Model.forward
 # 1. Convert collator-provided cu-seqlens into reusable packed slices once.
 # 2. Keep use_cache=False forwards stateless so the TileLang indexer can run.
+# 3. Under Ulysses SP the collator keeps full ``attention_mask`` /
+#    ``cu_seq_lens_*`` while slicing ``input_ids`` / local ``position_ids``.
+#    Build the sliding-window mask and packed compression metadata on the full
+#    sequence length so attention matches non-SP semantics after the all-gather
+#    inside ``DeepseekV4Attention``.
 # ================================================================
 @config.override_method(
     "DeepseekV4Model.forward",
-    description="Propagate packed boundaries and preserve stateless indexer dispatch",
+    description="Packed boundaries, SP-aware full-sequence masks, stateless indexer dispatch",
 )
 def deepseek_v4_model_forward_patched(
     self,
@@ -846,21 +905,34 @@ def deepseek_v4_model_forward_patched(
         position_ids = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device) + past_seen
         position_ids = position_ids.unsqueeze(0)
 
+    ulysses_enabled = get_parallel_state().ulysses_enabled
+    ulysses_group = get_parallel_state().ulysses_group if ulysses_enabled else None
+    ulysses_size = get_parallel_state().ulysses_size if ulysses_enabled else 1
+    local_seq_len = inputs_embeds.shape[1]
+    full_seq_len = local_seq_len * ulysses_size if ulysses_enabled else local_seq_len
+    full_position_ids = (
+        gather_outputs(position_ids, gather_dim=-1, group=ulysses_group) if ulysses_enabled else position_ids
+    )
+
     cu_seq_lens_q = kwargs.get("cu_seq_lens_q")
     if isinstance(cu_seq_lens_q, torch.Tensor) and inputs_embeds.shape[0] == 1:
         boundaries = cu_seq_lens_q.detach().cpu().tolist()
-        if boundaries[0] != 0 or boundaries[-1] != inputs_embeds.shape[1]:
+        if boundaries[0] != 0 or boundaries[-1] != full_seq_len:
             raise ValueError(
                 "DeepSeek V4 packed cu_seq_lens_q must span the full sequence; "
-                f"got {boundaries} for length {inputs_embeds.shape[1]}"
+                f"got {boundaries} for length {full_seq_len}"
             )
         packed_sequence_slices = tuple(zip(boundaries[:-1], boundaries[1:], strict=True))
         kwargs["packed_sequence_slices"] = packed_sequence_slices
         compress_rates = tuple(self.config.compress_rates.values())
         hca_rate = self.config.compress_rates["heavily_compressed_attention"]
+        # Metadata is indexed by global positions / cu-seqlens; under SP the
+        # collator already provides full-sequence cu-seqlens while local embeds
+        # are only one shard, so materialize a full-length reference tensor.
+        metadata_reference = inputs_embeds.new_empty(inputs_embeds.shape[0], full_seq_len, inputs_embeds.shape[-1])
         kwargs["packed_compression_metadata"] = build_packed_compression_metadata(
-            inputs_embeds,
-            position_ids,
+            metadata_reference,
+            full_position_ids,
             packed_sequence_slices,
             compress_rates,
             block_bias_rates=(hca_rate,),
@@ -873,12 +945,19 @@ def deepseek_v4_model_forward_patched(
     if isinstance(attention_mask, dict):
         causal_mask = next(iter(attention_mask.values()))
     else:
+        mask_embeds = inputs_embeds
+        mask_position_ids = position_ids
+        if ulysses_enabled:
+            # SP collator keeps the full 2D attention_mask while slicing
+            # input_ids; build the 4D sliding-window mask on the full length.
+            mask_embeds = inputs_embeds.new_empty(inputs_embeds.shape[0], full_seq_len, inputs_embeds.shape[-1])
+            mask_position_ids = full_position_ids
         causal_mask = create_sliding_window_causal_mask(
             config=self.config,
-            inputs_embeds=inputs_embeds,
+            inputs_embeds=mask_embeds,
             attention_mask=attention_mask,
             past_key_values=past_key_values,
-            position_ids=position_ids,
+            position_ids=mask_position_ids,
         )
     if "packed_sequence_slices" in kwargs:
         causal_mask = isolate_packed_causal_mask_(causal_mask, kwargs["packed_sequence_slices"])
