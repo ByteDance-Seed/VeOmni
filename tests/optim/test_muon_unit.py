@@ -20,6 +20,8 @@ import pytest
 import torch
 import torch.nn as nn
 
+from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type
+
 
 muon_module = pytest.importorskip("torch.optim._muon")
 from torch.optim import Muon as UpstreamMuon  # noqa: E402
@@ -325,10 +327,10 @@ class TestGramNewtonSchulz:
         assert out.shape == x.shape
         assert torch.isfinite(out).all()
 
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+    @pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="CUDA required")
     def test_package_kernel_optional(self):
         pytest.importorskip("gram_newton_schulz")
-        x = torch.randn(2, 256, 1024, device="cuda", dtype=torch.bfloat16)
+        x = torch.randn(2, 256, 1024, device=get_device_type(), dtype=torch.bfloat16)
         out = run_newton_schulz(
             x,
             ns_coefficients=DEFAULT_NS_COEFFICIENTS,
