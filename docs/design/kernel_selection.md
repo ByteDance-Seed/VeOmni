@@ -25,7 +25,7 @@ selection knob.
 | Vision rotary embedding | `rotary_pos_emb_vision_implementation` | `eager`, `npu` | `"eager"` | Model registration via ops config singleton |
 | Gated RMSNorm | `rms_norm_gated_implementation` | `eager`, `fla`, `npu` | `"fla"` (GPU) | Qwen3.5 OpSlot binding |
 | Causal Conv1D | `causal_conv1d_implementation` | `eager`, `fla`, `npu` | `"fla"` (GPU) | Qwen3.5 OpSlot binding |
-| Gated delta rule | `chunk_gated_delta_rule_implementation` | `eager`, `fla`, `flash_qla` (SM90), `npu` | `"fla"` (GPU) | Qwen3.5 OpSlot binding |
+| Gated delta rule | `chunk_gated_delta_rule_implementation` | `eager`, `fla`, `flash_qla` (SM90), `npu`, `npu_ascendc` | `"fla"` (GPU) | Qwen3.5 OpSlot binding |
 | Load-balancing loss | `load_balancing_loss_implementation` | `eager`, `triton` (CUDA; NPU config normalizes this default to `eager`) | `"triton"` | `apply_ops_config()` (before model build) |
 | MoE experts | `moe_implementation` | `eager`, `fused_triton`, `fused_quack` (SM90+), `fused_npu` | `"fused_triton"` (GPU) | `build_foundation_model` |
 
@@ -292,12 +292,16 @@ model:
 |---|---|---|---|
 | `rms_norm_gated_implementation` | `fla` | `npu` | HuggingFace reference implementation |
 | `causal_conv1d_implementation` | `fla` | `npu` | No `cu_seqlens` path |
-| `chunk_gated_delta_rule_implementation` | `fla`, `flash_qla` (SM90 only) | `npu` | No `cu_seqlens` path |
+| `chunk_gated_delta_rule_implementation` | `fla`, `flash_qla` (SM90 only) | `npu`, `npu_ascendc` | No `cu_seqlens` path |
 
 The NPU gated RMSNorm uses `torch_npu`. The NPU causal Conv1D and gated
-delta-rule implementations additionally require `triton-ascend`. Registrations
-live in `veomni/ops/kernels/gated_delta_rule/__init__.py`; field defaults and
-allowed values are documented by `OpsImplementationConfig`.
+delta-rule implementations additionally require `triton-ascend`. For the gated
+delta rule there are two NPU backends: `npu` (the vendored MindSpeed-MM Triton
+kernel) and `npu_ascendc` (an AscendC fused `torch.ops.npu.*` path), the latter
+requiring a manual `fla_npu` install and `ASCEND_CUSTOM_OPP_PATH` exported before
+process start. Registrations live in
+`veomni/ops/kernels/gated_delta_rule/__init__.py`; field defaults and allowed
+values are documented by `OpsImplementationConfig`.
 
 ---
 

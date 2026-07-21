@@ -36,11 +36,18 @@ Backends per op:
 - ``rms_norm_gated``: ``fla`` (GPU), ``npu``.
 - ``causal_conv1d``: ``fla`` (GPU), ``npu``.
 - ``chunk_gated_delta_rule``: ``fla`` (GPU), ``flash_qla`` (GPU ``gpu`` extra,
-  Hopper SM90), ``npu``.
+  Hopper SM90), ``npu`` (vendored Triton), ``npu_ascendc`` (AscendC fused ops).
 
 The ``npu`` ``causal_conv1d`` backend is a thin adapter (``npu_causal_conv1d``)
 over the vendored kernel; the ``npu`` ``chunk_gated_delta_rule`` binds the
 vendored kernel directly (its signature already matches the call site).
+
+The ``npu_ascendc`` ``chunk_gated_delta_rule`` backend is a second NPU path that
+delegates the heavy compute to the external ``fla_npu`` package
+(``torch.ops.npu.*`` fused ops, installed manually on NPU), using a few Triton
+kernels from ``_ascend/triton_core`` (a newer generation of Triton kernels) as
+glue around them. It coexists with the pure-Triton ``npu`` backend, which stays
+as the fallback.
 """
 
 from __future__ import annotations
@@ -233,5 +240,52 @@ KERNEL_REGISTRY.register(
         factory=_npu_chunk_gated_delta_rule_factory,
         hardware=HardwareRequirement(device_type="npu"),
         description="NPU vendored Triton chunk gated delta rule (varlen-aware, MindSpeed-MM)",
+    )
+)
+
+
+# ── chunk_gated_delta_rule (NPU AscendC fused) ───────────────────────────────
+
+
+def _npu_ascendc_chunk_gated_delta_rule_factory():
+    """Return the AscendC chunk gated delta rule (``npu_ascendc_gated_delta_rule``).
+
+    Unlike the pure-Triton ``npu`` backend above, this path offloads the heavy
+    GDN compute to the external ``fla_npu`` package (registered as
+    ``torch.ops.npu.*`` fused ops), wrapping a few ``_ascend/triton_core`` Triton
+    kernels around them as glue. The underlying ``flash_gated_delta_rule`` entry
+    expects ``q/k/v`` in ``[B, H, T, D]``, but the ``Qwen3_5GatedDeltaNet.forward``
+    call site feeds the FLA layout ``[B, T, H, D]`` — so a thin adapter
+    (``npu_ascendc_gated_delta_rule``) transposes the seq/head dims at the op
+    boundary rather than replicating MM's per-implementation forward branching.
+
+    Lazily imported so the transitive ``torch_npu`` / ``fla_npu`` / triton-ascend
+    imports only fire when this backend is selected. ``fla_npu`` is installed
+    manually on NPU (not a declared dependency); re-raise its absence with an
+    actionable message instead of a bare ``ModuleNotFoundError``.
+    """
+    try:
+        from .npu_ascendc_gated_delta_rule import chunk_gated_delta_rule
+    except ModuleNotFoundError as e:
+        if e.name in ("fla_npu", "torch_npu"):
+            raise RuntimeError(
+                f"chunk_gated_delta_rule 'npu_ascendc' backend requires the '{e.name}' package, "
+                "which is not installed. Install fla_npu manually on NPU "
+                "(https://github.com/flashserve/flash-linear-attention-npu), or set "
+                "chunk_gated_delta_rule_implementation to 'npu' (vendored Triton) or 'eager'."
+            ) from e
+        raise
+
+    return chunk_gated_delta_rule
+
+
+KERNEL_REGISTRY.register(
+    KernelSpec(
+        name="npu_ascendc",
+        op_name="chunk_gated_delta_rule",
+        variant="standard",
+        factory=_npu_ascendc_chunk_gated_delta_rule_factory,
+        hardware=HardwareRequirement(device_type="npu"),
+        description="NPU AscendC fused chunk gated delta rule (torch.ops.npu.* via fla_npu, varlen-aware, MindSpeed-MM triton_core)",
     )
 )

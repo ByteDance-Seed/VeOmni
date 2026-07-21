@@ -207,6 +207,53 @@ model:
     chunk_gated_delta_rule_implementation: flash_qla
 ```
 
+#### `npu_ascendc` — AscendC fused backend (NPU, `chunk_gated_delta_rule` only)
+
+`npu_ascendc` is a second NPU backend for `chunk_gated_delta_rule` that delegates the heavy GDN
+compute to the external [`fla_npu`](https://github.com/flashserve/flash-linear-attention-npu)
+package (registered as `torch.ops.npu.*` fused ops); only the Triton glue stays vendored under
+`_ascend/triton_core`. It coexists with `npu` (pure vendored Triton), which remains the fallback.
+Set only `chunk_gated_delta_rule` to `npu_ascendc`; keep `rms_norm_gated` / `causal_conv1d` on `npu`:
+
+```yaml
+model:
+  ops_implementation:
+    rms_norm_gated_implementation: npu
+    causal_conv1d_implementation: npu
+    chunk_gated_delta_rule_implementation: npu_ascendc
+```
+
+`fla_npu` is not a declared VeOmni dependency (same as `triton-ascend`). It supports Ascend
+910B (A2) / 910_93 (A3) / 950 (A5); on non-arch35 chips the `solve_tril` step auto-falls-back to
+the vendored Triton kernel via `is_arch35()`.
+
+The prebuilt NPU images on [quay.io](https://quay.io/repository/ascend/veomni?tab=tags) already
+bundle `fla_npu`:
+
+- A2: `quay.io/ascend/veomni:v0.1.11-cann9.0.0-torch_npu2.10.0.post2-A2-ubuntu22.04-py3.11-veomni-latest`
+- A3: `quay.io/ascend/veomni:v0.1.11-cann9.0.0-torch_npu2.10.0.post2-A3-ubuntu22.04-py3.11-veomni-latest`
+
+To build on a bare host instead, install from the
+[`flash-linear-attention-npu`](https://github.com/flashserve/flash-linear-attention-npu) sources:
+
+```bash
+git clone https://github.com/flashserve/flash-linear-attention-npu
+cd flash-linear-attention-npu
+git checkout c2e3d83f
+
+source /usr/local/Ascend/cann/set_env.sh          # source your actual CANN path
+
+# --soc must match the chip: {ascend910b, ascend910_93, ascend950}
+bash build.sh --soc=ascend910b --pkg --vendor_name=fla_npu
+bash build_out/fla-npu_*.run
+cd torch_custom/fla_npu/ && bash build.sh
+
+pip list | grep fla_npu   # verify it is installed
+```
+
+If `fla_npu` is absent when `npu_ascendc` is selected, the backend raises an actionable error at
+`OpSlot.bind()` time (pointing back to the install step or to `npu` / `eager`).
+
 ### How It Works
 
 Qwen3.5 is a hybrid model alternating between softmax and linear attention layers:
