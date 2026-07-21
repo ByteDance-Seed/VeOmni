@@ -256,23 +256,26 @@ model:
 
 ### What gets patched
 
-For each selected backend, the model's `device_patch.py` either swaps the
-target HF class (`replace_forward=False`) or rebinds its `forward`
-(`replace_forward=True`). The summary of the Liger swap shape (the most
-common case):
+For each selected backend, a model either applies a `device_patch.py` target
+replacement or adds an OpSlot guard in its patchgen-generated `forward`.
+Functional OpSlots preserve model-specific constructors and can also pass
+model-specific arguments such as an optional RMSNorm weight:
 
 | Config field | Original | Liger replacement |
 |---|---|---|
-| `rms_norm_implementation` | `{Model}RMSNorm` | `LigerRMSNorm` |
+| `rms_norm_implementation` | `{Model}RMSNorm` | Functional Liger RMSNorm |
 | `rotary_pos_emb_implementation` | `apply_rotary_pos_emb` | `liger_rotary_pos_emb` |
-| `swiglu_mlp_implementation` | `{Model}MLP` | `LigerSwiGLUMLP` |
+| `swiglu_mlp_implementation` | `{Model}MLP.forward` | Functional Liger SwiGLU |
 
 The `npu` and `triton` backends follow the same `device_patch.py` flow — the
 only difference is the kernel callable on the other side of the registry.
 
 ### Models with Liger support
 
-Qwen2, Qwen3, Qwen3-MoE, Qwen2-VL, DeepSeek-V3, Llama, Seed-OSS.
+Qwen2, Qwen3, Qwen3-MoE, Qwen2-VL, DeepSeek-V3, DeepSeek-V4, Llama,
+Seed-OSS. DeepSeek-V4 supports weighted and unweighted RMSNorm plus a
+clamp-preserving Liger silu*mul path for shared experts; its partial
+interleaved RoPE remains eager-only.
 
 ### Key files
 

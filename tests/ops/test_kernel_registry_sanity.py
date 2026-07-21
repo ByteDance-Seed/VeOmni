@@ -90,6 +90,7 @@ class TestHardwareRequirement:
 # is "missing expected kernel" rather than "test silently passes".
 EXPECTED_NPU_OPS = [
     ("rms_norm", "standard"),
+    ("rms_norm", "unweighted"),
     ("rms_norm", "qwen3_5"),
     ("rotary_pos_emb", "full"),
     ("rotary_pos_emb_vision", "full"),

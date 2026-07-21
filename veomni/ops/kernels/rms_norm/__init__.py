@@ -67,6 +67,24 @@ KERNEL_REGISTRY.register(
 )
 
 
+def _npu_unweighted_rms_norm_factory():
+    from .npu import unweighted_rms_norm_forward_npu
+
+    return unweighted_rms_norm_forward_npu
+
+
+KERNEL_REGISTRY.register(
+    KernelSpec(
+        name="npu",
+        op_name="rms_norm",
+        variant="unweighted",
+        factory=_npu_unweighted_rms_norm_factory,
+        hardware=HardwareRequirement(device_type="npu"),
+        description="unweighted RMSNorm eager fallback on NPU",
+    )
+)
+
+
 def _npu_qwen3_5_rms_norm_factory():
     from .npu import qwen3_5_rms_norm_forward_npu
 

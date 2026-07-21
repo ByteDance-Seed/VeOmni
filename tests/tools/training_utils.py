@@ -111,16 +111,13 @@ _GPU_PER_MODEL_OVERRIDES: Dict[str, Dict[str, str]] = {
         "rms_norm_implementation": "eager",
         "rotary_pos_emb_implementation": "eager",
     },
-    # DeepSeek-V4 attention is eager-only, but MoE uses the GPU-default
-    # fused_triton backend now that the experts path forwards swiglu_limit.
-    # Keep RMSNorm/RoPE/SwiGLU eager because V4's custom unweighted norms,
-    # partial RoPE, and shared-expert MLP are intentionally not Liger-swapped.
+    # DeepSeek-V4 attention and partial interleaved RoPE are eager-only. MoE
+    # uses the GPU-default fused_triton backend, while weighted/unweighted
+    # RMSNorm and the shared-expert MLP use their default Liger OpSlots.
     "deepseek_v4": {
         "attn_implementation": "eager",
         "moe_implementation": "fused_triton",
-        "rms_norm_implementation": "eager",
         "rotary_pos_emb_implementation": "eager",
-        "swiglu_mlp_implementation": "eager",
     },
 }
 
