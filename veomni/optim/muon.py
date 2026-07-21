@@ -302,16 +302,16 @@ def run_newton_schulz(
     ns_coefficients: Sequence[Any] = DEFAULT_NS_COEFFICIENTS,
     ns_steps: int = DEFAULT_NS_STEPS,
     eps: float = EPS,
-    ns_implementation: str = "std",
+    ns_implementation: str = "gram_quack",
     gram_ns_reset_iterations: Sequence[int] = (2,),
     compute_dtype: Optional[torch.dtype] = None,
 ) -> Tensor:
     """Dispatch Newton-Schulz / Gram Newton-Schulz for a ``[..., M, K]`` update.
 
     ``ns_implementation``:
-      - ``std``: default torch Muon-compatible Newton-Schulz
+      - ``std``: torch Muon-compatible Newton-Schulz
       - ``gram``: pure-PyTorch Gram Newton-Schulz
-      - ``gram_quack``: quack CuTeDSL GEMM kernels (falls back to ``gram`` if unavailable)
+      - ``gram_quack`` (default): quack CuTeDSL GEMM kernels (falls back to ``gram`` if unavailable)
     """
     if ns_implementation not in NS_IMPLEMENTATIONS:
         raise ValueError(f"Unknown ns_implementation={ns_implementation!r}; expected one of {NS_IMPLEMENTATIONS}")
@@ -494,7 +494,7 @@ class DistributedMuon(Optimizer):
         eps: float = EPS,
         ns_steps: int = DEFAULT_NS_STEPS,
         adjust_lr_fn: Optional[str] = None,
-        ns_implementation: str = "std",
+        ns_implementation: str = "gram_quack",
         gram_ns_reset_iterations: Sequence[int] = (2,),
     ) -> None:
         if not _MUON_AVAILABLE:
@@ -554,7 +554,7 @@ class DistributedMuon(Optimizer):
             ns_steps = int(group["ns_steps"])
             eps = float(group["eps"])
             adjust_lr_fn = group["adjust_lr_fn"]
-            ns_implementation = str(group.get("ns_implementation", "std"))
+            ns_implementation = str(group.get("ns_implementation", "gram_quack"))
             gram_ns_reset_iterations = tuple(group.get("gram_ns_reset_iterations", (2,)))
 
             for p in group["params"]:
@@ -611,7 +611,7 @@ class DistributedMuon(Optimizer):
         ns_coefficients: Tuple[float, float, float],
         ns_steps: int,
         eps: float,
-        ns_implementation: str = "std",
+        ns_implementation: str = "gram_quack",
         gram_ns_reset_iterations: Sequence[int] = (2,),
     ) -> Tensor:
         """Run Newton-Schulz on ``update`` according to its layout kind."""

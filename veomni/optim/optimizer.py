@@ -553,7 +553,7 @@ def _build_muon_with_adamw(
 
     muon_lr = float(muon_kwargs.get("lr", 2e-2))
     adjust_lr_fn = muon_kwargs.get("adjust_lr_fn", "match_rms_adamw")
-    ns_implementation = muon_kwargs.get("ns_implementation", "std")
+    ns_implementation = muon_kwargs.get("ns_implementation", "gram_quack")
     ns_steps = int(muon_kwargs.get("ns_steps", 5))
     lr_source = (
         "explicit"
@@ -599,7 +599,7 @@ def _build_muon_with_adamw(
             eps=muon_kwargs.get("eps", 1e-7),
             ns_steps=muon_kwargs.get("ns_steps", 5),
             adjust_lr_fn=muon_kwargs.get("adjust_lr_fn", "match_rms_adamw"),
-            ns_implementation=muon_kwargs.get("ns_implementation", "std"),
+            ns_implementation=muon_kwargs.get("ns_implementation", "gram_quack"),
             gram_ns_reset_iterations=muon_kwargs.get("gram_ns_reset_iterations", (2,)),
         )
 

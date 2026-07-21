@@ -135,6 +135,7 @@ class TestNumerics:
             momentum=0.9,
             nesterov=True,
             adjust_lr_fn="match_rms_adamw",
+            ns_implementation="std",  # match upstream torch.optim.Muon NS path
         )
 
         torch.manual_seed(7)
