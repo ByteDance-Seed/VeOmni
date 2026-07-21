@@ -606,9 +606,11 @@ class BaseTrainer(Stateful, ABC):
         # (EnvironMeter, DCP checkpointer) are handed the state directly, so
         # no ambient ``use_parallel_state`` scope is needed around hook dispatch.
         #
-        # ``channel_loss_callback`` is ordered after the meter (which resets
-        # ``step_*_metrics`` in ``on_step_end``) and before ``wandb`` (which
-        # logs them), so its per-source metrics survive into the logged payload.
+        # ``channel_loss_callback`` is ordered after the meter for
+        # ``on_step_end`` (the meter resets ``step_*_metrics``) and before
+        # ``wandb`` (which logs them), so its per-source metrics survive into
+        # the logged payload. ``on_step_begin`` snapshots channel metadata first
+        # because multi-source accounting consumes it.
         self._callbacks = [
             self.environ_meter_callback,
             self.tqdm_callback,
@@ -639,7 +641,14 @@ class BaseTrainer(Stateful, ABC):
             callback.on_epoch_end(self.state)
 
     def on_step_begin(self, micro_batches=None, **kwargs):
+        # Multi-source accounting consumes ``ds_idx`` / ``source_name`` from the
+        # micro-batches. Channel loss must snapshot that metadata first, while
+        # keeping its on_step_end position after the meter so its metrics are not
+        # overwritten by the meter's per-step reset.
+        self.channel_loss_callback.on_step_begin(self.state, micro_batches=micro_batches, **kwargs)
         for callback in self._callbacks:
+            if callback is self.channel_loss_callback:
+                continue
             callback.on_step_begin(self.state, micro_batches=micro_batches, **kwargs)
 
     def on_step_end(self, loss=None, loss_dict=None, grad_norm=None):
