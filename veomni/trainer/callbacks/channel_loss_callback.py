@@ -103,6 +103,7 @@ class ChannelLossComputer:
         self._per_mb_attention_masks: list[torch.Tensor | None] = []
         self._micro_step = 0
         self.step_totals: dict[ChannelKey, tuple[torch.Tensor, torch.Tensor]] = {}
+        self.step_data_totals: dict[ChannelKey, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
         self.source_names: dict[ChannelKey, str] = {}
         self.strict = False
 
@@ -299,6 +300,7 @@ class ChannelLossComputer:
         self._per_mb_attention_masks = per_mb_attention_masks
         self._micro_step = 0
         self.step_totals = {}
+        self.step_data_totals = {}
 
     def before_micro_step(self) -> None:
         step = self._micro_step
@@ -318,11 +320,23 @@ class ChannelLossComputer:
                 source_id = item["source_id"]
                 loss_sum = item["loss_sum"].detach()
                 token_count = item["token_count"].detach()
+                sample_count = item["sample_count"].detach()
+                input_token_count = item["input_token_count"].detach()
                 previous = self.step_totals.get(source_id)
                 if previous is None:
                     self.step_totals[source_id] = (loss_sum, token_count)
                 else:
                     self.step_totals[source_id] = (previous[0] + loss_sum, previous[1] + token_count)
+
+                data_previous = self.step_data_totals.get(source_id)
+                if data_previous is None:
+                    self.step_data_totals[source_id] = (sample_count, input_token_count, token_count)
+                else:
+                    self.step_data_totals[source_id] = (
+                        data_previous[0] + sample_count,
+                        data_previous[1] + input_token_count,
+                        data_previous[2] + token_count,
+                    )
         self._source_ids = []
         self._position_ids = None
         self._attention_mask = None
@@ -436,6 +450,7 @@ class ChannelLossComputer:
             sp_enabled=sp_enabled,
             parallel_state=self.parallel_state,
             strict=self.strict,
+            include_data_stats=True,
         )
 
     def _per_token_ce(
@@ -511,6 +526,7 @@ class ChannelLossComputer:
         sp_enabled: bool = False,
         parallel_state: ParallelState | None = None,
         strict: bool = False,
+        include_data_stats: bool = False,
     ) -> list[dict[str, Any]]:
         if not source_ids:
             return []
@@ -542,6 +558,7 @@ class ChannelLossComputer:
                     ignore_index=ignore_index,
                     parallel_state=parallel_state,
                     strict=strict,
+                    include_data_stats=include_data_stats,
                 )
 
             row_width = pos_2d.size(1)
@@ -579,16 +596,24 @@ class ChannelLossComputer:
         for i, (_, start, end) in enumerate(segments):
             labels_slice = labels_flat[start : end + 1]
             loss_slice = per_token_loss[start : end + 1]
+            mask_slice = attention_mask_flat[start : end + 1] if attention_mask_flat is not None else None
             valid = labels_slice != ignore_index
             token_count = valid.sum()
             loss_sum = loss_slice[valid].sum()
-            channel_loss.append(
-                {
-                    "source_id": source_ids[i],
-                    "loss_sum": loss_sum,
-                    "token_count": token_count,
-                }
+            input_token_count = (
+                mask_slice.to(torch.bool).sum(dtype=torch.int64)
+                if mask_slice is not None
+                else torch.as_tensor(labels_slice.numel(), device=labels_slice.device, dtype=torch.int64)
             )
+            item = {
+                "source_id": source_ids[i],
+                "loss_sum": loss_sum,
+                "token_count": token_count,
+            }
+            if include_data_stats:
+                item["sample_count"] = torch.ones((), device=labels_slice.device, dtype=torch.int64)
+                item["input_token_count"] = input_token_count
+            channel_loss.append(item)
         return channel_loss
 
     @staticmethod
@@ -602,6 +627,7 @@ class ChannelLossComputer:
         ignore_index: int,
         parallel_state: ParallelState | None = None,
         strict: bool = False,
+        include_data_stats: bool = False,
     ) -> list[dict[str, Any]]:
         if parallel_state is None:
             raise ValueError("parallel_state is required for SP channel-loss aggregation.")
@@ -638,6 +664,11 @@ class ChannelLossComputer:
             valid = labels_slice != ignore_index
             token_count = valid.sum(dtype=torch.int64)
             loss_sum = loss_slice[valid].sum()
+            input_token_count = (
+                mask_slice.to(torch.bool).sum(dtype=torch.int64)
+                if mask_slice is not None
+                else torch.as_tensor(labels_slice.numel(), device=labels_slice.device, dtype=torch.int64)
+            )
             false_flag = torch.zeros((), dtype=torch.bool, device=labels_slice.device)
             has_explicit_padding_mask = (
                 ~mask_slice.to(torch.bool).any()
@@ -645,18 +676,20 @@ class ChannelLossComputer:
                 else false_flag
             )
             has_only_zero_positions = bool(pos_slice.eq(0).all().tolist()) if pos_slice.numel() > 0 else False
-            segments.append(
-                {
-                    "batch_idx": batch_idx,
-                    "sp_rank": sp_rank,
-                    "local_order": local_order,
-                    "is_start": is_start,
-                    "has_explicit_padding_mask": has_explicit_padding_mask,
-                    "has_only_zero_positions": has_only_zero_positions,
-                    "loss_sum": loss_sum,
-                    "token_count": token_count,
-                }
-            )
+            segment = {
+                "batch_idx": batch_idx,
+                "sp_rank": sp_rank,
+                "local_order": local_order,
+                "is_start": is_start,
+                "has_explicit_padding_mask": has_explicit_padding_mask,
+                "has_only_zero_positions": has_only_zero_positions,
+                "loss_sum": loss_sum,
+                "token_count": token_count,
+            }
+            if include_data_stats:
+                segment["sample_count"] = torch.as_tensor(int(is_start), device=labels_slice.device, dtype=torch.int64)
+                segment["input_token_count"] = input_token_count
+            segments.append(segment)
 
         for batch_idx, row_pos in enumerate(positions_cpu):
             row_len = min(local_width, max(seq_len - batch_idx * local_width, 0))
@@ -683,15 +716,24 @@ class ChannelLossComputer:
             device=per_token_loss.device,
             parallel_state=parallel_state,
             strict=strict,
+            include_data_stats=include_data_stats,
         )
-        return [
-            {
+        result = []
+        for item in reduced:
+            converted = {
                 "source_id": item["source_id"],
                 "loss_sum": torch.as_tensor(item["loss_sum"], device=per_token_loss.device, dtype=torch.float32),
                 "token_count": torch.as_tensor(item["token_count"], device=per_token_loss.device, dtype=torch.int64),
             }
-            for item in reduced
-        ]
+            if include_data_stats:
+                converted["sample_count"] = torch.as_tensor(
+                    item["sample_count"], device=per_token_loss.device, dtype=torch.int64
+                )
+                converted["input_token_count"] = torch.as_tensor(
+                    item["input_token_count"], device=per_token_loss.device, dtype=torch.int64
+                )
+            result.append(converted)
+        return result
 
     @staticmethod
     def _reduce_sp(
@@ -700,6 +742,7 @@ class ChannelLossComputer:
         device: torch.device,
         parallel_state: ParallelState | None = None,
         strict: bool = False,
+        include_data_stats: bool = False,
     ) -> list[dict[str, Any]]:
         if local_segments:
             local_zero_position_flags = torch.tensor(
@@ -747,12 +790,24 @@ class ChannelLossComputer:
                     local_zero_position_flags = torch.stack(
                         [segment["has_only_zero_positions"] for segment in local_segments]
                     ).to(device=device, dtype=torch.int64)
-                    local_integer_stats = torch.stack(
-                        [local_token_counts, local_explicit_padding_flags, local_zero_position_flags], dim=1
-                    )
+                    integer_columns = [local_token_counts]
+                    if include_data_stats:
+                        integer_columns.extend(
+                            [
+                                torch.stack([segment["sample_count"] for segment in local_segments]).to(
+                                    device=device, dtype=torch.int64
+                                ),
+                                torch.stack([segment["input_token_count"] for segment in local_segments]).to(
+                                    device=device, dtype=torch.int64
+                                ),
+                            ]
+                        )
+                    integer_columns.extend([local_explicit_padding_flags, local_zero_position_flags])
+                    local_integer_stats = torch.stack(integer_columns, dim=1)
                 else:
                     local_loss_sums = torch.empty(0, dtype=torch.float32, device=device)
-                    local_integer_stats = torch.empty((0, 3), dtype=torch.int64, device=device)
+                    integer_column_count = 5 if include_data_stats else 3
+                    local_integer_stats = torch.empty((0, integer_column_count), dtype=torch.int64, device=device)
 
                 loss_padding = local_loss_sums.new_zeros(max_segment_count - local_loss_sums.size(0))
                 integer_padding = local_integer_stats.new_zeros(
@@ -768,15 +823,18 @@ class ChannelLossComputer:
                 for rank_idx, rank_metadata in enumerate(gathered_metadata):
                     for segment_idx, metadata in enumerate(rank_metadata or []):
                         integer_stats = gathered_integer_stats[rank_idx][segment_idx]
-                        all_segments.append(
-                            {
-                                **metadata,
-                                "loss_sum": gathered_loss_sums[rank_idx][segment_idx],
-                                "token_count": integer_stats[0],
-                                "has_explicit_padding_mask": integer_stats[1].to(torch.bool),
-                                "has_only_zero_positions": integer_stats[2].to(torch.bool),
-                            }
-                        )
+                        stats_offset = 2 if include_data_stats else 0
+                        segment = {
+                            **metadata,
+                            "loss_sum": gathered_loss_sums[rank_idx][segment_idx],
+                            "token_count": integer_stats[0],
+                            "has_explicit_padding_mask": integer_stats[1 + stats_offset].to(torch.bool),
+                            "has_only_zero_positions": integer_stats[2 + stats_offset].to(torch.bool),
+                        }
+                        if include_data_stats:
+                            segment["sample_count"] = integer_stats[1]
+                            segment["input_token_count"] = integer_stats[2]
+                        all_segments.append(segment)
 
         all_segments.sort(
             key=lambda segment: (
@@ -808,13 +866,15 @@ class ChannelLossComputer:
         for segment in all_segments:
             batch_idx = int(segment.get("batch_idx", 0))
             if segment["is_start"]:
-                result.append(
-                    {
-                        "source_id": source_ids[doc_idx],
-                        "loss_sum": segment["loss_sum"],
-                        "token_count": segment["token_count"],
-                    }
-                )
+                item = {
+                    "source_id": source_ids[doc_idx],
+                    "loss_sum": segment["loss_sum"],
+                    "token_count": segment["token_count"],
+                }
+                if include_data_stats:
+                    item["sample_count"] = segment["sample_count"]
+                    item["input_token_count"] = segment["input_token_count"]
+                result.append(item)
                 last_result_idx_by_batch[batch_idx] = len(result) - 1
                 doc_idx += 1
                 continue
@@ -831,6 +891,9 @@ class ChannelLossComputer:
                 continue
             result[result_idx]["loss_sum"] += segment["loss_sum"]
             result[result_idx]["token_count"] += segment["token_count"]
+            if include_data_stats:
+                result[result_idx]["sample_count"] += segment["sample_count"]
+                result[result_idx]["input_token_count"] += segment["input_token_count"]
         return result
 
 
@@ -1027,6 +1090,8 @@ class ChannelLossCallback(Callback):
             return
 
         metrics = self._build_metrics(totals, source_names)
+        data_totals = self._reduce_step_data_totals(self.computer.step_data_totals, list(totals))
+        metrics.update(self._build_data_metrics(data_totals, source_names))
         if not metrics:
             return
 
@@ -1103,6 +1168,39 @@ class ChannelLossCallback(Callback):
         registered_names = self._register_sources(source_ids, synchronized_names)
         return totals, registered_names
 
+    def _reduce_step_data_totals(
+        self,
+        local_totals: dict[ChannelKey, tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+        source_ids: list[ChannelKey],
+    ) -> dict[ChannelKey, tuple[int, int, int]]:
+        if not source_ids:
+            return {}
+
+        device = self._data_totals_device(local_totals)
+        counts = torch.zeros((len(source_ids), 3), dtype=torch.int64, device=device)
+        source_indices = {source_id: index for index, source_id in enumerate(source_ids)}
+        for source_id, (sample_count, input_token_count, label_token_count) in local_totals.items():
+            index = source_indices.get(source_id)
+            if index is None:
+                continue
+            counts[index] = torch.stack(
+                [
+                    torch.as_tensor(sample_count, dtype=torch.int64, device=device),
+                    torch.as_tensor(input_token_count, dtype=torch.int64, device=device),
+                    torch.as_tensor(label_token_count, dtype=torch.int64, device=device),
+                ]
+            )
+
+        ps = self.parallel_state
+        if ps.dp_size > 1 and dist.is_available() and dist.is_initialized():
+            dist.all_reduce(counts, group=ps.dp_group)
+
+        values = counts.cpu().tolist()
+        return {
+            source_id: (int(values[index][0]), int(values[index][1]), int(values[index][2]))
+            for index, source_id in enumerate(source_ids)
+        }
+
     def _register_sources(
         self,
         source_ids: list[ChannelKey],
@@ -1157,6 +1255,16 @@ class ChannelLossCallback(Callback):
                 pass
         return torch.device("cpu")
 
+    def _data_totals_device(
+        self,
+        local_totals: dict[ChannelKey, tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+    ) -> torch.device:
+        for counts in local_totals.values():
+            for count in counts:
+                if isinstance(count, torch.Tensor):
+                    return count.device
+        return self._totals_device({})
+
     def _build_metrics(
         self,
         totals: dict[ChannelKey, tuple[float, int]],
@@ -1176,21 +1284,67 @@ class ChannelLossCallback(Callback):
                 metrics[f"{self.config.token_count_metric_prefix}/{name}"] = float(token_count)
         return metrics
 
+    def _build_data_metrics(
+        self,
+        totals: dict[ChannelKey, tuple[int, int, int]],
+        source_names: dict[ChannelKey, str] | None = None,
+    ) -> dict[str, float]:
+        metric_names = self._render_data_metric_names(totals, source_names)
+        metrics: dict[str, float] = {}
+        for source_id, (sample_count, input_token_count, label_token_count) in sorted(
+            totals.items(), key=lambda item: _channel_sort_key(item[0])
+        ):
+            if sample_count <= 0:
+                continue
+            name = metric_names[source_id]
+            metrics[f"samples/{name}"] = float(sample_count)
+            metrics[f"input_tokens/{name}"] = float(input_token_count)
+            metrics[f"label_tokens/{name}"] = float(label_token_count)
+            metrics[f"label_tokens_per_sample/{name}"] = label_token_count / sample_count
+        return metrics
+
+    def _render_data_metric_names(
+        self,
+        totals: dict[ChannelKey, tuple[int, int, int]],
+        source_names: dict[ChannelKey, str] | None,
+    ) -> dict[ChannelKey, str]:
+        base_names = self._render_base_metric_names(totals, source_names)
+        name_counts: dict[str, int] = defaultdict(int)
+        for name in base_names.values():
+            name_counts[name] += 1
+        return {
+            source_id: (
+                base_names[source_id]
+                if name_counts[base_names[source_id]] == 1
+                else f"{_stable_source_metric_fragment(source_id)}__{base_names[source_id]}"
+            )
+            for source_id in totals
+        }
+
     def _render_metric_names(
         self,
         totals: dict[ChannelKey, tuple[float, int]],
         source_names: dict[ChannelKey, str] | None,
     ) -> dict[ChannelKey, str]:
+        base_names = self._render_base_metric_names(totals, source_names)
+        return {
+            source_id: f"{_stable_source_metric_fragment(source_id)}__{base_names[source_id]}" for source_id in totals
+        }
+
+    def _render_base_metric_names(
+        self,
+        totals: dict[ChannelKey, tuple[Any, ...]],
+        source_names: dict[ChannelKey, str] | None,
+    ) -> dict[ChannelKey, str]:
         self._register_sources(list(totals), source_names)
         rendered: dict[ChannelKey, str] = {}
-        for source_id in totals:
+        for source_id in self._source_registry:
             source_name = self._source_registry[source_id]
-            display_name = (
+            rendered[source_id] = (
                 _sanitize_metric_fragment(source_name)
                 if source_name is not None
                 else self._resolve_source_name(source_id)
             )
-            rendered[source_id] = f"{_stable_source_metric_fragment(source_id)}__{display_name}"
         return rendered
 
     def _resolve_source_name(self, source_id: ChannelKey) -> str:

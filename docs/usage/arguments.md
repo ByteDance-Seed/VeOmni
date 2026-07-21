@@ -347,7 +347,11 @@ NPU validation runs at two times:
 
 This is an observability-only side channel. It computes detached per-token CE
 from the model loss inputs, aggregates by packed-sequence source metadata, and
-adds metrics such as `channel_loss/<source-id>__<source>` to the normal step metrics. It does
+adds metrics such as `channel_loss/<source-id>__<source>` to the normal step metrics. The same
+sampled steps also report source-level data composition as `samples/<source>`,
+`input_tokens/<source>`, `label_tokens/<source>`, and
+`label_tokens_per_sample/<source>`. These counters use the packed segments already
+aligned for channel loss; they do not require per-sample IDs. This side channel does
 not change the returned training loss or gradients. Fused-loss backends may
 recompute the LM-head projection on sampled steps, so the default interval is
 10 steps; set `interval=1` for per-step metrics. DiT trainers and

@@ -107,8 +107,20 @@ def test_channel_loss_computer_aggregates_packed_logits_by_source():
     loss_0, tokens_0 = _expected_segment(logits, labels, 0, 2)
     loss_1, tokens_1 = _expected_segment(logits, labels, 3, 4)
     assert result == [
-        {"source_id": 0, "loss_sum": pytest.approx(loss_0), "token_count": tokens_0},
-        {"source_id": 1, "loss_sum": pytest.approx(loss_1), "token_count": tokens_1},
+        {
+            "source_id": 0,
+            "loss_sum": pytest.approx(loss_0),
+            "token_count": tokens_0,
+            "sample_count": 1,
+            "input_token_count": 3,
+        },
+        {
+            "source_id": 1,
+            "loss_sum": pytest.approx(loss_1),
+            "token_count": tokens_1,
+            "sample_count": 1,
+            "input_token_count": 2,
+        },
     ]
 
 
@@ -151,6 +163,46 @@ def test_channel_loss_computer_hidden_states_path_matches_logits_path():
     )
 
     assert hs_result == logits_result
+
+
+def test_channel_loss_computer_counts_attention_masked_input_tokens():
+    computer = ChannelLossComputer()
+    computer._source_ids = ["repoqa"]
+    computer._position_ids = torch.tensor([[0, 1, 2, 3]])
+
+    result = computer._compute_channel_loss(
+        logits=torch.randn(1, 4, 8),
+        labels=torch.tensor([[1, 2, 3, 4]]),
+        vocab_size=8,
+        hidden_states=None,
+        weights=None,
+        attention_mask=torch.tensor([[1, 1, 1, 0]]),
+        shift_labels=None,
+        ignore_index=IGNORE_INDEX,
+    )
+
+    assert result[0]["sample_count"].item() == 1
+    assert result[0]["input_token_count"].item() == 3
+    assert result[0]["token_count"].item() == 3
+
+
+def test_channel_loss_computer_counts_data_metrics_with_sequence_parallel():
+    result = ChannelLossComputer._aggregate_by_source(
+        per_token_loss=torch.ones(4),
+        labels_flat=torch.tensor([1, 2, 3, IGNORE_INDEX]),
+        attention_mask_flat=torch.tensor([1, 1, 1, 0]),
+        source_ids=["repoqa", "other"],
+        position_ids=torch.tensor([[0, 1, 0, 1]]),
+        ignore_index=IGNORE_INDEX,
+        sp_enabled=True,
+        parallel_state=SimpleNamespace(sp_group=None, sp_size=1),
+        strict=True,
+        include_data_stats=True,
+    )
+
+    assert [item["sample_count"].item() for item in result] == [1, 1]
+    assert [item["input_token_count"].item() for item in result] == [2, 1]
+    assert [item["token_count"].item() for item in result] == [2, 1]
 
 
 def test_channel_loss_wrapper_forwards_original_call_unchanged():
@@ -841,9 +893,27 @@ def test_channel_loss_computer_aggregates_step_results_locally():
     computer = ChannelLossComputer()
     computer.begin_step([], [], [])
     computer._result = [
-        {"source_id": "a", "loss_sum": torch.tensor(2.0), "token_count": torch.tensor(1)},
-        {"source_id": "a", "loss_sum": torch.tensor(4.0), "token_count": torch.tensor(2)},
-        {"source_id": "b", "loss_sum": torch.tensor(3.0), "token_count": torch.tensor(1)},
+        {
+            "source_id": "a",
+            "loss_sum": torch.tensor(2.0),
+            "token_count": torch.tensor(1),
+            "sample_count": torch.tensor(1),
+            "input_token_count": torch.tensor(3),
+        },
+        {
+            "source_id": "a",
+            "loss_sum": torch.tensor(4.0),
+            "token_count": torch.tensor(2),
+            "sample_count": torch.tensor(1),
+            "input_token_count": torch.tensor(4),
+        },
+        {
+            "source_id": "b",
+            "loss_sum": torch.tensor(3.0),
+            "token_count": torch.tensor(1),
+            "sample_count": torch.tensor(1),
+            "input_token_count": torch.tensor(2),
+        },
     ]
 
     computer.after_micro_step()
@@ -851,6 +921,67 @@ def test_channel_loss_computer_aggregates_step_results_locally():
     assert set(computer.step_totals) == {"a", "b"}
     assert computer.step_totals["a"][0].item() == 6.0
     assert computer.step_totals["a"][1].item() == 3
+    assert tuple(value.item() for value in computer.step_data_totals["a"]) == (2, 7, 3)
+
+
+def test_channel_loss_computer_requires_data_stats_for_step_aggregation():
+    computer = ChannelLossComputer()
+    computer.begin_step([], [], [])
+    computer._result = [
+        {
+            "source_id": "a",
+            "loss_sum": torch.tensor(2.0),
+            "token_count": torch.tensor(1),
+            "sample_count": torch.tensor(1),
+        }
+    ]
+
+    with pytest.raises(KeyError, match="input_token_count"):
+        computer.after_micro_step()
+
+
+def test_base_step_begin_captures_channel_metadata_before_multisource_meter():
+    calls = []
+
+    class RecordingCallback:
+        def __init__(self, name, consume_metadata=False):
+            self.name = name
+            self.consume_metadata = consume_metadata
+
+        def on_step_begin(self, state, micro_batches=None, **kwargs):
+            calls.append((self.name, "ds_idx" in micro_batches[0]))
+            if self.consume_metadata:
+                micro_batches[0].pop("ds_idx")
+                micro_batches[0].pop("source_name")
+
+    trainer = object.__new__(BaseTrainer)
+    trainer.state = TrainerState(global_step=1)
+    trainer.channel_loss_callback = RecordingCallback("channel")
+    meter = RecordingCallback("meter", consume_metadata=True)
+    tail = RecordingCallback("tail")
+    trainer._callbacks = [meter, trainer.channel_loss_callback, tail]
+    micro_batches = [{"ds_idx": torch.tensor([7]), "source_name": ["repoqa"]}]
+
+    BaseTrainer.on_step_begin(trainer, micro_batches=micro_batches)
+
+    assert calls == [("channel", True), ("meter", True), ("tail", False)]
+
+
+def test_base_step_begin_allows_missing_channel_loss_callback():
+    calls = []
+
+    class RecordingCallback:
+        def on_step_begin(self, state, micro_batches=None, **kwargs):
+            calls.append(micro_batches)
+
+    trainer = object.__new__(BaseTrainer)
+    trainer.state = TrainerState(global_step=1)
+    trainer._callbacks = [RecordingCallback()]
+    micro_batches = [{"input_ids": torch.tensor([1, 2])}]
+
+    BaseTrainer.on_step_begin(trainer, micro_batches=micro_batches)
+
+    assert calls == [micro_batches]
 
 
 def test_base_forward_backward_allows_missing_channel_loss_callback():
@@ -1268,6 +1399,52 @@ def test_channel_loss_metric_name_is_source_qualified_from_first_emission():
     assert "channel_loss/train_a" not in metrics
 
 
+def test_channel_loss_builds_per_step_data_metrics_with_source_name():
+    cfg = ChannelLossConfig(enable=True)
+    trainer = SimpleNamespace(args=SimpleNamespace(train=SimpleNamespace(channel_loss=cfg)), environ_meter=None)
+    callback = ChannelLossCallback(trainer)
+
+    metrics = callback._build_data_metrics(
+        {7: (2, 11, 5)},
+        {7: "repoqa"},
+    )
+
+    assert metrics == {
+        "samples/repoqa": 2.0,
+        "input_tokens/repoqa": 11.0,
+        "label_tokens/repoqa": 5.0,
+        "label_tokens_per_sample/repoqa": 2.5,
+    }
+
+
+def test_channel_loss_data_metric_name_collisions_remain_distinct():
+    cfg = ChannelLossConfig(enable=True)
+    trainer = SimpleNamespace(args=SimpleNamespace(train=SimpleNamespace(channel_loss=cfg)), environ_meter=None)
+    callback = ChannelLossCallback(trainer)
+
+    metrics = callback._build_data_metrics(
+        {1: (1, 3, 2), 2: (1, 4, 3)},
+        {1: "train/a", 2: "train_a"},
+    )
+
+    assert metrics["samples/source-i-1__train_a"] == 1.0
+    assert metrics["samples/source-i-2__train_a"] == 1.0
+
+
+def test_channel_loss_data_metric_collision_registry_persists_across_steps():
+    cfg = ChannelLossConfig(enable=True)
+    trainer = SimpleNamespace(args=SimpleNamespace(train=SimpleNamespace(channel_loss=cfg)), environ_meter=None)
+    callback = ChannelLossCallback(trainer)
+
+    first = callback._build_data_metrics({1: (1, 3, 2)}, {1: "train/a"})
+    second = callback._build_data_metrics({2: (1, 4, 3)}, {2: "train_a"})
+    third = callback._build_data_metrics({1: (1, 3, 2)}, {1: "train/a"})
+
+    assert "samples/train_a" in first
+    assert "samples/source-i-2__train_a" in second
+    assert "samples/source-i-1__train_a" in third
+
+
 def test_channel_loss_metric_name_collision_registry_persists_across_steps():
     cfg = ChannelLossConfig(enable=True)
     trainer = SimpleNamespace(args=SimpleNamespace(train=SimpleNamespace(channel_loss=cfg)), environ_meter=None)
@@ -1381,6 +1558,10 @@ def test_channel_loss_callback_updates_trainer_metrics():
         0: (torch.tensor(6.0), torch.tensor(3)),
         1: (torch.tensor(3.0), torch.tensor(1)),
     }
+    callback.computer.step_data_totals = {
+        0: (torch.tensor(2), torch.tensor(10), torch.tensor(3)),
+        1: (torch.tensor(1), torch.tensor(4), torch.tensor(1)),
+    }
     callback._collect_step = True
 
     callback.on_step_end(TrainerState(global_step=1), loss=0.0, loss_dict={}, grad_norm=0.0)
@@ -1389,6 +1570,10 @@ def test_channel_loss_callback_updates_trainer_metrics():
     assert math.isclose(trainer.step_env_metrics["channel_loss/source-i-1__source-b"], 3.0)
     assert math.isclose(trainer.step_env_metrics["channel_loss_weighted/source-i-0__source_a"], 1.5)
     assert math.isclose(trainer.step_env_metrics["channel_tokens/source-i-1__source-b"], 1.0)
+    assert trainer.step_env_metrics["samples/source_a"] == 2.0
+    assert trainer.step_env_metrics["input_tokens/source_a"] == 10.0
+    assert trainer.step_env_metrics["label_tokens/source_a"] == 3.0
+    assert trainer.step_env_metrics["label_tokens_per_sample/source_a"] == 1.5
     assert trainer.step_train_metrics == trainer.step_env_metrics
 
 
