@@ -28,6 +28,11 @@ from torch import Tensor
 from torch.distributed.tensor import DTensor, Replicate, Shard
 from torch.optim.optimizer import Optimizer
 
+from ..utils import logging
+
+
+logger = logging.get_logger(__name__)
+
 
 try:
     # Reuse upstream's private NS constants and the LR-adjust helper so we
@@ -288,6 +293,7 @@ def _package_gram_newton_schulz(
 
 # Newton-Schulz backend selectors for DistributedMuon / run_newton_schulz.
 NS_IMPLEMENTATIONS = ("std", "gram", "gram_quack")
+_GRAM_QUACK_FALLBACK_WARNED = False
 
 
 @torch.no_grad()
@@ -330,9 +336,16 @@ def run_newton_schulz(
                 reset_iterations=gram_ns_reset_iterations,
                 use_kernels=True,
             )
-        except ImportError:
+        except ImportError as exc:
             # Optional dependency; keep training runnable without quack kernels.
-            pass
+            global _GRAM_QUACK_FALLBACK_WARNED
+            if not _GRAM_QUACK_FALLBACK_WARNED:
+                _GRAM_QUACK_FALLBACK_WARNED = True
+                logger.warning_rank0(
+                    "[Muon] ns_implementation=gram_quack requested but gram-newton-schulz/quack "
+                    f"is unavailable ({type(exc).__name__}: {exc}). Falling back to pure-PyTorch "
+                    "gram path for the rest of this process."
+                )
     return batched_gram_newton_schulz(
         grad,
         ns_coefficients=schedule,

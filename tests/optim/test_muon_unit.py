@@ -349,3 +349,69 @@ class TestGramNewtonSchulz:
         p.grad = torch.randn_like(p)
         opt.step()
         assert torch.isfinite(p).all()
+
+
+class TestMuonLrResolution:
+    def test_muon_lr_inherits_adamw_lr_under_match_rms(self):
+        from veomni.optim import build_optimizer
+
+        model = _toy_model()
+        opt = build_optimizer(
+            model,
+            lr=1.5e-4,
+            weight_decay=0.01,
+            optimizer_type="muon",
+            muon_kwargs={"adjust_lr_fn": "match_rms_adamw"},  # no explicit lr
+        )
+        muon_opt = opt.optimizers_dict["muon"]
+        assert muon_opt.param_groups[0]["lr"] == pytest.approx(1.5e-4)
+
+    def test_muon_lr_original_defaults_to_25x(self):
+        from veomni.optim import build_optimizer
+
+        model = _toy_model()
+        opt = build_optimizer(
+            model,
+            lr=1e-4,
+            weight_decay=0.01,
+            optimizer_type="muon",
+            muon_kwargs={"adjust_lr_fn": "original"},
+        )
+        muon_opt = opt.optimizers_dict["muon"]
+        assert muon_opt.param_groups[0]["lr"] == pytest.approx(2.5e-3)
+
+    def test_muon_lr_explicit_wins(self):
+        from veomni.optim import build_optimizer
+
+        model = _toy_model()
+        opt = build_optimizer(
+            model,
+            lr=1e-4,
+            weight_decay=0.01,
+            optimizer_type="muon",
+            muon_kwargs={"lr": 3e-3, "adjust_lr_fn": "match_rms_adamw"},
+        )
+        muon_opt = opt.optimizers_dict["muon"]
+        assert muon_opt.param_groups[0]["lr"] == pytest.approx(3e-3)
+
+
+class TestGramQuackFallback:
+    def test_gram_quack_falls_back_without_package(self, monkeypatch):
+        import veomni.optim.muon as muon_mod
+
+        monkeypatch.setattr(muon_mod, "_GRAM_QUACK_FALLBACK_WARNED", False)
+
+        def _boom(*_a, **_k):
+            raise ImportError("quack missing for test")
+
+        monkeypatch.setattr(muon_mod, "_package_gram_newton_schulz", _boom)
+        x = _sample_2d(8, 16, dtype=torch.float32, seed=0)
+        out = run_newton_schulz(
+            x,
+            ns_implementation="gram_quack",
+            gram_ns_reset_iterations=(2,),
+            compute_dtype=torch.float32,
+        )
+        assert out.shape == x.shape
+        assert torch.isfinite(out).all()
+        assert muon_mod._GRAM_QUACK_FALLBACK_WARNED is True

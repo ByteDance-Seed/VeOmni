@@ -198,10 +198,21 @@ class VeOmniIter:
         return {}
 
 
+def _resolve_muon_lr(optimizer_cfg) -> float:
+    """Resolve Muon LR, inheriting AdamW lr under match_rms_adamw when unset."""
+    if optimizer_cfg.muon_lr is not None:
+        return float(optimizer_cfg.muon_lr)
+    adamw_lr = float(optimizer_cfg.lr)
+    if optimizer_cfg.muon_adjust_lr_fn == "match_rms_adamw":
+        return adamw_lr
+    # original: Moonlight-style ~25x AdamW lr starting point
+    return 25.0 * adamw_lr
+
+
 def _collect_muon_kwargs(optimizer_cfg) -> Dict[str, Any]:
     """Pull Muon-specific hyperparameters out of ``OptimizerConfig``."""
     return {
-        "lr": optimizer_cfg.muon_lr,
+        "lr": _resolve_muon_lr(optimizer_cfg),
         "momentum": optimizer_cfg.muon_momentum,
         "nesterov": optimizer_cfg.muon_nesterov,
         "weight_decay": optimizer_cfg.muon_weight_decay,
@@ -211,6 +222,10 @@ def _collect_muon_kwargs(optimizer_cfg) -> Dict[str, Any]:
         "adjust_lr_fn": optimizer_cfg.muon_adjust_lr_fn,
         "ns_implementation": optimizer_cfg.muon_ns_implementation,
         "gram_ns_reset_iterations": tuple(optimizer_cfg.muon_gram_ns_reset_iterations),
+        # Surface for startup summary only; not a DistributedMuon ctor kwarg.
+        "expert_zero_comm": bool(optimizer_cfg.muon_expert_zero_comm),
+        "adamw_lr": float(optimizer_cfg.lr),
+        "muon_lr_explicit": optimizer_cfg.muon_lr is not None,
     }
 
 
