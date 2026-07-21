@@ -15,6 +15,7 @@
 import time
 from typing import TYPE_CHECKING, Any, Dict, List
 
+import torch.distributed as dist
 from tqdm import trange
 
 from ...utils import helper
@@ -160,27 +161,64 @@ class WandbTraceCallback(Callback):
 class ProfileTraceCallback(Callback):
     def on_train_begin(self, state: TrainerState, **kwargs) -> None:
         args: "VeOmniArguments" = self.trainer.args
+        self.profiler = None
+        self._profile_active = False
+        if not args.train.profile.enable:
+            return
+
+        # ProfileConfig uses absolute global steps, while torch profiler's
+        # schedule starts at zero for each process. Rebase the remaining window
+        # when resuming from a checkpoint or hot-updating a running job.
+        first_profile_step = max(args.train.profile.start_step, state.global_step + 1)
+        if first_profile_step >= args.train.profile.end_step:
+            logger.warning_rank0(
+                f"Profiling window [{args.train.profile.start_step}, {args.train.profile.end_step}) "
+                f"has no remaining steps after global step {state.global_step}; profiling is skipped."
+            )
+            return
+
+        self._profile_active = True
         if args.train.profile.this_rank:
             self.profiler = helper.create_profiler(
-                start_step=args.train.profile.start_step,
-                end_step=args.train.profile.end_step,
+                start_step=first_profile_step - state.global_step,
+                end_step=args.train.profile.end_step - state.global_step,
                 trace_dir=args.train.profile.trace_dir,
                 record_shapes=args.train.profile.record_shapes,
                 profile_memory=args.train.profile.profile_memory,
                 with_stack=args.train.profile.with_stack,
                 with_modules=args.train.profile.with_modules,
                 global_rank=args.train.global_rank,
+                npu_offline_analysis=args.train.profile.npu_offline_analysis,
             )
             self.profiler.start()
 
     def on_step_end(self, state: TrainerState, **kwargs) -> None:
         args: "VeOmniArguments" = self.trainer.args
-        if args.train.profile.this_rank:
+        # on_trace_ready runs synchronously when the schedule exits its active
+        # window, in profiler.step() at global step end_step - 1. Keep
+        # non-profiled ranks out of the next collective until NPU finalization
+        # (raw dump and optional online analyse) completes on the profiled rank(s).
+        # This applies to both online and offline Ascend analysis.
+        synchronize_finalize = (
+            self._profile_active
+            and helper.IS_NPU_AVAILABLE
+            and state.global_step == args.train.profile.end_step - 1
+            and dist.is_available()
+            and dist.is_initialized()
+        )
+
+        if synchronize_finalize:
+            dist.barrier()
+
+        if self.profiler is not None:
             if state.global_step <= args.train.profile.end_step:
                 self.profiler.step()
 
             if state.global_step == args.train.profile.end_step:
                 self.profiler.stop()
+
+        if synchronize_finalize:
+            dist.barrier()
 
 
 class EnvironMeterCallback(Callback):

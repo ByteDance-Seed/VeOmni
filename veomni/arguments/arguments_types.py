@@ -217,6 +217,15 @@ class ProfileConfig:
             "help": "whether to profile rank0 only. When false, every rank will be profiled; Please expect many files to save, which can be slow and take a lot of disk space."
         },
     )
+    npu_offline_analysis: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Defer online Ascend analysis by setting analyse_flag=False, so training only finalizes raw data. "
+                "Parse the raw data offline with torch_npu or msprof. This option only affects NPU profiling."
+            )
+        },
+    )
 
 
 @dataclass

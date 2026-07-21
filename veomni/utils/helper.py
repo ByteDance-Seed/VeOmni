@@ -671,6 +671,7 @@ def create_profiler(
     with_stack: bool,
     with_modules: bool,
     global_rank: int,
+    npu_offline_analysis: bool = False,
 ):
     """
     Creates a profiler to record the CPU and CUDA activities. Default export to trace.json.
@@ -685,10 +686,12 @@ def create_profiler(
         record_shapes (bool): Whether to record the shapes of the tensors.
         profile_memory (bool): Whether to profile the memory usage.
         with_stack (bool): Whether to include the stack trace.
+        npu_offline_analysis (bool): Whether to defer Ascend profiler analysis to an offline process.
     """
 
     def handler_fn(p):
         time = int(datetime.datetime.now().timestamp())
+        hdfs_copy_succeeded = False
 
         trace_file_extention = "pt.trace.json.gz"
         gpu_memory_file_extension = "pkl"
@@ -711,14 +714,37 @@ def create_profiler(
             p.export_chrome_trace(trace_file)
         logger.info(f"Profiling result saved at {trace_file}.")
 
-        get_torch_device().memory._dump_snapshot(gpu_memory_file)
-        logger.info(f"Profiling memory visualization saved at {gpu_memory_file}.")
+        if not (IS_NPU_AVAILABLE and npu_offline_analysis):
+            get_torch_device().memory._dump_snapshot(gpu_memory_file)
+            logger.info(f"Profiling memory visualization saved at {gpu_memory_file}.")
 
         if trace_dir.startswith("hdfs://"):
-            copy(trace_file, trace_dir)
-            logger.info(f"Profiling result uploaded to {trace_dir}.")
+            hdfs_copy_succeeded = bool(copy(trace_file, trace_dir))
+            if hdfs_copy_succeeded:
+                logger.info(f"Profiling result uploaded to {trace_dir}.")
+            else:
+                logger.warning(
+                    f"Failed to copy profiling result to {trace_dir}; the raw capture remains at {trace_file}."
+                )
 
-        if VEOMNI_UPLOAD_CMD:
+        if VEOMNI_UPLOAD_CMD and IS_NPU_AVAILABLE and npu_offline_analysis:
+            if trace_dir.startswith("hdfs://"):
+                if hdfs_copy_succeeded:
+                    logger.warning(
+                        "VEOMNI_UPLOAD_CMD is skipped because offline NPU profiling produces a raw directory. "
+                        f"The raw directory has already been copied to {trace_dir}; parse it offline."
+                    )
+                else:
+                    logger.warning(
+                        "VEOMNI_UPLOAD_CMD is skipped because offline NPU profiling produces a raw directory, "
+                        f"and the automatic copy to {trace_dir} failed. Preserve {trace_file} before the pod exits."
+                    )
+            else:
+                logger.warning(
+                    "VEOMNI_UPLOAD_CMD is skipped because offline NPU profiling produces a raw directory. "
+                    f"Copy {trace_file} to durable storage outside the training process, then parse it offline."
+                )
+        elif VEOMNI_UPLOAD_CMD:
             try:
                 logger.info_rank0(f"upload trace file {trace_file}")
                 if IS_NPU_AVAILABLE:
@@ -738,8 +764,10 @@ def create_profiler(
     if IS_NPU_AVAILABLE:
         profiler_module = torch_npu.profiler
         activities = [profiler_module.ProfilerActivity.CPU, profiler_module.ProfilerActivity.NPU]
+        trace_handler_kwargs = {"analyse_flag": False} if npu_offline_analysis else {}
         npu_trace_handler = torch_npu.profiler.tensorboard_trace_handler(
-            CACHE_DIR if trace_dir.startswith("hdfs://") else trace_dir
+            CACHE_DIR if trace_dir.startswith("hdfs://") else trace_dir,
+            **trace_handler_kwargs,
         )
         experimental_config = torch_npu.profiler._ExperimentalConfig(
             aic_metrics=torch_npu.profiler.AiCMetrics.PipeUtilization,
@@ -772,7 +800,7 @@ def create_profiler(
         with_stack=with_stack,
         experimental_config=experimental_config,
     )
-    if (IS_CUDA_AVAILABLE or IS_NPU_AVAILABLE) and profile_memory:
+    if (IS_CUDA_AVAILABLE or IS_NPU_AVAILABLE) and profile_memory and not (IS_NPU_AVAILABLE and npu_offline_analysis):
         return ProfilerWithMem(base_profiler)
     else:
         return base_profiler
