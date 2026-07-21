@@ -107,7 +107,11 @@ def l2norm_bwd_kernel(
     i_t_start = tl.program_id(0)
     num_blocks = bt_size
 
-    total_i_t = T // BT
+    # VeOmni fix: ceil, not floor. Floor drops the partial last block when T is
+    # not a multiple of BT (varlen/ragged segments), so its rows in `dx` are
+    # never written and keep uninitialized garbage. The block_start < T guard
+    # plus boundary_check below already handle the partial block once scheduled.
+    total_i_t = (T + BT - 1) // BT
     base_tasks_per_block = total_i_t // num_blocks
     remainder_tasks = total_i_t % num_blocks
 
