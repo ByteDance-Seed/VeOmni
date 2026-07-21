@@ -46,6 +46,10 @@ def prepare_ulysses_qkv(
         repeat_count = ulysses_size // key_value_head_count
         key = torch.repeat_interleave(key, dim=2, repeats=repeat_count)
         value = torch.repeat_interleave(value, dim=2, repeats=repeat_count)
+    else:
+        assert key_value_head_count % ulysses_size == 0, (
+            f"num_key_value_heads ({key_value_head_count}) must be divisible by ulysses_size ({ulysses_size})"
+        )
 
     if query.ndim == 4 and query.size(0) == 1:
         query, key, value = query.squeeze(0), key.squeeze(0), value.squeeze(0)

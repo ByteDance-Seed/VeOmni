@@ -169,6 +169,22 @@ def test_ulysses_helpers_preserve_flash_layout(monkeypatch, batch_size, seq_dim,
     assert restored.shape == (batch_size, 5, 2, 8)
 
 
+@pytest.mark.parametrize(("key_value_head_count", "ulysses_size"), [(3, 4), (6, 4)])
+def test_ulysses_helpers_reject_nondivisible_key_value_heads(key_value_head_count, ulysses_size):
+    query = torch.randn(1, 5, 8, 8)
+    key = torch.randn(1, 5, key_value_head_count, 8)
+    value = torch.randn(1, 5, key_value_head_count, 8)
+
+    with pytest.raises(AssertionError, match="must be divisible"):
+        attention_ulysses.prepare_ulysses_qkv(
+            query,
+            key,
+            value,
+            group=object(),
+            ulysses_size=ulysses_size,
+        )
+
+
 def test_ulysses_head_auxiliary_slices_global_vector_by_rank(monkeypatch):
     monkeypatch.setattr(attention_ulysses.dist, "get_rank", lambda group: 1)
     auxiliary = torch.arange(4)
