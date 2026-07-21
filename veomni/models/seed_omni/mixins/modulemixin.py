@@ -88,60 +88,6 @@ def post_forward(*contexts: str) -> Callable[[Callable], Callable]:
     return decorator
 
 
-def sp_pre_forward(*contexts: str) -> Callable[[Callable], Callable]:
-    """Decorator: register a **per-module sequence-parallel loop-head hook**.
-
-    A module opts into per-module SP (Ulysses) for a call-site by declaring this
-    hook. The graph runs the endpoint ``sp_size`` times (one SP-group sample per
-    iteration); the driver first broadcasts that sample's ``pre_forward`` output
-    to the whole group, THEN calls this hook with the shared data. The hook only
-    slices its inputs to this rank's ``1/sp_size`` chunk (+ any per-shard
-    precompute such as ``cu_seqlens``), returning the plain ``forward`` kwargs::
-
-        @sp_pre_forward("forward")
-        def forward_sp_pre(self, inputs_embeds, ...): ...
-
-    No broadcast here — every rank already holds the active sample. Its
-    :func:`sp_post_forward` counterpart all-gathers output shards so every rank
-    reconstructs the same full sample. See :meth:`ModuleMixin.sp_pre_forward`.
-    """
-
-    if not contexts:
-        raise ValueError("@sp_pre_forward requires at least one context.")
-
-    def decorator(fn: Callable) -> Callable:
-        fn._omni_sp_pre_context = tuple(contexts)
-        return fn
-
-    return decorator
-
-
-def sp_post_forward(*contexts: str) -> Callable[[Callable], Callable]:
-    """Decorator: register a **per-module sequence-parallel loop-tail hook**.
-
-    The output counterpart of :func:`sp_pre_forward`: called at the END of each SP
-    iteration with the plain ``forward`` output, it all-gathers this rank's output
-    shard (``sp_all_gather_shards``) so every rank reconstructs the same full
-    sample::
-
-        @sp_post_forward("forward")
-        def forward_sp_post(self, hidden_states, ...): ...
-
-    The driver selects which sample feeds ``post_forward`` / the carrier.
-    Stripping SP padding the loop-head added is this hook's job on every rank —
-    keep it out of the SP-agnostic ``post_forward``.
-    """
-
-    if not contexts:
-        raise ValueError("@sp_post_forward requires at least one context.")
-
-    def decorator(fn: Callable) -> Callable:
-        fn._omni_sp_post_context = tuple(contexts)
-        return fn
-
-    return decorator
-
-
 class CPUPreprocessor:
     """Picklable, weight-free CPU input-prep run inside DataLoader workers.
 
@@ -253,10 +199,19 @@ class ModuleMixin:
         """Dispatch to the ``@pre_forward(method)``-decorated hook for this node's
         call-site (``"forward"`` / ``"encode"`` / ``"decode"`` / ...).
 
-        Routes packing / SP slice / conversation extraction per call site. A
-        module with multiple call-sites declares one ``@pre_forward(<method>)``
-        hook each; a single-call-site module may instead override this method
-        directly. Default (no hook, no override): identity pass-through.
+        Routes packing / conversation extraction / **SP input slice** per call
+        site. A module opts into sequence parallelism by branching on
+        ``get_parallel_state().sp_size > 1`` *inside* this hook (after stashing
+        the full pre-slice seqlens for the meter via
+        :meth:`metric_meter_set_seqlens`): every rank of the SP group holds the
+        SAME replicated sample, so it slices its inputs to this rank's
+        ``1/sp_size`` chunk (+ any per-shard precompute such as ``cu_seqlens``);
+        the paired :meth:`post_forward` hook all-gathers the output shards back to
+        the full sample. When ``sp_size == 1`` the branch is skipped and the node
+        runs once on full data. A module with multiple call-sites declares one
+        ``@pre_forward(<method>)`` hook each; a single-call-site module may instead
+        override this method directly. Default (no hook, no override): identity
+        pass-through.
         """
         name = type(self)._omni_hook_name("_omni_pre_context", method)
         if name is None:
@@ -275,15 +230,14 @@ class ModuleMixin:
         :meth:`~veomni.models.seed_omni.mixins.metric_meter_mixin.MetricMeterMixin.metric_meter_token_lengths`
         (a no-op stash on a non-metered module — nothing drains it).
 
-        Why pre-slice / own-data: ``metric_meter_add`` runs *after* ``pre_forward``
-        (see ``TrainingGraph.step``), so its ``data`` is already this SP rank's
-        shard — measuring it under-counts by ~``sp``. But the value must be this
-        rank's **own** lengths (before ``sp_gather_seqs``), NOT the
-        post-gather aggregate: ``OmniEnvironMeter`` sums tokens+FLOPs over the
-        ``dp_group``, and in per-module SP the gather spans ``module_sp`` distinct
-        DP ranks, so a post-gather value would be counted ``module_sp`` times.
-        "Own data (full) + DP-sum" reconstructs the true global total, matching the
-        non-SP run. (See constraints.md 7c.)
+        Why pre-slice / full-sample: under uniform SP the ``pre_forward`` hook
+        slices to this rank's ``1/sp_size`` shard, so a length read *after* the
+        slice would under-count by ~``sp``. Stash the FULL (pre-slice) per-sample
+        lengths here — before the slice branch — instead: ``OmniEnvironMeter`` sums
+        tokens+FLOPs over the ``dp_group`` (which excludes the SP ranks that all
+        hold the same replicated sample), so the full-sample value counted once per
+        DP shard reconstructs the true global total, matching the non-SP run. (See
+        constraints.md 7c.)
         """
         if not hasattr(self, "_metric_full_seqlens"):
             self._metric_full_seqlens: Dict[str, List[int]] = {}
@@ -302,46 +256,18 @@ class ModuleMixin:
 
     def post_forward(self, method: str, **outputs: Any) -> Dict[str, Any]:
         """Dispatch to the ``@post_forward(method)``-decorated hook for this node's
-        call-site — e.g. SP gather, final ``_loss`` mean, conversation write-back.
+        call-site — e.g. SP output all-gather, final ``_loss`` mean, conversation
+        write-back.
 
-        Mirrors :meth:`pre_forward`. Default (no hook, no override): identity
-        pass-through of the call-site return dict.
+        Mirrors :meth:`pre_forward`. A module that sliced its inputs under SP in
+        ``pre_forward`` (``get_parallel_state().sp_size > 1``) branches on the same
+        condition here to all-gather this rank's output shard back to the full
+        (replicated) sample — via ``gather_outputs`` (autograd-aware all-gather
+        whose backward sums grads across the SP group) — and strip the SP pad,
+        before running the SP-agnostic write-back. Default (no hook, no override):
+        identity pass-through of the call-site return dict.
         """
         name = type(self)._omni_hook_name("_omni_post_context", method)
-        if name is None:
-            return outputs
-        return getattr(self, name)(**outputs)
-
-    def supports_sp(self, method: str) -> bool:
-        """True when this module declares a per-module SP loop for call-site ``method``.
-
-        Opt-in: a module supports the looped Ulysses path for ``method`` iff it has
-        an ``@sp_pre_forward(method)``-decorated hook. The graph only drives the SP
-        loop (:func:`~veomni.models.seed_omni.graphs.dispatch.run_sp_looped_endpoint`)
-        when this is ``True`` and the module's scoped ``sp_size > 1``; otherwise the
-        plain ``method`` runs once.
-        """
-        return type(self)._omni_hook_name("_omni_sp_pre_context", method) is not None
-
-    def sp_pre_forward(self, method: str, **kwargs: Any) -> Dict[str, Any]:
-        """Dispatch to the ``@sp_pre_forward(method)`` loop-head hook.
-
-        The graph driver has already broadcast the active sample's ``pre_forward``
-        output to the whole SP group, so ``**kwargs`` is data every rank shares; the
-        hook only slices it to this rank's ``1/sp_size`` shard (+ any per-shard
-        precompute)."""
-        name = type(self)._omni_hook_name("_omni_sp_pre_context", method)
-        if name is None:
-            raise NotImplementedError(
-                f"{type(self).__name__} has no @sp_pre_forward('{method}') hook; "
-                "check `supports_sp(method)` before driving the SP loop."
-            )
-        return getattr(self, name)(**kwargs)
-
-    def sp_post_forward(self, method: str, **outputs: Any) -> Dict[str, Any]:
-        """Dispatch to the ``@sp_post_forward(method)`` loop-tail hook (all-gather
-        this sample's shards onto every rank). Default: identity pass-through."""
-        name = type(self)._omni_hook_name("_omni_sp_post_context", method)
         if name is None:
             return outputs
         return getattr(self, name)(**outputs)
@@ -496,6 +422,4 @@ __all__ = [
     "CPUPreprocessor",
     "pre_forward",
     "post_forward",
-    "sp_pre_forward",
-    "sp_post_forward",
 ]

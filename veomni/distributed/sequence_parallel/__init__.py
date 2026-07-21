@@ -36,12 +36,8 @@ from .data import (
     gather_outputs,
     slice_input_tensor,
     slice_input_tensor_scale_grad,
-    sp_all_gather_shards,
-    sp_broadcast_from_rank,
-    sp_gather_seqs,
     sp_pad,
     sp_pad_and_slice,
-    sp_take_own_seq,
 )
 from .loss import reduce_sequence_parallel_loss
 from .ulysses import (
@@ -67,10 +63,6 @@ __all__ = [
     "get_unified_sequence_parallel_world_size",
     "slice_input_tensor",
     "slice_input_tensor_scale_grad",
-    "sp_gather_seqs",
-    "sp_take_own_seq",
-    "sp_all_gather_shards",
-    "sp_broadcast_from_rank",
     "sp_pad",
     "sp_pad_and_slice",
     "gather_heads_scatter_seq",

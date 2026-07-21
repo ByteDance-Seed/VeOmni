@@ -3,7 +3,7 @@ from typing import Any, Dict, List, Optional
 import torch
 
 from veomni.distributed.parallel_state import get_parallel_state
-from veomni.distributed.sequence_parallel import slice_input_tensor, sp_all_gather_shards
+from veomni.distributed.sequence_parallel import gather_outputs, slice_input_tensor
 
 from ....mixins.metric_meter_mixin import MetricMeterMixin
 from ....mixins.modulemixin import (
@@ -11,8 +11,6 @@ from ....mixins.modulemixin import (
     ModuleMixin,
     post_forward,
     pre_forward,
-    sp_post_forward,
-    sp_pre_forward,
 )
 from ....utils.conversation import ConversationItem, is_dummy, iter_desired_items
 from .configuration import JanusSiglipConfig
@@ -72,7 +70,7 @@ class JanusSiglipModuleMixin(ModuleMixin):
     def init_omni_state(self) -> None:
         # Training state
         self._conversation_carrier: Any = None
-        # Active sample's image count. Under per-module SP the loop-tail
+        # Active sample's image count. Under SP the output-gather hook
         # (``forward_sp_post``) narrows the all-gathered (batch-padded) embeds to it.
         self._sp_own_len: Optional[int] = None
 
@@ -99,40 +97,27 @@ class JanusSiglipModuleMixin(ModuleMixin):
         # is dummy; if any image is real it is False. Passed as a scalar so the
         # modeling forward can short-circuit to a dummy output when appropriate.
         is_dummy_flag = all(is_dummy(it) for it in items)
-        # Metering: this rank's OWN image count. The meter sums over the DP group
-        # only, so each rank reports just its own images (not the module_sp peers a
-        # per-module SP forward redistributes) — identical to the non-SP run for
-        # both SP-disabled and per-module SP.
+        # Metering: this rank's OWN image count, stashed BEFORE the SP slice below.
+        # The meter sums over the DP group only, so each rank reports just its own
+        # images (not the SP peers that hold the same replicated batch) — identical
+        # to the non-SP run for both SP-disabled and uniform SP.
         self._metric_meter_stash_tokens(int(pixel_values.shape[0]))
-        # ``is_dummy`` is only a non-SP inference/eval short-circuit (skip the ViT
-        # for an all-dummy batch that has no anchor to keep). The per-module SP loop
-        # is a training path where we always run the ViT (the FSDP grad anchor), so
-        # ``forward_sp_pre`` drops it — here it stays for the plain (non-SP) forward.
+
+        if get_parallel_state().sp_size > 1:
+            # SP input-slice: hand this rank its ``1/sp_size`` slice of the image
+            # batch (SigLIP shards the batch dim — its ViT attention is not Ulysses;
+            # slicing the replicated batch is exactly per-rank image balance). Every
+            # SP rank already holds the same image batch (the dataloader replicates
+            # each shard); pad it to a multiple of ``sp_size`` and take this rank's
+            # contiguous chunk. ``is_dummy`` is dropped: the SP path is a training
+            # path that always runs the ViT (the FSDP grad anchor). ``forward_post``
+            # all-gathers the shards back.
+            self._sp_own_len = pixel_values.size(0)
+            pixel_values = slice_input_tensor(pixel_values, dim=0, padding=True, group=get_parallel_state().sp_group)
+            return {"pixel_values": pixel_values}
+        # ``is_dummy`` stays for the plain (non-SP) forward: a non-SP inference/eval
+        # short-circuit that skips the ViT for an all-dummy batch with no anchor.
         return {"pixel_values": pixel_values, "is_dummy": is_dummy_flag}
-
-    @sp_pre_forward("forward")
-    def forward_sp_pre(self, pixel_values: torch.Tensor, **kwargs: Any) -> Dict[str, Any]:
-        """SP loop-head: hand this rank its ``1/sp_size`` slice of one image batch
-        (SigLIP shards the batch dim — its ViT attention is not Ulysses).
-
-        The driver has broadcast the active sample's image batch to the whole group;
-        pad it to a multiple of ``sp_size`` and take this rank's contiguous chunk.
-        ``is_dummy`` is dropped (see ``forward_pre``): the SP path always encodes.
-        """
-        del kwargs
-        self._sp_own_len = pixel_values.size(0)
-        pixel_values = slice_input_tensor(pixel_values, dim=0, padding=True, group=get_parallel_state().sp_group)
-        return {"pixel_values": pixel_values}
-
-    @sp_post_forward("forward")
-    def forward_sp_post(self, image_embeds: torch.Tensor, **kwargs: Any) -> Dict[str, Any]:
-        """SP loop-tail: all-gather batch shards so every rank holds this sample's
-        image embeds, then drop the batch pad tail to the sample's real image count."""
-        del kwargs
-        ps = get_parallel_state()
-        image_embeds = sp_all_gather_shards(image_embeds, dim=0, group=ps.sp_group)
-        image_embeds = image_embeds.narrow(0, 0, self._sp_own_len)
-        return {"image_embeds": image_embeds}
 
     def _metric_meter_stash_tokens(self, num_images: int) -> None:
         # One ViT sequence per image; tokens = patches = (image/patch)**2.
@@ -142,12 +127,16 @@ class JanusSiglipModuleMixin(ModuleMixin):
 
     @post_forward("forward")
     def forward_post(self, image_embeds: torch.Tensor) -> Dict[str, Any]:
+        if get_parallel_state().sp_size > 1:
+            # SP output-gather: all-gather batch shards back to the full image batch
+            # (autograd-aware; backward sums grads across the SP group), then drop
+            # the SP pad tail so the count matches its conversation items below.
+            image_embeds = gather_outputs(image_embeds, gather_dim=0, group=get_parallel_state().sp_group)
+            image_embeds = image_embeds.narrow(0, 0, self._sp_own_len)
         conversation = self._conversation_carrier
         self._conversation_carrier = None
         # forward returns one embed row per fed item, in source order; scatter them
-        # back onto the same source items (real or dummy alike). Under per-module SP
-        # the loop-tail (``forward_sp_post``) has already gathered this rank's own
-        # images back, so the count matches its conversation items here.
+        # back onto the same source items (real or dummy alike).
         items = list(iter_desired_items(conversation, types=["image"], sources=[_SOURCE]))
         for item, emb in zip(items, image_embeds, strict=True):
             item.value = emb

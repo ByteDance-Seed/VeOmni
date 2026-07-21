@@ -45,58 +45,67 @@ backbone:
 
 ## Sequence Parallel (Ulysses)
 
-SP is **per-module**. The outer (orchestrator) trainer ALWAYS runs with SP
-disabled (`ulysses_size == 1`, `cp_size == 1`) — it does no per-token compute, so
-`OmniTrainer.__init__` raises if the outer `sp_size != 1`. Do NOT pass a top-level
-`accelerator.ulysses_size`; declare SP on the modules you want sharded via their
-own `accelerator.ulysses_size`. Every rank loads its own DP shard directly (no
-rank-0-only dataloader / broadcast).
+> **Architecture (2026-07-20, implemented — Arch B):** SeedOmni V2 uses classic
+> single-pass Ulysses at ONE **uniform** SP size shared by the outer trainer and
+> every module. The earlier looped per-module SP (Arch A: outer SP=1, distinct
+> per-rank samples, per-sample loop + gather-to-owner + activation offload/ckpt +
+> `fsdp2_ac_patch`) is **deleted**. Decision record + deferred future work
+> (data-balance, compute-packing, audio/video halo): `docs/seed_omni/module_level_sp.md`.
 
-A module declaring `ulysses_size = S > 1` has an SP group of `S` ranks each
-holding a **distinct** per-rank sequence. The graph driver
-(`graphs/dispatch.run_sp_looped_endpoint`) loops over the group's samples so
-every rank builds the **same** autograd topology (no gather-to-one-rank)::
+SP is **uniform**. Set the SP size on the outer trainer
+(`accelerator.ulysses_size`); `OmniTrainer._validate_uniform_sp()` raises at
+build time unless every module's `ulysses_size` equals it. Do NOT add per-module
+`ulysses_size` overrides — modules inherit the outer size. The dataloader is the
+standard `BaseTrainer` build-time sharded loader: it yields `dp_size = world / sp`
+**distinct** shards and **replicates** each shard across its SP group, so every
+rank of an SP group holds the SAME sample.
 
-    for sample_idx in range(sp_size):
-        data = broadcast(rank sample_idx's pre_forward)   # sp_broadcast_from_rank
-        sp_kwargs = module.sp_pre_forward(**data)         # pad + Ulysses/batch slice
-        out = plain_forward(**sp_kwargs)
-        out = module.sp_post_forward(**out)               # sp_all_gather_shards → full sample
+A module with `sp_size = S > 1` runs classic single-pass Ulysses, with the SP
+slice/gather living INSIDE its own `pre_forward` / `post_forward` (no separate
+`sp_pre_forward` / `sp_post_forward` hooks — same shape as veomni v1 single-model
+SP):
 
-Peak activation stays ≈ one sample / `sp_size`. The driver returns this rank's
-sample for `post_forward` / the carrier, folding a fixed-order zero-link over
-all sample outs so backward visits collectives in lockstep.
+    kwargs = module.pre_forward(**data)    # if sp_size>1: pad + slice replicated sample to 1/S
+    out    = module(**kwargs)              # ONE forward; attention all-to-alls over the SP group
+    out    = module.post_forward(**out)    # if sp_size>1: gather_outputs → all-gather + strip pad; then SP-agnostic write-back
 
-Primitives (`distributed/sequence_parallel` + `@sp_pre_forward` / `@sp_post_forward`):
+Forward AND backward both peak at ≈ `1/S` — no loop, no per-sample checkpoint, no
+CPU offload. `gather_outputs` uses autograd-aware `_Gather`; its backward
+all-reduce over the SP group is cancelled by FSDP2's grad averaging over the
+`dp_shard_sp` mesh, so gradients match the non-SP baseline (constraints 7a/7b).
 
-- Loop input: `sp_broadcast_from_rank(tensor, src_group_rank, group)` (shape +
-  dtype in the protocol — peers must not assume the local sample's dtype).
-- Loop head (`@sp_pre_forward`): `sp_pad` + `slice_input_tensor` /
-  `sp_pad_and_slice` to this rank's chunk; stash the sample's real length.
-- Loop tail (`@sp_post_forward`): `sp_all_gather_shards(chunk, dim, group)` so
-  every rank holds the same full sample, then `narrow` off the SP pad.
+Primitives (`distributed/sequence_parallel`), each called from an
+`if get_parallel_state().sp_size > 1:` branch:
+
+- In `pre_forward` (after stashing the full pre-slice seqlens for the meter):
+  `sp_pad` + `slice_input_tensor` / `sp_pad_and_slice` to this rank's `1/S` chunk
+  (rebuild any varlen `cu_seqlens` over the FULL padded sequence first); stash the
+  sample's real pre-pad length for the gather.
+- In `post_forward`: `gather_outputs(chunk, gather_dim, group)` to all-gather the
+  full sequence on every rank, then `narrow` off the SP pad, then fall through to
+  the SP-agnostic write-back.
 
 Which dim shards depends on the module's attention:
-- **Sequence-dim (Ulysses)** — text backbones (`qwen3/llm`, `janus/llama`) shard
-  the packed token sequence; the Qwen3-VL ViT (`qwen3vl/vision`) shards the flat
-  patch sequence. Broadcast the DATA (pixels **and** `grid_thw`), then DERIVE
-  the ViT cu_seqlens metadata from the broadcast `grid_thw` — mirroring the text
-  backbone deriving its FA `cu_seqlens` from the broadcast `position_ids`.
+- **Sequence-dim (Ulysses)** — text backbones (`qwen3/llm`, `janus/llama`,
+  `qwen3vl/llm`) shard the packed token sequence; the Qwen3-VL ViT
+  (`qwen3vl/vision`) shards the flat patch sequence and rebuilds its ViT
+  `cu_seqlens` from the (replicated) `grid_thw`.
 - **Batch-dim** — SigLIP (`janus/siglip`) / VQVAE (`janus/vqvae`), whose attention
-  does not honor Ulysses, shard the image batch instead. DDP modules: call the
-  raw module inside the SP loop (avoid multi-forward reducer); AVG param grads
+  does not honor Ulysses, shard the (replicated) image batch instead — slicing the
+  replicated batch is exactly per-rank image balance. DDP modules AVG param grads
   over `fsdp_group` in `veomni_clip_grad_norm` /
-  `veomni_omni_module_clip_grad_norm` when `sp_size > 1` (same surface as FSDP2).
+  `veomni_omni_module_clip_grad_norm` when `sp_size > 1`, and set
+  `broadcast_buffers=False` under SP (constraints 7e).
 
-**Per-module group isolation.** Modules may run at *different* SP sizes in the
-same graph (e.g. ViT `ulysses_size=2` while the LLM runs `ulysses_size=4`). This
-works because the SP/DP/CP process groups are **ParallelState-local**: the
-`comm.py` getters (`get_ulysses_sequence_parallel_group`,
-`get_unified_sequence_parallel_group`, …) resolve from
-`get_parallel_state().{ulysses,sp,cp,dp}_group` (the current state's device-mesh
-subgroup) — there are no group globals. Since `use_parallel_state` (via the
-graph's `_module_scope`) already scopes `_PARALLEL_STATE` per module for its
-forward and its grad-checkpoint recompute, the global attention integration
+**Per-module group isolation.** Each module builds its OWN `ParallelState`/device
+mesh, so even at the same uniform SP size the modules hold distinct SP subgroup
+objects. This is safe because the SP/DP/CP process groups are
+**ParallelState-local**: the `comm.py` getters
+(`get_ulysses_sequence_parallel_group`, `get_unified_sequence_parallel_group`, …)
+resolve from `get_parallel_state().{ulysses,sp,cp,dp}_group` (the current state's
+device-mesh subgroup) — there are no group globals. Since `use_parallel_state`
+(via the graph's `_module_scope`) already scopes `_PARALLEL_STATE` per module for
+its forward and its grad-checkpoint recompute, the global attention integration
 (`veomni_flash_attention_2_with_sp`, which only reaches the group through
 `get_ulysses_sequence_parallel_group()`) automatically all-to-alls over the
 scoped module's own group. No key bookkeeping. (No group-injection seam: SP unit
@@ -112,12 +121,15 @@ model silently falls back to SDPA — the Ulysses all-to-all lives in the
 flash-attention path, so SDPA leaves the sliced chunk ungathered while the
 cu_seqlens describe the full sequence (a `split_with_sizes` size mismatch).
 
-Metering must stash **pre-gather / pre-slice own-data** seqlens (see
+Metering must stash **pre-slice full-sample** seqlens in `pre_forward` (see
 `module-contract.md` + constraint 7c). All backbones (`qwen3/llm`, `janus/llama`,
-`qwen3vl/llm`) and vision towers (`qwen3vl/vision`, `janus/siglip`, `janus/vqvae`)
-support `module_sp > 1`; the Qwen3-VL in-model backbone (`qwen3vl/llm`) aggregates
-its distinct per-rank sequences including DeepStack visual embeds + 3-row M-RoPE
-`position_ids` (reconciling the mixed real/dummy case with a MAX all-reduce).
+`qwen3vl/llm`), the text encoder (`base/text_encoder`) and vision towers
+(`qwen3vl/vision`, `janus/siglip`, `janus/vqvae`) support `sp_size > 1`. The
+Qwen3-VL in-model backbone (`qwen3vl/llm`) slices the packed sequence INCLUDING
+DeepStack visual embeds + 3-row M-RoPE `position_ids`; since the sample is
+replicated (each rank self-describing), `visual_pos_masks` / per-layer DeepStack
+embeds are normalized to real tensors before the slice (no cross-rank
+reconciliation).
 
 ## Inference
 

@@ -13,11 +13,10 @@ def _allreduce_ddp_sp_grads(model: torch.nn.Module, parallel_state) -> None:
 
     DDP's ``process_group`` is ``dp_group``. Enabling Ulysses/SP shrinks ``dp``
     (``dp_size = world / sp_size``), so that allreduce is often a no-op while each
-    rank still holds only a shard's worth of param grads (token-dim Ulysses,
-    batch-dim Omni loop, or Omni loop calling the raw module to avoid DDP's
-    multi-forward reducer). AVG over ``fsdp_group`` matches FSDP2's effective
-    sync surface — including HSDP, where ``dp_sp`` already contains
-    ``dp_replicate``.
+    rank still holds only a shard's worth of param grads (token-dim Ulysses, or
+    batch-dim Omni SP where a DDP vision tower slices the replicated image batch).
+    AVG over ``fsdp_group`` matches FSDP2's effective sync surface — including
+    HSDP, where ``dp_sp`` already contains ``dp_replicate``.
     """
     group = parallel_state.fsdp_group
     if group is None or dist.get_world_size(group) <= 1:

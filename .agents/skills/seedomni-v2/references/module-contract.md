@@ -49,11 +49,14 @@ A module opts into token / theoretical-FLOPs metering by multi-inheriting
 - **Implement `estimate_flops(seqlens)`** with the module's own FLOPs formula
   (count only what this module computes — e.g. an AR backbone excludes `wte`/`lm_head`).
 
-Critical SP rule: stash **this rank's own** seqlens (pre-gather / pre-slice),
-never the post-`sp_gather_seqs` aggregate. `OmniEnvironMeter` sums tokens
-+ FLOPs over the `dp_group`, so post-gather would over-count by `module_sp` in
-per-module SP. See constraint 7c. A call-site that shouldn't be counted (e.g. a VQ
-codec's `decode`) simply stashes nothing → `[]`.
+Critical SP rule: stash the **full (pre-slice)** per-sample seqlens, not the
+`1/sp` chunk the `pre_forward` SP branch slices to (stash BEFORE that
+`if sp_size > 1:` slice). `OmniEnvironMeter` sums tokens
++ FLOPs over the `dp_group` (which excludes the replicated SP ranks), so the
+full-sample value counted once per DP shard reconstructs the global total; reading
+the sliced forward `data` would under-count by ~`sp`. See constraint 7c. A
+call-site that shouldn't be counted (e.g. a VQ codec's `decode`) simply stashes
+nothing → `[]`.
 
 ## Common Module Shapes
 

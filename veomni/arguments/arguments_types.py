@@ -386,22 +386,6 @@ class FSDPConfig:
         default=True,
         metadata={"help": "Enable reshard after forward for FSDP2."},
     )
-    sp_keep_params_unsharded: bool = field(
-        default=False,
-        metadata={
-            "help": (
-                "Per-module sequence parallel only (SeedOmni V2): keep FSDP2 params "
-                "unsharded across the SP loop's ``sp_size`` back-to-back forwards so "
-                "they all-gather ONCE instead of per forward (param comm drops from "
-                "``sp_size`` all-gathers to one). Trades memory for comm — the full "
-                "unsharded params stay resident for the whole burst. Default False "
-                "(memory-safe): each forward re-fires the normal all-gather/reshard "
-                "hooks. Enable ONLY for a module whose unsharded params comfortably "
-                "fit; a large backbone would OOM. No effect unless the module runs "
-                "per-module SP (``ulysses_size > 1``). Results/grads are identical."
-            )
-        },
-    )
     reshard_after_backward: bool = field(
         default=True,
         metadata={"help": "Enable reshard after backward for FSDP2."},

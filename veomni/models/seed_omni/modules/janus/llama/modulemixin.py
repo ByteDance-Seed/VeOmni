@@ -3,12 +3,12 @@ from typing import Any, Dict, List, Optional
 import torch
 
 from veomni.distributed.parallel_state import get_parallel_state
-from veomni.distributed.sequence_parallel import slice_input_tensor, sp_all_gather_shards, sp_pad
+from veomni.distributed.sequence_parallel import gather_outputs, slice_input_tensor, sp_pad
 from veomni.utils.seqlen_pos_transform_utils import prepare_fa_kwargs_from_position_ids, valid_seqlens_from_cu_seqlens
 from veomni.utils.tensor_utils import naflatten, unflatten
 
 from ....mixins.metric_meter_mixin import MetricMeterMixin
-from ....mixins.modulemixin import ModuleMixin, post_forward, pre_forward, sp_post_forward, sp_pre_forward
+from ....mixins.modulemixin import ModuleMixin, post_forward, pre_forward
 from ....utils.conversation import ConversationItem, is_dummy
 from .configuration import JanusLlamaConfig
 
@@ -18,7 +18,7 @@ class JanusLlamaModuleMixin(ModuleMixin):
         # Training state
         self._conversation_carrier: Optional[list[list[ConversationItem]]] = None
         self._pack_inputs_embeds_shape: Optional[torch.Tensor] = None
-        # Active sample's pre-pad packed length. Under per-module SP the loop-tail
+        # Active sample's pre-pad packed length. Under SP the output-gather hook
         # (``forward_sp_post``) narrows the all-gathered (padded) output back to it.
         self._sp_own_len: Optional[int] = None
 
@@ -56,6 +56,33 @@ class JanusLlamaModuleMixin(ModuleMixin):
         self.metric_meter_set_seqlens(
             "forward", [int(s) for s in valid_seqlens_from_cu_seqlens(cu_seq_lens_q).tolist()]
         )
+
+        if get_parallel_state().sp_size > 1:
+            # SP input-slice: slice the (replicated) packed sample to this rank's
+            # Ulysses shard (+ per-shard ``cu_seqlens``). The dataloader replicates
+            # each shard across the SP group, so ``inputs_embeds`` / ``attention_mask``
+            # / ``position_ids`` are the SAME on every rank. Pad them to a multiple of
+            # ``sp_size``, rebuild FA varlen ``cu_seqlens`` over the padded sample,
+            # then hand this rank only its ``1/sp_size`` chunk (the full-sample
+            # ``cu_seqlens`` above are for metering / the non-SP path only).
+            # ``forward_post`` all-gathers the shards back.
+            group = get_parallel_state().sp_group
+            self._sp_own_len = inputs_embeds.size(1)
+            embeds = sp_pad(inputs_embeds, dim=1, pad_value=0)
+            mask = sp_pad(attention_mask, dim=1, pad_value=1)
+            pids = sp_pad(position_ids, dim=1, pad_value=0)
+            (cu_q, cu_k), (max_q, max_k) = prepare_fa_kwargs_from_position_ids(pids)
+            embeds = slice_input_tensor(embeds, dim=1, padding=False, group=group)
+            pids = slice_input_tensor(pids, dim=1, padding=False, group=group)
+            return dict(
+                inputs_embeds=embeds,
+                attention_mask=mask,
+                position_ids=pids,
+                cu_seq_lens_q=cu_q,
+                cu_seq_lens_k=cu_k,
+                max_length_q=max_q,
+                max_length_k=max_k,
+            )
         return dict(
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
@@ -67,56 +94,16 @@ class JanusLlamaModuleMixin(ModuleMixin):
             **kwargs,
         )
 
-    @sp_pre_forward("forward")
-    def forward_sp_pre(
-        self,
-        inputs_embeds: torch.Tensor,
-        attention_mask: torch.Tensor,
-        position_ids: torch.Tensor,
-        **kwargs: Any,
-    ) -> Dict[str, Any]:
-        """SP loop-head: slice one (already-broadcast) packed sample to this rank's
-        Ulysses shard (+ per-shard ``cu_seqlens``).
-
-        The driver has broadcast the active sample's ``forward_pre`` output to the
-        whole SP group, so ``inputs_embeds`` / ``attention_mask`` / ``position_ids``
-        are the SAME on every rank. This hook pads them to a multiple of ``sp_size``,
-        builds FA varlen ``cu_seqlens`` over the padded sample, then hands this rank
-        only its ``1/sp_size`` chunk. Full-sample ``cu_seqlens`` from ``forward_pre``
-        (in ``**kwargs``) are dropped and recomputed per shard.
-        """
-        del kwargs
-        group = get_parallel_state().sp_group
-        self._sp_own_len = inputs_embeds.size(1)
-        embeds = sp_pad(inputs_embeds, dim=1, pad_value=0)
-        mask = sp_pad(attention_mask, dim=1, pad_value=1)
-        pids = sp_pad(position_ids, dim=1, pad_value=0)
-        (cu_q, cu_k), (max_q, max_k) = prepare_fa_kwargs_from_position_ids(pids)
-        embeds = slice_input_tensor(embeds, dim=1, padding=False, group=group)
-        pids = slice_input_tensor(pids, dim=1, padding=False, group=group)
-        return dict(
-            inputs_embeds=embeds,
-            attention_mask=mask,
-            position_ids=pids,
-            cu_seq_lens_q=cu_q,
-            cu_seq_lens_k=cu_k,
-            max_length_q=max_q,
-            max_length_k=max_k,
-        )
-
-    @sp_post_forward("forward")
-    def forward_sp_post(self, hidden_states: torch.Tensor, **kwargs: Any) -> Dict[str, Any]:
-        """SP loop-tail: all-gather Ulysses shards so every rank holds this sample,
-        then strip the pad added in ``forward_sp_pre``."""
-        del kwargs
-        ps = get_parallel_state()
-        hidden = sp_all_gather_shards(hidden_states, dim=1, group=ps.sp_group)
-        hidden = hidden.narrow(1, 0, self._sp_own_len)
-        return {"hidden_states": hidden, "past_key_values": None}
-
     @post_forward("forward")
     def forward_post(self, **outputs: Any) -> Dict[str, Any]:
         hidden_states = outputs.get("hidden_states")
+
+        if get_parallel_state().sp_size > 1:
+            # SP output-gather: all-gather Ulysses shards back to the full sequence
+            # (autograd-aware; backward sums grads across the SP group), then strip
+            # the SP pad tail so the packed length matches its carrier below.
+            hidden_states = gather_outputs(hidden_states, gather_dim=1, group=get_parallel_state().sp_group)
+            hidden_states = hidden_states.narrow(1, 0, self._sp_own_len)
 
         conversation = self._conversation_carrier
         pack_shape = self._pack_inputs_embeds_shape

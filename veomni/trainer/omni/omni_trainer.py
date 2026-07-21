@@ -96,9 +96,22 @@ class MultiOptimizer:
     (``step`` / ``zero_grad``).  Checkpointing is per-module (handled by each
     module-trainer's :class:`OmniModuleHfCallback` / :class:`OmniModuleLoraCallback`
     against the real per-module optimizer), so no ``state_dict`` is needed here.
+
+    An empty map is allowed when ``allow_empty=True`` (e.g. ``offline_cache`` with
+    every module frozen): ``step`` / ``zero_grad`` become no-ops and
+    ``param_groups`` is ``[]``.
     """
 
-    def __init__(self, optimizers: Dict[str, torch.optim.Optimizer]):
+    def __init__(
+        self,
+        optimizers: Dict[str, torch.optim.Optimizer],
+        *,
+        allow_empty: bool = False,
+    ):
+        if not optimizers:
+            if not allow_empty:
+                raise ValueError("OmniTrainer found no trainable module optimizers to build.")
+            logger.info_rank0("MultiOptimizer: empty — no trainable modules (e.g. offline_cache encode-only).")
         self.optimizers = optimizers
 
     @property
@@ -282,16 +295,8 @@ class OmniTrainer:
 
         self.base._setup()
 
-        # SP is a per-module concern; the orchestrator must run with SP disabled.
-        outer_ps = get_parallel_state()
-        if outer_ps.sp_size != 1:
-            raise ValueError(
-                "OmniTrainer requires the outer (orchestrator) sequence-parallel size to be 1 "
-                f"(got ulysses_size={outer_ps.ulysses_size}, cp_size={outer_ps.cp_size}). "
-                "Declare sequence parallelism per module via each module's accelerator.ulysses_size instead."
-            )
-
         self._build_model()
+        self._validate_uniform_sp()
         self._freeze_model_module()
         self._build_model_assets()
         self._build_data_transform()
@@ -333,6 +338,35 @@ class OmniTrainer:
         logger.info_rank0(
             f"OmniTrainer: composed OmniModel with {len(self.module_names)} modules ({self.module_names})."
         )
+
+    # ── Uniform sequence-parallel size ─────────────────────────────────────────
+
+    def _validate_uniform_sp(self):
+        """Enforce a single, uniform SP size across the outer trainer + all modules.
+
+        SeedOmni runs classic single-pass Ulysses: the outer dataloader replicates
+        each shard across the SP group (``dp_size = world / sp_size``) and every SP
+        module slices that replicated sample to its ``1/sp_size`` chunk. This only
+        works if the outer mesh and every module share ONE SP size — a module at a
+        different ``ulysses_size`` would form a mismatched process group and slice
+        against the wrong replication factor. Fail loudly at build time.
+        """
+        outer_sp = get_parallel_state().sp_size
+        mismatched = {
+            name: mt.parallel_state.sp_size
+            for name, mt in self.module_trainers.items()
+            if mt.parallel_state.sp_size != outer_sp
+        }
+        if mismatched:
+            raise ValueError(
+                "OmniTrainer requires a uniform sequence-parallel size: every module's "
+                f"ulysses_size must equal the outer trainer's ({outer_sp}). Mismatched "
+                f"modules (name: sp_size): {mismatched}. Set the outer "
+                "top-level `accelerator.ulysses_size` (NOT `train.accelerator.*`, which "
+                "OmniArguments overwrites) and drop per-module SP overrides (or set them "
+                "all to the same value)."
+            )
+        logger.info_rank0(f"OmniTrainer: uniform sequence-parallel size = {outer_sp}.")
 
     # ── Freeze (aggregate report) ───────────────────────────────────────────────
 
@@ -410,10 +444,9 @@ class OmniTrainer:
         The build lives on the module-trainer; here we only invoke it and
         collect the result.  ``build_optimizer`` only ever puts ``requires_grad``
         params into the optimizer, so a partially-frozen module just trains its
-        remaining params and a fully-frozen one yields a harmless empty optimizer
-        (``step()`` is a no-op) — no per-module freeze bookkeeping needed.
-        Aggregated behind :class:`MultiOptimizer` so the metering callbacks and
-        train loop see the canonical ``base.optimizer`` surface.
+        remaining params.  A fully-frozen module is skipped. Aggregated behind
+        :class:`MultiOptimizer` (``allow_empty`` for ``offline_cache`` when every
+        module is frozen).
         """
         base = self.base
         self.optimizers: Dict[str, torch.optim.Optimizer] = {}
@@ -422,9 +455,10 @@ class OmniTrainer:
                 with use_parallel_state(module_trainer.parallel_state):
                     module_trainer._build_optimizer()
                 self.optimizers[name] = module_trainer.base.optimizer
-        if not self.optimizers:
-            raise ValueError("OmniTrainer found no trainable module optimizers to build.")
-        base.optimizer = MultiOptimizer(self.optimizers)
+        base.optimizer = MultiOptimizer(
+            self.optimizers,
+            allow_empty=base.args.train.train_type == "offline_cache",
+        )
         logger.info_rank0(f"OmniTrainer: built {len(self.optimizers)} optimizer(s): {list(self.optimizers)}.")
 
     def _build_lr_scheduler(self):
@@ -432,7 +466,8 @@ class OmniTrainer:
 
         Module-trainer schedulers read ``args.train_steps`` (fixed by the shared
         dataset); propagate the global value into each module-trainer's private
-        args copy before invoking the build.
+        args copy before invoking the build. An empty map is fine
+        (``get_last_lr`` → ``[0.0]``), e.g. fully-frozen ``offline_cache``.
         """
         base = self.base
         self.lr_schedulers: Dict[str, Any] = {}

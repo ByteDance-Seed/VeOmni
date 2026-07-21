@@ -4,7 +4,7 @@ import torch
 import torch.nn.functional as F
 
 from ......distributed.parallel_state import get_parallel_state
-from ......distributed.sequence_parallel import slice_input_tensor, sp_all_gather_shards
+from ......distributed.sequence_parallel import gather_outputs, slice_input_tensor
 from ......utils import helper
 from ....graphs.generation_graph import FSM_SIGNAL_KEY
 from ....mixins.metric_meter_mixin import MetricMeterMixin
@@ -13,8 +13,6 @@ from ....mixins.modulemixin import (
     ModuleMixin,
     post_forward,
     pre_forward,
-    sp_post_forward,
-    sp_pre_forward,
 )
 from ....utils.conversation import (
     ConversationItem,
@@ -82,7 +80,7 @@ class JanusVqvaeModuleMixin(ModuleMixin):
     def init_omni_state(self) -> None:
         # Training state
         self._conversation_carrier: Any = None
-        # Active sample's image count. Under per-module SP the encode loop-tail
+        # Active sample's image count. Under SP the encode output-gather hook
         # (``encode_sp_post``) narrows the all-gathered (batch-padded) embeds + VQ ids.
         self._sp_own_len: Optional[int] = None
 
@@ -113,41 +111,26 @@ class JanusVqvaeModuleMixin(ModuleMixin):
         # it is False. Passed as a scalar so ``encode`` can short-circuit to a
         # dummy output when there is no anchor to maintain.
         is_dummy_flag = all(is_dummy(it) for it in items)
-        # Metering: this rank's OWN image count. The meter sums over the DP group
-        # only, so each rank reports just its own images (not the module_sp peers a
-        # per-module SP forward redistributes) — identical to the non-SP run for
-        # both SP-disabled and per-module SP.
+        # Metering: this rank's OWN image count, stashed BEFORE the SP slice below.
+        # The meter sums over the DP group only, so each rank reports just its own
+        # images (not the SP peers that hold the same replicated batch) — identical
+        # to the non-SP run for both SP-disabled and uniform SP.
         self._metric_meter_stash_tokens(int(pixel_values.shape[0]))
-        # ``is_dummy`` is only a non-SP inference/eval short-circuit (skip the codec
-        # for an all-dummy batch with no anchor). The per-module SP loop is a training
-        # path that always runs the codec (the FSDP grad anchor), so ``encode_sp_pre``
-        # drops it — here it stays for the plain (non-SP) encode.
+
+        if get_parallel_state().sp_size > 1:
+            # SP input-slice: hand this rank its ``1/sp_size`` slice of the image
+            # batch (the VQVAE codec shards the batch dim — its attention is not
+            # Ulysses). Every SP rank already holds the same image batch (the
+            # dataloader replicates each shard); pad it to a multiple of ``sp_size``
+            # and take this rank's contiguous chunk. ``is_dummy`` is dropped: the SP
+            # path is a training path that always runs the codec (the FSDP grad
+            # anchor). ``encode_post`` all-gathers the shards back.
+            self._sp_own_len = pixel_values.size(0)
+            pixel_values = slice_input_tensor(pixel_values, dim=0, padding=True, group=get_parallel_state().sp_group)
+            return {"pixel_values": pixel_values}
+        # ``is_dummy`` stays for the plain (non-SP) encode: a non-SP inference/eval
+        # short-circuit that skips the codec for an all-dummy batch with no anchor.
         return {"pixel_values": pixel_values, "is_dummy": is_dummy_flag}
-
-    @sp_pre_forward("encode")
-    def encode_sp_pre(self, pixel_values: torch.Tensor, **kwargs: Any) -> Dict[str, Any]:
-        """SP loop-head: hand this rank its ``1/sp_size`` slice of one image batch
-        (the VQVAE codec shards the batch dim — its attention is not Ulysses).
-
-        The driver has broadcast the active sample's image batch to the whole group;
-        pad it to a multiple of ``sp_size`` and take this rank's contiguous chunk.
-        ``is_dummy`` is dropped (see ``encode_pre``): the SP path always encodes."""
-        del kwargs
-        self._sp_own_len = pixel_values.size(0)
-        pixel_values = slice_input_tensor(pixel_values, dim=0, padding=True, group=get_parallel_state().sp_group)
-        return {"pixel_values": pixel_values}
-
-    @sp_post_forward("encode")
-    def encode_sp_post(self, image_embeds: torch.Tensor, vq_token_ids: torch.Tensor, **kwargs: Any) -> Dict[str, Any]:
-        """SP loop-tail: all-gather batch shards so every rank holds this sample's
-        embeds + VQ ids, then drop the batch pad tail to the sample's real image count."""
-        del kwargs
-        ps = get_parallel_state()
-        image_embeds = sp_all_gather_shards(image_embeds, dim=0, group=ps.sp_group)
-        vq_token_ids = sp_all_gather_shards(vq_token_ids, dim=0, group=ps.sp_group)
-        image_embeds = image_embeds.narrow(0, 0, self._sp_own_len)
-        vq_token_ids = vq_token_ids.narrow(0, 0, self._sp_own_len)
-        return {"image_embeds": image_embeds, "vq_token_ids": vq_token_ids}
 
     def _metric_meter_stash_tokens(self, num_images: int) -> None:
         # VQ image tokens per image; counted on encode only (decode is the
@@ -156,14 +139,20 @@ class JanusVqvaeModuleMixin(ModuleMixin):
 
     @post_forward("encode")
     def encode_post(self, **outputs: Any) -> Dict[str, Any]:
-        conversation = self._conversation_carrier
-        self._conversation_carrier = None
         image_embeds = outputs["image_embeds"]
         vq_token_ids = outputs["vq_token_ids"]
+        if get_parallel_state().sp_size > 1:
+            # SP output-gather: all-gather batch shards back to the full image batch
+            # (autograd-aware; backward sums grads across the SP group), then drop
+            # the SP pad tail so the count matches its conversation items below.
+            image_embeds = gather_outputs(image_embeds, gather_dim=0, group=get_parallel_state().sp_group)
+            vq_token_ids = gather_outputs(vq_token_ids, gather_dim=0, group=get_parallel_state().sp_group)
+            image_embeds = image_embeds.narrow(0, 0, self._sp_own_len)
+            vq_token_ids = vq_token_ids.narrow(0, 0, self._sp_own_len)
+        conversation = self._conversation_carrier
+        self._conversation_carrier = None
         # encode returns one (embed, VQ-id) row per fed item, in source order; scatter
-        # them back onto the same source items (real or dummy alike). Under per-module
-        # SP the loop-tail (``encode_sp_post``) has already gathered this rank's own
-        # images back, so the count matches its conversation items here.
+        # them back onto the same source items (real or dummy alike).
         items = list(iter_desired_items(conversation, types=["image"], sources=[_SOURCE]))
         for item, emb, ids in zip(items, image_embeds, vq_token_ids, strict=True):
             item.value = emb.to(dtype=self.dtype)
@@ -181,8 +170,7 @@ class JanusVqvaeModuleMixin(ModuleMixin):
         # the whole ``dp_sp`` (``fsdp_group``) mesh (``modeling.decode`` →
         # ``reduce_sequence_parallel_loss``), so each rank scoring only its OWN span
         # yields the identical global loss + gradient regardless of the DP/SP split.
-        # Skipping the gather-concat keeps peak logits at this rank's own span (the
-        # looped SP path does not fit a single fsdp-reduced scalar).
+        # Skipping the gather-concat keeps peak logits at this rank's own span.
         return {"hidden_states": hidden_states, "labels": labels, "is_dummy": is_dummy_flag}
 
     @post_forward("decode")
@@ -206,9 +194,8 @@ class JanusVqvaeModuleMixin(ModuleMixin):
         # they build the teacher-forcing span identically. ``all_dummy`` is the
         # batch-level flag returned to ``decode``: True only when *every* gen span
         # is a dummy. Dummy spans are additionally masked with -100 labels so that
-        # a mixed real/dummy span — which happens when a module SP group of
-        # module_sp ranks aggregates distinct per-rank spans — still scores its
-        # real rows and ignores its dummy rows.
+        # a mixed real/dummy batch still scores its real rows and ignores its dummy
+        # rows.
         all_dummy = True
         saw_span = False
         for sample in conversation_list:
