@@ -524,11 +524,22 @@ class BaseTrainer(Stateful, ABC):
         if args.train.chunk_mbs_config.enable:
             kwargs["chunk_mbs_config"] = args.train.chunk_mbs_config
 
+        # Full DCP resume already contains model weights. Skip the HF materialize
+        # pass to avoid a second peak (HF load then DCP overwrite) that can OOM
+        # large MoE jobs on resume. LoRA DCPs are trainable-only and still need HF base.
+        skip_weights_load = args.train.checkpoint.load_path is not None and not bool(args.model.lora_config)
+        if skip_weights_load:
+            logger.info_rank0(
+                f"DCP resume enabled (load_path={args.train.checkpoint.load_path}); "
+                "skipping HF weight materialization before checkpoint restore."
+            )
+
         # Parallelize model
         self.model = build_parallelize_model(
             self.model,
             init_device=args.train.init_device,
             weights_path=args.model.model_path,
+            skip_weights_load=skip_weights_load,
             enable_reshard_after_forward=args.train.accelerator.fsdp_config.reshard_after_forward,
             mixed_precision=args.train.accelerator.fsdp_config.mixed_precision,
             enable_gradient_checkpointing=args.train.gradient_checkpointing.enable,

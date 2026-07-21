@@ -427,16 +427,33 @@ def parallelize_model_fsdp2(
     assert kwargs.get("init_device") == "meta", "Please use init_device: meta for FSDP2"
     materialize_device = "cpu" if enable_fsdp_cpu_offload else get_device_type()
 
-    if weights_path is None:
+    # When resuming from a full DCP (model + optimizer), skip the expensive HF
+    # weight materialization. Callers set this for non-LoRA resumes; LoRA DCPs are
+    # trainable-only and still need the HF base weights.
+    skip_weights_load = kwargs.pop("skip_weights_load", False)
+    is_peft_model = kwargs.pop("is_peft_model", False)
+    adapter_path = kwargs.pop("adapter_path", None)
+    if skip_weights_load and is_peft_model:
+        raise ValueError(
+            "skip_weights_load=True is incompatible with LoRA/PEFT models: DCP is "
+            "trainable-only and the frozen base must still be loaded from weights_path."
+        )
+
+    if weights_path is None or skip_weights_load:
+        if skip_weights_load:
+            logger.info_rank0(
+                "Skipping pretrained weight load for DCP resume; "
+                "parameters will be restored from the distributed checkpoint."
+            )
         model.to_empty(device=materialize_device)
         _reset_hf_initialized_flag(model)
-        model.init_weights()
+        # Random init is unnecessary when DCP will overwrite every parameter.
+        if not skip_weights_load:
+            model.init_weights()
     else:
         from torch.distributed.tensor import distribute_tensor
 
         logger.info_rank0(f"starting to load model weights from {weights_path}...")
-        is_peft_model = kwargs.pop("is_peft_model", False)
-        adapter_path = kwargs.pop("adapter_path", None)
         if is_peft_model:
             if adapter_path is not None:
                 logger.info_rank0(f"also loading lora adapter weights from {adapter_path}...")

@@ -280,11 +280,19 @@ class OptimizerState(Stateful):
             restore_optimizer_param_group_defaults(self.optimizer)
             return
 
-        # Single torch optimizer
+        # Single torch optimizer.
+        # ``strict=False`` matches the DCP planner's allow_partial_load intent:
+        # params that never received a gradient (and thus have no saved Adam
+        # state) keep the default-initialized state that
+        # ``set_optimizer_state_dict`` / ``_init_optim_state`` already created.
+        # Torch 2.11+ raises under the default strict=True when any
+        # requires_grad param is missing from the checkpoint (DeepSeek-V4
+        # indexer ``position_bias`` is one such case on short toy runs).
         set_optimizer_state_dict(
             model=self.model,
             optimizers=self.optimizer,
             optim_state_dict=optim_state_from_dcp_load,
+            options=StateDictOptions(strict=False),
         )
         restore_optimizer_param_group_defaults(self.optimizer)
 
@@ -521,6 +529,10 @@ class DistributedCheckpointer(CheckpointerBase):
         )
 
         cls._load_extra_state(checkpoint_dir=checkpoint_dir, state=state)
+
+        # Drop temporary allocations from DCP load before training resumes.
+        gc.collect()
+        empty_cache()
 
         logger.info_rank0(f"Loaded checkpoint from {checkpoint_dir}")
 

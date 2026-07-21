@@ -171,3 +171,6 @@ nsysoutput/
 
 # Agents worksspace should not be tracked by the primary repo.
 .agents_workspace/
+
+# local checkpoint saveload / resume profile outputs
+test_trainer_saveload_*/

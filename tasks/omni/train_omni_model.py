@@ -250,6 +250,15 @@ def main():
     if hasattr(model, "get_parallel_plan"):
         cpu_load_param_name = getattr(model.get_parallel_plan(), "cpu_load_param_name", None)
 
+    skip_weights_load = args.train.checkpoint.load_path is not None and not bool(
+        getattr(args.model, "lora_config", None)
+    )
+    if skip_weights_load:
+        logger.info_rank0(
+            f"DCP resume path set ({args.train.checkpoint.load_path}); "
+            f"will skip HF weight load from {args.model.model_path}."
+        )
+
     model = build_parallelize_model(
         model,
         weights_path=args.model.model_path,
@@ -264,6 +273,7 @@ def main():
         broadcast_model_weights_from_rank0=args.train.broadcast_model_weights_from_rank0,
         cpu_load_param_name=cpu_load_param_name,
         max_load_broadcast_size=args.train.accelerator.fsdp_config.max_load_broadcast_size,
+        skip_weights_load=skip_weights_load,
     )
     optimizer = build_optimizer(
         model,
