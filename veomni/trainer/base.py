@@ -209,6 +209,9 @@ def _collect_muon_kwargs(optimizer_cfg) -> Dict[str, Any]:
         "ns_coefficients": tuple(optimizer_cfg.muon_ns_coefficients),
         "eps": optimizer_cfg.muon_eps,
         "adjust_lr_fn": optimizer_cfg.muon_adjust_lr_fn,
+        "ns_algorithm": optimizer_cfg.muon_ns_algorithm,
+        "ns_use_kernels": optimizer_cfg.muon_ns_use_kernels,
+        "gram_ns_reset_iterations": tuple(optimizer_cfg.muon_gram_ns_reset_iterations),
     }
 
 

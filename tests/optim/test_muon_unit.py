@@ -29,7 +29,9 @@ from veomni.optim.muon import (  # noqa: E402
     DEFAULT_NS_COEFFICIENTS,
     DEFAULT_NS_STEPS,
     DistributedMuon,
+    batched_gram_newton_schulz,
     batched_newton_schulz,
+    run_newton_schulz,
     split_muon_adamw_params,
 )
 
@@ -263,7 +265,7 @@ class TestBatchedNS:
         "case",
         [
             {"ns_steps": 150, "match": "less than 100"},
-            {"ns_coefficients": (1.0, 2.0), "match": "exactly 3"},
+            {"ns_coefficients": (1.0, 2.0), "match": "Per-step ns_coefficients|exactly 3|Coefficients"},
         ],
         ids=["too_many_steps", "bad_coefficients"],
     )
@@ -277,3 +279,76 @@ class TestBatchedNS:
         out = batched_newton_schulz(torch.zeros(*shape))
         assert torch.isfinite(out).all()
         assert out.shape == tuple(shape)
+
+
+class TestGramNewtonSchulz:
+    """Gram-NS pure torch path + optional Dao-AILab package kernels."""
+
+    def test_rectangular_close_to_standard_same_coeffs(self):
+        x = _sample_2d(32, 128, dtype=torch.float32, seed=7)
+        std = batched_newton_schulz(
+            x.clone(),
+            DEFAULT_NS_COEFFICIENTS,
+            DEFAULT_NS_STEPS,
+            eps=1e-7,
+            compute_dtype=torch.float32,
+        )
+        # No restart + same coeffs => Gram rearrangement should match standard NS.
+        gram = batched_gram_newton_schulz(
+            x.clone(),
+            ns_coefficients=DEFAULT_NS_COEFFICIENTS,
+            ns_steps=DEFAULT_NS_STEPS,
+            eps=1e-7,
+            reset_iterations=(),
+            compute_dtype=torch.float32,
+        )
+        torch.testing.assert_close(gram.float(), std.float(), atol=5e-3, rtol=5e-3)
+
+    def test_3d_batch_shape(self):
+        g = torch.Generator().manual_seed(0)
+        x = torch.randn(4, 16, 64, generator=g, dtype=torch.float32)
+        out = batched_gram_newton_schulz(x, reset_iterations=(2,), compute_dtype=torch.float32)
+        assert out.shape == x.shape
+        assert torch.isfinite(out).all()
+
+    def test_run_dispatch_gram_torch(self):
+        x = _sample_2d(16, 64, dtype=torch.float32, seed=1)
+        out = run_newton_schulz(
+            x,
+            ns_coefficients=DEFAULT_NS_COEFFICIENTS,
+            ns_steps=5,
+            ns_algorithm="gram_newton_schulz",
+            ns_use_kernels=False,
+            gram_ns_reset_iterations=(2,),
+            compute_dtype=torch.float32,
+        )
+        assert out.shape == x.shape
+        assert torch.isfinite(out).all()
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+    def test_package_kernel_optional(self):
+        pytest.importorskip("gram_newton_schulz")
+        x = torch.randn(2, 256, 1024, device="cuda", dtype=torch.bfloat16)
+        out = run_newton_schulz(
+            x,
+            ns_coefficients=DEFAULT_NS_COEFFICIENTS,
+            ns_steps=5,
+            ns_algorithm="gram_newton_schulz",
+            ns_use_kernels=True,
+            gram_ns_reset_iterations=(2,),
+        )
+        assert out.shape == x.shape
+        assert torch.isfinite(out).all()
+
+    def test_distributed_muon_accepts_gram_flags(self):
+        p = nn.Parameter(torch.randn(8, 16))
+        opt = DistributedMuon(
+            [p],
+            lr=1e-3,
+            ns_algorithm="gram_newton_schulz",
+            ns_use_kernels=False,
+            gram_ns_reset_iterations=(2,),
+        )
+        p.grad = torch.randn_like(p)
+        opt.step()
+        assert torch.isfinite(p).all()

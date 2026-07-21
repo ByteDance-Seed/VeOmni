@@ -151,6 +151,36 @@ class OptimizerConfig:
             )
         },
     )
+    muon_ns_algorithm: Literal["newton_schulz", "gram_newton_schulz"] = field(
+        default="newton_schulz",
+        metadata={
+            "help": (
+                "Newton-Schulz variant used by Muon. 'newton_schulz' is the default "
+                "torch.optim.Muon-compatible path; 'gram_newton_schulz' uses the "
+                "Dao-AILab Gram Newton-Schulz rearrangement (optionally with kernels)."
+            )
+        },
+    )
+    muon_ns_use_kernels: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "When muon_ns_algorithm=gram_newton_schulz, prefer Dao-AILab "
+                "gram-newton-schulz + quack CuTeDSL kernels (Hopper/Blackwell). "
+                "If the optional package is not installed, falls back to the pure-PyTorch Gram path."
+            )
+        },
+    )
+    muon_gram_ns_reset_iterations: List[int] = field(
+        default_factory=lambda: [2],
+        metadata={
+            "help": (
+                "Restart indices for Gram Newton-Schulz (applied immediately before "
+                "those iteration indices). Default [2] matches Dao-AILab guidance "
+                "for 5-step schedules."
+            )
+        },
+    )
 
 
 @dataclass
