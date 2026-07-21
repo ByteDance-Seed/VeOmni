@@ -196,14 +196,14 @@ def test_bind_veomni_ops_binds_model_registered_config_slots():
         rms_norm_gated_implementation="eager",
         causal_conv1d_implementation="eager",
         chunk_gated_delta_rule_implementation="eager",
-        dsa_indexer_backend="cudnn",
-        dsa_attention_backend="flashmla_cudnn",
+        dsa_indexer_implementation="cudnn",
+        dsa_attention_implementation="flashmla_cudnn",
     )
-    indexer_slot = OpsConfigSlot("dsa_indexer_backend")
-    attention_slot = OpsConfigSlot("dsa_attention_backend")
+    indexer_slot = OpsConfigSlot("dsa_indexer_implementation")
+    attention_slot = OpsConfigSlot("dsa_attention_implementation")
     fake_module = SimpleNamespace(
-        veomni_dsa_indexer_backend=indexer_slot,
-        veomni_dsa_attention_backend=attention_slot,
+        veomni_dsa_indexer_implementation=indexer_slot,
+        veomni_dsa_attention_implementation=attention_slot,
     )
 
     assert _bind_veomni_ops(fake_module, ops_config)
