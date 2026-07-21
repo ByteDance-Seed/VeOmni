@@ -271,6 +271,59 @@ def test_tulu_text_items_have_no_img_tag():
         assert it.meta == {}
 
 
+def test_tulu_prepends_leading_system_message_to_first_user():
+    conv = {
+        "messages": [
+            {"role": "system", "content": "Answer like a pirate."},
+            {"role": "user", "content": "Where is the treasure?"},
+            {"role": "assistant", "content": "Arr, beyond the reef."},
+        ]
+    }
+
+    constructed, _, _, items = _build("tulu-3-sft-mixture", conv, {})
+
+    expected_user = "<system>\nAnswer like a pirate.\n</system>\nWhere is the treasure?"
+    assert constructed == [
+        ["user", ("text", expected_user)],
+        ["assistant", ("text", "Arr, beyond the reef.")],
+    ]
+    assert [(item.role, item.value) for item in items] == [
+        ("user", expected_user),
+        ("assistant", "Arr, beyond the reef."),
+    ]
+    assert conv["messages"][0] == {"role": "system", "content": "Answer like a pirate."}
+    assert conv["messages"][1] == {"role": "user", "content": "Where is the treasure?"}
+
+
+@pytest.mark.parametrize(
+    "messages",
+    [
+        [
+            {"role": "user", "content": "hello"},
+            {"role": "system", "content": "Answer briefly."},
+            {"role": "assistant", "content": "hi"},
+        ],
+        [
+            {"role": "system", "content": "Answer briefly."},
+            {"role": "system", "content": "Answer precisely."},
+            {"role": "user", "content": "hello"},
+        ],
+    ],
+)
+def test_tulu_rejects_unsupported_system_message_layout(messages):
+    with pytest.raises(ValueError, match="at most one system message, at the beginning"):
+        conv_preprocess("tulu-3-sft-mixture", {"messages": messages}, {})
+
+
+def test_tulu_rejects_system_message_without_user():
+    messages = [
+        {"role": "system", "content": "Answer briefly."},
+        {"role": "assistant", "content": "hello"},
+    ]
+    with pytest.raises(ValueError, match="must contain a user message"):
+        conv_preprocess("tulu-3-sft-mixture", {"messages": messages}, {})
+
+
 def test_preprocessors_return_matching_refs():
     # Non-edit preprocessors echo the sample's media refs unchanged so the
     # transform's fetch_images/fetch_videos see a ref list whose length matches
