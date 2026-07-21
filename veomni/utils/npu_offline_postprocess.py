@@ -120,21 +120,52 @@ def copy_raw_dir(raw_dir: Path, copy_to: str) -> None:
 
 def run_analyse(raw_dir: Path, max_process_number: Optional[int] = None) -> None:
     try:
-        import torch_npu
+        from torch_npu.profiler.profiler import analyse as npu_analyse
     except ImportError as exc:  # pragma: no cover
         raise RuntimeError("torch_npu is required for --analyse") from exc
 
     profiler_path = resolve_analyse_path(raw_dir)
+    trace_path = raw_dir / "ASCEND_PROFILER_OUTPUT" / "trace_view.json"
+    if trace_path.is_file():
+        existing_stat = trace_path.stat()
+        existing_signature = (
+            existing_stat.st_ino,
+            existing_stat.st_size,
+            existing_stat.st_mtime_ns,
+            existing_stat.st_ctime_ns,
+        )
+    else:
+        existing_signature = None
     kwargs = {}
     if max_process_number is not None:
         kwargs["max_process_number"] = max_process_number
-    logger.info("Running torch_npu.profiler.analyse(profiler_path=%s)", profiler_path)
+    logger.info("Running torch_npu.profiler.profiler.analyse(profiler_path=%s)", profiler_path)
     started = time.perf_counter()
-    torch_npu.profiler.analyse(profiler_path=profiler_path, **kwargs)
+    npu_analyse(profiler_path=profiler_path, **kwargs)
+    if not trace_path.is_file():
+        raise FileNotFoundError(f"trace_view.json not found under {raw_dir} after analyse")
+    trace_stat = trace_path.stat()
+    if trace_stat.st_size == 0:
+        raise RuntimeError(f"torch_npu analyse produced an empty trace: {trace_path}")
+    trace_signature = (
+        trace_stat.st_ino,
+        trace_stat.st_size,
+        trace_stat.st_mtime_ns,
+        trace_stat.st_ctime_ns,
+    )
+    if trace_signature == existing_signature:
+        raise RuntimeError(f"torch_npu analyse did not create or update the existing trace: {trace_path}")
+    with open(trace_path, "rb") as trace_file:
+        head = trace_file.read(4096).lstrip()
+        trace_file.seek(max(0, trace_stat.st_size - 4096))
+        tail = trace_file.read().rstrip()
+    if not head.startswith(b"[") or not tail.endswith(b"]"):
+        raise RuntimeError(f"torch_npu analyse produced an incomplete trace: {trace_path}")
     logger.info(
-        "NPU_PROFILE_ANALYSE mode=offline duration_seconds=%.6f raw_dir=%s",
+        "NPU_PROFILE_ANALYSE mode=offline duration_seconds=%.6f raw_dir=%s trace=%s",
         time.perf_counter() - started,
         raw_dir,
+        trace_path,
     )
 
 
@@ -223,7 +254,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--analyse",
         action="store_true",
-        help="Run torch_npu.profiler.analyse to produce Chrome/DB outputs",
+        help="Run torch_npu.profiler.profiler.analyse to produce Chrome/DB outputs",
     )
     parser.add_argument(
         "--upload-cmd",

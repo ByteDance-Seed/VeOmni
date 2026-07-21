@@ -1,10 +1,24 @@
 import json
 import shlex
+import sys
+import types
 
 import pytest
 
 from veomni.utils import hdfs_io
 from veomni.utils import npu_offline_postprocess as post
+
+
+def _install_fake_torch_npu(monkeypatch, analyse):
+    torch_npu = types.ModuleType("torch_npu")
+    profiler_package = types.ModuleType("torch_npu.profiler")
+    profiler_package.__path__ = []
+    profiler_module = types.ModuleType("torch_npu.profiler.profiler")
+    profiler_module.analyse = analyse
+    torch_npu.profiler = profiler_package
+    monkeypatch.setitem(sys.modules, "torch_npu", torch_npu)
+    monkeypatch.setitem(sys.modules, "torch_npu.profiler", profiler_package)
+    monkeypatch.setitem(sys.modules, "torch_npu.profiler.profiler", profiler_module)
 
 
 def test_resolve_raw_dir_accepts_ascend_pt(tmp_path):
@@ -34,6 +48,97 @@ def test_resolve_analyse_path_targets_only_requested_capture(tmp_path):
     sibling.mkdir()
 
     assert post.resolve_analyse_path(raw) == str(raw)
+
+
+def test_run_analyse_uses_public_torch_npu_entrypoint(tmp_path, monkeypatch):
+    raw = tmp_path / "localhost_1_2_ascend_pt"
+    raw.mkdir()
+    calls = []
+
+    def analyse(**kwargs):
+        calls.append(kwargs)
+        output = raw / "ASCEND_PROFILER_OUTPUT"
+        output.mkdir()
+        (output / "trace_view.json").write_text("[]", encoding="utf-8")
+
+    _install_fake_torch_npu(monkeypatch, analyse)
+
+    post.run_analyse(raw, max_process_number=7)
+
+    assert calls == [{"profiler_path": str(raw), "max_process_number": 7}]
+
+
+def test_run_analyse_rejects_silent_parser_failure(tmp_path, monkeypatch):
+    raw = tmp_path / "localhost_1_2_ascend_pt"
+    raw.mkdir()
+    _install_fake_torch_npu(monkeypatch, lambda **_kwargs: None)
+
+    with pytest.raises(FileNotFoundError, match="after analyse"):
+        post.run_analyse(raw)
+
+
+def test_run_analyse_rejects_empty_trace(tmp_path, monkeypatch):
+    raw = tmp_path / "localhost_1_2_ascend_pt"
+    raw.mkdir()
+
+    def analyse(**_kwargs):
+        output = raw / "ASCEND_PROFILER_OUTPUT"
+        output.mkdir()
+        (output / "trace_view.json").touch()
+
+    _install_fake_torch_npu(monkeypatch, analyse)
+
+    with pytest.raises(RuntimeError, match="empty trace"):
+        post.run_analyse(raw)
+
+
+def test_run_analyse_rejects_stale_existing_trace(tmp_path, monkeypatch):
+    raw = tmp_path / "localhost_1_2_ascend_pt"
+    output = raw / "ASCEND_PROFILER_OUTPUT"
+    output.mkdir(parents=True)
+    trace = output / "trace_view.json"
+    trace.write_text("[]", encoding="utf-8")
+    _install_fake_torch_npu(monkeypatch, lambda **_kwargs: None)
+
+    with pytest.raises(RuntimeError, match="did not create or update"):
+        post.run_analyse(raw)
+
+    assert trace.read_text(encoding="utf-8") == "[]"
+
+
+def test_run_analyse_does_not_fallback_to_stale_gzip(tmp_path, monkeypatch):
+    raw = tmp_path / "localhost_1_2_ascend_pt"
+    output = raw / "ASCEND_PROFILER_OUTPUT"
+    output.mkdir(parents=True)
+    trace = output / "trace_view.json"
+    trace.write_text("[]", encoding="utf-8")
+    packed = output / "trace_view.json.gz"
+    packed.write_bytes(b"old-gzip")
+
+    def analyse(**_kwargs):
+        trace.unlink()
+
+    _install_fake_torch_npu(monkeypatch, analyse)
+
+    with pytest.raises(FileNotFoundError, match="after analyse"):
+        post.run_analyse(raw)
+
+    assert packed.read_bytes() == b"old-gzip"
+
+
+def test_run_analyse_rejects_truncated_trace(tmp_path, monkeypatch):
+    raw = tmp_path / "localhost_1_2_ascend_pt"
+    raw.mkdir()
+
+    def analyse(**_kwargs):
+        output = raw / "ASCEND_PROFILER_OUTPUT"
+        output.mkdir()
+        (output / "trace_view.json").write_text('[{"partial": true}', encoding="utf-8")
+
+    _install_fake_torch_npu(monkeypatch, analyse)
+
+    with pytest.raises(RuntimeError, match="incomplete trace"):
+        post.run_analyse(raw)
 
 
 def test_copy_raw_dir_refuses_source_parent_and_existing_target(tmp_path):
