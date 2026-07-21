@@ -52,9 +52,9 @@ class OmniModuleInferencer(OmniModuleTrainer):
     def __init__(
         self,
         args: VeOmniArguments,
-        subfolder_name: str,
+        module_name: str,
     ):
-        self.subfolder_name = subfolder_name
+        self.module_name = module_name
         self.base = BaseTrainer.__new__(BaseTrainer)
         self.base.args = args
 
@@ -76,7 +76,7 @@ class OmniModuleInferencer(OmniModuleTrainer):
             # global current state, so scope the meta-init + FSDP/DDP wrap (which
             # read ``get_parallel_state()``) to it.
             self._setup()
-            with use_parallel_state(self.parallel_state):
+            with use_parallel_state(self.module_name):
                 self.base._build_model()
                 self._build_model_assets()
                 self._freeze_model_module()
@@ -127,7 +127,7 @@ class OmniModuleInferencer(OmniModuleTrainer):
         else:
             device_map = "auto"
         logger.info_rank0(
-            f"OmniModuleInferencer '{self.subfolder_name}': eager load "
+            f"OmniModuleInferencer '{self.module_name}': eager load "
             f"(model_type={model_type}, cls={cls.__name__}, device_map={device_map}) from {model_path}"
         )
         self.base.model = cls.from_pretrained(

@@ -58,7 +58,6 @@ from ..callbacks import (
 
 if TYPE_CHECKING:
     from ...arguments import VeOmniArguments
-    from ...distributed.parallel_state import ParallelState
     from ..callbacks import TrainerState
 
 
@@ -93,16 +92,16 @@ class _OmniModulePayloadMixin:
     """Retarget a single-model checkpoint callback at one OmniModule sub-tree.
 
     Mixed in **before** the concrete base callback so these overrides win.
-    ``self.subfolder_name`` (the module's YAML key, passed in at construction)
+    ``self.module_name`` (the module's YAML key, passed in at construction)
     is the ``<module>/`` subdir every save / load path is nested under.
     """
 
-    def __init__(self, trainer: "BaseTrainer", subfolder_name: str) -> None:
-        self.subfolder_name = subfolder_name
+    def __init__(self, trainer: "BaseTrainer", module_name: str) -> None:
+        self.module_name = module_name
         super().__init__(trainer)
 
     def _module_subdir(self, root: str, state: "TrainerState") -> str:
-        return os.path.join(root, f"global_step_{state.global_step}", self.subfolder_name)
+        return os.path.join(root, f"global_step_{state.global_step}", self.module_name)
 
     def _save_dir(self, state: "TrainerState") -> str:
         return self._module_subdir(self.trainer.args.train.checkpoint.save_path, state)
@@ -112,10 +111,10 @@ class _OmniModulePayloadMixin:
 
     def _load_dir(self) -> Optional[str]:
         load_path = self.trainer.args.train.checkpoint.load_path
-        return None if load_path is None else os.path.join(load_path, self.subfolder_name)
+        return None if load_path is None else os.path.join(load_path, self.module_name)
 
     def _model_assets_dir(self) -> str:
-        return os.path.join(self.trainer.args.train.checkpoint.model_assets_dir, self.subfolder_name)
+        return os.path.join(self.trainer.args.train.checkpoint.model_assets_dir, self.module_name)
 
     def _extra_state(self, state: "TrainerState") -> Dict[str, Any]:
         # Per-model only — the global step / dataloader / environ-meter / rng are
@@ -246,29 +245,32 @@ class OmniModuleTrainer:
     """
 
     base: BaseTrainer
-    parallel_state: "ParallelState"
     _has_trainable_parameters: bool = None
 
     def __init__(
         self,
         args: "VeOmniArguments",
-        subfolder_name: str = "",
+        module_name: str,
     ):
         # Composition (mirrors OmniTrainer): a bare BaseTrainer whose global
         # _setup() is deliberately skipped (owned by OmniTrainer); we call only
         # its per-model build helpers, in order.
         self.base = BaseTrainer.__new__(BaseTrainer)
         self.base.args = args
+        # Single identity for this module: the registry key for its ParallelState
+        # AND the ``<module>/`` checkpoint subdir (one name, no aliases).
+        self.module_name = module_name
 
         # Build this module's own ParallelState (does not mutate the global
-        # current state — that stays the orchestrator's).
+        # current state — that stays the orchestrator's) and register it in the
+        # global parallel-state registry under this module's name.
         self._setup()
 
         # The meta-init + FSDP2/DDP wrap read the *current* global ParallelState
         # via ``get_parallel_state()`` (``build_parallelize_model`` /
         # ``parallelize_model_fsdp2`` / ``torch_parallelize``), so scope them to
-        # this module's state.
-        with use_parallel_state(self.parallel_state):
+        # this module's state (by registry name).
+        with use_parallel_state(self.module_name):
             self.base._build_model()  # meta-init the sub-model from its config.json
 
             # Load this module's own processor / tokenizer and assemble
@@ -288,7 +290,7 @@ class OmniModuleTrainer:
                 self._scope_recompute_to_parallel_state()
 
             # This module's own checkpoint callbacks (DCP resume + HF/LoRA export),
-            # reusing the shared single-model callbacks.  ``subfolder_name`` (the
+            # reusing the shared single-model callbacks.  ``module_name`` (the
             # module's YAML key) is the ``<module>/`` checkpoint subdir.  Optimizer /
             # lr-scheduler are built later via :meth:`_build_optimizer` /
             # :meth:`_build_lr_scheduler` (the orchestrator calls them once
@@ -298,7 +300,7 @@ class OmniModuleTrainer:
             # ``Callback`` captures it (``Callback.__init__`` → ``get_parallel_state()``)
             # as its own ``self.parallel_state``; the runtime ``on_*`` dispatch then
             # needs no wrapper (explicit ownership, mirroring ``BaseTrainer``).
-            self._init_callbacks(subfolder_name)
+            self._init_callbacks()
 
         # Make ``base`` look enough like a single-model trainer for the reused
         # checkpoint callbacks: the dataloader is global (owned by the
@@ -353,14 +355,22 @@ class OmniModuleTrainer:
         distributed process group / device / seed are already initialised once
         by the orchestrator (``OmniTrainer.base._setup``), so here we only build
         **this** module's own device mesh from its (merged) ``train.accelerator``
-        and make it the current global state — so the immediately-following
-        meta-init + _build_parallelized_model (FSDP wrap) read this module's mesh
-        rather than the orchestrator's.  The accelerator is already merged +
-        validated by ``OmniConfig.module_config``; the orchestrator restores its
-        default state after the build loop.
+        and register it.  It is NOT made current here — the build sites scope to
+        it explicitly via ``use_parallel_state(self.module_name)`` so the
+        immediately-following meta-init + _build_parallelized_model (FSDP wrap)
+        read this module's mesh rather than the orchestrator's.  The accelerator
+        is already merged + validated by ``OmniConfig.module_config``.
+
+        The state is registered in the global ``_PARALLEL_STATE_REGISTRY`` under
+        this module's name (``module_name``, unique per OmniConfig and distinct
+        from the orchestrator's ``"base"``), so every scope site re-enters it by
+        name via ``use_parallel_state(self.module_name)`` (the registry is the
+        single source of truth — the module-trainer keeps no local handle).
+        ``init_parallel_state`` never overwrites the orchestrator's current global
+        state — it only adds to the registry / topology cache.
         """
         acc = self.base.args.train.accelerator
-        self.parallel_state = init_parallel_state(
+        init_parallel_state(
             dp_size=acc.dp_size,
             dp_replicate_size=acc.dp_replicate_size,
             dp_shard_size=acc.dp_shard_size,
@@ -373,6 +383,7 @@ class OmniModuleTrainer:
             extra_parallel_names=acc.extra_parallel_names,
             dp_mode=acc.fsdp_config.fsdp_mode,
             async_enabled=acc.enable_async,
+            name=self.module_name,
         )
 
     def _scope_recompute_to_parallel_state(self) -> None:
@@ -387,11 +398,11 @@ class OmniModuleTrainer:
         the omni path runs non-reentrant (``train.gradient_checkpointing.enable_reentrant``
         defaults to ``False``).
         """
-        ps = self.parallel_state
+        name = self.module_name
         gc = self.base.args.train.gradient_checkpointing
 
         def _recompute_context_fn():
-            return nullcontext(), use_parallel_state(ps)
+            return nullcontext(), use_parallel_state(name)
 
         # DDP wraps the model (``.module``) and does not expose
         # ``gradient_checkpointing_enable``; FSDP2 wraps in place. Unwrap so the
@@ -432,31 +443,32 @@ class OmniModuleTrainer:
 
     # ── Callbacks (checkpoint + metric meter; both per-module) ─────────────────
 
-    def _init_callbacks(self, subfolder_name: str):
+    def _init_callbacks(self):
         """Build this module's DCP resume + HF/LoRA export callbacks.
 
         Mirrors :meth:`BaseTrainer._init_callbacks` (the DCP + HF/LoRA half),
         bound to ``self.base`` so the shared callbacks save / load **this**
-        module's weights to its ``<subfolder_name>/`` subdir.
+        module's weights to its ``<module_name>/`` subdir.
 
         Fully-frozen modules (no ``requires_grad`` params) get no-op callbacks:
         there is nothing to train, no optimizer to snapshot, and weights stay
         at the released checkpoint (e.g. offline_cache OE/ViT/VAE).
         """
         base = self.base
+        module_name = self.module_name
         if not any(p.requires_grad for p in base.model.parameters()):
             logger.info_rank0(
-                f"OmniModuleTrainer[{subfolder_name}]: fully frozen — skipping DCP/HF checkpoint callbacks."
+                f"OmniModuleTrainer[{module_name}]: fully frozen — skipping DCP/HF checkpoint callbacks."
             )
             self._has_trainable_parameters = False
             self.checkpointer_callback = _FrozenModuleNoOpCkptCallback(base)
             self.hf_ckpt_callback = _FrozenModuleNoOpCkptCallback(base)
             return
-        self.checkpointer_callback = OmniModuleDcpCallback(base, subfolder_name)
+        self.checkpointer_callback = OmniModuleDcpCallback(base, module_name)
         if base.args.model.lora_config:
-            self.hf_ckpt_callback = OmniModuleLoraCallback(base, subfolder_name)
+            self.hf_ckpt_callback = OmniModuleLoraCallback(base, module_name)
         else:
-            self.hf_ckpt_callback = OmniModuleHfCallback(base, subfolder_name)
+            self.hf_ckpt_callback = OmniModuleHfCallback(base, module_name)
 
     def on_train_begin(self, state):
         self.checkpointer_callback.on_train_begin(state)
