@@ -457,9 +457,10 @@ def main():
                     train_metrics.update({f"training/{k}": v for k, v in step_info.items()})
                     wandb.log(train_metrics, step=global_step)
 
+            # Align with ProfileTraceCallback: barrier around Ascend finalize for
+            # both online and offline analysis so rank0 dump cannot race peers.
             synchronize_profile_finalize = (
                 profile_active
-                and args.train.profile.npu_offline_analysis
                 and helper.IS_NPU_AVAILABLE
                 and global_step == args.train.profile.end_step - 1
                 and dist.is_available()
@@ -472,6 +473,9 @@ def main():
                 profiler.step()
                 if global_step == args.train.profile.end_step:
                     profiler.stop()
+                    # Persistence/upload is owned by create_profiler.on_trace_ready
+                    # (hdfs copy / VEOMNI_UPLOAD_CMD). Do not call helper.upload_trace:
+                    # that helper was never defined on main and would AttributeError.
 
             if synchronize_profile_finalize:
                 dist.barrier()

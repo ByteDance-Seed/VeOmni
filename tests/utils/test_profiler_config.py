@@ -197,6 +197,7 @@ def test_npu_offline_analysis_reports_failed_hdfs_copy(monkeypatch, tmp_path):
     ]
 
 
+@pytest.mark.parametrize("npu_offline_analysis", [True, False])
 @pytest.mark.parametrize(
     ("this_rank", "expected_events"),
     [
@@ -204,11 +205,11 @@ def test_npu_offline_analysis_reports_failed_hdfs_copy(monkeypatch, tmp_path):
         (False, ["barrier", "barrier"]),
     ],
 )
-def test_npu_offline_analysis_synchronizes_finalization(monkeypatch, this_rank, expected_events):
+def test_npu_profile_synchronizes_finalization(monkeypatch, npu_offline_analysis, this_rank, expected_events):
     events = []
     profile_config = SimpleNamespace(
         enable=True,
-        npu_offline_analysis=True,
+        npu_offline_analysis=npu_offline_analysis,
         end_step=6,
         this_rank=this_rank,
     )
@@ -234,9 +235,9 @@ def test_npu_offline_analysis_synchronizes_finalization(monkeypatch, this_rank, 
     assert events == expected_events
 
 
-def test_npu_offline_analysis_stops_without_finalize_barrier_at_end_step(monkeypatch):
+def test_npu_profile_stops_without_finalize_barrier_at_end_step(monkeypatch):
     events = []
-    profile_config = SimpleNamespace(enable=True, npu_offline_analysis=True, end_step=6, this_rank=True)
+    profile_config = SimpleNamespace(enable=True, npu_offline_analysis=False, end_step=6, this_rank=True)
     callback = object.__new__(trace_callback.ProfileTraceCallback)
     callback.trainer = SimpleNamespace(args=SimpleNamespace(train=SimpleNamespace(profile=profile_config)))
     callback._profile_active = True
@@ -252,7 +253,7 @@ def test_npu_offline_analysis_stops_without_finalize_barrier_at_end_step(monkeyp
     assert events == ["step", "stop"]
 
 
-def test_npu_offline_analysis_does_not_synchronize_before_finalize_step(monkeypatch):
+def test_npu_profile_does_not_synchronize_before_finalize_step(monkeypatch):
     events = []
     profile_config = SimpleNamespace(enable=True, npu_offline_analysis=True, end_step=6, this_rank=True)
     callback = object.__new__(trace_callback.ProfileTraceCallback)
@@ -266,6 +267,24 @@ def test_npu_offline_analysis_does_not_synchronize_before_finalize_step(monkeypa
     monkeypatch.setattr(trace_callback.dist, "barrier", lambda: events.append("barrier"))
 
     callback.on_step_end(TrainerState(global_step=4))
+
+    assert events == ["step"]
+
+
+def test_cuda_profile_does_not_use_npu_finalize_barrier(monkeypatch):
+    events = []
+    profile_config = SimpleNamespace(enable=True, npu_offline_analysis=False, end_step=6, this_rank=True)
+    callback = object.__new__(trace_callback.ProfileTraceCallback)
+    callback.trainer = SimpleNamespace(args=SimpleNamespace(train=SimpleNamespace(profile=profile_config)))
+    callback._profile_active = True
+    callback.profiler = SimpleNamespace(step=lambda: events.append("step"), stop=lambda: events.append("stop"))
+
+    monkeypatch.setattr(trace_callback.helper, "IS_NPU_AVAILABLE", False)
+    monkeypatch.setattr(trace_callback.dist, "is_available", lambda: True)
+    monkeypatch.setattr(trace_callback.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(trace_callback.dist, "barrier", lambda: events.append("barrier"))
+
+    callback.on_step_end(TrainerState(global_step=5))
 
     assert events == ["step"]
 

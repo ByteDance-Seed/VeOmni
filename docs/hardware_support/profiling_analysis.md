@@ -74,7 +74,7 @@ train:
     trace_dir: /tmp/veomni_npu_profile
 ```
 
-VeOmni synchronizes all ranks immediately before and after the final profiler step in this mode. This prevents non-profiled ranks from entering the next collective while rank 0 finalizes its raw capture. All ranks must execute the profile callback at the same global step. `start_step` and `end_step` are absolute global steps; VeOmni rebases the remaining schedule after checkpoint resume or a hot update and skips a window that has already elapsed.
+VeOmni synchronizes all ranks immediately before and after the final profiler step on Ascend (both online and offline analysis). This prevents non-profiled ranks from entering the next collective while rank 0 finalizes its capture. Prefer `npu_offline_analysis: true` so that barrier only covers raw finalization rather than a long Chrome/DB export. All ranks must execute the profile callback at the same global step. `start_step` and `end_step` are absolute global steps; VeOmni rebases the remaining schedule after checkpoint resume or a hot update and skips a window that has already elapsed.
 
 Using an `hdfs://` trace directory is supported, but not recommended for large Ascend captures: it still copies the raw directory synchronously before releasing the other ranks and can therefore stall training. Prefer `/tmp` or another pod-local SSD path, then copy the finalized `*_ascend_pt` directory to durable storage from a separate process.
 

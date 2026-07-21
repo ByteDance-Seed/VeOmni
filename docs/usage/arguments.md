@@ -340,7 +340,7 @@ NPU validation runs at two times:
 | with_stack | `bool` | `True` | Record stack traces. |
 | with_modules | `bool` | `False` | Record module hierarchy in profiler traces. |
 | rank0_only | `bool` | `True` | Profile rank 0 only. |
-| npu_offline_analysis | `bool` | `False` | Set Ascend `analyse_flag=False`, synchronize distributed finalization, and defer trace analysis to an offline process. Use a pod-local `trace_dir`. NPU only. |
+| npu_offline_analysis | `bool` | `False` | Set Ascend `analyse_flag=False` and defer Chrome/DB analysis to an offline process. Use a pod-local `trace_dir`. NPU only. Distributed finalization barriers run for all Ascend profiles. |
 
 ### ChannelLossConfig
 

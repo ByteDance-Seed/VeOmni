@@ -194,19 +194,19 @@ class ProfileTraceCallback(Callback):
 
     def on_step_end(self, state: TrainerState, **kwargs) -> None:
         args: "VeOmniArguments" = self.trainer.args
+        # on_trace_ready runs synchronously when the schedule exits its active
+        # window, in profiler.step() at global step end_step - 1. Keep
+        # non-profiled ranks out of the next collective until NPU finalization
+        # (raw dump and optional online analyse) completes on the profiled rank(s).
+        # This applies to both online and offline Ascend analysis.
         synchronize_finalize = (
             self._profile_active
-            and args.train.profile.npu_offline_analysis
             and helper.IS_NPU_AVAILABLE
             and state.global_step == args.train.profile.end_step - 1
             and dist.is_available()
             and dist.is_initialized()
         )
 
-        # on_trace_ready runs synchronously when the schedule exits its active
-        # window, in profiler.step() at global step end_step - 1. Keep
-        # non-profiled ranks out of the next collective until raw finalization
-        # completes on the profiled rank(s).
         if synchronize_finalize:
             dist.barrier()
 
