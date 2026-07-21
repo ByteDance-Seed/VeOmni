@@ -441,6 +441,16 @@ def get_parallel_state_by_name(name: str) -> "ParallelState":
     return _PARALLEL_STATE_REGISTRY[name]
 
 
+def is_parallel_state_registered(name: str) -> bool:
+    """True when ``name`` has a ParallelState in the global registry.
+
+    Distributed Omni modules register their state via ``init_parallel_state(
+    name=...)`` in ``OmniModuleTrainer._setup``; eager modules never do. Callers
+    use this to decide whether a module's forward must be scoped by name.
+    """
+    return name in _PARALLEL_STATE_REGISTRY
+
+
 def init_parallel_state(
     dp_size: int = 1,
     dp_replicate_size: int = 1,

@@ -32,6 +32,7 @@ import torch.distributed as dist
 
 from ...arguments import OmniArguments
 from ...data.multimodal.image_utils import load_image
+from ...distributed.parallel_state import is_parallel_state_registered
 from ...models.seed_omni import build_conversation
 from ...models.seed_omni.graphs import GraphProfiler
 from ...models.seed_omni.modeling_omni import OmniModel, _unwrap_module
@@ -139,9 +140,13 @@ class OmniInferencer(OmniTrainer):
 
         if self._distributed:
             # Only distributed (FSDP / extra-parallel) modules register a
-            # ParallelState under their name; eager modules do not and stay
-            # unscoped. Hand the model the set of registered names.
-            registered_names = [name for name, mi in self.module_inferencers.items() if hasattr(mi, "parallel_state")]
+            # ParallelState under their name (``OmniModuleInferencer._setup`` ->
+            # ``init_parallel_state(name=...)``); eager modules do not and stay
+            # unscoped. Query the registry directly — the old ``parallel_state``
+            # attribute was dropped in the registry refactor, so a ``hasattr``
+            # check silently matched nothing and left every node running under
+            # the default (world) state, corrupting emb/EP collectives.
+            registered_names = [name for name in self.module_inferencers if is_parallel_state_registered(name)]
             if registered_names:
                 self.base.model.set_module_parallel_state_names(registered_names)
         self.base.model_config = omni_config
