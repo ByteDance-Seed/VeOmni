@@ -564,8 +564,7 @@ def _build_muon_with_adamw(
             eps=muon_kwargs.get("eps", 1e-7),
             ns_steps=muon_kwargs.get("ns_steps", 5),
             adjust_lr_fn=muon_kwargs.get("adjust_lr_fn", "match_rms_adamw"),
-            ns_algorithm=muon_kwargs.get("ns_algorithm", "newton_schulz"),
-            ns_use_kernels=muon_kwargs.get("ns_use_kernels", False),
+            ns_implementation=muon_kwargs.get("ns_implementation", "std"),
             gram_ns_reset_iterations=muon_kwargs.get("gram_ns_reset_iterations", (2,)),
         )
 

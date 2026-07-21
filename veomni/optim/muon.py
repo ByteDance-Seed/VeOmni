@@ -57,6 +57,7 @@ __all__ = [
     "DEFAULT_NS_STEPS",
     "DistributedMuon",
     "batched_gram_newton_schulz",
+    "NS_IMPLEMENTATIONS",
     "batched_newton_schulz",
     "run_newton_schulz",
     "split_muon_adamw_params",
@@ -264,8 +265,8 @@ def _package_gram_newton_schulz(
         from gram_newton_schulz import GramNewtonSchulz
     except ImportError as exc:  # pragma: no cover - optional dependency
         raise ImportError(
-            "muon_ns_algorithm='gram_newton_schulz' with muon_ns_use_kernels=True "
-            "requires the gram-newton-schulz package. Install with: "
+            "muon_ns_implementation='gram_quack' requires the gram-newton-schulz "
+            "package. Install with: "
             "`pip install gram-newton-schulz --no-build-isolation` "
             "(needs Hopper/Blackwell + quack-kernels)."
         ) from exc
@@ -285,22 +286,31 @@ def _package_gram_newton_schulz(
     return ortho(grad)
 
 
+# Newton-Schulz backend selectors for DistributedMuon / run_newton_schulz.
+NS_IMPLEMENTATIONS = ("std", "gram", "gram_quack")
+
+
 @torch.no_grad()
 def run_newton_schulz(
     grad: Tensor,
     ns_coefficients: Sequence[Any] = DEFAULT_NS_COEFFICIENTS,
     ns_steps: int = DEFAULT_NS_STEPS,
     eps: float = EPS,
-    ns_algorithm: str = "newton_schulz",
-    ns_use_kernels: bool = False,
+    ns_implementation: str = "std",
     gram_ns_reset_iterations: Sequence[int] = (2,),
     compute_dtype: Optional[torch.dtype] = None,
 ) -> Tensor:
-    """Dispatch Newton-Schulz / Gram Newton-Schulz for a ``[..., M, K]`` update."""
-    if ns_algorithm not in ("newton_schulz", "gram_newton_schulz"):
-        raise ValueError(f"Unknown ns_algorithm={ns_algorithm!r}; expected 'newton_schulz' or 'gram_newton_schulz'")
+    """Dispatch Newton-Schulz / Gram Newton-Schulz for a ``[..., M, K]`` update.
 
-    if ns_algorithm == "newton_schulz":
+    ``ns_implementation``:
+      - ``std``: default torch Muon-compatible Newton-Schulz
+      - ``gram``: pure-PyTorch Gram Newton-Schulz
+      - ``gram_quack``: quack CuTeDSL GEMM kernels (falls back to ``gram`` if unavailable)
+    """
+    if ns_implementation not in NS_IMPLEMENTATIONS:
+        raise ValueError(f"Unknown ns_implementation={ns_implementation!r}; expected one of {NS_IMPLEMENTATIONS}")
+
+    if ns_implementation == "std":
         schedule = _as_coeff_schedule(ns_coefficients, ns_steps)
         return batched_newton_schulz(
             grad,
@@ -311,7 +321,7 @@ def run_newton_schulz(
         )
 
     schedule = _as_coeff_schedule(ns_coefficients, ns_steps)
-    if ns_use_kernels:
+    if ns_implementation == "gram_quack":
         try:
             return _package_gram_newton_schulz(
                 grad,
@@ -471,8 +481,7 @@ class DistributedMuon(Optimizer):
         eps: float = EPS,
         ns_steps: int = DEFAULT_NS_STEPS,
         adjust_lr_fn: Optional[str] = None,
-        ns_algorithm: str = "newton_schulz",
-        ns_use_kernels: bool = False,
+        ns_implementation: str = "std",
         gram_ns_reset_iterations: Sequence[int] = (2,),
     ) -> None:
         if not _MUON_AVAILABLE:
@@ -489,8 +498,8 @@ class DistributedMuon(Optimizer):
             raise ValueError(f"weight decay should be >= 0 but is: {weight_decay}")
         if adjust_lr_fn is not None and adjust_lr_fn not in ("original", "match_rms_adamw"):
             raise ValueError(f"Adjust learning rate function {adjust_lr_fn} is not supported")
-        if ns_algorithm not in ("newton_schulz", "gram_newton_schulz"):
-            raise ValueError(f"ns_algorithm must be 'newton_schulz' or 'gram_newton_schulz', got {ns_algorithm!r}")
+        if ns_implementation not in NS_IMPLEMENTATIONS:
+            raise ValueError(f"ns_implementation must be one of {NS_IMPLEMENTATIONS}, got {ns_implementation!r}")
 
         defaults: Dict[str, Any] = {
             "lr": lr,
@@ -501,8 +510,7 @@ class DistributedMuon(Optimizer):
             "eps": eps,
             "ns_steps": ns_steps,
             "adjust_lr_fn": adjust_lr_fn,
-            "ns_algorithm": ns_algorithm,
-            "ns_use_kernels": bool(ns_use_kernels),
+            "ns_implementation": ns_implementation,
             "gram_ns_reset_iterations": tuple(int(i) for i in gram_ns_reset_iterations),
         }
         super().__init__(params, defaults)
@@ -533,8 +541,7 @@ class DistributedMuon(Optimizer):
             ns_steps = int(group["ns_steps"])
             eps = float(group["eps"])
             adjust_lr_fn = group["adjust_lr_fn"]
-            ns_algorithm = str(group.get("ns_algorithm", "newton_schulz"))
-            ns_use_kernels = bool(group.get("ns_use_kernels", False))
+            ns_implementation = str(group.get("ns_implementation", "std"))
             gram_ns_reset_iterations = tuple(group.get("gram_ns_reset_iterations", (2,)))
 
             for p in group["params"]:
@@ -561,8 +568,7 @@ class DistributedMuon(Optimizer):
                     ns_coefficients,
                     ns_steps,
                     eps,
-                    ns_algorithm=ns_algorithm,
-                    ns_use_kernels=ns_use_kernels,
+                    ns_implementation=ns_implementation,
                     gram_ns_reset_iterations=gram_ns_reset_iterations,
                 )
 
@@ -592,8 +598,7 @@ class DistributedMuon(Optimizer):
         ns_coefficients: Tuple[float, float, float],
         ns_steps: int,
         eps: float,
-        ns_algorithm: str = "newton_schulz",
-        ns_use_kernels: bool = False,
+        ns_implementation: str = "std",
         gram_ns_reset_iterations: Sequence[int] = (2,),
     ) -> Tensor:
         """Run Newton-Schulz on ``update`` according to its layout kind."""
@@ -604,8 +609,7 @@ class DistributedMuon(Optimizer):
                 ns_coefficients=ns_coefficients,
                 ns_steps=ns_steps,
                 eps=eps,
-                ns_algorithm=ns_algorithm,
-                ns_use_kernels=ns_use_kernels,
+                ns_implementation=ns_implementation,
                 gram_ns_reset_iterations=gram_ns_reset_iterations,
             )
 

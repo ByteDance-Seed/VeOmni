@@ -90,8 +90,7 @@ def main() -> None:
             x,
             ns_coefficients=DEFAULT_NS_COEFFICIENTS,
             ns_steps=5,
-            ns_algorithm="gram_newton_schulz",
-            ns_use_kernels=False,
+            ns_implementation="gram",
             gram_ns_reset_iterations=(2,),
         )
 
@@ -105,8 +104,7 @@ def main() -> None:
                 x,
                 ns_coefficients=DEFAULT_NS_COEFFICIENTS,
                 ns_steps=5,
-                ns_algorithm="gram_newton_schulz",
-                ns_use_kernels=False,
+                ns_implementation="gram",
                 gram_ns_reset_iterations=(2,),
             )
 
@@ -141,8 +139,7 @@ def main() -> None:
                 x,
                 ns_coefficients=DEFAULT_NS_COEFFICIENTS,
                 ns_steps=5,
-                ns_algorithm="gram_newton_schulz",
-                ns_use_kernels=True,
+                ns_implementation="gram_quack",
                 gram_ns_reset_iterations=(2,),
             )
 

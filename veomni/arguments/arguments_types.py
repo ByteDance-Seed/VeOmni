@@ -151,23 +151,16 @@ class OptimizerConfig:
             )
         },
     )
-    muon_ns_algorithm: Literal["newton_schulz", "gram_newton_schulz"] = field(
-        default="newton_schulz",
+    muon_ns_implementation: Literal["std", "gram", "gram_quack"] = field(
+        default="std",
         metadata={
             "help": (
-                "Newton-Schulz variant used by Muon. 'newton_schulz' is the default "
-                "torch.optim.Muon-compatible path; 'gram_newton_schulz' uses the "
-                "Dao-AILab Gram Newton-Schulz rearrangement (optionally with kernels)."
-            )
-        },
-    )
-    muon_ns_use_kernels: bool = field(
-        default=False,
-        metadata={
-            "help": (
-                "When muon_ns_algorithm=gram_newton_schulz, prefer Dao-AILab "
-                "gram-newton-schulz + quack CuTeDSL kernels (Hopper/Blackwell). "
-                "If the optional package is not installed, falls back to the pure-PyTorch Gram path."
+                "Newton-Schulz implementation used by Muon. "
+                "'std' (default): torch.optim.Muon-compatible Newton-Schulz; "
+                "'gram': pure-PyTorch Dao-AILab Gram Newton-Schulz; "
+                "'gram_quack': Dao-AILab Gram-NS with quack CuTeDSL GEMM kernels "
+                "(Hopper/Blackwell). If quack/package is missing, gram_quack "
+                "falls back to gram."
             )
         },
     )

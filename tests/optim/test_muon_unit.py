@@ -317,8 +317,7 @@ class TestGramNewtonSchulz:
             x,
             ns_coefficients=DEFAULT_NS_COEFFICIENTS,
             ns_steps=5,
-            ns_algorithm="gram_newton_schulz",
-            ns_use_kernels=False,
+            ns_implementation="gram",
             gram_ns_reset_iterations=(2,),
             compute_dtype=torch.float32,
         )
@@ -333,8 +332,7 @@ class TestGramNewtonSchulz:
             x,
             ns_coefficients=DEFAULT_NS_COEFFICIENTS,
             ns_steps=5,
-            ns_algorithm="gram_newton_schulz",
-            ns_use_kernels=True,
+            ns_implementation="gram_quack",
             gram_ns_reset_iterations=(2,),
         )
         assert out.shape == x.shape
@@ -345,8 +343,7 @@ class TestGramNewtonSchulz:
         opt = DistributedMuon(
             [p],
             lr=1e-3,
-            ns_algorithm="gram_newton_schulz",
-            ns_use_kernels=False,
+            ns_implementation="gram",
             gram_ns_reset_iterations=(2,),
         )
         p.grad = torch.randn_like(p)
