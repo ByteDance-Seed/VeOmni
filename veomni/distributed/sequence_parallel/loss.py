@@ -64,4 +64,10 @@ class ReduceLoss(torch.autograd.Function):
 
 
 def reduce_sequence_parallel_loss(loss: torch.Tensor, num_valid_tokens: torch.Tensor, group=None) -> torch.Tensor:
+    # Direct module calls and CPU unit tests may run before torch.distributed is
+    # initialized. In that case there is only one local loss to reduce. Keep the
+    # all-dummy behavior aligned with the distributed path while preserving a
+    # zero-gradient connection to ``loss``.
+    if not dist.is_available() or not dist.is_initialized():
+        return torch.where(num_valid_tokens > 0, loss, torch.zeros_like(loss))
     return ReduceLoss.apply(loss, num_valid_tokens, group)
