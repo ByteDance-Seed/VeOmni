@@ -44,10 +44,19 @@ class EmbParallelMixin:
           in-place ``detach_`` of a grad-requiring DTensor); keep grad in training
           so the kernel's backward reaches the sharded param.
 
+        With ``emb`` OFF the weight is still a DTensor -- a plain FSDP2 ``Shard(0)``
+        over ``dp_shard`` -- because a tied head reads ``embed_tokens.weight``
+        directly, bypassing the embedding's own FSDP2 unshard hook. There is no
+        ``emb`` group to consult, so ``full_tensor()`` all-gathers the whole
+        ``[vocab, hidden]`` table for the plain ``F.linear`` projection (grad kept
+        in training, detached in inference, as above).
+
         Non-DTensor weights (single replica / eager) pass through unchanged.
         """
         if not isinstance(weight, DTensor):
             return weight
+        if not EmbParallelMixin.emb_parallel_active():
+            return weight.full_tensor() if torch.is_grad_enabled() else weight.detach().full_tensor()
         ps = get_parallel_state()
         if ps.extra_parallel_fsdp_size("emb") == 1:
             return weight.to_local()
