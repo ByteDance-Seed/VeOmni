@@ -216,6 +216,75 @@ class TestWaitForPendingSave:
         mock_dist.barrier.assert_not_called()
 
 
+class TestDcpToHfDtypeConversion:
+    def test_save_dtype_only_casts_floating_tensors(self):
+        import tempfile
+
+        import torch.distributed.checkpoint as dcp
+
+        from veomni.checkpoint.dcp_checkpointer import _get_sharding_plan, _process_shard
+
+        fp8_dtype = getattr(torch, "float8_e4m3fn", None)
+        if fp8_dtype is None:
+            pytest.skip("torch.float8_e4m3fn is unavailable")
+
+        state_dict = {
+            "model.weight": torch.ones(4, dtype=torch.float32),
+            "model.tid2eid": torch.arange(8, dtype=torch.int64),
+            "model.flag": torch.tensor([True, False]),
+            "model.fp8": torch.tensor([1.0, 2.0], dtype=fp8_dtype),
+        }
+
+        with tempfile.TemporaryDirectory() as checkpoint_path:
+            dcp.save(state_dict, checkpoint_id=checkpoint_path)
+            bf16_shards, bf16_total_size, _ = _get_sharding_plan(
+                checkpoint_path,
+                shard_size=5,
+                save_dtype="bfloat16",
+            )
+            native_shards, native_total_size, _ = _get_sharding_plan(
+                checkpoint_path,
+                shard_size=5,
+                save_dtype=None,
+            )
+
+            bf16_state = {}
+            for shard in bf16_shards:
+                bf16_state.update(_process_shard(shard, checkpoint_path, save_dtype="bfloat16"))
+
+            native_state = {}
+            for shard in native_shards:
+                native_state.update(_process_shard(shard, checkpoint_path, save_dtype=None))
+
+        expected_bf16_size = 0
+        expected_native_size = 0
+        for tensor in state_dict.values():
+            expected_native_size += tensor.numel() * tensor.element_size()
+            output_element_size = (
+                torch.empty((), dtype=torch.bfloat16).element_size()
+                if tensor.is_floating_point()
+                else tensor.element_size()
+            )
+            expected_bf16_size += tensor.numel() * output_element_size
+
+        assert bf16_total_size == expected_bf16_size
+        assert native_total_size == expected_native_size
+        assert len(bf16_shards) == 4
+        assert len(native_shards) == 3
+        assert set(native_shards[0]) == {"flag", "fp8"}
+
+        assert bf16_state["weight"].dtype == torch.bfloat16
+        assert bf16_state["fp8"].dtype == torch.bfloat16
+        assert bf16_state["tid2eid"].dtype == torch.int64
+        assert bf16_state["flag"].dtype == torch.bool
+        torch.testing.assert_close(bf16_state["tid2eid"], state_dict["model.tid2eid"])
+
+        assert native_state["weight"].dtype == torch.float32
+        assert native_state["fp8"].dtype == fp8_dtype
+        assert native_state["tid2eid"].dtype == torch.int64
+        assert native_state["flag"].dtype == torch.bool
+
+
 # ---------------------------------------------------------------------------
 # Partial save/load (LoRA / trainable_only path)
 # ---------------------------------------------------------------------------

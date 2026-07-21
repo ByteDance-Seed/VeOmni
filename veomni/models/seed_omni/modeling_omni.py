@@ -77,7 +77,7 @@ handled by the logger.
 """
 
 from contextlib import nullcontext
-from typing import Any, Dict, Iterator, List, Mapping, Optional, Tuple
+from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional, Tuple
 
 import torch.nn as nn
 
@@ -189,11 +189,13 @@ class OmniModel(nn.Module):
         # training analogue of ``_generated`` / ``_collect_generated``).
         self._losses: Dict[str, Any] = {}
 
-        # ``{module_name: ParallelState}`` — set by the trainer so each node's
-        # forward runs under its module's own device mesh / extra-parallel
-        # groups (see :meth:`set_module_parallel_states`).  Empty by default so
-        # the runtime stays importable without a trainer (the print-flow tests).
-        self._module_parallel_states: Dict[str, Any] = {}
+        # Module names whose ParallelState is registered in the global
+        # ``_PARALLEL_STATE_REGISTRY`` (set by the trainer via
+        # :meth:`set_module_parallel_state_names`).  ``_module_scope`` scopes a
+        # node's forward under its module's mesh by *name* (registry lookup).
+        # Empty by default so the runtime stays importable without a trainer
+        # (print-flow tests) and eager single-process inference stays unscoped.
+        self._module_parallel_state_names: set = set()
 
         # Prime per-request inference runtime state (FSM at its initial
         # state).  :meth:`generate` deliberately does NOT reset, so a future
@@ -221,27 +223,33 @@ class OmniModel(nn.Module):
         """
         return list(self._generated)
 
-    def set_module_parallel_states(self, module_parallel_states: Mapping[str, Any]) -> None:
-        """Register ``{module_name: ParallelState}`` for per-node forward scoping.
+    def set_module_parallel_state_names(self, module_names: Iterable[str]) -> None:
+        """Register which module names have a ParallelState in the global registry.
 
-        Called by :class:`~veomni.trainer.omni.omni_trainer.OmniTrainer` after the
-        modules are built so each node's pre/forward/post runs under its own
+        Called by :class:`~veomni.trainer.omni.omni_trainer.OmniTrainer` (and the
+        inferencer) after the modules are built. Each module trainer registers its
+        own :class:`ParallelState` under its module name via ``init_parallel_state(
+        name=...)``; here we only record the *set of names* so each node's
+        pre/forward/post can be scoped by name (registry lookup) under its own
         module's device mesh / extra-parallel groups — needed when modules use
-        different parallelism (e.g. a vocab-parallel ``emb`` embedding whose
-        forward all-reduces over the ``emb`` group, or an EP MoE module whose
-        kernels read ``get_parallel_state().ep_group``).
+        different parallelism (e.g. a vocab-parallel ``emb`` embedding whose forward
+        all-reduces over the ``emb`` group, or an EP MoE module whose kernels read
+        ``get_parallel_state().ep_group``). Only distributed modules are passed
+        (eager single-process inference modules stay unscoped).
         """
-        self._module_parallel_states = dict(module_parallel_states)
+        self._module_parallel_state_names = set(module_names)
 
     def _module_scope(self, module_name: str):
         """Context manager scoping ``module_name``'s ParallelState as current.
 
         Used by both training ``forward`` and the inference ``generate`` FSM
-        (passed as ``scope_fn`` to :meth:`GenerationGraph.step`).  No-op when no
-        per-module states are registered (e.g. eager single-process inference).
+        (passed as ``scope_fn`` to :meth:`GenerationGraph.step`).  Resolves the
+        state from the global registry by name; no-op when the module has no
+        registered state (e.g. eager single-process inference / print-flow tests).
         """
-        ps = self._module_parallel_states.get(module_name)
-        return use_parallel_state(ps) if ps is not None else nullcontext()
+        if module_name in self._module_parallel_state_names:
+            return use_parallel_state(module_name)
+        return nullcontext()
 
     # ── Training ──────────────────────────────────────────────────────────────
 

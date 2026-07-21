@@ -9,6 +9,12 @@
 #  It contains a patched version of the original HuggingFace modeling code.
 #
 #  Patches applied:
+#    - method_override: DeepseekV4RMSNorm.forward
+#      OpSlot guard for Liger fused weighted RMSNorm with official eager FP32 fallback
+#    - method_override: DeepseekV4UnweightedRMSNorm.forward
+#      OpSlot guard for Liger fused unweighted RMSNorm
+#    - method_override: DeepseekV4RotaryEmbedding.forward
+#      Retain FP32 cos/sin for inference and use activation dtype for checkpoint-stable training
 #    - method_override: DeepseekV4HyperConnection.forward
 #      Dispatch DeepSeek V4 mHC pre/Sinkhorn/collapse through an OpSlot
 #    - method_override: DeepseekV4HyperHead.forward
@@ -26,9 +32,15 @@
 #    - function_replacement: eager_attention_forward
 #      Optional TileLang sparse MQA dispatch
 #    - method_override: DeepseekV4Model.forward
-#      Propagate packed sequence boundaries to compressed attention
+#      Propagate packed boundaries and preserve stateless indexer dispatch
 #    - class_replacement: DeepseekV4Experts
 #      Use v5 gate_up_proj expert layout with OpSlot-guarded VeOmni fused-MoE path
+#    - method_override: DeepseekV4MLP.forward
+#      Clamp-aware shared-expert SwiGLU with optional Liger fused silu-mul
+#    - method_override: DeepseekV4TopKRouter.forward
+#      Match the official DeepSeek-V4 FP32 router projection
+#    - method_override: DeepseekV4HashRouter.forward
+#      Match the official DeepSeek-V4 FP32 hash-router projection
 #    - method_override: DeepseekV4ForCausalLM.forward
 #      OpSlot guard for fused cross entropy in DeepseekV4ForCausalLM.forward
 #    - method_override: DeepseekV4ForCausalLM.get_parallel_plan
@@ -75,13 +87,22 @@ from veomni.utils.model_outputs import MoeCausalLMOutputWithLogProbs
 
 
 veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
+veomni_rms_norm = OpSlot("rms_norm", "standard")
+veomni_unweighted_rms_norm = OpSlot("rms_norm", "unweighted")
+veomni_swiglu_mlp = OpSlot("swiglu_mlp", "standard")
 veomni_moe_experts_forward = OpSlot("moe_experts", "standard")
 veomni_load_balancing_loss = OpSlot("load_balancing_loss", "standard")
 veomni_mhc_pre = OpSlot("mhc", "pre")
 veomni_mhc_post = OpSlot("mhc", "post")
 veomni_mhc_head = OpSlot("mhc", "head")
-veomni_dsa_indexer_backend = OpsConfigSlot("dsa_indexer_backend")
-veomni_dsa_attention_backend = OpsConfigSlot("dsa_attention_backend")
+veomni_dsa_indexer_implementation = OpsConfigSlot("dsa_indexer_implementation")
+veomni_dsa_attention_implementation = OpsConfigSlot("dsa_attention_implementation")
+
+
+# ======================================================================
+# [MODIFIED CLASS] DeepseekV4RMSNorm
+# Methods patched: forward
+# ======================================================================
 
 
 @use_kernel_forward_from_hub("RMSNorm")
@@ -94,15 +115,27 @@ class DeepseekV4RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
 
+    # ================================================================
+    # Patch: DeepSeek V4 RMSNorm dispatch
+    # ================================================================
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if veomni_rms_norm.use_non_eager_impl:
+            return veomni_rms_norm(hidden_states, self.weight, self.variance_epsilon)
+
         input_dtype = hidden_states.dtype
-        hidden_states = hidden_states.to(torch.float32)
-        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states.float()
+        variance = hidden_states.square().mean(-1, keepdim=True)
         hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
-        return self.weight * hidden_states.to(input_dtype)
+        return (self.weight.float() * hidden_states).to(input_dtype)
 
     def extra_repr(self):
         return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
+
+
+# ======================================================================
+# [MODIFIED CLASS] DeepseekV4UnweightedRMSNorm
+# Methods patched: forward
+# ======================================================================
 
 
 class DeepseekV4UnweightedRMSNorm(nn.Module):
@@ -111,7 +144,16 @@ class DeepseekV4UnweightedRMSNorm(nn.Module):
         self.eps = eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if veomni_unweighted_rms_norm.use_non_eager_impl:
+            return veomni_unweighted_rms_norm(x, None, self.eps)
+
         return x * torch.rsqrt(x.float().square().mean(-1, keepdim=True) + self.eps).to(x.dtype)
+
+
+# ======================================================================
+# [MODIFIED CLASS] DeepseekV4RotaryEmbedding
+# Methods patched: forward
+# ======================================================================
 
 
 class DeepseekV4RotaryEmbedding(nn.Module):
@@ -190,14 +232,12 @@ class DeepseekV4RotaryEmbedding(nn.Module):
         )
         return inv_freq, attention_factor
 
+    # ================================================================
+    # Patch: official RoPE table precision and checkpoint-stable training dtype
+    # ================================================================
     @torch.no_grad()
     @dynamic_rope_update  # power user: used with advanced RoPE types (e.g. dynamic rope)
     def forward(self, x, position_ids, layer_type=None):
-        # Key difference vs Laguna's forward: no `torch.cat([freqs, freqs], dim=-1)`
-        # duplication. V4's interleaved RoPE pairs consecutive channels, so we only need
-        # `rope_head_dim // 2` unique θ entries — the `apply_rotary_pos_emb` helper does
-        # the `repeat_interleave(2)` next to the rotation math, where the link between
-        # the doubled dim and `rotate_half` is local and obvious.
         inv_freq = getattr(self, f"{layer_type}_inv_freq")
         attention_scaling = getattr(self, f"{layer_type}_attention_scaling")
         inv_freq_expanded = inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)
@@ -207,7 +247,9 @@ class DeepseekV4RotaryEmbedding(nn.Module):
             freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
             cos = freqs.cos() * attention_scaling
             sin = freqs.sin() * attention_scaling
-        return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
+        if self.training:
+            return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
+        return cos, sin
 
 
 class DeepseekV4HCACache(DynamicSlidingWindowLayer):
@@ -576,7 +618,7 @@ class DeepseekV4Indexer(nn.Module):
     # ================================================================
     # Patch: DeepseekV4Indexer.forward
     # 1. Dispatch CUDA prefill/training index scoring to the TileLang Lightning
-    #    Indexer when ``dsa_indexer_backend=tilelang``. Cache/decode and unusual
+    #    Indexer when ``dsa_indexer_implementation=tilelang``. Cache/decode and unusual
     #    position layouts retain the upstream eager implementation.
     # ================================================================
     def forward(
@@ -663,17 +705,18 @@ class DeepseekV4Indexer(nn.Module):
         top_k = min(self.index_topk, compressed_len)
 
         # --- Patch.1 ---
-        indexer_backend = veomni_dsa_indexer_backend.value
-        if indexer_backend not in {"eager", "tilelang"}:
+        indexer_implementation = veomni_dsa_indexer_implementation.value
+        if indexer_implementation not in {"eager", "tilelang"}:
             raise ValueError(
-                f"DeepSeek-V4 does not support dsa_indexer_backend={indexer_backend!r}; expected 'eager' or 'tilelang'"
+                "DeepSeek-V4 does not support "
+                f"dsa_indexer_implementation={indexer_implementation!r}; expected 'eager' or 'tilelang'"
             )
         canonical_positions = torch.arange(seq_len, device=position_ids.device).unsqueeze(0).expand_as(position_ids)
         packed_ranges = None
         if packed_compression_metadata is not None and cache_layer is None:
             packed_ranges = packed_compressed_causal_ranges(packed_compression_metadata[self.compress_rate])
         use_tilelang = (
-            indexer_backend == "tilelang"
+            indexer_implementation == "tilelang"
             and hidden_states.is_cuda
             and q.dtype == torch.bfloat16
             and compressed_kv.dtype == torch.bfloat16
@@ -876,7 +919,7 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
 # ================================================================
 # Patch: eager_attention_forward
 # 1. Dispatch DeepSeek-V4 attention to the TileLang sparse MQA kernel when
-#    ``dsa_attention_backend=tilelang_sparse``. The existing additive mask is
+#    ``dsa_attention_implementation=tilelang``. The existing additive mask is
 #    converted to a compact fixed-width index list, preserving sliding-window,
 #    compressor, causal, and invalid-index semantics.
 # 2. Preserve the upstream eager implementation as the default fallback.
@@ -892,14 +935,14 @@ def eager_attention_forward(
     **kwargs,
 ):
     # --- Patch.1 ---
-    attention_backend = veomni_dsa_attention_backend.value
-    if attention_backend not in {"eager", "tilelang_sparse"}:
+    attention_implementation = veomni_dsa_attention_implementation.value
+    if attention_implementation not in {"eager", "tilelang"}:
         raise ValueError(
-            f"DeepSeek-V4 does not support dsa_attention_backend={attention_backend!r}; "
-            "expected 'eager' or 'tilelang_sparse'"
+            "DeepSeek-V4 does not support "
+            f"dsa_attention_implementation={attention_implementation!r}; expected 'eager' or 'tilelang'"
         )
     use_tilelang = (
-        attention_backend == "tilelang_sparse"
+        attention_implementation == "tilelang"
         and query.is_cuda
         and query.dtype == torch.bfloat16
         and key.dtype == torch.bfloat16
@@ -1032,8 +1075,9 @@ class DeepseekV4Attention(nn.Module):
         cos, sin = position_embeddings[self.rope_layer_type]
 
         q_residual = self.q_a_norm(self.q_a_proj(hidden_states))
-        q = self.q_b_proj(q_residual).view(*hidden_shape).transpose(1, 2)
-        q = self.q_b_norm(q)
+        q = self.q_b_proj(q_residual).view(*hidden_shape)
+        q = q * torch.rsqrt(q.square().mean(-1, keepdim=True) + self.q_b_norm.eps)
+        q = q.transpose(1, 2)
         q = apply_rotary_pos_emb(q, cos, sin)
 
         kv = self.kv_norm(self.kv_proj(hidden_states)).view(*hidden_shape).transpose(1, 2)
@@ -1210,6 +1254,12 @@ class DeepseekV4HyperHead(nn.Module):
         return (pre.unsqueeze(-1) * x).sum(dim=2).to(x.dtype)
 
 
+# ======================================================================
+# [MODIFIED CLASS] DeepseekV4MLP
+# Methods patched: forward
+# ======================================================================
+
+
 class DeepseekV4MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -1221,9 +1271,34 @@ class DeepseekV4MLP(nn.Module):
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=config.mlp_bias)
         self.act_fn = ACT2FN[config.hidden_act]
 
-    def forward(self, x):
-        down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
-        return down_proj
+    # ================================================================
+    # Patch: DeepseekV4MLP.forward
+    # Shared experts can use functional Liger SwiGLU via OpSlot. Keep the class
+    # because its V4-specific intermediate-size mapping is incompatible with
+    # LigerSwiGLUMLP construction. Eager fallback retains official FP32 clamp.
+    # ================================================================
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Official DeepSeek-V4 shared experts clamp gate/up before silu*mul. Apply
+        # that first, then optionally fuse only the silu*mul via Liger. The generic
+        # ``veomni_swiglu_mlp(self, x)`` path re-runs projections without clamp and
+        # would change arithmetic under the default ``swiglu_limit``.
+        dtype = x.dtype
+        gate = self.gate_proj(x).float().clamp(max=self.config.swiglu_limit)
+        up = (
+            self.up_proj(x)
+            .float()
+            .clamp(
+                min=-self.config.swiglu_limit,
+                max=self.config.swiglu_limit,
+            )
+        )
+        if veomni_swiglu_mlp.use_non_eager_impl:
+            from liger_kernel.ops.swiglu import LigerSiLUMulFunction
+
+            return self.down_proj(LigerSiLUMulFunction.apply(gate.to(dtype), up.to(dtype)))
+
+        hidden_states = self.act_fn(gate) * up
+        return self.down_proj(hidden_states.to(dtype))
 
 
 # ======================================================================
@@ -1313,6 +1388,12 @@ class DeepseekV4Experts(nn.Module):
         # --- Patch.3 ---
 
 
+# ======================================================================
+# [MODIFIED CLASS] DeepseekV4TopKRouter
+# Methods patched: forward
+# ======================================================================
+
+
 class DeepseekV4TopKRouter(nn.Module):
     def __init__(self, config: DeepseekV4Config):
         super().__init__()
@@ -1324,14 +1405,26 @@ class DeepseekV4TopKRouter(nn.Module):
         self.routed_scaling_factor = config.routed_scaling_factor
         self.register_buffer("e_score_correction_bias", torch.zeros(self.num_experts), persistent=True)
 
-    def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         flat = hidden_states.reshape(-1, self.hidden_dim)
-        logits = F.linear(flat, self.weight)
+        device_type = flat.device.type if isinstance(flat.device.type, str) and flat.device.type != "mps" else "cpu"
+        with maybe_autocast(device_type=device_type, enabled=False):
+            logits = F.linear(flat.float(), self.weight.float())
+        correction_bias = self.e_score_correction_bias.float()
         scores = self.score_fn(logits)
-        indices = torch.topk(scores + self.e_score_correction_bias, self.top_k, dim=-1, sorted=False).indices
+        indices = torch.topk(scores + correction_bias, self.top_k, dim=-1, sorted=False).indices
         weights = scores.gather(1, indices)
         weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-20)
         return logits, weights * self.routed_scaling_factor, indices
+
+
+# ======================================================================
+# [MODIFIED CLASS] DeepseekV4HashRouter
+# Methods patched: forward
+# ======================================================================
 
 
 class DeepseekV4HashRouter(nn.Module):
@@ -1354,10 +1447,14 @@ class DeepseekV4HashRouter(nn.Module):
         self.register_buffer("tid2eid", torch.zeros(config.vocab_size, self.top_k, dtype=torch.long), persistent=True)
 
     def forward(
-        self, hidden_states: torch.Tensor, input_ids: torch.Tensor
+        self,
+        hidden_states: torch.Tensor,
+        input_ids: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         flat = hidden_states.reshape(-1, self.hidden_dim)
-        logits = F.linear(flat, self.weight)
+        device_type = flat.device.type if isinstance(flat.device.type, str) and flat.device.type != "mps" else "cpu"
+        with maybe_autocast(device_type=device_type, enabled=False):
+            logits = F.linear(flat.float(), self.weight.float())
         scores = self.score_fn(logits)
         indices = self.tid2eid[input_ids.reshape(-1)].long()
         weights = scores.gather(1, indices)
@@ -1562,6 +1659,7 @@ class DeepseekV4Model(DeepseekV4PreTrainedModel):
     # ================================================================
     # Patch: DeepseekV4Model.forward
     # 1. Convert collator-provided cu-seqlens into reusable packed slices once.
+    # 2. Keep use_cache=False forwards stateless so the TileLang indexer can run.
     # ================================================================
     @merge_with_config_defaults
     @capture_outputs
@@ -1578,13 +1676,17 @@ class DeepseekV4Model(DeepseekV4PreTrainedModel):
     ) -> MoeModelOutputWithPast:
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
-        return_cache = past_key_values if use_cache else None
-        if past_key_values is None:
+        # Stateless prefill/training must keep the cache absent: the TileLang
+        # Lightning Indexer dispatch is intentionally cache-free, and creating a
+        # DynamicCache here would silently force its eager decode fallback even
+        # when use_cache=False.
+        if past_key_values is None and use_cache:
             past_key_values = DynamicCache(config=self.config)
+        return_cache = past_key_values if use_cache else None
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
         if position_ids is None:
-            past_seen = past_key_values.get_seq_length()
+            past_seen = past_key_values.get_seq_length() if past_key_values is not None else 0
             position_ids = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device) + past_seen
             position_ids = position_ids.unsqueeze(0)
 

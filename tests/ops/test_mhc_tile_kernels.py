@@ -143,13 +143,13 @@ def test_tile_kernels_mhc_head_forward_backward_matches_eager():
 
 @pytest.mark.parametrize("variant", ["pre", "post", "head"])
 def test_tile_kernels_mhc_registry_entries(variant):
-    assert "tile_kernels" in KERNEL_REGISTRY.list_available("mhc", variant)
+    assert "tilelang" in KERNEL_REGISTRY.list_available("mhc", variant)
 
 
 @patch(f"{_REGISTRY_MODULE}.IS_CUDA_AVAILABLE", True)
 @patch(f"{_REGISTRY_MODULE}.IS_NPU_AVAILABLE", False)
 @patch(f"{_REGISTRY_MODULE}.get_gpu_compute_capability", return_value=90)
-def test_bind_veomni_ops_uses_mhc_backend(_mock_cc):
+def test_bind_veomni_ops_uses_mhc_implementation(_mock_cc):
     from veomni.arguments.arguments_types import OpsImplementationConfig
     from veomni.models.auto import _bind_veomni_ops
 
@@ -170,7 +170,7 @@ def test_bind_veomni_ops_uses_mhc_backend(_mock_cc):
         rms_norm_gated_implementation="eager",
         causal_conv1d_implementation="eager",
         chunk_gated_delta_rule_implementation="eager",
-        mhc_backend="tile_kernels",
+        mhc_implementation="tilelang",
     )
 
     assert _bind_veomni_ops(fake_module, ops_config)

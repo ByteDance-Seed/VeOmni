@@ -795,9 +795,9 @@ lift 到 `train.accelerator`）。
 | 层级 | 职责 |
 |------|------|
 | 全局 `ParallelState` | trainer 层一次 `init_parallel_state(...)`（顶层 `accelerator`）；拓扑相同的子模块复用它 |
-| 每个 `OmniModuleTrainer._setup` | 拓扑不同的子模块自建独立 `ParallelState`（先 `_dedup_extra_parallel` 折叠重复的 `ep`）|
-| `ModuleMixin.forward()` | 内部自管 SP `gather/scatter`；运行时被包在 `use_parallel_state(该模块 state)` 中 |
-| `OmniModel` | `set_module_parallel_states({name: ps})` + `_module_scope(name)`：每个 node 的 forward/generate 在该模块 state 下执行，使 `get_parallel_state()` 解析到该模块 mesh |
+| 每个 `OmniModuleTrainer._setup` | 拓扑不同的子模块自建独立 `ParallelState`（先 `_dedup_extra_parallel` 折叠重复的 `ep`），并以**模块名**（`self.module_name`，同时也是 `<module>/` ckpt 子目录名）注册进全局 registry（`init_parallel_state(name=self.module_name)`）；module-trainer 不保留 `parallel_state` 句柄，读取方按名 `get_parallel_state_by_name(module_name)` |
+| `ModuleMixin.forward()` | 内部自管 SP `gather/scatter`；运行时被包在 `use_parallel_state(模块名)` 中（registry 按名解析）|
+| `OmniModel` | `set_module_parallel_state_names(names)` 记录已注册模块名 + `_module_scope(name)` → `use_parallel_state(name)`：每个 node 的 forward/generate 在该模块 state 下执行，使 `get_parallel_state()` 解析到该模块 mesh（registry 是 state 对象的唯一来源；eager 推理模块不注册、不 scope）|
 | `ModuleMixin.get_parallel_plan()` | 返回**模块本地** fqn 的 `ParallelPlan`（如 `embed_tokens.weight` / `layers.*.mlp.experts.gate_up_proj`）|
 | 梯度裁剪 | `_omni_clip_grad_norm`：按各模块拓扑分别 reduce pᵗʰ-power → 合成全局范数 → 共享系数裁剪（见下）|
 

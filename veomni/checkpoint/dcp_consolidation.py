@@ -17,11 +17,13 @@
 # with __globals__ bound to the target module. Variables like DATA_OFFSETS_KEY,
 # _read_tensor_data_mmap, etc. are resolved at runtime from torch.distributed.checkpoint.
 
-"""Patch for PyTorch DCP (Distributed Checkpoint) safetensors consolidation.
+"""Patches for PyTorch DCP (Distributed Checkpoint) safetensors consolidation.
 
-This module provides a monkey patch to fix compatibility issues with distributed
-file systems (e.g., HDFS via FUSE) that do not support r+b (read-write binary)
-file mode for random write access.
+This module provides monkey patches for:
+- Distributed file systems (e.g., HDFS via FUSE) that do not support r+b
+  (read-write binary) file mode for random write access.
+- Integer and boolean tensors, whose byte sizes PyTorch's consolidator computes
+  with ``torch.finfo`` even though it only accepts floating-point dtypes.
 """
 
 import hashlib
@@ -34,6 +36,7 @@ _dcp_consolidation_patch_applied = False
 # Fixed torch versions for this patch - update when upgrading torch
 _SUPPORTED_TORCH_VERSION_PREFIXES = ("2.9", "2.10", "2.11")
 _EXPECTED_PROCESS_OUTPUT_FILE_ARGS = ("output_file", "output_data", "input_files_data")
+_EXPECTED_PARSE_INPUT_METADATA_ARGS = ("input_files_data", "output_files_data")
 _SUPPORTED_PROCESS_OUTPUT_FILE_SHA256 = {
     # torch 2.9.1
     "0837813477b4ca319890ef671b954f83bbe966f21a751875606b74e4e8e30ea8",
@@ -44,10 +47,14 @@ _SUPPORTED_PROCESS_OUTPUT_FILE_SHA256 = {
     # torch 2.11.0+cu130 CI wheel
     "433c9d026092f48f5ba02631975294de1a8ae98e020d5cb6ffd0f5db760476fe",
 }
+_SUPPORTED_PARSE_INPUT_METADATA_SHA256 = {
+    # torch 2.9.1, 2.10.0, and 2.11.0 (upstream source and cu130 CI wheel)
+    "f6c476c9467a32928c8b29c211988c78a14a934bc4cbc5763a3882a7fc3b11f0",
+}
 
 
 def apply_dcp_consolidation_patch():
-    """Patch DCP safetensors consolidation to use append mode for HDFS FUSE compatibility.
+    """Patch DCP safetensors consolidation for HDFS FUSE and non-floating tensors.
 
     The original implementation in PyTorch uses r+b mode for random write access:
         with open(output_file, "r+b") as output_stream:
@@ -60,8 +67,13 @@ def apply_dcp_consolidation_patch():
         with open(output_file, "ab") as output_stream:
             ...
 
-    Note: Append mode requires tensors to be processed in offset order, which is
-    already ensured by sorting tensors before writing.
+    PyTorch also computes every tensor's byte size with ``torch.finfo`` during
+    consolidation. This fails for valid safetensors dtypes such as int64 and
+    bool. The patched metadata parser uses ``Tensor.element_size()`` instead,
+    which handles every torch dtype supported by safetensors.
+
+    Note: Append mode requires tensors to be processed in offset order, which
+    is already ensured by sorting tensors before writing.
 
     The patch uses types.FunctionType to create a new function with __globals__
     bound to the target module, enabling access to internal functions like
@@ -89,6 +101,12 @@ def apply_dcp_consolidation_patch():
             f"_process_output_file attribute. Please verify torch {_SUPPORTED_TORCH_VERSION_PREFIXES} compatibility."
         )
 
+    if not hasattr(hf_module, "_parse_input_metadata"):
+        raise RuntimeError(
+            "torch.distributed.checkpoint._consolidate_hf_safetensors does not have "
+            f"_parse_input_metadata attribute. Please verify torch {_SUPPORTED_TORCH_VERSION_PREFIXES} compatibility."
+        )
+
     process_output_file = hf_module._process_output_file
     process_output_file_args = tuple(inspect.signature(process_output_file).parameters)
     if process_output_file_args != _EXPECTED_PROCESS_OUTPUT_FILE_ARGS:
@@ -104,6 +122,24 @@ def apply_dcp_consolidation_patch():
         raise RuntimeError(
             "torch.distributed.checkpoint._consolidate_hf_safetensors._process_output_file "
             f"source hash {process_output_file_hash} is not in the verified set. "
+            "Please update the DCP consolidation patch."
+        )
+
+    parse_input_metadata = hf_module._parse_input_metadata
+    parse_input_metadata_args = tuple(inspect.signature(parse_input_metadata).parameters)
+    if parse_input_metadata_args != _EXPECTED_PARSE_INPUT_METADATA_ARGS:
+        raise RuntimeError(
+            "torch.distributed.checkpoint._consolidate_hf_safetensors._parse_input_metadata "
+            f"signature changed from {_EXPECTED_PARSE_INPUT_METADATA_ARGS} to {parse_input_metadata_args}. "
+            "Please update the DCP consolidation patch."
+        )
+
+    parse_input_metadata_source = inspect.getsource(parse_input_metadata)
+    parse_input_metadata_hash = hashlib.sha256(parse_input_metadata_source.encode()).hexdigest()
+    if parse_input_metadata_hash not in _SUPPORTED_PARSE_INPUT_METADATA_SHA256:
+        raise RuntimeError(
+            "torch.distributed.checkpoint._consolidate_hf_safetensors._parse_input_metadata "
+            f"source hash {parse_input_metadata_hash} is not in the verified set. "
             "Please update the DCP consolidation patch."
         )
 
@@ -152,6 +188,46 @@ def apply_dcp_consolidation_patch():
 
                 output_stream.write(full_tensor_mv)
 
+    def _parse_input_metadata_impl(input_files_data, output_files_data):
+        from safetensors.torch import _getdtype
+
+        fqn_to_size_mapping = {}
+
+        for file_data in input_files_data.values():
+            safetensors_metadata = file_data.metadata
+            dcp_sharding_info = _get_dcp_custom_metadata(safetensors_metadata)
+            if not dcp_sharding_info:
+                raise ValueError(
+                    "No DCP custom metadata found in safetensors file. "
+                    "The file must be saved with DCP to be consolidated."
+                )
+
+            for key, val in safetensors_metadata.items():
+                if key == DEFAULT_EXTRA_METADATA_KEY:
+                    continue
+
+                sizes = val[SHAPE_KEY]
+                offsets = dcp_sharding_info[key][SAVED_OFFSETS_KEY]
+
+                if key not in fqn_to_size_mapping:
+                    cur_size = [size + offset for size, offset in zip(sizes, offsets)]
+                    fqn_to_size_mapping[key] = (cur_size, val[DTYPE_KEY])
+                else:
+                    cur_size = fqn_to_size_mapping[key][0]
+                    for i in range(len(sizes)):
+                        cur_size[i] = max(cur_size[i], sizes[i] + offsets[i])
+
+        for fqn, tensor_info in fqn_to_size_mapping.items():
+            tensor_size, dtype_str = tensor_info
+            dtype_size = torch.empty((), dtype=_getdtype(dtype_str)).element_size()
+            for output_data in output_files_data.values():
+                if fqn in output_data.fqn_data:
+                    output_data.fqn_data[fqn] = _FqnData(
+                        shape_in_file=tensor_size,
+                        dtype_size=dtype_size,
+                        dtype_str=dtype_str,
+                    )
+
     # Create a new function with the target module's globals
     # This ensures that internal functions like _read_tensor_data_mmap are resolved correctly
     patched_func = types.FunctionType(
@@ -162,5 +238,14 @@ def apply_dcp_consolidation_patch():
         _process_output_file_impl.__closure__,
     )
 
+    patched_parse_input_metadata = types.FunctionType(
+        _parse_input_metadata_impl.__code__,
+        hf_module.__dict__,
+        _parse_input_metadata_impl.__name__,
+        _parse_input_metadata_impl.__defaults__,
+        _parse_input_metadata_impl.__closure__,
+    )
+
     hf_module._process_output_file = patched_func
+    hf_module._parse_input_metadata = patched_parse_input_metadata
     _dcp_consolidation_patch_applied = True

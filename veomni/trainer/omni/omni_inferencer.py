@@ -127,7 +127,7 @@ class OmniInferencer(OmniTrainer):
             module_config = omni_config.module_config(name)
             module_inferencer = OmniModuleInferencer(
                 module_config,
-                subfolder_name=name,
+                module_name=name,
             )
             self.module_inferencers[name] = module_inferencer
             modules[name] = module_inferencer.model
@@ -138,13 +138,12 @@ class OmniInferencer(OmniTrainer):
         self.base.model = OmniModel(omni_config, modules)
 
         if self._distributed:
-            module_parallel_states = {
-                name: mi.parallel_state
-                for name, mi in self.module_inferencers.items()
-                if hasattr(mi, "parallel_state")
-            }
-            if module_parallel_states:
-                self.base.model.set_module_parallel_states(module_parallel_states)
+            # Only distributed (FSDP / extra-parallel) modules register a
+            # ParallelState under their name; eager modules do not and stay
+            # unscoped. Hand the model the set of registered names.
+            registered_names = [name for name, mi in self.module_inferencers.items() if hasattr(mi, "parallel_state")]
+            if registered_names:
+                self.base.model.set_module_parallel_state_names(registered_names)
         self.base.model_config = omni_config
         logger.info_rank0(
             f"OmniInferencer: composed OmniModel with {len(self.module_names)} modules ({self.module_names})."
