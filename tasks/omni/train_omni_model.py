@@ -296,19 +296,6 @@ def main():
         model_assets = [model_config, processor]
         save_model_assets(args.train.checkpoint.model_assets_dir, model_assets)
 
-    if args.train.profile.this_rank:
-        profiler = helper.create_profiler(
-            start_step=args.train.profile.start_step,
-            end_step=args.train.profile.end_step,
-            trace_dir=args.train.profile.trace_dir,
-            record_shapes=args.train.profile.record_shapes,
-            profile_memory=args.train.profile.profile_memory,
-            with_stack=args.train.profile.with_stack,
-            with_modules=args.train.profile.with_modules,
-            global_rank=args.train.global_rank,
-        )
-        profiler.start()
-
     start_epoch, start_step, global_step = 0, 0, 0
     save_checkpoint_path = None
     environ_meter = helper.EnvironMeter(
@@ -337,6 +324,30 @@ def main():
 
         dist.barrier()
         logger.info_rank0(f"Load distributed checkpoint from {args.train.checkpoint.load_path} successfully!")
+
+    profiler = None
+    profile_active = False
+    if args.train.profile.enable:
+        first_profile_step = max(args.train.profile.start_step, global_step + 1)
+        profile_active = first_profile_step < args.train.profile.end_step
+        if not profile_active:
+            logger.warning_rank0(
+                f"Profiling window [{args.train.profile.start_step}, {args.train.profile.end_step}) "
+                f"has no remaining steps after global step {global_step}; profiling is skipped."
+            )
+        elif args.train.profile.this_rank:
+            profiler = helper.create_profiler(
+                start_step=first_profile_step - global_step,
+                end_step=args.train.profile.end_step - global_step,
+                trace_dir=args.train.profile.trace_dir,
+                record_shapes=args.train.profile.record_shapes,
+                profile_memory=args.train.profile.profile_memory,
+                with_stack=args.train.profile.with_stack,
+                with_modules=args.train.profile.with_modules,
+                global_rank=args.train.global_rank,
+                npu_offline_analysis=args.train.profile.npu_offline_analysis,
+            )
+            profiler.start()
 
     helper.empty_cache()
     model_fwd_context, model_bwd_context = build_activation_offloading_context(
@@ -446,11 +457,24 @@ def main():
                     train_metrics.update({f"training/{k}": v for k, v in step_info.items()})
                     wandb.log(train_metrics, step=global_step)
 
-            if args.train.profile.this_rank and global_step <= args.train.profile.end_step:
+            synchronize_profile_finalize = (
+                profile_active
+                and args.train.profile.npu_offline_analysis
+                and helper.IS_NPU_AVAILABLE
+                and global_step == args.train.profile.end_step - 1
+                and dist.is_available()
+                and dist.is_initialized()
+            )
+            if synchronize_profile_finalize:
+                dist.barrier()
+
+            if profiler is not None and global_step <= args.train.profile.end_step:
                 profiler.step()
                 if global_step == args.train.profile.end_step:
                     profiler.stop()
-                    helper.upload_trace(args.train.wandb.project, args.train.wandb.name, args.train.profile.trace_dir)
+
+            if synchronize_profile_finalize:
+                dist.barrier()
 
             if args.train.checkpoint.save_steps and global_step % args.train.checkpoint.save_steps == 0:
                 helper.empty_cache()
