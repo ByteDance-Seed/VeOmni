@@ -25,10 +25,11 @@ import argparse
 import gzip
 import json
 import logging
-import os
+import shlex
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -57,8 +58,8 @@ def resolve_raw_dir(raw_dir: str | Path) -> Path:
 
 
 def resolve_analyse_path(raw_dir: Path) -> str:
-    """torch_npu.profiler.analyse expects the parent of `*_ascend_pt`."""
-    return str(raw_dir.parent)
+    """Target exactly one finalized ``*_ascend_pt`` capture."""
+    return str(raw_dir)
 
 
 def find_trace_view(raw_dir: Path) -> Path:
@@ -87,21 +88,33 @@ def gzip_trace(trace_path: Path) -> Path:
 def copy_raw_dir(raw_dir: Path, copy_to: str) -> None:
     if copy_to.startswith("hdfs://"):
         try:
-            from veomni.utils.hdfs_io import copy, makedirs
+            from veomni.utils.hdfs_io import copy, exists, makedirs
         except Exception as exc:  # pragma: no cover - import path depends on install
             raise RuntimeError(f"HDFS copy requires veomni.utils.hdfs_io: {exc}") from exc
+        target = f"{copy_to.rstrip('/')}/{raw_dir.name}"
+        if exists(target):
+            raise FileExistsError(f"Refusing to overwrite existing HDFS profile target: {target}")
         makedirs(copy_to, exist_ok=True)
-        if not copy(str(raw_dir), copy_to):
-            raise RuntimeError(f"Failed to copy {raw_dir} to {copy_to}")
-        logger.info("Copied raw profile to %s", copy_to)
+        if not copy(str(raw_dir), target):
+            raise RuntimeError(f"Failed to copy {raw_dir} to {target}")
+        logger.info("Copied raw profile to %s", target)
         return
 
-    dest = Path(copy_to).expanduser()
-    dest.mkdir(parents=True, exist_ok=True)
+    source = raw_dir.resolve()
+    dest = Path(copy_to).expanduser().resolve()
     target = dest / raw_dir.name
+    if target == source:
+        raise ValueError(f"copy_to cannot be the raw profile source parent: {dest}")
+    try:
+        dest.relative_to(source)
+    except ValueError:
+        pass
+    else:
+        raise ValueError(f"copy_to cannot be inside the raw profile directory: {dest}")
     if target.exists():
-        shutil.rmtree(target)
-    shutil.copytree(raw_dir, target)
+        raise FileExistsError(f"Refusing to overwrite existing profile target: {target} already exists")
+    dest.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(source, target)
     logger.info("Copied raw profile to %s", target)
 
 
@@ -116,19 +129,31 @@ def run_analyse(raw_dir: Path, max_process_number: Optional[int] = None) -> None
     if max_process_number is not None:
         kwargs["max_process_number"] = max_process_number
     logger.info("Running torch_npu.profiler.analyse(profiler_path=%s)", profiler_path)
+    started = time.perf_counter()
     torch_npu.profiler.analyse(profiler_path=profiler_path, **kwargs)
+    logger.info(
+        "NPU_PROFILE_ANALYSE mode=offline duration_seconds=%.6f raw_dir=%s",
+        time.perf_counter() - started,
+        raw_dir,
+    )
 
 
-def run_upload_cmd(upload_cmd: str, trace_file: Path) -> None:
+def run_upload_cmd(upload_cmd: str | list[str], trace_file: Path) -> None:
+    if isinstance(upload_cmd, list):
+        logger.info("Uploading with argv: %s", shlex.join(upload_cmd))
+        subprocess.run(upload_cmd, check=True)
+        return
+
+    quoted_trace = shlex.quote(str(trace_file))
     if "{trace}" in upload_cmd:
-        command = upload_cmd.format(trace=str(trace_file))
+        command = upload_cmd.replace("{trace}", quoted_trace)
     else:
-        command = f"{upload_cmd} {trace_file}"
+        command = f"{upload_cmd} {quoted_trace}"
     logger.info("Uploading with command: %s", command)
     subprocess.run(command, shell=True, check=True, executable="/bin/bash")
 
 
-def build_merlin_upload_cmd(trace_file: Path, name: Optional[str] = None) -> str:
+def build_merlin_upload_cmd(trace_file: Path, name: Optional[str] = None) -> list[str]:
     payload = {
         "file_path": str(trace_file),
         "asset_type": "perfetto",
@@ -137,7 +162,7 @@ def build_merlin_upload_cmd(trace_file: Path, name: Optional[str] = None) -> str
     if name:
         payload["name"] = name
     # job_id / trial_id are inferred by merlin-cli from RH2_JOB_RUN_ID / ARNOLD_TRIAL_ID.
-    return "merlin-cli profiling upload --json " + json.dumps(payload, ensure_ascii=False)
+    return ["merlin-cli", "profiling", "upload", "--json", json.dumps(payload, ensure_ascii=False)]
 
 
 def postprocess(

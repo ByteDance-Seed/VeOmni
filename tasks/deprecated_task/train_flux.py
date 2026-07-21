@@ -154,10 +154,8 @@ def get_param_groups(model: torch.nn.Module, default_lr: float, vit_lr: float):
 
 def main():
     args = parse_args(Arguments)
-    if args.train.profile.npu_offline_analysis:
-        raise ValueError(
-            "NPU offline profiling is not supported by this deprecated entrypoint; use a current trainer."
-        )
+    if args.train.profile.enable and helper.IS_NPU_AVAILABLE:
+        raise ValueError("NPU profiling is not supported by this deprecated entrypoint; use a current trainer.")
     get_torch_device().set_device(f"{get_device_type()}:{args.train.local_rank}")
     dist.init_process_group(backend=get_dist_comm_backend())
     helper.set_seed(args.train.seed, args.train.enable_full_determinism)

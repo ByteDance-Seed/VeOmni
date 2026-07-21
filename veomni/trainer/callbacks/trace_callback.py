@@ -163,6 +163,9 @@ class ProfileTraceCallback(Callback):
         args: "VeOmniArguments" = self.trainer.args
         self.profiler = None
         self._profile_active = False
+        self._profiler_stopped = False
+        self._step_started_at = None
+        self._profile_timing_start_step = None
         if not args.train.profile.enable:
             return
 
@@ -178,6 +181,10 @@ class ProfileTraceCallback(Callback):
             return
 
         self._profile_active = True
+        # Include the one warmup transition immediately before the requested
+        # active window, but do not add timing/logging overhead to unrelated
+        # training steps.
+        self._profile_timing_start_step = first_profile_step - 1
         if args.train.profile.this_rank:
             self.profiler = helper.create_profiler(
                 start_step=first_profile_step - state.global_step,
@@ -188,9 +195,20 @@ class ProfileTraceCallback(Callback):
                 with_stack=args.train.profile.with_stack,
                 with_modules=args.train.profile.with_modules,
                 global_rank=args.train.global_rank,
-                npu_offline_analysis=args.train.profile.npu_offline_analysis,
+                npu_analysis_mode=args.train.profile.npu_analysis_mode,
             )
             self.profiler.start()
+
+    def on_step_begin(self, state: TrainerState, **kwargs) -> None:
+        args: "VeOmniArguments" = self.trainer.args
+        timing_start_step = getattr(self, "_profile_timing_start_step", None)
+        if (
+            self._profile_active
+            and helper.IS_NPU_AVAILABLE
+            and timing_start_step is not None
+            and timing_start_step <= state.global_step <= args.train.profile.end_step
+        ):
+            self._step_started_at = time.perf_counter()
 
     def on_step_end(self, state: TrainerState, **kwargs) -> None:
         args: "VeOmniArguments" = self.trainer.args
@@ -207,18 +225,87 @@ class ProfileTraceCallback(Callback):
             and dist.is_initialized()
         )
 
+        pre_barrier_seconds = 0.0
+        profiler_step_seconds = 0.0
+        post_barrier_seconds = 0.0
+
         if synchronize_finalize:
+            started = time.perf_counter()
             dist.barrier()
+            pre_barrier_seconds = time.perf_counter() - started
 
-        if self.profiler is not None:
-            if state.global_step <= args.train.profile.end_step:
-                self.profiler.step()
+        try:
+            if self.profiler is not None:
+                if state.global_step <= args.train.profile.end_step:
+                    started = time.perf_counter()
+                    self.profiler.step()
+                    profiler_step_seconds = time.perf_counter() - started
 
-            if state.global_step == args.train.profile.end_step:
+                if state.global_step == args.train.profile.end_step:
+                    self.profiler.stop()
+                    self._profiler_stopped = True
+        finally:
+            if synchronize_finalize:
+                started = time.perf_counter()
+                dist.barrier()
+                post_barrier_seconds = time.perf_counter() - started
+
+        if state.global_step == args.train.profile.end_step:
+            self._profile_active = False
+
+        step_started_at = getattr(self, "_step_started_at", None)
+        if step_started_at is not None:
+            effective_mode = getattr(
+                self.profiler,
+                "_veomni_npu_analysis_mode",
+                args.train.profile.npu_analysis_mode,
+            )
+            timing_message = (
+                "NPU_PROFILE_STEP "
+                f"mode={effective_mode} rank={getattr(args.train, 'global_rank', 0)} "
+                f"step={state.global_step} finalize={str(synchronize_finalize).lower()} "
+                f"total_seconds={time.perf_counter() - step_started_at:.6f} "
+                f"pre_barrier_seconds={pre_barrier_seconds:.6f} "
+                f"profiler_step_seconds={profiler_step_seconds:.6f} "
+                f"post_barrier_seconds={post_barrier_seconds:.6f}"
+            )
+            if synchronize_finalize:
+                logger.info(timing_message)
+            else:
+                logger.info_rank0(timing_message)
+            self._step_started_at = None
+
+    def on_train_end(self, state: TrainerState, **kwargs) -> None:
+        args: "VeOmniArguments" = self.trainer.args
+        if not (args.train.profile.enable and helper.IS_NPU_AVAILABLE):
+            return
+
+        synchronize_cleanup = self._profile_active and dist.is_available() and dist.is_initialized()
+        if synchronize_cleanup:
+            dist.barrier()
+        try:
+            if self.profiler is not None and not getattr(self, "_profiler_stopped", False):
                 self.profiler.stop()
+                self._profiler_stopped = True
+        finally:
+            if synchronize_cleanup:
+                dist.barrier()
+        self._profile_active = False
 
-        if synchronize_finalize:
-            dist.barrier()
+        effective_mode = getattr(
+            self.profiler,
+            "_veomni_npu_analysis_mode",
+            args.train.profile.npu_analysis_mode,
+        )
+        logger.info_rank0(
+            f"NPU_PROFILE_TRAIN_END mode={effective_mode} step={state.global_step} wall_time_seconds={time.time():.6f}"
+        )
+        if self.profiler is not None:
+            helper.wait_npu_profile_sidecars(self.profiler)
+        logger.info_rank0(
+            f"NPU_PROFILE_TEARDOWN_DONE mode={effective_mode} step={state.global_step} "
+            f"wall_time_seconds={time.time():.6f}"
+        )
 
 
 class EnvironMeterCallback(Callback):

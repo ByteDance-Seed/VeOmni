@@ -326,6 +326,7 @@ def main():
         logger.info_rank0(f"Load distributed checkpoint from {args.train.checkpoint.load_path} successfully!")
 
     profiler = None
+    profiler_stopped = False
     profile_active = False
     if args.train.profile.enable:
         first_profile_step = max(args.train.profile.start_step, global_step + 1)
@@ -345,7 +346,7 @@ def main():
                 with_stack=args.train.profile.with_stack,
                 with_modules=args.train.profile.with_modules,
                 global_rank=args.train.global_rank,
-                npu_offline_analysis=args.train.profile.npu_offline_analysis,
+                npu_analysis_mode=args.train.profile.npu_analysis_mode,
             )
             profiler.start()
 
@@ -457,8 +458,8 @@ def main():
                     train_metrics.update({f"training/{k}": v for k, v in step_info.items()})
                     wandb.log(train_metrics, step=global_step)
 
-            # Align with ProfileTraceCallback: barrier around Ascend finalize for
-            # both online and offline analysis so rank0 dump cannot race peers.
+            # Align with ProfileTraceCallback: barrier around Ascend raw finalize
+            # and optional async-analysis submission so rank0 cannot race peers.
             synchronize_profile_finalize = (
                 profile_active
                 and helper.IS_NPU_AVAILABLE
@@ -468,17 +469,16 @@ def main():
             )
             if synchronize_profile_finalize:
                 dist.barrier()
-
-            if profiler is not None and global_step <= args.train.profile.end_step:
-                profiler.step()
-                if global_step == args.train.profile.end_step:
-                    profiler.stop()
-                    # Persistence/upload is owned by create_profiler.on_trace_ready
-                    # (hdfs copy / VEOMNI_UPLOAD_CMD). Do not call helper.upload_trace:
-                    # that helper was never defined on main and would AttributeError.
-
-            if synchronize_profile_finalize:
-                dist.barrier()
+            try:
+                if profiler is not None and global_step <= args.train.profile.end_step:
+                    profiler.step()
+                    if global_step == args.train.profile.end_step:
+                        profiler.stop()
+                        profiler_stopped = True
+                        # Persistence/upload is owned by create_profiler.on_trace_ready.
+            finally:
+                if synchronize_profile_finalize:
+                    dist.barrier()
 
             if args.train.checkpoint.save_steps and global_step % args.train.checkpoint.save_steps == 0:
                 helper.empty_cache()
@@ -518,6 +518,21 @@ def main():
             Checkpointer.save(args.train.checkpoint.save_path, state, global_steps=global_step)
             dist.barrier()
             logger.info_rank0(f"Distributed checkpoint saved at {save_checkpoint_path} successfully!")
+
+    synchronize_profile_cleanup = (
+        profile_active and helper.IS_NPU_AVAILABLE and dist.is_available() and dist.is_initialized()
+    )
+    if synchronize_profile_cleanup:
+        dist.barrier()
+    try:
+        if profiler is not None and not profiler_stopped:
+            profiler.stop()
+            profiler_stopped = True
+    finally:
+        if synchronize_profile_cleanup:
+            dist.barrier()
+    if profiler is not None:
+        helper.wait_npu_profile_sidecars(profiler)
 
     synchronize()
     # release memory

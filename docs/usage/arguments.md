@@ -340,7 +340,8 @@ NPU validation runs at two times:
 | with_stack | `bool` | `True` | Record stack traces. |
 | with_modules | `bool` | `False` | Record module hierarchy in profiler traces. |
 | rank0_only | `bool` | `True` | Profile rank 0 only. |
-| npu_offline_analysis | `bool` | `False` | Set Ascend `analyse_flag=False` and defer Chrome/DB analysis to an offline process. Use a pod-local `trace_dir`. NPU only. Distributed finalization barriers run for all Ascend profiles. With `VEOMNI_UPLOAD_CMD` or `VEOMNI_NPU_OFFLINE_MERLIN_UPLOAD=1`, VeOmni spawns an async sidecar (`python -m veomni.utils.npu_offline_postprocess`) for analyse/copy/upload so training is not blocked. |
+| npu_analysis_mode | `Literal["offline", "async"]` | `"offline"` | Ascend only. `offline` finalizes raw data for later postprocessing; `async` uses torch_npu's online process pool (`analyse_flag=True, async_mode=True`). Use a pod-local directory for `async`. Distributed barriers cover raw finalization and handler submission, not background analysis. |
+| npu_offline_analysis | `Optional[bool]` | `None` | Deprecated migration alias. `true` maps to `npu_analysis_mode="offline"`; `false` is rejected because synchronous online parsing was removed. |
 
 ### ChannelLossConfig
 
