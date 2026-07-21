@@ -45,6 +45,27 @@ def imagenet1k_preprocess(conversations, example, **kwargs):
 def tulu_3_sft_mixture_preprocess(conversations, example, **kwargs):
     del kwargs, example
     text_example = conversations["messages"]
+
+    system_messages = [message for message in text_example if message["role"] == "system"]
+    if system_messages:
+        if len(system_messages) != 1 or text_example[0]["role"] != "system":
+            raise ValueError("Tulu conversations must contain at most one system message, at the beginning.")
+
+        first_user_index = next(
+            (index for index, message in enumerate(text_example) if message["role"] == "user"),
+            None,
+        )
+        if first_user_index is None:
+            raise ValueError("Tulu conversations with a system message must contain a user message.")
+
+        first_user = text_example[first_user_index]
+        first_user_content = f"<system>\n{system_messages[0]['content']}\n</system>\n{first_user['content']}"
+        text_example = [
+            {**message, "content": first_user_content} if index == first_user_index else message
+            for index, message in enumerate(text_example)
+            if message["role"] != "system"
+        ]
+
     constructed_conversation = []
     for conversation in text_example:
         constructed_conversation.append([conversation["role"], ("text", conversation["content"])])
