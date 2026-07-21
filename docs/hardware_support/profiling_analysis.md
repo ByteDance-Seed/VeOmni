@@ -61,7 +61,28 @@ The same option can be enabled from the command line:
 --train.profile.npu_offline_analysis true
 ```
 
-Use pod-local storage for large Ascend captures, then copy the finalized raw directory to durable storage before parsing it offline.
+Use pod-local storage for large Ascend captures, then copy / parse / upload outside the training barrier.
+
+VeOmni can spawn an async sidecar after raw finalization:
+
+| Env | Effect |
+|-----|--------|
+| `VEOMNI_UPLOAD_CMD=...` | Auto-spawn sidecar: analyse → run the command on `trace_view.json.gz` (`{trace}` placeholder supported) |
+| `VEOMNI_NPU_OFFLINE_MERLIN_UPLOAD=1` | Auto-spawn sidecar: analyse → `merlin-cli profiling upload` (Perfetto; job/trial inferred from Merlin env) |
+| `VEOMNI_NPU_OFFLINE_POSTPROCESS=1` | Force-spawn sidecar (analyse; also async-copy when `trace_dir` is `hdfs://`) |
+| `VEOMNI_NPU_OFFLINE_POSTPROCESS=0` | Disable sidecar; keep sync HDFS copy and skip in-process upload |
+
+Manual / external postprocess (recommended when the train pod may exit soon after capture):
+
+```bash
+python -m veomni.utils.npu_offline_postprocess \
+  --raw-dir /tmp/veomni_npu_profile \
+  --copy-to hdfs://haruna/.../profile/ \
+  --analyse \
+  --merlin-upload
+```
+
+Sidecar logs are written next to the raw directory as `veomni_npu_offline_postprocess.log`.
 
 For distributed Ascend training, use the following options together:
 
@@ -76,7 +97,7 @@ train:
 
 VeOmni synchronizes all ranks immediately before and after the final profiler step on Ascend (both online and offline analysis). This prevents non-profiled ranks from entering the next collective while rank 0 finalizes its capture. Prefer `npu_offline_analysis: true` so that barrier only covers raw finalization rather than a long Chrome/DB export. All ranks must execute the profile callback at the same global step. `start_step` and `end_step` are absolute global steps; VeOmni rebases the remaining schedule after checkpoint resume or a hot update and skips a window that has already elapsed.
 
-Using an `hdfs://` trace directory is supported, but not recommended for large Ascend captures: it still copies the raw directory synchronously before releasing the other ranks and can therefore stall training. Prefer `/tmp` or another pod-local SSD path, then copy the finalized `*_ascend_pt` directory to durable storage from a separate process.
+Using an `hdfs://` trace directory is supported, but not recommended for large Ascend captures unless the async sidecar is enabled (`VEOMNI_UPLOAD_CMD` / `VEOMNI_NPU_OFFLINE_MERLIN_UPLOAD=1` / `VEOMNI_NPU_OFFLINE_POSTPROCESS=1`): without the sidecar, VeOmni still copies the raw directory synchronously before releasing the other ranks. Prefer `/tmp` or another pod-local SSD path, then let the sidecar (or a separate process) copy / analyse / upload.
 
 The current trainer callback and `tasks/omni/train_omni_model.py` support this option. Deprecated standalone training entrypoints reject it explicitly instead of falling back to online analysis.
 

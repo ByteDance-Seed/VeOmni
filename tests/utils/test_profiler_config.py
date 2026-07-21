@@ -87,20 +87,25 @@ def test_npu_offline_analysis_does_not_record_unused_memory_history(monkeypatch,
     assert not isinstance(profiler, helper.ProfilerWithMem)
 
 
-def test_npu_offline_analysis_skips_file_upload_hook(monkeypatch, tmp_path):
+def test_npu_offline_analysis_spawns_async_upload_sidecar(monkeypatch, tmp_path):
     fake_profiler = _FakeNpuProfiler()
-    warnings = []
-    upload_calls = []
+    sidecar_calls = []
     raw_dir = tmp_path / "rank0_ascend_pt"
     raw_dir.mkdir()
 
     monkeypatch.setattr(helper, "IS_NPU_AVAILABLE", True)
     monkeypatch.setattr(helper, "IS_CUDA_AVAILABLE", False)
     monkeypatch.setattr(helper, "VEOMNI_UPLOAD_CMD", "upload-trace")
+    monkeypatch.setattr(helper, "VEOMNI_NPU_OFFLINE_POSTPROCESS", None)
+    monkeypatch.setattr(helper, "VEOMNI_NPU_OFFLINE_MERLIN_UPLOAD", None)
     monkeypatch.setattr(helper, "torch_npu", SimpleNamespace(profiler=fake_profiler), raising=False)
     monkeypatch.setattr(helper, "get_torch_device", lambda: pytest.fail("offline mode must not dump memory snapshots"))
-    monkeypatch.setattr(helper.logger, "warning", warnings.append)
-    monkeypatch.setattr(helper.subprocess, "run", lambda *args, **kwargs: upload_calls.append((args, kwargs)))
+    monkeypatch.setattr(
+        helper,
+        "spawn_npu_offline_sidecar",
+        lambda *args, **kwargs: sidecar_calls.append((args, kwargs)),
+    )
+    monkeypatch.setattr(helper.subprocess, "run", lambda *args, **kwargs: pytest.fail("must not sync-upload"))
 
     profiler = helper.create_profiler(
         start_step=1,
@@ -115,16 +120,17 @@ def test_npu_offline_analysis_skips_file_upload_hook(monkeypatch, tmp_path):
     )
     profiler.on_trace_ready(SimpleNamespace(prof_if=SimpleNamespace(prof_path=str(raw_dir))))
 
-    assert upload_calls == []
-    assert warnings == [
-        "VEOMNI_UPLOAD_CMD is skipped because offline NPU profiling produces a raw directory. "
-        f"Copy {raw_dir} to durable storage outside the training process, then parse it offline."
+    assert sidecar_calls == [
+        (
+            (str(raw_dir),),
+            {"copy_to": None, "analyse": True, "upload_cmd": "upload-trace", "merlin_upload": False},
+        )
     ]
 
 
-def test_npu_offline_analysis_reports_automatic_hdfs_copy(monkeypatch, tmp_path):
+def test_npu_offline_analysis_defers_hdfs_copy_to_sidecar(monkeypatch, tmp_path):
     fake_profiler = _FakeNpuProfiler()
-    warnings = []
+    sidecar_calls = []
     copies = []
     trace_dir = "hdfs://haruna/profile"
     raw_dir = tmp_path / "rank0_ascend_pt"
@@ -133,12 +139,18 @@ def test_npu_offline_analysis_reports_automatic_hdfs_copy(monkeypatch, tmp_path)
     monkeypatch.setattr(helper, "IS_NPU_AVAILABLE", True)
     monkeypatch.setattr(helper, "IS_CUDA_AVAILABLE", False)
     monkeypatch.setattr(helper, "VEOMNI_UPLOAD_CMD", "upload-trace")
+    monkeypatch.setattr(helper, "VEOMNI_NPU_OFFLINE_POSTPROCESS", None)
+    monkeypatch.setattr(helper, "VEOMNI_NPU_OFFLINE_MERLIN_UPLOAD", None)
     monkeypatch.setattr(helper, "CACHE_DIR", str(tmp_path / "cache"))
     monkeypatch.setattr(helper, "torch_npu", SimpleNamespace(profiler=fake_profiler), raising=False)
     monkeypatch.setattr(helper.hdfs_io, "makedirs", lambda *args, **kwargs: None)
     monkeypatch.setattr(helper, "copy", lambda source, target: (copies.append((source, target)), True)[1])
     monkeypatch.setattr(helper, "get_torch_device", lambda: pytest.fail("offline mode must not dump memory snapshots"))
-    monkeypatch.setattr(helper.logger, "warning", warnings.append)
+    monkeypatch.setattr(
+        helper,
+        "spawn_npu_offline_sidecar",
+        lambda *args, **kwargs: sidecar_calls.append((args, kwargs)),
+    )
 
     profiler = helper.create_profiler(
         start_step=1,
@@ -153,16 +165,20 @@ def test_npu_offline_analysis_reports_automatic_hdfs_copy(monkeypatch, tmp_path)
     )
     profiler.on_trace_ready(SimpleNamespace(prof_if=SimpleNamespace(prof_path=str(raw_dir))))
 
-    assert copies == [(str(raw_dir), trace_dir)]
-    assert warnings == [
-        "VEOMNI_UPLOAD_CMD is skipped because offline NPU profiling produces a raw directory. "
-        f"The raw directory has already been copied to {trace_dir}; parse it offline."
+    assert copies == []
+    assert sidecar_calls == [
+        (
+            (str(raw_dir),),
+            {"copy_to": trace_dir, "analyse": True, "upload_cmd": "upload-trace", "merlin_upload": False},
+        )
     ]
 
 
-def test_npu_offline_analysis_reports_failed_hdfs_copy(monkeypatch, tmp_path):
+def test_npu_offline_analysis_can_opt_out_of_sidecar(monkeypatch, tmp_path):
     fake_profiler = _FakeNpuProfiler()
     warnings = []
+    sidecar_calls = []
+    copies = []
     trace_dir = "hdfs://haruna/profile"
     raw_dir = tmp_path / "rank0_ascend_pt"
     raw_dir.mkdir()
@@ -170,12 +186,19 @@ def test_npu_offline_analysis_reports_failed_hdfs_copy(monkeypatch, tmp_path):
     monkeypatch.setattr(helper, "IS_NPU_AVAILABLE", True)
     monkeypatch.setattr(helper, "IS_CUDA_AVAILABLE", False)
     monkeypatch.setattr(helper, "VEOMNI_UPLOAD_CMD", "upload-trace")
+    monkeypatch.setattr(helper, "VEOMNI_NPU_OFFLINE_POSTPROCESS", "0")
+    monkeypatch.setattr(helper, "VEOMNI_NPU_OFFLINE_MERLIN_UPLOAD", None)
     monkeypatch.setattr(helper, "CACHE_DIR", str(tmp_path / "cache"))
     monkeypatch.setattr(helper, "torch_npu", SimpleNamespace(profiler=fake_profiler), raising=False)
     monkeypatch.setattr(helper.hdfs_io, "makedirs", lambda *args, **kwargs: None)
-    monkeypatch.setattr(helper, "copy", lambda source, target: False)
+    monkeypatch.setattr(helper, "copy", lambda source, target: (copies.append((source, target)), True)[1])
     monkeypatch.setattr(helper, "get_torch_device", lambda: pytest.fail("offline mode must not dump memory snapshots"))
     monkeypatch.setattr(helper.logger, "warning", warnings.append)
+    monkeypatch.setattr(
+        helper,
+        "spawn_npu_offline_sidecar",
+        lambda *args, **kwargs: sidecar_calls.append((args, kwargs)),
+    )
 
     profiler = helper.create_profiler(
         start_step=1,
@@ -190,10 +213,48 @@ def test_npu_offline_analysis_reports_failed_hdfs_copy(monkeypatch, tmp_path):
     )
     profiler.on_trace_ready(SimpleNamespace(prof_if=SimpleNamespace(prof_path=str(raw_dir))))
 
-    assert warnings == [
-        f"Failed to copy profiling result to {trace_dir}; the raw capture remains at {raw_dir}.",
-        "VEOMNI_UPLOAD_CMD is skipped because offline NPU profiling produces a raw directory, "
-        f"and the automatic copy to {trace_dir} failed. Preserve {raw_dir} before the pod exits.",
+    assert sidecar_calls == []
+    assert copies == [(str(raw_dir), trace_dir)]
+    assert any("VEOMNI_UPLOAD_CMD is skipped" in warning for warning in warnings)
+
+
+def test_npu_offline_analysis_spawns_merlin_upload_sidecar(monkeypatch, tmp_path):
+    fake_profiler = _FakeNpuProfiler()
+    sidecar_calls = []
+    raw_dir = tmp_path / "rank0_ascend_pt"
+    raw_dir.mkdir()
+
+    monkeypatch.setattr(helper, "IS_NPU_AVAILABLE", True)
+    monkeypatch.setattr(helper, "IS_CUDA_AVAILABLE", False)
+    monkeypatch.setattr(helper, "VEOMNI_UPLOAD_CMD", None)
+    monkeypatch.setattr(helper, "VEOMNI_NPU_OFFLINE_POSTPROCESS", None)
+    monkeypatch.setattr(helper, "VEOMNI_NPU_OFFLINE_MERLIN_UPLOAD", "1")
+    monkeypatch.setattr(helper, "torch_npu", SimpleNamespace(profiler=fake_profiler), raising=False)
+    monkeypatch.setattr(helper, "get_torch_device", lambda: pytest.fail("offline mode must not dump memory snapshots"))
+    monkeypatch.setattr(
+        helper,
+        "spawn_npu_offline_sidecar",
+        lambda *args, **kwargs: sidecar_calls.append((args, kwargs)),
+    )
+
+    profiler = helper.create_profiler(
+        start_step=1,
+        end_step=2,
+        trace_dir=str(tmp_path),
+        record_shapes=False,
+        profile_memory=False,
+        with_stack=False,
+        with_modules=False,
+        global_rank=0,
+        npu_offline_analysis=True,
+    )
+    profiler.on_trace_ready(SimpleNamespace(prof_if=SimpleNamespace(prof_path=str(raw_dir))))
+
+    assert sidecar_calls == [
+        (
+            (str(raw_dir),),
+            {"copy_to": None, "analyse": True, "upload_cmd": None, "merlin_upload": True},
+        )
     ]
 
 

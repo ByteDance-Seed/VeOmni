@@ -66,6 +66,69 @@ VALID_CONFIG_TYPE = None
 VEOMNI_UPLOAD_CMD = None
 FlopsCounter = None
 
+# Offline Ascend postprocess sidecar (analyse / durable copy / upload).
+# - unset / auto: spawn when VEOMNI_UPLOAD_CMD is set or VEOMNI_NPU_OFFLINE_MERLIN_UPLOAD=1
+# - VEOMNI_NPU_OFFLINE_POSTPROCESS=1: always spawn after raw finalize
+# - VEOMNI_NPU_OFFLINE_POSTPROCESS=0: never spawn; sync HDFS copy + skip upload
+VEOMNI_NPU_OFFLINE_POSTPROCESS = os.getenv("VEOMNI_NPU_OFFLINE_POSTPROCESS")
+VEOMNI_NPU_OFFLINE_MERLIN_UPLOAD = os.getenv("VEOMNI_NPU_OFFLINE_MERLIN_UPLOAD")
+
+
+def _env_flag(value: Optional[str]) -> Optional[bool]:
+    if value is None or value == "":
+        return None
+    return value.lower() in {"1", "true", "yes", "on"}
+
+
+def spawn_npu_offline_sidecar(
+    raw_dir: str,
+    *,
+    copy_to: Optional[str] = None,
+    analyse: bool = True,
+    upload_cmd: Optional[str] = None,
+    merlin_upload: bool = False,
+) -> Optional[subprocess.Popen]:
+    """Fire-and-forget offline Ascend postprocess so training is not blocked.
+
+    The sidecar runs in a new session so it can outlive a soft train shutdown.
+    Logs go to ``<raw_dir>/veomni_npu_offline_postprocess.log``.
+    """
+    cmd = [sys.executable, "-m", "veomni.utils.npu_offline_postprocess", "--raw-dir", raw_dir]
+    if copy_to:
+        cmd.extend(["--copy-to", copy_to])
+    if analyse:
+        cmd.append("--analyse")
+    if upload_cmd:
+        cmd.extend(["--upload-cmd", upload_cmd])
+    if merlin_upload:
+        cmd.append("--merlin-upload")
+
+    if not (copy_to or analyse or upload_cmd or merlin_upload):
+        logger.warning("spawn_npu_offline_sidecar called with nothing to do; skipping")
+        return None
+
+    log_dir = raw_dir if os.path.isdir(raw_dir) else os.path.dirname(raw_dir) or "."
+    os.makedirs(log_dir, exist_ok=True)
+    log_path = os.path.join(log_dir, "veomni_npu_offline_postprocess.log")
+    log_fh = open(log_path, "a", encoding="utf-8")
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=log_fh,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+            close_fds=True,
+        )
+    except Exception as exc:
+        log_fh.close()
+        logger.warning(f"Failed to spawn NPU offline postprocess sidecar: {exc}")
+        return None
+
+    logger.info(
+        f"Spawned NPU offline postprocess sidecar pid={proc.pid} log={log_path} cmd={' '.join(cmd)}"
+    )
+    return proc
+
 
 def convert_hdfs_fuse_path(*args, **kwargs):
     if len(args) > 0:
@@ -718,48 +781,72 @@ def create_profiler(
             get_torch_device().memory._dump_snapshot(gpu_memory_file)
             logger.info(f"Profiling memory visualization saved at {gpu_memory_file}.")
 
-        if trace_dir.startswith("hdfs://"):
-            hdfs_copy_succeeded = bool(copy(trace_file, trace_dir))
-            if hdfs_copy_succeeded:
-                logger.info(f"Profiling result uploaded to {trace_dir}.")
-            else:
-                logger.warning(
-                    f"Failed to copy profiling result to {trace_dir}; the raw capture remains at {trace_file}."
-                )
+        offline_postprocess_flag = _env_flag(VEOMNI_NPU_OFFLINE_POSTPROCESS)
+        merlin_upload = _env_flag(VEOMNI_NPU_OFFLINE_MERLIN_UPLOAD) is True
+        use_offline_sidecar = (
+            IS_NPU_AVAILABLE
+            and npu_offline_analysis
+            and offline_postprocess_flag is not False
+            and (offline_postprocess_flag is True or bool(VEOMNI_UPLOAD_CMD) or merlin_upload)
+        )
 
-        if VEOMNI_UPLOAD_CMD and IS_NPU_AVAILABLE and npu_offline_analysis:
+        if use_offline_sidecar:
+            # Keep barrier short: only raw finalize stays in-process. Durable copy,
+            # torch_npu analyse, and upload run in a detached sidecar.
+            spawn_npu_offline_sidecar(
+                str(trace_file),
+                copy_to=trace_dir if trace_dir.startswith("hdfs://") else None,
+                analyse=True,
+                upload_cmd=VEOMNI_UPLOAD_CMD,
+                merlin_upload=merlin_upload and not VEOMNI_UPLOAD_CMD,
+            )
+        else:
+            hdfs_copy_succeeded = False
             if trace_dir.startswith("hdfs://"):
+                hdfs_copy_succeeded = bool(copy(trace_file, trace_dir))
                 if hdfs_copy_succeeded:
+                    logger.info(f"Profiling result uploaded to {trace_dir}.")
+                else:
+                    logger.warning(
+                        f"Failed to copy profiling result to {trace_dir}; the raw capture remains at {trace_file}."
+                    )
+
+            if VEOMNI_UPLOAD_CMD and IS_NPU_AVAILABLE and npu_offline_analysis:
+                # Explicit opt-out of the sidecar; keep the old skip warning.
+                if trace_dir.startswith("hdfs://"):
+                    if hdfs_copy_succeeded:
+                        logger.warning(
+                            "VEOMNI_UPLOAD_CMD is skipped because offline NPU profiling produces a raw directory. "
+                            f"The raw directory has already been copied to {trace_dir}; parse it offline "
+                            "(or set VEOMNI_NPU_OFFLINE_POSTPROCESS=1 / leave it unset with VEOMNI_UPLOAD_CMD)."
+                        )
+                    else:
+                        logger.warning(
+                            "VEOMNI_UPLOAD_CMD is skipped because offline NPU profiling produces a raw directory, "
+                            f"and the automatic copy to {trace_dir} failed. Preserve {trace_file} before the pod exits."
+                        )
+                else:
                     logger.warning(
                         "VEOMNI_UPLOAD_CMD is skipped because offline NPU profiling produces a raw directory. "
-                        f"The raw directory has already been copied to {trace_dir}; parse it offline."
+                        f"Copy {trace_file} to durable storage outside the training process, then parse it offline "
+                        "(or unset VEOMNI_NPU_OFFLINE_POSTPROCESS=0 so the async sidecar can run)."
                     )
-                else:
-                    logger.warning(
-                        "VEOMNI_UPLOAD_CMD is skipped because offline NPU profiling produces a raw directory, "
-                        f"and the automatic copy to {trace_dir} failed. Preserve {trace_file} before the pod exits."
-                    )
-            else:
-                logger.warning(
-                    "VEOMNI_UPLOAD_CMD is skipped because offline NPU profiling produces a raw directory. "
-                    f"Copy {trace_file} to durable storage outside the training process, then parse it offline."
-                )
-        elif VEOMNI_UPLOAD_CMD:
-            try:
-                logger.info_rank0(f"upload trace file {trace_file}")
-                if IS_NPU_AVAILABLE:
-                    import gzip
-                    import shutil
+            elif VEOMNI_UPLOAD_CMD:
+                try:
+                    logger.info_rank0(f"upload trace file {trace_file}")
+                    if IS_NPU_AVAILABLE:
+                        import gzip
+                        import shutil
 
-                    npu_trace_file = f"{trace_file}/ASCEND_PROFILER_OUTPUT/trace_view.json"
-                    with open(npu_trace_file, "rb") as f_in, gzip.open(f"{npu_trace_file}.gz", "wb") as f_out:
-                        shutil.copyfileobj(f_in, f_out)
-                    command2 = f"{VEOMNI_UPLOAD_CMD} {npu_trace_file}.gz"
-                else:
-                    command2 = f"{VEOMNI_UPLOAD_CMD} {trace_file}"
-                subprocess.run(command2, shell=True, check=True, executable="/bin/bash")
-            except Exception as e:
-                logger.warning(f"failed to upload trace file {trace_file}, error: {e}")
+                        npu_trace_file = f"{trace_file}/ASCEND_PROFILER_OUTPUT/trace_view.json"
+                        with open(npu_trace_file, "rb") as f_in, gzip.open(f"{npu_trace_file}.gz", "wb") as f_out:
+                            shutil.copyfileobj(f_in, f_out)
+                        command2 = f"{VEOMNI_UPLOAD_CMD} {npu_trace_file}.gz"
+                    else:
+                        command2 = f"{VEOMNI_UPLOAD_CMD} {trace_file}"
+                    subprocess.run(command2, shell=True, check=True, executable="/bin/bash")
+                except Exception as e:
+                    logger.warning(f"failed to upload trace file {trace_file}, error: {e}")
 
     if IS_NPU_AVAILABLE:
         profiler_module = torch_npu.profiler

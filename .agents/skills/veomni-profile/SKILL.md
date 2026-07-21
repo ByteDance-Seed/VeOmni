@@ -15,6 +15,7 @@ Key components:
 | `VeomniFlopsCounter` | `veomni/utils/count_flops.py` | Analytical FLOPs/MFU computation per model family |
 | `EnvironMeter` | `veomni/utils/helper.py` | Step-level throughput metrics (tokens/s, FLOPs, MFU) |
 | `merge_chrome_trace.py` | `scripts/profile/merge_chrome_trace.py` | Merge multi-rank Chrome traces for unified viewing |
+| `npu_offline_postprocess` | `veomni/utils/npu_offline_postprocess.py` | Async Ascend offline analyse / durable copy / Merlin upload sidecar |
 
 Output formats:
 - **Chrome trace**: `veomni_rank{R}_{timestamp}.pt.trace.json.gz` — viewable in `chrome://tracing` or Perfetto
