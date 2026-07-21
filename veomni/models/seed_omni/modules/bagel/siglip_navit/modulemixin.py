@@ -7,15 +7,13 @@ from typing import Any
 import torch
 
 from ......distributed.parallel_state import get_parallel_state
-from ......distributed.sequence_parallel import sp_all_gather_shards
+from ......distributed.sequence_parallel import gather_outputs
 from ....mixins.metric_meter_mixin import MetricMeterMixin
 from ....mixins.modulemixin import (
     CPUPreprocessor,
     ModuleMixin,
     post_forward,
     pre_forward,
-    sp_post_forward,
-    sp_pre_forward,
 )
 from ....utils.conversation import ConversationItem, iter_desired_items
 from ..sources import BAGEL_SIGLIP_CONTEXT
@@ -86,8 +84,8 @@ class BagelSiglipNavitModuleMixin(ModuleMixin):
     def init_omni_state(self) -> None:
         self._conversation_carrier: list[list[ConversationItem]] | None = None
         self._image_items: list[ConversationItem] = []
-        self._forward_sp_sample_image_count: int | None = None
-        self._forward_sp_sample_token_count: int | None = None
+        self._sp_image_count: int | None = None
+        self._sp_token_count: int | None = None
 
     def build_cpu_preprocessor(self) -> CPUPreprocessor | None:
         """Worker-side image patchify for training batches."""
@@ -130,7 +128,55 @@ class BagelSiglipNavitModuleMixin(ModuleMixin):
         self._image_items = self._select_siglip_image_items(conversation_list)
         out = self._inputs_from_preprocessed_items(self._image_items)
         self.metric_meter_set_seqlens("forward", self._metric_sample_token_lens(conversation_list))
-        return out
+
+        ps = get_parallel_state()
+        if ps.sp_size == 1:
+            self._sp_image_count = None
+            self._sp_token_count = None
+            return out
+
+        if ps.cp_size != 1:
+            raise ValueError(f"BAGEL SigLIP NaViT training supports Ulysses groups only; got cp_size={ps.cp_size}.")
+
+        token_lens = out["token_lens"]
+        image_count = int(token_lens.numel())
+        if image_count == 0:
+            raise ValueError("BAGEL SigLIP NaViT SP requires at least one real or dummy image.")
+        self._sp_image_count = image_count
+        self._sp_token_count = int(token_lens.sum().item())
+
+        pad_images = (-image_count) % ps.sp_size
+        if pad_images:
+            token_lens = torch.cat((token_lens, token_lens.new_ones(pad_images)), dim=0)
+            out["patchified_pixel_values"] = torch.cat(
+                (
+                    out["patchified_pixel_values"],
+                    out["patchified_pixel_values"].new_zeros((pad_images, *out["patchified_pixel_values"].shape[1:])),
+                ),
+                dim=0,
+            )
+            out["patchified_position_ids"] = torch.cat(
+                (
+                    out["patchified_position_ids"],
+                    out["patchified_position_ids"].new_zeros((pad_images, *out["patchified_position_ids"].shape[1:])),
+                ),
+                dim=0,
+            )
+
+        images_per_rank = int(token_lens.numel()) // ps.sp_size
+        image_start = ps.sp_rank * images_per_rank
+        image_end = image_start + images_per_rank
+        full_cu_seqlens = torch.nn.functional.pad(torch.cumsum(token_lens, dim=0), (1, 0))
+        token_start = int(full_cu_seqlens[image_start].item())
+        token_end = int(full_cu_seqlens[image_end].item())
+        local_token_lens = token_lens[image_start:image_end].contiguous()
+        return {
+            "patchified_pixel_values": out["patchified_pixel_values"][token_start:token_end].contiguous(),
+            "patchified_position_ids": out["patchified_position_ids"][token_start:token_end].contiguous(),
+            "cu_seqlens": torch.nn.functional.pad(torch.cumsum(local_token_lens, dim=0), (1, 0)).to(torch.int32),
+            "max_seqlen": int(local_token_lens.max().item()),
+            "token_lens": local_token_lens,
+        }
 
     @post_forward("forward")
     def forward_post(
@@ -138,113 +184,27 @@ class BagelSiglipNavitModuleMixin(ModuleMixin):
         image_embeds: torch.Tensor,
         token_lens: torch.Tensor | None = None,
     ) -> dict[str, Any]:
+        if token_lens is None:
+            raise ValueError("BagelSiglipNavit.forward_post requires token_lens for non-dummy outputs.")
+
+        ps = get_parallel_state()
+        if ps.sp_size > 1:
+            if self._sp_image_count is None or self._sp_token_count is None:
+                raise RuntimeError("BAGEL SigLIP NaViT SP image shape was not initialized.")
+            image_embeds = gather_outputs(image_embeds, gather_dim=0, group=ps.sp_group)
+            token_lens = gather_outputs(token_lens, gather_dim=0, group=ps.sp_group)
+            image_embeds = image_embeds.narrow(0, 0, self._sp_token_count)
+            token_lens = token_lens.narrow(0, 0, self._sp_image_count)
+
         conversation = self._conversation_carrier
         image_items = self._image_items
         self._conversation_carrier = None
         self._image_items = []
-
-        if token_lens is None:
-            raise ValueError("BagelSiglipNavit.forward_post requires token_lens for non-dummy outputs.")
+        self._sp_image_count = None
+        self._sp_token_count = None
 
         self._scatter_image_embeds(image_items, image_embeds, token_lens)
         return {"conversation_list": conversation}
-
-    # ── Ulysess SP hooks ──────────────────────────────────
-
-    @sp_pre_forward("forward")
-    def forward_sp_pre(
-        self,
-        patchified_pixel_values: torch.Tensor,
-        patchified_position_ids: torch.Tensor,
-        token_lens: torch.Tensor,
-        **kwargs: Any,
-    ) -> dict[str, Any]:
-        """Shard one broadcast NaViT sample at whole-image boundaries.
-
-        BAGEL stores a variable-size image batch as one flat patch tensor plus
-        ``token_lens``. Its ViT attention is not Ulysses-aware, so a rank must
-        receive complete images rather than an arbitrary patch slice. Pad the
-        image list with one-patch dummy images until every SP rank owns a
-        non-empty contiguous image shard, then rebuild the local varlen metadata
-        from the broadcast tensor values.
-        """
-        del kwargs
-        ps = get_parallel_state()
-        if ps.cp_size != 1:
-            raise ValueError(f"BAGEL SigLIP NaViT training supports Ulysses groups only; got cp_size={ps.cp_size}.")
-
-        sample_image_count = int(token_lens.numel())
-        if sample_image_count == 0:
-            raise ValueError("BAGEL SigLIP NaViT SP requires at least one real or dummy image.")
-        sample_token_count = int(token_lens.sum().item())
-        self._forward_sp_sample_image_count = sample_image_count
-        self._forward_sp_sample_token_count = sample_token_count
-
-        pad_images = (-sample_image_count) % ps.sp_size
-        if pad_images:
-            token_lens = torch.cat((token_lens, token_lens.new_ones(pad_images)), dim=0)
-            patchified_pixel_values = torch.cat(
-                (
-                    patchified_pixel_values,
-                    patchified_pixel_values.new_zeros((pad_images, *patchified_pixel_values.shape[1:])),
-                ),
-                dim=0,
-            )
-            patchified_position_ids = torch.cat(
-                (
-                    patchified_position_ids,
-                    patchified_position_ids.new_zeros((pad_images, *patchified_position_ids.shape[1:])),
-                ),
-                dim=0,
-            )
-
-        image_start, image_end = self._balanced_image_bounds(
-            int(token_lens.numel()),
-            ps.sp_rank,
-            ps.sp_size,
-        )
-        full_cu_seqlens = torch.nn.functional.pad(torch.cumsum(token_lens, dim=0), (1, 0))
-        token_start = int(full_cu_seqlens[image_start].item())
-        token_end = int(full_cu_seqlens[image_end].item())
-        local_token_lens = token_lens[image_start:image_end].contiguous()
-        return {
-            "patchified_pixel_values": patchified_pixel_values[token_start:token_end].contiguous(),
-            "patchified_position_ids": patchified_position_ids[token_start:token_end].contiguous(),
-            "cu_seqlens": torch.nn.functional.pad(torch.cumsum(local_token_lens, dim=0), (1, 0)).to(torch.int32),
-            "max_seqlen": int(local_token_lens.max().item()),
-            "token_lens": local_token_lens,
-        }
-
-    @sp_post_forward("forward")
-    def forward_sp_post(
-        self,
-        image_embeds: torch.Tensor,
-        token_lens: torch.Tensor,
-        **kwargs: Any,
-    ) -> dict[str, Any]:
-        """All-gather whole-image shards and remove the dummy image tail."""
-        del kwargs
-        sample_image_count = self._forward_sp_sample_image_count
-        sample_token_count = self._forward_sp_sample_token_count
-        self._forward_sp_sample_image_count = None
-        self._forward_sp_sample_token_count = None
-        if sample_image_count is None or sample_token_count is None:
-            raise RuntimeError("BAGEL SigLIP NaViT SP sample shape was not initialized.")
-
-        group = get_parallel_state().sp_group
-        image_embeds = sp_all_gather_shards(image_embeds, dim=0, group=group)
-        token_lens = sp_all_gather_shards(token_lens, dim=0, group=group)
-        return {
-            "image_embeds": image_embeds.narrow(0, 0, sample_token_count),
-            "token_lens": token_lens.narrow(0, 0, sample_image_count),
-        }
-
-    @staticmethod
-    def _balanced_image_bounds(num_images: int, rank: int, world_size: int) -> tuple[int, int]:
-        images_per_rank, remainder = divmod(num_images, world_size)
-        start = rank * images_per_rank + min(rank, remainder)
-        count = images_per_rank + int(rank < remainder)
-        return start, start + count
 
     # ── Internal helpers ──────────────────────────────────
 

@@ -376,16 +376,20 @@ def test_bagel_qwen2_mot_rejects_context_parallel_training(monkeypatch) -> None:
     monkeypatch.setattr(
         modulemixin,
         "get_parallel_state",
-        lambda: SimpleNamespace(sp_enabled=True, cp_size=2),
+        lambda: SimpleNamespace(sp_size=2, cp_size=2),
     )
+    conversation = [
+        [
+            ConversationItem(
+                type="text",
+                value=torch.zeros(1, int(model.config.hidden_size), device=model.device, dtype=model.dtype),
+                role="user",
+            )
+        ]
+    ]
 
     with pytest.raises(ValueError, match="Ulysses sequence parallelism only"):
-        model.forward_sp_pre(
-            packed_sequence=torch.zeros(1, int(model.config.hidden_size), device=model.device, dtype=model.dtype),
-            packed_position_ids=torch.zeros(1, device=model.device, dtype=torch.long),
-            packed_token_type_ids=torch.zeros(1, device=model.device, dtype=torch.long),
-            attention_mask=torch.ones(1, 1, 1, 1, device=model.device, dtype=torch.bool),
-        )
+        model.forward_pre(conversation_list=conversation)
 
 
 def test_bagel_flow_dummy_embed_anchors_to_vae_dummy_output() -> None:

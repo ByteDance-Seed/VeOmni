@@ -193,7 +193,6 @@ def test_bagel_mot_forward_pre_returns_sample_local_tensor_contract():
     assert "packed_und_token_indexes" not in forward_parameters
     assert "packed_gen_token_indexes" not in forward_parameters
     assert all(parameter.kind is not Parameter.VAR_KEYWORD for parameter in forward_parameters.values())
-    assert model.supports_sp("forward") is True
     assert set(inputs) == {
         "packed_sequence",
         "packed_position_ids",
@@ -231,18 +230,6 @@ def test_bagel_mot_training_attention_mask_contract_is_checked_once_at_the_modul
         model.forward_pre(conversation_list=conversation)
 
 
-def test_bagel_mot_forward_opts_into_training_graph_owner_loop(monkeypatch):
-    from veomni.distributed import parallel_state
-    from veomni.models.seed_omni.graphs.training_graph import TrainingGraph
-
-    BagelQwen2MoT = model_cls("bagel_qwen2_mot")
-    BagelQwen2MoTConfig = config_cls("bagel_qwen2_mot")
-    model = BagelQwen2MoT(BagelQwen2MoTConfig(**tiny_bagel_qwen2_cfg())).train()
-    monkeypatch.setattr(parallel_state, "get_parallel_state", lambda: SimpleNamespace(sp_size=4))
-
-    assert TrainingGraph._use_sp_loop(model, "forward") is True
-
-
 def test_bagel_mot_forward_pre_normalizes_sample_broadcast_dtype():
     BagelQwen2MoT = model_cls("bagel_qwen2_mot")
     BagelQwen2MoTConfig = config_cls("bagel_qwen2_mot")
@@ -268,7 +255,7 @@ def test_bagel_mot_forward_pre_normalizes_sample_broadcast_dtype():
     assert inputs["packed_sequence"].dtype == model.dtype
 
 
-def test_bagel_mot_sp_pre_keeps_dense_mask_full_and_marks_sequence_padding(monkeypatch):
+def test_bagel_mot_forward_pre_keeps_dense_mask_full_and_marks_sequence_padding(monkeypatch):
     from veomni.models.seed_omni.modules.bagel.qwen2_mot import modulemixin
 
     BagelQwen2MoT = model_cls("bagel_qwen2_mot")
@@ -277,7 +264,7 @@ def test_bagel_mot_sp_pre_keeps_dense_mask_full_and_marks_sequence_padding(monke
     monkeypatch.setattr(
         modulemixin,
         "get_parallel_state",
-        lambda: SimpleNamespace(cp_size=1, ulysses_size=4, sp_group=object()),
+        lambda: SimpleNamespace(sp_size=4, cp_size=1, ulysses_size=4, sp_group=object()),
     )
 
     def fake_sp_pad(tensor, dim, pad_value):
@@ -288,16 +275,19 @@ def test_bagel_mot_sp_pre_keeps_dense_mask_full_and_marks_sequence_padding(monke
 
     monkeypatch.setattr(modulemixin, "sp_pad", fake_sp_pad)
     monkeypatch.setattr(modulemixin, "slice_input_tensor", lambda tensor, **kwargs: tensor)
-    attention_mask = torch.ones(1, 1, 5, 5, dtype=torch.bool)
-
-    inputs = model.forward_sp_pre(
-        packed_sequence=torch.ones(5, int(model.config.hidden_size)),
-        packed_position_ids=torch.arange(5),
-        packed_token_type_ids=torch.tensor([0, 0, 1, 1, 1]),
-        attention_mask=attention_mask,
+    hidden_size = int(model.config.hidden_size)
+    text = ConversationItem(type="text", value=torch.ones(2, hidden_size), role="user")
+    image = ConversationItem(
+        type="image",
+        value=torch.ones(3, hidden_size),
+        role="assistant",
+        source=BAGEL_VAE_CONTEXT,
+        meta={_IMG_TAG_KEY: "gen"},
     )
 
-    assert inputs["attention_mask"] is attention_mask
+    inputs = model.forward_pre(conversation_list=[[text, image]])
+
+    assert inputs["attention_mask"].shape == (1, 1, 5, 5)
     assert inputs["packed_sequence"].shape[0] == 8
     assert set(inputs) == {
         "packed_sequence",

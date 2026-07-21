@@ -249,7 +249,7 @@ def test_native_gqa_rejects_invalid_global_head_ratio_at_config_init() -> None:
         )
 
 
-def test_native_gqa_rejects_kv_heads_that_cannot_be_sharded_in_sp_pre(
+def test_native_gqa_rejects_kv_heads_that_cannot_be_sharded_in_forward_pre(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from veomni.models.seed_omni.modules.bagel.qwen2_mot import modulemixin
@@ -268,13 +268,17 @@ def test_native_gqa_rejects_kv_heads_that_cannot_be_sharded_in_sp_pre(
     monkeypatch.setattr(
         modulemixin,
         "get_parallel_state",
-        lambda: SimpleNamespace(cp_size=1, ulysses_size=4),
+        lambda: SimpleNamespace(sp_size=4, cp_size=1, ulysses_size=4),
     )
+    conversation = [
+        [
+            ConversationItem(
+                type="text",
+                value=torch.randn(2, model.config.hidden_size),
+                role="user",
+            )
+        ]
+    ]
 
     with pytest.raises(ValueError, match="KV heads must be divisible"):
-        model.forward_sp_pre(
-            packed_sequence=torch.randn(2, model.config.hidden_size),
-            packed_position_ids=torch.arange(2),
-            packed_token_type_ids=torch.zeros(2, dtype=torch.long),
-            attention_mask=torch.ones(1, 1, 2, 2, dtype=torch.bool),
-        )
+        model.forward_pre(conversation_list=conversation)

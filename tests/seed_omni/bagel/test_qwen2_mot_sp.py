@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
-from types import MethodType
 
 import pytest
 import torch
@@ -14,16 +13,17 @@ from torch.distributed.tensor import DTensor
 from tests.seed_omni.bagel.contracts.helpers import config_cls, model_cls, tiny_bagel_qwen2_cfg
 from tests.tools.launch_utils import torchrun
 from veomni.distributed.parallel_state import init_parallel_state, use_parallel_state
-from veomni.models.seed_omni.graphs.dispatch import run_sp_looped_endpoint
 from veomni.models.seed_omni.modules.bagel.sources import BAGEL_SIGLIP_CONTEXT, BAGEL_VAE_CONTEXT
 from veomni.models.seed_omni.utils.conversation import _IMG_TAG_KEY, ConversationItem
 from veomni.utils.device import get_device_type, get_torch_device
 
 
-def _rank_items(
-    rank: int, device: torch.device, hidden_size: int
+def _sample_items(
+    sample_index: int,
+    device: torch.device,
+    hidden_size: int,
 ) -> tuple[list[ConversationItem], list[torch.Tensor]]:
-    generator = torch.Generator(device=device).manual_seed(7300 + rank)
+    generator = torch.Generator(device=device).manual_seed(7300 + sample_index)
 
     def make_tensor(length: int) -> torch.Tensor:
         return torch.randn(
@@ -35,7 +35,7 @@ def _rank_items(
             requires_grad=True,
         )
 
-    if rank == 0:
+    if sample_index == 0:
         values = [make_tensor(2), make_tensor(3)]
         items = [
             ConversationItem(type="text", value=values[0], role="user"),
@@ -46,7 +46,7 @@ def _rank_items(
                 source=BAGEL_SIGLIP_CONTEXT,
             ),
         ]
-    elif rank == 1:
+    elif sample_index == 1:
         values = [make_tensor(2), make_tensor(3), make_tensor(1)]
         items = [
             ConversationItem(type="text", value=values[0], role="user"),
@@ -59,7 +59,7 @@ def _rank_items(
             ),
             ConversationItem(type="text", value=values[2], role="assistant"),
         ]
-    elif rank == 2:
+    elif sample_index == 2:
         values = [make_tensor(2), make_tensor(5)]
         items = [
             ConversationItem(
@@ -109,20 +109,36 @@ def _rank_items(
     return items, values
 
 
+def _replicated_batch(
+    device: torch.device,
+    hidden_size: int,
+) -> tuple[list[list[ConversationItem]], list[torch.Tensor]]:
+    conversation: list[list[ConversationItem]] = []
+    inputs: list[torch.Tensor] = []
+    for sample_index in range(4):
+        items, sample_inputs = _sample_items(sample_index, device, hidden_size)
+        conversation.append(items)
+        inputs.extend(sample_inputs)
+    return conversation, inputs
+
+
 def _carrier_hidden(conversation: list[list[ConversationItem]]) -> torch.Tensor:
-    sample = conversation[0]
-    real_hidden = [item.value for item in sample if item.role != "dummy" and torch.is_tensor(item.value)]
+    real_hidden = [
+        item.value
+        for sample in conversation
+        for item in sample
+        if item.role != "dummy" and torch.is_tensor(item.value)
+    ]
     assert real_hidden
     return torch.cat(real_hidden, dim=0)
 
 
 def _forward_carrier(
     model: torch.nn.Module,
-    items: list[ConversationItem],
+    conversation: list[list[ConversationItem]],
     parallel_state,
-    sample_shapes: list[tuple[int, tuple[int, ...]]] | None = None,
+    input_shapes: list[tuple[tuple[int, ...], tuple[int, ...]]] | None = None,
 ) -> torch.Tensor:
-    conversation = [items]
     with (
         use_parallel_state(parallel_state),
         torch.autocast(
@@ -131,24 +147,14 @@ def _forward_carrier(
         ),
     ):
         inputs = model.forward_pre(conversation_list=conversation)
-        if parallel_state.sp_size > 1:
-            assert model.supports_sp("forward") is True
-            if sample_shapes is not None:
-                original_sp_pre = model.forward_sp_pre
-
-                def recording_sp_pre(self, **kwargs):
-                    sample_shapes.append(
-                        (
-                            int(kwargs["packed_sequence"].shape[0]),
-                            tuple(kwargs["attention_mask"].shape),
-                        )
-                    )
-                    return original_sp_pre(**kwargs)
-
-                model.forward_sp_pre = MethodType(recording_sp_pre, model)
-            outputs = run_sp_looped_endpoint(model, model, method="forward", kwargs=inputs)
-        else:
-            outputs = model(**inputs)
+        if input_shapes is not None:
+            input_shapes.append(
+                (
+                    tuple(inputs["packed_sequence"].shape),
+                    tuple(inputs["attention_mask"].shape),
+                )
+            )
+        outputs = model(**inputs)
         result = model.forward_post(**outputs)
     return _carrier_hidden(result["conversation_list"])
 
@@ -171,12 +177,12 @@ def _qwen2_mot_sp_worker() -> None:
     assert world_size == 4
     device = torch.device(f"{get_device_type()}:{rank}")
 
-    outer_state = init_parallel_state(
+    non_sp_state = init_parallel_state(
         dp_size=world_size,
         dp_shard_size=world_size,
         dp_mode="fsdp2",
     )
-    module_state = init_parallel_state(
+    sp_state = init_parallel_state(
         ulysses_size=world_size,
         dp_mode="fsdp2",
     )
@@ -192,29 +198,43 @@ def _qwen2_mot_sp_worker() -> None:
         "attn_implementation": "veomni_flash_attention_2_with_sp",
     }
     torch.manual_seed(9102)
-    reference = BagelQwen2MoT(BagelQwen2MoTConfig(**config_kwargs)).to(device=device, dtype=torch.bfloat16).train()
+    reference = (
+        BagelQwen2MoT(BagelQwen2MoTConfig(**config_kwargs))
+        .to(
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        .train()
+    )
     torch.manual_seed(9102)
     sequence_parallel = (
-        BagelQwen2MoT(BagelQwen2MoTConfig(**config_kwargs)).to(device=device, dtype=torch.bfloat16).train()
+        BagelQwen2MoT(BagelQwen2MoTConfig(**config_kwargs))
+        .to(
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        .train()
     )
     sequence_parallel.load_state_dict(reference.state_dict())
 
     mp_policy = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32)
     for layer in sequence_parallel.model.layers:
-        fully_shard(layer, mesh=module_state.fsdp_mesh, mp_policy=mp_policy)
-    fully_shard(sequence_parallel, mesh=module_state.fsdp_mesh, mp_policy=mp_policy)
-    _enable_scoped_gradient_checkpointing(sequence_parallel, module_state)
+        fully_shard(layer, mesh=sp_state.fsdp_mesh, mp_policy=mp_policy)
+    fully_shard(sequence_parallel, mesh=sp_state.fsdp_mesh, mp_policy=mp_policy)
+    _enable_scoped_gradient_checkpointing(sequence_parallel, sp_state)
 
     hidden_size = int(reference.config.hidden_size)
-    reference_items, reference_inputs = _rank_items(rank, device, hidden_size)
-    sp_items, sp_inputs = _rank_items(rank, device, hidden_size)
+    reference_conversation, reference_inputs = _replicated_batch(device, hidden_size)
+    sp_conversation, sp_inputs = _replicated_batch(device, hidden_size)
     expected_sample_lengths = [5, 6, 7, 8]
-    sample_shapes: list[tuple[int, tuple[int, ...]]] = []
+    input_shapes: list[tuple[tuple[int, ...], tuple[int, ...]]] = []
 
-    reference_hidden = _forward_carrier(reference, reference_items, outer_state)
-    sp_hidden = _forward_carrier(sequence_parallel, sp_items, module_state, sample_shapes)
-    assert sample_shapes == [(length, (1, 1, length, length)) for length in expected_sample_lengths]
-    assert sequence_parallel._metric_full_seqlens["forward"] == [expected_sample_lengths[rank]]
+    reference_hidden = _forward_carrier(reference, reference_conversation, non_sp_state)
+    sp_hidden = _forward_carrier(sequence_parallel, sp_conversation, sp_state, input_shapes)
+    assert input_shapes == [((7, hidden_size), (1, 1, 26, 26))]
+    assert sequence_parallel._metric_full_seqlens["forward"] == expected_sample_lengths
+    assert torch.isfinite(reference_hidden).all()
+    assert torch.isfinite(sp_hidden).all()
     torch.testing.assert_close(sp_hidden, reference_hidden, rtol=2e-2, atol=2e-2)
 
     reference_loss = reference_hidden.float().square().mean()
@@ -225,21 +245,25 @@ def _qwen2_mot_sp_worker() -> None:
     for reference_input, sp_input in zip(reference_inputs, sp_inputs, strict=True):
         assert reference_input.grad is not None
         assert sp_input.grad is not None
+        assert torch.isfinite(reference_input.grad).all()
         assert torch.isfinite(sp_input.grad).all()
-        torch.testing.assert_close(sp_input.grad, reference_input.grad, rtol=3e-2, atol=3e-2)
+        sp_grad = sp_input.grad.detach().clone()
+        dist.all_reduce(sp_grad, op=dist.ReduceOp.SUM, group=sp_state.sp_group)
+        sp_grad /= world_size
+        torch.testing.assert_close(sp_grad, reference_input.grad, rtol=3e-2, atol=3e-2)
 
     reference_grads: dict[str, torch.Tensor] = {}
     for name, parameter in reference.named_parameters():
         assert parameter.grad is not None, f"reference parameter {name} did not participate in backward"
+        assert torch.isfinite(parameter.grad).all()
         grad = parameter.grad.detach().clone()
         dist.all_reduce(grad, op=dist.ReduceOp.SUM)
         reference_grads[name] = grad / world_size
 
     for name, parameter in sequence_parallel.named_parameters():
         assert parameter.grad is not None, f"SP parameter {name} did not participate in backward"
-        assert torch.isfinite(
-            parameter.grad.to_local() if isinstance(parameter.grad, DTensor) else parameter.grad
-        ).all()
+        local_grad = parameter.grad.to_local() if isinstance(parameter.grad, DTensor) else parameter.grad
+        assert torch.isfinite(local_grad).all()
         sp_grad = parameter.grad.full_tensor() if isinstance(parameter.grad, DTensor) else parameter.grad
         torch.testing.assert_close(
             sp_grad,

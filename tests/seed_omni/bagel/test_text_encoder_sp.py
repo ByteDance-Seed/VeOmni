@@ -32,7 +32,10 @@ def _text_encoder_sp_worker() -> None:
             )
         ).to(device=device, dtype=torch.float32)
 
-    input_ids = torch.arange(rank + 2, device=device, dtype=torch.long) + rank * 4
+    # Uniform SP replicates the same DP sample across every SP rank. Use an odd
+    # sequence length so encode_pre must pad to six tokens before slicing it into
+    # two equal local shards.
+    input_ids = torch.arange(5, device=device, dtype=torch.long)
     item = ConversationItem(
         type="text",
         value=input_ids,
@@ -40,7 +43,7 @@ def _text_encoder_sp_worker() -> None:
         meta={
             "_omni_tokenized": True,
             "input_ids": input_ids,
-            "labels": input_ids.clone() if rank == 0 else torch.full_like(input_ids, -100),
+            "labels": input_ids.clone(),
         },
     )
     conversation = [[item]]
@@ -57,7 +60,7 @@ def _text_encoder_sp_worker() -> None:
 
     with use_parallel_state(module_state):
         decode_inputs = model.decode_pre(conversation_list=conversation)
-        assert decode_inputs["hidden_states"].shape == (2, model.config.hidden_size)
+        assert decode_inputs["hidden_states"].shape == (5, model.config.hidden_size)
         decoded = model.decode(**decode_inputs)
         outputs = model.decode_post(**decoded)
 
@@ -71,13 +74,12 @@ def _text_encoder_sp_worker() -> None:
     loss.backward()
     assert model.lm_head.weight.grad is not None
     assert torch.isfinite(model.lm_head.weight.grad).all()
-    if rank == 1:
-        assert item.value.grad is not None
-        torch.testing.assert_close(item.value.grad, torch.zeros_like(item.value.grad))
+    assert item.value.grad is not None
+    assert torch.isfinite(item.value.grad).all()
 
     dist.barrier()
 
 
 @pytest.mark.skipif(get_torch_device().device_count() < 2, reason="device_count should be >= 2")
-def test_bagel_text_encoder_sp2_handles_mixed_valid_and_dummy_decode_spans() -> None:
+def test_bagel_text_encoder_sp2_handles_replicated_padded_sequence() -> None:
     torchrun(_text_encoder_sp_worker, world_size=2)
