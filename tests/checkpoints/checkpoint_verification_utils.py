@@ -259,7 +259,7 @@ def verify_hf_checkpoint_weights(
                 logger.error(f"Shape mismatch for key '{key}': {original_tensor.shape} vs {loaded_tensor.shape}")
                 return False
 
-            # Check dtype matches (both should be bf16 now)
+            # Check dtype matches (floating tensors are bf16; integer/bool buffers keep native dtype)
             if original_tensor.dtype != loaded_tensor.dtype:
                 logger.error(f"Dtype mismatch for key '{key}': {original_tensor.dtype} vs {loaded_tensor.dtype}")
                 return False
@@ -340,10 +340,17 @@ def verify_dcp_to_hf_conversion(
         traceback.print_exc()
         return False
 
-    # Convert DCP state dict from fp32 to bf16 to match HF checkpoint dtype
-    logger.info("Converting DCP weights from fp32 to bf16 for exact comparison...")
-    dcp_state_dict_bf16 = {key: tensor.to(torch.bfloat16) for key, tensor in dcp_state_dict.items()}
-    logger.info(f"✓ Converted {len(dcp_state_dict_bf16)} tensors to bf16")
+    # Convert floating DCP tensors to bf16 to match HF export dtype. Integer /
+    # boolean buffers (e.g. DeepSeek-V4 hash-router ``tid2eid``) must keep their
+    # original dtype — the save path already skips non-floating tensors.
+    logger.info("Converting floating DCP weights from fp32 to bf16 for exact comparison...")
+    dcp_state_dict_bf16 = {
+        key: (tensor.to(torch.bfloat16) if tensor.is_floating_point() else tensor)
+        for key, tensor in dcp_state_dict.items()
+    }
+    n_cast = sum(1 for t in dcp_state_dict_bf16.values() if t.dtype == torch.bfloat16)
+    n_kept = len(dcp_state_dict_bf16) - n_cast
+    logger.info(f"✓ Converted {n_cast} floating tensors to bf16; kept {n_kept} non-floating tensors")
 
     # Verify the HF checkpoint against DCP state dict (bf16 vs bf16, exact match)
     return verify_hf_checkpoint(

@@ -280,11 +280,32 @@ def _run_trainer_save_hf_safetensor(model_name: str, ep_size: int):
 
 
 # MoE save/load coverage.
-TEST_MODELS = ["qwen3_moe", "deepseek_v3"]
+# deepseek_v4 is included for hash-MoE tid2eid + fused experts + mHC DCP resume.
+# CI L20-8 keeps the default nproc=8; local machines can override with
+# VEOMNI_CHECKPOINT_TEST_NPROC (ep sizes larger than nproc are skipped).
+TEST_MODELS = ["qwen3_moe", "deepseek_v3", "deepseek_v4"]
 TEST_EP_SIZES = [1, 4, 8]
 
 
-@pytest.mark.parametrize("model_name,ep_size", [(model, ep) for model in TEST_MODELS for ep in TEST_EP_SIZES])
+def _saveload_cases():
+    try:
+        from .utils import get_checkpoint_test_nproc
+    except Exception:
+        from utils import get_checkpoint_test_nproc
+
+    nproc = get_checkpoint_test_nproc()
+    cases = []
+    for model in TEST_MODELS:
+        # DeepSeek-V4 EP token dispatch is not yet covered by saveload (e2e also
+        # keeps max_ep_size=1). Exercise DCP resume + HF export at ep=1 only.
+        ep_sizes = [1] if model == "deepseek_v4" else TEST_EP_SIZES
+        for ep in ep_sizes:
+            if ep <= nproc:
+                cases.append((model, ep))
+    return cases
+
+
+@pytest.mark.parametrize("model_name,ep_size", _saveload_cases())
 def test_trainer_saveload(model_name: str, ep_size: int):
     _run_trainer_saveload_and_verify(model_name, ep_size)
 
