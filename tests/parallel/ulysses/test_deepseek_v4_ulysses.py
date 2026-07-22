@@ -25,6 +25,7 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+from torch import nn
 
 from veomni.utils.device import get_device_type, get_dist_comm_backend, get_torch_device
 
@@ -47,6 +48,160 @@ def _build_causal_mask(seq_len: int, sliding_window: int | None, device, dtype) 
         causal = causal & (k_idx > q_idx - sliding_window)
     full_mask = torch.zeros(1, 1, seq_len, seq_len, device=device, dtype=dtype)
     return full_mask.masked_fill(~causal, torch.finfo(dtype).min)
+
+
+def test_sliding_attention_sp_only_gathers_mqa_kv(monkeypatch):
+    """Sliding-only layers must not all-gather unused compressor inputs."""
+    from transformers import AutoConfig
+
+    from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as dsv4
+
+    config = AutoConfig.from_pretrained("tests/toy_config/deepseek_v4_toy")
+    layer = dsv4.DeepseekV4Attention(config, layer_idx=0).float().eval()
+    layer.compressor = None
+    sp_size = 2
+    sp_state = SimpleNamespace(ulysses_enabled=True, ulysses_group=object(), ulysses_size=sp_size, ulysses_rank=0)
+    gather_shapes = []
+
+    def fake_gather_outputs(x, gather_dim, **_kwargs):
+        gather_shapes.append(tuple(x.shape))
+        return torch.cat([x] * sp_size, dim=gather_dim)
+
+    def fake_gather_seq_scatter_heads(x, seq_dim, head_dim, **_kwargs):
+        return torch.cat([x] * sp_size, dim=seq_dim).chunk(sp_size, dim=head_dim)[0]
+
+    def fake_gather_heads_scatter_seq(x, head_dim, seq_dim, **_kwargs):
+        return torch.cat([x.chunk(sp_size, dim=seq_dim)[0]] * sp_size, dim=head_dim)
+
+    monkeypatch.setattr(dsv4, "get_parallel_state", lambda: sp_state)
+    monkeypatch.setattr(dsv4, "gather_outputs", fake_gather_outputs)
+    monkeypatch.setattr(dsv4, "gather_seq_scatter_heads", fake_gather_seq_scatter_heads)
+    monkeypatch.setattr(dsv4, "gather_heads_scatter_seq", fake_gather_heads_scatter_seq)
+
+    local_seq_len = 4
+    hidden_states = torch.randn(1, local_seq_len, config.hidden_size)
+    position_ids = torch.arange(local_seq_len).unsqueeze(0)
+    rotary = dsv4.DeepseekV4RotaryEmbedding(config)
+    position_embeddings = {
+        "main": rotary(hidden_states, position_ids=position_ids, layer_type="main"),
+        "compress": rotary(hidden_states, position_ids=position_ids, layer_type="compress"),
+    }
+    output, _ = layer(
+        hidden_states,
+        position_embeddings=position_embeddings,
+        position_ids=position_ids,
+        attention_mask=_build_causal_mask(local_seq_len * sp_size, config.sliding_window, "cpu", torch.float32),
+    )
+
+    assert output.shape == hidden_states.shape
+    assert gather_shapes == [(1, 1, local_seq_len, config.head_dim)]
+
+
+def test_model_sp_uses_lightweight_full_sequence_references(monkeypatch):
+    """Mask and packed metadata helpers must not allocate full-width dummy hidden states."""
+    from transformers import AutoConfig
+
+    from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as dsv4
+
+    class TakeFirstHyperConnection(nn.Module):
+        def forward(self, hidden_states):
+            return hidden_states[:, :, 0]
+
+    config = AutoConfig.from_pretrained("tests/toy_config/deepseek_v4_toy")
+    model = dsv4.DeepseekV4Model(config).float().eval()
+    model.layers = nn.ModuleList()
+    model.hc_head = TakeFirstHyperConnection()
+    sp_size = 2
+    sp_state = SimpleNamespace(ulysses_enabled=True, ulysses_group=object(), ulysses_size=sp_size)
+    helper_input_shapes = {}
+
+    def fake_gather_outputs(x, gather_dim, **_kwargs):
+        return torch.cat([x] * sp_size, dim=gather_dim)
+
+    def fake_build_metadata(reference, *_args, **_kwargs):
+        helper_input_shapes["metadata"] = tuple(reference.shape)
+        return {}
+
+    def fake_create_mask(*, inputs_embeds, **_kwargs):
+        helper_input_shapes["mask"] = tuple(inputs_embeds.shape)
+        seq_len = inputs_embeds.shape[1]
+        return inputs_embeds.new_zeros((inputs_embeds.shape[0], 1, seq_len, seq_len))
+
+    monkeypatch.setattr(dsv4, "get_parallel_state", lambda: sp_state)
+    monkeypatch.setattr(dsv4, "gather_outputs", fake_gather_outputs)
+    monkeypatch.setattr(dsv4, "build_packed_compression_metadata", fake_build_metadata)
+    monkeypatch.setattr(dsv4, "create_sliding_window_causal_mask", fake_create_mask)
+
+    local_seq_len = 4
+    full_seq_len = local_seq_len * sp_size
+    inputs_embeds = torch.randn(1, local_seq_len, config.hidden_size)
+    model(
+        inputs_embeds=inputs_embeds,
+        position_ids=torch.arange(local_seq_len).unsqueeze(0),
+        attention_mask=torch.ones(1, full_seq_len, dtype=torch.bool),
+        cu_seq_lens_q=torch.tensor([0, full_seq_len], dtype=torch.int32),
+        use_cache=False,
+    )
+
+    assert helper_input_shapes == {
+        "metadata": (1, full_seq_len, 1),
+        "mask": (1, full_seq_len, 1),
+    }
+
+
+def test_lightweight_references_preserve_metadata_and_mask_semantics():
+    """The real helpers must ignore feature width, not merely accept width one."""
+    from transformers import AutoConfig
+
+    from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as dsv4
+
+    config = AutoConfig.from_pretrained("tests/toy_config/deepseek_v4_toy")
+    config._attn_implementation = "eager"
+    seq_len = 8
+    full_width_reference = torch.empty(1, seq_len, config.hidden_size)
+    lightweight_reference = torch.empty(1, seq_len, 1)
+    position_ids = torch.tensor([[0, 1, 2, 3, 0, 1, 2, 3]])
+    sequence_slices = ((0, 4), (4, 8))
+    compress_rates = tuple(config.compress_rates.values())
+    hca_rate = config.compress_rates["heavily_compressed_attention"]
+
+    full_metadata = dsv4.build_packed_compression_metadata(
+        full_width_reference,
+        position_ids,
+        sequence_slices,
+        compress_rates,
+        block_bias_rates=(hca_rate,),
+    )
+    lightweight_metadata = dsv4.build_packed_compression_metadata(
+        lightweight_reference,
+        position_ids,
+        sequence_slices,
+        compress_rates,
+        block_bias_rates=(hca_rate,),
+    )
+    assert full_metadata.keys() == lightweight_metadata.keys()
+    for rate in full_metadata:
+        assert full_metadata[rate].keys() == lightweight_metadata[rate].keys()
+        for name in full_metadata[rate]:
+            torch.testing.assert_close(full_metadata[rate][name], lightweight_metadata[rate][name], rtol=0, atol=0)
+
+    attention_mask = torch.ones(1, seq_len, dtype=torch.bool)
+    full_mask = dsv4.create_sliding_window_causal_mask(
+        config=config,
+        inputs_embeds=full_width_reference,
+        attention_mask=attention_mask,
+        past_key_values=None,
+        position_ids=position_ids,
+    )
+    lightweight_mask = dsv4.create_sliding_window_causal_mask(
+        config=config,
+        inputs_embeds=lightweight_reference,
+        attention_mask=attention_mask,
+        past_key_values=None,
+        position_ids=position_ids,
+    )
+    torch.testing.assert_close(full_mask, lightweight_mask, rtol=0, atol=0)
+    assert full_width_reference.numel() == lightweight_reference.numel() * config.hidden_size
 
 
 def _run_deepseek_v4_attention_sp_fw_bw(
