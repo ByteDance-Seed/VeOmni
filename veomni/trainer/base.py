@@ -623,7 +623,13 @@ class BaseTrainer(Stateful, ABC):
         self.state = TrainerState()
 
     def on_train_begin(self):
+        # Restore global_step before callbacks derive any absolute-step
+        # schedules (notably ProfileTraceCallback). Keep the normal callback
+        # order unchanged for step/epoch/end hooks.
+        self.checkpointer_callback.on_train_begin(self.state)
         for callback in self._callbacks:
+            if callback is self.checkpointer_callback:
+                continue
             callback.on_train_begin(self.state)
 
     def on_train_end(self):

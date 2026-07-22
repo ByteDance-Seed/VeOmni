@@ -50,6 +50,8 @@ def main():
     dist.init_process_group(backend=get_dist_comm_backend(), timeout=pg_nccl_timeout)
 
     args = parse_args(VeOmniArguments)
+    if args.train.profile.enable and helper.IS_NPU_AVAILABLE:
+        raise ValueError("NPU profiling is not supported by this deprecated entrypoint; use a current trainer.")
     logger.info(f"Process rank: {args.train.global_rank}, world size: {args.train.world_size}")
     logger.info_rank0(json.dumps(asdict(args), indent=2))
     get_torch_device().set_device(f"{get_device_type()}:{args.train.local_rank}")
