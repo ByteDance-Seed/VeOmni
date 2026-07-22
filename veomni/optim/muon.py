@@ -296,6 +296,15 @@ NS_IMPLEMENTATIONS = ("std", "gram", "gram_quack")
 _GRAM_QUACK_FALLBACK_WARNED = False
 
 
+def _gram_quack_unavailable_reason(grad: Tensor) -> Optional[str]:
+    if grad.device.type != "cuda":
+        return None
+    major, minor = torch.cuda.get_device_capability(grad.device)
+    if major < 9:
+        return f"CUDA compute capability {major}.{minor} is unsupported; quack kernels require 9.0 or newer"
+    return None
+
+
 @torch.no_grad()
 def run_newton_schulz(
     grad: Tensor,
@@ -328,24 +337,25 @@ def run_newton_schulz(
 
     schedule = _as_coeff_schedule(ns_coefficients, ns_steps)
     if ns_implementation == "gram_quack":
-        try:
-            return _package_gram_newton_schulz(
-                grad,
-                schedule=schedule,
-                eps=eps,
-                reset_iterations=gram_ns_reset_iterations,
-                use_kernels=True,
-            )
-        except ImportError as exc:
-            # Optional dependency; keep training runnable without quack kernels.
-            global _GRAM_QUACK_FALLBACK_WARNED
-            if not _GRAM_QUACK_FALLBACK_WARNED:
-                _GRAM_QUACK_FALLBACK_WARNED = True
-                logger.warning_rank0(
-                    "[Muon] ns_implementation=gram_quack requested but gram-newton-schulz/quack "
-                    f"is unavailable ({type(exc).__name__}: {exc}). Falling back to pure-PyTorch "
-                    "gram path for the rest of this process."
+        fallback_reason = _gram_quack_unavailable_reason(grad)
+        if fallback_reason is None:
+            try:
+                return _package_gram_newton_schulz(
+                    grad,
+                    schedule=schedule,
+                    eps=eps,
+                    reset_iterations=gram_ns_reset_iterations,
+                    use_kernels=True,
                 )
+            except ImportError as exc:
+                fallback_reason = f"{type(exc).__name__}: {exc}"
+        global _GRAM_QUACK_FALLBACK_WARNED
+        if not _GRAM_QUACK_FALLBACK_WARNED:
+            _GRAM_QUACK_FALLBACK_WARNED = True
+            logger.warning_rank0(
+                "[Muon] ns_implementation=gram_quack requested but gram-newton-schulz/quack "
+                f"is unavailable ({fallback_reason}). Falling back to pure-PyTorch gram path."
+            )
     return batched_gram_newton_schulz(
         grad,
         ns_coefficients=schedule,

@@ -328,24 +328,23 @@ class TestGramNewtonSchulz:
         assert torch.isfinite(out).all()
 
     @pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="CUDA required")
-    def test_package_kernel_optional(self):
-        pytest.importorskip("gram_newton_schulz")
+    def test_package_kernel_or_hardware_fallback(self, monkeypatch):
+        import veomni.optim.muon as muon_mod
 
-        try:
-            x = torch.randn(2, 256, 1024, device=get_device_type(), dtype=torch.bfloat16)
-            out = run_newton_schulz(
-                x,
-                ns_coefficients=DEFAULT_NS_COEFFICIENTS,
-                ns_steps=5,
-                ns_implementation="gram_quack",
-                gram_ns_reset_iterations=(2,),
-            )
-            assert out.shape == x.shape
-            assert torch.isfinite(out).all()
-        except NotImplementedError as exc:
-            if "Gemm Sm80 is not implemented yet" in str(exc):
-                pytest.skip("quack.gemm_sm80 backend not implemented in this quack version")
-            raise
+        pytest.importorskip("gram_newton_schulz")
+        monkeypatch.setattr(muon_mod, "_GRAM_QUACK_FALLBACK_WARNED", False)
+        x = torch.randn(2, 256, 1024, device=get_device_type(), dtype=torch.bfloat16)
+        out = run_newton_schulz(
+            x,
+            ns_coefficients=DEFAULT_NS_COEFFICIENTS,
+            ns_steps=5,
+            ns_implementation="gram_quack",
+            gram_ns_reset_iterations=(2,),
+        )
+        assert out.shape == x.shape
+        assert torch.isfinite(out).all()
+        compute_capability = torch.cuda.get_device_capability(x.device)
+        assert muon_mod._GRAM_QUACK_FALLBACK_WARNED is (compute_capability[0] < 9)
 
     def test_distributed_muon_accepts_gram_flags(self):
         p = nn.Parameter(torch.randn(8, 16))
@@ -424,3 +423,35 @@ class TestGramQuackFallback:
         assert out.shape == x.shape
         assert torch.isfinite(out).all()
         assert muon_mod._GRAM_QUACK_FALLBACK_WARNED is True
+
+    def test_gram_quack_falls_back_on_pre_hopper_cuda(self, monkeypatch):
+        import veomni.optim.muon as muon_mod
+
+        monkeypatch.setattr(muon_mod.torch.cuda, "get_device_capability", lambda _device: (8, 0))
+        grad = type("FakeTensor", (), {"device": torch.device("cuda")})()
+        assert "compute capability 8.0" in muon_mod._gram_quack_unavailable_reason(grad)
+
+    def test_gram_quack_propagates_unknown_not_implemented(self, monkeypatch):
+        import veomni.optim.muon as muon_mod
+
+        monkeypatch.setattr(muon_mod, "_gram_quack_unavailable_reason", lambda _grad: None)
+
+        def _boom(*_a, **_k):
+            raise NotImplementedError("unexpected kernel limitation")
+
+        monkeypatch.setattr(muon_mod, "_package_gram_newton_schulz", _boom)
+        x = _sample_2d(8, 16, dtype=torch.float32, seed=0)
+        with pytest.raises(NotImplementedError, match="unexpected kernel limitation"):
+            run_newton_schulz(
+                x,
+                ns_implementation="gram_quack",
+                gram_ns_reset_iterations=(2,),
+                compute_dtype=torch.float32,
+            )
+
+    def test_gram_quack_uses_package_on_hopper(self, monkeypatch):
+        import veomni.optim.muon as muon_mod
+
+        monkeypatch.setattr(muon_mod.torch.cuda, "get_device_capability", lambda _device: (9, 0))
+        grad = type("FakeTensor", (), {"device": torch.device("cuda")})()
+        assert muon_mod._gram_quack_unavailable_reason(grad) is None

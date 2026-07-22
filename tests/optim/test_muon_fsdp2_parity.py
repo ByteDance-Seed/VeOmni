@@ -436,3 +436,42 @@ def _torchrun_cmd(nproc: int, port: int, mode: str, use_zero_comm: bool) -> list
 
 
 @pytest.mark.skipif(not _has_devices(4), reason="device_count should be >= 4")
+def test_dense_4gpu():
+    cmd = _torchrun_cmd(nproc=4, port=29611, mode="dense", use_zero_comm=False)
+    env = os.environ.copy()
+    env.setdefault("NCCL_DEBUG", "WARN")
+    result = subprocess.run(cmd, env=env, check=True)
+    assert result.returncode == 0
+
+
+@pytest.mark.skipif(not _has_devices(4), reason="device_count should be >= 4")
+def test_qwen3_moe_default_backend_4gpu():
+    """Default backend: ``Shard(1)`` on experts + ep_fsdp all-gather in Muon."""
+    cmd = _torchrun_cmd(nproc=4, port=29612, mode="moe", use_zero_comm=False)
+    env = os.environ.copy()
+    env.setdefault("NCCL_DEBUG", "WARN")
+    result = subprocess.run(cmd, env=env, check=True)
+    assert result.returncode == 0
+
+
+@pytest.mark.skipif(not _has_devices(4), reason="device_count should be >= 4")
+def test_qwen3_moe_zero_comm_backend_4gpu():
+    """Zero-comm backend: ``Shard(0)`` on experts + local batched NS."""
+    cmd = _torchrun_cmd(nproc=4, port=29613, mode="moe", use_zero_comm=True)
+    env = os.environ.copy()
+    env.setdefault("NCCL_DEBUG", "WARN")
+    result = subprocess.run(cmd, env=env, check=True)
+    assert result.returncode == 0
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--mode", choices=["dense", "moe"], required=True)
+    parser.add_argument("--zero-comm", type=int, default=0)
+    args = parser.parse_args()
+    if args.mode == "dense":
+        _run_dense()
+    else:
+        _run_qwen3_moe(use_zero_comm=bool(args.zero_comm))
