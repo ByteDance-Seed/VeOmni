@@ -43,13 +43,16 @@ from __future__ import annotations
 import re
 from collections import defaultdict
 from functools import lru_cache
+from typing import Generator
 
 import torch
 from transformers.conversion_mapping import get_checkpoint_conversion_mapping
 from transformers.core_model_loading import WeightRenaming, rename_source_key
 
+from veomni.ops.kernels.deepseek_v4 import act_quant, fp4_act_quant
+
 from ....utils import logging
-from ...checkpoint_tensor_loading import ConvertedCheckpointTensor
+from ...checkpoint_tensor_loading import ConvertedCheckpointTensor, export_weights
 
 
 logger = logging.get_logger(__name__)
@@ -65,10 +68,57 @@ _PROJ_NAME_ALIASES = {
     "w2": "down_proj",
     "w3": "up_proj",
 }
+_PROJ_NAME_TO_W_NAME = {
+    "gate_proj": "w1",
+    "down_proj": "w2",
+    "up_proj": "w3",
+}
 _DEEPSEEK_V4_WEIGHT_RENAMINGS = [
     transform
     for transform in (get_checkpoint_conversion_mapping("deepseek_v4") or [])
     if isinstance(transform, WeightRenaming)
+]
+# NOTE: Transformers's DeepSeek-V4 weight reverse renaming is buggy, manually fix it here.
+_INDEXER_REVERSE_RENAMINGS = [
+    WeightRenaming(
+        source_patterns=r"^layers\.(\d+)\.self_attn\.compressor\.indexer\.q_b_proj\.",
+        target_patterns=r"layers.\1.attn.indexer.wq_b.",
+    ),
+    WeightRenaming(
+        source_patterns=r"^layers\.(\d+)\.self_attn\.compressor\.indexer\.position_bias$",
+        target_patterns=r"layers.\1.attn.indexer.compressor.ape",
+    ),
+    WeightRenaming(
+        source_patterns=r"^layers\.(\d+)\.self_attn\.compressor\.indexer\.kv_proj\.",
+        target_patterns=r"layers.\1.attn.indexer.compressor.wkv.",
+    ),
+    WeightRenaming(
+        source_patterns=r"^layers\.(\d+)\.self_attn\.compressor\.indexer\.gate_proj\.",
+        target_patterns=r"layers.\1.attn.indexer.compressor.wgate.",
+    ),
+    WeightRenaming(
+        source_patterns=r"^layers\.(\d+)\.self_attn\.compressor\.indexer\.kv_norm\.",
+        target_patterns=r"layers.\1.attn.indexer.compressor.norm.",
+    ),
+]
+_NESTED_REVERSE_RENAMINGS = [
+    WeightRenaming(
+        source_patterns=rf"^layers\.(\d+)\.self_attn\.(.+)\.{target}\.",
+        target_patterns=rf"layers.\1.attn.\2.{source}.",
+    )
+    for source, target in (
+        ("wq_a", "q_a_proj"),
+        ("wq_b", "q_b_proj"),
+        ("wkv", "kv_proj"),
+        ("wgate", "gate_proj"),
+        ("wo_a", "o_a_proj"),
+        ("wo_b", "o_b_proj"),
+    )
+]
+_DEEPSEEK_V4_WEIGHT_REVERSE_RENAMINGS = [
+    *_INDEXER_REVERSE_RENAMINGS,
+    *_NESTED_REVERSE_RENAMINGS,
+    *[transform.reverse_transform() for transform in reversed(_DEEPSEEK_V4_WEIGHT_RENAMINGS)],
 ]
 _FP4_E2M1_VALUES = (
     0.0,
@@ -327,6 +377,53 @@ class DeepseekV4CheckpointTensorConverter:
             raise RuntimeError("DeepseekV4 checkpoint converter: incomplete checkpoint detected. " + "; ".join(errors))
         self._scaled_weight_buffer.clear()
         return finalized
+
+    def export_weights(self, model: torch.nn.Module) -> Generator[tuple[str, torch.Tensor]]:
+        config = model.config
+        fqn_to_index_mapping = model._veomni_fqn_to_index_mapping
+        expert_dtype = config.expert_dtype
+        export_weight_names = set()
+        for name, param in export_weights(model):
+            # 1. replace mlp.experts.0.(gate_proj|up_proj|down_proj).weight to mlp.experts.0.(w1|w2|w3).weight
+            if "mlp.experts." in name:
+                fields = name.split(".")
+                fields[-2] = _PROJ_NAME_TO_W_NAME[fields[-2]]
+                name = ".".join(fields)
+
+            # 2. reverse the renaming
+            origin, _ = rename_source_key(
+                name.removeprefix(self.target_model_prefix), _DEEPSEEK_V4_WEIGHT_REVERSE_RENAMINGS, []
+            )
+            assert origin in fqn_to_index_mapping, f"Unexpected exported weight name: {name}, origin: {origin}"
+
+            # 3. check if the weight needs to be quantized
+            scale_name = None
+            if origin.endswith(".weight"):
+                scale_name = origin.removesuffix(".weight") + ".scale"
+
+            if scale_name is None or scale_name not in fqn_to_index_mapping:
+                export_weight_names.add(origin)
+                yield origin, param
+                continue
+
+            # 4. quantize the weight
+            fp4_quantize = "ffn.experts." in origin and expert_dtype == "fp4"
+            param = param.to(torch.bfloat16)
+            if fp4_quantize:
+                weight, scale = fp4_act_quant(param, block_size=32, inplace=False)
+            else:
+                weight, scale = act_quant(param, block_size=128, scale_fmt="ue8m0", scale_dtype=torch.float8_e8m0fnu)
+
+            export_weight_names.add(origin)
+            export_weight_names.add(scale_name)
+            yield origin, weight
+            yield scale_name, scale
+
+        missing_weight_names = fqn_to_index_mapping.keys() - export_weight_names
+        # MTP not supported for now, ignore it.
+        missing_weight_names = {name for name in missing_weight_names if not name.startswith("mtp.")}
+        if missing_weight_names:
+            logger.warning(f"Export weights missing: {missing_weight_names}")
 
 
 def create_deepseek_v4_checkpoint_tensor_converter(model):

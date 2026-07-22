@@ -28,10 +28,13 @@ load when an index mapping is supplied).
 
 import json
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Protocol, Union
+from typing import TYPE_CHECKING, Callable, Dict, Generator, List, Optional, Protocol, Union
 
 import torch
 from torch import nn
+from torch.distributed.tensor import DTensor
+
+from veomni.distributed import parallel_state
 
 from ..utils import logging
 
@@ -209,6 +212,7 @@ def prepare_fqn_to_index_mapping_for_model(
     prepared = maybe_convert_fqn_to_index_mapping(fqn_to_index_mapping, model)
     if prepared is not None:
         model._veomni_prepared_fqn_to_index_mapping = prepared
+        model._veomni_fqn_to_index_mapping = fqn_to_index_mapping
     return prepared
 
 
@@ -243,3 +247,58 @@ def maybe_convert_checkpoint_tensor(
     if not converter.can_handle(name):
         return ConvertedCheckpointTensor(name=name, tensor=tensor)
     return converter.convert(name, tensor)
+
+
+def _map_moe_params_common(name, tensor, ep_rank):
+    num_experts_per_rank = tensor.size(0)
+    for i in range(num_experts_per_rank):
+        idx = ep_rank * num_experts_per_rank + i
+        new_key = name.replace("mlp.experts.", f"mlp.experts.{idx}.") + ".weight"
+        yield new_key, tensor[i].to(tensor.device, non_blocking=True)
+
+
+def _process_moe_params(name, tensor, ep_rank):
+    if "gate_up_proj" in name:
+        gate, up = tensor.chunk(2, dim=1)
+        params = {
+            name.replace("gate_up_proj", "gate_proj"): gate,
+            name.replace("gate_up_proj", "up_proj"): up,
+        }
+    else:
+        params = {name: tensor}
+
+    for key, value in params.items():
+        yield from _map_moe_params_common(key, value, ep_rank)
+
+
+def export_weights(model: torch.nn.Module) -> Generator[tuple[str, torch.Tensor], None, None]:
+    """
+    Export master weights from fully_sharded model, fused MoE weights are split into per-expert weights.
+
+    Args:
+        model: The fully_sharded model to export the master weights from.
+
+    Returns:
+        A generator of tuples of the form (name, tensor).
+    """
+    ps = parallel_state.get_parallel_state()
+    params = model.state_dict()
+    for name, param in params.items():
+        unsharded_tensor = param.full_tensor() if isinstance(param, DTensor) else param
+
+        is_expert_layer = "mlp.experts." in name
+        is_proj = any(p in name for p in ["down_proj", "gate_proj", "up_proj", "gate_up_proj"])
+
+        if is_expert_layer and is_proj and ps.ep_enabled:
+            ep_rank, ep_size = ps.ep_rank, ps.ep_size
+            buffer = torch.empty_like(unsharded_tensor)  # [num_experts/ep_size, H, I]
+            for src_ep_rank in range(ep_size):
+                tensor = unsharded_tensor if src_ep_rank == ep_rank else buffer
+                torch.distributed.broadcast(tensor, group_src=src_ep_rank, group=ps.ep_group)
+                yield from _process_moe_params(name, tensor, ep_rank=src_ep_rank)
+
+        else:
+            if is_expert_layer:
+                yield from _process_moe_params(name, unsharded_tensor, ep_rank=0)
+            else:
+                yield name, unsharded_tensor
