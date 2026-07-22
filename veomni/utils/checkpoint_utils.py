@@ -33,7 +33,7 @@ _GLOBAL_STEP_PREFIX = "global_step_"
 
 
 def should_skip_hf_weight_load(load_path: Optional[str], lora_config: Any) -> bool:
-    """Return whether a full DCP resume can skip initial HF weight loading."""
+    """Return whether a full non-LoRA resume can skip initial HF weight loading."""
     return load_path is not None and not bool(lora_config)
 
 

@@ -84,6 +84,7 @@ def parallelize_model_fsdp2(
     basic_modules: Optional[List[str]] = None,
     muon_expert_zero_comm: bool = False,
     compile_config: Optional[CompileConfig] = None,
+    should_skip_hf_weight_load: bool = False,
     **kwargs,
 ) -> "nn.Module":
     """
@@ -109,6 +110,8 @@ def parallelize_model_fsdp2(
         ep_size, emb_size = 2, 4
     We will use this model for illustration of Expert Parallel + Embed Parallel below.
     """
+    if "skip_weights_load" in kwargs:
+        raise TypeError("'skip_weights_load' was renamed to 'should_skip_hf_weight_load'")
 
     parallel_state = get_parallel_state()
 
@@ -427,28 +430,27 @@ def parallelize_model_fsdp2(
     assert kwargs.get("init_device") == "meta", "Please use init_device: meta for FSDP2"
     materialize_device = "cpu" if enable_fsdp_cpu_offload else get_device_type()
 
-    # When resuming from a full DCP (model + optimizer), skip the expensive HF
-    # weight materialization. Callers set this for non-LoRA resumes; LoRA DCPs are
-    # trainable-only and still need the HF base weights.
-    skip_weights_load = kwargs.pop("skip_weights_load", False)
+    # A full non-LoRA checkpoint will overwrite the model, so its resume path can
+    # skip expensive HF weight materialization. LoRA checkpoints are trainable-only
+    # and still need the HF base weights.
     is_peft_model = kwargs.pop("is_peft_model", False)
     adapter_path = kwargs.pop("adapter_path", None)
-    if skip_weights_load and is_peft_model:
+    if should_skip_hf_weight_load and is_peft_model:
         raise ValueError(
-            "skip_weights_load=True is incompatible with LoRA/PEFT models: DCP is "
+            "should_skip_hf_weight_load=True is incompatible with LoRA/PEFT models: the checkpoint is "
             "trainable-only and the frozen base must still be loaded from weights_path."
         )
 
-    if weights_path is None or skip_weights_load:
-        if skip_weights_load:
+    if weights_path is None or should_skip_hf_weight_load:
+        if should_skip_hf_weight_load:
             logger.info_rank0(
-                "Skipping pretrained weight load for DCP resume; "
+                "Skipping pretrained weight load for checkpoint resume; "
                 "parameters will be restored from the distributed checkpoint."
             )
         model.to_empty(device=materialize_device)
         _reset_hf_initialized_flag(model)
-        # Random init is unnecessary when DCP will overwrite every parameter.
-        if not skip_weights_load:
+        # Random init is unnecessary when the checkpoint will overwrite every parameter.
+        if not should_skip_hf_weight_load:
             model.init_weights()
     else:
         from torch.distributed.tensor import distribute_tensor
@@ -525,6 +527,7 @@ def build_parallelize_model(
     basic_modules: Optional[List[str]] = None,
     muon_expert_zero_comm: bool = False,
     compile_config: Optional[CompileConfig] = None,
+    should_skip_hf_weight_load: bool = False,
     **kwargs,
 ) -> "nn.Module":
     """Apply parallel strategies to the model.
@@ -533,6 +536,8 @@ def build_parallelize_model(
         muon_expert_zero_comm: Shard ExtraParallel weights on dim-0 when the
             EP-local dim is divisible by ``ep_fsdp_size``.
     """
+    if "skip_weights_load" in kwargs:
+        raise TypeError("'skip_weights_load' was renamed to 'should_skip_hf_weight_load'")
 
     parallel_state = get_parallel_state()
     compile_config = compile_config or CompileConfig()
@@ -590,6 +595,7 @@ def build_parallelize_model(
                 basic_modules=basic_modules,
                 muon_expert_zero_comm=muon_expert_zero_comm,
                 compile_config=compile_config,
+                should_skip_hf_weight_load=should_skip_hf_weight_load,
                 **kwargs,
             )
         else:
