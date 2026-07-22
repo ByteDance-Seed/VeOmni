@@ -6,9 +6,13 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
+import torch
+import torch.distributed.checkpoint as dcp
+from torch import nn
 
 from veomni.distributed import torch_parallelize
 from veomni.distributed.torch_parallelize import build_parallelize_model, parallelize_model_fsdp2
+from veomni.models.module_utils import init_empty_weights
 from veomni.utils.checkpoint_utils import should_skip_hf_weight_load
 
 
@@ -44,6 +48,50 @@ def test_build_parallelize_model_forwards_should_skip_hf_weight_load(monkeypatch
 
     assert result is parallelized_model
     assert parallelize_fsdp2.call_args.kwargs["should_skip_hf_weight_load"] is True
+
+
+def test_dcp_resume_preserves_nonpersistent_buffers_and_forward(monkeypatch, tmp_path):
+    class ModelWithDerivedBuffer(nn.Module):
+        _no_split_modules = []
+
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.tensor([[1.0, 2.0], [3.0, 4.0]]))
+            self.register_buffer("scale", torch.tensor([0.25, 2.0]), persistent=False)
+
+        def forward(self, x):
+            return (x @ self.weight) * self.scale
+
+        def init_weights(self):
+            raise AssertionError("DCP resume must not initialize model parameters")
+
+    original = ModelWithDerivedBuffer()
+    assert "scale" not in original.state_dict()
+    inputs = torch.tensor([[2.0, -1.0]])
+    expected_output = original(inputs)
+    checkpoint_dir = tmp_path / "dcp"
+    dcp.save({"model": original}, checkpoint_id=checkpoint_dir)
+
+    with init_empty_weights():
+        resumed = ModelWithDerivedBuffer()
+    assert resumed.weight.is_meta
+    assert not resumed.scale.is_meta
+    parallel_state = SimpleNamespace(any_extra_parallel_enabled=False, extra_parallel_names=[], fsdp_mesh=None)
+    monkeypatch.setattr(torch_parallelize, "get_parallel_state", lambda: parallel_state)
+    monkeypatch.setattr(torch_parallelize, "fully_shard", lambda *args, **kwargs: None)
+    monkeypatch.setattr(torch_parallelize, "get_device_type", lambda: "cpu")
+
+    resumed = parallelize_model_fsdp2(
+        resumed,
+        weights_path="unused-hf-path",
+        mixed_precision=SimpleNamespace(enable=False),
+        should_skip_hf_weight_load=True,
+        init_device="meta",
+    )
+    dcp.load({"model": resumed}, checkpoint_id=checkpoint_dir)
+
+    torch.testing.assert_close(resumed.scale, original.scale, rtol=0, atol=0)
+    torch.testing.assert_close(resumed(inputs), expected_output, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("parallelize", [build_parallelize_model, parallelize_model_fsdp2])

@@ -48,6 +48,28 @@ def _reset_hf_initialized_flag(module: nn.Module) -> None:
         _reset_hf_initialized_flag(child)
 
 
+def _to_empty_preserving_nonpersistent_buffers(model: nn.Module, device: str) -> None:
+    """Materialize parameters without discarding config-derived buffers.
+
+    Distributed checkpoints restore ``state_dict()``, which excludes buffers
+    registered with ``persistent=False``. Snapshot those buffers before
+    ``to_empty()`` so values such as rotary ``inv_freq`` survive the DCP resume
+    materialization path without duplicating persistent buffers that DCP loads.
+    """
+    buffers = []
+    for module in model.modules():
+        for name in module._non_persistent_buffers_set:
+            buffer = module._buffers.get(name)
+            if buffer is not None:
+                buffers.append((module, name, buffer.detach().clone()))
+
+    model.to_empty(device=device)
+
+    for module, name, buffer in buffers:
+        materialized_buffer = module._buffers[name]
+        materialized_buffer.copy_(buffer.to(device=materialized_buffer.device, dtype=materialized_buffer.dtype))
+
+
 def _check_extra_parallel_dim0_divisibility(model: "nn.Module", para_name: str, ep_fsdp_size: int) -> bool:
     """Return whether EP-local dim-0 can be evenly sharded by ``ep_fsdp_size``."""
     parallel_plan = getattr(model, "get_parallel_plan", None)
@@ -447,7 +469,10 @@ def parallelize_model_fsdp2(
                 "Skipping pretrained weight load for checkpoint resume; "
                 "parameters will be restored from the distributed checkpoint."
             )
-        model.to_empty(device=materialize_device)
+        if should_skip_hf_weight_load:
+            _to_empty_preserving_nonpersistent_buffers(model, materialize_device)
+        else:
+            model.to_empty(device=materialize_device)
         _reset_hf_initialized_flag(model)
         # Random init is unnecessary when the checkpoint will overwrite every parameter.
         if not should_skip_hf_weight_load:
