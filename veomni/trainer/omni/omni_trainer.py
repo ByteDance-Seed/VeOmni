@@ -596,26 +596,27 @@ class OmniTrainer:
         del micro_batch
         return total_loss, loss_dict
 
-    def model_reshard(self, micro_step: int, num_micro_steps: int):
-        """Toggle ``set_reshard_after_backward`` on every *nested* FSDP2 unit.
+    def _model_reshard(self, micro_step: int, num_micro_steps: int) -> None:
+        """Cascade the grad-accum reshard intent into every module-trainer.
 
-        The ``OmniModel`` root is a plain ``nn.Module`` (not an ``FSDPModule``),
-        so — unlike the single-model path — we walk its sub-modules and toggle
-        each FSDP2 child individually.
+        The micro-step arithmetic is a *global* grad-accum concept (same for
+        every module), so it lives here once: keep params gathered from the first
+        micro-step (``reshard=False``) until the last (``reshard=True``), with
+        nothing to do on intermediate steps or when there is no accumulation.
+        Each ``OmniModuleTrainer`` then decides for itself (from its own
+        ``fsdp_config``) whether to apply it — mirroring the per-module
+        :meth:`clip_grad_norm` cascade.
         """
-        fsdp_cfg = self.base.args.train.accelerator.fsdp_config
-        if fsdp_cfg.fsdp_mode != "fsdp2" or fsdp_cfg.reshard_after_backward or num_micro_steps <= 1:
+        if num_micro_steps <= 1:
             return
-        try:
-            from torch.distributed.fsdp import FSDPModule
-        except ImportError:
+        if micro_step == 0:
+            reshard = False
+        elif micro_step == num_micro_steps - 1:
+            reshard = True
+        else:
             return
-        for mod in self.base.model.modules():
-            if isinstance(mod, FSDPModule):
-                if micro_step == 0:
-                    mod.set_reshard_after_backward(False)
-                elif micro_step == num_micro_steps - 1:
-                    mod.set_reshard_after_backward(True)
+        for module_trainer in self.module_trainers.values():
+            module_trainer.model_reshard(reshard)
 
     def train_step(self, data_iterator: Any) -> None:
         base = self.base
@@ -631,7 +632,7 @@ class OmniTrainer:
         num_micro_steps = len(micro_batches)
 
         for micro_step, micro_batch in enumerate(micro_batches):
-            self.model_reshard(micro_step, num_micro_steps)
+            self._model_reshard(micro_step, num_micro_steps)
             loss, loss_dict = self.forward_backward_step(micro_batch, micro_step=micro_step)
             total_loss += loss.item() / num_micro_steps
             for k, v in loss_dict.items():
@@ -661,7 +662,7 @@ class OmniTrainer:
 
         num_micro_steps = len(micro_batches)
         for micro_step, micro_batch in enumerate(micro_batches):
-            self.model_reshard(micro_step, num_micro_steps)
+            self._model_reshard(micro_step, num_micro_steps)
             micro_batch = base.preforward(micro_batch)
             profiler = self._build_graph_profiler()
             with (

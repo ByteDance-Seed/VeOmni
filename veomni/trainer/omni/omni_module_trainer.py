@@ -472,6 +472,41 @@ class OmniModuleTrainer:
         with self._scoped():
             return veomni_omni_module_clip_grad_norm(self.base.model, max_norm, norm_type)
 
+    def model_reshard(self, reshard: bool) -> None:
+        """Set ``set_reshard_after_backward`` on this module's FSDP2 units.
+
+        A gradient-accumulation optimization owned per-module: the orchestrator
+        decides *when* (``reshard=False`` on the first micro-step to keep params
+        gathered across the window and skip the reshard → re-all-gather churn;
+        ``reshard=True`` on the last so the final backward frees the full
+        params). This method only *applies* that intent to this module — trading
+        param memory for communication.
+
+        Read the **module's own** ``fsdp_config`` (not the orchestrator's): each
+        OmniModule has its own merged ``train.accelerator``, so ``fsdp_mode`` /
+        ``reshard_after_backward`` may differ per module — a DDP module has no
+        FSDP2 units to toggle (skipped by the ``isinstance`` check), and a module
+        that keeps ``reshard_after_backward=True`` opts out here. No
+        ``ParallelState`` is read (unlike :meth:`clip_grad_norm`), so this needs no
+        scoping — ``set_reshard_after_backward`` just flips a flag on the unit.
+        """
+        fsdp_cfg = self.base.args.train.accelerator.fsdp_config
+        if fsdp_cfg.fsdp_mode != "fsdp2" or fsdp_cfg.reshard_after_backward:
+            return
+        try:
+            from torch.distributed.fsdp import FSDPModule
+        except ImportError:
+            return
+        # ``set_reshard_after_backward`` recurses into every nested FSDP unit by
+        # default, so one call on the root-sharded model covers them all (the
+        # generic ``parallelize_model_fsdp2`` ``fully_shard``s the root). A module
+        # that owns its parallelize via ``customized_build_parallelize_model``
+        # (contract: "FSDP-or-not") may leave the root un-sharded — it then owns
+        # its own reshard policy, so skip rather than assume a root FSDP unit.
+        model = self.base.model
+        if isinstance(model, FSDPModule):
+            model.set_reshard_after_backward(reshard)
+
     # ── Metric metering ────────────────────────────────────────────────────────
 
     def collect_metric_meter(self) -> Optional[MetricMeterResult]:
