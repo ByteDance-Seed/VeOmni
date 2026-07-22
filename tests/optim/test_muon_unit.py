@@ -20,7 +20,7 @@ import pytest
 import torch
 import torch.nn as nn
 
-from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type
+from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type, get_gpu_compute_capability
 
 
 muon_module = pytest.importorskip("torch.optim._muon")
@@ -343,8 +343,7 @@ class TestGramNewtonSchulz:
         )
         assert out.shape == x.shape
         assert torch.isfinite(out).all()
-        compute_capability = torch.cuda.get_device_capability(x.device)
-        assert muon_mod._GRAM_QUACK_FALLBACK_WARNED is (compute_capability[0] < 9)
+        assert muon_mod._GRAM_QUACK_FALLBACK_WARNED is (get_gpu_compute_capability(x.device) < 90)
 
     def test_distributed_muon_accepts_gram_flags(self):
         p = nn.Parameter(torch.randn(8, 16))
@@ -408,8 +407,12 @@ class TestGramQuackFallback:
         import veomni.optim.muon as muon_mod
 
         monkeypatch.setattr(muon_mod, "_GRAM_QUACK_FALLBACK_WARNED", False)
+        monkeypatch.setattr(muon_mod, "_gram_quack_unavailable_reason", lambda _grad: None)
+        call_count = 0
 
         def _boom(*_a, **_k):
+            nonlocal call_count
+            call_count += 1
             raise ImportError("quack missing for test")
 
         monkeypatch.setattr(muon_mod, "_package_gram_newton_schulz", _boom)
@@ -423,13 +426,41 @@ class TestGramQuackFallback:
         assert out.shape == x.shape
         assert torch.isfinite(out).all()
         assert muon_mod._GRAM_QUACK_FALLBACK_WARNED is True
+        assert call_count == 1
 
     def test_gram_quack_falls_back_on_pre_hopper_cuda(self, monkeypatch):
         import veomni.optim.muon as muon_mod
 
-        monkeypatch.setattr(muon_mod.torch.cuda, "get_device_capability", lambda _device: (8, 0))
-        grad = type("FakeTensor", (), {"device": torch.device("cuda")})()
+        monkeypatch.setattr(muon_mod, "IS_CUDA_AVAILABLE", True)
+        monkeypatch.setattr(muon_mod, "get_device_type", lambda: "cuda")
+        queried_devices = []
+        monkeypatch.setattr(
+            muon_mod, "get_gpu_compute_capability", lambda device: queried_devices.append(device) or 80
+        )
+        grad = type("FakeTensor", (), {"device": torch.device("cuda:1")})()
         assert "compute capability 8.0" in muon_mod._gram_quack_unavailable_reason(grad)
+        assert queried_devices == [grad.device]
+
+    def test_gram_quack_falls_back_without_cuda(self, monkeypatch):
+        import veomni.optim.muon as muon_mod
+
+        monkeypatch.setattr(muon_mod, "IS_CUDA_AVAILABLE", False)
+        monkeypatch.setattr(muon_mod, "_GRAM_QUACK_FALLBACK_WARNED", False)
+
+        def _unexpected(*_a, **_k):
+            raise AssertionError("package backend should not be called for non-CUDA tensors")
+
+        monkeypatch.setattr(muon_mod, "_package_gram_newton_schulz", _unexpected)
+        x = _sample_2d(8, 16, dtype=torch.float32, seed=0)
+        out = run_newton_schulz(
+            x,
+            ns_implementation="gram_quack",
+            gram_ns_reset_iterations=(2,),
+            compute_dtype=torch.float32,
+        )
+        assert out.shape == x.shape
+        assert torch.isfinite(out).all()
+        assert muon_mod._GRAM_QUACK_FALLBACK_WARNED is True
 
     def test_gram_quack_propagates_unknown_not_implemented(self, monkeypatch):
         import veomni.optim.muon as muon_mod
@@ -452,6 +483,8 @@ class TestGramQuackFallback:
     def test_gram_quack_uses_package_on_hopper(self, monkeypatch):
         import veomni.optim.muon as muon_mod
 
-        monkeypatch.setattr(muon_mod.torch.cuda, "get_device_capability", lambda _device: (9, 0))
+        monkeypatch.setattr(muon_mod, "IS_CUDA_AVAILABLE", True)
+        monkeypatch.setattr(muon_mod, "get_device_type", lambda: "cuda")
+        monkeypatch.setattr(muon_mod, "get_gpu_compute_capability", lambda _device: 90)
         grad = type("FakeTensor", (), {"device": torch.device("cuda")})()
         assert muon_mod._gram_quack_unavailable_reason(grad) is None

@@ -29,6 +29,7 @@ from torch.distributed.tensor import DTensor, Replicate, Shard
 from torch.optim.optimizer import Optimizer
 
 from ..utils import logging
+from ..utils.device import IS_CUDA_AVAILABLE, get_device_type, get_gpu_compute_capability
 
 
 logger = logging.get_logger(__name__)
@@ -297,10 +298,11 @@ _GRAM_QUACK_FALLBACK_WARNED = False
 
 
 def _gram_quack_unavailable_reason(grad: Tensor) -> Optional[str]:
-    if grad.device.type != "cuda":
-        return None
-    major, minor = torch.cuda.get_device_capability(grad.device)
-    if major < 9:
+    if not IS_CUDA_AVAILABLE or grad.device.type != get_device_type():
+        return f"{grad.device.type} tensors are unsupported; quack kernels require CUDA SM90 or newer"
+    compute_capability = get_gpu_compute_capability(grad.device)
+    if compute_capability < 90:
+        major, minor = divmod(compute_capability, 10)
         return f"CUDA compute capability {major}.{minor} is unsupported; quack kernels require 9.0 or newer"
     return None
 
