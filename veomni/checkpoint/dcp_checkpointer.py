@@ -48,16 +48,6 @@ from .checkpointer import CheckpointerBase
 
 logger = logging.get_logger(__name__)
 
-_DCP_HF_DTYPE_TRACE_KEY = os.environ.get("VEOMNI_DCP_HF_DTYPE_TRACE_KEY")
-
-
-def _matches_dtype_trace_key(key: str) -> bool:
-    # DCP keys may carry one additional leading "model." prefix compared with HF keys.
-    return bool(
-        _DCP_HF_DTYPE_TRACE_KEY and (key == _DCP_HF_DTYPE_TRACE_KEY or key == f"model.{_DCP_HF_DTYPE_TRACE_KEY}")
-    )
-
-
 _EXTRA_STATE_FORMAT = "extra_state_rank_{}.pt"
 _EXTRA_STATE_DIR = "extra_state"
 
@@ -762,13 +752,6 @@ def _get_sharding_plan(
                     f"Cannot determine dtype for tensor '{key}': metadata does not contain dtype information"
                 )
             source_dtype = tensor_meta.properties.dtype
-            if _matches_dtype_trace_key(key) and not source_dtype.is_floating_point:
-                logger.info(
-                    "DCP_HF_DTYPE_TRACE "
-                    f"stage=plan dcp_key={key!r} hf_key={hf_key!r} "
-                    f"metadata_dtype={source_dtype} metadata_shape={tuple(tensor_meta.size)} "
-                    f"save_dtype={save_dtype!r}"
-                )
             if save_dtype and source_dtype.is_floating_point:
                 dtype = getattr(torch, save_dtype) if isinstance(save_dtype, str) else save_dtype
             else:
@@ -835,12 +818,6 @@ def _process_shard(
             tensor_metadata.size,
             dtype=tensor_metadata.properties.dtype,
         )
-        if _matches_dtype_trace_key(dcp_key) and not tensor_metadata.properties.dtype.is_floating_point:
-            logger.info(
-                "DCP_HF_DTYPE_TRACE "
-                f"stage=template dcp_key={dcp_key!r} metadata_dtype={tensor_metadata.properties.dtype} "
-                f"template_dtype={state_dict[dcp_key].dtype} template_device={state_dict[dcp_key].device}"
-            )
 
     # Load partial checkpoint
     load(
@@ -858,16 +835,6 @@ def _process_shard(
 
     for hf_key, dcp_key in shard_keys.items():
         tensor = state_dict[dcp_key]
-        metadata_dtype = metadata.state_dict_metadata[dcp_key].properties.dtype
-        trace_dtype = _matches_dtype_trace_key(dcp_key)
-
-        if trace_dtype:
-            logger.info(
-                "DCP_HF_DTYPE_TRACE "
-                f"stage=post_load dcp_key={dcp_key!r} hf_key={hf_key!r} metadata_dtype={metadata_dtype} "
-                f"tensor_dtype={tensor.dtype} tensor_device={tensor.device} "
-                f"is_floating_point={tensor.is_floating_point()}"
-            )
 
         if hasattr(tensor, "full_tensor"):
             tensor = tensor.full_tensor()
@@ -877,14 +844,6 @@ def _process_shard(
 
         # Explicitly move to CPU and detach to avoid memory retention
         processed_dict[hf_key] = tensor.cpu().detach().clone()
-        if trace_dtype:
-            output = processed_dict[hf_key]
-            logger.info(
-                "DCP_HF_DTYPE_TRACE "
-                f"stage=processed dcp_key={dcp_key!r} hf_key={hf_key!r} target_dtype={target_dtype} "
-                f"output_dtype={output.dtype} output_device={output.device} "
-                f"is_floating_point={output.is_floating_point()}"
-            )
         # Delete the original tensor immediately
         del tensor
 

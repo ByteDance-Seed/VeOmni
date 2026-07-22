@@ -37,12 +37,6 @@ except ImportError:
 
 logger = logging.get_logger(__name__)
 
-_DCP_HF_DTYPE_TRACE_KEY = os.environ.get("VEOMNI_DCP_HF_DTYPE_TRACE_KEY")
-
-
-def _matches_dtype_trace_key(key: str) -> bool:
-    return bool(_DCP_HF_DTYPE_TRACE_KEY and key == _DCP_HF_DTYPE_TRACE_KEY)
-
 
 def _normalize_key(key: str) -> Optional[str]:
     """
@@ -267,17 +261,7 @@ def verify_hf_checkpoint_weights(
 
             # Check dtype matches (floating tensors are bf16; integer/bool buffers keep native dtype)
             if original_tensor.dtype != loaded_tensor.dtype:
-                logger.error(
-                    "DCP_HF_DTYPE_TRACE "
-                    f"stage=verify_mismatch key={key!r} "
-                    f"original_dtype={original_tensor.dtype} loaded_dtype={loaded_tensor.dtype} "
-                    f"original_shape={tuple(original_tensor.shape)} loaded_shape={tuple(loaded_tensor.shape)} "
-                    f"original_device={original_tensor.device} loaded_device={loaded_tensor.device} "
-                    f"original_is_floating={original_tensor.is_floating_point()} "
-                    f"loaded_is_floating={loaded_tensor.is_floating_point()} "
-                    f"original_element_size={original_tensor.element_size()} "
-                    f"loaded_element_size={loaded_tensor.element_size()}"
-                )
+                logger.error(f"Dtype mismatch for key '{key}': {original_tensor.dtype} vs {loaded_tensor.dtype}")
                 return False
 
             # Direct comparison since both tensors should be in the same dtype (bf16)
@@ -364,15 +348,6 @@ def verify_dcp_to_hf_conversion(
         key: (tensor.to(torch.bfloat16) if tensor.is_floating_point() else tensor)
         for key, tensor in dcp_state_dict.items()
     }
-    if _DCP_HF_DTYPE_TRACE_KEY:
-        for key, tensor in sorted(dcp_state_dict_bf16.items()):
-            if _matches_dtype_trace_key(key):
-                logger.info(
-                    "DCP_HF_DTYPE_TRACE "
-                    f"stage=verification_source key={key!r} dtype={tensor.dtype} "
-                    f"shape={tuple(tensor.shape)} device={tensor.device} "
-                    f"element_size={tensor.element_size()} is_floating_point={tensor.is_floating_point()}"
-                )
     n_cast = sum(1 for t in dcp_state_dict_bf16.values() if t.dtype == torch.bfloat16)
     n_kept = len(dcp_state_dict_bf16) - n_cast
     logger.info(f"✓ Converted {n_cast} floating tensors to bf16; kept {n_kept} non-floating tensors")

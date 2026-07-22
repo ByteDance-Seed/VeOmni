@@ -174,8 +174,6 @@ jobs:
         run: |
           uv run --frozen pytest -v -s -x tests/checkpoints/test_checkpoint_callback.py
       - name: Run e2e dcp save and load test
-        env:
-          VEOMNI_DCP_HF_DTYPE_TRACE_KEY: model.layers.0.mlp.gate.tid2eid
         run: |
           uv run --frozen pytest -v -s -x tests/checkpoints/test_trainer_saveload.py
       - name: Run distributed tests (dummy_forward)

@@ -23,12 +23,6 @@ if TYPE_CHECKING:
 
 logger = helper.create_logger(__name__)
 
-_DCP_HF_DTYPE_TRACE_KEY = os.environ.get("VEOMNI_DCP_HF_DTYPE_TRACE_KEY")
-
-
-def _matches_dtype_trace_key(key: str) -> bool:
-    return bool(_DCP_HF_DTYPE_TRACE_KEY and key == _DCP_HF_DTYPE_TRACE_KEY)
-
 
 # PEFT LoRA adapter key markers. The training DCP keeps PEFT's wrapped FQNs intact
 # (e.g. ``base_model.model.<...>.lora_A.default.weight``), so a substring check on
@@ -140,16 +134,6 @@ def save_model_weights(
         logger.info(f"Processing shard {shard_idx + 1}/{num_shards}: {filename} ({len(shard_keys)} tensors)")
 
         processed_dict = _process_shard(shard_keys, checkpoint_path, save_dtype)
-
-        if _DCP_HF_DTYPE_TRACE_KEY:
-            for key, tensor in processed_dict.items():
-                if _matches_dtype_trace_key(key):
-                    logger.info(
-                        "DCP_HF_DTYPE_TRACE "
-                        f"stage=pre_write hf_key={key!r} output_file={filename!r} "
-                        f"tensor_dtype={tensor.dtype} tensor_shape={tuple(tensor.shape)} "
-                        f"tensor_device={tensor.device} element_size={tensor.element_size()}"
-                    )
 
         # Save shard
         if safe_serialization:
