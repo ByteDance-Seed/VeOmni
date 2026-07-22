@@ -201,15 +201,13 @@ deepseek_v4_text_smoke_test_cases = [
         True,  # is_moe
         _DEFAULT_RTOL,
         _DEFAULT_ATOL,
-        # DeepSeek-V4 attention is eager-only (no FA / SDPA / FlexAttention)
-        # and the 4D ``[B, S, hc_mult, D]`` HyperConnection residual stack
-        # is not SP-aware yet. Force ``max_sp_size=1`` until a V4-specific
-        # eager-SP path lands.
-        1,
+        # DeepSeek-V4 uses an eager/TileLang SP path (Q Ulysses + MQA sequence
+        # gather around compressors). Exercise SP=1 vs SP=2 alignment.
+        2,
         # The GPU fused-MoE path now preserves DeepSeek-V4's ``swiglu_limit``
         # clamp, so keep the smoke test on the default fused_triton MoE path.
         # EP remains disabled here because the surrounding V4 e2e coverage is
-        # a single-mode smoke test, not an EP alignment test.
+        # an SP alignment smoke test, not an EP alignment test.
         1,
     ),
     pytest.param(
@@ -501,7 +499,7 @@ def test_deepseek_v4_tilelang_dyn_bsz_smoke(
         rtol=_DEFAULT_RTOL,
         atol=_DEFAULT_ATOL,
         train_path=request.getfixturevalue(dataset_fixture),
-        max_sp_size=1,
+        max_sp_size=2,
         max_ep_size=1,
         compare_alignment=False,
         extra_args=[*_DEEPSEEK_V4_TILELANG_TRAINING_ARGS, *case_args],

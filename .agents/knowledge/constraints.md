@@ -181,3 +181,9 @@ Core files:
 25. **Module-level OpSlots are shared by every model instance**
    - Modeling modules expose `OpSlot` objects such as `veomni_causal_lm_loss` as globals. Policy/reference models in DPO can therefore use the same slot.
    - Temporary interception must use forward-scoped ownership and reference-counted dispatch. A closure bound to one model or callback can observe another model's forward and corrupt side-channel state.
+
+26. **DCP full resume skips HF weight materialization**
+    - When `train.checkpoint.load_path` is set and the run is not LoRA/PEFT, `BaseTrainer` / omni train pass `skip_weights_load=True` into `build_parallelize_model` / `parallelize_model_fsdp2`.
+    - The model is only `to_empty()`-materialized; parameters are restored by DCP in `CheckpointerCallback.on_train_begin`.
+    - LoRA/PEFT must not set `skip_weights_load` (and the FSDP2 path raises if both are set): LoRA DCP is trainable-only and still needs the HF base from `model.model_path`.
+    - After DCP load, `empty_cache()` is called to reduce first-step NCCL OOM risk from allocator fragmentation on near-OOM MoE jobs.

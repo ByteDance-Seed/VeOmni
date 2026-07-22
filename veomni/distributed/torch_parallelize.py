@@ -48,6 +48,28 @@ def _reset_hf_initialized_flag(module: nn.Module) -> None:
         _reset_hf_initialized_flag(child)
 
 
+def _to_empty_preserving_nonpersistent_buffers(model: nn.Module, device: str) -> None:
+    """Materialize parameters without discarding config-derived buffers.
+
+    Distributed checkpoints restore ``state_dict()``, which excludes buffers
+    registered with ``persistent=False``. Snapshot those buffers before
+    ``to_empty()`` so values such as rotary ``inv_freq`` survive the DCP resume
+    materialization path without duplicating persistent buffers that DCP loads.
+    """
+    buffers = []
+    for module in model.modules():
+        for name in module._non_persistent_buffers_set:
+            buffer = module._buffers.get(name)
+            if buffer is not None:
+                buffers.append((module, name, buffer.detach().clone()))
+
+    model.to_empty(device=device)
+
+    for module, name, buffer in buffers:
+        materialized_buffer = module._buffers[name]
+        materialized_buffer.copy_(buffer.to(device=materialized_buffer.device, dtype=materialized_buffer.dtype))
+
+
 def _check_extra_parallel_dim0_divisibility(model: "nn.Module", para_name: str, ep_fsdp_size: int) -> bool:
     """Return whether EP-local dim-0 can be evenly sharded by ``ep_fsdp_size``."""
     parallel_plan = getattr(model, "get_parallel_plan", None)
@@ -84,6 +106,7 @@ def parallelize_model_fsdp2(
     basic_modules: Optional[List[str]] = None,
     muon_expert_zero_comm: bool = False,
     compile_config: Optional[CompileConfig] = None,
+    should_skip_hf_weight_load: bool = False,
     **kwargs,
 ) -> "nn.Module":
     """
@@ -109,6 +132,8 @@ def parallelize_model_fsdp2(
         ep_size, emb_size = 2, 4
     We will use this model for illustration of Expert Parallel + Embed Parallel below.
     """
+    if "skip_weights_load" in kwargs:
+        raise TypeError("'skip_weights_load' was renamed to 'should_skip_hf_weight_load'")
 
     parallel_state = get_parallel_state()
 
@@ -427,16 +452,35 @@ def parallelize_model_fsdp2(
     assert kwargs.get("init_device") == "meta", "Please use init_device: meta for FSDP2"
     materialize_device = "cpu" if enable_fsdp_cpu_offload else get_device_type()
 
-    if weights_path is None:
-        model.to_empty(device=materialize_device)
+    # A full non-LoRA checkpoint will overwrite the model, so its resume path can
+    # skip expensive HF weight materialization. LoRA checkpoints are trainable-only
+    # and still need the HF base weights.
+    is_peft_model = kwargs.pop("is_peft_model", False)
+    adapter_path = kwargs.pop("adapter_path", None)
+    if should_skip_hf_weight_load and is_peft_model:
+        raise ValueError(
+            "should_skip_hf_weight_load=True is incompatible with LoRA/PEFT models: the checkpoint is "
+            "trainable-only and the frozen base must still be loaded from weights_path."
+        )
+
+    if weights_path is None or should_skip_hf_weight_load:
+        if should_skip_hf_weight_load:
+            logger.info_rank0(
+                "Skipping pretrained weight load for checkpoint resume; "
+                "parameters will be restored from the distributed checkpoint."
+            )
+        if should_skip_hf_weight_load:
+            _to_empty_preserving_nonpersistent_buffers(model, materialize_device)
+        else:
+            model.to_empty(device=materialize_device)
         _reset_hf_initialized_flag(model)
-        model.init_weights()
+        # Random init is unnecessary when the checkpoint will overwrite every parameter.
+        if not should_skip_hf_weight_load:
+            model.init_weights()
     else:
         from torch.distributed.tensor import distribute_tensor
 
         logger.info_rank0(f"starting to load model weights from {weights_path}...")
-        is_peft_model = kwargs.pop("is_peft_model", False)
-        adapter_path = kwargs.pop("adapter_path", None)
         if is_peft_model:
             if adapter_path is not None:
                 logger.info_rank0(f"also loading lora adapter weights from {adapter_path}...")
@@ -508,6 +552,7 @@ def build_parallelize_model(
     basic_modules: Optional[List[str]] = None,
     muon_expert_zero_comm: bool = False,
     compile_config: Optional[CompileConfig] = None,
+    should_skip_hf_weight_load: bool = False,
     **kwargs,
 ) -> "nn.Module":
     """Apply parallel strategies to the model.
@@ -516,6 +561,8 @@ def build_parallelize_model(
         muon_expert_zero_comm: Shard ExtraParallel weights on dim-0 when the
             EP-local dim is divisible by ``ep_fsdp_size``.
     """
+    if "skip_weights_load" in kwargs:
+        raise TypeError("'skip_weights_load' was renamed to 'should_skip_hf_weight_load'")
 
     parallel_state = get_parallel_state()
     compile_config = compile_config or CompileConfig()
@@ -573,6 +620,7 @@ def build_parallelize_model(
                 basic_modules=basic_modules,
                 muon_expert_zero_comm=muon_expert_zero_comm,
                 compile_config=compile_config,
+                should_skip_hf_weight_load=should_skip_hf_weight_load,
                 **kwargs,
             )
         else:

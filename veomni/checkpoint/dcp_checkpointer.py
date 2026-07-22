@@ -52,6 +52,35 @@ _EXTRA_STATE_FORMAT = "extra_state_rank_{}.pt"
 _EXTRA_STATE_DIR = "extra_state"
 
 
+class _ModelStrictLoadPlanner(DefaultLoadPlanner):
+    """Allow partial optimizer state while requiring a complete full-model DCP."""
+
+    def __init__(self, strict_model: bool):
+        super().__init__(allow_partial_load=True)
+        self.strict_model = strict_model
+
+    def create_local_plan(self):
+        plan = super().create_local_plan()
+        if not self.strict_model:
+            return plan
+
+        assert self.metadata is not None
+        missing_model_keys = sorted(
+            key
+            for key, path in self.mappings.items()
+            if path and path[0] == "model" and key not in self.metadata.state_dict_metadata
+        )
+        if missing_model_keys:
+            preview = ", ".join(missing_model_keys[:10])
+            suffix = " ..." if len(missing_model_keys) > 10 else ""
+            raise RuntimeError(
+                f"DCP is missing {len(missing_model_keys)} model key(s) required for a full-model resume: "
+                f"{preview}{suffix}"
+            )
+
+        return plan
+
+
 def _validate_extra_parallel_meshes(parallel_state) -> None:
     """Fail-fast precondition for ExtraParallel state dict preprocessing.
 
@@ -236,9 +265,9 @@ class OptimizerState(Stateful):
     equivalent to what AdamW would create on the next ``step()`` call.
 
     Note: ``allow_partial_load`` is set globally on the DCP planner (it
-    cannot be scoped to optimizer-only).  Model-weight integrity is still
-    enforced by ``set_model_state_dict(strict=True)`` inside
-    ``ModelState.load_state_dict`` for non-LoRA loads.
+    cannot be scoped to optimizer-only). ``_ModelStrictLoadPlanner`` therefore
+    validates model-key completeness from checkpoint metadata before loading a
+    non-LoRA full-model DCP.
     """
 
     def __init__(self, model, optimizer, parallel_state=None):
@@ -280,11 +309,19 @@ class OptimizerState(Stateful):
             restore_optimizer_param_group_defaults(self.optimizer)
             return
 
-        # Single torch optimizer
+        # Single torch optimizer.
+        # ``strict=False`` matches the DCP planner's allow_partial_load intent:
+        # params that never received a gradient (and thus have no saved Adam
+        # state) keep the default-initialized state that
+        # ``set_optimizer_state_dict`` / ``_init_optim_state`` already created.
+        # Torch 2.11+ raises under the default strict=True when any
+        # requires_grad param is missing from the checkpoint (DeepSeek-V4
+        # indexer ``position_bias`` is one such case on short toy runs).
         set_optimizer_state_dict(
             model=self.model,
             optimizers=self.optimizer,
             optim_state_dict=optim_state_from_dcp_load,
+            options=StateDictOptions(strict=False),
         )
         restore_optimizer_param_group_defaults(self.optimizer)
 
@@ -517,7 +554,7 @@ class DistributedCheckpointer(CheckpointerBase):
             state_dict=load_state,
             storage_reader=storage_reader,
             process_group=process_group,
-            planner=DefaultLoadPlanner(allow_partial_load=True),
+            planner=_ModelStrictLoadPlanner(strict_model=not trainable_only),
         )
 
         cls._load_extra_state(checkpoint_dir=checkpoint_dir, state=state)
