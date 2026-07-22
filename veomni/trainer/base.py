@@ -614,8 +614,11 @@ class BaseTrainer(Stateful, ABC):
             self.tqdm_callback,
             self.channel_loss_callback,
             self.wandb_callback,
-            self.profile_callback,
             self.checkpointer_callback,
+            # Profile schedules use absolute global steps, so initialize them
+            # after checkpoint restore without changing any other callback's
+            # relative ordering.
+            self.profile_callback,
             self.hf_ckpt_callback,
             self.evaluate_callback,
             self.moe_monitor_callback,
@@ -623,13 +626,7 @@ class BaseTrainer(Stateful, ABC):
         self.state = TrainerState()
 
     def on_train_begin(self):
-        # Restore global_step before callbacks derive any absolute-step
-        # schedules (notably ProfileTraceCallback). Keep the normal callback
-        # order unchanged for step/epoch/end hooks.
-        self.checkpointer_callback.on_train_begin(self.state)
         for callback in self._callbacks:
-            if callback is self.checkpointer_callback:
-                continue
             callback.on_train_begin(self.state)
 
     def on_train_end(self):

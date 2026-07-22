@@ -66,7 +66,7 @@ if IS_NPU_AVAILABLE:
 
 # internal use
 VALID_CONFIG_TYPE = None
-VEOMNI_UPLOAD_CMD = os.getenv("VEOMNI_UPLOAD_CMD")
+VEOMNI_UPLOAD_CMD = None
 FlopsCounter = None
 
 # Offline Ascend postprocess sidecar (analyse / durable copy / upload).
@@ -972,18 +972,16 @@ def create_profiler(
         logger.info(f"Profiling memory visualization saved at {gpu_memory_file}.")
 
         if is_hdfs_trace:
-            if copy(trace_file, trace_dir):
-                logger.info(f"Profiling result uploaded to {trace_dir}.")
-            else:
-                logger.warning(f"Failed to copy profiling result to {trace_dir}; trace remains at {trace_file}.")
+            copy(trace_file, trace_dir)
+            logger.info(f"Profiling result uploaded to {trace_dir}.")
 
         if VEOMNI_UPLOAD_CMD:
             try:
                 logger.info_rank0(f"upload trace file {trace_file}")
-                command = f"{VEOMNI_UPLOAD_CMD} {shlex.quote(str(trace_file))}"
-                subprocess.run(command, shell=True, check=True, executable="/bin/bash")
-            except Exception as exc:
-                logger.warning(f"failed to upload trace file {trace_file}, error: {exc}")
+                command2 = f"{VEOMNI_UPLOAD_CMD} {trace_file}"
+                subprocess.run(command2, shell=True, check=True, executable="/bin/bash")
+            except Exception as e:
+                logger.warning(f"failed to upload trace file {trace_file}, error: {e}")
 
     if IS_NPU_AVAILABLE:
         profiler_module = torch_npu.profiler

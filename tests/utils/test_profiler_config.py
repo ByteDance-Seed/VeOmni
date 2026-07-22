@@ -1210,12 +1210,19 @@ def test_profile_callback_rebases_absolute_steps_after_resume(monkeypatch, tmp_p
     assert create_calls[0]["end_step"] == 2
 
 
-def test_base_trainer_restores_checkpoint_before_profile_schedule():
+def test_base_trainer_preserves_declared_callback_order_for_profile_resume():
     from veomni.trainer.base import BaseTrainer
 
     events = []
     trainer = object.__new__(BaseTrainer)
     trainer.state = TrainerState(global_step=0)
+
+    class _Callback:
+        def __init__(self, name):
+            self.name = name
+
+        def on_train_begin(self, state):
+            events.append((self.name, state.global_step))
 
     class _CheckpointCallback:
         def on_train_begin(self, state):
@@ -1228,12 +1235,15 @@ def test_base_trainer_restores_checkpoint_before_profile_schedule():
 
     checkpoint = _CheckpointCallback()
     profile = _ProfileCallback()
+    before = _Callback("before")
+    after = _Callback("after")
     trainer.checkpointer_callback = checkpoint
-    trainer._callbacks = [profile, checkpoint]
+    trainer.profile_callback = profile
+    trainer._callbacks = [before, checkpoint, profile, after]
 
     trainer.on_train_begin()
 
-    assert events == [("checkpoint", 0), ("profile", 4)]
+    assert events == [("before", 0), ("checkpoint", 0), ("profile", 4), ("after", 4)]
 
 
 def test_profile_callback_skips_elapsed_window(monkeypatch):
