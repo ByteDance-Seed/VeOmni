@@ -303,7 +303,7 @@ NPU validation runs at two times:
 | weight_decay | `float` | `0` | L2 regularization strength. |
 | no_decay_modules | `List[str]` | `[]` | Modules excluded from weight decay (e.g. `RMSNorm`). |
 | no_decay_params | `List[str]` | `[]` | Parameters excluded from weight decay (e.g. `bias`). |
-| max_grad_norm | `float` | `1.0` | Gradient clipping norm. |
+| max_grad_norm | `float` | `1.0` | Gradient clipping norm. Values `<= 0` disable gradient clipping and skip the grad-norm pass. |
 | muon_lr | `float` | `2e-2` | Learning rate for Muon-managed 2-D hidden weights and 3-D expert stacks. |
 | muon_momentum | `float` | `0.95` | Momentum factor for Muon. |
 | muon_nesterov | `bool` | `True` | Enable Nesterov momentum for Muon. |

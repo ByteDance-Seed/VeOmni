@@ -33,6 +33,23 @@ from veomni.utils.device import (
 logger = helper.create_logger(__name__)
 
 
+def test_clip_grad_norm_non_positive_max_norm_skips_parallel_state(monkeypatch):
+    model = nn.Linear(2, 2)
+    model(torch.ones(1, 2)).sum().backward()
+    original_grads = [param.grad.detach().clone() for param in model.parameters()]
+
+    def fail_get_parallel_state():
+        raise AssertionError("disabled grad clipping should not query parallel state")
+
+    monkeypatch.setattr("veomni.distributed.clip_grad_norm.get_parallel_state", fail_get_parallel_state)
+
+    grad_norm = veomni_clip_grad_norm(model, max_norm=0.0)
+
+    assert grad_norm == 0.0
+    for param, original_grad in zip(model.parameters(), original_grads):
+        torch.testing.assert_close(param.grad, original_grad)
+
+
 def _torch_npu_version() -> str:
     """Return the version of torch_npu if installed, otherwise return "0.0.0"."""
     if importlib.util.find_spec("torch_npu") is None:
