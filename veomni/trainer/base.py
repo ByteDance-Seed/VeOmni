@@ -66,6 +66,7 @@ from ..models import build_foundation_model, build_tokenizer
 from ..ops.batch_invariant_ops import set_batch_invariant_mode
 from ..optim import build_lr_scheduler, build_optimizer
 from ..utils import helper, logging
+from ..utils.checkpoint_utils import should_skip_hf_weight_load
 from ..utils.device import (
     get_device_type,
     get_dist_comm_backend,
@@ -198,10 +199,21 @@ class VeOmniIter:
         return {}
 
 
+def _resolve_muon_lr(optimizer_cfg) -> float:
+    """Resolve Muon LR, inheriting AdamW lr under match_rms_adamw when unset."""
+    if optimizer_cfg.muon_lr is not None:
+        return float(optimizer_cfg.muon_lr)
+    adamw_lr = float(optimizer_cfg.lr)
+    if optimizer_cfg.muon_adjust_lr_fn == "match_rms_adamw":
+        return adamw_lr
+    # original: Moonlight-style ~25x AdamW lr starting point
+    return 25.0 * adamw_lr
+
+
 def _collect_muon_kwargs(optimizer_cfg) -> Dict[str, Any]:
     """Pull Muon-specific hyperparameters out of ``OptimizerConfig``."""
     return {
-        "lr": optimizer_cfg.muon_lr,
+        "lr": _resolve_muon_lr(optimizer_cfg),
         "momentum": optimizer_cfg.muon_momentum,
         "nesterov": optimizer_cfg.muon_nesterov,
         "weight_decay": optimizer_cfg.muon_weight_decay,
@@ -209,6 +221,12 @@ def _collect_muon_kwargs(optimizer_cfg) -> Dict[str, Any]:
         "ns_coefficients": tuple(optimizer_cfg.muon_ns_coefficients),
         "eps": optimizer_cfg.muon_eps,
         "adjust_lr_fn": optimizer_cfg.muon_adjust_lr_fn,
+        "ns_implementation": optimizer_cfg.muon_ns_implementation,
+        "gram_ns_reset_iterations": tuple(optimizer_cfg.muon_gram_ns_reset_iterations),
+        # Surface for startup summary only; not a DistributedMuon ctor kwarg.
+        "expert_zero_comm": bool(optimizer_cfg.muon_expert_zero_comm),
+        "adamw_lr": float(optimizer_cfg.lr),
+        "muon_lr_explicit": optimizer_cfg.muon_lr is not None,
     }
 
 
@@ -524,11 +542,25 @@ class BaseTrainer(Stateful, ABC):
         if args.train.chunk_mbs_config.enable:
             kwargs["chunk_mbs_config"] = args.train.chunk_mbs_config
 
+        # A full non-LoRA resume already contains model weights. Skip the HF
+        # materialization pass to avoid a second peak (HF load then checkpoint
+        # overwrite) that can OOM large MoE jobs. LoRA resumes still need the HF base.
+        skip_hf_weight_load = should_skip_hf_weight_load(
+            args.train.checkpoint.load_path,
+            args.model.lora_config,
+        )
+        if skip_hf_weight_load:
+            logger.info_rank0(
+                f"Checkpoint resume enabled (load_path={args.train.checkpoint.load_path}); "
+                "skipping HF weight materialization before checkpoint restore."
+            )
+
         # Parallelize model
         self.model = build_parallelize_model(
             self.model,
             init_device=args.train.init_device,
             weights_path=args.model.model_path,
+            should_skip_hf_weight_load=skip_hf_weight_load,
             enable_reshard_after_forward=args.train.accelerator.fsdp_config.reshard_after_forward,
             mixed_precision=args.train.accelerator.fsdp_config.mixed_precision,
             enable_gradient_checkpointing=args.train.gradient_checkpointing.enable,

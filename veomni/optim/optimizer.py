@@ -508,6 +508,16 @@ def _build_muon_with_adamw(
     dict keys and grad-clipping metadata stay keyed by mesh.
     """
     muon_kwargs = dict(muon_kwargs or {})
+    # Summary-only keys collected by the trainer; not DistributedMuon ctor args.
+    expert_zero_comm = bool(muon_kwargs.pop("expert_zero_comm", False))
+    adamw_lr = float(muon_kwargs.pop("adamw_lr", lr))
+    muon_lr_explicit = bool(
+        muon_kwargs.pop("muon_lr_explicit", "lr" in muon_kwargs and muon_kwargs.get("lr") is not None)
+    )
+    if muon_kwargs.get("lr") is None:
+        adjust_lr_fn = muon_kwargs.get("adjust_lr_fn", "match_rms_adamw")
+        muon_kwargs["lr"] = float(adamw_lr) if adjust_lr_fn == "match_rms_adamw" else 25.0 * float(adamw_lr)
+        muon_lr_explicit = False
     muon_params, adamw_params, muon_names, adamw_names = split_muon_adamw_params(
         model,
         no_decay_modules=no_decay_modules,
@@ -541,9 +551,34 @@ def _build_muon_with_adamw(
     muon_per_para, muon_non_para = _split_by_ep(muon_params)
     adamw_per_para, adamw_non_para = _split_by_ep(adamw_params)
 
+    muon_lr = float(muon_kwargs.get("lr", 2e-2))
+    adjust_lr_fn = muon_kwargs.get("adjust_lr_fn", "match_rms_adamw")
+    ns_implementation = muon_kwargs.get("ns_implementation", "gram_quack")
+    ns_steps = int(muon_kwargs.get("ns_steps", 5))
+    lr_source = (
+        "explicit"
+        if muon_lr_explicit
+        else (
+            "inherit optimizer.lr (match_rms_adamw)"
+            if adjust_lr_fn == "match_rms_adamw"
+            else "25x optimizer.lr (original)"
+        )
+    )
     logger.info_rank0(
         f"Muon optimizer: {len(muon_params)} param(s) on Muon, {len(adamw_params)} on AdamW. "
         f"First few Muon params: {muon_names[:5]}; first few AdamW params: {adamw_names[:5]}."
+    )
+    logger.info_rank0(
+        "[Muon] "
+        f"ns_implementation={ns_implementation}, ns_steps={ns_steps}, "
+        f"adjust_lr_fn={adjust_lr_fn}, "
+        f"muon_lr={muon_lr:g} ({lr_source}), adamw_lr={adamw_lr:g}, "
+        f"muon_weight_decay={float(muon_kwargs.get('weight_decay', 0.0)):g}, "
+        f"adamw_weight_decay={float(weight_decay):g}, "
+        f"momentum={float(muon_kwargs.get('momentum', 0.95)):g}, "
+        f"nesterov={bool(muon_kwargs.get('nesterov', True))}, "
+        f"expert_zero_comm={expert_zero_comm} "
+        "(applied at FSDP parallelize; see [muon_expert_zero_comm] logs)."
     )
     if extra_parallel_aware:
         for para in extra_parallel_names:
@@ -564,6 +599,8 @@ def _build_muon_with_adamw(
             eps=muon_kwargs.get("eps", 1e-7),
             ns_steps=muon_kwargs.get("ns_steps", 5),
             adjust_lr_fn=muon_kwargs.get("adjust_lr_fn", "match_rms_adamw"),
+            ns_implementation=muon_kwargs.get("ns_implementation", "gram_quack"),
+            gram_ns_reset_iterations=muon_kwargs.get("gram_ns_reset_iterations", (2,)),
         )
 
     def _make_adamw(params: List[torch.nn.Parameter]) -> AdamW:

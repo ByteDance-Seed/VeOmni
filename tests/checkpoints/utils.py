@@ -11,6 +11,15 @@ from tools import hf_local_or_remote, resolve_ops_overrides
 from tools.launch_utils import find_free_port
 
 
+def get_checkpoint_test_nproc() -> int:
+    """World size for trainer saveload torchrun jobs.
+
+    Defaults to 8 to match the L20-8 CI runners. Override with
+    ``VEOMNI_CHECKPOINT_TEST_NPROC`` for local machines with fewer GPUs.
+    """
+    return int(os.environ.get("VEOMNI_CHECKPOINT_TEST_NPROC", "8"))
+
+
 MODEL_CONFIGS = {
     "qwen3_moe": {
         "config_path": "tests/toy_config/qwen3_moe_toy/config.json",
@@ -18,6 +27,12 @@ MODEL_CONFIGS = {
     },
     "deepseek_v3": {
         "config_path": "tests/toy_config/deepseek_v3_toy/config.json",
+        "tokenizer_path": "deepseek-ai/DeepSeek-V3",
+    },
+    # Reuse the DeepSeek-V3 tokenizer assets; the saveload trainer only needs a
+    # tokenizer object for model-assets bookkeeping and trains on dummy text.
+    "deepseek_v4": {
+        "config_path": "tests/toy_config/deepseek_v4_toy/config.json",
         "tokenizer_path": "deepseek-ai/DeepSeek-V3",
     },
 }
@@ -54,9 +69,15 @@ def get_checkpoint_test_command(
     tokenizer_path = hf_local_or_remote(MODEL_CONFIGS[model_name]["tokenizer_path"])
     output_dir = get_output_dir(model_name, ep_size, dp_replicate_size)
     port = find_free_port()
+    nproc = get_checkpoint_test_nproc()
+    if ep_size > nproc:
+        raise ValueError(f"ep_size={ep_size} exceeds checkpoint-test world size nproc={nproc}")
+    # Keep global batch a multiple of micro_batch * dp_size. With micro_batch=1
+    # and dp_size = nproc // ep_size, nproc itself is always valid.
+    global_batch_size = nproc
 
     params = [
-        f"torchrun --nnodes=1 --nproc_per_node=8 --master-port={port}",
+        f"{sys.executable} -m torch.distributed.run --nnodes=1 --nproc_per_node={nproc} --master-port={port}",
         "tests/checkpoints/test_trainer_saveload.py",
         f"--model.config_path {config_path}",
         f"--model.tokenizer_path {tokenizer_path}",
@@ -70,7 +91,7 @@ def get_checkpoint_test_command(
         "--train.accelerator.fsdp_config.fsdp_mode fsdp2",
         "--train.init_device meta",
         f"--train.accelerator.ep_size {ep_size}",
-        "--train.global_batch_size 8",
+        f"--train.global_batch_size {global_batch_size}",
         "--train.micro_batch_size 1",
         "--train.optimizer.lr 1e-7",
         "--train.optimizer.lr_warmup_ratio 0.007",

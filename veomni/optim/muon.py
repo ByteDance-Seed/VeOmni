@@ -28,6 +28,12 @@ from torch import Tensor
 from torch.distributed.tensor import DTensor, Replicate, Shard
 from torch.optim.optimizer import Optimizer
 
+from ..utils import logging
+from ..utils.device import IS_CUDA_AVAILABLE, get_device_type, get_gpu_compute_capability
+
+
+logger = logging.get_logger(__name__)
+
 
 try:
     # Reuse upstream's private NS constants and the LR-adjust helper so we
@@ -56,7 +62,10 @@ __all__ = [
     "DEFAULT_NS_COEFFICIENTS",
     "DEFAULT_NS_STEPS",
     "DistributedMuon",
+    "batched_gram_newton_schulz",
+    "NS_IMPLEMENTATIONS",
     "batched_newton_schulz",
+    "run_newton_schulz",
     "split_muon_adamw_params",
 ]
 
@@ -72,6 +81,51 @@ _DEFAULT_ADAMW_NAME_PATTERNS: Tuple[str, ...] = (
 )
 
 
+def _as_coeff_schedule(
+    ns_coefficients: Sequence[Any],
+    ns_steps: int,
+) -> Tuple[Tuple[float, float, float], ...]:
+    """Expand a single (a,b,c) or validate a per-step coefficient schedule."""
+    if ns_steps >= 100:
+        raise ValueError("Number of steps must be less than 100 for computational efficiency")
+    if len(ns_coefficients) == 0:
+        raise ValueError("ns_coefficients must not be empty")
+
+    # Single triple: (a, b, c) reused for every step (torch.optim.Muon style).
+    first = ns_coefficients[0]
+    if len(ns_coefficients) == 3 and not isinstance(first, (list, tuple)):
+        a, b, c = (float(ns_coefficients[0]), float(ns_coefficients[1]), float(ns_coefficients[2]))
+        return tuple((a, b, c) for _ in range(ns_steps))
+
+    # Flat sequences that are not a single (a,b,c) are invalid.
+    if all(not isinstance(x, (list, tuple)) for x in ns_coefficients):
+        raise ValueError(
+            "Coefficients must be a tuple of exactly 3 values (a, b, c), or a "
+            f"sequence of (a, b, c) triples; got length-{len(ns_coefficients)} flat sequence"
+        )
+
+    schedule: List[Tuple[float, float, float]] = []
+    for row in ns_coefficients:
+        if not isinstance(row, (list, tuple)) or len(row) != 3:
+            raise ValueError(f"Per-step ns_coefficients must be a sequence of (a, b, c) triples; got {row!r}")
+        schedule.append((float(row[0]), float(row[1]), float(row[2])))
+    if not schedule:
+        raise ValueError("ns_coefficients schedule is empty")
+    return tuple(schedule)
+
+
+def _flatten_matrix_batch(grad: Tensor) -> Tuple[Tensor, torch.Size]:
+    """Reshape ``[..., M, K]`` into ``[B, M, K]`` while remembering the original shape."""
+    if grad.ndim < 2:
+        raise ValueError(f"Input must have ndim >= 2, got shape {tuple(grad.shape)}")
+    original_shape = grad.shape
+    if grad.ndim == 2:
+        return grad.unsqueeze(0), original_shape
+    if grad.ndim == 3:
+        return grad, original_shape
+    return grad.reshape(-1, grad.shape[-2], grad.shape[-1]), original_shape
+
+
 @torch.no_grad()
 def batched_newton_schulz(
     grad: Tensor,
@@ -81,14 +135,10 @@ def batched_newton_schulz(
     compute_dtype: torch.dtype = torch.bfloat16,
 ) -> Tensor:
     """Run quintic Newton-Schulz on each trailing ``[M, K]`` matrix."""
-    if ns_steps >= 100:
-        raise ValueError("Number of steps must be less than 100 for computational efficiency")
+    schedule = _as_coeff_schedule(ns_coefficients, ns_steps)
     if grad.ndim < 2:
         raise ValueError(f"Input must have ndim >= 2, got shape {tuple(grad.shape)}")
-    if len(ns_coefficients) != 3:
-        raise ValueError("Coefficients must be a tuple of exactly 3 values")
 
-    a, b, c = ns_coefficients
     original_dtype = grad.dtype
     ortho = grad.to(compute_dtype)
 
@@ -101,7 +151,7 @@ def batched_newton_schulz(
     ortho = ortho / norm
 
     # Keep the 2D path byte-compatible with upstream; use the batched form for 3D.
-    for _ in range(ns_steps):
+    for a, b, c in schedule:
         A = ortho @ ortho.mT
         if A.ndim == 2:
             gram_update = torch.addmm(A, A, A, beta=b, alpha=c)
@@ -122,6 +172,200 @@ def batched_newton_schulz(
         ortho = ortho.mT
 
     return ortho.to(original_dtype)
+
+
+@torch.no_grad()
+def batched_gram_newton_schulz(
+    grad: Tensor,
+    ns_coefficients: Sequence[Any] = DEFAULT_NS_COEFFICIENTS,
+    ns_steps: int = DEFAULT_NS_STEPS,
+    eps: float = EPS,
+    compute_dtype: torch.dtype = torch.float16,
+    reset_iterations: Sequence[int] = (2,),
+) -> Tensor:
+    """Pure-PyTorch Gram Newton-Schulz (Dao-AILab algorithm, no custom kernels).
+
+    Algebraically rearranges quintic NS so the iterative work stays on the small
+    square Gram matrix, with optional intermediate restarts for stability.
+    Square matrices fall back to standard Newton-Schulz.
+    """
+    schedule = _as_coeff_schedule(ns_coefficients, ns_steps)
+    reset_set = {int(i) for i in reset_iterations}
+    original_dtype = grad.dtype
+    X, original_shape = _flatten_matrix_batch(grad)
+
+    # Strictly rectangular only — same policy as Dao-AILab/gram-newton-schulz.
+    if X.size(-2) == X.size(-1):
+        out = batched_newton_schulz(
+            X,
+            ns_coefficients=schedule,
+            ns_steps=len(schedule),
+            eps=eps,
+            compute_dtype=torch.bfloat16 if compute_dtype == torch.float16 else compute_dtype,
+        )
+        return out.to(original_dtype).reshape(original_shape)
+
+    tall_skinny = X.size(-2) > X.size(-1)
+    # Match upstream package numerics: normalize in fp32, iterate in half.
+    X = X.to(torch.float32)
+    X = X / (X.norm(dim=(-2, -1), keepdim=True) + eps)
+    X = X.to(compute_dtype)
+
+    if tall_skinny:
+        R = torch.bmm(X.transpose(1, 2), X)
+    else:
+        R = torch.bmm(X, X.transpose(1, 2))
+
+    batch = R.size(0)
+    eye = torch.eye(R.size(-1), device=X.device, dtype=X.dtype).unsqueeze(0).expand(batch, -1, -1).contiguous()
+    Q: Optional[Tensor] = None
+
+    for i, (a, b, c) in enumerate(schedule):
+        if i in reset_set and i != 0:
+            if Q is None:
+                raise RuntimeError("Gram-NS restart requested before Q was initialized")
+            if tall_skinny:
+                X = torch.bmm(X, Q)
+                R = torch.bmm(X.transpose(1, 2), X)
+            else:
+                X = torch.bmm(Q, X)
+                R = torch.bmm(X, X.transpose(1, 2))
+            Q = None
+
+        # Z = b R + c R @ R
+        Z = torch.baddbmm(R, R, R, beta=b, alpha=c)
+        if i == 0 or i in reset_set:
+            Q = Z + a * eye
+        else:
+            assert Q is not None
+            # Q = a Q + Q @ Z
+            Q = torch.baddbmm(Q, Q, Z, beta=a, alpha=1.0)
+
+        # Skip Gram update before a restart or after the final step.
+        if i < len(schedule) - 1 and (i + 1) not in reset_set:
+            assert Q is not None
+            # RZ = a R + R @ Z ; R = a RZ + Z @ RZ
+            RZ = torch.baddbmm(R, R, Z, beta=a, alpha=1.0)
+            R = torch.baddbmm(RZ, Z, RZ, beta=a, alpha=1.0)
+
+    assert Q is not None
+    if tall_skinny:
+        X = torch.bmm(X, Q)
+    else:
+        X = torch.bmm(Q, X)
+    return X.to(original_dtype).reshape(original_shape)
+
+
+_PACKAGE_GRAM_NS_CACHE: Dict[Tuple[Any, ...], Any] = {}
+
+
+def _package_gram_newton_schulz(
+    grad: Tensor,
+    schedule: Tuple[Tuple[float, float, float], ...],
+    eps: float,
+    reset_iterations: Sequence[int],
+    use_kernels: bool,
+) -> Tensor:
+    """Call Dao-AILab ``GramNewtonSchulz`` (optional quack/CuTeDSL kernels)."""
+    try:
+        from gram_newton_schulz import GramNewtonSchulz
+    except ImportError as exc:  # pragma: no cover - optional dependency
+        raise ImportError(
+            "muon_ns_implementation='gram_quack' requires the gram-newton-schulz "
+            "package. Install with: "
+            "`pip install gram-newton-schulz --no-build-isolation` "
+            "(needs Hopper/Blackwell + quack-kernels)."
+        ) from exc
+
+    key = (schedule, float(eps), tuple(int(i) for i in reset_iterations), bool(use_kernels))
+    ortho = _PACKAGE_GRAM_NS_CACHE.get(key)
+    if ortho is None:
+        ortho = GramNewtonSchulz(
+            ns_epsilon=float(eps),
+            ns_use_kernels=bool(use_kernels),
+            ns_coefficients=[list(t) for t in schedule],
+            gram_newton_schulz_reset_iterations=[int(i) for i in reset_iterations],
+            # torch.compile is brittle across torch/CUDA combos; keep eager.
+            compile_kwargs=None,
+        )
+        _PACKAGE_GRAM_NS_CACHE[key] = ortho
+    return ortho(grad)
+
+
+# Newton-Schulz backend selectors for DistributedMuon / run_newton_schulz.
+NS_IMPLEMENTATIONS = ("std", "gram", "gram_quack")
+_GRAM_QUACK_FALLBACK_WARNED = False
+
+
+def _gram_quack_unavailable_reason(grad: Tensor) -> Optional[str]:
+    if not IS_CUDA_AVAILABLE or grad.device.type != get_device_type():
+        return f"{grad.device.type} tensors are unsupported; quack kernels require CUDA SM90 or newer"
+    compute_capability = get_gpu_compute_capability(grad.device)
+    if compute_capability < 90:
+        major, minor = divmod(compute_capability, 10)
+        return f"CUDA compute capability {major}.{minor} is unsupported; quack kernels require 9.0 or newer"
+    return None
+
+
+@torch.no_grad()
+def run_newton_schulz(
+    grad: Tensor,
+    ns_coefficients: Sequence[Any] = DEFAULT_NS_COEFFICIENTS,
+    ns_steps: int = DEFAULT_NS_STEPS,
+    eps: float = EPS,
+    ns_implementation: str = "gram_quack",
+    gram_ns_reset_iterations: Sequence[int] = (2,),
+    compute_dtype: Optional[torch.dtype] = None,
+) -> Tensor:
+    """Dispatch Newton-Schulz / Gram Newton-Schulz for a ``[..., M, K]`` update.
+
+    ``ns_implementation``:
+      - ``std``: torch Muon-compatible Newton-Schulz
+      - ``gram``: pure-PyTorch Gram Newton-Schulz
+      - ``gram_quack`` (default): quack CuTeDSL GEMM kernels (falls back to ``gram`` if unavailable)
+    """
+    if ns_implementation not in NS_IMPLEMENTATIONS:
+        raise ValueError(f"Unknown ns_implementation={ns_implementation!r}; expected one of {NS_IMPLEMENTATIONS}")
+
+    if ns_implementation == "std":
+        schedule = _as_coeff_schedule(ns_coefficients, ns_steps)
+        return batched_newton_schulz(
+            grad,
+            ns_coefficients=schedule,
+            ns_steps=len(schedule),
+            eps=eps,
+            compute_dtype=torch.bfloat16 if compute_dtype is None else compute_dtype,
+        )
+
+    schedule = _as_coeff_schedule(ns_coefficients, ns_steps)
+    if ns_implementation == "gram_quack":
+        fallback_reason = _gram_quack_unavailable_reason(grad)
+        if fallback_reason is None:
+            try:
+                return _package_gram_newton_schulz(
+                    grad,
+                    schedule=schedule,
+                    eps=eps,
+                    reset_iterations=gram_ns_reset_iterations,
+                    use_kernels=True,
+                )
+            except ImportError as exc:
+                fallback_reason = f"{type(exc).__name__}: {exc}"
+        global _GRAM_QUACK_FALLBACK_WARNED
+        if not _GRAM_QUACK_FALLBACK_WARNED:
+            _GRAM_QUACK_FALLBACK_WARNED = True
+            logger.warning_rank0(
+                "[Muon] ns_implementation=gram_quack requested but gram-newton-schulz/quack "
+                f"is unavailable ({fallback_reason}). Falling back to pure-PyTorch gram path."
+            )
+    return batched_gram_newton_schulz(
+        grad,
+        ns_coefficients=schedule,
+        ns_steps=len(schedule),
+        eps=eps,
+        compute_dtype=torch.float16 if compute_dtype is None else compute_dtype,
+        reset_iterations=gram_ns_reset_iterations,
+    )
 
 
 def _is_adamw_by_name(name: str, extra_patterns: Sequence[str]) -> bool:
@@ -262,6 +506,8 @@ class DistributedMuon(Optimizer):
         eps: float = EPS,
         ns_steps: int = DEFAULT_NS_STEPS,
         adjust_lr_fn: Optional[str] = None,
+        ns_implementation: str = "gram_quack",
+        gram_ns_reset_iterations: Sequence[int] = (2,),
     ) -> None:
         if not _MUON_AVAILABLE:
             raise RuntimeError(
@@ -277,6 +523,8 @@ class DistributedMuon(Optimizer):
             raise ValueError(f"weight decay should be >= 0 but is: {weight_decay}")
         if adjust_lr_fn is not None and adjust_lr_fn not in ("original", "match_rms_adamw"):
             raise ValueError(f"Adjust learning rate function {adjust_lr_fn} is not supported")
+        if ns_implementation not in NS_IMPLEMENTATIONS:
+            raise ValueError(f"ns_implementation must be one of {NS_IMPLEMENTATIONS}, got {ns_implementation!r}")
 
         defaults: Dict[str, Any] = {
             "lr": lr,
@@ -287,6 +535,8 @@ class DistributedMuon(Optimizer):
             "eps": eps,
             "ns_steps": ns_steps,
             "adjust_lr_fn": adjust_lr_fn,
+            "ns_implementation": ns_implementation,
+            "gram_ns_reset_iterations": tuple(int(i) for i in gram_ns_reset_iterations),
         }
         super().__init__(params, defaults)
 
@@ -316,6 +566,8 @@ class DistributedMuon(Optimizer):
             ns_steps = int(group["ns_steps"])
             eps = float(group["eps"])
             adjust_lr_fn = group["adjust_lr_fn"]
+            ns_implementation = str(group.get("ns_implementation", "gram_quack"))
+            gram_ns_reset_iterations = tuple(group.get("gram_ns_reset_iterations", (2,)))
 
             for p in group["params"]:
                 if p.grad is None:
@@ -335,7 +587,15 @@ class DistributedMuon(Optimizer):
                 update = grad.lerp(buf, momentum) if nesterov else buf
 
                 kind = _classify_param(p)
-                ortho = self._compute_ortho(update, kind, ns_coefficients, ns_steps, eps)
+                ortho = self._compute_ortho(
+                    update,
+                    kind,
+                    ns_coefficients,
+                    ns_steps,
+                    eps,
+                    ns_implementation=ns_implementation,
+                    gram_ns_reset_iterations=gram_ns_reset_iterations,
+                )
 
                 lr_shape = p.shape[-2:] if p.ndim >= 2 else p.shape
                 adjusted_lr = _adjust_lr(lr, adjust_lr_fn, lr_shape)
@@ -363,19 +623,31 @@ class DistributedMuon(Optimizer):
         ns_coefficients: Tuple[float, float, float],
         ns_steps: int,
         eps: float,
+        ns_implementation: str = "gram_quack",
+        gram_ns_reset_iterations: Sequence[int] = (2,),
     ) -> Tensor:
         """Run Newton-Schulz on ``update`` according to its layout kind."""
+
+        def _ns(x: Tensor) -> Tensor:
+            return run_newton_schulz(
+                x,
+                ns_coefficients=ns_coefficients,
+                ns_steps=ns_steps,
+                eps=eps,
+                ns_implementation=ns_implementation,
+                gram_ns_reset_iterations=gram_ns_reset_iterations,
+            )
+
         if kind == _KIND_LOCAL:
-            return batched_newton_schulz(update, ns_coefficients, ns_steps, eps)
+            return _ns(update)
 
         if kind == _KIND_FSDP_GATHER_2D:
-            full = _full_grad(update)
-            return batched_newton_schulz(full, ns_coefficients, ns_steps, eps)
+            return _ns(_full_grad(update))
 
         if kind == _KIND_MOE_LOCAL_3D:
             assert isinstance(update, DTensor)
             local = update._local_tensor
-            local_ortho = batched_newton_schulz(local, ns_coefficients, ns_steps, eps)
+            local_ortho = _ns(local)
             return DTensor.from_local(
                 local_ortho,
                 device_mesh=update.device_mesh,
@@ -384,7 +656,6 @@ class DistributedMuon(Optimizer):
             )
 
         if kind == _KIND_MOE_GATHER_3D:
-            full = _full_grad(update)
-            return batched_newton_schulz(full, ns_coefficients, ns_steps, eps)
+            return _ns(_full_grad(update))
 
         raise ValueError(f"Unknown DistributedMuon kind: {kind!r}")
