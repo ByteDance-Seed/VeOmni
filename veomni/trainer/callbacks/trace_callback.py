@@ -165,6 +165,7 @@ class ProfileTraceCallback(Callback):
         self._profile_active = False
         self._profiler_stopped = False
         self._profiler_failed = False
+        self._profile_cleanup_barrier_required = False
         self._step_started_at = None
         self._profile_timing_start_step = None
         if not args.train.profile.enable:
@@ -189,6 +190,9 @@ class ProfileTraceCallback(Callback):
         )
 
         self._profile_active = True
+        # Keep teardown synchronization rank-shared even if only the profiled
+        # rank later observes a profiler failure.
+        self._profile_cleanup_barrier_required = True
         # Include the one warmup transition immediately before the requested
         # active window, but do not add timing/logging overhead to unrelated
         # training steps.
@@ -255,7 +259,11 @@ class ProfileTraceCallback(Callback):
 
         profile_error = None
         try:
-            if self.profiler is not None and not getattr(self, "_profiler_failed", False):
+            if (
+                self.profiler is not None
+                and not getattr(self, "_profiler_failed", False)
+                and not getattr(self, "_profiler_stopped", False)
+            ):
                 try:
                     if state.global_step <= args.train.profile.end_step:
                         started = time.perf_counter()
@@ -270,7 +278,6 @@ class ProfileTraceCallback(Callback):
                         raise
                     profile_error = exc
                     self._profiler_failed = True
-                    self._profiler_stopped = True
         finally:
             if synchronize_finalize:
                 started = time.perf_counter()
@@ -313,7 +320,11 @@ class ProfileTraceCallback(Callback):
         if not (args.train.profile.enable and helper.IS_NPU_AVAILABLE):
             return
 
-        synchronize_cleanup = self._profile_active and dist.is_available() and dist.is_initialized()
+        synchronize_cleanup = (
+            getattr(self, "_profile_cleanup_barrier_required", self._profile_active)
+            and dist.is_available()
+            and dist.is_initialized()
+        )
         if synchronize_cleanup:
             dist.barrier()
         try:
@@ -332,6 +343,7 @@ class ProfileTraceCallback(Callback):
             if synchronize_cleanup:
                 dist.barrier()
         self._profile_active = False
+        self._profile_cleanup_barrier_required = False
 
         effective_mode = getattr(
             self.profiler,

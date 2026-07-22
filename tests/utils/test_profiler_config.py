@@ -893,24 +893,86 @@ def test_npu_profile_finalize_error_still_releases_post_barrier(monkeypatch):
     callback = object.__new__(trace_callback.ProfileTraceCallback)
     callback.trainer = SimpleNamespace(args=SimpleNamespace(train=SimpleNamespace(profile=profile_config)))
     callback._profile_active = True
+    callback._profile_cleanup_barrier_required = True
+    callback._profiler_stopped = False
 
     def fail_step():
         events.append("step")
         raise RuntimeError("raw dump failed")
 
-    callback.profiler = SimpleNamespace(step=fail_step, stop=lambda: None)
+    callback.profiler = SimpleNamespace(
+        _veomni_npu_analysis_mode="offline",
+        step=fail_step,
+        stop=lambda: events.append("stop"),
+    )
     monkeypatch.setattr(trace_callback.helper, "IS_NPU_AVAILABLE", True)
+    monkeypatch.setattr(trace_callback.helper, "wait_npu_profile_sidecars", lambda profiler: events.append("wait"))
     monkeypatch.setattr(trace_callback.dist, "is_available", lambda: True)
     monkeypatch.setattr(trace_callback.dist, "is_initialized", lambda: True)
     monkeypatch.setattr(trace_callback.dist, "barrier", lambda: events.append("barrier"))
     monkeypatch.setattr(trace_callback.logger, "warning", warnings.append)
+    monkeypatch.setattr(trace_callback.logger, "info_rank0", lambda message: None)
 
     callback.on_step_end(TrainerState(global_step=5))
 
     assert events == ["barrier", "step", "barrier"]
     assert callback._profiler_failed is True
-    assert callback._profiler_stopped is True
+    assert callback._profiler_stopped is False
     assert any("training will continue" in warning and "raw dump failed" in warning for warning in warnings)
+
+    # A failed step disables further sampling, but teardown still attempts one
+    # synchronized best-effort stop instead of treating the profiler as closed.
+    callback.on_step_end(TrainerState(global_step=6))
+    callback.on_train_end(TrainerState(global_step=30))
+
+    assert events == ["barrier", "step", "barrier", "barrier", "stop", "barrier", "wait"]
+    assert callback._profiler_stopped is True
+
+
+def test_npu_profile_scheduled_stop_error_is_retried_at_train_end(monkeypatch):
+    events = []
+    warnings = []
+    stop_attempts = 0
+    profile_config = SimpleNamespace(enable=True, npu_analysis_mode="offline", end_step=6, this_rank=True)
+    callback = object.__new__(trace_callback.ProfileTraceCallback)
+    callback.trainer = SimpleNamespace(args=SimpleNamespace(train=SimpleNamespace(profile=profile_config)))
+    callback._profile_active = True
+    callback._profile_cleanup_barrier_required = True
+    callback._profiler_failed = False
+    callback._profiler_stopped = False
+
+    def stop_profiler():
+        nonlocal stop_attempts
+        stop_attempts += 1
+        events.append("stop")
+        if stop_attempts == 1:
+            raise RuntimeError("scheduled stop failed")
+
+    callback.profiler = SimpleNamespace(
+        _veomni_npu_analysis_mode="offline",
+        step=lambda: events.append("step"),
+        stop=stop_profiler,
+    )
+    monkeypatch.setattr(trace_callback.helper, "IS_NPU_AVAILABLE", True)
+    monkeypatch.setattr(trace_callback.helper, "wait_npu_profile_sidecars", lambda profiler: events.append("wait"))
+    monkeypatch.setattr(trace_callback.dist, "is_available", lambda: True)
+    monkeypatch.setattr(trace_callback.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(trace_callback.dist, "barrier", lambda: events.append("barrier"))
+    monkeypatch.setattr(trace_callback.logger, "warning", warnings.append)
+    monkeypatch.setattr(trace_callback.logger, "info_rank0", lambda message: None)
+
+    callback.on_step_end(TrainerState(global_step=6))
+
+    assert events == ["step", "stop"]
+    assert callback._profiler_failed is True
+    assert callback._profiler_stopped is False
+
+    callback.on_train_end(TrainerState(global_step=30))
+
+    assert events == ["step", "stop", "barrier", "stop", "barrier", "wait"]
+    assert stop_attempts == 2
+    assert callback._profiler_stopped is True
+    assert any("scheduled stop failed" in warning for warning in warnings)
 
 
 def test_npu_profile_initialization_error_is_nonfatal(monkeypatch, tmp_path):

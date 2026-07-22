@@ -66,6 +66,8 @@ if IS_NPU_AVAILABLE:
 
 # internal use
 VALID_CONFIG_TYPE = None
+# Platform integrations assign this module global after import. An explicit
+# user override is read separately from the environment in ``handler_fn``.
 VEOMNI_UPLOAD_CMD = None
 FlopsCounter = None
 
@@ -910,18 +912,19 @@ def create_profiler(
         if IS_NPU_AVAILABLE:
             offline_postprocess_flag = _env_flag(VEOMNI_NPU_OFFLINE_POSTPROCESS)
             merlin_upload = _should_upload_npu_profile_to_merlin()
-            explicit_upload_cmd = os.getenv("VEOMNI_UPLOAD_CMD")
+            user_upload_cmd = os.getenv("VEOMNI_UPLOAD_CMD")
+            platform_upload_cmd = VEOMNI_UPLOAD_CMD
             automatic_upload_opted_out = _env_flag(VEOMNI_NPU_OFFLINE_MERLIN_UPLOAD) is False
-            if explicit_upload_cmd:
-                selected_upload_cmd = explicit_upload_cmd
+            if user_upload_cmd:
+                selected_upload_cmd = user_upload_cmd
                 selected_merlin_upload = False
                 selected_platform_associated_upload = False
-            elif VEOMNI_UPLOAD_CMD and not automatic_upload_opted_out:
+            elif platform_upload_cmd and not automatic_upload_opted_out:
                 # Platform integrations may provide a file-based uploader that
                 # handles traces too large for an SDK JSON/base64 request. Give
                 # it a trial-first environment because the JobRun Profiling
                 # tab queries assets through the selected Arnold trial.
-                selected_upload_cmd = VEOMNI_UPLOAD_CMD
+                selected_upload_cmd = platform_upload_cmd
                 selected_merlin_upload = False
                 selected_platform_associated_upload = merlin_upload
             elif merlin_upload:

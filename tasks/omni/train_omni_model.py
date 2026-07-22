@@ -326,6 +326,7 @@ def main():
         logger.info_rank0(f"Load distributed checkpoint from {args.train.checkpoint.load_path} successfully!")
 
     profiler = None
+    profiler_failed = False
     profiler_stopped = False
     profile_active = False
     if args.train.profile.enable:
@@ -360,6 +361,7 @@ def main():
                 if not helper.IS_NPU_AVAILABLE:
                     raise
                 profiler = None
+                profiler_failed = True
                 profiler_stopped = True
                 logger.warning(
                     "NPU profiler initialization failed; profiling is disabled for this rank and training will "
@@ -487,7 +489,12 @@ def main():
                 dist.barrier()
             profile_error = None
             try:
-                if profiler is not None and not profiler_stopped and global_step <= args.train.profile.end_step:
+                if (
+                    profiler is not None
+                    and not profiler_failed
+                    and not profiler_stopped
+                    and global_step <= args.train.profile.end_step
+                ):
                     try:
                         profiler.step()
                         if global_step == args.train.profile.end_step:
@@ -498,7 +505,7 @@ def main():
                         if not helper.IS_NPU_AVAILABLE:
                             raise
                         profile_error = exc
-                        profiler_stopped = True
+                        profiler_failed = True
             finally:
                 if synchronize_profile_finalize:
                     dist.barrier()
@@ -559,6 +566,7 @@ def main():
             except Exception as exc:
                 if not helper.IS_NPU_AVAILABLE:
                     raise
+                profiler_failed = True
                 logger.warning(
                     "NPU profiler cleanup failed; training completion will continue after all ranks leave the "
                     f"cleanup barrier. Error: {exc}"
