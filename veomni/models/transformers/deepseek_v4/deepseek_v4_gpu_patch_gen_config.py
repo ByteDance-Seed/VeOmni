@@ -20,9 +20,9 @@ patchgen veomni.models.transformers.deepseek_v4.deepseek_v4_gpu_patch_gen_config
 Patches:
 1. ``DeepseekV4Indexer.forward`` — optional TileLang Lightning Indexer for
    canonical CUDA prefill/training positions, selected by
-   ``dsa_indexer_backend=tilelang`` with eager cache/decode fallback.
+   ``dsa_indexer_implementation=tilelang`` with eager cache/decode fallback.
 2. ``eager_attention_forward`` — optional TileLang sparse MQA attention,
-   selected by ``dsa_attention_backend=tilelang_sparse``. Converts the
+   selected by ``dsa_attention_implementation=tilelang``. Converts the
    upstream additive sliding/compressor mask into compact indices.
 3. ``DeepseekV4Experts`` — drops upstream ``@use_experts_implementation``
    (which would otherwise dispatch to ``grouped_mm`` and bypass VeOmni's
@@ -30,24 +30,34 @@ Patches:
    ``down_proj [E, H, I]`` layout and the gpt-oss-style ``swiglu_limit``
    clamp. Dispatch is OpSlot-guarded (``veomni_moe_experts_forward``):
    non-eager -> ``fused_moe_forward``; eager -> per-expert loop.
-4. ``DeepseekV4ForCausalLM.forward`` — OpSlot guard for fused
+4. ``DeepseekV4RMSNorm`` / ``DeepseekV4UnweightedRMSNorm`` — functional
+   OpSlot dispatch to Liger RMSNorm while preserving the two distinct class
+   layouts. The unweighted form passes ``weight=None`` to Liger's supported
+   non-affine path; eager keeps the official weighted FP32 multiply order.
+5. ``DeepseekV4MLP.forward`` — shared experts always apply the official
+   ``swiglu_limit`` clamp, then optionally fuse silu*mul via Liger when the
+   SwiGLU OpSlot is non-eager. Routed experts remain on the fused-MoE path
+   above so their clamp is kept there too.
+6. ``DeepseekV4ForCausalLM.forward`` — OpSlot guard for fused
    cross-entropy (``veomni_causal_lm_loss``) + ``MoeCausalLMOutputWithLogProbs``
    so callers can read per-token log-probs / entropy alongside the loss.
-5. Register ``get_parallel_plan`` on ``DeepseekV4ForCausalLM``.
+7. ``DeepseekV4RotaryEmbedding.forward`` — retains FP32 cos/sin tables for
+   official-compatible inference and casts them to the activation dtype during
+   training so FSDP activation-checkpoint recomputation sees stable metadata.
+8. ``DeepseekV4HyperConnections.pre`` / ``DeepseekV4HyperConnections.post`` /
+   ``DeepseekV4HyperConnections.head`` — optional TileKernels mHC dispatch
+   selected by ``mhc_implementation=tilelang``.
+9. ``DeepseekV4Attention.forward`` — matches the official BF16 per-head Q
+   normalization before RoPE.
+10. ``DeepseekV4TopKRouter.forward`` / ``DeepseekV4HashRouter.forward`` —
+   always perform the official FP32 router projection.
+11. Register ``get_parallel_plan`` on ``DeepseekV4ForCausalLM``.
 
 Intentionally NOT patched:
 
-- ``DeepseekV4RMSNorm`` / ``DeepseekV4UnweightedRMSNorm`` — DeepSeek-V4 ships
-  two RMSNorm flavours (the second is unweighted and used inside the
-  HCA/CSA compressors). LigerRMSNorm replaces only the standard form, and a
-  blind swap would shadow the unweighted variant. RoPE-determinism /
-  batch-invariant RMSNorm are wired separately at runtime by future
-  ``device_patch.py`` infra (mirroring DeepseekV3) when needed.
-- ``DeepseekV4MLP`` — also used as ``shared_experts`` with a custom
-  ``moe_intermediate_size`` (via ``attribute_map["intermediate_size"] =
-  "moe_intermediate_size"``). ``LigerSwiGLUMLP.__init__`` rejects the
-  ``intermediate_size`` kwarg pattern that DeepSeek-V4 uses, so swapping
-  would break shared-expert construction. Same reasoning as DeepseekV3.
+- Class-level ``LigerSwiGLUMLP`` / ``LigerRMSNorm`` replacement — keep the
+  native V4 constructors (unweighted norm layout and shared-expert
+  ``moe_intermediate_size`` mapping) and only swap arithmetic through OpSlots.
 - ``apply_rotary_pos_emb`` — DeepSeek-V4 uses a *partial* RoPE (the
   trailing ``qk_rope_head_dim`` slice only, with the leading nope channels
   untouched) plus an interleaved ``repeat_interleave(2)`` cos/sin layout
@@ -111,13 +121,16 @@ from veomni.utils.model_outputs import MoeCausalLMOutputWithLogProbs
 # runtime slots used by the generated modeling are bound at model-build
 # time by ``_bind_veomni_ops()`` in ``veomni/models/auto.py``.
 veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
+veomni_rms_norm = OpSlot("rms_norm", "standard")
+veomni_unweighted_rms_norm = OpSlot("rms_norm", "unweighted")
+veomni_swiglu_mlp = OpSlot("swiglu_mlp", "standard")
 veomni_moe_experts_forward = OpSlot("moe_experts", "standard")
 veomni_load_balancing_loss = OpSlot("load_balancing_loss", "standard")
 veomni_mhc_pre = OpSlot("mhc", "pre")
 veomni_mhc_post = OpSlot("mhc", "post")
 veomni_mhc_head = OpSlot("mhc", "head")
-veomni_dsa_indexer_backend = OpsConfigSlot("dsa_indexer_backend")
-veomni_dsa_attention_backend = OpsConfigSlot("dsa_attention_backend")
+veomni_dsa_indexer_implementation = OpsConfigSlot("dsa_indexer_implementation")
+veomni_dsa_attention_implementation = OpsConfigSlot("dsa_attention_implementation")
 
 
 config = PatchConfig(
@@ -158,15 +171,69 @@ config.add_post_import_block(
     """
     from veomni.ops.dispatch import OpSlot, OpsConfigSlot
     veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
+    veomni_rms_norm = OpSlot("rms_norm", "standard")
+    veomni_unweighted_rms_norm = OpSlot("rms_norm", "unweighted")
+    veomni_swiglu_mlp = OpSlot("swiglu_mlp", "standard")
     veomni_moe_experts_forward = OpSlot("moe_experts", "standard")
     veomni_load_balancing_loss = OpSlot("load_balancing_loss", "standard")
     veomni_mhc_pre = OpSlot("mhc", "pre")
     veomni_mhc_post = OpSlot("mhc", "post")
     veomni_mhc_head = OpSlot("mhc", "head")
-    veomni_dsa_indexer_backend = OpsConfigSlot("dsa_indexer_backend")
-    veomni_dsa_attention_backend = OpsConfigSlot("dsa_attention_backend")
+    veomni_dsa_indexer_implementation = OpsConfigSlot("dsa_indexer_implementation")
+    veomni_dsa_attention_implementation = OpsConfigSlot("dsa_attention_implementation")
     """
 )
+
+
+# ================================================================
+# Patch: DeepSeek V4 RMSNorm dispatch
+# ================================================================
+@config.override_method(
+    "DeepseekV4RMSNorm.forward",
+    description="OpSlot guard for Liger fused weighted RMSNorm with official eager FP32 fallback",
+)
+def deepseek_v4_rms_norm_forward_patched(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    if veomni_rms_norm.use_non_eager_impl:
+        return veomni_rms_norm(hidden_states, self.weight, self.variance_epsilon)
+
+    input_dtype = hidden_states.dtype
+    hidden_states = hidden_states.float()
+    variance = hidden_states.square().mean(-1, keepdim=True)
+    hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+    return (self.weight.float() * hidden_states).to(input_dtype)
+
+
+@config.override_method(
+    "DeepseekV4UnweightedRMSNorm.forward",
+    description="OpSlot guard for Liger fused unweighted RMSNorm",
+)
+def deepseek_v4_unweighted_rmsnorm_forward_patched(self, x: torch.Tensor) -> torch.Tensor:
+    if veomni_unweighted_rms_norm.use_non_eager_impl:
+        return veomni_unweighted_rms_norm(x, None, self.eps)
+
+    return x * torch.rsqrt(x.float().square().mean(-1, keepdim=True) + self.eps).to(x.dtype)
+
+
+# ================================================================
+# Patch: official RoPE table precision and checkpoint-stable training dtype
+# ================================================================
+@config.override_method(
+    "DeepseekV4RotaryEmbedding.forward",
+    description="Retain FP32 cos/sin for inference and use activation dtype for checkpoint-stable training",
+)
+def deepseek_v4_rotary_embedding_forward_patched(self, x, position_ids, layer_type=None):
+    inv_freq = getattr(self, f"{layer_type}_inv_freq")
+    attention_scaling = getattr(self, f"{layer_type}_attention_scaling")
+    inv_freq_expanded = inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)
+    position_ids_expanded = position_ids[:, None, :].float()
+    device_type = x.device.type if isinstance(x.device.type, str) and x.device.type != "mps" else "cpu"
+    with maybe_autocast(device_type=device_type, enabled=False):
+        freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
+        cos = freqs.cos() * attention_scaling
+        sin = freqs.sin() * attention_scaling
+    if self.training:
+        return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
+    return cos, sin
 
 
 # ================================================================
@@ -445,7 +512,7 @@ def deepseek_v4_csa_compressor_forward_patched(
 # ================================================================
 # Patch: DeepseekV4Indexer.forward
 # 1. Dispatch CUDA prefill/training index scoring to the TileLang Lightning
-#    Indexer when ``dsa_indexer_backend=tilelang``. Cache/decode and unusual
+#    Indexer when ``dsa_indexer_implementation=tilelang``. Cache/decode and unusual
 #    position layouts retain the upstream eager implementation.
 # ================================================================
 @config.override_method("DeepseekV4Indexer.forward", description="Optional TileLang Lightning Indexer dispatch")
@@ -529,17 +596,18 @@ def deepseek_v4_indexer_forward_patched(
     top_k = min(self.index_topk, compressed_len)
 
     # --- Patch.1 ---
-    indexer_backend = veomni_dsa_indexer_backend.value
-    if indexer_backend not in {"eager", "tilelang"}:
+    indexer_implementation = veomni_dsa_indexer_implementation.value
+    if indexer_implementation not in {"eager", "tilelang"}:
         raise ValueError(
-            f"DeepSeek-V4 does not support dsa_indexer_backend={indexer_backend!r}; expected 'eager' or 'tilelang'"
+            "DeepSeek-V4 does not support "
+            f"dsa_indexer_implementation={indexer_implementation!r}; expected 'eager' or 'tilelang'"
         )
     canonical_positions = torch.arange(seq_len, device=position_ids.device).unsqueeze(0).expand_as(position_ids)
     packed_ranges = None
     if packed_compression_metadata is not None and cache_layer is None:
         packed_ranges = packed_compressed_causal_ranges(packed_compression_metadata[self.compress_rate])
     use_tilelang = (
-        indexer_backend == "tilelang"
+        indexer_implementation == "tilelang"
         and hidden_states.is_cuda
         and q.dtype == torch.bfloat16
         and compressed_kv.dtype == torch.bfloat16
@@ -607,8 +675,9 @@ def deepseek_v4_attention_forward_patched(
     cos, sin = position_embeddings[self.rope_layer_type]
 
     q_residual = self.q_a_norm(self.q_a_proj(hidden_states))
-    q = self.q_b_proj(q_residual).view(*hidden_shape).transpose(1, 2)
-    q = self.q_b_norm(q)
+    q = self.q_b_proj(q_residual).view(*hidden_shape)
+    q = q * torch.rsqrt(q.square().mean(-1, keepdim=True) + self.q_b_norm.eps)
+    q = q.transpose(1, 2)
     q = apply_rotary_pos_emb(q, cos, sin)
 
     kv = self.kv_norm(self.kv_proj(hidden_states)).view(*hidden_shape).transpose(1, 2)
@@ -662,7 +731,7 @@ def deepseek_v4_attention_forward_patched(
 # ================================================================
 # Patch: eager_attention_forward
 # 1. Dispatch DeepSeek-V4 attention to the TileLang sparse MQA kernel when
-#    ``dsa_attention_backend=tilelang_sparse``. The existing additive mask is
+#    ``dsa_attention_implementation=tilelang``. The existing additive mask is
 #    converted to a compact fixed-width index list, preserving sliding-window,
 #    compressor, causal, and invalid-index semantics.
 # 2. Preserve the upstream eager implementation as the default fallback.
@@ -679,14 +748,14 @@ def deepseek_v4_eager_attention_forward_patched(
     **kwargs,
 ):
     # --- Patch.1 ---
-    attention_backend = veomni_dsa_attention_backend.value
-    if attention_backend not in {"eager", "tilelang_sparse"}:
+    attention_implementation = veomni_dsa_attention_implementation.value
+    if attention_implementation not in {"eager", "tilelang"}:
         raise ValueError(
-            f"DeepSeek-V4 does not support dsa_attention_backend={attention_backend!r}; "
-            "expected 'eager' or 'tilelang_sparse'"
+            "DeepSeek-V4 does not support "
+            f"dsa_attention_implementation={attention_implementation!r}; expected 'eager' or 'tilelang'"
         )
     use_tilelang = (
-        attention_backend == "tilelang_sparse"
+        attention_implementation == "tilelang"
         and query.is_cuda
         and query.dtype == torch.bfloat16
         and key.dtype == torch.bfloat16
@@ -745,10 +814,11 @@ def deepseek_v4_eager_attention_forward_patched(
 # ================================================================
 # Patch: DeepseekV4Model.forward
 # 1. Convert collator-provided cu-seqlens into reusable packed slices once.
+# 2. Keep use_cache=False forwards stateless so the TileLang indexer can run.
 # ================================================================
 @config.override_method(
     "DeepseekV4Model.forward",
-    description="Propagate packed sequence boundaries to compressed attention",
+    description="Propagate packed boundaries and preserve stateless indexer dispatch",
 )
 def deepseek_v4_model_forward_patched(
     self,
@@ -762,13 +832,17 @@ def deepseek_v4_model_forward_patched(
 ) -> MoeModelOutputWithPast:
     if (input_ids is None) ^ (inputs_embeds is not None):
         raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
-    return_cache = past_key_values if use_cache else None
-    if past_key_values is None:
+    # Stateless prefill/training must keep the cache absent: the TileLang
+    # Lightning Indexer dispatch is intentionally cache-free, and creating a
+    # DynamicCache here would silently force its eager decode fallback even
+    # when use_cache=False.
+    if past_key_values is None and use_cache:
         past_key_values = DynamicCache(config=self.config)
+    return_cache = past_key_values if use_cache else None
     if inputs_embeds is None:
         inputs_embeds = self.embed_tokens(input_ids)
     if position_ids is None:
-        past_seen = past_key_values.get_seq_length()
+        past_seen = past_key_values.get_seq_length() if past_key_values is not None else 0
         position_ids = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device) + past_seen
         position_ids = position_ids.unsqueeze(0)
 
@@ -912,6 +986,80 @@ class PatchedDeepseekV4Experts(nn.Module):
         up = up.clamp(min=-self.limit, max=self.limit)
         return self.act_fn(gate) * up
         # --- Patch.3 ---
+
+
+# ================================================================
+# Patch: DeepseekV4MLP.forward
+# Shared experts can use functional Liger SwiGLU via OpSlot. Keep the class
+# because its V4-specific intermediate-size mapping is incompatible with
+# LigerSwiGLUMLP construction. Eager fallback retains official FP32 clamp.
+# ================================================================
+@config.override_method(
+    "DeepseekV4MLP.forward",
+    description="Clamp-aware shared-expert SwiGLU with optional Liger fused silu-mul",
+)
+def deepseek_v4_mlp_forward_patched(self, x: torch.Tensor) -> torch.Tensor:
+    # Official DeepSeek-V4 shared experts clamp gate/up before silu*mul. Apply
+    # that first, then optionally fuse only the silu*mul via Liger. The generic
+    # ``veomni_swiglu_mlp(self, x)`` path re-runs projections without clamp and
+    # would change arithmetic under the default ``swiglu_limit``.
+    dtype = x.dtype
+    gate = self.gate_proj(x).float().clamp(max=self.config.swiglu_limit)
+    up = (
+        self.up_proj(x)
+        .float()
+        .clamp(
+            min=-self.config.swiglu_limit,
+            max=self.config.swiglu_limit,
+        )
+    )
+    if veomni_swiglu_mlp.use_non_eager_impl:
+        from liger_kernel.ops.swiglu import LigerSiLUMulFunction
+
+        return self.down_proj(LigerSiLUMulFunction.apply(gate.to(dtype), up.to(dtype)))
+
+    hidden_states = self.act_fn(gate) * up
+    return self.down_proj(hidden_states.to(dtype))
+
+
+@config.override_method(
+    "DeepseekV4TopKRouter.forward",
+    description="Match the official DeepSeek-V4 FP32 router projection",
+)
+def deepseek_v4_topk_router_forward_patched(
+    self,
+    hidden_states: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    flat = hidden_states.reshape(-1, self.hidden_dim)
+    device_type = flat.device.type if isinstance(flat.device.type, str) and flat.device.type != "mps" else "cpu"
+    with maybe_autocast(device_type=device_type, enabled=False):
+        logits = F.linear(flat.float(), self.weight.float())
+    correction_bias = self.e_score_correction_bias.float()
+    scores = self.score_fn(logits)
+    indices = torch.topk(scores + correction_bias, self.top_k, dim=-1, sorted=False).indices
+    weights = scores.gather(1, indices)
+    weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-20)
+    return logits, weights * self.routed_scaling_factor, indices
+
+
+@config.override_method(
+    "DeepseekV4HashRouter.forward",
+    description="Match the official DeepSeek-V4 FP32 hash-router projection",
+)
+def deepseek_v4_hash_router_forward_patched(
+    self,
+    hidden_states: torch.Tensor,
+    input_ids: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    flat = hidden_states.reshape(-1, self.hidden_dim)
+    device_type = flat.device.type if isinstance(flat.device.type, str) and flat.device.type != "mps" else "cpu"
+    with maybe_autocast(device_type=device_type, enabled=False):
+        logits = F.linear(flat.float(), self.weight.float())
+    scores = self.score_fn(logits)
+    indices = self.tid2eid[input_ids.reshape(-1)].long()
+    weights = scores.gather(1, indices)
+    weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-20)
+    return logits, weights * self.routed_scaling_factor, indices
 
 
 # ================================================================

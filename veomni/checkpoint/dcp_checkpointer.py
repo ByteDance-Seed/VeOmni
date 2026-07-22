@@ -642,18 +642,7 @@ class DistributedCheckpointer(CheckpointerBase):
 
 def get_dtype_size(dtype: torch.dtype) -> int:
     """Return size in bytes for a given dtype."""
-    size_map = {
-        torch.float32: 4,
-        torch.float16: 2,
-        torch.bfloat16: 2,
-        torch.int64: 8,
-        torch.int32: 4,
-        torch.int16: 2,
-        torch.int8: 1,
-        torch.uint8: 1,
-        torch.bool: 1,
-    }
-    return size_map.get(dtype, 4)
+    return torch.empty((), dtype=dtype).element_size()
 
 
 def _normalize_key(key: str) -> Optional[str]:
@@ -721,14 +710,15 @@ def _get_sharding_plan(
         hf_key = _normalize_key(key)
         if hf_key:
             # Determine dtype for size calculation
-            if save_dtype:
+            if not hasattr(tensor_meta.properties, "dtype"):
+                raise ValueError(
+                    f"Cannot determine dtype for tensor '{key}': metadata does not contain dtype information"
+                )
+            source_dtype = tensor_meta.properties.dtype
+            if save_dtype and source_dtype.is_floating_point:
                 dtype = getattr(torch, save_dtype) if isinstance(save_dtype, str) else save_dtype
             else:
-                if not hasattr(tensor_meta.properties, "dtype"):
-                    raise ValueError(
-                        f"Cannot determine dtype for tensor '{key}': metadata does not contain dtype information"
-                    )
-                dtype = tensor_meta.properties.dtype
+                dtype = source_dtype
 
             # Calculate tensor size in bytes
             numel = 1
@@ -812,7 +802,7 @@ def _process_shard(
         if hasattr(tensor, "full_tensor"):
             tensor = tensor.full_tensor()
 
-        if target_dtype:
+        if target_dtype and tensor.is_floating_point():
             tensor = tensor.to(dtype=target_dtype)
 
         # Explicitly move to CPU and detach to avoid memory retention

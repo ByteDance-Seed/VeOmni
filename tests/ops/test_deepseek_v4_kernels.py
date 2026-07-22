@@ -14,6 +14,7 @@
 
 import importlib
 import sys
+import types
 from types import SimpleNamespace
 
 import pytest
@@ -268,9 +269,9 @@ def test_deepseek_v4_generated_attention_dispatch_matches_eager():
     )
 
     try:
-        modeling.veomni_dsa_attention_backend.bind(SimpleNamespace(dsa_attention_backend="eager"))
+        modeling.veomni_dsa_attention_implementation.bind(SimpleNamespace(dsa_attention_implementation="eager"))
         expected, _ = modeling.eager_attention_forward(module, query, key, key, causal_mask, dim**-0.5, dropout=0.0)
-        modeling.veomni_dsa_attention_backend.bind(SimpleNamespace(dsa_attention_backend="tilelang_sparse"))
+        modeling.veomni_dsa_attention_implementation.bind(SimpleNamespace(dsa_attention_implementation="tilelang"))
         actual, weights = modeling.eager_attention_forward(
             module, query, key, key, causal_mask, dim**-0.5, dropout=0.0
         )
@@ -284,7 +285,7 @@ def test_deepseek_v4_generated_attention_dispatch_matches_eager():
         assert fp32_weights is not None
         assert fp32_output.dtype == torch.float32
     finally:
-        modeling.veomni_dsa_attention_backend.bind(SimpleNamespace(dsa_attention_backend="eager"))
+        modeling.veomni_dsa_attention_implementation.bind(SimpleNamespace(dsa_attention_implementation="eager"))
 
 
 def test_deepseek_v4_generated_indexer_dispatch_and_position_fallback(monkeypatch):
@@ -311,7 +312,7 @@ def test_deepseek_v4_generated_indexer_dispatch_and_position_fallback(monkeypatc
 
     monkeypatch.setattr(modeling, "v4_lighting_indexer", fake_tilelang)
     try:
-        modeling.veomni_dsa_indexer_backend.bind(SimpleNamespace(dsa_indexer_backend="tilelang"))
+        modeling.veomni_dsa_indexer_implementation.bind(SimpleNamespace(dsa_indexer_implementation="tilelang"))
         tilelang_indices = indexer(hidden_states, q_residual, canonical_positions, None, 0)
         assert calls
         expected_topk = seq_len // config.compress_rates["compressed_sparse_attention"]
@@ -349,7 +350,61 @@ def test_deepseek_v4_generated_indexer_dispatch_and_position_fallback(monkeypatc
         assert len(calls) == 2
         assert eager_indices.shape == tilelang_indices.shape
     finally:
-        modeling.veomni_dsa_indexer_backend.bind(SimpleNamespace(dsa_indexer_backend="eager"))
+        modeling.veomni_dsa_indexer_implementation.bind(SimpleNamespace(dsa_indexer_implementation="eager"))
+
+
+def test_deepseek_v4_stateless_forward_does_not_create_decode_cache():
+    from transformers import AutoConfig
+    from transformers.cache_utils import DynamicCache
+
+    from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling
+
+    config = AutoConfig.from_pretrained("tests/toy_config/deepseek_v4_toy")
+    model = modeling.DeepseekV4Model(config)
+    seen_caches = []
+
+    for layer in model.layers:
+
+        def passthrough(self, hidden_states, past_key_values=None, **kwargs):
+            seen_caches.append(past_key_values)
+            return hidden_states
+
+        layer.forward = types.MethodType(passthrough, layer)
+
+    input_ids = torch.arange(8).unsqueeze(0)
+    model(input_ids=input_ids, use_cache=False)
+    assert seen_caches and all(cache is None for cache in seen_caches)
+
+    seen_caches.clear()
+    output = model(input_ids=input_ids, use_cache=True)
+    assert seen_caches and all(isinstance(cache, DynamicCache) for cache in seen_caches)
+    assert isinstance(output.past_key_values, DynamicCache)
+
+
+def test_deepseek_v4_stateless_model_reaches_tilelang_indexer(monkeypatch):
+    _require_tilelang_cuda()
+    from transformers import AutoConfig
+
+    from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling
+
+    config = AutoConfig.from_pretrained("tests/toy_config/deepseek_v4_toy")
+    config._attn_implementation = "eager"
+    model = modeling.DeepseekV4Model(config).to(device=DEVICE, dtype=torch.bfloat16).eval()
+    calls = []
+
+    def fake_tilelang(q, k, weights, compress_ratio, topk, *args, **kwargs):
+        calls.append((q.shape, k.shape, weights.shape, compress_ratio, topk))
+        indices = torch.zeros(q.shape[1], q.shape[0], topk, device=DEVICE, dtype=torch.int32)
+        return torch.zeros_like(indices, dtype=torch.float32), indices
+
+    monkeypatch.setattr(modeling, "v4_lighting_indexer", fake_tilelang)
+    try:
+        modeling.veomni_dsa_indexer_implementation.bind(SimpleNamespace(dsa_indexer_implementation="tilelang"))
+        with torch.no_grad():
+            model(input_ids=torch.arange(8, device=DEVICE).unsqueeze(0), use_cache=False)
+        assert calls
+    finally:
+        modeling.veomni_dsa_indexer_implementation.bind(SimpleNamespace(dsa_indexer_implementation="eager"))
 
 
 def test_deepseek_v4_packed_compressors_match_independent_sequences():
@@ -374,7 +429,7 @@ def test_deepseek_v4_packed_compressors_match_independent_sequences():
         block_bias_rates=(config.compress_rates["heavily_compressed_attention"],),
     )
 
-    modeling.veomni_dsa_indexer_backend.bind(SimpleNamespace(dsa_indexer_backend="eager"))
+    modeling.veomni_dsa_indexer_implementation.bind(SimpleNamespace(dsa_indexer_implementation="eager"))
     for compressor_cls in (modeling.DeepseekV4HCACompressor, modeling.DeepseekV4CSACompressor):
         compressor = compressor_cls(config)
         # Compressors allocate ``position_bias`` with ``torch.empty``; the full

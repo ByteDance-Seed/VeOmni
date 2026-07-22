@@ -50,9 +50,9 @@ _deepseek_v4_tilelang_skip = pytest.mark.skipif(
 
 _DEEPSEEK_V4_TILELANG_TRAINING_ARGS = [
     "--train.dyn_bsz=True",
-    "--model.ops_implementation.dsa_indexer_backend=tilelang",
-    "--model.ops_implementation.dsa_attention_backend=tilelang_sparse",
-    "--model.ops_implementation.mhc_backend=tile_kernels",
+    "--model.ops_implementation.dsa_indexer_implementation=tilelang",
+    "--model.ops_implementation.dsa_attention_implementation=tilelang",
+    "--model.ops_implementation.mhc_implementation=tilelang",
 ]
 _QWEN3_VL_CHUNK_MBS_TRAINING_ARGS = [
     "--train.chunk_mbs_config.enable=True",

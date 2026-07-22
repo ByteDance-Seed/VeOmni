@@ -54,3 +54,17 @@ images:
     uv_extra_flags:
       - "--allow-insecure-host github.com"
       - "--allow-insecure-host pythonhosted.org"
+
+  - name: ascend_9.0.0_a2.x86
+    output: docker/ascend/Dockerfile.ascend_9.0.0_a2.x86
+    template: ascend.Dockerfile.j2
+    base_image: "swr.cn-south-1.myhuaweicloud.com/ascendhub/cann:9.0.0-910b-ubuntu22.04-py3.11"
+    python_dist_packages: "/usr/local/python3.11.15/lib/python3.11/site-packages/"
+    header_comments:
+      - "docker hub: https://hub.docker.com/layers/ascendai/cann/9.0.0-910b-ubuntu22.04-py3.11/images/sha256-latest"
+      - "cann web: https://www.hiascend.com/developer/ascendhub/detail/17da20d1c2b6493cb38765adeba85884"
+      - "git repo: https://gitcode.com/Ascend/pytorch"
+    uv_extras_preset: ascend_x86
+    uv_extra_flags:
+      - "--allow-insecure-host github.com"
+      - "--allow-insecure-host pythonhosted.org"

@@ -534,17 +534,22 @@ def build_parallelize_model(
     if mixed_precision.enable:  # upcast to float32 before feed it to optimizer
         model = model.float()
 
+    checkpoint_early_stop = kwargs.pop("early_stop", True)
     if enable_gradient_checkpointing and hasattr(model, "gradient_checkpointing_enable"):
         logger.info_rank0("Enable gradient checkpointing.")
         use_reentrant = kwargs.pop("enable_reentrant", False)
         if use_reentrant:
             torch.utils.checkpoint.CheckpointFunction = CheckpointFunction
 
+        gradient_checkpointing_kwargs = {
+            "use_reentrant": use_reentrant,
+            "context_fn": kwargs.pop("recompute_context_fn", noop_context_fn),
+        }
+        if not use_reentrant:
+            gradient_checkpointing_kwargs["early_stop"] = checkpoint_early_stop
+
         model.gradient_checkpointing_enable(
-            gradient_checkpointing_kwargs={
-                "use_reentrant": use_reentrant,
-                "context_fn": kwargs.pop("recompute_context_fn", noop_context_fn),
-            },
+            gradient_checkpointing_kwargs=gradient_checkpointing_kwargs,
         )
 
     if chunk_mbs_config is not None and chunk_mbs_config.enable:

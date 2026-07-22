@@ -114,11 +114,13 @@ class TestGetModelSaveState(unittest.TestCase):
             "fp32": torch.randn(4, 4, dtype=torch.float32),
             "bf16": torch.randn(4, 4, dtype=torch.bfloat16),
             "fp16": torch.randn(4, 4, dtype=torch.float16),
+            "int64": torch.randint(0, 8, (4, 4), dtype=torch.int64),
         }
         result = _call_get_model_save_state(self.model, None, fake)
         self.assertEqual(result["fp32"].dtype, torch.bfloat16)
         self.assertEqual(result["bf16"].dtype, torch.bfloat16)
         self.assertEqual(result["fp16"].dtype, torch.float16)
+        self.assertEqual(result["int64"].dtype, torch.int64)
 
     def test_tied_weight_filtered_out(self):
         fake = {
@@ -209,7 +211,11 @@ class TestSaveHfSafetensorDistributed(unittest.TestCase):
         self.assertEqual(writer_cls.call_args.kwargs["fqn_to_index_mapping"], mapping)
 
     def test_save_state_passed_to_dcp_save(self):
-        fake = {"w": torch.randn(4, 4, dtype=torch.bfloat16)}
+        fake = {
+            "weight": torch.randn(4, 4, dtype=torch.bfloat16),
+            "int64_buffer": torch.randint(0, 8, (4, 4), dtype=torch.int64),
+            "bool_buffer": torch.tensor([True, False]),
+        }
         _, _, dcp_save, _ = _call_save_distributed(
             self.model,
             "/tmp/test",
@@ -218,7 +224,67 @@ class TestSaveHfSafetensorDistributed(unittest.TestCase):
             fake,
         )
         dcp_save.assert_called_once()
-        self.assertEqual(set(dcp_save.call_args.kwargs["state_dict"]), {"w"})
+        saved_state = dcp_save.call_args.kwargs["state_dict"]
+        self.assertEqual(set(saved_state), {"weight", "int64_buffer", "bool_buffer"})
+        self.assertEqual(saved_state["int64_buffer"].dtype, torch.int64)
+
+        import json
+        import tempfile
+        from pathlib import Path
+
+        import torch.distributed.checkpoint as dcp
+        from safetensors.torch import load_file
+        from torch.distributed.checkpoint import HuggingFaceStorageWriter
+        from torch.distributed.checkpoint._hf_utils import CUSTOM_METADATA_KEY
+
+        from veomni.checkpoint.dcp_consolidation import apply_dcp_consolidation_patch
+
+        apply_dcp_consolidation_patch()
+        with tempfile.TemporaryDirectory() as output_dir:
+            storage_writer = HuggingFaceStorageWriter(
+                path=output_dir,
+                save_distributed=True,
+                enable_consolidation=True,
+                fqn_to_index_mapping=dict.fromkeys(fake, 1),
+            )
+            dcp.save(fake, storage_writer=storage_writer)
+
+            consolidated_files = list(Path(output_dir).glob("*.safetensors"))
+            self.assertEqual(len(consolidated_files), 1)
+            loaded_state = load_file(consolidated_files[0])
+
+        torch.testing.assert_close(loaded_state["int64_buffer"], fake["int64_buffer"])
+        torch.testing.assert_close(loaded_state["bool_buffer"], fake["bool_buffer"])
+
+        import torch.distributed.checkpoint._consolidate_hf_safetensors as hf_module
+
+        input_files_data = {
+            "shard_0": hf_module._InputFileData(
+                metadata={
+                    "int64_buffer": {hf_module.SHAPE_KEY: [2, 4], hf_module.DTYPE_KEY: "I64"},
+                    hf_module.DEFAULT_EXTRA_METADATA_KEY: {
+                        CUSTOM_METADATA_KEY: json.dumps({"int64_buffer": {hf_module.SAVED_OFFSETS_KEY: [0, 0]}})
+                    },
+                }
+            ),
+            "shard_1": hf_module._InputFileData(
+                metadata={
+                    "int64_buffer": {hf_module.SHAPE_KEY: [2, 4], hf_module.DTYPE_KEY: "I64"},
+                    hf_module.DEFAULT_EXTRA_METADATA_KEY: {
+                        CUSTOM_METADATA_KEY: json.dumps({"int64_buffer": {hf_module.SAVED_OFFSETS_KEY: [2, 0]}})
+                    },
+                }
+            ),
+        }
+        output_files_data = {
+            "model.safetensors": hf_module._OutputFileData(fqn_data={"int64_buffer": hf_module._FqnData()})
+        }
+
+        hf_module._parse_input_metadata(input_files_data, output_files_data)
+
+        int64_buffer_data = output_files_data["model.safetensors"].fqn_data["int64_buffer"]
+        self.assertEqual(int64_buffer_data.shape_in_file, [4, 4])
+        self.assertEqual(int64_buffer_data.dtype_size, torch.empty((), dtype=torch.int64).element_size())
 
     def test_model_assets_saved(self):
         fake = {"w": torch.randn(2, 2, dtype=torch.bfloat16)}
