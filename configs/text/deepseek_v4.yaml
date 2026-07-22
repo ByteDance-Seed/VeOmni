@@ -23,6 +23,8 @@ data:
 train:
   dyn_bsz: false
   accelerator:
+    # DeepSeek-V4 SP: Ulysses on Q heads + sequence all-gather for MQA/compressors.
+    # Requires num_attention_heads % ulysses_size == 0.
     ulysses_size: 1
     ep_size: 1
     fsdp_config:
