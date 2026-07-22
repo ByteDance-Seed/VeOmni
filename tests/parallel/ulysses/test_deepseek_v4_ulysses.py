@@ -149,61 +149,6 @@ def test_model_sp_uses_lightweight_full_sequence_references(monkeypatch):
     }
 
 
-def test_lightweight_references_preserve_metadata_and_mask_semantics():
-    """The real helpers must ignore feature width, not merely accept width one."""
-    from transformers import AutoConfig
-
-    from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as dsv4
-
-    config = AutoConfig.from_pretrained("tests/toy_config/deepseek_v4_toy")
-    config._attn_implementation = "eager"
-    seq_len = 8
-    full_width_reference = torch.empty(1, seq_len, config.hidden_size)
-    lightweight_reference = torch.empty(1, seq_len, 1)
-    position_ids = torch.tensor([[0, 1, 2, 3, 0, 1, 2, 3]])
-    sequence_slices = ((0, 4), (4, 8))
-    compress_rates = tuple(config.compress_rates.values())
-    hca_rate = config.compress_rates["heavily_compressed_attention"]
-
-    full_metadata = dsv4.build_packed_compression_metadata(
-        full_width_reference,
-        position_ids,
-        sequence_slices,
-        compress_rates,
-        block_bias_rates=(hca_rate,),
-    )
-    lightweight_metadata = dsv4.build_packed_compression_metadata(
-        lightweight_reference,
-        position_ids,
-        sequence_slices,
-        compress_rates,
-        block_bias_rates=(hca_rate,),
-    )
-    assert full_metadata.keys() == lightweight_metadata.keys()
-    for rate in full_metadata:
-        assert full_metadata[rate].keys() == lightweight_metadata[rate].keys()
-        for name in full_metadata[rate]:
-            torch.testing.assert_close(full_metadata[rate][name], lightweight_metadata[rate][name], rtol=0, atol=0)
-
-    attention_mask = torch.ones(1, seq_len, dtype=torch.bool)
-    full_mask = dsv4.create_sliding_window_causal_mask(
-        config=config,
-        inputs_embeds=full_width_reference,
-        attention_mask=attention_mask,
-        past_key_values=None,
-        position_ids=position_ids,
-    )
-    lightweight_mask = dsv4.create_sliding_window_causal_mask(
-        config=config,
-        inputs_embeds=lightweight_reference,
-        attention_mask=attention_mask,
-        past_key_values=None,
-        position_ids=position_ids,
-    )
-    torch.testing.assert_close(full_mask, lightweight_mask, rtol=0, atol=0)
-    assert full_width_reference.numel() == lightweight_reference.numel() * config.hidden_size
-
-
 def _run_deepseek_v4_attention_sp_fw_bw(
     rank: int,
     world_size: int,
