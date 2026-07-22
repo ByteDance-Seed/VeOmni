@@ -39,7 +39,7 @@ from ..utils.device import (
     get_device_type,
     synchronize,
 )
-from .base import BaseTrainer, VeOmniIter
+from .base import BaseTrainer
 
 
 logger = helper.create_logger(__name__)
@@ -562,10 +562,7 @@ class DiTTrainer:
             self.on_epoch_begin()
 
             if self.base.train_dataloader is not None:
-                self.base.data_iterator = VeOmniIter(
-                    self.base.train_dataloader,
-                    use_background_prefetcher=args.data.dataloader.use_background_prefetcher,
-                )
+                self.base.data_iterator = self.base.build_data_iterator()
             else:
                 self.base.data_iterator = None
 
