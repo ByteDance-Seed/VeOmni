@@ -27,6 +27,7 @@ from veomni.models import save_model_assets, save_model_weights
 from veomni.models.seed_omni import SeedOmniModel, build_omni_model, build_omni_processor
 from veomni.optim import build_lr_scheduler, build_optimizer
 from veomni.utils import helper
+from veomni.utils.checkpoint_utils import should_skip_hf_weight_load
 from veomni.utils.device import get_device_type, get_torch_device, synchronize
 from veomni.utils.dist_utils import all_reduce
 from veomni.utils.model_utils import pretty_print_trainable_parameters
@@ -250,6 +251,16 @@ def main():
     if hasattr(model, "get_parallel_plan"):
         cpu_load_param_name = getattr(model.get_parallel_plan(), "cpu_load_param_name", None)
 
+    skip_hf_weight_load = should_skip_hf_weight_load(
+        args.train.checkpoint.load_path,
+        getattr(args.model, "lora_config", None),
+    )
+    if skip_hf_weight_load:
+        logger.info_rank0(
+            f"Checkpoint resume path set ({args.train.checkpoint.load_path}); "
+            f"will skip HF weight load from {args.model.model_path}."
+        )
+
     model = build_parallelize_model(
         model,
         weights_path=args.model.model_path,
@@ -264,6 +275,7 @@ def main():
         broadcast_model_weights_from_rank0=args.train.broadcast_model_weights_from_rank0,
         cpu_load_param_name=cpu_load_param_name,
         max_load_broadcast_size=args.train.accelerator.fsdp_config.max_load_broadcast_size,
+        should_skip_hf_weight_load=skip_hf_weight_load,
     )
     optimizer = build_optimizer(
         model,

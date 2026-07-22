@@ -105,6 +105,11 @@ class CheckpointerCallback(Callback):
             # If resume at the end of epoch, clear resume state and prefetch data
             iter(self.trainer.train_dataloader)
 
+        # Free transient buffers from DCP materialization before the first train step.
+        # Large MoE resumes are often near GPU capacity; leftover allocator fragments
+        # after load can OOM the first NCCL collective (e.g. grad-norm all-reduce).
+        helper.empty_cache()
+
         dist.barrier()
         logger.info_rank0(f"Load distributed checkpoint from {args.train.checkpoint.load_path} successfully!")
 

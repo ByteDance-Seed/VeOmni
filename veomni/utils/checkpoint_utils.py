@@ -14,6 +14,7 @@
 
 
 import os
+from typing import Any, Optional
 
 import torch.distributed as dist
 
@@ -29,6 +30,11 @@ from .logging import get_logger
 logger = get_logger(__name__)
 
 _GLOBAL_STEP_PREFIX = "global_step_"
+
+
+def should_skip_hf_weight_load(load_path: Optional[str], lora_config: Any) -> bool:
+    """Return whether a full non-LoRA resume can skip initial HF weight loading."""
+    return load_path is not None and not bool(lora_config)
 
 
 def _validate_dcp_checkpoint_entry(checkpoints_dir: str, entry: str):
