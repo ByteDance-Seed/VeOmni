@@ -1312,11 +1312,16 @@ class ChannelLossCallback(Callback):
         name_counts: dict[str, int] = defaultdict(int)
         for name in base_names.values():
             name_counts[name] += 1
+        qualified_names = {
+            source_id: f"{_stable_source_metric_fragment(source_id)}__{base_names[source_id]}"
+            for source_id in base_names
+        }
+        qualified_values = set(qualified_names.values())
         return {
             source_id: (
                 base_names[source_id]
-                if name_counts[base_names[source_id]] == 1
-                else f"{_stable_source_metric_fragment(source_id)}__{base_names[source_id]}"
+                if name_counts[base_names[source_id]] == 1 and base_names[source_id] not in qualified_values
+                else qualified_names[source_id]
             )
             for source_id in totals
         }

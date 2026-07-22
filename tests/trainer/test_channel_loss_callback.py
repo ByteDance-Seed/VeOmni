@@ -1431,6 +1431,22 @@ def test_channel_loss_data_metric_name_collisions_remain_distinct():
     assert metrics["samples/source-i-2__train_a"] == 1.0
 
 
+def test_channel_loss_data_metric_names_avoid_short_qualified_cross_collision():
+    cfg = ChannelLossConfig(enable=True)
+    trainer = SimpleNamespace(args=SimpleNamespace(train=SimpleNamespace(channel_loss=cfg)), environ_meter=None)
+    callback = ChannelLossCallback(trainer)
+
+    metrics = callback._build_data_metrics(
+        {0: (1, 3, 2), 1: (2, 8, 6), 2: (3, 15, 12)},
+        {0: "foo", 1: "foo", 2: "source-i-0__foo"},
+    )
+
+    assert metrics["samples/source-i-0__foo"] == 1.0
+    assert metrics["samples/source-i-1__foo"] == 2.0
+    assert metrics["samples/source-i-2__source-i-0__foo"] == 3.0
+    assert len([key for key in metrics if key.startswith("samples/")]) == 3
+
+
 def test_channel_loss_data_metric_collision_registry_persists_across_steps():
     cfg = ChannelLossConfig(enable=True)
     trainer = SimpleNamespace(args=SimpleNamespace(train=SimpleNamespace(channel_loss=cfg)), environ_meter=None)

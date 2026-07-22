@@ -365,6 +365,18 @@ their preference pair's source metadata. If distinct source names sanitize to
 the same metric key, the stable source-ID prefix keeps their time series
 distinct from the first emission.
 
+When W&B is enabled, rank 0 also publishes one final `channel_overview` HTML
+snapshot. It combines every source on one shared-axis loss chart with a
+raw/weighted toggle, shows the observed label-token mix as a 100% stacked
+chart, and provides a step-selectable sample/token summary table. Native scalar
+metrics remain the live, machine-readable contract throughout training. The
+dashboard contains aggregate metrics only; optional dataloader adapters may call
+`trainer.set_channel_loss_trace_step_id(...)` once per step with an opaque ID,
+but sample content and physical locators remain in adapter-owned artifacts. Set
+`VEOMNI_CHANNEL_DASHBOARD_MAX_POINTS` to a positive
+integer to bound rendered points (default: 2000; retained history is also
+bounded).
+
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | enable | `bool` | `False` | Enable channel loss logging. |

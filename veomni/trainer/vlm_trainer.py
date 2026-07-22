@@ -282,6 +282,11 @@ class VLMTrainer:
     def on_step_end(self, loss=None, loss_dict=None, grad_norm=None):
         self.base.on_step_end(loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
 
+    def set_channel_loss_trace_step_id(self, trace_step_id: Any) -> None:
+        """Forward the optional dataloader trace contract to the base trainer."""
+
+        self.base.set_channel_loss_trace_step_id(trace_step_id)
+
     def train_step(
         self,
         data_iterator: Any,
