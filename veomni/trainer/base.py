@@ -779,6 +779,10 @@ class BaseTrainer(Stateful, ABC):
             elif micro_step == num_micro_steps - 1:
                 self.model.set_requires_all_reduce(True)
 
+    def sync_before_train_step(self):
+        if self.args.train.sync_each_train_step:
+            synchronize()
+
     def train_step(
         self,
         data_iterator: Any,
@@ -791,7 +795,7 @@ class BaseTrainer(Stateful, ABC):
         self.on_step_begin(micro_batches=micro_batches)
 
         # Forward and backward for each micro batch
-        synchronize()
+        self.sync_before_train_step()
 
         total_loss = 0.0
         total_loss_dict = defaultdict(int)
