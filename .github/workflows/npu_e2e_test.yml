@@ -132,6 +132,8 @@ jobs:
       - name: Sync dependencies
         run: |
           uv sync --frozen --python 3.11 --extra npu --group dev
+          # Qwen3.5's vendored GDN kernels require the optional Ascend Triton runtime.
+          uv pip install triton-ascend==3.2.1 --extra-index-url=https://triton-ascend.osinfra.cn/pypi/simple
       - name: Check final pip list
         run: |
           uv pip list

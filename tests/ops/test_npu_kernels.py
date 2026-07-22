@@ -28,9 +28,10 @@ import torch
 import torch.nn.functional as F
 
 import veomni.ops  # noqa: F401 — trigger KERNEL_REGISTRY registrations
-from tests.tools import is_npu_arch35
 from veomni.ops.dispatch import OpSlot
 from veomni.utils.device import IS_NPU_AVAILABLE, get_device_type
+
+from ..tools import is_npu_arch35
 
 
 pytestmark = pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="NPU kernels require torch_npu")
