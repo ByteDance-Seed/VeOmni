@@ -147,19 +147,18 @@ def test_flex_attention_rejects_invalid_gqa(query_heads, kv_heads, expected_mess
 
 def test_flex_attention_rejects_unsupported_masks(monkeypatch):
     query = torch.randn(1, 4, 8, 8)
-    block_mask = _causal_block_mask(8, query.device)
     module = _FakeAttentionModule()
 
-    with pytest.raises(TypeError, match="requires a BlockMask"):
-        veomni_attention.flex_attention_forward(
-            module,
-            query,
-            query,
-            query,
-            torch.ones(1, 1, 8, 8, dtype=torch.bool),
-        )
-    with pytest.raises(ValueError, match="must be encoded in the supplied BlockMask"):
-        veomni_attention.flex_attention_forward(module, query, query, query, block_mask, sliding_window=4)
+    for unsupported_mask in (None, torch.ones(1, 1, 8, 8, dtype=torch.bool)):
+        with pytest.raises(TypeError, match="requires a BlockMask"):
+            veomni_attention.flex_attention_forward(
+                module,
+                query,
+                query,
+                query,
+                unsupported_mask,
+                sliding_window=4,
+            )
 
     head_specific_mask = create_block_mask(
         lambda batch_idx, head_idx, query_idx, key_idx: query_idx >= key_idx,
@@ -177,6 +176,42 @@ def test_flex_attention_rejects_unsupported_masks(monkeypatch):
     )
     with pytest.raises(ValueError, match="requires a head-broadcast BlockMask"):
         veomni_attention.flex_attention_forward(module, query, query, query, head_specific_mask)
+
+
+def test_flex_attention_accepts_sliding_window_metadata_with_block_mask(monkeypatch):
+    captured = {}
+
+    def fake_backend(module, query, key, value, attention_mask, **kwargs):
+        captured["attention_mask"] = attention_mask
+        captured["kwargs"] = kwargs
+        return query.transpose(1, 2), None
+
+    monkeypatch.setattr(flex_backend, "_flex_attention_forward", fake_backend)
+    monkeypatch.setattr(flex_backend, "get_parallel_state", lambda: SimpleNamespace(ulysses_enabled=False))
+    query = torch.randn(1, 4, 8, 8)
+    block_mask = create_block_mask(
+        lambda batch_idx, head_idx, query_idx, key_idx: (query_idx >= key_idx) & (query_idx - key_idx < 4),
+        B=None,
+        H=None,
+        Q_LEN=query.shape[2],
+        KV_LEN=query.shape[2],
+        device=query.device,
+        BLOCK_SIZE=128,
+    )
+
+    output, auxiliary = veomni_attention.flex_attention_forward(
+        _FakeAttentionModule(),
+        query,
+        query,
+        query,
+        block_mask,
+        sliding_window=4,
+    )
+
+    assert captured["attention_mask"] is block_mask
+    assert "sliding_window" not in captured["kwargs"]
+    torch.testing.assert_close(output, query.transpose(1, 2))
+    assert auxiliary is None
 
 
 def test_flex_attention_delegates_active_ulysses_to_shared_helpers(monkeypatch):

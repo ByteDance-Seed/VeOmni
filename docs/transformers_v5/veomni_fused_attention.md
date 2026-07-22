@@ -63,9 +63,12 @@ output uses `[batch, sequence, heads, head_dim]`.
 semantics and BlockMask construction; the generic op does not convert a dense
 mask or construct model-specific visibility rules.
 
-Standalone `sliding_window` is rejected because window semantics must be
-encoded in the supplied BlockMask. Dropout and remaining kernel validation are
-delegated to the pinned Transformers/PyTorch FlexAttention adapter.
+Transformers models may pass `sliding_window` metadata alongside a native
+BlockMask whose predicate already encodes the window. The adapter accepts but
+does not use that integer metadata to reconstruct or alter visibility; the
+supplied BlockMask remains the sole mask authority. Calls without a native
+BlockMask are rejected. Dropout and remaining kernel validation are delegated
+to the pinned Transformers/PyTorch FlexAttention adapter.
 
 ## Ulysses sequence parallelism
 

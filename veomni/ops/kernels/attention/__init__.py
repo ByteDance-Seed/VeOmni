@@ -24,7 +24,7 @@ from .flash import (
     flash_attention_forward,
     patch_transformers_hub_kernel_loader_for_veomni,
 )
-from .flex import flex_attention_forward
+from .flex import flex_attention_forward, register_veomni_flex_attention_mask_builder
 
 
 _ATTENTION_FORWARD_DISPATCH: dict[str, Callable] = {
@@ -76,6 +76,7 @@ def fused_attention_forward(
 def apply_veomni_attention_patch():
     """Register VeOmni's fused-attention implementations."""
     patch_transformers_hub_kernel_loader_for_veomni()
+    register_veomni_flex_attention_mask_builder()
     ALL_ATTENTION_FUNCTIONS.register("veomni_flex_attention_with_sp", fused_attention_forward)
     ALL_ATTENTION_FUNCTIONS.register("veomni_flash_attention_2_with_sp", fused_attention_forward)
     ALL_ATTENTION_FUNCTIONS.register("veomni_flash_attention_3_with_sp", fused_attention_forward)

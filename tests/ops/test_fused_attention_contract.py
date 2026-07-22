@@ -18,7 +18,14 @@ from types import SimpleNamespace
 import pytest
 import torch
 from torch import nn
+from torch.nn.attention.flex_attention import BlockMask
+from transformers import PreTrainedConfig
 from transformers.integrations.flex_attention import flex_attention_forward as hf_flex_attention_forward
+from transformers.masking_utils import (
+    ALL_MASK_ATTENTION_FUNCTIONS,
+    create_causal_mask,
+    create_sliding_window_causal_mask,
+)
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
 from veomni.arguments.arguments_types import OpsImplementationConfig
@@ -59,15 +66,43 @@ def test_apply_veomni_attention_patch_registers_custom_facade_names(monkeypatch)
     monkeypatch.setattr(
         veomni_attention,
         "patch_transformers_hub_kernel_loader_for_veomni",
-        lambda: patch_calls.append(True),
+        lambda: patch_calls.append("hub_kernel_loader"),
+    )
+    monkeypatch.setattr(
+        veomni_attention,
+        "register_veomni_flex_attention_mask_builder",
+        lambda: patch_calls.append("flex_mask_builder"),
     )
 
     veomni_attention.apply_veomni_attention_patch()
 
-    assert patch_calls == [True]
+    assert patch_calls == ["hub_kernel_loader", "flex_mask_builder"]
     for implementation in (*_FLASH_IMPLEMENTATIONS, _FLEX_IMPLEMENTATION):
         assert ALL_ATTENTION_FUNCTIONS[implementation] is veomni_attention.fused_attention_forward
     assert ALL_ATTENTION_FUNCTIONS["flex_attention"] is hf_flex_attention_forward
+
+
+def test_register_veomni_flex_attention_mask_builder_reuses_transformers_flex_builder(monkeypatch):
+    mask_mapping = ALL_MASK_ATTENTION_FUNCTIONS._global_mapping
+    monkeypatch.setitem(mask_mapping, _FLEX_IMPLEMENTATION, object())
+
+    veomni_attention.register_veomni_flex_attention_mask_builder()
+    veomni_attention.register_veomni_flex_attention_mask_builder()
+
+    assert ALL_MASK_ATTENTION_FUNCTIONS[_FLEX_IMPLEMENTATION] is ALL_MASK_ATTENTION_FUNCTIONS["flex_attention"]
+
+    config = PreTrainedConfig()
+    config._attn_implementation = _FLEX_IMPLEMENTATION
+    config.sliding_window = 4
+    inputs_embeds = torch.randn(1, 8, 16)
+    position_ids = torch.arange(8).unsqueeze(0)
+
+    causal_mask = create_causal_mask(config, inputs_embeds, None, None, position_ids)
+    sliding_window_mask = create_sliding_window_causal_mask(config, inputs_embeds, None, None, position_ids)
+
+    assert isinstance(causal_mask, BlockMask)
+    assert isinstance(sliding_window_mask, BlockMask)
+    assert causal_mask.shape == sliding_window_mask.shape == (1, 1, 8, 8)
 
 
 @pytest.mark.parametrize("implementation", [*_FLASH_IMPLEMENTATIONS, _FLEX_IMPLEMENTATION])

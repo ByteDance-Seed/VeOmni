@@ -19,6 +19,7 @@ from typing import Callable, Optional
 import torch
 from torch.nn.attention.flex_attention import BlockMask
 from transformers.integrations.flex_attention import flex_attention_forward as hf_flex_attention_forward
+from transformers.masking_utils import ALL_MASK_ATTENTION_FUNCTIONS
 
 from ....distributed.parallel_state import get_parallel_state
 from .ulysses import (
@@ -30,6 +31,14 @@ from .ulysses import (
 
 # Module-level patch slot for the underlying Transformers FlexAttention adapter.
 _flex_attention_forward: Callable = hf_flex_attention_forward
+
+
+def register_veomni_flex_attention_mask_builder() -> None:
+    """Register Transformers' FlexAttention mask builder under VeOmni's SP-aware name."""
+    ALL_MASK_ATTENTION_FUNCTIONS.register(
+        "veomni_flex_attention_with_sp",
+        ALL_MASK_ATTENTION_FUNCTIONS["flex_attention"],
+    )
 
 
 def flex_attention_forward(
@@ -57,8 +66,11 @@ def flex_attention_forward(
             f"key/value heads ({key.shape[1]})."
         )
 
-    if sliding_window is not None:
-        raise ValueError("FlexAttention sliding-window semantics must be encoded in the supplied BlockMask.")
+    # Transformers models may pass ``sliding_window`` metadata together with a
+    # BlockMask that already encodes the window predicate. The BlockMask remains
+    # the sole source of visibility semantics; do not reconstruct or modify it
+    # from the integer metadata.
+    del sliding_window
 
     parallel_state = get_parallel_state()
     ulysses_enabled = parallel_state.ulysses_enabled and not skip_ulysses
