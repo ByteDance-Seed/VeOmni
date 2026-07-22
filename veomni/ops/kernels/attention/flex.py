@@ -19,7 +19,7 @@ from typing import Callable, Optional
 import torch
 from torch.nn.attention.flex_attention import BlockMask
 from transformers.integrations.flex_attention import flex_attention_forward as hf_flex_attention_forward
-from transformers.masking_utils import ALL_MASK_ATTENTION_FUNCTIONS
+from transformers.masking_utils import ALL_MASK_ATTENTION_FUNCTIONS, causal_mask_function
 
 from ....distributed.parallel_state import get_parallel_state
 from .ulysses import (
@@ -31,13 +31,63 @@ from .ulysses import (
 
 # Module-level patch slot for the underlying Transformers FlexAttention adapter.
 _flex_attention_forward: Callable = hf_flex_attention_forward
+_flex_attention_mask_builder: Callable = ALL_MASK_ATTENTION_FUNCTIONS["flex_attention"]
+
+
+def flex_attention_mask_builder(
+    batch_size: int,
+    q_length: int,
+    kv_length: int,
+    q_offset: int = 0,
+    kv_offset: int = 0,
+    mask_function: Callable = causal_mask_function,
+    attention_mask: torch.Tensor | None = None,
+    **kwargs,
+) -> BlockMask:
+    """Build a Transformers FlexAttention mask with Ulysses-global sequence dimensions."""
+    parallel_state = get_parallel_state()
+    if not parallel_state.ulysses_enabled:
+        return _flex_attention_mask_builder(
+            batch_size=batch_size,
+            q_length=q_length,
+            kv_length=kv_length,
+            q_offset=q_offset,
+            kv_offset=kv_offset,
+            mask_function=mask_function,
+            attention_mask=attention_mask,
+            **kwargs,
+        )
+
+    if q_offset != 0 or kv_offset != 0:
+        raise ValueError("FlexAttention with Ulysses does not support cached mask offsets.")
+    if attention_mask is None or attention_mask.ndim != 2:
+        raise ValueError("FlexAttention with Ulysses requires a full-sequence 2D attention mask.")
+
+    full_sequence_length = q_length * parallel_state.ulysses_size
+    if attention_mask.shape[-1] != full_sequence_length:
+        raise ValueError(
+            "FlexAttention with Ulysses requires the full attention-mask sequence length to equal "
+            f"local q_length * ulysses_size, got attention_mask.shape[-1]={attention_mask.shape[-1]}, "
+            f"q_length={q_length}, ulysses_size={parallel_state.ulysses_size}."
+        )
+
+    return _flex_attention_mask_builder(
+        batch_size=batch_size,
+        q_length=full_sequence_length,
+        kv_length=full_sequence_length,
+        q_offset=0,
+        kv_offset=0,
+        mask_function=mask_function,
+        attention_mask=attention_mask,
+        **kwargs,
+    )
 
 
 def register_veomni_flex_attention_mask_builder() -> None:
-    """Register Transformers' FlexAttention mask builder under VeOmni's SP-aware name."""
+    """Register VeOmni's SP-aware wrapper around Transformers' FlexAttention mask builder."""
     ALL_MASK_ATTENTION_FUNCTIONS.register(
         "veomni_flex_attention_with_sp",
-        ALL_MASK_ATTENTION_FUNCTIONS["flex_attention"],
+        flex_attention_mask_builder,
     )
 
 
@@ -71,6 +121,12 @@ def flex_attention_forward(
     # the sole source of visibility semantics; do not reconstruct or modify it
     # from the integer metadata.
     del sliding_window
+
+    kernel_options = dict(kwargs.pop("kernel_options", {}) or {})
+    # PyTorch's AUTO backend may select Flex Decoding for short queries and then
+    # fail during Inductor kernel selection. Use the standard Triton FlexAttention
+    # kernel by default while preserving an explicit caller override.
+    kernel_options.setdefault("BACKEND", "TRITON")
 
     parallel_state = get_parallel_state()
     ulysses_enabled = parallel_state.ulysses_enabled and not skip_ulysses
@@ -107,6 +163,7 @@ def flex_attention_forward(
         dropout=dropout,
         scaling=scaling,
         softcap=softcap,
+        kernel_options=kernel_options,
         **kwargs,
     )
 

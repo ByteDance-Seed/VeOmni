@@ -123,6 +123,32 @@ def test_flex_attention_cpu_forward_uses_native_block_mask_and_hf_layout():
     assert torch.isfinite(output).all()
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="FlexAttention backward requires CUDA")
+def test_flex_attention_short_query_uses_default_triton_backend():
+    sequence_length = 65
+    device = torch.device("cuda")
+    query = torch.randn(1, 2, sequence_length, 256, device=device, dtype=torch.bfloat16, requires_grad=True)
+    key = torch.randn(1, 1, sequence_length, 256, device=device, dtype=torch.bfloat16, requires_grad=True)
+    value = torch.randn(1, 1, sequence_length, 256, device=device, dtype=torch.bfloat16, requires_grad=True)
+
+    output, auxiliary = veomni_attention.flex_attention_forward(
+        _FakeAttentionModule(),
+        query,
+        key,
+        value,
+        _causal_block_mask(sequence_length, device),
+    )
+    output.float().square().mean().backward()
+
+    assert output.shape == (1, sequence_length, 2, 256)
+    assert auxiliary is not None
+    assert torch.isfinite(auxiliary).all()
+    assert torch.isfinite(output).all()
+    for tensor in (query, key, value):
+        assert tensor.grad is not None
+        assert torch.isfinite(tensor.grad).all()
+
+
 @pytest.mark.parametrize(
     ("query_heads", "kv_heads", "expected_message"),
     [
@@ -210,6 +236,7 @@ def test_flex_attention_accepts_sliding_window_metadata_with_block_mask(monkeypa
 
     assert captured["attention_mask"] is block_mask
     assert "sliding_window" not in captured["kwargs"]
+    assert captured["kwargs"]["kernel_options"] == {"BACKEND": "TRITON"}
     torch.testing.assert_close(output, query.transpose(1, 2))
     assert auxiliary is None
 

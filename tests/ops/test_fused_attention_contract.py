@@ -30,6 +30,7 @@ from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
 from veomni.arguments.arguments_types import OpsImplementationConfig
 from veomni.ops.kernels import attention as veomni_attention
+from veomni.ops.kernels.attention import flex as flex_backend
 
 
 _FLASH_IMPLEMENTATIONS = (
@@ -82,14 +83,14 @@ def test_apply_veomni_attention_patch_registers_custom_facade_names(monkeypatch)
     assert ALL_ATTENTION_FUNCTIONS["flex_attention"] is hf_flex_attention_forward
 
 
-def test_register_veomni_flex_attention_mask_builder_reuses_transformers_flex_builder(monkeypatch):
+def test_register_veomni_flex_attention_mask_builder_uses_sp_aware_wrapper(monkeypatch):
     mask_mapping = ALL_MASK_ATTENTION_FUNCTIONS._global_mapping
     monkeypatch.setitem(mask_mapping, _FLEX_IMPLEMENTATION, object())
 
     veomni_attention.register_veomni_flex_attention_mask_builder()
     veomni_attention.register_veomni_flex_attention_mask_builder()
 
-    assert ALL_MASK_ATTENTION_FUNCTIONS[_FLEX_IMPLEMENTATION] is ALL_MASK_ATTENTION_FUNCTIONS["flex_attention"]
+    assert ALL_MASK_ATTENTION_FUNCTIONS[_FLEX_IMPLEMENTATION] is flex_backend.flex_attention_mask_builder
 
     config = PreTrainedConfig()
     config._attn_implementation = _FLEX_IMPLEMENTATION
@@ -103,6 +104,72 @@ def test_register_veomni_flex_attention_mask_builder_reuses_transformers_flex_bu
     assert isinstance(causal_mask, BlockMask)
     assert isinstance(sliding_window_mask, BlockMask)
     assert causal_mask.shape == sliding_window_mask.shape == (1, 1, 8, 8)
+
+
+def test_veomni_flex_attention_mask_builder_uses_ulysses_global_sequence_length(monkeypatch):
+    monkeypatch.setattr(
+        flex_backend,
+        "get_parallel_state",
+        lambda: SimpleNamespace(ulysses_enabled=True, ulysses_size=2),
+    )
+    veomni_attention.register_veomni_flex_attention_mask_builder()
+
+    config = PreTrainedConfig()
+    config._attn_implementation = _FLEX_IMPLEMENTATION
+    config.sliding_window = 4
+    local_inputs_embeds = torch.randn(1, 4, 16)
+    full_attention_mask = torch.ones(1, 8, dtype=torch.long)
+    local_position_ids = torch.arange(4).unsqueeze(0)
+
+    causal_mask = create_causal_mask(
+        config,
+        local_inputs_embeds,
+        full_attention_mask,
+        None,
+        local_position_ids,
+    )
+    sliding_window_mask = create_sliding_window_causal_mask(
+        config,
+        local_inputs_embeds,
+        full_attention_mask,
+        None,
+        local_position_ids,
+    )
+
+    assert causal_mask.shape == sliding_window_mask.shape == (1, 1, 8, 8)
+    zero = torch.tensor(0)
+    last_query = torch.tensor(7)
+    first_key = torch.tensor(0)
+    nearby_key = torch.tensor(6)
+    assert causal_mask.mask_mod(zero, zero, last_query, first_key)
+    assert sliding_window_mask.mask_mod(zero, zero, last_query, nearby_key)
+    assert not sliding_window_mask.mask_mod(zero, zero, last_query, first_key)
+
+
+@pytest.mark.parametrize(
+    ("attention_mask", "expected_message"),
+    [
+        (None, "requires a full-sequence 2D attention mask"),
+        (torch.ones(1, 4, dtype=torch.long), "local q_length \\* ulysses_size"),
+    ],
+)
+def test_veomni_flex_attention_mask_builder_rejects_incomplete_ulysses_metadata(
+    monkeypatch,
+    attention_mask,
+    expected_message,
+):
+    monkeypatch.setattr(
+        flex_backend,
+        "get_parallel_state",
+        lambda: SimpleNamespace(ulysses_enabled=True, ulysses_size=2),
+    )
+    veomni_attention.register_veomni_flex_attention_mask_builder()
+    config = PreTrainedConfig()
+    config._attn_implementation = _FLEX_IMPLEMENTATION
+    local_inputs_embeds = torch.randn(1, 4, 16)
+
+    with pytest.raises(ValueError, match=expected_message):
+        create_causal_mask(config, local_inputs_embeds, attention_mask, None)
 
 
 @pytest.mark.parametrize("implementation", [*_FLASH_IMPLEMENTATIONS, _FLEX_IMPLEMENTATION])
