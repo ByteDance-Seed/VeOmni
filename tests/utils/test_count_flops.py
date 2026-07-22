@@ -74,6 +74,24 @@ def gpt_oss_counter(gpt_oss_config):
     return VeomniFlopsCounter(gpt_oss_config)
 
 
+@pytest.fixture
+def deepseek_v4_config():
+    config = _load_toy_config("tests/toy_config/deepseek_v4_toy")
+    config.compress_rates = vars(config.compress_rates)
+    config.layer_types = [
+        "heavily_compressed_attention",
+        "heavily_compressed_attention",
+        "heavily_compressed_attention",
+        "compressed_sparse_attention",
+    ]
+    return config
+
+
+@pytest.fixture
+def deepseek_v4_counter(deepseek_v4_config):
+    return VeomniFlopsCounter(deepseek_v4_config)
+
+
 class TestQwen35Flops:
     pytestmark = pytest.mark.usefixtures("mock_device_flops")
 
@@ -148,3 +166,43 @@ class TestGptOssFlops:
         full_flops, _ = full_counter.estimate_flops(batch_seqlens, delta_time=1.0)
 
         assert full_flops > mixed_flops
+
+
+class TestDeepseekV4Flops:
+    pytestmark = pytest.mark.usefixtures("mock_device_flops")
+
+    def test_numerical(self, deepseek_v4_counter):
+        flops, promised_flops = deepseek_v4_counter.estimate_flops([12, 5], delta_time=1.0)
+
+        assert flops == pytest.approx(0.000264658944, rel=1e-9)
+        assert promised_flops == 1000.0
+
+    def test_csa_topk_caps_main_attention_but_not_indexer(self, deepseek_v4_config):
+        batch_seqlens = [256]
+        baseline_flops, _ = VeomniFlopsCounter(deepseek_v4_config).estimate_flops(batch_seqlens, delta_time=1.0)
+
+        smaller_topk_config = deepcopy(deepseek_v4_config)
+        smaller_topk_config.index_topk = 4
+        smaller_topk_flops, _ = VeomniFlopsCounter(smaller_topk_config).estimate_flops(batch_seqlens, delta_time=1.0)
+
+        assert smaller_topk_flops < baseline_flops
+
+    def test_shared_experts_scale_moe_flops(self, deepseek_v4_config):
+        batch_seqlens = [64]
+        baseline_flops, _ = VeomniFlopsCounter(deepseek_v4_config).estimate_flops(batch_seqlens, delta_time=1.0)
+
+        more_shared_config = deepcopy(deepseek_v4_config)
+        more_shared_config.n_shared_experts = deepseek_v4_config.n_shared_experts + 1
+        more_shared_flops, _ = VeomniFlopsCounter(more_shared_config).estimate_flops(batch_seqlens, delta_time=1.0)
+
+        assert more_shared_flops > baseline_flops
+
+    def test_hca_compression_rate_reduces_attention_flops(self, deepseek_v4_config):
+        batch_seqlens = [256]
+        baseline_flops, _ = VeomniFlopsCounter(deepseek_v4_config).estimate_flops(batch_seqlens, delta_time=1.0)
+
+        compressed_config = deepcopy(deepseek_v4_config)
+        compressed_config.compress_rates["heavily_compressed_attention"] = 64
+        compressed_flops, _ = VeomniFlopsCounter(compressed_config).estimate_flops(batch_seqlens, delta_time=1.0)
+
+        assert compressed_flops < baseline_flops

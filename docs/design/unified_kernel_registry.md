@@ -279,9 +279,9 @@ class OpsImplementationConfig:
     rms_norm_gated_implementation: str = "fla"
     causal_conv1d_implementation: str = "fla"
     chunk_gated_delta_rule_implementation: str = "fla"
-    dsa_indexer_backend: Literal["eager", "cudnn", "tilelang"] = "eager"
-    dsa_attention_backend: Literal["eager", "flashmla_cudnn", "tilelang_sparse"] = "eager"
-    mhc_backend: Literal["eager", "tile_kernels"] = "eager"
+    dsa_indexer_implementation: Literal["eager", "cudnn", "tilelang"] = "eager"
+    dsa_attention_implementation: Literal["eager", "flashmla_cudnn", "tilelang"] = "eager"
+    mhc_implementation: Literal["eager", "tilelang"] = "eager"
 ```
 
 **Shipped today** (what is actually on `OpsImplementationConfig` as of this
@@ -299,9 +299,9 @@ PR — see `veomni/arguments/arguments_types.py`):
 | `rms_norm_gated_implementation` | `eager`, `fla`, `npu` | Qwen3.5 GatedDeltaNet `self.norm`; default `fla` |
 | `causal_conv1d_implementation` | `eager`, `fla`, `npu` | Qwen3.5 GatedDeltaNet pre-mixer; `eager` has no `cu_seqlens` path |
 | `chunk_gated_delta_rule_implementation` | `eager`, `fla`, `flash_qla`, `npu` | Qwen3.5 linear attention; `flash_qla` is Hopper SM90-only, while `npu` uses the vendored MindSpeed-MM kernel |
-| `dsa_indexer_backend` | `eager`, `cudnn`, `tilelang` | GLM-DSA supports `cudnn`; DeepSeek V4 supports `tilelang`. Optimized backends require compatible NVIDIA hardware. |
-| `dsa_attention_backend` | `eager`, `flashmla_cudnn`, `tilelang_sparse` | GLM-DSA supports `flashmla_cudnn`; DeepSeek V4 supports `tilelang_sparse`. Optimized backends require compatible NVIDIA hardware. |
-| `mhc_backend` | `eager`, `tile_kernels` | DeepSeek V4 manifold-constrained Hyper-Connection pre/post/head kernels. The three `OpSlot("mhc", variant)` instances share this selection and require NVIDIA SM90+ for `tile_kernels`. |
+| `dsa_indexer_implementation` | `eager`, `cudnn`, `tilelang` | GLM-DSA supports `cudnn`; DeepSeek V4 supports `tilelang`. Optimized implementations require compatible NVIDIA hardware. |
+| `dsa_attention_implementation` | `eager`, `flashmla_cudnn`, `tilelang` | GLM-DSA supports `flashmla_cudnn`; DeepSeek V4 supports `tilelang`. Optimized implementations require compatible NVIDIA hardware. |
+| `mhc_implementation` | `eager`, `tilelang` | DeepSeek V4 manifold-constrained Hyper-Connection pre/post/head kernels provided by the `tile-kernels` package. The three `OpSlot("mhc", variant)` instances share this selection and require NVIDIA SM90+ for `tilelang`. |
 
 No preset field was shipped. Configure each `OpsImplementationConfig` field
 explicitly; unknown fields such as `preset` are invalid.
