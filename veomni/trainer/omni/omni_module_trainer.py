@@ -38,7 +38,9 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import torch.distributed as dist
 
+from ...distributed.clip_grad_norm import veomni_omni_module_clip_grad_norm
 from ...distributed.parallel_state import (
+    get_parallel_state_by_name,
     init_parallel_state,
     use_parallel_state,
 )
@@ -348,6 +350,27 @@ class OmniModuleTrainer:
 
     # ── Parallel state (per-module device mesh) ────────────────────────────────
 
+    @property
+    def parallel_state(self):
+        """This module's :class:`ParallelState`, resolved from the global registry.
+
+        A read-only lookup (no stored handle) keyed by :attr:`module_name` — the
+        registry is the single source of truth. Encapsulates the module's private
+        parallelism so callers (the orchestrator, clip/validate) never look it up
+        by name themselves; the module owns entering it (see :meth:`_scoped`).
+        """
+        return get_parallel_state_by_name(self.module_name)
+
+    def _scoped(self):
+        """Context manager making this module's ParallelState current.
+
+        The module owns its parallelism: every method that reads
+        ``get_parallel_state()`` (optimizer / lr-scheduler build, gradient clip)
+        enters this itself, so the orchestrator can call them plainly without
+        knowing (or wrapping) the module's private state.
+        """
+        return use_parallel_state(self.module_name)
+
     def _setup(self):
         """Build this module's own :class:`ParallelState` and set it current.
 
@@ -423,12 +446,31 @@ class OmniModuleTrainer:
         return self._has_trainable_parameters
 
     def _build_optimizer(self):
-        """Build this module's optimizer over its still-trainable params."""
-        self.base._build_optimizer()
+        """Build this module's optimizer over its still-trainable params.
+
+        Scoped to this module's own ParallelState: a distributed optimizer (e.g.
+        Muon) reads ``get_parallel_state()`` at build time, so it must resolve to
+        this module's mesh, not the orchestrator's.
+        """
+        with self._scoped():
+            self.base._build_optimizer()
 
     def _build_lr_scheduler(self):
         """Build this module's lr-scheduler (needs ``base.args.train_steps`` set)."""
-        self.base._build_lr_scheduler()
+        with self._scoped():
+            self.base._build_lr_scheduler()
+
+    def clip_grad_norm(self, max_norm: float, norm_type: float = 2.0) -> float:
+        """Clip this module's grads under its own parallelism; return the module norm.
+
+        Owns entering its own state: ``veomni_omni_module_clip_grad_norm`` reads
+        the current ParallelState via ``get_parallel_state()`` (like
+        ``veomni_clip_grad_norm``), so run it inside ``self._scoped()``. The
+        orchestrator only sums the returned per-module norms — it never handles
+        the module's private mesh.
+        """
+        with self._scoped():
+            return veomni_omni_module_clip_grad_norm(self.base.model, max_norm, norm_type)
 
     # ── Metric metering ────────────────────────────────────────────────────────
 

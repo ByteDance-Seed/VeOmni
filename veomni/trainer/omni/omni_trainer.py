@@ -60,8 +60,7 @@ import torch.distributed as dist
 from ...arguments import OmniArguments
 from ...data import SeedOmniCollator
 from ...data.data_transform import build_data_transform
-from ...distributed.clip_grad_norm import veomni_omni_module_clip_grad_norm
-from ...distributed.parallel_state import get_parallel_state, get_parallel_state_by_name, use_parallel_state
+from ...distributed.parallel_state import get_parallel_state
 from ...models.seed_omni.graphs import GraphProfiler
 from ...models.seed_omni.mixins.metric_meter_mixin import MetricMeterResult
 from ...models.seed_omni.modeling_omni import OmniModel, _unwrap_module
@@ -356,9 +355,9 @@ class OmniTrainer:
         """
         outer_sp = get_parallel_state().sp_size
         mismatched = {
-            name: get_parallel_state_by_name(name).sp_size
-            for name in self.module_trainers
-            if get_parallel_state_by_name(name).sp_size != outer_sp
+            name: module_trainer.parallel_state.sp_size
+            for name, module_trainer in self.module_trainers.items()
+            if module_trainer.parallel_state.sp_size != outer_sp
         }
         if mismatched:
             raise ValueError(
@@ -455,8 +454,7 @@ class OmniTrainer:
         self.optimizers: Dict[str, torch.optim.Optimizer] = {}
         for name, module_trainer in self.module_trainers.items():
             if module_trainer.has_trainable_parameters:
-                with use_parallel_state(name):
-                    module_trainer._build_optimizer()
+                module_trainer._build_optimizer()
                 self.optimizers[name] = module_trainer.base.optimizer
         base.optimizer = MultiOptimizer(
             self.optimizers,
@@ -641,12 +639,7 @@ class OmniTrainer:
 
         max_grad_norm = args.train.optimizer.max_grad_norm
         module_grad_norms = [
-            veomni_omni_module_clip_grad_norm(
-                module_trainer.base.model,
-                get_parallel_state_by_name(module_trainer.module_name),
-                max_grad_norm,
-            )
-            for module_trainer in self.module_trainers.values()
+            module_trainer.clip_grad_norm(max_grad_norm) for module_trainer in self.module_trainers.values()
         ]
         grad_norm = math.sqrt(sum(g * g for g in module_grad_norms)) if module_grad_norms else 0.0
         base.optimizer.step()

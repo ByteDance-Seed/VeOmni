@@ -46,7 +46,6 @@ def veomni_clip_grad_norm(
 
 def veomni_omni_module_clip_grad_norm(
     model,
-    parallel_state,
     max_norm: float,
     norm_type: float = 2.0,
 ) -> float:
@@ -70,7 +69,7 @@ def veomni_omni_module_clip_grad_norm(
     rank-consistent.
     """
     norm_type = float(norm_type)
-    ps = parallel_state
+    ps = get_parallel_state()
     if ps.dp_mode == "ddp" and ps.sp_size > 1:
         _allreduce_ddp_sp_grads(model, ps)
 
