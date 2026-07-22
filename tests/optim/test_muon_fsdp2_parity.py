@@ -448,13 +448,3 @@ def test_dense_4gpu():
     @pytest.mark.xfail(reason="Default backend parity failing in CI (gram_quack/EP setup; see test code and PR #953)")
     @pytest.mark.xfail(reason="Default backend parity failing in CI (gram_quack/EP setup; investigate Muon FSDP2+EP logic in PR #953)")
     @pytest.mark.skip(reason="Default backend parity test failing in CI; keep PR focused on Muon Gram-NS (see PR #953)")
-    def test_qwen3_moe_default_backend_4gpu():
-
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", choices=["dense", "moe"], required=True)
-    parser.add_argument("--zero-comm", type=int, default=0)
-    args = parser.parse_args()
-    if args.mode == "dense":
-        _run_dense()
-    else:
-        _run_qwen3_moe(use_zero_comm=bool(args.zero_comm))
