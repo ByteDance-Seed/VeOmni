@@ -21,6 +21,7 @@ from pathlib import Path
 
 import pytest
 import torch
+from torch.nn import functional as F
 from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.nn.attention.flex_attention import BlockMask
 from torch.nn.functional import scaled_dot_product_attention
@@ -31,6 +32,7 @@ from transformers.models.gemma3.modeling_gemma3 import Gemma3ForCausalLM as HFGe
 
 from veomni.arguments.arguments_types import OpsImplementationConfig
 from veomni.models.auto import build_foundation_model
+from veomni.models.transformers.gemma3.generated import patched_modeling_gemma3_gpu as gemma3_modeling
 from veomni.models.transformers.gemma3.generated.patched_modeling_gemma3_gpu import (
     Gemma3ForCausalLM as VeOmniGemma3ForCausalLM,
 )
@@ -48,11 +50,15 @@ _PROFILE_SEQUENCE_LENGTHS = (4096, 8192, 20000)
 _PROFILE_ITERATIONS = 5
 
 
-def _eager_ops_config(attn_implementation: str) -> OpsImplementationConfig:
+def _eager_ops_config(
+    attn_implementation: str,
+    *,
+    cross_entropy_loss_implementation: str = "eager",
+) -> OpsImplementationConfig:
     return OpsImplementationConfig(
         attn_implementation=attn_implementation,
         moe_implementation="eager",
-        cross_entropy_loss_implementation="eager",
+        cross_entropy_loss_implementation=cross_entropy_loss_implementation,
         rms_norm_implementation="eager",
         swiglu_mlp_implementation="eager",
         rotary_pos_emb_implementation="eager",
@@ -144,6 +150,49 @@ def test_gemma3_patched_causal_lm_forward_supports_eager_training(monkeypatch):
     assert torch.isfinite(output.loss)
     assert torch.isfinite(output.logits).all()
     assert torch.isfinite(model.model.layers[0].self_attn.q_proj.weight.grad).all()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Liger fused linear cross entropy requires CUDA")
+def test_gemma3_patched_causal_lm_forward_supports_fused_loss(monkeypatch):
+    monkeypatch.setenv("MODELING_BACKEND", "veomni")
+    torch.manual_seed(23)
+    model = build_foundation_model(
+        _TOY_CONFIG,
+        torch_dtype="bfloat16",
+        init_device="cuda",
+        ops_implementation=_eager_ops_config(
+            "eager",
+            cross_entropy_loss_implementation="liger_kernel",
+        ),
+    ).train()
+    input_ids = torch.randint(3, model.config.vocab_size, (2, 16), device=model.device)
+    labels = input_ids.clone()
+    labels[0, 0] = -100
+
+    assert gemma3_modeling.veomni_causal_lm_loss.use_non_eager_impl
+    with torch.no_grad():
+        reference_logits = model(input_ids=input_ids, use_cache=False).logits
+        reference_loss = F.cross_entropy(
+            reference_logits[:, :-1].float().reshape(-1, model.config.vocab_size),
+            labels[:, 1:].reshape(-1),
+        )
+
+    model.zero_grad(set_to_none=True)
+    output = model(input_ids=input_ids, labels=labels, use_cache=False)
+
+    assert output.logits is None
+    assert output.fused_linear_aux is None
+    assert torch.isfinite(output.loss)
+    torch.testing.assert_close(output.loss, reference_loss, rtol=1e-2, atol=1e-2)
+
+    output.loss.backward()
+    for parameter in (
+        model.model.layers[0].self_attn.q_proj.weight,
+        model.lm_head.weight,
+    ):
+        assert parameter.grad is not None
+        assert torch.isfinite(parameter.grad).all()
+        assert parameter.grad.abs().max() > 0
 
 
 def test_gemma3_routes_native_full_and_sliding_block_masks(monkeypatch):
