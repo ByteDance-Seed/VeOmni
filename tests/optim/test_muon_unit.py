@@ -431,13 +431,14 @@ class TestGramQuackFallback:
     def test_gram_quack_falls_back_on_pre_hopper_cuda(self, monkeypatch):
         import veomni.optim.muon as muon_mod
 
+        device_type = get_device_type()
         monkeypatch.setattr(muon_mod, "IS_CUDA_AVAILABLE", True)
-        monkeypatch.setattr(muon_mod, "get_device_type", lambda: "cuda")
+        monkeypatch.setattr(muon_mod, "get_device_type", lambda: device_type)
         queried_devices = []
         monkeypatch.setattr(
             muon_mod, "get_gpu_compute_capability", lambda device: queried_devices.append(device) or 80
         )
-        grad = type("FakeTensor", (), {"device": torch.device("cuda:1")})()
+        grad = type("FakeTensor", (), {"device": torch.device(f"{device_type}:1")})()
         assert "compute capability 8.0" in muon_mod._gram_quack_unavailable_reason(grad)
         assert queried_devices == [grad.device]
 
@@ -483,8 +484,9 @@ class TestGramQuackFallback:
     def test_gram_quack_uses_package_on_hopper(self, monkeypatch):
         import veomni.optim.muon as muon_mod
 
+        device_type = get_device_type()
         monkeypatch.setattr(muon_mod, "IS_CUDA_AVAILABLE", True)
-        monkeypatch.setattr(muon_mod, "get_device_type", lambda: "cuda")
+        monkeypatch.setattr(muon_mod, "get_device_type", lambda: device_type)
         monkeypatch.setattr(muon_mod, "get_gpu_compute_capability", lambda _device: 90)
-        grad = type("FakeTensor", (), {"device": torch.device("cuda")})()
+        grad = type("FakeTensor", (), {"device": torch.device(device_type)})()
         assert muon_mod._gram_quack_unavailable_reason(grad) is None
