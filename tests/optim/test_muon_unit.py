@@ -330,16 +330,22 @@ class TestGramNewtonSchulz:
     @pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="CUDA required")
     def test_package_kernel_optional(self):
         pytest.importorskip("gram_newton_schulz")
-        x = torch.randn(2, 256, 1024, device=get_device_type(), dtype=torch.bfloat16)
-        out = run_newton_schulz(
-            x,
-            ns_coefficients=DEFAULT_NS_COEFFICIENTS,
-            ns_steps=5,
-            ns_implementation="gram_quack",
-            gram_ns_reset_iterations=(2,),
-        )
-        assert out.shape == x.shape
-        assert torch.isfinite(out).all()
+
+        try:
+            x = torch.randn(2, 256, 1024, device=get_device_type(), dtype=torch.bfloat16)
+            out = run_newton_schulz(
+                x,
+                ns_coefficients=DEFAULT_NS_COEFFICIENTS,
+                ns_steps=5,
+                ns_implementation="gram_quack",
+                gram_ns_reset_iterations=(2,),
+            )
+            assert out.shape == x.shape
+            assert torch.isfinite(out).all()
+        except NotImplementedError as exc:
+            if "Gemm Sm80 is not implemented yet" in str(exc):
+                pytest.skip("quack.gemm_sm80 backend not implemented in this quack version")
+            raise
 
     def test_distributed_muon_accepts_gram_flags(self):
         p = nn.Parameter(torch.randn(8, 16))
