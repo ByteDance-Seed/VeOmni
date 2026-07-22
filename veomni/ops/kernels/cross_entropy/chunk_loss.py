@@ -127,9 +127,10 @@ def chunk_loss_function(
         return loss, logits
 
     chunk_labels = torch.split(labels, chunk_size, dim=1)
+    num_items_in_batch = (labels != ignore_index).sum()
 
     loss_kwargs_chunks = [
-        {"labels": chunk_labels[i], "ignore_index": ignore_index, "num_items_in_batch": (labels != ignore_index).sum()}
+        {"labels": chunk_labels[i], "ignore_index": ignore_index, "num_items_in_batch": num_items_in_batch}
         for i in range(len(chunk_labels))
     ]
 
