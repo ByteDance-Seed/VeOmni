@@ -28,6 +28,18 @@ def _model_cls(model_type: str):
     return OMNI_MODEL_REGISTRY[model_type]()
 
 
+def _patch_local_loss_reducer(monkeypatch):
+    """Keep module-only tests out of the distributed loss collective."""
+    import veomni.models.seed_omni.modules.janus.vqvae.modeling as vqvae_modeling
+
+    def _local_reduce(loss, num_valid_tokens, group=None):
+        del group
+        return torch.where(num_valid_tokens > 0, loss, torch.zeros_like(loss))
+
+    monkeypatch.setattr(vqvae_modeling, "reduce_sequence_parallel_loss", _local_reduce)
+    return vqvae_modeling
+
+
 def _load_omni_config(
     *,
     model_path: str = "",
@@ -276,8 +288,10 @@ def test_text_encoder_decode_inference_returns_logits_only():
     assert out["loss"] is None
 
 
-def test_janus_vqvae_decode_training_loss():
+def test_janus_vqvae_decode_training_loss(monkeypatch):
     """Training ``decode``: hidden_states + labels → scalar loss."""
+    _patch_local_loss_reducer(monkeypatch)
+
     JanusVqvae = _model_cls("janus_vqvae")
     JanusVqvaeConfig = _config_cls("janus_vqvae")
     jv = JanusVqvae(JanusVqvaeConfig(vq_config=_tiny_vq_cfg()))
@@ -293,9 +307,12 @@ def test_janus_vqvae_dummy_decode_keeps_generation_head_in_graph(monkeypatch):
     """FSDP2 regression: under FSDP the dummy decode path must route through
     ``generation_head`` so its grad/reduce_scatter fires on every rank (ranks
     with no assistant image would otherwise skip it and dead-lock NCCL)."""
-    import veomni.models.seed_omni.modules.janus.vqvae.modeling as vqvae_modeling
-
-    monkeypatch.setattr(vqvae_modeling, "get_parallel_state", lambda: SimpleNamespace(fsdp_enabled=True))
+    vqvae_modeling = _patch_local_loss_reducer(monkeypatch)
+    monkeypatch.setattr(
+        vqvae_modeling,
+        "get_parallel_state",
+        lambda: SimpleNamespace(fsdp_enabled=True, fsdp_group=None),
+    )
 
     JanusVqvae = _model_cls("janus_vqvae")
     JanusVqvaeConfig = _config_cls("janus_vqvae")
@@ -306,7 +323,7 @@ def test_janus_vqvae_dummy_decode_keeps_generation_head_in_graph(monkeypatch):
     assert all(p.requires_grad for p in jv.generation_head.parameters())
 
     h = torch.randn(1, 4, 64, requires_grad=True)
-    labels = torch.randint(0, 64, (1, 4))
+    labels = torch.full((1, 4), -100)
     out = jv.decode(hidden_states=h, labels=labels, is_dummy=True)
 
     # Zero loss contribution, but the head's params must be in the graph.
@@ -316,6 +333,7 @@ def test_janus_vqvae_dummy_decode_keeps_generation_head_in_graph(monkeypatch):
     out["loss"].backward()
     head_grads = [p.grad for p in jv.generation_head.parameters() if p.grad is not None]
     assert head_grads, "dummy decode must produce a gradient path through generation_head"
+    assert all(torch.count_nonzero(grad) == 0 for grad in head_grads)
 
 
 def test_janus_vqvae_dummy_encode_emits_real_shaped_zeros_without_fsdp(monkeypatch):
@@ -360,12 +378,15 @@ def test_janus_vqvae_dummy_encode_skips_codec_in_eval_even_under_fsdp(monkeypatc
     assert out["image_embeds"].abs().sum().item() == 0.0
 
 
-def test_janus_vqvae_dummy_decode_skips_generation_head_without_fsdp(monkeypatch):
-    """Without FSDP there is no collective to anchor, so the dummy decode returns
-    a 0.0 loss directly (no generation_head pass)."""
-    import veomni.models.seed_omni.modules.janus.vqvae.modeling as vqvae_modeling
-
-    monkeypatch.setattr(vqvae_modeling, "get_parallel_state", lambda: SimpleNamespace(fsdp_enabled=False))
+def test_janus_vqvae_dummy_decode_keeps_generation_head_in_graph_without_fsdp(monkeypatch):
+    """The non-distributed dummy path follows the same decode contract: ignored
+    labels contribute 0.0 while ``generation_head`` remains in the graph."""
+    vqvae_modeling = _patch_local_loss_reducer(monkeypatch)
+    monkeypatch.setattr(
+        vqvae_modeling,
+        "get_parallel_state",
+        lambda: SimpleNamespace(fsdp_enabled=False, fsdp_group=None),
+    )
 
     JanusVqvae = _model_cls("janus_vqvae")
     JanusVqvaeConfig = _config_cls("janus_vqvae")
@@ -373,12 +394,14 @@ def test_janus_vqvae_dummy_decode_skips_generation_head_without_fsdp(monkeypatch
     jv.freeze_model()
 
     h = torch.randn(1, 4, 64, requires_grad=True)
-    labels = torch.randint(0, 64, (1, 4))
+    labels = torch.full((1, 4), -100)
     out = jv.decode(hidden_states=h, labels=labels, is_dummy=True)
 
     assert out["loss"].detach().item() == 0.0
     out["loss"].backward()
-    assert all(p.grad is None for p in jv.generation_head.parameters())
+    head_grads = [p.grad for p in jv.generation_head.parameters() if p.grad is not None]
+    assert head_grads, "dummy decode must preserve the uniform generation_head path"
+    assert all(torch.count_nonzero(grad) == 0 for grad in head_grads)
 
 
 def test_janus_siglip_forward_returns_image_embeds():

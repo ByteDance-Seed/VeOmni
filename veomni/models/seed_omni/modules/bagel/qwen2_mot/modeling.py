@@ -12,15 +12,15 @@ from torch.nn.functional import scaled_dot_product_attention
 from veomni.utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE
 
 
-if IS_CUDA_AVAILABLE:
-    from flash_attn import flash_attn_varlen_func
-
 if IS_NPU_AVAILABLE:
     import torch_npu
 from transformers import PreTrainedModel
 from transformers.models.qwen2.modeling_qwen2 import Qwen2MLP, Qwen2RMSNorm
 from transformers.utils import ModelOutput
 
+from ......distributed.parallel_state import get_parallel_state
+from ......distributed.sequence_parallel import gather_heads_scatter_seq, gather_seq_scatter_heads
+from ......ops.kernels.attention import flash_attention_forward
 from .configuration import BagelQwen2MoTConfig
 from .modulemixin import BagelQwen2MoTMetricMeterMixin, BagelQwen2MoTModuleMixin
 
@@ -40,19 +40,16 @@ class BagelQwen2MoT(BagelQwen2MoTModuleMixin, BagelQwen2MoTMetricMeterMixin, Pre
     def forward(  # type: ignore[override]
         self,
         packed_sequence: torch.Tensor,
-        sample_lens: list[int],
-        attention_mask: Any,
         packed_position_ids: torch.Tensor,
-        packed_und_token_indexes: Optional[torch.Tensor] = None,
-        packed_gen_token_indexes: Optional[torch.Tensor] = None,
-        **kwargs: Any,
+        packed_token_type_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
     ) -> Dict[str, Any]:
-        del kwargs
+        packed_und_token_indexes = torch.nonzero(packed_token_type_ids == 0, as_tuple=False).flatten()
+        packed_gen_token_indexes = torch.nonzero(packed_token_type_ids == 1, as_tuple=False).flatten()
         output = self.model(
             packed_sequence=packed_sequence,
-            sample_lens=sample_lens,
-            attention_mask=attention_mask,
             packed_position_ids=packed_position_ids,
+            attention_mask=attention_mask,
             packed_und_token_indexes=packed_und_token_indexes,
             packed_gen_token_indexes=packed_gen_token_indexes,
         )
@@ -227,6 +224,7 @@ class BagelQwen2RotaryEmbedding(nn.Module):
 class BagelQwen2MoTAttention(nn.Module):
     def __init__(self, config: BagelQwen2MoTConfig, layer_idx: int):
         super().__init__()
+        self.config = config
         self.layer_idx = layer_idx
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_attention_heads
@@ -248,9 +246,9 @@ class BagelQwen2MoTAttention(nn.Module):
     def _forward_packed_train(
         self,
         packed_sequence: torch.Tensor,
-        sample_lens: list[int],
-        attention_mask: Any,
-        packed_position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        attention_mask: torch.Tensor,
+        packed_position_cos: torch.Tensor,
+        packed_position_sin: torch.Tensor,
         packed_und_token_indexes: torch.Tensor,
         packed_gen_token_indexes: torch.Tensor,
     ) -> torch.Tensor:
@@ -309,52 +307,57 @@ class BagelQwen2MoTAttention(nn.Module):
             packed_query_states_ = _fold_zero_anchors(packed_query_states_, query_states_norm_gen)
             packed_key_states_ = _fold_zero_anchors(packed_key_states_, key_states_norm_gen)
 
-        packed_cos, packed_sin = packed_position_embeddings
         packed_query_states_, packed_key_states_ = _apply_rotary_pos_emb(
             packed_query_states_,
             packed_key_states_,
-            packed_cos,
-            packed_sin,
+            packed_position_cos,
+            packed_position_sin,
             unsqueeze_dim=1,
         )
 
-        if isinstance(attention_mask, list):
-            packed_key_states_ = packed_key_states_[:, :, None, :].repeat(
-                1, 1, self.num_heads // self.num_key_value_heads, 1
+        sequence_length = int(attention_mask.shape[-1])
+        ps = get_parallel_state()
+        if ps.sp_enabled:
+            # Ulysses all-to-all gathers the active sample's complete packed sequence
+            # while sharding Q and native-GQA K/V heads.
+            packed_query_states_ = gather_seq_scatter_heads(
+                packed_query_states_,
+                seq_dim=0,
+                head_dim=1,
+                group=ps.ulysses_group,
+                unpadded_dim_size=sequence_length,
             )
-            packed_key_states_ = packed_key_states_.reshape(-1, self.num_heads, self.head_dim)
-            packed_value_states = packed_value_states[:, :, None, :].repeat(
-                1,
-                1,
-                self.num_heads // self.num_key_value_heads,
-                1,
+            packed_key_states_ = gather_seq_scatter_heads(
+                packed_key_states_,
+                seq_dim=0,
+                head_dim=1,
+                group=ps.ulysses_group,
+                unpadded_dim_size=sequence_length,
             )
-            packed_value_states = packed_value_states.reshape(-1, self.num_heads, self.head_dim)
+            packed_value_states = gather_seq_scatter_heads(
+                packed_value_states,
+                seq_dim=0,
+                head_dim=1,
+                group=ps.ulysses_group,
+                unpadded_dim_size=sequence_length,
+            )
 
-            unpacked_query_states = packed_query_states_.transpose(0, 1).split(sample_lens, dim=1)
-            unpacked_key_states = packed_key_states_.transpose(0, 1).split(sample_lens, dim=1)
-            unpacked_value_states = packed_value_states.transpose(0, 1).split(sample_lens, dim=1)
-            unpacked_attn_output = []
-            for query_states, key_states, value_states, attention_mask_per_sample in zip(
-                unpacked_query_states,
-                unpacked_key_states,
-                unpacked_value_states,
-                attention_mask,
-                strict=True,
-            ):
-                with sdpa_kernel(backends=[SDPBackend.EFFICIENT_ATTENTION]):
-                    attn_output = scaled_dot_product_attention(
-                        query_states.to(torch.bfloat16).unsqueeze(0),
-                        key_states.to(torch.bfloat16).unsqueeze(0),
-                        value_states.to(torch.bfloat16).unsqueeze(0),
-                        attention_mask_per_sample.to(torch.bfloat16).unsqueeze(0),
-                    )
-                unpacked_attn_output.append(attn_output.squeeze(0))
-            packed_attn_output = torch.cat(unpacked_attn_output, dim=1)
-        else:
-            raise NotImplementedError("BAGEL Qwen2 MoT training currently requires nested attention masks.")
-
-        packed_attn_output = packed_attn_output.transpose(0, 1).reshape(-1, self.num_heads * self.head_dim)
+        packed_attn_output = self._masked_dense_attention(
+            packed_query_states_,
+            packed_key_states_,
+            packed_value_states,
+            attention_mask=attention_mask,
+        )
+        if ps.sp_enabled:
+            # Reverse the Ulysses sequence/head redistribution for the attention
+            # output: gather heads and scatter the packed sequence.
+            packed_attn_output = gather_heads_scatter_seq(
+                packed_attn_output,
+                seq_dim=0,
+                head_dim=1,
+                group=ps.ulysses_group,
+            )
+        packed_attn_output = packed_attn_output.reshape(-1, self.num_heads * self.head_dim)
         packed_attn_output_ = packed_attn_output.new_zeros(packed_attn_output.shape)
         attn_output_und = self.o_proj(packed_attn_output[packed_und_token_indexes])
         attn_output_gen = self.o_proj_moe_gen(packed_attn_output[packed_gen_token_indexes])
@@ -365,6 +368,34 @@ class BagelQwen2MoTAttention(nn.Module):
         if not has_gen_tokens:
             packed_attn_output_ = _fold_zero_anchors(packed_attn_output_, attn_output_gen)
         return packed_attn_output_
+
+    def _masked_dense_attention(
+        self,
+        query_states: torch.Tensor,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+        *,
+        attention_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Apply one native-GQA SDPA call to the active sample's complete packed sequence."""
+
+        query = query_states.transpose(0, 1).unsqueeze(0)
+        key = key_states.transpose(0, 1).unsqueeze(0)
+        value = value_states.transpose(0, 1).unsqueeze(0)
+        with sdpa_kernel(
+            backends=[SDPBackend.CUDNN_ATTENTION, SDPBackend.MATH],
+            set_priority=True,
+        ):
+            output = scaled_dot_product_attention(
+                query,
+                key,
+                value,
+                attn_mask=attention_mask,
+                dropout_p=0.0,
+                is_causal=False,
+                enable_gqa=True,
+            )
+        return output.squeeze(0).transpose(0, 1).contiguous()
 
     def _forward_packed_inference(
         self,
@@ -380,6 +411,12 @@ class BagelQwen2MoTAttention(nn.Module):
         mode: str = "und",
         packed_vae_token_indexes: Optional[torch.Tensor] = None,
         packed_text_indexes: Optional[torch.Tensor] = None,
+        *,
+        cu_seq_lens_q: torch.Tensor,
+        cu_seq_lens_k: torch.Tensor,
+        max_length_q: int,
+        max_length_k: int,
+        total_key_value_tokens: int,
     ) -> tuple[torch.Tensor, Optional[NaiveCache]]:
         is_gen = _check_packed_inference_mode(mode)
         if not is_gen:
@@ -440,7 +477,7 @@ class BagelQwen2MoTAttention(nn.Module):
             past_key_states = past_key_values.key_cache[self.layer_idx]
             past_value_states = past_key_values.value_cache[self.layer_idx]
 
-            seqlens = int(query_lens.sum().item() + key_values_lens.sum().item())
+            seqlens = total_key_value_tokens
             merged_key_states = past_key_states.new_zeros((seqlens, self.num_key_value_heads, self.head_dim))
             merged_value_states = past_key_states.new_zeros((seqlens, self.num_key_value_heads, self.head_dim))
             merged_key_states[packed_query_indexes] = packed_key_states
@@ -453,21 +490,24 @@ class BagelQwen2MoTAttention(nn.Module):
             merged_value_states = packed_value_states
             key_values_lens = query_lens
 
-        cu_seqlens_q = torch.nn.functional.pad(torch.cumsum(query_lens, dim=0), (1, 0))
-        cu_seqlens_k = torch.nn.functional.pad(torch.cumsum(key_values_lens, dim=0), (1, 0))
-        max_seqlen_q = int(query_lens.max().item())
-        max_seqlen_k = int(key_values_lens.max().item())
         if IS_CUDA_AVAILABLE:
-            packed_attn_output = flash_attn_varlen_func(
-                q=packed_query_states,
-                k=merged_key_states,
-                v=merged_value_states,
-                cu_seqlens_q=cu_seqlens_q.to(torch.int32),
-                cu_seqlens_k=cu_seqlens_k.to(torch.int32),
-                max_seqlen_q=max_seqlen_q,
-                max_seqlen_k=max_seqlen_k,
-                causal=is_causal,
+            packed_attn_output, _ = flash_attention_forward(
+                self,
+                packed_query_states.transpose(0, 1).unsqueeze(0),
+                merged_key_states.transpose(0, 1).unsqueeze(0),
+                merged_value_states.transpose(0, 1).unsqueeze(0),
+                attention_mask=None,
+                dropout=0.0,
+                is_causal=is_causal,
+                cu_seq_lens_q=cu_seq_lens_q,
+                cu_seq_lens_k=cu_seq_lens_k,
+                max_length_q=max_length_q,
+                max_length_k=max_length_k,
+                # Inference owns its packed KV-cache layout and does not enter the
+                # training-only module Ulysses redistribution.
+                skip_ulysses=True,
             )
+            packed_attn_output = packed_attn_output.squeeze(0)
         else:
             head_num = packed_query_states.shape[1]
             if is_causal:
@@ -483,8 +523,8 @@ class BagelQwen2MoTAttention(nn.Module):
                     scale=1.0 / math.sqrt(packed_query_states.shape[-1]),
                     keep_prob=1,
                     input_layout="TND",
-                    actual_seq_qlen=tuple(cu_seqlens_q[1:].cpu().numpy().tolist()),
-                    actual_seq_kvlen=tuple(cu_seqlens_k[1:].cpu().numpy().tolist()),
+                    actual_seq_qlen=tuple(cu_seq_lens_q[1:].cpu().numpy().tolist()),
+                    actual_seq_kvlen=tuple(cu_seq_lens_k[1:].cpu().numpy().tolist()),
                     sparse_mode=3,
                 )[0]
             else:
@@ -498,10 +538,9 @@ class BagelQwen2MoTAttention(nn.Module):
                     scale=1.0 / math.sqrt(packed_query_states.shape[-1]),
                     keep_prob=1,
                     input_layout="TND",
-                    actual_seq_qlen=tuple(cu_seqlens_q[1:].cpu().numpy().tolist()),
-                    actual_seq_kvlen=tuple(cu_seqlens_k[1:].cpu().numpy().tolist()),
+                    actual_seq_qlen=tuple(cu_seq_lens_q[1:].cpu().numpy().tolist()),
+                    actual_seq_kvlen=tuple(cu_seq_lens_k[1:].cpu().numpy().tolist()),
                 )[0]
-
         packed_attn_output = packed_attn_output.reshape(-1, self.hidden_size)
         if not is_gen:
             packed_attn_output = self.o_proj(packed_attn_output)
@@ -539,9 +578,9 @@ class BagelQwen2MoTDecoderLayer(nn.Module):
     def _forward_packed_train(
         self,
         packed_sequence: torch.Tensor,
-        sample_lens: list[int],
-        attention_mask: Any,
-        packed_position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        attention_mask: torch.Tensor,
+        packed_position_cos: torch.Tensor,
+        packed_position_sin: torch.Tensor,
         packed_und_token_indexes: torch.Tensor,
         packed_gen_token_indexes: torch.Tensor,
     ) -> torch.Tensor:
@@ -560,9 +599,9 @@ class BagelQwen2MoTDecoderLayer(nn.Module):
 
         packed_sequence_, _ = self.self_attn(
             packed_sequence=packed_sequence_,
-            sample_lens=sample_lens,
             attention_mask=attention_mask,
-            packed_position_embeddings=packed_position_embeddings,
+            packed_position_cos=packed_position_cos,
+            packed_position_sin=packed_position_sin,
             packed_und_token_indexes=packed_und_token_indexes,
             packed_gen_token_indexes=packed_gen_token_indexes,
         )
@@ -597,6 +636,12 @@ class BagelQwen2MoTDecoderLayer(nn.Module):
         mode: str = "und",
         packed_vae_token_indexes: Optional[torch.Tensor] = None,
         packed_text_indexes: Optional[torch.Tensor] = None,
+        *,
+        cu_seq_lens_q: torch.Tensor,
+        cu_seq_lens_k: torch.Tensor,
+        max_length_q: int,
+        max_length_k: int,
+        total_key_value_tokens: int,
     ) -> tuple[torch.Tensor, Optional[NaiveCache]]:
         is_gen = _check_packed_inference_mode(mode)
         residual = packed_query_sequence
@@ -624,6 +669,11 @@ class BagelQwen2MoTDecoderLayer(nn.Module):
             mode=mode,
             packed_vae_token_indexes=packed_vae_token_indexes,
             packed_text_indexes=packed_text_indexes,
+            cu_seq_lens_q=cu_seq_lens_q,
+            cu_seq_lens_k=cu_seq_lens_k,
+            max_length_q=max_length_q,
+            max_length_k=max_length_k,
+            total_key_value_tokens=total_key_value_tokens,
         )
         packed_query_sequence = residual + packed_query_sequence
 
@@ -667,14 +717,14 @@ class BagelQwen2MoTBackbone(nn.Module):
     def _forward_packed_train(
         self,
         packed_sequence: torch.Tensor,
-        sample_lens: list[int],
-        attention_mask: Any,
         packed_position_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
         packed_und_token_indexes: Optional[torch.Tensor] = None,
         packed_gen_token_indexes: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         cos, sin = self.rotary_emb(packed_sequence, packed_position_ids.unsqueeze(0))
-        packed_position_embeddings = (cos.squeeze(0), sin.squeeze(0))
+        packed_position_cos = cos.squeeze(0)
+        packed_position_sin = sin.squeeze(0)
 
         if self.use_moe:
             if packed_und_token_indexes is None:
@@ -690,18 +740,18 @@ class BagelQwen2MoTBackbone(nn.Module):
                 packed_sequence, _ = self._gradient_checkpointing_func(
                     decoder_layer.__call__,
                     packed_sequence,
-                    sample_lens,
                     attention_mask,
-                    packed_position_embeddings,
+                    packed_position_cos,
+                    packed_position_sin,
                     packed_und_token_indexes,
                     packed_gen_token_indexes,
                 )
             else:
                 packed_sequence, _ = decoder_layer(
                     packed_sequence=packed_sequence,
-                    sample_lens=sample_lens,
                     attention_mask=attention_mask,
-                    packed_position_embeddings=packed_position_embeddings,
+                    packed_position_cos=packed_position_cos,
+                    packed_position_sin=packed_position_sin,
                     packed_und_token_indexes=packed_und_token_indexes,
                     packed_gen_token_indexes=packed_gen_token_indexes,
                 )
@@ -750,6 +800,16 @@ class BagelQwen2MoTBackbone(nn.Module):
         cos, sin = self.rotary_emb(packed_query_sequence, packed_query_position_ids.unsqueeze(0))
         packed_query_position_embeddings = (cos.squeeze(0), sin.squeeze(0))
 
+        cache_has_values = past_key_values.key_cache[0] is not None
+        if cache_has_values and key_values_lens is None:
+            raise ValueError("key_values_lens is required when cache is non-empty.")
+        effective_key_values_lens = key_values_lens + query_lens if cache_has_values else query_lens
+        cu_seq_lens_q = torch.nn.functional.pad(torch.cumsum(query_lens, dim=0), (1, 0)).to(torch.int32)
+        cu_seq_lens_k = torch.nn.functional.pad(torch.cumsum(effective_key_values_lens, dim=0), (1, 0)).to(torch.int32)
+        max_length_q = int(query_lens.max().item())
+        max_length_k = int(effective_key_values_lens.max().item())
+        total_key_value_tokens = int(effective_key_values_lens.sum().item())
+
         for decoder_layer in self.layers:
             packed_query_sequence, past_key_values = decoder_layer(
                 packed_query_sequence=packed_query_sequence,
@@ -764,6 +824,11 @@ class BagelQwen2MoTBackbone(nn.Module):
                 mode=mode,
                 packed_vae_token_indexes=packed_vae_token_indexes,
                 packed_text_indexes=packed_text_indexes,
+                cu_seq_lens_q=cu_seq_lens_q,
+                cu_seq_lens_k=cu_seq_lens_k,
+                max_length_q=max_length_q,
+                max_length_k=max_length_k,
+                total_key_value_tokens=total_key_value_tokens,
             )
 
         if not is_gen:

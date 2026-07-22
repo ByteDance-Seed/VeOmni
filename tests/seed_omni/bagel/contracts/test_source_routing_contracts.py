@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -350,6 +352,44 @@ def test_bagel_qwen2_mot_flow_alignment_requires_real_flow_item() -> None:
     out = model._fold_dummy_anchors(packed_sequence, [[flow_output, flow_dummy]])
     assert out is not packed_sequence
     assert out.requires_grad
+
+
+def test_bagel_qwen2_mot_forward_pre_rejects_only_upstream_dummy_anchor(monkeypatch) -> None:
+    model = _tiny_qwen2_mot()
+    hidden_size = int(model.config.hidden_size)
+    siglip_dummy = ConversationItem(
+        type="image",
+        value=torch.ones(1, hidden_size, requires_grad=True),
+        role="dummy",
+        source=BAGEL_SIGLIP_CONTEXT,
+    )
+    monkeypatch.setattr(model, "_has_valid_upstream_embeddings", lambda conversation_list: (True, False))
+
+    with pytest.raises(ValueError, match="got no packable tokens"):
+        model.forward_pre(conversation_list=[[siglip_dummy]])
+
+
+def test_bagel_qwen2_mot_rejects_context_parallel_training(monkeypatch) -> None:
+    from veomni.models.seed_omni.modules.bagel.qwen2_mot import modulemixin
+
+    model = _tiny_qwen2_mot()
+    monkeypatch.setattr(
+        modulemixin,
+        "get_parallel_state",
+        lambda: SimpleNamespace(sp_size=2, cp_size=2),
+    )
+    conversation = [
+        [
+            ConversationItem(
+                type="text",
+                value=torch.zeros(1, int(model.config.hidden_size), device=model.device, dtype=model.dtype),
+                role="user",
+            )
+        ]
+    ]
+
+    with pytest.raises(ValueError, match="Ulysses sequence parallelism only"):
+        model.forward_pre(conversation_list=conversation)
 
 
 def test_bagel_flow_dummy_embed_anchors_to_vae_dummy_output() -> None:

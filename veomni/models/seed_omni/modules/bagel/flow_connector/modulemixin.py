@@ -6,6 +6,8 @@ from typing import Any
 
 import torch
 
+from ......distributed.parallel_state import get_parallel_state
+from ......distributed.sequence_parallel import gather_outputs, slice_input_tensor, sp_pad
 from ....graphs.generation_graph import FSM_SIGNAL_KEY
 from ....mixins.metric_meter_mixin import MetricMeterMixin
 from ....mixins.modulemixin import ModuleMixin, post_forward, pre_forward
@@ -40,9 +42,11 @@ class BagelFlowConnectorModuleMixin(ModuleMixin):
         self._conversation_carrier: list[list[ConversationItem]] | None = None
         self._embed_items: list[ConversationItem] = []
         self._embed_lengths: list[int] = []
+        self._sp_embed_length: int | None = None
         self._decode_target_groups: list[list[ConversationItem]] = []
         self._decode_lengths: list[int] = []
         self._decode_target: torch.Tensor | None = None
+        self._sp_decode_length: int | None = None
         self._generation_state = FlowGenerationState()
 
     def reset_local_inference_state(self) -> None:
@@ -201,6 +205,7 @@ class BagelFlowConnectorModuleMixin(ModuleMixin):
         del kwargs
         self._conversation_carrier = conversation_list
         self._embed_lengths = []
+        self._sp_embed_length = None
 
         self._embed_items = self._select_vae_context_latent_items(conversation_list)
         if not self._embed_items:
@@ -220,6 +225,7 @@ class BagelFlowConnectorModuleMixin(ModuleMixin):
                 inputs["latents"] = inputs["latents"] + anchor
                 parts.append(inputs)
                 self._embed_lengths.extend(lengths)
+                meter_lengths.extend(int(v) for v in lengths)
                 continue
 
             tag = item.meta.get(_IMG_TAG_KEY)
@@ -254,16 +260,26 @@ class BagelFlowConnectorModuleMixin(ModuleMixin):
             "position_ids": torch.cat([part["position_ids"] for part in parts], dim=0),
             "timesteps": torch.cat([part["timesteps"] for part in parts], dim=0),
         }
+        ps = get_parallel_state()
+        if ps.sp_size == 1:
+            self._sp_embed_length = None
+            return inputs
+
+        self._sp_embed_length, inputs = self._slice_sp_token_inputs("embed_latent", **inputs)
         return inputs
 
     @post_forward("embed_latent")
     def embed_latent_post(self, latent_embeds: torch.Tensor) -> dict[str, Any]:
+        if get_parallel_state().sp_size > 1:
+            latent_embeds = self._gather_sp_token_output("embed_latent", latent_embeds, self._sp_embed_length)
+
         conversation = self._conversation_carrier
         embed_items = self._embed_items
         embed_lengths = self._embed_lengths
         self._conversation_carrier = None
         self._embed_items = []
         self._embed_lengths = []
+        self._sp_embed_length = None
 
         self._scatter_latent_embeds(embed_items, embed_lengths, latent_embeds)
         return {"conversation_list": conversation}
@@ -278,6 +294,7 @@ class BagelFlowConnectorModuleMixin(ModuleMixin):
         self._conversation_carrier = conversation_list
         self._decode_lengths = []
         self._decode_target = None
+        self._sp_decode_length = None
 
         self._decode_target_groups = self._select_velocity_target_groups(conversation_list)
 
@@ -304,10 +321,21 @@ class BagelFlowConnectorModuleMixin(ModuleMixin):
         if target_parts:
             self._decode_target = torch.cat(target_parts, dim=0)
 
-        return {"hidden_states": torch.cat([part["hidden_states"] for part in inputs_parts], dim=0)}
+        self.metric_meter_set_seqlens("decode_velocity", [int(v) for v in self._decode_lengths])
+        inputs = {"hidden_states": torch.cat([part["hidden_states"] for part in inputs_parts], dim=0)}
+        ps = get_parallel_state()
+        if ps.sp_size == 1:
+            self._sp_decode_length = None
+            return inputs
+
+        self._sp_decode_length, inputs = self._slice_sp_token_inputs("decode_velocity", **inputs)
+        return inputs
 
     @post_forward("decode_velocity")
     def decode_velocity_post(self, velocity: torch.Tensor) -> dict[str, Any]:
+        if get_parallel_state().sp_size > 1:
+            velocity = self._gather_sp_token_output("decode_velocity", velocity, self._sp_decode_length)
+
         conversation = self._conversation_carrier
         decode_target_groups = self._decode_target_groups
         decode_lengths = self._decode_lengths
@@ -316,6 +344,7 @@ class BagelFlowConnectorModuleMixin(ModuleMixin):
         self._decode_target_groups = []
         self._decode_lengths = []
         self._decode_target = None
+        self._sp_decode_length = None
 
         real_velocity_parts = self._scatter_velocity(decode_target_groups, decode_lengths, velocity)
         loss = velocity.sum() * 0.0
@@ -325,6 +354,37 @@ class BagelFlowConnectorModuleMixin(ModuleMixin):
             token_count = torch.tensor(float(mse.shape[0]), device=mse.device, dtype=mse.dtype)
             loss = loss + mse.mean(dim=-1).sum() / token_count
         return {"conversation_list": conversation, "_loss": loss}
+
+    @staticmethod
+    def _slice_sp_token_inputs(method: str, **inputs: torch.Tensor) -> tuple[int, dict[str, torch.Tensor]]:
+        ps = get_parallel_state()
+        if ps.cp_size != 1:
+            raise ValueError(f"BAGEL flow connector {method} supports Ulysses groups only; got cp_size={ps.cp_size}.")
+
+        lengths = {name: int(tensor.shape[0]) for name, tensor in inputs.items()}
+        if not lengths or next(iter(lengths.values())) == 0:
+            raise ValueError(f"BAGEL flow connector {method} SP requires at least one token.")
+        if len(set(lengths.values())) != 1:
+            raise ValueError(f"BAGEL flow connector {method} SP inputs must have matching token lengths: {lengths}.")
+
+        full_length = next(iter(lengths.values()))
+        local_inputs = {
+            name: slice_input_tensor(
+                sp_pad(tensor, dim=0, pad_value=0),
+                dim=0,
+                padding=False,
+                group=ps.sp_group,
+            )
+            for name, tensor in inputs.items()
+        }
+        return full_length, local_inputs
+
+    @staticmethod
+    def _gather_sp_token_output(method: str, output: torch.Tensor, full_length: int | None) -> torch.Tensor:
+        if full_length is None:
+            raise RuntimeError(f"BAGEL flow connector {method} SP token length was not initialized.")
+        output = gather_outputs(output, gather_dim=0, group=get_parallel_state().sp_group)
+        return output.narrow(0, 0, full_length)
 
     # ── Dummy helpers ──────────────────────────────────
 

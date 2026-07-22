@@ -550,7 +550,14 @@ def test_bagel_vae_preprocessor_appends_per_sample_dummy_for_missing_context():
         dummy_pixel_shape=torch.tensor([2, 2], dtype=torch.long),
     )
     batch = [
-        [ConversationItem(type="image", value=torch.full((3, 4, 4), 9, dtype=torch.uint8), role="assistant")],
+        [
+            ConversationItem(
+                type="image",
+                value=torch.full((3, 4, 4), 9, dtype=torch.uint8),
+                role="assistant",
+                meta={_IMG_TAG_KEY: "gen"},
+            )
+        ],
         [ConversationItem(type="text", value="text-only", role="user")],
     ]
 
@@ -591,6 +598,7 @@ def test_bagel_vae_preprocessor_keeps_bs4_sample_aligned_for_0_2_4_images():
                             type="image",
                             value=torch.full((3, 4, 4), 9, dtype=torch.uint8),
                             role="assistant",
+                            meta={_IMG_TAG_KEY: "gen"},
                         )
                     ]
                 )

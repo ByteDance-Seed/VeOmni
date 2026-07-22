@@ -48,6 +48,11 @@ class BagelQwen2MoTConfig(Qwen2Config):
             tie_word_embeddings=tie_word_embeddings,
             **kwargs,
         )
+        if self.num_attention_heads % self.num_key_value_heads != 0:
+            raise ValueError(
+                "BAGEL Qwen2-MoT query heads must be divisible by KV heads, "
+                f"got query={self.num_attention_heads}, key_value={self.num_key_value_heads}."
+            )
         self.qk_norm = qk_norm
         self.layer_module = layer_module
         self.freeze_und = freeze_und

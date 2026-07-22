@@ -54,7 +54,6 @@ class BagelTextEncoderModuleMixin(TextEncoderModuleMixin):
 
     def init_omni_state(self) -> None:
         super().init_omni_state()
-        self._decode_has_valid_labels: bool = False
         self._chat_template: Optional[BagelChatTemplate] = None
 
     @property
@@ -154,10 +153,11 @@ class BagelTextEncoderModuleMixin(TextEncoderModuleMixin):
         conversation_list: Optional[List[List[ConversationItem]]] = None,
         **kwargs: Any,
     ) -> Dict[str, Any]:
-        del kwargs
-        self._conversation_carrier = conversation_list
-        input_ids = self._prepare_encode_inputs(self._conversation_carrier)
-        return {"input_ids": input_ids}
+        return super().encode_pre(conversation_list, **kwargs)
+
+    @post_forward("encode")
+    def encode_post(self, **outputs: Any) -> Dict[str, Any]:
+        return super().encode_post(**outputs)
 
     @pre_forward("decode")
     def decode_pre(
@@ -165,31 +165,11 @@ class BagelTextEncoderModuleMixin(TextEncoderModuleMixin):
         conversation_list: Optional[List[List[ConversationItem]]] = None,
         **kwargs: Any,
     ) -> Dict[str, Any]:
-        del kwargs
-        self._conversation_carrier = conversation_list
-
-        inputs = self._prepare_decode_inputs(conversation_list)
-        if inputs is not None:
-            hidden_states, shift_labels = inputs
-            has_valid_labels = bool(torch.any(shift_labels != -100).item())
-            if has_valid_labels:
-                self._decode_has_valid_labels = True
-                return {"hidden_states": hidden_states, "shift_labels": shift_labels}
-
-        dummy = self.dummy_inputs(kind="decode")
-        dummy = self._anchor_dummy_decode_inputs(conversation_list, dummy)
-        self._decode_has_valid_labels = False
-        return {"hidden_states": dummy["hidden_states"], "shift_labels": dummy["labels"]}
+        return super().decode_pre(conversation_list, **kwargs)
 
     @post_forward("decode")
     def decode_post(self, **outputs: Any) -> Dict[str, Any]:
-        if self._decode_has_valid_labels:
-            self._decode_has_valid_labels = False
-            return super().decode_post(**outputs)
-
-        conversation = self._conversation_carrier
-        self._conversation_carrier = None
-        return {"conversation_list": conversation, "_loss": outputs["logits"].sum() * 0.0}
+        return super().decode_post(**outputs)
 
     # ── Dummy helpers ──────────────────────────────────
 
@@ -271,7 +251,7 @@ class BagelTextEncoderModuleMixin(TextEncoderModuleMixin):
     def _prepare_decode_inputs(
         self,
         conversation_list: Optional[List[List[ConversationItem]]],
-    ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         if conversation_list is None:
             raise ValueError("BagelTextEncoder._prepare_decode_inputs requires conversation_list.")
 
@@ -297,12 +277,14 @@ class BagelTextEncoderModuleMixin(TextEncoderModuleMixin):
             hidden_parts.append(hidden_states.to(device=self.device, dtype=self.dtype))
             shift_label_parts.append(shift_labels)
 
-        if not hidden_parts:
-            return None
+        if hidden_parts:
+            hidden_states = torch.cat(hidden_parts, dim=0)
+            shift_labels = torch.cat(shift_label_parts, dim=0).to(device=hidden_states.device, non_blocking=True)
+            if torch.any(shift_labels != -100):
+                return hidden_states, shift_labels
 
-        hidden_states = torch.cat(hidden_parts, dim=0)
-        shift_labels = torch.cat(shift_label_parts, dim=0).to(device=hidden_states.device, non_blocking=True)
-        return hidden_states, shift_labels
+        dummy = self._anchor_dummy_decode_inputs(conversation_list, self.dummy_inputs(kind="decode"))
+        return dummy["hidden_states"], dummy["labels"]
 
 
 __all__ = [
