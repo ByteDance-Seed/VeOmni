@@ -28,6 +28,18 @@ def _model_cls(model_type: str):
     return OMNI_MODEL_REGISTRY[model_type]()
 
 
+def _patch_local_loss_reducer(monkeypatch):
+    """Keep module-only tests out of the distributed loss collective."""
+    import veomni.models.seed_omni.modules.janus.vqvae.modeling as vqvae_modeling
+
+    def _local_reduce(loss, num_valid_tokens, group=None):
+        del group
+        return torch.where(num_valid_tokens > 0, loss, torch.zeros_like(loss))
+
+    monkeypatch.setattr(vqvae_modeling, "reduce_sequence_parallel_loss", _local_reduce)
+    return vqvae_modeling
+
+
 def _load_omni_config(
     *,
     model_path: str = "",
@@ -276,8 +288,10 @@ def test_text_encoder_decode_inference_returns_logits_only():
     assert out["loss"] is None
 
 
-def test_janus_vqvae_decode_training_loss():
+def test_janus_vqvae_decode_training_loss(monkeypatch):
     """Training ``decode``: hidden_states + labels → scalar loss."""
+    _patch_local_loss_reducer(monkeypatch)
+
     JanusVqvae = _model_cls("janus_vqvae")
     JanusVqvaeConfig = _config_cls("janus_vqvae")
     jv = JanusVqvae(JanusVqvaeConfig(vq_config=_tiny_vq_cfg()))
@@ -293,8 +307,7 @@ def test_janus_vqvae_dummy_decode_keeps_generation_head_in_graph(monkeypatch):
     """FSDP2 regression: under FSDP the dummy decode path must route through
     ``generation_head`` so its grad/reduce_scatter fires on every rank (ranks
     with no assistant image would otherwise skip it and dead-lock NCCL)."""
-    import veomni.models.seed_omni.modules.janus.vqvae.modeling as vqvae_modeling
-
+    vqvae_modeling = _patch_local_loss_reducer(monkeypatch)
     monkeypatch.setattr(
         vqvae_modeling,
         "get_parallel_state",
@@ -368,8 +381,7 @@ def test_janus_vqvae_dummy_encode_skips_codec_in_eval_even_under_fsdp(monkeypatc
 def test_janus_vqvae_dummy_decode_keeps_generation_head_in_graph_without_fsdp(monkeypatch):
     """The non-distributed dummy path follows the same decode contract: ignored
     labels contribute 0.0 while ``generation_head`` remains in the graph."""
-    import veomni.models.seed_omni.modules.janus.vqvae.modeling as vqvae_modeling
-
+    vqvae_modeling = _patch_local_loss_reducer(monkeypatch)
     monkeypatch.setattr(
         vqvae_modeling,
         "get_parallel_state",
