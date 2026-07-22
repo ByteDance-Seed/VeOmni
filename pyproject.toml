@@ -69,6 +69,9 @@ gpu = [
   "liger-kernel",
   "flash-linear-attention",
   "quack-kernels[cu13]==0.5.0",
+  # Dao-AILab Gram Newton-Schulz (default muon_ns_implementation=gram_quack).
+  # Pure-torch `gram` path does not need this; package ImportError falls back to gram.
+  "gram-newton-schulz==0.1.6",
   "torch-c-dlpack-ext",
   "apache-tvm-ffi==0.1.9",
   # Training-capable DeepSeek V4 mHC kernels. TileKernels 1.0.0 requires
