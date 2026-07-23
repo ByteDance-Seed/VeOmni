@@ -662,19 +662,25 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
         b = self.in_proj_b(hidden_states)
         a = self.in_proj_a(hidden_states)
 
-        # Modification: Ulysses SP all-to-all for linear attention heads.
-        ulysses_enabled = get_parallel_state().ulysses_enabled
-        if ulysses_enabled:
-            ulysses_group = get_parallel_state().ulysses_group
-            ulysses_size = get_parallel_state().ulysses_size
-            ulysses_rank = get_parallel_state().ulysses_rank
-            assert self.num_k_heads % ulysses_size == 0 and self.num_v_heads % ulysses_size == 0, (
-                f"SP size ({ulysses_size}) must divide num_k_heads ({self.num_k_heads}) "
+        # Modification: Ulysses / unified-SP all-to-all for linear attention heads.
+        # CP>1 uses unified SP + zigzag restore (not Ring). Ulysses-only unchanged.
+        from veomni.distributed.context_parallel.gdn_sp import (
+            maybe_restore_canonical,
+            maybe_to_rank_major,
+            resolve_gdn_sp_group,
+        )
+
+        gdn_sp_group, gdn_sp_size, gdn_head_rank, gdn_need_zigzag = resolve_gdn_sp_group()
+        gdn_sp_enabled = gdn_sp_group is not None
+        cp_size_for_gdn = get_parallel_state().cp_size if gdn_need_zigzag else 1
+        if gdn_sp_enabled:
+            assert self.num_k_heads % gdn_sp_size == 0 and self.num_v_heads % gdn_sp_size == 0, (
+                f"SP size ({gdn_sp_size}) must divide num_k_heads ({self.num_k_heads}) "
                 f"and num_v_heads ({self.num_v_heads}) for gated deltanet LASP"
             )
 
-            local_num_k_heads = self.num_k_heads // ulysses_size
-            local_num_v_heads = self.num_v_heads // ulysses_size
+            local_num_k_heads = self.num_k_heads // gdn_sp_size
+            local_num_v_heads = self.num_v_heads // gdn_sp_size
             local_key_dim = self.head_k_dim * local_num_k_heads
             local_value_dim = self.head_v_dim * local_num_v_heads
 
@@ -685,14 +691,20 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
             v_proj = v_proj.reshape(batch_size, seq_len, self.num_v_heads, self.head_v_dim)
 
             # All-to-all: gather full sequence, scatter heads -> [B, S_full, local_heads, head_dim]
-            q_proj = gather_seq_scatter_heads(q_proj, seq_dim=1, head_dim=2, group=ulysses_group)
-            k_proj = gather_seq_scatter_heads(k_proj, seq_dim=1, head_dim=2, group=ulysses_group)
-            v_proj = gather_seq_scatter_heads(v_proj, seq_dim=1, head_dim=2, group=ulysses_group)
+            q_proj = gather_seq_scatter_heads(q_proj, seq_dim=1, head_dim=2, group=gdn_sp_group)
+            k_proj = gather_seq_scatter_heads(k_proj, seq_dim=1, head_dim=2, group=gdn_sp_group)
+            v_proj = gather_seq_scatter_heads(v_proj, seq_dim=1, head_dim=2, group=gdn_sp_group)
 
             b = b.reshape(batch_size, seq_len, self.num_v_heads)
             a = a.reshape(batch_size, seq_len, self.num_v_heads)
-            b = gather_seq_scatter_heads(b, seq_dim=1, head_dim=2, group=ulysses_group)
-            a = gather_seq_scatter_heads(a, seq_dim=1, head_dim=2, group=ulysses_group)
+            b = gather_seq_scatter_heads(b, seq_dim=1, head_dim=2, group=gdn_sp_group)
+            a = gather_seq_scatter_heads(a, seq_dim=1, head_dim=2, group=gdn_sp_group)
+
+            q_proj = maybe_restore_canonical(q_proj, enabled=gdn_need_zigzag, cp_size=cp_size_for_gdn, dim=1)
+            k_proj = maybe_restore_canonical(k_proj, enabled=gdn_need_zigzag, cp_size=cp_size_for_gdn, dim=1)
+            v_proj = maybe_restore_canonical(v_proj, enabled=gdn_need_zigzag, cp_size=cp_size_for_gdn, dim=1)
+            b = maybe_restore_canonical(b, enabled=gdn_need_zigzag, cp_size=cp_size_for_gdn, dim=1)
+            a = maybe_restore_canonical(a, enabled=gdn_need_zigzag, cp_size=cp_size_for_gdn, dim=1)
 
             # Flatten heads back to channels and concat for conv1d: [B, S_full, local_dim]
             q_proj = q_proj.reshape(q_proj.shape[0], q_proj.shape[1], -1)
@@ -704,6 +716,7 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
             local_num_v_heads = self.num_v_heads
             local_key_dim = self.key_dim
             local_value_dim = self.value_dim
+            gdn_head_rank = 0
 
         if use_precomputed_states:
             # Modification: keep this disabled until FLA causal_conv1d_update decode path is validated.
@@ -714,10 +727,10 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
                 conv_state = F.pad(mixed_qkv_t, (self.conv_kernel_size - mixed_qkv_t.shape[-1], 0))
                 cache_params.conv_states[self.layer_idx] = conv_state
             if self.causal_conv1d_fn is not None:
-                # Modification: shard conv1d weights per Ulysses rank to match head-sharded channels.
-                if ulysses_enabled:
+                # Modification: shard conv1d weights per SP rank to match head-sharded channels.
+                if gdn_sp_enabled:
                     conv_weight = self._get_local_conv1d_weight(
-                        ulysses_rank=ulysses_rank,
+                        ulysses_rank=gdn_head_rank,
                         local_key_dim=local_key_dim,
                         local_value_dim=local_value_dim,
                     )
@@ -767,9 +780,9 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
 
         beta = b.sigmoid()
         # If the model is loaded in fp16, without the .float() here, A might be -inf
-        # Modification: slice A_log/dt_bias for local V-heads under Ulysses SP.
-        if ulysses_enabled:
-            v_head_offset = ulysses_rank * local_num_v_heads
+        # Modification: slice A_log/dt_bias for local V-heads under SP.
+        if gdn_sp_enabled:
+            v_head_offset = gdn_head_rank * local_num_v_heads
             v_head_slice = slice(v_head_offset, v_head_offset + local_num_v_heads)
             g = -self.A_log[v_head_slice].float().exp() * F.softplus(a.float() + self.dt_bias[v_head_slice])
         else:
@@ -821,9 +834,12 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
             cache_params.recurrent_states[self.layer_idx] = last_recurrent_state
 
         # Modification: gather attention output back to sequence-sharded layout before gated norm.
-        if ulysses_enabled:
+        if gdn_sp_enabled:
+            core_attn_out = maybe_to_rank_major(
+                core_attn_out, enabled=gdn_need_zigzag, cp_size=cp_size_for_gdn, dim=1
+            )
             core_attn_out = gather_heads_scatter_seq(
-                core_attn_out, head_dim=2, seq_dim=1, group=get_parallel_state().ulysses_group
+                core_attn_out, head_dim=2, seq_dim=1, group=gdn_sp_group
             )
 
         # reshape input data into 2D tensor
