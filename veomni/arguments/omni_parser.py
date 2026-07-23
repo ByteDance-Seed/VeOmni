@@ -80,7 +80,9 @@ def load_yaml_with_inherit(path: str, *, _seen: set | None = None) -> Any:
         b_path = b if os.path.isabs(b) else os.path.normpath(os.path.join(here, b))
         base_data = load_yaml_with_inherit(b_path, _seen=seen)
         if not isinstance(base_data, dict):
-            raise ValueError(f"`{_INHERIT_KEY}` base {b_path} (from {path}) must be a mapping YAML, got {type(base_data).__name__}")
+            raise ValueError(
+                f"`{_INHERIT_KEY}` base {b_path} (from {path}) must be a mapping YAML, got {type(base_data).__name__}"
+            )
         merged = _deep_update(merged, base_data)
     return _deep_update(merged, data)
 

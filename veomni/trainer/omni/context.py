@@ -53,6 +53,8 @@ from typing import TYPE_CHECKING, Any, Callable, ContextManager, Iterable, Itera
 
 import torch
 
+from veomni.trainer.omni.omni_module_trainer import OmniModuleTrainer
+
 from ...distributed.offloading import build_activation_offloading_context
 from ...ops.batch_invariant_ops import set_batch_invariant_mode
 
@@ -132,7 +134,7 @@ def register_veomni_context(
 
 
 def setup_veomni_context(
-    args: Optional["OmniArguments"],
+    args: "OmniArguments",
     module_trainers: "Optional[Mapping[str, Any]]" = None,
 ) -> None:
     """Wire the run's active contexts from the catalog, based on ``args`` (once, at init).
@@ -141,12 +143,15 @@ def setup_veomni_context(
     whether — and how — its context applies to this run; the ones that return a
     provider are wired into the active set (others are simply absent, so there are
     no runtime flag checks). Called by the trainer (``_setup_context``). Rebuilds the
-    active set from scratch each call.
+    active set from scratch each call. ``args`` is always the live run args (the
+    builders read it directly — no ``None`` guard).
     """
     module_trainers = module_trainers if module_trainers is not None else {}
     _ACTIVE_CONTEXTS.clear()
     for name, entry in VEOMNI_CONTEXT_CATALOG.items():
-        provider = entry.build(args, module_trainers)
+        # module_trainers is passed by keyword so builders that don't need it can
+        # simply swallow it via **kwargs (only model_reshard names it explicitly).
+        provider = entry.build(args, module_trainers=module_trainers)
         if provider is not None:
             _ACTIVE_CONTEXTS[name] = _ActiveContext(provider, entry.phases, entry.modes)
 
@@ -208,7 +213,7 @@ def veomni_context(
 
 
 @register_veomni_context("no_grad", phases=("forward",), modes=("offline_cache",))
-def _build_no_grad(args, module_trainers):
+def _build_no_grad(args: "OmniArguments", **kwargs):
     # Always wired for its phase/mode: the offline-cache forward just encodes, no
     # backward, so grad is off. Training keeps grad on for the backward pass. A
     # fresh CM per step (torch.no_grad() is cheap; kept per-call for uniformity).
@@ -216,11 +221,11 @@ def _build_no_grad(args, module_trainers):
 
 
 @register_veomni_context("activation_offloading_forward", phases=("forward",), modes=("train", "offline_cache"))
-def _build_activation_offloading_forward(args, module_trainers):
+def _build_activation_offloading_forward(args: "OmniArguments", **kwargs):
     # Wired in only when offloading is enabled; the forward context is built ONCE
     # here and reused every step (matches BaseTrainer — the saved_tensors_hooks
     # instance is reusable across passes).
-    offload = args.train.accelerator.offload_config if args is not None else None
+    offload = args.train.accelerator.offload_config
     if offload is None or not offload.enable_activation:
         return None
     fwd_context, _ = build_activation_offloading_context(
@@ -230,11 +235,11 @@ def _build_activation_offloading_forward(args, module_trainers):
 
 
 @register_veomni_context("activation_offloading_backward", phases=("backward",), modes=("train", "offline_cache"))
-def _build_activation_offloading_backward(args, module_trainers):
+def _build_activation_offloading_backward(args: "OmniArguments", **kwargs):
     # Wired in only when offloading is enabled; the backward context is built ONCE
     # here and reused every step. Backward only ever fires for train; offline_cache
     # is listed for symmetry but never enters a backward.
-    offload = args.train.accelerator.offload_config if args is not None else None
+    offload = args.train.accelerator.offload_config
     if offload is None or not offload.enable_activation:
         return None
     _, bwd_context = build_activation_offloading_context(
@@ -244,16 +249,16 @@ def _build_activation_offloading_backward(args, module_trainers):
 
 
 @register_veomni_context("batch_invariant", phases=("forward", "backward"), modes=("train", "offline_cache"))
-def _build_batch_invariant(args, module_trainers):
+def _build_batch_invariant(args: "OmniArguments", **kwargs):
     # Wired in only when enabled. set_batch_invariant_mode is a generator CM
     # (single-use), so build a FRESH one each step.
-    if args is None or not args.train.enable_batch_invariant_mode:
+    if not args.train.enable_batch_invariant_mode:
         return None
     return lambda **kwargs: set_batch_invariant_mode(True)
 
 
 @register_veomni_context("model_reshard", phases=("forward",), modes=("train", "offline_cache"))
-def _build_model_reshard(args, module_trainers):
+def _build_model_reshard(args: "OmniArguments", module_trainers: "Mapping[str, OmniModuleTrainer]", **kwargs):
     # Wired in whenever there are module-trainers to cascade to (train / offline
     # cache). The no-op-without-accumulation decision is per step (depends on the
     # runtime num_micro_steps), so it lives in the provider; module_trainers is
@@ -270,7 +275,9 @@ def _build_model_reshard(args, module_trainers):
 
 
 @contextmanager
-def _reshard_cm(module_trainers, micro_step, num_micro_steps):
+def _reshard_cm(
+    module_trainers: "Mapping[str, OmniModuleTrainer]", micro_step: int, num_micro_steps: int
+) -> Iterator[None]:
     """Cascade the grad-accum reshard intent into every module-trainer.
 
     The micro-step arithmetic is a *global* grad-accum concept (same for every
@@ -287,7 +294,7 @@ def _reshard_cm(module_trainers, micro_step, num_micro_steps):
         reshard = None  # nothing to toggle on middle steps
     if reshard is not None:
         for module_trainer in module_trainers.values():
-            module_trainer.model_reshard(reshard)
+            module_trainer._model_reshard(reshard)
     yield
 
 

@@ -288,8 +288,7 @@ class OmniModuleTrainer:
             # read the wrong groups (e.g. an EP MoE backbone falls back to the non-EP
             # kernel path on its EP-sharded experts → shape mismatch). Re-enter this
             # module's state during recompute.
-            if self.base.args.train.gradient_checkpointing.enable:
-                self._scope_recompute_to_parallel_state()
+            self._scope_recompute_to_parallel_state()
 
             # This module's own checkpoint callbacks (DCP resume + HF/LoRA export),
             # reusing the shared single-model callbacks.  ``module_name`` (the
@@ -430,12 +429,13 @@ class OmniModuleTrainer:
         # DDP wraps the model (``.module``) and does not expose
         # ``gradient_checkpointing_enable``; FSDP2 wraps in place. Unwrap so the
         # call reaches the raw HF model regardless of dp_mode.
-        _unwrap_module(self.base.model).gradient_checkpointing_enable(
-            gradient_checkpointing_kwargs={
-                "use_reentrant": gc.enable_reentrant,
-                "context_fn": _recompute_context_fn,
-            }
-        )
+        if gc.enable:
+            _unwrap_module(self.base.model).gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={
+                    "use_reentrant": gc.enable_reentrant,
+                    "context_fn": _recompute_context_fn,
+                }
+            )
 
     # ── Optimizer / lr-scheduler (built here; the orchestrator only calls) ─────
 
@@ -460,7 +460,7 @@ class OmniModuleTrainer:
         with self._scoped():
             self.base._build_lr_scheduler()
 
-    def clip_grad_norm(self, max_norm: float, norm_type: float = 2.0) -> float:
+    def _clip_grad_norm(self, max_norm: float, norm_type: float = 2.0) -> float:
         """Clip this module's grads under its own parallelism; return the module norm.
 
         Owns entering its own state: ``veomni_omni_module_clip_grad_norm`` reads
@@ -472,7 +472,7 @@ class OmniModuleTrainer:
         with self._scoped():
             return veomni_omni_module_clip_grad_norm(self.base.model, max_norm, norm_type)
 
-    def model_reshard(self, reshard: bool) -> None:
+    def _model_reshard(self, reshard: bool) -> None:
         """Set ``set_reshard_after_backward`` on this module's FSDP2 units.
 
         A gradient-accumulation optimization owned per-module: the orchestrator
@@ -487,7 +487,7 @@ class OmniModuleTrainer:
         ``reshard_after_backward`` may differ per module — a DDP module has no
         FSDP2 units to toggle (skipped by the ``isinstance`` check), and a module
         that keeps ``reshard_after_backward=True`` opts out here. No
-        ``ParallelState`` is read (unlike :meth:`clip_grad_norm`), so this needs no
+        ``ParallelState`` is read (unlike :meth:`_clip_grad_norm`), so this needs no
         scoping — ``set_reshard_after_backward`` just flips a flag on the unit.
         """
         fsdp_cfg = self.base.args.train.accelerator.fsdp_config
@@ -509,7 +509,7 @@ class OmniModuleTrainer:
 
     # ── Metric metering ────────────────────────────────────────────────────────
 
-    def collect_metric_meter(self) -> Optional[MetricMeterResult]:
+    def _collect_metric_meter(self) -> Optional[MetricMeterResult]:
         """The per-module metrics computed at the last :meth:`on_step_end`.
 
         Returns ``(theoretical_flops, seqlens)`` for a metered module, else

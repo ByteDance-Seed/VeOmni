@@ -563,7 +563,7 @@ class OmniTrainer:
         """
         module_metrics: Dict[str, MetricMeterResult] = {}
         for name, module_trainer in self.module_trainers.items():
-            result = module_trainer.collect_metric_meter()
+            result = module_trainer._collect_metric_meter()
             if result is not None:
                 module_metrics[name] = result
         return module_metrics
@@ -577,7 +577,7 @@ class OmniTrainer:
         """
         max_grad_norm = self.base.args.train.optimizer.max_grad_norm
         module_grad_norms = [
-            module_trainer.clip_grad_norm(max_grad_norm) for module_trainer in self.module_trainers.values()
+            module_trainer._clip_grad_norm(max_grad_norm) for module_trainer in self.module_trainers.values()
         ]
         return math.sqrt(sum(g * g for g in module_grad_norms)) if module_grad_norms else 0.0
 

@@ -63,7 +63,7 @@ class _FakeModuleTrainer:
     def __init__(self):
         self.reshard_calls = []
 
-    def model_reshard(self, reshard):
+    def _model_reshard(self, reshard):
         self.reshard_calls.append(reshard)
 
 
@@ -270,15 +270,15 @@ def test_builtin_context_declared_phases_and_modes(name, phases, modes):
 
 
 def test_no_grad_always_wired_and_builds_no_grad():
-    provider = context._build_no_grad(None, {})
+    provider = context._build_no_grad(_args())
     assert provider is not None
     assert isinstance(provider(), torch.no_grad)
 
 
 def test_activation_offloading_wired_and_built_once_when_enabled():
     # offload on, grad-ckpt off → fwd is custom_save_on_cpu, bwd is nullcontext.
-    fwd_provider = context._build_activation_offloading_forward(_args(offload=True, gc=False), {})
-    bwd_provider = context._build_activation_offloading_backward(_args(offload=True, gc=False), {})
+    fwd_provider = context._build_activation_offloading_forward(_args(offload=True, gc=False))
+    bwd_provider = context._build_activation_offloading_backward(_args(offload=True, gc=False))
     assert isinstance(fwd_provider(), custom_save_on_cpu)
     assert isinstance(bwd_provider(), nullcontext)
     # built once at setup, reused every step (same instance across provider calls).
@@ -287,16 +287,16 @@ def test_activation_offloading_wired_and_built_once_when_enabled():
 
 
 def test_activation_offloading_not_wired_when_disabled():
-    assert context._build_activation_offloading_forward(_args(offload=False), {}) is None
-    assert context._build_activation_offloading_backward(_args(offload=False), {}) is None
+    assert context._build_activation_offloading_forward(_args(offload=False)) is None
+    assert context._build_activation_offloading_backward(_args(offload=False)) is None
 
 
 def test_batch_invariant_wired_only_when_enabled():
-    provider = context._build_batch_invariant(_args(batch_invariant=True), {})
+    provider = context._build_batch_invariant(_args(batch_invariant=True))
     assert provider is not None
     # generator CM (single-use), so a fresh instance is built each step.
     assert provider() is not provider()
-    assert context._build_batch_invariant(_args(batch_invariant=False), {}) is None
+    assert context._build_batch_invariant(_args(batch_invariant=False)) is None
 
 
 def test_model_reshard_not_wired_without_module_trainers():
@@ -369,8 +369,9 @@ def test_composer_reshard_cascade_on_train_forward():
             assert mt.reshard_calls == [False]
 
 
-def test_setup_none_wires_only_no_grad():
+def test_setup_all_off_wires_only_no_grad():
     with _saved_active():
-        setup_veomni_context(None)  # defensive: no args, no module-trainers
+        # everything off, no module-trainers → only the always-on no_grad is wired.
+        setup_veomni_context(_args(offload=False, batch_invariant=False))
         # only no_grad is wired; reshard/offloading/batch-invariant are absent.
         assert set(context._ACTIVE_CONTEXTS) == {"no_grad"}

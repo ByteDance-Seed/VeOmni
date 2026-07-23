@@ -45,8 +45,7 @@ def unwrap_graph_module(wrapped: nn.Module, *, module_name: str) -> ModuleMixin:
                 return base
 
     raise TypeError(
-        f"Graph module '{module_name}' must be a ModuleMixin or wrap one on `.module`; "
-        f"got {type(wrapped).__name__}."
+        f"Graph module '{module_name}' must be a ModuleMixin or wrap one on `.module`; got {type(wrapped).__name__}."
     )
 
 
