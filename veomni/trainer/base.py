@@ -56,9 +56,9 @@ from ..data import (
 from ..data.chat_template import ChatTemplate
 from ..data.data_collator import DataCollator, MainCollator
 from ..data.data_transform import build_data_transform
+from ..distributed.async_offload import apply_async_activation_offload
 from ..distributed.chunk_mbs import build_chunk_mbs_ranges, chunk_mbs_context
 from ..distributed.clip_grad_norm import veomni_clip_grad_norm
-from ..distributed.async_offload import apply_async_activation_offload
 from ..distributed.offloading import build_activation_offloading_context
 from ..distributed.parallel_state import clear_parallel_state, init_parallel_state, use_parallel_state
 from ..distributed.torch_compile import CompileConfig, mark_compile_step_begin
