@@ -7,6 +7,7 @@ import torch.nn.functional as F
 from torch import nn
 from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.nn.attention.flex_attention import create_block_mask
+from transformers.configuration_utils import PreTrainedConfig
 
 from veomni.utils.device import get_device_type, get_dist_comm_backend, get_torch_device
 
@@ -25,6 +26,7 @@ from veomni.distributed.sequence_parallel.comm import (
 )
 from veomni.distributed.sequence_parallel.data import gather_outputs, slice_input_tensor
 from veomni.distributed.sequence_parallel.utils import unpadding_tensor_for_seqeunce_parallel
+from veomni.models.transformers.masking_utils import create_causal_mask
 from veomni.ops.kernels.attention import flash as flash_backend
 from veomni.ops.kernels.attention import flex as flex_backend
 from veomni.utils.helper import enable_high_precision_for_bf16, set_seed
@@ -309,6 +311,73 @@ class AttentionBackendSequenceParallelTest(SequenceParallelTest):
 
             torch.testing.assert_close(sync_tensor(local_output, dim=1), baseline_output, rtol=3e-2, atol=3e-2)
             torch.testing.assert_close(sync_tensor(local_lse, dim=2), baseline_lse, rtol=3e-2, atol=3e-2)
+            baseline_output.backward(output_gradient)
+            local_output.backward(output_gradient[:, local_slice].contiguous())
+            self._assert_qkv_gradients(local, baseline)
+        finally:
+            flex_backend.get_parallel_state = original_get_parallel_state
+
+    @pytest.mark.skipif(
+        get_device_type() != "cuda" or get_torch_device().device_count() < 2,
+        reason="packed FlexAttention Ulysses parity requires at least 2 CUDA devices",
+    )
+    def test_packed_causal_flex_wrapper_matches_non_sp_oracle(self):
+        sequence_length = 16
+        group, world_size, device, local_slice, baseline, local, output_gradient = self._build_qkv(
+            sequence_length=sequence_length,
+            head_dim=16,
+            dtype=torch.bfloat16,
+            seed=9192,
+        )
+        config = PreTrainedConfig()
+        config._attn_implementation = "veomni_flex_attention_with_sp"
+        attention_mask = torch.ones(1, sequence_length, device=device, dtype=torch.long)
+        cu_seq_lens_q = torch.tensor([0, 3, 8, 12, 16], device=device, dtype=torch.int32)
+        module = _FakeFlexAttentionModule().to(device)
+        original_get_parallel_state = flex_backend.get_parallel_state
+        try:
+            flex_backend.get_parallel_state = lambda: SimpleNamespace(ulysses_enabled=False)
+            baseline_block_mask = create_causal_mask(
+                config=config,
+                inputs_embeds=torch.empty(1, sequence_length, 1, device=device),
+                attention_mask=attention_mask,
+                past_key_values=None,
+                cu_seq_lens_q=cu_seq_lens_q,
+            )
+            baseline_output, _ = flex_backend.flex_attention_forward(
+                module,
+                *baseline,
+                baseline_block_mask,
+                kernel_options={"BACKEND": "TRITON"},
+            )
+
+            flex_backend.get_parallel_state = lambda: SimpleNamespace(
+                ulysses_enabled=True,
+                ulysses_group=group,
+                ulysses_size=world_size,
+            )
+            local_block_mask = create_causal_mask(
+                config=config,
+                inputs_embeds=torch.empty(1, sequence_length // world_size, 1, device=device),
+                attention_mask=attention_mask,
+                past_key_values=None,
+                cu_seq_lens_q=cu_seq_lens_q,
+            )
+            local_output, _ = flex_backend.flex_attention_forward(
+                module,
+                *local,
+                local_block_mask,
+                kernel_options={"BACKEND": "TRITON"},
+            )
+
+            def index(value):
+                return torch.tensor(value, device=device)
+
+            assert baseline_block_mask.shape == local_block_mask.shape == (1, 1, sequence_length, sequence_length)
+            assert not local_block_mask.mask_mod(index(0), index(0), index(8), index(7))
+            assert local_block_mask.mask_mod(index(0), index(0), index(7), index(3))
+            torch.testing.assert_close(sync_tensor(local_output, dim=1), baseline_output, rtol=3e-2, atol=3e-2)
+
             baseline_output.backward(output_gradient)
             local_output.backward(output_gradient[:, local_slice].contiguous())
             self._assert_qkv_gradients(local, baseline)

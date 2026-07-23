@@ -9,6 +9,8 @@
 #  It contains a patched version of the original HuggingFace modeling code.
 #
 #  Patches applied:
+#    - method_override: Gemma3TextModel.forward
+#      Pass packed-sequence boundaries into VeOmni FlexAttention mask preparation
 #    - method_override: Gemma3ForCausalLM.forward
 #      Adapt Gemma 3 causal-LM loss to VeOmni's fused-loss output contract
 #
@@ -26,7 +28,7 @@ from transformers.cache_utils import Cache, DynamicCache
 from transformers.configuration_utils import PreTrainedConfig
 from transformers.generation import GenerationMixin
 from transformers.integrations import use_kernel_func_from_hub, use_kernelized_func
-from transformers.masking_utils import create_causal_mask, create_masks_for_generate, create_sliding_window_causal_mask
+from transformers.masking_utils import create_masks_for_generate
 from transformers.modeling_layers import GenericForSequenceClassification, GradientCheckpointingLayer
 from transformers.modeling_outputs import (
     BaseModelOutputWithPast,
@@ -48,6 +50,8 @@ from transformers.utils import (
 )
 from transformers.utils.generic import maybe_autocast, merge_with_config_defaults
 from transformers.utils.output_capturing import capture_outputs
+
+from veomni.models.transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
 
 # Additional import blocks for patches
 # Bound at model-build time by _bind_veomni_ops() in auto.py.
@@ -496,6 +500,12 @@ def _bidirectional_window_overlay(sliding_window: int) -> Callable[[int, int, in
     return inner_mask
 
 
+# ======================================================================
+# [MODIFIED CLASS] Gemma3TextModel
+# Methods patched: forward
+# ======================================================================
+
+
 @auto_docstring
 class Gemma3TextModel(Gemma3PreTrainedModel):
     config: Gemma3TextConfig
@@ -556,6 +566,7 @@ class Gemma3TextModel(Gemma3PreTrainedModel):
                 "attention_mask": attention_mask,
                 "past_key_values": past_key_values,
                 "position_ids": position_ids,
+                "cu_seq_lens_q": kwargs.get("cu_seq_lens_q"),
             }
             sliding_mask_kwargs = mask_kwargs.copy()
 

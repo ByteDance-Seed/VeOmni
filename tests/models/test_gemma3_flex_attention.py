@@ -18,6 +18,7 @@ import json
 import os
 import statistics
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -40,6 +41,7 @@ from veomni.models.transformers.gemma3.generated.patched_modeling_gemma3_gpu imp
     Gemma3TextModel as VeOmniGemma3TextModel,
 )
 from veomni.ops.kernels import attention as veomni_attention
+from veomni.ops.kernels.attention import flex as flex_attention
 
 
 _TOY_CONFIG = Path(__file__).parents[1] / "toy_config" / "gemma3_toy"
@@ -228,6 +230,177 @@ def test_gemma3_routes_native_full_and_sliding_block_masks(monkeypatch):
     assert not sliding_mask.mask_mod(zero, zero, query_idx, distant_key_idx)
     assert sliding_mask.mask_mod(zero, zero, query_idx, nearby_key_idx)
     assert full_mask.mask_mod(zero, zero, query_idx, distant_key_idx)
+
+
+def test_gemma3_builds_pack_aware_full_and_sliding_block_masks(monkeypatch):
+    captured = []
+
+    def fake_flex_adapter(module, query, key, value, attention_mask, **kwargs):
+        captured.append((module.layer_type, attention_mask))
+        return torch.zeros_like(query).transpose(1, 2), None
+
+    monkeypatch.setitem(
+        veomni_attention._ATTENTION_FORWARD_DISPATCH,
+        _FLEX_IMPLEMENTATION,
+        fake_flex_adapter,
+    )
+    config = _toy_config()
+    model = VeOmniGemma3ForCausalLM._from_config(config, attn_implementation=_FLEX_IMPLEMENTATION).eval()
+    input_ids = torch.randint(3, config.vocab_size, (1, 8))
+    position_ids = torch.tensor([[0, 1, 2, 0, 1, 2, 3, 4]])
+    cu_seq_lens_q = torch.tensor([0, 3, 8], dtype=torch.int32)
+
+    with torch.no_grad():
+        model(
+            input_ids=input_ids,
+            attention_mask=torch.ones_like(input_ids),
+            position_ids=position_ids,
+            cu_seq_lens_q=cu_seq_lens_q,
+            use_cache=False,
+        )
+
+    assert [layer_type for layer_type, _ in captured] == ["sliding_attention", "full_attention"]
+    zero = torch.tensor(0)
+    first_token_in_second_pack = torch.tensor(3)
+    last_token_in_first_pack = torch.tensor(2)
+    for _, block_mask in captured:
+        assert not block_mask.mask_mod(zero, zero, first_token_in_second_pack, last_token_in_first_pack)
+
+
+def test_gemma3_packed_flex_matches_independent_samples_on_cpu():
+    torch.compiler.reset()
+    torch.manual_seed(123)
+    config = _toy_config()
+    model = VeOmniGemma3ForCausalLM._from_config(config, attn_implementation=_FLEX_IMPLEMENTATION).eval()
+    first_input_ids = torch.tensor([[5, 6, 7]])
+    second_input_ids = torch.tensor([[8, 9, 10, 11, 12]])
+    packed_input_ids = torch.cat((first_input_ids, second_input_ids), dim=1)
+
+    with torch.no_grad():
+        packed_logits = model(
+            input_ids=packed_input_ids,
+            attention_mask=torch.ones_like(packed_input_ids),
+            position_ids=torch.tensor([[0, 1, 2, 0, 1, 2, 3, 4]]),
+            cu_seq_lens_q=torch.tensor([0, 3, 8], dtype=torch.int32),
+            use_cache=False,
+        ).logits
+        first_logits = model(
+            input_ids=first_input_ids,
+            attention_mask=torch.ones_like(first_input_ids),
+            position_ids=torch.arange(3).unsqueeze(0),
+            cu_seq_lens_q=torch.tensor([0, 3], dtype=torch.int32),
+            use_cache=False,
+        ).logits
+        second_logits = model(
+            input_ids=second_input_ids,
+            attention_mask=torch.ones_like(second_input_ids),
+            position_ids=torch.arange(5).unsqueeze(0),
+            cu_seq_lens_q=torch.tensor([0, 5], dtype=torch.int32),
+            use_cache=False,
+        ).logits
+
+    torch.testing.assert_close(packed_logits[:, :3], first_logits, rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(packed_logits[:, 3:], second_logits, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Gemma 3 packed FlexAttention requires CUDA")
+def test_gemma3_packed_flex_matches_independent_samples_on_cuda():
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    torch.manual_seed(127)
+    config = _toy_config()
+    model = VeOmniGemma3ForCausalLM._from_config(
+        config,
+        attn_implementation=_FLEX_IMPLEMENTATION,
+    ).to(device=device, dtype=dtype)
+    model.eval()
+    packed_inputs = torch.randn(
+        1,
+        8,
+        config.hidden_size,
+        device=device,
+        dtype=dtype,
+        requires_grad=True,
+    )
+
+    with torch.no_grad():
+        first_logits = model(
+            inputs_embeds=packed_inputs[:, :3].detach(),
+            attention_mask=torch.ones(1, 3, device=device, dtype=torch.long),
+            position_ids=torch.arange(3, device=device).unsqueeze(0),
+            cu_seq_lens_q=torch.tensor([0, 3], device=device, dtype=torch.int32),
+            use_cache=False,
+        ).logits
+        second_logits = model(
+            inputs_embeds=packed_inputs[:, 3:].detach(),
+            attention_mask=torch.ones(1, 5, device=device, dtype=torch.long),
+            position_ids=torch.arange(5, device=device).unsqueeze(0),
+            cu_seq_lens_q=torch.tensor([0, 5], device=device, dtype=torch.int32),
+            use_cache=False,
+        ).logits
+
+    packed_logits = model(
+        inputs_embeds=packed_inputs,
+        attention_mask=torch.ones(1, 8, device=device, dtype=torch.long),
+        position_ids=torch.tensor([[0, 1, 2, 0, 1, 2, 3, 4]], device=device),
+        cu_seq_lens_q=torch.tensor([0, 3, 8], device=device, dtype=torch.int32),
+        use_cache=False,
+    ).logits
+
+    assert model.config._attn_implementation == _FLEX_IMPLEMENTATION
+    torch.testing.assert_close(packed_logits[:, :3], first_logits, rtol=3e-2, atol=3e-2)
+    torch.testing.assert_close(packed_logits[:, 3:], second_logits, rtol=3e-2, atol=3e-2)
+
+    packed_logits.float().square().mean().backward()
+    gradients = (
+        packed_inputs.grad,
+        model.model.layers[0].self_attn.q_proj.weight.grad,
+        model.model.layers[0].self_attn.k_proj.weight.grad,
+        model.model.layers[0].self_attn.v_proj.weight.grad,
+        model.model.layers[0].self_attn.o_proj.weight.grad,
+        model.lm_head.weight.grad,
+    )
+    for gradient in gradients:
+        assert gradient is not None
+        assert torch.isfinite(gradient).all()
+        assert gradient.abs().max() > 0
+
+
+def test_gemma3_builds_global_pack_aware_masks_with_ulysses(monkeypatch):
+    captured = []
+
+    def fake_flex_adapter(module, query, key, value, attention_mask, **kwargs):
+        captured.append(attention_mask)
+        return torch.zeros_like(query).transpose(1, 2), None
+
+    monkeypatch.setattr(
+        flex_attention,
+        "get_parallel_state",
+        lambda: SimpleNamespace(ulysses_enabled=True, ulysses_size=2),
+    )
+    monkeypatch.setitem(
+        veomni_attention._ATTENTION_FORWARD_DISPATCH,
+        _FLEX_IMPLEMENTATION,
+        fake_flex_adapter,
+    )
+    config = _toy_config()
+    model = VeOmniGemma3ForCausalLM._from_config(config, attn_implementation=_FLEX_IMPLEMENTATION).eval()
+    local_input_ids = torch.randint(3, config.vocab_size, (1, 4))
+
+    with torch.no_grad():
+        model(
+            input_ids=local_input_ids,
+            attention_mask=torch.ones(1, 8, dtype=torch.long),
+            position_ids=torch.tensor([[0, 1, 2, 0]]),
+            cu_seq_lens_q=torch.tensor([0, 3, 5, 8], dtype=torch.int32),
+            use_cache=False,
+        )
+
+    assert len(captured) == 2
+    zero = torch.tensor(0)
+    for block_mask in captured:
+        assert block_mask.shape == (1, 1, 8, 8)
+        assert not block_mask.mask_mod(zero, zero, torch.tensor(5), torch.tensor(4))
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Gemma 3 FlexAttention backward requires CUDA")
