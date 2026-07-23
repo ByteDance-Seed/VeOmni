@@ -369,6 +369,62 @@ their preference pair's source metadata. If distinct source names sanitize to
 the same metric key, the stable source-ID prefix keeps their time series
 distinct from the first emission.
 
+#### Public loader metadata contract
+
+Public multi-source loaders attach a versioned raw envelope to every transformed
+feature before collation:
+
+```python
+{
+    "_veomni_source_metadata": {
+        "schema_version": 1,
+        "source_id": 7,  # an int or str; bool is rejected
+        "source_name": "repoqa",  # optional
+        # Optional diagnostics: row_id, sample_id, part_index
+    }
+}
+```
+
+Configured source IDs must be unique while preserving their type, so `7` and
+`"7"` are distinct. For channel-loss attribution, a custom loader only needs
+to attach this raw envelope before `MainCollator`; it does not need to
+implement packing or sequence-parallel handling. When VeOmni's multisource
+environment meter is enabled as well, the loader must continue to expose its
+integer `ds_idx` compatibility field.
+
+`MainCollator` consumes the raw envelope and emits
+`_veomni_packed_source_metadata` with `schema_version=1`,
+`coordinate_space="packed_pre_sp"`, `valid_token_count`, and an ordered
+`segments` list. Each segment records `segment_index`, `sample_index`,
+`subsegment_index`, `token_start`, and `token_length`, plus its source fields
+and any optional diagnostics. Coordinates describe the full packed sequence
+before sequence-parallel slicing. Fixed-length and sequence-parallel tail
+padding are excluded, and every sequence-parallel rank receives the same
+envelope. `source_name` is either present on every packed segment or omitted
+from every segment; mixed presence is rejected to prevent incorrect attribution.
+
+Channel loss prefers the canonical packed envelope and uses configured legacy
+metadata keys only as a compatibility fallback. If canonical and legacy
+metadata coexist, their typed source IDs and names must agree segment by
+segment or training fails closed. Fields owned by the canonical or VeOmni
+multisource contract are removed before model forward, including when channel
+loss is disabled; unrelated generic custom-model inputs are preserved.
+
+Fixed-sample batching requires each input transform to produce exactly one
+feature. A one-to-many transform must use dynamic batching; fixed batching
+fails explicitly instead of silently dropping transformed parts.
+
+Iterable interleave checkpoints now persist the ordered typed `source_ids`
+topology and reject a changed topology on resume. Legacy version-less
+checkpoints remain loadable, but did not record enough information for this
+validation.
+
+Version-0 weighted-multisource checkpoints whose IDs equal display names are
+interpreted as output from the historical builder behavior and migrated by
+unchanged source name. Renaming or otherwise changing that ambiguous v0
+topology cannot guarantee exact recovery; use strict reconciliation or an
+explicit offline migration instead.
+
 When W&B is enabled, rank 0 also publishes one final `channel_overview` HTML
 snapshot. It combines every source on one shared-axis loss chart with a
 raw/weighted toggle, shows the observed label-token mix as a 100% stacked

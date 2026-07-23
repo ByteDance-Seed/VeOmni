@@ -37,6 +37,11 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 
+from ...data.source_metadata import (
+    PACKED_SOURCE_METADATA_KEY,
+    normalize_packed_source_metadata,
+    strip_source_metadata,
+)
 from ...distributed.parallel_state import get_parallel_state
 from ...utils.constants import IGNORE_INDEX
 from ...utils.device import empty_cache, synchronize
@@ -1724,12 +1729,21 @@ class ChannelLossCallback(Callback):
         self._collect_step = state.global_step % self.config.interval == 0
         if not self._collect_step:
             self.computer.begin_step([], [], [])
+            missing_source_micro_steps = []
+            for micro_step, micro_batch in enumerate(micro_batches or []):
+                source_ids, source_names, _, _, canonical_segments = self._extract_metadata(micro_batch)
+                if canonical_segments is not None:
+                    self._validate_canonical_legacy_metadata(
+                        micro_batch,
+                        source_ids,
+                        source_names,
+                        canonical_segments,
+                    )
+                else:
+                    self._raise_if_ambiguous_single_legacy_name(source_ids, source_names)
+                if self.config.strict and not source_ids:
+                    missing_source_micro_steps.append(micro_step)
             if self.config.strict:
-                missing_source_micro_steps = []
-                for micro_step, micro_batch in enumerate(micro_batches or []):
-                    source_ids, _, _, _ = self._extract_metadata(micro_batch)
-                    if not source_ids:
-                        missing_source_micro_steps.append(micro_step)
                 self._raise_if_missing_source_ids(missing_source_micro_steps)
             return
 
@@ -1738,10 +1752,21 @@ class ChannelLossCallback(Callback):
         per_mb_attention_masks: list[torch.Tensor | None] = []
         missing_source_micro_steps = []
         for micro_step, micro_batch in enumerate(micro_batches or []):
-            source_ids, source_names, position_ids, attention_mask = self._extract_metadata(micro_batch)
+            source_ids, source_names, position_ids, attention_mask, canonical_segments = self._extract_metadata(
+                micro_batch
+            )
             if self.config.strict and not source_ids:
                 missing_source_micro_steps.append(micro_step)
-            source_ids, source_names = self._repeat_source_metadata(source_ids, source_names, source_repeat)
+            if canonical_segments is not None:
+                source_names = self._validate_canonical_legacy_metadata(
+                    micro_batch,
+                    source_ids,
+                    source_names,
+                    canonical_segments,
+                )
+            else:
+                source_ids, source_names = self._repeat_source_metadata(source_ids, source_names, source_repeat)
+                self._raise_if_ambiguous_single_legacy_name(source_ids, source_names)
             self.computer.record_source_names(source_ids, source_names)
             per_mb_source_ids.append(source_ids)
             per_mb_position_ids.append(position_ids)
@@ -1765,6 +1790,65 @@ class ChannelLossCallback(Callback):
             source_names = [source_name for source_name in source_names for _ in range(repeat)]
         return repeated_ids, source_names
 
+    def _validate_canonical_legacy_metadata(
+        self,
+        micro_batch: dict[str, Any],
+        canonical_ids: list[ChannelKey],
+        canonical_names: list[str],
+        canonical_segments: list[dict[str, Any]],
+    ) -> list[str]:
+        legacy_ids = self._first_present_list(micro_batch, self.config.source_id_keys, _as_channel_key_list)
+        legacy_names = self._first_present_list(micro_batch, self.config.source_name_keys, _as_str_list)
+        sample_count = max(segment["sample_index"] for segment in canonical_segments) + 1 if canonical_segments else 0
+        if legacy_ids:
+            id_candidates = []
+            if len(legacy_ids) == sample_count:
+                id_candidates.append([legacy_ids[segment["sample_index"]] for segment in canonical_segments])
+            if len(legacy_ids) == len(canonical_segments):
+                id_candidates.append(legacy_ids)
+            canonical_signature = _source_id_signature(canonical_ids)
+            if not any(_source_id_signature(candidate_ids) == canonical_signature for candidate_ids in id_candidates):
+                raise ChannelLossMetadataError(
+                    "Channel loss: canonical source IDs conflict with legacy source metadata "
+                    f"(canonical={canonical_signature}, legacy={_source_id_signature(legacy_ids)}, "
+                    f"sample_count={sample_count})."
+                )
+
+        if not legacy_names:
+            return canonical_names
+        self._raise_if_ambiguous_single_legacy_name(canonical_ids, legacy_names)
+        name_candidates = []
+        if len(legacy_names) == sample_count:
+            name_candidates.append([legacy_names[segment["sample_index"]] for segment in canonical_segments])
+        if len(legacy_names) == len(canonical_segments):
+            name_candidates.append(legacy_names)
+        if len(legacy_names) == 1:
+            name_candidates.append(legacy_names * len(canonical_segments))
+        if canonical_names:
+            if any(candidate_names == canonical_names for candidate_names in name_candidates):
+                return canonical_names
+            raise ChannelLossMetadataError(
+                "Channel loss: canonical source names conflict with legacy source metadata "
+                f"(canonical={canonical_names!r}, legacy={legacy_names!r}, sample_count={sample_count})."
+            )
+        if not name_candidates:
+            raise ChannelLossMetadataError(
+                "Channel loss: canonical source names conflict with legacy source metadata "
+                f"(canonical_count=0, legacy_count={len(legacy_names)}, sample_count={sample_count})."
+            )
+        return name_candidates[0]
+
+    @staticmethod
+    def _raise_if_ambiguous_single_legacy_name(
+        source_ids: list[ChannelKey],
+        source_names: list[str],
+    ) -> None:
+        if len(source_names) == 1 and len(set(_source_id_signature(source_ids))) > 1:
+            raise ChannelLossMetadataError(
+                "Channel loss: a single legacy source name is ambiguous for multiple typed source IDs "
+                f"(source_ids={_source_id_signature(source_ids)}, legacy_name={source_names[0]!r})."
+            )
+
     def _raise_if_missing_source_ids(self, local_missing_micro_steps: list[int]) -> None:
         if not self._synchronize_strict_failure(bool(local_missing_micro_steps)):
             return
@@ -1785,7 +1869,10 @@ class ChannelLossCallback(Callback):
         self.computer.before_micro_step()
 
     def strip_model_inputs(self, micro_batch: dict[str, Any]) -> None:
-        if not self.enabled or not isinstance(micro_batch, dict):
+        if not isinstance(micro_batch, dict):
+            return
+        strip_source_metadata(micro_batch)
+        if not self.enabled:
             return
         for key in self._strip_keys:
             micro_batch.pop(key, None)
@@ -2175,17 +2262,41 @@ class ChannelLossCallback(Callback):
     def _extract_metadata(
         self,
         micro_batch: Any,
-    ) -> tuple[list[ChannelKey], list[str], torch.Tensor | None, torch.Tensor | None]:
+    ) -> tuple[list[ChannelKey], list[str], torch.Tensor | None, torch.Tensor | None, list[dict] | None]:
         if isinstance(micro_batch, dict):
-            source_ids = self._first_present_list(micro_batch, self.config.source_id_keys, _as_channel_key_list)
-            source_names = self._first_present_list(micro_batch, self.config.source_name_keys, _as_str_list)
+            if PACKED_SOURCE_METADATA_KEY in micro_batch:
+                try:
+                    packed_metadata = normalize_packed_source_metadata(micro_batch[PACKED_SOURCE_METADATA_KEY])
+                except ValueError as exc:
+                    raise ChannelLossMetadataError(f"Channel loss: invalid canonical source metadata: {exc}") from exc
+                self._validate_canonical_packing_boundaries(micro_batch, packed_metadata)
+                segments = packed_metadata["segments"]
+                canonical_source_ids = [segment["source_id"] for segment in segments]
+                canonical_source_names = (
+                    [segment["source_name"] for segment in segments]
+                    if all("source_name" in segment for segment in segments)
+                    else []
+                )
+                position_ids = micro_batch.get("position_ids")
+                attention_mask = micro_batch.get("attention_mask")
+                return (
+                    canonical_source_ids,
+                    canonical_source_names,
+                    position_ids if isinstance(position_ids, torch.Tensor) else None,
+                    attention_mask if isinstance(attention_mask, torch.Tensor) else None,
+                    segments,
+                )
+
+            legacy_source_ids = self._first_present_list(micro_batch, self.config.source_id_keys, _as_channel_key_list)
+            legacy_source_names = self._first_present_list(micro_batch, self.config.source_name_keys, _as_str_list)
             position_ids = micro_batch.get("position_ids")
             attention_mask = micro_batch.get("attention_mask")
             return (
-                source_ids,
-                source_names,
+                legacy_source_ids,
+                legacy_source_names,
                 position_ids if isinstance(position_ids, torch.Tensor) else None,
                 attention_mask if isinstance(attention_mask, torch.Tensor) else None,
+                None,
             )
 
         if isinstance(micro_batch, (list, tuple)):
@@ -2196,9 +2307,147 @@ class ChannelLossCallback(Callback):
                     continue
                 source_ids.extend(self._first_present_list(sample, self.config.source_id_keys, _as_channel_key_list))
                 source_names.extend(self._first_present_list(sample, self.config.source_name_keys, _as_str_list))
-            return source_ids, source_names, None, None
+            return source_ids, source_names, None, None, None
 
-        return [], [], None, None
+        return [], [], None, None, None
+
+    def _validate_canonical_packing_boundaries(
+        self,
+        micro_batch: dict[str, Any],
+        packed_metadata: dict[str, Any],
+    ) -> None:
+        canonical_boundaries = [0]
+        canonical_boundaries.extend(
+            segment["token_start"] + segment["token_length"] for segment in packed_metadata["segments"]
+        )
+        valid_token_count = packed_metadata["valid_token_count"]
+
+        cu_seq_lens_q = micro_batch.get("cu_seq_lens_q")
+        if isinstance(cu_seq_lens_q, torch.Tensor):
+            if cu_seq_lens_q.dim() != 1 or cu_seq_lens_q.numel() < 2:
+                raise ChannelLossMetadataError(
+                    "Channel loss: canonical boundary validation requires one-dimensional cu_seq_lens_q "
+                    "with at least two entries."
+                )
+            full_boundaries = cu_seq_lens_q.detach().cpu().tolist()
+            if (
+                full_boundaries[0] != 0
+                or any(type(boundary) is not int for boundary in full_boundaries)
+                or any(left >= right for left, right in zip(full_boundaries, full_boundaries[1:]))
+            ):
+                raise ChannelLossMetadataError(
+                    "Channel loss: canonical boundary validation requires strictly increasing cu_seq_lens_q "
+                    "starting at zero."
+                )
+
+            tail_padding_length = self._canonical_tail_padding_length(micro_batch.get("tail_padding_length"))
+            actual_valid_token_count = full_boundaries[-1] - tail_padding_length
+            if tail_padding_length > full_boundaries[-1] or actual_valid_token_count != valid_token_count:
+                raise ChannelLossMetadataError(
+                    "Channel loss: canonical valid_token_count conflicts with cu_seq_lens_q/tail_padding_length "
+                    f"(canonical={valid_token_count}, actual={actual_valid_token_count})."
+                )
+            actual_boundaries = [boundary for boundary in full_boundaries if boundary <= valid_token_count]
+            if not actual_boundaries or actual_boundaries[-1] != valid_token_count:
+                raise ChannelLossMetadataError(
+                    "Channel loss: canonical valid-token tail does not end on a cu_seq_lens_q boundary "
+                    f"(valid_token_count={valid_token_count}, cu_seq_lens_q={full_boundaries})."
+                )
+            if actual_boundaries != canonical_boundaries:
+                raise ChannelLossMetadataError(
+                    "Channel loss: canonical token boundaries conflict with full packed cu_seq_lens_q "
+                    f"(canonical={canonical_boundaries}, actual={actual_boundaries})."
+                )
+            position_ids = micro_batch.get("position_ids")
+            if not bool(self.parallel_state.sp_enabled):
+                if not isinstance(position_ids, torch.Tensor):
+                    raise ChannelLossMetadataError(
+                        "Channel loss: non-SP canonical boundary validation requires full position_ids."
+                    )
+                position_boundaries = self._canonical_boundaries_from_position_ids(
+                    position_ids,
+                    valid_token_count=valid_token_count,
+                    full_token_count=full_boundaries[-1],
+                    require_zero_tail=True,
+                )
+                if position_boundaries != canonical_boundaries:
+                    raise ChannelLossMetadataError(
+                        "Channel loss: canonical token boundaries conflict with full packed position_ids "
+                        f"(canonical={canonical_boundaries}, actual={position_boundaries})."
+                    )
+            return
+
+        position_ids = micro_batch.get("position_ids")
+        if bool(self.parallel_state.sp_enabled):
+            raise ChannelLossMetadataError(
+                "Channel loss: canonical boundary validation under sequence parallelism requires full pre-SP "
+                "cu_seq_lens_q."
+            )
+        if not isinstance(position_ids, torch.Tensor):
+            raise ChannelLossMetadataError(
+                "Channel loss: canonical boundary validation requires full position_ids when sequence "
+                "parallelism is disabled."
+            )
+        actual_boundaries = self._canonical_boundaries_from_position_ids(
+            position_ids,
+            valid_token_count=valid_token_count,
+            full_token_count=valid_token_count,
+            require_zero_tail=False,
+        )
+        if actual_boundaries != canonical_boundaries:
+            raise ChannelLossMetadataError(
+                "Channel loss: canonical token boundaries conflict with full packed position_ids "
+                f"(canonical={canonical_boundaries}, actual={actual_boundaries})."
+            )
+
+    @staticmethod
+    def _canonical_boundaries_from_position_ids(
+        position_ids: torch.Tensor,
+        *,
+        valid_token_count: int,
+        full_token_count: int,
+        require_zero_tail: bool,
+    ) -> list[int]:
+        if position_ids.dim() == 3:
+            position_ids = position_ids[:, 0, :]
+        flat_position_ids = position_ids.detach().reshape(-1)
+        if flat_position_ids.numel() != full_token_count:
+            raise ChannelLossMetadataError(
+                "Channel loss: canonical valid/full token counts conflict with full packed position_ids "
+                f"(canonical_valid={valid_token_count}, expected_full={full_token_count}, "
+                f"actual_full={flat_position_ids.numel()})."
+            )
+
+        padding_position_ids = flat_position_ids[valid_token_count:]
+        if (
+            require_zero_tail
+            and padding_position_ids.numel() > 0
+            and not bool(padding_position_ids.eq(0).all().cpu().item())
+        ):
+            raise ChannelLossMetadataError(
+                "Channel loss: canonical padding tail requires position_ids == 0 for every padded token."
+            )
+
+        valid_position_ids = flat_position_ids[:valid_token_count]
+        boundaries = torch.nonzero(valid_position_ids == 0, as_tuple=False).flatten().cpu().tolist()
+        boundaries.append(valid_token_count)
+        return boundaries
+
+    @staticmethod
+    def _canonical_tail_padding_length(value: Any) -> int:
+        if isinstance(value, torch.Tensor):
+            if value.numel() != 1:
+                raise ChannelLossMetadataError(
+                    "Channel loss: canonical boundary validation requires scalar tail_padding_length."
+                )
+            value = value.detach().cpu().item()
+        if value is None:
+            return 0
+        if type(value) is not int or value < 0:
+            raise ChannelLossMetadataError(
+                "Channel loss: canonical boundary validation requires non-negative integer tail_padding_length."
+            )
+        return value
 
     @staticmethod
     def _first_present_list(

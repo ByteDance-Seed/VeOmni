@@ -144,9 +144,7 @@ def _compute_wan_seqlens(micro_batch: Dict[str, "torch.Tensor"]) -> List[int]:
 
 
 def _get_multisource_ds_idx(micro_batch: Dict[str, "torch.Tensor"]) -> List[int]:
-    ds_idx = micro_batch.pop("ds_idx")
-    micro_batch.pop("source_name", None)
-    micro_batch.pop("cur_token_num", None)
+    ds_idx = micro_batch["ds_idx"]
     if isinstance(ds_idx, torch.Tensor):
         # packed micro batch
         return ds_idx.tolist()

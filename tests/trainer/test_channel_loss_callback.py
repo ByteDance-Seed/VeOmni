@@ -1551,6 +1551,19 @@ def test_base_step_begin_captures_channel_metadata_before_multisource_meter():
     assert calls == [("channel", True), ("meter", True), ("tail", False)]
 
 
+def test_multisource_meter_reads_source_metadata_without_consuming_it():
+    from veomni.utils import helper
+
+    micro_batch = {
+        "ds_idx": torch.tensor([3, 4]),
+        "source_name": ["train/a", "train/b"],
+        "cur_token_num": torch.tensor([2, 2]),
+    }
+
+    assert helper._get_multisource_ds_idx(micro_batch) == [3, 4]
+    assert set(micro_batch) == {"ds_idx", "source_name", "cur_token_num"}
+
+
 def test_base_step_begin_allows_missing_channel_loss_callback():
     calls = []
 
@@ -1593,6 +1606,96 @@ def test_base_forward_backward_allows_missing_channel_loss_callback(monkeypatch)
     assert loss.item() == 2.0
     assert loss_dict["loss"].item() == 2.0
     assert trainer.model.weight.grad.item() == 2.0
+
+
+def test_base_forward_backward_strips_internal_source_metadata_without_channel_callback(monkeypatch):
+    _install_test_parallel_state(monkeypatch)
+    trainer = object.__new__(BaseTrainer)
+    trainer.state = TrainerState(global_step=1)
+    trainer.device = torch.device("cpu")
+    trainer.args = SimpleNamespace(
+        train=SimpleNamespace(
+            enable_batch_invariant_mode=False,
+            local_rank=0,
+        )
+    )
+    trainer.model = _TinyLossModel()
+    trainer.model_fwd_context = nullcontext()
+    trainer.model_bwd_context = nullcontext()
+    trainer.micro_batch_token_len = 1
+    trainer.micro_batches_token_len = 1
+    trainer.LOG_SAMPLE = False
+    trainer.channel_loss_callback = None
+    trainer.postforward = lambda outputs, micro_batch: (outputs.loss, {"loss": outputs.loss.detach()})
+    micro_batch = {
+        "x": torch.tensor(2.0),
+        "ds_idx": torch.tensor([3]),
+        "source_id": ["stable-id"],
+        "source_name": ["train/a"],
+        "cur_token_num": torch.tensor([1]),
+        "_veomni_source_metadata": {
+            "schema_version": 1,
+            "source_id": "stable-id",
+            "source_name": "train/a",
+        },
+        "_veomni_packed_source_metadata": {
+            "schema_version": 1,
+            "coordinate_space": "packed_pre_sp",
+            "valid_token_count": 1,
+            "segments": [
+                {
+                    "source_id": "stable-id",
+                    "source_name": "train/a",
+                    "segment_index": 0,
+                    "sample_index": 0,
+                    "subsegment_index": 0,
+                    "token_start": 0,
+                    "token_length": 1,
+                }
+            ],
+        },
+    }
+
+    loss, loss_dict = BaseTrainer.forward_backward_step(trainer, micro_batch)
+
+    assert loss.item() == 2.0
+    assert loss_dict["loss"].item() == 2.0
+    assert trainer.model.weight.grad.item() == 2.0
+
+
+def test_base_preforward_strips_source_metadata_before_sample_logging(monkeypatch):
+    import veomni.trainer.base as base_trainer_module
+
+    trainer = object.__new__(BaseTrainer)
+    trainer.device = torch.device("cpu")
+    trainer.args = SimpleNamespace(
+        train=SimpleNamespace(chunk_mbs_config=None, local_rank=0),
+    )
+    trainer.LOG_SAMPLE = True
+    logged_keys = []
+    monkeypatch.setattr(
+        base_trainer_module.helper,
+        "print_example",
+        lambda *, example, **_kwargs: logged_keys.extend(example.keys()),
+    )
+
+    result = BaseTrainer.preforward(
+        trainer,
+        {
+            "x": torch.tensor(2.0),
+            "source_id": ["stable-id"],
+            "row_id": [7],
+            "_veomni_packed_source_metadata": {
+                "schema_version": 1,
+                "coordinate_space": "packed_pre_sp",
+                "valid_token_count": 1,
+                "segments": [],
+            },
+        },
+    )
+
+    assert logged_keys == ["x"]
+    assert set(result) == {"x"}
 
 
 def test_base_forward_backward_strips_channel_metadata_after_preforward(monkeypatch):
@@ -1912,6 +2015,504 @@ def test_dpo_channel_loss_real_base_dispatch_repeats_metadata_and_emits_policy_t
         assert reference_model.scale.grad is None
     finally:
         base.channel_loss_callback.computer.uninstall()
+
+
+def test_channel_loss_canonical_metadata_bypasses_dpo_source_repeat():
+    cfg = ChannelLossConfig(enable=True, interval=1)
+    trainer = SimpleNamespace(args=SimpleNamespace(train=SimpleNamespace(channel_loss=cfg)))
+    callback = ChannelLossCallback(trainer)
+    micro_batch = {
+        "position_ids": torch.tensor([[0, 1, 0, 1, 0, 1, 0, 1]]),
+        "source_id": torch.tensor([3, 4]),
+        "source_name": ["train/a", "train/b"],
+        "_veomni_packed_source_metadata": {
+            "schema_version": 1,
+            "coordinate_space": "packed_pre_sp",
+            "valid_token_count": 8,
+            "segments": [
+                {
+                    "source_id": 3,
+                    "source_name": "train/a",
+                    "segment_index": 0,
+                    "sample_index": 0,
+                    "subsegment_index": 0,
+                    "token_start": 0,
+                    "token_length": 2,
+                },
+                {
+                    "source_id": 3,
+                    "source_name": "train/a",
+                    "segment_index": 1,
+                    "sample_index": 0,
+                    "subsegment_index": 1,
+                    "token_start": 2,
+                    "token_length": 2,
+                },
+                {
+                    "source_id": 4,
+                    "source_name": "train/b",
+                    "segment_index": 2,
+                    "sample_index": 1,
+                    "subsegment_index": 0,
+                    "token_start": 4,
+                    "token_length": 2,
+                },
+                {
+                    "source_id": 4,
+                    "source_name": "train/b",
+                    "segment_index": 3,
+                    "sample_index": 1,
+                    "subsegment_index": 1,
+                    "token_start": 6,
+                    "token_length": 2,
+                },
+            ],
+        },
+    }
+
+    callback.on_step_begin(
+        TrainerState(global_step=1),
+        micro_batches=[micro_batch],
+        source_repeat=2,
+    )
+
+    assert callback.computer._per_mb_source_ids == [[3, 3, 4, 4]]
+    assert callback.computer.source_names == {3: "train/a", 4: "train/b"}
+
+
+@pytest.mark.parametrize(
+    ("legacy_source_ids", "legacy_source_names"),
+    [
+        ([3], ["train/a"]),
+        ([3, 3], ["train/a", "train/a"]),
+    ],
+)
+def test_channel_loss_expands_per_sample_legacy_metadata_for_arbitrary_position_resets(
+    legacy_source_ids,
+    legacy_source_names,
+):
+    cfg = ChannelLossConfig(enable=True, interval=1)
+    trainer = SimpleNamespace(args=SimpleNamespace(train=SimpleNamespace(channel_loss=cfg)))
+    callback = ChannelLossCallback(trainer)
+    micro_batch = {
+        "position_ids": torch.tensor([[0, 1, 0, 1]]),
+        "source_id": torch.tensor(legacy_source_ids),
+        "source_name": legacy_source_names,
+        "_veomni_packed_source_metadata": {
+            "schema_version": 1,
+            "coordinate_space": "packed_pre_sp",
+            "valid_token_count": 4,
+            "segments": [
+                {
+                    "source_id": 3,
+                    "source_name": "train/a",
+                    "segment_index": 0,
+                    "sample_index": 0,
+                    "subsegment_index": 0,
+                    "token_start": 0,
+                    "token_length": 2,
+                },
+                {
+                    "source_id": 3,
+                    "source_name": "train/a",
+                    "segment_index": 1,
+                    "sample_index": 0,
+                    "subsegment_index": 1,
+                    "token_start": 2,
+                    "token_length": 2,
+                },
+            ],
+        },
+    }
+
+    callback.on_step_begin(TrainerState(global_step=1), micro_batches=[micro_batch])
+
+    assert callback.computer._per_mb_source_ids == [[3, 3]]
+    assert callback.computer.source_names == {3: "train/a"}
+
+
+def test_channel_loss_rejects_canonical_legacy_source_id_conflict():
+    cfg = ChannelLossConfig(enable=True, interval=2, strict=False)
+    trainer = SimpleNamespace(args=SimpleNamespace(train=SimpleNamespace(channel_loss=cfg)))
+    callback = ChannelLossCallback(trainer)
+    micro_batch = {
+        "position_ids": torch.tensor([[0, 1, 0, 1, 0, 1, 0, 1]]),
+        "source_id": torch.tensor([3, 9]),
+        "source_name": ["train/a", "train/b"],
+        "_veomni_packed_source_metadata": {
+            "schema_version": 1,
+            "coordinate_space": "packed_pre_sp",
+            "valid_token_count": 8,
+            "segments": [
+                {
+                    "source_id": 3,
+                    "source_name": "train/a",
+                    "segment_index": 0,
+                    "sample_index": 0,
+                    "subsegment_index": 0,
+                    "token_start": 0,
+                    "token_length": 2,
+                },
+                {
+                    "source_id": 3,
+                    "source_name": "train/a",
+                    "segment_index": 1,
+                    "sample_index": 0,
+                    "subsegment_index": 1,
+                    "token_start": 2,
+                    "token_length": 2,
+                },
+                {
+                    "source_id": 4,
+                    "source_name": "train/b",
+                    "segment_index": 2,
+                    "sample_index": 1,
+                    "subsegment_index": 0,
+                    "token_start": 4,
+                    "token_length": 2,
+                },
+                {
+                    "source_id": 4,
+                    "source_name": "train/b",
+                    "segment_index": 3,
+                    "sample_index": 1,
+                    "subsegment_index": 1,
+                    "token_start": 6,
+                    "token_length": 2,
+                },
+            ],
+        },
+    }
+
+    with pytest.raises(ChannelLossMetadataError, match="canonical source IDs conflict with legacy"):
+        callback.on_step_begin(
+            TrainerState(global_step=1),
+            micro_batches=[micro_batch],
+            source_repeat=2,
+        )
+
+
+def test_channel_loss_rejects_canonical_boundaries_on_unsampled_non_strict_step():
+    cfg = ChannelLossConfig(enable=True, interval=2, strict=False)
+    trainer = SimpleNamespace(args=SimpleNamespace(train=SimpleNamespace(channel_loss=cfg)))
+    callback = ChannelLossCallback(trainer)
+    micro_batch = {
+        "position_ids": torch.tensor([[0, 1, 0, 1]]),
+        "_veomni_packed_source_metadata": {
+            "schema_version": 1,
+            "coordinate_space": "packed_pre_sp",
+            "valid_token_count": 4,
+            "segments": [
+                {
+                    "source_id": 3,
+                    "segment_index": 0,
+                    "sample_index": 0,
+                    "subsegment_index": 0,
+                    "token_start": 0,
+                    "token_length": 3,
+                },
+                {
+                    "source_id": 4,
+                    "segment_index": 1,
+                    "sample_index": 1,
+                    "subsegment_index": 0,
+                    "token_start": 3,
+                    "token_length": 1,
+                },
+            ],
+        },
+    }
+
+    with pytest.raises(ChannelLossMetadataError, match="token boundaries conflict"):
+        callback.on_step_begin(TrainerState(global_step=1), micro_batches=[micro_batch])
+
+
+def test_channel_loss_prefers_full_cu_seqlens_when_validating_canonical_boundaries():
+    cfg = ChannelLossConfig(enable=True, interval=1, strict=False)
+    trainer = SimpleNamespace(args=SimpleNamespace(train=SimpleNamespace(channel_loss=cfg)))
+    callback = ChannelLossCallback(trainer)
+    micro_batch = {
+        "position_ids": torch.tensor([[0, 1, 0, 1]]),
+        "cu_seq_lens_q": torch.tensor([0, 1, 4], dtype=torch.int32),
+        "_veomni_packed_source_metadata": {
+            "schema_version": 1,
+            "coordinate_space": "packed_pre_sp",
+            "valid_token_count": 4,
+            "segments": [
+                {
+                    "source_id": 3,
+                    "segment_index": 0,
+                    "sample_index": 0,
+                    "subsegment_index": 0,
+                    "token_start": 0,
+                    "token_length": 2,
+                },
+                {
+                    "source_id": 4,
+                    "segment_index": 1,
+                    "sample_index": 1,
+                    "subsegment_index": 0,
+                    "token_start": 2,
+                    "token_length": 2,
+                },
+            ],
+        },
+    }
+
+    with pytest.raises(ChannelLossMetadataError, match="cu_seq_lens_q"):
+        callback.on_step_begin(TrainerState(global_step=1), micro_batches=[micro_batch])
+
+
+def test_channel_loss_cross_checks_full_position_resets_against_canonical_cu_seqlens():
+    cfg = ChannelLossConfig(enable=True, interval=1, strict=False)
+    trainer = SimpleNamespace(args=SimpleNamespace(train=SimpleNamespace(channel_loss=cfg)))
+    callback = ChannelLossCallback(trainer)
+    micro_batch = {
+        # cu-seqlens agree with canonical [2, 2], but the actual non-SP
+        # position resets describe [1, 3].
+        "position_ids": torch.tensor([[0, 0, 1, 2]]),
+        "cu_seq_lens_q": torch.tensor([0, 2, 4], dtype=torch.int32),
+        "_veomni_packed_source_metadata": {
+            "schema_version": 1,
+            "coordinate_space": "packed_pre_sp",
+            "valid_token_count": 4,
+            "segments": [
+                {
+                    "source_id": 3,
+                    "segment_index": 0,
+                    "sample_index": 0,
+                    "subsegment_index": 0,
+                    "token_start": 0,
+                    "token_length": 2,
+                },
+                {
+                    "source_id": 4,
+                    "segment_index": 1,
+                    "sample_index": 1,
+                    "subsegment_index": 0,
+                    "token_start": 2,
+                    "token_length": 2,
+                },
+            ],
+        },
+    }
+
+    with pytest.raises(ChannelLossMetadataError, match="full packed position_ids"):
+        callback.on_step_begin(TrainerState(global_step=1), micro_batches=[micro_batch])
+
+
+def test_channel_loss_rejects_nonzero_position_ids_in_declared_non_sp_padding_tail():
+    cfg = ChannelLossConfig(enable=True, interval=1, strict=False)
+    trainer = SimpleNamespace(args=SimpleNamespace(train=SimpleNamespace(channel_loss=cfg)))
+    callback = ChannelLossCallback(trainer)
+    micro_batch = {
+        "position_ids": torch.tensor([[0, 1, 2, 0, 1, 9, 9, 9]]),
+        "cu_seq_lens_q": torch.tensor([0, 3, 5, 8], dtype=torch.int32),
+        "tail_padding_length": 3,
+        "_veomni_packed_source_metadata": {
+            "schema_version": 1,
+            "coordinate_space": "packed_pre_sp",
+            "valid_token_count": 5,
+            "segments": [
+                {
+                    "source_id": 3,
+                    "segment_index": 0,
+                    "sample_index": 0,
+                    "subsegment_index": 0,
+                    "token_start": 0,
+                    "token_length": 3,
+                },
+                {
+                    "source_id": 4,
+                    "segment_index": 1,
+                    "sample_index": 1,
+                    "subsegment_index": 0,
+                    "token_start": 3,
+                    "token_length": 2,
+                },
+            ],
+        },
+    }
+
+    with pytest.raises(ChannelLossMetadataError, match="padding tail.*position_ids == 0"):
+        callback.on_step_begin(TrainerState(global_step=1), micro_batches=[micro_batch])
+
+
+def test_channel_loss_requires_full_position_ids_for_non_sp_canonical_batch():
+    cfg = ChannelLossConfig(enable=True, interval=1, strict=False)
+    trainer = SimpleNamespace(args=SimpleNamespace(train=SimpleNamespace(channel_loss=cfg)))
+    callback = ChannelLossCallback(trainer)
+    micro_batch = {
+        "cu_seq_lens_q": torch.tensor([0, 2, 4], dtype=torch.int32),
+        "_veomni_packed_source_metadata": {
+            "schema_version": 1,
+            "coordinate_space": "packed_pre_sp",
+            "valid_token_count": 4,
+            "segments": [
+                {
+                    "source_id": 3,
+                    "segment_index": 0,
+                    "sample_index": 0,
+                    "subsegment_index": 0,
+                    "token_start": 0,
+                    "token_length": 2,
+                },
+                {
+                    "source_id": 4,
+                    "segment_index": 1,
+                    "sample_index": 1,
+                    "subsegment_index": 0,
+                    "token_start": 2,
+                    "token_length": 2,
+                },
+            ],
+        },
+    }
+
+    with pytest.raises(ChannelLossMetadataError, match="requires full position_ids"):
+        callback.on_step_begin(TrainerState(global_step=1), micro_batches=[micro_batch])
+
+
+@pytest.mark.parametrize(("sp_enabled", "sp_rank"), [(False, 0), (True, 1)])
+def test_channel_loss_accepts_main_collator_padding_and_full_pre_sp_boundaries(
+    monkeypatch,
+    sp_enabled,
+    sp_rank,
+):
+    import veomni.data.data_collator as data_collator_module
+
+    parallel_state = _install_test_parallel_state(
+        monkeypatch,
+        _test_parallel_state(
+            sp_enabled=sp_enabled,
+            sp_size=2 if sp_enabled else 1,
+            sp_rank=sp_rank,
+        ),
+    )
+    monkeypatch.setattr(data_collator_module, "get_parallel_state", lambda: parallel_state)
+    features = [
+        {
+            "input_ids": torch.tensor([11, 12, 13]),
+            "attention_mask": torch.ones(3, dtype=torch.long),
+            "labels": torch.tensor([11, 12, 13]),
+            "_veomni_source_metadata": {
+                "schema_version": 1,
+                "source_id": 7,
+                "source_name": "source-int",
+            },
+        },
+        {
+            "input_ids": torch.tensor([21, 22]),
+            "attention_mask": torch.ones(2, dtype=torch.long),
+            "labels": torch.tensor([21, 22]),
+            "_veomni_source_metadata": {
+                "schema_version": 1,
+                "source_id": "7",
+                "source_name": "source-string",
+            },
+        },
+    ]
+    micro_batch = data_collator_module.MainCollator(pad_to_length=8)(features)
+    cfg = ChannelLossConfig(enable=True, interval=1, strict=True)
+    trainer = SimpleNamespace(args=SimpleNamespace(train=SimpleNamespace(channel_loss=cfg)))
+    callback = ChannelLossCallback(trainer)
+
+    callback.on_step_begin(TrainerState(global_step=1), micro_batches=[micro_batch])
+
+    assert callback.computer._per_mb_source_ids == [[7, "7"]]
+    assert callback.computer.source_names == {7: "source-int", "7": "source-string"}
+    assert micro_batch["_veomni_packed_source_metadata"]["valid_token_count"] == 5
+    assert micro_batch["cu_seq_lens_q"].tolist() == [0, 3, 5, 8]
+    assert int(micro_batch["tail_padding_length"]) == 3
+
+
+def test_channel_loss_rejects_ambiguous_single_legacy_name_for_multiple_typed_sources():
+    cfg = ChannelLossConfig(enable=True, interval=1, strict=False)
+    trainer = SimpleNamespace(args=SimpleNamespace(train=SimpleNamespace(channel_loss=cfg)))
+    callback = ChannelLossCallback(trainer)
+    micro_batch = {
+        "position_ids": torch.tensor([[0, 1, 0, 1]]),
+        "source_id": [7, "7"],
+        "source_name": ["ambiguous-name"],
+        "_veomni_packed_source_metadata": {
+            "schema_version": 1,
+            "coordinate_space": "packed_pre_sp",
+            "valid_token_count": 4,
+            "segments": [
+                {
+                    "source_id": 7,
+                    "segment_index": 0,
+                    "sample_index": 0,
+                    "subsegment_index": 0,
+                    "token_start": 0,
+                    "token_length": 2,
+                },
+                {
+                    "source_id": "7",
+                    "segment_index": 1,
+                    "sample_index": 1,
+                    "subsegment_index": 0,
+                    "token_start": 2,
+                    "token_length": 2,
+                },
+            ],
+        },
+    }
+
+    with pytest.raises(ChannelLossMetadataError, match="single legacy source name is ambiguous"):
+        callback.on_step_begin(TrainerState(global_step=1), micro_batches=[micro_batch])
+
+
+def test_channel_loss_rejects_ambiguous_single_name_in_legacy_only_metadata():
+    cfg = ChannelLossConfig(enable=True, interval=1, strict=False)
+    trainer = SimpleNamespace(args=SimpleNamespace(train=SimpleNamespace(channel_loss=cfg)))
+    callback = ChannelLossCallback(trainer)
+    micro_batch = {
+        "position_ids": torch.tensor([[0, 1, 0, 1]]),
+        "source_id": [7, "7"],
+        "source_name": ["ambiguous-name"],
+    }
+
+    with pytest.raises(ChannelLossMetadataError, match="single legacy source name is ambiguous"):
+        callback.on_step_begin(TrainerState(global_step=1), micro_batches=[micro_batch])
+
+
+def test_channel_loss_rejects_name_only_legacy_conflict_with_canonical_metadata():
+    cfg = ChannelLossConfig(enable=True, interval=1, strict=False)
+    trainer = SimpleNamespace(args=SimpleNamespace(train=SimpleNamespace(channel_loss=cfg)))
+    callback = ChannelLossCallback(trainer)
+    micro_batch = {
+        "position_ids": torch.tensor([[0, 1, 0, 1]]),
+        "source_name": ["wrong-a", "train/b"],
+        "_veomni_packed_source_metadata": {
+            "schema_version": 1,
+            "coordinate_space": "packed_pre_sp",
+            "valid_token_count": 4,
+            "segments": [
+                {
+                    "source_id": 7,
+                    "source_name": "train/a",
+                    "segment_index": 0,
+                    "sample_index": 0,
+                    "subsegment_index": 0,
+                    "token_start": 0,
+                    "token_length": 2,
+                },
+                {
+                    "source_id": "7",
+                    "source_name": "train/b",
+                    "segment_index": 1,
+                    "sample_index": 1,
+                    "subsegment_index": 0,
+                    "token_start": 2,
+                    "token_length": 2,
+                },
+            ],
+        },
+    }
+
+    with pytest.raises(ChannelLossMetadataError, match="canonical source names conflict with legacy"):
+        callback.on_step_begin(TrainerState(global_step=1), micro_batches=[micro_batch])
 
 
 def test_dit_rejects_channel_loss_before_initialization():

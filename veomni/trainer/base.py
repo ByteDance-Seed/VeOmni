@@ -56,6 +56,7 @@ from ..data import (
 from ..data.chat_template import ChatTemplate
 from ..data.data_collator import DataCollator, MainCollator
 from ..data.data_transform import build_data_transform
+from ..data.source_metadata import strip_source_metadata
 from ..distributed.chunk_mbs import build_chunk_mbs_ranges, chunk_mbs_context
 from ..distributed.clip_grad_norm import veomni_clip_grad_norm
 from ..distributed.offloading import build_activation_offloading_context
@@ -679,7 +680,7 @@ class BaseTrainer(Stateful, ABC):
         for callback in self._callbacks:
             callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
 
-    def preforward(self, micro_batch: List[Dict[str, Any]]) -> Dict[str, Any]:
+    def preforward(self, micro_batch: Dict[str, Any]) -> Dict[str, Any]:
         """Preprocess micro batches before forward pass.
 
         Tensors are moved to ``self.device`` non-blockingly. Nested dicts
@@ -697,6 +698,10 @@ class BaseTrainer(Stateful, ABC):
 
         chunk_mbs_config = getattr(self.args.train, "chunk_mbs_config", None)
         self._chunk_mbs_ranges = build_chunk_mbs_ranges(micro_batch, chunk_mbs_config)
+        strip_source_metadata(
+            micro_batch,
+            strip_legacy=bool(getattr(getattr(self.args, "data", None), "enable_multisource", False)),
+        )
         micro_batch = {k: _to_device(v) for k, v in micro_batch.items()}
         if getattr(self, "LOG_SAMPLE", True):
             helper.print_example(example=micro_batch, rank=self.args.train.local_rank)
