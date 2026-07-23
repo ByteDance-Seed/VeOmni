@@ -15,6 +15,8 @@ This guide provides comprehensive information for using VeOmni framework with As
 
 ## Key Updates
 
+2026/7/23: Qwen3.5 GatedDeltaNet adds an Ascend 910B4-1 BV64 launch profile and live hardware gate.
+
 2026/7/14: VeOmni main uses PyTorch and torch_npu 2.10.0.
 
 2026/5/11: VeOmni provides images based on Ascend CANN 9.0.0.
@@ -30,6 +32,12 @@ Product Hardware Support List
 |<term>Ascend 950 Series Products</term>|     ✅     |
 |<term>Atlas A3 Training Series Products</term>|     ✅     |
 |<term>Atlas A2 Training Series Products</term>|     ✅     |
+
+For Qwen3.5 on Ascend 910B4-1, set
+`TRITON_ASCEND_ARCH=Ascend910B4` before importing Triton. The GatedDeltaNet
+recurrence then selects its B4-specific BV64 launch automatically. Run the
+[Qwen3.5 live hardware gate](../examples/qwen3_5.md#ascend-910b4-1) before a
+long training job.
 
 - For the operating systems supported by each hardware product in bare-metal deployment scenarios, please refer to the Compatibility Query Assistant(https://www.hiascend.com/hardware/compatibility).
 - For the operating systems supported by each hardware product in virtual machine and container deployment scenarios, please refer to the "Operating System Compatibility Description"(https://www.hiascend.com/document/detail/zh/canncommercial/900/softwareinst/instg/instg_0101.html?OS=openEuler&InstallType=netyum) chapter of the CANN Software Installation Guide(Commercial Edition) or the "Operating System Compatibility Description"(https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/900/softwareinst/instg/instg_0101.html?OS=openEuler&InstallType=netyum) chapter (Community Edition).
