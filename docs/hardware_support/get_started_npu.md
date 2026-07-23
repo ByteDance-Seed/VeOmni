@@ -68,7 +68,11 @@ The following table shows the supported software versions for VeOmni when runnin
 
 Repository Docker definitions also cover CANN 8.3.RC2. Treat the PyTorch,
 torch_npu, CANN, and `triton-ascend` versions as one compatibility set and
-validate non-CI combinations on the target hardware.
+validate non-CI combinations on the target hardware. Qwen3.5's vendored NPU
+Triton kernels use the fixed Linux x86_64 / Python 3.11 installation in
+`scripts/ci/install_triton_ascend.py`; this is separate from the portable
+`npu` extra because the upstream wheel publishes development-only exact pins
+as runtime dependencies.
 
 ## Supported Models
 
@@ -78,8 +82,8 @@ VeOmni supports a wide range of models on Ascend NPUs, including large language 
 |---|---|---|---|---|---|---|
 | [Qwen3](../examples/qwen3.md) | 8B | ✅ | ✅ | | ✅ | |
 | | 30B | ✅ | ✅ | ✅ | ✅ | |
-| [Qwen3.5](../examples/qwen3_5.md) | 9B | ✅ | ✅ | | ✅ | Requires explicit GatedDeltaNet NPU kernels; generic NPU E2E coverage pending |
-| | 35B-A3B | ✅ | ✅ | ✅ | ✅ | Requires explicit GatedDeltaNet NPU kernels; generic NPU E2E coverage pending |
+| [Qwen3.5](../examples/qwen3_5.md) | 9B | ✅ | ✅ | | ✅ | Requires explicit GatedDeltaNet NPU kernels; CI validates the dense toy config with VLM E2E and text FSDP equivalence |
+| | 35B-A3B | ✅ | ✅ | ✅ | ✅ | Requires explicit GatedDeltaNet NPU kernels; CI validates the MoE toy config with VLM E2E and text FSDP equivalence |
 | [Qwen3-VL](../examples/qwen3_vl.md) | 8B | ✅ | ✅ | | ✅ | |
 | | 30B | ✅ | ✅ | ✅ | ✅ | |
 | [Wan2.1](../examples/wan2.1.md) | 1.3B | ✅ | ✅ | | ✅ | Prototype |

@@ -12,6 +12,7 @@ on:
     paths:
       - "**/*.py"
       - "!scripts/**/*.py"
+      - "scripts/ci/install_triton_ascend.py"
       - .github/workflows/npu_unit_tests.yml
       - "pyproject.toml"
       - "uv.lock"
@@ -21,6 +22,7 @@ on:
     paths:
       - "**/*.py"
       - "!scripts/**/*.py"
+      - "scripts/ci/install_triton_ascend.py"
       - .github/workflows/npu_unit_tests.yml
       - "pyproject.toml"
       - "uv.lock"
@@ -143,6 +145,7 @@ jobs:
       - name: Sync dependencies
         run: |
           uv sync --frozen --python 3.11 --extra npu --group dev
+          uv run --frozen python scripts/ci/install_triton_ascend.py
       - name: Check final pip list
         run: |
           uv pip list
@@ -186,10 +189,13 @@ jobs:
         run: |
           uv run --frozen pytest -v -s -x tests/ops/test_comp.py
           uv run --frozen pytest -v -s -x tests/ops/test_moe_hw_gate.py
+          uv run --frozen pytest -v -s -x tests/ops/test_gdn_ascend_gate.py
           uv run --frozen pytest -v -s -x tests/ops/test_npu_kernels.py
       - name: Run utils tests
         run: |
           uv run --frozen pytest -v -s -x tests/utils/test_count_flops.py
+          uv run --frozen pytest -v -s -x tests/tools/test_training_utils.py
+          uv run --frozen pytest -v -s -x tests/tools/test_npu_ci_dependencies.py
       - name: Run LoRA save/load test
         # peft ships under the `npu` extra, so the earlier
         # `uv sync --extra npu --group dev` step already installs it — no extra

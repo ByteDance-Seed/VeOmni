@@ -30,13 +30,9 @@ import pytest
 
 from veomni.utils.device import IS_NPU_AVAILABLE, get_device_type
 
-from ..tools import ParallelConfig
+from ..tools import ParallelConfig, is_npu_arch35
 
 
-# Qwen3.5 GatedDeltaNet has no NPU kernel today (varlen path unsupported).
-_qwen3_5_npu_skip = pytest.mark.skipif(
-    IS_NPU_AVAILABLE, reason="Qwen3.5 GatedDeltaNet has no NPU backend (varlen path)"
-)
 _gpt_oss_npu_skip = pytest.mark.skipif(IS_NPU_AVAILABLE, reason="GPT-OSS FSDP equivalence is GPU-only today")
 
 _DEFAULT_RTOL = 1e-1
@@ -229,7 +225,6 @@ _text_test_cases = [
         _DEFAULT_RTOL,
         _DEFAULT_ATOL,
         id="qwen3_5",
-        marks=_qwen3_5_npu_skip,
     ),
     pytest.param(
         "qwen3_5_moe",
@@ -238,7 +233,6 @@ _text_test_cases = [
         _DEFAULT_RTOL,
         _DEFAULT_ATOL,
         id="qwen3_5_moe",
-        marks=_qwen3_5_npu_skip,
     ),
     pytest.param(
         "deepseek_v3",
@@ -269,6 +263,9 @@ def test_text_fsdp_equivalence(
     atol: float,
 ):
     """Verify single-GPU vs FSDP2 produce equivalent loss/grad_norm for text models."""
+    if model_name in {"qwen3_5", "qwen3_5_moe"} and is_npu_arch35():
+        pytest.skip("Qwen3.5 causal_conv1d is not supported on arch35 NPUs")
+
     _run_fsdp_equivalence(
         model_name=model_name,
         config_path=config_path,
