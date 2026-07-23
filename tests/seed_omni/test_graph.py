@@ -10,6 +10,7 @@ import pytest
 from veomni.arguments.arguments_types_omni import OmniGraphProfileArguments
 from veomni.models.seed_omni import EdgeDef, NodeDef
 from veomni.models.seed_omni.graphs import profiling
+from veomni.models.seed_omni.graphs.executor import execute_generation_node, execute_train_node
 from veomni.models.seed_omni.graphs.generation_graph import GenerationGraph
 from veomni.models.seed_omni.graphs.graph import END
 from veomni.models.seed_omni.graphs.profiling import GraphProfiler
@@ -258,16 +259,15 @@ def test_cursor_lifecycle():
     assert not g.is_done() and g.current_node_name == g.execution_order[0]
 
 
-def test_step_loop_flows_carrier_in_topological_order():
-    """Driving step + maybe_transition mirrors OmniModel.forward; carrier accretes per node."""
+def test_plan_loop_flows_carrier_in_topological_order():
+    """Driving iter_nodes() + execute_train_node mirrors OmniModel.forward; carrier accretes per node."""
     g = TrainingGraph(edges=_understanding_only_edges())
     modules = _fake_modules(g)
     batch = {"conversation_list": []}
     profiler = GraphProfiler()
     g.reset()
-    while not g.is_done():
-        batch = g.step(modules, batch, profiler=profiler)
-        g.maybe_transition(profiler=profiler)
+    for node in g.iter_nodes():
+        execute_train_node(modules, node, batch, profiler=profiler)
     # run_ar runs last; both encoders precede it.
     trace = profiler.save_records()
     assert batch["conversation_list"][-1] == "run_ar.forward"
@@ -355,17 +355,18 @@ def test_graph_profile_callback_is_gated_outside_step_window(tmp_path):
     assert not (output_dir / "graph_trace").exists()
 
 
-def test_step_dispatches_non_forward_method_via_wrapper():
+def test_execute_train_node_dispatches_non_forward_method_via_wrapper():
     """A dotted ``module.encode`` node must run the module's ``encode`` (alias trick)."""
     g = TrainingGraph(edges=[{"from": "vq_decoder.encode", "to": "end"}])
     modules = _fake_modules(g)
-    batch = g.step(modules, {"conversation_list": []})
+    node = next(g.iter_nodes())
+    batch = execute_train_node(modules, node, {"conversation_list": []})
     assert batch["conversation_list"] == ["vq_decoder.encode"]
     # forward restored after the aliased call.
     assert modules["vq_decoder"].forward.__name__ == "forward"
 
 
-def test_step_unwraps_ddp_style_wrapper():
+def test_execute_train_node_unwraps_ddp_style_wrapper():
     """A wrapper without ``pre_forward`` is unwrapped via ``.module`` (DDP)."""
 
     class _DDPWrap:
@@ -377,7 +378,8 @@ def test_step_unwraps_ddp_style_wrapper():
 
     g = TrainingGraph(edges=[{"from": "run_ar", "to": "end"}])
     inner = _FakeOmniModule("run_ar")
-    batch = g.step({"run_ar": _DDPWrap(inner)}, {"conversation_list": []})
+    node = next(g.iter_nodes())
+    batch = execute_train_node({"run_ar": _DDPWrap(inner)}, node, {"conversation_list": []})
     assert batch["conversation_list"] == ["run_ar.forward"]
 
 
@@ -405,24 +407,31 @@ def _one_step_generation_graph(endpoint: str) -> GenerationGraph:
     )
 
 
-def test_generation_step_dispatches_bare_generate_via_wrapper_call():
+def _run_one_body(g: GenerationGraph, modules: dict, ctx: dict) -> dict:
+    """Drive one FSM body iteration: graph selects nodes, executor runs them."""
+    for node in g.iter_nodes(ctx):
+        execute_generation_node(modules, node, ctx, state_name=g.current_state_name)
+    return ctx
+
+
+def test_generation_dispatches_bare_generate_via_wrapper_call():
     g = _one_step_generation_graph("run_ar")
     inner = _FakeOmniModule("run_ar")
     wrapped = _TrackingWrapper(inner)
 
-    ctx = g.step({"run_ar": wrapped}, {"conversation_list": []})
+    ctx = _run_one_body(g, {"run_ar": wrapped}, {"conversation_list": []})
 
     assert wrapped.calls == 1
     assert ctx["conversation_list"] == ["run_ar.generate"]
     assert inner.forward.__name__ == "forward"
 
 
-def test_generation_step_dispatches_dotted_method_via_wrapper_call():
+def test_generation_dispatches_dotted_method_via_wrapper_call():
     g = _one_step_generation_graph("run_ar.encode")
     inner = _FakeOmniModule("run_ar")
     wrapped = _TrackingWrapper(inner)
 
-    ctx = g.step({"run_ar": wrapped}, {"conversation_list": []})
+    ctx = _run_one_body(g, {"run_ar": wrapped}, {"conversation_list": []})
 
     assert wrapped.calls == 1
     assert ctx["conversation_list"] == ["run_ar.encode"]
@@ -434,14 +443,14 @@ def test_generation_endpoint_can_call_original_forward_without_recursing():
     inner = _FakeOmniModule("run_ar")
     wrapped = _TrackingWrapper(inner)
 
-    ctx = g.step({"run_ar": wrapped}, {"conversation_list": []})
+    ctx = _run_one_body(g, {"run_ar": wrapped}, {"conversation_list": []})
 
     assert wrapped.calls == 1
     assert ctx["conversation_list"] == ["run_ar.forward", "run_ar.generate_via_forward"]
     assert inner.forward.__name__ == "forward"
 
 
-def test_step_applies_module_scope():
+def test_execute_train_node_applies_module_scope():
     from contextlib import contextmanager
 
     scoped: list[str] = []
@@ -452,11 +461,12 @@ def test_step_applies_module_scope():
         yield
 
     g = TrainingGraph(edges=[{"from": "run_ar", "to": "end"}])
-    g.step(_fake_modules(g), {"conversation_list": []}, scope_fn=scope_fn)
+    node = next(g.iter_nodes())
+    execute_train_node(_fake_modules(g), node, {"conversation_list": []}, scope_fn=scope_fn)
     assert scoped == ["run_ar"]
 
 
-def test_step_merges_loss_into_batch():
+def test_execute_train_node_merges_loss_into_batch():
     class _LossModule(_FakeOmniModule):
         def forward(self, **kwargs):
             out = super().forward(**kwargs)
@@ -464,14 +474,16 @@ def test_step_merges_loss_into_batch():
             return out
 
     g = TrainingGraph(edges=[{"from": "run_ar", "to": "end"}])
-    batch = g.step({"run_ar": _LossModule("run_ar")}, {"conversation_list": []})
+    node = next(g.iter_nodes())
+    batch = execute_train_node({"run_ar": _LossModule("run_ar")}, node, {"conversation_list": []})
     assert batch["_loss"] == 1.5
 
 
-def test_step_raises_for_missing_module():
+def test_execute_train_node_raises_for_missing_module():
     g = TrainingGraph(edges=[{"from": "run_ar", "to": "end"}])
+    node = next(g.iter_nodes())
     with pytest.raises(KeyError, match="missing from modules dict"):
-        g.step({}, {"conversation_list": []})
+        execute_train_node({}, node, {"conversation_list": []})
 
 
 # ── Mermaid visualisation ────────────────────────────────────────────────────

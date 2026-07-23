@@ -264,20 +264,21 @@ What each node does to the shared carrier:
 5. **`janus_text_encoder.decode`** / **`janus_vqvae.decode`** — read hidden
    states + labels off the carrier and each return one `_loss`.
 
-The runtime loop (simplified from `OmniModel.forward` + `TrainingGraph.step`,
-which mirrors `OmniModel.generate` + `GenerationGraph.step`):
+The runtime loop (simplified from `OmniModel.forward` + `TrainingGraph.iter_nodes`,
+which mirrors `OmniModel.generate` + `GenerationGraph.iter_nodes`):
 
 ```python
 training_graph.reset()
 profiler = GraphProfiler()
-while not training_graph.is_done():
-    # TrainingGraph.step runs the current node end-to-end: unwrap the wrapped
-    # sub-module (held by OmniModel), scope its ParallelState, pre_forward →
+# The graph only SELECTS nodes (profiler-free — it is model-bound); execution is
+# external (execute_train_node) and the profiler lives at the call site.
+for node in training_graph.iter_nodes():
+    # execute_train_node runs the selected node end-to-end: unwrap the wrapped
+    # sub-module (held by OmniModel), scope its ParallelState (scope_fn), pre_forward →
     # call (through the FSDP/DDP wrapper) → post_forward, merge conversation_list
     # + _loss back into the shared batch (edges are topology only, no input routing).
-    batch = training_graph.step(modules, batch, profiler=profiler, scope_fn=scope_fn)
-    self._collect_training_loss(batch, profiler)   # pop _loss → self._losses[node]
-    training_graph.maybe_transition(profiler=profiler)
+    execute_train_node(modules, node, batch, profiler=profiler, scope_fn=scope_fn)
+    self._collect_training_loss(batch, node.name, profiler)   # pop _loss → self._losses[node]
 total_loss = sum(self._losses.values())
 ```
 

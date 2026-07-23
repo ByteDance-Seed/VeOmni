@@ -38,15 +38,17 @@ Training
 --------
 ``forward(**batch)`` walks the DAG one node at a time, fully symmetric with
 :meth:`generate` (it resets the graph cursor at entry — each forward is
-independent):
+independent). The graph only **selects** nodes; execution is external:
 
-  * ``batch = training_graph.step(modules, batch)`` — run the node at the cursor
-    (``pre_forward`` → method → ``post_forward``, every method routed through the
-    module's ``__call__`` so FSDP2/DDP hooks fire). Edges declare execution order
-    only — no per-field routing; every node receives the same shared ``batch``
-    and reads / mutates the ``conversation_list`` carrier in place.
-  * ``_collect_training_loss(batch)`` — drain the node's optional ``_loss``.
-  * ``training_graph.maybe_transition()`` — advance the cursor.
+  * ``for node in training_graph.iter_nodes(): ...`` — the graph yields the node at the
+    cursor (selection only), then advances via ``maybe_transition``. Edges
+    declare execution order only — no per-field routing.
+  * ``execute_train_node(modules, node, batch, scope_fn=self.module_context)`` —
+    run the node (``pre_forward`` → method → ``post_forward``, every method
+    routed through the module's ``__call__`` so FSDP2/DDP hooks fire), mutating
+    the shared ``conversation_list`` carrier in place.
+  * ``_collect_training_loss(batch, node.name)`` — drain the node's optional
+    ``_loss``.
 
 Returns ``{"loss": scalar_or_None, "losses": {node: scalar}}``.
 
@@ -55,7 +57,9 @@ Inference
 ``generate(request, profiler, generation_kwargs)`` loops (it does **not** reset
 the FSM — the caller owns request boundaries via :meth:`reset`):
 
-  * ``ctx = fsm.step(modules, ctx)`` — one iteration of the current state.
+  * ``for node in fsm.iter_nodes(ctx): execute_generation_node(...)`` — the FSM
+    selects the nodes of one iteration of the current state (honouring the
+    ``module_signal`` early-break); the caller runs each.
   * ``fsm.maybe_transition(ctx)`` — first matching condition wins.
   * Stop when ``fsm.is_done()`` or the ``generation_kwargs["max_new_tokens"]``
     safety cap (default 2048) is reached.
@@ -65,9 +69,10 @@ FSM step return dict when a span ends; :meth:`OmniModel.generate` drains
 those into :attr:`OmniModel.generated` via :meth:`_collect_generated` and
 does not persist them on ``ctx``.
 
-Both ``step`` and ``maybe_transition`` accept an optional graph profiler.
-Print-driven flow tests collect the visit log from ``profiler.save_records()`` to
-assert the expected node order and transition timing.
+The executors (``execute_train_node`` / ``execute_generation_node``) and
+``maybe_transition`` accept an optional graph profiler. Print-driven flow tests
+collect the visit log from ``profiler.save_records()`` to assert the expected
+node order and transition timing.
 
 ``OmniModel.generate`` always emits a coarse progress trail via
 :meth:`logger.info_rank0` — one line per FSM state entry
@@ -84,7 +89,9 @@ import torch.nn as nn
 from ...distributed.parallel_state import use_parallel_state
 from ...utils import helper
 from .configuration_omni import OmniConfig
+from .graphs.executor import execute_generation_node, execute_train_node
 from .graphs.generation_graph import GenerationGraph
+from .graphs.graph import NodeDef
 from .graphs.profiling import GraphProfiler
 from .graphs.training_graph import TrainingGraph
 from .mixins.modulemixin import ModuleMixin
@@ -253,8 +260,10 @@ class OmniModel(nn.Module):
 
     # ── Training ──────────────────────────────────────────────────────────────
 
-    def _collect_training_loss(self, batch: Dict[str, Any], profiler: Optional[GraphProfiler] = None) -> None:
-        """Drain ``batch["_loss"]`` for the just-stepped node into :attr:`_losses`.
+    def _collect_training_loss(
+        self, batch: Dict[str, Any], node_name: str, profiler: Optional[GraphProfiler] = None
+    ) -> None:
+        """Drain ``batch["_loss"]`` for the just-executed ``node_name`` into :attr:`_losses`.
 
         The training analogue of :meth:`_collect_generated`: the node's
         ``post_forward`` merges an optional scalar ``_loss`` into the carrier;
@@ -263,10 +272,9 @@ class OmniModel(nn.Module):
         """
         loss = batch.pop(_LOSS_KEY, None)
         if loss is not None:
-            node = self.training_graph.current_node_name
-            self._losses[node] = loss
+            self._losses[node_name] = loss
             if profiler is not None:
-                profiler.record(f"loss:{node}")
+                profiler.record(f"loss:{node_name}")
 
     def forward(
         self,
@@ -276,12 +284,11 @@ class OmniModel(nn.Module):
     ) -> Dict[str, Any]:
         """Execute the training DAG once over the full ``batch``.
 
-        Fully symmetric with :meth:`generate`: walk the graph one node at a time
-        — ``step`` runs the node at the cursor, ``_collect_training_loss`` drains
-        its ``_loss``, ``maybe_transition`` advances the cursor — until
-        ``is_done()``. Each module is invoked exactly once and owns its internal
-        micro-batch chunking (token-mean reduction included). The wrapped
-        sub-modules are passed to ``step`` so it can fire the FSDP2/DDP hooks.
+        Fully symmetric with :meth:`generate`: the graph *selects* one node at a
+        time (``training_graph.iter_nodes``), the external ``execute_train_node`` runs
+        it (firing the FSDP2/DDP hooks) and ``_collect_training_loss`` drains its
+        ``_loss`` — until ``is_done()``. Each module is invoked exactly once and
+        owns its internal micro-batch chunking (token-mean reduction included).
 
         Parameters
         ----------
@@ -307,15 +314,17 @@ class OmniModel(nn.Module):
         self._losses.clear()
         modules = {name: getattr(self, name) for name in self._module_names}
 
-        while not self.training_graph.is_done():
-            batch = self.training_graph.step(
-                modules,
-                batch,
-                profiler=profiler,
-                scope_fn=self.module_context,
-            )
-            self._collect_training_loss(batch, profiler)
-            self.training_graph.maybe_transition(profiler=profiler)
+        # The graph only *selects* the next node (profiler-free — it is
+        # model-bound); execution (unwrap + module scope + pre/forward/post) is
+        # external (``execute_train_node``) and the transition trace is recorded
+        # here, where the profiler lives — the graph stays pure.
+        prev_node: Optional[NodeDef] = None
+        for node in self.training_graph.iter_nodes():
+            if prev_node is not None and profiler is not None:
+                profiler.record(f"transition: -> {node.name}")
+            execute_train_node(modules, node, batch, profiler=profiler, scope_fn=self.module_context)
+            self._collect_training_loss(batch, node.name, profiler)
+            prev_node = node
 
         return {"loss": _sum_losses(self._losses), "losses": dict(self._losses)}
 
@@ -461,12 +470,29 @@ class OmniModel(nn.Module):
 
         while not self.generation_graph.is_done() and total_steps < max_new_tokens:
             self._emit_progress(total_steps)
-            ctx = self.generation_graph.step(
-                modules, ctx, profiler=profiler, generation_kwargs=generation_kwargs, scope_fn=self.module_context
-            )
+            # The FSM only *selects* the nodes for this state's body iteration;
+            # execution is external (``execute_generation_node``). ``iter_nodes``
+            # reads the mutated ``ctx`` after each yield to honour a terminating
+            # ``module_signal`` / fan-in gating. ``state_name`` (stable across the
+            # body) only labels the profiler node.
+            state_name = self.generation_graph.current_state_name
+            for node in self.generation_graph.iter_nodes(ctx):
+                execute_generation_node(
+                    modules,
+                    node,
+                    ctx,
+                    state_name=state_name,
+                    generation_kwargs=generation_kwargs,
+                    profiler=profiler,
+                    scope_fn=self.module_context,
+                )
             total_steps += 1
             self._collect_generated(ctx, profiler)
-            self.generation_graph.maybe_transition(ctx, profiler=profiler)
+            # The FSM advances state (profiler-free); we record the transition
+            # trace here from the returned FiredTransition, so the graph stays pure.
+            fired = self.generation_graph.maybe_transition(ctx)
+            if fired is not None and profiler is not None:
+                profiler.record(f"transition: {fired.from_state} -> {fired.to_state} [{fired.condition}]")
 
         # Final emit — captures the state the FSM is in after the loop
         # exits.  Usually ``done`` (a module raised its terminating signal);

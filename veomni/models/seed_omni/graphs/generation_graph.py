@@ -94,7 +94,8 @@ Usage
   >>> fsm.reset()
   >>> ctx = {"input_ids": ..., "attention_mask": ...}
   >>> while not fsm.is_done():
-  ...     ctx = fsm.step(modules, ctx)
+  ...     for node in fsm.iter_nodes(ctx):          # graph selects; caller runs
+  ...         execute_generation_node(modules, node, ctx, state_name=fsm.current_state_name)
   ...     fsm.maybe_transition(ctx)
 
 See also
@@ -103,17 +104,14 @@ See also
 ``training_graph.py``  — DAG view driven by ``OmniConfig.training_graph``.
 """
 
-from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import Any, Callable, ContextManager, Dict, List, Optional
+from typing import Any, Dict, Iterator, List, Optional
 
-from .dispatch import call_graph_endpoint, unwrap_graph_module
 from .graph import (
     EdgeDef,
     NodeDef,
     is_end,
 )
-from .profiling import GraphProfiler
 
 
 # Default method for a bare endpoint in the inference FSM (training uses
@@ -178,6 +176,19 @@ class _Condition:
 class _Transition:
     condition: _Condition
     next_state: str
+
+
+@dataclass
+class FiredTransition:
+    """A transition that just fired in :meth:`GenerationGraph.maybe_transition`.
+
+    Returned to the caller (which owns the profiler) so it can format the
+    transition trace — the graph itself stays profiler-free.
+    """
+
+    from_state: str
+    to_state: str
+    condition: str  # human-readable condition description, e.g. ``module_signal(text_done)``
 
 
 # ── State ─────────────────────────────────────────────────────────────────────
@@ -326,59 +337,40 @@ class GenerationGraph:
 
     # ── Step & Transition ─────────────────────────────────────────────────────
 
-    def step(
-        self,
-        modules: Dict[str, Any],
-        ctx: Dict[str, Any],
-        profiler: Optional[GraphProfiler] = None,
-        generation_kwargs: Optional[Dict[str, Any]] = None,
-        scope_fn: Optional[Callable[[str], ContextManager]] = None,
-    ) -> Dict[str, Any]:
-        """Execute one iteration of the current state.
+    def iter_nodes(self, ctx: Dict[str, Any]) -> Iterator[NodeDef]:
+        """Yield the nodes to run for ONE iteration of the current state body.
+
+        Selection only — the graph never runs a model forward. The caller
+        executes each yielded node — see
+        :func:`~veomni.models.seed_omni.graphs.executor.execute_generation_node`
+        — mutating ``ctx`` in place; this generator reads the mutated ``ctx``
+        *after* each yield to honour a terminating ``module_signal`` (it stops
+        yielding) and the body's feed-forward fan-in gating. Mirror of
+        :meth:`TrainingGraph.iter_nodes` (which yields a whole training pass).
 
         Algorithm (topological body execution, see module-doc §"body"):
 
-        1. Compute ``pending[X]`` = number of body edges with ``to: X``
-           for every node ``X`` in the body's node sequence.  Nodes with
-           ``pending == 0`` are body sources — they execute on first
-           sight as ``edge.from_``.
-        2. Walk ``state.body`` edges in declaration order.  For each
-           edge ``e``:
+        1. Compute ``pending[X]`` = number of feed-forward body edges with
+           ``to: X`` for every node ``X`` in the body's node sequence. Nodes
+           with ``pending == 0`` are body sources — they run on first sight as
+           ``edge.from_``.
+        2. Walk ``state.body`` edges in declaration order. For each edge ``e``:
 
-           a. If ``e.from_`` hasn't been executed yet, execute it now.
-              (If it still has unprocessed in-body fan-in, that's a
-              body-ordering bug — raise.)
-           c. Decrement ``pending[e.to]``.  When it reaches zero (and
-              ``e.to`` is not ``end`` and not yet executed), execute it.
+           a. If ``e.from_`` hasn't run yet, yield it now. (If it still has
+              unprocessed in-body fan-in, that's a body-ordering bug — raise.)
+           b. If the just-run node raised a terminating ``module_signal``, stop.
+           c. Decrement ``pending[e.to]`` so a downstream node becomes runnable
+              once its later ``from_`` appearance is reached.
 
-        ``end`` is a virtual sink and is never executed; an edge with
-        ``to: end`` only pins its ``from_`` node into the active set.
-        The same node never re-executes within one step.
+        ``end`` is a virtual sink and is never yielded; an edge with ``to: end``
+        only pins its ``from_`` node into the active set. The same node never
+        re-runs within one body iteration.
 
-        Method dispatch: bare nodes (YAML default ``forward``) invoke
-        ``module.generate``; explicit YAML methods dispatch as-is.
-
-        Parameters
-        ----------
-        modules:
-            ``{module_name: module}`` dict.  Any object exposing the
-            requested method works — :class:`OmniModule` mixin instances,
-            plain modules in tests, or FSDP-unwrapped raw modules.
-        context:
-            Mutable generation context (input_ids, attention_mask, kv
-            cache, previously generated tokens, ...).  This call returns
-            a *new* dict; the input is not mutated.
-        profiler:
-            Optional graph profiler that records node path lines and, when
-            enabled, node timing.
-
-        Returns
-        -------
-        Updated context dict.
+        Method dispatch (in the executor): bare nodes default to ``generate``;
+        dotted ``module.method`` nodes dispatch verbatim.
         """
         state = self._current_state
         executed: set = set()
-        pending_step_ids: Any = None
 
         # Per-node first appearance as `from_` in body — distinguishes
         # **feed-forward** edges (with `to: X` *before* X's first `from_`
@@ -408,85 +400,58 @@ class GenerationGraph:
             if i < fi:
                 pending[e.to] += 1
 
-        def _run(node_name: str) -> None:
-            nonlocal pending_step_ids
-            if is_end(node_name) or node_name in executed:
-                return
-            if pending.get(node_name, 0) > 0:
-                raise RuntimeError(
-                    f"FSM step (state '{state.name}'): node '{node_name}' is being "
-                    f"executed before all of its feed-forward in-body inputs have "
-                    f"been routed (pending={pending[node_name]}). Re-order the body "
-                    f"so every edge feeding '{node_name}' precedes its first "
-                    f"appearance as a source."
-                )
-            node = self._node_pool[node_name]
-            wrapped = modules.get(node.module)
-            if wrapped is None:
-                raise KeyError(
-                    f"FSM step: module '{node.module}' (node '{node_name}') missing "
-                    f"from modules dict. Provided: {sorted(modules)}."
-                )
-            method_name = node.method
-            raw = unwrap_graph_module(wrapped, module_name=node.module)
-            # Optional per-module scope (e.g. make this module's ParallelState
-            # current so Extra Parallel groups resolve correctly).
-            module_context = scope_fn(node.module) if scope_fn is not None else nullcontext()
-            profile_context = (
-                profiler.node(f"[State|{state.name}] {node_name}: {node.module}.{method_name}")
-                if profiler is not None
-                else nullcontext()
-            )
-            with module_context, profile_context:
-                out = call_graph_endpoint(
-                    wrapped,
-                    raw,
-                    method=method_name,
-                    kwargs={**ctx, "generation_kwargs": generation_kwargs},
-                )
-            if not isinstance(out, dict):
-                raise TypeError(f"FSM node '{node_name}'.{method_name} must return a dict; got {type(out).__name__}.")
-            ctx.update(out)
-            executed.add(node_name)
-
         for i, edge in enumerate(state.body):
-            # 1. Execute the source node (idempotent for repeated `from_`).
-            _run(edge.from_)
+            # 1. Select the source node (idempotent for repeated `from_`).
+            name = edge.from_
+            if not is_end(name) and name not in executed:
+                if pending.get(name, 0) > 0:
+                    raise RuntimeError(
+                        f"FSM step (state '{state.name}'): node '{name}' is being "
+                        f"executed before all of its feed-forward in-body inputs have "
+                        f"been routed (pending={pending[name]}). Re-order the body "
+                        f"so every edge feeding '{name}' precedes its first "
+                        f"appearance as a source."
+                    )
+                executed.add(name)
+                yield self._node_pool[name]
 
-            # A terminating ``module_signal`` (e.g. ``text_done`` on ``</s>``)
-            # means no further nodes in this body should run — transition is
-            # evaluated in :meth:`maybe_transition` after the step returns.
+            # A terminating ``module_signal`` (e.g. ``text_done`` on ``</s>``),
+            # written by the node the caller just ran, means no further nodes in
+            # this body should run — the transition is evaluated in
+            # :meth:`maybe_transition` after this generator is exhausted.
             if FSM_SIGNAL_KEY in ctx:
-                break
+                return
 
-            # 2. Decrement the destination's feed-forward pending count;
-            #    if the node has no later appearance as a source (it's a
-            #    body sink), trigger it now once all its inputs are in.
+            # 2. Decrement the destination's feed-forward pending count so it
+            #    becomes runnable once its later `from_` appearance is reached.
             if not is_end(edge.to):
                 fi = first_from_idx.get(edge.to, len(state.body))
                 if i < fi:
                     pending[edge.to] -= 1
 
-        return ctx
-
-    def maybe_transition(self, context: Dict[str, Any], *, profiler: Optional[GraphProfiler] = None) -> bool:
+    def maybe_transition(self, context: Dict[str, Any]) -> Optional["FiredTransition"]:
         """Check transitions for the current state.
 
-        Returns True if a transition fired (state changed).
+        Returns a :class:`FiredTransition` (``from_state`` / ``to_state`` /
+        ``condition`` description) if a transition fired and the state changed,
+        else ``None``. The graph stays profiler-free: the caller (which owns the
+        profiler) formats the transition trace from the returned value.
 
-        For ``module_signal`` transitions ``context["module_signal"]`` is
-        popped after logging the trace and before the state switch.
+        For ``module_signal`` transitions ``context["module_signal"]`` is popped
+        before the state switch.
         """
         state = self._current_state
         for trans in state.transitions:
             if trans.condition.check(context):
-                if profiler is not None:
-                    profiler.record(f"transition: {state.name} -> {trans.next_state} [{trans.condition.describe()}]")
                 if trans.condition.type == "module_signal":
                     context.pop(FSM_SIGNAL_KEY, None)
                 self._transition_to(trans.next_state, context)
-                return True
-        return False
+                return FiredTransition(
+                    from_state=state.name,
+                    to_state=trans.next_state,
+                    condition=trans.condition.describe(),
+                )
+        return None
 
     # ── Accessors ─────────────────────────────────────────────────────────────
 
@@ -608,4 +573,4 @@ class GenerationGraph:
         self._current = next_state
 
 
-__all__ = ["GenerationGraph"]
+__all__ = ["GenerationGraph", "FiredTransition"]

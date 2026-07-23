@@ -100,17 +100,24 @@ from veomni.models.seed_omni.utils.convert_registry import convert_checkpoint
 ### 3.1 Executor removed → `TrainingGraph.step`
 - **Gone:** `OmniModel.set_node_executors`, `OmniModel._node_executors`,
   `OmniModel._run_node`, and `OmniModuleTrainer.forward` (the old executor callable).
-- **Now:** `OmniModel.forward` loops the FSM exactly like `OmniModel.generate`:
+- **Now:** `OmniModel.forward` loops the graph exactly like `OmniModel.generate`.
+  The graph only *selects* nodes; execution is external (`execute_train_node`,
+  in `graphs/executor.py`) — see the current form below:
   ```python
   training_graph.reset()
   profiler = GraphProfiler()
-  while not training_graph.is_done():
-      batch = training_graph.step(modules, batch, profiler=profiler, scope_fn=scope_fn)
-      self._collect_training_loss(batch, profiler)  # pop _loss → self._losses
-      training_graph.maybe_transition(profiler=profiler)
+  for node in training_graph.iter_nodes():   # selection only, profiler-free
+      execute_train_node(modules, node, batch, profiler=profiler, scope_fn=scope_fn)
+      self._collect_training_loss(batch, node.name, profiler)  # pop _loss → self._losses
   ```
   `TrainingGraph` gained `reset()` / `is_done()` / `current_node_name` /
-  `maybe_transition()` (mirrors `GenerationGraph`).
+  `maybe_transition()` / `iter_nodes()` (mirrors `GenerationGraph`, whose per-iteration
+  selector is `iter_nodes(ctx)`).
+
+  > Note: an earlier form of this refactor had the graph's `step(modules, batch,
+  > ...)` run the node inline. A later change split *selection* (graph
+  > `iter_nodes`) from *execution* (`graphs/executor.py`), so the graph no
+  > longer performs any model forward.
 - **If your code** called `set_node_executors` or relied on `OmniModuleTrainer.forward`,
   delete that wiring — the orchestrator no longer injects an executor.
 

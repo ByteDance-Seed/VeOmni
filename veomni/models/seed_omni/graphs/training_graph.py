@@ -46,9 +46,12 @@ Exposed surface
 * ``module_of(node)`` / ``method_of(node)`` — accessors.
 * ``reset()`` / ``is_done()`` / ``current_node_name`` — cursor lifecycle
                                             (mirror of the generation FSM).
-* ``step(modules, batch, ...)``         — run the node at the cursor (one
-                                            forward); ``maybe_transition()``
-                                            advances to the next node.
+* ``iter_nodes()``                      — generator that *selects* nodes in
+                                            execution order (no forward — the
+                                            caller runs each via
+                                            ``executor.execute_train_node``);
+                                            ``maybe_transition()`` advances the
+                                            cursor.
 * ``to_mermaid(...)``                    — render the active DAG (``end`` is
                                             drawn as a dashed terminal node).
 
@@ -59,12 +62,9 @@ See also
 """
 
 from collections import defaultdict, deque
-from contextlib import nullcontext
-from typing import Any, Callable, ContextManager, Dict, List, Optional
+from typing import Dict, Iterator, List, Optional
 
-from .dispatch import call_graph_endpoint, unwrap_graph_module
 from .graph import EdgeDef, NodeDef, is_end
-from .profiling import GraphProfiler
 
 
 def _mermaid_id(name: str) -> str:
@@ -201,77 +201,28 @@ class TrainingGraph:
 
     # ── Step & Transition (mirror of GenerationGraph) ───────────────────────────
 
-    def step(
-        self,
-        modules: Dict[str, Any],
-        batch: Dict[str, Any],
-        *,
-        profiler: Optional[GraphProfiler] = None,
-        scope_fn: Optional[Callable[[str], ContextManager]] = None,
-    ) -> Dict[str, Any]:
-        """Run the node at the cursor — one forward (mirror of ``GenerationGraph.step``).
+    def iter_nodes(self) -> Iterator[NodeDef]:
+        """Yield each active node in execution order (selection only — no forward).
 
-        Like the FSM step, this is self-contained: it resolves the module, scopes
-        its :class:`ParallelState` (via ``scope_fn`` — vocab-parallel ``emb`` /
-        MoE EP groups), runs ``pre_forward`` → method → ``post_forward``, and
-        feeds the optional per-module metric meter. Training and inference both
-        call the graph endpoint through the **wrapped** module so DDP/FSDP hooks
-        fire. Non-``forward`` node methods are dispatched by temporarily
-        pointing ``raw.forward`` at the target method so they still run through
-        ``__call__``. ``raw`` (the unwrapped :class:`ModuleMixin`) owns the
-        hooks; FSDP2 is in-place (``raw is wrapped``) while DDP wraps
-        (``raw = wrapped.module``).
+        The graph only *chooses* what runs next; it never runs a model forward and
+        knows nothing about profiling / parallel infra (it is model-bound and
+        meant to travel with the pure modeling definition). The caller executes
+        each yielded node — see
+        :func:`~veomni.models.seed_omni.graphs.executor.execute_train_node` —
+        mutating the shared ``conversation_list`` carrier in place. After the
+        caller consumes a node, this generator advances the cursor
+        (:meth:`maybe_transition`) and yields the next, until :meth:`is_done`.
+        Mirror of :meth:`GenerationGraph.iter_nodes` (one FSM body iteration).
 
-        Edges are pure topology — no per-node input routing. Every node receives
-        the same shared ``batch``; cross-node state flows through the single
-        ``conversation_list`` carrier, so the node's return dict (only ever
-        ``conversation_list`` and/or ``_loss``) is merged back into ``batch`` for
-        downstream nodes. Loss collection lives in :meth:`OmniModel.forward`
-        (``_collect_training_loss``), mirroring ``_collect_generated``.
-
-        Returns the (mutated) ``batch``.
+        Because execution is external, loss draining, any per-node context
+        (module scope / profiler node), and the transition trace all live at the
+        call site, not here.
         """
-        node_name = self.current_node_name
-        node = self._node_by_name[node_name]
-        method = node.method
+        while not self.is_done():
+            yield self._node_by_name[self.current_node_name]
+            self.maybe_transition()
 
-        wrapped = modules.get(node.module)
-        if wrapped is None:
-            raise KeyError(
-                f"TrainingGraph.step: module '{node.module}' (node '{node_name}') missing "
-                f"from modules dict. Provided: {sorted(modules)}."
-            )
-        raw = unwrap_graph_module(wrapped, module_name=node.module)
-
-        module_context = scope_fn(node.module) if scope_fn is not None else nullcontext()
-        profile_context = profiler.node(f"forward:{node_name}") if profiler is not None else nullcontext()
-        with module_context, profile_context:
-            # ``pre_forward`` does packing / conversation extraction and, when the
-            # module's scoped ``sp_size > 1``, slices its inputs to this rank's
-            # ``1/sp`` shard (classic single-pass Ulysses: every SP rank holds the
-            # SAME replicated sample; the model's attention all-to-alls run over the
-            # SP group internally). ``post_forward`` all-gathers the output shard
-            # back to the full sample on every rank, so downstream nodes run
-            # identically on replicated full data. SP is thus fully contained in the
-            # module's own pre/post hooks — the graph and modeling stay SP-unaware.
-            kwargs = raw.pre_forward(method=method, **batch)
-
-            # Opt-in metric meter (only modules multi-inheriting a MetricMeterMixin
-            # have ``metric_meter_add``). It drains the FULL pre-slice seqlens the
-            # module stashed inside ``pre_forward`` (via ``metric_meter_set_seqlens``,
-            # before any SP slice), so metering is SP-invariant regardless of the
-            # sharded ``kwargs`` handed here.
-            if hasattr(raw, "metric_meter_add"):
-                raw.metric_meter_add(method, kwargs)
-
-            out = call_graph_endpoint(wrapped, raw, method=method, kwargs=kwargs)
-            out = raw.post_forward(method=method, **out)
-
-        batch.update(out)
-
-        return batch
-
-    def maybe_transition(self, *, profiler: Optional[GraphProfiler] = None) -> bool:
+    def maybe_transition(self) -> bool:
         """Advance the cursor to the next node (mirror of ``GenerationGraph.maybe_transition``).
 
         Training's "transition" is unconditional: a static topological pass just
@@ -279,10 +230,7 @@ class TrainingGraph:
         once the cursor steps past the last one (``is_done()``).
         """
         self._cursor += 1
-        moved = not self.is_done()
-        if profiler is not None and moved:
-            profiler.record(f"transition: -> {self.current_node_name}")
-        return moved
+        return not self.is_done()
 
     # ── visualization ────────────────────────────────────────────────────────
 
