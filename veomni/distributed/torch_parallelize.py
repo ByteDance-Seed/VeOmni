@@ -29,7 +29,7 @@ from torch.utils.checkpoint import noop_context_fn
 from ..arguments import MixedPrecisionConfig
 from ..models import load_model_weights, load_model_weights_ep_sharded, rank0_load_and_broadcast_weights
 from ..utils import logging
-from ..utils.device import IS_NPU_AVAILABLE, get_device_type
+from ..utils.device import IS_NPU_AVAILABLE, get_device_id, get_device_type
 from .checkpoint import CheckpointFunction
 from .chunk_mbs import apply_chunk_mbs
 from .parallel_plan import get_runtime_parallel_plan
@@ -49,25 +49,76 @@ def _reset_hf_initialized_flag(module: nn.Module) -> None:
 
 
 def _to_empty_preserving_nonpersistent_buffers(model: nn.Module, device: str) -> None:
-    """Materialize parameters without discarding config-derived buffers.
+    """Materialize parameters while preserving buffer alias groups.
 
-    Distributed checkpoints restore ``state_dict()``, which excludes buffers
-    registered with ``persistent=False``. Snapshot those buffers before
-    ``to_empty()`` so values such as rotary ``inv_freq`` survive the DCP resume
-    materialization path without duplicating persistent buffers that DCP loads.
+    ``Module.to_empty()`` replaces each registered buffer independently, which
+    breaks aliases. Record every registration before materialization and bind
+    each original alias group to one materialized tensor afterwards.
+
+    Distributed checkpoints do not restore groups containing only
+    nonpersistent buffers, so preserve their config-derived values. If a group
+    has any persistent registration, the checkpoint is authoritative and will
+    populate the shared materialized tensor during the subsequent DCP load.
     """
-    buffers = []
+
+    buffer_groups: dict[int, list[tuple[nn.Module, str]]] = {}
+    preserved_nonpersistent_buffers: dict[int, torch.Tensor] = {}
     for module in model.modules():
-        for name in module._non_persistent_buffers_set:
-            buffer = module._buffers.get(name)
-            if buffer is not None:
-                buffers.append((module, name, buffer.detach().clone()))
+        for name, buffer in module._buffers.items():
+            if buffer is None:
+                continue
+            buffer_id = id(buffer)
+            buffer_groups.setdefault(buffer_id, []).append((module, name))
+
+    for buffer_id, registrations in buffer_groups.items():
+        if all(name in module._non_persistent_buffers_set for module, name in registrations):
+            module, name = registrations[0]
+            preserved_nonpersistent_buffers[buffer_id] = module._buffers[name].detach().clone()
 
     model.to_empty(device=device)
 
-    for module, name, buffer in buffers:
-        materialized_buffer = module._buffers[name]
-        materialized_buffer.copy_(buffer.to(device=materialized_buffer.device, dtype=materialized_buffer.dtype))
+    for buffer_id, registrations in buffer_groups.items():
+        if buffer_id in preserved_nonpersistent_buffers:
+            canonical_buffer = preserved_nonpersistent_buffers[buffer_id].to(device=device)
+        else:
+            module, name = registrations[0]
+            canonical_buffer = module._buffers[name]
+        for module, name in registrations:
+            module._buffers[name] = canonical_buffer
+
+
+@torch.no_grad()
+def _move_model_buffers_to_device(model: nn.Module, device: torch.device) -> tuple[int, int]:
+    """Move registered buffers without moving CPU-offloaded parameters.
+
+    PyTorch's ``Module._apply`` replaces buffer tensor objects during device
+    conversion, so external references are not guaranteed to retain object
+    identity. This helper follows that contract while memoizing by object
+    identity so multiple registrations of the same buffer remain aliased.
+    Tensor subclasses such as DTensor keep their type through ``Tensor.to``.
+    """
+
+    moved_count = 0
+    moved_bytes = 0
+    moved_by_id: dict[int, torch.Tensor] = {}
+    for module in model.modules():
+        for name, buffer in module._buffers.items():
+            if buffer is None:
+                continue
+            buffer_id = id(buffer)
+            if buffer_id in moved_by_id:
+                module._buffers[name] = moved_by_id[buffer_id]
+                continue
+            if buffer.device == device:
+                moved_by_id[buffer_id] = buffer
+                continue
+
+            moved_count += 1
+            moved_bytes += buffer.numel() * buffer.element_size()
+            moved_buffer = buffer.to(device=device)
+            moved_by_id[buffer_id] = moved_buffer
+            module._buffers[name] = moved_buffer
+    return moved_count, moved_bytes
 
 
 def _check_extra_parallel_dim0_divisibility(model: "nn.Module", para_name: str, ep_fsdp_size: int) -> bool:
@@ -534,6 +585,17 @@ def parallelize_model_fsdp2(
                     adapter_path=adapter_path,
                     fqn_to_index_mapping=fqn_to_index_mapping,
                 )
+
+    if enable_fsdp_cpu_offload:
+        device_type = get_device_type()
+        compute_device = (
+            torch.device(device_type, get_device_id()) if device_type != "cpu" else torch.device(device_type)
+        )
+        moved_buffers, moved_buffer_bytes = _move_model_buffers_to_device(model, compute_device)
+        logger.info_rank0(
+            "FSDP2 CPU offload kept registered buffers on the compute device: "
+            f"moved_buffers={moved_buffers}, moved_bytes={moved_buffer_bytes}."
+        )
 
     # Register grad norm clipping method for FSDP2
     from .fsdp2 import clip_grad_norm as clip_grad_norm_fn
