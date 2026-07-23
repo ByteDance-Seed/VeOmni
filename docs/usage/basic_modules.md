@@ -318,6 +318,16 @@ train_dataloader = build_dataloader(
 )
 ```
 
+When worker-side dynamic batching is configured with `infinity=True`, exhausting
+the upstream dataset restarts its iterator without advancing the dataset epoch or
+calling `set_epoch()`. Consequently, epoch-seeded shufflers repeat the same
+permutation on every internal restart.
+
+When `infinity_padding=True`, each worker starts emitting padding batches after
+its upstream dataset is exhausted. These batches are excluded from loss weighting.
+The training loop stops once all ranks return only padding batches for the same
+training step.
+
 ### Collate Function
 VeOmni default supports a unified collate function for all tasks (text task, multimodal task, omni task, etc.) (source code: [veomni/data/data_collator.py](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/data/data_collator.py)). The `MainCollator` handles: packing sequences, precompute position_ids & cu_seqlens & max_seqlens, and sequence parallel slice.
 

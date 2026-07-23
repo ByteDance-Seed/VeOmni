@@ -140,6 +140,10 @@ def build_native_dataloader(
             Use ``"spawn"`` when worker-side code must be pickle-safe and should not
             inherit parent-process state; keep ``"fork"`` for the legacy Linux behavior.
             Example: ``multiprocessing_context="spawn"``.
+        infinity_padding: In worker-side dynamic batching, keep yielding copies of
+            each worker's last real micro batch after its upstream dataset is exhausted.
+            The copies retain their original labels and carry ``padding_flag=True`` for
+            downstream loss accounting.
     """
     if collate_fn_kwargs is None:
         collate_fn_kwargs = {}

@@ -31,7 +31,10 @@ def count_loss_token(batches: Union[list[dict[str, torch.Tensor]], dict[str, tor
     }
 
     def _count(obj):
-        if isinstance(obj, dict) and not obj.get("padding_flag", False):
+        if isinstance(obj, dict):
+            if obj.get("padding_flag", False):
+                return
+
             token_len["foundation_tokens"] += torch.sum(obj["labels"] != IGNORE_INDEX)  # text tokens
 
             for key in obj.keys():
@@ -55,12 +58,18 @@ def mean_global_loss(
     losses: Union[dict[str, torch.Tensor], torch.Tensor],
     micro_batch_token_len: dict[str, torch.Tensor],
     micro_batches_token_len: dict[str, torch.Tensor],
+    infinity_padding: bool = False,
 ):
     """Calcuate the global mean loss. Avg on all_reduced_token_num instead of on dp_size.
     - cur_losses[key] = cur_loss * cur_token_num / global_batches_token_num * get_parallel_state().fsdp_size
     # fsdp by default divides gradients by its size, so we need to multiply by fsdp_size
+
+    When ``infinity_padding`` is enabled, stop iteration if every loss type has
+    zero tokens globally. This reuses the token-count reductions needed for loss weighting.
     """
     loss_dict = {}
+    all_reduced_lens = []
+    zero_len_nonzero_loss = None
 
     if isinstance(losses, torch.Tensor):  # text loss only
         losses = {"foundation_loss": losses}
@@ -73,18 +82,23 @@ def mean_global_loss(
             cur_token_len = all_reduce(cur_token_len.item(), op="sum", group=get_parallel_state().sp_group)
 
         all_reduced_len = all_reduce((micro_batches_token_len[f"{loss_name}_tokens"].item()), op="sum")
+        all_reduced_lens.append(all_reduced_len)
 
         if all_reduced_len != 0:
             cur_loss = cur_loss * cur_token_len / all_reduced_len * get_parallel_state().fsdp_size
-        else:
-            if not torch.allclose(cur_loss, torch.zeros_like(cur_loss)):
-                raise ValueError(
-                    f"The all_reduced_len for {loss_name}_tokens is 0, but the cur_loss is not 0: {cur_loss}"
-                )
+        elif zero_len_nonzero_loss is None and not torch.allclose(cur_loss, torch.zeros_like(cur_loss)):
+            zero_len_nonzero_loss = (loss_name, cur_loss)
 
         if get_parallel_state().sp_enabled:
             cur_loss = cur_loss / get_parallel_state().sp_size
 
         loss_dict[key] = cur_loss
+
+    if infinity_padding and all_reduced_lens and all(all_reduced_len == 0 for all_reduced_len in all_reduced_lens):
+        raise StopIteration("All ranks reached infinity padding.")
+
+    if zero_len_nonzero_loss is not None:
+        loss_name, cur_loss = zero_len_nonzero_loss
+        raise ValueError(f"The all_reduced_len for {loss_name}_tokens is 0, but the cur_loss is not 0: {cur_loss}")
 
     return loss_dict

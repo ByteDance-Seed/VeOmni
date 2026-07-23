@@ -674,8 +674,17 @@ class BaseTrainer(Stateful, ABC):
         self, outputs: ModelOutput, micro_batch: Dict[str, torch.Tensor]
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """Postprocess model outputs after forward pass."""
+        infinity_padding = False
+        if self.args.train.dyn_bsz and self.args.train.dyn_bsz_runtime == "worker":
+            dynamic_dataset = self.train_dataloader.dataset
+            infinity_padding = getattr(dynamic_dataset, "_infinity_padding", False) and not getattr(
+                dynamic_dataset, "_infinity", False
+            )
         loss_dict: Dict[str, torch.Tensor] = mean_global_loss(
-            outputs.loss, self.micro_batch_token_len, self.micro_batches_token_len
+            outputs.loss,
+            self.micro_batch_token_len,
+            self.micro_batches_token_len,
+            infinity_padding=infinity_padding,
         )
         loss = torch.stack(list(loss_dict.values())).sum()
         return loss, loss_dict
