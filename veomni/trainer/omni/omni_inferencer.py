@@ -256,7 +256,6 @@ class OmniInferencer(OmniTrainer):
             if preprocessor is not None:
                 preprocessor(batched, inference=True, generation_kwargs=generation_kwargs)
 
-    @torch.no_grad()
     def _run(self, req: InferenceRequest) -> dict[str, Any]:
         for module in self.modules.values():
             if hasattr(module, "reset_global_inference_state"):
@@ -270,17 +269,15 @@ class OmniInferencer(OmniTrainer):
             "conversation_list": conversation,
         }
         self.model.reset()
-        profile_args = self.args.graph_profile
-        profiler = GraphProfiler(
-            enable_wall_time=profile_args.enable_wall_time,
-            enable_cuda_events=profile_args.enable_cuda_events,
-            enable_memory=profile_args.enable_memory,
-        )
-        ctx = self.model.generate(
-            request=request_dict,
-            profiler=profiler,
-            generation_kwargs=req.generation_kwargs,
-        )
+        # Inference always emits a per-request trace (no train-step window), so —
+        # unlike the trainer — this is ungated.
+        profiler = GraphProfiler.from_config(self.args.graph_profile)
+        with torch.no_grad():
+            ctx = self.model.generate(
+                request=request_dict,
+                profiler=profiler,
+                generation_kwargs=req.generation_kwargs,
+            )
         ctx["profiler"] = profiler
         return ctx
 

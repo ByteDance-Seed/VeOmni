@@ -15,6 +15,7 @@ from veomni.models.seed_omni.graphs.graph import END
 from veomni.models.seed_omni.graphs.profiling import GraphProfiler
 from veomni.models.seed_omni.graphs.training_graph import TrainingGraph
 from veomni.models.seed_omni.mixins.modulemixin import ModuleMixin
+from veomni.trainer.callbacks import GraphProfileCallback
 from veomni.trainer.omni.omni_trainer import OmniTrainer
 
 
@@ -299,30 +300,59 @@ def test_graph_profiler_can_append_request_peak_memory(monkeypatch):
     assert profiler.save_records() == ["forward:run_ar.forward | peak_allocated_gb=2.000 | peak_reserved_gb=3.000"]
 
 
-def test_omni_trainer_saves_training_graph_profile_from_top_level_profile(tmp_path):
-    profile = OmniGraphProfileArguments(enable_wall_time=True, train_start_step=2, train_end_step=3)
-    output_dir = tmp_path / "output"
+def _make_graph_profile_callback(output_dir, *, global_rank=0, **profile_kwargs):
+    """A GraphProfileCallback wired to a stub OmniTrainer (no full trainer init)."""
+    profile = OmniGraphProfileArguments(**profile_kwargs)
     trainer = OmniTrainer.__new__(OmniTrainer)
     trainer.base = SimpleNamespace(
         args=SimpleNamespace(
             graph_profile=profile,
             train=SimpleNamespace(
-                global_rank=0,
+                global_rank=global_rank,
                 checkpoint=SimpleNamespace(output_dir=str(output_dir)),
             ),
         ),
-        state=SimpleNamespace(global_step=3),
     )
+    callback = GraphProfileCallback.__new__(GraphProfileCallback)
+    callback.trainer = trainer
+    trainer.graph_profiler = None
+    return callback, trainer
 
-    profiler = trainer._build_graph_profiler()
+
+def test_graph_profile_callback_saves_training_graph_profile(tmp_path):
+    output_dir = tmp_path / "output"
+    callback, trainer = _make_graph_profile_callback(
+        output_dir, enable_wall_time=True, train_start_step=2, train_end_step=3
+    )
+    state = SimpleNamespace(global_step=3)
+
+    # Step begin builds + binds the profiler for the step's forwards to consume.
+    callback.on_step_begin(state)
+    profiler = trainer.graph_profiler
     assert profiler is not None
     with profiler.node("forward:run_ar.forward"):
         pass
-    trainer._save_graph_profile(profiler, micro_step=1)
 
-    trace_path = output_dir / "graph_trace" / "step_000003_micro_01_rank_0.txt"
+    # Step end writes the per-step trace file and clears the slot.
+    callback.on_step_end(state)
+    trace_path = output_dir / "graph_trace" / "step_000003_rank_0.txt"
     assert trace_path.exists()
     assert "forward:run_ar.forward | wall_ms=" in trace_path.read_text()
+    assert trainer.graph_profiler is None
+
+
+def test_graph_profile_callback_is_gated_outside_step_window(tmp_path):
+    output_dir = tmp_path / "output"
+    callback, trainer = _make_graph_profile_callback(
+        output_dir, enable_wall_time=True, train_start_step=2, train_end_step=3
+    )
+
+    # global_step outside [train_start_step, train_end_step] → no profiler bound,
+    # and end is a no-op (no trace file written).
+    callback.on_step_begin(SimpleNamespace(global_step=5))
+    assert trainer.graph_profiler is None
+    callback.on_step_end(SimpleNamespace(global_step=5))
+    assert not (output_dir / "graph_trace").exists()
 
 
 def test_step_dispatches_non_forward_method_via_wrapper():

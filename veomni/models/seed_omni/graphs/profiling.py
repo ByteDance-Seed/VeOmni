@@ -22,9 +22,13 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from time import perf_counter
-from typing import Iterator
+from typing import TYPE_CHECKING, Iterator
 
 from ....utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE, get_torch_device
+
+
+if TYPE_CHECKING:
+    from ....arguments.arguments_types_omni import OmniGraphProfileArguments
 
 
 class GraphProfiler:
@@ -43,6 +47,20 @@ class GraphProfiler:
         self._lines: list[str] = []
         if self.enable_memory:
             self._reset_peak_memory_stats()
+
+    @classmethod
+    def from_config(cls, config: OmniGraphProfileArguments) -> GraphProfiler:
+        """Build from the ``graph_profile`` args (the ``enable_*`` detail switches).
+
+        Shared by the trainer and the inferencer so the field list lives in one
+        place; each caller keeps its own gating (train step window vs. always-on
+        per request).
+        """
+        return cls(
+            enable_wall_time=config.enable_wall_time,
+            enable_cuda_events=config.enable_cuda_events,
+            enable_memory=config.enable_memory,
+        )
 
     @contextmanager
     def node(self, line: str) -> Iterator[None]:

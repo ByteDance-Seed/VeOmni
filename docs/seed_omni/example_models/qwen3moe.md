@@ -201,7 +201,7 @@ surfaced (and fixed) a few omni-specific interactions. Full design notes:
 - **Fused MoE kernel** is bound because `qwen3_moe/llm/modeling.py` re-exports the
   patched module's OpSlots into the omni module namespace (so
   `build_foundation_model`'s `_bind_veomni_ops` finds them); the EP-aware kernel
-  reads `get_parallel_state().ep_group`, resolved per-node via `_module_scope`.
+  reads `get_parallel_state().ep_group`, resolved per-node via `module_context`.
 - **Gradient checkpointing** recompute is re-scoped to the module's `ParallelState`
   (`OmniModuleTrainer._scope_recompute_to_parallel_state`) so EP stays enabled
   during backward recompute.

@@ -51,7 +51,7 @@ import math
 import os
 import random
 from collections import defaultdict
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List
 
 import numpy as np
 import torch
@@ -61,19 +61,19 @@ from ...arguments import OmniArguments
 from ...data import SeedOmniCollator
 from ...data.data_transform import build_data_transform
 from ...distributed.parallel_state import get_parallel_state
-from ...models.seed_omni.graphs import GraphProfiler
 from ...models.seed_omni.mixins.metric_meter_mixin import MetricMeterResult
 from ...models.seed_omni.modeling_omni import OmniModel, _unwrap_module
 from ...models.seed_omni.utils.offline_cache import SeedOmniOfflineCacheWriter
-from ...ops.batch_invariant_ops import set_batch_invariant_mode
 from ...utils import helper, logging
 from ...utils.device import synchronize
 from ...utils.model_utils import pretty_print_trainable_parameters
 from ..base import BaseTrainer
 from ..callbacks import (
     Callback,
+    GraphProfileCallback,
     OmniEnvironMeterCallback,
 )
+from .context import format_active_contexts, setup_veomni_context, veomni_context
 from .omni_module_trainer import OmniModuleTrainer
 
 
@@ -295,6 +295,9 @@ class OmniTrainer:
         self.base._setup()
 
         self._build_model()
+        # Right after the module-trainers exist (the reshard cascade needs them);
+        # everything else the context builders read comes from args.
+        self._setup_context()
         self._validate_uniform_sp()
         self._freeze_model_module()
         self._build_model_assets()
@@ -305,7 +308,6 @@ class OmniTrainer:
         self._build_offline_cache_writer()
         self._build_optimizer()
         self._build_lr_scheduler()
-        self.base._build_training_context()
         self._init_callbacks()
 
     # ── Build: per-module trainers + compose ───────────────────────────────────
@@ -332,7 +334,7 @@ class OmniTrainer:
         model = OmniModel(self.omni_config, modules)
         # Each module trainer registered its ParallelState under its module name in
         # the global registry (init_parallel_state(name=...)); hand the model the
-        # set of names so _module_scope re-enters each by name.
+        # set of names so module_context re-enters each by name.
         model.set_module_parallel_state_names(self.module_trainers.keys())
         base.model_config = self.omni_config
 
@@ -479,6 +481,37 @@ class OmniTrainer:
                 self.lr_schedulers[name] = module_trainer.base.lr_scheduler
         base.lr_scheduler = MultiLRScheduler(self.lr_schedulers)
 
+    # ── Step-level context registry setup (config → context.py) ───────────────
+
+    def _setup_context(self):
+        """Hand the step-level context registry the live args (once, at init).
+
+        Single-model trainers build their activation-offloading contexts on
+        ``BaseTrainer`` (``BaseTrainer._build_training_context``, left untouched).
+        The Omni path instead hands the live args (plus ``module_trainers`` for the
+        reshard cascade) to the step-level context registry
+        (:func:`~veomni.trainer.omni.context.setup_veomni_context`), and the
+        registry's factories read what they need off the args and build their own
+        contexts (activation offloading, batch-invariant, and the per-module
+        reshard cascade). ``self.base._build_training_context`` is intentionally
+        NOT called for the Omni trainer.
+
+        After wiring, the resolved active contexts are logged as a
+        ``stage → contexts`` table so each run's actual context wiring is visible.
+        """
+        setup_veomni_context(self.base.args, self.module_trainers)
+
+        # Log what got wired, per execution stage this run actually runs: the
+        # offline-cache path only encodes (one forward, no backward); every other
+        # train_type runs the train forward + backward. Read from args so this
+        # doesn't depend on the later-built writer.
+        args: OmniArguments = self.base.args
+        if args.train.train_type == "offline_cache":
+            stages = [("forward", "offline_cache")]
+        else:
+            stages = [("forward", "train"), ("backward", "train")]
+        logger.info_rank0("OmniTrainer: wired step contexts\n" + format_active_contexts(stages))
+
     # ── Callbacks (orchestrator owns trace; each module owns its checkpoint) ───
 
     def _init_callbacks(self):
@@ -502,20 +535,24 @@ class OmniTrainer:
         base.environ_meter_callback = OmniEnvironMeterCallback(self)
         base.checkpointer_callback = OmniGlobalStateCallback(self)
         base.hf_ckpt_callback = Callback(base)
+        # Owns the per-step graph-profiler lifecycle (build on on_step_begin, save
+        # on on_step_end); sets/reads ``self.graph_profiler`` (consumed by the forward).
+        base.graph_profile_callback = GraphProfileCallback(self)
         base._callbacks = [
             base.environ_meter_callback,
             base.tqdm_callback,
             base.wandb_callback,
             base.profile_callback,
+            base.graph_profile_callback,
             base.checkpointer_callback,
             base.hf_ckpt_callback,
             base.evaluate_callback,
             base.moe_monitor_callback,
         ]
 
-    # ── Metric metering (gather each module's tokens + theoretical FLOPs) ──────
+    # ── Metric metering + grad-norm helpers ───────────────────────────────────
 
-    def collect_metric_meter(self) -> Dict[str, MetricMeterResult]:
+    def _collect_metric_meter(self) -> Dict[str, MetricMeterResult]:
         """Gather every metered module's ``(theoretical_flops, seqlens)``.
 
         Each :class:`OmniModuleTrainer` stashed its time-independent contribution
@@ -531,154 +568,18 @@ class OmniTrainer:
                 module_metrics[name] = result
         return module_metrics
 
-    # ── Forward / backward (override single-model path) ────────────────────────
+    def _clip_grad_norm(self) -> float:
+        """Clip each module-trainer's grads and combine into the global L2 grad norm.
 
-    def _should_save_graph_profile(self) -> bool:
-        profile = self.base.args.graph_profile
-        if self.base.args.train.global_rank != 0:
-            return False
-        if not profile.enable_graph_profiling():
-            return False
-        return profile.train_start_step <= self.base.state.global_step <= profile.train_end_step
-
-    def _build_graph_profiler(self) -> Optional[GraphProfiler]:
-        profile = self.base.args.graph_profile
-        if not self._should_save_graph_profile():
-            return None
-
-        return GraphProfiler(
-            enable_wall_time=profile.enable_wall_time,
-            enable_cuda_events=profile.enable_cuda_events,
-            enable_memory=profile.enable_memory,
-        )
-
-    def _save_graph_profile(self, profiler: Optional[GraphProfiler], *, micro_step: int) -> None:
-        if profiler is None:
-            return
-
-        args: OmniArguments = self.base.args
-        trace_dir = os.path.join(args.train.checkpoint.output_dir, "graph_trace")
-        os.makedirs(trace_dir, exist_ok=True)
-        trace_path = os.path.join(
-            trace_dir,
-            f"step_{self.base.state.global_step:06d}_micro_{micro_step:02d}_rank_{args.train.global_rank}.txt",
-        )
-        with open(trace_path, "w", encoding="utf-8") as f:
-            f.write("\n".join(profiler.save_records()) + "\n")
-        logger.info_rank0(f"OmniTrainer: graph profile trace → {trace_path}")
-
-    def forward_backward_step(self, micro_batch: Dict[str, Any], *, micro_step: int = 0):
-        """One gradient-accumulation micro-batch over the training DAG.
-
-        ``OmniModel.forward`` returns ``{"loss", "losses"}`` where ``loss`` is
-        the summed per-node ``_loss``; a single backward then propagates across
-        every FSDP2 unit.
+        Each :class:`OmniModuleTrainer` clips the params of its own FSDP unit and
+        returns that module's grad norm; the whole-model norm is their L2
+        combination (sqrt of sum of squares). Empty (no module-trainers) → 0.0.
         """
-        base = self.base
-        micro_batch = base.preforward(micro_batch)
-        profiler = self._build_graph_profiler()
-
-        with base.model_fwd_context, set_batch_invariant_mode(base.args.train.enable_batch_invariant_mode):
-            result: Dict[str, Any] = base.model(profiler=profiler, **micro_batch)
-        self._save_graph_profile(profiler, micro_step=micro_step)
-
-        total_loss: torch.Tensor = result["loss"]
-        if total_loss is None:
-            raise RuntimeError(
-                "OmniModel.forward produced no loss — no training node emitted a `_loss`. "
-                "Check that the training data + per-module training forwards are wired (D4/D5)."
-            )
-        loss_dict: Dict[str, torch.Tensor] = result.get("losses", {})
-
-        with base.model_bwd_context, set_batch_invariant_mode(base.args.train.enable_batch_invariant_mode):
-            total_loss.backward()
-
-        del micro_batch
-        return total_loss, loss_dict
-
-    def _model_reshard(self, micro_step: int, num_micro_steps: int) -> None:
-        """Cascade the grad-accum reshard intent into every module-trainer.
-
-        The micro-step arithmetic is a *global* grad-accum concept (same for
-        every module), so it lives here once: keep params gathered from the first
-        micro-step (``reshard=False``) until the last (``reshard=True``), with
-        nothing to do on intermediate steps or when there is no accumulation.
-        Each ``OmniModuleTrainer`` then decides for itself (from its own
-        ``fsdp_config``) whether to apply it — mirroring the per-module
-        :meth:`clip_grad_norm` cascade.
-        """
-        if num_micro_steps <= 1:
-            return
-        if micro_step == 0:
-            reshard = False
-        elif micro_step == num_micro_steps - 1:
-            reshard = True
-        else:
-            return
-        for module_trainer in self.module_trainers.values():
-            module_trainer.model_reshard(reshard)
-
-    def train_step(self, data_iterator: Any) -> None:
-        base = self.base
-        args: OmniArguments = base.args
-        base.state.global_step += 1
-
-        micro_batches: List[Dict[str, Any]] = next(data_iterator)
-        self.on_step_begin(micro_batches=micro_batches)
-        synchronize()
-
-        total_loss = 0.0
-        total_loss_dict: Dict[str, float] = defaultdict(float)
-        num_micro_steps = len(micro_batches)
-
-        for micro_step, micro_batch in enumerate(micro_batches):
-            self._model_reshard(micro_step, num_micro_steps)
-            loss, loss_dict = self.forward_backward_step(micro_batch, micro_step=micro_step)
-            total_loss += loss.item() / num_micro_steps
-            for k, v in loss_dict.items():
-                total_loss_dict[k] += v.item() / num_micro_steps
-
-        max_grad_norm = args.train.optimizer.max_grad_norm
+        max_grad_norm = self.base.args.train.optimizer.max_grad_norm
         module_grad_norms = [
             module_trainer.clip_grad_norm(max_grad_norm) for module_trainer in self.module_trainers.values()
         ]
-        grad_norm = math.sqrt(sum(g * g for g in module_grad_norms)) if module_grad_norms else 0.0
-        base.optimizer.step()
-        base.lr_scheduler.step()
-        base.optimizer.zero_grad()
-
-        self.on_step_end(loss=total_loss, loss_dict=dict(total_loss_dict), grad_norm=grad_norm)
-
-    def offline_cache_step(self, data_iterator: Any) -> None:
-        base = self.base
-        if self.offline_cache_writer is None:
-            raise RuntimeError("offline_cache_step requires an initialized SeedOmniOfflineCacheWriter.")
-
-        base.state.global_step += 1
-
-        micro_batches: List[Dict[str, Any]] = next(data_iterator)
-        self.on_step_begin(micro_batches=micro_batches)
-        synchronize()
-
-        num_micro_steps = len(micro_batches)
-        for micro_step, micro_batch in enumerate(micro_batches):
-            self._model_reshard(micro_step, num_micro_steps)
-            micro_batch = base.preforward(micro_batch)
-            profiler = self._build_graph_profiler()
-            with (
-                torch.no_grad(),
-                base.model_fwd_context,
-                set_batch_invariant_mode(base.args.train.enable_batch_invariant_mode),
-            ):
-                base.model(profiler=profiler, **micro_batch)
-            self._save_graph_profile(profiler, micro_step=micro_step)
-
-            conversation_list = micro_batch.get("conversation_list")
-            if conversation_list is None:
-                raise RuntimeError("offline_cache graph did not leave `conversation_list` in the micro-batch.")
-            self.offline_cache_writer.save_conversation_list(conversation_list)
-
-        self.on_step_end(loss=0.0, loss_dict={}, grad_norm=0.0)
+        return math.sqrt(sum(g * g for g in module_grad_norms)) if module_grad_norms else 0.0
 
     # ── Callback delegators (trace via base; cascade ckpt into module-trainers) ─
     #
@@ -724,7 +625,89 @@ class OmniTrainer:
             module_trainer.on_step_end(self.base.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
         self.base.on_step_end(loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
 
-    # ── Train loop (mirrors BaseTrainer.train / VLMTrainer.train) ──────────────
+    # ── Main entrypoints: forward/backward → step → train loop ─────────────────
+
+    def forward_backward_step(self, micro_batch: Dict[str, Any], *, micro_step: int = 0, num_micro_steps: int = 1):
+        """One gradient-accumulation micro-batch over the training DAG.
+
+        ``OmniModel.forward`` returns ``{"loss", "losses"}`` where ``loss`` is
+        the summed per-node ``_loss``; a single backward then propagates across
+        every FSDP2 unit. The step-level concerns (activation offloading,
+        batch-invariant mode, and the grad-accum ``model_reshard`` cascade) are
+        composed by :func:`veomni_context`.
+        """
+        base = self.base
+        micro_batch = base.preforward(micro_batch)
+
+        # ``graph_profiler`` is bound once per step by GraphProfileCallback.on_step_begin
+        # (None outside the profiling window); the same profiler spans every micro-batch.
+        with veomni_context("forward", "train", micro_step, num_micro_steps):
+            result: Dict[str, Any] = base.model(profiler=self.graph_profiler, **micro_batch)
+
+        total_loss: torch.Tensor = result["loss"]
+        if total_loss is None:
+            raise RuntimeError(
+                "OmniModel.forward produced no loss — no training node emitted a `_loss`. "
+                "Check that the training data + per-module training forwards are wired (D4/D5)."
+            )
+        loss_dict: Dict[str, torch.Tensor] = result.get("losses", {})
+
+        with veomni_context("backward", "train", micro_step, num_micro_steps):
+            total_loss.backward()
+
+        del micro_batch
+        return total_loss, loss_dict
+
+    def train_step(self, data_iterator: Any) -> None:
+        base = self.base
+        base.state.global_step += 1
+
+        micro_batches: List[Dict[str, Any]] = next(data_iterator)
+        self.on_step_begin(micro_batches=micro_batches)
+        synchronize()
+
+        total_loss = 0.0
+        total_loss_dict: Dict[str, float] = defaultdict(float)
+        num_micro_steps = len(micro_batches)
+
+        for micro_step, micro_batch in enumerate(micro_batches):
+            loss, loss_dict = self.forward_backward_step(
+                micro_batch, micro_step=micro_step, num_micro_steps=num_micro_steps
+            )
+            total_loss += loss.item() / num_micro_steps
+            for k, v in loss_dict.items():
+                total_loss_dict[k] += v.item() / num_micro_steps
+
+        grad_norm = self._clip_grad_norm()
+        base.optimizer.step()
+        base.lr_scheduler.step()
+        base.optimizer.zero_grad()
+
+        self.on_step_end(loss=total_loss, loss_dict=dict(total_loss_dict), grad_norm=grad_norm)
+
+    def offline_cache_step(self, data_iterator: Any) -> None:
+        base = self.base
+        if self.offline_cache_writer is None:
+            raise RuntimeError("offline_cache_step requires an initialized SeedOmniOfflineCacheWriter.")
+
+        base.state.global_step += 1
+
+        micro_batches: List[Dict[str, Any]] = next(data_iterator)
+        self.on_step_begin(micro_batches=micro_batches)
+        synchronize()
+
+        num_micro_steps = len(micro_batches)
+        for micro_step, micro_batch in enumerate(micro_batches):
+            micro_batch = base.preforward(micro_batch)
+            with veomni_context("forward", "offline_cache", micro_step, num_micro_steps):
+                base.model(profiler=self.graph_profiler, **micro_batch)
+
+            conversation_list = micro_batch.get("conversation_list")
+            if conversation_list is None:
+                raise RuntimeError("offline_cache graph did not leave `conversation_list` in the micro-batch.")
+            self.offline_cache_writer.save_conversation_list(conversation_list)
+
+        self.on_step_end(loss=0.0, loss_dict={}, grad_norm=0.0)
 
     def train(self):
         base = self.base

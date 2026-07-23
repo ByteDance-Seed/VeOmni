@@ -413,7 +413,7 @@ class OmniModuleTrainer:
         """Make gradient-checkpoint recompute re-enter this module's ParallelState.
 
         torch ``checkpoint``'s ``context_fn`` returns ``(forward_ctx, recompute_ctx)``;
-        the forward is already wrapped in :meth:`OmniModel._module_scope`, but the
+        the forward is already wrapped in :meth:`OmniModel.module_context`, but the
         recompute (in backward) escapes it. Setting ``recompute_ctx`` to
         :func:`use_parallel_state` keeps reads of the free ``get_parallel_state()``
         (EP groups, vocab-parallel ``emb`` group, …) resolving to this module's mesh

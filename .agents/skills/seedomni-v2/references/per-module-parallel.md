@@ -104,7 +104,7 @@ objects. This is safe because the SP/DP/CP process groups are
 (`get_ulysses_sequence_parallel_group`, `get_unified_sequence_parallel_group`, …)
 resolve from `get_parallel_state().{ulysses,sp,cp,dp}_group` (the current state's
 device-mesh subgroup) — there are no group globals. Since `use_parallel_state`
-(via the graph's `_module_scope`) already scopes `_PARALLEL_STATE` per module for
+(via the graph's `module_context`) already scopes `_PARALLEL_STATE` per module for
 its forward and its grad-checkpoint recompute, the global attention integration
 (`veomni_flash_attention_2_with_sp`, which only reaches the group through
 `get_ulysses_sequence_parallel_group()`) automatically all-to-alls over the

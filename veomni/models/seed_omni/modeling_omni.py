@@ -191,7 +191,7 @@ class OmniModel(nn.Module):
 
         # Module names whose ParallelState is registered in the global
         # ``_PARALLEL_STATE_REGISTRY`` (set by the trainer via
-        # :meth:`set_module_parallel_state_names`).  ``_module_scope`` scopes a
+        # :meth:`set_module_parallel_state_names`).  ``module_context`` scopes a
         # node's forward under its module's mesh by *name* (registry lookup).
         # Empty by default so the runtime stays importable without a trainer
         # (print-flow tests) and eager single-process inference stays unscoped.
@@ -239,7 +239,7 @@ class OmniModel(nn.Module):
         """
         self._module_parallel_state_names = set(module_names)
 
-    def _module_scope(self, module_name: str):
+    def module_context(self, module_name: str):
         """Context manager scoping ``module_name``'s ParallelState as current.
 
         Used by both training ``forward`` and the inference ``generate`` FSM
@@ -312,7 +312,7 @@ class OmniModel(nn.Module):
                 modules,
                 batch,
                 profiler=profiler,
-                scope_fn=self._module_scope,
+                scope_fn=self.module_context,
             )
             self._collect_training_loss(batch, profiler)
             self.training_graph.maybe_transition(profiler=profiler)
@@ -462,7 +462,7 @@ class OmniModel(nn.Module):
         while not self.generation_graph.is_done() and total_steps < max_new_tokens:
             self._emit_progress(total_steps)
             ctx = self.generation_graph.step(
-                modules, ctx, profiler=profiler, generation_kwargs=generation_kwargs, scope_fn=self._module_scope
+                modules, ctx, profiler=profiler, generation_kwargs=generation_kwargs, scope_fn=self.module_context
             )
             total_steps += 1
             self._collect_generated(ctx, profiler)

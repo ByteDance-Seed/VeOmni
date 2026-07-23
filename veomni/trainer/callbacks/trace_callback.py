@@ -253,6 +253,8 @@ class OmniEnvironMeterCallback(Callback):
     ``self.trainer.base`` where the wandb / tqdm callbacks read it.
     """
 
+    trainer: "OmniTrainer"
+
     def __init__(self, trainer: "OmniTrainer") -> None:
         super().__init__(trainer)
         base = trainer.base
@@ -281,7 +283,7 @@ class OmniEnvironMeterCallback(Callback):
         # ``(theoretical_flops, seqlens)`` in its module-trainer's on_step_end;
         # the meter sums the FLOPs + merges the tokens and applies this single
         # whole-graph delta to get the overall achieved FLOPs / MFU.
-        module_metrics = self.trainer.collect_metric_meter()
+        module_metrics = self.trainer._collect_metric_meter()
         step_env_metrics = base.environ_meter.step(delta_time, state.global_step, module_metrics)
 
         step_train_metrics = {
