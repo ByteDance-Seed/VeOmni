@@ -869,6 +869,8 @@ class _MapStyleSamplerWrapper(IterableDataset):
         seed: int = 0,
         drop_last: bool = False,
     ) -> None:
+        if num_replicas <= 0:
+            raise ValueError(f"num_replicas must be positive, got {num_replicas}")
         if rank < 0 or rank >= num_replicas:
             raise ValueError(f"Invalid rank {rank}, rank should be in the interval [0, {num_replicas - 1}]")
         self.dataset = dataset
@@ -928,8 +930,10 @@ class _MapStyleSamplerWrapper(IterableDataset):
         if not self._just_resumed:
             self._yielded = 0
         else:
-            # Resuming: keep the restored progress (clamped to this worker's index count).
-            self._yielded = min(self._yielded, len(indices))
+            if self._yielded > len(indices):
+                raise RuntimeError(
+                    f"Restored yielded count {self._yielded} exceeds this worker's {len(indices)} assigned samples."
+                )
             self._just_resumed = False
 
         for idx in indices[self._yielded :]:

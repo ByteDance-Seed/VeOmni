@@ -1,6 +1,6 @@
 """Tests for DynamicBatchingSizeDataset functionality.
 
-This module tests the ``DynamicBatchingSizeDataset`` class using ``ShardedIterableDataset``.
+This module tests ``DynamicBatchingSizeDataset`` with iterable and map-style datasets.
 It validates that ``DynamicBatchingSizeDataset`` can properly:
 
 1. Batch samples based on token count (``micro_batch_seq_length``).
@@ -23,8 +23,8 @@ The test suite includes:
 
     End-to-end distributed tests (require ``torchrun`` with 2 processes):
         - ``test_dynamic_batching_dataset_distributed`` – parametrised over
-          ``shuffle × save_by_idx × multi_sample_per_iteration`` (5 combinations), verifying that resumed
-          batches are byte-for-byte identical to the original run.
+          dataset type, shuffle, save_by_idx, and multi-sample transforms, verifying
+          that resumed batches are byte-for-byte identical to the original run.
 """
 
 import argparse
@@ -50,6 +50,7 @@ from transformers import PretrainedConfig
 from utils import (
     FakeModel,
     ShardedIterableDataset,
+    ShardedMappingDataset,
     StepAwareResumeCheckpointerCallback,
     compare_global_batch,
     compare_items,
@@ -534,22 +535,24 @@ def test_save_load_state_dict(save_by_idx):
 
 
 @pytest.mark.parametrize(
-    "shuffle,save_by_idx,multi_sample_per_iteration",
+    "dataset_type,shuffle,save_by_idx,multi_sample_per_iteration",
     [
-        (False, False, False),
-        (False, True, False),
-        (True, False, False),
-        (True, True, False),
-        (True, True, True),
+        ("iterable", False, False, False),
+        ("iterable", False, True, False),
+        ("iterable", True, False, False),
+        ("iterable", True, True, False),
+        ("iterable", True, True, True),
+        ("mapping", True, True, False),
     ],
 )
-def test_dynamic_batching_dataset_distributed(shuffle, save_by_idx, multi_sample_per_iteration):
+def test_dynamic_batching_dataset_distributed(dataset_type, shuffle, save_by_idx, multi_sample_per_iteration):
     """Test DynamicBatchingSizeDataset in distributed setting.
 
     Runs _main_distributed_test() by torchrun with or without data shuffling
     and with or without save_by_idx for checkpoint buffer saving.
 
     Args:
+        dataset_type: Whether the upstream is iterable or map-style.
         shuffle: Whether to enable data shuffling.
         save_by_idx: Whether to save buffer by index for checkpointing.
         multi_sample_per_iteration: Whether one dataset iteration emits two samples.
@@ -558,6 +561,7 @@ def test_dynamic_batching_dataset_distributed(shuffle, save_by_idx, multi_sample
         subprocess.CalledProcessError: If the distributed test fails.
     """
     command = build_command(
+        dataset_type=dataset_type,
         shuffle=shuffle,
         save_by_idx=save_by_idx,
         multi_sample_per_iteration=multi_sample_per_iteration,
@@ -567,13 +571,14 @@ def test_dynamic_batching_dataset_distributed(shuffle, save_by_idx, multi_sample
     assert result.returncode == 0
 
 
-def build_command(shuffle=True, save_by_idx=True, multi_sample_per_iteration=False):
+def build_command(dataset_type="iterable", shuffle=True, save_by_idx=True, multi_sample_per_iteration=False):
     """Build torchrun command for distributed testing.
 
     Constructs a command to launch the test script with torchrun for
     distributed execution with 2 processes.
 
     Args:
+        dataset_type: Whether to build an iterable or map-style upstream dataset.
         shuffle: Whether to enable data shuffling.
         save_by_idx: Whether to save buffer by index for checkpointing.
         multi_sample_per_iteration: Whether one dataset iteration emits two samples.
@@ -604,6 +609,7 @@ def build_command(shuffle=True, save_by_idx=True, multi_sample_per_iteration=Fal
         "--train.checkpoint.output_dir=.tests/cache",
         "--train.dyn_bsz=true",
         "--train.dyn_bsz_runtime=worker",
+        f"--dataset_type={dataset_type}",
         f"--save_by_idx={str(save_by_idx).lower()}",
         f"--multi_sample_per_iteration={str(multi_sample_per_iteration).lower()}",
         "--train.seed=42",
@@ -625,10 +631,12 @@ class TrainerTest(BaseTrainer):
     def __init__(
         self,
         args: VeOmniArguments,
+        dataset_type: str,
         shuffle: bool,
         save_by_idx: bool,
         multi_sample_per_iteration: bool,
     ):
+        self.dataset_type = dataset_type
         self.shuffle = shuffle
         self.save_by_idx = save_by_idx
         self.multi_sample_per_iteration = multi_sample_per_iteration
@@ -653,12 +661,15 @@ class TrainerTest(BaseTrainer):
     def _build_dataset(self):
         args = self.args
         transform = multi_sample_transform if self.multi_sample_per_iteration else single_sample_transform
-        self.train_dataset = ShardedIterableDataset(
-            size=DATASET_SIZE,
-            shuffle=self.shuffle,
-            seed=args.train.seed,
-            transform=transform,
-        )
+        if self.dataset_type == "mapping":
+            self.train_dataset = ShardedMappingDataset(size=DATASET_SIZE, transform=transform)
+        else:
+            self.train_dataset = ShardedIterableDataset(
+                size=DATASET_SIZE,
+                shuffle=self.shuffle,
+                seed=args.train.seed,
+                transform=transform,
+            )
         effective_dataset_size = DATASET_SIZE * (2 if self.multi_sample_per_iteration else 1)
         args.compute_train_steps(effective_dataset_size)
         args.train.num_train_epochs = 2
@@ -816,6 +827,7 @@ def _main_distributed_test():
         patch("veomni.utils.device.empty_cache", mock_empty_cache),
     ):
         _parser = argparse.ArgumentParser()
+        _parser.add_argument("--dataset_type", choices=["iterable", "mapping"], default="iterable")
         _parser.add_argument("--shuffle", type=lambda x: x.lower() == "true", default=True)
         _parser.add_argument("--save_by_idx", type=lambda x: x.lower() == "true", default=True)
         _parser.add_argument("--multi_sample_per_iteration", type=lambda x: x.lower() == "true", default=False)
@@ -825,6 +837,7 @@ def _main_distributed_test():
         args = parse_args(VeOmniArguments)
         trainer = TrainerTest(
             args,
+            dataset_type=test_args.dataset_type,
             shuffle=test_args.shuffle,
             save_by_idx=test_args.save_by_idx,
             multi_sample_per_iteration=test_args.multi_sample_per_iteration,
