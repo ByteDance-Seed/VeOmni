@@ -241,11 +241,9 @@ class OmniConfig(PretrainedConfig):
         if modules is None:
             return {}
         if isinstance(modules, (str, os.PathLike)):
-            import yaml
+            from ...arguments.omni_parser import load_yaml_with_inherit
 
-            with open(modules, encoding="utf-8") as f:
-                loaded = yaml.safe_load(f) or {}
-            return loaded
+            return load_yaml_with_inherit(str(modules)) or {}
         return deepcopy(modules)
 
     @staticmethod
@@ -259,10 +257,9 @@ class OmniConfig(PretrainedConfig):
         if graph is None:
             return None
         if isinstance(graph, (str, os.PathLike)):
-            import yaml
+            from ...arguments.omni_parser import load_yaml_with_inherit
 
-            with open(graph, encoding="utf-8") as f:
-                graph = yaml.safe_load(f)
+            graph = load_yaml_with_inherit(str(graph))
         if isinstance(graph, dict) and key in graph:
             return graph[key]
         return graph

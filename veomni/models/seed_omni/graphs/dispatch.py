@@ -17,16 +17,36 @@ def unwrap_graph_module(wrapped: nn.Module, *, module_name: str) -> ModuleMixin:
     raw :class:`ModuleMixin` owns graph endpoint methods and pre/post hooks.
     FSDP2 is composable and leaves the module itself as the callable object;
     DDP-style wrappers expose the raw module through ``.module``.
+
+    A LoRA-wrapped module (:class:`veomni.lora.VeOmniLoraModel`, possibly
+    FSDP2-composed in place so it is still that instance, or DDP-wrapped on
+    ``.module``) exposes the raw base model through ``get_base_model()``
+    (PEFT-aligned ``base_model.model``).  Its ``forward`` chain still bottoms out
+    at ``base_model.model.forward``, so the :func:`call_graph_endpoint`
+    trampoline (which swaps that module's ``forward``) keeps working — we only
+    need to return the inner :class:`ModuleMixin` here.
     """
     if isinstance(wrapped, ModuleMixin):
         return wrapped
 
-    raw = getattr(wrapped, "module", None)
-    if isinstance(raw, ModuleMixin):
-        return raw
+    # DDP-style wrapper: raw module (or a LoRA wrapper) lives on ``.module``.
+    inner = getattr(wrapped, "module", None)
+    if isinstance(inner, ModuleMixin):
+        return inner
+
+    # LoRA (PEFT-shaped) wrapper: descend to the base ModuleMixin. Handles both
+    # the FSDP2-composed LoRA model (``wrapped`` itself) and DDP(LoRA)
+    # (``wrapped.module``).
+    for candidate in (wrapped, inner):
+        get_base = getattr(candidate, "get_base_model", None)
+        if callable(get_base):
+            base = get_base()
+            if isinstance(base, ModuleMixin):
+                return base
 
     raise TypeError(
-        f"Graph module '{module_name}' must be a ModuleMixin or wrap one on `.module`; got {type(wrapped).__name__}."
+        f"Graph module '{module_name}' must be a ModuleMixin or wrap one on `.module`; "
+        f"got {type(wrapped).__name__}."
     )
 
 

@@ -29,11 +29,60 @@ behaviours the omni launchers need:
 """
 
 import argparse
+import os
 from typing import Any, Dict, Type
 
 import yaml
 
 from .parser import T, _add_arguments_recursive, _deep_update, _instantiate_recursive
+
+
+_INHERIT_KEY = "__inherit__"
+
+
+def load_yaml_with_inherit(path: str, *, _seen: set | None = None) -> Any:
+    """``yaml.safe_load`` + recursive ``__inherit__`` base merging.
+
+    A mapping may declare ``__inherit__: <path>`` (or a list of paths) to inherit
+    from one or more base YAMLs. Each base path is resolved relative to *this*
+    file's own directory (absolute paths pass through), so configs can be split
+    into folders and still reference a shared ``base.yaml`` / a parent module or
+    graph file. Bases are merged left→right and then this file's own keys win
+    (deep dict merge via :func:`_deep_update`; lists and scalars replace, they do
+    not concatenate). Bases may themselves ``__inherit__`` recursively.
+
+    Non-mapping YAML (e.g. a graph file that is a bare list) and mappings without
+    ``__inherit__`` are returned unchanged, so this is a drop-in replacement for
+    ``yaml.safe_load(open(path))`` everywhere the omni configs are loaded.
+    """
+    path = os.path.abspath(path)
+    seen = set() if _seen is None else _seen
+    if path in seen:
+        chain = " -> ".join([*seen, path])
+        raise ValueError(f"circular `{_INHERIT_KEY}` chain detected: {chain}")
+    seen = seen | {path}
+
+    with open(path, encoding="utf-8") as f:
+        data = yaml.safe_load(f)
+
+    if not isinstance(data, dict) or _INHERIT_KEY not in data:
+        return data
+
+    bases = data.pop(_INHERIT_KEY)
+    if isinstance(bases, str):
+        bases = [bases]
+    if not isinstance(bases, list) or not all(isinstance(b, str) for b in bases):
+        raise ValueError(f"`{_INHERIT_KEY}` in {path} must be a path string or a list of path strings, got {bases!r}")
+
+    here = os.path.dirname(path)
+    merged: Dict[str, Any] = {}
+    for b in bases:
+        b_path = b if os.path.isabs(b) else os.path.normpath(os.path.join(here, b))
+        base_data = load_yaml_with_inherit(b_path, _seen=seen)
+        if not isinstance(base_data, dict):
+            raise ValueError(f"`{_INHERIT_KEY}` base {b_path} (from {path}) must be a mapping YAML, got {type(base_data).__name__}")
+        merged = _deep_update(merged, base_data)
+    return _deep_update(merged, data)
 
 
 def _coerce_cli_value(raw: str) -> Any:
@@ -112,8 +161,7 @@ def _preload_path_field(config: Dict[str, Any], path_keys) -> None:
     value = current.get(last) if isinstance(current, dict) else None
     if not isinstance(value, str) or not value.endswith((".yaml", ".yml")):
         return
-    with open(value) as f:
-        loaded = yaml.safe_load(f)
+    loaded = load_yaml_with_inherit(value)
     if loaded is not None:
         current[last] = loaded
 
@@ -150,10 +198,9 @@ def parse_omni_args(
     final_config: Dict[str, Any] = {}
     config_path: Any = getattr(args, "config_file", None) or None
     if config_path and (config_path.endswith(".yaml") or config_path.endswith(".yml")):
-        with open(config_path) as f:
-            yaml_config = yaml.safe_load(f)
-            if yaml_config:
-                final_config = yaml_config
+        yaml_config = load_yaml_with_inherit(config_path)
+        if yaml_config:
+            final_config = yaml_config
 
     # Pre-load path fields (e.g. model.modules) so sub-key CLI overrides merge.
     for dotted in preload_path_fields:
@@ -180,4 +227,4 @@ def parse_omni_args(
     return instance
 
 
-__all__ = ["parse_omni_args"]
+__all__ = ["load_yaml_with_inherit", "parse_omni_args"]
