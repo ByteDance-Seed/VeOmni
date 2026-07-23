@@ -657,14 +657,19 @@ class BaseTrainer(Stateful, ABC):
         for callback in self._callbacks:
             callback.on_epoch_end(self.state)
 
-    def on_step_begin(self, micro_batches=None, **kwargs):
+    def on_step_begin(self, micro_batches=None, channel_loss_source_repeat: int = 1, **kwargs):
         # Multi-source accounting consumes ``ds_idx`` / ``source_name`` from the
         # micro-batches. Channel loss must snapshot that metadata first, while
         # keeping its on_step_end position after the meter so its metrics are not
         # overwritten by the meter's per-step reset.
         channel_loss_callback = getattr(self, "channel_loss_callback", None)
         if channel_loss_callback is not None:
-            channel_loss_callback.on_step_begin(self.state, micro_batches=micro_batches, **kwargs)
+            channel_loss_callback.on_step_begin(
+                self.state,
+                micro_batches=micro_batches,
+                source_repeat=channel_loss_source_repeat,
+                **kwargs,
+            )
         for callback in self._callbacks:
             if callback is channel_loss_callback:
                 continue

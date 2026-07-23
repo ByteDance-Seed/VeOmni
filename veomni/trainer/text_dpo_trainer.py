@@ -402,7 +402,7 @@ class TextDPOTrainer:
     def on_step_begin(self, micro_batches=None):
         # Each DPO preference pair is packed as two consecutive causal-LM
         # segments (chosen, rejected) but carries one source metadata entry.
-        self.base.on_step_begin(micro_batches=micro_batches, source_repeat=2)
+        self.base.on_step_begin(micro_batches=micro_batches, channel_loss_source_repeat=2)
 
     def on_step_end(self, loss=None, loss_dict=None, grad_norm=None):
         self.base.on_step_end(loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)

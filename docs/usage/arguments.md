@@ -354,7 +354,11 @@ sampled steps also report source-level data composition as `samples/<source>`,
 aligned for channel loss; they do not require per-sample IDs. This side channel does
 not change the returned training loss or gradients. Fused-loss backends may
 recompute the LM-head projection on sampled steps, so the default interval is
-10 steps; set `interval=1` for per-step metrics. DiT trainers and
+10 steps; set `interval=1` for per-step metrics. On memory-constrained
+profiles, `release_cache=true` synchronizes and releases the detached CE
+workspace after each sampled forward and before training backward. This does
+not change the objective or gradients, but adds synchronization and allocator
+churn. DiT trainers and
 `data.data_type="classification"` are not supported because they do not optimize
 a causal-LM objective. SeedOmni's `Qwen3MoeFoundationModel` is also unsupported
 because its legacy forward bypasses the observable loss dispatch. `BaseRLTrainer`
@@ -389,6 +393,7 @@ bounded).
 | token_count_metric_prefix | `str` | `"channel_tokens"` | Prefix for supervised token-count metrics. |
 | log_weighted_loss | `bool` | `True` | Log weighted loss metrics. |
 | log_token_count | `bool` | `True` | Log token-count metrics. |
+| release_cache | `bool` | `False` | Synchronize and release detached CE allocator cache after sampled forwards to lower memory carried into backward. |
 | strict | `bool` | `False` | Raise when source metadata is missing or cannot be aligned with packed segments; otherwise skip invalid batches. |
 
 ### GradientCheckpointingConfig
