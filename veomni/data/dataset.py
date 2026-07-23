@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import copy
+import math
 import os
 import random
 import traceback
@@ -810,6 +811,153 @@ class WeightedMultiSourceDataset(IterableDataset):
             self._exhausted = [False for _ in range(self._ds_num)]
 
         self._just_resumed = True
+
+
+class _MapStyleSamplerWrapper(IterableDataset):
+    """Internal wrapper that re-creates the sampler for a map-style dataset.
+
+    This is *not* a general-purpose dataset and is not meant to be used directly.
+    It exists only for one internal path: ``DynamicBatchingSizeDataset``
+    (``dyn_bsz_runtime="worker"``) accepts iterable upstreams only, so a map-style
+    dataset gets wrapped into an ``IterableDataset`` *before* the sampler decision in
+    ``build_native_dataloader`` and silently loses the ``StatefulDistributedSampler``
+    that would otherwise shard it. This wrapper puts that sampler back, inline, on top
+    of the map-style dataset:
+
+    1. Rank split: indices are deterministically shuffled with ``seed + epoch`` and
+       partitioned across ``num_replicas`` with the exact same padding and
+       strided-slice scheme as ``torch.utils.data.DistributedSampler``.
+    2. Worker split: inside each DataLoader worker, the rank's indices are further
+       strided-sliced by ``worker_id`` so that workers read disjoint samples with
+       balanced counts (difference <= 1).
+    3. Resume: the number of yielded samples is tracked per worker and exposed via
+       ``state_dict()`` / ``load_state_dict()``, composing with ``StatefulDataLoader``
+       per-worker snapshots (the same ``num_workers`` must be used on resume). On
+       resume the iterator skips the already-consumed prefix of the same
+       deterministic permutation.
+
+    It also implements the ``get_item()`` / ``output_index_for_resume`` protocol
+    required by ``DynamicBatchingSizeDataset(save_by_idx=True)``: yielded resume
+    indices are *global* dataset indices, so buffered samples are refetched in O(1)
+    on resume, independent of epoch or permutation.
+
+    Note:
+        With ``save_by_idx=True``, ``dataset[idx]`` must be deterministic: resume
+        rebuilds the buffer by re-fetching saved indices, so the same index must
+        yield the same sample(s). A transform expanding one index into a ``list`` is
+        fine (``DynamicBatchingSizeDataset`` tracks the sub-index), as long as that
+        expansion is reproducible.
+
+    Attributes:
+        dataset: The underlying map-style dataset (must support ``len()`` and
+            integer indexing).
+        num_replicas: Number of data-parallel ranks.
+        rank: This process's data-parallel rank.
+        shuffle: Whether to shuffle indices with ``seed + epoch`` each epoch.
+        seed: Base random seed shared by all ranks.
+        drop_last: If True, drop tail samples to make the dataset evenly divisible
+            across ranks; otherwise pad by wrapping around (same as
+            ``DistributedSampler``).
+    """
+
+    def __init__(
+        self,
+        dataset: "Dataset",
+        num_replicas: int = 1,
+        rank: int = 0,
+        shuffle: bool = True,
+        seed: int = 0,
+        drop_last: bool = False,
+    ) -> None:
+        if num_replicas <= 0:
+            raise ValueError(f"num_replicas must be positive, got {num_replicas}")
+        if rank < 0 or rank >= num_replicas:
+            raise ValueError(f"Invalid rank {rank}, rank should be in the interval [0, {num_replicas - 1}]")
+        self.dataset = dataset
+        self.num_replicas = num_replicas
+        self.rank = rank
+        self.shuffle = shuffle
+        self.seed = seed
+        self.drop_last = drop_last
+        self.epoch = 0
+        # Set by DynamicBatchingSizeDataset.save_by_idx; when True, yield (sample, global_idx).
+        self.output_index_for_resume = False
+
+        if self.drop_last and len(self.dataset) % self.num_replicas != 0:
+            self.num_samples = math.ceil((len(self.dataset) - self.num_replicas) / self.num_replicas)
+        else:
+            self.num_samples = math.ceil(len(self.dataset) / self.num_replicas)
+        self.total_size = self.num_samples * self.num_replicas
+
+        self._yielded = 0
+        # When resumed from a checkpoint, __iter__ keeps the restored _yielded instead of
+        # resetting it to 0, mirroring DynamicBatchingSizeDataset's resume handling.
+        self._just_resumed = False
+
+    def __len__(self) -> int:
+        """Number of samples assigned to this rank (across all of its workers)."""
+        return self.num_samples
+
+    def _rank_indices(self) -> list:
+        """Compute this rank's global indices, mirroring ``DistributedSampler.__iter__``."""
+        if self.shuffle:
+            g = torch.Generator()
+            g.manual_seed(self.seed + self.epoch)
+            indices = torch.randperm(len(self.dataset), generator=g).tolist()
+        else:
+            indices = list(range(len(self.dataset)))
+
+        if not self.drop_last:
+            # Pad by wrapping around so every rank gets the same number of samples.
+            padding_size = self.total_size - len(indices)
+            if padding_size <= len(indices):
+                indices += indices[:padding_size]
+            else:
+                indices += (indices * math.ceil(padding_size / len(indices)))[:padding_size]
+        else:
+            indices = indices[: self.total_size]
+        assert len(indices) == self.total_size
+
+        return indices[self.rank : self.total_size : self.num_replicas]
+
+    def __iter__(self):
+        worker_info = get_worker_info()
+        worker_id = worker_info.id if worker_info is not None else 0
+        num_workers = worker_info.num_workers if worker_info is not None else 1
+        # Strided worker split keeps per-worker counts balanced (difference <= 1).
+        indices = self._rank_indices()[worker_id::num_workers]
+
+        if not self._just_resumed:
+            self._yielded = 0
+        else:
+            if self._yielded > len(indices):
+                raise RuntimeError(
+                    f"Restored yielded count {self._yielded} exceeds this worker's {len(indices)} assigned samples."
+                )
+            self._just_resumed = False
+
+        for idx in indices[self._yielded :]:
+            self._yielded += 1
+            sample = self.dataset[idx]
+            if self.output_index_for_resume:
+                yield sample, int(idx)
+            else:
+                yield sample
+
+    def get_item(self, idx: int):
+        """Refetch a sample by global dataset index (used by ``save_by_idx`` resume)."""
+        return self.dataset[idx]
+
+    def state_dict(self) -> Dict[str, Any]:
+        return {"epoch": self.epoch, "yielded": self._yielded}
+
+    def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
+        self.epoch = state_dict["epoch"]
+        self._yielded = state_dict["yielded"]
+        self._just_resumed = True
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = epoch
 
 
 class DynamicBatchingSizeDataset(IterableDataset):
