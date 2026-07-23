@@ -64,14 +64,13 @@ def add_flash_attention_kwargs_from_position_ids(
         batch: The batch dictionary containing position_ids. Will be modified in-place to add
                cu_seq_lens_q, cu_seq_lens_k, max_length_q, max_length_k, and
                linear_attn_cu_seq_lens_q. When ``linear_attn_tail_padding_length > 0``,
-               also stores ``tail_padding_length`` (0-d ``torch.int32`` tensor) so
-               downstream valid-seqlens helpers can strip the coalesced pad segment and
-               distributed/PP stages preserve the metadata.
+               also stores ``tail_padding_length`` so downstream valid-seqlens helpers can
+               strip the coalesced pad segment.
         linear_attn_tail_padding_length: Number of known padding tokens appended at the tail by
                collators (``pad_to_length`` / SP pad). ``position_ids == 0`` encodes each pad
                token as its own 1-token boundary; both FlashAttention and linear-attention
-               cu-seqlens coalesce that tail into one segment. Ascend NPU
-               ``npu_fusion_attention`` SIGSEGVs on the uncoalesced per-token form.
+               cu-seqlens coalesce that tail into one segment. NPU ``npu_fusion_attention``
+               SIGSEGVs on the uncoalesced per-token form.
 
     Returns:
         Tuple of (cu_seq_lens_q, cu_seq_lens_k, max_length_q, max_length_k) for additional use.
@@ -87,12 +86,7 @@ def add_flash_attention_kwargs_from_position_ids(
         seqlens = cu_seq_lens_q[1:] - cu_seq_lens_q[:-1]
         max_length_q = int(seqlens.max().item()) if seqlens.numel() else 0
         max_length_k = max_length_q
-        # Keep as a 0-d tensor so PP / distributed stages preserve the metadata.
-        batch["tail_padding_length"] = torch.tensor(
-            linear_attn_tail_padding_length,
-            dtype=torch.int32,
-            device=cu_seq_lens_q.device,
-        )
+        batch["tail_padding_length"] = int(linear_attn_tail_padding_length)
 
     batch["cu_seq_lens_q"] = cu_seq_lens_q
     batch["cu_seq_lens_k"] = cu_seq_lens_k
@@ -139,7 +133,7 @@ DEFAULT_DATA_COLLATE_INFO: Dict[str, DataCollateInfo] = {
     "input_ids": DataCollateInfo(-1, True, 0, 1),
     "labels": DataCollateInfo(-1, True, IGNORE_INDEX, 1),
     "attention_mask": DataCollateInfo(-1, False, 1, 1),
-    "position_ids": DataCollateInfo(-1, False, 0, 1),
+    "position_ids": DataCollateInfo(-1, True, 0, 1),  # CP/Ulysses must shard RoPE positions with tokens
     "pixel_values": DataCollateInfo(0, True, 0, 4),
     "pixel_values_videos": DataCollateInfo(0, True, 0, 4),
     "image_mask": DataCollateInfo(-1, False, 0, 1),
@@ -324,10 +318,42 @@ class SequenceParallelCollator(DataCollator):
     metadata_collate_func: Optional[MetadataCollateFunc] = None
 
     def __post_init__(self):
-        self.sp_size = get_parallel_state().sp_size
-        self.sp_rank = get_parallel_state().sp_rank
+        parallel_state = get_parallel_state()
+        self.sp_size = parallel_state.sp_size
+        self.sp_rank = parallel_state.sp_rank
+        self.cp_size = parallel_state.cp_size
+        self.ulysses_size = parallel_state.ulysses_size
+        self.cp_rank = parallel_state.cp_rank if parallel_state.cp_enabled else 0
+        self.ulysses_rank = parallel_state.ulysses_rank if parallel_state.ulysses_enabled else 0
+        # Balanced causal CP needs 2 * cp chunks before Ulysses split.
+        self.sp_pad_multiple = 2 if parallel_state.cp_enabled else 1
 
     def sp_slice(self, key: str, feature: torch.Tensor, dim: int = -1) -> torch.Tensor:
+        if self.cp_size > 1:
+            from ..distributed.context_parallel.sharding import hybrid_cp_slice
+
+            if isinstance(feature, list):
+                assert dim == 0, f"Only support dim=0 for {key} as it is a List"
+                tensor = torch.arange(len(feature))
+                # Hybrid slice index list via tensor path then reselect.
+                index = hybrid_cp_slice(
+                    tensor,
+                    cp_size=self.cp_size,
+                    cp_rank=self.cp_rank,
+                    ulysses_size=self.ulysses_size,
+                    ulysses_rank=self.ulysses_rank,
+                    dim=0,
+                )
+                return [feature[i] for i in index.tolist()]
+            return hybrid_cp_slice(
+                feature,
+                cp_size=self.cp_size,
+                cp_rank=self.cp_rank,
+                ulysses_size=self.ulysses_size,
+                ulysses_rank=self.ulysses_rank,
+                dim=dim,
+            )
+
         if isinstance(feature, list):
             assert dim == 0, f"Only support dim=0 for {key} as it is a List"
             seq_length = len(feature)
@@ -352,7 +378,7 @@ class SequenceParallelCollator(DataCollator):
         else:
             seq_length = feature.size(dim)
 
-        scale_sp_size = self.sp_size * pad_scale
+        scale_sp_size = self.sp_size * pad_scale * self.sp_pad_multiple
         sp_chunk_size = (seq_length + scale_sp_size - 1) // scale_sp_size
         pad_size = sp_chunk_size * scale_sp_size - seq_length
         if pad_size == 0:
@@ -407,15 +433,86 @@ class SequenceParallelCollator(DataCollator):
                 if key == "position_ids":
                     linear_attn_tail_padding_length += post_pad_len - pre_pad_len
 
-            if sp_slice and key != "position_ids":  # position_ids should be sp sliced after precompute fa kwargs
-                # sp slice
+            # Defer slicing until FA kwargs exist when CP is enabled (need global cu_seqlens).
+            if self.cp_size <= 1 and sp_slice and key != "position_ids":
                 batch[key] = self.sp_slice(key, batch[key], dim=pack_dim)
 
         add_flash_attention_kwargs_from_position_ids(batch, linear_attn_tail_padding_length)
 
-        batch["position_ids"] = self.sp_slice(
-            "position_ids", batch["position_ids"], dim=self.collate_infos["position_ids"].pack_dim
-        )
+        if self.cp_size > 1:
+            from ..distributed.context_parallel.packed_sharding import (
+                apply_packed_cp_partition,
+                build_packed_cp_partition,
+                pad_packed_tensor_to_sample_multiple,
+            )
+
+            if "cu_seq_lens_q" not in batch:
+                raise RuntimeError("CP>1 requires cu_seq_lens_q from packed position_ids.")
+            sample_multiple = 2 * self.cp_size * max(self.ulysses_size, 1)
+            # Per-sample pad so zigzag CP is well-defined on packed boundaries.
+            # All sequence tensors must share the same original cu_seqlens plan.
+            cu_src = batch["cu_seq_lens_q"]
+            cu_dst = None
+            for key in list(batch.keys()):
+                collate_info: DataCollateInfo = self.collate_infos.get(key, None)
+                if collate_info is None or not isinstance(batch[key], torch.Tensor):
+                    continue
+                pad_value = 0 if collate_info.sp_pad_value is None else collate_info.sp_pad_value
+                batch[key], cu_new = pad_packed_tensor_to_sample_multiple(
+                    batch[key],
+                    cu_src,
+                    multiple=sample_multiple,
+                    dim=collate_info.pack_dim,
+                    pad_value=pad_value,
+                )
+                cu_dst = cu_new
+            if cu_dst is None:
+                raise RuntimeError("CP>1 packing pad found no sequence tensors to align.")
+            batch["cu_seq_lens_q"] = cu_dst
+            batch["cu_seq_lens_k"] = cu_dst.clone()
+            diffs = (cu_dst[1:] - cu_dst[:-1]).tolist()
+            batch["max_length_q"] = int(max(diffs) if diffs else 0)
+            batch["max_length_k"] = batch["max_length_q"]
+
+            # GDN gathers to full sequence under unified SP; keep global cu_seqlens for it.
+            # Ring FA keeps local cu_seq_lens_q after partition below.
+            batch["linear_attn_cu_seq_lens_q"] = batch["cu_seq_lens_q"].clone()
+            partition = build_packed_cp_partition(
+                batch["cu_seq_lens_q"],
+                cp_size=self.cp_size,
+                cp_rank=self.cp_rank,
+                ulysses_size=max(self.ulysses_size, 1),
+                ulysses_rank=self.ulysses_rank if self.ulysses_size > 1 else 0,
+            )
+            for key in list(batch.keys()):
+                collate_info: DataCollateInfo = self.collate_infos.get(key, None)
+                if collate_info is None or not collate_info.sp_slice:
+                    continue
+                if isinstance(batch[key], list):
+                    index = partition.token_indices
+                    batch[key] = [batch[key][i] for i in index.tolist()]
+                else:
+                    batch[key] = apply_packed_cp_partition(
+                        batch[key], partition, dim=collate_info.pack_dim
+                    )
+            # RoPE cos/sin follow position_ids; must match local token shard under CP.
+            if "position_ids" in batch and isinstance(batch["position_ids"], torch.Tensor):
+                pos_dim = self.collate_infos["position_ids"].pack_dim
+                # Avoid double-slice if already partitioned via sp_slice=True above.
+                if batch["position_ids"].size(pos_dim) != partition.token_indices.numel():
+                    batch["position_ids"] = apply_packed_cp_partition(
+                        batch["position_ids"], partition, dim=pos_dim
+                    )
+            local_cu = partition.local_cu_seqlens
+            batch["cu_seq_lens_q"] = local_cu
+            batch["cu_seq_lens_k"] = local_cu.clone()
+            batch["max_length_q"] = partition.local_max_seqlen
+            batch["max_length_k"] = partition.local_max_seqlen
+            # linear_attn_cu_seq_lens_q stays global for GDN post-gather kernels.
+        else:
+            batch["position_ids"] = self.sp_slice(
+                "position_ids", batch["position_ids"], dim=self.collate_infos["position_ids"].pack_dim
+            )
 
         # Hand the SP-padded batch + per-modality sp-pad patch counts to the
         # model-provided hook, which derives ``multimodal_metadata`` (cu_seqlens,
@@ -538,10 +635,9 @@ class PostCollator(DataCollator):
 @dataclass
 class SeqlensComputePostCollator(DataCollator):
     def __call__(self, micro_batch: Dict[str, torch.Tensor]):
-        tail_padding_length = micro_batch.get("tail_padding_length")
         seq_lens = valid_seqlens_from_cu_seqlens(
             micro_batch["cu_seq_lens_q"],
-            tail_padding_length=int(tail_padding_length) if tail_padding_length is not None else None,
+            int(micro_batch.get("tail_padding_length", 0) or 0),
         ).tolist()
         return seq_lens
 
