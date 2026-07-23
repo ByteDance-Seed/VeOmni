@@ -452,7 +452,7 @@ class OffloadConfig:
 
     enable_activation: bool = field(
         default=False,
-        metadata={"help": "Enable activation offload to CPU."},
+        metadata={"help": "Enable synchronous activation offload to CPU."},
     )
     activation_gpu_limit: float = field(
         default=0.0,
@@ -460,6 +460,33 @@ class OffloadConfig:
             "help": "When enabling activation offload, `activation_gpu_limit` GB activations are allowed to reserve on GPU."
         },
     )
+    enable_async_activation: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Enable async activation offload to CPU via stream-based D2H/H2D transfers. "
+                "More efficient than synchronous offload. When enabled, takes precedence over "
+                "`enable_activation`. Requires specifying `activation_offload_modules`."
+            )
+        },
+    )
+    activation_offload_modules: List[str] = field(
+        default_factory=list,
+        metadata={
+            "help": (
+                "Module name patterns for async activation offload. Supports glob patterns "
+                "(e.g. `model.layers.*`) and the special `{*}` wildcard for sequential "
+                "module groups (e.g. `model.layers.{*}` expands to all decoder layers)."
+            )
+        },
+    )
+
+    def __post_init__(self):
+        if self.enable_async_activation and not self.activation_offload_modules:
+            raise ValueError(
+                "enable_async_activation requires at least one entry in "
+                "activation_offload_modules (e.g. ['model.layers.{*}'])."
+            )
 
 
 @dataclass
