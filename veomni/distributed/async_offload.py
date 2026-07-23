@@ -442,4 +442,9 @@ def apply_async_activation_offload(model, activation_offload_modules: List[str])
     if not activation_offload_modules:
         return
     matched_modules = get_offload_modules(model, activation_offload_modules)
+    if not matched_modules:
+        raise ValueError(
+            "activation_offload_modules did not match any model modules: "
+            f"{activation_offload_modules!r}"
+        )
     async_offload_modules(matched_modules)

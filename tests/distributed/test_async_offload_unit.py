@@ -18,7 +18,7 @@ import pytest
 import torch.nn as nn
 
 from veomni.arguments.arguments_types import OffloadConfig
-from veomni.distributed.async_offload import GetCnt, get_offload_modules
+from veomni.distributed.async_offload import GetCnt, apply_async_activation_offload, get_offload_modules
 from veomni.utils.module_match import module_name_match
 
 
@@ -32,6 +32,15 @@ def test_offload_config_requires_modules_when_async_enabled():
     )
     assert cfg.enable_async_activation is True
     assert cfg.activation_offload_modules == ["model.layers.{*}"]
+
+
+def test_offload_config_rejects_sync_and_async_activation_together():
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        OffloadConfig(
+            enable_activation=True,
+            enable_async_activation=True,
+            activation_offload_modules=["model.layers.{*}"],
+        )
 
 
 def test_module_name_match_glob():
@@ -64,3 +73,10 @@ def test_get_offload_modules_brace_star_expands_sequential():
     # depth field is rewritten to total offload layer count
     assert all(item[-1] == 3 for item in matched)
     assert [item[2] for item in matched] == [0, 1, 2]
+
+
+def test_apply_async_activation_offload_rejects_unmatched_patterns():
+    model = nn.Sequential(nn.Linear(4, 4))
+
+    with pytest.raises(ValueError, match="did not match any model modules"):
+        apply_async_activation_offload(model, ["model.layers.{*}"])

@@ -465,7 +465,7 @@ class OffloadConfig:
         metadata={
             "help": (
                 "Enable async activation offload to CPU via stream-based D2H/H2D transfers. "
-                "More efficient than synchronous offload. When enabled, takes precedence over "
+                "More efficient than synchronous offload. Mutually exclusive with "
                 "`enable_activation`. Requires specifying `activation_offload_modules`."
             )
         },
@@ -482,6 +482,11 @@ class OffloadConfig:
     )
 
     def __post_init__(self):
+        if self.enable_activation and self.enable_async_activation:
+            raise ValueError(
+                "enable_activation and enable_async_activation are mutually exclusive; "
+                "select exactly one activation offload mode."
+            )
         if self.enable_async_activation and not self.activation_offload_modules:
             raise ValueError(
                 "enable_async_activation requires at least one entry in "
