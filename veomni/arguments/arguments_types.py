@@ -1009,6 +1009,14 @@ class OpsImplementationConfig:
             "'eager' (PyTorch F.cross_entropy)."
         },
     )
+    cross_entropy_loss_release_cache: bool = field(
+        default=False,
+        metadata={
+            "help": "Synchronize and release transient chunk-loss allocator cache before model backward. "
+            "This lowers peak accelerator memory for constrained profiles at the cost of a per-microbatch "
+            "synchronization; it only affects the 'chunk_loss'/'npu' cross-entropy implementations."
+        },
+    )
     rms_norm_implementation: str = field(
         default="liger_kernel",
         metadata={
