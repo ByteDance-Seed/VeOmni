@@ -23,8 +23,9 @@ The test suite includes:
 
     End-to-end distributed tests (require ``torchrun`` with 2 processes):
         - ``test_dynamic_batching_dataset_distributed`` – parametrised over
-          ``shuffle × save_by_idx × multi_sample_per_iteration`` (5 combinations), verifying that resumed
-          batches are byte-for-byte identical to the original run.
+          shuffle, checkpoint-buffer format, multi-sample transforms, and the
+          ``infinity`` / ``infinity_padding`` modes, verifying that resumed batches
+          are byte-for-byte identical to the original run.
 """
 
 import argparse
@@ -532,16 +533,20 @@ def test_save_load_state_dict(save_by_idx):
 
 
 @pytest.mark.parametrize(
-    "shuffle,save_by_idx,multi_sample_per_iteration",
+    "shuffle,save_by_idx,multi_sample_per_iteration,infinity,infinity_padding",
     [
-        (False, False, False),
-        (False, True, False),
-        (True, False, False),
-        (True, True, False),
-        (True, True, True),
+        (False, False, False, False, False),
+        (False, True, False, False, False),
+        (True, False, False, False, False),
+        (True, True, False, False, False),
+        (True, True, True, False, False),
+        (False, False, False, True, False),
+        (False, False, False, False, True),
     ],
 )
-def test_dynamic_batching_dataset_distributed(shuffle, save_by_idx, multi_sample_per_iteration):
+def test_dynamic_batching_dataset_distributed(
+    shuffle, save_by_idx, multi_sample_per_iteration, infinity, infinity_padding
+):
     """Test DynamicBatchingSizeDataset in distributed setting.
 
     Runs _main_distributed_test() by torchrun with or without data shuffling
@@ -551,6 +556,8 @@ def test_dynamic_batching_dataset_distributed(shuffle, save_by_idx, multi_sample
         shuffle: Whether to enable data shuffling.
         save_by_idx: Whether to save buffer by index for checkpointing.
         multi_sample_per_iteration: Whether one dataset iteration emits two samples.
+        infinity: Whether workers restart their upstream dataset after exhaustion.
+        infinity_padding: Whether exhausted workers keep emitting padding batches.
 
     Raises:
         subprocess.CalledProcessError: If the distributed test fails.
@@ -559,13 +566,21 @@ def test_dynamic_batching_dataset_distributed(shuffle, save_by_idx, multi_sample
         shuffle=shuffle,
         save_by_idx=save_by_idx,
         multi_sample_per_iteration=multi_sample_per_iteration,
+        infinity=infinity,
+        infinity_padding=infinity_padding,
     )
     # Pass current environment to subprocess to inherit virtual environment
     result = subprocess.run(command, check=True, env=os.environ.copy())
     assert result.returncode == 0
 
 
-def build_command(shuffle=True, save_by_idx=True, multi_sample_per_iteration=False):
+def build_command(
+    shuffle=True,
+    save_by_idx=True,
+    multi_sample_per_iteration=False,
+    infinity=False,
+    infinity_padding=False,
+):
     """Build torchrun command for distributed testing.
 
     Constructs a command to launch the test script with torchrun for
@@ -575,11 +590,19 @@ def build_command(shuffle=True, save_by_idx=True, multi_sample_per_iteration=Fal
         shuffle: Whether to enable data shuffling.
         save_by_idx: Whether to save buffer by index for checkpointing.
         multi_sample_per_iteration: Whether one dataset iteration emits two samples.
+        infinity: Whether workers restart their upstream dataset after exhaustion.
+        infinity_padding: Whether exhausted workers keep emitting padding batches.
 
     Returns:
         list: Command arguments for subprocess.run().
     """
     port = find_free_port()
+    # The larger token estimate makes the exhaustion-mode cases request more
+    # steps than the finite test dataset can provide in one pass.
+    train_size = 3000 if infinity or infinity_padding else 2000
+    # Infinite workers can still be active at interpreter teardown, causing the
+    # pin-memory thread to race with process shutdown and occasionally SIGABRT.
+    pin_memory = not (infinity or infinity_padding)
 
     command = [
         "torchrun",
@@ -589,11 +612,12 @@ def build_command(shuffle=True, save_by_idx=True, multi_sample_per_iteration=Fal
         "tests/data/test_dynamic_batching_dataset.py",
         "--model.config_path=test",
         "--data.train_path=None",
-        "--data.train_size=2000",
+        f"--data.train_size={train_size}",
         f"--data.dyn_bsz_buffer_size={READY_FOR_MICRO_BATCH_THRESHOLD}",
         "--data.max_seq_len=16",
         "--data.dataloader.num_workers=2",
         "--data.dataloader.drop_last=false",
+        f"--data.dataloader.pin_memory={str(pin_memory).lower()}",
         "--train.micro_batch_size=2",
         f"--shuffle={str(shuffle).lower()}",
         "--train.global_batch_size=16",
@@ -604,6 +628,8 @@ def build_command(shuffle=True, save_by_idx=True, multi_sample_per_iteration=Fal
         "--train.dyn_bsz_runtime=worker",
         f"--save_by_idx={str(save_by_idx).lower()}",
         f"--multi_sample_per_iteration={str(multi_sample_per_iteration).lower()}",
+        f"--infinity={str(infinity).lower()}",
+        f"--infinity_padding={str(infinity_padding).lower()}",
         "--train.seed=42",
         # Hardware-aware ops_implementation overrides; see test_datasets.py.
         *resolve_ops_overrides(None),
@@ -626,10 +652,16 @@ class TrainerTest(BaseTrainer):
         shuffle: bool,
         save_by_idx: bool,
         multi_sample_per_iteration: bool,
+        infinity: bool,
+        infinity_padding: bool,
     ):
         self.shuffle = shuffle
         self.save_by_idx = save_by_idx
         self.multi_sample_per_iteration = multi_sample_per_iteration
+        self.infinity = infinity
+        self.infinity_padding = infinity_padding
+        self.saw_real_batch = False
+        self.saw_padding_batch = False
         super().__init__(args)
 
     def _setup(self):
@@ -683,6 +715,8 @@ class TrainerTest(BaseTrainer):
             dyn_bsz_physical_overflow_ratio=args.train.dyn_bsz_physical_overflow_ratio,
             dyn_bsz_buffer_size=args.data.dyn_bsz_buffer_size,
             dyn_bsz_dataset_save_by_idx=self.save_by_idx,
+            infinity=self.infinity,
+            infinity_padding=self.infinity_padding,
             seed=args.train.seed,
             collate_fn=self.collate_fn,
             **dataloader_kwargs,
@@ -747,11 +781,15 @@ class TrainerTest(BaseTrainer):
         self.state.global_step += 1
         self.state.curr_step += 1
         micro_batches: List[Dict[str, Any]] = next(data_iterator)
+        self.saw_real_batch |= any(not micro_batch.get("padding_flag", False) for micro_batch in micro_batches)
+        self.saw_padding_batch |= any(micro_batch.get("padding_flag", False) for micro_batch in micro_batches)
         self.on_step_begin(micro_batches=micro_batches)
         self.on_step_end(loss=0.0, loss_dict={}, grad_norm=0.0)
 
     def resume_train(self):
         self.is_resume_train = True
+        self.saw_real_batch = False
+        self.saw_padding_batch = False
         super().train()
 
     def destroy_distributed(self):
@@ -786,7 +824,21 @@ class CheckCallback(Callback):
             else:
                 self.trainer.pred_data_list.append(micro_batches)
 
+    def on_epoch_end(self, state: TrainerState, **kwargs) -> None:
+        if self.trainer.infinity or self.trainer.infinity_padding:
+            assert state.curr_step == self.trainer.args.train_steps - 1, (
+                f"Exhaustion mode stopped at step {state.curr_step}, expected {self.trainer.args.train_steps - 1}"
+            )
+
     def on_train_end(self, state: TrainerState, **kwargs) -> None:
+        if self.trainer.infinity:
+            assert self.trainer.saw_real_batch
+            assert not self.trainer.saw_padding_batch
+        elif self.trainer.infinity_padding:
+            if not self.trainer.is_resume_train:
+                assert self.trainer.saw_real_batch
+            assert self.trainer.saw_padding_batch
+
         if self.trainer.is_resume_train:
             assert len(self.trainer.gt_data_list) == len(self.trainer.pred_data_list), (
                 f"Batch count mismatch: gt={len(self.trainer.gt_data_list)}, pred={len(self.trainer.pred_data_list)}"
@@ -794,6 +846,8 @@ class CheckCallback(Callback):
 
             for i, (gt_batch, pred_batch) in enumerate(zip(self.trainer.gt_data_list, self.trainer.pred_data_list)):
                 assert len(gt_batch) == len(pred_batch), f"Micro batch count mismatch at batch {i}"
+                for gt_micro_batch, pred_micro_batch in zip(gt_batch, pred_batch, strict=True):
+                    assert gt_micro_batch.get("padding_flag", False) == pred_micro_batch.get("padding_flag", False)
 
             compare_global_batch(self.trainer.gt_data_list, self.trainer.pred_data_list)
             compare_metrics(self.trainer.step_env_metrics, self.trainer.golden_env_metrics)
@@ -817,6 +871,8 @@ def _main_distributed_test():
         _parser.add_argument("--shuffle", type=lambda x: x.lower() == "true", default=True)
         _parser.add_argument("--save_by_idx", type=lambda x: x.lower() == "true", default=True)
         _parser.add_argument("--multi_sample_per_iteration", type=lambda x: x.lower() == "true", default=False)
+        _parser.add_argument("--infinity", type=lambda x: x.lower() == "true", default=False)
+        _parser.add_argument("--infinity_padding", type=lambda x: x.lower() == "true", default=False)
         test_args, remaining_argv = _parser.parse_known_args()
         sys.argv = [sys.argv[0]] + remaining_argv
 
@@ -826,6 +882,8 @@ def _main_distributed_test():
             shuffle=test_args.shuffle,
             save_by_idx=test_args.save_by_idx,
             multi_sample_per_iteration=test_args.multi_sample_per_iteration,
+            infinity=test_args.infinity,
+            infinity_padding=test_args.infinity_padding,
         )
         trainer.train()
         assert trainer.args.train.checkpoint.load_path is not None

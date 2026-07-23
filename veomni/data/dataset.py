@@ -871,7 +871,9 @@ class DynamicBatchingSizeDataset(IterableDataset):
                 ``micro_batch_seq_length`` is emitted as a single-sample batch instead of
                 being silently discarded. This is not supported yet.
             infinity: If True, restart the upstream dataset whenever it is exhausted so
-                iteration never stops because of source exhaustion. Takes precedence over
+                iteration never stops because of source exhaustion. Restarting does not
+                advance the dataset epoch or call ``set_epoch()``, so epoch-seeded shufflers
+                repeat the same permutation on every restart. Takes precedence over
                 ``infinity_padding``.
             infinity_padding: If True, after the upstream dataset is exhausted and the
                 buffer drained, keep yielding padding micro batches (deep-copied from the
@@ -987,9 +989,7 @@ class DynamicBatchingSizeDataset(IterableDataset):
         # Keep the most recent real micro batch around so infinity_padding has a template
         # to deep-copy padding batches from after the source is exhausted.
         last_micro_batch = None
-        # Guards infinity: if a restart is immediately followed by StopIteration (upstream
-        # is empty), we'd spin forever burning CPU. Set on restart, cleared once next()
-        # yields anything; a StopIteration while still set means the source is empty.
+        # Prevent an infinite restart loop when the upstream dataset is empty.
         just_restarted = False
 
         while True:
@@ -1013,7 +1013,7 @@ class DynamicBatchingSizeDataset(IterableDataset):
                         logger.warning("dynamic_batching_collate_fn returned None, skip this micro_batch")
 
                 item = next(self._data_iter)
-                just_restarted = False  # upstream produced data, so it isn't empty
+                just_restarted = False
                 if self.save_by_idx:
                     item, output_index = item
                 else:
@@ -1049,8 +1049,7 @@ class DynamicBatchingSizeDataset(IterableDataset):
                                 "infinity=True but the upstream dataset produced nothing after a restart; "
                                 "refusing to spin forever on an empty dataset."
                             ) from None
-                        # Restart the upstream dataset and keep going forever; the buffer is
-                        # preserved so batching continues to accumulate across epochs.
+                        # Restart the upstream iterator without clearing self._buffer.
                         self._data_iter = iter(self.dataset)
                         just_restarted = True
                         continue
@@ -1072,11 +1071,6 @@ class DynamicBatchingSizeDataset(IterableDataset):
                                 "there is nothing to pad from; stopping iteration."
                             )
                             return
-                        # Keep yielding padding micro batches forever; downstream groups them
-                        # into num_micro_batch-sized steps and loss accounting skips them via
-                        # the padding_flag marker. One deep copy suffices: downstream is
-                        # read-only on the yielded batch (preforward rebuilds a new dict and
-                        # moves tensors to device before the model sees them).
                         padding_batch = copy.deepcopy(last_micro_batch)
                         padding_batch["padding_flag"] = True
                         while True:
