@@ -98,12 +98,14 @@ class OptimizerConfig:
         metadata={"help": "Clip value for gradient norm."},
     )
     # ---- Muon-specific (only consulted when type == "muon") ---------------
-    muon_lr: float = field(
-        default=2e-2,
+    muon_lr: Optional[float] = field(
+        default=None,
         metadata={
             "help": (
                 "Learning rate for the Muon group (2D hidden weights and 3D expert stacks). "
-                "Per Moonlight, ~25x the AdamW lr is a common starting point."
+                "If unset: inherits train.optimizer.lr when muon_adjust_lr_fn=match_rms_adamw "
+                "(default); uses 25x train.optimizer.lr when muon_adjust_lr_fn=original "
+                "(Moonlight-style starting point)."
             )
         },
     )
@@ -148,6 +150,28 @@ class OptimizerConfig:
                 "Use whole-expert Shard(0) for Muon under FSDP+ExtraParallel when "
                 "(num_experts/ep_size) %% ep_fsdp_size == 0; otherwise fall back "
                 "to the default hidden-dim sharding path."
+            )
+        },
+    )
+    muon_ns_implementation: Literal["std", "gram", "gram_quack"] = field(
+        default="gram_quack",
+        metadata={
+            "help": (
+                "Newton-Schulz implementation used by Muon. "
+                "'std': torch.optim.Muon-compatible Newton-Schulz; "
+                "'gram': pure-PyTorch Dao-AILab Gram Newton-Schulz; "
+                "'gram_quack' (default): Dao-AILab Gram-NS with quack CuTeDSL GEMM kernels "
+                "(Hopper/Blackwell). If quack/package is missing, falls back to gram."
+            )
+        },
+    )
+    muon_gram_ns_reset_iterations: List[int] = field(
+        default_factory=lambda: [2],
+        metadata={
+            "help": (
+                "Restart indices for Gram Newton-Schulz (applied immediately before "
+                "those iteration indices). Default [2] matches Dao-AILab guidance "
+                "for 5-step schedules."
             )
         },
     )
