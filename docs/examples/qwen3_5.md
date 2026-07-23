@@ -182,12 +182,20 @@ model:
     chunk_gated_delta_rule_implementation: npu
 ```
 
-Install `triton-ascend` on the NPU host. VeOmni main pins PyTorch and
-`torch_npu` 2.10.0; the corresponding CANN 9.0.0 stack uses v3.2.1:
+VeOmni main pins PyTorch and `torch_npu` 2.10.0; the corresponding CANN 9.0.0
+CI stack uses Triton-Ascend 3.2.1. From a VeOmni source checkout, install the
+locked NPU environment and the tested Triton wheels with:
 
 ```bash
-pip install triton-ascend==3.2.1 --extra-index-url=https://triton-ascend.osinfra.cn/pypi/simple
+uv sync --frozen --python 3.11 --extra npu
+uv run --frozen python scripts/ci/install_triton_ascend.py
 ```
+
+The helper intentionally supports Linux x86_64 and Python 3.11 only. It installs
+fixed wheel URLs with SHA256 verification without applying the upstream wheel's
+development-only dependency pins. Keep the Qwen3.5 vendored Triton kernels
+disabled on aarch64 or other Python versions until a compatible package set is
+available and validated.
 
 See the [triton-ascend quick-start](https://github.com/triton-lang/triton-ascend/blob/main/docs/zh/quick_start.md)
 for the compatibility matrix and troubleshooting. Keep CANN, `torch_npu`,

@@ -68,7 +68,11 @@ The following table shows the supported software versions for VeOmni when runnin
 
 Repository Docker definitions also cover CANN 8.3.RC2. Treat the PyTorch,
 torch_npu, CANN, and `triton-ascend` versions as one compatibility set and
-validate non-CI combinations on the target hardware.
+validate non-CI combinations on the target hardware. Qwen3.5's vendored NPU
+Triton kernels use the fixed Linux x86_64 / Python 3.11 installation in
+`scripts/ci/install_triton_ascend.py`; this is separate from the portable
+`npu` extra because the upstream wheel publishes development-only exact pins
+as runtime dependencies.
 
 ## Supported Models
 
