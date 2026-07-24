@@ -26,7 +26,7 @@ from veomni.checkpoint import ckpt_to_state_dict
 from veomni.models import save_model_assets, save_model_weights
 from veomni.models.module_utils import _save_state_dict
 from veomni.utils import helper
-from veomni.utils.device import IS_NPU_AVAILABLE, synchronize
+from veomni.utils.device import synchronize
 from veomni.utils.import_utils import is_torch_version_greater_than
 
 
@@ -208,14 +208,7 @@ def save_hf_safetensor(
     """
     from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
 
-    # Disable the distributed `HuggingFaceStorageWriter` path on NPU.  Under
-    # HSDP replicate ranks independently cast fp32->bf16 on-device and write
-    # per-rank safetensors files.  When the casts are not bit-exact (~1 ULP on
-    # Ascend 910B) the consolidation step bakes in whichever rank's data it
-    # reads last, causing an intermittent mismatch against the fp32 DCP
-    # checkpoint.  Route through the legacy rank-0 path until the underlying
-    # fp32->bf16 determinism issue is resolved in the NPU stack.
-    use_distributed = is_torch_version_greater_than("2.9") and ckpt_manager == "dcp" and not IS_NPU_AVAILABLE
+    use_distributed = is_torch_version_greater_than("2.9") and ckpt_manager == "dcp"
 
     # Ensure all GPU operations are complete before reading tensor data for saving
     synchronize()
