@@ -33,6 +33,7 @@ the ``cp`` group on the resulting shard (see
 ``veomni/ops/kernels/attention/__init__.py``).
 """
 
+import inspect
 from typing import Optional, Tuple
 
 import torch
@@ -43,6 +44,24 @@ from torch.distributed import ProcessGroup
 from .comm import get_context_parallel_group
 
 
+# Flash-attention backend selection for the ring kernels.
+#
+# The zig-zag ring attention needs the LOW-LEVEL forward/backward primitives
+# (they must return the log-sum-exp so the online-softmax merge can run across
+# ring steps, and take pre-allocated ``dq/dk/dv`` out-tensors in backward). Two
+# backends expose such primitives and are auto-detected here:
+#
+#   * ``"fa2"`` — classic FlashAttention-2 (``flash_attn.flash_attn_interface``).
+#     Available on Ampere/Hopper GPUs with the CUDA extension built.
+#   * ``"fa4"`` — FlashAttention-4 CuTe backend (``flash_attn.cute.interface``).
+#     The only backend with SM10.0 (Blackwell / GB200) kernels; FA3 is
+#     Hopper-only and has no Blackwell image, so it is not used here.
+#
+# Both return the SAME log-sum-exp layout (dense ``(b, h, s)`` / varlen
+# ``(h, total)``), so the online-softmax merge code is backend-agnostic; only
+# the thin ``_fa_*`` wrappers below differ. ``FA_BACKEND`` records the choice.
+FA_BACKEND = None
+
 try:
     from flash_attn.flash_attn_interface import (
         _flash_attn_backward,
@@ -52,8 +71,36 @@ try:
     )
 
     _FA_AVAILABLE = True
-except ImportError:  # pragma: no cover - only hit without flash-attn
+    FA_BACKEND = "fa2"
+except ImportError:  # pragma: no cover - depends on installed flash-attn build
     _FA_AVAILABLE = False
+
+if not _FA_AVAILABLE:
+    try:
+        from flash_attn.cute.interface import (
+            _flash_attn_bwd as _fa4_bwd,
+        )
+        from flash_attn.cute.interface import (
+            _flash_attn_fwd as _fa4_fwd,
+        )
+
+        # The ring wrappers below drive the FA4 CuTe primitives with the LSE /
+        # varlen / in-place-grad API introduced in recent FA4 builds. Older
+        # CuTe builds expose the same names with a narrower signature, on which
+        # those calls would raise deep inside a kernel launch; verify the
+        # required parameters exist up front and otherwise decline the backend.
+        _fa4_fwd_params = inspect.signature(_fa4_fwd).parameters
+        _fa4_bwd_params = inspect.signature(_fa4_bwd).parameters
+        _fa4_ok = all(p in _fa4_fwd_params for p in ("return_lse", "cu_seqlens_q", "max_seqlen_q")) and all(
+            p in _fa4_bwd_params for p in ("dq", "dk", "dv", "cu_seqlens_q", "max_seqlen_q", "window_size_left")
+        )
+        if _fa4_ok:
+            _FA_AVAILABLE = True
+            FA_BACKEND = "fa4"
+        else:  # pragma: no cover - only hit on older/narrower FA4 CuTe builds
+            _FA_AVAILABLE = False
+    except ImportError:  # pragma: no cover - depends on installed flash-attn build
+        _FA_AVAILABLE = False
 
 
 __all__ = [
@@ -66,6 +113,19 @@ __all__ = [
 
 
 def _fa_forward(q, k, v, softmax_scale, causal, dropout_p=0.0):
+    """Dense low-level FA forward returning ``(out, lse)`` with ``lse`` as ``(b, h, s)``."""
+    if FA_BACKEND == "fa4":
+        out, lse = _fa4_fwd(
+            q,
+            k,
+            v,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size_left=-1,
+            window_size_right=-1,
+            return_lse=True,
+        )
+        return out, lse
     out, lse, _, _ = _flash_attn_forward(
         q=q,
         k=k,
@@ -86,6 +146,23 @@ def _fa_backward(dout, q, k, v, out, lse, softmax_scale, causal, dropout_p=0.0):
     dq = torch.empty_like(q)
     dk = torch.empty_like(k)
     dv = torch.empty_like(v)
+    if FA_BACKEND == "fa4":
+        _fa4_bwd(
+            q,
+            k,
+            v,
+            out,
+            dout,
+            lse,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size_left=-1,
+            window_size_right=-1,
+            dq=dq,
+            dk=dk,
+            dv=dv,
+        )
+        return dq, dk, dv
     _flash_attn_backward(
         dout=dout,
         q=q,
@@ -335,6 +412,23 @@ def _zigzag_ring_backward(group, dout, q, k, v, out, lse, softmax_scale):
     def bwd(dout_, q_, k_, v_, out_, lse_, causal):
         sq = q_.shape[1]
         skv = k_.shape[1]
+        if FA_BACKEND == "fa4":
+            _fa4_bwd(
+                q_,
+                k_,
+                v_,
+                out_,
+                dout_,
+                lse_,
+                softmax_scale=softmax_scale,
+                causal=causal,
+                window_size_left=-1,
+                window_size_right=-1,
+                dq=dq_b[:, :sq],
+                dk=dk_b[:, :skv],
+                dv=dv_b[:, :skv],
+            )
+            return
         _flash_attn_backward(
             dout=dout_,
             q=q_,
@@ -441,7 +535,7 @@ def ring_flash_attn_func(
 ) -> Tensor:
     """Plain ring attention. ``q/k/v`` are ``(b, s_local, h, d)``."""
     if not _FA_AVAILABLE:
-        raise RuntimeError("ring_flash_attn_func requires flash-attn (FA2) to be installed.")
+        raise RuntimeError("ring_flash_attn_func requires a flash-attn backend (FA2 or FA4) to be installed.")
     group = get_context_parallel_group() if group is None else group
     return _RingFlashAttn.apply(group, q, k, v, softmax_scale, causal, False)
 
@@ -460,7 +554,7 @@ def zigzag_ring_flash_attn_func(
     two zig-zag blocks the rank owns (see ``.data.zigzag_reorder``).
     """
     if not _FA_AVAILABLE:
-        raise RuntimeError("zigzag_ring_flash_attn_func requires flash-attn (FA2) to be installed.")
+        raise RuntimeError("zigzag_ring_flash_attn_func requires a flash-attn backend (FA2 or FA4) to be installed.")
     assert causal, "zigzag ring attention is only defined for causal attention"
     group = get_context_parallel_group() if group is None else group
     return _RingFlashAttn.apply(group, q, k, v, softmax_scale, causal, True)
@@ -479,6 +573,23 @@ def zigzag_ring_flash_attn_func(
 # divisible by ``2 * cp``.                                                      #
 # --------------------------------------------------------------------------- #
 def _fa_varlen_forward(q, k, v, cu_q, cu_k, max_q, max_k, softmax_scale, causal):
+    """Varlen low-level FA forward returning ``(out, lse)`` with ``lse`` as ``(h, total)``."""
+    if FA_BACKEND == "fa4":
+        out, lse = _fa4_fwd(
+            q,
+            k,
+            v,
+            cu_seqlens_q=cu_q,
+            cu_seqlens_k=cu_k,
+            max_seqlen_q=max_q,
+            max_seqlen_k=max_k,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size_left=-1,
+            window_size_right=-1,
+            return_lse=True,
+        )
+        return out, lse
     out, lse, _, _ = _flash_attn_varlen_forward(
         q=q,
         k=k,
@@ -500,6 +611,27 @@ def _fa_varlen_forward(q, k, v, cu_q, cu_k, max_q, max_k, softmax_scale, causal)
 
 
 def _fa_varlen_backward(dout, q, k, v, out, lse, dq, dk, dv, cu_q, cu_k, max_q, max_k, softmax_scale, causal):
+    if FA_BACKEND == "fa4":
+        _fa4_bwd(
+            q,
+            k,
+            v,
+            out,
+            dout,
+            lse,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size_left=-1,
+            window_size_right=-1,
+            cu_seqlens_q=cu_q,
+            cu_seqlens_k=cu_k,
+            max_seqlen_q=max_q,
+            max_seqlen_k=max_k,
+            dq=dq,
+            dk=dk,
+            dv=dv,
+        )
+        return
     _flash_attn_varlen_backward(
         dout=dout,
         q=q,
@@ -801,7 +933,7 @@ def zigzag_ring_flash_attn_varlen_func(
     ``.data.zigzag_reorder_varlen``.
     """
     if not _FA_AVAILABLE:
-        raise RuntimeError("zigzag_ring_flash_attn_varlen_func requires flash-attn (FA2).")
+        raise RuntimeError("zigzag_ring_flash_attn_varlen_func requires a flash-attn backend (FA2 or FA4).")
     assert causal, "zigzag ring attention is only defined for causal attention"
     group = get_context_parallel_group() if group is None else group
     return _ZigzagRingVarlenFlashAttn.apply(group, q, k, v, cu_seqlens, max_seqlen, softmax_scale)

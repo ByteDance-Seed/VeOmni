@@ -496,7 +496,12 @@ bash train.sh tasks/train_text.py configs/text/qwen3_usp.yaml \
   segment is automatically aligned too (the total is a multiple of `2·cp_size`).
   Unaligned documents raise an actionable `ValueError` at collate time — pack
   your data with this alignment, or keep `cp_size == 1` for arbitrary lengths.
-- **FA2 required**: ring attention builds on `flash_attn` (FA2) forward/backward.
+- **Flash-attention backend**: ring attention builds on a `flash_attn`
+  forward/backward pair, auto-selected at import time (see `FA_BACKEND` in
+  `ring_attention.py`): classic **FA2** (`flash_attn.flash_attn_interface`) on
+  Ampere/Hopper, or the **FA4** CuTe backend (`flash_attn.cute.interface`) on
+  Blackwell/GB200. FA3 is Hopper-only (no Blackwell kernel image) and is not
+  used by the ring path. Any one of these backends is sufficient.
 - **Divisibility**: `max_seq_len` must be divisible by `2 · ulysses_size · cp_size`
   (the collator pads up to this multiple automatically).
 - **Loss/data layout**: the `SequenceParallelCollator` lays sequences out

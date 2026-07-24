@@ -39,13 +39,8 @@ from torch.testing._internal.common_utils import run_tests
 
 from veomni.distributed.sequence_parallel.data import local_cu_seqlens, zigzag_reorder_varlen
 
-
-try:
-    from flash_attn import flash_attn_varlen_func
-
-    _FA_OK = True
-except ImportError:
-    _FA_OK = False
+from ._ref import FA_OK as _FA_OK
+from ._ref import ref_attn_varlen_func
 
 
 class _ZigzagRingVarlenTest(MultiProcessTestCase):
@@ -88,7 +83,7 @@ class _ZigzagRingVarlenTest(MultiProcessTestCase):
         qf = q.clone().requires_grad_(True)
         kf = k.clone().requires_grad_(True)
         vf = v.clone().requires_grad_(True)
-        ref = flash_attn_varlen_func(qf, kf, vf, cu, cu, max_seqlen, max_seqlen, softmax_scale=scale, causal=True)
+        ref = ref_attn_varlen_func(qf, kf, vf, cu, max_seqlen, scale, causal=True)
         ref.backward(g)
 
         def shard(t):
@@ -121,7 +116,7 @@ class ZigzagRingVarlenWorld2Test(_ZigzagRingVarlenTest):
     def world_size(self):
         return 2
 
-    @pytest.mark.skipif(not _FA_OK, reason="flash-attn (FA2) required")
+    @pytest.mark.skipif(not _FA_OK, reason="a flash-attn backend (FA2 or FA4) is required")
     @pytest.mark.skipif(get_torch_device().device_count() < 2, reason="device_count should be >= 2")
     def test_varlen_ring_matches_full(self):
         self._run_case()
@@ -132,7 +127,7 @@ class ZigzagRingVarlenWorld4Test(_ZigzagRingVarlenTest):
     def world_size(self):
         return 4
 
-    @pytest.mark.skipif(not _FA_OK, reason="flash-attn (FA2) required")
+    @pytest.mark.skipif(not _FA_OK, reason="a flash-attn backend (FA2 or FA4) is required")
     @pytest.mark.skipif(get_torch_device().device_count() < 4, reason="device_count should be >= 4")
     def test_varlen_ring_matches_full(self):
         self._run_case()

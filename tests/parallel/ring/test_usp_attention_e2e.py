@@ -44,13 +44,8 @@ from torch.testing._internal.common_utils import run_tests
 from veomni.distributed import parallel_state as PS
 from veomni.distributed.sequence_parallel.data import zigzag_reorder, zigzag_reorder_varlen
 
-
-try:
-    from flash_attn import flash_attn_func
-
-    _FA_OK = True
-except ImportError:
-    _FA_OK = False
+from ._ref import ATTN_IMPL_WITH_SP, ref_attn_func, ref_attn_varlen_func
+from ._ref import FA_OK as _FA_OK
 
 
 ULYSSES = 2
@@ -65,7 +60,7 @@ class _AttnModule(torch.nn.Module):
         self.is_causal = True
 
         class _Cfg:
-            _attn_implementation = "veomni_flash_attention_2_with_sp"
+            _attn_implementation = ATTN_IMPL_WITH_SP
 
         self.config = _Cfg()
         self.layer_idx = 0
@@ -111,7 +106,7 @@ class USPAttentionE2ETest(MultiProcessTestCase):
         uly_chunk = cp_region.shape[1] // ULYSSES
         return cp_region[:, uly_rank * uly_chunk : (uly_rank + 1) * uly_chunk].clone()
 
-    @pytest.mark.skipif(not _FA_OK, reason="flash-attn (FA2) required")
+    @pytest.mark.skipif(not _FA_OK, reason="a flash-attn backend (FA2 or FA4) is required")
     @pytest.mark.skipif(get_torch_device().device_count() < 4, reason="device_count should be >= 4")
     def test_usp_matches_full_attention(self):
         from veomni.ops.kernels.attention import flash_attention_forward
@@ -130,11 +125,11 @@ class USPAttentionE2ETest(MultiProcessTestCase):
             dist.broadcast(t, 0)
 
         # reference: single-device full causal attention (b, s, h, d layout)
-        ref = flash_attn_func(
+        ref = ref_attn_func(
             q.transpose(1, 2).contiguous(),
             k.transpose(1, 2).contiguous(),
             v.transpose(1, 2).contiguous(),
-            softmax_scale=scale,
+            scale,
             causal=True,
         )  # (b, s, h, d)
 
@@ -164,11 +159,9 @@ class USPAttentionE2ETest(MultiProcessTestCase):
         uly_chunk = cp_region.shape[1] // ULYSSES
         return cp_region[:, uly_rank * uly_chunk : (uly_rank + 1) * uly_chunk].clone()
 
-    @pytest.mark.skipif(not _FA_OK, reason="flash-attn (FA2) required")
+    @pytest.mark.skipif(not _FA_OK, reason="a flash-attn backend (FA2 or FA4) is required")
     @pytest.mark.skipif(get_torch_device().device_count() < 4, reason="device_count should be >= 4")
     def test_usp_varlen_matches_full(self):
-        from flash_attn import flash_attn_varlen_func
-
         from veomni.ops.kernels.attention import flash_attention_forward
 
         state, mesh = self._init()
@@ -192,15 +185,13 @@ class USPAttentionE2ETest(MultiProcessTestCase):
             dist.broadcast(t, 0)
 
         # reference: single-device full packed varlen causal attention (b, s, h, d)
-        ref = flash_attn_varlen_func(
+        ref = ref_attn_varlen_func(
             q.transpose(1, 2).reshape(seq, h, d).contiguous(),
             k.transpose(1, 2).reshape(seq, h, d).contiguous(),
             v.transpose(1, 2).reshape(seq, h, d).contiguous(),
             cu,
-            cu,
             max_seqlen,
-            max_seqlen,
-            softmax_scale=scale,
+            scale,
             causal=True,
         ).reshape(b, seq, h, d)
 

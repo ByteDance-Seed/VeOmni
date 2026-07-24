@@ -316,10 +316,11 @@ def flash_attention_forward(
     # ring only needs to span the ``cp`` group. The data collator lays the
     # sequence out in zig-zag block order (see ``SequenceParallelCollator`` /
     # ``sequence_parallel.data.zigzag_reorder``), so causal attention is balanced
-    # across ``cp`` ranks. Requires FA2 (flash-attn) and causal attention. Both
-    # dense and packed (varlen) sequences are supported: packed documents take
-    # the ``zigzag_ring_flash_attn_varlen_func`` path with per-document LOCAL
-    # cu_seqlens derived from the FULL ``cu_seq_lens_q``.
+    # across ``cp`` ranks. Requires a flash-attn backend (FA2 on Ampere/Hopper,
+    # FA4 CuTe on Blackwell/GB200 — auto-selected in ``ring_attention``) and
+    # causal attention. Both dense and packed (varlen) sequences are supported:
+    # packed documents take the ``zigzag_ring_flash_attn_varlen_func`` path with
+    # per-document LOCAL cu_seqlens derived from the FULL ``cu_seq_lens_q``.
     cp_state = get_parallel_state()
     if cp_state.cp_enabled:
         from ....distributed.sequence_parallel.data import local_cu_seqlens

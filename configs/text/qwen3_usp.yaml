@@ -9,7 +9,8 @@
 #
 # Constraints for the ``cp`` (ring) path:
 #   * causal attention only (no explicit attention masks under cp)
-#   * FA2 (flash-attn) required
+#   * a flash-attn backend is required (FA2 on Ampere/Hopper, FA4 CuTe on
+#     Blackwell/GB200 — auto-selected at import time)
 #   * max_seq_len must be divisible by 2 * ulysses_size * cp_size
 #   * packed (varlen) sequences ARE supported: every packed document length
 #     must additionally be divisible by 2 * cp_size (balanced ring attention

@@ -39,14 +39,8 @@ from veomni.distributed.sequence_parallel.data import zigzag_reorder
 from veomni.distributed.sequence_parallel.ring_attention import zigzag_ring_flash_attn_func
 
 from ..ulysses.utils import SequenceParallelTest
-
-
-try:
-    from flash_attn import flash_attn_func
-
-    _FA_OK = True
-except ImportError:
-    _FA_OK = False
+from ._ref import FA_OK as _FA_OK
+from ._ref import ref_attn_func
 
 
 class ZigzagRingAttentionTest(SequenceParallelTest):
@@ -58,7 +52,7 @@ class ZigzagRingAttentionTest(SequenceParallelTest):
         chunk = reordered.shape[1] // world
         return reordered[:, rank * chunk : (rank + 1) * chunk].clone()
 
-    @pytest.mark.skipif(not _FA_OK, reason="flash-attn (FA2) required")
+    @pytest.mark.skipif(not _FA_OK, reason="a flash-attn backend (FA2 or FA4) is required")
     @pytest.mark.skipif(get_torch_device().device_count() < 2, reason="device_count should be >= 2")
     def test_matches_full_attention(self):
         group = self._get_process_group()
@@ -82,7 +76,7 @@ class ZigzagRingAttentionTest(SequenceParallelTest):
         qf = q.clone().requires_grad_(True)
         kf = k.clone().requires_grad_(True)
         vf = v.clone().requires_grad_(True)
-        ref = flash_attn_func(qf, kf, vf, softmax_scale=scale, causal=True)
+        ref = ref_attn_func(qf, kf, vf, scale, causal=True)
         ref.backward(g)
 
         # zig-zag ring: shard, run, compare against the matching reference chunk
