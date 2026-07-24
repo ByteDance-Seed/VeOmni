@@ -447,11 +447,30 @@ patchgen --list
 
 ### Adding a new model
 
-1. Create `veomni/models/transformers/<model>/<model>_gpu_patch_gen_config.py` at the model root
-2. Define your `PatchConfig` and patches
-3. Run `patchgen veomni.models.transformers.<model>.<model>_gpu_patch_gen_config --diff -v`
-4. Verify the generated output in `veomni/models/transformers/<model>/generated/`
-5. Run `patchgen --check` to confirm CI will pass
+1. Create `veomni/models/transformers/<model>/` with an `__init__.py` that
+   registers the generated class in `MODELING_REGISTRY` under the config's
+   exact `model_type`. Register a custom config or processor in
+   `MODEL_CONFIG_REGISTRY` or `MODEL_PROCESSOR_REGISTRY` when the integration
+   provides one. Import the package from `veomni.models.transformers` so all
+   module-level registration runs at import time.
+2. Create `<model>_gpu_patch_gen_config.py` at the model root. Point its
+   `PatchConfig` at the pinned Transformers source module and declare only the
+   imports, methods, classes, or op slots that VeOmni must change.
+3. Audit backend routing before enabling a new attention implementation.
+   FlexAttention in particular requires the generated model to dispatch via
+   `config._attn_implementation` and to construct a model-correct native
+   `BlockMask`; changing the training config alone is insufficient. See
+   [VeOmni Fused Attention Interface](../transformers_v5/veomni_fused_attention.md#integrating-a-new-patchgen-model).
+4. Run
+   `patchgen veomni.models.transformers.<model>.<model>_gpu_patch_gen_config --dry-run`,
+   then regenerate with `--diff -v`.
+5. Review both the generated output under
+   `veomni/models/transformers/<model>/generated/` and its diff against the
+   upstream source. Never patch the generated file directly.
+6. Add a toy config plus registry, forward/backward, backend-routing, and
+   parallelism tests appropriate to the model. Follow
+   [Testing a New Model](../transformers_v5/testing_new_model.md).
+7. Run `patchgen --check` and the focused model tests before committing.
 
 ## Using patchgen from a dependent project
 
@@ -584,11 +603,7 @@ Inspired by HuggingFace's own `modular_model_converter.py`, we:
 
 ## Contributing
 
-To add support for a new model:
-
-1. Create `veomni/models/transformers/<model>/<model>_gpu_patch_gen_config.py` at the model root
-2. Define your `PatchConfig` and patches
-3. Test with `patchgen veomni.models.transformers.<model>.<model>_gpu_patch_gen_config --dry-run`
-4. Generate and verify the output in `veomni/models/transformers/<model>/generated/`
-5. Use `--diff` to review changes against original HF code
-6. Run `make check-patchgen` (or `patchgen --check`) to ensure CI will pass
+To add support for a new model, follow
+[Adding a new model](#adding-a-new-model). In addition to generating and
+reviewing the modeling file, that workflow includes registry wiring,
+backend-contract audits, focused tests, and the patchgen drift gate.
