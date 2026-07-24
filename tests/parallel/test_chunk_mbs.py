@@ -1,6 +1,7 @@
 import copy
 import sys
 import types
+from contextlib import contextmanager
 from functools import partial
 
 import pytest
@@ -12,10 +13,12 @@ from transformers.modeling_layers import GradientCheckpointingLayer
 from veomni.arguments import ChunkMBSConfig, MixedPrecisionConfig
 from veomni.distributed.chunk_mbs import (
     PackedSequenceRange,
+    _VariableSplitAllToAll,
     apply_chunk_mbs,
     build_chunk_mbs_ranges,
     chunk_mbs_context,
 )
+from veomni.distributed.sequence_parallel.ulysses import gather_heads_scatter_seq, gather_seq_scatter_heads
 
 
 def _config(chunk_mbs=2):
@@ -77,6 +80,40 @@ def test_build_chunk_mbs_ranges_noops_when_micro_batch_is_small():
     batch = {"cu_seq_lens_q": torch.tensor([0, 3, 5], dtype=torch.int32)}
 
     assert build_chunk_mbs_ranges(batch, _config(chunk_mbs=2)) is None
+
+
+def test_preforward_builds_chunk_ranges_in_base_parallel_state(monkeypatch):
+    import veomni.trainer.base as base_trainer
+
+    active_state = None
+
+    @contextmanager
+    def use_parallel_state(name):
+        nonlocal active_state
+        previous_state = active_state
+        active_state = name
+        try:
+            yield
+        finally:
+            active_state = previous_state
+
+    def build_ranges(batch, config):
+        assert active_state == "base"
+        return [PackedSequenceRange(0, 2, 0, 4, 2)]
+
+    monkeypatch.setattr(base_trainer, "use_parallel_state", use_parallel_state)
+    monkeypatch.setattr(base_trainer, "build_chunk_mbs_ranges", build_ranges)
+    trainer = object.__new__(base_trainer.BaseTrainer)
+    trainer.args = types.SimpleNamespace(
+        train=types.SimpleNamespace(chunk_mbs_config=_config(chunk_mbs=1), local_rank=0)
+    )
+    trainer.device = torch.device("cpu")
+    trainer.LOG_SAMPLE = False
+
+    batch = {"cu_seq_lens_q": torch.tensor([0, 2, 4], dtype=torch.int32)}
+    assert trainer.preforward(batch) == batch
+    assert trainer._chunk_mbs_ranges == [PackedSequenceRange(0, 2, 0, 4, 2)]
+    assert active_state is None
 
 
 @pytest.mark.parametrize(
@@ -391,6 +428,7 @@ class _Qwen3VLRoot(nn.Module):
 
     def __init__(self, layer):
         super().__init__()
+        self._no_split_modules = [layer.__class__.__name__, "Qwen3VLVisionBlock"]
         self.model = nn.Module()
         self.model.language_model = nn.Module()
         self.model.language_model.layers = nn.ModuleList([layer])
@@ -432,6 +470,542 @@ class _Qwen3_5LinearAttentionStub(nn.Module):
                 state = torch.tanh(projected[:, token_idx] + decay * state)
                 outputs.append(state)
         return torch.stack(outputs, dim=1)
+
+
+class Qwen3VLTextDecoderLayer(GradientCheckpointingLayer):
+    def __init__(self, group):
+        super().__init__()
+        self.group = group
+        self.scale = nn.Parameter(torch.tensor([0.5, 1.0, 1.5, 2.0]))
+        self.calls = []
+
+    def forward(
+        self,
+        hidden_states,
+        position_embeddings,
+        position_ids,
+        cu_seq_lens_q,
+        cu_seq_lens_k,
+        max_length_q,
+        max_length_k,
+        attention_mask=None,
+        **kwargs,
+    ):
+        assert "linear_attn_cu_seq_lens_q" not in kwargs
+        self.calls.append((tuple(hidden_states.shape), cu_seq_lens_q.tolist()))
+        assert attention_mask is None
+        assert torch.equal(cu_seq_lens_q, cu_seq_lens_k)
+        assert max_length_q == max_length_k
+
+        cos, sin = position_embeddings
+        hidden_states = (
+            hidden_states + cos + sin + position_ids.unsqueeze(-1).to(hidden_states.dtype) * 0.01
+        ) * self.scale
+        states = hidden_states.squeeze(0).view(
+            hidden_states.shape[1], self.group.size(), hidden_states.shape[-1] // self.group.size()
+        )
+        states = gather_seq_scatter_heads(states, seq_dim=0, head_dim=1, group=self.group)
+        states = torch.cat(
+            [states[start:end].cumsum(dim=0) for start, end in zip(cu_seq_lens_q[:-1], cu_seq_lens_q[1:])]
+        )
+        states = gather_heads_scatter_seq(states, head_dim=1, seq_dim=0, group=self.group)
+        return states.reshape_as(hidden_states)
+
+
+class _SPQwen3VLRoot(nn.Module):
+    _no_split_modules = ["Qwen3VLTextDecoderLayer", "Qwen3VLVisionBlock"]
+
+    def __init__(self, group):
+        super().__init__()
+        self.model = nn.Module()
+        self.model.language_model = nn.Module()
+        self.model.language_model.layers = nn.ModuleList([Qwen3VLTextDecoderLayer(group)])
+
+
+class Qwen3VLMoeTextTopKRouter(nn.Module):
+    def __init__(self, hidden_size, num_experts):
+        super().__init__()
+        self.weight = nn.Parameter(
+            torch.arange(num_experts * hidden_size, dtype=torch.float32).view(num_experts, -1) / 20
+        )
+
+    def forward(self, hidden_states):
+        flat_states = hidden_states.reshape(-1, hidden_states.shape[-1])
+        router_logits = nn.functional.linear(flat_states, self.weight)
+        selected_experts = router_logits.argmax(dim=-1, keepdim=True)
+        routing_weights = torch.ones_like(selected_experts, dtype=hidden_states.dtype)
+        return router_logits, routing_weights, selected_experts
+
+
+class Qwen3VLMoeTextExperts(nn.Module):
+    def __init__(self, group, hidden_size):
+        super().__init__()
+        self.group = group
+        self.weight = nn.Parameter(torch.eye(hidden_size))
+
+    def forward(self, hidden_states, selected_experts, routing_weights):
+        del routing_weights
+        flat_states = hidden_states.reshape(-1, hidden_states.shape[-1])
+        selected_experts = selected_experts.reshape(-1)
+        world_size = self.group.size()
+        rank = self.group.rank()
+        input_splits = [(selected_experts == expert).sum().item() for expert in range(world_size)]
+        split_tensor = torch.tensor(input_splits, dtype=torch.int64, device=flat_states.device)
+        gathered_splits = [torch.empty_like(split_tensor) for _ in range(world_size)]
+        torch.distributed.all_gather(gathered_splits, split_tensor, group=self.group)
+        output_splits = [int(splits[rank].item()) for splits in gathered_splits]
+
+        permutation = selected_experts.argsort(stable=True)
+        permuted_states = flat_states[permutation]
+        dispatched_states = _VariableSplitAllToAll.apply(self.group, permuted_states, output_splits, input_splits)
+        expert_output = nn.functional.linear(dispatched_states, self.weight)
+        returned_states = _VariableSplitAllToAll.apply(self.group, expert_output, input_splits, output_splits)
+        return returned_states[permutation.argsort()].reshape_as(hidden_states)
+
+
+class Qwen3VLMoeTextSparseMoeBlock(nn.Module):
+    def __init__(self, group, hidden_size):
+        super().__init__()
+        self.gate = Qwen3VLMoeTextTopKRouter(hidden_size, group.size())
+        self.experts = Qwen3VLMoeTextExperts(group, hidden_size)
+
+    def forward(self, hidden_states):
+        router_logits, routing_weights, selected_experts = self.gate(hidden_states)
+        output = self.experts(hidden_states, selected_experts, routing_weights)
+        return output, router_logits
+
+
+class Qwen3VLMoeTextDecoderLayer(GradientCheckpointingLayer):
+    def __init__(self, ep_group, use_sp, sp_group=None):
+        super().__init__()
+        self.group = sp_group if sp_group is not None else ep_group
+        self.use_sp = use_sp
+        self.scale = nn.Parameter(torch.tensor([0.5, 1.0, 1.5, 2.0]))
+        self.mlp = Qwen3VLMoeTextSparseMoeBlock(ep_group, hidden_size=4)
+        self.router_logits = []
+
+    def forward(
+        self,
+        hidden_states,
+        position_embeddings,
+        position_ids,
+        cu_seq_lens_q,
+        cu_seq_lens_k,
+        max_length_q,
+        max_length_k,
+        attention_mask=None,
+        output_router_logits=False,
+        **kwargs,
+    ):
+        assert attention_mask is None
+        assert torch.equal(cu_seq_lens_q, cu_seq_lens_k)
+        assert max_length_q == max_length_k
+
+        cos, sin = position_embeddings
+        states = (hidden_states + cos + sin + position_ids.unsqueeze(-1).to(hidden_states.dtype) * 0.01) * self.scale
+        if self.use_sp:
+            states = states.squeeze(0).view(hidden_states.shape[1], 2, 2)
+            states = gather_seq_scatter_heads(states, seq_dim=0, head_dim=1, group=self.group)
+            states = torch.cat(
+                [states[start:end].cumsum(dim=0) for start, end in zip(cu_seq_lens_q[:-1], cu_seq_lens_q[1:])]
+            )
+            states = gather_heads_scatter_seq(states, head_dim=1, seq_dim=0, group=self.group)
+            states = states.reshape_as(hidden_states)
+
+        moe_output, router_logits = self.mlp(states)
+        if output_router_logits:
+            self.router_logits.append(router_logits)
+        return states + moe_output
+
+
+class _Qwen3VLMoeRoot(nn.Module):
+    _no_split_modules = ["Qwen3VLMoeTextDecoderLayer", "Qwen3VLMoeVisionBlock"]
+
+    def __init__(self, ep_group, use_sp, sp_group=None):
+        super().__init__()
+        self.model = nn.Module()
+        self.model.language_model = nn.Module()
+        self.model.language_model.layers = nn.ModuleList([Qwen3VLMoeTextDecoderLayer(ep_group, use_sp, sp_group)])
+
+
+def _packed_cumsum_reference(hidden_states, position_embeddings, position_ids, cu_seq_lens, scale):
+    cos, sin = position_embeddings
+    states = (hidden_states + cos + sin + position_ids.unsqueeze(-1).to(hidden_states.dtype) * 0.01) * scale
+    states = states.squeeze(0).view(hidden_states.shape[1], 2, 2)
+    states = torch.cat([states[start:end].cumsum(dim=0) for start, end in zip(cu_seq_lens[:-1], cu_seq_lens[1:])])
+    return states.reshape_as(hidden_states)
+
+
+def _run_ulysses_chunk_mbs(rank, world_size, init_path, use_checkpoint):
+    import os
+
+    import torch.distributed as dist
+
+    import veomni.distributed.chunk_mbs as chunk_mbs
+    from veomni.utils.device import get_device_type, get_dist_comm_backend, get_torch_device
+
+    device_type = get_device_type()
+    backend = "gloo" if device_type == "cpu" else get_dist_comm_backend()
+    if device_type == "cpu" and sys.platform == "darwin":
+        os.environ["GLOO_SOCKET_IFNAME"] = "lo0"
+    if device_type != "cpu":
+        get_torch_device().set_device(rank)
+    dist.init_process_group(backend, init_method=f"file://{init_path}", rank=rank, world_size=world_size)
+    try:
+        group = dist.group.WORLD
+        chunk_mbs.get_parallel_state = lambda: types.SimpleNamespace(
+            sp_enabled=True,
+            ulysses_enabled=True,
+            cp_enabled=False,
+            tp_enabled=False,
+            pp_enabled=False,
+            any_extra_parallel_enabled=False,
+            ulysses_group=group,
+        )
+
+        position_ids = torch.cat([torch.arange(length) for length in (4, 3, 2, 3)]).view(1, -1)
+        batch = {"position_ids": position_ids}
+        from veomni.data.data_collator import add_flash_attention_kwargs_from_position_ids
+
+        add_flash_attention_kwargs_from_position_ids(batch)
+        cu_seq_lens = batch["cu_seq_lens_q"]
+        ranges = build_chunk_mbs_ranges(batch, _config(chunk_mbs=2))
+        position_ids = position_ids.to(device_type)
+        full_hidden = torch.arange(48, dtype=torch.float32, device=device_type).view(1, 12, 4) / 10
+        full_position_embeddings = (
+            torch.arange(48, dtype=torch.float32, device=device_type).view(1, 12, 4) / 100,
+            torch.full((1, 12, 4), 0.25, device=device_type),
+        )
+
+        reference_hidden = full_hidden.detach().clone().requires_grad_()
+        reference_scale = nn.Parameter(torch.tensor([0.5, 1.0, 1.5, 2.0], device=device_type))
+        reference_output = _packed_cumsum_reference(
+            reference_hidden, full_position_embeddings, position_ids, cu_seq_lens, reference_scale
+        )
+        reference_output.square().sum().backward()
+
+        model = _SPQwen3VLRoot(group).to(device_type)
+        layer = model.model.language_model.layers[0]
+        if use_checkpoint:
+            layer.gradient_checkpointing = True
+            layer._gradient_checkpointing_func = partial(checkpoint, use_reentrant=False)
+        apply_chunk_mbs(model, _config(chunk_mbs=2))
+
+        local_seq_len = full_hidden.shape[1] // world_size
+        local_start = rank * local_seq_len
+        local_hidden = full_hidden[:, local_start : local_start + local_seq_len].detach().clone().requires_grad_()
+        local_position_embeddings = tuple(
+            value[:, local_start : local_start + local_seq_len] for value in full_position_embeddings
+        )
+        local_position_ids = position_ids[:, local_start : local_start + local_seq_len]
+        with chunk_mbs_context(ranges):
+            local_output = layer(
+                local_hidden,
+                position_embeddings=local_position_embeddings,
+                position_ids=local_position_ids,
+                attention_mask=None,
+                cu_seq_lens_q=cu_seq_lens,
+                cu_seq_lens_k=cu_seq_lens,
+                max_length_q=4,
+                max_length_k=4,
+                linear_attn_cu_seq_lens_q=batch["linear_attn_cu_seq_lens_q"].to(device_type),
+            )
+            local_output.square().sum().backward()
+
+        gathered_outputs = [torch.empty_like(local_output) for _ in range(world_size)]
+        gathered_hidden_grads = [torch.empty_like(local_hidden.grad) for _ in range(world_size)]
+        dist.all_gather(gathered_outputs, local_output.detach())
+        dist.all_gather(gathered_hidden_grads, local_hidden.grad)
+        output = torch.cat(gathered_outputs, dim=1)
+        hidden_grad = torch.cat(gathered_hidden_grads, dim=1)
+        dist.all_reduce(layer.scale.grad)
+
+        torch.testing.assert_close(output, reference_output.detach())
+        torch.testing.assert_close(hidden_grad, reference_hidden.grad)
+        torch.testing.assert_close(layer.scale.grad, reference_scale.grad)
+        first_shard_length = (7 + world_size - 1) // world_size
+        second_shard_length = (5 + world_size - 1) // world_size
+        assert layer.calls[:2] == [
+            ((1, first_shard_length, 4), [0, 4, 7, first_shard_length * world_size]),
+            ((1, second_shard_length, 4), [0, 2, 5, second_shard_length * world_size]),
+        ]
+        assert len(layer.calls) == (4 if use_checkpoint else 2)
+    finally:
+        dist.destroy_process_group()
+
+
+def _run_ep_chunk_mbs(rank, world_size, init_path, use_sp, use_checkpoint, uneven_ranges=False, use_fsdp=False):
+    import os
+
+    import torch.distributed as dist
+
+    import veomni.distributed.chunk_mbs as chunk_mbs
+    from veomni.utils.device import get_device_type, get_dist_comm_backend, get_torch_device
+
+    device_type = get_device_type()
+    backend = "gloo" if device_type == "cpu" else get_dist_comm_backend()
+    if device_type == "cpu" and sys.platform == "darwin":
+        os.environ["GLOO_SOCKET_IFNAME"] = "lo0"
+    if device_type != "cpu":
+        get_torch_device().set_device(rank)
+    dist.init_process_group(backend, init_method=f"file://{init_path}", rank=rank, world_size=world_size)
+    try:
+        if use_fsdp:
+            from torch.distributed.device_mesh import init_device_mesh
+
+            assert world_size == 4
+            ep_mesh = init_device_mesh("cpu", (2, 2), mesh_dim_names=("ep_fsdp", "ep"))
+            ep_group = ep_mesh["ep"].get_group()
+            sp_group = ep_group
+        else:
+            ep_group = dist.group.WORLD
+            sp_group = ep_group
+            ep_mesh = types.SimpleNamespace(mesh_dim_names=("ep",), get_group=lambda _name: ep_group)
+        if use_sp and uneven_ranges and not use_fsdp:
+            assert world_size == 4
+            sp_groups = [dist.new_group(ranks) for ranks in ([0, 1], [2, 3])]
+            sp_group = sp_groups[rank // 2]
+        chunk_mbs.get_parallel_state = lambda: types.SimpleNamespace(
+            sp_enabled=use_sp,
+            ulysses_enabled=use_sp,
+            cp_enabled=False,
+            tp_enabled=False,
+            pp_enabled=False,
+            any_extra_parallel_enabled=True,
+            extra_parallel_names=("ep",),
+            extra_parallel_enabled=lambda name: name == "ep",
+            ep_group=ep_group,
+            extra_parallel_fsdp_device_mesh={"ep": ep_mesh},
+            ulysses_group=sp_group if use_sp else None,
+        )
+
+        torch.manual_seed(0)
+        baseline_model = _Qwen3VLMoeRoot(ep_group, use_sp, sp_group).to(device_type)
+        chunked_model = _Qwen3VLMoeRoot(ep_group, use_sp, sp_group).to(device_type)
+        baseline_layer = baseline_model.model.language_model.layers[0]
+        chunked_layer = chunked_model.model.language_model.layers[0]
+        with torch.no_grad():
+            baseline_layer.mlp.experts.weight.mul_(dist.get_rank(ep_group) + 1)
+        chunked_layer.load_state_dict(baseline_layer.state_dict())
+
+        if use_checkpoint:
+            for layer in (baseline_layer, chunked_layer):
+                layer.gradient_checkpointing = True
+                layer._gradient_checkpointing_func = partial(checkpoint, use_reentrant=False)
+        apply_chunk_mbs(chunked_model, _config(chunk_mbs=2))
+        if use_fsdp:
+            from torch.distributed._composable.fsdp import fully_shard
+
+            fully_shard(baseline_layer.mlp.experts, mesh=ep_mesh["ep_fsdp"])
+            fully_shard(chunked_layer.mlp.experts, mesh=ep_mesh["ep_fsdp"])
+
+        if use_fsdp:
+            data_group = ep_mesh.get_local_rank("ep_fsdp")
+        else:
+            data_group = rank // 2 if use_sp and uneven_ranges else rank
+        if uneven_ranges and data_group % 2 == 1:
+            cu_seq_lens = torch.tensor([0, 2, 4, 6, 8, 10, 12], dtype=torch.int32)
+        else:
+            cu_seq_lens = torch.tensor([0, 4, 7, 9, 12], dtype=torch.int32)
+        ranges = build_chunk_mbs_ranges(
+            {"cu_seq_lens_q": cu_seq_lens, "cu_seq_lens_k": cu_seq_lens}, _config(chunk_mbs=2)
+        )
+        assert ranges is not None and len(ranges) == 2
+        position_ids = (
+            torch.cat([torch.arange(end - start) for start, end in zip(cu_seq_lens[:-1], cu_seq_lens[1:])])
+            .view(1, -1)
+            .to(device_type)
+        )
+        full_hidden = torch.arange(48, dtype=torch.float32, device=device_type).view(1, 12, 4) / 10
+        full_position_embeddings = (
+            torch.arange(48, dtype=torch.float32, device=device_type).view(1, 12, 4) / 100,
+            torch.full((1, 12, 4), 0.25, device=device_type),
+        )
+        if use_sp:
+            local_start = dist.get_rank(sp_group) * 6
+            hidden_states = full_hidden[:, local_start : local_start + 6] + data_group * 0.03
+            local_position_ids = position_ids[:, local_start : local_start + 6]
+            local_position_embeddings = tuple(
+                value[:, local_start : local_start + 6] for value in full_position_embeddings
+            )
+        else:
+            hidden_states = full_hidden + rank * 0.03
+            local_position_ids = position_ids
+            local_position_embeddings = full_position_embeddings
+        forward_kwargs = {
+            "position_embeddings": local_position_embeddings,
+            "position_ids": local_position_ids,
+            "attention_mask": None,
+            "cu_seq_lens_q": cu_seq_lens,
+            "cu_seq_lens_k": cu_seq_lens,
+            "max_length_q": int(cu_seq_lens.diff().max().item()),
+            "max_length_k": int(cu_seq_lens.diff().max().item()),
+            "output_router_logits": True,
+        }
+
+        baseline_hidden = hidden_states.detach().clone().requires_grad_()
+        baseline_output = baseline_layer(baseline_hidden, **forward_kwargs)
+        baseline_router_logits = torch.cat(baseline_layer.router_logits)
+        baseline_loss = baseline_output.float().square().mean() + baseline_router_logits.float().square().mean() * 0.03
+        baseline_loss.backward()
+
+        chunked_hidden = hidden_states.detach().clone().requires_grad_()
+        with chunk_mbs_context(ranges):
+            chunked_output = chunked_layer(chunked_hidden, **forward_kwargs)
+            chunked_router_logits = torch.cat(chunked_layer.router_logits[:2])
+            chunked_loss = (
+                chunked_output.float().square().mean() + chunked_router_logits.float().square().mean() * 0.03
+            )
+            chunked_loss.backward()
+
+        torch.testing.assert_close(chunked_output, baseline_output)
+        torch.testing.assert_close(chunked_router_logits, baseline_router_logits)
+        torch.testing.assert_close(chunked_hidden.grad, baseline_hidden.grad)
+        baseline_grads = {name: param.grad for name, param in baseline_layer.named_parameters()}
+        chunked_grads = {name: param.grad for name, param in chunked_layer.named_parameters()}
+        assert chunked_grads.keys() == baseline_grads.keys()
+        for name, baseline_grad in baseline_grads.items():
+            chunked_grad = chunked_grads[name]
+            if use_sp and ".experts." not in name:
+                dist.all_reduce(baseline_grad, group=sp_group)
+                dist.all_reduce(chunked_grad, group=sp_group)
+            baseline_grad = _local_tensor(baseline_grad)
+            chunked_grad = _local_tensor(chunked_grad)
+            torch.testing.assert_close(
+                chunked_grad, baseline_grad, msg=lambda msg, parameter_name=name: f"{parameter_name}: {msg}"
+            )
+    finally:
+        dist.destroy_process_group()
+
+
+def _run_ep_chunk_mbs_single_round_fallback(rank, world_size, init_path):
+    import os
+
+    import torch.distributed as dist
+
+    import veomni.distributed.chunk_mbs as chunk_mbs
+    from veomni.utils.device import get_device_type, get_dist_comm_backend, get_torch_device
+
+    device_type = get_device_type()
+    backend = "gloo" if device_type == "cpu" else get_dist_comm_backend()
+    if device_type == "cpu" and sys.platform == "darwin":
+        os.environ["GLOO_SOCKET_IFNAME"] = "lo0"
+    if device_type != "cpu":
+        get_torch_device().set_device(rank)
+    dist.init_process_group(backend, init_method=f"file://{init_path}", rank=rank, world_size=world_size)
+    try:
+        group = dist.group.WORLD
+        ep_mesh = types.SimpleNamespace(mesh_dim_names=("ep",), get_group=lambda _name: group)
+        chunk_mbs.get_parallel_state = lambda: types.SimpleNamespace(
+            any_extra_parallel_enabled=True,
+            extra_parallel_names=("ep",),
+            extra_parallel_enabled=lambda name: name == "ep",
+            ep_group=group,
+            extra_parallel_fsdp_device_mesh={"ep": ep_mesh},
+        )
+        if rank == 0:
+            cu_seq_lens = torch.tensor([0, 6, 12], dtype=torch.int32)
+        else:
+            cu_seq_lens = torch.tensor([0, 2, 4, 6, 8, 10, 12], dtype=torch.int32)
+
+        ranges = build_chunk_mbs_ranges({"cu_seq_lens_q": cu_seq_lens}, _config(chunk_mbs=2))
+
+        assert ranges is None
+    finally:
+        dist.destroy_process_group()
+
+
+def _run_fsdp2_ulysses_chunk_mbs(rank, world_size, init_path, uneven_ranges=False):
+    import torch.distributed as dist
+    from torch.distributed._composable.fsdp import fully_shard
+    from torch.distributed.device_mesh import init_device_mesh
+
+    import veomni.distributed.chunk_mbs as chunk_mbs
+
+    dist.init_process_group("gloo", init_method=f"file://{init_path}", rank=rank, world_size=world_size)
+    try:
+        if uneven_ranges:
+            assert world_size == 4
+            sp_groups = [dist.new_group(ranks) for ranks in ([0, 1], [2, 3])]
+            group = sp_groups[rank // 2]
+            data_group = rank // 2
+        else:
+            group = dist.group.WORLD
+            data_group = 0
+        mesh = init_device_mesh("cpu", (world_size,), mesh_dim_names=("fsdp",))
+        chunk_mbs.get_parallel_state = lambda: types.SimpleNamespace(
+            sp_enabled=True,
+            ulysses_enabled=True,
+            cp_enabled=False,
+            tp_enabled=False,
+            pp_enabled=False,
+            fsdp_enabled=True,
+            fsdp_mesh=mesh,
+            any_extra_parallel_enabled=False,
+            ulysses_group=group,
+        )
+
+        baseline_model = _SPQwen3VLRoot(group)
+        chunked_model = _SPQwen3VLRoot(group)
+        baseline_layer = baseline_model.model.language_model.layers[0]
+        chunked_layer = chunked_model.model.language_model.layers[0]
+        chunked_layer.load_state_dict(baseline_layer.state_dict())
+        for layer in (baseline_layer, chunked_layer):
+            layer.gradient_checkpointing = True
+            layer._gradient_checkpointing_func = partial(checkpoint, use_reentrant=False)
+        apply_chunk_mbs(chunked_model, _config(chunk_mbs=2))
+
+        fully_shard(baseline_layer, mesh=mesh)
+        fully_shard(chunked_layer, mesh=mesh)
+
+        if uneven_ranges and data_group == 1:
+            cu_seq_lens = torch.tensor([0, 2, 4, 6, 8, 10, 12], dtype=torch.int32)
+        else:
+            cu_seq_lens = torch.tensor([0, 4, 7, 9, 12], dtype=torch.int32)
+        ranges = build_chunk_mbs_ranges(
+            {"cu_seq_lens_q": cu_seq_lens, "cu_seq_lens_k": cu_seq_lens}, _config(chunk_mbs=2)
+        )
+        assert ranges is not None and len(ranges) == 2
+        position_ids = torch.cat(
+            [torch.arange(end - start) for start, end in zip(cu_seq_lens[:-1], cu_seq_lens[1:])]
+        ).view(1, -1)
+        full_hidden = torch.arange(48, dtype=torch.float32).view(1, 12, 4) / 10
+        full_position_embeddings = (
+            torch.arange(48, dtype=torch.float32).view(1, 12, 4) / 100,
+            torch.full((1, 12, 4), 0.25),
+        )
+        local_start = dist.get_rank(group) * 6
+        local_position_embeddings = tuple(
+            value[:, local_start : local_start + 6] for value in full_position_embeddings
+        )
+        local_position_ids = position_ids[:, local_start : local_start + 6]
+        forward_kwargs = {
+            "position_embeddings": local_position_embeddings,
+            "position_ids": local_position_ids,
+            "attention_mask": None,
+            "cu_seq_lens_q": cu_seq_lens,
+            "cu_seq_lens_k": cu_seq_lens,
+            "max_length_q": int(cu_seq_lens.diff().max().item()),
+            "max_length_k": int(cu_seq_lens.diff().max().item()),
+        }
+
+        local_hidden = full_hidden[:, local_start : local_start + 6] + data_group * 0.03
+        baseline_hidden = local_hidden.detach().clone().requires_grad_()
+        baseline_output = baseline_layer(baseline_hidden, **forward_kwargs)
+        baseline_output.square().sum().backward()
+        baseline_grad = _local_tensor(baseline_layer.scale.grad).detach().clone()
+
+        chunked_hidden = local_hidden.detach().clone().requires_grad_()
+        with chunk_mbs_context(ranges):
+            chunked_output = chunked_layer(chunked_hidden, **forward_kwargs)
+            chunked_output.square().sum().backward()
+        chunked_grad = _local_tensor(chunked_layer.scale.grad).detach().clone()
+
+        torch.testing.assert_close(chunked_output, baseline_output)
+        torch.testing.assert_close(chunked_hidden.grad, baseline_hidden.grad)
+        torch.testing.assert_close(chunked_grad, baseline_grad)
+    finally:
+        dist.destroy_process_group()
 
 
 def _packed_causal_attention_mask(cu_seq_lens: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
@@ -646,14 +1220,31 @@ def test_slice_kwargs_slices_two_dimensional_square_attention_mask():
     assert torch.equal(chunk_kwargs["attention_mask"], attention_mask[1:3, 1:3])
 
 
+@pytest.mark.parametrize("model_type", ["dense", "moe"])
 @pytest.mark.parametrize("use_checkpoint", [False, True])
-def test_apply_chunk_mbs_matches_qwen3_vl_decoder_layer(monkeypatch, use_checkpoint):
+def test_apply_chunk_mbs_matches_qwen3_vl_decoder_layer(monkeypatch, model_type, use_checkpoint):
     import veomni.distributed.chunk_mbs as chunk_mbs
-    from veomni.models.transformers.qwen3_vl.generated.patched_modeling_qwen3_vl_gpu import (
-        Qwen3VLTextConfig,
-        Qwen3VLTextDecoderLayer,
-        Qwen3VLTextRotaryEmbedding,
-    )
+
+    if model_type == "dense":
+        from veomni.models.transformers.qwen3_vl.generated.patched_modeling_qwen3_vl_gpu import (
+            Qwen3VLTextConfig as TextConfig,
+        )
+        from veomni.models.transformers.qwen3_vl.generated.patched_modeling_qwen3_vl_gpu import (
+            Qwen3VLTextDecoderLayer as TextDecoderLayer,
+        )
+        from veomni.models.transformers.qwen3_vl.generated.patched_modeling_qwen3_vl_gpu import (
+            Qwen3VLTextRotaryEmbedding as TextRotaryEmbedding,
+        )
+    else:
+        from veomni.models.transformers.qwen3_vl_moe.generated.patched_modeling_qwen3_vl_moe_gpu import (
+            Qwen3VLMoeTextConfig as TextConfig,
+        )
+        from veomni.models.transformers.qwen3_vl_moe.generated.patched_modeling_qwen3_vl_moe_gpu import (
+            Qwen3VLMoeTextDecoderLayer as TextDecoderLayer,
+        )
+        from veomni.models.transformers.qwen3_vl_moe.generated.patched_modeling_qwen3_vl_moe_gpu import (
+            Qwen3VLMoeTextRotaryEmbedding as TextRotaryEmbedding,
+        )
 
     monkeypatch.setattr(
         chunk_mbs,
@@ -662,7 +1253,7 @@ def test_apply_chunk_mbs_matches_qwen3_vl_decoder_layer(monkeypatch, use_checkpo
     )
 
     torch.manual_seed(0)
-    config = Qwen3VLTextConfig(
+    config_kwargs = dict(
         vocab_size=64,
         hidden_size=16,
         intermediate_size=32,
@@ -677,9 +1268,21 @@ def test_apply_chunk_mbs_matches_qwen3_vl_decoder_layer(monkeypatch, use_checkpo
         hidden_act="silu",
         rope_theta=10000,
     )
+    if model_type == "moe":
+        config_kwargs.update(
+            moe_intermediate_size=24,
+            num_experts=4,
+            num_experts_per_tok=2,
+            decoder_sparse_step=1,
+            mlp_only_layers=[],
+        )
+    config = TextConfig(**config_kwargs)
     config._attn_implementation = "eager"
 
-    baseline_layer = Qwen3VLTextDecoderLayer(config, layer_idx=0)
+    baseline_layer = TextDecoderLayer(config, layer_idx=0)
+    if model_type == "moe":
+        nn.init.normal_(baseline_layer.mlp.experts.gate_up_proj, mean=0.0, std=config.initializer_range)
+        nn.init.normal_(baseline_layer.mlp.experts.down_proj, mean=0.0, std=config.initializer_range)
     chunked_root = _Qwen3VLRoot(copy.deepcopy(baseline_layer))
     chunked_layer = chunked_root.model.language_model.layers[0]
     checkpoint_calls = []
@@ -719,7 +1322,7 @@ def test_apply_chunk_mbs_matches_qwen3_vl_decoder_layer(monkeypatch, use_checkpo
         ),
         dim=0,
     )
-    rotary_emb = Qwen3VLTextRotaryEmbedding(config)
+    rotary_emb = TextRotaryEmbedding(config)
     position_embeddings = rotary_emb(hidden_states, position_ids[1:])
     assert position_embeddings[0].shape == (1, 9, config.head_dim)
     attention_mask = _packed_causal_attention_mask(cu_seq_lens, hidden_states.dtype)
@@ -970,16 +1573,82 @@ def test_chunked_forward_rejects_non_packed_hidden_state_shape(shape):
         chunk_mbs._chunked_forward(lambda hidden_states: hidden_states, ranges, (torch.zeros(shape),), {})
 
 
-def test_apply_chunk_mbs_rejects_sequence_parallel(monkeypatch):
+def test_apply_chunk_mbs_rejects_non_ulysses_sequence_parallel(monkeypatch):
     import veomni.distributed.chunk_mbs as chunk_mbs
 
     monkeypatch.setattr(
         chunk_mbs,
         "get_parallel_state",
-        lambda: types.SimpleNamespace(sp_enabled=True, any_extra_parallel_enabled=False),
+        lambda: types.SimpleNamespace(
+            sp_enabled=True,
+            ulysses_enabled=False,
+            cp_enabled=True,
+            any_extra_parallel_enabled=False,
+        ),
     )
 
-    with pytest.raises(RuntimeError, match="sequence parallelism"):
+    with pytest.raises(RuntimeError, match="Ulysses without context parallelism"):
+        apply_chunk_mbs(_ToyRoot(), _config(chunk_mbs=2))
+
+
+def test_apply_chunk_mbs_rejects_non_qwen3_vl_ulysses(monkeypatch):
+    import veomni.distributed.chunk_mbs as chunk_mbs
+
+    monkeypatch.setattr(
+        chunk_mbs,
+        "get_parallel_state",
+        lambda: types.SimpleNamespace(
+            sp_enabled=True,
+            ulysses_enabled=True,
+            cp_enabled=False,
+            tp_enabled=False,
+            pp_enabled=False,
+            any_extra_parallel_enabled=False,
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="Qwen3-VL decoder layers only"):
+        apply_chunk_mbs(_ToyRoot(), _config(chunk_mbs=2))
+
+
+def test_apply_chunk_mbs_rejects_asynchronous_ulysses(monkeypatch):
+    import veomni.distributed.chunk_mbs as chunk_mbs
+
+    monkeypatch.setattr(
+        chunk_mbs,
+        "get_parallel_state",
+        lambda: types.SimpleNamespace(
+            sp_enabled=True,
+            ulysses_enabled=True,
+            async_enabled=True,
+            cp_enabled=False,
+            tp_enabled=False,
+            pp_enabled=False,
+            any_extra_parallel_enabled=False,
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="asynchronous Ulysses"):
+        apply_chunk_mbs(_SPQwen3VLRoot(None), _config(chunk_mbs=2))
+
+
+def test_apply_chunk_mbs_rejects_extra_parallel_for_non_qwen3_vl_moe(monkeypatch):
+    import veomni.distributed.chunk_mbs as chunk_mbs
+
+    monkeypatch.setattr(
+        chunk_mbs,
+        "get_parallel_state",
+        lambda: types.SimpleNamespace(
+            sp_enabled=False,
+            tp_enabled=False,
+            pp_enabled=False,
+            any_extra_parallel_enabled=True,
+            extra_parallel_names=("ep",),
+            extra_parallel_enabled=lambda name: name == "ep",
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="Qwen3-VL-MoE with expert parallelism only"):
         apply_chunk_mbs(_ToyRoot(), _config(chunk_mbs=2))
 
 
@@ -1166,6 +1835,108 @@ def test_chunk_mbs_recompute_with_real_fsdp2(tmp_path):
         _run_real_fsdp2_chunk_mbs,
         args=(2, str(tmp_path / "pg")),
         nprocs=2,
+        join=True,
+    )
+
+
+@pytest.mark.parametrize("world_size", [2, 4])
+@pytest.mark.parametrize("use_checkpoint", [False, True])
+def test_chunk_mbs_with_ulysses_matches_packed_reference(tmp_path, world_size, use_checkpoint):
+    torch.multiprocessing.spawn(
+        _run_ulysses_chunk_mbs,
+        args=(world_size, str(tmp_path / f"ulysses-{world_size}-{use_checkpoint}"), use_checkpoint),
+        nprocs=world_size,
+        join=True,
+    )
+
+
+@pytest.mark.parametrize("use_sp", [False, True])
+@pytest.mark.parametrize("use_checkpoint", [False, True])
+def test_chunk_mbs_with_qwen3_vl_moe_ep_matches_packed_reference(tmp_path, use_sp, use_checkpoint):
+    torch.multiprocessing.spawn(
+        _run_ep_chunk_mbs,
+        args=(2, str(tmp_path / f"ep-sp{use_sp}-checkpoint{use_checkpoint}"), use_sp, use_checkpoint),
+        nprocs=2,
+        join=True,
+    )
+
+
+@pytest.mark.parametrize("use_checkpoint", [False, True])
+def test_chunk_mbs_ep_synchronizes_uneven_dynamic_ranges(tmp_path, use_checkpoint):
+    torch.multiprocessing.spawn(
+        _run_ep_chunk_mbs,
+        args=(
+            2,
+            str(tmp_path / f"ep-uneven-checkpoint{use_checkpoint}"),
+            False,
+            use_checkpoint,
+            True,
+        ),
+        nprocs=2,
+        join=True,
+    )
+
+
+def test_chunk_mbs_ep_falls_back_to_one_round_for_uneven_dynamic_ranges(tmp_path):
+    torch.multiprocessing.spawn(
+        _run_ep_chunk_mbs_single_round_fallback,
+        args=(2, str(tmp_path / "ep-uneven-single-round")),
+        nprocs=2,
+        join=True,
+    )
+
+
+@pytest.mark.parametrize("use_checkpoint", [False, True])
+def test_chunk_mbs_sp_ep_synchronizes_uneven_dynamic_ranges(tmp_path, use_checkpoint):
+    torch.multiprocessing.spawn(
+        _run_ep_chunk_mbs,
+        args=(
+            4,
+            str(tmp_path / f"sp-ep-uneven-checkpoint{use_checkpoint}"),
+            True,
+            use_checkpoint,
+            True,
+        ),
+        nprocs=4,
+        join=True,
+    )
+
+
+@pytest.mark.skipif(sys.platform == "darwin", reason="CPU FSDP2 process groups are not supported on macOS CI.")
+@pytest.mark.parametrize("use_sp", [False, True])
+@pytest.mark.parametrize("use_checkpoint", [False, True])
+def test_chunk_mbs_fsdp2_ep_synchronizes_uneven_dynamic_ranges(tmp_path, use_sp, use_checkpoint):
+    torch.multiprocessing.spawn(
+        _run_ep_chunk_mbs,
+        args=(
+            4,
+            str(tmp_path / f"fsdp2-sp{use_sp}-ep-uneven-checkpoint{use_checkpoint}"),
+            use_sp,
+            use_checkpoint,
+            True,
+            True,
+        ),
+        nprocs=4,
+        join=True,
+    )
+
+
+@pytest.mark.skipif(sys.platform == "darwin", reason="CPU FSDP2 process groups are not supported on macOS CI.")
+def test_chunk_mbs_with_ulysses_and_real_fsdp2(tmp_path):
+    torch.multiprocessing.spawn(
+        _run_fsdp2_ulysses_chunk_mbs,
+        args=(2, str(tmp_path / "fsdp2-ulysses")),
+        nprocs=2,
+        join=True,
+    )
+
+
+@pytest.mark.skipif(sys.platform == "darwin", reason="CPU FSDP2 process groups are not supported on macOS CI.")
+def test_chunk_mbs_fsdp2_ulysses_synchronizes_uneven_dynamic_ranges(tmp_path):
+    torch.multiprocessing.spawn(
+        _run_fsdp2_ulysses_chunk_mbs,
+        args=(4, str(tmp_path / "fsdp2-ulysses-uneven"), True),
+        nprocs=4,
         join=True,
     )
 

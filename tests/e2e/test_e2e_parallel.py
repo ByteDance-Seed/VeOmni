@@ -54,6 +54,10 @@ _DEEPSEEK_V4_TILELANG_TRAINING_ARGS = [
     "--model.ops_implementation.dsa_attention_implementation=tilelang",
     "--model.ops_implementation.mhc_implementation=tilelang",
 ]
+_QWEN3_VL_CHUNK_MBS_TRAINING_ARGS = [
+    "--train.chunk_mbs_config.enable=True",
+    "--train.chunk_mbs_config.chunk_mbs=1",
+]
 
 
 def _materialize_weights_dir(config_path: str, output_path: str, save_original_format: bool = True) -> Path:
@@ -400,6 +404,14 @@ def dummy_qwen3vl_dataset():
 
 
 @pytest.fixture(scope="session")
+def dummy_qwen3vl_chunk_mbs_dataset():
+    dummy_dataset = DummyDataset(seq_len=1024, dataset_type="qwen3vl", cache_name="qwen3vl_chunk_mbs")
+    train_path = dummy_dataset.save_path
+    yield train_path
+    del dummy_dataset
+
+
+@pytest.fixture(scope="session")
 def dummy_qwen2omni_dataset():
     dummy_dataset = DummyDataset(seq_len=2048, dataset_type="qwen2omni")
     train_path = dummy_dataset.save_path
@@ -536,8 +548,10 @@ def test_qwen3vl_parallel_align(
     rtol: float,
     atol: float,
     max_sp_size: int | None,
-    dummy_qwen3vl_dataset,
+    request: pytest.FixtureRequest,
 ):
+    chunk_mbs_enabled = model_name in {"qwen3vl", "qwen3vlmoe"}
+    dataset_fixture = "dummy_qwen3vl_chunk_mbs_dataset" if chunk_mbs_enabled else "dummy_qwen3vl_dataset"
     main(
         task_name="train_vlm_test",
         model_name=model_name,
@@ -546,7 +560,8 @@ def test_qwen3vl_parallel_align(
         rtol=rtol,
         atol=atol,
         max_sp_size=max_sp_size,
-        train_path=dummy_qwen3vl_dataset,
+        train_path=request.getfixturevalue(dataset_fixture),
+        extra_args=_QWEN3_VL_CHUNK_MBS_TRAINING_ARGS if chunk_mbs_enabled else None,
     )
 
 
