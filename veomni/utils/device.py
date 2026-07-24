@@ -91,8 +91,10 @@ def stream_synchronize() -> None:
 
 
 def empty_cache() -> None:
-    """Execute torch empty cache operation."""
-    get_torch_device().empty_cache()
+    """Release unused accelerator cache when the active device supports it."""
+    device = get_torch_device()
+    if hasattr(device, "empty_cache"):
+        device.empty_cache()
 
 
 def set_device(device: torch.types.Device) -> None:
@@ -110,11 +112,11 @@ def is_hccl_backend() -> bool:
     return get_dist_comm_backend() == "hccl"
 
 
-def get_gpu_compute_capability() -> int:
+def get_gpu_compute_capability(device: torch.types.Device | int | None = None) -> int:
     """Return the compute capability as an integer (e.g. 70, 80, 90), or 0 if no GPU."""
     if not IS_CUDA_AVAILABLE:
         return 0
-    major, minor = torch.cuda.get_device_capability()
+    major, minor = torch.cuda.get_device_capability(device)
     return major * 10 + minor
 
 

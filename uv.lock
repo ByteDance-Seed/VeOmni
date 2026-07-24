@@ -1104,6 +1104,19 @@ wheels = [
 ]
 
 [[package]]
+name = "gram-newton-schulz"
+version = "0.1.6"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "nvidia-cutlass-dsl" },
+    { name = "quack-kernels" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/5f/d5/5a6863847b504aac78ea7f0501fd2d25c766d452e2ab4d94f7a714c17823/gram_newton_schulz-0.1.6.tar.gz", hash = "sha256:6e13ab3000845968c78ef7b5be882c2eba4b3f36eedc74ca3f2e38acdecce21b", size = 18335, upload-time = "2026-07-02T05:32:08.769Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/a6/62/5de8e75b44e7f7980b140fdaf145880e3232a97a1a14d0fc0dc264dd70cc/gram_newton_schulz-0.1.6-py3-none-any.whl", hash = "sha256:5608c834bb0989d640eb1608bd2a9f1a4a908c46c9887847de98fa383b759c1c", size = 19132, upload-time = "2026-07-02T05:32:07.914Z" },
+]
+
+[[package]]
 name = "h11"
 version = "0.16.0"
 source = { registry = "https://pypi.org/simple" }
@@ -4108,6 +4121,7 @@ gpu = [
     { name = "flash-mla", version = "1.0.0+9241ae3", source = { url = "https://github.com/Luosuu/flash-mla-wheels/releases/download/v1.0.0-9241ae3-torch211cu130/flash_mla-1.0.0%2B9241ae3-1torch211cu130cuda131sm90asm100f-cp312-cp312-linux_x86_64.whl" }, marker = "(python_full_version >= '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'extra-6-veomni-gpu') or (python_full_version < '3.12' and extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (python_full_version < '3.12' and extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (python_full_version < '3.12' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (platform_machine != 'x86_64' and extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (platform_machine != 'x86_64' and extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (platform_machine != 'x86_64' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform != 'linux' and extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu') or (sys_platform != 'linux' and extra == 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu-aarch64') or (sys_platform != 'linux' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64') or (extra != 'extra-6-veomni-gpu' and extra == 'extra-6-veomni-npu' and extra == 'extra-6-veomni-npu-aarch64')" },
     { name = "flash-qla" },
     { name = "ftfy" },
+    { name = "gram-newton-schulz" },
     { name = "hf-transfer" },
     { name = "librosa" },
     { name = "liger-kernel" },
@@ -4252,6 +4266,7 @@ requires-dist = [
     { name = "ftfy", marker = "extra == 'gpu'" },
     { name = "ftfy", marker = "extra == 'npu'" },
     { name = "ftfy", marker = "extra == 'npu-aarch64'" },
+    { name = "gram-newton-schulz", marker = "extra == 'gpu'", specifier = "==0.1.6" },
     { name = "hf-transfer", marker = "extra == 'gpu'" },
     { name = "hf-transfer", marker = "extra == 'npu'" },
     { name = "hf-transfer", marker = "extra == 'npu-aarch64'" },

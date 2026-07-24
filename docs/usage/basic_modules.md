@@ -402,7 +402,7 @@ Muon-specific knobs (only consulted when `optimizer.type == "muon"`):
 
 | Field | Default | Description |
 |-------|---------|-------------|
-| `muon_lr` | `2e-2` | Learning rate for the Muon group. Per Moonlight, ~25× the AdamW lr is a common starting point. |
+| `muon_lr` | `None` | Learning rate for the Muon group. Unset: inherits `optimizer.lr` when `muon_adjust_lr_fn=match_rms_adamw` (default); uses `25×optimizer.lr` when `original` (Moonlight-style). |
 | `muon_momentum` | `0.95` | Momentum factor (Nesterov when `muon_nesterov=True`). |
 | `muon_nesterov` | `true` | Use Nesterov momentum. |
 | `muon_weight_decay` | `0.0` | Decoupled weight decay for the Muon group. |
@@ -410,7 +410,11 @@ Muon-specific knobs (only consulted when `optimizer.type == "muon"`):
 | `muon_ns_coefficients` | `[3.4445, -4.7750, 2.0315]` | Quintic NS polynomial coefficients (a, b, c). |
 | `muon_eps` | `1e-7` | Numerical-stability epsilon for the spectral-norm normalization. |
 | `muon_adjust_lr_fn` | `match_rms_adamw` | Per-matrix LR adjustment. `original` follows Keller Jordan; `match_rms_adamw` matches the RMS of an AdamW update so AdamW-tuned hyperparams transfer. |
-| `muon_expert_zero_comm` | `false` | **MoE / FSDP+EP only.** When `true`, expert FSDP shards along dim-0 (whole experts per rank) instead of the default dim-1 (hidden split), letting Muon's batched Newton-Schulz run with **zero communication**. Requires `(num_experts / ep_size) % ep_fsdp_size == 0`; otherwise the trainer logs a warning and silently falls back to the dim-1 + all-to-all-gather path. |
+| `muon_expert_zero_comm` | `false` | **MoE / FSDP+EP only.** When `true`, expert FSDP shards along dim-0 (whole experts per rank) instead of the default dim-1 (hidden split), letting Muon's batched Newton-Schulz run with **zero communication**. Requires `(num_experts / ep_size) % ep_fsdp_size == 0`; otherwise the trainer logs a warning and falls back to the dim-1 + all-to-all-gather path. |
+| `muon_ns_implementation` | `gram_quack` | Newton–Schulz backend: `std`, `gram` (pure PyTorch Gram-NS), or `gram_quack` (default; Dao-AILab + quack CuTeDSL GEMM; falls back to `gram` with a warning if unavailable). |
+| `muon_gram_ns_reset_iterations` | `[2]` | Restart indices for Gram-NS (`gram` / `gram_quack` only). |
+
+On build, VeOmni logs a one-line `[Muon]` summary (NS backend, resolved LRs, `expert_zero_comm`). Whether zero-comm sharding actually activated is logged separately as `[muon_expert_zero_comm]` during parallelize.
 
 For MoE training under FSDP2+EP, the Muon flow auto-classifies each parameter into one of four code paths in `DistributedMuon`:
 

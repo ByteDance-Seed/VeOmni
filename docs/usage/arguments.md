@@ -186,7 +186,7 @@ NPU validation runs at two times:
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
-| attn_implementation | `Optional[Literal[...]]` | `"flash_attention_2"` | Attention implementation to use. |
+| attn_implementation | `Optional[Literal[...]]` | `"flash_attention_2"` | Attention implementation. Supported public values include `eager`, `sdpa`, `flash_attention_2/3/4`, `flex_attention`, and `native-sparse`. Under the VeOmni modeling backend, Flash and Flex values resolve to SP-aware registry names. FlexAttention requires a model-provided native `BlockMask`; Ulysses currently requires it to be head-broadcast. |
 | moe_implementation | `str` | `"fused_triton"` | MoE experts forward implementation. `fused_triton` uses Triton group-gemm (GPU, SM70+); `fused_quack` uses Quack CUTLASS/CuTe (GPU, SM90+); `fused_npu` uses the NPU group-gemm kernel; `eager` is the reference loop. A value still equal to the GPU default auto-resolves to `fused_npu` on NPU; explicit incompatible non-default overrides raise. |
 | cross_entropy_loss_implementation | `str` | `"liger_kernel"` | Cross-entropy loss. `liger_kernel` (default, GPU only) fuses `lm_head` linear + CE; requires VeOmni-patched modeling files that pass `hidden_states=`/`weights=` to `self.loss_function(...)` — unpatched HF models that pass logits will RuntimeError. `chunk_loss` is the hardware-agnostic chunked F.linear+CE (CUDA + NPU). `npu` is a back-compat alias for `chunk_loss`. `eager` is `F.cross_entropy`. |
 | rms_norm_implementation | `str` | `"liger_kernel"` | RMSNorm. Known values: `liger_kernel` (default, GPU only), `npu`, `triton` (DeepSeek-V3 only; GPU only), `eager`. |
@@ -304,7 +304,7 @@ NPU validation runs at two times:
 | no_decay_modules | `List[str]` | `[]` | Modules excluded from weight decay (e.g. `RMSNorm`). |
 | no_decay_params | `List[str]` | `[]` | Parameters excluded from weight decay (e.g. `bias`). |
 | max_grad_norm | `float` | `1.0` | Gradient clipping norm. |
-| muon_lr | `float` | `2e-2` | Learning rate for Muon-managed 2-D hidden weights and 3-D expert stacks. |
+| muon_lr | `Optional[float]` | `None` | Learning rate for Muon-managed 2-D/3-D weights. Unset: inherits `lr` under `match_rms_adamw`, else `25×lr` under `original`. |
 | muon_momentum | `float` | `0.95` | Momentum factor for Muon. |
 | muon_nesterov | `bool` | `True` | Enable Nesterov momentum for Muon. |
 | muon_weight_decay | `float` | `0.0` | Decoupled weight decay for Muon parameter groups. |
@@ -313,6 +313,8 @@ NPU validation runs at two times:
 | muon_eps | `float` | `1e-7` | Numerical-stability epsilon used in spectral-norm normalization. |
 | muon_adjust_lr_fn | `Literal["original", "match_rms_adamw"]` | `"match_rms_adamw"` | Per-matrix learning-rate adjustment strategy. |
 | muon_expert_zero_comm | `bool` | `False` | Use whole-expert `Shard(0)` when the FSDP+ExtraParallel topology permits zero-communication expert Muon updates. |
+| muon_ns_implementation | `Literal["std", "gram", "gram_quack"]` | `"gram_quack"` | Newton–Schulz backend: standard, pure-PyTorch Gram-NS, or Gram-NS with quack kernels (default; falls back to `gram` if unavailable). |
+| muon_gram_ns_reset_iterations | `List[int]` | `[2]` | Restart indices for Gram Newton–Schulz (ignored by `std`). |
 
 ### WandbConfig
 

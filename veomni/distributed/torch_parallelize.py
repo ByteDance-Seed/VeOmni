@@ -48,6 +48,28 @@ def _reset_hf_initialized_flag(module: nn.Module) -> None:
         _reset_hf_initialized_flag(child)
 
 
+def _to_empty_preserving_nonpersistent_buffers(model: nn.Module, device: str) -> None:
+    """Materialize parameters without discarding config-derived buffers.
+
+    Distributed checkpoints restore ``state_dict()``, which excludes buffers
+    registered with ``persistent=False``. Snapshot those buffers before
+    ``to_empty()`` so values such as rotary ``inv_freq`` survive the DCP resume
+    materialization path without duplicating persistent buffers that DCP loads.
+    """
+    buffers = []
+    for module in model.modules():
+        for name in module._non_persistent_buffers_set:
+            buffer = module._buffers.get(name)
+            if buffer is not None:
+                buffers.append((module, name, buffer.detach().clone()))
+
+    model.to_empty(device=device)
+
+    for module, name, buffer in buffers:
+        materialized_buffer = module._buffers[name]
+        materialized_buffer.copy_(buffer.to(device=materialized_buffer.device, dtype=materialized_buffer.dtype))
+
+
 def _resolve_weights_path_mapping(
     model: nn.Module,
     weights_path: Mapping[str, str],
@@ -101,6 +123,7 @@ def _apply_weights_load_step(
     distribute_tensor_fn: Callable[..., Any],
     fqn_to_index_mapping: Optional[Mapping[str, int]],
     ep_sharded_stream_load: bool = False,
+    should_skip_hf_weight_load: bool = False,
 ) -> None:
     """Materialise meta-initialised parameters and (optionally) load weights.
 
@@ -144,6 +167,21 @@ def _apply_weights_load_step(
       composition is exercised end-to-end by D2.3's smoke tests (which
       run real FSDP) — the unit tests here only cover dispatch.
     """
+    if should_skip_hf_weight_load and is_peft_model:
+        raise ValueError(
+            "should_skip_hf_weight_load=True is incompatible with LoRA/PEFT models: the checkpoint is "
+            "trainable-only and the frozen base must still be loaded from weights_path."
+        )
+
+    if should_skip_hf_weight_load:
+        logger.info_rank0(
+            "Skipping pretrained weight load for checkpoint resume; "
+            "parameters will be restored from the distributed checkpoint."
+        )
+        _to_empty_preserving_nonpersistent_buffers(model, materialize_device)
+        _reset_hf_initialized_flag(model)
+        return
+
     if weights_path is None:
         model.to_empty(device=materialize_device)
         _reset_hf_initialized_flag(model)
@@ -308,6 +346,7 @@ def parallelize_model_fsdp2(
     basic_modules: Optional[List[str]] = None,
     muon_expert_zero_comm: bool = False,
     compile_config: Optional[CompileConfig] = None,
+    should_skip_hf_weight_load: bool = False,
     **kwargs,
 ) -> "nn.Module":
     """
@@ -349,6 +388,8 @@ def parallelize_model_fsdp2(
               owns its own HF folder.  Incompatible with
               ``is_peft_model=True`` — raises ``NotImplementedError``.
     """
+    if "skip_weights_load" in kwargs:
+        raise TypeError("'skip_weights_load' was renamed to 'should_skip_hf_weight_load'")
 
     parallel_state = get_parallel_state()
 
@@ -681,6 +722,7 @@ def parallelize_model_fsdp2(
         distribute_tensor_fn=distribute_tensor,
         fqn_to_index_mapping=kwargs.get("fqn_to_index_mapping"),
         ep_sharded_stream_load=bool(kwargs.get("ep_sharded_stream_load", False)),
+        should_skip_hf_weight_load=should_skip_hf_weight_load,
     )
 
     # Register grad norm clipping method for FSDP2
@@ -780,6 +822,7 @@ def build_parallelize_model(
     basic_modules: Optional[List[str]] = None,
     muon_expert_zero_comm: bool = False,
     compile_config: Optional[CompileConfig] = None,
+    should_skip_hf_weight_load: bool = False,
     **kwargs,
 ) -> "nn.Module":
     """Apply parallel strategies to the model.
@@ -798,6 +841,8 @@ def build_parallelize_model(
         muon_expert_zero_comm: Shard ExtraParallel weights on dim-0 when the
             EP-local dim is divisible by ``ep_fsdp_size``.
     """
+    if "skip_weights_load" in kwargs:
+        raise TypeError("'skip_weights_load' was renamed to 'should_skip_hf_weight_load'")
 
     parallel_state = get_parallel_state()
     compile_config = compile_config or CompileConfig()
@@ -855,6 +900,7 @@ def build_parallelize_model(
                 basic_modules=basic_modules,
                 muon_expert_zero_comm=muon_expert_zero_comm,
                 compile_config=compile_config,
+                should_skip_hf_weight_load=should_skip_hf_weight_load,
                 **kwargs,
             )
         else:

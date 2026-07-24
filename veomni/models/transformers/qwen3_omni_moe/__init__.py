@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from ....lora.target_mapping import convert_fused_moe_lora_targets
+from ....utils.device import IS_NPU_AVAILABLE
 from ...loader import MODEL_CONFIG_REGISTRY, MODEL_PROCESSOR_REGISTRY, MODELING_REGISTRY
 
 
@@ -69,11 +70,19 @@ def register_qwen3_omni_moe_modeling(architecture: str):
         convert_qwen3_omni_moe_fqn_to_index_mapping,
         create_qwen3_omni_moe_checkpoint_tensor_converter,
     )
-    from .generated.patched_modeling_qwen3_omni_moe_gpu import (
-        Qwen3OmniMoeForConditionalGeneration,
-        Qwen3OmniMoeThinkerForConditionalGeneration,
-        Qwen3OmniMoeThinkerTextModel,
-    )
+
+    if IS_NPU_AVAILABLE:
+        from .generated.patched_modeling_qwen3_omni_moe_npu import (
+            Qwen3OmniMoeForConditionalGeneration,
+            Qwen3OmniMoeThinkerForConditionalGeneration,
+            Qwen3OmniMoeThinkerTextModel,
+        )
+    else:
+        from .generated.patched_modeling_qwen3_omni_moe_gpu import (
+            Qwen3OmniMoeForConditionalGeneration,
+            Qwen3OmniMoeThinkerForConditionalGeneration,
+            Qwen3OmniMoeThinkerTextModel,
+        )
 
     # The thinker text submodel is also loadable standalone (e.g. when the
     # registry dispatches on architecture == "...ThinkerTextModel"), so the

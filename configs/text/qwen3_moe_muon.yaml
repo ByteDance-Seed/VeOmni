@@ -40,12 +40,14 @@ train:
     lr_decay_style: cosine
     max_grad_norm: 1.0
     # Moonlight Muon (`match_rms_adamw`) aligns the update RMS with AdamW,
-    # so the Muon group reuses the AdamW lr / weight_decay.
-    muon_lr: 1.0e-4
+    # so the Muon group can reuse the AdamW lr (muon_lr may be omitted).
+    # muon_lr: 1.0e-4
     muon_momentum: 0.95
     muon_nesterov: true
     muon_weight_decay: 0.1
     muon_ns_steps: 5
+    # std | gram | gram_quack (default; quack CuTeDSL GEMM on H100/B200/GB200)
+    muon_ns_implementation: gram_quack
     muon_adjust_lr_fn: match_rms_adamw
     # Requires (num_experts / ep_size) % ep_fsdp_size == 0; otherwise falls back.
     muon_expert_zero_comm: true

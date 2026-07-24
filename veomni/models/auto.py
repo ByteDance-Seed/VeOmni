@@ -122,6 +122,8 @@ def build_foundation_model(
             "flash_attention_2",
             "flash_attention_3",
             "flash_attention_4",
+            "flex_attention",
+            "veomni_flex_attention_with_sp",
             "veomni_flash_attention_2_with_sp",
             "veomni_flash_attention_3_with_sp",
             "veomni_flash_attention_4_with_sp",
@@ -228,12 +230,13 @@ def build_foundation_model(
     }
 
     if attn_implementation not in (
+        "veomni_flex_attention_with_sp",
         "veomni_flash_attention_2_with_sp",
         "veomni_flash_attention_3_with_sp",
         "veomni_flash_attention_4_with_sp",
     ):
         logger.warning_rank0(
-            f"building foundation model with attn_implementation: {attn_implementation}.. you are missing sequence parallelism support. Please use veomni_flash_attention_2_with_sp or veomni_flash_attention_3_with_sp for SP."
+            f"building foundation model with attn_implementation: {attn_implementation}.. you are missing sequence parallelism support. Please use a veomni_*_with_sp attention implementation for SP."
         )
 
     if (init_device == "cpu" and get_parallel_state().global_rank != 0) or init_device == "meta":

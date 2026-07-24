@@ -20,6 +20,8 @@ import pytest
 import torch
 import torch.nn as nn
 
+from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type, get_gpu_compute_capability
+
 
 muon_module = pytest.importorskip("torch.optim._muon")
 from torch.optim import Muon as UpstreamMuon  # noqa: E402
@@ -29,7 +31,9 @@ from veomni.optim.muon import (  # noqa: E402
     DEFAULT_NS_COEFFICIENTS,
     DEFAULT_NS_STEPS,
     DistributedMuon,
+    batched_gram_newton_schulz,
     batched_newton_schulz,
+    run_newton_schulz,
     split_muon_adamw_params,
 )
 
@@ -133,6 +137,7 @@ class TestNumerics:
             momentum=0.9,
             nesterov=True,
             adjust_lr_fn="match_rms_adamw",
+            ns_implementation="std",  # match upstream torch.optim.Muon NS path
         )
 
         torch.manual_seed(7)
@@ -263,7 +268,7 @@ class TestBatchedNS:
         "case",
         [
             {"ns_steps": 150, "match": "less than 100"},
-            {"ns_coefficients": (1.0, 2.0), "match": "exactly 3"},
+            {"ns_coefficients": (1.0, 2.0), "match": "Per-step ns_coefficients|exactly 3|Coefficients"},
         ],
         ids=["too_many_steps", "bad_coefficients"],
     )
@@ -277,3 +282,211 @@ class TestBatchedNS:
         out = batched_newton_schulz(torch.zeros(*shape))
         assert torch.isfinite(out).all()
         assert out.shape == tuple(shape)
+
+
+class TestGramNewtonSchulz:
+    """Gram-NS pure torch path + optional Dao-AILab package kernels."""
+
+    def test_rectangular_close_to_standard_same_coeffs(self):
+        x = _sample_2d(32, 128, dtype=torch.float32, seed=7)
+        std = batched_newton_schulz(
+            x.clone(),
+            DEFAULT_NS_COEFFICIENTS,
+            DEFAULT_NS_STEPS,
+            eps=1e-7,
+            compute_dtype=torch.float32,
+        )
+        # No restart + same coeffs => Gram rearrangement should match standard NS.
+        gram = batched_gram_newton_schulz(
+            x.clone(),
+            ns_coefficients=DEFAULT_NS_COEFFICIENTS,
+            ns_steps=DEFAULT_NS_STEPS,
+            eps=1e-7,
+            reset_iterations=(),
+            compute_dtype=torch.float32,
+        )
+        torch.testing.assert_close(gram.float(), std.float(), atol=5e-3, rtol=5e-3)
+
+    def test_3d_batch_shape(self):
+        g = torch.Generator().manual_seed(0)
+        x = torch.randn(4, 16, 64, generator=g, dtype=torch.float32)
+        out = batched_gram_newton_schulz(x, reset_iterations=(2,), compute_dtype=torch.float32)
+        assert out.shape == x.shape
+        assert torch.isfinite(out).all()
+
+    def test_run_dispatch_gram_torch(self):
+        x = _sample_2d(16, 64, dtype=torch.float32, seed=1)
+        out = run_newton_schulz(
+            x,
+            ns_coefficients=DEFAULT_NS_COEFFICIENTS,
+            ns_steps=5,
+            ns_implementation="gram",
+            gram_ns_reset_iterations=(2,),
+            compute_dtype=torch.float32,
+        )
+        assert out.shape == x.shape
+        assert torch.isfinite(out).all()
+
+    @pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="CUDA required")
+    def test_package_kernel_or_hardware_fallback(self, monkeypatch):
+        import veomni.optim.muon as muon_mod
+
+        pytest.importorskip("gram_newton_schulz")
+        monkeypatch.setattr(muon_mod, "_GRAM_QUACK_FALLBACK_WARNED", False)
+        x = torch.randn(2, 256, 1024, device=get_device_type(), dtype=torch.bfloat16)
+        out = run_newton_schulz(
+            x,
+            ns_coefficients=DEFAULT_NS_COEFFICIENTS,
+            ns_steps=5,
+            ns_implementation="gram_quack",
+            gram_ns_reset_iterations=(2,),
+        )
+        assert out.shape == x.shape
+        assert torch.isfinite(out).all()
+        assert muon_mod._GRAM_QUACK_FALLBACK_WARNED is (get_gpu_compute_capability(x.device) < 90)
+
+    def test_distributed_muon_accepts_gram_flags(self):
+        p = nn.Parameter(torch.randn(8, 16))
+        opt = DistributedMuon(
+            [p],
+            lr=1e-3,
+            ns_implementation="gram",
+            gram_ns_reset_iterations=(2,),
+        )
+        p.grad = torch.randn_like(p)
+        opt.step()
+        assert torch.isfinite(p).all()
+
+
+class TestMuonLrResolution:
+    def test_muon_lr_inherits_adamw_lr_under_match_rms(self):
+        from veomni.optim import build_optimizer
+
+        model = _toy_model()
+        opt = build_optimizer(
+            model,
+            lr=1.5e-4,
+            weight_decay=0.01,
+            optimizer_type="muon",
+            muon_kwargs={"adjust_lr_fn": "match_rms_adamw"},  # no explicit lr
+        )
+        muon_opt = opt.optimizers_dict["muon"]
+        assert muon_opt.param_groups[0]["lr"] == pytest.approx(1.5e-4)
+
+    def test_muon_lr_original_defaults_to_25x(self):
+        from veomni.optim import build_optimizer
+
+        model = _toy_model()
+        opt = build_optimizer(
+            model,
+            lr=1e-4,
+            weight_decay=0.01,
+            optimizer_type="muon",
+            muon_kwargs={"adjust_lr_fn": "original"},
+        )
+        muon_opt = opt.optimizers_dict["muon"]
+        assert muon_opt.param_groups[0]["lr"] == pytest.approx(2.5e-3)
+
+    def test_muon_lr_explicit_wins(self):
+        from veomni.optim import build_optimizer
+
+        model = _toy_model()
+        opt = build_optimizer(
+            model,
+            lr=1e-4,
+            weight_decay=0.01,
+            optimizer_type="muon",
+            muon_kwargs={"lr": 3e-3, "adjust_lr_fn": "match_rms_adamw"},
+        )
+        muon_opt = opt.optimizers_dict["muon"]
+        assert muon_opt.param_groups[0]["lr"] == pytest.approx(3e-3)
+
+
+class TestGramQuackFallback:
+    def test_gram_quack_falls_back_without_package(self, monkeypatch):
+        import veomni.optim.muon as muon_mod
+
+        monkeypatch.setattr(muon_mod, "_GRAM_QUACK_FALLBACK_WARNED", False)
+        monkeypatch.setattr(muon_mod, "_gram_quack_unavailable_reason", lambda _grad: None)
+        call_count = 0
+
+        def _boom(*_a, **_k):
+            nonlocal call_count
+            call_count += 1
+            raise ImportError("quack missing for test")
+
+        monkeypatch.setattr(muon_mod, "_package_gram_newton_schulz", _boom)
+        x = _sample_2d(8, 16, dtype=torch.float32, seed=0)
+        out = run_newton_schulz(
+            x,
+            ns_implementation="gram_quack",
+            gram_ns_reset_iterations=(2,),
+            compute_dtype=torch.float32,
+        )
+        assert out.shape == x.shape
+        assert torch.isfinite(out).all()
+        assert muon_mod._GRAM_QUACK_FALLBACK_WARNED is True
+        assert call_count == 1
+
+    def test_gram_quack_falls_back_on_pre_hopper_cuda(self, monkeypatch):
+        import veomni.optim.muon as muon_mod
+
+        device_type = get_device_type()
+        monkeypatch.setattr(muon_mod, "IS_CUDA_AVAILABLE", True)
+        monkeypatch.setattr(muon_mod, "get_device_type", lambda: device_type)
+        queried_devices = []
+        monkeypatch.setattr(
+            muon_mod, "get_gpu_compute_capability", lambda device: queried_devices.append(device) or 80
+        )
+        grad = type("FakeTensor", (), {"device": torch.device(f"{device_type}:1")})()
+        assert "compute capability 8.0" in muon_mod._gram_quack_unavailable_reason(grad)
+        assert queried_devices == [grad.device]
+
+    def test_gram_quack_falls_back_without_cuda(self, monkeypatch):
+        import veomni.optim.muon as muon_mod
+
+        monkeypatch.setattr(muon_mod, "IS_CUDA_AVAILABLE", False)
+        monkeypatch.setattr(muon_mod, "_GRAM_QUACK_FALLBACK_WARNED", False)
+
+        def _unexpected(*_a, **_k):
+            raise AssertionError("package backend should not be called for non-CUDA tensors")
+
+        monkeypatch.setattr(muon_mod, "_package_gram_newton_schulz", _unexpected)
+        x = _sample_2d(8, 16, dtype=torch.float32, seed=0)
+        out = run_newton_schulz(
+            x,
+            ns_implementation="gram_quack",
+            gram_ns_reset_iterations=(2,),
+            compute_dtype=torch.float32,
+        )
+        assert out.shape == x.shape
+        assert torch.isfinite(out).all()
+        assert muon_mod._GRAM_QUACK_FALLBACK_WARNED is True
+
+    def test_gram_quack_propagates_unknown_not_implemented(self, monkeypatch):
+        import veomni.optim.muon as muon_mod
+
+        monkeypatch.setattr(muon_mod, "_gram_quack_unavailable_reason", lambda _grad: None)
+
+        def _boom(*_a, **_k):
+            raise NotImplementedError("unexpected kernel limitation")
+
+        monkeypatch.setattr(muon_mod, "_package_gram_newton_schulz", _boom)
+        x = _sample_2d(8, 16, dtype=torch.float32, seed=0)
+        with pytest.raises(NotImplementedError, match="unexpected kernel limitation"):
+            run_newton_schulz(
+                x,
+                ns_implementation="gram_quack",
+                gram_ns_reset_iterations=(2,),
+                compute_dtype=torch.float32,
+            )
+
+    def test_gram_quack_uses_package_on_hopper(self, monkeypatch):
+        import veomni.optim.muon as muon_mod
+
+        device_type = get_device_type()
+        monkeypatch.setattr(muon_mod, "IS_CUDA_AVAILABLE", True)
+        monkeypatch.setattr(muon_mod, "get_device_type", lambda: device_type)
+        monkeypatch.setattr(muon_mod, "get_gpu_compute_capability", lambda _device: 90)
+        grad = type("FakeTensor", (), {"device": torch.device(device_type)})()
+        assert muon_mod._gram_quack_unavailable_reason(grad) is None

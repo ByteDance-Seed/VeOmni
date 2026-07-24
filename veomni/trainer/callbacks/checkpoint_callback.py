@@ -149,6 +149,11 @@ class CheckpointerCallback(Callback):
 
         self._load_extra_state(state["extra_state"])
 
+        # Free transient buffers from DCP materialization before the first train step.
+        # Large MoE resumes are often near GPU capacity; leftover allocator fragments
+        # after load can OOM the first NCCL collective (e.g. grad-norm all-reduce).
+        helper.empty_cache()
+
         dist.barrier()
         logger.info_rank0(f"Load distributed checkpoint from {load_dir} successfully!")
 
