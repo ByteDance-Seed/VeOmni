@@ -6,15 +6,17 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+import torch.distributed.checkpoint as dcp
 from safetensors.torch import save_file
 from torch import distributed as dist
 from torch import nn
+from torch.distributed.device_mesh import DeviceMesh
 
 from veomni.arguments import DataArguments, ModelArguments, TrainingArguments, parse_args
 from veomni.distributed.parallel_plan import ParallelPlan
 from veomni.distributed.parallel_state import init_parallel_state
-from veomni.distributed.torch_parallelize import build_parallelize_model
-from veomni.models.module_utils import load_model_weights, rank0_load_and_broadcast_weights
+from veomni.distributed.torch_parallelize import _move_model_buffers_to_device, build_parallelize_model
+from veomni.models.module_utils import init_empty_weights, load_model_weights, rank0_load_and_broadcast_weights
 from veomni.utils import helper
 from veomni.utils.device import get_device_type, get_dist_comm_backend, get_torch_device
 
@@ -34,8 +36,8 @@ logger = helper.create_logger(__name__)
 class BroadcastTestArguments:
     weights_path: str = ""
     device_type: str = get_device_type()
-    backend: str = get_dist_comm_backend()
-    mode: str = "broadcast"  # "broadcast" | "load_weights"
+    backend: str = ""
+    mode: str = "broadcast"  # "broadcast" | "load_weights" | "offload_training"
 
 
 @dataclass
@@ -172,6 +174,24 @@ class ToyModel(torch.nn.Module):
         self.linear3.bias.data.fill_(2.0)
 
 
+class ToyBufferModel(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.linear = nn.Linear(4, 2)
+        self.register_buffer("offset", torch.tensor([0.25, -0.5]))
+        self.register_buffer("scale", torch.tensor(0.75), persistent=False)
+        self.config = SimpleNamespace(tie_word_embeddings=False)
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        return self.linear(inputs) * self.scale + self.offset
+
+    def init_weights(self) -> None:
+        nn.init.xavier_uniform_(self.linear.weight)
+        self.linear.bias.data.fill_(0.125)
+        self.offset.copy_(torch.tensor([0.25, -0.5], device=self.offset.device))
+        self.scale.fill_(0.75)
+
+
 def _write_checkpoint(checkpoint_dir: Path, is_parallel: bool) -> str:
     torch.manual_seed(0)
     if is_parallel:
@@ -185,6 +205,15 @@ def _write_checkpoint(checkpoint_dir: Path, is_parallel: bool) -> str:
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     logger.info(f"Saving checkpoint to {checkpoint_dir}")
     save_file(state_dict, str(checkpoint_dir / "model.safetensors"))
+    return str(checkpoint_dir)
+
+
+def _write_buffer_checkpoint(checkpoint_dir: Path) -> str:
+    torch.manual_seed(2026)
+    model = ToyBufferModel()
+    model.init_weights()
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    save_file(model.state_dict(), str(checkpoint_dir / "model.safetensors"))
     return str(checkpoint_dir)
 
 
@@ -210,13 +239,226 @@ def _assert_model_parameters_on_device(model: nn.Module, expected_device_type: s
         )
 
 
+def _assert_model_buffers_on_device(model: nn.Module, expected_device_type: str) -> None:
+    for name, buffer in model.named_buffers():
+        local_buffer = buffer.to_local() if DTensor is not None and isinstance(buffer, DTensor) else buffer
+        assert local_buffer.device.type == expected_device_type, (
+            f"Expected buffer {name} to be on {expected_device_type}, got {local_buffer.device.type}."
+        )
+
+
+def _assert_model_gradients_on_device(model: nn.Module, expected_device_type: str) -> None:
+    gradient_count = 0
+    for name, parameter in model.named_parameters():
+        if parameter.grad is None:
+            continue
+        gradient_count += 1
+        gradient = parameter.grad
+        local_gradient = gradient.to_local() if DTensor is not None and isinstance(gradient, DTensor) else gradient
+        assert local_gradient.device.type == expected_device_type, (
+            f"Expected gradient {name} to be on {expected_device_type}, got {local_gradient.device.type}."
+        )
+    assert gradient_count > 0, "Expected the training step to produce gradients."
+
+
+def _assert_optimizer_moments_on_device(optimizer: torch.optim.Optimizer, expected_device_type: str) -> None:
+    assert optimizer.state, "Expected the optimizer step to initialize optimizer state."
+    moment_count = 0
+    for state in optimizer.state.values():
+        for name in ("exp_avg", "exp_avg_sq"):
+            assert name in state, f"Expected optimizer state to contain {name}."
+            moment_count += 1
+            moment = state[name]
+            local_moment = moment.to_local() if DTensor is not None and isinstance(moment, DTensor) else moment
+            assert local_moment.device.type == expected_device_type, (
+                f"Expected optimizer state {name} to be on {expected_device_type}, got {local_moment.device.type}."
+            )
+    assert moment_count > 0, "Expected at least one optimizer moment tensor."
+
+
+def test_move_model_buffers_to_device_preserves_parameters_and_persistence() -> None:
+    model = nn.Sequential(nn.Linear(2, 2))
+    model.register_buffer("persistent_buffer", torch.ones(2))
+    runtime_buffer = torch.ones(3)
+    model[0].register_buffer("runtime_buffer", runtime_buffer, persistent=False)
+    model.register_buffer("runtime_buffer_alias", runtime_buffer, persistent=False)
+    model.register_buffer("optional_buffer", None)
+
+    parameter_devices = {name: parameter.device for name, parameter in model.named_parameters()}
+    moved_count, moved_bytes = _move_model_buffers_to_device(model, torch.device("meta"))
+
+    assert moved_count == 2
+    assert moved_bytes == 5 * torch.tensor([], dtype=torch.float32).element_size()
+    assert {name: parameter.device for name, parameter in model.named_parameters()} == parameter_devices
+    assert model.persistent_buffer.device.type == "meta"
+    assert model[0].runtime_buffer.device.type == "meta"
+    assert model.runtime_buffer_alias is model[0].runtime_buffer
+    assert model.optional_buffer is None
+    assert "persistent_buffer" in model.state_dict()
+    assert "0.runtime_buffer" not in model.state_dict()
+    assert "runtime_buffer_alias" not in model.state_dict()
+
+
+@pytest.mark.skipif(DTensor is None, reason="DTensor required")
+def test_move_model_buffers_to_device_preserves_dtensor_aliases(tmp_path: Path) -> None:
+    if dist.is_initialized():
+        pytest.skip("Test requires ownership of the default process group.")
+
+    dist.init_process_group(
+        backend="gloo",
+        init_method=f"file://{tmp_path / 'process_group'}",
+        rank=0,
+        world_size=1,
+    )
+    try:
+        mesh = DeviceMesh("cpu", [0])
+        buffer = DTensor.from_local(torch.ones(3), mesh, [Replicate()])
+        model = nn.Module()
+        model.register_buffer("distributed_buffer", buffer)
+        model.register_buffer("distributed_buffer_alias", buffer, persistent=False)
+
+        moved_count, moved_bytes = _move_model_buffers_to_device(model, torch.device("meta"))
+
+        assert moved_count == 1
+        assert moved_bytes == 3 * torch.tensor([], dtype=torch.float32).element_size()
+        assert isinstance(model.distributed_buffer, DTensor)
+        assert model.distributed_buffer.to_local().device.type == "meta"
+        assert model.distributed_buffer_alias is model.distributed_buffer
+    finally:
+        dist.destroy_process_group()
+
+
+def run_fsdp_cpu_offload_training_test(args: Arguments) -> None:
+    weights_path = Path(args.test.weights_path)
+    if not weights_path.exists():
+        raise ValueError("`--test.weights_path` must point to an existing directory.")
+
+    get_torch_device().set_device(args.train.local_rank)
+    dist.init_process_group(backend=args.test.backend or get_dist_comm_backend())
+
+    parallel_state = init_parallel_state(
+        dp_size=args.train.accelerator.dp_size,
+        dp_replicate_size=args.train.accelerator.dp_replicate_size,
+        dp_shard_size=args.train.accelerator.dp_shard_size,
+        tp_size=args.train.accelerator.tp_size,
+        pp_size=args.train.accelerator.pp_size,
+        cp_size=args.train.accelerator.cp_size,
+        ulysses_size=args.train.accelerator.ulysses_size,
+        dp_mode=args.train.accelerator.fsdp_config.fsdp_mode,
+    )
+
+    try:
+        reference_model = ToyBufferModel().to(get_device_type())
+        load_model_weights(reference_model, str(weights_path), init_device=get_device_type())
+
+        with init_empty_weights():
+            fsdp_model = ToyBufferModel()
+        assert all(parameter.is_meta for parameter in fsdp_model.parameters())
+        fsdp_model = build_parallelize_model(
+            fsdp_model,
+            weights_path=str(weights_path),
+            init_device=args.train.init_device,
+            mixed_precision=args.train.accelerator.fsdp_config.mixed_precision,
+            enable_gradient_checkpointing=False,
+            enable_fsdp_offload=True,
+            fsdp_offload_pin_memory=False,
+            basic_modules=[],
+        )
+
+        _assert_model_parameters_on_device(fsdp_model, "cpu")
+        _assert_model_buffers_on_device(fsdp_model, get_device_type())
+
+        fsdp_optimizer = torch.optim.AdamW(fsdp_model.parameters(), lr=1e-2, weight_decay=0.0)
+        reference_optimizer = torch.optim.AdamW(reference_model.parameters(), lr=1e-2, weight_decay=0.0)
+        inputs = torch.tensor(
+            [[0.5, -1.0, 1.5, 2.0], [-0.25, 0.75, 1.25, -1.5]],
+            device=get_device_type(),
+        )
+
+        fsdp_output = fsdp_model(inputs)
+        reference_output = reference_model(inputs)
+        torch.testing.assert_close(fsdp_output, reference_output, atol=1e-6, rtol=1e-6)
+
+        fsdp_output.square().mean().backward()
+        reference_output.square().mean().backward()
+        _assert_model_gradients_on_device(fsdp_model, "cpu")
+        fsdp_optimizer.step()
+        reference_optimizer.step()
+
+        _assert_model_parameters_on_device(fsdp_model, "cpu")
+        _assert_model_buffers_on_device(fsdp_model, get_device_type())
+        _assert_optimizer_moments_on_device(fsdp_optimizer, "cpu")
+
+        with torch.no_grad():
+            resumed_offset = torch.tensor([1.5, -2.0], device=get_device_type())
+            fsdp_model.offset.copy_(resumed_offset)
+            reference_model.offset.copy_(resumed_offset)
+
+        fsdp_updated_output = fsdp_model(inputs)
+        reference_updated_output = reference_model(inputs)
+        torch.testing.assert_close(fsdp_updated_output, reference_updated_output, atol=1e-5, rtol=1e-5)
+
+        checkpoint_dir = weights_path.parent / "dcp_cold_resume"
+        from veomni.checkpoint.dcp_checkpointer import ModelState
+
+        dcp.save(
+            {"model": ModelState(fsdp_model, parallel_state=parallel_state)},
+            checkpoint_id=checkpoint_dir,
+        )
+
+        with init_empty_weights():
+            resumed_model = ToyBufferModel()
+        assert all(parameter.is_meta for parameter in resumed_model.parameters())
+        resumed_model = build_parallelize_model(
+            resumed_model,
+            weights_path="unused-hf-path",
+            init_device=args.train.init_device,
+            mixed_precision=args.train.accelerator.fsdp_config.mixed_precision,
+            enable_gradient_checkpointing=False,
+            enable_fsdp_offload=True,
+            fsdp_offload_pin_memory=False,
+            should_skip_hf_weight_load=True,
+            basic_modules=[],
+        )
+        _assert_model_parameters_on_device(resumed_model, "cpu")
+        _assert_model_buffers_on_device(resumed_model, get_device_type())
+        torch.testing.assert_close(
+            resumed_model.scale,
+            torch.tensor(0.75, device=get_device_type()),
+            atol=0.0,
+            rtol=0.0,
+        )
+
+        dcp.load(
+            {"model": ModelState(resumed_model, parallel_state=parallel_state)},
+            checkpoint_id=checkpoint_dir,
+        )
+        _assert_model_parameters_on_device(resumed_model, "cpu")
+        _assert_model_buffers_on_device(resumed_model, get_device_type())
+        torch.testing.assert_close(resumed_model.offset, resumed_offset, atol=0.0, rtol=0.0)
+        torch.testing.assert_close(
+            resumed_model.scale,
+            torch.tensor(0.75, device=get_device_type()),
+            atol=0.0,
+            rtol=0.0,
+        )
+        torch.testing.assert_close(resumed_model(inputs), reference_updated_output, atol=1e-5, rtol=1e-5)
+
+        dist.barrier()
+    finally:
+        dist.destroy_process_group()
+        from veomni.distributed.parallel_state import clear_parallel_state
+
+        clear_parallel_state()
+
+
 def run_rank0_broadcast_test(args: Arguments) -> None:
     weights_path = Path(args.test.weights_path)
     if not weights_path.exists():
         raise ValueError("`--test.weights_path` must point to an existing directory.")
 
     get_torch_device().set_device(args.train.local_rank)
-    dist.init_process_group(backend=args.test.backend)
+    dist.init_process_group(backend=args.test.backend or get_dist_comm_backend())
 
     init_parallel_state(
         dp_size=args.train.accelerator.dp_size,
@@ -399,7 +641,10 @@ def run_rank0_broadcast_test(args: Arguments) -> None:
         clear_parallel_state()
 
 
-@pytest.mark.skipif(not dist.is_available(), reason="torch.distributed required")
+@pytest.mark.skipif(
+    not dist.is_available() or get_device_type() == "cpu",
+    reason="Distributed FSDP2 weight loading test requires an accelerator",
+)
 @pytest.mark.parametrize("cpu_offload", [False, True], ids=["no_offload", "cpu_offload"])
 def test_load_dist_model_weights_matches_standard(tmp_path: Path, cpu_offload: bool) -> None:
     checkpoint_dir = tmp_path / "ckpt"
@@ -451,7 +696,7 @@ def run_load_weights_test(args: Arguments) -> None:
         raise ValueError("`--test.weights_path` must point to an existing directory.")
 
     get_torch_device().set_device(args.train.local_rank)
-    dist.init_process_group(backend=args.test.backend)
+    dist.init_process_group(backend=args.test.backend or get_dist_comm_backend())
 
     init_parallel_state(
         dp_size=args.train.accelerator.dp_size,
@@ -566,7 +811,10 @@ def run_load_weights_test(args: Arguments) -> None:
         clear_parallel_state()
 
 
-@pytest.mark.skipif(not dist.is_available(), reason="torch.distributed required")
+@pytest.mark.skipif(
+    not dist.is_available() or get_device_type() == "cpu",
+    reason="Distributed FSDP2 weight loading test requires an accelerator",
+)
 @pytest.mark.parametrize("cpu_offload", [False, True], ids=["no_offload", "cpu_offload"])
 def test_load_weights_no_scatter(tmp_path: Path, cpu_offload: bool) -> None:
     """
@@ -607,9 +855,44 @@ def test_load_weights_no_scatter(tmp_path: Path, cpu_offload: bool) -> None:
     assert result.returncode == 0
 
 
+@pytest.mark.skipif(
+    not dist.is_available() or get_device_type() == "cpu",
+    reason="FSDP2 CPU-offload device residency requires an accelerator",
+)
+def test_fsdp_cpu_offload_training_keeps_buffers_on_compute_device(tmp_path: Path) -> None:
+    if get_torch_device().device_count() < 2:
+        pytest.skip("FSDP2 CPU-offload residency gate requires at least two accelerator devices.")
+
+    weights_path = _write_buffer_checkpoint(tmp_path / "ckpt")
+    world_size = 2
+    port = 12345 + random.randint(0, 100)
+    command = [
+        "torchrun",
+        f"--nproc_per_node={world_size}",
+        f"--master_port={port}",
+        "tests/utils/test_rank0_load_and_broadcast_weights.py",
+        "--model.config_path=test",
+        "--data.train_path=tests",
+        "--train.checkpoint.output_dir=.tests/cache",
+        "--train.accelerator.fsdp_config.fsdp_mode=fsdp2",
+        "--train.init_device=meta",
+        "--train.accelerator.fsdp_config.mixed_precision.enable=False",
+        "--train.gradient_checkpointing.enable=False",
+        f"--test.weights_path={weights_path}",
+        f"--test.device_type={get_device_type()}",
+        f"--test.backend={get_dist_comm_backend()}",
+        "--test.mode=offload_training",
+    ]
+
+    result = subprocess.run(command, check=True)
+    assert result.returncode == 0
+
+
 if __name__ == "__main__":
     args = parse_args(Arguments)
-    if getattr(args.test, "mode", "broadcast") == "load_weights":
+    if getattr(args.test, "mode", "broadcast") == "offload_training":
+        run_fsdp_cpu_offload_training_test(args)
+    elif getattr(args.test, "mode", "broadcast") == "load_weights":
         run_load_weights_test(args)
     else:
         run_rank0_broadcast_test(args)
