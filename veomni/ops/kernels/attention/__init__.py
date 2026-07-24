@@ -307,23 +307,89 @@ def flash_attention_forward(
             f"unknown attn_implementation for veomni flash_attention with SP support: {module.config._attn_implementation}"
         )
 
-    attn_output = _flash_attention_forward(
-        query,
-        key,
-        value,
-        attention_mask,
-        query_length=seq_len,
-        is_causal=is_causal,
-        dropout=dropout,
-        softmax_scale=scaling,
-        sliding_window=sliding_window,
-        softcap=softcap,
-        use_top_left_mask=False,
-        target_dtype=target_dtype,
-        attn_implementation=fa_kernel_implementation,
-        layer_idx=module.layer_idx if hasattr(module, "layer_idx") else None,
-        **kwargs,
-    )
+    # USP ring-attention (context-parallel) branch.
+    #
+    # When ``cp_size > 1`` the sequence is additionally split across the ``cp``
+    # mesh dimension and attention is computed with zig-zag ring attention over
+    # the ``cp`` group. This composes with Ulysses: the Ulysses all-to-all above
+    # already restored the full ``cp``-local sequence with a head subset, so the
+    # ring only needs to span the ``cp`` group. The data collator lays the
+    # sequence out in zig-zag block order (see ``SequenceParallelCollator`` /
+    # ``sequence_parallel.data.zigzag_reorder``), so causal attention is balanced
+    # across ``cp`` ranks. Requires FA2 (flash-attn) and causal attention. Both
+    # dense and packed (varlen) sequences are supported: packed documents take
+    # the ``zigzag_ring_flash_attn_varlen_func`` path with per-document LOCAL
+    # cu_seqlens derived from the FULL ``cu_seq_lens_q``.
+    cp_state = get_parallel_state()
+    if cp_state.cp_enabled:
+        from ....distributed.sequence_parallel.data import local_cu_seqlens
+        from ....distributed.sequence_parallel.ring_attention import (
+            zigzag_ring_flash_attn_func,
+            zigzag_ring_flash_attn_varlen_func,
+        )
+
+        if not is_causal:
+            raise NotImplementedError("context-parallel (cp_size>1) ring attention requires causal attention")
+        if attention_mask is not None:
+            raise NotImplementedError(
+                "context-parallel (cp_size>1) ring attention does not support explicit attention masks"
+            )
+        # ``cu_seq_lens_q`` (when present) is computed by the collator on the FULL
+        # (pre-slice) packed position_ids, so it describes the whole sequence
+        # across the ``cp`` group. A single ``[0, S]`` segment is a plain
+        # (non-packed) sequence and takes the dense ring path; multiple segments
+        # are genuinely packed documents and take the varlen ring path, where
+        # each document is zig-zag split independently across ``cp`` (see
+        # ``SequenceParallelCollator`` / ``sequence_parallel.data``).
+        cu_seq_lens_q = kwargs.get("cu_seq_lens_q")
+        is_packed = cu_seq_lens_q is not None and cu_seq_lens_q.numel() > 2
+        # query/key/value are (b, s, h, d) here (already transposed for FA).
+        if is_packed:
+            # Derive the per-rank LOCAL document offsets for this cp-region: every
+            # document is split evenly across ``cp`` so each local document length
+            # is ``doc_len // cp_size``. ``varlen`` FA wants ``(total, h, d)``.
+            local_cu = local_cu_seqlens(cu_seq_lens_q.to(torch.int32), cp_state.cp_size)
+            seqlens = local_cu[1:] - local_cu[:-1]
+            local_max = int(seqlens.max().item()) if seqlens.numel() else 0
+            q3, k3, v3 = query.squeeze(0), key.squeeze(0), value.squeeze(0)
+            attn_output = zigzag_ring_flash_attn_varlen_func(
+                q3,
+                k3,
+                v3,
+                local_cu,
+                local_max,
+                softmax_scale=scaling,
+                causal=True,
+                group=cp_state.cp_group,
+            )
+            attn_output = attn_output.unsqueeze(0)
+        else:
+            attn_output = zigzag_ring_flash_attn_func(
+                query,
+                key,
+                value,
+                softmax_scale=scaling,
+                causal=True,
+                group=cp_state.cp_group,
+            )
+    else:
+        attn_output = _flash_attention_forward(
+            query,
+            key,
+            value,
+            attention_mask,
+            query_length=seq_len,
+            is_causal=is_causal,
+            dropout=dropout,
+            softmax_scale=scaling,
+            sliding_window=sliding_window,
+            softcap=softcap,
+            use_top_left_mask=False,
+            target_dtype=target_dtype,
+            attn_implementation=fa_kernel_implementation,
+            layer_idx=module.layer_idx if hasattr(module, "layer_idx") else None,
+            **kwargs,
+        )
 
     # Ulysses patch
     if ulysses_enabled and not skip_ulysses:

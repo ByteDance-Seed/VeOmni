@@ -296,3 +296,129 @@ def sp_take_own_seq(full: Tensor, dim: int, seg_lengths: List[int], sp_rank: int
         return full
     offset = sum(seg_lengths[:sp_rank])
     return full.narrow(dim, offset, seg_lengths[sp_rank])
+
+
+# ── Zig-zag reordering for USP ring attention ──────────────────────────────
+#
+# Balanced causal ring attention (see ``ring_attention.zigzag_ring_flash_attn``)
+# requires the sequence to be laid out so that context-parallel rank ``r`` owns
+# blocks ``r`` and ``2*cp-1-r`` of a ``2*cp``-way split. ``zigzag_reorder``
+# permutes the FULL (pre-slice) sequence so that a subsequent CONTIGUOUS slice
+# into ``cp`` equal chunks hands each cp-rank exactly those two blocks (in the
+# ``[low_block, high_block]`` order the kernel expects). ``zigzag_undo`` is the
+# inverse permutation, applied to per-rank outputs after they are gathered.
+
+
+def zigzag_block_order(cp_size: int) -> List[int]:
+    """Return the block permutation that maps zig-zag block layout to rank order.
+
+    With ``2*cp_size`` blocks, cp-rank ``r`` owns blocks ``r`` and
+    ``2*cp_size-1-r``. Concatenating each rank's ``[r, 2*cp-1-r]`` blocks in rank
+    order yields the permutation ``[0, 2c-1, 1, 2c-2, ...]`` over the original
+    block indices.
+    """
+    order = []
+    for r in range(cp_size):
+        order.append(r)
+        order.append(2 * cp_size - 1 - r)
+    return order
+
+
+def zigzag_reorder(tensor: Tensor, dim: int, cp_size: int) -> Tensor:
+    """Permute ``tensor`` along ``dim`` into zig-zag block order.
+
+    ``tensor`` length along ``dim`` must be divisible by ``2 * cp_size``. After
+    reordering, a contiguous split into ``cp_size`` chunks gives cp-rank ``r``
+    its ``[block r, block 2*cp-1-r]`` pair.
+    """
+    if cp_size <= 1:
+        return tensor
+    n_blocks = 2 * cp_size
+    seq = tensor.size(dim)
+    assert seq % n_blocks == 0, f"seq len {seq} not divisible by 2*cp_size ({n_blocks})"
+    blocks = list(torch.tensor_split(tensor, n_blocks, dim=dim))
+    order = zigzag_block_order(cp_size)
+    return torch.cat([blocks[i].contiguous() for i in order], dim=dim)
+
+
+def zigzag_undo(tensor: Tensor, dim: int, cp_size: int) -> Tensor:
+    """Inverse of :func:`zigzag_reorder` — restore the original block order."""
+    if cp_size <= 1:
+        return tensor
+    n_blocks = 2 * cp_size
+    seq = tensor.size(dim)
+    assert seq % n_blocks == 0, f"seq len {seq} not divisible by 2*cp_size ({n_blocks})"
+    blocks = list(torch.tensor_split(tensor, n_blocks, dim=dim))
+    order = zigzag_block_order(cp_size)
+    inverse = [0] * n_blocks
+    for new_pos, orig in enumerate(order):
+        inverse[orig] = new_pos
+    return torch.cat([blocks[inverse[i]].contiguous() for i in range(n_blocks)], dim=dim)
+
+
+# ── Per-document zig-zag reordering for USP varlen (packed) ring attention ──
+#
+# Packed sequences hold several documents concatenated along the sequence dim.
+# For balanced causal ring attention over ``cp`` each document must be
+# INDEPENDENTLY zig-zag split across the ``cp`` group. ``zigzag_reorder_varlen``
+# permutes each document's tokens into zig-zag block order so a subsequent
+# CONTIGUOUS split into ``cp_size`` chunks hands cp-rank ``r`` its
+# ``[block r, block 2*cp-1-r]`` pair FOR EVERY DOCUMENT. Every document length
+# must be divisible by ``2 * cp_size``.
+
+
+def zigzag_reorder_varlen(tensor: Tensor, cu_seqlens: "torch.Tensor", dim: int, cp_size: int) -> Tensor:
+    """Zig-zag reorder packed documents for a subsequent contiguous ``cp`` split.
+
+    Each document is split into ``2*cp_size`` blocks; cp-rank ``r`` owns blocks
+    ``r`` and ``2*cp_size-1-r`` of EVERY document. The output is laid out
+    ``rank``-major / ``document``-minor so a plain contiguous split into
+    ``cp_size`` chunks hands rank ``r`` its per-document ``[block r,
+    block 2*cp-1-r]`` pairs concatenated across documents (matching
+    :func:`local_cu_seqlens`). Every document length must be divisible by
+    ``2 * cp_size``.
+    """
+    if cp_size <= 1:
+        return tensor
+    cu = [int(x) for x in cu_seqlens.tolist()]
+    n_blocks = 2 * cp_size
+    # doc_blocks[i] holds the 2*cp block slices for document i.
+    doc_blocks = []
+    for i in range(len(cu) - 1):
+        start, end = cu[i], cu[i + 1]
+        seg_len = end - start
+        assert seg_len % n_blocks == 0, (
+            f"document length {seg_len} not divisible by 2*cp_size ({n_blocks}); "
+            "packed varlen under context-parallel requires every document length "
+            "to be a multiple of 2*cp_size"
+        )
+        seg = tensor.narrow(dim, start, seg_len)
+        doc_blocks.append(list(torch.tensor_split(seg, n_blocks, dim=dim)))
+    pieces = []
+    for r in range(cp_size):
+        for blocks in doc_blocks:
+            pieces.append(blocks[r])
+            pieces.append(blocks[n_blocks - 1 - r])
+    return torch.cat([p.contiguous() for p in pieces], dim=dim)
+
+
+def local_cu_seqlens(cu_seqlens: "torch.Tensor", cp_size: int) -> "torch.Tensor":
+    """Per-rank LOCAL cu_seqlens after per-document zig-zag slicing.
+
+    Each document's local length is ``doc_len // cp_size`` (this rank owns 2 of
+    the ``2*cp_size`` blocks). Returns a tensor of the same dtype/device.
+    """
+    if cp_size <= 1:
+        return cu_seqlens
+    cu = [int(x) for x in cu_seqlens.tolist()]
+    n_blocks = 2 * cp_size
+    local = [0]
+    for i in range(len(cu) - 1):
+        seg_len = cu[i + 1] - cu[i]
+        assert seg_len % n_blocks == 0, (
+            f"document length {seg_len} not divisible by 2*cp_size ({n_blocks}); "
+            "packed varlen under context-parallel requires every document length "
+            "to be a multiple of 2*cp_size"
+        )
+        local.append(local[-1] + seg_len // cp_size)
+    return torch.tensor(local, dtype=cu_seqlens.dtype, device=cu_seqlens.device)

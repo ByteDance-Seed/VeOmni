@@ -778,7 +778,11 @@ class TrainingArguments:
             )
         assert acc.tp_size == 1, "Tensor parallel size not supported yet."
         assert acc.pp_size == 1, "Pipeline parallel size not supported yet."
-        assert acc.cp_size == 1, "Context parallel size not supported yet."
+        # Context parallel (Ring-Attention) is supported as the ``cp`` half of USP
+        # (Unified Sequence Parallelism, https://arxiv.org/abs/2405.07719). It
+        # composes with Ulysses: the effective SP size is ``ulysses_size * cp_size``.
+        # Ring attention currently requires the causal, non-varlen path (no packing
+        # / cu_seqlens under ``cp``) and FA2 (flash-attn).
 
         acc.dp_size = self.world_size // (acc.pp_size * acc.ulysses_size * acc.cp_size * acc.tp_size)
 
