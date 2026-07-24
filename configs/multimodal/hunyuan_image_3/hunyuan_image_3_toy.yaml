@@ -1,0 +1,73 @@
+# Hunyuan Image 3 single_gen_t2i_v1 TOY end-to-end config (posterior_cache).
+#
+# Drives tasks/train_vlm.py + VLMTrainer over the tiny tests/toy_config model.
+# ``train.train_path`` and ``train.checkpoint.output_dir`` are provided on the CLI.
+# Single-GPU: init_device=cuda + mixed_precision.enable=false keeps params in bf16
+# (flash-attention GCA needs bf16) without FSDP (fsdp is inactive on one rank).
+model:
+  config_path: tests/toy_config/hunyuan_image_3_toy
+  ops_implementation:
+    attn_implementation: flash_attention_2
+    moe_implementation: eager
+
+data:
+  train_path: PLACEHOLDER_SET_ON_CLI
+  datasets_type: mapping
+  data_type: multimodal_generation
+  text_keys: prompt
+  max_seq_len: 128
+  dataloader:
+    num_workers: 0
+  image_generation:
+    task_type: t2i
+    latent_source: posterior_cache
+    prompt_dropout_prob: 0.0
+    default_base_size: 1024
+    # P3: posterior_cache samples don't carry ``width`` / ``height`` columns —
+    # the cached latent shape already fixes the geometry. Opt out of
+    # ``same_bucket_batching`` so the trainer skips ``BucketIndexer``; mbs=1
+    # here so heterogeneous batching isn't a concern either.
+    same_bucket_batching: false
+    resolution_policy:
+      preset: hunyuan_image_3_official_v1
+      anchors:
+        - base_size: 1024
+          weight: 1.0
+
+train:
+  component_policy:
+    transformer: trainable
+    text_embedding: trainable
+    image_projector: trainable
+    timestep_modules: trainable
+    image_head: trainable
+    vae_encoder: absent
+    vae_decoder: absent
+    vision_model: absent
+    vision_aligner: absent
+    lm_head: absent
+  flow:
+    num_train_timesteps: 1000
+    timestep_sampling: uniform
+    training_shift: 1.0
+    prediction_type: velocity
+    loss_weighting: uniform
+  dyn_bsz: false
+  micro_batch_size: 1
+  global_batch_size: 1
+  bsz_warmup_ratio: 0
+  num_train_epochs: 2
+  max_steps: 5
+  init_device: cuda
+  accelerator:
+    fsdp_config:
+      fsdp_mode: ddp
+      mixed_precision:
+        enable: false
+  optimizer:
+    lr: 1.0e-4
+  checkpoint:
+    output_dir: PLACEHOLDER_SET_ON_CLI
+    save_steps: 1000000
+  wandb:
+    enable: false

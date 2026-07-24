@@ -1346,9 +1346,11 @@ class DataArguments:
             "help": "Number of samples for training to compute training steps for non-dynamic batch dataloader."
         },
     )
-    data_type: Literal["plaintext", "conversation", "diffusion", "classification", "dpo"] = field(
-        default="conversation",
-        metadata={"help": "Type of the training data."},
+    data_type: Literal["plaintext", "conversation", "diffusion", "classification", "dpo", "multimodal_generation"] = (
+        field(
+            default="conversation",
+            metadata={"help": "Type of the training data."},
+        )
     )
     datasets_type: str = field(
         default="mapping",
@@ -1401,6 +1403,10 @@ class DataArguments:
                 self.text_keys = "text"
             elif self.data_type == "dpo":
                 self.text_keys = "chosen"
+            elif self.data_type == "multimodal_generation":
+                # T2I generation reads its prompt column; the model-local
+                # generation transform owns the rest of the schema.
+                self.text_keys = "prompt"
             else:
                 raise ValueError(f"Unknown data type: {self.data_type}")
 

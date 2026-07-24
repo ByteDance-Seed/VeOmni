@@ -15,7 +15,7 @@
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from dataclasses import asdict, dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, List, Literal, Optional, Sequence, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -121,6 +121,23 @@ class DataCollateInfo:
         default=1,
         metadata={"help": "sp_pad scale of a sequence in batch. Default is 1"},
     )
+    pack_mode: Literal["cat", "list"] = field(
+        default="cat",
+        metadata={
+            "help": (
+                "How PackingCollator combines per-sample tensors. ``cat`` (default) "
+                "runs ``torch.cat(dim=pack_dim)`` — the legacy behavior; every model "
+                "not overriding this keeps byte-identical output. ``list`` keeps the "
+                "batch as a Python ``list[Tensor]`` so downstream (model-owned "
+                "metadata hook / forward) can consume samples with heterogeneous "
+                "shapes, e.g. per-sample image buckets that would otherwise fail "
+                "the ``torch.cat`` shape check. When ``pack_mode='list'`` this "
+                "collator skips the cat/unsqueeze machinery for the key; SP-side "
+                "sp_pad/sp_slice for list features is already handled by "
+                "``SequenceParallelCollator``."
+            )
+        },
+    )
 
     def __post_init__(self):
         assert self.pack_dim is not None, "pack_dim must be specified"
@@ -132,6 +149,16 @@ class DataCollateInfo:
         assert (self.sp_pad_value is None) == (self.sp_pad_scale is None), (
             "sp_pad_value and sp_pad_scale must be specified together or None"
         )
+
+        if self.pack_mode not in ("cat", "list"):
+            raise ValueError(f"pack_mode must be 'cat' or 'list', got {self.pack_mode!r}.")
+        if self.pack_mode == "list" and self.sp_slice:
+            # sp_slice on a list means slicing along dim 0 (the sample list); that
+            # combination is meaningful but has never been exercised — the only
+            # current list-mode users (HI3 image staging) set sp_slice=False.
+            # Reject the combo eagerly so a future user notices instead of
+            # silently getting a truncated list.
+            raise ValueError("pack_mode='list' with sp_slice=True is not supported yet.")
 
 
 # pack_dim, sp_slice, sp_pad_value, sp_pad_scale
@@ -251,7 +278,8 @@ class PackingCollator(DataCollator):
 
         keys_to_pad = []
         for key in self.collate_infos.keys():
-            if self.collate_infos[key].pack_dim == -1:
+            if self.collate_infos[key].pack_dim == -1 and self.collate_infos[key].pack_mode == "cat":
+                # list-mode keys have no packed sequence axis to pad; skip.
                 keys_to_pad.append(key)
 
         for key in keys_to_pad:
@@ -288,6 +316,14 @@ class PackingCollator(DataCollator):
                 if key == "labels" and not self.seq_classification:
                     for i in range(1, len(batch[key])):
                         batch[key][i][0] = IGNORE_INDEX
+
+                if collate_info.pack_mode == "list":
+                    # Keep as List[Tensor] — used by model-owned pipelines whose
+                    # per-sample tensors have heterogeneous shapes (e.g. HI3
+                    # per-sample image buckets under mbs>1). ``batch[key]`` is
+                    # already a list; no cat/unsqueeze. SP-side sp_pad on lists
+                    # is handled by SequenceParallelCollator.sp_padding.
+                    continue
 
                 batch[key] = torch.cat(batch[key], dim=pack_dim)
                 if pack_dim == -1:

@@ -12,20 +12,29 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Model output dataclasses for the per-token fused-linear loss path.
+"""Shared model output dataclasses for the veomni model zoo.
 
-A patched ``*ForCausalLM.forward`` returns one of the ``*WithLogProbs``
-dataclasses below. When called with ``return_log_probs=True``, the
-``fused_linear_aux`` field carries a ``FusedLinearAuxOutput`` payload
-holding the per-token tensors verl's distillation and PPO consumers
-read; ``logits`` and ``loss`` are then ``None``. On the plain loss
-path ``fused_linear_aux`` is ``None`` and ``logits`` / ``loss`` are
-populated as usual.
+Two families live here:
 
-Two-level shape (nested payload + thin mixin) keeps the per-model
-subclass declarations to a single shared field — adding a new
-per-token metric only edits ``FusedLinearAuxOutput`` (one place),
-not every ``*WithLogProbs`` subclass + every patchgen ``forward``.
+1. ``*WithLogProbs`` dataclasses for the per-token fused-linear loss
+   path. A patched ``*ForCausalLM.forward`` returns one of these; when
+   called with ``return_log_probs=True``, the ``fused_linear_aux``
+   field carries a ``FusedLinearAuxOutput`` payload holding the
+   per-token tensors verl's distillation and PPO consumers read;
+   ``logits`` and ``loss`` are then ``None``. On the plain loss path
+   ``fused_linear_aux`` is ``None`` and ``logits`` / ``loss`` are
+   populated as usual.
+
+   Two-level shape (nested payload + thin mixin) keeps the per-model
+   subclass declarations to a single shared field — adding a new
+   per-token metric only edits ``FusedLinearAuxOutput`` (one place),
+   not every ``*WithLogProbs`` subclass + every patchgen ``forward``.
+
+2. Diffusion / reference-training outputs (e.g. HunyuanImage 3), which
+   don't fit the ``*WithLogProbs`` pattern but colocate here so per-model
+   output dataclasses have one home; GPU and NPU generated modeling
+   files can then share one definition.
+
 Imports are kept light (no ``veomni.data`` dependency) so external
 integrators (verl) can pull the dataclasses without paying the
 data-pipeline import cost.
@@ -42,6 +51,7 @@ from transformers.models.qwen2_vl.modeling_qwen2_vl import Qwen2VLCausalLMOutput
 from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import Qwen3OmniMoeThinkerCausalLMOutputWithPast
 from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLCausalLMOutputWithPast
 from transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe import Qwen3VLMoeCausalLMOutputWithPast
+from transformers.utils import ModelOutput
 
 
 @dataclass
@@ -199,3 +209,32 @@ class Qwen3OmniMoeThinkerCausalLMOutputWithLogProbs(
     __doc__ = (
         "``Qwen3OmniMoeThinkerCausalLMOutputWithPast`` + ``fused_linear_aux`` payload." + _FUSED_LINEAR_AUX_ARGS_DOC
     )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Diffusion / reference-training outputs.
+#
+# Not part of the fused-linear log-probs family, but colocated so per-model
+# output dataclasses have one home (see module docstring).
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+@dataclass
+class HunyuanImage3ReferenceOutput(ModelOutput):
+    """HunyuanImage 3 ``single_gen_t2i_v1`` reference forward output.
+
+    Populated by the patched ``HunyuanImage3ForCausalMM.forward``: the
+    flow-matching prediction + target, the sampled per-step noise / timestep
+    tensors, and the transformer hidden states used by downstream image
+    decoders. ``loss`` is a dict so image + auxiliary losses can be logged
+    separately.
+    """
+
+    loss: dict[str, torch.Tensor] | None = None
+    diffusion_prediction: torch.Tensor | None = None
+    flow_target: torch.Tensor | None = None
+    latents: torch.Tensor | None = None
+    noised_latents: torch.Tensor | None = None
+    sigmas: torch.Tensor | None = None
+    timesteps: torch.Tensor | None = None
+    transformer_hidden_states: torch.Tensor | None = None

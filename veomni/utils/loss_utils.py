@@ -59,6 +59,14 @@ def mean_global_loss(
     """Calcuate the global mean loss. Avg on all_reduced_token_num instead of on dp_size.
     - cur_losses[key] = cur_loss * cur_token_num / global_batches_token_num * get_parallel_state().fsdp_size
     # fsdp by default divides gradients by its size, so we need to multiply by fsdp_size
+
+    The formula is agnostic to whether the normalizer tokens are SP-sharded (e.g.
+    text CE over a sliced sequence) or SP-replicated (e.g. the Hunyuan Image 3
+    flow loss, which the model gathers before computing): under replicated data
+    both the SP-summed ``cur_token_len`` and the world-summed ``all_reduced_len``
+    scale up by ``sp_size`` and the ratio is preserved. The SP layout is decided
+    upstream by the data collator's per-key ``sp_slice`` flag; the reducer just
+    consumes the counts it is handed.
     """
     loss_dict = {}
 

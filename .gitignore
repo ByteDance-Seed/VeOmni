@@ -171,3 +171,11 @@ nsysoutput/
 
 # Agents worksspace should not be tracked by the primary repo.
 .agents_workspace/
+
+.claude/
+
+# Hunyuan Image 3 smoke / bucketing scratch workdirs (generated parquet, DCP
+# checkpoints, exported HF weights — can be hundreds of MB).
+.tests/
+.bucket_smoke_workdir/
+.throughput_smoke_workdir/

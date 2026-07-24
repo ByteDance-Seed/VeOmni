@@ -400,7 +400,16 @@ def parallelize_model_fsdp2(
     # to a freed buffer. Decoder layers reshard normally (their calls
     # above pass `reshard_after_forward` explicitly).
     root_fsdp_kwargs = {k: v for k, v in fsdp_kwargs.items() if k != "reshard_after_forward"}
-    fully_shard(model, **root_fsdp_kwargs)
+    # Opt-in: a model may declare params to keep OUT of FSDP entirely (unsharded, and
+    # not mixed-precision-cast) — e.g. a frozen FP32 VAE encoder that must stay
+    # replicated FP32 on every rank. The hook is called here, before the root
+    # fully_shard and (in the meta path) before to_empty/load, so a model can also fix
+    # those params' dtype at the right moment. No hook -> None -> default behavior, so
+    # every other model is unaffected.
+    root_ignored_params = None
+    if hasattr(model, "get_fsdp_ignored_params"):
+        root_ignored_params = model.get_fsdp_ignored_params() or None
+    fully_shard(model, **root_fsdp_kwargs, ignored_params=root_ignored_params)
 
     # configure manual prefetching when needed
     need_manual_prefetch = (

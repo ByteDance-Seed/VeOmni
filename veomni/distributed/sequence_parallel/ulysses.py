@@ -103,7 +103,12 @@ def _all_to_all_single(
             .contiguous()
         )
 
-    output = torch.empty_like(x)
+    # dist.all_to_all_single requires BOTH input and output to be contiguous.
+    # In the scatter_dim==0 branch we skip the pre-reshape, so ``x`` (e.g. an
+    # autograd grad_output) may be non-contiguous — torch.empty_like would then
+    # inherit those non-contig strides and NCCL would reject the output. Force
+    # contiguous memory format on the output regardless of x's layout.
+    output = torch.empty_like(x, memory_format=torch.contiguous_format)
     comm = dist.all_to_all_single(output, x.contiguous(), group=group, async_op=async_op)
 
     if async_op:

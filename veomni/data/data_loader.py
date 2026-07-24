@@ -89,6 +89,7 @@ def build_native_dataloader(
     collate_fn_kwargs: Optional[Dict[str, Any]] = None,
     multiprocessing_context=None,
     save_steps: int = 0,
+    batch_sampler: Optional["torch.utils.data.Sampler"] = None,
 ) -> "DistributedDataloader":
     """Build the native training dataloader.
 
@@ -138,6 +139,16 @@ def build_native_dataloader(
             Use ``"spawn"`` when worker-side code must be pickle-safe and should not
             inherit parent-process state; keep ``"fork"`` for the legacy Linux behavior.
             Example: ``multiprocessing_context="spawn"``.
+        batch_sampler: Optional custom batch sampler. When provided, replaces the
+            default ``StatefulDistributedSampler`` + ``batch_size=dataloader_batch_size``
+            wiring: the batch sampler owns per-rank sharding, shuffling, and the
+            per-batch index list. Mutually exclusive with ``dyn_bsz=True`` (dynamic
+            batching decides its own micro-batch sizes). Must yield lists of
+            ``dataloader_batch_size`` indices per iteration so
+            ``MakeMicroBatchCollator`` slices them into ``num_micro_batch`` micro-
+            batches of ``micro_batch_size``. Used by the bucket-aware pipeline
+            (:class:`veomni.data.bucket.BucketBatchSampler`) to guarantee same-
+            bucket samples share a micro-batch.
     """
     if collate_fn_kwargs is None:
         collate_fn_kwargs = {}
@@ -215,7 +226,15 @@ def build_native_dataloader(
         collate_fn = MakeMicroBatchCollator(num_micro_batch=num_micro_batch, internal_data_collator=collate_fn)
 
     sampler = None
-    if not isinstance(dataset, IterableDataset):
+    if batch_sampler is not None:
+        if dyn_bsz:
+            raise ValueError(
+                "batch_sampler is mutually exclusive with dyn_bsz=True; dynamic batching "
+                "decides its own micro-batch sizes and cannot use a fixed-length batch sampler."
+            )
+        if isinstance(dataset, IterableDataset):
+            raise ValueError("batch_sampler cannot be used with an IterableDataset (no index-based access).")
+    elif not isinstance(dataset, IterableDataset):
         sampler = StatefulDistributedSampler(
             dataset,
             num_replicas=parallel_state.dp_size,
@@ -230,20 +249,37 @@ def build_native_dataloader(
         snapshot_every_n_steps = save_steps
     else:
         snapshot_every_n_steps = 1
-    dataloader = DistributedDataloader(
-        dataset,
-        batch_size=dataloader_batch_size,
-        sampler=sampler,
-        num_workers=num_workers,
-        collate_fn=collate_fn,
-        pin_memory=pin_memory,
-        pin_memory_device=get_device_type(),
-        drop_last=drop_last,
-        prefetch_factor=prefetch_factor,
-        worker_init_fn=worker_init_fn,
-        multiprocessing_context=multiprocessing_context,
-        snapshot_every_n_steps=snapshot_every_n_steps,
-    )
+    if batch_sampler is not None:
+        # torch DataLoader: batch_sampler is mutually exclusive with
+        # batch_size / sampler / shuffle / drop_last (they are already encoded
+        # in the batch_sampler's yielded index lists).
+        dataloader = DistributedDataloader(
+            dataset,
+            batch_sampler=batch_sampler,
+            num_workers=num_workers,
+            collate_fn=collate_fn,
+            pin_memory=pin_memory,
+            pin_memory_device=get_device_type(),
+            prefetch_factor=prefetch_factor,
+            worker_init_fn=worker_init_fn,
+            multiprocessing_context=multiprocessing_context,
+            snapshot_every_n_steps=snapshot_every_n_steps,
+        )
+    else:
+        dataloader = DistributedDataloader(
+            dataset,
+            batch_size=dataloader_batch_size,
+            sampler=sampler,
+            num_workers=num_workers,
+            collate_fn=collate_fn,
+            pin_memory=pin_memory,
+            pin_memory_device=get_device_type(),
+            drop_last=drop_last,
+            prefetch_factor=prefetch_factor,
+            worker_init_fn=worker_init_fn,
+            multiprocessing_context=multiprocessing_context,
+            snapshot_every_n_steps=snapshot_every_n_steps,
+        )
 
     if dyn_bsz and dyn_bsz_runtime == "main":
         dataloader = DynamicBatchSizeDataLoader(

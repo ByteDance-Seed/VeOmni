@@ -1,0 +1,84 @@
+# Hunyuan Image 3 single_gen_t2i_v1 full fine-tune recipe (RFC §17).
+#
+# Illustrative production recipe for tasks/train_vlm.py + VLMTrainer. Paths and
+# sizes are placeholders, not performance commitments; tune per target cluster.
+# The online VAE path runs FP32 only (RFC §5.2). DCP resume / official export /
+# LoRA are separate follow-up tracks. P3 refactor: single-anchor
+# ``default_base_size`` per training run drives the new
+# ``HunyuanImage3BucketBatchSampler`` (see plan_bucketing.md); multi-anchor
+# training (256/512/1024 in one run) is deprecated by the single-anchor invariant.
+model:
+  model_path: /path/to/tencent/HunyuanImage-3.0
+  tokenizer_path: /path/to/tencent/HunyuanImage-3.0
+  config_path: configs/model_configs/hunyuan_image_3/HunyuanImage3Base.json
+  ops_implementation:
+    attn_implementation: flash_attention_2
+    moe_implementation: fused_triton
+
+data:
+  train_path: /path/to/training-data
+  datasets_type: mapping
+  data_type: multimodal_generation
+  text_keys: prompt
+  max_seq_len: 8192
+  dataloader:
+    # P3: batch_sampler runs in the main process; workers just fetch indices.
+    num_workers: 8
+  image_generation:
+    task_type: t2i
+    latent_source: online_vae
+    target_image_key: image
+    target_width_key: width
+    target_height_key: height
+    default_base_size: 1024
+    same_bucket_batching: true
+    resolution_policy:
+      preset: hunyuan_image_3_official_v1
+      anchors:
+        - base_size: 1024
+          weight: 1.0
+      selection_mode: synchronized_weighted
+      scheduler_seed: 0
+    prompt_dropout_prob: 0.1
+
+train:
+  component_policy:
+    transformer: trainable
+    text_embedding: trainable
+    image_projector: trainable
+    timestep_modules: trainable
+    image_head: trainable
+    vae_encoder: frozen
+    vae_decoder: absent
+    vision_model: absent
+    vision_aligner: absent
+    lm_head: absent
+  flow:
+    num_train_timesteps: 1000
+    timestep_sampling: uniform
+    training_shift: 1.0
+    prediction_type: velocity
+    loss_weighting: uniform
+  dyn_bsz: false
+  # mbs>1 is now supported end-to-end via the bucket batch sampler; bump it if
+  # per-sample memory allows for better throughput.
+  micro_batch_size: 1
+  global_batch_size: 8
+  init_device: meta
+  num_train_epochs: 1
+  max_steps: 1000
+  accelerator:
+    ulysses_size: 4
+    ep_size: 8
+    fsdp_config:
+      fsdp_mode: fsdp2
+      mixed_precision:
+        enable: true
+  gradient_checkpointing:
+    enable: true
+    enable_reentrant: false
+  optimizer:
+    type: adamw
+    lr: 1.0e-5
+  checkpoint:
+    output_dir: hunyuan_image_3_full

@@ -124,6 +124,98 @@ class TestCheckpointerCallbackLastSavedStep:
 
         trainer.channel_loss_callback.load_state_dict.assert_called_once_with(callback_state)
 
+    def test_save_includes_bucket_batch_sampler_state(self, mock_helper, mock_dist, mock_build_ckpt):
+        """P4: BucketBatchSampler cursors + epochs land in extra_state on save."""
+        trainer = _make_mock_trainer()
+        sampler_state = {
+            "version": 1,
+            "seed": 42,
+            "dp_rank": 0,
+            "dp_size": 4,
+            "micro_batch_size": 4,
+            "num_micro_batch": 2,
+            "global_step": 17,
+            "epochs": {0: 1, 1: 0},
+            "cursors": {0: 8, 1: 12},
+        }
+        trainer.bucket_batch_sampler = MagicMock()
+        trainer.bucket_batch_sampler.state_dict.return_value = sampler_state
+        mock_build_ckpt.return_value = trainer.checkpointer
+        cb = CheckpointerCallback(trainer)
+
+        cb._save_checkpoint(TrainerState(global_step=17))
+
+        checkpoint_state = trainer.checkpointer.save.call_args.args[1]
+        assert checkpoint_state["extra_state"]["bucket_batch_sampler"] == sampler_state
+
+    def test_load_restores_bucket_batch_sampler_state(self, mock_helper, mock_dist, mock_build_ckpt):
+        """P4: on resume the callback calls sampler.load_state_dict with the saved state."""
+        trainer = _make_mock_trainer()
+        trainer.args.train.checkpoint.load_path = "/tmp/test_ckpt/global_step_17"
+        trainer.args.train_steps = 100
+        trainer.state = TrainerState()
+
+        sampler_state = {
+            "version": 1,
+            "seed": 42,
+            "dp_rank": 0,
+            "dp_size": 4,
+            "micro_batch_size": 4,
+            "num_micro_batch": 2,
+            "global_step": 17,
+            "epochs": {0: 1, 1: 0},
+            "cursors": {0: 8, 1: 12},
+        }
+        trainer.bucket_batch_sampler = MagicMock()
+        trainer.bucket_batch_sampler.global_step = 17
+
+        def load_checkpoint(path, state, **kwargs):
+            state["extra_state"] = {
+                "global_step": 17,
+                "lr_scheduler": {},
+                "train_dataloader": None,
+                "environ_meter": {},
+                "channel_loss_callback": None,
+                "bucket_batch_sampler": sampler_state,
+                "torch_rng_state": torch.get_rng_state(),
+            }
+
+        trainer.checkpointer.load.side_effect = load_checkpoint
+        mock_build_ckpt.return_value = trainer.checkpointer
+        cb = CheckpointerCallback(trainer)
+
+        cb._load_checkpoint()
+
+        trainer.bucket_batch_sampler.load_state_dict.assert_called_once_with(sampler_state)
+
+    def test_manifest_identity_includes_bucket_indexer_fingerprint(self, mock_helper, mock_dist, mock_build_ckpt):
+        """P4: ``bucket_indexer_fingerprint`` gets hard-gated via extra_hashes."""
+        trainer = _make_mock_trainer()
+        trainer.bucket_indexer_fingerprint = "deadbeef1234"
+        # No bucket_scheduler on this trainer to keep the assertion clean.
+        del trainer.bucket_scheduler
+        mock_build_ckpt.return_value = trainer.checkpointer
+        cb = CheckpointerCallback(trainer)
+
+        extra, _soft = cb._manifest_identity()
+        assert extra.get("bucket_indexer_fingerprint") == "deadbeef1234"
+
+    def test_manifest_identity_omits_bucket_indexer_fingerprint_when_absent(
+        self, mock_helper, mock_dist, mock_build_ckpt
+    ):
+        """Non-HI3 trainers (or HI3 with ``same_bucket_batching=False``) never
+        set ``bucket_indexer_fingerprint``; the manifest must stay generic."""
+        trainer = _make_mock_trainer()
+        # Ensure the getattr fallback in _manifest_identity returns None.
+        if hasattr(trainer, "bucket_indexer_fingerprint"):
+            del trainer.bucket_indexer_fingerprint
+        del trainer.bucket_scheduler  # keep extra dict minimal
+        mock_build_ckpt.return_value = trainer.checkpointer
+        cb = CheckpointerCallback(trainer)
+
+        extra, _soft = cb._manifest_identity()
+        assert "bucket_indexer_fingerprint" not in extra
+
     def test_epoch_end_retries_after_failed_save(self, mock_helper, mock_dist, mock_build_ckpt):
         """If save fails at step_end, epoch_end should still attempt to save (not skip)."""
         trainer = _make_mock_trainer()

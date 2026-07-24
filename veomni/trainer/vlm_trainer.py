@@ -21,7 +21,7 @@ import torch
 from ..arguments import DataArguments, ModelArguments, TrainingArguments, VeOmniArguments
 from ..data import MainCollator, build_data_transform, build_multimodal_chat_template
 from ..distributed.clip_grad_norm import veomni_clip_grad_norm
-from ..distributed.parallel_state import use_parallel_state
+from ..distributed.parallel_state import get_parallel_state, use_parallel_state
 from ..models import build_foundation_model, build_processor
 from ..optim import build_optimizer
 from ..utils import helper
@@ -50,6 +50,25 @@ def _get_vlm_visual_module(model):
     return None
 
 
+def _maybe_load_tokenizer(tokenizer_path):
+    """Best-effort tokenizer load (no remote code) for generation tasks.
+
+    Returns ``None`` on failure so a toy path can fall back to length-based
+    tokenization; the generation data transform tolerates a missing tokenizer.
+    """
+    if not tokenizer_path:
+        return None
+    from transformers import AutoTokenizer
+
+    try:
+        return AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=False)
+    except Exception as error:  # noqa: BLE001 - toy fallback, never fatal
+        logger.warning_rank0(
+            f"Could not load a tokenizer from {tokenizer_path!r}: {error}. Falling back to length-based tokenization."
+        )
+        return None
+
+
 @dataclass
 class VLMTrainingArguments(TrainingArguments):
     freeze_vit: bool = field(
@@ -64,6 +83,22 @@ class VLMTrainingArguments(TrainingArguments):
         default=1e-6,
         metadata={"help": "Maximum learning rate for vit parameters."},
     )
+    # Generation-task training config, consumed by a model's trainer_hooks
+    # (e.g. Hunyuan Image 3). Kept as opaque dicts here so the shared trainer has no
+    # model-local type dependency; the hook constructs/validates its typed schema.
+    #   * flow — flow-matching objective (passed to the model forward's flow_config,
+    #     which applies its own defaults + validation).
+    #   * component_policy — per-component lifecycle recipe (absent/frozen/trainable);
+    #     the trainer injects it into the model config at build (config_kwargs), so the
+    #     official checkpoint's config.json needs no overlay. Empty for other families.
+    flow: Optional[Dict] = field(
+        default=None,
+        metadata={"help": "Flow-matching training config for multimodal generation."},
+    )
+    component_policy: Dict[str, str] = field(
+        default_factory=dict,
+        metadata={"help": "Per-component lifecycle policy (absent/frozen/trainable)."},
+    )
 
 
 @dataclass
@@ -72,6 +107,15 @@ class VLMMDataArguments(DataArguments):
     mm_configs: Optional[Dict] = field(
         default_factory=dict,
         metadata={"help": "Config for multimodal input."},
+    )
+    # Image-generation (T2I / IT2I) task schema (resolution policy, latent source,
+    # bucketing, ...) for generative image models. Opaque dict here (like mm_configs);
+    # the model's trainer_hooks build its typed schema. Required only when
+    # ``data_type == "multimodal_generation"`` (that enum value + its
+    # ``text_keys="prompt"`` default live in the base ``DataArguments``).
+    image_generation: Optional[Dict] = field(
+        default=None,
+        metadata={"help": "Image-generation task schema (resolution policy, latent source, ...)."},
     )
 
 
@@ -114,6 +158,11 @@ class VLMTrainer:
             # rewrite build model to support data balancing
             self._build_model()
 
+            # Model-owned trainer orchestration (data transform / bucket dataloader /
+            # per-step context), or None for plain VLMs. Mirrors the
+            # apply_component_policy / get_extra_collate_infos getattr hooks.
+            self._trainer_hooks = getattr(self.base.model, "trainer_hooks", None)
+
             # rewrite freeze_model_module to support freeze multimodal encoder, etc.
             self._freeze_model_module()
 
@@ -128,8 +177,15 @@ class VLMTrainer:
             # rewrite build_collate_fn to support multimodal collate_fn
             self._build_collate_fn()
 
-            self.base._build_dataloader()
+            self._build_dataloader()
             self.base._build_parallelized_model()
+
+            # Reapply the model's component lifecycle policy after FSDP2/EP wrapping
+            # and before the optimizer reads requires_grad (e.g. Hunyuan Image 3
+            # keeps the VAE frozen/eval). No-op for models without the hook.
+            apply_component_policy = getattr(self.base.model, "apply_component_policy", None)
+            if apply_component_policy is not None:
+                apply_component_policy()
 
             # rewrite build_optimizer to support different lr param groups
             self._build_optimizer()
@@ -141,6 +197,13 @@ class VLMTrainer:
     def _build_model(self):
         args: VeOmniVLMArguments = self.base.args
         logger.info_rank0("Build model")
+        config_kwargs = dict(args.model.model_config or {})
+        if args.train.component_policy:
+            # component_policy is a training recipe, not part of the official
+            # checkpoint's config.json. Inject it into the model config at build so
+            # no config.json overlay is needed; it also stays the single source for
+            # validate + the DCP manifest. Only generation-task models set it.
+            config_kwargs["component_policy"] = dict(args.train.component_policy)
         self.base.model = build_foundation_model(
             config_path=args.model.config_path,
             weights_path=args.model.model_path,
@@ -149,11 +212,19 @@ class VLMTrainer:
             encoder_data_balance=args.model.encoder_data_balance,
             encoder_data_balance_sorting_algo=args.model.encoder_data_balance_sorting_algo,
             ops_implementation=args.model.ops_implementation,
-            config_kwargs=args.model.model_config,
+            config_kwargs=config_kwargs,
         )
         self.base.model_config = self.base.model.config
 
     def _freeze_model_module(self):
+        # VLMTrainer overrides the base freeze pass (VLMs freeze vision/audio
+        # towers, not just LoRA); the LoRA wrap the base version does at the
+        # top is therefore skipped here unless we call it explicitly. Wrap
+        # first so the subsequent freeze_vit / freeze_audio_tower work goes
+        # through the LoRA wrapper's __getattr__ passthrough. Cheap no-op when
+        # ``args.model.lora_config`` is empty.
+        self.base._setup_lora()
+
         args: VeOmniVLMArguments = self.base.args
         model_config = self.base.model_config
         if model_config.model_type in ("qwen2_5_omni", "qwen3_omni_moe"):
@@ -185,6 +256,15 @@ class VLMTrainer:
 
     def _build_model_assets(self):
         args: VeOmniVLMArguments = self.base.args
+        if args.data.data_type == "multimodal_generation":
+            # Generation task: no HF processor / chat template. The data transform
+            # owns its resolution policy / image processor; the toy path tokenizes
+            # prompts with the model tokenizer when one is available.
+            self.base.processor = None
+            self.base.chat_template = None
+            self.base.tokenizer = _maybe_load_tokenizer(args.model.tokenizer_path)
+            self.base.model_assets = []
+            return
         self.base.processor = build_processor(args.model.tokenizer_path, max_pixels=MAX_PIXELS)
         if self.base.model_config.model_type not in ("qwen2_5_omni", "qwen3_omni_moe"):
             self.base.chat_template = build_multimodal_chat_template(
@@ -198,6 +278,10 @@ class VLMTrainer:
     def _build_data_transform(self):
         args: VeOmniVLMArguments = self.base.args
         model_type = self.base.model_config.model_type
+
+        if self._trainer_hooks is not None:
+            self._trainer_hooks.build_data_transform(self)
+            return
 
         self.base.data_transform = build_data_transform(
             model_type,
@@ -230,6 +314,12 @@ class VLMTrainer:
             data_collate_info=data_collate_info,
             metadata_collate_func=metadata_collate_func,
         )
+
+    def _build_dataloader(self):
+        """Let the generation hooks build a bucket dataloader; else fall back."""
+        if self._trainer_hooks is not None and self._trainer_hooks.build_dataloader(self):
+            return
+        self.base._build_dataloader()
 
     def _build_optimizer(self):
         args: VeOmniVLMArguments = self.base.args
@@ -289,6 +379,12 @@ class VLMTrainer:
         args: VeOmniVLMArguments = self.base.args
         self.base.state.global_step += 1
 
+        # P3: the deprecated ``ScheduledResolutionTransform`` / ``all_ranks_have_data``
+        # special case was removed — ``BucketBatchSampler`` is a main-process
+        # ``BatchSampler`` whose iteration is naturally symmetric across ranks
+        # (all DP ranks tick the same schedule and independently draw from their
+        # own bucket shards; when any rank's queue exhausts it reshuffles
+        # locally). No cross-rank ``all_reduce(MIN)`` is needed.
         micro_batches: List[Dict[str, Any]] = next(data_iterator)
 
         self.on_step_begin(micro_batches=micro_batches)
@@ -309,6 +405,20 @@ class VLMTrainer:
             loss_dict: Dict[str, torch.Tensor]
             # token num for fixed_ce_loss in postforward
             self.base.micro_batch_token_len = count_loss_token(micro_batch)
+            # Flow-matching training injects per-micro-step flow config + RNG identity
+            # so every SP/EP rank of one logical micro-batch draws the same posterior /
+            # noise / timestep. The identity uses the pure data-parallel replica rank
+            # (no SP/EP); ``veomni.schedulers.flow_matching`` on the model side
+            # applies defaults + validation to the opaque ``flow_config`` dict.
+            if args.train.flow:
+                parallel_state = get_parallel_state()
+                micro_batch["flow_config"] = dict(args.train.flow)
+                micro_batch["flow_step_context"] = {
+                    "train_seed": int(args.train.seed),
+                    "data_replica_rank": int(parallel_state.dp_rank),
+                    "optimizer_step": int(self.base.state.global_step),
+                    "micro_step": int(micro_step),
+                }
             loss, loss_dict = self.base.forward_backward_step(micro_batch)
 
             total_loss += loss.item()
@@ -329,6 +439,12 @@ class VLMTrainer:
     def train(self):
         args: VeOmniVLMArguments = self.base.args
         self.on_train_begin()
+
+        # P3: the deprecated ``ScheduledResolutionTransform.resume_offset`` alignment
+        # was removed — DCP resume for ``BucketBatchSampler`` happens via its own
+        # ``state_dict()`` / ``load_state_dict()`` (wired up in P4's checkpoint
+        # callback), not by patching ``resume_offset`` after the fact.
+
         logger.info(
             f"Rank{args.train.local_rank} Start training. "
             f"Start step: {self.base.start_step}. "

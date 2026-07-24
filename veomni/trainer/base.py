@@ -479,12 +479,12 @@ class BaseTrainer(Stateful, ABC):
             seq_classification=seq_classification,
         )
 
-    def _build_dataloader(self):
+    def _build_dataloader(self, batch_sampler=None):
         args: VeOmniArguments = self.args
         dataloader_kwargs = asdict(args.data.dataloader)
         dataloader_type = dataloader_kwargs.pop("type")
         dataloader_kwargs.pop("use_background_prefetcher", None)
-        self.train_dataloader = build_dataloader(
+        loader_kwargs = dict(
             dataloader_type=dataloader_type,
             dataset=self.train_dataset,
             micro_batch_size=args.train.micro_batch_size,
@@ -494,16 +494,28 @@ class BaseTrainer(Stateful, ABC):
             train_steps=args.train_steps,
             bsz_warmup_ratio=args.train.bsz_warmup_ratio,
             bsz_warmup_init_mbtoken=args.train.bsz_warmup_init_mbtoken,
-            dyn_bsz=args.train.dyn_bsz,
-            dyn_bsz_runtime=args.train.dyn_bsz_runtime,
-            dyn_bsz_count_mode=args.train.dyn_bsz_count_mode,
-            dyn_bsz_physical_overflow_ratio=args.train.dyn_bsz_physical_overflow_ratio,
-            dyn_bsz_buffer_size=args.data.dyn_bsz_buffer_size,
             seed=args.train.seed,
             collate_fn=self.collate_fn,
             save_steps=args.train.checkpoint.save_steps,
-            **dataloader_kwargs,
         )
+        if batch_sampler is not None:
+            # A custom batch_sampler yields fixed-size index batches and is mutually
+            # exclusive with dynamic batching (which decides its own sizes).
+            if args.train.dyn_bsz:
+                raise ValueError(
+                    "A custom batch_sampler requires train.dyn_bsz=false — dynamic batching "
+                    "decides its own micro-batch sizes and cannot cooperate with a batch_sampler."
+                )
+            loader_kwargs.update(dyn_bsz=False, batch_sampler=batch_sampler)
+        else:
+            loader_kwargs.update(
+                dyn_bsz=args.train.dyn_bsz,
+                dyn_bsz_runtime=args.train.dyn_bsz_runtime,
+                dyn_bsz_count_mode=args.train.dyn_bsz_count_mode,
+                dyn_bsz_physical_overflow_ratio=args.train.dyn_bsz_physical_overflow_ratio,
+                dyn_bsz_buffer_size=args.data.dyn_bsz_buffer_size,
+            )
+        self.train_dataloader = build_dataloader(**loader_kwargs, **dataloader_kwargs)
 
     def _build_parallelized_model(self):
         args: VeOmniArguments = self.args
@@ -649,10 +661,11 @@ class BaseTrainer(Stateful, ABC):
     def preforward(self, micro_batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         """Preprocess micro batches before forward pass.
 
-        Tensors are moved to ``self.device`` non-blockingly. Nested dicts
-        (e.g. ``multimodal_metadata`` emitted by ``PackingCollator``) are
-        recursed so inner tensor values land on the device too; Python ints
-        / lists / etc. pass through unchanged.
+        Tensors are moved to ``self.device`` non-blockingly. Nested dicts and
+        lists / tuples (e.g. ``multimodal_metadata`` emitted by ``PackingCollator``
+        or ``pack_mode="list"`` staging like HI3's per-sample image posteriors)
+        are recursed so inner tensor values land on the device too; Python ints
+        / strings / etc. pass through unchanged.
         """
 
         def _to_device(v: Any) -> Any:
@@ -660,6 +673,10 @@ class BaseTrainer(Stateful, ABC):
                 return v.to(self.device, non_blocking=True)
             if isinstance(v, dict):
                 return {k: _to_device(vv) for k, vv in v.items()}
+            if isinstance(v, list):
+                return [_to_device(vv) for vv in v]
+            if isinstance(v, tuple):
+                return tuple(_to_device(vv) for vv in v)
             return v
 
         chunk_mbs_config = getattr(self.args.train, "chunk_mbs_config", None)
@@ -675,7 +692,9 @@ class BaseTrainer(Stateful, ABC):
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """Postprocess model outputs after forward pass."""
         loss_dict: Dict[str, torch.Tensor] = mean_global_loss(
-            outputs.loss, self.micro_batch_token_len, self.micro_batches_token_len
+            outputs.loss,
+            self.micro_batch_token_len,
+            self.micro_batches_token_len,
         )
         loss = torch.stack(list(loss_dict.values())).sum()
         return loss, loss_dict

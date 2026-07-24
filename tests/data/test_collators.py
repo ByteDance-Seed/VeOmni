@@ -200,4 +200,100 @@ def test_packing_collator_clamps_linear_attn_tail_padding_length(monkeypatch, fe
     assert m._LINEAR_ATTN_TAIL_PADDING_LENGTH not in out
 
 
+def test_data_collator_info_pack_mode_defaults_and_validation():
+    """``pack_mode`` defaults to ``"cat"`` so every non-HI3 model stays byte-identical;
+    invalid values raise; ``"list"`` + ``sp_slice=True`` combo is rejected eagerly.
+
+    ``sp_pad_value`` / ``sp_pad_scale`` must be passed as a pair (both None or both
+    set) — the dataclass default ``sp_pad_scale=1`` is a footgun that requires an
+    explicit ``sp_pad_scale=None`` override when using ``sp_pad_value=None``.
+    """
+    import veomni.data.data_collator as m
+
+    # Default pack_mode
+    info = m.DataCollateInfo(pack_dim=0, sp_pad_value=None, sp_pad_scale=None)
+    assert info.pack_mode == "cat"
+
+    # Explicit list
+    info_list = m.DataCollateInfo(pack_dim=0, pack_mode="list", sp_pad_value=None, sp_pad_scale=None)
+    assert info_list.pack_mode == "list"
+
+    # Invalid value
+    with pytest.raises(ValueError, match="pack_mode"):
+        m.DataCollateInfo(pack_dim=0, pack_mode="invalid", sp_pad_value=None, sp_pad_scale=None)
+
+    # list + sp_slice combo rejected
+    with pytest.raises(ValueError, match="sp_slice"):
+        m.DataCollateInfo(pack_dim=0, sp_slice=True, sp_pad_value=0, sp_pad_scale=1, pack_mode="list")
+
+    # Default table entries all stay "cat" (no accidental behavior change).
+    for name, entry in m.DEFAULT_DATA_COLLATE_INFO.items():
+        assert entry.pack_mode == "cat", f"default entry {name} unexpectedly changed pack_mode"
+
+
+def test_packing_collator_pack_mode_list_keeps_list_of_tensors(monkeypatch):
+    """``pack_mode='list'`` skips ``torch.cat`` and preserves per-sample tensors —
+    the mechanism HI3 uses under mbs>1 with heterogeneous image buckets."""
+    import veomni.data.data_collator as m
+
+    monkeypatch.setattr(m, "get_parallel_state", lambda: _fake_ps(sp_enabled=False))
+
+    features = [
+        {
+            "input_ids": torch.tensor([1, 2, 3], dtype=torch.long),
+            "labels": torch.full((3,), IGNORE_INDEX, dtype=torch.long),
+            "attention_mask": torch.tensor([1, 1, 1], dtype=torch.long),
+            "position_ids": torch.arange(3, dtype=torch.int64),
+            "hy3_staging": torch.zeros(1, 3, 8, 4),  # shape [1, C, H0, W0]
+        },
+        {
+            "input_ids": torch.tensor([4, 5], dtype=torch.long),
+            "labels": torch.full((2,), IGNORE_INDEX, dtype=torch.long),
+            "attention_mask": torch.tensor([1, 1], dtype=torch.long),
+            "position_ids": torch.arange(2, dtype=torch.int64),
+            "hy3_staging": torch.ones(1, 3, 6, 6),  # DIFFERENT shape [1, C, H1, W1]
+        },
+    ]
+
+    collate_infos = m.DEFAULT_DATA_COLLATE_INFO.copy()
+    collate_infos["hy3_staging"] = m.DataCollateInfo(
+        pack_dim=0, pack_mode="list", sp_pad_value=None, sp_pad_scale=None
+    )
+
+    collator = m.PackingCollator(collate_infos=collate_infos)
+    out = collator(features)
+
+    # Text tensors still get packed (cat + unsqueeze).
+    assert out["input_ids"].shape == (1, 5)
+    # Heterogeneous staging survives as a list of the original per-sample tensors.
+    assert isinstance(out["hy3_staging"], list)
+    assert len(out["hy3_staging"]) == 2
+    assert out["hy3_staging"][0].shape == (1, 3, 8, 4)
+    assert out["hy3_staging"][1].shape == (1, 3, 6, 6)
+    # And the values weren't clobbered.
+    assert torch.equal(out["hy3_staging"][0], torch.zeros(1, 3, 8, 4))
+    assert torch.equal(out["hy3_staging"][1], torch.ones(1, 3, 6, 6))
+
+
+def test_build_native_dataloader_batch_sampler_arg():
+    """``build_native_dataloader.batch_sampler`` opt-in: reject dyn_bsz combo and
+    IterableDataset combo; accept a plain map-style dataset with a custom sampler."""
+    import veomni.data.data_loader as dl
+
+    # dyn_bsz + batch_sampler → mutually exclusive
+    dummy = [{"input_ids": torch.tensor([1])}]
+    dummy_bs = torch.utils.data.BatchSampler(torch.utils.data.SequentialSampler(dummy), batch_size=1, drop_last=True)
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        dl.build_native_dataloader(
+            dataset=dummy,
+            micro_batch_size=1,
+            global_batch_size=1,
+            dataloader_batch_size=1,
+            max_seq_len=8,
+            train_steps=1,
+            dyn_bsz=True,  # incompatible with batch_sampler
+            batch_sampler=dummy_bs,
+        )
+
+
 # TODO: add omni data ci test
