@@ -92,6 +92,68 @@ def test_dpo_main_collator_sp_disabled(monkeypatch):
     assert batch["position_ids"].eq(0).sum().item() == 2 * batch["ds_idx"].numel()
 
 
+def test_dpo_canonical_source_metadata_expands_from_position_resets(monkeypatch):
+    """Canonical metadata expands chosen/rejected without trainer-side repetition."""
+    import veomni.data.data_collator as m
+
+    monkeypatch.setattr(m, "get_parallel_state", lambda: _fake_ps(sp_enabled=False))
+
+    s1 = _make_flat_dpo_sample([1, 2, 3], [4, 5, 6])
+    s2 = _make_flat_dpo_sample([7, 8], [9, 10])
+    s1["_veomni_source_metadata"] = {
+        "schema_version": 1,
+        "source_id": "A",
+        "source_name": "train/a",
+    }
+    s2["_veomni_source_metadata"] = {
+        "schema_version": 1,
+        "source_id": "B",
+        "source_name": "train/b",
+    }
+
+    batch = m.MainCollator()([s1, s2])
+
+    assert batch["_veomni_packed_source_metadata"]["valid_token_count"] == 10
+    assert batch["_veomni_packed_source_metadata"]["segments"] == [
+        {
+            "source_id": "A",
+            "source_name": "train/a",
+            "segment_index": 0,
+            "sample_index": 0,
+            "subsegment_index": 0,
+            "token_start": 0,
+            "token_length": 3,
+        },
+        {
+            "source_id": "A",
+            "source_name": "train/a",
+            "segment_index": 1,
+            "sample_index": 0,
+            "subsegment_index": 1,
+            "token_start": 3,
+            "token_length": 3,
+        },
+        {
+            "source_id": "B",
+            "source_name": "train/b",
+            "segment_index": 2,
+            "sample_index": 1,
+            "subsegment_index": 0,
+            "token_start": 6,
+            "token_length": 2,
+        },
+        {
+            "source_id": "B",
+            "source_name": "train/b",
+            "segment_index": 3,
+            "sample_index": 1,
+            "subsegment_index": 1,
+            "token_start": 8,
+            "token_length": 2,
+        },
+    ]
+
+
 def test_dpo_main_collator_sp_enabled(monkeypatch):
     """MainCollator packs and SP-slices flat DPO samples."""
     import veomni.data.data_collator as m

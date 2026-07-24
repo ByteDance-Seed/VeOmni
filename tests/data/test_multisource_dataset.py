@@ -36,7 +36,19 @@ from utils import (
 
 from veomni.arguments import VeOmniArguments, parse_args
 from veomni.data import build_dataloader
-from veomni.data.dataset import WeightedMultiSourceDataset
+from veomni.data.data_collator import MainCollator
+from veomni.data.dataset import (
+    DynamicBatchingSizeDataset,
+    InterleavedIterableDataset,
+    WeightedMultiSourceDataset,
+    build_dataset,
+)
+from veomni.data.source_metadata import (
+    attach_source_metadata,
+    make_source_metadata,
+    normalize_packed_source_metadata,
+    normalize_source_metadata,
+)
 from veomni.distributed.parallel_state import get_parallel_state
 from veomni.trainer.base import BaseTrainer
 from veomni.trainer.callbacks import Callback, TrainerState
@@ -155,7 +167,7 @@ class TrainerTest(BaseTrainer):
         dist.barrier()
 
         state = cast(WeightedMultiSourceDataset, self.train_dataset).state_dict()
-        assert state["version"] == 0
+        assert state["version"] == 1
         assert state["topology"]["stopping_strategy"] == "all_exhausted"
         assert state["topology"]["level"] == "token"
         assert state["topology"]["source_names"] == self.multisource_names
@@ -423,6 +435,430 @@ def _make_simple_dataset(
     )
 
 
+def test_weighted_multisource_builder_emits_configured_stable_source_id(tmp_path, monkeypatch):
+    config_path = tmp_path / "multisource.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "sources": ["source.jsonl"],
+                "names": ["display-name"],
+                "source_ids": [17],
+                "schedule": [{"schedule_type": "const", "weights": [1.0]}],
+                "upstream_sharded": False,
+            }
+        )
+    )
+
+    def fake_build_iterable_dataset(*, transform, **_kwargs):
+        transformed = transform({"input_ids": [1, 2]})
+        return MockIterableDataset([transformed])
+
+    monkeypatch.setattr("veomni.data.dataset.build_iterable_dataset", fake_build_iterable_dataset)
+    dataset = build_dataset(
+        "veomni_weighted_multisource",
+        train_path=str(config_path),
+        transform=lambda sample: {**sample, "source_id": "discarded-by-source-wrapper"},
+        shuffle=False,
+    )
+
+    sample = next(iter(dataset))
+
+    assert sample["source_id"] == 17
+    assert sample["source_name"] == "display-name"
+    assert sample["_veomni_source_metadata"] == {
+        "schema_version": 1,
+        "source_id": 17,
+        "source_name": "display-name",
+    }
+
+
+def test_weighted_multisource_rejects_boolean_source_id():
+    with pytest.raises(ValueError, match="source_ids must contain only int or str"):
+        _make_simple_dataset(
+            datasets=[MockIterableDataset([{"input_ids": [1]}])],
+            weights=[1.0],
+            source_ids=[True],
+        )
+
+
+def test_attach_source_metadata_assigns_missing_logical_part_index():
+    chunks = [
+        {"input_ids": [1]},
+        {"input_ids": [2], "part_index": 7},
+    ]
+
+    attach_source_metadata(chunks, source_id="stable-id", source_name="display-name")
+
+    assert [chunk["_veomni_source_metadata"]["part_index"] for chunk in chunks] == [0, 7]
+
+
+def test_attach_source_metadata_removes_stale_name_when_canonical_name_is_missing():
+    sample = {
+        "input_ids": [1],
+        "channel_name": "stale-channel",
+        "source_name": "stale-source",
+        "dataset_name": "stale-dataset",
+        "data_name": "stale-data",
+    }
+
+    attach_source_metadata(sample, source_id="stable-id", source_name=None)
+
+    assert not {"channel_name", "source_name", "dataset_name", "data_name"} & sample.keys()
+    assert "source_name" not in sample["_veomni_source_metadata"]
+
+
+def test_make_source_metadata_rejects_non_string_source_name():
+    with pytest.raises(ValueError, match="source_name must be a str or None"):
+        make_source_metadata("stable-id", True)
+
+
+def test_interleaved_iterable_preserves_source_metadata_after_transform():
+    dataset = InterleavedIterableDataset(
+        data=[
+            {
+                "input_ids": [1, 2],
+                "ds_idx": 0,
+                "source_id": "stable-id",
+                "source_name": "display-name",
+            }
+        ],
+        transform=lambda _sample, **_kwargs: {"input_ids": [3, 4]},
+    )
+
+    sample = next(iter(dataset))
+
+    assert sample["source_id"] == "stable-id"
+    assert sample["source_name"] == "display-name"
+    assert sample["_veomni_source_metadata"] == {
+        "schema_version": 1,
+        "source_id": "stable-id",
+        "source_name": "display-name",
+    }
+
+
+def test_interleaved_iterable_checkpoint_validates_typed_source_id_topology():
+    class StatefulRows:
+        def __init__(self):
+            self.cursor = 0
+
+        def __iter__(self):
+            return iter(())
+
+        def state_dict(self):
+            return {"cursor": self.cursor}
+
+        def load_state_dict(self, state):
+            self.cursor = state["cursor"]
+
+    rows = StatefulRows()
+    rows.cursor = 3
+    dataset = InterleavedIterableDataset(rows, source_ids=[7, "7"])
+
+    state = dataset.state_dict()
+
+    assert state == {
+        "version": 1,
+        "topology": {"source_ids": [7, "7"]},
+        "dataset": {"cursor": 3},
+    }
+
+    restored_rows = StatefulRows()
+    restored = InterleavedIterableDataset(restored_rows, source_ids=[7, "7"])
+    restored.load_state_dict(copy.deepcopy(state))
+    assert restored_rows.cursor == 3
+
+    reordered = InterleavedIterableDataset(StatefulRows(), source_ids=["7", 7])
+    with pytest.raises(ValueError, match="source_ids topology"):
+        reordered.load_state_dict(copy.deepcopy(state))
+
+    # Version-less states from the old wrapper remain loadable, but cannot
+    # provide topology validation retroactively.
+    restored.load_state_dict({"dataset": {"cursor": 4}})
+    assert restored_rows.cursor == 4
+
+
+def test_interleave_builder_preserves_typed_source_ids_after_transform(tmp_path, monkeypatch):
+    config_path = tmp_path / "interleave.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "sources": ["source-a.jsonl", "source-b.jsonl"],
+                "names": ["a", "b"],
+                "source_ids": [101, "101"],
+                "schedule": [{"schedule_type": "const", "weights": [0.5, 0.5]}],
+            }
+        )
+    )
+
+    class MappableRows:
+        def __init__(self, rows):
+            self.rows = rows
+
+        def map(self, transform):
+            return MappableRows([transform(row) for row in self.rows])
+
+        def __iter__(self):
+            return iter(self.rows)
+
+    def fake_build_iterable_dataset(train_path, **_kwargs):
+        return type("DatasetWrapper", (), {"_data": MappableRows([{"input_ids": [len(train_path)]}])})()
+
+    monkeypatch.setattr("veomni.data.dataset.build_iterable_dataset", fake_build_iterable_dataset)
+    monkeypatch.setattr(
+        "veomni.data.dataset.interleave_datasets",
+        lambda *, datasets, **_kwargs: [row for dataset in datasets for row in dataset],
+    )
+    monkeypatch.setattr("veomni.data.dataset.split_dataset_by_node", lambda dataset, *_args: dataset)
+
+    dataset = build_dataset(
+        "interleave",
+        train_path=str(config_path),
+        datasets_type="iterable",
+        transform=lambda sample, **_kwargs: {"input_ids": sample["input_ids"]},
+    )
+
+    samples = list(dataset)
+
+    assert [sample["source_id"] for sample in samples] == [101, "101"]
+    assert [sample["_veomni_source_metadata"]["source_id"] for sample in samples] == [101, "101"]
+
+
+def test_interleave_mapping_builder_attaches_metadata_to_transformed_parts(tmp_path, monkeypatch):
+    config_path = tmp_path / "interleave-mapping.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "sources": ["source-a.jsonl", "source-b.jsonl"],
+                "names": ["a", "b"],
+                "source_ids": [202, "202"],
+                "schedule": [{"schedule_type": "const", "weights": [0.5, 0.5]}],
+            }
+        )
+    )
+
+    class ColumnRows:
+        def __init__(self, rows):
+            self.rows = rows
+
+        def add_column(self, name, values):
+            return ColumnRows([{**row, name: value} for row, value in zip(self.rows, values)])
+
+        def __getitem__(self, index):
+            return self.rows[index]
+
+        def __len__(self):
+            return len(self.rows)
+
+    def fake_build_mapping_dataset(train_path, **_kwargs):
+        return type("DatasetWrapper", (), {"_data": ColumnRows([{"input_ids": [len(train_path)]}])})()
+
+    monkeypatch.setattr("veomni.data.dataset.build_mapping_dataset", fake_build_mapping_dataset)
+    monkeypatch.setattr(
+        "veomni.data.dataset.interleave_datasets",
+        lambda *, datasets, **_kwargs: ColumnRows([row for dataset in datasets for row in dataset.rows]),
+    )
+
+    dataset = build_dataset(
+        "interleave",
+        train_path=str(config_path),
+        datasets_type="mapping",
+        transform=lambda sample, **_kwargs: [
+            {"input_ids": sample["input_ids"]},
+            {"input_ids": sample["input_ids"]},
+        ],
+    )
+
+    first_parts = dataset[0]
+    second_parts = dataset[1]
+
+    assert [part["_veomni_source_metadata"]["source_id"] for part in first_parts] == [202, 202]
+    assert [part["_veomni_source_metadata"]["part_index"] for part in first_parts] == [0, 1]
+    assert [part["_veomni_source_metadata"]["source_id"] for part in second_parts] == ["202", "202"]
+
+
+def test_real_hf_streaming_interleave_reaches_canonical_main_collator(tmp_path):
+    source_a = tmp_path / "source-a.jsonl"
+    source_b = tmp_path / "source-b.jsonl"
+    source_a.write_text("\n".join(f'{{"tokens": [{token}, {token + 1}]}}' for token in (11, 21, 31, 41)) + "\n")
+    source_b.write_text('{"tokens": [101, 102]}\n')
+    config_path = tmp_path / "streaming-interleave.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "sources": [str(source_a), str(source_b)],
+                "names": ["a", "b"],
+                "source_ids": [303, "303"],
+                "schedule": [{"schedule_type": "const", "weights": [1.0, 0.0]}],
+            }
+        )
+    )
+
+    def transform(sample, **_kwargs):
+        input_ids = torch.tensor(sample["tokens"], dtype=torch.long)
+        return {
+            "input_ids": input_ids,
+            "attention_mask": torch.ones_like(input_ids),
+            "labels": input_ids.clone(),
+        }
+
+    dataset = build_dataset(
+        "interleave",
+        train_path=str(config_path),
+        datasets_type="iterable",
+        transform=transform,
+        shuffle=False,
+    )
+    features = list(dataset)
+
+    assert [feature["input_ids"].tolist() for feature in features[:4]] == [
+        [11, 12],
+        [21, 22],
+        [31, 32],
+        [41, 42],
+    ]
+    features = features[:4]
+    assert [feature["_veomni_source_metadata"]["source_id"] for feature in features] == [303] * 4
+
+    packed = MainCollator()(features)
+
+    assert packed["_veomni_packed_source_metadata"]["valid_token_count"] == 8
+    assert [segment["source_id"] for segment in packed["_veomni_packed_source_metadata"]["segments"]] == [303] * 4
+    assert [segment["sample_index"] for segment in packed["_veomni_packed_source_metadata"]["segments"]] == [
+        0,
+        1,
+        2,
+        3,
+    ]
+
+
+@pytest.mark.parametrize(
+    "operation",
+    [
+        lambda: make_source_metadata(True, "name"),
+        lambda: attach_source_metadata({}, source_id=1.5, source_name="name"),
+    ],
+)
+def test_public_source_metadata_helpers_validate_source_id(operation):
+    with pytest.raises(ValueError, match="source_ids must contain only int or str"):
+        operation()
+
+
+def test_public_source_metadata_schema_helpers_fail_closed():
+    with pytest.raises(ValueError, match="schema_version must be 1"):
+        normalize_source_metadata({"schema_version": 2, "source_id": "a"})
+
+    with pytest.raises(ValueError, match="valid_token_count must equal"):
+        normalize_packed_source_metadata(
+            {
+                "schema_version": 1,
+                "coordinate_space": "packed_pre_sp",
+                "valid_token_count": 3,
+                "segments": [
+                    {
+                        "source_id": "a",
+                        "segment_index": 0,
+                        "sample_index": 0,
+                        "subsegment_index": 0,
+                        "token_start": 0,
+                        "token_length": 2,
+                    }
+                ],
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    "sample_coordinates",
+    [
+        [(1, 0), (1, 1)],
+        [(0, 0), (0, 2)],
+    ],
+)
+def test_packed_source_metadata_rejects_invalid_sample_subsegment_order(sample_coordinates):
+    segments = [
+        {
+            "source_id": "a",
+            "segment_index": segment_index,
+            "sample_index": sample_index,
+            "subsegment_index": subsegment_index,
+            "token_start": segment_index,
+            "token_length": 1,
+        }
+        for segment_index, (sample_index, subsegment_index) in enumerate(sample_coordinates)
+    ]
+
+    with pytest.raises(ValueError, match="sample_index/subsegment_index"):
+        normalize_packed_source_metadata(
+            {
+                "schema_version": 1,
+                "coordinate_space": "packed_pre_sp",
+                "valid_token_count": 2,
+                "segments": segments,
+            }
+        )
+
+
+def test_packed_source_metadata_rejects_partially_missing_source_names():
+    with pytest.raises(ValueError, match="source_name must be present on all segments or none"):
+        normalize_packed_source_metadata(
+            {
+                "schema_version": 1,
+                "coordinate_space": "packed_pre_sp",
+                "valid_token_count": 2,
+                "segments": [
+                    {
+                        "source_id": "a",
+                        "source_name": "source-a",
+                        "segment_index": 0,
+                        "sample_index": 0,
+                        "subsegment_index": 0,
+                        "token_start": 0,
+                        "token_length": 1,
+                    },
+                    {
+                        "source_id": "b",
+                        "segment_index": 1,
+                        "sample_index": 1,
+                        "subsegment_index": 0,
+                        "token_start": 1,
+                        "token_length": 1,
+                    },
+                ],
+            }
+        )
+
+
+def test_packed_source_metadata_rejects_conflicting_names_for_same_typed_source_id():
+    with pytest.raises(ValueError, match="same source_id must use one source_name"):
+        normalize_packed_source_metadata(
+            {
+                "schema_version": 1,
+                "coordinate_space": "packed_pre_sp",
+                "valid_token_count": 2,
+                "segments": [
+                    {
+                        "source_id": 7,
+                        "source_name": "source-a",
+                        "segment_index": 0,
+                        "sample_index": 0,
+                        "subsegment_index": 0,
+                        "token_start": 0,
+                        "token_length": 1,
+                    },
+                    {
+                        "source_id": 7,
+                        "source_name": "source-b",
+                        "segment_index": 1,
+                        "sample_index": 1,
+                        "subsegment_index": 0,
+                        "token_start": 1,
+                        "token_length": 1,
+                    },
+                ],
+            }
+        )
+
+
 def test_state_dict_structure():
     ds1 = MockIterableDataset([{"input_ids": [1, 2]}], name="a")
     ds2 = MockIterableDataset([{"input_ids": [3, 4, 5]}], name="b")
@@ -435,12 +871,284 @@ def test_state_dict_structure():
         source_ids=["id_a", "id_b"],
     )
     state = dataset.state_dict()
-    assert state["version"] == 0
+    assert state["version"] == 1
     assert state["topology"]["source_ids"] == ["id_a", "id_b"]
     assert sorted(state["runtime"]["avg_len_sum"].keys()) == ["id_a", "id_b"]
     assert sorted(state["runtime"]["avg_len_count"].keys()) == ["id_a", "id_b"]
     assert sorted(state["runtime"]["dataset_states"].keys()) == ["id_a", "id_b"]
     assert sorted(state["runtime"]["exhausted"].keys()) == ["id_a", "id_b"]
+
+
+def _legacy_weighted_state(
+    *,
+    source_names,
+    dataset_states,
+    avg_len_sum,
+    avg_len_count,
+    exhausted,
+    global_sample_idx=7,
+):
+    """Build the version-0 shape emitted while the public builder ignored source_ids."""
+    return {
+        "version": 0,
+        "topology": {
+            # The old builder typo made these aliases equal to source_names.
+            "source_ids": list(source_names),
+            "source_names": list(source_names),
+            "weights": [1.0 / len(source_names)] * len(source_names),
+            "level": "token",
+            "stopping_strategy": "all_exhausted",
+        },
+        "runtime": {
+            "random_state": np.random.RandomState(321).get_state(),
+            "avg_len_sum": dict(avg_len_sum),
+            "avg_len_count": dict(avg_len_count),
+            "exhausted": dict(exhausted),
+            "global_sample_idx": global_sample_idx,
+            "dataset_states": dict(dataset_states),
+        },
+    }
+
+
+def test_legacy_name_keyed_checkpoint_migrates_to_typed_stable_ids_and_roundtrips():
+    old_state = _legacy_weighted_state(
+        source_names=["integer-id-source", "string-id-source"],
+        dataset_states={
+            "integer-id-source": {"consumed": 3},
+            "string-id-source": {"consumed": 5},
+        },
+        avg_len_sum={"integer-id-source": 11.0, "string-id-source": 22.0},
+        avg_len_count={"integer-id-source": 2, "string-id-source": 4},
+        exhausted={"integer-id-source": True, "string-id-source": False},
+    )
+    restored_sources = [
+        MockIterableDataset([{"input_ids": [1]}], name="integer-id-source"),
+        MockIterableDataset([{"input_ids": [2]}], name="string-id-source"),
+    ]
+    restored = _make_simple_dataset(
+        datasets=restored_sources,
+        weights=[0.5, 0.5],
+        level="token",
+        stopping_strategy="all_exhausted",
+        source_names=["integer-id-source", "string-id-source"],
+        source_ids=[1, "1"],
+    )
+
+    restored.load_state_dict(copy.deepcopy(old_state))
+
+    assert restored._avg_len_sum == [11.0, 22.0]
+    assert restored._avg_len_count == [2, 4]
+    assert restored._exhausted == [True, False]
+    assert restored._global_sample_idx == 7
+    assert [source.state_dict() for source in restored_sources] == [{"consumed": 3}, {"consumed": 5}]
+
+    migrated_state = restored.state_dict()
+    assert migrated_state["version"] == 1
+    assert migrated_state["topology"]["source_ids"] == [1, "1"]
+    assert migrated_state["runtime"]["avg_len_sum"] == {1: 11.0, "1": 22.0}
+    assert migrated_state["runtime"]["avg_len_count"] == {1: 2, "1": 4}
+    assert migrated_state["runtime"]["exhausted"] == {1: True, "1": False}
+    assert migrated_state["runtime"]["dataset_states"] == {
+        1: {"consumed": 3},
+        "1": {"consumed": 5},
+    }
+
+    cold_sources = [
+        MockIterableDataset([{"input_ids": [1]}], name="integer-id-source"),
+        MockIterableDataset([{"input_ids": [2]}], name="string-id-source"),
+    ]
+    cold = _make_simple_dataset(
+        datasets=cold_sources,
+        weights=[0.5, 0.5],
+        level="token",
+        stopping_strategy="all_exhausted",
+        source_names=["integer-id-source", "string-id-source"],
+        source_ids=[1, "1"],
+    )
+    cold.load_state_dict(copy.deepcopy(migrated_state), reconcile_policy="strict")
+    assert cold.state_dict()["runtime"]["dataset_states"] == migrated_state["runtime"]["dataset_states"]
+
+
+def test_legacy_checkpoint_rejects_ambiguous_source_name_mapping():
+    old_state = _legacy_weighted_state(
+        source_names=["duplicate", "duplicate"],
+        dataset_states={"duplicate": {"consumed": 1}},
+        avg_len_sum={"duplicate": 1.0},
+        avg_len_count={"duplicate": 1},
+        exhausted={"duplicate": False},
+    )
+    restored = _make_simple_dataset(
+        datasets=[
+            MockIterableDataset([{"input_ids": [1]}]),
+            MockIterableDataset([{"input_ids": [2]}]),
+        ],
+        weights=[0.5, 0.5],
+        source_names=["duplicate", "other"],
+        source_ids=["stable-a", "stable-b"],
+    )
+
+    with pytest.raises(ValueError, match="ambiguous legacy source_names"):
+        restored.load_state_dict(old_state)
+
+
+def test_legacy_checkpoint_rejects_alias_collision_with_current_stable_id():
+    old_state = _legacy_weighted_state(
+        source_names=["legacy-a", "legacy-b"],
+        dataset_states={"legacy-a": {"consumed": 1}, "legacy-b": {"consumed": 2}},
+        avg_len_sum={"legacy-a": 1.0, "legacy-b": 2.0},
+        avg_len_count={"legacy-a": 1, "legacy-b": 1},
+        exhausted={"legacy-a": False, "legacy-b": False},
+    )
+    restored = _make_simple_dataset(
+        datasets=[
+            MockIterableDataset([{"input_ids": [1]}]),
+            MockIterableDataset([{"input_ids": [2]}]),
+        ],
+        weights=[0.5, 0.5],
+        source_names=["legacy-a", "legacy-b"],
+        # The legacy alias "legacy-b" would select source 0 through the new
+        # stable-ID table but source 1 through the version-0 name mapping.
+        source_ids=["legacy-b", "stable-b"],
+    )
+
+    with pytest.raises(ValueError, match="legacy source alias.*conflicts with current source_id"):
+        restored.load_state_dict(old_state)
+
+
+class _ResumeIndexDataset(IterableDataset):
+    def __init__(self):
+        self.rows = [
+            {"input_ids": [10], "attention_mask": [1]},
+            {"input_ids": [11], "attention_mask": [1]},
+            {"input_ids": [12], "attention_mask": [1]},
+        ]
+        self.output_index_for_resume = False
+        self.cursor = 0
+        self.loaded_cursor = None
+
+    def __iter__(self):
+        while self.cursor < len(self.rows):
+            row_idx = self.cursor
+            self.cursor += 1
+            row = copy.deepcopy(self.rows[row_idx])
+            if self.output_index_for_resume:
+                yield row, row_idx
+            else:
+                yield row
+
+    def get_item(self, row_idx):
+        # Buffer reconstruction must happen only after the upstream cursor was
+        # restored, otherwise exact cold resume can duplicate/skip rows.
+        if self.loaded_cursor is None:
+            raise RuntimeError("get_item called before upstream state restore")
+        return copy.deepcopy(self.rows[row_idx])
+
+    def state_dict(self):
+        return {"cursor": self.cursor}
+
+    def load_state_dict(self, state):
+        self.cursor = state["cursor"]
+        self.loaded_cursor = self.cursor
+
+
+def _make_dynamic_weighted_resume_dataset():
+    source = _ResumeIndexDataset()
+    weighted = WeightedMultiSourceDataset(
+        datasets=[source],
+        weights=[1.0],
+        source_names=["legacy-name"],
+        source_ids=["stable-id"],
+        upstream_sharded=True,
+        output_index_for_resume=True,
+    )
+    dynamic = DynamicBatchingSizeDataset(
+        dataset=weighted,
+        micro_batch_seq_length=1,
+        ready_for_micro_batch_threshold=1,
+        dynamic_batching_collate_fn=lambda samples: samples,
+        save_by_idx=True,
+        get_length_fn=lambda sample: len(sample["input_ids"]),
+    )
+    return source, weighted, dynamic
+
+
+def test_dynamic_save_by_idx_cold_resume_migrates_legacy_source_alias_before_buffer_rebuild():
+    legacy_upstream_state = _legacy_weighted_state(
+        source_names=["legacy-name"],
+        dataset_states={"legacy-name": {"cursor": 2}},
+        avg_len_sum={"legacy-name": 0.0},
+        avg_len_count={"legacy-name": 0},
+        exhausted={"legacy-name": False},
+        global_sample_idx=2,
+    )
+    old_dynamic_state = {
+        "save_by_idx": True,
+        "buffer_token_count": 1,
+        "buffer_physical_token_count": 1,
+        "buffer": [(("legacy-name", 1), 0)],
+        "dynamic_batch_upstream_dataset_state": legacy_upstream_state,
+    }
+    source, _weighted, dynamic = _make_dynamic_weighted_resume_dataset()
+
+    dynamic.load_state_dict(copy.deepcopy(old_dynamic_state))
+
+    assert source.loaded_cursor == 2
+    assert dynamic._buffer[0][0]["input_ids"] == [11]
+    assert dynamic._buffer[0][0]["source_id"] == "stable-id"
+    migrated = dynamic.state_dict()
+    assert migrated["buffer"] == [(("stable-id", 1), 0)]
+    assert migrated["dynamic_batch_upstream_dataset_state"]["version"] == 1
+    assert migrated["dynamic_batch_upstream_dataset_state"]["topology"]["source_ids"] == ["stable-id"]
+
+    cold_source, _cold_weighted, cold_dynamic = _make_dynamic_weighted_resume_dataset()
+    cold_dynamic.load_state_dict(copy.deepcopy(migrated))
+    resumed_rows = [sample["input_ids"][0] for micro_batch in cold_dynamic for sample in micro_batch]
+    assert cold_source.loaded_cursor == 2
+    assert resumed_rows == [11, 12]
+
+
+def test_dynamic_v0_buffer_rejects_removed_alias_reused_as_current_stable_id():
+    class StatelessResumeIndexDataset(_ResumeIndexDataset):
+        def get_item(self, row_idx):
+            return copy.deepcopy(self.rows[row_idx])
+
+    legacy_upstream_state = _legacy_weighted_state(
+        source_names=["removed-source"],
+        dataset_states={"removed-source": {"cursor": 2}},
+        avg_len_sum={"removed-source": 0.0},
+        avg_len_count={"removed-source": 0},
+        exhausted={"removed-source": False},
+        global_sample_idx=2,
+    )
+    old_dynamic_state = {
+        "save_by_idx": True,
+        "buffer_token_count": 1,
+        "buffer_physical_token_count": 1,
+        "buffer": [(("removed-source", 1), 0)],
+        "dynamic_batch_upstream_dataset_state": legacy_upstream_state,
+    }
+    new_source = StatelessResumeIndexDataset()
+    weighted = WeightedMultiSourceDataset(
+        datasets=[new_source],
+        weights=[1.0],
+        source_names=["new-source"],
+        # Reusing the removed v0 name as a new stable ID must not redirect
+        # the old buffer entry to this unrelated source.
+        source_ids=["removed-source"],
+        upstream_sharded=True,
+        output_index_for_resume=True,
+    )
+    dynamic = DynamicBatchingSizeDataset(
+        dataset=weighted,
+        micro_batch_seq_length=1,
+        ready_for_micro_batch_threshold=1,
+        dynamic_batching_collate_fn=lambda samples: samples,
+        save_by_idx=True,
+        get_length_fn=lambda sample: len(sample["input_ids"]),
+    )
+
+    with pytest.raises(ValueError, match="removed legacy source alias"):
+        dynamic.load_state_dict(copy.deepcopy(old_dynamic_state))
 
 
 def test_exhausted_state_save_restore_and_elastic():

@@ -75,6 +75,130 @@ def test_seqcls_collator_sp_enabled(monkeypatch, features_two_samples):
     assert out["max_length_k"] == exp_max_length
 
 
+def test_main_collator_emits_packed_source_metadata_in_position_reset_order(monkeypatch):
+    import veomni.data.data_collator as m
+
+    monkeypatch.setattr(m, "get_parallel_state", lambda: _fake_ps(sp_enabled=False))
+    features = [
+        {
+            "input_ids": torch.tensor([11, 12, 13]),
+            "attention_mask": torch.ones(3, dtype=torch.long),
+            "labels": torch.tensor([11, 12, 13]),
+            "_veomni_source_metadata": {
+                "schema_version": 1,
+                "source_id": 7,
+                "source_name": "a",
+                "row_id": 42,
+                "sample_id": "sample-a",
+                "part_index": 1,
+            },
+        },
+        {
+            "input_ids": torch.tensor([21, 22]),
+            "attention_mask": torch.ones(2, dtype=torch.long),
+            "labels": torch.tensor([21, 22]),
+            "_veomni_source_metadata": {
+                "schema_version": 1,
+                "source_id": "7",
+                "source_name": "b",
+            },
+        },
+    ]
+
+    batch = m.MainCollator()(features)
+
+    assert "_veomni_source_metadata" not in batch
+    assert batch["_veomni_packed_source_metadata"] == {
+        "schema_version": 1,
+        "coordinate_space": "packed_pre_sp",
+        "valid_token_count": 5,
+        "segments": [
+            {
+                "source_id": 7,
+                "source_name": "a",
+                "row_id": 42,
+                "sample_id": "sample-a",
+                "part_index": 1,
+                "segment_index": 0,
+                "sample_index": 0,
+                "subsegment_index": 0,
+                "token_start": 0,
+                "token_length": 3,
+            },
+            {
+                "source_id": "7",
+                "source_name": "b",
+                "segment_index": 1,
+                "sample_index": 1,
+                "subsegment_index": 0,
+                "token_start": 3,
+                "token_length": 2,
+            },
+        ],
+    }
+
+
+def test_packed_source_metadata_excludes_padding_and_is_identical_across_sp_ranks(monkeypatch):
+    import veomni.data.data_collator as m
+
+    def make_features():
+        return [
+            {
+                "input_ids": torch.tensor([11, 12, 13]),
+                "attention_mask": torch.ones(3, dtype=torch.long),
+                "labels": torch.tensor([11, 12, 13]),
+                "_veomni_source_metadata": {
+                    "schema_version": 1,
+                    "source_id": "a",
+                    "source_name": "source-a",
+                },
+            },
+            {
+                "input_ids": torch.tensor([21, 22]),
+                "attention_mask": torch.ones(2, dtype=torch.long),
+                "labels": torch.tensor([21, 22]),
+                "_veomni_source_metadata": {
+                    "schema_version": 1,
+                    "source_id": "b",
+                    "source_name": "source-b",
+                },
+            },
+        ]
+
+    packed_by_rank = []
+    for sp_rank in (0, 1):
+        monkeypatch.setattr(
+            m,
+            "get_parallel_state",
+            lambda sp_rank=sp_rank: _fake_ps(sp_enabled=True, sp_size=2, sp_rank=sp_rank),
+        )
+        batch = m.MainCollator(pad_to_length=8)(make_features())
+        packed_by_rank.append(batch["_veomni_packed_source_metadata"])
+
+    assert packed_by_rank[0] == packed_by_rank[1]
+    assert packed_by_rank[0]["valid_token_count"] == 5
+    assert packed_by_rank[0]["segments"] == [
+        {
+            "source_id": "a",
+            "source_name": "source-a",
+            "segment_index": 0,
+            "sample_index": 0,
+            "subsegment_index": 0,
+            "token_start": 0,
+            "token_length": 3,
+        },
+        {
+            "source_id": "b",
+            "source_name": "source-b",
+            "segment_index": 1,
+            "sample_index": 1,
+            "subsegment_index": 0,
+            "token_start": 3,
+            "token_length": 2,
+        },
+    ]
+
+
 def test_data_collator_pad_to_length_sp_disabled(monkeypatch, features_two_samples):
     if IS_NPU_AVAILABLE:
         pytest.skip("NPU does not support this padding test yet.")

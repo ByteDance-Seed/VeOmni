@@ -40,6 +40,7 @@ from ..utils import logging
 from ..utils.constants import IGNORE_INDEX
 from ..utils.dist_utils import main_process_first
 from ..utils.multisource_utils import parse_multisource_config
+from .source_metadata import SourceId, attach_source_metadata, validate_source_id, validate_source_ids
 
 
 logger = logging.get_logger(__name__)
@@ -95,49 +96,114 @@ class IterativeDataset(IterableDataset):
 
 
 class InterleavedIterableDataset(IterativeDataset):
-    def __init__(self, data: "HFIterableDataset", transform: Optional[Callable] = None):
+    def __init__(
+        self,
+        data: "HFIterableDataset",
+        transform: Optional[Callable] = None,
+        source_ids: Optional[Sequence[SourceId]] = None,
+    ):
         self._data = data
         self._transform = transform
+        self._source_ids = (
+            validate_source_ids(source_ids, expected_count=len(source_ids)) if source_ids is not None else None
+        )
 
     def __iter__(self):
         for sample in self._data:
+            ds_idx = sample["ds_idx"]
+            source_id = validate_source_id(
+                self._source_ids[ds_idx] if self._source_ids is not None else sample.get("source_id", ds_idx)
+            )
+            source_name = sample.get("source_name", None)
             if self._transform is not None:
-                ds_idx = sample["ds_idx"]
-                source_name = sample.get("source_name", None)
                 transformed_sample = self._transform(sample, source_name=source_name)
-                if isinstance(transformed_sample, List):
-                    for idx in range(len(transformed_sample)):
-                        transformed_sample[idx]["ds_idx"] = ds_idx
-                    yield transformed_sample
-                else:
-                    transformed_sample["ds_idx"] = ds_idx
-                    yield transformed_sample
             else:
-                yield sample
+                transformed_sample = sample
+            yield attach_source_metadata(
+                transformed_sample,
+                source_id=source_id,
+                source_name=source_name,
+                ds_idx=ds_idx,
+            )
+
+    def state_dict(self):
+        """Save the iterable state together with its typed source-ID topology."""
+        return {
+            "version": 1,
+            "topology": {
+                "source_ids": list(self._source_ids) if self._source_ids is not None else None,
+            },
+            "dataset": self._data.state_dict(),
+        }
+
+    def load_state_dict(self, state_dict):
+        """Restore state and fail closed if the source-ID topology changed."""
+        if "version" not in state_dict:
+            # Backward compatibility for the previous wrapper shape. It did not
+            # persist source topology, so no retroactive validation is possible.
+            self._data.load_state_dict(state_dict["dataset"])
+            return
+
+        version = state_dict["version"]
+        if type(version) is not int or version != 1:
+            raise ValueError(f"unsupported interleaved iterable state version: {version!r}")
+        topology = state_dict.get("topology")
+        if not isinstance(topology, dict) or "source_ids" not in topology:
+            raise ValueError("interleaved iterable state missing topology.source_ids")
+        raw_saved_source_ids = topology["source_ids"]
+        saved_source_ids = (
+            validate_source_ids(raw_saved_source_ids, expected_count=len(raw_saved_source_ids))
+            if isinstance(raw_saved_source_ids, (list, tuple))
+            else None
+        )
+        if raw_saved_source_ids is not None and saved_source_ids is None:
+            raise ValueError("interleaved iterable topology.source_ids must be a list, tuple, or None")
+
+        current_signature = (
+            [(type(source_id), source_id) for source_id in self._source_ids] if self._source_ids is not None else None
+        )
+        saved_signature = (
+            [(type(source_id), source_id) for source_id in saved_source_ids] if saved_source_ids is not None else None
+        )
+        if saved_signature != current_signature:
+            raise ValueError(
+                "interleaved iterable source_ids topology changed across checkpoint resume "
+                f"(saved={raw_saved_source_ids!r}, current={self._source_ids!r})"
+            )
+        self._data.load_state_dict(state_dict["dataset"])
 
 
 class InterleavedMappingDataset(MappingDataset):
-    def __init__(self, data: "Dataset", transform: Optional[Callable] = None):
+    def __init__(
+        self,
+        data: "Dataset",
+        transform: Optional[Callable] = None,
+        source_ids: Optional[Sequence[SourceId]] = None,
+    ):
         super().__init__(data, transform)
+        self._source_ids = list(source_ids) if source_ids is not None else None
 
     def __getitem__(self, index: int) -> List[Dict[str, "torch.Tensor"]]:
         if index >= len(self.indices):
             random.shuffle(self.indices)
             index = index % len(self.indices)
         mapped_idx = self.indices[index]
+        sample = self._data[mapped_idx]
+        ds_idx = sample["ds_idx"]
+        source_id = validate_source_id(
+            self._source_ids[ds_idx] if self._source_ids is not None else sample.get("source_id", ds_idx)
+        )
+        source_name = sample.get("source_name", None)
         if self._transform is not None:
-            sample = self._data[mapped_idx]
-            ds_idx = sample["ds_idx"]
-            source_name = sample.get("source_name", None)
             transformed_sample = self._transform(sample, source_name=source_name)
-            if isinstance(transformed_sample, List):
-                for idx in range(len(transformed_sample)):
-                    transformed_sample[idx]["ds_idx"] = ds_idx
-            else:
-                transformed_sample["ds_idx"] = ds_idx
-            return transformed_sample
         else:
-            return self._data[mapped_idx]
+            transformed_sample = sample
+        return attach_source_metadata(
+            transformed_sample,
+            source_id=source_id,
+            source_name=source_name,
+            ds_idx=ds_idx,
+        )
 
 
 class EnergonDataset(IterativeDataset):
@@ -376,7 +442,7 @@ class WeightedMultiSourceDataset(IterableDataset):
         level: Literal["sample", "token"] = "sample",
         sample_token_len_fn: Optional[Callable[[Any], float]] = None,
         source_names: Optional[Sequence[str]] = None,
-        source_ids: Optional[Sequence[str]] = None,
+        source_ids: Optional[Sequence[SourceId]] = None,
         upstream_sharded: bool = False,
         stopping_strategy: Literal["first_exhausted", "all_exhausted", "never_exhausted"] = "first_exhausted",
         output_index_for_resume: bool = False,
@@ -413,7 +479,7 @@ class WeightedMultiSourceDataset(IterableDataset):
         self._level = level
         self._sample_token_len_fn = sample_token_len_fn or self._default_sample_token_len
         self._source_names = list(source_names) if source_names is not None else None
-        self._source_ids = list(source_ids) if source_ids is not None else []
+        self._source_ids: list[SourceId] = list(source_ids) if source_ids is not None else []
         self._upstream_sharded = upstream_sharded
         self._stopping_strategy = stopping_strategy
         self._ds_num = len(self._datasets)
@@ -427,7 +493,8 @@ class WeightedMultiSourceDataset(IterableDataset):
                     self._source_names.append(f"source_{i}")
 
         if not self._source_ids:
-            self._source_ids = copy.deepcopy(self._source_names)
+            assert self._source_names is not None
+            self._source_ids = list(self._source_names)
 
         self._id2dataset = {
             source_id: (dataset, ds_idx)
@@ -444,10 +511,7 @@ class WeightedMultiSourceDataset(IterableDataset):
             raise ValueError("weights length must match datasets length")
         if self._source_names is not None and len(self._source_names) != self._ds_num:
             raise ValueError("source_names length must match datasets length")
-        if len(self._source_ids) != self._ds_num:
-            raise ValueError("source_ids length must match datasets length")
-        if len(set(self._source_ids)) != self._ds_num:
-            raise ValueError("source_ids must be unique")
+        self._source_ids = validate_source_ids(self._source_ids, expected_count=self._ds_num)
         if self._level not in ("sample", "token"):
             raise ValueError("level must be 'sample' or 'token'")
         if self._stopping_strategy not in ("first_exhausted", "all_exhausted", "never_exhausted"):
@@ -460,6 +524,11 @@ class WeightedMultiSourceDataset(IterableDataset):
         self.output_index_for_resume = output_index_for_resume
 
         self._just_resumed = False
+        # Populated only while loading a version-0 checkpoint produced by the
+        # weighted-multisource builder bug that used source names as IDs.
+        # Removed aliases map to None so a newly reused stable ID cannot silently
+        # redirect an old dynamic-batching buffer entry to the wrong source.
+        self._legacy_resume_source_id_map: dict[SourceId, SourceId | None] = {}
 
     @property
     def output_index_for_resume(self) -> bool:
@@ -509,7 +578,7 @@ class WeightedMultiSourceDataset(IterableDataset):
         Raises:
             AttributeError: If the underlying sub-dataset does not provide an index-based fetch API.
         """
-        source_id, idx = resume_index
+        source_id, idx = self.canonicalize_output_index_for_resume(resume_index)
         dataset, ds_idx = self._id2dataset[source_id]
         get_item_fn = getattr(dataset, "get_item", None)
         if callable(get_item_fn):
@@ -517,6 +586,27 @@ class WeightedMultiSourceDataset(IterableDataset):
             sample = self._attach_meta(sample, ds_idx)
             return sample
         raise AttributeError(f"dataset '{source_id}' does not implement get_item")
+
+    def canonicalize_output_index_for_resume(self, resume_index):
+        """Translate a checkpoint buffer index to the current stable source ID.
+
+        Version-0 weighted-multisource checkpoints can contain source-name
+        aliases in dynamic-batching buffers.  ``load_state_dict`` records the
+        unambiguous legacy-name-to-stable-ID mapping so the outer batching
+        dataset can rewrite those entries before its next checkpoint.
+        """
+        if not isinstance(resume_index, (tuple, list)) or len(resume_index) != 2:
+            raise ValueError("weighted multisource resume index must be a (source_id, row_index) pair")
+        source_id, row_index = resume_index
+        source_id = validate_source_id(source_id)
+        if source_id in self._legacy_resume_source_id_map:
+            current_source_id = self._legacy_resume_source_id_map[source_id]
+            if current_source_id is None:
+                raise ValueError(f"checkpoint buffer references removed legacy source alias {source_id!r}")
+            return current_source_id, row_index
+        if source_id in self._id2dataset:
+            return source_id, row_index
+        raise ValueError(f"checkpoint buffer references unknown source_id {source_id!r}")
 
     def set_epoch(self, epoch: int) -> None:
         """Set the epoch for deterministic sampling.
@@ -648,7 +738,9 @@ class WeightedMultiSourceDataset(IterableDataset):
 
         Adds:
             - ``ds_idx``: the integer source index
+            - ``source_id``: the stable source identifier
             - ``source_name``: optional display name if provided
+            - ``_veomni_source_metadata``: the versioned source envelope
 
         Args:
             sample: A sample or list of samples.
@@ -658,18 +750,13 @@ class WeightedMultiSourceDataset(IterableDataset):
             The updated sample (mutated in place when possible).
         """
         source_name = self._source_names[ds_idx] if self._source_names is not None else None
-        if isinstance(sample, list):
-            for item in sample:
-                if isinstance(item, dict):
-                    item["ds_idx"] = ds_idx
-                    if source_name is not None:
-                        item["source_name"] = source_name
-            return sample
-        if isinstance(sample, dict):
-            sample["ds_idx"] = ds_idx
-            if source_name is not None:
-                sample["source_name"] = source_name
-        return sample
+        source_id = self._source_ids[ds_idx]
+        return attach_source_metadata(
+            sample,
+            source_id=source_id,
+            source_name=source_name,
+            ds_idx=ds_idx,
+        )
 
     def _default_sample_token_len(self, sample: Any) -> float:
         """Default heuristic to estimate token length of a sample.
@@ -718,7 +805,7 @@ class WeightedMultiSourceDataset(IterableDataset):
         # save _exhausted state
         exhausted_by_id = {source_id: self._exhausted[idx] for idx, source_id in enumerate(self._source_ids)}
         return {
-            "version": 0,
+            "version": 1,
             "topology": {
                 "source_ids": list(self._source_ids),
                 "source_names": list(self._source_names) if self._source_names is not None else None,
@@ -760,41 +847,116 @@ class WeightedMultiSourceDataset(IterableDataset):
         topology = state["topology"]
         if "source_ids" not in topology:
             raise ValueError("state_dict missing topology.source_ids")
-        saved_source_ids = topology["source_ids"]
-        added = []
-        removed = []
-        if saved_source_ids is not None:
+        version = state.get("version", 0)
+        if isinstance(version, bool) or not isinstance(version, int) or version not in (0, 1):
+            raise ValueError(f"unsupported weighted multisource state version: {version!r}")
+        raw_saved_source_ids = topology["source_ids"]
+        if not isinstance(raw_saved_source_ids, (list, tuple)):
+            raise ValueError("topology.source_ids must be a list or tuple")
+
+        self._legacy_resume_source_id_map = {}
+        saved_source_ids = [validate_source_id(source_id) for source_id in raw_saved_source_ids]
+        saved_runtime_key_by_current_id: dict[SourceId, SourceId] = {}
+
+        saved_source_names = topology.get("source_names")
+        legacy_name_keyed = (
+            version == 0
+            and isinstance(saved_source_names, (list, tuple))
+            and len(saved_source_names) == len(saved_source_ids)
+            and all(
+                type(source_id) is type(source_name) and source_id == source_name
+                for source_id, source_name in zip(saved_source_ids, saved_source_names)
+            )
+        )
+        if legacy_name_keyed:
+            if not all(isinstance(source_name, str) for source_name in saved_source_names):
+                raise ValueError("legacy weighted multisource source_names must contain only strings")
+            if len(set(saved_source_names)) != len(saved_source_names):
+                raise ValueError("ambiguous legacy source_names in version-0 checkpoint")
+            if self._source_names is None or not all(isinstance(name, str) for name in self._source_names):
+                raise ValueError("current weighted multisource source_names must contain only strings")
+            if len(set(self._source_names)) != len(self._source_names):
+                raise ValueError("ambiguous current source_names while migrating version-0 checkpoint")
+
+            current_id_by_name = dict(zip(self._source_names, self._source_ids))
+            current_index_by_id = {source_id: idx for idx, source_id in enumerate(self._source_ids)}
+            for legacy_name in saved_source_names:
+                current_id = current_id_by_name.get(legacy_name)
+                self._legacy_resume_source_id_map[legacy_name] = current_id
+                if current_id is None:
+                    continue
+                conflicting_idx = current_index_by_id.get(legacy_name)
+                if conflicting_idx is not None and self._source_ids[conflicting_idx] != current_id:
+                    raise ValueError(
+                        f"legacy source alias {legacy_name!r} conflicts with current source_id "
+                        f"owned by source_name {self._source_names[conflicting_idx]!r}"
+                    )
+                saved_runtime_key_by_current_id[current_id] = legacy_name
+
+            saved_names_set = set(saved_source_names)
+            current_names_set = set(self._source_names)
+            added = [
+                source_id
+                for source_name, source_id in zip(self._source_names, self._source_ids)
+                if source_name not in saved_names_set
+            ]
+            removed = [source_name for source_name in saved_source_names if source_name not in current_names_set]
+
+            for field_name in ("avg_len_sum", "avg_len_count", "dataset_states", "exhausted"):
+                field = runtime.get(field_name)
+                if field is None and field_name == "exhausted":
+                    continue
+                if isinstance(field, dict):
+                    unknown_keys = [key for key in field if key not in saved_names_set]
+                    if unknown_keys:
+                        raise ValueError(
+                            f"runtime.{field_name} contains keys outside legacy topology.source_ids: {unknown_keys}"
+                        )
+        else:
+            saved_source_ids = validate_source_ids(saved_source_ids, expected_count=len(saved_source_ids))
             saved_set = set(saved_source_ids)
+            current_set = set(self._source_ids)
             added = [source_id for source_id in self._source_ids if source_id not in saved_set]
-            removed = [source_id for source_id in saved_source_ids if source_id not in set(self._source_ids)]
-            if added or removed:
-                if reconcile_policy == "strict":
-                    raise ValueError(
-                        f"source_ids mismatch: added={added} removed={removed} with policy={reconcile_policy}"
-                    )
-                if reconcile_policy == "allow_add" and removed:
-                    raise ValueError(
-                        f"source_ids removed not allowed: removed={removed} with policy={reconcile_policy}"
-                    )
-                if reconcile_policy == "warn_only":
-                    logger.warning(
-                        f"source_ids changed: added={added} removed={removed} with policy={reconcile_policy}"
-                    )
+            removed = [source_id for source_id in saved_source_ids if source_id not in current_set]
+            saved_runtime_key_by_current_id = {
+                source_id: source_id for source_id in self._source_ids if source_id in saved_set
+            }
+
+        if added or removed:
+            if reconcile_policy == "strict":
+                raise ValueError(
+                    f"source_ids mismatch: added={added} removed={removed} with policy={reconcile_policy}"
+                )
+            if reconcile_policy == "allow_add" and removed:
+                raise ValueError(f"source_ids removed not allowed: removed={removed} with policy={reconcile_policy}")
+            if reconcile_policy == "warn_only":
+                logger.warning(f"source_ids changed: added={added} removed={removed} with policy={reconcile_policy}")
         random_state = runtime["random_state"]
         self._random_state.set_state(random_state)
         avg_len_sum = runtime["avg_len_sum"]
         avg_len_count = runtime["avg_len_count"]
         if not isinstance(avg_len_sum, dict) or not isinstance(avg_len_count, dict):
             raise ValueError("runtime.avg_len_sum and runtime.avg_len_count must be dicts keyed by source_id")
-        self._avg_len_sum = [float(avg_len_sum.get(source_id, 0.0)) for source_id in self._source_ids]
-        self._avg_len_count = [int(avg_len_count.get(source_id, 0)) for source_id in self._source_ids]
+        self._avg_len_sum = [
+            float(avg_len_sum.get(saved_runtime_key_by_current_id[source_id], 0.0))
+            if source_id in saved_runtime_key_by_current_id
+            else 0.0
+            for source_id in self._source_ids
+        ]
+        self._avg_len_count = [
+            int(avg_len_count.get(saved_runtime_key_by_current_id[source_id], 0))
+            if source_id in saved_runtime_key_by_current_id
+            else 0
+            for source_id in self._source_ids
+        ]
         self._global_sample_idx = runtime.get("global_sample_idx", 0)
         dataset_states = runtime["dataset_states"]
         if not isinstance(dataset_states, dict):
             raise ValueError("runtime.dataset_states must be a dict keyed by source_id")
         dataset_states_by_id = dataset_states
         for dataset, source_id in zip(self._datasets, self._source_ids):
-            ds_state = dataset_states_by_id.get(source_id)
+            saved_runtime_key = saved_runtime_key_by_current_id.get(source_id)
+            ds_state = dataset_states_by_id.get(saved_runtime_key) if saved_runtime_key is not None else None
             if ds_state is None:
                 continue
             load_state_fn = getattr(dataset, "load_state_dict", None)
@@ -805,7 +967,12 @@ class WeightedMultiSourceDataset(IterableDataset):
         # This is important when sources are added/removed during checkpoint resume
         if "exhausted" in runtime and isinstance(runtime["exhausted"], dict):
             exhausted_dict = runtime["exhausted"]
-            self._exhausted = [bool(exhausted_dict.get(source_id, False)) for source_id in self._source_ids]
+            self._exhausted = [
+                bool(exhausted_dict.get(saved_runtime_key_by_current_id[source_id], False))
+                if source_id in saved_runtime_key_by_current_id
+                else False
+                for source_id in self._source_ids
+            ]
         else:
             self._exhausted = [False for _ in range(self._ds_num)]
 
@@ -1149,11 +1316,20 @@ class DynamicBatchingSizeDataset(IterableDataset):
                 checkpoint buffer holds some full samples instead of indices (incompatible
                 checkpoint format).
         """
+        # Restore the upstream dataset before rebuilding an index-only buffer.
+        # In particular, a version-0 WeightedMultiSourceDataset checkpoint must
+        # first establish its legacy source-name -> stable-ID migration map, and
+        # some upstream get_item implementations depend on restored state.
+        if "dynamic_batch_upstream_dataset_state" in state_dict:
+            self.dataset.load_state_dict(state_dict["dynamic_batch_upstream_dataset_state"])
+
         # prev_save_by_idx does not have to be equal to self.save_by_idx, however, we still need to resume the buffer according to it.
         prev_save_by_idx = state_dict["save_by_idx"]
         if prev_save_by_idx:
             self._buffer = []
             self._buffer_of_output_index = []
+            self._buffer_token_count = 0
+            self._buffer_physical_token_count = 0
             cached_output_index = None
             cached_restored_samples = None
             for output_index_entry in state_dict["buffer"]:
@@ -1161,6 +1337,14 @@ class DynamicBatchingSizeDataset(IterableDataset):
                 # ``output_index`` identifies the upstream item and ``sample_idx``
                 # selects one sample after flattening a possible ``list[dict]``.
                 output_index, sample_idx = output_index_entry
+                canonicalize_output_index = getattr(
+                    self.dataset,
+                    "canonicalize_output_index_for_resume",
+                    None,
+                )
+                if callable(canonicalize_output_index):
+                    output_index = canonicalize_output_index(output_index)
+                canonical_output_index_entry = (output_index, sample_idx)
                 if output_index != cached_output_index:
                     restored_item = self.dataset.get_item(output_index)
                     cached_restored_samples = restored_item if isinstance(restored_item, list) else [restored_item]
@@ -1172,7 +1356,7 @@ class DynamicBatchingSizeDataset(IterableDataset):
                 )
                 self._buffer.append((restored_sample, length, physical_length))
                 if self.save_by_idx:
-                    self._buffer_of_output_index.append(output_index_entry)
+                    self._buffer_of_output_index.append(canonical_output_index_entry)
                 self._buffer_token_count += length
                 self._buffer_physical_token_count += physical_length
         else:
@@ -1204,10 +1388,6 @@ class DynamicBatchingSizeDataset(IterableDataset):
         assert self._buffer_physical_token_count == sum(
             item[2] if len(item) > 2 else item[1] for item in self._buffer
         ), "buffer_physical_token_count does not match the sum of physical lengths in buffer"
-        del state_dict["buffer"]
-
-        if "dynamic_batch_upstream_dataset_state" in state_dict:
-            self.dataset.load_state_dict(state_dict["dynamic_batch_upstream_dataset_state"])
 
         self._just_resumed = True
 
@@ -1323,6 +1503,7 @@ def build_interleave_dataset(
     namespace: Literal["train", "test"] = "train",
     transform: Optional[Callable] = None,
     seed: int = 42,
+    shuffle: bool = True,
     **kwargs,
 ):
     """
@@ -1333,6 +1514,7 @@ def build_interleave_dataset(
         namespace (Literal["train", "test"]): dataset namespace
         transform (Optional[Callable]): transform function
         seed (int): random seed
+        shuffle (bool): whether to shuffle each iterable source
     Returns:
         InterleavedIterableDataset: interleaved iterable dataset
         or
@@ -1344,6 +1526,10 @@ def build_interleave_dataset(
     sources = multisource_config["sources"]
     schedule = multisource_config["schedule"]
     source_names = multisource_config["names"]
+    source_ids = validate_source_ids(
+        multisource_config.get("source_ids", source_names),
+        expected_count=len(sources),
+    )
 
     if len(schedule) > 1 or schedule[0]["schedule_type"] != "const":
         logger.info_rank0("Interleaved dataset only supports const schedule type.")
@@ -1356,12 +1542,22 @@ def build_interleave_dataset(
 
         def add_ds_idx_to_iterable(dataset, ds_idx, source_name):
             def trans_example(example):
-                return {**example, "ds_idx": ds_idx, "source_name": source_name}
+                return {
+                    **example,
+                    "ds_idx": ds_idx,
+                    "source_name": source_name,
+                }
 
             return dataset.map(trans_example)
 
         for idx, source in enumerate(sources):
-            dataset = build_iterable_dataset(source, namespace=namespace, seed=seed, split_by_node=False)
+            dataset = build_iterable_dataset(
+                source,
+                namespace=namespace,
+                seed=seed,
+                split_by_node=False,
+                shuffle=shuffle,
+            )
             ds = dataset._data
             ds = add_ds_idx_to_iterable(ds, idx, source_names[idx])
             datasets.append(ds)
@@ -1374,6 +1570,7 @@ def build_interleave_dataset(
         interleave_dataset = InterleavedIterableDataset(
             interleave_dataset,
             transform=transform,
+            source_ids=source_ids,
         )
     elif datasets_type == "mapping":
         logger.info_rank0("Start building mapping multisource dataset")
@@ -1387,6 +1584,7 @@ def build_interleave_dataset(
         interleave_dataset = InterleavedMappingDataset(
             interleave_datasets(datasets=datasets, probabilities=weights, seed=seed),
             transform=transform,
+            source_ids=source_ids,
         )
     else:
         raise ValueError(f"Unsupported datasets_type: {datasets_type}")
@@ -1508,7 +1706,7 @@ def build_weighted_multisource_dataset(
     sources = multisource_config["sources"]
     source_names = multisource_config.get("names")
     source_ids = multisource_config.get(
-        "source_names", source_names
+        "source_ids", source_names
     )  # if source_ids is not provided, use source_names as source_ids
 
     level = multisource_config.get("level", "sample")

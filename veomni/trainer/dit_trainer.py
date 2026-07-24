@@ -28,6 +28,7 @@ from transformers.modeling_outputs import ModelOutput
 from ..arguments import DataArguments, ModelArguments, TrainingArguments, VeOmniArguments
 from ..data import build_data_transform, build_dataloader
 from ..data.data_collator import DataCollator
+from ..data.source_metadata import strip_source_metadata
 from ..distributed.clip_grad_norm import veomni_clip_grad_norm
 from ..distributed.parallel_state import get_parallel_state, use_parallel_state
 from ..models import build_foundation_model
@@ -433,6 +434,10 @@ class DiTTrainer:
                 return [_to_device(item) for item in v]
             return v
 
+        strip_source_metadata(
+            micro_batch,
+            strip_legacy=bool(getattr(getattr(self.base.args, "data", None), "enable_multisource", False)),
+        )
         micro_batch = {k: _to_device(v) for k, v in micro_batch.items()}
         if getattr(self.base, "LOG_SAMPLE", True):
             helper.print_example(example=micro_batch, rank=self.base.args.train.local_rank)
