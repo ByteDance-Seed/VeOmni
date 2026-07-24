@@ -159,6 +159,12 @@ class TextDPOTrainer:
             self.base._build_dataset()
             self.base._build_collate_fn()
             self.base._build_dataloader()
+            if args.train.dyn_bsz and args.train.dyn_bsz_runtime == "worker":
+                dynamic_dataset = self.base.train_dataloader.dataset
+                if getattr(dynamic_dataset, "_infinity_padding", False) and not getattr(
+                    dynamic_dataset, "_infinity", False
+                ):
+                    raise ValueError("infinity padding is not supported by TextDPOTrainer.")
             self._build_postforward()
             self.base._build_parallelized_model()
             self.base._build_optimizer()

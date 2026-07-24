@@ -84,6 +84,8 @@ def build_native_dataloader(
     prefetch_factor: int = 2,
     shuffle: bool = True,
     seed: int = 0,
+    infinity: bool = False,
+    infinity_padding: bool = False,
     collate_fn: Optional[Callable] = None,
     build_collate_fn: bool = True,
     collate_fn_kwargs: Optional[Dict[str, Any]] = None,
@@ -138,6 +140,10 @@ def build_native_dataloader(
             Use ``"spawn"`` when worker-side code must be pickle-safe and should not
             inherit parent-process state; keep ``"fork"`` for the legacy Linux behavior.
             Example: ``multiprocessing_context="spawn"``.
+        infinity_padding: In worker-side dynamic batching, keep yielding copies of
+            each worker's last real micro batch after its upstream dataset is exhausted.
+            The copies retain their original labels and carry ``padding_flag=True`` for
+            downstream loss accounting.
     """
     if collate_fn_kwargs is None:
         collate_fn_kwargs = {}
@@ -201,6 +207,8 @@ def build_native_dataloader(
                 get_physical_length_fn=dyn_bsz_physical_length_fn,
                 dynamic_batching_collate_fn=dyn_bsz_collate_fn,
                 save_by_idx=dyn_bsz_dataset_save_by_idx,
+                infinity=infinity,
+                infinity_padding=infinity_padding,
             )
             collate_fn = NoopDataCollator()
     else:
