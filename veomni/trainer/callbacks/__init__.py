@@ -20,6 +20,7 @@ Provides callback system for customizing trainer behavior at various stages of t
 
 from .base import Callback, TrainerState
 from .channel_loss_callback import ChannelLossCallback, ChannelLossComputer
+from .channel_loss_dashboard import ChannelLossDashboardCallback, ChannelLossDashboardData
 from .checkpoint_callback import CheckpointerCallback, HFLoraCkptCallback, HuggingfaceCkptCallback
 from .evaluate_callback import EvaluateCallback
 from .trace_callback import (
@@ -36,6 +37,8 @@ __all__ = [
     "TrainerState",
     "ChannelLossCallback",
     "ChannelLossComputer",
+    "ChannelLossDashboardCallback",
+    "ChannelLossDashboardData",
     "CheckpointerCallback",
     "HuggingfaceCkptCallback",
     "HFLoraCkptCallback",

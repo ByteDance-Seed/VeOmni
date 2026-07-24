@@ -312,6 +312,15 @@ class ChannelLossConfig:
         default=True,
         metadata={"help": "Log supervised token count for each channel."},
     )
+    release_cache: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Synchronize and release allocator cache after detached channel-loss CE on sampled steps. "
+                "This can lower peak memory before backward at the cost of extra synchronization."
+            )
+        },
+    )
     strict: bool = field(
         default=False,
         metadata={

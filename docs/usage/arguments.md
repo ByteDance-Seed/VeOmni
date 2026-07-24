@@ -349,10 +349,18 @@ NPU validation runs at two times:
 
 This is an observability-only side channel. It computes detached per-token CE
 from the model loss inputs, aggregates by packed-sequence source metadata, and
-adds metrics such as `channel_loss/<source-id>__<source>` to the normal step metrics. It does
+adds metrics such as `channel_loss/<source-id>__<source>` to the normal step metrics. The same
+sampled steps also report source-level data composition as `samples/<source>`,
+`input_tokens/<source>`, `label_tokens/<source>`, and
+`label_tokens_per_sample/<source>`. These counters use the packed segments already
+aligned for channel loss; they do not require per-sample IDs. This side channel does
 not change the returned training loss or gradients. Fused-loss backends may
 recompute the LM-head projection on sampled steps, so the default interval is
-10 steps; set `interval=1` for per-step metrics. DiT trainers and
+10 steps; set `interval=1` for per-step metrics. On memory-constrained
+profiles, `release_cache=true` synchronizes and releases the detached CE
+workspace after each sampled forward and before training backward. This does
+not change the objective or gradients, but adds synchronization and allocator
+churn. DiT trainers and
 `data.data_type="classification"` are not supported because they do not optimize
 a causal-LM objective. SeedOmni's `Qwen3MoeFoundationModel` is also unsupported
 because its legacy forward bypasses the observable loss dispatch. `BaseRLTrainer`
@@ -362,6 +370,18 @@ reference-model forward is excluded, and the chosen/rejected segments both use
 their preference pair's source metadata. If distinct source names sanitize to
 the same metric key, the stable source-ID prefix keeps their time series
 distinct from the first emission.
+
+When W&B is enabled, rank 0 also publishes one final `channel_overview` HTML
+snapshot. It combines every source on one shared-axis loss chart with a
+raw/weighted toggle, shows the observed label-token mix as a 100% stacked
+chart, and provides a step-selectable sample/token summary table. Native scalar
+metrics remain the live, machine-readable contract throughout training. The
+dashboard contains aggregate metrics only; optional dataloader adapters may call
+`trainer.set_channel_loss_trace_step_id(...)` once per step with an opaque ID,
+but sample content and physical locators remain in adapter-owned artifacts. Set
+`VEOMNI_CHANNEL_DASHBOARD_MAX_POINTS` to a positive
+integer to bound rendered points (default: 2000; retained history is also
+bounded).
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
@@ -375,6 +395,7 @@ distinct from the first emission.
 | token_count_metric_prefix | `str` | `"channel_tokens"` | Prefix for supervised token-count metrics. |
 | log_weighted_loss | `bool` | `True` | Log weighted loss metrics. |
 | log_token_count | `bool` | `True` | Log token-count metrics. |
+| release_cache | `bool` | `False` | Synchronize and release detached CE allocator cache after sampled forwards to lower memory carried into backward. |
 | strict | `bool` | `False` | Raise when source metadata is missing or cannot be aligned with packed segments; otherwise skip invalid batches. |
 
 ### GradientCheckpointingConfig
