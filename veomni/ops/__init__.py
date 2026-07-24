@@ -45,7 +45,8 @@ logger = logging.get_logger(__name__)
 def build_ALL_OPS():
     return [
         ("_fused_moe_forward", moe._fused_moe_forward),
-        ("_flash_attention_forward", attention._flash_attention_forward),
+        ("_flash_attention_forward", attention.flash._flash_attention_forward),
+        ("_flex_attention_forward", attention.flex._flex_attention_forward),
         ("_load_balancing_loss", load_balancing_loss._load_balancing_loss),
     ]
 
