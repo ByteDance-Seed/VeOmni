@@ -456,11 +456,10 @@ patchgen --list
 2. Create `<model>_gpu_patch_gen_config.py` at the model root. Point its
    `PatchConfig` at the pinned Transformers source module and declare only the
    imports, methods, classes, or op slots that VeOmni must change.
-3. Audit backend routing before enabling a new attention implementation.
-   FlexAttention in particular requires the generated model to dispatch via
-   `config._attn_implementation` and to construct a model-correct native
-   `BlockMask`; changing the training config alone is insufficient. See
-   [VeOmni Fused Attention Interface](../transformers_v5/veomni_fused_attention.md#integrating-a-new-patchgen-model).
+3. Review the generated model's integration points for the selected backend,
+   including attention dispatch, mask construction, and any backend-specific
+   metadata passed through model forward. Add only the narrow patchgen
+   overrides that the model requires.
 4. Run
    `patchgen veomni.models.transformers.<model>.<model>_gpu_patch_gen_config --dry-run`,
    then regenerate with `--diff -v`.
@@ -471,6 +470,13 @@ patchgen --list
    parallelism tests appropriate to the model. Follow
    [Testing a New Model](../transformers_v5/testing_new_model.md).
 7. Run `patchgen --check` and the focused model tests before committing.
+
+> **Note:** When enabling FlexAttention for packed sequences, use VeOmni's
+> causal/sliding mask wrappers instead of the corresponding Transformers
+> helpers, and pass `cu_seq_lens_q` into mask construction. The wrappers add
+> packed-sample boundaries to the native mask so tokens from different samples
+> cannot attend to each other. See the
+> [FlexAttention integration guide](../transformers_v5/veomni_fused_attention.md#integrating-a-new-patchgen-model).
 
 ## Using patchgen from a dependent project
 
