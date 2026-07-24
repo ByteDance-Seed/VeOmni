@@ -398,15 +398,29 @@ class BaseTrainer(Stateful, ABC):
 
     def _build_model(self):
         logger.info_rank0("Build model")
+        config_kwargs = dict(self.args.model.model_config)
+        config_kwargs["_veomni_enable_mtp"] = self.args.train.enable_mtp
         self.model = build_foundation_model(
             config_path=self.args.model.config_path,
             weights_path=self.args.model.model_path,
             torch_dtype="float32" if self.args.train.accelerator.fsdp_config.mixed_precision.enable else "bfloat16",
             init_device=self.args.train.init_device,
             ops_implementation=self.args.model.ops_implementation,
-            config_kwargs=self.args.model.model_config,
+            config_kwargs=config_kwargs,
         )
+        if hasattr(self.model.config, "_veomni_enable_mtp"):
+            delattr(self.model.config, "_veomni_enable_mtp")
         self.model_config = self.model.config
+        self._configure_mtp_training()
+
+    def _configure_mtp_training(self):
+        """Apply runtime MTP training arguments without changing checkpoint structure."""
+        configure_mtp = getattr(self.model, "configure_mtp_training", None)
+        if configure_mtp is None:
+            if self.args.train.enable_mtp:
+                raise ValueError("train.enable_mtp=True requires a model that supports MTP training.")
+            return
+        configure_mtp(enabled=self.args.train.enable_mtp, loss_weight=self.args.train.mtp_loss_weight)
 
     def _setup_lora(self):
         """Wrap ``self.model`` with the PEFT-free :class:`veomni.lora.VeOmniLoraModel`.
