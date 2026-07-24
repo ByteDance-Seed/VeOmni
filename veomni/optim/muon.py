@@ -23,6 +23,7 @@ params are gathered only when the NS iteration needs the full trailing
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 from torch import Tensor
 from torch.distributed.tensor import DTensor, Replicate, Shard
@@ -487,6 +488,45 @@ def _wrap_full_as_dtensor_like(full: Tensor, ref: Tensor) -> Tensor:
     return replicated.redistribute(device_mesh=mesh, placements=ref.placements)
 
 
+def _fsdp_all2all_fast_path_eligible(p: DTensor) -> bool:
+    """True when ``p`` is an evenly-sharded 2D ``Shard(0)`` DTensor on a 1D mesh.
+
+    This is the dominant FSDP2 case. The owner-based all-to-all path assumes a
+    single shard dim (dim 0), a one-dimensional device mesh, and shard sizes
+    that ``torch.tensor_split`` can reconstruct exactly. Anything else (HSDP
+    multi-dim meshes, ``Shard(d>0)``, ragged shards) falls back to the generic
+    ``full_tensor()`` path, which stays byte-for-byte with the previous
+    behavior.
+    """
+    if p.device_mesh.ndim != 1:
+        return False
+    placements = p.placements
+    if len(placements) != 1 or not isinstance(placements[0], Shard):
+        return False
+    if placements[0].dim != 0:
+        return False
+    world = p.device_mesh.size(0)
+    if world <= 1:
+        return False
+    full_rows = int(p.shape[0])
+    # Only the last shard may be smaller; every earlier shard must be full.
+    # DTensor pads with size ``ceil(full_rows / world)`` per rank.
+    shard_rows = -(-full_rows // world)
+    return shard_rows * (world - 1) < full_rows
+
+
+def _shard_row_sizes(full_rows: int, world: int) -> List[int]:
+    """Per-rank row counts matching DTensor's ``Shard(0)`` even split."""
+    shard_rows = -(-full_rows // world)
+    sizes = []
+    remaining = full_rows
+    for _ in range(world):
+        take = min(shard_rows, max(remaining, 0))
+        sizes.append(take)
+        remaining -= take
+    return sizes
+
+
 class DistributedMuon(Optimizer):
     """Muon optimizer that handles dense and 3D-MoE FSDP2-sharded DTensors.
 
@@ -568,7 +608,21 @@ class DistributedMuon(Optimizer):
             adjust_lr_fn = group["adjust_lr_fn"]
             ns_implementation = str(group.get("ns_implementation", "gram_quack"))
             gram_ns_reset_iterations = tuple(group.get("gram_ns_reset_iterations", (2,)))
+            ns_kwargs = {
+                "ns_coefficients": ns_coefficients,
+                "ns_steps": ns_steps,
+                "eps": eps,
+                "ns_implementation": ns_implementation,
+                "gram_ns_reset_iterations": gram_ns_reset_iterations,
+            }
 
+            # Phase 1: local momentum update. Collect the orthogonalized update
+            # ``ortho`` per param. Evenly-sharded 2D ``Shard(0)`` params are
+            # deferred into per-mesh buckets so their Newton-Schulz runs once on
+            # a single owner rank (via all-to-all) instead of redundantly on
+            # every rank behind an all-gather + redistribute round-trip.
+            pending: List[Dict[str, Any]] = []
+            a2a_buckets: Dict[Any, List[int]] = {}
             for p in group["params"]:
                 if p.grad is None:
                     continue
@@ -587,15 +641,30 @@ class DistributedMuon(Optimizer):
                 update = grad.lerp(buf, momentum) if nesterov else buf
 
                 kind = _classify_param(p)
-                ortho = self._compute_ortho(
-                    update,
-                    kind,
-                    ns_coefficients,
-                    ns_steps,
-                    eps,
-                    ns_implementation=ns_implementation,
-                    gram_ns_reset_iterations=gram_ns_reset_iterations,
-                )
+                entry: Dict[str, Any] = {"p": p, "update": update, "kind": kind, "ortho": None}
+
+                if (
+                    kind == _KIND_FSDP_GATHER_2D
+                    and isinstance(update, DTensor)
+                    and _fsdp_all2all_fast_path_eligible(update)
+                ):
+                    a2a_buckets.setdefault(update.device_mesh, []).append(len(pending))
+                else:
+                    entry["ortho"] = self._compute_ortho(update, kind, **ns_kwargs)
+                pending.append(entry)
+
+            # Phase 2: owner-based all-to-all Newton-Schulz for bucketed params.
+            for mesh, idxs in a2a_buckets.items():
+                updates = [pending[i]["update"] for i in idxs]
+                local_orthos = self._ortho_fsdp_group_all2all(updates, mesh, ns_kwargs)
+                for i, local_ortho in zip(idxs, local_orthos):
+                    pending[i]["ortho"] = local_ortho
+                    pending[i]["ortho_is_local_shard"] = True
+
+            # Phase 3: apply the parameter update.
+            for entry in pending:
+                p = entry["p"]
+                ortho = entry["ortho"]
 
                 lr_shape = p.shape[-2:] if p.ndim >= 2 else p.shape
                 adjusted_lr = _adjust_lr(lr, adjust_lr_fn, lr_shape)
@@ -605,7 +674,14 @@ class DistributedMuon(Optimizer):
 
                 if isinstance(p, DTensor):
                     target_dtype = p.to_local().dtype
-                    if isinstance(ortho, DTensor):
+                    if entry.get("ortho_is_local_shard"):
+                        update_dt = DTensor.from_local(
+                            ortho.to(dtype=target_dtype),
+                            device_mesh=p.device_mesh,
+                            placements=p.placements,
+                            run_check=False,
+                        )
+                    elif isinstance(ortho, DTensor):
                         update_dt = ortho.to(dtype=target_dtype)
                     else:
                         update_dt = _wrap_full_as_dtensor_like(ortho.to(dtype=target_dtype), p)
@@ -615,6 +691,102 @@ class DistributedMuon(Optimizer):
                 p.add_(update_dt, alpha=-adjusted_lr)
 
         return loss
+
+    def _ortho_fsdp_group_all2all(
+        self,
+        updates: List["DTensor"],
+        mesh: Any,
+        ns_kwargs: Dict[str, Any],
+    ) -> List[Tensor]:
+        """Orthogonalize evenly-sharded 2D ``Shard(0)`` updates via all-to-all.
+
+        Instead of all-gathering every parameter to every rank and running
+        Newton-Schulz redundantly on all of them, params are processed in
+        chunks of ``world`` and each rank becomes the sole *owner* of one param
+        in the chunk. A single balanced ``all_to_all`` reassembles the owner's
+        full ``[M, K]`` matrix (each rank contributes its row shard); the owner
+        runs NS once; a reverse ``all_to_all`` scatters the row shards back.
+        This keeps the same math while cutting redundant compute by ``world``
+        and removing the redistribute round-trip.
+
+        Invariant: every rank must call this with the same ``updates`` list
+        length and ordering (guaranteed by the shared ``param_groups`` order and
+        the requirement that each Muon param has a gradient on all ranks). The
+        all-to-all pairing is position-based, so a rank-divergent bucket would
+        deadlock — the same constraint the previous all-gather path relied on.
+
+        Buffers are allocated per parameter (own ``dtype``/``K``), so a bucket
+        may safely mix dtypes and trailing shapes.
+
+        Returns one local-shard (``[m_local, K]``) tensor per input update, in
+        input order.
+        """
+        world = mesh.size(0)
+        my_idx = int(mesh.get_coordinate()[0])
+        group = mesh.get_group(0)
+        device = updates[0].to_local().device
+        pad_dtype = updates[0].to_local().dtype  # stable across ranks for empty padding slots
+
+        results: List[Optional[Tensor]] = [None] * len(updates)
+
+        for base in range(0, len(updates), world):
+            owned_pos = base + my_idx  # global index of the param this rank owns
+            owned_update = updates[owned_pos] if owned_pos < len(updates) else None
+
+            # Forward all_to_all: rank ``r`` sends its row shard of param
+            # ``base + j`` to owner rank ``j``; owner ``j`` gathers all ``world``
+            # row shards of its owned param ``base + j``.
+            send_list: List[Tensor] = []
+            recv_list: List[Tensor] = []
+            if owned_update is not None:
+                owned_k = int(owned_update.shape[1])
+                owned_dtype = owned_update.to_local().dtype
+                owned_rows = _shard_row_sizes(int(owned_update.shape[0]), world)
+            else:
+                owned_k = 0
+                owned_dtype = pad_dtype
+                owned_rows = [0] * world
+
+            for j in range(world):
+                pos = base + j
+                if pos < len(updates):
+                    send_list.append(updates[pos].to_local().contiguous())
+                else:
+                    send_list.append(torch.empty(0, 0, device=device, dtype=pad_dtype))
+                recv_list.append(torch.empty(owned_rows[j], owned_k, device=device, dtype=owned_dtype))
+
+            dist.all_to_all(recv_list, send_list, group=group)
+
+            if owned_update is not None:
+                full_grad = torch.cat(recv_list, dim=0)
+                full_ortho = self._compute_ortho(full_grad, _KIND_LOCAL, **ns_kwargs)
+                scatter_send = [c.contiguous() for c in torch.split(full_ortho, owned_rows, dim=0)]
+            else:
+                scatter_send = [torch.empty(0, 0, device=device, dtype=pad_dtype) for _ in range(world)]
+
+            # Reverse all_to_all: owner ``j`` returns each rank ``i`` its row
+            # shard of param ``base + j``.
+            back_recv: List[Tensor] = []
+            for j in range(world):
+                pos = base + j
+                if pos < len(updates):
+                    param = updates[pos]
+                    rows = _shard_row_sizes(int(param.shape[0]), world)[my_idx]
+                    back_recv.append(
+                        torch.empty(rows, int(param.shape[1]), device=device, dtype=param.to_local().dtype)
+                    )
+                else:
+                    back_recv.append(torch.empty(0, 0, device=device, dtype=pad_dtype))
+
+            dist.all_to_all(back_recv, scatter_send, group=group)
+
+            for j in range(world):
+                pos = base + j
+                if pos < len(updates):
+                    results[pos] = back_recv[j]
+
+        assert all(r is not None for r in results)
+        return results  # type: ignore[return-value]
 
     @staticmethod
     def _compute_ortho(
