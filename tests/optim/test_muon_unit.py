@@ -23,6 +23,7 @@ import torch
 import torch.nn as nn
 from torch.distributed.tensor import Shard
 
+from veomni.optim import muon as muon_impl
 from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type, get_gpu_compute_capability
 
 
@@ -129,6 +130,14 @@ class TestFsdpAllToAllEligibility:
 
         assert _shard_row_sizes(param.shape[0], world_size) == [1] * 24 + [0] * 8
         assert _fsdp_all2all_fast_path_eligible(param)
+
+    def test_bucket_key_separates_local_dtypes(self):
+        mesh = object()
+        fp32 = SimpleNamespace(device_mesh=mesh, to_local=lambda: torch.empty(1, dtype=torch.float32))
+        bf16 = SimpleNamespace(device_mesh=mesh, to_local=lambda: torch.empty(1, dtype=torch.bfloat16))
+        bucket_key = getattr(muon_impl, "_fsdp_all2all_bucket_key", lambda update: update.device_mesh)
+
+        assert bucket_key(fp32) != bucket_key(bf16)
 
 
 class TestNumerics:

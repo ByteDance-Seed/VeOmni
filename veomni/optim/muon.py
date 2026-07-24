@@ -509,6 +509,11 @@ def _fsdp_all2all_fast_path_eligible(p: DTensor) -> bool:
     return True
 
 
+def _fsdp_all2all_bucket_key(update: DTensor) -> Tuple[Any, torch.dtype]:
+    """Group all-to-all updates by mesh and local communication dtype."""
+    return update.device_mesh, update.to_local().dtype
+
+
 def _shard_row_sizes(full_rows: int, world: int) -> List[int]:
     """Per-rank row counts matching DTensor's ``Shard(0)`` even split."""
     shard_rows = -(-full_rows // world)
@@ -616,7 +621,7 @@ class DistributedMuon(Optimizer):
             # a single owner rank (via all-to-all) instead of redundantly on
             # every rank behind an all-gather + redistribute round-trip.
             pending: List[Dict[str, Any]] = []
-            a2a_buckets: Dict[Any, List[int]] = {}
+            a2a_buckets: Dict[Tuple[Any, torch.dtype], List[int]] = {}
             for p in group["params"]:
                 if p.grad is None:
                     continue
@@ -642,13 +647,13 @@ class DistributedMuon(Optimizer):
                     and isinstance(update, DTensor)
                     and _fsdp_all2all_fast_path_eligible(update)
                 ):
-                    a2a_buckets.setdefault(update.device_mesh, []).append(len(pending))
+                    a2a_buckets.setdefault(_fsdp_all2all_bucket_key(update), []).append(len(pending))
                 else:
                     entry["ortho"] = self._compute_ortho(update, kind, **ns_kwargs)
                 pending.append(entry)
 
             # Phase 2: owner-based all-to-all Newton-Schulz for bucketed params.
-            for mesh, idxs in a2a_buckets.items():
+            for (mesh, _local_dtype), idxs in a2a_buckets.items():
                 updates = [pending[i]["update"] for i in idxs]
                 local_orthos = self._ortho_fsdp_group_all2all(updates, mesh, ns_kwargs)
                 for i, local_ortho in zip(idxs, local_orthos):

@@ -79,14 +79,14 @@ def _make_grads(
             ep_factor = full.shape[0] // p.shape[0]
             local_full = _ep_local_slice(full, ep_factor, ep_rank) if ep_factor > 1 else full
             full_dt = DTensor.from_local(
-                local_full.to(device),
+                local_full.to(device=device, dtype=p.dtype),
                 device_mesh=p.device_mesh,
                 placements=[Replicate()] * p.device_mesh.ndim,
                 run_check=False,
             )
             p.grad = full_dt.redistribute(device_mesh=p.device_mesh, placements=p.placements)
         else:
-            p.grad = full.to(device)
+            p.grad = full.to(device=device, dtype=p.dtype)
 
 
 def _full_state_dict(model: nn.Module, ep_group=None) -> dict:
@@ -146,15 +146,23 @@ class _ToyDenseModel(nn.Module):
         return self.block1(self.block0(x)).sum()
 
 
-def _build_dense_model(device: torch.device, hidden: int = 32, intermediate: int = 64) -> nn.Module:
+def _build_dense_model(
+    device: torch.device,
+    hidden: int = 32,
+    intermediate: int = 64,
+    mixed_dtype: bool = False,
+) -> nn.Module:
     torch.manual_seed(SEED)
-    return _ToyDenseModel(hidden=hidden, intermediate=intermediate).to(device)
+    model = _ToyDenseModel(hidden=hidden, intermediate=intermediate).to(device)
+    if mixed_dtype:
+        model.block1.to(torch.bfloat16)
+    return model
 
 
-def _dense_golden_state(full_shapes: dict, hidden: int, intermediate: int) -> dict:
+def _dense_golden_state(full_shapes: dict, hidden: int, intermediate: int, mixed_dtype: bool) -> dict:
     """Single-process reference for the dense FSDP2 path."""
     device = torch.device("cpu")
-    model = _build_dense_model(device, hidden=hidden, intermediate=intermediate)
+    model = _build_dense_model(device, hidden=hidden, intermediate=intermediate, mixed_dtype=mixed_dtype)
     opt = DistributedMuon(
         list(model.parameters()),
         lr=5e-3,
@@ -170,7 +178,7 @@ def _dense_golden_state(full_shapes: dict, hidden: int, intermediate: int) -> di
     return _full_state_dict(model)
 
 
-def _run_dense(hidden: int = 32, intermediate: int = 64) -> None:
+def _run_dense(hidden: int = 32, intermediate: int = 64, mixed_dtype: bool = False) -> None:
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     device_type = get_device_type()
     get_torch_device().set_device(f"{device_type}:{local_rank}")
@@ -179,7 +187,7 @@ def _run_dense(hidden: int = 32, intermediate: int = 64) -> None:
     world_size = dist.get_world_size()
     device = torch.device(f"{device_type}:{local_rank}")
 
-    model = _build_dense_model(device, hidden=hidden, intermediate=intermediate)
+    model = _build_dense_model(device, hidden=hidden, intermediate=intermediate, mixed_dtype=mixed_dtype)
     full_shapes = {fqn: tuple(p.shape) for fqn, p in model.named_parameters() if p.requires_grad}
     fully_shard(model.block0)
     fully_shard(model.block1)
@@ -202,14 +210,20 @@ def _run_dense(hidden: int = 32, intermediate: int = 64) -> None:
 
     fsdp_state = _full_state_dict(model)
     if rank == 0:
-        golden = _dense_golden_state(full_shapes, hidden=hidden, intermediate=intermediate)
+        golden = _dense_golden_state(
+            full_shapes,
+            hidden=hidden,
+            intermediate=intermediate,
+            mixed_dtype=mixed_dtype,
+        )
         assert set(fsdp_state.keys()) == set(golden.keys())
         for k, v in golden.items():
+            tol = 1e-2 if v.dtype == torch.bfloat16 else 1e-4
             torch.testing.assert_close(
                 fsdp_state[k],
                 v,
-                atol=1e-4,
-                rtol=1e-4,
+                atol=tol,
+                rtol=tol,
                 msg=f"FSDP2 Muon update for {k!r} diverges from single-device Muon (world_size={world_size}).",
             )
         print(f"[rank0] dense FSDP2 / single-device parity OK across {len(golden)} param(s)")
@@ -438,7 +452,7 @@ def _torchrun_cmd(nproc: int, port: int, mode: str, use_zero_comm: bool) -> list
 
 @pytest.mark.skipif(not _has_devices(4), reason="device_count should be >= 4")
 def test_dense_4gpu():
-    cmd = _torchrun_cmd(nproc=4, port=29611, mode="dense", use_zero_comm=False)
+    cmd = _torchrun_cmd(nproc=4, port=find_free_port(), mode="dense", use_zero_comm=False)
     env = os.environ.copy()
     env.setdefault("NCCL_DEBUG", "WARN")
     result = subprocess.run(cmd, env=env, check=True)
@@ -455,9 +469,18 @@ def test_dense_empty_shards_4gpu():
 
 
 @pytest.mark.skipif(not _has_devices(4), reason="device_count should be >= 4")
+def test_dense_mixed_dtype_4gpu():
+    cmd = _torchrun_cmd(nproc=4, port=find_free_port(), mode="dense_mixed_dtype", use_zero_comm=False)
+    env = os.environ.copy()
+    env.setdefault("NCCL_DEBUG", "WARN")
+    result = subprocess.run(cmd, env=env, check=True)
+    assert result.returncode == 0
+
+
+@pytest.mark.skipif(not _has_devices(4), reason="device_count should be >= 4")
 def test_qwen3_moe_default_backend_4gpu():
     """Default backend: ``Shard(1)`` on experts + ep_fsdp all-gather in Muon."""
-    cmd = _torchrun_cmd(nproc=4, port=29612, mode="moe", use_zero_comm=False)
+    cmd = _torchrun_cmd(nproc=4, port=find_free_port(), mode="moe", use_zero_comm=False)
     env = os.environ.copy()
     env.setdefault("NCCL_DEBUG", "WARN")
     result = subprocess.run(cmd, env=env, check=True)
@@ -467,7 +490,7 @@ def test_qwen3_moe_default_backend_4gpu():
 @pytest.mark.skipif(not _has_devices(4), reason="device_count should be >= 4")
 def test_qwen3_moe_zero_comm_backend_4gpu():
     """Zero-comm backend: ``Shard(0)`` on experts + local batched NS."""
-    cmd = _torchrun_cmd(nproc=4, port=29613, mode="moe", use_zero_comm=True)
+    cmd = _torchrun_cmd(nproc=4, port=find_free_port(), mode="moe", use_zero_comm=True)
     env = os.environ.copy()
     env.setdefault("NCCL_DEBUG", "WARN")
     result = subprocess.run(cmd, env=env, check=True)
@@ -478,12 +501,14 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", choices=["dense", "dense_empty", "moe"], required=True)
+    parser.add_argument("--mode", choices=["dense", "dense_empty", "dense_mixed_dtype", "moe"], required=True)
     parser.add_argument("--zero-comm", type=int, default=0)
     args = parser.parse_args()
     if args.mode == "dense":
         _run_dense()
     elif args.mode == "dense_empty":
         _run_dense(hidden=2, intermediate=3)
+    elif args.mode == "dense_mixed_dtype":
+        _run_dense(mixed_dtype=True)
     else:
         _run_qwen3_moe(use_zero_comm=bool(args.zero_comm))
