@@ -16,9 +16,12 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 import torch.nn as nn
+from torch.distributed.tensor import Shard
 
 from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type, get_gpu_compute_capability
 
@@ -31,6 +34,8 @@ from veomni.optim.muon import (  # noqa: E402
     DEFAULT_NS_COEFFICIENTS,
     DEFAULT_NS_STEPS,
     DistributedMuon,
+    _fsdp_all2all_fast_path_eligible,
+    _shard_row_sizes,
     batched_gram_newton_schulz,
     batched_newton_schulz,
     run_newton_schulz,
@@ -111,6 +116,19 @@ class TestParamShapeEligibility:
         else:
             with pytest.raises(ValueError, match="2D and 3D"):
                 DistributedMuon([p], lr=1e-3)
+
+
+class TestFsdpAllToAllEligibility:
+    def test_empty_rank_shards_remain_all_to_all_eligible(self):
+        world_size = 32
+        param = SimpleNamespace(
+            device_mesh=SimpleNamespace(ndim=1, size=lambda dim: world_size),
+            placements=(Shard(0),),
+            shape=(24, 16384),
+        )
+
+        assert _shard_row_sizes(param.shape[0], world_size) == [1] * 24 + [0] * 8
+        assert _fsdp_all2all_fast_path_eligible(param)
 
 
 class TestNumerics:

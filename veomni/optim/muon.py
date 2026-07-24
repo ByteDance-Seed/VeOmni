@@ -489,14 +489,12 @@ def _wrap_full_as_dtensor_like(full: Tensor, ref: Tensor) -> Tensor:
 
 
 def _fsdp_all2all_fast_path_eligible(p: DTensor) -> bool:
-    """True when ``p`` is an evenly-sharded 2D ``Shard(0)`` DTensor on a 1D mesh.
+    """True when ``p`` is a 2D ``Shard(0)`` DTensor on a 1D mesh.
 
-    This is the dominant FSDP2 case. The owner-based all-to-all path assumes a
-    single shard dim (dim 0), a one-dimensional device mesh, and shard sizes
-    that ``torch.tensor_split`` can reconstruct exactly. Anything else (HSDP
-    multi-dim meshes, ``Shard(d>0)``, ragged shards) falls back to the generic
-    ``full_tensor()`` path, which stays byte-for-byte with the previous
-    behavior.
+    The owner-based all-to-all path supports empty tail-rank shards when the
+    first dimension is smaller than the mesh. Anything else (HSDP multi-dim
+    meshes, ``Shard(d>0)``, ragged shards) falls back to the generic
+    ``full_tensor()`` path.
     """
     if p.device_mesh.ndim != 1:
         return False
@@ -508,11 +506,7 @@ def _fsdp_all2all_fast_path_eligible(p: DTensor) -> bool:
     world = p.device_mesh.size(0)
     if world <= 1:
         return False
-    full_rows = int(p.shape[0])
-    # Only the last shard may be smaller; every earlier shard must be full.
-    # DTensor pads with size ``ceil(full_rows / world)`` per rank.
-    shard_rows = -(-full_rows // world)
-    return shard_rows * (world - 1) < full_rows
+    return True
 
 
 def _shard_row_sizes(full_rows: int, world: int) -> List[int]:
@@ -679,6 +673,8 @@ class DistributedMuon(Optimizer):
                             ortho.to(dtype=target_dtype),
                             device_mesh=p.device_mesh,
                             placements=p.placements,
+                            shape=p.shape,
+                            stride=p.stride(),
                             run_check=False,
                         )
                     elif isinstance(ortho, DTensor):

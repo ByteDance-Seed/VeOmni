@@ -28,6 +28,7 @@ import torch.nn as nn
 from torch.distributed.fsdp import fully_shard
 from torch.distributed.tensor import DTensor, Replicate, Shard
 
+from tests.tools.launch_utils import find_free_port
 from veomni.distributed.parallel_state import init_parallel_state
 from veomni.optim.muon import DistributedMuon
 from veomni.utils.device import (
@@ -145,15 +146,15 @@ class _ToyDenseModel(nn.Module):
         return self.block1(self.block0(x)).sum()
 
 
-def _build_dense_model(device: torch.device) -> nn.Module:
+def _build_dense_model(device: torch.device, hidden: int = 32, intermediate: int = 64) -> nn.Module:
     torch.manual_seed(SEED)
-    return _ToyDenseModel().to(device)
+    return _ToyDenseModel(hidden=hidden, intermediate=intermediate).to(device)
 
 
-def _dense_golden_state(full_shapes: dict) -> dict:
+def _dense_golden_state(full_shapes: dict, hidden: int, intermediate: int) -> dict:
     """Single-process reference for the dense FSDP2 path."""
     device = torch.device("cpu")
-    model = _build_dense_model(device)
+    model = _build_dense_model(device, hidden=hidden, intermediate=intermediate)
     opt = DistributedMuon(
         list(model.parameters()),
         lr=5e-3,
@@ -169,7 +170,7 @@ def _dense_golden_state(full_shapes: dict) -> dict:
     return _full_state_dict(model)
 
 
-def _run_dense() -> None:
+def _run_dense(hidden: int = 32, intermediate: int = 64) -> None:
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     device_type = get_device_type()
     get_torch_device().set_device(f"{device_type}:{local_rank}")
@@ -178,7 +179,7 @@ def _run_dense() -> None:
     world_size = dist.get_world_size()
     device = torch.device(f"{device_type}:{local_rank}")
 
-    model = _build_dense_model(device)
+    model = _build_dense_model(device, hidden=hidden, intermediate=intermediate)
     full_shapes = {fqn: tuple(p.shape) for fqn, p in model.named_parameters() if p.requires_grad}
     fully_shard(model.block0)
     fully_shard(model.block1)
@@ -201,7 +202,7 @@ def _run_dense() -> None:
 
     fsdp_state = _full_state_dict(model)
     if rank == 0:
-        golden = _dense_golden_state(full_shapes)
+        golden = _dense_golden_state(full_shapes, hidden=hidden, intermediate=intermediate)
         assert set(fsdp_state.keys()) == set(golden.keys())
         for k, v in golden.items():
             torch.testing.assert_close(
@@ -445,6 +446,15 @@ def test_dense_4gpu():
 
 
 @pytest.mark.skipif(not _has_devices(4), reason="device_count should be >= 4")
+def test_dense_empty_shards_4gpu():
+    cmd = _torchrun_cmd(nproc=4, port=find_free_port(), mode="dense_empty", use_zero_comm=False)
+    env = os.environ.copy()
+    env.setdefault("NCCL_DEBUG", "WARN")
+    result = subprocess.run(cmd, env=env, check=True)
+    assert result.returncode == 0
+
+
+@pytest.mark.skipif(not _has_devices(4), reason="device_count should be >= 4")
 def test_qwen3_moe_default_backend_4gpu():
     """Default backend: ``Shard(1)`` on experts + ep_fsdp all-gather in Muon."""
     cmd = _torchrun_cmd(nproc=4, port=29612, mode="moe", use_zero_comm=False)
@@ -468,10 +478,12 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", choices=["dense", "moe"], required=True)
+    parser.add_argument("--mode", choices=["dense", "dense_empty", "moe"], required=True)
     parser.add_argument("--zero-comm", type=int, default=0)
     args = parser.parse_args()
     if args.mode == "dense":
         _run_dense()
+    elif args.mode == "dense_empty":
+        _run_dense(hidden=2, intermediate=3)
     else:
         _run_qwen3_moe(use_zero_comm=bool(args.zero_comm))
