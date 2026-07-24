@@ -171,6 +171,7 @@ and DeepSeek V4's `hc_mult=4` layout.
 model:
   ops_implementation:
     cross_entropy_loss_implementation: liger_kernel   # default; set to "chunk_loss" / "npu" / "eager" on NPU
+    cross_entropy_loss_release_cache: false            # opt in on memory-constrained chunk-loss profiles
 ```
 
 **Field:** `OpsImplementationConfig.cross_entropy_loss_implementation`
@@ -188,6 +189,13 @@ The `npu` chunk-loss binds only to `ForCausalLM` and
 `eager_cross_entropy` because chunk_loss hard-codes the causal
 `labels[..., 1:]` shift (incompatible with token-level classification
 labels).
+
+`cross_entropy_loss_release_cache=true` adds a stream synchronization and
+allocator-cache release after the chunked loss has precomputed and packed its
+input/lm-head gradients. It can lower the peak memory carried into model
+backward on constrained accelerators, but it may reduce throughput through
+synchronization and allocator churn. The default is `false`; this setting has
+no effect on the `eager` or `liger_kernel` implementations.
 
 Selecting `liger_kernel` requires that the model's forward pass pass
 `hidden_states=` and `weights=self.lm_head.weight` through

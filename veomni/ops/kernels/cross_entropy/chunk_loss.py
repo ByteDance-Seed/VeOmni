@@ -34,10 +34,32 @@ from typing import Any, Callable, Optional
 
 import torch
 import torch.nn.functional as F
+from torch.autograd.graph import saved_tensors_hooks
 
 from ....distributed.parallel_state import get_parallel_state
 from ....distributed.sequence_parallel import reduce_sequence_parallel_loss
+from ....utils.device import empty_cache, stream_synchronize
 from .eager import eager_cross_entropy
+
+
+def _keep_saved_tensor_on_device(tensor: torch.Tensor) -> torch.Tensor:
+    """Identity hook for the short-lived, chunk-local CE graph."""
+    return tensor
+
+
+def _release_accelerator_cache(device: torch.device) -> None:
+    """Release transient chunk-CE allocator blocks before model backward.
+
+    ``ChunkLoss.apply`` returns only after the outer saved-tensor hook has
+    packed the precomputed input and lm-head gradients. Synchronizing at that
+    boundary makes the short-lived logits/autograd allocations reusable, and
+    ``empty_cache`` returns their now-unoccupied blocks to the accelerator
+    allocator. CPU execution has no accelerator cache to release.
+    """
+    if device.type == "cpu":
+        return
+    stream_synchronize()
+    empty_cache()
 
 
 class ChunkLoss(torch.autograd.Function):
@@ -66,13 +88,42 @@ class ChunkLoss(torch.autograd.Function):
         for i in range(len(hidden_states_chunks)):
             hidden_states_chunk = hidden_states_chunks[i]
             grad_inputs_chunk = grad_inputs_chunks[i]
-            (chunk_grad_input, chunk_grad_weight), (chunk_loss, _) = torch.func.grad_and_value(
-                loss_forward, argnums=(0, 1), has_aux=True
-            )(hidden_states_chunk, head_weight, None, **loss_kwargs_chunks[i])
+            # ``torch.func`` transforms reject any active saved-tensor hooks,
+            # including the hooks used by activation offloading. A custom
+            # autograd ``Function.forward`` runs under no-grad, so explicitly
+            # re-enable grad and differentiate detached leaves for this chunk.
+            # This computes the same first-order VJP that the custom backward
+            # stores below while remaining compatible with saved-tensor hooks.
+            # The chunk-local graph is differentiated immediately, so moving
+            # its vocab-sized FP32 logits to CPU only adds transfers and can
+            # retain asynchronous copies across chunks. Shadow the outer
+            # activation-offload hook with an identity hook here; once this
+            # scope exits, ``ctx.save_for_backward`` below again uses the outer
+            # hook for the long-lived precomputed gradients.
+            with torch.enable_grad(), saved_tensors_hooks(_keep_saved_tensor_on_device, _keep_saved_tensor_on_device):
+                hidden_states_leaf = hidden_states_chunk.detach().requires_grad_(True)
+                head_weight_leaf = head_weight.detach().requires_grad_(True)
+                chunk_loss, chunk_aux = loss_forward(
+                    hidden_states_leaf, head_weight_leaf, None, **loss_kwargs_chunks[i]
+                )
+                # The auxiliary value is normally the FP32 logits. Drop the
+                # direct reference before differentiation so consecutive
+                # chunks cannot retain an extra vocab-sized buffer.
+                del chunk_aux
+                chunk_grad_input, chunk_grad_weight = torch.autograd.grad(
+                    chunk_loss,
+                    (hidden_states_leaf, head_weight_leaf),
+                    create_graph=False,
+                    retain_graph=False,
+                )
 
-            accumulated_loss.add_(chunk_loss)
+            accumulated_loss.add_(chunk_loss.detach())
             grad_inputs_chunk.copy_(chunk_grad_input)
             grad_weight.add_(chunk_grad_weight)
+            # Assignment evaluates the next iteration's RHS before rebinding
+            # these names. Delete them now so the previous FP32 logits graph
+            # and full lm-head gradient cannot overlap the next projection.
+            del hidden_states_leaf, head_weight_leaf, chunk_loss, chunk_grad_input, chunk_grad_weight
 
         ctx.save_for_backward(grad_inputs, grad_weight)
         return accumulated_loss
@@ -95,6 +146,7 @@ def chunk_loss_function(
     num_items_in_batch: Optional[int] = None,
     ignore_index: int = -100,
     shift_labels: Optional[torch.Tensor] = None,
+    release_cache: bool = False,
     **kwargs,
 ) -> torch.Tensor:
     sp_enabled = get_parallel_state().sp_enabled
@@ -134,6 +186,15 @@ def chunk_loss_function(
     ]
 
     chunk_loss = ChunkLoss.apply(hidden_states, weights, None, ce_loss_func, loss_kwargs_chunks, chunk_size)
+
+    # Keep this cleanup after ``apply`` rather than inside ``ChunkLoss.forward``:
+    # saved-tensor pack hooks run as the custom Function finishes applying.
+    # Before this boundary the NPU originals of ``grad_inputs``/``grad_weight``
+    # may still be live, so an allocator flush cannot reclaim the full
+    # short-lived CE working set. This is opt-in because synchronization and
+    # allocator churn can trade throughput for lower peak memory.
+    if release_cache:
+        _release_accelerator_cache(hidden_states.device)
 
     # Match ``ForCausalLMLoss`` SP behavior so chunk_loss can back both
     # ForCausalLM and ForConditionalGeneration heads when SP is enabled.
